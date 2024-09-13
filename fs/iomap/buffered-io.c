@@ -223,7 +223,7 @@ struct iomap_readpage_ctx {
 };
 
 static int iomap_read_inline_data(struct inode *inode, struct page *page,
-		struct iomap *iomap)
+		const struct iomap *iomap)
 {
 	size_t size = i_size_read(inode) - iomap->offset;
 	void *addr;
