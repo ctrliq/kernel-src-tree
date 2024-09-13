@@ -141,7 +141,7 @@ struct rand_data {
  * This test complies with SP800-90B section 4.4.2.
  ***************************************************************************/
 
-/**
+/*
  * Reset the APT counter
  *
  * @ec [in] Reference to entropy collector
@@ -154,7 +154,7 @@ static void jent_apt_reset(struct rand_data *ec, unsigned int delta_masked)
 	ec->apt_observations = 0;
 }
 
-/**
+/*
  * Insert a new entropy event into APT
  *
  * @ec [in] Reference to entropy collector
@@ -198,7 +198,7 @@ static void jent_apt_insert(struct rand_data *ec, unsigned int delta_masked)
  * the end. The caller of the Jitter RNG is informed with an error code.
  ***************************************************************************/
 
-/**
+/*
  * Repetition Count Test as defined in SP800-90B section 4.4.1
  *
  * @ec [in] Reference to entropy collector
@@ -239,7 +239,7 @@ static void jent_rct_insert(struct rand_data *ec, int stuck)
 	}
 }
 
-/**
+/*
  * Is there an RCT health test failure?
  *
  * @ec [in] Reference to entropy collector
@@ -262,7 +262,7 @@ static inline __u64 jent_delta(__u64 prev, __u64 next)
 			       (JENT_UINT64_MAX - prev + 1 + next);
 }
 
-/**
+/*
  * Stuck test by checking the:
  * 	1st derivative of the jitter measurement (time delta)
  * 	2nd derivative of the jitter measurement (delta of time deltas)
@@ -303,7 +303,7 @@ static int jent_stuck(struct rand_data *ec, __u64 current_delta)
 	return 0;
 }
 
-/**
+/*
  * Report any health test failures
  *
  * @ec [in] Reference to entropy collector
@@ -325,7 +325,7 @@ static int jent_health_failure(struct rand_data *ec)
  * Noise sources
  ***************************************************************************/
 
-/**
+/*
  * Update of the loop count used for the next round of
  * an entropy collection.
  *
@@ -368,7 +368,7 @@ static __u64 jent_loop_shuffle(struct rand_data *ec,
 	return (shuffle + (1<<min));
 }
 
-/**
+/*
  * CPU Jitter noise source -- this is the noise source based on the CPU
  *			      execution time jitter
  *
@@ -450,7 +450,7 @@ static void jent_lfsr_time(struct rand_data *ec, __u64 time, __u64 loop_cnt,
 		ec->data = new;
 }
 
-/**
+/*
  * Memory Access noise source -- this is a noise source based on variations in
  *				 memory access times
  *
@@ -515,7 +515,7 @@ static void jent_memaccess(struct rand_data *ec, __u64 loop_cnt)
 /***************************************************************************
  * Start of entropy processing logic
  ***************************************************************************/
-/**
+/*
  * This is the heart of the entropy generation: calculate time deltas and
  * use the CPU jitter in the time deltas. The jitter is injected into the
  * entropy pool.
@@ -554,7 +554,7 @@ static int jent_measure_jitter(struct rand_data *ec)
 	return stuck;
 }
 
-/**
+/*
  * Generator of one 64 bit random number
  * Function fills rand_data->data
  *
@@ -584,7 +584,7 @@ static void jent_gen_entropy(struct rand_data *ec)
 	}
 }
 
-/**
+/*
  * Entry function: Obtain entropy for the caller.
  *
  * This function invokes the entropy gathering logic as often to generate
