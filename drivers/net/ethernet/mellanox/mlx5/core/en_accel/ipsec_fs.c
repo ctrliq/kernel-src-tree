@@ -620,8 +620,8 @@ int mlx5e_accel_ipsec_fs_add_rule(struct mlx5e_priv *priv,
 }
 
 void mlx5e_accel_ipsec_fs_del_rule(struct mlx5e_priv *priv,
-				   struct mlx5_accel_esp_xfrm_attrs *attrs,
-				   struct mlx5e_ipsec_rule *ipsec_rule)
+			     struct mlx5_accel_esp_xfrm_attrs *attrs,
+			     struct mlx5e_ipsec_rule *ipsec_rule)
 {
 	if (!priv->ipsec->rx_fs)
 		return;
