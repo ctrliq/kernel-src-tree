@@ -747,13 +747,13 @@ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 
 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
 
+	preempt_disable_rt();
 	/* Update lruvec */
 	if (!pn->memcg->percpu_stats_disabled)
 		__this_cpu_add(pn->lruvec_stat_local->count[idx], val);
 
 	memcg = percpu_stats_memcg(pn->memcg, &pn);
 
-	preempt_disable_rt();
 	/* Update memcg */
 	__mod_memcg_state(memcg, idx, val);
 

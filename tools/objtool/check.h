@@ -40,6 +40,7 @@ struct insn_state {
 struct instruction {
 	struct list_head list;
 	struct hlist_node hash;
+	struct list_head call_node;
 	struct section *sec;
 	unsigned long offset;
 	unsigned int len;
@@ -62,6 +63,7 @@ struct objtool_file {
 	struct elf *elf;
 	struct list_head insn_list;
 	DECLARE_HASHTABLE(insn_hash, 16);
+	struct list_head return_thunk_list;
 	bool ignore_unreachables, c_file, hints, rodata;
 };
 
