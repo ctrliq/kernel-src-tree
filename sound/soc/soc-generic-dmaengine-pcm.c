@@ -83,7 +83,6 @@ static int dmaengine_pcm_hw_params(struct snd_soc_component *component,
 			struct snd_pcm_hw_params *params,
 			struct dma_slave_config *slave_config);
 	struct dma_slave_config slave_config;
-	int ret;
 
 	memset(&slave_config, 0, sizeof(slave_config));
 
@@ -93,7 +92,7 @@ static int dmaengine_pcm_hw_params(struct snd_soc_component *component,
 		prepare_slave_config = pcm->config->prepare_slave_config;
 
 	if (prepare_slave_config) {
-		ret = prepare_slave_config(substream, params, &slave_config);
+		int ret = prepare_slave_config(substream, params, &slave_config);
 		if (ret)
 			return ret;
 
