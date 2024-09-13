@@ -2971,6 +2971,7 @@ void nfs_access_add_cache(struct inode *inode, struct nfs_access_entry *set)
 	RB_CLEAR_NODE(&cache->rb_node);
 	cache->cred = get_cred(set->cred);
 	cache->mask = set->mask;
+	cache->timestamp = ktime_get_ns();
 
 	/* The above field assignments must be visible
 	 * before this item appears on the lru.  We cannot easily
