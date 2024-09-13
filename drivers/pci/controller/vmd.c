@@ -900,7 +900,8 @@ static int vmd_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	if (vmd->instance < 0)
 		return vmd->instance;
 
-	vmd->name = kasprintf(GFP_KERNEL, "vmd%d", vmd->instance);
+	vmd->name = devm_kasprintf(&dev->dev, GFP_KERNEL, "vmd%d",
+				   vmd->instance);
 	if (!vmd->name) {
 		err = -ENOMEM;
 		goto out_release_instance;
@@ -938,7 +939,6 @@ static int vmd_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
  out_release_instance:
 	ida_simple_remove(&vmd_instance_ida, vmd->instance);
-	kfree(vmd->name);
 	return err;
 }
 
@@ -961,7 +961,6 @@ static void vmd_remove(struct pci_dev *dev)
 	vmd_detach_resources(vmd);
 	vmd_remove_irq_domain(vmd);
 	ida_simple_remove(&vmd_instance_ida, vmd->instance);
-	kfree(vmd->name);
 }
 
 #ifdef CONFIG_PM_SLEEP
