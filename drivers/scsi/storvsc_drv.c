@@ -1235,11 +1235,6 @@ static void storvsc_on_channel_callback(void *context)
 			return;
 		}
 
-		if (unlikely(time_after(jiffies, time_limit))) {
-			hv_pkt_iter_close(channel);
-			return;
-		}
-
 		if (pktlen < minlen) {
 			dev_err(&device->device,
 				"Invalid pkt: id=%llu, len=%u, minlen=%u\n",
@@ -1664,10 +1659,6 @@ static int storvsc_host_reset_handler(struct scsi_cmnd *scmnd)
  */
 static enum blk_eh_timer_return storvsc_eh_timed_out(struct scsi_cmnd *scmnd)
 {
-#if IS_ENABLED(CONFIG_SCSI_FC_ATTRS)
-	if (scmnd->device->host->transportt == fc_transport_template)
-		return fc_eh_timed_out(scmnd);
-#endif
 	return BLK_EH_RESET_TIMER;
 }
 
