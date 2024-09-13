@@ -1928,6 +1928,12 @@ static int validate_call(struct instruction *insn, struct insn_state *state)
 		return 1;
 	}
 
+	if (state->df) {
+		WARN_FUNC("call to %s() with DF set",
+				insn->sec, insn->offset, insn_dest_name(insn));
+		return 1;
+	}
+
 	return 0;
 }
 
@@ -2069,6 +2075,11 @@ static int validate_branch(struct objtool_file *file, struct instruction *first,
 				return 1;
 			}
 
+			if (state.df) {
+				WARN_FUNC("return with DF set", sec, insn->offset);
+				return 1;
+			}
+
 			if (func && has_modified_stack_frame(&state)) {
 				WARN_FUNC("return with modified stack frame",
 					  sec, insn->offset);
@@ -2195,6 +2206,20 @@ static int validate_branch(struct objtool_file *file, struct instruction *first,
 			}
 
 			state.uaccess = false;
+			break;
+
+		case INSN_STD:
+			if (state.df)
+				WARN_FUNC("recursive STD", sec, insn->offset);
+
+			state.df = true;
+			break;
+
+		case INSN_CLD:
+			if (!state.df && insn->func)
+				WARN_FUNC("redundant CLD", sec, insn->offset);
+
+			state.df = false;
 			break;
 
 		default:
