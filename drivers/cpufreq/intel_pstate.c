@@ -3393,6 +3393,7 @@ static const struct x86_cpu_id intel_epp_default[] = {
 
 static const struct x86_cpu_id intel_hybrid_scaling_factor[] = {
 	X86_MATCH_INTEL_FAM6_MODEL(METEORLAKE_L, HYBRID_SCALING_FACTOR_MTL),
+	X86_MATCH_VFM(INTEL_ARROWLAKE, HYBRID_SCALING_FACTOR_MTL),
 	{}
 };
 
