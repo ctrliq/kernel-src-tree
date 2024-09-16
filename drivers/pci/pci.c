@@ -4448,12 +4448,6 @@ void pci_intx(struct pci_dev *pdev, int enable)
 {
 	u16 pci_command, new;
 
-	/* Preserve the "hybrid" behavior for backwards compatibility */
-	if (pci_is_managed(pdev)) {
-		WARN_ON_ONCE(pcim_intx(pdev, enable) != 0);
-		return;
-	}
-
 	pci_read_config_word(pdev, PCI_COMMAND, &pci_command);
 
 	if (enable)
@@ -4461,8 +4455,15 @@ void pci_intx(struct pci_dev *pdev, int enable)
 	else
 		new = pci_command | PCI_COMMAND_INTX_DISABLE;
 
-	if (new != pci_command)
+	if (new != pci_command) {
+		/* Preserve the "hybrid" behavior for backwards compatibility */
+		if (pci_is_managed(pdev)) {
+			WARN_ON_ONCE(pcim_intx(pdev, enable) != 0);
+			return;
+		}
+
 		pci_write_config_word(pdev, PCI_COMMAND, new);
+	}
 }
 EXPORT_SYMBOL_GPL(pci_intx);
 
