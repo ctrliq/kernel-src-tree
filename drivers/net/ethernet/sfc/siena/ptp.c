@@ -1779,7 +1779,7 @@ static int efx_ptp_ts_init(struct efx_nic *efx, struct hwtstamp_config *init)
 }
 
 void efx_siena_ptp_get_ts_info(struct efx_nic *efx,
-			       struct ethtool_ts_info *ts_info)
+			       struct kernel_ethtool_ts_info *ts_info)
 {
 	struct efx_ptp_data *ptp = efx->ptp_data;
 	struct efx_nic *primary = efx->primary;
