@@ -5779,6 +5779,7 @@ int security_lock_kernel_down(const char *where, enum lockdown_reason level)
 }
 EXPORT_SYMBOL(security_lock_kernel_down);
 
+/**
  * security_bdev_alloc() - Allocate a block device LSM blob
  * @bdev: block device
  *
