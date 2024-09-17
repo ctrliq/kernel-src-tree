@@ -3228,10 +3228,12 @@ static int nh_valid_get_del_req(const struct nlmsghdr *nlh,
 		return -EINVAL;
 	}
 
-	if (tb[NHA_OP_FLAGS])
-		*op_flags = nla_get_u32(tb[NHA_OP_FLAGS]);
-	else
-		*op_flags = 0;
+	if (op_flags) {
+		if (tb[NHA_OP_FLAGS])
+			*op_flags = nla_get_u32(tb[NHA_OP_FLAGS]);
+		else
+			*op_flags = 0;
+	}
 
 	return 0;
 }
@@ -3248,7 +3250,6 @@ static int rtm_del_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 		.portid = NETLINK_CB(skb).portid,
 	};
 	struct nexthop *nh;
-	u32 op_flags;
 	int err;
 	u32 id;
 
@@ -3257,7 +3258,7 @@ static int rtm_del_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (err < 0)
 		return err;
 
-	err = nh_valid_get_del_req(nlh, tb, &id, &op_flags, extack);
+	err = nh_valid_get_del_req(nlh, tb, &id, NULL, extack);
 	if (err)
 		return err;
 
@@ -3729,7 +3730,6 @@ static int nh_valid_get_bucket_req(const struct nlmsghdr *nlh,
 				   struct netlink_ext_ack *extack)
 {
 	struct nlattr *tb[NHA_MAX + 1];
-	u32 op_flags;
 	int err;
 
 	err = nlmsg_parse(nlh, sizeof(struct nhmsg), tb, NHA_MAX,
@@ -3737,7 +3737,7 @@ static int nh_valid_get_bucket_req(const struct nlmsghdr *nlh,
 	if (err < 0)
 		return err;
 
-	err = nh_valid_get_del_req(nlh, tb, id, &op_flags, extack);
+	err = nh_valid_get_del_req(nlh, tb, id, NULL, extack);
 	if (err)
 		return err;
 
