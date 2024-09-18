@@ -25,7 +25,7 @@
 #include <linux/suspend.h>
 #include <linux/delay.h>
 
-#include "internal.h"
+#include "../internal.h"
 
 #ifdef CONFIG_X86_INTEL_LPSS
 
@@ -167,13 +167,9 @@ static struct pwm_lookup byt_pwm_lookup[] = {
 
 static void byt_pwm_setup(struct lpss_private_data *pdata)
 {
-	u64 uid;
-
 	/* Only call pwm_add_table for the first PWM controller */
-	if (acpi_dev_uid_to_integer(pdata->adev, &uid) || uid != 1)
-		return;
-
-	pwm_add_table(byt_pwm_lookup, ARRAY_SIZE(byt_pwm_lookup));
+	if (acpi_dev_uid_match(pdata->adev, 1))
+		pwm_add_table(byt_pwm_lookup, ARRAY_SIZE(byt_pwm_lookup));
 }
 
 #define LPSS_I2C_ENABLE			0x6c
@@ -218,13 +214,9 @@ static struct pwm_lookup bsw_pwm_lookup[] = {
 
 static void bsw_pwm_setup(struct lpss_private_data *pdata)
 {
-	u64 uid;
-
 	/* Only call pwm_add_table for the first PWM controller */
-	if (acpi_dev_uid_to_integer(pdata->adev, &uid) || uid != 1)
-		return;
-
-	pwm_add_table(bsw_pwm_lookup, ARRAY_SIZE(bsw_pwm_lookup));
+	if (acpi_dev_uid_match(pdata->adev, 1))
+		pwm_add_table(bsw_pwm_lookup, ARRAY_SIZE(bsw_pwm_lookup));
 }
 
 static const struct property_entry lpt_spi_properties[] = {
@@ -333,6 +325,7 @@ static const struct lpss_device_desc bsw_i2c_dev_desc = {
 
 static const struct property_entry bsw_spi_properties[] = {
 	PROPERTY_ENTRY_U32("intel,spi-pxa2xx-type", LPSS_BSW_SSP),
+	PROPERTY_ENTRY_U32("num-cs", 2),
 	{ }
 };
 
@@ -461,8 +454,9 @@ static int register_device_clock(struct acpi_device *adev,
 		if (!clk_name)
 			return -ENOMEM;
 		clk = clk_register_fractional_divider(NULL, clk_name, parent,
+						      0, prv_base, 1, 15, 16, 15,
 						      CLK_FRAC_DIVIDER_POWER_OF_TWO_PS,
-						      prv_base, 1, 15, 16, 15, 0, NULL);
+						      NULL);
 		parent = clk_name;
 
 		clk_name = kasprintf(GFP_KERNEL, "%s-update", devname);
@@ -570,31 +564,6 @@ static struct device *acpi_lpss_find_device(const char *hid, const char *uid)
 	return bus_find_device(&pci_bus_type, NULL, &data, match_hid_uid);
 }
 
-static bool acpi_lpss_dep(struct acpi_device *adev, acpi_handle handle)
-{
-	struct acpi_handle_list dep_devices;
-	bool ret = false;
-	int i;
-
-	if (!acpi_has_method(adev->handle, "_DEP"))
-		return false;
-
-	if (!acpi_evaluate_reference(adev->handle, "_DEP", NULL, &dep_devices)) {
-		dev_dbg(&adev->dev, "Failed to evaluate _DEP.\n");
-		return false;
-	}
-
-	for (i = 0; i < dep_devices.count; i++) {
-		if (dep_devices.handles[i] == handle) {
-			ret = true;
-			break;
-		}
-	}
-
-	acpi_handle_list_free(&dep_devices);
-	return ret;
-}
-
 static void acpi_lpss_link_consumer(struct device *dev1,
 				    const struct lpss_device_links *link)
 {
@@ -605,7 +574,7 @@ static void acpi_lpss_link_consumer(struct device *dev1,
 		return;
 
 	if ((link->dep_missing_ids && dmi_check_system(link->dep_missing_ids))
-	    || acpi_lpss_dep(ACPI_COMPANION(dev2), ACPI_HANDLE(dev1)))
+	    || acpi_device_dep(ACPI_HANDLE(dev2), ACPI_HANDLE(dev1)))
 		device_link_add(dev2, dev1, link->flags);
 
 	put_device(dev2);
@@ -621,7 +590,7 @@ static void acpi_lpss_link_supplier(struct device *dev1,
 		return;
 
 	if ((link->dep_missing_ids && dmi_check_system(link->dep_missing_ids))
-	    || acpi_lpss_dep(ACPI_COMPANION(dev1), ACPI_HANDLE(dev2)))
+	    || acpi_device_dep(ACPI_HANDLE(dev1), ACPI_HANDLE(dev2)))
 		device_link_add(dev1, dev2, link->flags);
 
 	put_device(dev2);
@@ -918,10 +887,8 @@ static int acpi_lpss_activate(struct device *dev)
 	if (pdata->dev_desc->flags & (LPSS_SAVE_CTX | LPSS_SAVE_CTX_ONCE))
 		lpss_deassert_reset(pdata);
 
-#ifdef CONFIG_PM
 	if (pdata->dev_desc->flags & LPSS_SAVE_CTX_ONCE)
 		acpi_lpss_save_ctx(dev, pdata);
-#endif
 
 	return 0;
 }
