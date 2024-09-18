@@ -5189,7 +5189,7 @@ static bool nft_setelem_valid_key_end(const struct nft_set *set,
         if (flags & NFT_SET_ELEM_INTERVAL_END)
             return false;
     } else {
-        if (!nla[NFTA_SET_ELEM_KEY_END])
+        if (nla[NFTA_SET_ELEM_KEY_END])
             return false;
     }
 
