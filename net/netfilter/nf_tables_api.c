@@ -8845,7 +8845,8 @@ static void __net_exit nf_tables_pre_exit_net(struct net *net)
 static void __net_exit nf_tables_exit_net(struct net *net)
 {
 	mutex_lock(&net->nft_commit_mutex);
-	if (!list_empty(&net->nft.commit_list))
+	if (!list_empty(&net->nft.commit_list) ||
+	    !list_empty(&net->nft_module_list))
 		__nf_tables_abort(net, NFNL_ABORT_NONE);
 	__nft_release_tables(net);
 	mutex_unlock(&net->nft_commit_mutex);
