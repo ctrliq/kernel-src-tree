@@ -127,7 +127,7 @@ static int essiv_aead_setkey(struct crypto_aead *tfm, const u8 *key,
 	      crypto_shash_update(desc, keys.enckey, keys.enckeylen) ?:
 	      crypto_shash_finup(desc, keys.authkey, keys.authkeylen, salt);
 	if (err)
-		return err;
+		goto out;
 
 	crypto_cipher_clear_flags(tctx->essiv_cipher, CRYPTO_TFM_REQ_MASK);
 	crypto_cipher_set_flags(tctx->essiv_cipher, crypto_aead_get_flags(tfm) &
@@ -137,6 +137,8 @@ static int essiv_aead_setkey(struct crypto_aead *tfm, const u8 *key,
 	crypto_aead_set_flags(tfm, crypto_cipher_get_flags(tctx->essiv_cipher) &
 				   CRYPTO_TFM_RES_MASK);
 
+out:
+	memzero_explicit(&keys, sizeof(keys));
 	return err;
 }
 
