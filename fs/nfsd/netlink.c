@@ -10,12 +10,32 @@
 
 #include <uapi/linux/nfsd_netlink.h>
 
+/* NFSD_CMD_THREADS_SET - do */
+static const struct nla_policy nfsd_threads_set_nl_policy[NFSD_A_SERVER_SCOPE + 1] = {
+	[NFSD_A_SERVER_THREADS] = { .type = NLA_U32, },
+	[NFSD_A_SERVER_GRACETIME] = { .type = NLA_U32, },
+	[NFSD_A_SERVER_LEASETIME] = { .type = NLA_U32, },
+	[NFSD_A_SERVER_SCOPE] = { .type = NLA_NUL_STRING, },
+};
+
 /* Ops table for nfsd */
 static const struct genl_split_ops nfsd_nl_ops[] = {
 	{
 		.cmd	= NFSD_CMD_RPC_STATUS_GET,
 		.dumpit	= nfsd_nl_rpc_status_get_dumpit,
 		.flags	= GENL_CMD_CAP_DUMP,
+	},
+	{
+		.cmd		= NFSD_CMD_THREADS_SET,
+		.doit		= nfsd_nl_threads_set_doit,
+		.policy		= nfsd_threads_set_nl_policy,
+		.maxattr	= NFSD_A_SERVER_SCOPE,
+		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd	= NFSD_CMD_THREADS_GET,
+		.doit	= nfsd_nl_threads_get_doit,
+		.flags	= GENL_CMD_CAP_DO,
 	},
 };
 
