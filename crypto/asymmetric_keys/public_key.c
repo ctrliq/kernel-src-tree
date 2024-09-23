@@ -139,7 +139,7 @@ int public_key_verify_signature(const struct public_key *pkey,
 		ret = -EKEYREJECTED;
 
 out_free_output:
-	kfree(output);
+	kfree_sensitive(output);
 error_free_req:
 	akcipher_request_free(req);
 error_free_tfm:
