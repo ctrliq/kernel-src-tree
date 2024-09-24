@@ -2,6 +2,8 @@
 # Purpose: These are general dist-release tests.  They are run from a git
 # worktree created by the first test.
 
+DIST_RELEASE_REGEX="^\[redhat\] kernel-[0-9.]*"
+
 load test-lib.bash
 
 @test "dist-release setup worktree" {
@@ -36,7 +38,7 @@ _dist-release_test_2() {
 	# release number in Makefile.rhelver.
 	# and above in prologue.
 	cd $BATS_TMPDIR/distrelease
-	title="$(git log --oneline --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
+	title="$(git log --oneline --grep "${DIST_RELEASE_REGEX}" -n 1 --pretty="format:%s")"
 	# title = ... [redhat] kernel-5.11.0-0.rc0.20201220git467f8165a2b0.104
 	# Just the title message part AFTER "[redhat] ":
 	title=${title##*\[redhat\] }
@@ -66,7 +68,7 @@ _dist-release_test_3() {
 	changelog=$(head -1 ./redhat/kernel.changelog-${RHEL_MAJOR}.${RHEL_MINOR} | sed -e 's/.*\[\(.*\)\].*/\1/')
 
 	# Extract the tag in the latest [redhat] kernel commit message
-	commit="$(git log --oneline --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
+	commit="$(git log --oneline --grep "${DIST_RELEASE_REGEX}" -n 1 --pretty="format:%s")"
 	# Extract just the commit message part AFTER "[redhat] ":
 	gitlog=${commit##*\[redhat\] }
 	# This time, strip off "kernel-" also:
