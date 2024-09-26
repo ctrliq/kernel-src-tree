@@ -512,6 +512,7 @@ static int queue_folios_pte_range(pmd_t *pmd, unsigned long addr,
 	struct queue_pages *qp = walk->private;
 	unsigned long flags = qp->flags;
 	pte_t *pte, *mapped_pte;
+	pte_t ptent;
 	spinlock_t *ptl;
 
 	ptl = pmd_trans_huge_lock(pmd, vma);
@@ -524,9 +525,10 @@ static int queue_folios_pte_range(pmd_t *pmd, unsigned long addr,
 		return 0;
 	}
 	for (; addr != end; pte++, addr += PAGE_SIZE) {
-		if (!pte_present(*pte))
+		ptent = ptep_get(pte);
+		if (!pte_present(ptent))
 			continue;
-		folio = vm_normal_folio(vma, addr, *pte);
+		folio = vm_normal_folio(vma, addr, ptent);
 		if (!folio || folio_is_zone_device(folio))
 			continue;
 		/*
@@ -1213,24 +1215,22 @@ int do_migrate_pages(struct mm_struct *mm, const nodemask_t *from,
  * list of pages handed to migrate_pages()--which is how we get here--
  * is in virtual address order.
  */
-static struct page *new_page(struct page *page, unsigned long start)
+static struct folio *new_folio(struct folio *src, unsigned long start)
 {
-	struct folio *dst, *src = page_folio(page);
 	struct vm_area_struct *vma;
 	unsigned long address;
 	VMA_ITERATOR(vmi, current->mm, start);
 	gfp_t gfp = GFP_HIGHUSER_MOVABLE | __GFP_RETRY_MAYFAIL;
 
 	for_each_vma(vmi, vma) {
-		address = page_address_in_vma(page, vma);
+		address = page_address_in_vma(&src->page, vma);
 		if (address != -EFAULT)
 			break;
 	}
 
 	if (folio_test_hugetlb(src)) {
-		dst = alloc_hugetlb_folio_vma(folio_hstate(src),
+		return alloc_hugetlb_folio_vma(folio_hstate(src),
 				vma, address);
-		return &dst->page;
 	}
 
 	if (folio_test_large(src))
@@ -1239,9 +1239,8 @@ static struct page *new_page(struct page *page, unsigned long start)
 	/*
 	 * if !vma, vma_alloc_folio() will use task or system default policy
 	 */
-	dst = vma_alloc_folio(gfp, folio_order(src), vma, address,
+	return vma_alloc_folio(gfp, folio_order(src), vma, address,
 			folio_test_large(src));
-	return &dst->page;
 }
 #else
 
@@ -1257,7 +1256,7 @@ int do_migrate_pages(struct mm_struct *mm, const nodemask_t *from,
 	return -ENOSYS;
 }
 
-static struct page *new_page(struct page *page, unsigned long start)
+static struct folio *new_folio(struct folio *src, unsigned long start)
 {
 	return NULL;
 }
@@ -1356,7 +1355,7 @@ static long do_mbind(unsigned long start, unsigned long len,
 
 		if (!list_empty(&pagelist)) {
 			WARN_ON_ONCE(flags & MPOL_MF_LAZY);
-			nr_failed = migrate_pages(&pagelist, new_page, NULL,
+			nr_failed = migrate_pages(&pagelist, new_folio, NULL,
 				start, MIGRATE_SYNC, MR_MEMPOLICY_MBIND, NULL);
 			if (nr_failed)
 				putback_movable_pages(&pagelist);

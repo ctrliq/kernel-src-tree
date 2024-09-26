@@ -111,7 +111,7 @@ again:
 		swp_entry_t entry;
 		pte_t pte;
 
-		pte = *ptep;
+		pte = ptep_get(ptep);
 
 		if (pte_none(pte)) {
 			if (vma_is_anonymous(vma)) {
@@ -194,7 +194,7 @@ again:
 			bool anon_exclusive;
 			pte_t swp_pte;
 
-			flush_cache_page(vma, addr, pte_pfn(*ptep));
+			flush_cache_page(vma, addr, pte_pfn(pte));
 			anon_exclusive = PageAnon(page) && PageAnonExclusive(page);
 			if (anon_exclusive) {
 				pte = ptep_clear_flush(vma, addr, ptep);
@@ -376,7 +376,7 @@ static unsigned long migrate_device_unmap(unsigned long *src_pfns,
 		/* ZONE_DEVICE pages are not on LRU */
 		if (!is_zone_device_page(page)) {
 			if (!PageLRU(page) && allow_drain) {
-				/* Drain CPU's pagevec */
+				/* Drain CPU's lru cache */
 				lru_add_drain_all();
 				allow_drain = false;
 			}
@@ -572,6 +572,7 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 	pud_t *pudp;
 	pmd_t *pmdp;
 	pte_t *ptep;
+	pte_t orig_pte;
 
 	/* Only allow populating anonymous memory */
 	if (!vma_is_anonymous(vma))
@@ -627,16 +628,18 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
 	if (!ptep)
 		goto abort;
+	orig_pte = ptep_get(ptep);
+
 	if (check_stable_address_space(mm))
 		goto unlock_abort;
 
-	if (pte_present(*ptep)) {
-		unsigned long pfn = pte_pfn(*ptep);
+	if (pte_present(orig_pte)) {
+		unsigned long pfn = pte_pfn(orig_pte);
 
 		if (!is_zero_pfn(pfn))
 			goto unlock_abort;
 		flush = true;
-	} else if (!pte_none(*ptep))
+	} else if (!pte_none(orig_pte))
 		goto unlock_abort;
 
 	/*
@@ -653,7 +656,7 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 	get_page(page);
 
 	if (flush) {
-		flush_cache_page(vma, addr, pte_pfn(*ptep));
+		flush_cache_page(vma, addr, pte_pfn(orig_pte));
 		ptep_clear_flush(vma, addr, ptep);
 		set_pte_at_notify(mm, addr, ptep, entry);
 		update_mmu_cache(vma, addr, ptep);

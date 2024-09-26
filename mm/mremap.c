@@ -188,7 +188,7 @@ static int move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
 
 	for (; old_addr < old_end; old_pte++, old_addr += PAGE_SIZE,
 				   new_pte++, new_addr += PAGE_SIZE) {
-		if (pte_none(*old_pte))
+		if (pte_none(ptep_get(old_pte)))
 			continue;
 
 		pte = ptep_get_and_clear(mm, old_addr, old_pte);
@@ -913,7 +913,6 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	struct vm_area_struct *vma;
 	unsigned long ret = -EINVAL;
 	bool locked = false;
-	bool downgraded = false;
 	struct vm_userfaultfd_ctx uf = NULL_VM_UFFD_CTX;
 	LIST_HEAD(uf_unmap_early);
 	LIST_HEAD(uf_unmap);
@@ -926,7 +925,8 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	 * mapping address intact. A non-zero tag will cause the subsequent
 	 * range checks to reject the address as invalid.
 	 *
-	 * See Documentation/arm64/tagged-address-abi.rst for more information.
+	 * See Documentation/arch/arm64/tagged-address-abi.rst for more
+	 * information.
 	 */
 	addr = untagged_addr(addr);
 
@@ -998,24 +998,23 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	 * Always allow a shrinking remap: that just unmaps
 	 * the unnecessary pages..
 	 * do_vmi_munmap does all the needed commit accounting, and
-	 * downgrades mmap_lock to read if so directed.
+	 * unlocks the mmap_lock if so directed.
 	 */
 	if (old_len >= new_len) {
-		int retval;
 		VMA_ITERATOR(vmi, mm, addr + new_len);
 
-		retval = do_vmi_munmap(&vmi, mm, addr + new_len,
-				       old_len - new_len, &uf_unmap, true);
-		/* Returning 1 indicates mmap_lock is downgraded to read. */
-		if (retval == 1) {
-			downgraded = true;
-		} else if (retval < 0 && old_len != new_len) {
-			ret = retval;
+		if (old_len == new_len) {
+			ret = addr;
 			goto out;
 		}
 
+		ret = do_vmi_munmap(&vmi, mm, addr + new_len, old_len - new_len,
+				    &uf_unmap, true);
+		if (ret)
+			goto out;
+
 		ret = addr;
-		goto out;
+		goto out_unlocked;
 	}
 
 	/*
@@ -1100,12 +1099,10 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 out:
 	if (offset_in_page(ret))
 		locked = false;
-	if (downgraded)
-		mmap_read_unlock(current->mm);
-	else
-		mmap_write_unlock(current->mm);
+	mmap_write_unlock(current->mm);
 	if (locked && new_len > old_len)
 		mm_populate(new_addr + old_len, new_len - old_len);
+out_unlocked:
 	userfaultfd_unmap_complete(mm, &uf_unmap_early);
 	mremap_userfaultfd_complete(&uf, addr, ret, old_len);
 	userfaultfd_unmap_complete(mm, &uf_unmap);
