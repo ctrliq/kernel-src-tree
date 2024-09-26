@@ -290,6 +290,9 @@ static int gpr_set(struct task_struct *target, const struct user_regset *regset,
 static int ppr_get(struct task_struct *target, const struct user_regset *regset,
 		   struct membuf to)
 {
+	if (target->thread.regs == NULL)
+		return -ENODEV;
+
 	return membuf_write(&to, &target->thread.regs->ppr, sizeof(u64));
 }
 
@@ -304,6 +307,9 @@ static int ppr_set(struct task_struct *target, const struct user_regset *regset,
 static int dscr_get(struct task_struct *target, const struct user_regset *regset,
 		    struct membuf to)
 {
+	if (target->thread.regs == NULL)
+		return -ENODEV;
+
 	return membuf_write(&to, &target->thread.dscr, sizeof(u64));
 }
 static int dscr_set(struct task_struct *target, const struct user_regset *regset,
@@ -318,6 +324,9 @@ static int dscr_set(struct task_struct *target, const struct user_regset *regset
 static int tar_get(struct task_struct *target, const struct user_regset *regset,
 		   struct membuf to)
 {
+	if (target->thread.regs == NULL)
+		return -ENODEV;
+
 	return membuf_write(&to, &target->thread.tar, sizeof(u64));
 }
 static int tar_set(struct task_struct *target, const struct user_regset *regset,
@@ -331,6 +340,9 @@ static int tar_set(struct task_struct *target, const struct user_regset *regset,
 static int ebb_active(struct task_struct *target, const struct user_regset *regset)
 {
 	if (!cpu_has_feature(CPU_FTR_ARCH_207S))
+		return -ENODEV;
+
+	if (target->thread.regs == NULL)
 		return -ENODEV;
 
 	if (target->thread.used_ebb)
@@ -389,6 +401,9 @@ static int ebb_set(struct task_struct *target, const struct user_regset *regset,
 static int pmu_active(struct task_struct *target, const struct user_regset *regset)
 {
 	if (!cpu_has_feature(CPU_FTR_ARCH_207S))
+		return -ENODEV;
+
+	if (target->thread.regs == NULL)
 		return -ENODEV;
 
 	return regset->n;
@@ -454,6 +469,9 @@ static int pmu_set(struct task_struct *target, const struct user_regset *regset,
 static int pkey_active(struct task_struct *target, const struct user_regset *regset)
 {
 	if (!arch_pkeys_enabled())
+		return -ENODEV;
+
+	if (target->thread.regs == NULL)
 		return -ENODEV;
 
 	return regset->n;

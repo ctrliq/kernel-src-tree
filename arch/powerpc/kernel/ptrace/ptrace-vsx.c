@@ -24,6 +24,9 @@ int fpr_get(struct task_struct *target, const struct user_regset *regset,
 	u64 buf[33];
 	int i;
 
+	if (target->thread.regs == NULL)
+		return -ENODEV;
+
 	flush_fp_to_thread(target);
 
 	/* copy to local buffer then write that out */
@@ -78,6 +81,9 @@ int fpr_set(struct task_struct *target, const struct user_regset *regset,
 
 int vsr_active(struct task_struct *target, const struct user_regset *regset)
 {
+	if (target->thread.regs == NULL)
+		return -ENODEV;
+
 	flush_vsx_to_thread(target);
 	return target->thread.used_vsr ? regset->n : 0;
 }
