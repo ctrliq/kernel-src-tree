@@ -920,7 +920,7 @@ int zpci_deconfigure_device(struct zpci_dev *zdev)
 }
 
 /**
- * zpci_device_reserved() - Mark device as resverved
+ * zpci_device_reserved() - Mark device as reserved
  * @zdev: the zpci_dev that was reserved
  *
  * Handle the case that a given zPCI function was reserved by another system.
@@ -1126,7 +1126,7 @@ static int __init pci_base_init(void)
 
 	if (MACHINE_HAS_PCI_MIO) {
 		static_branch_enable(&have_mio);
-		ctl_set_bit(2, 5);
+		system_ctl_set_bit(2, CR2_MIO_ADDRESSING_BIT);
 	}
 
 	rc = zpci_debug_init();

@@ -103,7 +103,7 @@ static inline void _free_kb_keybuf(struct key_blob *kb)
 {
 	if (kb->key && kb->key != kb->keybuf
 	    && kb->keylen > sizeof(kb->keybuf)) {
-		kfree(kb->key);
+		kfree_sensitive(kb->key);
 		kb->key = NULL;
 	}
 }
@@ -125,17 +125,16 @@ struct s390_pxts_ctx {
 static inline int __paes_keyblob2pkey(struct key_blob *kb,
 				     struct pkey_protkey *pk)
 {
-	int i, ret;
+	int i, ret = -EIO;
 
-	/* try three times in case of failure */
-	for (i = 0; i < 3; i++) {
-		if (i > 0 && ret == -EAGAIN && in_task())
+	/* try three times in case of busy card */
+	for (i = 0; ret && i < 3; i++) {
+		if (ret == -EBUSY && in_task()) {
 			if (msleep_interruptible(1000))
 				return -EINTR;
+		}
 		ret = pkey_keyblob2pkey(kb->key, kb->keylen,
 					pk->protkey, &pk->len, &pk->type);
-		if (ret == 0)
-			break;
 	}
 
 	return ret;

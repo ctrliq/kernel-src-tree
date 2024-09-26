@@ -72,6 +72,7 @@ extern unsigned int zlib_dfltcc_support;
 #define ZLIB_DFLTCC_FULL_DEBUG		4
 
 extern unsigned long ident_map_size;
+extern unsigned long max_mappable;
 
 /* The Write Back bit position in the physaddr is given by the SLPC PCI */
 extern unsigned long mio_wb_bit_mask;
@@ -122,7 +123,6 @@ static inline void vmcp_cma_reserve(void) { }
 
 void report_user_fault(struct pt_regs *regs, long signr, int is_mm_fault);
 
-void cmma_init(void);
 void cmma_init_nodat(void);
 
 extern void (*_machine_restart)(char *command);
@@ -135,13 +135,13 @@ static inline unsigned long kaslr_offset(void)
 	return __kaslr_offset;
 }
 
-extern int is_full_image;
-
-struct initrd_data {
-	unsigned long start;
-	unsigned long size;
-};
-extern struct initrd_data initrd_data;
+extern int __kaslr_enabled;
+static inline int kaslr_enabled(void)
+{
+	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE))
+		return __kaslr_enabled;
+	return 0;
+}
 
 struct oldmem_data {
 	unsigned long start;
@@ -149,7 +149,7 @@ struct oldmem_data {
 };
 extern struct oldmem_data oldmem_data;
 
-static inline u32 gen_lpswe(unsigned long addr)
+static __always_inline u32 gen_lpswe(unsigned long addr)
 {
 	BUILD_BUG_ON(addr > 0xfff);
 	return 0xb2b20000 | addr;

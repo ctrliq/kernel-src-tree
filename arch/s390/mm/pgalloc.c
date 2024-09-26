@@ -33,19 +33,9 @@ static struct ctl_table page_table_sysctl[] = {
 	{ }
 };
 
-static struct ctl_table page_table_sysctl_dir[] = {
-	{
-		.procname	= "vm",
-		.maxlen		= 0,
-		.mode		= 0555,
-		.child		= page_table_sysctl,
-	},
-	{ }
-};
-
 static int __init page_table_register_sysctl(void)
 {
-	return register_sysctl_table(page_table_sysctl_dir) ? 0 : -ENOMEM;
+	return register_sysctl("vm", page_table_sysctl) ? 0 : -ENOMEM;
 }
 __initcall(page_table_register_sysctl);
 
@@ -72,8 +62,8 @@ static void __crst_table_upgrade(void *arg)
 
 	/* change all active ASCEs to avoid the creation of new TLBs */
 	if (current->active_mm == mm) {
-		S390_lowcore.user_asce = mm->context.asce;
-		__ctl_load(S390_lowcore.user_asce, 7, 7);
+		S390_lowcore.user_asce.val = mm->context.asce;
+		local_ctl_load(7, &S390_lowcore.user_asce);
 	}
 	__tlb_flush_local();
 }
@@ -143,13 +133,7 @@ err_p4d:
 
 static inline unsigned int atomic_xor_bits(atomic_t *v, unsigned int bits)
 {
-	unsigned int old, new;
-
-	do {
-		old = atomic_read(v);
-		new = old ^ bits;
-	} while (atomic_cmpxchg(v, old, new) != old);
-	return new;
+	return atomic_fetch_xor(bits, v) ^ bits;
 }
 
 #ifdef CONFIG_PGSTE

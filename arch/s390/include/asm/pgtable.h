@@ -18,6 +18,7 @@
 #include <linux/radix-tree.h>
 #include <linux/atomic.h>
 #include <asm/sections.h>
+#include <asm/ctlreg.h>
 #include <asm/bug.h>
 #include <asm/page.h>
 #include <asm/uv.h>
@@ -25,7 +26,7 @@
 extern pgd_t swapper_pg_dir[];
 extern pgd_t invalid_pg_dir[];
 extern void paging_init(void);
-extern unsigned long s390_invalid_asce;
+extern struct ctlreg s390_invalid_asce;
 
 enum {
 	PG_DIRECT_MAP_4K = 0,
@@ -34,7 +35,7 @@ enum {
 	PG_DIRECT_MAP_MAX
 };
 
-extern atomic_long_t direct_pages_count[PG_DIRECT_MAP_MAX];
+extern atomic_long_t __bootdata_preserved(direct_pages_count[PG_DIRECT_MAP_MAX]);
 
 static inline void update_page_count(int level, long count)
 {
@@ -88,8 +89,6 @@ extern unsigned long __bootdata_preserved(VMALLOC_END);
 #define VMALLOC_DEFAULT_SIZE	((512UL << 30) - MODULES_LEN)
 extern struct page *__bootdata_preserved(vmemmap);
 extern unsigned long __bootdata_preserved(vmemmap_size);
-
-#define VMEM_MAX_PHYS ((unsigned long) vmemmap)
 
 extern unsigned long __bootdata_preserved(MODULES_VADDR);
 extern unsigned long __bootdata_preserved(MODULES_END);
@@ -483,6 +482,12 @@ static inline int is_module_addr(void *addr)
 				   _REGION3_ENTRY_YOUNG |  \
 				   _REGION_ENTRY_PROTECT | \
 				   _REGION_ENTRY_NOEXEC)
+#define REGION3_KERNEL_EXEC __pgprot(_REGION_ENTRY_TYPE_R3 | \
+				 _REGION3_ENTRY_LARGE |	 \
+				 _REGION3_ENTRY_READ |	 \
+				 _REGION3_ENTRY_WRITE |	 \
+				 _REGION3_ENTRY_YOUNG |	 \
+				 _REGION3_ENTRY_DIRTY)
 
 static inline bool mm_p4d_folded(struct mm_struct *mm)
 {

@@ -10,7 +10,7 @@
 
 #include <linux/errno.h>
 #include <linux/memblock.h>
-#include <asm/ctl_reg.h>
+#include <asm/ctlreg.h>
 #include <asm/sclp.h>
 #include <asm/ipl.h>
 #include <asm/setup.h>
@@ -55,6 +55,7 @@ static void __init sclp_early_facilities_detect(void)
 		S390_lowcore.machine_flags |= MACHINE_FLAG_TLB_GUEST;
 	if (sccb->cpuoff > 134) {
 		sclp.has_diag318 = !!(sccb->byte_134 & 0x80);
+		sclp.has_diag320 = !!(sccb->byte_134 & 0x04);
 		sclp.has_iplcc = !!(sccb->byte_134 & 0x02);
 	}
 	if (sccb->cpuoff > 137) {
@@ -147,7 +148,7 @@ int __init sclp_early_get_core_info(struct sclp_core_info *info)
 	}
 	sclp_fill_core_info(info, sccb);
 out:
-	memblock_phys_free((unsigned long)sccb, length);
+	memblock_free(sccb, length);
 	return rc;
 }
 
