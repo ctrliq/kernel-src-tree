@@ -1037,6 +1037,9 @@ static inline bool gup_must_unshare(struct vm_area_struct *vma,
 	return !PageAnonExclusive(page);
 }
 
+extern bool mirrored_kernelcore;
+extern bool memblock_has_mirror(void);
+
 static inline bool vma_soft_dirty_enabled(struct vm_area_struct *vma)
 {
 	/*
@@ -1062,8 +1065,6 @@ static inline void vma_iter_config(struct vma_iterator *vmi,
 		   (vmi->mas.index > index || vmi->mas.last < index));
 	__mas_set_range(&vmi->mas, index, last - 1);
 }
-
-extern bool mirrored_kernelcore;
 
 /*
  * VMA Iterator functions shared between nommu and mmap
