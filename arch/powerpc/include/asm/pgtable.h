@@ -139,6 +139,9 @@ static inline pgtable_t pmd_pgtable(pmd_t pmd)
 }
 
 #ifdef CONFIG_PPC64
+int __meminit vmemmap_populated(unsigned long vmemmap_addr, int vmemmap_map_size);
+bool altmap_cross_boundary(struct vmem_altmap *altmap, unsigned long start,
+			   unsigned long page_size);
 /*
  * mm/memory_hotplug.c:mhp_supports_memmap_on_memory goes into details
  * some of the restrictions. We don't check for PMD_SIZE because our
