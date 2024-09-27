@@ -450,8 +450,8 @@ struct page *cma_alloc(struct cma *cma, unsigned long count,
 	pr_info_once("Initial CMA usage detected\n");
 #endif /* CONFIG_RHEL_DIFFERENCES */
 
-	pr_debug("%s(cma %p, count %lu, align %d)\n", __func__, (void *)cma,
-		 count, align);
+	pr_debug("%s(cma %p, name: %s, count %lu, align %d)\n", __func__,
+		(void *)cma, cma->name, count, align);
 
 	if (!count)
 		goto out;
