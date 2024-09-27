@@ -39,6 +39,7 @@ struct misc_res {
 	atomic64_t watermark;
 	atomic64_t usage;
 	atomic64_t events;
+	atomic64_t events_local;
 };
 
 /**
@@ -52,6 +53,8 @@ struct misc_cg {
 
 	/* misc.events */
 	struct cgroup_file events_file;
+	/* misc.events.local */
+	struct cgroup_file events_local_file;
 
 	struct misc_res res[MISC_CG_RES_TYPES];
 };
