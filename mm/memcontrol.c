@@ -5491,7 +5491,7 @@ static void percpu_stats_free_rwork_fn(struct work_struct *work)
 
 	cgroup_rstat_flush_hold(memcg->css.cgroup);
 	WRITE_ONCE(memcg->percpu_stats_disabled, PERCPU_STATS_FLUSHED);
-	cgroup_rstat_flush_release();
+	cgroup_rstat_flush_release(memcg->css.cgroup);
 
 	for_each_node(node) {
 		struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
