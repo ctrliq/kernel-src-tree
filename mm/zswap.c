@@ -1349,7 +1349,7 @@ static void zswap_fill_page(void *ptr, unsigned long value)
 
 bool zswap_store(struct folio *folio)
 {
-	swp_entry_t swp = folio_swap_entry(folio);
+	swp_entry_t swp = folio->swap;
 	int type = swp_type(swp);
 	pgoff_t offset = swp_offset(swp);
 	struct page *page = &folio->page;
@@ -1563,7 +1563,7 @@ shrink:
 
 bool zswap_load(struct folio *folio)
 {
-	swp_entry_t swp = folio_swap_entry(folio);
+	swp_entry_t swp = folio->swap;
 	int type = swp_type(swp);
 	pgoff_t offset = swp_offset(swp);
 	struct page *page = &folio->page;
