@@ -34,6 +34,7 @@ powerpc
     ultravisor
     vas-api
     vcpudispatch_stats
+    vmemmap_dedup
 
     features
 
