@@ -142,6 +142,9 @@ static bool zswap_exclusive_loads_enabled = IS_ENABLED(
 		CONFIG_ZSWAP_EXCLUSIVE_LOADS_DEFAULT_ON);
 module_param_named(exclusive_loads, zswap_exclusive_loads_enabled, bool, 0644);
 
+/* Number of zpools in zswap_pool (empirically determined for scalability) */
+#define ZSWAP_NR_ZPOOLS 32
+
 /*********************************
 * data structures
 **********************************/
@@ -161,7 +164,7 @@ struct crypto_acomp_ctx {
  * needs to be verified that it's still valid in the tree.
  */
 struct zswap_pool {
-	struct zpool *zpool;
+	struct zpool *zpools[ZSWAP_NR_ZPOOLS];
 	struct crypto_acomp_ctx __percpu *acomp_ctx;
 	struct kref kref;
 	struct list_head list;
@@ -248,7 +251,7 @@ static bool zswap_has_pool;
 
 #define zswap_pool_debug(msg, p)				\
 	pr_debug("%s pool %s/%s\n", msg, (p)->tfm_name,		\
-		 zpool_get_type((p)->zpool))
+		 zpool_get_type((p)->zpools[0]))
 
 static int zswap_writeback_entry(struct zswap_entry *entry,
 				 struct zswap_tree *tree);
@@ -272,11 +275,13 @@ static void zswap_update_total_size(void)
 {
 	struct zswap_pool *pool;
 	u64 total = 0;
+	int i;
 
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(pool, &zswap_pools, list)
-		total += zpool_get_total_size(pool->zpool);
+		for (i = 0; i < ZSWAP_NR_ZPOOLS; i++)
+			total += zpool_get_total_size(pool->zpools[i]);
 
 	rcu_read_unlock();
 
@@ -451,6 +456,16 @@ static bool zswap_rb_erase(struct rb_root *root, struct zswap_entry *entry)
 	return false;
 }
 
+static struct zpool *zswap_find_zpool(struct zswap_entry *entry)
+{
+	int i = 0;
+
+	if (ZSWAP_NR_ZPOOLS > 1)
+		i = hash_ptr(entry, ilog2(ZSWAP_NR_ZPOOLS));
+
+	return entry->pool->zpools[i];
+}
+
 /*
  * Carries out the common pattern of freeing and entry's zpool allocation,
  * freeing the entry itself, and decrementing the number of stored pages.
@@ -461,7 +476,7 @@ static void zswap_free_entry(struct zswap_entry *entry)
 		atomic_dec(&zswap_same_filled_pages);
 	else {
 		zswap_lru_del(&entry->pool->list_lru, entry);
-		zpool_free(entry->pool->zpool, entry->handle);
+		zpool_free(zswap_find_zpool(entry), entry->handle);
 		zswap_pool_put(entry->pool);
 	}
 	if (entry->objcg) {
@@ -674,7 +689,8 @@ static struct zswap_pool *zswap_pool_find_get(char *type, char *compressor)
 	list_for_each_entry_rcu(pool, &zswap_pools, list) {
 		if (strcmp(pool->tfm_name, compressor))
 			continue;
-		if (strcmp(zpool_get_type(pool->zpool), type))
+		/* all zpools share the same type */
+		if (strcmp(zpool_get_type(pool->zpools[0]), type))
 			continue;
 		/* if we can't get it, it's about to be destroyed */
 		if (!zswap_pool_get(pool))
@@ -848,6 +864,7 @@ resched:
 
 static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
 {
+	int i;
 	struct zswap_pool *pool;
 	char name[38]; /* 'zswap' + 32 char (max) num + \0 */
 	gfp_t gfp = __GFP_NORETRY | __GFP_NOWARN | __GFP_KSWAPD_RECLAIM;
@@ -868,15 +885,18 @@ static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
 	if (!pool)
 		return NULL;
 
-	/* unique name for each pool specifically required by zsmalloc */
-	snprintf(name, 38, "zswap%x", atomic_inc_return(&zswap_pools_count));
+	for (i = 0; i < ZSWAP_NR_ZPOOLS; i++) {
+		/* unique name for each pool specifically required by zsmalloc */
+		snprintf(name, 38, "zswap%x",
+			 atomic_inc_return(&zswap_pools_count));
 
-	pool->zpool = zpool_create_pool(type, name, gfp);
-	if (!pool->zpool) {
-		pr_err("%s zpool not available\n", type);
-		goto error;
+		pool->zpools[i] = zpool_create_pool(type, name, gfp);
+		if (!pool->zpools[i]) {
+			pr_err("%s zpool not available\n", type);
+			goto error;
+		}
 	}
-	pr_debug("using %s zpool\n", zpool_get_type(pool->zpool));
+	pr_debug("using %s zpool\n", zpool_get_type(pool->zpools[0]));
 
 	strscpy(pool->tfm_name, compressor, sizeof(pool->tfm_name));
 
@@ -907,8 +927,8 @@ static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
 error:
 	if (pool->acomp_ctx)
 		free_percpu(pool->acomp_ctx);
-	if (pool->zpool)
-		zpool_destroy_pool(pool->zpool);
+	while (i--)
+		zpool_destroy_pool(pool->zpools[i]);
 	kfree(pool);
 	return NULL;
 }
@@ -957,6 +977,8 @@ static struct zswap_pool *__zswap_pool_create_fallback(void)
 
 static void zswap_pool_destroy(struct zswap_pool *pool)
 {
+	int i;
+
 	zswap_pool_debug("destroying", pool);
 
 	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
@@ -968,7 +990,8 @@ static void zswap_pool_destroy(struct zswap_pool *pool)
 	pool->next_shrink = NULL;
 	spin_unlock(&zswap_pools_lock);
 
-	zpool_destroy_pool(pool->zpool);
+	for (i = 0; i < ZSWAP_NR_ZPOOLS; i++)
+		zpool_destroy_pool(pool->zpools[i]);
 	kfree(pool);
 }
 
@@ -1195,7 +1218,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 	struct page *page;
 	struct scatterlist input, output;
 	struct crypto_acomp_ctx *acomp_ctx;
-	struct zpool *pool = entry->pool->zpool;
+	struct zpool *pool = zswap_find_zpool(entry);
 	bool page_was_allocated;
 	u8 *src, *tmp = NULL;
 	unsigned int dlen;
@@ -1336,6 +1359,7 @@ bool zswap_store(struct folio *folio)
 	struct obj_cgroup *objcg = NULL;
 	struct mem_cgroup *memcg = NULL;
 	struct zswap_pool *pool;
+	struct zpool *zpool;
 	unsigned int dlen = PAGE_SIZE;
 	unsigned long handle, value;
 	char *buf;
@@ -1461,10 +1485,11 @@ bool zswap_store(struct folio *folio)
 		goto put_dstmem;
 
 	/* store */
+	zpool = zswap_find_zpool(entry);
 	gfp = __GFP_NORETRY | __GFP_NOWARN | __GFP_KSWAPD_RECLAIM;
-	if (zpool_malloc_support_movable(entry->pool->zpool))
+	if (zpool_malloc_support_movable(zpool))
 		gfp |= __GFP_HIGHMEM | __GFP_MOVABLE;
-	ret = zpool_malloc(entry->pool->zpool, dlen, gfp, &handle);
+	ret = zpool_malloc(zpool, dlen, gfp, &handle);
 	if (ret == -ENOSPC) {
 		zswap_reject_compress_poor++;
 		goto put_dstmem;
@@ -1473,9 +1498,9 @@ bool zswap_store(struct folio *folio)
 		zswap_reject_alloc_fail++;
 		goto put_dstmem;
 	}
-	buf = zpool_map_handle(entry->pool->zpool, handle, ZPOOL_MM_WO);
+	buf = zpool_map_handle(zpool, handle, ZPOOL_MM_WO);
 	memcpy(buf, dst, dlen);
-	zpool_unmap_handle(entry->pool->zpool, handle);
+	zpool_unmap_handle(zpool, handle);
 	mutex_unlock(acomp_ctx->mutex);
 
 	/* populate entry */
@@ -1546,6 +1571,7 @@ bool zswap_load(struct folio *folio)
 	struct scatterlist input, output;
 	struct crypto_acomp_ctx *acomp_ctx;
 	u8 *src, *dst, *tmp;
+	struct zpool *zpool;
 	unsigned int dlen;
 	bool ret;
 
@@ -1568,7 +1594,8 @@ bool zswap_load(struct folio *folio)
 		goto stats;
 	}
 
-	if (!zpool_can_sleep_mapped(entry->pool->zpool)) {
+	zpool = zswap_find_zpool(entry);
+	if (!zpool_can_sleep_mapped(zpool)) {
 		tmp = kmalloc(entry->length, GFP_KERNEL);
 		if (!tmp) {
 			ret = false;
@@ -1578,12 +1605,12 @@ bool zswap_load(struct folio *folio)
 
 	/* decompress */
 	dlen = PAGE_SIZE;
-	src = zpool_map_handle(entry->pool->zpool, entry->handle, ZPOOL_MM_RO);
+	src = zpool_map_handle(zpool, entry->handle, ZPOOL_MM_RO);
 
-	if (!zpool_can_sleep_mapped(entry->pool->zpool)) {
+	if (!zpool_can_sleep_mapped(zpool)) {
 		memcpy(tmp, src, entry->length);
 		src = tmp;
-		zpool_unmap_handle(entry->pool->zpool, entry->handle);
+		zpool_unmap_handle(zpool, entry->handle);
 	}
 
 	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
@@ -1596,8 +1623,8 @@ bool zswap_load(struct folio *folio)
 		WARN_ON(1);
 	mutex_unlock(acomp_ctx->mutex);
 
-	if (zpool_can_sleep_mapped(entry->pool->zpool))
-		zpool_unmap_handle(entry->pool->zpool, entry->handle);
+	if (zpool_can_sleep_mapped(zpool))
+		zpool_unmap_handle(zpool, entry->handle);
 	else
 		kfree(tmp);
 
@@ -1747,7 +1774,7 @@ static int zswap_setup(void)
 	pool = __zswap_pool_create_fallback();
 	if (pool) {
 		pr_info("loaded using pool %s/%s\n", pool->tfm_name,
-			zpool_get_type(pool->zpool));
+			zpool_get_type(pool->zpools[0]));
 		list_add(&pool->list, &zswap_pools);
 		zswap_has_pool = true;
 	} else {
