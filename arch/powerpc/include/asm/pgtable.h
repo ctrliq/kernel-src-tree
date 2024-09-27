@@ -139,14 +139,6 @@ static inline pgtable_t pmd_pgtable(pmd_t pmd)
 }
 
 #ifdef CONFIG_PPC64
-#define is_ioremap_addr is_ioremap_addr
-static inline bool is_ioremap_addr(const void *x)
-{
-	unsigned long addr = (unsigned long)x;
-
-	return addr >= IOREMAP_BASE && addr < IOREMAP_END;
-}
-
 /*
  * mm/memory_hotplug.c:mhp_supports_memmap_on_memory goes into details
  * some of the restrictions. We don't check for PMD_SIZE because our
