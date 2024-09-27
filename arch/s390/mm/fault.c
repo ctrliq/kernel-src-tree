@@ -386,6 +386,8 @@ static void do_exception(struct pt_regs *regs, int access)
 	vma_end_read(vma);
 	if (!(fault & VM_FAULT_RETRY)) {
 		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
+		if (likely(!(fault & VM_FAULT_ERROR)))
+			fault = 0;
 		goto out;
 	}
 	count_vm_vma_lock_event(VMA_LOCK_RETRY);
