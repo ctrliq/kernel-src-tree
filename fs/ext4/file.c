@@ -688,8 +688,7 @@ ext4_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 }
 
 #ifdef CONFIG_FS_DAX
-static vm_fault_t ext4_dax_huge_fault(struct vm_fault *vmf,
-		enum page_entry_size pe_size)
+static vm_fault_t ext4_dax_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
 	int error = 0;
 	vm_fault_t result;
@@ -705,7 +704,7 @@ static vm_fault_t ext4_dax_huge_fault(struct vm_fault *vmf,
 	 * read-only.
 	 *
 	 * We check for VM_SHARED rather than vmf->cow_page since the latter is
-	 * unset for pe_size != PE_SIZE_PTE (i.e. only in do_cow_fault); for
+	 * unset for order != 0 (i.e. only in do_cow_fault); for
 	 * other sizes, dax_iomap_fault will handle splitting / fallback so that
 	 * we eventually come back with a COW page.
 	 */
@@ -729,7 +728,7 @@ retry:
 	} else {
 		filemap_invalidate_lock_shared(mapping);
 	}
-	result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_iomap_ops);
+	result = dax_iomap_fault(vmf, order, &pfn, &error, &ext4_iomap_ops);
 	if (write) {
 		ext4_journal_stop(handle);
 
@@ -738,7 +737,7 @@ retry:
 			goto retry;
 		/* Handling synchronous page fault? */
 		if (result & VM_FAULT_NEEDDSYNC)
-			result = dax_finish_sync_fault(vmf, pe_size, pfn);
+			result = dax_finish_sync_fault(vmf, order, pfn);
 		filemap_invalidate_unlock_shared(mapping);
 		sb_end_pagefault(sb);
 	} else {
@@ -750,7 +749,7 @@ retry:
 
 static vm_fault_t ext4_dax_fault(struct vm_fault *vmf)
 {
-	return ext4_dax_huge_fault(vmf, PE_SIZE_PTE);
+	return ext4_dax_huge_fault(vmf, 0);
 }
 
 static const struct vm_operations_struct ext4_dax_vm_ops = {
