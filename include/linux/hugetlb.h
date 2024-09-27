@@ -1028,6 +1028,11 @@ void hugetlb_register_node(struct node *node);
 void hugetlb_unregister_node(struct node *node);
 #endif
 
+/*
+ * Check if a given raw @page in a hugepage is HWPOISON.
+ */
+bool is_raw_hwpoison_page_in_hugepage(struct page *page);
+
 #else	/* CONFIG_HUGETLB_PAGE */
 struct hstate {};
 
