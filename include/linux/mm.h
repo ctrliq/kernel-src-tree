@@ -1205,8 +1205,6 @@ static inline void page_mapcount_reset(struct page *page)
 	atomic_set(&(page)->_mapcount, -1);
 }
 
-unsigned long nr_free_buffer_pages(void);
-
 /**
  * page_mapcount() - Number of times this precise page is mapped.
  * @page: The page.
@@ -1312,14 +1310,8 @@ void put_pages_list(struct list_head *pages);
 void split_page(struct page *page, unsigned int order);
 void folio_copy(struct folio *dst, struct folio *src);
 
-/*
- * Compound pages have a destructor function.  Provide a
- * prototype for that function and accessor functions.
- * These are _only_ valid on the head of a compound page.
- */
-typedef void compound_page_dtor(struct page *);
+unsigned long nr_free_buffer_pages(void);
 
-/* Keep the enum in sync with compound_page_dtors array in mm/page_alloc.c */
 enum compound_dtor_id {
 	NULL_COMPOUND_DTOR,
 	COMPOUND_PAGE_DTOR,
@@ -1371,8 +1363,6 @@ static inline unsigned long thp_size(struct page *page)
 {
 	return PAGE_SIZE << thp_order(page);
 }
-
-void free_compound_page(struct page *page);
 
 #ifdef CONFIG_MMU
 /*
