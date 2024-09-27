@@ -1349,7 +1349,7 @@ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm, unsigned long 
 {
 	pmd_t pmd = native_pmdp_get_and_clear(pmdp);
 
-	page_table_check_pmd_clear(mm, addr, pmd);
+	page_table_check_pmd_clear(mm, pmd);
 
 	return pmd;
 }
