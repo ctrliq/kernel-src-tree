@@ -794,6 +794,7 @@ int thermal_bind_cdev_to_trip(struct thermal_zone_device *tz,
 	int result;
 
 	lockdep_assert_held(&thermal_list_lock);
+	lockdep_assert_held(&tz->lock);
 
 	if (list_empty(&tz->node) || list_empty(&cdev->node))
 		return -EINVAL;
@@ -856,7 +857,6 @@ int thermal_bind_cdev_to_trip(struct thermal_zone_device *tz,
 	if (result)
 		goto remove_trip_file;
 
-	mutex_lock(&tz->lock);
 	mutex_lock(&cdev->lock);
 	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
 		if (pos->trip == trip && pos->cdev == cdev) {
@@ -871,7 +871,6 @@ int thermal_bind_cdev_to_trip(struct thermal_zone_device *tz,
 		thermal_governor_update_tz(tz, THERMAL_TZ_BIND_CDEV);
 	}
 	mutex_unlock(&cdev->lock);
-	mutex_unlock(&tz->lock);
 
 	if (!result)
 		return 0;
@@ -895,11 +894,19 @@ int thermal_zone_bind_cooling_device(struct thermal_zone_device *tz,
 				     unsigned long upper, unsigned long lower,
 				     unsigned int weight)
 {
+	int ret;
+
 	if (trip_index < 0 || trip_index >= tz->num_trips)
 		return -EINVAL;
 
-	return thermal_bind_cdev_to_trip(tz, &tz->trips[trip_index].trip, cdev,
-					 upper, lower, weight);
+	mutex_lock(&tz->lock);
+
+	ret = thermal_bind_cdev_to_trip(tz, &tz->trips[trip_index].trip, cdev,
+					upper, lower, weight);
+
+	mutex_unlock(&tz->lock);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(thermal_zone_bind_cooling_device);
 
@@ -921,7 +928,8 @@ int thermal_unbind_cdev_from_trip(struct thermal_zone_device *tz,
 {
 	struct thermal_instance *pos, *next;
 
-	mutex_lock(&tz->lock);
+	lockdep_assert_held(&tz->lock);
+
 	mutex_lock(&cdev->lock);
 	list_for_each_entry_safe(pos, next, &tz->thermal_instances, tz_node) {
 		if (pos->trip == trip && pos->cdev == cdev) {
@@ -931,12 +939,10 @@ int thermal_unbind_cdev_from_trip(struct thermal_zone_device *tz,
 			thermal_governor_update_tz(tz, THERMAL_TZ_UNBIND_CDEV);
 
 			mutex_unlock(&cdev->lock);
-			mutex_unlock(&tz->lock);
 			goto unbind;
 		}
 	}
 	mutex_unlock(&cdev->lock);
-	mutex_unlock(&tz->lock);
 
 	return -ENODEV;
 
@@ -954,10 +960,18 @@ int thermal_zone_unbind_cooling_device(struct thermal_zone_device *tz,
 				       int trip_index,
 				       struct thermal_cooling_device *cdev)
 {
+	int ret;
+
 	if (trip_index < 0 || trip_index >= tz->num_trips)
 		return -EINVAL;
 
-	return thermal_unbind_cdev_from_trip(tz, &tz->trips[trip_index].trip, cdev);
+	mutex_lock(&tz->lock);
+
+	ret = thermal_unbind_cdev_from_trip(tz, &tz->trips[trip_index].trip, cdev);
+
+	mutex_unlock(&tz->lock);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(thermal_zone_unbind_cooling_device);
 
