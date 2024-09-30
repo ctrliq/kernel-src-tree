@@ -952,8 +952,8 @@ void print_bind_err_msg(struct thermal_zone_device *tz,
 		cdev->type, thermal_zone_trip_id(tz, trip), ret);
 }
 
-static void thermal_zone_cdev_binding(struct thermal_zone_device *tz,
-				      struct thermal_cooling_device *cdev)
+static void thermal_zone_cdev_bind(struct thermal_zone_device *tz,
+				   struct thermal_cooling_device *cdev)
 {
 	struct thermal_trip_desc *td;
 
@@ -1078,7 +1078,7 @@ __thermal_cooling_device_register(struct device_node *np,
 
 	/* Update binding information for 'this' new cdev */
 	list_for_each_entry(pos, &thermal_tz_list, node)
-		thermal_zone_cdev_binding(pos, cdev);
+		thermal_zone_cdev_bind(pos, cdev);
 
 	list_for_each_entry(pos, &thermal_tz_list, node)
 		if (atomic_cmpxchg(&pos->need_update, 1, 0))
@@ -1279,8 +1279,8 @@ unlock_list:
 }
 EXPORT_SYMBOL_GPL(thermal_cooling_device_update);
 
-static void thermal_zone_cdev_unbinding(struct thermal_zone_device *tz,
-					struct thermal_cooling_device *cdev)
+static void thermal_zone_cdev_unbind(struct thermal_zone_device *tz,
+				     struct thermal_cooling_device *cdev)
 {
 	struct thermal_trip_desc *td;
 
@@ -1319,7 +1319,7 @@ void thermal_cooling_device_unregister(struct thermal_cooling_device *cdev)
 
 	/* Unbind all thermal zones associated with 'this' cdev */
 	list_for_each_entry(tz, &thermal_tz_list, node)
-		thermal_zone_cdev_unbinding(tz, cdev);
+		thermal_zone_cdev_unbind(tz, cdev);
 
 	mutex_unlock(&thermal_list_lock);
 
@@ -1532,7 +1532,7 @@ thermal_zone_device_register_with_trips(const char *type,
 
 	/* Bind cooling devices for this zone */
 	list_for_each_entry(cdev, &thermal_cdev_list, node)
-		thermal_zone_cdev_binding(tz, cdev);
+		thermal_zone_cdev_bind(tz, cdev);
 
 	mutex_unlock(&thermal_list_lock);
 
@@ -1626,7 +1626,7 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 
 	/* Unbind all cdevs associated with 'this' thermal zone */
 	list_for_each_entry(cdev, &thermal_cdev_list, node)
-		thermal_zone_cdev_unbinding(tz, cdev);
+		thermal_zone_cdev_unbind(tz, cdev);
 
 	mutex_unlock(&thermal_list_lock);
 
