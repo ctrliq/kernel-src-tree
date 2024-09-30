@@ -9,7 +9,6 @@
 #include <linux/sched/mm.h>
 #include <linux/errno.h>
 #include <linux/freezer.h>
-#include <linux/kthread.h>
 #include <linux/slab.h>
 #include <net/sock.h>
 #include <linux/sunrpc/addr.h>
@@ -674,7 +673,7 @@ static bool svc_alloc_arg(struct svc_rqst *rqstp)
 			continue;
 
 		set_current_state(TASK_INTERRUPTIBLE);
-		if (kthread_should_stop()) {
+		if (svc_thread_should_stop(rqstp)) {
 			set_current_state(TASK_RUNNING);
 			return false;
 		}
@@ -712,7 +711,7 @@ rqst_should_sleep(struct svc_rqst *rqstp)
 		return false;
 
 	/* are we shutting down? */
-	if (kthread_should_stop())
+	if (svc_thread_should_stop(rqstp))
 		return false;
 
 	/* are we freezing? */
@@ -857,7 +856,7 @@ void svc_recv(struct svc_rqst *rqstp)
 
 	clear_bit(SP_TASK_PENDING, &pool->sp_flags);
 
-	if (kthread_should_stop())
+	if (svc_thread_should_stop(rqstp))
 		return;
 
 	rqstp->rq_xprt = svc_xprt_dequeue(pool);
