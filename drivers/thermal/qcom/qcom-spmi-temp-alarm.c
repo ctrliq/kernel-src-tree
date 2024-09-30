@@ -448,7 +448,7 @@ static int qpnp_tm_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(&pdev->dev, ret, "init failed\n");
 
-	if (devm_thermal_add_hwmon_sysfs(chip->tz_dev))
+	if (devm_thermal_add_hwmon_sysfs(&pdev->dev, chip->tz_dev))
 		dev_warn(&pdev->dev,
 			 "Failed to add hwmon sysfs attributes\n");
 
