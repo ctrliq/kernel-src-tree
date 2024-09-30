@@ -698,7 +698,7 @@ static bool svc_alloc_arg(struct svc_rqst *rqstp)
 }
 
 static bool
-rqst_should_sleep(struct svc_rqst *rqstp)
+svc_thread_should_sleep(struct svc_rqst *rqstp)
 {
 	struct svc_pool		*pool = rqstp->rq_pool;
 
@@ -724,15 +724,15 @@ rqst_should_sleep(struct svc_rqst *rqstp)
 	return true;
 }
 
-static void svc_rqst_wait_for_work(struct svc_rqst *rqstp)
+static void svc_thread_wait_for_work(struct svc_rqst *rqstp)
 {
 	struct svc_pool *pool = rqstp->rq_pool;
 
-	if (rqst_should_sleep(rqstp)) {
+	if (svc_thread_should_sleep(rqstp)) {
 		set_current_state(TASK_IDLE | TASK_FREEZABLE);
 		llist_add(&rqstp->rq_idle, &pool->sp_idle_threads);
 
-		if (unlikely(!rqst_should_sleep(rqstp)))
+		if (unlikely(!svc_thread_should_sleep(rqstp)))
 			/* Work just became available.  This thread cannot simply
 			 * choose not to sleep as it *must* wait until removed.
 			 * So wake the first waiter - whether it is this
@@ -849,7 +849,7 @@ void svc_recv(struct svc_rqst *rqstp)
 	if (!svc_alloc_arg(rqstp))
 		return;
 
-	svc_rqst_wait_for_work(rqstp);
+	svc_thread_wait_for_work(rqstp);
 
 	clear_bit(SP_TASK_PENDING, &pool->sp_flags);
 
