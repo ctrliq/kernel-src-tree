@@ -536,7 +536,7 @@ struct mddev {
 	int				sync_checkers;	/* # of threads checking writes_pending */
 	struct request_queue		*queue;	/* for plugging ... */
 
-	struct bitmap			*bitmap; /* the bitmap for the device */
+	void				*bitmap; /* the bitmap for the device */
 	struct bitmap_operations	*bitmap_ops;
 	struct {
 		struct file		*file; /* the bitmap file */
