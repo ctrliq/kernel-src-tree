@@ -2028,7 +2028,7 @@ int phy_suspend(struct phy_device *phydev)
 	const struct phy_driver *phydrv = phydev->drv;
 	int ret;
 
-	if (phydev->suspended)
+	if (phydev->suspended || !phydrv)
 		return 0;
 
 	phy_ethtool_get_wol(phydev, &wol);
@@ -2038,7 +2038,7 @@ int phy_suspend(struct phy_device *phydev)
 	if (phydev->wol_enabled && !(phydrv->flags & PHY_ALWAYS_CALL_SUSPEND))
 		return -EBUSY;
 
-	if (!phydrv || !phydrv->suspend)
+	if (!phydrv->suspend)
 		return 0;
 
 	ret = phydrv->suspend(phydev);
