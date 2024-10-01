@@ -6457,7 +6457,7 @@ static inline sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_n
 						    &sync_blocks);
 		else /* completed sync */
 			conf->fullsync = 0;
-		md_bitmap_close_sync(mddev->bitmap);
+		mddev->bitmap_ops->close_sync(mddev);
 
 		return 0;
 	}
