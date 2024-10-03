@@ -1,0 +1,75 @@
+USB: core: Make do_proc_control() and do_proc_bulk() killable
+
+jira LE-1907
+cve CVE-2021-47582
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Alan Stern <stern@rowland.harvard.edu>
+commit ae8709b296d80c7f45aa1f35c0e7659ad69edce1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/ae8709b2.failed
+
+The USBDEVFS_CONTROL and USBDEVFS_BULK ioctls invoke
+usb_start_wait_urb(), which contains an uninterruptible wait with a
+user-specified timeout value.  If timeout value is very large and the
+device being accessed does not respond in a reasonable amount of time,
+the kernel will complain about "Task X blocked for more than N
+seconds", as found in testing by syzbot:
+
+INFO: task syz-executor.0:8700 blocked for more than 143 seconds.
+      Not tainted 5.14.0-rc7-syzkaller #0
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+task:syz-executor.0  state:D stack:23192 pid: 8700 ppid:  8455 flags:0x00004004
+Call Trace:
+ context_switch kernel/sched/core.c:4681 [inline]
+ __schedule+0xc07/0x11f0 kernel/sched/core.c:5938
+ schedule+0x14b/0x210 kernel/sched/core.c:6017
+ schedule_timeout+0x98/0x2f0 kernel/time/timer.c:1857
+ do_wait_for_common+0x2da/0x480 kernel/sched/completion.c:85
+ __wait_for_common kernel/sched/completion.c:106 [inline]
+ wait_for_common kernel/sched/completion.c:117 [inline]
+ wait_for_completion_timeout+0x46/0x60 kernel/sched/completion.c:157
+ usb_start_wait_urb+0x167/0x550 drivers/usb/core/message.c:63
+ do_proc_bulk+0x978/0x1080 drivers/usb/core/devio.c:1236
+ proc_bulk drivers/usb/core/devio.c:1273 [inline]
+ usbdev_do_ioctl drivers/usb/core/devio.c:2547 [inline]
+ usbdev_ioctl+0x3441/0x6b10 drivers/usb/core/devio.c:2713
+...
+
+To fix this problem, this patch replaces usbfs's calls to
+usb_control_msg() and usb_bulk_msg() with special-purpose code that
+does essentially the same thing (as recommended in the comment for
+usb_start_wait_urb()), except that it always uses a killable wait and
+it uses GFP_KERNEL rather than GFP_NOIO.
+
+Reported-and-tested-by: syzbot+ada0f7d3d9fd2016d927@syzkaller.appspotmail.com
+	Suggested-by: Oliver Neukum <oneukum@suse.com>
+	Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Link: https://lore.kernel.org/r/20210903175312.GA468440@rowland.harvard.edu
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ae8709b296d80c7f45aa1f35c0e7659ad69edce1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/devio.c
+diff --cc drivers/usb/core/devio.c
+index 986ad8499855,fa66e6e58792..000000000000
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@@ -1218,10 -1277,8 +1285,15 @@@ static int do_proc_bulk(struct usb_dev_
+  		pipe = usb_rcvbulkpipe(dev, bulk->ep & 0x7f);
+  	else
+  		pipe = usb_sndbulkpipe(dev, bulk->ep & 0x7f);
+++<<<<<<< HEAD
+ +	if (!usb_maxpacket(dev, pipe))
+ +		return -EINVAL;
+ +	len1 = bulk->len;
+ +	if (len1 >= (INT_MAX - sizeof(struct urb)))
+++=======
++ 	ep = usb_pipe_endpoint(dev, pipe);
++ 	if (!ep || !usb_endpoint_maxp(&ep->desc))
+++>>>>>>> ae8709b296d8 (USB: core: Make do_proc_control() and do_proc_bulk() killable)
+  		return -EINVAL;
+  	ret = usbfs_increase_memory_usage(len1 + sizeof(struct urb));
+  	if (ret)
+* Unmerged path drivers/usb/core/devio.c
