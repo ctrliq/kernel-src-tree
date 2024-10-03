@@ -1,0 +1,661 @@
+drm/amdgpu: change vm->task_info handling
+
+jira LE-1907
+cve CVE-2024-41008
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Shashank Sharma <shashank.sharma@amd.com>
+commit b8f67b9ddf4f8fe6dd536590712b5912ad78f99c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/b8f67b9d.failed
+
+This patch changes the handling and lifecycle of vm->task_info object.
+The major changes are:
+- vm->task_info is a dynamically allocated ptr now, and its uasge is
+  reference counted.
+- introducing two new helper funcs for task_info lifecycle management
+    - amdgpu_vm_get_task_info: reference counts up task_info before
+      returning this info
+    - amdgpu_vm_put_task_info: reference counts down task_info
+- last put to task_info() frees task_info from the vm.
+
+This patch also does logistical changes required for existing usage
+of vm->task_info.
+
+V2: Do not block all the prints when task_info not found (Felix)
+
+V3: Fixed review comments from Felix
+   - Fix wrong indentation
+   - No debug message for -ENOMEM
+   - Add NULL check for task_info
+   - Do not duplicate the debug messages (ti vs no ti)
+   - Get first reference of task_info in vm_init(), put last
+     in vm_fini()
+
+V4: Fixed review comments from Felix
+   - fix double reference increment in create_task_info
+   - change amdgpu_vm_get_task_info_pasid
+   - additional changes in amdgpu_gem.c while porting
+
+	Cc: Christian Koenig <christian.koenig@amd.com>
+	Cc: Alex Deucher <alexander.deucher@amd.com>
+	Cc: Felix Kuehling <Felix.Kuehling@amd.com>
+	Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+	Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit b8f67b9ddf4f8fe6dd536590712b5912ad78f99c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+#	drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+#	drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+#	drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+#	drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index ed1164a87fce,67c234bcf89f..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@@ -180,13 -182,45 +180,47 @@@ static int amdgpu_gem_object_open(struc
+  		return r;
+  
+  	bo_va = amdgpu_vm_bo_find(vm, abo);
+ -	if (!bo_va)
+ +	if (!bo_va) {
+  		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
+ -	else
+ +	} else {
+  		++bo_va->ref_count;
+++<<<<<<< HEAD
+++=======
++ 	amdgpu_bo_unreserve(abo);
++ 
++ 	/* Validate and add eviction fence to DMABuf imports with dynamic
++ 	 * attachment in compute VMs. Re-validation will be done by
++ 	 * amdgpu_vm_validate. Fences are on the reservation shared with the
++ 	 * export, which is currently required to be validated and fenced
++ 	 * already by amdgpu_amdkfd_gpuvm_restore_process_bos.
++ 	 *
++ 	 * Nested locking below for the case that a GEM object is opened in
++ 	 * kfd_mem_export_dmabuf. Since the lock below is only taken for imports,
++ 	 * but not for export, this is a different lock class that cannot lead to
++ 	 * circular lock dependencies.
++ 	 */
++ 	if (!vm->is_compute_context || !vm->process_info)
++ 		return 0;
++ 	if (!obj->import_attach ||
++ 	    !dma_buf_is_dynamic(obj->import_attach->dmabuf))
++ 		return 0;
++ 	mutex_lock_nested(&vm->process_info->lock, 1);
++ 	if (!WARN_ON(!vm->process_info->eviction_fence)) {
++ 		r = amdgpu_amdkfd_bo_validate_and_fence(abo, AMDGPU_GEM_DOMAIN_GTT,
++ 							&vm->process_info->eviction_fence->base);
++ 		if (r) {
++ 			struct amdgpu_task_info *ti = amdgpu_vm_get_task_info_vm(vm);
++ 
++ 			dev_warn(adev->dev, "validate_and_fence failed: %d\n", r);
++ 			if (ti) {
++ 				dev_warn(adev->dev, "pid %d\n", ti->pid);
++ 				amdgpu_vm_put_task_info(ti);
++ 			}
++ 		}
+++>>>>>>> b8f67b9ddf4f (drm/amdgpu: change vm->task_info handling)
+  	}
+ -	mutex_unlock(&vm->process_info->lock);
+ -
+ -	return r;
+ +	amdgpu_bo_unreserve(abo);
+ +	return 0;
+  }
+  
+  static void amdgpu_gem_object_close(struct drm_gem_object *obj,
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+index 6437ead87e5f,a59364e9b6ed..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+@@@ -165,5 -162,90 +165,75 @@@ void amdgpu_device_unlock_reset_domain(
+  	up_write(&reset_domain->sem);
+  }
+  
+ -#ifndef CONFIG_DEV_COREDUMP
+ -void amdgpu_coredump(struct amdgpu_device *adev, bool vram_lost,
+ -		     struct amdgpu_reset_context *reset_context)
+ -{
+ -}
+ -#else
+ -static ssize_t
+ -amdgpu_devcoredump_read(char *buffer, loff_t offset, size_t count,
+ -			void *data, size_t datalen)
+ -{
+ -	struct drm_printer p;
+ -	struct amdgpu_coredump_info *coredump = data;
+ -	struct drm_print_iterator iter;
+ -	int i;
+  
+ -	iter.data = buffer;
+ -	iter.offset = 0;
+ -	iter.start = offset;
+ -	iter.remain = count;
+  
+++<<<<<<< HEAD
+++=======
++ 	p = drm_coredump_printer(&iter);
++ 
++ 	drm_printf(&p, "**** AMDGPU Device Coredump ****\n");
++ 	drm_printf(&p, "version: " AMDGPU_COREDUMP_VERSION "\n");
++ 	drm_printf(&p, "kernel: " UTS_RELEASE "\n");
++ 	drm_printf(&p, "module: " KBUILD_MODNAME "\n");
++ 	drm_printf(&p, "time: %lld.%09ld\n", coredump->reset_time.tv_sec,
++ 			coredump->reset_time.tv_nsec);
++ 
++ 	if (coredump->reset_task_info.pid)
++ 		drm_printf(&p, "process_name: %s PID: %d\n",
++ 			   coredump->reset_task_info.process_name,
++ 			   coredump->reset_task_info.pid);
++ 
++ 	if (coredump->reset_vram_lost)
++ 		drm_printf(&p, "VRAM is lost due to GPU reset!\n");
++ 	if (coredump->adev->reset_info.num_regs) {
++ 		drm_printf(&p, "AMDGPU register dumps:\nOffset:     Value:\n");
++ 
++ 		for (i = 0; i < coredump->adev->reset_info.num_regs; i++)
++ 			drm_printf(&p, "0x%08x: 0x%08x\n",
++ 				   coredump->adev->reset_info.reset_dump_reg_list[i],
++ 				   coredump->adev->reset_info.reset_dump_reg_value[i]);
++ 	}
++ 
++ 	return count - iter.remain;
++ }
++ 
++ static void amdgpu_devcoredump_free(void *data)
++ {
++ 	kfree(data);
++ }
++ 
++ void amdgpu_coredump(struct amdgpu_device *adev, bool vram_lost,
++ 		     struct amdgpu_reset_context *reset_context)
++ {
++ 	struct amdgpu_coredump_info *coredump;
++ 	struct drm_device *dev = adev_to_drm(adev);
++ 
++ 	coredump = kzalloc(sizeof(*coredump), GFP_NOWAIT);
++ 
++ 	if (!coredump) {
++ 		DRM_ERROR("%s: failed to allocate memory for coredump\n", __func__);
++ 		return;
++ 	}
++ 
++ 	coredump->reset_vram_lost = vram_lost;
++ 
++ 	if (reset_context->job && reset_context->job->vm) {
++ 		struct amdgpu_task_info *ti;
++ 		struct amdgpu_vm *vm = reset_context->job->vm;
++ 
++ 		ti = amdgpu_vm_get_task_info_vm(vm);
++ 		if (ti) {
++ 			coredump->reset_task_info = *ti;
++ 			amdgpu_vm_put_task_info(ti);
++ 		}
++ 	}
++ 
++ 	coredump->adev = adev;
++ 
++ 	ktime_get_ts64(&coredump->reset_time);
++ 
++ 	dev_coredumpm(dev->dev, THIS_MODULE, coredump, 0, GFP_NOWAIT,
++ 		      amdgpu_devcoredump_read, amdgpu_devcoredump_free);
++ }
++ #endif
+++>>>>>>> b8f67b9ddf4f (drm/amdgpu: change vm->task_info handling)
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index a9bb8e7b650e,18db0ddef362..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@@ -400,6 -504,34 +400,37 @@@ int amdgpu_vm_validate_pt_bos(struct am
+  		}
+  		spin_lock(&vm->status_lock);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	while (ticket && !list_empty(&vm->evicted_user)) {
++ 		bo_base = list_first_entry(&vm->evicted_user,
++ 					   struct amdgpu_vm_bo_base,
++ 					   vm_status);
++ 		spin_unlock(&vm->status_lock);
++ 
++ 		bo = bo_base->bo;
++ 
++ 		if (dma_resv_locking_ctx(bo->tbo.base.resv) != ticket) {
++ 			struct amdgpu_task_info *ti = amdgpu_vm_get_task_info_vm(vm);
++ 
++ 			pr_warn_ratelimited("Evicted user BO is not reserved\n");
++ 			if (ti) {
++ 				pr_warn_ratelimited("pid %d\n", ti->pid);
++ 				amdgpu_vm_put_task_info(ti);
++ 			}
++ 
++ 			return -EINVAL;
++ 		}
++ 
++ 		r = validate(param, bo);
++ 		if (r)
++ 			return r;
++ 
++ 		amdgpu_vm_bo_invalidated(bo_base);
++ 
++ 		spin_lock(&vm->status_lock);
++ 	}
+++>>>>>>> b8f67b9ddf4f (drm/amdgpu: change vm->task_info handling)
+  	spin_unlock(&vm->status_lock);
+  
+  	amdgpu_vm_eviction_lock(vm);
+@@@ -2107,11 -2412,14 +2240,15 @@@ int amdgpu_vm_init(struct amdgpu_devic
+  
+  	r = amdgpu_vm_pt_clear(adev, vm, root, false);
+  	if (r)
+ -		goto error_free_root;
+ +		goto error_unreserve;
+  
++ 	r = amdgpu_vm_create_task_info(vm);
++ 	if (r)
++ 		DRM_DEBUG("Failed to create task info for VM\n");
++ 
+  	amdgpu_bo_unreserve(vm->root.bo);
+ -	amdgpu_bo_unref(&root_bo);
+ +
+ +	INIT_KFIFO(vm->faults);
+  
+  	return 0;
+  
+diff --cc drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+index be16e627e54b,d933e19e0cf5..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+@@@ -109,10 -100,12 +109,14 @@@ static int gmc_v10_0_process_interrupt(
+  				       struct amdgpu_irq_src *source,
+  				       struct amdgpu_iv_entry *entry)
+  {
+ -	uint32_t vmhub_index = entry->client_id == SOC15_IH_CLIENTID_VMC ?
+ -			       AMDGPU_MMHUB0(0) : AMDGPU_GFXHUB(0);
+ -	struct amdgpu_vmhub *hub = &adev->vmhub[vmhub_index];
+  	bool retry_fault = !!(entry->src_data[1] & 0x80);
+  	bool write_fault = !!(entry->src_data[1] & 0x20);
+++<<<<<<< HEAD
+ +	struct amdgpu_vmhub *hub = &adev->vmhub[entry->vmid_src];
+ +	struct amdgpu_task_info task_info;
+++=======
++ 	struct amdgpu_task_info *task_info;
+++>>>>>>> b8f67b9ddf4f (drm/amdgpu: change vm->task_info handling)
+  	uint32_t status = 0;
+  	u64 addr;
+  
+@@@ -160,19 -157,22 +164,27 @@@
+  	if (!printk_ratelimit())
+  		return 0;
+  
+- 	memset(&task_info, 0, sizeof(struct amdgpu_task_info));
+- 	amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);
+- 
+  	dev_err(adev->dev,
+++<<<<<<< HEAD
+ +		"[%s] page fault (src_id:%u ring:%u vmid:%u pasid:%u, "
+ +		"for process %s pid %d thread %s pid %d)\n",
+++=======
++ 		"[%s] page fault (src_id:%u ring:%u vmid:%u pasid:%u)\n",
+++>>>>>>> b8f67b9ddf4f (drm/amdgpu: change vm->task_info handling)
+  		entry->vmid_src ? "mmhub" : "gfxhub",
+- 		entry->src_id, entry->ring_id, entry->vmid,
+- 		entry->pasid, task_info.process_name, task_info.tgid,
+- 		task_info.task_name, task_info.pid);
++ 		entry->src_id, entry->ring_id, entry->vmid, entry->pasid);
++ 	task_info = amdgpu_vm_get_task_info_pasid(adev, entry->pasid);
++ 	if (task_info) {
++ 		dev_err(adev->dev,
++ 			" in process %s pid %d thread %s pid %d\n",
++ 			task_info->process_name, task_info->tgid,
++ 			task_info->task_name, task_info->pid);
++ 		amdgpu_vm_put_task_info(task_info);
++ 	}
++ 
+  	dev_err(adev->dev, "  in page starting at address 0x%016llx from client 0x%x (%s)\n",
+- 		addr, entry->client_id,
+- 		soc15_ih_clientid_name[entry->client_id]);
++ 			addr, entry->client_id,
++ 			soc15_ih_clientid_name[entry->client_id]);
+  
+  	if (!amdgpu_sriov_vf(adev))
+  		hub->vmhub_funcs->print_l2_protection_fault_status(adev,
+diff --cc drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+index 14ca327b602c,527dc917e049..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+@@@ -118,20 -123,27 +118,29 @@@ static int gmc_v11_0_process_interrupt(
+  	}
+  
+  	if (printk_ratelimit()) {
+- 		struct amdgpu_task_info task_info;
+- 
+- 		memset(&task_info, 0, sizeof(struct amdgpu_task_info));
+- 		amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);
++ 		struct amdgpu_task_info *task_info;
+  
+  		dev_err(adev->dev,
+++<<<<<<< HEAD
+ +			"[%s] page fault (src_id:%u ring:%u vmid:%u pasid:%u, "
+ +			"for process %s pid %d thread %s pid %d)\n",
+++=======
++ 			"[%s] page fault (src_id:%u ring:%u vmid:%u pasid:%u)\n",
+++>>>>>>> b8f67b9ddf4f (drm/amdgpu: change vm->task_info handling)
+  			entry->vmid_src ? "mmhub" : "gfxhub",
+- 			entry->src_id, entry->ring_id, entry->vmid,
+- 			entry->pasid, task_info.process_name, task_info.tgid,
+- 			task_info.task_name, task_info.pid);
++ 			entry->src_id, entry->ring_id, entry->vmid, entry->pasid);
++ 		task_info = amdgpu_vm_get_task_info_pasid(adev, entry->pasid);
++ 		if (task_info) {
++ 			dev_err(adev->dev,
++ 				" in process %s pid %d thread %s pid %d)\n",
++ 				task_info->process_name, task_info->tgid,
++ 				task_info->task_name, task_info->pid);
++ 			amdgpu_vm_put_task_info(task_info);
++ 		}
++ 
+  		dev_err(adev->dev, "  in page starting at address 0x%016llx from client %d\n",
+- 			addr, entry->client_id);
++ 				addr, entry->client_id);
++ 
+  		if (!amdgpu_sriov_vf(adev))
+  			hub->vmhub_funcs->print_l2_protection_fault_status(adev, status);
+  	}
+diff --cc drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index bc8b4e405b7a,47b63a4ce68b..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@@ -601,27 -626,20 +601,44 @@@ static int gmc_v9_0_process_interrupt(s
+  	if (!printk_ratelimit())
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (entry->client_id == SOC15_IH_CLIENTID_VMC) {
+ +		hub_name = "mmhub0";
+ +		hub = &adev->vmhub[AMDGPU_MMHUB_0];
+ +	} else if (entry->client_id == SOC15_IH_CLIENTID_VMC1) {
+ +		hub_name = "mmhub1";
+ +		hub = &adev->vmhub[AMDGPU_MMHUB_1];
+ +	} else {
+ +		hub_name = "gfxhub0";
+ +		hub = &adev->vmhub[AMDGPU_GFXHUB_0];
+ +	}
+ +
+ +	memset(&task_info, 0, sizeof(struct amdgpu_task_info));
+ +	amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);
+ +
+ +	dev_err(adev->dev,
+ +		"[%s] %s page fault (src_id:%u ring:%u vmid:%u "
+ +		"pasid:%u, for process %s pid %d thread %s pid %d)\n",
+ +		hub_name, retry_fault ? "retry" : "no-retry",
+ +		entry->src_id, entry->ring_id, entry->vmid,
+ +		entry->pasid, task_info.process_name, task_info.tgid,
+ +		task_info.task_name, task_info.pid);
+++=======
++ 	dev_err(adev->dev,
++ 		"[%s] %s page fault (src_id:%u ring:%u vmid:%u pasid:%u)\n", hub_name,
++ 		retry_fault ? "retry" : "no-retry",
++ 		entry->src_id, entry->ring_id, entry->vmid, entry->pasid);
++ 
++ 	task_info = amdgpu_vm_get_task_info_pasid(adev, entry->pasid);
++ 	if (task_info) {
++ 		dev_err(adev->dev,
++ 			" for process %s pid %d thread %s pid %d)\n",
++ 			task_info->process_name, task_info->tgid,
++ 			task_info->task_name, task_info->pid);
++ 		amdgpu_vm_put_task_info(task_info);
++ 	}
++ 
+++>>>>>>> b8f67b9ddf4f (drm/amdgpu: change vm->task_info handling)
+  	dev_err(adev->dev, "  in page starting at address 0x%016llx from IH client 0x%x (%s)\n",
+  		addr, entry->client_id,
+  		soc15_ih_clientid_name[entry->client_id]);
+* Unmerged path drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+index 7e025c76be9b..4a549c88c528 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+@@ -1599,9 +1599,14 @@ static int amdgpu_debugfs_vm_info_show(struct seq_file *m, void *unused)
+ 	list_for_each_entry(file, &dev->filelist, lhead) {
+ 		struct amdgpu_fpriv *fpriv = file->driver_priv;
+ 		struct amdgpu_vm *vm = &fpriv->vm;
++		struct amdgpu_task_info *ti;
++
++		ti = amdgpu_vm_get_task_info_vm(vm);
++		if (ti) {
++			seq_printf(m, "pid:%d\tProcess:%s ----------\n", ti->pid, ti->process_name);
++			amdgpu_vm_put_task_info(ti);
++		}
+ 
+-		seq_printf(m, "pid:%d\tProcess:%s ----------\n",
+-				vm->task_info.pid, vm->task_info.process_name);
+ 		r = amdgpu_bo_reserve(vm->root.bo, true);
+ 		if (r)
+ 			break;
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index c3d9d75143f4..f101795789f9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -35,7 +35,7 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ {
+ 	struct amdgpu_ring *ring = to_amdgpu_ring(s_job->sched);
+ 	struct amdgpu_job *job = to_amdgpu_job(s_job);
+-	struct amdgpu_task_info ti;
++	struct amdgpu_task_info *ti;
+ 	struct amdgpu_device *adev = ring->adev;
+ 	int idx;
+ 	int r;
+@@ -48,7 +48,7 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ 		return DRM_GPU_SCHED_STAT_ENODEV;
+ 	}
+ 
+-	memset(&ti, 0, sizeof(struct amdgpu_task_info));
++
+ 	adev->job_hang = true;
+ 
+ 	if (amdgpu_gpu_recovery &&
+@@ -58,12 +58,16 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ 		goto exit;
+ 	}
+ 
+-	amdgpu_vm_get_task_info(ring->adev, job->pasid, &ti);
+ 	DRM_ERROR("ring %s timeout, signaled seq=%u, emitted seq=%u\n",
+-		  job->base.sched->name, atomic_read(&ring->fence_drv.last_seq),
+-		  ring->fence_drv.sync_seq);
+-	DRM_ERROR("Process information: process %s pid %d thread %s pid %d\n",
+-		  ti.process_name, ti.tgid, ti.task_name, ti.pid);
++		   job->base.sched->name, atomic_read(&ring->fence_drv.last_seq),
++		   ring->fence_drv.sync_seq);
++
++	ti = amdgpu_vm_get_task_info_pasid(ring->adev, job->pasid);
++	if (ti) {
++		DRM_ERROR("Process information: process %s pid %d thread %s pid %d\n",
++			  ti->process_name, ti->tgid, ti->task_name, ti->pid);
++		amdgpu_vm_put_task_info(ti);
++	}
+ 
+ 	if (amdgpu_device_should_recover_gpu(ring->adev)) {
+ 		struct amdgpu_reset_context reset_context;
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 856a64bc7a89..0b49ad9230b2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -171,10 +171,11 @@ struct amdgpu_vm_pte_funcs {
+ };
+ 
+ struct amdgpu_task_info {
+-	char	process_name[TASK_COMM_LEN];
+-	char	task_name[TASK_COMM_LEN];
+-	pid_t	pid;
+-	pid_t	tgid;
++	char		process_name[TASK_COMM_LEN];
++	char		task_name[TASK_COMM_LEN];
++	pid_t		pid;
++	pid_t		tgid;
++	struct kref	refcount;
+ };
+ 
+ /**
+@@ -319,7 +320,7 @@ struct amdgpu_vm {
+ 	uint64_t		pd_phys_addr;
+ 
+ 	/* Some basic info about the task */
+-	struct amdgpu_task_info task_info;
++	struct amdgpu_task_info *task_info;
+ 
+ 	/* Store positions of group of BOs */
+ 	struct ttm_lru_bulk_move lru_bulk_move;
+@@ -448,8 +449,14 @@ bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
+ 				  struct amdgpu_job *job);
+ void amdgpu_vm_check_compute_bug(struct amdgpu_device *adev);
+ 
+-void amdgpu_vm_get_task_info(struct amdgpu_device *adev, u32 pasid,
+-			     struct amdgpu_task_info *task_info);
++struct amdgpu_task_info *
++amdgpu_vm_get_task_info_pasid(struct amdgpu_device *adev, u32 pasid);
++
++struct amdgpu_task_info *
++amdgpu_vm_get_task_info_vm(struct amdgpu_vm *vm);
++
++void amdgpu_vm_put_task_info(struct amdgpu_task_info *task_info);
++
+ bool amdgpu_vm_handle_fault(struct amdgpu_device *adev, u32 pasid,
+ 			    uint64_t addr, bool write_fault);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
+index 4642cff0e1a4..a830af0156a0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
+@@ -973,7 +973,7 @@ int amdgpu_vm_ptes_update(struct amdgpu_vm_update_params *params,
+ 			trace_amdgpu_vm_update_ptes(params, frag_start, upd_end,
+ 						    min(nptes, 32u), dst, incr,
+ 						    upd_flags,
+-						    vm->task_info.tgid,
++						    vm->task_info ? vm->task_info->tgid : 0,
+ 						    vm->immediate.fence_context);
+ 			amdgpu_vm_pte_update_flags(params, to_amdgpu_bo_vm(pt),
+ 						   cursor.level, pe_start, dst,
+* Unmerged path drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+* Unmerged path drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+index 504c1b34dab7..76ff1ab482b1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -1451,18 +1451,24 @@ static int gmc_v8_0_process_interrupt(struct amdgpu_device *adev,
+ 		gmc_v8_0_set_fault_enable_default(adev, false);
+ 
+ 	if (printk_ratelimit()) {
+-		struct amdgpu_task_info task_info;
++		struct amdgpu_task_info *task_info;
+ 
+-		memset(&task_info, 0, sizeof(struct amdgpu_task_info));
+-		amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);
++		dev_err(adev->dev, "GPU fault detected: %d 0x%08x\n",
++			entry->src_id, entry->src_data[0]);
++
++		task_info = amdgpu_vm_get_task_info_pasid(adev, entry->pasid);
++		if (task_info) {
++			dev_err(adev->dev, " for process %s pid %d thread %s pid %d\n",
++				task_info->process_name, task_info->tgid,
++				task_info->task_name, task_info->pid);
++			amdgpu_vm_put_task_info(task_info);
++		}
+ 
+-		dev_err(adev->dev, "GPU fault detected: %d 0x%08x for process %s pid %d thread %s pid %d\n",
+-			entry->src_id, entry->src_data[0], task_info.process_name,
+-			task_info.tgid, task_info.task_name, task_info.pid);
+ 		dev_err(adev->dev, "  VM_CONTEXT1_PROTECTION_FAULT_ADDR   0x%08X\n",
+-			addr);
++				addr);
+ 		dev_err(adev->dev, "  VM_CONTEXT1_PROTECTION_FAULT_STATUS 0x%08X\n",
+ 			status);
++
+ 		gmc_v8_0_vm_decode_fault(adev, status, addr, mc_client,
+ 					 entry->pasid);
+ 	}
+* Unmerged path drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+index 03a0d8efd3d5..5539587d5ce0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
+@@ -2095,7 +2095,7 @@ static int sdma_v4_0_print_iv_entry(struct amdgpu_device *adev,
+ 					      struct amdgpu_iv_entry *entry)
+ {
+ 	int instance;
+-	struct amdgpu_task_info task_info;
++	struct amdgpu_task_info *task_info;
+ 	u64 addr;
+ 
+ 	instance = sdma_v4_0_irq_id_to_seq(entry->client_id);
+@@ -2107,15 +2107,20 @@ static int sdma_v4_0_print_iv_entry(struct amdgpu_device *adev,
+ 	addr = (u64)entry->src_data[0] << 12;
+ 	addr |= ((u64)entry->src_data[1] & 0xf) << 44;
+ 
+-	memset(&task_info, 0, sizeof(struct amdgpu_task_info));
+-	amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);
+-
+ 	dev_dbg_ratelimited(adev->dev,
+-		   "[sdma%d] address:0x%016llx src_id:%u ring:%u vmid:%u "
+-		   "pasid:%u, for process %s pid %d thread %s pid %d\n",
+-		   instance, addr, entry->src_id, entry->ring_id, entry->vmid,
+-		   entry->pasid, task_info.process_name, task_info.tgid,
+-		   task_info.task_name, task_info.pid);
++			   "[sdma%d] address:0x%016llx src_id:%u ring:%u vmid:%u pasid:%u\n",
++			   instance, addr, entry->src_id, entry->ring_id, entry->vmid,
++			   entry->pasid);
++
++	task_info = amdgpu_vm_get_task_info_pasid(adev, entry->pasid);
++	if (task_info) {
++		dev_dbg_ratelimited(adev->dev,
++				    " for process %s pid %d thread %s pid %d\n",
++				    task_info->process_name, task_info->tgid,
++				    task_info->task_name, task_info->pid);
++		amdgpu_vm_put_task_info(task_info);
++	}
++
+ 	return 0;
+ }
+ 
+* Unmerged path drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c
+index 0472b56de245..7640fb76884f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c
+@@ -238,16 +238,16 @@ void kfd_smi_event_update_thermal_throttling(struct kfd_dev *dev,
+ 
+ void kfd_smi_event_update_vmfault(struct kfd_dev *dev, uint16_t pasid)
+ {
+-	struct amdgpu_task_info task_info;
+-
+-	memset(&task_info, 0, sizeof(struct amdgpu_task_info));
+-	amdgpu_vm_get_task_info(dev->adev, pasid, &task_info);
+-	/* Report VM faults from user applications, not retry from kernel */
+-	if (!task_info.pid)
+-		return;
+-
+-	kfd_smi_event_add(0, dev, KFD_SMI_EVENT_VMFAULT, "%x:%s\n",
+-			  task_info.pid, task_info.task_name);
++	struct amdgpu_task_info *task_info;
++
++	task_info = amdgpu_vm_get_task_info_pasid(dev->adev, pasid);
++	if (task_info) {
++		/* Report VM faults from user applications, not retry from kernel */
++		if (task_info->pid)
++			kfd_smi_event_add(0, dev, KFD_SMI_EVENT_VMFAULT, "%x:%s\n",
++					 task_info->pid, task_info->task_name);
++		amdgpu_vm_put_task_info(task_info);
++	}
+ }
+ 
+ void kfd_smi_event_page_fault_start(struct kfd_dev *dev, pid_t pid,
