@@ -1,0 +1,112 @@
+media: cec: abort if the current transmit was canceled
+
+jira LE-1907
+cve CVE-2024-23848
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Hans Verkuil <hverkuil-cisco@xs4all.nl>
+commit 590a8e564c6eff7e77a84e728612f1269e3c0685
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/590a8e56.failed
+
+If a transmit-in-progress was canceled, then, once the transmit
+is done, mark it as aborted and refrain from retrying the transmit.
+
+To signal this situation the new transmit_in_progress_aborted field is
+set to true.
+
+The old implementation would just set adap->transmitting to NULL and
+set adap->transmit_in_progress to false, but on the hardware level
+the transmit was still ongoing. However, the framework would think
+the transmit was aborted, and if a new transmit was issued, then
+it could overwrite the HW buffer containing the old transmit with the
+new transmit, leading to garbled data on the CEC bus.
+
+	Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Signed-off-by: Mauro Carvalho Chehab <mchehab@kernel.org>
+(cherry picked from commit 590a8e564c6eff7e77a84e728612f1269e3c0685)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/cec/core/cec-adap.c
+diff --cc drivers/media/cec/core/cec-adap.c
+index e0e9d4808c3d,b7ca429604ed..000000000000
+--- a/drivers/media/cec/core/cec-adap.c
++++ b/drivers/media/cec/core/cec-adap.c
+@@@ -1558,6 -1565,48 +1563,51 @@@ static void cec_claim_log_addrs(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Helper functions to enable/disable the CEC adapter.
++  *
++  * These functions are called with adap->lock held.
++  */
++ static int cec_activate_cnt_inc(struct cec_adapter *adap)
++ {
++ 	int ret;
++ 
++ 	if (adap->activate_cnt++)
++ 		return 0;
++ 
++ 	/* serialize adap_enable */
++ 	mutex_lock(&adap->devnode.lock);
++ 	adap->last_initiator = 0xff;
++ 	adap->transmit_in_progress = false;
++ 	ret = adap->ops->adap_enable(adap, true);
++ 	if (ret)
++ 		adap->activate_cnt--;
++ 	mutex_unlock(&adap->devnode.lock);
++ 	return ret;
++ }
++ 
++ static void cec_activate_cnt_dec(struct cec_adapter *adap)
++ {
++ 	if (WARN_ON(!adap->activate_cnt))
++ 		return;
++ 
++ 	if (--adap->activate_cnt)
++ 		return;
++ 
++ 	/* serialize adap_enable */
++ 	mutex_lock(&adap->devnode.lock);
++ 	WARN_ON(adap->ops->adap_enable(adap, false));
++ 	adap->last_initiator = 0xff;
++ 	adap->transmit_in_progress = false;
++ 	adap->transmit_in_progress_aborted = false;
++ 	if (adap->transmitting)
++ 		cec_data_cancel(adap->transmitting, CEC_TX_STATUS_ABORTED);
++ 	mutex_unlock(&adap->devnode.lock);
++ }
++ 
+++>>>>>>> 590a8e564c6e (media: cec: abort if the current transmit was canceled)
+  /* Set a new physical address and send an event notifying userspace of this.
+   *
+   * This function is called with adap->lock held.
+* Unmerged path drivers/media/cec/core/cec-adap.c
+diff --git a/include/media/cec.h b/include/media/cec.h
+index 03e01c17f6ec..9c5d355b9696 100644
+--- a/include/media/cec.h
++++ b/include/media/cec.h
+@@ -156,6 +156,11 @@ struct cec_adap_ops {
+  * @wait_queue:		queue of transmits waiting for a reply
+  * @transmitting:	CEC messages currently being transmitted
+  * @transmit_in_progress: true if a transmit is in progress
++ * @transmit_in_progress_aborted: true if a transmit is in progress is to be
++ *			aborted. This happens if the logical address is
++ *			invalidated while the transmit is ongoing. In that
++ *			case the transmit will finish, but will not retransmit
++ *			and be marked as ABORTED.
+  * @kthread_config:	kthread used to configure a CEC adapter
+  * @config_completion:	used to signal completion of the config kthread
+  * @kthread:		main CEC processing thread
+@@ -205,6 +210,7 @@ struct cec_adapter {
+ 	struct list_head wait_queue;
+ 	struct cec_data *transmitting;
+ 	bool transmit_in_progress;
++	bool transmit_in_progress_aborted;
+ 
+ 	struct task_struct *kthread_config;
+ 	struct completion config_completion;
