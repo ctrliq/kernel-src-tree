@@ -1,0 +1,85 @@
+media: cec: core: add adap_nb_transmit_canceled() callback
+
+jira LE-1907
+cve CVE-2024-23848
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Hans Verkuil <hverkuil-cisco@xs4all.nl>
+commit da53c36ddd3f118a525a04faa8c47ca471e6c467
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/da53c36d.failed
+
+A potential deadlock was found by Zheng Zhang with a local syzkaller
+instance.
+
+The problem is that when a non-blocking CEC transmit is canceled by calling
+cec_data_cancel, that in turn can call the high-level received() driver
+callback, which can call cec_transmit_msg() to transmit a new message.
+
+The cec_data_cancel() function is called with the adap->lock mutex held,
+and cec_transmit_msg() tries to take that same lock.
+
+The root cause is that the received() callback can either be used to pass
+on a received message (and then adap->lock is not held), or to report a
+canceled transmit (and then adap->lock is held).
+
+This is confusing, so create a new low-level adap_nb_transmit_canceled
+callback that reports back that a non-blocking transmit was canceled.
+
+And the received() callback is only called when a message is received,
+as was the case before commit f9d0ecbf56f4 ("media: cec: correctly pass
+on reply results") complicated matters.
+
+	Reported-by: Zheng Zhang <zheng.zhang@email.ucr.edu>
+	Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Fixes: f9d0ecbf56f4 ("media: cec: correctly pass on reply results")
+	Signed-off-by: Mauro Carvalho Chehab <mchehab@kernel.org>
+(cherry picked from commit da53c36ddd3f118a525a04faa8c47ca471e6c467)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/cec/core/cec-adap.c
+diff --cc drivers/media/cec/core/cec-adap.c
+index 714127e5a25c,a9b73fb33888..000000000000
+--- a/drivers/media/cec/core/cec-adap.c
++++ b/drivers/media/cec/core/cec-adap.c
+@@@ -396,7 -380,13 +396,15 @@@ static void cec_data_cancel(struct cec_
+  	}
+  
+  	/* Queue transmitted message for monitoring purposes */
+++<<<<<<< HEAD
+ +	cec_queue_msg_monitor(data->adap, &data->msg, 1);
+++=======
++ 	cec_queue_msg_monitor(adap, &data->msg, 1);
++ 
++ 	if (!data->blocking && data->msg.sequence)
++ 		/* Allow drivers to react to a canceled transmit */
++ 		call_void_op(adap, adap_nb_transmit_canceled, &data->msg);
+++>>>>>>> da53c36ddd3f (media: cec: core: add adap_nb_transmit_canceled() callback)
+  
+  	cec_data_completed(data);
+  }
+* Unmerged path drivers/media/cec/core/cec-adap.c
+diff --git a/include/media/cec.h b/include/media/cec.h
+index c494f37771a8..1e0cc9ece1c6 100644
+--- a/include/media/cec.h
++++ b/include/media/cec.h
+@@ -113,14 +113,16 @@ struct cec_adap_ops {
+ 	int (*adap_log_addr)(struct cec_adapter *adap, u8 logical_addr);
+ 	int (*adap_transmit)(struct cec_adapter *adap, u8 attempts,
+ 			     u32 signal_free_time, struct cec_msg *msg);
++	void (*adap_nb_transmit_canceled)(struct cec_adapter *adap,
++					  const struct cec_msg *msg);
+ 	void (*adap_status)(struct cec_adapter *adap, struct seq_file *file);
+ 	void (*adap_free)(struct cec_adapter *adap);
+ 
+-	/* Error injection callbacks */
++	/* Error injection callbacks, called without adap->lock held */
+ 	int (*error_inj_show)(struct cec_adapter *adap, struct seq_file *sf);
+ 	bool (*error_inj_parse_line)(struct cec_adapter *adap, char *line);
+ 
+-	/* High-level CEC message callback */
++	/* High-level CEC message callback, called without adap->lock held */
+ 	int (*received)(struct cec_adapter *adap, struct cec_msg *msg);
+ };
+ 
