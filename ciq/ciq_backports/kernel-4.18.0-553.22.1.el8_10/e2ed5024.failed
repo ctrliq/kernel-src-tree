@@ -1,0 +1,298 @@
+media: cec: use call_op and check for !unregistered
+
+jira LE-1907
+cve CVE-2024-23848
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Hans Verkuil <hverkuil-cisco@xs4all.nl>
+commit e2ed5024ac2bc27d4bfc99fd58f5ab54de8fa965
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/e2ed5024.failed
+
+Use call_(void_)op consistently in the CEC core framework. Ditto
+for the cec pin ops. And check if !adap->devnode.unregistered before
+calling each op. This avoids calls to ops when the device has been
+unregistered and the underlying hardware may be gone.
+
+	Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Signed-off-by: Mauro Carvalho Chehab <mchehab@kernel.org>
+(cherry picked from commit e2ed5024ac2bc27d4bfc99fd58f5ab54de8fa965)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/cec/core/cec-adap.c
+diff --cc drivers/media/cec/core/cec-adap.c
+index e0e9d4808c3d,f465618850f7..000000000000
+--- a/drivers/media/cec/core/cec-adap.c
++++ b/drivers/media/cec/core/cec-adap.c
+@@@ -396,7 -392,13 +387,15 @@@ static void cec_data_cancel(struct cec_
+  	}
+  
+  	/* Queue transmitted message for monitoring purposes */
+++<<<<<<< HEAD
+ +	cec_queue_msg_monitor(data->adap, &data->msg, 1);
+++=======
++ 	cec_queue_msg_monitor(adap, &data->msg, 1);
++ 
++ 	if (!data->blocking && data->msg.sequence)
++ 		/* Allow drivers to process the message first */
++ 		call_op(adap, received, &data->msg);
+++>>>>>>> e2ed5024ac2b (media: cec: use call_op and check for !unregistered)
+  
+  	cec_data_completed(data);
+  }
+@@@ -571,10 -573,11 +570,16 @@@ int cec_thread_func(void *_adap
+  		if (data->attempts == 0)
+  			data->attempts = attempts;
+  
+ -		adap->transmit_in_progress_aborted = false;
+  		/* Tell the adapter to transmit, cancel on error */
+++<<<<<<< HEAD
+ +		if (adap->ops->adap_transmit(adap, data->attempts,
+ +					     signal_free_time, &data->msg))
+ +			cec_data_cancel(data, CEC_TX_STATUS_ABORTED);
+++=======
++ 		if (call_op(adap, adap_transmit, data->attempts,
++ 			    signal_free_time, &data->msg))
++ 			cec_data_cancel(data, CEC_TX_STATUS_ABORTED, 0);
+++>>>>>>> e2ed5024ac2b (media: cec: use call_op and check for !unregistered)
+  		else
+  			adap->transmit_in_progress = true;
+  
+@@@ -1558,6 -1567,48 +1562,51 @@@ static void cec_claim_log_addrs(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Helper functions to enable/disable the CEC adapter.
++  *
++  * These functions are called with adap->lock held.
++  */
++ static int cec_activate_cnt_inc(struct cec_adapter *adap)
++ {
++ 	int ret;
++ 
++ 	if (adap->activate_cnt++)
++ 		return 0;
++ 
++ 	/* serialize adap_enable */
++ 	mutex_lock(&adap->devnode.lock);
++ 	adap->last_initiator = 0xff;
++ 	adap->transmit_in_progress = false;
++ 	ret = call_op(adap, adap_enable, true);
++ 	if (ret)
++ 		adap->activate_cnt--;
++ 	mutex_unlock(&adap->devnode.lock);
++ 	return ret;
++ }
++ 
++ static void cec_activate_cnt_dec(struct cec_adapter *adap)
++ {
++ 	if (WARN_ON(!adap->activate_cnt))
++ 		return;
++ 
++ 	if (--adap->activate_cnt)
++ 		return;
++ 
++ 	/* serialize adap_enable */
++ 	mutex_lock(&adap->devnode.lock);
++ 	WARN_ON(call_op(adap, adap_enable, false));
++ 	adap->last_initiator = 0xff;
++ 	adap->transmit_in_progress = false;
++ 	adap->transmit_in_progress_aborted = false;
++ 	if (adap->transmitting)
++ 		cec_data_cancel(adap->transmitting, CEC_TX_STATUS_ABORTED, 0);
++ 	mutex_unlock(&adap->devnode.lock);
++ }
++ 
+++>>>>>>> e2ed5024ac2b (media: cec: use call_op and check for !unregistered)
+  /* Set a new physical address and send an event notifying userspace of this.
+   *
+   * This function is called with adap->lock held.
+* Unmerged path drivers/media/cec/core/cec-adap.c
+diff --git a/drivers/media/cec/core/cec-api.c b/drivers/media/cec/core/cec-api.c
+index 016f23b7f0a8..262853f7e2ac 100644
+--- a/drivers/media/cec/core/cec-api.c
++++ b/drivers/media/cec/core/cec-api.c
+@@ -600,7 +600,8 @@ static int cec_open(struct inode *inode, struct file *filp)
+ 		adap->conn_info.type != CEC_CONNECTOR_TYPE_NO_CONNECTOR;
+ 	cec_queue_event_fh(fh, &ev, 0);
+ #ifdef CONFIG_CEC_PIN
+-	if (adap->pin && adap->pin->ops->read_hpd) {
++	if (adap->pin && adap->pin->ops->read_hpd &&
++	    !adap->devnode.unregistered) {
+ 		err = adap->pin->ops->read_hpd(adap);
+ 		if (err >= 0) {
+ 			ev.event = err ? CEC_EVENT_PIN_HPD_HIGH :
+@@ -608,7 +609,8 @@ static int cec_open(struct inode *inode, struct file *filp)
+ 			cec_queue_event_fh(fh, &ev, 0);
+ 		}
+ 	}
+-	if (adap->pin && adap->pin->ops->read_5v) {
++	if (adap->pin && adap->pin->ops->read_5v &&
++	    !adap->devnode.unregistered) {
+ 		err = adap->pin->ops->read_5v(adap);
+ 		if (err >= 0) {
+ 			ev.event = err ? CEC_EVENT_PIN_5V_HIGH :
+diff --git a/drivers/media/cec/core/cec-core.c b/drivers/media/cec/core/cec-core.c
+index e24aacf6b54d..b4489ae77140 100644
+--- a/drivers/media/cec/core/cec-core.c
++++ b/drivers/media/cec/core/cec-core.c
+@@ -220,7 +220,7 @@ static ssize_t cec_error_inj_write(struct file *file,
+ 		line = strsep(&p, "\n");
+ 		if (!*line || *line == '#')
+ 			continue;
+-		if (!adap->ops->error_inj_parse_line(adap, line)) {
++		if (!call_op(adap, error_inj_parse_line, line)) {
+ 			kfree(buf);
+ 			return -EINVAL;
+ 		}
+@@ -233,7 +233,7 @@ static int cec_error_inj_show(struct seq_file *sf, void *unused)
+ {
+ 	struct cec_adapter *adap = sf->private;
+ 
+-	return adap->ops->error_inj_show(adap, sf);
++	return call_op(adap, error_inj_show, sf);
+ }
+ 
+ static int cec_error_inj_open(struct inode *inode, struct file *file)
+diff --git a/drivers/media/cec/core/cec-pin-priv.h b/drivers/media/cec/core/cec-pin-priv.h
+index 7bad5a0b7cb7..8eb5819e6ccb 100644
+--- a/drivers/media/cec/core/cec-pin-priv.h
++++ b/drivers/media/cec/core/cec-pin-priv.h
+@@ -12,6 +12,17 @@
+ #include <linux/atomic.h>
+ #include <media/cec-pin.h>
+ 
++#define call_pin_op(pin, op, arg...)					\
++	((pin && pin->ops->op && !pin->adap->devnode.unregistered) ?	\
++	 pin->ops->op(pin->adap, ## arg) : 0)
++
++#define call_void_pin_op(pin, op, arg...)				\
++	do {								\
++		if (pin && pin->ops->op &&				\
++		    !pin->adap->devnode.unregistered)			\
++			pin->ops->op(pin->adap, ## arg);		\
++	} while (0)
++
+ enum cec_pin_state {
+ 	/* CEC is off */
+ 	CEC_ST_OFF,
+diff --git a/drivers/media/cec/core/cec-pin.c b/drivers/media/cec/core/cec-pin.c
+index 7979aa96ed19..aca287371e32 100644
+--- a/drivers/media/cec/core/cec-pin.c
++++ b/drivers/media/cec/core/cec-pin.c
+@@ -135,7 +135,7 @@ static void cec_pin_update(struct cec_pin *pin, bool v, bool force)
+ 
+ static bool cec_pin_read(struct cec_pin *pin)
+ {
+-	bool v = pin->ops->read(pin->adap);
++	bool v = call_pin_op(pin, read);
+ 
+ 	cec_pin_update(pin, v, false);
+ 	return v;
+@@ -143,13 +143,13 @@ static bool cec_pin_read(struct cec_pin *pin)
+ 
+ static void cec_pin_low(struct cec_pin *pin)
+ {
+-	pin->ops->low(pin->adap);
++	call_void_pin_op(pin, low);
+ 	cec_pin_update(pin, false, false);
+ }
+ 
+ static bool cec_pin_high(struct cec_pin *pin)
+ {
+-	pin->ops->high(pin->adap);
++	call_void_pin_op(pin, high);
+ 	return cec_pin_read(pin);
+ }
+ 
+@@ -1086,7 +1086,7 @@ static int cec_pin_thread_func(void *_adap)
+ 				    CEC_PIN_IRQ_UNCHANGED)) {
+ 		case CEC_PIN_IRQ_DISABLE:
+ 			if (irq_enabled) {
+-				pin->ops->disable_irq(adap);
++				call_void_pin_op(pin, disable_irq);
+ 				irq_enabled = false;
+ 			}
+ 			cec_pin_high(pin);
+@@ -1097,7 +1097,7 @@ static int cec_pin_thread_func(void *_adap)
+ 		case CEC_PIN_IRQ_ENABLE:
+ 			if (irq_enabled)
+ 				break;
+-			pin->enable_irq_failed = !pin->ops->enable_irq(adap);
++			pin->enable_irq_failed = !call_pin_op(pin, enable_irq);
+ 			if (pin->enable_irq_failed) {
+ 				cec_pin_to_idle(pin);
+ 				hrtimer_start(&pin->timer, ns_to_ktime(0),
+@@ -1112,8 +1112,8 @@ static int cec_pin_thread_func(void *_adap)
+ 		if (kthread_should_stop())
+ 			break;
+ 	}
+-	if (pin->ops->disable_irq && irq_enabled)
+-		pin->ops->disable_irq(adap);
++	if (irq_enabled)
++		call_void_pin_op(pin, disable_irq);
+ 	hrtimer_cancel(&pin->timer);
+ 	cec_pin_read(pin);
+ 	cec_pin_to_idle(pin);
+@@ -1207,7 +1207,7 @@ static void cec_pin_adap_status(struct cec_adapter *adap,
+ 	seq_printf(file, "state: %s\n", states[pin->state].name);
+ 	seq_printf(file, "tx_bit: %d\n", pin->tx_bit);
+ 	seq_printf(file, "rx_bit: %d\n", pin->rx_bit);
+-	seq_printf(file, "cec pin: %d\n", pin->ops->read(adap));
++	seq_printf(file, "cec pin: %d\n", call_pin_op(pin, read));
+ 	seq_printf(file, "cec pin events dropped: %u\n",
+ 		   pin->work_pin_events_dropped_cnt);
+ 	seq_printf(file, "irq failed: %d\n", pin->enable_irq_failed);
+@@ -1260,8 +1260,7 @@ static void cec_pin_adap_status(struct cec_adapter *adap,
+ 	pin->rx_data_bit_too_long_cnt = 0;
+ 	pin->rx_low_drive_cnt = 0;
+ 	pin->tx_low_drive_cnt = 0;
+-	if (pin->ops->status)
+-		pin->ops->status(adap, file);
++	call_void_pin_op(pin, status, file);
+ }
+ 
+ static int cec_pin_adap_monitor_all_enable(struct cec_adapter *adap,
+@@ -1277,7 +1276,7 @@ static void cec_pin_adap_free(struct cec_adapter *adap)
+ {
+ 	struct cec_pin *pin = adap->pin;
+ 
+-	if (pin->ops->free)
++	if (pin && pin->ops->free)
+ 		pin->ops->free(adap);
+ 	adap->pin = NULL;
+ 	kfree(pin);
+@@ -1287,7 +1286,7 @@ static int cec_pin_received(struct cec_adapter *adap, struct cec_msg *msg)
+ {
+ 	struct cec_pin *pin = adap->pin;
+ 
+-	if (pin->ops->received)
++	if (pin->ops->received && !adap->devnode.unregistered)
+ 		return pin->ops->received(adap, msg);
+ 	return -ENOMSG;
+ }
+diff --git a/drivers/media/cec/core/cec-priv.h b/drivers/media/cec/core/cec-priv.h
+index 7bdf855aaecd..c7d03ae3f76b 100644
+--- a/drivers/media/cec/core/cec-priv.h
++++ b/drivers/media/cec/core/cec-priv.h
+@@ -17,6 +17,16 @@
+ 			pr_info("cec-%s: " fmt, adap->name, ## arg);	\
+ 	} while (0)
+ 
++#define call_op(adap, op, arg...)					\
++	((adap->ops->op && !adap->devnode.unregistered) ?		\
++	 adap->ops->op(adap, ## arg) : 0)
++
++#define call_void_op(adap, op, arg...)					\
++	do {								\
++		if (adap->ops->op && !adap->devnode.unregistered)	\
++			adap->ops->op(adap, ## arg);			\
++	} while (0)
++
+ /* devnode to cec_adapter */
+ #define to_cec_adapter(node) container_of(node, struct cec_adapter, devnode)
+ 
