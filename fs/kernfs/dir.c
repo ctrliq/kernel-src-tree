@@ -771,12 +771,15 @@ int kernfs_add_one(struct kernfs_node *kn)
 		goto out_unlock;
 
 	/* Update timestamps on the parent */
+	down_write(&root->kernfs_iattr_rwsem);
+
 	ps_iattr = parent->iattr;
 	if (ps_iattr) {
 		ktime_get_real_ts64(&ps_iattr->ia_ctime);
 		ps_iattr->ia_mtime = ps_iattr->ia_ctime;
 	}
 
+	up_write(&root->kernfs_iattr_rwsem);
 	up_write(&root->kernfs_rwsem);
 
 	/*
@@ -938,6 +941,8 @@ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
 
 	idr_init(&root->ino_idr);
 	init_rwsem(&root->kernfs_rwsem);
+	init_rwsem(&root->kernfs_iattr_rwsem);
+	init_rwsem(&root->kernfs_supers_rwsem);
 	INIT_LIST_HEAD(&root->supers);
 
 	/*
@@ -1456,11 +1461,14 @@ static void __kernfs_remove(struct kernfs_node *kn)
 				pos->parent ? pos->parent->iattr : NULL;
 
 			/* update timestamps on the parent */
+			down_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+
 			if (ps_iattr) {
 				ktime_get_real_ts64(&ps_iattr->ia_ctime);
 				ps_iattr->ia_mtime = ps_iattr->ia_ctime;
 			}
 
+			up_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
 			kernfs_put(pos);
 		}
 
