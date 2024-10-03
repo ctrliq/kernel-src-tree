@@ -1,0 +1,141 @@
+dm-crypt: limit the size of encryption requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 0d815e3400e631d227a3a95968b8c8e7e0c0ef9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/0d815e34.failed
+
+There was a performance regression reported where dm-crypt would perform
+worse on new kernels than on old kernels. The reason is that the old
+kernels split the bios to NVMe request size (that is usually 65536 or
+131072 bytes) and the new kernels pass the big bios through dm-crypt and
+split them underneath.
+
+If a big 1MiB bio is passed to dm-crypt, dm-crypt processes it on a single
+core without parallelization and this is what causes the performance
+degradation.
+
+This commit introduces new tunable variables
+/sys/module/dm_crypt/parameters/max_read_size and
+/sys/module/dm_crypt/parameters/max_write_size that specify the maximum
+bio size for dm-crypt. Bios larger than this value are split, so that
+they can be encrypted in parallel by multiple cores. If these variables
+are '0', a default 131072 is used.
+
+Splitting bios may cause performance regressions in other workloads - if
+this happens, the user should increase the value in max_read_size and
+max_write_size variables.
+
+max_read_size:
+128k    2399MiB/s
+256k    2368MiB/s
+512k    1986MiB/s
+1024    1790MiB/s
+
+max_write_size:
+128k    1712MiB/s
+256k    1651MiB/s
+512k    1537MiB/s
+1024k   1332MiB/s
+
+Note that if you run dm-crypt inside a virtual machine, you may need to do
+"echo numa >/sys/module/workqueue/parameters/default_affinity_scope" to
+improve performance.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Tested-by: Laurence Oberman <loberman@redhat.com>
+(cherry picked from commit 0d815e3400e631d227a3a95968b8c8e7e0c0ef9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-crypt.c
+diff --cc drivers/md/dm-crypt.c
+index ba5dbca6ca9f,f46ff843d4c3..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -229,12 -237,37 +229,41 @@@ struct crypt_config 
+  #define POOL_ENTRY_SIZE	512
+  
+  static DEFINE_SPINLOCK(dm_crypt_clients_lock);
+ -static unsigned int dm_crypt_clients_n;
+ +static unsigned dm_crypt_clients_n = 0;
+  static volatile unsigned long dm_crypt_pages_per_client;
+  #define DM_CRYPT_MEMORY_PERCENT			2
+++<<<<<<< HEAD
+ +#define DM_CRYPT_MIN_PAGES_PER_CLIENT		(BIO_MAX_PAGES * 16)
+++=======
++ #define DM_CRYPT_MIN_PAGES_PER_CLIENT		(BIO_MAX_VECS * 16)
++ #define DM_CRYPT_DEFAULT_MAX_READ_SIZE		131072
++ #define DM_CRYPT_DEFAULT_MAX_WRITE_SIZE		131072
++ 
++ static unsigned int max_read_size = 0;
++ module_param(max_read_size, uint, 0644);
++ MODULE_PARM_DESC(max_read_size, "Maximum size of a read request");
++ static unsigned int max_write_size = 0;
++ module_param(max_write_size, uint, 0644);
++ MODULE_PARM_DESC(max_write_size, "Maximum size of a write request");
++ static unsigned get_max_request_size(struct crypt_config *cc, bool wrt)
++ {
++ 	unsigned val, sector_align;
++ 	val = !wrt ? READ_ONCE(max_read_size) : READ_ONCE(max_write_size);
++ 	if (likely(!val))
++ 		val = !wrt ? DM_CRYPT_DEFAULT_MAX_READ_SIZE : DM_CRYPT_DEFAULT_MAX_WRITE_SIZE;
++ 	if (wrt || cc->on_disk_tag_size) {
++ 		if (unlikely(val > BIO_MAX_VECS << PAGE_SHIFT))
++ 			val = BIO_MAX_VECS << PAGE_SHIFT;
++ 	}
++ 	sector_align = max(bdev_logical_block_size(cc->dev->bdev), (unsigned)cc->sector_size);
++ 	val = round_down(val, sector_align);
++ 	if (unlikely(!val))
++ 		val = sector_align;
++ 	return val >> SECTOR_SHIFT;
++ }
+++>>>>>>> 0d815e3400e6 (dm-crypt: limit the size of encryption requests)
+  
+ -static void crypt_endio(struct bio *clone);
+ +static void clone_init(struct dm_crypt_io *, struct bio *);
+  static void kcryptd_queue_crypt(struct dm_crypt_io *io);
+  static struct scatterlist *crypt_get_sg_data(struct crypt_config *cc,
+  					     struct scatterlist *sg);
+@@@ -3345,9 -3518,9 +3375,15 @@@ static int crypt_map(struct dm_target *
+  	/*
+  	 * Check if bio is too large, split as needed.
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_iter.bi_size > (BIO_MAX_PAGES << PAGE_SHIFT)) &&
+ +	    (bio_data_dir(bio) == WRITE || cc->on_disk_tag_size))
+ +		dm_accept_partial_bio(bio, ((BIO_MAX_PAGES << PAGE_SHIFT) >> SECTOR_SHIFT));
+++=======
++ 	max_sectors = get_max_request_size(cc, bio_data_dir(bio) == WRITE);
++ 	if (unlikely(bio_sectors(bio) > max_sectors))
++ 		dm_accept_partial_bio(bio, max_sectors);
+++>>>>>>> 0d815e3400e6 (dm-crypt: limit the size of encryption requests)
+  
+  	/*
+  	 * Ensure that bio is a multiple of internal sector encryption size
+diff --git a/Documentation/admin-guide/device-mapper/dm-crypt.rst b/Documentation/admin-guide/device-mapper/dm-crypt.rst
+index 4ba56c256c05..8d9af4ba1948 100644
+--- a/Documentation/admin-guide/device-mapper/dm-crypt.rst
++++ b/Documentation/admin-guide/device-mapper/dm-crypt.rst
+@@ -155,6 +155,17 @@ iv_large_sectors
+    The <iv_offset> must be multiple of <sector_size> (in 512 bytes units)
+    if this flag is specified.
+ 
++
++Module parameters::
++max_read_size
++max_write_size
++   Maximum size of read or write requests. When a request larger than this size
++   is received, dm-crypt will split the request. The splitting improves
++   concurrency (the split requests could be encrypted in parallel by multiple
++   cores), but it also causes overhead. The user should tune these parameters to
++   fit the actual workload.
++
++
+ Example scripts
+ ===============
+ LUKS (Linux Unified Key Setup) is now the preferred way to set up disk
+* Unmerged path drivers/md/dm-crypt.c
