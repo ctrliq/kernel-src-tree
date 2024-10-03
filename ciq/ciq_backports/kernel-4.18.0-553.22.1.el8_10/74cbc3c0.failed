@@ -1,0 +1,477 @@
+mlxsw: spectrum_acl_tcam: Move devlink param to TCAM code
+
+jira LE-1907
+cve CVE-2024-26595
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit 74cbc3c03c828ccf265a72f9bcb5aee906978744
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/74cbc3c0.failed
+
+Cited commit added 'DEVLINK_CMD_PARAM_DEL' notifications whenever the
+network namespace of the devlink instance is changed. Specifically, the
+notifications are generated after calling reload_down(), but before
+calling reload_up(). At this stage, the data structures accessed while
+reading the value of the "acl_region_rehash_interval" devlink parameter
+are uninitialized, resulting in a use-after-free [1].
+
+Fix by moving the registration and unregistration of the devlink
+parameter to the TCAM code where it is actually used. This means that
+the parameter is unregistered during reload_down() and then
+re-registered during reload_up(), avoiding the use-after-free between
+these two operations.
+
+Reproducer:
+
+ # ip netns add test123
+ # devlink dev reload pci/0000:06:00.0 netns test123
+
+[1]
+BUG: KASAN: use-after-free in mlxsw_sp_acl_tcam_vregion_rehash_intrvl_get+0xb2/0xd0
+Read of size 4 at addr ffff888162fd37d8 by task devlink/1323
+[...]
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0x95/0xbd
+ print_report+0x181/0x4a1
+ kasan_report+0xdb/0x200
+ mlxsw_sp_acl_tcam_vregion_rehash_intrvl_get+0xb2/0xd0
+ mlxsw_sp_params_acl_region_rehash_intrvl_get+0x32/0x80
+ devlink_nl_param_fill.constprop.0+0x29a/0x11e0
+ devlink_param_notify.constprop.0+0xb9/0x250
+ devlink_notify_unregister+0xbc/0x470
+ devlink_reload+0x1aa/0x440
+ devlink_nl_cmd_reload+0x559/0x11b0
+ genl_family_rcv_msg_doit.isra.0+0x1f8/0x2e0
+ genl_rcv_msg+0x558/0x7f0
+ netlink_rcv_skb+0x170/0x440
+ genl_rcv+0x2d/0x40
+ netlink_unicast+0x53f/0x810
+ netlink_sendmsg+0x961/0xe80
+ __sys_sendto+0x2a4/0x420
+ __x64_sys_sendto+0xe5/0x1c0
+ do_syscall_64+0x38/0x80
+ entry_SYSCALL_64_after_hwframe+0x63/0xcd
+
+Fixes: 7d7e9169a3ec ("devlink: move devlink reload notifications back in between _down() and _up() calls")
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Petr Machata <petrm@nvidia.com>
+	Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 74cbc3c03c828ccf265a72f9bcb5aee906978744)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index b3865448c3a1,a8f94b7544ee..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@@ -3342,64 -3861,8 +3342,67 @@@ static int mlxsw_sp_kvd_sizes_get(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +mlxsw_sp_params_acl_region_rehash_intrvl_get(struct devlink *devlink, u32 id,
+ +					     struct devlink_param_gset_ctx *ctx)
+ +{
+ +	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
+ +	struct mlxsw_sp *mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
+ +
+ +	ctx->val.vu32 = mlxsw_sp_acl_region_rehash_intrvl_get(mlxsw_sp);
+ +	return 0;
+ +}
+ +
+ +static int
+ +mlxsw_sp_params_acl_region_rehash_intrvl_set(struct devlink *devlink, u32 id,
+ +					     struct devlink_param_gset_ctx *ctx)
+ +{
+ +	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
+ +	struct mlxsw_sp *mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
+ +
+ +	return mlxsw_sp_acl_region_rehash_intrvl_set(mlxsw_sp, ctx->val.vu32);
+ +}
+ +
+ +static const struct devlink_param mlxsw_sp2_devlink_params[] = {
+ +	DEVLINK_PARAM_DRIVER(MLXSW_DEVLINK_PARAM_ID_ACL_REGION_REHASH_INTERVAL,
+ +			     "acl_region_rehash_interval",
+ +			     DEVLINK_PARAM_TYPE_U32,
+ +			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
+ +			     mlxsw_sp_params_acl_region_rehash_intrvl_get,
+ +			     mlxsw_sp_params_acl_region_rehash_intrvl_set,
+ +			     NULL),
+ +};
+ +
+ +static int mlxsw_sp2_params_register(struct mlxsw_core *mlxsw_core)
+ +{
+ +	struct devlink *devlink = priv_to_devlink(mlxsw_core);
+ +	union devlink_param_value value;
+ +	int err;
+ +
+ +	err = devlink_params_register(devlink, mlxsw_sp2_devlink_params,
+ +				      ARRAY_SIZE(mlxsw_sp2_devlink_params));
+ +	if (err)
+ +		return err;
+ +
+ +	value.vu32 = 0;
+ +	devlink_param_driverinit_value_set(devlink,
+ +					   MLXSW_DEVLINK_PARAM_ID_ACL_REGION_REHASH_INTERVAL,
+ +					   value);
+ +	return 0;
+ +}
+ +
+ +static void mlxsw_sp2_params_unregister(struct mlxsw_core *mlxsw_core)
+ +{
+ +	devlink_params_unregister(priv_to_devlink(mlxsw_core),
+ +				  mlxsw_sp2_devlink_params,
+ +				  ARRAY_SIZE(mlxsw_sp2_devlink_params));
+ +}
+ +
+++=======
+++>>>>>>> 74cbc3c03c82 (mlxsw: spectrum_acl_tcam: Move devlink param to TCAM code)
+  static void mlxsw_sp_ptp_transmitted(struct mlxsw_core *mlxsw_core,
+ -				     struct sk_buff *skb, u16 local_port)
+ +				     struct sk_buff *skb, u8 local_port)
+  {
+  	struct mlxsw_sp *mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
+  
+@@@ -3522,11 -3978,42 +3523,48 @@@ static struct mlxsw_driver mlxsw_sp3_dr
+  	.ptp_transmitted		= mlxsw_sp_ptp_transmitted,
+  	.txhdr_len			= MLXSW_TXHDR_LEN,
+  	.profile			= &mlxsw_sp2_config_profile,
+++<<<<<<< HEAD
+ +	.res_query_enabled		= true,
+ +	.fw_fatal_enabled		= true,
+ +	.temp_warn_enabled		= true,
+++=======
++ 	.sdq_supports_cqe_v2		= true,
++ };
++ 
++ static struct mlxsw_driver mlxsw_sp4_driver = {
++ 	.kind				= mlxsw_sp4_driver_name,
++ 	.priv_size			= sizeof(struct mlxsw_sp),
++ 	.init				= mlxsw_sp4_init,
++ 	.fini				= mlxsw_sp_fini,
++ 	.port_split			= mlxsw_sp_port_split,
++ 	.port_unsplit			= mlxsw_sp_port_unsplit,
++ 	.ports_remove_selected		= mlxsw_sp_ports_remove_selected,
++ 	.sb_pool_get			= mlxsw_sp_sb_pool_get,
++ 	.sb_pool_set			= mlxsw_sp_sb_pool_set,
++ 	.sb_port_pool_get		= mlxsw_sp_sb_port_pool_get,
++ 	.sb_port_pool_set		= mlxsw_sp_sb_port_pool_set,
++ 	.sb_tc_pool_bind_get		= mlxsw_sp_sb_tc_pool_bind_get,
++ 	.sb_tc_pool_bind_set		= mlxsw_sp_sb_tc_pool_bind_set,
++ 	.sb_occ_snapshot		= mlxsw_sp_sb_occ_snapshot,
++ 	.sb_occ_max_clear		= mlxsw_sp_sb_occ_max_clear,
++ 	.sb_occ_port_pool_get		= mlxsw_sp_sb_occ_port_pool_get,
++ 	.sb_occ_tc_port_bind_get	= mlxsw_sp_sb_occ_tc_port_bind_get,
++ 	.trap_init			= mlxsw_sp_trap_init,
++ 	.trap_fini			= mlxsw_sp_trap_fini,
++ 	.trap_action_set		= mlxsw_sp_trap_action_set,
++ 	.trap_group_init		= mlxsw_sp_trap_group_init,
++ 	.trap_group_set			= mlxsw_sp_trap_group_set,
++ 	.trap_policer_init		= mlxsw_sp_trap_policer_init,
++ 	.trap_policer_fini		= mlxsw_sp_trap_policer_fini,
++ 	.trap_policer_set		= mlxsw_sp_trap_policer_set,
++ 	.trap_policer_counter_get	= mlxsw_sp_trap_policer_counter_get,
++ 	.txhdr_construct		= mlxsw_sp_txhdr_construct,
++ 	.resources_register		= mlxsw_sp2_resources_register,
++ 	.ptp_transmitted		= mlxsw_sp_ptp_transmitted,
++ 	.txhdr_len			= MLXSW_TXHDR_LEN,
++ 	.profile			= &mlxsw_sp4_config_profile,
++ 	.sdq_supports_cqe_v2		= true,
+++>>>>>>> 74cbc3c03c82 (mlxsw: spectrum_acl_tcam: Move devlink param to TCAM code)
+  };
+  
+  bool mlxsw_sp_port_dev_check(const struct net_device *dev)
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+index 5a6f89dd08a1,d50786b0a6ce..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+@@@ -1583,6 -1447,153 +1549,156 @@@ mlxsw_sp_acl_tcam_vregion_rehash(struc
+  		mlxsw_sp_acl_tcam_vregion_rehash_end(mlxsw_sp, vregion, ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlxsw_sp_acl_tcam_region_rehash_intrvl_get(struct devlink *devlink, u32 id,
++ 					   struct devlink_param_gset_ctx *ctx)
++ {
++ 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
++ 	struct mlxsw_sp_acl_tcam *tcam;
++ 	struct mlxsw_sp *mlxsw_sp;
++ 
++ 	mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
++ 	tcam = mlxsw_sp_acl_to_tcam(mlxsw_sp->acl);
++ 	ctx->val.vu32 = tcam->vregion_rehash_intrvl;
++ 
++ 	return 0;
++ }
++ 
++ static int
++ mlxsw_sp_acl_tcam_region_rehash_intrvl_set(struct devlink *devlink, u32 id,
++ 					   struct devlink_param_gset_ctx *ctx)
++ {
++ 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
++ 	struct mlxsw_sp_acl_tcam_vregion *vregion;
++ 	struct mlxsw_sp_acl_tcam *tcam;
++ 	struct mlxsw_sp *mlxsw_sp;
++ 	u32 val = ctx->val.vu32;
++ 
++ 	if (val < MLXSW_SP_ACL_TCAM_VREGION_REHASH_INTRVL_MIN && val)
++ 		return -EINVAL;
++ 
++ 	mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
++ 	tcam = mlxsw_sp_acl_to_tcam(mlxsw_sp->acl);
++ 	tcam->vregion_rehash_intrvl = val;
++ 	mutex_lock(&tcam->lock);
++ 	list_for_each_entry(vregion, &tcam->vregion_list, tlist) {
++ 		if (val)
++ 			mlxsw_core_schedule_dw(&vregion->rehash.dw, 0);
++ 		else
++ 			cancel_delayed_work_sync(&vregion->rehash.dw);
++ 	}
++ 	mutex_unlock(&tcam->lock);
++ 	return 0;
++ }
++ 
++ static const struct devlink_param mlxsw_sp_acl_tcam_rehash_params[] = {
++ 	DEVLINK_PARAM_DRIVER(MLXSW_DEVLINK_PARAM_ID_ACL_REGION_REHASH_INTERVAL,
++ 			     "acl_region_rehash_interval",
++ 			     DEVLINK_PARAM_TYPE_U32,
++ 			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
++ 			     mlxsw_sp_acl_tcam_region_rehash_intrvl_get,
++ 			     mlxsw_sp_acl_tcam_region_rehash_intrvl_set,
++ 			     NULL),
++ };
++ 
++ static int mlxsw_sp_acl_tcam_rehash_params_register(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
++ 
++ 	if (!mlxsw_sp->acl_tcam_ops->region_rehash_hints_get)
++ 		return 0;
++ 
++ 	return devl_params_register(devlink, mlxsw_sp_acl_tcam_rehash_params,
++ 				    ARRAY_SIZE(mlxsw_sp_acl_tcam_rehash_params));
++ }
++ 
++ static void
++ mlxsw_sp_acl_tcam_rehash_params_unregister(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
++ 
++ 	if (!mlxsw_sp->acl_tcam_ops->region_rehash_hints_get)
++ 		return;
++ 
++ 	devl_params_unregister(devlink, mlxsw_sp_acl_tcam_rehash_params,
++ 			       ARRAY_SIZE(mlxsw_sp_acl_tcam_rehash_params));
++ }
++ 
++ int mlxsw_sp_acl_tcam_init(struct mlxsw_sp *mlxsw_sp,
++ 			   struct mlxsw_sp_acl_tcam *tcam)
++ {
++ 	const struct mlxsw_sp_acl_tcam_ops *ops = mlxsw_sp->acl_tcam_ops;
++ 	u64 max_tcam_regions;
++ 	u64 max_regions;
++ 	u64 max_groups;
++ 	int err;
++ 
++ 	mutex_init(&tcam->lock);
++ 	tcam->vregion_rehash_intrvl =
++ 			MLXSW_SP_ACL_TCAM_VREGION_REHASH_INTRVL_DFLT;
++ 	INIT_LIST_HEAD(&tcam->vregion_list);
++ 
++ 	err = mlxsw_sp_acl_tcam_rehash_params_register(mlxsw_sp);
++ 	if (err)
++ 		goto err_rehash_params_register;
++ 
++ 	max_tcam_regions = MLXSW_CORE_RES_GET(mlxsw_sp->core,
++ 					      ACL_MAX_TCAM_REGIONS);
++ 	max_regions = MLXSW_CORE_RES_GET(mlxsw_sp->core, ACL_MAX_REGIONS);
++ 
++ 	/* Use 1:1 mapping between ACL region and TCAM region */
++ 	if (max_tcam_regions < max_regions)
++ 		max_regions = max_tcam_regions;
++ 
++ 	tcam->used_regions = bitmap_zalloc(max_regions, GFP_KERNEL);
++ 	if (!tcam->used_regions) {
++ 		err = -ENOMEM;
++ 		goto err_alloc_used_regions;
++ 	}
++ 	tcam->max_regions = max_regions;
++ 
++ 	max_groups = MLXSW_CORE_RES_GET(mlxsw_sp->core, ACL_MAX_GROUPS);
++ 	tcam->used_groups = bitmap_zalloc(max_groups, GFP_KERNEL);
++ 	if (!tcam->used_groups) {
++ 		err = -ENOMEM;
++ 		goto err_alloc_used_groups;
++ 	}
++ 	tcam->max_groups = max_groups;
++ 	tcam->max_group_size = MLXSW_CORE_RES_GET(mlxsw_sp->core,
++ 						  ACL_MAX_GROUP_SIZE);
++ 
++ 	err = ops->init(mlxsw_sp, tcam->priv, tcam);
++ 	if (err)
++ 		goto err_tcam_init;
++ 
++ 	return 0;
++ 
++ err_tcam_init:
++ 	bitmap_free(tcam->used_groups);
++ err_alloc_used_groups:
++ 	bitmap_free(tcam->used_regions);
++ err_alloc_used_regions:
++ 	mlxsw_sp_acl_tcam_rehash_params_unregister(mlxsw_sp);
++ err_rehash_params_register:
++ 	mutex_destroy(&tcam->lock);
++ 	return err;
++ }
++ 
++ void mlxsw_sp_acl_tcam_fini(struct mlxsw_sp *mlxsw_sp,
++ 			    struct mlxsw_sp_acl_tcam *tcam)
++ {
++ 	const struct mlxsw_sp_acl_tcam_ops *ops = mlxsw_sp->acl_tcam_ops;
++ 
++ 	ops->fini(mlxsw_sp, tcam->priv);
++ 	bitmap_free(tcam->used_groups);
++ 	bitmap_free(tcam->used_regions);
++ 	mlxsw_sp_acl_tcam_rehash_params_unregister(mlxsw_sp);
++ 	mutex_destroy(&tcam->lock);
++ }
++ 
+++>>>>>>> 74cbc3c03c82 (mlxsw: spectrum_acl_tcam: Move devlink param to TCAM code)
+  static const enum mlxsw_afk_element mlxsw_sp_acl_tcam_pattern_ipv4[] = {
+  	MLXSW_AFK_ELEMENT_SRC_SYS_PORT,
+  	MLXSW_AFK_ELEMENT_DMAC_32_47,
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/core.c b/drivers/net/ethernet/mellanox/mlxsw/core.c
+index 9cc97818be78..a877614e9177 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@ -1642,29 +1642,12 @@ static const struct devlink_ops mlxsw_devlink_ops = {
+ 
+ static int mlxsw_core_params_register(struct mlxsw_core *mlxsw_core)
+ {
+-	int err;
+-
+-	err = mlxsw_core_fw_params_register(mlxsw_core);
+-	if (err)
+-		return err;
+-
+-	if (mlxsw_core->driver->params_register) {
+-		err = mlxsw_core->driver->params_register(mlxsw_core);
+-		if (err)
+-			goto err_params_register;
+-	}
+-	return 0;
+-
+-err_params_register:
+-	mlxsw_core_fw_params_unregister(mlxsw_core);
+-	return err;
++	return mlxsw_core_fw_params_register(mlxsw_core);
+ }
+ 
+ static void mlxsw_core_params_unregister(struct mlxsw_core *mlxsw_core)
+ {
+ 	mlxsw_core_fw_params_unregister(mlxsw_core);
+-	if (mlxsw_core->driver->params_register)
+-		mlxsw_core->driver->params_unregister(mlxsw_core);
+ }
+ 
+ struct mlxsw_core_health_event {
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/core.h b/drivers/net/ethernet/mellanox/mlxsw/core.h
+index d21981cc04ca..dc92614305ff 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.h
+@@ -388,8 +388,6 @@ struct mlxsw_driver {
+ 			     const struct mlxsw_config_profile *profile,
+ 			     u64 *p_single_size, u64 *p_double_size,
+ 			     u64 *p_linear_size);
+-	int (*params_register)(struct mlxsw_core *mlxsw_core);
+-	void (*params_unregister)(struct mlxsw_core *mlxsw_core);
+ 
+ 	/* Notify a driver that a timestamped packet was transmitted. Driver
+ 	 * is responsible for freeing the passed-in SKB.
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index 60d92454cfd3..e05042ddc996 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@ -892,6 +892,7 @@ enum mlxsw_sp_acl_profile {
+ };
+ 
+ struct mlxsw_afk *mlxsw_sp_acl_afk(struct mlxsw_sp_acl *acl);
++struct mlxsw_sp_acl_tcam *mlxsw_sp_acl_to_tcam(struct mlxsw_sp_acl *acl);
+ 
+ int mlxsw_sp_acl_ruleset_bind(struct mlxsw_sp *mlxsw_sp,
+ 			      struct mlxsw_sp_flow_block *block,
+@@ -1015,8 +1016,6 @@ mlxsw_sp_acl_act_cookie_lookup(struct mlxsw_sp *mlxsw_sp, u32 cookie_index)
+ 
+ int mlxsw_sp_acl_init(struct mlxsw_sp *mlxsw_sp);
+ void mlxsw_sp_acl_fini(struct mlxsw_sp *mlxsw_sp);
+-u32 mlxsw_sp_acl_region_rehash_intrvl_get(struct mlxsw_sp *mlxsw_sp);
+-int mlxsw_sp_acl_region_rehash_intrvl_set(struct mlxsw_sp *mlxsw_sp, u32 val);
+ 
+ struct mlxsw_sp_acl_mangle_action;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
+index 67cedfa76f78..58e9366b9075 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
+@@ -40,6 +40,11 @@ struct mlxsw_afk *mlxsw_sp_acl_afk(struct mlxsw_sp_acl *acl)
+ 	return acl->afk;
+ }
+ 
++struct mlxsw_sp_acl_tcam *mlxsw_sp_acl_to_tcam(struct mlxsw_sp_acl *acl)
++{
++	return &acl->tcam;
++}
++
+ struct mlxsw_sp_acl_ruleset_ht_key {
+ 	struct mlxsw_sp_flow_block *block;
+ 	u32 chain_index;
+@@ -1024,22 +1029,6 @@ void mlxsw_sp_acl_fini(struct mlxsw_sp *mlxsw_sp)
+ 	kfree(acl);
+ }
+ 
+-u32 mlxsw_sp_acl_region_rehash_intrvl_get(struct mlxsw_sp *mlxsw_sp)
+-{
+-	struct mlxsw_sp_acl *acl = mlxsw_sp->acl;
+-
+-	return mlxsw_sp_acl_tcam_vregion_rehash_intrvl_get(mlxsw_sp,
+-							   &acl->tcam);
+-}
+-
+-int mlxsw_sp_acl_region_rehash_intrvl_set(struct mlxsw_sp *mlxsw_sp, u32 val)
+-{
+-	struct mlxsw_sp_acl *acl = mlxsw_sp->acl;
+-
+-	return mlxsw_sp_acl_tcam_vregion_rehash_intrvl_set(mlxsw_sp,
+-							   &acl->tcam, val);
+-}
+-
+ struct mlxsw_sp_acl_rulei_ops mlxsw_sp1_acl_rulei_ops = {
+ 	.act_mangle_field = mlxsw_sp1_acl_rulei_act_mangle_field,
+ };
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.h b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.h
+index a41df10ade9b..dea80a977fa8 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.h
+@@ -29,11 +29,6 @@ int mlxsw_sp_acl_tcam_init(struct mlxsw_sp *mlxsw_sp,
+ 			   struct mlxsw_sp_acl_tcam *tcam);
+ void mlxsw_sp_acl_tcam_fini(struct mlxsw_sp *mlxsw_sp,
+ 			    struct mlxsw_sp_acl_tcam *tcam);
+-u32 mlxsw_sp_acl_tcam_vregion_rehash_intrvl_get(struct mlxsw_sp *mlxsw_sp,
+-						struct mlxsw_sp_acl_tcam *tcam);
+-int mlxsw_sp_acl_tcam_vregion_rehash_intrvl_set(struct mlxsw_sp *mlxsw_sp,
+-						struct mlxsw_sp_acl_tcam *tcam,
+-						u32 val);
+ int mlxsw_sp_acl_tcam_priority_get(struct mlxsw_sp *mlxsw_sp,
+ 				   struct mlxsw_sp_acl_rule_info *rulei,
+ 				   u32 *priority, bool fillup_priority);
