@@ -1,0 +1,301 @@
+KVM: selftests: Generalize check_clocksource() from kvm_clock_test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit e440c5f2e3e6893aeb39bbba6dd181207840a795
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/e440c5f2.failed
+
+Several existing x86 selftests need to check that the underlying system
+clocksource is TSC or based on TSC but every test implements its own
+check. As a first step towards unification, extract check_clocksource()
+from kvm_clock_test and split it into two functions: arch-neutral
+'sys_get_cur_clocksource()' and x86-specific 'sys_clocksource_is_tsc()'.
+Fix a couple of pre-existing issues in kvm_clock_test: memory leakage in
+check_clocksource() and using TEST_ASSERT() instead of TEST_REQUIRE().
+The change also makes the test fail when system clocksource can't be read
+from sysfs.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Link: https://lore.kernel.org/r/20240109141121.1619463-2-vkuznets@redhat.com
+[sean: eliminate if-elif pattern just to set a bool true]
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+(cherry picked from commit e440c5f2e3e6893aeb39bbba6dd181207840a795)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/include/test_util.h
+#	tools/testing/selftests/kvm/include/x86_64/processor.h
+#	tools/testing/selftests/kvm/lib/test_util.c
+#	tools/testing/selftests/kvm/lib/x86_64/processor.c
+#	tools/testing/selftests/kvm/x86_64/kvm_clock_test.c
+diff --cc tools/testing/selftests/kvm/include/test_util.h
+index 2ace289f8625,50a5e31ba8da..000000000000
+--- a/tools/testing/selftests/kvm/include/test_util.h
++++ b/tools/testing/selftests/kvm/include/test_util.h
+@@@ -134,13 -172,29 +134,31 @@@ static inline void *align_ptr_up(void *
+  	return (void *)align_up((unsigned long)x, size);
+  }
+  
+ -int atoi_paranoid(const char *num_str);
+ -
+ -static inline uint32_t atoi_positive(const char *name, const char *num_str)
+ +/*
+ + * Whether or not the given source type is shared memory (as opposed to
+ + * anonymous).
+ + */
+ +static inline bool backing_src_is_shared(enum vm_mem_backing_src_type t)
+  {
+ -	int num = atoi_paranoid(num_str);
+ -
+ -	TEST_ASSERT(num > 0, "%s must be greater than 0, got '%s'", name, num_str);
+ -	return num;
+ +	return vm_mem_backing_src_alias(t)->flag & MAP_SHARED;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline uint32_t atoi_non_negative(const char *name, const char *num_str)
++ {
++ 	int num = atoi_paranoid(num_str);
++ 
++ 	TEST_ASSERT(num >= 0, "%s must be non-negative, got '%s'", name, num_str);
++ 	return num;
++ }
++ 
++ int guest_vsnprintf(char *buf, int n, const char *fmt, va_list args);
++ __printf(3, 4) int guest_snprintf(char *buf, int n, const char *fmt, ...);
++ 
++ char *strdup_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2), nonnull(1)));
++ 
++ char *sys_get_cur_clocksource(void);
++ 
+++>>>>>>> e440c5f2e3e6 (KVM: selftests: Generalize check_clocksource() from kvm_clock_test)
+  #endif /* SELFTEST_KVM_TEST_UTIL_H */
+diff --cc tools/testing/selftests/kvm/include/x86_64/processor.h
+index d0d51adec76e,01eec72e0d3e..000000000000
+--- a/tools/testing/selftests/kvm/include/x86_64/processor.h
++++ b/tools/testing/selftests/kvm/include/x86_64/processor.h
+@@@ -505,14 -1249,28 +505,19 @@@ void __virt_pg_map(struct kvm_vm *vm, u
+  #define X86_CR0_CD          (1UL<<30) /* Cache Disable */
+  #define X86_CR0_PG          (1UL<<31) /* Paging */
+  
+ -#define PFERR_PRESENT_BIT 0
+ -#define PFERR_WRITE_BIT 1
+ -#define PFERR_USER_BIT 2
+ -#define PFERR_RSVD_BIT 3
+ -#define PFERR_FETCH_BIT 4
+ -#define PFERR_PK_BIT 5
+ -#define PFERR_SGX_BIT 15
+ -#define PFERR_GUEST_FINAL_BIT 32
+ -#define PFERR_GUEST_PAGE_BIT 33
+ -#define PFERR_IMPLICIT_ACCESS_BIT 48
+ -
+ -#define PFERR_PRESENT_MASK	BIT(PFERR_PRESENT_BIT)
+ -#define PFERR_WRITE_MASK	BIT(PFERR_WRITE_BIT)
+ -#define PFERR_USER_MASK		BIT(PFERR_USER_BIT)
+ -#define PFERR_RSVD_MASK		BIT(PFERR_RSVD_BIT)
+ -#define PFERR_FETCH_MASK	BIT(PFERR_FETCH_BIT)
+ -#define PFERR_PK_MASK		BIT(PFERR_PK_BIT)
+ -#define PFERR_SGX_MASK		BIT(PFERR_SGX_BIT)
+ -#define PFERR_GUEST_FINAL_MASK	BIT_ULL(PFERR_GUEST_FINAL_BIT)
+ -#define PFERR_GUEST_PAGE_MASK	BIT_ULL(PFERR_GUEST_PAGE_BIT)
+ -#define PFERR_IMPLICIT_ACCESS	BIT_ULL(PFERR_IMPLICIT_ACCESS_BIT)
+ +/* VMX_EPT_VPID_CAP bits */
+ +#define VMX_EPT_VPID_CAP_AD_BITS       (1ULL << 21)
+ +
+ +#define XSTATE_XTILE_CFG_BIT		17
+ +#define XSTATE_XTILE_DATA_BIT		18
+  
+++<<<<<<< HEAD
+ +#define XSTATE_XTILE_CFG_MASK		(1ULL << XSTATE_XTILE_CFG_BIT)
+ +#define XSTATE_XTILE_DATA_MASK		(1ULL << XSTATE_XTILE_DATA_BIT)
+ +#define XFEATURE_XTILE_MASK		(XSTATE_XTILE_CFG_MASK | \
+ +					XSTATE_XTILE_DATA_MASK)
+++=======
++ bool sys_clocksource_is_tsc(void);
++ 
+++>>>>>>> e440c5f2e3e6 (KVM: selftests: Generalize check_clocksource() from kvm_clock_test)
+  #endif /* SELFTEST_KVM_PROCESSOR_H */
+diff --cc tools/testing/selftests/kvm/lib/test_util.c
+index 6d23878bbfe1,5a8f8becb129..000000000000
+--- a/tools/testing/selftests/kvm/lib/test_util.c
++++ b/tools/testing/selftests/kvm/lib/test_util.c
+@@@ -334,3 -361,59 +334,62 @@@ long get_run_delay(void
+  
+  	return val[1];
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int atoi_paranoid(const char *num_str)
++ {
++ 	char *end_ptr;
++ 	long num;
++ 
++ 	errno = 0;
++ 	num = strtol(num_str, &end_ptr, 0);
++ 	TEST_ASSERT(!errno, "strtol(\"%s\") failed", num_str);
++ 	TEST_ASSERT(num_str != end_ptr,
++ 		    "strtol(\"%s\") didn't find a valid integer.", num_str);
++ 	TEST_ASSERT(*end_ptr == '\0',
++ 		    "strtol(\"%s\") failed to parse trailing characters \"%s\".",
++ 		    num_str, end_ptr);
++ 	TEST_ASSERT(num >= INT_MIN && num <= INT_MAX,
++ 		    "%ld not in range of [%d, %d]", num, INT_MIN, INT_MAX);
++ 
++ 	return num;
++ }
++ 
++ char *strdup_printf(const char *fmt, ...)
++ {
++ 	va_list ap;
++ 	char *str;
++ 
++ 	va_start(ap, fmt);
++ 	TEST_ASSERT(vasprintf(&str, fmt, ap) >= 0, "vasprintf() failed");
++ 	va_end(ap);
++ 
++ 	return str;
++ }
++ 
++ #define CLOCKSOURCE_PATH "/sys/devices/system/clocksource/clocksource0/current_clocksource"
++ 
++ char *sys_get_cur_clocksource(void)
++ {
++ 	char *clk_name;
++ 	struct stat st;
++ 	FILE *fp;
++ 
++ 	fp = fopen(CLOCKSOURCE_PATH, "r");
++ 	TEST_ASSERT(fp, "failed to open clocksource file, errno: %d", errno);
++ 
++ 	TEST_ASSERT(!fstat(fileno(fp), &st), "failed to stat clocksource file, errno: %d",
++ 		    errno);
++ 
++ 	clk_name = malloc(st.st_size);
++ 	TEST_ASSERT(clk_name, "failed to allocate buffer to read file");
++ 
++ 	TEST_ASSERT(fgets(clk_name, st.st_size, fp), "failed to read clocksource file: %d",
++ 		    ferror(fp));
++ 
++ 	fclose(fp);
++ 
++ 	return clk_name;
++ }
+++>>>>>>> e440c5f2e3e6 (KVM: selftests: Generalize check_clocksource() from kvm_clock_test)
+diff --cc tools/testing/selftests/kvm/lib/x86_64/processor.c
+index eb5e20676bc0,e6964ff2a37d..000000000000
+--- a/tools/testing/selftests/kvm/lib/x86_64/processor.c
++++ b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+@@@ -1543,3 -1283,29 +1543,32 @@@ unsigned long vm_compute_max_gfn(struc
+  done:
+  	return min(max_gfn, ht_gfn - 1);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /* Returns true if kvm_intel was loaded with unrestricted_guest=1. */
++ bool vm_is_unrestricted_guest(struct kvm_vm *vm)
++ {
++ 	/* Ensure that a KVM vendor-specific module is loaded. */
++ 	if (vm == NULL)
++ 		close(open_kvm_dev_path_or_exit());
++ 
++ 	return get_kvm_intel_param_bool("unrestricted_guest");
++ }
++ 
++ void kvm_selftest_arch_init(void)
++ {
++ 	host_cpu_is_intel = this_cpu_is_intel();
++ 	host_cpu_is_amd = this_cpu_is_amd();
++ }
++ 
++ bool sys_clocksource_is_tsc(void)
++ {
++ 	char *clk_name = sys_get_cur_clocksource();
++ 	bool ret = !strcmp(clk_name, "tsc\n");
++ 
++ 	free(clk_name);
++ 
++ 	return ret;
++ }
+++>>>>>>> e440c5f2e3e6 (KVM: selftests: Generalize check_clocksource() from kvm_clock_test)
+diff --cc tools/testing/selftests/kvm/x86_64/kvm_clock_test.c
+index 97731454f3f3,6fcc1a433587..000000000000
+--- a/tools/testing/selftests/kvm/x86_64/kvm_clock_test.c
++++ b/tools/testing/selftests/kvm/x86_64/kvm_clock_test.c
+@@@ -140,59 -132,20 +140,62 @@@ static void enter_guest(struct kvm_vm *
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +#define CLOCKSOURCE_PATH "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+ +
+ +static void check_clocksource(void)
+ +{
+ +	char *clk_name;
+ +	struct stat st;
+ +	FILE *fp;
+ +
+ +	fp = fopen(CLOCKSOURCE_PATH, "r");
+ +	if (!fp) {
+ +		pr_info("failed to open clocksource file: %d; assuming TSC.\n",
+ +			errno);
+ +		return;
+ +	}
+ +
+ +	if (fstat(fileno(fp), &st)) {
+ +		pr_info("failed to stat clocksource file: %d; assuming TSC.\n",
+ +			errno);
+ +		goto out;
+ +	}
+ +
+ +	clk_name = malloc(st.st_size);
+ +	TEST_ASSERT(clk_name, "failed to allocate buffer to read file\n");
+ +
+ +	if (!fgets(clk_name, st.st_size, fp)) {
+ +		pr_info("failed to read clocksource file: %d; assuming TSC.\n",
+ +			ferror(fp));
+ +		goto out;
+ +	}
+ +
+ +	TEST_ASSERT(!strncmp(clk_name, "tsc\n", st.st_size),
+ +		    "clocksource not supported: %s", clk_name);
+ +out:
+ +	fclose(fp);
+ +}
+ +
+++=======
+++>>>>>>> e440c5f2e3e6 (KVM: selftests: Generalize check_clocksource() from kvm_clock_test)
+  int main(void)
+  {
+ -	struct kvm_vcpu *vcpu;
+  	vm_vaddr_t pvti_gva;
+  	vm_paddr_t pvti_gpa;
+  	struct kvm_vm *vm;
+  	int flags;
+  
+  	flags = kvm_check_cap(KVM_CAP_ADJUST_CLOCK);
+ -	TEST_REQUIRE(flags & KVM_CLOCK_REALTIME);
+ +	if (!(flags & KVM_CLOCK_REALTIME)) {
+ +		print_skip("KVM_CLOCK_REALTIME not supported; flags: %x",
+ +			   flags);
+ +		exit(KSFT_SKIP);
+ +	}
+  
+- 	check_clocksource();
++ 	TEST_REQUIRE(sys_clocksource_is_tsc());
+  
+ -	vm = vm_create_with_one_vcpu(&vcpu, guest_main);
+ +	vm = vm_create_default(VCPU_ID, 0, guest_main);
+  
+  	pvti_gva = vm_vaddr_alloc(vm, getpagesize(), 0x10000);
+  	pvti_gpa = addr_gva2gpa(vm, pvti_gva);
+* Unmerged path tools/testing/selftests/kvm/include/test_util.h
+* Unmerged path tools/testing/selftests/kvm/include/x86_64/processor.h
+* Unmerged path tools/testing/selftests/kvm/lib/test_util.c
+* Unmerged path tools/testing/selftests/kvm/lib/x86_64/processor.c
+* Unmerged path tools/testing/selftests/kvm/x86_64/kvm_clock_test.c
