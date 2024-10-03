@@ -1,0 +1,165 @@
+vt_ioctl: fix array_index_nospec in vt_setactivate
+
+jira LE-1907
+cve CVE-2022-48804
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Jakob Koschel <jakobkoschel@gmail.com>
+commit 61cc70d9e8ef5b042d4ed87994d20100ec8896d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/61cc70d9.failed
+
+array_index_nospec ensures that an out-of-bounds value is set to zero
+on the transient path. Decreasing the value by one afterwards causes
+a transient integer underflow. vsa.console should be decreased first
+and then sanitized with array_index_nospec.
+
+Kasper Acknowledgements: Jakob Koschel, Brian Johannesmeyer, Kaveh
+Razavi, Herbert Bos, Cristiano Giuffrida from the VUSec group at VU
+Amsterdam.
+
+Co-developed-by: Brian Johannesmeyer <bjohannesmeyer@gmail.com>
+	Signed-off-by: Brian Johannesmeyer <bjohannesmeyer@gmail.com>
+	Signed-off-by: Jakob Koschel <jakobkoschel@gmail.com>
+Link: https://lore.kernel.org/r/20220127144406.3589293-1-jakobkoschel@gmail.com
+	Cc: stable <stable@vger.kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 61cc70d9e8ef5b042d4ed87994d20100ec8896d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/vt/vt_ioctl.c
+diff --cc drivers/tty/vt/vt_ioctl.c
+index dc2162446156,e0714a9c9fd7..000000000000
+--- a/drivers/tty/vt/vt_ioctl.c
++++ b/drivers/tty/vt/vt_ioctl.c
+@@@ -301,6 -507,125 +301,128 @@@ do_unimap_ioctl(int cmd, struct unimapd
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vt_io_ioctl(struct vc_data *vc, unsigned int cmd, void __user *up,
++ 		bool perm)
++ {
++ 	switch (cmd) {
++ 	case PIO_CMAP:
++ 		if (!perm)
++ 			return -EPERM;
++ 		return con_set_cmap(up);
++ 
++ 	case GIO_CMAP:
++ 		return con_get_cmap(up);
++ 
++ 	case PIO_SCRNMAP:
++ 		if (!perm)
++ 			return -EPERM;
++ 		return con_set_trans_old(up);
++ 
++ 	case GIO_SCRNMAP:
++ 		return con_get_trans_old(up);
++ 
++ 	case PIO_UNISCRNMAP:
++ 		if (!perm)
++ 			return -EPERM;
++ 		return con_set_trans_new(up);
++ 
++ 	case GIO_UNISCRNMAP:
++ 		return con_get_trans_new(up);
++ 
++ 	case PIO_UNIMAPCLR:
++ 		if (!perm)
++ 			return -EPERM;
++ 		con_clear_unimap(vc);
++ 		break;
++ 
++ 	case PIO_UNIMAP:
++ 	case GIO_UNIMAP:
++ 		return do_unimap_ioctl(cmd, up, perm, vc);
++ 
++ 	default:
++ 		return -ENOIOCTLCMD;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int vt_reldisp(struct vc_data *vc, unsigned int swtch)
++ {
++ 	int newvt, ret;
++ 
++ 	if (vc->vt_mode.mode != VT_PROCESS)
++ 		return -EINVAL;
++ 
++ 	/* Switched-to response */
++ 	if (vc->vt_newvt < 0) {
++ 		 /* If it's just an ACK, ignore it */
++ 		return swtch == VT_ACKACQ ? 0 : -EINVAL;
++ 	}
++ 
++ 	/* Switching-from response */
++ 	if (swtch == 0) {
++ 		/* Switch disallowed, so forget we were trying to do it. */
++ 		vc->vt_newvt = -1;
++ 		return 0;
++ 	}
++ 
++ 	/* The current vt has been released, so complete the switch. */
++ 	newvt = vc->vt_newvt;
++ 	vc->vt_newvt = -1;
++ 	ret = vc_allocate(newvt);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * When we actually do the console switch, make sure we are atomic with
++ 	 * respect to other console switches..
++ 	 */
++ 	complete_change_console(vc_cons[newvt].d);
++ 
++ 	return 0;
++ }
++ 
++ static int vt_setactivate(struct vt_setactivate __user *sa)
++ {
++ 	struct vt_setactivate vsa;
++ 	struct vc_data *nvc;
++ 	int ret;
++ 
++ 	if (copy_from_user(&vsa, sa, sizeof(vsa)))
++ 		return -EFAULT;
++ 	if (vsa.console == 0 || vsa.console > MAX_NR_CONSOLES)
++ 		return -ENXIO;
++ 
++ 	vsa.console--;
++ 	vsa.console = array_index_nospec(vsa.console, MAX_NR_CONSOLES);
++ 	console_lock();
++ 	ret = vc_allocate(vsa.console);
++ 	if (ret) {
++ 		console_unlock();
++ 		return ret;
++ 	}
++ 
++ 	/*
++ 	 * This is safe providing we don't drop the console sem between
++ 	 * vc_allocate and finishing referencing nvc.
++ 	 */
++ 	nvc = vc_cons[vsa.console].d;
++ 	nvc->vt_mode = vsa.mode;
++ 	nvc->vt_mode.frsig = 0;
++ 	put_pid(nvc->vt_pid);
++ 	nvc->vt_pid = get_pid(task_pid(current));
++ 	console_unlock();
++ 
++ 	/* Commence switch and lock */
++ 	/* Review set_console locks */
++ 	set_console(vsa.console);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 61cc70d9e8ef (vt_ioctl: fix array_index_nospec in vt_setactivate)
+  /* deallocate a single console, if possible (leave 0) */
+  static int vt_disallocate(unsigned int vc_num)
+  {
+* Unmerged path drivers/tty/vt/vt_ioctl.c
