@@ -1,0 +1,137 @@
+ceph: force sending a cap update msg back to MDS for revoke op
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.35.1.el9_4
+commit-author Xiubo Li <xiubli@redhat.com>
+commit 31634d7597d8c57894b6c98eeefc9e58cf842993
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.35.1.el9_4/31634d75.failed
+
+If a client sends out a cap update dropping caps with the prior 'seq'
+just before an incoming cap revoke request, then the client may drop
+the revoke because it believes it's already released the requested
+capabilities.
+
+This causes the MDS to wait indefinitely for the client to respond
+to the revoke. It's therefore always a good idea to ack the cap
+revoke request with the bumped up 'seq'.
+
+Currently if the cap->issued equals to the newcaps the check_caps()
+will do nothing, we should force flush the caps.
+
+	Cc: stable@vger.kernel.org
+Link: https://tracker.ceph.com/issues/61782
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Venky Shankar <vshankar@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 31634d7597d8c57894b6c98eeefc9e58cf842993)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/caps.c
+diff --cc fs/ceph/caps.c
+index c337c1643906,808c9c048276..000000000000
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@@ -1979,9 -2098,9 +1981,15 @@@ retry
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	dout("check_caps %llx.%llx file_want %s used %s dirty %s flushing %s"
+ +	     " issued %s revoking %s retain %s %s%s%s\n", ceph_vinop(inode),
+ +	     ceph_cap_string(file_wanted),
+++=======
++ 	doutc(cl, "%p %llx.%llx file_want %s used %s dirty %s "
++ 	      "flushing %s issued %s revoking %s retain %s %s%s%s%s\n",
++ 	     inode, ceph_vinop(inode), ceph_cap_string(file_wanted),
+++>>>>>>> 31634d7597d8 (ceph: force sending a cap update msg back to MDS for revoke op)
+  	     ceph_cap_string(used), ceph_cap_string(ci->i_dirty_caps),
+  	     ceph_cap_string(ci->i_flushing_caps),
+  	     ceph_cap_string(issued), ceph_cap_string(revoking),
+@@@ -3364,11 -3518,22 +3378,13 @@@ static void handle_cap_grant(struct ino
+  	bool queue_invalidate = false;
+  	bool deleted_inode = false;
+  	bool fill_inline = false;
++ 	bool revoke_wait = false;
++ 	int flags = 0;
+  
+ -	/*
+ -	 * If there is at least one crypto block then we'll trust
+ -	 * fscrypt_file_size. If the real length of the file is 0, then
+ -	 * ignore it (it has probably been truncated down to 0 by the MDS).
+ -	 */
+ -	if (IS_ENCRYPTED(inode) && size)
+ -		size = extra_info->fscrypt_file_size;
+ -
+ -	doutc(cl, "%p %llx.%llx cap %p mds%d seq %d %s\n", inode,
+ -	      ceph_vinop(inode), cap, session->s_mds, seq,
+ -	      ceph_cap_string(newcaps));
+ -	doutc(cl, " size %llu max_size %llu, i_size %llu\n", size,
+ -	      max_size, i_size_read(inode));
+ +	dout("handle_cap_grant inode %p cap %p mds%d seq %d %s\n",
+ +	     inode, cap, session->s_mds, seq, ceph_cap_string(newcaps));
+ +	dout(" size %llu max_size %llu, i_size %llu\n", size, max_size,
+ +		i_size_read(inode));
+  
+  
+  	/*
+@@@ -3537,21 -3711,25 +3553,29 @@@
+  	if (cap->issued & ~newcaps) {
+  		int revoking = cap->issued & ~newcaps;
+  
+ -		doutc(cl, "revocation: %s -> %s (revoking %s)\n",
+ -		      ceph_cap_string(cap->issued), ceph_cap_string(newcaps),
+ -		      ceph_cap_string(revoking));
+ +		dout("revocation: %s -> %s (revoking %s)\n",
+ +		     ceph_cap_string(cap->issued),
+ +		     ceph_cap_string(newcaps),
+ +		     ceph_cap_string(revoking));
+  		if (S_ISREG(inode->i_mode) &&
+- 		    (revoking & used & CEPH_CAP_FILE_BUFFER))
++ 		    (revoking & used & CEPH_CAP_FILE_BUFFER)) {
+  			writeback = true;  /* initiate writeback; will delay ack */
+- 		else if (queue_invalidate &&
++ 			revoke_wait = true;
++ 		} else if (queue_invalidate &&
+  			 revoking == CEPH_CAP_FILE_CACHE &&
+- 			 (newcaps & CEPH_CAP_FILE_LAZYIO) == 0)
+- 			; /* do nothing yet, invalidation will be queued */
+- 		else if (cap == ci->i_auth_cap)
++ 			 (newcaps & CEPH_CAP_FILE_LAZYIO) == 0) {
++ 			revoke_wait = true; /* do nothing yet, invalidation will be queued */
++ 		} else if (cap == ci->i_auth_cap) {
+  			check_caps = 1; /* check auth cap only */
+- 		else
++ 		} else {
+  			check_caps = 2; /* check all caps */
+++<<<<<<< HEAD
+++=======
++ 		}
++ 		/* If there is new caps, try to wake up the waiters */
++ 		if (~cap->issued & newcaps)
++ 			wake = true;
+++>>>>>>> 31634d7597d8 (ceph: force sending a cap update msg back to MDS for revoke op)
+  		cap->issued = newcaps;
+  		cap->implemented |= newcaps;
+  	} else if (cap->issued == newcaps) {
+* Unmerged path fs/ceph/caps.c
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 437bd0065960..7e92606db164 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -194,9 +194,10 @@ struct ceph_cap {
+ 	struct list_head caps_item;
+ };
+ 
+-#define CHECK_CAPS_AUTHONLY   1  /* only check auth cap */
+-#define CHECK_CAPS_FLUSH      2  /* flush any dirty caps */
+-#define CHECK_CAPS_NOINVAL    4  /* don't invalidate pagecache */
++#define CHECK_CAPS_AUTHONLY     1  /* only check auth cap */
++#define CHECK_CAPS_FLUSH        2  /* flush any dirty caps */
++#define CHECK_CAPS_NOINVAL      4  /* don't invalidate pagecache */
++#define CHECK_CAPS_FLUSH_FORCE  8  /* force flush any caps */
+ 
+ struct ceph_cap_flush {
+ 	u64 tid;
