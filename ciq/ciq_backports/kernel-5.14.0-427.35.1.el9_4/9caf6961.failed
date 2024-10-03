@@ -1,0 +1,271 @@
+kernfs: Introduce separate rwsem to protect inode attributes.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.35.1.el9_4
+Rebuild_CHGLOG: - kernfs: Introduce separate rwsem to protect inode attributes (Jay Shin) [RHEL-55253 RHEL-52956]
+Rebuild_FUZZ: 99.17%
+commit-author Imran Khan <imran.f.khan@oracle.com>
+commit 9caf696142252a466fb89e629d0eddcdced027b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.35.1.el9_4/9caf6961.failed
+
+Right now a global per-fs rwsem (kernfs_rwsem) synchronizes multiple
+kernfs operations. On a large system with few hundred CPUs and few
+hundred applications simultaneoulsy trying to access sysfs, this
+results in multiple sys_open(s) contending on kernfs_rwsem via
+kernfs_iop_permission and kernfs_dop_revalidate.
+
+For example on a system with 384 cores, if I run 200 instances of an
+application which is mostly executing the following loop:
+
+  for (int loop = 0; loop <100 ; loop++)
+  {
+    for (int port_num = 1; port_num < 2; port_num++)
+    {
+      for (int gid_index = 0; gid_index < 254; gid_index++ )
+      {
+        char ret_buf[64], ret_buf_lo[64];
+        char gid_file_path[1024];
+
+        int      ret_len;
+        int      ret_fd;
+        ssize_t  ret_rd;
+
+        ub4  i, saved_errno;
+
+        memset(ret_buf, 0, sizeof(ret_buf));
+        memset(gid_file_path, 0, sizeof(gid_file_path));
+
+        ret_len = snprintf(gid_file_path, sizeof(gid_file_path),
+                           "/sys/class/infiniband/%s/ports/%d/gids/%d",
+                           dev_name,
+                           port_num,
+                           gid_index);
+
+        ret_fd = open(gid_file_path, O_RDONLY | O_CLOEXEC);
+        if (ret_fd < 0)
+        {
+          printf("Failed to open %s\n", gid_file_path);
+          continue;
+        }
+
+        /* Read the GID */
+        ret_rd = read(ret_fd, ret_buf, 40);
+
+        if (ret_rd == -1)
+        {
+          printf("Failed to read from file %s, errno: %u\n",
+                 gid_file_path, saved_errno);
+
+          continue;
+        }
+
+        close(ret_fd);
+      }
+    }
+
+I see contention around kernfs_rwsem as follows:
+
+path_openat
+|
+|----link_path_walk.part.0.constprop.0
+|      |
+|      |--49.92%--inode_permission
+|      |          |
+|      |           --48.69%--kernfs_iop_permission
+|      |                     |
+|      |                     |--18.16%--down_read
+|      |                     |
+|      |                     |--15.38%--up_read
+|      |                     |
+|      |                      --14.58%--_raw_spin_lock
+|      |                                |
+|      |                                 -----
+|      |
+|      |--29.08%--walk_component
+|      |          |
+|      |           --29.02%--lookup_fast
+|      |                     |
+|      |                     |--24.26%--kernfs_dop_revalidate
+|      |                     |          |
+|      |                     |          |--14.97%--down_read
+|      |                     |          |
+|      |                     |           --9.01%--up_read
+|      |                     |
+|      |                      --4.74%--__d_lookup
+|      |                                |
+|      |                                 --4.64%--_raw_spin_lock
+|      |                                           |
+|      |                                            ----
+
+Having a separate per-fs rwsem to protect kernfs inode attributes,
+will avoid the above mentioned contention and result in better
+performance as can bee seen below:
+
+path_openat
+|
+|----link_path_walk.part.0.constprop.0
+|     |
+|     |
+|     |--27.06%--inode_permission
+|     |          |
+|     |           --25.84%--kernfs_iop_permission
+|     |                     |
+|     |                     |--9.29%--up_read
+|     |                     |
+|     |                     |--8.19%--down_read
+|     |                     |
+|     |                      --7.89%--_raw_spin_lock
+|     |                                |
+|     |                                 ----
+|     |
+|     |--22.42%--walk_component
+|     |          |
+|     |           --22.36%--lookup_fast
+|     |                     |
+|     |                     |--16.07%--__d_lookup
+|     |                     |          |
+|     |                     |           --16.01%--_raw_spin_lock
+|     |                     |                     |
+|     |                     |                      ----
+|     |                     |
+|     |                      --6.28%--kernfs_dop_revalidate
+|     |                                |
+|     |                                |--3.76%--down_read
+|     |                                |
+|     |                                 --2.26%--up_read
+
+As can be seen from the above data the overhead due to both
+kerfs_iop_permission and kernfs_dop_revalidate have gone down and
+this also reduces overall run time of the earlier mentioned loop.
+
+	Signed-off-by: Imran Khan <imran.f.khan@oracle.com>
+Link: https://lore.kernel.org/r/20230309110932.2889010-2-imran.f.khan@oracle.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9caf696142252a466fb89e629d0eddcdced027b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/inode.c
+diff --cc fs/kernfs/inode.c
+index 74f3453f4639,b22b74d1a115..000000000000
+--- a/fs/kernfs/inode.c
++++ b/fs/kernfs/inode.c
+@@@ -119,8 -119,8 +119,13 @@@ int kernfs_iop_setattr(struct user_name
+  		return -EINVAL;
+  
+  	root = kernfs_root(kn);
+++<<<<<<< HEAD
+ +	down_write(&root->kernfs_rwsem);
+ +	error = setattr_prepare(&init_user_ns, dentry, iattr);
+++=======
++ 	down_write(&root->kernfs_iattr_rwsem);
++ 	error = setattr_prepare(&nop_mnt_idmap, dentry, iattr);
+++>>>>>>> 9caf69614225 (kernfs: Introduce separate rwsem to protect inode attributes.)
+  	if (error)
+  		goto out;
+  
+@@@ -129,10 -129,10 +134,10 @@@
+  		goto out;
+  
+  	/* this ignores size changes */
+ -	setattr_copy(&nop_mnt_idmap, inode, iattr);
+ +	setattr_copy(&init_user_ns, inode, iattr);
+  
+  out:
+- 	up_write(&root->kernfs_rwsem);
++ 	up_write(&root->kernfs_iattr_rwsem);
+  	return error;
+  }
+  
+@@@ -189,10 -189,10 +194,15 @@@ int kernfs_iop_getattr(struct user_name
+  	struct kernfs_node *kn = inode->i_private;
+  	struct kernfs_root *root = kernfs_root(kn);
+  
+- 	down_read(&root->kernfs_rwsem);
++ 	down_read(&root->kernfs_iattr_rwsem);
+  	kernfs_refresh_inode(kn, inode);
+++<<<<<<< HEAD
+ +	generic_fillattr(&init_user_ns, inode, stat);
+ +	up_read(&root->kernfs_rwsem);
+++=======
++ 	generic_fillattr(&nop_mnt_idmap, inode, stat);
++ 	up_read(&root->kernfs_iattr_rwsem);
+++>>>>>>> 9caf69614225 (kernfs: Introduce separate rwsem to protect inode attributes.)
+  
+  	return 0;
+  }
+@@@ -285,10 -285,10 +295,15 @@@ int kernfs_iop_permission(struct user_n
+  	kn = inode->i_private;
+  	root = kernfs_root(kn);
+  
+- 	down_read(&root->kernfs_rwsem);
++ 	down_read(&root->kernfs_iattr_rwsem);
+  	kernfs_refresh_inode(kn, inode);
+++<<<<<<< HEAD
+ +	ret = generic_permission(&init_user_ns, inode, mask);
+ +	up_read(&root->kernfs_rwsem);
+++=======
++ 	ret = generic_permission(&nop_mnt_idmap, inode, mask);
++ 	up_read(&root->kernfs_iattr_rwsem);
+++>>>>>>> 9caf69614225 (kernfs: Introduce separate rwsem to protect inode attributes.)
+  
+  	return ret;
+  }
+diff --git a/fs/kernfs/dir.c b/fs/kernfs/dir.c
+index 7172d1aa289a..2a9b29a3a500 100644
+--- a/fs/kernfs/dir.c
++++ b/fs/kernfs/dir.c
+@@ -759,12 +759,15 @@ int kernfs_add_one(struct kernfs_node *kn)
+ 		goto out_unlock;
+ 
+ 	/* Update timestamps on the parent */
++	down_write(&root->kernfs_iattr_rwsem);
++
+ 	ps_iattr = parent->iattr;
+ 	if (ps_iattr) {
+ 		ktime_get_real_ts64(&ps_iattr->ia_ctime);
+ 		ps_iattr->ia_mtime = ps_iattr->ia_ctime;
+ 	}
+ 
++	up_write(&root->kernfs_iattr_rwsem);
+ 	up_write(&root->kernfs_rwsem);
+ 
+ 	/*
+@@ -927,6 +930,7 @@ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
+ 
+ 	idr_init(&root->ino_idr);
+ 	init_rwsem(&root->kernfs_rwsem);
++	init_rwsem(&root->kernfs_iattr_rwsem);
+ 	INIT_LIST_HEAD(&root->supers);
+ 
+ 	/*
+@@ -1445,11 +1449,14 @@ static void __kernfs_remove(struct kernfs_node *kn)
+ 				pos->parent ? pos->parent->iattr : NULL;
+ 
+ 			/* update timestamps on the parent */
++			down_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
++
+ 			if (ps_iattr) {
+ 				ktime_get_real_ts64(&ps_iattr->ia_ctime);
+ 				ps_iattr->ia_mtime = ps_iattr->ia_ctime;
+ 			}
+ 
++			up_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+ 			kernfs_put(pos);
+ 		}
+ 
+* Unmerged path fs/kernfs/inode.c
+diff --git a/fs/kernfs/kernfs-internal.h b/fs/kernfs/kernfs-internal.h
+index fc5821effd97..4620b74f44b0 100644
+--- a/fs/kernfs/kernfs-internal.h
++++ b/fs/kernfs/kernfs-internal.h
+@@ -47,6 +47,7 @@ struct kernfs_root {
+ 
+ 	wait_queue_head_t	deactivate_waitq;
+ 	struct rw_semaphore	kernfs_rwsem;
++	struct rw_semaphore	kernfs_iattr_rwsem;
+ };
+ 
+ /* +1 to avoid triggering overflow warning when negating it */
