@@ -5,18 +5,14 @@ kapi := $(gen)/asm
 
 kapi-hdrs-y := $(kapi)/cpucaps.h $(kapi)/sysreg-defs.h
 
-targets += $(addprefix ../../../,$(gen-y) $(kapi-hdrs-y))
+targets += $(addprefix ../../../, $(kapi-hdrs-y))
 
 PHONY += kapi
 
-kapi:   $(kapi-hdrs-y) $(gen-y)
-
-# Create output directory if not already present
-_dummy := $(shell [ -d '$(kapi)' ] || mkdir -p '$(kapi)')
+kapi:   $(kapi-hdrs-y)
 
 quiet_cmd_gen_cpucaps = GEN     $@
-      cmd_gen_cpucaps = mkdir -p $(dir $@) && \
-                     $(AWK) -f $(filter-out $(PHONY),$^) > $@
+      cmd_gen_cpucaps = mkdir -p $(dir $@); $(AWK) -f $(real-prereqs) > $@
 
 quiet_cmd_gen_sysreg = GEN     $@
       cmd_gen_sysreg = mkdir -p $(dir $@); $(AWK) -f $(real-prereqs) > $@
