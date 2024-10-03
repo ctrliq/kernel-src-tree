@@ -1571,7 +1571,7 @@ static int amd_pstate_epp_cpu_exit(struct cpufreq_policy *policy)
 	return 0;
 }
 
-static void amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
+static int amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
 {
 	struct amd_cpudata *cpudata = policy->driver_data;
 	u32 max_perf, min_perf, min_limit_perf, max_limit_perf;
@@ -1621,7 +1621,7 @@ static void amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
 		 * This return value can only be negative for shared_memory
 		 * systems where EPP register read/write not supported.
 		 */
-		return;
+		return epp;
 	}
 
 	if (cpudata->policy == CPUFREQ_POLICY_PERFORMANCE)
@@ -1634,12 +1634,13 @@ static void amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
 	}
 
 	WRITE_ONCE(cpudata->cppc_req_cached, value);
-	amd_pstate_set_epp(cpudata, epp);
+	return amd_pstate_set_epp(cpudata, epp);
 }
 
 static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
 {
 	struct amd_cpudata *cpudata = policy->driver_data;
+	int ret;
 
 	if (!policy->cpuinfo.max_freq)
 		return -ENODEV;
@@ -1649,7 +1650,9 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
 
 	cpudata->policy = policy->policy;
 
-	amd_pstate_epp_update_limit(policy);
+	ret = amd_pstate_epp_update_limit(policy);
+	if (ret)
+		return ret;
 
 	/*
 	 * policy->cur is never updated with the amd_pstate_epp driver, but it
