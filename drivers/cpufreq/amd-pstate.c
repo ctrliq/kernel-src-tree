@@ -1879,8 +1879,10 @@ static int __init amd_pstate_init(void)
 	}
 
 	ret = cpufreq_register_driver(current_pstate_driver);
-	if (ret)
+	if (ret) {
 		pr_err("failed to register with return %d\n", ret);
+		goto disable_driver;
+	}
 
 	dev_root = bus_get_dev_root(&cpu_subsys);
 	if (dev_root) {
@@ -1896,6 +1898,8 @@ static int __init amd_pstate_init(void)
 
 global_attr_free:
 	cpufreq_unregister_driver(current_pstate_driver);
+disable_driver:
+	amd_pstate_enable(false);
 	return ret;
 }
 device_initcall(amd_pstate_init);
