@@ -1,0 +1,100 @@
+block: fix that util can be greater than 100%
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 7be835694daebbb4adffbc461519081aa0cf28e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/7be83569.failed
+
+util means the percentage that disk has IO, and theoretically it should
+not be greater than 100%. However, there is a gap for rq-based disk:
+
+io_ticks will be updated when rq is allocated, however, before such rq
+dispatch to driver, it will not be account as inflight from
+blk_mq_start_request() hence diskstats_show()/part_stat_show() will not
+update io_ticks. For example:
+
+1) at t0, issue a new IO, rq is allocated, and blk_account_io_start()
+update io_ticks;
+
+2) something is wrong with drivers, and the rq can't be dispatched;
+
+3) at t0 + 10s, drivers recovers and rq is dispatched and done, io_ticks
+is updated;
+
+Then if user is using "iostat 1" to monitor "util", between t0 - t0+9s,
+util will be zero, and between t0+9s - t0+10s, util will be 1000%.
+
+Fix this problem by updating io_ticks from diskstats_show() and
+part_stat_show() if there are rq allocated.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Link: https://lore.kernel.org/r/20240509123717.3223892-3-yukuai1@huaweicloud.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 7be835694daebbb4adffbc461519081aa0cf28e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+diff --cc block/genhd.c
+index 4ee7f13f5cd8,7f39fbe60753..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -1304,22 -950,17 +1304,30 @@@ ssize_t part_size_show(struct device *d
+  ssize_t part_stat_show(struct device *dev,
+  		       struct device_attribute *attr, char *buf)
+  {
+++<<<<<<< HEAD
+ +	struct hd_struct *p = dev_to_part(dev);
+ +	struct request_queue *q = part_to_disk(p)->queue;
+ +	struct disk_stats stat;
+ +	unsigned int inflight;
+ +
+ +	if (queue_is_mq(q))
+ +		inflight = blk_mq_in_flight(q, p);
+ +	else
+ +		inflight = part_in_flight(p);
+ +
+++=======
++ 	struct block_device *bdev = dev_to_bdev(dev);
++ 	struct disk_stats stat;
++ 	unsigned int inflight;
++ 
++ 	inflight = part_in_flight(bdev);
+++>>>>>>> 7be835694dae (block: fix that util can be greater than 100%)
+  	if (inflight) {
+  		part_stat_lock();
+ -		update_io_ticks(bdev, jiffies, true);
+ +		update_io_ticks(p, jiffies, true);
+  		part_stat_unlock();
+  	}
+ -	part_stat_read_all(bdev, &stat);
+ +	part_stat_read_all(p, &stat);
+  	return sprintf(buf,
+  		"%8lu %8lu %8llu %8u "
+  		"%8lu %8lu %8llu %8u "
+@@@ -1633,13 -1247,12 +1641,21 @@@ static int diskstats_show(struct seq_fi
+  				"\n\n");
+  	*/
+  
+++<<<<<<< HEAD
+ +	disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
+ +	while ((hd = disk_part_iter_next(&piter))) {
+ +		if (queue_is_mq(gp->queue))
+ +			inflight = blk_mq_in_flight(gp->queue, hd);
+ +		else
+ +			inflight = part_in_flight(hd);
+++=======
++ 	rcu_read_lock();
++ 	xa_for_each(&gp->part_tbl, idx, hd) {
++ 		if (bdev_is_partition(hd) && !bdev_nr_sectors(hd))
++ 			continue;
+++>>>>>>> 7be835694dae (block: fix that util can be greater than 100%)
+  
++ 		inflight = part_in_flight(hd);
+  		if (inflight) {
+  			part_stat_lock();
+  			update_io_ticks(hd, jiffies, true);
+* Unmerged path block/genhd.c
