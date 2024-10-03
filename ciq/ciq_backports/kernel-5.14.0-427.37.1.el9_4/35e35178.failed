@@ -1,0 +1,135 @@
+fork: defer linking file vma until vma is fully initialized
+
+jira LE-1907
+cve CVE-2024-27022
+Rebuild_History Non-Buildable kernel-5.14.0-427.37.1.el9_4
+commit-author Miaohe Lin <linmiaohe@huawei.com>
+commit 35e351780fa9d8240dd6f7e4f245f9ea37e96c19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.37.1.el9_4/35e35178.failed
+
+Thorvald reported a WARNING [1]. And the root cause is below race:
+
+ CPU 1					CPU 2
+ fork					hugetlbfs_fallocate
+  dup_mmap				 hugetlbfs_punch_hole
+   i_mmap_lock_write(mapping);
+   vma_interval_tree_insert_after -- Child vma is visible through i_mmap tree.
+   i_mmap_unlock_write(mapping);
+   hugetlb_dup_vma_private -- Clear vma_lock outside i_mmap_rwsem!
+					 i_mmap_lock_write(mapping);
+   					 hugetlb_vmdelete_list
+					  vma_interval_tree_foreach
+					   hugetlb_vma_trylock_write -- Vma_lock is cleared.
+   tmp->vm_ops->open -- Alloc new vma_lock outside i_mmap_rwsem!
+					   hugetlb_vma_unlock_write -- Vma_lock is assigned!!!
+					 i_mmap_unlock_write(mapping);
+
+hugetlb_dup_vma_private() and hugetlb_vm_op_open() are called outside
+i_mmap_rwsem lock while vma lock can be used in the same time.  Fix this
+by deferring linking file vma until vma is fully initialized.  Those vmas
+should be initialized first before they can be used.
+
+Link: https://lkml.kernel.org/r/20240410091441.3539905-1-linmiaohe@huawei.com
+Fixes: 8d9bfb260814 ("hugetlb: add vma based lock for pmd sharing")
+	Signed-off-by: Miaohe Lin <linmiaohe@huawei.com>
+	Reported-by: Thorvald Natvig <thorvald@google.com>
+Closes: https://lore.kernel.org/linux-mm/20240129161735.6gmjsswx62o4pbja@revolver/T/ [1]
+	Reviewed-by: Jane Chu <jane.chu@oracle.com>
+	Cc: Christian Brauner <brauner@kernel.org>
+	Cc: Heiko Carstens <hca@linux.ibm.com>
+	Cc: Kent Overstreet <kent.overstreet@linux.dev>
+	Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+	Cc: Mateusz Guzik <mjguzik@gmail.com>
+	Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Cc: Miaohe Lin <linmiaohe@huawei.com>
+	Cc: Muchun Song <muchun.song@linux.dev>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peng Zhang <zhangpeng.00@bytedance.com>
+	Cc: Tycho Andersen <tandersen@netflix.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 35e351780fa9d8240dd6f7e4f245f9ea37e96c19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+diff --cc kernel/fork.c
+index a97c37970134,aebb3e6c96dc..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -662,7 -713,24 +662,28 @@@ static __latent_entropy int dup_mmap(st
+  			tmp->anon_vma = NULL;
+  		} else if (anon_vma_fork(tmp, mpnt))
+  			goto fail_nomem_anon_vma_fork;
+++<<<<<<< HEAD
+ +		tmp->vm_flags &= ~(VM_LOCKED | VM_LOCKONFAULT);
+++=======
++ 		vm_flags_clear(tmp, VM_LOCKED_MASK);
++ 		/*
++ 		 * Copy/update hugetlb private vma information.
++ 		 */
++ 		if (is_vm_hugetlb_page(tmp))
++ 			hugetlb_dup_vma_private(tmp);
++ 
++ 		/*
++ 		 * Link the vma into the MT. After using __mt_dup(), memory
++ 		 * allocation is not necessary here, so it cannot fail.
++ 		 */
++ 		vma_iter_bulk_store(&vmi, tmp);
++ 
++ 		mm->map_count++;
++ 
++ 		if (tmp->vm_ops && tmp->vm_ops->open)
++ 			tmp->vm_ops->open(tmp);
++ 
+++>>>>>>> 35e351780fa9 (fork: defer linking file vma until vma is fully initialized)
+  		file = tmp->vm_file;
+  		if (file) {
+  			struct address_space *mapping = file->f_mapping;
+@@@ -679,33 -747,13 +700,43 @@@
+  			i_mmap_unlock_write(mapping);
+  		}
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * Copy/update hugetlb private vma information.
+ +		 */
+ +		if (is_vm_hugetlb_page(tmp))
+ +			hugetlb_dup_vma_private(tmp);
+ +
+ +		/*
+ +		 * Link in the new vma and copy the page table entries.
+ +		 */
+ +		*pprev = tmp;
+ +		pprev = &tmp->vm_next;
+ +		tmp->vm_prev = prev;
+ +		prev = tmp;
+ +
+ +		__vma_link_rb(mm, tmp, rb_link, rb_parent);
+ +		rb_link = &tmp->vm_rb.rb_right;
+ +		rb_parent = &tmp->vm_rb;
+ +
+ +		mm->map_count++;
+ +		if (!(tmp->vm_flags & VM_WIPEONFORK))
+ +			retval = copy_page_range(tmp, mpnt);
+ +
+ +		if (tmp->vm_ops && tmp->vm_ops->open)
+ +			tmp->vm_ops->open(tmp);
+ +
+ +		if (retval)
+ +			goto out;
+++=======
++ 		if (!(tmp->vm_flags & VM_WIPEONFORK))
++ 			retval = copy_page_range(tmp, mpnt);
++ 
++ 		if (retval) {
++ 			mpnt = vma_next(&vmi);
++ 			goto loop_out;
++ 		}
+++>>>>>>> 35e351780fa9 (fork: defer linking file vma until vma is fully initialized)
+  	}
+  	/* a new mm has just been created */
+  	retval = arch_dup_mmap(oldmm, mm);
+* Unmerged path kernel/fork.c
