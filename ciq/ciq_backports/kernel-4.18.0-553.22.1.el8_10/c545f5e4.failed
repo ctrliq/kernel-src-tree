@@ -1,0 +1,343 @@
+EDAC/i10nm: Skip the absent memory controllers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+commit c545f5e412250555bd4e717d062b117f20bab418
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/c545f5e4.failed
+
+Some Sapphire Rapids workstations' absent memory controllers
+still appear as PCIe devices that fool the i10nm_edac driver
+and result in "shift exponent -66 is negative" call traces
+from skx_get_dimm_info().
+
+Skip the absent memory controllers to avoid the call traces.
+
+	Reported-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Closes: https://lore.kernel.org/linux-edac/CAAd53p41Ku1m1rapeqb1xtD+kKuk+BaUW=dumuoF0ZO3GhFjFA@mail.gmail.com/T/#m5de16dce60a8c836ec235868c7c16e3fefad0cc2
+	Tested-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Reported-by: Koba Ko <koba.ko@canonical.com>
+Closes: https://lore.kernel.org/linux-edac/SA1PR11MB71305B71CCCC3D9305835202892AA@SA1PR11MB7130.namprd11.prod.outlook.com/T/#t
+	Tested-by: Koba Ko <koba.ko@canonical.com>
+Fixes: d4dc89d069aa ("EDAC, i10nm: Add a driver for Intel 10nm server processors")
+	Signed-off-by: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+Link: https://lore.kernel.org/r/20230710013232.59712-1-qiuxu.zhuo@intel.com
+(cherry picked from commit c545f5e412250555bd4e717d062b117f20bab418)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/edac/i10nm_base.c
+diff --cc drivers/edac/i10nm_base.c
+index d509f584afbd,349ff6cfb379..000000000000
+--- a/drivers/edac/i10nm_base.c
++++ b/drivers/edac/i10nm_base.c
+@@@ -335,6 -433,267 +335,270 @@@ static bool i10nm_check_2lm(struct res_
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Check whether the error comes from DDRT by ICX/Tremont/SPR model specific error code.
++  * Refer to SDM vol3B 17.11.3/17.13.2 Intel IMC MC error codes for IA32_MCi_STATUS.
++  */
++ static bool i10nm_mscod_is_ddrt(u32 mscod)
++ {
++ 	switch (res_cfg->type) {
++ 	case I10NM:
++ 		switch (mscod) {
++ 		case 0x0106: case 0x0107:
++ 		case 0x0800: case 0x0804:
++ 		case 0x0806 ... 0x0808:
++ 		case 0x080a ... 0x080e:
++ 		case 0x0810: case 0x0811:
++ 		case 0x0816: case 0x081e:
++ 		case 0x081f:
++ 			return true;
++ 		}
++ 
++ 		break;
++ 	case SPR:
++ 		switch (mscod) {
++ 		case 0x0800: case 0x0804:
++ 		case 0x0806 ... 0x0808:
++ 		case 0x080a ... 0x080e:
++ 		case 0x0810: case 0x0811:
++ 		case 0x0816: case 0x081e:
++ 		case 0x081f:
++ 			return true;
++ 		}
++ 
++ 		break;
++ 	default:
++ 		return false;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool i10nm_mc_decode_available(struct mce *mce)
++ {
++ #define ICX_IMCx_CHy		0x06666000
++ 	u8 bank;
++ 
++ 	if (!decoding_via_mca || mem_cfg_2lm)
++ 		return false;
++ 
++ 	if ((mce->status & (MCI_STATUS_MISCV | MCI_STATUS_ADDRV))
++ 			!= (MCI_STATUS_MISCV | MCI_STATUS_ADDRV))
++ 		return false;
++ 
++ 	bank = mce->bank;
++ 
++ 	switch (res_cfg->type) {
++ 	case I10NM:
++ 		/* Check whether the bank is one of {13,14,17,18,21,22,25,26} */
++ 		if (!(ICX_IMCx_CHy & (1 << bank)))
++ 			return false;
++ 		break;
++ 	case SPR:
++ 		if (bank < 13 || bank > 20)
++ 			return false;
++ 		break;
++ 	default:
++ 		return false;
++ 	}
++ 
++ 	/* DDRT errors can't be decoded from MCA bank registers */
++ 	if (MCI_MISC_ECC_MODE(mce->misc) == MCI_MISC_ECC_DDRT)
++ 		return false;
++ 
++ 	if (i10nm_mscod_is_ddrt(MCI_STATUS_MSCOD(mce->status)))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool i10nm_mc_decode(struct decoded_addr *res)
++ {
++ 	struct mce *m = res->mce;
++ 	struct skx_dev *d;
++ 	u8 bank;
++ 
++ 	if (!i10nm_mc_decode_available(m))
++ 		return false;
++ 
++ 	list_for_each_entry(d, i10nm_edac_list, list) {
++ 		if (d->imc[0].src_id == m->socketid) {
++ 			res->socket = m->socketid;
++ 			res->dev = d;
++ 			break;
++ 		}
++ 	}
++ 
++ 	switch (res_cfg->type) {
++ 	case I10NM:
++ 		bank              = m->bank - 13;
++ 		res->imc          = bank / 4;
++ 		res->channel      = bank % 2;
++ 		res->column       = GET_BITFIELD(m->misc, 9, 18) << 2;
++ 		res->row          = GET_BITFIELD(m->misc, 19, 39);
++ 		res->bank_group   = GET_BITFIELD(m->misc, 40, 41);
++ 		res->bank_address = GET_BITFIELD(m->misc, 42, 43);
++ 		res->bank_group  |= GET_BITFIELD(m->misc, 44, 44) << 2;
++ 		res->rank         = GET_BITFIELD(m->misc, 56, 58);
++ 		res->dimm         = res->rank >> 2;
++ 		res->rank         = res->rank % 4;
++ 		break;
++ 	case SPR:
++ 		bank              = m->bank - 13;
++ 		res->imc          = bank / 2;
++ 		res->channel      = bank % 2;
++ 		res->column       = GET_BITFIELD(m->misc, 9, 18) << 2;
++ 		res->row          = GET_BITFIELD(m->misc, 19, 36);
++ 		res->bank_group   = GET_BITFIELD(m->misc, 37, 38);
++ 		res->bank_address = GET_BITFIELD(m->misc, 39, 40);
++ 		res->bank_group  |= GET_BITFIELD(m->misc, 41, 41) << 2;
++ 		res->rank         = GET_BITFIELD(m->misc, 57, 57);
++ 		res->dimm         = GET_BITFIELD(m->misc, 58, 58);
++ 		break;
++ 	default:
++ 		return false;
++ 	}
++ 
++ 	if (!res->dev) {
++ 		skx_printk(KERN_ERR, "No device for src_id %d imc %d\n",
++ 			   m->socketid, res->imc);
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ /**
++  * get_gnr_mdev() - Get the PCI device of the @logical_idx-th DDR memory controller.
++  *
++  * @d            : The pointer to the structure of CPU socket EDAC device.
++  * @logical_idx  : The logical index of the present memory controller (0 ~ max present MC# - 1).
++  * @physical_idx : To store the corresponding physical index of @logical_idx.
++  *
++  * RETURNS       : The PCI device of the @logical_idx-th DDR memory controller, NULL on failure.
++  */
++ static struct pci_dev *get_gnr_mdev(struct skx_dev *d, int logical_idx, int *physical_idx)
++ {
++ #define GNR_MAX_IMC_PCI_CNT	28
++ 
++ 	struct pci_dev *mdev;
++ 	int i, logical = 0;
++ 
++ 	/*
++ 	 * Detect present memory controllers from { PCI device: 8-5, function 7-1 }
++ 	 */
++ 	for (i = 0; i < GNR_MAX_IMC_PCI_CNT; i++) {
++ 		mdev = pci_get_dev_wrapper(d->seg,
++ 					   d->bus[res_cfg->ddr_mdev_bdf.bus],
++ 					   res_cfg->ddr_mdev_bdf.dev + i / 7,
++ 					   res_cfg->ddr_mdev_bdf.fun + i % 7);
++ 
++ 		if (mdev) {
++ 			if (logical == logical_idx) {
++ 				*physical_idx = i;
++ 				return mdev;
++ 			}
++ 
++ 			pci_dev_put(mdev);
++ 			logical++;
++ 		}
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ /**
++  * get_ddr_munit() - Get the resource of the i-th DDR memory controller.
++  *
++  * @d      : The pointer to the structure of CPU socket EDAC device.
++  * @i      : The index of the CPU socket relative DDR memory controller.
++  * @offset : To store the MMIO offset of the i-th DDR memory controller.
++  * @size   : To store the MMIO size of the i-th DDR memory controller.
++  *
++  * RETURNS : The PCI device of the i-th DDR memory controller, NULL on failure.
++  */
++ static struct pci_dev *get_ddr_munit(struct skx_dev *d, int i, u32 *offset, unsigned long *size)
++ {
++ 	struct pci_dev *mdev;
++ 	int physical_idx;
++ 	u32 reg;
++ 
++ 	switch (res_cfg->type) {
++ 	case GNR:
++ 		if (I10NM_GET_IMC_BAR(d, 0, reg)) {
++ 			i10nm_printk(KERN_ERR, "Failed to get mc0 bar\n");
++ 			return NULL;
++ 		}
++ 
++ 		mdev = get_gnr_mdev(d, i, &physical_idx);
++ 		if (!mdev)
++ 			return NULL;
++ 
++ 		*offset = I10NM_GET_IMC_MMIO_OFFSET(reg) +
++ 			  I10NM_GNR_IMC_MMIO_OFFSET +
++ 			  physical_idx * I10NM_GNR_IMC_MMIO_SIZE;
++ 		*size   = I10NM_GNR_IMC_MMIO_SIZE;
++ 
++ 		break;
++ 	default:
++ 		if (I10NM_GET_IMC_BAR(d, i, reg)) {
++ 			i10nm_printk(KERN_ERR, "Failed to get mc%d bar\n", i);
++ 			return NULL;
++ 		}
++ 
++ 		mdev = pci_get_dev_wrapper(d->seg,
++ 					   d->bus[res_cfg->ddr_mdev_bdf.bus],
++ 					   res_cfg->ddr_mdev_bdf.dev + i,
++ 					   res_cfg->ddr_mdev_bdf.fun);
++ 		if (!mdev)
++ 			return NULL;
++ 
++ 		*offset  = I10NM_GET_IMC_MMIO_OFFSET(reg);
++ 		*size    = I10NM_GET_IMC_MMIO_SIZE(reg);
++ 	}
++ 
++ 	return mdev;
++ }
++ 
++ /**
++  * i10nm_imc_absent() - Check whether the memory controller @imc is absent
++  *
++  * @imc    : The pointer to the structure of memory controller EDAC device.
++  *
++  * RETURNS : true if the memory controller EDAC device is absent, false otherwise.
++  */
++ static bool i10nm_imc_absent(struct skx_imc *imc)
++ {
++ 	u32 mcmtr;
++ 	int i;
++ 
++ 	switch (res_cfg->type) {
++ 	case SPR:
++ 		for (i = 0; i < res_cfg->ddr_chan_num; i++) {
++ 			mcmtr = I10NM_GET_MCMTR(imc, i);
++ 			edac_dbg(1, "ch%d mcmtr reg %x\n", i, mcmtr);
++ 			if (mcmtr != ~0)
++ 				return false;
++ 		}
++ 
++ 		/*
++ 		 * Some workstations' absent memory controllers still
++ 		 * appear as PCIe devices, misleading the EDAC driver.
++ 		 * By observing that the MMIO registers of these absent
++ 		 * memory controllers consistently hold the value of ~0.
++ 		 *
++ 		 * We identify a memory controller as absent by checking
++ 		 * if its MMIO register "mcmtr" == ~0 in all its channels.
++ 		 */
++ 		return true;
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
+++>>>>>>> c545f5e41225 (EDAC/i10nm: Skip the absent memory controllers)
+  static int i10nm_get_ddr_munits(void)
+  {
+  	struct pci_dev *mdev;
+@@@ -363,9 -726,9 +627,15 @@@
+  		edac_dbg(2, "socket%d mmio base 0x%llx (reg 0x%x)\n",
+  			 j++, base, reg);
+  
+++<<<<<<< HEAD
+ +		for (i = 0; i < I10NM_NUM_DDR_IMC; i++) {
+ +			mdev = pci_get_dev_wrapper(d->seg, d->bus[0],
+ +						   12 + i, 0);
+++=======
++ 		for (lmc = 0, i = 0; i < res_cfg->ddr_imc_num; i++) {
++ 			mdev = get_ddr_munit(d, i, &off, &size);
++ 
+++>>>>>>> c545f5e41225 (EDAC/i10nm: Skip the absent memory controllers)
+  			if (i == 0 && !mdev) {
+  				i10nm_printk(KERN_ERR, "No IMC found\n");
+  				return -ENODEV;
+@@@ -373,15 -736,6 +643,18 @@@
+  			if (!mdev)
+  				continue;
+  
+++<<<<<<< HEAD
+ +			d->imc[i].mdev = mdev;
+ +
+ +			if (I10NM_GET_IMC_BAR(d, i, reg)) {
+ +				i10nm_printk(KERN_ERR, "Failed to get mc bar\n");
+ +				return -ENODEV;
+ +			}
+ +
+ +			off  = I10NM_GET_IMC_MMIO_OFFSET(reg);
+ +			size = I10NM_GET_IMC_MMIO_SIZE(reg);
+++=======
+++>>>>>>> c545f5e41225 (EDAC/i10nm: Skip the absent memory controllers)
+  			edac_dbg(2, "mc%d mmio base 0x%llx size 0x%lx (reg 0x%x)\n",
+  				 i, base + off, size, reg);
+  
+* Unmerged path drivers/edac/i10nm_base.c
