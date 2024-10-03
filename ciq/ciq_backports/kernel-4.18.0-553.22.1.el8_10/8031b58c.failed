@@ -1,0 +1,196 @@
+mptcp: ensure snd_una is properly initialized on connect
+
+jira LE-1907
+cve CVE-2024-40931
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 8031b58c3a9b1db3ef68b3bd749fbee2e1e1aaa3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/8031b58c.failed
+
+This is strictly related to commit fb7a0d334894 ("mptcp: ensure snd_nxt
+is properly initialized on connect"). It turns out that syzkaller can
+trigger the retransmit after fallback and before processing any other
+incoming packet - so that snd_una is still left uninitialized.
+
+Address the issue explicitly initializing snd_una together with snd_nxt
+and write_seq.
+
+	Suggested-by: Mat Martineau <martineau@kernel.org>
+Fixes: 8fd738049ac3 ("mptcp: fallback in case of simultaneous connect")
+	Cc: stable@vger.kernel.org
+	Reported-by: Christoph Paasch <cpaasch@apple.com>
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/485
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <martineau@kernel.org>
+	Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://lore.kernel.org/r/20240607-upstream-net-20240607-misc-fixes-v1-1-1ab9ddfa3d00@kernel.org
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 8031b58c3a9b1db3ef68b3bd749fbee2e1e1aaa3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index e670605aff94,bb7dca8aa2d9..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -3291,6 -3639,153 +3291,156 @@@ static void mptcp_shutdown(struct sock 
+  		__mptcp_wr_shutdown(sk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mptcp_forward_alloc_get(const struct sock *sk)
++ {
++ 	return READ_ONCE(sk->sk_forward_alloc) +
++ 	       READ_ONCE(mptcp_sk(sk)->rmem_fwd_alloc);
++ }
++ 
++ static int mptcp_ioctl_outq(const struct mptcp_sock *msk, u64 v)
++ {
++ 	const struct sock *sk = (void *)msk;
++ 	u64 delta;
++ 
++ 	if (sk->sk_state == TCP_LISTEN)
++ 		return -EINVAL;
++ 
++ 	if ((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV))
++ 		return 0;
++ 
++ 	delta = msk->write_seq - v;
++ 	if (__mptcp_check_fallback(msk) && msk->first) {
++ 		struct tcp_sock *tp = tcp_sk(msk->first);
++ 
++ 		/* the first subflow is disconnected after close - see
++ 		 * __mptcp_close_ssk(). tcp_disconnect() moves the write_seq
++ 		 * so ignore that status, too.
++ 		 */
++ 		if (!((1 << msk->first->sk_state) &
++ 		      (TCPF_SYN_SENT | TCPF_SYN_RECV | TCPF_CLOSE)))
++ 			delta += READ_ONCE(tp->write_seq) - tp->snd_una;
++ 	}
++ 	if (delta > INT_MAX)
++ 		delta = INT_MAX;
++ 
++ 	return (int)delta;
++ }
++ 
++ static int mptcp_ioctl(struct sock *sk, int cmd, int *karg)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 	bool slow;
++ 
++ 	switch (cmd) {
++ 	case SIOCINQ:
++ 		if (sk->sk_state == TCP_LISTEN)
++ 			return -EINVAL;
++ 
++ 		lock_sock(sk);
++ 		__mptcp_move_skbs(msk);
++ 		*karg = mptcp_inq_hint(sk);
++ 		release_sock(sk);
++ 		break;
++ 	case SIOCOUTQ:
++ 		slow = lock_sock_fast(sk);
++ 		*karg = mptcp_ioctl_outq(msk, READ_ONCE(msk->snd_una));
++ 		unlock_sock_fast(sk, slow);
++ 		break;
++ 	case SIOCOUTQNSD:
++ 		slow = lock_sock_fast(sk);
++ 		*karg = mptcp_ioctl_outq(msk, msk->snd_nxt);
++ 		unlock_sock_fast(sk, slow);
++ 		break;
++ 	default:
++ 		return -ENOIOCTLCMD;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void mptcp_subflow_early_fallback(struct mptcp_sock *msk,
++ 					 struct mptcp_subflow_context *subflow)
++ {
++ 	subflow->request_mptcp = 0;
++ 	__mptcp_do_fallback(msk);
++ }
++ 
++ static int mptcp_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
++ {
++ 	struct mptcp_subflow_context *subflow;
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 	int err = -EINVAL;
++ 	struct sock *ssk;
++ 
++ 	ssk = __mptcp_nmpc_sk(msk);
++ 	if (IS_ERR(ssk))
++ 		return PTR_ERR(ssk);
++ 
++ 	mptcp_set_state(sk, TCP_SYN_SENT);
++ 	subflow = mptcp_subflow_ctx(ssk);
++ #ifdef CONFIG_TCP_MD5SIG
++ 	/* no MPTCP if MD5SIG is enabled on this socket or we may run out of
++ 	 * TCP option space.
++ 	 */
++ 	if (rcu_access_pointer(tcp_sk(ssk)->md5sig_info))
++ 		mptcp_subflow_early_fallback(msk, subflow);
++ #endif
++ 	if (subflow->request_mptcp && mptcp_token_new_connect(ssk)) {
++ 		MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_TOKENFALLBACKINIT);
++ 		mptcp_subflow_early_fallback(msk, subflow);
++ 	}
++ 
++ 	WRITE_ONCE(msk->write_seq, subflow->idsn);
++ 	WRITE_ONCE(msk->snd_nxt, subflow->idsn);
++ 	WRITE_ONCE(msk->snd_una, subflow->idsn);
++ 	if (likely(!__mptcp_check_fallback(msk)))
++ 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPCAPABLEACTIVE);
++ 
++ 	/* if reaching here via the fastopen/sendmsg path, the caller already
++ 	 * acquired the subflow socket lock, too.
++ 	 */
++ 	if (!msk->fastopening)
++ 		lock_sock(ssk);
++ 
++ 	/* the following mirrors closely a very small chunk of code from
++ 	 * __inet_stream_connect()
++ 	 */
++ 	if (ssk->sk_state != TCP_CLOSE)
++ 		goto out;
++ 
++ 	if (BPF_CGROUP_PRE_CONNECT_ENABLED(ssk)) {
++ 		err = ssk->sk_prot->pre_connect(ssk, uaddr, addr_len);
++ 		if (err)
++ 			goto out;
++ 	}
++ 
++ 	err = ssk->sk_prot->connect(ssk, uaddr, addr_len);
++ 	if (err < 0)
++ 		goto out;
++ 
++ 	inet_assign_bit(DEFER_CONNECT, sk, inet_test_bit(DEFER_CONNECT, ssk));
++ 
++ out:
++ 	if (!msk->fastopening)
++ 		release_sock(ssk);
++ 
++ 	/* on successful connect, the msk state will be moved to established by
++ 	 * subflow_finish_connect()
++ 	 */
++ 	if (unlikely(err)) {
++ 		/* avoid leaving a dangling token in an unconnected socket */
++ 		mptcp_token_destroy(msk);
++ 		mptcp_set_state(sk, TCP_CLOSE);
++ 		return err;
++ 	}
++ 
++ 	mptcp_copy_inaddrs(sk, ssk);
++ 	return 0;
++ }
++ 
+++>>>>>>> 8031b58c3a9b (mptcp: ensure snd_una is properly initialized on connect)
+  static struct proto mptcp_prot = {
+  	.name		= "MPTCP",
+  	.owner		= THIS_MODULE,
+* Unmerged path net/mptcp/protocol.c
