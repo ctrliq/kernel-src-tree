@@ -1,0 +1,191 @@
+media: cec: call enable_adap on s_log_addrs
+
+jira LE-1907
+cve CVE-2024-23848
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Hans Verkuil <hverkuil-cisco@xs4all.nl>
+commit 3813c932ed970dd4f413498ccecb03c73c4f1784
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/3813c932.failed
+
+Don't enable/disable the adapter if the first fh is opened or the
+last fh is closed, instead do this when the adapter is configured
+or unconfigured, and also when we enter Monitor All or Monitor Pin
+mode for the first time or we exit the Monitor All/Pin mode for the
+last time.
+
+However, if needs_hpd is true, then do this when the physical
+address is set or cleared: in that case the adapter typically is
+powered by the HPD, so it really is disabled when the HPD is low.
+This case (needs_hpd is true) was already handled in this way, so
+this wasn't changed.
+
+The problem with the old behavior was that if the HPD goes low when
+no fh is open, and a transmit was in progress, then the adapter would
+be disabled, typically stopping the transmit immediately which
+leaves a partial message on the bus, which isn't nice and can confuse
+some adapters.
+
+It makes much more sense to disable it only when the adapter is
+unconfigured and we're not monitoring the bus, since then you really
+won't be using it anymore.
+
+To keep track of this store a CEC activation count and call adap_enable
+only when it goes from 0 to 1 or back to 0.
+
+	Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Signed-off-by: Mauro Carvalho Chehab <mchehab@kernel.org>
+(cherry picked from commit 3813c932ed970dd4f413498ccecb03c73c4f1784)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/cec/core/cec-adap.c
+#	drivers/media/cec/core/cec-api.c
+diff --cc drivers/media/cec/core/cec-adap.c
+index e0e9d4808c3d,1a095308f3ab..000000000000
+--- a/drivers/media/cec/core/cec-adap.c
++++ b/drivers/media/cec/core/cec-adap.c
+@@@ -1576,39 -1619,32 +1618,53 @@@ void __cec_s_phys_addr(struct cec_adapt
+  		adap->phys_addr = CEC_PHYS_ADDR_INVALID;
+  		cec_post_state_event(adap);
+  		cec_adap_unconfigure(adap);
+++<<<<<<< HEAD
+ +		/* Disabling monitor all mode should always succeed */
+ +		if (adap->monitor_all_cnt)
+ +			WARN_ON(call_op(adap, adap_monitor_all_enable, false));
+ +		mutex_lock(&adap->devnode.lock);
+ +		if (adap->needs_hpd || list_empty(&adap->devnode.fhs)) {
+ +			WARN_ON(adap->ops->adap_enable(adap, false));
+ +			adap->transmit_in_progress = false;
+++=======
++ 		if (becomes_invalid && adap->needs_hpd) {
++ 			/* Disable monitor-all/pin modes if needed */
++ 			if (adap->monitor_all_cnt)
++ 				WARN_ON(call_op(adap, adap_monitor_all_enable, false));
++ 			if (adap->monitor_pin_cnt)
++ 				WARN_ON(call_op(adap, adap_monitor_pin_enable, false));
++ 			cec_activate_cnt_dec(adap);
+++>>>>>>> 3813c932ed97 (media: cec: call enable_adap on s_log_addrs)
+  			wake_up_interruptible(&adap->kthread_waitq);
+  		}
+- 		mutex_unlock(&adap->devnode.lock);
+- 		if (phys_addr == CEC_PHYS_ADDR_INVALID)
++ 		if (becomes_invalid)
+  			return;
+  	}
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&adap->devnode.lock);
+ +	adap->last_initiator = 0xff;
+ +	adap->transmit_in_progress = false;
+ +
+ +	if ((adap->needs_hpd || list_empty(&adap->devnode.fhs)) &&
+ +	    adap->ops->adap_enable(adap, true)) {
+ +		mutex_unlock(&adap->devnode.lock);
+ +		return;
+++=======
++ 	if (is_invalid && adap->needs_hpd) {
++ 		if (cec_activate_cnt_inc(adap))
++ 			return;
++ 		/*
++ 		 * Re-enable monitor-all/pin modes if needed. We warn, but
++ 		 * continue if this fails as this is not a critical error.
++ 		 */
++ 		if (adap->monitor_all_cnt)
++ 			WARN_ON(call_op(adap, adap_monitor_all_enable, true));
++ 		if (adap->monitor_pin_cnt)
++ 			WARN_ON(call_op(adap, adap_monitor_pin_enable, true));
+++>>>>>>> 3813c932ed97 (media: cec: call enable_adap on s_log_addrs)
+  	}
+  
+- 	if (adap->monitor_all_cnt &&
+- 	    call_op(adap, adap_monitor_all_enable, true)) {
+- 		if (adap->needs_hpd || list_empty(&adap->devnode.fhs))
+- 			WARN_ON(adap->ops->adap_enable(adap, false));
+- 		mutex_unlock(&adap->devnode.lock);
+- 		return;
+- 	}
+- 	mutex_unlock(&adap->devnode.lock);
+- 
+  	adap->phys_addr = phys_addr;
+  	cec_post_state_event(adap);
+  	if (adap->log_addrs.num_log_addrs)
+diff --cc drivers/media/cec/core/cec-api.c
+index 016f23b7f0a8,0284db12842b..000000000000
+--- a/drivers/media/cec/core/cec-api.c
++++ b/drivers/media/cec/core/cec-api.c
+@@@ -580,17 -586,6 +580,20 @@@ static int cec_open(struct inode *inode
+  		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&devnode->lock);
+ +	if (list_empty(&devnode->fhs) &&
+ +	    !adap->needs_hpd &&
+ +	    adap->phys_addr == CEC_PHYS_ADDR_INVALID) {
+ +		err = adap->ops->adap_enable(adap, true);
+ +		if (err) {
+ +			mutex_unlock(&devnode->lock);
+ +			kfree(fh);
+ +			return err;
+ +		}
+ +	}
+++=======
+++>>>>>>> 3813c932ed97 (media: cec: call enable_adap on s_log_addrs)
+  	filp->private_data = fh;
+  
+  	/* Queue up initial state events */
+@@@ -618,7 -613,10 +621,12 @@@
+  	}
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&devnode->lock);
++ 	mutex_lock(&devnode->lock_fhs);
+++>>>>>>> 3813c932ed97 (media: cec: call enable_adap on s_log_addrs)
+  	list_add(&fh->list, &devnode->fhs);
+ -	mutex_unlock(&devnode->lock_fhs);
+  	mutex_unlock(&devnode->lock);
+  
+  	return 0;
+@@@ -648,11 -646,9 +656,15 @@@ static int cec_release(struct inode *in
+  	mutex_unlock(&adap->lock);
+  
+  	mutex_lock(&devnode->lock);
+ -	mutex_lock(&devnode->lock_fhs);
+  	list_del(&fh->list);
+++<<<<<<< HEAD
+ +	if (cec_is_registered(adap) && list_empty(&devnode->fhs) &&
+ +	    !adap->needs_hpd && adap->phys_addr == CEC_PHYS_ADDR_INVALID) {
+ +		WARN_ON(adap->ops->adap_enable(adap, false));
+ +	}
+++=======
++ 	mutex_unlock(&devnode->lock_fhs);
+++>>>>>>> 3813c932ed97 (media: cec: call enable_adap on s_log_addrs)
+  	mutex_unlock(&devnode->lock);
+  
+  	/* Unhook pending transmits from this filehandle. */
+* Unmerged path drivers/media/cec/core/cec-adap.c
+* Unmerged path drivers/media/cec/core/cec-api.c
+diff --git a/include/media/cec.h b/include/media/cec.h
+index 03e01c17f6ec..946255a87341 100644
+--- a/include/media/cec.h
++++ b/include/media/cec.h
+@@ -173,6 +173,7 @@ struct cec_adap_ops {
+  * @cec_pin_is_high:	if true then the CEC pin is high. Only used with the
+  *	CEC pin framework.
+  * @last_initiator:	the initiator of the last transmitted message.
++ * @activate_cnt:	number of times that CEC is activated
+  * @monitor_all_cnt:	number of filehandles monitoring all msgs
+  * @monitor_pin_cnt:	number of filehandles monitoring pin changes
+  * @follower_cnt:	number of filehandles in follower mode
+@@ -223,6 +224,7 @@ struct cec_adapter {
+ 	bool is_configured;
+ 	bool cec_pin_is_high;
+ 	u8 last_initiator;
++	u32 activate_cnt;
+ 	u32 monitor_all_cnt;
+ 	u32 monitor_pin_cnt;
+ 	u32 follower_cnt;
