@@ -1,0 +1,84 @@
+filelock: Remove locks reliably when fcntl/close race is detected
+
+jira LE-1907
+cve CVE-2024-41012
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Jann Horn <jannh@google.com>
+commit 3cad1bc010416c6dd780643476bc59ed742436b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/3cad1bc0.failed
+
+When fcntl_setlk() races with close(), it removes the created lock with
+do_lock_file_wait().
+However, LSMs can allow the first do_lock_file_wait() that created the lock
+while denying the second do_lock_file_wait() that tries to remove the lock.
+In theory (but AFAIK not in practice), posix_lock_file() could also fail to
+remove a lock due to GFP_KERNEL allocation failure (when splitting a range
+in the middle).
+
+After the bug has been triggered, use-after-free reads will occur in
+lock_get_status() when userspace reads /proc/locks. This can likely be used
+to read arbitrary kernel memory, but can't corrupt kernel memory.
+This only affects systems with SELinux / Smack / AppArmor / BPF-LSM in
+enforcing mode and only works from some security contexts.
+
+Fix it by calling locks_remove_posix() instead, which is designed to
+reliably get rid of POSIX locks associated with the given file and
+files_struct and is also used by filp_flush().
+
+Fixes: c293621bbf67 ("[PATCH] stale POSIX lock handling")
+	Cc: stable@kernel.org
+Link: https://bugs.chromium.org/p/project-zero/issues/detail?id=2563
+	Signed-off-by: Jann Horn <jannh@google.com>
+Link: https://lore.kernel.org/r/20240702-fs-lock-recover-2-v1-1-edd456f63789@google.com
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit 3cad1bc010416c6dd780643476bc59ed742436b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/locks.c
+diff --cc fs/locks.c
+index c261d5329981,c360d1992d21..000000000000
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@@ -2323,24 -2448,24 +2323,29 @@@ int fcntl_setlk(unsigned int fd, struc
+  	error = do_lock_file_wait(filp, cmd, file_lock);
+  
+  	/*
+- 	 * Attempt to detect a close/fcntl race and recover by releasing the
+- 	 * lock that was just acquired. There is no need to do that when we're
++ 	 * Detect close/fcntl races and recover by zapping all POSIX locks
++ 	 * associated with this file and our files_struct, just like on
++ 	 * filp_flush(). There is no need to do that when we're
+  	 * unlocking though, or for OFD locks.
+  	 */
+ -	if (!error && file_lock->c.flc_type != F_UNLCK &&
+ -	    !(file_lock->c.flc_flags & FL_OFDLCK)) {
+ -		struct files_struct *files = current->files;
+ +	if (!error && file_lock->fl_type != F_UNLCK &&
+ +	    !(file_lock->fl_flags & FL_OFDLCK)) {
+  		/*
+  		 * We need that spin_lock here - it prevents reordering between
+  		 * update of i_flctx->flc_posix and check for it done in
+  		 * close(). rcu_read_lock() wouldn't do.
+  		 */
+ -		spin_lock(&files->file_lock);
+ -		f = files_lookup_fd_locked(files, fd);
+ -		spin_unlock(&files->file_lock);
+ +		spin_lock(&current->files->file_lock);
+ +		f = fcheck(fd);
+ +		spin_unlock(&current->files->file_lock);
+  		if (f != filp) {
+++<<<<<<< HEAD
+ +			file_lock->fl_type = F_UNLCK;
+ +			error = do_lock_file_wait(filp, cmd, file_lock);
+ +			WARN_ON_ONCE(error);
+++=======
++ 			locks_remove_posix(filp, files);
+++>>>>>>> 3cad1bc01041 (filelock: Remove locks reliably when fcntl/close race is detected)
+  			error = -EBADF;
+  		}
+  	}
+* Unmerged path fs/locks.c
