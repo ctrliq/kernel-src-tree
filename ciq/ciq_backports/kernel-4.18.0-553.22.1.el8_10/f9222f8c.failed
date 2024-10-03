@@ -1,0 +1,272 @@
+media: cec-adap.c: drop activate_cnt, use state info instead
+
+jira LE-1907
+cve CVE-2024-23848
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Hans Verkuil <hverkuil-cisco@xs4all.nl>
+commit f9222f8ca18bcb1d55dd749b493b29fd8092fb82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/f9222f8c.failed
+
+Using an activation counter to decide when the enable or disable the
+cec adapter is not the best approach and can lead to race conditions.
+
+Change this to determining the current status of the adapter, and
+enable or disable the adapter accordingly.
+
+It now only needs to be called whenever there is a chance that the
+state changes, and it can handle enabling/disabling monitoring as
+well if needed.
+
+This simplifies the code and it should be a more robust approach as well.
+
+	Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Signed-off-by: Mauro Carvalho Chehab <mchehab@kernel.org>
+(cherry picked from commit f9222f8ca18bcb1d55dd749b493b29fd8092fb82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/cec/core/cec-adap.c
+diff --cc drivers/media/cec/core/cec-adap.c
+index 24d1589a9261,8bf91b5a7d0e..000000000000
+--- a/drivers/media/cec/core/cec-adap.c
++++ b/drivers/media/cec/core/cec-adap.c
+@@@ -1573,6 -1573,60 +1573,63 @@@ static void cec_claim_log_addrs(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Helper function to enable/disable the CEC adapter.
++  *
++  * This function is called with adap->lock held.
++  */
++ static int cec_adap_enable(struct cec_adapter *adap)
++ {
++ 	bool enable;
++ 	int ret = 0;
++ 
++ 	enable = adap->monitor_all_cnt || adap->monitor_pin_cnt ||
++ 		 adap->log_addrs.num_log_addrs;
++ 	if (adap->needs_hpd)
++ 		enable = enable && adap->phys_addr != CEC_PHYS_ADDR_INVALID;
++ 
++ 	if (enable == adap->is_enabled)
++ 		return 0;
++ 
++ 	/* serialize adap_enable */
++ 	mutex_lock(&adap->devnode.lock);
++ 	if (enable) {
++ 		adap->last_initiator = 0xff;
++ 		adap->transmit_in_progress = false;
++ 		ret = adap->ops->adap_enable(adap, true);
++ 		if (!ret) {
++ 			/*
++ 			 * Enable monitor-all/pin modes if needed. We warn, but
++ 			 * continue if this fails as this is not a critical error.
++ 			 */
++ 			if (adap->monitor_all_cnt)
++ 				WARN_ON(call_op(adap, adap_monitor_all_enable, true));
++ 			if (adap->monitor_pin_cnt)
++ 				WARN_ON(call_op(adap, adap_monitor_pin_enable, true));
++ 		}
++ 	} else {
++ 		/* Disable monitor-all/pin modes if needed (needs_hpd == 1) */
++ 		if (adap->monitor_all_cnt)
++ 			WARN_ON(call_op(adap, adap_monitor_all_enable, false));
++ 		if (adap->monitor_pin_cnt)
++ 			WARN_ON(call_op(adap, adap_monitor_pin_enable, false));
++ 		WARN_ON(adap->ops->adap_enable(adap, false));
++ 		adap->last_initiator = 0xff;
++ 		adap->transmit_in_progress = false;
++ 		adap->transmit_in_progress_aborted = false;
++ 		if (adap->transmitting)
++ 			cec_data_cancel(adap->transmitting, CEC_TX_STATUS_ABORTED, 0);
++ 	}
++ 	if (!ret)
++ 		adap->is_enabled = enable;
++ 	wake_up_interruptible(&adap->kthread_waitq);
++ 	mutex_unlock(&adap->devnode.lock);
++ 	return ret;
++ }
++ 
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  /* Set a new physical address and send an event notifying userspace of this.
+   *
+   * This function is called with adap->lock held.
+@@@ -1591,40 -1647,16 +1648,50 @@@ void __cec_s_phys_addr(struct cec_adapt
+  		adap->phys_addr = CEC_PHYS_ADDR_INVALID;
+  		cec_post_state_event(adap);
+  		cec_adap_unconfigure(adap);
+++<<<<<<< HEAD
+ +		/* Disabling monitor all mode should always succeed */
+ +		if (adap->monitor_all_cnt)
+ +			WARN_ON(call_op(adap, adap_monitor_all_enable, false));
+ +		mutex_lock(&adap->devnode.lock);
+ +		if (adap->needs_hpd || list_empty(&adap->devnode.fhs)) {
+ +			WARN_ON(adap->ops->adap_enable(adap, false));
+ +			adap->transmit_in_progress = false;
+ +			wake_up_interruptible(&adap->kthread_waitq);
+ +		}
+ +		mutex_unlock(&adap->devnode.lock);
+ +		if (phys_addr == CEC_PHYS_ADDR_INVALID)
+ +			return;
+ +	}
+ +
+ +	mutex_lock(&adap->devnode.lock);
+ +	adap->last_initiator = 0xff;
+ +	adap->transmit_in_progress = false;
+ +
+ +	if ((adap->needs_hpd || list_empty(&adap->devnode.fhs)) &&
+ +	    adap->ops->adap_enable(adap, true)) {
+ +		mutex_unlock(&adap->devnode.lock);
+ +		return;
+++=======
++ 		if (becomes_invalid) {
++ 			cec_adap_enable(adap);
++ 			return;
++ 		}
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  	}
+  
+ +	if (adap->monitor_all_cnt &&
+ +	    call_op(adap, adap_monitor_all_enable, true)) {
+ +		if (adap->needs_hpd || list_empty(&adap->devnode.fhs))
+ +			WARN_ON(adap->ops->adap_enable(adap, false));
+ +		mutex_unlock(&adap->devnode.lock);
+ +		return;
+ +	}
+ +	mutex_unlock(&adap->devnode.lock);
+ +
+  	adap->phys_addr = phys_addr;
++ 	if (is_invalid)
++ 		cec_adap_enable(adap);
++ 
+  	cec_post_state_event(adap);
+  	if (!adap->log_addrs.num_log_addrs)
+  		return;
+@@@ -1698,6 -1734,7 +1766,10 @@@ int __cec_s_log_addrs(struct cec_adapte
+  		adap->log_addrs.osd_name[0] = '\0';
+  		adap->log_addrs.vendor_id = CEC_VENDOR_ID_NONE;
+  		adap->log_addrs.cec_version = CEC_OP_CEC_VERSION_2_0;
+++<<<<<<< HEAD
+++=======
++ 		cec_adap_enable(adap);
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  		return 0;
+  	}
+  
+@@@ -2134,20 -2171,25 +2207,38 @@@ skip_processing
+   */
+  int cec_monitor_all_cnt_inc(struct cec_adapter *adap)
+  {
+ -	int ret;
+ +	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	if (adap->monitor_all_cnt == 0)
+ +		ret = call_op(adap, adap_monitor_all_enable, 1);
+ +	if (ret == 0)
+ +		adap->monitor_all_cnt++;
+++=======
++ 	if (adap->monitor_all_cnt++)
++ 		return 0;
++ 
++ 	ret = cec_adap_enable(adap);
++ 	if (ret)
++ 		adap->monitor_all_cnt--;
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  	return ret;
+  }
+  
+  void cec_monitor_all_cnt_dec(struct cec_adapter *adap)
+  {
+++<<<<<<< HEAD
+ +	adap->monitor_all_cnt--;
+ +	if (adap->monitor_all_cnt == 0)
+ +		WARN_ON(call_op(adap, adap_monitor_all_enable, 0));
+++=======
++ 	if (WARN_ON(!adap->monitor_all_cnt))
++ 		return;
++ 	if (--adap->monitor_all_cnt)
++ 		return;
++ 	WARN_ON(call_op(adap, adap_monitor_all_enable, false));
++ 	cec_adap_enable(adap);
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  }
+  
+  /*
+@@@ -2157,20 -2199,25 +2248,38 @@@
+   */
+  int cec_monitor_pin_cnt_inc(struct cec_adapter *adap)
+  {
+ -	int ret;
+ +	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	if (adap->monitor_pin_cnt == 0)
+ +		ret = call_op(adap, adap_monitor_pin_enable, 1);
+ +	if (ret == 0)
+ +		adap->monitor_pin_cnt++;
+++=======
++ 	if (adap->monitor_pin_cnt++)
++ 		return 0;
++ 
++ 	ret = cec_adap_enable(adap);
++ 	if (ret)
++ 		adap->monitor_pin_cnt--;
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  	return ret;
+  }
+  
+  void cec_monitor_pin_cnt_dec(struct cec_adapter *adap)
+  {
+++<<<<<<< HEAD
+ +	adap->monitor_pin_cnt--;
+ +	if (adap->monitor_pin_cnt == 0)
+ +		WARN_ON(call_op(adap, adap_monitor_pin_enable, 0));
+++=======
++ 	if (WARN_ON(!adap->monitor_pin_cnt))
++ 		return;
++ 	if (--adap->monitor_pin_cnt)
++ 		return;
++ 	WARN_ON(call_op(adap, adap_monitor_pin_enable, false));
++ 	cec_adap_enable(adap);
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  }
+  
+  #ifdef CONFIG_DEBUG_FS
+@@@ -2184,6 -2231,7 +2293,10 @@@ int cec_adap_status(struct seq_file *fi
+  	struct cec_data *data;
+  
+  	mutex_lock(&adap->lock);
+++<<<<<<< HEAD
+++=======
++ 	seq_printf(file, "enabled: %d\n", adap->is_enabled);
+++>>>>>>> f9222f8ca18b (media: cec-adap.c: drop activate_cnt, use state info instead)
+  	seq_printf(file, "configured: %d\n", adap->is_configured);
+  	seq_printf(file, "configuring: %d\n", adap->is_configuring);
+  	seq_printf(file, "phys_addr: %x.%x.%x.%x\n",
+* Unmerged path drivers/media/cec/core/cec-adap.c
+diff --git a/include/media/cec.h b/include/media/cec.h
+index c494f37771a8..96789febee87 100644
+--- a/include/media/cec.h
++++ b/include/media/cec.h
+@@ -168,6 +168,7 @@ struct cec_adap_ops {
+  * @needs_hpd:		if true, then the HDMI HotPlug Detect pin must be high
+  *	in order to transmit or receive CEC messages. This is usually a HW
+  *	limitation.
++ * @is_enabled:		the CEC adapter is enabled
+  * @is_configuring:	the CEC adapter is configuring (i.e. claiming LAs)
+  * @must_reconfigure:	while configuring, the PA changed, so reclaim LAs
+  * @is_configured:	the CEC adapter is configured (i.e. has claimed LAs)
+@@ -220,6 +221,7 @@ struct cec_adapter {
+ 
+ 	u16 phys_addr;
+ 	bool needs_hpd;
++	bool is_enabled;
+ 	bool is_configuring;
+ 	bool must_reconfigure;
+ 	bool is_configured;
