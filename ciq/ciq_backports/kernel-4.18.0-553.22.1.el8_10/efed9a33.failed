@@ -1,0 +1,271 @@
+kyber: fix out of bounds access when preempted
+
+jira LE-1907
+cve CVE-2021-46984
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Omar Sandoval <osandov@fb.com>
+commit efed9a3337e341bd0989161b97453b52567bc59d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/efed9a33.failed
+
+__blk_mq_sched_bio_merge() gets the ctx and hctx for the current CPU and
+passes the hctx to ->bio_merge(). kyber_bio_merge() then gets the ctx
+for the current CPU again and uses that to get the corresponding Kyber
+context in the passed hctx. However, the thread may be preempted between
+the two calls to blk_mq_get_ctx(), and the ctx returned the second time
+may no longer correspond to the passed hctx. This "works" accidentally
+most of the time, but it can cause us to read garbage if the second ctx
+came from an hctx with more ctx's than the first one (i.e., if
+ctx->index_hw[hctx->type] > hctx->nr_ctx).
+
+This manifested as this UBSAN array index out of bounds error reported
+by Jakub:
+
+UBSAN: array-index-out-of-bounds in ../kernel/locking/qspinlock.c:130:9
+index 13106 is out of range for type 'long unsigned int [128]'
+Call Trace:
+ dump_stack+0xa4/0xe5
+ ubsan_epilogue+0x5/0x40
+ __ubsan_handle_out_of_bounds.cold.13+0x2a/0x34
+ queued_spin_lock_slowpath+0x476/0x480
+ do_raw_spin_lock+0x1c2/0x1d0
+ kyber_bio_merge+0x112/0x180
+ blk_mq_submit_bio+0x1f5/0x1100
+ submit_bio_noacct+0x7b0/0x870
+ submit_bio+0xc2/0x3a0
+ btrfs_map_bio+0x4f0/0x9d0
+ btrfs_submit_data_bio+0x24e/0x310
+ submit_one_bio+0x7f/0xb0
+ submit_extent_page+0xc4/0x440
+ __extent_writepage_io+0x2b8/0x5e0
+ __extent_writepage+0x28d/0x6e0
+ extent_write_cache_pages+0x4d7/0x7a0
+ extent_writepages+0xa2/0x110
+ do_writepages+0x8f/0x180
+ __writeback_single_inode+0x99/0x7f0
+ writeback_sb_inodes+0x34e/0x790
+ __writeback_inodes_wb+0x9e/0x120
+ wb_writeback+0x4d2/0x660
+ wb_workfn+0x64d/0xa10
+ process_one_work+0x53a/0xa80
+ worker_thread+0x69/0x5b0
+ kthread+0x20b/0x240
+ ret_from_fork+0x1f/0x30
+
+Only Kyber uses the hctx, so fix it by passing the request_queue to
+->bio_merge() instead. BFQ and mq-deadline just use that, and Kyber can
+map the queues itself to avoid the mismatch.
+
+Fixes: a6088845c2bf ("block: kyber: make kyber more friendly with merging")
+	Reported-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+Link: https://lore.kernel.org/r/c7598605401a48d5cfeadebb678abd10af22b83f.1620691329.git.osandov@fb.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit efed9a3337e341bd0989161b97453b52567bc59d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bfq-iosched.c
+#	block/blk-mq-sched.c
+#	block/kyber-iosched.c
+#	block/mq-deadline.c
+#	include/linux/elevator.h
+diff --cc block/bfq-iosched.c
+index c49d92b5ef8d,59b2499d3f8b..000000000000
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@@ -2329,9 -2263,9 +2329,13 @@@ static void bfq_remove_request(struct r
+  
+  }
+  
+++<<<<<<< HEAD
+ +static bool bfq_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
+++=======
++ static bool bfq_bio_merge(struct request_queue *q, struct bio *bio,
++ 		unsigned int nr_segs)
+++>>>>>>> efed9a3337e3 (kyber: fix out of bounds access when preempted)
+  {
+- 	struct request_queue *q = hctx->queue;
+  	struct bfq_data *bfqd = q->elevator->elevator_data;
+  	struct request *free = NULL;
+  	/*
+diff --cc block/blk-mq-sched.c
+index 8f52783b0eda,996a4b2f73aa..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -370,79 -354,39 +370,85 @@@ void blk_mq_sched_dispatch_requests(str
+  	}
+  }
+  
+ -bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
+ -		unsigned int nr_segs)
+ +bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
+ +			    struct request **merged_request)
+ +{
+ +	struct request *rq;
+ +
+ +	switch (elv_merge(q, &rq, bio)) {
+ +	case ELEVATOR_BACK_MERGE:
+ +		if (!blk_mq_sched_allow_merge(q, rq, bio))
+ +			return false;
+ +		if (!bio_attempt_back_merge(q, rq, bio))
+ +			return false;
+ +		*merged_request = attempt_back_merge(q, rq);
+ +		if (!*merged_request)
+ +			elv_merged_request(q, rq, ELEVATOR_BACK_MERGE);
+ +		return true;
+ +	case ELEVATOR_FRONT_MERGE:
+ +		if (!blk_mq_sched_allow_merge(q, rq, bio))
+ +			return false;
+ +		if (!bio_attempt_front_merge(q, rq, bio))
+ +			return false;
+ +		*merged_request = attempt_front_merge(q, rq);
+ +		if (!*merged_request)
+ +			elv_merged_request(q, rq, ELEVATOR_FRONT_MERGE);
+ +		return true;
+ +	case ELEVATOR_DISCARD_MERGE:
+ +		return bio_attempt_discard_merge(q, rq, bio);
+ +	default:
+ +		return false;
+ +	}
+ +}
+ +EXPORT_SYMBOL_GPL(blk_mq_sched_try_merge);
+ +
+ +/*
+ + * Reverse check our software queue for entries that we could potentially
+ + * merge with. Currently includes a hand-wavy stop count of 8, to not spend
+ + * too much time checking for merges.
+ + */
+ +static bool blk_mq_attempt_merge(struct request_queue *q,
+ +				 struct blk_mq_hw_ctx *hctx,
+ +				 struct blk_mq_ctx *ctx, struct bio *bio)
+ +{
+ +	enum hctx_type type = hctx->type;
+ +
+ +	lockdep_assert_held(&ctx->lock);
+ +
+ +	if (blk_bio_list_merge(q, &ctx->rq_lists[type], bio)) {
+ +		ctx->rq_merged++;
+ +		return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio)
+  {
+  	struct elevator_queue *e = q->elevator;
+- 	struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
+- 	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, bio->bi_opf, ctx);
++ 	struct blk_mq_ctx *ctx;
++ 	struct blk_mq_hw_ctx *hctx;
+  	bool ret = false;
+  	enum hctx_type type;
+  
+  	if (e && e->type->ops.bio_merge)
+++<<<<<<< HEAD
+ +		return e->type->ops.bio_merge(hctx, bio);
+++=======
++ 		return e->type->ops.bio_merge(q, bio, nr_segs);
+++>>>>>>> efed9a3337e3 (kyber: fix out of bounds access when preempted)
+  
++ 	ctx = blk_mq_get_ctx(q);
++ 	hctx = blk_mq_map_queue(q, bio->bi_opf, ctx);
+  	type = hctx->type;
+ -	if (!(hctx->flags & BLK_MQ_F_SHOULD_MERGE) ||
+ -	    list_empty_careful(&ctx->rq_lists[type]))
+ -		return false;
+ -
+ -	/* default per sw-queue merge */
+ -	spin_lock(&ctx->lock);
+ -	/*
+ -	 * Reverse check our software queue for entries that we could
+ -	 * potentially merge with. Currently includes a hand-wavy stop
+ -	 * count of 8, to not spend too much time checking for merges.
+ -	 */
+ -	if (blk_bio_list_merge(q, &ctx->rq_lists[type], bio, nr_segs)) {
+ -		ctx->rq_merged++;
+ -		ret = true;
+ +	if ((hctx->flags & BLK_MQ_F_SHOULD_MERGE) &&
+ +			!list_empty_careful(&ctx->rq_lists[type])) {
+ +		/* default per sw-queue merge */
+ +		spin_lock(&ctx->lock);
+ +		ret = blk_mq_attempt_merge(q, hctx, ctx, bio);
+ +		spin_unlock(&ctx->lock);
+  	}
+  
+ -	spin_unlock(&ctx->lock);
+ -
+  	return ret;
+  }
+  
+diff --cc block/kyber-iosched.c
+index 6df74a3a3cd3,81e3279ecd57..000000000000
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@@ -572,10 -561,12 +572,16 @@@ static void kyber_limit_depth(unsigned 
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static bool kyber_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
+++=======
++ static bool kyber_bio_merge(struct request_queue *q, struct bio *bio,
++ 		unsigned int nr_segs)
+++>>>>>>> efed9a3337e3 (kyber: fix out of bounds access when preempted)
+  {
++ 	struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
++ 	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, bio->bi_opf, ctx);
+  	struct kyber_hctx_data *khd = hctx->sched_data;
+- 	struct blk_mq_ctx *ctx = blk_mq_get_ctx(hctx->queue);
+  	struct kyber_ctx_queue *kcq = &khd->kcqs[ctx->index_hw[hctx->type]];
+  	unsigned int sched_domain = kyber_sched_domain(bio->bi_opf);
+  	struct list_head *rq_list = &kcq->rq_list[sched_domain];
+diff --cc block/mq-deadline.c
+index 43ce0ae88b4a,8eea2cbf2bf4..000000000000
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@@ -631,13 -461,9 +631,17 @@@ static int dd_request_merge(struct requ
+  	return ELEVATOR_NO_MERGE;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Attempt to merge a bio into an existing request. This function is called
+ + * before @bio is associated with a request.
+ + */
+ +static bool dd_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
+++=======
++ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
++ 		unsigned int nr_segs)
+++>>>>>>> efed9a3337e3 (kyber: fix out of bounds access when preempted)
+  {
+- 	struct request_queue *q = hctx->queue;
+  	struct deadline_data *dd = q->elevator->elevator_data;
+  	struct request *free = NULL;
+  	bool ret;
+diff --cc include/linux/elevator.h
+index b4f3bc81ddd3,dcb2f9022c1d..000000000000
+--- a/include/linux/elevator.h
++++ b/include/linux/elevator.h
+@@@ -31,9 -31,10 +31,13 @@@ struct elevator_mq_ops 
+  	void (*exit_sched)(struct elevator_queue *);
+  	int (*init_hctx)(struct blk_mq_hw_ctx *, unsigned int);
+  	void (*exit_hctx)(struct blk_mq_hw_ctx *, unsigned int);
+ -	void (*depth_updated)(struct blk_mq_hw_ctx *);
+  
+  	bool (*allow_merge)(struct request_queue *, struct request *, struct bio *);
+++<<<<<<< HEAD
+ +	bool (*bio_merge)(struct blk_mq_hw_ctx *, struct bio *);
+++=======
++ 	bool (*bio_merge)(struct request_queue *, struct bio *, unsigned int);
+++>>>>>>> efed9a3337e3 (kyber: fix out of bounds access when preempted)
+  	int (*request_merge)(struct request_queue *q, struct request **, struct bio *);
+  	void (*request_merged)(struct request_queue *, struct request *, enum elv_merge);
+  	void (*requests_merged)(struct request_queue *, struct request *, struct request *);
+* Unmerged path block/bfq-iosched.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/kyber-iosched.c
+* Unmerged path block/mq-deadline.c
+* Unmerged path include/linux/elevator.h
