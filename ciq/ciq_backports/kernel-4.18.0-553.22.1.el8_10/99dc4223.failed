@@ -1,0 +1,694 @@
+block: support to account io_ticks precisely
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.22.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 99dc422335d8b2bd4d105797241d3e715bae90e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.22.1.el8_10/99dc4223.failed
+
+Currently, io_ticks is accounted based on sampling, specifically
+update_io_ticks() will always account io_ticks by 1 jiffies from
+bdev_start_io_acct()/blk_account_io_start(), and the result can be
+inaccurate, for example(HZ is 250):
+
+Test script:
+fio -filename=/dev/sda -bs=4k -rw=write -direct=1 -name=test -thinktime=4ms
+
+Test result: util is about 90%, while the disk is really idle.
+
+This behaviour is introduced by commit 5b18b5a73760 ("block: delete
+part_round_stats and switch to less precise counting"), however, there
+was a key point that is missed that this patch also improve performance
+a lot:
+
+Before the commit:
+part_round_stats:
+  if (part->stamp != now)
+   stats |= 1;
+
+  part_in_flight()
+  -> there can be lots of task here in 1 jiffies.
+  part_round_stats_single()
+   __part_stat_add()
+  part->stamp = now;
+
+After the commit:
+update_io_ticks:
+  stamp = part->bd_stamp;
+  if (time_after(now, stamp))
+   if (try_cmpxchg())
+    __part_stat_add()
+    -> only one task can reach here in 1 jiffies.
+
+Hence in order to account io_ticks precisely, we only need to know if
+there are IO inflight at most once in one jiffies. Noted that for
+rq-based device, iterating tags should not be used here because
+'tags->lock' is grabbed in blk_mq_find_and_get_req(), hence
+part_stat_lock_inc/dec() and part_in_flight() is used to trace inflight.
+The additional overhead is quite little:
+
+ - per cpu add/dec for each IO for rq-based device;
+ - per cpu sum for each jiffies;
+
+And it's verified by null-blk that there are no performance degration
+under heavy IO pressure.
+
+Fixes: 5b18b5a73760 ("block: delete part_round_stats and switch to less precise counting")
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Link: https://lore.kernel.org/r/20240509123717.3223892-2-yukuai1@huaweicloud.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 99dc422335d8b2bd4d105797241d3e715bae90e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq.c
+#	block/blk.h
+#	block/genhd.c
+diff --cc block/blk-core.c
+index b00416cf5d87,8566bbd8aeba..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -1132,143 -886,112 +1132,169 @@@ blk_qc_t submit_bio(struct bio *bio
+  EXPORT_SYMBOL(submit_bio);
+  
+  /**
+ - * bio_poll - poll for BIO completions
+ - * @bio: bio to poll for
+ - * @iob: batches of IO
+ - * @flags: BLK_POLL_* flags that control the behavior
+ + * blk_cloned_rq_check_limits - Helper function to check a cloned request
+ + *                              for the new queue limits
+ + * @q:  the queue
+ + * @rq: the request being checked
+   *
+ - * Poll for completions on queue associated with the bio. Returns number of
+ - * completed entries found.
+ + * Description:
+ + *    @rq may have been made based on weaker limitations of upper-level queues
+ + *    in request stacking drivers, and it may violate the limitation of @q.
+ + *    Since the block layer and the underlying device driver trust @rq
+ + *    after it is inserted to @q, it should be checked against @q before
+ + *    the insertion using this generic function.
+   *
+ - * Note: the caller must either be the context that submitted @bio, or
+ - * be in a RCU critical section to prevent freeing of @bio.
+ + *    Request stacking drivers like request-based dm may change the queue
+ + *    limits when retrying requests on other queues. Those requests need
+ + *    to be checked against the new queue limits again during dispatch.
+   */
+ -int bio_poll(struct bio *bio, struct io_comp_batch *iob, unsigned int flags)
+ +static blk_status_t blk_cloned_rq_check_limits(struct request_queue *q,
+ +				      struct request *rq)
+  {
+ -	blk_qc_t cookie = READ_ONCE(bio->bi_cookie);
+ -	struct block_device *bdev;
+ -	struct request_queue *q;
+ -	int ret = 0;
+ +	unsigned int max_sectors = blk_queue_get_max_sectors(q, req_op(rq));
+ +	unsigned int max_segments = blk_rq_get_max_segments(rq);
+  
+ -	bdev = READ_ONCE(bio->bi_bdev);
+ -	if (!bdev)
+ -		return 0;
+ -
+ -	q = bdev_get_queue(bdev);
+ -	if (cookie == BLK_QC_T_NONE ||
+ -	    !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+ -		return 0;
+ +	if (blk_rq_sectors(rq) > max_sectors) {
+ +		/*
+ +		 * SCSI device does not have a good way to return if
+ +		 * Write Same/Zero is actually supported. If a device rejects
+ +		 * a non-read/write command (discard, write same,etc.) the
+ +		 * low-level device driver will set the relevant queue limit to
+ +		 * 0 to prevent blk-lib from issuing more of the offending
+ +		 * operations. Commands queued prior to the queue limit being
+ +		 * reset need to be completed with BLK_STS_NOTSUPP to avoid I/O
+ +		 * errors being propagated to upper layers.
+ +		 */
+ +		if (max_sectors == 0)
+ +			return BLK_STS_NOTSUPP;
+  
+ -	blk_flush_plug(current->plug, false);
+ +		printk(KERN_ERR "%s: over max size limit. (%u > %u)\n",
+ +			__func__, blk_rq_sectors(rq), max_sectors);
+ +		return BLK_STS_IOERR;
+ +	}
+  
+  	/*
+ -	 * We need to be able to enter a frozen queue, similar to how
+ -	 * timeouts also need to do that. If that is blocked, then we can
+ -	 * have pending IO when a queue freeze is started, and then the
+ -	 * wait for the freeze to finish will wait for polled requests to
+ -	 * timeout as the poller is preventer from entering the queue and
+ -	 * completing them. As long as we prevent new IO from being queued,
+ -	 * that should be all that matters.
+ +	 * queue's settings related to segment counting like q->bounce_pfn
+ +	 * may differ from that of other stacking queues.
+ +	 * Recalculate it to check the request correctly on this queue's
+ +	 * limitation.
+  	 */
+ -	if (!percpu_ref_tryget(&q->q_usage_counter))
+ -		return 0;
+ -	if (queue_is_mq(q)) {
+ -		ret = blk_mq_poll(q, cookie, iob, flags);
+ -	} else {
+ -		struct gendisk *disk = q->disk;
+ -
+ -		if (disk && disk->fops->poll_bio)
+ -			ret = disk->fops->poll_bio(bio, iob, flags);
+ +	blk_recalc_rq_segments(rq);
+ +	if (rq->nr_phys_segments > max_segments) {
+ +		printk(KERN_ERR "%s: over max segments limit. (%u > %u)\n",
+ +			__func__, rq->nr_phys_segments, max_segments);
+ +		return BLK_STS_IOERR;
+  	}
+ -	blk_queue_exit(q);
+ -	return ret;
+ +
+ +	return BLK_STS_OK;
+  }
+ -EXPORT_SYMBOL_GPL(bio_poll);
+  
+ -/*
+ - * Helper to implement file_operations.iopoll.  Requires the bio to be stored
+ - * in iocb->private, and cleared before freeing the bio.
+ +/**
+ + * blk_insert_cloned_request - Helper for stacking drivers to submit a request
+ + * @q:  the queue to submit the request
+ + * @rq: the request being queued
+   */
+ -int iocb_bio_iopoll(struct kiocb *kiocb, struct io_comp_batch *iob,
+ -		    unsigned int flags)
+ +blk_status_t blk_insert_cloned_request(struct request_queue *q, struct request *rq)
+  {
+ +	blk_status_t ret;
+ +
+ +	ret = blk_cloned_rq_check_limits(q, rq);
+ +	if (ret != BLK_STS_OK)
+ +		return ret;
+ +
+ +	if (rq->rq_disk &&
+ +	    should_fail_request(&rq->rq_disk->part0, blk_rq_bytes(rq)))
+ +		return BLK_STS_IOERR;
+ +
+ +	if (blk_queue_io_stat(q))
+ +		blk_account_io_start(rq);
+ +
+ +	/*
+ +	 * Since we have a scheduler attached on the top device,
+ +	 * bypass a potential scheduler on the bottom device for
+ +	 * insert.
+ +	 */
+ +	return blk_mq_request_issue_directly(rq, true);
+ +}
+ +EXPORT_SYMBOL_GPL(blk_insert_cloned_request);
+ +
+ +/**
+ + * blk_rq_err_bytes - determine number of bytes till the next failure boundary
+ + * @rq: request to examine
+ + *
+ + * Description:
+ + *     A request could be merge of IOs which require different failure
+ + *     handling.  This function determines the number of bytes which
+ + *     can be failed from the beginning of the request without
+ + *     crossing into area which need to be retried further.
+ + *
+ + * Return:
+ + *     The number of bytes to fail.
+ + */
+ +unsigned int blk_rq_err_bytes(const struct request *rq)
+ +{
+ +	unsigned int ff = rq->cmd_flags & REQ_FAILFAST_MASK;
+ +	unsigned int bytes = 0;
+  	struct bio *bio;
+ -	int ret = 0;
+ +
+ +	if (!(rq->rq_flags & RQF_MIXED_MERGE))
+ +		return blk_rq_bytes(rq);
+  
+  	/*
+ -	 * Note: the bio cache only uses SLAB_TYPESAFE_BY_RCU, so bio can
+ -	 * point to a freshly allocated bio at this point.  If that happens
+ -	 * we have a few cases to consider:
+ -	 *
+ -	 *  1) the bio is beeing initialized and bi_bdev is NULL.  We can just
+ -	 *     simply nothing in this case
+ -	 *  2) the bio points to a not poll enabled device.  bio_poll will catch
+ -	 *     this and return 0
+ -	 *  3) the bio points to a poll capable device, including but not
+ -	 *     limited to the one that the original bio pointed to.  In this
+ -	 *     case we will call into the actual poll method and poll for I/O,
+ -	 *     even if we don't need to, but it won't cause harm either.
+ -	 *
+ -	 * For cases 2) and 3) above the RCU grace period ensures that bi_bdev
+ -	 * is still allocated. Because partitions hold a reference to the whole
+ -	 * device bdev and thus disk, the disk is also still valid.  Grabbing
+ -	 * a reference to the queue in bio_poll() ensures the hctxs and requests
+ -	 * are still valid as well.
+ +	 * Currently the only 'mixing' which can happen is between
+ +	 * different fastfail types.  We can safely fail portions
+ +	 * which have all the failfast bits that the first one has -
+ +	 * the ones which are at least as eager to fail as the first
+ +	 * one.
+  	 */
+++<<<<<<< HEAD
+ +	for (bio = rq->bio; bio; bio = bio->bi_next) {
+ +		if ((bio->bi_opf & ff) != ff)
+ +			break;
+ +		bytes += bio->bi_iter.bi_size;
+ +	}
+ +
+ +	/* this could lead to infinite loop */
+ +	BUG_ON(blk_rq_bytes(rq) && !bytes);
+ +	return bytes;
+ +}
+ +EXPORT_SYMBOL_GPL(blk_rq_err_bytes);
+ +
+ +static void blk_account_io_completion(struct request *req, unsigned int bytes)
+ +{
+ +	if (req->part && blk_do_io_stat(req)) {
+ +		const int sgrp = op_stat_group(req_op(req));
+ +		struct hd_struct *part;
+ +
+ +		part_stat_lock();
+ +		part = req->part;
+ +		part_stat_add(part, sectors[sgrp], bytes >> 9);
+ +		part_stat_unlock();
+++=======
++ 	rcu_read_lock();
++ 	bio = READ_ONCE(kiocb->private);
++ 	if (bio)
++ 		ret = bio_poll(bio, iob, flags);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(iocb_bio_iopoll);
++ 
++ void update_io_ticks(struct block_device *part, unsigned long now, bool end)
++ {
++ 	unsigned long stamp;
++ again:
++ 	stamp = READ_ONCE(part->bd_stamp);
++ 	if (unlikely(time_after(now, stamp)) &&
++ 	    likely(try_cmpxchg(&part->bd_stamp, &stamp, now)) &&
++ 	    (end || part_in_flight(part)))
++ 		__part_stat_add(part, io_ticks, now - stamp);
++ 
++ 	if (part->bd_partno) {
++ 		part = bdev_whole(part);
++ 		goto again;
+++>>>>>>> 99dc422335d8 (block: support to account io_ticks precisely)
+  	}
+  }
+  
+diff --cc block/blk-mq.c
+index 910d3b9bdae2,8e01e4b32e10..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -564,22 -742,305 +564,318 @@@ void blk_mq_free_request(struct reques
+  }
+  EXPORT_SYMBOL_GPL(blk_mq_free_request);
+  
+++<<<<<<< HEAD
+++=======
++ void blk_mq_free_plug_rqs(struct blk_plug *plug)
++ {
++ 	struct request *rq;
++ 
++ 	while ((rq = rq_list_pop(&plug->cached_rq)) != NULL)
++ 		blk_mq_free_request(rq);
++ }
++ 
++ void blk_dump_rq_flags(struct request *rq, char *msg)
++ {
++ 	printk(KERN_INFO "%s: dev %s: flags=%llx\n", msg,
++ 		rq->q->disk ? rq->q->disk->disk_name : "?",
++ 		(__force unsigned long long) rq->cmd_flags);
++ 
++ 	printk(KERN_INFO "  sector %llu, nr/cnr %u/%u\n",
++ 	       (unsigned long long)blk_rq_pos(rq),
++ 	       blk_rq_sectors(rq), blk_rq_cur_sectors(rq));
++ 	printk(KERN_INFO "  bio %p, biotail %p, len %u\n",
++ 	       rq->bio, rq->biotail, blk_rq_bytes(rq));
++ }
++ EXPORT_SYMBOL(blk_dump_rq_flags);
++ 
++ static void blk_account_io_completion(struct request *req, unsigned int bytes)
++ {
++ 	if (req->part && blk_do_io_stat(req)) {
++ 		const int sgrp = op_stat_group(req_op(req));
++ 
++ 		part_stat_lock();
++ 		part_stat_add(req->part, sectors[sgrp], bytes >> 9);
++ 		part_stat_unlock();
++ 	}
++ }
++ 
++ static void blk_print_req_error(struct request *req, blk_status_t status)
++ {
++ 	printk_ratelimited(KERN_ERR
++ 		"%s error, dev %s, sector %llu op 0x%x:(%s) flags 0x%x "
++ 		"phys_seg %u prio class %u\n",
++ 		blk_status_to_str(status),
++ 		req->q->disk ? req->q->disk->disk_name : "?",
++ 		blk_rq_pos(req), (__force u32)req_op(req),
++ 		blk_op_str(req_op(req)),
++ 		(__force u32)(req->cmd_flags & ~REQ_OP_MASK),
++ 		req->nr_phys_segments,
++ 		IOPRIO_PRIO_CLASS(req->ioprio));
++ }
++ 
++ /*
++  * Fully end IO on a request. Does not support partial completions, or
++  * errors.
++  */
++ static void blk_complete_request(struct request *req)
++ {
++ 	const bool is_flush = (req->rq_flags & RQF_FLUSH_SEQ) != 0;
++ 	int total_bytes = blk_rq_bytes(req);
++ 	struct bio *bio = req->bio;
++ 
++ 	trace_block_rq_complete(req, BLK_STS_OK, total_bytes);
++ 
++ 	if (!bio)
++ 		return;
++ 
++ #ifdef CONFIG_BLK_DEV_INTEGRITY
++ 	if (blk_integrity_rq(req) && req_op(req) == REQ_OP_READ)
++ 		req->q->integrity.profile->complete_fn(req, total_bytes);
++ #endif
++ 
++ 	/*
++ 	 * Upper layers may call blk_crypto_evict_key() anytime after the last
++ 	 * bio_endio().  Therefore, the keyslot must be released before that.
++ 	 */
++ 	blk_crypto_rq_put_keyslot(req);
++ 
++ 	blk_account_io_completion(req, total_bytes);
++ 
++ 	do {
++ 		struct bio *next = bio->bi_next;
++ 
++ 		/* Completion has already been traced */
++ 		bio_clear_flag(bio, BIO_TRACE_COMPLETION);
++ 
++ 		blk_zone_update_request_bio(req, bio);
++ 
++ 		if (!is_flush)
++ 			bio_endio(bio);
++ 		bio = next;
++ 	} while (bio);
++ 
++ 	/*
++ 	 * Reset counters so that the request stacking driver
++ 	 * can find how many bytes remain in the request
++ 	 * later.
++ 	 */
++ 	if (!req->end_io) {
++ 		req->bio = NULL;
++ 		req->__data_len = 0;
++ 	}
++ }
++ 
++ /**
++  * blk_update_request - Complete multiple bytes without completing the request
++  * @req:      the request being processed
++  * @error:    block status code
++  * @nr_bytes: number of bytes to complete for @req
++  *
++  * Description:
++  *     Ends I/O on a number of bytes attached to @req, but doesn't complete
++  *     the request structure even if @req doesn't have leftover.
++  *     If @req has leftover, sets it up for the next range of segments.
++  *
++  *     Passing the result of blk_rq_bytes() as @nr_bytes guarantees
++  *     %false return from this function.
++  *
++  * Note:
++  *	The RQF_SPECIAL_PAYLOAD flag is ignored on purpose in this function
++  *      except in the consistency check at the end of this function.
++  *
++  * Return:
++  *     %false - this request doesn't have any more data
++  *     %true  - this request has more data
++  **/
++ bool blk_update_request(struct request *req, blk_status_t error,
++ 		unsigned int nr_bytes)
++ {
++ 	bool is_flush = req->rq_flags & RQF_FLUSH_SEQ;
++ 	bool quiet = req->rq_flags & RQF_QUIET;
++ 	int total_bytes;
++ 
++ 	trace_block_rq_complete(req, error, nr_bytes);
++ 
++ 	if (!req->bio)
++ 		return false;
++ 
++ #ifdef CONFIG_BLK_DEV_INTEGRITY
++ 	if (blk_integrity_rq(req) && req_op(req) == REQ_OP_READ &&
++ 	    error == BLK_STS_OK)
++ 		req->q->integrity.profile->complete_fn(req, nr_bytes);
++ #endif
++ 
++ 	/*
++ 	 * Upper layers may call blk_crypto_evict_key() anytime after the last
++ 	 * bio_endio().  Therefore, the keyslot must be released before that.
++ 	 */
++ 	if (blk_crypto_rq_has_keyslot(req) && nr_bytes >= blk_rq_bytes(req))
++ 		__blk_crypto_rq_put_keyslot(req);
++ 
++ 	if (unlikely(error && !blk_rq_is_passthrough(req) && !quiet) &&
++ 	    !test_bit(GD_DEAD, &req->q->disk->state)) {
++ 		blk_print_req_error(req, error);
++ 		trace_block_rq_error(req, error, nr_bytes);
++ 	}
++ 
++ 	blk_account_io_completion(req, nr_bytes);
++ 
++ 	total_bytes = 0;
++ 	while (req->bio) {
++ 		struct bio *bio = req->bio;
++ 		unsigned bio_bytes = min(bio->bi_iter.bi_size, nr_bytes);
++ 
++ 		if (unlikely(error))
++ 			bio->bi_status = error;
++ 
++ 		if (bio_bytes == bio->bi_iter.bi_size) {
++ 			req->bio = bio->bi_next;
++ 		} else if (bio_is_zone_append(bio) && error == BLK_STS_OK) {
++ 			/*
++ 			 * Partial zone append completions cannot be supported
++ 			 * as the BIO fragments may end up not being written
++ 			 * sequentially.
++ 			 */
++ 			bio->bi_status = BLK_STS_IOERR;
++ 		}
++ 
++ 		/* Completion has already been traced */
++ 		bio_clear_flag(bio, BIO_TRACE_COMPLETION);
++ 		if (unlikely(quiet))
++ 			bio_set_flag(bio, BIO_QUIET);
++ 
++ 		bio_advance(bio, bio_bytes);
++ 
++ 		/* Don't actually finish bio if it's part of flush sequence */
++ 		if (!bio->bi_iter.bi_size) {
++ 			blk_zone_update_request_bio(req, bio);
++ 			if (!is_flush)
++ 				bio_endio(bio);
++ 		}
++ 
++ 		total_bytes += bio_bytes;
++ 		nr_bytes -= bio_bytes;
++ 
++ 		if (!nr_bytes)
++ 			break;
++ 	}
++ 
++ 	/*
++ 	 * completely done
++ 	 */
++ 	if (!req->bio) {
++ 		/*
++ 		 * Reset counters so that the request stacking driver
++ 		 * can find how many bytes remain in the request
++ 		 * later.
++ 		 */
++ 		req->__data_len = 0;
++ 		return false;
++ 	}
++ 
++ 	req->__data_len -= total_bytes;
++ 
++ 	/* update sector only for requests with clear definition of sector */
++ 	if (!blk_rq_is_passthrough(req))
++ 		req->__sector += total_bytes >> 9;
++ 
++ 	/* mixed attributes always follow the first bio */
++ 	if (req->rq_flags & RQF_MIXED_MERGE) {
++ 		req->cmd_flags &= ~REQ_FAILFAST_MASK;
++ 		req->cmd_flags |= req->bio->bi_opf & REQ_FAILFAST_MASK;
++ 	}
++ 
++ 	if (!(req->rq_flags & RQF_SPECIAL_PAYLOAD)) {
++ 		/*
++ 		 * If total number of sectors is less than the first segment
++ 		 * size, something has gone terribly wrong.
++ 		 */
++ 		if (blk_rq_bytes(req) < blk_rq_cur_bytes(req)) {
++ 			blk_dump_rq_flags(req, "request botched");
++ 			req->__data_len = blk_rq_cur_bytes(req);
++ 		}
++ 
++ 		/* recalculate the number of segments */
++ 		req->nr_phys_segments = blk_recalc_rq_segments(req);
++ 	}
++ 
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(blk_update_request);
++ 
++ static inline void blk_account_io_done(struct request *req, u64 now)
++ {
++ 	trace_block_io_done(req);
++ 
++ 	/*
++ 	 * Account IO completion.  flush_rq isn't accounted as a
++ 	 * normal IO on queueing nor completion.  Accounting the
++ 	 * containing request is enough.
++ 	 */
++ 	if (blk_do_io_stat(req) && req->part &&
++ 	    !(req->rq_flags & RQF_FLUSH_SEQ)) {
++ 		const int sgrp = op_stat_group(req_op(req));
++ 
++ 		part_stat_lock();
++ 		update_io_ticks(req->part, jiffies, true);
++ 		part_stat_inc(req->part, ios[sgrp]);
++ 		part_stat_add(req->part, nsecs[sgrp], now - req->start_time_ns);
++ 		part_stat_local_dec(req->part,
++ 				    in_flight[op_is_write(req_op(req))]);
++ 		part_stat_unlock();
++ 	}
++ }
++ 
++ static inline void blk_account_io_start(struct request *req)
++ {
++ 	trace_block_io_start(req);
++ 
++ 	if (blk_do_io_stat(req)) {
++ 		/*
++ 		 * All non-passthrough requests are created from a bio with one
++ 		 * exception: when a flush command that is part of a flush sequence
++ 		 * generated by the state machine in blk-flush.c is cloned onto the
++ 		 * lower device by dm-multipath we can get here without a bio.
++ 		 */
++ 		if (req->bio)
++ 			req->part = req->bio->bi_bdev;
++ 		else
++ 			req->part = req->q->disk->part0;
++ 
++ 		part_stat_lock();
++ 		update_io_ticks(req->part, jiffies, false);
++ 		part_stat_local_inc(req->part,
++ 				    in_flight[op_is_write(req_op(req))]);
++ 		part_stat_unlock();
++ 	}
++ }
++ 
++ static inline void __blk_mq_end_request_acct(struct request *rq, u64 now)
++ {
++ 	if (rq->rq_flags & RQF_STATS)
++ 		blk_stat_add(rq, now);
++ 
++ 	blk_mq_sched_completed_request(rq, now);
++ 	blk_account_io_done(rq, now);
++ }
++ 
+++>>>>>>> 99dc422335d8 (block: support to account io_ticks precisely)
+  inline void __blk_mq_end_request(struct request *rq, blk_status_t error)
+  {
+ +	u64 now = 0;
+ +
+  	if (blk_mq_need_time_stamp(rq))
+ -		__blk_mq_end_request_acct(rq, blk_time_get_ns());
+ +		now = ktime_get_ns();
+ +
+ +	if (rq->rq_flags & RQF_STATS) {
+ +		blk_mq_poll_stats_start(rq->q);
+ +		blk_stat_add(rq, now);
+ +	}
+  
+ -	blk_mq_finish_request(rq);
+ +	if (rq->internal_tag != BLK_MQ_NO_TAG)
+ +		blk_mq_sched_completed_request(rq, now);
+ +
+ +	blk_account_io_done(rq, now);
+  
+  	if (rq->end_io) {
+  		rq_qos_done(rq->q, rq);
+diff --cc block/blk.h
+index 79fea57ee5ce,3870bdcd5cad..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -255,9 -362,12 +255,15 @@@ int blk_dev_init(void)
+   */
+  static inline bool blk_do_io_stat(struct request *rq)
+  {
+ -	return (rq->rq_flags & RQF_IO_STAT) && !blk_rq_is_passthrough(rq);
+ +	return rq->rq_disk && (rq->rq_flags & RQF_IO_STAT);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void update_io_ticks(struct block_device *part, unsigned long now, bool end);
++ unsigned int part_in_flight(struct block_device *part);
++ 
+++>>>>>>> 99dc422335d8 (block: support to account io_ticks precisely)
+  static inline void req_set_nomerge(struct request_queue *q, struct request *req)
+  {
+  	req->cmd_flags |= REQ_NOMERGE;
+diff --cc block/genhd.c
+index 4ee7f13f5cd8,8f1163d2d171..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -107,14 -117,8 +107,18 @@@ static void part_stat_read_all(struct h
+  		stat->io_ticks += ptr->io_ticks;
+  	}
+  }
+ +#else /* CONFIG_SMP */
+ +static void part_stat_read_all(struct hd_struct *part, struct disk_stats *stat)
+ +{
+ +	memcpy(stat, &part->dkstats, sizeof(struct disk_stats));
+ +}
+ +#endif /* CONFIG_SMP */
+  
+++<<<<<<< HEAD
+ +static unsigned int part_in_flight(struct hd_struct *part)
+++=======
++ unsigned int part_in_flight(struct block_device *part)
+++>>>>>>> 99dc422335d8 (block: support to account io_ticks precisely)
+  {
+  	unsigned int inflight = 0;
+  	int cpu;
+* Unmerged path block/blk-core.c
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 73430634fb8a..6d5de71f6c73 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -707,6 +707,8 @@ static void blk_account_io_merge_request(struct request *req)
+ 	if (blk_do_io_stat(req)) {
+ 		part_stat_lock();
+ 		part_stat_inc(req->part, merges[op_stat_group(req_op(req))]);
++		part_stat_local_dec(req->part,
++				    in_flight[op_is_write(req_op(req))]);
+ 		part_stat_unlock();
+ 
+ 		hd_struct_put(req->part);
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk.h
+* Unmerged path block/genhd.c
