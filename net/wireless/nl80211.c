@@ -467,7 +467,7 @@ static struct netlink_range_validation nl80211_punct_bitmap_range = {
 	.max = 0xffff,
 };
 
-static const struct netlink_range_validation q_range = {
+static struct netlink_range_validation q_range = {
 	.max = INT_MAX,
 };
 

@@ -543,8 +543,8 @@ int dirty_background_bytes_handler(struct ctl_table *table, int write,
 	if (ret == 0 && write) {
 		if (DIV_ROUND_UP(dirty_background_bytes, PAGE_SIZE) >
 								UINT_MAX) {
-			dirty_background_bytes = old_bytes;
-			return -ERANGE;
+		dirty_background_bytes = old_bytes;
+		return -ERANGE;
 		}
 		dirty_background_ratio = 0;
 	}
