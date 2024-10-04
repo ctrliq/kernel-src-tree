@@ -259,7 +259,7 @@ struct thread_struct {
 	unsigned long   sier3;
 	unsigned long	hashkeyr;
 	unsigned long	dexcr;
-
+	unsigned long	dexcr_onexec;	/* Reset value to load on exec */
 #endif
 };
 
