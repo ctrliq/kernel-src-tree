@@ -2872,6 +2872,7 @@ static u32 qed_grc_dump_ctx_data(struct qed_hwfn *p_hwfn,
 							  false,
 							  SPLIT_TYPE_NONE, 0);
 		}
+		cond_resched();
 	}
 
 	return offset;
