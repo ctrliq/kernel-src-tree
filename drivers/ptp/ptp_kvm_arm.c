@@ -24,5 +24,5 @@ int kvm_arch_ptp_init(void)
 
 int kvm_arch_ptp_get_clock(struct timespec64 *ts)
 {
-	return kvm_arch_ptp_get_crosststamp(NULL, ts, NULL);
+	return kvm_arch_ptp_get_crosststamp(NULL, ts, NULL, NULL);
 }
