@@ -1594,7 +1594,7 @@ static double annotation_line__max_percent(struct annotation_line *al,
 	double percent_max = 0.0;
 	int i;
 
-	for (i = 0; i < notes->nr_events; i++) {
+	for (i = 0; i < notes->src->nr_events; i++) {
 		double percent;
 
 		percent = annotation_data__percent(&al->data[i],
@@ -1684,7 +1684,7 @@ static void __annotation_line__write(struct annotation_line *al, struct annotati
 	if (al->offset != -1 && percent_max != 0.0) {
 		int i;
 
-		for (i = 0; i < notes->nr_events; i++) {
+		for (i = 0; i < notes->src->nr_events; i++) {
 			double percent;
 
 			percent = annotation_data__percent(&al->data[i], percent_type);
@@ -1856,7 +1856,7 @@ int symbol__annotate2(struct map_symbol *ms, struct evsel *evsel,
 		return err;
 
 	annotation__init_column_widths(notes, sym);
-	notes->nr_events = nr_pcnt;
+	notes->src->nr_events = nr_pcnt;
 
 	annotation__update_column_widths(notes);
 	sym->annotate2 = 1;
