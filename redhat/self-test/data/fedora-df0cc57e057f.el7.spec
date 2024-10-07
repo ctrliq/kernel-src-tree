@@ -1,9 +1,9 @@
 %global package_name kernel
 %global gemini 0
-%global include_fedora 1
+%global include_fedora 0
 %global include_rhel 1
 %global include_rt 1
-%global patchlist_changelog 1
+%global patchlist_changelog 0
 %global released_kernel 0
 %define buildid .test
 %define specrpmversion 5.16.0
