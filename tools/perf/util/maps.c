@@ -206,11 +206,6 @@ void maps__set_unwind_libunwind_ops(struct maps *maps, const struct unwind_libun
 
 static struct rw_semaphore *maps__lock(struct maps *maps)
 {
-	/*
-	 * When the lock is acquired or released the maps invariants should
-	 * hold.
-	 */
-	check_invariants(maps);
 	return &RC_CHK_ACCESS(maps)->lock;
 }
 
@@ -359,6 +354,7 @@ static int map__strcmp(const void *a, const void *b)
 static int maps__sort_by_name(struct maps *maps)
 {
 	int err = 0;
+
 	down_write(maps__lock(maps));
 	if (!maps__maps_by_name_sorted(maps)) {
 		struct map **maps_by_name = maps__maps_by_name(maps);
@@ -385,6 +381,7 @@ static int maps__sort_by_name(struct maps *maps)
 			maps__set_maps_by_name_sorted(maps, true);
 		}
 	}
+	check_invariants(maps);
 	up_write(maps__lock(maps));
 	return err;
 }
@@ -503,6 +500,7 @@ int maps__insert(struct maps *maps, struct map *map)
 
 	down_write(maps__lock(maps));
 	ret = __maps__insert(maps, map);
+	check_invariants(maps);
 	up_write(maps__lock(maps));
 	return ret;
 }
@@ -537,6 +535,7 @@ void maps__remove(struct maps *maps, struct map *map)
 {
 	down_write(maps__lock(maps));
 	__maps__remove(maps, map);
+	check_invariants(maps);
 	up_write(maps__lock(maps));
 }
 
@@ -603,6 +602,7 @@ void maps__remove_maps(struct maps *maps, bool (*cb)(struct map *map, void *data
 		else
 			i++;
 	}
+	check_invariants(maps);
 	up_write(maps__lock(maps));
 }
 
@@ -943,6 +943,8 @@ int maps__copy_from(struct maps *dest, struct maps *parent)
 			map__put(new);
 		}
 	}
+	check_invariants(dest);
+
 	up_read(maps__lock(parent));
 	up_write(maps__lock(dest));
 	return err;
@@ -1098,6 +1100,7 @@ void maps__fixup_end(struct maps *maps)
 		map__set_end(maps_by_address[n - 1], ~0ULL);
 
 	RC_CHK_ACCESS(maps)->ends_broken = false;
+	check_invariants(maps);
 
 	up_write(maps__lock(maps));
 }
@@ -1148,6 +1151,8 @@ int maps__merge_in(struct maps *kmaps, struct map *new_map)
 	    map__start(kmaps_maps_by_address[first_after_]) >= map__end(new_map)) {
 		/* No overlap so regular insert suffices. */
 		int ret = __maps__insert(kmaps, new_map);
+
+		check_invariants(kmaps);
 		up_write(maps__lock(kmaps));
 		return ret;
 	}
@@ -1184,6 +1189,7 @@ int maps__merge_in(struct maps *kmaps, struct map *new_map)
 		map__zput(kmaps_maps_by_address[i]);
 
 	free(kmaps_maps_by_address);
+	check_invariants(kmaps);
 	up_write(maps__lock(kmaps));
 	return 0;
 }
