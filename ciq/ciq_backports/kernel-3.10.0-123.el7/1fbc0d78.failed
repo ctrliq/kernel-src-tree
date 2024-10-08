@@ -1,0 +1,755 @@
+drm/i915: Fix the PPT fdi lane bifurcate state handling on ivb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [drm] i915: Fix the PPT fdi lane bifurcate state handling on ivb (Rob Clark) [1054409]
+Rebuild_FUZZ: 96.67%
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 1fbc0d789d12fec313c91912fc11733fdfbab863
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/1fbc0d78.failed
+
+Originally I've thought that this is leftover hw state dirt from the
+BIOS. But after way too much helpless flailing around on my part I've
+noticed that the actual bug is when we change the state of an already
+active pipe.
+
+For example when we change the fdi lines from 2 to 3 without switching
+off outputs in-between we'll never see the crucial on->off transition
+in the ->modeset_global_resources hook the current logic relies on.
+
+Patch version 2 got this right by instead also checking whether the
+pipe is indeed active. But that in turn broke things when pipes have
+been turned off through dpms since the bifurcate enabling is done in
+the ->crtc_mode_set callback.
+
+To address this issues discussed with Ville in the patch review move
+the setting of the bifurcate bit into the ->crtc_enable hook. That way
+we won't wreak havoc with this state when userspace puts all other
+outputs into dpms off state. This also moves us forward with our
+overall goal to unify the modeset and dpms on paths (which we need to
+have to allow runtime pm in the dpms off state).
+
+Unfortunately this requires us to move the bifurcate helpers around a
+bit.
+
+Also update the commit message, I've misanalyzed the bug rather badly.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=70507
+	Tested-by: Jan-Michael Brummer <jan.brummer@tabos.org>
+	Cc: stable@vger.kernel.org
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 1fbc0d789d12fec313c91912fc11733fdfbab863)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 56746dcac40f,d78d33f9337d..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -2467,6 -2327,12 +2467,15 @@@ static void intel_fdi_normal_train(stru
+  			   FDI_FE_ERRC_ENABLE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool pipe_has_enabled_pch(struct intel_crtc *crtc)
++ {
++ 	return crtc->base.enabled && crtc->active &&
++ 		crtc->config.has_pch_encoder;
++ }
++ 
+++>>>>>>> 1fbc0d789d12 (drm/i915: Fix the PPT fdi lane bifurcate state handling on ivb)
+  static void ivb_modeset_global_resources(struct drm_device *dev)
+  {
+  	struct drm_i915_private *dev_priv = dev->dev_private;
+@@@ -3085,6 -2956,72 +3094,75 @@@ static void lpt_program_iclkip(struct d
+  	mutex_unlock(&dev_priv->dpio_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ironlake_pch_transcoder_set_timings(struct intel_crtc *crtc,
++ 						enum pipe pch_transcoder)
++ {
++ 	struct drm_device *dev = crtc->base.dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	enum transcoder cpu_transcoder = crtc->config.cpu_transcoder;
++ 
++ 	I915_WRITE(PCH_TRANS_HTOTAL(pch_transcoder),
++ 		   I915_READ(HTOTAL(cpu_transcoder)));
++ 	I915_WRITE(PCH_TRANS_HBLANK(pch_transcoder),
++ 		   I915_READ(HBLANK(cpu_transcoder)));
++ 	I915_WRITE(PCH_TRANS_HSYNC(pch_transcoder),
++ 		   I915_READ(HSYNC(cpu_transcoder)));
++ 
++ 	I915_WRITE(PCH_TRANS_VTOTAL(pch_transcoder),
++ 		   I915_READ(VTOTAL(cpu_transcoder)));
++ 	I915_WRITE(PCH_TRANS_VBLANK(pch_transcoder),
++ 		   I915_READ(VBLANK(cpu_transcoder)));
++ 	I915_WRITE(PCH_TRANS_VSYNC(pch_transcoder),
++ 		   I915_READ(VSYNC(cpu_transcoder)));
++ 	I915_WRITE(PCH_TRANS_VSYNCSHIFT(pch_transcoder),
++ 		   I915_READ(VSYNCSHIFT(cpu_transcoder)));
++ }
++ 
++ static void cpt_enable_fdi_bc_bifurcation(struct drm_device *dev)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	uint32_t temp;
++ 
++ 	temp = I915_READ(SOUTH_CHICKEN1);
++ 	if (temp & FDI_BC_BIFURCATION_SELECT)
++ 		return;
++ 
++ 	WARN_ON(I915_READ(FDI_RX_CTL(PIPE_B)) & FDI_RX_ENABLE);
++ 	WARN_ON(I915_READ(FDI_RX_CTL(PIPE_C)) & FDI_RX_ENABLE);
++ 
++ 	temp |= FDI_BC_BIFURCATION_SELECT;
++ 	DRM_DEBUG_KMS("enabling fdi C rx\n");
++ 	I915_WRITE(SOUTH_CHICKEN1, temp);
++ 	POSTING_READ(SOUTH_CHICKEN1);
++ }
++ 
++ static void ivybridge_update_fdi_bc_bifurcation(struct intel_crtc *intel_crtc)
++ {
++ 	struct drm_device *dev = intel_crtc->base.dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 
++ 	switch (intel_crtc->pipe) {
++ 	case PIPE_A:
++ 		break;
++ 	case PIPE_B:
++ 		if (intel_crtc->config.fdi_lanes > 2)
++ 			WARN_ON(I915_READ(SOUTH_CHICKEN1) & FDI_BC_BIFURCATION_SELECT);
++ 		else
++ 			cpt_enable_fdi_bc_bifurcation(dev);
++ 
++ 		break;
++ 	case PIPE_C:
++ 		cpt_enable_fdi_bc_bifurcation(dev);
++ 
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ }
++ 
+++>>>>>>> 1fbc0d789d12 (drm/i915: Fix the PPT fdi lane bifurcate state handling on ivb)
+  /*
+   * Enable PCH resources required for PCH ports:
+   *   - PCH PLLs
+@@@ -3101,8 -3038,11 +3179,11 @@@ static void ironlake_pch_enable(struct 
+  	int pipe = intel_crtc->pipe;
+  	u32 reg, temp;
+  
+ -	assert_pch_transcoder_disabled(dev_priv, pipe);
+ +	assert_transcoder_disabled(dev_priv, pipe);
+  
++ 	if (IS_IVYBRIDGE(dev))
++ 		ivybridge_update_fdi_bc_bifurcation(intel_crtc);
++ 
+  	/* Write the TU size bits before fdi link training, so that error
+  	 * detection works. */
+  	I915_WRITE(FDI_RX_TUSIZE1(pipe),
+@@@ -5328,88 -5638,6 +5409,91 @@@ static bool ironlake_compute_clocks(str
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static void cpt_enable_fdi_bc_bifurcation(struct drm_device *dev)
+ +{
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	uint32_t temp;
+ +
+ +	temp = I915_READ(SOUTH_CHICKEN1);
+ +	if (temp & FDI_BC_BIFURCATION_SELECT)
+ +		return;
+ +
+ +	WARN_ON(I915_READ(FDI_RX_CTL(PIPE_B)) & FDI_RX_ENABLE);
+ +	WARN_ON(I915_READ(FDI_RX_CTL(PIPE_C)) & FDI_RX_ENABLE);
+ +
+ +	temp |= FDI_BC_BIFURCATION_SELECT;
+ +	DRM_DEBUG_KMS("enabling fdi C rx\n");
+ +	I915_WRITE(SOUTH_CHICKEN1, temp);
+ +	POSTING_READ(SOUTH_CHICKEN1);
+ +}
+ +
+ +static bool ironlake_check_fdi_lanes(struct intel_crtc *intel_crtc)
+ +{
+ +	struct drm_device *dev = intel_crtc->base.dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_crtc *pipe_B_crtc =
+ +		to_intel_crtc(dev_priv->pipe_to_crtc_mapping[PIPE_B]);
+ +
+ +	DRM_DEBUG_KMS("checking fdi config on pipe %i, lanes %i\n",
+ +		      intel_crtc->pipe, intel_crtc->fdi_lanes);
+ +	if (intel_crtc->fdi_lanes > 4) {
+ +		DRM_DEBUG_KMS("invalid fdi lane config on pipe %i: %i lanes\n",
+ +			      intel_crtc->pipe, intel_crtc->fdi_lanes);
+ +		/* Clamp lanes to avoid programming the hw with bogus values. */
+ +		intel_crtc->fdi_lanes = 4;
+ +
+ +		return false;
+ +	}
+ +
+ +	if (INTEL_INFO(dev)->num_pipes == 2)
+ +		return true;
+ +
+ +	switch (intel_crtc->pipe) {
+ +	case PIPE_A:
+ +		return true;
+ +	case PIPE_B:
+ +		if (dev_priv->pipe_to_crtc_mapping[PIPE_C]->enabled &&
+ +		    intel_crtc->fdi_lanes > 2) {
+ +			DRM_DEBUG_KMS("invalid shared fdi lane config on pipe %i: %i lanes\n",
+ +				      intel_crtc->pipe, intel_crtc->fdi_lanes);
+ +			/* Clamp lanes to avoid programming the hw with bogus values. */
+ +			intel_crtc->fdi_lanes = 2;
+ +
+ +			return false;
+ +		}
+ +
+ +		if (intel_crtc->fdi_lanes > 2)
+ +			WARN_ON(I915_READ(SOUTH_CHICKEN1) & FDI_BC_BIFURCATION_SELECT);
+ +		else
+ +			cpt_enable_fdi_bc_bifurcation(dev);
+ +
+ +		return true;
+ +	case PIPE_C:
+ +		if (!pipe_B_crtc->base.enabled || pipe_B_crtc->fdi_lanes <= 2) {
+ +			if (intel_crtc->fdi_lanes > 2) {
+ +				DRM_DEBUG_KMS("invalid shared fdi lane config on pipe %i: %i lanes\n",
+ +					      intel_crtc->pipe, intel_crtc->fdi_lanes);
+ +				/* Clamp lanes to avoid programming the hw with bogus values. */
+ +				intel_crtc->fdi_lanes = 2;
+ +
+ +				return false;
+ +			}
+ +		} else {
+ +			DRM_DEBUG_KMS("fdi link B uses too many lanes to enable link C\n");
+ +			return false;
+ +		}
+ +
+ +		cpt_enable_fdi_bc_bifurcation(dev);
+ +
+ +		return true;
+ +	default:
+ +		BUG();
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 1fbc0d789d12 (drm/i915: Fix the PPT fdi lane bifurcate state handling on ivb)
+  int ironlake_get_lanes_required(int target_clock, int link_bw, int bpp)
+  {
+  	/*
+@@@ -5675,77 -5814,446 +5759,81 @@@ static int ironlake_crtc_mode_set(struc
+  	if (intel_crtc->config.has_dp_encoder)
+  		intel_dp_set_m_n(intel_crtc);
+  
+ -	if (is_lvds && has_reduced_clock && i915_powersave)
+ -		intel_crtc->lowfreq_avail = true;
+ -	else
+ -		intel_crtc->lowfreq_avail = false;
+ -
+ -	if (intel_crtc->config.has_pch_encoder) {
+ -		pll = intel_crtc_to_shared_dpll(intel_crtc);
+ -
+ -	}
+ -
+ -	intel_set_pipe_timings(intel_crtc);
+ -
+ -	if (intel_crtc->config.has_pch_encoder) {
+ -		intel_cpu_transcoder_set_m_n(intel_crtc,
+ -					     &intel_crtc->config.fdi_m_n);
+ -	}
+ -
+ -	ironlake_set_pipeconf(crtc);
+ -
+ -	/* Set up the display plane register */
+ -	I915_WRITE(DSPCNTR(plane), DISPPLANE_GAMMA_ENABLE);
+ -	POSTING_READ(DSPCNTR(plane));
+ -
+ -	ret = intel_pipe_set_base(crtc, x, y, fb);
+ -
+ -	intel_update_watermarks(dev);
+ -
+ -	return ret;
+ -}
+ -
+ -static void ironlake_get_fdi_m_n_config(struct intel_crtc *crtc,
+ -					struct intel_crtc_config *pipe_config)
+ -{
+ -	struct drm_device *dev = crtc->base.dev;
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ -	enum transcoder transcoder = pipe_config->cpu_transcoder;
+ -
+ -	pipe_config->fdi_m_n.link_m = I915_READ(PIPE_LINK_M1(transcoder));
+ -	pipe_config->fdi_m_n.link_n = I915_READ(PIPE_LINK_N1(transcoder));
+ -	pipe_config->fdi_m_n.gmch_m = I915_READ(PIPE_DATA_M1(transcoder))
+ -					& ~TU_SIZE_MASK;
+ -	pipe_config->fdi_m_n.gmch_n = I915_READ(PIPE_DATA_N1(transcoder));
+ -	pipe_config->fdi_m_n.tu = ((I915_READ(PIPE_DATA_M1(transcoder))
+ -				   & TU_SIZE_MASK) >> TU_SIZE_SHIFT) + 1;
+ -}
+ -
+ -static void ironlake_get_pfit_config(struct intel_crtc *crtc,
+ -				     struct intel_crtc_config *pipe_config)
+ -{
+ -	struct drm_device *dev = crtc->base.dev;
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ -	uint32_t tmp;
+ -
+ -	tmp = I915_READ(PF_CTL(crtc->pipe));
+ -
+ -	if (tmp & PF_ENABLE) {
+ -		pipe_config->pch_pfit.enabled = true;
+ -		pipe_config->pch_pfit.pos = I915_READ(PF_WIN_POS(crtc->pipe));
+ -		pipe_config->pch_pfit.size = I915_READ(PF_WIN_SZ(crtc->pipe));
+ -
+ -		/* We currently do not free assignements of panel fitters on
+ -		 * ivb/hsw (since we don't use the higher upscaling modes which
+ -		 * differentiates them) so just WARN about this case for now. */
+ -		if (IS_GEN7(dev)) {
+ -			WARN_ON((tmp & PF_PIPE_SEL_MASK_IVB) !=
+ -				PF_PIPE_SEL_IVB(crtc->pipe));
+ -		}
+ -	}
+ -}
+ -
+ -static bool ironlake_get_pipe_config(struct intel_crtc *crtc,
+ -				     struct intel_crtc_config *pipe_config)
+ -{
+ -	struct drm_device *dev = crtc->base.dev;
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ -	uint32_t tmp;
+ -
+ -	pipe_config->cpu_transcoder = (enum transcoder) crtc->pipe;
+ -	pipe_config->shared_dpll = DPLL_ID_PRIVATE;
+ -
+ -	tmp = I915_READ(PIPECONF(crtc->pipe));
+ -	if (!(tmp & PIPECONF_ENABLE))
+ -		return false;
+ -
+ -	switch (tmp & PIPECONF_BPC_MASK) {
+ -	case PIPECONF_6BPC:
+ -		pipe_config->pipe_bpp = 18;
+ -		break;
+ -	case PIPECONF_8BPC:
+ -		pipe_config->pipe_bpp = 24;
+ -		break;
+ -	case PIPECONF_10BPC:
+ -		pipe_config->pipe_bpp = 30;
+ -		break;
+ -	case PIPECONF_12BPC:
+ -		pipe_config->pipe_bpp = 36;
+ -		break;
+ -	default:
+ -		break;
+ -	}
+ -
+ -	if (I915_READ(PCH_TRANSCONF(crtc->pipe)) & TRANS_ENABLE) {
+ -		struct intel_shared_dpll *pll;
+ -
+ -		pipe_config->has_pch_encoder = true;
+ -
+ -		tmp = I915_READ(FDI_RX_CTL(crtc->pipe));
+ -		pipe_config->fdi_lanes = ((FDI_DP_PORT_WIDTH_MASK & tmp) >>
+ -					  FDI_DP_PORT_WIDTH_SHIFT) + 1;
+ -
+ -		ironlake_get_fdi_m_n_config(crtc, pipe_config);
+ -
+ -		if (HAS_PCH_IBX(dev_priv->dev)) {
+ -			pipe_config->shared_dpll =
+ -				(enum intel_dpll_id) crtc->pipe;
+ -		} else {
+ -			tmp = I915_READ(PCH_DPLL_SEL);
+ -			if (tmp & TRANS_DPLLB_SEL(crtc->pipe))
+ -				pipe_config->shared_dpll = DPLL_ID_PCH_PLL_B;
+ -			else
+ -				pipe_config->shared_dpll = DPLL_ID_PCH_PLL_A;
+ -		}
+ -
+ -		pll = &dev_priv->shared_dplls[pipe_config->shared_dpll];
+ -
+ -		WARN_ON(!pll->get_hw_state(dev_priv, pll,
+ -					   &pipe_config->dpll_hw_state));
+ -
+ -		tmp = pipe_config->dpll_hw_state.dpll;
+ -		pipe_config->pixel_multiplier =
+ -			((tmp & PLL_REF_SDVO_HDMI_MULTIPLIER_MASK)
+ -			 >> PLL_REF_SDVO_HDMI_MULTIPLIER_SHIFT) + 1;
+ -	} else {
+ -		pipe_config->pixel_multiplier = 1;
+ -	}
+ -
+ -	intel_get_pipe_timings(crtc, pipe_config);
+ -
+ -	ironlake_get_pfit_config(crtc, pipe_config);
+ -
+ -	return true;
+ -}
+ -
+ -static void assert_can_disable_lcpll(struct drm_i915_private *dev_priv)
+ -{
+ -	struct drm_device *dev = dev_priv->dev;
+ -	struct intel_ddi_plls *plls = &dev_priv->ddi_plls;
+ -	struct intel_crtc *crtc;
+ -	unsigned long irqflags;
+ -	uint32_t val;
+ -
+ -	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head)
+ -		WARN(crtc->base.enabled, "CRTC for pipe %c enabled\n",
+ -		     pipe_name(crtc->pipe));
+ -
+ -	WARN(I915_READ(HSW_PWR_WELL_DRIVER), "Power well on\n");
+ -	WARN(plls->spll_refcount, "SPLL enabled\n");
+ -	WARN(plls->wrpll1_refcount, "WRPLL1 enabled\n");
+ -	WARN(plls->wrpll2_refcount, "WRPLL2 enabled\n");
+ -	WARN(I915_READ(PCH_PP_STATUS) & PP_ON, "Panel power on\n");
+ -	WARN(I915_READ(BLC_PWM_CPU_CTL2) & BLM_PWM_ENABLE,
+ -	     "CPU PWM1 enabled\n");
+ -	WARN(I915_READ(HSW_BLC_PWM2_CTL) & BLM_PWM_ENABLE,
+ -	     "CPU PWM2 enabled\n");
+ -	WARN(I915_READ(BLC_PWM_PCH_CTL1) & BLM_PCH_PWM_ENABLE,
+ -	     "PCH PWM1 enabled\n");
+ -	WARN(I915_READ(UTIL_PIN_CTL) & UTIL_PIN_ENABLE,
+ -	     "Utility pin enabled\n");
+ -	WARN(I915_READ(PCH_GTC_CTL) & PCH_GTC_ENABLE, "PCH GTC enabled\n");
+ -
+ -	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+ -	val = I915_READ(DEIMR);
+ -	WARN((val & ~DE_PCH_EVENT_IVB) != val,
+ -	     "Unexpected DEIMR bits enabled: 0x%x\n", val);
+ -	val = I915_READ(SDEIMR);
+ -	WARN((val | SDE_HOTPLUG_MASK_CPT) != 0xffffffff,
+ -	     "Unexpected SDEIMR bits enabled: 0x%x\n", val);
+ -	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+ -}
+ -
+ -/*
+ - * This function implements pieces of two sequences from BSpec:
+ - * - Sequence for display software to disable LCPLL
+ - * - Sequence for display software to allow package C8+
+ - * The steps implemented here are just the steps that actually touch the LCPLL
+ - * register. Callers should take care of disabling all the display engine
+ - * functions, doing the mode unset, fixing interrupts, etc.
+ - */
+ -void hsw_disable_lcpll(struct drm_i915_private *dev_priv,
+ -		       bool switch_to_fclk, bool allow_power_down)
+ -{
+ -	uint32_t val;
+ -
+ -	assert_can_disable_lcpll(dev_priv);
+ -
+ -	val = I915_READ(LCPLL_CTL);
+ -
+ -	if (switch_to_fclk) {
+ -		val |= LCPLL_CD_SOURCE_FCLK;
+ -		I915_WRITE(LCPLL_CTL, val);
+ -
+ -		if (wait_for_atomic_us(I915_READ(LCPLL_CTL) &
+ -				       LCPLL_CD_SOURCE_FCLK_DONE, 1))
+ -			DRM_ERROR("Switching to FCLK failed\n");
+ -
+ -		val = I915_READ(LCPLL_CTL);
+ -	}
+ -
+ -	val |= LCPLL_PLL_DISABLE;
+ -	I915_WRITE(LCPLL_CTL, val);
+ -	POSTING_READ(LCPLL_CTL);
+ -
+ -	if (wait_for((I915_READ(LCPLL_CTL) & LCPLL_PLL_LOCK) == 0, 1))
+ -		DRM_ERROR("LCPLL still locked\n");
+ -
+ -	val = I915_READ(D_COMP);
+ -	val |= D_COMP_COMP_DISABLE;
+ -	I915_WRITE(D_COMP, val);
+ -	POSTING_READ(D_COMP);
+ -	ndelay(100);
+ -
+ -	if (wait_for((I915_READ(D_COMP) & D_COMP_RCOMP_IN_PROGRESS) == 0, 1))
+ -		DRM_ERROR("D_COMP RCOMP still in progress\n");
+ -
+ -	if (allow_power_down) {
+ -		val = I915_READ(LCPLL_CTL);
+ -		val |= LCPLL_POWER_DOWN_ALLOW;
+ -		I915_WRITE(LCPLL_CTL, val);
+ -		POSTING_READ(LCPLL_CTL);
+ -	}
+ -}
+ -
+ -/*
+ - * Fully restores LCPLL, disallowing power down and switching back to LCPLL
+ - * source.
+ - */
+ -void hsw_restore_lcpll(struct drm_i915_private *dev_priv)
+ -{
+ -	uint32_t val;
+ -
+ -	val = I915_READ(LCPLL_CTL);
+ -
+ -	if ((val & (LCPLL_PLL_LOCK | LCPLL_PLL_DISABLE | LCPLL_CD_SOURCE_FCLK |
+ -		    LCPLL_POWER_DOWN_ALLOW)) == LCPLL_PLL_LOCK)
+ -		return;
+ -
+ -	/* Make sure we're not on PC8 state before disabling PC8, otherwise
+ -	 * we'll hang the machine! */
+ -	dev_priv->uncore.funcs.force_wake_get(dev_priv);
+ -
+ -	if (val & LCPLL_POWER_DOWN_ALLOW) {
+ -		val &= ~LCPLL_POWER_DOWN_ALLOW;
+ -		I915_WRITE(LCPLL_CTL, val);
+ -		POSTING_READ(LCPLL_CTL);
+ -	}
+ -
+ -	val = I915_READ(D_COMP);
+ -	val |= D_COMP_COMP_FORCE;
+ -	val &= ~D_COMP_COMP_DISABLE;
+ -	I915_WRITE(D_COMP, val);
+ -	POSTING_READ(D_COMP);
+ -
+ -	val = I915_READ(LCPLL_CTL);
+ -	val &= ~LCPLL_PLL_DISABLE;
+ -	I915_WRITE(LCPLL_CTL, val);
+ -
+ -	if (wait_for(I915_READ(LCPLL_CTL) & LCPLL_PLL_LOCK, 5))
+ -		DRM_ERROR("LCPLL not locked yet\n");
+ -
+ -	if (val & LCPLL_CD_SOURCE_FCLK) {
+ -		val = I915_READ(LCPLL_CTL);
+ -		val &= ~LCPLL_CD_SOURCE_FCLK;
+ -		I915_WRITE(LCPLL_CTL, val);
+ -
+ -		if (wait_for_atomic_us((I915_READ(LCPLL_CTL) &
+ -					LCPLL_CD_SOURCE_FCLK_DONE) == 0, 1))
+ -			DRM_ERROR("Switching back to LCPLL failed\n");
+ -	}
+ -
+ -	dev_priv->uncore.funcs.force_wake_put(dev_priv);
+ -}
+ -
+ -void hsw_enable_pc8_work(struct work_struct *__work)
+ -{
+ -	struct drm_i915_private *dev_priv =
+ -		container_of(to_delayed_work(__work), struct drm_i915_private,
+ -			     pc8.enable_work);
+ -	struct drm_device *dev = dev_priv->dev;
+ -	uint32_t val;
+ -
+ -	if (dev_priv->pc8.enabled)
+ -		return;
+ -
+ -	DRM_DEBUG_KMS("Enabling package C8+\n");
+ -
+ -	dev_priv->pc8.enabled = true;
+ -
+ -	if (dev_priv->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE) {
+ -		val = I915_READ(SOUTH_DSPCLK_GATE_D);
+ -		val &= ~PCH_LP_PARTITION_LEVEL_DISABLE;
+ -		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
+ -	}
+ -
+ -	lpt_disable_clkout_dp(dev);
+ -	hsw_pc8_disable_interrupts(dev);
+ -	hsw_disable_lcpll(dev_priv, true, true);
+ -}
+ -
+ -static void __hsw_enable_package_c8(struct drm_i915_private *dev_priv)
+ -{
+ -	WARN_ON(!mutex_is_locked(&dev_priv->pc8.lock));
+ -	WARN(dev_priv->pc8.disable_count < 1,
+ -	     "pc8.disable_count: %d\n", dev_priv->pc8.disable_count);
+ -
+ -	dev_priv->pc8.disable_count--;
+ -	if (dev_priv->pc8.disable_count != 0)
+ -		return;
+ -
+ -	schedule_delayed_work(&dev_priv->pc8.enable_work,
+ -			      msecs_to_jiffies(i915_pc8_timeout));
+ -}
+ -
+ -static void __hsw_disable_package_c8(struct drm_i915_private *dev_priv)
+ -{
+ -	struct drm_device *dev = dev_priv->dev;
+ -	uint32_t val;
+ -
+ -	WARN_ON(!mutex_is_locked(&dev_priv->pc8.lock));
+ -	WARN(dev_priv->pc8.disable_count < 0,
+ -	     "pc8.disable_count: %d\n", dev_priv->pc8.disable_count);
+ -
+ -	dev_priv->pc8.disable_count++;
+ -	if (dev_priv->pc8.disable_count != 1)
+ -		return;
+ -
+ -	cancel_delayed_work_sync(&dev_priv->pc8.enable_work);
+ -	if (!dev_priv->pc8.enabled)
+ -		return;
+ -
+ -	DRM_DEBUG_KMS("Disabling package C8+\n");
+ -
+ -	hsw_restore_lcpll(dev_priv);
+ -	hsw_pc8_restore_interrupts(dev);
+ -	lpt_init_pch_refclk(dev);
+ -
+ -	if (dev_priv->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE) {
+ -		val = I915_READ(SOUTH_DSPCLK_GATE_D);
+ -		val |= PCH_LP_PARTITION_LEVEL_DISABLE;
+ -		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
+ -	}
+ -
+ -	intel_prepare_ddi(dev);
+ -	i915_gem_init_swizzling(dev);
+ -	mutex_lock(&dev_priv->rps.hw_lock);
+ -	gen6_update_ring_freq(dev);
+ -	mutex_unlock(&dev_priv->rps.hw_lock);
+ -	dev_priv->pc8.enabled = false;
+ -}
+ -
+ -void hsw_enable_package_c8(struct drm_i915_private *dev_priv)
+ -{
+ -	mutex_lock(&dev_priv->pc8.lock);
+ -	__hsw_enable_package_c8(dev_priv);
+ -	mutex_unlock(&dev_priv->pc8.lock);
+ -}
+ +	for_each_encoder_on_crtc(dev, crtc, encoder)
+ +		if (encoder->pre_pll_enable)
+ +			encoder->pre_pll_enable(encoder);
+  
+ -void hsw_disable_package_c8(struct drm_i915_private *dev_priv)
+ -{
+ -	mutex_lock(&dev_priv->pc8.lock);
+ -	__hsw_disable_package_c8(dev_priv);
+ -	mutex_unlock(&dev_priv->pc8.lock);
+ -}
+ +	if (intel_crtc->pch_pll) {
+ +		I915_WRITE(intel_crtc->pch_pll->pll_reg, dpll);
+  
+ -static bool hsw_can_enable_package_c8(struct drm_i915_private *dev_priv)
+ -{
+ -	struct drm_device *dev = dev_priv->dev;
+ -	struct intel_crtc *crtc;
+ -	uint32_t val;
+ +		/* Wait for the clocks to stabilize. */
+ +		POSTING_READ(intel_crtc->pch_pll->pll_reg);
+ +		udelay(150);
+  
+ -	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head)
+ -		if (crtc->base.enabled)
+ -			return false;
+ +		/* The pixel multiplier can only be updated once the
+ +		 * DPLL is enabled and the clocks are stable.
+ +		 *
+ +		 * So write it again.
+ +		 */
+ +		I915_WRITE(intel_crtc->pch_pll->pll_reg, dpll);
+ +	}
+  
+ -	/* This case is still possible since we have the i915.disable_power_well
+ -	 * parameter and also the KVMr or something else might be requesting the
+ -	 * power well. */
+ -	val = I915_READ(HSW_PWR_WELL_DRIVER);
+ -	if (val != 0) {
+ -		DRM_DEBUG_KMS("Not enabling PC8: power well on\n");
+ -		return false;
+ +	intel_crtc->lowfreq_avail = false;
+ +	if (intel_crtc->pch_pll) {
+ +		if (is_lvds && has_reduced_clock && i915_powersave) {
+ +			I915_WRITE(intel_crtc->pch_pll->fp1_reg, fp2);
+ +			intel_crtc->lowfreq_avail = true;
+ +		} else {
+ +			I915_WRITE(intel_crtc->pch_pll->fp1_reg, fp);
+ +		}
+  	}
+  
+ -	return true;
+ -}
+++<<<<<<< HEAD
+ +	intel_set_pipe_timings(intel_crtc, mode, adjusted_mode);
+  
+ -/* Since we're called from modeset_global_resources there's no way to
+ - * symmetrically increase and decrease the refcount, so we use
+ - * dev_priv->pc8.requirements_met to track whether we already have the refcount
+ - * or not.
+ - */
+ -static void hsw_update_package_c8(struct drm_device *dev)
+ -{
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ -	bool allow;
+ +	/* Note, this also computes intel_crtc->fdi_lanes which is used below in
+ +	 * ironlake_check_fdi_lanes. */
+ +	intel_crtc->fdi_lanes = 0;
+ +	if (intel_crtc->config.has_pch_encoder)
+ +		ironlake_fdi_set_m_n(crtc);
+  
+ -	if (!i915_enable_pc8)
+ -		return;
+ +	fdi_config_ok = ironlake_check_fdi_lanes(intel_crtc);
+  
+ -	mutex_lock(&dev_priv->pc8.lock);
+ +	ironlake_set_pipeconf(crtc, adjusted_mode, dither);
+  
+ -	allow = hsw_can_enable_package_c8(dev_priv);
+ +	intel_wait_for_vblank(dev, pipe);
+++=======
+++	ironlake_set_pipeconf(crtc);
+++>>>>>>> 1fbc0d789d12 (drm/i915: Fix the PPT fdi lane bifurcate state handling on ivb)
+  
+ -	if (allow == dev_priv->pc8.requirements_met)
+ -		goto done;
+ +	/* Set up the display plane register */
+ +	I915_WRITE(DSPCNTR(plane), DISPPLANE_GAMMA_ENABLE);
+ +	POSTING_READ(DSPCNTR(plane));
+  
+ -	dev_priv->pc8.requirements_met = allow;
+ +	ret = intel_pipe_set_base(crtc, x, y, fb);
+  
+ -	if (allow)
+ -		__hsw_enable_package_c8(dev_priv);
+ -	else
+ -		__hsw_disable_package_c8(dev_priv);
+ +	intel_update_watermarks(dev);
+  
+ -done:
+ -	mutex_unlock(&dev_priv->pc8.lock);
+ -}
+ +	intel_update_linetime_watermarks(dev, pipe, adjusted_mode);
+  
+ -static void hsw_package_c8_gpu_idle(struct drm_i915_private *dev_priv)
+ -{
+ -	if (!dev_priv->pc8.gpu_idle) {
+ -		dev_priv->pc8.gpu_idle = true;
+ -		hsw_enable_package_c8(dev_priv);
+ -	}
+ +	return fdi_config_ok ? ret : -EINVAL;
+  }
+  
+ -static void hsw_package_c8_gpu_busy(struct drm_i915_private *dev_priv)
+ +static bool ironlake_get_pipe_config(struct intel_crtc *crtc,
+ +				     struct intel_crtc_config *pipe_config)
+  {
+ -	if (dev_priv->pc8.gpu_idle) {
+ -		dev_priv->pc8.gpu_idle = false;
+ -		hsw_disable_package_c8(dev_priv);
+ -	}
+ +	struct drm_device *dev = crtc->base.dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	uint32_t tmp;
+ +
+ +	tmp = I915_READ(PIPECONF(crtc->pipe));
+ +	if (!(tmp & PIPECONF_ENABLE))
+ +		return false;
+ +
+ +	if (I915_READ(TRANSCONF(crtc->pipe)) & TRANS_ENABLE)
+ +		pipe_config->has_pch_encoder = true;
+ +
+ +	return true;
+  }
+  
+  static void haswell_modeset_global_resources(struct drm_device *dev)
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
