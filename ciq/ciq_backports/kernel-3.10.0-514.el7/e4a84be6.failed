@@ -1,0 +1,148 @@
+x86/mm: Disallow running with 32-bit PTEs to work around erratum
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] Disallow running with 32-bit PTEs to work around erratum (Larry Woodman) [1347159]
+Rebuild_FUZZ: 93.33%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit e4a84be6f05eab4778732d799f63b3cd15427885
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e4a84be6.failed
+
+The Intel(R) Xeon Phi(TM) Processor x200 Family (codename: Knights
+Landing) has an erratum where a processor thread setting the Accessed
+or Dirty bits may not do so atomically against its checks for the
+Present bit.  This may cause a thread (which is about to page fault)
+to set A and/or D, even though the Present bit had already been
+atomically cleared.
+
+These bits are truly "stray".  In the case of the Dirty bit, the
+thread associated with the stray set was *not* allowed to write to
+the page.  This means that we do not have to launder the bit(s); we
+can simply ignore them.
+
+If the PTE is used for storing a swap index or a NUMA migration index,
+the A bit could be misinterpreted as part of the swap type.  The stray
+bits being set cause a software-cleared PTE to be interpreted as a
+swap entry.  In some cases (like when the swap index ends up being
+for a non-existent swapfile), the kernel detects the stray value
+and WARN()s about it, but there is no guarantee that the kernel can
+always detect it.
+
+When we have 64-bit PTEs (64-bit mode or 32-bit PAE), we were able
+to move the swap PTE format around to avoid these troublesome bits.
+But, 32-bit non-PAE is tight on bits.  So, disallow it from running
+on this hardware.  I can't imagine anyone wanting to run 32-bit
+non-highmem kernels on this hardware, but disallowing them from
+running entirely is surely the safe thing to do.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Luis R. Rodriguez <mcgrof@suse.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Toshi Kani <toshi.kani@hp.com>
+	Cc: dave.hansen@intel.com
+	Cc: linux-mm@kvack.org
+	Cc: mhocko@suse.com
+Link: http://lkml.kernel.org/r/20160708001914.D0B50110@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e4a84be6f05eab4778732d799f63b3cd15427885)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/cpuflags.c
+#	arch/x86/boot/cpuflags.h
+* Unmerged path arch/x86/boot/cpuflags.c
+* Unmerged path arch/x86/boot/cpuflags.h
+diff --git a/arch/x86/boot/boot.h b/arch/x86/boot/boot.h
+index ca13621c6ee2..6a4f6f846021 100644
+--- a/arch/x86/boot/boot.h
++++ b/arch/x86/boot/boot.h
+@@ -303,6 +303,7 @@ struct cpu_features {
+ };
+ extern struct cpu_features cpu;
+ int check_cpu(int *cpu_level_ptr, int *req_level_ptr, u32 **err_flags_ptr);
++int check_knl_erratum(void);
+ int validate_cpu(void);
+ 
+ /* early_serial_console.c */
+diff --git a/arch/x86/boot/cpu.c b/arch/x86/boot/cpu.c
+index 6ec6bb6e9957..ae98089fa13a 100644
+--- a/arch/x86/boot/cpu.c
++++ b/arch/x86/boot/cpu.c
+@@ -79,6 +79,8 @@ int validate_cpu(void)
+ 		}
+ 		putchar('\n');
+ 		return -1;
++	} else if (check_knl_erratum()) {
++		return -1;
+ 	} else {
+ 		return 0;
+ 	}
+diff --git a/arch/x86/boot/cpucheck.c b/arch/x86/boot/cpucheck.c
+index f1c2d75cabfd..90365817a11a 100644
+--- a/arch/x86/boot/cpucheck.c
++++ b/arch/x86/boot/cpucheck.c
+@@ -24,6 +24,7 @@
+ # include "boot.h"
+ #endif
+ #include <linux/types.h>
++#include <asm/intel-family.h>
+ #include <asm/processor-flags.h>
+ #include <asm/required-features.h>
+ #include <asm/msr-index.h>
+@@ -241,6 +242,8 @@ int check_cpu(int *cpu_level_ptr, int *req_level_ptr, u32 **err_flags_ptr)
+ 
+ 		err = check_flags();
+ 	}
++	if (!err)
++		err = check_knl_erratum();
+ 
+ 	if (err_flags_ptr)
+ 		*err_flags_ptr = err ? err_flags : NULL;
+@@ -251,3 +254,33 @@ int check_cpu(int *cpu_level_ptr, int *req_level_ptr, u32 **err_flags_ptr)
+ 
+ 	return (cpu.level < req_level || err) ? -1 : 0;
+ }
++
++int check_knl_erratum(void)
++{
++	/*
++	 * First check for the affected model/family:
++	 */
++	if (!is_intel() ||
++	    cpu.family != 6 ||
++	    cpu.model != INTEL_FAM6_XEON_PHI_KNL)
++		return 0;
++
++	/*
++	 * This erratum affects the Accessed/Dirty bits, and can
++	 * cause stray bits to be set in !Present PTEs.  We have
++	 * enough bits in our 64-bit PTEs (which we have on real
++	 * 64-bit mode or PAE) to avoid using these troublesome
++	 * bits.  But, we do not have enough space in our 32-bit
++	 * PTEs.  So, refuse to run on 32-bit non-PAE kernels.
++	 */
++	if (IS_ENABLED(CONFIG_X86_64) || IS_ENABLED(CONFIG_X86_PAE))
++		return 0;
++
++	puts("This 32-bit kernel can not run on this Xeon Phi x200\n"
++	     "processor due to a processor erratum.  Use a 64-bit\n"
++	     "kernel, or enable PAE in this 32-bit kernel.\n\n");
++
++	return -1;
++}
++
++
+* Unmerged path arch/x86/boot/cpuflags.c
+* Unmerged path arch/x86/boot/cpuflags.h
