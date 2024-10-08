@@ -1,0 +1,137 @@
+ext4: start transaction before calling into DAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matthew Wilcox <willy@linux.intel.com>
+commit 01a33b4ace68bc35679a347f21d5ed6e222e30dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/01a33b4a.failed
+
+Jan Kara pointed out that in the case where we are writing to a hole, we
+can end up with a lock inversion between the page lock and the journal
+lock.  We can avoid this by starting the transaction in ext4 before
+calling into DAX.  The journal lock nests inside the superblock
+pagefault lock, so we have to duplicate that code from dax_fault, like
+XFS does.
+
+	Signed-off-by: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 01a33b4ace68bc35679a347f21d5ed6e222e30dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,113837e7ba98..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -200,10 -188,104 +200,103 @@@ ext4_file_write(struct kiocb *iocb, con
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ static void ext4_end_io_unwritten(struct buffer_head *bh, int uptodate)
++ {
++ 	struct inode *inode = bh->b_assoc_map->host;
++ 	/* XXX: breaks on 32-bit > 16TB. Is that even supported? */
++ 	loff_t offset = (loff_t)(uintptr_t)bh->b_private << inode->i_blkbits;
++ 	int err;
++ 	if (!uptodate)
++ 		return;
++ 	WARN_ON(!buffer_unwritten(bh));
++ 	err = ext4_convert_unwritten_extents(NULL, inode, offset, bh->b_size);
++ }
++ 
++ static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	int result;
++ 	handle_t *handle = NULL;
++ 	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
++ 	bool write = vmf->flags & FAULT_FLAG_WRITE;
++ 
++ 	if (write) {
++ 		sb_start_pagefault(sb);
++ 		file_update_time(vma->vm_file);
++ 		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
++ 						EXT4_DATA_TRANS_BLOCKS(sb));
++ 	}
++ 
++ 	if (IS_ERR(handle))
++ 		result = VM_FAULT_SIGBUS;
++ 	else
++ 		result = __dax_fault(vma, vmf, ext4_get_block_dax,
++ 						ext4_end_io_unwritten);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		sb_end_pagefault(sb);
++ 	}
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
++ 						pmd_t *pmd, unsigned int flags)
++ {
++ 	int result;
++ 	handle_t *handle = NULL;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	bool write = flags & FAULT_FLAG_WRITE;
++ 
++ 	if (write) {
++ 		sb_start_pagefault(sb);
++ 		file_update_time(vma->vm_file);
++ 		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
++ 				ext4_chunk_trans_blocks(inode,
++ 							PMD_SIZE / PAGE_SIZE));
++ 	}
++ 
++ 	if (IS_ERR(handle))
++ 		result = VM_FAULT_SIGBUS;
++ 	else
++ 		result = __dax_pmd_fault(vma, addr, pmd, flags,
++ 				ext4_get_block_dax, ext4_end_io_unwritten);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		sb_end_pagefault(sb);
++ 	}
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_mkwrite(vma, vmf, ext4_get_block_dax,
++ 				ext4_end_io_unwritten);
++ }
++ 
++ static const struct vm_operations_struct ext4_dax_vm_ops = {
++ 	.fault		= ext4_dax_fault,
++ 	.pmd_fault	= ext4_dax_pmd_fault,
++ 	.page_mkwrite	= ext4_dax_mkwrite,
++ 	.pfn_mkwrite	= dax_pfn_mkwrite,
++ };
++ #else
++ #define ext4_dax_vm_ops	ext4_file_vm_ops
++ #endif
++ 
+++>>>>>>> 01a33b4ace68 (ext4: start transaction before calling into DAX)
+  static const struct vm_operations_struct ext4_file_vm_ops = {
+  	.fault		= filemap_fault,
+ -	.map_pages	= filemap_map_pages,
+  	.page_mkwrite   = ext4_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+  };
+  
+  static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+* Unmerged path fs/ext4/file.c
