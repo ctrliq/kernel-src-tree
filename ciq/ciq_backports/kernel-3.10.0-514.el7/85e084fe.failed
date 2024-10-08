@@ -1,0 +1,517 @@
+libceph: drop msg argument from ceph_osdc_callback_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 85e084feb47349d62989efe1713a8723af95f4ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/85e084fe.failed
+
+finish_read(), its only user, uses it to get to hdr.data_len, which is
+what ->r_result is set to on success.  This gains us the ability to
+safely call callbacks from contexts other than reply, e.g. map check.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 85e084feb47349d62989efe1713a8723af95f4ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,e75fd0b028e9..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -491,6 -554,198 +491,201 @@@ static ssize_t ceph_sync_read(struct ki
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct ceph_aio_request {
++ 	struct kiocb *iocb;
++ 	size_t total_len;
++ 	int write;
++ 	int error;
++ 	struct list_head osd_reqs;
++ 	unsigned num_reqs;
++ 	atomic_t pending_reqs;
++ 	struct timespec mtime;
++ 	struct ceph_cap_flush *prealloc_cf;
++ };
++ 
++ struct ceph_aio_work {
++ 	struct work_struct work;
++ 	struct ceph_osd_request *req;
++ };
++ 
++ static void ceph_aio_retry_work(struct work_struct *work);
++ 
++ static void ceph_aio_complete(struct inode *inode,
++ 			      struct ceph_aio_request *aio_req)
++ {
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	int ret;
++ 
++ 	if (!atomic_dec_and_test(&aio_req->pending_reqs))
++ 		return;
++ 
++ 	ret = aio_req->error;
++ 	if (!ret)
++ 		ret = aio_req->total_len;
++ 
++ 	dout("ceph_aio_complete %p rc %d\n", inode, ret);
++ 
++ 	if (ret >= 0 && aio_req->write) {
++ 		int dirty;
++ 
++ 		loff_t endoff = aio_req->iocb->ki_pos + aio_req->total_len;
++ 		if (endoff > i_size_read(inode)) {
++ 			if (ceph_inode_set_size(inode, endoff))
++ 				ceph_check_caps(ci, CHECK_CAPS_AUTHONLY, NULL);
++ 		}
++ 
++ 		spin_lock(&ci->i_ceph_lock);
++ 		ci->i_inline_version = CEPH_INLINE_NONE;
++ 		dirty = __ceph_mark_dirty_caps(ci, CEPH_CAP_FILE_WR,
++ 					       &aio_req->prealloc_cf);
++ 		spin_unlock(&ci->i_ceph_lock);
++ 		if (dirty)
++ 			__mark_inode_dirty(inode, dirty);
++ 
++ 	}
++ 
++ 	ceph_put_cap_refs(ci, (aio_req->write ? CEPH_CAP_FILE_WR :
++ 						CEPH_CAP_FILE_RD));
++ 
++ 	aio_req->iocb->ki_complete(aio_req->iocb, ret, 0);
++ 
++ 	ceph_free_cap_flush(aio_req->prealloc_cf);
++ 	kfree(aio_req);
++ }
++ 
++ static void ceph_aio_complete_req(struct ceph_osd_request *req)
++ {
++ 	int rc = req->r_result;
++ 	struct inode *inode = req->r_inode;
++ 	struct ceph_aio_request *aio_req = req->r_priv;
++ 	struct ceph_osd_data *osd_data = osd_req_op_extent_osd_data(req, 0);
++ 	int num_pages = calc_pages_for((u64)osd_data->alignment,
++ 				       osd_data->length);
++ 
++ 	dout("ceph_aio_complete_req %p rc %d bytes %llu\n",
++ 	     inode, rc, osd_data->length);
++ 
++ 	if (rc == -EOLDSNAPC) {
++ 		struct ceph_aio_work *aio_work;
++ 		BUG_ON(!aio_req->write);
++ 
++ 		aio_work = kmalloc(sizeof(*aio_work), GFP_NOFS);
++ 		if (aio_work) {
++ 			INIT_WORK(&aio_work->work, ceph_aio_retry_work);
++ 			aio_work->req = req;
++ 			queue_work(ceph_inode_to_client(inode)->wb_wq,
++ 				   &aio_work->work);
++ 			return;
++ 		}
++ 		rc = -ENOMEM;
++ 	} else if (!aio_req->write) {
++ 		if (rc == -ENOENT)
++ 			rc = 0;
++ 		if (rc >= 0 && osd_data->length > rc) {
++ 			int zoff = osd_data->alignment + rc;
++ 			int zlen = osd_data->length - rc;
++ 			/*
++ 			 * If read is satisfied by single OSD request,
++ 			 * it can pass EOF. Otherwise read is within
++ 			 * i_size.
++ 			 */
++ 			if (aio_req->num_reqs == 1) {
++ 				loff_t i_size = i_size_read(inode);
++ 				loff_t endoff = aio_req->iocb->ki_pos + rc;
++ 				if (endoff < i_size)
++ 					zlen = min_t(size_t, zlen,
++ 						     i_size - endoff);
++ 				aio_req->total_len = rc + zlen;
++ 			}
++ 
++ 			if (zlen > 0)
++ 				ceph_zero_page_vector_range(zoff, zlen,
++ 							    osd_data->pages);
++ 		}
++ 	}
++ 
++ 	ceph_put_page_vector(osd_data->pages, num_pages, false);
++ 	ceph_osdc_put_request(req);
++ 
++ 	if (rc < 0)
++ 		cmpxchg(&aio_req->error, 0, rc);
++ 
++ 	ceph_aio_complete(inode, aio_req);
++ 	return;
++ }
++ 
++ static void ceph_aio_retry_work(struct work_struct *work)
++ {
++ 	struct ceph_aio_work *aio_work =
++ 		container_of(work, struct ceph_aio_work, work);
++ 	struct ceph_osd_request *orig_req = aio_work->req;
++ 	struct ceph_aio_request *aio_req = orig_req->r_priv;
++ 	struct inode *inode = orig_req->r_inode;
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_snap_context *snapc;
++ 	struct ceph_osd_request *req;
++ 	int ret;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	if (__ceph_have_pending_cap_snap(ci)) {
++ 		struct ceph_cap_snap *capsnap =
++ 			list_last_entry(&ci->i_cap_snaps,
++ 					struct ceph_cap_snap,
++ 					ci_item);
++ 		snapc = ceph_get_snap_context(capsnap->context);
++ 	} else {
++ 		BUG_ON(!ci->i_head_snapc);
++ 		snapc = ceph_get_snap_context(ci->i_head_snapc);
++ 	}
++ 	spin_unlock(&ci->i_ceph_lock);
++ 
++ 	req = ceph_osdc_alloc_request(orig_req->r_osdc, snapc, 2,
++ 			false, GFP_NOFS);
++ 	if (!req) {
++ 		ret = -ENOMEM;
++ 		req = orig_req;
++ 		goto out;
++ 	}
++ 
++ 	req->r_flags =	CEPH_OSD_FLAG_ORDERSNAP |
++ 			CEPH_OSD_FLAG_ONDISK |
++ 			CEPH_OSD_FLAG_WRITE;
++ 	ceph_oloc_copy(&req->r_base_oloc, &orig_req->r_base_oloc);
++ 	ceph_oid_copy(&req->r_base_oid, &orig_req->r_base_oid);
++ 
++ 	ret = ceph_osdc_alloc_messages(req, GFP_NOFS);
++ 	if (ret) {
++ 		ceph_osdc_put_request(req);
++ 		req = orig_req;
++ 		goto out;
++ 	}
++ 
++ 	req->r_ops[0] = orig_req->r_ops[0];
++ 	osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
++ 
++ 	req->r_mtime = aio_req->mtime;
++ 	req->r_data_offset = req->r_ops[0].extent.offset;
++ 
++ 	ceph_osdc_put_request(orig_req);
++ 
++ 	req->r_callback = ceph_aio_complete_req;
++ 	req->r_inode = inode;
++ 	req->r_priv = aio_req;
++ 
++ 	ret = ceph_osdc_start_request(req->r_osdc, req, false);
++ out:
++ 	if (ret < 0) {
++ 		req->r_result = ret;
++ 		ceph_aio_complete_req(req);
++ 	}
++ 
++ 	ceph_put_snap_context(snapc);
++ 	kfree(aio_work);
++ }
++ 
+++>>>>>>> 85e084feb473 (libceph: drop msg argument from ceph_osdc_callback_t)
+  /*
+   * Write commit request unsafe callback, called to tell us when a
+   * request is unsafe (that is, in flight--has been handed to the
+@@@ -524,6 -779,200 +719,203 @@@ static void ceph_sync_write_unsafe(stru
+  }
+  
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t
++ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
++ 		       struct ceph_snap_context *snapc,
++ 		       struct ceph_cap_flush **pcf)
++ {
++ 	struct file *file = iocb->ki_filp;
++ 	struct inode *inode = file_inode(file);
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
++ 	struct ceph_vino vino;
++ 	struct ceph_osd_request *req;
++ 	struct page **pages;
++ 	struct ceph_aio_request *aio_req = NULL;
++ 	int num_pages = 0;
++ 	int flags;
++ 	int ret;
++ 	struct timespec mtime = current_fs_time(inode->i_sb);
++ 	size_t count = iov_iter_count(iter);
++ 	loff_t pos = iocb->ki_pos;
++ 	bool write = iov_iter_rw(iter) == WRITE;
++ 
++ 	if (write && ceph_snap(file_inode(file)) != CEPH_NOSNAP)
++ 		return -EROFS;
++ 
++ 	dout("sync_direct_read_write (%s) on file %p %lld~%u\n",
++ 	     (write ? "write" : "read"), file, pos, (unsigned)count);
++ 
++ 	ret = filemap_write_and_wait_range(inode->i_mapping, pos, pos + count);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (write) {
++ 		ret = invalidate_inode_pages2_range(inode->i_mapping,
++ 					pos >> PAGE_SHIFT,
++ 					(pos + count) >> PAGE_SHIFT);
++ 		if (ret < 0)
++ 			dout("invalidate_inode_pages2_range returned %d\n", ret);
++ 
++ 		flags = CEPH_OSD_FLAG_ORDERSNAP |
++ 			CEPH_OSD_FLAG_ONDISK |
++ 			CEPH_OSD_FLAG_WRITE;
++ 	} else {
++ 		flags = CEPH_OSD_FLAG_READ;
++ 	}
++ 
++ 	while (iov_iter_count(iter) > 0) {
++ 		u64 size = dio_get_pagev_size(iter);
++ 		size_t start = 0;
++ 		ssize_t len;
++ 
++ 		vino = ceph_vino(inode);
++ 		req = ceph_osdc_new_request(&fsc->client->osdc, &ci->i_layout,
++ 					    vino, pos, &size, 0,
++ 					    /*include a 'startsync' command*/
++ 					    write ? 2 : 1,
++ 					    write ? CEPH_OSD_OP_WRITE :
++ 						    CEPH_OSD_OP_READ,
++ 					    flags, snapc,
++ 					    ci->i_truncate_seq,
++ 					    ci->i_truncate_size,
++ 					    false);
++ 		if (IS_ERR(req)) {
++ 			ret = PTR_ERR(req);
++ 			break;
++ 		}
++ 
++ 		len = size;
++ 		pages = dio_get_pages_alloc(iter, len, &start, &num_pages);
++ 		if (IS_ERR(pages)) {
++ 			ceph_osdc_put_request(req);
++ 			ret = PTR_ERR(pages);
++ 			break;
++ 		}
++ 
++ 		/*
++ 		 * To simplify error handling, allow AIO when IO within i_size
++ 		 * or IO can be satisfied by single OSD request.
++ 		 */
++ 		if (pos == iocb->ki_pos && !is_sync_kiocb(iocb) &&
++ 		    (len == count || pos + count <= i_size_read(inode))) {
++ 			aio_req = kzalloc(sizeof(*aio_req), GFP_KERNEL);
++ 			if (aio_req) {
++ 				aio_req->iocb = iocb;
++ 				aio_req->write = write;
++ 				INIT_LIST_HEAD(&aio_req->osd_reqs);
++ 				if (write) {
++ 					aio_req->mtime = mtime;
++ 					swap(aio_req->prealloc_cf, *pcf);
++ 				}
++ 			}
++ 			/* ignore error */
++ 		}
++ 
++ 		if (write) {
++ 			/*
++ 			 * throw out any page cache pages in this range. this
++ 			 * may block.
++ 			 */
++ 			truncate_inode_pages_range(inode->i_mapping, pos,
++ 					(pos+len) | (PAGE_SIZE - 1));
++ 
++ 			osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
++ 			req->r_mtime = mtime;
++ 		}
++ 
++ 		osd_req_op_extent_osd_data_pages(req, 0, pages, len, start,
++ 						 false, false);
++ 
++ 		if (aio_req) {
++ 			aio_req->total_len += len;
++ 			aio_req->num_reqs++;
++ 			atomic_inc(&aio_req->pending_reqs);
++ 
++ 			req->r_callback = ceph_aio_complete_req;
++ 			req->r_inode = inode;
++ 			req->r_priv = aio_req;
++ 			list_add_tail(&req->r_unsafe_item, &aio_req->osd_reqs);
++ 
++ 			pos += len;
++ 			iov_iter_advance(iter, len);
++ 			continue;
++ 		}
++ 
++ 		ret = ceph_osdc_start_request(req->r_osdc, req, false);
++ 		if (!ret)
++ 			ret = ceph_osdc_wait_request(&fsc->client->osdc, req);
++ 
++ 		size = i_size_read(inode);
++ 		if (!write) {
++ 			if (ret == -ENOENT)
++ 				ret = 0;
++ 			if (ret >= 0 && ret < len && pos + ret < size) {
++ 				int zlen = min_t(size_t, len - ret,
++ 						 size - pos - ret);
++ 				ceph_zero_page_vector_range(start + ret, zlen,
++ 							    pages);
++ 				ret += zlen;
++ 			}
++ 			if (ret >= 0)
++ 				len = ret;
++ 		}
++ 
++ 		ceph_put_page_vector(pages, num_pages, false);
++ 
++ 		ceph_osdc_put_request(req);
++ 		if (ret < 0)
++ 			break;
++ 
++ 		pos += len;
++ 		iov_iter_advance(iter, len);
++ 
++ 		if (!write && pos >= size)
++ 			break;
++ 
++ 		if (write && pos > size) {
++ 			if (ceph_inode_set_size(inode, pos))
++ 				ceph_check_caps(ceph_inode(inode),
++ 						CHECK_CAPS_AUTHONLY,
++ 						NULL);
++ 		}
++ 	}
++ 
++ 	if (aio_req) {
++ 		if (aio_req->num_reqs == 0) {
++ 			kfree(aio_req);
++ 			return ret;
++ 		}
++ 
++ 		ceph_get_cap_refs(ci, write ? CEPH_CAP_FILE_WR :
++ 					      CEPH_CAP_FILE_RD);
++ 
++ 		while (!list_empty(&aio_req->osd_reqs)) {
++ 			req = list_first_entry(&aio_req->osd_reqs,
++ 					       struct ceph_osd_request,
++ 					       r_unsafe_item);
++ 			list_del_init(&req->r_unsafe_item);
++ 			if (ret >= 0)
++ 				ret = ceph_osdc_start_request(req->r_osdc,
++ 							      req, false);
++ 			if (ret < 0) {
++ 				req->r_result = ret;
++ 				ceph_aio_complete_req(req);
++ 			}
++ 		}
++ 		return -EIOCBQUEUED;
++ 	}
++ 
++ 	if (ret != -EOLDSNAPC && pos > iocb->ki_pos) {
++ 		ret = pos - iocb->ki_pos;
++ 		iocb->ki_pos = pos;
++ 	}
++ 	return ret;
++ }
++ 
+++>>>>>>> 85e084feb473 (libceph: drop msg argument from ceph_osdc_callback_t)
+  /*
+   * Synchronous write, straight from __user pointer or user pages.
+   *
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index c099cc2cae71..579b55142689 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -1872,13 +1872,12 @@ static void rbd_osd_call_callback(struct rbd_obj_request *obj_request)
+ 		obj_request_done_set(obj_request);
+ }
+ 
+-static void rbd_osd_req_callback(struct ceph_osd_request *osd_req,
+-				struct ceph_msg *msg)
++static void rbd_osd_req_callback(struct ceph_osd_request *osd_req)
+ {
+ 	struct rbd_obj_request *obj_request = osd_req->r_priv;
+ 	u16 opcode;
+ 
+-	dout("%s: osd_req %p msg %p\n", __func__, osd_req, msg);
++	dout("%s: osd_req %p\n", __func__, osd_req);
+ 	rbd_assert(osd_req == obj_request->osd_req);
+ 	if (obj_request_img_data_test(obj_request)) {
+ 		rbd_assert(obj_request->img_request);
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index 5265e35034fa..9cf2e5ca8d6c 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -237,12 +237,12 @@ static int ceph_readpage(struct file *filp, struct page *page)
+ /*
+  * Finish an async read(ahead) op.
+  */
+-static void finish_read(struct ceph_osd_request *req, struct ceph_msg *msg)
++static void finish_read(struct ceph_osd_request *req)
+ {
+ 	struct inode *inode = req->r_inode;
+ 	struct ceph_osd_data *osd_data;
+-	int rc = req->r_result;
+-	int bytes = le32_to_cpu(msg->hdr.data_len);
++	int rc = req->r_result <= 0 ? req->r_result : 0;
++	int bytes = req->r_result >= 0 ? req->r_result : 0;
+ 	int num_pages;
+ 	int i;
+ 
+@@ -569,8 +569,7 @@ static void ceph_release_pages(struct page **pages, int num)
+  * If we get an error, set the mapping error bit, but not the individual
+  * page error bits.
+  */
+-static void writepages_finish(struct ceph_osd_request *req,
+-			      struct ceph_msg *msg)
++static void writepages_finish(struct ceph_osd_request *req)
+ {
+ 	struct inode *inode = req->r_inode;
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
+* Unmerged path fs/ceph/file.c
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index cc16ab3e4c14..8b4edbc69e23 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -20,8 +20,7 @@ struct ceph_osd_client;
+ /*
+  * completion callback for async writepages
+  */
+-typedef void (*ceph_osdc_callback_t)(struct ceph_osd_request *,
+-				     struct ceph_msg *);
++typedef void (*ceph_osdc_callback_t)(struct ceph_osd_request *);
+ typedef void (*ceph_osdc_unsafe_callback_t)(struct ceph_osd_request *, bool);
+ 
+ /* a given osd we're communicating with */
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 4e649b707367..901a47efa4f6 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1867,7 +1867,7 @@ static void handle_reply(struct ceph_osd_client *osdc, struct ceph_msg *msg)
+ 		    result >= 0 && !(flags & CEPH_OSD_FLAG_ONDISK))
+ 			req->r_unsafe_callback(req, true);
+ 		if (req->r_callback)
+-			req->r_callback(req, msg);
++			req->r_callback(req);
+ 		else
+ 			complete_all(&req->r_completion);
+ 	}
+@@ -1891,7 +1891,7 @@ bad_put:
+ 	req->r_result = -EIO;
+ 	__unregister_request(osdc, req);
+ 	if (req->r_callback)
+-		req->r_callback(req, msg);
++		req->r_callback(req);
+ 	else
+ 		complete_all(&req->r_completion);
+ 	complete_request(req);
