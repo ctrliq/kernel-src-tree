@@ -1,0 +1,87 @@
+s390/spinlock: optimize spin_unlock code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] spinlock: optimize spin_unlock code (Hendrik Brueckner) [1204860]
+Rebuild_FUZZ: 93.33%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit 442302820356977237e32a76a211e7942255003a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/44230282.failed
+
+Use a memory barrier + store sequence instead of a load + compare and swap
+sequence to unlock a spinlock and an rw lock.
+For the spinlock case this saves us two memory reads and a not needed cpu
+serialization after the compare and swap instruction stored the new value.
+
+The kernel size (performance_defconfig) gets reduced by ~14k.
+
+Average execution time of a tight inlined spin_unlock loop drops from
+5.8ns to 0.7ns on a zEC12 machine.
+
+An artificial stress test case where several counters are protected with
+a single spinlock and which are only incremented while holding the spinlock
+shows ~30% improvement on a 4 cpu machine.
+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 442302820356977237e32a76a211e7942255003a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/spinlock.h
+diff --cc arch/s390/include/asm/spinlock.h
+index b60212a02d08,d26ad2ac7cb2..000000000000
+--- a/arch/s390/include/asm/spinlock.h
++++ b/arch/s390/include/asm/spinlock.h
+@@@ -52,21 -59,14 +52,24 @@@ static inline int arch_spin_is_locked(a
+  
+  static inline int arch_spin_trylock_once(arch_spinlock_t *lp)
+  {
+ -	barrier();
+ -	return likely(arch_spin_value_unlocked(*lp) &&
+ -		      _raw_compare_and_swap(&lp->lock, 0, SPINLOCK_LOCKVAL));
+ +	unsigned int new = ~smp_processor_id();
+ +
+ +	return _raw_compare_and_swap(&lp->lock, 0, new);
+ +}
+ +
+++<<<<<<< HEAD
+ +static inline int arch_spin_tryrelease_once(arch_spinlock_t *lp)
+ +{
+ +	unsigned int old = ~smp_processor_id();
+ +
+ +	return _raw_compare_and_swap(&lp->lock, old, 0);
+  }
+  
+++=======
+++>>>>>>> 442302820356 (s390/spinlock: optimize spin_unlock code)
+  static inline void arch_spin_lock(arch_spinlock_t *lp)
+  {
+ -	if (!arch_spin_trylock_once(lp))
+ +	if (unlikely(!arch_spin_trylock_once(lp)))
+  		arch_spin_lock_wait(lp);
+  }
+  
+diff --git a/arch/s390/include/asm/barrier.h b/arch/s390/include/asm/barrier.h
+index 19ff956b752b..b5dce6544d76 100644
+--- a/arch/s390/include/asm/barrier.h
++++ b/arch/s390/include/asm/barrier.h
+@@ -15,11 +15,13 @@
+ 
+ #ifdef CONFIG_HAVE_MARCH_Z196_FEATURES
+ /* Fast-BCR without checkpoint synchronization */
+-#define mb() do {  asm volatile("bcr 14,0" : : : "memory"); } while (0)
++#define __ASM_BARRIER "bcr 14,0\n"
+ #else
+-#define mb() do {  asm volatile("bcr 15,0" : : : "memory"); } while (0)
++#define __ASM_BARRIER "bcr 15,0\n"
+ #endif
+ 
++#define mb() do {  asm volatile(__ASM_BARRIER : : : "memory"); } while (0)
++
+ #define rmb()				mb()
+ #define wmb()				mb()
+ #define read_barrier_depends()		do { } while(0)
+* Unmerged path arch/s390/include/asm/spinlock.h
