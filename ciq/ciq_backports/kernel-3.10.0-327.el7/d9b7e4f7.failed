@@ -1,0 +1,177 @@
+ipmi: Periodically check to see if irqs and messages are set right
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Corey Minyard <cminyard@mvista.com>
+commit d9b7e4f717a167610a49ceb9e5969e80146c89a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d9b7e4f7.failed
+
+The BMC can be reset while we are running; that means the interrupt
+and event message buffer settings may be wrong.  So periodically
+check to see if these values are correct, and fix them if they
+are wrong.
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+	Tested-by: Tony Rex <tony.rex@ericsson.com>
+	Tested-by: Magnus Johansson E <magnus.e.johansson@ericsson.com>
+(cherry picked from commit d9b7e4f717a167610a49ceb9e5969e80146c89a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_si_intf.c
+diff --cc drivers/char/ipmi/ipmi_si_intf.c
+index f73439915954,2952d2dcc855..000000000000
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@@ -257,8 -255,13 +254,13 @@@ struct smi_info 
+  	 * memory.  Once that situation clears up, it will re-enable
+  	 * interrupts.
+  	 */
+ -	bool interrupt_disabled;
+ +	int interrupt_disabled;
+  
++ 	/*
++ 	 * Does the BMC support events?
++ 	 */
++ 	bool supports_event_msg_buff;
++ 
+  	/* From the get device id response... */
+  	struct ipmi_device_id device_id;
+  
+@@@ -441,22 -451,45 +428,34 @@@ static void smi_mod_timer(struct smi_in
+   * polled until we can allocate some memory.  Once we have some
+   * memory, we will re-enable the interrupt.
+   */
+ -static inline bool disable_si_irq(struct smi_info *smi_info)
+ +static inline void disable_si_irq(struct smi_info *smi_info)
+  {
+  	if ((smi_info->irq) && (!smi_info->interrupt_disabled)) {
+++<<<<<<< HEAD
+ +		start_disable_irq(smi_info);
+ +		smi_info->interrupt_disabled = 1;
+ +		if (!atomic_read(&smi_info->stop_operation))
+ +			smi_mod_timer(smi_info, jiffies + SI_TIMEOUT_JIFFIES);
+++=======
++ 		smi_info->interrupt_disabled = true;
++ 		start_check_enables(smi_info);
++ 		return true;
+++>>>>>>> d9b7e4f717a1 (ipmi: Periodically check to see if irqs and messages are set right)
+  	}
+ -	return false;
+  }
+  
+ -static inline bool enable_si_irq(struct smi_info *smi_info)
+ +static inline void enable_si_irq(struct smi_info *smi_info)
+  {
+  	if ((smi_info->irq) && (smi_info->interrupt_disabled)) {
+++<<<<<<< HEAD
+ +		start_enable_irq(smi_info);
+ +		smi_info->interrupt_disabled = 0;
+++=======
++ 		smi_info->interrupt_disabled = false;
++ 		start_check_enables(smi_info);
++ 		return true;
+++>>>>>>> d9b7e4f717a1 (ipmi: Periodically check to see if irqs and messages are set right)
+  	}
+ -	return false;
+ -}
+ -
+ -/*
+ - * Allocate a message.  If unable to allocate, start the interrupt
+ - * disable process and return NULL.  If able to allocate but
+ - * interrupts are disabled, free the message and return NULL after
+ - * starting the interrupt enable process.
+ - */
+ -static struct ipmi_smi_msg *alloc_msg_handle_irq(struct smi_info *smi_info)
+ -{
+ -	struct ipmi_smi_msg *msg;
+ -
+ -	msg = ipmi_alloc_smi_msg();
+ -	if (!msg) {
+ -		if (!disable_si_irq(smi_info))
+ -			smi_info->si_state = SI_NORMAL;
+ -	} else if (enable_si_irq(smi_info)) {
+ -		ipmi_free_smi_msg(msg);
+ -		msg = NULL;
+ -	}
+ -	return msg;
+  }
+  
+  static void handle_flags(struct smi_info *smi_info)
+@@@ -675,55 -712,26 +701,60 @@@ static void handle_transaction_done(str
+  			dev_warn(smi_info->dev,
+  				 "Maybe ok, but ipmi might run very slowly.\n");
+  			smi_info->si_state = SI_NORMAL;
+- 		} else {
++ 			break;
++ 		}
++ 		enables = current_global_enables(smi_info, 0);
++ 		if (enables != (msg[3] & GLOBAL_ENABLES_MASK)) {
++ 			/* Enables are not correct, fix them. */
+  			msg[0] = (IPMI_NETFN_APP_REQUEST << 2);
+  			msg[1] = IPMI_SET_BMC_GLOBAL_ENABLES_CMD;
+- 			msg[2] = (msg[3] |
+- 				  IPMI_BMC_RCV_MSG_INTR |
+- 				  IPMI_BMC_EVT_MSG_INTR);
++ 			msg[2] = enables | (msg[3] & ~GLOBAL_ENABLES_MASK);
+  			smi_info->handlers->start_transaction(
+  				smi_info->si_sm, msg, 3);
+++<<<<<<< HEAD
+ +			smi_info->si_state = SI_ENABLE_INTERRUPTS2;
+ +		}
+ +		break;
+ +	}
+ +
+ +	case SI_ENABLE_INTERRUPTS2:
+ +	{
+ +		unsigned char msg[4];
+ +
+ +		/* We got the flags from the SMI, now handle them. */
+ +		smi_info->handlers->get_result(smi_info->si_sm, msg, 4);
+ +		if (msg[2] != 0) {
+ +			dev_warn(smi_info->dev,
+ +				 "Couldn't set irq info: %x.\n", msg[2]);
+ +			dev_warn(smi_info->dev,
+ +				 "Maybe ok, but ipmi might run very slowly.\n");
+ +		} else
+ +			smi_info->interrupt_disabled = 0;
+ +		smi_info->si_state = SI_NORMAL;
+ +		break;
+ +	}
+ +
+ +	case SI_DISABLE_INTERRUPTS1:
+ +	{
+ +		unsigned char msg[4];
+ +
+ +		/* We got the flags from the SMI, now handle them. */
+ +		smi_info->handlers->get_result(smi_info->si_sm, msg, 4);
+ +		if (msg[2] != 0) {
+ +			dev_warn(smi_info->dev, "Could not disable interrupts"
+ +				 ", failed get.\n");
+- 			smi_info->si_state = SI_NORMAL;
+++=======
++ 			smi_info->si_state = SI_SETTING_ENABLES;
++ 		} else if (smi_info->supports_event_msg_buff) {
++ 			smi_info->curr_msg = ipmi_alloc_smi_msg();
++ 			if (!smi_info->curr_msg) {
++ 				smi_info->si_state = SI_NORMAL;
++ 				break;
++ 			}
++ 			start_getting_msg_queue(smi_info);
+  		} else {
+- 			msg[0] = (IPMI_NETFN_APP_REQUEST << 2);
+- 			msg[1] = IPMI_SET_BMC_GLOBAL_ENABLES_CMD;
+- 			msg[2] = (msg[3] &
+- 				  ~(IPMI_BMC_RCV_MSG_INTR |
+- 				    IPMI_BMC_EVT_MSG_INTR));
+- 			smi_info->handlers->start_transaction(
+- 				smi_info->si_sm, msg, 3);
+- 			smi_info->si_state = SI_DISABLE_INTERRUPTS2;
+++>>>>>>> d9b7e4f717a1 (ipmi: Periodically check to see if irqs and messages are set right)
++ 			smi_info->si_state = SI_NORMAL;
+  		}
+  		break;
+  	}
+* Unmerged path drivers/char/ipmi/ipmi_si_intf.c
