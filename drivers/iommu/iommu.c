@@ -732,7 +732,7 @@ static int add_iommu_group(struct device *dev, void *data)
 	struct iommu_ops *ops = data;
 
 	if (!ops->add_device)
-		return -ENODEV;
+		return 0;
 
 	WARN_ON(dev->iommu_group);
 
