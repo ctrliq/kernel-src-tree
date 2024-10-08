@@ -1,0 +1,110 @@
+x86, irq, PCI: Keep IRQ assignment for PCI devices during suspend/hibernation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] irq, pci: Keep IRQ assignment for PCI devices during suspend/hibernation (Steve Best) [1231358 1238216]
+Rebuild_FUZZ: 96.64%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 3eec595235c17a74094daa1e02d1b0af2e9a7125
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3eec5952.failed
+
+Now IOAPIC driver dynamically allocates IRQ numbers for IOAPIC pins.
+We need to keep IRQ assignment for PCI devices during suspend/hibernation,
+otherwise it may cause failure of suspend/hibernation due to:
+1) Device driver calls pci_enable_device() to allocate an IRQ number
+   and register interrupt handler on the returned IRQ.
+2) Device driver's suspend callback calls pci_disable_device() and
+   release assigned IRQ in turn.
+3) Device driver's resume callback calls pci_enable_device() to
+   allocate IRQ number again. A different IRQ number may be assigned
+   by IOAPIC driver this time.
+4) Now the hardware delivers interrupt to the new IRQ but interrupt
+   handler is still registered against the old IRQ, so it breaks
+   suspend/hibernation.
+
+To fix this issue, we keep IRQ assignment during suspend/hibernation.
+Flag pci_dev.dev.power.is_prepared is used to detect that
+pci_disable_device() is called during suspend/hibernation.
+
+Reported-and-Tested-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Grant Likely <grant.likely@linaro.org>
+	Cc: Len Brown <lenb@kernel.org>
+Link: http://lkml.kernel.org/r/1407478071-29399-1-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 3eec595235c17a74094daa1e02d1b0af2e9a7125)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/pci/irq.c
+#	arch/x86/pci/mrst.c
+diff --cc arch/x86/pci/irq.c
+index 84112f55dd7a,bc1a2c341891..000000000000
+--- a/arch/x86/pci/irq.c
++++ b/arch/x86/pci/irq.c
+@@@ -1254,3 -1253,12 +1254,15 @@@ static int pirq_enable_irq(struct pci_d
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void pirq_disable_irq(struct pci_dev *dev)
++ {
++ 	if (io_apic_assign_pci_irqs && !dev->dev.power.is_prepared &&
++ 	    dev->irq) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq = 0;
++ 	}
++ }
+++>>>>>>> 3eec595235c1 (x86, irq, PCI: Keep IRQ assignment for PCI devices during suspend/hibernation)
+diff --cc arch/x86/pci/mrst.c
+index 903fded50786,3865116c51fb..000000000000
+--- a/arch/x86/pci/mrst.c
++++ b/arch/x86/pci/mrst.c
+@@@ -225,7 -227,13 +225,17 @@@ static int mrst_pci_irq_enable(struct p
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:arch/x86/pci/mrst.c
+ +struct pci_ops pci_mrst_ops = {
+++=======
++ static void intel_mid_pci_irq_disable(struct pci_dev *dev)
++ {
++ 	if (!dev->dev.power.is_prepared && dev->irq > 0)
++ 		mp_unmap_irq(dev->irq);
++ }
++ 
++ struct pci_ops intel_mid_pci_ops = {
+++>>>>>>> 3eec595235c1 (x86, irq, PCI: Keep IRQ assignment for PCI devices during suspend/hibernation):arch/x86/pci/intel_mid_pci.c
+  	.read = pci_read,
+  	.write = pci_write,
+  };
+* Unmerged path arch/x86/pci/irq.c
+* Unmerged path arch/x86/pci/mrst.c
+diff --git a/drivers/acpi/pci_irq.c b/drivers/acpi/pci_irq.c
+index d8cd9b655f87..cfa42d71b37e 100644
+--- a/drivers/acpi/pci_irq.c
++++ b/drivers/acpi/pci_irq.c
+@@ -468,6 +468,10 @@ void acpi_pci_irq_disable(struct pci_dev *dev)
+ 	if (!pin)
+ 		return;
+ 
++	/* Keep IOAPIC pin configuration when suspending */
++	if (dev->dev.power.is_prepared)
++		return;
++
+ 	entry = acpi_pci_irq_lookup(dev, pin);
+ 	if (!entry)
+ 		return;
