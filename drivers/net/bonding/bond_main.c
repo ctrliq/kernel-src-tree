@@ -398,7 +398,7 @@ struct vlan_entry *bond_next_vlan(struct bonding *bond, struct vlan_entry *curr)
  * @skb: hw accel VLAN tagged skb to transmit
  * @slave_dev: slave that is supposed to xmit this skbuff
  */
-int bond_dev_queue_xmit(struct bonding *bond, struct sk_buff *skb,
+void bond_dev_queue_xmit(struct bonding *bond, struct sk_buff *skb,
 			struct net_device *slave_dev)
 {
 	skb->dev = slave_dev;
@@ -411,8 +411,6 @@ int bond_dev_queue_xmit(struct bonding *bond, struct sk_buff *skb,
 		bond_netpoll_send_skb(bond_get_slave_by_dev(bond, slave_dev), skb);
 	else
 		dev_queue_xmit(skb);
-
-	return 0;
 }
 
 /*
