@@ -52,6 +52,9 @@
 					 (d) == I40E_QSFP_B_DEVICE_ID  || \
 					 (d) == I40E_QSFP_C_DEVICE_ID)
 
+/* I40E_MASK is a macro used on 32 bit registers */
+#define I40E_MASK(mask, shift) (mask << shift)
+
 #define I40E_MAX_VSI_QP			16
 #define I40E_MAX_VF_VSI			3
 #define I40E_MAX_CHAINED_RX_BUFFERS	5
