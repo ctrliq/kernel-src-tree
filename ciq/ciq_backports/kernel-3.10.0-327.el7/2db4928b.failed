@@ -1,0 +1,147 @@
+powerpc/iommu: Remove dma_data union
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] iommu: Remove dma_data union (Gustavo Duarte) [1246880]
+Rebuild_FUZZ: 87.50%
+commit-author Benjamin Herrenschmidt <benh@kernel.crashing.org>
+commit 2db4928bb559f8b43ca75879548111dc13a7de31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2db4928b.failed
+
+To support "hybrid" DMA ops in a subsequent patch, we will need both
+a direct DMA offset and an iommu pointer. Those are currently exclusive
+(a union), so change them to be separate fields.
+
+While there, also type iommu_table_base properly and make exist only
+on CONFIG_PPC64 since it's not referenced on 32-bit at all.
+
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 2db4928bb559f8b43ca75879548111dc13a7de31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/device.h
+#	arch/powerpc/include/asm/iommu.h
+diff --cc arch/powerpc/include/asm/device.h
+index 77e97dd0c15d,406c2b1ff82d..000000000000
+--- a/arch/powerpc/include/asm/device.h
++++ b/arch/powerpc/include/asm/device.h
+@@@ -8,6 -8,10 +8,13 @@@
+  
+  struct dma_map_ops;
+  struct device_node;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PPC64
++ struct pci_dn;
++ struct iommu_table;
++ #endif
+++>>>>>>> 2db4928bb559 (powerpc/iommu: Remove dma_data union)
+  
+  /*
+   * Arch extensions to struct device.
+@@@ -20,14 -24,19 +27,16 @@@ struct dev_archdata 
+  	struct dma_map_ops	*dma_ops;
+  
+  	/*
+- 	 * When an iommu is in use, dma_data is used as a ptr to the base of the
+- 	 * iommu_table.  Otherwise, it is a simple numerical offset.
++ 	 * These two used to be a union. However, with the hybrid ops we need
++ 	 * both so here we store both a DMA offset for direct mappings and
++ 	 * an iommu_table for remapped DMA.
+  	 */
+- 	union {
+- 		dma_addr_t	dma_offset;
+- 		void		*iommu_table_base;
+- 	} dma_data;
++ 	dma_addr_t		dma_offset;
++ 
++ #ifdef CONFIG_PPC64
++ 	struct iommu_table	*iommu_table_base;
++ #endif
+  
+ -#ifdef CONFIG_IOMMU_API
+ -	void			*iommu_domain;
+ -#endif
+  #ifdef CONFIG_SWIOTLB
+  	dma_addr_t		max_direct_dma_addr;
+  #endif
+diff --cc arch/powerpc/include/asm/iommu.h
+index 2d866433cb3d,7b87bab09564..000000000000
+--- a/arch/powerpc/include/asm/iommu.h
++++ b/arch/powerpc/include/asm/iommu.h
+@@@ -136,20 -230,30 +141,47 @@@ static inline int __init tce_iommu_bus_
+  }
+  #endif /* !CONFIG_IOMMU_API */
+  
+++<<<<<<< HEAD
+ +static inline void set_iommu_table_base_and_group(struct device *dev,
+ +						  void *base)
+ +{
+ +	set_iommu_table_base(dev, base);
+ +	iommu_add_device(dev);
+ +}
+ +
+ +extern int iommu_map_sg(struct device *dev, struct iommu_table *tbl,
+ +			struct scatterlist *sglist, int nelems,
+ +			unsigned long mask, enum dma_data_direction direction,
+ +			struct dma_attrs *attrs);
+ +extern void iommu_unmap_sg(struct iommu_table *tbl, struct scatterlist *sglist,
+ +			   int nelems, enum dma_data_direction direction,
+ +			   struct dma_attrs *attrs);
+++=======
++ #else
++ 
++ static inline void *get_iommu_table_base(struct device *dev)
++ {
++ 	return NULL;
++ }
++ 
++ static inline int dma_iommu_dma_supported(struct device *dev, u64 mask)
++ {
++ 	return 0;
++ }
++ 
++ #endif /* CONFIG_PPC64 */
++ 
++ extern int ppc_iommu_map_sg(struct device *dev, struct iommu_table *tbl,
++ 			    struct scatterlist *sglist, int nelems,
++ 			    unsigned long mask,
++ 			    enum dma_data_direction direction,
++ 			    struct dma_attrs *attrs);
++ extern void ppc_iommu_unmap_sg(struct iommu_table *tbl,
++ 			       struct scatterlist *sglist,
++ 			       int nelems,
++ 			       enum dma_data_direction direction,
++ 			       struct dma_attrs *attrs);
+++>>>>>>> 2db4928bb559 (powerpc/iommu: Remove dma_data union)
+  
+  extern void *iommu_alloc_coherent(struct device *dev, struct iommu_table *tbl,
+  				  size_t size, dma_addr_t *dma_handle,
+* Unmerged path arch/powerpc/include/asm/device.h
+diff --git a/arch/powerpc/include/asm/dma-mapping.h b/arch/powerpc/include/asm/dma-mapping.h
+index 150866b2a3fe..8bfcf8cf9fdb 100644
+--- a/arch/powerpc/include/asm/dma-mapping.h
++++ b/arch/powerpc/include/asm/dma-mapping.h
+@@ -106,7 +106,7 @@ static inline void set_dma_ops(struct device *dev, struct dma_map_ops *ops)
+ static inline dma_addr_t get_dma_offset(struct device *dev)
+ {
+ 	if (dev)
+-		return dev->archdata.dma_data.dma_offset;
++		return dev->archdata.dma_offset;
+ 
+ 	return PCI_DRAM_OFFSET;
+ }
+@@ -114,7 +114,7 @@ static inline dma_addr_t get_dma_offset(struct device *dev)
+ static inline void set_dma_offset(struct device *dev, dma_addr_t off)
+ {
+ 	if (dev)
+-		dev->archdata.dma_data.dma_offset = off;
++		dev->archdata.dma_offset = off;
+ }
+ 
+ /* this will be removed soon */
+* Unmerged path arch/powerpc/include/asm/iommu.h
