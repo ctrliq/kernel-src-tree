@@ -1,0 +1,152 @@
+nfsd: add new io class tracepoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jeff Layton <jlayton@poochiereds.net>
+commit 6e8b50d16a757d53f8817acecba97c5d4aa1cf65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6e8b50d1.failed
+
+Add some new tracepoints in the nfsd read/write codepaths. The idea
+is that this will give us the ability to measure how long each phase of
+a read or write operation takes.
+
+	Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 6e8b50d16a757d53f8817acecba97c5d4aa1cf65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/vfs.c
+diff --cc fs/nfsd/vfs.c
+index 9d5f27fbf3f5,3257c59dc860..000000000000
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@@ -1161,13 -984,22 +1162,32 @@@ __be32 nfsd_read(struct svc_rqst *rqstp
+  	struct raparms	*ra;
+  	__be32 err;
+  
+++<<<<<<< HEAD
+ +	err = nfsd_get_tmp_read_open(rqstp, fhp, &file, &ra);
+ +	if (err)
+ +		return err;
+ +
+ +	err = nfsd_vfs_read(rqstp, file, offset, vec, vlen, count);
+ +
+ +	nfsd_put_tmp_read_open(file, ra);
+++=======
++ 	trace_read_start(rqstp, fhp, offset, vlen);
++ 	err = nfsd_open(rqstp, fhp, S_IFREG, NFSD_MAY_READ, &file);
++ 	if (err)
++ 		return err;
++ 
++ 	ra = nfsd_init_raparms(file);
++ 
++ 	trace_read_opened(rqstp, fhp, offset, vlen);
++ 	err = nfsd_vfs_read(rqstp, file, offset, vec, vlen, count);
++ 	trace_read_io_done(rqstp, fhp, offset, vlen);
++ 
++ 	if (ra)
++ 		nfsd_put_raparams(file, ra);
++ 	fput(file);
+++>>>>>>> 6e8b50d16a75 (nfsd: add new io class tracepoint)
++ 
++ 	trace_read_done(rqstp, fhp, offset, vlen);
+  
+  	return err;
+  }
+diff --git a/fs/nfsd/nfsfh.h b/fs/nfsd/nfsfh.h
+index 032fd965fe88..71283cd2a0e8 100644
+--- a/fs/nfsd/nfsfh.h
++++ b/fs/nfsd/nfsfh.h
+@@ -7,6 +7,7 @@
+ #ifndef _LINUX_NFSD_NFSFH_H
+ #define _LINUX_NFSD_NFSFH_H
+ 
++#include <linux/crc32.h>
+ #include <linux/sunrpc/svc.h>
+ #include <uapi/linux/nfsd/nfsfh.h>
+ 
+@@ -205,6 +206,28 @@ static inline bool fh_fsid_match(struct knfsd_fh *fh1, struct knfsd_fh *fh2)
+ 	return true;
+ }
+ 
++#ifdef CONFIG_CRC32
++/**
++ * knfsd_fh_hash - calculate the crc32 hash for the filehandle
++ * @fh - pointer to filehandle
++ *
++ * returns a crc32 hash for the filehandle that is compatible with
++ * the one displayed by "wireshark".
++ */
++
++static inline u32
++knfsd_fh_hash(struct knfsd_fh *fh)
++{
++	return ~crc32_le(0xFFFFFFFF, (unsigned char *)&fh->fh_base, fh->fh_size);
++}
++#else
++static inline u32
++knfsd_fh_hash(struct knfsd_fh *fh)
++{
++	return 0;
++}
++#endif
++
+ #ifdef CONFIG_NFSD_V3
+ /*
+  * The wcc data stored in current_fh should be cleared
+diff --git a/fs/nfsd/trace.h b/fs/nfsd/trace.h
+index 0befe762762b..3287041905da 100644
+--- a/fs/nfsd/trace.h
++++ b/fs/nfsd/trace.h
+@@ -8,6 +8,47 @@
+ #define _NFSD_TRACE_H
+ 
+ #include <linux/tracepoint.h>
++#include "nfsfh.h"
++
++DECLARE_EVENT_CLASS(nfsd_io_class,
++	TP_PROTO(struct svc_rqst *rqstp,
++		 struct svc_fh	*fhp,
++		 loff_t		offset,
++		 int		len),
++	TP_ARGS(rqstp, fhp, offset, len),
++	TP_STRUCT__entry(
++		__field(__be32, xid)
++		__field_struct(struct knfsd_fh, fh)
++		__field(loff_t, offset)
++		__field(int, len)
++	),
++	TP_fast_assign(
++		__entry->xid = rqstp->rq_xid,
++		fh_copy_shallow(&__entry->fh, &fhp->fh_handle);
++		__entry->offset = offset;
++		__entry->len = len;
++	),
++	TP_printk("xid=0x%x fh=0x%x offset=%lld len=%d",
++		  __be32_to_cpu(__entry->xid), knfsd_fh_hash(&__entry->fh),
++		  __entry->offset, __entry->len)
++)
++
++#define DEFINE_NFSD_IO_EVENT(name)		\
++DEFINE_EVENT(nfsd_io_class, name,		\
++	TP_PROTO(struct svc_rqst *rqstp,	\
++		 struct svc_fh	*fhp,		\
++		 loff_t		offset,		\
++		 int		len),		\
++	TP_ARGS(rqstp, fhp, offset, len))
++
++DEFINE_NFSD_IO_EVENT(read_start);
++DEFINE_NFSD_IO_EVENT(read_opened);
++DEFINE_NFSD_IO_EVENT(read_io_done);
++DEFINE_NFSD_IO_EVENT(read_done);
++DEFINE_NFSD_IO_EVENT(write_start);
++DEFINE_NFSD_IO_EVENT(write_opened);
++DEFINE_NFSD_IO_EVENT(write_io_done);
++DEFINE_NFSD_IO_EVENT(write_done);
+ 
+ #include "state.h"
+ 
+* Unmerged path fs/nfsd/vfs.c
