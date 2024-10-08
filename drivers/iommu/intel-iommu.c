@@ -2800,9 +2800,6 @@ static int iommu_no_mapping(struct device *dev)
 	struct pci_dev *pdev;
 	int found;
 
-	if (unlikely(!dev_is_pci(dev)))
-		return 1;
-
 	if (iommu_dummy(dev))
 		return 1;
 
