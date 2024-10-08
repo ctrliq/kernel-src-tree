@@ -1,0 +1,583 @@
+KVM: s390: adapter interrupt sources
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/s390: adapter interrupt sources (David Gibson) [1123145 1123133 1123367]
+Rebuild_FUZZ: 95.77%
+commit-author Cornelia Huck <cornelia.huck@de.ibm.com>
+commit 841b91c584b6d1e2a2cb508bd2d0236cd37e1750
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/841b91c5.failed
+
+Add a new interface to register/deregister sources of adapter interrupts
+identified by an unique id via the flic. Adapters may also be maskable
+and carry a list of pinned pages.
+
+These adapters will be used by irq routing later.
+
+	Acked-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Signed-off-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+(cherry picked from commit 841b91c584b6d1e2a2cb508bd2d0236cd37e1750)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/devices/s390_flic.txt
+#	arch/s390/include/uapi/asm/kvm.h
+#	arch/s390/kvm/interrupt.c
+#	arch/s390/kvm/kvm-s390.h
+diff --cc arch/s390/include/uapi/asm/kvm.h
+index d25da598ec62,c003c6a73b1e..000000000000
+--- a/arch/s390/include/uapi/asm/kvm.h
++++ b/arch/s390/include/uapi/asm/kvm.h
+@@@ -16,6 -16,44 +16,47 @@@
+  
+  #define __KVM_S390
+  
+++<<<<<<< HEAD
+++=======
++ /* Device control API: s390-specific devices */
++ #define KVM_DEV_FLIC_GET_ALL_IRQS	1
++ #define KVM_DEV_FLIC_ENQUEUE		2
++ #define KVM_DEV_FLIC_CLEAR_IRQS		3
++ #define KVM_DEV_FLIC_APF_ENABLE		4
++ #define KVM_DEV_FLIC_APF_DISABLE_WAIT	5
++ #define KVM_DEV_FLIC_ADAPTER_REGISTER	6
++ #define KVM_DEV_FLIC_ADAPTER_MODIFY	7
++ /*
++  * We can have up to 4*64k pending subchannels + 8 adapter interrupts,
++  * as well as up  to ASYNC_PF_PER_VCPU*KVM_MAX_VCPUS pfault done interrupts.
++  * There are also sclp and machine checks. This gives us
++  * sizeof(kvm_s390_irq)*(4*65536+8+64*64+1+1) = 72 * 266250 = 19170000
++  * Lets round up to 8192 pages.
++  */
++ #define KVM_S390_MAX_FLOAT_IRQS	266250
++ #define KVM_S390_FLIC_MAX_BUFFER	0x2000000
++ 
++ struct kvm_s390_io_adapter {
++ 	__u32 id;
++ 	__u8 isc;
++ 	__u8 maskable;
++ 	__u8 swap;
++ 	__u8 pad;
++ };
++ 
++ #define KVM_S390_IO_ADAPTER_MASK 1
++ #define KVM_S390_IO_ADAPTER_MAP 2
++ #define KVM_S390_IO_ADAPTER_UNMAP 3
++ 
++ struct kvm_s390_io_adapter_req {
++ 	__u32 id;
++ 	__u8 type;
++ 	__u8 mask;
++ 	__u16 pad0;
++ 	__u64 addr;
++ };
++ 
+++>>>>>>> 841b91c584b6 (KVM: s390: adapter interrupt sources)
+  /* for KVM_GET_REGS and KVM_SET_REGS */
+  struct kvm_regs {
+  	/* general purpose regs for s390 */
+diff --cc arch/s390/kvm/interrupt.c
+index 7f1f7ac5cf7f,7ecef5a18e25..000000000000
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@@ -838,3 -884,403 +838,406 @@@ int kvm_s390_inject_vcpu(struct kvm_vcp
+  	mutex_unlock(&vcpu->kvm->lock);
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void clear_floating_interrupts(struct kvm *kvm)
++ {
++ 	struct kvm_s390_float_interrupt *fi;
++ 	struct kvm_s390_interrupt_info	*n, *inti = NULL;
++ 
++ 	mutex_lock(&kvm->lock);
++ 	fi = &kvm->arch.float_int;
++ 	spin_lock(&fi->lock);
++ 	list_for_each_entry_safe(inti, n, &fi->list, list) {
++ 		list_del(&inti->list);
++ 		kfree(inti);
++ 	}
++ 	fi->irq_count = 0;
++ 	atomic_set(&fi->active, 0);
++ 	spin_unlock(&fi->lock);
++ 	mutex_unlock(&kvm->lock);
++ }
++ 
++ static inline int copy_irq_to_user(struct kvm_s390_interrupt_info *inti,
++ 				   u8 *addr)
++ {
++ 	struct kvm_s390_irq __user *uptr = (struct kvm_s390_irq __user *) addr;
++ 	struct kvm_s390_irq irq = {0};
++ 
++ 	irq.type = inti->type;
++ 	switch (inti->type) {
++ 	case KVM_S390_INT_PFAULT_INIT:
++ 	case KVM_S390_INT_PFAULT_DONE:
++ 	case KVM_S390_INT_VIRTIO:
++ 	case KVM_S390_INT_SERVICE:
++ 		irq.u.ext = inti->ext;
++ 		break;
++ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
++ 		irq.u.io = inti->io;
++ 		break;
++ 	case KVM_S390_MCHK:
++ 		irq.u.mchk = inti->mchk;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (copy_to_user(uptr, &irq, sizeof(irq)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int get_all_floating_irqs(struct kvm *kvm, __u8 *buf, __u64 len)
++ {
++ 	struct kvm_s390_interrupt_info *inti;
++ 	struct kvm_s390_float_interrupt *fi;
++ 	int ret = 0;
++ 	int n = 0;
++ 
++ 	mutex_lock(&kvm->lock);
++ 	fi = &kvm->arch.float_int;
++ 	spin_lock(&fi->lock);
++ 
++ 	list_for_each_entry(inti, &fi->list, list) {
++ 		if (len < sizeof(struct kvm_s390_irq)) {
++ 			/* signal userspace to try again */
++ 			ret = -ENOMEM;
++ 			break;
++ 		}
++ 		ret = copy_irq_to_user(inti, buf);
++ 		if (ret)
++ 			break;
++ 		buf += sizeof(struct kvm_s390_irq);
++ 		len -= sizeof(struct kvm_s390_irq);
++ 		n++;
++ 	}
++ 
++ 	spin_unlock(&fi->lock);
++ 	mutex_unlock(&kvm->lock);
++ 
++ 	return ret < 0 ? ret : n;
++ }
++ 
++ static int flic_get_attr(struct kvm_device *dev, struct kvm_device_attr *attr)
++ {
++ 	int r;
++ 
++ 	switch (attr->group) {
++ 	case KVM_DEV_FLIC_GET_ALL_IRQS:
++ 		r = get_all_floating_irqs(dev->kvm, (u8 *) attr->addr,
++ 					  attr->attr);
++ 		break;
++ 	default:
++ 		r = -EINVAL;
++ 	}
++ 
++ 	return r;
++ }
++ 
++ static inline int copy_irq_from_user(struct kvm_s390_interrupt_info *inti,
++ 				     u64 addr)
++ {
++ 	struct kvm_s390_irq __user *uptr = (struct kvm_s390_irq __user *) addr;
++ 	void *target = NULL;
++ 	void __user *source;
++ 	u64 size;
++ 
++ 	if (get_user(inti->type, (u64 __user *)addr))
++ 		return -EFAULT;
++ 
++ 	switch (inti->type) {
++ 	case KVM_S390_INT_PFAULT_INIT:
++ 	case KVM_S390_INT_PFAULT_DONE:
++ 	case KVM_S390_INT_VIRTIO:
++ 	case KVM_S390_INT_SERVICE:
++ 		target = (void *) &inti->ext;
++ 		source = &uptr->u.ext;
++ 		size = sizeof(inti->ext);
++ 		break;
++ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
++ 		target = (void *) &inti->io;
++ 		source = &uptr->u.io;
++ 		size = sizeof(inti->io);
++ 		break;
++ 	case KVM_S390_MCHK:
++ 		target = (void *) &inti->mchk;
++ 		source = &uptr->u.mchk;
++ 		size = sizeof(inti->mchk);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (copy_from_user(target, source, size))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int enqueue_floating_irq(struct kvm_device *dev,
++ 				struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_interrupt_info *inti = NULL;
++ 	int r = 0;
++ 	int len = attr->attr;
++ 
++ 	if (len % sizeof(struct kvm_s390_irq) != 0)
++ 		return -EINVAL;
++ 	else if (len > KVM_S390_FLIC_MAX_BUFFER)
++ 		return -EINVAL;
++ 
++ 	while (len >= sizeof(struct kvm_s390_irq)) {
++ 		inti = kzalloc(sizeof(*inti), GFP_KERNEL);
++ 		if (!inti)
++ 			return -ENOMEM;
++ 
++ 		r = copy_irq_from_user(inti, attr->addr);
++ 		if (r) {
++ 			kfree(inti);
++ 			return r;
++ 		}
++ 		r = __inject_vm(dev->kvm, inti);
++ 		if (r) {
++ 			kfree(inti);
++ 			return r;
++ 		}
++ 		len -= sizeof(struct kvm_s390_irq);
++ 		attr->addr += sizeof(struct kvm_s390_irq);
++ 	}
++ 
++ 	return r;
++ }
++ 
++ static struct s390_io_adapter *get_io_adapter(struct kvm *kvm, unsigned int id)
++ {
++ 	if (id >= MAX_S390_IO_ADAPTERS)
++ 		return NULL;
++ 	return kvm->arch.adapters[id];
++ }
++ 
++ static int register_io_adapter(struct kvm_device *dev,
++ 			       struct kvm_device_attr *attr)
++ {
++ 	struct s390_io_adapter *adapter;
++ 	struct kvm_s390_io_adapter adapter_info;
++ 
++ 	if (copy_from_user(&adapter_info,
++ 			   (void __user *)attr->addr, sizeof(adapter_info)))
++ 		return -EFAULT;
++ 
++ 	if ((adapter_info.id >= MAX_S390_IO_ADAPTERS) ||
++ 	    (dev->kvm->arch.adapters[adapter_info.id] != NULL))
++ 		return -EINVAL;
++ 
++ 	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
++ 	if (!adapter)
++ 		return -ENOMEM;
++ 
++ 	INIT_LIST_HEAD(&adapter->maps);
++ 	init_rwsem(&adapter->maps_lock);
++ 	atomic_set(&adapter->nr_maps, 0);
++ 	adapter->id = adapter_info.id;
++ 	adapter->isc = adapter_info.isc;
++ 	adapter->maskable = adapter_info.maskable;
++ 	adapter->masked = false;
++ 	adapter->swap = adapter_info.swap;
++ 	dev->kvm->arch.adapters[adapter->id] = adapter;
++ 
++ 	return 0;
++ }
++ 
++ int kvm_s390_mask_adapter(struct kvm *kvm, unsigned int id, bool masked)
++ {
++ 	int ret;
++ 	struct s390_io_adapter *adapter = get_io_adapter(kvm, id);
++ 
++ 	if (!adapter || !adapter->maskable)
++ 		return -EINVAL;
++ 	ret = adapter->masked;
++ 	adapter->masked = masked;
++ 	return ret;
++ }
++ 
++ static int kvm_s390_adapter_map(struct kvm *kvm, unsigned int id, __u64 addr)
++ {
++ 	struct s390_io_adapter *adapter = get_io_adapter(kvm, id);
++ 	struct s390_map_info *map;
++ 	int ret;
++ 
++ 	if (!adapter || !addr)
++ 		return -EINVAL;
++ 
++ 	map = kzalloc(sizeof(*map), GFP_KERNEL);
++ 	if (!map) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 	INIT_LIST_HEAD(&map->list);
++ 	map->guest_addr = addr;
++ 	map->addr = gmap_translate(addr, kvm->arch.gmap);
++ 	if (map->addr == -EFAULT) {
++ 		ret = -EFAULT;
++ 		goto out;
++ 	}
++ 	ret = get_user_pages_fast(map->addr, 1, 1, &map->page);
++ 	if (ret < 0)
++ 		goto out;
++ 	BUG_ON(ret != 1);
++ 	down_write(&adapter->maps_lock);
++ 	if (atomic_inc_return(&adapter->nr_maps) < MAX_S390_ADAPTER_MAPS) {
++ 		list_add_tail(&map->list, &adapter->maps);
++ 		ret = 0;
++ 	} else {
++ 		put_page(map->page);
++ 		ret = -EINVAL;
++ 	}
++ 	up_write(&adapter->maps_lock);
++ out:
++ 	if (ret)
++ 		kfree(map);
++ 	return ret;
++ }
++ 
++ static int kvm_s390_adapter_unmap(struct kvm *kvm, unsigned int id, __u64 addr)
++ {
++ 	struct s390_io_adapter *adapter = get_io_adapter(kvm, id);
++ 	struct s390_map_info *map, *tmp;
++ 	int found = 0;
++ 
++ 	if (!adapter || !addr)
++ 		return -EINVAL;
++ 
++ 	down_write(&adapter->maps_lock);
++ 	list_for_each_entry_safe(map, tmp, &adapter->maps, list) {
++ 		if (map->guest_addr == addr) {
++ 			found = 1;
++ 			atomic_dec(&adapter->nr_maps);
++ 			list_del(&map->list);
++ 			put_page(map->page);
++ 			kfree(map);
++ 			break;
++ 		}
++ 	}
++ 	up_write(&adapter->maps_lock);
++ 
++ 	return found ? 0 : -EINVAL;
++ }
++ 
++ void kvm_s390_destroy_adapters(struct kvm *kvm)
++ {
++ 	int i;
++ 	struct s390_map_info *map, *tmp;
++ 
++ 	for (i = 0; i < MAX_S390_IO_ADAPTERS; i++) {
++ 		if (!kvm->arch.adapters[i])
++ 			continue;
++ 		list_for_each_entry_safe(map, tmp,
++ 					 &kvm->arch.adapters[i]->maps, list) {
++ 			list_del(&map->list);
++ 			put_page(map->page);
++ 			kfree(map);
++ 		}
++ 		kfree(kvm->arch.adapters[i]);
++ 	}
++ }
++ 
++ static int modify_io_adapter(struct kvm_device *dev,
++ 			     struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_io_adapter_req req;
++ 	struct s390_io_adapter *adapter;
++ 	int ret;
++ 
++ 	if (copy_from_user(&req, (void __user *)attr->addr, sizeof(req)))
++ 		return -EFAULT;
++ 
++ 	adapter = get_io_adapter(dev->kvm, req.id);
++ 	if (!adapter)
++ 		return -EINVAL;
++ 	switch (req.type) {
++ 	case KVM_S390_IO_ADAPTER_MASK:
++ 		ret = kvm_s390_mask_adapter(dev->kvm, req.id, req.mask);
++ 		if (ret > 0)
++ 			ret = 0;
++ 		break;
++ 	case KVM_S390_IO_ADAPTER_MAP:
++ 		ret = kvm_s390_adapter_map(dev->kvm, req.id, req.addr);
++ 		break;
++ 	case KVM_S390_IO_ADAPTER_UNMAP:
++ 		ret = kvm_s390_adapter_unmap(dev->kvm, req.id, req.addr);
++ 		break;
++ 	default:
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int flic_set_attr(struct kvm_device *dev, struct kvm_device_attr *attr)
++ {
++ 	int r = 0;
++ 	unsigned int i;
++ 	struct kvm_vcpu *vcpu;
++ 
++ 	switch (attr->group) {
++ 	case KVM_DEV_FLIC_ENQUEUE:
++ 		r = enqueue_floating_irq(dev, attr);
++ 		break;
++ 	case KVM_DEV_FLIC_CLEAR_IRQS:
++ 		r = 0;
++ 		clear_floating_interrupts(dev->kvm);
++ 		break;
++ 	case KVM_DEV_FLIC_APF_ENABLE:
++ 		dev->kvm->arch.gmap->pfault_enabled = 1;
++ 		break;
++ 	case KVM_DEV_FLIC_APF_DISABLE_WAIT:
++ 		dev->kvm->arch.gmap->pfault_enabled = 0;
++ 		/*
++ 		 * Make sure no async faults are in transition when
++ 		 * clearing the queues. So we don't need to worry
++ 		 * about late coming workers.
++ 		 */
++ 		synchronize_srcu(&dev->kvm->srcu);
++ 		kvm_for_each_vcpu(i, vcpu, dev->kvm)
++ 			kvm_clear_async_pf_completion_queue(vcpu);
++ 		break;
++ 	case KVM_DEV_FLIC_ADAPTER_REGISTER:
++ 		r = register_io_adapter(dev, attr);
++ 		break;
++ 	case KVM_DEV_FLIC_ADAPTER_MODIFY:
++ 		r = modify_io_adapter(dev, attr);
++ 		break;
++ 	default:
++ 		r = -EINVAL;
++ 	}
++ 
++ 	return r;
++ }
++ 
++ static int flic_create(struct kvm_device *dev, u32 type)
++ {
++ 	if (!dev)
++ 		return -EINVAL;
++ 	if (dev->kvm->arch.flic)
++ 		return -EINVAL;
++ 	dev->kvm->arch.flic = dev;
++ 	return 0;
++ }
++ 
++ static void flic_destroy(struct kvm_device *dev)
++ {
++ 	dev->kvm->arch.flic = NULL;
++ 	kfree(dev);
++ }
++ 
++ /* s390 floating irq controller (flic) */
++ struct kvm_device_ops kvm_flic_ops = {
++ 	.name = "kvm-flic",
++ 	.get_attr = flic_get_attr,
++ 	.set_attr = flic_set_attr,
++ 	.create = flic_create,
++ 	.destroy = flic_destroy,
++ };
+++>>>>>>> 841b91c584b6 (KVM: s390: adapter interrupt sources)
+diff --cc arch/s390/kvm/kvm-s390.h
+index dc99f1ca4267,5502cc951868..000000000000
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@@ -132,9 -134,9 +132,10 @@@ int __must_check kvm_s390_inject_vm(str
+  int __must_check kvm_s390_inject_vcpu(struct kvm_vcpu *vcpu,
+  				      struct kvm_s390_interrupt *s390int);
+  int __must_check kvm_s390_inject_program_int(struct kvm_vcpu *vcpu, u16 code);
+ +int __must_check kvm_s390_inject_sigp_stop(struct kvm_vcpu *vcpu, int action);
+  struct kvm_s390_interrupt_info *kvm_s390_get_io_int(struct kvm *kvm,
+  						    u64 cr6, u64 schid);
++ int kvm_s390_mask_adapter(struct kvm *kvm, unsigned int id, bool masked);
+  
+  /* implemented in priv.c */
+  int kvm_s390_handle_b2(struct kvm_vcpu *vcpu);
+@@@ -158,4 -160,9 +159,12 @@@ void exit_sie_sync(struct kvm_vcpu *vcp
+  /* implemented in diag.c */
+  int kvm_s390_handle_diag(struct kvm_vcpu *vcpu);
+  
+++<<<<<<< HEAD
+++=======
++ /* implemented in interrupt.c */
++ int kvm_cpu_has_interrupt(struct kvm_vcpu *vcpu);
++ int psw_extint_disabled(struct kvm_vcpu *vcpu);
++ void kvm_s390_destroy_adapters(struct kvm *kvm);
++ 
+++>>>>>>> 841b91c584b6 (KVM: s390: adapter interrupt sources)
+  #endif
+* Unmerged path Documentation/virtual/kvm/devices/s390_flic.txt
+* Unmerged path Documentation/virtual/kvm/devices/s390_flic.txt
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index e87ecaa2c569..84e6744743c5 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -18,6 +18,7 @@
+ #include <linux/kvm_host.h>
+ #include <asm/debug.h>
+ #include <asm/cpu.h>
++#include <asm/isc.h>
+ 
+ #define KVM_MAX_VCPUS 64
+ #define KVM_USER_MEM_SLOTS 32
+@@ -266,12 +267,34 @@ struct kvm_vm_stat {
+ struct kvm_arch_memory_slot {
+ };
+ 
++struct s390_map_info {
++	struct list_head list;
++	__u64 guest_addr;
++	__u64 addr;
++	struct page *page;
++};
++
++struct s390_io_adapter {
++	unsigned int id;
++	int isc;
++	bool maskable;
++	bool masked;
++	bool swap;
++	struct rw_semaphore maps_lock;
++	struct list_head maps;
++	atomic_t nr_maps;
++};
++
++#define MAX_S390_IO_ADAPTERS ((MAX_ISC + 1) * 8)
++#define MAX_S390_ADAPTER_MAPS 256
++
+ struct kvm_arch{
+ 	struct sca_block *sca;
+ 	debug_info_t *dbf;
+ 	struct kvm_s390_float_interrupt float_int;
+ 	struct gmap *gmap;
+ 	int css_support;
++	struct s390_io_adapter *adapters[MAX_S390_IO_ADAPTERS];
+ };
+ 
+ #define KVM_HVA_ERR_BAD		(-1UL)
+* Unmerged path arch/s390/include/uapi/asm/kvm.h
+* Unmerged path arch/s390/kvm/interrupt.c
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 4975fcbb6a2a..93f659b68f3b 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -315,6 +315,7 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 	debug_unregister(kvm->arch.dbf);
+ 	if (!kvm_is_ucontrol(kvm))
+ 		gmap_free(kvm->arch.gmap);
++	kvm_s390_destroy_adapters(kvm);
+ }
+ 
+ /* Section: vcpu related */
+* Unmerged path arch/s390/kvm/kvm-s390.h
