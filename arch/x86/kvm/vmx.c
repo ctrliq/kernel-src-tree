@@ -846,7 +846,6 @@ static const u32 vmx_msr_index[] = {
 #endif
 	MSR_EFER, MSR_TSC_AUX, MSR_STAR,
 };
-#define NR_VMX_MSR ARRAY_SIZE(vmx_msr_index)
 
 static inline bool is_page_fault(u32 intr_info)
 {
@@ -4481,7 +4480,7 @@ static int vmx_vcpu_setup(struct vcpu_vmx *vmx)
 		vmx->vcpu.arch.pat = host_pat;
 	}
 
-	for (i = 0; i < NR_VMX_MSR; ++i) {
+	for (i = 0; i < ARRAY_SIZE(vmx_msr_index); ++i) {
 		u32 index = vmx_msr_index[i];
 		u32 data_low, data_high;
 		int j = vmx->nmsrs;
@@ -7762,7 +7761,8 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 		goto free_vcpu;
 
 	vmx->guest_msrs = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	BUILD_BUG_ON(PAGE_SIZE / sizeof(struct shared_msr_entry) < NR_VMX_MSR);
+	BUILD_BUG_ON(ARRAY_SIZE(vmx_msr_index) * sizeof(vmx->guest_msrs[0])
+		     > PAGE_SIZE);
 
 	err = -ENOMEM;
 	if (!vmx->guest_msrs) {
@@ -9126,7 +9126,7 @@ static int __init vmx_init(void)
 
 	rdmsrl_safe(MSR_EFER, &host_efer);
 
-	for (i = 0; i < NR_VMX_MSR; ++i)
+	for (i = 0; i < ARRAY_SIZE(vmx_msr_index); ++i)
 		kvm_define_shared_msr(i, vmx_msr_index[i]);
 
 	vmx_io_bitmap_a = (unsigned long *)__get_free_page(GFP_KERNEL);
