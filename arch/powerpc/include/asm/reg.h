@@ -1194,6 +1194,15 @@
 				     : "r" ((unsigned long)(v)) \
 				     : "memory")
 
+static inline unsigned long mfvtb (void)
+{
+#ifdef CONFIG_PPC_BOOK3S_64
+	if (cpu_has_feature(CPU_FTR_ARCH_207S))
+		return mfspr(SPRN_VTB);
+#endif
+	return 0;
+}
+
 #ifdef __powerpc64__
 #ifdef CONFIG_PPC_CELL
 #define mftb()		({unsigned long rval;				\
