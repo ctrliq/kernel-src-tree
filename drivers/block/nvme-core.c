@@ -1887,6 +1887,19 @@ static size_t db_bar_size(struct nvme_dev *dev, unsigned nr_io_queues)
 	return 4096 + ((nr_io_queues + 1) * 8 * dev->db_stride);
 }
 
+static int nvme_cpu_notify(struct notifier_block *self,
+				unsigned long action, void *hcpu)
+{
+	struct nvme_dev *dev = container_of(self, struct nvme_dev, nb);
+	switch (action) {
+	case CPU_ONLINE:
+	case CPU_DEAD:
+		nvme_assign_io_queues(dev);
+		break;
+	}
+	return NOTIFY_OK;
+}
+
 static int nvme_setup_io_queues(struct nvme_dev *dev)
 {
 	struct nvme_queue *adminq = dev->queues[0];
@@ -2004,6 +2017,11 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 			goto free_queues;
 		}
 	}
+
+	dev->nb.notifier_call = &nvme_cpu_notify;
+	result = register_hotcpu_notifier(&dev->nb);
+	if (result)
+		goto free_queues;
 
 	return 0;
 
@@ -2279,6 +2297,7 @@ static void nvme_dev_shutdown(struct nvme_dev *dev)
 	int i;
 
 	dev->initialized = 0;
+	unregister_hotcpu_notifier(&dev->nb);
 
 	spin_lock(&dev_list_lock);
 	list_del_init(&dev->node);
