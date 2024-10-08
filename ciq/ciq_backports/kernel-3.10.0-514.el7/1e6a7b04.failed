@@ -1,0 +1,251 @@
+iommu/amd: Use iommu core for passthrough mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [iommu] amd: Use iommu core for passthrough mode (Myron Stowe) [1050021]
+Rebuild_FUZZ: 93.02%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 1e6a7b04c033fe76ec7fe746ef6a3b22ab9502b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1e6a7b04.failed
+
+Remove the AMD IOMMU driver implementation for passthrough
+mode and rely on the new iommu core features for that.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 1e6a7b04c033fe76ec7fe746ef6a3b22ab9502b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+#	drivers/iommu/amd_iommu_init.c
+diff --cc drivers/iommu/amd_iommu.c
+index ec80b60ecc11,89e6d4b2cdb6..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -79,9 -76,7 +79,13 @@@ LIST_HEAD(hpet_map)
+   * Domain for untranslated devices - only allocated
+   * if iommu=pt passed on kernel cmd line.
+   */
+++<<<<<<< HEAD
+ +static struct protection_domain *pt_domain;
+ +
+ +static struct iommu_ops amd_iommu_ops;
+++=======
++ static const struct iommu_ops amd_iommu_ops;
+++>>>>>>> 1e6a7b04c033 (iommu/amd: Use iommu core for passthrough mode)
+  
+  static ATOMIC_NOTIFIER_HEAD(ppr_notifier);
+  int amd_iommu_max_glx_val = -1;
+@@@ -119,7 -114,7 +123,11 @@@ struct iommu_cmd 
+  struct kmem_cache *amd_iommu_irq_cache;
+  
+  static void update_domain(struct protection_domain *domain);
+++<<<<<<< HEAD
+ +static int __init alloc_passthrough_domain(void);
+++=======
++ static int protection_domain_init(struct protection_domain *domain);
+++>>>>>>> 1e6a7b04c033 (iommu/amd: Use iommu core for passthrough mode)
+  
+  /****************************************************************************
+   *
+@@@ -2375,44 -2245,57 +2374,67 @@@ static void detach_device(struct devic
+  	dev_data->ats.enabled = false;
+  }
+  
+ -static int amd_iommu_add_device(struct device *dev)
+ +/*
+ + * Find out the protection domain structure for a given PCI device. This
+ + * will give us the pointer to the page table root for example.
+ + */
+ +static struct protection_domain *domain_for_device(struct device *dev)
+  {
+  	struct iommu_dev_data *dev_data;
+ -	struct iommu_domain *domain;
+ -	struct amd_iommu *iommu;
+ -	u16 devid;
+ -	int ret;
+ +	struct protection_domain *dom = NULL;
+ +	unsigned long flags;
+  
+ -	if (!check_device(dev) || get_dev_data(dev))
+ -		return 0;
+ +	dev_data   = get_dev_data(dev);
+  
+ -	devid = get_device_id(dev);
+ -	iommu = amd_iommu_rlookup_table[devid];
+ +	if (dev_data->domain)
+ +		return dev_data->domain;
+  
+ -	ret = iommu_init_device(dev);
+ -	if (ret) {
+ -		if (ret != -ENOTSUPP)
+ -			pr_err("Failed to initialize device %s - trying to proceed anyway\n",
+ -				dev_name(dev));
+ +	if (dev_data->alias_data != NULL) {
+ +		struct iommu_dev_data *alias_data = dev_data->alias_data;
+  
+++<<<<<<< HEAD
+ +		read_lock_irqsave(&amd_iommu_devtable_lock, flags);
+ +		if (alias_data->domain != NULL) {
+ +			__attach_device(dev_data, alias_data->domain);
+ +			dom = alias_data->domain;
+ +		}
+ +		read_unlock_irqrestore(&amd_iommu_devtable_lock, flags);
+++=======
++ 		iommu_ignore_device(dev);
++ 		dev->archdata.dma_ops = &nommu_dma_ops;
++ 		goto out;
++ 	}
++ 	init_iommu_group(dev);
++ 
++ 	dev_data = get_dev_data(dev);
++ 
++ 	BUG_ON(!dev_data);
++ 
++ 	if (iommu_pass_through || dev_data->iommu_v2)
++ 		iommu_request_dm_for_dev(dev);
++ 
++ 	/* Domains are initialized for this device - have a look what we ended up with */
++ 	domain = iommu_get_domain_for_dev(dev);
++ 	if (domain->type == IOMMU_DOMAIN_IDENTITY) {
++ 		dev_data->passthrough = true;
++ 		dev->archdata.dma_ops = &nommu_dma_ops;
++ 	} else {
++ 		dev->archdata.dma_ops = &amd_iommu_dma_ops;
+++>>>>>>> 1e6a7b04c033 (iommu/amd: Use iommu core for passthrough mode)
+  	}
+  
+ -out:
+ -	iommu_completion_wait(iommu);
+ -
+ -	return 0;
+ +	return dom;
+  }
+  
+ -static void amd_iommu_remove_device(struct device *dev)
+ +static int device_change_notifier(struct notifier_block *nb,
+ +				  unsigned long action, void *data)
+  {
+ +	struct dma_ops_domain *dma_domain;
+ +	struct protection_domain *domain;
+ +	struct iommu_dev_data *dev_data;
+ +	struct device *dev = data;
+  	struct amd_iommu *iommu;
+ +	unsigned long flags;
+  	u16 devid;
+  
+  	if (!check_device(dev))
+@@@ -3231,21 -2935,52 +3253,70 @@@ out_err
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static int __init alloc_passthrough_domain(void)
+ +{
+ +	if (pt_domain != NULL)
+ +		return 0;
+ +
+ +	/* allocate passthrough domain */
+ +	pt_domain = protection_domain_alloc();
+ +	if (!pt_domain)
+ +		return -ENOMEM;
+ +
+ +	pt_domain->mode = PAGE_MODE_NONE;
+ +
+ +	return 0;
+ +}
+ +static int amd_iommu_domain_init(struct iommu_domain *dom)
+++=======
++ static struct iommu_domain *amd_iommu_domain_alloc(unsigned type)
++ {
++ 	struct protection_domain *pdomain;
++ 	struct dma_ops_domain *dma_domain;
++ 
++ 	switch (type) {
++ 	case IOMMU_DOMAIN_UNMANAGED:
++ 		pdomain = protection_domain_alloc();
++ 		if (!pdomain)
++ 			return NULL;
++ 
++ 		pdomain->mode    = PAGE_MODE_3_LEVEL;
++ 		pdomain->pt_root = (void *)get_zeroed_page(GFP_KERNEL);
++ 		if (!pdomain->pt_root) {
++ 			protection_domain_free(pdomain);
++ 			return NULL;
++ 		}
++ 
++ 		pdomain->domain.geometry.aperture_start = 0;
++ 		pdomain->domain.geometry.aperture_end   = ~0ULL;
++ 		pdomain->domain.geometry.force_aperture = true;
++ 
++ 		break;
++ 	case IOMMU_DOMAIN_DMA:
++ 		dma_domain = dma_ops_domain_alloc();
++ 		if (!dma_domain) {
++ 			pr_err("AMD-Vi: Failed to allocate\n");
++ 			return NULL;
++ 		}
++ 		pdomain = &dma_domain->domain;
++ 		break;
++ 	case IOMMU_DOMAIN_IDENTITY:
++ 		pdomain = protection_domain_alloc();
++ 		if (!pdomain)
++ 			return NULL;
++ 
++ 		pdomain->mode = PAGE_MODE_NONE;
++ 		break;
++ 	default:
++ 		return NULL;
++ 	}
++ 
++ 	return &pdomain->domain;
++ }
++ 
++ static void amd_iommu_domain_free(struct iommu_domain *dom)
+++>>>>>>> 1e6a7b04c033 (iommu/amd: Use iommu core for passthrough mode)
+  {
+  	struct protection_domain *domain;
+  
+diff --cc drivers/iommu/amd_iommu_init.c
+index 8d6a15e2890d,a24495eb4e26..000000000000
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@@ -1977,31 -2026,6 +1977,34 @@@ static bool detect_ivrs(void
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int amd_iommu_init_dma(void)
+ +{
+ +	struct amd_iommu *iommu;
+ +	int ret;
+ +
+ +	if (iommu_pass_through)
+ +		ret = amd_iommu_init_passthrough();
+ +	else
+ +		ret = amd_iommu_init_dma_ops();
+ +
+ +	if (ret)
+ +		return ret;
+ +
+ +	init_device_table_dma();
+ +
+ +	for_each_iommu(iommu)
+ +		iommu_flush_all_caches(iommu);
+ +
+ +	amd_iommu_init_api();
+ +
+ +	amd_iommu_init_notifier();
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 1e6a7b04c033 (iommu/amd: Use iommu core for passthrough mode)
+  /****************************************************************************
+   *
+   * AMD IOMMU Initialization State Machine
+* Unmerged path drivers/iommu/amd_iommu.c
+* Unmerged path drivers/iommu/amd_iommu_init.c
