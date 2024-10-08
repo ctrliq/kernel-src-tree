@@ -86,6 +86,7 @@ static const char * const ue_status_low_desc[] = {
 	"JTAG ",
 	"MPU_INTPEND "
 };
+
 /* UE Status High CSR */
 static const char * const ue_status_hi_desc[] = {
 	"LPCMEMHOST",
@@ -1382,6 +1383,7 @@ static int be_set_vf_tx_rate(struct net_device *netdev, int vf, int rate)
 		adapter->vf_cfg[vf].tx_rate = rate;
 	return status;
 }
+
 static int be_set_vf_link_state(struct net_device *netdev, int vf,
 				int link_state)
 {
