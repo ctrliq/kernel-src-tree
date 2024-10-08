@@ -1,0 +1,216 @@
+mmc: sdhci: set_uhs_signaling() need not return a value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] sdhci: set_uhs_signaling() need not return a value (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 95.24%
+commit-author Russell King <rmk+kernel@arm.linux.org.uk>
+commit 13e645012dff774895906058163ae244f47b9b81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/13e64501.failed
+
+The set_uhs_signaling() method gives the impression that it can fail,
+but anything returned from the method is entirely ignored by the sdhci
+driver.  So returning failure has no effect.
+
+So, kill the idea that it's possible for this to return an error by
+removing the returned value.
+
+	Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+	Tested-by: Markus Pargmann <mpa@pengutronix.de>
+	Tested-by: Stephen Warren <swarren@nvidia.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Chris Ball <chris@printf.net>
+(cherry picked from commit 13e645012dff774895906058163ae244f47b9b81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/sdhci-esdhc-imx.c
+diff --cc drivers/mmc/host/sdhci-esdhc-imx.c
+index 98f46704baa6,72e0581e564f..000000000000
+--- a/drivers/mmc/host/sdhci-esdhc-imx.c
++++ b/drivers/mmc/host/sdhci-esdhc-imx.c
+@@@ -432,7 -755,142 +432,146 @@@ static int esdhc_pltfm_bus_width(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct sdhci_ops sdhci_esdhc_ops = {
+++=======
++ static void esdhc_post_tuning(struct sdhci_host *host)
++ {
++ 	u32 reg;
++ 
++ 	reg = readl(host->ioaddr + ESDHC_MIX_CTRL);
++ 	reg &= ~ESDHC_MIX_CTRL_EXE_TUNE;
++ 	writel(reg, host->ioaddr + ESDHC_MIX_CTRL);
++ }
++ 
++ static int esdhc_executing_tuning(struct sdhci_host *host, u32 opcode)
++ {
++ 	struct scatterlist sg;
++ 	char *tuning_pattern;
++ 	int min, max, avg, ret;
++ 
++ 	tuning_pattern = kmalloc(ESDHC_TUNING_BLOCK_PATTERN_LEN, GFP_KERNEL);
++ 	if (!tuning_pattern)
++ 		return -ENOMEM;
++ 
++ 	sg_init_one(&sg, tuning_pattern, ESDHC_TUNING_BLOCK_PATTERN_LEN);
++ 
++ 	/* find the mininum delay first which can pass tuning */
++ 	min = ESDHC_TUNE_CTRL_MIN;
++ 	while (min < ESDHC_TUNE_CTRL_MAX) {
++ 		esdhc_prepare_tuning(host, min);
++ 		if (!esdhc_send_tuning_cmd(host, opcode, &sg))
++ 			break;
++ 		min += ESDHC_TUNE_CTRL_STEP;
++ 	}
++ 
++ 	/* find the maxinum delay which can not pass tuning */
++ 	max = min + ESDHC_TUNE_CTRL_STEP;
++ 	while (max < ESDHC_TUNE_CTRL_MAX) {
++ 		esdhc_prepare_tuning(host, max);
++ 		if (esdhc_send_tuning_cmd(host, opcode, &sg)) {
++ 			max -= ESDHC_TUNE_CTRL_STEP;
++ 			break;
++ 		}
++ 		max += ESDHC_TUNE_CTRL_STEP;
++ 	}
++ 
++ 	/* use average delay to get the best timing */
++ 	avg = (min + max) / 2;
++ 	esdhc_prepare_tuning(host, avg);
++ 	ret = esdhc_send_tuning_cmd(host, opcode, &sg);
++ 	esdhc_post_tuning(host);
++ 
++ 	kfree(tuning_pattern);
++ 
++ 	dev_dbg(mmc_dev(host->mmc), "tunning %s at 0x%x ret %d\n",
++ 		ret ? "failed" : "passed", avg, ret);
++ 
++ 	return ret;
++ }
++ 
++ static int esdhc_change_pinstate(struct sdhci_host *host,
++ 						unsigned int uhs)
++ {
++ 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++ 	struct pltfm_imx_data *imx_data = pltfm_host->priv;
++ 	struct pinctrl_state *pinctrl;
++ 
++ 	dev_dbg(mmc_dev(host->mmc), "change pinctrl state for uhs %d\n", uhs);
++ 
++ 	if (IS_ERR(imx_data->pinctrl) ||
++ 		IS_ERR(imx_data->pins_default) ||
++ 		IS_ERR(imx_data->pins_100mhz) ||
++ 		IS_ERR(imx_data->pins_200mhz))
++ 		return -EINVAL;
++ 
++ 	switch (uhs) {
++ 	case MMC_TIMING_UHS_SDR50:
++ 		pinctrl = imx_data->pins_100mhz;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR104:
++ 	case MMC_TIMING_MMC_HS200:
++ 		pinctrl = imx_data->pins_200mhz;
++ 		break;
++ 	default:
++ 		/* back to default state for other legacy timing */
++ 		pinctrl = imx_data->pins_default;
++ 	}
++ 
++ 	return pinctrl_select_state(imx_data->pinctrl, pinctrl);
++ }
++ 
++ static void esdhc_set_uhs_signaling(struct sdhci_host *host, unsigned int uhs)
++ {
++ 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++ 	struct pltfm_imx_data *imx_data = pltfm_host->priv;
++ 	struct esdhc_platform_data *boarddata = &imx_data->boarddata;
++ 
++ 	switch (uhs) {
++ 	case MMC_TIMING_UHS_SDR12:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR12;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR25:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR25;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR50:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR50;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR104:
++ 	case MMC_TIMING_MMC_HS200:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR104;
++ 		break;
++ 	case MMC_TIMING_UHS_DDR50:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_DDR50;
++ 		writel(readl(host->ioaddr + ESDHC_MIX_CTRL) |
++ 				ESDHC_MIX_CTRL_DDREN,
++ 				host->ioaddr + ESDHC_MIX_CTRL);
++ 		imx_data->is_ddr = 1;
++ 		if (boarddata->delay_line) {
++ 			u32 v;
++ 			v = boarddata->delay_line <<
++ 				ESDHC_DLL_OVERRIDE_VAL_SHIFT |
++ 				(1 << ESDHC_DLL_OVERRIDE_EN_SHIFT);
++ 			if (is_imx53_esdhc(imx_data))
++ 				v <<= 1;
++ 			writel(v, host->ioaddr + ESDHC_DLL_CTRL);
++ 		}
++ 		break;
++ 	}
++ 
++ 	esdhc_change_pinstate(host, uhs);
++ }
++ 
++ static void esdhc_reset(struct sdhci_host *host, u8 mask)
++ {
++ 	sdhci_reset(host, mask);
++ 
++ 	sdhci_writel(host, host->ier, SDHCI_INT_ENABLE);
++ 	sdhci_writel(host, host->ier, SDHCI_SIGNAL_ENABLE);
++ }
++ 
++ static struct sdhci_ops sdhci_esdhc_ops = {
+++>>>>>>> 13e645012dff (mmc: sdhci: set_uhs_signaling() need not return a value)
+  	.read_l = esdhc_readl_le,
+  	.read_w = esdhc_readw_le,
+  	.write_l = esdhc_writel_le,
+* Unmerged path drivers/mmc/host/sdhci-esdhc-imx.c
+diff --git a/drivers/mmc/host/sdhci-pxav3.c b/drivers/mmc/host/sdhci-pxav3.c
+index 56d9bee93d8f..59cae129ff44 100644
+--- a/drivers/mmc/host/sdhci-pxav3.c
++++ b/drivers/mmc/host/sdhci-pxav3.c
+@@ -129,7 +129,7 @@ static void pxav3_gen_init_74_clocks(struct sdhci_host *host, u8 power_mode)
+ 	pxa->power_mode = power_mode;
+ }
+ 
+-static int pxav3_set_uhs_signaling(struct sdhci_host *host, unsigned int uhs)
++static void pxav3_set_uhs_signaling(struct sdhci_host *host, unsigned int uhs)
+ {
+ 	u16 ctrl_2;
+ 
+@@ -163,8 +163,6 @@ static int pxav3_set_uhs_signaling(struct sdhci_host *host, unsigned int uhs)
+ 	dev_dbg(mmc_dev(host->mmc),
+ 		"%s uhs = %d, ctrl_2 = %04X\n",
+ 		__func__, uhs, ctrl_2);
+-
+-	return 0;
+ }
+ 
+ static const struct sdhci_ops pxav3_sdhci_ops = {
+diff --git a/drivers/mmc/host/sdhci.h b/drivers/mmc/host/sdhci.h
+index 0a3ed01887db..0405abd21b53 100644
+--- a/drivers/mmc/host/sdhci.h
++++ b/drivers/mmc/host/sdhci.h
+@@ -289,7 +289,7 @@ struct sdhci_ops {
+ 	void	(*platform_reset_enter)(struct sdhci_host *host, u8 mask);
+ 	void	(*platform_reset_exit)(struct sdhci_host *host, u8 mask);
+ 	int	(*platform_execute_tuning)(struct sdhci_host *host, u32 opcode);
+-	int	(*set_uhs_signaling)(struct sdhci_host *host, unsigned int uhs);
++	void	(*set_uhs_signaling)(struct sdhci_host *host, unsigned int uhs);
+ 	void	(*hw_reset)(struct sdhci_host *host);
+ 	void	(*platform_suspend)(struct sdhci_host *host);
+ 	void	(*platform_resume)(struct sdhci_host *host);
