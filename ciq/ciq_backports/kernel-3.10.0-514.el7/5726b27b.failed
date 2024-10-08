@@ -1,0 +1,255 @@
+ext2: Add locking for DAX faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 5726b27b09cc92452b543764899a07e7c8037edd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5726b27b.failed
+
+Add locking to ensure that DAX faults are isolated from ext2 operations
+that modify the data blocks allocation for an inode.  This is intended to
+be analogous to the work being done in XFS by Dave Chinner:
+
+http://www.spinics.net/lists/linux-fsdevel/msg90260.html
+
+Compared with XFS the ext2 case is greatly simplified by the fact that ext2
+already allocates and zeros new blocks before they are returned as part of
+ext2_get_block(), so DAX doesn't need to worry about getting unmapped or
+unwritten buffer heads.
+
+This means that the only work we need to do in ext2 is to isolate the DAX
+faults from inode block allocation changes.  I believe this just means that
+we need to isolate the DAX faults from truncate operations.
+
+The newly introduced dax_sem is intended to replicate the protection
+offered by i_mmaplock in XFS.  In addition to truncate the i_mmaplock also
+protects XFS operations like hole punching, fallocate down, extent
+manipulation IOCTLS like xfs_ioc_space() and extent swapping.  Truncate is
+the only one of these operations supported by ext2.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.com>
+(cherry picked from commit 5726b27b09cc92452b543764899a07e7c8037edd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext2/file.c
+diff --cc fs/ext2/file.c
+index a5b3a5db3120,11a42c5a09ae..000000000000
+--- a/fs/ext2/file.c
++++ b/fs/ext2/file.c
+@@@ -25,6 -26,120 +25,123 @@@
+  #include "xattr.h"
+  #include "acl.h"
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ /*
++  * The lock ordering for ext2 DAX fault paths is:
++  *
++  * mmap_sem (MM)
++  *   sb_start_pagefault (vfs, freeze)
++  *     ext2_inode_info->dax_sem
++  *       address_space->i_mmap_rwsem or page_lock (mutually exclusive in DAX)
++  *         ext2_inode_info->truncate_mutex
++  *
++  * The default page_lock and i_size verification done by non-DAX fault paths
++  * is sufficient because ext2 doesn't support hole punching.
++  */
++ static int ext2_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct ext2_inode_info *ei = EXT2_I(inode);
++ 	int ret;
++ 
++ 	if (vmf->flags & FAULT_FLAG_WRITE) {
++ 		sb_start_pagefault(inode->i_sb);
++ 		file_update_time(vma->vm_file);
++ 	}
++ 	down_read(&ei->dax_sem);
++ 
++ 	ret = __dax_fault(vma, vmf, ext2_get_block, NULL);
++ 
++ 	up_read(&ei->dax_sem);
++ 	if (vmf->flags & FAULT_FLAG_WRITE)
++ 		sb_end_pagefault(inode->i_sb);
++ 	return ret;
++ }
++ 
++ static int ext2_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
++ 						pmd_t *pmd, unsigned int flags)
++ {
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct ext2_inode_info *ei = EXT2_I(inode);
++ 	int ret;
++ 
++ 	if (flags & FAULT_FLAG_WRITE) {
++ 		sb_start_pagefault(inode->i_sb);
++ 		file_update_time(vma->vm_file);
++ 	}
++ 	down_read(&ei->dax_sem);
++ 
++ 	ret = __dax_pmd_fault(vma, addr, pmd, flags, ext2_get_block, NULL);
++ 
++ 	up_read(&ei->dax_sem);
++ 	if (flags & FAULT_FLAG_WRITE)
++ 		sb_end_pagefault(inode->i_sb);
++ 	return ret;
++ }
++ 
++ static int ext2_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct ext2_inode_info *ei = EXT2_I(inode);
++ 	int ret;
++ 
++ 	sb_start_pagefault(inode->i_sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&ei->dax_sem);
++ 
++ 	ret = __dax_mkwrite(vma, vmf, ext2_get_block, NULL);
++ 
++ 	up_read(&ei->dax_sem);
++ 	sb_end_pagefault(inode->i_sb);
++ 	return ret;
++ }
++ 
++ static int ext2_dax_pfn_mkwrite(struct vm_area_struct *vma,
++ 		struct vm_fault *vmf)
++ {
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct ext2_inode_info *ei = EXT2_I(inode);
++ 	int ret = VM_FAULT_NOPAGE;
++ 	loff_t size;
++ 
++ 	sb_start_pagefault(inode->i_sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&ei->dax_sem);
++ 
++ 	/* check that the faulting page hasn't raced with truncate */
++ 	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	if (vmf->pgoff >= size)
++ 		ret = VM_FAULT_SIGBUS;
++ 
++ 	up_read(&ei->dax_sem);
++ 	sb_end_pagefault(inode->i_sb);
++ 	return ret;
++ }
++ 
++ static const struct vm_operations_struct ext2_dax_vm_ops = {
++ 	.fault		= ext2_dax_fault,
++ 	.pmd_fault	= ext2_dax_pmd_fault,
++ 	.page_mkwrite	= ext2_dax_mkwrite,
++ 	.pfn_mkwrite	= ext2_dax_pfn_mkwrite,
++ };
++ 
++ static int ext2_file_mmap(struct file *file, struct vm_area_struct *vma)
++ {
++ 	if (!IS_DAX(file_inode(file)))
++ 		return generic_file_mmap(file, vma);
++ 
++ 	file_accessed(file);
++ 	vma->vm_ops = &ext2_dax_vm_ops;
++ 	vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
++ 	return 0;
++ }
++ #else
++ #define ext2_file_mmap	generic_file_mmap
++ #endif
++ 
+++>>>>>>> 5726b27b09cc (ext2: Add locking for DAX faults)
+  /*
+   * Called when filp is released. This happens when all file descriptors
+   * for a single struct file are closed. Note that different open() calls
+diff --git a/fs/ext2/ext2.h b/fs/ext2/ext2.h
+index d9a17d0b124d..6df72cd057dc 100644
+--- a/fs/ext2/ext2.h
++++ b/fs/ext2/ext2.h
+@@ -679,6 +679,9 @@ struct ext2_inode_info {
+ 	struct rw_semaphore xattr_sem;
+ #endif
+ 	rwlock_t i_meta_lock;
++#ifdef CONFIG_FS_DAX
++	struct rw_semaphore dax_sem;
++#endif
+ 
+ 	/*
+ 	 * truncate_mutex is for serialising ext2_truncate() against
+@@ -691,6 +694,14 @@ struct ext2_inode_info {
+ 	struct list_head i_orphan;	/* unlinked but open inodes */
+ };
+ 
++#ifdef CONFIG_FS_DAX
++#define dax_sem_down_write(ext2_inode)	down_write(&(ext2_inode)->dax_sem)
++#define dax_sem_up_write(ext2_inode)	up_write(&(ext2_inode)->dax_sem)
++#else
++#define dax_sem_down_write(ext2_inode)
++#define dax_sem_up_write(ext2_inode)
++#endif
++
+ /*
+  * Inode dynamic state flags
+  */
+* Unmerged path fs/ext2/file.c
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index 115fa58bb9ae..103896fc939d 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -1082,6 +1082,7 @@ static void ext2_free_branches(struct inode *inode, __le32 *p, __le32 *q, int de
+ 		ext2_free_data(inode, p, q);
+ }
+ 
++/* dax_sem must be held when calling this function */
+ static void __ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ {
+ 	__le32 *i_data = EXT2_I(inode)->i_data;
+@@ -1097,6 +1098,10 @@ static void __ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ 	blocksize = inode->i_sb->s_blocksize;
+ 	iblock = (offset + blocksize-1) >> EXT2_BLOCK_SIZE_BITS(inode->i_sb);
+ 
++#ifdef CONFIG_FS_DAX
++	WARN_ON(!rwsem_is_locked(&ei->dax_sem));
++#endif
++
+ 	n = ext2_block_to_path(inode, iblock, offsets, NULL);
+ 	if (n == 0)
+ 		return;
+@@ -1182,7 +1187,10 @@ static void ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ 		return;
+ 	if (IS_APPEND(inode) || IS_IMMUTABLE(inode))
+ 		return;
++
++	dax_sem_down_write(EXT2_I(inode));
+ 	__ext2_truncate_blocks(inode, offset);
++	dax_sem_up_write(EXT2_I(inode));
+ }
+ 
+ static int ext2_setsize(struct inode *inode, loff_t newsize)
+@@ -1210,8 +1218,10 @@ static int ext2_setsize(struct inode *inode, loff_t newsize)
+ 	if (error)
+ 		return error;
+ 
++	dax_sem_down_write(EXT2_I(inode));
+ 	truncate_setsize(inode, newsize);
+ 	__ext2_truncate_blocks(inode, newsize);
++	dax_sem_up_write(EXT2_I(inode));
+ 
+ 	inode->i_mtime = inode->i_ctime = CURRENT_TIME_SEC;
+ 	if (inode_needs_sync(inode)) {
+diff --git a/fs/ext2/super.c b/fs/ext2/super.c
+index a47e9381bae0..726aed1b1a49 100644
+--- a/fs/ext2/super.c
++++ b/fs/ext2/super.c
+@@ -189,6 +189,9 @@ static void init_once(void *foo)
+ 	init_rwsem(&ei->xattr_sem);
+ #endif
+ 	mutex_init(&ei->truncate_mutex);
++#ifdef CONFIG_FS_DAX
++	init_rwsem(&ei->dax_sem);
++#endif
+ 	inode_init_once(&ei->vfs_inode);
+ }
+ 
