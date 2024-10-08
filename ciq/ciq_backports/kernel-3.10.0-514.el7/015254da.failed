@@ -1,0 +1,120 @@
+zram: use notify_free to account all free notifications
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+commit 015254daf1753003c19c46b90ee85a963260d270
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/015254da.failed
+
+`notify_free' device attribute accounts the number of slot free
+notifications and internally represents the number of zram_free_page()
+calls.  Slot free notifications are sent only when device is used as a
+swap device, hence `notify_free' is used only for swap devices.  Since
+f4659d8e620d08 (zram: support REQ_DISCARD) ZRAM handles yet another one
+free notification (also via zram_free_page() call) -- REQ_DISCARD
+requests, which are sent by a filesystem, whenever some data blocks are
+discarded.  However, there is no way to know the number of notifications
+in the latter case.
+
+Use `notify_free' to account the number of pages freed by
+zram_bio_discard() and zram_slot_free_notify().  Depending on usage
+scenario `notify_free' represents:
+
+ a) the number of pages freed because of slot free notifications, which is
+   equal to the number of swap_slot_free_notify() calls, so there is no
+   behaviour change
+
+ b) the number of pages freed because of REQ_DISCARD notifications
+
+	Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Acked-by: Minchan Kim <minchan@kernel.org>
+	Acked-by: Jerome Marchand <jmarchan@redhat.com>
+	Cc: Nitin Gupta <ngupta@vflare.org>
+	Cc: Chao Yu <chao2.yu@samsung.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 015254daf1753003c19c46b90ee85a963260d270)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/zram/zram_drv.c
+diff --cc drivers/block/zram/zram_drv.c
+index b59c2688c8e7,3b850164c65c..000000000000
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@@ -642,6 -665,45 +642,48 @@@ static int zram_bvec_rw(struct zram *zr
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * zram_bio_discard - handler on discard request
++  * @index: physical block index in PAGE_SIZE units
++  * @offset: byte offset within physical block
++  */
++ static void zram_bio_discard(struct zram *zram, u32 index,
++ 			     int offset, struct bio *bio)
++ {
++ 	size_t n = bio->bi_iter.bi_size;
++ 	struct zram_meta *meta = zram->meta;
++ 
++ 	/*
++ 	 * zram manages data in physical block size units. Because logical block
++ 	 * size isn't identical with physical block size on some arch, we
++ 	 * could get a discard request pointing to a specific offset within a
++ 	 * certain physical block.  Although we can handle this request by
++ 	 * reading that physiclal block and decompressing and partially zeroing
++ 	 * and re-compressing and then re-storing it, this isn't reasonable
++ 	 * because our intent with a discard request is to save memory.  So
++ 	 * skipping this logical block is appropriate here.
++ 	 */
++ 	if (offset) {
++ 		if (n <= (PAGE_SIZE - offset))
++ 			return;
++ 
++ 		n -= (PAGE_SIZE - offset);
++ 		index++;
++ 	}
++ 
++ 	while (n >= PAGE_SIZE) {
++ 		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
++ 		zram_free_page(zram, index);
++ 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
++ 		atomic64_inc(&zram->stats.notify_free);
++ 		index++;
++ 		n -= PAGE_SIZE;
++ 	}
++ }
++ 
+++>>>>>>> 015254daf175 (zram: use notify_free to account all free notifications)
+  static void zram_reset_device(struct zram *zram, bool reset_capacity)
+  {
+  	size_t index;
+diff --git a/Documentation/ABI/testing/sysfs-block-zram b/Documentation/ABI/testing/sysfs-block-zram
+index b13dc993291f..a6148eaf91e5 100644
+--- a/Documentation/ABI/testing/sysfs-block-zram
++++ b/Documentation/ABI/testing/sysfs-block-zram
+@@ -77,11 +77,14 @@ What:		/sys/block/zram<id>/notify_free
+ Date:		August 2010
+ Contact:	Nitin Gupta <ngupta@vflare.org>
+ Description:
+-		The notify_free file is read-only and specifies the number of
+-		swap slot free notifications received by this device. These
+-		notifications are sent to a swap block device when a swap slot
+-		is freed. This statistic is applicable only when this disk is
+-		being used as a swap disk.
++		The notify_free file is read-only. Depending on device usage
++		scenario it may account a) the number of pages freed because
++		of swap slot free notifications or b) the number of pages freed
++		because of REQ_DISCARD requests sent by bio. The former ones
++		are sent to a swap block device when a swap slot is freed, which
++		implies that this disk is being used as a swap disk. The latter
++		ones are sent by filesystem mounted with discard option,
++		whenever some data blocks are getting discarded.
+ 
+ What:		/sys/block/zram<id>/zero_pages
+ Date:		August 2010
+* Unmerged path drivers/block/zram/zram_drv.c
