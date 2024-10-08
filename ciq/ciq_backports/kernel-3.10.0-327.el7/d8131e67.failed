@@ -1,0 +1,398 @@
+ALSA: line6: Consolidate URB unlink and sync helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] line6: Consolidate URB unlink and sync helpers (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 93.88%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit d8131e67f08bc15e54104cb69deb06bad9d87f30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d8131e67.failed
+
+The codes to unlink and sync URBs are identical for both playback and
+capture streams.  Consolidate to single helper functions.
+
+	Tested-by: Chris Rorvick <chris@rorvick.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit d8131e67f08bc15e54104cb69deb06bad9d87f30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/line6/capture.c
+#	drivers/staging/line6/pcm.c
+#	drivers/staging/line6/playback.c
+diff --cc drivers/staging/line6/capture.c
+index 7ed8560f3c0a,1d477d7a42fb..000000000000
+--- a/drivers/staging/line6/capture.c
++++ b/drivers/staging/line6/capture.c
+@@@ -87,57 -85,6 +87,60 @@@ int line6_submit_audio_in_all_urbs(stru
+  }
+  
+  /*
+++<<<<<<< HEAD:drivers/staging/line6/capture.c
+ +	Unlink all currently active capture URBs.
+ +*/
+ +void line6_unlink_audio_in_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = LINE6_ISO_BUFFERS; i--;) {
+ +		if (test_bit(i, &line6pcm->active_urb_in)) {
+ +			if (!test_and_set_bit(i, &line6pcm->unlink_urb_in)) {
+ +				struct urb *u = line6pcm->urb_audio_in[i];
+ +				usb_unlink_urb(u);
+ +			}
+ +		}
+ +	}
+ +}
+ +
+ +/*
+ +	Wait until unlinking of all currently active capture URBs has been
+ +	finished.
+ +*/
+ +void line6_wait_clear_audio_in_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	int timeout = HZ;
+ +	unsigned int i;
+ +	int alive;
+ +
+ +	do {
+ +		alive = 0;
+ +		for (i = LINE6_ISO_BUFFERS; i--;) {
+ +			if (test_bit(i, &line6pcm->active_urb_in))
+ +				alive++;
+ +		}
+ +		if (!alive)
+ +			break;
+ +		set_current_state(TASK_UNINTERRUPTIBLE);
+ +		schedule_timeout(1);
+ +	} while (--timeout > 0);
+ +	if (alive)
+ +		snd_printk(KERN_ERR "timeout: still %d active urbs..\n", alive);
+ +}
+ +
+ +/*
+ +	Unlink all currently active capture URBs, and wait for finishing.
+ +*/
+ +void line6_unlink_wait_clear_audio_in_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	line6_unlink_audio_in_urbs(line6pcm);
+ +	line6_wait_clear_audio_in_urbs(line6pcm);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> d8131e67f08b (ALSA: line6: Consolidate URB unlink and sync helpers):sound/usb/line6/capture.c
+  	Copy data into ALSA capture buffer.
+  */
+  void line6_capture_copy(struct snd_line6_pcm *line6pcm, char *fbuf, int fsize)
+diff --cc drivers/staging/line6/pcm.c
+index cfc50624f3e2,677419dcacf9..000000000000
+--- a/drivers/staging/line6/pcm.c
++++ b/drivers/staging/line6/pcm.c
+@@@ -61,44 -54,83 +61,85 @@@ static ssize_t pcm_set_impulse_volume(s
+  		line6_pcm_acquire(line6pcm, LINE6_BITS_PCM_IMPULSE);
+  	else
+  		line6_pcm_release(line6pcm, LINE6_BITS_PCM_IMPULSE);
+ -	return 1;
+ -}
+  
+ -/* impulse response period controls */
+ -static int snd_line6_impulse_period_info(struct snd_kcontrol *kcontrol,
+ -					 struct snd_ctl_elem_info *uinfo)
+ -{
+ -	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+ -	uinfo->count = 1;
+ -	uinfo->value.integer.min = 0;
+ -	uinfo->value.integer.max = 2000;
+ -	return 0;
+ +	return count;
+  }
+  
+ -static int snd_line6_impulse_period_get(struct snd_kcontrol *kcontrol,
+ -					struct snd_ctl_elem_value *ucontrol)
+ +/*
+ +	"read" request on "impulse_period" special file.
+ +*/
+ +static ssize_t pcm_get_impulse_period(struct device *dev,
+ +				      struct device_attribute *attr, char *buf)
+  {
+ -	struct snd_line6_pcm *line6pcm = snd_kcontrol_chip(kcontrol);
+ -
+ -	ucontrol->value.integer.value[0] = line6pcm->impulse_period;
+ -	return 0;
+ +	return sprintf(buf, "%d\n", dev2pcm(dev)->impulse_period);
+  }
+  
+ -static int snd_line6_impulse_period_put(struct snd_kcontrol *kcontrol,
+ -					struct snd_ctl_elem_value *ucontrol)
+ +/*
+ +	"write" request on "impulse_period" special file.
+ +*/
+ +static ssize_t pcm_set_impulse_period(struct device *dev,
+ +				      struct device_attribute *attr,
+ +				      const char *buf, size_t count)
+  {
+ -	struct snd_line6_pcm *line6pcm = snd_kcontrol_chip(kcontrol);
+ -	int value = ucontrol->value.integer.value[0];
+ +	int value;
+ +	int ret;
+  
+ -	if (line6pcm->impulse_period == value)
+ -		return 0;
+ +	ret = kstrtoint(buf, 10, &value);
+ +	if (ret < 0)
+ +		return ret;
+  
+ -	line6pcm->impulse_period = value;
+ -	return 1;
+ +	dev2pcm(dev)->impulse_period = value;
+ +	return count;
+  }
+  
+ +static DEVICE_ATTR(impulse_volume, S_IWUSR | S_IRUGO, pcm_get_impulse_volume,
+ +		   pcm_set_impulse_volume);
+ +static DEVICE_ATTR(impulse_period, S_IWUSR | S_IRUGO, pcm_get_impulse_period,
+ +		   pcm_set_impulse_period);
+ +
+ +#endif
+ +
++ /*
++ 	Unlink all currently active URBs.
++ */
++ static void line6_unlink_audio_urbs(struct snd_line6_pcm *line6pcm,
++ 				    struct line6_pcm_stream *pcms)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < LINE6_ISO_BUFFERS; i++) {
++ 		if (test_bit(i, &pcms->active_urbs)) {
++ 			if (!test_and_set_bit(i, &pcms->unlink_urbs))
++ 				usb_unlink_urb(pcms->urbs[i]);
++ 		}
++ 	}
++ }
++ 
++ /*
++ 	Wait until unlinking of all currently active URBs has been finished.
++ */
++ static void line6_wait_clear_audio_urbs(struct snd_line6_pcm *line6pcm,
++ 					struct line6_pcm_stream *pcms)
++ {
++ 	int timeout = HZ;
++ 	int i;
++ 	int alive;
++ 
++ 	do {
++ 		alive = 0;
++ 		for (i = 0; i < LINE6_ISO_BUFFERS; i++) {
++ 			if (test_bit(i, &pcms->active_urbs))
++ 				alive++;
++ 		}
++ 		if (!alive)
++ 			break;
++ 		set_current_state(TASK_UNINTERRUPTIBLE);
++ 		schedule_timeout(1);
++ 	} while (--timeout > 0);
++ 	if (alive)
++ 		snd_printk(KERN_ERR "timeout: still %d active urbs..\n", alive);
++ }
++ 
+  static bool test_flags(unsigned long flags0, unsigned long flags1,
+  		       unsigned long mask)
+  {
+@@@ -198,15 -234,19 +239,15 @@@ pcm_acquire_error
+  
+  int line6_pcm_release(struct snd_line6_pcm *line6pcm, int channels)
+  {
+ -	unsigned long flags_old, flags_new;
+ -
+ -	do {
+ -		flags_old = ACCESS_ONCE(line6pcm->flags);
+ -		flags_new = flags_old & ~channels;
+ -	} while (cmpxchg(&line6pcm->flags, flags_old, flags_new) != flags_old);
+ +	unsigned long flags_old =
+ +	    __sync_fetch_and_and(&line6pcm->flags, ~channels);
+ +	unsigned long flags_new = flags_old & ~channels;
+  
+  	if (test_flags(flags_new, flags_old, LINE6_BITS_CAPTURE_STREAM))
+- 		line6_unlink_audio_in_urbs(line6pcm);
++ 		line6_unlink_audio_urbs(line6pcm, &line6pcm->in);
+  
+  	if (test_flags(flags_new, flags_old, LINE6_BITS_CAPTURE_BUFFER)) {
+- 		line6_wait_clear_audio_in_urbs(line6pcm);
++ 		line6_wait_clear_audio_urbs(line6pcm, &line6pcm->in);
+  		line6_free_capture_buffer(line6pcm);
+  	}
+  
+@@@ -321,26 -366,25 +362,43 @@@ static struct snd_kcontrol_new line6_co
+  /*
+  	Cleanup the PCM device.
+  */
+- static void line6_cleanup_pcm(struct snd_pcm *pcm)
++ static void cleanup_urbs(struct line6_pcm_stream *pcms)
+  {
+  	int i;
+- 	struct snd_line6_pcm *line6pcm = snd_pcm_chip(pcm);
+  
+++<<<<<<< HEAD:drivers/staging/line6/pcm.c
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	device_remove_file(line6pcm->line6->ifcdev, &dev_attr_impulse_volume);
+ +	device_remove_file(line6pcm->line6->ifcdev, &dev_attr_impulse_period);
+ +#endif
+ +
+ +	for (i = LINE6_ISO_BUFFERS; i--;) {
+ +		if (line6pcm->urb_audio_out[i]) {
+ +			usb_kill_urb(line6pcm->urb_audio_out[i]);
+ +			usb_free_urb(line6pcm->urb_audio_out[i]);
+ +		}
+ +		if (line6pcm->urb_audio_in[i]) {
+ +			usb_kill_urb(line6pcm->urb_audio_in[i]);
+ +			usb_free_urb(line6pcm->urb_audio_in[i]);
+ +		}
+ +	}
+++=======
++ 	for (i = 0; i < LINE6_ISO_BUFFERS; i++) {
++ 		if (pcms->urbs[i]) {
++ 			usb_kill_urb(pcms->urbs[i]);
++ 			usb_free_urb(pcms->urbs[i]);
++ 		}
++ 	}
++ }
++ 
++ static void line6_cleanup_pcm(struct snd_pcm *pcm)
++ {
++ 	struct snd_line6_pcm *line6pcm = snd_pcm_chip(pcm);
++ 
++ 	cleanup_urbs(&line6pcm->out);
++ 	cleanup_urbs(&line6pcm->in);
++ 	kfree(line6pcm);
+++>>>>>>> d8131e67f08b (ALSA: line6: Consolidate URB unlink and sync helpers):sound/usb/line6/pcm.c
+  }
+  
+  /* create a PCM device */
+@@@ -397,12 -418,10 +455,19 @@@ static void pcm_disconnect_substream(st
+  */
+  void line6_pcm_disconnect(struct snd_line6_pcm *line6pcm)
+  {
+++<<<<<<< HEAD:drivers/staging/line6/pcm.c
+ +	pcm_disconnect_substream(get_substream
+ +				 (line6pcm, SNDRV_PCM_STREAM_CAPTURE));
+ +	pcm_disconnect_substream(get_substream
+ +				 (line6pcm, SNDRV_PCM_STREAM_PLAYBACK));
+ +	line6_unlink_wait_clear_audio_out_urbs(line6pcm);
+ +	line6_unlink_wait_clear_audio_in_urbs(line6pcm);
+++=======
++ 	line6_unlink_audio_urbs(line6pcm, &line6pcm->out);
++ 	line6_unlink_audio_urbs(line6pcm, &line6pcm->in);
++ 	line6_wait_clear_audio_urbs(line6pcm, &line6pcm->out);
++ 	line6_wait_clear_audio_urbs(line6pcm, &line6pcm->in);
+++>>>>>>> d8131e67f08b (ALSA: line6: Consolidate URB unlink and sync helpers):sound/usb/line6/pcm.c
+  }
+  
+  /*
+diff --cc drivers/staging/line6/playback.c
+index d11db09086cb,3820ed08b342..000000000000
+--- a/drivers/staging/line6/playback.c
++++ b/drivers/staging/line6/playback.c
+@@@ -293,61 -290,10 +293,64 @@@ int line6_submit_audio_out_all_urbs(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/line6/playback.c
+ +/*
+ +	Unlink all currently active playback URBs.
+ +*/
+ +void line6_unlink_audio_out_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = LINE6_ISO_BUFFERS; i--;) {
+ +		if (test_bit(i, &line6pcm->active_urb_out)) {
+ +			if (!test_and_set_bit(i, &line6pcm->unlink_urb_out)) {
+ +				struct urb *u = line6pcm->urb_audio_out[i];
+ +				usb_unlink_urb(u);
+ +			}
+ +		}
+ +	}
+ +}
+ +
+ +/*
+ +	Wait until unlinking of all currently active playback URBs has been
+ +	finished.
+ +*/
+ +void line6_wait_clear_audio_out_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	int timeout = HZ;
+ +	unsigned int i;
+ +	int alive;
+ +
+ +	do {
+ +		alive = 0;
+ +		for (i = LINE6_ISO_BUFFERS; i--;) {
+ +			if (test_bit(i, &line6pcm->active_urb_out))
+ +				alive++;
+ +		}
+ +		if (!alive)
+ +			break;
+ +		set_current_state(TASK_UNINTERRUPTIBLE);
+ +		schedule_timeout(1);
+ +	} while (--timeout > 0);
+ +	if (alive)
+ +		snd_printk(KERN_ERR "timeout: still %d active urbs..\n", alive);
+ +}
+ +
+ +/*
+ +	Unlink all currently active playback URBs, and wait for finishing.
+ +*/
+ +void line6_unlink_wait_clear_audio_out_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	line6_unlink_audio_out_urbs(line6pcm);
+ +	line6_wait_clear_audio_out_urbs(line6pcm);
+ +}
+ +
+++=======
+++>>>>>>> d8131e67f08b (ALSA: line6: Consolidate URB unlink and sync helpers):sound/usb/line6/playback.c
+  void line6_free_playback_buffer(struct snd_line6_pcm *line6pcm)
+  {
+ -	kfree(line6pcm->out.buffer);
+ -	line6pcm->out.buffer = NULL;
+ +	kfree(line6pcm->buffer_out);
+ +	line6pcm->buffer_out = NULL;
+  }
+  
+  /*
+* Unmerged path drivers/staging/line6/capture.c
+diff --git a/drivers/staging/line6/capture.h b/drivers/staging/line6/capture.h
+index 4157bcb598a9..56753a3adedf 100644
+--- a/drivers/staging/line6/capture.h
++++ b/drivers/staging/line6/capture.h
+@@ -26,10 +26,6 @@ extern void line6_capture_check_period(struct snd_line6_pcm *line6pcm,
+ extern int line6_create_audio_in_urbs(struct snd_line6_pcm *line6pcm);
+ extern void line6_free_capture_buffer(struct snd_line6_pcm *line6pcm);
+ extern int line6_submit_audio_in_all_urbs(struct snd_line6_pcm *line6pcm);
+-extern void line6_unlink_audio_in_urbs(struct snd_line6_pcm *line6pcm);
+-extern void line6_unlink_wait_clear_audio_in_urbs(struct snd_line6_pcm
+-						  *line6pcm);
+-extern void line6_wait_clear_audio_in_urbs(struct snd_line6_pcm *line6pcm);
+ extern int snd_line6_capture_trigger(struct snd_line6_pcm *line6pcm, int cmd);
+ 
+ #endif
+* Unmerged path drivers/staging/line6/pcm.c
+* Unmerged path drivers/staging/line6/playback.c
+diff --git a/drivers/staging/line6/playback.h b/drivers/staging/line6/playback.h
+index 743bd6f74c57..a1b78f4ad046 100644
+--- a/drivers/staging/line6/playback.h
++++ b/drivers/staging/line6/playback.h
+@@ -32,10 +32,6 @@ extern struct snd_pcm_ops snd_line6_playback_ops;
+ extern int line6_create_audio_out_urbs(struct snd_line6_pcm *line6pcm);
+ extern void line6_free_playback_buffer(struct snd_line6_pcm *line6pcm);
+ extern int line6_submit_audio_out_all_urbs(struct snd_line6_pcm *line6pcm);
+-extern void line6_unlink_audio_out_urbs(struct snd_line6_pcm *line6pcm);
+-extern void line6_unlink_wait_clear_audio_out_urbs(struct snd_line6_pcm
+-						   *line6pcm);
+-extern void line6_wait_clear_audio_out_urbs(struct snd_line6_pcm *line6pcm);
+ extern int snd_line6_playback_trigger(struct snd_line6_pcm *line6pcm, int cmd);
+ 
+ #endif
