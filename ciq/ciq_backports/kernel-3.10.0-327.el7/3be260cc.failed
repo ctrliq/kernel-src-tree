@@ -1,0 +1,152 @@
+md/linear: remove rcu protections in favour of suspend/resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] linear: remove rcu protections in favour of suspend/resume (Jes Sorensen) [1150149 1173510 1194720]
+Rebuild_FUZZ: 97.48%
+commit-author NeilBrown <neilb@suse.de>
+commit 3be260cc18f850873cd32381158e28b0a9a391fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3be260cc.failed
+
+The use of 'rcu' to protect accesses to ->private_data so that
+the ->private_data could be updated predates the introduction
+of mddev_suspend/mddev_resume.
+These are a cleaner mechanism for providing stability while
+swapping in a new ->private data - it is used by level_store()
+to support changing of raid levels.
+
+So get rid of the RCU stuff and just use mddev_suspend, mddev_resume.
+
+As these function call ->quiesce(), we add an empty function for
+linear just like for raid0.
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 3be260cc18f850873cd32381158e28b0a9a391fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/linear.c
+diff --cc drivers/md/linear.c
+index cfa72dcb5f78,b3e717adbc9b..000000000000
+--- a/drivers/md/linear.c
++++ b/drivers/md/linear.c
+@@@ -287,57 -272,51 +270,70 @@@ static void linear_make_request(struct 
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	tmp_dev = which_dev(mddev, bio->bi_sector);
+ +	start_sector = tmp_dev->end_sector - tmp_dev->rdev->sectors;
+ +
+ +
+ +	if (unlikely(bio->bi_sector >= (tmp_dev->end_sector)
+ +		     || (bio->bi_sector < start_sector))) {
+ +		char b[BDEVNAME_SIZE];
+ +
+ +		printk(KERN_ERR
+ +		       "md/linear:%s: make_request: Sector %llu out of bounds on "
+ +		       "dev %s: %llu sectors, offset %llu\n",
+ +		       mdname(mddev),
+ +		       (unsigned long long)bio->bi_sector,
+ +		       bdevname(tmp_dev->rdev->bdev, b),
+ +		       (unsigned long long)tmp_dev->rdev->sectors,
+ +		       (unsigned long long)start_sector);
+ +		rcu_read_unlock();
+ +		bio_io_error(bio);
+ +		return;
+ +	}
+ +	if (unlikely(bio_end_sector(bio) > tmp_dev->end_sector)) {
+ +		/* This bio crosses a device boundary, so we have to
+ +		 * split it.
+ +		 */
+ +		struct bio_pair *bp;
+ +		sector_t end_sector = tmp_dev->end_sector;
+ +
+ +		rcu_read_unlock();
+ +
+ +		bp = bio_split(bio, end_sector - bio->bi_sector);
+++=======
++ 	do {
++ 		tmp_dev = which_dev(mddev, bio->bi_iter.bi_sector);
++ 		start_sector = tmp_dev->end_sector - tmp_dev->rdev->sectors;
++ 		end_sector = tmp_dev->end_sector;
++ 		data_offset = tmp_dev->rdev->data_offset;
++ 		bio->bi_bdev = tmp_dev->rdev->bdev;
++ 
++ 		if (unlikely(bio->bi_iter.bi_sector >= end_sector ||
++ 			     bio->bi_iter.bi_sector < start_sector))
++ 			goto out_of_bounds;
+++>>>>>>> 3be260cc18f8 (md/linear: remove rcu protections in favour of suspend/resume)
+  
+ -		if (unlikely(bio_end_sector(bio) > end_sector)) {
+ -			/* This bio crosses a device boundary, so we have to
+ -			 * split it.
+ -			 */
+ -			split = bio_split(bio, end_sector -
+ -					  bio->bi_iter.bi_sector,
+ -					  GFP_NOIO, fs_bio_set);
+ -			bio_chain(split, bio);
+ -		} else {
+ -			split = bio;
+ -		}
+ +		linear_make_request(mddev, &bp->bio1);
+ +		linear_make_request(mddev, &bp->bio2);
+ +		bio_pair_release(bp);
+ +		return;
+ +	}
+ +		    
+ +	bio->bi_bdev = tmp_dev->rdev->bdev;
+ +	bio->bi_sector = bio->bi_sector - start_sector
+ +		+ tmp_dev->rdev->data_offset;
+ +	rcu_read_unlock();
+ +
+ +	if (unlikely((bio->bi_rw & REQ_DISCARD) &&
+ +		     !blk_queue_discard(bdev_get_queue(bio->bi_bdev)))) {
+ +		/* Just ignore it */
+ +		bio_endio(bio, 0);
+ +		return;
+ +	}
+  
+ -		split->bi_iter.bi_sector = split->bi_iter.bi_sector -
+ -			start_sector + data_offset;
+ -
+ -		if (unlikely((split->bi_rw & REQ_DISCARD) &&
+ -			 !blk_queue_discard(bdev_get_queue(split->bi_bdev)))) {
+ -			/* Just ignore it */
+ -			bio_endio(split, 0);
+ -		} else
+ -			generic_make_request(split);
+ -	} while (split != bio);
+ -	return;
+ -
+ -out_of_bounds:
+ -	printk(KERN_ERR
+ -	       "md/linear:%s: make_request: Sector %llu out of bounds on "
+ -	       "dev %s: %llu sectors, offset %llu\n",
+ -	       mdname(mddev),
+ -	       (unsigned long long)bio->bi_iter.bi_sector,
+ -	       bdevname(tmp_dev->rdev->bdev, b),
+ -	       (unsigned long long)tmp_dev->rdev->sectors,
+ -	       (unsigned long long)start_sector);
+ -	bio_io_error(bio);
+ +	generic_make_request(bio);
+  }
+  
+  static void linear_status (struct seq_file *seq, struct mddev *mddev)
+@@@ -346,6 -325,9 +342,12 @@@
+  	seq_printf(seq, " %dk rounding", mddev->chunk_sectors / 2);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void linear_quiesce(struct mddev *mddev, int state)
++ {
++ }
+++>>>>>>> 3be260cc18f8 (md/linear: remove rcu protections in favour of suspend/resume)
+  
+  static struct md_personality linear_personality =
+  {
+* Unmerged path drivers/md/linear.c
