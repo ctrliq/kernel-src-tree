@@ -1,0 +1,368 @@
+xfs: replace xfs_mod_incore_sb_batched
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 0bd5ddedccca4451ac2390d1155b4ab74b990eff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0bd5dded.failed
+
+Introduce helper functions for modifying fields in the superblock
+into xfs_trans.c, the only caller of xfs_mod_incore_sb_batch().  We
+can then use these directly in xfs_trans_unreserve_and_mod_sb() and
+so remove another user of the xfs_mode_incore_sb() API without
+losing any functionality or scalability of the transaction commit
+code..
+
+Based on a patch from Christoph Hellwig.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 0bd5ddedccca4451ac2390d1155b4ab74b990eff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_mount.c
+#	fs/xfs/xfs_mount.h
+#	fs/xfs/xfs_trans.c
+diff --cc fs/xfs/xfs_mount.c
+index 1f0460bd27b8,d748aa73003b..000000000000
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@@ -1335,57 -1353,6 +1335,60 @@@ xfs_mod_incore_sb
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Change more than one field in the in-core superblock structure at a time.
+ + *
+ + * The fields and changes to those fields are specified in the array of
+ + * xfs_mod_sb structures passed in.  Either all of the specified deltas
+ + * will be applied or none of them will.  If any modified field dips below 0,
+ + * then all modifications will be backed out and EINVAL will be returned.
+ + *
+ + * Note that this function may not be used for the superblock values that
+ + * are tracked with the in-memory per-cpu counters - a direct call to
+ + * xfs_icsb_modify_counters is required for these.
+ + */
+ +int
+ +xfs_mod_incore_sb_batch(
+ +	struct xfs_mount	*mp,
+ +	xfs_mod_sb_t		*msb,
+ +	uint			nmsb,
+ +	int			rsvd)
+ +{
+ +	xfs_mod_sb_t		*msbp;
+ +	int			error = 0;
+ +
+ +	/*
+ +	 * Loop through the array of mod structures and apply each individually.
+ +	 * If any fail, then back out all those which have already been applied.
+ +	 * Do all of this within the scope of the m_sb_lock so that all of the
+ +	 * changes will be atomic.
+ +	 */
+ +	spin_lock(&mp->m_sb_lock);
+ +	for (msbp = msb; msbp < (msb + nmsb); msbp++) {
+ +		ASSERT(msbp->msb_field < XFS_SBS_ICOUNT ||
+ +		       msbp->msb_field > XFS_SBS_FDBLOCKS);
+ +
+ +		error = xfs_mod_incore_sb_unlocked(mp, msbp->msb_field,
+ +						   msbp->msb_delta, rsvd);
+ +		if (error)
+ +			goto unwind;
+ +	}
+ +	spin_unlock(&mp->m_sb_lock);
+ +	return 0;
+ +
+ +unwind:
+ +	while (--msbp >= msb) {
+ +		error = xfs_mod_incore_sb_unlocked(mp, msbp->msb_field,
+ +						   -msbp->msb_delta, rsvd);
+ +		ASSERT(error == 0);
+ +	}
+ +	spin_unlock(&mp->m_sb_lock);
+ +	return error;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 0bd5ddedccca (xfs: replace xfs_mod_incore_sb_batched)
+   * xfs_getsb() is called to obtain the buffer for the superblock.
+   * The buffer is returned locked and read in from disk.
+   * The buffer should be released with a call to xfs_brelse().
+diff --cc fs/xfs/xfs_mount.h
+index 77ab2563aabb,1c11512bab83..000000000000
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@@ -309,40 -260,8 +309,43 @@@ xfs_daddr_to_agbno(struct xfs_mount *mp
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Per-cpu superblock locking functions
+ + */
+ +#ifdef HAVE_PERCPU_SB
+ +static inline void
+ +xfs_icsb_lock(xfs_mount_t *mp)
+ +{
+ +	mutex_lock(&mp->m_icsb_mutex);
+ +}
+ +
+ +static inline void
+ +xfs_icsb_unlock(xfs_mount_t *mp)
+ +{
+ +	mutex_unlock(&mp->m_icsb_mutex);
+ +}
+ +#else
+ +#define xfs_icsb_lock(mp)
+ +#define xfs_icsb_unlock(mp)
+ +#endif
+ +
+ +/*
+ + * This structure is for use by the xfs_mod_incore_sb_batch() routine.
+ + * xfs_growfs can specify a few fields which are more than int limit
+ + */
+ +typedef struct xfs_mod_sb {
+ +	xfs_sb_field_t	msb_field;	/* Field to modify, see below */
+ +	int64_t		msb_delta;	/* Change to make to specified field */
+ +} xfs_mod_sb_t;
+ +
+ +/*
+++=======
+++>>>>>>> 0bd5ddedccca (xfs: replace xfs_mod_incore_sb_batched)
+   * Per-ag incore structure, copies of information in agf and agi, to improve the
+ - * performance of allocation group selection.
+ + * performance of allocation group selection. This is defined for the kernel
+ + * only, and hence is defined here instead of in xfs_ag.h. You need the struct
+ + * xfs_mount to be defined to look up a xfs_perag anyway (via mp->m_perag_tree),
+ + * so this doesn't introduce any strange header file dependencies.
+   */
+  typedef struct xfs_perag {
+  	struct xfs_mount *pag_mount;	/* owner filesystem */
+@@@ -397,9 -316,13 +400,19 @@@ extern int	xfs_initialize_perag(xfs_mou
+  
+  extern void	xfs_unmountfs(xfs_mount_t *);
+  extern int	xfs_mod_incore_sb(xfs_mount_t *, xfs_sb_field_t, int64_t, int);
+++<<<<<<< HEAD
+ +extern int	xfs_mod_incore_sb_batch(xfs_mount_t *, xfs_mod_sb_t *,
+ +			uint, int);
+ +extern int	xfs_mount_log_sb(xfs_mount_t *, __int64_t);
+++=======
++ extern int	xfs_mod_icount(struct xfs_mount *mp, int64_t delta);
++ extern int	xfs_mod_ifree(struct xfs_mount *mp, int64_t delta);
++ extern int	xfs_mod_fdblocks(struct xfs_mount *mp, int64_t delta,
++ 				 bool reserved);
++ extern int	xfs_mod_frextents(struct xfs_mount *mp, int64_t delta);
++ 
++ extern int	xfs_mount_log_sb(xfs_mount_t *);
+++>>>>>>> 0bd5ddedccca (xfs: replace xfs_mod_incore_sb_batched)
+  extern struct xfs_buf *xfs_getsb(xfs_mount_t *, int);
+  extern int	xfs_readsb(xfs_mount_t *, int);
+  extern void	xfs_freesb(xfs_mount_t *);
+diff --cc fs/xfs/xfs_trans.c
+index ddcabad67a51,220ef2c906b2..000000000000
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@@ -511,21 -547,15 +552,31 @@@ xfs_sb_mod64
+   */
+  void
+  xfs_trans_unreserve_and_mod_sb(
+- 	xfs_trans_t	*tp)
++ 	struct xfs_trans	*tp)
+  {
+++<<<<<<< HEAD
+ +	xfs_mod_sb_t	msb[9];	/* If you add cases, add entries */
+ +	xfs_mod_sb_t	*msbp;
+ +	xfs_mount_t	*mp = tp->t_mountp;
+ +	/* REFERENCED */
+ +	int		error;
+ +	int		rsvd;
+ +	int64_t		blkdelta = 0;
+ +	int64_t		rtxdelta = 0;
+ +	int64_t		idelta = 0;
+ +	int64_t		ifreedelta = 0;
+ +
+ +	msbp = msb;
+ +	rsvd = (tp->t_flags & XFS_TRANS_RESERVE) != 0;
+++=======
++ 	struct xfs_mount	*mp = tp->t_mountp;
++ 	bool			rsvd = (tp->t_flags & XFS_TRANS_RESERVE) != 0;
++ 	int64_t			blkdelta = 0;
++ 	int64_t			rtxdelta = 0;
++ 	int64_t			idelta = 0;
++ 	int64_t			ifreedelta = 0;
++ 	int			error;
+++>>>>>>> 0bd5ddedccca (xfs: replace xfs_mod_incore_sb_batched)
+  
+  	/* calculate deltas */
+  	if (tp->t_blk_res > 0)
+@@@ -569,77 -596,98 +620,109 @@@
+  			goto out_undo_icount;
+  	}
+  
++ 	if (rtxdelta == 0 && !(tp->t_flags & XFS_TRANS_SB_DIRTY))
++ 		return;
++ 
+  	/* apply remaining deltas */
+++<<<<<<< HEAD
+ +	if (rtxdelta != 0) {
+ +		msbp->msb_field = XFS_SBS_FREXTENTS;
+ +		msbp->msb_delta = rtxdelta;
+ +		msbp++;
+++=======
++ 	spin_lock(&mp->m_sb_lock);
++ 	if (rtxdelta) {
++ 		error = xfs_sb_mod64(&mp->m_sb.sb_frextents, rtxdelta);
++ 		if (error)
++ 			goto out_undo_ifree;
+++>>>>>>> 0bd5ddedccca (xfs: replace xfs_mod_incore_sb_batched)
+  	}
+  
+- 	if (tp->t_flags & XFS_TRANS_SB_DIRTY) {
+- 		if (tp->t_dblocks_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_DBLOCKS;
+- 			msbp->msb_delta = tp->t_dblocks_delta;
+- 			msbp++;
+- 		}
+- 		if (tp->t_agcount_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_AGCOUNT;
+- 			msbp->msb_delta = tp->t_agcount_delta;
+- 			msbp++;
+- 		}
+- 		if (tp->t_imaxpct_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_IMAX_PCT;
+- 			msbp->msb_delta = tp->t_imaxpct_delta;
+- 			msbp++;
+- 		}
+- 		if (tp->t_rextsize_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_REXTSIZE;
+- 			msbp->msb_delta = tp->t_rextsize_delta;
+- 			msbp++;
+- 		}
+- 		if (tp->t_rbmblocks_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_RBMBLOCKS;
+- 			msbp->msb_delta = tp->t_rbmblocks_delta;
+- 			msbp++;
+- 		}
+- 		if (tp->t_rblocks_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_RBLOCKS;
+- 			msbp->msb_delta = tp->t_rblocks_delta;
+- 			msbp++;
+- 		}
+- 		if (tp->t_rextents_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_REXTENTS;
+- 			msbp->msb_delta = tp->t_rextents_delta;
+- 			msbp++;
+- 		}
+- 		if (tp->t_rextslog_delta != 0) {
+- 			msbp->msb_field = XFS_SBS_REXTSLOG;
+- 			msbp->msb_delta = tp->t_rextslog_delta;
+- 			msbp++;
+- 		}
+- 	}
+- 
+- 	/*
+- 	 * If we need to change anything, do it.
+- 	 */
+- 	if (msbp > msb) {
+- 		error = xfs_mod_incore_sb_batch(tp->t_mountp, msb,
+- 			(uint)(msbp - msb), rsvd);
++ 	if (tp->t_dblocks_delta != 0) {
++ 		error = xfs_sb_mod64(&mp->m_sb.sb_dblocks, tp->t_dblocks_delta);
+  		if (error)
+ -			goto out_undo_frextents;
+ +			goto out_undo_ifreecount;
+  	}
+- 
++ 	if (tp->t_agcount_delta != 0) {
++ 		error = xfs_sb_mod32(&mp->m_sb.sb_agcount, tp->t_agcount_delta);
++ 		if (error)
++ 			goto out_undo_dblocks;
++ 	}
++ 	if (tp->t_imaxpct_delta != 0) {
++ 		error = xfs_sb_mod8(&mp->m_sb.sb_imax_pct, tp->t_imaxpct_delta);
++ 		if (error)
++ 			goto out_undo_agcount;
++ 	}
++ 	if (tp->t_rextsize_delta != 0) {
++ 		error = xfs_sb_mod32(&mp->m_sb.sb_rextsize,
++ 				     tp->t_rextsize_delta);
++ 		if (error)
++ 			goto out_undo_imaxpct;
++ 	}
++ 	if (tp->t_rbmblocks_delta != 0) {
++ 		error = xfs_sb_mod32(&mp->m_sb.sb_rbmblocks,
++ 				     tp->t_rbmblocks_delta);
++ 		if (error)
++ 			goto out_undo_rextsize;
++ 	}
++ 	if (tp->t_rblocks_delta != 0) {
++ 		error = xfs_sb_mod64(&mp->m_sb.sb_rblocks, tp->t_rblocks_delta);
++ 		if (error)
++ 			goto out_undo_rbmblocks;
++ 	}
++ 	if (tp->t_rextents_delta != 0) {
++ 		error = xfs_sb_mod64(&mp->m_sb.sb_rextents,
++ 				     tp->t_rextents_delta);
++ 		if (error)
++ 			goto out_undo_rblocks;
++ 	}
++ 	if (tp->t_rextslog_delta != 0) {
++ 		error = xfs_sb_mod8(&mp->m_sb.sb_rextslog,
++ 				     tp->t_rextslog_delta);
++ 		if (error)
++ 			goto out_undo_rextents;
++ 	}
++ 	spin_unlock(&mp->m_sb_lock);
+  	return;
+  
+++<<<<<<< HEAD
+ +out_undo_ifreecount:
+++=======
++ out_undo_rextents:
++ 	if (tp->t_rextents_delta)
++ 		xfs_sb_mod64(&mp->m_sb.sb_rextents, -tp->t_rextents_delta);
++ out_undo_rblocks:
++ 	if (tp->t_rblocks_delta)
++ 		xfs_sb_mod64(&mp->m_sb.sb_rblocks, -tp->t_rblocks_delta);
++ out_undo_rbmblocks:
++ 	if (tp->t_rbmblocks_delta)
++ 		xfs_sb_mod32(&mp->m_sb.sb_rbmblocks, -tp->t_rbmblocks_delta);
++ out_undo_rextsize:
++ 	if (tp->t_rextsize_delta)
++ 		xfs_sb_mod32(&mp->m_sb.sb_rextsize, -tp->t_rextsize_delta);
++ out_undo_imaxpct:
++ 	if (tp->t_rextsize_delta)
++ 		xfs_sb_mod8(&mp->m_sb.sb_imax_pct, -tp->t_imaxpct_delta);
++ out_undo_agcount:
++ 	if (tp->t_agcount_delta)
++ 		xfs_sb_mod32(&mp->m_sb.sb_agcount, -tp->t_agcount_delta);
++ out_undo_dblocks:
++ 	if (tp->t_dblocks_delta)
++ 		xfs_sb_mod64(&mp->m_sb.sb_dblocks, -tp->t_dblocks_delta);
++ out_undo_frextents:
++ 	if (rtxdelta)
++ 		xfs_sb_mod64(&mp->m_sb.sb_frextents, -rtxdelta);
++ out_undo_ifree:
++ 	spin_unlock(&mp->m_sb_lock);
+++>>>>>>> 0bd5ddedccca (xfs: replace xfs_mod_incore_sb_batched)
+  	if (ifreedelta)
+ -		xfs_mod_ifree(mp, -ifreedelta);
+ +		xfs_icsb_modify_counters(mp, XFS_SBS_IFREE, -ifreedelta, rsvd);
+  out_undo_icount:
+  	if (idelta)
+ -		xfs_mod_icount(mp, -idelta);
+ +		xfs_icsb_modify_counters(mp, XFS_SBS_ICOUNT, -idelta, rsvd);
+  out_undo_fdblocks:
+  	if (blkdelta)
+ -		xfs_mod_fdblocks(mp, -blkdelta, rsvd);
+ +		xfs_icsb_modify_counters(mp, XFS_SBS_FDBLOCKS, -blkdelta, rsvd);
+  out:
+  	ASSERT(error == 0);
+  	return;
+* Unmerged path fs/xfs/xfs_mount.c
+* Unmerged path fs/xfs/xfs_mount.h
+* Unmerged path fs/xfs/xfs_trans.c
