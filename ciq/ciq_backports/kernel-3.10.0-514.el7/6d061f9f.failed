@@ -1,0 +1,189 @@
+mm/page_ref: use page_ref helper instead of direct modification of _count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit 6d061f9f6136d477932088c24ce155d7dc785746
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6d061f9f.failed
+
+page_reference manipulation functions are introduced to track down
+reference count change of the page.  Use it instead of direct
+modification of _count.
+
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Johannes Berg <johannes@sipsolutions.net>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Sunil Goutham <sgoutham@cavium.com>
+	Cc: Chris Metcalf <cmetcalf@mellanox.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6d061f9f6136d477932088c24ce155d7dc785746)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/thunder/nicvf_queues.c
+#	mm/filemap.c
+#	net/wireless/util.c
+diff --cc mm/filemap.c
+index 813fbe54f73b,01690338e3d2..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -190,6 -193,30 +190,33 @@@ void __delete_from_page_cache(struct pa
+  	else
+  		cleancache_invalidate_page(mapping, page);
+  
+++<<<<<<< HEAD
+++=======
++ 	VM_BUG_ON_PAGE(page_mapped(page), page);
++ 	if (!IS_ENABLED(CONFIG_DEBUG_VM) && unlikely(page_mapped(page))) {
++ 		int mapcount;
++ 
++ 		pr_alert("BUG: Bad page cache in process %s  pfn:%05lx\n",
++ 			 current->comm, page_to_pfn(page));
++ 		dump_page(page, "still mapped when deleted");
++ 		dump_stack();
++ 		add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
++ 
++ 		mapcount = page_mapcount(page);
++ 		if (mapping_exiting(mapping) &&
++ 		    page_count(page) >= mapcount + 2) {
++ 			/*
++ 			 * All vmas have already been torn down, so it's
++ 			 * a good bet that actually the page is unmapped,
++ 			 * and we'd prefer not to leak it: if we're wrong,
++ 			 * some other bad page check should catch it later.
++ 			 */
++ 			page_mapcount_reset(page);
++ 			page_ref_sub(page, mapcount);
++ 		}
++ 	}
++ 
+++>>>>>>> 6d061f9f6136 (mm/page_ref: use page_ref helper instead of direct modification of _count)
+  	page_cache_tree_delete(mapping, page, shadow);
+  
+  	page->mapping = NULL;
+diff --cc net/wireless/util.c
+index 7e4e3fffe7ce,4e809e978b7d..000000000000
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@@ -644,6 -644,96 +644,99 @@@ int ieee80211_data_from_8023(struct sk_
+  }
+  EXPORT_SYMBOL(ieee80211_data_from_8023);
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ __frame_add_frag(struct sk_buff *skb, struct page *page,
++ 		 void *ptr, int len, int size)
++ {
++ 	struct skb_shared_info *sh = skb_shinfo(skb);
++ 	int page_offset;
++ 
++ 	page_ref_inc(page);
++ 	page_offset = ptr - page_address(page);
++ 	skb_add_rx_frag(skb, sh->nr_frags, page, page_offset, len, size);
++ }
++ 
++ static void
++ __ieee80211_amsdu_copy_frag(struct sk_buff *skb, struct sk_buff *frame,
++ 			    int offset, int len)
++ {
++ 	struct skb_shared_info *sh = skb_shinfo(skb);
++ 	const skb_frag_t *frag = &sh->frags[-1];
++ 	struct page *frag_page;
++ 	void *frag_ptr;
++ 	int frag_len, frag_size;
++ 	int head_size = skb->len - skb->data_len;
++ 	int cur_len;
++ 
++ 	frag_page = virt_to_head_page(skb->head);
++ 	frag_ptr = skb->data;
++ 	frag_size = head_size;
++ 
++ 	while (offset >= frag_size) {
++ 		offset -= frag_size;
++ 		frag++;
++ 		frag_page = skb_frag_page(frag);
++ 		frag_ptr = skb_frag_address(frag);
++ 		frag_size = skb_frag_size(frag);
++ 	}
++ 
++ 	frag_ptr += offset;
++ 	frag_len = frag_size - offset;
++ 
++ 	cur_len = min(len, frag_len);
++ 
++ 	__frame_add_frag(frame, frag_page, frag_ptr, cur_len, frag_size);
++ 	len -= cur_len;
++ 
++ 	while (len > 0) {
++ 		frag++;
++ 		frag_len = skb_frag_size(frag);
++ 		cur_len = min(len, frag_len);
++ 		__frame_add_frag(frame, skb_frag_page(frag),
++ 				 skb_frag_address(frag), cur_len, frag_len);
++ 		len -= cur_len;
++ 	}
++ }
++ 
++ static struct sk_buff *
++ __ieee80211_amsdu_copy(struct sk_buff *skb, unsigned int hlen,
++ 		       int offset, int len, bool reuse_frag)
++ {
++ 	struct sk_buff *frame;
++ 	int cur_len = len;
++ 
++ 	if (skb->len - offset < len)
++ 		return NULL;
++ 
++ 	/*
++ 	 * When reusing framents, copy some data to the head to simplify
++ 	 * ethernet header handling and speed up protocol header processing
++ 	 * in the stack later.
++ 	 */
++ 	if (reuse_frag)
++ 		cur_len = min_t(int, len, 32);
++ 
++ 	/*
++ 	 * Allocate and reserve two bytes more for payload
++ 	 * alignment since sizeof(struct ethhdr) is 14.
++ 	 */
++ 	frame = dev_alloc_skb(hlen + sizeof(struct ethhdr) + 2 + cur_len);
++ 
++ 	skb_reserve(frame, hlen + sizeof(struct ethhdr) + 2);
++ 	skb_copy_bits(skb, offset, skb_put(frame, cur_len), cur_len);
++ 
++ 	len -= cur_len;
++ 	if (!len)
++ 		return frame;
++ 
++ 	offset += cur_len;
++ 	__ieee80211_amsdu_copy_frag(skb, frame, offset, len);
++ 
++ 	return frame;
++ }
+++>>>>>>> 6d061f9f6136 (mm/page_ref: use page_ref helper instead of direct modification of _count)
+  
+  void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
+  			      const u8 *addr, enum nl80211_iftype iftype,
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_queues.c
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_queues.c
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index 8114541f327c..3aabfc0adefe 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -920,7 +920,7 @@ static inline int qede_realloc_rx_buffer(struct qede_dev *edev,
+ 		 * network stack to take the ownership of the page
+ 		 * which can be recycled multiple times by the driver.
+ 		 */
+-		atomic_inc(&curr_cons->data->_count);
++		page_ref_inc(curr_cons->data);
+ 		qede_reuse_page(edev, rxq, curr_cons);
+ 	}
+ 
+* Unmerged path mm/filemap.c
+* Unmerged path net/wireless/util.c
