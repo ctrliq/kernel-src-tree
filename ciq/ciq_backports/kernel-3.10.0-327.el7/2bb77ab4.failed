@@ -1,0 +1,258 @@
+bonding: Call dev_kfree_skby_any instead of kfree_skb.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] bonding: Call dev_kfree_skby_any instead of kfree_skb (Nikolay Aleksandrov) [1166647]
+Rebuild_FUZZ: 99.07%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 2bb77ab42a6a40162a367b80394b96bb756ad5f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2bb77ab4.failed
+
+Replace kfree_skb with dev_kfree_skb_any in functions that can
+be called in hard irq and other contexts.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2bb77ab42a6a40162a367b80394b96bb756ad5f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_3ad.c
+index dc508c87249d,dee2a84a2929..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -2474,31 -2464,23 +2474,38 @@@ int bond_3ad_xmit_xor(struct sk_buff *s
+  	if (slave_agg_no >= 0) {
+  		pr_err("%s: Error: Couldn't find a slave to tx on for aggregator ID %d\n",
+  		       dev->name, agg_id);
+ -		goto err_free;
+ +		goto out;
+  	}
+  
+ -	/* we couldn't find any suitable slave after the agg_no, so use the
+ -	 * first suitable found, if found.
+ -	 */
+ -	if (first_ok_slave)
+ -		bond_dev_queue_xmit(bond, skb, first_ok_slave->dev);
+ -	else
+ -		goto err_free;
+ +	start_at = slave;
+ +
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		int slave_agg_id = 0;
+ +		struct aggregator *agg = SLAVE_AD_INFO(slave).port.aggregator;
+ +
+ +		if (agg)
+ +			slave_agg_id = agg->aggregator_identifier;
+ +
+ +		if (SLAVE_IS_OK(slave) && agg && (slave_agg_id == agg_id)) {
+ +			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +			break;
+ +		}
+ +	}
+  
+  out:
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+ +	}
+ +
+  	return NETDEV_TX_OK;
+++<<<<<<< HEAD
+++=======
++ err_free:
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ 	goto out;
+++>>>>>>> 2bb77ab42a6a (bonding: Call dev_kfree_skby_any instead of kfree_skb.)
+  }
+  
+  int bond_3ad_lacpdu_recv(const struct sk_buff *skb, struct bonding *bond,
+diff --cc drivers/net/bonding/bond_alb.c
+index c0b6155b648d,9cf836b67b15..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -1426,27 -1448,24 +1426,33 @@@ int bond_alb_xmit(struct sk_buff *skb, 
+  	}
+  
+  	if (tx_slave && SLAVE_IS_OK(tx_slave)) {
+ -		if (tx_slave != rcu_dereference(bond->curr_active_slave)) {
+ -			ether_addr_copy(eth_data->h_source,
+ -					tx_slave->dev->dev_addr);
+ +		if (tx_slave != bond->curr_active_slave) {
+ +			memcpy(eth_data->h_source,
+ +			       tx_slave->dev->dev_addr,
+ +			       ETH_ALEN);
+  		}
+  
+ -		bond_dev_queue_xmit(bond, skb, tx_slave->dev);
+ -		goto out;
+ +		res = bond_dev_queue_xmit(bond, skb, tx_slave->dev);
+ +	} else {
+ +		if (tx_slave) {
+ +			_lock_tx_hashtbl(bond);
+ +			__tlb_clear_slave(bond, tx_slave, 0);
+ +			_unlock_tx_hashtbl(bond);
+ +		}
+  	}
+  
+ -	if (tx_slave) {
+ -		_lock_tx_hashtbl(bond);
+ -		__tlb_clear_slave(bond, tx_slave, 0);
+ -		_unlock_tx_hashtbl(bond);
+ -	}
+ +	read_unlock(&bond->curr_slave_lock);
+  
+++<<<<<<< HEAD
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+ +	}
+++=======
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ out:
+++>>>>>>> 2bb77ab42a6a (bonding: Call dev_kfree_skby_any instead of kfree_skb.)
+  	return NETDEV_TX_OK;
+  }
+  
+diff --cc drivers/net/bonding/bond_main.c
+index fe3f9d12b71e,e717db301d46..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -3840,6 -3511,79 +3840,82 @@@ unwind
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * bond_xmit_slave_id - transmit skb through slave with slave_id
++  * @bond: bonding device that is transmitting
++  * @skb: buffer to transmit
++  * @slave_id: slave id up to slave_cnt-1 through which to transmit
++  *
++  * This function tries to transmit through slave with slave_id but in case
++  * it fails, it tries to find the first available slave for transmission.
++  * The skb is consumed in all cases, thus the function is void.
++  */
++ static void bond_xmit_slave_id(struct bonding *bond, struct sk_buff *skb, int slave_id)
++ {
++ 	struct list_head *iter;
++ 	struct slave *slave;
++ 	int i = slave_id;
++ 
++ 	/* Here we start from the slave with slave_id */
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (--i < 0) {
++ 			if (slave_can_tx(slave)) {
++ 				bond_dev_queue_xmit(bond, skb, slave->dev);
++ 				return;
++ 			}
++ 		}
++ 	}
++ 
++ 	/* Here we start from the first slave up to slave_id */
++ 	i = slave_id;
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (--i < 0)
++ 			break;
++ 		if (slave_can_tx(slave)) {
++ 			bond_dev_queue_xmit(bond, skb, slave->dev);
++ 			return;
++ 		}
++ 	}
++ 	/* no slave that can tx has been found */
++ 	dev_kfree_skb_any(skb);
++ }
++ 
++ /**
++  * bond_rr_gen_slave_id - generate slave id based on packets_per_slave
++  * @bond: bonding device to use
++  *
++  * Based on the value of the bonding device's packets_per_slave parameter
++  * this function generates a slave id, which is usually used as the next
++  * slave to transmit through.
++  */
++ static u32 bond_rr_gen_slave_id(struct bonding *bond)
++ {
++ 	u32 slave_id;
++ 	struct reciprocal_value reciprocal_packets_per_slave;
++ 	int packets_per_slave = bond->params.packets_per_slave;
++ 
++ 	switch (packets_per_slave) {
++ 	case 0:
++ 		slave_id = prandom_u32();
++ 		break;
++ 	case 1:
++ 		slave_id = bond->rr_tx_counter;
++ 		break;
++ 	default:
++ 		reciprocal_packets_per_slave =
++ 			bond->params.reciprocal_packets_per_slave;
++ 		slave_id = reciprocal_divide(bond->rr_tx_counter,
++ 					     reciprocal_packets_per_slave);
++ 		break;
++ 	}
++ 	bond->rr_tx_counter++;
++ 
++ 	return slave_id;
++ }
++ 
+++>>>>>>> 2bb77ab42a6a (bonding: Call dev_kfree_skby_any instead of kfree_skb.)
+  static int bond_xmit_roundrobin(struct sk_buff *skb, struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+@@@ -3902,15 -3619,12 +3978,21 @@@ static int bond_xmit_activebackup(struc
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+  	struct slave *slave;
+ +	int res = 1;
+  
+ -	slave = rcu_dereference(bond->curr_active_slave);
+ +	slave = bond->curr_active_slave;
+  	if (slave)
+++<<<<<<< HEAD
+ +		res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +
+ +	if (res)
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+++=======
++ 		bond_dev_queue_xmit(bond, skb, slave->dev);
++ 	else
++ 		dev_kfree_skb_any(skb);
+++>>>>>>> 2bb77ab42a6a (bonding: Call dev_kfree_skby_any instead of kfree_skb.)
+  
+  	return NETDEV_TX_OK;
+  }
+@@@ -4101,14 -3771,12 +4183,19 @@@ static netdev_tx_t bond_start_xmit(stru
+  	if (is_netpoll_tx_blocked(dev))
+  		return NETDEV_TX_BUSY;
+  
+ -	rcu_read_lock();
+ -	if (bond_has_slaves(bond))
+ +	read_lock(&bond->lock);
+ +
+ +	if (bond->slave_cnt)
+  		ret = __bond_start_xmit(skb, dev);
+  	else
+++<<<<<<< HEAD
+ +		kfree_skb(skb);
+ +
+ +	read_unlock(&bond->lock);
+++=======
++ 		dev_kfree_skb_any(skb);
++ 	rcu_read_unlock();
+++>>>>>>> 2bb77ab42a6a (bonding: Call dev_kfree_skby_any instead of kfree_skb.)
+  
+  	return ret;
+  }
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_alb.c
+* Unmerged path drivers/net/bonding/bond_main.c
