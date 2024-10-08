@@ -1,0 +1,599 @@
+HID: hid-input: allow input_configured callback return errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hid] input: allow input_configured callback return errors (Benjamin Tissoires) [1311883]
+Rebuild_FUZZ: 92.04%
+commit-author Dmitry Torokhov <dmitry.torokhov@gmail.com>
+commit b2c68a2f1bab3e3d3bf4ab2b5fcd94cd37f61b41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b2c68a2f.failed
+
+When configuring input device via input_configured callback we may
+encounter errors (for example input_mt_init_slots() may fail). Instead
+of continuing with half-initialized input device let's allow driver
+indicate failures.
+
+	Signed-off-by: Jaikumar Ganesh <jaikumarg@android.com>
+	Signed-off-by: Arve Hjønnevåg <arve@android.com>
+	Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Reviewed-by: David Herrmann <dh.herrmann@gmail.com>
+	Acked-by: Nikolai Kondrashov <Nikolai.Kondrashov@redhat.com>
+	Acked-by: Andrew Duggan <aduggan@synaptics.com>
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit b2c68a2f1bab3e3d3bf4ab2b5fcd94cd37f61b41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/hid-elo.c
+#	drivers/hid/hid-lenovo.c
+#	drivers/hid/hid-logitech-hidpp.c
+#	drivers/hid/hid-multitouch.c
+#	drivers/hid/hid-rmi.c
+#	drivers/hid/hid-sony.c
+#	drivers/hid/hid-uclogic.c
+diff --cc drivers/hid/hid-multitouch.c
+index ac1a207a60ca,2ed42d8f805b..000000000000
+--- a/drivers/hid/hid-multitouch.c
++++ b/drivers/hid/hid-multitouch.c
+@@@ -753,11 -748,17 +754,14 @@@ static int mt_touch_input_configured(st
+  
+  	/* check for clickpads */
+  	if ((td->mt_flags & INPUT_MT_POINTER) && (td->buttons_count == 1))
+ -		td->is_buttonpad = true;
+ -
+ -	if (td->is_buttonpad)
+  		__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
+  
+- 	input_mt_init_slots(input, td->maxcontacts, td->mt_flags);
++ 	ret = input_mt_init_slots(input, td->maxcontacts, td->mt_flags);
++ 	if (ret)
++ 		return ret;
+  
+  	td->mt_flags = 0;
++ 	return 0;
+  }
+  
+  static int mt_input_mapping(struct hid_device *hdev, struct hid_input *hi,
+@@@ -907,10 -939,20 +911,18 @@@ static int mt_input_configured(struct h
+  	struct mt_device *td = hid_get_drvdata(hdev);
+  	char *name;
+  	const char *suffix = NULL;
+- 
+- 	if (hi->report->id == td->mt_report_id)
+- 		mt_touch_input_configured(hdev, hi);
+++<<<<<<< HEAD
+++=======
++ 	struct hid_field *field = hi->report->field[0];
++ 	int ret;
+++>>>>>>> b2c68a2f1bab (HID: hid-input: allow input_configured callback return errors)
++ 
++ 	if (hi->report->id == td->mt_report_id) {
++ 		ret = mt_touch_input_configured(hdev, hi);
++ 		if (ret)
++ 			return ret;
++ 	}
+  
+ -	/*
+ -	 * some egalax touchscreens have "application == HID_DG_TOUCHSCREEN"
+ -	 * for the stylus. Check this first, and then rely on the application
+ -	 * field.
+ -	 */
+  	if (hi->report->field[0]->physical == HID_DG_STYLUS) {
+  		suffix = "Pen";
+  		/* force BTN_STYLUS to allow tablet matching in udev */
+diff --cc drivers/hid/hid-rmi.c
+index 0816d6a3139e,67cd059a8f46..000000000000
+--- a/drivers/hid/hid-rmi.c
++++ b/drivers/hid/hid-rmi.c
+@@@ -762,8 -1185,11 +762,14 @@@ static int rmi_input_configured(struct 
+  	hid_dbg(hdev, "Opening low level driver\n");
+  	ret = hid_hw_open(hdev);
+  	if (ret)
+- 		return;
++ 		return ret;
++ 
+++<<<<<<< HEAD
+++=======
++ 	if (!(data->device_flags & RMI_DEVICE))
++ 		return 0;
+  
+++>>>>>>> b2c68a2f1bab (HID: hid-input: allow input_configured callback return errors)
+  	/* Allow incoming hid reports */
+  	hid_device_io_start(hdev);
+  
+diff --cc drivers/hid/hid-sony.c
+index 312098e4af4f,774cd2210566..000000000000
+--- a/drivers/hid/hid-sony.c
++++ b/drivers/hid/hid-sony.c
+@@@ -117,43 -1308,79 +117,77 @@@ static int sony_raw_event(struct hid_de
+  	return 0;
+  }
+  
+ -static int sony_mapping(struct hid_device *hdev, struct hid_input *hi,
+ -			struct hid_field *field, struct hid_usage *usage,
+ -			unsigned long **bit, int *max)
+ +/*
+ + * The Sony Sixaxis does not handle HID Output Reports on the Interrupt EP
+ + * like it should according to usbhid/hid-core.c::usbhid_output_raw_report()
+ + * so we need to override that forcing HID Output Reports on the Control EP.
+ + *
+ + * There is also another issue about HID Output Reports via USB, the Sixaxis
+ + * does not want the report_id as part of the data packet, so we have to
+ + * discard buf[0] when sending the actual control message, even for numbered
+ + * reports, humpf!
+ + */
+ +static int sixaxis_usb_output_raw_report(struct hid_device *hid, __u8 *buf,
+ +		size_t count, unsigned char report_type)
+  {
+ -	struct sony_sc *sc = hid_get_drvdata(hdev);
+ -
+ -	if (sc->quirks & BUZZ_CONTROLLER) {
+ -		unsigned int key = usage->hid & HID_USAGE;
+ -
+ -		if ((usage->hid & HID_USAGE_PAGE) != HID_UP_BUTTON)
+ -			return -1;
+ -
+ -		switch (usage->collection_index) {
+ -		case 1:
+ -			if (key >= ARRAY_SIZE(buzz_keymap))
+ -				return -1;
+ -
+ -			key = buzz_keymap[key];
+ -			if (!key)
+ -				return -1;
+ -			break;
+ -		default:
+ -			return -1;
+ -		}
+ +	struct usb_interface *intf = to_usb_interface(hid->dev.parent);
+ +	struct usb_device *dev = interface_to_usbdev(intf);
+ +	struct usb_host_interface *interface = intf->cur_altsetting;
+ +	int report_id = buf[0];
+ +	int ret;
+  
+ -		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, key);
+ -		return 1;
+++<<<<<<< HEAD
+ +	if (report_type == HID_OUTPUT_REPORT) {
+ +		/* Don't send the Report ID */
+ +		buf++;
+ +		count--;
+  	}
+  
+ -	if (sc->quirks & PS3REMOTE)
+ -		return ps3remote_mapping(hdev, hi, field, usage, bit, max);
+ +	ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
+ +		HID_REQ_SET_REPORT,
+ +		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+ +		((report_type + 1) << 8) | report_id,
+ +		interface->desc.bInterfaceNumber, buf, count,
+ +		USB_CTRL_SET_TIMEOUT);
+  
+ -	/* Let hid-core decide for the others */
+ -	return 0;
+ -}
+ -
+ -static int sony_register_touchpad(struct hid_input *hi, int touch_count,
+ -					int w, int h)
+ -{
+ -	struct input_dev *input_dev = hi->input;
+ -	int ret;
+ +	/* Count also the Report ID, in case of an Output report. */
+ +	if (ret > 0 && report_type == HID_OUTPUT_REPORT)
+ +		ret++;
+  
+ +	return ret;
+++=======
++ 	ret = input_mt_init_slots(input_dev, touch_count, 0);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	input_set_abs_params(input_dev, ABS_MT_POSITION_X, 0, w, 0, 0);
++ 	input_set_abs_params(input_dev, ABS_MT_POSITION_Y, 0, h, 0, 0);
++ 
++ 	return 0;
++ }
++ 
++ static int sony_input_configured(struct hid_device *hdev,
++ 					struct hid_input *hidinput)
++ {
++ 	struct sony_sc *sc = hid_get_drvdata(hdev);
++ 	int ret;
++ 
++ 	/*
++ 	 * The Dualshock 4 touchpad supports 2 touches and has a
++ 	 * resolution of 1920x942 (44.86 dots/mm).
++ 	 */
++ 	if (sc->quirks & DUALSHOCK4_CONTROLLER) {
++ 		ret = sony_register_touchpad(hidinput, 2, 1920, 942);
++ 		if (ret) {
++ 			hid_err(sc->hdev,
++ 				"Unable to initialize multi-touch slots: %d\n",
++ 				ret);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	return 0;
+++>>>>>>> b2c68a2f1bab (HID: hid-input: allow input_configured callback return errors)
+  }
+  
+  /*
+diff --cc drivers/hid/hid-uclogic.c
+index fb8b516ff0ed,85ac43517e3f..000000000000
+--- a/drivers/hid/hid-uclogic.c
++++ b/drivers/hid/hid-uclogic.c
+@@@ -626,6 -716,233 +626,236 @@@ static __u8 *uclogic_report_fixup(struc
+  	return rdesc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int uclogic_input_mapping(struct hid_device *hdev, struct hid_input *hi,
++ 		struct hid_field *field, struct hid_usage *usage,
++ 		unsigned long **bit, int *max)
++ {
++ 	struct uclogic_drvdata *drvdata = hid_get_drvdata(hdev);
++ 
++ 	/* discard the unused pen interface */
++ 	if ((drvdata->ignore_pen_usage) &&
++ 	    (field->application == HID_DG_PEN))
++ 		return -1;
++ 
++ 	/* let hid-core decide what to do */
++ 	return 0;
++ }
++ 
++ static int uclogic_input_configured(struct hid_device *hdev,
++ 		struct hid_input *hi)
++ {
++ 	char *name;
++ 	const char *suffix = NULL;
++ 	struct hid_field *field;
++ 	size_t len;
++ 
++ 	/* no report associated (HID_QUIRK_MULTI_INPUT not set) */
++ 	if (!hi->report)
++ 		return 0;
++ 
++ 	field = hi->report->field[0];
++ 
++ 	switch (field->application) {
++ 	case HID_GD_KEYBOARD:
++ 		suffix = "Keyboard";
++ 		break;
++ 	case HID_GD_MOUSE:
++ 		suffix = "Mouse";
++ 		break;
++ 	case HID_GD_KEYPAD:
++ 		suffix = "Pad";
++ 		break;
++ 	case HID_DG_PEN:
++ 		suffix = "Pen";
++ 		break;
++ 	case HID_CP_CONSUMER_CONTROL:
++ 		suffix = "Consumer Control";
++ 		break;
++ 	case HID_GD_SYSTEM_CONTROL:
++ 		suffix = "System Control";
++ 		break;
++ 	}
++ 
++ 	if (suffix) {
++ 		len = strlen(hdev->name) + 2 + strlen(suffix);
++ 		name = devm_kzalloc(&hi->input->dev, len, GFP_KERNEL);
++ 		if (name) {
++ 			snprintf(name, len, "%s %s", hdev->name, suffix);
++ 			hi->input->name = name;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * Enable fully-functional tablet mode and determine device parameters.
++  *
++  * @hdev:	HID device
++  */
++ static int uclogic_tablet_enable(struct hid_device *hdev)
++ {
++ 	int rc;
++ 	struct usb_device *usb_dev = hid_to_usb_dev(hdev);
++ 	struct uclogic_drvdata *drvdata = hid_get_drvdata(hdev);
++ 	__le16 *buf = NULL;
++ 	size_t len;
++ 	s32 params[UCLOGIC_PH_ID_NUM];
++ 	s32 resolution;
++ 	__u8 *p;
++ 	s32 v;
++ 
++ 	/*
++ 	 * Read string descriptor containing tablet parameters. The specific
++ 	 * string descriptor and data were discovered by sniffing the Windows
++ 	 * driver traffic.
++ 	 * NOTE: This enables fully-functional tablet mode.
++ 	 */
++ 	len = UCLOGIC_PRM_NUM * sizeof(*buf);
++ 	buf = kmalloc(len, GFP_KERNEL);
++ 	if (buf == NULL) {
++ 		hid_err(hdev, "failed to allocate parameter buffer\n");
++ 		rc = -ENOMEM;
++ 		goto cleanup;
++ 	}
++ 	rc = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
++ 				USB_REQ_GET_DESCRIPTOR, USB_DIR_IN,
++ 				(USB_DT_STRING << 8) + 0x64,
++ 				0x0409, buf, len,
++ 				USB_CTRL_GET_TIMEOUT);
++ 	if (rc == -EPIPE) {
++ 		hid_err(hdev, "device parameters not found\n");
++ 		rc = -ENODEV;
++ 		goto cleanup;
++ 	} else if (rc < 0) {
++ 		hid_err(hdev, "failed to get device parameters: %d\n", rc);
++ 		rc = -ENODEV;
++ 		goto cleanup;
++ 	} else if (rc != len) {
++ 		hid_err(hdev, "invalid device parameters\n");
++ 		rc = -ENODEV;
++ 		goto cleanup;
++ 	}
++ 
++ 	/* Extract device parameters */
++ 	params[UCLOGIC_PH_ID_X_LM] = le16_to_cpu(buf[UCLOGIC_PRM_X_LM]);
++ 	params[UCLOGIC_PH_ID_Y_LM] = le16_to_cpu(buf[UCLOGIC_PRM_Y_LM]);
++ 	params[UCLOGIC_PH_ID_PRESSURE_LM] =
++ 		le16_to_cpu(buf[UCLOGIC_PRM_PRESSURE_LM]);
++ 	resolution = le16_to_cpu(buf[UCLOGIC_PRM_RESOLUTION]);
++ 	if (resolution == 0) {
++ 		params[UCLOGIC_PH_ID_X_PM] = 0;
++ 		params[UCLOGIC_PH_ID_Y_PM] = 0;
++ 	} else {
++ 		params[UCLOGIC_PH_ID_X_PM] = params[UCLOGIC_PH_ID_X_LM] *
++ 						1000 / resolution;
++ 		params[UCLOGIC_PH_ID_Y_PM] = params[UCLOGIC_PH_ID_Y_LM] *
++ 						1000 / resolution;
++ 	}
++ 
++ 	/* Allocate fixed report descriptor */
++ 	drvdata->rdesc = devm_kzalloc(&hdev->dev,
++ 				sizeof(uclogic_tablet_rdesc_template),
++ 				GFP_KERNEL);
++ 	if (drvdata->rdesc == NULL) {
++ 		hid_err(hdev, "failed to allocate fixed rdesc\n");
++ 		rc = -ENOMEM;
++ 		goto cleanup;
++ 	}
++ 	drvdata->rsize = sizeof(uclogic_tablet_rdesc_template);
++ 
++ 	/* Format fixed report descriptor */
++ 	memcpy(drvdata->rdesc, uclogic_tablet_rdesc_template,
++ 		drvdata->rsize);
++ 	for (p = drvdata->rdesc;
++ 	     p <= drvdata->rdesc + drvdata->rsize - 4;) {
++ 		if (p[0] == 0xFE && p[1] == 0xED && p[2] == 0x1D &&
++ 		    p[3] < ARRAY_SIZE(params)) {
++ 			v = params[p[3]];
++ 			put_unaligned(cpu_to_le32(v), (s32 *)p);
++ 			p += 4;
++ 		} else {
++ 			p++;
++ 		}
++ 	}
++ 
++ 	rc = 0;
++ 
++ cleanup:
++ 	kfree(buf);
++ 	return rc;
++ }
++ 
++ static int uclogic_probe(struct hid_device *hdev,
++ 		const struct hid_device_id *id)
++ {
++ 	int rc;
++ 	struct usb_interface *intf = to_usb_interface(hdev->dev.parent);
++ 	struct uclogic_drvdata *drvdata;
++ 
++ 	/*
++ 	 * libinput requires the pad interface to be on a different node
++ 	 * than the pen, so use QUIRK_MULTI_INPUT for all tablets.
++ 	 */
++ 	hdev->quirks |= HID_QUIRK_MULTI_INPUT;
++ 	hdev->quirks |= HID_QUIRK_NO_EMPTY_INPUT;
++ 
++ 	/* Allocate and assign driver data */
++ 	drvdata = devm_kzalloc(&hdev->dev, sizeof(*drvdata), GFP_KERNEL);
++ 	if (drvdata == NULL)
++ 		return -ENOMEM;
++ 
++ 	hid_set_drvdata(hdev, drvdata);
++ 
++ 	switch (id->product) {
++ 	case USB_DEVICE_ID_HUION_TABLET:
++ 		/* If this is the pen interface */
++ 		if (intf->cur_altsetting->desc.bInterfaceNumber == 0) {
++ 			rc = uclogic_tablet_enable(hdev);
++ 			if (rc) {
++ 				hid_err(hdev, "tablet enabling failed\n");
++ 				return rc;
++ 			}
++ 			drvdata->invert_pen_inrange = true;
++ 		} else {
++ 			drvdata->ignore_pen_usage = true;
++ 		}
++ 		break;
++ 	}
++ 
++ 	rc = hid_parse(hdev);
++ 	if (rc) {
++ 		hid_err(hdev, "parse failed\n");
++ 		return rc;
++ 	}
++ 
++ 	rc = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
++ 	if (rc) {
++ 		hid_err(hdev, "hw start failed\n");
++ 		return rc;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int uclogic_raw_event(struct hid_device *hdev, struct hid_report *report,
++ 			u8 *data, int size)
++ {
++ 	struct uclogic_drvdata *drvdata = hid_get_drvdata(hdev);
++ 
++ 	if ((drvdata->invert_pen_inrange) &&
++ 	    (report->type == HID_INPUT_REPORT) &&
++ 	    (report->id == UCLOGIC_PEN_REPORT_ID) &&
++ 	    (size >= 2))
++ 		/* Invert the in-range bit */
++ 		data[1] ^= 0x40;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> b2c68a2f1bab (HID: hid-input: allow input_configured callback return errors)
+  static const struct hid_device_id uclogic_devices[] = {
+  	{ HID_USB_DEVICE(USB_VENDOR_ID_UCLOGIC,
+  				USB_DEVICE_ID_UCLOGIC_TABLET_PF1209) },
+* Unmerged path drivers/hid/hid-elo.c
+* Unmerged path drivers/hid/hid-lenovo.c
+* Unmerged path drivers/hid/hid-logitech-hidpp.c
+diff --git a/drivers/hid/hid-appleir.c b/drivers/hid/hid-appleir.c
+index a42e6a394c5e..af78bf264de9 100644
+--- a/drivers/hid/hid-appleir.c
++++ b/drivers/hid/hid-appleir.c
+@@ -256,7 +256,7 @@ out:
+ 	return 0;
+ }
+ 
+-static void appleir_input_configured(struct hid_device *hid,
++static int appleir_input_configured(struct hid_device *hid,
+ 		struct hid_input *hidinput)
+ {
+ 	struct input_dev *input_dev = hidinput->input;
+@@ -275,6 +275,8 @@ static void appleir_input_configured(struct hid_device *hid,
+ 	for (i = 0; i < ARRAY_SIZE(appleir_key_table); i++)
+ 		set_bit(appleir->keymap[i], input_dev->keybit);
+ 	clear_bit(KEY_RESERVED, input_dev->keybit);
++
++	return 0;
+ }
+ 
+ static int appleir_input_mapping(struct hid_device *hid,
+* Unmerged path drivers/hid/hid-elo.c
+diff --git a/drivers/hid/hid-input.c b/drivers/hid/hid-input.c
+index cce94fcc128e..f40c788e6bfa 100644
+--- a/drivers/hid/hid-input.c
++++ b/drivers/hid/hid-input.c
+@@ -1413,8 +1413,9 @@ int hidinput_connect(struct hid_device *hid, unsigned int force)
+ 				 * UGCI) cram a lot of unrelated inputs into the
+ 				 * same interface. */
+ 				hidinput->report = report;
+-				if (drv->input_configured)
+-					drv->input_configured(hid, hidinput);
++				if (drv->input_configured &&
++				    drv->input_configured(hid, hidinput))
++					goto out_cleanup;
+ 				if (input_register_device(hidinput->input))
+ 					goto out_cleanup;
+ 				hidinput = NULL;
+@@ -1435,8 +1436,9 @@ int hidinput_connect(struct hid_device *hid, unsigned int force)
+ 	}
+ 
+ 	if (hidinput) {
+-		if (drv->input_configured)
+-			drv->input_configured(hid, hidinput);
++		if (drv->input_configured &&
++		    drv->input_configured(hid, hidinput))
++			goto out_cleanup;
+ 		if (input_register_device(hidinput->input))
+ 			goto out_cleanup;
+ 	}
+* Unmerged path drivers/hid/hid-lenovo.c
+* Unmerged path drivers/hid/hid-logitech-hidpp.c
+diff --git a/drivers/hid/hid-magicmouse.c b/drivers/hid/hid-magicmouse.c
+index c24f3dfd9367..9ad7bf12e6c5 100644
+--- a/drivers/hid/hid-magicmouse.c
++++ b/drivers/hid/hid-magicmouse.c
+@@ -471,18 +471,22 @@ static int magicmouse_input_mapping(struct hid_device *hdev,
+ 	return 0;
+ }
+ 
+-static void magicmouse_input_configured(struct hid_device *hdev,
++static int magicmouse_input_configured(struct hid_device *hdev,
+ 		struct hid_input *hi)
+ 
+ {
+ 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
++	int ret;
+ 
+-	int ret = magicmouse_setup_input(msc->input, hdev);
++	ret = magicmouse_setup_input(msc->input, hdev);
+ 	if (ret) {
+ 		hid_err(hdev, "magicmouse setup input failed (%d)\n", ret);
+ 		/* clean msc->input to notify probe() of the failure */
+ 		msc->input = NULL;
++		return ret;
+ 	}
++
++	return 0;
+ }
+ 
+ 
+* Unmerged path drivers/hid/hid-multitouch.c
+diff --git a/drivers/hid/hid-ntrig.c b/drivers/hid/hid-ntrig.c
+index 5482156ab4de..46361fd7d4e5 100644
+--- a/drivers/hid/hid-ntrig.c
++++ b/drivers/hid/hid-ntrig.c
+@@ -859,14 +859,14 @@ not_claimed_input:
+ 	return 1;
+ }
+ 
+-static void ntrig_input_configured(struct hid_device *hid,
++static int ntrig_input_configured(struct hid_device *hid,
+ 		struct hid_input *hidinput)
+ 
+ {
+ 	struct input_dev *input = hidinput->input;
+ 
+ 	if (hidinput->report->maxfield < 1)
+-		return;
++		return 0;
+ 
+ 	switch (hidinput->report->field[0]->application) {
+ 	case HID_DG_PEN:
+@@ -890,6 +890,8 @@ static void ntrig_input_configured(struct hid_device *hid,
+ 							"N-Trig MultiTouch";
+ 		break;
+ 	}
++
++	return 0;
+ }
+ 
+ static int ntrig_probe(struct hid_device *hdev, const struct hid_device_id *id)
+* Unmerged path drivers/hid/hid-rmi.c
+* Unmerged path drivers/hid/hid-sony.c
+* Unmerged path drivers/hid/hid-uclogic.c
+diff --git a/include/linux/hid.h b/include/linux/hid.h
+index 537af3092265..bca3067adfba 100644
+--- a/include/linux/hid.h
++++ b/include/linux/hid.h
+@@ -658,8 +658,8 @@ struct hid_driver {
+ 	int (*input_mapped)(struct hid_device *hdev,
+ 			struct hid_input *hidinput, struct hid_field *field,
+ 			struct hid_usage *usage, unsigned long **bit, int *max);
+-	void (*input_configured)(struct hid_device *hdev,
+-				 struct hid_input *hidinput);
++	int (*input_configured)(struct hid_device *hdev,
++				struct hid_input *hidinput);
+ 	void (*feature_mapping)(struct hid_device *hdev,
+ 			struct hid_field *field,
+ 			struct hid_usage *usage);
