@@ -1,0 +1,255 @@
+KVM: PPC: Book3S HV: Remove RMA-related variables from code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s_hv: Remove RMA-related variables from code (Thomas Huth) [1287973]
+Rebuild_FUZZ: 93.81%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit 31037ecad275e9ad9bc671c34f72b495cf708ca3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/31037eca.failed
+
+We don't support real-mode areas now that 970 support is removed.
+Remove the remaining details of rma from the code.  Also rename
+rma_setup_done to hpte_setup_done to better reflect the changes.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 31037ecad275e9ad9bc671c34f72b495cf708ca3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_host.h
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/include/asm/kvm_host.h
+index a8a745023181,015773f5bb33..000000000000
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@@ -244,10 -228,8 +244,13 @@@ struct kvm_arch 
+  	int tlbie_lock;
+  	unsigned long lpcr;
+  	unsigned long rmor;
+- 	struct kvm_rma_info *rma;
+  	unsigned long vrma_slb_v;
+++<<<<<<< HEAD
+ +	int rma_setup_done;
+ +	int using_mmu_notifiers;
+++=======
++ 	int hpte_setup_done;
+++>>>>>>> 31037ecad275 (KVM: PPC: Book3S HV: Remove RMA-related variables from code)
+  	u32 hpt_order;
+  	atomic_t vcpus_running;
+  	u32 online_vcores;
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 24c07628d44c,dde14fd64d8e..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -2556,11 -2044,11 +2556,16 @@@ static int kvmppc_vcpu_run_hv(struct kv
+  	}
+  
+  	atomic_inc(&vcpu->kvm->arch.vcpus_running);
+- 	/* Order vcpus_running vs. rma_setup_done, see kvmppc_alloc_reset_hpt */
++ 	/* Order vcpus_running vs. hpte_setup_done, see kvmppc_alloc_reset_hpt */
+  	smp_mb();
+  
+++<<<<<<< HEAD
+ +	/* On the first time here, set up HTAB and VRMA or RMA */
+ +	if (!vcpu->kvm->arch.rma_setup_done) {
+++=======
++ 	/* On the first time here, set up HTAB and VRMA */
++ 	if (!vcpu->kvm->arch.hpte_setup_done) {
+++>>>>>>> 31037ecad275 (KVM: PPC: Book3S HV: Remove RMA-related variables from code)
+  		r = kvmppc_hv_setup_htab_rma(vcpu);
+  		if (r)
+  			goto out;
+@@@ -2933,92 -2281,29 +2938,92 @@@ static int kvmppc_hv_setup_htab_rma(str
+  	psize = vma_kernel_pagesize(vma);
+  	porder = __ilog2(psize);
+  
+ +	/* Is this one of our preallocated RMAs? */
+ +	if (vma->vm_file && vma->vm_file->f_op == &kvm_rma_fops &&
+ +	    hva == vma->vm_start)
+ +		ri = vma->vm_file->private_data;
+ +
+  	up_read(&current->mm->mmap_sem);
+  
+ -	/* We can handle 4k, 64k or 16M pages in the VRMA */
+ -	err = -EINVAL;
+ -	if (!(psize == 0x1000 || psize == 0x10000 ||
+ -	      psize == 0x1000000))
+ -		goto out_srcu;
+ +	if (!ri) {
+ +		/* On POWER7, use VRMA; on PPC970, give up */
+ +		err = -EPERM;
+ +		if (cpu_has_feature(CPU_FTR_ARCH_201)) {
+ +			pr_err("KVM: CPU requires an RMO\n");
+ +			goto out_srcu;
+ +		}
+  
+ -	/* Update VRMASD field in the LPCR */
+ -	senc = slb_pgsize_encoding(psize);
+ -	kvm->arch.vrma_slb_v = senc | SLB_VSID_B_1T |
+ -		(VRMA_VSID << SLB_VSID_SHIFT_1T);
+ -	/* the -4 is to account for senc values starting at 0x10 */
+ -	lpcr = senc << (LPCR_VRMASD_SH - 4);
+ +		/* We can handle 4k, 64k or 16M pages in the VRMA */
+ +		err = -EINVAL;
+ +		if (!(psize == 0x1000 || psize == 0x10000 ||
+ +		      psize == 0x1000000))
+ +			goto out_srcu;
+  
+ -	/* Create HPTEs in the hash page table for the VRMA */
+ -	kvmppc_map_vrma(vcpu, memslot, porder);
+ +		/* Update VRMASD field in the LPCR */
+ +		senc = slb_pgsize_encoding(psize);
+ +		kvm->arch.vrma_slb_v = senc | SLB_VSID_B_1T |
+ +			(VRMA_VSID << SLB_VSID_SHIFT_1T);
+ +		lpcr_mask = LPCR_VRMASD;
+ +		/* the -4 is to account for senc values starting at 0x10 */
+ +		lpcr = senc << (LPCR_VRMASD_SH - 4);
+ +
+ +		/* Create HPTEs in the hash page table for the VRMA */
+ +		kvmppc_map_vrma(vcpu, memslot, porder);
+ +
+ +	} else {
+ +		/* Set up to use an RMO region */
+ +		rma_size = kvm_rma_pages;
+ +		if (rma_size > memslot->npages)
+ +			rma_size = memslot->npages;
+ +		rma_size <<= PAGE_SHIFT;
+ +		rmls = lpcr_rmls(rma_size);
+ +		err = -EINVAL;
+ +		if ((long)rmls < 0) {
+ +			pr_err("KVM: Can't use RMA of 0x%lx bytes\n", rma_size);
+ +			goto out_srcu;
+ +		}
+ +		atomic_inc(&ri->use_count);
+ +		kvm->arch.rma = ri;
+ +
+ +		/* Update LPCR and RMOR */
+ +		if (cpu_has_feature(CPU_FTR_ARCH_201)) {
+ +			/* PPC970; insert RMLS value (split field) in HID4 */
+ +			lpcr_mask = (1ul << HID4_RMLS0_SH) |
+ +				(3ul << HID4_RMLS2_SH) | HID4_RMOR;
+ +			lpcr = ((rmls >> 2) << HID4_RMLS0_SH) |
+ +				((rmls & 3) << HID4_RMLS2_SH);
+ +			/* RMOR is also in HID4 */
+ +			lpcr |= ((ri->base_pfn >> (26 - PAGE_SHIFT)) & 0xffff)
+ +				<< HID4_RMOR_SH;
+ +		} else {
+ +			/* POWER7 */
+ +			lpcr_mask = LPCR_VPM0 | LPCR_VRMA_L | LPCR_RMLS;
+ +			lpcr = rmls << LPCR_RMLS_SH;
+ +			kvm->arch.rmor = ri->base_pfn << PAGE_SHIFT;
+ +		}
+ +		pr_info("KVM: Using RMO at %lx size %lx (LPCR = %lx)\n",
+ +			ri->base_pfn << PAGE_SHIFT, rma_size, lpcr);
+ +
+ +		/* Initialize phys addrs of pages in RMO */
+ +		npages = kvm_rma_pages;
+ +		porder = __ilog2(npages);
+ +		physp = memslot->arch.slot_phys;
+ +		if (physp) {
+ +			if (npages > memslot->npages)
+ +				npages = memslot->npages;
+ +			spin_lock(&kvm->arch.slot_phys_lock);
+ +			for (i = 0; i < npages; ++i)
+ +				physp[i] = ((ri->base_pfn + i) << PAGE_SHIFT) +
+ +					porder;
+ +			spin_unlock(&kvm->arch.slot_phys_lock);
+ +		}
+ +	}
+  
+ -	kvmppc_update_lpcr(kvm, lpcr, LPCR_VRMASD);
+ +	kvmppc_update_lpcr(kvm, lpcr, lpcr_mask);
+  
+- 	/* Order updates to kvm->arch.lpcr etc. vs. rma_setup_done */
++ 	/* Order updates to kvm->arch.lpcr etc. vs. hpte_setup_done */
+  	smp_wmb();
+- 	kvm->arch.rma_setup_done = 1;
++ 	kvm->arch.hpte_setup_done = 1;
+  	err = 0;
+   out_srcu:
+  	srcu_read_unlock(&kvm->srcu, srcu_idx);
+* Unmerged path arch/powerpc/include/asm/kvm_host.h
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 8afd9d68ffc0..ca9e1b7eec47 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -120,12 +120,12 @@ long kvmppc_alloc_reset_hpt(struct kvm *kvm, u32 *htab_orderp)
+ 	long order;
+ 
+ 	mutex_lock(&kvm->lock);
+-	if (kvm->arch.rma_setup_done) {
+-		kvm->arch.rma_setup_done = 0;
+-		/* order rma_setup_done vs. vcpus_running */
++	if (kvm->arch.hpte_setup_done) {
++		kvm->arch.hpte_setup_done = 0;
++		/* order hpte_setup_done vs. vcpus_running */
+ 		smp_mb();
+ 		if (atomic_read(&kvm->arch.vcpus_running)) {
+-			kvm->arch.rma_setup_done = 1;
++			kvm->arch.hpte_setup_done = 1;
+ 			goto out;
+ 		}
+ 	}
+@@ -1507,20 +1507,20 @@ static ssize_t kvm_htab_write(struct file *file, const char __user *buf,
+ 	unsigned long tmp[2];
+ 	ssize_t nb;
+ 	long int err, ret;
+-	int rma_setup;
++	int hpte_setup;
+ 
+ 	if (!access_ok(VERIFY_READ, buf, count))
+ 		return -EFAULT;
+ 
+ 	/* lock out vcpus from running while we're doing this */
+ 	mutex_lock(&kvm->lock);
+-	rma_setup = kvm->arch.rma_setup_done;
+-	if (rma_setup) {
+-		kvm->arch.rma_setup_done = 0;	/* temporarily */
+-		/* order rma_setup_done vs. vcpus_running */
++	hpte_setup = kvm->arch.hpte_setup_done;
++	if (hpte_setup) {
++		kvm->arch.hpte_setup_done = 0;	/* temporarily */
++		/* order hpte_setup_done vs. vcpus_running */
+ 		smp_mb();
+ 		if (atomic_read(&kvm->arch.vcpus_running)) {
+-			kvm->arch.rma_setup_done = 1;
++			kvm->arch.hpte_setup_done = 1;
+ 			mutex_unlock(&kvm->lock);
+ 			return -EBUSY;
+ 		}
+@@ -1573,7 +1573,7 @@ static ssize_t kvm_htab_write(struct file *file, const char __user *buf,
+ 				       "r=%lx\n", ret, i, v, r);
+ 				goto out;
+ 			}
+-			if (!rma_setup && is_vrma_hpte(v)) {
++			if (!hpte_setup && is_vrma_hpte(v)) {
+ 				unsigned long psize = hpte_base_page_size(v, r);
+ 				unsigned long senc = slb_pgsize_encoding(psize);
+ 				unsigned long lpcr;
+@@ -1582,7 +1582,7 @@ static ssize_t kvm_htab_write(struct file *file, const char __user *buf,
+ 					(VRMA_VSID << SLB_VSID_SHIFT_1T);
+ 				lpcr = senc << (LPCR_VRMASD_SH - 4);
+ 				kvmppc_update_lpcr(kvm, lpcr, LPCR_VRMASD);
+-				rma_setup = 1;
++				hpte_setup = 1;
+ 			}
+ 			++i;
+ 			hptp += 2;
+@@ -1598,9 +1598,9 @@ static ssize_t kvm_htab_write(struct file *file, const char __user *buf,
+ 	}
+ 
+  out:
+-	/* Order HPTE updates vs. rma_setup_done */
++	/* Order HPTE updates vs. hpte_setup_done */
+ 	smp_wmb();
+-	kvm->arch.rma_setup_done = rma_setup;
++	kvm->arch.hpte_setup_done = hpte_setup;
+ 	mutex_unlock(&kvm->lock);
+ 
+ 	if (err)
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
