@@ -1,0 +1,191 @@
+CIFS: Fix NULL pointer dereference in mid callback
+
+jira LE-1907
+cve CVE-2014-7145
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [fs] cifs: NULL pointer dereference in SMB2_tcon (Jacob Tanenbaum) [1147529] {CVE-2014-7145}
+Rebuild_FUZZ: 79.57%
+commit-author Pavel Shilovsky <pshilov@microsoft.com>
+commit 86a7964be7afaf3df6b64faaa10a7032d2444e51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/86a7964b.failed
+
+There is a race between a system call processing thread
+and the demultiplex thread when mid->resp_buf becomes NULL
+and later is being accessed to get credits. It happens when
+the 1st thread wakes up before a mid callback is called in
+the 2nd one but the mid state has already been set to
+MID_RESPONSE_RECEIVED. This causes NULL pointer dereference
+in mid callback.
+
+Fix this by saving credits from the response before we
+update the mid state and then use this value in the mid
+callback rather then accessing a response buffer.
+
+	Cc: Stable <stable@vger.kernel.org>
+Fixes: ee258d79159afed5 ("CIFS: Move credit processing to mid callbacks for SMB3")
+	Tested-by: Frank Sorenson <sorenson@redhat.com>
+	Reviewed-by: Ronnie Sahlberg <lsahlber@redhat.com>
+	Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 86a7964be7afaf3df6b64faaa10a7032d2444e51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/smb2ops.c
+diff --cc fs/cifs/cifsglob.h
+index de6aed8c78e5,5d2dd04b55a6..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -1228,8 -1513,18 +1228,13 @@@ typedef void (mid_callback_t)(struct mi
+  /* one of these for every pending CIFS request to the server */
+  struct mid_q_entry {
+  	struct list_head qhead;	/* mids waiting on reply from this server */
+ -	struct kref refcount;
+  	struct TCP_Server_Info *server;	/* server corresponding to this mid */
+  	__u64 mid;		/* multiplex id */
+++<<<<<<< HEAD
+++=======
++ 	__u16 credits;		/* number of credits consumed by this mid */
++ 	__u16 credits_received;	/* number of credits from the response */
+++>>>>>>> 86a7964be7af (CIFS: Fix NULL pointer dereference in mid callback)
+  	__u32 pid;		/* process id */
+  	__u32 sequence_number;  /* for CIFS signing */
+  	unsigned long when_alloc;  /* when mid was created */
+diff --cc fs/cifs/smb2ops.c
+index 787844bde384,eb92cd4502cc..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -109,7 -151,91 +109,95 @@@ smb2_get_credits_field(struct TCP_Serve
+  static unsigned int
+  smb2_get_credits(struct mid_q_entry *mid)
+  {
+++<<<<<<< HEAD
+ +	return le16_to_cpu(((struct smb2_hdr *)mid->resp_buf)->CreditRequest);
+++=======
++ 	return mid->credits_received;
++ }
++ 
++ static int
++ smb2_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
++ 		      unsigned int *num, struct cifs_credits *credits)
++ {
++ 	int rc = 0;
++ 	unsigned int scredits;
++ 
++ 	spin_lock(&server->req_lock);
++ 	while (1) {
++ 		if (server->credits <= 0) {
++ 			spin_unlock(&server->req_lock);
++ 			cifs_num_waiters_inc(server);
++ 			rc = wait_event_killable(server->request_q,
++ 				has_credits(server, &server->credits, 1));
++ 			cifs_num_waiters_dec(server);
++ 			if (rc)
++ 				return rc;
++ 			spin_lock(&server->req_lock);
++ 		} else {
++ 			if (server->tcpStatus == CifsExiting) {
++ 				spin_unlock(&server->req_lock);
++ 				return -ENOENT;
++ 			}
++ 
++ 			scredits = server->credits;
++ 			/* can deadlock with reopen */
++ 			if (scredits <= 8) {
++ 				*num = SMB2_MAX_BUFFER_SIZE;
++ 				credits->value = 0;
++ 				credits->instance = 0;
++ 				break;
++ 			}
++ 
++ 			/* leave some credits for reopen and other ops */
++ 			scredits -= 8;
++ 			*num = min_t(unsigned int, size,
++ 				     scredits * SMB2_MAX_BUFFER_SIZE);
++ 
++ 			credits->value =
++ 				DIV_ROUND_UP(*num, SMB2_MAX_BUFFER_SIZE);
++ 			credits->instance = server->reconnect_instance;
++ 			server->credits -= credits->value;
++ 			server->in_flight++;
++ 			if (server->in_flight > server->max_in_flight)
++ 				server->max_in_flight = server->in_flight;
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock(&server->req_lock);
++ 	return rc;
++ }
++ 
++ static int
++ smb2_adjust_credits(struct TCP_Server_Info *server,
++ 		    struct cifs_credits *credits,
++ 		    const unsigned int payload_size)
++ {
++ 	int new_val = DIV_ROUND_UP(payload_size, SMB2_MAX_BUFFER_SIZE);
++ 
++ 	if (!credits->value || credits->value == new_val)
++ 		return 0;
++ 
++ 	if (credits->value < new_val) {
++ 		WARN_ONCE(1, "request has less credits (%d) than required (%d)",
++ 			  credits->value, new_val);
++ 		return -ENOTSUPP;
++ 	}
++ 
++ 	spin_lock(&server->req_lock);
++ 
++ 	if (server->reconnect_instance != credits->instance) {
++ 		spin_unlock(&server->req_lock);
++ 		cifs_server_dbg(VFS, "trying to return %d credits to old session\n",
++ 			 credits->value - new_val);
++ 		return -EAGAIN;
++ 	}
++ 
++ 	server->credits += credits->value - new_val;
++ 	spin_unlock(&server->req_lock);
++ 	wake_up(&server->request_q);
++ 	credits->value = new_val;
++ 	return 0;
+++>>>>>>> 86a7964be7af (CIFS: Fix NULL pointer dereference in mid callback)
+  }
+  
+  static __u64
+* Unmerged path fs/cifs/cifsglob.h
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 20d75b8ddb26..1779b8eba13e 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -666,6 +666,20 @@ dequeue_mid(struct mid_q_entry *mid, bool malformed)
+ 	spin_unlock(&GlobalMid_Lock);
+ }
+ 
++static unsigned int
++smb2_get_credits_from_hdr(char *buffer, struct TCP_Server_Info *server)
++{
++	struct smb2_sync_hdr *shdr = (struct smb2_sync_hdr *)buffer;
++
++	/*
++	 * SMB1 does not use credits.
++	 */
++	if (server->vals->header_preamble_size)
++		return 0;
++
++	return le16_to_cpu(shdr->CreditRequest);
++}
++
+ static void
+ handle_mid(struct mid_q_entry *mid, struct TCP_Server_Info *server,
+ 	   char *buf, int malformed)
+@@ -673,6 +687,7 @@ handle_mid(struct mid_q_entry *mid, struct TCP_Server_Info *server,
+ 	if (server->ops->check_trans2 &&
+ 	    server->ops->check_trans2(mid, server, buf, malformed))
+ 		return;
++	mid->credits_received = smb2_get_credits_from_hdr(buf, server);
+ 	mid->resp_buf = buf;
+ 	mid->large_buf = server->large_buf;
+ 	/* Was previous buf put in mpx struct for multi-rsp? */
+* Unmerged path fs/cifs/smb2ops.c
