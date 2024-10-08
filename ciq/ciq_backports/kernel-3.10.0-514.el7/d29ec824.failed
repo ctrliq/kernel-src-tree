@@ -1,0 +1,917 @@
+nvme: submit internal commands through the block layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit d29ec8241c10eacf59c23b3828a88dbae06e7e3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d29ec824.failed
+
+Use block layer queues with an internal cmd_type to submit internally
+generated NVMe commands.  This both simplifies the code a lot and allow
+for a better structure.  For example now the LighNVM code can construct
+commands without knowing the details of the underlying I/O descriptors.
+Or a future NVMe over network target could inject commands, as well as
+could the SCSI translation and ioctl code be reused for such a beast.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit d29ec8241c10eacf59c23b3828a88dbae06e7e3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	drivers/block/nvme-scsi.c
+diff --cc drivers/block/nvme-core.c
+index a8d9055d2103,03bd638e76dd..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -709,9 -827,11 +731,12 @@@ static int nvme_submit_iod(struct nvme_
+  	writel(nvmeq->sq_tail, nvmeq->q_db);
+  
+  	return 0;
+ +
+  }
+  
++ /*
++  * NOTE: ns is NULL when called on the admin queue.
++  */
+  static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+  			 const struct blk_mq_queue_data *bd)
+  {
+@@@ -765,9 -885,8 +790,14 @@@
+  			goto retry_cmd;
+  
+  		if (blk_rq_bytes(req) !=
+++<<<<<<< HEAD
+ +                    nvme_setup_prps(nvmeq->dev, iod, blk_rq_bytes(req), GFP_ATOMIC)) {
+ +			dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->sg,
+ +					iod->nents, dma_dir);
+++=======
++                     nvme_setup_prps(dev, iod, blk_rq_bytes(req), GFP_ATOMIC)) {
++ 			dma_unmap_sg(dev->dev, iod->sg, iod->nents, dma_dir);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  			goto retry_cmd;
+  		}
+  		if (blk_integrity_rq(req)) {
+@@@ -1425,9 -1599,10 +1507,9 @@@ static int nvme_shutdown_ctrl(struct nv
+  }
+  
+  static struct blk_mq_ops nvme_mq_admin_ops = {
+- 	.queue_rq	= nvme_admin_queue_rq,
++ 	.queue_rq	= nvme_queue_rq,
+  	.map_queue	= blk_mq_map_queue,
+  	.init_hctx	= nvme_admin_init_hctx,
+ -	.exit_hctx	= nvme_exit_hctx,
+  	.init_request	= nvme_admin_init_request,
+  	.timeout	= nvme_timeout,
+  };
+@@@ -1544,78 -1720,6 +1626,81 @@@ static int nvme_configure_admin_queue(s
+  	return result;
+  }
+  
+++<<<<<<< HEAD
+ +struct nvme_iod *nvme_map_user_pages(struct nvme_dev *dev, int write,
+ +				unsigned long addr, unsigned length)
+ +{
+ +	int i, err, count, nents, offset;
+ +	struct scatterlist *sg;
+ +	struct page **pages;
+ +	struct nvme_iod *iod;
+ +
+ +	if (addr & 3)
+ +		return ERR_PTR(-EINVAL);
+ +	if (!length || length > INT_MAX - PAGE_SIZE)
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	offset = offset_in_page(addr);
+ +	count = DIV_ROUND_UP(offset + length, PAGE_SIZE);
+ +	pages = kcalloc(count, sizeof(*pages), GFP_KERNEL);
+ +	if (!pages)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	err = get_user_pages_fast(addr, count, 1, pages);
+ +	if (err < count) {
+ +		count = err;
+ +		err = -EFAULT;
+ +		goto put_pages;
+ +	}
+ +
+ +	err = -ENOMEM;
+ +	iod = __nvme_alloc_iod(count, length, dev, 0, GFP_KERNEL);
+ +	if (!iod)
+ +		goto put_pages;
+ +
+ +	sg = iod->sg;
+ +	sg_init_table(sg, count);
+ +	for (i = 0; i < count; i++) {
+ +		sg_set_page(&sg[i], pages[i],
+ +			    min_t(unsigned, length, PAGE_SIZE - offset),
+ +			    offset);
+ +		length -= (PAGE_SIZE - offset);
+ +		offset = 0;
+ +	}
+ +	sg_mark_end(&sg[i - 1]);
+ +	iod->nents = count;
+ +
+ +	nents = dma_map_sg(&dev->pci_dev->dev, sg, count,
+ +				write ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +	if (!nents)
+ +		goto free_iod;
+ +
+ +	kfree(pages);
+ +	return iod;
+ +
+ + free_iod:
+ +	kfree(iod);
+ + put_pages:
+ +	for (i = 0; i < count; i++)
+ +		put_page(pages[i]);
+ +	kfree(pages);
+ +	return ERR_PTR(err);
+ +}
+ +
+ +void nvme_unmap_user_pages(struct nvme_dev *dev, int write,
+ +			struct nvme_iod *iod)
+ +{
+ +	int i;
+ +
+ +	dma_unmap_sg(&dev->pci_dev->dev, iod->sg, iod->nents,
+ +				write ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +
+ +	for (i = 0; i < iod->nents; i++)
+ +		put_page(sg_page(&iod->sg[i]));
+ +}
+ +
+++=======
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
+  {
+  	struct nvme_dev *dev = ns->dev;
+@@@ -1651,17 -1742,21 +1723,26 @@@
+  		return -EINVAL;
+  	}
+  
+- 	if (IS_ERR(iod))
+- 		return PTR_ERR(iod);
++ 	length = (io.nblocks + 1) << ns->lba_shift;
++ 	meta_len = (io.nblocks + 1) * ns->ms;
++ 	write = io.opcode & 1;
+  
+- 	prp_len = nvme_setup_prps(dev, iod, length, GFP_KERNEL);
+- 	if (length != prp_len) {
+- 		status = -ENOMEM;
+- 		goto unmap;
+- 	}
+  	if (meta_len) {
+++<<<<<<< HEAD
+ +		meta = dma_alloc_coherent(&dev->pci_dev->dev, meta_len,
+ +					  &meta_dma, GFP_KERNEL);
+++=======
++ 		if (((io.metadata & 3) || !io.metadata) && !ns->ext)
++ 			return -EINVAL;
++ 
++ 		if (ns->ext) {
++ 			length += meta_len;
++ 			meta_len = 0;
++ 		}
++ 
++ 		meta = dma_alloc_coherent(dev->dev, meta_len,
++ 						&meta_dma, GFP_KERNEL);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  		if (!meta) {
+  			status = -ENOMEM;
+  			goto unmap;
+@@@ -1686,14 -1781,11 +1767,17 @@@
+  	c.rw.reftag = cpu_to_le32(io.reftag);
+  	c.rw.apptag = cpu_to_le16(io.apptag);
+  	c.rw.appmask = cpu_to_le16(io.appmask);
+- 	c.rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
+- 	c.rw.prp2 = cpu_to_le64(iod->first_dma);
+  	c.rw.metadata = cpu_to_le64(meta_dma);
+- 	status = nvme_submit_sync_cmd(ns->queue, &c);
++ 
++ 	status = __nvme_submit_sync_cmd(ns->queue, &c, NULL,
++ 			(void __user *)io.addr, length, NULL, 0);
+   unmap:
+++<<<<<<< HEAD
+ +	nvme_unmap_user_pages(dev, write, iod);
+ +	nvme_free_iod(dev, iod);
+ +
+++=======
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	if (meta) {
+  		if (status == NVME_SC_SUCCESS && !write) {
+  			if (copy_to_user((void __user *)io.metadata, meta,
+@@@ -1855,30 -1925,14 +1917,41 @@@ static int nvme_revalidate_disk(struct 
+  	struct nvme_ns *ns = disk->private_data;
+  	struct nvme_dev *dev = ns->dev;
+  	struct nvme_id_ns *id;
+++<<<<<<< HEAD
+ +	dma_addr_t dma_addr;
+ +	u8 lbaf;
+ +	u16 old_ms;
+ +	unsigned short bs;
+ +
+ +	id = dma_alloc_coherent(&dev->pci_dev->dev, 4096, &dma_addr,
+ +								GFP_KERNEL);
+ +	if (!id) {
+ +		dev_warn(&dev->pci_dev->dev, "%s: Memory alocation failure\n",
+ +								__func__);
+ +		return 0;
+ +	}
+ +
+ +	if (nvme_identify(dev, ns->ns_id, 0, dma_addr)) {
+ +		dev_warn(&dev->pci_dev->dev,
+ +			"identify failed ns:%d, setting capacity to 0\n",
+ +			ns->ns_id);
+ +		memset(id, 0, sizeof(*id));
+ +	}
+++=======
++ 	u8 lbaf, pi_type;
++ 	u16 old_ms;
++ 	unsigned short bs;
++ 
++ 	if (nvme_identify_ns(dev, ns->ns_id, &id)) {
++ 		dev_warn(dev->dev, "%s: Identify failure\n", __func__);
++ 		return 0;
++ 	}
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+ +
+ +	if (id->ncap == 0) {
+ +		dma_free_coherent(&dev->pci_dev->dev, 4096, id, dma_addr);
+ +		return -ENODEV;
+ +	}
+  
+  	old_ms = ns->ms;
+  	lbaf = id->flbas & NVME_NS_FLBAS_LBA_MASK;
+@@@ -1916,7 -1973,7 +1989,11 @@@
+  	if (dev->oncs & NVME_CTRL_ONCS_DSM)
+  		nvme_config_discard(ns);
+  
+++<<<<<<< HEAD
+ +	dma_free_coherent(&dev->pci_dev->dev, 4096, id, dma_addr);
+++=======
++ 	kfree(id);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	return 0;
+  }
+  
+@@@ -2276,22 -2209,15 +2353,26 @@@ static void nvme_dev_scan(struct work_s
+   */
+  static int nvme_dev_add(struct nvme_dev *dev)
+  {
+ -	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ +	struct pci_dev *pdev = dev->pci_dev;
+  	int res;
+ -	unsigned nn, i;
+ +	unsigned nn;
+  	struct nvme_id_ctrl *ctrl;
+- 	void *mem;
+- 	dma_addr_t dma_addr;
+  	int shift = NVME_CAP_MPSMIN(readq(&dev->bar->cap)) + 12;
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&pdev->dev, 4096, &dma_addr, GFP_KERNEL);
+ +	if (!mem)
+ +		return -ENOMEM;
+ +
+ +	res = nvme_identify(dev, 0, 1, dma_addr);
+ +	if (res) {
+ +		dev_err(&pdev->dev, "Identify Controller failed (%d)\n", res);
+ +		dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+++=======
++ 	res = nvme_identify_ctrl(dev, &ctrl);
++ 	if (res) {
++ 		dev_err(dev->dev, "Identify Controller failed (%d)\n", res);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  		return -EIO;
+  	}
+  
+@@@ -2317,23 -2242,24 +2397,43 @@@
+  		} else
+  			dev->max_hw_sectors = max_hw_sectors;
+  	}
+++<<<<<<< HEAD
+ +	dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+++=======
++ 	kfree(ctrl);
++ 
++ 	dev->tagset.ops = &nvme_mq_ops;
++ 	dev->tagset.nr_hw_queues = dev->online_queues - 1;
++ 	dev->tagset.timeout = NVME_IO_TIMEOUT;
++ 	dev->tagset.numa_node = dev_to_node(dev->dev);
++ 	dev->tagset.queue_depth =
++ 				min_t(int, dev->q_depth, BLK_MQ_MAX_DEPTH) - 1;
++ 	dev->tagset.cmd_size = nvme_cmd_size(dev);
++ 	dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
++ 	dev->tagset.driver_data = dev;
++ 
++ 	if (blk_mq_alloc_tag_set(&dev->tagset))
++ 		return 0;
++ 
++ 	for (i = 1; i <= nn; i++)
++ 		nvme_alloc_ns(dev, i);
+ -
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+ +
+ +	if (!dev->tagset.tags) {
+ +		dev->tagset.ops = &nvme_mq_ops;
+ +		dev->tagset.nr_hw_queues = dev->online_queues - 1;
+ +		dev->tagset.timeout = NVME_IO_TIMEOUT;
+ +		dev->tagset.numa_node = dev_to_node(&dev->pci_dev->dev);
+ +		dev->tagset.queue_depth =
+ +					min_t(int, dev->q_depth, BLK_MQ_MAX_DEPTH) - 1;
+ +		dev->tagset.cmd_size = nvme_cmd_size(dev);
+ +		dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
+ +		dev->tagset.driver_data = dev;
+ +		
+ +		if (blk_mq_alloc_tag_set(&dev->tagset))
+ +			return 0;
+ +	}
+ +	schedule_work(&dev->scan_work);
+  	return 0;
+  }
+  
+diff --cc drivers/block/nvme-scsi.c
+index daa0d50b3bfd,8e6223e5b670..000000000000
+--- a/drivers/block/nvme-scsi.c
++++ b/drivers/block/nvme-scsi.c
+@@@ -536,21 -534,17 +534,27 @@@ static int nvme_trans_standard_inquiry_
+  	u8 cmdque = 0x01 << 1;
+  	u8 fw_offset = sizeof(dev->firmware_rev);
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns),
+ +				&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out_dma;
+ +	}
+ +
+++=======
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	/* nvme ns identify - use DPS value for PROTECT field */
+- 	nvme_sc = nvme_identify(dev, ns->ns_id, 0, dma_addr);
++ 	nvme_sc = nvme_identify_ns(dev, ns->ns_id, &id_ns);
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  	if (res)
+- 		goto out_free;
++ 		return res;
+  
+- 	id_ns = mem;
+- 	(id_ns->dps) ? (protect = 0x01) : (protect = 0);
++ 	if (id_ns->dps)
++ 		protect = 0x01;
++ 	else
++ 		protect = 0;
++ 	kfree(id_ns);
+  
+  	memset(inq_response, 0, STANDARD_INQUIRY_LENGTH);
+  	inq_response[2] = VERSION_SPC_4;
+@@@ -567,13 -561,7 +571,17 @@@
+  	strncpy(&inq_response[32], dev->firmware_rev + fw_offset, 4);
+  
+  	xfer_len = min(alloc_len, STANDARD_INQUIRY_LENGTH);
+++<<<<<<< HEAD
+ +	res = nvme_trans_copy_to_user(hdr, inq_response, xfer_len);
+ +
+ + out_free:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns), mem,
+ +			  dma_addr);
+ + out_dma:
+ +	return res;
+++=======
++ 	return nvme_trans_copy_to_user(hdr, inq_response, xfer_len);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  }
+  
+  static int nvme_trans_supported_vpd_pages(struct nvme_ns *ns,
+@@@ -623,13 -609,6 +629,16 @@@ static int nvme_trans_device_id_page(st
+  	int xfer_len;
+  	__be32 tmp_id = cpu_to_be32(ns->ns_id);
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns),
+ +					&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out_dma;
+ +	}
+ +
+++=======
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	memset(inq_response, 0, alloc_len);
+  	inq_response[1] = INQ_DEVICE_IDENTIFICATION_PAGE;    /* Page Code */
+  	if (readl(&dev->bar->vs) >= NVME_VS(1, 1)) {
+@@@ -680,13 -663,7 +693,17 @@@
+  		memcpy(&inq_response[56], dev->serial, sizeof(dev->serial));
+  	}
+  	xfer_len = alloc_len;
+++<<<<<<< HEAD
+ +	res = nvme_trans_copy_to_user(hdr, inq_response, xfer_len);
+ +
+ + out_free:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns), mem,
+ +			  dma_addr);
+ + out_dma:
+ +	return res;
+++=======
++ 	return nvme_trans_copy_to_user(hdr, inq_response, xfer_len);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  }
+  
+  static int nvme_trans_ext_inq_page(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+@@@ -710,27 -685,21 +725,33 @@@
+  	u8 luiclr = 0x01;
+  
+  	inq_response = kmalloc(EXTENDED_INQUIRY_DATA_PAGE_LENGTH, GFP_KERNEL);
+- 	if (inq_response == NULL) {
+- 		res = -ENOMEM;
+- 		goto out_mem;
+- 	}
++ 	if (inq_response == NULL)
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns),
+ +							&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out_dma;
+ +	}
+ +
+ +	/* nvme ns identify */
+ +	nvme_sc = nvme_identify(dev, ns->ns_id, 0, dma_addr);
+++=======
++ 	nvme_sc = nvme_identify_ns(dev, ns->ns_id, &id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  	if (res)
+- 		goto out_free;
++ 		goto out_free_inq;
++ 
++ 	spt = spt_lut[id_ns->dpc & 0x07] << 3;
++ 	if (id_ns->dps)
++ 		protect = 0x01;
++ 	else
++ 		protect = 0;
++ 	kfree(id_ns);
+  
+- 	id_ns = mem;
+- 	spt = spt_lut[(id_ns->dpc) & 0x07] << 3;
+- 	(id_ns->dps) ? (protect = 0x01) : (protect = 0);
+  	grd_chk = protect << 2;
+  	app_chk = protect << 1;
+  	ref_chk = protect;
+@@@ -758,12 -726,8 +778,15 @@@
+  	xfer_len = min(alloc_len, EXTENDED_INQUIRY_DATA_PAGE_LENGTH);
+  	res = nvme_trans_copy_to_user(hdr, inq_response, xfer_len);
+  
+++<<<<<<< HEAD
+ + out_free:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns), mem,
+ +			  dma_addr);
+ + out_dma:
+++=======
++  out_free_inq:
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	kfree(inq_response);
+-  out_mem:
+  	return res;
+  }
+  
+@@@ -860,27 -820,13 +880,23 @@@ static int nvme_trans_log_info_exceptio
+  	u16 temp_k;
+  
+  	log_response = kzalloc(LOG_INFO_EXCP_PAGE_LENGTH, GFP_KERNEL);
+- 	if (log_response == NULL) {
+- 		res = -ENOMEM;
+- 		goto out_mem;
+- 	}
++ 	if (log_response == NULL)
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev,
+ +					sizeof(struct nvme_smart_log),
+ +					&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out_dma;
+ +	}
+++=======
++ 	res = nvme_get_log_page(dev, &smart_log);
++ 	if (res < 0)
++ 		goto out_free_response;
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  
+- 	/* Get SMART Log Page */
+- 	memset(&c, 0, sizeof(c));
+- 	c.common.opcode = nvme_admin_get_log_page;
+- 	c.common.nsid = cpu_to_le32(0xFFFFFFFF);
+- 	c.common.prp1 = cpu_to_le64(dma_addr);
+- 	c.common.cdw10[0] = cpu_to_le32((((sizeof(struct nvme_smart_log) /
+- 			BYTES_TO_DWORDS) - 1) << 16) | NVME_LOG_SMART);
+- 	res = nvme_submit_sync_cmd(dev->admin_q, &c);
+  	if (res != NVME_SC_SUCCESS) {
+  		temp_c = LOG_TEMP_UNKNOWN;
+  	} else {
+@@@ -904,11 -850,8 +920,14 @@@
+  	xfer_len = min(alloc_len, LOG_INFO_EXCP_PAGE_LENGTH);
+  	res = nvme_trans_copy_to_user(hdr, log_response, xfer_len);
+  
+++<<<<<<< HEAD
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_smart_log),
+ +			  mem, dma_addr);
+ + out_dma:
+++=======
++  out_free_response:
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	kfree(log_response);
+-  out_mem:
+  	return res;
+  }
+  
+@@@ -928,27 -868,13 +944,23 @@@ static int nvme_trans_log_temperature(s
+  	u16 temp_k;
+  
+  	log_response = kzalloc(LOG_TEMP_PAGE_LENGTH, GFP_KERNEL);
+- 	if (log_response == NULL) {
+- 		res = -ENOMEM;
+- 		goto out_mem;
+- 	}
++ 	if (log_response == NULL)
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev,
+ +					sizeof(struct nvme_smart_log),
+ +					&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out_dma;
+ +	}
+++=======
++ 	res = nvme_get_log_page(dev, &smart_log);
++ 	if (res < 0)
++ 		goto out_free_response;
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  
+- 	/* Get SMART Log Page */
+- 	memset(&c, 0, sizeof(c));
+- 	c.common.opcode = nvme_admin_get_log_page;
+- 	c.common.nsid = cpu_to_le32(0xFFFFFFFF);
+- 	c.common.prp1 = cpu_to_le64(dma_addr);
+- 	c.common.cdw10[0] = cpu_to_le32((((sizeof(struct nvme_smart_log) /
+- 			BYTES_TO_DWORDS) - 1) << 16) | NVME_LOG_SMART);
+- 	res = nvme_submit_sync_cmd(dev->admin_q, &c);
+  	if (res != NVME_SC_SUCCESS) {
+  		temp_c_cur = LOG_TEMP_UNKNOWN;
+  	} else {
+@@@ -985,11 -911,8 +997,14 @@@
+  	xfer_len = min(alloc_len, LOG_TEMP_PAGE_LENGTH);
+  	res = nvme_trans_copy_to_user(hdr, log_response, xfer_len);
+  
+++<<<<<<< HEAD
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_smart_log),
+ +			  mem, dma_addr);
+ + out_dma:
+++=======
++  out_free_response:
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	kfree(log_response);
+-  out_mem:
+  	return res;
+  }
+  
+@@@ -1036,20 -957,11 +1049,23 @@@ static int nvme_trans_fill_blk_desc(str
+  	else if (llbaa > 0 && len < MODE_PAGE_LLBAA_BLK_DES_LEN)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns),
+ +							&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	/* nvme ns identify */
+ +	nvme_sc = nvme_identify(dev, ns->ns_id, 0, dma_addr);
+++=======
++ 	nvme_sc = nvme_identify_ns(dev, ns->ns_id, &id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  	if (res)
+- 		goto out_dma;
++ 		return res;
+  
+- 	id_ns = mem;
+  	flbas = (id_ns->flbas) & 0x0F;
+  	lba_length = (1 << (id_ns->lbaf[flbas].ds));
+  
+@@@ -1069,10 -981,7 +1085,14 @@@
+  		memcpy(&resp[12], &tmp_len, sizeof(u32));
+  	}
+  
+++<<<<<<< HEAD
+ + out_dma:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns), mem,
+ +			  dma_addr);
+ + out:
+++=======
++ 	kfree(id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	return res;
+  }
+  
+@@@ -1304,21 -1211,13 +1322,25 @@@ static int nvme_trans_power_state(struc
+  	int lowest_pow_st;	/* max npss = lowest power consumption */
+  	unsigned ps_desired = 0;
+  
+++<<<<<<< HEAD
+ +	/* NVMe Controller Identify */
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev,
+ +				sizeof(struct nvme_id_ctrl),
+ +				&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out;
+ +	}
+ +	nvme_sc = nvme_identify(dev, 0, 1, dma_addr);
+++=======
++ 	nvme_sc = nvme_identify_ctrl(dev, &id_ctrl);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  	if (res)
+- 		goto out_dma;
++ 		return res;
+  
+- 	id_ctrl = mem;
+  	lowest_pow_st = max(POWER_STATE_0, (int)(id_ctrl->npss - 1));
++ 	kfree(id_ctrl);
+  
+  	switch (pc) {
+  	case NVME_POWER_STATE_START_VALID:
+@@@ -1358,13 -1257,7 +1380,17 @@@
+  	}
+  	nvme_sc = nvme_set_features(dev, NVME_FEAT_POWER_MGMT, ps_desired, 0,
+  				    NULL);
+++<<<<<<< HEAD
+ +	res = nvme_trans_status_code(hdr, nvme_sc);
+ +
+ + out_dma:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ctrl), mem,
+ +			  dma_addr);
+ + out:
+ +	return res;
+++=======
++ 	return nvme_trans_status_code(hdr, nvme_sc);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  }
+  
+  static int nvme_trans_send_activate_fw_cmd(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+@@@ -1612,19 -1483,12 +1616,23 @@@ static int nvme_trans_fmt_set_blk_size_
+  	 */
+  
+  	if (ns->mode_select_num_blocks == 0 || ns->mode_select_block_len == 0) {
+++<<<<<<< HEAD
+ +		mem = dma_alloc_coherent(&dev->pci_dev->dev,
+ +			sizeof(struct nvme_id_ns), &dma_addr, GFP_KERNEL);
+ +		if (mem == NULL) {
+ +			res = -ENOMEM;
+ +			goto out;
+ +		}
+ +		/* nvme ns identify */
+ +		nvme_sc = nvme_identify(dev, ns->ns_id, 0, dma_addr);
+++=======
++ 		struct nvme_id_ns *id_ns;
++ 
++ 		nvme_sc = nvme_identify_ns(dev, ns->ns_id, &id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  		res = nvme_trans_status_code(hdr, nvme_sc);
+  		if (res)
+- 			goto out_dma;
+- 
+- 		id_ns = mem;
++ 			return res;
+  
+  		if (ns->mode_select_num_blocks == 0)
+  			ns->mode_select_num_blocks = le64_to_cpu(id_ns->ncap);
+@@@ -1633,12 -1497,11 +1641,17 @@@
+  			ns->mode_select_block_len =
+  						(1 << (id_ns->lbaf[flbas].ds));
+  		}
+++<<<<<<< HEAD
+ + out_dma:
+ +		dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns),
+ +				  mem, dma_addr);
+++=======
++ 
++ 		kfree(id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	}
+-  out:
+- 	return res;
++ 
++ 	return 0;
+  }
+  
+  static int nvme_trans_fmt_get_parm_header(struct sg_io_hdr *hdr, u8 len,
+@@@ -1717,19 -1578,11 +1728,22 @@@ static int nvme_trans_fmt_send_cmd(stru
+  	struct nvme_command c;
+  
+  	/* Loop thru LBAF's in id_ns to match reqd lbaf, put in cdw10 */
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns),
+ +							&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out;
+ +	}
+ +	/* nvme ns identify */
+ +	nvme_sc = nvme_identify(dev, ns->ns_id, 0, dma_addr);
+++=======
++ 	nvme_sc = nvme_identify_ns(dev, ns->ns_id, &id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  	if (res)
+- 		goto out_dma;
++ 		return res;
+  
+- 	id_ns = mem;
+  	flbas = (id_ns->flbas) & 0x0F;
+  	nlbaf = id_ns->nlbaf;
+  
+@@@ -1757,13 -1610,10 +1771,17 @@@
+  	c.format.nsid = cpu_to_le32(ns->ns_id);
+  	c.format.cdw10 = cpu_to_le32(cdw10);
+  
+- 	nvme_sc = nvme_submit_sync_cmd(dev->admin_q, &c);
++ 	nvme_sc = nvme_submit_sync_cmd(dev->admin_q, &c, NULL, 0);
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  
+++<<<<<<< HEAD
+ + out_dma:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns), mem,
+ +			  dma_addr);
+ + out:
+++=======
++ 	kfree(id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	return res;
+  }
+  
+@@@ -2223,19 -2050,10 +2219,21 @@@ static int nvme_trans_read_capacity(str
+  		resp_size = READ_CAP_10_RESP_SIZE;
+  	}
+  
+++<<<<<<< HEAD
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns),
+ +							&dma_addr, GFP_KERNEL);
+ +	if (mem == NULL) {
+ +		res = -ENOMEM;
+ +		goto out;
+ +	}
+ +	/* nvme ns identify */
+ +	nvme_sc = nvme_identify(dev, ns->ns_id, 0, dma_addr);
+++=======
++ 	nvme_sc = nvme_identify_ns(dev, ns->ns_id, &id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  	if (res)
+- 		goto out_dma;
+- 
+- 	id_ns = mem;
++ 		return res;	
+  
+  	response = kzalloc(resp_size, GFP_KERNEL);
+  	if (response == NULL) {
+@@@ -2248,10 -2066,8 +2246,15 @@@
+  	res = nvme_trans_copy_to_user(hdr, response, xfer_len);
+  
+  	kfree(response);
+++<<<<<<< HEAD
+ + out_dma:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ns), mem,
+ +			  dma_addr);
+ + out:
+++=======
++  out_free_id:
++ 	kfree(id_ns);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	return res;
+  }
+  
+@@@ -2278,20 -2092,11 +2279,23 @@@ static int nvme_trans_report_luns(struc
+  	case ALL_LUNS_RETURNED:
+  	case ALL_WELL_KNOWN_LUNS_RETURNED:
+  	case RESTRICTED_LUNS_RETURNED:
+++<<<<<<< HEAD
+ +		/* NVMe Controller Identify */
+ +		mem = dma_alloc_coherent(&dev->pci_dev->dev,
+ +					sizeof(struct nvme_id_ctrl),
+ +					&dma_addr, GFP_KERNEL);
+ +		if (mem == NULL) {
+ +			res = -ENOMEM;
+ +			goto out;
+ +		}
+ +		nvme_sc = nvme_identify(dev, 0, 1, dma_addr);
+++=======
++ 		nvme_sc = nvme_identify_ctrl(dev, &id_ctrl);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  		res = nvme_trans_status_code(hdr, nvme_sc);
+  		if (res)
+- 			goto out_dma;
++ 			return res;
+  
+- 		id_ctrl = mem;
+  		ll_length = le32_to_cpu(id_ctrl->nn) * LUN_ENTRY_SIZE;
+  		resp_size = ll_length + LUN_DATA_HEADER_SIZE;
+  
+@@@ -2328,10 -2133,8 +2332,15 @@@
+  	res = nvme_trans_copy_to_user(hdr, response, xfer_len);
+  
+  	kfree(response);
+++<<<<<<< HEAD
+ + out_dma:
+ +	dma_free_coherent(&dev->pci_dev->dev, sizeof(struct nvme_id_ctrl), mem,
+ +			  dma_addr);
+ + out:
+++=======
++  out_free_id:
++ 	kfree(id_ctrl);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	return res;
+  }
+  
+@@@ -2603,8 -2396,7 +2602,12 @@@ static int nvme_trans_unmap(struct nvme
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	range = dma_alloc_coherent(&dev->pci_dev->dev, ndesc * sizeof(*range),
+ +							&dma_addr, GFP_KERNEL);
+++=======
++ 	range = kcalloc(ndesc, sizeof(*range), GFP_KERNEL);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+  	if (!range)
+  		goto out;
+  
+@@@ -2620,12 -2412,11 +2623,16 @@@
+  	c.dsm.nr = cpu_to_le32(ndesc - 1);
+  	c.dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
+  
+- 	nvme_sc = nvme_submit_sync_cmd(ns->queue, &c);
++ 	nvme_sc = nvme_submit_sync_cmd(ns->queue, &c, range,
++ 			ndesc * sizeof(*range));
+  	res = nvme_trans_status_code(hdr, nvme_sc);
+  
+++<<<<<<< HEAD
+ +	dma_free_coherent(&dev->pci_dev->dev, ndesc * sizeof(*range),
+ +							range, dma_addr);
+++=======
++ 	kfree(range);
+++>>>>>>> d29ec8241c10 (nvme: submit internal commands through the block layer)
+   out:
+  	kfree(plist);
+  	return res;
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path drivers/block/nvme-scsi.c
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index c0535e04f9c4..b44c9a995766 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -146,21 +146,15 @@ static inline u64 nvme_block_nr(struct nvme_ns *ns, sector_t sector)
+ 	return (sector >> (ns->lba_shift - 9));
+ }
+ 
+-/**
+- * nvme_free_iod - frees an nvme_iod
+- * @dev: The device that the I/O was submitted to
+- * @iod: The memory to free
+- */
+-void nvme_free_iod(struct nvme_dev *dev, struct nvme_iod *iod);
+-
+-int nvme_setup_prps(struct nvme_dev *, struct nvme_iod *, int, gfp_t);
+-struct nvme_iod *nvme_map_user_pages(struct nvme_dev *dev, int write,
+-				unsigned long addr, unsigned length);
+-void nvme_unmap_user_pages(struct nvme_dev *dev, int write,
+-			struct nvme_iod *iod);
+-int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd);
+-int nvme_identify(struct nvme_dev *, unsigned nsid, unsigned cns,
+-							dma_addr_t dma_addr);
++int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
++		void *buf, unsigned bufflen);
++int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
++		void *buffer, void __user *ubuffer, unsigned bufflen,
++		u32 *result, unsigned timeout);
++int nvme_identify_ctrl(struct nvme_dev *dev, struct nvme_id_ctrl **id);
++int nvme_identify_ns(struct nvme_dev *dev, unsigned nsid,
++		struct nvme_id_ns **id);
++int nvme_get_log_page(struct nvme_dev *dev, struct nvme_smart_log **log);
+ int nvme_get_features(struct nvme_dev *dev, unsigned fid, unsigned nsid,
+ 			dma_addr_t dma_addr, u32 *result);
+ int nvme_set_features(struct nvme_dev *dev, unsigned fid, unsigned dword11,
