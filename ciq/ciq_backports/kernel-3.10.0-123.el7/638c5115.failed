@@ -1,0 +1,142 @@
+USBNET: support DMA SG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Ming Lei <ming.lei@canonical.com>
+commit 638c5115a794981441246fa8fa5d95c1875af5ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/638c5115.failed
+
+This patch introduces support of DMA SG if the USB host controller
+which usbnet device is attached to is capable of building packet from
+discontinuous buffers.
+
+The patch supports passing the skb fragment buffers to usb stack directly
+via urb->sg.
+
+	Cc: Ben Hutchings <bhutchings@solarflare.com>
+	Cc: Grant Grundler <grundler@google.com>
+	Cc: Freddy Xin <freddy@asix.com.tw>
+	Cc: Alan Stern <stern@rowland.harvard.edu>
+	Acked-by: Oliver Neukum <oneukum@suse.de>
+	Signed-off-by: Ming Lei <ming.lei@canonical.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: David S. Miller <davem@davemloft.net>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 638c5115a794981441246fa8fa5d95c1875af5ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/usb/usbnet.h
+diff --cc include/linux/usb/usbnet.h
+index 8fbc008e183e,2b47e6364e36..000000000000
+--- a/include/linux/usb/usbnet.h
++++ b/include/linux/usb/usbnet.h
+@@@ -34,7 -34,7 +34,11 @@@ struct usbnet 
+  	struct mutex		phy_mutex;
+  	unsigned char		suspend_count;
+  	unsigned char		pkt_cnt, pkt_err;
+++<<<<<<< HEAD
+ +	unsigned short		rx_qlen, tx_qlen;
+++=======
++ 	unsigned		can_dma_sg:1;
+++>>>>>>> 638c5115a794 (USBNET: support DMA SG)
+  
+  	/* i/o info: pipes etc */
+  	unsigned		in, out;
+diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
+index d74de074a438..b0e6eddc0152 100644
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -1223,6 +1223,37 @@ EXPORT_SYMBOL_GPL(usbnet_tx_timeout);
+ 
+ /*-------------------------------------------------------------------------*/
+ 
++static int build_dma_sg(const struct sk_buff *skb, struct urb *urb)
++{
++	unsigned num_sgs, total_len = 0;
++	int i, s = 0;
++
++	num_sgs = skb_shinfo(skb)->nr_frags + 1;
++	if (num_sgs == 1)
++		return 0;
++
++	urb->sg = kmalloc(num_sgs * sizeof(struct scatterlist), GFP_ATOMIC);
++	if (!urb->sg)
++		return -ENOMEM;
++
++	urb->num_sgs = num_sgs;
++	sg_init_table(urb->sg, urb->num_sgs);
++
++	sg_set_buf(&urb->sg[s++], skb->data, skb_headlen(skb));
++	total_len += skb_headlen(skb);
++
++	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
++		struct skb_frag_struct *f = &skb_shinfo(skb)->frags[i];
++
++		total_len += skb_frag_size(f);
++		sg_set_page(&urb->sg[i + s], f->page.p, f->size,
++				f->page_offset);
++	}
++	urb->transfer_buffer_length = total_len;
++
++	return 1;
++}
++
+ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
+ 				     struct net_device *net)
+ {
+@@ -1249,7 +1280,6 @@ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
+ 			goto drop;
+ 		}
+ 	}
+-	length = skb->len;
+ 
+ 	if (!(urb = usb_alloc_urb (0, GFP_ATOMIC))) {
+ 		netif_dbg(dev, tx_err, dev->net, "no urb\n");
+@@ -1259,10 +1289,14 @@ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
+ 	entry = (struct skb_data *) skb->cb;
+ 	entry->urb = urb;
+ 	entry->dev = dev;
+-	entry->length = length;
+ 
+ 	usb_fill_bulk_urb (urb, dev->udev, dev->out,
+ 			skb->data, skb->len, tx_complete, skb);
++	if (dev->can_dma_sg) {
++		if (build_dma_sg(skb, urb) < 0)
++			goto drop;
++	}
++	entry->length = length = urb->transfer_buffer_length;
+ 
+ 	/* don't assume the hardware handles USB_ZERO_PACKET
+ 	 * NOTE:  strictly conforming cdc-ether devices should expect
+@@ -1331,7 +1365,10 @@ drop:
+ not_drop:
+ 		if (skb)
+ 			dev_kfree_skb_any (skb);
+-		usb_free_urb (urb);
++		if (urb) {
++			kfree(urb->sg);
++			usb_free_urb(urb);
++		}
+ 	} else
+ 		netif_dbg(dev, tx_queued, dev->net,
+ 			  "> tx, len %d, type 0x%x\n", length, skb->protocol);
+@@ -1382,6 +1419,7 @@ static void usbnet_bh (unsigned long param)
+ 			rx_process (dev, skb);
+ 			continue;
+ 		case tx_done:
++			kfree(entry->urb->sg);
+ 		case rx_cleanup:
+ 			usb_free_urb (entry->urb);
+ 			dev_kfree_skb (skb);
+@@ -1718,6 +1756,7 @@ int usbnet_resume (struct usb_interface *intf)
+ 			retval = usb_submit_urb(res, GFP_ATOMIC);
+ 			if (retval < 0) {
+ 				dev_kfree_skb_any(skb);
++				kfree(res->sg);
+ 				usb_free_urb(res);
+ 				usb_autopm_put_interface_async(dev->intf);
+ 			} else {
+* Unmerged path include/linux/usb/usbnet.h
