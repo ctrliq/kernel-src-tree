@@ -1,0 +1,208 @@
+ip: make IP identifiers less predictable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 04ca6973f7c1a0d8537f2d9906a0cf8e69886d75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/04ca6973.failed
+
+In "Counting Packets Sent Between Arbitrary Internet Hosts", Jeffrey and
+Jedidiah describe ways exploiting linux IP identifier generation to
+infer whether two machines are exchanging packets.
+
+With commit 73f156a6e8c1 ("inetpeer: get rid of ip_id_count"), we
+changed IP id generation, but this does not really prevent this
+side-channel technique.
+
+This patch adds a random amount of perturbation so that IP identifiers
+for a given destination [1] are no longer monotonically increasing after
+an idle period.
+
+Note that prandom_u32_max(1) returns 0, so if generator is used at most
+once per jiffy, this patch inserts no hole in the ID suite and do not
+increase collision probability.
+
+This is jiffies based, so in the worst case (HZ=1000), the id can
+rollover after ~65 seconds of idle time, which should be fine.
+
+We also change the hash used in __ip_select_ident() to not only hash
+on daddr, but also saddr and protocol, so that ICMP probes can not be
+used to infer information for other protocols.
+
+For IPv6, adds saddr into the hash as well, but not nexthdr.
+
+If I ping the patched target, we can see ID are now hard to predict.
+
+21:57:11.008086 IP (...)
+    A > target: ICMP echo request, seq 1, length 64
+21:57:11.010752 IP (... id 2081 ...)
+    target > A: ICMP echo reply, seq 1, length 64
+
+21:57:12.013133 IP (...)
+    A > target: ICMP echo request, seq 2, length 64
+21:57:12.015737 IP (... id 3039 ...)
+    target > A: ICMP echo reply, seq 2, length 64
+
+21:57:13.016580 IP (...)
+    A > target: ICMP echo request, seq 3, length 64
+21:57:13.019251 IP (... id 3437 ...)
+    target > A: ICMP echo reply, seq 3, length 64
+
+[1] TCP sessions uses a per flow ID generator not changed by this patch.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Jeffrey Knockel <jeffk@cs.unm.edu>
+	Reported-by: Jedidiah R. Crandall <crandall@cs.unm.edu>
+	Cc: Willy Tarreau <w@1wt.eu>
+	Cc: Hannes Frederic Sowa <hannes@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 04ca6973f7c1a0d8537f2d9906a0cf8e69886d75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+#	net/ipv4/route.c
+#	net/ipv6/ip6_output.c
+diff --cc include/net/ip.h
+index ac68d6939a5b,7596eb22e1ce..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -314,9 -309,10 +314,16 @@@ static inline unsigned int ip_skb_dst_m
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more);
+ +
+ +static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, struct sock *sk)
+++=======
++ u32 ip_idents_reserve(u32 hash, int segs);
++ void __ip_select_ident(struct iphdr *iph, int segs);
++ 
++ static inline void ip_select_ident_segs(struct sk_buff *skb, struct sock *sk, int segs)
+++>>>>>>> 04ca6973f7c1 (ip: make IP identifiers less predictable)
+  {
+  	struct iphdr *iph = ip_hdr(skb);
+  
+diff --cc net/ipv4/route.c
+index bc344977f369,190199851c9a..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -462,39 -457,45 +462,78 @@@ static struct neighbour *ipv4_neigh_loo
+  	return neigh_create(&arp_tbl, pkey, dev);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Peer allocation may fail only in serious out-of-memory conditions.  However
+ + * we still can generate some output.
+ + * Random ID selection looks a bit dangerous because we have no chances to
+ + * select ID being unique in a reasonable period of time.
+ + * But broken packet identifier may be better than no packet at all.
+ + */
+ +static void ip_select_fb_ident(struct iphdr *iph)
+++=======
++ #define IP_IDENTS_SZ 2048u
++ struct ip_ident_bucket {
++ 	atomic_t	id;
++ 	u32		stamp32;
++ };
++ 
++ static struct ip_ident_bucket *ip_idents __read_mostly;
++ 
++ /* In order to protect privacy, we add a perturbation to identifiers
++  * if one generator is seldom used. This makes hard for an attacker
++  * to infer how many packets were sent between two points in time.
++  */
++ u32 ip_idents_reserve(u32 hash, int segs)
++ {
++ 	struct ip_ident_bucket *bucket = ip_idents + hash % IP_IDENTS_SZ;
++ 	u32 old = ACCESS_ONCE(bucket->stamp32);
++ 	u32 now = (u32)jiffies;
++ 	u32 delta = 0;
++ 
++ 	if (old != now && cmpxchg(&bucket->stamp32, old, now) == old)
++ 		delta = prandom_u32_max(now - old);
++ 
++ 	return atomic_add_return(segs + delta, &bucket->id) - segs;
++ }
++ EXPORT_SYMBOL(ip_idents_reserve);
++ 
++ void __ip_select_ident(struct iphdr *iph, int segs)
+++>>>>>>> 04ca6973f7c1 (ip: make IP identifiers less predictable)
+  {
+ -	static u32 ip_idents_hashrnd __read_mostly;
+ -	u32 hash, id;
+ +	static DEFINE_SPINLOCK(ip_fb_id_lock);
+ +	static u32 ip_fallback_id;
+ +	u32 salt;
+  
+ -	net_get_random_once(&ip_idents_hashrnd, sizeof(ip_idents_hashrnd));
+ +	spin_lock_bh(&ip_fb_id_lock);
+ +	salt = secure_ip_id((__force __be32)ip_fallback_id ^ iph->daddr);
+ +	iph->id = htons(salt & 0xFFFF);
+ +	ip_fallback_id = salt;
+ +	spin_unlock_bh(&ip_fb_id_lock);
+ +}
+  
+++<<<<<<< HEAD
+ +void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more)
+ +{
+ +	struct net *net = dev_net(dst->dev);
+ +	struct inet_peer *peer;
+ +
+ +	peer = inet_getpeer_v4(net->ipv4.peers, iph->daddr, 1);
+ +	if (peer) {
+ +		iph->id = htons(inet_getid(peer, more));
+ +		inet_putpeer(peer);
+ +		return;
+ +	}
+ +
+ +	ip_select_fb_ident(iph);
+++=======
++ 	hash = jhash_3words((__force u32)iph->daddr,
++ 			    (__force u32)iph->saddr,
++ 			    iph->protocol,
++ 			    ip_idents_hashrnd);
++ 	id = ip_idents_reserve(hash, segs);
++ 	iph->id = htons(id);
+++>>>>>>> 04ca6973f7c1 (ip: make IP identifiers less predictable)
+  }
+  EXPORT_SYMBOL(__ip_select_ident);
+  
+diff --cc net/ipv6/ip6_output.c
+index 6e24dc6ba803,45702b8cd141..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -520,8 -537,21 +520,26 @@@ static void ip6_copy_metadata(struct sk
+  	skb_copy_secmark(to, from);
+  }
+  
+++<<<<<<< HEAD
+ +int ip6_fragment(struct sock *sk, struct sk_buff *skb,
+ +		 int (*output)(struct sock *, struct sk_buff *))
+++=======
++ static void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt)
++ {
++ 	static u32 ip6_idents_hashrnd __read_mostly;
++ 	u32 hash, id;
++ 
++ 	net_get_random_once(&ip6_idents_hashrnd, sizeof(ip6_idents_hashrnd));
++ 
++ 	hash = __ipv6_addr_jhash(&rt->rt6i_dst.addr, ip6_idents_hashrnd);
++ 	hash = __ipv6_addr_jhash(&rt->rt6i_src.addr, hash);
++ 
++ 	id = ip_idents_reserve(hash, 1);
++ 	fhdr->identification = htonl(id);
++ }
++ 
++ int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
+++>>>>>>> 04ca6973f7c1 (ip: make IP identifiers less predictable)
+  {
+  	struct sk_buff *frag;
+  	struct rt6_info *rt = (struct rt6_info*)skb_dst(skb);
+* Unmerged path include/net/ip.h
+* Unmerged path net/ipv4/route.c
+* Unmerged path net/ipv6/ip6_output.c
