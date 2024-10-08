@@ -1,0 +1,231 @@
+mei: fix mei_poll operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 1d9013f09203c694e2cba478b05afc6484d55180
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1d9013f0.failed
+
+mei_poll returned with POLLIN w/o checking whether the operation
+has really completed.
+remove redundant check and locking in amthif specific handler
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 1d9013f09203c694e2cba478b05afc6484d55180)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/amthif.c
+diff --cc drivers/misc/mei/amthif.c
+index a11128c1997f,3c1fd87ee10b..000000000000
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@@ -327,76 -310,70 +327,88 @@@ static int mei_amthif_send_cmd(struct m
+  }
+  
+  /**
+ - * mei_amthif_run_next_cmd - send next amt command from queue
+ + * mei_amthif_write - write amthif data to amthif client
+   *
+   * @dev: the device structure
+ + * @cb: mei call back struct
+ + *
+ + * returns 0 on success, <0 on failure.
+   *
+ - * Return: 0 on success, <0 on failure.
+   */
+ -int mei_amthif_run_next_cmd(struct mei_device *dev)
+ +int mei_amthif_write(struct mei_device *dev, struct mei_cl_cb *cb)
+  {
+ -	struct mei_cl *cl = &dev->iamthif_cl;
+ -	struct mei_cl_cb *cb;
+ +	int ret;
+  
+ -	dev->iamthif_canceled = false;
+ -	dev->iamthif_state = MEI_IAMTHIF_IDLE;
+ -	dev->iamthif_timer = 0;
+ -	dev->iamthif_file_object = NULL;
+ +	if (!dev || !cb)
+ +		return -ENODEV;
+  
+ -	dev_dbg(dev->dev, "complete amthif cmd_list cb.\n");
+ +	ret = mei_io_cb_alloc_resp_buf(cb, dev->iamthif_mtu);
+ +	if (ret)
+ +		return ret;
+  
+ -	cb = list_first_entry_or_null(&dev->amthif_cmd_list.list,
+ -					typeof(*cb), list);
+ -	if (!cb)
+ -		return 0;
+ +	cb->fop_type = MEI_FOP_WRITE;
+  
+ -	list_del_init(&cb->list);
+ -	return mei_amthif_send_cmd(cl, cb);
+ +	if (!list_empty(&dev->amthif_cmd_list.list) ||
+ +	    dev->iamthif_state != MEI_IAMTHIF_IDLE) {
+ +		dev_dbg(&dev->pdev->dev,
+ +			"amthif state = %d\n", dev->iamthif_state);
+ +		dev_dbg(&dev->pdev->dev, "AMTHIF: add cb to the wait list\n");
+ +		list_add_tail(&cb->list, &dev->amthif_cmd_list.list);
+ +		return 0;
+ +	}
+ +	return mei_amthif_send_cmd(dev, cb);
+  }
+ -
+  /**
+ - * mei_amthif_write - write amthif data to amthif client
+ + * mei_amthif_run_next_cmd
+   *
+ - * @cl: host client
+ - * @cb: mei call back struct
+ + * @dev: the device structure
+   *
+ - * Return: 0 on success, <0 on failure.
+ + * returns 0 on success, <0 on failure.
+   */
+ -int mei_amthif_write(struct mei_cl *cl, struct mei_cl_cb *cb)
+ +void mei_amthif_run_next_cmd(struct mei_device *dev)
+  {
+ +	struct mei_cl_cb *cb;
+ +	struct mei_cl_cb *next;
+ +	int status;
+  
+ -	struct mei_device *dev;
+ -
+ -	if (WARN_ON(!cl || !cl->dev))
+ -		return -ENODEV;
+ -
+ -	if (WARN_ON(!cb))
+ -		return -EINVAL;
+ +	if (!dev)
+ +		return;
+  
+ -	dev = cl->dev;
+ +	dev->iamthif_msg_buf_size = 0;
+ +	dev->iamthif_msg_buf_index = 0;
+ +	dev->iamthif_canceled = false;
+ +	dev->iamthif_ioctl = true;
+ +	dev->iamthif_state = MEI_IAMTHIF_IDLE;
+ +	dev->iamthif_timer = 0;
+ +	dev->iamthif_file_object = NULL;
+  
+ -	list_add_tail(&cb->list, &dev->amthif_cmd_list.list);
+ -	return mei_amthif_run_next_cmd(dev);
+ +	dev_dbg(&dev->pdev->dev, "complete amthif cmd_list cb.\n");
+ +
+ +	list_for_each_entry_safe(cb, next, &dev->amthif_cmd_list.list, list) {
+ +		list_del(&cb->list);
+ +		if (!cb->cl)
+ +			continue;
+ +		status = mei_amthif_send_cmd(dev, cb);
+ +		if (status)
+ +			dev_warn(&dev->pdev->dev, "amthif write failed status = %d\n",
+ +						status);
+ +		break;
+ +	}
+  }
+  
+ +
++ /**
++  * mei_amthif_poll - the amthif poll function
++  *
++  * @dev: the device structure
++  * @file: pointer to file structure
++  * @wait: pointer to poll_table structure
++  *
++  * Return: poll mask
++  *
++  * Locking: called under "dev->device_lock" lock
++  */
++ 
+  unsigned int mei_amthif_poll(struct mei_device *dev,
+  		struct file *file, poll_table *wait)
+  {
+@@@ -404,19 -381,12 +416,22 @@@
+  
+  	poll_wait(file, &dev->iamthif_cl.wait, wait);
+  
+- 	mutex_lock(&dev->device_lock);
+- 	if (!mei_cl_is_connected(&dev->iamthif_cl)) {
++ 	if (dev->iamthif_state == MEI_IAMTHIF_READ_COMPLETE &&
++ 	    dev->iamthif_file_object == file) {
+  
+++<<<<<<< HEAD
+ +		mask = POLLERR;
+ +
+ +	} else if (dev->iamthif_state == MEI_IAMTHIF_READ_COMPLETE &&
+ +		   dev->iamthif_file_object == file) {
+ +
+ +		mask |= (POLLIN | POLLRDNORM);
+ +		dev_dbg(&dev->pdev->dev, "run next amthif cb\n");
+++=======
++ 		mask |= POLLIN | POLLRDNORM;
+++>>>>>>> 1d9013f09203 (mei: fix mei_poll operation)
+  		mei_amthif_run_next_cmd(dev);
+  	}
+- 	mutex_unlock(&dev->device_lock);
+  
+  	return mask;
+  }
+* Unmerged path drivers/misc/mei/amthif.c
+diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
+index 3c539de435ba..8195d4a5aa02 100644
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -1008,7 +1008,7 @@ void mei_cl_complete(struct mei_cl *cl, struct mei_cl_cb *cb)
+ 			MEI_READING == cl->reading_state) {
+ 		cl->reading_state = MEI_READ_COMPLETE;
+ 		if (waitqueue_active(&cl->rx_wait))
+-			wake_up_interruptible(&cl->rx_wait);
++			wake_up_interruptible_all(&cl->rx_wait);
+ 		else
+ 			mei_cl_bus_rx_event(cl);
+ 
+diff --git a/drivers/misc/mei/main.c b/drivers/misc/mei/main.c
+index b23f9eba9e3a..eb6d46e9ff29 100644
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@ -628,6 +628,7 @@ static long mei_compat_ioctl(struct file *file,
+  */
+ static unsigned int mei_poll(struct file *file, poll_table *wait)
+ {
++	unsigned long req_events = poll_requested_events(wait);
+ 	struct mei_cl *cl = file->private_data;
+ 	struct mei_device *dev;
+ 	unsigned int mask = 0;
+@@ -644,22 +645,19 @@ static unsigned int mei_poll(struct file *file, poll_table *wait)
+ 		goto out;
+ 	}
+ 
+-	mutex_unlock(&dev->device_lock);
+-
+-
+-	if (cl == &dev->iamthif_cl)
+-		return mei_amthif_poll(dev, file, wait);
+-
+-	poll_wait(file, &cl->tx_wait, wait);
+-
+-	mutex_lock(&dev->device_lock);
+-
+-	if (!mei_cl_is_connected(cl)) {
+-		mask = POLLERR;
++	if (cl == &dev->iamthif_cl) {
++		mask = mei_amthif_poll(dev, file, wait);
+ 		goto out;
+ 	}
+ 
+-	mask |= (POLLIN | POLLRDNORM);
++	if (req_events & (POLLIN | POLLRDNORM)) {
++		poll_wait(file, &cl->rx_wait, wait);
++
++		if (!list_empty(&cl->rd_completed))
++			mask |= POLLIN | POLLRDNORM;
++		else
++			mei_cl_read_start(cl, 0, file);
++	}
+ 
+ out:
+ 	mutex_unlock(&dev->device_lock);
