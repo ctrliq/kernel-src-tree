@@ -1,0 +1,365 @@
+i40e/i40evf: Rewrite logic for 8 descriptor per packet check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 2d37490b82afe1d1b745811e6ce0a4d16bc5e996
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2d37490b.failed
+
+This patch is meant to rewrite the logic for how we determine if we can
+transmit the frame or if it needs to be linearized.
+
+The previous code for this function was using a mix of division and modulus
+division as a part of computing if we need to take the slow path.  Instead
+I have replaced this by simply working with a sliding window which will
+tell us if the frame would be capable of causing a single packet to span
+several descriptors.
+
+The logic for the scan is fairly simple.  If any given group of 6 fragments
+is less than gso_size - 1 then it is possible for us to have one byte
+coming out of the first fragment, 6 fragments, and one or more bytes coming
+out of the last fragment.  This gives us a total of 8 fragments
+which exceeds what we can allow so we send such frames to be linearized.
+
+Arguably the use of modulus might be more exact as the approach I propose
+may generate some false positives.  However the likelihood of us taking much
+of a hit for those false positives is fairly low, and I would rather not
+add more overhead in the case where we are receiving a frame composed of 4K
+pages.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 2d37490b82afe1d1b745811e6ce0a4d16bc5e996)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_fcoe.c
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.h
+#	drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+diff --cc drivers/net/ethernet/intel/i40e/i40e_fcoe.c
+index e61646fcfb11,052df93f1da4..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_fcoe.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_fcoe.c
+@@@ -1371,8 -1367,24 +1371,27 @@@ static netdev_tx_t i40e_fcoe_xmit_frame
+  	if (i40e_fcoe_set_skb_header(skb))
+  		goto out_drop;
+  
+++<<<<<<< HEAD
+ +	if (!i40e_xmit_descriptor_count(skb, tx_ring))
+++=======
++ 	count = i40e_xmit_descriptor_count(skb);
++ 	if (i40e_chk_linearize(skb, count)) {
++ 		if (__skb_linearize(skb))
++ 			goto out_drop;
++ 		count = TXD_USE_COUNT(skb->len);
++ 		tx_ring->tx_stats.tx_linearize++;
++ 	}
++ 
++ 	/* need: 1 descriptor per page * PAGE_SIZE/I40E_MAX_DATA_PER_TXD,
++ 	 *       + 1 desc for skb_head_len/I40E_MAX_DATA_PER_TXD,
++ 	 *       + 4 desc gap to avoid the cache line where head is,
++ 	 *       + 1 desc for context descriptor,
++ 	 * otherwise try next time
++ 	 */
++ 	if (i40e_maybe_stop_tx(tx_ring, count + 4 + 1)) {
++ 		tx_ring->tx_stats.tx_busy++;
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+  		return NETDEV_TX_BUSY;
+ -	}
+  
+  	/* prepare the xmit flags */
+  	if (i40e_tx_prepare_vlan_flags(skb, tx_ring, &tx_flags))
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 5a3abb58e191,5123646a895f..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -2587,27 -2593,8 +2587,30 @@@ static inline int __i40e_maybe_stop_tx(
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * i40e_maybe_stop_tx - 1st level check for tx stop conditions
+ + * @tx_ring: the ring to be checked
+ + * @size:    the size buffer we want to assure is available
+ + *
+ + * Returns 0 if stop is not needed
+ + **/
+ +#ifdef I40E_FCOE
+ +inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
+ +#else
+ +static inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
+ +#endif
+ +{
+ +	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
+ +		return 0;
+ +	return __i40e_maybe_stop_tx(tx_ring, size);
+ +}
+ +
+ +/**
+ + * i40e_chk_linearize - Check if there are more than 8 fragments per packet
+++=======
++  * __i40e_chk_linearize - Check if there are more than 8 fragments per packet
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+   * @skb:      send buffer
+-  * @tx_flags: collected send information
+   *
+   * Note: Our HW can't scatter-gather more than 8 fragments to build
+   * a packet on the wire and so we need to figure out the cases where we
+@@@ -2924,8 -2887,24 +2940,27 @@@ static netdev_tx_t i40e_xmit_frame_ring
+  	/* prefetch the data, we'll need it later */
+  	prefetch(skb->data);
+  
+++<<<<<<< HEAD
+ +	if (0 == i40e_xmit_descriptor_count(skb, tx_ring))
+++=======
++ 	count = i40e_xmit_descriptor_count(skb);
++ 	if (i40e_chk_linearize(skb, count)) {
++ 		if (__skb_linearize(skb))
++ 			goto out_drop;
++ 		count = TXD_USE_COUNT(skb->len);
++ 		tx_ring->tx_stats.tx_linearize++;
++ 	}
++ 
++ 	/* need: 1 descriptor per page * PAGE_SIZE/I40E_MAX_DATA_PER_TXD,
++ 	 *       + 1 desc for skb_head_len/I40E_MAX_DATA_PER_TXD,
++ 	 *       + 4 desc gap to avoid the cache line where head is,
++ 	 *       + 1 desc for context descriptor,
++ 	 * otherwise try next time
++ 	 */
++ 	if (i40e_maybe_stop_tx(tx_ring, count + 4 + 1)) {
++ 		tx_ring->tx_stats.tx_busy++;
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+  		return NETDEV_TX_BUSY;
+ -	}
+  
+  	/* prepare the xmit flags */
+  	if (i40e_tx_prepare_vlan_flags(skb, tx_ring, &tx_flags))
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.h
+index ae22c4e9162f,56009709528a..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+@@@ -338,7 -335,9 +338,13 @@@ int i40e_tx_prepare_vlan_flags(struct s
+  			       struct i40e_ring *tx_ring, u32 *flags);
+  #endif
+  void i40e_force_wb(struct i40e_vsi *vsi, struct i40e_q_vector *q_vector);
+++<<<<<<< HEAD
+ +u32 i40e_get_tx_pending(struct i40e_ring *ring);
+++=======
++ u32 i40e_get_tx_pending(struct i40e_ring *ring, bool in_sw);
++ int __i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size);
++ bool __i40e_chk_linearize(struct sk_buff *skb);
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+  
+  /**
+   * i40e_get_head - Retrieve head from head writeback
+@@@ -353,4 -352,63 +359,66 @@@ static inline u32 i40e_get_head(struct 
+  
+  	return le32_to_cpu(*(volatile __le32 *)head);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * i40e_xmit_descriptor_count - calculate number of Tx descriptors needed
++  * @skb:     send buffer
++  * @tx_ring: ring to send buffer on
++  *
++  * Returns number of data descriptors needed for this skb. Returns 0 to indicate
++  * there is not enough descriptors available in this ring since we need at least
++  * one descriptor.
++  **/
++ static inline int i40e_xmit_descriptor_count(struct sk_buff *skb)
++ {
++ 	const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
++ 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
++ 	int count = 0, size = skb_headlen(skb);
++ 
++ 	for (;;) {
++ 		count += TXD_USE_COUNT(size);
++ 
++ 		if (!nr_frags--)
++ 			break;
++ 
++ 		size = skb_frag_size(frag++);
++ 	}
++ 
++ 	return count;
++ }
++ 
++ /**
++  * i40e_maybe_stop_tx - 1st level check for Tx stop conditions
++  * @tx_ring: the ring to be checked
++  * @size:    the size buffer we want to assure is available
++  *
++  * Returns 0 if stop is not needed
++  **/
++ static inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
++ {
++ 	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
++ 		return 0;
++ 	return __i40e_maybe_stop_tx(tx_ring, size);
++ }
++ 
++ /**
++  * i40e_chk_linearize - Check if there are more than 8 fragments per packet
++  * @skb:      send buffer
++  * @count:    number of buffers used
++  *
++  * Note: Our HW can't scatter-gather more than 8 fragments to build
++  * a packet on the wire and so we need to figure out the cases where we
++  * need to linearize the skb.
++  **/
++ static inline bool i40e_chk_linearize(struct sk_buff *skb, int count)
++ {
++ 	/* we can only support up to 8 data buffers for a single send */
++ 	if (likely(count <= I40E_MAX_BUFFER_TXD))
++ 		return false;
++ 
++ 	return __i40e_chk_linearize(skb);
++ }
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+  #endif /* _I40E_TXRX_H_ */
+diff --cc drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+index f6384b0c8220,2369db58cdb1..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+@@@ -1770,10 -1795,9 +1770,14 @@@ static void i40e_create_tx_ctx(struct i
+  	context_desc->type_cmd_tso_mss = cpu_to_le64(cd_type_cmd_tso_mss);
+  }
+  
+++<<<<<<< HEAD
+ + /**
+ + * i40e_chk_linearize - Check if there are more than 8 fragments per packet
+++=======
++ /**
++  * __i40evf_chk_linearize - Check if there are more than 8 fragments per packet
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+   * @skb:      send buffer
+-  * @tx_flags: collected send information
+   *
+   * Note: Our HW can't scatter-gather more than 8 fragments to build
+   * a packet on the wire and so we need to figure out the cases where we
+@@@ -2122,8 -2106,24 +2139,27 @@@ static netdev_tx_t i40e_xmit_frame_ring
+  	/* prefetch the data, we'll need it later */
+  	prefetch(skb->data);
+  
+++<<<<<<< HEAD
+ +	if (0 == i40evf_xmit_descriptor_count(skb, tx_ring))
+++=======
++ 	count = i40e_xmit_descriptor_count(skb);
++ 	if (i40e_chk_linearize(skb, count)) {
++ 		if (__skb_linearize(skb))
++ 			goto out_drop;
++ 		count = TXD_USE_COUNT(skb->len);
++ 		tx_ring->tx_stats.tx_linearize++;
++ 	}
++ 
++ 	/* need: 1 descriptor per page * PAGE_SIZE/I40E_MAX_DATA_PER_TXD,
++ 	 *       + 1 desc for skb_head_len/I40E_MAX_DATA_PER_TXD,
++ 	 *       + 4 desc gap to avoid the cache line where head is,
++ 	 *       + 1 desc for context descriptor,
++ 	 * otherwise try next time
++ 	 */
++ 	if (i40e_maybe_stop_tx(tx_ring, count + 4 + 1)) {
++ 		tx_ring->tx_stats.tx_busy++;
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+  		return NETDEV_TX_BUSY;
+ -	}
+  
+  	/* prepare the xmit flags */
+  	if (i40evf_tx_prepare_vlan_flags(skb, tx_ring, &tx_flags))
+diff --cc drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+index 5467fcdf7670,c1dd8c5c9666..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+@@@ -326,7 -325,9 +326,13 @@@ void i40evf_free_tx_resources(struct i4
+  void i40evf_free_rx_resources(struct i40e_ring *rx_ring);
+  int i40evf_napi_poll(struct napi_struct *napi, int budget);
+  void i40evf_force_wb(struct i40e_vsi *vsi, struct i40e_q_vector *q_vector);
+++<<<<<<< HEAD
+ +u32 i40evf_get_tx_pending(struct i40e_ring *ring);
+++=======
++ u32 i40evf_get_tx_pending(struct i40e_ring *ring, bool in_sw);
++ int __i40evf_maybe_stop_tx(struct i40e_ring *tx_ring, int size);
++ bool __i40evf_chk_linearize(struct sk_buff *skb);
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+  
+  /**
+   * i40e_get_head - Retrieve head from head writeback
+@@@ -341,4 -342,63 +347,66 @@@ static inline u32 i40e_get_head(struct 
+  
+  	return le32_to_cpu(*(volatile __le32 *)head);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * i40e_xmit_descriptor_count - calculate number of Tx descriptors needed
++  * @skb:     send buffer
++  * @tx_ring: ring to send buffer on
++  *
++  * Returns number of data descriptors needed for this skb. Returns 0 to indicate
++  * there is not enough descriptors available in this ring since we need at least
++  * one descriptor.
++  **/
++ static inline int i40e_xmit_descriptor_count(struct sk_buff *skb)
++ {
++ 	const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
++ 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
++ 	int count = 0, size = skb_headlen(skb);
++ 
++ 	for (;;) {
++ 		count += TXD_USE_COUNT(size);
++ 
++ 		if (!nr_frags--)
++ 			break;
++ 
++ 		size = skb_frag_size(frag++);
++ 	}
++ 
++ 	return count;
++ }
++ 
++ /**
++  * i40e_maybe_stop_tx - 1st level check for Tx stop conditions
++  * @tx_ring: the ring to be checked
++  * @size:    the size buffer we want to assure is available
++  *
++  * Returns 0 if stop is not needed
++  **/
++ static inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
++ {
++ 	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
++ 		return 0;
++ 	return __i40evf_maybe_stop_tx(tx_ring, size);
++ }
++ 
++ /**
++  * i40e_chk_linearize - Check if there are more than 8 fragments per packet
++  * @skb:      send buffer
++  * @count:    number of buffers used
++  *
++  * Note: Our HW can't scatter-gather more than 8 fragments to build
++  * a packet on the wire and so we need to figure out the cases where we
++  * need to linearize the skb.
++  **/
++ static inline bool i40e_chk_linearize(struct sk_buff *skb, int count)
++ {
++ 	/* we can only support up to 8 data buffers for a single send */
++ 	if (likely(count <= I40E_MAX_BUFFER_TXD))
++ 		return false;
++ 
++ 	return __i40evf_chk_linearize(skb);
++ }
+++>>>>>>> 2d37490b82af (i40e/i40evf: Rewrite logic for 8 descriptor per packet check)
+  #endif /* _I40E_TXRX_H_ */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_fcoe.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.h
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40e_txrx.h
