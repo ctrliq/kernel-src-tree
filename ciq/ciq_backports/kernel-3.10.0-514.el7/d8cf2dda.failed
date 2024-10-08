@@ -1,0 +1,189 @@
+net/mlx5e: Use workqueue for vxlan ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Use workqueue for vxlan ops (kamal heib) [1275159 1296272 1296405 1298421 1298422 1298423 1298424 1298425]
+Rebuild_FUZZ: 94.44%
+commit-author Matthew Finlay <matt@mellanox.com>
+commit d8cf2dda3de6e6293fb01539fb4e180a7ab42afd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d8cf2dda.failed
+
+The vxlan add/delete port NDOs are called under rcu lock.
+The current mlx5e implementation can potentially block in these
+calls, which is not allowed.  Move to using the mlx5e workqueue
+to handle these NDOs.
+
+Fixes: b3f63c3d5e2c ('net/mlx5e: Add netdev support for VXLAN tunneling')
+	Signed-off-by: Matthew Finlay <matt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d8cf2dda3de6e6293fb01539fb4e180a7ab42afd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/vxlan.c
+diff --cc drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+index 1d7bd82a1fb1,129f3527aa14..000000000000
+--- a/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
++++ b/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+@@@ -29,34 -29,33 +29,55 @@@
+   * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+   */
+ -#ifndef __MLX5_VXLAN_H__
+ -#define __MLX5_VXLAN_H__
+  
+ -#include <linux/mlx5/driver.h>
+ -#include "en.h"
+ +/*
+ + * This file is conditionally built on PowerPC only.  Otherwise weak symbol
+ + * versions of the functions exported from here are used.
+ + */
+  
+ -struct mlx5e_vxlan {
+ -	u16 udp_port;
+ -};
+ +#include "ipath_kernel.h"
+  
+++<<<<<<< HEAD:drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+ +/**
+ + * ipath_enable_wc - enable write combining for MMIO writes to the device
+ + * @dd: infinipath device
+ + *
+ + * Nothing to do on PowerPC, so just return without error.
+ + */
+ +int ipath_enable_wc(struct ipath_devdata *dd)
+++=======
++ struct mlx5e_vxlan_work {
++ 	struct work_struct	work;
++ 	struct mlx5e_priv	*priv;
++ 	sa_family_t		sa_family;
++ 	u16			port;
++ };
++ 
++ static inline bool mlx5e_vxlan_allowed(struct mlx5_core_dev *mdev)
+++>>>>>>> d8cf2dda3de6 (net/mlx5e: Use workqueue for vxlan ops):drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
+  {
+ -	return (MLX5_CAP_ETH(mdev, tunnel_stateless_vxlan) &&
+ -		mlx5_core_is_pf(mdev));
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+ +/**
+ + * ipath_unordered_wc - indicate whether write combining is unordered
+ + *
+ + * Because our performance depends on our ability to do write
+ + * combining mmio writes in the most efficient way, we need to
+ + * know if we are on a processor that may reorder stores when
+ + * write combining.
+ + */
+ +int ipath_unordered_wc(void)
+ +{
+ +	return 1;
+ +}
+++=======
++ void mlx5e_vxlan_init(struct mlx5e_priv *priv);
++ void mlx5e_vxlan_queue_work(struct mlx5e_priv *priv, sa_family_t sa_family,
++ 			    u16 port, int add);
++ struct mlx5e_vxlan *mlx5e_vxlan_lookup_port(struct mlx5e_priv *priv, u16 port);
++ void mlx5e_vxlan_cleanup(struct mlx5e_priv *priv);
++ 
++ #endif /* __MLX5_VXLAN_H__ */
+++>>>>>>> d8cf2dda3de6 (net/mlx5e: Use workqueue for vxlan ops):drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 23ff9e4eac90,d4dfc5ce516a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2016,7 -2149,79 +2016,83 @@@ static int mlx5e_get_vf_stats(struct ne
+  					    vf_stats);
+  }
+  
+++<<<<<<< HEAD
+ +static struct net_device_ops mlx5e_netdev_ops = {
+++=======
++ static void mlx5e_add_vxlan_port(struct net_device *netdev,
++ 				 sa_family_t sa_family, __be16 port)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	if (!mlx5e_vxlan_allowed(priv->mdev))
++ 		return;
++ 
++ 	mlx5e_vxlan_queue_work(priv, sa_family, be16_to_cpu(port), 1);
++ }
++ 
++ static void mlx5e_del_vxlan_port(struct net_device *netdev,
++ 				 sa_family_t sa_family, __be16 port)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	if (!mlx5e_vxlan_allowed(priv->mdev))
++ 		return;
++ 
++ 	mlx5e_vxlan_queue_work(priv, sa_family, be16_to_cpu(port), 0);
++ }
++ 
++ static netdev_features_t mlx5e_vxlan_features_check(struct mlx5e_priv *priv,
++ 						    struct sk_buff *skb,
++ 						    netdev_features_t features)
++ {
++ 	struct udphdr *udph;
++ 	u16 proto;
++ 	u16 port = 0;
++ 
++ 	switch (vlan_get_protocol(skb)) {
++ 	case htons(ETH_P_IP):
++ 		proto = ip_hdr(skb)->protocol;
++ 		break;
++ 	case htons(ETH_P_IPV6):
++ 		proto = ipv6_hdr(skb)->nexthdr;
++ 		break;
++ 	default:
++ 		goto out;
++ 	}
++ 
++ 	if (proto == IPPROTO_UDP) {
++ 		udph = udp_hdr(skb);
++ 		port = be16_to_cpu(udph->dest);
++ 	}
++ 
++ 	/* Verify if UDP port is being offloaded by HW */
++ 	if (port && mlx5e_vxlan_lookup_port(priv, port))
++ 		return features;
++ 
++ out:
++ 	/* Disable CSUM and GSO if the udp dport is not offloaded by HW */
++ 	return features & ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
++ }
++ 
++ static netdev_features_t mlx5e_features_check(struct sk_buff *skb,
++ 					      struct net_device *netdev,
++ 					      netdev_features_t features)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	features = vlan_features_check(skb, features);
++ 	features = vxlan_features_check(skb, features);
++ 
++ 	/* Validate if the tunneled packet is being offloaded by HW */
++ 	if (skb->encapsulation &&
++ 	    (features & NETIF_F_CSUM_MASK || features & NETIF_F_GSO_MASK))
++ 		return mlx5e_vxlan_features_check(priv, skb, features);
++ 
++ 	return features;
++ }
++ 
++ static const struct net_device_ops mlx5e_netdev_ops_basic = {
+++>>>>>>> d8cf2dda3de6 (net/mlx5e: Use workqueue for vxlan ops)
+  	.ndo_open                = mlx5e_open,
+  	.ndo_stop                = mlx5e_close,
+  	.ndo_start_xmit          = mlx5e_xmit,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/vxlan.c
+* Unmerged path drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/vxlan.c
