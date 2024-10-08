@@ -1,0 +1,269 @@
+sctp: allow GSO frags to access the chunk too
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+commit 1f45f78f8e511203f03138f2ccde3d2cf90d2cbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1f45f78f.failed
+
+SCTP will try to access original IP headers on sctp_recvmsg in order to
+copy the addresses used. There are also other places that do similar access
+to IP or even SCTP headers. But after 90017accff61 ("sctp: Add GSO
+support") they aren't always there because they are only present in the
+header skb.
+
+SCTP handles the queueing of incoming data by cloning the incoming skb
+and limiting to only the relevant payload. This clone has its cb updated
+to something different and it's then queued on socket rx queue. Thus we
+need to fix this in two moments.
+
+For rx path, not related to socket queue yet, this patch uses a
+partially copied sctp_input_cb to such GSO frags. This restores the
+ability to access the headers for this part of the code.
+
+Regarding the socket rx queue, it removes iif member from sctp_event and
+also add a chunk pointer on it.
+
+With these changes we're always able to reach the headers again.
+
+The biggest change here is that now the sctp_chunk struct and the
+original skb are only freed after the application consumed the buffer.
+Note however that the original payload was already like this due to the
+skb cloning.
+
+For iif, SCTP's IPv4 code doesn't use it, so no change is necessary.
+IPv6 now can fetch it directly from original's IPv6 CB as the original
+skb is still accessible.
+
+In the future we probably can simplify sctp_v*_skb_iif() stuff, as
+sctp_v4_skb_iif() was called but it's return value not used, and now
+it's not even called, but such cleanup is out of scope for this change.
+
+Fixes: 90017accff61 ("sctp: Add GSO support")
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1f45f78f8e511203f03138f2ccde3d2cf90d2cbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/ulpevent.h
+#	net/sctp/inqueue.c
+diff --cc include/net/sctp/ulpevent.h
+index ca4693b4e09e,2c098cd7e7e2..000000000000
+--- a/include/net/sctp/ulpevent.h
++++ b/include/net/sctp/ulpevent.h
+@@@ -55,6 -48,11 +55,14 @@@
+   */
+  struct sctp_ulpevent {
+  	struct sctp_association *asoc;
+++<<<<<<< HEAD
+++=======
++ 	struct sctp_chunk *chunk;
++ 	unsigned int rmem_len;
++ 	__u32 ppid;
++ 	__u32 tsn;
++ 	__u32 cumtsn;
+++>>>>>>> 1f45f78f8e51 (sctp: allow GSO frags to access the chunk too)
+  	__u16 stream;
+  	__u16 ssn;
+  	__u16 flags;
+diff --cc net/sctp/inqueue.c
+index f49b9cedb9f5,147d975b0455..000000000000
+--- a/net/sctp/inqueue.c
++++ b/net/sctp/inqueue.c
+@@@ -188,6 -205,26 +188,29 @@@ next_chunk
+  
+  		if (chunk->asoc)
+  			sock_rps_save_rxhash(chunk->asoc->base.sk, chunk->skb);
+++<<<<<<< HEAD
+++=======
++ 
++ 		queue->in_progress = chunk;
++ 
++ new_skb:
++ 		/* This is the first chunk in the packet.  */
++ 		ch = (sctp_chunkhdr_t *) chunk->skb->data;
++ 		chunk->singleton = 1;
++ 		chunk->data_accepted = 0;
++ 		chunk->pdiscard = 0;
++ 		chunk->auth = 0;
++ 		chunk->has_asconf = 0;
++ 		chunk->end_of_packet = 0;
++ 		chunk->ecn_ce_done = 0;
++ 		if (chunk->head_skb) {
++ 			struct sctp_input_cb
++ 				*cb = SCTP_INPUT_CB(chunk->skb),
++ 				*head_cb = SCTP_INPUT_CB(chunk->head_skb);
++ 
++ 			cb->chunk = head_cb->chunk;
++ 		}
+++>>>>>>> 1f45f78f8e51 (sctp: allow GSO frags to access the chunk too)
+  	}
+  
+  	chunk->chunk_hdr = ch;
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index 7fbce55da678..ef22912f6dea 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -1096,6 +1096,13 @@ struct sctp_input_cb {
+ };
+ #define SCTP_INPUT_CB(__skb)	((struct sctp_input_cb *)&((__skb)->cb[0]))
+ 
++static inline const struct sk_buff *sctp_gso_headskb(const struct sk_buff *skb)
++{
++	const struct sctp_chunk *chunk = SCTP_INPUT_CB(skb)->chunk;
++
++	return chunk->head_skb ? : skb;
++}
++
+ /* These bind address data fields common between endpoints and associations */
+ struct sctp_bind_addr {
+ 
+* Unmerged path include/net/sctp/ulpevent.h
+* Unmerged path net/sctp/inqueue.c
+diff --git a/net/sctp/ipv6.c b/net/sctp/ipv6.c
+index ee418fd68e35..f8fe42085fe5 100644
+--- a/net/sctp/ipv6.c
++++ b/net/sctp/ipv6.c
+@@ -423,6 +423,7 @@ static void sctp_v6_from_skb(union sctp_addr *addr, struct sk_buff *skb,
+ 	addr->v6.sin6_flowinfo = 0; /* FIXME */
+ 	addr->v6.sin6_scope_id = ((struct inet6_skb_parm *)skb->cb)->iif;
+ 
++	/* Always called on head skb, so this is safe */
+ 	sh = sctp_hdr(skb);
+ 	if (is_saddr) {
+ 		*port  = sh->source;
+@@ -713,8 +714,7 @@ static int sctp_v6_addr_to_user(struct sctp_sock *sp, union sctp_addr *addr)
+ /* Where did this skb come from?  */
+ static int sctp_v6_skb_iif(const struct sk_buff *skb)
+ {
+-	struct inet6_skb_parm *opt = (struct inet6_skb_parm *) skb->cb;
+-	return opt->iif;
++	return IP6CB(skb)->iif;
+ }
+ 
+ /* Was this packet marked by Explicit Congestion Notification? */
+@@ -783,15 +783,14 @@ static void sctp_inet6_skb_msgname(struct sk_buff *skb, char *msgname,
+ 	if (ip_hdr(skb)->version == 4) {
+ 		addr->v4.sin_family = AF_INET;
+ 		addr->v4.sin_port = sh->source;
+-		addr->v4.sin_addr.s_addr =  ip_hdr(skb)->saddr;
++		addr->v4.sin_addr.s_addr = ip_hdr(skb)->saddr;
+ 	} else {
+ 		addr->v6.sin6_family = AF_INET6;
+ 		addr->v6.sin6_flowinfo = 0;
+ 		addr->v6.sin6_port = sh->source;
+ 		addr->v6.sin6_addr = ipv6_hdr(skb)->saddr;
+ 		if (ipv6_addr_type(&addr->v6.sin6_addr) & IPV6_ADDR_LINKLOCAL) {
+-			struct sctp_ulpevent *ev = sctp_skb2event(skb);
+-			addr->v6.sin6_scope_id = ev->iif;
++			addr->v6.sin6_scope_id = sctp_v6_skb_iif(skb);
+ 		}
+ 	}
+ 
+diff --git a/net/sctp/protocol.c b/net/sctp/protocol.c
+index 1768628058cf..44fbeae31d0a 100644
+--- a/net/sctp/protocol.c
++++ b/net/sctp/protocol.c
+@@ -245,6 +245,7 @@ static void sctp_v4_from_skb(union sctp_addr *addr, struct sk_buff *skb,
+ 	port = &addr->v4.sin_port;
+ 	addr->v4.sin_family = AF_INET;
+ 
++	/* Always called on head skb, so this is safe */
+ 	sh = sctp_hdr(skb);
+ 	if (is_saddr) {
+ 		*port  = sh->source;
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+index 8f36c1df3b6f..4c10e8df69ca 100644
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -6120,7 +6120,8 @@ static int sctp_eat_data(const struct sctp_association *asoc,
+ 		af = sctp_get_af_specific(
+ 			ipver2af(ip_hdr(chunk->skb)->version));
+ 
+-		if (af && af->is_ce(chunk->skb) && asoc->peer.ecn_capable) {
++		if (af && af->is_ce(sctp_gso_headskb(chunk->skb)) &&
++		    asoc->peer.ecn_capable) {
+ 			/* Do real work as sideffect. */
+ 			sctp_add_cmd_sf(commands, SCTP_CMD_ECN_CE,
+ 					SCTP_U32(tsn));
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 34a2b15b5d0d..9d515a113d06 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -2068,7 +2068,7 @@ SCTP_STATIC int sctp_recvmsg(struct kiocb *iocb, struct sock *sk,
+ {
+ 	struct sctp_ulpevent *event = NULL;
+ 	struct sctp_sock *sp = sctp_sk(sk);
+-	struct sk_buff *skb;
++	struct sk_buff *skb, *head_skb;
+ 	int copied;
+ 	int err = 0;
+ 	int skb_len;
+@@ -2105,12 +2105,16 @@ SCTP_STATIC int sctp_recvmsg(struct kiocb *iocb, struct sock *sk,
+ 	if (err)
+ 		goto out_free;
+ 
+-	sock_recv_ts_and_drops(msg, sk, skb);
++	if (event->chunk && event->chunk->head_skb)
++		head_skb = event->chunk->head_skb;
++	else
++		head_skb = skb;
++	sock_recv_ts_and_drops(msg, sk, head_skb);
+ 	if (sctp_ulpevent_is_notification(event)) {
+ 		msg->msg_flags |= MSG_NOTIFICATION;
+ 		sp->pf->event_msgname(event, msg->msg_name, addr_len);
+ 	} else {
+-		sp->pf->skb_msgname(skb, msg->msg_name, addr_len);
++		sp->pf->skb_msgname(head_skb, msg->msg_name, addr_len);
+ 	}
+ 
+ 	/* Check if we allow SCTP_SNDRCVINFO. */
+diff --git a/net/sctp/ulpevent.c b/net/sctp/ulpevent.c
+index daef787acd61..b2af2a44b23c 100644
+--- a/net/sctp/ulpevent.c
++++ b/net/sctp/ulpevent.c
+@@ -749,6 +749,12 @@ struct sctp_ulpevent *sctp_ulpevent_make_rcvmsg(struct sctp_association *asoc,
+ 
+ 	sctp_ulpevent_receive_data(event, asoc);
+ 
++	/* And hold the chunk as we need it for getting the IP headers
++	 * later in recvmsg
++	 */
++	sctp_chunk_hold(chunk);
++	event->chunk = chunk;
++
+ 	event->stream = ntohs(chunk->subh.data_hdr->stream);
+ 	event->ssn = ntohs(chunk->subh.data_hdr->ssn);
+ 	event->ppid = chunk->subh.data_hdr->ppid;
+@@ -758,11 +764,11 @@ struct sctp_ulpevent *sctp_ulpevent_make_rcvmsg(struct sctp_association *asoc,
+ 	}
+ 	event->tsn = ntohl(chunk->subh.data_hdr->tsn);
+ 	event->msg_flags |= chunk->chunk_hdr->flags;
+-	event->iif = sctp_chunk_iif(chunk);
+ 
+ 	return event;
+ 
+ fail_mark:
++	sctp_chunk_put(chunk);
+ 	kfree_skb(skb);
+ fail:
+ 	return NULL;
+@@ -1043,6 +1049,7 @@ static void sctp_ulpevent_release_data(struct sctp_ulpevent *event)
+ 
+ done:
+ 	sctp_assoc_rwnd_increase(event->asoc, len);
++	sctp_chunk_put(event->chunk);
+ 	sctp_ulpevent_release_owner(event);
+ }
+ 
+@@ -1065,6 +1072,7 @@ static void sctp_ulpevent_release_frag_data(struct sctp_ulpevent *event)
+ 	}
+ 
+ done:
++	sctp_chunk_put(event->chunk);
+ 	sctp_ulpevent_release_owner(event);
+ }
+ 
