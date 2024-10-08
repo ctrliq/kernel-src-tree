@@ -1,0 +1,215 @@
+mei: me: use runtime PG pm domain for non wakeable devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit e13fa90ce42d8e7ee501426ea414c8ae4a5366ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e13fa90c.failed
+
+For non wakeable devices we can't use pci runtime framework
+as we are not able to wakeup from D3 states.
+Instead we create new pg runtime domain that only drives ME power
+gating protocol to reduce the power consumption.
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit e13fa90ce42d8e7ee501426ea414c8ae4a5366ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/pci-me.c
+diff --cc drivers/misc/mei/pci-me.c
+index 3a3889205f93,88516b02c685..000000000000
+--- a/drivers/misc/mei/pci-me.c
++++ b/drivers/misc/mei/pci-me.c
+@@@ -89,7 -87,13 +89,17 @@@ static const struct pci_device_id mei_m
+  
+  MODULE_DEVICE_TABLE(pci, mei_me_pci_tbl);
+  
+++<<<<<<< HEAD
+ +static DEFINE_MUTEX(mei_mutex);
+++=======
++ #ifdef CONFIG_PM_RUNTIME
++ static inline void mei_me_set_pm_domain(struct mei_device *dev);
++ static inline void mei_me_unset_pm_domain(struct mei_device *dev);
++ #else
++ static inline void mei_me_set_pm_domain(struct mei_device *dev) {}
++ static inline void mei_me_unset_pm_domain(struct mei_device *dev) {}
++ #endif /* CONFIG_PM_RUNTIME */
+++>>>>>>> e13fa90ce42d (mei: me: use runtime PG pm domain for non wakeable devices)
+  
+  /**
+   * mei_quirk_probe - probe for devices that doesn't valid ME interface
+@@@ -232,7 -233,16 +242,20 @@@ static int mei_me_probe(struct pci_dev 
+  
+  	schedule_delayed_work(&dev->timer_work, HZ);
+  
+++<<<<<<< HEAD
+ +	mutex_unlock(&mei_mutex);
+++=======
++ 	/*
++ 	* For not wake-able HW runtime pm framework
++ 	* can't be used on pci device level.
++ 	* Use domain runtime pm callbacks instead.
++ 	*/
++ 	if (!pci_dev_run_wake(pdev))
++ 		mei_me_set_pm_domain(dev);
++ 
++ 	if (mei_pg_is_enabled(dev))
++ 		pm_runtime_put_noidle(&pdev->dev);
+++>>>>>>> e13fa90ce42d (mei: me: use runtime PG pm domain for non wakeable devices)
+  
+  	dev_dbg(&pdev->dev, "initialization successful.\n");
+  
+@@@ -283,7 -292,8 +306,12 @@@ static void mei_me_remove(struct pci_de
+  	dev_dbg(&pdev->dev, "stop\n");
+  	mei_stop(dev);
+  
+++<<<<<<< HEAD
+ +	mei_pdev = NULL;
+++=======
++ 	if (!pci_dev_run_wake(pdev))
++ 		mei_me_unset_pm_domain(dev);
+++>>>>>>> e13fa90ce42d (mei: me: use runtime PG pm domain for non wakeable devices)
+  
+  	/* disable interrupts */
+  	mei_disable_interrupts(dev);
+@@@ -363,8 -373,116 +391,120 @@@ static int mei_me_pci_resume(struct dev
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ #endif /* CONFIG_PM_SLEEP */
++ 
++ #ifdef CONFIG_PM_RUNTIME
++ static int mei_me_pm_runtime_idle(struct device *device)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(device);
++ 	struct mei_device *dev;
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime_idle\n");
++ 
++ 	dev = pci_get_drvdata(pdev);
++ 	if (!dev)
++ 		return -ENODEV;
++ 	if (mei_write_is_idle(dev))
++ 		pm_schedule_suspend(device, MEI_ME_RPM_TIMEOUT * 2);
++ 
++ 	return -EBUSY;
++ }
++ 
++ static int mei_me_pm_runtime_suspend(struct device *device)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(device);
++ 	struct mei_device *dev;
++ 	int ret;
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime suspend\n");
++ 
++ 	dev = pci_get_drvdata(pdev);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	mutex_lock(&dev->device_lock);
++ 
++ 	if (mei_write_is_idle(dev))
++ 		ret = mei_me_pg_set_sync(dev);
++ 	else
++ 		ret = -EAGAIN;
++ 
++ 	mutex_unlock(&dev->device_lock);
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime suspend ret=%d\n", ret);
++ 
++ 	return ret;
++ }
++ 
++ static int mei_me_pm_runtime_resume(struct device *device)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(device);
++ 	struct mei_device *dev;
++ 	int ret;
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime resume\n");
++ 
++ 	dev = pci_get_drvdata(pdev);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	mutex_lock(&dev->device_lock);
++ 
++ 	ret = mei_me_pg_unset_sync(dev);
++ 
++ 	mutex_unlock(&dev->device_lock);
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime resume ret = %d\n", ret);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * mei_me_set_pm_domain - fill and set pm domian stucture for device
++  *
++  * @dev: mei_device
++  */
++ static inline void mei_me_set_pm_domain(struct mei_device *dev)
++ {
++ 	struct pci_dev *pdev  = dev->pdev;
++ 
++ 	if (pdev->dev.bus && pdev->dev.bus->pm) {
++ 		dev->pg_domain.ops = *pdev->dev.bus->pm;
++ 
++ 		dev->pg_domain.ops.runtime_suspend = mei_me_pm_runtime_suspend;
++ 		dev->pg_domain.ops.runtime_resume = mei_me_pm_runtime_resume;
++ 		dev->pg_domain.ops.runtime_idle = mei_me_pm_runtime_idle;
++ 
++ 		pdev->dev.pm_domain = &dev->pg_domain;
++ 	}
++ }
++ 
++ /**
++  * mei_me_unset_pm_domain - clean pm domian stucture for device
++  *
++  * @dev: mei_device
++  */
++ static inline void mei_me_unset_pm_domain(struct mei_device *dev)
++ {
++ 	/* stop using pm callbacks if any */
++ 	dev->pdev->dev.pm_domain = NULL;
++ }
++ #endif /* CONFIG_PM_RUNTIME */
++ 
++ #ifdef CONFIG_PM
++ static const struct dev_pm_ops mei_me_pm_ops = {
++ 	SET_SYSTEM_SLEEP_PM_OPS(mei_me_pci_suspend,
++ 				mei_me_pci_resume)
++ 	SET_RUNTIME_PM_OPS(
++ 		mei_me_pm_runtime_suspend,
++ 		mei_me_pm_runtime_resume,
++ 		mei_me_pm_runtime_idle)
++ };
+++>>>>>>> e13fa90ce42d (mei: me: use runtime PG pm domain for non wakeable devices)
+  
+ +static SIMPLE_DEV_PM_OPS(mei_me_pm_ops, mei_me_pci_suspend, mei_me_pci_resume);
+  #define MEI_ME_PM_OPS	(&mei_me_pm_ops)
+  #else
+  #define MEI_ME_PM_OPS	NULL
+diff --git a/drivers/misc/mei/mei_dev.h b/drivers/misc/mei/mei_dev.h
+index 307fbba18ca2..41b08bb75871 100644
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -425,6 +425,9 @@ struct mei_device {
+ 	 * Power Gating support
+ 	 */
+ 	enum mei_pg_event pg_event;
++#ifdef CONFIG_PM_RUNTIME
++	struct dev_pm_domain pg_domain;
++#endif /* CONFIG_PM_RUNTIME */
+ 
+ 	unsigned char rd_msg_buf[MEI_RD_MSG_BUF_SIZE];	/* control messages */
+ 	u32 rd_msg_hdr;
+* Unmerged path drivers/misc/mei/pci-me.c
