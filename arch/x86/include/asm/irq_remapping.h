@@ -31,6 +31,10 @@ struct msi_msg;
 struct pci_dev;
 struct irq_cfg;
 
+enum irq_remap_cap {
+	IRQ_POSTING_CAP = 0,
+};
+
 #ifdef CONFIG_IRQ_REMAP
 
 extern void set_irq_remapping_broken(void);
