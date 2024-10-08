@@ -1,0 +1,390 @@
+sched/deadline: Fix bandwidth check/update when migrating tasks between exclusive cpusets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@arm.com>
+commit 7f51412a415d87ea8598d14722fb31e4f5701257
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7f51412a.failed
+
+Exclusive cpusets are the only way users can restrict SCHED_DEADLINE tasks
+affinity (performing what is commonly called clustered scheduling).
+Unfortunately, such thing is currently broken for two reasons:
+
+ - No check is performed when the user tries to attach a task to
+   an exlusive cpuset (recall that exclusive cpusets have an
+   associated maximum allowed bandwidth).
+
+ - Bandwidths of source and destination cpusets are not correctly
+   updated after a task is migrated between them.
+
+This patch fixes both things at once, as they are opposite faces
+of the same coin.
+
+The check is performed in cpuset_can_attach(), as there aren't any
+points of failure after that function. The updated is split in two
+halves. We first reserve bandwidth in the destination cpuset, after
+we pass the check in cpuset_can_attach(). And we then release
+bandwidth from the source cpuset when the task's affinity is
+actually changed. Even if there can be time windows when sched_setattr()
+may erroneously fail in the source cpuset, we are fine with it, as
+we can't perfom an atomic update of both cpusets at once.
+
+	Reported-by: Daniel Wagner <daniel.wagner@bmw-carit.de>
+	Reported-by: Vincent Legout <vincent@legout.info>
+	Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Dario Faggioli <raistlin@linux.it>
+	Cc: Michael Trimarchi <michael@amarulasolutions.com>
+	Cc: Fabio Checconi <fchecconi@gmail.com>
+	Cc: michael@amarulasolutions.com
+	Cc: luca.abeni@unitn.it
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: cgroups@vger.kernel.org
+Link: http://lkml.kernel.org/r/1411118561-26323-3-git-send-email-juri.lelli@arm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 7f51412a415d87ea8598d14722fb31e4f5701257)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cpuset.c
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+#	kernel/sched/sched.h
+diff --cc kernel/cpuset.c
+index 7e3a1129e077,7af8577fc8f8..000000000000
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@@ -1383,24 -1417,20 +1383,30 @@@ static int cpuset_can_attach(struct cgr
+  	struct task_struct *task;
+  	int ret;
+  
+ -	/* used later by cpuset_attach() */
+ -	cpuset_attach_old_cs = task_cs(cgroup_taskset_first(tset));
+ -
+  	mutex_lock(&cpuset_mutex);
+  
+ -	/* allow moving tasks into an empty cpuset if on default hierarchy */
+  	ret = -ENOSPC;
+ -	if (!cgroup_on_dfl(css->cgroup) &&
+ -	    (cpumask_empty(cs->cpus_allowed) || nodes_empty(cs->mems_allowed)))
+ +	if (cpumask_empty(cs->cpus_allowed) || nodes_empty(cs->mems_allowed))
+  		goto out_unlock;
+  
+++<<<<<<< HEAD
+ +	cgroup_taskset_for_each(task, cgrp, tset) {
+ +		/*
+ +		 * Kthreads which disallow setaffinity shouldn't be moved
+ +		 * to a new cpuset; we don't want to change their cpu
+ +		 * affinity and isolating such threads by their set of
+ +		 * allowed nodes is unnecessary.  Thus, cpusets are not
+ +		 * applicable for such threads.  This prevents checking for
+ +		 * success of set_cpus_allowed_ptr() on all attached tasks
+ +		 * before cpus_allowed may be changed.
+ +		 */
+ +		ret = -EINVAL;
+ +		if (task->flags & PF_NO_SETAFFINITY)
+++=======
++ 	cgroup_taskset_for_each(task, tset) {
++ 		ret = task_can_attach(task, cs->cpus_allowed);
++ 		if (ret)
+++>>>>>>> 7f51412a415d (sched/deadline: Fix bandwidth check/update when migrating tasks between exclusive cpusets)
+  			goto out_unlock;
+  		ret = security_task_setscheduler(task);
+  		if (ret)
+diff --cc kernel/sched/core.c
+index f8654b1100de,9993feeb8b10..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1974,8 -1982,106 +1974,107 @@@ void sched_fork(unsigned long clone_fla
+  #endif
+  
+  	put_cpu();
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ unsigned long to_ratio(u64 period, u64 runtime)
++ {
++ 	if (runtime == RUNTIME_INF)
++ 		return 1ULL << 20;
++ 
++ 	/*
++ 	 * Doing this here saves a lot of checks in all
++ 	 * the calling paths, and returning zero seems
++ 	 * safe for them anyway.
++ 	 */
++ 	if (period == 0)
++ 		return 0;
++ 
++ 	return div64_u64(runtime << 20, period);
++ }
++ 
++ #ifdef CONFIG_SMP
++ inline struct dl_bw *dl_bw_of(int i)
++ {
++ 	rcu_lockdep_assert(rcu_read_lock_sched_held(),
++ 			   "sched RCU must be held");
++ 	return &cpu_rq(i)->rd->dl_bw;
++ }
++ 
++ static inline int dl_bw_cpus(int i)
++ {
++ 	struct root_domain *rd = cpu_rq(i)->rd;
++ 	int cpus = 0;
++ 
++ 	rcu_lockdep_assert(rcu_read_lock_sched_held(),
++ 			   "sched RCU must be held");
++ 	for_each_cpu_and(i, rd->span, cpu_active_mask)
++ 		cpus++;
++ 
++ 	return cpus;
++ }
++ #else
++ inline struct dl_bw *dl_bw_of(int i)
++ {
++ 	return &cpu_rq(i)->dl.dl_bw;
++ }
++ 
++ static inline int dl_bw_cpus(int i)
++ {
++ 	return 1;
++ }
++ #endif
++ 
++ /*
++  * We must be sure that accepting a new task (or allowing changing the
++  * parameters of an existing one) is consistent with the bandwidth
++  * constraints. If yes, this function also accordingly updates the currently
++  * allocated bandwidth to reflect the new situation.
++  *
++  * This function is called while holding p's rq->lock.
++  */
++ static int dl_overflow(struct task_struct *p, int policy,
++ 		       const struct sched_attr *attr)
++ {
++ 
++ 	struct dl_bw *dl_b = dl_bw_of(task_cpu(p));
++ 	u64 period = attr->sched_period ?: attr->sched_deadline;
++ 	u64 runtime = attr->sched_runtime;
++ 	u64 new_bw = dl_policy(policy) ? to_ratio(period, runtime) : 0;
++ 	int cpus, err = -1;
++ 
++ 	if (new_bw == p->dl.dl_bw)
++ 		return 0;
++ 
++ 	/*
++ 	 * Either if a task, enters, leave, or stays -deadline but changes
++ 	 * its parameters, we may need to update accordingly the total
++ 	 * allocated bandwidth of the container.
++ 	 */
++ 	raw_spin_lock(&dl_b->lock);
++ 	cpus = dl_bw_cpus(task_cpu(p));
++ 	if (dl_policy(policy) && !task_has_dl_policy(p) &&
++ 	    !__dl_overflow(dl_b, cpus, 0, new_bw)) {
++ 		__dl_add(dl_b, new_bw);
++ 		err = 0;
++ 	} else if (dl_policy(policy) && task_has_dl_policy(p) &&
++ 		   !__dl_overflow(dl_b, cpus, p->dl.dl_bw, new_bw)) {
++ 		__dl_clear(dl_b, p->dl.dl_bw);
++ 		__dl_add(dl_b, new_bw);
++ 		err = 0;
++ 	} else if (!dl_policy(policy) && task_has_dl_policy(p)) {
++ 		__dl_clear(dl_b, p->dl.dl_bw);
++ 		err = 0;
++ 	}
++ 	raw_spin_unlock(&dl_b->lock);
++ 
++ 	return err;
++ }
++ 
++ extern void init_dl_bw(struct dl_bw *dl_b);
++ 
+++>>>>>>> 7f51412a415d (sched/deadline: Fix bandwidth check/update when migrating tasks between exclusive cpusets)
+  /*
+   * wake_up_new_task - wake up a newly created task for the first time.
+   *
+@@@ -5062,7 -4650,85 +5161,58 @@@ void init_idle(struct task_struct *idle
+  #endif
+  }
+  
++ int task_can_attach(struct task_struct *p,
++ 		    const struct cpumask *cs_cpus_allowed)
++ {
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Kthreads which disallow setaffinity shouldn't be moved
++ 	 * to a new cpuset; we don't want to change their cpu
++ 	 * affinity and isolating such threads by their set of
++ 	 * allowed nodes is unnecessary.  Thus, cpusets are not
++ 	 * applicable for such threads.  This prevents checking for
++ 	 * success of set_cpus_allowed_ptr() on all attached tasks
++ 	 * before cpus_allowed may be changed.
++ 	 */
++ 	if (p->flags & PF_NO_SETAFFINITY) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ #ifdef CONFIG_SMP
++ 	if (dl_task(p) && !cpumask_intersects(task_rq(p)->rd->span,
++ 					      cs_cpus_allowed)) {
++ 		unsigned int dest_cpu = cpumask_any_and(cpu_active_mask,
++ 							cs_cpus_allowed);
++ 		struct dl_bw *dl_b = dl_bw_of(dest_cpu);
++ 		bool overflow;
++ 		int cpus;
++ 		unsigned long flags;
++ 
++ 		raw_spin_lock_irqsave(&dl_b->lock, flags);
++ 		cpus = dl_bw_cpus(dest_cpu);
++ 		overflow = __dl_overflow(dl_b, cpus, 0, p->dl.dl_bw);
++ 		if (overflow)
++ 			ret = -EBUSY;
++ 		else {
++ 			/*
++ 			 * We reserve space for this task in the destination
++ 			 * root_domain, as we can't fail after this point.
++ 			 * We will free resources in the source root_domain
++ 			 * later on (see set_cpus_allowed_dl()).
++ 			 */
++ 			__dl_add(dl_b, p->dl.dl_bw);
++ 		}
++ 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
++ 
++ 	}
++ #endif
++ out:
++ 	return ret;
++ }
++ 
+  #ifdef CONFIG_SMP
+ -/*
+ - * move_queued_task - move a queued task to new rq.
+ - *
+ - * Returns (locked) new rq. Old rq's lock is released.
+ - */
+ -static struct rq *move_queued_task(struct task_struct *p, int new_cpu)
+ -{
+ -	struct rq *rq = task_rq(p);
+ -
+ -	lockdep_assert_held(&rq->lock);
+ -
+ -	dequeue_task(rq, p, 0);
+ -	p->on_rq = TASK_ON_RQ_MIGRATING;
+ -	set_task_cpu(p, new_cpu);
+ -	raw_spin_unlock(&rq->lock);
+ -
+ -	rq = cpu_rq(new_cpu);
+ -
+ -	raw_spin_lock(&rq->lock);
+ -	BUG_ON(task_cpu(p) != new_cpu);
+ -	p->on_rq = TASK_ON_RQ_QUEUED;
+ -	enqueue_task(rq, p, 0);
+ -	check_preempt_curr(rq, p, 0);
+ -
+ -	return rq;
+ -}
+ -
+  void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+  {
+  	if (p->sched_class && p->sched_class->set_cpus_allowed)
+diff --cc kernel/sched/sched.h
+index b976abe32e72,ec3917c5f898..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -103,6 -132,69 +103,72 @@@ struct rt_bandwidth 
+  	struct hrtimer		rt_period_timer;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ void __dl_clear_params(struct task_struct *p);
++ 
++ /*
++  * To keep the bandwidth of -deadline tasks and groups under control
++  * we need some place where:
++  *  - store the maximum -deadline bandwidth of the system (the group);
++  *  - cache the fraction of that bandwidth that is currently allocated.
++  *
++  * This is all done in the data structure below. It is similar to the
++  * one used for RT-throttling (rt_bandwidth), with the main difference
++  * that, since here we are only interested in admission control, we
++  * do not decrease any runtime while the group "executes", neither we
++  * need a timer to replenish it.
++  *
++  * With respect to SMP, the bandwidth is given on a per-CPU basis,
++  * meaning that:
++  *  - dl_bw (< 100%) is the bandwidth of the system (group) on each CPU;
++  *  - dl_total_bw array contains, in the i-eth element, the currently
++  *    allocated bandwidth on the i-eth CPU.
++  * Moreover, groups consume bandwidth on each CPU, while tasks only
++  * consume bandwidth on the CPU they're running on.
++  * Finally, dl_total_bw_cpu is used to cache the index of dl_total_bw
++  * that will be shown the next time the proc or cgroup controls will
++  * be red. It on its turn can be changed by writing on its own
++  * control.
++  */
++ struct dl_bandwidth {
++ 	raw_spinlock_t dl_runtime_lock;
++ 	u64 dl_runtime;
++ 	u64 dl_period;
++ };
++ 
++ static inline int dl_bandwidth_enabled(void)
++ {
++ 	return sysctl_sched_rt_runtime >= 0;
++ }
++ 
++ extern struct dl_bw *dl_bw_of(int i);
++ 
++ struct dl_bw {
++ 	raw_spinlock_t lock;
++ 	u64 bw, total_bw;
++ };
++ 
++ static inline
++ void __dl_clear(struct dl_bw *dl_b, u64 tsk_bw)
++ {
++ 	dl_b->total_bw -= tsk_bw;
++ }
++ 
++ static inline
++ void __dl_add(struct dl_bw *dl_b, u64 tsk_bw)
++ {
++ 	dl_b->total_bw += tsk_bw;
++ }
++ 
++ static inline
++ bool __dl_overflow(struct dl_bw *dl_b, int cpus, u64 old_bw, u64 new_bw)
++ {
++ 	return dl_b->bw != -1 &&
++ 	       dl_b->bw * cpus < dl_b->total_bw - old_bw + new_bw;
++ }
++ 
+++>>>>>>> 7f51412a415d (sched/deadline: Fix bandwidth check/update when migrating tasks between exclusive cpusets)
+  extern struct mutex sched_domains_mutex;
+  
+  #ifdef CONFIG_CGROUP_SCHED
+* Unmerged path kernel/sched/deadline.c
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e57aba91f593..b8d019618477 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1964,6 +1964,8 @@ static inline void tsk_restore_flags(struct task_struct *task,
+ 	task->flags |= orig_flags & flags;
+ }
+ 
++extern int task_can_attach(struct task_struct *p,
++			   const struct cpumask *cs_cpus_allowed);
+ #ifdef CONFIG_SMP
+ extern void do_set_cpus_allowed(struct task_struct *p,
+ 			       const struct cpumask *new_mask);
+* Unmerged path kernel/cpuset.c
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/sched.h
