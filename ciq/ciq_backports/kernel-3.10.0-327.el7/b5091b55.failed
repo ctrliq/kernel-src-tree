@@ -1,0 +1,161 @@
+bonding: Replace rcu_dereference() with rcu_access_pointer()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Andreea-Cristina Bernat <bernat.ada@gmail.com>
+commit b5091b552a9fd7c45f9f8f4efa23bc78af0553cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b5091b55.failed
+
+This "rcu_dereference()" call is used directly in a condition.
+Since its return value is never dereferenced it is recommended to use
+"rcu_access_pointer()" instead of "rcu_dereference()".
+Therefore, this patch makes this replacement.
+
+The following Coccinelle semantic patch was used for solving it:
+@@
+@@
+
+(
+ if(
+ (<+...
+- rcu_dereference
++ rcu_access_pointer
+  (...)
+ ...+>)) {...}
+|
+ while(
+ (<+...
+- rcu_dereference
++ rcu_access_pointer
+  (...)
+  ...+>)) {...}
+)
+
+	Signed-off-by: Andreea-Cristina Bernat <bernat.ada@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b5091b552a9fd7c45f9f8f4efa23bc78af0553cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+diff --cc drivers/net/bonding/bond_alb.c
+index 06a8df1ef842,73c21e233131..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -1313,9 -1370,109 +1313,99 @@@ void bond_alb_deinitialize(struct bondi
+  
+  	tlb_deinitialize(bond);
+  
+ -	if (bond_info->rlb_enabled)
+ +	if (bond_info->rlb_enabled) {
+  		rlb_deinitialize(bond);
+ -}
+ -
+ -static int bond_do_alb_xmit(struct sk_buff *skb, struct bonding *bond,
+ -		struct slave *tx_slave)
+ -{
+ -	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct ethhdr *eth_data = eth_hdr(skb);
+ -
+ -	if (!tx_slave) {
+ -		/* unbalanced or unassigned, send through primary */
+ -		tx_slave = rcu_dereference(bond->curr_active_slave);
+ -		if (bond->params.tlb_dynamic_lb)
+ -			bond_info->unbalanced_load += skb->len;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (tx_slave && bond_slave_can_tx(tx_slave)) {
++ 		if (tx_slave != rcu_access_pointer(bond->curr_active_slave)) {
++ 			ether_addr_copy(eth_data->h_source,
++ 					tx_slave->dev->dev_addr);
++ 		}
++ 
++ 		bond_dev_queue_xmit(bond, skb, tx_slave->dev);
++ 		goto out;
++ 	}
++ 
++ 	if (tx_slave && bond->params.tlb_dynamic_lb) {
++ 		_lock_tx_hashtbl(bond);
++ 		__tlb_clear_slave(bond, tx_slave, 0);
++ 		_unlock_tx_hashtbl(bond);
++ 	}
++ 
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ out:
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static int bond_tlb_update_slave_arr(struct bonding *bond,
++ 				     struct slave *skipslave)
++ {
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct slave *tx_slave;
++ 	struct list_head *iter;
++ 	struct tlb_up_slave *new_arr, *old_arr;
++ 
++ 	new_arr = kzalloc(offsetof(struct tlb_up_slave, arr[bond->slave_cnt]),
++ 			  GFP_ATOMIC);
++ 	if (!new_arr)
++ 		return -ENOMEM;
++ 
++ 	bond_for_each_slave(bond, tx_slave, iter) {
++ 		if (!bond_slave_can_tx(tx_slave))
++ 			continue;
++ 		if (skipslave == tx_slave)
++ 			continue;
++ 		new_arr->arr[new_arr->count++] = tx_slave;
++ 	}
++ 
++ 	old_arr = rtnl_dereference(bond_info->slave_arr);
++ 	rcu_assign_pointer(bond_info->slave_arr, new_arr);
++ 	if (old_arr)
++ 		kfree_rcu(old_arr, rcu);
++ 
++ 	return 0;
++ }
++ 
++ int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct ethhdr *eth_data;
++ 	struct slave *tx_slave = NULL;
++ 	u32 hash_index;
++ 
++ 	skb_reset_mac_header(skb);
++ 	eth_data = eth_hdr(skb);
++ 
++ 	/* Do not TX balance any multicast or broadcast */
++ 	if (!is_multicast_ether_addr(eth_data->h_dest)) {
++ 		switch (skb->protocol) {
++ 		case htons(ETH_P_IP):
++ 		case htons(ETH_P_IPX):
++ 		    /* In case of IPX, it will falback to L2 hash */
++ 		case htons(ETH_P_IPV6):
++ 			hash_index = bond_xmit_hash(bond, skb);
++ 			if (bond->params.tlb_dynamic_lb) {
++ 				tx_slave = tlb_choose_channel(bond,
++ 							      hash_index & 0xFF,
++ 							      skb->len);
++ 			} else {
++ 				struct tlb_up_slave *slaves;
++ 
++ 				slaves = rcu_dereference(bond_info->slave_arr);
++ 				if (slaves && slaves->count)
++ 					tx_slave = slaves->arr[hash_index %
++ 							       slaves->count];
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	return bond_do_alb_xmit(skb, bond, tx_slave);
+++>>>>>>> b5091b552a9f (bonding: Replace rcu_dereference() with rcu_access_pointer())
+  }
+  
+  int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+* Unmerged path drivers/net/bonding/bond_alb.c
