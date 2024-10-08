@@ -1,0 +1,120 @@
+sched/deadline: Fix bad accounting of nr_running
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@gmail.com>
+commit 3d5f35bdfdef5fd627afe9b4bf9c4f32d17f4593
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3d5f35bd.failed
+
+Rostedt writes:
+
+My test suite was locking up hard when enabling mmiotracer. This was due
+to the mmiotracer placing all but one CPU offline. I found this out
+when I was able to reproduce the bug with just my stress-cpu-hotplug
+test. This bug baffled me because it would not always trigger, and
+would only trigger on the first run after boot up. The
+stress-cpu-hotplug test would crash hard the first run, or never crash
+at all. But a new reboot may cause it to crash on the first run again.
+
+I spent all week bisecting this, as I couldn't find a consistent
+reproducer. I finally narrowed it down to the sched deadline patches,
+and even more peculiar, to the commit that added the sched
+deadline boot up self test to the latency tracer. Then it dawned on me
+to what the bug was.
+
+All it took was to run a task under sched deadline to screw up the CPU
+hot plugging. This explained why it would lock up only on the first run
+of the stress-cpu-hotplug test. The bug happened when the boot up self
+test of the schedule latency tracer would test a deadline task. The
+deadline task would corrupt something that would cause CPU hotplug to
+fail. If it didn't corrupt it, the stress test would always work
+(there's no other sched deadline tasks that would run to cause
+problems). If it did corrupt on boot up, the first test would lockup
+hard.
+
+I proved this theory by running my deadline test program on another box,
+and then run the stress-cpu-hotplug test, and it would now consistently
+lock up. I could run stress-cpu-hotplug over and over with no problem,
+but once I ran the deadline test, the next run of the
+stress-cpu-hotplug would lock hard.
+
+After adding lots of tracing to the code, I found the cause. The
+function tracer showed that migrate_tasks() was stuck in an infinite
+loop, where rq->nr_running never equaled 1 to break out of it. When I
+added a trace_printk() to see what that number was, it was 335 and
+never decrementing!
+
+Looking at the deadline code I found:
+
+static void __dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags) {
+	dequeue_dl_entity(&p->dl);
+	dequeue_pushable_dl_task(rq, p);
+}
+
+static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags) {
+	update_curr_dl(rq);
+	__dequeue_task_dl(rq, p, flags);
+
+	dec_nr_running(rq);
+}
+
+And this:
+
+	if (dl_runtime_exceeded(rq, dl_se)) {
+		__dequeue_task_dl(rq, curr, 0);
+		if (likely(start_dl_timer(dl_se, curr->dl.dl_boosted)))
+			dl_se->dl_throttled = 1;
+		else
+			enqueue_task_dl(rq, curr, ENQUEUE_REPLENISH);
+
+		if (!is_leftmost(curr, &rq->dl))
+			resched_task(curr);
+	}
+
+Notice how we call __dequeue_task_dl() and in the else case we
+call enqueue_task_dl()? Also notice that dequeue_task_dl() has
+underscores where enqueue_task_dl() does not. The enqueue_task_dl()
+calls inc_nr_running(rq), but __dequeue_task_dl() does not. This is
+where we get nr_running out of sync.
+
+[snip]
+
+Another point where nr_running can get out of sync is when the dl_timer
+fires:
+
+	dl_se->dl_throttled = 0;
+	if (p->on_rq) {
+		enqueue_task_dl(rq, p, ENQUEUE_REPLENISH);
+		if (task_has_dl_policy(rq->curr))
+			check_preempt_curr_dl(rq, p, 0);
+		else
+			resched_task(rq->curr);
+
+This patch does two things:
+
+ - correctly accounts for throttled tasks (that are now considered
+   !running);
+
+ - fixes the bug, updating nr_running from {inc,dec}_dl_tasks(),
+   since we risk to update it twice in some situations (e.g., a
+   task is dequeued while it has exceeded its budget).
+
+	Cc: mingo@redhat.com
+	Cc: torvalds@linux-foundation.org
+	Cc: akpm@linux-foundation.org
+	Reported-by: Steven Rostedt <rostedt@goodmis.org>
+	Reviewed-by: Steven Rostedt <rostedt@goodmis.org>
+	Tested-by: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1392884379-13744-1-git-send-email-juri.lelli@gmail.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 3d5f35bdfdef5fd627afe9b4bf9c4f32d17f4593)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/deadline.c
