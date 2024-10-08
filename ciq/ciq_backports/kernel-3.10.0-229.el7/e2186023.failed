@@ -1,0 +1,675 @@
+powerpc/powernv: Add support for POWER8 split core on powernv
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Add support for POWER8 split core on powernv (Don Zickus) [1127366]
+Rebuild_FUZZ: 92.98%
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit e2186023f2d81ee7bb42d2a7dec3d889df7cdace
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e2186023.failed
+
+Upcoming POWER8 chips support a concept called split core. This is where the
+core can be split into subcores that although not full cores, are able to
+appear as full cores to a guest.
+
+The splitting & unsplitting procedure is mildly complicated, and explained at
+length in the comments within the patch.
+
+One notable detail is that when splitting or unsplitting we need to pull
+offline cpus out of their offline state to do work as part of the procedure.
+
+The interface for changing the split mode is via a sysfs file, eg:
+
+ $ echo 2 > /sys/devices/system/cpu/subcores_per_core
+
+Currently supported values are '1', '2' and '4'. And indicate respectively that
+the core should be unsplit, split in half, and split in quarters. These modes
+correspond to threads_per_subcore of 8, 4 and 2.
+
+We do not allow changing the split mode while KVM VMs are active. This is to
+prevent the value changing while userspace is configuring the VM, and also to
+prevent the mode being changed in such a way that existing guests are unable to
+be run.
+
+CPU hotplug fixes by Srivatsa.  max_cpus fixes by Mahesh.  cpuset fixes by
+benh.  Fix for irq race by paulus.  The rest by mikey and mpe.
+
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+	Signed-off-by: Michael Neuling <mikey@neuling.org>
+	Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit e2186023f2d81ee7bb42d2a7dec3d889df7cdace)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/reg.h
+diff --cc arch/powerpc/include/asm/reg.h
+index e983e00762dc,2cd799b382ec..000000000000
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@@ -223,10 -225,20 +223,19 @@@
+  #define   CTRL_TE	0x00c00000	/* thread enable */
+  #define   CTRL_RUNLATCH	0x1
+  #define SPRN_DAWR	0xB4
+++<<<<<<< HEAD
+++=======
++ #define SPRN_RPR	0xBA	/* Relative Priority Register */
++ #define SPRN_CIABR	0xBB
++ #define   CIABR_PRIV		0x3
++ #define   CIABR_PRIV_USER	1
++ #define   CIABR_PRIV_SUPER	2
++ #define   CIABR_PRIV_HYPER	3
+++>>>>>>> e2186023f2d8 (powerpc/powernv: Add support for POWER8 split core on powernv)
+  #define SPRN_DAWRX	0xBC
+ -#define   DAWRX_USER	__MASK(0)
+ -#define   DAWRX_KERNEL	__MASK(1)
+ -#define   DAWRX_HYP	__MASK(2)
+ -#define   DAWRX_WTI	__MASK(3)
+ -#define   DAWRX_WT	__MASK(4)
+ -#define   DAWRX_DR	__MASK(5)
+ -#define   DAWRX_DW	__MASK(6)
+ +#define   DAWRX_USER	(1UL << 0)
+ +#define   DAWRX_KERNEL	(1UL << 1)
+ +#define   DAWRX_HYP	(1UL << 2)
+  #define SPRN_DABR	0x3F5	/* Data Address Breakpoint Register */
+  #define SPRN_DABR2	0x13D	/* e300 */
+  #define SPRN_DABRX	0x3F7	/* Data Address Breakpoint Register Extension */
+@@@ -260,6 -272,14 +269,17 @@@
+  #define SPRN_HRMOR	0x139	/* Real mode offset register */
+  #define SPRN_HSRR0	0x13A	/* Hypervisor Save/Restore 0 */
+  #define SPRN_HSRR1	0x13B	/* Hypervisor Save/Restore 1 */
+++<<<<<<< HEAD
+++=======
++ #define SPRN_IC		0x350	/* Virtual Instruction Count */
++ #define SPRN_VTB	0x351	/* Virtual Time Base */
++ #define SPRN_LDBAR	0x352	/* LD Base Address Register */
++ #define SPRN_PMICR	0x354   /* Power Management Idle Control Reg */
++ #define SPRN_PMSR	0x355   /* Power Management Status Reg */
++ #define SPRN_PMMAR	0x356	/* Power Management Memory Activity Register */
++ #define SPRN_PMCR	0x374	/* Power Management Control Register */
++ 
+++>>>>>>> e2186023f2d8 (powerpc/powernv: Add support for POWER8 split core on powernv)
+  /* HFSCR and FSCR bit numbers are the same */
+  #define FSCR_TAR_LG	8	/* Enable Target Address Register */
+  #define FSCR_EBB_LG	7	/* Enable Event Based Branching */
+* Unmerged path arch/powerpc/include/asm/reg.h
+diff --git a/arch/powerpc/platforms/powernv/Makefile b/arch/powerpc/platforms/powernv/Makefile
+index 63cebb9b4d45..4ad0d345bc96 100644
+--- a/arch/powerpc/platforms/powernv/Makefile
++++ b/arch/powerpc/platforms/powernv/Makefile
+@@ -1,7 +1,7 @@
+ obj-y			+= setup.o opal-takeover.o opal-wrappers.o opal.o opal-async.o
+ obj-y			+= opal-rtc.o opal-nvram.o opal-lpc.o opal-flash.o
+ obj-y			+= rng.o opal-elog.o opal-dump.o opal-sysparam.o opal-sensor.o
+-obj-y			+= opal-msglog.o
++obj-y			+= opal-msglog.o subcore.o subcore-asm.o
+ 
+ obj-$(CONFIG_SMP)	+= smp.o
+ obj-$(CONFIG_PCI)	+= pci.o pci-p5ioc2.o pci-ioda.o
+diff --git a/arch/powerpc/platforms/powernv/powernv.h b/arch/powerpc/platforms/powernv/powernv.h
+index de6819be1f95..86195c98764a 100644
+--- a/arch/powerpc/platforms/powernv/powernv.h
++++ b/arch/powerpc/platforms/powernv/powernv.h
+@@ -17,4 +17,6 @@ static inline void pnv_pci_shutdown(void) { }
+ 
+ extern void pnv_lpc_init(void);
+ 
++bool cpu_core_split_required(void);
++
+ #endif /* _POWERNV_H */
+diff --git a/arch/powerpc/platforms/powernv/smp.c b/arch/powerpc/platforms/powernv/smp.c
+index e91f28f2ca7b..24bff4e0ffda 100644
+--- a/arch/powerpc/platforms/powernv/smp.c
++++ b/arch/powerpc/platforms/powernv/smp.c
+@@ -160,15 +160,17 @@ static void pnv_smp_cpu_kill_self(void)
+ 		ppc64_runlatch_off();
+ 		power7_nap();
+ 		ppc64_runlatch_on();
+-		if (!generic_check_cpu_restart(cpu)) {
++
++		/* Reenable IRQs briefly to clear the IPI that woke us */
++		local_irq_enable();
++		local_irq_disable();
++		mb();
++
++		if (cpu_core_split_required())
++			continue;
++
++		if (!generic_check_cpu_restart(cpu))
+ 			DBG("CPU%d Unexpected exit while offline !\n", cpu);
+-			/* We may be getting an IPI, so we re-enable
+-			 * interrupts to process it, it will be ignored
+-			 * since we aren't online (hopefully)
+-			 */
+-			local_irq_enable();
+-			local_irq_disable();
+-		}
+ 	}
+ 	mtspr(SPRN_LPCR, mfspr(SPRN_LPCR) | LPCR_PECE1);
+ 	DBG("CPU%d coming online...\n", cpu);
+diff --git a/arch/powerpc/platforms/powernv/subcore-asm.S b/arch/powerpc/platforms/powernv/subcore-asm.S
+new file mode 100644
+index 000000000000..39bb24aa8f34
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/subcore-asm.S
+@@ -0,0 +1,95 @@
++/*
++ * Copyright 2013, Michael (Ellerman|Neuling), IBM Corporation.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#include <asm/asm-offsets.h>
++#include <asm/ppc_asm.h>
++#include <asm/reg.h>
++
++#include "subcore.h"
++
++
++_GLOBAL(split_core_secondary_loop)
++	/*
++	 * r3 = u8 *state, used throughout the routine
++	 * r4 = temp
++	 * r5 = temp
++	 * ..
++	 * r12 = MSR
++	 */
++	mfmsr	r12
++
++	/* Disable interrupts so SRR0/1 don't get trashed */
++	li	r4,0
++	ori	r4,r4,MSR_EE|MSR_SE|MSR_BE|MSR_RI
++	andc	r4,r12,r4
++	sync
++	mtmsrd	r4
++
++	/* Switch to real mode and leave interrupts off */
++	li	r5, MSR_IR|MSR_DR
++	andc	r5, r4, r5
++
++	LOAD_REG_ADDR(r4, real_mode)
++
++	mtspr	SPRN_SRR0,r4
++	mtspr	SPRN_SRR1,r5
++	rfid
++	b	.	/* prevent speculative execution */
++
++real_mode:
++	/* Grab values from unsplit SPRs */
++	mfspr	r6,  SPRN_LDBAR
++	mfspr	r7,  SPRN_PMMAR
++	mfspr	r8,  SPRN_PMCR
++	mfspr	r9,  SPRN_RPR
++	mfspr	r10, SPRN_SDR1
++
++	/* Order reading the SPRs vs telling the primary we are ready to split */
++	sync
++
++	/* Tell thread 0 we are in real mode */
++	li	r4, SYNC_STEP_REAL_MODE
++	stb	r4, 0(r3)
++
++	li	r5, (HID0_POWER8_4LPARMODE | HID0_POWER8_2LPARMODE)@highest
++	sldi	r5, r5, 48
++
++	/* Loop until we see the split happen in HID0 */
++1:	mfspr	r4, SPRN_HID0
++	and.	r4, r4, r5
++	beq	1b
++
++	/*
++	 * We only need to initialise the below regs once for each subcore,
++	 * but it's simpler and harmless to do it on each thread.
++	 */
++
++	/* Make sure various SPRS have sane values */
++	li	r4, 0
++	mtspr	SPRN_LPID, r4
++	mtspr	SPRN_PCR, r4
++	mtspr	SPRN_HDEC, r4
++
++	/* Restore SPR values now we are split */
++	mtspr	SPRN_LDBAR, r6
++	mtspr	SPRN_PMMAR, r7
++	mtspr	SPRN_PMCR, r8
++	mtspr	SPRN_RPR, r9
++	mtspr	SPRN_SDR1, r10
++
++	LOAD_REG_ADDR(r5, virtual_mode)
++
++	/* Get out of real mode */
++	mtspr	SPRN_SRR0,r5
++	mtspr	SPRN_SRR1,r12
++	rfid
++	b	.	/* prevent speculative execution */
++
++virtual_mode:
++	blr
+diff --git a/arch/powerpc/platforms/powernv/subcore.c b/arch/powerpc/platforms/powernv/subcore.c
+new file mode 100644
+index 000000000000..894ecb3eb596
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/subcore.c
+@@ -0,0 +1,392 @@
++/*
++ * Copyright 2013, Michael (Ellerman|Neuling), IBM Corporation.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#define pr_fmt(fmt)	"powernv: " fmt
++
++#include <linux/kernel.h>
++#include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/device.h>
++#include <linux/gfp.h>
++#include <linux/smp.h>
++#include <linux/stop_machine.h>
++
++#include <asm/cputhreads.h>
++#include <asm/kvm_ppc.h>
++#include <asm/machdep.h>
++#include <asm/opal.h>
++#include <asm/smp.h>
++
++#include "subcore.h"
++
++
++/*
++ * Split/unsplit procedure:
++ *
++ * A core can be in one of three states, unsplit, 2-way split, and 4-way split.
++ *
++ * The mapping to subcores_per_core is simple:
++ *
++ *  State       | subcores_per_core
++ *  ------------|------------------
++ *  Unsplit     |        1
++ *  2-way split |        2
++ *  4-way split |        4
++ *
++ * The core is split along thread boundaries, the mapping between subcores and
++ * threads is as follows:
++ *
++ *  Unsplit:
++ *          ----------------------------
++ *  Subcore |            0             |
++ *          ----------------------------
++ *  Thread  |  0  1  2  3  4  5  6  7  |
++ *          ----------------------------
++ *
++ *  2-way split:
++ *          -------------------------------------
++ *  Subcore |        0        |        1        |
++ *          -------------------------------------
++ *  Thread  |  0   1   2   3  |  4   5   6   7  |
++ *          -------------------------------------
++ *
++ *  4-way split:
++ *          -----------------------------------------
++ *  Subcore |    0    |    1    |    2    |    3    |
++ *          -----------------------------------------
++ *  Thread  |  0   1  |  2   3  |  4   5  |  6   7  |
++ *          -----------------------------------------
++ *
++ *
++ * Transitions
++ * -----------
++ *
++ * It is not possible to transition between either of the split states, the
++ * core must first be unsplit. The legal transitions are:
++ *
++ *  -----------          ---------------
++ *  |         |  <---->  | 2-way split |
++ *  |         |          ---------------
++ *  | Unsplit |
++ *  |         |          ---------------
++ *  |         |  <---->  | 4-way split |
++ *  -----------          ---------------
++ *
++ * Unsplitting
++ * -----------
++ *
++ * Unsplitting is the simpler procedure. It requires thread 0 to request the
++ * unsplit while all other threads NAP.
++ *
++ * Thread 0 clears HID0_POWER8_DYNLPARDIS (Dynamic LPAR Disable). This tells
++ * the hardware that if all threads except 0 are napping, the hardware should
++ * unsplit the core.
++ *
++ * Non-zero threads are sent to a NAP loop, they don't exit the loop until they
++ * see the core unsplit.
++ *
++ * Core 0 spins waiting for the hardware to see all the other threads napping
++ * and perform the unsplit.
++ *
++ * Once thread 0 sees the unsplit, it IPIs the secondary threads to wake them
++ * out of NAP. They will then see the core unsplit and exit the NAP loop.
++ *
++ * Splitting
++ * ---------
++ *
++ * The basic splitting procedure is fairly straight forward. However it is
++ * complicated by the fact that after the split occurs, the newly created
++ * subcores are not in a fully initialised state.
++ *
++ * Most notably the subcores do not have the correct value for SDR1, which
++ * means they must not be running in virtual mode when the split occurs. The
++ * subcores have separate timebases SPRs but these are pre-synchronised by
++ * opal.
++ *
++ * To begin with secondary threads are sent to an assembly routine. There they
++ * switch to real mode, so they are immune to the uninitialised SDR1 value.
++ * Once in real mode they indicate that they are in real mode, and spin waiting
++ * to see the core split.
++ *
++ * Thread 0 waits to see that all secondaries are in real mode, and then begins
++ * the splitting procedure. It firstly sets HID0_POWER8_DYNLPARDIS, which
++ * prevents the hardware from unsplitting. Then it sets the appropriate HID bit
++ * to request the split, and spins waiting to see that the split has happened.
++ *
++ * Concurrently the secondaries will notice the split. When they do they set up
++ * their SPRs, notably SDR1, and then they can return to virtual mode and exit
++ * the procedure.
++ */
++
++/* Initialised at boot by subcore_init() */
++static int subcores_per_core;
++
++/*
++ * Used to communicate to offline cpus that we want them to pop out of the
++ * offline loop and do a split or unsplit.
++ *
++ * 0 - no split happening
++ * 1 - unsplit in progress
++ * 2 - split to 2 in progress
++ * 4 - split to 4 in progress
++ */
++static int new_split_mode;
++
++static cpumask_var_t cpu_offline_mask;
++
++struct split_state {
++	u8 step;
++	u8 master;
++};
++
++static DEFINE_PER_CPU(struct split_state, split_state);
++
++static void wait_for_sync_step(int step)
++{
++	int i, cpu = smp_processor_id();
++
++	for (i = cpu + 1; i < cpu + threads_per_core; i++)
++		while(per_cpu(split_state, i).step < step)
++			barrier();
++
++	/* Order the wait loop vs any subsequent loads/stores. */
++	mb();
++}
++
++static void unsplit_core(void)
++{
++	u64 hid0, mask;
++	int i, cpu;
++
++	mask = HID0_POWER8_2LPARMODE | HID0_POWER8_4LPARMODE;
++
++	cpu = smp_processor_id();
++	if (cpu_thread_in_core(cpu) != 0) {
++		while (mfspr(SPRN_HID0) & mask)
++			power7_nap(0);
++
++		per_cpu(split_state, cpu).step = SYNC_STEP_UNSPLIT;
++		return;
++	}
++
++	hid0 = mfspr(SPRN_HID0);
++	hid0 &= ~HID0_POWER8_DYNLPARDIS;
++	mtspr(SPRN_HID0, hid0);
++
++	while (mfspr(SPRN_HID0) & mask)
++		cpu_relax();
++
++	/* Wake secondaries out of NAP */
++	for (i = cpu + 1; i < cpu + threads_per_core; i++)
++		smp_send_reschedule(i);
++
++	wait_for_sync_step(SYNC_STEP_UNSPLIT);
++}
++
++static void split_core(int new_mode)
++{
++	struct {  u64 value; u64 mask; } split_parms[2] = {
++		{ HID0_POWER8_1TO2LPAR, HID0_POWER8_2LPARMODE },
++		{ HID0_POWER8_1TO4LPAR, HID0_POWER8_4LPARMODE }
++	};
++	int i, cpu;
++	u64 hid0;
++
++	/* Convert new_mode (2 or 4) into an index into our parms array */
++	i = (new_mode >> 1) - 1;
++	BUG_ON(i < 0 || i > 1);
++
++	cpu = smp_processor_id();
++	if (cpu_thread_in_core(cpu) != 0) {
++		split_core_secondary_loop(&per_cpu(split_state, cpu).step);
++		return;
++	}
++
++	wait_for_sync_step(SYNC_STEP_REAL_MODE);
++
++	/* Write new mode */
++	hid0  = mfspr(SPRN_HID0);
++	hid0 |= HID0_POWER8_DYNLPARDIS | split_parms[i].value;
++	mtspr(SPRN_HID0, hid0);
++
++	/* Wait for it to happen */
++	while (!(mfspr(SPRN_HID0) & split_parms[i].mask))
++		cpu_relax();
++}
++
++static void cpu_do_split(int new_mode)
++{
++	/*
++	 * At boot subcores_per_core will be 0, so we will always unsplit at
++	 * boot. In the usual case where the core is already unsplit it's a
++	 * nop, and this just ensures the kernel's notion of the mode is
++	 * consistent with the hardware.
++	 */
++	if (subcores_per_core != 1)
++		unsplit_core();
++
++	if (new_mode != 1)
++		split_core(new_mode);
++
++	mb();
++	per_cpu(split_state, smp_processor_id()).step = SYNC_STEP_FINISHED;
++}
++
++bool cpu_core_split_required(void)
++{
++	smp_rmb();
++
++	if (!new_split_mode)
++		return false;
++
++	cpu_do_split(new_split_mode);
++
++	return true;
++}
++
++static int cpu_update_split_mode(void *data)
++{
++	int cpu, new_mode = *(int *)data;
++
++	if (this_cpu_ptr(&split_state)->master) {
++		new_split_mode = new_mode;
++		smp_wmb();
++
++		cpumask_andnot(cpu_offline_mask, cpu_present_mask,
++			       cpu_online_mask);
++
++		/* This should work even though the cpu is offline */
++		for_each_cpu(cpu, cpu_offline_mask)
++			smp_send_reschedule(cpu);
++	}
++
++	cpu_do_split(new_mode);
++
++	if (this_cpu_ptr(&split_state)->master) {
++		/* Wait for all cpus to finish before we touch subcores_per_core */
++		for_each_present_cpu(cpu) {
++			if (cpu >= setup_max_cpus)
++				break;
++
++			while(per_cpu(split_state, cpu).step < SYNC_STEP_FINISHED)
++				barrier();
++		}
++
++		new_split_mode = 0;
++
++		/* Make the new mode public */
++		subcores_per_core = new_mode;
++		threads_per_subcore = threads_per_core / subcores_per_core;
++
++		/* Make sure the new mode is written before we exit */
++		mb();
++	}
++
++	return 0;
++}
++
++static int set_subcores_per_core(int new_mode)
++{
++	struct split_state *state;
++	int cpu;
++
++	if (kvm_hv_mode_active()) {
++		pr_err("Unable to change split core mode while KVM active.\n");
++		return -EBUSY;
++	}
++
++	/*
++	 * We are only called at boot, or from the sysfs write. If that ever
++	 * changes we'll need a lock here.
++	 */
++	BUG_ON(new_mode < 1 || new_mode > 4 || new_mode == 3);
++
++	for_each_present_cpu(cpu) {
++		state = &per_cpu(split_state, cpu);
++		state->step = SYNC_STEP_INITIAL;
++		state->master = 0;
++	}
++
++	get_online_cpus();
++
++	/* This cpu will update the globals before exiting stop machine */
++	this_cpu_ptr(&split_state)->master = 1;
++
++	/* Ensure state is consistent before we call the other cpus */
++	mb();
++
++	stop_machine(cpu_update_split_mode, &new_mode, cpu_online_mask);
++
++	put_online_cpus();
++
++	return 0;
++}
++
++static ssize_t __used store_subcores_per_core(struct device *dev,
++		struct device_attribute *attr, const char *buf,
++		size_t count)
++{
++	unsigned long val;
++	int rc;
++
++	/* We are serialised by the attribute lock */
++
++	rc = sscanf(buf, "%lx", &val);
++	if (rc != 1)
++		return -EINVAL;
++
++	switch (val) {
++	case 1:
++	case 2:
++	case 4:
++		if (subcores_per_core == val)
++			/* Nothing to do */
++			goto out;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	rc = set_subcores_per_core(val);
++	if (rc)
++		return rc;
++
++out:
++	return count;
++}
++
++static ssize_t show_subcores_per_core(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%x\n", subcores_per_core);
++}
++
++static DEVICE_ATTR(subcores_per_core, 0644,
++		show_subcores_per_core, store_subcores_per_core);
++
++static int subcore_init(void)
++{
++	if (!cpu_has_feature(CPU_FTR_ARCH_207S))
++		return 0;
++
++	/*
++	 * We need all threads in a core to be present to split/unsplit so
++         * continue only if max_cpus are aligned to threads_per_core.
++	 */
++	if (setup_max_cpus % threads_per_core)
++		return 0;
++
++	BUG_ON(!alloc_cpumask_var(&cpu_offline_mask, GFP_KERNEL));
++
++	set_subcores_per_core(1);
++
++	return device_create_file(cpu_subsys.dev_root,
++				  &dev_attr_subcores_per_core);
++}
++machine_device_initcall(powernv, subcore_init);
+diff --git a/arch/powerpc/platforms/powernv/subcore.h b/arch/powerpc/platforms/powernv/subcore.h
+new file mode 100644
+index 000000000000..148abc91debf
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/subcore.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright 2013, Michael Ellerman, IBM Corporation.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++/* These are ordered and tested with <= */
++#define SYNC_STEP_INITIAL	0
++#define SYNC_STEP_UNSPLIT	1	/* Set by secondary when it sees unsplit */
++#define SYNC_STEP_REAL_MODE	2	/* Set by secondary when in real mode  */
++#define SYNC_STEP_FINISHED	3	/* Set by secondary when split/unsplit is done */
++
++#ifndef __ASSEMBLY__
++void split_core_secondary_loop(u8 *state);
++#endif
