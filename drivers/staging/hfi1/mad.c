@@ -2681,7 +2681,7 @@ static int pma_get_opa_porterrors(struct opa_pma_mad *pmp,
 {
 	size_t response_data_size;
 	struct _port_ectrs *rsp;
-	unsigned long port_num;
+	u8 port_num;
 	struct opa_port_error_counters64_msg *req;
 	struct hfi1_devdata *dd = dd_from_ibdev(ibdev);
 	u32 num_ports;
@@ -2722,7 +2722,7 @@ static int pma_get_opa_porterrors(struct opa_pma_mad *pmp,
 	port_num = find_first_bit((unsigned long *)&port_mask,
 					sizeof(port_mask));
 
-	if ((u8)port_num != port) {
+	if (port_num != port) {
 		pmp->mad_hdr.status |= IB_SMP_INVALID_FIELD;
 		return reply((struct ib_mad_hdr *)pmp);
 	}
@@ -2733,7 +2733,7 @@ static int pma_get_opa_porterrors(struct opa_pma_mad *pmp,
 	ppd = ppd_from_ibp(ibp);
 
 	memset(rsp, 0, sizeof(*rsp));
-	rsp->port_number = (u8)port_num;
+	rsp->port_number = port_num;
 
 	rsp->port_rcv_constraint_errors =
 		cpu_to_be64(read_port_cntr(ppd, C_SW_RCV_CSTR_ERR,
@@ -2801,7 +2801,7 @@ static int pma_get_opa_errorinfo(struct opa_pma_mad *pmp,
 	struct hfi1_devdata *dd = dd_from_ibdev(ibdev);
 	u64 port_mask;
 	u32 num_ports;
-	unsigned long port_num;
+	u8 port_num;
 	u8 num_pslm;
 	u64 reg;
 
@@ -2834,7 +2834,7 @@ static int pma_get_opa_errorinfo(struct opa_pma_mad *pmp,
 	port_num = find_first_bit((unsigned long *)&port_mask,
 				  sizeof(port_mask));
 
-	if ((u8)port_num != port) {
+	if (port_num != port) {
 		pmp->mad_hdr.status |= IB_SMP_INVALID_FIELD;
 		return reply((struct ib_mad_hdr *)pmp);
 	}
@@ -3042,7 +3042,7 @@ static int pma_set_opa_errorinfo(struct opa_pma_mad *pmp,
 	struct hfi1_devdata *dd = dd_from_ibdev(ibdev);
 	u64 port_mask;
 	u32 num_ports;
-	unsigned long port_num;
+	u8 port_num;
 	u8 num_pslm;
 	u32 error_info_select;
 
@@ -3067,7 +3067,7 @@ static int pma_set_opa_errorinfo(struct opa_pma_mad *pmp,
 	port_num = find_first_bit((unsigned long *)&port_mask,
 				  sizeof(port_mask));
 
-	if ((u8)port_num != port) {
+	if (port_num != port) {
 		pmp->mad_hdr.status |= IB_SMP_INVALID_FIELD;
 		return reply((struct ib_mad_hdr *)pmp);
 	}
