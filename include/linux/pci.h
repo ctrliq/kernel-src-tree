@@ -1029,11 +1029,6 @@ int pci_save_vc_state(struct pci_dev *dev);
 void pci_restore_vc_state(struct pci_dev *dev);
 void pci_allocate_vc_save_buffers(struct pci_dev *dev);
 
-#define PCI_EXP_IDO_REQUEST	(1<<0)
-#define PCI_EXP_IDO_COMPLETION	(1<<1)
-void pci_enable_ido(struct pci_dev *dev, unsigned long type);
-void pci_disable_ido(struct pci_dev *dev, unsigned long type);
-
 /* For use by arch with custom probe code */
 void set_pcie_port_type(struct pci_dev *pdev);
 void set_pcie_hotplug_bridge(struct pci_dev *pdev);
@@ -1467,14 +1462,6 @@ static inline int pci_enable_wake(struct pci_dev *dev, pci_power_t state,
 				  int enable)
 {
 	return 0;
-}
-
-static inline void pci_enable_ido(struct pci_dev *dev, unsigned long type)
-{
-}
-
-static inline void pci_disable_ido(struct pci_dev *dev, unsigned long type)
-{
 }
 
 static inline int pci_request_regions(struct pci_dev *dev, const char *res_name)
