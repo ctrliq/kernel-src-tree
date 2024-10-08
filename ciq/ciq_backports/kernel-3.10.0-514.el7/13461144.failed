@@ -1,0 +1,368 @@
+ip_tunnel: add support for setting flow label via collect metadata
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 134611446dc657e1bbc73ca0e4e6b599df687db0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/13461144.failed
+
+This patch extends udp_tunnel6_xmit_skb() to pass in the IPv6 flow label
+from call sites. Currently, there's no such option and it's always set to
+zero when writing ip6_flow_hdr(). Add a label member to ip_tunnel_key, so
+that flow-based tunnels via collect metadata frontends can make use of it.
+vxlan and geneve will be converted to add flow label support separately.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 134611446dc657e1bbc73ca0e4e6b599df687db0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+#	drivers/net/vxlan.c
+#	include/net/dst_metadata.h
+#	include/net/ip_tunnels.h
+#	net/tipc/udp_media.c
+diff --cc drivers/net/geneve.c
+index d82906728571,89ccff79d76c..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -704,6 -986,173 +704,176 @@@ err
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_IPV6)
++ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
++ 				    struct ip_tunnel_info *info)
++ {
++ 	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct geneve_sock *gs6 = geneve->sock6;
++ 	struct dst_entry *dst = NULL;
++ 	const struct iphdr *iip; /* interior IP header */
++ 	int err = -EINVAL;
++ 	struct flowi6 fl6;
++ 	__u8 prio, ttl;
++ 	__be16 sport;
++ 	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
++ 	u32 flags = geneve->flags;
++ 
++ 	if (geneve->collect_md) {
++ 		if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX))) {
++ 			netdev_dbg(dev, "no tunnel metadata\n");
++ 			goto tx_error;
++ 		}
++ 	}
++ 
++ 	dst = geneve_get_v6_dst(skb, dev, &fl6, info);
++ 	if (IS_ERR(dst)) {
++ 		err = PTR_ERR(dst);
++ 		goto tx_error;
++ 	}
++ 
++ 	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
++ 	skb_reset_mac_header(skb);
++ 
++ 	iip = ip_hdr(skb);
++ 
++ 	if (info) {
++ 		const struct ip_tunnel_key *key = &info->key;
++ 		u8 *opts = NULL;
++ 		u8 vni[3];
++ 
++ 		tunnel_id_to_vni(key->tun_id, vni);
++ 		if (info->options_len)
++ 			opts = ip_tunnel_info_opts(info);
++ 
++ 		if (key->tun_flags & TUNNEL_CSUM)
++ 			flags &= ~GENEVE_F_UDP_ZERO_CSUM6_TX;
++ 		else
++ 			flags |= GENEVE_F_UDP_ZERO_CSUM6_TX;
++ 
++ 		err = geneve6_build_skb(dst, skb, key->tun_flags, vni,
++ 					info->options_len, opts,
++ 					flags, xnet);
++ 		if (unlikely(err))
++ 			goto err;
++ 
++ 		prio = ip_tunnel_ecn_encap(key->tos, iip, skb);
++ 		ttl = key->ttl;
++ 	} else {
++ 		err = geneve6_build_skb(dst, skb, 0, geneve->vni,
++ 					0, NULL, flags, xnet);
++ 		if (unlikely(err))
++ 			goto err;
++ 
++ 		prio = ip_tunnel_ecn_encap(fl6.flowi6_tos, iip, skb);
++ 		ttl = geneve->ttl;
++ 		if (!ttl && ipv6_addr_is_multicast(&fl6.daddr))
++ 			ttl = 1;
++ 		ttl = ttl ? : ip6_dst_hoplimit(dst);
++ 	}
++ 	udp_tunnel6_xmit_skb(dst, gs6->sock->sk, skb, dev,
++ 			     &fl6.saddr, &fl6.daddr, prio, ttl, 0,
++ 			     sport, geneve->dst_port,
++ 			     !!(flags & GENEVE_F_UDP_ZERO_CSUM6_TX));
++ 	return NETDEV_TX_OK;
++ 
++ tx_error:
++ 	dev_kfree_skb(skb);
++ err:
++ 	if (err == -ELOOP)
++ 		dev->stats.collisions++;
++ 	else if (err == -ENETUNREACH)
++ 		dev->stats.tx_carrier_errors++;
++ 	else
++ 		dev->stats.tx_errors++;
++ 	return NETDEV_TX_OK;
++ }
++ #endif
++ 
++ static netdev_tx_t geneve_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct ip_tunnel_info *info = NULL;
++ 
++ 	if (geneve->collect_md)
++ 		info = skb_tunnel_info(skb);
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	if ((info && ip_tunnel_info_af(info) == AF_INET6) ||
++ 	    (!info && geneve->remote.sa.sa_family == AF_INET6))
++ 		return geneve6_xmit_skb(skb, dev, info);
++ #endif
++ 	return geneve_xmit_skb(skb, dev, info);
++ }
++ 
++ static int __geneve_change_mtu(struct net_device *dev, int new_mtu, bool strict)
++ {
++ 	/* The max_mtu calculation does not take account of GENEVE
++ 	 * options, to avoid excluding potentially valid
++ 	 * configurations.
++ 	 */
++ 	int max_mtu = IP_MAX_MTU - GENEVE_BASE_HLEN - sizeof(struct iphdr)
++ 		- dev->hard_header_len;
++ 
++ 	if (new_mtu < 68)
++ 		return -EINVAL;
++ 
++ 	if (new_mtu > max_mtu) {
++ 		if (strict)
++ 			return -EINVAL;
++ 
++ 		new_mtu = max_mtu;
++ 	}
++ 
++ 	dev->mtu = new_mtu;
++ 	return 0;
++ }
++ 
++ static int geneve_change_mtu(struct net_device *dev, int new_mtu)
++ {
++ 	return __geneve_change_mtu(dev, new_mtu, true);
++ }
++ 
++ static int geneve_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct rtable *rt;
++ 	struct flowi4 fl4;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	struct dst_entry *dst;
++ 	struct flowi6 fl6;
++ #endif
++ 
++ 	if (ip_tunnel_info_af(info) == AF_INET) {
++ 		rt = geneve_get_v4_rt(skb, dev, &fl4, info);
++ 		if (IS_ERR(rt))
++ 			return PTR_ERR(rt);
++ 
++ 		ip_rt_put(rt);
++ 		info->key.u.ipv4.src = fl4.saddr;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (ip_tunnel_info_af(info) == AF_INET6) {
++ 		dst = geneve_get_v6_dst(skb, dev, &fl6, info);
++ 		if (IS_ERR(dst))
++ 			return PTR_ERR(dst);
++ 
++ 		dst_release(dst);
++ 		info->key.u.ipv6.src = fl6.saddr;
++ #endif
++ 	} else {
++ 		return -EINVAL;
++ 	}
++ 
++ 	info->key.tp_src = udp_flow_src_port(geneve->net, skb,
++ 					     1, USHRT_MAX, true);
++ 	info->key.tp_dst = geneve->dst_port;
++ 	return 0;
++ }
++ 
+++>>>>>>> 134611446dc6 (ip_tunnel: add support for setting flow label via collect metadata)
+  static const struct net_device_ops geneve_netdev_ops = {
+  	.ndo_init		= geneve_init,
+  	.ndo_uninit		= geneve_uninit,
+diff --cc drivers/net/vxlan.c
+index 000e4c57a81e,8bdcd5ea8424..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2010,14 -2053,21 +2010,27 @@@ static void vxlan_xmit_one(struct sk_bu
+  			return;
+  		}
+  
+ -		if (!info)
+ -			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM6_TX);
+ -
+ -		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+++<<<<<<< HEAD
+ +		md.vni = htonl(vni << 8);
+ +		md.gbp = skb->mark;
+ +
+ +		err = vxlan6_xmit_skb(ndst, sk, skb, dev, &fl6.saddr, &fl6.daddr,
+ +				      0, ttl, src_port, dst_port, &md,
+ +				      !net_eq(vxlan->net, dev_net(vxlan->dev)),
+ +				      vxlan->flags);
+++=======
++ 		skb_scrub_packet(skb, xnet);
++ 		err = vxlan_build_skb(skb, ndst, sizeof(struct ipv6hdr),
++ 				      vni, md, flags, udp_sum);
++ 		if (err < 0) {
++ 			dst_release(ndst);
++ 			return;
++ 		}
++ 		udp_tunnel6_xmit_skb(ndst, sk, skb, dev,
++ 				     &saddr, &dst->sin6.sin6_addr, tos, ttl, 0,
++ 				     src_port, dst_port, !udp_sum);
+++>>>>>>> 134611446dc6 (ip_tunnel: add support for setting flow label via collect metadata)
+  #endif
+  	}
+  
+diff --cc include/net/ip_tunnels.h
+index 3a5ac80169cf,5dc2e454f866..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -27,13 -27,28 +27,19 @@@
+  /* Used to memset ip_tunnel padding. */
+  #define IP_TUNNEL_KEY_SIZE	offsetofend(struct ip_tunnel_key, tp_dst)
+  
+ -/* Used to memset ipv4 address padding. */
+ -#define IP_TUNNEL_KEY_IPV4_PAD	offsetofend(struct ip_tunnel_key, u.ipv4.dst)
+ -#define IP_TUNNEL_KEY_IPV4_PAD_LEN				\
+ -	(FIELD_SIZEOF(struct ip_tunnel_key, u) -		\
+ -	 FIELD_SIZEOF(struct ip_tunnel_key, u.ipv4))
+ -
+  struct ip_tunnel_key {
+  	__be64			tun_id;
+ -	union {
+ -		struct {
+ -			__be32	src;
+ -			__be32	dst;
+ -		} ipv4;
+ -		struct {
+ -			struct in6_addr src;
+ -			struct in6_addr dst;
+ -		} ipv6;
+ -	} u;
+ +	__be32			ipv4_src;
+ +	__be32			ipv4_dst;
+  	__be16			tun_flags;
+++<<<<<<< HEAD
+ +	u8			ipv4_tos;
+ +	u8			ipv4_ttl;
+++=======
++ 	u8			tos;		/* TOS for IPv4, TC for IPv6 */
++ 	u8			ttl;		/* TTL for IPv4, HL for IPv6 */
++ 	__be32			label;		/* Flow Label for IPv6 */
+++>>>>>>> 134611446dc6 (ip_tunnel: add support for setting flow label via collect metadata)
+  	__be16			tp_src;
+  	__be16			tp_dst;
+  };
+@@@ -168,19 -180,21 +174,37 @@@ int ip_tunnel_encap_add_ops(const struc
+  int ip_tunnel_encap_del_ops(const struct ip_tunnel_encap_ops *op,
+  			    unsigned int num);
+  
+++<<<<<<< HEAD
+ +static inline void __ip_tunnel_info_init(struct ip_tunnel_info *tun_info,
+ +					 __be32 saddr, __be32 daddr,
+ +					 u8 tos, u8 ttl,
+ +					 __be16 tp_src, __be16 tp_dst,
+ +					 __be64 tun_id, __be16 tun_flags,
+ +					 const void *opts, u8 opts_len)
+ +{
+ +	tun_info->key.tun_id = tun_id;
+ +	tun_info->key.ipv4_src = saddr;
+ +	tun_info->key.ipv4_dst = daddr;
+ +	tun_info->key.ipv4_tos = tos;
+ +	tun_info->key.ipv4_ttl = ttl;
+ +	tun_info->key.tun_flags = tun_flags;
+++=======
++ static inline void ip_tunnel_key_init(struct ip_tunnel_key *key,
++ 				      __be32 saddr, __be32 daddr,
++ 				      u8 tos, u8 ttl, __be32 label,
++ 				      __be16 tp_src, __be16 tp_dst,
++ 				      __be64 tun_id, __be16 tun_flags)
++ {
++ 	key->tun_id = tun_id;
++ 	key->u.ipv4.src = saddr;
++ 	key->u.ipv4.dst = daddr;
++ 	memset((unsigned char *)key + IP_TUNNEL_KEY_IPV4_PAD,
++ 	       0, IP_TUNNEL_KEY_IPV4_PAD_LEN);
++ 	key->tos = tos;
++ 	key->ttl = ttl;
++ 	key->label = label;
++ 	key->tun_flags = tun_flags;
+++>>>>>>> 134611446dc6 (ip_tunnel: add support for setting flow label via collect metadata)
+  
+  	/* For the tunnel types on the top of IPsec, the tp_src and tp_dst of
+  	 * the upper tunnel are used.
+* Unmerged path include/net/dst_metadata.h
+* Unmerged path net/tipc/udp_media.c
+* Unmerged path drivers/net/geneve.c
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/dst_metadata.h
+* Unmerged path include/net/ip_tunnels.h
+diff --git a/include/net/udp_tunnel.h b/include/net/udp_tunnel.h
+index c491c1221606..22133d1e5f0a 100644
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@ -87,8 +87,8 @@ int udp_tunnel6_xmit_skb(struct dst_entry *dst, struct sock *sk,
+ 			 struct sk_buff *skb,
+ 			 struct net_device *dev, struct in6_addr *saddr,
+ 			 struct in6_addr *daddr,
+-			 __u8 prio, __u8 ttl, __be16 src_port,
+-			 __be16 dst_port, bool nocheck);
++			 __u8 prio, __u8 ttl, __be32 label,
++			 __be16 src_port, __be16 dst_port, bool nocheck);
+ #endif
+ 
+ void udp_tunnel_sock_release(struct socket *sock);
+diff --git a/net/ipv6/ip6_udp_tunnel.c b/net/ipv6/ip6_udp_tunnel.c
+index bba8903e871f..1c0f101b9a45 100644
+--- a/net/ipv6/ip6_udp_tunnel.c
++++ b/net/ipv6/ip6_udp_tunnel.c
+@@ -66,8 +66,8 @@ int udp_tunnel6_xmit_skb(struct dst_entry *dst, struct sock *sk,
+ 			 struct sk_buff *skb,
+ 			 struct net_device *dev, struct in6_addr *saddr,
+ 			 struct in6_addr *daddr,
+-			 __u8 prio, __u8 ttl, __be16 src_port,
+-			 __be16 dst_port, bool nocheck)
++			 __u8 prio, __u8 ttl, __be32 label,
++			 __be16 src_port, __be16 dst_port, bool nocheck)
+ {
+ 	struct udphdr *uh;
+ 	struct ipv6hdr *ip6h;
+@@ -91,7 +91,7 @@ int udp_tunnel6_xmit_skb(struct dst_entry *dst, struct sock *sk,
+ 	__skb_push(skb, sizeof(*ip6h));
+ 	skb_reset_network_header(skb);
+ 	ip6h		  = ipv6_hdr(skb);
+-	ip6_flow_hdr(ip6h, prio, htonl(0));
++	ip6_flow_hdr(ip6h, prio, label);
+ 	ip6h->payload_len = htons(skb->len);
+ 	ip6h->nexthdr     = IPPROTO_UDP;
+ 	ip6h->hop_limit   = ttl;
+* Unmerged path net/tipc/udp_media.c
