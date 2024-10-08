@@ -1,0 +1,191 @@
+IB/rdamvt: Fix rdmavt s_ack_queue sizing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 8b103e9cdee5f381bc20a8a9f9bb5be11de8e68f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8b103e9c.failed
+
+rdmavt allows the driver to specify the size of the ack queue, but
+only uses it for the modify QP limit testing for setting the atomic
+limit value.
+
+The driver dependent size is now used to size the s_ack_queue ring
+dynamicially.
+
+Since the driver knows its size, the driver will use its define
+for any ring size dependent code.
+
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 8b103e9cdee5f381bc20a8a9f9bb5be11de8e68f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/qp.c
+diff --cc drivers/infiniband/sw/rdmavt/qp.c
+index 38a063f382e8,5fa4d4d81ee0..000000000000
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@@ -390,6 -390,111 +390,114 @@@ static void free_qpn(struct rvt_qpn_tab
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * rvt_clear_mr_refs - Drop help mr refs
++  * @qp: rvt qp data structure
++  * @clr_sends: If shoudl clear send side or not
++  */
++ static void rvt_clear_mr_refs(struct rvt_qp *qp, int clr_sends)
++ {
++ 	unsigned n;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(qp->ibqp.device);
++ 
++ 	if (test_and_clear_bit(RVT_R_REWIND_SGE, &qp->r_aflags))
++ 		rvt_put_ss(&qp->s_rdma_read_sge);
++ 
++ 	rvt_put_ss(&qp->r_sge);
++ 
++ 	if (clr_sends) {
++ 		while (qp->s_last != qp->s_head) {
++ 			struct rvt_swqe *wqe = rvt_get_swqe_ptr(qp, qp->s_last);
++ 			unsigned i;
++ 
++ 			for (i = 0; i < wqe->wr.num_sge; i++) {
++ 				struct rvt_sge *sge = &wqe->sg_list[i];
++ 
++ 				rvt_put_mr(sge->mr);
++ 			}
++ 			if (qp->ibqp.qp_type == IB_QPT_UD ||
++ 			    qp->ibqp.qp_type == IB_QPT_SMI ||
++ 			    qp->ibqp.qp_type == IB_QPT_GSI)
++ 				atomic_dec(&ibah_to_rvtah(
++ 						wqe->ud_wr.ah)->refcount);
++ 			if (++qp->s_last >= qp->s_size)
++ 				qp->s_last = 0;
++ 			smp_wmb(); /* see qp_set_savail */
++ 		}
++ 		if (qp->s_rdma_mr) {
++ 			rvt_put_mr(qp->s_rdma_mr);
++ 			qp->s_rdma_mr = NULL;
++ 		}
++ 	}
++ 
++ 	if (qp->ibqp.qp_type != IB_QPT_RC)
++ 		return;
++ 
++ 	for (n = 0; n < rvt_max_atomic(rdi); n++) {
++ 		struct rvt_ack_entry *e = &qp->s_ack_queue[n];
++ 
++ 		if (e->opcode == IB_OPCODE_RC_RDMA_READ_REQUEST &&
++ 		    e->rdma_sge.mr) {
++ 			rvt_put_mr(e->rdma_sge.mr);
++ 			e->rdma_sge.mr = NULL;
++ 		}
++ 	}
++ }
++ 
++ /**
++  * rvt_remove_qp - remove qp form table
++  * @rdi: rvt dev struct
++  * @qp: qp to remove
++  *
++  * Remove the QP from the table so it can't be found asynchronously by
++  * the receive routine.
++  */
++ static void rvt_remove_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp)
++ {
++ 	struct rvt_ibport *rvp = rdi->ports[qp->port_num - 1];
++ 	u32 n = hash_32(qp->ibqp.qp_num, rdi->qp_dev->qp_table_bits);
++ 	unsigned long flags;
++ 	int removed = 1;
++ 
++ 	spin_lock_irqsave(&rdi->qp_dev->qpt_lock, flags);
++ 
++ 	if (rcu_dereference_protected(rvp->qp[0],
++ 			lockdep_is_held(&rdi->qp_dev->qpt_lock)) == qp) {
++ 		RCU_INIT_POINTER(rvp->qp[0], NULL);
++ 	} else if (rcu_dereference_protected(rvp->qp[1],
++ 			lockdep_is_held(&rdi->qp_dev->qpt_lock)) == qp) {
++ 		RCU_INIT_POINTER(rvp->qp[1], NULL);
++ 	} else {
++ 		struct rvt_qp *q;
++ 		struct rvt_qp __rcu **qpp;
++ 
++ 		removed = 0;
++ 		qpp = &rdi->qp_dev->qp_table[n];
++ 		for (; (q = rcu_dereference_protected(*qpp,
++ 			lockdep_is_held(&rdi->qp_dev->qpt_lock))) != NULL;
++ 			qpp = &q->next) {
++ 			if (q == qp) {
++ 				RCU_INIT_POINTER(*qpp,
++ 				     rcu_dereference_protected(qp->next,
++ 				     lockdep_is_held(&rdi->qp_dev->qpt_lock)));
++ 				removed = 1;
++ 				trace_rvt_qpremove(qp, n);
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	spin_unlock_irqrestore(&rdi->qp_dev->qpt_lock, flags);
++ 	if (removed) {
++ 		synchronize_rcu();
++ 		if (atomic_dec_and_test(&qp->refcount))
++ 			wake_up(&qp->wait);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 8b103e9cdee5 (IB/rdamvt: Fix rdmavt s_ack_queue sizing)
+   * reset_qp - initialize the QP state to the reset state
+   * @qp: the QP to reset
+   * @type: the QP type
+* Unmerged path drivers/infiniband/sw/rdmavt/qp.c
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index c579fa3bd96f..2726ca5e75fc 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -327,6 +327,15 @@ static inline unsigned rvt_get_npkeys(struct rvt_dev_info *rdi)
+ 	return rdi->dparms.npkeys;
+ }
+ 
++/*
++ * Return the max atomic suitable for determining
++ * the size of the ack ring buffer in a QP.
++ */
++static inline unsigned int rvt_max_atomic(struct rvt_dev_info *rdi)
++{
++	return rdi->dparms.max_rdma_atomic + 1;
++}
++
+ /*
+  * Return the indexed PKEY from the port PKEY table.
+  */
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index 680d27326824..9aee5480812c 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -209,8 +209,6 @@ struct rvt_mmap_info {
+ 	unsigned size;
+ };
+ 
+-#define RVT_MAX_RDMA_ATOMIC	16
+-
+ /*
+  * This structure holds the information that the send tasklet needs
+  * to send a RDMA read response or atomic operation.
+@@ -276,8 +274,7 @@ struct rvt_qp {
+ 	atomic_t refcount ____cacheline_aligned_in_smp;
+ 	wait_queue_head_t wait;
+ 
+-	struct rvt_ack_entry s_ack_queue[RVT_MAX_RDMA_ATOMIC + 1]
+-		____cacheline_aligned_in_smp;
++	struct rvt_ack_entry *s_ack_queue;
+ 	struct rvt_sge_state s_rdma_read_sge;
+ 
+ 	spinlock_t r_lock ____cacheline_aligned_in_smp;      /* used for APM */
