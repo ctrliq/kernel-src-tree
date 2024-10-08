@@ -1017,7 +1017,7 @@ static int read_events(struct perf_kvm_stat *kvm)
 	kvm->session = perf_session__new(&file, false, &kvm->tool);
 	if (!kvm->session) {
 		pr_err("Initializing perf session failed\n");
-		return -EINVAL;
+		return -1;
 	}
 
 	symbol__init(&kvm->session->header.env);
@@ -1317,7 +1317,7 @@ static int kvm_events_live(struct perf_kvm_stat *kvm,
 	 */
 	kvm->session = perf_session__new(&file, false, &kvm->tool);
 	if (kvm->session == NULL) {
-		err = -ENOMEM;
+		err = -1;
 		goto out;
 	}
 	kvm->session->evlist = kvm->evlist;
