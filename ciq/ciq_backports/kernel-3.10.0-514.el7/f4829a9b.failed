@@ -1,0 +1,313 @@
+blk-mq: fix racy updates of rq->errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit f4829a9b7a61e159367350008a608b062c4f6840
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f4829a9b.failed
+
+blk_mq_complete_request may be a no-op if the request has already
+been completed by others means (e.g. a timeout or cancellation), but
+currently drivers have to set rq->errors before calling
+blk_mq_complete_request, which might leave us with the wrong error value.
+
+Add an error parameter to blk_mq_complete_request so that we can
+defer setting rq->errors until we known we won the race to complete the
+request.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f4829a9b7a61e159367350008a608b062c4f6840)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/loop.c
+#	drivers/block/nvme-core.c
+#	drivers/block/xen-blkfront.c
+diff --cc drivers/block/loop.c
+index d5de459aa504,674f800a3b57..000000000000
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@@ -1619,6 -1450,105 +1619,108 @@@ int loop_unregister_transfer(int number
+  EXPORT_SYMBOL(loop_register_transfer);
+  EXPORT_SYMBOL(loop_unregister_transfer);
+  
+++<<<<<<< HEAD
+++=======
++ static int loop_queue_rq(struct blk_mq_hw_ctx *hctx,
++ 		const struct blk_mq_queue_data *bd)
++ {
++ 	struct loop_cmd *cmd = blk_mq_rq_to_pdu(bd->rq);
++ 	struct loop_device *lo = cmd->rq->q->queuedata;
++ 
++ 	blk_mq_start_request(bd->rq);
++ 
++ 	if (lo->lo_state != Lo_bound)
++ 		return -EIO;
++ 
++ 	if (cmd->rq->cmd_flags & REQ_WRITE) {
++ 		struct loop_device *lo = cmd->rq->q->queuedata;
++ 		bool need_sched = true;
++ 
++ 		spin_lock_irq(&lo->lo_lock);
++ 		if (lo->write_started)
++ 			need_sched = false;
++ 		else
++ 			lo->write_started = true;
++ 		list_add_tail(&cmd->list, &lo->write_cmd_head);
++ 		spin_unlock_irq(&lo->lo_lock);
++ 
++ 		if (need_sched)
++ 			queue_work(lo->wq, &lo->write_work);
++ 	} else {
++ 		queue_work(lo->wq, &cmd->read_work);
++ 	}
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ }
++ 
++ static void loop_handle_cmd(struct loop_cmd *cmd)
++ {
++ 	const bool write = cmd->rq->cmd_flags & REQ_WRITE;
++ 	struct loop_device *lo = cmd->rq->q->queuedata;
++ 	int ret = 0;
++ 
++ 	if (write && (lo->lo_flags & LO_FLAGS_READ_ONLY)) {
++ 		ret = -EIO;
++ 		goto failed;
++ 	}
++ 
++ 	ret = do_req_filebacked(lo, cmd->rq);
++  failed:
++ 	blk_mq_complete_request(cmd->rq, ret ? -EIO : 0);
++ }
++ 
++ static void loop_queue_write_work(struct work_struct *work)
++ {
++ 	struct loop_device *lo =
++ 		container_of(work, struct loop_device, write_work);
++ 	LIST_HEAD(cmd_list);
++ 
++ 	spin_lock_irq(&lo->lo_lock);
++  repeat:
++ 	list_splice_init(&lo->write_cmd_head, &cmd_list);
++ 	spin_unlock_irq(&lo->lo_lock);
++ 
++ 	while (!list_empty(&cmd_list)) {
++ 		struct loop_cmd *cmd = list_first_entry(&cmd_list,
++ 				struct loop_cmd, list);
++ 		list_del_init(&cmd->list);
++ 		loop_handle_cmd(cmd);
++ 	}
++ 
++ 	spin_lock_irq(&lo->lo_lock);
++ 	if (!list_empty(&lo->write_cmd_head))
++ 		goto repeat;
++ 	lo->write_started = false;
++ 	spin_unlock_irq(&lo->lo_lock);
++ }
++ 
++ static void loop_queue_read_work(struct work_struct *work)
++ {
++ 	struct loop_cmd *cmd =
++ 		container_of(work, struct loop_cmd, read_work);
++ 
++ 	loop_handle_cmd(cmd);
++ }
++ 
++ static int loop_init_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx,
++ 		unsigned int numa_node)
++ {
++ 	struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	cmd->rq = rq;
++ 	INIT_WORK(&cmd->read_work, loop_queue_read_work);
++ 
++ 	return 0;
++ }
++ 
++ static struct blk_mq_ops loop_mq_ops = {
++ 	.queue_rq       = loop_queue_rq,
++ 	.map_queue      = blk_mq_map_queue,
++ 	.init_request	= loop_init_request,
++ };
++ 
+++>>>>>>> f4829a9b7a61 (blk-mq: fix racy updates of rq->errors)
+  static int loop_add(struct loop_device **l, int i)
+  {
+  	struct loop_device *lo;
+diff --cc drivers/block/nvme-core.c
+index f5099f908371,6f04771f1019..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -528,12 -618,22 +528,28 @@@ static void req_completion(struct nvme_
+  			spin_unlock_irqrestore(req->q->queue_lock, flags);
+  			return;
+  		}
+++<<<<<<< HEAD
+ +		req->errors = nvme_error_status(status);
+ +	} else
+ +		req->errors = 0;
+++=======
++ 
++ 		if (req->cmd_type == REQ_TYPE_DRV_PRIV) {
++ 			if (cmd_rq->ctx == CMD_CTX_CANCELLED)
++ 				status = -EINTR;
++ 		} else {
++ 			status = nvme_error_status(status);
++ 		}
++ 	}
++ 
++ 	if (req->cmd_type == REQ_TYPE_DRV_PRIV) {
++ 		u32 result = le32_to_cpup(&cqe->result);
++ 		req->special = (void *)(uintptr_t)result;
++ 	}
+++>>>>>>> f4829a9b7a61 (blk-mq: fix racy updates of rq->errors)
+  
+  	if (cmd_rq->aborted)
+ -		dev_warn(nvmeq->dev->dev,
+ +		dev_warn(&nvmeq->dev->pci_dev->dev,
+  			"completing aborted command with status:%04x\n",
+  			status);
+  
+@@@ -731,10 -859,10 +747,17 @@@ static int nvme_queue_rq(struct blk_mq_
+  	 * unless this namespace is formated such that the metadata can be
+  	 * stripped/generated by the controller with PRACT=1.
+  	 */
+++<<<<<<< HEAD
+ +	if (ns->ms && !blk_integrity_rq(req)) {
+ +		if (!(ns->pi_type && ns->ms == 8)) {
+ +			req->errors = -EFAULT;
+ +			blk_mq_complete_request(req);
+++=======
++ 	if (ns && ns->ms && !blk_integrity_rq(req)) {
++ 		if (!(ns->pi_type && ns->ms == 8) &&
++ 					req->cmd_type != REQ_TYPE_DRV_PRIV) {
++ 			blk_mq_complete_request(req, -EFAULT);
+++>>>>>>> f4829a9b7a61 (blk-mq: fix racy updates of rq->errors)
+  			return BLK_MQ_RQ_QUEUE_OK;
+  		}
+  	}
+diff --cc drivers/block/xen-blkfront.c
+index 3ee1a4eb6b6f,611170896b8c..000000000000
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@@ -1188,7 -1196,7 +1188,11 @@@ static irqreturn_t blkif_interrupt(int 
+  				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
+  				queue_flag_clear(QUEUE_FLAG_SECDISCARD, rq);
+  			}
+++<<<<<<< HEAD
+ +			__blk_end_request_all(req, error);
+++=======
++ 			blk_mq_complete_request(req, error);
+++>>>>>>> f4829a9b7a61 (blk-mq: fix racy updates of rq->errors)
+  			break;
+  		case BLKIF_OP_FLUSH_DISKCACHE:
+  		case BLKIF_OP_WRITE_BARRIER:
+@@@ -1216,7 -1224,7 +1220,11 @@@
+  				dev_dbg(&info->xbdev->dev, "Bad return from blkdev data "
+  					"request: %x\n", bret->status);
+  
+++<<<<<<< HEAD
+ +			__blk_end_request_all(req, error);
+++=======
++ 			blk_mq_complete_request(req, error);
+++>>>>>>> f4829a9b7a61 (blk-mq: fix racy updates of rq->errors)
+  			break;
+  		default:
+  			BUG();
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 78177b3aba60..514534ddfdc7 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -397,14 +397,16 @@ void __blk_mq_complete_request(struct request *rq)
+  *	Ends all I/O on a request. It does not handle partial completions.
+  *	The actual completion happens out-of-order, through a IPI handler.
+  **/
+-void blk_mq_complete_request(struct request *rq)
++void blk_mq_complete_request(struct request *rq, int error)
+ {
+ 	struct request_queue *q = rq->q;
+ 
+ 	if (unlikely(blk_should_fake_timeout(q)))
+ 		return;
+-	if (!blk_mark_rq_complete(rq))
++	if (!blk_mark_rq_complete(rq)) {
++		rq->errors = error;
+ 		__blk_mq_complete_request(rq);
++	}
+ }
+ EXPORT_SYMBOL(blk_mq_complete_request);
+ 
+@@ -620,10 +622,8 @@ static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
+ 		 * If a request wasn't started before the queue was
+ 		 * marked dying, kill it here or it'll go unnoticed.
+ 		 */
+-		if (unlikely(blk_queue_dying(rq->q))) {
+-			rq->errors = -EIO;
+-			blk_mq_complete_request(rq);
+-		}
++		if (unlikely(blk_queue_dying(rq->q)))
++			blk_mq_complete_request(rq, -EIO);
+ 		return;
+ 	}
+ 	if (rq->cmd_flags & REQ_NO_TIMEOUT)
+* Unmerged path drivers/block/loop.c
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index e84600e2aa70..afe77ddcd8ce 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -240,7 +240,7 @@ static inline void null_handle_cmd(struct nullb_cmd *cmd)
+ 	case NULL_IRQ_SOFTIRQ:
+ 		switch (queue_mode)  {
+ 		case NULL_Q_MQ:
+-			blk_mq_complete_request(cmd->rq);
++			blk_mq_complete_request(cmd->rq, cmd->rq->errors);
+ 			break;
+ 		case NULL_Q_RQ:
+ 			blk_complete_request(cmd->rq);
+* Unmerged path drivers/block/nvme-core.c
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 6c616922f7a6..e59436901151 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -144,7 +144,7 @@ static void virtblk_done(struct virtqueue *vq)
+ 	do {
+ 		virtqueue_disable_cb(vq);
+ 		while ((vbr = virtqueue_get_buf(vblk->vqs[qid].vq, &len)) != NULL) {
+-			blk_mq_complete_request(vbr->req);
++			blk_mq_complete_request(vbr->req, vbr->req->errors);
+ 			req_done = true;
+ 		}
+ 		if (unlikely(virtqueue_is_broken(vq)))
+* Unmerged path drivers/block/xen-blkfront.c
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index ab3c3045f4ba..7abd07b3cb01 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1879,7 +1879,7 @@ static int scsi_mq_prep_fn(struct request *req)
+ static void scsi_mq_done(struct scsi_cmnd *cmd)
+ {
+ 	trace_scsi_dispatch_cmd_done(cmd);
+-	blk_mq_complete_request(cmd->request);
++	blk_mq_complete_request(cmd->request, cmd->request->errors);
+ }
+ 
+ static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index e1980b059537..b33f15ac07c0 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -257,7 +257,7 @@ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head);
+ void blk_mq_cancel_requeue_work(struct request_queue *q);
+ void blk_mq_kick_requeue_list(struct request_queue *q);
+ void blk_mq_abort_requeue_list(struct request_queue *q);
+-void blk_mq_complete_request(struct request *rq);
++void blk_mq_complete_request(struct request *rq, int error);
+ 
+ void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+ void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);
