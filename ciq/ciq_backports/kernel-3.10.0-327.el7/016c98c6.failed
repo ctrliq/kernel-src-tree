@@ -1,0 +1,149 @@
+virtio: unify config_changed handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [virtio] unify config_changed handling (David Gibson) [1196009]
+Rebuild_FUZZ: 87.88%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 016c98c6fe0c914d12e2e242b2bccde6d6dea54b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/016c98c6.failed
+
+Replace duplicated code in all transports with a single wrapper in
+virtio.c.
+
+The only functional change is in virtio_mmio.c: if a buggy device sends
+us an interrupt before driver is set, we previously returned IRQ_NONE,
+now we return IRQ_HANDLED.
+
+As this must not happen in practice, this does not look like a big deal.
+
+See also commit 3fff0179e33cd7d0a688dab65700c46ad089e934
+	virtio-pci: do not oops on config change if driver not loaded.
+for the original motivation behind the driver check.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+	Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+(cherry picked from commit 016c98c6fe0c914d12e2e242b2bccde6d6dea54b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mic/card/mic_virtio.c
+* Unmerged path drivers/misc/mic/card/mic_virtio.c
+* Unmerged path drivers/misc/mic/card/mic_virtio.c
+diff --git a/drivers/s390/kvm/kvm_virtio.c b/drivers/s390/kvm/kvm_virtio.c
+index 0b51fa7ede7f..cb6836387fb2 100644
+--- a/drivers/s390/kvm/kvm_virtio.c
++++ b/drivers/s390/kvm/kvm_virtio.c
+@@ -406,15 +406,8 @@ static void kvm_extint_handler(struct ext_code ext_code,
+ 
+ 	switch (param) {
+ 	case VIRTIO_PARAM_CONFIG_CHANGED:
+-	{
+-		struct virtio_driver *drv;
+-		drv = container_of(vq->vdev->dev.driver,
+-				   struct virtio_driver, driver);
+-		if (drv->config_changed)
+-			drv->config_changed(vq->vdev);
+-
++		virtio_config_changed(vq->vdev);
+ 		break;
+-	}
+ 	case VIRTIO_PARAM_DEV_ADD:
+ 		schedule_work(&hotplug_work);
+ 		break;
+diff --git a/drivers/s390/kvm/virtio_ccw.c b/drivers/s390/kvm/virtio_ccw.c
+index d2c0b442bce5..6cbe6ef3c889 100644
+--- a/drivers/s390/kvm/virtio_ccw.c
++++ b/drivers/s390/kvm/virtio_ccw.c
+@@ -940,11 +940,7 @@ static void virtio_ccw_int_handler(struct ccw_device *cdev,
+ 		vring_interrupt(0, vq);
+ 	}
+ 	if (test_bit(0, &vcdev->indicators2)) {
+-		drv = container_of(vcdev->vdev.dev.driver,
+-				   struct virtio_driver, driver);
+-
+-		if (drv && drv->config_changed)
+-			drv->config_changed(&vcdev->vdev);
++		virtio_config_changed(&vcdev->vdev);
+ 		clear_bit(0, &vcdev->indicators2);
+ 	}
+ }
+diff --git a/drivers/virtio/virtio.c b/drivers/virtio/virtio.c
+index ee59b74768d9..2df0834ae02b 100644
+--- a/drivers/virtio/virtio.c
++++ b/drivers/virtio/virtio.c
+@@ -228,6 +228,15 @@ void unregister_virtio_device(struct virtio_device *dev)
+ }
+ EXPORT_SYMBOL_GPL(unregister_virtio_device);
+ 
++void virtio_config_changed(struct virtio_device *dev)
++{
++	struct virtio_driver *drv = drv_to_virtio(dev->dev.driver);
++
++	if (drv && drv->config_changed)
++		drv->config_changed(dev);
++}
++EXPORT_SYMBOL_GPL(virtio_config_changed);
++
+ static int virtio_init(void)
+ {
+ 	if (bus_register(&virtio_bus) != 0)
+diff --git a/drivers/virtio/virtio_mmio.c b/drivers/virtio/virtio_mmio.c
+index e9fdeb861992..3fdb0c1ccb35 100644
+--- a/drivers/virtio/virtio_mmio.c
++++ b/drivers/virtio/virtio_mmio.c
+@@ -234,8 +234,6 @@ static irqreturn_t vm_interrupt(int irq, void *opaque)
+ {
+ 	struct virtio_mmio_device *vm_dev = opaque;
+ 	struct virtio_mmio_vq_info *info;
+-	struct virtio_driver *vdrv = container_of(vm_dev->vdev.dev.driver,
+-			struct virtio_driver, driver);
+ 	unsigned long status;
+ 	unsigned long flags;
+ 	irqreturn_t ret = IRQ_NONE;
+@@ -244,9 +242,8 @@ static irqreturn_t vm_interrupt(int irq, void *opaque)
+ 	status = readl(vm_dev->base + VIRTIO_MMIO_INTERRUPT_STATUS);
+ 	writel(status, vm_dev->base + VIRTIO_MMIO_INTERRUPT_ACK);
+ 
+-	if (unlikely(status & VIRTIO_MMIO_INT_CONFIG)
+-			&& vdrv && vdrv->config_changed) {
+-		vdrv->config_changed(&vm_dev->vdev);
++	if (unlikely(status & VIRTIO_MMIO_INT_CONFIG)) {
++		virtio_config_changed(&vm_dev->vdev);
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+diff --git a/drivers/virtio/virtio_pci.c b/drivers/virtio/virtio_pci.c
+index f1e5c1770b8e..0878fd77716d 100644
+--- a/drivers/virtio/virtio_pci.c
++++ b/drivers/virtio/virtio_pci.c
+@@ -211,12 +211,8 @@ static bool vp_notify(struct virtqueue *vq)
+ static irqreturn_t vp_config_changed(int irq, void *opaque)
+ {
+ 	struct virtio_pci_device *vp_dev = opaque;
+-	struct virtio_driver *drv;
+-	drv = container_of(vp_dev->vdev.dev.driver,
+-			   struct virtio_driver, driver);
+ 
+-	if (drv && drv->config_changed)
+-		drv->config_changed(&vp_dev->vdev);
++	virtio_config_changed(&vp_dev->vdev);
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/include/linux/virtio.h b/include/linux/virtio.h
+index 19472171fdba..46acc95f3fdf 100644
+--- a/include/linux/virtio.h
++++ b/include/linux/virtio.h
+@@ -115,6 +115,8 @@ void unregister_virtio_device(struct virtio_device *dev);
+ 
+ void virtio_break_device(struct virtio_device *dev);
+ 
++void virtio_config_changed(struct virtio_device *dev);
++
+ /**
+  * virtio_driver - operations for a virtio I/O driver
+  * @driver: underlying device driver (populate name and owner).
