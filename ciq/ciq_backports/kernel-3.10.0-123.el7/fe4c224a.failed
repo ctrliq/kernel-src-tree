@@ -1,0 +1,100 @@
+xfs: inode log reservations are still too small
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit fe4c224aa1ffa4352849ac5f452de7132739bee2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/fe4c224a.failed
+
+Back in commit 23956703 ("xfs: inode log reservations are too
+small"), the reservation size was increased to take into account the
+difference in size between the in-memory BMBT block headers and the
+on-disk BMDR headers. This solved a transaction overrun when logging
+the inode size.
+
+Recently, however, we've seen a number of these same overruns on
+kernels with the above fix in it. All of them have been by 4 bytes,
+so we must still not be accounting for something correctly.
+
+Through inspection it turns out the above commit didn't take into
+account everything it should have. That is, it only accounts for a
+single log op_hdr structure, when it can actually require up to four
+op_hdrs - one for each region (log iovec) that is formatted. These
+regions are the inode log format header, the inode core, and the two
+forks that can be held in the literal area of the inode.
+
+This means we are not accounting for 36 bytes of log space that the
+transaction can use, and hence when we get inodes in certain formats
+with particular fragmentation patterns we can overrun the
+transaction. Fix this by adding the correct accounting for log
+op_headers in the transaction.
+
+	Tested-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit fe4c224aa1ffa4352849ac5f452de7132739bee2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans_resv.c
+diff --cc fs/xfs/xfs_trans_resv.c
+index 9da7df08b814,c486e4b9f2a7..000000000000
+--- a/fs/xfs/xfs_trans_resv.c
++++ b/fs/xfs/xfs_trans_resv.c
+@@@ -74,6 -65,47 +74,50 @@@ xfs_calc_buf_res
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Logging inodes is really tricksy. They are logged in memory format,
++  * which means that what we write into the log doesn't directly translate into
++  * the amount of space they use on disk.
++  *
++  * Case in point - btree format forks in memory format use more space than the
++  * on-disk format. In memory, the buffer contains a normal btree block header so
++  * the btree code can treat it as though it is just another generic buffer.
++  * However, when we write it to the inode fork, we don't write all of this
++  * header as it isn't needed. e.g. the root is only ever in the inode, so
++  * there's no need for sibling pointers which would waste 16 bytes of space.
++  *
++  * Hence when we have an inode with a maximally sized btree format fork, then
++  * amount of information we actually log is greater than the size of the inode
++  * on disk. Hence we need an inode reservation function that calculates all this
++  * correctly. So, we log:
++  *
++  * - 4 log op headers for object
++  *	- for the ilf, the inode core and 2 forks
++  * - inode log format object
++  * - the inode core
++  * - two inode forks containing bmap btree root blocks.
++  *	- the btree data contained by both forks will fit into the inode size,
++  *	  hence when combined with the inode core above, we have a total of the
++  *	  actual inode size.
++  *	- the BMBT headers need to be accounted separately, as they are
++  *	  additional to the records and pointers that fit inside the inode
++  *	  forks.
++  */
++ STATIC uint
++ xfs_calc_inode_res(
++ 	struct xfs_mount	*mp,
++ 	uint			ninodes)
++ {
++ 	return ninodes *
++ 		(4 * sizeof(struct xlog_op_header) +
++ 		 sizeof(struct xfs_inode_log_format) +
++ 		 mp->m_sb.sb_inodesize +
++ 		 2 * XFS_BMBT_BLOCK_LEN(mp));
++ }
++ 
++ /*
+++>>>>>>> fe4c224aa1ff (xfs: inode log reservations are still too small)
+   * Various log reservation values.
+   *
+   * These are based on the size of the file system block because that is what
+* Unmerged path fs/xfs/xfs_trans_resv.c
