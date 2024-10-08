@@ -1,0 +1,258 @@
+mei: bus: report also uuid in module alias
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit c93b76b34b4d8dbe8e3443eb27e49ac60034342b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c93b76b3.failed
+
+In order to automate modules matching add device uuid
+which is reported in client enumeration, keep also
+the name that is needed in for nfc distinguishing radio vendor
+
+Report mei:name:uuid
+
+	Cc: linux-api@vger.kernel.org
+	Cc: Samuel Ortiz <sameo@linux.intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit c93b76b34b4d8dbe8e3443eb27e49ac60034342b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	scripts/mod/file2alias.c
+diff --cc scripts/mod/file2alias.c
+index 45f9a3377dcd,62c517f4b592..000000000000
+--- a/scripts/mod/file2alias.c
++++ b/scripts/mod/file2alias.c
+@@@ -1133,7 -1159,17 +1142,21 @@@ static int do_x86cpu_entry(const char *
+  }
+  ADD_TO_DEVTABLE("x86cpu", x86_cpu_id, do_x86cpu_entry);
+  
+++<<<<<<< HEAD
+ +/* Looks like: mei:S */
+++=======
++ /* LOOKS like cpu:type:*:feature:*FEAT* */
++ static int do_cpu_entry(const char *filename, void *symval, char *alias)
++ {
++ 	DEF_FIELD(symval, cpu_feature, feature);
++ 
++ 	sprintf(alias, "cpu:type:*:feature:*%04X*", feature);
++ 	return 1;
++ }
++ ADD_TO_DEVTABLE("cpu", cpu_feature, do_cpu_entry);
++ 
++ /* Looks like: mei:S:uuid */
+++>>>>>>> c93b76b34b4d (mei: bus: report also uuid in module alias)
+  static int do_mei_entry(const char *filename, void *symval,
+  			char *alias)
+  {
+diff --git a/Documentation/ABI/testing/sysfs-bus-mei b/Documentation/ABI/testing/sysfs-bus-mei
+index 2066f0bbd453..91967a70313a 100644
+--- a/Documentation/ABI/testing/sysfs-bus-mei
++++ b/Documentation/ABI/testing/sysfs-bus-mei
+@@ -4,4 +4,4 @@ KernelVersion:	3.10
+ Contact:	Samuel Ortiz <sameo@linux.intel.com>
+ 		linux-mei@linux.intel.com
+ Description:	Stores the same MODALIAS value emitted by uevent
+-		Format: mei:<mei device name>
++		Format: mei:<mei device name>:<device uuid>:
+diff --git a/drivers/misc/mei/bus.c b/drivers/misc/mei/bus.c
+index ca8736c3675b..11b84339982c 100644
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@ -31,23 +31,40 @@
+ #define to_mei_cl_driver(d) container_of(d, struct mei_cl_driver, driver)
+ #define to_mei_cl_device(d) container_of(d, struct mei_cl_device, dev)
+ 
++static inline uuid_le uuid_le_cast(const __u8 uuid[16])
++{
++	return *(uuid_le *)uuid;
++}
++
+ static int mei_cl_device_match(struct device *dev, struct device_driver *drv)
+ {
+ 	struct mei_cl_device *device = to_mei_cl_device(dev);
+ 	struct mei_cl_driver *driver = to_mei_cl_driver(drv);
+ 	const struct mei_cl_device_id *id;
++	const uuid_le *uuid;
++	const char *name;
+ 
+ 	if (!device)
+ 		return 0;
+ 
++	uuid = mei_me_cl_uuid(device->me_cl);
++	name = device->name;
++
+ 	if (!driver || !driver->id_table)
+ 		return 0;
+ 
+ 	id = driver->id_table;
+ 
+-	while (id->name[0]) {
+-		if (!strncmp(dev_name(dev), id->name, sizeof(id->name)))
+-			return 1;
++	while (uuid_le_cmp(NULL_UUID_LE, uuid_le_cast(id->uuid))) {
++
++		if (!uuid_le_cmp(*uuid, uuid_le_cast(id->uuid))) {
++			if (id->name[0]) {
++				if (!strncmp(name, id->name, sizeof(id->name)))
++					return 1;
++			} else {
++				return 1;
++			}
++		}
+ 
+ 		id++;
+ 	}
+@@ -70,7 +87,7 @@ static int mei_cl_device_probe(struct device *dev)
+ 
+ 	dev_dbg(dev, "Device probe\n");
+ 
+-	strlcpy(id.name, dev_name(dev), sizeof(id.name));
++	strlcpy(id.name, device->name, sizeof(id.name));
+ 
+ 	return driver->probe(device, &id);
+ }
+@@ -101,9 +118,12 @@ static int mei_cl_device_remove(struct device *dev)
+ static ssize_t modalias_show(struct device *dev, struct device_attribute *a,
+ 			     char *buf)
+ {
+-	int len;
++	struct mei_cl_device *device = to_mei_cl_device(dev);
++	const uuid_le *uuid = mei_me_cl_uuid(device->me_cl);
++	size_t len;
+ 
+-	len = snprintf(buf, PAGE_SIZE, "mei:%s\n", dev_name(dev));
++	len = snprintf(buf, PAGE_SIZE, "mei:%s:" MEI_CL_UUID_FMT ":",
++		device->name, MEI_CL_UUID_ARGS(uuid->b));
+ 
+ 	return (len >= PAGE_SIZE) ? (PAGE_SIZE - 1) : len;
+ }
+@@ -117,7 +137,11 @@ ATTRIBUTE_GROUPS(mei_cl_dev);
+ 
+ static int mei_cl_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+-	if (add_uevent_var(env, "MODALIAS=mei:%s", dev_name(dev)))
++	struct mei_cl_device *device = to_mei_cl_device(dev);
++	const uuid_le *uuid = mei_me_cl_uuid(device->me_cl);
++
++	if (add_uevent_var(env, "MODALIAS=mei:%s:" MEI_CL_UUID_FMT ":",
++		device->name, MEI_CL_UUID_ARGS(uuid->b)))
+ 		return -ENOMEM;
+ 
+ 	return 0;
+@@ -176,7 +200,9 @@ struct mei_cl_device *mei_cl_add_device(struct mei_device *dev,
+ 	device->dev.bus = &mei_cl_bus_type;
+ 	device->dev.type = &mei_cl_device_type;
+ 
+-	dev_set_name(&device->dev, "%s", name);
++	strlcpy(device->name, name, sizeof(device->name));
++
++	dev_set_name(&device->dev, "mei:%s:%pUl", name, mei_me_cl_uuid(me_cl));
+ 
+ 	status = device_register(&device->dev);
+ 	if (status) {
+diff --git a/drivers/misc/mei/mei_dev.h b/drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa..e854bb82d4bb 100644
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -334,6 +334,7 @@ void mei_cl_bus_exit(void);
+  * @dev: linux driver model device pointer
+  * @uuid: me client uuid
+  * @cl: mei client
++ * @name: device name
+  * @ops: ME transport ops
+  * @event_cb: Drivers register this callback to get asynchronous ME
+  *	events (e.g. Rx buffer pending) notifications.
+@@ -344,6 +345,7 @@ struct mei_cl_device {
+ 	struct device dev;
+ 
+ 	struct mei_cl *cl;
++	char name[MEI_CL_NAME_SIZE];
+ 
+ 	const struct mei_cl_ops *ops;
+ 
+diff --git a/drivers/nfc/mei_phy.h b/drivers/nfc/mei_phy.h
+index d669900f8278..06608c28ff14 100644
+--- a/drivers/nfc/mei_phy.h
++++ b/drivers/nfc/mei_phy.h
+@@ -3,7 +3,10 @@
+ 
+ #include <linux/mei_cl_bus.h>
+ #include <net/nfc/hci.h>
++#include <linux/uuid.h>
+ 
++#define MEI_NFC_UUID __UUID_LE(0x0bb17a78, 0x2a8e, 0x4c50, \
++		0x94, 0xd4, 0x50, 0x26, 0x67, 0x23, 0x77, 0x5c)
+ #define MEI_NFC_HEADER_SIZE 10
+ #define MEI_NFC_MAX_HCI_PAYLOAD 300
+ 
+diff --git a/drivers/nfc/microread/mei.c b/drivers/nfc/microread/mei.c
+index cdf1bc53b257..bb6fcaa8c9c3 100644
+--- a/drivers/nfc/microread/mei.c
++++ b/drivers/nfc/microread/mei.c
+@@ -69,7 +69,7 @@ static int microread_mei_remove(struct mei_cl_device *device)
+ }
+ 
+ static struct mei_cl_device_id microread_mei_tbl[] = {
+-	{ MICROREAD_DRIVER_NAME },
++	{ MICROREAD_DRIVER_NAME, MEI_NFC_UUID},
+ 
+ 	/* required last entry */
+ 	{ }
+diff --git a/drivers/nfc/pn544/mei.c b/drivers/nfc/pn544/mei.c
+index b5d3d18179eb..604091701a25 100644
+--- a/drivers/nfc/pn544/mei.c
++++ b/drivers/nfc/pn544/mei.c
+@@ -69,7 +69,7 @@ static int pn544_mei_remove(struct mei_cl_device *device)
+ }
+ 
+ static struct mei_cl_device_id pn544_mei_tbl[] = {
+-	{ PN544_DRIVER_NAME },
++	{ PN544_DRIVER_NAME, MEI_NFC_UUID},
+ 
+ 	/* required last entry */
+ 	{ }
+diff --git a/include/linux/mod_devicetable.h b/include/linux/mod_devicetable.h
+index b3bd7e737e8b..fa8fe1e4885e 100644
+--- a/include/linux/mod_devicetable.h
++++ b/include/linux/mod_devicetable.h
+@@ -573,9 +573,22 @@ struct ipack_device_id {
+ 
+ #define MEI_CL_MODULE_PREFIX "mei:"
+ #define MEI_CL_NAME_SIZE 32
++#define MEI_CL_UUID_FMT "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
++#define MEI_CL_UUID_ARGS(_u) \
++	_u[0], _u[1], _u[2], _u[3], _u[4], _u[5], _u[6], _u[7], \
++	_u[8], _u[9], _u[10], _u[11], _u[12], _u[13], _u[14], _u[15]
+ 
++/**
++ * struct mei_cl_device_id - MEI client device identifier
++ * @name: helper name
++ * @uuid: client uuid
++ * @driver_info: information used by the driver.
++ *
++ * identifies mei client device by uuid and name
++ */
+ struct mei_cl_device_id {
+ 	char name[MEI_CL_NAME_SIZE];
++	__u8 uuid[16];
+ 	kernel_ulong_t driver_info;
+ };
+ 
+diff --git a/scripts/mod/devicetable-offsets.c b/scripts/mod/devicetable-offsets.c
+index e66d4d258e1a..85ff7fc33815 100644
+--- a/scripts/mod/devicetable-offsets.c
++++ b/scripts/mod/devicetable-offsets.c
+@@ -176,6 +176,7 @@ int main(void)
+ 
+ 	DEVID(mei_cl_device_id);
+ 	DEVID_FIELD(mei_cl_device_id, name);
++	DEVID_FIELD(mei_cl_device_id, uuid);
+ 
+ 	return 0;
+ }
+* Unmerged path scripts/mod/file2alias.c
