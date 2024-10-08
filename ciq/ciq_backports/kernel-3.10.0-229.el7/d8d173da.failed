@@ -1,0 +1,138 @@
+KVM: mmu: remove uninteresting MMU "new_cr3" callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/mmu: remove uninteresting MMU "new_cr3" callbacks (Paolo Bonzini) [1116936]
+Rebuild_FUZZ: 97.20%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit d8d173dab2505e72b62882e5a580862e6ec1c06c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d8d173da.failed
+
+The new_cr3 MMU callback has been a wrapper for mmu_free_roots since commit
+e676505 (KVM: MMU: Force cr3 reload with two dimensional paging on mov
+cr3 emulation, 2012-07-08).
+
+The commit message mentioned that "mmu_free_roots() is somewhat of an overkill,
+but fixing that is more complicated and will be done after this minimal fix".
+One year has passed, and no one really felt the need to do a different fix.
+Wrap the call with a kvm_mmu_new_cr3 function for clarity, but remove the
+callback.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Gleb Natapov <gleb@redhat.com>
+(cherry picked from commit d8d173dab2505e72b62882e5a580862e6ec1c06c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 94dde056e31c,dff856c8621a..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3441,10 -3422,8 +3436,9 @@@ static void nonpaging_free(struct kvm_v
+  static int nonpaging_init_context(struct kvm_vcpu *vcpu,
+  				  struct kvm_mmu *context)
+  {
+- 	context->new_cr3 = nonpaging_new_cr3;
+  	context->page_fault = nonpaging_page_fault;
+  	context->gva_to_gpa = nonpaging_gva_to_gpa;
+ +	context->free = nonpaging_free;
+  	context->sync_page = nonpaging_sync_page;
+  	context->invlpg = nonpaging_invlpg;
+  	context->update_pte = nonpaging_update_pte;
+@@@ -3673,13 -3683,11 +3665,12 @@@ static int paging32_init_context(struc
+  	context->root_level = PT32_ROOT_LEVEL;
+  
+  	reset_rsvds_bits_mask(vcpu, context);
+ -	update_permission_bitmask(vcpu, context, false);
+ +	update_permission_bitmask(vcpu, context);
+  	update_last_pte_bitmap(vcpu, context);
+  
+- 	context->new_cr3 = paging_new_cr3;
+  	context->page_fault = paging32_page_fault;
+  	context->gva_to_gpa = paging32_gva_to_gpa;
+ +	context->free = paging_free;
+  	context->sync_page = paging32_sync_page;
+  	context->invlpg = paging32_invlpg;
+  	context->update_pte = paging32_update_pte;
+@@@ -3700,9 -3708,7 +3691,8 @@@ static int init_kvm_tdp_mmu(struct kvm_
+  	struct kvm_mmu *context = vcpu->arch.walk_mmu;
+  
+  	context->base_role.word = 0;
+- 	context->new_cr3 = nonpaging_new_cr3;
+  	context->page_fault = tdp_page_fault;
+ +	context->free = nonpaging_free;
+  	context->sync_page = nonpaging_sync_page;
+  	context->invlpg = nonpaging_invlpg;
+  	context->update_pte = nonpaging_update_pte;
+@@@ -3767,6 -3773,31 +3757,34 @@@ int kvm_init_shadow_mmu(struct kvm_vcp
+  }
+  EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+  
+++<<<<<<< HEAD
+++=======
++ int kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
++ 		bool execonly)
++ {
++ 	ASSERT(vcpu);
++ 	ASSERT(!VALID_PAGE(vcpu->arch.mmu.root_hpa));
++ 
++ 	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
++ 
++ 	context->nx = true;
++ 	context->page_fault = ept_page_fault;
++ 	context->gva_to_gpa = ept_gva_to_gpa;
++ 	context->sync_page = ept_sync_page;
++ 	context->invlpg = ept_invlpg;
++ 	context->update_pte = ept_update_pte;
++ 	context->root_level = context->shadow_root_level;
++ 	context->root_hpa = INVALID_PAGE;
++ 	context->direct_map = false;
++ 
++ 	update_permission_bitmask(vcpu, context, true);
++ 	reset_rsvds_bits_mask_ept(vcpu, context, execonly);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(kvm_init_shadow_ept_mmu);
++ 
+++>>>>>>> d8d173dab250 (KVM: mmu: remove uninteresting MMU "new_cr3" callbacks)
+  static int init_kvm_softmmu(struct kvm_vcpu *vcpu)
+  {
+  	int r = kvm_init_shadow_mmu(vcpu, vcpu->arch.walk_mmu);
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index e785612376c0..15575572aa78 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -253,7 +253,6 @@ struct kvm_pio_request {
+  * mode.
+  */
+ struct kvm_mmu {
+-	void (*new_cr3)(struct kvm_vcpu *vcpu);
+ 	void (*set_cr3)(struct kvm_vcpu *vcpu, unsigned long root);
+ 	unsigned long (*get_cr3)(struct kvm_vcpu *vcpu);
+ 	u64 (*get_pdptr)(struct kvm_vcpu *vcpu, int index);
+@@ -925,6 +924,7 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
+ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gva_t gva, u32 error_code,
+ 		       void *insn, int insn_len);
+ void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva);
++void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu);
+ 
+ void kvm_enable_tdp(void);
+ void kvm_disable_tdp(void);
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index f0cdd181f16a..ac8a6f198932 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -698,7 +698,7 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+ 
+ 	vcpu->arch.cr3 = cr3;
+ 	__set_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->arch.regs_avail);
+-	vcpu->arch.mmu.new_cr3(vcpu);
++	kvm_mmu_new_cr3(vcpu);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(kvm_set_cr3);
