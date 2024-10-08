@@ -1,0 +1,136 @@
+hyperv: Add handling of IP header with option field in netvsc_set_hash()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit f88e67149f97d73c704d6fe6f492edde97463025
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f88e6714.failed
+
+In case that the IP header has optional field at the end, this patch will
+get the port numbers after that field, and compute the hash. The general
+parser skb_flow_dissect() is used here.
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f88e67149f97d73c704d6fe6f492edde97463025)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 854b31f1a85a,9e17d1a91e71..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -129,6 -128,105 +129,108 @@@ static int netvsc_close(struct net_devi
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *init_ppi_data(struct rndis_message *msg, u32 ppi_size,
++ 				int pkt_type)
++ {
++ 	struct rndis_packet *rndis_pkt;
++ 	struct rndis_per_packet_info *ppi;
++ 
++ 	rndis_pkt = &msg->msg.pkt;
++ 	rndis_pkt->data_offset += ppi_size;
++ 
++ 	ppi = (struct rndis_per_packet_info *)((void *)rndis_pkt +
++ 		rndis_pkt->per_pkt_info_offset + rndis_pkt->per_pkt_info_len);
++ 
++ 	ppi->size = ppi_size;
++ 	ppi->type = pkt_type;
++ 	ppi->ppi_offset = sizeof(struct rndis_per_packet_info);
++ 
++ 	rndis_pkt->per_pkt_info_len += ppi_size;
++ 
++ 	return ppi;
++ }
++ 
++ union sub_key {
++ 	u64 k;
++ 	struct {
++ 		u8 pad[3];
++ 		u8 kb;
++ 		u32 ka;
++ 	};
++ };
++ 
++ /* Toeplitz hash function
++  * data: network byte order
++  * return: host byte order
++  */
++ static u32 comp_hash(u8 *key, int klen, void *data, int dlen)
++ {
++ 	union sub_key subk;
++ 	int k_next = 4;
++ 	u8 dt;
++ 	int i, j;
++ 	u32 ret = 0;
++ 
++ 	subk.k = 0;
++ 	subk.ka = ntohl(*(u32 *)key);
++ 
++ 	for (i = 0; i < dlen; i++) {
++ 		subk.kb = key[k_next];
++ 		k_next = (k_next + 1) % klen;
++ 		dt = ((u8 *)data)[i];
++ 		for (j = 0; j < 8; j++) {
++ 			if (dt & 0x80)
++ 				ret ^= subk.ka;
++ 			dt <<= 1;
++ 			subk.k <<= 1;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static bool netvsc_set_hash(u32 *hash, struct sk_buff *skb)
++ {
++ 	struct flow_keys flow;
++ 	int data_len;
++ 
++ 	if (!skb_flow_dissect(skb, &flow) || flow.n_proto != htons(ETH_P_IP))
++ 		return false;
++ 
++ 	if (flow.ip_proto == IPPROTO_TCP)
++ 		data_len = 12;
++ 	else
++ 		data_len = 8;
++ 
++ 	*hash = comp_hash(netvsc_hash_key, HASH_KEYLEN, &flow, data_len);
++ 
++ 	return true;
++ }
++ 
++ static u16 netvsc_select_queue(struct net_device *ndev, struct sk_buff *skb,
++ 			void *accel_priv, select_queue_fallback_t fallback)
++ {
++ 	struct net_device_context *net_device_ctx = netdev_priv(ndev);
++ 	struct hv_device *hdev =  net_device_ctx->device_ctx;
++ 	struct netvsc_device *nvsc_dev = hv_get_drvdata(hdev);
++ 	u32 hash;
++ 	u16 q_idx = 0;
++ 
++ 	if (nvsc_dev == NULL || ndev->real_num_tx_queues <= 1)
++ 		return 0;
++ 
++ 	if (netvsc_set_hash(&hash, skb)) {
++ 		q_idx = nvsc_dev->send_table[hash % VRSS_SEND_TAB_SIZE] %
++ 			ndev->real_num_tx_queues;
++ 		skb_set_hash(skb, hash, PKT_HASH_TYPE_L3);
++ 	}
++ 
++ 	return q_idx;
++ }
++ 
+++>>>>>>> f88e67149f97 (hyperv: Add handling of IP header with option field in netvsc_set_hash())
+  static void netvsc_xmit_completion(void *context)
+  {
+  	struct hv_netvsc_packet *packet = (struct hv_netvsc_packet *)context;
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
