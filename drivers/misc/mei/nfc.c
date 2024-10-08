@@ -473,7 +473,6 @@ err:
 	mei_nfc_free(ndev);
 	mutex_unlock(&dev->device_lock);
 
-	return;
 }
 
 
