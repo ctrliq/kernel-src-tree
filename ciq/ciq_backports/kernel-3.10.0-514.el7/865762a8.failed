@@ -1,0 +1,615 @@
+slab/slub: adjust kmem_cache_alloc_bulk API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 865762a8119e74b5f0e236d2d8eaaf8be9292a06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/865762a8.failed
+
+Adjust kmem_cache_alloc_bulk API before we have any real users.
+
+Adjust API to return type 'int' instead of previously type 'bool'.  This
+is done to allow future extension of the bulk alloc API.
+
+A future extension could be to allow SLUB to stop at a page boundary, when
+specified by a flag, and then return the number of objects.
+
+The advantage of this approach, would make it easier to make bulk alloc
+run without local IRQs disabled.  With an approach of cmpxchg "stealing"
+the entire c->freelist or page->freelist.  To avoid overshooting we would
+stop processing at a slab-page boundary.  Else we always end up returning
+some objects at the cost of another cmpxchg.
+
+To keep compatible with future users of this API linking against an older
+kernel when using the new flag, we need to return the number of allocated
+objects with this API change.
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Vladimir Davydov <vdavydov@virtuozzo.com>
+	Acked-by: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 865762a8119e74b5f0e236d2d8eaaf8be9292a06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/slab.h
+#	mm/slab.c
+#	mm/slab.h
+#	mm/slab_common.c
+#	mm/slob.c
+#	mm/slub.c
+diff --cc include/linux/slab.h
+index 45cf2dc0539d,2037a861e367..000000000000
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@@ -297,92 -302,102 +297,103 @@@ static __always_inline int kmalloc_inde
+  	/* Will never be reached. Needed because the compiler may complain */
+  	return -1;
+  }
+ -#endif /* !CONFIG_SLOB */
+  
+ -void *__kmalloc(size_t size, gfp_t flags) __assume_kmalloc_alignment;
+ -void *kmem_cache_alloc(struct kmem_cache *, gfp_t flags) __assume_slab_alignment;
+ -void kmem_cache_free(struct kmem_cache *, void *);
+ +#ifdef CONFIG_SLAB
+ +#include <linux/slab_def.h>
+ +#elif defined(CONFIG_SLUB)
+ +#include <linux/slub_def.h>
+ +#else
+ +#error "Unknown slab allocator"
+ +#endif
+  
+  /*
+ - * Bulk allocation and freeing operations. These are accellerated in an
+ - * allocator specific way to avoid taking locks repeatedly or building
+ - * metadata structures unnecessarily.
+ - *
+ - * Note that interrupts must be enabled when calling these functions.
+ + * Determine size used for the nth kmalloc cache.
+ + * return size or 0 if a kmalloc cache for that
+ + * size does not exist
+   */
+++<<<<<<< HEAD
+ +static __always_inline int kmalloc_size(int n)
+++=======
++ void kmem_cache_free_bulk(struct kmem_cache *, size_t, void **);
++ int kmem_cache_alloc_bulk(struct kmem_cache *, gfp_t, size_t, void **);
++ 
++ #ifdef CONFIG_NUMA
++ void *__kmalloc_node(size_t size, gfp_t flags, int node) __assume_kmalloc_alignment;
++ void *kmem_cache_alloc_node(struct kmem_cache *, gfp_t flags, int node) __assume_slab_alignment;
++ #else
++ static __always_inline void *__kmalloc_node(size_t size, gfp_t flags, int node)
+++>>>>>>> 865762a8119e (slab/slub: adjust kmem_cache_alloc_bulk API)
+  {
+ -	return __kmalloc(size, flags);
+ -}
+ -
+ -static __always_inline void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t flags, int node)
+ -{
+ -	return kmem_cache_alloc(s, flags);
+ -}
+ -#endif
+ -
+ -#ifdef CONFIG_TRACING
+ -extern void *kmem_cache_alloc_trace(struct kmem_cache *, gfp_t, size_t) __assume_slab_alignment;
+ -
+ -#ifdef CONFIG_NUMA
+ -extern void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ -					   gfp_t gfpflags,
+ -					   int node, size_t size) __assume_slab_alignment;
+ -#else
+ -static __always_inline void *
+ -kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ -			      gfp_t gfpflags,
+ -			      int node, size_t size)
+ -{
+ -	return kmem_cache_alloc_trace(s, gfpflags, size);
+ -}
+ -#endif /* CONFIG_NUMA */
+ -
+ -#else /* CONFIG_TRACING */
+ -static __always_inline void *kmem_cache_alloc_trace(struct kmem_cache *s,
+ -		gfp_t flags, size_t size)
+ -{
+ -	void *ret = kmem_cache_alloc(s, flags);
+ +	if (n > 2)
+ +		return 1 << n;
+  
+ -	kasan_kmalloc(s, ret, size);
+ -	return ret;
+ -}
+ +	if (n == 1 && KMALLOC_MIN_SIZE <= 32)
+ +		return 96;
+  
+ -static __always_inline void *
+ -kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ -			      gfp_t gfpflags,
+ -			      int node, size_t size)
+ -{
+ -	void *ret = kmem_cache_alloc_node(s, gfpflags, node);
+ +	if (n == 2 && KMALLOC_MIN_SIZE <= 64)
+ +		return 192;
+  
+ -	kasan_kmalloc(s, ret, size);
+ -	return ret;
+ +	return 0;
+  }
+ -#endif /* CONFIG_TRACING */
+ -
+ -extern void *kmalloc_order(size_t size, gfp_t flags, unsigned int order) __assume_page_alignment;
+ +#endif /* !CONFIG_SLOB */
+  
+ -#ifdef CONFIG_TRACING
+ -extern void *kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order) __assume_page_alignment;
+ -#else
+ -static __always_inline void *
+ -kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
+ -{
+ -	return kmalloc_order(size, flags, order);
+ -}
+ +/*
+ + * Setting ARCH_SLAB_MINALIGN in arch headers allows a different alignment.
+ + * Intended for arches that get misalignment faults even for 64 bit integer
+ + * aligned buffers.
+ + */
+ +#ifndef ARCH_SLAB_MINALIGN
+ +#define ARCH_SLAB_MINALIGN __alignof__(unsigned long long)
+  #endif
+ +/*
+ + * This is the main placeholder for memcg-related information in kmem caches.
+ + * struct kmem_cache will hold a pointer to it, so the memory cost while
+ + * disabled is 1 pointer. The runtime cost while enabled, gets bigger than it
+ + * would otherwise be if that would be bundled in kmem_cache: we'll need an
+ + * extra pointer chase. But the trade off clearly lays in favor of not
+ + * penalizing non-users.
+ + *
+ + * Both the root cache and the child caches will have it. For the root cache,
+ + * this will hold a dynamically allocated array large enough to hold
+ + * information about the currently limited memcgs in the system.
+ + *
+ + * Child caches will hold extra metadata needed for its operation. Fields are:
+ + *
+ + * @memcg: pointer to the memcg this cache belongs to
+ + * @list: list_head for the list of all caches in this memcg
+ + * @root_cache: pointer to the global, root cache, this cache was derived from
+ + * @dead: set to true after the memcg dies; the cache may still be around.
+ + * @nr_pages: number of pages that belongs to this cache.
+ + * @destroy: worker to be called whenever we are ready, or believe we may be
+ + *           ready, to destroy this cache.
+ + */
+ +struct memcg_cache_params {
+ +	bool is_root_cache;
+ +	union {
+ +		struct kmem_cache *memcg_caches[0];
+ +		struct {
+ +			struct mem_cgroup *memcg;
+ +			struct list_head list;
+ +			struct kmem_cache *root_cache;
+ +			bool dead;
+ +			atomic_t nr_pages;
+ +			struct work_struct destroy;
+ +		};
+ +	};
+ +};
+  
+ -static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+ -{
+ -	unsigned int order = get_order(size);
+ -	return kmalloc_order_trace(size, flags, order);
+ -}
+ +int memcg_update_all_caches(int num_memcgs);
+ +
+ +struct seq_file;
+ +int cache_show(struct kmem_cache *s, struct seq_file *m);
+ +void print_slabinfo_header(struct seq_file *m);
+  
+  /**
+ - * kmalloc - allocate memory
+ - * @size: how many bytes of memory are required.
+ + * kmalloc_array - allocate memory for an array.
+ + * @n: number of elements.
+ + * @size: element size.
+   * @flags: the type of memory to allocate.
+   *
+ - * kmalloc is the normal method of allocating memory
+ - * for objects smaller than page size in the kernel.
+ - *
+   * The @flags argument may be one of:
+   *
+   * %GFP_USER - Allocate memory on behalf of user.  May sleep.
+diff --cc mm/slab.c
+index 2343cb092452,4765c97ce690..000000000000
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@@ -3628,6 -3413,19 +3628,22 @@@ void *kmem_cache_alloc(struct kmem_cach
+  }
+  EXPORT_SYMBOL(kmem_cache_alloc);
+  
+++<<<<<<< HEAD
+++=======
++ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++ {
++ 	__kmem_cache_free_bulk(s, size, p);
++ }
++ EXPORT_SYMBOL(kmem_cache_free_bulk);
++ 
++ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++ 								void **p)
++ {
++ 	return __kmem_cache_alloc_bulk(s, flags, size, p);
++ }
++ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++ 
+++>>>>>>> 865762a8119e (slab/slub: adjust kmem_cache_alloc_bulk API)
+  #ifdef CONFIG_TRACING
+  void *
+  kmem_cache_alloc_trace(struct kmem_cache *cachep, gfp_t flags, size_t size)
+diff --cc mm/slab.h
+index 4d6d836247dd,7b6087197997..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -113,32 -163,27 +113,44 @@@ void slabinfo_show_stats(struct seq_fil
+  ssize_t slabinfo_write(struct file *file, const char __user *buffer,
+  		       size_t count, loff_t *ppos);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Generic implementation of bulk operations
++  * These are useful for situations in which the allocator cannot
++  * perform optimizations. In that case segments of the objecct listed
++  * may be allocated or freed using these operations.
++  */
++ void __kmem_cache_free_bulk(struct kmem_cache *, size_t, void **);
++ int __kmem_cache_alloc_bulk(struct kmem_cache *, gfp_t, size_t, void **);
++ 
+++>>>>>>> 865762a8119e (slab/slub: adjust kmem_cache_alloc_bulk API)
+  #ifdef CONFIG_MEMCG_KMEM
+ -/*
+ - * Iterate over all memcg caches of the given root cache. The caller must hold
+ - * slab_mutex.
+ - */
+ -#define for_each_memcg_cache(iter, root) \
+ -	list_for_each_entry(iter, &(root)->memcg_params.list, \
+ -			    memcg_params.list)
+ -
+  static inline bool is_root_cache(struct kmem_cache *s)
+  {
+ -	return s->memcg_params.is_root_cache;
+ +	return !s->memcg_params || s->memcg_params->is_root_cache;
+ +}
+ +
+ +static inline bool cache_match_memcg(struct kmem_cache *cachep,
+ +				     struct mem_cgroup *memcg)
+ +{
+ +	return (is_root_cache(cachep) && !memcg) ||
+ +				(cachep->memcg_params->memcg == memcg);
+ +}
+ +
+ +static inline void memcg_bind_pages(struct kmem_cache *s, int order)
+ +{
+ +	if (!is_root_cache(s))
+ +		atomic_add(1 << order, &s->memcg_params->nr_pages);
+ +}
+ +
+ +static inline void memcg_release_pages(struct kmem_cache *s, int order)
+ +{
+ +	if (is_root_cache(s))
+ +		return;
+ +
+ +	if (atomic_sub_and_test((1 << order), &s->memcg_params->nr_pages))
+ +		mem_cgroup_destroy_cache(s);
+  }
+  
+  static inline bool slab_equal_or_root(struct kmem_cache *s,
+diff --cc mm/slab_common.c
+index a45665bac0bc,3c6a86b4ec25..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -81,7 -104,94 +81,33 @@@ static inline int kmem_cache_sanity_che
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ void __kmem_cache_free_bulk(struct kmem_cache *s, size_t nr, void **p)
++ {
++ 	size_t i;
++ 
++ 	for (i = 0; i < nr; i++)
++ 		kmem_cache_free(s, p[i]);
++ }
++ 
++ int __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t nr,
++ 								void **p)
++ {
++ 	size_t i;
++ 
++ 	for (i = 0; i < nr; i++) {
++ 		void *x = p[i] = kmem_cache_alloc(s, flags);
++ 		if (!x) {
++ 			__kmem_cache_free_bulk(s, i, p);
++ 			return 0;
++ 		}
++ 	}
++ 	return i;
++ }
++ 
+++>>>>>>> 865762a8119e (slab/slub: adjust kmem_cache_alloc_bulk API)
+  #ifdef CONFIG_MEMCG_KMEM
+ -void slab_init_memcg_params(struct kmem_cache *s)
+ -{
+ -	s->memcg_params.is_root_cache = true;
+ -	INIT_LIST_HEAD(&s->memcg_params.list);
+ -	RCU_INIT_POINTER(s->memcg_params.memcg_caches, NULL);
+ -}
+ -
+ -static int init_memcg_params(struct kmem_cache *s,
+ -		struct mem_cgroup *memcg, struct kmem_cache *root_cache)
+ -{
+ -	struct memcg_cache_array *arr;
+ -
+ -	if (memcg) {
+ -		s->memcg_params.is_root_cache = false;
+ -		s->memcg_params.memcg = memcg;
+ -		s->memcg_params.root_cache = root_cache;
+ -		return 0;
+ -	}
+ -
+ -	slab_init_memcg_params(s);
+ -
+ -	if (!memcg_nr_cache_ids)
+ -		return 0;
+ -
+ -	arr = kzalloc(sizeof(struct memcg_cache_array) +
+ -		      memcg_nr_cache_ids * sizeof(void *),
+ -		      GFP_KERNEL);
+ -	if (!arr)
+ -		return -ENOMEM;
+ -
+ -	RCU_INIT_POINTER(s->memcg_params.memcg_caches, arr);
+ -	return 0;
+ -}
+ -
+ -static void destroy_memcg_params(struct kmem_cache *s)
+ -{
+ -	if (is_root_cache(s))
+ -		kfree(rcu_access_pointer(s->memcg_params.memcg_caches));
+ -}
+ -
+ -static int update_memcg_params(struct kmem_cache *s, int new_array_size)
+ -{
+ -	struct memcg_cache_array *old, *new;
+ -
+ -	if (!is_root_cache(s))
+ -		return 0;
+ -
+ -	new = kzalloc(sizeof(struct memcg_cache_array) +
+ -		      new_array_size * sizeof(void *), GFP_KERNEL);
+ -	if (!new)
+ -		return -ENOMEM;
+ -
+ -	old = rcu_dereference_protected(s->memcg_params.memcg_caches,
+ -					lockdep_is_held(&slab_mutex));
+ -	if (old)
+ -		memcpy(new->entries, old->entries,
+ -		       memcg_nr_cache_ids * sizeof(void *));
+ -
+ -	rcu_assign_pointer(s->memcg_params.memcg_caches, new);
+ -	if (old)
+ -		kfree_rcu(old, rcu);
+ -	return 0;
+ -}
+ -
+  int memcg_update_all_caches(int num_memcgs)
+  {
+  	struct kmem_cache *s;
+diff --cc mm/slob.c
+index eeed4a05a2ef,17e8f8cc7c53..000000000000
+--- a/mm/slob.c
++++ b/mm/slob.c
+@@@ -594,6 -611,19 +594,22 @@@ void kmem_cache_free(struct kmem_cache 
+  }
+  EXPORT_SYMBOL(kmem_cache_free);
+  
+++<<<<<<< HEAD
+++=======
++ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++ {
++ 	__kmem_cache_free_bulk(s, size, p);
++ }
++ EXPORT_SYMBOL(kmem_cache_free_bulk);
++ 
++ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++ 								void **p)
++ {
++ 	return __kmem_cache_alloc_bulk(s, flags, size, p);
++ }
++ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++ 
+++>>>>>>> 865762a8119e (slab/slub: adjust kmem_cache_alloc_bulk API)
+  int __kmem_cache_shutdown(struct kmem_cache *c)
+  {
+  	/* No way to check for remaining objects */
+diff --cc mm/slub.c
+index 9230da41a30e,46997517406e..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2659,6 -2814,161 +2659,164 @@@ void kmem_cache_free(struct kmem_cache 
+  }
+  EXPORT_SYMBOL(kmem_cache_free);
+  
+++<<<<<<< HEAD
+++=======
++ struct detached_freelist {
++ 	struct page *page;
++ 	void *tail;
++ 	void *freelist;
++ 	int cnt;
++ };
++ 
++ /*
++  * This function progressively scans the array with free objects (with
++  * a limited look ahead) and extract objects belonging to the same
++  * page.  It builds a detached freelist directly within the given
++  * page/objects.  This can happen without any need for
++  * synchronization, because the objects are owned by running process.
++  * The freelist is build up as a single linked list in the objects.
++  * The idea is, that this detached freelist can then be bulk
++  * transferred to the real freelist(s), but only requiring a single
++  * synchronization primitive.  Look ahead in the array is limited due
++  * to performance reasons.
++  */
++ static int build_detached_freelist(struct kmem_cache *s, size_t size,
++ 				   void **p, struct detached_freelist *df)
++ {
++ 	size_t first_skipped_index = 0;
++ 	int lookahead = 3;
++ 	void *object;
++ 
++ 	/* Always re-init detached_freelist */
++ 	df->page = NULL;
++ 
++ 	do {
++ 		object = p[--size];
++ 	} while (!object && size);
++ 
++ 	if (!object)
++ 		return 0;
++ 
++ 	/* Start new detached freelist */
++ 	set_freepointer(s, object, NULL);
++ 	df->page = virt_to_head_page(object);
++ 	df->tail = object;
++ 	df->freelist = object;
++ 	p[size] = NULL; /* mark object processed */
++ 	df->cnt = 1;
++ 
++ 	while (size) {
++ 		object = p[--size];
++ 		if (!object)
++ 			continue; /* Skip processed objects */
++ 
++ 		/* df->page is always set at this point */
++ 		if (df->page == virt_to_head_page(object)) {
++ 			/* Opportunity build freelist */
++ 			set_freepointer(s, object, df->freelist);
++ 			df->freelist = object;
++ 			df->cnt++;
++ 			p[size] = NULL; /* mark object processed */
++ 
++ 			continue;
++ 		}
++ 
++ 		/* Limit look ahead search */
++ 		if (!--lookahead)
++ 			break;
++ 
++ 		if (!first_skipped_index)
++ 			first_skipped_index = size + 1;
++ 	}
++ 
++ 	return first_skipped_index;
++ }
++ 
++ 
++ /* Note that interrupts must be enabled when calling this function. */
++ void kmem_cache_free_bulk(struct kmem_cache *orig_s, size_t size, void **p)
++ {
++ 	if (WARN_ON(!size))
++ 		return;
++ 
++ 	do {
++ 		struct detached_freelist df;
++ 		struct kmem_cache *s;
++ 
++ 		/* Support for memcg */
++ 		s = cache_from_obj(orig_s, p[size - 1]);
++ 
++ 		size = build_detached_freelist(s, size, p, &df);
++ 		if (unlikely(!df.page))
++ 			continue;
++ 
++ 		slab_free(s, df.page, df.freelist, df.tail, df.cnt, _RET_IP_);
++ 	} while (likely(size));
++ }
++ EXPORT_SYMBOL(kmem_cache_free_bulk);
++ 
++ /* Note that interrupts must be enabled when calling this function. */
++ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++ 			  void **p)
++ {
++ 	struct kmem_cache_cpu *c;
++ 	int i;
++ 
++ 	/* memcg and kmem_cache debug support */
++ 	s = slab_pre_alloc_hook(s, flags);
++ 	if (unlikely(!s))
++ 		return false;
++ 	/*
++ 	 * Drain objects in the per cpu slab, while disabling local
++ 	 * IRQs, which protects against PREEMPT and interrupts
++ 	 * handlers invoking normal fastpath.
++ 	 */
++ 	local_irq_disable();
++ 	c = this_cpu_ptr(s->cpu_slab);
++ 
++ 	for (i = 0; i < size; i++) {
++ 		void *object = c->freelist;
++ 
++ 		if (unlikely(!object)) {
++ 			/*
++ 			 * Invoking slow path likely have side-effect
++ 			 * of re-populating per CPU c->freelist
++ 			 */
++ 			p[i] = ___slab_alloc(s, flags, NUMA_NO_NODE,
++ 					    _RET_IP_, c);
++ 			if (unlikely(!p[i]))
++ 				goto error;
++ 
++ 			c = this_cpu_ptr(s->cpu_slab);
++ 			continue; /* goto for-loop */
++ 		}
++ 		c->freelist = get_freepointer(s, object);
++ 		p[i] = object;
++ 	}
++ 	c->tid = next_tid(c->tid);
++ 	local_irq_enable();
++ 
++ 	/* Clear memory outside IRQ disabled fastpath loop */
++ 	if (unlikely(flags & __GFP_ZERO)) {
++ 		int j;
++ 
++ 		for (j = 0; j < i; j++)
++ 			memset(p[j], 0, s->object_size);
++ 	}
++ 
++ 	/* memcg and kmem_cache debug support */
++ 	slab_post_alloc_hook(s, flags, size, p);
++ 	return i;
++ error:
++ 	local_irq_enable();
++ 	slab_post_alloc_hook(s, flags, i, p);
++ 	__kmem_cache_free_bulk(s, i, p);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++ 
++ 
+++>>>>>>> 865762a8119e (slab/slub: adjust kmem_cache_alloc_bulk API)
+  /*
+   * Object placement in a slab is made very easy because we always start at
+   * offset 0. If we tune the size of the object to the alignment then we can
+* Unmerged path include/linux/slab.h
+* Unmerged path mm/slab.c
+* Unmerged path mm/slab.h
+* Unmerged path mm/slab_common.c
+* Unmerged path mm/slob.c
+* Unmerged path mm/slub.c
