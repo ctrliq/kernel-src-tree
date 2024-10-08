@@ -1,0 +1,153 @@
+md/raid5: need_this_block: tidy/fix last condition.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] raid5: need_this_block: tidy/fix last condition (Jes Sorensen) [1150149 1173510 1194720]
+Rebuild_FUZZ: 95.92%
+commit-author NeilBrown <neilb@suse.de>
+commit ea664c8245f3d5e78d05d1250bc0be0d60e264af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ea664c82.failed
+
+That last condition is unclear and over cautious.
+
+There are two related issues here.
+
+If a partial write is destined for a missing device, then
+either RMW or RCW can work.  We must read all the available
+block.  Only then can the missing blocks be calculated, and
+then the parity update performed.
+
+If RMW is not an option, then there is a complication even
+without partial writes.  If we would need to read a missing
+device to perform the reconstruction, then we must first read every
+block so the missing device data can be computed.
+This is the case for RAID6 (Which currently does not support
+RMW) and for times when we don't trust the parity (after a crash)
+and so are in the process of resyncing it.
+
+So make these two cases more clear and separate, and perform
+the relevant tests more  thoroughly.
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit ea664c8245f3d5e78d05d1250bc0be0d60e264af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index 7648d382ecbd,a03cf2d889bf..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -2907,19 -2902,95 +2907,108 @@@ static int fetch_block(struct stripe_he
+  	struct r5dev *dev = &sh->dev[disk_idx];
+  	struct r5dev *fdev[2] = { &sh->dev[s->failed_num[0]],
+  				  &sh->dev[s->failed_num[1]] };
++ 	int i;
++ 
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (test_bit(R5_LOCKED, &dev->flags) ||
++ 	    test_bit(R5_UPTODATE, &dev->flags))
++ 		/* No point reading this as we already have it or have
++ 		 * decided to get it.
++ 		 */
++ 		return 0;
++ 
++ 	if (dev->toread ||
++ 	    (dev->towrite && !test_bit(R5_OVERWRITE, &dev->flags)))
++ 		/* We need this block to directly satisfy a request */
++ 		return 1;
++ 
++ 	if (s->syncing || s->expanding ||
++ 	    (s->replacing && want_replace(sh, disk_idx)))
++ 		/* When syncing, or expanding we read everything.
++ 		 * When replacing, we need the replaced block.
++ 		 */
++ 		return 1;
++ 
++ 	if ((s->failed >= 1 && fdev[0]->toread) ||
++ 	    (s->failed >= 2 && fdev[1]->toread))
++ 		/* If we want to read from a failed device, then
++ 		 * we need to actually read every other device.
++ 		 */
++ 		return 1;
++ 
++ 	/* Sometimes neither read-modify-write nor reconstruct-write
++ 	 * cycles can work.  In those cases we read every block we
++ 	 * can.  Then the parity-update is certain to have enough to
++ 	 * work with.
++ 	 * This can only be a problem when we need to write something,
++ 	 * and some device has failed.  If either of those tests
++ 	 * fail we need look no further.
++ 	 */
++ 	if (!s->failed || !s->to_write)
++ 		return 0;
++ 
++ 	if (test_bit(R5_Insync, &dev->flags) &&
++ 	    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
++ 		/* Pre-reads at not permitted until after short delay
++ 		 * to gather multiple requests.  However if this
++ 		 * device is no Insync, the block could only be be computed
++ 		 * and there is no need to delay that.
++ 		 */
++ 		return 0;
++ 
++ 	for (i = 0; i < s->failed; i++) {
++ 		if (fdev[i]->towrite &&
++ 		    !test_bit(R5_UPTODATE, &fdev[i]->flags) &&
++ 		    !test_bit(R5_OVERWRITE, &fdev[i]->flags))
++ 			/* If we have a partial write to a failed
++ 			 * device, then we will need to reconstruct
++ 			 * the content of that device, so all other
++ 			 * devices must be read.
++ 			 */
++ 			return 1;
++ 	}
++ 
++ 	/* If we are forced to do a reconstruct-write, either because
++ 	 * the current RAID6 implementation only supports that, or
++ 	 * or because parity cannot be trusted and we are currently
++ 	 * recovering it, there is extra need to be careful.
++ 	 * If one of the devices that we would need to read, because
++ 	 * it is not being overwritten (and maybe not written at all)
++ 	 * is missing/faulty, then we need to read everything we can.
++ 	 */
++ 	if (sh->raid_conf->level != 6 &&
++ 	    sh->sector < sh->raid_conf->mddev->recovery_cp)
++ 		/* reconstruct-write isn't being forced */
++ 		return 0;
++ 	for (i = 0; i < s->failed; i++) {
++ 		if (!test_bit(R5_UPTODATE, &fdev[i]->flags) &&
++ 		    !test_bit(R5_OVERWRITE, &fdev[i]->flags))
++ 			return 1;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int fetch_block(struct stripe_head *sh, struct stripe_head_state *s,
++ 		       int disk_idx, int disks)
++ {
++ 	struct r5dev *dev = &sh->dev[disk_idx];
+  
+++>>>>>>> ea664c8245f3 (md/raid5: need_this_block: tidy/fix last condition.)
+  	/* is the data in this block needed, and can we get it? */
+ -	if (need_this_block(sh, s, disk_idx, disks)) {
+ +	if (!test_bit(R5_LOCKED, &dev->flags) &&
+ +	    !test_bit(R5_UPTODATE, &dev->flags) &&
+ +	    (dev->toread ||
+ +	     (dev->towrite && !test_bit(R5_OVERWRITE, &dev->flags)) ||
+ +	     s->syncing || s->expanding ||
+ +	     (s->replacing && want_replace(sh, disk_idx)) ||
+ +	     (s->failed >= 1 && fdev[0]->toread) ||
+ +	     (s->failed >= 2 && fdev[1]->toread) ||
+ +	     (sh->raid_conf->level <= 5 && s->failed && fdev[0]->towrite &&
+ +	      !test_bit(R5_OVERWRITE, &fdev[0]->flags)) ||
+ +	     (sh->raid_conf->level == 6 && s->failed && s->to_write))) {
+  		/* we would like to get this block, possibly by computing it,
+  		 * otherwise read it if the backing disk is insync
+  		 */
+* Unmerged path drivers/md/raid5.c
