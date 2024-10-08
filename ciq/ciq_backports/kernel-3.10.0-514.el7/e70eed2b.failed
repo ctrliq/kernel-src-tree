@@ -1,0 +1,150 @@
+cpufreq: intel_pstate: Account for non C0 time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Account for non C0 time (Prarit Bhargava) [1283337]
+Rebuild_FUZZ: 89.16%
+commit-author Philippe Longepe <philippe.longepe@intel.com>
+commit e70eed2b64545ab5c9d2f4d43372d79762f1b985
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e70eed2b.failed
+
+The current function to calculate cpu utilization uses the average P-state
+ratio (APerf/Mperf) scaled by the ratio of the current P-state to the
+max available non-turbo one. This leads to an overestimation of
+utilization which causes higher-performance P-states to be selected more
+often and that leads to increased energy consumption.
+
+This is a problem for low-power systems, so it is better to use a
+different utilization calculation algorithm for them.
+
+Namely, the Percent Busy value (or load) can be estimated as the ratio of the
+MPERF counter that runs at a constant rate only during active periods (C0) to
+the time stamp counter (TSC) that also runs (at the same rate) during idle.
+That is:
+
+Percent Busy = 100 * (delta_mperf / delta_tsc)
+
+Use this algorithm for platforms with SoCs based on the Airmont and Silvermont
+Atom cores.
+
+	Signed-off-by: Philippe Longepe <philippe.longepe@intel.com>
+	Signed-off-by: Stephane Gasparini <stephane.gasparini@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit e70eed2b64545ab5c9d2f4d43372d79762f1b985)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 07d88cb77cb6,8bfebaeda2dd..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -139,6 -142,9 +139,12 @@@ struct cpu_defaults 
+  	struct pstate_funcs funcs;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline int32_t get_target_pstate_use_performance(struct cpudata *cpu);
++ static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu);
++ 
+++>>>>>>> e70eed2b6454 (cpufreq: intel_pstate: Account for non C0 time)
+  static struct pstate_adjust_policy pid_params;
+  static struct pstate_funcs pstate_funcs;
+  static int hwp_active;
+@@@ -669,13 -757,35 +675,45 @@@ static struct cpu_defaults byt_params 
+  		.i_gain_pct = 4,
+  	},
+  	.funcs = {
+++<<<<<<< HEAD
+ +		.get_max = byt_get_max_pstate,
+ +		.get_max_physical = byt_get_max_pstate,
+ +		.get_min = byt_get_min_pstate,
+ +		.get_turbo = byt_get_turbo_pstate,
+ +		.set = byt_set_pstate,
+ +		.get_scaling = byt_get_scaling,
+ +		.get_vid = byt_get_vid,
+++=======
++ 		.get_max = atom_get_max_pstate,
++ 		.get_max_physical = atom_get_max_pstate,
++ 		.get_min = atom_get_min_pstate,
++ 		.get_turbo = atom_get_turbo_pstate,
++ 		.set = atom_set_pstate,
++ 		.get_scaling = silvermont_get_scaling,
++ 		.get_vid = atom_get_vid,
++ 		.get_target_pstate = get_target_pstate_use_cpu_load,
++ 	},
++ };
++ 
++ static struct cpu_defaults airmont_params = {
++ 	.pid_policy = {
++ 		.sample_rate_ms = 10,
++ 		.deadband = 0,
++ 		.setpoint = 60,
++ 		.p_gain_pct = 14,
++ 		.d_gain_pct = 0,
++ 		.i_gain_pct = 4,
++ 	},
++ 	.funcs = {
++ 		.get_max = atom_get_max_pstate,
++ 		.get_max_physical = atom_get_max_pstate,
++ 		.get_min = atom_get_min_pstate,
++ 		.get_turbo = atom_get_turbo_pstate,
++ 		.set = atom_set_pstate,
++ 		.get_scaling = airmont_get_scaling,
++ 		.get_vid = atom_get_vid,
++ 		.get_target_pstate = get_target_pstate_use_cpu_load,
+++>>>>>>> e70eed2b6454 (cpufreq: intel_pstate: Account for non C0 time)
+  	},
+  };
+  
+@@@ -779,7 -891,11 +817,15 @@@ static inline void intel_pstate_sample(
+  	local_irq_save(flags);
+  	rdmsrl(MSR_IA32_APERF, aperf);
+  	rdmsrl(MSR_IA32_MPERF, mperf);
+++<<<<<<< HEAD
+ +	tsc = native_read_tsc();
+++=======
++ 	tsc = rdtsc();
++ 	if ((cpu->prev_mperf == mperf) || (cpu->prev_tsc == tsc)) {
++ 		local_irq_restore(flags);
++ 		return;
++ 	}
+++>>>>>>> e70eed2b6454 (cpufreq: intel_pstate: Account for non C0 time)
+  	local_irq_restore(flags);
+  
+  	cpu->last_sample_time = cpu->sample.time;
+@@@ -814,7 -930,26 +860,30 @@@ static inline void intel_pstate_set_sam
+  	mod_timer_pinned(&cpu->timer, jiffies + delay);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int32_t intel_pstate_get_scaled_busy(struct cpudata *cpu)
+++=======
++ static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu)
++ {
++ 	struct sample *sample = &cpu->sample;
++ 	int32_t cpu_load;
++ 
++ 	/*
++ 	 * The load can be estimated as the ratio of the mperf counter
++ 	 * running at a constant frequency during active periods
++ 	 * (C0) and the time stamp counter running at the same frequency
++ 	 * also during C-states.
++ 	 */
++ 	cpu_load = div64_u64(int_tofp(100) * sample->mperf, sample->tsc);
++ 
++ 	cpu->sample.busy_scaled = cpu_load;
++ 
++ 	return cpu->pstate.current_pstate - pid_calc(&cpu->pid, cpu_load);
++ }
++ 
++ 
++ static inline int32_t get_target_pstate_use_performance(struct cpudata *cpu)
+++>>>>>>> e70eed2b6454 (cpufreq: intel_pstate: Account for non C0 time)
+  {
+  	int32_t core_busy, max_pstate, current_pstate, sample_ratio;
+  	s64 duration_us;
+* Unmerged path drivers/cpufreq/intel_pstate.c
