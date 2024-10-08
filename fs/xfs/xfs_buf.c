@@ -1078,7 +1078,7 @@ xfs_buf_ioend_work(
 	xfs_buf_ioend(bp);
 }
 
-void
+static void
 xfs_buf_ioend_async(
 	struct xfs_buf	*bp)
 {
