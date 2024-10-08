@@ -1,0 +1,232 @@
+crypto: nx - fix SHA-2 for chunks bigger than block size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [crypto] nx: fix SHA-2 for chunks bigger than block size (Steve Best) [999606]
+Rebuild_FUZZ: 89.32%
+commit-author Marcelo Cerri <mhcerri@linux.vnet.ibm.com>
+commit 069fa0453f9dc86fd97dd5b3f5fda4724ed5ff69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/069fa045.failed
+
+Each call to the co-processor, with exception of the last call, needs to
+send data that is multiple of block size. As consequence, any remaining
+data is kept in the internal NX context.
+
+This patch fixes a bug in the driver that causes it to save incorrect
+data into the context when data is bigger than the block size.
+
+	Reviewed-by: Joy Latten <jmlatten@linux.vnet.ibm.com>
+	Signed-off-by: Marcelo Cerri <mhcerri@linux.vnet.ibm.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 069fa0453f9dc86fd97dd5b3f5fda4724ed5ff69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/nx/nx-sha256.c
+#	drivers/crypto/nx/nx-sha512.c
+diff --cc drivers/crypto/nx/nx-sha256.c
+index 67024f2f0b78,da0b24a7633f..000000000000
+--- a/drivers/crypto/nx/nx-sha256.c
++++ b/drivers/crypto/nx/nx-sha256.c
+@@@ -75,39 -73,66 +75,54 @@@ static int nx_sha256_update(struct shas
+  		goto out;
+  	}
+  
+ -	in_sg = nx_ctx->in_sg;
+ -	max_sg_len = min_t(u32, nx_driver.of.max_sg_len/sizeof(struct nx_sg),
+ -			   nx_ctx->ap->sglen);
+ -
+ -	do {
+ -		/*
+ -		 * to_process: the SHA256_BLOCK_SIZE data chunk to process in
+ -		 * this update. This value is also restricted by the sg list
+ -		 * limits.
+ -		 */
+ -		to_process = min_t(u64, total, nx_ctx->ap->databytelen);
+ -		to_process = min_t(u64, to_process,
+ -				   NX_PAGE_SIZE * (max_sg_len - 1));
+ -		to_process = to_process & ~(SHA256_BLOCK_SIZE - 1);
+ -		leftover = total - to_process;
+ -
+ -		if (sctx->count) {
+ -			in_sg = nx_build_sg_list(nx_ctx->in_sg,
+ -						 (u8 *) sctx->buf,
+ -						 sctx->count, max_sg_len);
+ -		}
+ -		in_sg = nx_build_sg_list(in_sg, (u8 *) data,
+ +	/* to_process: the SHA256_BLOCK_SIZE data chunk to process in this
+ +	 * update */
+ +	to_process = (sctx->count + len) & ~(SHA256_BLOCK_SIZE - 1);
+ +	leftover = (sctx->count + len) & (SHA256_BLOCK_SIZE - 1);
+ +
+ +	if (sctx->count) {
+ +		in_sg = nx_build_sg_list(nx_ctx->in_sg, (u8 *)sctx->buf,
+ +					 sctx->count, nx_ctx->ap->sglen);
+ +		in_sg = nx_build_sg_list(in_sg, (u8 *)data,
+  					 to_process - sctx->count,
+ -					 max_sg_len);
+ +					 nx_ctx->ap->sglen);
+  		nx_ctx->op.inlen = (nx_ctx->in_sg - in_sg) *
+  					sizeof(struct nx_sg);
+ +	} else {
+ +		in_sg = nx_build_sg_list(nx_ctx->in_sg, (u8 *)data,
+ +					 to_process, nx_ctx->ap->sglen);
+ +		nx_ctx->op.inlen = (nx_ctx->in_sg - in_sg) *
+ +					sizeof(struct nx_sg);
+ +	}
+  
+ -		if (NX_CPB_FDM(csbcpb) & NX_FDM_CONTINUATION) {
+ -			/*
+ -			 * we've hit the nx chip previously and we're updating
+ -			 * again, so copy over the partial digest.
+ -			 */
+ -			memcpy(csbcpb->cpb.sha256.input_partial_digest,
+ -			       csbcpb->cpb.sha256.message_digest,
+ -			       SHA256_DIGEST_SIZE);
+ -		}
+ +	NX_CPB_FDM(csbcpb) |= NX_FDM_INTERMEDIATE;
+  
+ -		NX_CPB_FDM(csbcpb) |= NX_FDM_INTERMEDIATE;
+ -		if (!nx_ctx->op.inlen || !nx_ctx->op.outlen) {
+ -			rc = -EINVAL;
+ -			goto out;
+ -		}
+ +	if (!nx_ctx->op.inlen || !nx_ctx->op.outlen) {
+ +		rc = -EINVAL;
+ +		goto out;
+ +	}
+  
+ -		rc = nx_hcall_sync(nx_ctx, &nx_ctx->op,
+ -				   desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP);
+ -		if (rc)
+ -			goto out;
+ +	rc = nx_hcall_sync(nx_ctx, &nx_ctx->op,
+ +			   desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP);
+ +	if (rc)
+ +		goto out;
+  
+++<<<<<<< HEAD
+ +	atomic_inc(&(nx_ctx->stats->sha256_ops));
+++=======
++ 		atomic_inc(&(nx_ctx->stats->sha256_ops));
++ 		csbcpb->cpb.sha256.message_bit_length += (u64)
++ 			(csbcpb->cpb.sha256.spbc * 8);
++ 
++ 		/* everything after the first update is continuation */
++ 		NX_CPB_FDM(csbcpb) |= NX_FDM_CONTINUATION;
++ 
++ 		total -= to_process;
++ 		data += to_process - sctx->count;
++ 		sctx->count = 0;
++ 		in_sg = nx_ctx->in_sg;
++ 	} while (leftover >= SHA256_BLOCK_SIZE);
+++>>>>>>> 069fa0453f9d (crypto: nx - fix SHA-2 for chunks bigger than block size)
+  
+  	/* copy the leftover back into the state struct */
+  	if (leftover)
+diff --cc drivers/crypto/nx/nx-sha512.c
+index 08eee1122349,4ae5b0f221d5..000000000000
+--- a/drivers/crypto/nx/nx-sha512.c
++++ b/drivers/crypto/nx/nx-sha512.c
+@@@ -75,39 -73,68 +75,56 @@@ static int nx_sha512_update(struct shas
+  		goto out;
+  	}
+  
+ -	in_sg = nx_ctx->in_sg;
+ -	max_sg_len = min_t(u32, nx_driver.of.max_sg_len/sizeof(struct nx_sg),
+ -			   nx_ctx->ap->sglen);
+ -
+ -	do {
+ -		/*
+ -		 * to_process: the SHA512_BLOCK_SIZE data chunk to process in
+ -		 * this update. This value is also restricted by the sg list
+ -		 * limits.
+ -		 */
+ -		to_process = min_t(u64, total, nx_ctx->ap->databytelen);
+ -		to_process = min_t(u64, to_process,
+ -				   NX_PAGE_SIZE * (max_sg_len - 1));
+ -		to_process = to_process & ~(SHA512_BLOCK_SIZE - 1);
+ -		leftover = total - to_process;
+ -
+ -		if (sctx->count[0]) {
+ -			in_sg = nx_build_sg_list(nx_ctx->in_sg,
+ -						 (u8 *) sctx->buf,
+ -						 sctx->count[0], max_sg_len);
+ -		}
+ -		in_sg = nx_build_sg_list(in_sg, (u8 *) data,
+ +	/* to_process: the SHA512_BLOCK_SIZE data chunk to process in this
+ +	 * update */
+ +	to_process = (sctx->count[0] + len) & ~(SHA512_BLOCK_SIZE - 1);
+ +	leftover = (sctx->count[0] + len) & (SHA512_BLOCK_SIZE - 1);
+ +
+ +	if (sctx->count[0]) {
+ +		in_sg = nx_build_sg_list(nx_ctx->in_sg, (u8 *)sctx->buf,
+ +					 sctx->count[0], nx_ctx->ap->sglen);
+ +		in_sg = nx_build_sg_list(in_sg, (u8 *)data,
+  					 to_process - sctx->count[0],
+ -					 max_sg_len);
+ +					 nx_ctx->ap->sglen);
+  		nx_ctx->op.inlen = (nx_ctx->in_sg - in_sg) *
+  					sizeof(struct nx_sg);
+ +	} else {
+ +		in_sg = nx_build_sg_list(nx_ctx->in_sg, (u8 *)data,
+ +					 to_process, nx_ctx->ap->sglen);
+ +		nx_ctx->op.inlen = (nx_ctx->in_sg - in_sg) *
+ +					sizeof(struct nx_sg);
+ +	}
+  
+ -		if (NX_CPB_FDM(csbcpb) & NX_FDM_CONTINUATION) {
+ -			/*
+ -			 * we've hit the nx chip previously and we're updating
+ -			 * again, so copy over the partial digest.
+ -			 */
+ -			memcpy(csbcpb->cpb.sha512.input_partial_digest,
+ -			       csbcpb->cpb.sha512.message_digest,
+ -			       SHA512_DIGEST_SIZE);
+ -		}
+ +	NX_CPB_FDM(csbcpb) |= NX_FDM_INTERMEDIATE;
+  
+ -		NX_CPB_FDM(csbcpb) |= NX_FDM_INTERMEDIATE;
+ -		if (!nx_ctx->op.inlen || !nx_ctx->op.outlen) {
+ -			rc = -EINVAL;
+ -			goto out;
+ -		}
+ +	if (!nx_ctx->op.inlen || !nx_ctx->op.outlen) {
+ +		rc = -EINVAL;
+ +		goto out;
+ +	}
+  
+ -		rc = nx_hcall_sync(nx_ctx, &nx_ctx->op,
+ -				   desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP);
+ -		if (rc)
+ -			goto out;
+ +	rc = nx_hcall_sync(nx_ctx, &nx_ctx->op,
+ +			   desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP);
+ +	if (rc)
+ +		goto out;
+  
+++<<<<<<< HEAD
+ +	atomic_inc(&(nx_ctx->stats->sha512_ops));
+++=======
++ 		atomic_inc(&(nx_ctx->stats->sha512_ops));
++ 		spbc_bits = csbcpb->cpb.sha512.spbc * 8;
++ 		csbcpb->cpb.sha512.message_bit_length_lo += spbc_bits;
++ 		if (csbcpb->cpb.sha512.message_bit_length_lo < spbc_bits)
++ 			csbcpb->cpb.sha512.message_bit_length_hi++;
++ 
++ 		/* everything after the first update is continuation */
++ 		NX_CPB_FDM(csbcpb) |= NX_FDM_CONTINUATION;
++ 
++ 		total -= to_process;
++ 		data += to_process - sctx->count[0];
++ 		sctx->count[0] = 0;
++ 		in_sg = nx_ctx->in_sg;
++ 	} while (leftover >= SHA512_BLOCK_SIZE);
+++>>>>>>> 069fa0453f9d (crypto: nx - fix SHA-2 for chunks bigger than block size)
+  
+  	/* copy the leftover back into the state struct */
+  	if (leftover)
+* Unmerged path drivers/crypto/nx/nx-sha256.c
+* Unmerged path drivers/crypto/nx/nx-sha512.c
