@@ -1,0 +1,199 @@
+perf tools: Add lzma decompression support for kernel module
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] tools: Add lzma decompression support for kernel module (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 95.65%
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 80a32e5b498a7547073e5e4b2b804edc7219979d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/80a32e5b.failed
+
+In short, Fedora compresses kernel modules now (since version 21) with
+lzma compression.
+
+Adding lzma decompress support into the dso.c:compressions array
+introduced by Namhyung earlier.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Acked-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Corey Ashford <cjashfor@linux.vnet.ibm.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/n/tip-2glp65kdtbrk0gblmirsjsnt@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 80a32e5b498a7547073e5e4b2b804edc7219979d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/Build
+* Unmerged path tools/perf/util/Build
+diff --git a/tools/perf/Makefile.perf b/tools/perf/Makefile.perf
+index 0066e52a44e4..243a0db6f210 100644
+--- a/tools/perf/Makefile.perf
++++ b/tools/perf/Makefile.perf
+@@ -71,6 +71,8 @@ include config/utilities.mak
+ #
+ # Define NO_LIBBABELTRACE if you do not want libbabeltrace support
+ # for CTF data format.
++#
++# Define NO_LZMA if you do not want to support compressed (xz) kernel modules
+ 
+ ifeq ($(srctree),)
+ srctree := $(patsubst %/,%,$(dir $(shell pwd)))
+diff --git a/tools/perf/config/Makefile b/tools/perf/config/Makefile
+index 49715ac798cd..28e134bea825 100644
+--- a/tools/perf/config/Makefile
++++ b/tools/perf/config/Makefile
+@@ -624,6 +624,17 @@ ifndef NO_ZLIB
+   endif
+ endif
+ 
++ifndef NO_LZMA
++  ifeq ($(feature-lzma), 1)
++    CFLAGS += -DHAVE_LZMA_SUPPORT
++    EXTLIBS += -llzma
++    $(call detected,CONFIG_LZMA)
++  else
++    msg := $(warning No liblzma found, disables xz kernel module decompression, please install xz-devel/liblzma-dev);
++    NO_LZMA := 1
++  endif
++endif
++
+ ifndef NO_BACKTRACE
+   ifeq ($(feature-backtrace), 1)
+     CFLAGS += -DHAVE_BACKTRACE_SUPPORT
+* Unmerged path tools/perf/util/Build
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index 814554d1b857..be368414036c 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -147,6 +147,9 @@ static const struct {
+ } compressions[] = {
+ #ifdef HAVE_ZLIB_SUPPORT
+ 	{ "gz", gzip_decompress_to_file },
++#endif
++#ifdef HAVE_LZMA_SUPPORT
++	{ "xz", lzma_decompress_to_file },
+ #endif
+ 	{ NULL, NULL },
+ };
+diff --git a/tools/perf/util/lzma.c b/tools/perf/util/lzma.c
+new file mode 100644
+index 000000000000..95a1acb61245
+--- /dev/null
++++ b/tools/perf/util/lzma.c
+@@ -0,0 +1,95 @@
++#include <lzma.h>
++#include <stdio.h>
++#include <linux/compiler.h>
++#include "util.h"
++#include "debug.h"
++
++#define BUFSIZE 8192
++
++static const char *lzma_strerror(lzma_ret ret)
++{
++	switch ((int) ret) {
++	case LZMA_MEM_ERROR:
++		return "Memory allocation failed";
++	case LZMA_OPTIONS_ERROR:
++		return "Unsupported decompressor flags";
++	case LZMA_FORMAT_ERROR:
++		return "The input is not in the .xz format";
++	case LZMA_DATA_ERROR:
++		return "Compressed file is corrupt";
++	case LZMA_BUF_ERROR:
++		return "Compressed file is truncated or otherwise corrupt";
++	default:
++		return "Unknown error, possibly a bug";
++	}
++}
++
++int lzma_decompress_to_file(const char *input, int output_fd)
++{
++	lzma_action action = LZMA_RUN;
++	lzma_stream strm   = LZMA_STREAM_INIT;
++	lzma_ret ret;
++
++	u8 buf_in[BUFSIZE];
++	u8 buf_out[BUFSIZE];
++	FILE *infile;
++
++	infile = fopen(input, "rb");
++	if (!infile) {
++		pr_err("lzma: fopen failed on %s: '%s'\n",
++		       input, strerror(errno));
++		return -1;
++	}
++
++	ret = lzma_stream_decoder(&strm, UINT64_MAX, LZMA_CONCATENATED);
++	if (ret != LZMA_OK) {
++		pr_err("lzma: lzma_stream_decoder failed %s (%d)\n",
++			lzma_strerror(ret), ret);
++		return -1;
++	}
++
++	strm.next_in   = NULL;
++	strm.avail_in  = 0;
++	strm.next_out  = buf_out;
++	strm.avail_out = sizeof(buf_out);
++
++	while (1) {
++		if (strm.avail_in == 0 && !feof(infile)) {
++			strm.next_in  = buf_in;
++			strm.avail_in = fread(buf_in, 1, sizeof(buf_in), infile);
++
++			if (ferror(infile)) {
++				pr_err("lzma: read error: %s\n", strerror(errno));
++				return -1;
++			}
++
++			if (feof(infile))
++				action = LZMA_FINISH;
++		}
++
++		ret = lzma_code(&strm, action);
++
++		if (strm.avail_out == 0 || ret == LZMA_STREAM_END) {
++			ssize_t write_size = sizeof(buf_out) - strm.avail_out;
++
++			if (writen(output_fd, buf_out, write_size) != write_size) {
++				pr_err("lzma: write error: %s\n", strerror(errno));
++				return -1;
++			}
++
++			strm.next_out  = buf_out;
++			strm.avail_out = sizeof(buf_out);
++		}
++
++		if (ret != LZMA_OK) {
++			if (ret == LZMA_STREAM_END)
++				return 0;
++
++			pr_err("lzma: failed %s\n", lzma_strerror(ret));
++			return -1;
++		}
++	}
++
++	fclose(infile);
++	return 0;
++}
+diff --git a/tools/perf/util/util.h b/tools/perf/util/util.h
+index fbd598afc606..1ff23e04ad27 100644
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@ -329,4 +329,8 @@ bool find_process(const char *name);
+ int gzip_decompress_to_file(const char *input, int output_fd);
+ #endif
+ 
++#ifdef HAVE_LZMA_SUPPORT
++int lzma_decompress_to_file(const char *input, int output_fd);
++#endif
++
+ #endif /* GIT_COMPAT_UTIL_H */
