@@ -1,0 +1,176 @@
+KVM: provide irq_unsafe kvm_guest_{enter|exit}
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christian Borntraeger <borntraeger@de.ibm.com>
+commit 0097d12e504b3ce57b68810737ad6a5a64a98c68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0097d12e.failed
+
+Several kvm architectures disable interrupts before kvm_guest_enter.
+kvm_guest_enter then uses local_irq_save/restore to disable interrupts
+again or for the first time. Lets provide underscore versions of
+kvm_guest_{enter|exit} that assume being called locked.
+kvm_guest_enter now disables interrupts for the full function and
+thus we can remove the check for preemptible.
+
+This patch then adopts s390/kvm to use local_irq_disable/enable calls
+which are slighty cheaper that local_irq_save/restore and call these
+new functions.
+
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0097d12e504b3ce57b68810737ad6a5a64a98c68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index 1e923bcabe93,2be391bb8557..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -778,6 -1964,96 +778,90 @@@ static int __vcpu_run(struct kvm_vcpu *
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __vcpu_run(struct kvm_vcpu *vcpu)
++ {
++ 	int rc, exit_reason;
++ 
++ 	/*
++ 	 * We try to hold kvm->srcu during most of vcpu_run (except when run-
++ 	 * ning the guest), so that memslots (and other stuff) are protected
++ 	 */
++ 	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++ 
++ 	do {
++ 		rc = vcpu_pre_run(vcpu);
++ 		if (rc)
++ 			break;
++ 
++ 		srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++ 		/*
++ 		 * As PF_VCPU will be used in fault handler, between
++ 		 * guest_enter and guest_exit should be no uaccess.
++ 		 */
++ 		local_irq_disable();
++ 		__kvm_guest_enter();
++ 		local_irq_enable();
++ 		exit_reason = sie64a(vcpu->arch.sie_block,
++ 				     vcpu->run->s.regs.gprs);
++ 		local_irq_disable();
++ 		__kvm_guest_exit();
++ 		local_irq_enable();
++ 		vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++ 
++ 		rc = vcpu_post_run(vcpu, exit_reason);
++ 	} while (!signal_pending(current) && !guestdbg_exit_pending(vcpu) && !rc);
++ 
++ 	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++ 	return rc;
++ }
++ 
++ static void sync_regs(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
++ {
++ 	vcpu->arch.sie_block->gpsw.mask = kvm_run->psw_mask;
++ 	vcpu->arch.sie_block->gpsw.addr = kvm_run->psw_addr;
++ 	if (kvm_run->kvm_dirty_regs & KVM_SYNC_PREFIX)
++ 		kvm_s390_set_prefix(vcpu, kvm_run->s.regs.prefix);
++ 	if (kvm_run->kvm_dirty_regs & KVM_SYNC_CRS) {
++ 		memcpy(&vcpu->arch.sie_block->gcr, &kvm_run->s.regs.crs, 128);
++ 		/* some control register changes require a tlb flush */
++ 		kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++ 	}
++ 	if (kvm_run->kvm_dirty_regs & KVM_SYNC_ARCH0) {
++ 		vcpu->arch.sie_block->cputm = kvm_run->s.regs.cputm;
++ 		vcpu->arch.sie_block->ckc = kvm_run->s.regs.ckc;
++ 		vcpu->arch.sie_block->todpr = kvm_run->s.regs.todpr;
++ 		vcpu->arch.sie_block->pp = kvm_run->s.regs.pp;
++ 		vcpu->arch.sie_block->gbea = kvm_run->s.regs.gbea;
++ 	}
++ 	if (kvm_run->kvm_dirty_regs & KVM_SYNC_PFAULT) {
++ 		vcpu->arch.pfault_token = kvm_run->s.regs.pft;
++ 		vcpu->arch.pfault_select = kvm_run->s.regs.pfs;
++ 		vcpu->arch.pfault_compare = kvm_run->s.regs.pfc;
++ 		if (vcpu->arch.pfault_token == KVM_S390_PFAULT_TOKEN_INVALID)
++ 			kvm_clear_async_pf_completion_queue(vcpu);
++ 	}
++ 	kvm_run->kvm_dirty_regs = 0;
++ }
++ 
++ static void store_regs(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
++ {
++ 	kvm_run->psw_mask = vcpu->arch.sie_block->gpsw.mask;
++ 	kvm_run->psw_addr = vcpu->arch.sie_block->gpsw.addr;
++ 	kvm_run->s.regs.prefix = kvm_s390_get_prefix(vcpu);
++ 	memcpy(&kvm_run->s.regs.crs, &vcpu->arch.sie_block->gcr, 128);
++ 	kvm_run->s.regs.cputm = vcpu->arch.sie_block->cputm;
++ 	kvm_run->s.regs.ckc = vcpu->arch.sie_block->ckc;
++ 	kvm_run->s.regs.todpr = vcpu->arch.sie_block->todpr;
++ 	kvm_run->s.regs.pp = vcpu->arch.sie_block->pp;
++ 	kvm_run->s.regs.gbea = vcpu->arch.sie_block->gbea;
++ 	kvm_run->s.regs.pft = vcpu->arch.pfault_token;
++ 	kvm_run->s.regs.pfs = vcpu->arch.pfault_select;
++ 	kvm_run->s.regs.pfc = vcpu->arch.pfault_compare;
++ }
++ 
+++>>>>>>> 0097d12e504b (KVM: provide irq_unsafe kvm_guest_{enter|exit})
+  int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
+  {
+  	int rc;
+* Unmerged path arch/s390/kvm/kvm-s390.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 711736b3eead..5c0261342122 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -786,16 +786,10 @@ static inline void kvm_iommu_unmap_pages(struct kvm *kvm,
+ }
+ #endif
+ 
+-static inline void kvm_guest_enter(void)
++/* must be called with irqs disabled */
++static inline void __kvm_guest_enter(void)
+ {
+-	unsigned long flags;
+-
+-	BUG_ON(preemptible());
+-
+-	local_irq_save(flags);
+ 	guest_enter();
+-	local_irq_restore(flags);
+-
+ 	/* KVM does not hold any references to rcu protected data when it
+ 	 * switches CPU into a guest mode. In fact switching to a guest mode
+ 	 * is very similar to exiting to userspace from rcu point of view. In
+@@ -807,12 +801,27 @@ static inline void kvm_guest_enter(void)
+ 		rcu_virt_note_context_switch(smp_processor_id());
+ }
+ 
++/* must be called with irqs disabled */
++static inline void __kvm_guest_exit(void)
++{
++	guest_exit();
++}
++
++static inline void kvm_guest_enter(void)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	__kvm_guest_enter();
++	local_irq_restore(flags);
++}
++
+ static inline void kvm_guest_exit(void)
+ {
+ 	unsigned long flags;
+ 
+ 	local_irq_save(flags);
+-	guest_exit();
++	__kvm_guest_exit();
+ 	local_irq_restore(flags);
+ }
+ 
