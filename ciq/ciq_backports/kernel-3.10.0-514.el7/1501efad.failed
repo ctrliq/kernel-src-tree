@@ -1,0 +1,200 @@
+md/raid: only permit hot-add of compatible integrity profiles
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [md] raid: only permit hot-add of compatible integrity profiles (Jes Sorensen) [1250578 1265947 1273343 1299140 1307091 1312828 1320563 1340839]
+Rebuild_FUZZ: 97.48%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 1501efadc524a0c99494b576923091589a52d2a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1501efad.failed
+
+It is not safe for an integrity profile to be changed while i/o is
+in-flight in the queue.  Prevent adding new disks or otherwise online
+spares to an array if the device has an incompatible integrity profile.
+
+The original change to the blk_integrity_unregister implementation in
+md, commmit c7bfced9a671 "md: suspend i/o during runtime
+blk_integrity_unregister" introduced an immediate hang regression.
+
+This policy of disallowing changes the integrity profile once one has
+been established is shared with DM.
+
+Here is an abbreviated log from a test run that:
+1/ Creates a degraded raid1 with an integrity-enabled device (pmem0s) [   59.076127]
+2/ Tries to add an integrity-disabled device (pmem1m) [   90.489209]
+3/ Retries with an integrity-enabled device (pmem1s) [  205.671277]
+
+[   59.076127] md/raid1:md0: active with 1 out of 2 mirrors
+[   59.078302] md: data integrity enabled on md0
+[..]
+[   90.489209] md0: incompatible integrity profile for pmem1m
+[..]
+[  205.671277] md: super_written gets error=-5
+[  205.677386] md/raid1:md0: Disk failure on pmem1m, disabling device.
+[  205.677386] md/raid1:md0: Operation continuing on 1 devices.
+[  205.683037] RAID1 conf printout:
+[  205.684699]  --- wd:1 rd:2
+[  205.685972]  disk 0, wo:0, o:1, dev:pmem0s
+[  205.687562]  disk 1, wo:1, o:1, dev:pmem1s
+[  205.691717] md: recovery of RAID array md0
+
+Fixes: c7bfced9a671 ("md: suspend i/o during runtime blk_integrity_unregister")
+	Cc: <stable@vger.kernel.org>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Reported-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: NeilBrown <neilb@suse.com>
+(cherry picked from commit 1501efadc524a0c99494b576923091589a52d2a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/multipath.c
+#	drivers/md/raid1.c
+#	drivers/md/raid10.c
+diff --cc drivers/md/md.c
+index 02efc1fbf923,2cf0e1c00b9a..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -2013,14 -2027,15 +2017,26 @@@ int md_integrity_add_rdev(struct md_rde
+  	bi_mddev = blk_get_integrity(mddev->gendisk);
+  
+  	if (!bi_mddev) /* nothing to do */
+++<<<<<<< HEAD
+ +		return;
+ +	if (rdev->raid_disk < 0) /* skip spares */
+ +		return;
+ +	if (bi_rdev && blk_integrity_compare(mddev->gendisk,
+ +					     rdev->bdev->bd_disk) >= 0)
+ +		return;
+ +	printk(KERN_NOTICE "disabling data integrity on %s\n", mdname(mddev));
+ +	blk_integrity_unregister(mddev->gendisk);
+++=======
++ 		return 0;
++ 
++ 	if (blk_integrity_compare(mddev->gendisk, rdev->bdev->bd_disk) != 0) {
++ 		printk(KERN_NOTICE "%s: incompatible integrity profile for %s\n",
++ 				mdname(mddev), bdevname(rdev->bdev, name));
++ 		return -ENXIO;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 1501efadc524 (md/raid: only permit hot-add of compatible integrity profiles)
+  }
+  EXPORT_SYMBOL(md_integrity_add_rdev);
+  
+diff --cc drivers/md/multipath.c
+index f3a25e1ac3ee,0a72ab6e6c20..000000000000
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@@ -257,18 -257,9 +257,24 @@@ static int multipath_add_disk(struct md
+  			disk_stack_limits(mddev->gendisk, rdev->bdev,
+  					  rdev->data_offset << 9);
+  
+++<<<<<<< HEAD
+ +		/* as we don't honour merge_bvec_fn, we must never risk
+ +		 * violating it, so limit ->max_segments to one, lying
+ +		 * within a single page.
+ +		 * (Note: it is very unlikely that a device with
+ +		 * merge_bvec_fn will be involved in multipath.)
+ +		 */
+ +			if (q->merge_bvec_fn) {
+ +				blk_queue_max_segments(mddev->queue, 1);
+ +				blk_queue_segment_boundary(mddev->queue,
+ +							   PAGE_CACHE_SIZE - 1);
+ +			}
+ +
+++=======
++ 			err = md_integrity_add_rdev(rdev, mddev);
++ 			if (err)
++ 				break;
+++>>>>>>> 1501efadc524 (md/raid: only permit hot-add of compatible integrity profiles)
+  			spin_lock_irq(&conf->device_lock);
+  			mddev->degraded--;
+  			rdev->raid_disk = path;
+@@@ -276,7 -267,6 +282,10 @@@
+  			spin_unlock_irq(&conf->device_lock);
+  			rcu_assign_pointer(p->rdev, rdev);
+  			err = 0;
+++<<<<<<< HEAD
+ +			md_integrity_add_rdev(rdev, mddev);
+++=======
+++>>>>>>> 1501efadc524 (md/raid: only permit hot-add of compatible integrity profiles)
+  			break;
+  		}
+  
+diff --cc drivers/md/raid1.c
+index 52d460453f3d,c4b913409226..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -1647,20 -1635,6 +1650,23 @@@ static int raid1_add_disk(struct mddev 
+  			break;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	if (err == 0 && test_bit(Unmerged, &rdev->flags)) {
+ +		/* Some requests might not have seen this new
+ +		 * merge_bvec_fn.  We must wait for them to complete
+ +		 * before merging the device fully.
+ +		 * First we make sure any code which has tested
+ +		 * our function has submitted the request, then
+ +		 * we wait for all outstanding requests to complete.
+ +		 */
+ +		synchronize_sched();
+ +		freeze_array(conf, 0);
+ +		unfreeze_array(conf);
+ +		clear_bit(Unmerged, &rdev->flags);
+ +	}
+ +	md_integrity_add_rdev(rdev, mddev);
+++=======
+++>>>>>>> 1501efadc524 (md/raid: only permit hot-add of compatible integrity profiles)
+  	if (mddev->queue && blk_queue_discard(bdev_get_queue(rdev->bdev)))
+  		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
+  	print_conf(conf);
+diff --cc drivers/md/raid10.c
+index aeac3f41ef7a,ce959b4ae4df..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -1852,20 -1742,6 +1855,23 @@@ static int raid10_add_disk(struct mdde
+  		rcu_assign_pointer(p->rdev, rdev);
+  		break;
+  	}
+++<<<<<<< HEAD
+ +	if (err == 0 && test_bit(Unmerged, &rdev->flags)) {
+ +		/* Some requests might not have seen this new
+ +		 * merge_bvec_fn.  We must wait for them to complete
+ +		 * before merging the device fully.
+ +		 * First we make sure any code which has tested
+ +		 * our function has submitted the request, then
+ +		 * we wait for all outstanding requests to complete.
+ +		 */
+ +		synchronize_sched();
+ +		freeze_array(conf, 0);
+ +		unfreeze_array(conf);
+ +		clear_bit(Unmerged, &rdev->flags);
+ +	}
+ +	md_integrity_add_rdev(rdev, mddev);
+++=======
+++>>>>>>> 1501efadc524 (md/raid: only permit hot-add of compatible integrity profiles)
+  	if (mddev->queue && blk_queue_discard(bdev_get_queue(rdev->bdev)))
+  		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
+  
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 80987f886ca3..53cfaa4131e0 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -634,7 +634,7 @@ extern void md_wait_for_blocked_rdev(struct md_rdev *rdev, struct mddev *mddev);
+ extern void md_set_array_sectors(struct mddev *mddev, sector_t array_sectors);
+ extern int md_check_no_bitmap(struct mddev *mddev);
+ extern int md_integrity_register(struct mddev *mddev);
+-extern void md_integrity_add_rdev(struct md_rdev *rdev, struct mddev *mddev);
++extern int md_integrity_add_rdev(struct md_rdev *rdev, struct mddev *mddev);
+ extern int strict_strtoul_scaled(const char *cp, unsigned long *res, int scale);
+ 
+ extern void mddev_init(struct mddev *mddev);
+* Unmerged path drivers/md/multipath.c
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid10.c
