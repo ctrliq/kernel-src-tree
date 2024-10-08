@@ -1,0 +1,131 @@
+nfs: only reset desc->pg_mirror_idx when mirroring is supported
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit 47af81f29556a45493e5c87289c3c16ce911096c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/47af81f2.failed
+
+so that we don't reset desc->pg_mirror_idx for read unnecessarily.
+Remove WARN_ON_ONCE from __nfs_pageio_add_request to allow LD to
+set pg_mirror_idx for read where pg_mirror_count is always 1.
+
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Tom Haynes <loghyr@primarydata.com>
+(cherry picked from commit 47af81f29556a45493e5c87289c3c16ce911096c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+diff --cc fs/nfs/pagelist.c
+index c60681b2bf26,f9d8c4691149..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -1021,6 -1121,77 +1021,79 @@@ int nfs_pageio_add_request(struct nfs_p
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int nfs_pageio_add_request(struct nfs_pageio_descriptor *desc,
++ 			   struct nfs_page *req)
++ {
++ 	u32 midx;
++ 	unsigned int pgbase, offset, bytes;
++ 	struct nfs_page *dupreq, *lastreq;
++ 
++ 	pgbase = req->wb_pgbase;
++ 	offset = req->wb_offset;
++ 	bytes = req->wb_bytes;
++ 
++ 	nfs_pageio_setup_mirroring(desc, req);
++ 
++ 	for (midx = 0; midx < desc->pg_mirror_count; midx++) {
++ 		if (midx) {
++ 			nfs_page_group_lock(req, false);
++ 
++ 			/* find the last request */
++ 			for (lastreq = req->wb_head;
++ 			     lastreq->wb_this_page != req->wb_head;
++ 			     lastreq = lastreq->wb_this_page)
++ 				;
++ 
++ 			dupreq = nfs_create_request(req->wb_context,
++ 					req->wb_page, lastreq, pgbase, bytes);
++ 
++ 			if (IS_ERR(dupreq)) {
++ 				nfs_page_group_unlock(req);
++ 				return 0;
++ 			}
++ 
++ 			nfs_lock_request(dupreq);
++ 			nfs_page_group_unlock(req);
++ 			dupreq->wb_offset = offset;
++ 			dupreq->wb_index = req->wb_index;
++ 		} else
++ 			dupreq = req;
++ 
++ 		if (nfs_pgio_has_mirroring(desc))
++ 			desc->pg_mirror_idx = midx;
++ 		if (!nfs_pageio_add_request_mirror(desc, dupreq))
++ 			return 0;
++ 	}
++ 
++ 	return 1;
++ }
++ 
++ /*
++  * nfs_pageio_complete_mirror - Complete I/O on the current mirror of an
++  *				nfs_pageio_descriptor
++  * @desc: pointer to io descriptor
++  */
++ static void nfs_pageio_complete_mirror(struct nfs_pageio_descriptor *desc,
++ 				       u32 mirror_idx)
++ {
++ 	struct nfs_pgio_mirror *mirror = &desc->pg_mirrors[mirror_idx];
++ 	u32 restore_idx = desc->pg_mirror_idx;
++ 
++ 	if (nfs_pgio_has_mirroring(desc))
++ 		desc->pg_mirror_idx = mirror_idx;
++ 	for (;;) {
++ 		nfs_pageio_doio(desc);
++ 		if (!mirror->pg_recoalesce)
++ 			break;
++ 		if (!nfs_do_recoalesce(desc))
++ 			break;
++ 	}
++ 	desc->pg_mirror_idx = restore_idx;
++ }
++ 
+++>>>>>>> 47af81f29556 (nfs: only reset desc->pg_mirror_idx when mirroring is supported)
+  /*
+   * nfs_pageio_resend - Transfer requests to new descriptor and resend
+   * @hdr - the pgio header to move request from
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 9fe4201d709b..42c89f322c98 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -6,6 +6,7 @@
+ #include <linux/mount.h>
+ #include <linux/security.h>
+ #include <linux/crc32.h>
++#include <linux/nfs_page.h>
+ 
+ #define NFS_MS_MASK (MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_SYNCHRONOUS)
+ 
+@@ -255,6 +256,12 @@ static inline void nfs_iocounter_init(struct nfs_io_counter *c)
+ 	atomic_set(&c->io_count, 0);
+ }
+ 
++static inline bool nfs_pgio_has_mirroring(struct nfs_pageio_descriptor *desc)
++{
++	WARN_ON_ONCE(desc->pg_mirror_count < 1);
++	return desc->pg_mirror_count > 1;
++}
++
+ /* nfs2xdr.c */
+ extern struct rpc_procinfo nfs_procedures[];
+ extern int nfs2_decode_dirent(struct xdr_stream *,
+* Unmerged path fs/nfs/pagelist.c
