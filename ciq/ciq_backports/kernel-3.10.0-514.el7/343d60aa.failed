@@ -1,0 +1,174 @@
+ipv6: change ipv6_stub_impl.ipv6_dst_lookup to take net argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Roopa Prabhu <roopa@cumulusnetworks.com>
+commit 343d60aada5a358ca186d6e9e353230379c426d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/343d60aa.failed
+
+This patch adds net argument to ipv6_stub_impl.ipv6_dst_lookup
+for use cases where sk is not available (like mpls).
+sk appears to be needed to get the namespace 'net' and is optional
+otherwise. This patch series changes ipv6_stub_impl.ipv6_dst_lookup
+to take net argument. sk remains optional.
+
+All callers of ipv6_stub_impl.ipv6_dst_lookup have been modified
+to pass net. I have modified them to use already available
+'net' in the scope of the call. I can change them to
+sock_net(sk) to avoid any unintended change in behaviour if sock
+namespace is different. They dont seem to be from code inspection.
+
+	Signed-off-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 343d60aada5a358ca186d6e9e353230379c426d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/udp_media.c
+* Unmerged path net/tipc/udp_media.c
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index e2461103c0f3..f126087a18c7 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -1984,7 +1984,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+ 		fl6.flowi6_mark = skb->mark;
+ 		fl6.flowi6_proto = IPPROTO_UDP;
+ 
+-		if (ipv6_stub->ipv6_dst_lookup(sk, &ndst, &fl6)) {
++		if (ipv6_stub->ipv6_dst_lookup(vxlan->net, sk, &ndst, &fl6)) {
+ 			netdev_dbg(dev, "no route to %pI6\n",
+ 				   &dst->sin6.sin6_addr);
+ 			dev->stats.tx_carrier_errors++;
+diff --git a/include/net/addrconf.h b/include/net/addrconf.h
+index e044b5b8f56d..0b1ea98caa8d 100644
+--- a/include/net/addrconf.h
++++ b/include/net/addrconf.h
+@@ -153,8 +153,8 @@ struct ipv6_stub {
+ 				 const struct in6_addr *addr);
+ 	int (*ipv6_sock_mc_drop)(struct sock *sk, int ifindex,
+ 				 const struct in6_addr *addr);
+-	int (*ipv6_dst_lookup)(struct sock *sk, struct dst_entry **dst,
+-				struct flowi6 *fl6);
++	int (*ipv6_dst_lookup)(struct net *net, struct sock *sk,
++			       struct dst_entry **dst, struct flowi6 *fl6);
+ 	void (*udpv6_encap_enable)(void);
+ 	void (*ndisc_send_na)(struct net_device *dev, struct neighbour *neigh,
+ 			      const struct in6_addr *daddr,
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index 5dca98c3fc9f..7adb36133b40 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -763,7 +763,8 @@ static inline struct sk_buff *ip6_finish_skb(struct sock *sk)
+ 			      &inet6_sk(sk)->cork);
+ }
+ 
+-int ip6_dst_lookup(struct sock *sk, struct dst_entry **dst, struct flowi6 *fl6);
++int ip6_dst_lookup(struct net *net, struct sock *sk, struct dst_entry **dst,
++		   struct flowi6 *fl6);
+ struct dst_entry *ip6_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
+ 				      const struct in6_addr *final_dst);
+ struct dst_entry *ip6_sk_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
+diff --git a/net/ipv6/addrconf_core.c b/net/ipv6/addrconf_core.c
+index 8e32394fa54f..a0ed0d8c036c 100644
+--- a/net/ipv6/addrconf_core.c
++++ b/net/ipv6/addrconf_core.c
+@@ -107,7 +107,16 @@ int inet6addr_notifier_call_chain(unsigned long val, void *v)
+ }
+ EXPORT_SYMBOL(inet6addr_notifier_call_chain);
+ 
+-const struct ipv6_stub *ipv6_stub __read_mostly;
++static int eafnosupport_ipv6_dst_lookup(struct net *net, struct sock *u1,
++					struct dst_entry **u2,
++					struct flowi6 *u3)
++{
++	return -EAFNOSUPPORT;
++}
++
++const struct ipv6_stub *ipv6_stub __read_mostly = &(struct ipv6_stub) {
++	.ipv6_dst_lookup = eafnosupport_ipv6_dst_lookup,
++};
+ EXPORT_SYMBOL_GPL(ipv6_stub);
+ 
+ /* IPv6 Wildcard Address and Loopback Address defined by RFC2553 */
+diff --git a/net/ipv6/icmp.c b/net/ipv6/icmp.c
+index 8a66e2366f49..94f2fdfbd4f1 100644
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@ -314,7 +314,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net, struct sk_buff *sk
+ 	struct flowi6 fl2;
+ 	int err;
+ 
+-	err = ip6_dst_lookup(sk, &dst, fl6);
++	err = ip6_dst_lookup(net, sk, &dst, fl6);
+ 	if (err)
+ 		return ERR_PTR(err);
+ 
+@@ -346,7 +346,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net, struct sk_buff *sk
+ 	if (err)
+ 		goto relookup_failed;
+ 
+-	err = ip6_dst_lookup(sk, &dst2, &fl2);
++	err = ip6_dst_lookup(net, sk, &dst2, &fl2);
+ 	if (err)
+ 		goto relookup_failed;
+ 
+@@ -571,7 +571,7 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
+ 	else if (!fl6.flowi6_oif)
+ 		fl6.flowi6_oif = np->ucast_oif;
+ 
+-	err = ip6_dst_lookup(sk, &dst, &fl6);
++	err = ip6_dst_lookup(net, sk, &dst, &fl6);
+ 	if (err)
+ 		goto out;
+ 	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), sk, 0);
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 6e24dc6ba803..75a0adbfc4e9 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -862,10 +862,9 @@ out:
+ 	return dst;
+ }
+ 
+-static int ip6_dst_lookup_tail(struct sock *sk,
++static int ip6_dst_lookup_tail(struct net *net, struct sock *sk,
+ 			       struct dst_entry **dst, struct flowi6 *fl6)
+ {
+-	struct net *net = sock_net(sk);
+ #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
+ 	struct neighbour *n;
+ 	struct rt6_info *rt;
+@@ -949,10 +948,11 @@ out_err_release:
+  *
+  *	It returns zero on success, or a standard errno code on error.
+  */
+-int ip6_dst_lookup(struct sock *sk, struct dst_entry **dst, struct flowi6 *fl6)
++int ip6_dst_lookup(struct net *net, struct sock *sk, struct dst_entry **dst,
++		   struct flowi6 *fl6)
+ {
+ 	*dst = NULL;
+-	return ip6_dst_lookup_tail(sk, dst, fl6);
++	return ip6_dst_lookup_tail(net, sk, dst, fl6);
+ }
+ EXPORT_SYMBOL_GPL(ip6_dst_lookup);
+ 
+@@ -973,7 +973,7 @@ struct dst_entry *ip6_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
+ 	struct dst_entry *dst = NULL;
+ 	int err;
+ 
+-	err = ip6_dst_lookup_tail(sk, &dst, fl6);
++	err = ip6_dst_lookup_tail(sock_net(sk), sk, &dst, fl6);
+ 	if (err)
+ 		return ERR_PTR(err);
+ 	if (final_dst)
+@@ -1007,7 +1007,7 @@ struct dst_entry *ip6_sk_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
+ 
+ 	dst = ip6_sk_dst_check(sk, dst, fl6);
+ 
+-	err = ip6_dst_lookup_tail(sk, &dst, fl6);
++	err = ip6_dst_lookup_tail(sock_net(sk), sk, &dst, fl6);
+ 	if (err)
+ 		return ERR_PTR(err);
+ 	if (final_dst)
+* Unmerged path net/tipc/udp_media.c
