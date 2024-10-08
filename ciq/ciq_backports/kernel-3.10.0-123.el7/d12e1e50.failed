@@ -1,0 +1,134 @@
+ipc/sem.c: replace shared sem_otime with per-semaphore value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [ipc] sem: replace shared sem_otime with per-semaphore value (Rik van Riel) [881820]
+Rebuild_FUZZ: 94.74%
+commit-author Manfred Spraul <manfred@colorfullife.com>
+commit d12e1e50e47e0900dbbf52237b7e171f4f15ea1e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/d12e1e50.failed
+
+sem_otime contains the time of the last semaphore operation that
+completed successfully.  Every operation updates this value, thus access
+from multiple cpus can cause thrashing.
+
+Therefore the patch replaces the variable with a per-semaphore variable.
+The per-array sem_otime is only calculated when required.
+
+No performance improvement on a single-socket i3 - only important for
+larger systems.
+
+	Signed-off-by: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Davidlohr Bueso <davidlohr.bueso@hp.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d12e1e50e47e0900dbbf52237b7e171f4f15ea1e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/sem.c
+diff --cc ipc/sem.c
+index e659bff82f2d,51352e1bfff9..000000000000
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@@ -835,47 -883,43 +836,58 @@@ static void do_smart_update(struct sem_
+  
+  	otime |= do_smart_wakeup_zero(sma, sops, nsops, pt);
+  
+ -	if (!list_empty(&sma->pending_alter)) {
+ -		/* semaphore array uses the global queue - just process it. */
+ -		otime |= update_queue(sma, -1, pt);
+ -	} else {
+ -		if (!sops) {
+ -			/*
+ -			 * No sops, thus the modified semaphores are not
+ -			 * known. Check all.
+ -			 */
+ -			for (i = 0; i < sma->sem_nsems; i++)
+ -				otime |= update_queue(sma, i, pt);
+ -		} else {
+ -			/*
+ -			 * Check the semaphores that were increased:
+ -			 * - No complex ops, thus all sleeping ops are
+ -			 *   decrease.
+ -			 * - if we decreased the value, then any sleeping
+ -			 *   semaphore ops wont be able to run: If the
+ -			 *   previous value was too small, then the new
+ -			 *   value will be too small, too.
+ -			 */
+ -			for (i = 0; i < nsops; i++) {
+ -				if (sops[i].sem_op > 0) {
+ -					otime |= update_queue(sma,
+ -							sops[i].sem_num, pt);
+ -				}
+ +	progress = 1;
+ +retry_global:
+ +	if (sma->complex_count) {
+ +		if (update_queue(sma, -1, pt)) {
+ +			progress = 1;
+ +			otime = 1;
+ +			sops = NULL;
+ +		}
+ +	}
+++<<<<<<< HEAD
+ +	if (!progress)
+ +		goto done;
+ +
+ +	if (!sops) {
+ +		/* No semops; something special is going on. */
+ +		for (i = 0; i < sma->sem_nsems; i++) {
+ +			if (update_queue(sma, i, pt)) {
+ +				otime = 1;
+ +				progress = 1;
+  			}
+  		}
+ +		goto done_checkretry;
+ +	}
+ +
+ +	/* Check the semaphores that were modified. */
+ +	for (i = 0; i < nsops; i++) {
+ +		if (sops[i].sem_op > 0 ||
+ +			(sops[i].sem_op < 0 &&
+ +				sma->sem_base[sops[i].sem_num].semval == 0))
+ +			if (update_queue(sma, sops[i].sem_num, pt)) {
+ +				otime = 1;
+ +				progress = 1;
+ +			}
+  	}
+ +done_checkretry:
+ +	if (progress) {
+ +		progress = 0;
+ +		goto retry_global;
+ +	}
+ +done:
+ +	if (otime)
+ +		sma->sem_otime = get_seconds();
+++=======
++ 	if (otime) {
++ 		if (sops == NULL) {
++ 			sma->sem_base[0].sem_otime = get_seconds();
++ 		} else {
++ 			sma->sem_base[sops[0].sem_num].sem_otime =
++ 								get_seconds();
++ 		}
++ 	}
+++>>>>>>> d12e1e50e47e (ipc/sem.c: replace shared sem_otime with per-semaphore value)
+  }
+  
+  
+diff --git a/include/linux/sem.h b/include/linux/sem.h
+index 55e17f68d256..976ce3a19f1b 100644
+--- a/include/linux/sem.h
++++ b/include/linux/sem.h
+@@ -12,7 +12,6 @@ struct task_struct;
+ struct sem_array {
+ 	struct kern_ipc_perm	____cacheline_aligned_in_smp
+ 				sem_perm;	/* permissions .. see ipc.h */
+-	time_t			sem_otime;	/* last semop time */
+ 	time_t			sem_ctime;	/* last change time */
+ 	struct sem		*sem_base;	/* ptr to first semaphore in array */
+ 	struct list_head	pending_alter;	/* pending operations */
+* Unmerged path ipc/sem.c
