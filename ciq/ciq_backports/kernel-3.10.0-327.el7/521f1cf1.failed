@@ -1,0 +1,223 @@
+inet_diag: fix access to tcp cc information
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 521f1cf1dbb9d5ad858dca5dc75d1b45f64b6589
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/521f1cf1.failed
+
+Two different problems are fixed here :
+
+1) inet_sk_diag_fill() might be called without socket lock held.
+   icsk->icsk_ca_ops can change under us and module be unloaded.
+   -> Access to freed memory.
+   Fix this using rcu_read_lock() to prevent module unload.
+
+2) Some TCP Congestion Control modules provide information
+   but again this is not safe against icsk->icsk_ca_ops
+   change and nla_put() errors were ignored. Some sockets
+   could not get the additional info if skb was almost full.
+
+Fix this by returning a status from get_info() handlers and
+using rcu protection as well.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 521f1cf1dbb9d5ad858dca5dc75d1b45f64b6589)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/inet_diag.c
+#	net/ipv4/tcp_vegas.h
+diff --cc net/ipv4/inet_diag.c
+index 4eeba4e497a0,bb77ebdae3b3..000000000000
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@@ -86,12 -105,15 +86,18 @@@ static size_t inet_sk_attr_size(void
+  }
+  
+  int inet_sk_diag_fill(struct sock *sk, struct inet_connection_sock *icsk,
+ -		      struct sk_buff *skb, const struct inet_diag_req_v2 *req,
+ -		      struct user_namespace *user_ns,
+ -		      u32 portid, u32 seq, u16 nlmsg_flags,
+ -		      const struct nlmsghdr *unlh)
+ +			      struct sk_buff *skb, struct inet_diag_req_v2 *req,
+ +			      struct user_namespace *user_ns,		      	
+ +			      u32 portid, u32 seq, u16 nlmsg_flags,
+ +			      const struct nlmsghdr *unlh)
+  {
+  	const struct inet_sock *inet = inet_sk(sk);
+++<<<<<<< HEAD
+++=======
++ 	const struct tcp_congestion_ops *ca_ops;
++ 	const struct inet_diag_handler *handler;
++ 	int ext = req->idiag_ext;
+++>>>>>>> 521f1cf1dbb9 (inet_diag: fix access to tcp cc information)
+  	struct inet_diag_msg *r;
+  	struct nlmsghdr  *nlh;
+  	struct nlattr *attr;
+@@@ -212,12 -223,21 +225,20 @@@
+  
+  	handler->idiag_get_info(sk, r, info);
+  
+- 	if (sk->sk_state < TCP_TIME_WAIT &&
+- 	    icsk->icsk_ca_ops && icsk->icsk_ca_ops->get_info)
+- 		icsk->icsk_ca_ops->get_info(sk, ext, skb);
++ 	if (sk->sk_state < TCP_TIME_WAIT) {
++ 		int err = 0;
++ 
++ 		rcu_read_lock();
++ 		ca_ops = READ_ONCE(icsk->icsk_ca_ops);
++ 		if (ca_ops && ca_ops->get_info)
++ 			err = ca_ops->get_info(sk, ext, skb);
++ 		rcu_read_unlock();
++ 		if (err < 0)
++ 			goto errout;
++ 	}
+  
+  out:
+ -	nlmsg_end(skb, nlh);
+ -	return 0;
+ +	return nlmsg_end(skb, nlh);
+  
+  errout:
+  	nlmsg_cancel(skb, nlh);
+diff --cc net/ipv4/tcp_vegas.h
+index 6c0eea2f8249,e8a6b33cc61d..000000000000
+--- a/net/ipv4/tcp_vegas.h
++++ b/net/ipv4/tcp_vegas.h
+@@@ -15,10 -15,10 +15,18 @@@ struct vegas 
+  	u32	baseRTT;	/* the min of all Vegas RTT measurements seen (in usec) */
+  };
+  
+++<<<<<<< HEAD
+ +extern void tcp_vegas_init(struct sock *sk);
+ +extern void tcp_vegas_state(struct sock *sk, u8 ca_state);
+ +extern void tcp_vegas_pkts_acked(struct sock *sk, u32 cnt, s32 rtt_us);
+ +extern void tcp_vegas_cwnd_event(struct sock *sk, enum tcp_ca_event event);
+ +extern void tcp_vegas_get_info(struct sock *sk, u32 ext, struct sk_buff *skb);
+++=======
++ void tcp_vegas_init(struct sock *sk);
++ void tcp_vegas_state(struct sock *sk, u8 ca_state);
++ void tcp_vegas_pkts_acked(struct sock *sk, u32 cnt, s32 rtt_us);
++ void tcp_vegas_cwnd_event(struct sock *sk, enum tcp_ca_event event);
++ int tcp_vegas_get_info(struct sock *sk, u32 ext, struct sk_buff *skb);
+++>>>>>>> 521f1cf1dbb9 (inet_diag: fix access to tcp cc information)
+  
+  #endif	/* __TCP_VEGAS_H */
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 0373da38f3bc..a5fb7f588472 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -822,7 +822,7 @@ struct tcp_congestion_ops {
+ 	/* hook for packet ack accounting (optional) */
+ 	void (*pkts_acked)(struct sock *sk, u32 num_acked, s32 rtt_us);
+ 	/* get info for inet_diag (optional) */
+-	void (*get_info)(struct sock *sk, u32 ext, struct sk_buff *skb);
++	int (*get_info)(struct sock *sk, u32 ext, struct sk_buff *skb);
+ 
+ 	char 		name[TCP_CA_NAME_MAX];
+ 	struct module 	*owner;
+* Unmerged path net/ipv4/inet_diag.c
+diff --git a/net/ipv4/tcp_dctcp.c b/net/ipv4/tcp_dctcp.c
+index b504371af742..4376016f7fa5 100644
+--- a/net/ipv4/tcp_dctcp.c
++++ b/net/ipv4/tcp_dctcp.c
+@@ -277,7 +277,7 @@ static void dctcp_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
+ 	}
+ }
+ 
+-static void dctcp_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
++static int dctcp_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+ {
+ 	const struct dctcp *ca = inet_csk_ca(sk);
+ 
+@@ -297,8 +297,9 @@ static void dctcp_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+ 			info.dctcp_ab_tot = ca->acked_bytes_total;
+ 		}
+ 
+-		nla_put(skb, INET_DIAG_DCTCPINFO, sizeof(info), &info);
++		return nla_put(skb, INET_DIAG_DCTCPINFO, sizeof(info), &info);
+ 	}
++	return 0;
+ }
+ 
+ static struct tcp_congestion_ops dctcp __read_mostly = {
+diff --git a/net/ipv4/tcp_illinois.c b/net/ipv4/tcp_illinois.c
+index 834857f3c871..bd7a354ebd74 100644
+--- a/net/ipv4/tcp_illinois.c
++++ b/net/ipv4/tcp_illinois.c
+@@ -302,8 +302,7 @@ static u32 tcp_illinois_ssthresh(struct sock *sk)
+ 
+ 
+ /* Extract info for Tcp socket info provided via netlink. */
+-static void tcp_illinois_info(struct sock *sk, u32 ext,
+-			      struct sk_buff *skb)
++static int tcp_illinois_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+ {
+ 	const struct illinois *ca = inet_csk_ca(sk);
+ 
+@@ -320,8 +319,9 @@ static void tcp_illinois_info(struct sock *sk, u32 ext,
+ 			do_div(t, info.tcpv_rttcnt);
+ 			info.tcpv_rtt = t;
+ 		}
+-		nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
++		return nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
+ 	}
++	return 0;
+ }
+ 
+ static struct tcp_congestion_ops tcp_illinois __read_mostly = {
+diff --git a/net/ipv4/tcp_vegas.c b/net/ipv4/tcp_vegas.c
+index c042e529a11e..fec8e24d4622 100644
+--- a/net/ipv4/tcp_vegas.c
++++ b/net/ipv4/tcp_vegas.c
+@@ -289,7 +289,7 @@ static void tcp_vegas_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ }
+ 
+ /* Extract info for Tcp socket info provided via netlink. */
+-void tcp_vegas_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
++int tcp_vegas_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+ {
+ 	const struct vegas *ca = inet_csk_ca(sk);
+ 	if (ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
+@@ -300,8 +300,9 @@ void tcp_vegas_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+ 			.tcpv_minrtt = ca->minRTT,
+ 		};
+ 
+-		nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
++		return nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
+ 	}
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(tcp_vegas_get_info);
+ 
+* Unmerged path net/ipv4/tcp_vegas.h
+diff --git a/net/ipv4/tcp_westwood.c b/net/ipv4/tcp_westwood.c
+index 96198c81cefd..3a0d11871aa9 100644
+--- a/net/ipv4/tcp_westwood.c
++++ b/net/ipv4/tcp_westwood.c
+@@ -259,8 +259,7 @@ static void tcp_westwood_event(struct sock *sk, enum tcp_ca_event event)
+ 
+ 
+ /* Extract info for Tcp socket info provided via netlink. */
+-static void tcp_westwood_info(struct sock *sk, u32 ext,
+-			      struct sk_buff *skb)
++static int tcp_westwood_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+ {
+ 	const struct westwood *ca = inet_csk_ca(sk);
+ 	if (ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
+@@ -270,8 +269,9 @@ static void tcp_westwood_info(struct sock *sk, u32 ext,
+ 			.tcpv_minrtt = jiffies_to_usecs(ca->rtt_min),
+ 		};
+ 
+-		nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
++		return nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
+ 	}
++	return 0;
+ }
+ 
+ 
