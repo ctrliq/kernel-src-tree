@@ -1,0 +1,446 @@
+tpm: device class for tpm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+commit 313d21eeab9282e01fdcecd40e9ca87e0953627f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/313d21ee.failed
+
+Added own device class for TPM. Uses MISC_MAJOR:TPM_MINOR for the
+first character device in order to retain backwards compatibility.
+Added tpm_dev_release() back attached to the character device.
+
+I've been running this code now for a while on my laptop (Lenovo
+T430S) TrouSerS works perfectly without modifications. I don't
+believe it breaks anything significantly.
+
+The sysfs attributes that have been placed under the wrong place
+and are against sysfs-rules.txt should be probably left to
+stagnate under platform device directory and start defining
+new sysfs attributes to the char device directory.
+
+Guidelines for future TPM sysfs attributes should be probably
+along the lines of
+
+- Single flat set of mandatory sysfs attributes. For example,
+  current PPI interface is way way too rich when you only want
+  to use it to clear and activate the TPM.
+
+- Define sysfs attribute if and only if there's no way to get
+  the value from ring-3. No attributes for TPM properties. It's
+  just unnecessary maintenance hurdle that we don't want.
+
+	Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+	Reviewed-by: Jasob Gunthorpe <jason.gunthorpe@obsidianresearch.com>
+	Reviewed-by: Stefan Berger <stefanb@linux.vnet.ibm.com>
+	Tested-by: Scot Doyle <lkml14@scotdoyle.com>
+	Tested-by: Peter Huewe <peterhuewe@gmx.de>
+	Signed-off-by: Peter Huewe <peterhuewe@gmx.de>
+(cherry picked from commit 313d21eeab9282e01fdcecd40e9ca87e0953627f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/tpm/tpm-chip.c
+#	drivers/char/tpm/tpm-dev.c
+#	drivers/char/tpm/tpm-interface.c
+#	drivers/char/tpm/tpm.h
+#	drivers/char/tpm/tpm_tis.c
+diff --cc drivers/char/tpm/tpm-dev.c
+index d9b774e02a1f,de0337ebd658..000000000000
+--- a/drivers/char/tpm/tpm-dev.c
++++ b/drivers/char/tpm/tpm-dev.c
+@@@ -182,32 -180,4 +180,32 @@@ const struct file_operations tpm_fops 
+  	.release = tpm_release,
+  };
+  
+- int tpm_dev_add_device(struct tpm_chip *chip)
+- {
+- 	int rc;
+  
+++<<<<<<< HEAD
+ +	chip->vendor.miscdev.fops = &tpm_fops;
+ +	if (chip->dev_num == 0)
+ +		chip->vendor.miscdev.minor = TPM_MINOR;
+ +	else
+ +		chip->vendor.miscdev.minor = MISC_DYNAMIC_MINOR;
+ +
+ +	chip->vendor.miscdev.name = chip->devname;
+ +	chip->vendor.miscdev.parent = chip->dev;
+ +
+ +	rc = misc_register(&chip->vendor.miscdev);
+ +	if (rc) {
+ +		chip->vendor.miscdev.name = NULL;
+ +		dev_err(chip->dev,
+ +			"unable to misc_register %s, minor %d err=%d\n",
+ +			chip->vendor.miscdev.name,
+ +			chip->vendor.miscdev.minor, rc);
+ +	}
+ +	return rc;
+ +}
+ +
+ +void tpm_dev_del_device(struct tpm_chip *chip)
+ +{
+ +	if (chip->vendor.miscdev.name)
+ +		misc_deregister(&chip->vendor.miscdev);
+ +}
+++=======
+++>>>>>>> 313d21eeab92 (tpm: device class for tpm)
+diff --cc drivers/char/tpm/tpm-interface.c
+index c17aa45024aa,b6f6b17392fd..000000000000
+--- a/drivers/char/tpm/tpm-interface.c
++++ b/drivers/char/tpm/tpm-interface.c
+@@@ -1044,103 -997,34 +1044,134 @@@ int tpm_get_random(u32 chip_num, u8 *ou
+  }
+  EXPORT_SYMBOL_GPL(tpm_get_random);
+  
+++<<<<<<< HEAD
+ +/* In case vendor provided release function, call it too.*/
+ +
+ +void tpm_dev_vendor_release(struct tpm_chip *chip)
+ +{
+ +	if (!chip)
+ +		return;
+ +
+ +	clear_bit(chip->dev_num, dev_mask);
+ +}
+ +EXPORT_SYMBOL_GPL(tpm_dev_vendor_release);
+ +
+ +
+ +/*
+ + * Once all references to platform device are down to 0,
+ + * release all allocated structures.
+ + */
+ +static void tpm_dev_release(struct device *dev)
+ +{
+ +	struct tpm_chip *chip = dev_get_drvdata(dev);
+ +
+ +	if (!chip)
+ +		return;
+ +
+ +	tpm_dev_vendor_release(chip);
+ +
+ +	chip->release(dev);
+ +	kfree(chip);
+ +}
+ +
+ +/*
+ + * Called from tpm_<specific>.c probe function only for devices
+ + * the driver has determined it should claim.  Prior to calling
+ + * this function the specific probe function has called pci_enable_device
+ + * upon errant exit from this function specific probe function should call
+ + * pci_disable_device
+ + */
+ +struct tpm_chip *tpm_register_hardware(struct device *dev,
+ +				       const struct tpm_class_ops *ops)
+ +{
+ +	struct tpm_chip *chip;
+ +
+ +	/* Driver specific per-device data */
+ +	chip = kzalloc(sizeof(*chip), GFP_KERNEL);
+ +
+ +	if (chip == NULL)
+ +		return NULL;
+ +
+ +	mutex_init(&chip->tpm_mutex);
+ +	INIT_LIST_HEAD(&chip->list);
+ +
+ +	chip->ops = ops;
+ +	chip->dev_num = find_first_zero_bit(dev_mask, TPM_NUM_DEVICES);
+ +
+ +	if (chip->dev_num >= TPM_NUM_DEVICES) {
+ +		dev_err(dev, "No available tpm device numbers\n");
+ +		goto out_free;
+ +	}
+ +
+ +	set_bit(chip->dev_num, dev_mask);
+ +
+ +	scnprintf(chip->devname, sizeof(chip->devname), "%s%d", "tpm",
+ +		  chip->dev_num);
+ +
+ +	chip->dev = get_device(dev);
+ +	chip->release = dev->release;
+ +	dev->release = tpm_dev_release;
+ +	dev_set_drvdata(dev, chip);
+ +
+ +	if (tpm_dev_add_device(chip))
+ +		goto put_device;
+ +
+ +	if (tpm_sysfs_add_device(chip))
+ +		goto del_misc;
+ +
+ +	if (tpm_add_ppi(&dev->kobj))
+ +		goto del_sysfs;
+ +
+ +	chip->bios_dir = tpm_bios_log_setup(chip->devname);
+ +
+ +	/* Make chip available */
+ +	spin_lock(&driver_lock);
+ +	list_add_tail_rcu(&chip->list, &tpm_chip_list);
+ +	spin_unlock(&driver_lock);
+ +
+ +	return chip;
+ +
+ +del_sysfs:
+ +	tpm_sysfs_del_device(chip);
+ +del_misc:
+ +	tpm_dev_del_device(chip);
+ +put_device:
+ +	put_device(chip->dev);
+ +out_free:
+ +	kfree(chip);
+ +	return NULL;
+ +}
+ +EXPORT_SYMBOL_GPL(tpm_register_hardware);
+++=======
++ static int __init tpm_init(void)
++ {
++ 	int rc;
++ 
++ 	tpm_class = class_create(THIS_MODULE, "tpm");
++ 	if (IS_ERR(tpm_class)) {
++ 		pr_err("couldn't create tpm class\n");
++ 		return PTR_ERR(tpm_class);
++ 	}
++ 
++ 	rc = alloc_chrdev_region(&tpm_devt, 0, TPM_NUM_DEVICES, "tpm");
++ 	if (rc < 0) {
++ 		pr_err("tpm: failed to allocate char dev region\n");
++ 		class_destroy(tpm_class);
++ 		return rc;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void __exit tpm_exit(void)
++ {
++ 	class_destroy(tpm_class);
++ 	unregister_chrdev_region(tpm_devt, TPM_NUM_DEVICES);
++ }
++ 
++ subsys_initcall(tpm_init);
++ module_exit(tpm_exit);
+++>>>>>>> 313d21eeab92 (tpm: device class for tpm)
+  
+  MODULE_AUTHOR("Leendert van Doorn (leendert@watson.ibm.com)");
+  MODULE_DESCRIPTION("TPM Driver");
+diff --cc drivers/char/tpm/tpm.h
+index e638eb016b90,d46765b4c97e..000000000000
+--- a/drivers/char/tpm/tpm.h
++++ b/drivers/char/tpm/tpm.h
+@@@ -26,7 -26,8 +26,11 @@@
+  #include <linux/platform_device.h>
+  #include <linux/io.h>
+  #include <linux/tpm.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/acpi.h>
++ #include <linux/cdev.h>
+++>>>>>>> 313d21eeab92 (tpm: device class for tpm)
+  
+  enum tpm_const {
+  	TPM_MINOR = 224,	/* officially assigned */
+@@@ -94,9 -94,20 +97,16 @@@ struct tpm_vendor_specific 
+  #define TPM_VID_WINBOND  0x1050
+  #define TPM_VID_STM      0x104A
+  
+ -#define TPM_PPI_VERSION_LEN		3
+ -
+ -enum tpm_chip_flags {
+ -	TPM_CHIP_FLAG_REGISTERED	= BIT(0),
+ -	TPM_CHIP_FLAG_PPI		= BIT(1),
+ -};
+ -
+  struct tpm_chip {
+++<<<<<<< HEAD
+ +	struct device *dev;	/* Device stuff */
+++=======
++ 	struct device *pdev;	/* Device stuff */
++ 	struct device dev;
++ 	struct cdev cdev;
++ 
+++>>>>>>> 313d21eeab92 (tpm: device class for tpm)
+  	const struct tpm_class_ops *ops;
+ -	unsigned int flags;
+  
+  	int dev_num;		/* /dev/tpm# */
+  	char devname[7];
+@@@ -331,8 -346,12 +345,17 @@@ extern int tpm_pm_resume(struct device 
+  extern int wait_for_tpm_stat(struct tpm_chip *, u8, unsigned long,
+  			     wait_queue_head_t *, bool);
+  
+++<<<<<<< HEAD
+ +int tpm_dev_add_device(struct tpm_chip *chip);
+ +void tpm_dev_del_device(struct tpm_chip *chip);
+++=======
++ struct tpm_chip *tpm_chip_find_get(int chip_num);
++ extern struct tpm_chip *tpmm_chip_alloc(struct device *dev,
++ 				       const struct tpm_class_ops *ops);
++ extern int tpm_chip_register(struct tpm_chip *chip);
++ extern void tpm_chip_unregister(struct tpm_chip *chip);
++ 
+++>>>>>>> 313d21eeab92 (tpm: device class for tpm)
+  int tpm_sysfs_add_device(struct tpm_chip *chip);
+  void tpm_sysfs_del_device(struct tpm_chip *chip);
+  
+diff --cc drivers/char/tpm/tpm_tis.c
+index 51350cd0847e,239cf0bbc1a1..000000000000
+--- a/drivers/char/tpm/tpm_tis.c
++++ b/drivers/char/tpm/tpm_tis.c
+@@@ -685,10 -696,10 +685,17 @@@ static int tpm_tis_init(struct device *
+  		for (i = irq_s; i <= irq_e && chip->vendor.irq == 0; i++) {
+  			iowrite8(i, chip->vendor.iobase +
+  				 TPM_INT_VECTOR(chip->vendor.locality));
+++<<<<<<< HEAD
+ +			if (request_irq
+ +			    (i, tis_int_probe, IRQF_SHARED,
+ +			     chip->vendor.miscdev.name, chip) != 0) {
+ +				dev_info(chip->dev,
+++=======
++ 			if (devm_request_irq
++ 			    (dev, i, tis_int_probe, IRQF_SHARED,
++ 			     chip->devname, chip) != 0) {
++ 				dev_info(chip->pdev,
+++>>>>>>> 313d21eeab92 (tpm: device class for tpm)
+  					 "Unable to request irq: %d for probe\n",
+  					 i);
+  				continue;
+@@@ -733,10 -743,10 +740,17 @@@
+  		iowrite8(chip->vendor.irq,
+  			 chip->vendor.iobase +
+  			 TPM_INT_VECTOR(chip->vendor.locality));
+++<<<<<<< HEAD
+ +		if (request_irq
+ +		    (chip->vendor.irq, tis_int_handler, IRQF_SHARED,
+ +		     chip->vendor.miscdev.name, chip) != 0) {
+ +			dev_info(chip->dev,
+++=======
++ 		if (devm_request_irq
++ 		    (dev, chip->vendor.irq, tis_int_handler, IRQF_SHARED,
++ 		     chip->devname, chip) != 0) {
++ 			dev_info(chip->pdev,
+++>>>>>>> 313d21eeab92 (tpm: device class for tpm)
+  				 "Unable to request irq: %d for use\n",
+  				 chip->vendor.irq);
+  			chip->vendor.irq = 0;
+* Unmerged path drivers/char/tpm/tpm-chip.c
+diff --git a/Documentation/ABI/stable/sysfs-class-tpm b/Documentation/ABI/stable/sysfs-class-tpm
+index a60b45e2493b..9f790eebb5d2 100644
+--- a/Documentation/ABI/stable/sysfs-class-tpm
++++ b/Documentation/ABI/stable/sysfs-class-tpm
+@@ -1,4 +1,4 @@
+-What:		/sys/class/misc/tpmX/device/
++What:		/sys/class/tpm/tpmX/device/
+ Date:		April 2005
+ KernelVersion:	2.6.12
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -6,7 +6,7 @@ Description:	The device/ directory under a specific TPM instance exposes
+ 		the properties of that TPM chip
+ 
+ 
+-What:		/sys/class/misc/tpmX/device/active
++What:		/sys/class/tpm/tpmX/device/active
+ Date:		April 2006
+ KernelVersion:	2.6.17
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -18,7 +18,7 @@ Description:	The "active" property prints a '1' if the TPM chip is accepting
+ 		section 17 for more information on which commands are
+ 		available.
+ 
+-What:		/sys/class/misc/tpmX/device/cancel
++What:		/sys/class/tpm/tpmX/device/cancel
+ Date:		June 2005
+ KernelVersion:	2.6.13
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -26,7 +26,7 @@ Description:	The "cancel" property allows you to cancel the currently
+ 		pending TPM command. Writing any value to cancel will call the
+ 		TPM vendor specific cancel operation.
+ 
+-What:		/sys/class/misc/tpmX/device/caps
++What:		/sys/class/tpm/tpmX/device/caps
+ Date:		April 2005
+ KernelVersion:	2.6.12
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -43,7 +43,7 @@ Description:	The "caps" property contains TPM manufacturer and version info.
+ 		the chip supports. Firmware version is that of the chip and
+ 		is manufacturer specific.
+ 
+-What:		/sys/class/misc/tpmX/device/durations
++What:		/sys/class/tpm/tpmX/device/durations
+ Date:		March 2011
+ KernelVersion:	3.1
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -66,7 +66,7 @@ Description:	The "durations" property shows the 3 vendor-specific values
+ 		scaled to be displayed in usecs. In this case "[adjusted]"
+ 		will be displayed in place of "[original]".
+ 
+-What:		/sys/class/misc/tpmX/device/enabled
++What:		/sys/class/tpm/tpmX/device/enabled
+ Date:		April 2006
+ KernelVersion:	2.6.17
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -75,7 +75,7 @@ Description:	The "enabled" property prints a '1' if the TPM chip is enabled,
+ 		may be visible but produce a '0' after some operation that
+ 		disables the TPM.
+ 
+-What:		/sys/class/misc/tpmX/device/owned
++What:		/sys/class/tpm/tpmX/device/owned
+ Date:		April 2006
+ KernelVersion:	2.6.17
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -83,7 +83,7 @@ Description:	The "owned" property produces a '1' if the TPM_TakeOwnership
+ 		ordinal has been executed successfully in the chip. A '0'
+ 		indicates that ownership hasn't been taken.
+ 
+-What:		/sys/class/misc/tpmX/device/pcrs
++What:		/sys/class/tpm/tpmX/device/pcrs
+ Date:		April 2005
+ KernelVersion:	2.6.12
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -106,7 +106,7 @@ Description:	The "pcrs" property will dump the current value of all Platform
+ 		1.2 chips, PCRs represent SHA-1 hashes, which are 20 bytes
+ 		long. Use the "caps" property to determine TPM version.
+ 
+-What:		/sys/class/misc/tpmX/device/pubek
++What:		/sys/class/tpm/tpmX/device/pubek
+ Date:		April 2005
+ KernelVersion:	2.6.12
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -158,7 +158,7 @@ Description:	The "pubek" property will return the TPM's public endorsement
+ 		Modulus Length: 256 (bytes)
+ 		Modulus:	The 256 byte Endorsement Key modulus
+ 
+-What:		/sys/class/misc/tpmX/device/temp_deactivated
++What:		/sys/class/tpm/tpmX/device/temp_deactivated
+ Date:		April 2006
+ KernelVersion:	2.6.17
+ Contact:	tpmdd-devel@lists.sf.net
+@@ -167,7 +167,7 @@ Description:	The "temp_deactivated" property returns a '1' if the chip has
+ 		cycle. Whether a warm boot (reboot) will clear a TPM chip
+ 		from a temp_deactivated state is platform specific.
+ 
+-What:		/sys/class/misc/tpmX/device/timeouts
++What:		/sys/class/tpm/tpmX/device/timeouts
+ Date:		March 2011
+ KernelVersion:	3.1
+ Contact:	tpmdd-devel@lists.sf.net
+* Unmerged path drivers/char/tpm/tpm-chip.c
+* Unmerged path drivers/char/tpm/tpm-dev.c
+* Unmerged path drivers/char/tpm/tpm-interface.c
+* Unmerged path drivers/char/tpm/tpm.h
+diff --git a/drivers/char/tpm/tpm_i2c_nuvoton.c b/drivers/char/tpm/tpm_i2c_nuvoton.c
+index bbb4997438c3..4e728664a156 100644
+--- a/drivers/char/tpm/tpm_i2c_nuvoton.c
++++ b/drivers/char/tpm/tpm_i2c_nuvoton.c
+@@ -564,7 +564,7 @@ static int i2c_nuvoton_probe(struct i2c_client *client,
+ 		rc = devm_request_irq(dev, chip->vendor.irq,
+ 				      i2c_nuvoton_int_handler,
+ 				      IRQF_TRIGGER_LOW,
+-				      chip->vendor.miscdev.name,
++				      chip->devname,
+ 				      chip);
+ 		if (rc) {
+ 			dev_err(dev, "%s() Unable to request irq: %d for use\n",
+* Unmerged path drivers/char/tpm/tpm_tis.c
