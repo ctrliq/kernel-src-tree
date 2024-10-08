@@ -1,0 +1,136 @@
+sctp: fix the transport dead race check by using atomic_add_unless on refcnt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 1eed677933b816978abc4e3e18ecae5f254cb9be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1eed6779.failed
+
+Now when __sctp_lookup_association is running in BH, it will try to
+check if t->dead is set, but meanwhile other CPUs may be freeing this
+transport and this assoc and if it happens that
+__sctp_lookup_association checked t->dead a bit too early, it may think
+that the association is still good while it was already freed.
+
+So we fix this race by using atomic_add_unless in sctp_transport_hold.
+After we get one transport from hashtable, we will hold it only when
+this transport's refcnt is not 0, so that we can make sure t->asoc
+cannot be freed before we hold the asoc again.
+
+Note that sctp association is not freed using RCU so we can't use
+atomic_add_unless() with it as it may just be too late for that either.
+
+Fixes: 4f0087812648 ("sctp: apply rhashtable api to send/recv path")
+	Reported-by: Vlad Yasevich <vyasevich@gmail.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1eed677933b816978abc4e3e18ecae5f254cb9be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/input.c
+diff --cc net/sctp/input.c
+index 336fe69bc6d8,49d2cc751386..000000000000
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@@ -1005,34 -934,22 +1005,53 @@@ static struct sctp_association *__sctp_
+  					const union sctp_addr *peer,
+  					struct sctp_transport **pt)
+  {
+++<<<<<<< HEAD
+ +	struct sctp_hashbucket *head;
+ +	struct sctp_ep_common *epb;
+ +	struct sctp_association *asoc;
+ +	struct sctp_transport *transport;
+ +	int hash;
+ +
+ +	/* Optimize here for direct hit, only listening connections can
+ +	 * have wildcards anyways.
+ +	 */
+ +	hash = sctp_assoc_hashfn(net, ntohs(local->v4.sin_port),
+ +				 ntohs(peer->v4.sin_port));
+ +	head = &sctp_assoc_hashtable[hash];
+ +	read_lock(&head->lock);
+ +	sctp_for_each_hentry(epb, &head->chain) {
+ +		asoc = sctp_assoc(epb);
+ +		transport = sctp_assoc_is_match(asoc, net, local, peer);
+ +		if (transport)
+ +			goto hit;
+ +	}
+ +
+ +	read_unlock(&head->lock);
+ +
+ +	return NULL;
+ +
+ +hit:
+ +	*pt = transport;
+ +	sctp_association_hold(asoc);
+ +	read_unlock(&head->lock);
+++=======
++ 	struct sctp_transport *t;
++ 	struct sctp_association *asoc = NULL;
++ 
++ 	rcu_read_lock();
++ 	t = sctp_addrs_lookup_transport(net, local, peer);
++ 	if (!t || !sctp_transport_hold(t))
++ 		goto out;
++ 
++ 	asoc = t->asoc;
++ 	sctp_association_hold(asoc);
++ 	*pt = t;
++ 
++ 	sctp_transport_put(t);
++ 
++ out:
++ 	rcu_read_unlock();
+++>>>>>>> 1eed677933b8 (sctp: fix the transport dead race check by using atomic_add_unless on refcnt)
+  	return asoc;
+  }
+  
+@@@ -1045,9 -962,7 +1064,13 @@@ struct sctp_association *sctp_lookup_as
+  {
+  	struct sctp_association *asoc;
+  
+++<<<<<<< HEAD
+ +	sctp_local_bh_disable();
+ +	asoc = __sctp_lookup_association(net, laddr, paddr, transportp);
+ +	sctp_local_bh_enable();
+++=======
++ 	asoc = __sctp_lookup_association(net, laddr, paddr, transportp);
+++>>>>>>> 1eed677933b8 (sctp: fix the transport dead race check by using atomic_add_unless on refcnt)
+  
+  	return asoc;
+  }
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index 7a7c7cb8b173..45c485a4dee2 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -964,7 +964,7 @@ void sctp_transport_route(struct sctp_transport *, union sctp_addr *,
+ void sctp_transport_pmtu(struct sctp_transport *, struct sock *sk);
+ void sctp_transport_free(struct sctp_transport *);
+ void sctp_transport_reset_timers(struct sctp_transport *);
+-void sctp_transport_hold(struct sctp_transport *);
++int sctp_transport_hold(struct sctp_transport *);
+ void sctp_transport_put(struct sctp_transport *);
+ void sctp_transport_update_rto(struct sctp_transport *, __u32);
+ void sctp_transport_raise_cwnd(struct sctp_transport *, __u32, __u32);
+* Unmerged path net/sctp/input.c
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 098f1d5f769e..9bb2115ae584 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -300,9 +300,9 @@ void sctp_transport_route(struct sctp_transport *transport,
+ }
+ 
+ /* Hold a reference to a transport.  */
+-void sctp_transport_hold(struct sctp_transport *transport)
++int sctp_transport_hold(struct sctp_transport *transport)
+ {
+-	atomic_inc(&transport->refcnt);
++	return atomic_add_unless(&transport->refcnt, 1, 0);
+ }
+ 
+ /* Release a reference to a transport and clean up
