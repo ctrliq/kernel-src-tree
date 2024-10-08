@@ -1,0 +1,90 @@
+ipv6: Fix mem leak in rt6i_pcpu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 903ce4abdf374e3365d93bcb3df56c62008835ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/903ce4ab.failed
+
+It was first reported and reproduced by Petr (thanks!) in
+https://bugzilla.kernel.org/show_bug.cgi?id=119581
+
+free_percpu(rt->rt6i_pcpu) used to always happen in ip6_dst_destroy().
+
+However, after fixing a deadlock bug in
+commit 9c7370a166b4 ("ipv6: Fix a potential deadlock when creating pcpu rt"),
+free_percpu() is not called before setting non_pcpu_rt->rt6i_pcpu to NULL.
+
+It is worth to note that rt6i_pcpu is protected by table->tb6_lock.
+
+kmemleak somehow did not report it.  We nailed it down by
+observing the pcpu entries in /proc/vmallocinfo (first suggested
+by Hannes, thanks!).
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Fixes: 9c7370a166b4 ("ipv6: Fix a potential deadlock when creating pcpu rt")
+	Reported-by: Petr Novopashenniy <pety@rusnet.ru>
+	Tested-by: Petr Novopashenniy <pety@rusnet.ru>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Cc: Petr Novopashenniy <pety@rusnet.ru>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 903ce4abdf374e3365d93bcb3df56c62008835ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_fib.c
+diff --cc net/ipv6/ip6_fib.c
+index 052ec06f45c0,771be1fa4176..000000000000
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@@ -160,10 -153,40 +160,45 @@@ static __inline__ void node_free(struc
+  	kmem_cache_free(fib6_node_kmem, fn);
+  }
+  
+ -static void rt6_rcu_free(struct rt6_info *rt)
+ +static __inline__ void rt6_release(struct rt6_info *rt)
+  {
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&rt->rt6i_ref))
+ +		dst_free(&rt->dst);
+++=======
++ 	call_rcu(&rt->dst.rcu_head, dst_rcu_free);
++ }
++ 
++ static void rt6_free_pcpu(struct rt6_info *non_pcpu_rt)
++ {
++ 	int cpu;
++ 
++ 	if (!non_pcpu_rt->rt6i_pcpu)
++ 		return;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct rt6_info **ppcpu_rt;
++ 		struct rt6_info *pcpu_rt;
++ 
++ 		ppcpu_rt = per_cpu_ptr(non_pcpu_rt->rt6i_pcpu, cpu);
++ 		pcpu_rt = *ppcpu_rt;
++ 		if (pcpu_rt) {
++ 			rt6_rcu_free(pcpu_rt);
++ 			*ppcpu_rt = NULL;
++ 		}
++ 	}
++ 
++ 	free_percpu(non_pcpu_rt->rt6i_pcpu);
++ 	non_pcpu_rt->rt6i_pcpu = NULL;
++ }
++ 
++ static void rt6_release(struct rt6_info *rt)
++ {
++ 	if (atomic_dec_and_test(&rt->rt6i_ref)) {
++ 		rt6_free_pcpu(rt);
++ 		rt6_rcu_free(rt);
++ 	}
+++>>>>>>> 903ce4abdf37 (ipv6: Fix mem leak in rt6i_pcpu)
+  }
+  
+  static void fib6_link_table(struct net *net, struct fib6_table *tb)
+* Unmerged path net/ipv6/ip6_fib.c
