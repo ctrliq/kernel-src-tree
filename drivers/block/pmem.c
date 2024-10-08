@@ -153,7 +153,7 @@ static struct pmem_device *pmem_alloc(struct device *dev,
 		goto out_unmap;
 
 	blk_queue_make_request(pmem->pmem_queue, pmem_make_request);
-	blk_queue_max_hw_sectors(pmem->pmem_queue, 1024);
+	blk_queue_max_hw_sectors(pmem->pmem_queue, UINT_MAX);
 	blk_queue_bounce_limit(pmem->pmem_queue, BLK_BOUNCE_ANY);
 
 	disk = alloc_disk(0);
