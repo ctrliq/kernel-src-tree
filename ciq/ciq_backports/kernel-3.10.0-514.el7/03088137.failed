@@ -1,0 +1,180 @@
+vhost_net: basic polling support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit 0308813724606549436d30efd877a80c8e00790e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/03088137.failed
+
+This patch tries to poll for new added tx buffer or socket receive
+queue for a while at the end of tx/rx processing. The maximum time
+spent on polling were specified through a new kind of vring ioctl.
+
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 0308813724606549436d30efd877a80c8e00790e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vhost.c
+diff --cc drivers/vhost/vhost.c
+index e5367e13b952,669fef1e2bb6..000000000000
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@@ -281,8 -301,9 +281,14 @@@ static void vhost_vq_reset(struct vhost
+  	vq->call = NULL;
+  	vq->log_ctx = NULL;
+  	vq->memory = NULL;
+++<<<<<<< HEAD
+ +	vq->is_le = virtio_legacy_is_little_endian();
+ +	vhost_vq_reset_user_be(vq);
+++=======
++ 	vhost_reset_is_le(vq);
++ 	vhost_disable_cross_endian(vq);
++ 	vq->busyloop_timeout = 0;
+++>>>>>>> 030881372460 (vhost_net: basic polling support)
+  }
+  
+  static int vhost_worker(void *data)
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index b93dc62f5d2f..24bf0dc2f4c9 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -327,6 +327,43 @@ static void vhost_zerocopy_callback(struct ubuf_info *ubuf, bool success)
+ 	rcu_read_unlock_bh();
+ }
+ 
++static inline unsigned long busy_clock(void)
++{
++	return local_clock() >> 10;
++}
++
++static bool vhost_can_busy_poll(struct vhost_dev *dev,
++				unsigned long endtime)
++{
++	return likely(!need_resched()) &&
++	       likely(!time_after(busy_clock(), endtime)) &&
++	       likely(!signal_pending(current)) &&
++	       !vhost_has_work(dev);
++}
++
++static int vhost_net_tx_get_vq_desc(struct vhost_net *net,
++				    struct vhost_virtqueue *vq,
++				    struct iovec iov[], unsigned int iov_size,
++				    unsigned int *out_num, unsigned int *in_num)
++{
++	unsigned long uninitialized_var(endtime);
++	int r = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
++				    out_num, in_num, NULL, NULL);
++
++	if (r == vq->num && vq->busyloop_timeout) {
++		preempt_disable();
++		endtime = busy_clock() + vq->busyloop_timeout;
++		while (vhost_can_busy_poll(vq->dev, endtime) &&
++		       vhost_vq_avail_empty(vq->dev, vq))
++			cpu_relax_lowlatency();
++		preempt_enable();
++		r = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
++					out_num, in_num, NULL, NULL);
++	}
++
++	return r;
++}
++
+ /* Expects to be always run from workqueue - which acts as
+  * read-size critical section for our kind of RCU. */
+ static void handle_tx(struct vhost_net *net)
+@@ -372,10 +409,9 @@ static void handle_tx(struct vhost_net *net)
+ 			      % UIO_MAXIOV == nvq->done_idx))
+ 			break;
+ 
+-		head = vhost_get_vq_desc(vq, vq->iov,
+-					 ARRAY_SIZE(vq->iov),
+-					 &out, &in,
+-					 NULL, NULL);
++		head = vhost_net_tx_get_vq_desc(net, vq, vq->iov,
++						ARRAY_SIZE(vq->iov),
++						&out, &in);
+ 		/* On error, stop handling until the next kick. */
+ 		if (unlikely(head < 0))
+ 			break;
+@@ -482,6 +518,38 @@ static int peek_head_len(struct sock *sk)
+ 	return len;
+ }
+ 
++static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
++{
++	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_TX];
++	struct vhost_virtqueue *vq = &nvq->vq;
++	unsigned long uninitialized_var(endtime);
++	int len = peek_head_len(sk);
++
++	if (!len && vq->busyloop_timeout) {
++		/* Both tx vq and rx socket were polled here */
++		mutex_lock(&vq->mutex);
++		vhost_disable_notify(&net->dev, vq);
++
++		preempt_disable();
++		endtime = busy_clock() + vq->busyloop_timeout;
++
++		while (vhost_can_busy_poll(&net->dev, endtime) &&
++		       skb_queue_empty(&sk->sk_receive_queue) &&
++		       vhost_vq_avail_empty(&net->dev, vq))
++			cpu_relax_lowlatency();
++
++		preempt_enable();
++
++		if (vhost_enable_notify(&net->dev, vq))
++			vhost_poll_queue(&vq->poll);
++		mutex_unlock(&vq->mutex);
++
++		len = peek_head_len(sk);
++	}
++
++	return len;
++}
++
+ /* This is a multi-buffer version of vhost_get_desc, that works if
+  *	vq has read descriptors only.
+  * @vq		- the relevant virtqueue
+@@ -599,7 +667,7 @@ static void handle_rx(struct vhost_net *net)
+ 		vq->log : NULL;
+ 	mergeable = vhost_has_feature(vq, VIRTIO_NET_F_MRG_RXBUF);
+ 
+-	while ((sock_len = peek_head_len(sock->sk))) {
++	while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk))) {
+ 		sock_len += sock_hlen;
+ 		vhost_len = sock_len + vhost_hlen;
+ 		headcount = get_rx_bufs(vq, vq->heads, vhost_len,
+* Unmerged path drivers/vhost/vhost.c
+diff --git a/drivers/vhost/vhost.h b/drivers/vhost/vhost.h
+index 926f30951167..d6652cbaba07 100644
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -119,6 +119,7 @@ struct vhost_virtqueue {
+ 	/* Ring endianness requested by userspace for cross-endian support. */
+ 	bool user_be;
+ #endif
++	u32 busyloop_timeout;
+ };
+ 
+ struct vhost_dev {
+diff --git a/include/uapi/linux/vhost.h b/include/uapi/linux/vhost.h
+index ab3731917bac..61a8777178c6 100644
+--- a/include/uapi/linux/vhost.h
++++ b/include/uapi/linux/vhost.h
+@@ -126,6 +126,12 @@ struct vhost_memory {
+ #define VHOST_SET_VRING_CALL _IOW(VHOST_VIRTIO, 0x21, struct vhost_vring_file)
+ /* Set eventfd to signal an error */
+ #define VHOST_SET_VRING_ERR _IOW(VHOST_VIRTIO, 0x22, struct vhost_vring_file)
++/* Set busy loop timeout (in us) */
++#define VHOST_SET_VRING_BUSYLOOP_TIMEOUT _IOW(VHOST_VIRTIO, 0x23,	\
++					 struct vhost_vring_state)
++/* Get busy loop timeout (in us) */
++#define VHOST_GET_VRING_BUSYLOOP_TIMEOUT _IOW(VHOST_VIRTIO, 0x24,	\
++					 struct vhost_vring_state)
+ 
+ /* VHOST_NET specific defines */
+ 
