@@ -1,0 +1,210 @@
+perf/x86: Use INST_RETIRED.PREC_DIST for cycles: ppp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 724697648eec540b2a7561089b1c87cb33e6a0eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/72469764.failed
+
+Add a new 'three-p' precise level, that uses INST_RETIRED.PREC_DIST as
+base. The basic mechanism of abusing the inverse cmask to get all
+cycles works the same as before.
+
+PREC_DIST is available on Sandy Bridge or later. It had some problems
+on Sandy Bridge, so we only use it on IvyBridge and later. I tested it
+on Broadwell and Skylake.
+
+PREC_DIST has special support for avoiding shadow effects, which can
+give better results compare to UOPS_RETIRED. The drawback is that
+PREC_DIST can only schedule on counter 1, but that is ok for cycle
+sampling, as there is normally no need to do multiple cycle sampling
+runs in parallel. It is still possible to run perf top in parallel, as
+that doesn't use precise mode. Also of course the multiplexing can
+still allow parallel operation.
+
+:pp stays with the previous event.
+
+Example:
+
+Sample a loop with 10 sqrt with old cycles:pp
+
+	  0.14 │10:   sqrtps %xmm1,%xmm0     <--------------
+	  9.13 │      sqrtps %xmm1,%xmm0
+	 11.58 │      sqrtps %xmm1,%xmm0
+	 11.51 │      sqrtps %xmm1,%xmm0
+	  6.27 │      sqrtps %xmm1,%xmm0
+	 10.38 │      sqrtps %xmm1,%xmm0
+	 12.20 │      sqrtps %xmm1,%xmm0
+	 12.74 │      sqrtps %xmm1,%xmm0
+	  5.40 │      sqrtps %xmm1,%xmm0
+	 10.14 │      sqrtps %xmm1,%xmm0
+	 10.51 │    ↑ jmp    10
+
+We expect all 10 sqrt to get roughly the sample number of samples.
+
+But you can see that the instruction directly after the JMP is
+systematically underestimated in the result, due to sampling shadow
+effects.
+
+With the new PREC_DIST based sampling this problem is gone and all
+instructions show up roughly evenly:
+
+	  9.51 │10:   sqrtps %xmm1,%xmm0
+	 11.74 │      sqrtps %xmm1,%xmm0
+	 11.84 │      sqrtps %xmm1,%xmm0
+	  6.05 │      sqrtps %xmm1,%xmm0
+	 10.46 │      sqrtps %xmm1,%xmm0
+	 12.25 │      sqrtps %xmm1,%xmm0
+	 12.18 │      sqrtps %xmm1,%xmm0
+	  5.26 │      sqrtps %xmm1,%xmm0
+	 10.13 │      sqrtps %xmm1,%xmm0
+	 10.43 │      sqrtps %xmm1,%xmm0
+	  0.16 │    ↑ jmp    10
+
+Even with PREC_DIST there is still sampling skid and the result is not
+completely even, but systematic shadow effects are significantly
+reduced.
+
+The improvements are mainly expected to make a difference in high IPC
+code. With low IPC it should be similar.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: hpa@zytor.com
+Link: http://lkml.kernel.org/r/1448929689-13771-2-git-send-email-andi@firstfloor.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 724697648eec540b2a7561089b1c87cb33e6a0eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/perf_event_intel.c
+diff --cc arch/x86/kernel/cpu/perf_event_intel.c
+index c36bbcb05ca5,762c6023a97f..000000000000
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@@ -2499,6 -2475,53 +2499,56 @@@ static void intel_pebs_aliases_snb(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void intel_pebs_aliases_precdist(struct perf_event *event)
++ {
++ 	if ((event->hw.config & X86_RAW_EVENT_MASK) == 0x003c) {
++ 		/*
++ 		 * Use an alternative encoding for CPU_CLK_UNHALTED.THREAD_P
++ 		 * (0x003c) so that we can use it with PEBS.
++ 		 *
++ 		 * The regular CPU_CLK_UNHALTED.THREAD_P event (0x003c) isn't
++ 		 * PEBS capable. However we can use INST_RETIRED.PREC_DIST
++ 		 * (0x01c0), which is a PEBS capable event, to get the same
++ 		 * count.
++ 		 *
++ 		 * The PREC_DIST event has special support to minimize sample
++ 		 * shadowing effects. One drawback is that it can be
++ 		 * only programmed on counter 1, but that seems like an
++ 		 * acceptable trade off.
++ 		 */
++ 		u64 alt_config = X86_CONFIG(.event=0xc0, .umask=0x01, .inv=1, .cmask=16);
++ 
++ 		alt_config |= (event->hw.config & ~X86_RAW_EVENT_MASK);
++ 		event->hw.config = alt_config;
++ 	}
++ }
++ 
++ static void intel_pebs_aliases_ivb(struct perf_event *event)
++ {
++ 	if (event->attr.precise_ip < 3)
++ 		return intel_pebs_aliases_snb(event);
++ 	return intel_pebs_aliases_precdist(event);
++ }
++ 
++ static void intel_pebs_aliases_skl(struct perf_event *event)
++ {
++ 	if (event->attr.precise_ip < 3)
++ 		return intel_pebs_aliases_core2(event);
++ 	return intel_pebs_aliases_precdist(event);
++ }
++ 
++ static unsigned long intel_pmu_free_running_flags(struct perf_event *event)
++ {
++ 	unsigned long flags = x86_pmu.free_running_flags;
++ 
++ 	if (event->attr.use_clockid)
++ 		flags &= ~PERF_SAMPLE_TIME;
++ 	return flags;
++ }
++ 
+++>>>>>>> 724697648eec (perf/x86: Use INST_RETIRED.PREC_DIST for cycles: ppp)
+  static int intel_pmu_hw_config(struct perf_event *event)
+  {
+  	int ret = x86_pmu_hw_config(event);
+diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
+index 422b52ebe193..1dc28b02c3ac 100644
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@ -448,6 +448,9 @@ int x86_pmu_hw_config(struct perf_event *event)
+ 			/* Support for IP fixup */
+ 			if (x86_pmu.lbr_nr || x86_pmu.intel_cap.pebs_format >= 2)
+ 				precise++;
++
++			if (x86_pmu.pebs_prec_dist)
++				precise++;
+ 		}
+ 
+ 		if (event->attr.precise_ip > precise)
+diff --git a/arch/x86/kernel/cpu/perf_event.h b/arch/x86/kernel/cpu/perf_event.h
+index f8dcf0407283..ca3468d9bf1b 100644
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@ -581,7 +581,8 @@ struct x86_pmu {
+ 			bts_active	:1,
+ 			pebs		:1,
+ 			pebs_active	:1,
+-			pebs_broken	:1;
++			pebs_broken	:1,
++			pebs_prec_dist	:1;
+ 	int		pebs_record_size;
+ 	void		(*drain_pebs)(struct pt_regs *regs);
+ 	struct event_constraint *pebs_constraints;
+* Unmerged path arch/x86/kernel/cpu/perf_event_intel.c
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_ds.c b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+index a0739015b0cc..80ba04cff981 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_ds.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+@@ -644,6 +644,8 @@ struct event_constraint intel_ivb_pebs_event_constraints[] = {
+ 	INTEL_PST_CONSTRAINT(0x02cd, 0x8),    /* MEM_TRANS_RETIRED.PRECISE_STORES */
+ 	/* UOPS_RETIRED.ALL, inv=1, cmask=16 (cycles:p). */
+ 	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c2, 0xf),
++	/* INST_RETIRED.PREC_DIST, inv=1, cmask=16 (cycles:ppp). */
++	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
+ 	INTEL_EXCLEVT_CONSTRAINT(0xd0, 0xf),    /* MEM_UOP_RETIRED.* */
+ 	INTEL_EXCLEVT_CONSTRAINT(0xd1, 0xf),    /* MEM_LOAD_UOPS_RETIRED.* */
+ 	INTEL_EXCLEVT_CONSTRAINT(0xd2, 0xf),    /* MEM_LOAD_UOPS_LLC_HIT_RETIRED.* */
+@@ -658,6 +660,8 @@ struct event_constraint intel_hsw_pebs_event_constraints[] = {
+ 	INTEL_PLD_CONSTRAINT(0x01cd, 0xf),    /* MEM_TRANS_RETIRED.* */
+ 	/* UOPS_RETIRED.ALL, inv=1, cmask=16 (cycles:p). */
+ 	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c2, 0xf),
++	/* INST_RETIRED.PREC_DIST, inv=1, cmask=16 (cycles:ppp). */
++	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
+ 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_NA(0x01c2, 0xf), /* UOPS_RETIRED.ALL */
+ 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_XLD(0x11d0, 0xf), /* MEM_UOPS_RETIRED.STLB_MISS_LOADS */
+ 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_XLD(0x21d0, 0xf), /* MEM_UOPS_RETIRED.LOCK_LOADS */
+@@ -676,6 +680,8 @@ struct event_constraint intel_hsw_pebs_event_constraints[] = {
+ 
+ struct event_constraint intel_skl_pebs_event_constraints[] = {
+ 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x1c0, 0x2),	/* INST_RETIRED.PREC_DIST */
++	/* INST_RETIRED.PREC_DIST, inv=1, cmask=16 (cycles:ppp). */
++	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
+ 	/* INST_RETIRED.TOTAL_CYCLES_PS (inv=1, cmask=16) (cycles:p). */
+ 	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x0f),
+ 	INTEL_PLD_CONSTRAINT(0x1cd, 0xf),		      /* MEM_TRANS_RETIRED.* */
