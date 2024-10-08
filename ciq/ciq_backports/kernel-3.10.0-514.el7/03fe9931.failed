@@ -1,0 +1,169 @@
+svcrdma: Define maximum number of backchannel requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 03fe9931536fe4782e9e34f7f499d588acd2015b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/03fe9931.failed
+
+Extra resources for handling backchannel requests have to be
+pre-allocated when a transport instance is created. Set up
+additional fields in svcxprt_rdma to track these resources.
+
+The max_requests fields are elements of the RPC-over-RDMA
+protocol, so they should be u32. To ensure that unsigned
+arithmetic is used everywhere, some other fields in the
+svcxprt_rdma struct are updated.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Acked-by: Bruce Fields <bfields@fieldses.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 03fe9931536fe4782e9e34f7f499d588acd2015b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_transport.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_transport.c
+index 9e33fdc56b4e,af86dfeceb4a..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@@ -1028,11 -1013,11 +1028,16 @@@ static struct svc_xprt *svc_rdma_accept
+  	struct rdma_conn_param conn_param;
+  	struct ib_cq_init_attr cq_attr = {};
+  	struct ib_qp_init_attr qp_attr;
+ -	struct ib_device *dev;
+ +	struct ib_device_attr devattr;
+  	int uninitialized_var(dma_mr_acc);
+  	int need_dma_mr = 0;
+++<<<<<<< HEAD
+ +	int ret;
+ +	int i;
+++=======
++ 	unsigned int i;
++ 	int ret = 0;
+++>>>>>>> 03fe9931536f (svcrdma: Define maximum number of backchannel requests)
+  
+  	listen_rdma = container_of(xprt, struct svcxprt_rdma, sc_xprt);
+  	clear_bit(XPT_CONN, &xprt->xpt_flags);
+@@@ -1061,13 -1041,18 +1066,24 @@@
+  
+  	/* Qualify the transport resource defaults with the
+  	 * capabilities of this particular device */
+ -	newxprt->sc_max_sge = min((size_t)dev->attrs.max_sge,
+ +	newxprt->sc_max_sge = min((size_t)devattr.max_sge,
+  				  (size_t)RPCSVC_MAXPAGES);
+ -	newxprt->sc_max_sge_rd = min_t(size_t, dev->attrs.max_sge_rd,
+ +	newxprt->sc_max_sge_rd = min_t(size_t, devattr.max_sge_rd,
+  				       RPCSVC_MAXPAGES);
+++<<<<<<< HEAD
+ +	newxprt->sc_max_requests = min((size_t)devattr.max_qp_wr,
+ +				   (size_t)svcrdma_max_requests);
+ +	newxprt->sc_sq_depth = RPCRDMA_SQ_DEPTH_MULT * newxprt->sc_max_requests;
+++=======
++ 	newxprt->sc_max_req_size = svcrdma_max_req_size;
++ 	newxprt->sc_max_requests = min_t(u32, dev->attrs.max_qp_wr,
++ 					 svcrdma_max_requests);
++ 	newxprt->sc_max_bc_requests = min_t(u32, dev->attrs.max_qp_wr,
++ 					    svcrdma_max_bc_requests);
++ 	newxprt->sc_rq_depth = newxprt->sc_max_requests +
++ 			       newxprt->sc_max_bc_requests;
++ 	newxprt->sc_sq_depth = RPCRDMA_SQ_DEPTH_MULT * newxprt->sc_rq_depth;
+++>>>>>>> 03fe9931536f (svcrdma: Define maximum number of backchannel requests)
+  
+  	if (!svc_rdma_prealloc_ctxts(newxprt))
+  		goto errout;
+@@@ -1096,8 -1081,8 +1112,13 @@@
+  		dprintk("svcrdma: error creating SQ CQ for connect request\n");
+  		goto errout;
+  	}
+++<<<<<<< HEAD
+ +	cq_attr.cqe = newxprt->sc_max_requests;
+ +	newxprt->sc_rq_cq = ib_create_cq(newxprt->sc_cm_id->device,
+++=======
++ 	cq_attr.cqe = newxprt->sc_rq_depth;
++ 	newxprt->sc_rq_cq = ib_create_cq(dev,
+++>>>>>>> 03fe9931536f (svcrdma: Define maximum number of backchannel requests)
+  					 rq_comp_handler,
+  					 cq_event_handler,
+  					 newxprt,
+@@@ -1203,11 -1184,10 +1224,11 @@@
+  		}
+  		newxprt->sc_dma_lkey = newxprt->sc_phys_mr->lkey;
+  	} else
+ -		newxprt->sc_dma_lkey = dev->local_dma_lkey;
+ +		newxprt->sc_dma_lkey =
+ +			newxprt->sc_cm_id->device->local_dma_lkey;
+  
+  	/* Post receive buffers */
+- 	for (i = 0; i < newxprt->sc_max_requests; i++) {
++ 	for (i = 0; i < newxprt->sc_rq_depth; i++) {
+  		ret = svc_rdma_post_recv(newxprt, GFP_KERNEL);
+  		if (ret) {
+  			dprintk("svcrdma: failure posting receive buffers\n");
+diff --git a/include/linux/sunrpc/svc_rdma.h b/include/linux/sunrpc/svc_rdma.h
+index aa20d5f0dab3..e149670159bc 100644
+--- a/include/linux/sunrpc/svc_rdma.h
++++ b/include/linux/sunrpc/svc_rdma.h
+@@ -51,6 +51,7 @@
+ /* RPC/RDMA parameters and stats */
+ extern unsigned int svcrdma_ord;
+ extern unsigned int svcrdma_max_requests;
++extern unsigned int svcrdma_max_bc_requests;
+ extern unsigned int svcrdma_max_req_size;
+ 
+ extern atomic_t rdma_stat_recv;
+@@ -136,10 +137,11 @@ struct svcxprt_rdma {
+ 	int                  sc_max_sge;
+ 	int                  sc_max_sge_rd;	/* max sge for read target */
+ 
+-	int                  sc_sq_depth;	/* Depth of SQ */
+ 	atomic_t             sc_sq_count;	/* Number of SQ WR on queue */
+-
+-	int                  sc_max_requests;	/* Depth of RQ */
++	unsigned int	     sc_sq_depth;	/* Depth of SQ */
++	unsigned int	     sc_rq_depth;	/* Depth of RQ */
++	u32		     sc_max_requests;	/* Forward credits */
++	u32		     sc_max_bc_requests;/* Backward credits */
+ 	int                  sc_max_req_size;	/* Size of each RQ WR buf */
+ 
+ 	struct ib_pd         *sc_pd;
+@@ -188,6 +190,11 @@ struct svcxprt_rdma {
+ #define RPCRDMA_MAX_REQUESTS    32
+ #define RPCRDMA_MAX_REQ_SIZE    4096
+ 
++/* Typical ULP usage of BC requests is NFSv4.1 backchannel. Our
++ * current NFSv4.1 implementation supports one backchannel slot.
++ */
++#define RPCRDMA_MAX_BC_REQUESTS	2
++
+ #define RPCSVC_MAXPAYLOAD_RDMA	RPCSVC_MAXPAYLOAD
+ 
+ /* svc_rdma_marshal.c */
+diff --git a/net/sunrpc/xprtrdma/svc_rdma.c b/net/sunrpc/xprtrdma/svc_rdma.c
+index 1660d52ab1d9..053ad5286d6f 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma.c
++++ b/net/sunrpc/xprtrdma/svc_rdma.c
+@@ -56,6 +56,7 @@ unsigned int svcrdma_ord = RPCRDMA_ORD;
+ static unsigned int min_ord = 1;
+ static unsigned int max_ord = 4096;
+ unsigned int svcrdma_max_requests = RPCRDMA_MAX_REQUESTS;
++unsigned int svcrdma_max_bc_requests = RPCRDMA_MAX_BC_REQUESTS;
+ static unsigned int min_max_requests = 4;
+ static unsigned int max_max_requests = 16384;
+ unsigned int svcrdma_max_req_size = RPCRDMA_MAX_REQ_SIZE;
+@@ -252,9 +253,10 @@ int svc_rdma_init(void)
+ {
+ 	dprintk("SVCRDMA Module Init, register RPC RDMA transport\n");
+ 	dprintk("\tsvcrdma_ord      : %d\n", svcrdma_ord);
+-	dprintk("\tmax_requests     : %d\n", svcrdma_max_requests);
+-	dprintk("\tsq_depth         : %d\n",
++	dprintk("\tmax_requests     : %u\n", svcrdma_max_requests);
++	dprintk("\tsq_depth         : %u\n",
+ 		svcrdma_max_requests * RPCRDMA_SQ_DEPTH_MULT);
++	dprintk("\tmax_bc_requests  : %u\n", svcrdma_max_bc_requests);
+ 	dprintk("\tmax_inline       : %d\n", svcrdma_max_req_size);
+ 
+ 	svc_rdma_wq = alloc_workqueue("svc_rdma", 0, 0);
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_transport.c
