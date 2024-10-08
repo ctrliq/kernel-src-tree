@@ -1621,7 +1621,6 @@ xfs_free_buftarg(
 int
 xfs_setsize_buftarg(
 	xfs_buftarg_t		*btp,
-	unsigned int		blocksize,
 	unsigned int		sectorsize)
 {
 	/* Set up metadata sector size info */
@@ -1656,8 +1655,7 @@ xfs_setsize_buftarg_early(
 	xfs_buftarg_t		*btp,
 	struct block_device	*bdev)
 {
-	return xfs_setsize_buftarg(btp, PAGE_SIZE,
-				   bdev_logical_block_size(bdev));
+	return xfs_setsize_buftarg(btp, bdev_logical_block_size(bdev));
 }
 
 xfs_buftarg_t *
