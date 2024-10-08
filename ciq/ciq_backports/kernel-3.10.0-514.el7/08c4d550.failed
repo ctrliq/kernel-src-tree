@@ -1,0 +1,226 @@
+mpt3sas: setpci reset kernel oops fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sreekanth Reddy <sreekanth.reddy@avagotech.com>
+commit 08c4d550c5797d842b1f1bb85d474a8b54f02382
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/08c4d550.failed
+
+setpci reset on nytro warpdrive card along with sysfs access and cli
+ioctl access resulted in kernel oops
+
+1. pci_access_mutex lock added to provide synchronization between IOCTL,
+   sysfs, PCI resource handling path
+
+2. gioc_lock spinlock to protect list operations over multiple
+   controllers
+
+This patch is ported from commit 6229b414b3ad ("mpt2sas: setpci reset
+kernel oops fix").
+
+	Signed-off-by: Sreekanth Reddy <Sreekanth.Reddy@avagotech.com>
+	Acked-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 08c4d550c5797d842b1f1bb85d474a8b54f02382)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_base.h
+#	drivers/scsi/mpt3sas/mpt3sas_scsih.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.h
+index e4afe8ed3bc7,6d64fa8268e7..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@@ -1090,6 -1167,19 +1097,22 @@@ typedef u8 (*MPT_CALLBACK)(struct MPT3S
+  
+  /* base shared API */
+  extern struct list_head mpt3sas_ioc_list;
+++<<<<<<< HEAD
+++=======
++ extern char    driver_name[MPT_NAME_LENGTH];
++ /* spinlock on list operations over IOCs
++  * Case: when multiple warpdrive cards(IOCs) are in use
++  * Each IOC will added to the ioc list structure on initialization.
++  * Watchdog threads run at regular intervals to check IOC for any
++  * fault conditions which will trigger the dead_ioc thread to
++  * deallocate pci resource, resulting deleting the IOC netry from list,
++  * this deletion need to protected by spinlock to enusre that
++  * ioc removal is syncrhonized, if not synchronized it might lead to
++  * list_del corruption as the ioc list is traversed in cli path.
++  */
++ extern spinlock_t gioc_lock;
++ 
+++>>>>>>> 08c4d550c579 (mpt3sas: setpci reset kernel oops fix)
+  void mpt3sas_base_start_watchdog(struct MPT3SAS_ADAPTER *ioc);
+  void mpt3sas_base_stop_watchdog(struct MPT3SAS_ADAPTER *ioc);
+  
+diff --cc drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index dab4affe7dc9,d0ab0028c2eb..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@@ -80,6 -89,9 +80,12 @@@ static int _scsih_scan_finished(struct 
+  
+  /* global parameters */
+  LIST_HEAD(mpt3sas_ioc_list);
+++<<<<<<< HEAD
+++=======
++ char    driver_name[MPT_NAME_LENGTH];
++ /* global ioc lock for list operations */
++ DEFINE_SPINLOCK(gioc_lock);
+++>>>>>>> 08c4d550c579 (mpt3sas: setpci reset kernel oops fix)
+  
+  /* local parameters */
+  static u8 scsi_io_cb_idx = -1;
+@@@ -8055,10 -8390,11 +8065,12 @@@ _scsih_probe(struct pci_dev *pdev, cons
+  	ioc = shost_priv(shost);
+  	memset(ioc, 0, sizeof(struct MPT3SAS_ADAPTER));
+  	INIT_LIST_HEAD(&ioc->list);
++ 	spin_lock(&gioc_lock);
+  	list_add_tail(&ioc->list, &mpt3sas_ioc_list);
++ 	spin_unlock(&gioc_lock);
+  	ioc->shost = shost;
+  	ioc->id = mpt_ids++;
+ +	sprintf(ioc->name, "%s%d", MPT3SAS_DRIVER_NAME, ioc->id);
+  	ioc->pdev = pdev;
+  	ioc->scsi_io_cb_idx = scsi_io_cb_idx;
+  	ioc->tm_cb_idx = tm_cb_idx;
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index 5c7d5b89e89c..ae2504166dbe 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -108,9 +108,12 @@ _scsih_set_fwfault_debug(const char *val, struct kernel_param *kp)
+ 	if (ret)
+ 		return ret;
+ 
++	/* global ioc spinlock to protect controller list on list operations */
+ 	pr_info("setting fwfault_debug(%d)\n", mpt3sas_fwfault_debug);
++	spin_lock(&gioc_lock);
+ 	list_for_each_entry(ioc, &mpt3sas_ioc_list, list)
+ 		ioc->fwfault_debug = mpt3sas_fwfault_debug;
++	spin_unlock(&gioc_lock);
+ 	return 0;
+ }
+ module_param_call(mpt3sas_fwfault_debug, _scsih_set_fwfault_debug,
+@@ -5091,6 +5094,8 @@ mpt3sas_base_free_resources(struct MPT3SAS_ADAPTER *ioc)
+ 	dexitprintk(ioc, pr_info(MPT3SAS_FMT "%s\n", ioc->name,
+ 	    __func__));
+ 
++	/* synchronizing freeing resource with pci_access_mutex lock */
++	mutex_lock(&ioc->pci_access_mutex);
+ 	if (ioc->chip_phys && ioc->chip) {
+ 		_base_mask_interrupts(ioc);
+ 		ioc->shost_recovery = 1;
+@@ -5099,6 +5104,7 @@ mpt3sas_base_free_resources(struct MPT3SAS_ADAPTER *ioc)
+ 	}
+ 
+ 	mpt3sas_base_unmap_resources(ioc);
++	mutex_unlock(&ioc->pci_access_mutex);
+ 	return;
+ }
+ 
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.h
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_ctl.c b/drivers/scsi/mpt3sas/mpt3sas_ctl.c
+index 028766e49f64..cc6256b0a542 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_ctl.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_ctl.c
+@@ -416,13 +416,16 @@ static int
+ _ctl_verify_adapter(int ioc_number, struct MPT3SAS_ADAPTER **iocpp)
+ {
+ 	struct MPT3SAS_ADAPTER *ioc;
+-
++	/* global ioc lock to protect controller on list operations */
++	spin_lock(&gioc_lock);
+ 	list_for_each_entry(ioc, &mpt3sas_ioc_list, list) {
+ 		if (ioc->id != ioc_number)
+ 			continue;
++		spin_unlock(&gioc_lock);
+ 		*iocpp = ioc;
+ 		return ioc_number;
+ 	}
++	spin_unlock(&gioc_lock);
+ 	*iocpp = NULL;
+ 	return -1;
+ }
+@@ -511,10 +514,15 @@ _ctl_poll(struct file *filep, poll_table *wait)
+ 
+ 	poll_wait(filep, &ctl_poll_wait, wait);
+ 
++	/* global ioc lock to protect controller on list operations */
++	spin_lock(&gioc_lock);
+ 	list_for_each_entry(ioc, &mpt3sas_ioc_list, list) {
+-		if (ioc->aen_event_read_flag)
++		if (ioc->aen_event_read_flag) {
++			spin_unlock(&gioc_lock);
+ 			return POLLIN | POLLRDNORM;
++		}
+ 	}
++	spin_unlock(&gioc_lock);
+ 	return 0;
+ }
+ 
+@@ -2196,16 +2204,25 @@ _ctl_ioctl_main(struct file *file, unsigned int cmd, void __user *arg,
+ 	if (_ctl_verify_adapter(ioctl_header.ioc_number, &ioc) == -1 || !ioc)
+ 		return -ENODEV;
+ 
++	/* pci_access_mutex lock acquired by ioctl path */
++	mutex_lock(&ioc->pci_access_mutex);
++
+ 	if (ioc->shost_recovery || ioc->pci_error_recovery ||
+-	    ioc->is_driver_loading)
+-		return -EAGAIN;
++	    ioc->is_driver_loading || ioc->remove_host) {
++		ret = -EAGAIN;
++		goto out_unlock_pciaccess;
++	}
+ 
+ 	state = (file->f_flags & O_NONBLOCK) ? NON_BLOCKING : BLOCKING;
+ 	if (state == NON_BLOCKING) {
+-		if (!mutex_trylock(&ioc->ctl_cmds.mutex))
+-			return -EAGAIN;
+-	} else if (mutex_lock_interruptible(&ioc->ctl_cmds.mutex))
+-		return -ERESTARTSYS;
++		if (!mutex_trylock(&ioc->ctl_cmds.mutex)) {
++			ret = -EAGAIN;
++			goto out_unlock_pciaccess;
++		}
++	} else if (mutex_lock_interruptible(&ioc->ctl_cmds.mutex)) {
++		ret = -ERESTARTSYS;
++		goto out_unlock_pciaccess;
++	}
+ 
+ 
+ 	switch (cmd) {
+@@ -2286,6 +2303,8 @@ _ctl_ioctl_main(struct file *file, unsigned int cmd, void __user *arg,
+ 	}
+ 
+ 	mutex_unlock(&ioc->ctl_cmds.mutex);
++out_unlock_pciaccess:
++	mutex_unlock(&ioc->pci_access_mutex);
+ 	return ret;
+ }
+ 
+@@ -2733,6 +2752,12 @@ _ctl_BRM_status_show(struct device *cdev, struct device_attribute *attr,
+ 		    " warpdrive\n", ioc->name, __func__);
+ 		goto out;
+ 	}
++	/* pci_access_mutex lock acquired by sysfs show path */
++	mutex_lock(&ioc->pci_access_mutex);
++	if (ioc->pci_error_recovery || ioc->remove_host) {
++		mutex_unlock(&ioc->pci_access_mutex);
++		return 0;
++	}
+ 
+ 	/* allocate upto GPIOVal 36 entries */
+ 	sz = offsetof(Mpi2IOUnitPage3_t, GPIOVal) + (sizeof(u16) * 36);
+@@ -2771,6 +2796,7 @@ _ctl_BRM_status_show(struct device *cdev, struct device_attribute *attr,
+ 
+  out:
+ 	kfree(io_unit_pg3);
++	mutex_unlock(&ioc->pci_access_mutex);
+ 	return rc;
+ }
+ static DEVICE_ATTR(BRM_status, S_IRUGO, _ctl_BRM_status_show, NULL);
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_scsih.c
