@@ -1,0 +1,223 @@
+mm: softdirty: enable write notifications on VMAs after VM_SOFTDIRTY cleared
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] softdirty: enable write notifications on VMAs after VM_SOFTDIRTY cleared (Oleg Nesterov) [1269561]
+Rebuild_FUZZ: 97.30%
+commit-author Peter Feiner <pfeiner@google.com>
+commit 64e455079e1bd7787cc47be30b7f601ce682a5f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/64e45507.failed
+
+For VMAs that don't want write notifications, PTEs created for read faults
+have their write bit set.  If the read fault happens after VM_SOFTDIRTY is
+cleared, then the PTE's softdirty bit will remain clear after subsequent
+writes.
+
+Here's a simple code snippet to demonstrate the bug:
+
+  char* m = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE,
+                 MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+  system("echo 4 > /proc/$PPID/clear_refs"); /* clear VM_SOFTDIRTY */
+  assert(*m == '\0');     /* new PTE allows write access */
+  assert(!soft_dirty(x));
+  *m = 'x';               /* should dirty the page */
+  assert(soft_dirty(x));  /* fails */
+
+With this patch, write notifications are enabled when VM_SOFTDIRTY is
+cleared.  Furthermore, to avoid unnecessary faults, write notifications
+are disabled when VM_SOFTDIRTY is set.
+
+As a side effect of enabling and disabling write notifications with
+care, this patch fixes a bug in mprotect where vm_page_prot bits set by
+drivers were zapped on mprotect.  An analogous bug was fixed in mmap by
+commit c9d0bf241451 ("mm: uncached vma support with writenotify").
+
+	Signed-off-by: Peter Feiner <pfeiner@google.com>
+	Reported-by: Peter Feiner <pfeiner@google.com>
+	Suggested-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Cyrill Gorcunov <gorcunov@openvz.org>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Jamie Liu <jamieliu@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 64e455079e1bd7787cc47be30b7f601ce682a5f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+#	include/asm-generic/pgtable.h
+#	mm/mmap.c
+diff --cc fs/proc/task_mmu.c
+index 452c618feb42,4e0388cffe3d..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -772,6 -827,21 +772,24 @@@ static ssize_t clear_refs_write(struct 
+  			.private = &cp,
+  		};
+  		down_read(&mm->mmap_sem);
+++<<<<<<< HEAD
+++=======
++ 		if (type == CLEAR_REFS_SOFT_DIRTY) {
++ 			for (vma = mm->mmap; vma; vma = vma->vm_next) {
++ 				if (!(vma->vm_flags & VM_SOFTDIRTY))
++ 					continue;
++ 				up_read(&mm->mmap_sem);
++ 				down_write(&mm->mmap_sem);
++ 				for (vma = mm->mmap; vma; vma = vma->vm_next) {
++ 					vma->vm_flags &= ~VM_SOFTDIRTY;
++ 					vma_set_page_prot(vma);
++ 				}
++ 				downgrade_write(&mm->mmap_sem);
++ 				break;
++ 			}
++ 			mmu_notifier_invalidate_range_start(mm, 0, -1);
++ 		}
+++>>>>>>> 64e455079e1b (mm: softdirty: enable write notifications on VMAs after VM_SOFTDIRTY cleared)
+  		for (vma = mm->mmap; vma; vma = vma->vm_next) {
+  			cp.vma = vma;
+  			if (is_vm_hugetlb_page(vma))
+diff --cc include/asm-generic/pgtable.h
+index 34b45521969b,752e30d63904..000000000000
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@@ -232,6 -249,24 +232,27 @@@ static inline int pmd_same(pmd_t pmd_a
+  #define pgprot_writecombine pgprot_noncached
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifndef pgprot_device
++ #define pgprot_device pgprot_noncached
++ #endif
++ 
++ #ifndef pgprot_modify
++ #define pgprot_modify pgprot_modify
++ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
++ {
++ 	if (pgprot_val(oldprot) == pgprot_val(pgprot_noncached(oldprot)))
++ 		newprot = pgprot_noncached(newprot);
++ 	if (pgprot_val(oldprot) == pgprot_val(pgprot_writecombine(oldprot)))
++ 		newprot = pgprot_writecombine(newprot);
++ 	if (pgprot_val(oldprot) == pgprot_val(pgprot_device(oldprot)))
++ 		newprot = pgprot_device(newprot);
++ 	return newprot;
++ }
++ #endif
++ 
+++>>>>>>> 64e455079e1b (mm: softdirty: enable write notifications on VMAs after VM_SOFTDIRTY cleared)
+  /*
+   * When walking page tables, get the address of the next boundary,
+   * or the end address of the range if that comes earlier.  Although no
+diff --cc mm/mmap.c
+index dc2927ad5660,7f855206e7fb..000000000000
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@@ -1646,6 -1663,17 +1655,20 @@@ out
+  	if (file)
+  		uprobe_mmap(vma);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * New (or expanded) vma always get soft dirty status.
++ 	 * Otherwise user-space soft-dirty page tracker won't
++ 	 * be able to distinguish situation when vma area unmapped,
++ 	 * then new mapped in-place (which must be aimed as
++ 	 * a completely new data area).
++ 	 */
++ 	vma->vm_flags |= VM_SOFTDIRTY;
++ 
++ 	vma_set_page_prot(vma);
++ 
+++>>>>>>> 64e455079e1b (mm: softdirty: enable write notifications on VMAs after VM_SOFTDIRTY cleared)
+  	return addr;
+  
+  unmap_and_free_vma:
+* Unmerged path fs/proc/task_mmu.c
+* Unmerged path include/asm-generic/pgtable.h
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 77beacdc1090..2ae7a09a001e 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1931,11 +1931,16 @@ static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
+ 
+ #ifdef CONFIG_MMU
+ pgprot_t vm_get_page_prot(unsigned long vm_flags);
++void vma_set_page_prot(struct vm_area_struct *vma);
+ #else
+ static inline pgprot_t vm_get_page_prot(unsigned long vm_flags)
+ {
+ 	return __pgprot(0);
+ }
++static inline void vma_set_page_prot(struct vm_area_struct *vma)
++{
++	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
++}
+ #endif
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+diff --git a/mm/memory.c b/mm/memory.c
+index fce51319197b..a4864e41d8c8 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2825,7 +2825,8 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	old_page = vm_normal_page(vma, address, orig_pte);
+ 	if (!old_page) {
+ 		/*
+-		 * VM_MIXEDMAP !pfn_valid() case
++		 * VM_MIXEDMAP !pfn_valid() case, or VM_SOFTDIRTY clear on a
++		 * VM_PFNMAP VMA.
+ 		 *
+ 		 * We should not cow pages in a shared writeable mapping.
+ 		 * Just mark the pages writable as we can't do any dirty
+* Unmerged path mm/mmap.c
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 468917529124..96fceacc3941 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -29,13 +29,6 @@
+ #include <asm/cacheflush.h>
+ #include <asm/tlbflush.h>
+ 
+-#ifndef pgprot_modify
+-static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
+-{
+-	return newprot;
+-}
+-#endif
+-
+ /*
+  * For a prot_numa update we only hold mmap_sem for read so there is a
+  * potential race with faulting where a pmd was temporarily none. This
+@@ -93,7 +86,9 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 				 * Avoid taking write faults for pages we
+ 				 * know to be dirty.
+ 				 */
+-				if (dirty_accountable && pte_dirty(ptent))
++				if (dirty_accountable && pte_dirty(ptent) &&
++				    (pte_soft_dirty(ptent) ||
++				     !(vma->vm_flags & VM_SOFTDIRTY)))
+ 					ptent = pte_mkwrite(ptent);
+ 				ptep_modify_prot_commit(mm, addr, pte, ptent);
+ 				updated = true;
+@@ -321,13 +316,8 @@ success:
+ 	 * held in write mode.
+ 	 */
+ 	vma->vm_flags = newflags;
+-	vma->vm_page_prot = pgprot_modify(vma->vm_page_prot,
+-					  vm_get_page_prot(newflags));
+-
+-	if (vma_wants_writenotify(vma)) {
+-		vma->vm_page_prot = vm_get_page_prot(newflags & ~VM_SHARED);
+-		dirty_accountable = 1;
+-	}
++	dirty_accountable = vma_wants_writenotify(vma);
++	vma_set_page_prot(vma);
+ 
+ 	change_protection(vma, start, end, vma->vm_page_prot,
+ 			  dirty_accountable, 0);
