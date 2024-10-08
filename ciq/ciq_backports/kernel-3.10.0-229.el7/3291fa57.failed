@@ -1,0 +1,200 @@
+NVMe: Add tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 3291fa57cb1b004c1a4823beb28b5cc72555f1a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3291fa57.failed
+
+Adding tracepoints for bio_complete and block_split into nvme to help
+with gathering IO info using blktrace and blkparse.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+(cherry picked from commit 3291fa57cb1b004c1a4823beb28b5cc72555f1a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 15b841d4b251,025dd4cad4a6..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -380,17 -413,30 +382,41 @@@ static void bio_completion(struct nvme_
+  	struct nvme_iod *iod = ctx;
+  	struct bio *bio = iod->private;
+  	u16 status = le16_to_cpup(&cqe->status) >> 1;
+- 
++ 	int error = 0;
++ 
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(status)) {
++ 		if (!(status & NVME_SC_DNR ||
++ 				bio->bi_rw & REQ_FAILFAST_MASK) &&
++ 				(jiffies - iod->start_time) < IOD_TIMEOUT) {
++ 			if (!waitqueue_active(&nvmeq->sq_full))
++ 				add_wait_queue(&nvmeq->sq_full,
++ 							&nvmeq->sq_cong_wait);
++ 			list_add_tail(&iod->node, &nvmeq->iod_bio);
++ 			wake_up(&nvmeq->sq_full);
++ 			return;
++ 		}
++ 		error = -EIO;
++ 	}
+++>>>>>>> 3291fa57cb1b (NVMe: Add tracepoints)
+  	if (iod->nents) {
+ -		dma_unmap_sg(nvmeq->q_dmadev, iod->sg, iod->nents,
+ +		dma_unmap_sg(&dev->pci_dev->dev, iod->sg, iod->nents,
+  			bio_data_dir(bio) ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+  		nvme_end_io_acct(bio, iod->start_time);
+  	}
+++<<<<<<< HEAD
+ +	nvme_free_iod(dev, iod);
+ +	if (status)
+ +		bio_endio(bio, -EIO);
+ +	else
+ +		bio_endio(bio, 0);
+++=======
++ 	nvme_free_iod(nvmeq->dev, iod);
++ 
++ 	trace_block_bio_complete(bdev_get_queue(bio->bi_bdev), bio, error);
++ 	bio_endio(bio, error);
+++>>>>>>> 3291fa57cb1b (NVMe: Add tracepoints)
+  }
+  
+  /* length is in bytes.  gfp flags indicates whether we may sleep. */
+@@@ -474,104 -518,22 +500,112 @@@ int nvme_setup_prps(struct nvme_dev *de
+  	return total_len;
+  }
+  
+ +struct nvme_bio_pair {
+ +	struct bio b1, b2, *parent;
+ +	struct bio_vec *bv1, *bv2;
+ +	int err;
+ +	atomic_t cnt;
+ +};
+ +
+ +static void nvme_bio_pair_endio(struct bio *bio, int err)
+ +{
+ +	struct nvme_bio_pair *bp = bio->bi_private;
+ +
+ +	if (err)
+ +		bp->err = err;
+ +
+ +	if (atomic_dec_and_test(&bp->cnt)) {
+ +		bio_endio(bp->parent, bp->err);
+ +		kfree(bp->bv1);
+ +		kfree(bp->bv2);
+ +		kfree(bp);
+ +	}
+ +}
+ +
+ +static struct nvme_bio_pair *nvme_bio_split(struct bio *bio, int idx,
+ +							int len, int offset)
+ +{
+ +	struct nvme_bio_pair *bp;
+ +
+ +	BUG_ON(len > bio->bi_size);
+ +	BUG_ON(idx > bio->bi_vcnt);
+ +
+ +	bp = kmalloc(sizeof(*bp), GFP_ATOMIC);
+ +	if (!bp)
+ +		return NULL;
+ +	bp->err = 0;
+ +
+ +	bp->b1 = *bio;
+ +	bp->b2 = *bio;
+ +
+ +	bp->b1.bi_size = len;
+ +	bp->b2.bi_size -= len;
+ +	bp->b1.bi_vcnt = idx;
+ +	bp->b2.bi_idx = idx;
+ +	bp->b2.bi_sector += len >> 9;
+ +
+ +	if (offset) {
+ +		bp->bv1 = kmalloc(bio->bi_max_vecs * sizeof(struct bio_vec),
+ +								GFP_ATOMIC);
+ +		if (!bp->bv1)
+ +			goto split_fail_1;
+ +
+ +		bp->bv2 = kmalloc(bio->bi_max_vecs * sizeof(struct bio_vec),
+ +								GFP_ATOMIC);
+ +		if (!bp->bv2)
+ +			goto split_fail_2;
+ +
+ +		memcpy(bp->bv1, bio->bi_io_vec,
+ +			bio->bi_max_vecs * sizeof(struct bio_vec));
+ +		memcpy(bp->bv2, bio->bi_io_vec,
+ +			bio->bi_max_vecs * sizeof(struct bio_vec));
+ +
+ +		bp->b1.bi_io_vec = bp->bv1;
+ +		bp->b2.bi_io_vec = bp->bv2;
+ +		bp->b2.bi_io_vec[idx].bv_offset += offset;
+ +		bp->b2.bi_io_vec[idx].bv_len -= offset;
+ +		bp->b1.bi_io_vec[idx].bv_len = offset;
+ +		bp->b1.bi_vcnt++;
+ +	} else
+ +		bp->bv1 = bp->bv2 = NULL;
+ +
+ +	bp->b1.bi_private = bp;
+ +	bp->b2.bi_private = bp;
+ +
+ +	bp->b1.bi_end_io = nvme_bio_pair_endio;
+ +	bp->b2.bi_end_io = nvme_bio_pair_endio;
+ +
+ +	bp->parent = bio;
+ +	atomic_set(&bp->cnt, 2);
+ +
+ +	return bp;
+ +
+ + split_fail_2:
+ +	kfree(bp->bv1);
+ + split_fail_1:
+ +	kfree(bp);
+ +	return NULL;
+ +}
+ +
+  static int nvme_split_and_submit(struct bio *bio, struct nvme_queue *nvmeq,
+ -				 int len)
+ +						int idx, int len, int offset)
+  {
+ -	struct bio *split = bio_split(bio, len >> 9, GFP_ATOMIC, NULL);
+ -	if (!split)
+ +	struct nvme_bio_pair *bp = nvme_bio_split(bio, idx, len, offset);
+ +	if (!bp)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (bio_list_empty(&nvmeq->sq_cong))
+++=======
++ 	trace_block_split(bdev_get_queue(bio->bi_bdev), bio,
++ 					split->bi_iter.bi_sector);
++ 	bio_chain(split, bio);
++ 
++ 	if (!waitqueue_active(&nvmeq->sq_full))
+++>>>>>>> 3291fa57cb1b (NVMe: Add tracepoints)
+  		add_wait_queue(&nvmeq->sq_full, &nvmeq->sq_cong_wait);
+ -	bio_list_add(&nvmeq->sq_cong, split);
+ -	bio_list_add(&nvmeq->sq_cong, bio);
+ -	wake_up(&nvmeq->sq_full);
+ +	bio_list_add(&nvmeq->sq_cong, &bp->b1);
+ +	bio_list_add(&nvmeq->sq_cong, &bp->b2);
+  
+  	return 0;
+  }
+diff --git a/block/blk-core.c b/block/blk-core.c
+index c73506fa40d8..a3271614d439 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -43,6 +43,7 @@
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_complete);
++EXPORT_TRACEPOINT_SYMBOL_GPL(block_split);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
+ 
+ DEFINE_IDA(blk_queue_ida);
+* Unmerged path drivers/block/nvme-core.c
