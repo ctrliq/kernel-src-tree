@@ -1,0 +1,135 @@
+tools: ffs-test: convert to new descriptor format fixing compilation error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Michal Nazarewicz <mina86@mina86.com>
+commit f2af74123f8c5a735248547f4286a3adc28633c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f2af7412.failed
+
+Commit [ac8dde11: “usb: gadget: f_fs: Add flags to descriptors block”]
+which introduced a new descriptor format for FunctionFS removed the
+usb_functionfs_descs_head structure, which is still used by ffs-test.
+tool.
+
+Convert ffs-test by converting it to use the new header format.  For
+testing kernels prior to 3.14 (when the new format was introduced) and
+parsing of the legacy headers in the new kernels, provide a compilation
+flag to make the tool use the old format.
+
+Finally, include information as to when the legacy FunctionFS headers
+format has been deprecated (which is also when the new one has been
+introduced).
+
+	Reported-by: Lad, Prabhakar <prabhakar.csengg@gmail.com>
+	Signed-off-by: Michal Nazarewicz <mina86@mina86.com>
+	Signed-off-by: Felipe Balbi <balbi@ti.com>
+(cherry picked from commit f2af74123f8c5a735248547f4286a3adc28633c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/usb/functionfs.h
+diff --cc include/uapi/linux/usb/functionfs.h
+index d6b01283f85c,ecb3a31f7ca6..000000000000
+--- a/include/uapi/linux/usb/functionfs.h
++++ b/include/uapi/linux/usb/functionfs.h
+@@@ -44,7 -39,25 +44,29 @@@ struct usb_functionfs_descs_head 
+   *
+   * | off | name      | type         | description                          |
+   * |-----+-----------+--------------+--------------------------------------|
+++<<<<<<< HEAD
+ + * |   0 | magic     | LE32         | FUNCTIONFS_{FS,HS}_DESCRIPTORS_MAGIC |
+++=======
++  * |   0 | magic     | LE32         | FUNCTIONFS_DESCRIPTORS_MAGIC_V2      |
++  * |   4 | length    | LE32         | length of the whole data chunk       |
++  * |   8 | flags     | LE32         | combination of functionfs_flags      |
++  * |     | fs_count  | LE32         | number of full-speed descriptors     |
++  * |     | hs_count  | LE32         | number of high-speed descriptors     |
++  * |     | ss_count  | LE32         | number of super-speed descriptors    |
++  * |     | fs_descrs | Descriptor[] | list of full-speed descriptors       |
++  * |     | hs_descrs | Descriptor[] | list of high-speed descriptors       |
++  * |     | ss_descrs | Descriptor[] | list of super-speed descriptors      |
++  *
++  * Depending on which flags are set, various fields may be missing in the
++  * structure.  Any flags that are not recognised cause the whole block to be
++  * rejected with -ENOSYS.
++  *
++  * Legacy descriptors format (deprecated as of 3.14):
++  *
++  * | off | name      | type         | description                          |
++  * |-----+-----------+--------------+--------------------------------------|
++  * |   0 | magic     | LE32         | FUNCTIONFS_DESCRIPTORS_MAGIC         |
+++>>>>>>> f2af74123f8c (tools: ffs-test: convert to new descriptor format fixing compilation error)
+   * |   4 | length    | LE32         | length of the whole data chunk       |
+   * |   8 | fs_count  | LE32         | number of full-speed descriptors     |
+   * |  12 | hs_count  | LE32         | number of high-speed descriptors     |
+* Unmerged path include/uapi/linux/usb/functionfs.h
+diff --git a/tools/usb/Makefile b/tools/usb/Makefile
+index 396d6c44e9d7..75746f95c4d7 100644
+--- a/tools/usb/Makefile
++++ b/tools/usb/Makefile
+@@ -5,7 +5,11 @@ PTHREAD_LIBS = -lpthread
+ WARNINGS = -Wall -Wextra
+ CFLAGS = $(WARNINGS) -g $(PTHREAD_LIBS) -I../include
+ 
+-all: testusb ffs-test
++all: testusb ffs-test ffs-test-legacy
++
++ffs-test-legacy: ffs-test.c
++	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -DUSE_LEGACY_DESC_HEAD
++
+ %: %.c
+ 	$(CC) $(CFLAGS) -o $@ $^
+ 
+diff --git a/tools/usb/ffs-test.c b/tools/usb/ffs-test.c
+index fe1e66b6ef40..74b353d9eb50 100644
+--- a/tools/usb/ffs-test.c
++++ b/tools/usb/ffs-test.c
+@@ -1,5 +1,5 @@
+ /*
+- * ffs-test.c.c -- user mode filesystem api for usb composite function
++ * ffs-test.c -- user mode filesystem api for usb composite function
+  *
+  * Copyright (C) 2010 Samsung Electronics
+  *                    Author: Michal Nazarewicz <mina86@mina86.com>
+@@ -21,6 +21,8 @@
+ 
+ /* $(CROSS_COMPILE)cc -Wall -Wextra -g -o ffs-test ffs-test.c -lpthread */
+ 
++/* Uncomment to make the tool use legacy FFS descriptor headers. */
++/* #define USE_LEGACY_DESC_HEAD */
+ 
+ #define _BSD_SOURCE /* for endian.h */
+ 
+@@ -106,7 +108,15 @@ static void _msg(unsigned level, const char *fmt, ...)
+ /******************** Descriptors and Strings *******************************/
+ 
+ static const struct {
+-	struct usb_functionfs_descs_head header;
++	struct {
++		__le32 magic;
++		__le32 length;
++#ifndef USE_LEGACY_DESC_HEAD
++		__le32 flags;
++#endif
++		__le32 fs_count;
++		__le32 hs_count;
++	} __attribute__((packed)) header;
+ 	struct {
+ 		struct usb_interface_descriptor intf;
+ 		struct usb_endpoint_descriptor_no_audio sink;
+@@ -114,7 +124,13 @@ static const struct {
+ 	} __attribute__((packed)) fs_descs, hs_descs;
+ } __attribute__((packed)) descriptors = {
+ 	.header = {
++#ifdef USE_LEGACY_DESC_HEAD
+ 		.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC),
++#else
++		.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
++		.flags = cpu_to_le32(FUNCTIONFS_HAS_FS_DESC |
++				     FUNCTIONFS_HAS_HS_DESC),
++#endif
+ 		.length = cpu_to_le32(sizeof descriptors),
+ 		.fs_count = 3,
+ 		.hs_count = 3,
