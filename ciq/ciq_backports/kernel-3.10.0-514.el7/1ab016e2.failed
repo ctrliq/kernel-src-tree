@@ -1,0 +1,265 @@
+vxlan: move inner L2 header processing to a separate function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 1ab016e237e7d0734fb7adbbfe6d4cacb3520421
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1ab016e2.failed
+
+This code will be different for VXLAN-GPE, so move it to a separate
+function. It will also make the rx path less spaghetti-like.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1ab016e237e7d0734fb7adbbfe6d4cacb3520421)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 000e4c57a81e,68a8f9f43e2a..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1133,149 -1144,70 +1133,163 @@@ static struct vxlanhdr *vxlan_remcsum(s
+  {
+  	size_t start, offset, plen;
+  
+ -	if (!(unparsed->vx_flags & VXLAN_HF_RCO) || skb->remcsum_offload)
+ -		goto out;
+ +	if (skb->remcsum_offload)
+ +		return vh;
+  
+ -	start = vxlan_rco_start(unparsed->vx_vni);
+ -	offset = start + vxlan_rco_offset(unparsed->vx_vni);
+ +	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
+ +	offset = start + ((data & VXLAN_RCO_UDP) ?
+ +			  offsetof(struct udphdr, check) :
+ +			  offsetof(struct tcphdr, check));
+  
+ -	plen = sizeof(struct vxlanhdr) + offset + sizeof(u16);
+ +	plen = hdrlen + offset + sizeof(u16);
+  
+  	if (!pskb_may_pull(skb, plen))
+ -		return false;
+ +		return NULL;
+  
+ -	skb_remcsum_process(skb, (void *)(vxlan_hdr(skb) + 1), start, offset,
+ -			    !!(vxflags & VXLAN_F_REMCSUM_NOPARTIAL));
+ -out:
+ -	unparsed->vx_flags &= ~VXLAN_HF_RCO;
+ -	unparsed->vx_vni &= VXLAN_VNI_MASK;
+ -	return true;
+ +	vh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
+ +
+ +	skb_remcsum_process(skb, (void *)vh + hdrlen, start, offset,
+ +			    nopartial);
+ +
+ +	return vh;
+  }
+  
+ -static void vxlan_parse_gbp_hdr(struct vxlanhdr *unparsed,
+ -				struct sk_buff *skb, u32 vxflags,
+ -				struct vxlan_metadata *md,
+ -				struct metadata_dst *tun_dst)
+ +/* Callback from net/ipv4/udp.c to receive packets */
+ +static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+  {
+ -	struct vxlanhdr_gbp *gbp = (struct vxlanhdr_gbp *)unparsed;
+ +	struct vxlan_sock *vs;
+ +	struct vxlanhdr *vxh;
+ +	u32 flags, vni;
+ +	struct vxlan_metadata md = {0};
+  
+ -	if (!(unparsed->vx_flags & VXLAN_HF_GBP))
+ -		goto out;
+ +	/* Need Vxlan and inner Ethernet header to be present */
+ +	if (!pskb_may_pull(skb, VXLAN_HLEN))
+ +		goto error;
+  
+ -	md->gbp = ntohs(gbp->policy_id);
+ +	vxh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
+ +	flags = ntohl(vxh->vx_flags);
+ +	vni = ntohl(vxh->vx_vni);
+  
+ -	if (tun_dst)
+ -		tun_dst->u.tun_info.key.tun_flags |= TUNNEL_VXLAN_OPT;
+ +	if (flags & VXLAN_HF_VNI) {
+ +		flags &= ~VXLAN_HF_VNI;
+ +	} else {
+ +		/* VNI flag always required to be set */
+ +		goto bad_flags;
+ +	}
+  
+ -	if (gbp->dont_learn)
+ -		md->gbp |= VXLAN_GBP_DONT_LEARN;
+ +	if (iptunnel_pull_header(skb, VXLAN_HLEN, htons(ETH_P_TEB)))
+ +		goto drop;
+ +	vxh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
+  
+ -	if (gbp->policy_applied)
+ -		md->gbp |= VXLAN_GBP_POLICY_APPLIED;
+ +	vs = rcu_dereference_sk_user_data(sk);
+ +	if (!vs)
+ +		goto drop;
+  
+ -	/* In flow-based mode, GBP is carried in dst_metadata */
+ -	if (!(vxflags & VXLAN_F_COLLECT_METADATA))
+ -		skb->mark = md->gbp;
+ -out:
+ -	unparsed->vx_flags &= ~VXLAN_GBP_USED_BITS;
+ +	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
+ +		vxh = vxlan_remcsum(skb, vxh, sizeof(struct vxlanhdr), vni,
+ +				    !!(vs->flags & VXLAN_F_REMCSUM_NOPARTIAL));
+ +		if (!vxh)
+ +			goto drop;
+ +
+ +		flags &= ~VXLAN_HF_RCO;
+ +		vni &= VXLAN_VNI_MASK;
+ +	}
+ +
+ +	/* For backwards compatibility, only allow reserved fields to be
+ +	 * used by VXLAN extensions if explicitly requested.
+ +	 */
+ +	if ((flags & VXLAN_HF_GBP) && (vs->flags & VXLAN_F_GBP)) {
+ +		struct vxlanhdr_gbp *gbp;
+ +
+ +		gbp = (struct vxlanhdr_gbp *)vxh;
+ +		md.gbp = ntohs(gbp->policy_id);
+ +
+ +		if (gbp->dont_learn)
+ +			md.gbp |= VXLAN_GBP_DONT_LEARN;
+ +
+ +		if (gbp->policy_applied)
+ +			md.gbp |= VXLAN_GBP_POLICY_APPLIED;
+ +
+ +		flags &= ~VXLAN_GBP_USED_BITS;
+ +	}
+ +
+ +	if (flags || vni & ~VXLAN_VNI_MASK) {
+ +		/* If there are any unprocessed flags remaining treat
+ +		 * this as a malformed packet. This behavior diverges from
+ +		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
+ +		 * in reserved fields are to be ignored. The approach here
+ +		 * maintains compatibility with previous stack code, and also
+ +		 * is more robust and provides a little more security in
+ +		 * adding extensions to VXLAN.
+ +		 */
+ +
+ +		goto bad_flags;
+ +	}
+ +
+ +	md.vni = vxh->vx_vni;
+ +	vs->rcv(vs, skb, &md);
+ +	return 0;
+ +
+ +drop:
+ +	/* Consume bad packet */
+ +	kfree_skb(skb);
+ +	return 0;
+ +
+ +bad_flags:
+ +	netdev_dbg(skb->dev, "invalid vxlan flags=%#x vni=%#x\n",
+ +		   ntohl(vxh->vx_flags), ntohl(vxh->vx_vni));
+ +
+ +error:
+ +	/* Return non vxlan pkt */
+ +	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ +		      struct vxlan_metadata *md)
+ +{
+ +	struct iphdr *oip = NULL;
+ +	struct ipv6hdr *oip6 = NULL;
+ +	struct vxlan_dev *vxlan;
+ +	struct pcpu_sw_netstats *stats;
+ +	union vxlan_addr saddr;
+ +	__u32 vni;
+ +	int err = 0;
+ +	union vxlan_addr *remote_ip;
+++=======
++ static bool vxlan_set_mac(struct vxlan_dev *vxlan,
++ 			  struct vxlan_sock *vs,
++ 			  struct sk_buff *skb)
++ {
++ 	union vxlan_addr saddr;
+++>>>>>>> 1ab016e237e7 (vxlan: move inner L2 header processing to a separate function)
+ +
+ +	vni = ntohl(md->vni) >> 8;
+ +	/* Is this VNI defined? */
+ +	vxlan = vxlan_vs_find_vni(vs, vni);
+ +	if (!vxlan)
+ +		goto drop;
+  
+ +	remote_ip = &vxlan->default_dst.remote_ip;
+  	skb_reset_mac_header(skb);
+ +	skb_scrub_packet(skb, !net_eq(vxlan->net, dev_net(vxlan->dev)));
+  	skb->protocol = eth_type_trans(skb, vxlan->dev);
+  	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+  
+  	/* Ignore packet loops (and multicast echo) */
+  	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
+- 		goto drop;
++ 		return false;
+  
+++<<<<<<< HEAD
+ +	/* Re-examine inner Ethernet packet */
+ +	if (remote_ip->sa.sa_family == AF_INET) {
+ +		oip = ip_hdr(skb);
+ +		saddr.sin.sin_addr.s_addr = oip->saddr;
+++=======
++ 	/* Get data from the outer IP header */
++ 	if (vxlan_get_sk_family(vs) == AF_INET) {
++ 		saddr.sin.sin_addr.s_addr = ip_hdr(skb)->saddr;
+++>>>>>>> 1ab016e237e7 (vxlan: move inner L2 header processing to a separate function)
+  		saddr.sa.sa_family = AF_INET;
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+@@@ -1287,10 -1218,37 +1300,43 @@@
+  
+  	if ((vxlan->flags & VXLAN_F_LEARN) &&
+  	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
+++<<<<<<< HEAD
+ +		goto drop;
+ +
+++=======
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void vxlan_rcv(struct vxlan_dev *vxlan, struct vxlan_sock *vs,
++ 		      struct sk_buff *skb, struct vxlan_metadata *md,
++ 		      struct metadata_dst *tun_dst)
++ {
++ 	struct iphdr *oip = NULL;
++ 	struct ipv6hdr *oip6 = NULL;
++ 	struct pcpu_sw_netstats *stats;
++ 	int err = 0;
++ 
++ 	if (!vxlan_set_mac(vxlan, vs, skb))
++ 		goto drop;
++ 
++ 	/* Get data from the outer IP header */
++ 	if (vxlan_get_sk_family(vs) == AF_INET)
++ 		oip = ip_hdr(skb);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else
++ 		oip6 = ipv6_hdr(skb);
++ #endif
++ 
++ 	if (tun_dst) {
++ 		skb_dst_set(skb, (struct dst_entry *)tun_dst);
++ 		tun_dst = NULL;
++ 	}
++ 
+++>>>>>>> 1ab016e237e7 (vxlan: move inner L2 header processing to a separate function)
+  	skb_reset_network_header(skb);
+ +	skb->mark = md->gbp;
+  
+  	if (oip6)
+  		err = IP6_ECN_decapsulate(oip6, skb);
+* Unmerged path drivers/net/vxlan.c
