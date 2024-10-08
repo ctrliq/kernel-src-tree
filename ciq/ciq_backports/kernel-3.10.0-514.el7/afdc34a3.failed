@@ -1,0 +1,711 @@
+printk: Add per_cpu printk func to allow printk to be diverted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Steven Rostedt (Red Hat) <rostedt@goodmis.org>
+commit afdc34a3d3b823a12a93b822ee1efb566f884032
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/afdc34a3.failed
+
+Being able to divert printk to call another function besides the normal
+logging is useful for such things like NMI handling. If some functions
+are to be called from NMI that does printk() it is possible to lock up
+the box if the nmi handler triggers when another printk is happening.
+
+One example of this use is to perform a stack trace on all CPUs via NMI.
+But if the NMI is to do the printk() it can cause the system to lock up.
+By allowing the printk to be diverted to another function that can safely
+record the printk output and then print it when it in a safe context
+then NMIs will be safe to call these functions like show_regs().
+
+Link: http://lkml.kernel.org/p/20140619213952.209176403@goodmis.org
+
+	Tested-by: Jiri Kosina <jkosina@suse.cz>
+	Acked-by: Jiri Kosina <jkosina@suse.cz>
+	Acked-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Reviewed-by: Petr Mladek <pmladek@suse.cz>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit afdc34a3d3b823a12a93b822ee1efb566f884032)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/percpu.h
+diff --cc include/linux/percpu.h
+index 467dd251499e,ba2e85a0ff5b..000000000000
+--- a/include/linux/percpu.h
++++ b/include/linux/percpu.h
+@@@ -171,594 -134,7 +171,599 @@@ extern phys_addr_t per_cpu_ptr_to_phys(
+  	(typeof(type) __percpu *)__alloc_percpu(sizeof(type),		\
+  						__alignof__(type))
+  
+++<<<<<<< HEAD
+ +/*
+ + * Branching function to split up a function into a set of functions that
+ + * are called for different scalar sizes of the objects handled.
+ + */
+ +
+ +extern void __bad_size_call_parameter(void);
+ +
+ +#define __pcpu_size_call_return(stem, variable)				\
+ +({	typeof(variable) pscr_ret__;					\
+ +	__verify_pcpu_ptr(&(variable));					\
+ +	switch(sizeof(variable)) {					\
+ +	case 1: pscr_ret__ = stem##1(variable);break;			\
+ +	case 2: pscr_ret__ = stem##2(variable);break;			\
+ +	case 4: pscr_ret__ = stem##4(variable);break;			\
+ +	case 8: pscr_ret__ = stem##8(variable);break;			\
+ +	default:							\
+ +		__bad_size_call_parameter();break;			\
+ +	}								\
+ +	pscr_ret__;							\
+ +})
+ +
+ +#define __pcpu_size_call_return2(stem, variable, ...)			\
+ +({									\
+ +	typeof(variable) pscr2_ret__;					\
+ +	__verify_pcpu_ptr(&(variable));					\
+ +	switch(sizeof(variable)) {					\
+ +	case 1: pscr2_ret__ = stem##1(variable, __VA_ARGS__); break;	\
+ +	case 2: pscr2_ret__ = stem##2(variable, __VA_ARGS__); break;	\
+ +	case 4: pscr2_ret__ = stem##4(variable, __VA_ARGS__); break;	\
+ +	case 8: pscr2_ret__ = stem##8(variable, __VA_ARGS__); break;	\
+ +	default:							\
+ +		__bad_size_call_parameter(); break;			\
+ +	}								\
+ +	pscr2_ret__;							\
+ +})
+ +
+ +/*
+ + * Special handling for cmpxchg_double.  cmpxchg_double is passed two
+ + * percpu variables.  The first has to be aligned to a double word
+ + * boundary and the second has to follow directly thereafter.
+ + * We enforce this on all architectures even if they don't support
+ + * a double cmpxchg instruction, since it's a cheap requirement, and it
+ + * avoids breaking the requirement for architectures with the instruction.
+ + */
+ +#define __pcpu_double_call_return_bool(stem, pcp1, pcp2, ...)		\
+ +({									\
+ +	bool pdcrb_ret__;						\
+ +	__verify_pcpu_ptr(&pcp1);					\
+ +	BUILD_BUG_ON(sizeof(pcp1) != sizeof(pcp2));			\
+ +	VM_BUG_ON((unsigned long)(&pcp1) % (2 * sizeof(pcp1)));		\
+ +	VM_BUG_ON((unsigned long)(&pcp2) !=				\
+ +		  (unsigned long)(&pcp1) + sizeof(pcp1));		\
+ +	switch(sizeof(pcp1)) {						\
+ +	case 1: pdcrb_ret__ = stem##1(pcp1, pcp2, __VA_ARGS__); break;	\
+ +	case 2: pdcrb_ret__ = stem##2(pcp1, pcp2, __VA_ARGS__); break;	\
+ +	case 4: pdcrb_ret__ = stem##4(pcp1, pcp2, __VA_ARGS__); break;	\
+ +	case 8: pdcrb_ret__ = stem##8(pcp1, pcp2, __VA_ARGS__); break;	\
+ +	default:							\
+ +		__bad_size_call_parameter(); break;			\
+ +	}								\
+ +	pdcrb_ret__;							\
+ +})
+ +
+ +#define __pcpu_size_call(stem, variable, ...)				\
+ +do {									\
+ +	__verify_pcpu_ptr(&(variable));					\
+ +	switch(sizeof(variable)) {					\
+ +		case 1: stem##1(variable, __VA_ARGS__);break;		\
+ +		case 2: stem##2(variable, __VA_ARGS__);break;		\
+ +		case 4: stem##4(variable, __VA_ARGS__);break;		\
+ +		case 8: stem##8(variable, __VA_ARGS__);break;		\
+ +		default: 						\
+ +			__bad_size_call_parameter();break;		\
+ +	}								\
+ +} while (0)
+ +
+ +/*
+ + * Optimized manipulation for memory allocated through the per cpu
+ + * allocator or for addresses of per cpu variables.
+ + *
+ + * These operation guarantee exclusivity of access for other operations
+ + * on the *same* processor. The assumption is that per cpu data is only
+ + * accessed by a single processor instance (the current one).
+ + *
+ + * The first group is used for accesses that must be done in a
+ + * preemption safe way since we know that the context is not preempt
+ + * safe. Interrupts may occur. If the interrupt modifies the variable
+ + * too then RMW actions will not be reliable.
+ + *
+ + * The arch code can provide optimized functions in two ways:
+ + *
+ + * 1. Override the function completely. F.e. define this_cpu_add().
+ + *    The arch must then ensure that the various scalar format passed
+ + *    are handled correctly.
+ + *
+ + * 2. Provide functions for certain scalar sizes. F.e. provide
+ + *    this_cpu_add_2() to provide per cpu atomic operations for 2 byte
+ + *    sized RMW actions. If arch code does not provide operations for
+ + *    a scalar size then the fallback in the generic code will be
+ + *    used.
+ + */
+ +
+ +#define _this_cpu_generic_read(pcp)					\
+ +({	typeof(pcp) ret__;						\
+ +	preempt_disable();						\
+ +	ret__ = *this_cpu_ptr(&(pcp));					\
+ +	preempt_enable();						\
+ +	ret__;								\
+ +})
+ +
+ +#ifndef this_cpu_read
+ +# ifndef this_cpu_read_1
+ +#  define this_cpu_read_1(pcp)	_this_cpu_generic_read(pcp)
+ +# endif
+ +# ifndef this_cpu_read_2
+ +#  define this_cpu_read_2(pcp)	_this_cpu_generic_read(pcp)
+ +# endif
+ +# ifndef this_cpu_read_4
+ +#  define this_cpu_read_4(pcp)	_this_cpu_generic_read(pcp)
+ +# endif
+ +# ifndef this_cpu_read_8
+ +#  define this_cpu_read_8(pcp)	_this_cpu_generic_read(pcp)
+ +# endif
+ +# define this_cpu_read(pcp)	__pcpu_size_call_return(this_cpu_read_, (pcp))
+ +#endif
+ +
+ +#define _this_cpu_generic_to_op(pcp, val, op)				\
+ +do {									\
+ +	unsigned long flags;						\
+ +	raw_local_irq_save(flags);					\
+ +	*__this_cpu_ptr(&(pcp)) op val;					\
+ +	raw_local_irq_restore(flags);					\
+ +} while (0)
+ +
+ +#ifndef this_cpu_write
+ +# ifndef this_cpu_write_1
+ +#  define this_cpu_write_1(pcp, val)	_this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# ifndef this_cpu_write_2
+ +#  define this_cpu_write_2(pcp, val)	_this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# ifndef this_cpu_write_4
+ +#  define this_cpu_write_4(pcp, val)	_this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# ifndef this_cpu_write_8
+ +#  define this_cpu_write_8(pcp, val)	_this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# define this_cpu_write(pcp, val)	__pcpu_size_call(this_cpu_write_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef this_cpu_add
+ +# ifndef this_cpu_add_1
+ +#  define this_cpu_add_1(pcp, val)	_this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# ifndef this_cpu_add_2
+ +#  define this_cpu_add_2(pcp, val)	_this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# ifndef this_cpu_add_4
+ +#  define this_cpu_add_4(pcp, val)	_this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# ifndef this_cpu_add_8
+ +#  define this_cpu_add_8(pcp, val)	_this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# define this_cpu_add(pcp, val)		__pcpu_size_call(this_cpu_add_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef this_cpu_sub
+ +# define this_cpu_sub(pcp, val)		this_cpu_add((pcp), -(val))
+ +#endif
+ +
+ +#ifndef this_cpu_inc
+ +# define this_cpu_inc(pcp)		this_cpu_add((pcp), 1)
+ +#endif
+ +
+ +#ifndef this_cpu_dec
+ +# define this_cpu_dec(pcp)		this_cpu_sub((pcp), 1)
+ +#endif
+ +
+ +#ifndef this_cpu_and
+ +# ifndef this_cpu_and_1
+ +#  define this_cpu_and_1(pcp, val)	_this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# ifndef this_cpu_and_2
+ +#  define this_cpu_and_2(pcp, val)	_this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# ifndef this_cpu_and_4
+ +#  define this_cpu_and_4(pcp, val)	_this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# ifndef this_cpu_and_8
+ +#  define this_cpu_and_8(pcp, val)	_this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# define this_cpu_and(pcp, val)		__pcpu_size_call(this_cpu_and_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef this_cpu_or
+ +# ifndef this_cpu_or_1
+ +#  define this_cpu_or_1(pcp, val)	_this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# ifndef this_cpu_or_2
+ +#  define this_cpu_or_2(pcp, val)	_this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# ifndef this_cpu_or_4
+ +#  define this_cpu_or_4(pcp, val)	_this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# ifndef this_cpu_or_8
+ +#  define this_cpu_or_8(pcp, val)	_this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# define this_cpu_or(pcp, val)		__pcpu_size_call(this_cpu_or_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef this_cpu_xor
+ +# ifndef this_cpu_xor_1
+ +#  define this_cpu_xor_1(pcp, val)	_this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# ifndef this_cpu_xor_2
+ +#  define this_cpu_xor_2(pcp, val)	_this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# ifndef this_cpu_xor_4
+ +#  define this_cpu_xor_4(pcp, val)	_this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# ifndef this_cpu_xor_8
+ +#  define this_cpu_xor_8(pcp, val)	_this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# define this_cpu_xor(pcp, val)		__pcpu_size_call(this_cpu_or_, (pcp), (val))
+ +#endif
+ +
+ +#define _this_cpu_generic_add_return(pcp, val)				\
+ +({									\
+ +	typeof(pcp) ret__;						\
+ +	unsigned long flags;						\
+ +	raw_local_irq_save(flags);					\
+ +	__this_cpu_add(pcp, val);					\
+ +	ret__ = __this_cpu_read(pcp);					\
+ +	raw_local_irq_restore(flags);					\
+ +	ret__;								\
+ +})
+ +
+ +#ifndef this_cpu_add_return
+ +# ifndef this_cpu_add_return_1
+ +#  define this_cpu_add_return_1(pcp, val)	_this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# ifndef this_cpu_add_return_2
+ +#  define this_cpu_add_return_2(pcp, val)	_this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# ifndef this_cpu_add_return_4
+ +#  define this_cpu_add_return_4(pcp, val)	_this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# ifndef this_cpu_add_return_8
+ +#  define this_cpu_add_return_8(pcp, val)	_this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# define this_cpu_add_return(pcp, val)	__pcpu_size_call_return2(this_cpu_add_return_, pcp, val)
+ +#endif
+ +
+ +#define this_cpu_sub_return(pcp, val)	this_cpu_add_return(pcp, -(val))
+ +#define this_cpu_inc_return(pcp)	this_cpu_add_return(pcp, 1)
+ +#define this_cpu_dec_return(pcp)	this_cpu_add_return(pcp, -1)
+ +
+ +#define _this_cpu_generic_xchg(pcp, nval)				\
+ +({	typeof(pcp) ret__;						\
+ +	unsigned long flags;						\
+ +	raw_local_irq_save(flags);					\
+ +	ret__ = __this_cpu_read(pcp);					\
+ +	__this_cpu_write(pcp, nval);					\
+ +	raw_local_irq_restore(flags);					\
+ +	ret__;								\
+ +})
+ +
+ +#ifndef this_cpu_xchg
+ +# ifndef this_cpu_xchg_1
+ +#  define this_cpu_xchg_1(pcp, nval)	_this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# ifndef this_cpu_xchg_2
+ +#  define this_cpu_xchg_2(pcp, nval)	_this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# ifndef this_cpu_xchg_4
+ +#  define this_cpu_xchg_4(pcp, nval)	_this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# ifndef this_cpu_xchg_8
+ +#  define this_cpu_xchg_8(pcp, nval)	_this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# define this_cpu_xchg(pcp, nval)	\
+ +	__pcpu_size_call_return2(this_cpu_xchg_, (pcp), nval)
+ +#endif
+ +
+ +#define _this_cpu_generic_cmpxchg(pcp, oval, nval)			\
+ +({									\
+ +	typeof(pcp) ret__;						\
+ +	unsigned long flags;						\
+ +	raw_local_irq_save(flags);					\
+ +	ret__ = __this_cpu_read(pcp);					\
+ +	if (ret__ == (oval))						\
+ +		__this_cpu_write(pcp, nval);				\
+ +	raw_local_irq_restore(flags);					\
+ +	ret__;								\
+ +})
+ +
+ +#ifndef this_cpu_cmpxchg
+ +# ifndef this_cpu_cmpxchg_1
+ +#  define this_cpu_cmpxchg_1(pcp, oval, nval)	_this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# ifndef this_cpu_cmpxchg_2
+ +#  define this_cpu_cmpxchg_2(pcp, oval, nval)	_this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# ifndef this_cpu_cmpxchg_4
+ +#  define this_cpu_cmpxchg_4(pcp, oval, nval)	_this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# ifndef this_cpu_cmpxchg_8
+ +#  define this_cpu_cmpxchg_8(pcp, oval, nval)	_this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# define this_cpu_cmpxchg(pcp, oval, nval)	\
+ +	__pcpu_size_call_return2(this_cpu_cmpxchg_, pcp, oval, nval)
+ +#endif
+ +
+ +/*
+ + * cmpxchg_double replaces two adjacent scalars at once.  The first
+ + * two parameters are per cpu variables which have to be of the same
+ + * size.  A truth value is returned to indicate success or failure
+ + * (since a double register result is difficult to handle).  There is
+ + * very limited hardware support for these operations, so only certain
+ + * sizes may work.
+ + */
+ +#define _this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +({									\
+ +	int ret__;							\
+ +	unsigned long flags;						\
+ +	raw_local_irq_save(flags);					\
+ +	ret__ = __this_cpu_generic_cmpxchg_double(pcp1, pcp2,		\
+ +			oval1, oval2, nval1, nval2);			\
+ +	raw_local_irq_restore(flags);					\
+ +	ret__;								\
+ +})
+ +
+ +#ifndef this_cpu_cmpxchg_double
+ +# ifndef this_cpu_cmpxchg_double_1
+ +#  define this_cpu_cmpxchg_double_1(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	_this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# ifndef this_cpu_cmpxchg_double_2
+ +#  define this_cpu_cmpxchg_double_2(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	_this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# ifndef this_cpu_cmpxchg_double_4
+ +#  define this_cpu_cmpxchg_double_4(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	_this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# ifndef this_cpu_cmpxchg_double_8
+ +#  define this_cpu_cmpxchg_double_8(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	_this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# define this_cpu_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	__pcpu_double_call_return_bool(this_cpu_cmpxchg_double_, (pcp1), (pcp2), (oval1), (oval2), (nval1), (nval2))
+ +#endif
+ +
+ +/*
+ + * Generic percpu operations for context that are safe from preemption/interrupts.
+ + * Either we do not care about races or the caller has the
+ + * responsibility of handling preemption/interrupt issues. Arch code can still
+ + * override these instructions since the arch per cpu code may be more
+ + * efficient and may actually get race freeness for free (that is the
+ + * case for x86 for example).
+ + *
+ + * If there is no other protection through preempt disable and/or
+ + * disabling interupts then one of these RMW operations can show unexpected
+ + * behavior because the execution thread was rescheduled on another processor
+ + * or an interrupt occurred and the same percpu variable was modified from
+ + * the interrupt context.
+ + */
+ +#ifndef __this_cpu_read
+ +# ifndef __this_cpu_read_1
+ +#  define __this_cpu_read_1(pcp)	(*__this_cpu_ptr(&(pcp)))
+ +# endif
+ +# ifndef __this_cpu_read_2
+ +#  define __this_cpu_read_2(pcp)	(*__this_cpu_ptr(&(pcp)))
+ +# endif
+ +# ifndef __this_cpu_read_4
+ +#  define __this_cpu_read_4(pcp)	(*__this_cpu_ptr(&(pcp)))
+ +# endif
+ +# ifndef __this_cpu_read_8
+ +#  define __this_cpu_read_8(pcp)	(*__this_cpu_ptr(&(pcp)))
+ +# endif
+ +# define __this_cpu_read(pcp)	__pcpu_size_call_return(__this_cpu_read_, (pcp))
+ +#endif
+ +
+ +#define __this_cpu_generic_to_op(pcp, val, op)				\
+ +do {									\
+ +	*__this_cpu_ptr(&(pcp)) op val;					\
+ +} while (0)
+ +
+ +#ifndef __this_cpu_write
+ +# ifndef __this_cpu_write_1
+ +#  define __this_cpu_write_1(pcp, val)	__this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# ifndef __this_cpu_write_2
+ +#  define __this_cpu_write_2(pcp, val)	__this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# ifndef __this_cpu_write_4
+ +#  define __this_cpu_write_4(pcp, val)	__this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# ifndef __this_cpu_write_8
+ +#  define __this_cpu_write_8(pcp, val)	__this_cpu_generic_to_op((pcp), (val), =)
+ +# endif
+ +# define __this_cpu_write(pcp, val)	__pcpu_size_call(__this_cpu_write_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef __this_cpu_add
+ +# ifndef __this_cpu_add_1
+ +#  define __this_cpu_add_1(pcp, val)	__this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# ifndef __this_cpu_add_2
+ +#  define __this_cpu_add_2(pcp, val)	__this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# ifndef __this_cpu_add_4
+ +#  define __this_cpu_add_4(pcp, val)	__this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# ifndef __this_cpu_add_8
+ +#  define __this_cpu_add_8(pcp, val)	__this_cpu_generic_to_op((pcp), (val), +=)
+ +# endif
+ +# define __this_cpu_add(pcp, val)	__pcpu_size_call(__this_cpu_add_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef __this_cpu_sub
+ +# define __this_cpu_sub(pcp, val)	__this_cpu_add((pcp), -(val))
+ +#endif
+ +
+ +#ifndef __this_cpu_inc
+ +# define __this_cpu_inc(pcp)		__this_cpu_add((pcp), 1)
+ +#endif
+ +
+ +#ifndef __this_cpu_dec
+ +# define __this_cpu_dec(pcp)		__this_cpu_sub((pcp), 1)
+ +#endif
+ +
+ +#ifndef __this_cpu_and
+ +# ifndef __this_cpu_and_1
+ +#  define __this_cpu_and_1(pcp, val)	__this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# ifndef __this_cpu_and_2
+ +#  define __this_cpu_and_2(pcp, val)	__this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# ifndef __this_cpu_and_4
+ +#  define __this_cpu_and_4(pcp, val)	__this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# ifndef __this_cpu_and_8
+ +#  define __this_cpu_and_8(pcp, val)	__this_cpu_generic_to_op((pcp), (val), &=)
+ +# endif
+ +# define __this_cpu_and(pcp, val)	__pcpu_size_call(__this_cpu_and_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef __this_cpu_or
+ +# ifndef __this_cpu_or_1
+ +#  define __this_cpu_or_1(pcp, val)	__this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# ifndef __this_cpu_or_2
+ +#  define __this_cpu_or_2(pcp, val)	__this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# ifndef __this_cpu_or_4
+ +#  define __this_cpu_or_4(pcp, val)	__this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# ifndef __this_cpu_or_8
+ +#  define __this_cpu_or_8(pcp, val)	__this_cpu_generic_to_op((pcp), (val), |=)
+ +# endif
+ +# define __this_cpu_or(pcp, val)	__pcpu_size_call(__this_cpu_or_, (pcp), (val))
+ +#endif
+ +
+ +#ifndef __this_cpu_xor
+ +# ifndef __this_cpu_xor_1
+ +#  define __this_cpu_xor_1(pcp, val)	__this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# ifndef __this_cpu_xor_2
+ +#  define __this_cpu_xor_2(pcp, val)	__this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# ifndef __this_cpu_xor_4
+ +#  define __this_cpu_xor_4(pcp, val)	__this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# ifndef __this_cpu_xor_8
+ +#  define __this_cpu_xor_8(pcp, val)	__this_cpu_generic_to_op((pcp), (val), ^=)
+ +# endif
+ +# define __this_cpu_xor(pcp, val)	__pcpu_size_call(__this_cpu_xor_, (pcp), (val))
+ +#endif
+ +
+ +#define __this_cpu_generic_add_return(pcp, val)				\
+ +({									\
+ +	__this_cpu_add(pcp, val);					\
+ +	__this_cpu_read(pcp);						\
+ +})
+ +
+ +#ifndef __this_cpu_add_return
+ +# ifndef __this_cpu_add_return_1
+ +#  define __this_cpu_add_return_1(pcp, val)	__this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# ifndef __this_cpu_add_return_2
+ +#  define __this_cpu_add_return_2(pcp, val)	__this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# ifndef __this_cpu_add_return_4
+ +#  define __this_cpu_add_return_4(pcp, val)	__this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# ifndef __this_cpu_add_return_8
+ +#  define __this_cpu_add_return_8(pcp, val)	__this_cpu_generic_add_return(pcp, val)
+ +# endif
+ +# define __this_cpu_add_return(pcp, val)	\
+ +	__pcpu_size_call_return2(__this_cpu_add_return_, pcp, val)
+ +#endif
+ +
+ +#define __this_cpu_sub_return(pcp, val)	__this_cpu_add_return(pcp, -(val))
+ +#define __this_cpu_inc_return(pcp)	__this_cpu_add_return(pcp, 1)
+ +#define __this_cpu_dec_return(pcp)	__this_cpu_add_return(pcp, -1)
+ +
+ +#define __this_cpu_generic_xchg(pcp, nval)				\
+ +({	typeof(pcp) ret__;						\
+ +	ret__ = __this_cpu_read(pcp);					\
+ +	__this_cpu_write(pcp, nval);					\
+ +	ret__;								\
+ +})
+ +
+ +#ifndef __this_cpu_xchg
+ +# ifndef __this_cpu_xchg_1
+ +#  define __this_cpu_xchg_1(pcp, nval)	__this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# ifndef __this_cpu_xchg_2
+ +#  define __this_cpu_xchg_2(pcp, nval)	__this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# ifndef __this_cpu_xchg_4
+ +#  define __this_cpu_xchg_4(pcp, nval)	__this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# ifndef __this_cpu_xchg_8
+ +#  define __this_cpu_xchg_8(pcp, nval)	__this_cpu_generic_xchg(pcp, nval)
+ +# endif
+ +# define __this_cpu_xchg(pcp, nval)	\
+ +	__pcpu_size_call_return2(__this_cpu_xchg_, (pcp), nval)
+ +#endif
+ +
+ +#define __this_cpu_generic_cmpxchg(pcp, oval, nval)			\
+ +({									\
+ +	typeof(pcp) ret__;						\
+ +	ret__ = __this_cpu_read(pcp);					\
+ +	if (ret__ == (oval))						\
+ +		__this_cpu_write(pcp, nval);				\
+ +	ret__;								\
+ +})
+ +
+ +#ifndef __this_cpu_cmpxchg
+ +# ifndef __this_cpu_cmpxchg_1
+ +#  define __this_cpu_cmpxchg_1(pcp, oval, nval)	__this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# ifndef __this_cpu_cmpxchg_2
+ +#  define __this_cpu_cmpxchg_2(pcp, oval, nval)	__this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# ifndef __this_cpu_cmpxchg_4
+ +#  define __this_cpu_cmpxchg_4(pcp, oval, nval)	__this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# ifndef __this_cpu_cmpxchg_8
+ +#  define __this_cpu_cmpxchg_8(pcp, oval, nval)	__this_cpu_generic_cmpxchg(pcp, oval, nval)
+ +# endif
+ +# define __this_cpu_cmpxchg(pcp, oval, nval)	\
+ +	__pcpu_size_call_return2(__this_cpu_cmpxchg_, pcp, oval, nval)
+ +#endif
+ +
+ +#define __this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +({									\
+ +	int __ret = 0;							\
+ +	if (__this_cpu_read(pcp1) == (oval1) &&				\
+ +			 __this_cpu_read(pcp2)  == (oval2)) {		\
+ +		__this_cpu_write(pcp1, (nval1));			\
+ +		__this_cpu_write(pcp2, (nval2));			\
+ +		__ret = 1;						\
+ +	}								\
+ +	(__ret);							\
+ +})
+ +
+ +#ifndef __this_cpu_cmpxchg_double
+ +# ifndef __this_cpu_cmpxchg_double_1
+ +#  define __this_cpu_cmpxchg_double_1(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	__this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# ifndef __this_cpu_cmpxchg_double_2
+ +#  define __this_cpu_cmpxchg_double_2(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	__this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# ifndef __this_cpu_cmpxchg_double_4
+ +#  define __this_cpu_cmpxchg_double_4(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	__this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# ifndef __this_cpu_cmpxchg_double_8
+ +#  define __this_cpu_cmpxchg_double_8(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	__this_cpu_generic_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+ +# endif
+ +# define __this_cpu_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)	\
+ +	__pcpu_double_call_return_bool(__this_cpu_cmpxchg_double_, (pcp1), (pcp2), (oval1), (oval2), (nval1), (nval2))
+ +#endif
+++=======
++ /* To avoid include hell, as printk can not declare this, we declare it here */
++ DECLARE_PER_CPU(printk_func_t, printk_func);
+++>>>>>>> afdc34a3d3b8 (printk: Add per_cpu printk func to allow printk to be diverted)
+  
+  #endif /* __LINUX_PERCPU_H */
+* Unmerged path include/linux/percpu.h
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index 2deb0b0f3cd4..e54f636a0f16 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -147,6 +147,8 @@ extern int kptr_restrict;
+ 
+ extern void wake_up_klogd(void);
+ 
++typedef int(*printk_func_t)(const char *fmt, va_list args);
++
+ void log_buf_kexec_setup(void);
+ void __init setup_log_buf(int early);
+ void dump_stack_set_arch_desc(const char *fmt, ...);
+diff --git a/kernel/printk.c b/kernel/printk.c
+index 6881a4f0352d..f38793938e35 100644
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@ -1669,6 +1669,30 @@ asmlinkage int printk_emit(int facility, int level,
+ }
+ EXPORT_SYMBOL(printk_emit);
+ 
++int vprintk_default(const char *fmt, va_list args)
++{
++	int r;
++
++#ifdef CONFIG_KGDB_KDB
++	if (unlikely(kdb_trap_printk)) {
++		r = vkdb_printf(fmt, args);
++		return r;
++	}
++#endif
++	r = vprintk_emit(0, -1, NULL, 0, fmt, args);
++
++	return r;
++}
++EXPORT_SYMBOL_GPL(vprintk_default);
++
++/*
++ * This allows printk to be diverted to another function per cpu.
++ * This is useful for calling printk functions from within NMI
++ * without worrying about race conditions that can lock up the
++ * box.
++ */
++DEFINE_PER_CPU(printk_func_t, printk_func) = vprintk_default;
++
+ /**
+  * printk - print a kernel message
+  * @fmt: format string
+@@ -1692,19 +1716,15 @@ EXPORT_SYMBOL(printk_emit);
+  */
+ asmlinkage int printk(const char *fmt, ...)
+ {
++	printk_func_t vprintk_func;
+ 	va_list args;
+ 	int r;
+ 
+-#ifdef CONFIG_KGDB_KDB
+-	if (unlikely(kdb_trap_printk)) {
+-		va_start(args, fmt);
+-		r = vkdb_printf(fmt, args);
+-		va_end(args);
+-		return r;
+-	}
+-#endif
+ 	va_start(args, fmt);
+-	r = vprintk_emit(0, -1, NULL, 0, fmt, args);
++	preempt_disable();
++	vprintk_func = this_cpu_read(printk_func);
++	r = vprintk_func(fmt, args);
++	preempt_enable();
+ 	va_end(args);
+ 
+ 	return r;
