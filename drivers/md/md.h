@@ -446,13 +446,6 @@ struct mddev {
 };
 
 
-static inline void rdev_dec_pending(struct md_rdev *rdev, struct mddev *mddev)
-{
-	int faulty = test_bit(Faulty, &rdev->flags);
-	if (atomic_dec_and_test(&rdev->nr_pending) && faulty)
-		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
-}
-
 static inline void md_sync_acct(struct block_device *bdev, unsigned long nr_sectors)
 {
         atomic_add(nr_sectors, &bdev->bd_contains->bd_disk->sync_io);
@@ -639,4 +632,14 @@ static inline int mddev_check_plugged(struct mddev *mddev)
 	return !!blk_check_plugged(md_unplug, mddev,
 				   sizeof(struct blk_plug_cb));
 }
+
+static inline void rdev_dec_pending(struct md_rdev *rdev, struct mddev *mddev)
+{
+	int faulty = test_bit(Faulty, &rdev->flags);
+	if (atomic_dec_and_test(&rdev->nr_pending) && faulty) {
+		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+		md_wakeup_thread(mddev->thread);
+	}
+}
+
 #endif /* _MD_MD_H */
