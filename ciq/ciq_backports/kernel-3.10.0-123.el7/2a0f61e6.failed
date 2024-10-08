@@ -1,0 +1,81 @@
+blk-throttle: set REQ_THROTTLED from throtl_charge_bio() and gate stats update with it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 2a0f61e6ecd08d260054bde4b096ff207ce5350f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/2a0f61e6.failed
+
+With proper hierarchy support, a bio can be dispatched multiple times
+until it reaches the top-level service_queue and we don't want to
+update dispatch stats at each step.  They are local stats and will be
+kept local.  If recursive stats are necessary, they should be
+implemented separately and definitely not by updating counters
+recursively on each dispatch.
+
+This patch moves REQ_THROTTLED setting to throtl_charge_bio() and gate
+stats update with it so that dispatch stats are updated only on the
+first time the bio is charged to a throtl_grp, which will always be
+the throtl_grp the bio was originally queued to.
+
+This means that REQ_THROTTLED would be set even for bios which don't
+get throttled.  As we don't want bios to leave blk-throtl with the
+flag set, move REQ_THROTLLED clearing to the end of blk_throtl_bio()
+and clear if the bio is being issued directly.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Vivek Goyal <vgoyal@redhat.com>
+(cherry picked from commit 2a0f61e6ecd08d260054bde4b096ff207ce5350f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-throttle.c
+diff --cc block/blk-throttle.c
+index e65e45a33372,420eaa150d11..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -704,11 -757,25 +704,26 @@@ static void throtl_charge_bio(struct th
+  	tg->bytes_disp[rw] += bio->bi_size;
+  	tg->io_disp[rw]++;
+  
+- 	throtl_update_dispatch_stats(tg_to_blkg(tg), bio->bi_size, bio->bi_rw);
++ 	/*
++ 	 * REQ_THROTTLED is used to prevent the same bio to be throttled
++ 	 * more than once as a throttled bio will go through blk-throtl the
++ 	 * second time when it eventually gets issued.  Set it when a bio
++ 	 * is being charged to a tg.
++ 	 *
++ 	 * Dispatch stats aren't recursive and each @bio should only be
++ 	 * accounted by the @tg it was originally associated with.  Let's
++ 	 * update the stats when setting REQ_THROTTLED for the first time
++ 	 * which is guaranteed to be for the @bio's original tg.
++ 	 */
++ 	if (!(bio->bi_rw & REQ_THROTTLED)) {
++ 		bio->bi_rw |= REQ_THROTTLED;
++ 		throtl_update_dispatch_stats(tg_to_blkg(tg), bio->bi_size,
++ 					     bio->bi_rw);
++ 	}
+  }
+  
+ -static void throtl_add_bio_tg(struct bio *bio, struct throtl_grp *tg)
+ +static void throtl_add_bio_tg(struct bio *bio, struct throtl_grp *tg,
+ +			      struct throtl_service_queue *parent_sq)
+  {
+  	struct throtl_service_queue *sq = &tg->service_queue;
+  	bool rw = bio_data_dir(bio);
+@@@ -770,8 -835,7 +785,12 @@@ static void tg_dispatch_one_bio(struct 
+  	tg->td->nr_queued[rw]--;
+  
+  	throtl_charge_bio(tg, bio);
+++<<<<<<< HEAD
+ +	bio_list_add(bl, bio);
+ +	bio->bi_rw |= REQ_THROTTLED;
+++=======
++ 	bio_list_add(&sq->parent_sq->bio_lists[rw], bio);
+++>>>>>>> 2a0f61e6ecd0 (blk-throttle: set REQ_THROTTLED from throtl_charge_bio() and gate stats update with it)
+  
+  	throtl_trim_slice(tg, rw);
+  }
+* Unmerged path block/blk-throttle.c
