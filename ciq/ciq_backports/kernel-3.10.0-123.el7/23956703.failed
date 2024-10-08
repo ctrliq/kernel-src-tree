@@ -1,0 +1,95 @@
+xfs: inode log reservations are too small
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 239567033c38933c4d6f402f9f8a2126df73e4c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/23956703.failed
+
+We've been seeing occasional problems with log space leaks and
+transaction underruns such as this for some time:
+
+ XFS (dm-0): xlog_write: reservation summary:
+   trans type  = FSYNC_TS (36)
+   unit res    = 2740 bytes
+   current res = -4 bytes
+   total reg   = 0 bytes (o/flow = 0 bytes)
+   ophdrs      = 0 (ophdr space = 0 bytes)
+   ophdr + reg = 0 bytes
+   num regions = 0
+
+Turns out that xfstests generic/311 is reliably reproducing this
+problem with the test it runs at sequence 16 of it execution. It is
+a 100% reliable reproducer with the mkfs configuration of "-b
+size=1024 -m crc=1" on a 10GB scratch device.
+
+The problem? Inode forks in btree format are logged in memory
+format, not disk format (i.e. bmbt format, not bmdr format). That
+means there is a btree block header being logged, when such a
+structure is never written to the inode fork in bmdr format. The
+bmdr header in the inode is only 4 bytes, while the bmbt header is
+24 bytes for v4 filesystems and 72 bytes for v5 filesystems.
+
+We currently reserve the inode size plus the rounded up overhead of
+a logging a buffer, which is 128 bytes. That means the reservation
+for a 512 byte inode is 640 bytes. What we can actually log is:
+
+	inode core, data and attr fork = 512 bytes
+	inode log format + log op header = 56 + 12 = 68 bytes
+	data fork bmbt hdr = 24/72 bytes
+	attr fork bmbt hdr = 24/72 bytes
+
+So, for a v2 inodes we can log at least 628 bytes, but if we split that
+inode over the end of the log across log buffers, we need to also
+another log op header, which takes us to 640 bytes. If there's
+another reservation taken out of this that I haven't taken into
+account (perhaps multiple iclog splits?) or I haven't corectly
+calculated the bmbt format space used (entirely possible), then
+we will overun it.
+
+For v3 inodes the maximum is actually 724 bytes, and even a
+single maximally sized btree format fork can blow it (652 bytes).
+And that's exactly what is happening with the FSYNC_TS transaction
+in the above output - it's consumed 644 bytes of space after the CIL
+context took the space reserved for it (2100 bytes).
+
+This problem has always been present in the XFS code - the btree
+format inode forks have always been logged in this manner. Hence
+there has always been the possibility of an overrun with such a
+transaction. The CRC code has just exposed it frequently enough to
+be able to debug and understand the root cause....
+
+So, let's fix all the inode log space reservations.
+
+[ I'm so glad we spent the effort to clean up the transaction
+  reservation code. This is an easy fix now. ]
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Mark Tinguely <tinguely@sgi.com>
+	Signed-off-by: Ben Myers <bpm@sgi.com>
+
+(cherry picked from commit 239567033c38933c4d6f402f9f8a2126df73e4c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans_resv.c
+diff --cc fs/xfs/xfs_trans_resv.c
+index e9211add5183,a65a3cc40610..000000000000
+--- a/fs/xfs/xfs_trans_resv.c
++++ b/fs/xfs/xfs_trans_resv.c
+@@@ -626,7 -660,8 +659,12 @@@ STATIC uin
+  xfs_calc_qm_dqalloc_reservation(
+  	struct xfs_mount	*mp)
+  {
+++<<<<<<< HEAD
+ +	return XFS_WRITE_LOG_RES(mp) +
+++=======
++ 	ASSERT(M_RES(mp)->tr_write.tr_logres);
++ 	return M_RES(mp)->tr_write.tr_logres +
+++>>>>>>> 239567033c38 (xfs: inode log reservations are too small)
+  		xfs_calc_buf_res(1,
+  			XFS_FSB_TO_B(mp, XFS_DQUOT_CLUSTER_SIZE_FSB) - 1);
+  }
+* Unmerged path fs/xfs/xfs_trans_resv.c
