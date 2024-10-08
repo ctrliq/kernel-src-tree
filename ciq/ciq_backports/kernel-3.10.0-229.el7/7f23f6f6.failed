@@ -1,0 +1,222 @@
+xprtrmda: Reduce lock contention in completion handlers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] sunrpc/xprtrdma: Reduce lock contention in completion handlers (Steve Dickson) [1113248]
+Rebuild_FUZZ: 92.31%
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 7f23f6f6e388d2003c4ecf5d558f3c2191e12530
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/7f23f6f6.failed
+
+Skip the ib_poll_cq() after re-arming, if the provider knows there
+are no additional items waiting. (Have a look at commit ed23a727 for
+more details).
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 7f23f6f6e388d2003c4ecf5d558f3c2191e12530)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 871eaa4ede37,c7d5281063fd..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -142,74 -142,106 +142,142 @@@ rpcrdma_cq_async_error_upcall(struct ib
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +void rpcrdma_event_process(struct ib_wc *wc)
+++=======
++ static void
++ rpcrdma_sendcq_process_wc(struct ib_wc *wc)
++ {
++ 	struct rpcrdma_mw *frmr = (struct rpcrdma_mw *)(unsigned long)wc->wr_id;
++ 
++ 	dprintk("RPC:       %s: frmr %p status %X opcode %d\n",
++ 		__func__, frmr, wc->status, wc->opcode);
++ 
++ 	if (wc->wr_id == 0ULL)
++ 		return;
++ 	if (wc->status != IB_WC_SUCCESS)
++ 		return;
++ 
++ 	if (wc->opcode == IB_WC_FAST_REG_MR)
++ 		frmr->r.frmr.state = FRMR_IS_VALID;
++ 	else if (wc->opcode == IB_WC_LOCAL_INV)
++ 		frmr->r.frmr.state = FRMR_IS_INVALID;
++ }
++ 
++ static int
++ rpcrdma_sendcq_poll(struct ib_cq *cq)
++ {
++ 	struct ib_wc wc;
++ 	int rc;
++ 
++ 	while ((rc = ib_poll_cq(cq, 1, &wc)) == 1)
++ 		rpcrdma_sendcq_process_wc(&wc);
++ 	return rc;
++ }
++ 
++ /*
++  * Handle send, fast_reg_mr, and local_inv completions.
++  *
++  * Send events are typically suppressed and thus do not result
++  * in an upcall. Occasionally one is signaled, however. This
++  * prevents the provider's completion queue from wrapping and
++  * losing a completion.
++  */
++ static void
++ rpcrdma_sendcq_upcall(struct ib_cq *cq, void *cq_context)
++ {
++ 	int rc;
++ 
++ 	rc = rpcrdma_sendcq_poll(cq);
++ 	if (rc) {
++ 		dprintk("RPC:       %s: ib_poll_cq failed: %i\n",
++ 			__func__, rc);
++ 		return;
++ 	}
++ 
++ 	rc = ib_req_notify_cq(cq,
++ 			IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS);
++ 	if (rc == 0)
++ 		return;
++ 	if (rc < 0) {
++ 		dprintk("RPC:       %s: ib_req_notify_cq failed: %i\n",
++ 			__func__, rc);
++ 		return;
++ 	}
++ 
++ 	rpcrdma_sendcq_poll(cq);
++ }
++ 
++ static void
++ rpcrdma_recvcq_process_wc(struct ib_wc *wc)
+++>>>>>>> 7f23f6f6e388 (xprtrmda: Reduce lock contention in completion handlers)
+  {
+ +	struct rpcrdma_mw *frmr;
+  	struct rpcrdma_rep *rep =
+ -			(struct rpcrdma_rep *)(unsigned long)wc->wr_id;
+ +			(struct rpcrdma_rep *)(unsigned long) wc->wr_id;
+  
+ -	dprintk("RPC:       %s: rep %p status %X opcode %X length %u\n",
+ +	dprintk("RPC:       %s: event rep %p status %X opcode %X length %u\n",
+  		__func__, rep, wc->status, wc->opcode, wc->byte_len);
+  
+ -	if (wc->status != IB_WC_SUCCESS) {
+ +	if (!rep) /* send or bind completion that we don't care about */
+ +		return;
+ +
+ +	if (IB_WC_SUCCESS != wc->status) {
+ +		dprintk("RPC:       %s: WC opcode %d status %X, connection lost\n",
+ +			__func__, wc->opcode, wc->status);
+  		rep->rr_len = ~0U;
+ -		goto out_schedule;
+ -	}
+ -	if (wc->opcode != IB_WC_RECV)
+ +		if (wc->opcode != IB_WC_FAST_REG_MR && wc->opcode != IB_WC_LOCAL_INV)
+ +			rpcrdma_schedule_tasklet(rep);
+  		return;
+ +	}
+  
+ -	rep->rr_len = wc->byte_len;
+ -	ib_dma_sync_single_for_cpu(rdmab_to_ia(rep->rr_buffer)->ri_id->device,
+ +	switch (wc->opcode) {
+ +	case IB_WC_FAST_REG_MR:
+ +		frmr = (struct rpcrdma_mw *)(unsigned long)wc->wr_id;
+ +		frmr->r.frmr.state = FRMR_IS_VALID;
+ +		break;
+ +	case IB_WC_LOCAL_INV:
+ +		frmr = (struct rpcrdma_mw *)(unsigned long)wc->wr_id;
+ +		frmr->r.frmr.state = FRMR_IS_INVALID;
+ +		break;
+ +	case IB_WC_RECV:
+ +		rep->rr_len = wc->byte_len;
+ +		ib_dma_sync_single_for_cpu(
+ +			rdmab_to_ia(rep->rr_buffer)->ri_id->device,
+  			rep->rr_iov.addr, rep->rr_len, DMA_FROM_DEVICE);
+ -
+ -	if (rep->rr_len >= 16) {
+ -		struct rpcrdma_msg *p = (struct rpcrdma_msg *)rep->rr_base;
+ -		unsigned int credits = ntohl(p->rm_credit);
+ -
+ -		if (credits == 0)
+ -			credits = 1;	/* don't deadlock */
+ -		else if (credits > rep->rr_buffer->rb_max_requests)
+ -			credits = rep->rr_buffer->rb_max_requests;
+ -		atomic_set(&rep->rr_buffer->rb_credits, credits);
+ +		/* Keep (only) the most recent credits, after check validity */
+ +		if (rep->rr_len >= 16) {
+ +			struct rpcrdma_msg *p =
+ +					(struct rpcrdma_msg *) rep->rr_base;
+ +			unsigned int credits = ntohl(p->rm_credit);
+ +			if (credits == 0) {
+ +				dprintk("RPC:       %s: server"
+ +					" dropped credits to 0!\n", __func__);
+ +				/* don't deadlock */
+ +				credits = 1;
+ +			} else if (credits > rep->rr_buffer->rb_max_requests) {
+ +				dprintk("RPC:       %s: server"
+ +					" over-crediting: %d (%d)\n",
+ +					__func__, credits,
+ +					rep->rr_buffer->rb_max_requests);
+ +				credits = rep->rr_buffer->rb_max_requests;
+ +			}
+ +			atomic_set(&rep->rr_buffer->rb_credits, credits);
+ +		}
+ +		/* fall through */
+ +	case IB_WC_BIND_MW:
+ +		rpcrdma_schedule_tasklet(rep);
+ +		break;
+ +	default:
+ +		dprintk("RPC:       %s: unexpected WC event %X\n",
+ +			__func__, wc->opcode);
+ +		break;
+  	}
+ -
+ -out_schedule:
+ -	rpcrdma_schedule_tasklet(rep);
+  }
+  
+ -static int
+ -rpcrdma_recvcq_poll(struct ib_cq *cq)
+ +static inline int
+ +rpcrdma_cq_poll(struct ib_cq *cq)
+  {
+  	struct ib_wc wc;
+  	int rc;
+@@@ -250,13 -268,19 +318,22 @@@ rpcrdma_cq_event_upcall(struct ib_cq *c
+  {
+  	int rc;
+  
+ -	rc = rpcrdma_recvcq_poll(cq);
+ -	if (rc) {
+ -		dprintk("RPC:       %s: ib_poll_cq failed: %i\n",
+ -			__func__, rc);
+ +	rc = rpcrdma_cq_poll(cq);
+ +	if (rc)
+  		return;
+ -	}
+  
+++<<<<<<< HEAD
+ +	rc = ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+ +	if (rc) {
+ +		dprintk("RPC:       %s: ib_req_notify_cq failed %i\n",
+++=======
++ 	rc = ib_req_notify_cq(cq,
++ 			IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS);
++ 	if (rc == 0)
++ 		return;
++ 	if (rc < 0) {
++ 		dprintk("RPC:       %s: ib_req_notify_cq failed: %i\n",
+++>>>>>>> 7f23f6f6e388 (xprtrmda: Reduce lock contention in completion handlers)
+  			__func__, rc);
+  		return;
+  	}
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
