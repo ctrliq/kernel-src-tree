@@ -1,0 +1,104 @@
+GFS2: Fix uninitialized VFS inode in gfs2_create_inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Abhi Das <adas@redhat.com>
+commit 059788039f1e6343f34f46d202f8d9f2158c2783
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/05978803.failed
+
+When gfs2_create_inode() fails due to quota violation, the VFS
+inode is not completely uninitialized. This can cause a list
+corruption error.
+
+This patch correctly uninitializes the VFS inode when a quota
+violation occurs in the gfs2_create_inode codepath.
+
+Resolves: rhbz#1059808
+	Signed-off-by: Abhi Das <adas@redhat.com>
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+(cherry picked from commit 059788039f1e6343f34f46d202f8d9f2158c2783)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/inode.c
+diff --cc fs/gfs2/inode.c
+index 3922571e7f44,28cc7bf6575a..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -558,9 -597,10 +558,9 @@@ static int gfs2_create_inode(struct ino
+  	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
+  	struct gfs2_glock *io_gl;
+  	struct dentry *d;
+- 	int error;
++ 	int error, free_vfs_inode = 0;
+  	u32 aflags = 0;
+ -	unsigned blocks = 1;
+ -	struct gfs2_diradd da = { .bh = NULL, };
+ +	int arq;
+  
+  	if (!name->len || name->len > GFS2_FNAMESIZE)
+  		return -ENAMETOOLONG;
+@@@ -715,10 -781,16 +715,21 @@@ fail_gunlock2
+  fail_free_inode:
+  	if (ip->i_gl)
+  		gfs2_glock_put(ip->i_gl);
+++<<<<<<< HEAD
+ +	gfs2_rs_delete(ip);
+ +	free_inode_nonrcu(inode);
+ +	inode = NULL;
+++=======
++ 	gfs2_rs_delete(ip, NULL);
++ fail_free_acls:
++ 	if (default_acl)
++ 		posix_acl_release(default_acl);
++ 	if (acl)
++ 		posix_acl_release(acl);
++ fail_free_vfs_inode:
++ 	free_vfs_inode = 1;
+++>>>>>>> 059788039f1e (GFS2: Fix uninitialized VFS inode in gfs2_create_inode)
+  fail_gunlock:
+ -	gfs2_dir_no_add(&da);
+  	gfs2_glock_dq_uninit(ghs);
+  	if (inode && !IS_ERR(inode)) {
+  		clear_nlink(inode);
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index e371cf73e9b8..90b0773ddf40 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -355,6 +355,7 @@ enum {
+ 	GIF_ALLOC_FAILED	= 2,
+ 	GIF_SW_PAGED		= 3,
+ 	GIF_ORDERED		= 4,
++	GIF_FREE_VFS_INODE      = 5,
+ };
+ 
+ struct gfs2_inode {
+* Unmerged path fs/gfs2/inode.c
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index ac96a99c0e5d..d8e31f9df7db 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1223,7 +1223,7 @@ static int gfs2_drop_inode(struct inode *inode)
+ {
+ 	struct gfs2_inode *ip = GFS2_I(inode);
+ 
+-	if (inode->i_nlink) {
++	if (!test_bit(GIF_FREE_VFS_INODE, &ip->i_flags) && inode->i_nlink) {
+ 		struct gfs2_glock *gl = ip->i_iopen_gh.gh_gl;
+ 		if (gl && test_bit(GLF_DEMOTE, &gl->gl_flags))
+ 			clear_nlink(inode);
+@@ -1438,6 +1438,11 @@ static void gfs2_evict_inode(struct inode *inode)
+ 	struct gfs2_holder gh;
+ 	int error;
+ 
++	if (test_bit(GIF_FREE_VFS_INODE, &ip->i_flags)) {
++		clear_inode(inode);
++		return;
++	}
++
+ 	if (inode->i_nlink || (sb->s_flags & MS_RDONLY))
+ 		goto out;
+ 
