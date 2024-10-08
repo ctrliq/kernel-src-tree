@@ -1,0 +1,117 @@
+rcu: Protect uses of jiffies_stall field with ACCESS_ONCE()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Iulia Manda <iulia.manda21@gmail.com>
+commit 4fc5b75537d4f56577ad00355b4cd09627deb3c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4fc5b755.failed
+
+Some of the uses of the rcu_state structure's ->jiffies_stall field
+do not use ACCESS_ONCE(), despite there being unprotected accesses.
+This commit therefore uses the ACCESS_ONCE() macro to protect this field.
+
+	Signed-off-by: Iulia Manda <iulia.manda21@gmail.com>
+	Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+(cherry picked from commit 4fc5b75537d4f56577ad00355b4cd09627deb3c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcutree.c
+diff --cc kernel/rcutree.c
+index bba581a56b22,c624415f8386..000000000000
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@@ -827,8 -859,14 +827,19 @@@ static int rcu_implicit_dynticks_qs(str
+  
+  static void record_gp_stall_check_time(struct rcu_state *rsp)
+  {
+++<<<<<<< HEAD:kernel/rcutree.c
+ +	rsp->gp_start = jiffies;
+ +	rsp->jiffies_stall = jiffies + rcu_jiffies_till_stall_check();
+++=======
++ 	unsigned long j = jiffies;
++ 	unsigned long j1;
++ 
++ 	rsp->gp_start = j;
++ 	smp_wmb(); /* Record start time before stall time. */
++ 	j1 = rcu_jiffies_till_stall_check();
++ 	ACCESS_ONCE(rsp->jiffies_stall) = j + j1;
++ 	rsp->jiffies_resched = j + j1 / 2;
+++>>>>>>> 4fc5b75537d4 (rcu: Protect uses of jiffies_stall field with ACCESS_ONCE()):kernel/rcu/tree.c
+  }
+  
+  /*
+@@@ -995,68 -1077,9 +1006,68 @@@ void rcu_cpu_stall_reset(void
+  	struct rcu_state *rsp;
+  
+  	for_each_rcu_flavor(rsp)
+- 		rsp->jiffies_stall = jiffies + ULONG_MAX / 2;
++ 		ACCESS_ONCE(rsp->jiffies_stall) = jiffies + ULONG_MAX / 2;
+  }
+  
+ +/*
+ + * Update CPU-local rcu_data state to record the newly noticed grace period.
+ + * This is used both when we started the grace period and when we notice
+ + * that someone else started the grace period.  The caller must hold the
+ + * ->lock of the leaf rcu_node structure corresponding to the current CPU,
+ + *  and must have irqs disabled.
+ + */
+ +static void __note_new_gpnum(struct rcu_state *rsp, struct rcu_node *rnp, struct rcu_data *rdp)
+ +{
+ +	if (rdp->gpnum != rnp->gpnum) {
+ +		/*
+ +		 * If the current grace period is waiting for this CPU,
+ +		 * set up to detect a quiescent state, otherwise don't
+ +		 * go looking for one.
+ +		 */
+ +		rdp->gpnum = rnp->gpnum;
+ +		trace_rcu_grace_period(rsp->name, rdp->gpnum, "cpustart");
+ +		rdp->passed_quiesce = 0;
+ +		rdp->qs_pending = !!(rnp->qsmask & rdp->grpmask);
+ +		zero_cpu_stall_ticks(rdp);
+ +	}
+ +}
+ +
+ +static void note_new_gpnum(struct rcu_state *rsp, struct rcu_data *rdp)
+ +{
+ +	unsigned long flags;
+ +	struct rcu_node *rnp;
+ +
+ +	local_irq_save(flags);
+ +	rnp = rdp->mynode;
+ +	if (rdp->gpnum == ACCESS_ONCE(rnp->gpnum) || /* outside lock. */
+ +	    !raw_spin_trylock(&rnp->lock)) { /* irqs already off, so later. */
+ +		local_irq_restore(flags);
+ +		return;
+ +	}
+ +	__note_new_gpnum(rsp, rnp, rdp);
+ +	raw_spin_unlock_irqrestore(&rnp->lock, flags);
+ +}
+ +
+ +/*
+ + * Did someone else start a new RCU grace period start since we last
+ + * checked?  Update local state appropriately if so.  Must be called
+ + * on the CPU corresponding to rdp.
+ + */
+ +static int
+ +check_for_new_grace_period(struct rcu_state *rsp, struct rcu_data *rdp)
+ +{
+ +	unsigned long flags;
+ +	int ret = 0;
+ +
+ +	local_irq_save(flags);
+ +	if (rdp->gpnum != rsp->gpnum) {
+ +		note_new_gpnum(rsp, rdp);
+ +		ret = 1;
+ +	}
+ +	local_irq_restore(flags);
+ +	return ret;
+ +}
+ +
+  /*
+   * Initialize the specified rcu_data structure's callback list to empty.
+   */
+* Unmerged path kernel/rcutree.c
