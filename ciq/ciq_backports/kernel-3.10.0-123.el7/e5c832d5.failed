@@ -1,0 +1,202 @@
+vfs: fix dentry RCU to refcounting possibly sleeping dput()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit e5c832d5558826cc6e9a24746cfdec8e7780063a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/e5c832d5.failed
+
+This is the fix that the last two commits indirectly led up to - making
+sure that we don't call dput() in a bad context on the dentries we've
+looked up in RCU mode after the sequence count validation fails.
+
+This basically expands d_rcu_to_refcount() into the callers, and then
+fixes the callers to delay the dput() in the failure case until _after_
+we've dropped all locks and are no longer in an RCU-locked region.
+
+The case of 'complete_walk()' was trivial, since its failure case did
+the unlock_rcu_walk() directly after the call to d_rcu_to_refcount(),
+and as such that is just a pure expansion of the function with a trivial
+movement of the resulting dput() to after 'unlock_rcu_walk()'.
+
+In contrast, the unlazy_walk() case was much more complicated, because
+not only does convert two different dentries from RCU to be reference
+counted, but it used to not call unlock_rcu_walk() at all, and instead
+just returned an error and let the caller clean everything up in
+"terminate_walk()".
+
+Happily, one of the dentries in question (called "parent" inside
+unlazy_walk()) is the dentry of "nd->path", which terminate_walk() wants
+a refcount to anyway for the non-RCU case.
+
+So what the new and improved unlazy_walk() does is to first turn that
+dentry into a refcounted one, and once that is set up, the error cases
+can continue to use the terminate_walk() helper for cleanup, but for the
+non-RCU case.  Which makes it possible to drop out of RCU mode if we
+actually hit the sequence number failure case.
+
+	Acked-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e5c832d5558826cc6e9a24746cfdec8e7780063a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+diff --cc fs/namei.c
+index b8c893be1266,56e4f4d537d0..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -508,56 -508,75 +508,119 @@@ static int unlazy_walk(struct nameidat
+  {
+  	struct fs_struct *fs = current->fs;
+  	struct dentry *parent = nd->path.dentry;
+- 	int want_root = 0;
+  
+  	BUG_ON(!(nd->flags & LOOKUP_RCU));
+++<<<<<<< HEAD
+ +	if (nd->root.mnt && !(nd->flags & LOOKUP_ROOT)) {
+ +		want_root = 1;
+ +		spin_lock(&fs->lock);
+ +		if (nd->root.mnt != fs->root.mnt ||
+ +				nd->root.dentry != fs->root.dentry)
+ +			goto err_root;
+ +	}
+ +	spin_lock(&parent->d_lock);
+ +	if (!dentry) {
+ +		if (!__d_rcu_to_refcount(parent, nd->seq))
+ +			goto err_parent;
+ +		BUG_ON(nd->inode != parent->d_inode);
+ +	} else {
+ +		if (dentry->d_parent != parent)
+ +			goto err_parent;
+ +		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ +		if (!__d_rcu_to_refcount(dentry, nd->seq))
+ +			goto err_child;
+ +		/*
+ +		 * If the sequence check on the child dentry passed, then
+ +		 * the child has not been removed from its parent. This
+ +		 * means the parent dentry must be valid and able to take
+ +		 * a reference at this point.
+ +		 */
+ +		BUG_ON(!IS_ROOT(dentry) && dentry->d_parent != parent);
+ +		BUG_ON(!parent->d_count);
+ +		parent->d_count++;
+ +		spin_unlock(&dentry->d_lock);
+ +	}
+ +	spin_unlock(&parent->d_lock);
+ +	if (want_root) {
+++=======
++ 
++ 	/*
++ 	 * Get a reference to the parent first: we're
++ 	 * going to make "path_put(nd->path)" valid in
++ 	 * non-RCU context for "terminate_walk()".
++ 	 *
++ 	 * If this doesn't work, return immediately with
++ 	 * RCU walking still active (and then we will do
++ 	 * the RCU walk cleanup in terminate_walk()).
++ 	 */
++ 	if (!lockref_get_not_dead(&parent->d_lockref))
++ 		return -ECHILD;
++ 
++ 	/*
++ 	 * After the mntget(), we terminate_walk() will do
++ 	 * the right thing for non-RCU mode, and all our
++ 	 * subsequent exit cases should unlock_rcu_walk()
++ 	 * before returning.
++ 	 */
++ 	mntget(nd->path.mnt);
++ 	nd->flags &= ~LOOKUP_RCU;
++ 
++ 	/*
++ 	 * For a negative lookup, the lookup sequence point is the parents
++ 	 * sequence point, and it only needs to revalidate the parent dentry.
++ 	 *
++ 	 * For a positive lookup, we need to move both the parent and the
++ 	 * dentry from the RCU domain to be properly refcounted. And the
++ 	 * sequence number in the dentry validates *both* dentry counters,
++ 	 * since we checked the sequence number of the parent after we got
++ 	 * the child sequence number. So we know the parent must still
++ 	 * be valid if the child sequence number is still valid.
++ 	 */
++ 	if (!dentry) {
++ 		if (read_seqcount_retry(&parent->d_seq, nd->seq))
++ 			goto out;
++ 		BUG_ON(nd->inode != parent->d_inode);
++ 	} else {
++ 		if (!lockref_get_not_dead(&dentry->d_lockref))
++ 			goto out;
++ 		if (read_seqcount_retry(&dentry->d_seq, nd->seq))
++ 			goto drop_dentry;
++ 	}
++ 
++ 	/*
++ 	 * Sequence counts matched. Now make sure that the root is
++ 	 * still valid and get it if required.
++ 	 */
++ 	if (nd->root.mnt && !(nd->flags & LOOKUP_ROOT)) {
++ 		spin_lock(&fs->lock);
++ 		if (nd->root.mnt != fs->root.mnt || nd->root.dentry != fs->root.dentry)
++ 			goto unlock_and_drop_dentry;
+++>>>>>>> e5c832d55588 (vfs: fix dentry RCU to refcounting possibly sleeping dput())
+  		path_get(&nd->root);
+  		spin_unlock(&fs->lock);
+  	}
+- 	mntget(nd->path.mnt);
+  
+  	unlock_rcu_walk();
+- 	nd->flags &= ~LOOKUP_RCU;
+  	return 0;
+  
+++<<<<<<< HEAD
+ +err_child:
+ +	spin_unlock(&dentry->d_lock);
+ +err_parent:
+ +	spin_unlock(&parent->d_lock);
+ +err_root:
+ +	if (want_root)
+ +		spin_unlock(&fs->lock);
+++=======
++ unlock_and_drop_dentry:
++ 	spin_unlock(&fs->lock);
++ drop_dentry:
++ 	unlock_rcu_walk();
++ 	dput(dentry);
++ 	return -ECHILD;
++ out:
++ 	unlock_rcu_walk();
+++>>>>>>> e5c832d55588 (vfs: fix dentry RCU to refcounting possibly sleeping dput())
+  	return -ECHILD;
+  }
+  
+@@@ -585,14 -604,16 +648,27 @@@ static int complete_walk(struct nameida
+  		nd->flags &= ~LOOKUP_RCU;
+  		if (!(nd->flags & LOOKUP_ROOT))
+  			nd->root.mnt = NULL;
+++<<<<<<< HEAD
+ +		spin_lock(&dentry->d_lock);
+ +		if (unlikely(!__d_rcu_to_refcount(dentry, nd->seq))) {
+ +			spin_unlock(&dentry->d_lock);
+ +			unlock_rcu_walk();
+ +			return -ECHILD;
+ +		}
+ +		BUG_ON(nd->inode != dentry->d_inode);
+ +		spin_unlock(&dentry->d_lock);
+++=======
++ 
++ 		if (unlikely(!lockref_get_not_dead(&dentry->d_lockref))) {
++ 			unlock_rcu_walk();
++ 			return -ECHILD;
++ 		}
++ 		if (read_seqcount_retry(&dentry->d_seq, nd->seq)) {
++ 			unlock_rcu_walk();
++ 			dput(dentry);
++ 			return -ECHILD;
++ 		}
+++>>>>>>> e5c832d55588 (vfs: fix dentry RCU to refcounting possibly sleeping dput())
+  		mntget(nd->path.mnt);
+  		unlock_rcu_walk();
+  	}
+* Unmerged path fs/namei.c
