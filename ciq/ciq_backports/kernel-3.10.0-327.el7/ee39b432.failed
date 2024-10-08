@@ -1,0 +1,126 @@
+btrfs: remove unlikely from data-dependent branches and slow paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author David Sterba <dsterba@suse.cz>
+commit ee39b432b4ac083acdafd7b4f156283722e3bf14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ee39b432.failed
+
+There are the branch hints that obviously depend on the data being
+processed, the CPU predictor will do better job according to the actual
+load. It also does not make sense to use the hints in slow paths that do
+a lot of other operations like locking, waiting or IO.
+
+	Signed-off-by: David Sterba <dsterba@suse.cz>
+(cherry picked from commit ee39b432b4ac083acdafd7b4f156283722e3bf14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/file.c
+diff --cc fs/btrfs/file.c
+index 47bc15ed20a0,a18ceabd99a8..000000000000
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@@ -1810,17 -1792,12 +1810,22 @@@ static ssize_t btrfs_file_aio_write(str
+  	if (sync)
+  		atomic_inc(&BTRFS_I(inode)->sync_writers);
+  
+++<<<<<<< HEAD
+ +	if (unlikely(file->f_flags & O_DIRECT)) {
+ +		num_written = __btrfs_direct_write(iocb, iov, nr_segs,
+ +						   pos, ppos, count, ocount);
+++=======
++ 	if (file->f_flags & O_DIRECT) {
++ 		num_written = __btrfs_direct_write(iocb, from, pos);
+++>>>>>>> ee39b432b4ac (btrfs: remove unlikely from data-dependent branches and slow paths)
+  	} else {
+ -		num_written = __btrfs_buffered_write(file, from, pos);
+ +		struct iov_iter i;
+ +
+ +		iov_iter_init(&i, iov, nr_segs, count, num_written);
+ +
+ +		num_written = __btrfs_buffered_write(file, &i, pos);
+  		if (num_written > 0)
+ -			iocb->ki_pos = pos + num_written;
+ +			*ppos = pos + num_written;
+  	}
+  
+  	mutex_unlock(&inode->i_mutex);
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index eccc2b872810..c5a18d260d27 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -9694,7 +9694,7 @@ void btrfs_end_nocow_write(struct btrfs_root *root)
+ 
+ int btrfs_start_nocow_write(struct btrfs_root *root)
+ {
+-	if (unlikely(atomic_read(&root->will_be_snapshoted)))
++	if (atomic_read(&root->will_be_snapshoted))
+ 		return 0;
+ 
+ 	percpu_counter_inc(&root->subv_writers->counter);
+@@ -9702,7 +9702,7 @@ int btrfs_start_nocow_write(struct btrfs_root *root)
+ 	 * Make sure counter is updated before we check for snapshot creation.
+ 	 */
+ 	smp_mb();
+-	if (unlikely(atomic_read(&root->will_be_snapshoted))) {
++	if (atomic_read(&root->will_be_snapshoted)) {
+ 		btrfs_end_nocow_write(root);
+ 		return 0;
+ 	}
+* Unmerged path fs/btrfs/file.c
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 6ca91ad3069e..85a0b6da4996 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -7469,9 +7469,9 @@ static int btrfs_submit_direct_hook(int rw, struct btrfs_dio_private *dip,
+ 	atomic_inc(&dip->pending_bios);
+ 
+ 	while (bvec <= (orig_bio->bi_io_vec + orig_bio->bi_vcnt - 1)) {
+-		if (unlikely(map_length < submit_len + bvec->bv_len ||
++		if (map_length < submit_len + bvec->bv_len ||
+ 		    bio_add_page(bio, bvec->bv_page, bvec->bv_len,
+-				 bvec->bv_offset) < bvec->bv_len)) {
++				 bvec->bv_offset) < bvec->bv_len) {
+ 			/*
+ 			 * inc the count before we submit the bio so
+ 			 * we know the end IO handler won't happen before
+@@ -7698,8 +7698,8 @@ static ssize_t btrfs_direct_IO(int rw, struct kiocb *iocb,
+ 		ret = btrfs_delalloc_reserve_space(inode, count);
+ 		if (ret)
+ 			goto out;
+-	} else if (unlikely(test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
+-				     &BTRFS_I(inode)->runtime_flags))) {
++	} else if (test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
++				     &BTRFS_I(inode)->runtime_flags)) {
+ 		inode_dio_done(inode);
+ 		flags = DIO_LOCKING | DIO_SKIP_HOLES;
+ 		wakeup = false;
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index 50fda7f1bcc1..375531ca532a 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -3147,7 +3147,7 @@ static void clone_update_extent_map(struct inode *inode,
+ 					em->start + em->len - 1, 0);
+ 	}
+ 
+-	if (unlikely(ret))
++	if (ret)
+ 		set_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+ 			&BTRFS_I(inode)->runtime_flags);
+ }
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 242eb7dac9f1..3383cf82bc43 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -418,7 +418,7 @@ start_transaction(struct btrfs_root *root, u64 num_items, unsigned int type,
+ 		/*
+ 		 * Do the reservation for the relocation root creation
+ 		 */
+-		if (unlikely(need_reserve_reloc_root(root))) {
++		if (need_reserve_reloc_root(root)) {
+ 			num_bytes += root->nodesize;
+ 			reloc_reserved = true;
+ 		}
