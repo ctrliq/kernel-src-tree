@@ -1,0 +1,238 @@
+powerpc/powernv: Add interfaces for flash device access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Add interfaces for flash device access (Gustavo Duarte) [1221072 1229224]
+Rebuild_FUZZ: 92.16%
+commit-author Cyril Bur <cyrilbur@gmail.com>
+commit ed59190e41b725e1cfd79541f5fc66c20adb0671
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ed59190e.failed
+
+This change adds the OPAL interface definitions to allow Linux to read,
+write and erase from system flash devices. We register platform devices
+for the flash devices exported by firmware.
+
+We clash with the existing opal_flash_init function, which is really for
+the FSP flash update functionality, so we rename that initcall to
+opal_flash_update_init().
+
+A future change will add an mtd driver that uses this interface.
+
+Changes from Joel Stanley and Jeremy Kerr.
+
+	Signed-off-by: Cyril Bur <cyrilbur@gmail.com>
+	Signed-off-by: Jeremy Kerr <jk@ozlabs.org>
+	Signed-off-by: Joel Stanley <joel@jms.id.au>
+	Acked-by: Stewart Smith <stewart@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit ed59190e41b725e1cfd79541f5fc66c20adb0671)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/opal-api.h
+#	arch/powerpc/platforms/powernv/opal-wrappers.S
+#	arch/powerpc/platforms/powernv/opal.c
+diff --cc arch/powerpc/platforms/powernv/opal-wrappers.S
+index af5726c0359f,4e740375772c..000000000000
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@@ -147,5 -282,16 +147,17 @@@ OPAL_CALL(opal_sync_host_reboot,		OPAL_
+  OPAL_CALL(opal_sensor_read,			OPAL_SENSOR_READ);
+  OPAL_CALL(opal_get_param,			OPAL_GET_PARAM);
+  OPAL_CALL(opal_set_param,			OPAL_SET_PARAM);
+ -OPAL_CALL(opal_handle_hmi,			OPAL_HANDLE_HMI);
+ -OPAL_CALL(opal_slw_set_reg,			OPAL_SLW_SET_REG);
+  OPAL_CALL(opal_register_dump_region,		OPAL_REGISTER_DUMP_REGION);
+  OPAL_CALL(opal_unregister_dump_region,		OPAL_UNREGISTER_DUMP_REGION);
+++<<<<<<< HEAD
+++=======
++ OPAL_CALL(opal_pci_set_phb_cxl_mode,		OPAL_PCI_SET_PHB_CAPI_MODE);
++ OPAL_CALL(opal_tpo_write,			OPAL_WRITE_TPO);
++ OPAL_CALL(opal_tpo_read,			OPAL_READ_TPO);
++ OPAL_CALL(opal_ipmi_send,			OPAL_IPMI_SEND);
++ OPAL_CALL(opal_ipmi_recv,			OPAL_IPMI_RECV);
++ OPAL_CALL(opal_i2c_request,			OPAL_I2C_REQUEST);
++ OPAL_CALL(opal_flash_read,			OPAL_FLASH_READ);
++ OPAL_CALL(opal_flash_write,			OPAL_FLASH_WRITE);
++ OPAL_CALL(opal_flash_erase,			OPAL_FLASH_ERASE);
+++>>>>>>> ed59190e41b7 (powerpc/powernv: Add interfaces for flash device access)
+diff --cc arch/powerpc/platforms/powernv/opal.c
+index b32c77b1797c,2241565b0739..000000000000
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@@ -592,6 -692,96 +592,99 @@@ static void __init opal_dump_region_ini
+  		pr_warn("DUMP: Failed to register kernel log buffer. "
+  			"rc = %d\n", rc);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void opal_flash_init(struct device_node *opal_node)
++ {
++ 	struct device_node *np;
++ 
++ 	for_each_child_of_node(opal_node, np)
++ 		if (of_device_is_compatible(np, "ibm,opal-flash"))
++ 			of_platform_device_create(np, NULL, NULL);
++ }
++ 
++ static void opal_ipmi_init(struct device_node *opal_node)
++ {
++ 	struct device_node *np;
++ 
++ 	for_each_child_of_node(opal_node, np)
++ 		if (of_device_is_compatible(np, "ibm,opal-ipmi"))
++ 			of_platform_device_create(np, NULL, NULL);
++ }
++ 
++ static void opal_i2c_create_devs(void)
++ {
++ 	struct device_node *np;
++ 
++ 	for_each_compatible_node(np, NULL, "ibm,opal-i2c")
++ 		of_platform_device_create(np, NULL, NULL);
++ }
++ 
++ static void __init opal_irq_init(struct device_node *dn)
++ {
++ 	const __be32 *irqs;
++ 	int i, irqlen;
++ 
++ 	/* Get interrupt property */
++ 	irqs = of_get_property(opal_node, "opal-interrupts", &irqlen);
++ 	opal_irq_count = irqs ? (irqlen / 4) : 0;
++ 	pr_debug("Found %d interrupts reserved for OPAL\n", opal_irq_count);
++ 	if (!opal_irq_count)
++ 		return;
++ 
++ 	/* Install interrupt handlers */
++ 	opal_irqs = kzalloc(opal_irq_count * sizeof(unsigned int), GFP_KERNEL);
++ 	for (i = 0; irqs && i < opal_irq_count; i++, irqs++) {
++ 		unsigned int irq, virq;
++ 		int rc;
++ 
++ 		/* Get hardware and virtual IRQ */
++ 		irq = be32_to_cpup(irqs);
++ 		virq = irq_create_mapping(NULL, irq);
++ 		if (virq == NO_IRQ) {
++ 			pr_warn("Failed to map irq 0x%x\n", irq);
++ 			continue;
++ 		}
++ 
++ 		/* Install interrupt handler */
++ 		rc = request_irq(virq, opal_interrupt, 0, "opal", NULL);
++ 		if (rc) {
++ 			irq_dispose_mapping(virq);
++ 			pr_warn("Error %d requesting irq %d (0x%x)\n",
++ 				 rc, virq, irq);
++ 			continue;
++ 		}
++ 
++ 		/* Cache IRQ */
++ 		opal_irqs[i] = virq;
++ 	}
++ }
++ 
++ static int kopald(void *unused)
++ {
++ 	set_freezable();
++ 	do {
++ 		try_to_freeze();
++ 		opal_poll_events(NULL);
++ 		msleep_interruptible(opal_heartbeat);
++ 	} while (!kthread_should_stop());
++ 
++ 	return 0;
++ }
++ 
++ static void opal_init_heartbeat(void)
++ {
++ 	/* Old firwmware, we assume the HVC heartbeat is sufficient */
++ 	if (of_property_read_u32(opal_node, "ibm,heartbeat-ms",
++ 				 &opal_heartbeat) != 0)
++ 		opal_heartbeat = 0;
++ 
++ 	if (opal_heartbeat)
++ 		kthread_run(kopald, NULL, "kopald");
++ }
++ 
+++>>>>>>> ed59190e41b7 (powerpc/powernv: Add interfaces for flash device access)
+  static int __init opal_init(void)
+  {
+  	struct device_node *np, *consoles;
+@@@ -655,6 -835,11 +748,14 @@@
+  		opal_msglog_init();
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Initialize OPAL IPMI backend */
++ 	opal_ipmi_init(opal_node);
++ 
++ 	opal_flash_init(opal_node);
++ 
+++>>>>>>> ed59190e41b7 (powerpc/powernv: Add interfaces for flash device access)
+  	return 0;
+  }
+  machine_subsys_initcall(powernv, opal_init);
+@@@ -691,6 -876,11 +792,14 @@@ void opal_shutdown(void
+  
+  /* Export this so that test modules can use it */
+  EXPORT_SYMBOL_GPL(opal_invalid_call);
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(opal_ipmi_send);
++ EXPORT_SYMBOL_GPL(opal_ipmi_recv);
++ EXPORT_SYMBOL_GPL(opal_flash_read);
++ EXPORT_SYMBOL_GPL(opal_flash_write);
++ EXPORT_SYMBOL_GPL(opal_flash_erase);
+++>>>>>>> ed59190e41b7 (powerpc/powernv: Add interfaces for flash device access)
+  
+  /* Convert a region of vmalloc memory to an opal sg list */
+  struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
+* Unmerged path arch/powerpc/include/asm/opal-api.h
+* Unmerged path arch/powerpc/include/asm/opal-api.h
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 5683e9a3a478..e38a0d49656e 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -867,6 +867,13 @@ int64_t opal_sensor_read(uint32_t sensor_hndl, int token, __be32 *sensor_data);
+ int64_t opal_register_dump_region(uint32_t id, uint64_t start, uint64_t end);
+ int64_t opal_unregister_dump_region(uint32_t id);
+ 
++int64_t opal_flash_read(uint64_t id, uint64_t offset, uint64_t buf,
++		uint64_t size, uint64_t token);
++int64_t opal_flash_write(uint64_t id, uint64_t offset, uint64_t buf,
++		uint64_t size, uint64_t token);
++int64_t opal_flash_erase(uint64_t id, uint64_t offset, uint64_t size,
++		uint64_t token);
++
+ /* Internal functions */
+ extern int early_init_dt_scan_opal(unsigned long node, const char *uname,
+ 				   int depth, void *data);
+@@ -901,7 +908,7 @@ extern int opal_set_rtc_time(struct rtc_time *tm);
+ extern void opal_get_rtc_time(struct rtc_time *tm);
+ extern unsigned long opal_get_boot_time(void);
+ extern void opal_nvram_init(void);
+-extern void opal_flash_init(void);
++extern void opal_flash_update_init(void);
+ extern void opal_flash_term_callback(void);
+ extern int opal_elog_init(void);
+ extern void opal_platform_dump_init(void);
+diff --git a/arch/powerpc/platforms/powernv/opal-flash.c b/arch/powerpc/platforms/powernv/opal-flash.c
+index 8031232d62f3..71a0d51bebaf 100644
+--- a/arch/powerpc/platforms/powernv/opal-flash.c
++++ b/arch/powerpc/platforms/powernv/opal-flash.c
+@@ -546,7 +546,7 @@ static struct attribute_group image_op_attr_group = {
+ 	.attrs = image_op_attrs,
+ };
+ 
+-void __init opal_flash_init(void)
++void __init opal_flash_update_init(void)
+ {
+ 	int ret;
+ 
+* Unmerged path arch/powerpc/platforms/powernv/opal-wrappers.S
+* Unmerged path arch/powerpc/platforms/powernv/opal.c
