@@ -1,0 +1,320 @@
+drm/i915: split conversion function out into separate function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] i915: split some conversion functions out into separate functions (Dave Airlie) [1140440]
+Rebuild_FUZZ: 91.34%
+commit-author Dave Airlie <airlied@redhat.com>
+commit d05410f9a450df8848196ce87f1c9ef14ff89cb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d05410f9.failed
+
+for MST I need to reuse this, so just move it now.
+
+	Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit d05410f9a450df8848196ce87f1c9ef14ff89cb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index aad6f7bfc589,421ea71b2e58..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -3702,6 -4300,291 +3702,294 @@@ static void i9xx_pfit_enable(struct int
+  	I915_WRITE(BCLRPAT(crtc->pipe), 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum intel_display_power_domain port_to_power_domain(enum port port)
++ {
++ 	switch (port) {
++ 	case PORT_A:
++ 		return POWER_DOMAIN_PORT_DDI_A_4_LANES;
++ 	case PORT_B:
++ 		return POWER_DOMAIN_PORT_DDI_B_4_LANES;
++ 	case PORT_C:
++ 		return POWER_DOMAIN_PORT_DDI_C_4_LANES;
++ 	case PORT_D:
++ 		return POWER_DOMAIN_PORT_DDI_D_4_LANES;
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		return POWER_DOMAIN_PORT_OTHER;
++ 	}
++ }
++ 
++ #define for_each_power_domain(domain, mask)				\
++ 	for ((domain) = 0; (domain) < POWER_DOMAIN_NUM; (domain)++)	\
++ 		if ((1 << (domain)) & (mask))
++ 
++ enum intel_display_power_domain
++ intel_display_port_power_domain(struct intel_encoder *intel_encoder)
++ {
++ 	struct drm_device *dev = intel_encoder->base.dev;
++ 	struct intel_digital_port *intel_dig_port;
++ 
++ 	switch (intel_encoder->type) {
++ 	case INTEL_OUTPUT_UNKNOWN:
++ 		/* Only DDI platforms should ever use this output type */
++ 		WARN_ON_ONCE(!HAS_DDI(dev));
++ 	case INTEL_OUTPUT_DISPLAYPORT:
++ 	case INTEL_OUTPUT_HDMI:
++ 	case INTEL_OUTPUT_EDP:
++ 		intel_dig_port = enc_to_dig_port(&intel_encoder->base);
++ 		return port_to_power_domain(intel_dig_port->port);
++ 	case INTEL_OUTPUT_ANALOG:
++ 		return POWER_DOMAIN_PORT_CRT;
++ 	case INTEL_OUTPUT_DSI:
++ 		return POWER_DOMAIN_PORT_DSI;
++ 	default:
++ 		return POWER_DOMAIN_PORT_OTHER;
++ 	}
++ }
++ 
++ static unsigned long get_crtc_power_domains(struct drm_crtc *crtc)
++ {
++ 	struct drm_device *dev = crtc->dev;
++ 	struct intel_encoder *intel_encoder;
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 	enum pipe pipe = intel_crtc->pipe;
++ 	unsigned long mask;
++ 	enum transcoder transcoder;
++ 
++ 	transcoder = intel_pipe_to_cpu_transcoder(dev->dev_private, pipe);
++ 
++ 	mask = BIT(POWER_DOMAIN_PIPE(pipe));
++ 	mask |= BIT(POWER_DOMAIN_TRANSCODER(transcoder));
++ 	if (intel_crtc->config.pch_pfit.enabled ||
++ 	    intel_crtc->config.pch_pfit.force_thru)
++ 		mask |= BIT(POWER_DOMAIN_PIPE_PANEL_FITTER(pipe));
++ 
++ 	for_each_encoder_on_crtc(dev, crtc, intel_encoder)
++ 		mask |= BIT(intel_display_port_power_domain(intel_encoder));
++ 
++ 	return mask;
++ }
++ 
++ void intel_display_set_init_power(struct drm_i915_private *dev_priv,
++ 				  bool enable)
++ {
++ 	if (dev_priv->power_domains.init_power_on == enable)
++ 		return;
++ 
++ 	if (enable)
++ 		intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
++ 	else
++ 		intel_display_power_put(dev_priv, POWER_DOMAIN_INIT);
++ 
++ 	dev_priv->power_domains.init_power_on = enable;
++ }
++ 
++ static void modeset_update_crtc_power_domains(struct drm_device *dev)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	unsigned long pipe_domains[I915_MAX_PIPES] = { 0, };
++ 	struct intel_crtc *crtc;
++ 
++ 	/*
++ 	 * First get all needed power domains, then put all unneeded, to avoid
++ 	 * any unnecessary toggling of the power wells.
++ 	 */
++ 	for_each_intel_crtc(dev, crtc) {
++ 		enum intel_display_power_domain domain;
++ 
++ 		if (!crtc->base.enabled)
++ 			continue;
++ 
++ 		pipe_domains[crtc->pipe] = get_crtc_power_domains(&crtc->base);
++ 
++ 		for_each_power_domain(domain, pipe_domains[crtc->pipe])
++ 			intel_display_power_get(dev_priv, domain);
++ 	}
++ 
++ 	for_each_intel_crtc(dev, crtc) {
++ 		enum intel_display_power_domain domain;
++ 
++ 		for_each_power_domain(domain, crtc->enabled_power_domains)
++ 			intel_display_power_put(dev_priv, domain);
++ 
++ 		crtc->enabled_power_domains = pipe_domains[crtc->pipe];
++ 	}
++ 
++ 	intel_display_set_init_power(dev_priv, false);
++ }
++ 
++ /* returns HPLL frequency in kHz */
++ static int valleyview_get_vco(struct drm_i915_private *dev_priv)
++ {
++ 	int hpll_freq, vco_freq[] = { 800, 1600, 2000, 2400 };
++ 
++ 	/* Obtain SKU information */
++ 	mutex_lock(&dev_priv->dpio_lock);
++ 	hpll_freq = vlv_cck_read(dev_priv, CCK_FUSE_REG) &
++ 		CCK_FUSE_HPLL_FREQ_MASK;
++ 	mutex_unlock(&dev_priv->dpio_lock);
++ 
++ 	return vco_freq[hpll_freq] * 1000;
++ }
++ 
++ static void vlv_update_cdclk(struct drm_device *dev)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 
++ 	dev_priv->vlv_cdclk_freq = dev_priv->display.get_display_clock_speed(dev);
++ 	DRM_DEBUG_DRIVER("Current CD clock rate: %d kHz",
++ 			 dev_priv->vlv_cdclk_freq);
++ 
++ 	/*
++ 	 * Program the gmbus_freq based on the cdclk frequency.
++ 	 * BSpec erroneously claims we should aim for 4MHz, but
++ 	 * in fact 1MHz is the correct frequency.
++ 	 */
++ 	I915_WRITE(GMBUSFREQ_VLV, dev_priv->vlv_cdclk_freq);
++ }
++ 
++ /* Adjust CDclk dividers to allow high res or save power if possible */
++ static void valleyview_set_cdclk(struct drm_device *dev, int cdclk)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	u32 val, cmd;
++ 
++ 	WARN_ON(dev_priv->display.get_display_clock_speed(dev) != dev_priv->vlv_cdclk_freq);
++ 
++ 	if (cdclk >= 320000) /* jump to highest voltage for 400MHz too */
++ 		cmd = 2;
++ 	else if (cdclk == 266667)
++ 		cmd = 1;
++ 	else
++ 		cmd = 0;
++ 
++ 	mutex_lock(&dev_priv->rps.hw_lock);
++ 	val = vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ);
++ 	val &= ~DSPFREQGUAR_MASK;
++ 	val |= (cmd << DSPFREQGUAR_SHIFT);
++ 	vlv_punit_write(dev_priv, PUNIT_REG_DSPFREQ, val);
++ 	if (wait_for((vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ) &
++ 		      DSPFREQSTAT_MASK) == (cmd << DSPFREQSTAT_SHIFT),
++ 		     50)) {
++ 		DRM_ERROR("timed out waiting for CDclk change\n");
++ 	}
++ 	mutex_unlock(&dev_priv->rps.hw_lock);
++ 
++ 	if (cdclk == 400000) {
++ 		u32 divider, vco;
++ 
++ 		vco = valleyview_get_vco(dev_priv);
++ 		divider = DIV_ROUND_CLOSEST(vco << 1, cdclk) - 1;
++ 
++ 		mutex_lock(&dev_priv->dpio_lock);
++ 		/* adjust cdclk divider */
++ 		val = vlv_cck_read(dev_priv, CCK_DISPLAY_CLOCK_CONTROL);
++ 		val &= ~DISPLAY_FREQUENCY_VALUES;
++ 		val |= divider;
++ 		vlv_cck_write(dev_priv, CCK_DISPLAY_CLOCK_CONTROL, val);
++ 
++ 		if (wait_for((vlv_cck_read(dev_priv, CCK_DISPLAY_CLOCK_CONTROL) &
++ 			      DISPLAY_FREQUENCY_STATUS) == (divider << DISPLAY_FREQUENCY_STATUS_SHIFT),
++ 			     50))
++ 			DRM_ERROR("timed out waiting for CDclk change\n");
++ 		mutex_unlock(&dev_priv->dpio_lock);
++ 	}
++ 
++ 	mutex_lock(&dev_priv->dpio_lock);
++ 	/* adjust self-refresh exit latency value */
++ 	val = vlv_bunit_read(dev_priv, BUNIT_REG_BISOC);
++ 	val &= ~0x7f;
++ 
++ 	/*
++ 	 * For high bandwidth configs, we set a higher latency in the bunit
++ 	 * so that the core display fetch happens in time to avoid underruns.
++ 	 */
++ 	if (cdclk == 400000)
++ 		val |= 4500 / 250; /* 4.5 usec */
++ 	else
++ 		val |= 3000 / 250; /* 3.0 usec */
++ 	vlv_bunit_write(dev_priv, BUNIT_REG_BISOC, val);
++ 	mutex_unlock(&dev_priv->dpio_lock);
++ 
++ 	vlv_update_cdclk(dev);
++ }
++ 
++ static int valleyview_calc_cdclk(struct drm_i915_private *dev_priv,
++ 				 int max_pixclk)
++ {
++ 	int vco = valleyview_get_vco(dev_priv);
++ 	int freq_320 = (vco <<  1) % 320000 != 0 ? 333333 : 320000;
++ 
++ 	/*
++ 	 * Really only a few cases to deal with, as only 4 CDclks are supported:
++ 	 *   200MHz
++ 	 *   267MHz
++ 	 *   320/333MHz (depends on HPLL freq)
++ 	 *   400MHz
++ 	 * So we check to see whether we're above 90% of the lower bin and
++ 	 * adjust if needed.
++ 	 *
++ 	 * We seem to get an unstable or solid color picture at 200MHz.
++ 	 * Not sure what's wrong. For now use 200MHz only when all pipes
++ 	 * are off.
++ 	 */
++ 	if (max_pixclk > freq_320*9/10)
++ 		return 400000;
++ 	else if (max_pixclk > 266667*9/10)
++ 		return freq_320;
++ 	else if (max_pixclk > 0)
++ 		return 266667;
++ 	else
++ 		return 200000;
++ }
++ 
++ /* compute the max pixel clock for new configuration */
++ static int intel_mode_max_pixclk(struct drm_i915_private *dev_priv)
++ {
++ 	struct drm_device *dev = dev_priv->dev;
++ 	struct intel_crtc *intel_crtc;
++ 	int max_pixclk = 0;
++ 
++ 	for_each_intel_crtc(dev, intel_crtc) {
++ 		if (intel_crtc->new_enabled)
++ 			max_pixclk = max(max_pixclk,
++ 					 intel_crtc->new_config->adjusted_mode.crtc_clock);
++ 	}
++ 
++ 	return max_pixclk;
++ }
++ 
++ static void valleyview_modeset_global_pipes(struct drm_device *dev,
++ 					    unsigned *prepare_pipes)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct intel_crtc *intel_crtc;
++ 	int max_pixclk = intel_mode_max_pixclk(dev_priv);
++ 
++ 	if (valleyview_calc_cdclk(dev_priv, max_pixclk) ==
++ 	    dev_priv->vlv_cdclk_freq)
++ 		return;
++ 
++ 	/* disable/enable all currently active pipes while we change cdclk */
++ 	for_each_intel_crtc(dev, intel_crtc)
++ 		if (intel_crtc->base.enabled)
++ 			*prepare_pipes |= (1 << intel_crtc->pipe);
++ }
++ 
++ static void valleyview_modeset_global_resources(struct drm_device *dev)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	int max_pixclk = intel_mode_max_pixclk(dev_priv);
++ 	int req_cdclk = valleyview_calc_cdclk(dev_priv, max_pixclk);
++ 
++ 	if (req_cdclk != dev_priv->vlv_cdclk_freq)
++ 		valleyview_set_cdclk(dev, req_cdclk);
++ 	modeset_update_crtc_power_domains(dev);
++ }
++ 
+++>>>>>>> d05410f9a450 (drm/i915: split conversion function out into separate function)
+  static void valleyview_crtc_enable(struct drm_crtc *crtc)
+  {
+  	struct drm_device *dev = crtc->dev;
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
