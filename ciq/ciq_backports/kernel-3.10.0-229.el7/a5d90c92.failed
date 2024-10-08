@@ -1,0 +1,142 @@
+x86/efi: Quirk out SGI UV
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [x86] efi: Quirk out SGI UV (Dave Young) [1080109]
+Rebuild_FUZZ: 91.30%
+commit-author Borislav Petkov <bp@suse.de>
+commit a5d90c923bcfb9632d998ed06e9569216ad695f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a5d90c92.failed
+
+Alex reported hitting the following BUG after the EFI 1:1 virtual
+mapping work was merged,
+
+ kernel BUG at arch/x86/mm/init_64.c:351!
+ invalid opcode: 0000 [#1] SMP
+ Call Trace:
+  [<ffffffff818aa71d>] init_extra_mapping_uc+0x13/0x15
+  [<ffffffff818a5e20>] uv_system_init+0x22b/0x124b
+  [<ffffffff8108b886>] ? clockevents_register_device+0x138/0x13d
+  [<ffffffff81028dbb>] ? setup_APIC_timer+0xc5/0xc7
+  [<ffffffff8108b620>] ? clockevent_delta2ns+0xb/0xd
+  [<ffffffff818a3a92>] ? setup_boot_APIC_clock+0x4a8/0x4b7
+  [<ffffffff8153d955>] ? printk+0x72/0x74
+  [<ffffffff818a1757>] native_smp_prepare_cpus+0x389/0x3d6
+  [<ffffffff818957bc>] kernel_init_freeable+0xb7/0x1fb
+  [<ffffffff81535530>] ? rest_init+0x74/0x74
+  [<ffffffff81535539>] kernel_init+0x9/0xff
+  [<ffffffff81541dfc>] ret_from_fork+0x7c/0xb0
+  [<ffffffff81535530>] ? rest_init+0x74/0x74
+
+Getting this thing to work with the new mapping scheme would need more
+work, so automatically switch to the old memmap layout for SGI UV.
+
+	Acked-by: Russ Anderson <rja@sgi.com>
+	Cc: Alex Thorlton <athorlton@sgi.com
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit a5d90c923bcfb9632d998ed06e9569216ad695f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+#	arch/x86/platform/efi/efi.c
+diff --cc arch/x86/include/asm/efi.h
+index 0062a0125041,acd86c850414..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -101,6 -127,24 +101,27 @@@ extern void efi_call_phys_prelog(void)
+  extern void efi_call_phys_epilog(void);
+  extern void efi_unmap_memmap(void);
+  extern void efi_memory_uc(u64 addr, unsigned long size);
+++<<<<<<< HEAD
+++=======
++ extern void __init efi_map_region(efi_memory_desc_t *md);
++ extern void __init efi_map_region_fixed(efi_memory_desc_t *md);
++ extern void efi_sync_low_kernel_mappings(void);
++ extern void efi_setup_page_tables(void);
++ extern void __init old_map_region(efi_memory_desc_t *md);
++ extern void __init runtime_code_page_mkexec(void);
++ extern void __init efi_runtime_mkexec(void);
++ extern void __init efi_apply_memmap_quirks(void);
++ 
++ struct efi_setup_data {
++ 	u64 fw_vendor;
++ 	u64 runtime;
++ 	u64 tables;
++ 	u64 smbios;
++ 	u64 reserved[8];
++ };
++ 
++ extern u64 efi_setup;
+++>>>>>>> a5d90c923bcf (x86/efi: Quirk out SGI UV)
+  
+  #ifdef CONFIG_EFI
+  
+diff --cc arch/x86/platform/efi/efi.c
+index 4ba4bd5dfe10,b97acecf3fd9..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -1022,3 -1199,34 +1023,37 @@@ efi_status_t efi_query_variable_store(u
+  	return EFI_SUCCESS;
+  }
+  EXPORT_SYMBOL_GPL(efi_query_variable_store);
+++<<<<<<< HEAD
+++=======
++ 
++ static int __init parse_efi_cmdline(char *str)
++ {
++ 	if (*str == '=')
++ 		str++;
++ 
++ 	if (!strncmp(str, "old_map", 7))
++ 		set_bit(EFI_OLD_MEMMAP, &x86_efi_facility);
++ 
++ 	return 0;
++ }
++ early_param("efi", parse_efi_cmdline);
++ 
++ void __init efi_apply_memmap_quirks(void)
++ {
++ 	/*
++ 	 * Once setup is done earlier, unmap the EFI memory map on mismatched
++ 	 * firmware/kernel architectures since there is no support for runtime
++ 	 * services.
++ 	 */
++ 	if (!efi_is_native()) {
++ 		pr_info("efi: Setup done, disabling due to 32/64-bit mismatch\n");
++ 		efi_unmap_memmap();
++ 	}
++ 
++ 	/*
++ 	 * UV doesn't support the new EFI pagetable mapping yet.
++ 	 */
++ 	if (is_uv_system())
++ 		set_bit(EFI_OLD_MEMMAP, &x86_efi_facility);
++ }
+++>>>>>>> a5d90c923bcf (x86/efi: Quirk out SGI UV)
+* Unmerged path arch/x86/include/asm/efi.h
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 49c66cf1f9aa..1360cc3e6f92 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -1294,14 +1294,8 @@ void __init setup_arch(char **cmdline_p)
+ 	register_refined_jiffies(CLOCK_TICK_RATE);
+ 
+ #ifdef CONFIG_EFI
+-	/* Once setup is done above, unmap the EFI memory map on
+-	 * mismatched firmware/kernel archtectures since there is no
+-	 * support for runtime services.
+-	 */
+-	if (efi_enabled(EFI_BOOT) && !efi_is_native()) {
+-		pr_info("efi: Setup done, disabling due to 32/64-bit mismatch\n");
+-		efi_unmap_memmap();
+-	}
++	if (efi_enabled(EFI_BOOT))
++		efi_apply_memmap_quirks();
+ #endif
+ 
+ 	rh_check_supported();
+* Unmerged path arch/x86/platform/efi/efi.c
