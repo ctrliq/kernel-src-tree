@@ -1,0 +1,159 @@
+kernel/watchdog.c: perform all-CPU backtrace in case of hard lockup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [kernel] watchdog: perform all-CPU backtrace in case of hard lockup (David Arcari) [1290573]
+Rebuild_FUZZ: 92.80%
+commit-author Jiri Kosina <jkosina@suse.cz>
+commit 55537871ef666b4153fd1ef8782e4a13fee142cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/55537871.failed
+
+In many cases of hardlockup reports, it's actually not possible to know
+why it triggered, because the CPU that got stuck is usually waiting on a
+resource (with IRQs disabled) in posession of some other CPU is holding.
+
+IOW, we are often looking at the stacktrace of the victim and not the
+actual offender.
+
+Introduce sysctl / cmdline parameter that makes it possible to have
+hardlockup detector perform all-CPU backtrace.
+
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+	Reviewed-by: Aaron Tomlin <atomlin@redhat.com>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+	Acked-by: Don Zickus <dzickus@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 55537871ef666b4153fd1ef8782e4a13fee142cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sysctl/kernel.txt
+#	kernel/watchdog.c
+diff --cc Documentation/sysctl/kernel.txt
+index b27c6b7edd64,af70d1541d3a..000000000000
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@@ -33,6 -33,11 +33,14 @@@ show up in /proc/sys/kernel
+  - domainname
+  - hostname
+  - hotplug
+++<<<<<<< HEAD
+++=======
++ - hardlockup_all_cpu_backtrace
++ - hung_task_panic
++ - hung_task_check_count
++ - hung_task_timeout_secs
++ - hung_task_warnings
+++>>>>>>> 55537871ef66 (kernel/watchdog.c: perform all-CPU backtrace in case of hard lockup)
+  - kexec_load_disabled
+  - kptr_restrict
+  - kstack_depth_to_print       [ X86 only ]
+diff --cc kernel/watchdog.c
+index 32e2f4abc31e,f6b32b8cbffe..000000000000
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@@ -56,11 -57,38 +56,13 @@@ int __read_mostly watchdog_thresh = 10
+  
+  #ifdef CONFIG_SMP
+  int __read_mostly sysctl_softlockup_all_cpu_backtrace;
++ int __read_mostly sysctl_hardlockup_all_cpu_backtrace;
+  #else
+  #define sysctl_softlockup_all_cpu_backtrace 0
++ #define sysctl_hardlockup_all_cpu_backtrace 0
+  #endif
+ -static struct cpumask watchdog_cpumask __read_mostly;
+ -unsigned long *watchdog_cpumask_bits = cpumask_bits(&watchdog_cpumask);
+  
+ -/* Helper for online, unparked cpus. */
+ -#define for_each_watchdog_cpu(cpu) \
+ -	for_each_cpu_and((cpu), cpu_online_mask, &watchdog_cpumask)
+ -
+ -/*
+ - * The 'watchdog_running' variable is set to 1 when the watchdog threads
+ - * are registered/started and is set to 0 when the watchdog threads are
+ - * unregistered/stopped, so it is an indicator whether the threads exist.
+ - */
+  static int __read_mostly watchdog_running;
+ -/*
+ - * If a subsystem has a need to deactivate the watchdog temporarily, it
+ - * can use the suspend/resume interface to achieve this. The content of
+ - * the 'watchdog_suspended' variable reflects this state. Existing threads
+ - * are parked/unparked by the lockup_detector_{suspend|resume} functions
+ - * (see comment blocks pertaining to those functions for further details).
+ - *
+ - * 'watchdog_suspended' also prevents threads from being registered/started
+ - * or unregistered/stopped via parameters in /proc/sys/kernel, so the state
+ - * of 'watchdog_running' cannot change while the watchdog is deactivated
+ - * temporarily (see related code in 'proc' handlers).
+ - */
+ -static int __read_mostly watchdog_suspended;
+ -
+  static u64 __read_mostly sample_period;
+  
+  static DEFINE_PER_CPU(unsigned long, watchdog_touch_ts);
+@@@ -86,8 -114,7 +88,12 @@@ static unsigned long soft_lockup_nmi_wa
+  #ifdef CONFIG_HARDLOCKUP_DETECTOR
+  static int hardlockup_panic =
+  			CONFIG_BOOTPARAM_HARDLOCKUP_PANIC_VALUE;
+++<<<<<<< HEAD
+ +
+ +static bool hardlockup_detector_enabled = true;
+++=======
++ static unsigned long hardlockup_allcpu_dumped;
+++>>>>>>> 55537871ef66 (kernel/watchdog.c: perform all-CPU backtrace in case of hard lockup)
+  /*
+   * We may not want to enable hard lockup detection by default in all cases,
+   * for example when running the kernel as a guest on a hypervisor. In these
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index a11881467ef2..2538bd1c643c 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1011,6 +1011,11 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			Format: <unsigned int> such that (rxsize & ~0x1fffc0) == 0.
+ 			Default: 1024
+ 
++	hardlockup_all_cpu_backtrace=
++			[KNL] Should the hard-lockup detector generate
++			backtraces on all cpus.
++			Format: <integer>
++
+ 	hashdist=	[KNL,NUMA] Large hashes allocated during boot
+ 			are distributed across NUMA nodes.  Defaults on
+ 			for 64-bit NUMA, off otherwise.
+* Unmerged path Documentation/sysctl/kernel.txt
+diff --git a/include/linux/nmi.h b/include/linux/nmi.h
+index 6fe7c9ae7224..9e47cab0ab32 100644
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@ -73,6 +73,7 @@ extern int soft_watchdog_enabled;
+ extern int watchdog_user_enabled;
+ extern int watchdog_thresh;
+ extern int sysctl_softlockup_all_cpu_backtrace;
++extern int sysctl_hardlockup_all_cpu_backtrace;
+ struct ctl_table;
+ extern int proc_watchdog(struct ctl_table *, int ,
+ 			 void __user *, size_t *, loff_t *);
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 41128551c952..515fd704f780 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -863,6 +863,15 @@ static struct ctl_table kern_table[] = {
+ 		.extra1		= &zero,
+ 		.extra2		= &one,
+ 	},
++	{
++		.procname	= "hardlockup_all_cpu_backtrace",
++		.data		= &sysctl_hardlockup_all_cpu_backtrace,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one,
++	},
+ #endif /* CONFIG_SMP */
+ 	{
+ 		.procname       = "nmi_watchdog",
+* Unmerged path kernel/watchdog.c
