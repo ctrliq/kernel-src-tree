@@ -1,0 +1,126 @@
+perf: Fix perf_event_comm() vs. exec() assumption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit e041e328c4b41e1db79bfe5ba9992c2ed771ad19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e041e328.failed
+
+perf_event_comm() assumes that set_task_comm() is only called on
+exec(), and in particular that its only called on current.
+
+Neither are true, as Dave reported a WARN triggered by set_task_comm()
+being called on !current.
+
+Separate the exec() hook from the comm hook.
+
+	Reported-by: Dave Jones <davej@redhat.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: linux-fsdevel@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/r/20140521153219.GH5226@laptop.programming.kicks-ass.net
+[ Build fix. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e041e328c4b41e1db79bfe5ba9992c2ed771ad19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+diff --cc fs/exec.c
+index 4ba6694d6649,a038a41a3677..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -1116,7 -1110,8 +1116,12 @@@ void setup_new_exec(struct linux_binpr
+  	else
+  		set_dumpable(current->mm, suid_dumpable);
+  
+++<<<<<<< HEAD
+ +	set_task_comm(current, bprm->tcomm);
+++=======
++ 	perf_event_exec();
++ 	set_task_comm(current, kbasename(bprm->filename));
+++>>>>>>> e041e328c4b4 (perf: Fix perf_event_comm() vs. exec() assumption)
+  
+  	/* Set the new mm task size. We have to do that late because it may
+  	 * depend on TIF_32BIT which is only updated in flush_thread() on
+* Unmerged path fs/exec.c
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 8838b22cb728..9bd32abea8a5 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -726,6 +726,7 @@ extern struct perf_guest_info_callbacks *perf_guest_cbs;
+ extern int perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *callbacks);
+ extern int perf_unregister_guest_info_callbacks(struct perf_guest_info_callbacks *callbacks);
+ 
++extern void perf_event_exec(void);
+ extern void perf_event_comm(struct task_struct *tsk);
+ extern void perf_event_fork(struct task_struct *tsk);
+ 
+@@ -803,7 +804,7 @@ extern void perf_event_enable(struct perf_event *event);
+ extern void perf_event_disable(struct perf_event *event);
+ extern int __perf_event_disable(void *info);
+ extern void perf_event_task_tick(void);
+-#else
++#else /* !CONFIG_PERF_EVENTS: */
+ static inline void
+ perf_event_task_sched_in(struct task_struct *prev,
+ 			 struct task_struct *task)			{ }
+@@ -833,6 +834,7 @@ static inline int perf_unregister_guest_info_callbacks
+ (struct perf_guest_info_callbacks *callbacks)				{ return 0; }
+ 
+ static inline void perf_event_mmap(struct vm_area_struct *vma)		{ }
++static inline void perf_event_exec(void)				{ }
+ static inline void perf_event_comm(struct task_struct *tsk)		{ }
+ static inline void perf_event_fork(struct task_struct *tsk)		{ }
+ static inline void perf_event_init(void)				{ }
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index f41fb263220f..6deeeb6d471d 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -2985,6 +2985,22 @@ out:
+ 	local_irq_restore(flags);
+ }
+ 
++void perf_event_exec(void)
++{
++	struct perf_event_context *ctx;
++	int ctxn;
++
++	rcu_read_lock();
++	for_each_task_context_nr(ctxn) {
++		ctx = current->perf_event_ctxp[ctxn];
++		if (!ctx)
++			continue;
++
++		perf_event_enable_on_exec(ctx);
++	}
++	rcu_read_unlock();
++}
++
+ /*
+  * Cross CPU call to read the hardware event
+  */
+@@ -5082,18 +5098,6 @@ static void perf_event_comm_event(struct perf_comm_event *comm_event)
+ void perf_event_comm(struct task_struct *task)
+ {
+ 	struct perf_comm_event comm_event;
+-	struct perf_event_context *ctx;
+-	int ctxn;
+-
+-	rcu_read_lock();
+-	for_each_task_context_nr(ctxn) {
+-		ctx = task->perf_event_ctxp[ctxn];
+-		if (!ctx)
+-			continue;
+-
+-		perf_event_enable_on_exec(ctx);
+-	}
+-	rcu_read_unlock();
+ 
+ 	if (!atomic_read(&nr_comm_events))
+ 		return;
