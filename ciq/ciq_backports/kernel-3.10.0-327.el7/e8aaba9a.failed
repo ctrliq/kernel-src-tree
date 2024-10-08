@@ -1,0 +1,173 @@
+xfs: xfs_buf_ioend and xfs_buf_iodone_work duplicate functionality
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit e8aaba9a783c8e5d2c58ebe69650ea31b91bb745
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e8aaba9a.failed
+
+We do some work in xfs_buf_ioend, and some work in
+xfs_buf_iodone_work, but much of that functionality is the same.
+This work can all be done in a single function, leaving
+xfs_buf_iodone just a wrapper to determine if we should execute it
+by workqueue or directly. hence rename xfs_buf_iodone_work to
+xfs_buf_ioend(), and add a new xfs_buf_ioend_async() for places that
+need async processing.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit e8aaba9a783c8e5d2c58ebe69650ea31b91bb745)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/xfs_buf.c
+index f83c9cff6fbd,a046149e6099..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1055,31 -1029,22 +1059,41 @@@ xfs_buf_ioend
+  	}
+  }
+  
+- void
+- xfs_buf_ioend(
+- 	struct xfs_buf	*bp,
+- 	int		schedule)
++ static void
++ xfs_buf_ioend_work(
++ 	struct work_struct	*work)
+  {
+- 	bool		read = !!(bp->b_flags & XBF_READ);
++ 	struct xfs_buf		*bp =
++ 		container_of(work, xfs_buf_t, b_iodone_work);
+  
+- 	trace_xfs_buf_iodone(bp, _RET_IP_);
++ 	xfs_buf_ioend(bp);
++ }
+  
+++<<<<<<< HEAD
+ +	if (bp->b_error == 0)
+ +		bp->b_flags |= XBF_DONE;
+ +
+ +	if (bp->b_iodone || (read && bp->b_ops) || (bp->b_flags & XBF_ASYNC)) {
+ +		if (schedule) {
+ +			INIT_WORK(&bp->b_iodone_work, xfs_buf_iodone_work);
+ +			queue_work(bp->b_target->bt_mount->m_buf_workqueue,
+ +				   &bp->b_iodone_work);
+ +		} else {
+ +			xfs_buf_iodone_work(&bp->b_iodone_work);
+ +		}
+ +	} else {
+ +		bp->b_flags &= ~(XBF_READ | XBF_WRITE | XBF_READ_AHEAD);
+ +		complete(&bp->b_iowait);
+ +		xfs_buf_rele(bp);
+ +	}
+++=======
++ void
++ xfs_buf_ioend_async(
++ 	struct xfs_buf	*bp)
++ {
++ 	INIT_WORK(&bp->b_iodone_work, xfs_buf_ioend_work);
++ 	queue_work(xfslogd_workqueue, &bp->b_iodone_work);
+++>>>>>>> e8aaba9a783c (xfs: xfs_buf_ioend and xfs_buf_iodone_work duplicate functionality)
+  }
+  
+  void
+@@@ -1130,9 -1095,9 +1144,9 @@@ xfs_bioerror
+  	XFS_BUF_UNDONE(bp);
+  	xfs_buf_stale(bp);
+  
+- 	xfs_buf_ioend(bp, 0);
++ 	xfs_buf_ioend(bp);
+  
+ -	return -EIO;
+ +	return EIO;
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_inode.c
+index f0c92c3ecc50,00d210bbf3c3..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -3038,8 -3055,8 +3038,13 @@@ cluster_corrupt_out
+  		if (bp->b_iodone) {
+  			XFS_BUF_UNDONE(bp);
+  			xfs_buf_stale(bp);
+++<<<<<<< HEAD
+ +			xfs_buf_ioerror(bp, EIO);
+ +			xfs_buf_ioend(bp, 0);
+++=======
++ 			xfs_buf_ioerror(bp, -EIO);
++ 			xfs_buf_ioend(bp);
+++>>>>>>> e8aaba9a783c (xfs: xfs_buf_ioend and xfs_buf_iodone_work duplicate functionality)
+  		} else {
+  			xfs_buf_stale(bp);
+  			xfs_buf_relse(bp);
+* Unmerged path fs/xfs/xfs_buf.c
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index 75e98ced9b68..90688ffa633c 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -283,7 +283,7 @@ extern void xfs_buf_unlock(xfs_buf_t *);
+ 
+ /* Buffer Read and Write Routines */
+ extern int xfs_bwrite(struct xfs_buf *bp);
+-extern void xfs_buf_ioend(xfs_buf_t *,	int);
++extern void xfs_buf_ioend(struct xfs_buf *bp);
+ extern void xfs_buf_ioerror(xfs_buf_t *, int);
+ extern void xfs_buf_ioerror_alert(struct xfs_buf *, const char *func);
+ extern void xfs_buf_iorequest(xfs_buf_t *);
+diff --git a/fs/xfs/xfs_buf_item.c b/fs/xfs/xfs_buf_item.c
+index fc73b0d1e302..702446ccf86d 100644
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@ -491,7 +491,7 @@ xfs_buf_item_unpin(
+ 		xfs_buf_ioerror(bp, EIO);
+ 		XFS_BUF_UNDONE(bp);
+ 		xfs_buf_stale(bp);
+-		xfs_buf_ioend(bp, 0);
++		xfs_buf_ioend(bp);
+ 	}
+ }
+ 
+@@ -1115,7 +1115,7 @@ do_callbacks:
+ 	xfs_buf_do_callbacks(bp);
+ 	bp->b_fspriv = NULL;
+ 	bp->b_iodone = NULL;
+-	xfs_buf_ioend(bp, 0);
++	xfs_buf_ioend(bp);
+ }
+ 
+ /*
+* Unmerged path fs/xfs/xfs_inode.c
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index b7fb382e491a..0ab92187b6ca 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -1678,7 +1678,7 @@ xlog_bdstrat(
+ 	if (iclog->ic_state & XLOG_STATE_IOERROR) {
+ 		xfs_buf_ioerror(bp, EIO);
+ 		xfs_buf_stale(bp);
+-		xfs_buf_ioend(bp, 0);
++		xfs_buf_ioend(bp);
+ 		/*
+ 		 * It would seem logical to return EIO here, but we rely on
+ 		 * the log state machine to propagate I/O errors instead of
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 7b97b53b2b95..9c3f3e869cdb 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -384,7 +384,7 @@ xlog_recover_iodone(
+ 					SHUTDOWN_META_IO_ERROR);
+ 	}
+ 	bp->b_iodone = NULL;
+-	xfs_buf_ioend(bp, 0);
++	xfs_buf_ioend(bp);
+ }
+ 
+ /*
