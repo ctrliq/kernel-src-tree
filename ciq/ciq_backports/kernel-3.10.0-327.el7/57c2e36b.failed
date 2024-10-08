@@ -1,0 +1,143 @@
+vmstat: Reduce time interval to stat update on idle cpu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Lameter <cl@linux.com>
+commit 57c2e36b6f4dd52e7e90f4c748a665b13fa228d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/57c2e36b.failed
+
+It was noted that the vm stat shepherd runs every 2 seconds and that the
+vmstat update is then scheduled 2 seconds in the future.
+
+This yields an interval of double the time interval which is not desired.
+
+Change the shepherd so that it does not delay the vmstat update on the
+other cpu.  We stil have to use schedule_delayed_work since we are using a
+delayed_work_struct but we can set the delay to 0.
+
+	Signed-off-by: Christoph Lameter <cl@linux.com>
+	Acked-by: Michal Hocko <mhocko@suse.cz>
+	Cc: Vinayak Menon <vinmenon@codeaurora.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 57c2e36b6f4dd52e7e90f4c748a665b13fa228d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmstat.c
+diff --cc mm/vmstat.c
+index 63f525670e51,4f5cd974e11a..000000000000
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@@ -1185,8 -1362,104 +1185,108 @@@ int sysctl_stat_interval __read_mostly 
+  
+  static void vmstat_update(struct work_struct *w)
+  {
+++<<<<<<< HEAD
+ +	refresh_cpu_vm_stats(smp_processor_id());
+ +	schedule_delayed_work(&__get_cpu_var(vmstat_work),
+++=======
++ 	if (refresh_cpu_vm_stats())
++ 		/*
++ 		 * Counters were updated so we expect more updates
++ 		 * to occur in the future. Keep on running the
++ 		 * update worker thread.
++ 		 */
++ 		schedule_delayed_work(this_cpu_ptr(&vmstat_work),
++ 			round_jiffies_relative(sysctl_stat_interval));
++ 	else {
++ 		/*
++ 		 * We did not update any counters so the app may be in
++ 		 * a mode where it does not cause counter updates.
++ 		 * We may be uselessly running vmstat_update.
++ 		 * Defer the checking for differentials to the
++ 		 * shepherd thread on a different processor.
++ 		 */
++ 		int r;
++ 		/*
++ 		 * Shepherd work thread does not race since it never
++ 		 * changes the bit if its zero but the cpu
++ 		 * online / off line code may race if
++ 		 * worker threads are still allowed during
++ 		 * shutdown / startup.
++ 		 */
++ 		r = cpumask_test_and_set_cpu(smp_processor_id(),
++ 			cpu_stat_off);
++ 		VM_BUG_ON(r);
++ 	}
++ }
++ 
++ /*
++  * Check if the diffs for a certain cpu indicate that
++  * an update is needed.
++  */
++ static bool need_update(int cpu)
++ {
++ 	struct zone *zone;
++ 
++ 	for_each_populated_zone(zone) {
++ 		struct per_cpu_pageset *p = per_cpu_ptr(zone->pageset, cpu);
++ 
++ 		BUILD_BUG_ON(sizeof(p->vm_stat_diff[0]) != 1);
++ 		/*
++ 		 * The fast way of checking if there are any vmstat diffs.
++ 		 * This works because the diffs are byte sized items.
++ 		 */
++ 		if (memchr_inv(p->vm_stat_diff, 0, NR_VM_ZONE_STAT_ITEMS))
++ 			return true;
++ 
++ 	}
++ 	return false;
++ }
++ 
++ 
++ /*
++  * Shepherd worker thread that checks the
++  * differentials of processors that have their worker
++  * threads for vm statistics updates disabled because of
++  * inactivity.
++  */
++ static void vmstat_shepherd(struct work_struct *w);
++ 
++ static DECLARE_DELAYED_WORK(shepherd, vmstat_shepherd);
++ 
++ static void vmstat_shepherd(struct work_struct *w)
++ {
++ 	int cpu;
++ 
++ 	get_online_cpus();
++ 	/* Check processors whose vmstat worker threads have been disabled */
++ 	for_each_cpu(cpu, cpu_stat_off)
++ 		if (need_update(cpu) &&
++ 			cpumask_test_and_clear_cpu(cpu, cpu_stat_off))
++ 
++ 			schedule_delayed_work_on(cpu,
++ 				&per_cpu(vmstat_work, cpu), 0);
++ 
++ 	put_online_cpus();
++ 
++ 	schedule_delayed_work(&shepherd,
++ 		round_jiffies_relative(sysctl_stat_interval));
++ 
++ }
++ 
++ static void __init start_shepherd_timer(void)
++ {
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu)
++ 		INIT_DELAYED_WORK(per_cpu_ptr(&vmstat_work, cpu),
++ 			vmstat_update);
++ 
++ 	if (!alloc_cpumask_var(&cpu_stat_off, GFP_KERNEL))
++ 		BUG();
++ 	cpumask_copy(cpu_stat_off, cpu_online_mask);
++ 
++ 	schedule_delayed_work(&shepherd,
+++>>>>>>> 57c2e36b6f4d (vmstat: Reduce time interval to stat update on idle cpu)
+  		round_jiffies_relative(sysctl_stat_interval));
+  }
+  
+* Unmerged path mm/vmstat.c
