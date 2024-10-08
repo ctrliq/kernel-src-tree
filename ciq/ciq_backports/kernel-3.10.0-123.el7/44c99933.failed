@@ -1,0 +1,526 @@
+NFS: Add method to detect whether an FSID is still on the server
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 44c9993384e9311cd56acf6ead3baffab616ae50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/44c99933.failed
+
+Introduce a mechanism for probing a server to determine if an FSID
+is present or absent.
+
+The on-the-wire compound is different between minor version 0 and 1.
+Minor version 0 appends a RENEW operation to identify which client
+ID is probing.  Minor version 1 has a SEQUENCE operation in the
+compound which effectively carries the same information.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+(cherry picked from commit 44c9993384e9311cd56acf6ead3baffab616ae50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4_fs.h
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4_fs.h
+index 174c8183b54e,2f0f8c216441..000000000000
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@@ -205,6 -206,9 +205,12 @@@ struct nfs4_state_maintenance_ops 
+  };
+  
+  struct nfs4_mig_recovery_ops {
+++<<<<<<< HEAD
+++=======
++ 	int (*get_locations)(struct inode *, struct nfs4_fs_locations *,
++ 		struct page *, struct rpc_cred *);
++ 	int (*fsid_present)(struct inode *, struct rpc_cred *);
+++>>>>>>> 44c9993384e9 (NFS: Add method to detect whether an FSID is still on the server)
+  };
+  
+  extern const struct dentry_operations nfs4_dentry_operations;
+@@@ -237,6 -241,9 +243,12 @@@ extern int nfs4_do_close(struct nfs4_st
+  extern int nfs4_server_capabilities(struct nfs_server *server, struct nfs_fh *fhandle);
+  extern int nfs4_proc_fs_locations(struct rpc_clnt *, struct inode *, const struct qstr *,
+  				  struct nfs4_fs_locations *, struct page *);
+++<<<<<<< HEAD
+++=======
++ extern int nfs4_proc_get_locations(struct inode *, struct nfs4_fs_locations *,
++ 		struct page *page, struct rpc_cred *);
++ extern int nfs4_proc_fsid_present(struct inode *, struct rpc_cred *);
+++>>>>>>> 44c9993384e9 (NFS: Add method to detect whether an FSID is still on the server)
+  extern struct rpc_clnt *nfs4_proc_lookup_mountpoint(struct inode *, struct qstr *,
+  			    struct nfs_fh *, struct nfs_fattr *);
+  extern int nfs4_proc_secinfo(struct inode *, const struct qstr *, struct nfs4_secinfo_flavors *);
+diff --cc fs/nfs/nfs4proc.c
+index f0305a2a8018,01b90bd341bb..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -5538,11 -6002,291 +5538,174 @@@ int nfs4_proc_fs_locations(struct rpc_c
+  	return err;
+  }
+  
+ -/*
+ - * This operation also signals the server that this client is
+ - * performing migration recovery.  The server can stop returning
+ - * NFS4ERR_LEASE_MOVED to this client.  A RENEW operation is
+ - * appended to this compound to identify the client ID which is
+ - * performing recovery.
+ - */
+ -static int _nfs40_proc_get_locations(struct inode *inode,
+ -				     struct nfs4_fs_locations *locations,
+ -				     struct page *page, struct rpc_cred *cred)
+ -{
+ -	struct nfs_server *server = NFS_SERVER(inode);
+ -	struct rpc_clnt *clnt = server->client;
+ -	u32 bitmask[2] = {
+ -		[0] = FATTR4_WORD0_FSID | FATTR4_WORD0_FS_LOCATIONS,
+ -	};
+ -	struct nfs4_fs_locations_arg args = {
+ -		.clientid	= server->nfs_client->cl_clientid,
+ -		.fh		= NFS_FH(inode),
+ -		.page		= page,
+ -		.bitmask	= bitmask,
+ -		.migration	= 1,		/* skip LOOKUP */
+ -		.renew		= 1,		/* append RENEW */
+ -	};
+ -	struct nfs4_fs_locations_res res = {
+ -		.fs_locations	= locations,
+ -		.migration	= 1,
+ -		.renew		= 1,
+ -	};
+ -	struct rpc_message msg = {
+ -		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_FS_LOCATIONS],
+ -		.rpc_argp	= &args,
+ -		.rpc_resp	= &res,
+ -		.rpc_cred	= cred,
+ -	};
+ -	unsigned long now = jiffies;
+ -	int status;
+ -
+ -	nfs_fattr_init(&locations->fattr);
+ -	locations->server = server;
+ -	locations->nlocations = 0;
+ -
+ -	nfs4_init_sequence(&args.seq_args, &res.seq_res, 0);
+ -	nfs4_set_sequence_privileged(&args.seq_args);
+ -	status = nfs4_call_sync_sequence(clnt, server, &msg,
+ -					&args.seq_args, &res.seq_res);
+ -	if (status)
+ -		return status;
+ -
+ -	renew_lease(server, now);
+ -	return 0;
+ -}
+ -
+ -#ifdef CONFIG_NFS_V4_1
+ -
+ -/*
+ - * This operation also signals the server that this client is
+ - * performing migration recovery.  The server can stop asserting
+ - * SEQ4_STATUS_LEASE_MOVED for this client.  The client ID
+ - * performing this operation is identified in the SEQUENCE
+ - * operation in this compound.
+ - *
+ - * When the client supports GETATTR(fs_locations_info), it can
+ - * be plumbed in here.
+ - */
+ -static int _nfs41_proc_get_locations(struct inode *inode,
+ -				     struct nfs4_fs_locations *locations,
+ -				     struct page *page, struct rpc_cred *cred)
+ -{
+ -	struct nfs_server *server = NFS_SERVER(inode);
+ -	struct rpc_clnt *clnt = server->client;
+ -	u32 bitmask[2] = {
+ -		[0] = FATTR4_WORD0_FSID | FATTR4_WORD0_FS_LOCATIONS,
+ -	};
+ -	struct nfs4_fs_locations_arg args = {
+ -		.fh		= NFS_FH(inode),
+ -		.page		= page,
+ -		.bitmask	= bitmask,
+ -		.migration	= 1,		/* skip LOOKUP */
+ -	};
+ -	struct nfs4_fs_locations_res res = {
+ -		.fs_locations	= locations,
+ -		.migration	= 1,
+ -	};
+ -	struct rpc_message msg = {
+ -		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_FS_LOCATIONS],
+ -		.rpc_argp	= &args,
+ -		.rpc_resp	= &res,
+ -		.rpc_cred	= cred,
+ -	};
+ -	int status;
+ -
+ -	nfs_fattr_init(&locations->fattr);
+ -	locations->server = server;
+ -	locations->nlocations = 0;
+ -
+ -	nfs4_init_sequence(&args.seq_args, &res.seq_res, 0);
+ -	nfs4_set_sequence_privileged(&args.seq_args);
+ -	status = nfs4_call_sync_sequence(clnt, server, &msg,
+ -					&args.seq_args, &res.seq_res);
+ -	if (status == NFS4_OK &&
+ -	    res.seq_res.sr_status_flags & SEQ4_STATUS_LEASE_MOVED)
+ -		status = -NFS4ERR_LEASE_MOVED;
+ -	return status;
+ -}
+ -
+ -#endif	/* CONFIG_NFS_V4_1 */
+ -
+  /**
+ - * nfs4_proc_get_locations - discover locations for a migrated FSID
+ - * @inode: inode on FSID that is migrating
+ - * @locations: result of query
+ - * @page: buffer
+ - * @cred: credential to use for this operation
+ - *
+ - * Returns NFS4_OK on success, a negative NFS4ERR status code if the
+ - * operation failed, or a negative errno if a local error occurred.
+ - *
+ - * On success, "locations" is filled in, but if the server has
+ - * no locations information, NFS_ATTR_FATTR_V4_LOCATIONS is not
+ - * asserted.
+ - *
+ - * -NFS4ERR_LEASE_MOVED is returned if the server still has leases
+ - * from this client that require migration recovery.
+ + * Use the state managment nfs_client cl_rpcclient, which uses krb5i (if
+ + * possible) as per RFC3530bis and RFC5661 Security Considerations sections
+   */
+++<<<<<<< HEAD
+ +static int _nfs4_proc_secinfo(struct inode *dir, const struct qstr *name, struct nfs4_secinfo_flavors *flavors)
+++=======
++ int nfs4_proc_get_locations(struct inode *inode,
++ 			    struct nfs4_fs_locations *locations,
++ 			    struct page *page, struct rpc_cred *cred)
++ {
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct nfs_client *clp = server->nfs_client;
++ 	const struct nfs4_mig_recovery_ops *ops =
++ 					clp->cl_mvops->mig_recovery_ops;
++ 	struct nfs4_exception exception = { };
++ 	int status;
++ 
++ 	dprintk("%s: FSID %llx:%llx on \"%s\"\n", __func__,
++ 		(unsigned long long)server->fsid.major,
++ 		(unsigned long long)server->fsid.minor,
++ 		clp->cl_hostname);
++ 	nfs_display_fhandle(NFS_FH(inode), __func__);
++ 
++ 	do {
++ 		status = ops->get_locations(inode, locations, page, cred);
++ 		if (status != -NFS4ERR_DELAY)
++ 			break;
++ 		nfs4_handle_exception(server, status, &exception);
++ 	} while (exception.retry);
++ 	return status;
++ }
++ 
++ /*
++  * This operation also signals the server that this client is
++  * performing "lease moved" recovery.  The server can stop
++  * returning NFS4ERR_LEASE_MOVED to this client.  A RENEW operation
++  * is appended to this compound to identify the client ID which is
++  * performing recovery.
++  */
++ static int _nfs40_proc_fsid_present(struct inode *inode, struct rpc_cred *cred)
++ {
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct nfs_client *clp = NFS_SERVER(inode)->nfs_client;
++ 	struct rpc_clnt *clnt = server->client;
++ 	struct nfs4_fsid_present_arg args = {
++ 		.fh		= NFS_FH(inode),
++ 		.clientid	= clp->cl_clientid,
++ 		.renew		= 1,		/* append RENEW */
++ 	};
++ 	struct nfs4_fsid_present_res res = {
++ 		.renew		= 1,
++ 	};
++ 	struct rpc_message msg = {
++ 		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_FSID_PRESENT],
++ 		.rpc_argp	= &args,
++ 		.rpc_resp	= &res,
++ 		.rpc_cred	= cred,
++ 	};
++ 	unsigned long now = jiffies;
++ 	int status;
++ 
++ 	res.fh = nfs_alloc_fhandle();
++ 	if (res.fh == NULL)
++ 		return -ENOMEM;
++ 
++ 	nfs4_init_sequence(&args.seq_args, &res.seq_res, 0);
++ 	nfs4_set_sequence_privileged(&args.seq_args);
++ 	status = nfs4_call_sync_sequence(clnt, server, &msg,
++ 						&args.seq_args, &res.seq_res);
++ 	nfs_free_fhandle(res.fh);
++ 	if (status)
++ 		return status;
++ 
++ 	do_renew_lease(clp, now);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_NFS_V4_1
++ 
++ /*
++  * This operation also signals the server that this client is
++  * performing "lease moved" recovery.  The server can stop asserting
++  * SEQ4_STATUS_LEASE_MOVED for this client.  The client ID performing
++  * this operation is identified in the SEQUENCE operation in this
++  * compound.
++  */
++ static int _nfs41_proc_fsid_present(struct inode *inode, struct rpc_cred *cred)
++ {
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct rpc_clnt *clnt = server->client;
++ 	struct nfs4_fsid_present_arg args = {
++ 		.fh		= NFS_FH(inode),
++ 	};
++ 	struct nfs4_fsid_present_res res = {
++ 	};
++ 	struct rpc_message msg = {
++ 		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_FSID_PRESENT],
++ 		.rpc_argp	= &args,
++ 		.rpc_resp	= &res,
++ 		.rpc_cred	= cred,
++ 	};
++ 	int status;
++ 
++ 	res.fh = nfs_alloc_fhandle();
++ 	if (res.fh == NULL)
++ 		return -ENOMEM;
++ 
++ 	nfs4_init_sequence(&args.seq_args, &res.seq_res, 0);
++ 	nfs4_set_sequence_privileged(&args.seq_args);
++ 	status = nfs4_call_sync_sequence(clnt, server, &msg,
++ 						&args.seq_args, &res.seq_res);
++ 	nfs_free_fhandle(res.fh);
++ 	if (status == NFS4_OK &&
++ 	    res.seq_res.sr_status_flags & SEQ4_STATUS_LEASE_MOVED)
++ 		status = -NFS4ERR_LEASE_MOVED;
++ 	return status;
++ }
++ 
++ #endif	/* CONFIG_NFS_V4_1 */
++ 
++ /**
++  * nfs4_proc_fsid_present - Is this FSID present or absent on server?
++  * @inode: inode on FSID to check
++  * @cred: credential to use for this operation
++  *
++  * Server indicates whether the FSID is present, moved, or not
++  * recognized.  This operation is necessary to clear a LEASE_MOVED
++  * condition for this client ID.
++  *
++  * Returns NFS4_OK if the FSID is present on this server,
++  * -NFS4ERR_MOVED if the FSID is no longer present, a negative
++  *  NFS4ERR code if some error occurred on the server, or a
++  *  negative errno if a local failure occurred.
++  */
++ int nfs4_proc_fsid_present(struct inode *inode, struct rpc_cred *cred)
++ {
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct nfs_client *clp = server->nfs_client;
++ 	const struct nfs4_mig_recovery_ops *ops =
++ 					clp->cl_mvops->mig_recovery_ops;
++ 	struct nfs4_exception exception = { };
++ 	int status;
++ 
++ 	dprintk("%s: FSID %llx:%llx on \"%s\"\n", __func__,
++ 		(unsigned long long)server->fsid.major,
++ 		(unsigned long long)server->fsid.minor,
++ 		clp->cl_hostname);
++ 	nfs_display_fhandle(NFS_FH(inode), __func__);
++ 
++ 	do {
++ 		status = ops->fsid_present(inode, cred);
++ 		if (status != -NFS4ERR_DELAY)
++ 			break;
++ 		nfs4_handle_exception(server, status, &exception);
++ 	} while (exception.retry);
++ 	return status;
++ }
++ 
++ /**
++  * If 'use_integrity' is true and the state managment nfs_client
++  * cl_rpcclient is using krb5i/p, use the integrity protected cl_rpcclient
++  * and the machine credential as per RFC3530bis and RFC5661 Security
++  * Considerations sections. Otherwise, just use the user cred with the
++  * filesystem's rpc_client.
++  */
++ static int _nfs4_proc_secinfo(struct inode *dir, const struct qstr *name, struct nfs4_secinfo_flavors *flavors, bool use_integrity)
+++>>>>>>> 44c9993384e9 (NFS: Add method to detect whether an FSID is still on the server)
+  {
+  	int status;
+  	struct nfs4_secinfo_arg args = {
+@@@ -7359,10 -8177,14 +7522,20 @@@ static const struct nfs4_state_maintena
+  #endif
+  
+  static const struct nfs4_mig_recovery_ops nfs40_mig_recovery_ops = {
+++<<<<<<< HEAD
+++=======
++ 	.get_locations = _nfs40_proc_get_locations,
++ 	.fsid_present = _nfs40_proc_fsid_present,
+++>>>>>>> 44c9993384e9 (NFS: Add method to detect whether an FSID is still on the server)
+  };
+  
+  #if defined(CONFIG_NFS_V4_1)
+  static const struct nfs4_mig_recovery_ops nfs41_mig_recovery_ops = {
+++<<<<<<< HEAD
+++=======
++ 	.get_locations = _nfs41_proc_get_locations,
++ 	.fsid_present = _nfs41_proc_fsid_present,
+++>>>>>>> 44c9993384e9 (NFS: Add method to detect whether an FSID is still on the server)
+  };
+  #endif	/* CONFIG_NFS_V4_1 */
+  
+* Unmerged path fs/nfs/nfs4_fs.h
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4xdr.c b/fs/nfs/nfs4xdr.c
+index 437b5123a2e6..6423286647f8 100644
+--- a/fs/nfs/nfs4xdr.c
++++ b/fs/nfs/nfs4xdr.c
+@@ -581,11 +581,13 @@ static int nfs4_stat_to_errno(int);
+ #define NFS4_enc_getattr_sz	(compound_encode_hdr_maxsz + \
+ 				encode_sequence_maxsz + \
+ 				encode_putfh_maxsz + \
+-				encode_getattr_maxsz)
++				encode_getattr_maxsz + \
++				encode_renew_maxsz)
+ #define NFS4_dec_getattr_sz	(compound_decode_hdr_maxsz + \
+ 				decode_sequence_maxsz + \
+ 				decode_putfh_maxsz + \
+-				decode_getattr_maxsz)
++				decode_getattr_maxsz + \
++				decode_renew_maxsz)
+ #define NFS4_enc_lookup_sz	(compound_encode_hdr_maxsz + \
+ 				encode_sequence_maxsz + \
+ 				encode_putfh_maxsz + \
+@@ -737,6 +739,18 @@ static int nfs4_stat_to_errno(int);
+ 				decode_sequence_maxsz + \
+ 				decode_putfh_maxsz + \
+ 				decode_secinfo_maxsz)
++#define NFS4_enc_fsid_present_sz \
++				(compound_encode_hdr_maxsz + \
++				 encode_sequence_maxsz + \
++				 encode_putfh_maxsz + \
++				 encode_getfh_maxsz + \
++				 encode_renew_maxsz)
++#define NFS4_dec_fsid_present_sz \
++				(compound_decode_hdr_maxsz + \
++				 decode_sequence_maxsz + \
++				 decode_putfh_maxsz + \
++				 decode_getfh_maxsz + \
++				 decode_renew_maxsz)
+ #if defined(CONFIG_NFS_V4_1)
+ #define NFS4_enc_bind_conn_to_session_sz \
+ 				(compound_encode_hdr_maxsz + \
+@@ -2706,6 +2720,26 @@ static void nfs4_xdr_enc_secinfo(struct rpc_rqst *req,
+ 	encode_nops(&hdr);
+ }
+ 
++/*
++ * Encode FSID_PRESENT request
++ */
++static void nfs4_xdr_enc_fsid_present(struct rpc_rqst *req,
++				      struct xdr_stream *xdr,
++				      struct nfs4_fsid_present_arg *args)
++{
++	struct compound_hdr hdr = {
++		.minorversion = nfs4_xdr_minorversion(&args->seq_args),
++	};
++
++	encode_compound_hdr(xdr, req, &hdr);
++	encode_sequence(xdr, &args->seq_args, &hdr);
++	encode_putfh(xdr, args->fh, &hdr);
++	encode_getfh(xdr, &hdr);
++	if (args->renew)
++		encode_renew(xdr, args->clientid, &hdr);
++	encode_nops(&hdr);
++}
++
+ #if defined(CONFIG_NFS_V4_1)
+ /*
+  * BIND_CONN_TO_SESSION request
+@@ -6783,6 +6817,34 @@ out:
+ 	return status;
+ }
+ 
++/*
++ * Decode FSID_PRESENT response
++ */
++static int nfs4_xdr_dec_fsid_present(struct rpc_rqst *rqstp,
++				     struct xdr_stream *xdr,
++				     struct nfs4_fsid_present_res *res)
++{
++	struct compound_hdr hdr;
++	int status;
++
++	status = decode_compound_hdr(xdr, &hdr);
++	if (status)
++		goto out;
++	status = decode_sequence(xdr, &res->seq_res, rqstp);
++	if (status)
++		goto out;
++	status = decode_putfh(xdr);
++	if (status)
++		goto out;
++	status = decode_getfh(xdr, res->fh);
++	if (status)
++		goto out;
++	if (res->renew)
++		status = decode_renew(xdr);
++out:
++	return status;
++}
++
+ #if defined(CONFIG_NFS_V4_1)
+ /*
+  * Decode BIND_CONN_TO_SESSION response
+@@ -7297,6 +7359,7 @@ struct rpc_procinfo	nfs4_procedures[] = {
+ 	PROC(FS_LOCATIONS,	enc_fs_locations,	dec_fs_locations),
+ 	PROC(RELEASE_LOCKOWNER,	enc_release_lockowner,	dec_release_lockowner),
+ 	PROC(SECINFO,		enc_secinfo,		dec_secinfo),
++	PROC(FSID_PRESENT,	enc_fsid_present,	dec_fsid_present),
+ #if defined(CONFIG_NFS_V4_1)
+ 	PROC(EXCHANGE_ID,	enc_exchange_id,	dec_exchange_id),
+ 	PROC(CREATE_SESSION,	enc_create_session,	dec_create_session),
+diff --git a/include/linux/nfs4.h b/include/linux/nfs4.h
+index 3859ddbecb5f..bfe6c379a24e 100644
+--- a/include/linux/nfs4.h
++++ b/include/linux/nfs4.h
+@@ -460,6 +460,7 @@ enum {
+ 	NFSPROC4_CLNT_FS_LOCATIONS,
+ 	NFSPROC4_CLNT_RELEASE_LOCKOWNER,
+ 	NFSPROC4_CLNT_SECINFO,
++	NFSPROC4_CLNT_FSID_PRESENT,
+ 
+ 	/* nfs41 */
+ 	NFSPROC4_CLNT_EXCHANGE_ID,
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index 99dc96aaa00c..a3376df1a9ac 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1084,6 +1084,19 @@ struct nfs4_secinfo_res {
+ 	struct nfs4_secinfo_flavors	*flavors;
+ };
+ 
++struct nfs4_fsid_present_arg {
++	struct nfs4_sequence_args	seq_args;
++	const struct nfs_fh		*fh;
++	clientid4			clientid;
++	unsigned char			renew:1;
++};
++
++struct nfs4_fsid_present_res {
++	struct nfs4_sequence_res	seq_res;
++	struct nfs_fh			*fh;
++	unsigned char			renew:1;
++};
++
+ #endif /* CONFIG_NFS_V4 */
+ 
+ struct nfstime4 {
