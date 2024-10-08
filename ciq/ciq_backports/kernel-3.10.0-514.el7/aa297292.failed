@@ -1,0 +1,433 @@
+x86/tsc: Enumerate SKL cpu_khz and tsc_khz via CPUID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] tsc: Enumerate SKL cpu_khz and tsc_khz via CPUID (Prarit Bhargava) [1366396]
+Rebuild_FUZZ: 96.00%
+commit-author Len Brown <len.brown@intel.com>
+commit aa297292d708e89773b3b2cdcaf33f01bfa095d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/aa297292.failed
+
+Skylake CPU base-frequency and TSC frequency may differ
+by up to 2%.
+
+Enumerate CPU and TSC frequencies separately, allowing
+cpu_khz and tsc_khz to differ.
+
+The existing CPU frequency calibration mechanism is unchanged.
+However, CPUID extensions are preferred, when available.
+
+CPUID.0x16 is preferred over MSR and timer calibration
+for CPU frequency discovery.
+
+CPUID.0x15 takes precedence over CPU-frequency
+for TSC frequency discovery.
+
+	Signed-off-by: Len Brown <len.brown@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/b27ec289fd005833b27d694d9c2dbb716c5cdff7.1466138954.git.len.brown@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit aa297292d708e89773b3b2cdcaf33f01bfa095d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/tsc.c
+diff --cc arch/x86/kernel/tsc.c
+index 934c769b779b,e1496b79c28a..000000000000
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@@ -35,12 -36,254 +35,257 @@@ static int __read_mostly tsc_unstable
+  
+  /* native_sched_clock() is called before tsc_init(), so
+     we must start with the TSC soft disabled to prevent
+ -   erroneous rdtsc usage on !boot_cpu_has(X86_FEATURE_TSC) processors */
+ +   erroneous rdtsc usage on !cpu_has_tsc processors */
+  static int __read_mostly tsc_disabled = -1;
+  
+ -static DEFINE_STATIC_KEY_FALSE(__use_tsc);
+ +static struct static_key __use_tsc = STATIC_KEY_INIT;
+  
+  int tsc_clocksource_reliable;
+++<<<<<<< HEAD
+++=======
++ 
++ static u32 art_to_tsc_numerator;
++ static u32 art_to_tsc_denominator;
++ static u64 art_to_tsc_offset;
++ struct clocksource *art_related_clocksource;
++ 
++ /*
++  * Use a ring-buffer like data structure, where a writer advances the head by
++  * writing a new data entry and a reader advances the tail when it observes a
++  * new entry.
++  *
++  * Writers are made to wait on readers until there's space to write a new
++  * entry.
++  *
++  * This means that we can always use an {offset, mul} pair to compute a ns
++  * value that is 'roughly' in the right direction, even if we're writing a new
++  * {offset, mul} pair during the clock read.
++  *
++  * The down-side is that we can no longer guarantee strict monotonicity anymore
++  * (assuming the TSC was that to begin with), because while we compute the
++  * intersection point of the two clock slopes and make sure the time is
++  * continuous at the point of switching; we can no longer guarantee a reader is
++  * strictly before or after the switch point.
++  *
++  * It does mean a reader no longer needs to disable IRQs in order to avoid
++  * CPU-Freq updates messing with his times, and similarly an NMI reader will
++  * no longer run the risk of hitting half-written state.
++  */
++ 
++ struct cyc2ns {
++ 	struct cyc2ns_data data[2];	/*  0 + 2*24 = 48 */
++ 	struct cyc2ns_data *head;	/* 48 + 8    = 56 */
++ 	struct cyc2ns_data *tail;	/* 56 + 8    = 64 */
++ }; /* exactly fits one cacheline */
++ 
++ static DEFINE_PER_CPU_ALIGNED(struct cyc2ns, cyc2ns);
++ 
++ struct cyc2ns_data *cyc2ns_read_begin(void)
++ {
++ 	struct cyc2ns_data *head;
++ 
++ 	preempt_disable();
++ 
++ 	head = this_cpu_read(cyc2ns.head);
++ 	/*
++ 	 * Ensure we observe the entry when we observe the pointer to it.
++ 	 * matches the wmb from cyc2ns_write_end().
++ 	 */
++ 	smp_read_barrier_depends();
++ 	head->__count++;
++ 	barrier();
++ 
++ 	return head;
++ }
++ 
++ void cyc2ns_read_end(struct cyc2ns_data *head)
++ {
++ 	barrier();
++ 	/*
++ 	 * If we're the outer most nested read; update the tail pointer
++ 	 * when we're done. This notifies possible pending writers
++ 	 * that we've observed the head pointer and that the other
++ 	 * entry is now free.
++ 	 */
++ 	if (!--head->__count) {
++ 		/*
++ 		 * x86-TSO does not reorder writes with older reads;
++ 		 * therefore once this write becomes visible to another
++ 		 * cpu, we must be finished reading the cyc2ns_data.
++ 		 *
++ 		 * matches with cyc2ns_write_begin().
++ 		 */
++ 		this_cpu_write(cyc2ns.tail, head);
++ 	}
++ 	preempt_enable();
++ }
++ 
++ /*
++  * Begin writing a new @data entry for @cpu.
++  *
++  * Assumes some sort of write side lock; currently 'provided' by the assumption
++  * that cpufreq will call its notifiers sequentially.
++  */
++ static struct cyc2ns_data *cyc2ns_write_begin(int cpu)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 	struct cyc2ns_data *data = c2n->data;
++ 
++ 	if (data == c2n->head)
++ 		data++;
++ 
++ 	/* XXX send an IPI to @cpu in order to guarantee a read? */
++ 
++ 	/*
++ 	 * When we observe the tail write from cyc2ns_read_end(),
++ 	 * the cpu must be done with that entry and its safe
++ 	 * to start writing to it.
++ 	 */
++ 	while (c2n->tail == data)
++ 		cpu_relax();
++ 
++ 	return data;
++ }
++ 
++ static void cyc2ns_write_end(int cpu, struct cyc2ns_data *data)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 
++ 	/*
++ 	 * Ensure the @data writes are visible before we publish the
++ 	 * entry. Matches the data-depencency in cyc2ns_read_begin().
++ 	 */
++ 	smp_wmb();
++ 
++ 	ACCESS_ONCE(c2n->head) = data;
++ }
++ 
++ /*
++  * Accelerators for sched_clock()
++  * convert from cycles(64bits) => nanoseconds (64bits)
++  *  basic equation:
++  *              ns = cycles / (freq / ns_per_sec)
++  *              ns = cycles * (ns_per_sec / freq)
++  *              ns = cycles * (10^9 / (cpu_khz * 10^3))
++  *              ns = cycles * (10^6 / cpu_khz)
++  *
++  *      Then we use scaling math (suggested by george@mvista.com) to get:
++  *              ns = cycles * (10^6 * SC / cpu_khz) / SC
++  *              ns = cycles * cyc2ns_scale / SC
++  *
++  *      And since SC is a constant power of two, we can convert the div
++  *  into a shift. The larger SC is, the more accurate the conversion, but
++  *  cyc2ns_scale needs to be a 32-bit value so that 32-bit multiplication
++  *  (64-bit result) can be used.
++  *
++  *  We can use khz divisor instead of mhz to keep a better precision.
++  *  (mathieu.desnoyers@polymtl.ca)
++  *
++  *                      -johnstul@us.ibm.com "math is hard, lets go shopping!"
++  */
++ 
++ static void cyc2ns_data_init(struct cyc2ns_data *data)
++ {
++ 	data->cyc2ns_mul = 0;
++ 	data->cyc2ns_shift = 0;
++ 	data->cyc2ns_offset = 0;
++ 	data->__count = 0;
++ }
++ 
++ static void cyc2ns_init(int cpu)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 
++ 	cyc2ns_data_init(&c2n->data[0]);
++ 	cyc2ns_data_init(&c2n->data[1]);
++ 
++ 	c2n->head = c2n->data;
++ 	c2n->tail = c2n->data;
++ }
++ 
++ static inline unsigned long long cycles_2_ns(unsigned long long cyc)
++ {
++ 	struct cyc2ns_data *data, *tail;
++ 	unsigned long long ns;
++ 
++ 	/*
++ 	 * See cyc2ns_read_*() for details; replicated in order to avoid
++ 	 * an extra few instructions that came with the abstraction.
++ 	 * Notable, it allows us to only do the __count and tail update
++ 	 * dance when its actually needed.
++ 	 */
++ 
++ 	preempt_disable_notrace();
++ 	data = this_cpu_read(cyc2ns.head);
++ 	tail = this_cpu_read(cyc2ns.tail);
++ 
++ 	if (likely(data == tail)) {
++ 		ns = data->cyc2ns_offset;
++ 		ns += mul_u64_u32_shr(cyc, data->cyc2ns_mul, data->cyc2ns_shift);
++ 	} else {
++ 		data->__count++;
++ 
++ 		barrier();
++ 
++ 		ns = data->cyc2ns_offset;
++ 		ns += mul_u64_u32_shr(cyc, data->cyc2ns_mul, data->cyc2ns_shift);
++ 
++ 		barrier();
++ 
++ 		if (!--data->__count)
++ 			this_cpu_write(cyc2ns.tail, data);
++ 	}
++ 	preempt_enable_notrace();
++ 
++ 	return ns;
++ }
++ 
++ static void set_cyc2ns_scale(unsigned long khz, int cpu)
++ {
++ 	unsigned long long tsc_now, ns_now;
++ 	struct cyc2ns_data *data;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	sched_clock_idle_sleep_event();
++ 
++ 	if (!khz)
++ 		goto done;
++ 
++ 	data = cyc2ns_write_begin(cpu);
++ 
++ 	tsc_now = rdtsc();
++ 	ns_now = cycles_2_ns(tsc_now);
++ 
++ 	/*
++ 	 * Compute a new multiplier as per the above comment and ensure our
++ 	 * time function is continuous; see the comment near struct
++ 	 * cyc2ns_data.
++ 	 */
++ 	clocks_calc_mult_shift(&data->cyc2ns_mul, &data->cyc2ns_shift, khz,
++ 			       NSEC_PER_MSEC, 0);
++ 
++ 	/*
++ 	 * cyc2ns_shift is exported via arch_perf_update_userpage() where it is
++ 	 * not expected to be greater than 31 due to the original published
++ 	 * conversion algorithm shifting a 32-bit value (now specifies a 64-bit
++ 	 * value) - refer perf_event_mmap_page documentation in perf_event.h.
++ 	 */
++ 	if (data->cyc2ns_shift == 32) {
++ 		data->cyc2ns_shift = 31;
++ 		data->cyc2ns_mul >>= 1;
++ 	}
++ 
++ 	data->cyc2ns_offset = ns_now -
++ 		mul_u64_u32_shr(tsc_now, data->cyc2ns_mul, data->cyc2ns_shift);
++ 
++ 	cyc2ns_write_end(cpu, data);
++ 
++ done:
++ 	sched_clock_idle_wakeup_event(0);
++ 	local_irq_restore(flags);
++ }
+++>>>>>>> aa297292d708 (x86/tsc: Enumerate SKL cpu_khz and tsc_khz via CPUID)
+  /*
+   * Scheduler clock - returns current time in nanosec units.
+   */
+@@@ -439,10 -727,11 +737,18 @@@ unsigned long native_calibrate_cpu(void
+  	unsigned long flags, latch, ms, fast_calibrate;
+  	int hpet = is_hpet_enabled(), i, loopmin;
+  
+++<<<<<<< HEAD
+ +	/* Calibrate TSC using MSR for Intel Atom SoCs */
+ +	local_irq_save(flags);
+ +	fast_calibrate = try_msr_calibrate_tsc();
+ +	local_irq_restore(flags);
+++=======
++ 	fast_calibrate = cpu_khz_from_cpuid();
++ 	if (fast_calibrate)
++ 		return fast_calibrate;
++ 
++ 	fast_calibrate = cpu_khz_from_msr();
+++>>>>>>> aa297292d708 (x86/tsc: Enumerate SKL cpu_khz and tsc_khz via CPUID)
+  	if (fast_calibrate)
+  		return fast_calibrate;
+  
+@@@ -599,15 -888,17 +905,27 @@@ int recalibrate_cpu_khz(void
+  #ifndef CONFIG_SMP
+  	unsigned long cpu_khz_old = cpu_khz;
+  
+ -	if (!boot_cpu_has(X86_FEATURE_TSC))
+ +	if (cpu_has_tsc) {
+ +		tsc_khz = x86_platform.calibrate_tsc();
+ +		cpu_khz = tsc_khz;
+ +		cpu_data(0).loops_per_jiffy =
+ +			cpufreq_scale(cpu_data(0).loops_per_jiffy,
+ +					cpu_khz_old, cpu_khz);
+ +		return 0;
+ +	} else
+  		return -ENODEV;
+++<<<<<<< HEAD
+++=======
++ 
++ 	cpu_khz = x86_platform.calibrate_cpu();
++ 	tsc_khz = x86_platform.calibrate_tsc();
++ 	if (tsc_khz == 0)
++ 		tsc_khz = cpu_khz;
++ 	cpu_data(0).loops_per_jiffy = cpufreq_scale(cpu_data(0).loops_per_jiffy,
++ 						    cpu_khz_old, cpu_khz);
++ 
++ 	return 0;
+++>>>>>>> aa297292d708 (x86/tsc: Enumerate SKL cpu_khz and tsc_khz via CPUID)
+  #else
+  	return -ENODEV;
+  #endif
+@@@ -995,13 -1295,15 +1313,15 @@@ void __init tsc_init(void
+  	u64 lpj;
+  	int cpu;
+  
+ -	if (!boot_cpu_has(X86_FEATURE_TSC)) {
+ -		setup_clear_cpu_cap(X86_FEATURE_TSC_DEADLINE_TIMER);
+ +	x86_init.timers.tsc_pre_init();
+ +
+ +	if (!cpu_has_tsc)
+  		return;
+ -	}
+  
++ 	cpu_khz = x86_platform.calibrate_cpu();
+  	tsc_khz = x86_platform.calibrate_tsc();
+- 	cpu_khz = tsc_khz;
++ 	if (tsc_khz == 0)
++ 		tsc_khz = cpu_khz;
+  
+  	if (!tsc_khz) {
+  		mark_tsc_unstable("could not calculate TSC khz");
+@@@ -1018,8 -1321,10 +1338,15 @@@
+  	 * speed as the bootup CPU. (cpufreq notifiers will fix this
+  	 * up if their speed diverges)
+  	 */
+++<<<<<<< HEAD
+ +	for_each_possible_cpu(cpu)
+ +		set_cyc2ns_scale(cpu_khz, cpu);
+++=======
++ 	for_each_possible_cpu(cpu) {
++ 		cyc2ns_init(cpu);
++ 		set_cyc2ns_scale(tsc_khz, cpu);
++ 	}
+++>>>>>>> aa297292d708 (x86/tsc: Enumerate SKL cpu_khz and tsc_khz via CPUID)
+  
+  	if (tsc_disabled > 0)
+  		return;
+diff --git a/arch/x86/include/asm/tsc.h b/arch/x86/include/asm/tsc.h
+index aad56eb3bbe2..a3f18f2f51f1 100644
+--- a/arch/x86/include/asm/tsc.h
++++ b/arch/x86/include/asm/tsc.h
+@@ -50,6 +50,7 @@ extern void mark_tsc_unstable(char *reason);
+ extern int unsynchronized_tsc(void);
+ extern int check_tsc_unstable(void);
+ extern int check_tsc_disabled(void);
++extern unsigned long native_calibrate_cpu(void);
+ extern unsigned long native_calibrate_tsc(void);
+ extern unsigned long long native_sched_clock_from_tsc(u64 tsc);
+ 
+diff --git a/arch/x86/include/asm/x86_init.h b/arch/x86/include/asm/x86_init.h
+index e45e4da96bf1..63546f22ade7 100644
+--- a/arch/x86/include/asm/x86_init.h
++++ b/arch/x86/include/asm/x86_init.h
+@@ -146,7 +146,8 @@ struct timespec;
+ 
+ /**
+  * struct x86_platform_ops - platform specific runtime functions
+- * @calibrate_tsc:		calibrate TSC
++ * @calibrate_cpu:		calibrate CPU
++ * @calibrate_tsc:		calibrate TSC, if different from CPU
+  * @get_wallclock:		get time from HW clock like RTC etc.
+  * @set_wallclock:		set time back to HW clock
+  * @is_untracked_pat_range	exclude from PAT logic
+@@ -157,6 +158,7 @@ struct timespec;
+  * @apic_post_init:		adjust apic if neeeded
+  */
+ struct x86_platform_ops {
++	unsigned long (*calibrate_cpu)(void);
+ 	unsigned long (*calibrate_tsc)(void);
+ 	void (*get_wallclock)(struct timespec *ts);
+ 	int (*set_wallclock)(const struct timespec *ts);
+* Unmerged path arch/x86/kernel/tsc.c
+diff --git a/arch/x86/kernel/x86_init.c b/arch/x86/kernel/x86_init.c
+index 8d367e03d7a8..b4c4bfd10b59 100644
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -93,6 +93,7 @@ static void default_nmi_init(void) { };
+ static int default_i8042_detect(void) { return 1; };
+ 
+ struct x86_platform_ops x86_platform = {
++	.calibrate_cpu			= native_calibrate_cpu,
+ 	.calibrate_tsc			= native_calibrate_tsc,
+ 	.get_wallclock			= mach_get_cmos_time,
+ 	.set_wallclock			= mach_set_rtc_mmss,
