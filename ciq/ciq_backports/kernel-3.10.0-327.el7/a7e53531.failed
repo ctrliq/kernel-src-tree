@@ -1,0 +1,374 @@
+fib_trie: Make fib_table rcu safe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit a7e53531234dc206bb75abb5305a72665dd4d75d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a7e53531.failed
+
+The fib_table was wrapped in several places with an
+rcu_read_lock/rcu_read_unlock however after looking over the code I found
+several spots where the tables were being accessed as just standard
+pointers without any protections.  This change fixes that so that all of
+the proper protections are in place when accessing the table to take RCU
+replacement or removal of the table into account.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a7e53531234dc206bb75abb5305a72665dd4d75d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 8be89b1a8b93,3642b17c8726..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -195,9 -190,16 +195,16 @@@ static inline struct tnode *tnode_get_c
+  static inline struct tnode *tnode_get_child_rcu(const struct tnode *tn,
+  						unsigned long i)
+  {
+ -	return rcu_dereference_rtnl(tn->tnode[i]);
+ +	return rcu_dereference_rtnl(tn->child[i]);
+  }
+  
++ static inline struct fib_table *trie_get_table(struct trie *t)
++ {
++ 	unsigned long *tb_data = (unsigned long *)t;
++ 
++ 	return container_of(tb_data, struct fib_table, tb_data[0]);
++ }
++ 
+  /* To understand this stuff, an understanding of keys and all their bits is
+   * necessary. Every node in the trie has a key associated with it, but not
+   * all of the bits in that key are significant.
+@@@ -1711,15 -1611,19 +1719,25 @@@ static void __trie_free_rcu(struct rcu_
+  	kfree(tb);
+  }
+  
+++<<<<<<< HEAD
+ +static int fn_trie_dump_fa(t_key key, int plen, struct list_head *fah,
+ +			   struct fib_table *tb,
+ +			   struct sk_buff *skb, struct netlink_callback *cb)
+++=======
++ void fib_free_table(struct fib_table *tb)
++ {
++ 	call_rcu(&tb->rcu, __trie_free_rcu);
++ }
++ 
++ static int fn_trie_dump_leaf(struct tnode *l, struct fib_table *tb,
++ 			     struct sk_buff *skb, struct netlink_callback *cb)
+++>>>>>>> a7e53531234d (fib_trie: Make fib_table rcu safe)
+  {
+ -	__be32 xkey = htonl(l->key);
+ -	struct fib_alias *fa;
+  	int i, s_i;
+ +	struct fib_alias *fa;
+ +	__be32 xkey = htonl(key);
+  
+ -	s_i = cb->args[4];
+ +	s_i = cb->args[5];
+  	i = 0;
+  
+  	/* rcu_read_lock is hold by caller */
+@@@ -1793,32 -1661,31 +1812,47 @@@ int fib_table_dump(struct fib_table *tb
+  	/* Dump starting at last key.
+  	 * Note: 0.0.0.0/0 (ie default) is first key.
+  	 */
+ -	int count = cb->args[2];
+ -	t_key key = cb->args[3];
+ +	if (count == 0)
+ +		l = trie_firstleaf(t);
+ +	else {
+ +		/* Normally, continue from last key, but if that is missing
+ +		 * fallback to using slow rescan
+ +		 */
+ +		l = fib_find_node(t, key);
+ +		if (!l)
+ +			l = trie_leafindex(t, count);
+ +	}
+  
+++<<<<<<< HEAD
+ +	while (l) {
+ +		cb->args[2] = l->key;
+ +		if (fn_trie_dump_leaf(l, tb, skb, cb) < 0) {
+ +			cb->args[3] = count;
+ +			rcu_read_unlock();
+++=======
++ 	tp = rcu_dereference_rtnl(t->trie);
++ 
++ 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
++ 		if (fn_trie_dump_leaf(l, tb, skb, cb) < 0) {
++ 			cb->args[3] = key;
++ 			cb->args[2] = count;
+++>>>>>>> a7e53531234d (fib_trie: Make fib_table rcu safe)
+  			return -1;
+  		}
+  
+  		++count;
+ -		key = l->key + 1;
+ -
+ +		l = trie_nextleaf(l);
+  		memset(&cb->args[4], 0,
+  		       sizeof(cb->args) - 4*sizeof(cb->args[0]));
+ -
+ -		/* stop loop if key wrapped back to 0 */
+ -		if (key < l->key)
+ -			break;
+  	}
+++<<<<<<< HEAD
+ +	cb->args[3] = count;
+ +	rcu_read_unlock();
+++=======
++ 
++ 	cb->args[3] = key;
++ 	cb->args[2] = count;
+++>>>>>>> a7e53531234d (fib_trie: Make fib_table rcu safe)
+  
+  	return skb->len;
+  }
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index b6b47c06a6d0..e33c2462139f 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -183,6 +183,7 @@ struct fib_table {
+ 	u32			tb_id;
+ 	int			tb_default;
+ 	int			tb_num_default;
++	struct rcu_head		rcu;
+ 	unsigned long		tb_data[0];
+ };
+ 
+@@ -204,12 +205,16 @@ extern void fib_free_table(struct fib_table *tb);
+ 
+ static inline struct fib_table *fib_get_table(struct net *net, u32 id)
+ {
++	struct hlist_node *tb_hlist;
+ 	struct hlist_head *ptr;
+ 
+ 	ptr = id == RT_TABLE_LOCAL ?
+ 		&net->ipv4.fib_table_hash[TABLE_LOCAL_INDEX] :
+ 		&net->ipv4.fib_table_hash[TABLE_MAIN_INDEX];
+-	return hlist_entry(ptr->first, struct fib_table, tb_hlist);
++
++	tb_hlist = rcu_dereference_rtnl(hlist_first_rcu(ptr));
++
++	return hlist_entry(tb_hlist, struct fib_table, tb_hlist);
+ }
+ 
+ static inline struct fib_table *fib_new_table(struct net *net, u32 id)
+@@ -220,15 +225,19 @@ static inline struct fib_table *fib_new_table(struct net *net, u32 id)
+ static inline int fib_lookup(struct net *net, const struct flowi4 *flp,
+ 			     struct fib_result *res)
+ {
+-	int err = -ENETUNREACH;
++	struct fib_table *tb;
++	int err;
+ 
+ 	rcu_read_lock();
+ 
+-	if (!fib_table_lookup(fib_get_table(net, RT_TABLE_LOCAL), flp, res,
+-			      FIB_LOOKUP_NOREF) ||
+-	    !fib_table_lookup(fib_get_table(net, RT_TABLE_MAIN), flp, res,
+-			      FIB_LOOKUP_NOREF))
+-		err = 0;
++	for (err = 0; !err; err = -ENETUNREACH) {
++		tb = fib_get_table(net, RT_TABLE_LOCAL);
++		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
++			break;
++		tb = fib_get_table(net, RT_TABLE_MAIN);
++		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
++			break;
++	}
+ 
+ 	rcu_read_unlock();
+ 
+@@ -248,28 +257,33 @@ extern int __fib_lookup(struct net *net, struct flowi4 *flp,
+ static inline int fib_lookup(struct net *net, struct flowi4 *flp,
+ 			     struct fib_result *res)
+ {
+-	if (!net->ipv4.fib_has_custom_rules) {
+-		int err = -ENETUNREACH;
+-
+-		rcu_read_lock();
+-
+-		res->tclassid = 0;
+-		if ((net->ipv4.fib_local &&
+-		     !fib_table_lookup(net->ipv4.fib_local, flp, res,
+-				       FIB_LOOKUP_NOREF)) ||
+-		    (net->ipv4.fib_main &&
+-		     !fib_table_lookup(net->ipv4.fib_main, flp, res,
+-				       FIB_LOOKUP_NOREF)) ||
+-		    (net->ipv4.fib_default &&
+-		     !fib_table_lookup(net->ipv4.fib_default, flp, res,
+-				       FIB_LOOKUP_NOREF)))
+-			err = 0;
+-
+-		rcu_read_unlock();
+-
+-		return err;
++	struct fib_table *tb;
++	int err;
++
++	if (net->ipv4.fib_has_custom_rules)
++		return __fib_lookup(net, flp, res);
++
++	rcu_read_lock();
++
++	res->tclassid = 0;
++
++	for (err = 0; !err; err = -ENETUNREACH) {
++		tb = rcu_dereference_rtnl(net->ipv4.fib_local);
++		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
++			break;
++
++		tb = rcu_dereference_rtnl(net->ipv4.fib_main);
++		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
++			break;
++
++		tb = rcu_dereference_rtnl(net->ipv4.fib_default);
++		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
++			break;
+ 	}
+-	return __fib_lookup(net, flp, res);
++
++	rcu_read_unlock();
++
++	return err;
+ }
+ 
+ #endif /* CONFIG_IP_MULTIPLE_TABLES */
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index 2ba9de89e8ec..33cef6b17100 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/uidgid.h>
+ #include <net/inet_frag.h>
++#include <linux/rcupdate.h>
+ 
+ struct tcpm_hash_bucket;
+ struct ctl_table_header;
+@@ -29,9 +30,9 @@ struct netns_ipv4 {
+ #ifdef CONFIG_IP_MULTIPLE_TABLES
+ 	struct fib_rules_ops	*rules_ops;
+ 	bool			fib_has_custom_rules;
+-	struct fib_table	*fib_local;
+-	struct fib_table	*fib_main;
+-	struct fib_table	*fib_default;
++	struct fib_table __rcu	*fib_local;
++	struct fib_table __rcu	*fib_main;
++	struct fib_table __rcu	*fib_default;
+ #endif
+ #ifdef CONFIG_IP_ROUTE_CLASSID
+ 	int			fib_num_tclassid_users;
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index 23a5b44b74a0..e2a2cba53fa4 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -89,17 +89,14 @@ struct fib_table *fib_new_table(struct net *net, u32 id)
+ 
+ 	switch (id) {
+ 	case RT_TABLE_LOCAL:
+-		net->ipv4.fib_local = tb;
++		rcu_assign_pointer(net->ipv4.fib_local, tb);
+ 		break;
+-
+ 	case RT_TABLE_MAIN:
+-		net->ipv4.fib_main = tb;
++		rcu_assign_pointer(net->ipv4.fib_main, tb);
+ 		break;
+-
+ 	case RT_TABLE_DEFAULT:
+-		net->ipv4.fib_default = tb;
++		rcu_assign_pointer(net->ipv4.fib_default, tb);
+ 		break;
+-
+ 	default:
+ 		break;
+ 	}
+@@ -132,13 +129,14 @@ struct fib_table *fib_get_table(struct net *net, u32 id)
+ static void fib_flush(struct net *net)
+ {
+ 	int flushed = 0;
+-	struct fib_table *tb;
+-	struct hlist_head *head;
+ 	unsigned int h;
+ 
+ 	for (h = 0; h < FIB_TABLE_HASHSZ; h++) {
+-		head = &net->ipv4.fib_table_hash[h];
+-		hlist_for_each_entry(tb, head, tb_hlist)
++		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
++		struct hlist_node *tmp;
++		struct fib_table *tb;
++
++		hlist_for_each_entry_safe(tb, tmp, head, tb_hlist)
+ 			flushed += fib_table_flush(tb);
+ 	}
+ 
+@@ -663,10 +661,12 @@ static int inet_dump_fib(struct sk_buff *skb, struct netlink_callback *cb)
+ 	s_h = cb->args[0];
+ 	s_e = cb->args[1];
+ 
++	rcu_read_lock();
++
+ 	for (h = s_h; h < FIB_TABLE_HASHSZ; h++, s_e = 0) {
+ 		e = 0;
+ 		head = &net->ipv4.fib_table_hash[h];
+-		hlist_for_each_entry(tb, head, tb_hlist) {
++		hlist_for_each_entry_rcu(tb, head, tb_hlist) {
+ 			if (e < s_e)
+ 				goto next;
+ 			if (dumped)
+@@ -680,6 +680,8 @@ next:
+ 		}
+ 	}
+ out:
++	rcu_read_unlock();
++
+ 	cb->args[1] = e;
+ 	cb->args[0] = h;
+ 
+@@ -1117,14 +1119,34 @@ static void ip_fib_net_exit(struct net *net)
+ 
+ 	rtnl_lock();
+ 	for (i = 0; i < FIB_TABLE_HASHSZ; i++) {
+-		struct fib_table *tb;
+-		struct hlist_head *head;
++		struct hlist_head *head = &net->ipv4.fib_table_hash[i];
+ 		struct hlist_node *tmp;
++		struct fib_table *tb;
++
++		/* this is done in two passes as flushing the table could
++		 * cause it to be reallocated in order to accommodate new
++		 * tnodes at the root as the table shrinks.
++		 */
++		hlist_for_each_entry_safe(tb, tmp, head, tb_hlist)
++			fib_table_flush(tb);
+ 
+-		head = &net->ipv4.fib_table_hash[i];
+ 		hlist_for_each_entry_safe(tb, tmp, head, tb_hlist) {
++#ifdef CONFIG_IP_MULTIPLE_TABLES
++			switch (tb->tb_id) {
++			case RT_TABLE_LOCAL:
++				RCU_INIT_POINTER(net->ipv4.fib_local, NULL);
++				break;
++			case RT_TABLE_MAIN:
++				RCU_INIT_POINTER(net->ipv4.fib_main, NULL);
++				break;
++			case RT_TABLE_DEFAULT:
++				RCU_INIT_POINTER(net->ipv4.fib_default, NULL);
++				break;
++			default:
++				break;
++			}
++#endif
+ 			hlist_del(&tb->tb_hlist);
+-			fib_table_flush(tb);
+ 			fib_free_table(tb);
+ 		}
+ 	}
+* Unmerged path net/ipv4/fib_trie.c
