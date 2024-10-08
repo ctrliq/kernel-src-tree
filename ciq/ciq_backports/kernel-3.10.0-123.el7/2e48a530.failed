@@ -1,0 +1,141 @@
+blk-throttle: make throtl_pending_timer_fn() ready for hierarchy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 2e48a530a3a7daebd0cc17866304a36d39b611de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/2e48a530.failed
+
+throtl_pending_timer_fn() currently assumes that the parent_sq is the
+top level one and the bio's dispatched are ready to be issued;
+however, this assumption will be wrong with proper hierarchy support.
+This patch makes the following changes to make
+throtl_pending_timer_fn() ready for hiearchy.
+
+* If the parent_sq isn't the top-level one, update the parent
+  throtl_grp's dispatch time and schedule the next dispatch as
+  necessary.  If the parent's dispatch time is now, repeat the
+  function for the parent throtl_grp.
+
+* If the parent_sq is the top-level one, kick issue work_item as
+  before.
+
+* The debug message printed by throtl_log() now prints out the
+  service_queue's nr_queued[] instead of the total nr_queued as the
+  latter becomes uninteresting and misleading with hierarchical
+  dispatch.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Vivek Goyal <vgoyal@redhat.com>
+(cherry picked from commit 2e48a530a3a7daebd0cc17866304a36d39b611de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-throttle.c
+diff --cc block/blk-throttle.c
+index e65e45a33372,bc65077f6e43..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -838,13 -945,92 +838,96 @@@ static int throtl_select_dispatch(struc
+  	return nr_disp;
+  }
+  
+++<<<<<<< HEAD
+ +/* work function to dispatch throttled bios */
+++=======
++ /**
++  * throtl_pending_timer_fn - timer function for service_queue->pending_timer
++  * @arg: the throtl_service_queue being serviced
++  *
++  * This timer is armed when a child throtl_grp with active bio's become
++  * pending and queued on the service_queue's pending_tree and expires when
++  * the first child throtl_grp should be dispatched.  This function
++  * dispatches bio's from the children throtl_grps to the parent
++  * service_queue.
++  *
++  * If the parent's parent is another throtl_grp, dispatching is propagated
++  * by either arming its pending_timer or repeating dispatch directly.  If
++  * the top-level service_tree is reached, throtl_data->dispatch_work is
++  * kicked so that the ready bio's are issued.
++  */
++ static void throtl_pending_timer_fn(unsigned long arg)
++ {
++ 	struct throtl_service_queue *sq = (void *)arg;
++ 	struct throtl_grp *tg = sq_to_tg(sq);
++ 	struct throtl_data *td = sq_to_td(sq);
++ 	struct request_queue *q = td->queue;
++ 	struct throtl_service_queue *parent_sq;
++ 	bool dispatched;
++ 	int ret;
++ 
++ 	spin_lock_irq(q->queue_lock);
++ again:
++ 	parent_sq = sq->parent_sq;
++ 	dispatched = false;
++ 
++ 	while (true) {
++ 		throtl_log(sq, "dispatch nr_queued=%u read=%u write=%u",
++ 			   sq->nr_queued[READ] + sq->nr_queued[WRITE],
++ 			   sq->nr_queued[READ], sq->nr_queued[WRITE]);
++ 
++ 		ret = throtl_select_dispatch(sq);
++ 		if (ret) {
++ 			throtl_log(sq, "bios disp=%u", ret);
++ 			dispatched = true;
++ 		}
++ 
++ 		if (throtl_schedule_next_dispatch(sq, false))
++ 			break;
++ 
++ 		/* this dispatch windows is still open, relax and repeat */
++ 		spin_unlock_irq(q->queue_lock);
++ 		cpu_relax();
++ 		spin_lock_irq(q->queue_lock);
++ 	}
++ 
++ 	if (!dispatched)
++ 		goto out_unlock;
++ 
++ 	if (parent_sq) {
++ 		/* @parent_sq is another throl_grp, propagate dispatch */
++ 		if (tg->flags & THROTL_TG_WAS_EMPTY) {
++ 			tg_update_disptime(tg);
++ 			if (!throtl_schedule_next_dispatch(parent_sq, false)) {
++ 				/* window is already open, repeat dispatching */
++ 				sq = parent_sq;
++ 				tg = sq_to_tg(sq);
++ 				goto again;
++ 			}
++ 		}
++ 	} else {
++ 		/* reached the top-level, queue issueing */
++ 		queue_work(kthrotld_workqueue, &td->dispatch_work);
++ 	}
++ out_unlock:
++ 	spin_unlock_irq(q->queue_lock);
++ }
++ 
++ /**
++  * blk_throtl_dispatch_work_fn - work function for throtl_data->dispatch_work
++  * @work: work item being executed
++  *
++  * This function is queued for execution when bio's reach the bio_lists[]
++  * of throtl_data->service_queue.  Those bio's are ready and issued by this
++  * function.
++  */
+++>>>>>>> 2e48a530a3a7 (blk-throttle: make throtl_pending_timer_fn() ready for hierarchy)
+  void blk_throtl_dispatch_work_fn(struct work_struct *work)
+  {
+ -	struct throtl_data *td = container_of(work, struct throtl_data,
+ -					      dispatch_work);
+ -	struct throtl_service_queue *td_sq = &td->service_queue;
+ +	struct throtl_data *td = container_of(to_delayed_work(work),
+ +					      struct throtl_data, dispatch_work);
+  	struct request_queue *q = td->queue;
+ +	unsigned int nr_disp = 0;
+  	struct bio_list bio_list_on_stack;
+  	struct bio *bio;
+  	struct blk_plug plug;
+* Unmerged path block/blk-throttle.c
