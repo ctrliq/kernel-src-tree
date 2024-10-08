@@ -1,0 +1,129 @@
+kvm: x86: ignore ioapic polarity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [virt] kvm: ignore ioapic polarity (Paolo Bonzini) [1036478]
+Rebuild_FUZZ: 91.53%
+commit-author Gabriel L. Somlo <gsomlo@gmail.com>
+commit 100943c54e0947a07d2c0185368fc2fd848f7f28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/100943c5.failed
+
+Both QEMU and KVM have already accumulated a significant number of
+optimizations based on the hard-coded assumption that ioapic polarity
+will always use the ActiveHigh convention, where the logical and
+physical states of level-triggered irq lines always match (i.e.,
+active(asserted) == high == 1, inactive == low == 0). QEMU guests
+are expected to follow directions given via ACPI and configure the
+ioapic with polarity 0 (ActiveHigh). However, even when misbehaving
+guests (e.g. OS X <= 10.9) set the ioapic polarity to 1 (ActiveLow),
+QEMU will still use the ActiveHigh signaling convention when
+interfacing with KVM.
+
+This patch modifies KVM to completely ignore ioapic polarity as set by
+the guest OS, enabling misbehaving guests to work alongside those which
+comply with the ActiveHigh polarity specified by QEMU's ACPI tables.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: Gabriel L. Somlo <somlo@cmu.edu>
+[Move documentation to KVM_IRQ_LINE, add ia64. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 100943c54e0947a07d2c0185368fc2fd848f7f28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virtual/kvm/api.txt
+index 5f91eda91647,4714f282a43e..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -612,9 -612,24 +612,30 @@@ On some architectures it is required th
+  been previously created with KVM_CREATE_IRQCHIP.  Note that edge-triggered
+  interrupts require the level to be set to 1 and then back to 0.
+  
+++<<<<<<< HEAD
+ +ARM can signal an interrupt either at the CPU level, or at the in-kernel irqchip
+ +(GIC), and for in-kernel irqchip can tell the GIC to use PPIs designated for
+ +specific cpus.  The irq field is interpreted like this:
+++=======
++ On real hardware, interrupt pins can be active-low or active-high.  This
++ does not matter for the level field of struct kvm_irq_level: 1 always
++ means active (asserted), 0 means inactive (deasserted).
++ 
++ x86 allows the operating system to program the interrupt polarity
++ (active-low/active-high) for level-triggered interrupts, and KVM used
++ to consider the polarity.  However, due to bitrot in the handling of
++ active-low interrupts, the above convention is now valid on x86 too.
++ This is signaled by KVM_CAP_X86_IOAPIC_POLARITY_IGNORED.  Userspace
++ should not present interrupts to the guest as active-low unless this
++ capability is present (or unless it is not using the in-kernel irqchip,
++ of course).
++ 
++ 
++ ARM/arm64 can signal an interrupt either at the CPU level, or at the
++ in-kernel irqchip (GIC), and for in-kernel irqchip can tell the GIC to
++ use PPIs designated for specific cpus.  The irq field is interpreted
++ like this:
+++>>>>>>> 100943c54e09 (kvm: x86: ignore ioapic polarity)
+  
+    bits:  | 31 ... 24 | 23  ... 16 | 15    ...    0 |
+    field: | irq_type  | vcpu_index |     irq_id     |
+diff --cc include/uapi/linux/kvm.h
+index d88c8ee00c8b,a7518be31d53..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -666,6 -736,11 +666,14 @@@ struct kvm_ppc_smmu_info 
+  #define KVM_CAP_IRQ_MPIC 90
+  #define KVM_CAP_PPC_RTAS 91
+  #define KVM_CAP_IRQ_XICS 92
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ARM_EL1_32BIT 93
++ #define KVM_CAP_SPAPR_MULTITCE 94
++ #define KVM_CAP_EXT_EMUL_CPUID 95
++ #define KVM_CAP_HYPERV_TIME 96
++ #define KVM_CAP_IOAPIC_POLARITY_IGNORED 97
+++>>>>>>> 100943c54e09 (kvm: x86: ignore ioapic polarity)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+* Unmerged path Documentation/virtual/kvm/api.txt
+diff --git a/arch/ia64/kvm/kvm-ia64.c b/arch/ia64/kvm/kvm-ia64.c
+index 5b2dc0d10c8f..dd97ca9fd654 100644
+--- a/arch/ia64/kvm/kvm-ia64.c
++++ b/arch/ia64/kvm/kvm-ia64.c
+@@ -199,6 +199,7 @@ int kvm_dev_ioctl_check_extension(long ext)
+ 	case KVM_CAP_IRQCHIP:
+ 	case KVM_CAP_MP_STATE:
+ 	case KVM_CAP_IRQ_INJECT_STATUS:
++	case KVM_CAP_IOAPIC_POLARITY_IGNORED:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_COALESCED_MMIO:
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index eb07c5a9d74a..1af2e8d6f252 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2605,6 +2605,7 @@ int kvm_dev_ioctl_check_extension(long ext)
+ 	case KVM_CAP_KVMCLOCK_CTRL:
+ 	case KVM_CAP_READONLY_MEM:
+ 	case KVM_CAP_HYPERV_TIME:
++	case KVM_CAP_IOAPIC_POLARITY_IGNORED:
+ #ifdef CONFIG_KVM_DEVICE_ASSIGNMENT
+ 	case KVM_CAP_ASSIGN_DEV_IRQ:
+ 	case KVM_CAP_PCI_2_3:
+* Unmerged path include/uapi/linux/kvm.h
+diff --git a/virt/kvm/ioapic.c b/virt/kvm/ioapic.c
+index 2d682977ce82..ad170b41b130 100644
+--- a/virt/kvm/ioapic.c
++++ b/virt/kvm/ioapic.c
+@@ -328,7 +328,6 @@ int kvm_ioapic_set_irq(struct kvm_ioapic *ioapic, int irq, int irq_source_id,
+ 	irq_level = __kvm_irq_line_state(&ioapic->irq_states[irq],
+ 					 irq_source_id, level);
+ 	entry = ioapic->redirtbl[irq];
+-	irq_level ^= entry.fields.polarity;
+ 	if (!irq_level) {
+ 		ioapic->irr &= ~mask;
+ 		ret = 1;
