@@ -759,10 +759,7 @@ static unsigned int __cpuinit amd_size_cache(struct cpuinfo_x86 *c,
 
 static void __cpuinit cpu_set_tlb_flushall_shift(struct cpuinfo_x86 *c)
 {
-	tlb_flushall_shift = 5;
-
-	if (c->x86 <= 0x11)
-		tlb_flushall_shift = 4;
+	tlb_flushall_shift = 6;
 }
 
 static void __cpuinit cpu_detect_tlb_amd(struct cpuinfo_x86 *c)
