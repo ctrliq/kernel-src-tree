@@ -208,10 +208,6 @@ int blk_verify_command(struct request_queue *q,
 	if (capable(CAP_SYS_RAWIO) || blk_queue_unpriv_sgio(q))
 		return 0;
 
-	/* if there's no filter set, assume we're filtering everything out */
-	if (!filter)
-		return -EPERM;
-
 	/* Anybody who can open the device can do a read-safe command */
 	if (test_bit(cmd[0], filter->read_ok))
 		return 0;
