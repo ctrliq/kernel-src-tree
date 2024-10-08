@@ -1,0 +1,134 @@
+USB: WUSBCORE: clear RPIPE stall for control endpoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [usb] wusbcore: clear RPIPE stall for control endpoints (Don Zickus) [895641]
+Rebuild_FUZZ: 95.15%
+commit-author Thomas Pugliese <thomas.pugliese@gmail.com>
+commit 6d33f7bb8c3863e54f8bdede0a2bf97a3585ac20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6d33f7bb.failed
+
+When the HWA encounters a STALL on a control endpoint, it should clear the
+RPIPE_STALL feature on the RPIPE before processing the next transfer
+request.  Otherwise, all transfer requests on that endpoint after the
+first STALL will fail because the RPIPE is still in the halted state.
+This also removes the unneccessary call to spin_lock_irqsave for a nested
+lock that was present in the first patch.
+
+	Signed-off-by: Thomas Pugliese <thomas.pugliese@gmail.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 6d33f7bb8c3863e54f8bdede0a2bf97a3585ac20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/wusbcore/wa-xfer.c
+diff --cc drivers/usb/wusbcore/wa-xfer.c
+index 1f0c207f2a51,d74fe1ae16ac..000000000000
+--- a/drivers/usb/wusbcore/wa-xfer.c
++++ b/drivers/usb/wusbcore/wa-xfer.c
+@@@ -1335,6 -1524,9 +1379,12 @@@ error_submit_buf_in
+  		dev_err(dev, "xfer %p#%u: can't submit DTI data phase: %d\n",
+  			xfer, seg_idx, result);
+  	seg->result = result;
+++<<<<<<< HEAD
+++=======
++ 	kfree(wa->buf_in_urb->sg);
++ error_sg_alloc:
++ 	__wa_xfer_abort(xfer);
+++>>>>>>> 6d33f7bb8c38 (USB: WUSBCORE: clear RPIPE stall for control endpoints)
+  error_complete:
+  	seg->status = WA_SEG_ERROR;
+  	xfer->segs_done++;
+diff --git a/drivers/usb/wusbcore/wa-hc.h b/drivers/usb/wusbcore/wa-hc.h
+index d6bea3e0b54a..cf250c21e946 100644
+--- a/drivers/usb/wusbcore/wa-hc.h
++++ b/drivers/usb/wusbcore/wa-hc.h
+@@ -91,6 +91,7 @@
+ struct wusbhc;
+ struct wahc;
+ extern void wa_urb_enqueue_run(struct work_struct *ws);
++extern void wa_process_errored_transfers_run(struct work_struct *ws);
+ 
+ /**
+  * RPipe instance
+@@ -190,8 +191,14 @@ struct wahc {
+ 
+ 	struct list_head xfer_list;
+ 	struct list_head xfer_delayed_list;
++	struct list_head xfer_errored_list;
++	/*
++	 * lock for the above xfer lists.  Can be taken while a xfer->lock is
++	 * held but not in the reverse order.
++	 */
+ 	spinlock_t xfer_list_lock;
+-	struct work_struct xfer_work;
++	struct work_struct xfer_enqueue_work;
++	struct work_struct xfer_error_work;
+ 	atomic_t xfer_id_count;
+ };
+ 
+@@ -244,8 +251,10 @@ static inline void wa_init(struct wahc *wa)
+ 	edc_init(&wa->dti_edc);
+ 	INIT_LIST_HEAD(&wa->xfer_list);
+ 	INIT_LIST_HEAD(&wa->xfer_delayed_list);
++	INIT_LIST_HEAD(&wa->xfer_errored_list);
+ 	spin_lock_init(&wa->xfer_list_lock);
+-	INIT_WORK(&wa->xfer_work, wa_urb_enqueue_run);
++	INIT_WORK(&wa->xfer_enqueue_work, wa_urb_enqueue_run);
++	INIT_WORK(&wa->xfer_error_work, wa_process_errored_transfers_run);
+ 	atomic_set(&wa->xfer_id_count, 1);
+ }
+ 
+@@ -269,6 +278,8 @@ static inline void rpipe_put(struct wa_rpipe *rpipe)
+ 
+ }
+ extern void rpipe_ep_disable(struct wahc *, struct usb_host_endpoint *);
++extern void rpipe_clear_feature_stalled(struct wahc *,
++			struct usb_host_endpoint *);
+ extern int wa_rpipes_create(struct wahc *);
+ extern void wa_rpipes_destroy(struct wahc *);
+ static inline void rpipe_avail_dec(struct wa_rpipe *rpipe)
+diff --git a/drivers/usb/wusbcore/wa-rpipe.c b/drivers/usb/wusbcore/wa-rpipe.c
+index 9a595c1ed867..fd4f1ce6256a 100644
+--- a/drivers/usb/wusbcore/wa-rpipe.c
++++ b/drivers/usb/wusbcore/wa-rpipe.c
+@@ -527,3 +527,24 @@ void rpipe_ep_disable(struct wahc *wa, struct usb_host_endpoint *ep)
+ 	mutex_unlock(&wa->rpipe_mutex);
+ }
+ EXPORT_SYMBOL_GPL(rpipe_ep_disable);
++
++/* Clear the stalled status of an RPIPE. */
++void rpipe_clear_feature_stalled(struct wahc *wa, struct usb_host_endpoint *ep)
++{
++	struct wa_rpipe *rpipe;
++
++	mutex_lock(&wa->rpipe_mutex);
++	rpipe = ep->hcpriv;
++	if (rpipe != NULL) {
++		u16 index = le16_to_cpu(rpipe->descr.wRPipeIndex);
++
++		usb_control_msg(
++			wa->usb_dev, usb_rcvctrlpipe(wa->usb_dev, 0),
++			USB_REQ_CLEAR_FEATURE,
++			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_RPIPE,
++			RPIPE_STALL, index, NULL, 0, 1000);
++	}
++	mutex_unlock(&wa->rpipe_mutex);
++}
++EXPORT_SYMBOL_GPL(rpipe_clear_feature_stalled);
++
+* Unmerged path drivers/usb/wusbcore/wa-xfer.c
+diff --git a/include/linux/usb/wusb-wa.h b/include/linux/usb/wusb-wa.h
+index 6be985b2a434..4ff744e2b678 100644
+--- a/include/linux/usb/wusb-wa.h
++++ b/include/linux/usb/wusb-wa.h
+@@ -66,6 +66,7 @@ enum {
+ 	WA_ENABLE = 0x01,
+ 	WA_RESET = 0x02,
+ 	RPIPE_PAUSE = 0x1,
++	RPIPE_STALL = 0x2,
+ };
+ 
+ /* Responses from Get Status request ([WUSB] section 8.3.1.6) */
