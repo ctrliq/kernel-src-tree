@@ -1,0 +1,127 @@
+PCI: pciehp: Drop pointless ACPI-based "slot detection" check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [pci] hotplug: Drop pointless ACPI-based "slot detection" check (Jarod Wilson) [1211805]
+Rebuild_FUZZ: 88.14%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit e705c2959b06b9db184842852da619a0b1672bbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e705c295.failed
+
+Jarod Wilson reports that ExpressCard hotplug doesn't work on HP ZBook G2.
+The problem turns out to be the ACPI-based "slot detection" code called
+from pciehp_probe() which uses questionable heuristics based on what ACPI
+objects are present for the PCIe port device to figure out whether to
+register a hotplug slot for that port.
+
+That code is used if there is at least one PCIe port having an ACPI device
+configuration object related to hotplug (such as _EJ0 or _RMV), and the
+Thunderbolt port on the ZBook has _RMV.  Of course, Thunderbolt and PCIe
+native hotplug need not be mutually exclusive (as they aren't on the
+ZBook), so that rule is simply incorrect.
+
+Moreover, the ACPI-based "slot detection" check does not add any value if
+pciehp_probe() is called at all and the service type of the device object
+it has been called for is PCIE_PORT_SERVICE_HP, because PCIe hotplug
+services are only registered if the _OSC handshake in acpi_pci_root_add()
+allows the kernel to control the PCIe native hotplug feature.  No more
+checks need to be carried out to decide whether or not to register a native
+PCIe hotlug slot in that case.
+
+For the above reasons, make pciehp_probe() check if it has been called for
+the right service type and drop the pointless ACPI-based "slot detection"
+check from it.  Also remove the entire code whose only user is that check
+(the entire pciehp_acpi.c file goes away as a result) and drop function
+headers related to it from the internal pciehp header file.
+
+Link: http://lkml.kernel.org/r/1431632038-39917-1-git-send-email-jarod@redhat.com
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=98581
+	Reported-by: Jarod Wilson <jarod@redhat.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Jarod Wilson <jarod@redhat.com>
+	Tested-by: Jarod Wilson <jarod@redhat.com>
+(cherry picked from commit e705c2959b06b9db184842852da619a0b1672bbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/pciehp.h
+#	drivers/pci/hotplug/pciehp_acpi.c
+diff --cc drivers/pci/hotplug/pciehp.h
+index 7bae08bc1a61,ce4d12c4eff4..000000000000
+--- a/drivers/pci/hotplug/pciehp.h
++++ b/drivers/pci/hotplug/pciehp.h
+@@@ -166,23 -167,4 +166,26 @@@ static inline const char *slot_name(str
+  	return hotplug_slot_name(slot->hotplug_slot);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_ACPI
+ +#include <acpi/acpi.h>
+ +#include <acpi/acpi_bus.h>
+ +#include <linux/pci-acpi.h>
+ +
+ +void __init pciehp_acpi_slot_detection_init(void);
+ +int pciehp_acpi_slot_detection_check(struct pci_dev *dev);
+ +
+ +static inline void pciehp_firmware_init(void)
+ +{
+ +	pciehp_acpi_slot_detection_init();
+ +}
+ +#else
+ +#define pciehp_firmware_init()				do {} while (0)
+ +static inline int pciehp_acpi_slot_detection_check(struct pci_dev *dev)
+ +{
+ +	return 0;
+ +}
+ +#endif				/* CONFIG_ACPI */
+++=======
+++>>>>>>> e705c2959b06 (PCI: pciehp: Drop pointless ACPI-based "slot detection" check)
+  #endif				/* _PCIEHP_H */
+* Unmerged path drivers/pci/hotplug/pciehp_acpi.c
+diff --git a/drivers/pci/hotplug/Makefile b/drivers/pci/hotplug/Makefile
+index 3e6532b945c1..4047815b5367 100644
+--- a/drivers/pci/hotplug/Makefile
++++ b/drivers/pci/hotplug/Makefile
+@@ -61,9 +61,6 @@ pciehp-objs		:=	pciehp_core.o	\
+ 				pciehp_ctrl.o	\
+ 				pciehp_pci.o	\
+ 				pciehp_hpc.o
+-ifdef CONFIG_ACPI
+-pciehp-objs		+=	pciehp_acpi.o
+-endif
+ 
+ shpchp-objs		:=	shpchp_core.o	\
+ 				shpchp_ctrl.o	\
+* Unmerged path drivers/pci/hotplug/pciehp.h
+* Unmerged path drivers/pci/hotplug/pciehp_acpi.c
+diff --git a/drivers/pci/hotplug/pciehp_core.c b/drivers/pci/hotplug/pciehp_core.c
+index e5abcaf74245..300c03178bb4 100644
+--- a/drivers/pci/hotplug/pciehp_core.c
++++ b/drivers/pci/hotplug/pciehp_core.c
+@@ -248,12 +248,9 @@ static int pciehp_probe(struct pcie_device *dev)
+ 	struct slot *slot;
+ 	u8 occupied, poweron;
+ 
+-	if (pciehp_force)
+-		dev_info(&dev->device,
+-			 "Bypassing BIOS check for pciehp use on %s\n",
+-			 pci_name(dev->port));
+-	else if (pciehp_acpi_slot_detection_check(dev->port))
+-		goto err_out_none;
++	/* If this is not a "hotplug" service, we have no business here. */
++	if (dev->service != PCIE_PORT_SERVICE_HP)
++		return -ENODEV;
+ 
+ 	if (!dev->port->subordinate) {
+ 		/* Can happen if we run out of bus numbers during probe */
+@@ -367,7 +364,6 @@ static int __init pcied_init(void)
+ {
+ 	int retval = 0;
+ 
+-	pciehp_firmware_init();
+ 	retval = pcie_port_service_register(&hpdriver_portdrv);
+ 	dbg("pcie_port_service_register = %d\n", retval);
+ 	info(DRIVER_DESC " version: " DRIVER_VERSION "\n");
