@@ -1,0 +1,143 @@
+sched/core: Use dl_bw_of() under rcu_read_lock_sched()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@arm.com>
+commit 75e23e49dbdd86aace375f599062aa67483a001b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/75e23e49.failed
+
+As per commit f10e00f4bf36 ("sched/dl: Use dl_bw_of() under
+rcu_read_lock_sched()"), dl_bw_of() has to be protected by
+rcu_read_lock_sched().
+
+	Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/1414497286-28824-1-git-send-email-juri.lelli@arm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 75e23e49dbdd86aace375f599062aa67483a001b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index f8654b1100de,df0569ebec0f..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -5062,7 -4654,109 +5062,113 @@@ void init_idle(struct task_struct *idle
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SMP
+++=======
++ int cpuset_cpumask_can_shrink(const struct cpumask *cur,
++ 			      const struct cpumask *trial)
++ {
++ 	int ret = 1, trial_cpus;
++ 	struct dl_bw *cur_dl_b;
++ 	unsigned long flags;
++ 
++ 	rcu_read_lock_sched();
++ 	cur_dl_b = dl_bw_of(cpumask_any(cur));
++ 	trial_cpus = cpumask_weight(trial);
++ 
++ 	raw_spin_lock_irqsave(&cur_dl_b->lock, flags);
++ 	if (cur_dl_b->bw != -1 &&
++ 	    cur_dl_b->bw * trial_cpus < cur_dl_b->total_bw)
++ 		ret = 0;
++ 	raw_spin_unlock_irqrestore(&cur_dl_b->lock, flags);
++ 	rcu_read_unlock_sched();
++ 
++ 	return ret;
++ }
++ 
++ int task_can_attach(struct task_struct *p,
++ 		    const struct cpumask *cs_cpus_allowed)
++ {
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Kthreads which disallow setaffinity shouldn't be moved
++ 	 * to a new cpuset; we don't want to change their cpu
++ 	 * affinity and isolating such threads by their set of
++ 	 * allowed nodes is unnecessary.  Thus, cpusets are not
++ 	 * applicable for such threads.  This prevents checking for
++ 	 * success of set_cpus_allowed_ptr() on all attached tasks
++ 	 * before cpus_allowed may be changed.
++ 	 */
++ 	if (p->flags & PF_NO_SETAFFINITY) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ #ifdef CONFIG_SMP
++ 	if (dl_task(p) && !cpumask_intersects(task_rq(p)->rd->span,
++ 					      cs_cpus_allowed)) {
++ 		unsigned int dest_cpu = cpumask_any_and(cpu_active_mask,
++ 							cs_cpus_allowed);
++ 		struct dl_bw *dl_b;
++ 		bool overflow;
++ 		int cpus;
++ 		unsigned long flags;
++ 
++ 		rcu_read_lock_sched();
++ 		dl_b = dl_bw_of(dest_cpu);
++ 		raw_spin_lock_irqsave(&dl_b->lock, flags);
++ 		cpus = dl_bw_cpus(dest_cpu);
++ 		overflow = __dl_overflow(dl_b, cpus, 0, p->dl.dl_bw);
++ 		if (overflow)
++ 			ret = -EBUSY;
++ 		else {
++ 			/*
++ 			 * We reserve space for this task in the destination
++ 			 * root_domain, as we can't fail after this point.
++ 			 * We will free resources in the source root_domain
++ 			 * later on (see set_cpus_allowed_dl()).
++ 			 */
++ 			__dl_add(dl_b, p->dl.dl_bw);
++ 		}
++ 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
++ 		rcu_read_unlock_sched();
++ 
++ 	}
++ #endif
++ out:
++ 	return ret;
++ }
++ 
++ #ifdef CONFIG_SMP
++ /*
++  * move_queued_task - move a queued task to new rq.
++  *
++  * Returns (locked) new rq. Old rq's lock is released.
++  */
++ static struct rq *move_queued_task(struct task_struct *p, int new_cpu)
++ {
++ 	struct rq *rq = task_rq(p);
++ 
++ 	lockdep_assert_held(&rq->lock);
++ 
++ 	dequeue_task(rq, p, 0);
++ 	p->on_rq = TASK_ON_RQ_MIGRATING;
++ 	set_task_cpu(p, new_cpu);
++ 	raw_spin_unlock(&rq->lock);
++ 
++ 	rq = cpu_rq(new_cpu);
++ 
++ 	raw_spin_lock(&rq->lock);
++ 	BUG_ON(task_cpu(p) != new_cpu);
++ 	p->on_rq = TASK_ON_RQ_QUEUED;
++ 	enqueue_task(rq, p, 0);
++ 	check_preempt_curr(rq, p, 0);
++ 
++ 	return rq;
++ }
++ 
+++>>>>>>> 75e23e49dbdd (sched/core: Use dl_bw_of() under rcu_read_lock_sched())
+  void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+  {
+  	if (p->sched_class && p->sched_class->set_cpus_allowed)
+* Unmerged path kernel/sched/core.c
