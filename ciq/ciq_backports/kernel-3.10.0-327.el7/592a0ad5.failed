@@ -1,0 +1,224 @@
+hpsa: factor out hpsa_ioaccel_submit function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Webb Scales <webbnh@hp.com>
+commit 592a0ad5aee754e931a35292e073eb7fd64ddd5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/592a0ad5.failed
+
+clean up command submission
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@Suse.de>
+	Signed-off-by: Webb Scales <webbnh@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 592a0ad5aee754e931a35292e073eb7fd64ddd5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 12c02e8d4ce8,0331c9ab3b35..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -3964,7 -4333,189 +3964,193 @@@ static int hpsa_scsi_queue_command(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int do_not_scan_if_controller_locked_up(struct ctlr_info *h)
+++=======
++ static void hpsa_cmd_init(struct ctlr_info *h, int index,
++ 				struct CommandList *c)
++ {
++ 	dma_addr_t cmd_dma_handle, err_dma_handle;
++ 
++ 	/* Zero out all of commandlist except the last field, refcount */
++ 	memset(c, 0, offsetof(struct CommandList, refcount));
++ 	c->Header.tag = cpu_to_le64((u64) (index << DIRECT_LOOKUP_SHIFT));
++ 	cmd_dma_handle = h->cmd_pool_dhandle + index * sizeof(*c);
++ 	c->err_info = h->errinfo_pool + index;
++ 	memset(c->err_info, 0, sizeof(*c->err_info));
++ 	err_dma_handle = h->errinfo_pool_dhandle
++ 	    + index * sizeof(*c->err_info);
++ 	c->cmdindex = index;
++ 	c->busaddr = (u32) cmd_dma_handle;
++ 	c->ErrDesc.Addr = cpu_to_le64((u64) err_dma_handle);
++ 	c->ErrDesc.Len = cpu_to_le32((u32) sizeof(*c->err_info));
++ 	c->h = h;
++ }
++ 
++ static void hpsa_preinitialize_commands(struct ctlr_info *h)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < h->nr_cmds; i++) {
++ 		struct CommandList *c = h->cmd_pool + i;
++ 
++ 		hpsa_cmd_init(h, i, c);
++ 		atomic_set(&c->refcount, 0);
++ 	}
++ }
++ 
++ static inline void hpsa_cmd_partial_init(struct ctlr_info *h, int index,
++ 				struct CommandList *c)
++ {
++ 	dma_addr_t cmd_dma_handle = h->cmd_pool_dhandle + index * sizeof(*c);
++ 
++ 	memset(c->Request.CDB, 0, sizeof(c->Request.CDB));
++ 	memset(c->err_info, 0, sizeof(*c->err_info));
++ 	c->busaddr = (u32) cmd_dma_handle;
++ }
++ 
++ static int hpsa_ioaccel_submit(struct ctlr_info *h,
++ 		struct CommandList *c, struct scsi_cmnd *cmd,
++ 		unsigned char *scsi3addr)
++ {
++ 	struct hpsa_scsi_dev_t *dev = cmd->device->hostdata;
++ 	int rc = IO_ACCEL_INELIGIBLE;
++ 
++ 	cmd->host_scribble = (unsigned char *) c;
++ 
++ 	if (dev->offload_enabled) {
++ 		hpsa_cmd_init(h, c->cmdindex, c);
++ 		c->cmd_type = CMD_SCSI;
++ 		c->scsi_cmd = cmd;
++ 		rc = hpsa_scsi_ioaccel_raid_map(h, c);
++ 		if (rc < 0)     /* scsi_dma_map failed. */
++ 			rc = SCSI_MLQUEUE_HOST_BUSY;
++ 	} else if (dev->ioaccel_handle) {
++ 		hpsa_cmd_init(h, c->cmdindex, c);
++ 		c->cmd_type = CMD_SCSI;
++ 		c->scsi_cmd = cmd;
++ 		rc = hpsa_scsi_ioaccel_direct_map(h, c);
++ 		if (rc < 0)     /* scsi_dma_map failed. */
++ 			rc = SCSI_MLQUEUE_HOST_BUSY;
++ 	}
++ 	return rc;
++ }
++ 
++ static void hpsa_command_resubmit_worker(struct work_struct *work)
++ {
++ 	struct scsi_cmnd *cmd;
++ 	struct hpsa_scsi_dev_t *dev;
++ 	struct CommandList *c =
++ 			container_of(work, struct CommandList, work);
++ 
++ 	cmd = c->scsi_cmd;
++ 	dev = cmd->device->hostdata;
++ 	if (!dev) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd_free(c->h, c);
++ 		cmd->scsi_done(cmd);
++ 		return;
++ 	}
++ 	if (c->cmd_type == CMD_IOACCEL2) {
++ 		struct ctlr_info *h = c->h;
++ 		struct io_accel2_cmd *c2 = &h->ioaccel2_cmd_pool[c->cmdindex];
++ 		int rc;
++ 
++ 		if (c2->error_data.serv_response ==
++ 				IOACCEL2_STATUS_SR_TASK_COMP_SET_FULL) {
++ 			rc = hpsa_ioaccel_submit(h, c, cmd, dev->scsi3addr);
++ 			if (rc == 0)
++ 				return;
++ 			if (rc == SCSI_MLQUEUE_HOST_BUSY) {
++ 				/*
++ 				 * If we get here, it means dma mapping failed.
++ 				 * Try again via scsi mid layer, which will
++ 				 * then get SCSI_MLQUEUE_HOST_BUSY.
++ 				 */
++ 				cmd->result = DID_IMM_RETRY << 16;
++ 				cmd->scsi_done(cmd);
++ 				cmd_free(h, c);	/* FIX-ME:  on merge, change
++ 						 * to cmd_tagged_free() and
++ 						 * ultimately to
++ 						 * hpsa_cmd_free_and_done(). */
++ 				return;
++ 			}
++ 			/* else, fall thru and resubmit down CISS path */
++ 		}
++ 	}
++ 	hpsa_cmd_partial_init(c->h, c->cmdindex, c);
++ 	if (hpsa_ciss_submit(c->h, c, cmd, dev->scsi3addr)) {
++ 		/*
++ 		 * If we get here, it means dma mapping failed. Try
++ 		 * again via scsi mid layer, which will then get
++ 		 * SCSI_MLQUEUE_HOST_BUSY.
++ 		 *
++ 		 * hpsa_ciss_submit will have already freed c
++ 		 * if it encountered a dma mapping failure.
++ 		 */
++ 		cmd->result = DID_IMM_RETRY << 16;
++ 		cmd->scsi_done(cmd);
++ 	}
++ }
++ 
++ /* Running in struct Scsi_Host->host_lock less mode */
++ static int hpsa_scsi_queue_command(struct Scsi_Host *sh, struct scsi_cmnd *cmd)
++ {
++ 	struct ctlr_info *h;
++ 	struct hpsa_scsi_dev_t *dev;
++ 	unsigned char scsi3addr[8];
++ 	struct CommandList *c;
++ 	int rc = 0;
++ 
++ 	/* Get the ptr to our adapter structure out of cmd->host. */
++ 	h = sdev_to_hba(cmd->device);
++ 	dev = cmd->device->hostdata;
++ 	if (!dev) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 	memcpy(scsi3addr, dev->scsi3addr, sizeof(scsi3addr));
++ 
++ 	if (unlikely(lockup_detected(h))) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 	c = cmd_alloc(h);
++ 	if (c == NULL) {			/* trouble... */
++ 		dev_err(&h->pdev->dev, "cmd_alloc returned NULL!\n");
++ 		return SCSI_MLQUEUE_HOST_BUSY;
++ 	}
++ 	if (unlikely(lockup_detected(h))) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd_free(h, c);
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Call alternate submit routine for I/O accelerated commands.
++ 	 * Retries always go down the normal I/O path.
++ 	 */
++ 	if (likely(cmd->retries == 0 &&
++ 		cmd->request->cmd_type == REQ_TYPE_FS &&
++ 		h->acciopath_status)) {
++ 		rc = hpsa_ioaccel_submit(h, c, cmd, scsi3addr);
++ 		if (rc == 0)
++ 			return 0;
++ 		if (rc == SCSI_MLQUEUE_HOST_BUSY) {
++ 			cmd_free(h, c);	/* FIX-ME:  on merge, change to
++ 					 * cmd_tagged_free(), and ultimately
++ 					 * to hpsa_cmd_resolve_and_free(). */
++ 			return SCSI_MLQUEUE_HOST_BUSY;
++ 		}
++ 	}
++ 	return hpsa_ciss_submit(h, c, cmd, scsi3addr);
++ }
++ 
++ static void hpsa_scan_complete(struct ctlr_info *h)
+++>>>>>>> 592a0ad5aee7 (hpsa: factor out hpsa_ioaccel_submit function)
+  {
+  	unsigned long flags;
+  
+* Unmerged path drivers/scsi/hpsa.c
