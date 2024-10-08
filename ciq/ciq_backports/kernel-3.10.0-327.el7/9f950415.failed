@@ -1,0 +1,155 @@
+tcp: fix child sockets to use system default congestion control if not set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Neal Cardwell <ncardwell@google.com>
+commit 9f950415e4e28e7cfae2e416b43e862e8101d996
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9f950415.failed
+
+Linux 3.17 and earlier are explicitly engineered so that if the app
+doesn't specifically request a CC module on a listener before the SYN
+arrives, then the child gets the system default CC when the connection
+is established. See tcp_init_congestion_control() in 3.17 or earlier,
+which says "if no choice made yet assign the current value set as
+default". The change ("net: tcp: assign tcp cong_ops when tcp sk is
+created") altered these semantics, so that children got their parent
+listener's congestion control even if the system default had changed
+after the listener was created.
+
+This commit returns to those original semantics from 3.17 and earlier,
+since they are the original semantics from 2007 in 4d4d3d1e8 ("[TCP]:
+Congestion control initialization."), and some Linux congestion
+control workflows depend on that.
+
+In summary, if a listener socket specifically sets TCP_CONGESTION to
+"x", or the route locks the CC module to "x", then the child gets
+"x". Otherwise the child gets current system default from
+net.ipv4.tcp_congestion_control. That's the behavior in 3.17 and
+earlier, and this commit restores that.
+
+Fixes: 55d8694fa82c ("net: tcp: assign tcp cong_ops when tcp sk is created")
+	Cc: Florian Westphal <fw@strlen.de>
+	Cc: Daniel Borkmann <dborkman@redhat.com>
+	Cc: Glenn Judd <glenn.judd@morganstanley.com>
+	Cc: Stephen Hemminger <stephen@networkplumber.org>
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9f950415e4e28e7cfae2e416b43e862e8101d996)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/inet_connection_sock.h
+#	net/ipv4/tcp_cong.c
+#	net/ipv4/tcp_minisocks.c
+diff --cc include/net/inet_connection_sock.h
+index c55aeed41ace,0320bbb7d7b5..000000000000
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@@ -97,7 -98,9 +97,13 @@@ struct inet_connection_sock 
+  	const struct tcp_congestion_ops *icsk_ca_ops;
+  	const struct inet_connection_sock_af_ops *icsk_af_ops;
+  	unsigned int		  (*icsk_sync_mss)(struct sock *sk, u32 pmtu);
+++<<<<<<< HEAD
+ +	__u8			  icsk_ca_state;
+++=======
++ 	__u8			  icsk_ca_state:6,
++ 				  icsk_ca_setsockopt:1,
++ 				  icsk_ca_dst_locked:1;
+++>>>>>>> 9f950415e4e2 (tcp: fix child sockets to use system default congestion control if not set)
+  	__u8			  icsk_retransmits;
+  	__u8			  icsk_pending;
+  	__u8			  icsk_backoff;
+diff --cc net/ipv4/tcp_cong.c
+index 511547b93096,84be008c945c..000000000000
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@@ -249,25 -327,19 +250,34 @@@ out
+  int tcp_set_congestion_control(struct sock *sk, const char *name)
+  {
+  	struct inet_connection_sock *icsk = inet_csk(sk);
+ -	const struct tcp_congestion_ops *ca;
+ +	struct tcp_congestion_ops *ca;
+  	int err = 0;
+  
+ -	if (icsk->icsk_ca_dst_locked)
+ -		return -EPERM;
+ -
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	ca = tcp_ca_find(name);
+ +
+ +	/* no change asking for existing value */
+ +	if (ca == icsk->icsk_ca_ops)
+ +		goto out;
+ +
+ +#ifdef CONFIG_MODULES
+ +	/* not found attempt to autoload module */
+ +	if (!ca && capable(CAP_NET_ADMIN)) {
+ +		rcu_read_unlock();
+ +		request_module("tcp_%s", name);
+ +		rcu_read_lock();
+ +		ca = tcp_ca_find(name);
+ +	}
+ +#endif
+++=======
++ 	ca = __tcp_ca_find_autoload(name);
++ 	/* No change asking for existing value */
++ 	if (ca == icsk->icsk_ca_ops) {
++ 		icsk->icsk_ca_setsockopt = 1;
++ 		goto out;
++ 	}
+++>>>>>>> 9f950415e4e2 (tcp: fix child sockets to use system default congestion control if not set)
+  	if (!ca)
+  		err = -ENOENT;
+  	else if (!((ca->flags & TCP_CONG_NON_RESTRICTED) ||
+diff --cc net/ipv4/tcp_minisocks.c
+index 6c69a4574ad0,17e7339ee5ca..000000000000
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@@ -387,6 -401,35 +387,38 @@@ static inline void TCP_ECN_openreq_chil
+  	tp->ecn_flags = inet_rsk(req)->ecn_ok ? TCP_ECN_OK : 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void tcp_ca_openreq_child(struct sock *sk, const struct dst_entry *dst)
++ {
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 	u32 ca_key = dst_metric(dst, RTAX_CC_ALGO);
++ 	bool ca_got_dst = false;
++ 
++ 	if (ca_key != TCP_CA_UNSPEC) {
++ 		const struct tcp_congestion_ops *ca;
++ 
++ 		rcu_read_lock();
++ 		ca = tcp_ca_find_key(ca_key);
++ 		if (likely(ca && try_module_get(ca->owner))) {
++ 			icsk->icsk_ca_dst_locked = tcp_ca_dst_locked(dst);
++ 			icsk->icsk_ca_ops = ca;
++ 			ca_got_dst = true;
++ 		}
++ 		rcu_read_unlock();
++ 	}
++ 
++ 	/* If no valid choice made yet, assign current system default ca. */
++ 	if (!ca_got_dst &&
++ 	    (!icsk->icsk_ca_setsockopt ||
++ 	     !try_module_get(icsk->icsk_ca_ops->owner)))
++ 		tcp_assign_congestion_control(sk);
++ 
++ 	tcp_set_ca_state(sk, TCP_CA_Open);
++ }
++ EXPORT_SYMBOL_GPL(tcp_ca_openreq_child);
++ 
+++>>>>>>> 9f950415e4e2 (tcp: fix child sockets to use system default congestion control if not set)
+  /* This is not only more efficient than what we used to do, it eliminates
+   * a lot of code duplication between IPv4/IPv6 SYN recv processing. -DaveM
+   *
+* Unmerged path include/net/inet_connection_sock.h
+* Unmerged path net/ipv4/tcp_cong.c
+* Unmerged path net/ipv4/tcp_minisocks.c
