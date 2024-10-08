@@ -1095,8 +1095,7 @@ void ceph_queue_caps_release(struct inode *inode)
  * caller should hold snap_rwsem (read), s_mutex.
  */
 static int __send_cap(struct ceph_mds_client *mdsc, struct ceph_cap *cap,
-		      int op, int used, int want, int retain, int flushing,
-		      unsigned *pflush_tid)
+		      int op, int used, int want, int retain, int flushing)
 	__releases(cap->ci->i_ceph_lock)
 {
 	struct ceph_inode_info *ci = cap->ci;
@@ -1168,8 +1167,6 @@ static int __send_cap(struct ceph_mds_client *mdsc, struct ceph_cap *cap,
 		 * first ack clean Ax.
 		 */
 		flush_tid = ++ci->i_cap_flush_last_tid;
-		if (pflush_tid)
-			*pflush_tid = flush_tid;
 		dout(" cap_flush_tid %d\n", (int)flush_tid);
 		for (i = 0; i < CEPH_CAP_BITS; i++)
 			if (flushing & (1 << i))
@@ -1725,7 +1722,7 @@ ack:
 
 		/* __send_cap drops i_ceph_lock */
 		delayed += __send_cap(mdsc, cap, CEPH_CAP_OP_UPDATE, cap_used,
-				      want, retain, flushing, NULL);
+				      want, retain, flushing);
 		goto retry; /* retake i_ceph_lock and restart our cap scan. */
 	}
 
@@ -1754,12 +1751,12 @@ ack:
 /*
  * Try to flush dirty caps back to the auth mds.
  */
-static int try_flush_caps(struct inode *inode, unsigned *flush_tid)
+static int try_flush_caps(struct inode *inode, u16 flush_tid[])
 {
 	struct ceph_mds_client *mdsc = ceph_sb_to_client(inode->i_sb)->mdsc;
 	struct ceph_inode_info *ci = ceph_inode(inode);
-	int flushing = 0;
 	struct ceph_mds_session *session = NULL;
+	int flushing = 0;
 
 retry:
 	spin_lock(&ci->i_ceph_lock);
@@ -1788,17 +1785,19 @@ retry:
 
 		/* __send_cap drops i_ceph_lock */
 		delayed = __send_cap(mdsc, cap, CEPH_CAP_OP_FLUSH, used, want,
-				     cap->issued | cap->implemented, flushing,
-				     flush_tid);
-		if (!delayed)
-			goto out_unlocked;
+				     cap->issued | cap->implemented, flushing);
 
 		spin_lock(&ci->i_ceph_lock);
-		__cap_delay_requeue(mdsc, ci);
+		if (delayed)
+			__cap_delay_requeue(mdsc, ci);
 	}
+
+	flushing = ci->i_flushing_caps;
+	if (flushing)
+		memcpy(flush_tid, ci->i_cap_flush_tid,
+		       sizeof(ci->i_cap_flush_tid));
 out:
 	spin_unlock(&ci->i_ceph_lock);
-out_unlocked:
 	if (session)
 		mutex_unlock(&session->s_mutex);
 	return flushing;
@@ -1807,19 +1806,22 @@ out_unlocked:
 /*
  * Return true if we've flushed caps through the given flush_tid.
  */
-static int caps_are_flushed(struct inode *inode, unsigned tid)
+static int caps_are_flushed(struct inode *inode, u16 flush_tid[])
 {
 	struct ceph_inode_info *ci = ceph_inode(inode);
 	int i, ret = 1;
 
 	spin_lock(&ci->i_ceph_lock);
-	for (i = 0; i < CEPH_CAP_BITS; i++)
-		if ((ci->i_flushing_caps & (1 << i)) &&
-		    ci->i_cap_flush_tid[i] <= tid) {
+	for (i = 0; i < CEPH_CAP_BITS; i++) {
+		if (!(ci->i_flushing_caps & (1 << i)))
+			continue;
+		// tid only has 16 bits. we need to handle wrapping
+		if ((s16)(ci->i_cap_flush_tid[i] - flush_tid[i]) <= 0) {
 			/* still flushing this bit */
 			ret = 0;
 			break;
 		}
+	}
 	spin_unlock(&ci->i_ceph_lock);
 	return ret;
 }
@@ -1872,7 +1874,7 @@ int ceph_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file->f_mapping->host;
 	struct ceph_inode_info *ci = ceph_inode(inode);
-	unsigned flush_tid;
+	u16 flush_tid[CEPH_CAP_BITS];
 	int ret;
 	int dirty;
 
@@ -1884,7 +1886,7 @@ int ceph_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 		return ret;
 	mutex_lock(&inode->i_mutex);
 
-	dirty = try_flush_caps(inode, &flush_tid);
+	dirty = try_flush_caps(inode, flush_tid);
 	dout("fsync dirty caps are %s\n", ceph_cap_string(dirty));
 
 	/*
@@ -1893,7 +1895,6 @@ int ceph_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 	 * wait for that)
 	 */
 	if (!datasync && (dirty & ~CEPH_CAP_ANY_FILE_WR)) {
-		dout("fsync waiting for flush_tid %u\n", flush_tid);
 		ret = wait_event_interruptible(ci->i_cap_wq,
 				       caps_are_flushed(inode, flush_tid));
 	}
@@ -1912,14 +1913,14 @@ int ceph_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 int ceph_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	struct ceph_inode_info *ci = ceph_inode(inode);
-	unsigned flush_tid;
+	u16 flush_tid[CEPH_CAP_BITS];
 	int err = 0;
 	int dirty;
 	int wait = wbc->sync_mode == WB_SYNC_ALL;
 
 	dout("write_inode %p wait=%d\n", inode, wait);
 	if (wait) {
-		dirty = try_flush_caps(inode, &flush_tid);
+		dirty = try_flush_caps(inode, flush_tid);
 		if (dirty)
 			err = wait_event_interruptible(ci->i_cap_wq,
 				       caps_are_flushed(inode, flush_tid));
@@ -1989,7 +1990,7 @@ void ceph_kick_flushing_caps(struct ceph_mds_client *mdsc,
 					     __ceph_caps_used(ci),
 					     __ceph_caps_wanted(ci),
 					     cap->issued | cap->implemented,
-					     ci->i_flushing_caps, NULL);
+					     ci->i_flushing_caps);
 			if (delayed) {
 				spin_lock(&ci->i_ceph_lock);
 				__cap_delay_requeue(mdsc, ci);
@@ -2028,7 +2029,7 @@ static void kick_flushing_inode_caps(struct ceph_mds_client *mdsc,
 				     __ceph_caps_used(ci),
 				     __ceph_caps_wanted(ci),
 				     cap->issued | cap->implemented,
-				     ci->i_flushing_caps, NULL);
+				     ci->i_flushing_caps);
 		if (delayed) {
 			spin_lock(&ci->i_ceph_lock);
 			__cap_delay_requeue(mdsc, ci);
