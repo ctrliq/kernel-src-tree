@@ -3622,6 +3622,7 @@ enum {
 	AD1884_FIXUP_AMP_OVERRIDE,
 	AD1884_FIXUP_HP_EAPD,
 	AD1884_FIXUP_DMIC_COEF,
+	AD1884_FIXUP_HP_TOUCHSMART,
 };
 
 static const struct hda_fixup ad1884_fixups[] = {
@@ -3639,9 +3640,16 @@ static const struct hda_fixup ad1884_fixups[] = {
 		.type = HDA_FIXUP_VERBS,
 		.v.verbs = ad1884_dmic_init_verbs,
 	},
+	[AD1884_FIXUP_HP_TOUCHSMART] = {
+		.type = HDA_FIXUP_VERBS,
+		.v.verbs = ad1884_dmic_init_verbs,
+		.chained = true,
+		.chain_id = AD1884_FIXUP_HP_EAPD,
+	},
 };
 
 static const struct snd_pci_quirk ad1884_fixup_tbl[] = {
+	SND_PCI_QUIRK(0x103c, 0x2a82, "HP Touchsmart", AD1884_FIXUP_HP_TOUCHSMART),
 	SND_PCI_QUIRK_VENDOR(0x103c, "HP", AD1884_FIXUP_HP_EAPD),
 	SND_PCI_QUIRK_VENDOR(0x17aa, "Lenovo Thinkpad", AD1884_FIXUP_DMIC_COEF),
 	{}
