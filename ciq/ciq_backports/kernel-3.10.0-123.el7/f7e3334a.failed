@@ -1,0 +1,129 @@
+powerpc: Fix memory hotplug with sparse vmemmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [powerpc] Fix memory hotplug with sparse vmemmap (Steve Best) [805181]
+Rebuild_FUZZ: 89.41%
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit f7e3334a6bcb42e7295a9bd9cb36ca4e6e4e66b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/f7e3334a.failed
+
+Previous commit 46723bfa540... introduced a new config option
+HAVE_BOOTMEM_INFO_NODE that ended up breaking memory hot-remove for ppc
+when sparse vmemmap is not defined.
+
+This patch defines HAVE_BOOTMEM_INFO_NODE for ppc and adds the call to
+register_page_bootmem_info_node. Without this we get a BUG_ON for memory
+hot remove in put_page_bootmem().
+
+This also adds a stub for register_page_bootmem_memmap to allow ppc to build
+with sparse vmemmap defined. Leaving this as a stub is fine since the same
+vmemmap addresses are also handled in vmemmap_populate and as such are
+properly mapped.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+CC: <stable@vger.kernel.org> [v3.9+]
+(cherry picked from commit f7e3334a6bcb42e7295a9bd9cb36ca4e6e4e66b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/mem.c
+diff --cc arch/powerpc/mm/mem.c
+index 15588e2072ef,3fa93dc7fe75..000000000000
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@@ -297,49 -297,24 +297,61 @@@ void __init paging_init(void
+  }
+  #endif /* ! CONFIG_NEED_MULTIPLE_NODES */
+  
++ static void __init register_page_bootmem_info(void)
++ {
++ 	int i;
++ 
++ 	for_each_online_node(i)
++ 		register_page_bootmem_info_node(NODE_DATA(i));
++ }
++ 
+  void __init mem_init(void)
+  {
+ +#ifdef CONFIG_NEED_MULTIPLE_NODES
+ +	int nid;
+ +#endif
+ +	pg_data_t *pgdat;
+ +	unsigned long i;
+ +	struct page *page;
+ +	unsigned long reservedpages = 0, codesize, initsize, datasize, bsssize;
+ +
+  #ifdef CONFIG_SWIOTLB
+  	swiotlb_init(0);
+  #endif
+  
+++<<<<<<< HEAD
+ +	num_physpages = memblock_phys_mem_size() >> PAGE_SHIFT;
+++=======
++ 	register_page_bootmem_info();
+++>>>>>>> f7e3334a6bcb (powerpc: Fix memory hotplug with sparse vmemmap)
+  	high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
+ -	set_max_mapnr(max_pfn);
+ -	free_all_bootmem();
+ +
+ +#ifdef CONFIG_NEED_MULTIPLE_NODES
+ +        for_each_online_node(nid) {
+ +		if (NODE_DATA(nid)->node_spanned_pages != 0) {
+ +			printk("freeing bootmem node %d\n", nid);
+ +			totalram_pages +=
+ +				free_all_bootmem_node(NODE_DATA(nid));
+ +		}
+ +	}
+ +#else
+ +	max_mapnr = max_pfn;
+ +	totalram_pages += free_all_bootmem();
+ +#endif
+ +	for_each_online_pgdat(pgdat) {
+ +		for (i = 0; i < pgdat->node_spanned_pages; i++) {
+ +			if (!pfn_valid(pgdat->node_start_pfn + i))
+ +				continue;
+ +			page = pgdat_page_nr(pgdat, i);
+ +			if (PageReserved(page))
+ +				reservedpages++;
+ +		}
+ +	}
+ +
+ +	codesize = (unsigned long)&_sdata - (unsigned long)&_stext;
+ +	datasize = (unsigned long)&_edata - (unsigned long)&_sdata;
+ +	initsize = (unsigned long)&__init_end - (unsigned long)&__init_begin;
+ +	bsssize = (unsigned long)&__bss_stop - (unsigned long)&__bss_start;
+  
+  #ifdef CONFIG_HIGHMEM
+  	{
+diff --git a/arch/powerpc/mm/init_64.c b/arch/powerpc/mm/init_64.c
+index d0cd9e4c6837..8ed035d2edb5 100644
+--- a/arch/powerpc/mm/init_64.c
++++ b/arch/powerpc/mm/init_64.c
+@@ -300,5 +300,9 @@ void vmemmap_free(unsigned long start, unsigned long end)
+ {
+ }
+ 
++void register_page_bootmem_memmap(unsigned long section_nr,
++				  struct page *start_page, unsigned long size)
++{
++}
+ #endif /* CONFIG_SPARSEMEM_VMEMMAP */
+ 
+* Unmerged path arch/powerpc/mm/mem.c
+diff --git a/mm/Kconfig b/mm/Kconfig
+index f5e698e30d4a..957f8d2577d7 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -183,7 +183,7 @@ config MEMORY_HOTPLUG_SPARSE
+ config MEMORY_HOTREMOVE
+ 	bool "Allow for memory hot remove"
+ 	select MEMORY_ISOLATION
+-	select HAVE_BOOTMEM_INFO_NODE if X86_64
++	select HAVE_BOOTMEM_INFO_NODE if (X86_64 || PPC64)
+ 	depends on MEMORY_HOTPLUG && ARCH_ENABLE_MEMORY_HOTREMOVE
+ 	depends on MIGRATION
+ 
