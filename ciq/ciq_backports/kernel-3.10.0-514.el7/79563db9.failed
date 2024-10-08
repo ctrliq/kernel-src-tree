@@ -1,0 +1,862 @@
+mei: add reference counting for me clients
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 79563db9ddd37908343103debf20da716ccc5ce4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/79563db9.failed
+
+To support dynamic addition and removal of
+me clients we add reference counter.
+
+Update kdoc with locking requirements.
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 79563db9ddd37908343103debf20da716ccc5ce4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/amthif.c
+#	drivers/misc/mei/bus.c
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/client.h
+#	drivers/misc/mei/debugfs.c
+#	drivers/misc/mei/hbm.c
+#	drivers/misc/mei/main.c
+#	drivers/misc/mei/mei_dev.h
+#	drivers/misc/mei/nfc.c
+#	drivers/misc/mei/wd.c
+diff --cc drivers/misc/mei/amthif.c
+index a11128c1997f,c4cb9a984a5f..000000000000
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@@ -103,11 -105,9 +105,15 @@@ int mei_amthif_host_init(struct mei_dev
+  	dev->iamthif_msg_buf = msg_buf;
+  
+  	ret = mei_cl_link(cl, MEI_IAMTHIF_HOST_CLIENT_ID);
+- 
+  	if (ret < 0) {
+++<<<<<<< HEAD
+ +		dev_err(&dev->pdev->dev,
+ +			"amthif: failed link client %d\n", ret);
+ +		return ret;
+++=======
++ 		dev_err(dev->dev, "amthif: failed cl_link %d\n", ret);
++ 		goto out;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  	}
+  
+  	ret = mei_cl_connect(cl, NULL);
+diff --cc drivers/misc/mei/bus.c
+index ca8736c3675b,be767f4db26a..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -229,35 -228,42 +229,57 @@@ static int ___mei_cl_send(struct mei_c
+  			bool blocking)
+  {
+  	struct mei_device *dev;
+++<<<<<<< HEAD
+ +	struct mei_cl_cb *cb;
+ +	int id;
+ +	int rets;
+++=======
++ 	struct mei_me_client *me_cl = NULL;
++ 	struct mei_cl_cb *cb = NULL;
++ 	ssize_t rets;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	if (WARN_ON(!cl || !cl->dev))
+  		return -ENODEV;
+  
+  	dev = cl->dev;
+  
+- 	if (cl->state != MEI_FILE_CONNECTED)
+- 		return -ENODEV;
++ 	mutex_lock(&dev->device_lock);
++ 	if (cl->state != MEI_FILE_CONNECTED) {
++ 		rets = -ENODEV;
++ 		goto out;
++ 	}
+  
+  	/* Check if we have an ME client device */
+++<<<<<<< HEAD
+ +	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (id < 0)
+ +		return id;
+ +
+ +	if (length > dev->me_clients[id].props.max_msg_length)
+ +		return -EINVAL;
+++=======
++ 	me_cl = mei_me_cl_by_uuid_id(dev, &cl->cl_uuid, cl->me_client_id);
++ 	if (!me_cl) {
++ 		rets = -ENOTTY;
++ 		goto out;
++ 	}
++ 
++ 	if (length > me_cl->props.max_msg_length) {
++ 		rets = -EFBIG;
++ 		goto out;
++ 	}
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	cb = mei_io_cb_init(cl, NULL);
+- 	if (!cb)
+- 		return -ENOMEM;
++ 	if (!cb) {
++ 		rets = -ENOMEM;
++ 		goto out;
++ 	}
+  
+  	rets = mei_io_cb_alloc_req_buf(cb, length);
+- 	if (rets < 0) {
+- 		mei_io_cb_free(cb);
+- 		return rets;
+- 	}
++ 	if (rets < 0)
++ 		goto out;
+  
+  	memcpy(cb->request_buffer.data, buf, length);
+  
+diff --cc drivers/misc/mei/client.c
+index 22a9268f24eb,dfbddfe1c7a0..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -27,49 -27,187 +27,209 @@@
+  #include "client.h"
+  
+  /**
+++<<<<<<< HEAD
+ + * mei_me_cl_by_uuid - locate index of me client
+++=======
++  * mei_me_cl_init - initialize me client
++  *
++  * @me_cl: me client
++  */
++ void mei_me_cl_init(struct mei_me_client *me_cl)
++ {
++ 	INIT_LIST_HEAD(&me_cl->list);
++ 	kref_init(&me_cl->refcnt);
++ }
++ 
++ /**
++  * mei_me_cl_get - increases me client refcount
++  *
++  * @me_cl: me client
++  *
++  * Locking: called under "dev->device_lock" lock
++  *
++  * Return: me client or NULL
++  */
++ struct mei_me_client *mei_me_cl_get(struct mei_me_client *me_cl)
++ {
++ 	if (me_cl)
++ 		kref_get(&me_cl->refcnt);
++ 
++ 	return me_cl;
++ }
++ 
++ /**
++  * mei_me_cl_release - unlink and free me client
++  *
++  * Locking: called under "dev->device_lock" lock
++  *
++  * @ref: me_client refcount
++  */
++ static void mei_me_cl_release(struct kref *ref)
++ {
++ 	struct mei_me_client *me_cl =
++ 		container_of(ref, struct mei_me_client, refcnt);
++ 	list_del(&me_cl->list);
++ 	kfree(me_cl);
++ }
++ /**
++  * mei_me_cl_put - decrease me client refcount and free client if necessary
++  *
++  * Locking: called under "dev->device_lock" lock
++  *
++  * @me_cl: me client
++  */
++ void mei_me_cl_put(struct mei_me_client *me_cl)
++ {
++ 	if (me_cl)
++ 		kref_put(&me_cl->refcnt, mei_me_cl_release);
++ }
++ 
++ /**
++  * mei_me_cl_by_uuid - locate me client by uuid
++  *	increases ref count
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+   *
+   * @dev: mei device
+ - * @uuid: me client uuid
+   *
+   * Locking: called under "dev->device_lock" lock
+   *
+ - * Return: me client or NULL if not found
+ + * returns me client index or -ENOENT if not found
+   */
+ -struct mei_me_client *mei_me_cl_by_uuid(const struct mei_device *dev,
+ -					const uuid_le *uuid)
+ +int mei_me_cl_by_uuid(const struct mei_device *dev, const uuid_le *uuid)
+  {
+ -	struct mei_me_client *me_cl;
+ -
+ +	int i;
+ +
+++<<<<<<< HEAD
+ +	for (i = 0; i < dev->me_clients_num; ++i)
+ +		if (uuid_le_cmp(*uuid,
+ +				dev->me_clients[i].props.protocol_name) == 0)
+ +			return i;
+++=======
++ 	list_for_each_entry(me_cl, &dev->me_clients, list)
++ 		if (uuid_le_cmp(*uuid, me_cl->props.protocol_name) == 0)
++ 			return mei_me_cl_get(me_cl);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+ -	return NULL;
+ +	return -ENOENT;
+  }
+  
+ +
+  /**
+++<<<<<<< HEAD
+ + * mei_me_cl_by_id return index to me_clients for client_id
+++=======
++  * mei_me_cl_by_id - locate me client by client id
++  *	increases ref count
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+   *
+   * @dev: the device structure
+   * @client_id: me client id
+   *
+   * Locking: called under "dev->device_lock" lock
+   *
+ - * Return: me client or NULL if not found
+ + * returns index on success, -ENOENT on failure.
+   */
+ -struct mei_me_client *mei_me_cl_by_id(struct mei_device *dev, u8 client_id)
+ +
+ +int mei_me_cl_by_id(struct mei_device *dev, u8 client_id)
+  {
+ +	int i;
+  
+ -	struct mei_me_client *me_cl;
+ +	for (i = 0; i < dev->me_clients_num; i++)
+ +		if (dev->me_clients[i].client_id == client_id)
+ +			return i;
+  
+++<<<<<<< HEAD
+ +	return -ENOENT;
+++=======
++ 	list_for_each_entry(me_cl, &dev->me_clients, list)
++ 		if (me_cl->client_id == client_id)
++ 			return mei_me_cl_get(me_cl);
++ 
++ 	return NULL;
+  }
+  
++ /**
++  * mei_me_cl_by_uuid_id - locate me client by client id and uuid
++  *	increases ref count
++  *
++  * @dev: the device structure
++  * @uuid: me client uuid
++  * @client_id: me client id
++  *
++  * Locking: called under "dev->device_lock" lock
++  *
++  * Return: me client or NULL if not found
++  */
++ struct mei_me_client *mei_me_cl_by_uuid_id(struct mei_device *dev,
++ 					   const uuid_le *uuid, u8 client_id)
++ {
++ 	struct mei_me_client *me_cl;
++ 
++ 	list_for_each_entry(me_cl, &dev->me_clients, list)
++ 		if (uuid_le_cmp(*uuid, me_cl->props.protocol_name) == 0 &&
++ 		    me_cl->client_id == client_id)
++ 			return mei_me_cl_get(me_cl);
++ 
++ 	return NULL;
++ }
++ 
++ /**
++  * mei_me_cl_rm_by_uuid - remove all me clients matching uuid
++  *
++  * @dev: the device structure
++  * @uuid: me client uuid
++  *
++  * Locking: called under "dev->device_lock" lock
++  */
++ void mei_me_cl_rm_by_uuid(struct mei_device *dev, const uuid_le *uuid)
++ {
++ 	struct mei_me_client *me_cl, *next;
++ 
++ 	dev_dbg(dev->dev, "remove %pUl\n", uuid);
++ 	list_for_each_entry_safe(me_cl, next, &dev->me_clients, list)
++ 		if (uuid_le_cmp(*uuid, me_cl->props.protocol_name) == 0)
++ 			mei_me_cl_put(me_cl);
++ }
++ 
++ /**
++  * mei_me_cl_rm_by_uuid_id - remove all me clients matching client id
++  *
++  * @dev: the device structure
++  * @uuid: me client uuid
++  * @id: me client id
++  *
++  * Locking: called under "dev->device_lock" lock
++  */
++ void mei_me_cl_rm_by_uuid_id(struct mei_device *dev, const uuid_le *uuid, u8 id)
++ {
++ 	struct mei_me_client *me_cl, *next;
++ 	const uuid_le *pn;
++ 
++ 	dev_dbg(dev->dev, "remove %pUl %d\n", uuid, id);
++ 	list_for_each_entry_safe(me_cl, next, &dev->me_clients, list) {
++ 		pn =  &me_cl->props.protocol_name;
++ 		if (me_cl->client_id == id && uuid_le_cmp(*uuid, *pn) == 0)
++ 			mei_me_cl_put(me_cl);
++ 	}
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
++ }
++ 
++ /**
++  * mei_me_cl_rm_all - remove all me clients
++  *
++  * @dev: the device structure
++  *
++  * Locking: called under "dev->device_lock" lock
++  */
++ void mei_me_cl_rm_all(struct mei_device *dev)
++ {
++ 	struct mei_me_client *me_cl, *next;
++ 
++ 	list_for_each_entry_safe(me_cl, next, &dev->me_clients, list)
++ 			mei_me_cl_put(me_cl);
++ }
++ 
++ 
+  
+  /**
+   * mei_cl_cmp_id - tells if the clients are the same
+@@@ -647,7 -790,7 +807,11 @@@ int mei_cl_flow_ctrl_creds(struct mei_c
+  {
+  	struct mei_device *dev;
+  	struct mei_me_client *me_cl;
+++<<<<<<< HEAD
+ +	int id;
+++=======
++ 	int rets = 0;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	if (WARN_ON(!cl || !cl->dev))
+  		return -EINVAL;
+@@@ -660,19 -800,19 +824,24 @@@
+  	if (cl->mei_flow_ctrl_creds > 0)
+  		return 1;
+  
+ -	me_cl = mei_me_cl_by_uuid_id(dev, &cl->cl_uuid, cl->me_client_id);
+ -	if (!me_cl) {
+ +	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (id < 0) {
+  		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+ -		return -ENOENT;
+ +		return id;
+  	}
+  
+++<<<<<<< HEAD
+ +	me_cl = &dev->me_clients[id];
+ +	if (me_cl->mei_flow_ctrl_creds) {
+++=======
++ 	if (me_cl->mei_flow_ctrl_creds > 0) {
++ 		rets = 1;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  		if (WARN_ON(me_cl->props.single_recv_buf == 0))
+- 			return -EINVAL;
+- 		return 1;
++ 			rets = -EINVAL;
+  	}
+- 	return 0;
++ 	mei_me_cl_put(me_cl);
++ 	return rets;
+  }
+  
+  /**
+@@@ -689,30 -829,36 +858,47 @@@ int mei_cl_flow_ctrl_reduce(struct mei_
+  {
+  	struct mei_device *dev;
+  	struct mei_me_client *me_cl;
+++<<<<<<< HEAD
+ +	int id;
+++=======
++ 	int rets;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	if (WARN_ON(!cl || !cl->dev))
+  		return -EINVAL;
+  
+  	dev = cl->dev;
+  
+ -	me_cl = mei_me_cl_by_uuid_id(dev, &cl->cl_uuid, cl->me_client_id);
+ -	if (!me_cl) {
+ +	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (id < 0) {
+  		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+ -		return -ENOENT;
+ +		return id;
+  	}
+  
+++<<<<<<< HEAD
+ +	me_cl = &dev->me_clients[id];
+ +	if (me_cl->props.single_recv_buf != 0) {
+ +		if (WARN_ON(me_cl->mei_flow_ctrl_creds <= 0))
+ +			return -EINVAL;
+++=======
++ 	if (me_cl->props.single_recv_buf) {
++ 		if (WARN_ON(me_cl->mei_flow_ctrl_creds <= 0)) {
++ 			rets = -EINVAL;
++ 			goto out;
++ 		}
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  		me_cl->mei_flow_ctrl_creds--;
+  	} else {
+- 		if (WARN_ON(cl->mei_flow_ctrl_creds <= 0))
+- 			return -EINVAL;
++ 		if (WARN_ON(cl->mei_flow_ctrl_creds <= 0)) {
++ 			rets = -EINVAL;
++ 			goto out;
++ 		}
+  		cl->mei_flow_ctrl_creds--;
+  	}
+- 	return 0;
++ 	rets = 0;
++ out:
++ 	mei_me_cl_put(me_cl);
++ 	return rets;
+  }
+  
+  /**
+@@@ -746,10 -893,13 +932,13 @@@ int mei_cl_read_start(struct mei_cl *cl
+  		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+  		return  -ENOTTY;
+  	}
++ 	/* always allocate at least client max message */
++ 	length = max_t(size_t, length, me_cl->props.max_msg_length);
++ 	mei_me_cl_put(me_cl);
+  
+ -	rets = pm_runtime_get(dev->dev);
+ +	rets = pm_runtime_get(&dev->pdev->dev);
+  	if (rets < 0 && rets != -EINPROGRESS) {
+ -		pm_runtime_put_noidle(dev->dev);
+ +		pm_runtime_put_noidle(&dev->pdev->dev);
+  		cl_err(dev, cl, "rpm: get failed %d\n", rets);
+  		return rets;
+  	}
+@@@ -760,8 -910,6 +949,11 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* always allocate at least client max message */
+ +	length = max_t(size_t, length, dev->me_clients[i].props.max_msg_length);
+++=======
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  	rets = mei_io_cb_alloc_resp_buf(cb, length);
+  	if (rets)
+  		goto out;
+diff --cc drivers/misc/mei/client.h
+index bf2b0b1b493d,cfcde8e97fc4..000000000000
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@@ -24,8 -24,22 +24,27 @@@
+  
+  #include "mei_dev.h"
+  
+++<<<<<<< HEAD
+ +int mei_me_cl_by_uuid(const struct mei_device *dev, const uuid_le *cuuid);
+ +int mei_me_cl_by_id(struct mei_device *dev, u8 client_id);
+++=======
++ /*
++  * reference counting base function
++  */
++ void mei_me_cl_init(struct mei_me_client *me_cl);
++ void mei_me_cl_put(struct mei_me_client *me_cl);
++ struct mei_me_client *mei_me_cl_get(struct mei_me_client *me_cl);
++ 
++ struct mei_me_client *mei_me_cl_by_uuid(const struct mei_device *dev,
++ 					const uuid_le *uuid);
++ struct mei_me_client *mei_me_cl_by_id(struct mei_device *dev, u8 client_id);
++ struct mei_me_client *mei_me_cl_by_uuid_id(struct mei_device *dev,
++ 					   const uuid_le *uuid, u8 client_id);
++ void mei_me_cl_rm_by_uuid(struct mei_device *dev, const uuid_le *uuid);
++ void mei_me_cl_rm_by_uuid_id(struct mei_device *dev,
++ 			     const uuid_le *uuid, u8 id);
++ void mei_me_cl_rm_all(struct mei_device *dev);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  /*
+   * MEI IO Functions
+diff --cc drivers/misc/mei/debugfs.c
+index 85d1d2217fb8,b125380ee871..000000000000
+--- a/drivers/misc/mei/debugfs.c
++++ b/drivers/misc/mei/debugfs.c
+@@@ -28,18 -28,15 +29,30 @@@ static ssize_t mei_dbgfs_read_meclients
+  					size_t cnt, loff_t *ppos)
+  {
+  	struct mei_device *dev = fp->private_data;
+++<<<<<<< HEAD
+ +	struct mei_me_client *cl;
+ +	const size_t bufsz = 1024;
+ +	char *buf = kzalloc(bufsz, GFP_KERNEL);
+ +	int i;
+ +	int pos = 0;
+ +	int ret;
+ +
+ +	if  (!buf)
+ +		return -ENOMEM;
+ +
+ +	pos += scnprintf(buf + pos, bufsz - pos,
+ +			"  |id|addr|         UUID                       |con|msg len|\n");
+++=======
++ 	struct mei_me_client *me_cl, *n;
++ 	size_t bufsz = 1;
++ 	char *buf;
++ 	int i = 0;
++ 	int pos = 0;
++ 	int ret;
++ 
++ #define HDR \
++ "  |id|fix|         UUID                       |con|msg len|sb|refc|\n"
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	mutex_lock(&dev->device_lock);
+  
+@@@ -47,20 -56,22 +60,39 @@@
+  	if (dev->dev_state != MEI_DEV_ENABLED)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < dev->me_clients_num; i++) {
+ +		cl = &dev->me_clients[i];
+ +
+ +		/* skip me clients that cannot be connected */
+ +		if (cl->props.max_number_of_connections == 0)
+ +			continue;
+ +
+ +		pos += scnprintf(buf + pos, bufsz - pos,
+ +			"%2d|%2d|%4d|%pUl|%3d|%7d|\n",
+ +			i, cl->client_id,
+ +			cl->props.fixed_address,
+ +			&cl->props.protocol_name,
+ +			cl->props.max_number_of_connections,
+ +			cl->props.max_msg_length);
+++=======
++ 	list_for_each_entry_safe(me_cl, n, &dev->me_clients, list) {
++ 
++ 		me_cl = mei_me_cl_get(me_cl);
++ 		if (me_cl) {
++ 			pos += scnprintf(buf + pos, bufsz - pos,
++ 				"%2d|%2d|%3d|%pUl|%3d|%7d|%2d|%4d|\n",
++ 				i++, me_cl->client_id,
++ 				me_cl->props.fixed_address,
++ 				&me_cl->props.protocol_name,
++ 				me_cl->props.max_number_of_connections,
++ 				me_cl->props.max_msg_length,
++ 				me_cl->props.single_recv_buf,
++ 				atomic_read(&me_cl->refcnt.refcount));
++ 		}
++ 
++ 		mei_me_cl_put(me_cl);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  	}
+  out:
+  	mutex_unlock(&dev->device_lock);
+diff --cc drivers/misc/mei/hbm.c
+index 3cb8e1000d69,c8412d41e4f1..000000000000
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@@ -92,12 -111,9 +92,16 @@@ void mei_hbm_idle(struct mei_device *de
+   */
+  void mei_hbm_reset(struct mei_device *dev)
+  {
+ +	dev->me_clients_num = 0;
+ +	dev->me_client_presentation_num = 0;
+  	dev->me_client_index = 0;
+  
+++<<<<<<< HEAD
+ +	kfree(dev->me_clients);
+ +	dev->me_clients = NULL;
+++=======
++ 	mei_me_cl_rm_all(dev);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	mei_hbm_idle(dev);
+  }
+@@@ -288,6 -311,37 +292,40 @@@ static int mei_hbm_enum_clients_req(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * mei_hbm_me_cl_add - add new me client to the list
++  *
++  * @dev: the device structure
++  * @res: hbm property response
++  *
++  * Return: 0 on success and -ENOMEM on allocation failure
++  */
++ 
++ static int mei_hbm_me_cl_add(struct mei_device *dev,
++ 			     struct hbm_props_response *res)
++ {
++ 	struct mei_me_client *me_cl;
++ 	const uuid_le *uuid = &res->client_properties.protocol_name;
++ 
++ 	mei_me_cl_rm_by_uuid(dev, uuid);
++ 
++ 	me_cl = kzalloc(sizeof(struct mei_me_client), GFP_KERNEL);
++ 	if (!me_cl)
++ 		return -ENOMEM;
++ 
++ 	mei_me_cl_init(me_cl);
++ 
++ 	me_cl->props = res->client_properties;
++ 	me_cl->client_id = res->me_addr;
++ 	me_cl->mei_flow_ctrl_creds = 0;
++ 
++ 	list_add(&me_cl->list, &dev->me_clients);
++ 	return 0;
++ }
++ 
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  /**
+   * mei_hbm_prop_req - request property for a single client
+   *
+@@@ -427,27 -474,28 +465,45 @@@ static int mei_hbm_add_single_flow_cred
+  				  struct hbm_flow_control *flow)
+  {
+  	struct mei_me_client *me_cl;
+++<<<<<<< HEAD
+ +	int id;
+++=======
++ 	int rets;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+ -	me_cl = mei_me_cl_by_id(dev, flow->me_addr);
+ -	if (!me_cl) {
+ -		dev_err(dev->dev, "no such me client %d\n",
+ +	id = mei_me_cl_by_id(dev, flow->me_addr);
+ +	if (id < 0) {
+ +		dev_err(&dev->pdev->dev, "no such me client %d\n",
+  			flow->me_addr);
+ -		return -ENOENT;
+ +		return id;
+  	}
+  
+++<<<<<<< HEAD
+ +	me_cl = &dev->me_clients[id];
+ +	if (me_cl->props.single_recv_buf) {
+ +		me_cl->mei_flow_ctrl_creds++;
+ +		dev_dbg(&dev->pdev->dev, "recv flow ctrl msg ME %d (single).\n",
+ +		    flow->me_addr);
+ +		dev_dbg(&dev->pdev->dev, "flow control credentials =%d.\n",
+ +		    me_cl->mei_flow_ctrl_creds);
+ +	} else {
+ +		BUG();	/* error in flow control */
+ +	}
+++=======
++ 	if (WARN_ON(me_cl->props.single_recv_buf == 0)) {
++ 		rets = -EINVAL;
++ 		goto out;
++ 	}
+  
+- 	return 0;
++ 	me_cl->mei_flow_ctrl_creds++;
++ 	dev_dbg(dev->dev, "recv flow ctrl msg ME %d (single) creds = %d.\n",
++ 	    flow->me_addr, me_cl->mei_flow_ctrl_creds);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
++ 
++ 	rets = 0;
++ out:
++ 	mei_me_cl_put(me_cl);
++ 	return rets;
+  }
+  
+  /**
+diff --cc drivers/misc/mei/main.c
+index b23f9eba9e3a,3c019c0e60eb..000000000000
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@@ -326,6 -303,7 +326,10 @@@ static ssize_t mei_write(struct file *f
+  			 size_t length, loff_t *offset)
+  {
+  	struct mei_cl *cl = file->private_data;
+++<<<<<<< HEAD
+++=======
++ 	struct mei_me_client *me_cl = NULL;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  	struct mei_cl_cb *write_cb = NULL;
+  	struct mei_device *dev;
+  	unsigned long timeout = 0;
+@@@ -467,34 -435,30 +473,29 @@@ static int mei_ioctl_connect_client(str
+  	cl = file->private_data;
+  	dev = cl->dev;
+  
+- 	if (dev->dev_state != MEI_DEV_ENABLED) {
+- 		rets = -ENODEV;
+- 		goto end;
+- 	}
++ 	if (dev->dev_state != MEI_DEV_ENABLED)
++ 		return -ENODEV;
+  
+  	if (cl->state != MEI_FILE_INITIALIZING &&
+- 	    cl->state != MEI_FILE_DISCONNECTED) {
+- 		rets = -EBUSY;
+- 		goto end;
+- 	}
++ 	    cl->state != MEI_FILE_DISCONNECTED)
++ 		return  -EBUSY;
+  
+  	/* find ME client we're trying to connect to */
+ -	me_cl = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
+ -	if (!me_cl || me_cl->props.fixed_address) {
+ -		dev_dbg(dev->dev, "Cannot connect to FW Client UUID = %pUl\n",
+ +	i = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
+ +	if (i < 0 || dev->me_clients[i].props.fixed_address) {
+ +		dev_dbg(&dev->pdev->dev, "Cannot connect to FW Client UUID = %pUl\n",
+  				&data->in_client_uuid);
+- 		rets = -ENOTTY;
+- 		goto end;
++ 		return  -ENOTTY;
+  	}
+  
+ -	cl->me_client_id = me_cl->client_id;
+ -	cl->cl_uuid = me_cl->props.protocol_name;
+ +	cl->me_client_id = dev->me_clients[i].client_id;
+  
+ -	dev_dbg(dev->dev, "Connect to FW Client ID = %d\n",
+ +	dev_dbg(&dev->pdev->dev, "Connect to FW Client ID = %d\n",
+  			cl->me_client_id);
+ -	dev_dbg(dev->dev, "FW Client - Protocol Version = %d\n",
+ -			me_cl->props.protocol_version);
+ -	dev_dbg(dev->dev, "FW Client - Max Msg Len = %d\n",
+ -			me_cl->props.max_msg_length);
+ +	dev_dbg(&dev->pdev->dev, "FW Client - Protocol Version = %d\n",
+ +			dev->me_clients[i].props.protocol_version);
+ +	dev_dbg(&dev->pdev->dev, "FW Client - Max Msg Len = %d\n",
+ +			dev->me_clients[i].props.max_msg_length);
+  
+  	/* if we're connecting to amthif client then we will use the
+  	 * existing connection
+@@@ -522,14 -484,12 +523,12 @@@
+  		goto end;
+  	}
+  
+- 
+  	/* prepare the output buffer */
+  	client = &data->out_client_properties;
+ -	client->max_msg_length = me_cl->props.max_msg_length;
+ -	client->protocol_version = me_cl->props.protocol_version;
+ -	dev_dbg(dev->dev, "Can connect?\n");
+ +	client->max_msg_length = dev->me_clients[i].props.max_msg_length;
+ +	client->protocol_version = dev->me_clients[i].props.protocol_version;
+ +	dev_dbg(&dev->pdev->dev, "Can connect?\n");
+  
+- 
+  	rets = mei_cl_connect(cl, file);
+  
+  end:
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,6c6ce9381535..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -173,11 -171,15 +173,23 @@@ struct mei_fw_status 
+  /**
+   * struct mei_me_client - representation of me (fw) client
+   *
+++<<<<<<< HEAD
+ + * @props  - client properties
+ + * @client_id - me client id
+ + * @mei_flow_ctrl_creds - flow control credits
+ + */
+ +struct mei_me_client {
+++=======
++  * @list: link in me client list
++  * @refcnt: struct reference count
++  * @props: client properties
++  * @client_id: me client id
++  * @mei_flow_ctrl_creds: flow control credits
++  */
++ struct mei_me_client {
++ 	struct list_head list;
++ 	struct kref refcnt;
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  	struct mei_client_properties props;
+  	u8 client_id;
+  	u8 mei_flow_ctrl_creds;
+diff --cc drivers/misc/mei/nfc.c
+index 2b65e8021f0d,bb61a119b8bb..000000000000
+--- a/drivers/misc/mei/nfc.c
++++ b/drivers/misc/mei/nfc.c
+@@@ -505,7 -519,9 +505,13 @@@ int mei_nfc_host_init(struct mei_devic
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	cl_info->me_client_id = dev->me_clients[i].client_id;
+++=======
++ 	cl_info->me_client_id = me_cl->client_id;
++ 	cl_info->cl_uuid = me_cl->props.protocol_name;
++ 	mei_me_cl_put(me_cl);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	ret = mei_cl_link(cl_info, MEI_HOST_CLIENT_ID_ANY);
+  	if (ret)
+@@@ -523,7 -538,9 +529,13 @@@
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	cl->me_client_id = dev->me_clients[i].client_id;
+++=======
++ 	cl->me_client_id = me_cl->client_id;
++ 	cl->cl_uuid = me_cl->props.protocol_name;
++ 	mei_me_cl_put(me_cl);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	ret = mei_cl_link(cl, MEI_HOST_CLIENT_ID_ANY);
+  	if (ret)
+diff --cc drivers/misc/mei/wd.c
+index 1e4f4283f10e,475f1dea45bf..000000000000
+--- a/drivers/misc/mei/wd.c
++++ b/drivers/misc/mei/wd.c
+@@@ -81,7 -74,9 +81,13 @@@ int mei_wd_host_init(struct mei_device 
+  		return -ENOTTY;
+  	}
+  
+++<<<<<<< HEAD
+ +	cl->me_client_id = dev->me_clients[id].client_id;
+++=======
++ 	cl->me_client_id = me_cl->client_id;
++ 	cl->cl_uuid = me_cl->props.protocol_name;
++ 	mei_me_cl_put(me_cl);
+++>>>>>>> 79563db9ddd3 (mei: add reference counting for me clients)
+  
+  	ret = mei_cl_link(cl, MEI_WD_HOST_CLIENT_ID);
+  
+* Unmerged path drivers/misc/mei/amthif.c
+* Unmerged path drivers/misc/mei/bus.c
+* Unmerged path drivers/misc/mei/client.c
+* Unmerged path drivers/misc/mei/client.h
+* Unmerged path drivers/misc/mei/debugfs.c
+* Unmerged path drivers/misc/mei/hbm.c
+* Unmerged path drivers/misc/mei/main.c
+* Unmerged path drivers/misc/mei/mei_dev.h
+* Unmerged path drivers/misc/mei/nfc.c
+* Unmerged path drivers/misc/mei/wd.c
