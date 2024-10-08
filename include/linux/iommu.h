@@ -72,6 +72,20 @@ enum iommu_attr {
 	DOMAIN_ATTR_MAX,
 };
 
+/**
+ * struct iommu_dm_region - descriptor for a direct mapped memory region
+ * @list: Linked list pointers
+ * @start: System physical start address of the region
+ * @length: Length of the region in bytes
+ * @prot: IOMMU Protection flags (READ/WRITE/...)
+ */
+struct iommu_dm_region {
+	struct list_head	list;
+	phys_addr_t		start;
+	size_t			length;
+	int			prot;
+};
+
 #ifdef CONFIG_IOMMU_API
 
 /**
@@ -114,6 +128,10 @@ struct iommu_ops {
 	int (*domain_set_attr)(struct iommu_domain *domain,
 			       enum iommu_attr attr, void *data);
 
+	/* Request/Free a list of direct mapping requirements for a device */
+	void (*get_dm_regions)(struct device *dev, struct list_head *list);
+	void (*put_dm_regions)(struct device *dev, struct list_head *list);
+
 	/* Window handling functions */
 	int (*domain_window_enable)(struct iommu_domain *domain, u32 wnd_nr,
 				    phys_addr_t paddr, u64 size, int prot);
@@ -155,6 +173,9 @@ extern size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova,
 extern phys_addr_t iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova);
 extern void iommu_set_fault_handler(struct iommu_domain *domain,
 			iommu_fault_handler_t handler, void *token);
+
+extern void iommu_get_dm_regions(struct device *dev, struct list_head *list);
+extern void iommu_put_dm_regions(struct device *dev, struct list_head *list);
 
 extern int iommu_attach_group(struct iommu_domain *domain,
 			      struct iommu_group *group);
@@ -313,6 +334,16 @@ static inline phys_addr_t iommu_iova_to_phys(struct iommu_domain *domain, dma_ad
 
 static inline void iommu_set_fault_handler(struct iommu_domain *domain,
 				iommu_fault_handler_t handler, void *token)
+{
+}
+
+static inline void iommu_get_dm_regions(struct device *dev,
+					struct list_head *list)
+{
+}
+
+static inline void iommu_put_dm_regions(struct device *dev,
+					struct list_head *list)
 {
 }
 
