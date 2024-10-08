@@ -404,6 +404,29 @@ struct device_domain_info {
 	struct dmar_domain *domain; /* pointer to domain */
 };
 
+struct dmar_rmrr_unit {
+	struct list_head list;		/* list of rmrr units	*/
+	struct acpi_dmar_header *hdr;	/* ACPI header		*/
+	u64	base_address;		/* reserved base address*/
+	u64	end_address;		/* reserved end address */
+	struct pci_dev **devices;	/* target devices */
+	int	devices_cnt;		/* target device count */
+};
+
+struct dmar_atsr_unit {
+	struct list_head list;		/* list of ATSR units */
+	struct acpi_dmar_header *hdr;	/* ACPI header */
+	struct pci_dev **devices;	/* target devices */
+	int devices_cnt;		/* target device count */
+	u8 include_all:1;		/* include all ports */
+};
+
+static LIST_HEAD(dmar_atsr_units);
+static LIST_HEAD(dmar_rmrr_units);
+
+#define for_each_rmrr_units(rmrr) \
+	list_for_each_entry(rmrr, &dmar_rmrr_units, list)
+
 static void flush_unmaps_timeout(unsigned long data);
 
 DEFINE_TIMER(unmap_timer,  flush_unmaps_timeout, 0, 0);
@@ -427,6 +450,8 @@ static int timer_on;
 static long list_size;
 
 static void domain_remove_dev_info(struct dmar_domain *domain);
+static void domain_remove_one_dev_info(struct dmar_domain *domain,
+				       struct pci_dev *pdev);
 
 #ifdef CONFIG_INTEL_IOMMU_DEFAULT_ON
 int dmar_disabled = 0;
@@ -2285,8 +2310,6 @@ static int __init si_domain_init(int hw)
 	return 0;
 }
 
-static void domain_remove_one_dev_info(struct dmar_domain *domain,
-					  struct pci_dev *pdev);
 static int identity_mapping(struct pci_dev *pdev)
 {
 	struct device_domain_info *info;
@@ -3489,8 +3512,6 @@ static void __init init_iommu_pm_ops(void)
 static inline void init_iommu_pm_ops(void) {}
 #endif	/* CONFIG_PM */
 
-LIST_HEAD(dmar_rmrr_units);
-
 static void __init dmar_register_rmrr_unit(struct dmar_rmrr_unit *rmrr)
 {
 	list_add(&rmrr->list, &dmar_rmrr_units);
@@ -3532,8 +3553,6 @@ rmrr_parse_dev(struct dmar_rmrr_unit *rmrru)
 	}
 	return ret;
 }
-
-static LIST_HEAD(dmar_atsr_units);
 
 int __init dmar_parse_one_atsr(struct acpi_dmar_header *hdr)
 {
