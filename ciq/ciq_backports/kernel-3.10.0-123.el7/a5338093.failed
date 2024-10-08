@@ -1,0 +1,139 @@
+mm: move mmu notifier call from change_protection to change_pmd_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] move mmu notifier call from change_protection to change_pmd_range (Rik van Riel) [1066655]
+Rebuild_FUZZ: 97.01%
+commit-author Rik van Riel <riel@redhat.com>
+commit a5338093bfb462256f70f3450c08f73e59543e26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/a5338093.failed
+
+The NUMA scanning code can end up iterating over many gigabytes of
+unpopulated memory, especially in the case of a freshly started KVM
+guest with lots of memory.
+
+This results in the mmu notifier code being called even when there are
+no mapped pages in a virtual address range.  The amount of time wasted
+can be enough to trigger soft lockup warnings with very large KVM
+guests.
+
+This patch moves the mmu notifier call to the pmd level, which
+represents 1GB areas of memory on x86-64.  Furthermore, the mmu notifier
+code is only called from the address in the PMD where present mappings
+are first encountered.
+
+The hugetlbfs code is left alone for now; hugetlb mappings are not
+relocatable, and as such are left alone by the NUMA code, and should
+never trigger this problem to begin with.
+
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Reported-by: Xing Gang <gang.xing@hp.com>
+	Tested-by: Chegu Vinod <chegu_vinod@hp.com>
+	Cc: Sasha Levin <sasha.levin@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a5338093bfb462256f70f3450c08f73e59543e26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mprotect.c
+diff --cc mm/mprotect.c
+index ac7046362258,c43d557941f8..000000000000
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@@ -139,13 -140,26 +139,31 @@@ static inline unsigned long change_pmd_
+  		pgprot_t newprot, int dirty_accountable, int prot_numa)
+  {
+  	pmd_t *pmd;
++ 	struct mm_struct *mm = vma->vm_mm;
+  	unsigned long next;
+  	unsigned long pages = 0;
+++<<<<<<< HEAD
+ +	bool all_same_node;
+++=======
++ 	unsigned long nr_huge_updates = 0;
++ 	unsigned long mni_start = 0;
+++>>>>>>> a5338093bfb4 (mm: move mmu notifier call from change_protection to change_pmd_range)
+  
+  	pmd = pmd_offset(pud, addr);
+  	do {
+ -		unsigned long this_pages;
+ -
+  		next = pmd_addr_end(addr, end);
+++<<<<<<< HEAD
+++=======
++ 		if (!pmd_trans_huge(*pmd) && pmd_none_or_clear_bad(pmd))
++ 			continue;
++ 
++ 		/* invoke the mmu notifier if the pmd is populated */
++ 		if (!mni_start) {
++ 			mni_start = addr;
++ 			mmu_notifier_invalidate_range_start(mm, mni_start, end);
++ 		}
++ 
+++>>>>>>> a5338093bfb4 (mm: move mmu notifier call from change_protection to change_pmd_range)
+  		if (pmd_trans_huge(*pmd)) {
+  			if (next - addr != HPAGE_PMD_SIZE)
+  				split_huge_page_pmd(vma, addr, pmd);
+@@@ -160,23 -176,19 +178,31 @@@
+  					continue;
+  				}
+  			}
+ -			/* fall through, the trans huge pmd just split */
+ +			/* fall through */
+  		}
+ -		this_pages = change_pte_range(vma, pmd, addr, next, newprot,
+ -				 dirty_accountable, prot_numa);
+ -		pages += this_pages;
+ +		if (pmd_none_or_clear_bad(pmd))
+ +			continue;
+ +		pages += change_pte_range(vma, pmd, addr, next, newprot,
+ +				 dirty_accountable, prot_numa, &all_same_node);
+ +
+ +		/*
+ +		 * If we are changing protections for NUMA hinting faults then
+ +		 * set pmd_numa if the examined pages were all on the same
+ +		 * node. This allows a regular PMD to be handled as one fault
+ +		 * and effectively batches the taking of the PTL
+ +		 */
+ +		if (prot_numa && all_same_node)
+ +			change_pmd_protnuma(vma->vm_mm, addr, pmd);
+  	} while (pmd++, addr = next, addr != end);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (mni_start)
++ 		mmu_notifier_invalidate_range_end(mm, mni_start, end);
++ 
++ 	if (nr_huge_updates)
++ 		count_vm_numa_events(NUMA_HUGE_PTE_UPDATES, nr_huge_updates);
+++>>>>>>> a5338093bfb4 (mm: move mmu notifier call from change_protection to change_pmd_range)
+  	return pages;
+  }
+  
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 633455f15eac..4004514c911a 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3064,6 +3064,7 @@ unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
+ 	BUG_ON(address >= end);
+ 	flush_cache_range(vma, address, end);
+ 
++	mmu_notifier_invalidate_range_start(mm, start, end);
+ 	mutex_lock(&vma->vm_file->f_mapping->i_mmap_mutex);
+ 	spin_lock(&mm->page_table_lock);
+ 	for (; address < end; address += huge_page_size(h)) {
+@@ -3091,6 +3092,7 @@ unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
+ 	 */
+ 	flush_tlb_range(vma, start, end);
+ 	mutex_unlock(&vma->vm_file->f_mapping->i_mmap_mutex);
++	mmu_notifier_invalidate_range_end(mm, start, end);
+ 
+ 	return pages << h->order;
+ }
+* Unmerged path mm/mprotect.c
