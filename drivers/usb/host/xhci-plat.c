@@ -119,6 +119,7 @@ static int xhci_plat_probe(struct platform_device *pdev)
 	hcd = dev_get_drvdata(&pdev->dev);
 	xhci = hcd_to_xhci(hcd);
 	xhci->clk = clk;
+	xhci->main_hcd = hcd;
 	xhci->shared_hcd = usb_create_shared_hcd(driver, &pdev->dev,
 			dev_name(&pdev->dev), hcd);
 	if (!xhci->shared_hcd) {
