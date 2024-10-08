@@ -1,0 +1,149 @@
+hv_netvsc: Cleanup the test for freeing skb when we use sendbuf mechanism
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author KY Srinivasan <kys@microsoft.com>
+commit cbacec76bcd03ff21b37ac331e652b5a8f3ea644
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cbacec76.failed
+
+In preparation for embedding the rndis state and other packet state into
+the skb, cleanup the test for freeing the skb.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cbacec76bcd03ff21b37ac331e652b5a8f3ea644)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 48afb9d964ab,ecbd81385e96..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -810,6 -808,103 +810,106 @@@ int netvsc_send(struct hv_device *devic
+  			   packet, ret);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return ret;
++ }
++ 
++ int netvsc_send(struct hv_device *device,
++ 		struct hv_netvsc_packet *packet)
++ {
++ 	struct netvsc_device *net_device;
++ 	int ret = 0, m_ret = 0;
++ 	struct vmbus_channel *out_channel;
++ 	u16 q_idx = packet->q_idx;
++ 	u32 pktlen = packet->total_data_buflen, msd_len = 0;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	struct sk_buff *skb = NULL;
++ 	unsigned long flag;
++ 	struct multi_send_data *msdp;
++ 	struct hv_netvsc_packet *msd_send = NULL, *cur_send = NULL;
++ 
++ 	net_device = get_outbound_net_device(device);
++ 	if (!net_device)
++ 		return -ENODEV;
++ 
++ 	out_channel = net_device->chn_table[q_idx];
++ 	if (!out_channel) {
++ 		out_channel = device->channel;
++ 		q_idx = 0;
++ 		packet->q_idx = 0;
++ 	}
++ 	packet->channel = out_channel;
++ 	packet->send_buf_index = NETVSC_INVALID_INDEX;
++ 
++ 	msdp = &net_device->msd[q_idx];
++ 
++ 	/* batch packets in send buffer if possible */
++ 	spin_lock_irqsave(&msdp->lock, flag);
++ 	if (msdp->pkt)
++ 		msd_len = msdp->pkt->total_data_buflen;
++ 
++ 	if (packet->is_data_pkt && msd_len > 0 &&
++ 	    msdp->count < net_device->max_pkt &&
++ 	    msd_len + pktlen + net_device->pkt_align <
++ 	    net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 
++ 	} else if (packet->is_data_pkt && pktlen + net_device->pkt_align <
++ 		   net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 				msd_send = msdp->pkt;
++ 				msdp->pkt = NULL;
++ 				msdp->count = 0;
++ 				msd_len = 0;
++ 		}
++ 	}
++ 
++ 	if (section_index != NETVSC_INVALID_INDEX) {
++ 		netvsc_copy_to_send_buf(net_device,
++ 					section_index, msd_len,
++ 					packet);
++ 		skb = (struct sk_buff *)
++ 		       (unsigned long)packet->send_completion_tid;
++ 
++ 		packet->page_buf_cnt = 0;
++ 		packet->send_completion_tid = 0;
++ 		packet->send_buf_index = section_index;
++ 		packet->total_data_buflen += msd_len;
++ 
++ 		kfree(msdp->pkt);
++ 		if (packet->xmit_more) {
++ 			msdp->pkt = packet;
++ 			msdp->count++;
++ 		} else {
++ 			cur_send = packet;
++ 			msdp->pkt = NULL;
++ 			msdp->count = 0;
++ 		}
++ 	} else {
++ 		msd_send = msdp->pkt;
++ 		msdp->pkt = NULL;
++ 		msdp->count = 0;
++ 		cur_send = packet;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&msdp->lock, flag);
++ 
++ 	if (msd_send) {
++ 		m_ret = netvsc_send_pkt(msd_send, net_device);
++ 
++ 		if (m_ret != 0) {
++ 			netvsc_free_send_slot(net_device,
++ 					      msd_send->send_buf_index);
++ 			kfree(msd_send);
++ 		}
++ 	}
++ 
++ 	if (cur_send)
++ 		ret = netvsc_send_pkt(cur_send, net_device);
++ 
+++>>>>>>> cbacec76bcd0 (hv_netvsc: Cleanup the test for freeing skb when we use sendbuf mechanism)
+  	if (ret != 0) {
+  		if (section_index != NETVSC_INVALID_INDEX)
+  			netvsc_free_send_slot(net_device, section_index);
+* Unmerged path drivers/net/hyperv/netvsc.c
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index f6bc78f79972..f389dd95a5b4 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -234,11 +234,10 @@ static void netvsc_xmit_completion(void *context)
+ 	struct hv_netvsc_packet *packet = (struct hv_netvsc_packet *)context;
+ 	struct sk_buff *skb = (struct sk_buff *)
+ 		(unsigned long)packet->send_completion_tid;
+-	u32 index = packet->send_buf_index;
+ 
+ 	kfree(packet);
+ 
+-	if (skb && (index == NETVSC_INVALID_INDEX))
++	if (skb)
+ 		dev_kfree_skb_any(skb);
+ }
+ 
