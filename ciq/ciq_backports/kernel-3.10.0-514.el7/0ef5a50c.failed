@@ -1,0 +1,105 @@
+block: make bio_inc_remaining() interface accessible again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 0ef5a50c1658d4d96a44f145bcb92ff3310c75b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0ef5a50c.failed
+
+Commit 326e1dbb57 ("block: remove management of bi_remaining when
+restoring original bi_end_io") made bio_inc_remaining() private to bio.c
+because the only use-case that made sense was confined to the
+bio_chain() interface.
+
+Since that time DM thinp went on to use bio_chain() in its relatively
+complex implementation of async discard support.  That implementation,
+even when converted over to use the new async __blkdev_issue_discard()
+interface, depends on deferred completion of the original discard bio --
+which is most appropriately implemented using bio_inc_remaining().
+
+DM thinp foolishly duplicated bio_inc_remaining(), local to dm-thin.c as
+__bio_inc_remaining(), so re-exporting bio_inc_remaining() allows us to
+put an end to that foolishness.
+
+All said, bio_inc_remaining() should really only be used in conjunction
+with bio_chain().  It isn't intended for generic bio reference counting.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Acked-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0ef5a50c1658d4d96a44f145bcb92ff3310c75b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/bio.c
+diff --cc fs/bio.c
+index 746d996a349a,0e4aa42bc30d..000000000000
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@@ -311,28 -296,25 +311,31 @@@ void bio_reset(struct bio *bio
+  }
+  EXPORT_SYMBOL(bio_reset);
+  
+ -static struct bio *__bio_chain_endio(struct bio *bio)
+ +static void bio_chain_endio(struct bio *bio, int error)
+  {
+ -	struct bio *parent = bio->bi_private;
+ -
+ -	if (!parent->bi_error)
+ -		parent->bi_error = bio->bi_error;
+ +	bio_endio(bio->bi_private, error);
+  	bio_put(bio);
+ -	return parent;
+  }
+  
+ -static void bio_chain_endio(struct bio *bio)
+++<<<<<<< HEAD:fs/bio.c
+ +/*
+ + * Increment chain count for the bio. Make sure the CHAIN flag update
+ + * is visible before the raised count.
+ + */
+ +static inline void bio_inc_remaining(struct bio *bio)
+  {
+ -	bio_endio(__bio_chain_endio(bio));
+ +	if (WARN_ON_ONCE(!bio->bio_aux))
+ +		return;
+ +
+ +	bio->bio_aux->bi_flags |= (1 << BIO_AUX_CHAIN);
+ +	smp_mb__before_atomic();
+ +	atomic_inc(&bio->bio_aux->__bi_remaining);
+  }
+  
+++=======
+++>>>>>>> 0ef5a50c1658 (block: make bio_inc_remaining() interface accessible again):block/bio.c
+  /**
+   * bio_chain - chain bio completions
+ - * @bio: the target bio
+ - * @parent: the @bio's parent bio
+   *
+   * The caller won't have a bi_end_io called when @bio completes - instead,
+   * @parent's bi_end_io won't be called until both @parent and @bio have
+* Unmerged path fs/bio.c
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 09dfccd12025..1531c78d8995 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -524,6 +524,17 @@ static inline struct bio *bio_list_get(struct bio_list *bl)
+ 	return bio;
+ }
+ 
++/*
++ * Increment chain count for the bio. Make sure the CHAIN flag update
++ * is visible before the raised count.
++ */
++static inline void bio_inc_remaining(struct bio *bio)
++{
++	bio_set_flag(bio, BIO_CHAIN);
++	smp_mb__before_atomic();
++	atomic_inc(&bio->__bi_remaining);
++}
++
+ /*
+  * bio_set is used to allow other portions of the IO system to
+  * allocate their own private memory pools for bio and iovec structures.
