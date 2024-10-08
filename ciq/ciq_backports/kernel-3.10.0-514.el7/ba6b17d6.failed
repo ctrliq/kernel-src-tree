@@ -1,0 +1,105 @@
+zram: fix umount-reset_store-mount race condition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+commit ba6b17d68c8e3aa8d55d0474299cb931965c5ea5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ba6b17d6.failed
+
+Ganesh Mahendran was the first one who proposed to use bdev->bd_mutex to
+avoid ->bd_holders race condition:
+
+        CPU0                            CPU1
+umount /* zram->init_done is true */
+reset_store()
+bdev->bd_holders == 0                   mount
+...                                     zram_make_request()
+zram_reset_device()
+
+However, his solution required some considerable amount of code movement,
+which we can avoid.
+
+Apart from using bdev->bd_mutex in reset_store(), this patch also
+simplifies zram_reset_device().
+
+zram_reset_device() has a bool parameter reset_capacity which tells it
+whether disk capacity and itself disk should be reset.  There are two
+zram_reset_device() callers:
+
+-- zram_exit() passes reset_capacity=false
+-- reset_store() passes reset_capacity=true
+
+So we can move reset_capacity-sensitive work out of zram_reset_device()
+and perform it unconditionally in reset_store().  This also lets us drop
+reset_capacity parameter from zram_reset_device() and pass zram pointer
+only.
+
+	Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Reported-by: Ganesh Mahendran <opensource.ganesh@gmail.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ba6b17d68c8e3aa8d55d0474299cb931965c5ea5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/zram/zram_drv.c
+diff --cc drivers/block/zram/zram_drv.c
+index 993edf69896a,2607bd9f4955..000000000000
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@@ -655,7 -676,46 +655,50 @@@ static int zram_bvec_rw(struct zram *zr
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void zram_reset_device(struct zram *zram, bool reset_capacity)
+++=======
++ /*
++  * zram_bio_discard - handler on discard request
++  * @index: physical block index in PAGE_SIZE units
++  * @offset: byte offset within physical block
++  */
++ static void zram_bio_discard(struct zram *zram, u32 index,
++ 			     int offset, struct bio *bio)
++ {
++ 	size_t n = bio->bi_iter.bi_size;
++ 	struct zram_meta *meta = zram->meta;
++ 
++ 	/*
++ 	 * zram manages data in physical block size units. Because logical block
++ 	 * size isn't identical with physical block size on some arch, we
++ 	 * could get a discard request pointing to a specific offset within a
++ 	 * certain physical block.  Although we can handle this request by
++ 	 * reading that physiclal block and decompressing and partially zeroing
++ 	 * and re-compressing and then re-storing it, this isn't reasonable
++ 	 * because our intent with a discard request is to save memory.  So
++ 	 * skipping this logical block is appropriate here.
++ 	 */
++ 	if (offset) {
++ 		if (n <= (PAGE_SIZE - offset))
++ 			return;
++ 
++ 		n -= (PAGE_SIZE - offset);
++ 		index++;
++ 	}
++ 
++ 	while (n >= PAGE_SIZE) {
++ 		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
++ 		zram_free_page(zram, index);
++ 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
++ 		atomic64_inc(&zram->stats.notify_free);
++ 		index++;
++ 		n -= PAGE_SIZE;
++ 	}
++ }
++ 
++ static void zram_reset_device(struct zram *zram)
+++>>>>>>> ba6b17d68c8e (zram: fix umount-reset_store-mount race condition)
+  {
+  	down_write(&zram->init_lock);
+  
+* Unmerged path drivers/block/zram/zram_drv.c
