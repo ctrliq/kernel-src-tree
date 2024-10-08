@@ -1,0 +1,195 @@
+nfsd: split DRC global spinlock into per-bucket locks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 89a26b3d295d35fefcc994cb0cf3817d0ff432d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/89a26b3d.failed
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 89a26b3d295d35fefcc994cb0cf3817d0ff432d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfscache.c
+diff --cc fs/nfsd/nfscache.c
+index dfe380798466,74603654b7f9..000000000000
+--- a/fs/nfsd/nfscache.c
++++ b/fs/nfsd/nfscache.c
+@@@ -28,7 -28,8 +28,12 @@@
+  #define TARGET_BUCKET_SIZE	64
+  
+  struct nfsd_drc_bucket {
+++<<<<<<< HEAD
+ +	struct hlist_head cache_hash;
+++=======
++ 	struct list_head lru_head;
++ 	spinlock_t cache_lock;
+++>>>>>>> 89a26b3d295d (nfsd: split DRC global spinlock into per-bucket locks)
+  };
+  
+  static struct nfsd_drc_bucket	*drc_hashtbl;
+@@@ -180,6 -180,11 +184,14 @@@ int nfsd_reply_cache_init(void
+  	drc_hashtbl = kcalloc(hashsize, sizeof(*drc_hashtbl), GFP_KERNEL);
+  	if (!drc_hashtbl)
+  		goto out_nomem;
+++<<<<<<< HEAD
+++=======
++ 	for (i = 0; i < hashsize; i++) {
++ 		INIT_LIST_HEAD(&drc_hashtbl[i].lru_head);
++ 		spin_lock_init(&drc_hashtbl[i].cache_lock);
++ 	}
++ 	drc_hashsize = hashsize;
+++>>>>>>> 89a26b3d295d (nfsd: split DRC global spinlock into per-bucket locks)
+  
+  	return 0;
+  out_nomem:
+@@@ -221,26 -231,13 +233,27 @@@ lru_put_end(struct svc_cacherep *rp
+  	schedule_delayed_work(&cache_cleaner, RC_EXPIRE);
+  }
+  
+ -static long
+ -prune_bucket(struct nfsd_drc_bucket *b)
+ +/*
+ + * Move a cache entry from one hash list to another
+ + */
+ +static void
+ +hash_refile(struct nfsd_drc_bucket *b, struct svc_cacherep *rp)
+ +{
+ +	hlist_del_init(&rp->c_hash);
+ +	hlist_add_head(&rp->c_hash, &b->cache_hash);
+ +}
+ +
+ +/*
+ + * Walk the LRU list and prune off entries that are older than RC_EXPIRE.
+ + * Also prune the oldest ones when the total exceeds the max number of entries.
+ + */
+ +static void
+ +prune_cache_entries(void)
+  {
+  	struct svc_cacherep *rp, *tmp;
+ -	long freed = 0;
+  
+ -	list_for_each_entry_safe(rp, tmp, &b->lru_head, c_lru) {
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(rp, tmp, &lru_head, c_lru) {
+  		/*
+  		 * Don't free entries attached to calls that are still
+  		 * in-progress, but do keep scanning the list.
+@@@ -251,6 -248,32 +264,18 @@@
+  		    time_before(jiffies, rp->c_timestamp + RC_EXPIRE))
+  			break;
+  		nfsd_reply_cache_free_locked(rp);
+ -		freed++;
+ -	}
+ -	return freed;
+ -}
+ -
+ -/*
+ - * Walk the LRU list and prune off entries that are older than RC_EXPIRE.
+ - * Also prune the oldest ones when the total exceeds the max number of entries.
+ - */
+ -static long
+ -prune_cache_entries(void)
+ -{
+ -	unsigned int i;
+ -	long freed = 0;
+ -	bool cancel = true;
+ -
+++=======
++ 	for (i = 0; i < drc_hashsize; i++) {
++ 		struct nfsd_drc_bucket *b = &drc_hashtbl[i];
++ 
++ 		if (list_empty(&b->lru_head))
++ 			continue;
++ 		spin_lock(&b->cache_lock);
++ 		freed += prune_bucket(b);
++ 		if (!list_empty(&b->lru_head))
++ 			cancel = false;
++ 		spin_unlock(&b->cache_lock);
+++>>>>>>> 89a26b3d295d (nfsd: split DRC global spinlock into per-bucket locks)
+  	}
+  
+  	/*
+@@@ -268,25 -288,20 +293,33 @@@
+  static void
+  cache_cleaner_func(struct work_struct *unused)
+  {
+- 	spin_lock(&cache_lock);
+  	prune_cache_entries();
+- 	spin_unlock(&cache_lock);
+  }
+  
+ -static unsigned long
+ -nfsd_reply_cache_count(struct shrinker *shrink, struct shrink_control *sc)
+ +static int
+ +nfsd_reply_cache_shrink(struct shrinker *shrink, struct shrink_control *sc)
+  {
+++<<<<<<< HEAD
+ +	unsigned int num;
+ +
+ +	spin_lock(&cache_lock);
+ +	if (sc->nr_to_scan)
+ +		prune_cache_entries();
+ +	num = num_drc_entries;
+ +	spin_unlock(&cache_lock);
+ +
+ +	return num;
+++=======
++ 	return atomic_read(&num_drc_entries);
++ }
++ 
++ static unsigned long
++ nfsd_reply_cache_scan(struct shrinker *shrink, struct shrink_control *sc)
++ {
++ 	return prune_cache_entries();
+++>>>>>>> 89a26b3d295d (nfsd: split DRC global spinlock into per-bucket locks)
+  }
+ +
+  /*
+   * Walk an xdr_buf and get a CRC for at most the first RC_CSUMLEN bytes
+   */
+@@@ -409,9 -425,9 +442,9 @@@ nfsd_cache_lookup(struct svc_rqst *rqst
+  	 * preallocate an entry.
+  	 */
+  	rp = nfsd_reply_cache_alloc();
+- 	spin_lock(&cache_lock);
++ 	spin_lock(&b->cache_lock);
+  	if (likely(rp)) {
+ -		atomic_inc(&num_drc_entries);
+ +		++num_drc_entries;
+  		drc_mem_usage += sizeof(*rp);
+  	}
+  
+@@@ -549,12 -569,12 +582,12 @@@ nfsd_cache_update(struct svc_rqst *rqst
+  		memcpy(cachv->iov_base, statp, bufsize);
+  		break;
+  	case RC_NOCACHE:
+- 		nfsd_reply_cache_free(rp);
++ 		nfsd_reply_cache_free(b, rp);
+  		return;
+  	}
+- 	spin_lock(&cache_lock);
++ 	spin_lock(&b->cache_lock);
+  	drc_mem_usage += bufsize;
+ -	lru_put_end(b, rp);
+ +	lru_put_end(rp);
+  	rp->c_secure = rqstp->rq_secure;
+  	rp->c_type = cachetype;
+  	rp->c_state = RC_DONE;
+@@@ -589,9 -609,9 +622,8 @@@ nfsd_cache_append(struct svc_rqst *rqst
+   */
+  static int nfsd_reply_cache_stats_show(struct seq_file *m, void *v)
+  {
+- 	spin_lock(&cache_lock);
+  	seq_printf(m, "max entries:           %u\n", max_drc_entries);
+ -	seq_printf(m, "num entries:           %u\n",
+ -			atomic_read(&num_drc_entries));
+ +	seq_printf(m, "num entries:           %u\n", num_drc_entries);
+  	seq_printf(m, "hash buckets:          %u\n", 1 << maskbits);
+  	seq_printf(m, "mem usage:             %u\n", drc_mem_usage);
+  	seq_printf(m, "cache hits:            %u\n", nfsdstats.rchits);
+* Unmerged path fs/nfsd/nfscache.c
