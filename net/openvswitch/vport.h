@@ -94,7 +94,7 @@ struct vport_portids {
 
 /**
  * struct vport - one port within a datapath
- * @rcu: RCU callback head for deferred destruction.
+ * @dev: Pointer to net_device.
  * @dp: Datapath to which this port belongs.
  * @upcall_portids: RCU protected 'struct vport_portids'.
  * @port_no: Index into @dp's @ports array.
@@ -104,6 +104,7 @@ struct vport_portids {
  * @percpu_stats: Points to per-CPU statistics used and maintained by vport
  * @err_stats: Points to error statistics used and maintained by vport
  * @detach_list: list used for detaching vport in net-exit call.
+ * @rcu: RCU callback head for deferred destruction.
  */
 struct vport {
 	struct rcu_head rcu;
