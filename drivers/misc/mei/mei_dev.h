@@ -385,6 +385,22 @@ enum mei_pg_state {
 	MEI_PG_ON =  1,
 };
 
+/*
+ * mei_cfg
+ *
+ * @fw_status - FW status
+ */
+struct mei_cfg {
+	const struct mei_fw_status fw_status;
+};
+
+
+#define MEI_PCI_DEVICE(dev, cfg) \
+	.vendor = PCI_VENDOR_ID_INTEL, .device = (dev), \
+	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, \
+	.driver_data = (kernel_ulong_t)&(cfg)
+
+
 /**
  * struct mei_device -  MEI private device struct
 
@@ -396,6 +412,7 @@ enum mei_pg_state {
  * @hbuf_depth - depth of hardware host/write buffer is slots
  * @hbuf_is_ready - query if the host host/write buffer is ready
  * @wr_msg - the buffer for hbm control messages
+ * @cfg - per device generation config and ops
  */
 struct mei_device {
 	struct pci_dev *pdev;	/* pointer to pci device struct */
@@ -503,6 +520,7 @@ struct mei_device {
 
 
 	const struct mei_hw_ops *ops;
+	const struct mei_cfg *cfg;
 	char hw[0] __aligned(sizeof(void *));
 };
 
@@ -535,7 +553,7 @@ static inline u32 mei_slots2data(int slots)
 /*
  * mei init function prototypes
  */
-void mei_device_init(struct mei_device *dev);
+void mei_device_init(struct mei_device *dev, const struct mei_cfg *cfg);
 int mei_reset(struct mei_device *dev);
 int mei_start(struct mei_device *dev);
 int mei_restart(struct mei_device *dev);
@@ -613,6 +631,7 @@ void mei_watchdog_unregister(struct mei_device *dev);
 /*
  * Register Access Function
  */
+
 
 static inline void mei_hw_config(struct mei_device *dev)
 {
@@ -701,11 +720,7 @@ static inline int mei_count_full_read_slots(struct mei_device *dev)
 	return dev->ops->rdbuf_full_slots(dev);
 }
 
-static inline int mei_fw_status(struct mei_device *dev,
-				struct mei_fw_status *fw_status)
-{
-	return dev->ops->fw_status(dev, fw_status);
-}
+int mei_fw_status(struct mei_device *dev, struct mei_fw_status *fw_status);
 
 #define FW_STS_FMT "%08X %08X"
 #define FW_STS_PRM(fw_status) \
