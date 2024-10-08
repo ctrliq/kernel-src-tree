@@ -1,0 +1,124 @@
+nfsd: fput rd_file from XDR encode context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 96bcad506457cfa0c26680446eedefb616c6b079
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/96bcad50.failed
+
+Remove the hack where we fput the read-specific file in generic code.
+Instead we can do it in nfsd4_encode_read as that gets called for all
+error cases as well.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 96bcad506457cfa0c26680446eedefb616c6b079)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4xdr.c
+diff --cc fs/nfsd/nfs4xdr.c
+index 1be91163d0ce,ca09fec7a4bf..000000000000
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@@ -3417,23 -3418,23 +3418,29 @@@ nfsd4_encode_read(struct nfsd4_compound
+  	unsigned long maxcount;
+  	struct xdr_stream *xdr = &resp->xdr;
+  	struct file *file = read->rd_filp;
+ +	struct svc_fh *fhp = read->rd_fhp;
+  	int starting_len = xdr->buf->len;
+ -	struct raparms *ra = NULL;
+ +	struct raparms *ra;
+  	__be32 *p;
+- 	__be32 err;
+  
+  	if (nfserr)
+- 		return nfserr;
++ 		goto out;
+  
+  	p = xdr_reserve_space(xdr, 8); /* eof flag and byte count */
+  	if (!p) {
+++<<<<<<< HEAD
+ +		WARN_ON_ONCE(resp->rqstp->rq_splice_ok);
+ +		return nfserr_resource;
+++=======
++ 		WARN_ON_ONCE(test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags));
++ 		nfserr = nfserr_resource;
++ 		goto out;
+++>>>>>>> 96bcad506457 (nfsd: fput rd_file from XDR encode context)
+  	}
+ -	if (resp->xdr.buf->page_len && test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags)) {
+ +	if (resp->xdr.buf->page_len && resp->rqstp->rq_splice_ok) {
+  		WARN_ON_ONCE(1);
+- 		return nfserr_resource;
++ 		nfserr = nfserr_resource;
++ 		goto out;
+  	}
+  	xdr_commit_encode(xdr);
+  
+@@@ -3441,28 -3442,24 +3448,41 @@@
+  	maxcount = min_t(unsigned long, maxcount, (xdr->buf->buflen - xdr->buf->len));
+  	maxcount = min_t(unsigned long, maxcount, read->rd_length);
+  
+ -	if (read->rd_tmp_file)
+ -		ra = nfsd_init_raparms(file);
+ +	if (read->rd_filp)
+ +		err = nfsd_permission(resp->rqstp, fhp->fh_export,
+ +				fhp->fh_dentry,
+ +				NFSD_MAY_READ|NFSD_MAY_OWNER_OVERRIDE);
+ +	else
+ +		err = nfsd_get_tmp_read_open(resp->rqstp, read->rd_fhp,
+ +						&file, &ra);
+ +	if (err)
+ +		goto err_truncate;
+  
+++<<<<<<< HEAD
+ +	if (file->f_op->splice_read && resp->rqstp->rq_splice_ok)
+ +		err = nfsd4_encode_splice_read(resp, read, file, maxcount);
+++=======
++ 	if (file->f_op->splice_read && test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags))
++ 		nfserr = nfsd4_encode_splice_read(resp, read, file, maxcount);
+++>>>>>>> 96bcad506457 (nfsd: fput rd_file from XDR encode context)
+  	else
+- 		err = nfsd4_encode_readv(resp, read, file, maxcount);
++ 		nfserr = nfsd4_encode_readv(resp, read, file, maxcount);
+  
+ -	if (ra)
+ -		nfsd_put_raparams(file, ra);
+ +	if (!read->rd_filp)
+ +		nfsd_put_tmp_read_open(file, ra);
+  
+++<<<<<<< HEAD
+ +err_truncate:
+ +	if (err)
+++=======
++ 	if (nfserr)
+++>>>>>>> 96bcad506457 (nfsd: fput rd_file from XDR encode context)
+  		xdr_truncate_encode(xdr, starting_len);
+- 	return err;
++ 
++ out:
++ 	if (file)
++ 		fput(file);
++ 	return nfserr;
+  }
+  
+  static __be32
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index 61084d7f71c1..9b9599ff67ec 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -1731,10 +1731,6 @@ encode_op:
+ 			be32_to_cpu(status));
+ 
+ 		nfsd4_cstate_clear_replay(cstate);
+-		/* XXX Ugh, we need to get rid of this kind of special case: */
+-		if (op->opnum == OP_READ && op->u.read.rd_filp)
+-			fput(op->u.read.rd_filp);
+-
+ 		nfsd4_increment_op_stats(op->opnum);
+ 	}
+ 
+* Unmerged path fs/nfsd/nfs4xdr.c
