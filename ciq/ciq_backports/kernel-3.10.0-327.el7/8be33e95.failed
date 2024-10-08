@@ -1,0 +1,290 @@
+fib_trie: Fib walk rcu should take a tnode and key instead of a trie and a leaf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 8be33e955cb959dabc1a6eef0b7356fe8cf73fa6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8be33e95.failed
+
+This change makes it so that leaf_walk_rcu takes a tnode and a key instead
+of the trie and a leaf.
+
+The main idea behind this is to avoid using the leaf parent pointer as that
+can have additional overhead in the future as I am trying to reduce the
+size of a leaf down to 16 bytes on 64b systems and 12b on 32b systems.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8be33e955cb959dabc1a6eef0b7356fe8cf73fa6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 3fe26090641a,bf488cee524a..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1573,141 -1485,148 +1573,148 @@@ int fib_table_delete(struct fib_table *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int trie_flush_list(struct list_head *head)
+ +{
+ +	struct fib_alias *fa, *fa_node;
+ +	int found = 0;
+ +
+ +	list_for_each_entry_safe(fa, fa_node, head, fa_list) {
+ +		struct fib_info *fi = fa->fa_info;
+ +
+ +		if (fi && (fi->fib_flags & RTNH_F_DEAD)) {
+ +			list_del_rcu(&fa->fa_list);
+ +			fib_release_info(fa->fa_info);
+ +			alias_free_mem_rcu(fa);
+ +			found++;
+ +		}
+ +	}
+ +	return found;
+ +}
+ +
+ +static int trie_flush_leaf(struct tnode *l)
+ +{
+ +	int found = 0;
+ +	struct hlist_head *lih = &l->list;
+ +	struct hlist_node *tmp;
+ +	struct leaf_info *li = NULL;
+ +	unsigned char plen = KEYLENGTH;
+ +
+ +	hlist_for_each_entry_safe(li, tmp, lih, hlist) {
+ +		found += trie_flush_list(&li->falh);
+ +
+ +		if (list_empty(&li->falh)) {
+ +			hlist_del_rcu(&li->hlist);
+ +			free_leaf_info(li);
+ +			continue;
+ +		}
+ +
+ +		plen = li->plen;
+ +	}
+ +
+ +	l->slen = KEYLENGTH - plen;
+ +
+ +	return found;
+ +}
+ +
+ +/*
+ + * Scan for the next right leaf starting at node p->child[idx]
+ + * Since we have back pointer, no recursion necessary.
+ + */
+ +static struct tnode *leaf_walk_rcu(struct tnode *p, struct tnode *c)
+++=======
++ /* Scan for the next leaf starting at the provided key value */
++ static struct tnode *leaf_walk_rcu(struct tnode **tn, t_key key)
+++>>>>>>> 8be33e955cb9 (fib_trie: Fib walk rcu should take a tnode and key instead of a trie and a leaf)
+  {
+- 	do {
+- 		unsigned long idx = c ? idx = get_index(c->key, p) + 1 : 0;
++ 	struct tnode *pn, *n = *tn;
++ 	unsigned long cindex;
+  
+- 		while (idx < tnode_child_length(p)) {
+- 			c = tnode_get_child_rcu(p, idx++);
+- 			if (!c)
+- 				continue;
+- 
+- 			if (IS_LEAF(c))
+- 				return c;
+- 
+- 			/* Rescan start scanning in new node */
+- 			p = c;
+- 			idx = 0;
+- 		}
+- 
+- 		/* Node empty, walk back up to parent */
+- 		c = p;
+- 	} while ((p = node_parent_rcu(c)) != NULL);
++ 	/* record parent node for backtracing */
++ 	pn = n;
++ 	cindex = n ? get_index(key, n) : 0;
+  
+- 	return NULL; /* Root of trie */
+- }
++ 	/* this loop is meant to try and find the key in the trie */
++ 	while (n) {
++ 		unsigned long idx = get_index(key, n);
+  
+- static struct tnode *trie_firstleaf(struct trie *t)
+- {
+- 	struct tnode *n = rcu_dereference_rtnl(t->trie);
++ 		/* guarantee forward progress on the keys */
++ 		if (IS_LEAF(n) && (n->key >= key))
++ 			goto found;
++ 		if (idx >= (1ul << n->bits))
++ 			break;
+  
+- 	if (!n)
+- 		return NULL;
++ 		/* record parent and next child index */
++ 		pn = n;
++ 		cindex = idx;
+  
+- 	if (IS_LEAF(n))          /* trie is just a leaf */
+- 		return n;
++ 		/* descend into the next child */
++ 		n = tnode_get_child_rcu(pn, cindex++);
++ 	}
+  
+- 	return leaf_walk_rcu(n, NULL);
+- }
++ 	/* this loop will search for the next leaf with a greater key */
++ 	while (pn) {
++ 		/* if we exhausted the parent node we will need to climb */
++ 		if (cindex >= (1ul << pn->bits)) {
++ 			t_key pkey = pn->key;
+  
+- static struct tnode *trie_nextleaf(struct tnode *l)
+- {
+- 	struct tnode *p = node_parent_rcu(l);
++ 			pn = node_parent_rcu(pn);
++ 			if (!pn)
++ 				break;
+  
+- 	if (!p)
+- 		return NULL;	/* trie with just one leaf */
++ 			cindex = get_index(pkey, pn) + 1;
++ 			continue;
++ 		}
+  
+- 	return leaf_walk_rcu(p, l);
+- }
++ 		/* grab the next available node */
++ 		n = tnode_get_child_rcu(pn, cindex++);
++ 		if (!n)
++ 			continue;
+  
+- static struct tnode *trie_leafindex(struct trie *t, int index)
+- {
+- 	struct tnode *l = trie_firstleaf(t);
++ 		/* no need to compare keys since we bumped the index */
++ 		if (IS_LEAF(n))
++ 			goto found;
+  
+- 	while (l && index-- > 0)
+- 		l = trie_nextleaf(l);
++ 		/* Rescan start scanning in new node */
++ 		pn = n;
++ 		cindex = 0;
++ 	}
+  
+- 	return l;
++ 	*tn = pn;
++ 	return NULL; /* Root of trie */
++ found:
++ 	/* if we are at the limit for keys just return NULL for the tnode */
++ 	*tn = (n->key == KEY_MAX) ? NULL : pn;
++ 	return n;
+  }
+  
+- 
+- /*
+-  * Caller must hold RTNL.
+-  */
++ /* Caller must hold RTNL. */
+  int fib_table_flush(struct fib_table *tb)
+  {
+ -	struct trie *t = (struct trie *)tb->tb_data;
+ -	struct hlist_node *tmp;
+ -	struct fib_alias *fa;
+ -	struct tnode *n, *pn;
+ -	unsigned long cindex;
+ -	unsigned char slen;
+ +	struct trie *t = (struct trie *) tb->tb_data;
+ +	struct tnode *l, *ll = NULL;
+  	int found = 0;
+  
+ -	n = rcu_dereference(t->trie);
+ -	if (!n)
+ -		goto flush_complete;
+ -
+ -	pn = NULL;
+ -	cindex = 0;
+ -
+ -	while (IS_TNODE(n)) {
+ -		/* record pn and cindex for leaf walking */
+ -		pn = n;
+ -		cindex = 1ul << n->bits;
+ -backtrace:
+ -		/* walk trie in reverse order */
+ -		do {
+ -			while (!(cindex--)) {
+ -				t_key pkey = pn->key;
+ -
+ -				n = pn;
+ -				pn = node_parent(n);
+ -
+ -				/* resize completed node */
+ -				resize(t, n);
+ -
+ -				/* if we got the root we are done */
+ -				if (!pn)
+ -					goto flush_complete;
+ +	for (l = trie_firstleaf(t); l; l = trie_nextleaf(l)) {
+ +		found += trie_flush_leaf(l);
+  
+ -				cindex = get_index(pkey, pn);
+ -			}
+ -
+ -			/* grab the next available node */
+ -			n = tnode_get_child(pn, cindex);
+ -		} while (!n);
+ -	}
+ -
+ -	/* track slen in case any prefixes survive */
+ -	slen = 0;
+ -
+ -	hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
+ -		struct fib_info *fi = fa->fa_info;
+ -
+ -		if (fi && (fi->fib_flags & RTNH_F_DEAD)) {
+ -			hlist_del_rcu(&fa->fa_list);
+ -			fib_release_info(fa->fa_info);
+ -			alias_free_mem_rcu(fa);
+ -			found++;
+ -
+ -			continue;
+ +		if (ll) {
+ +			if (hlist_empty(&ll->list))
+ +				trie_leaf_remove(t, ll);
+ +			else
+ +				leaf_pull_suffix(ll);
+  		}
+  
+ -		slen = fa->fa_slen;
+ +		ll = l;
+  	}
+  
+ -	/* update leaf slen */
+ -	n->slen = slen;
+ -
+ -	if (hlist_empty(&n->leaf)) {
+ -		put_child_root(pn, t, n->key, NULL);
+ -		node_free(n);
+ -	} else {
+ -		leaf_pull_suffix(n);
+ +	if (ll) {
+ +		if (hlist_empty(&ll->list))
+ +			trie_leaf_remove(t, ll);
+ +		else
+ +			leaf_pull_suffix(ll);
+  	}
+  
+ -	/* if trie is leaf only loop is completed */
+ -	if (pn)
+ -		goto backtrace;
+ -flush_complete:
+  	pr_debug("trie_flush found=%d\n", found);
+  	return found;
+  }
+* Unmerged path net/ipv4/fib_trie.c
