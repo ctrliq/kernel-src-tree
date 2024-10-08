@@ -1,0 +1,140 @@
+nEPT: MMU context for nested EPT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/nept: MMU context for nested EPT (Paolo Bonzini) [1048496 1116936]
+Rebuild_FUZZ: 94.12%
+commit-author Nadav Har'El <nyh@il.ibm.com>
+commit 155a97a3d7c78b46cef6f1a973c831bc5a4f82bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/155a97a3.failed
+
+KVM's existing shadow MMU code already supports nested TDP. To use it, we
+need to set up a new "MMU context" for nested EPT, and create a few callbacks
+for it (nested_ept_*()). This context should also use the EPT versions of
+the page table access functions (defined in the previous patch).
+Then, we need to switch back and forth between this nested context and the
+regular MMU context when switching between L1 and L2 (when L1 runs this L2
+with EPT).
+
+	Reviewed-by: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+	Signed-off-by: Nadav Har'El <nyh@il.ibm.com>
+	Signed-off-by: Jun Nakajima <jun.nakajima@intel.com>
+	Signed-off-by: Xinhao Xu <xinhao.xu@intel.com>
+	Signed-off-by: Yang Zhang <yang.z.zhang@Intel.com>
+	Signed-off-by: Gleb Natapov <gleb@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 155a97a3d7c78b46cef6f1a973c831bc5a4f82bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 2c1e4e9c4bd8,2ae0aa4461e8..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -7358,6 -7357,48 +7363,51 @@@ static void vmx_set_supported_cpuid(u3
+  		entry->ecx |= bit(X86_FEATURE_VMX);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,
++ 		struct x86_exception *fault)
++ {
++ 	struct vmcs12 *vmcs12;
++ 	nested_vmx_vmexit(vcpu);
++ 	vmcs12 = get_vmcs12(vcpu);
++ 
++ 	if (fault->error_code & PFERR_RSVD_MASK)
++ 		vmcs12->vm_exit_reason = EXIT_REASON_EPT_MISCONFIG;
++ 	else
++ 		vmcs12->vm_exit_reason = EXIT_REASON_EPT_VIOLATION;
++ 	vmcs12->exit_qualification = vcpu->arch.exit_qualification;
++ 	vmcs12->guest_physical_address = fault->address;
++ }
++ 
++ /* Callbacks for nested_ept_init_mmu_context: */
++ 
++ static unsigned long nested_ept_get_cr3(struct kvm_vcpu *vcpu)
++ {
++ 	/* return the page table to be shadowed - in our case, EPT12 */
++ 	return get_vmcs12(vcpu)->ept_pointer;
++ }
++ 
++ static int nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
++ {
++ 	int r = kvm_init_shadow_ept_mmu(vcpu, &vcpu->arch.mmu,
++ 			nested_vmx_ept_caps & VMX_EPT_EXECUTE_ONLY_BIT);
++ 
++ 	vcpu->arch.mmu.set_cr3           = vmx_set_cr3;
++ 	vcpu->arch.mmu.get_cr3           = nested_ept_get_cr3;
++ 	vcpu->arch.mmu.inject_page_fault = nested_ept_inject_page_fault;
++ 
++ 	vcpu->arch.walk_mmu              = &vcpu->arch.nested_mmu;
++ 
++ 	return r;
++ }
++ 
++ static void nested_ept_uninit_mmu_context(struct kvm_vcpu *vcpu)
++ {
++ 	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
++ }
++ 
+++>>>>>>> 155a97a3d7c7 (nEPT: MMU context for nested EPT)
+  /*
+   * prepare_vmcs02 is called when the L1 guest hypervisor runs its nested
+   * L2 guest. L1 has a vmcs for L2 (vmcs12), and this function "merges" it
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 8b6c12a864c1..82781fe30234 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3765,6 +3765,33 @@ int kvm_init_shadow_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context)
+ }
+ EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+ 
++int kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
++		bool execonly)
++{
++	ASSERT(vcpu);
++	ASSERT(!VALID_PAGE(vcpu->arch.mmu.root_hpa));
++
++	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
++
++	context->nx = true;
++	context->new_cr3 = paging_new_cr3;
++	context->page_fault = ept_page_fault;
++	context->gva_to_gpa = ept_gva_to_gpa;
++	context->sync_page = ept_sync_page;
++	context->invlpg = ept_invlpg;
++	context->update_pte = ept_update_pte;
++	context->free = paging_free;
++	context->root_level = context->shadow_root_level;
++	context->root_hpa = INVALID_PAGE;
++	context->direct_map = false;
++
++	update_permission_bitmask(vcpu, context, true);
++	reset_rsvds_bits_mask_ept(vcpu, context, execonly);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(kvm_init_shadow_ept_mmu);
++
+ static int init_kvm_softmmu(struct kvm_vcpu *vcpu)
+ {
+ 	int r = kvm_init_shadow_mmu(vcpu, vcpu->arch.walk_mmu);
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 5b59c573aba7..77e044a0f5f7 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -71,6 +71,8 @@ enum {
+ 
+ int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct);
+ int kvm_init_shadow_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context);
++int kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
++		bool execonly);
+ 
+ static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+ {
+* Unmerged path arch/x86/kvm/vmx.c
