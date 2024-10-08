@@ -1,0 +1,121 @@
+hrtimer: Prevent stale expiry time in hrtimer_interrupt()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 9bc7491906b4113b4c5ae442157c7dfc4e10cd14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9bc74919.failed
+
+hrtimer_interrupt() has the following subtle issue:
+
+hrtimer_interrupt()
+  lock(cpu_base);
+  expires_next = KTIME_MAX;
+
+  expire_timers(CLOCK_MONOTONIC);
+  expires = get_next_timer(CLOCK_MONOTONIC);
+  if (expires < expires_next)
+    expires_next = expires;
+
+  expire_timers(CLOCK_REALTIME);
+    unlock(cpu_base);
+    wakeup()
+    hrtimer_start(CLOCK_MONOTONIC, newtimer);
+    lock(cpu_base();  
+  expires = get_next_timer(CLOCK_REALTIME);
+  if (expires < expires_next)
+    expires_next = expires;
+
+So because we already evaluated the next expiring timer of
+CLOCK_MONOTONIC we ignore that the expiry time of newtimer might be
+earlier than the overall next expiry time in hrtimer_interrupt().
+
+To solve this, remove the caching of the next expiry value from
+hrtimer_interrupt() and reevaluate all active clock bases for the next
+expiry value. To avoid another code duplication, create a shared
+evaluation function and use it for hrtimer_get_next_event(),
+hrtimer_force_reprogram() and hrtimer_interrupt().
+
+There is another subtlety in this mechanism:
+
+While hrtimer_interrupt() is running, we want to avoid to touch the
+hardware device because we will reprogram it anyway at the end of
+hrtimer_interrupt(). This works nicely for hrtimers which get rearmed
+via the HRTIMER_RESTART mechanism, because we drop out when the
+callback on that CPU is running. But that fails, if a new timer gets
+enqueued like in the example above.
+
+This has another implication: While hrtimer_interrupt() is running we
+refuse remote enqueueing of timers - see hrtimer_interrupt() and
+hrtimer_check_target().
+
+hrtimer_interrupt() tries to prevent this by setting cpu_base->expires
+to KTIME_MAX, but that fails if a new timer gets queued.
+
+Prevent both the hardware access and the remote enqueue
+explicitely. We can loosen the restriction on the remote enqueue now
+due to reevaluation of the next expiry value, but that needs a
+seperate patch.
+
+Folded in a fix from Vignesh Radhakrishnan.
+
+Reported-and-tested-by: Stanislav Fomichev <stfomichev@yandex-team.ru>
+Based-on-patch-by: Stanislav Fomichev <stfomichev@yandex-team.ru>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: vigneshr@codeaurora.org
+	Cc: john.stultz@linaro.org
+	Cc: viresh.kumar@linaro.org
+	Cc: fweisbec@gmail.com
+	Cc: cl@linux.com
+	Cc: stuart.w.hayes@gmail.com
+Link: http://lkml.kernel.org/r/alpine.DEB.2.11.1501202049190.5526@nanos
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 9bc7491906b4113b4c5ae442157c7dfc4e10cd14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/hrtimer.c
+diff --cc kernel/hrtimer.c
+index 944eb16e2398,b663653a5d5b..000000000000
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@@ -1161,11 -1118,9 +1176,15 @@@ EXPORT_SYMBOL_GPL(hrtimer_get_remaining
+   */
+  ktime_t hrtimer_get_next_event(void)
+  {
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	struct hrtimer_cpu_base *cpu_base = &__get_cpu_var(hrtimer_bases);
+ +	struct hrtimer_clock_base *base = cpu_base->clock_base;
+ +	ktime_t delta, mindelta = { .tv64 = KTIME_MAX };
+++=======
++ 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
++ 	ktime_t mindelta = { .tv64 = KTIME_MAX };
+++>>>>>>> 9bc7491906b4 (hrtimer: Prevent stale expiry time in hrtimer_interrupt()):kernel/time/hrtimer.c
+  	unsigned long flags;
+- 	int i;
+  
+  	raw_spin_lock_irqsave(&cpu_base->lock, flags);
+  
+diff --git a/include/linux/hrtimer.h b/include/linux/hrtimer.h
+index 246086962372..fb8e3a5f1929 100644
+--- a/include/linux/hrtimer.h
++++ b/include/linux/hrtimer.h
+@@ -170,6 +170,7 @@ enum  hrtimer_base_type {
+  * @clock_was_set:	Indicates that clock was set from irq context.
+  * @expires_next:	absolute time of the next event which was scheduled
+  *			via clock_set_next_event()
++ * @in_hrtirq:		hrtimer_interrupt() is currently executing
+  * @hres_active:	State of high resolution mode
+  * @hang_detected:	The last hrtimer interrupt detected a hang
+  * @nr_events:		Total number of hrtimer interrupt events
+@@ -185,6 +186,7 @@ struct hrtimer_cpu_base {
+ 	unsigned int			clock_was_set;
+ #ifdef CONFIG_HIGH_RES_TIMERS
+ 	ktime_t				expires_next;
++	int				in_hrtirq;
+ 	int				hres_active;
+ 	int				hang_detected;
+ 	unsigned long			nr_events;
+* Unmerged path kernel/hrtimer.c
