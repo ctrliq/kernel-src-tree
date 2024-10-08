@@ -1,0 +1,244 @@
+x86: irq: Fix bug in setting IOAPIC pin attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] irq: Fix bug in setting IOAPIC pin attributes (Steve Best) [1231358 1234860]
+Rebuild_FUZZ: 94.74%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit f395dcae7a68497751869cf0031fd8ce5e115f0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f395dcae.failed
+
+Commit 15a3c7cc9154321fc3 "x86, irq: Introduce two helper functions
+to support irqdomain map operation" breaks LPSS ACPI enumerated
+devices.
+
+On startup, IOAPIC driver preallocates IRQ descriptors and programs
+IOAPIC pins with default level and polarity attributes for all legacy
+IRQs. Later legacy IRQ users may fail to set IOAPIC pin attributes
+if the requested attributes conflicts with the default IOAPIC pin
+attributes. So change mp_irqdomain_map() to allow the first legacy IRQ
+user to reprogram IOAPIC pin with different attributes.
+
+Reported-and-tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Grant Likely <grant.likely@linaro.org>
+	Cc: Prarit Bhargava <prarit@redhat.com>
+Link: http://lkml.kernel.org/r/1409118795-17046-1-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit f395dcae7a68497751869cf0031fd8ce5e115f0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/io_apic.c
+diff --cc arch/x86/kernel/apic/io_apic.c
+index 07a33b81b46c,40a4aa3f4061..000000000000
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@@ -984,11 -996,99 +984,71 @@@ static int irq_trigger(int idx
+  	return trigger;
+  }
+  
+ -static int alloc_irq_from_domain(struct irq_domain *domain, u32 gsi, int pin)
+ -{
+ -	int irq = -1;
+ -	int ioapic = (int)(long)domain->host_data;
+ -	int type = ioapics[ioapic].irqdomain_cfg.type;
+ -
+ -	switch (type) {
+ -	case IOAPIC_DOMAIN_LEGACY:
+ -		/*
+ -		 * Dynamically allocate IRQ number for non-ISA IRQs in the first 16
+ -		 * GSIs on some weird platforms.
+ -		 */
+ -		if (gsi < nr_legacy_irqs())
+ -			irq = irq_create_mapping(domain, pin);
+ -		else if (irq_create_strict_mappings(domain, gsi, pin, 1) == 0)
+ -			irq = gsi;
+ -		break;
+ -	case IOAPIC_DOMAIN_STRICT:
+ -		if (irq_create_strict_mappings(domain, gsi, pin, 1) == 0)
+ -			irq = gsi;
+ -		break;
+ -	case IOAPIC_DOMAIN_DYNAMIC:
+ -		irq = irq_create_mapping(domain, pin);
+ -		break;
+ -	default:
+ -		WARN(1, "ioapic: unknown irqdomain type %d\n", type);
+ -		break;
+ -	}
+ -
+ -	return irq > 0 ? irq : -1;
+ -}
+ -
+ -static int mp_map_pin_to_irq(u32 gsi, int idx, int ioapic, int pin,
+ -			     unsigned int flags)
+ +static int pin_2_irq(int idx, int apic, int pin)
+  {
+  	int irq;
+++<<<<<<< HEAD
+ +	int bus = mp_irqs[idx].srcbus;
+ +	struct mp_ioapic_gsi *gsi_cfg = mp_ioapic_gsi_routing(apic);
+++=======
++ 	struct irq_domain *domain = mp_ioapic_irqdomain(ioapic);
++ 	struct mp_pin_info *info = mp_pin_info(ioapic, pin);
++ 
++ 	if (!domain)
++ 		return -1;
++ 
++ 	mutex_lock(&ioapic_mutex);
++ 
++ 	/*
++ 	 * Don't use irqdomain to manage ISA IRQs because there may be
++ 	 * multiple IOAPIC pins sharing the same ISA IRQ number and
++ 	 * irqdomain only supports 1:1 mapping between IOAPIC pin and
++ 	 * IRQ number. A typical IOAPIC has 24 pins, pin 0-15 are used
++ 	 * for legacy IRQs and pin 16-23 are used for PCI IRQs (PIRQ A-H).
++ 	 * When ACPI is disabled, only legacy IRQ numbers (IRQ0-15) are
++ 	 * available, and some BIOSes may use MP Interrupt Source records
++ 	 * to override IRQ numbers for PIRQs instead of reprogramming
++ 	 * the interrupt routing logic. Thus there may be multiple pins
++ 	 * sharing the same legacy IRQ number when ACPI is disabled.
++ 	 */
++ 	if (idx >= 0 && test_bit(mp_irqs[idx].srcbus, mp_bus_not_pci)) {
++ 		irq = mp_irqs[idx].srcbusirq;
++ 		if (flags & IOAPIC_MAP_ALLOC) {
++ 			if (info->count == 0 &&
++ 			    mp_irqdomain_map(domain, irq, pin) != 0)
++ 				irq = -1;
++ 
++ 			/* special handling for timer IRQ0 */
++ 			if (irq == 0)
++ 				info->count++;
++ 		}
++ 	} else {
++ 		irq = irq_find_mapping(domain, pin);
++ 		if (irq <= 0 && (flags & IOAPIC_MAP_ALLOC))
++ 			irq = alloc_irq_from_domain(domain, gsi, pin);
++ 	}
++ 
++ 	if (flags & IOAPIC_MAP_ALLOC) {
++ 		/* special handling for legacy IRQs */
++ 		if (irq < nr_legacy_irqs() && info->count == 1 &&
++ 		    mp_irqdomain_map(domain, irq, pin) != 0)
++ 			irq = -1;
++ 
++ 		if (irq > 0)
++ 			info->count++;
++ 		else if (info->count == 0)
++ 			info->set = 0;
++ 	}
++ 
++ 	mutex_unlock(&ioapic_mutex);
++ 
++ 	return irq > 0 ? irq : -1;
++ }
++ 
++ static int pin_2_irq(int idx, int ioapic, int pin, unsigned int flags)
++ {
++ 	u32 gsi = mp_pin_to_gsi(ioapic, pin);
+++>>>>>>> f395dcae7a68 (x86: irq: Fix bug in setting IOAPIC pin attributes)
+  
+  	/*
+  	 * Debugging check, we are in big trouble if this message pops up!
+@@@ -3863,6 -3880,85 +3923,88 @@@ void __init mp_register_ioapic(int id, 
+  	nr_ioapics++;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mp_irqdomain_map(struct irq_domain *domain, unsigned int virq,
++ 		     irq_hw_number_t hwirq)
++ {
++ 	int ioapic = (int)(long)domain->host_data;
++ 	struct mp_pin_info *info = mp_pin_info(ioapic, hwirq);
++ 	struct io_apic_irq_attr attr;
++ 
++ 	/* Get default attribute if not set by caller yet */
++ 	if (!info->set) {
++ 		u32 gsi = mp_pin_to_gsi(ioapic, hwirq);
++ 
++ 		if (acpi_get_override_irq(gsi, &info->trigger,
++ 					  &info->polarity) < 0) {
++ 			/*
++ 			 * PCI interrupts are always polarity one level
++ 			 * triggered.
++ 			 */
++ 			info->trigger = 1;
++ 			info->polarity = 1;
++ 		}
++ 		info->node = NUMA_NO_NODE;
++ 
++ 		/*
++ 		 * setup_IO_APIC_irqs() programs all legacy IRQs with default
++ 		 * trigger and polarity attributes. Don't set the flag for that
++ 		 * case so the first legacy IRQ user could reprogram the pin
++ 		 * with real trigger and polarity attributes.
++ 		 */
++ 		if (virq >= nr_legacy_irqs() || info->count)
++ 			info->set = 1;
++ 	}
++ 	set_io_apic_irq_attr(&attr, ioapic, hwirq, info->trigger,
++ 			     info->polarity);
++ 
++ 	return io_apic_setup_irq_pin(virq, info->node, &attr);
++ }
++ 
++ void mp_irqdomain_unmap(struct irq_domain *domain, unsigned int virq)
++ {
++ 	struct irq_data *data = irq_get_irq_data(virq);
++ 	struct irq_cfg *cfg = irq_cfg(virq);
++ 	int ioapic = (int)(long)domain->host_data;
++ 	int pin = (int)data->hwirq;
++ 
++ 	ioapic_mask_entry(ioapic, pin);
++ 	__remove_pin_from_irq(cfg, ioapic, pin);
++ 	WARN_ON(cfg->irq_2_pin != NULL);
++ 	arch_teardown_hwirq(virq);
++ }
++ 
++ int mp_set_gsi_attr(u32 gsi, int trigger, int polarity, int node)
++ {
++ 	int ret = 0;
++ 	int ioapic, pin;
++ 	struct mp_pin_info *info;
++ 
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0)
++ 		return -ENODEV;
++ 
++ 	pin = mp_find_ioapic_pin(ioapic, gsi);
++ 	info = mp_pin_info(ioapic, pin);
++ 	trigger = trigger ? 1 : 0;
++ 	polarity = polarity ? 1 : 0;
++ 
++ 	mutex_lock(&ioapic_mutex);
++ 	if (!info->set) {
++ 		info->trigger = trigger;
++ 		info->polarity = polarity;
++ 		info->node = node;
++ 		info->set = 1;
++ 	} else if (info->trigger != trigger || info->polarity != polarity) {
++ 		ret = -EBUSY;
++ 	}
++ 	mutex_unlock(&ioapic_mutex);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> f395dcae7a68 (x86: irq: Fix bug in setting IOAPIC pin attributes)
+  /* Enable IOAPIC early just for system timer */
+  void __init pre_init_apic_IRQ0(void)
+  {
+* Unmerged path arch/x86/kernel/apic/io_apic.c
