@@ -1,0 +1,267 @@
+net: remove search_list from netdev_adjacent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] remove search_list from netdev_adjacent (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 93.98%
+commit-author Veaceslav Falico <vfalico@redhat.com>
+commit 620f3186caa8124e0efaf329751cf51c5d55c731
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/620f3186.failed
+
+We already don't need it cause we see every upper/lower device in the list
+already.
+
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Eric Dumazet <edumazet@google.com>
+CC: Jiri Pirko <jiri@resnulli.us>
+CC: Alexander Duyck <alexander.h.duyck@intel.com>
+CC: Cong Wang <amwang@redhat.com>
+	Signed-off-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 620f3186caa8124e0efaf329751cf51c5d55c731)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 853d90c0f78c,749925a040a4..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4498,55 -4369,46 +4498,60 @@@ softnet_break
+  
+  struct netdev_adjacent {
+  	struct net_device *dev;
+ -
+ -	/* upper master flag, there can only be one master device per list */
+  	bool master;
+ -
+ -	/* indicates that this dev is our first-level lower/upper device */
+ -	bool neighbour;
+ -
+ -	/* counter for the number of times this device was added to us */
+ -	u16 ref_nr;
+ -
+  	struct list_head list;
+  	struct rcu_head rcu;
+- 	struct list_head search_list;
+  };
+  
+ -static struct netdev_adjacent *__netdev_find_adj(struct net_device *dev,
+ -						 struct net_device *adj_dev,
+ -						 bool upper)
+++<<<<<<< HEAD
+ +static void __append_search_uppers(struct list_head *search_list,
+ +				   struct net_device *dev)
+  {
+ -	struct netdev_adjacent *adj;
+ -	struct list_head *dev_list;
+ -
+ -	dev_list = upper ? &dev->upper_dev_list : &dev->lower_dev_list;
+ +	struct netdev_adjacent *upper;
+  
+ -	list_for_each_entry(adj, dev_list, list) {
+ -		if (adj->dev == adj_dev)
+ -			return adj;
+ +	list_for_each_entry(upper, &dev->upper_dev_list, list) {
+ +		/* check if this upper is not already in search list */
+ +		if (list_empty(&upper->search_list))
+ +			list_add_tail(&upper->search_list, search_list);
+  	}
+ -	return NULL;
+  }
+  
+ -static inline struct netdev_adjacent *__netdev_find_upper(struct net_device *dev,
+ -							  struct net_device *udev)
+ +static bool __netdev_search_upper_dev(struct net_device *dev,
+ +				      struct net_device *upper_dev)
+  {
+ -	return __netdev_find_adj(dev, udev, true);
+ +	LIST_HEAD(search_list);
+ +	struct netdev_adjacent *upper;
+ +	struct netdev_adjacent *tmp;
+ +	bool ret = false;
+ +
+ +	__append_search_uppers(&search_list, dev);
+ +	list_for_each_entry(upper, &search_list, search_list) {
+ +		if (upper->dev == upper_dev) {
+ +			ret = true;
+ +			break;
+ +		}
+ +		__append_search_uppers(&search_list, upper->dev);
+ +	}
+ +	list_for_each_entry_safe(upper, tmp, &search_list, search_list)
+ +		INIT_LIST_HEAD(&upper->search_list);
+ +	return ret;
+  }
+  
+ -static inline struct netdev_adjacent *__netdev_find_lower(struct net_device *dev,
+ -							  struct net_device *ldev)
+ +static struct netdev_adjacent *__netdev_find_upper(struct net_device *dev,
+ +						struct net_device *upper_dev)
+++=======
+++static struct netdev_adjacent *__netdev_find_adj(struct net_device *dev,
+++						 struct net_device *adj_dev,
+++						 bool upper)
+++>>>>>>> 620f3186caa8 (net: remove search_list from netdev_adjacent)
+  {
+ -	return __netdev_find_adj(dev, ldev, false);
+ +	struct netdev_adjacent *upper;
+ +
+ +	list_for_each_entry(upper, &dev->upper_dev_list, list) {
+ +		if (upper->dev == upper_dev)
+ +			return upper;
+ +	}
+ +	return NULL;
+  }
+  
+  /**
+@@@ -4625,6 -4487,143 +4630,146 @@@ struct net_device *netdev_master_upper_
+  }
+  EXPORT_SYMBOL(netdev_master_upper_dev_get_rcu);
+  
+++<<<<<<< HEAD
+++=======
++ static int __netdev_adjacent_dev_insert(struct net_device *dev,
++ 					struct net_device *adj_dev,
++ 					bool neighbour, bool master,
++ 					bool upper)
++ {
++ 	struct netdev_adjacent *adj;
++ 
++ 	adj = __netdev_find_adj(dev, adj_dev, upper);
++ 
++ 	if (adj) {
++ 		BUG_ON(neighbour);
++ 		adj->ref_nr++;
++ 		return 0;
++ 	}
++ 
++ 	adj = kmalloc(sizeof(*adj), GFP_KERNEL);
++ 	if (!adj)
++ 		return -ENOMEM;
++ 
++ 	adj->dev = adj_dev;
++ 	adj->master = master;
++ 	adj->neighbour = neighbour;
++ 	adj->ref_nr = 1;
++ 
++ 	dev_hold(adj_dev);
++ 	pr_debug("dev_hold for %s, because of %s link added from %s to %s\n",
++ 		 adj_dev->name, upper ? "upper" : "lower", dev->name,
++ 		 adj_dev->name);
++ 
++ 	if (!upper) {
++ 		list_add_tail_rcu(&adj->list, &dev->lower_dev_list);
++ 		return 0;
++ 	}
++ 
++ 	/* Ensure that master upper link is always the first item in list. */
++ 	if (master)
++ 		list_add_rcu(&adj->list, &dev->upper_dev_list);
++ 	else
++ 		list_add_tail_rcu(&adj->list, &dev->upper_dev_list);
++ 
++ 	return 0;
++ }
++ 
++ static inline int __netdev_upper_dev_insert(struct net_device *dev,
++ 					    struct net_device *udev,
++ 					    bool master, bool neighbour)
++ {
++ 	return __netdev_adjacent_dev_insert(dev, udev, neighbour, master,
++ 					    true);
++ }
++ 
++ static inline int __netdev_lower_dev_insert(struct net_device *dev,
++ 					    struct net_device *ldev,
++ 					    bool neighbour)
++ {
++ 	return __netdev_adjacent_dev_insert(dev, ldev, neighbour, false,
++ 					    false);
++ }
++ 
++ void __netdev_adjacent_dev_remove(struct net_device *dev,
++ 				  struct net_device *adj_dev, bool upper)
++ {
++ 	struct netdev_adjacent *adj;
++ 
++ 	if (upper)
++ 		adj = __netdev_find_upper(dev, adj_dev);
++ 	else
++ 		adj = __netdev_find_lower(dev, adj_dev);
++ 
++ 	if (!adj)
++ 		BUG();
++ 
++ 	if (adj->ref_nr > 1) {
++ 		adj->ref_nr--;
++ 		return;
++ 	}
++ 
++ 	list_del_rcu(&adj->list);
++ 	pr_debug("dev_put for %s, because of %s link removed from %s to %s\n",
++ 		 adj_dev->name, upper ? "upper" : "lower", dev->name,
++ 		 adj_dev->name);
++ 	dev_put(adj_dev);
++ 	kfree_rcu(adj, rcu);
++ }
++ 
++ static inline void __netdev_upper_dev_remove(struct net_device *dev,
++ 					     struct net_device *udev)
++ {
++ 	return __netdev_adjacent_dev_remove(dev, udev, true);
++ }
++ 
++ static inline void __netdev_lower_dev_remove(struct net_device *dev,
++ 					     struct net_device *ldev)
++ {
++ 	return __netdev_adjacent_dev_remove(dev, ldev, false);
++ }
++ 
++ int __netdev_adjacent_dev_insert_link(struct net_device *dev,
++ 				      struct net_device *upper_dev,
++ 				      bool master, bool neighbour)
++ {
++ 	int ret;
++ 
++ 	ret = __netdev_upper_dev_insert(dev, upper_dev, master, neighbour);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = __netdev_lower_dev_insert(upper_dev, dev, neighbour);
++ 	if (ret) {
++ 		__netdev_upper_dev_remove(dev, upper_dev);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline int __netdev_adjacent_dev_link(struct net_device *dev,
++ 					     struct net_device *udev)
++ {
++ 	return __netdev_adjacent_dev_insert_link(dev, udev, false, false);
++ }
++ 
++ static inline int __netdev_adjacent_dev_link_neighbour(struct net_device *dev,
++ 						       struct net_device *udev,
++ 						       bool master)
++ {
++ 	return __netdev_adjacent_dev_insert_link(dev, udev, master, true);
++ }
++ 
++ void __netdev_adjacent_dev_unlink(struct net_device *dev,
++ 				  struct net_device *upper_dev)
++ {
++ 	__netdev_upper_dev_remove(dev, upper_dev);
++ 	__netdev_lower_dev_remove(upper_dev, dev);
++ }
++ 
++ 
+++>>>>>>> 620f3186caa8 (net: remove search_list from netdev_adjacent)
+  static int __netdev_upper_dev_link(struct net_device *dev,
+  				   struct net_device *upper_dev, bool master)
+  {
+* Unmerged path net/core/dev.c
