@@ -1,0 +1,176 @@
+sched: Fix crash if cpuset_cpumask_can_shrink() is passed an empty cpumask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Galbraith <umgwanakikbuti@gmail.com>
+commit bb2bc55a694d45cdeda91b6f28ab2adec28125ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bb2bc55a.failed
+
+While creating an exclusive cpuset, we passed cpuset_cpumask_can_shrink()
+an empty cpumask (cur), and dl_bw_of(cpumask_any(cur)) made boom with it:
+
+ CPU: 0 PID: 6942 Comm: shield.sh Not tainted 3.19.0-master #19
+ Hardware name: MEDIONPC MS-7502/MS-7502, BIOS 6.00 PG 12/26/2007
+ task: ffff880224552450 ti: ffff8800caab8000 task.ti: ffff8800caab8000
+ RIP: 0010:[<ffffffff81073846>]  [<ffffffff81073846>] cpuset_cpumask_can_shrink+0x56/0xb0
+ [...]
+ Call Trace:
+  [<ffffffff810cb82a>] validate_change+0x18a/0x200
+  [<ffffffff810cc877>] cpuset_write_resmask+0x3b7/0x720
+  [<ffffffff810c4d58>] cgroup_file_write+0x38/0x100
+  [<ffffffff811d953a>] kernfs_fop_write+0x12a/0x180
+  [<ffffffff8116e1a3>] vfs_write+0xb3/0x1d0
+  [<ffffffff8116ed06>] SyS_write+0x46/0xb0
+  [<ffffffff8159ced6>] system_call_fastpath+0x16/0x1b
+
+	Signed-off-by: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Acked-by: Zefan Li <lizefan@huawei.com>
+Fixes: f82f80426f7a ("sched/deadline: Ensure that updates to exclusive cpusets don't break AC")
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/1422417235.5716.5.camel@marge.simpson.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit bb2bc55a694d45cdeda91b6f28ab2adec28125ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index f8654b1100de,5c86687d22b3..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -5062,7 -4635,112 +5062,53 @@@ void init_idle(struct task_struct *idle
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int cpuset_cpumask_can_shrink(const struct cpumask *cur,
++ 			      const struct cpumask *trial)
++ {
++ 	int ret = 1, trial_cpus;
++ 	struct dl_bw *cur_dl_b;
++ 	unsigned long flags;
++ 
++ 	if (!cpumask_weight(cur))
++ 		return ret;
++ 
++ 	rcu_read_lock_sched();
++ 	cur_dl_b = dl_bw_of(cpumask_any(cur));
++ 	trial_cpus = cpumask_weight(trial);
++ 
++ 	raw_spin_lock_irqsave(&cur_dl_b->lock, flags);
++ 	if (cur_dl_b->bw != -1 &&
++ 	    cur_dl_b->bw * trial_cpus < cur_dl_b->total_bw)
++ 		ret = 0;
++ 	raw_spin_unlock_irqrestore(&cur_dl_b->lock, flags);
++ 	rcu_read_unlock_sched();
++ 
++ 	return ret;
++ }
++ 
++ int task_can_attach(struct task_struct *p,
++ 		    const struct cpumask *cs_cpus_allowed)
+ -{
+ -	int ret = 0;
+ -
+ -	/*
+ -	 * Kthreads which disallow setaffinity shouldn't be moved
+ -	 * to a new cpuset; we don't want to change their cpu
+ -	 * affinity and isolating such threads by their set of
+ -	 * allowed nodes is unnecessary.  Thus, cpusets are not
+ -	 * applicable for such threads.  This prevents checking for
+ -	 * success of set_cpus_allowed_ptr() on all attached tasks
+ -	 * before cpus_allowed may be changed.
+ -	 */
+ -	if (p->flags & PF_NO_SETAFFINITY) {
+ -		ret = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -#ifdef CONFIG_SMP
+ -	if (dl_task(p) && !cpumask_intersects(task_rq(p)->rd->span,
+ -					      cs_cpus_allowed)) {
+ -		unsigned int dest_cpu = cpumask_any_and(cpu_active_mask,
+ -							cs_cpus_allowed);
+ -		struct dl_bw *dl_b;
+ -		bool overflow;
+ -		int cpus;
+ -		unsigned long flags;
+ -
+ -		rcu_read_lock_sched();
+ -		dl_b = dl_bw_of(dest_cpu);
+ -		raw_spin_lock_irqsave(&dl_b->lock, flags);
+ -		cpus = dl_bw_cpus(dest_cpu);
+ -		overflow = __dl_overflow(dl_b, cpus, 0, p->dl.dl_bw);
+ -		if (overflow)
+ -			ret = -EBUSY;
+ -		else {
+ -			/*
+ -			 * We reserve space for this task in the destination
+ -			 * root_domain, as we can't fail after this point.
+ -			 * We will free resources in the source root_domain
+ -			 * later on (see set_cpus_allowed_dl()).
+ -			 */
+ -			__dl_add(dl_b, p->dl.dl_bw);
+ -		}
+ -		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
+ -		rcu_read_unlock_sched();
+ -
+ -	}
+ -#endif
+ -out:
+ -	return ret;
+ -}
+ -
+ -#ifdef CONFIG_SMP
+ -/*
+ - * move_queued_task - move a queued task to new rq.
+ - *
+ - * Returns (locked) new rq. Old rq's lock is released.
+ - */
+ -static struct rq *move_queued_task(struct task_struct *p, int new_cpu)
+ -{
+ -	struct rq *rq = task_rq(p);
+ -
+ -	lockdep_assert_held(&rq->lock);
+ -
+ -	dequeue_task(rq, p, 0);
+ -	p->on_rq = TASK_ON_RQ_MIGRATING;
+ -	set_task_cpu(p, new_cpu);
+ -	raw_spin_unlock(&rq->lock);
+ -
+ -	rq = cpu_rq(new_cpu);
+ -
+ -	raw_spin_lock(&rq->lock);
+ -	BUG_ON(task_cpu(p) != new_cpu);
+ -	p->on_rq = TASK_ON_RQ_QUEUED;
+ -	enqueue_task(rq, p, 0);
+ -	check_preempt_curr(rq, p, 0);
+++{
+++	int ret = 0;
++ 
+ -	return rq;
+ -}
+++	/*
+++	 * Kthreads which disallow setaffinity shouldn't be moved
+++	 * to a new cpuset; we don't want to change their cpu
+++	 * affinity and isolating such threads by their set of
+++	 * allowed nodes is unnecessary.  Thus, cpusets are not
+++	 * applicable for such threads.  This prevents checking for
+++	 * success of set_cpus_allowed_ptr() on all attached tasks
+++	 * before cpus_allowed may be changed.
+++	 */
+++	if (p->flags & PF_NO_SETAFFINITY) {
+++		ret = -EINVAL;
+++		goto out;
+++	}
++ 
+++>>>>>>> bb2bc55a694d (sched: Fix crash if cpuset_cpumask_can_shrink() is passed an empty cpumask)
+ +#ifdef CONFIG_SMP
+  void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+  {
+  	if (p->sched_class && p->sched_class->set_cpus_allowed)
+* Unmerged path kernel/sched/core.c
