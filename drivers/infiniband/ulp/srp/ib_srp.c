@@ -315,7 +315,7 @@ static struct ib_fmr_pool *srp_alloc_fmr_pool(struct srp_target_port *target)
 	struct ib_fmr_pool_param fmr_param;
 
 	memset(&fmr_param, 0, sizeof(fmr_param));
-	fmr_param.pool_size	    = target->scsi_host->can_queue;
+	fmr_param.pool_size	    = target->mr_pool_size;
 	fmr_param.dirty_watermark   = fmr_param.pool_size / 4;
 	fmr_param.cache		    = 1;
 	fmr_param.max_pages_per_fmr = dev->max_pages_per_mr;
@@ -449,8 +449,7 @@ static struct srp_fr_pool *srp_alloc_fr_pool(struct srp_target_port *target)
 {
 	struct srp_device *dev = target->srp_host->srp_dev;
 
-	return srp_create_fr_pool(dev->dev, dev->pd,
-				  target->scsi_host->can_queue,
+	return srp_create_fr_pool(dev->dev, dev->pd, target->mr_pool_size,
 				  dev->max_pages_per_mr);
 }
 
@@ -3256,6 +3255,7 @@ static ssize_t srp_create_target(struct device *dev,
 	}
 
 	target_host->sg_tablesize = target->sg_tablesize;
+	target->mr_pool_size = target->scsi_host->can_queue;
 	target->indirect_size = target->sg_tablesize *
 				sizeof (struct srp_direct_buf);
 	target->max_iu_len = sizeof (struct srp_cmd) +
