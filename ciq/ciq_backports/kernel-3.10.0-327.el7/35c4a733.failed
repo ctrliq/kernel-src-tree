@@ -1,0 +1,259 @@
+KVM: PPC: Move kvmppc_ld/st to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: Move kvmppc_ld/st to common code (Thomas Huth) [1226884 1227323]
+Rebuild_FUZZ: 93.67%
+commit-author Alexander Graf <agraf@suse.de>
+commit 35c4a7330dbe1ae6f590a5645b185e35ddb3f6d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/35c4a733.failed
+
+We have enough common infrastructure now to resolve GVA->GPA mappings at
+runtime. With this we can move our book3s specific helpers to load / store
+in guest virtual address space to common code as well.
+
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 35c4a7330dbe1ae6f590a5645b185e35ddb3f6d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s.c
+diff --cc arch/powerpc/kvm/book3s.c
+index a3cbada114bc,de8da3387e90..000000000000
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@@ -408,85 -410,6 +408,88 @@@ static int kvmppc_xlate(struct kvm_vcp
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+ +static hva_t kvmppc_bad_hva(void)
+ +{
+ +	return PAGE_OFFSET;
+ +}
+ +
+ +static hva_t kvmppc_pte_to_hva(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte)
+ +{
+ +	hva_t hpage;
+ +
+ +	hpage = gfn_to_hva(vcpu->kvm, pte->raddr >> PAGE_SHIFT);
+ +	if (kvm_is_error_hva(hpage))
+ +		goto err;
+ +
+ +	return hpage | (pte->raddr & ~PAGE_MASK);
+ +err:
+ +	return kvmppc_bad_hva();
+ +}
+ +
+ +int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+ +	      bool data)
+ +{
+ +	struct kvmppc_pte pte;
+ +	int r;
+ +
+ +	vcpu->stat.st++;
+ +
+ +	r = kvmppc_xlate(vcpu, *eaddr, data, true, &pte);
+ +	if (r < 0)
+ +		return r;
+ +
+ +	*eaddr = pte.raddr;
+ +
+ +	if (!pte.may_write)
+ +		return -EPERM;
+ +
+ +	if (kvm_write_guest(vcpu->kvm, pte.raddr, ptr, size))
+ +		return EMULATE_DO_MMIO;
+ +
+ +	return EMULATE_DONE;
+ +}
+ +EXPORT_SYMBOL_GPL(kvmppc_st);
+ +
+ +int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+ +		      bool data)
+ +{
+ +	struct kvmppc_pte pte;
+ +	hva_t hva = *eaddr;
+ +	int rc;
+ +
+ +	vcpu->stat.ld++;
+ +
+ +	rc = kvmppc_xlate(vcpu, *eaddr, data, false, &pte);
+ +	if (rc)
+ +		return rc;
+ +
+ +	*eaddr = pte.raddr;
+ +
+ +	if (!pte.may_read)
+ +		return -EPERM;
+ +
+ +	if (!data && !pte.may_execute)
+ +		return -ENOEXEC;
+ +
+ +	hva = kvmppc_pte_to_hva(vcpu, &pte);
+ +	if (kvm_is_error_hva(hva))
+ +		goto mmio;
+ +
+ +	if (copy_from_user(ptr, (void __user *)hva, size)) {
+ +		printk(KERN_INFO "kvmppc_ld at 0x%lx failed\n", hva);
+ +		goto mmio;
+ +	}
+ +
+ +	return EMULATE_DONE;
+ +
+ +mmio:
+ +	return EMULATE_DO_MMIO;
+ +}
+ +EXPORT_SYMBOL_GPL(kvmppc_ld);
+ +
+++=======
+++>>>>>>> 35c4a7330dbe (KVM: PPC: Move kvmppc_ld/st to common code)
+  int kvmppc_load_last_inst(struct kvm_vcpu *vcpu, enum instruction_type type,
+  					 u32 *inst)
+  {
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 40c8fc30b955..35bce13ec38c 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -144,8 +144,8 @@ extern void kvmppc_mmu_hpte_sysexit(void);
+ extern int kvmppc_mmu_hv_init(void);
+ extern int kvmppc_book3s_hcall_implemented(struct kvm *kvm, unsigned long hc);
+ 
++/* XXX remove this export when load_last_inst() is generic */
+ extern int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr, bool data);
+-extern int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr, bool data);
+ extern void kvmppc_book3s_queue_irqprio(struct kvm_vcpu *vcpu, unsigned int vec);
+ extern void kvmppc_book3s_dequeue_irqprio(struct kvm_vcpu *vcpu,
+ 					  unsigned int vec);
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 7e791c43d831..107ec83afe08 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -119,15 +119,15 @@ struct kvm_vcpu_stat {
+ 	u32 halt_wakeup;
+ 	u32 dbell_exits;
+ 	u32 gdbell_exits;
++	u32 ld;
++	u32 st;
+ #ifdef CONFIG_PPC_BOOK3S
+ 	u32 pf_storage;
+ 	u32 pf_instruc;
+ 	u32 sp_storage;
+ 	u32 sp_instruc;
+ 	u32 queue_intr;
+-	u32 ld;
+ 	u32 ld_slow;
+-	u32 st;
+ 	u32 st_slow;
+ #endif
+ };
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 2da5f547d872..8bf210e4c70a 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -70,6 +70,10 @@ extern int kvmppc_handle_store(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ extern int kvmppc_load_last_inst(struct kvm_vcpu *vcpu,
+ 				 enum instruction_type type, u32 *inst);
+ 
++extern int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
++		     bool data);
++extern int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
++		     bool data);
+ extern int kvmppc_emulate_instruction(struct kvm_run *run,
+                                       struct kvm_vcpu *vcpu);
+ extern int kvmppc_emulate_mmio(struct kvm_run *run, struct kvm_vcpu *vcpu);
+* Unmerged path arch/powerpc/kvm/book3s.c
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index bf2571061516..0c4d27c218c6 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -310,6 +310,87 @@ int kvmppc_emulate_mmio(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvmppc_emulate_mmio);
+ 
++static hva_t kvmppc_bad_hva(void)
++{
++	return PAGE_OFFSET;
++}
++
++static hva_t kvmppc_pte_to_hva(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte)
++{
++	hva_t hpage;
++
++	hpage = gfn_to_hva(vcpu->kvm, pte->raddr >> PAGE_SHIFT);
++	if (kvm_is_error_hva(hpage))
++		goto err;
++
++	return hpage | (pte->raddr & ~PAGE_MASK);
++err:
++	return kvmppc_bad_hva();
++}
++
++int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
++	      bool data)
++{
++	struct kvmppc_pte pte;
++	int r;
++
++	vcpu->stat.st++;
++
++	r = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
++			 XLATE_WRITE, &pte);
++	if (r < 0)
++		return r;
++
++	*eaddr = pte.raddr;
++
++	if (!pte.may_write)
++		return -EPERM;
++
++	if (kvm_write_guest(vcpu->kvm, pte.raddr, ptr, size))
++		return EMULATE_DO_MMIO;
++
++	return EMULATE_DONE;
++}
++EXPORT_SYMBOL_GPL(kvmppc_st);
++
++int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
++		      bool data)
++{
++	struct kvmppc_pte pte;
++	hva_t hva = *eaddr;
++	int rc;
++
++	vcpu->stat.ld++;
++
++	rc = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
++			  XLATE_READ, &pte);
++	if (rc)
++		return rc;
++
++	*eaddr = pte.raddr;
++
++	if (!pte.may_read)
++		return -EPERM;
++
++	if (!data && !pte.may_execute)
++		return -ENOEXEC;
++
++	hva = kvmppc_pte_to_hva(vcpu, &pte);
++	if (kvm_is_error_hva(hva))
++		goto mmio;
++
++	if (copy_from_user(ptr, (void __user *)hva, size)) {
++		printk(KERN_INFO "kvmppc_ld at 0x%lx failed\n", hva);
++		goto mmio;
++	}
++
++	return EMULATE_DONE;
++
++mmio:
++	return EMULATE_DO_MMIO;
++}
++EXPORT_SYMBOL_GPL(kvmppc_ld);
++
+ int kvm_arch_hardware_enable(void *garbage)
+ {
+ 	return 0;
