@@ -1,0 +1,208 @@
+GFS2: Clean up quota slot allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit ee2411a8db49a21bc55dc124e1b434ba194c8903
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ee2411a8.failed
+
+Quota slot allocation has historically used a vector of pages
+and a set of homegrown find/test/set/clear bit functions. Since
+the size of the bitmap is likely to be based on the default
+qc file size, thats a couple of pages at most. So we ought
+to be able to allocate that as a single chunk, with a vmalloc
+fallback, just in case of memory fragmentation.
+
+We are then able to use the kernel's own find/test/set/clear
+bit functions, rather than rolling our own.
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+	Cc: Abhijith Das <adas@redhat.com>
+(cherry picked from commit ee2411a8db49a21bc55dc124e1b434ba194c8903)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/quota.c
+diff --cc fs/gfs2/quota.c
+index 679b366e073c,79be67ab8603..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -241,88 -315,48 +241,86 @@@ static void qd_put(struct gfs2_quota_da
+  
+  static int slot_get(struct gfs2_quota_data *qd)
+  {
+- 	struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
+- 	unsigned int c, o = 0, b;
+- 	unsigned char byte = 0;
++ 	struct gfs2_sbd *sdp = qd->qd_sbd;
++ 	unsigned int bit;
++ 	int error = 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&qd_lru_lock);
+ +
+ +	if (qd->qd_slot_count++) {
+ +		spin_unlock(&qd_lru_lock);
+ +		return 0;
+ +	}
+ +
+ +	for (c = 0; c < sdp->sd_quota_chunks; c++)
+ +		for (o = 0; o < PAGE_SIZE; o++) {
+ +			byte = sdp->sd_quota_bitmap[c][o];
+ +			if (byte != 0xFF)
+ +				goto found;
+ +		}
+ +
+ +	goto fail;
+ +
+ +found:
+ +	for (b = 0; b < 8; b++)
+ +		if (!(byte & (1 << b)))
+ +			break;
+ +	qd->qd_slot = c * (8 * PAGE_SIZE) + o * 8 + b;
+ +
+ +	if (qd->qd_slot >= sdp->sd_quota_slots)
+ +		goto fail;
+ +
+ +	sdp->sd_quota_bitmap[c][o] |= 1 << b;
+ +
+ +	spin_unlock(&qd_lru_lock);
+ +
+ +	return 0;
+ +
+ +fail:
+ +	qd->qd_slot_count--;
+ +	spin_unlock(&qd_lru_lock);
+ +	return -ENOSPC;
+++=======
++ 	spin_lock(&qd_lock);
++ 	if (qd->qd_slot_count != 0)
++ 		goto out;
++ 
++ 	error = -ENOSPC;
++ 	bit = find_first_zero_bit(sdp->sd_quota_bitmap, sdp->sd_quota_slots);
++ 	if (bit < sdp->sd_quota_slots) {
++ 		set_bit(bit, sdp->sd_quota_bitmap);
++ 		qd->qd_slot = bit;
++ out:
++ 		qd->qd_slot_count++;
++ 	}
++ 	spin_unlock(&qd_lock);
++ 
++ 	return error;
+++>>>>>>> ee2411a8db49 (GFS2: Clean up quota slot allocation)
+  }
+  
+  static void slot_hold(struct gfs2_quota_data *qd)
+  {
+- 	struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
++ 	struct gfs2_sbd *sdp = qd->qd_sbd;
+  
+ -	spin_lock(&qd_lock);
+ +	spin_lock(&qd_lru_lock);
+  	gfs2_assert(sdp, qd->qd_slot_count);
+  	qd->qd_slot_count++;
+ -	spin_unlock(&qd_lock);
+ +	spin_unlock(&qd_lru_lock);
+  }
+  
+- static void gfs2_icbit_munge(struct gfs2_sbd *sdp, unsigned char **bitmap,
+- 			     unsigned int bit, int new_value)
+- {
+- 	unsigned int c, o, b = bit;
+- 	int old_value;
+- 
+- 	c = b / (8 * PAGE_SIZE);
+- 	b %= 8 * PAGE_SIZE;
+- 	o = b / 8;
+- 	b %= 8;
+- 
+- 	old_value = (bitmap[c][o] & (1 << b));
+- 	gfs2_assert_withdraw(sdp, !old_value != !new_value);
+- 
+- 	if (new_value)
+- 		bitmap[c][o] |= 1 << b;
+- 	else
+- 		bitmap[c][o] &= ~(1 << b);
+- }
+- 
+  static void slot_put(struct gfs2_quota_data *qd)
+  {
+- 	struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
++ 	struct gfs2_sbd *sdp = qd->qd_sbd;
+  
+ -	spin_lock(&qd_lock);
+ +	spin_lock(&qd_lru_lock);
+  	gfs2_assert(sdp, qd->qd_slot_count);
+  	if (!--qd->qd_slot_count) {
+- 		gfs2_icbit_munge(sdp, sdp->sd_quota_bitmap, qd->qd_slot, 0);
++ 		BUG_ON(!test_and_clear_bit(qd->qd_slot, sdp->sd_quota_bitmap));
+  		qd->qd_slot = -1;
+  	}
+ -	spin_unlock(&qd_lock);
+ +	spin_unlock(&qd_lru_lock);
+  }
+  
+  static int bh_get(struct gfs2_quota_data *qd)
+@@@ -1213,6 -1228,8 +1211,11 @@@ int gfs2_quota_init(struct gfs2_sbd *sd
+  	unsigned int blocks = size >> sdp->sd_sb.sb_bsize_shift;
+  	unsigned int x, slot = 0;
+  	unsigned int found = 0;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int hash;
++ 	unsigned int bm_size;
+++>>>>>>> ee2411a8db49 (GFS2: Clean up quota slot allocation)
+  	u64 dblock;
+  	u32 extlen = 0;
+  	int error;
+@@@ -1277,11 -1295,15 +1276,16 @@@
+  			qd->qd_slot = slot;
+  			qd->qd_slot_count = 1;
+  
+++<<<<<<< HEAD
+ +			spin_lock(&qd_lru_lock);
+ +			gfs2_icbit_munge(sdp, sdp->sd_quota_bitmap, slot, 1);
+++=======
++ 			spin_lock(&qd_lock);
++ 			BUG_ON(test_and_set_bit(slot, sdp->sd_quota_bitmap));
+++>>>>>>> ee2411a8db49 (GFS2: Clean up quota slot allocation)
+  			list_add(&qd->qd_list, &sdp->sd_quota_list);
+  			atomic_inc(&sdp->sd_quota_count);
+ -			spin_unlock(&qd_lock);
+ -
+ -			spin_lock_bucket(hash);
+ -			hlist_bl_add_head_rcu(&qd->qd_hlist, &qd_hash_table[hash]);
+ -			spin_unlock_bucket(hash);
+ +			spin_unlock(&qd_lru_lock);
+  
+  			found++;
+  		}
+@@@ -1305,9 -1327,8 +1309,8 @@@ void gfs2_quota_cleanup(struct gfs2_sb
+  {
+  	struct list_head *head = &sdp->sd_quota_list;
+  	struct gfs2_quota_data *qd;
+- 	unsigned int x;
+  
+ -	spin_lock(&qd_lock);
+ +	spin_lock(&qd_lru_lock);
+  	while (!list_empty(head)) {
+  		qd = list_entry(head->prev, struct gfs2_quota_data, qd_list);
+  
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 88b757b58e69..5a08d1f138f1 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -726,8 +726,7 @@ struct gfs2_sbd {
+ 	spinlock_t sd_trunc_lock;
+ 
+ 	unsigned int sd_quota_slots;
+-	unsigned int sd_quota_chunks;
+-	unsigned char **sd_quota_bitmap;
++	unsigned long *sd_quota_bitmap;
+ 
+ 	u64 sd_quota_sync_gen;
+ 
+* Unmerged path fs/gfs2/quota.c
