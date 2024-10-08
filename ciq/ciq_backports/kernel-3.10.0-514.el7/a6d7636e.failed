@@ -1,0 +1,124 @@
+xfs: fix recursive splice read locking with DAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit a6d7636e8d0fd94fd1937db91d5b06a91fa85dde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a6d7636e.failed
+
+Doing a splice read (generic/249) generates a lockdep splat because
+we recursively lock the inode iolock in this path:
+
+SyS_sendfile64
+do_sendfile
+do_splice_direct
+splice_direct_to_actor
+do_splice_to
+xfs_file_splice_read			<<<<<< lock here
+default_file_splice_read
+vfs_readv
+do_readv_writev
+do_iter_readv_writev
+xfs_file_read_iter			<<<<<< then here
+
+The issue here is that for DAX inodes we need to avoid the page
+cache path and hence simply push it into the normal read path.
+Unfortunately, we can't tell down at xfs_file_read_iter() whether we
+are being called from the splice path and hence we cannot avoid the
+locking at this layer. Hence we simply have to drop the inode
+locking at the higher splice layer for DAX.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Tested-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit a6d7636e8d0fd94fd1937db91d5b06a91fa85dde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index ff72b4ea0a57,ebe9b8290a70..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -409,56 -402,26 +409,75 @@@ xfs_file_splice_read
+  	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
+  		return -EIO;
+  
+- 	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
+- 
+  	trace_xfs_file_splice_read(ip, count, *ppos, ioflags);
+  
+++<<<<<<< HEAD
+ +	ret = generic_file_splice_read(infilp, ppos, pipe, count, flags);
+ +	if (ret > 0)
+ +		XFS_STATS_ADD(xs_read_bytes, ret);
+ +
+ +	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+++=======
++ 	/*
++ 	 * DAX inodes cannot ues the page cache for splice, so we have to push
++ 	 * them through the VFS IO path. This means it goes through
++ 	 * ->read_iter, which for us takes the XFS_IOLOCK_SHARED. Hence we
++ 	 * cannot lock the splice operation at this level for DAX inodes.
++ 	 */
++ 	if (IS_DAX(VFS_I(ip))) {
++ 		ret = default_file_splice_read(infilp, ppos, pipe, count,
++ 					       flags);
++ 		goto out;
++ 	}
++ 
++ 	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
++ 	ret = generic_file_splice_read(infilp, ppos, pipe, count, flags);
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ out:
++ 	if (ret > 0)
++ 		XFS_STATS_ADD(ip->i_mount, xs_read_bytes, ret);
+++>>>>>>> a6d7636e8d0f (xfs: fix recursive splice read locking with DAX)
+ +	return ret;
+ +}
+ +
+ +/*
+ + * xfs_file_splice_write() does not use xfs_rw_ilock() because
+ + * generic_file_splice_write() takes the i_mutex itself. This, in theory,
+ + * couuld cause lock inversions between the aio_write path and the splice path
+ + * if someone is doing concurrent splice(2) based writes and write(2) based
+ + * writes to the same inode. The only real way to fix this is to re-implement
+ + * the generic code here with correct locking orders.
+ + */
+ +STATIC ssize_t
+ +xfs_file_splice_write(
+ +	struct pipe_inode_info	*pipe,
+ +	struct file		*outfilp,
+ +	loff_t			*ppos,
+ +	size_t			count,
+ +	unsigned int		flags)
+ +{
+ +	struct inode		*inode = outfilp->f_mapping->host;
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +	int			ioflags = 0;
+ +	ssize_t			ret;
+ +
+ +	XFS_STATS_INC(xs_write_calls);
+ +
+ +	if (outfilp->f_mode & FMODE_NOCMTIME)
+ +		ioflags |= XFS_IO_INVIS;
+ +
+ +	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
+ +		return -EIO;
+ +
+ +	xfs_ilock(ip, XFS_IOLOCK_EXCL);
+ +
+ +	trace_xfs_file_splice_write(ip, count, *ppos, ioflags);
+ +
+ +	ret = generic_file_splice_write(pipe, outfilp, ppos, count, flags);
+ +	if (ret > 0)
+ +		XFS_STATS_ADD(xs_write_bytes, ret);
+ +
+ +	xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+  	return ret;
+  }
+  
+* Unmerged path fs/xfs/xfs_file.c
