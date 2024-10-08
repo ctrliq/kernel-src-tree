@@ -1,0 +1,158 @@
+bonding: Convert hw addr handling to sync/unsync, support ucast addresses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jay Vosburgh <fubar@us.ibm.com>
+commit 303d1cbf610eef31e039efc2e8da30cf94cf5ebc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/303d1cbf.failed
+
+This patch converts bonding to use the dev_uc/mc_sync and
+dev_uc/mc_sync_multiple functions for updating the hardware addresses
+of bonding slaves.
+
+	The existing functions to add or remove addresses are removed,
+and their functionality is replaced with calls to dev_mc_sync or
+dev_mc_sync_multiple, depending upon the bonding mode.
+
+	Calls to dev_uc_sync and dev_uc_sync_multiple are also added,
+so that unicast addresses added to a bond will be properly synced with
+its slaves.
+
+	Various functions are renamed to better reflect the new
+situation, and relevant comments are updated.
+
+	Signed-off-by: Jay Vosburgh <fubar@us.ibm.com>
+	Cc: Vlad Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 303d1cbf610eef31e039efc2e8da30cf94cf5ebc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index 478b5595b1be,4953f66a29a4..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -706,45 -706,15 +706,57 @@@ static int bond_set_allmulti(struct bon
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Add a Multicast address to slaves
+ + * according to mode
+ + */
+ +static void bond_mc_add(struct bonding *bond, void *addr)
+ +{
+ +	if (USES_PRIMARY(bond->params.mode)) {
+ +		/* write lock already acquired */
+ +		if (bond->curr_active_slave)
+ +			dev_mc_add(bond->curr_active_slave->dev, addr);
+ +	} else {
+ +		struct slave *slave;
+ +		int i;
+ +
+ +		bond_for_each_slave(bond, slave, i)
+ +			dev_mc_add(slave->dev, addr);
+ +	}
+ +}
+ +
+ +/*
+ + * Remove a multicast address from slave
+ + * according to mode
+ + */
+ +static void bond_mc_del(struct bonding *bond, void *addr)
+ +{
+ +	if (USES_PRIMARY(bond->params.mode)) {
+ +		/* write lock already acquired */
+ +		if (bond->curr_active_slave)
+ +			dev_mc_del(bond->curr_active_slave->dev, addr);
+ +	} else {
+ +		struct slave *slave;
+ +		int i;
+ +		bond_for_each_slave(bond, slave, i) {
+ +			dev_mc_del(slave->dev, addr);
+ +		}
+ +	}
+ +}
+ +
+ +
+++=======
++ static void __bond_resend_igmp_join_requests(struct net_device *dev)
++ {
++ 	struct in_device *in_dev;
++ 
++ 	in_dev = __in_dev_get_rcu(dev);
++ 	if (in_dev)
++ 		ip_mc_rejoin_groups(in_dev);
++ }
++ 
+++>>>>>>> 303d1cbf610e (bonding: Convert hw addr handling to sync/unsync, support ucast addresses)
+  /*
+   * Retrieve the list of registered multicast addresses for the bonding
+   * device and retransmit an IGMP JOIN request to the current active
+@@@ -2077,29 -2051,19 +2072,25 @@@ static int __bond_release_one(struct ne
+  
+  	bond_del_vlans_from_slave(bond, slave_dev);
+  
+- 	/* If the mode USES_PRIMARY, then we should only remove its
+- 	 * promisc and mc settings if it was the curr_active_slave, but that was
+- 	 * already taken care of above when we detached the slave
++ 	/* If the mode USES_PRIMARY, then this cases was handled above by
++ 	 * bond_change_active_slave(..., NULL)
+  	 */
+  	if (!USES_PRIMARY(bond->params.mode)) {
+ -		/* unset promiscuity level from slave */
+ -		if (bond_dev->flags & IFF_PROMISC)
+ +		/* unset promiscuity level from slave
+ +		 * NOTE: The NETDEV_CHANGEADDR call above may change the value
+ +		 * of the IFF_PROMISC flag in the bond_dev, but we need the
+ +		 * value of that flag before that change, as that was the value
+ +		 * when this slave was attached, so we cache at the start of the
+ +		 * function and use it here. Same goes for ALLMULTI below
+ +		 */
+ +		if (old_flags & IFF_PROMISC)
+  			dev_set_promiscuity(slave_dev, -1);
+  
+  		/* unset allmulti level from slave */
+ -		if (bond_dev->flags & IFF_ALLMULTI)
+ +		if (old_flags & IFF_ALLMULTI)
+  			dev_set_allmulti(slave_dev, -1);
+  
+- 		/* flush master's mc_list from slave */
+- 		netif_addr_lock_bh(bond_dev);
+- 		bond_mc_list_flush(bond_dev, slave_dev);
+- 		netif_addr_unlock_bh(bond_dev);
++ 		bond_hw_addr_flush(bond_dev, slave_dev);
+  	}
+  
+  	bond_upper_dev_unlink(bond_dev, slave_dev);
+@@@ -4813,10 -4752,11 +4783,9 @@@ static int bond_init(struct net_device 
+  
+  	/* Ensure valid dev_addr */
+  	if (is_zero_ether_addr(bond_dev->dev_addr) &&
+ -	    bond_dev->addr_assign_type == NET_ADDR_PERM) {
+ +	    bond_dev->addr_assign_type == NET_ADDR_PERM)
+  		eth_hw_addr_random(bond_dev);
+ -		bond->dev_addr_from_first = true;
+ -	}
+  
+- 	__hw_addr_init(&bond->mc_list);
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index fa77fd9c890c..407fc35b1234 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -231,7 +231,6 @@ struct bonding {
+ 	char     proc_file_name[IFNAMSIZ];
+ #endif /* CONFIG_PROC_FS */
+ 	struct   list_head bond_list;
+-	struct   netdev_hw_addr_list mc_list;
+ 	int      (*xmit_hash_policy)(struct sk_buff *, int);
+ 	u16      rr_tx_counter;
+ 	struct   ad_bond_info ad_info;
