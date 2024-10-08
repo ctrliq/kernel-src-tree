@@ -749,6 +749,12 @@ struct mlx4_dev {
 	int                     nvfs[MLX4_MAX_PORTS + 1];
 };
 
+struct mlx4_clock_params {
+	u64 offset;
+	u8 bar;
+	u8 size;
+};
+
 struct mlx4_eqe {
 	u8			reserved1;
 	u8			type;
@@ -1392,5 +1398,8 @@ struct mlx4_ptys_reg {
 int mlx4_ACCESS_PTYS_REG(struct mlx4_dev *dev,
 			 enum mlx4_access_reg_method method,
 			 struct mlx4_ptys_reg *ptys_reg);
+
+int mlx4_get_internal_clock_params(struct mlx4_dev *dev,
+				   struct mlx4_clock_params *params);
 
 #endif /* MLX4_DEVICE_H */
