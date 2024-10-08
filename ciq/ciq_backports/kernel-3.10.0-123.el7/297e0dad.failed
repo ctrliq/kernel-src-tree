@@ -1,0 +1,230 @@
+IB/mlx4: Handle Ethernet L2 parameters for IP based GID addressing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [infiniband] mlx4: Handle Ethernet L2 parameters for IP based GID addressing (Doug Ledford) [1051187]
+Rebuild_FUZZ: 97.67%
+commit-author Moni Shoua <monis@mellanox.com>
+commit 297e0dad720664dad44baa2cdd13f871979fb58c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/297e0dad.failed
+
+IP based RoCE gids don't store Ethernet L2 parameters, MAC and VLAN.
+
+Therefore, we need to extract them from the CQE and place them in
+struct ib_wc (to be used for cases were they were taken from the gid).
+
+Also, when modifying a QP or building address handle, instead of
+parsing the dgid to get the MAC and VLAN, take them from the address
+handle attributes.
+
+	Signed-off-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 297e0dad720664dad44baa2cdd13f871979fb58c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx4/qp.c
+diff --cc drivers/infiniband/hw/mlx4/qp.c
+index 4f10af2905b5,e0c2186529ff..000000000000
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@@ -1561,13 -1613,21 +1613,29 @@@ int mlx4_ib_modify_qp(struct ib_qp *ibq
+  	struct mlx4_ib_qp *qp = to_mqp(ibqp);
+  	enum ib_qp_state cur_state, new_state;
+  	int err = -EINVAL;
+++<<<<<<< HEAD
+ +
+++=======
++ 	int ll;
+++>>>>>>> 297e0dad7206 (IB/mlx4: Handle Ethernet L2 parameters for IP based GID addressing)
+  	mutex_lock(&qp->mutex);
+  
+  	cur_state = attr_mask & IB_QP_CUR_STATE ? attr->cur_qp_state : qp->state;
+  	new_state = attr_mask & IB_QP_STATE ? attr->qp_state : cur_state;
+  
+++<<<<<<< HEAD
+ +	if (!ib_modify_qp_is_ok(cur_state, new_state, ibqp->qp_type, attr_mask)) {
+++=======
++ 	if (cur_state == new_state && cur_state == IB_QPS_RESET) {
++ 		ll = IB_LINK_LAYER_UNSPECIFIED;
++ 	} else {
++ 		int port = attr_mask & IB_QP_PORT ? attr->port_num : qp->port;
++ 		ll = rdma_port_get_link_layer(&dev->ib_dev, port);
++ 	}
++ 
++ 	if (!ib_modify_qp_is_ok(cur_state, new_state, ibqp->qp_type,
++ 				attr_mask, ll)) {
+++>>>>>>> 297e0dad7206 (IB/mlx4: Handle Ethernet L2 parameters for IP based GID addressing)
+  		pr_debug("qpn 0x%x: invalid attribute mask specified "
+  			 "for transition %d to %d. qp_type %d,"
+  			 " attr_mask 0x%x\n",
+diff --git a/drivers/infiniband/hw/mlx4/ah.c b/drivers/infiniband/hw/mlx4/ah.c
+index a251becdaa98..170dca608042 100644
+--- a/drivers/infiniband/hw/mlx4/ah.c
++++ b/drivers/infiniband/hw/mlx4/ah.c
+@@ -39,25 +39,6 @@
+ 
+ #include "mlx4_ib.h"
+ 
+-int mlx4_ib_resolve_grh(struct mlx4_ib_dev *dev, const struct ib_ah_attr *ah_attr,
+-			u8 *mac, int *is_mcast, u8 port)
+-{
+-	struct in6_addr in6;
+-
+-	*is_mcast = 0;
+-
+-	memcpy(&in6, ah_attr->grh.dgid.raw, sizeof in6);
+-	if (rdma_link_local_addr(&in6))
+-		rdma_get_ll_mac(&in6, mac);
+-	else if (rdma_is_multicast_addr(&in6)) {
+-		rdma_get_mcast_mac(&in6, mac);
+-		*is_mcast = 1;
+-	} else
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+ static struct ib_ah *create_ib_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr,
+ 				  struct mlx4_ib_ah *ah)
+ {
+@@ -92,21 +73,18 @@ static struct ib_ah *create_iboe_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr
+ {
+ 	struct mlx4_ib_dev *ibdev = to_mdev(pd->device);
+ 	struct mlx4_dev *dev = ibdev->dev;
+-	union ib_gid sgid;
+-	u8 mac[6];
+-	int err;
+ 	int is_mcast;
++	struct in6_addr in6;
+ 	u16 vlan_tag;
+ 
+-	err = mlx4_ib_resolve_grh(ibdev, ah_attr, mac, &is_mcast, ah_attr->port_num);
+-	if (err)
+-		return ERR_PTR(err);
+-
+-	memcpy(ah->av.eth.mac, mac, 6);
+-	err = ib_get_cached_gid(pd->device, ah_attr->port_num, ah_attr->grh.sgid_index, &sgid);
+-	if (err)
+-		return ERR_PTR(err);
+-	vlan_tag = rdma_get_vlan_id(&sgid);
++	memcpy(&in6, ah_attr->grh.dgid.raw, sizeof(in6));
++	if (rdma_is_multicast_addr(&in6)) {
++		is_mcast = 1;
++		rdma_get_mcast_mac(&in6, ah->av.eth.mac);
++	} else {
++		memcpy(ah->av.eth.mac, ah_attr->dmac, ETH_ALEN);
++	}
++	vlan_tag = ah_attr->vlan_id;
+ 	if (vlan_tag < 0x1000)
+ 		vlan_tag |= (ah_attr->sl & 7) << 13;
+ 	ah->av.eth.port_pd = cpu_to_be32(to_mpd(pd)->pdn | (ah_attr->port_num << 24));
+diff --git a/drivers/infiniband/hw/mlx4/cq.c b/drivers/infiniband/hw/mlx4/cq.c
+index 66dbf8062374..cc40f08ca8f1 100644
+--- a/drivers/infiniband/hw/mlx4/cq.c
++++ b/drivers/infiniband/hw/mlx4/cq.c
+@@ -798,6 +798,15 @@ repoll:
+ 			wc->sl  = be16_to_cpu(cqe->sl_vid) >> 13;
+ 		else
+ 			wc->sl  = be16_to_cpu(cqe->sl_vid) >> 12;
++		if (be32_to_cpu(cqe->vlan_my_qpn) & MLX4_CQE_VLAN_PRESENT_MASK) {
++			wc->vlan_id = be16_to_cpu(cqe->sl_vid) &
++				MLX4_CQE_VID_MASK;
++		} else {
++			wc->vlan_id = 0xffff;
++		}
++		wc->wc_flags |= IB_WC_WITH_VLAN;
++		memcpy(wc->smac, cqe->smac, ETH_ALEN);
++		wc->wc_flags |= IB_WC_WITH_SMAC;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index 036b663dd26e..39e11c7e7855 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -675,9 +675,6 @@ int __mlx4_ib_query_pkey(struct ib_device *ibdev, u8 port, u16 index,
+ int __mlx4_ib_query_gid(struct ib_device *ibdev, u8 port, int index,
+ 			union ib_gid *gid, int netw_view);
+ 
+-int mlx4_ib_resolve_grh(struct mlx4_ib_dev *dev, const struct ib_ah_attr *ah_attr,
+-			u8 *mac, int *is_mcast, u8 port);
+-
+ static inline bool mlx4_ib_ah_grh_present(struct mlx4_ib_ah *ah)
+ {
+ 	u8 port = be32_to_cpu(ah->av.ib.port_pd) >> 24 & 3;
+* Unmerged path drivers/infiniband/hw/mlx4/qp.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/port.c b/drivers/net/ethernet/mellanox/mlx4/port.c
+index 93f75ec78c82..a58bcbf1b806 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/port.c
+@@ -123,6 +123,26 @@ static int mlx4_set_port_mac_table(struct mlx4_dev *dev, u8 port,
+ 	return err;
+ }
+ 
++int mlx4_find_cached_mac(struct mlx4_dev *dev, u8 port, u64 mac, int *idx)
++{
++	struct mlx4_port_info *info = &mlx4_priv(dev)->port[port];
++	struct mlx4_mac_table *table = &info->mac_table;
++	int i;
++
++	for (i = 0; i < MLX4_MAX_MAC_NUM; i++) {
++		if (!table->refs[i])
++			continue;
++
++		if (mac == (MLX4_MAC_MASK & be64_to_cpu(table->entries[i]))) {
++			*idx = i;
++			return 0;
++		}
++	}
++
++	return -ENOENT;
++}
++EXPORT_SYMBOL_GPL(mlx4_find_cached_mac);
++
+ int __mlx4_register_mac(struct mlx4_dev *dev, u8 port, u64 mac)
+ {
+ 	struct mlx4_port_info *info = &mlx4_priv(dev)->port[port];
+diff --git a/include/linux/mlx4/cq.h b/include/linux/mlx4/cq.h
+index 5dd0d70a0689..e7ecc12a1163 100644
+--- a/include/linux/mlx4/cq.h
++++ b/include/linux/mlx4/cq.h
+@@ -34,6 +34,7 @@
+ #define MLX4_CQ_H
+ 
+ #include <linux/types.h>
++#include <uapi/linux/if_ether.h>
+ 
+ #include <linux/mlx4/device.h>
+ #include <linux/mlx4/doorbell.h>
+@@ -43,10 +44,15 @@ struct mlx4_cqe {
+ 	__be32			immed_rss_invalid;
+ 	__be32			g_mlpath_rqpn;
+ 	__be16			sl_vid;
+-	__be16			rlid;
+-	__be16			status;
+-	u8			ipv6_ext_mask;
+-	u8			badfcs_enc;
++	union {
++		struct {
++			__be16	rlid;
++			__be16  status;
++			u8      ipv6_ext_mask;
++			u8      badfcs_enc;
++		};
++		u8  smac[ETH_ALEN];
++	};
+ 	__be32			byte_cnt;
+ 	__be16			wqe_index;
+ 	__be16			checksum;
+@@ -88,6 +94,7 @@ enum {
+ 	MLX4_CQE_L2_TUNNEL_IPV4		= 1 << 25,
+ 
+ 	MLX4_CQE_QPN_MASK		= 0xffffff,
++	MLX4_CQE_VID_MASK		= 0xfff,
+ };
+ 
+ enum {
