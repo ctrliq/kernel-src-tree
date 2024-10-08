@@ -1,0 +1,161 @@
+perf/x86/intel: Save/restore LBR stack during context switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] x86/intel: Save/restore LBR stack during context switch (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 95.65%
+commit-author Yan, Zheng <zheng.z.yan@intel.com>
+commit 76cb2c617f12a4dd53c0e899972813b805ad6cc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/76cb2c61.failed
+
+When the LBR call stack is enabled, it is necessary to save/restore
+the LBR stack on context switch. The solution is saving/restoring
+the LBR stack to/from task's perf event context.
+
+The LBR stack is saved/restored only when there are events that use
+the LBR call stack. If no event uses LBR call stack, the LBR stack
+is reset when task is scheduled in.
+
+	Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: eranian@google.com
+	Cc: jolsa@redhat.com
+Link: http://lkml.kernel.org/r/1415156173-10035-10-git-send-email-kan.liang@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 76cb2c617f12a4dd53c0e899972813b805ad6cc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/perf_event_intel_lbr.c
+diff --cc arch/x86/kernel/cpu/perf_event_intel_lbr.c
+index 92348471a707,a8b3f236cf37..000000000000
+--- a/arch/x86/kernel/cpu/perf_event_intel_lbr.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_lbr.c
+@@@ -180,9 -180,116 +180,118 @@@ void intel_pmu_lbr_reset(void
+  		intel_pmu_lbr_reset_64();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * TOS = most recently recorded branch
++  */
++ static inline u64 intel_pmu_lbr_tos(void)
++ {
++ 	u64 tos;
++ 
++ 	rdmsrl(x86_pmu.lbr_tos, tos);
++ 	return tos;
++ }
++ 
++ enum {
++ 	LBR_NONE,
++ 	LBR_VALID,
++ };
++ 
++ static void __intel_pmu_lbr_restore(struct x86_perf_task_context *task_ctx)
++ {
++ 	int i;
++ 	unsigned lbr_idx, mask;
++ 	u64 tos;
++ 
++ 	if (task_ctx->lbr_callstack_users == 0 ||
++ 	    task_ctx->lbr_stack_state == LBR_NONE) {
++ 		intel_pmu_lbr_reset();
++ 		return;
++ 	}
++ 
++ 	mask = x86_pmu.lbr_nr - 1;
++ 	tos = intel_pmu_lbr_tos();
++ 	for (i = 0; i < x86_pmu.lbr_nr; i++) {
++ 		lbr_idx = (tos - i) & mask;
++ 		wrmsrl(x86_pmu.lbr_from + lbr_idx, task_ctx->lbr_from[i]);
++ 		wrmsrl(x86_pmu.lbr_to + lbr_idx, task_ctx->lbr_to[i]);
++ 	}
++ 	task_ctx->lbr_stack_state = LBR_NONE;
++ }
++ 
++ static void __intel_pmu_lbr_save(struct x86_perf_task_context *task_ctx)
++ {
++ 	int i;
++ 	unsigned lbr_idx, mask;
++ 	u64 tos;
++ 
++ 	if (task_ctx->lbr_callstack_users == 0) {
++ 		task_ctx->lbr_stack_state = LBR_NONE;
++ 		return;
++ 	}
++ 
++ 	mask = x86_pmu.lbr_nr - 1;
++ 	tos = intel_pmu_lbr_tos();
++ 	for (i = 0; i < x86_pmu.lbr_nr; i++) {
++ 		lbr_idx = (tos - i) & mask;
++ 		rdmsrl(x86_pmu.lbr_from + lbr_idx, task_ctx->lbr_from[i]);
++ 		rdmsrl(x86_pmu.lbr_to + lbr_idx, task_ctx->lbr_to[i]);
++ 	}
++ 	task_ctx->lbr_stack_state = LBR_VALID;
++ }
++ 
++ void intel_pmu_lbr_sched_task(struct perf_event_context *ctx, bool sched_in)
++ {
++ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++ 	struct x86_perf_task_context *task_ctx;
++ 
++ 	if (!x86_pmu.lbr_nr)
++ 		return;
++ 
++ 	/*
++ 	 * If LBR callstack feature is enabled and the stack was saved when
++ 	 * the task was scheduled out, restore the stack. Otherwise flush
++ 	 * the LBR stack.
++ 	 */
++ 	task_ctx = ctx ? ctx->task_ctx_data : NULL;
++ 	if (task_ctx) {
++ 		if (sched_in) {
++ 			__intel_pmu_lbr_restore(task_ctx);
++ 			cpuc->lbr_context = ctx;
++ 		} else {
++ 			__intel_pmu_lbr_save(task_ctx);
++ 		}
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * When sampling the branck stack in system-wide, it may be
++ 	 * necessary to flush the stack on context switch. This happens
++ 	 * when the branch stack does not tag its entries with the pid
++ 	 * of the current task. Otherwise it becomes impossible to
++ 	 * associate a branch entry with a task. This ambiguity is more
++ 	 * likely to appear when the branch stack supports priv level
++ 	 * filtering and the user sets it to monitor only at the user
++ 	 * level (which could be a useful measurement in system-wide
++ 	 * mode). In that case, the risk is high of having a branch
++ 	 * stack with branch from multiple tasks.
++  	 */
++ 	if (sched_in) {
++ 		intel_pmu_lbr_reset();
++ 		cpuc->lbr_context = ctx;
++ 	}
++ }
++ 
++ static inline bool branch_user_callstack(unsigned br_sel)
++ {
++ 	return (br_sel & X86_BR_USER) && (br_sel & X86_BR_CALL_STACK);
++ }
++ 
+++>>>>>>> 76cb2c617f12 (perf/x86/intel: Save/restore LBR stack during context switch)
+  void intel_pmu_lbr_enable(struct perf_event *event)
+  {
+ -	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ -	struct x86_perf_task_context *task_ctx;
+ +	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
+  
+  	if (!x86_pmu.lbr_nr)
+  		return;
+* Unmerged path arch/x86/kernel/cpu/perf_event_intel_lbr.c
