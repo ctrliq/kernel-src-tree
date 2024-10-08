@@ -1,0 +1,165 @@
+netfilter: nf_tables: return set extensions from ->lookup()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit b2832dd6621bf73eb8ad38389a94bd83a5983886
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b2832dd6.failed
+
+Return the extension area from the ->lookup() function to allow to
+consolidate common actions.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit b2832dd6621bf73eb8ad38389a94bd83a5983886)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_hash.c
+#	net/netfilter/nft_rbtree.c
+diff --cc net/netfilter/nft_hash.c
+index f14a5e14123a,5bee82195ef5..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -23,22 -23,61 +23,28 @@@
+  /* We target a hash table size of 4, element hint is 75% of final size */
+  #define NFT_HASH_ELEMENT_HINT 3
+  
+ -struct nft_hash {
+ -	struct rhashtable		ht;
+ -};
+ -
+  struct nft_hash_elem {
+  	struct rhash_head		node;
+ -	struct nft_set_ext		ext;
+ -};
+ -
+ -struct nft_hash_cmp_arg {
+ -	const struct nft_set		*set;
+ -	const struct nft_data		*key;
+ +	struct nft_data			key;
+ +	struct nft_data			data[];
+  };
+  
+ -static const struct rhashtable_params nft_hash_params;
+ -
+ -static inline u32 nft_hash_key(const void *data, u32 len, u32 seed)
+ -{
+ -	const struct nft_hash_cmp_arg *arg = data;
+ -
+ -	return jhash(arg->key, len, seed);
+ -}
+ -
+ -static inline u32 nft_hash_obj(const void *data, u32 len, u32 seed)
+ -{
+ -	const struct nft_hash_elem *he = data;
+ -
+ -	return jhash(nft_set_ext_key(&he->ext), len, seed);
+ -}
+ -
+ -static inline int nft_hash_cmp(struct rhashtable_compare_arg *arg,
+ -			       const void *ptr)
+ -{
+ -	const struct nft_hash_cmp_arg *x = arg->key;
+ -	const struct nft_hash_elem *he = ptr;
+ -
+ -	if (nft_data_cmp(nft_set_ext_key(&he->ext), x->key, x->set->klen))
+ -		return 1;
+ -	return 0;
+ -}
+ -
+  static bool nft_hash_lookup(const struct nft_set *set,
+  			    const struct nft_data *key,
+- 			    struct nft_data *data)
++ 			    const struct nft_set_ext **ext)
+  {
+ -	struct nft_hash *priv = nft_set_priv(set);
+ +	const struct rhashtable *priv = nft_set_priv(set);
+  	const struct nft_hash_elem *he;
+ -	struct nft_hash_cmp_arg arg = {
+ -		.set	 = set,
+ -		.key	 = key,
+ -	};
+  
+++<<<<<<< HEAD
+ +	he = rhashtable_lookup(priv, key);
+ +	if (he && set->flags & NFT_SET_MAP)
+ +		nft_data_copy(data, he->data);
+++=======
++ 	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
++ 	if (he != NULL)
++ 		*ext = &he->ext;
+++>>>>>>> b2832dd6621b (netfilter: nf_tables: return set extensions from ->lookup())
+  
+  	return !!he;
+  }
+diff --cc net/netfilter/nft_rbtree.c
+index 2c75361077f7,cbba755ebebc..000000000000
+--- a/net/netfilter/nft_rbtree.c
++++ b/net/netfilter/nft_rbtree.c
+@@@ -53,12 -51,13 +53,17 @@@ static bool nft_rbtree_lookup(const str
+  			parent = parent->rb_right;
+  		else {
+  found:
+ -			if (nft_set_ext_exists(&rbe->ext, NFT_SET_EXT_FLAGS) &&
+ -			    *nft_set_ext_flags(&rbe->ext) &
+ -			    NFT_SET_ELEM_INTERVAL_END)
+ +			if (rbe->flags & NFT_SET_ELEM_INTERVAL_END)
+  				goto out;
+++<<<<<<< HEAD
+ +			if (set->flags & NFT_SET_MAP)
+ +				nft_data_copy(data, rbe->data);
+ +
+++=======
+++>>>>>>> b2832dd6621b (netfilter: nf_tables: return set extensions from ->lookup())
+  			spin_unlock_bh(&nft_rbtree_lock);
++ 
++ 			*ext = &rbe->ext;
+  			return true;
+  		}
+  	}
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index b84b4f62eade..30926cfa2d4e 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -201,6 +201,8 @@ struct nft_set_estimate {
+ 	enum nft_set_class	class;
+ };
+ 
++struct nft_set_ext;
++
+ /**
+  *	struct nft_set_ops - nf_tables set operations
+  *
+@@ -218,7 +220,7 @@ struct nft_set_estimate {
+ struct nft_set_ops {
+ 	bool				(*lookup)(const struct nft_set *set,
+ 						  const struct nft_data *key,
+-						  struct nft_data *data);
++						  const struct nft_set_ext **ext);
+ 	int				(*get)(const struct nft_set *set,
+ 					       struct nft_set_elem *elem);
+ 	int				(*insert)(const struct nft_set *set,
+* Unmerged path net/netfilter/nft_hash.c
+diff --git a/net/netfilter/nft_lookup.c b/net/netfilter/nft_lookup.c
+index 9615b8b9fb37..a5f30b8760ea 100644
+--- a/net/netfilter/nft_lookup.c
++++ b/net/netfilter/nft_lookup.c
+@@ -31,9 +31,13 @@ static void nft_lookup_eval(const struct nft_expr *expr,
+ {
+ 	const struct nft_lookup *priv = nft_expr_priv(expr);
+ 	const struct nft_set *set = priv->set;
++	const struct nft_set_ext *ext;
+ 
+-	if (set->ops->lookup(set, &data[priv->sreg], &data[priv->dreg]))
++	if (set->ops->lookup(set, &data[priv->sreg], &ext)) {
++		if (set->flags & NFT_SET_MAP)
++			nft_data_copy(&data[priv->dreg], nft_set_ext_data(ext));
+ 		return;
++	}
+ 	data[NFT_REG_VERDICT].verdict = NFT_BREAK;
+ }
+ 
+* Unmerged path net/netfilter/nft_rbtree.c
