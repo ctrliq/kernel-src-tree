@@ -1,0 +1,258 @@
+perf probe: Support distro-style debuginfo for uprobe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf/probe: Support distro-style debuginfo for uprobe (Jiri Olsa) [1134356]
+Rebuild_FUZZ: 98.11%
+commit-author Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+commit a15ad2f5360c821f030c53266ebf467738249c68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a15ad2f5.failed
+
+Support distro-style debuginfo supported by dso for setting uprobes.
+Note that this tries to find a debuginfo file based on the real path of
+the target binary. If the debuginfo is not correctly installed on the
+system, this can not find it.
+
+	Signed-off-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: "David A. Long" <dave.long@linaro.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: yrl.pp-manager.tt@hitachi.com
+Link: http://lkml.kernel.org/r/20140206053227.29635.54434.stgit@kbuild-fedora.yrl.intra.hitachi.co.jp
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit a15ad2f5360c821f030c53266ebf467738249c68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/probe-event.c
+#	tools/perf/util/probe-finder.c
+diff --cc tools/perf/util/probe-event.c
+index 1c9c96559614,0d1542f33d87..000000000000
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@@ -186,21 -245,18 +186,26 @@@ static int init_user_exec(void
+  	return ret;
+  }
+  
+ -static void clear_probe_trace_events(struct probe_trace_event *tevs, int ntevs)
+ +static int convert_to_perf_probe_point(struct probe_trace_point *tp,
+ +					struct perf_probe_point *pp)
+  {
+ -	int i;
+ +	pp->function = strdup(tp->symbol);
+  
+ -	for (i = 0; i < ntevs; i++)
+ -		clear_probe_trace_event(tevs + i);
+ +	if (pp->function == NULL)
+ +		return -ENOMEM;
+ +
+ +	pp->offset = tp->offset;
+ +	pp->retprobe = tp->retprobe;
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef DWARF_SUPPORT
+++=======
++ #ifdef HAVE_DWARF_SUPPORT
++ 
+++>>>>>>> a15ad2f5360c (perf probe: Support distro-style debuginfo for uprobe)
+  /* Open new debuginfo of given module */
+  static struct debuginfo *open_debuginfo(const char *module)
+  {
+diff --cc tools/perf/util/probe-finder.c
+index cc3411b9db28,df0238654698..000000000000
+--- a/tools/perf/util/probe-finder.c
++++ b/tools/perf/util/probe-finder.c
+@@@ -89,113 -90,60 +90,163 @@@ error
+  	return -ENOENT;
+  }
+  
+++<<<<<<< HEAD
+ +#if _ELFUTILS_PREREQ(0, 148)
+ +/* This method is buggy if elfutils is older than 0.148 */
+ +static int __linux_kernel_find_elf(Dwfl_Module *mod,
+ +				   void **userdata,
+ +				   const char *module_name,
+ +				   Dwarf_Addr base,
+ +				   char **file_name, Elf **elfp)
+++=======
++ static struct debuginfo *__debuginfo__new(const char *path)
+++>>>>>>> a15ad2f5360c (perf probe: Support distro-style debuginfo for uprobe)
+  {
+ -	struct debuginfo *dbg = zalloc(sizeof(*dbg));
+ -	if (!dbg)
+ -		return NULL;
+ +	int fd;
+ +	const char *path = kernel_get_module_path(module_name);
+ +
+++<<<<<<< HEAD
+ +	pr_debug2("Use file %s for %s\n", path, module_name);
+ +	if (path) {
+ +		fd = open(path, O_RDONLY);
+ +		if (fd >= 0) {
+ +			*file_name = strdup(path);
+ +			return fd;
+ +		}
+ +	}
+ +	/* If failed, try to call standard method */
+ +	return dwfl_linux_kernel_find_elf(mod, userdata, module_name, base,
+ +					  file_name, elfp);
+ +}
+  
+ +static const Dwfl_Callbacks kernel_callbacks = {
+ +	.find_debuginfo = dwfl_standard_find_debuginfo,
+ +	.debuginfo_path = &debuginfo_path,
+ +
+ +	.find_elf = __linux_kernel_find_elf,
+ +	.section_address = dwfl_linux_kernel_module_section_address,
+ +};
+ +
+ +/* Get a Dwarf from live kernel image */
+ +static int debuginfo__init_online_kernel_dwarf(struct debuginfo *self,
+ +					       Dwarf_Addr addr)
+++=======
++ 	if (debuginfo__init_offline_dwarf(dbg, path) < 0)
++ 		zfree(&dbg);
++ 	if (dbg)
++ 		pr_debug("Open Debuginfo file: %s\n", path);
++ 	return dbg;
++ }
++ 
++ enum dso_binary_type distro_dwarf_types[] = {
++ 	DSO_BINARY_TYPE__FEDORA_DEBUGINFO,
++ 	DSO_BINARY_TYPE__UBUNTU_DEBUGINFO,
++ 	DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO,
++ 	DSO_BINARY_TYPE__BUILDID_DEBUGINFO,
++ 	DSO_BINARY_TYPE__NOT_FOUND,
++ };
++ 
++ struct debuginfo *debuginfo__new(const char *path)
++ {
++ 	enum dso_binary_type *type;
++ 	char buf[PATH_MAX], nil = '\0';
++ 	struct dso *dso;
++ 	struct debuginfo *dinfo = NULL;
++ 
++ 	/* Try to open distro debuginfo files */
++ 	dso = dso__new(path);
++ 	if (!dso)
++ 		goto out;
++ 
++ 	for (type = distro_dwarf_types;
++ 	     !dinfo && *type != DSO_BINARY_TYPE__NOT_FOUND;
++ 	     type++) {
++ 		if (dso__read_binary_type_filename(dso, *type, &nil,
++ 						   buf, PATH_MAX) < 0)
++ 			continue;
++ 		dinfo = __debuginfo__new(buf);
++ 	}
++ 	dso__delete(dso);
++ 
++ out:
++ 	/* if failed to open all distro debuginfo, open given binary */
++ 	return dinfo ? : __debuginfo__new(path);
++ }
++ 
++ void debuginfo__delete(struct debuginfo *dbg)
+++>>>>>>> a15ad2f5360c (perf probe: Support distro-style debuginfo for uprobe)
+ +{
+ +	self->dwfl = dwfl_begin(&kernel_callbacks);
+ +	if (!self->dwfl)
+ +		return -EINVAL;
+ +
+ +	/* Load the kernel dwarves: Don't care the result here */
+ +	dwfl_linux_kernel_report_kernel(self->dwfl);
+ +	dwfl_linux_kernel_report_modules(self->dwfl);
+ +
+ +	self->dbg = dwfl_addrdwarf(self->dwfl, addr, &self->bias);
+ +	/* Here, check whether we could get a real dwarf */
+ +	if (!self->dbg) {
+ +		pr_debug("Failed to find kernel dwarf at %lx\n",
+ +			 (unsigned long)addr);
+ +		dwfl_end(self->dwfl);
+ +		memset(self, 0, sizeof(*self));
+ +		return -ENOENT;
+ +	}
+ +
+ +	return 0;
+ +}
+ +#else
+ +/* With older elfutils, this just support kernel module... */
+ +static int debuginfo__init_online_kernel_dwarf(struct debuginfo *self,
+ +					       Dwarf_Addr addr __maybe_unused)
+ +{
+ +	const char *path = kernel_get_module_path("kernel");
+ +
+ +	if (!path) {
+ +		pr_err("Failed to find vmlinux path\n");
+ +		return -ENOENT;
+ +	}
+ +
+ +	pr_debug2("Use file %s for debuginfo\n", path);
+ +	return debuginfo__init_offline_dwarf(self, path);
+ +}
+ +#endif
+ +
+ +struct debuginfo *debuginfo__new(const char *path)
+ +{
+ +	struct debuginfo *self = zalloc(sizeof(struct debuginfo));
+ +	if (!self)
+ +		return NULL;
+ +
+ +	if (debuginfo__init_offline_dwarf(self, path) < 0) {
+ +		free(self);
+ +		self = NULL;
+ +	}
+ +
+ +	return self;
+ +}
+ +
+ +struct debuginfo *debuginfo__new_online_kernel(unsigned long addr)
+ +{
+ +	struct debuginfo *self = zalloc(sizeof(struct debuginfo));
+ +	if (!self)
+ +		return NULL;
+ +
+ +	if (debuginfo__init_online_kernel_dwarf(self, (Dwarf_Addr)addr) < 0) {
+ +		free(self);
+ +		self = NULL;
+ +	}
+ +
+ +	return self;
+ +}
+ +
+ +void debuginfo__delete(struct debuginfo *self)
+  {
+ -	if (dbg) {
+ -		if (dbg->dwfl)
+ -			dwfl_end(dbg->dwfl);
+ -		free(dbg);
+ +	if (self) {
+ +		if (self->dwfl)
+ +			dwfl_end(self->dwfl);
+ +		free(self);
+  	}
+  }
+  
+* Unmerged path tools/perf/util/probe-event.c
+* Unmerged path tools/perf/util/probe-finder.c
+diff --git a/tools/perf/util/probe-finder.h b/tools/perf/util/probe-finder.h
+index 1bb36fdb4e50..fc58c5ae0464 100644
+--- a/tools/perf/util/probe-finder.h
++++ b/tools/perf/util/probe-finder.h
+@@ -30,6 +30,7 @@ struct debuginfo {
+ 	Dwarf_Addr	bias;
+ };
+ 
++/* This also tries to open distro debuginfo */
+ extern struct debuginfo *debuginfo__new(const char *path);
+ extern struct debuginfo *debuginfo__new_online_kernel(unsigned long addr);
+ extern void debuginfo__delete(struct debuginfo *self);
