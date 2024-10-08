@@ -1009,6 +1009,7 @@ static int vhost_update_avail_event(struct vhost_virtqueue *vq, u16 avail_event)
 
 int vhost_init_used(struct vhost_virtqueue *vq)
 {
+	u16 last_used_idx;
 	int r;
 	if (!vq->private_data)
 		return 0;
@@ -1017,7 +1018,13 @@ int vhost_init_used(struct vhost_virtqueue *vq)
 	if (r)
 		return r;
 	vq->signalled_used_valid = false;
-	return get_user(vq->last_used_idx, &vq->used->idx);
+	if (!access_ok(VERIFY_READ, &vq->used->idx, sizeof vq->used->idx))
+		return -EFAULT;
+	r = __get_user(last_used_idx, &vq->used->idx);
+	if (r)
+		return r;
+	vq->last_used_idx = last_used_idx;
+	return 0;
 }
 
 static int translate_desc(struct vhost_dev *dev, u64 addr, u32 len,
@@ -1374,7 +1381,7 @@ int vhost_add_used_n(struct vhost_virtqueue *vq, struct vring_used_elem *heads,
 
 	/* Make sure buffer is written before we update index. */
 	smp_wmb();
-	if (put_user(vq->last_used_idx, &vq->used->idx)) {
+	if (__put_user(vq->last_used_idx, &vq->used->idx)) {
 		vq_err(vq, "Failed to increment used idx");
 		return -EFAULT;
 	}
@@ -1418,7 +1425,7 @@ static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
 	if (unlikely(!v))
 		return true;
 
-	if (get_user(event, vhost_used_event(vq))) {
+	if (__get_user(event, vhost_used_event(vq))) {
 		vq_err(vq, "Failed to get used event idx");
 		return true;
 	}
