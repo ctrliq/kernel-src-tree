@@ -7919,8 +7919,6 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 
 	enter_guest_mode(vcpu);
 
-	vmx->nested.nested_run_pending = 1;
-
 	vmx->nested.vmcs01_tsc_offset = vmcs_read64(TSC_OFFSET);
 
 	cpu = get_cpu();
@@ -7938,6 +7936,8 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 
 	if (vmcs12->guest_activity_state == GUEST_ACTIVITY_HLT)
 		return kvm_emulate_halt(vcpu);
+
+	vmx->nested.nested_run_pending = 1;
 
 	/*
 	 * Note no nested_vmx_succeed or nested_vmx_fail here. At this point
