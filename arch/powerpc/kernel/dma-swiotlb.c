@@ -112,16 +112,13 @@ void swiotlb_detect_4g(void)
 		ppc_swiotlb_enable = 1;
 }
 
-static int __init swiotlb_late_init(void)
+static int __init check_swiotlb_enabled(void)
 {
-	if (ppc_swiotlb_enable) {
+	if (ppc_swiotlb_enable)
 		swiotlb_print_info();
-		set_pci_dma_ops(&swiotlb_dma_ops);
-		ppc_md.pci_dma_dev_setup = pci_dma_dev_setup_swiotlb;
-	} else {
+	else
 		swiotlb_free();
-	}
 
 	return 0;
 }
-subsys_initcall(swiotlb_late_init);
+subsys_initcall(check_swiotlb_enabled);
