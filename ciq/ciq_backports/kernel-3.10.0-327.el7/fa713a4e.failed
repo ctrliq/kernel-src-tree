@@ -1,0 +1,344 @@
+perf ordered_events: Untangle from perf_session
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] ordered_events: Untangle from perf_session (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 94.38%
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit fa713a4eb9cebe5dec71b1bd11429603e17d841d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fa713a4e.failed
+
+For use by tools that are not perf.data based, as maybe 'perf trace' in
+live mode.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Don Zickus <dzickus@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/n/tip-nedqe7cmii5w82etfi36urfz@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit fa713a4eb9cebe5dec71b1bd11429603e17d841d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/ordered-events.c
+#	tools/perf/util/ordered-events.h
+#	tools/perf/util/session.c
+#	tools/perf/util/session.h
+diff --cc tools/perf/util/session.c
+index 647c690afe48,23be146bd2fc..000000000000
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@@ -623,107 -512,109 +623,124 @@@ static int process_finished_round(struc
+  				  union perf_event *event __maybe_unused,
+  				  struct perf_session *session)
+  {
+- 	return ordered_events__flush(session, tool, OE_FLUSH__ROUND);
++ 	struct ordered_events *oe = &session->ordered_events;
++ 	struct perf_evlist *evlist = session->evlist;
++ 	struct machines *machines = &session->machines;
++ 
++ 	return ordered_events__flush(oe, machines, evlist, tool, OE_FLUSH__ROUND);
+  }
+  
+ +/* The queue is ordered by time */
+ +static void __queue_event(struct ordered_event *new, struct perf_session *s)
+ +{
+ +	struct ordered_events *oe = &s->ordered_events;
+++<<<<<<< HEAD
+ +	struct ordered_event *last = oe->last;
+ +	u64 timestamp = new->timestamp;
+ +	struct list_head *p;
+ +
+ +	++oe->nr_events;
+ +	oe->last = new;
+ +
+ +	if (!last) {
+ +		list_add(&new->list, &oe->events);
+ +		oe->max_timestamp = timestamp;
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * last event might point to some random place in the list as it's
+ +	 * the last queued event. We expect that the new event is close to
+ +	 * this.
+ +	 */
+ +	if (last->timestamp <= timestamp) {
+ +		while (last->timestamp <= timestamp) {
+ +			p = last->list.next;
+ +			if (p == &oe->events) {
+ +				list_add_tail(&new->list, &oe->events);
+ +				oe->max_timestamp = timestamp;
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add_tail(&new->list, &last->list);
+ +	} else {
+ +		while (last->timestamp > timestamp) {
+ +			p = last->list.prev;
+ +			if (p == &oe->events) {
+ +				list_add(&new->list, &oe->events);
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add(&new->list, &last->list);
+ +	}
+ +}
+ +
+ +#define MAX_SAMPLE_BUFFER	(64 * 1024 / sizeof(struct ordered_event))
+ +
+  int perf_session_queue_event(struct perf_session *s, union perf_event *event,
+ -			     struct perf_tool *tool, struct perf_sample *sample,
+ -			     u64 file_offset)
+ +				    struct perf_sample *sample, u64 file_offset)
+  {
+  	struct ordered_events *oe = &s->ordered_events;
+ +	struct list_head *cache = &oe->cache;
+++=======
++ 	struct perf_evlist *evlist = s->evlist;
++ 	struct machines *machines = &s->machines;
++ 
+++>>>>>>> fa713a4eb9ce (perf ordered_events: Untangle from perf_session)
+  	u64 timestamp = sample->time;
+  	struct ordered_event *new;
+  
+  	if (!timestamp || timestamp == ~0ULL)
+  		return -ETIME;
+  
+ -	if (timestamp < oe->last_flush) {
+ -		pr_oe_time(timestamp,      "out of order event\n");
+ -		pr_oe_time(oe->last_flush, "last flush, last_flush_type %d\n",
+ -			   oe->last_flush_type);
+ -
+ -		s->evlist->stats.nr_unordered_events++;
+ +	if (timestamp < s->ordered_events.last_flush) {
+ +		printf("Warning: Timestamp below last timeslice flush\n");
+ +		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!list_empty(cache)) {
+ +		new = list_entry(cache->next, struct ordered_event, list);
+ +		list_del(&new->list);
+ +	} else if (oe->buffer) {
+ +		new = oe->buffer + oe->buffer_idx;
+ +		if (++oe->buffer_idx == MAX_SAMPLE_BUFFER)
+ +			oe->buffer = NULL;
+ +	} else {
+ +		oe->buffer = malloc(MAX_SAMPLE_BUFFER * sizeof(*new));
+ +		if (!oe->buffer)
+ +			return -ENOMEM;
+ +		list_add(&oe->buffer->list, &oe->to_free);
+ +		oe->buffer_idx = 2;
+ +		new = oe->buffer + 1;
+++=======
++ 	new = ordered_events__new(oe, timestamp, event);
++ 	if (!new) {
++ 		ordered_events__flush(oe, machines, evlist, tool, OE_FLUSH__HALF);
++ 		new = ordered_events__new(oe, timestamp, event);
+++>>>>>>> fa713a4eb9ce (perf ordered_events: Untangle from perf_session)
+  	}
+  
+ -	if (!new)
+ -		return -ENOMEM;
+ -
+ +	new->timestamp = timestamp;
+  	new->file_offset = file_offset;
+ -	return 0;
+ -}
+ -
+ -static void callchain__lbr_callstack_printf(struct perf_sample *sample)
+ -{
+ -	struct ip_callchain *callchain = sample->callchain;
+ -	struct branch_stack *lbr_stack = sample->branch_stack;
+ -	u64 kernel_callchain_nr = callchain->nr;
+ -	unsigned int i;
+ -
+ -	for (i = 0; i < kernel_callchain_nr; i++) {
+ -		if (callchain->ips[i] == PERF_CONTEXT_USER)
+ -			break;
+ -	}
+ -
+ -	if ((i != kernel_callchain_nr) && lbr_stack->nr) {
+ -		u64 total_nr;
+ -		/*
+ -		 * LBR callstack can only get user call chain,
+ -		 * i is kernel call chain number,
+ -		 * 1 is PERF_CONTEXT_USER.
+ -		 *
+ -		 * The user call chain is stored in LBR registers.
+ -		 * LBR are pair registers. The caller is stored
+ -		 * in "from" register, while the callee is stored
+ -		 * in "to" register.
+ -		 * For example, there is a call stack
+ -		 * "A"->"B"->"C"->"D".
+ -		 * The LBR registers will recorde like
+ -		 * "C"->"D", "B"->"C", "A"->"B".
+ -		 * So only the first "to" register and all "from"
+ -		 * registers are needed to construct the whole stack.
+ -		 */
+ -		total_nr = i + 1 + lbr_stack->nr + 1;
+ -		kernel_callchain_nr = i + 1;
+ -
+ -		printf("... LBR call chain: nr:%" PRIu64 "\n", total_nr);
+ +	new->event = event;
+  
+ -		for (i = 0; i < kernel_callchain_nr; i++)
+ -			printf("..... %2d: %016" PRIx64 "\n",
+ -			       i, callchain->ips[i]);
+ +	__queue_event(new, s);
+  
+ -		printf("..... %2d: %016" PRIx64 "\n",
+ -		       (int)(kernel_callchain_nr), lbr_stack->entries[0].to);
+ -		for (i = 0; i < lbr_stack->nr; i++)
+ -			printf("..... %2d: %016" PRIx64 "\n",
+ -			       (int)(i + kernel_callchain_nr + 1), lbr_stack->entries[i].from);
+ -	}
+ +	return 0;
+  }
+  
+ -static void callchain__printf(struct perf_evsel *evsel,
+ -			      struct perf_sample *sample)
+ +static void callchain__printf(struct perf_sample *sample)
+  {
+  	unsigned int i;
+ -	struct ip_callchain *callchain = sample->callchain;
+  
+ -	if (has_branch_callstack(evsel))
+ -		callchain__lbr_callstack_printf(sample);
+ +	printf("... chain: nr:%" PRIu64 "\n", sample->callchain->nr);
+  
+ -	printf("... FP chain: nr:%" PRIu64 "\n", callchain->nr);
+ -
+ -	for (i = 0; i < callchain->nr; i++)
+ +	for (i = 0; i < sample->callchain->nr; i++)
+  		printf("..... %2d: %016" PRIx64 "\n",
+ -		       i, callchain->ips[i]);
+ +		       i, sample->callchain->ips[i]);
+  }
+  
+  static void branch_stack__printf(struct perf_sample *sample)
+@@@ -1003,20 -893,20 +1020,28 @@@ perf_session__deliver_sample(struct per
+  					    &sample->read.one, machine);
+  }
+  
+++<<<<<<< HEAD
+ +static int perf_session_deliver_event(struct perf_session *session,
+ +				      union perf_event *event,
+ +				      struct perf_sample *sample,
+ +				      struct perf_tool *tool,
+ +				      u64 file_offset)
+++=======
++ int machines__deliver_event(struct machines *machines,
++ 				struct perf_evlist *evlist,
++ 				union perf_event *event,
++ 				struct perf_sample *sample,
++ 				struct perf_tool *tool, u64 file_offset)
+++>>>>>>> fa713a4eb9ce (perf ordered_events: Untangle from perf_session)
+  {
+  	struct perf_evsel *evsel;
+  	struct machine *machine;
+  
+  	dump_event(evlist, event, file_offset, sample);
+  
+ -	evsel = perf_evlist__id2evsel(evlist, sample->id);
+ +	evsel = perf_evlist__id2evsel(session->evlist, sample->id);
+  
+- 	machine = machines__find_for_cpumode(&session->machines, event, sample);
++ 	machine = machines__find_for_cpumode(machines, event, sample);
+  
+  	switch (event->header.type) {
+  	case PERF_RECORD_SAMPLE:
+@@@ -1102,7 -991,9 +1127,13 @@@ int perf_session__deliver_synth_event(s
+  				      struct perf_sample *sample,
+  				      struct perf_tool *tool)
+  {
+++<<<<<<< HEAD
+ +	events_stats__inc(&session->stats, event->header.type);
+++=======
++ 	struct perf_evlist *evlist = session->evlist;
++ 
++ 	events_stats__inc(&evlist->stats, event->header.type);
+++>>>>>>> fa713a4eb9ce (perf ordered_events: Untangle from perf_session)
+  
+  	if (event->header.type >= PERF_RECORD_USER_TYPE_START)
+  		return perf_session__process_user_event(session, event, tool, 0);
+@@@ -1207,8 -1099,8 +1238,13 @@@ static s64 perf_session__process_event(
+  			return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	return perf_session_deliver_event(session, event, &sample, tool,
+ +					  file_offset);
+++=======
++ 	return machines__deliver_event(&session->machines, evlist, event,
++ 				       &sample, tool, file_offset);
+++>>>>>>> fa713a4eb9ce (perf ordered_events: Untangle from perf_session)
+  }
+  
+  void perf_event_header__bswap(struct perf_event_header *hdr)
+@@@ -1360,11 -1258,11 +1399,11 @@@ more
+  		goto more;
+  done:
+  	/* do the final flush for ordered samples */
+- 	err = ordered_events__flush(session, tool, OE_FLUSH__FINAL);
++ 	err = ordered_events__flush(oe, machines, evlist, tool, OE_FLUSH__FINAL);
+  out_err:
+  	free(buf);
+ -	perf_tool__warn_about_errors(tool, &session->evlist->stats);
+ -	ordered_events__free(&session->ordered_events);
+ +	perf_session__warn_about_errors(session, tool);
+ +	perf_session_free_sample_buffers(session);
+  	return err;
+  }
+  
+@@@ -1505,11 -1406,11 +1547,11 @@@ more
+  
+  out:
+  	/* do the final flush for ordered samples */
+- 	err = ordered_events__flush(session, tool, OE_FLUSH__FINAL);
++ 	err = ordered_events__flush(oe, machines, evlist, tool, OE_FLUSH__FINAL);
+  out_err:
+  	ui_progress__finish();
+ -	perf_tool__warn_about_errors(tool, &session->evlist->stats);
+ -	ordered_events__free(&session->ordered_events);
+ +	perf_session__warn_about_errors(session, tool);
+ +	perf_session_free_sample_buffers(session);
+  	session->one_mmap = false;
+  	return err;
+  }
+diff --cc tools/perf/util/session.h
+index 4c0f5b098c9f,c08fa6be5bf3..000000000000
+--- a/tools/perf/util/session.h
++++ b/tools/perf/util/session.h
+@@@ -70,6 -57,12 +70,15 @@@ int perf_session_queue_event(struct per
+  
+  void perf_tool__fill_defaults(struct perf_tool *tool);
+  
+++<<<<<<< HEAD
+++=======
++ int machines__deliver_event(struct machines *machines,
++ 				struct perf_evlist *evlist,
++ 				union perf_event *event,
++ 				struct perf_sample *sample,
++ 				struct perf_tool *tool, u64 file_offset);
++ 
+++>>>>>>> fa713a4eb9ce (perf ordered_events: Untangle from perf_session)
+  int perf_session__resolve_callchain(struct perf_session *session,
+  				    struct perf_evsel *evsel,
+  				    struct thread *thread,
+* Unmerged path tools/perf/util/ordered-events.c
+* Unmerged path tools/perf/util/ordered-events.h
+* Unmerged path tools/perf/util/ordered-events.c
+* Unmerged path tools/perf/util/ordered-events.h
+* Unmerged path tools/perf/util/session.c
+* Unmerged path tools/perf/util/session.h
