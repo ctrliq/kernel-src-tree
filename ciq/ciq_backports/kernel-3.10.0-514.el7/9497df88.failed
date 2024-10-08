@@ -1,0 +1,192 @@
+rhashtable: Fix reader/rehash race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 9497df88ab5567daa001829051c5f87161a81ff0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9497df88.failed
+
+There is a potential race condition between readers and the rehasher.
+In particular, the rehasher could have started a rehash while the
+reader finishes a scan of the old table but fails to see the new
+table pointer.
+
+This patch closes this window by adding smp_wmb/smp_rmb.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9497df88ab5567daa001829051c5f87161a81ff0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index 6d0c4774001c,68210cc2bab8..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -136,54 -191,102 +136,75 @@@ EXPORT_SYMBOL_GPL(rht_grow_above_75)
+   * @ht:		hash table
+   * @new_size:	new table size
+   */
+ -static bool rht_shrink_below_30(const struct rhashtable *ht, size_t new_size)
+ +bool rht_shrink_below_30(const struct rhashtable *ht, size_t new_size)
+  {
+  	/* Shrink table beneath 30% load */
+ -	return atomic_read(&ht->nelems) < (new_size * 3 / 10) &&
+ -	       (atomic_read(&ht->shift) > ht->p.min_shift);
+ -}
+ -
+ -static int rhashtable_rehash_one(struct rhashtable *ht, unsigned old_hash)
+ -{
+ -	struct bucket_table *new_tbl = rht_dereference(ht->future_tbl, ht);
+ -	struct bucket_table *old_tbl = rht_dereference(ht->tbl, ht);
+ -	struct rhash_head __rcu **pprev = &old_tbl->buckets[old_hash];
+ -	int err = -ENOENT;
+ -	struct rhash_head *head, *next, *entry;
+ -	spinlock_t *new_bucket_lock;
+ -	unsigned new_hash;
+ -
+ -	rht_for_each(entry, old_tbl, old_hash) {
+ -		err = 0;
+ -		next = rht_dereference_bucket(entry->next, old_tbl, old_hash);
+ -
+ -		if (rht_is_a_nulls(next))
+ -			break;
+ -
+ -		pprev = &entry->next;
+ -	}
+ -
+ -	if (err)
+ -		goto out;
+ -
+ -	new_hash = head_hashfn(ht, new_tbl, entry);
+ -
+ -	new_bucket_lock = bucket_lock(new_tbl, new_hash);
+ -
+ -	spin_lock_nested(new_bucket_lock, RHT_LOCK_NESTED);
+ -	head = rht_dereference_bucket(new_tbl->buckets[new_hash],
+ -				      new_tbl, new_hash);
+ -
+ -	if (rht_is_a_nulls(head))
+ -		INIT_RHT_NULLS_HEAD(entry->next, ht, new_hash);
+ -	else
+ -		RCU_INIT_POINTER(entry->next, head);
+ -
+ -	rcu_assign_pointer(new_tbl->buckets[new_hash], entry);
+ -	spin_unlock(new_bucket_lock);
+ -
+ -	rcu_assign_pointer(*pprev, next);
+ -
+ -out:
+ -	return err;
+ +	return ht->nelems < (new_size * 3 / 10);
+  }
+ +EXPORT_SYMBOL_GPL(rht_shrink_below_30);
+  
+ -static void rhashtable_rehash_chain(struct rhashtable *ht, unsigned old_hash)
+ +static void hashtable_chain_unzip(const struct rhashtable *ht,
+ +				  const struct bucket_table *new_tbl,
+ +				  struct bucket_table *old_tbl, size_t n)
+  {
+ -	struct bucket_table *old_tbl = rht_dereference(ht->tbl, ht);
+ -	spinlock_t *old_bucket_lock;
+ +	struct rhash_head *he, *p, *next;
+ +	unsigned int h;
+  
+ -	old_bucket_lock = bucket_lock(old_tbl, old_hash);
+ +	/* Old bucket empty, no work needed. */
+ +	p = rht_dereference(old_tbl->buckets[n], ht);
+ +	if (!p)
+ +		return;
+  
+ -	spin_lock_bh(old_bucket_lock);
+ -	while (!rhashtable_rehash_one(ht, old_hash))
+ -		;
+ -	spin_unlock_bh(old_bucket_lock);
+ -}
+ -
+ -static void rhashtable_rehash(struct rhashtable *ht,
+ -			      struct bucket_table *new_tbl)
+ -{
+ -	struct bucket_table *old_tbl = rht_dereference(ht->tbl, ht);
+ -	unsigned old_hash;
+ +	/* Advance the old bucket pointer one or more times until it
+ +	 * reaches a node that doesn't hash to the same bucket as the
+ +	 * previous node p. Call the previous node p;
+ +	 */
+ +	h = head_hashfn(ht, new_tbl, p);
+ +	rht_for_each_continue(he, p->next, old_tbl, n) {
+ +		if (head_hashfn(ht, new_tbl, he) != h)
+ +			break;
+ +		p = he;
+ +	}
+ +	RCU_INIT_POINTER(old_tbl->buckets[n], p->next);
+  
+ -	get_random_bytes(&new_tbl->hash_rnd, sizeof(new_tbl->hash_rnd));
+ +	/* Find the subsequent node which does hash to the same
+ +	 * bucket as node P, or NULL if no such node exists.
+ +	 */
+ +	next = NULL;
+ +	if (he) {
+ +		rht_for_each_continue(he, he->next, old_tbl, n) {
+ +			if (head_hashfn(ht, new_tbl, he) == h) {
+ +				next = he;
+ +				break;
+ +			}
+ +		}
+ +	}
+  
+ -	/* Make insertions go into the new, empty table right away. Deletions
+ -	 * and lookups will be attempted in both tables until we synchronize.
+ -	 * The synchronize_rcu() guarantees for the new table to be picked up
+ -	 * so no new additions go into the old table while we relink.
+ +	/* Set p's next pointer to that subsequent node pointer,
+ +	 * bypassing the nodes which do not hash to p's bucket
+  	 */
+++<<<<<<< HEAD
+ +	RCU_INIT_POINTER(p->next, next);
+++=======
++ 	rcu_assign_pointer(ht->future_tbl, new_tbl);
++ 
++ 	/* Ensure the new table is visible to readers. */
++ 	smp_wmb();
++ 
++ 	for (old_hash = 0; old_hash < old_tbl->size; old_hash++)
++ 		rhashtable_rehash_chain(ht, old_hash);
++ 
++ 	/* Publish the new table pointer. */
++ 	rcu_assign_pointer(ht->tbl, new_tbl);
++ 
++ 	/* Wait for readers. All new readers will see the new
++ 	 * table, and thus no references to the old table will
++ 	 * remain.
++ 	 */
++ 	synchronize_rcu();
++ 
++ 	bucket_table_free(old_tbl);
+++>>>>>>> 9497df88ab55 (rhashtable: Fix reader/rehash race)
+  }
+  
+  /**
+@@@ -457,6 -620,16 +478,18 @@@ void *rhashtable_lookup_compare(const s
+  		return rht_obj(ht, he);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Ensure we see any new tables. */
++ 	smp_rmb();
++ 
++ 	old_tbl = tbl;
++ 	tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	if (unlikely(tbl != old_tbl))
++ 		goto restart;
++ 	rcu_read_unlock();
++ 
+++>>>>>>> 9497df88ab55 (rhashtable: Fix reader/rehash race)
+  	return NULL;
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_lookup_compare);
+* Unmerged path lib/rhashtable.c
