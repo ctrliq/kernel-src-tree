@@ -1,0 +1,189 @@
+net/mlx4_core: Enhance the catas flow to support device reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_core: Enhance the catas flow to support device reset (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 96.61%
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit f6bc11e42646e661e699a5593cbd1e9dba7191d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f6bc11e4.failed
+
+This includes:
+
+- resetting the chip when a fatal error is detected (the current code
+  does not do this).
+
+- exposing the ability to enter error state from outside the catas code
+  by calling its functionality. (E.g. FW Command timeout, AER error).
+
+- managing a persistent device state. This is needed to sync between
+  reset flow cases.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f6bc11e42646e661e699a5593cbd1e9dba7191d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/catas.c
+#	include/linux/mlx4/device.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/catas.c
+index 9c656fe4983d,588d6b5e1211..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/catas.c
++++ b/drivers/net/ethernet/mellanox/mlx4/catas.c
+@@@ -69,56 -143,31 +146,83 @@@ static void poll_catas(unsigned long de
+  	struct mlx4_priv *priv = mlx4_priv(dev);
+  
+  	if (readl(priv->catas_err.map)) {
+++<<<<<<< HEAD
+ +		/* If the device is off-line, we cannot try to recover it */
+ +		if (pci_channel_offline(dev->pdev))
+ +			mod_timer(&priv->catas_err.timer,
+ +				  round_jiffies(jiffies + MLX4_CATAS_POLL_INTERVAL));
+ +		else {
+ +			dump_err_buf(dev);
+ +			mlx4_dispatch_event(dev, MLX4_DEV_EVENT_CATASTROPHIC_ERROR, 0);
+ +
+ +			if (internal_err_reset) {
+ +				spin_lock(&catas_lock);
+ +				list_add(&priv->catas_err.list, &catas_list);
+ +				spin_unlock(&catas_lock);
+ +
+ +				queue_work(mlx4_wq, &catas_work);
+ +			}
+ +		}
+ +	} else
+ +		mod_timer(&priv->catas_err.timer,
+ +			  round_jiffies(jiffies + MLX4_CATAS_POLL_INTERVAL));
+++=======
++ 		dump_err_buf(dev);
++ 		goto internal_err;
++ 	}
++ 
++ 	if (dev->persist->state & MLX4_DEVICE_STATE_INTERNAL_ERROR) {
++ 		mlx4_warn(dev, "Internal error mark was detected on device\n");
++ 		goto internal_err;
++ 	}
++ 
++ 	mod_timer(&priv->catas_err.timer,
++ 		  round_jiffies(jiffies + MLX4_CATAS_POLL_INTERVAL));
++ 	return;
++ 
++ internal_err:
++ 	if (internal_err_reset)
++ 		queue_work(dev->persist->catas_wq, &dev->persist->catas_work);
+++>>>>>>> f6bc11e42646 (net/mlx4_core: Enhance the catas flow to support device reset)
+  }
+  
+  static void catas_reset(struct work_struct *work)
+  {
+++<<<<<<< HEAD
+ +	struct mlx4_priv *priv, *tmppriv;
+ +	struct mlx4_dev *dev;
+ +
+ +	LIST_HEAD(tlist);
+ +	int ret;
+ +
+ +	spin_lock_irq(&catas_lock);
+ +	list_splice_init(&catas_list, &tlist);
+ +	spin_unlock_irq(&catas_lock);
+ +
+ +	list_for_each_entry_safe(priv, tmppriv, &tlist, catas_err.list) {
+ +		struct pci_dev *pdev = priv->dev.pdev;
+ +
+ +		/* If the device is off-line, we cannot reset it */
+ +		if (pci_channel_offline(pdev))
+ +			continue;
+ +
+ +		ret = mlx4_restart_one(priv->dev.pdev);
+ +		/* 'priv' now is not valid */
+ +		if (ret)
+ +			pr_err("mlx4 %s: Reset failed (%d)\n",
+ +			       pci_name(pdev), ret);
+ +		else {
+ +			dev  = pci_get_drvdata(pdev);
+ +			mlx4_dbg(dev, "Reset succeeded\n");
+ +		}
+ +	}
+++=======
++ 	struct mlx4_dev_persistent *persist =
++ 		container_of(work, struct mlx4_dev_persistent,
++ 			     catas_work);
++ 
++ 	mlx4_handle_error_state(persist);
+++>>>>>>> f6bc11e42646 (net/mlx4_core: Enhance the catas flow to support device reset)
+  }
+  
+  void mlx4_start_catas_poll(struct mlx4_dev *dev)
+diff --cc include/linux/mlx4/device.h
+index 04d2bbb20a34,7d5d317cb7a6..000000000000
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@@ -728,8 -749,21 +733,24 @@@ struct mlx4_vf_dev 
+  	u8			n_ports;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx4_dev_persistent {
++ 	struct pci_dev	       *pdev;
++ 	struct mlx4_dev	       *dev;
++ 	int                     nvfs[MLX4_MAX_PORTS + 1];
++ 	int			num_vfs;
++ 	enum mlx4_port_type curr_port_type[MLX4_MAX_PORTS + 1];
++ 	enum mlx4_port_type curr_port_poss_type[MLX4_MAX_PORTS + 1];
++ 	struct work_struct      catas_work;
++ 	struct workqueue_struct *catas_wq;
++ 	struct mutex	device_state_mutex; /* protect HW state */
++ 	u8		state;
++ };
++ 
+++>>>>>>> f6bc11e42646 (net/mlx4_core: Enhance the catas flow to support device reset)
+  struct mlx4_dev {
+ -	struct mlx4_dev_persistent *persist;
+ +	struct pci_dev	       *pdev;
+  	unsigned long		flags;
+  	unsigned long		num_slaves;
+  	struct mlx4_caps	caps;
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/catas.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/main.c b/drivers/net/ethernet/mellanox/mlx4/main.c
+index e21046536e8b..8f83db87bca9 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -2447,6 +2447,11 @@ static int mlx4_load_one(struct pci_dev *pdev, int pci_dev_data,
+ 		}
+ 	}
+ 
++	/* on load remove any previous indication of internal error,
++	 * device is up.
++	 */
++	dev->persist->state = MLX4_DEVICE_STATE_UP;
++
+ slave_start:
+ 	err = mlx4_cmd_init(dev);
+ 	if (err) {
+@@ -2835,6 +2840,7 @@ static int mlx4_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	dev->pdev = pdev;
+ 	pci_set_drvdata(pdev, dev);
+ 	priv->pci_dev_data = id->driver_data;
++	mutex_init(&dev->persist->device_state_mutex);
+ 
+ 	ret =  __mlx4_init_one(pdev, id->driver_data, priv);
+ 	if (ret)
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4.h b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+index cebd1180702b..40c37340e1ef 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -1178,7 +1178,7 @@ void mlx4_qp_event(struct mlx4_dev *dev, u32 qpn, int event_type);
+ 
+ void mlx4_srq_event(struct mlx4_dev *dev, u32 srqn, int event_type);
+ 
+-void mlx4_handle_catas_err(struct mlx4_dev *dev);
++void mlx4_enter_error_state(struct mlx4_dev_persistent *persist);
+ 
+ int mlx4_SENSE_PORT(struct mlx4_dev *dev, int port,
+ 		    enum mlx4_port_type *type);
+* Unmerged path include/linux/mlx4/device.h
