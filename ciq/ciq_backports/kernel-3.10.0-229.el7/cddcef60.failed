@@ -1,0 +1,145 @@
+perf tools: Share map_groups among threads of the same group
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf: Share map_groups among threads of the same group (Jiri Olsa) [1134356]
+Rebuild_FUZZ: 94.74%
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit cddcef607782966f1601808c17fe9c4c5f79f9f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/cddcef60.failed
+
+Sharing map groups within all process threads. This way
+there's only one copy of mmap info and it's reachable
+from any thread within the process.
+
+Original-patch-by: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Acked-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Corey Ashford <cjashfor@linux.vnet.ibm.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Don Zickus <dzickus@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/r/1397490723-1992-5-git-send-email-jolsa@redhat.com
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+(cherry picked from commit cddcef607782966f1601808c17fe9c4c5f79f9f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/thread.c
+#	tools/perf/util/thread.h
+diff --cc tools/perf/util/thread.c
+index 3ce0498bdae6,2fde0d5e40b5..000000000000
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@@ -15,7 -31,6 +31,10 @@@ struct thread *thread__new(pid_t pid, p
+  	struct thread *thread = zalloc(sizeof(*thread));
+  
+  	if (thread != NULL) {
+++<<<<<<< HEAD
+ +		map_groups__init(&thread->mg);
+++=======
+++>>>>>>> cddcef607782 (perf tools: Share map_groups among threads of the same group)
+  		thread->pid_ = pid;
+  		thread->tid = tid;
+  		thread->ppid = -1;
+@@@ -116,13 -132,30 +135,30 @@@ size_t thread__fprintf(struct thread *t
+  
+  void thread__insert_map(struct thread *thread, struct map *map)
+  {
+ -	map_groups__fixup_overlappings(thread->mg, map, verbose, stderr);
+ -	map_groups__insert(thread->mg, map);
+ +	map_groups__fixup_overlappings(&thread->mg, map, verbose, stderr);
+ +	map_groups__insert(&thread->mg, map);
+  }
+  
++ static int thread__clone_map_groups(struct thread *thread,
++ 				    struct thread *parent)
++ {
++ 	int i;
++ 
++ 	/* This is new thread, we share map groups for process. */
++ 	if (thread->pid_ == parent->pid_)
++ 		return 0;
++ 
++ 	/* But this one is new process, copy maps. */
++ 	for (i = 0; i < MAP__NR_TYPES; ++i)
++ 		if (map_groups__clone(thread->mg, parent->mg, i) < 0)
++ 			return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
+  int thread__fork(struct thread *thread, struct thread *parent, u64 timestamp)
+  {
+- 	int i, err;
++ 	int err;
+  
+  	if (parent->comm_set) {
+  		const char *comm = thread__comm_str(parent);
+@@@ -134,13 -167,8 +170,15 @@@
+  		thread->comm_set = true;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < MAP__NR_TYPES; ++i)
+ +		if (map_groups__clone(&thread->mg, &parent->mg, i) < 0)
+ +			return -ENOMEM;
+ +
+++=======
+++>>>>>>> cddcef607782 (perf tools: Share map_groups among threads of the same group)
+  	thread->ppid = parent->tid;
+- 
+- 	return 0;
++ 	return thread__clone_map_groups(thread, parent);
+  }
+  
+  void thread__find_cpumode_addr_location(struct thread *thread,
+diff --cc tools/perf/util/thread.h
+index 8d4dfb992c91,3c0c2724f82c..000000000000
+--- a/tools/perf/util/thread.h
++++ b/tools/perf/util/thread.h
+@@@ -30,7 -30,8 +30,12 @@@ struct machine
+  struct comm;
+  
+  struct thread *thread__new(pid_t pid, pid_t tid);
+++<<<<<<< HEAD
+ +void thread__delete(struct thread *self);
+++=======
++ int thread__init_map_groups(struct thread *thread, struct machine *machine);
++ void thread__delete(struct thread *thread);
+++>>>>>>> cddcef607782 (perf tools: Share map_groups among threads of the same group)
+  static inline void thread__exited(struct thread *thread)
+  {
+  	thread->dead = true;
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index f22fe19eb1e3..80823755867e 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -317,6 +317,17 @@ static struct thread *__machine__findnew_thread(struct machine *machine,
+ 		rb_link_node(&th->rb_node, parent, p);
+ 		rb_insert_color(&th->rb_node, &machine->threads);
+ 		machine->last_match = th;
++
++		/*
++		 * We have to initialize map_groups separately
++		 * after rb tree is updated.
++		 *
++		 * The reason is that we call machine__findnew_thread
++		 * within thread__init_map_groups to find the thread
++		 * leader and that would screwed the rb tree.
++		 */
++		if (thread__init_map_groups(th, machine))
++			return NULL;
+ 	}
+ 
+ 	return th;
+* Unmerged path tools/perf/util/thread.c
+* Unmerged path tools/perf/util/thread.h
