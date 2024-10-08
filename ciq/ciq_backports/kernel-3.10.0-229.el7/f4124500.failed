@@ -1,0 +1,217 @@
+KVM: nVMX: Fully emulate preemption timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/nvmx: Fully emulate preemption timer (Paolo Bonzini) [1116936]
+Rebuild_FUZZ: 96.30%
+commit-author Jan Kiszka <jan.kiszka@siemens.com>
+commit f4124500c2c13eb1208c6143b3f6d469709dea10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f4124500.failed
+
+We cannot rely on the hardware-provided preemption timer support because
+we are holding L2 in HLT outside non-root mode. Furthermore, emulating
+the preemption will resolve tick rate errata on older Intel CPUs.
+
+The emulation is based on hrtimer which is started on L2 entry, stopped
+on L2 exit and evaluated via the new check_nested_events hook. As we no
+longer rely on hardware features, we can enable both the preemption
+timer support and value saving unconditionally.
+
+	Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f4124500c2c13eb1208c6143b3f6d469709dea10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 827c1e271e94,e559675e113f..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -1046,6 -1054,17 +1052,20 @@@ static inline bool nested_cpu_has_virtu
+  	return vmcs12->pin_based_vm_exec_control & PIN_BASED_VIRTUAL_NMIS;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool nested_cpu_has_preemption_timer(struct vmcs12 *vmcs12)
++ {
++ 	return vmcs12->pin_based_vm_exec_control &
++ 		PIN_BASED_VMX_PREEMPTION_TIMER;
++ }
++ 
++ static inline int nested_cpu_has_ept(struct vmcs12 *vmcs12)
++ {
++ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_EPT);
++ }
++ 
+++>>>>>>> f4124500c2c1 (KVM: nVMX: Fully emulate preemption timer)
+  static inline bool is_exception(u32 intr_info)
+  {
+  	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
+@@@ -7514,6 -7550,83 +7519,86 @@@ static void vmx_set_supported_cpuid(u3
+  		entry->ecx |= bit(X86_FEATURE_VMX);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,
++ 		struct x86_exception *fault)
++ {
++ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 	u32 exit_reason;
++ 
++ 	if (fault->error_code & PFERR_RSVD_MASK)
++ 		exit_reason = EXIT_REASON_EPT_MISCONFIG;
++ 	else
++ 		exit_reason = EXIT_REASON_EPT_VIOLATION;
++ 	nested_vmx_vmexit(vcpu, exit_reason, 0, vcpu->arch.exit_qualification);
++ 	vmcs12->guest_physical_address = fault->address;
++ }
++ 
++ /* Callbacks for nested_ept_init_mmu_context: */
++ 
++ static unsigned long nested_ept_get_cr3(struct kvm_vcpu *vcpu)
++ {
++ 	/* return the page table to be shadowed - in our case, EPT12 */
++ 	return get_vmcs12(vcpu)->ept_pointer;
++ }
++ 
++ static void nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
++ {
++ 	kvm_init_shadow_ept_mmu(vcpu, &vcpu->arch.mmu,
++ 			nested_vmx_ept_caps & VMX_EPT_EXECUTE_ONLY_BIT);
++ 
++ 	vcpu->arch.mmu.set_cr3           = vmx_set_cr3;
++ 	vcpu->arch.mmu.get_cr3           = nested_ept_get_cr3;
++ 	vcpu->arch.mmu.inject_page_fault = nested_ept_inject_page_fault;
++ 
++ 	vcpu->arch.walk_mmu              = &vcpu->arch.nested_mmu;
++ }
++ 
++ static void nested_ept_uninit_mmu_context(struct kvm_vcpu *vcpu)
++ {
++ 	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
++ }
++ 
++ static void vmx_inject_page_fault_nested(struct kvm_vcpu *vcpu,
++ 		struct x86_exception *fault)
++ {
++ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 
++ 	WARN_ON(!is_guest_mode(vcpu));
++ 
++ 	/* TODO: also check PFEC_MATCH/MASK, not just EB.PF. */
++ 	if (vmcs12->exception_bitmap & (1u << PF_VECTOR))
++ 		nested_vmx_vmexit(vcpu, to_vmx(vcpu)->exit_reason,
++ 				  vmcs_read32(VM_EXIT_INTR_INFO),
++ 				  vmcs_readl(EXIT_QUALIFICATION));
++ 	else
++ 		kvm_inject_page_fault(vcpu, fault);
++ }
++ 
++ static void vmx_start_preemption_timer(struct kvm_vcpu *vcpu)
++ {
++ 	u64 preemption_timeout = get_vmcs12(vcpu)->vmx_preemption_timer_value;
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (vcpu->arch.virtual_tsc_khz == 0)
++ 		return;
++ 
++ 	/* Make sure short timeouts reliably trigger an immediate vmexit.
++ 	 * hrtimer_start does not guarantee this. */
++ 	if (preemption_timeout <= 1) {
++ 		vmx_preemption_timer_fn(&vmx->nested.preemption_timer);
++ 		return;
++ 	}
++ 
++ 	preemption_timeout <<= VMX_MISC_EMULATED_PREEMPTION_TIMER_RATE;
++ 	preemption_timeout *= 1000000;
++ 	do_div(preemption_timeout, vcpu->arch.virtual_tsc_khz);
++ 	hrtimer_start(&vmx->nested.preemption_timer,
++ 		      ns_to_ktime(preemption_timeout), HRTIMER_MODE_REL);
++ }
++ 
+++>>>>>>> f4124500c2c1 (KVM: nVMX: Fully emulate preemption timer)
+  /*
+   * prepare_vmcs02 is called when the L1 guest hypervisor runs its nested
+   * L2 guest. L1 has a vmcs for L2 (vmcs12), and this function "merges" it
+@@@ -7706,10 -7819,7 +7791,14 @@@ static void prepare_vmcs02(struct kvm_v
+  	 * we should use its exit controls. Note that VM_EXIT_LOAD_IA32_EFER
+  	 * bits are further modified by vmx_set_efer() below.
+  	 */
+++<<<<<<< HEAD
+ +	exit_control = vmcs_config.vmexit_ctrl;
+ +	if (vmcs12->pin_based_vm_exec_control & PIN_BASED_VMX_PREEMPTION_TIMER)
+ +		exit_control |= VM_EXIT_SAVE_VMX_PREEMPTION_TIMER;
+ +	vmcs_write32(VM_EXIT_CONTROLS, exit_control);
+++=======
++ 	vmcs_write32(VM_EXIT_CONTROLS, vmcs_config.vmexit_ctrl);
+++>>>>>>> f4124500c2c1 (KVM: nVMX: Fully emulate preemption timer)
+  
+  	/* vmcs12's VM_ENTRY_LOAD_IA32_EFER and VM_ENTRY_IA32E_MODE are
+  	 * emulated by vmx_set_efer(), below.
+@@@ -8045,6 -8163,57 +8134,60 @@@ static void vmcs12_save_pending_event(s
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vmx_check_nested_events(struct kvm_vcpu *vcpu, bool external_intr)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (nested_cpu_has_preemption_timer(get_vmcs12(vcpu)) &&
++ 	    vmx->nested.preemption_timer_expired) {
++ 		if (vmx->nested.nested_run_pending)
++ 			return -EBUSY;
++ 		nested_vmx_vmexit(vcpu, EXIT_REASON_PREEMPTION_TIMER, 0, 0);
++ 		return 0;
++ 	}
++ 
++ 	if (vcpu->arch.nmi_pending && nested_exit_on_nmi(vcpu)) {
++ 		if (vmx->nested.nested_run_pending)
++ 			return -EBUSY;
++ 		nested_vmx_vmexit(vcpu, EXIT_REASON_EXCEPTION_NMI,
++ 				  NMI_VECTOR | INTR_TYPE_NMI_INTR |
++ 				  INTR_INFO_VALID_MASK, 0);
++ 		/*
++ 		 * The NMI-triggered VM exit counts as injection:
++ 		 * clear this one and block further NMIs.
++ 		 */
++ 		vcpu->arch.nmi_pending = 0;
++ 		vmx_set_nmi_mask(vcpu, true);
++ 		return 0;
++ 	}
++ 
++ 	if ((kvm_cpu_has_interrupt(vcpu) || external_intr) &&
++ 	    nested_exit_on_intr(vcpu)) {
++ 		if (vmx->nested.nested_run_pending)
++ 			return -EBUSY;
++ 		nested_vmx_vmexit(vcpu, EXIT_REASON_EXTERNAL_INTERRUPT, 0, 0);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static u32 vmx_get_preemption_timer_value(struct kvm_vcpu *vcpu)
++ {
++ 	ktime_t remaining =
++ 		hrtimer_get_remaining(&to_vmx(vcpu)->nested.preemption_timer);
++ 	u64 value;
++ 
++ 	if (ktime_to_ns(remaining) <= 0)
++ 		return 0;
++ 
++ 	value = ktime_to_ns(remaining) * vcpu->arch.virtual_tsc_khz;
++ 	do_div(value, 1000000);
++ 	return value >> VMX_MISC_EMULATED_PREEMPTION_TIMER_RATE;
++ }
++ 
+++>>>>>>> f4124500c2c1 (KVM: nVMX: Fully emulate preemption timer)
+  /*
+   * prepare_vmcs12 is part of what we need to do when the nested L2 guest exits
+   * and we want to prepare to run its L1 parent. L1 keeps a vmcs for L2 (vmcs12),
+* Unmerged path arch/x86/kvm/vmx.c
