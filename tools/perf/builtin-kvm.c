@@ -1151,9 +1151,7 @@ out:
 	if (kvm->timerfd >= 0)
 		close(kvm->timerfd);
 
-	if (pollfds)
-		free(pollfds);
-
+	free(pollfds);
 	return err;
 }
 
