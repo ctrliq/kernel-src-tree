@@ -47,7 +47,7 @@
 
 struct nfs4_acl *nfs4_acl_new(int);
 int nfs4_acl_get_whotype(char *, u32);
-__be32 nfs4_acl_write_who(int who, __be32 **p, int *len);
+__be32 nfs4_acl_write_who(struct xdr_stream *xdr, int who);
 
 #define NFS4_ACL_TYPE_DEFAULT	0x01
 #define NFS4_ACL_DIR		0x02
