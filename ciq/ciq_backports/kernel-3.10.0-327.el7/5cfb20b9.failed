@@ -1,0 +1,185 @@
+powerpc/eeh: Emulate EEH recovery for VFIO devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Emulate EEH recovery for VFIO devices (Laurent Vivier) [1213675]
+Rebuild_FUZZ: 91.30%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit 5cfb20b96f624e9852c4f3f1c4397e81ca28d5aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5cfb20b9.failed
+
+When enabling EEH functionality on passed through devices (PE)
+with VFIO, the devices in the PE would be removed permanently
+from guest side. In that case, the PE remains frozen state.
+When returning PE to host, or restarting the guest again, we
+had mechanism unfreezing the PE by clearing PESTA/B frozen
+bits. However, that's not enough for some adapters, which are
+indicated as following "lspci" shows. Those adapters require
+hot reset on the parent bus to bring their firmware back to
+workable state. Otherwise, those adaptrs won't be operative
+and the host (for returning case) or the guest will fail to
+load the drivers for those adapters without exception.
+
+0000:01:00.0 Ethernet controller: Emulex Corporation OneConnect \
+             10Gb NIC (be3) (rev 02)
+0000:01:00.0 0200: 19a2:0710 (rev 02)
+0001:03:00.0 Ethernet controller: Emulex Corporation OneConnect \
+             NIC (Lancer) (rev 10)
+0001:03:00.0 0200: 10df:e220 (rev 10)
+
+The patch adds mechanism to emulate EEH recovery (for hot reset
+on parent PCI bus) on 3 gates to fix the issue: open/release one
+adapter of the PE, enable EEH functionality on one adapter of the
+PE.
+
+	Reported-by:  Murilo Fossa Vicentini <muvic@br.ibm.com>
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 5cfb20b96f624e9852c4f3f1c4397e81ca28d5aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/eeh_driver.c
+diff --cc arch/powerpc/kernel/eeh_driver.c
+index 420da61d4ce0,3fd514f8e4b2..000000000000
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@@ -450,21 -482,16 +482,29 @@@ static void *eeh_pe_detach_dev(void *da
+  static void *__eeh_clear_pe_frozen_state(void *data, void *flag)
+  {
+  	struct eeh_pe *pe = (struct eeh_pe *)data;
+++<<<<<<< HEAD
+ +	int i, rc;
+ +
+ +	for (i = 0; i < 3; i++) {
+ +		rc = eeh_pci_enable(pe, EEH_OPT_THAW_MMIO);
+ +		if (rc)
+ +			continue;
+ +		rc = eeh_pci_enable(pe, EEH_OPT_THAW_DMA);
+ +		if (!rc)
+ +			break;
+ +	}
+++=======
++ 	bool *clear_sw_state = flag;
++ 	int i, rc = 1;
++ 
++ 	for (i = 0; rc && i < 3; i++)
++ 		rc = eeh_unfreeze_pe(pe, clear_sw_state);
+++>>>>>>> 5cfb20b96f62 (powerpc/eeh: Emulate EEH recovery for VFIO devices)
+  
+ -	/* Stop immediately on any errors */
+ +	/* The PE has been isolated, clear it */
+  	if (rc) {
+ -		pr_warn("%s: Failure %d unfreezing PHB#%x-PE#%x\n",
+ -			__func__, rc, pe->phb->global_number, pe->addr);
+ +		pr_warn("%s: Can't clear frozen PHB#%x-PE#%x (%d)\n",
+ +			__func__, pe->phb->global_number, pe->addr, rc);
+  		return (void *)pe;
+  	}
+  
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 52bd2259c082..c8a697a34c9e 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -300,6 +300,7 @@ void eeh_add_device_tree_late(struct pci_bus *);
+ void eeh_add_sysfs_files(struct pci_bus *);
+ void eeh_remove_device(struct pci_dev *);
+ int eeh_unfreeze_pe(struct eeh_pe *pe, bool sw_state);
++int eeh_pe_reset_and_recover(struct eeh_pe *pe);
+ int eeh_dev_open(struct pci_dev *pdev);
+ void eeh_dev_release(struct pci_dev *pdev);
+ struct eeh_pe *eeh_iommu_group_to_pe(struct iommu_group *group);
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 582df14babaf..b3ed5142e5b3 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -1189,6 +1189,60 @@ int eeh_unfreeze_pe(struct eeh_pe *pe, bool sw_state)
+ 	return ret;
+ }
+ 
++
++static struct pci_device_id eeh_reset_ids[] = {
++	{ PCI_DEVICE(0x19a2, 0x0710) },	/* Emulex, BE     */
++	{ PCI_DEVICE(0x10df, 0xe220) },	/* Emulex, Lancer */
++	{ 0 }
++};
++
++static int eeh_pe_change_owner(struct eeh_pe *pe)
++{
++	struct eeh_dev *edev, *tmp;
++	struct pci_dev *pdev;
++	struct pci_device_id *id;
++	int flags, ret;
++
++	/* Check PE state */
++	flags = (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE);
++	ret = eeh_ops->get_state(pe, NULL);
++	if (ret < 0 || ret == EEH_STATE_NOT_SUPPORT)
++		return 0;
++
++	/* Unfrozen PE, nothing to do */
++	if ((ret & flags) == flags)
++		return 0;
++
++	/* Frozen PE, check if it needs PE level reset */
++	eeh_pe_for_each_dev(pe, edev, tmp) {
++		pdev = eeh_dev_to_pci_dev(edev);
++		if (!pdev)
++			continue;
++
++		for (id = &eeh_reset_ids[0]; id->vendor != 0; id++) {
++			if (id->vendor != PCI_ANY_ID &&
++			    id->vendor != pdev->vendor)
++				continue;
++			if (id->device != PCI_ANY_ID &&
++			    id->device != pdev->device)
++				continue;
++			if (id->subvendor != PCI_ANY_ID &&
++			    id->subvendor != pdev->subsystem_vendor)
++				continue;
++			if (id->subdevice != PCI_ANY_ID &&
++			    id->subdevice != pdev->subsystem_device)
++				continue;
++
++			goto reset;
++		}
++	}
++
++	return eeh_unfreeze_pe(pe, true);
++
++reset:
++	return eeh_pe_reset_and_recover(pe);
++}
++
+ /**
+  * eeh_dev_open - Increase count of pass through devices for PE
+  * @pdev: PCI device
+@@ -1220,7 +1274,7 @@ int eeh_dev_open(struct pci_dev *pdev)
+ 	 * in frozen PE won't work properly. Clear the frozen state
+ 	 * in advance.
+ 	 */
+-	ret = eeh_unfreeze_pe(edev->pe, true);
++	ret = eeh_pe_change_owner(edev->pe);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -1261,6 +1315,7 @@ void eeh_dev_release(struct pci_dev *pdev)
+ 	/* Decrease PE's pass through count */
+ 	atomic_dec(&edev->pe->pass_dev_cnt);
+ 	WARN_ON(atomic_read(&edev->pe->pass_dev_cnt) < 0);
++	eeh_pe_change_owner(edev->pe);
+ out:
+ 	mutex_unlock(&eeh_dev_mutex);
+ }
+@@ -1341,7 +1396,7 @@ int eeh_pe_set_option(struct eeh_pe *pe, int option)
+ 	switch (option) {
+ 	case EEH_OPT_ENABLE:
+ 		if (eeh_enabled()) {
+-			ret = eeh_unfreeze_pe(pe, true);
++			ret = eeh_pe_change_owner(pe);
+ 			break;
+ 		}
+ 		ret = -EIO;
+* Unmerged path arch/powerpc/kernel/eeh_driver.c
