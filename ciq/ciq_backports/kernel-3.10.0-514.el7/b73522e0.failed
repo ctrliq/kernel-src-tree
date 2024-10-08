@@ -1,0 +1,433 @@
+x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mm/mtrr: Enhance MTRR checks in kernel mapping helpers (Eric Sandeen) [1274459]
+Rebuild_FUZZ: 96.43%
+commit-author Toshi Kani <toshi.kani@hp.com>
+commit b73522e0c1be58d3c69b124985b8ccf94e3677f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b73522e0.failed
+
+This patch adds the argument 'uniform' to mtrr_type_lookup(),
+which gets set to 1 when a given range is covered uniformly by
+MTRRs, i.e. the range is fully covered by a single MTRR entry or
+the default type.
+
+Change pud_set_huge() and pmd_set_huge() to honor the 'uniform'
+flag to see if it is safe to create a huge page mapping in the
+range.
+
+This allows them to create a huge page mapping in a range
+covered by a single MTRR entry of any memory type. It also
+detects a non-optimal request properly. They continue to check
+with the WB type since it does not effectively change the
+uniform mapping even if a request spans multiple MTRR entries.
+
+pmd_set_huge() logs a warning message to a non-optimal request
+so that driver writers will be aware of such a case. Drivers
+should make a mapping request aligned to a single MTRR entry
+when the range is covered by MTRRs.
+
+	Signed-off-by: Toshi Kani <toshi.kani@hp.com>
+[ Realign, flesh out comments, improve warning message. ]
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Elliott@hp.com
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Luis R. Rodriguez <mcgrof@suse.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: dave.hansen@intel.com
+	Cc: linux-mm <linux-mm@kvack.org>
+	Cc: pebolle@tiscali.nl
+Link: http://lkml.kernel.org/r/1431714237-880-7-git-send-email-toshi.kani@hp.com
+Link: http://lkml.kernel.org/r/1432628901-18044-8-git-send-email-bp@alien8.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b73522e0c1be58d3c69b124985b8ccf94e3677f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mtrr/generic.c
+#	arch/x86/mm/pat.c
+#	arch/x86/mm/pgtable.c
+diff --cc arch/x86/kernel/cpu/mtrr/generic.c
+index 199d2e414219,f782d9b62cb3..000000000000
+--- a/arch/x86/kernel/cpu/mtrr/generic.c
++++ b/arch/x86/kernel/cpu/mtrr/generic.c
+@@@ -102,56 -102,74 +102,105 @@@ static int check_type_overlap(u8 *prev
+  	return 0;
+  }
+  
+ -/**
+ - * mtrr_type_lookup_fixed - look up memory type in MTRR fixed entries
+ - *
+ - * Return the MTRR fixed memory type of 'start'.
+ - *
+ - * MTRR fixed entries are divided into the following ways:
+ - *  0x00000 - 0x7FFFF : This range is divided into eight 64KB sub-ranges
+ - *  0x80000 - 0xBFFFF : This range is divided into sixteen 16KB sub-ranges
+ - *  0xC0000 - 0xFFFFF : This range is divided into sixty-four 4KB sub-ranges
+ - *
+ - * Return Values:
+ - * MTRR_TYPE_(type)  - Matched memory type
+ - * MTRR_TYPE_INVALID - Unmatched
+ +/*
+ + * Error/Semi-error returns:
+ + * 0xFF - when MTRR is not enabled
+ + * *repeat == 1 implies [start:end] spanned across MTRR range and type returned
+ + *		corresponds only to [start:*partial_end].
+ + *		Caller has to lookup again for [*partial_end:end].
+   */
+++<<<<<<< HEAD
+ +static u8 __mtrr_type_lookup(u64 start, u64 end, u64 *partial_end, int *repeat)
+++=======
++ static u8 mtrr_type_lookup_fixed(u64 start, u64 end)
++ {
++ 	int idx;
++ 
++ 	if (start >= 0x100000)
++ 		return MTRR_TYPE_INVALID;
++ 
++ 	/* 0x0 - 0x7FFFF */
++ 	if (start < 0x80000) {
++ 		idx = 0;
++ 		idx += (start >> 16);
++ 		return mtrr_state.fixed_ranges[idx];
++ 	/* 0x80000 - 0xBFFFF */
++ 	} else if (start < 0xC0000) {
++ 		idx = 1 * 8;
++ 		idx += ((start - 0x80000) >> 14);
++ 		return mtrr_state.fixed_ranges[idx];
++ 	}
++ 
++ 	/* 0xC0000 - 0xFFFFF */
++ 	idx = 3 * 8;
++ 	idx += ((start - 0xC0000) >> 12);
++ 	return mtrr_state.fixed_ranges[idx];
++ }
++ 
++ /**
++  * mtrr_type_lookup_variable - look up memory type in MTRR variable entries
++  *
++  * Return Value:
++  * MTRR_TYPE_(type) - Matched memory type or default memory type (unmatched)
++  *
++  * Output Arguments:
++  * repeat - Set to 1 when [start:end] spanned across MTRR range and type
++  *	    returned corresponds only to [start:*partial_end].  Caller has
++  *	    to lookup again for [*partial_end:end].
++  *
++  * uniform - Set to 1 when an MTRR covers the region uniformly, i.e. the
++  *	     region is fully covered by a single MTRR entry or the default
++  *	     type.
++  */
++ static u8 mtrr_type_lookup_variable(u64 start, u64 end, u64 *partial_end,
++ 				    int *repeat, u8 *uniform)
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+  {
+  	int i;
+  	u64 base, mask;
+  	u8 prev_match, curr_match;
+  
+  	*repeat = 0;
+++<<<<<<< HEAD
+ +	if (!mtrr_state_set)
+ +		return 0xFF;
+++=======
++ 	*uniform = 1;
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+  
+ -	/* Make end inclusive instead of exclusive */
+ +	if (!(mtrr_state.enabled & MTRR_STATE_MTRR_ENABLED))
+ +		return 0xFF;
+ +
+ +	/* Make end inclusive end, instead of exclusive */
+  	end--;
+  
+ -	prev_match = MTRR_TYPE_INVALID;
+ +	/* Look in fixed ranges. Just return the type as per start */
+ +	if ((start < 0x100000) &&
+ +	    (mtrr_state.have_fixed) &&
+ +	    (mtrr_state.enabled & MTRR_STATE_MTRR_FIXED_ENABLED)) {
+ +		int idx;
+ +
+ +		if (start < 0x80000) {
+ +			idx = 0;
+ +			idx += (start >> 16);
+ +			return mtrr_state.fixed_ranges[idx];
+ +		} else if (start < 0xC0000) {
+ +			idx = 1 * 8;
+ +			idx += ((start - 0x80000) >> 14);
+ +			return mtrr_state.fixed_ranges[idx];
+ +		} else {
+ +			idx = 3 * 8;
+ +			idx += ((start - 0xC0000) >> 12);
+ +			return mtrr_state.fixed_ranges[idx];
+ +		}
+ +	}
+ +
+ +	/*
+ +	 * Look in variable ranges
+ +	 * Look of multiple ranges matching this address and pick type
+ +	 * as per MTRR precedence
+ +	 */
+ +	prev_match = 0xFF;
+  	for (i = 0; i < num_var_ranges; ++i) {
+  		unsigned short start_state, end_state, inclusive;
+  
+@@@ -226,18 -242,48 +277,59 @@@
+  	return mtrr_state.def_type;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Returns the effective MTRR type for the region
+ + * Error return:
+ + * 0xFF - when MTRR is not enabled
+++=======
++ /**
++  * mtrr_type_lookup - look up memory type in MTRR
++  *
++  * Return Values:
++  * MTRR_TYPE_(type)  - The effective MTRR type for the region
++  * MTRR_TYPE_INVALID - MTRR is disabled
++  *
++  * Output Argument:
++  * uniform - Set to 1 when an MTRR covers the region uniformly, i.e. the
++  *	     region is fully covered by a single MTRR entry or the default
++  *	     type.
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+   */
+- u8 mtrr_type_lookup(u64 start, u64 end)
++ u8 mtrr_type_lookup(u64 start, u64 end, u8 *uniform)
+  {
+- 	u8 type, prev_type;
++ 	u8 type, prev_type, is_uniform = 1, dummy;
+  	int repeat;
+  	u64 partial_end;
+  
+++<<<<<<< HEAD
+ +	type = __mtrr_type_lookup(start, end, &partial_end, &repeat);
+++=======
++ 	if (!mtrr_state_set)
++ 		return MTRR_TYPE_INVALID;
++ 
++ 	if (!(mtrr_state.enabled & MTRR_STATE_MTRR_ENABLED))
++ 		return MTRR_TYPE_INVALID;
++ 
++ 	/*
++ 	 * Look up the fixed ranges first, which take priority over
++ 	 * the variable ranges.
++ 	 */
++ 	if ((start < 0x100000) &&
++ 	    (mtrr_state.have_fixed) &&
++ 	    (mtrr_state.enabled & MTRR_STATE_MTRR_FIXED_ENABLED)) {
++ 		is_uniform = 0;
++ 		type = mtrr_type_lookup_fixed(start, end);
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Look up the variable ranges.  Look of multiple ranges matching
++ 	 * this address and pick type as per MTRR precedence.
++ 	 */
++ 	type = mtrr_type_lookup_variable(start, end, &partial_end,
++ 					 &repeat, &is_uniform);
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+  
+  	/*
+  	 * Common path is with repeat = 0.
+@@@ -247,12 -294,19 +339,26 @@@
+  	while (repeat) {
+  		prev_type = type;
+  		start = partial_end;
+++<<<<<<< HEAD
+ +		type = __mtrr_type_lookup(start, end, &partial_end, &repeat);
+++=======
++ 		is_uniform = 0;
++ 		type = mtrr_type_lookup_variable(start, end, &partial_end,
++ 						 &repeat, &dummy);
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+  
+  		if (check_type_overlap(&prev_type, &type))
+- 			return type;
++ 			goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (mtrr_tom2 && (start >= (1ULL<<32)) && (end < mtrr_tom2))
++ 		type = MTRR_TYPE_WRBACK;
++ 
++ out:
++ 	*uniform = is_uniform;
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+  	return type;
+  }
+  
+diff --cc arch/x86/mm/pat.c
+index 657438858e83,372ad422c2c3..000000000000
+--- a/arch/x86/mm/pat.c
++++ b/arch/x86/mm/pat.c
+@@@ -145,14 -266,14 +145,19 @@@ static unsigned long pat_x_mtrr_type(u6
+  	 * Look for MTRR hint to get the effective type in case where PAT
+  	 * request is for WB.
+  	 */
+++<<<<<<< HEAD
+ +	if (req_type == _PAGE_CACHE_WB) {
+ +		u8 mtrr_type;
+++=======
++ 	if (req_type == _PAGE_CACHE_MODE_WB) {
++ 		u8 mtrr_type, uniform;
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+  
+- 		mtrr_type = mtrr_type_lookup(start, end);
++ 		mtrr_type = mtrr_type_lookup(start, end, &uniform);
+  		if (mtrr_type != MTRR_TYPE_WRBACK)
+ -			return _PAGE_CACHE_MODE_UC_MINUS;
+ +			return _PAGE_CACHE_UC_MINUS;
+  
+ -		return _PAGE_CACHE_MODE_WB;
+ +		return _PAGE_CACHE_WB;
+  	}
+  
+  	return req_type;
+diff --cc arch/x86/mm/pgtable.c
+index d5aa594e6332,fb0a9dd1d6e4..000000000000
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@@ -476,3 -561,99 +476,102 @@@ void native_set_fixmap(enum fixed_addre
+  {
+  	__native_set_fixmap(idx, pfn_pte(phys >> PAGE_SHIFT, flags));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
++ /**
++  * pud_set_huge - setup kernel PUD mapping
++  *
++  * MTRRs can override PAT memory types with 4KiB granularity. Therefore, this
++  * function sets up a huge page only if any of the following conditions are met:
++  *
++  * - MTRRs are disabled, or
++  *
++  * - MTRRs are enabled and the range is completely covered by a single MTRR, or
++  *
++  * - MTRRs are enabled and the corresponding MTRR memory type is WB, which
++  *   has no effect on the requested PAT memory type.
++  *
++  * Callers should try to decrease page size (1GB -> 2MB -> 4K) if the bigger
++  * page mapping attempt fails.
++  *
++  * Returns 1 on success and 0 on failure.
++  */
++ int pud_set_huge(pud_t *pud, phys_addr_t addr, pgprot_t prot)
++ {
++ 	u8 mtrr, uniform;
++ 
++ 	mtrr = mtrr_type_lookup(addr, addr + PUD_SIZE, &uniform);
++ 	if ((mtrr != MTRR_TYPE_INVALID) && (!uniform) &&
++ 	    (mtrr != MTRR_TYPE_WRBACK))
++ 		return 0;
++ 
++ 	prot = pgprot_4k_2_large(prot);
++ 
++ 	set_pte((pte_t *)pud, pfn_pte(
++ 		(u64)addr >> PAGE_SHIFT,
++ 		__pgprot(pgprot_val(prot) | _PAGE_PSE)));
++ 
++ 	return 1;
++ }
++ 
++ /**
++  * pmd_set_huge - setup kernel PMD mapping
++  *
++  * See text over pud_set_huge() above.
++  *
++  * Returns 1 on success and 0 on failure.
++  */
++ int pmd_set_huge(pmd_t *pmd, phys_addr_t addr, pgprot_t prot)
++ {
++ 	u8 mtrr, uniform;
++ 
++ 	mtrr = mtrr_type_lookup(addr, addr + PMD_SIZE, &uniform);
++ 	if ((mtrr != MTRR_TYPE_INVALID) && (!uniform) &&
++ 	    (mtrr != MTRR_TYPE_WRBACK)) {
++ 		pr_warn_once("%s: Cannot satisfy [mem %#010llx-%#010llx] with a huge-page mapping due to MTRR override.\n",
++ 			     __func__, addr, addr + PMD_SIZE);
++ 		return 0;
++ 	}
++ 
++ 	prot = pgprot_4k_2_large(prot);
++ 
++ 	set_pte((pte_t *)pmd, pfn_pte(
++ 		(u64)addr >> PAGE_SHIFT,
++ 		__pgprot(pgprot_val(prot) | _PAGE_PSE)));
++ 
++ 	return 1;
++ }
++ 
++ /**
++  * pud_clear_huge - clear kernel PUD mapping when it is set
++  *
++  * Returns 1 on success and 0 on failure (no PUD map is found).
++  */
++ int pud_clear_huge(pud_t *pud)
++ {
++ 	if (pud_large(*pud)) {
++ 		pud_clear(pud);
++ 		return 1;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * pmd_clear_huge - clear kernel PMD mapping when it is set
++  *
++  * Returns 1 on success and 0 on failure (no PMD map is found).
++  */
++ int pmd_clear_huge(pmd_t *pmd)
++ {
++ 	if (pmd_large(*pmd)) {
++ 		pmd_clear(pmd);
++ 		return 1;
++ 	}
++ 
++ 	return 0;
++ }
++ #endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */
+++>>>>>>> b73522e0c1be (x86/mm/mtrr: Enhance MTRR checks in kernel mapping helpers)
+diff --git a/arch/x86/include/asm/mtrr.h b/arch/x86/include/asm/mtrr.h
+index ef927948657c..082be13dfba4 100644
+--- a/arch/x86/include/asm/mtrr.h
++++ b/arch/x86/include/asm/mtrr.h
+@@ -31,7 +31,7 @@
+  * arch_phys_wc_add and arch_phys_wc_del.
+  */
+ # ifdef CONFIG_MTRR
+-extern u8 mtrr_type_lookup(u64 addr, u64 end);
++extern u8 mtrr_type_lookup(u64 addr, u64 end, u8 *uniform);
+ extern void mtrr_save_fixed_ranges(void *);
+ extern void mtrr_save_state(void);
+ extern int mtrr_add(unsigned long base, unsigned long size,
+@@ -50,7 +50,7 @@ extern int mtrr_trim_uncached_memory(unsigned long end_pfn);
+ extern int amd_special_default_mtrr(void);
+ extern int phys_wc_to_mtrr_index(int handle);
+ #  else
+-static inline u8 mtrr_type_lookup(u64 addr, u64 end)
++static inline u8 mtrr_type_lookup(u64 addr, u64 end, u8 *uniform)
+ {
+ 	/*
+ 	 * Return no-MTRRs:
+* Unmerged path arch/x86/kernel/cpu/mtrr/generic.c
+* Unmerged path arch/x86/mm/pat.c
+* Unmerged path arch/x86/mm/pgtable.c
