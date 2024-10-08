@@ -1,0 +1,196 @@
+staging/rdma/hfi1: actually use new RNR timer API in loopback path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: actually use new RNR timer API in loopback path (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 93.55%
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 34cee28f0bb067f4210271c4d7c4febe34bad2d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/34cee28f.failed
+
+The patch series which added a new API for the RNR timer did not include an
+updated call in the loopback path. RC/UC RNR loopback would be broken
+without this.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 34cee28f0bb067f4210271c4d7c4febe34bad2d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/rc.c
+#	drivers/staging/hfi1/ruc.c
+#	drivers/staging/rdma/hfi1/verbs.h
+diff --cc drivers/staging/hfi1/rc.c
+index dd57d65aa9b2,ba2a2ccac6f2..000000000000
+--- a/drivers/staging/hfi1/rc.c
++++ b/drivers/staging/hfi1/rc.c
+@@@ -58,9 -60,120 +58,112 @@@
+  /* cut down ridiculously long IB macro names */
+  #define OP(x) IB_OPCODE_RC_##x
+  
+ -/**
+ - * hfi1_add_retry_timer - add/start a retry timer
+ - * @qp - the QP
+ - *
+ - * add a retry timer on the QP
+ - */
+ -static inline void hfi1_add_retry_timer(struct rvt_qp *qp)
+ -{
+ -	qp->s_flags |= RVT_S_TIMER;
+ -	/* 4.096 usec. * (1 << qp->timeout) */
+ -	qp->s_timer.expires = jiffies + qp->timeout_jiffies;
+ -	add_timer(&qp->s_timer);
+ -}
+ +static void rc_timeout(unsigned long arg);
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +static u32 restart_sge(struct hfi1_sge_state *ss, struct hfi1_swqe *wqe,
+++=======
++ /**
++  * hfi1_add_rnr_timer - add/start an rnr timer
++  * @qp - the QP
++  * @to - timeout in usecs
++  *
++  * add an rnr timer on the QP
++  */
++ void hfi1_add_rnr_timer(struct rvt_qp *qp, u32 to)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	qp->s_flags |= RVT_S_WAIT_RNR;
++ 	qp->s_timer.expires = jiffies + usecs_to_jiffies(to);
++ 	add_timer(&priv->s_rnr_timer);
++ }
++ 
++ /**
++  * hfi1_mod_retry_timer - mod a retry timer
++  * @qp - the QP
++  *
++  * Modify a potentially already running retry
++  * timer
++  */
++ static inline void hfi1_mod_retry_timer(struct rvt_qp *qp)
++ {
++ 	qp->s_flags |= RVT_S_TIMER;
++ 	/* 4.096 usec. * (1 << qp->timeout) */
++ 	mod_timer(&qp->s_timer, jiffies + qp->timeout_jiffies);
++ }
++ 
++ /**
++  * hfi1_stop_retry_timer - stop a retry timer
++  * @qp - the QP
++  *
++  * stop a retry timer and return if the timer
++  * had been pending.
++  */
++ static inline int hfi1_stop_retry_timer(struct rvt_qp *qp)
++ {
++ 	int rval = 0;
++ 
++ 	/* Remove QP from retry */
++ 	if (qp->s_flags & RVT_S_TIMER) {
++ 		qp->s_flags &= ~RVT_S_TIMER;
++ 		rval = del_timer(&qp->s_timer);
++ 	}
++ 	return rval;
++ }
++ 
++ /**
++  * hfi1_stop_rc_timers - stop all timers
++  * @qp - the QP
++  *
++  * stop any pending timers
++  */
++ void hfi1_stop_rc_timers(struct rvt_qp *qp)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	/* Remove QP from all timers */
++ 	if (qp->s_flags & (RVT_S_TIMER | RVT_S_WAIT_RNR)) {
++ 		qp->s_flags &= ~(RVT_S_TIMER | RVT_S_WAIT_RNR);
++ 		del_timer(&qp->s_timer);
++ 		del_timer(&priv->s_rnr_timer);
++ 	}
++ }
++ 
++ /**
++  * hfi1_stop_rnr_timer - stop an rnr timer
++  * @qp - the QP
++  *
++  * stop an rnr timer and return if the timer
++  * had been pending.
++  */
++ static inline int hfi1_stop_rnr_timer(struct rvt_qp *qp)
++ {
++ 	int rval = 0;
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	/* Remove QP from rnr timer */
++ 	if (qp->s_flags & RVT_S_WAIT_RNR) {
++ 		qp->s_flags &= ~RVT_S_WAIT_RNR;
++ 		rval = del_timer(&priv->s_rnr_timer);
++ 	}
++ 	return rval;
++ }
++ 
++ /**
++  * hfi1_del_timers_sync - wait for any timeout routines to exit
++  * @qp - the QP
++  */
++ void hfi1_del_timers_sync(struct rvt_qp *qp)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	del_timer_sync(&qp->s_timer);
++ 	del_timer_sync(&priv->s_rnr_timer);
++ }
++ 
++ static u32 restart_sge(struct rvt_sge_state *ss, struct rvt_swqe *wqe,
+++>>>>>>> 34cee28f0bb0 (staging/rdma/hfi1: actually use new RNR timer API in loopback path):drivers/staging/rdma/hfi1/rc.c
+  		       u32 psn, u32 pmtu)
+  {
+  	u32 len;
+diff --cc drivers/staging/hfi1/ruc.c
+index c4280b6f47d4,a7add3c5d0f2..000000000000
+--- a/drivers/staging/hfi1/ruc.c
++++ b/drivers/staging/hfi1/ruc.c
+@@@ -368,6 -370,8 +368,11 @@@ static void ruc_loopback(struct hfi1_q
+  	enum ib_wc_status send_status;
+  	int release;
+  	int ret;
+++<<<<<<< HEAD:drivers/staging/hfi1/ruc.c
+++=======
++ 	int copy_last = 0;
++ 	u32 to;
+++>>>>>>> 34cee28f0bb0 (staging/rdma/hfi1: actually use new RNR timer API in loopback path):drivers/staging/rdma/hfi1/ruc.c
+  
+  	rcu_read_lock();
+  
+@@@ -592,13 -599,10 +597,18 @@@ rnr_nak
+  	if (sqp->s_rnr_retry_cnt < 7)
+  		sqp->s_rnr_retry--;
+  	spin_lock_irqsave(&sqp->s_lock, flags);
+ -	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_RECV_OK))
+ +	if (!(ib_hfi1_state_ops[sqp->state] & HFI1_PROCESS_RECV_OK))
+  		goto clr_busy;
+++<<<<<<< HEAD:drivers/staging/hfi1/ruc.c
+ +	sqp->s_flags |= HFI1_S_WAIT_RNR;
+ +	sqp->s_timer.function = hfi1_rc_rnr_retry;
+ +	sqp->s_timer.expires = jiffies +
+ +		usecs_to_jiffies(ib_hfi1_rnr_table[qp->r_min_rnr_timer]);
+ +	add_timer(&sqp->s_timer);
+++=======
++ 	to = ib_hfi1_rnr_table[qp->r_min_rnr_timer];
++ 	hfi1_add_rnr_timer(sqp, to);
+++>>>>>>> 34cee28f0bb0 (staging/rdma/hfi1: actually use new RNR timer API in loopback path):drivers/staging/rdma/hfi1/ruc.c
+  	goto clr_busy;
+  
+  op_err:
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
+* Unmerged path drivers/staging/hfi1/rc.c
+* Unmerged path drivers/staging/hfi1/ruc.c
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
