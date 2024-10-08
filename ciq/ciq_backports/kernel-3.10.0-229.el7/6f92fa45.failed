@@ -1,0 +1,276 @@
+NFS: Create a common rpc_call_ops struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Anna Schumaker <Anna.Schumaker@netapp.com>
+commit 6f92fa4581f1c26562f80dc686b3c9ea76556911
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/6f92fa45.failed
+
+The read and write paths set up this struct in exactly the same way, so
+create a single shared struct.
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 6f92fa4581f1c26562f80dc686b3c9ea76556911)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/internal.h
+#	fs/nfs/pagelist.c
+#	fs/nfs/read.c
+#	fs/nfs/write.c
+diff --cc fs/nfs/internal.h
+index 96bd22580dbf,e34220f10165..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -238,6 -237,12 +238,15 @@@ extern void nfs_pgheader_init(struct nf
+  void nfs_set_pgio_error(struct nfs_pgio_header *hdr, int error, loff_t pos);
+  int nfs_iocounter_wait(struct nfs_io_counter *c);
+  
+++<<<<<<< HEAD
+++=======
++ extern const struct rpc_call_ops nfs_pgio_common_ops;
++ struct nfs_rw_header *nfs_rw_header_alloc(const struct nfs_rw_ops *);
++ void nfs_rw_header_free(struct nfs_pgio_header *);
++ struct nfs_pgio_data *nfs_pgio_data_alloc(struct nfs_pgio_header *, unsigned int);
++ void nfs_pgio_data_release(struct nfs_pgio_data *);
++ 
+++>>>>>>> 6f92fa4581f1 (NFS: Create a common rpc_call_ops struct)
+  static inline void nfs_iocounter_init(struct nfs_io_counter *c)
+  {
+  	c->flags = 0;
+diff --cc fs/nfs/pagelist.c
+index 2ffebf2081ce,aabff78dc6e5..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -295,6 -297,123 +295,126 @@@ bool nfs_generic_pg_test(struct nfs_pag
+  }
+  EXPORT_SYMBOL_GPL(nfs_generic_pg_test);
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct nfs_rw_header *NFS_RW_HEADER(struct nfs_pgio_header *hdr)
++ {
++ 	return container_of(hdr, struct nfs_rw_header, header);
++ }
++ 
++ /**
++  * nfs_rw_header_alloc - Allocate a header for a read or write
++  * @ops: Read or write function vector
++  */
++ struct nfs_rw_header *nfs_rw_header_alloc(const struct nfs_rw_ops *ops)
++ {
++ 	struct nfs_rw_header *header = ops->rw_alloc_header();
++ 
++ 	if (header) {
++ 		struct nfs_pgio_header *hdr = &header->header;
++ 
++ 		INIT_LIST_HEAD(&hdr->pages);
++ 		INIT_LIST_HEAD(&hdr->rpc_list);
++ 		spin_lock_init(&hdr->lock);
++ 		atomic_set(&hdr->refcnt, 0);
++ 		hdr->rw_ops = ops;
++ 	}
++ 	return header;
++ }
++ EXPORT_SYMBOL_GPL(nfs_rw_header_alloc);
++ 
++ /*
++  * nfs_rw_header_free - Free a read or write header
++  * @hdr: The header to free
++  */
++ void nfs_rw_header_free(struct nfs_pgio_header *hdr)
++ {
++ 	hdr->rw_ops->rw_free_header(NFS_RW_HEADER(hdr));
++ }
++ EXPORT_SYMBOL_GPL(nfs_rw_header_free);
++ 
++ /**
++  * nfs_pgio_data_alloc - Allocate pageio data
++  * @hdr: The header making a request
++  * @pagecount: Number of pages to create
++  */
++ struct nfs_pgio_data *nfs_pgio_data_alloc(struct nfs_pgio_header *hdr,
++ 					  unsigned int pagecount)
++ {
++ 	struct nfs_pgio_data *data, *prealloc;
++ 
++ 	prealloc = &NFS_RW_HEADER(hdr)->rpc_data;
++ 	if (prealloc->header == NULL)
++ 		data = prealloc;
++ 	else
++ 		data = kzalloc(sizeof(*data), GFP_KERNEL);
++ 	if (!data)
++ 		goto out;
++ 
++ 	if (nfs_pgarray_set(&data->pages, pagecount)) {
++ 		data->header = hdr;
++ 		atomic_inc(&hdr->refcnt);
++ 	} else {
++ 		if (data != prealloc)
++ 			kfree(data);
++ 		data = NULL;
++ 	}
++ out:
++ 	return data;
++ }
++ 
++ /**
++  * nfs_pgio_data_release - Properly free pageio data
++  * @data: The data to release
++  */
++ void nfs_pgio_data_release(struct nfs_pgio_data *data)
++ {
++ 	struct nfs_pgio_header *hdr = data->header;
++ 	struct nfs_rw_header *pageio_header = NFS_RW_HEADER(hdr);
++ 
++ 	put_nfs_open_context(data->args.context);
++ 	if (data->pages.pagevec != data->pages.page_array)
++ 		kfree(data->pages.pagevec);
++ 	if (data == &pageio_header->rpc_data) {
++ 		data->header = NULL;
++ 		data = NULL;
++ 	}
++ 	if (atomic_dec_and_test(&hdr->refcnt))
++ 		hdr->completion_ops->completion(hdr);
++ 	/* Note: we only free the rpc_task after callbacks are done.
++ 	 * See the comment in rpc_free_task() for why
++ 	 */
++ 	kfree(data);
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_data_release);
++ 
++ /**
++  * nfs_pgio_prepare - Prepare pageio data to go over the wire
++  * @task: The current task
++  * @calldata: pageio data to prepare
++  */
++ static void nfs_pgio_prepare(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_data *data = calldata;
++ 	int err;
++ 	err = NFS_PROTO(data->header->inode)->pgio_rpc_prepare(task, data);
++ 	if (err)
++ 		rpc_exit(task, err);
++ }
++ 
++ /**
++  * nfs_pgio_release - Release pageio data
++  * @calldata: The pageio data to release
++  */
++ static void nfs_pgio_release(void *calldata)
++ {
++ 	struct nfs_pgio_data *data = calldata;
++ 	if (data->header->rw_ops->rw_release)
++ 		data->header->rw_ops->rw_release(data);
++ 	nfs_pgio_data_release(data);
++ }
++ 
+++>>>>>>> 6f92fa4581f1 (NFS: Create a common rpc_call_ops struct)
+  /**
+   * nfs_pageio_init - initialise a page io descriptor
+   * @desc: pointer to descriptor
+@@@ -328,6 -449,27 +448,30 @@@ void nfs_pageio_init(struct nfs_pageio_
+  }
+  EXPORT_SYMBOL_GPL(nfs_pageio_init);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * nfs_pgio_result - Basic pageio error handling
++  * @task: The task that ran
++  * @calldata: Pageio data to check
++  */
++ static void nfs_pgio_result(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_data *data = calldata;
++ 	struct inode *inode = data->header->inode;
++ 
++ 	dprintk("NFS: %s: %5u, (status %d)\n", __func__,
++ 		task->tk_pid, task->tk_status);
++ 
++ 	if (data->header->rw_ops->rw_done(task, data, inode) != 0)
++ 		return;
++ 	if (task->tk_status < 0)
++ 		nfs_set_pgio_error(data->header, task->tk_status, data->args.offset);
++ 	else
++ 		data->header->rw_ops->rw_result(task, data);
++ }
++ 
+++>>>>>>> 6f92fa4581f1 (NFS: Create a common rpc_call_ops struct)
+  static bool nfs_match_open_context(const struct nfs_open_context *ctx1,
+  		const struct nfs_open_context *ctx2)
+  {
+diff --cc fs/nfs/read.c
+index 473bba35a2cb,a33490c0899f..000000000000
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@@ -29,8 -29,8 +29,7 @@@
+  #define NFSDBG_FACILITY		NFSDBG_PAGECACHE
+  
+  static const struct nfs_pageio_ops nfs_pageio_read_ops;
+- static const struct rpc_call_ops nfs_read_common_ops;
+  static const struct nfs_pgio_completion_ops nfs_async_read_completion_ops;
+ -static const struct nfs_rw_ops nfs_rw_read_ops;
+  
+  static struct kmem_cache *nfs_rdata_cachep;
+  
+@@@ -513,26 -442,6 +512,29 @@@ static void nfs_readpage_result_common(
+  		nfs_readpage_retry(task, data);
+  }
+  
+++<<<<<<< HEAD
+ +static void nfs_readpage_release_common(void *calldata)
+ +{
+ +	nfs_readdata_release(calldata);
+ +}
+ +
+ +void nfs_read_prepare(struct rpc_task *task, void *calldata)
+ +{
+ +	struct nfs_read_data *data = calldata;
+ +	int err;
+ +	err = NFS_PROTO(data->header->inode)->read_rpc_prepare(task, data);
+ +	if (err)
+ +		rpc_exit(task, err);
+ +}
+ +
+ +static const struct rpc_call_ops nfs_read_common_ops = {
+ +	.rpc_call_prepare = nfs_read_prepare,
+ +	.rpc_call_done = nfs_readpage_result_common,
+ +	.rpc_release = nfs_readpage_release_common,
+ +};
+ +
+++=======
+++>>>>>>> 6f92fa4581f1 (NFS: Create a common rpc_call_ops struct)
+  /*
+   * Read a page over NFS.
+   * We read the page synchronously in the following case:
+diff --cc fs/nfs/write.c
+index f9fc82c305d1,d877f15fb31a..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -1351,15 -1269,8 +1350,18 @@@ static void nfs_writeback_release_commo
+  			set_bit(NFS_IOHDR_NEED_RESCHED, &hdr->flags);
+  		spin_unlock(&hdr->lock);
+  	}
+ +	nfs_writedata_release(data);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct rpc_call_ops nfs_write_common_ops = {
+ +	.rpc_call_prepare = nfs_write_prepare,
+ +	.rpc_call_done = nfs_writeback_done_common,
+ +	.rpc_release = nfs_writeback_release_common,
+ +};
+ +
+++=======
+++>>>>>>> 6f92fa4581f1 (NFS: Create a common rpc_call_ops struct)
+  /*
+   * Special version of should_remove_suid() that ignores capabilities.
+   */
+* Unmerged path fs/nfs/internal.h
+* Unmerged path fs/nfs/pagelist.c
+* Unmerged path fs/nfs/read.c
+* Unmerged path fs/nfs/write.c
