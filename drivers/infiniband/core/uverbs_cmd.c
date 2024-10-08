@@ -1976,7 +1976,8 @@ ssize_t ib_uverbs_create_qp(struct ib_uverbs_file *file,
 		   resp_size);
 	INIT_UDATA(&uhw, buf + sizeof(cmd),
 		   (unsigned long)cmd.response + resp_size,
-		   in_len - sizeof(cmd), out_len - resp_size);
+		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+		   out_len - resp_size);
 
 	memset(&cmd_ex, 0, sizeof(cmd_ex));
 	cmd_ex.user_handle = cmd.user_handle;
@@ -3393,7 +3394,8 @@ ssize_t ib_uverbs_create_srq(struct ib_uverbs_file *file,
 
 	INIT_UDATA(&udata, buf + sizeof cmd,
 		   (unsigned long) cmd.response + sizeof resp,
-		   in_len - sizeof cmd, out_len - sizeof resp);
+		   in_len - sizeof cmd - sizeof(struct ib_uverbs_cmd_hdr),
+		   out_len - sizeof resp);
 
 	ret = __uverbs_create_xsrq(file, ib_dev, &xcmd, &udata);
 	if (ret)
@@ -3419,7 +3421,8 @@ ssize_t ib_uverbs_create_xsrq(struct ib_uverbs_file *file,
 
 	INIT_UDATA(&udata, buf + sizeof cmd,
 		   (unsigned long) cmd.response + sizeof resp,
-		   in_len - sizeof cmd, out_len - sizeof resp);
+		   in_len - sizeof cmd - sizeof(struct ib_uverbs_cmd_hdr),
+		   out_len - sizeof resp);
 
 	ret = __uverbs_create_xsrq(file, ib_dev, &cmd, &udata);
 	if (ret)
