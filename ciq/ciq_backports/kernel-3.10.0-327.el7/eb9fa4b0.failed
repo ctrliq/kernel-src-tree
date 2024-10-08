@@ -1,0 +1,235 @@
+bonding: rebuild the lock use for bond_activebackup_arp_mon()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit eb9fa4b0199f62df3d174d32b4bd534df8ba4533
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/eb9fa4b0.failed
+
+The bond_activebackup_arp_mon() use the bond lock for read to
+protect the slave list, it is no effect, and the RTNL is only
+called for bond_ab_arp_commit() and peer notify, for the performance
+better, use RCU to replace with the bond lock, to the bond slave
+list need to called in RCU, add a new bond_first_slave_rcu()
+to get the first slave in RCU protection.
+
+In bond_ab_arp_probe(), the bond->current_arp_slave may changd
+if bond release slave, just like:
+
+        bond_ab_arp_probe()                     bond_release()
+        cpu 0                                   cpu 1
+        ...
+        if (bond->current_arp_slave...)         ...
+        ...                             bond->current_arp_slave = NULl
+        bond->current_arp_slave->dev->name      ...
+
+So the current_arp_slave need to dereference in the section.
+
+	Suggested-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Suggested-by: Jay Vosburgh <fubar@us.ibm.com>
+	Suggested-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eb9fa4b0199f62df3d174d32b4bd534df8ba4533)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index b9b7314b42bb,bad1bf949546..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2774,30 -2517,21 +2774,34 @@@ re_arm
+   * place for the slave.  Returns 0 if no changes are found, >0 if changes
+   * to link states must be committed.
+   *
+-  * Called with bond->lock held for read.
++  * Called with rcu_read_lock hold.
+   */
+ -static int bond_ab_arp_inspect(struct bonding *bond)
+ +static int bond_ab_arp_inspect(struct bonding *bond, int delta_in_ticks)
+  {
+ -	unsigned long trans_start, last_rx;
+ -	struct list_head *iter;
+  	struct slave *slave;
+ -	int commit = 0;
+ +	int i, commit = 0;
+ +	unsigned long trans_start;
+ +	int extra_ticks;
+ +
+++<<<<<<< HEAD
+ +	/* All the time comparisons below need some extra time. Otherwise, on
+ +	 * fast networks the ARP probe/reply may arrive within the same jiffy
+ +	 * as it was sent.  Then, the next time the ARP monitor is run, one
+ +	 * arp_interval will already have passed in the comparisons.
+ +	 */
+ +	extra_ticks = delta_in_ticks / 2;
+  
+ +	bond_for_each_slave(bond, slave, i) {
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
+++>>>>>>> eb9fa4b0199f (bonding: rebuild the lock use for bond_activebackup_arp_mon())
+  		slave->new_link = BOND_LINK_NOCHANGE;
+ -		last_rx = slave_last_rx(bond, slave);
+  
+  		if (slave->link != BOND_LINK_UP) {
+ -			if (bond_time_in_interval(bond, last_rx, 1)) {
+ +			if (time_in_range(jiffies,
+ +				slave_last_rx(bond, slave) - delta_in_ticks,
+ +				slave_last_rx(bond, slave) + delta_in_ticks + extra_ticks)) {
+ +
+  				slave->new_link = BOND_LINK_UP;
+  				commit++;
+  			}
+@@@ -2865,15 -2588,15 +2869,15 @@@
+   * Called to commit link state changes noted by inspection step of
+   * active-backup mode ARP monitor.
+   *
+-  * Called with RTNL and bond->lock for read.
++  * Called with RTNL hold.
+   */
+ -static void bond_ab_arp_commit(struct bonding *bond)
+ +static void bond_ab_arp_commit(struct bonding *bond, int delta_in_ticks)
+  {
+ -	unsigned long trans_start;
+ -	struct list_head *iter;
+  	struct slave *slave;
+ +	int i;
+ +	unsigned long trans_start;
+  
+ -	bond_for_each_slave(bond, slave, iter) {
+ +	bond_for_each_slave(bond, slave, i) {
+  		switch (slave->new_link) {
+  		case BOND_LINK_NOCHANGE:
+  			continue;
+@@@ -2946,8 -2667,10 +2950,15 @@@ do_failover
+   */
+  static void bond_ab_arp_probe(struct bonding *bond)
+  {
+++<<<<<<< HEAD
+ +	struct slave *slave;
+ +	int i;
+++=======
++ 	struct slave *slave, *before = NULL, *new_slave = NULL,
++ 		     *curr_arp_slave = rcu_dereference(bond->current_arp_slave);
++ 	struct list_head *iter;
++ 	bool found = false;
+++>>>>>>> eb9fa4b0199f (bonding: rebuild the lock use for bond_activebackup_arp_mon())
+  
+  	read_lock(&bond->curr_slave_lock);
+  
+@@@ -2969,25 -2692,20 +2980,37 @@@
+  	 * for becoming the curr_active_slave
+  	 */
+  
+++<<<<<<< HEAD
+ +	if (!bond->current_arp_slave) {
+ +		bond->current_arp_slave = bond->first_slave;
+ +		if (!bond->current_arp_slave)
+++=======
++ 	if (!curr_arp_slave) {
++ 		curr_arp_slave = bond_first_slave_rcu(bond);
++ 		if (!curr_arp_slave)
+++>>>>>>> eb9fa4b0199f (bonding: rebuild the lock use for bond_activebackup_arp_mon())
+  			return;
+  	}
+  
+- 	bond_set_slave_inactive_flags(bond->current_arp_slave);
++ 	bond_set_slave_inactive_flags(curr_arp_slave);
+  
+++<<<<<<< HEAD
+ +	/* search for next candidate */
+ +	bond_for_each_slave_from(bond, slave, i, bond->current_arp_slave->next) {
+ +		if (IS_UP(slave->dev)) {
+ +			slave->link = BOND_LINK_BACK;
+ +			bond_set_slave_active_flags(slave);
+ +			bond_arp_send_all(bond, slave);
+ +			slave->jiffies = jiffies;
+ +			bond->current_arp_slave = slave;
+ +			break;
+ +		}
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (!found && !before && IS_UP(slave->dev))
++ 			before = slave;
+++>>>>>>> eb9fa4b0199f (bonding: rebuild the lock use for bond_activebackup_arp_mon())
+  
+ -		if (found && !new_slave && IS_UP(slave->dev))
+ -			new_slave = slave;
+  		/* if the link state is up at this point, we
+  		 * mark it down - this can happen if we have
+  		 * simultaneous link failures and
+@@@ -3005,7 -2723,21 +3028,25 @@@
+  			pr_info("%s: backup interface %s is now down.\n",
+  				bond->dev->name, slave->dev->name);
+  		}
+++<<<<<<< HEAD
+++	}
+++=======
++ 		if (slave == curr_arp_slave)
++ 			found = true;
+  	}
++ 
++ 	if (!new_slave && before)
++ 		new_slave = before;
++ 
++ 	if (!new_slave)
++ 		return;
++ 
++ 	new_slave->link = BOND_LINK_BACK;
++ 	bond_set_slave_active_flags(new_slave);
++ 	bond_arp_send_all(bond, new_slave);
++ 	new_slave->jiffies = jiffies;
++ 	rcu_assign_pointer(bond->current_arp_slave, new_slave);
+++>>>>>>> eb9fa4b0199f (bonding: rebuild the lock use for bond_activebackup_arp_mon())
+  }
+  
+  void bond_activebackup_arp_mon(struct work_struct *work)
+@@@ -3015,17 -2747,17 +3056,22 @@@
+  	bool should_notify_peers = false;
+  	int delta_in_ticks;
+  
+- 	read_lock(&bond->lock);
+- 
+  	delta_in_ticks = msecs_to_jiffies(bond->params.arp_interval);
+  
+ -	if (!bond_has_slaves(bond))
+ +	if (bond->slave_cnt == 0)
+  		goto re_arm;
+  
++ 	rcu_read_lock();
++ 
+  	should_notify_peers = bond_should_notify_peers(bond);
+  
+++<<<<<<< HEAD
+ +	if (bond_ab_arp_inspect(bond, delta_in_ticks)) {
+ +		read_unlock(&bond->lock);
+++=======
++ 	if (bond_ab_arp_inspect(bond)) {
++ 		rcu_read_unlock();
+++>>>>>>> eb9fa4b0199f (bonding: rebuild the lock use for bond_activebackup_arp_mon())
+  
+  		/* Race avoidance with bond_close flush of workqueue */
+  		if (!rtnl_trylock()) {
+@@@ -3035,13 -2766,10 +3080,16 @@@
+  			goto re_arm;
+  		}
+  
+++<<<<<<< HEAD
+ +		read_lock(&bond->lock);
+ +
+ +		bond_ab_arp_commit(bond, delta_in_ticks);
+++=======
++ 		bond_ab_arp_commit(bond);
+++>>>>>>> eb9fa4b0199f (bonding: rebuild the lock use for bond_activebackup_arp_mon())
+  
+- 		read_unlock(&bond->lock);
+  		rtnl_unlock();
+- 		read_lock(&bond->lock);
++ 		rcu_read_lock();
+  	}
+  
+  	bond_ab_arp_probe(bond);
+* Unmerged path drivers/net/bonding/bond_main.c
