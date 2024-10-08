@@ -1,0 +1,124 @@
+drm/i915: Ignore SURFLIVE and flip counter when the GPU gets reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] i915: Ignore SURFLIVE and flip counter when the GPU gets reset (Rob Clark) [1173317]
+Rebuild_FUZZ: 96.88%
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit bdfa7542d40e6251c232a802231b37116bd31b11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/bdfa7542.failed
+
+During a GPU reset we need to get pending page flip cleared out
+since the ring contents are gone and flip will never complete
+on its own. This used to work until the mmio vs. CS flip race
+detection came about. That piece of code is looking for a
+specific surface address in the SURFLIVE register, but as
+a flip to that address may never happen the check may never
+pass. So we should just skip the SURFLIVE and flip counter
+checks when the GPU gets reset.
+
+intel_display_handle_reset() tries to effectively complete
+the flip anyway by calling .update_primary_plane(). But that
+may not satisfy the conditions of the mmio vs. CS race
+detection since there's no guarantee that a modeset didn't
+sneak in between the GPU reset and intel_display_handle_reset().
+Such a modeset will not wait for pending flips due to the ongoing GPU
+reset, and then the primary plane updates performed by
+intel_display_handle_reset() will already use the new surface
+address, and thus the surface address the flip is waiting for
+might never appear in SURFLIVE. The result is that the flip
+will never complete and attempts to perform further page flips
+will fail with -EBUSY.
+
+During the GPU reset intel_crtc_has_pending_flip() will return
+false regardless, so the deadlock with a modeset vs. the error
+work acquiring crtc->mutex was avoided. And the reset_counter
+check in intel_crtc_has_pending_flip() actually made this bug
+even less severe since it allowed normal modesets to go through
+even though there's a pending flip.
+
+This is a regression introduced by me here:
+ commit 75f7f3ec600524c9544cc31695155f1a9ddbe1d9
+ Author: Ville Syrjälä <ville.syrjala@linux.intel.com>
+ Date:   Tue Apr 15 21:41:34 2014 +0300
+
+    drm/i915: Fix mmio vs. CS flip race on ILK+
+
+Testcase: igt/kms_flip/flip-vs-panning-vs-hang
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+(cherry picked from commit bdfa7542d40e6251c232a802231b37116bd31b11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 5d5f48ca549a,8bcdb981d540..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -7703,9 -9397,55 +7703,58 @@@ void intel_finish_page_flip_plane(struc
+  	do_intel_finish_page_flip(dev, crtc);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Is 'a' after or equal to 'b'? */
++ static bool g4x_flip_count_after_eq(u32 a, u32 b)
++ {
++ 	return !((a - b) & 0x80000000);
++ }
++ 
++ static bool page_flip_finished(struct intel_crtc *crtc)
++ {
++ 	struct drm_device *dev = crtc->base.dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 
++ 	if (i915_reset_in_progress(&dev_priv->gpu_error) ||
++ 	    crtc->reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter))
++ 		return true;
++ 
++ 	/*
++ 	 * The relevant registers doen't exist on pre-ctg.
++ 	 * As the flip done interrupt doesn't trigger for mmio
++ 	 * flips on gmch platforms, a flip count check isn't
++ 	 * really needed there. But since ctg has the registers,
++ 	 * include it in the check anyway.
++ 	 */
++ 	if (INTEL_INFO(dev)->gen < 5 && !IS_G4X(dev))
++ 		return true;
++ 
++ 	/*
++ 	 * A DSPSURFLIVE check isn't enough in case the mmio and CS flips
++ 	 * used the same base address. In that case the mmio flip might
++ 	 * have completed, but the CS hasn't even executed the flip yet.
++ 	 *
++ 	 * A flip count check isn't enough as the CS might have updated
++ 	 * the base address just after start of vblank, but before we
++ 	 * managed to process the interrupt. This means we'd complete the
++ 	 * CS flip too soon.
++ 	 *
++ 	 * Combining both checks should get us a good enough result. It may
++ 	 * still happen that the CS flip has been executed, but has not
++ 	 * yet actually completed. But in case the base address is the same
++ 	 * anyway, we don't really care.
++ 	 */
++ 	return (I915_READ(DSPSURFLIVE(crtc->plane)) & ~0xfff) ==
++ 		crtc->unpin_work->gtt_offset &&
++ 		g4x_flip_count_after_eq(I915_READ(PIPE_FLIPCOUNT_GM45(crtc->pipe)),
++ 				    crtc->unpin_work->flip_count);
++ }
++ 
+++>>>>>>> bdfa7542d40e (drm/i915: Ignore SURFLIVE and flip counter when the GPU gets reset)
+  void intel_prepare_page_flip(struct drm_device *dev, int plane)
+  {
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	drm_i915_private_t *dev_priv = dev->dev_private;
+  	struct intel_crtc *intel_crtc =
+  		to_intel_crtc(dev_priv->plane_to_crtc_mapping[plane]);
+  	unsigned long flags;
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
