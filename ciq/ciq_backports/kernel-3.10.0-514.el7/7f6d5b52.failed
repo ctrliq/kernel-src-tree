@@ -1,0 +1,141 @@
+dax: move writeback calls into the filesystems
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 7f6d5b529b7dfe2fca30cbf4bc81e16575090025
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7f6d5b52.failed
+
+Previously calls to dax_writeback_mapping_range() for all DAX filesystems
+(ext2, ext4 & xfs) were centralized in filemap_write_and_wait_range().
+
+dax_writeback_mapping_range() needs a struct block_device, and it used
+to get that from inode->i_sb->s_bdev.  This is correct for normal inodes
+mounted on ext2, ext4 and XFS filesystems, but is incorrect for DAX raw
+block devices and for XFS real-time files.
+
+Instead, call dax_writeback_mapping_range() directly from the filesystem
+->writepages function so that it can supply us with a valid block
+device.  This also fixes DAX code to properly flush caches in response
+to sync(2).
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Cc: Al Viro <viro@ftp.linux.org.uk>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7f6d5b529b7dfe2fca30cbf4bc81e16575090025)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/linux/dax.h
+#	mm/filemap.c
+diff --cc mm/filemap.c
+index 813fbe54f73b,3461d97ecb30..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -437,7 -483,8 +438,12 @@@ int filemap_write_and_wait_range(struc
+  {
+  	int err = 0;
+  
+++<<<<<<< HEAD
+ +	if (mapping->nrpages) {
+++=======
++ 	if ((!dax_mapping(mapping) && mapping->nrpages) ||
++ 	    (dax_mapping(mapping) && mapping->nrexceptional)) {
+++>>>>>>> 7f6d5b529b7d (dax: move writeback calls into the filesystems)
+  		err = __filemap_fdatawrite_range(mapping, lstart, lend,
+  						 WB_SYNC_ALL);
+  		/* See comment of filemap_write_and_wait() */
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/dax.h
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 2557803cf68e..4c6fe503c28f 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1687,13 +1687,24 @@ static int blkdev_releasepage(struct page *page, gfp_t wait)
+ 	return try_to_free_buffers(page);
+ }
+ 
++static int blkdev_writepages(struct address_space *mapping,
++			     struct writeback_control *wbc)
++{
++	if (dax_mapping(mapping)) {
++		struct block_device *bdev = I_BDEV(mapping->host);
++
++		return dax_writeback_mapping_range(mapping, bdev, wbc);
++	}
++	return generic_writepages(mapping, wbc);
++}
++
+ static const struct address_space_operations def_blk_aops = {
+ 	.readpage	= blkdev_readpage,
+ 	.readpages	= blkdev_readpages,
+ 	.writepage	= blkdev_writepage,
+ 	.write_begin	= blkdev_write_begin,
+ 	.write_end	= blkdev_write_end,
+-	.writepages	= generic_writepages,
++	.writepages	= blkdev_writepages,
+ 	.releasepage	= blkdev_releasepage,
+ 	.direct_IO	= blkdev_direct_IO,
+ 	.is_dirty_writeback = buffer_check_dirty_writeback,
+* Unmerged path fs/dax.c
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index 115fa58bb9ae..4f865ca68742 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -866,6 +866,14 @@ ext2_direct_IO(int rw, struct kiocb *iocb, const struct iovec *iov,
+ static int
+ ext2_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ {
++#ifdef CONFIG_FS_DAX
++	if (dax_mapping(mapping)) {
++		return dax_writeback_mapping_range(mapping,
++						   mapping->host->i_sb->s_bdev,
++						   wbc);
++	}
++#endif
++
+ 	return mpage_writepages(mapping, wbc, ext2_get_block);
+ }
+ 
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 235a73f02c8d..785e45567dc0 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2308,6 +2308,10 @@ static int ext4_writepages(struct address_space *mapping,
+ 
+ 	trace_ext4_writepages(inode, wbc);
+ 
++	if (dax_mapping(mapping))
++		return dax_writeback_mapping_range(mapping, inode->i_sb->s_bdev,
++						   wbc);
++
+ 	/*
+ 	 * No pages to write? This is mainly a kludge to avoid starting
+ 	 * a transaction for special inodes like journal inode on last iput()
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 3ffbdb7cbd8f..6181dda19850 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -1231,6 +1231,10 @@ xfs_vm_writepages(
+ 	struct writeback_control *wbc)
+ {
+ 	xfs_iflags_clear(XFS_I(mapping->host), XFS_ITRUNCATED);
++	if (dax_mapping(mapping))
++		return dax_writeback_mapping_range(mapping,
++				xfs_find_bdev_for_inode(mapping->host), wbc);
++
+ 	return generic_writepages(mapping, wbc);
+ }
+ 
+* Unmerged path include/linux/dax.h
+* Unmerged path mm/filemap.c
