@@ -1,0 +1,452 @@
+bonding: Fix stacked device detection in arp monitoring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vlad Yasevich <vyasevic@redhat.com>
+commit 44a4085538c844e79d6ee6bcf46fabf7c57a9a38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/44a40855.failed
+
+Prior to commit fbd929f2dce460456807a51e18d623db3db9f077
+	bonding: support QinQ for bond arp interval
+
+the arp monitoring code allowed for proper detection of devices
+stacked on top of vlans.  Since the above commit, the
+code can still detect a device stacked on top of single
+vlan, but not a device stacked on top of Q-in-Q configuration.
+The search will only set the inner vlan tag if the route
+device is the vlan device.  However, this is not always the
+case, as it is possible to extend the stacked configuration.
+
+With this patch it is possible to provision devices on
+top Q-in-Q vlan configuration that should be used as
+a source of ARP monitoring information.
+
+For example:
+ip link add link bond0 vlan10 type vlan proto 802.1q id 10
+ip link add link vlan10 vlan100 type vlan proto 802.1q id 100
+ip link add link vlan100 type macvlan
+
+Note:  This patch limites the number of stacked VLANs to 2,
+just like before.  The original, however had another issue
+in that if we had more then 2 levels of VLANs, we would end
+up generating incorrectly tagged traffic.  This is no longer
+possible.
+
+Fixes: fbd929f2dce460456807a51e18d623db3db9f077 (bonding: support QinQ for bond arp interval)
+CC: Jay Vosburgh <j.vosburgh@gmail.com>
+CC: Veaceslav Falico <vfalico@redhat.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+CC: Ding Tianhong <dingtianhong@huawei.com>
+CC: Patric McHardy <kaber@trash.net>
+	Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 44a4085538c844e79d6ee6bcf46fabf7c57a9a38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+#	include/linux/if_vlan.h
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc drivers/net/bonding/bond_main.c
+index dd9219794eca,d3a67896d435..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2218,13 -2126,13 +2218,13 @@@ static bool bond_has_this_ip(struct bon
+   */
+  static void bond_arp_send(struct net_device *slave_dev, int arp_op,
+  			  __be32 dest_ip, __be32 src_ip,
+- 			  struct bond_vlan_tag *inner,
+- 			  struct bond_vlan_tag *outer)
++ 			  struct bond_vlan_tag *tags)
+  {
+  	struct sk_buff *skb;
++ 	int i;
+  
+ -	pr_debug("arp %d on slave %s: dst %pI4 src %pI4\n",
+ -		 arp_op, slave_dev->name, &dest_ip, &src_ip);
+ +	netdev_dbg(slave_dev, "arp %d on slave %s: dst %pI4 src %pI4\n",
+ +		   arp_op, slave_dev->name, &dest_ip, &src_ip);
+  
+  	skb = arp_create(arp_op, ETH_P_ARP, dest_ip, slave_dev, src_ip,
+  			 NULL, slave_dev->dev_addr, NULL);
+@@@ -2233,22 -2141,30 +2233,49 @@@
+  		net_err_ratelimited("ARP packet allocation failed\n");
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	if (outer->vlan_id) {
+ +		if (inner->vlan_id) {
+ +			netdev_dbg(slave_dev, "inner tag: proto %X vid %X\n",
+ +				   ntohs(inner->vlan_proto), inner->vlan_id);
+ +			skb = vlan_insert_tag_set_proto(skb, inner->vlan_proto,
+ +							inner->vlan_id);
+ +			if (!skb) {
+ +				net_err_ratelimited("failed to insert inner VLAN tag\n");
+ +				return;
+ +			}
+ +		}
+ +
+ +		netdev_dbg(slave_dev, "outer reg: proto %X vid %X\n",
+ +			   ntohs(outer->vlan_proto), outer->vlan_id);
+ +		__vlan_hwaccel_put_tag(skb, outer->vlan_proto,
+ +				       outer->vlan_id);
+++=======
++ 
++ 	/* Go through all the tags backwards and add them to the packet */
++ 	for (i = BOND_MAX_VLAN_ENCAP - 1; i > 0; i--) {
++ 		if (!tags[i].vlan_id)
++ 			continue;
++ 
++ 		pr_debug("inner tag: proto %X vid %X\n",
++ 			 ntohs(tags[i].vlan_proto), tags[i].vlan_id);
++ 		skb = __vlan_put_tag(skb, tags[i].vlan_proto,
++ 				     tags[i].vlan_id);
++ 		if (!skb) {
++ 			net_err_ratelimited("failed to insert inner VLAN tag\n");
++ 			return;
++ 		}
++ 	}
++ 	/* Set the outer tag */
++ 	if (tags[0].vlan_id) {
++ 		pr_debug("outer tag: proto %X vid %X\n",
++ 			 ntohs(tags[0].vlan_proto), tags[0].vlan_id);
++ 		skb = vlan_put_tag(skb, tags[0].vlan_proto, tags[0].vlan_id);
++ 		if (!skb) {
++ 			net_err_ratelimited("failed to insert outer VLAN tag\n");
++ 			return;
++ 		}
+++>>>>>>> 44a4085538c8 (bonding: Fix stacked device detection in arp monitoring)
+  	}
+  	arp_xmit(skb);
+  }
+@@@ -2256,18 -2206,15 +2317,27 @@@ static bool bond_verify_device_path(str
+  
+  static void bond_arp_send_all(struct bonding *bond, struct slave *slave)
+  {
+++<<<<<<< HEAD
+ +	struct netdev_upper *upper, *vlan_upper;
+++=======
+++>>>>>>> 44a4085538c8 (bonding: Fix stacked device detection in arp monitoring)
+  	struct rtable *rt;
+- 	struct bond_vlan_tag inner, outer;
++ 	struct bond_vlan_tag tags[BOND_MAX_VLAN_ENCAP];
+  	__be32 *targets = bond->params.arp_targets, addr;
+  	int i;
++ 	bool ret;
+  
+  	for (i = 0; i < BOND_MAX_ARP_TARGETS && targets[i]; i++) {
+++<<<<<<< HEAD
+ +		netdev_dbg(bond->dev, "basa: target %pI4\n", &targets[i]);
+ +		inner.vlan_proto = 0;
+ +		inner.vlan_id = 0;
+ +		outer.vlan_proto = 0;
+ +		outer.vlan_id = 0;
+++=======
++ 		pr_debug("basa: target %pI4\n", &targets[i]);
++ 		memset(tags, 0, sizeof(tags));
+++>>>>>>> 44a4085538c8 (bonding: Fix stacked device detection in arp monitoring)
+  
+  		/* Find out through which dev should the packet go */
+  		rt = ip_route_output(dev_net(bond->dev), targets[i], 0,
+@@@ -2289,55 -2237,16 +2360,62 @@@
+  			goto found;
+  
+  		rcu_read_lock();
+++<<<<<<< HEAD
+ +		/* first we search only for vlan devices. for every vlan
+ +		 * found we verify its upper dev list, searching for the
+ +		 * rt->dst.dev. If found we save the tag of the vlan and
+ +		 * proceed to send the packet.
+ +		 */
+ +		list_for_each_entry_rcu(vlan_upper, &bond->dev->upper_dev_list, list) {
+ +			if (!is_vlan_dev(vlan_upper->dev))
+ +				continue;
+ +
+ +			if (vlan_upper->dev == rt->dst.dev) {
+ +				outer.vlan_proto = vlan_dev_vlan_proto(vlan_upper->dev);
+ +				outer.vlan_id = vlan_dev_vlan_id(vlan_upper->dev);
+ +				rcu_read_unlock();
+ +				goto found;
+ +			}
+ +			list_for_each_entry_rcu(upper,
+ +						&vlan_upper->dev->upper_dev_list,
+ +						list) {
+ +				if (upper->dev == rt->dst.dev) {
+ +					/* If the upper dev is a vlan dev too,
+ +					 *  set the vlan tag to inner tag.
+ +					 */
+ +					if (is_vlan_dev(upper->dev)) {
+ +						inner.vlan_proto = vlan_dev_vlan_proto(upper->dev);
+ +						inner.vlan_id = vlan_dev_vlan_id(upper->dev);
+ +					}
+ +					outer.vlan_proto = vlan_dev_vlan_proto(vlan_upper->dev);
+ +					outer.vlan_id = vlan_dev_vlan_id(vlan_upper->dev);
+ +					rcu_read_unlock();
+ +					goto found;
+ +				}
+ +			}
+ +		}
+ +
+ +		/* if the device we're looking for is not on top of any of
+ +		 * our upper vlans, then just search for any dev that
+ +		 * matches, and in case it's a vlan - save the id
+ +		 */
+ +		list_for_each_entry_rcu(upper, &bond->dev->upper_dev_list, list) {
+ +			if (upper->dev == rt->dst.dev) {
+ +				rcu_read_unlock();
+ +				goto found;
+ +			}
+ +		}
+++=======
++ 		ret = bond_verify_device_path(bond->dev, rt->dst.dev, tags);
+++>>>>>>> 44a4085538c8 (bonding: Fix stacked device detection in arp monitoring)
+  		rcu_read_unlock();
+  
++ 		if (ret)
++ 			goto found;
++ 
+  		/* Not our device - skip */
+ -		pr_debug("%s: no path to arp_ip_target %pI4 via rt.dev %s\n",
+ -			 bond->dev->name, &targets[i],
+ -			 rt->dst.dev ? rt->dst.dev->name : "NULL");
+ +		netdev_dbg(bond->dev, "no path to arp_ip_target %pI4 via rt.dev %s\n",
+ +			   &targets[i], rt->dst.dev ? rt->dst.dev->name : "NULL");
+  
+  		ip_rt_put(rt);
+  		continue;
+diff --cc include/linux/if_vlan.h
+index 089213ca80b7,c901b13b6f03..000000000000
+--- a/include/linux/if_vlan.h
++++ b/include/linux/if_vlan.h
+@@@ -555,91 -485,9 +555,98 @@@ static inline void vlan_set_encap_proto
+  		skb->protocol = htons(ETH_P_802_2);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * skb_vlan_tagged - check if skb is vlan tagged.
+ + * @skb: skbuff to query
+ + *
+ + * Returns true if the skb is tagged, regardless of whether it is hardware
+ + * accelerated or not.
+ + */
+ +static inline bool skb_vlan_tagged(const struct sk_buff *skb)
+ +{
+ +	if (!skb_vlan_tag_present(skb) &&
+ +	    likely(skb->protocol != htons(ETH_P_8021Q) &&
+ +		   skb->protocol != htons(ETH_P_8021AD)))
+ +		return false;
+ +
+ +	return true;
+ +}
+ +
+ +/**
+ + * skb_vlan_tagged_multi - check if skb is vlan tagged with multiple headers.
+ + * @skb: skbuff to query
+ + *
+ + * Returns true if the skb is tagged with multiple vlan headers, regardless
+ + * of whether it is hardware accelerated or not.
+ + */
+ +static inline bool skb_vlan_tagged_multi(const struct sk_buff *skb)
+ +{
+ +	__be16 protocol = skb->protocol;
+ +
+ +	if (!skb_vlan_tag_present(skb)) {
+ +		struct vlan_ethhdr *veh;
+ +
+ +		if (likely(protocol != htons(ETH_P_8021Q) &&
+ +			   protocol != htons(ETH_P_8021AD)))
+ +			return false;
+ +
+ +		veh = (struct vlan_ethhdr *)skb->data;
+ +		protocol = veh->h_vlan_encapsulated_proto;
+ +	}
+ +
+ +	if (protocol != htons(ETH_P_8021Q) && protocol != htons(ETH_P_8021AD))
+ +		return false;
+ +
+ +	return true;
+ +}
+ +
+ +/**
+ + * vlan_features_check - drop unsafe features for skb with multiple tags.
+ + * @skb: skbuff to query
+ + * @features: features to be checked
+ + *
+ + * Returns features without unsafe ones if the skb has multiple tags.
+ + */
+ +static inline netdev_features_t vlan_features_check(const struct sk_buff *skb,
+ +						    netdev_features_t features)
+ +{
+ +	if (skb_vlan_tagged_multi(skb))
+ +		features = netdev_intersect_features(features,
+ +						     NETIF_F_SG |
+ +						     NETIF_F_HIGHDMA |
+ +						     NETIF_F_FRAGLIST |
+ +						     NETIF_F_GEN_CSUM |
+ +						     NETIF_F_HW_VLAN_CTAG_TX |
+ +						     NETIF_F_HW_VLAN_STAG_TX);
+ +
+ +	return features;
+ +}
+ +
+ +/**
+ + * compare_vlan_header - Compare two vlan headers
+ + * @h1: Pointer to vlan header
+ + * @h2: Pointer to vlan header
+ + *
+ + * Compare two vlan headers, returns 0 if equal.
+ + *
+ + * Please note that alignment of h1 & h2 are only guaranteed to be 16 bits.
+ + */
+ +static inline unsigned long compare_vlan_header(const struct vlan_hdr *h1,
+ +						const struct vlan_hdr *h2)
+ +{
+ +#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+ +	return *(u32 *)h1 ^ *(u32 *)h2;
+ +#else
+ +	return ((__force u32)h1->h_vlan_TCI ^ (__force u32)h2->h_vlan_TCI) |
+ +	       ((__force u32)h1->h_vlan_encapsulated_proto ^
+ +		(__force u32)h2->h_vlan_encapsulated_proto);
+ +#endif
+++=======
++ static inline int vlan_get_encap_level(struct net_device *dev)
++ {
++ 	BUG_ON(!is_vlan_dev(dev));
++ 	return vlan_dev_priv(dev)->nest_level;
+++>>>>>>> 44a4085538c8 (bonding: Fix stacked device detection in arp monitoring)
+  }
+  #endif /* !(_LINUX_IF_VLAN_H_) */
+diff --cc include/linux/netdevice.h
+index 7b10147de03d,b42d07b0390b..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -3274,7 -3056,52 +3274,56 @@@ extern int		weight_p
+  extern int		bpf_jit_enable;
+  
+  bool netdev_has_upper_dev(struct net_device *dev, struct net_device *upper_dev);
+++<<<<<<< HEAD
+ +bool netdev_has_any_upper_dev(struct net_device *dev);
+++=======
++ struct net_device *netdev_upper_get_next_dev_rcu(struct net_device *dev,
++ 						     struct list_head **iter);
++ struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
++ 						     struct list_head **iter);
++ 
++ /* iterate through upper list, must be called under RCU read lock */
++ #define netdev_for_each_upper_dev_rcu(dev, updev, iter) \
++ 	for (iter = &(dev)->adj_list.upper, \
++ 	     updev = netdev_upper_get_next_dev_rcu(dev, &(iter)); \
++ 	     updev; \
++ 	     updev = netdev_upper_get_next_dev_rcu(dev, &(iter)))
++ 
++ /* iterate through upper list, must be called under RCU read lock */
++ #define netdev_for_each_all_upper_dev_rcu(dev, updev, iter) \
++ 	for (iter = &(dev)->all_adj_list.upper, \
++ 	     updev = netdev_all_upper_get_next_dev_rcu(dev, &(iter)); \
++ 	     updev; \
++ 	     updev = netdev_all_upper_get_next_dev_rcu(dev, &(iter)))
++ 
++ void *netdev_lower_get_next_private(struct net_device *dev,
++ 				    struct list_head **iter);
++ void *netdev_lower_get_next_private_rcu(struct net_device *dev,
++ 					struct list_head **iter);
++ 
++ #define netdev_for_each_lower_private(dev, priv, iter) \
++ 	for (iter = (dev)->adj_list.lower.next, \
++ 	     priv = netdev_lower_get_next_private(dev, &(iter)); \
++ 	     priv; \
++ 	     priv = netdev_lower_get_next_private(dev, &(iter)))
++ 
++ #define netdev_for_each_lower_private_rcu(dev, priv, iter) \
++ 	for (iter = &(dev)->adj_list.lower, \
++ 	     priv = netdev_lower_get_next_private_rcu(dev, &(iter)); \
++ 	     priv; \
++ 	     priv = netdev_lower_get_next_private_rcu(dev, &(iter)))
++ 
++ void *netdev_lower_get_next(struct net_device *dev,
++ 				struct list_head **iter);
++ #define netdev_for_each_lower_dev(dev, ldev, iter) \
++ 	for (iter = &(dev)->adj_list.lower, \
++ 	     ldev = netdev_lower_get_next(dev, &(iter)); \
++ 	     ldev; \
++ 	     ldev = netdev_lower_get_next(dev, &(iter)))
++ 
++ void *netdev_adjacent_get_private(struct list_head *adj_list);
++ void *netdev_lower_get_first_private_rcu(struct net_device *dev);
+++>>>>>>> 44a4085538c8 (bonding: Fix stacked device detection in arp monitoring)
+  struct net_device *netdev_master_upper_dev_get(struct net_device *dev);
+  struct net_device *netdev_master_upper_dev_get_rcu(struct net_device *dev);
+  int netdev_upper_dev_link(struct net_device *dev, struct net_device *upper_dev);
+diff --cc net/core/dev.c
+index 004e3f31d664,9abc503b19b7..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4606,7 -4531,44 +4606,48 @@@ struct net_device *netdev_master_upper_
+  }
+  EXPORT_SYMBOL(netdev_master_upper_dev_get);
+  
+++<<<<<<< HEAD
+ +/* netdev_upper_get_next_dev_rcu - Get the next dev from upper list
+++=======
++ void *netdev_adjacent_get_private(struct list_head *adj_list)
++ {
++ 	struct netdev_adjacent *adj;
++ 
++ 	adj = list_entry(adj_list, struct netdev_adjacent, list);
++ 
++ 	return adj->private;
++ }
++ EXPORT_SYMBOL(netdev_adjacent_get_private);
++ 
++ /**
++  * netdev_upper_get_next_dev_rcu - Get the next dev from upper list
++  * @dev: device
++  * @iter: list_head ** of the current position
++  *
++  * Gets the next device from the dev's upper list, starting from iter
++  * position. The caller must hold RCU read lock.
++  */
++ struct net_device *netdev_upper_get_next_dev_rcu(struct net_device *dev,
++ 						 struct list_head **iter)
++ {
++ 	struct netdev_adjacent *upper;
++ 
++ 	WARN_ON_ONCE(!rcu_read_lock_held() && !lockdep_rtnl_is_held());
++ 
++ 	upper = list_entry_rcu((*iter)->next, struct netdev_adjacent, list);
++ 
++ 	if (&upper->list == &dev->adj_list.upper)
++ 		return NULL;
++ 
++ 	*iter = &upper->list;
++ 
++ 	return upper->dev;
++ }
++ EXPORT_SYMBOL(netdev_upper_get_next_dev_rcu);
++ 
++ /**
++  * netdev_all_upper_get_next_dev_rcu - Get the next dev from upper list
+++>>>>>>> 44a4085538c8 (bonding: Fix stacked device detection in arp monitoring)
+   * @dev: device
+   * @iter: list_head ** of the current position
+   *
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path include/linux/if_vlan.h
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 8c9030b1a51e..d3f6c84b2576 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -37,6 +37,7 @@
+ 
+ #define bond_version DRV_DESCRIPTION ": v" DRV_VERSION " (" DRV_RELDATE ")\n"
+ 
++#define BOND_MAX_VLAN_ENCAP	2
+ #define BOND_MAX_ARP_TARGETS	16
+ 
+ #define BOND_DEFAULT_MIIMON	100
+* Unmerged path net/core/dev.c
