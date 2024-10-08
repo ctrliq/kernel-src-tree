@@ -1,0 +1,557 @@
+mei: use only one buffer in callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 5db7514d9333c920791538c850cfb9dbd19025f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5db7514d.failed
+
+The callback structure is used exclusively for reading or writing
+therefore there is no reason to hold both response and request buffers
+in the callback structure
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5db7514d9333c920791538c850cfb9dbd19025f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/amthif.c
+#	drivers/misc/mei/bus.c
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/interrupt.c
+#	drivers/misc/mei/main.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/amthif.c
+index a11128c1997f,2cc41cb3bb38..000000000000
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@@ -230,16 -213,16 +230,27 @@@ int mei_amthif_read(struct mei_device *
+  		 * remove message from deletion list
+  		 */
+  
+++<<<<<<< HEAD
+ +	dev_dbg(&dev->pdev->dev, "amthif cb->response_buffer size - %d\n",
+ +	    cb->response_buffer.size);
+ +	dev_dbg(&dev->pdev->dev, "amthif cb->buf_idx - %lu\n", cb->buf_idx);
+++=======
++ 	dev_dbg(dev->dev, "amthif cb->buf size - %d\n",
++ 	    cb->buf.size);
++ 	dev_dbg(dev->dev, "amthif cb->buf_idx - %lu\n", cb->buf_idx);
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  
+  	/* length is being truncated to PAGE_SIZE, however,
+  	 * the buf_idx may point beyond */
+  	length = min_t(size_t, length, (cb->buf_idx - *offset));
+  
+++<<<<<<< HEAD
+ +	if (copy_to_user(ubuf, cb->response_buffer.data + *offset, length)) {
+ +		dev_dbg(&dev->pdev->dev, "failed to copy data to userland\n");
+++=======
++ 	if (copy_to_user(ubuf, cb->buf.data + *offset, length)) {
++ 		dev_dbg(dev->dev, "failed to copy data to userland\n");
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  		rets = -EFAULT;
+  	} else {
+  		rets = length;
+@@@ -257,23 -240,60 +268,64 @@@ out
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * mei_amthif_read_start - queue message for sending read credential
++  *
++  * @cl: host client
++  * @file: file pointer of message recipient
++  *
++  * Return: 0 on success, <0 on failure.
++  */
++ static int mei_amthif_read_start(struct mei_cl *cl, struct file *file)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 	struct mei_cl_cb *cb;
++ 	size_t length = dev->iamthif_mtu;
++ 	int rets;
++ 
++ 	cb = mei_io_cb_init(cl, file);
++ 	if (!cb) {
++ 		rets = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	rets = mei_io_cb_alloc_buf(cb, length);
++ 	if (rets)
++ 		goto err;
++ 
++ 	cb->fop_type = MEI_FOP_READ;
++ 	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
++ 
++ 	dev->iamthif_state = MEI_IAMTHIF_READING;
++ 	dev->iamthif_file_object = cb->file_object;
++ 	dev->iamthif_current_cb = cb;
++ 
++ 	return 0;
++ err:
++ 	mei_io_cb_free(cb);
++ 	return rets;
++ }
++ 
++ /**
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+   * mei_amthif_send_cmd - send amthif command to the ME
+   *
+ - * @cl: the host client
+ + * @dev: the device structure
+   * @cb: mei call back struct
+   *
+ - * Return: 0 on success, <0 on failure.
+ + * returns 0 on success, <0 on failure.
+ + *
+   */
+ -static int mei_amthif_send_cmd(struct mei_cl *cl, struct mei_cl_cb *cb)
+ +static int mei_amthif_send_cmd(struct mei_device *dev, struct mei_cl_cb *cb)
+  {
+ -	struct mei_device *dev;
+ +	struct mei_msg_hdr mei_hdr;
+  	int ret;
+  
+ -	if (!cl->dev || !cb)
+ +	if (!dev || !cb)
+  		return -ENODEV;
+  
+ -	dev = cl->dev;
+ +	dev_dbg(&dev->pdev->dev, "write data to amthif client.\n");
+  
+  	dev->iamthif_state = MEI_IAMTHIF_WRITING;
+  	dev->iamthif_current_cb = cb;
+diff --cc drivers/misc/mei/bus.c
+index ca8736c3675b,36b949a0fddb..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -238,33 -237,40 +238,39 @@@ static int ___mei_cl_send(struct mei_c
+  
+  	dev = cl->dev;
+  
+ -	mutex_lock(&dev->device_lock);
+ -	if (cl->state != MEI_FILE_CONNECTED) {
+ -		rets = -ENODEV;
+ -		goto out;
+ -	}
+ +	if (cl->state != MEI_FILE_CONNECTED)
+ +		return -ENODEV;
+  
+  	/* Check if we have an ME client device */
+ -	me_cl = mei_me_cl_by_uuid_id(dev, &cl->cl_uuid, cl->me_client_id);
+ -	if (!me_cl) {
+ -		rets = -ENOTTY;
+ -		goto out;
+ -	}
+ +	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (id < 0)
+ +		return id;
+  
+ -	if (length > me_cl->props.max_msg_length) {
+ -		rets = -EFBIG;
+ -		goto out;
+ -	}
+ +	if (length > dev->me_clients[id].props.max_msg_length)
+ +		return -EINVAL;
+  
+  	cb = mei_io_cb_init(cl, NULL);
+ -	if (!cb) {
+ -		rets = -ENOMEM;
+ -		goto out;
+ -	}
+ +	if (!cb)
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	rets = mei_io_cb_alloc_req_buf(cb, length);
+ +	if (rets < 0) {
+ +		mei_io_cb_free(cb);
+ +		return rets;
+ +	}
+++=======
++ 	rets = mei_io_cb_alloc_buf(cb, length);
++ 	if (rets < 0)
++ 		goto out;
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  
+- 	memcpy(cb->request_buffer.data, buf, length);
++ 	memcpy(cb->buf.data, buf, length);
+  
+ +	mutex_lock(&dev->device_lock);
+ +
+  	rets = mei_cl_write(cl, cb, blocking);
+  
+ -out:
+ -	mei_me_cl_put(me_cl);
+  	mutex_unlock(&dev->device_lock);
+  	if (rets < 0)
+  		mei_io_cb_free(cb);
+@@@ -318,10 -322,16 +324,15 @@@ int __mei_cl_recv(struct mei_cl *cl, u
+  		goto out;
+  	}
+  
+ -	if (cb->status) {
+ -		rets = cb->status;
+ -		goto free;
+ -	}
+ -
+  	r_length = min_t(size_t, length, cb->buf_idx);
+++<<<<<<< HEAD
+++=======
++ 	memcpy(buf, cb->buf.data, r_length);
++ 	rets = r_length;
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+ +
+ +	memcpy(buf, cb->response_buffer.data, r_length);
+  
+ -free:
+  	mei_io_cb_free(cb);
+  	cl->reading_state = MEI_IDLE;
+  	cl->read_cb = NULL;
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,5ecb6cc79d70..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -191,38 -422,12 +190,41 @@@ int mei_io_cb_alloc_buf(struct mei_cl_c
+  	if (length == 0)
+  		return 0;
+  
+- 	cb->request_buffer.data = kmalloc(length, GFP_KERNEL);
+- 	if (!cb->request_buffer.data)
++ 	cb->buf.data = kmalloc(length, GFP_KERNEL);
++ 	if (!cb->buf.data)
+  		return -ENOMEM;
+- 	cb->request_buffer.size = length;
++ 	cb->buf.size = length;
+  	return 0;
+  }
+++<<<<<<< HEAD
+ +/**
+ + * mei_io_cb_alloc_resp_buf - allocate response buffer
+ + *
+ + * @cb: io callback structure
+ + * @length: size of the buffer
+ + *
+ + * returns 0 on success
+ + *         -EINVAL if cb is NULL
+ + *         -ENOMEM if allocation failed
+ + */
+ +int mei_io_cb_alloc_resp_buf(struct mei_cl_cb *cb, size_t length)
+ +{
+ +	if (!cb)
+ +		return -EINVAL;
+ +
+ +	if (length == 0)
+ +		return 0;
+ +
+ +	cb->response_buffer.data = kmalloc(length, GFP_KERNEL);
+ +	if (!cb->response_buffer.data)
+ +		return -ENOMEM;
+ +	cb->response_buffer.size = length;
+ +	return 0;
+ +}
+ +
+ +
+++=======
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  
+  /**
+   * mei_cl_flush_queues - flushes queue lists belonging to cl.
+@@@ -761,9 -978,7 +763,13 @@@ int mei_cl_read_start(struct mei_cl *cl
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* always allocate at least client max message */
+ +	length = max_t(size_t, length, dev->me_clients[i].props.max_msg_length);
+ +	rets = mei_io_cb_alloc_resp_buf(cb, length);
+++=======
++ 	rets = mei_io_cb_alloc_buf(cb, length);
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  	if (rets)
+  		goto out;
+  
+@@@ -901,13 -1117,13 +907,13 @@@ int mei_cl_write(struct mei_cl *cl, str
+  	dev = cl->dev;
+  
+  
+- 	buf = &cb->request_buffer;
++ 	buf = &cb->buf;
+  
+ -	cl_dbg(dev, cl, "size=%d\n", buf->size);
+ +	cl_dbg(dev, cl, "mei_cl_write %d\n", buf->size);
+  
+ -	rets = pm_runtime_get(dev->dev);
+ +	rets = pm_runtime_get(&dev->pdev->dev);
+  	if (rets < 0 && rets != -EINPROGRESS) {
+ -		pm_runtime_put_noidle(dev->dev);
+ +		pm_runtime_put_noidle(&dev->pdev->dev);
+  		cl_err(dev, cl, "rpm: get failed %d\n", rets);
+  		return rets;
+  	}
+diff --cc drivers/misc/mei/interrupt.c
+index b8d9cfee3e87,60469a0053bb..000000000000
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@@ -87,74 -82,96 +87,117 @@@ static bool mei_cl_is_reading(struct me
+  }
+  
+  /**
+ - * mei_irq_discard_msg  - discard received message
+ + * mei_irq_read_client_message - process client message
+   *
+ - * @dev: mei device
+ - * @hdr: message header
+ - */
+ -static inline
+ -void mei_irq_discard_msg(struct mei_device *dev, struct mei_msg_hdr *hdr)
+ -{
+ -	/*
+ -	 * no need to check for size as it is guarantied
+ -	 * that length fits into rd_msg_buf
+ -	 */
+ -	mei_read_slots(dev, dev->rd_msg_buf, hdr->length);
+ -	dev_dbg(dev->dev, "discarding message " MEI_HDR_FMT "\n",
+ -		MEI_HDR_PRM(hdr));
+ -}
+ -
+ -/**
+ - * mei_cl_irq_read_msg - process client message
+ - *
+ - * @cl: reading client
+ + * @dev: the device structure
+   * @mei_hdr: header of mei client message
+ - * @complete_list: completion list
+ + * @complete_list: An instance of our list structure
+   *
+ - * Return: always 0
+ + * returns 0 on success, <0 on failure.
+   */
+ -int mei_cl_irq_read_msg(struct mei_cl *cl,
+ -		       struct mei_msg_hdr *mei_hdr,
+ -		       struct mei_cl_cb *complete_list)
+ +static int mei_cl_irq_read_msg(struct mei_device *dev,
+ +			       struct mei_msg_hdr *mei_hdr,
+ +			       struct mei_cl_cb *complete_list)
+  {
+ -	struct mei_device *dev = cl->dev;
+ -	struct mei_cl_cb *cb;
+ +	struct mei_cl *cl;
+ +	struct mei_cl_cb *cb, *next;
+  	unsigned char *buffer = NULL;
+  
+ -	list_for_each_entry(cb, &dev->read_list.list, list) {
+ -		if (cl == cb->cl)
+ -			break;
+ -	}
+ +	list_for_each_entry_safe(cb, next, &dev->read_list.list, list) {
+ +		cl = cb->cl;
+ +		if (!cl || !mei_cl_is_reading(cl, mei_hdr))
+ +			continue;
+  
+ -	if (&cb->list == &dev->read_list.list) {
+ -		dev_err(dev->dev, "no reader found\n");
+ -		goto out;
+ +		cl->reading_state = MEI_READING;
+ +
+++<<<<<<< HEAD
+ +		if (cb->response_buffer.size == 0 ||
+ +		    cb->response_buffer.data == NULL) {
+ +			cl_err(dev, cl, "response buffer is not allocated.\n");
+ +			list_del(&cb->list);
+ +			return -ENOMEM;
+ +		}
+ +
+ +		if (cb->response_buffer.size < mei_hdr->length + cb->buf_idx) {
+ +			cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
+ +				cb->response_buffer.size,
+ +				mei_hdr->length, cb->buf_idx);
+ +			buffer = krealloc(cb->response_buffer.data,
+ +					  mei_hdr->length + cb->buf_idx,
+ +					  GFP_KERNEL);
+ +
+ +			if (!buffer) {
+ +				list_del(&cb->list);
+ +				return -ENOMEM;
+ +			}
+ +			cb->response_buffer.data = buffer;
+ +			cb->response_buffer.size =
+ +				mei_hdr->length + cb->buf_idx;
+ +		}
+ +
+ +		buffer = cb->response_buffer.data + cb->buf_idx;
+ +		mei_read_slots(dev, buffer, mei_hdr->length);
+ +
+ +		cb->buf_idx += mei_hdr->length;
+ +		if (mei_hdr->msg_complete) {
+ +			cl->status = 0;
+ +			list_del(&cb->list);
+ +			cl_dbg(dev, cl, "completed read length = %lu\n",
+ +				cb->buf_idx);
+ +			list_add_tail(&cb->list, &complete_list->list);
+ +		}
+ +		break;
+  	}
+  
+ +	dev_dbg(&dev->pdev->dev, "message read\n");
+ +	if (!buffer) {
+ +		mei_read_slots(dev, dev->rd_msg_buf, mei_hdr->length);
+ +		dev_dbg(&dev->pdev->dev, "discarding message " MEI_HDR_FMT "\n",
+ +				MEI_HDR_PRM(mei_hdr));
+++=======
++ 	if (!mei_cl_is_reading(cl)) {
++ 		cl_err(dev, cl, "cl is not reading state=%d reading state=%d\n",
++ 			cl->state, cl->reading_state);
++ 		goto out;
++ 	}
++ 
++ 	cl->reading_state = MEI_READING;
++ 
++ 	if (cb->buf.size == 0 || cb->buf.data == NULL) {
++ 		cl_err(dev, cl, "response buffer is not allocated.\n");
++ 		list_move_tail(&cb->list, &complete_list->list);
++ 		cb->status = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	if (cb->buf.size < mei_hdr->length + cb->buf_idx) {
++ 		cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
++ 			cb->buf.size, mei_hdr->length, cb->buf_idx);
++ 		buffer = krealloc(cb->buf.data, mei_hdr->length + cb->buf_idx,
++ 				  GFP_KERNEL);
++ 
++ 		if (!buffer) {
++ 			cb->status = -ENOMEM;
++ 			list_move_tail(&cb->list, &complete_list->list);
++ 			goto out;
++ 		}
++ 		cb->buf.data = buffer;
++ 		cb->buf.size = mei_hdr->length + cb->buf_idx;
++ 	}
++ 
++ 	buffer = cb->buf.data + cb->buf_idx;
++ 	mei_read_slots(dev, buffer, mei_hdr->length);
++ 
++ 	cb->buf_idx += mei_hdr->length;
++ 
++ 	if (mei_hdr->msg_complete) {
++ 		cb->read_time = jiffies;
++ 		cl_dbg(dev, cl, "completed read length = %lu\n",
++ 			cb->buf_idx);
++ 		list_move_tail(&cb->list, &complete_list->list);
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  	}
+  
+ -out:
+ -	if (!buffer)
+ -		mei_irq_discard_msg(dev, mei_hdr);
+ -
+  	return 0;
+  }
+  
+diff --cc drivers/misc/mei/main.c
+index b23f9eba9e3a,1d44d110ed94..000000000000
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@@ -275,10 -254,17 +275,21 @@@ static ssize_t mei_read(struct file *fi
+  		rets = 0;
+  		goto out;
+  	}
+ -
+ -copy_buffer:
+  	/* now copy the data to user space */
+++<<<<<<< HEAD
+ +copy_buffer:
+ +	dev_dbg(&dev->pdev->dev, "buf.size = %d buf.idx= %ld\n",
+ +	    cb->response_buffer.size, cb->buf_idx);
+++=======
++ 	if (cb->status) {
++ 		rets = cb->status;
++ 		dev_dbg(dev->dev, "read operation failed %d\n", rets);
++ 		goto free;
++ 	}
++ 
++ 	dev_dbg(dev->dev, "buf.size = %d buf.idx= %ld\n",
++ 	    cb->buf.size, cb->buf_idx);
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  	if (length == 0 || ubuf == NULL || *offset > cb->buf_idx) {
+  		rets = -EMSGSIZE;
+  		goto free;
+@@@ -288,8 -274,8 +299,13 @@@
+  	 * however buf_idx may point beyond that */
+  	length = min_t(size_t, length, cb->buf_idx - *offset);
+  
+++<<<<<<< HEAD
+ +	if (copy_to_user(ubuf, cb->response_buffer.data + *offset, length)) {
+ +		dev_dbg(&dev->pdev->dev, "failed to copy data to userland\n");
+++=======
++ 	if (copy_to_user(ubuf, cb->buf.data + *offset, length)) {
++ 		dev_dbg(dev->dev, "failed to copy data to userland\n");
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+  		rets = -EFAULT;
+  		goto free;
+  	}
+@@@ -407,9 -393,9 +423,9 @@@ static ssize_t mei_write(struct file *f
+  	if (rets)
+  		goto out;
+  
+- 	rets = copy_from_user(write_cb->request_buffer.data, ubuf, length);
++ 	rets = copy_from_user(write_cb->buf.data, ubuf, length);
+  	if (rets) {
+ -		dev_dbg(dev->dev, "failed to copy data from userland\n");
+ +		dev_dbg(&dev->pdev->dev, "failed to copy data from userland\n");
+  		rets = -EFAULT;
+  		goto out;
+  	}
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,1a0f6e9588b6..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -189,8 -191,16 +189,21 @@@ struct mei_cl
+  /**
+   * struct mei_cl_cb - file operation callback structure
+   *
+++<<<<<<< HEAD
+ + * @cl - file client who is running this operation
+ + * @fop_type - file operation type
+++=======
++  * @list: link in callback queue
++  * @cl: file client who is running this operation
++  * @fop_type: file operation type
++  * @buf: buffer for data associated with the callback
++  * @buf_idx: last read index
++  * @read_time: last read operation time stamp (iamthif)
++  * @file_object: pointer to file structure
++  * @status: io status of the cb
++  * @internal: communication between driver and FW flag
++  * @completed: the transfer or reception has completed
+++>>>>>>> 5db7514d9333 (mei: use only one buffer in callback)
+   */
+  struct mei_cl_cb {
+  	struct list_head list;
+* Unmerged path drivers/misc/mei/amthif.c
+* Unmerged path drivers/misc/mei/bus.c
+* Unmerged path drivers/misc/mei/client.c
+diff --git a/drivers/misc/mei/client.h b/drivers/misc/mei/client.h
+index bf2b0b1b493d..897833f6f31d 100644
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@ -32,8 +32,7 @@ int mei_me_cl_by_id(struct mei_device *dev, u8 client_id);
+  */
+ struct mei_cl_cb *mei_io_cb_init(struct mei_cl *cl, struct file *fp);
+ void mei_io_cb_free(struct mei_cl_cb *priv_cb);
+-int mei_io_cb_alloc_req_buf(struct mei_cl_cb *cb, size_t length);
+-int mei_io_cb_alloc_resp_buf(struct mei_cl_cb *cb, size_t length);
++int mei_io_cb_alloc_buf(struct mei_cl_cb *cb, size_t length);
+ 
+ 
+ /**
+* Unmerged path drivers/misc/mei/interrupt.c
+* Unmerged path drivers/misc/mei/main.c
+* Unmerged path drivers/misc/mei/mei_dev.h
