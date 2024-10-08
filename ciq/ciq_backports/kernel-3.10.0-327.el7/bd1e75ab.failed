@@ -1,0 +1,101 @@
+tcp: add coalescing attempt in tcp_ofo_queue()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit bd1e75abf4b3c666f61a5cf90c896aa928a735d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bd1e75ab.failed
+
+In order to make TCP more resilient in presence of reorders, we need
+to allow coalescing to happen when skbs from out of order queue are
+transferred into receive queue. LRO/GRO can be completely canceled
+in some pathological cases, like per packet load balancing on aggregated
+links.
+
+I had to move tcp_try_coalesce() up in the file above tcp_ofo_queue()
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bd1e75abf4b3c666f61a5cf90c896aa928a735d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index b7e10e9c0e98,f3f016a15c5a..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -4037,67 -4061,6 +4037,70 @@@ static void tcp_sack_remove(struct tcp_
+  	tp->rx_opt.num_sacks = num_sacks;
+  }
+  
+++<<<<<<< HEAD
+ +/* This one checks to see if we can put data from the
+ + * out_of_order queue into the receive_queue.
+ + */
+ +static void tcp_ofo_queue(struct sock *sk)
+ +{
+ +	struct tcp_sock *tp = tcp_sk(sk);
+ +	__u32 dsack_high = tp->rcv_nxt;
+ +	struct sk_buff *skb;
+ +
+ +	while ((skb = skb_peek(&tp->out_of_order_queue)) != NULL) {
+ +		if (after(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
+ +			break;
+ +
+ +		if (before(TCP_SKB_CB(skb)->seq, dsack_high)) {
+ +			__u32 dsack = dsack_high;
+ +			if (before(TCP_SKB_CB(skb)->end_seq, dsack_high))
+ +				dsack_high = TCP_SKB_CB(skb)->end_seq;
+ +			tcp_dsack_extend(sk, TCP_SKB_CB(skb)->seq, dsack);
+ +		}
+ +
+ +		if (!after(TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt)) {
+ +			SOCK_DEBUG(sk, "ofo packet was already received\n");
+ +			__skb_unlink(skb, &tp->out_of_order_queue);
+ +			__kfree_skb(skb);
+ +			continue;
+ +		}
+ +		SOCK_DEBUG(sk, "ofo requeuing : rcv_next %X seq %X - %X\n",
+ +			   tp->rcv_nxt, TCP_SKB_CB(skb)->seq,
+ +			   TCP_SKB_CB(skb)->end_seq);
+ +
+ +		__skb_unlink(skb, &tp->out_of_order_queue);
+ +		__skb_queue_tail(&sk->sk_receive_queue, skb);
+ +		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +		if (tcp_hdr(skb)->fin)
+ +			tcp_fin(sk);
+ +	}
+ +}
+ +
+ +static bool tcp_prune_ofo_queue(struct sock *sk);
+ +static int tcp_prune_queue(struct sock *sk);
+ +
+ +static int tcp_try_rmem_schedule(struct sock *sk, struct sk_buff *skb,
+ +				 unsigned int size)
+ +{
+ +	if (atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf ||
+ +	    !sk_rmem_schedule(sk, skb, size)) {
+ +
+ +		if (tcp_prune_queue(sk) < 0)
+ +			return -1;
+ +
+ +		if (!sk_rmem_schedule(sk, skb, size)) {
+ +			if (!tcp_prune_ofo_queue(sk))
+ +				return -1;
+ +
+ +			if (!sk_rmem_schedule(sk, skb, size))
+ +				return -1;
+ +		}
+ +	}
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> bd1e75abf4b3 (tcp: add coalescing attempt in tcp_ofo_queue())
+  /**
+   * tcp_try_coalesce - try to merge skb to prior one
+   * @sk: socket
+* Unmerged path net/ipv4/tcp_input.c
