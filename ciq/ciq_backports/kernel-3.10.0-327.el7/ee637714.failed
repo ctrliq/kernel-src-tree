@@ -1,0 +1,1150 @@
+bonding: Simplify the xmit function for modes that use xmit_hash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mahesh Bandewar <maheshb@google.com>
+commit ee6377147409a00c071b2da853059a7d59979fbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ee637714.failed
+
+Earlier change to use usable slave array for TLB mode had an additional
+performance advantage. So extending the same logic to all other modes
+that use xmit-hash for slave selection (viz 802.3AD, and XOR modes).
+Also consolidating this with the earlier TLB change.
+
+The main idea is to build the usable slaves array in the control path
+and use that array for slave selection during xmit operation.
+
+Measured performance in a setup with a bond of 4x1G NICs with 200
+instances of netperf for the modes involved (3ad, xor, tlb)
+cmd: netperf -t TCP_RR -H <TargetHost> -l 60 -s 5
+
+Mode        TPS-Before   TPS-After
+
+802.3ad   : 468,694      493,101
+TLB (lb=0): 392,583      392,965
+XOR       : 475,696      484,517
+
+	Signed-off-by: Mahesh Bandewar <maheshb@google.com>
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee6377147409a00c071b2da853059a7d59979fbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_3ad.c
+index 65115ee7b259,2110215f3528..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -98,10 -99,10 +98,10 @@@ static const int ad_delta_in_ticks = (A
+  
+  static const u8 lacpdu_mcast_addr[ETH_ALEN] = MULTICAST_LACPDU_ADDR;
+  
+ -/* ================= main 802.3ad protocol functions ================== */
+ +// ================= main 802.3ad protocol functions ==================
+  static int ad_lacpdu_send(struct port *port);
+  static int ad_marker_send(struct port *port, struct bond_marker *marker);
+- static void ad_mux_machine(struct port *port);
++ static void ad_mux_machine(struct port *port, bool *update_slave_arr);
+  static void ad_rx_machine(struct lacpdu *lacpdu, struct port *port);
+  static void ad_tx_machine(struct port *port);
+  static void ad_periodic_machine(struct port *port);
+@@@ -110,15 -112,17 +111,26 @@@ static void ad_agg_selection_logic(stru
+  static void ad_clear_agg(struct aggregator *aggregator);
+  static void ad_initialize_agg(struct aggregator *aggregator);
+  static void ad_initialize_port(struct port *port, int lacp_fast);
+++<<<<<<< HEAD
+ +static void ad_enable_collecting_distributing(struct port *port);
+ +static void ad_disable_collecting_distributing(struct port *port);
+ +static void ad_marker_info_received(struct bond_marker *marker_info, struct port *port);
+ +static void ad_marker_response_received(struct bond_marker *marker, struct port *port);
+++=======
++ static void ad_enable_collecting_distributing(struct port *port,
++ 					      bool *update_slave_arr);
++ static void ad_disable_collecting_distributing(struct port *port,
++ 					       bool *update_slave_arr);
++ static void ad_marker_info_received(struct bond_marker *marker_info,
++ 				    struct port *port);
++ static void ad_marker_response_received(struct bond_marker *marker,
++ 					struct port *port);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  
+  
+ -/* ================= api to bonding and kernel code ================== */
+ +/////////////////////////////////////////////////////////////////////////////////
+ +// ================= api to bonding and kernel code ==================
+ +/////////////////////////////////////////////////////////////////////////////////
+  
+  /**
+   * __get_bond_by_port - get the port's bonding struct
+@@@ -896,9 -799,9 +908,13 @@@ static int ad_marker_send(struct port *
+  /**
+   * ad_mux_machine - handle a port's mux state machine
+   * @port: the port we're looking at
+++<<<<<<< HEAD
+ + *
+++=======
++  * @update_slave_arr: Does slave array need update?
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+   */
+- static void ad_mux_machine(struct port *port)
++ static void ad_mux_machine(struct port *port, bool *update_slave_arr)
+  {
+  	mux_states_t last_state;
+  
+@@@ -982,9 -904,9 +998,10 @@@
+  			 port->sm_mux_state);
+  		switch (port->sm_mux_state) {
+  		case AD_MUX_DETACHED:
+ +			__detach_bond_from_agg(port);
+  			port->actor_oper_port_state &= ~AD_STATE_SYNCHRONIZATION;
+- 			ad_disable_collecting_distributing(port);
++ 			ad_disable_collecting_distributing(port,
++ 							   update_slave_arr);
+  			port->actor_oper_port_state &= ~AD_STATE_COLLECTING;
+  			port->actor_oper_port_state &= ~AD_STATE_DISTRIBUTING;
+  			port->ntt = true;
+@@@ -1003,10 -925,11 +1021,11 @@@
+  		case AD_MUX_COLLECTING_DISTRIBUTING:
+  			port->actor_oper_port_state |= AD_STATE_COLLECTING;
+  			port->actor_oper_port_state |= AD_STATE_DISTRIBUTING;
+- 			ad_enable_collecting_distributing(port);
++ 			ad_enable_collecting_distributing(port,
++ 							  update_slave_arr);
+  			port->ntt = true;
+  			break;
+ -		default:
+ +		default:    //to silence the compiler
+  			break;
+  		}
+  	}
+@@@ -1396,16 -1347,18 +1416,16 @@@ static void ad_port_selection_logic(str
+  			       port->actor_port_number, port->slave->dev->name);
+  		}
+  	}
+ -	/* if all aggregator's ports are READY_N == TRUE, set ready=TRUE
+ -	 * in all aggregator's ports, else set ready=FALSE in all
+ -	 * aggregator's ports
+ -	 */
+ -	__set_agg_ports_ready(port->aggregator,
+ -			      __agg_ports_are_ready(port->aggregator));
+ +	// if all aggregator's ports are READY_N == TRUE, set ready=TRUE in all aggregator's ports
+ +	// else set ready=FALSE in all aggregator's ports
+ +	__set_agg_ports_ready(port->aggregator, __agg_ports_are_ready(port->aggregator));
+  
+  	aggregator = __get_first_agg(port);
+- 	ad_agg_selection_logic(aggregator);
++ 	ad_agg_selection_logic(aggregator, update_slave_arr);
+  }
+  
+ -/* Decide if "agg" is a better choice for the new active aggregator that
+ +/*
+ + * Decide if "agg" is a better choice for the new active aggregator that
+   * the current best, according to the ad_select policy.
+   */
+  static struct aggregator *ad_agg_selection_test(struct aggregator *best,
+@@@ -1600,10 -1560,11 +1622,12 @@@ static void ad_agg_selection_logic(stru
+  				__disable_port(port);
+  			}
+  		}
++ 		/* Slave array needs update. */
++ 		*update_slave_arr = true;
+  	}
+  
+ -	/* if the selected aggregator is of join individuals
+ +	/*
+ +	 * if the selected aggregator is of join individuals
+  	 * (partner_system is NULL), enable their ports
+  	 */
+  	active = __get_active_agg(origin);
+@@@ -1744,11 -1710,14 +1772,16 @@@ static void ad_enable_collecting_distri
+  /**
+   * ad_disable_collecting_distributing - disable a port's transmit/receive
+   * @port: the port we're looking at
+++<<<<<<< HEAD
+ + *
+++=======
++  * @update_slave_arr: Does slave array need update?
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+   */
+- static void ad_disable_collecting_distributing(struct port *port)
++ static void ad_disable_collecting_distributing(struct port *port,
++ 					       bool *update_slave_arr)
+  {
+ -	if (port->aggregator &&
+ -	    !MAC_ADDRESS_EQUAL(&(port->aggregator->partner_system),
+ -			       &(null_mac_addr))) {
+ +	if (port->aggregator && !MAC_ADDRESS_EQUAL(&(port->aggregator->partner_system), &(null_mac_addr))) {
+  		pr_debug("Disabling port %d(LAG %d)\n",
+  			 port->actor_port_number,
+  			 port->aggregator->aggregator_identifier);
+@@@ -1963,22 -1888,22 +1998,23 @@@ void bond_3ad_unbind_slave(struct slav
+  	struct bonding *bond = slave->bond;
+  	struct slave *slave_iter;
+  	struct list_head *iter;
++ 	bool dummy_slave_update; /* Ignore this value as caller updates array */
+  
+ -	/* Sync against bond_3ad_state_machine_handler() */
+ -	spin_lock_bh(&bond->mode_lock);
+ -	aggregator = &(SLAVE_AD_INFO(slave)->aggregator);
+ -	port = &(SLAVE_AD_INFO(slave)->port);
+ +	// find the aggregator related to this slave
+ +	aggregator = &(SLAVE_AD_INFO(slave).aggregator);
+  
+ -	/* if slave is null, the whole port is not initialized */
+ +	// find the port related to this slave
+ +	port = &(SLAVE_AD_INFO(slave).port);
+ +
+ +	// if slave is null, the whole port is not initialized
+  	if (!port->slave) {
+ -		netdev_warn(bond->dev, "Trying to unbind an uninitialized port on %s\n",
+ -			    slave->dev->name);
+ -		goto out;
+ +		pr_warning("Warning: %s: Trying to unbind an uninitialized port on %s\n",
+ +			   slave->bond->dev->name, slave->dev->name);
+ +		return;
+  	}
+  
+ -	netdev_dbg(bond->dev, "Unbinding Link Aggregation Group %d\n",
+ -		   aggregator->aggregator_identifier);
+ +	pr_debug("Unbinding Link Aggregation Group %d\n",
+ +		 aggregator->aggregator_identifier);
+  
+  	/* Tell the partner that this port is not suitable for aggregation */
+  	port->actor_oper_port_state &= ~AD_STATE_AGGREGATION;
+@@@ -2039,22 -1972,24 +2075,24 @@@
+  				ad_clear_agg(aggregator);
+  
+  				if (select_new_active_agg)
+- 					ad_agg_selection_logic(__get_first_agg(port));
++ 					ad_agg_selection_logic(__get_first_agg(port),
++ 							       &dummy_slave_update);
+  			} else {
+ -				netdev_warn(bond->dev, "unbinding aggregator, and could not find a new aggregator for its ports\n");
+ +				pr_warning("%s: Warning: unbinding aggregator, and could not find a new aggregator for its ports\n",
+ +					   slave->bond->dev->name);
+  			}
+ -		} else {
+ -			/* in case that the only port related to this
+ -			 * aggregator is the one we want to remove
+ -			 */
+ +		} else { // in case that the only port related to this aggregator is the one we want to remove
+  			select_new_active_agg = aggregator->is_active;
+ +			// clear the aggregator
+  			ad_clear_agg(aggregator);
+  			if (select_new_active_agg) {
+ -				netdev_info(bond->dev, "Removing an active aggregator\n");
+ -				/* select new active aggregator */
+ +				pr_info("%s: Removing an active aggregator\n",
+ +					slave->bond->dev->name);
+ +				// select new active aggregator
+  				temp_aggregator = __get_first_agg(port);
+  				if (temp_aggregator)
+- 					ad_agg_selection_logic(temp_aggregator);
++ 					ad_agg_selection_logic(temp_aggregator,
++ 							       &dummy_slave_update);
+  			}
+  		}
+  	}
+@@@ -2076,13 -2015,12 +2114,20 @@@
+  				temp_aggregator->num_of_ports--;
+  				if (temp_aggregator->num_of_ports == 0) {
+  					select_new_active_agg = temp_aggregator->is_active;
+ +					// clear the aggregator
+  					ad_clear_agg(temp_aggregator);
+  					if (select_new_active_agg) {
+++<<<<<<< HEAD
+ +						pr_info("%s: Removing an active aggregator\n",
+ +							slave->bond->dev->name);
+ +						// select new active aggregator
+ +						ad_agg_selection_logic(__get_first_agg(port));
+++=======
++ 						netdev_info(bond->dev, "Removing an active aggregator\n");
++ 						/* select new active aggregator */
++ 						ad_agg_selection_logic(__get_first_agg(port),
++ 							               &dummy_slave_update);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  					}
+  				}
+  				break;
+@@@ -2109,24 -2050,35 +2154,29 @@@ void bond_3ad_state_machine_handler(str
+  {
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    ad_work.work);
+ -	struct aggregator *aggregator;
+ -	struct list_head *iter;
+ -	struct slave *slave;
+  	struct port *port;
+++<<<<<<< HEAD
+ +	struct aggregator *aggregator;
+++=======
++ 	bool should_notify_rtnl = BOND_SLAVE_NOTIFY_LATER;
++ 	bool update_slave_arr = false;
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  
+ -	/* Lock to protect data accessed by all (e.g., port->sm_vars) and
+ -	 * against running with bond_3ad_unbind_slave. ad_rx_machine may run
+ -	 * concurrently due to incoming LACPDU as well.
+ -	 */
+ -	spin_lock_bh(&bond->mode_lock);
+ -	rcu_read_lock();
+ -
+ -	/* check if there are any slaves */
+ -	if (!bond_has_slaves(bond))
+ +	if (!rtnl_trylock()) {
+ +		queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+ +		return;
+ +	}
+ +	//check if there are any slaves
+ +	if (bond->slave_cnt == 0)
+  		goto re_arm;
+  
+ -	/* check if agg_select_timer timer after initialize is timed out */
+ -	if (BOND_AD_INFO(bond).agg_select_timer &&
+ -	    !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ -		slave = bond_first_slave_rcu(bond);
+ -		port = slave ? &(SLAVE_AD_INFO(slave)->port) : NULL;
+ -
+ -		/* select the active aggregator for the bond */
+ -		if (port) {
+ +	// check if agg_select_timer timer after initialize is timed out
+ +	if (BOND_AD_INFO(bond).agg_select_timer && !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ +		// select the active aggregator for the bond
+ +		if ((port = __get_first_port(bond))) {
+  			if (!port->slave) {
+ -				net_warn_ratelimited("%s: Warning: bond's first port is uninitialized\n",
+ -						     bond->dev->name);
+ +				pr_warning("%s: Warning: bond's first port is uninitialized\n",
+ +					   bond->dev->name);
+  				goto re_arm;
+  			}
+  
+@@@ -2144,27 -2097,34 +2194,46 @@@
+  			goto re_arm;
+  		}
+  
+ +		/* Lock around state machines to protect data accessed
+ +		 * by all (e.g., port->sm_vars).  ad_rx_machine may run
+ +		 * concurrently due to incoming LACPDU.
+ +		 */
+ +		__get_state_machine_lock(port);
+ +
+  		ad_rx_machine(NULL, port);
+  		ad_periodic_machine(port);
+- 		ad_port_selection_logic(port);
+- 		ad_mux_machine(port);
++ 		ad_port_selection_logic(port, &update_slave_arr);
++ 		ad_mux_machine(port, &update_slave_arr);
+  		ad_tx_machine(port);
+  
+ -		/* turn off the BEGIN bit, since we already handled it */
+ +		// turn off the BEGIN bit, since we already handled it
+  		if (port->sm_vars & AD_PORT_BEGIN)
+  			port->sm_vars &= ~AD_PORT_BEGIN;
+ +
+ +		__release_state_machine_lock(port);
+  	}
+  
+  re_arm:
+++<<<<<<< HEAD
+ +	rtnl_unlock();
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (slave->should_notify) {
++ 			should_notify_rtnl = BOND_SLAVE_NOTIFY_NOW;
++ 			break;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	spin_unlock_bh(&bond->mode_lock);
++ 
++ 	if (update_slave_arr)
++ 		bond_slave_arr_work_rearm(bond, 0);
++ 
++ 	if (should_notify_rtnl && rtnl_trylock()) {
++ 		bond_slave_state_notify(bond);
++ 		rtnl_unlock();
++ 	}
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  	queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+  }
+  
+@@@ -2347,13 -2310,21 +2416,22 @@@ void bond_3ad_handle_link_change(struc
+  	 */
+  	port->sm_vars |= AD_PORT_BEGIN;
+  
+++<<<<<<< HEAD
+ +	__release_state_machine_lock(port);
+++=======
++ 	spin_unlock_bh(&slave->bond->mode_lock);
++ 
++ 	/* RTNL is held and mode_lock is released so it's safe
++ 	 * to update slave_array here.
++ 	 */
++ 	bond_update_slave_arr(slave->bond, NULL);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  }
+  
+ -/**
+ - * bond_3ad_set_carrier - set link state for bonding master
+ - * @bond - bonding structure
+ - *
+ - * if we have an active aggregator, we're up, if not, we're down.
+ - * Presumes that we cannot have an active aggregator if there are
+ - * no slaves with link up.
+ +/*
+ + * set link state for bonding master: if we have an active
+ + * aggregator, we're up, if not, we're down.  Presumes that we cannot
+ + * have an active aggregator if there are no slaves with link up.
+   *
+   * This behavior complies with IEEE 802.3 section 43.3.9.
+   *
+@@@ -2431,74 -2410,6 +2509,77 @@@ int bond_3ad_get_active_agg_info(struc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +int bond_3ad_xmit_xor(struct sk_buff *skb, struct net_device *dev)
+ +{
+ +	struct slave *slave, *start_at;
+ +	struct bonding *bond = netdev_priv(dev);
+ +	int slave_agg_no;
+ +	int slaves_in_agg;
+ +	int agg_id;
+ +	int i;
+ +	struct ad_info ad_info;
+ +	int res = 1;
+ +
+ +	if (__bond_3ad_get_active_agg_info(bond, &ad_info)) {
+ +		pr_debug("%s: Error: __bond_3ad_get_active_agg_info failed\n",
+ +			 dev->name);
+ +		goto out;
+ +	}
+ +
+ +	slaves_in_agg = ad_info.ports;
+ +	agg_id = ad_info.aggregator_id;
+ +
+ +	if (slaves_in_agg == 0) {
+ +		/*the aggregator is empty*/
+ +		pr_debug("%s: Error: active aggregator is empty\n", dev->name);
+ +		goto out;
+ +	}
+ +
+ +	slave_agg_no = bond->xmit_hash_policy(skb, slaves_in_agg);
+ +
+ +	bond_for_each_slave(bond, slave, i) {
+ +		struct aggregator *agg = SLAVE_AD_INFO(slave).port.aggregator;
+ +
+ +		if (agg && (agg->aggregator_identifier == agg_id)) {
+ +			slave_agg_no--;
+ +			if (slave_agg_no < 0)
+ +				break;
+ +		}
+ +	}
+ +
+ +	if (slave_agg_no >= 0) {
+ +		pr_err("%s: Error: Couldn't find a slave to tx on for aggregator ID %d\n",
+ +		       dev->name, agg_id);
+ +		goto out;
+ +	}
+ +
+ +	start_at = slave;
+ +
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		int slave_agg_id = 0;
+ +		struct aggregator *agg = SLAVE_AD_INFO(slave).port.aggregator;
+ +
+ +		if (agg)
+ +			slave_agg_id = agg->aggregator_identifier;
+ +
+ +		if (SLAVE_IS_OK(slave) && agg && (slave_agg_id == agg_id)) {
+ +			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +			break;
+ +		}
+ +	}
+ +
+ +out:
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+ +	}
+ +
+ +	return NETDEV_TX_OK;
+ +}
+ +
+++=======
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  int bond_3ad_lacpdu_recv(const struct sk_buff *skb, struct bonding *bond,
+  			 struct slave *slave)
+  {
+diff --cc drivers/net/bonding/bond_alb.c
+index 06a8df1ef842,d2eadab787c5..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -206,7 -183,7 +206,11 @@@ static void tlb_deinitialize(struct bon
+  	kfree(bond_info->tx_hashtbl);
+  	bond_info->tx_hashtbl = NULL;
+  
+++<<<<<<< HEAD
+ +	_unlock_tx_hashtbl_bh(bond);
+++=======
++ 	spin_unlock_bh(&bond->mode_lock);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  }
+  
+  static long long compute_gap(struct slave *slave)
+@@@ -1313,9 -1292,81 +1317,71 @@@ void bond_alb_deinitialize(struct bondi
+  
+  	tlb_deinitialize(bond);
+  
+ -	if (bond_info->rlb_enabled)
+ +	if (bond_info->rlb_enabled) {
+  		rlb_deinitialize(bond);
+ -}
+ -
+ -static int bond_do_alb_xmit(struct sk_buff *skb, struct bonding *bond,
+ -			    struct slave *tx_slave)
+ -{
+ -	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct ethhdr *eth_data = eth_hdr(skb);
+ -
+ -	if (!tx_slave) {
+ -		/* unbalanced or unassigned, send through primary */
+ -		tx_slave = rcu_dereference(bond->curr_active_slave);
+ -		if (bond->params.tlb_dynamic_lb)
+ -			bond_info->unbalanced_load += skb->len;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (tx_slave && bond_slave_can_tx(tx_slave)) {
++ 		if (tx_slave != rcu_access_pointer(bond->curr_active_slave)) {
++ 			ether_addr_copy(eth_data->h_source,
++ 					tx_slave->dev->dev_addr);
++ 		}
++ 
++ 		bond_dev_queue_xmit(bond, skb, tx_slave->dev);
++ 		goto out;
++ 	}
++ 
++ 	if (tx_slave && bond->params.tlb_dynamic_lb) {
++ 		spin_lock(&bond->mode_lock);
++ 		__tlb_clear_slave(bond, tx_slave, 0);
++ 		spin_unlock(&bond->mode_lock);
++ 	}
++ 
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ out:
++ 	return NETDEV_TX_OK;
++ }
++ 
++ int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct ethhdr *eth_data;
++ 	struct slave *tx_slave = NULL;
++ 	u32 hash_index;
++ 
++ 	skb_reset_mac_header(skb);
++ 	eth_data = eth_hdr(skb);
++ 
++ 	/* Do not TX balance any multicast or broadcast */
++ 	if (!is_multicast_ether_addr(eth_data->h_dest)) {
++ 		switch (skb->protocol) {
++ 		case htons(ETH_P_IP):
++ 		case htons(ETH_P_IPX):
++ 		    /* In case of IPX, it will falback to L2 hash */
++ 		case htons(ETH_P_IPV6):
++ 			hash_index = bond_xmit_hash(bond, skb);
++ 			if (bond->params.tlb_dynamic_lb) {
++ 				tx_slave = tlb_choose_channel(bond,
++ 							      hash_index & 0xFF,
++ 							      skb->len);
++ 			} else {
++ 				struct bond_up_slave *slaves;
++ 				unsigned int count;
++ 
++ 				slaves = rcu_dereference(bond->slave_arr);
++ 				count = slaves ? ACCESS_ONCE(slaves->count) : 0;
++ 				if (likely(count))
++ 					tx_slave = slaves->arr[hash_index %
++ 							       count];
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	return bond_do_alb_xmit(skb, bond, tx_slave);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  }
+  
+  int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+@@@ -1592,12 -1604,12 +1658,16 @@@ void bond_alb_deinit_slave(struct bondi
+  	tlb_clear_slave(bond, slave, 0);
+  
+  	if (bond->alb_info.rlb_enabled) {
+ -		bond->alb_info.rx_slave = NULL;
+ +		bond->alb_info.next_rx_slave = NULL;
+  		rlb_clear_slave(bond, slave);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  }
+  
+ +/* Caller must hold bond lock for read */
+  void bond_alb_handle_link_change(struct bonding *bond, struct slave *slave, char link)
+  {
+  	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+@@@ -1619,6 -1630,11 +1689,14 @@@
+  			 */
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (bond_is_nondyn_tlb(bond)) {
++ 		if (bond_update_slave_arr(bond, NULL))
++ 			pr_err("Failed to build slave-array for TLB mode.\n");
++ 	}
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  }
+  
+  /**
+diff --cc drivers/net/bonding/bond_main.c
+index 723c3d160745,3ad5413d4f57..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -256,6 -208,9 +256,12 @@@ struct bond_parm_tbl ad_select_tbl[] = 
+  
+  static int bond_init(struct net_device *bond_dev);
+  static void bond_uninit(struct net_device *bond_dev);
+++<<<<<<< HEAD
+++=======
++ static struct rtnl_link_stats64 *bond_get_stats(struct net_device *bond_dev,
++ 						struct rtnl_link_stats64 *stats);
++ static void bond_slave_arr_handler(struct work_struct *work);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  
+  /*---------------------------- General routines -----------------------------*/
+  
+@@@ -1831,11 -1536,29 +1837,31 @@@ int bond_enslave(struct net_device *bon
+  		goto err_unregister;
+  	}
+  
+ -	res = bond_sysfs_slave_add(new_slave);
+ -	if (res) {
+ -		netdev_dbg(bond_dev, "Error %d calling bond_sysfs_slave_add\n", res);
+ -		goto err_upper_unlink;
+ -	}
+  
+++<<<<<<< HEAD
+ +	pr_info("%s: enslaving %s as a%s interface with a%s link.\n",
+ +		bond_dev->name, slave_dev->name,
+ +		bond_is_active_slave(new_slave) ? "n active" : " backup",
+ +		new_slave->link != BOND_LINK_DOWN ? "n up" : " down");
+++=======
++ 	bond->slave_cnt++;
++ 	bond_compute_features(bond);
++ 	bond_set_carrier(bond);
++ 
++ 	if (bond_uses_primary(bond)) {
++ 		block_netpoll_tx();
++ 		bond_select_active_slave(bond);
++ 		unblock_netpoll_tx();
++ 	}
++ 
++ 	if (bond_mode_uses_xmit_hash(bond))
++ 		bond_update_slave_arr(bond, NULL);
++ 
++ 	netdev_info(bond_dev, "Enslaving %s as %s interface with %s link\n",
++ 		    slave_dev->name,
++ 		    bond_is_active_slave(new_slave) ? "an active" : "a backup",
++ 		    new_slave->link != BOND_LINK_DOWN ? "an up" : "a down");
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  
+  	/* enslave is successful */
+  	return 0;
+@@@ -1952,39 -1668,32 +1978,63 @@@ static int __bond_release_one(struct ne
+  	 * for this slave anymore.
+  	 */
+  	netdev_rx_handler_unregister(slave_dev);
+ -
+ +	write_lock_bh(&bond->lock);
+ +
+++<<<<<<< HEAD
+ +	if (!all && !bond->params.fail_over_mac) {
+ +		if (ether_addr_equal(bond_dev->dev_addr, slave->perm_hwaddr) &&
+ +		    bond->slave_cnt > 1)
+ +			pr_warning("%s: Warning: the permanent HWaddr of %s - %pM - is still in use by %s. Set the HWaddr of %s to a different address to avoid conflicts.\n",
+ +				   bond_dev->name, slave_dev->name,
+ +				   slave->perm_hwaddr,
+ +				   bond_dev->name, slave_dev->name);
+++=======
++ 	if (BOND_MODE(bond) == BOND_MODE_8023AD)
++ 		bond_3ad_unbind_slave(slave);
++ 
++ 	if (bond_mode_uses_xmit_hash(bond))
++ 		bond_update_slave_arr(bond, slave);
++ 
++ 	netdev_info(bond_dev, "Releasing %s interface %s\n",
++ 		    bond_is_active_slave(slave) ? "active" : "backup",
++ 		    slave_dev->name);
++ 
++ 	oldcurrent = rcu_access_pointer(bond->curr_active_slave);
++ 
++ 	RCU_INIT_POINTER(bond->current_arp_slave, NULL);
++ 
++ 	if (!all && (!bond->params.fail_over_mac ||
++ 		     BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)) {
++ 		if (ether_addr_equal_64bits(bond_dev->dev_addr, slave->perm_hwaddr) &&
++ 		    bond_has_slaves(bond))
++ 			netdev_warn(bond_dev, "the permanent HWaddr of %s - %pM - is still in use by %s - set the HWaddr of %s to a different address to avoid conflicts\n",
++ 				    slave_dev->name, slave->perm_hwaddr,
++ 				    bond_dev->name, slave_dev->name);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  	}
+  
+ -	if (rtnl_dereference(bond->primary_slave) == slave)
+ -		RCU_INIT_POINTER(bond->primary_slave, NULL);
+ +	/* Inform AD package of unbinding of slave. */
+ +	if (bond->params.mode == BOND_MODE_8023AD) {
+ +		/* must be called before the slave is
+ +		 * detached from the list
+ +		 */
+ +		bond_3ad_unbind_slave(slave);
+ +	}
+ +
+ +	pr_info("%s: releasing %s interface %s\n",
+ +		bond_dev->name,
+ +		bond_is_active_slave(slave) ? "active" : "backup",
+ +		slave_dev->name);
+ +
+ +	oldcurrent = bond->curr_active_slave;
+ +
+ +	bond->current_arp_slave = NULL;
+ +
+ +	/* release the slave from its bond */
+ +	bond_detach_slave(bond, slave);
+ +
+ +	if (bond->primary_slave == slave)
+ +		bond->primary_slave = NULL;
+  
+  	if (oldcurrent == slave)
+  		bond_change_active_slave(bond, NULL);
+@@@ -2294,8 -1977,10 +2344,15 @@@ static void bond_miimon_commit(struct b
+  				bond_alb_handle_link_change(bond, slave,
+  							    BOND_LINK_UP);
+  
+++<<<<<<< HEAD
+ +			if (!bond->curr_active_slave ||
+ +			    (slave == bond->primary_slave))
+++=======
++ 			if (BOND_MODE(bond) == BOND_MODE_XOR)
++ 				bond_update_slave_arr(bond, NULL);
++ 
++ 			if (!bond->curr_active_slave || slave == primary)
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  				goto do_failover;
+  
+  			continue;
+@@@ -2321,7 -2007,10 +2378,14 @@@
+  				bond_alb_handle_link_change(bond, slave,
+  							    BOND_LINK_DOWN);
+  
+++<<<<<<< HEAD
+ +			if (slave == bond->curr_active_slave)
+++=======
++ 			if (BOND_MODE(bond) == BOND_MODE_XOR)
++ 				bond_update_slave_arr(bond, NULL);
++ 
++ 			if (slave == rcu_access_pointer(bond->curr_active_slave))
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  				goto do_failover;
+  
+  			continue;
+@@@ -2735,14 -2458,22 +2799,27 @@@ void bond_loadbalance_arp_mon(struct wo
+  			bond_arp_send_all(bond, slave);
+  	}
+  
+ -	rcu_read_unlock();
+ +	if (do_failover) {
+ +		block_netpoll_tx();
+ +		write_lock_bh(&bond->curr_slave_lock);
+  
+ -	if (do_failover || slave_state_changed) {
+ -		if (!rtnl_trylock())
+ -			goto re_arm;
+ +		bond_select_active_slave(bond);
+  
+++<<<<<<< HEAD
+ +		write_unlock_bh(&bond->curr_slave_lock);
+ +		unblock_netpoll_tx();
+++=======
++ 		if (slave_state_changed) {
++ 			bond_slave_state_change(bond);
++ 			if (BOND_MODE(bond) == BOND_MODE_XOR)
++ 				bond_update_slave_arr(bond, NULL);
++ 		} else if (do_failover) {
++ 			block_netpoll_tx();
++ 			bond_select_active_slave(bond);
++ 			unblock_netpoll_tx();
++ 		}
++ 		rtnl_unlock();
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  	}
+  
+  re_arm:
+@@@ -3122,15 -2844,23 +3199,30 @@@ static int bond_slave_netdev_event(unsi
+  			if (old_duplex != slave->duplex)
+  				bond_3ad_adapter_duplex_changed(slave);
+  		}
++ 		/* Refresh slave-array if applicable!
++ 		 * If the setup does not use miimon or arpmon (mode-specific!),
++ 		 * then these events will not cause the slave-array to be
++ 		 * refreshed. This will cause xmit to use a slave that is not
++ 		 * usable. Avoid such situation by refeshing the array at these
++ 		 * events. If these (miimon/arpmon) parameters are configured
++ 		 * then array gets refreshed twice and that should be fine!
++ 		 */
++ 		if (bond_mode_uses_xmit_hash(bond))
++ 			bond_update_slave_arr(bond, NULL);
+  		break;
+  	case NETDEV_DOWN:
+++<<<<<<< HEAD
+ +		/*
+ +		 * ... Or is it this?
+ +		 */
+++=======
++ 		if (bond_mode_uses_xmit_hash(bond))
++ 			bond_update_slave_arr(bond, NULL);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  		break;
+  	case NETDEV_CHANGEMTU:
+ -		/* TODO: Should slaves be allowed to
+ +		/*
+ +		 * TODO: Should slaves be allowed to
+  		 * independently alter their MTU?  For
+  		 * an active-backup bond, slaves need
+  		 * not be the same type of device, so
+@@@ -3914,41 -3605,147 +4011,185 @@@ static int bond_xmit_activebackup(struc
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * In bond_xmit_xor() , we determine the output device by using a pre-
+ + * determined xmit_hash_policy(), If the selected device is not enabled,
+ + * find the next active slave.
+++=======
++ /* Use this to update slave_array when (a) it's not appropriate to update
++  * slave_array right away (note that update_slave_array() may sleep)
++  * and / or (b) RTNL is not held.
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+   */
+- static int bond_xmit_xor(struct sk_buff *skb, struct net_device *bond_dev)
++ void bond_slave_arr_work_rearm(struct bonding *bond, unsigned long delay)
+  {
+++<<<<<<< HEAD
+ +	struct bonding *bond = netdev_priv(bond_dev);
+ +	struct slave *slave, *start_at;
+ +	int slave_no;
+ +	int i;
+ +	int res = 1;
+ +
+ +	slave_no = bond->xmit_hash_policy(skb, bond->slave_cnt);
+ +
+ +	bond_for_each_slave(bond, slave, i) {
+ +		slave_no--;
+ +		if (slave_no < 0)
+ +			break;
+ +	}
+ +
+ +	start_at = slave;
+ +
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		if (IS_UP(slave->dev) &&
+ +		    (slave->link == BOND_LINK_UP) &&
+ +		    bond_is_active_slave(slave)) {
+ +			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+++=======
++ 	queue_delayed_work(bond->wq, &bond->slave_arr_work, delay);
++ }
++ 
++ /* Slave array work handler. Holds only RTNL */
++ static void bond_slave_arr_handler(struct work_struct *work)
++ {
++ 	struct bonding *bond = container_of(work, struct bonding,
++ 					    slave_arr_work.work);
++ 	int ret;
++ 
++ 	if (!rtnl_trylock())
++ 		goto err;
++ 
++ 	ret = bond_update_slave_arr(bond, NULL);
++ 	rtnl_unlock();
++ 	if (ret) {
++ 		pr_warn_ratelimited("Failed to update slave array from WT\n");
++ 		goto err;
++ 	}
++ 	return;
++ 
++ err:
++ 	bond_slave_arr_work_rearm(bond, 1);
++ }
++ 
++ /* Build the usable slaves array in control path for modes that use xmit-hash
++  * to determine the slave interface -
++  * (a) BOND_MODE_8023AD
++  * (b) BOND_MODE_XOR
++  * (c) BOND_MODE_TLB && tlb_dynamic_lb == 0
++  *
++  * The caller is expected to hold RTNL only and NO other lock!
++  */
++ int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave)
++ {
++ 	struct slave *slave;
++ 	struct list_head *iter;
++ 	struct bond_up_slave *new_arr, *old_arr;
++ 	int slaves_in_agg;
++ 	int agg_id = 0;
++ 	int ret = 0;
++ 
++ #ifdef CONFIG_LOCKDEP
++ 	WARN_ON(lockdep_is_held(&bond->mode_lock));
++ #endif
++ 
++ 	new_arr = kzalloc(offsetof(struct bond_up_slave, arr[bond->slave_cnt]),
++ 			  GFP_KERNEL);
++ 	if (!new_arr) {
++ 		ret = -ENOMEM;
++ 		pr_err("Failed to build slave-array.\n");
++ 		goto out;
++ 	}
++ 	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
++ 		struct ad_info ad_info;
++ 
++ 		if (bond_3ad_get_active_agg_info(bond, &ad_info)) {
++ 			pr_debug("bond_3ad_get_active_agg_info failed\n");
++ 			kfree_rcu(new_arr, rcu);
++ 			/* No active aggragator means it's not safe to use
++ 			 * the previous array.
++ 			 */
++ 			old_arr = rtnl_dereference(bond->slave_arr);
++ 			if (old_arr) {
++ 				RCU_INIT_POINTER(bond->slave_arr, NULL);
++ 				kfree_rcu(old_arr, rcu);
++ 			}
++ 			goto out;
++ 		}
++ 		slaves_in_agg = ad_info.ports;
++ 		agg_id = ad_info.aggregator_id;
++ 	}
++ 	bond_for_each_slave(bond, slave, iter) {
++ 		if (BOND_MODE(bond) == BOND_MODE_8023AD) {
++ 			struct aggregator *agg;
++ 
++ 			agg = SLAVE_AD_INFO(slave)->port.aggregator;
++ 			if (!agg || agg->aggregator_identifier != agg_id)
++ 				continue;
++ 		}
++ 		if (!bond_slave_can_tx(slave))
++ 			continue;
++ 		if (skipslave == slave)
++ 			continue;
++ 		new_arr->arr[new_arr->count++] = slave;
++ 	}
++ 
++ 	old_arr = rtnl_dereference(bond->slave_arr);
++ 	rcu_assign_pointer(bond->slave_arr, new_arr);
++ 	if (old_arr)
++ 		kfree_rcu(old_arr, rcu);
++ out:
++ 	if (ret != 0 && skipslave) {
++ 		int idx;
++ 
++ 		/* Rare situation where caller has asked to skip a specific
++ 		 * slave but allocation failed (most likely!). BTW this is
++ 		 * only possible when the call is initiated from
++ 		 * __bond_release_one(). In this situation; overwrite the
++ 		 * skipslave entry in the array with the last entry from the
++ 		 * array to avoid a situation where the xmit path may choose
++ 		 * this to-be-skipped slave to send a packet out.
++ 		 */
++ 		old_arr = rtnl_dereference(bond->slave_arr);
++ 		for (idx = 0; idx < old_arr->count; idx++) {
++ 			if (skipslave == old_arr->arr[idx]) {
++ 				old_arr->arr[idx] =
++ 				    old_arr->arr[old_arr->count-1];
++ 				old_arr->count--;
++ 				break;
++ 			}
++ 		}
++ 	}
++ 	return ret;
++ }
++ 
++ /* Use this Xmit function for 3AD as well as XOR modes. The current
++  * usable slave array is formed in the control path. The xmit function
++  * just calculates hash and sends the packet out.
++  */
++ int bond_3ad_xor_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct bonding *bond = netdev_priv(dev);
++ 	struct slave *slave;
++ 	struct bond_up_slave *slaves;
++ 	unsigned int count;
++ 
++ 	slaves = rcu_dereference(bond->slave_arr);
++ 	count = slaves ? ACCESS_ONCE(slaves->count) : 0;
++ 	if (likely(count)) {
++ 		slave = slaves->arr[bond_xmit_hash(bond, skb) % count];
++ 		bond_dev_queue_xmit(bond, skb, slave->dev);
++ 	} else {
++ 		dev_kfree_skb_any(skb);
++ 		atomic_long_inc(&dev->tx_dropped);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  	}
+  
+  	return NETDEV_TX_OK;
+@@@ -4068,21 -3842,20 +4309,20 @@@ static netdev_tx_t __bond_start_xmit(st
+  		return bond_xmit_roundrobin(skb, dev);
+  	case BOND_MODE_ACTIVEBACKUP:
+  		return bond_xmit_activebackup(skb, dev);
++ 	case BOND_MODE_8023AD:
+  	case BOND_MODE_XOR:
+- 		return bond_xmit_xor(skb, dev);
++ 		return bond_3ad_xor_xmit(skb, dev);
+  	case BOND_MODE_BROADCAST:
+  		return bond_xmit_broadcast(skb, dev);
+- 	case BOND_MODE_8023AD:
+- 		return bond_3ad_xmit_xor(skb, dev);
+  	case BOND_MODE_ALB:
+ -		return bond_alb_xmit(skb, dev);
+  	case BOND_MODE_TLB:
+ -		return bond_tlb_xmit(skb, dev);
+ +		return bond_alb_xmit(skb, dev);
+  	default:
+  		/* Should never happen, mode already checked */
+ -		netdev_err(dev, "Unknown bonding mode %d\n", BOND_MODE(bond));
+ +		pr_err("%s: Error: Unknown bonding mode %d\n",
+ +		       dev->name, bond->params.mode);
+  		WARN_ON_ONCE(1);
+ -		dev_kfree_skb_any(skb);
+ +		kfree_skb(skb);
+  		return NETDEV_TX_OK;
+  	}
+  }
+@@@ -4287,15 -4018,23 +4527,27 @@@ void bond_setup(struct net_device *bond
+  static void bond_uninit(struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+++<<<<<<< HEAD
+ +	struct vlan_entry *vlan, *tmp;
+++=======
++ 	struct list_head *iter;
++ 	struct slave *slave;
++ 	struct bond_up_slave *arr;
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  
+  	bond_netpoll_cleanup(bond_dev);
+  
+  	/* Release the bonded slaves */
+ -	bond_for_each_slave(bond, slave, iter)
+ -		__bond_release_one(bond_dev, slave->dev, true);
+ -	netdev_info(bond_dev, "Released all slaves\n");
+ +	while (bond->first_slave != NULL)
+ +		__bond_release_one(bond_dev, bond->first_slave->dev, true);
+ +	pr_info("%s: released all slaves\n", bond_dev->name);
+  
++ 	arr = rtnl_dereference(bond->slave_arr);
++ 	if (arr) {
++ 		RCU_INIT_POINTER(bond->slave_arr, NULL);
++ 		kfree_rcu(arr, rcu);
++ 	}
++ 
+  	list_del(&bond->bond_list);
+  
+  	bond_debug_unregister(bond);
+diff --cc drivers/net/bonding/bonding.h
+index 64c0cb81e478,10920f0686e2..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -198,8 -175,16 +198,14 @@@ struct slave 
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	struct netpoll *np;
+  #endif
+ -	struct kobject kobj;
+ -	struct rtnl_link_stats64 slave_stats;
+  };
+  
++ struct bond_up_slave {
++ 	unsigned int	count;
++ 	struct rcu_head rcu;
++ 	struct slave	*arr[0];
++ };
++ 
+  /*
+   * Link pseudo-state only used internally by monitors
+   */
+@@@ -216,10 -196,10 +222,17 @@@
+   */
+  struct bonding {
+  	struct   net_device *dev; /* first - useful for panic debug */
+++<<<<<<< HEAD
+ +	struct   slave *first_slave;
+ +	struct   slave *curr_active_slave;
+ +	struct   slave *current_arp_slave;
+ +	struct   slave *primary_slave;
+++=======
++ 	struct   slave __rcu *curr_active_slave;
++ 	struct   slave __rcu *current_arp_slave;
++ 	struct   slave __rcu *primary_slave;
++ 	struct   bond_up_slave __rcu *slave_arr; /* Array of usable slaves */
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  	bool     force_primary;
+  	s32      slave_cnt; /* never change this value outside the attach/detach wrappers */
+  	int     (*recv_probe)(const struct sk_buff *, struct bonding *,
+@@@ -436,15 -537,13 +450,25 @@@ void bond_setup(struct net_device *bond
+  unsigned int bond_get_num_tx_queues(void);
+  int bond_netlink_init(void);
+  void bond_netlink_fini(void);
+++<<<<<<< HEAD
+ +
+ +struct bond_net {
+ +	struct net *		net;	/* Associated network namespace */
+ +	struct list_head	dev_list;
+ +#ifdef CONFIG_PROC_FS
+ +	struct proc_dir_entry *	proc_dir;
+ +#endif
+ +	struct class_attribute	class_attr_bonding_masters;
+ +};
+++=======
++ struct net_device *bond_option_active_slave_get_rcu(struct bonding *bond);
++ const char *bond_slave_link_status(s8 link);
++ struct bond_vlan_tag *bond_verify_device_path(struct net_device *start_dev,
++ 					      struct net_device *end_dev,
++ 					      int level);
++ int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave);
++ void bond_slave_arr_work_rearm(struct bonding *bond, unsigned long delay);
+++>>>>>>> ee6377147409 (bonding: Simplify the xmit function for modes that use xmit_hash)
+  
+  #ifdef CONFIG_PROC_FS
+  void bond_create_proc_entry(struct bonding *bond);
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_alb.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bonding.h
