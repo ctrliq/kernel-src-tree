@@ -1,0 +1,625 @@
+cxgb4: Add PHY firmware support for T420-BT cards
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 01b6961410b76af228eb993220024ff6db6ba80c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/01b69614.failed
+
+Add support for flashing 10GBaseT adapter with BCM 84834 PHY and
+Aquantia AQ1202 PHY.
+
+Updating of the PHY firmware must happen before the INITIALIZE_CMD.
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 01b6961410b76af228eb993220024ff6db6ba80c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+#	drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+#	drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index dddf17cba9bf,3c109d115365..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@@ -982,9 -1194,20 +1005,18 @@@ static inline int t4_memory_write(struc
+  	return t4_memory_rw(adap, 0, mtype, addr, len, buf, 0);
+  }
+  
+ -unsigned int t4_get_regs_len(struct adapter *adapter);
+ -void t4_get_regs(struct adapter *adap, void *buf, size_t buf_size);
+ -
+  int t4_seeprom_wp(struct adapter *adapter, bool enable);
+  int get_vpd_params(struct adapter *adapter, struct vpd_params *p);
+ -int t4_read_flash(struct adapter *adapter, unsigned int addr,
+ -		  unsigned int nwords, u32 *data, int byte_oriented);
+  int t4_load_fw(struct adapter *adapter, const u8 *fw_data, unsigned int size);
+++<<<<<<< HEAD
+++=======
++ int t4_load_phy_fw(struct adapter *adap,
++ 		   int win, spinlock_t *lock,
++ 		   int (*phy_fw_version)(const u8 *, size_t),
++ 		   const u8 *phy_fw_data, size_t phy_fw_size);
++ int t4_phy_fw_ver(struct adapter *adap, int *phy_fw_ver);
++ int t4_fwcache(struct adapter *adap, enum fw_params_param_dev_fwcache op);
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+  int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
+  		  const u8 *fw_data, unsigned int size, int force);
+  unsigned int t4_flash_cfg_addr(struct adapter *adapter);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 2a3e5627b439,73ac153795b6..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -484,6 -296,46 +488,49 @@@ static void link_report(struct net_devi
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CHELSIO_T4_DCB
++ /* Set up/tear down Data Center Bridging Priority mapping for a net device. */
++ static void dcb_tx_queue_prio_enable(struct net_device *dev, int enable)
++ {
++ 	struct port_info *pi = netdev_priv(dev);
++ 	struct adapter *adap = pi->adapter;
++ 	struct sge_eth_txq *txq = &adap->sge.ethtxq[pi->first_qset];
++ 	int i;
++ 
++ 	/* We use a simple mapping of Port TX Queue Index to DCB
++ 	 * Priority when we're enabling DCB.
++ 	 */
++ 	for (i = 0; i < pi->nqsets; i++, txq++) {
++ 		u32 name, value;
++ 		int err;
++ 
++ 		name = (FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DMAQ) |
++ 			FW_PARAMS_PARAM_X_V(
++ 				FW_PARAMS_PARAM_DMAQ_EQ_DCBPRIO_ETH) |
++ 			FW_PARAMS_PARAM_YZ_V(txq->q.cntxt_id));
++ 		value = enable ? i : 0xffffffff;
++ 
++ 		/* Since we can be called while atomic (from "interrupt
++ 		 * level") we need to issue the Set Parameters Commannd
++ 		 * without sleeping (timeout < 0).
++ 		 */
++ 		err = t4_set_params_timeout(adap, adap->mbox, adap->fn, 0, 1,
++ 					    &name, &value,
++ 					    -FW_CMD_MAX_TIMEOUT);
++ 
++ 		if (err)
++ 			dev_err(adap->pdev_dev,
++ 				"Can't %s DCB Priority on port %d, TX Queue %d: err=%d\n",
++ 				enable ? "set" : "unset", pi->port_id, i, -err);
++ 		else
++ 			txq->dcb_prio = value;
++ 	}
++ }
++ #endif /* CONFIG_CHELSIO_T4_DCB */
++ 
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+  void t4_os_link_changed(struct adapter *adapter, int port_id, int link_stat)
+  {
+  	struct net_device *dev = adapter->port[port_id];
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index 4234b8c917e7,7b92f0f86205..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@@ -331,116 -333,13 +332,123 @@@ int t4_wr_mbox_meat_timeout(struct adap
+  	return -ETIMEDOUT;
+  }
+  
++ int t4_wr_mbox_meat(struct adapter *adap, int mbox, const void *cmd, int size,
++ 		    void *rpl, bool sleep_ok)
++ {
++ 	return t4_wr_mbox_meat_timeout(adap, mbox, cmd, size, rpl, sleep_ok,
++ 				       FW_CMD_MAX_TIMEOUT);
++ }
++ 
+ +/**
+ + *	t4_mc_read - read from MC through backdoor accesses
+ + *	@adap: the adapter
+ + *	@addr: address of first byte requested
+ + *	@idx: which MC to access
+ + *	@data: 64 bytes of data containing the requested address
+ + *	@ecc: where to store the corresponding 64-bit ECC word
+ + *
+ + *	Read 64 bytes of data from MC starting at a 64-byte-aligned address
+ + *	that covers the requested address @addr.  If @parity is not %NULL it
+ + *	is assigned the 64-bit ECC word for the read data.
+ + */
+ +int t4_mc_read(struct adapter *adap, int idx, u32 addr, __be32 *data, u64 *ecc)
+ +{
+ +	int i;
+ +	u32 mc_bist_cmd, mc_bist_cmd_addr, mc_bist_cmd_len;
+ +	u32 mc_bist_status_rdata, mc_bist_data_pattern;
+ +
+ +	if (is_t4(adap->params.chip)) {
+ +		mc_bist_cmd = MC_BIST_CMD;
+ +		mc_bist_cmd_addr = MC_BIST_CMD_ADDR;
+ +		mc_bist_cmd_len = MC_BIST_CMD_LEN;
+ +		mc_bist_status_rdata = MC_BIST_STATUS_RDATA;
+ +		mc_bist_data_pattern = MC_BIST_DATA_PATTERN;
+ +	} else {
+ +		mc_bist_cmd = MC_REG(MC_P_BIST_CMD, idx);
+ +		mc_bist_cmd_addr = MC_REG(MC_P_BIST_CMD_ADDR, idx);
+ +		mc_bist_cmd_len = MC_REG(MC_P_BIST_CMD_LEN, idx);
+ +		mc_bist_status_rdata = MC_REG(MC_P_BIST_STATUS_RDATA, idx);
+ +		mc_bist_data_pattern = MC_REG(MC_P_BIST_DATA_PATTERN, idx);
+ +	}
+ +
+ +	if (t4_read_reg(adap, mc_bist_cmd) & START_BIST)
+ +		return -EBUSY;
+ +	t4_write_reg(adap, mc_bist_cmd_addr, addr & ~0x3fU);
+ +	t4_write_reg(adap, mc_bist_cmd_len, 64);
+ +	t4_write_reg(adap, mc_bist_data_pattern, 0xc);
+ +	t4_write_reg(adap, mc_bist_cmd, BIST_OPCODE(1) | START_BIST |
+ +		     BIST_CMD_GAP(1));
+ +	i = t4_wait_op_done(adap, mc_bist_cmd, START_BIST, 0, 10, 1);
+ +	if (i)
+ +		return i;
+ +
+ +#define MC_DATA(i) MC_BIST_STATUS_REG(mc_bist_status_rdata, i)
+ +
+ +	for (i = 15; i >= 0; i--)
+ +		*data++ = htonl(t4_read_reg(adap, MC_DATA(i)));
+ +	if (ecc)
+ +		*ecc = t4_read_reg64(adap, MC_DATA(16));
+ +#undef MC_DATA
+ +	return 0;
+ +}
+ +
+ +/**
+ + *	t4_edc_read - read from EDC through backdoor accesses
+ + *	@adap: the adapter
+ + *	@idx: which EDC to access
+ + *	@addr: address of first byte requested
+ + *	@data: 64 bytes of data containing the requested address
+ + *	@ecc: where to store the corresponding 64-bit ECC word
+ + *
+ + *	Read 64 bytes of data from EDC starting at a 64-byte-aligned address
+ + *	that covers the requested address @addr.  If @parity is not %NULL it
+ + *	is assigned the 64-bit ECC word for the read data.
+ + */
+ +int t4_edc_read(struct adapter *adap, int idx, u32 addr, __be32 *data, u64 *ecc)
+ +{
+ +	int i;
+ +	u32 edc_bist_cmd, edc_bist_cmd_addr, edc_bist_cmd_len;
+ +	u32 edc_bist_cmd_data_pattern, edc_bist_status_rdata;
+ +
+ +	if (is_t4(adap->params.chip)) {
+ +		edc_bist_cmd = EDC_REG(EDC_BIST_CMD, idx);
+ +		edc_bist_cmd_addr = EDC_REG(EDC_BIST_CMD_ADDR, idx);
+ +		edc_bist_cmd_len = EDC_REG(EDC_BIST_CMD_LEN, idx);
+ +		edc_bist_cmd_data_pattern = EDC_REG(EDC_BIST_DATA_PATTERN,
+ +						    idx);
+ +		edc_bist_status_rdata = EDC_REG(EDC_BIST_STATUS_RDATA,
+ +						    idx);
+ +	} else {
+ +		edc_bist_cmd = EDC_REG_T5(EDC_H_BIST_CMD, idx);
+ +		edc_bist_cmd_addr = EDC_REG_T5(EDC_H_BIST_CMD_ADDR, idx);
+ +		edc_bist_cmd_len = EDC_REG_T5(EDC_H_BIST_CMD_LEN, idx);
+ +		edc_bist_cmd_data_pattern =
+ +			EDC_REG_T5(EDC_H_BIST_DATA_PATTERN, idx);
+ +		edc_bist_status_rdata =
+ +			 EDC_REG_T5(EDC_H_BIST_STATUS_RDATA, idx);
+ +	}
+ +
+ +	if (t4_read_reg(adap, edc_bist_cmd) & START_BIST)
+ +		return -EBUSY;
+ +	t4_write_reg(adap, edc_bist_cmd_addr, addr & ~0x3fU);
+ +	t4_write_reg(adap, edc_bist_cmd_len, 64);
+ +	t4_write_reg(adap, edc_bist_cmd_data_pattern, 0xc);
+ +	t4_write_reg(adap, edc_bist_cmd,
+ +		     BIST_OPCODE(1) | BIST_CMD_GAP(1) | START_BIST);
+ +	i = t4_wait_op_done(adap, edc_bist_cmd, START_BIST, 0, 10, 1);
+ +	if (i)
+ +		return i;
+ +
+ +#define EDC_DATA(i) (EDC_BIST_STATUS_REG(edc_bist_status_rdata, i))
+ +
+ +	for (i = 15; i >= 0; i--)
+ +		*data++ = htonl(t4_read_reg(adap, EDC_DATA(i)));
+ +	if (ecc)
+ +		*ecc = t4_read_reg64(adap, EDC_DATA(16));
+ +#undef EDC_DATA
+ +	return 0;
+ +}
+ +
+  /**
+   *	t4_memory_rw - read/write EDC 0, EDC 1 or MC via PCIE memory window
+   *	@adap: the adapter
+@@@ -1275,6 -2045,186 +1283,189 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  *	t4_phy_fw_ver - return current PHY firmware version
++  *	@adap: the adapter
++  *	@phy_fw_ver: return value buffer for PHY firmware version
++  *
++  *	Returns the current version of external PHY firmware on the
++  *	adapter.
++  */
++ int t4_phy_fw_ver(struct adapter *adap, int *phy_fw_ver)
++ {
++ 	u32 param, val;
++ 	int ret;
++ 
++ 	param = (FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
++ 		 FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_PHYFW) |
++ 		 FW_PARAMS_PARAM_Y_V(adap->params.portvec) |
++ 		 FW_PARAMS_PARAM_Z_V(FW_PARAMS_PARAM_DEV_PHYFW_VERSION));
++ 	ret = t4_query_params(adap, adap->mbox, adap->fn, 0, 1,
++ 			      &param, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 	*phy_fw_ver = val;
++ 	return 0;
++ }
++ 
++ /**
++  *	t4_load_phy_fw - download port PHY firmware
++  *	@adap: the adapter
++  *	@win: the PCI-E Memory Window index to use for t4_memory_rw()
++  *	@win_lock: the lock to use to guard the memory copy
++  *	@phy_fw_version: function to check PHY firmware versions
++  *	@phy_fw_data: the PHY firmware image to write
++  *	@phy_fw_size: image size
++  *
++  *	Transfer the specified PHY firmware to the adapter.  If a non-NULL
++  *	@phy_fw_version is supplied, then it will be used to determine if
++  *	it's necessary to perform the transfer by comparing the version
++  *	of any existing adapter PHY firmware with that of the passed in
++  *	PHY firmware image.  If @win_lock is non-NULL then it will be used
++  *	around the call to t4_memory_rw() which transfers the PHY firmware
++  *	to the adapter.
++  *
++  *	A negative error number will be returned if an error occurs.  If
++  *	version number support is available and there's no need to upgrade
++  *	the firmware, 0 will be returned.  If firmware is successfully
++  *	transferred to the adapter, 1 will be retured.
++  *
++  *	NOTE: some adapters only have local RAM to store the PHY firmware.  As
++  *	a result, a RESET of the adapter would cause that RAM to lose its
++  *	contents.  Thus, loading PHY firmware on such adapters must happen
++  *	after any FW_RESET_CMDs ...
++  */
++ int t4_load_phy_fw(struct adapter *adap,
++ 		   int win, spinlock_t *win_lock,
++ 		   int (*phy_fw_version)(const u8 *, size_t),
++ 		   const u8 *phy_fw_data, size_t phy_fw_size)
++ {
++ 	unsigned long mtype = 0, maddr = 0;
++ 	u32 param, val;
++ 	int cur_phy_fw_ver = 0, new_phy_fw_vers = 0;
++ 	int ret;
++ 
++ 	/* If we have version number support, then check to see if the adapter
++ 	 * already has up-to-date PHY firmware loaded.
++ 	 */
++ 	 if (phy_fw_version) {
++ 		new_phy_fw_vers = phy_fw_version(phy_fw_data, phy_fw_size);
++ 		ret = t4_phy_fw_ver(adap, &cur_phy_fw_ver);
++ 		if (ret < 0)
++ 			return ret;
++ 
++ 		if (cur_phy_fw_ver >= new_phy_fw_vers) {
++ 			CH_WARN(adap, "PHY Firmware already up-to-date, "
++ 				"version %#x\n", cur_phy_fw_ver);
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	/* Ask the firmware where it wants us to copy the PHY firmware image.
++ 	 * The size of the file requires a special version of the READ coommand
++ 	 * which will pass the file size via the values field in PARAMS_CMD and
++ 	 * retrieve the return value from firmware and place it in the same
++ 	 * buffer values
++ 	 */
++ 	param = (FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
++ 		 FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_PHYFW) |
++ 		 FW_PARAMS_PARAM_Y_V(adap->params.portvec) |
++ 		 FW_PARAMS_PARAM_Z_V(FW_PARAMS_PARAM_DEV_PHYFW_DOWNLOAD));
++ 	val = phy_fw_size;
++ 	ret = t4_query_params_rw(adap, adap->mbox, adap->fn, 0, 1,
++ 				 &param, &val, 1);
++ 	if (ret < 0)
++ 		return ret;
++ 	mtype = val >> 8;
++ 	maddr = (val & 0xff) << 16;
++ 
++ 	/* Copy the supplied PHY Firmware image to the adapter memory location
++ 	 * allocated by the adapter firmware.
++ 	 */
++ 	if (win_lock)
++ 		spin_lock_bh(win_lock);
++ 	ret = t4_memory_rw(adap, win, mtype, maddr,
++ 			   phy_fw_size, (__be32 *)phy_fw_data,
++ 			   T4_MEMORY_WRITE);
++ 	if (win_lock)
++ 		spin_unlock_bh(win_lock);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Tell the firmware that the PHY firmware image has been written to
++ 	 * RAM and it can now start copying it over to the PHYs.  The chip
++ 	 * firmware will RESET the affected PHYs as part of this operation
++ 	 * leaving them running the new PHY firmware image.
++ 	 */
++ 	param = (FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
++ 		 FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_PHYFW) |
++ 		 FW_PARAMS_PARAM_Y_V(adap->params.portvec) |
++ 		 FW_PARAMS_PARAM_Z_V(FW_PARAMS_PARAM_DEV_PHYFW_DOWNLOAD));
++ 	ret = t4_set_params_timeout(adap, adap->mbox, adap->fn, 0, 1,
++ 				    &param, &val, 30000);
++ 
++ 	/* If we have version number support, then check to see that the new
++ 	 * firmware got loaded properly.
++ 	 */
++ 	if (phy_fw_version) {
++ 		ret = t4_phy_fw_ver(adap, &cur_phy_fw_ver);
++ 		if (ret < 0)
++ 			return ret;
++ 
++ 		if (cur_phy_fw_ver != new_phy_fw_vers) {
++ 			CH_WARN(adap, "PHY Firmware did not update: "
++ 				"version on adapter %#x, "
++ 				"version flashed %#x\n",
++ 				cur_phy_fw_ver, new_phy_fw_vers);
++ 			return -ENXIO;
++ 		}
++ 	}
++ 
++ 	return 1;
++ }
++ 
++ /**
++  *	t4_fwcache - firmware cache operation
++  *	@adap: the adapter
++  *	@op  : the operation (flush or flush and invalidate)
++  */
++ int t4_fwcache(struct adapter *adap, enum fw_params_param_dev_fwcache op)
++ {
++ 	struct fw_params_cmd c;
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.op_to_vfn =
++ 		cpu_to_be32(FW_CMD_OP_V(FW_PARAMS_CMD) |
++ 			    FW_CMD_REQUEST_F | FW_CMD_WRITE_F |
++ 			    FW_PARAMS_CMD_PFN_V(adap->fn) |
++ 			    FW_PARAMS_CMD_VFN_V(0));
++ 	c.retval_len16 = cpu_to_be32(FW_LEN16(c));
++ 	c.param[0].mnem =
++ 		cpu_to_be32(FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
++ 			    FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_FWCACHE));
++ 	c.param[0].val = (__force __be32)op;
++ 
++ 	return t4_wr_mbox(adap, adap->mbox, &c, sizeof(c), NULL);
++ }
++ 
++ void t4_ulprx_read_la(struct adapter *adap, u32 *la_buf)
++ {
++ 	unsigned int i, j;
++ 
++ 	for (i = 0; i < 8; i++) {
++ 		u32 *p = la_buf + i;
++ 
++ 		t4_write_reg(adap, ULP_RX_LA_CTL_A, i);
++ 		j = t4_read_reg(adap, ULP_RX_LA_WRPTR_A);
++ 		t4_write_reg(adap, ULP_RX_LA_RDPTR_A, j);
++ 		for (j = 0; j < ULPRX_LA_SIZE; j++, p += 8)
++ 			*p = t4_read_reg(adap, ULP_RX_LA_RDDATA_A);
++ 	}
++ }
++ 
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+  #define ADVERT_MASK (FW_PORT_CAP_SPEED_100M | FW_PORT_CAP_SPEED_1G |\
+  		     FW_PORT_CAP_SPEED_10G | FW_PORT_CAP_SPEED_40G | \
+  		     FW_PORT_CAP_ANEG)
+@@@ -3317,12 -4536,18 +3509,27 @@@ int t4_query_params_rw(struct adapter *
+  		return -EINVAL;
+  
+  	memset(&c, 0, sizeof(c));
+++<<<<<<< HEAD
+ +	c.op_to_vfn = htonl(FW_CMD_OP(FW_PARAMS_CMD) | FW_CMD_REQUEST |
+ +			    FW_CMD_READ | FW_PARAMS_CMD_PFN(pf) |
+ +			    FW_PARAMS_CMD_VFN(vf));
+ +	c.retval_len16 = htonl(FW_LEN16(c));
+ +	for (i = 0; i < nparams; i++, p += 2)
+ +		*p = htonl(*params++);
+++=======
++ 	c.op_to_vfn = cpu_to_be32(FW_CMD_OP_V(FW_PARAMS_CMD) |
++ 				  FW_CMD_REQUEST_F | FW_CMD_READ_F |
++ 				  FW_PARAMS_CMD_PFN_V(pf) |
++ 				  FW_PARAMS_CMD_VFN_V(vf));
++ 	c.retval_len16 = cpu_to_be32(FW_LEN16(c));
++ 
++ 	for (i = 0; i < nparams; i++) {
++ 		*p++ = cpu_to_be32(*params++);
++ 		if (rw)
++ 			*p = cpu_to_be32(*(val + i));
++ 		p++;
++ 	}
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+  
+  	ret = t4_wr_mbox(adap, mbox, &c, sizeof(c), &c);
+  	if (ret == 0)
+@@@ -3331,7 -4556,54 +3538,57 @@@
+  	return ret;
+  }
+  
++ int t4_query_params(struct adapter *adap, unsigned int mbox, unsigned int pf,
++ 		    unsigned int vf, unsigned int nparams, const u32 *params,
++ 		    u32 *val)
++ {
++ 	return t4_query_params_rw(adap, mbox, pf, vf, nparams, params, val, 0);
++ }
++ 
++ /**
+++<<<<<<< HEAD
+++=======
++  *      t4_set_params_timeout - sets FW or device parameters
++  *      @adap: the adapter
++  *      @mbox: mailbox to use for the FW command
++  *      @pf: the PF
++  *      @vf: the VF
++  *      @nparams: the number of parameters
++  *      @params: the parameter names
++  *      @val: the parameter values
++  *      @timeout: the timeout time
++  *
++  *      Sets the value of FW or device parameters.  Up to 7 parameters can be
++  *      specified at once.
++  */
++ int t4_set_params_timeout(struct adapter *adap, unsigned int mbox,
++ 			  unsigned int pf, unsigned int vf,
++ 			  unsigned int nparams, const u32 *params,
++ 			  const u32 *val, int timeout)
++ {
++ 	struct fw_params_cmd c;
++ 	__be32 *p = &c.param[0].mnem;
++ 
++ 	if (nparams > 7)
++ 		return -EINVAL;
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.op_to_vfn = cpu_to_be32(FW_CMD_OP_V(FW_PARAMS_CMD) |
++ 				  FW_CMD_REQUEST_F | FW_CMD_WRITE_F |
++ 				  FW_PARAMS_CMD_PFN_V(pf) |
++ 				  FW_PARAMS_CMD_VFN_V(vf));
++ 	c.retval_len16 = cpu_to_be32(FW_LEN16(c));
++ 
++ 	while (nparams--) {
++ 		*p++ = cpu_to_be32(*params++);
++ 		*p++ = cpu_to_be32(*val++);
++ 	}
++ 
++ 	return t4_wr_mbox_timeout(adap, mbox, &c, sizeof(c), NULL, timeout);
++ }
++ 
+  /**
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+   *	t4_set_params - sets FW or device parameters
+   *	@adap: the adapter
+   *	@mbox: mailbox to use for the FW command
+@@@ -3348,23 -4620,8 +3605,28 @@@ int t4_set_params(struct adapter *adap
+  		  unsigned int vf, unsigned int nparams, const u32 *params,
+  		  const u32 *val)
+  {
+++<<<<<<< HEAD
+ +	struct fw_params_cmd c;
+ +	__be32 *p = &c.param[0].mnem;
+ +
+ +	if (nparams > 7)
+ +		return -EINVAL;
+ +
+ +	memset(&c, 0, sizeof(c));
+ +	c.op_to_vfn = htonl(FW_CMD_OP(FW_PARAMS_CMD) | FW_CMD_REQUEST |
+ +			    FW_CMD_WRITE | FW_PARAMS_CMD_PFN(pf) |
+ +			    FW_PARAMS_CMD_VFN(vf));
+ +	c.retval_len16 = htonl(FW_LEN16(c));
+ +	while (nparams--) {
+ +		*p++ = htonl(*params++);
+ +		*p++ = htonl(*val++);
+ +	}
+ +
+ +	return t4_wr_mbox(adap, mbox, &c, sizeof(c), NULL);
+++=======
++ 	return t4_set_params_timeout(adap, mbox, pf, vf, nparams, params, val,
++ 				     FW_CMD_MAX_TIMEOUT);
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+index 6e8a06e7cea8,0848317e5c4f..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+@@@ -935,6 -1061,8 +935,11 @@@ enum fw_params_param_dev 
+  	FW_PARAMS_PARAM_DEV_FWREV = 0x0B,
+  	FW_PARAMS_PARAM_DEV_TPREV = 0x0C,
+  	FW_PARAMS_PARAM_DEV_CF = 0x0D,
+++<<<<<<< HEAD
+++=======
++ 	FW_PARAMS_PARAM_DEV_PHYFW = 0x0F,
++ 	FW_PARAMS_PARAM_DEV_DIAG = 0x11,
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+  	FW_PARAMS_PARAM_DEV_MAXORDIRD_QP = 0x13, /* max supported QP IRD/ORD */
+  	FW_PARAMS_PARAM_DEV_MAXIRD_ADAPTER = 0x14, /* max supported adap IRD */
+  	FW_PARAMS_PARAM_DEV_ULPTX_MEMWRITE_DSGL = 0x17,
+@@@ -995,22 -1124,47 +1000,63 @@@ enum fw_params_param_dmaq 
+  	FW_PARAMS_PARAM_DMAQ_EQ_CMPLIQID_CTRL = 0x11,
+  	FW_PARAMS_PARAM_DMAQ_EQ_SCHEDCLASS_ETH = 0x12,
+  	FW_PARAMS_PARAM_DMAQ_EQ_DCBPRIO_ETH = 0x13,
+ -	FW_PARAMS_PARAM_DMAQ_CONM_CTXT = 0x20,
+  };
+  
+++<<<<<<< HEAD
+ +#define FW_PARAMS_MNEM(x)      ((x) << 24)
+ +#define FW_PARAMS_PARAM_X(x)   ((x) << 16)
+ +#define FW_PARAMS_PARAM_Y_SHIFT  8
+ +#define FW_PARAMS_PARAM_Y_MASK   0xffU
+ +#define FW_PARAMS_PARAM_Y(x)     ((x) << FW_PARAMS_PARAM_Y_SHIFT)
+ +#define FW_PARAMS_PARAM_Y_GET(x) (((x) >> FW_PARAMS_PARAM_Y_SHIFT) &\
+ +		FW_PARAMS_PARAM_Y_MASK)
+ +#define FW_PARAMS_PARAM_Z_SHIFT  0
+ +#define FW_PARAMS_PARAM_Z_MASK   0xffu
+ +#define FW_PARAMS_PARAM_Z(x)     ((x) << FW_PARAMS_PARAM_Z_SHIFT)
+ +#define FW_PARAMS_PARAM_Z_GET(x) (((x) >> FW_PARAMS_PARAM_Z_SHIFT) &\
+ +		FW_PARAMS_PARAM_Z_MASK)
+ +#define FW_PARAMS_PARAM_XYZ(x) ((x) << 0)
+ +#define FW_PARAMS_PARAM_YZ(x)  ((x) << 0)
+++=======
++ enum fw_params_param_dev_phyfw {
++ 	FW_PARAMS_PARAM_DEV_PHYFW_DOWNLOAD = 0x00,
++ 	FW_PARAMS_PARAM_DEV_PHYFW_VERSION = 0x01,
++ };
++ 
++ enum fw_params_param_dev_diag {
++ 	FW_PARAM_DEV_DIAG_TMP		= 0x00,
++ 	FW_PARAM_DEV_DIAG_VDD		= 0x01,
++ };
++ 
++ enum fw_params_param_dev_fwcache {
++ 	FW_PARAM_DEV_FWCACHE_FLUSH      = 0x00,
++ 	FW_PARAM_DEV_FWCACHE_FLUSHINV   = 0x01,
++ };
++ 
++ #define FW_PARAMS_MNEM_S	24
++ #define FW_PARAMS_MNEM_V(x)	((x) << FW_PARAMS_MNEM_S)
++ 
++ #define FW_PARAMS_PARAM_X_S     16
++ #define FW_PARAMS_PARAM_X_V(x)	((x) << FW_PARAMS_PARAM_X_S)
++ 
++ #define FW_PARAMS_PARAM_Y_S	8
++ #define FW_PARAMS_PARAM_Y_M	0xffU
++ #define FW_PARAMS_PARAM_Y_V(x)	((x) << FW_PARAMS_PARAM_Y_S)
++ #define FW_PARAMS_PARAM_Y_G(x)	(((x) >> FW_PARAMS_PARAM_Y_S) &\
++ 		FW_PARAMS_PARAM_Y_M)
++ 
++ #define FW_PARAMS_PARAM_Z_S	0
++ #define FW_PARAMS_PARAM_Z_M	0xffu
++ #define FW_PARAMS_PARAM_Z_V(x)	((x) << FW_PARAMS_PARAM_Z_S)
++ #define FW_PARAMS_PARAM_Z_G(x)	(((x) >> FW_PARAMS_PARAM_Z_S) &\
++ 		FW_PARAMS_PARAM_Z_M)
++ 
++ #define FW_PARAMS_PARAM_XYZ_S		0
++ #define FW_PARAMS_PARAM_XYZ_V(x)	((x) << FW_PARAMS_PARAM_XYZ_S)
++ 
++ #define FW_PARAMS_PARAM_YZ_S		0
++ #define FW_PARAMS_PARAM_YZ_V(x)		((x) << FW_PARAMS_PARAM_YZ_S)
+++>>>>>>> 01b6961410b7 (cxgb4: Add PHY firmware support for T420-BT cards)
+  
+  struct fw_params_cmd {
+  	__be32 op_to_vfn;
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
