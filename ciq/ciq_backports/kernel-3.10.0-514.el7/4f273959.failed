@@ -1,0 +1,120 @@
+mei: nfc: fix deadlock on shutdown/suspend path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 4f273959b850569253299987eee611927f048de7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4f273959.failed
+
+In function mei_nfc_host_exit mei_cl_remove_device cannot be called
+under the device mutex as device removing flow invokes the device driver
+remove handler that calls in turn to mei_cl_disable_device which
+naturally acquires the device mutex.
+
+Also remove mei_cl_bus_remove_devices which has the same issue, but is
+never executed as currently the only device on the mei client bus is NFC
+and a new device cannot be easily added till the bus revamp is
+completed.
+
+This fixes regression caused by commit be9b720a0ccb ("mei_phy: move all
+nfc logic from mei driver to nfc")
+
+Prior to this change the nfc driver remove handler called to no-op
+disable function while actual nfc device was disabled directly from the
+mei driver.
+
+	Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Samuel Ortiz <sameo@linux.intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4f273959b850569253299987eee611927f048de7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/nfc.c
+diff --cc drivers/misc/mei/nfc.c
+index 2b65e8021f0d,290ef3037437..000000000000
+--- a/drivers/misc/mei/nfc.c
++++ b/drivers/misc/mei/nfc.c
+@@@ -550,8 -384,32 +550,37 @@@ err
+  
+  void mei_nfc_host_exit(struct mei_device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct mei_nfc_dev *ndev = &nfc_dev;
+ +	cancel_work_sync(&ndev->init_work);
+++=======
++ 	struct mei_nfc_dev *ndev;
++ 	struct mei_cl *cl;
++ 	struct mei_cl_device *cldev;
++ 
++ 	cl = mei_cl_bus_find_cl_by_uuid(dev, mei_nfc_guid);
++ 	if (!cl)
++ 		return;
++ 
++ 	cldev = cl->device;
++ 	if (!cldev)
++ 		return;
++ 
++ 	ndev = (struct mei_nfc_dev *)cldev->priv_data;
++ 	if (ndev)
++ 		cancel_work_sync(&ndev->init_work);
++ 
++ 	cldev->priv_data = NULL;
++ 
++ 	/* Need to remove the device here
++ 	 * since mei_nfc_free will unlink the clients
++ 	 */
++ 	mei_cl_remove_device(cldev);
++ 
++ 	mutex_lock(&dev->device_lock);
++ 	mei_nfc_free(ndev);
++ 	mutex_unlock(&dev->device_lock);
+++>>>>>>> 4f273959b850 (mei: nfc: fix deadlock on shutdown/suspend path)
+  }
+  
+  
+diff --git a/drivers/misc/mei/bus.c b/drivers/misc/mei/bus.c
+index ca8736c3675b..6d187ec9c4ac 100644
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@ -521,22 +521,6 @@ void mei_cl_bus_rx_event(struct mei_cl *cl)
+ 	schedule_work(&device->event_work);
+ }
+ 
+-void mei_cl_bus_remove_devices(struct mei_device *dev)
+-{
+-	struct mei_cl *cl, *next;
+-
+-	mutex_lock(&dev->device_lock);
+-	list_for_each_entry_safe(cl, next, &dev->device_list, device_link) {
+-		if (cl->device)
+-			mei_cl_remove_device(cl->device);
+-
+-		list_del(&cl->device_link);
+-		mei_cl_unlink(cl);
+-		kfree(cl);
+-	}
+-	mutex_unlock(&dev->device_lock);
+-}
+-
+ int __init mei_cl_bus_init(void)
+ {
+ 	return bus_register(&mei_cl_bus_type);
+diff --git a/drivers/misc/mei/init.c b/drivers/misc/mei/init.c
+index 08331e745faf..8201f3a7024d 100644
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -304,8 +304,6 @@ void mei_stop(struct mei_device *dev)
+ 
+ 	mei_nfc_host_exit(dev);
+ 
+-	mei_cl_bus_remove_devices(dev);
+-
+ 	mutex_lock(&dev->device_lock);
+ 
+ 	mei_wd_stop(dev);
+* Unmerged path drivers/misc/mei/nfc.c
