@@ -1,0 +1,150 @@
+sd: don't grab a device references from driver methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 3d9a1f530e508ff6fc9ab8220016b02f1bce255b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3d9a1f53.failed
+
+The device model already takes care of races between ->remove and
+->shutdown vs its other methods, and we now take care about locking
+them out for ->rescan as well.
+
+This is a partial revert of commit 39b7f1 ("[SCSI] sd: Fix refcounting").
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 3d9a1f530e508ff6fc9ab8220016b02f1bce255b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd.c
+diff --cc drivers/scsi/sd.c
+index 6f72cef799a7,9e0c63e57aff..000000000000
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@@ -609,25 -591,35 +590,30 @@@ static void scsi_disk_put(struct scsi_d
+  	mutex_unlock(&sd_ref_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +static void sd_prot_op(struct scsi_cmnd *scmd, unsigned int dif)
+++=======
++ static unsigned char sd_setup_protect_cmnd(struct scsi_cmnd *scmd,
++ 					   unsigned int dix, unsigned int dif)
+ -{
+ -	struct bio *bio = scmd->request->bio;
+ -	unsigned int prot_op = sd_prot_op(rq_data_dir(scmd->request), dix, dif);
+ -	unsigned int protect = 0;
+ -
+ -	if (dix) {				/* DIX Type 0, 1, 2, 3 */
+ -		if (bio_integrity_flagged(bio, BIP_IP_CHECKSUM))
+ -			scmd->prot_flags |= SCSI_PROT_IP_CHECKSUM;
+ -
+ -		if (bio_integrity_flagged(bio, BIP_CTRL_NOCHECK) == false)
+ -			scmd->prot_flags |= SCSI_PROT_GUARD_CHECK;
+ -	}
+ -
+ -	if (dif != SD_DIF_TYPE3_PROTECTION) {	/* DIX/DIF Type 0, 1, 2 */
+ -		scmd->prot_flags |= SCSI_PROT_REF_INCREMENT;
+ -
+ -		if (bio_integrity_flagged(bio, BIP_CTRL_NOCHECK) == false)
+ -			scmd->prot_flags |= SCSI_PROT_REF_CHECK;
+ -	}
+ -
+ -	if (dif) {				/* DIX/DIF Type 1, 2, 3 */
+ -		scmd->prot_flags |= SCSI_PROT_TRANSFER_PI;
+ -
+ -		if (bio_integrity_flagged(bio, BIP_DISK_NOCHECK))
+ -			protect = 3 << 5;	/* Disable target PI checking */
+ -		else
+ -			protect = 1 << 5;	/* Enable target PI checking */
+++>>>>>>> 3d9a1f530e50 (sd: don't grab a device references from driver methods)
+ +{
+ +	unsigned int prot_op = SCSI_PROT_NORMAL;
+ +	unsigned int dix = scsi_prot_sg_count(scmd);
+ +
+ +	if (scmd->sc_data_direction == DMA_FROM_DEVICE) {
+ +		if (dif && dix)
+ +			prot_op = SCSI_PROT_READ_PASS;
+ +		else if (dif && !dix)
+ +			prot_op = SCSI_PROT_READ_STRIP;
+ +		else if (!dif && dix)
+ +			prot_op = SCSI_PROT_READ_INSERT;
+ +	} else {
+ +		if (dif && dix)
+ +			prot_op = SCSI_PROT_WRITE_PASS;
+ +		else if (dif && !dix)
+ +			prot_op = SCSI_PROT_WRITE_INSERT;
+ +		else if (!dif && dix)
+ +			prot_op = SCSI_PROT_WRITE_STRIP;
+  	}
+  
+  	scsi_set_prot_op(scmd, prot_op);
+@@@ -3223,9 -3131,9 +3206,9 @@@ static void sd_shutdown(struct device *
+  		return;         /* this can happen */
+  
+  	if (pm_runtime_suspended(dev))
+- 		goto exit;
++ 		return;
+  
+ -	if (sdkp->WCE && sdkp->media_present) {
+ +	if (sdkp->WCE) {
+  		sd_printk(KERN_NOTICE, sdkp, "Synchronizing SCSI cache\n");
+  		sd_sync_cache(sdkp);
+  	}
+@@@ -3234,14 -3142,11 +3217,11 @@@
+  		sd_printk(KERN_NOTICE, sdkp, "Stopping disk\n");
+  		sd_start_stop_device(sdkp, 0);
+  	}
+- 
+- exit:
+- 	scsi_disk_put(sdkp);
+  }
+  
+ -static int sd_suspend_common(struct device *dev, bool ignore_stop_errors)
+ +static int sd_suspend(struct device *dev)
+  {
+- 	struct scsi_disk *sdkp = scsi_disk_get_from_dev(dev);
++ 	struct scsi_disk *sdkp = dev_get_drvdata(dev);
+  	int ret = 0;
+  
+  	if (!sdkp)
+@@@ -3263,21 -3175,25 +3243,15 @@@ done
+  	return ret;
+  }
+  
+ -static int sd_suspend_system(struct device *dev)
+ -{
+ -	return sd_suspend_common(dev, true);
+ -}
+ -
+ -static int sd_suspend_runtime(struct device *dev)
+ -{
+ -	return sd_suspend_common(dev, false);
+ -}
+ -
+  static int sd_resume(struct device *dev)
+  {
+- 	struct scsi_disk *sdkp = scsi_disk_get_from_dev(dev);
+- 	int ret = 0;
++ 	struct scsi_disk *sdkp = dev_get_drvdata(dev);
+  
+  	if (!sdkp->device->manage_start_stop)
+- 		goto done;
++ 		return 0;
+  
+  	sd_printk(KERN_NOTICE, sdkp, "Starting disk\n");
+- 	ret = sd_start_stop_device(sdkp, 1);
+- 
+- done:
+- 	scsi_disk_put(sdkp);
+- 	return ret;
++ 	return sd_start_stop_device(sdkp, 1);
+  }
+  
+  /**
+* Unmerged path drivers/scsi/sd.c
