@@ -1,0 +1,261 @@
+IB/iser: Move memory reg/dereg routines to iser_memory.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] iser: Move memory reg/dereg routines to iser_memory.c (Amir Vadai) [1164539]
+Rebuild_FUZZ: 97.25%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit d03e61d0366c61f596ada66ab11c217e7f887d15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d03e61d0.failed
+
+As memory registration/de-registration methods, lets
+move them to their natural location. While we're at it,
+make iser_reg_page_vec routine static.
+
+This patch does not change any functionality.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit d03e61d0366c61f596ada66ab11c217e7f887d15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index e160d7ee63dc,d5e5288fe3dd..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -446,15 -627,11 +446,18 @@@ int  iser_reg_rdma_mem_fmr(struct iscsi
+  int  iser_reg_rdma_mem_fastreg(struct iscsi_iser_task *task,
+  			       enum iser_data_dir cmd_dir);
+  
+ -int  iser_connect(struct iser_conn *iser_conn,
+ -		  struct sockaddr *src_addr,
+ -		  struct sockaddr *dst_addr,
+ -		  int non_blocking);
+ +int  iser_connect(struct iser_conn   *ib_conn,
+ +		  struct sockaddr    *src_addr,
+ +		  struct sockaddr    *dst_addr,
+ +		  int                non_blocking);
+ +
+++<<<<<<< HEAD
+ +int  iser_reg_page_vec(struct iser_conn     *ib_conn,
+ +		       struct iser_page_vec *page_vec,
+ +		       struct iser_mem_reg  *mem_reg);
+  
+++=======
+++>>>>>>> d03e61d0366c (IB/iser: Move memory reg/dereg routines to iser_memory.c)
+  void iser_unreg_mem_fmr(struct iscsi_iser_task *iser_task,
+  			enum iser_data_dir cmd_dir);
+  void iser_unreg_mem_fastreg(struct iscsi_iser_task *iser_task,
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 4cafd44ad193,986b5f4823ea..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -922,97 -992,10 +922,101 @@@ connect_failure
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * iser_reg_page_vec - Register physical memory
+ + *
+ + * returns: 0 on success, errno code on failure
+ + */
+ +int iser_reg_page_vec(struct iser_conn     *ib_conn,
+ +		      struct iser_page_vec *page_vec,
+ +		      struct iser_mem_reg  *mem_reg)
+ +{
+ +	struct ib_pool_fmr *mem;
+ +	u64		   io_addr;
+ +	u64		   *page_list;
+ +	int		   status;
+ +
+ +	page_list = page_vec->pages;
+ +	io_addr	  = page_list[0];
+ +
+ +	mem  = ib_fmr_pool_map_phys(ib_conn->fmr.pool,
+ +				    page_list,
+ +				    page_vec->length,
+ +				    io_addr);
+ +
+ +	if (IS_ERR(mem)) {
+ +		status = (int)PTR_ERR(mem);
+ +		iser_err("ib_fmr_pool_map_phys failed: %d\n", status);
+ +		return status;
+ +	}
+ +
+ +	mem_reg->lkey  = mem->fmr->lkey;
+ +	mem_reg->rkey  = mem->fmr->rkey;
+ +	mem_reg->len   = page_vec->length * SIZE_4K;
+ +	mem_reg->va    = io_addr;
+ +	mem_reg->is_mr = 1;
+ +	mem_reg->mem_h = (void *)mem;
+ +
+ +	mem_reg->va   += page_vec->offset;
+ +	mem_reg->len   = page_vec->data_size;
+ +
+ +	iser_dbg("PHYSICAL Mem.register, [PHYS p_array: 0x%p, sz: %d, "
+ +		 "entry[0]: (0x%08lx,%ld)] -> "
+ +		 "[lkey: 0x%08X mem_h: 0x%p va: 0x%08lX sz: %ld]\n",
+ +		 page_vec, page_vec->length,
+ +		 (unsigned long)page_vec->pages[0],
+ +		 (unsigned long)page_vec->data_size,
+ +		 (unsigned int)mem_reg->lkey, mem_reg->mem_h,
+ +		 (unsigned long)mem_reg->va, (unsigned long)mem_reg->len);
+ +	return 0;
+ +}
+ +
+ +/**
+ + * Unregister (previosuly registered using FMR) memory.
+ + * If memory is non-FMR does nothing.
+ + */
+ +void iser_unreg_mem_fmr(struct iscsi_iser_task *iser_task,
+ +			enum iser_data_dir cmd_dir)
+ +{
+ +	struct iser_mem_reg *reg = &iser_task->rdma_regd[cmd_dir].reg;
+ +	int ret;
+ +
+ +	if (!reg->is_mr)
+ +		return;
+ +
+ +	iser_dbg("PHYSICAL Mem.Unregister mem_h %p\n",reg->mem_h);
+ +
+ +	ret = ib_fmr_pool_unmap((struct ib_pool_fmr *)reg->mem_h);
+ +	if (ret)
+ +		iser_err("ib_fmr_pool_unmap failed %d\n", ret);
+ +
+ +	reg->mem_h = NULL;
+ +}
+ +
+ +void iser_unreg_mem_fastreg(struct iscsi_iser_task *iser_task,
+ +			    enum iser_data_dir cmd_dir)
+ +{
+ +	struct iser_mem_reg *reg = &iser_task->rdma_regd[cmd_dir].reg;
+ +	struct iser_conn *ib_conn = iser_task->ib_conn;
+ +	struct fast_reg_descriptor *desc = reg->mem_h;
+ +
+ +	if (!reg->is_mr)
+ +		return;
+ +
+ +	reg->mem_h = NULL;
+ +	reg->is_mr = 0;
+ +	spin_lock_bh(&ib_conn->lock);
+ +	list_add_tail(&desc->list, &ib_conn->fastreg.pool);
+ +	spin_unlock_bh(&ib_conn->lock);
+ +}
+ +
+ +int iser_post_recvl(struct iser_conn *ib_conn)
+++=======
++ int iser_post_recvl(struct iser_conn *iser_conn)
+++>>>>>>> d03e61d0366c (IB/iser: Move memory reg/dereg routines to iser_memory.c)
+  {
+  	struct ib_recv_wr rx_wr, *rx_wr_failed;
+ -	struct ib_conn *ib_conn = &iser_conn->ib_conn;
+  	struct ib_sge	  sge;
+  	int ib_ret;
+  
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+diff --git a/drivers/infiniband/ulp/iser/iser_memory.c b/drivers/infiniband/ulp/iser/iser_memory.c
+index f40132fc970c..a2eeb0bd02fb 100644
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@ -365,6 +365,94 @@ static int fall_to_bounce_buf(struct iscsi_iser_task *iser_task,
+ 	return 0;
+ }
+ 
++/**
++ * iser_reg_page_vec - Register physical memory
++ *
++ * returns: 0 on success, errno code on failure
++ */
++static
++int iser_reg_page_vec(struct ib_conn *ib_conn,
++		      struct iser_page_vec *page_vec,
++		      struct iser_mem_reg  *mem_reg)
++{
++	struct ib_pool_fmr *mem;
++	u64		   io_addr;
++	u64		   *page_list;
++	int		   status;
++
++	page_list = page_vec->pages;
++	io_addr	  = page_list[0];
++
++	mem  = ib_fmr_pool_map_phys(ib_conn->fmr.pool,
++				    page_list,
++				    page_vec->length,
++				    io_addr);
++
++	if (IS_ERR(mem)) {
++		status = (int)PTR_ERR(mem);
++		iser_err("ib_fmr_pool_map_phys failed: %d\n", status);
++		return status;
++	}
++
++	mem_reg->lkey  = mem->fmr->lkey;
++	mem_reg->rkey  = mem->fmr->rkey;
++	mem_reg->len   = page_vec->length * SIZE_4K;
++	mem_reg->va    = io_addr;
++	mem_reg->mem_h = (void *)mem;
++
++	mem_reg->va   += page_vec->offset;
++	mem_reg->len   = page_vec->data_size;
++
++	iser_dbg("PHYSICAL Mem.register, [PHYS p_array: 0x%p, sz: %d, "
++		 "entry[0]: (0x%08lx,%ld)] -> "
++		 "[lkey: 0x%08X mem_h: 0x%p va: 0x%08lX sz: %ld]\n",
++		 page_vec, page_vec->length,
++		 (unsigned long)page_vec->pages[0],
++		 (unsigned long)page_vec->data_size,
++		 (unsigned int)mem_reg->lkey, mem_reg->mem_h,
++		 (unsigned long)mem_reg->va, (unsigned long)mem_reg->len);
++	return 0;
++}
++
++/**
++ * Unregister (previosuly registered using FMR) memory.
++ * If memory is non-FMR does nothing.
++ */
++void iser_unreg_mem_fmr(struct iscsi_iser_task *iser_task,
++			enum iser_data_dir cmd_dir)
++{
++	struct iser_mem_reg *reg = &iser_task->rdma_regd[cmd_dir].reg;
++	int ret;
++
++	if (!reg->mem_h)
++		return;
++
++	iser_dbg("PHYSICAL Mem.Unregister mem_h %p\n", reg->mem_h);
++
++	ret = ib_fmr_pool_unmap((struct ib_pool_fmr *)reg->mem_h);
++	if (ret)
++		iser_err("ib_fmr_pool_unmap failed %d\n", ret);
++
++	reg->mem_h = NULL;
++}
++
++void iser_unreg_mem_fastreg(struct iscsi_iser_task *iser_task,
++			    enum iser_data_dir cmd_dir)
++{
++	struct iser_mem_reg *reg = &iser_task->rdma_regd[cmd_dir].reg;
++	struct iser_conn *iser_conn = iser_task->iser_conn;
++	struct ib_conn *ib_conn = &iser_conn->ib_conn;
++	struct fast_reg_descriptor *desc = reg->mem_h;
++
++	if (!desc)
++		return;
++
++	reg->mem_h = NULL;
++	spin_lock_bh(&ib_conn->lock);
++	list_add_tail(&desc->list, &ib_conn->fastreg.pool);
++	spin_unlock_bh(&ib_conn->lock);
++}
++
+ /**
+  * iser_reg_rdma_mem_fmr - Registers memory intended for RDMA,
+  * using FMR (if possible) obtaining rkey and va
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
