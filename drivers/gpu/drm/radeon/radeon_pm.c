@@ -472,7 +472,12 @@ static ssize_t radeon_set_dpm_state(struct device *dev,
 		goto fail;
 	}
 	mutex_unlock(&rdev->pm.mutex);
-	radeon_pm_compute_clocks(rdev);
+
+	/* Can't set dpm state when the card is off */
+	if (!(rdev->flags & RADEON_IS_PX) ||
+	    (ddev->switch_power_state == DRM_SWITCH_POWER_ON))
+		radeon_pm_compute_clocks(rdev);
+
 fail:
 	return count;
 }
