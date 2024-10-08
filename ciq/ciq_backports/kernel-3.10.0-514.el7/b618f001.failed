@@ -1,0 +1,116 @@
+[SMB3] Enable checking for continuous availability and persistent handle support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] Enable checking for continuous availability and persistent handle support (Sachin Prabhu) [1337587]
+Rebuild_FUZZ: 95.42%
+commit-author Steve French <smfrench@gmail.com>
+commit b618f001a20e44f691dd0e2ffea651a40a651871
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b618f001.failed
+
+Validate "persistenthandles" and "nopersistenthandles" mount options against
+the support the server claims in negotiate and tree connect SMB3 responses.
+
+	Signed-off-by: Steve French <steve.french@primarydata.com>
+	Reviewed-by: Pavel Shilovsky <pshilovsky@samba.org>
+(cherry picked from commit b618f001a20e44f691dd0e2ffea651a40a651871)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2ops.c
+diff --cc fs/cifs/smb2ops.c
+index 29be80b2c22d,53ccdde6ff18..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -1718,3 -1874,25 +1718,28 @@@ struct smb_version_values smb302_value
+  	.signing_required = SMB2_NEGOTIATE_SIGNING_REQUIRED,
+  	.create_lease_size = sizeof(struct create_lease_v2),
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_CIFS_SMB311
++ struct smb_version_values smb311_values = {
++ 	.version_string = SMB311_VERSION_STRING,
++ 	.protocol_id = SMB311_PROT_ID,
++ 	.req_capabilities = SMB2_GLOBAL_CAP_DFS | SMB2_GLOBAL_CAP_LEASING | SMB2_GLOBAL_CAP_LARGE_MTU | SMB2_GLOBAL_CAP_PERSISTENT_HANDLES,
++ 	.large_lock_type = 0,
++ 	.exclusive_lock_type = SMB2_LOCKFLAG_EXCLUSIVE_LOCK,
++ 	.shared_lock_type = SMB2_LOCKFLAG_SHARED_LOCK,
++ 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
++ 	.header_size = sizeof(struct smb2_hdr),
++ 	.max_header_size = MAX_SMB2_HDR_SIZE,
++ 	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++ 	.lock_cmd = SMB2_LOCK,
++ 	.cap_unix = 0,
++ 	.cap_nt_find = SMB2_NT_FIND,
++ 	.cap_large_files = SMB2_LARGE_FILES,
++ 	.signing_enabled = SMB2_NEGOTIATE_SIGNING_ENABLED | SMB2_NEGOTIATE_SIGNING_REQUIRED,
++ 	.signing_required = SMB2_NEGOTIATE_SIGNING_REQUIRED,
++ 	.create_lease_size = sizeof(struct create_lease_v2),
++ };
++ #endif /* SMB311 */
+++>>>>>>> b618f001a20e ([SMB3] Enable checking for continuous availability and persistent handle support)
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index f5bff8385c0d..975b1497d1f3 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -889,6 +889,7 @@ struct cifs_tcon {
+ 	bool broken_posix_open; /* e.g. Samba server versions < 3.3.2, 3.2.9 */
+ 	bool broken_sparse_sup; /* if server or share does not support sparse */
+ 	bool need_reconnect:1; /* connection reset, tid now invalid */
++	bool use_persistent:1; /* use persistent instead of durable handles */
+ #ifdef CONFIG_CIFS_SMB2
+ 	bool print:1;		/* set if connection to printer share */
+ 	bool bad_network_name:1; /* set if ret status STATUS_BAD_NETWORK_NAME */
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 9f435e420f24..fd54596dee91 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -2680,6 +2680,30 @@ cifs_get_tcon(struct cifs_ses *ses, struct smb_vol *volume_info)
+ 		cifs_dbg(FYI, "DFS disabled (%d)\n", tcon->Flags);
+ 	}
+ 	tcon->seal = volume_info->seal;
++	tcon->use_persistent = false;
++	/* check if SMB2 or later, CIFS does not support persistent handles */
++	if (volume_info->persistent) {
++		if (ses->server->vals->protocol_id == 0) {
++			cifs_dbg(VFS,
++			     "SMB3 or later required for persistent handles\n");
++			rc = -EOPNOTSUPP;
++			goto out_fail;
++		} else if (ses->server->capabilities &
++			   SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)
++			tcon->use_persistent = true;
++		else /* persistent handles requested but not supported */ {
++			cifs_dbg(VFS,
++				"Persistent handles not supported on share\n");
++			rc = -EOPNOTSUPP;
++			goto out_fail;
++		}
++	} else if ((tcon->capabilities & SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY)
++	     && (ses->server->capabilities & SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)
++	     && (volume_info->nopersistent == false)) {
++		cifs_dbg(FYI, "enabling persistent handles\n");
++		tcon->use_persistent = true;
++	}
++
+ 	/*
+ 	 * We can have only one retry value for a connection to a share so for
+ 	 * resources mounted more than once to the same server share the last
+@@ -3528,6 +3552,12 @@ try_mount_again:
+ 		goto mount_fail_check;
+ 	}
+ 
++	if ((volume_info->persistent == true) && ((ses->server->capabilities &
++		SMB2_GLOBAL_CAP_PERSISTENT_HANDLES) == 0)) {
++		cifs_dbg(VFS, "persistent handles not supported by server\n");
++		rc = -EOPNOTSUPP;
++		goto mount_fail_check;
++	}
+ 	/* search for existing tcon to this server share */
+ 	tcon = cifs_get_tcon(ses, volume_info);
+ 	if (IS_ERR(tcon)) {
+* Unmerged path fs/cifs/smb2ops.c
