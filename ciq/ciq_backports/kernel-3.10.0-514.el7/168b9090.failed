@@ -1,0 +1,231 @@
+libceph: monc hunt rate is 3s with backoff up to 30s
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 168b9090c739c4b5556023a3f08789b349ca7339
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/168b9090.failed
+
+Unless we are in the process of setting up a client (i.e. connecting to
+the monitor cluster for the first time), apply a backoff: every time we
+want to reopen a session, increase our timeout by a multiple (currently
+2); when we complete the connection, reduce that multipler by 50%.
+
+Mirrors ceph.git commit 794c86fd289bd62a35ed14368fa096c46736e9a2.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 168b9090c739c4b5556023a3f08789b349ca7339)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ceph/libceph.h
+#	net/ceph/mon_client.c
+diff --cc include/linux/ceph/libceph.h
+index 1cb06e0fe132,e7975e4681e1..000000000000
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@@ -64,9 -64,15 +64,21 @@@ struct ceph_options 
+  /*
+   * defaults
+   */
+++<<<<<<< HEAD
+ +#define CEPH_MOUNT_TIMEOUT_DEFAULT  60
+ +#define CEPH_OSD_KEEPALIVE_DEFAULT  5
+ +#define CEPH_OSD_IDLE_TTL_DEFAULT    60
+++=======
++ #define CEPH_MOUNT_TIMEOUT_DEFAULT	msecs_to_jiffies(60 * 1000)
++ #define CEPH_OSD_KEEPALIVE_DEFAULT	msecs_to_jiffies(5 * 1000)
++ #define CEPH_OSD_IDLE_TTL_DEFAULT	msecs_to_jiffies(60 * 1000)
++ 
++ #define CEPH_MONC_HUNT_INTERVAL		msecs_to_jiffies(3 * 1000)
++ #define CEPH_MONC_PING_INTERVAL		msecs_to_jiffies(10 * 1000)
++ #define CEPH_MONC_PING_TIMEOUT		msecs_to_jiffies(30 * 1000)
++ #define CEPH_MONC_HUNT_BACKOFF		2
++ #define CEPH_MONC_HUNT_MAX_MULT		10
+++>>>>>>> 168b9090c739 (libceph: monc hunt rate is 3s with backoff up to 30s)
+  
+  #define CEPH_MSG_MAX_FRONT_LEN	(16*1024*1024)
+  #define CEPH_MSG_MAX_MIDDLE_LEN	(16*1024*1024)
+diff --cc net/ceph/mon_client.c
+index 4a66c44fabbd,fd1cf408fd89..000000000000
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@@ -128,60 -128,102 +128,77 @@@ static void __close_session(struct ceph
+  }
+  
+  /*
+ - * Pick a new monitor at random and set cur_mon.  If we are repicking
+ - * (i.e. cur_mon is already set), be sure to pick a different one.
+ + * Open a session with a (new) monitor.
+   */
+ -static void pick_new_mon(struct ceph_mon_client *monc)
+ -{
+ -	int old_mon = monc->cur_mon;
+ -
+ -	BUG_ON(monc->monmap->num_mon < 1);
+ -
+ -	if (monc->monmap->num_mon == 1) {
+ -		monc->cur_mon = 0;
+ -	} else {
+ -		int max = monc->monmap->num_mon;
+ -		int o = -1;
+ -		int n;
+ -
+ -		if (monc->cur_mon >= 0) {
+ -			if (monc->cur_mon < monc->monmap->num_mon)
+ -				o = monc->cur_mon;
+ -			if (o >= 0)
+ -				max--;
+ -		}
+ -
+ -		n = prandom_u32() % max;
+ -		if (o >= 0 && n >= o)
+ -			n++;
+ -
+ -		monc->cur_mon = n;
+ -	}
+ -
+ -	dout("%s mon%d -> mon%d out of %d mons\n", __func__, old_mon,
+ -	     monc->cur_mon, monc->monmap->num_mon);
+ -}
+ -
+ -/*
+ - * Open a session with a new monitor.
+ - */
+ -static void __open_session(struct ceph_mon_client *monc)
+ +static int __open_session(struct ceph_mon_client *monc)
+  {
+ +	char r;
+  	int ret;
+  
+ -	pick_new_mon(monc);
+ -
+ +	if (monc->cur_mon < 0) {
+ +		get_random_bytes(&r, 1);
+ +		monc->cur_mon = r % monc->monmap->num_mon;
+ +		dout("open_session num=%d r=%d -> mon%d\n",
+ +		     monc->monmap->num_mon, r, monc->cur_mon);
+ +		monc->sub_sent = 0;
+ +		monc->sub_renew_after = jiffies;  /* i.e., expired */
+ +		monc->want_next_osdmap = !!monc->want_next_osdmap;
+ +
+++<<<<<<< HEAD
+ +		dout("open_session mon%d opening\n", monc->cur_mon);
+ +		ceph_con_open(&monc->con,
+ +			      CEPH_ENTITY_TYPE_MON, monc->cur_mon,
+ +			      &monc->monmap->mon_inst[monc->cur_mon].addr);
+++=======
++ 	if (monc->had_a_connection) {
++ 		monc->hunt_mult *= CEPH_MONC_HUNT_BACKOFF;
++ 		if (monc->hunt_mult > CEPH_MONC_HUNT_MAX_MULT)
++ 			monc->hunt_mult = CEPH_MONC_HUNT_MAX_MULT;
++ 	}
++ 
++ 	monc->sub_renew_after = jiffies; /* i.e., expired */
++ 	monc->sub_renew_sent = 0;
+++>>>>>>> 168b9090c739 (libceph: monc hunt rate is 3s with backoff up to 30s)
+  
+ -	dout("%s opening mon%d\n", __func__, monc->cur_mon);
+ -	ceph_con_open(&monc->con, CEPH_ENTITY_TYPE_MON, monc->cur_mon,
+ -		      &monc->monmap->mon_inst[monc->cur_mon].addr);
+ -
+ -	/*
+ -	 * send an initial keepalive to ensure our timestamp is valid
+ -	 * by the time we are in an OPENED state
+ -	 */
+ -	ceph_con_keepalive(&monc->con);
+ -
+ -	/* initiate authentication handshake */
+ -	ret = ceph_auth_build_hello(monc->auth,
+ -				    monc->m_auth->front.iov_base,
+ -				    monc->m_auth->front_alloc_len);
+ -	BUG_ON(ret <= 0);
+ -	__send_prepared_auth_request(monc, ret);
+ +		/* initiatiate authentication handshake */
+ +		ret = ceph_auth_build_hello(monc->auth,
+ +					    monc->m_auth->front.iov_base,
+ +					    monc->m_auth->front_alloc_len);
+ +		__send_prepared_auth_request(monc, ret);
+ +	} else {
+ +		dout("open_session mon%d already open\n", monc->cur_mon);
+ +	}
+ +	return 0;
+  }
+  
+- static bool __sub_expired(struct ceph_mon_client *monc)
+- {
+- 	return time_after_eq(jiffies, monc->sub_renew_after);
+- }
+- 
+  /*
+   * Reschedule delayed work timer.
+   */
+  static void __schedule_delayed(struct ceph_mon_client *monc)
+  {
+ -	unsigned long delay;
+ +	unsigned int delay;
+  
+++<<<<<<< HEAD
+ +	if (monc->cur_mon < 0 || __sub_expired(monc))
+ +		delay = 10 * HZ;
+ +	else
+ +		delay = 20 * HZ;
+ +	dout("__schedule_delayed after %u\n", delay);
+ +	schedule_delayed_work(&monc->delayed_work, delay);
+++=======
++ 	if (monc->hunting)
++ 		delay = CEPH_MONC_HUNT_INTERVAL * monc->hunt_mult;
++ 	else
++ 		delay = CEPH_MONC_PING_INTERVAL;
++ 
++ 	dout("__schedule_delayed after %lu\n", delay);
++ 	schedule_delayed_work(&monc->delayed_work,
++ 			      round_jiffies_relative(delay));
+++>>>>>>> 168b9090c739 (libceph: monc hunt rate is 3s with backoff up to 30s)
+  }
+  
+ -const char *ceph_sub_str[] = {
+ -	[CEPH_SUB_MDSMAP] = "mdsmap",
+ -	[CEPH_SUB_MONMAP] = "monmap",
+ -	[CEPH_SUB_OSDMAP] = "osdmap",
+ -};
+ -
+  /*
+ - * Send subscribe request for one or more maps, according to
+ - * monc->subs.
+ + * Send subscribe request for mdsmap and/or osdmap.
+   */
+  static void __send_subscribe(struct ceph_mon_client *monc)
+  {
+@@@ -787,7 -902,9 +804,13 @@@ int ceph_monc_init(struct ceph_mon_clie
+  	monc->cur_mon = -1;
+  	monc->hunting = true;
+  	monc->sub_renew_after = jiffies;
+++<<<<<<< HEAD
+ +	monc->sub_sent = 0;
+++=======
++ 	monc->sub_renew_sent = 0;
++ 	monc->had_a_connection = false;
++ 	monc->hunt_mult = 1;
+++>>>>>>> 168b9090c739 (libceph: monc hunt rate is 3s with backoff up to 30s)
+  
+  	INIT_DELAYED_WORK(&monc->delayed_work, delayed_work);
+  	monc->generic_request_tree = RB_ROOT;
+* Unmerged path include/linux/ceph/libceph.h
+diff --git a/include/linux/ceph/mon_client.h b/include/linux/ceph/mon_client.h
+index 81810dc21f06..a8c1fe5e1e16 100644
+--- a/include/linux/ceph/mon_client.h
++++ b/include/linux/ceph/mon_client.h
+@@ -71,6 +71,9 @@ struct ceph_mon_client {
+ 	unsigned long sub_sent, sub_renew_after;
+ 	struct ceph_connection con;
+ 
++	bool had_a_connection;
++	int hunt_mult; /* [1..CEPH_MONC_HUNT_MAX_MULT] */
++
+ 	/* pending generic requests */
+ 	struct rb_root generic_request_tree;
+ 	int num_generic_requests;
+* Unmerged path net/ceph/mon_client.c
