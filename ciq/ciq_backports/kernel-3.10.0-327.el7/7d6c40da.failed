@@ -1,0 +1,194 @@
+KVM: PPC: Book3S HV: Use bitmap of active threads rather than count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s-hv: Use bitmap of active threads rather than count (Laurent Vivier) [1213669]
+Rebuild_FUZZ: 94.57%
+commit-author Paul Mackerras <paulus@samba.org>
+commit 7d6c40da198ac18bd5dd2cd18628d5b4c615d842
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7d6c40da.failed
+
+Currently, the entry_exit_count field in the kvmppc_vcore struct
+contains two 8-bit counts, one of the threads that have started entering
+the guest, and one of the threads that have started exiting the guest.
+This changes it to an entry_exit_map field which contains two bitmaps
+of 8 bits each.  The advantage of doing this is that it gives us a
+bitmap of which threads need to be signalled when exiting the guest.
+That means that we no longer need to use the trick of setting the
+HDEC to 0 to pull the other threads out of the guest, which led in
+some cases to a spurious HDEC interrupt on the next guest entry.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 7d6c40da198ac18bd5dd2cd18628d5b4c615d842)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_builtin.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_builtin.c
+index f719a1437a31,275425142bb7..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@@ -175,18 -91,41 +175,47 @@@ void __init kvm_cma_reserve(void
+  	if (selected_size) {
+  		pr_debug("%s: reserving %ld MiB for global area\n", __func__,
+  			 (unsigned long)selected_size / SZ_1M);
+ -		align_size = HPT_ALIGN_PAGES << PAGE_SHIFT;
+ -		cma_declare_contiguous(0, selected_size, 0, align_size,
+ -			KVM_CMA_CHUNK_ORDER - PAGE_SHIFT, false, &kvm_cma);
+ -	}
+ -}
+ +		/*
+ +		 * Old CPUs require HPT aligned on a multiple of its size. So for them
+ +		 * make the alignment as max size we could request.
+ +		 */
+ +		if (!cpu_has_feature(CPU_FTR_ARCH_206))
+ +			align_size = __rounddown_pow_of_two(selected_size);
+ +		else
+ +			align_size = HPT_ALIGN_PAGES << PAGE_SHIFT;
+  
+++<<<<<<< HEAD
+ +		align_size = max(kvm_rma_pages << PAGE_SHIFT, align_size);
+ +		kvm_cma_declare_contiguous(selected_size, align_size);
+++=======
++ /*
++  * Real-mode H_CONFER implementation.
++  * We check if we are the only vcpu out of this virtual core
++  * still running in the guest and not ceded.  If so, we pop up
++  * to the virtual-mode implementation; if not, just return to
++  * the guest.
++  */
++ long int kvmppc_rm_h_confer(struct kvm_vcpu *vcpu, int target,
++ 			    unsigned int yield_count)
++ {
++ 	struct kvmppc_vcore *vc = vcpu->arch.vcore;
++ 	int threads_running;
++ 	int threads_ceded;
++ 	int threads_conferring;
++ 	u64 stop = get_tb() + 10 * tb_ticks_per_usec;
++ 	int rv = H_SUCCESS; /* => don't yield */
++ 
++ 	set_bit(vcpu->arch.ptid, &vc->conferring_threads);
++ 	while ((get_tb() < stop) && !VCORE_IS_EXITING(vc)) {
++ 		threads_running = VCORE_ENTRY_MAP(vc);
++ 		threads_ceded = vc->napping_threads;
++ 		threads_conferring = vc->conferring_threads;
++ 		if ((threads_ceded | threads_conferring) == threads_running) {
++ 			rv = H_TOO_HARD; /* => do yield */
++ 			break;
++ 		}
+++>>>>>>> 7d6c40da198a (KVM: PPC: Book3S HV: Use bitmap of active threads rather than count)
+  	}
+ -	clear_bit(vcpu->arch.ptid, &vc->conferring_threads);
+ -	return rv;
+  }
+  
+  /*
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 499fdba9ddf8,245f5c972030..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -1589,18 -1507,9 +1594,24 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201
+  	cmpwi	r3,0x100	/* Are we the first here? */
+  	bge	43f
+  	cmpwi	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
+++<<<<<<< HEAD
+ +	beq	40f
+ +	li	r0,0
+ +	mtspr	SPRN_HDEC,r0
+ +40:
+ +	/*
+ +	 * Send an IPI to any napping threads, since an HDEC interrupt
+ +	 * doesn't wake CPUs up from nap.
+ +	 */
+ +	lwz	r3,VCORE_NAPPING_THREADS(r5)
+ +	lbz	r4,HSTATE_PTID(r13)
+ +	li	r0,1
+ +	sld	r0,r0,r4
+++=======
++ 	beq	43f
++ 
++ 	srwi	r0,r7,8
+++>>>>>>> 7d6c40da198a (KVM: PPC: Book3S HV: Use bitmap of active threads rather than count)
+  	andc.	r3,r3,r0		/* no sense IPI'ing ourselves */
+  	beq	43f
+  	/* Order entry/exit update vs. IPIs */
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index d17590f243b6..7a29d2b4f855 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -285,16 +285,16 @@ struct kvm_arch {
+ 
+ /*
+  * Struct for a virtual core.
+- * Note: entry_exit_count combines an entry count in the bottom 8 bits
+- * and an exit count in the next 8 bits.  This is so that we can
+- * atomically increment the entry count iff the exit count is 0
+- * without taking the lock.
++ * Note: entry_exit_map combines a bitmap of threads that have entered
++ * in the bottom 8 bits and a bitmap of threads that have exited in the
++ * next 8 bits.  This is so that we can atomically set the entry bit
++ * iff the exit map is 0 without taking a lock.
+  */
+ struct kvmppc_vcore {
+ 	int n_runnable;
+ 	int n_busy;
+ 	int num_threads;
+-	int entry_exit_count;
++	int entry_exit_map;
+ 	int napping_threads;
+ 	int first_vcpuid;
+ 	u16 pcpu;
+@@ -318,8 +318,9 @@ struct kvmppc_vcore {
+ 	bool mpp_buffer_is_valid;
+ };
+ 
+-#define VCORE_ENTRY_COUNT(vc)	((vc)->entry_exit_count & 0xff)
+-#define VCORE_EXIT_COUNT(vc)	((vc)->entry_exit_count >> 8)
++#define VCORE_ENTRY_MAP(vc)	((vc)->entry_exit_map & 0xff)
++#define VCORE_EXIT_MAP(vc)	((vc)->entry_exit_map >> 8)
++#define VCORE_IS_EXITING(vc)	(VCORE_EXIT_MAP(vc) != 0)
+ 
+ /* Values for vcore_state */
+ #define VCORE_INACTIVE	0
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index b98af275a63f..00e55caf4770 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -543,7 +543,7 @@ int main(void)
+ 	DEFINE(VCPU_ACOP, offsetof(struct kvm_vcpu, arch.acop));
+ 	DEFINE(VCPU_WORT, offsetof(struct kvm_vcpu, arch.wort));
+ 	DEFINE(VCPU_SHADOW_SRR1, offsetof(struct kvm_vcpu, arch.shadow_srr1));
+-	DEFINE(VCORE_ENTRY_EXIT, offsetof(struct kvmppc_vcore, entry_exit_count));
++	DEFINE(VCORE_ENTRY_EXIT, offsetof(struct kvmppc_vcore, entry_exit_map));
+ 	DEFINE(VCORE_IN_GUEST, offsetof(struct kvmppc_vcore, in_guest));
+ 	DEFINE(VCORE_NAPPING_THREADS, offsetof(struct kvmppc_vcore, napping_threads));
+ 	DEFINE(VCORE_KVM, offsetof(struct kvmppc_vcore, kvm));
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 077343fa2903..76554bc42564 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -1720,7 +1720,7 @@ static void kvmppc_run_core(struct kvmppc_vcore *vc)
+ 	/*
+ 	 * Initialize *vc.
+ 	 */
+-	vc->entry_exit_count = 0;
++	vc->entry_exit_map = 0;
+ 	vc->preempt_tb = TB_NIL;
+ 	vc->in_guest = 0;
+ 	vc->napping_threads = 0;
+@@ -1903,8 +1903,7 @@ static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
+ 	 * this thread straight away and have it join in.
+ 	 */
+ 	if (!signal_pending(current)) {
+-		if (vc->vcore_state == VCORE_RUNNING &&
+-		    VCORE_EXIT_COUNT(vc) == 0) {
++		if (vc->vcore_state == VCORE_RUNNING && !VCORE_IS_EXITING(vc)) {
+ 			kvmppc_create_dtl_entry(vcpu, vc);
+ 			kvmppc_start_thread(vcpu);
+ 		} else if (vc->vcore_state == VCORE_SLEEPING) {
+* Unmerged path arch/powerpc/kvm/book3s_hv_builtin.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
