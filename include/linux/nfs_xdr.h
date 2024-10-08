@@ -1350,6 +1350,7 @@ struct nfs_unlinkdata {
 	struct inode *dir;
 	struct rpc_cred	*cred;
 	struct nfs_fattr dir_attr;
+	long timeout;
 };
 
 struct nfs_renamedata {
@@ -1363,6 +1364,7 @@ struct nfs_renamedata {
 	struct dentry		*new_dentry;
 	struct nfs_fattr	new_fattr;
 	void (*complete)(struct rpc_task *, struct nfs_renamedata *);
+	long timeout;
 };
 
 struct nfs_access_entry;
