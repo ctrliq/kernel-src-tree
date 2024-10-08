@@ -1,0 +1,181 @@
+i40e/i40evf: Fix TSO checksum pseudo-header adjustment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 24d41e5e2c9afe99b0584832206ba8779dfb783e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/24d41e5e.failed
+
+With IPv4 and IPv6 now using the same format for checksums based on the
+length of the frame we need to update the i40e and i40evf drivers so that
+they correctly account for lengths greater than or equal to 64K.
+
+With this patch the driver should now correctly update checksums for frames
+up to 16776960 in length which should be more than large enough for all
+possible TSO frames in the near future.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 24d41e5e2c9afe99b0584832206ba8779dfb783e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 421c31de3d59,5d5fa5359a1d..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -2139,26 -2286,50 +2139,62 @@@ static int i40e_tso(struct i40e_ring *t
+  	if (err < 0)
+  		return err;
+  
+ -	ip.hdr = skb_network_header(skb);
+ -	l4.hdr = skb_transport_header(skb);
+ -
+ -	/* initialize outer IP header fields */
+ -	if (ip.v4->version == 4) {
+ -		ip.v4->tot_len = 0;
+ -		ip.v4->check = 0;
+ -	} else {
+ -		ip.v6->payload_len = 0;
+ +	iph = skb->encapsulation ? inner_ip_hdr(skb) : ip_hdr(skb);
+ +	ipv6h = skb->encapsulation ? inner_ipv6_hdr(skb) : ipv6_hdr(skb);
+ +
+ +	if (iph->version == 4) {
+ +		tcph = skb->encapsulation ? inner_tcp_hdr(skb) : tcp_hdr(skb);
+ +		iph->tot_len = 0;
+ +		iph->check = 0;
+ +		tcph->check = ~csum_tcpudp_magic(iph->saddr, iph->daddr,
+ +						 0, IPPROTO_TCP, 0);
+ +	} else if (ipv6h->version == 6) {
+ +		tcph = skb->encapsulation ? inner_tcp_hdr(skb) : tcp_hdr(skb);
+ +		ipv6h->payload_len = 0;
+ +		tcph->check = ~csum_ipv6_magic(&ipv6h->saddr, &ipv6h->daddr,
+ +					       0, IPPROTO_TCP, 0);
+  	}
+  
+++<<<<<<< HEAD
+ +	l4len = skb->encapsulation ? inner_tcp_hdrlen(skb) : tcp_hdrlen(skb);
+ +	*hdr_len = (skb->encapsulation
+ +		    ? (skb_inner_transport_header(skb) - skb->data)
+ +		    : skb_transport_offset(skb)) + l4len;
+++=======
++ 	if (skb_shinfo(skb)->gso_type & (SKB_GSO_UDP_TUNNEL | SKB_GSO_GRE |
++ 					 SKB_GSO_UDP_TUNNEL_CSUM)) {
++ 		if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_TUNNEL_CSUM) {
++ 			/* determine offset of outer transport header */
++ 			l4_offset = l4.hdr - skb->data;
++ 
++ 			/* remove payload length from outer checksum */
++ 			paylen = skb->len - l4_offset;
++ 			csum_replace_by_diff(&l4.udp->check, htonl(paylen));
++ 		}
++ 
++ 		/* reset pointers to inner headers */
++ 		ip.hdr = skb_inner_network_header(skb);
++ 		l4.hdr = skb_inner_transport_header(skb);
++ 
++ 		/* initialize inner IP header fields */
++ 		if (ip.v4->version == 4) {
++ 			ip.v4->tot_len = 0;
++ 			ip.v4->check = 0;
++ 		} else {
++ 			ip.v6->payload_len = 0;
++ 		}
++ 	}
++ 
++ 	/* determine offset of inner transport header */
++ 	l4_offset = l4.hdr - skb->data;
++ 
++ 	/* remove payload length from inner checksum */
++ 	paylen = skb->len - l4_offset;
++ 	csum_replace_by_diff(&l4.tcp->check, htonl(paylen));
++ 
++ 	/* compute length of segmentation header */
++ 	*hdr_len = (l4.tcp->doff * 4) + l4_offset;
+++>>>>>>> 24d41e5e2c9a (i40e/i40evf: Fix TSO checksum pseudo-header adjustment)
+  
+  	/* find the field values */
+  	cd_cmd = I40E_TX_CTX_DESC_TSO;
+diff --cc drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+index 0e1a4d6e4e6e,04aabc52ba0d..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+@@@ -1399,26 -1553,50 +1399,62 @@@ static int i40e_tso(struct i40e_ring *t
+  	if (err < 0)
+  		return err;
+  
+ -	ip.hdr = skb_network_header(skb);
+ -	l4.hdr = skb_transport_header(skb);
+ -
+ -	/* initialize outer IP header fields */
+ -	if (ip.v4->version == 4) {
+ -		ip.v4->tot_len = 0;
+ -		ip.v4->check = 0;
+ -	} else {
+ -		ip.v6->payload_len = 0;
+ +	iph = skb->encapsulation ? inner_ip_hdr(skb) : ip_hdr(skb);
+ +	ipv6h = skb->encapsulation ? inner_ipv6_hdr(skb) : ipv6_hdr(skb);
+ +
+ +	if (iph->version == 4) {
+ +		tcph = skb->encapsulation ? inner_tcp_hdr(skb) : tcp_hdr(skb);
+ +		iph->tot_len = 0;
+ +		iph->check = 0;
+ +		tcph->check = ~csum_tcpudp_magic(iph->saddr, iph->daddr,
+ +						 0, IPPROTO_TCP, 0);
+ +	} else if (ipv6h->version == 6) {
+ +		tcph = skb->encapsulation ? inner_tcp_hdr(skb) : tcp_hdr(skb);
+ +		ipv6h->payload_len = 0;
+ +		tcph->check = ~csum_ipv6_magic(&ipv6h->saddr, &ipv6h->daddr,
+ +					       0, IPPROTO_TCP, 0);
+  	}
+  
+++<<<<<<< HEAD
+ +	l4len = skb->encapsulation ? inner_tcp_hdrlen(skb) : tcp_hdrlen(skb);
+ +	*hdr_len = (skb->encapsulation
+ +		    ? (skb_inner_transport_header(skb) - skb->data)
+ +		    : skb_transport_offset(skb)) + l4len;
+++=======
++ 	if (skb_shinfo(skb)->gso_type & (SKB_GSO_UDP_TUNNEL | SKB_GSO_GRE |
++ 					 SKB_GSO_UDP_TUNNEL_CSUM)) {
++ 		if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_TUNNEL_CSUM) {
++ 			/* determine offset of outer transport header */
++ 			l4_offset = l4.hdr - skb->data;
++ 
++ 			/* remove payload length from outer checksum */
++ 			paylen = skb->len - l4_offset;
++ 			csum_replace_by_diff(&l4.udp->check, htonl(paylen));
++ 		}
++ 
++ 		/* reset pointers to inner headers */
++ 		ip.hdr = skb_inner_network_header(skb);
++ 		l4.hdr = skb_inner_transport_header(skb);
++ 
++ 		/* initialize inner IP header fields */
++ 		if (ip.v4->version == 4) {
++ 			ip.v4->tot_len = 0;
++ 			ip.v4->check = 0;
++ 		} else {
++ 			ip.v6->payload_len = 0;
++ 		}
++ 	}
++ 
++ 	/* determine offset of inner transport header */
++ 	l4_offset = l4.hdr - skb->data;
++ 
++ 	/* remove payload length from inner checksum */
++ 	paylen = skb->len - l4_offset;
++ 	csum_replace_by_diff(&l4.tcp->check, htonl(paylen));
++ 
++ 	/* compute length of segmentation header */
++ 	*hdr_len = (l4.tcp->doff * 4) + l4_offset;
+++>>>>>>> 24d41e5e2c9a (i40e/i40evf: Fix TSO checksum pseudo-header adjustment)
+  
+  	/* find the field values */
+  	cd_cmd = I40E_TX_CTX_DESC_TSO;
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40e_txrx.c
