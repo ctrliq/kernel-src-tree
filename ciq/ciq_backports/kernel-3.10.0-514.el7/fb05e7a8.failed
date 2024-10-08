@@ -1,0 +1,149 @@
+net: don't wait for order-3 page allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] don't wait for order-3 page allocation (Sabrina Dubroca) [1284940]
+Rebuild_FUZZ: 93.83%
+commit-author Shaohua Li <shli@fb.com>
+commit fb05e7a89f500cfc06ae277bdc911b281928995d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fb05e7a8.failed
+
+We saw excessive direct memory compaction triggered by skb_page_frag_refill.
+This causes performance issues and add latency. Commit 5640f7685831e0
+introduces the order-3 allocation. According to the changelog, the order-3
+allocation isn't a must-have but to improve performance. But direct memory
+compaction has high overhead. The benefit of order-3 allocation can't
+compensate the overhead of direct memory compaction.
+
+This patch makes the order-3 page allocation atomic. If there is no memory
+pressure and memory isn't fragmented, the alloction will still success, so we
+don't sacrifice the order-3 benefit here. If the atomic allocation fails,
+direct memory compaction will not be triggered, skb_page_frag_refill will
+fallback to order-0 immediately, hence the direct memory compaction overhead is
+avoided. In the allocation failure case, kswapd is waken up and doing
+compaction, so chances are allocation could success next time.
+
+alloc_skb_with_frags is the same.
+
+The mellanox driver does similar thing, if this is accepted, we must fix
+the driver too.
+
+V3: fix the same issue in alloc_skb_with_frags as pointed out by Eric
+V2: make the changelog clearer
+
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Chris Mason <clm@fb.com>
+	Cc: Debabrata Banerjee <dbavatar@gmail.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fb05e7a89f500cfc06ae277bdc911b281928995d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index d9282bd8c9a4,41ec02242ea7..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -3997,3 -4350,81 +3997,84 @@@ int skb_vlan_push(struct sk_buff *skb, 
+  	return 0;
+  }
+  EXPORT_SYMBOL(skb_vlan_push);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * alloc_skb_with_frags - allocate skb with page frags
++  *
++  * @header_len: size of linear part
++  * @data_len: needed length in frags
++  * @max_page_order: max page order desired.
++  * @errcode: pointer to error code if any
++  * @gfp_mask: allocation mask
++  *
++  * This can be used to allocate a paged skb, given a maximal order for frags.
++  */
++ struct sk_buff *alloc_skb_with_frags(unsigned long header_len,
++ 				     unsigned long data_len,
++ 				     int max_page_order,
++ 				     int *errcode,
++ 				     gfp_t gfp_mask)
++ {
++ 	int npages = (data_len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++ 	unsigned long chunk;
++ 	struct sk_buff *skb;
++ 	struct page *page;
++ 	gfp_t gfp_head;
++ 	int i;
++ 
++ 	*errcode = -EMSGSIZE;
++ 	/* Note this test could be relaxed, if we succeed to allocate
++ 	 * high order pages...
++ 	 */
++ 	if (npages > MAX_SKB_FRAGS)
++ 		return NULL;
++ 
++ 	gfp_head = gfp_mask;
++ 	if (gfp_head & __GFP_WAIT)
++ 		gfp_head |= __GFP_REPEAT;
++ 
++ 	*errcode = -ENOBUFS;
++ 	skb = alloc_skb(header_len, gfp_head);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	skb->truesize += npages << PAGE_SHIFT;
++ 
++ 	for (i = 0; npages > 0; i++) {
++ 		int order = max_page_order;
++ 
++ 		while (order) {
++ 			if (npages >= 1 << order) {
++ 				page = alloc_pages((gfp_mask & ~__GFP_WAIT) |
++ 						   __GFP_COMP |
++ 						   __GFP_NOWARN |
++ 						   __GFP_NORETRY,
++ 						   order);
++ 				if (page)
++ 					goto fill_page;
++ 				/* Do not retry other high order allocations */
++ 				order = 1;
++ 				max_page_order = 0;
++ 			}
++ 			order--;
++ 		}
++ 		page = alloc_page(gfp_mask);
++ 		if (!page)
++ 			goto failure;
++ fill_page:
++ 		chunk = min_t(unsigned long, data_len,
++ 			      PAGE_SIZE << order);
++ 		skb_fill_page_desc(skb, i, page, 0, chunk);
++ 		data_len -= chunk;
++ 		npages -= 1 << order;
++ 	}
++ 	return skb;
++ 
++ failure:
++ 	kfree_skb(skb);
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(alloc_skb_with_frags);
+++>>>>>>> fb05e7a89f50 (net: don't wait for order-3 page allocation)
+* Unmerged path net/core/skbuff.c
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 39a74753a8db..5e20474af865 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1894,7 +1894,7 @@ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
+ 
+ 	pfrag->offset = 0;
+ 	if (SKB_FRAG_PAGE_ORDER) {
+-		pfrag->page = alloc_pages(gfp | __GFP_COMP |
++		pfrag->page = alloc_pages((gfp & ~__GFP_WAIT) | __GFP_COMP |
+ 					  __GFP_NOWARN | __GFP_NORETRY,
+ 					  SKB_FRAG_PAGE_ORDER);
+ 		if (likely(pfrag->page)) {
