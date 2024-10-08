@@ -1,0 +1,157 @@
+NVMe: Admin queue removal handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 0fb59cbc5f133207535b25ec7d16fba24d549ee2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0fb59cbc.failed
+
+This protects admin queue access on shutdown. When the controller is
+disabled, the queue is frozen to prevent new entry, and unfrozen on
+resume, and fixes cq_vector signedness to not suspend a queue twice.
+
+Since unfreezing the queue makes it available for commands, it requires
+the queue be initialized, so this moves this part after that.
+
+Special handling is done when the device is unresponsive during
+shutdown. This can be optimized to not require subsequent commands to
+timeout, but saving that fix for later.
+
+This patch also removes the kill signals in this path that were left-over
+artifacts from the blk-mq conversion and no longer necessary.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0fb59cbc5f133207535b25ec7d16fba24d549ee2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 48e1152870d9,5fcb993fc6c9..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1561,6 -1353,61 +1563,64 @@@ static int nvme_shutdown_ctrl(struct nv
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct blk_mq_ops nvme_mq_admin_ops = {
++ 	.queue_rq	= nvme_admin_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_admin_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_admin_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static struct blk_mq_ops nvme_mq_ops = {
++ 	.queue_rq	= nvme_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static void nvme_dev_remove_admin(struct nvme_dev *dev)
++ {
++ 	if (dev->admin_q && !blk_queue_dying(dev->admin_q)) {
++ 		blk_cleanup_queue(dev->admin_q);
++ 		blk_mq_free_tag_set(&dev->admin_tagset);
++ 	}
++ }
++ 
++ static int nvme_alloc_admin_tags(struct nvme_dev *dev)
++ {
++ 	if (!dev->admin_q) {
++ 		dev->admin_tagset.ops = &nvme_mq_admin_ops;
++ 		dev->admin_tagset.nr_hw_queues = 1;
++ 		dev->admin_tagset.queue_depth = NVME_AQ_DEPTH - 1;
++ 		dev->admin_tagset.timeout = ADMIN_TIMEOUT;
++ 		dev->admin_tagset.numa_node = dev_to_node(&dev->pci_dev->dev);
++ 		dev->admin_tagset.cmd_size = sizeof(struct nvme_cmd_info);
++ 		dev->admin_tagset.driver_data = dev;
++ 
++ 		if (blk_mq_alloc_tag_set(&dev->admin_tagset))
++ 			return -ENOMEM;
++ 
++ 		dev->admin_q = blk_mq_init_queue(&dev->admin_tagset);
++ 		if (IS_ERR(dev->admin_q)) {
++ 			blk_mq_free_tag_set(&dev->admin_tagset);
++ 			return -ENOMEM;
++ 		}
++ 		if (!blk_get_queue(dev->admin_q)) {
++ 			nvme_dev_remove_admin(dev);
++ 			return -ENODEV;
++ 		}
++ 	} else
++ 		blk_mq_unfreeze_queue(dev->admin_q);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 0fb59cbc5f13 (NVMe: Admin queue removal handling)
+  static int nvme_configure_admin_queue(struct nvme_dev *dev)
+  {
+  	int result;
+@@@ -1594,13 -1460,18 +1654,26 @@@
+  
+  	result = nvme_enable_ctrl(dev, cap);
+  	if (result)
+ -		goto free_nvmeq;
+ +		return result;
+ +
+++<<<<<<< HEAD
+ +	result = queue_request_irq(dev, nvmeq, nvmeq->irqname);
+ +	if (result)
+ +		return result;
+  
+ +	return result;
+++=======
++ 	nvmeq->cq_vector = 0;
++ 	result = queue_request_irq(dev, nvmeq, nvmeq->irqname);
++ 	if (result)
++ 		goto free_nvmeq;
++ 
++ 	return result;
++ 
++  free_nvmeq:
++ 	nvme_free_queues(dev, 0);
++ 	return result;
+++>>>>>>> 0fb59cbc5f13 (NVMe: Admin queue removal handling)
+  }
+  
+  struct nvme_iod *nvme_map_user_pages(struct nvme_dev *dev, int write,
+@@@ -2885,14 -2606,22 +2962,24 @@@ static int nvme_dev_start(struct nvme_d
+  		result = nvme_thread ? PTR_ERR(nvme_thread) : -EINTR;
+  		goto disable;
+  	}
+++<<<<<<< HEAD
+ +	nvme_init_queue(raw_nvmeq(dev, 0), 0);
+++=======
+  
+- 	result = nvme_setup_io_queues(dev);
++ 	nvme_init_queue(dev->queues[0], 0);
++ 	result = nvme_alloc_admin_tags(dev);
+  	if (result)
+  		goto disable;
+++>>>>>>> 0fb59cbc5f13 (NVMe: Admin queue removal handling)
++ 
++ 	result = nvme_setup_io_queues(dev);
++ 	if (result)
++ 		goto free_tags;
+  
+ -	nvme_set_irq_hints(dev);
+ -
+  	return result;
+  
++  free_tags:
++ 	nvme_dev_remove_admin(dev);
+   disable:
+  	nvme_disable_queue(dev, 0);
+  	nvme_dev_list_remove(dev);
+* Unmerged path drivers/block/nvme-core.c
