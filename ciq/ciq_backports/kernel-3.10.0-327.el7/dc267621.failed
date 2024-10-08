@@ -1,0 +1,74 @@
+dm crypt: offload writes to thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] dm-crypt: offload writes to thread (Mike Snitzer) [1205955 752438]
+Rebuild_FUZZ: 97.06%
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit dc2676210c425ee8e5cb1bec5bc84d004ddf4179
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dc267621.failed
+
+Submitting write bios directly in the encryption thread caused serious
+performance degradation.  On a multiprocessor machine, encryption requests
+finish in a different order than they were submitted.  Consequently, write
+requests would be submitted in a different order and it could cause severe
+performance degradation.
+
+Move the submission of write requests to a separate thread so that the
+requests can be sorted before submitting.  But this commit improves
+dm-crypt performance even without having dm-crypt perform request
+sorting (in particular it enables IO schedulers like CFQ to sort more
+effectively).
+
+Note: it is required that a previous commit ("dm crypt: don't allocate
+pages for a partial request") be applied before applying this patch.
+Otherwise, this commit could introduce a crash.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit dc2676210c425ee8e5cb1bec5bc84d004ddf4179)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-crypt.c
+diff --cc drivers/md/dm-crypt.c
+index 4fcca8922627,8c0e36b1d0ed..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -60,7 -59,8 +61,12 @@@ struct dm_crypt_io 
+  	atomic_t io_pending;
+  	int error;
+  	sector_t sector;
+++<<<<<<< HEAD
+ +	struct dm_crypt_io *base_io;
+++=======
++ 
++ 	struct list_head list;
+++>>>>>>> dc2676210c42 (dm crypt: offload writes to thread)
+  } CRYPTO_MINALIGN_ATTR;
+  
+  struct dm_crypt_request {
+@@@ -1191,14 -1235,14 +1253,14 @@@ static void kcryptd_crypt_write_io_subm
+  	}
+  
+  	/* crypt_convert should have filled the clone bio */
+ -	BUG_ON(io->ctx.iter_out.bi_size);
+ +	BUG_ON(io->ctx.idx_out < clone->bi_vcnt);
+  
+ -	clone->bi_iter.bi_sector = cc->start + io->sector;
+ +	clone->bi_sector = cc->start + io->sector;
+  
+- 	if (async)
+- 		kcryptd_queue_io(io);
+- 	else
+- 		generic_make_request(clone);
++ 	spin_lock_irqsave(&cc->write_thread_wait.lock, flags);
++ 	list_add_tail(&io->list, &cc->write_thread_list);
++ 	wake_up_locked(&cc->write_thread_wait);
++ 	spin_unlock_irqrestore(&cc->write_thread_wait.lock, flags);
+  }
+  
+  static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
+* Unmerged path drivers/md/dm-crypt.c
