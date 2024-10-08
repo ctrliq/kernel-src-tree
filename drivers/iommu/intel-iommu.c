@@ -304,7 +304,8 @@ static inline int first_pte_in_page(struct dma_pte *pte)
 static struct dmar_domain *si_domain;
 static int hw_pass_through = 1;
 
-/* domain represents a virtual machine, more than one devices
+/*
+ * Domain represents a virtual machine, more than one devices
  * across iommus may be owned in one domain, e.g. kvm guest.
  */
 #define DOMAIN_FLAG_VIRTUAL_MACHINE	(1 << 0)
@@ -523,6 +524,11 @@ static inline void free_devinfo_mem(void *vaddr)
 static inline int domain_type_is_vm(struct dmar_domain *domain)
 {
 	return domain->flags & DOMAIN_FLAG_VIRTUAL_MACHINE;
+}
+
+static inline int domain_type_is_si(struct dmar_domain *domain)
+{
+	return domain->flags & DOMAIN_FLAG_STATIC_IDENTITY;
 }
 
 static inline int domain_type_is_vm_or_si(struct dmar_domain *domain)
@@ -1787,21 +1793,23 @@ static void domain_exit(struct dmar_domain *domain)
 
 static int domain_context_mapping_one(struct dmar_domain *domain,
 				      struct intel_iommu *iommu,
-				      u8 bus, u8 devfn, int translation)
+				      u8 bus, u8 devfn)
 {
+	int translation = CONTEXT_TT_MULTI_LEVEL;
+	struct device_domain_info *info = NULL;
 	struct context_entry *context;
 	unsigned long flags;
 	struct dma_pte *pgd;
 	int id;
 	int agaw;
-	struct device_domain_info *info = NULL;
+
+	if (hw_pass_through && domain_type_is_si(domain))
+		translation = CONTEXT_TT_PASS_THROUGH;
 
 	pr_debug("Set context mapping for %02x:%02x.%d\n",
 		bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
 
 	BUG_ON(!domain->pgd);
-	BUG_ON(translation != CONTEXT_TT_PASS_THROUGH &&
-	       translation != CONTEXT_TT_MULTI_LEVEL);
 
 	spin_lock_irqsave(&iommu->lock, flags);
 	context = iommu_context_addr(iommu, bus, devfn, 1);
@@ -1891,7 +1899,6 @@ static int domain_context_mapping_one(struct dmar_domain *domain,
 struct domain_context_mapping_data {
 	struct dmar_domain *domain;
 	struct intel_iommu *iommu;
-	int translation;
 };
 
 static int domain_context_mapping_cb(struct pci_dev *pdev,
@@ -1900,13 +1907,11 @@ static int domain_context_mapping_cb(struct pci_dev *pdev,
 	struct domain_context_mapping_data *data = opaque;
 
 	return domain_context_mapping_one(data->domain, data->iommu,
-					  PCI_BUS_NUM(alias), alias & 0xff,
-					  data->translation);
+					  PCI_BUS_NUM(alias), alias & 0xff);
 }
 
 static int
-domain_context_mapping(struct dmar_domain *domain, struct device *dev,
-		       int translation)
+domain_context_mapping(struct dmar_domain *domain, struct device *dev)
 {
 	struct intel_iommu *iommu;
 	u8 bus, devfn;
@@ -1917,12 +1922,10 @@ domain_context_mapping(struct dmar_domain *domain, struct device *dev,
 		return -ENODEV;
 
 	if (!dev_is_pci(dev))
-		return domain_context_mapping_one(domain, iommu, bus, devfn,
-						  translation);
+		return domain_context_mapping_one(domain, iommu, bus, devfn);
 
 	data.domain = domain;
 	data.iommu = iommu;
-	data.translation = translation;
 
 	return pci_for_each_dma_alias(to_pci_dev(dev),
 				      &domain_context_mapping_cb, &data);
@@ -2392,7 +2395,7 @@ static int iommu_prepare_identity_map(struct device *dev,
 		goto error;
 
 	/* context entry init */
-	ret = domain_context_mapping(domain, dev, CONTEXT_TT_MULTI_LEVEL);
+	ret = domain_context_mapping(domain, dev);
 	if (ret)
 		goto error;
 
@@ -2506,8 +2509,7 @@ static int identity_mapping(struct device *dev)
 	return 0;
 }
 
-static int domain_add_dev_info(struct dmar_domain *domain,
-			       struct device *dev, int translation)
+static int domain_add_dev_info(struct dmar_domain *domain, struct device *dev)
 {
 	struct dmar_domain *ndomain;
 	struct intel_iommu *iommu;
@@ -2522,7 +2524,7 @@ static int domain_add_dev_info(struct dmar_domain *domain,
 	if (ndomain != domain)
 		return -EBUSY;
 
-	ret = domain_context_mapping(domain, dev, translation);
+	ret = domain_context_mapping(domain, dev);
 	if (ret) {
 		domain_remove_one_dev_info(domain, dev);
 		return ret;
@@ -2667,9 +2669,7 @@ static int __init dev_prepare_static_identity_mapping(struct device *dev, int hw
 	if (!iommu_should_identity_map(dev, 1))
 		return 0;
 
-	ret = domain_add_dev_info(si_domain, dev,
-				  hw ? CONTEXT_TT_PASS_THROUGH :
-				       CONTEXT_TT_MULTI_LEVEL);
+	ret = domain_add_dev_info(si_domain, dev);
 	if (!ret)
 		pr_info("IOMMU: %s identity mapping for device %s\n",
 			hw ? "hardware" : "software", dev_name(dev));
@@ -2972,7 +2972,7 @@ static struct dmar_domain *__get_valid_domain_for_dev(struct device *dev)
 
 	/* make sure context mapping is ok */
 	if (unlikely(!domain_context_mapped(dev))) {
-		ret = domain_context_mapping(domain, dev, CONTEXT_TT_MULTI_LEVEL);
+		ret = domain_context_mapping(domain, dev);
 		if (ret) {
 			printk(KERN_ERR "Domain context map for %s failed",
 			       dev_name(dev));
@@ -3027,10 +3027,7 @@ static int iommu_no_mapping(struct device *dev)
 		 */
 		if (iommu_should_identity_map(dev, 0)) {
 			int ret;
-			ret = domain_add_dev_info(si_domain, dev,
-						  hw_pass_through ?
-						  CONTEXT_TT_PASS_THROUGH :
-						  CONTEXT_TT_MULTI_LEVEL);
+			ret = domain_add_dev_info(si_domain, dev);
 			if (!ret) {
 				printk(KERN_INFO "64bit %s uses identity mapping\n",
 				       dev_name(dev));
@@ -4433,7 +4430,7 @@ static int intel_iommu_attach_device(struct iommu_domain *domain,
 		dmar_domain->agaw--;
 	}
 
-	return domain_add_dev_info(dmar_domain, dev, CONTEXT_TT_MULTI_LEVEL);
+	return domain_add_dev_info(dmar_domain, dev);
 }
 
 static void intel_iommu_detach_device(struct iommu_domain *domain,
