@@ -1217,11 +1217,6 @@ MODULE_LICENSE ("GPL");
 #define S3C2410_PLATFORM_DRIVER	ohci_hcd_s3c2410_driver
 #endif
 
-#ifdef CONFIG_USB_OHCI_EXYNOS
-#include "ohci-exynos.c"
-#define EXYNOS_PLATFORM_DRIVER	exynos_ohci_driver
-#endif
-
 #ifdef CONFIG_USB_OHCI_HCD_OMAP1
 #include "ohci-omap.c"
 #define OMAP1_PLATFORM_DRIVER	ohci_hcd_omap_driver
@@ -1369,12 +1364,6 @@ static int __init ohci_hcd_mod_init(void)
 		goto error_s3c2410;
 #endif
 
-#ifdef EXYNOS_PLATFORM_DRIVER
-	retval = platform_driver_register(&EXYNOS_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_exynos;
-#endif
-
 #ifdef EP93XX_PLATFORM_DRIVER
 	retval = platform_driver_register(&EP93XX_PLATFORM_DRIVER);
 	if (retval < 0)
@@ -1427,10 +1416,6 @@ static int __init ohci_hcd_mod_init(void)
 #ifdef EP93XX_PLATFORM_DRIVER
 	platform_driver_unregister(&EP93XX_PLATFORM_DRIVER);
  error_ep93xx:
-#endif
-#ifdef EXYNOS_PLATFORM_DRIVER
-	platform_driver_unregister(&EXYNOS_PLATFORM_DRIVER);
- error_exynos:
 #endif
 #ifdef S3C2410_PLATFORM_DRIVER
 	platform_driver_unregister(&S3C2410_PLATFORM_DRIVER);
@@ -1493,9 +1478,6 @@ static void __exit ohci_hcd_mod_exit(void)
 #endif
 #ifdef EP93XX_PLATFORM_DRIVER
 	platform_driver_unregister(&EP93XX_PLATFORM_DRIVER);
-#endif
-#ifdef EXYNOS_PLATFORM_DRIVER
-	platform_driver_unregister(&EXYNOS_PLATFORM_DRIVER);
 #endif
 #ifdef S3C2410_PLATFORM_DRIVER
 	platform_driver_unregister(&S3C2410_PLATFORM_DRIVER);
