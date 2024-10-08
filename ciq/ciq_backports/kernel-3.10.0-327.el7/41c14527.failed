@@ -1,0 +1,300 @@
+xfs: XFS_IOCTL_SETXATTR can run in user namespaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 41c145271d79eae508321340b727d3e3c9a66664
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/41c14527.failed
+
+Currently XFS_IOCTL_SETXATTR will fail if run in a user namespace as
+it it not allowed to change project IDs. The current code, however,
+also prevents any other change being made as well, so things like
+extent size hints cannot be set in user namespaces. This is wrong,
+so only disallow access to project IDs and related flags from inside
+the init namespace.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 41c145271d79eae508321340b727d3e3c9a66664)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_ioctl.c
+diff --cc fs/xfs/xfs_ioctl.c
+index c6e180d60c21,b65817cbc318..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -1073,10 -1115,23 +1073,23 @@@ xfs_ioctl_setattr
+  	/*
+  	 * Disallow 32bit project ids when projid32bit feature is not enabled.
+  	 */
+ -	if (fa->fsx_projid > (__uint16_t)-1 &&
+ -	    !xfs_sb_version_hasprojid32bit(&ip->i_mount->m_sb))
+ -		return -EINVAL;
+ +	if ((mask & FSX_PROJID) && (fa->fsx_projid > (__uint16_t)-1) &&
+ +			!xfs_sb_version_hasprojid32bit(&ip->i_mount->m_sb))
+ +		return XFS_ERROR(EINVAL);
+  
++ 	/*
++ 	 * Project Quota ID state is only allowed to change from within the init
++ 	 * namespace. Enforce that restriction only if we are trying to change
++ 	 * the quota ID state. Everything else is allowed in user namespaces.
++ 	 */
++ 	if (current_user_ns() != &init_user_ns) {
++ 		if (xfs_get_projid(ip) != fa->fsx_projid)
++ 			return -EINVAL;
++ 		if ((fa->fsx_xflags & XFS_XFLAG_PROJINHERIT) !=
++ 		    (ip->i_d.di_flags & XFS_DIFLAG_PROJINHERIT))
++ 			return -EINVAL;
++ 	}
++ 
+  	/*
+  	 * If disk quotas is on, we make sure that the dquots do exist on disk,
+  	 * before we start any other transactions. Trying to do this later
+@@@ -1093,182 -1148,82 +1106,191 @@@
+  			return code;
+  	}
+  
+ -	tp = xfs_ioctl_setattr_get_trans(ip);
+ -	if (IS_ERR(tp)) {
+ -		code = PTR_ERR(tp);
+ -		goto error_free_dquots;
+ +	/*
+ +	 * For the other attributes, we acquire the inode lock and
+ +	 * first do an error checking pass.
+ +	 */
+ +	tp = xfs_trans_alloc(mp, XFS_TRANS_SETATTR_NOT_SIZE);
+ +	code = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
+ +	if (code)
+ +		goto error_return;
+ +
+ +	lock_flags = XFS_ILOCK_EXCL;
+ +	xfs_ilock(ip, lock_flags);
+ +
+ +	/*
+ +	 * CAP_FOWNER overrides the following restrictions:
+ +	 *
+ +	 * The user ID of the calling process must be equal
+ +	 * to the file owner ID, except in cases where the
+ +	 * CAP_FSETID capability is applicable.
+ +	 */
+ +	if (!inode_owner_or_capable(VFS_I(ip))) {
+ +		code = XFS_ERROR(EPERM);
+ +		goto error_return;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Do a quota reservation only if projid is actually going to change.
+ +	 * Only allow changing of projid from init_user_ns since it is a
+ +	 * non user namespace aware identifier.
+ +	 */
+ +	if (mask & FSX_PROJID) {
+ +		if (current_user_ns() != &init_user_ns) {
+ +			code = XFS_ERROR(EINVAL);
+++=======
++ 
++ 	if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_PQUOTA_ON(mp) &&
++ 	    xfs_get_projid(ip) != fa->fsx_projid) {
++ 		code = xfs_qm_vop_chown_reserve(tp, ip, udqp, NULL, pdqp,
++ 				capable(CAP_FOWNER) ?  XFS_QMOPT_FORCE_RES : 0);
++ 		if (code)	/* out of quota */
+++>>>>>>> 41c145271d79 (xfs: XFS_IOCTL_SETXATTR can run in user namespaces)
+  			goto error_return;
+ +		}
+ +
+ +		if (XFS_IS_QUOTA_RUNNING(mp) &&
+ +		    XFS_IS_PQUOTA_ON(mp) &&
+ +		    xfs_get_projid(ip) != fa->fsx_projid) {
+ +			ASSERT(tp);
+ +			code = xfs_qm_vop_chown_reserve(tp, ip, udqp, NULL,
+ +						pdqp, capable(CAP_FOWNER) ?
+ +						XFS_QMOPT_FORCE_RES : 0);
+ +			if (code)	/* out of quota */
+ +				goto error_return;
+ +		}
+  	}
+  
+ -	/* Can't change extent size if any extents are allocated. */
+ -	code = -EINVAL;
+ -	if (ip->i_d.di_nextents &&
+ -	    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) != fa->fsx_extsize))
+ -		goto error_return;
+ +	if (mask & FSX_EXTSIZE) {
+ +		/*
+ +		 * Can't change extent size if any extents are allocated.
+ +		 */
+ +		if (ip->i_d.di_nextents &&
+ +		    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) !=
+ +		     fa->fsx_extsize)) {
+ +			code = XFS_ERROR(EINVAL);	/* EFBIG? */
+ +			goto error_return;
+ +		}
+  
+ -	/*
+ -	 * Extent size must be a multiple of the appropriate block size, if set
+ -	 * at all. It must also be smaller than the maximum extent size
+ -	 * supported by the filesystem.
+ -	 *
+ -	 * Also, for non-realtime files, limit the extent size hint to half the
+ -	 * size of the AGs in the filesystem so alignment doesn't result in
+ -	 * extents larger than an AG.
+ -	 */
+ -	if (fa->fsx_extsize != 0) {
+ -		xfs_extlen_t    size;
+ -		xfs_fsblock_t   extsize_fsb;
+ +		/*
+ +		 * Extent size must be a multiple of the appropriate block
+ +		 * size, if set at all. It must also be smaller than the
+ +		 * maximum extent size supported by the filesystem.
+ +		 *
+ +		 * Also, for non-realtime files, limit the extent size hint to
+ +		 * half the size of the AGs in the filesystem so alignment
+ +		 * doesn't result in extents larger than an AG.
+ +		 */
+ +		if (fa->fsx_extsize != 0) {
+ +			xfs_extlen_t    size;
+ +			xfs_fsblock_t   extsize_fsb;
+  
+ -		extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
+ -		if (extsize_fsb > MAXEXTLEN)
+ -			goto error_return;
+ +			extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
+ +			if (extsize_fsb > MAXEXTLEN) {
+ +				code = XFS_ERROR(EINVAL);
+ +				goto error_return;
+ +			}
+ +
+ +			if (XFS_IS_REALTIME_INODE(ip) ||
+ +			    ((mask & FSX_XFLAGS) &&
+ +			    (fa->fsx_xflags & XFS_XFLAG_REALTIME))) {
+ +				size = mp->m_sb.sb_rextsize <<
+ +				       mp->m_sb.sb_blocklog;
+ +			} else {
+ +				size = mp->m_sb.sb_blocksize;
+ +				if (extsize_fsb > mp->m_sb.sb_agblocks / 2) {
+ +					code = XFS_ERROR(EINVAL);
+ +					goto error_return;
+ +				}
+ +			}
+ +
+ +			if (fa->fsx_extsize % size) {
+ +				code = XFS_ERROR(EINVAL);
+ +				goto error_return;
+ +			}
+ +		}
+ +	}
+  
+ -		if (XFS_IS_REALTIME_INODE(ip) ||
+ +
+ +	if (mask & FSX_XFLAGS) {
+ +		/*
+ +		 * Can't change realtime flag if any extents are allocated.
+ +		 */
+ +		if ((ip->i_d.di_nextents || ip->i_delayed_blks) &&
+ +		    (XFS_IS_REALTIME_INODE(ip)) !=
+  		    (fa->fsx_xflags & XFS_XFLAG_REALTIME)) {
+ -			size = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
+ -		} else {
+ -			size = mp->m_sb.sb_blocksize;
+ -			if (extsize_fsb > mp->m_sb.sb_agblocks / 2)
+ +			code = XFS_ERROR(EINVAL);	/* EFBIG? */
+ +			goto error_return;
+ +		}
+ +
+ +		/*
+ +		 * If realtime flag is set then must have realtime data.
+ +		 */
+ +		if ((fa->fsx_xflags & XFS_XFLAG_REALTIME)) {
+ +			if ((mp->m_sb.sb_rblocks == 0) ||
+ +			    (mp->m_sb.sb_rextsize == 0) ||
+ +			    (ip->i_d.di_extsize % mp->m_sb.sb_rextsize)) {
+ +				code = XFS_ERROR(EINVAL);
+  				goto error_return;
+ +			}
+  		}
+  
+ -		if (fa->fsx_extsize % size)
+ +		/*
+ +		 * Can't modify an immutable/append-only file unless
+ +		 * we have appropriate permission.
+ +		 */
+ +		if ((ip->i_d.di_flags &
+ +				(XFS_DIFLAG_IMMUTABLE|XFS_DIFLAG_APPEND) ||
+ +		     (fa->fsx_xflags &
+ +				(XFS_XFLAG_IMMUTABLE | XFS_XFLAG_APPEND))) &&
+ +		    !capable(CAP_LINUX_IMMUTABLE)) {
+ +			code = XFS_ERROR(EPERM);
+  			goto error_return;
+ +		}
+  	}
+  
+ -
+ -	code = xfs_ioctl_setattr_xflags(tp, ip, fa);
+ -	if (code)
+ -		goto error_return;
+ +	xfs_trans_ijoin(tp, ip, 0);
+  
+  	/*
+ -	 * Change file ownership.  Must be the owner or privileged.  CAP_FSETID
+ -	 * overrides the following restrictions:
+ -	 *
+ -	 * The set-user-ID and set-group-ID bits of a file will be cleared upon
+ -	 * successful return from chown()
+ +	 * Change file ownership.  Must be the owner or privileged.
+  	 */
+ +	if (mask & FSX_PROJID) {
+ +		/*
+ +		 * CAP_FSETID overrides the following restrictions:
+ +		 *
+ +		 * The set-user-ID and set-group-ID bits of a file will be
+ +		 * cleared upon successful return from chown()
+ +		 */
+ +		if ((ip->i_d.di_mode & (S_ISUID|S_ISGID)) &&
+ +		    !inode_capable(VFS_I(ip), CAP_FSETID))
+ +			ip->i_d.di_mode &= ~(S_ISUID|S_ISGID);
+  
+ -	if ((ip->i_d.di_mode & (S_ISUID|S_ISGID)) &&
+ -	    !capable_wrt_inode_uidgid(VFS_I(ip), CAP_FSETID))
+ -		ip->i_d.di_mode &= ~(S_ISUID|S_ISGID);
+ -
+ -	/* Change the ownerships and register project quota modifications */
+ -	if (xfs_get_projid(ip) != fa->fsx_projid) {
+ -		if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_PQUOTA_ON(mp)) {
+ -			olddquot = xfs_qm_vop_chown(tp, ip,
+ -						&ip->i_pdquot, pdqp);
+ +		/*
+ +		 * Change the ownerships and register quota modifications
+ +		 * in the transaction.
+ +		 */
+ +		if (xfs_get_projid(ip) != fa->fsx_projid) {
+ +			if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_PQUOTA_ON(mp)) {
+ +				olddquot = xfs_qm_vop_chown(tp, ip,
+ +							&ip->i_pdquot, pdqp);
+ +			}
+ +			xfs_set_projid(ip, fa->fsx_projid);
+ +
+ +			/*
+ +			 * We may have to rev the inode as well as
+ +			 * the superblock version number since projids didn't
+ +			 * exist before DINODE_VERSION_2 and SB_VERSION_NLINK.
+ +			 */
+ +			if (ip->i_d.di_version == 1)
+ +				xfs_bump_ino_vers2(tp, ip);
+  		}
+ -		ASSERT(ip->i_d.di_version > 1);
+ -		xfs_set_projid(ip, fa->fsx_projid);
+ +
+ +	}
+ +
+ +	if (mask & FSX_XFLAGS) {
+ +		xfs_set_diflags(ip, fa->fsx_xflags);
+ +		xfs_diflags_to_linux(ip);
+  	}
+  
+  	/*
+* Unmerged path fs/xfs/xfs_ioctl.c
