@@ -1,0 +1,208 @@
+KEYS: validate certificate trust only with builtin keys
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Dmitry Kasatkin <d.kasatkin@samsung.com>
+commit 32c4741cb66703a3c282f41d77deff4afd93342a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/32c4741c.failed
+
+Instead of allowing public keys, with certificates signed by any
+key on the system trusted keyring, to be added to a trusted keyring,
+this patch further restricts the certificates to those signed only by
+builtin keys on the system keyring.
+
+This patch defines a new option 'builtin' for the kernel parameter
+'keys_ownerid' to allow trust validation using builtin keys.
+
+Simplified Mimi's "KEYS: define an owner trusted keyring" patch
+
+Changelog v7:
+- rename builtin_keys to use_builtin_keys
+
+	Signed-off-by: Dmitry Kasatkin <d.kasatkin@samsung.com>
+	Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+(cherry picked from commit 32c4741cb66703a3c282f41d77deff4afd93342a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+#	crypto/asymmetric_keys/x509_public_key.c
+#	include/linux/key.h
+diff --cc Documentation/kernel-parameters.txt
+index d726a752a002,90c12c591168..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -458,6 -566,11 +458,14 @@@ bytes respectively. Such letter suffixe
+  			possible to determine what the correct size should be.
+  			This option provides an override for these situations.
+  
+++<<<<<<< HEAD
+++=======
++ 	ca_keys=	[KEYS] This parameter identifies a specific key(s) on
++ 			the system trusted keyring to be used for certificate
++ 			trust validation.
++ 			format: { id:<keyid> | builtin }
++ 
+++>>>>>>> 32c4741cb667 (KEYS: validate certificate trust only with builtin keys)
+  	ccw_timeout_log [S390]
+  			See Documentation/s390/CommonIO for details.
+  
+diff --cc crypto/asymmetric_keys/x509_public_key.c
+index 2fcf47e69b21,927ce755ff67..000000000000
+--- a/crypto/asymmetric_keys/x509_public_key.c
++++ b/crypto/asymmetric_keys/x509_public_key.c
+@@@ -23,6 -24,74 +23,77 @@@
+  #include "public_key.h"
+  #include "x509_parser.h"
+  
+++<<<<<<< HEAD
+++=======
++ static bool use_builtin_keys;
++ static char *ca_keyid;
++ 
++ #ifndef MODULE
++ static int __init ca_keys_setup(char *str)
++ {
++ 	if (!str)		/* default system keyring */
++ 		return 1;
++ 
++ 	if (strncmp(str, "id:", 3) == 0)
++ 		ca_keyid = str;	/* owner key 'id:xxxxxx' */
++ 	else if (strcmp(str, "builtin") == 0)
++ 		use_builtin_keys = true;
++ 
++ 	return 1;
++ }
++ __setup("ca_keys=", ca_keys_setup);
++ #endif
++ 
++ /*
++  * Find a key in the given keyring by issuer and authority.
++  */
++ static struct key *x509_request_asymmetric_key(struct key *keyring,
++ 					       const char *signer,
++ 					       size_t signer_len,
++ 					       const char *authority,
++ 					       size_t auth_len)
++ {
++ 	key_ref_t key;
++ 	char *id;
++ 
++ 	/* Construct an identifier. */
++ 	id = kmalloc(signer_len + 2 + auth_len + 1, GFP_KERNEL);
++ 	if (!id)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	memcpy(id, signer, signer_len);
++ 	id[signer_len + 0] = ':';
++ 	id[signer_len + 1] = ' ';
++ 	memcpy(id + signer_len + 2, authority, auth_len);
++ 	id[signer_len + 2 + auth_len] = 0;
++ 
++ 	pr_debug("Look up: \"%s\"\n", id);
++ 
++ 	key = keyring_search(make_key_ref(keyring, 1),
++ 			     &key_type_asymmetric, id);
++ 	if (IS_ERR(key))
++ 		pr_debug("Request for module key '%s' err %ld\n",
++ 			 id, PTR_ERR(key));
++ 	kfree(id);
++ 
++ 	if (IS_ERR(key)) {
++ 		switch (PTR_ERR(key)) {
++ 			/* Hide some search errors */
++ 		case -EACCES:
++ 		case -ENOTDIR:
++ 		case -EAGAIN:
++ 			return ERR_PTR(-ENOKEY);
++ 		default:
++ 			return ERR_CAST(key);
++ 		}
++ 	}
++ 
++ 	pr_devel("<==%s() = 0 [%x]\n", __func__,
++ 		 key_serial(key_ref_to_ptr(key)));
++ 	return key_ref_to_ptr(key);
++ }
++ 
+++>>>>>>> 32c4741cb667 (KEYS: validate certificate trust only with builtin keys)
+  /*
+   * Set up the signature parameters in an X.509 certificate.  This involves
+   * digesting the signed data and extracting the signature.
+@@@ -103,6 -172,40 +174,43 @@@ int x509_check_signature(const struct p
+  EXPORT_SYMBOL_GPL(x509_check_signature);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Check the new certificate against the ones in the trust keyring.  If one of
++  * those is the signing key and validates the new certificate, then mark the
++  * new certificate as being trusted.
++  *
++  * Return 0 if the new certificate was successfully validated, 1 if we couldn't
++  * find a matching parent certificate in the trusted list and an error if there
++  * is a matching certificate but the signature check fails.
++  */
++ static int x509_validate_trust(struct x509_certificate *cert,
++ 			       struct key *trust_keyring)
++ {
++ 	struct key *key;
++ 	int ret = 1;
++ 
++ 	if (!trust_keyring)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (ca_keyid && !asymmetric_keyid_match(cert->authority, ca_keyid))
++ 		return -EPERM;
++ 
++ 	key = x509_request_asymmetric_key(trust_keyring,
++ 					  cert->issuer, strlen(cert->issuer),
++ 					  cert->authority,
++ 					  strlen(cert->authority));
++ 	if (!IS_ERR(key))  {
++ 		if (!use_builtin_keys
++ 		    || test_bit(KEY_FLAG_BUILTIN, &key->flags))
++ 			ret = x509_check_signature(key->payload.data, cert);
++ 		key_put(key);
++ 	}
++ 	return ret;
++ }
++ 
++ /*
+++>>>>>>> 32c4741cb667 (KEYS: validate certificate trust only with builtin keys)
+   * Attempt to parse a data blob for a key as an X509 certificate.
+   */
+  static int x509_key_preparse(struct key_preparsed_payload *prep)
+diff --cc include/linux/key.h
+index 3993480b0ac5,65316f7ae794..000000000000
+--- a/include/linux/key.h
++++ b/include/linux/key.h
+@@@ -170,7 -170,7 +170,11 @@@ struct key 
+  #define KEY_FLAG_INVALIDATED	7	/* set if key has been invalidated */
+  #define KEY_FLAG_TRUSTED	8	/* set if key is trusted */
+  #define KEY_FLAG_TRUSTED_ONLY	9	/* set if keyring only accepts links to trusted keys */
+++<<<<<<< HEAD
+ +#define KEY_FLAG_ROOT_CAN_INVAL	10	/* set if key can be invalidated by root without permission */
+++=======
++ #define KEY_FLAG_BUILTIN	10	/* set if key is builtin */
+++>>>>>>> 32c4741cb667 (KEYS: validate certificate trust only with builtin keys)
+  
+  	/* the key type and key description string
+  	 * - the desc is used to match a key against search criteria
+* Unmerged path Documentation/kernel-parameters.txt
+* Unmerged path crypto/asymmetric_keys/x509_public_key.c
+* Unmerged path include/linux/key.h
+diff --git a/kernel/system_keyring.c b/kernel/system_keyring.c
+index 478c4f8ec908..c15e93f5a418 100644
+--- a/kernel/system_keyring.c
++++ b/kernel/system_keyring.c
+@@ -106,6 +106,7 @@ static __init int load_system_certificate_list(void)
+ 			pr_err("Problem loading in-kernel X.509 certificate (%ld)\n",
+ 			       PTR_ERR(key));
+ 		} else {
++			set_bit(KEY_FLAG_BUILTIN, &key_ref_to_ptr(key)->flags);
+ 			pr_notice("Loaded X.509 cert '%s'\n",
+ 				  key_ref_to_ptr(key)->description);
+ 			key_ref_put(key);
