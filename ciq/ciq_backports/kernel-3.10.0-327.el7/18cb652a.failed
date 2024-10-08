@@ -1,0 +1,256 @@
+ixgbe: Clean-up page reuse code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 18cb652a41ab2c9975e9b4d7ac69230d5a258f24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/18cb652a.failed
+
+This patch cleans up the page reuse code getting it into a state where all
+the workarounds needed are in place as well as cleaning up a few minor
+oversights such as using __free_pages instead of put_page to drop a locally
+allocated page.
+
+It also cleans up how we clear the descriptor status bits.  Previously they
+were zeroed as a part of clearing the hdr_addr.  However the hdr_addr is a
+64 bit field and 64 bit writes can be a bit more expensive on on 32 bit
+systems.  Since we are no longer using the header split feature the upper
+32 bits of the address no longer need to be cleared.  As a result we can
+just clear the status bits and leave the length and VLAN fields as-is which
+should provide more information in debugging.
+
+	Cc: Don Skidmore <donald.c.skidmore@intel.com>
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 18cb652a41ab2c9975e9b4d7ac69230d5a258f24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index beae21a8db4c,3c1d4ea47782..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -4137,6 -4279,215 +4134,218 @@@ static void ixgbe_fdir_filter_restore(s
+  	spin_unlock(&adapter->fdir_perfect_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ixgbe_macvlan_set_rx_mode(struct net_device *dev, unsigned int pool,
++ 				      struct ixgbe_adapter *adapter)
++ {
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	u32 vmolr;
++ 
++ 	/* No unicast promiscuous support for VMDQ devices. */
++ 	vmolr = IXGBE_READ_REG(hw, IXGBE_VMOLR(pool));
++ 	vmolr |= (IXGBE_VMOLR_ROMPE | IXGBE_VMOLR_BAM | IXGBE_VMOLR_AUPE);
++ 
++ 	/* clear the affected bit */
++ 	vmolr &= ~IXGBE_VMOLR_MPE;
++ 
++ 	if (dev->flags & IFF_ALLMULTI) {
++ 		vmolr |= IXGBE_VMOLR_MPE;
++ 	} else {
++ 		vmolr |= IXGBE_VMOLR_ROMPE;
++ 		hw->mac.ops.update_mc_addr_list(hw, dev);
++ 	}
++ 	ixgbe_write_uc_addr_list(adapter->netdev, pool);
++ 	IXGBE_WRITE_REG(hw, IXGBE_VMOLR(pool), vmolr);
++ }
++ 
++ static void ixgbe_fwd_psrtype(struct ixgbe_fwd_adapter *vadapter)
++ {
++ 	struct ixgbe_adapter *adapter = vadapter->real_adapter;
++ 	int rss_i = adapter->num_rx_queues_per_pool;
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	u16 pool = vadapter->pool;
++ 	u32 psrtype = IXGBE_PSRTYPE_TCPHDR |
++ 		      IXGBE_PSRTYPE_UDPHDR |
++ 		      IXGBE_PSRTYPE_IPV4HDR |
++ 		      IXGBE_PSRTYPE_L2HDR |
++ 		      IXGBE_PSRTYPE_IPV6HDR;
++ 
++ 	if (hw->mac.type == ixgbe_mac_82598EB)
++ 		return;
++ 
++ 	if (rss_i > 3)
++ 		psrtype |= 2 << 29;
++ 	else if (rss_i > 1)
++ 		psrtype |= 1 << 29;
++ 
++ 	IXGBE_WRITE_REG(hw, IXGBE_PSRTYPE(VMDQ_P(pool)), psrtype);
++ }
++ 
++ /**
++  * ixgbe_clean_rx_ring - Free Rx Buffers per Queue
++  * @rx_ring: ring to free buffers from
++  **/
++ static void ixgbe_clean_rx_ring(struct ixgbe_ring *rx_ring)
++ {
++ 	struct device *dev = rx_ring->dev;
++ 	unsigned long size;
++ 	u16 i;
++ 
++ 	/* ring already cleared, nothing to do */
++ 	if (!rx_ring->rx_buffer_info)
++ 		return;
++ 
++ 	/* Free all the Rx ring sk_buffs */
++ 	for (i = 0; i < rx_ring->count; i++) {
++ 		struct ixgbe_rx_buffer *rx_buffer = &rx_ring->rx_buffer_info[i];
++ 
++ 		if (rx_buffer->skb) {
++ 			struct sk_buff *skb = rx_buffer->skb;
++ 			if (IXGBE_CB(skb)->page_released)
++ 				dma_unmap_page(dev,
++ 					       IXGBE_CB(skb)->dma,
++ 					       ixgbe_rx_bufsz(rx_ring),
++ 					       DMA_FROM_DEVICE);
++ 			dev_kfree_skb(skb);
++ 			rx_buffer->skb = NULL;
++ 		}
++ 
++ 		if (!rx_buffer->page)
++ 			continue;
++ 
++ 		dma_unmap_page(dev, rx_buffer->dma,
++ 			       ixgbe_rx_pg_size(rx_ring), DMA_FROM_DEVICE);
++ 		__free_pages(rx_buffer->page, ixgbe_rx_pg_order(rx_ring));
++ 
++ 		rx_buffer->page = NULL;
++ 	}
++ 
++ 	size = sizeof(struct ixgbe_rx_buffer) * rx_ring->count;
++ 	memset(rx_ring->rx_buffer_info, 0, size);
++ 
++ 	/* Zero out the descriptor ring */
++ 	memset(rx_ring->desc, 0, rx_ring->size);
++ 
++ 	rx_ring->next_to_alloc = 0;
++ 	rx_ring->next_to_clean = 0;
++ 	rx_ring->next_to_use = 0;
++ }
++ 
++ static void ixgbe_disable_fwd_ring(struct ixgbe_fwd_adapter *vadapter,
++ 				   struct ixgbe_ring *rx_ring)
++ {
++ 	struct ixgbe_adapter *adapter = vadapter->real_adapter;
++ 	int index = rx_ring->queue_index + vadapter->rx_base_queue;
++ 
++ 	/* shutdown specific queue receive and wait for dma to settle */
++ 	ixgbe_disable_rx_queue(adapter, rx_ring);
++ 	usleep_range(10000, 20000);
++ 	ixgbe_irq_disable_queues(adapter, ((u64)1 << index));
++ 	ixgbe_clean_rx_ring(rx_ring);
++ 	rx_ring->l2_accel_priv = NULL;
++ }
++ 
++ static int ixgbe_fwd_ring_down(struct net_device *vdev,
++ 			       struct ixgbe_fwd_adapter *accel)
++ {
++ 	struct ixgbe_adapter *adapter = accel->real_adapter;
++ 	unsigned int rxbase = accel->rx_base_queue;
++ 	unsigned int txbase = accel->tx_base_queue;
++ 	int i;
++ 
++ 	netif_tx_stop_all_queues(vdev);
++ 
++ 	for (i = 0; i < adapter->num_rx_queues_per_pool; i++) {
++ 		ixgbe_disable_fwd_ring(accel, adapter->rx_ring[rxbase + i]);
++ 		adapter->rx_ring[rxbase + i]->netdev = adapter->netdev;
++ 	}
++ 
++ 	for (i = 0; i < adapter->num_rx_queues_per_pool; i++) {
++ 		adapter->tx_ring[txbase + i]->l2_accel_priv = NULL;
++ 		adapter->tx_ring[txbase + i]->netdev = adapter->netdev;
++ 	}
++ 
++ 
++ 	return 0;
++ }
++ 
++ static int ixgbe_fwd_ring_up(struct net_device *vdev,
++ 			     struct ixgbe_fwd_adapter *accel)
++ {
++ 	struct ixgbe_adapter *adapter = accel->real_adapter;
++ 	unsigned int rxbase, txbase, queues;
++ 	int i, baseq, err = 0;
++ 
++ 	if (!test_bit(accel->pool, &adapter->fwd_bitmask))
++ 		return 0;
++ 
++ 	baseq = accel->pool * adapter->num_rx_queues_per_pool;
++ 	netdev_dbg(vdev, "pool %i:%i queues %i:%i VSI bitmask %lx\n",
++ 		   accel->pool, adapter->num_rx_pools,
++ 		   baseq, baseq + adapter->num_rx_queues_per_pool,
++ 		   adapter->fwd_bitmask);
++ 
++ 	accel->netdev = vdev;
++ 	accel->rx_base_queue = rxbase = baseq;
++ 	accel->tx_base_queue = txbase = baseq;
++ 
++ 	for (i = 0; i < adapter->num_rx_queues_per_pool; i++)
++ 		ixgbe_disable_fwd_ring(accel, adapter->rx_ring[rxbase + i]);
++ 
++ 	for (i = 0; i < adapter->num_rx_queues_per_pool; i++) {
++ 		adapter->rx_ring[rxbase + i]->netdev = vdev;
++ 		adapter->rx_ring[rxbase + i]->l2_accel_priv = accel;
++ 		ixgbe_configure_rx_ring(adapter, adapter->rx_ring[rxbase + i]);
++ 	}
++ 
++ 	for (i = 0; i < adapter->num_rx_queues_per_pool; i++) {
++ 		adapter->tx_ring[txbase + i]->netdev = vdev;
++ 		adapter->tx_ring[txbase + i]->l2_accel_priv = accel;
++ 	}
++ 
++ 	queues = min_t(unsigned int,
++ 		       adapter->num_rx_queues_per_pool, vdev->num_tx_queues);
++ 	err = netif_set_real_num_tx_queues(vdev, queues);
++ 	if (err)
++ 		goto fwd_queue_err;
++ 
++ 	err = netif_set_real_num_rx_queues(vdev, queues);
++ 	if (err)
++ 		goto fwd_queue_err;
++ 
++ 	if (is_valid_ether_addr(vdev->dev_addr))
++ 		ixgbe_add_mac_filter(adapter, vdev->dev_addr, accel->pool);
++ 
++ 	ixgbe_fwd_psrtype(accel);
++ 	ixgbe_macvlan_set_rx_mode(vdev, accel->pool, adapter);
++ 	return err;
++ fwd_queue_err:
++ 	ixgbe_fwd_ring_down(vdev, accel);
++ 	return err;
++ }
++ 
++ static void ixgbe_configure_dfwd(struct ixgbe_adapter *adapter)
++ {
++ 	struct net_device *upper;
++ 	struct list_head *iter;
++ 	int err;
++ 
++ 	netdev_for_each_all_upper_dev_rcu(adapter->netdev, upper, iter) {
++ 		if (netif_is_macvlan(upper)) {
++ 			struct macvlan_dev *dfwd = netdev_priv(upper);
++ 			struct ixgbe_fwd_adapter *vadapter = dfwd->fwd_priv;
++ 
++ 			if (dfwd->fwd_priv) {
++ 				err = ixgbe_fwd_ring_up(upper, vadapter);
++ 				if (err)
++ 					continue;
++ 			}
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 18cb652a41ab (ixgbe: Clean-up page reuse code)
+  static void ixgbe_configure(struct ixgbe_adapter *adapter)
+  {
+  	struct ixgbe_hw *hw = &adapter->hw;
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
