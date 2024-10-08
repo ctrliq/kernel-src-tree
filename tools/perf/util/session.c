@@ -98,6 +98,8 @@ struct perf_session *perf_session__new(struct perf_data_file *file,
 	INIT_LIST_HEAD(&session->ordered_events.cache);
 	INIT_LIST_HEAD(&session->ordered_events.to_free);
 	machines__init(&session->machines);
+	ordered_events__init(&session->ordered_events, &session->machines,
+			     session->evlist, tool, ordered_events__deliver_event);
 
 	if (file) {
 		if (perf_data_file__open(file))
