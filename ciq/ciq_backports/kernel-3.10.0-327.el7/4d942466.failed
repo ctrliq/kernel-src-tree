@@ -1,0 +1,317 @@
+mm: convert p[te|md]_mknonnuma and remaining page table manipulations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [mm] convert p[te|md]_mknonnuma and remaining page table manipulations (Gustavo Duarte) [1217743]
+Rebuild_FUZZ: 97.01%
+commit-author Mel Gorman <mgorman@suse.de>
+commit 4d9424669946532be754a6e116618dcb58430cb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4d942466.failed
+
+With PROT_NONE, the traditional page table manipulation functions are
+sufficient.
+
+[andre.przywara@arm.com: fix compiler warning in pmdp_invalidate()]
+[akpm@linux-foundation.org: fix build with STRICT_MM_TYPECHECKS]
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Acked-by: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+	Tested-by: Sasha Levin <sasha.levin@oracle.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Dave Jones <davej@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Kirill Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4d9424669946532be754a6e116618dcb58430cb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/pgtable-3level.h
+#	mm/huge_memory.c
+#	mm/pgtable-generic.c
+diff --cc arch/arm/include/asm/pgtable-3level.h
+index 86b8fe398b95,423a5ac09d3a..000000000000
+--- a/arch/arm/include/asm/pgtable-3level.h
++++ b/arch/arm/include/asm/pgtable-3level.h
+@@@ -166,8 -185,114 +166,100 @@@ static inline pmd_t *pmd_offset(pud_t *
+  		clean_pmd_entry(pmdp);	\
+  	} while (0)
+  
+ -/*
+ - * For 3 levels of paging the PTE_EXT_NG bit will be set for user address ptes
+ - * that are written to a page table but not for ptes created with mk_pte.
+ - *
+ - * In hugetlb_no_page, a new huge pte (new_pte) is generated and passed to
+ - * hugetlb_cow, where it is compared with an entry in a page table.
+ - * This comparison test fails erroneously leading ultimately to a memory leak.
+ - *
+ - * To correct this behaviour, we mask off PTE_EXT_NG for any pte that is
+ - * present before running the comparison.
+ - */
+ -#define __HAVE_ARCH_PTE_SAME
+ -#define pte_same(pte_a,pte_b)	((pte_present(pte_a) ? pte_val(pte_a) & ~PTE_EXT_NG	\
+ -					: pte_val(pte_a))				\
+ -				== (pte_present(pte_b) ? pte_val(pte_b) & ~PTE_EXT_NG	\
+ -					: pte_val(pte_b)))
+ -
+  #define set_pte_ext(ptep,pte,ext) cpu_set_pte_ext(ptep,__pte(pte_val(pte)|(ext)))
+  
+++<<<<<<< HEAD
+++=======
++ #define pte_huge(pte)		(pte_val(pte) && !(pte_val(pte) & PTE_TABLE_BIT))
++ #define pte_mkhuge(pte)		(__pte(pte_val(pte) & ~PTE_TABLE_BIT))
++ 
++ #define pmd_isset(pmd, val)	((u32)(val) == (val) ? pmd_val(pmd) & (val) \
++ 						: !!(pmd_val(pmd) & (val)))
++ #define pmd_isclear(pmd, val)	(!(pmd_val(pmd) & (val)))
++ 
++ #define pmd_young(pmd)		(pmd_isset((pmd), PMD_SECT_AF))
++ #define pte_special(pte)	(pte_isset((pte), L_PTE_SPECIAL))
++ static inline pte_t pte_mkspecial(pte_t pte)
++ {
++ 	pte_val(pte) |= L_PTE_SPECIAL;
++ 	return pte;
++ }
++ #define	__HAVE_ARCH_PTE_SPECIAL
++ 
++ #define __HAVE_ARCH_PMD_WRITE
++ #define pmd_write(pmd)		(pmd_isclear((pmd), L_PMD_SECT_RDONLY))
++ #define pmd_dirty(pmd)		(pmd_isset((pmd), L_PMD_SECT_DIRTY))
++ #define pud_page(pud)		pmd_page(__pmd(pud_val(pud)))
++ #define pud_write(pud)		pmd_write(__pmd(pud_val(pud)))
++ 
++ #define pmd_hugewillfault(pmd)	(!pmd_young(pmd) || !pmd_write(pmd))
++ #define pmd_thp_or_huge(pmd)	(pmd_huge(pmd) || pmd_trans_huge(pmd))
++ 
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ #define pmd_trans_huge(pmd)	(pmd_val(pmd) && !pmd_table(pmd))
++ #define pmd_trans_splitting(pmd) (pmd_isset((pmd), L_PMD_SECT_SPLITTING))
++ 
++ #ifdef CONFIG_HAVE_RCU_TABLE_FREE
++ #define __HAVE_ARCH_PMDP_SPLITTING_FLUSH
++ void pmdp_splitting_flush(struct vm_area_struct *vma, unsigned long address,
++ 			  pmd_t *pmdp);
++ #endif
++ #endif
++ 
++ #define PMD_BIT_FUNC(fn,op) \
++ static inline pmd_t pmd_##fn(pmd_t pmd) { pmd_val(pmd) op; return pmd; }
++ 
++ PMD_BIT_FUNC(wrprotect,	|= L_PMD_SECT_RDONLY);
++ PMD_BIT_FUNC(mkold,	&= ~PMD_SECT_AF);
++ PMD_BIT_FUNC(mksplitting, |= L_PMD_SECT_SPLITTING);
++ PMD_BIT_FUNC(mkwrite,   &= ~L_PMD_SECT_RDONLY);
++ PMD_BIT_FUNC(mkdirty,   |= L_PMD_SECT_DIRTY);
++ PMD_BIT_FUNC(mkyoung,   |= PMD_SECT_AF);
++ 
++ #define pmd_mkhuge(pmd)		(__pmd(pmd_val(pmd) & ~PMD_TABLE_BIT))
++ 
++ #define pmd_pfn(pmd)		(((pmd_val(pmd) & PMD_MASK) & PHYS_MASK) >> PAGE_SHIFT)
++ #define pfn_pmd(pfn,prot)	(__pmd(((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot)))
++ #define mk_pmd(page,prot)	pfn_pmd(page_to_pfn(page),prot)
++ 
++ /* represent a notpresent pmd by zero, this is used by pmdp_invalidate */
++ static inline pmd_t pmd_mknotpresent(pmd_t pmd)
++ {
++ 	return __pmd(0);
++ }
++ 
++ static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
++ {
++ 	const pmdval_t mask = PMD_SECT_USER | PMD_SECT_XN | L_PMD_SECT_RDONLY |
++ 				L_PMD_SECT_VALID | L_PMD_SECT_NONE;
++ 	pmd_val(pmd) = (pmd_val(pmd) & ~mask) | (pgprot_val(newprot) & mask);
++ 	return pmd;
++ }
++ 
++ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
++ 			      pmd_t *pmdp, pmd_t pmd)
++ {
++ 	BUG_ON(addr >= TASK_SIZE);
++ 
++ 	/* create a faulting entry if PROT_NONE protected */
++ 	if (pmd_val(pmd) & L_PMD_SECT_NONE)
++ 		pmd_val(pmd) &= ~L_PMD_SECT_VALID;
++ 
++ 	if (pmd_write(pmd) && pmd_dirty(pmd))
++ 		pmd_val(pmd) &= ~PMD_SECT_AP2;
++ 	else
++ 		pmd_val(pmd) |= PMD_SECT_AP2;
++ 
++ 	*pmdp = __pmd(pmd_val(pmd) | PMD_SECT_nG);
++ 	flush_pmd_entry(pmdp);
++ }
++ 
++ static inline int has_transparent_hugepage(void)
++ {
++ 	return 1;
++ }
++ 
+++>>>>>>> 4d9424669946 (mm: convert p[te|md]_mknonnuma and remaining page table manipulations)
+  #endif /* __ASSEMBLY__ */
+  
+  #endif /* _ASM_PGTABLE_3LEVEL_H */
+diff --cc mm/huge_memory.c
+index c8c32264deab,cb9b3e847dac..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1395,9 -1355,8 +1395,12 @@@ int do_huge_pmd_numa_page(struct mm_str
+  	goto out;
+  clear_pmdnuma:
+  	BUG_ON(!PageLocked(page));
+- 	pmd = pmd_mknonnuma(pmd);
++ 	pmd = pmd_modify(pmd, vma->vm_page_prot);
+  	set_pmd_at(mm, haddr, pmdp, pmd);
+++<<<<<<< HEAD
+ +	VM_BUG_ON(pmd_numa(*pmdp));
+++=======
+++>>>>>>> 4d9424669946 (mm: convert p[te|md]_mknonnuma and remaining page table manipulations)
+  	update_mmu_cache_pmd(vma, addr, pmdp);
+  	unlock_page(page);
+  out_unlock:
+@@@ -1539,29 -1480,11 +1542,37 @@@ int change_huge_pmd(struct vm_area_stru
+  	if (__pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+  		pmd_t entry;
+  		ret = 1;
+++<<<<<<< HEAD
+ +		if (!prot_numa) {
+ +			entry = pmdp_get_and_clear(mm, addr, pmd);
+ +			if (pmd_numa(entry))
+ +				entry = pmd_mknonnuma(entry);
+ +			entry = pmd_modify(entry, newprot);
+ +			ret = HPAGE_PMD_NR;
+ +			set_pmd_at(mm, addr, pmd, entry);
+ +			BUG_ON(pmd_write(entry));
+ +		} else {
+ +			struct page *page = pmd_page(*pmd);
+ +
+ +			/*
+ +			 * Do not trap faults against the zero page. The
+ +			 * read-only data is likely to be read-cached on the
+ +			 * local CPU cache and it is less useful to know about
+ +			 * local vs remote hits on the zero page.
+ +			 */
+ +			if (!is_huge_zero_page(page) &&
+ +			    !pmd_numa(*pmd)) {
+ +				pmdp_set_numa(mm, addr, pmd);
+ +				ret = HPAGE_PMD_NR;
+ +			}
+ +		}
+++=======
++ 		entry = pmdp_get_and_clear_notify(mm, addr, pmd);
++ 		entry = pmd_modify(entry, newprot);
++ 		ret = HPAGE_PMD_NR;
++ 		set_pmd_at(mm, addr, pmd, entry);
++ 		BUG_ON(pmd_write(entry));
+++>>>>>>> 4d9424669946 (mm: convert p[te|md]_mknonnuma and remaining page table manipulations)
+  		spin_unlock(ptl);
+  	}
+  
+diff --cc mm/pgtable-generic.c
+index b178c2e5d1a9,c25f94b33811..000000000000
+--- a/mm/pgtable-generic.c
++++ b/mm/pgtable-generic.c
+@@@ -169,9 -193,7 +169,13 @@@ void pmdp_invalidate(struct vm_area_str
+  		     pmd_t *pmdp)
+  {
+  	pmd_t entry = *pmdp;
+++<<<<<<< HEAD
+ +	if (pmd_numa(entry))
+ +		entry = pmd_mknonnuma(entry);
+ +	set_pmd_at(vma->vm_mm, address, pmdp, pmd_mknotpresent(*pmdp));
+++=======
++ 	set_pmd_at(vma->vm_mm, address, pmdp, pmd_mknotpresent(entry));
+++>>>>>>> 4d9424669946 (mm: convert p[te|md]_mknonnuma and remaining page table manipulations)
+  	flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+  }
+  #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+* Unmerged path arch/arm/include/asm/pgtable-3level.h
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index 725c7251f899..0e5631c5f487 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -31,8 +31,7 @@ extern int move_huge_pmd(struct vm_area_struct *vma,
+ 			 unsigned long new_addr, unsigned long old_end,
+ 			 pmd_t *old_pmd, pmd_t *new_pmd);
+ extern int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+-			unsigned long addr, pgprot_t newprot,
+-			int prot_numa);
++			unsigned long addr, pgprot_t newprot);
+ 
+ enum transparent_hugepage_flag {
+ 	TRANSPARENT_HUGEPAGE_FLAG,
+* Unmerged path mm/huge_memory.c
+diff --git a/mm/memory.c b/mm/memory.c
+index 75338cb200d7..b9b2933e51bb 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3569,9 +3569,9 @@ int do_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	* validation through pte_unmap_same(). It's of NUMA type but
+ 	* the pfn may be screwed if the read is non atomic.
+ 	*
+-	* ptep_modify_prot_start is not called as this is clearing
+-	* the _PAGE_NUMA bit and it is not really expected that there
+-	* would be concurrent hardware modifications to the PTE.
++	* We can safely just do a "set_pte_at()", because the old
++	* page table entry is not accessible, so there would be no
++	* concurrent hardware modifications to the PTE.
+ 	*/
+ 	ptl = pte_lockptr(mm, pmd);
+ 	spin_lock(ptl);
+@@ -3580,7 +3580,9 @@ int do_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		goto out;
+ 	}
+ 
+-	pte = pte_mknonnuma(pte);
++	/* Make it present again */
++	pte = pte_modify(pte, vma->vm_page_prot);
++	pte = pte_mkyoung(pte);
+ 	set_pte_at(mm, addr, ptep, pte);
+ 	update_mmu_cache(vma, addr, ptep);
+ 
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 4af9dc35103a..62779ec981f8 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -588,7 +588,7 @@ unsigned long change_prot_numa(struct vm_area_struct *vma,
+ {
+ 	int nr_updated;
+ 
+-	nr_updated = change_protection(vma, addr, end, vma->vm_page_prot, 0, 1);
++	nr_updated = change_protection(vma, addr, end, PAGE_NONE, 0, 1);
+ 	if (nr_updated)
+ 		count_vm_numa_events(NUMA_PTE_UPDATES, nr_updated);
+ 
+diff --git a/mm/migrate.c b/mm/migrate.c
+index dc377a18e698..fa27f97560b3 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1836,7 +1836,7 @@ out_fail:
+ out_dropref:
+ 	ptl = pmd_lock(mm, pmd);
+ 	if (pmd_same(*pmd, entry)) {
+-		entry = pmd_mknonnuma(entry);
++		entry = pmd_modify(entry, vma->vm_page_prot);
+ 		set_pmd_at(mm, mmun_start, pmd, entry);
+ 		update_mmu_cache_pmd(vma, address, &entry);
+ 	}
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index a182e560297e..e98b3ee589d7 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -162,7 +162,7 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
+ 				split_huge_page_pmd(vma, addr, pmd);
+ 			else {
+ 				int nr_ptes = change_huge_pmd(vma, pmd, addr,
+-						newprot, prot_numa);
++						newprot);
+ 
+ 				if (nr_ptes) {
+ 					if (nr_ptes == HPAGE_PMD_NR) {
+* Unmerged path mm/pgtable-generic.c
