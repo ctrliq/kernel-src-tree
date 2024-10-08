@@ -179,7 +179,6 @@ struct svcxprt_rdma {
 extern void svc_rdma_rcl_chunk_counts(struct rpcrdma_read_chunk *,
 				      int *, int *);
 extern int svc_rdma_xdr_decode_req(struct rpcrdma_msg **, struct svc_rqst *);
-extern int svc_rdma_xdr_decode_deferred_req(struct svc_rqst *);
 extern int svc_rdma_xdr_encode_error(struct svcxprt_rdma *,
 				     struct rpcrdma_msg *,
 				     enum rpcrdma_errcode, u32 *);
