@@ -1242,6 +1242,7 @@ struct ib_uobject {
 	int			id;		/* index into kernel idr */
 	struct kref		ref;
 	struct rw_semaphore	mutex;		/* protects .live */
+	struct rcu_head		rcu;		/* kfree_rcu() overhead */
 	int			live;
 };
 
