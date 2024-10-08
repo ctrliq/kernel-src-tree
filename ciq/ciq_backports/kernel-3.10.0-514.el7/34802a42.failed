@@ -1,0 +1,189 @@
+net/mlx5e: Do not modify the TX SKB
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Achiad Shochat <achiad@mellanox.com>
+commit 34802a42b3528b0e18ea4517c8b23e1214a09332
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/34802a42.failed
+
+If the SKB is cloned, or has an elevated users count, someone else
+can be looking at it at the same time.
+
+	Signed-off-by: Achiad Shochat <achiad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 34802a42b3528b0e18ea4517c8b23e1214a09332)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index c248aa35f3d5,ae3f0e326c79..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -334,11 -334,15 +334,18 @@@ struct mlx5e_tx_wqe_info 
+  	u8  num_dma;
+  };
+  
+++<<<<<<< HEAD
+ +#define MLX5E_TX_SKB_CB(__skb) ((struct mlx5e_tx_skb_cb *)__skb->cb)
+++=======
++ enum mlx5e_dma_map_type {
++ 	MLX5E_DMA_MAP_SINGLE,
++ 	MLX5E_DMA_MAP_PAGE
++ };
+++>>>>>>> 34802a42b352 (net/mlx5e: Do not modify the TX SKB)
+  
+  struct mlx5e_sq_dma {
+ -	dma_addr_t              addr;
+ -	u32                     size;
+ -	enum mlx5e_dma_map_type type;
+ +	dma_addr_t addr;
+ +	u32        size;
+  };
+  
+  enum {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 3168033e9691,aa037eb1a0b2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -61,23 -61,46 +61,31 @@@ void mlx5e_send_nop(struct mlx5e_sq *sq
+  	}
+  }
+  
+ -static inline void mlx5e_tx_dma_unmap(struct device *pdev,
+ -				      struct mlx5e_sq_dma *dma)
+ +static void mlx5e_dma_pop_last_pushed(struct mlx5e_sq *sq, dma_addr_t *addr,
+ +				      u32 *size)
+  {
+ -	switch (dma->type) {
+ -	case MLX5E_DMA_MAP_SINGLE:
+ -		dma_unmap_single(pdev, dma->addr, dma->size, DMA_TO_DEVICE);
+ -		break;
+ -	case MLX5E_DMA_MAP_PAGE:
+ -		dma_unmap_page(pdev, dma->addr, dma->size, DMA_TO_DEVICE);
+ -		break;
+ -	default:
+ -		WARN_ONCE(true, "mlx5e_tx_dma_unmap unknown DMA type!\n");
+ -	}
+ -}
+ -
+ -static inline void mlx5e_dma_push(struct mlx5e_sq *sq,
+ -				  dma_addr_t addr,
+ -				  u32 size,
+ -				  enum mlx5e_dma_map_type map_type)
+ -{
+ -	sq->dma_fifo[sq->dma_fifo_pc & sq->dma_fifo_mask].addr = addr;
+ -	sq->dma_fifo[sq->dma_fifo_pc & sq->dma_fifo_mask].size = size;
+ -	sq->dma_fifo[sq->dma_fifo_pc & sq->dma_fifo_mask].type = map_type;
+ -	sq->dma_fifo_pc++;
+ -}
+ -
+ -static inline struct mlx5e_sq_dma *mlx5e_dma_get(struct mlx5e_sq *sq, u32 i)
+ -{
+ -	return &sq->dma_fifo[i & sq->dma_fifo_mask];
+ +	sq->dma_fifo_pc--;
+ +	*addr = sq->dma_fifo[sq->dma_fifo_pc & sq->dma_fifo_mask].addr;
+ +	*size = sq->dma_fifo[sq->dma_fifo_pc & sq->dma_fifo_mask].size;
+  }
+  
+- static void mlx5e_dma_unmap_wqe_err(struct mlx5e_sq *sq, struct sk_buff *skb)
++ static void mlx5e_dma_unmap_wqe_err(struct mlx5e_sq *sq, u8 num_dma)
+  {
+ +	dma_addr_t addr;
+ +	u32 size;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < MLX5E_TX_SKB_CB(skb)->num_dma; i++) {
+ +		mlx5e_dma_pop_last_pushed(sq, &addr, &size);
+ +		dma_unmap_single(sq->pdev, addr, size, DMA_TO_DEVICE);
+++=======
++ 	for (i = 0; i < num_dma; i++) {
++ 		struct mlx5e_sq_dma *last_pushed_dma =
++ 			mlx5e_dma_get(sq, --sq->dma_fifo_pc);
++ 
++ 		mlx5e_tx_dma_unmap(sq->pdev, last_pushed_dma);
+++>>>>>>> 34802a42b352 (net/mlx5e: Do not modify the TX SKB)
+  	}
+  }
+  
+@@@ -224,8 -245,8 +244,13 @@@ static netdev_tx_t mlx5e_sq_xmit(struc
+  		dseg->lkey       = sq->mkey_be;
+  		dseg->byte_count = cpu_to_be32(headlen);
+  
+++<<<<<<< HEAD
+ +		mlx5e_dma_push(sq, dma_addr, headlen);
+ +		MLX5E_TX_SKB_CB(skb)->num_dma++;
+++=======
++ 		mlx5e_dma_push(sq, dma_addr, headlen, MLX5E_DMA_MAP_SINGLE);
++ 		wi->num_dma++;
+++>>>>>>> 34802a42b352 (net/mlx5e: Do not modify the TX SKB)
+  
+  		dseg++;
+  	}
+@@@ -243,8 -264,8 +268,13 @@@
+  		dseg->lkey       = sq->mkey_be;
+  		dseg->byte_count = cpu_to_be32(fsz);
+  
+++<<<<<<< HEAD
+ +		mlx5e_dma_push(sq, dma_addr, fsz);
+ +		MLX5E_TX_SKB_CB(skb)->num_dma++;
+++=======
++ 		mlx5e_dma_push(sq, dma_addr, fsz, MLX5E_DMA_MAP_PAGE);
++ 		wi->num_dma++;
+++>>>>>>> 34802a42b352 (net/mlx5e: Do not modify the TX SKB)
+  
+  		dseg++;
+  	}
+@@@ -358,14 -380,11 +389,20 @@@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *
+  				continue;
+  			}
+  
+++<<<<<<< HEAD
+ +			for (j = 0; j < MLX5E_TX_SKB_CB(skb)->num_dma; j++) {
+ +				dma_addr_t addr;
+ +				u32 size;
+++=======
++ 			for (j = 0; j < wi->num_dma; j++) {
++ 				struct mlx5e_sq_dma *dma =
++ 					mlx5e_dma_get(sq, dma_fifo_cc++);
+++>>>>>>> 34802a42b352 (net/mlx5e: Do not modify the TX SKB)
+  
+ -				mlx5e_tx_dma_unmap(sq->pdev, dma);
+ +				mlx5e_dma_get(sq, dma_fifo_cc, &addr, &size);
+ +				dma_fifo_cc++;
+ +				dma_unmap_single(sq->pdev, addr, size,
+ +						 DMA_TO_DEVICE);
+  			}
+  
+  			npkts++;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d82a25a01ad7..a0143bd4ba20 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -507,6 +507,7 @@ static void mlx5e_close_rq(struct mlx5e_rq *rq)
+ 
+ static void mlx5e_free_sq_db(struct mlx5e_sq *sq)
+ {
++	kfree(sq->wqe_info);
+ 	kfree(sq->dma_fifo);
+ 	kfree(sq->skb);
+ }
+@@ -519,8 +520,10 @@ static int mlx5e_alloc_sq_db(struct mlx5e_sq *sq, int numa)
+ 	sq->skb = kzalloc_node(wq_sz * sizeof(*sq->skb), GFP_KERNEL, numa);
+ 	sq->dma_fifo = kzalloc_node(df_sz * sizeof(*sq->dma_fifo), GFP_KERNEL,
+ 				    numa);
++	sq->wqe_info = kzalloc_node(wq_sz * sizeof(*sq->wqe_info), GFP_KERNEL,
++				    numa);
+ 
+-	if (!sq->skb || !sq->dma_fifo) {
++	if (!sq->skb || !sq->dma_fifo || !sq->wqe_info) {
+ 		mlx5e_free_sq_db(sq);
+ 		return -ENOMEM;
+ 	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
