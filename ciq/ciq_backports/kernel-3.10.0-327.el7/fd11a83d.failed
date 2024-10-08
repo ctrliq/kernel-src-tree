@@ -1,0 +1,254 @@
+net: Pull out core bits of __netdev_alloc_skb and add __napi_alloc_skb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Pull out core bits of __netdev_alloc_skb and add __napi_alloc_skb (Alexander Duyck) [1205273]
+Rebuild_FUZZ: 96.30%
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit fd11a83dd3630ec6a60f8a702446532c5c7e1991
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fd11a83d.failed
+
+This change pulls the core functionality out of __netdev_alloc_skb and
+places them in a new function named __alloc_rx_skb.  The reason for doing
+this is to make these bits accessible to a new function __napi_alloc_skb.
+In addition __alloc_rx_skb now has a new flags value that is used to
+determine which page frag pool to allocate from.  If the SKB_ALLOC_NAPI
+flag is set then the NAPI pool is used.  The advantage of this is that we
+do not have to use local_irq_save/restore when accessing the NAPI pool from
+NAPI context.
+
+In my test setup I saw at least 11ns of savings using the napi_alloc_skb
+function versus the netdev_alloc_skb function, most of this being due to
+the fact that we didn't have to call local_irq_save/restore.
+
+The main use case for napi_alloc_skb would be for things such as copybreak
+or page fragment based receive paths where an skb is allocated after the
+data has been received instead of before.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fd11a83dd3630ec6a60f8a702446532c5c7e1991)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+diff --cc include/linux/skbuff.h
+index 67a799712ba7,85ab7d72b54c..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -151,6 -150,8 +151,11 @@@
+  struct net_device;
+  struct scatterlist;
+  struct pipe_inode_info;
+++<<<<<<< HEAD
+++=======
++ struct iov_iter;
++ struct napi_struct;
+++>>>>>>> fd11a83dd363 (net: Pull out core bits of __netdev_alloc_skb and add __napi_alloc_skb)
+  
+  #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+  struct nf_conntrack {
+@@@ -2097,32 -2166,43 +2103,48 @@@ static inline struct sk_buff *netdev_al
+  	return __netdev_alloc_skb_ip_align(dev, length, GFP_ATOMIC);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + *	__skb_alloc_page - allocate pages for ps-rx on a skb and preserve pfmemalloc data
+ + *	@gfp_mask: alloc_pages_node mask. Set __GFP_NOMEMALLOC if not for network packet RX
+ + *	@skb: skb to set pfmemalloc on if __GFP_MEMALLOC is used
+ + *	@order: size of the allocation
+++=======
++ void *napi_alloc_frag(unsigned int fragsz);
++ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi,
++ 				 unsigned int length, gfp_t gfp_mask);
++ static inline struct sk_buff *napi_alloc_skb(struct napi_struct *napi,
++ 					     unsigned int length)
++ {
++ 	return __napi_alloc_skb(napi, length, GFP_ATOMIC);
++ }
++ 
++ /**
++  * __dev_alloc_pages - allocate page for network Rx
++  * @gfp_mask: allocation priority. Set __GFP_NOMEMALLOC if not for network Rx
++  * @order: size of the allocation
+++>>>>>>> fd11a83dd363 (net: Pull out core bits of __netdev_alloc_skb and add __napi_alloc_skb)
+   *
+ - * Allocate a new page.
+ + * 	Allocate a new page.
+   *
+ - * %NULL is returned if there is no free memory.
+ + * 	%NULL is returned if there is no free memory.
+  */
+ -static inline struct page *__dev_alloc_pages(gfp_t gfp_mask,
+ -					     unsigned int order)
+ -{
+ -	/* This piece of code contains several assumptions.
+ -	 * 1.  This is for device Rx, therefor a cold page is preferred.
+ -	 * 2.  The expectation is the user wants a compound page.
+ -	 * 3.  If requesting a order 0 page it will not be compound
+ -	 *     due to the check to see if order has a value in prep_new_page
+ -	 * 4.  __GFP_MEMALLOC is ignored if __GFP_NOMEMALLOC is set due to
+ -	 *     code in gfp_to_alloc_flags that should be enforcing this.
+ -	 */
+ -	gfp_mask |= __GFP_COLD | __GFP_COMP | __GFP_MEMALLOC;
+ +static inline struct page *__skb_alloc_pages(gfp_t gfp_mask,
+ +					      struct sk_buff *skb,
+ +					      unsigned int order)
+ +{
+ +	struct page *page;
+  
+ -	return alloc_pages_node(NUMA_NO_NODE, gfp_mask, order);
+ -}
+ +	gfp_mask |= __GFP_COLD;
+  
+ -static inline struct page *dev_alloc_pages(unsigned int order)
+ -{
+ -	return __dev_alloc_pages(GFP_ATOMIC, order);
+ +	if (!(gfp_mask & __GFP_NOMEMALLOC))
+ +		gfp_mask |= __GFP_MEMALLOC;
+ +
+ +	page = alloc_pages_node(NUMA_NO_NODE, gfp_mask, order);
+ +	if (skb && page && page->pfmemalloc)
+ +		skb->pfmemalloc = true;
+ +
+ +	return page;
+  }
+  
+  /**
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 511d2dc85a3a..ae58fdbc1d78 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3957,7 +3957,7 @@ struct sk_buff *napi_get_frags(struct napi_struct *napi)
+ 	struct sk_buff *skb = napi->skb;
+ 
+ 	if (!skb) {
+-		skb = netdev_alloc_skb_ip_align(napi->dev, GRO_MAX_HEAD);
++		skb = napi_alloc_skb(napi, GRO_MAX_HEAD);
+ 		napi->skb = skb;
+ 	}
+ 	return skb;
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index af49e6e94c48..cb48d5bf3dbf 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -423,10 +423,13 @@ void *netdev_alloc_frag(unsigned int fragsz)
+ EXPORT_SYMBOL(netdev_alloc_frag);
+ 
+ /**
+- *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
+- *	@dev: network device to receive on
++ *	__alloc_rx_skb - allocate an skbuff for rx
+  *	@length: length to allocate
+  *	@gfp_mask: get_free_pages mask, passed to alloc_skb
++ *	@flags:	If SKB_ALLOC_RX is set, __GFP_MEMALLOC will be used for
++ *		allocations in case we have to fallback to __alloc_skb()
++ *		If SKB_ALLOC_NAPI is set, page fragment will be allocated
++ *		from napi_cache instead of netdev_cache.
+  *
+  *	Allocate a new &sk_buff and assign it a usage count of one. The
+  *	buffer has unspecified headroom built in. Users should allocate
+@@ -435,11 +438,11 @@ EXPORT_SYMBOL(netdev_alloc_frag);
+  *
+  *	%NULL is returned if there is no free memory.
+  */
+-struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+-				   unsigned int length, gfp_t gfp_mask)
++static struct sk_buff *__alloc_rx_skb(unsigned int length, gfp_t gfp_mask,
++				      int flags)
+ {
+ 	struct sk_buff *skb = NULL;
+-	unsigned int fragsz = SKB_DATA_ALIGN(length + NET_SKB_PAD) +
++	unsigned int fragsz = SKB_DATA_ALIGN(length) +
+ 			      SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 
+ 	if (fragsz <= PAGE_SIZE && !(gfp_mask & (__GFP_WAIT | GFP_DMA))) {
+@@ -448,7 +451,9 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+ 		if (sk_memalloc_socks())
+ 			gfp_mask |= __GFP_MEMALLOC;
+ 
+-		data = __netdev_alloc_frag(fragsz, gfp_mask);
++		data = (flags & SKB_ALLOC_NAPI) ?
++			__napi_alloc_frag(fragsz, gfp_mask) :
++			__netdev_alloc_frag(fragsz, gfp_mask);
+ 
+ 		if (likely(data)) {
+ 			skb = build_skb(data, fragsz);
+@@ -456,17 +461,72 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+ 				put_page(virt_to_head_page(data));
+ 		}
+ 	} else {
+-		skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask,
++		skb = __alloc_skb(length, gfp_mask,
+ 				  SKB_ALLOC_RX, NUMA_NO_NODE);
+ 	}
++	return skb;
++}
++
++/**
++ *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
++ *	@dev: network device to receive on
++ *	@length: length to allocate
++ *	@gfp_mask: get_free_pages mask, passed to alloc_skb
++ *
++ *	Allocate a new &sk_buff and assign it a usage count of one. The
++ *	buffer has NET_SKB_PAD headroom built in. Users should allocate
++ *	the headroom they think they need without accounting for the
++ *	built in space. The built in space is used for optimisations.
++ *
++ *	%NULL is returned if there is no free memory.
++ */
++struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
++				   unsigned int length, gfp_t gfp_mask)
++{
++	struct sk_buff *skb;
++
++	length += NET_SKB_PAD;
++	skb = __alloc_rx_skb(length, gfp_mask, 0);
++
+ 	if (likely(skb)) {
+ 		skb_reserve(skb, NET_SKB_PAD);
+ 		skb->dev = dev;
+ 	}
++
+ 	return skb;
+ }
+ EXPORT_SYMBOL(__netdev_alloc_skb);
+ 
++/**
++ *	__napi_alloc_skb - allocate skbuff for rx in a specific NAPI instance
++ *	@napi: napi instance this buffer was allocated for
++ *	@length: length to allocate
++ *	@gfp_mask: get_free_pages mask, passed to alloc_skb and alloc_pages
++ *
++ *	Allocate a new sk_buff for use in NAPI receive.  This buffer will
++ *	attempt to allocate the head from a special reserved region used
++ *	only for NAPI Rx allocation.  By doing this we can save several
++ *	CPU cycles by avoiding having to disable and re-enable IRQs.
++ *
++ *	%NULL is returned if there is no free memory.
++ */
++struct sk_buff *__napi_alloc_skb(struct napi_struct *napi,
++				 unsigned int length, gfp_t gfp_mask)
++{
++	struct sk_buff *skb;
++
++	length += NET_SKB_PAD + NET_IP_ALIGN;
++	skb = __alloc_rx_skb(length, gfp_mask, SKB_ALLOC_NAPI);
++
++	if (likely(skb)) {
++		skb_reserve(skb, NET_SKB_PAD + NET_IP_ALIGN);
++		skb->dev = napi->dev;
++	}
++
++	return skb;
++}
++EXPORT_SYMBOL(__napi_alloc_skb);
++
+ void skb_add_rx_frag(struct sk_buff *skb, int i, struct page *page, int off,
+ 		     int size, unsigned int truesize)
+ {
