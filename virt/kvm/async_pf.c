@@ -67,7 +67,7 @@ static void async_pf_execute(struct work_struct *work)
 
 	use_mm(mm);
 	down_read(&mm->mmap_sem);
-	get_user_pages(current, mm, addr, 1, 1, 0, NULL, NULL);
+	get_user_pages(NULL, mm, addr, 1, 1, 0, NULL, NULL);
 	up_read(&mm->mmap_sem);
 	unuse_mm(mm);
 
