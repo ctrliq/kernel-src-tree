@@ -1,0 +1,89 @@
+cifs: fix the race in cifs_writev()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 19dfc1f5f2ef03a52aa30c8257c5745edef23f55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/19dfc1f5.failed
+
+O_APPEND handling there hadn't been completely fixed by Pavel's
+patch; it checks the right value, but it's racy - we can't really
+do that until i_mutex has been taken.
+
+Fix by switching to __generic_file_aio_write() (open-coding
+generic_file_aio_write(), actually) and pulling mutex_lock() above
+inode_size_read().
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 19dfc1f5f2ef03a52aa30c8257c5745edef23f55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/file.c
+diff --cc fs/cifs/file.c
+index a6da087c94b5,5bac2763c450..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -2579,31 -2579,32 +2579,58 @@@ cifs_writev(struct kiocb *iocb, const s
+  	struct cifsInodeInfo *cinode = CIFS_I(inode);
+  	struct TCP_Server_Info *server = tlink_tcon(cfile->tlink)->ses->server;
+  	ssize_t rc = -EACCES;
+++<<<<<<< HEAD
+ +
+ +	BUG_ON(iocb->ki_pos != pos);
+ +
+++=======
++ 	loff_t lock_pos = iocb->ki_pos;
++ 
+++>>>>>>> 19dfc1f5f2ef (cifs: fix the race in cifs_writev())
+  	/*
+  	 * We need to hold the sem to be sure nobody modifies lock list
+  	 * with a brlock that prevents writing.
+  	 */
+  	down_read(&cinode->lock_sem);
+++<<<<<<< HEAD
+ +	if (!cifs_find_lock_conflict(cfile, pos, iov_length(iov, nr_segs),
+ +				     server->vals->exclusive_lock_type, NULL,
+ +				     CIFS_WRITE_OP)) {
+ +		mutex_lock(&inode->i_mutex);
+ +		rc = __generic_file_aio_write(iocb, iov, nr_segs,
+ +					       &iocb->ki_pos);
+ +		mutex_unlock(&inode->i_mutex);
+ +	}
+ +
+ +	if (rc > 0 || rc == -EIOCBQUEUED) {
+ +		ssize_t err;
+ +
+ +		err = generic_write_sync(file, pos, rc);
+ +		if (err < 0 && rc > 0)
+ +			rc = err;
+ +	}
+ +
+++=======
++ 	mutex_lock(&inode->i_mutex);
++ 	if (file->f_flags & O_APPEND)
++ 		lock_pos = i_size_read(inode);
++ 	if (!cifs_find_lock_conflict(cfile, lock_pos, iov_length(iov, nr_segs),
++ 				     server->vals->exclusive_lock_type, NULL,
++ 				     CIFS_WRITE_OP)) {
++ 		rc = __generic_file_aio_write(iocb, iov, nr_segs);
++ 		mutex_unlock(&inode->i_mutex);
++ 
++ 		if (rc > 0) {
++ 			ssize_t err;
++ 
++ 			err = generic_write_sync(file, iocb->ki_pos - rc, rc);
++ 			if (rc < 0)
++ 				rc = err;
++ 		}
++ 	} else {
++ 		mutex_unlock(&inode->i_mutex);
++ 	}
+++>>>>>>> 19dfc1f5f2ef (cifs: fix the race in cifs_writev())
+  	up_read(&cinode->lock_sem);
+  	return rc;
+  }
+* Unmerged path fs/cifs/file.c
