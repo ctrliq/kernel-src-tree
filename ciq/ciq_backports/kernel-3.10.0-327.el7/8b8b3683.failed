@@ -1,0 +1,148 @@
+ring-buffer: Check if buffer exists before polling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Steven Rostedt (Red Hat) <rostedt@goodmis.org>
+commit 8b8b36834d0fff67fc8668093f4312dd04dcf21d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8b8b3683.failed
+
+The per_cpu buffers are created one per possible CPU. But these do
+not mean that those CPUs are online, nor do they even exist.
+
+With the addition of the ring buffer polling, it assumes that the
+caller polls on an existing buffer. But this is not the case if
+the user reads trace_pipe from a CPU that does not exist, and this
+causes the kernel to crash.
+
+Simple fix is to check the cpu against buffer bitmask against to see
+if the buffer was allocated or not and return -ENODEV if it is
+not.
+
+More updates were done to pass the -ENODEV back up to userspace.
+
+Link: http://lkml.kernel.org/r/5393DB61.6060707@oracle.com
+
+	Reported-by: Sasha Levin <sasha.levin@oracle.com>
+	Cc: stable@vger.kernel.org # 3.10+
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit 8b8b36834d0fff67fc8668093f4312dd04dcf21d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace.c
+diff --cc kernel/trace/trace.c
+index 89ea344de648,56422f1decba..000000000000
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@@ -1021,7 -1085,7 +1021,11 @@@ update_max_tr_single(struct trace_arra
+  }
+  #endif /* CONFIG_TRACER_MAX_TRACE */
+  
+++<<<<<<< HEAD
+ +static void default_wait_pipe(struct trace_iterator *iter)
+++=======
++ static int wait_on_pipe(struct trace_iterator *iter)
+++>>>>>>> 8b8b36834d0f (ring-buffer: Check if buffer exists before polling)
+  {
+  	/* Iterators are static, they should be filled or empty */
+  	if (trace_buffer_iter(iter, iter->cpu_file))
+@@@ -4070,6 -4397,18 +4075,21 @@@ static int tracing_wait_pipe(struct fil
+  		 */
+  		if (!tracing_is_on() && iter->pos)
+  			break;
+++<<<<<<< HEAD
+++=======
++ 
++ 		mutex_unlock(&iter->mutex);
++ 
++ 		ret = wait_on_pipe(iter);
++ 
++ 		mutex_lock(&iter->mutex);
++ 
++ 		if (ret)
++ 			return ret;
++ 
++ 		if (signal_pending(current))
++ 			return -EINTR;
+++>>>>>>> 8b8b36834d0f (ring-buffer: Check if buffer exists before polling)
+  	}
+  
+  	return 1;
+@@@ -4989,8 -5331,12 +5009,16 @@@ tracing_buffers_read(struct file *filp
+  				goto out_unlock;
+  			}
+  			mutex_unlock(&trace_types_lock);
+++<<<<<<< HEAD
+ +			iter->trace->wait_pipe(iter);
+++=======
++ 			ret = wait_on_pipe(iter);
+++>>>>>>> 8b8b36834d0f (ring-buffer: Check if buffer exists before polling)
+  			mutex_lock(&trace_types_lock);
++ 			if (ret) {
++ 				size = ret;
++ 				goto out_unlock;
++ 			}
+  			if (signal_pending(current)) {
+  				size = -EINTR;
+  				goto out_unlock;
+@@@ -5202,8 -5546,10 +5230,14 @@@ tracing_buffers_splice_read(struct fil
+  			goto out;
+  		}
+  		mutex_unlock(&trace_types_lock);
+++<<<<<<< HEAD
+ +		iter->trace->wait_pipe(iter);
+++=======
++ 		ret = wait_on_pipe(iter);
+++>>>>>>> 8b8b36834d0f (ring-buffer: Check if buffer exists before polling)
+  		mutex_lock(&trace_types_lock);
++ 		if (ret)
++ 			goto out;
+  		if (signal_pending(current)) {
+  			ret = -EINTR;
+  			goto out;
+diff --git a/include/linux/ring_buffer.h b/include/linux/ring_buffer.h
+index d69cf637a15a..49a4d6f59108 100644
+--- a/include/linux/ring_buffer.h
++++ b/include/linux/ring_buffer.h
+@@ -97,7 +97,7 @@ __ring_buffer_alloc(unsigned long size, unsigned flags, struct lock_class_key *k
+ 	__ring_buffer_alloc((size), (flags), &__key);	\
+ })
+ 
+-void ring_buffer_wait(struct ring_buffer *buffer, int cpu);
++int ring_buffer_wait(struct ring_buffer *buffer, int cpu);
+ int ring_buffer_poll_wait(struct ring_buffer *buffer, int cpu,
+ 			  struct file *filp, poll_table *poll_table);
+ 
+diff --git a/kernel/trace/ring_buffer.c b/kernel/trace/ring_buffer.c
+index 79806ae7cacd..221de3a8f92a 100644
+--- a/kernel/trace/ring_buffer.c
++++ b/kernel/trace/ring_buffer.c
+@@ -543,7 +543,7 @@ static void rb_wake_up_waiters(struct irq_work *work)
+  * as data is added to any of the @buffer's cpu buffers. Otherwise
+  * it will wait for data to be added to a specific cpu buffer.
+  */
+-void ring_buffer_wait(struct ring_buffer *buffer, int cpu)
++int ring_buffer_wait(struct ring_buffer *buffer, int cpu)
+ {
+ 	struct ring_buffer_per_cpu *cpu_buffer;
+ 	DEFINE_WAIT(wait);
+@@ -557,6 +557,8 @@ void ring_buffer_wait(struct ring_buffer *buffer, int cpu)
+ 	if (cpu == RING_BUFFER_ALL_CPUS)
+ 		work = &buffer->irq_work;
+ 	else {
++		if (!cpumask_test_cpu(cpu, buffer->cpumask))
++			return -ENODEV;
+ 		cpu_buffer = buffer->buffers[cpu];
+ 		work = &cpu_buffer->irq_work;
+ 	}
+@@ -591,6 +593,7 @@ void ring_buffer_wait(struct ring_buffer *buffer, int cpu)
+ 		schedule();
+ 
+ 	finish_wait(&work->waiters, &wait);
++	return 0;
+ }
+ 
+ /**
+* Unmerged path kernel/trace/trace.c
