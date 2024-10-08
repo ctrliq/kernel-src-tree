@@ -1,0 +1,106 @@
+KVM: PPC: Book3S HV: Move vcore preemption point up into kvmppc_run_vcpu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s-hv: Move vcore preemption point up into kvmppc_run_vcpu (Laurent Vivier) [1213669]
+Rebuild_FUZZ: 94.96%
+commit-author Paul Mackerras <paulus@samba.org>
+commit 25fedfca94cfbf2461314c6c34ef58e74a31b025
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/25fedfca.failed
+
+Rather than calling cond_resched() in kvmppc_run_core() before doing
+the post-processing for the vcpus that we have just run (that is,
+calling kvmppc_handle_exit_hv(), kvmppc_set_timer(), etc.), we now do
+that post-processing before calling cond_resched(), and that post-
+processing is moved out into its own function, post_guest_process().
+
+The reschedule point is now in kvmppc_run_vcpu() and we define a new
+vcore state, VCORE_PREEMPT, to indicate that that the vcore's runner
+task is runnable but not running.  (Doing the reschedule with the
+vcore in VCORE_INACTIVE state would be bad because there are potentially
+other vcpus waiting for the runner in kvmppc_wait_for_exec() which
+then wouldn't get woken up.)
+
+Also, we make use of the handy cond_resched_lock() function, which
+unlocks and relocks vc->lock for us around the reschedule.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 25fedfca94cfbf2461314c6c34ef58e74a31b025)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index a5eb5fe2e5ac,fb4f16628a51..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -1777,41 -2017,13 +1815,48 @@@ static void kvmppc_run_core(struct kvmp
+  	kvm_guest_exit();
+  
+  	preempt_enable();
+- 	cond_resched();
+  
+  	spin_lock(&vc->lock);
+++<<<<<<< HEAD
+ +	now = get_tb();
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		/* cancel pending dec exception if dec is positive */
+ +		if (now < vcpu->arch.dec_expires &&
+ +		    kvmppc_core_pending_dec(vcpu))
+ +			kvmppc_core_dequeue_dec(vcpu);
+ +
+ +		ret = RESUME_GUEST;
+ +		if (vcpu->arch.trap)
+ +			ret = kvmppc_handle_exit_hv(vcpu->arch.kvm_run, vcpu,
+ +						    vcpu->arch.run_task);
+ +
+ +		vcpu->arch.ret = ret;
+ +		vcpu->arch.trap = 0;
+ +
+ +		if (vcpu->arch.ceded) {
+ +			if (!is_kvmppc_resume_guest(ret))
+ +				kvmppc_end_cede(vcpu);
+ +			else
+ +				kvmppc_set_timer(vcpu);
+ +		}
+ +	}
+ +
+ + out:
+ +	vc->vcore_state = VCORE_INACTIVE;
+ +	list_for_each_entry_safe(vcpu, vnext, &vc->runnable_threads,
+ +				 arch.run_list) {
+ +		if (!is_kvmppc_resume_guest(vcpu->arch.ret)) {
+ +			kvmppc_remove_runnable(vc, vcpu);
+ +			wake_up(&vcpu->arch.cpu_run);
+ +		}
+ +	}
+++=======
++ 	post_guest_process(vc);
++ 
++  out:
++ 	vc->vcore_state = VCORE_INACTIVE;
++ 	trace_kvmppc_run_core(vc, 1);
+++>>>>>>> 25fedfca94cf (KVM: PPC: Book3S HV: Move vcore preemption point up into kvmppc_run_vcpu)
+  }
+  
+  /*
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 075aa71ef592..b059cf483c21 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -326,8 +326,9 @@ struct kvmppc_vcore {
+ /* Values for vcore_state */
+ #define VCORE_INACTIVE	0
+ #define VCORE_SLEEPING	1
+-#define VCORE_RUNNING	2
+-#define VCORE_EXITING	3
++#define VCORE_PREEMPT	2
++#define VCORE_RUNNING	3
++#define VCORE_EXITING	4
+ 
+ /*
+  * Struct used to manage memory for a virtual processor area
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
