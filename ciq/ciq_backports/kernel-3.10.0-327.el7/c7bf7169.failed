@@ -1,0 +1,444 @@
+ethernet: Use eth_<foo>_addr instead of memset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Joe Perches <joe@perches.com>
+commit c7bf716940c6a8ed39b444bfb0b97c2939ac312b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c7bf7169.failed
+
+Use the built-in function instead of memset.
+
+	Signed-off-by: Joe Perches <joe@perches.com>
+	Acked-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c7bf716940c6a8ed39b444bfb0b97c2939ac312b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/micrel/ksz884x.c
+#	drivers/net/ethernet/ti/netcp_core.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index b0a004972e7a,903664ff6904..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -3861,6 -3849,158 +3861,161 @@@ static void ixgbe_restore_vlan(struct i
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ixgbe_write_mc_addr_list - write multicast addresses to MTA
++  * @netdev: network interface device structure
++  *
++  * Writes multicast address list to the MTA hash table.
++  * Returns: -ENOMEM on failure
++  *                0 on no addresses written
++  *                X on writing X addresses to MTA
++  **/
++ static int ixgbe_write_mc_addr_list(struct net_device *netdev)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 
++ 	if (!netif_running(netdev))
++ 		return 0;
++ 
++ 	if (hw->mac.ops.update_mc_addr_list)
++ 		hw->mac.ops.update_mc_addr_list(hw, netdev);
++ 	else
++ 		return -ENOMEM;
++ 
++ #ifdef CONFIG_PCI_IOV
++ 	ixgbe_restore_vf_multicasts(adapter);
++ #endif
++ 
++ 	return netdev_mc_count(netdev);
++ }
++ 
++ #ifdef CONFIG_PCI_IOV
++ void ixgbe_full_sync_mac_table(struct ixgbe_adapter *adapter)
++ {
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	int i;
++ 	for (i = 0; i < hw->mac.num_rar_entries; i++) {
++ 		if (adapter->mac_table[i].state & IXGBE_MAC_STATE_IN_USE)
++ 			hw->mac.ops.set_rar(hw, i, adapter->mac_table[i].addr,
++ 					    adapter->mac_table[i].queue,
++ 					    IXGBE_RAH_AV);
++ 		else
++ 			hw->mac.ops.clear_rar(hw, i);
++ 
++ 		adapter->mac_table[i].state &= ~(IXGBE_MAC_STATE_MODIFIED);
++ 	}
++ }
++ #endif
++ 
++ static void ixgbe_sync_mac_table(struct ixgbe_adapter *adapter)
++ {
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	int i;
++ 	for (i = 0; i < hw->mac.num_rar_entries; i++) {
++ 		if (adapter->mac_table[i].state & IXGBE_MAC_STATE_MODIFIED) {
++ 			if (adapter->mac_table[i].state &
++ 			    IXGBE_MAC_STATE_IN_USE)
++ 				hw->mac.ops.set_rar(hw, i,
++ 						adapter->mac_table[i].addr,
++ 						adapter->mac_table[i].queue,
++ 						IXGBE_RAH_AV);
++ 			else
++ 				hw->mac.ops.clear_rar(hw, i);
++ 
++ 			adapter->mac_table[i].state &=
++ 						~(IXGBE_MAC_STATE_MODIFIED);
++ 		}
++ 	}
++ }
++ 
++ static void ixgbe_flush_sw_mac_table(struct ixgbe_adapter *adapter)
++ {
++ 	int i;
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 
++ 	for (i = 0; i < hw->mac.num_rar_entries; i++) {
++ 		adapter->mac_table[i].state |= IXGBE_MAC_STATE_MODIFIED;
++ 		adapter->mac_table[i].state &= ~IXGBE_MAC_STATE_IN_USE;
++ 		eth_zero_addr(adapter->mac_table[i].addr);
++ 		adapter->mac_table[i].queue = 0;
++ 	}
++ 	ixgbe_sync_mac_table(adapter);
++ }
++ 
++ static int ixgbe_available_rars(struct ixgbe_adapter *adapter)
++ {
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	int i, count = 0;
++ 
++ 	for (i = 0; i < hw->mac.num_rar_entries; i++) {
++ 		if (adapter->mac_table[i].state == 0)
++ 			count++;
++ 	}
++ 	return count;
++ }
++ 
++ /* this function destroys the first RAR entry */
++ static void ixgbe_mac_set_default_filter(struct ixgbe_adapter *adapter,
++ 					 u8 *addr)
++ {
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 
++ 	memcpy(&adapter->mac_table[0].addr, addr, ETH_ALEN);
++ 	adapter->mac_table[0].queue = VMDQ_P(0);
++ 	adapter->mac_table[0].state = (IXGBE_MAC_STATE_DEFAULT |
++ 				       IXGBE_MAC_STATE_IN_USE);
++ 	hw->mac.ops.set_rar(hw, 0, adapter->mac_table[0].addr,
++ 			    adapter->mac_table[0].queue,
++ 			    IXGBE_RAH_AV);
++ }
++ 
++ int ixgbe_add_mac_filter(struct ixgbe_adapter *adapter, u8 *addr, u16 queue)
++ {
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	int i;
++ 
++ 	if (is_zero_ether_addr(addr))
++ 		return -EINVAL;
++ 
++ 	for (i = 0; i < hw->mac.num_rar_entries; i++) {
++ 		if (adapter->mac_table[i].state & IXGBE_MAC_STATE_IN_USE)
++ 			continue;
++ 		adapter->mac_table[i].state |= (IXGBE_MAC_STATE_MODIFIED |
++ 						IXGBE_MAC_STATE_IN_USE);
++ 		ether_addr_copy(adapter->mac_table[i].addr, addr);
++ 		adapter->mac_table[i].queue = queue;
++ 		ixgbe_sync_mac_table(adapter);
++ 		return i;
++ 	}
++ 	return -ENOMEM;
++ }
++ 
++ int ixgbe_del_mac_filter(struct ixgbe_adapter *adapter, u8 *addr, u16 queue)
++ {
++ 	/* search table for addr, if found, set to 0 and sync */
++ 	int i;
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 
++ 	if (is_zero_ether_addr(addr))
++ 		return -EINVAL;
++ 
++ 	for (i = 0; i < hw->mac.num_rar_entries; i++) {
++ 		if (ether_addr_equal(addr, adapter->mac_table[i].addr) &&
++ 		    adapter->mac_table[i].queue == queue) {
++ 			adapter->mac_table[i].state |= IXGBE_MAC_STATE_MODIFIED;
++ 			adapter->mac_table[i].state &= ~IXGBE_MAC_STATE_IN_USE;
++ 			eth_zero_addr(adapter->mac_table[i].addr);
++ 			adapter->mac_table[i].queue = 0;
++ 			ixgbe_sync_mac_table(adapter);
++ 			return 0;
++ 		}
++ 	}
++ 	return -ENOMEM;
++ }
++ /**
+++>>>>>>> c7bf716940c6 (ethernet: Use eth_<foo>_addr instead of memset)
+   * ixgbe_write_uc_addr_list - write unicast addresses to RAR table
+   * @netdev: network interface device structure
+   *
+diff --cc drivers/net/ethernet/micrel/ksz884x.c
+index 8ebc352bcbe6,6f332ebdf3b5..000000000000
+--- a/drivers/net/ethernet/micrel/ksz884x.c
++++ b/drivers/net/ethernet/micrel/ksz884x.c
+@@@ -4149,8 -4143,8 +4149,13 @@@ static int hw_del_addr(struct ksz_hw *h
+  	int i;
+  
+  	for (i = 0; i < hw->addr_list_size; i++) {
+++<<<<<<< HEAD
+ +		if (!memcmp(hw->address[i], mac_addr, ETH_ALEN)) {
+ +			memset(hw->address[i], 0, ETH_ALEN);
+++=======
++ 		if (ether_addr_equal(hw->address[i], mac_addr)) {
++ 			eth_zero_addr(hw->address[i]);
+++>>>>>>> c7bf716940c6 (ethernet: Use eth_<foo>_addr instead of memset)
+  			writel(0, hw->io + ADD_ADDR_INCR * i +
+  				KS_ADD_ADDR_0_HI);
+  			return 0;
+* Unmerged path drivers/net/ethernet/ti/netcp_core.c
+diff --git a/drivers/net/ethernet/amd/pcnet32.c b/drivers/net/ethernet/amd/pcnet32.c
+index ed2130727643..0b6cc95a1c52 100644
+--- a/drivers/net/ethernet/amd/pcnet32.c
++++ b/drivers/net/ethernet/amd/pcnet32.c
+@@ -1681,7 +1681,7 @@ pcnet32_probe1(unsigned long ioaddr, int shared, struct pci_dev *pdev)
+ 
+ 	/* if the ethernet address is not valid, force to 00:00:00:00:00:00 */
+ 	if (!is_valid_ether_addr(dev->dev_addr))
+-		memset(dev->dev_addr, 0, ETH_ALEN);
++		eth_zero_addr(dev->dev_addr);
+ 
+ 	if (pcnet32_debug & NETIF_MSG_PROBE) {
+ 		pr_cont(" %pM", dev->dev_addr);
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
+index 09180e5c07bf..1f686b6d0e55 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
+@@ -2446,7 +2446,7 @@ static int bnx2x_run_loopback(struct bnx2x *bp, int loopback_mode)
+ 	}
+ 	packet = skb_put(skb, pkt_size);
+ 	memcpy(packet, bp->dev->dev_addr, ETH_ALEN);
+-	memset(packet + ETH_ALEN, 0, ETH_ALEN);
++	eth_zero_addr(packet + ETH_ALEN);
+ 	memset(packet + 2*ETH_ALEN, 0x77, (ETH_HLEN - 2*ETH_ALEN));
+ 	for (i = ETH_HLEN; i < pkt_size; i++)
+ 		packet[i] = (unsigned char) (i & 0xff);
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index a4f4584b14c4..5426b42b1ba6 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -11470,13 +11470,13 @@ static void bnx2x_get_cnic_mac_hwinfo(struct bnx2x *bp)
+ 	/* Disable iSCSI OOO if MAC configuration is invalid. */
+ 	if (!is_valid_ether_addr(iscsi_mac)) {
+ 		bp->flags |= NO_ISCSI_OOO_FLAG | NO_ISCSI_FLAG;
+-		memset(iscsi_mac, 0, ETH_ALEN);
++		eth_zero_addr(iscsi_mac);
+ 	}
+ 
+ 	/* Disable FCoE if MAC configuration is invalid. */
+ 	if (!is_valid_ether_addr(fip_mac)) {
+ 		bp->flags |= NO_FCOE_FLAG;
+-		memset(bp->fip_mac, 0, ETH_ALEN);
++		eth_zero_addr(bp->fip_mac);
+ 	}
+ }
+ 
+@@ -11487,7 +11487,7 @@ static void bnx2x_get_mac_hwinfo(struct bnx2x *bp)
+ 	int port = BP_PORT(bp);
+ 
+ 	/* Zero primary MAC configuration */
+-	memset(bp->dev->dev_addr, 0, ETH_ALEN);
++	eth_zero_addr(bp->dev->dev_addr);
+ 
+ 	if (BP_NOMCP(bp)) {
+ 		BNX2X_ERROR("warning: random MAC workaround active\n");
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+index 50de43b23264..131ad7b48720 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+@@ -2691,7 +2691,7 @@ int bnx2x_get_vf_config(struct net_device *dev, int vfidx,
+ 			memcpy(&ivi->mac, bulletin->mac, ETH_ALEN);
+ 		else
+ 			/* function has not been loaded yet. Show mac as 0s */
+-			memset(&ivi->mac, 0, ETH_ALEN);
++			eth_zero_addr(ivi->mac);
+ 
+ 		/* vlan */
+ 		if (bulletin->valid_bitmap & (1 << VLAN_VALID))
+diff --git a/drivers/net/ethernet/cisco/enic/enic_main.c b/drivers/net/ethernet/cisco/enic/enic_main.c
+index 1a9b75be67f6..6f676e4008eb 100644
+--- a/drivers/net/ethernet/cisco/enic/enic_main.c
++++ b/drivers/net/ethernet/cisco/enic/enic_main.c
+@@ -933,7 +933,7 @@ static int enic_set_vf_port(struct net_device *netdev, int vf,
+ 		} else {
+ 			memset(pp, 0, sizeof(*pp));
+ 			if (vf == PORT_SELF_VF)
+-				memset(netdev->dev_addr, 0, ETH_ALEN);
++				eth_zero_addr(netdev->dev_addr);
+ 		}
+ 	} else {
+ 		/* Set flag to indicate that the port assoc/disassoc
+@@ -943,14 +943,14 @@ static int enic_set_vf_port(struct net_device *netdev, int vf,
+ 
+ 		/* If DISASSOCIATE, clean up all assigned/saved macaddresses */
+ 		if (pp->request == PORT_REQUEST_DISASSOCIATE) {
+-			memset(pp->mac_addr, 0, ETH_ALEN);
++			eth_zero_addr(pp->mac_addr);
+ 			if (vf == PORT_SELF_VF)
+-				memset(netdev->dev_addr, 0, ETH_ALEN);
++				eth_zero_addr(netdev->dev_addr);
+ 		}
+ 	}
+ 
+ 	if (vf == PORT_SELF_VF)
+-		memset(pp->vf_mac, 0, ETH_ALEN);
++		eth_zero_addr(pp->vf_mac);
+ 
+ 	return err;
+ }
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index faa193e12fa0..ce1a77139fb8 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -3131,7 +3131,7 @@ int be_cmd_get_perm_mac(struct be_adapter *adapter, u8 *mac)
+ 	int status;
+ 	bool pmac_valid = false;
+ 
+-	memset(mac, 0, ETH_ALEN);
++	eth_zero_addr(mac);
+ 
+ 	if (BEx_chip(adapter)) {
+ 		if (be_physfn(adapter))
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index 4e5ddaa87095..39744b15da62 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -3131,7 +3131,7 @@ static int be_setup_wol(struct be_adapter *adapter, bool enable)
+ 	int status = 0;
+ 	u8 mac[ETH_ALEN];
+ 
+-	memset(mac, 0, ETH_ALEN);
++	eth_zero_addr(mac);
+ 
+ 	cmd.size = sizeof(struct be_cmd_req_acpi_wol_magic_config);
+ 	cmd.va = dma_zalloc_coherent(&adapter->pdev->dev, cmd.size, &cmd.dma,
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 07e7d261b761..6ed722142c98 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1680,7 +1680,7 @@ int mlx4_en_start_port(struct net_device *dev)
+ 	}
+ 
+ 	/* Attach rx QP to bradcast address */
+-	memset(&mc_list[10], 0xff, ETH_ALEN);
++	eth_broadcast_addr(&mc_list[10]);
+ 	mc_list[5] = priv->port; /* needed for B0 steering support */
+ 	if (mlx4_multicast_attach(mdev->dev, &priv->rss_map.indir_qp, mc_list,
+ 				  priv->port, 0, MLX4_PROT_ETH,
+@@ -1783,7 +1783,7 @@ void mlx4_en_stop_port(struct net_device *dev, int detach)
+ 	}
+ 
+ 	/* Detach All multicasts */
+-	memset(&mc_list[10], 0xff, ETH_ALEN);
++	eth_broadcast_addr(&mc_list[10]);
+ 	mc_list[5] = priv->port; /* needed for B0 steering support */
+ 	mlx4_multicast_detach(mdev->dev, &priv->rss_map.indir_qp, mc_list,
+ 			      MLX4_PROT_ETH, priv->broadcast_id);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_selftest.c b/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
+index 2d8ee66138e8..4e789479f00f 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
+@@ -66,7 +66,7 @@ static int mlx4_en_test_loopback_xmit(struct mlx4_en_priv *priv)
+ 	ethh = (struct ethhdr *)skb_put(skb, sizeof(struct ethhdr));
+ 	packet	= (unsigned char *)skb_put(skb, packet_size);
+ 	memcpy(ethh->h_dest, priv->dev->dev_addr, ETH_ALEN);
+-	memset(ethh->h_source, 0, ETH_ALEN);
++	eth_zero_addr(ethh->h_source);
+ 	ethh->h_proto = htons(ETH_P_ARP);
+ 	skb_set_mac_header(skb, 0);
+ 	for (i = 0; i < packet_size; ++i)	/* fill our packet */
+* Unmerged path drivers/net/ethernet/micrel/ksz884x.c
+diff --git a/drivers/net/ethernet/qlogic/netxen/netxen_nic_hw.c b/drivers/net/ethernet/qlogic/netxen/netxen_nic_hw.c
+index 79f7c39cebbf..21630dcb843d 100644
+--- a/drivers/net/ethernet/qlogic/netxen/netxen_nic_hw.c
++++ b/drivers/net/ethernet/qlogic/netxen/netxen_nic_hw.c
+@@ -539,7 +539,7 @@ static void netxen_p2_nic_set_multi(struct net_device *netdev)
+ 	u8 null_addr[ETH_ALEN];
+ 	int i;
+ 
+-	memset(null_addr, 0, ETH_ALEN);
++	eth_zero_addr(null_addr);
+ 
+ 	if (netdev->flags & IFF_PROMISC) {
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlge/qlge_main.c b/drivers/net/ethernet/qlogic/qlge/qlge_main.c
+index 1c3e1996018d..dd874e413351 100644
+--- a/drivers/net/ethernet/qlogic/qlge/qlge_main.c
++++ b/drivers/net/ethernet/qlogic/qlge/qlge_main.c
+@@ -460,7 +460,7 @@ static int ql_set_mac_addr(struct ql_adapter *qdev, int set)
+ 		netif_printk(qdev, ifup, KERN_DEBUG, qdev->ndev,
+ 			     "Set Mac addr %pM\n", addr);
+ 	} else {
+-		memset(zero_mac_addr, 0, ETH_ALEN);
++		eth_zero_addr(zero_mac_addr);
+ 		addr = &zero_mac_addr[0];
+ 		netif_printk(qdev, ifup, KERN_DEBUG, qdev->ndev,
+ 			     "Clearing MAC address\n");
+diff --git a/drivers/net/ethernet/smsc/smsc911x.c b/drivers/net/ethernet/smsc/smsc911x.c
+index 3663b9e04a31..92c75480f87e 100644
+--- a/drivers/net/ethernet/smsc/smsc911x.c
++++ b/drivers/net/ethernet/smsc/smsc911x.c
+@@ -841,7 +841,7 @@ static int smsc911x_phy_loopbacktest(struct net_device *dev)
+ 	unsigned long flags;
+ 
+ 	/* Initialise tx packet using broadcast destination address */
+-	memset(pdata->loopback_tx_pkt, 0xff, ETH_ALEN);
++	eth_broadcast_addr(pdata->loopback_tx_pkt);
+ 
+ 	/* Use incrementing source address */
+ 	for (i = 6; i < 12; i++)
+* Unmerged path drivers/net/ethernet/ti/netcp_core.c
+diff --git a/drivers/net/ethernet/toshiba/ps3_gelic_wireless.c b/drivers/net/ethernet/toshiba/ps3_gelic_wireless.c
+index d568af1eb4f4..35bf144d2a0e 100644
+--- a/drivers/net/ethernet/toshiba/ps3_gelic_wireless.c
++++ b/drivers/net/ethernet/toshiba/ps3_gelic_wireless.c
+@@ -1170,7 +1170,7 @@ static int gelic_wl_set_ap(struct net_device *netdev,
+ 	} else {
+ 		pr_debug("%s: clear bssid\n", __func__);
+ 		clear_bit(GELIC_WL_STAT_BSSID_SET, &wl->stat);
+-		memset(wl->bssid, 0, ETH_ALEN);
++		eth_zero_addr(wl->bssid);
+ 	}
+ 	spin_unlock_irqrestore(&wl->lock, irqflag);
+ 	pr_debug("%s: ->\n", __func__);
+@@ -1192,7 +1192,7 @@ static int gelic_wl_get_ap(struct net_device *netdev,
+ 		memcpy(data->ap_addr.sa_data, wl->active_bssid,
+ 		       ETH_ALEN);
+ 	} else
+-		memset(data->ap_addr.sa_data, 0, ETH_ALEN);
++		eth_zero_addr(data->ap_addr.sa_data);
+ 
+ 	spin_unlock_irqrestore(&wl->lock, irqflag);
+ 	mutex_unlock(&wl->assoc_stat_lock);
+diff --git a/drivers/net/ethernet/xscale/ixp4xx_eth.c b/drivers/net/ethernet/xscale/ixp4xx_eth.c
+index 6958a5e87703..139526046f75 100644
+--- a/drivers/net/ethernet/xscale/ixp4xx_eth.c
++++ b/drivers/net/ethernet/xscale/ixp4xx_eth.c
+@@ -938,7 +938,7 @@ static void eth_set_mcast_list(struct net_device *dev)
+ 		return;
+ 	}
+ 
+-	memset(diffs, 0, ETH_ALEN);
++	eth_zero_addr(diffs);
+ 
+ 	addr = NULL;
+ 	netdev_for_each_mc_addr(ha, dev) {
