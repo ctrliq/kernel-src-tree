@@ -1,0 +1,170 @@
+drm/i915/gen9: Store plane minimum blocks in CRTC wm state (v2)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matt Roper <matthew.d.roper@intel.com>
+commit 86a2100a8b96594902bb59b90614377df4f64ce0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/86a2100a.failed
+
+This will eventually allow us to re-use old values without
+re-calculating them for unchanged planes (which also helps us avoid
+re-grabbing extra plane states).
+
+v2:
+ -  Drop unnecessary memset's; they were meant for a later patch (which
+    got reworked anyway to not need them, but were mis-rebased into this
+    one.  (Maarten)
+
+	Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1463061971-19638-6-git-send-email-matthew.d.roper@intel.com
+(cherry picked from commit 86a2100a8b96594902bb59b90614377df4f64ce0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_drv.h
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 640e923ced09,db350e56b5aa..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -262,6 -344,109 +262,112 @@@ struct intel_initial_plane_config 
+  	u32 base;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define SKL_MIN_SRC_W 8
++ #define SKL_MAX_SRC_W 4096
++ #define SKL_MIN_SRC_H 8
++ #define SKL_MAX_SRC_H 4096
++ #define SKL_MIN_DST_W 8
++ #define SKL_MAX_DST_W 4096
++ #define SKL_MIN_DST_H 8
++ #define SKL_MAX_DST_H 4096
++ 
++ struct intel_scaler {
++ 	int in_use;
++ 	uint32_t mode;
++ };
++ 
++ struct intel_crtc_scaler_state {
++ #define SKL_NUM_SCALERS 2
++ 	struct intel_scaler scalers[SKL_NUM_SCALERS];
++ 
++ 	/*
++ 	 * scaler_users: keeps track of users requesting scalers on this crtc.
++ 	 *
++ 	 *     If a bit is set, a user is using a scaler.
++ 	 *     Here user can be a plane or crtc as defined below:
++ 	 *       bits 0-30 - plane (bit position is index from drm_plane_index)
++ 	 *       bit 31    - crtc
++ 	 *
++ 	 * Instead of creating a new index to cover planes and crtc, using
++ 	 * existing drm_plane_index for planes which is well less than 31
++ 	 * planes and bit 31 for crtc. This should be fine to cover all
++ 	 * our platforms.
++ 	 *
++ 	 * intel_atomic_setup_scalers will setup available scalers to users
++ 	 * requesting scalers. It will gracefully fail if request exceeds
++ 	 * avilability.
++ 	 */
++ #define SKL_CRTC_INDEX 31
++ 	unsigned scaler_users;
++ 
++ 	/* scaler used by crtc for panel fitting purpose */
++ 	int scaler_id;
++ };
++ 
++ /* drm_mode->private_flags */
++ #define I915_MODE_FLAG_INHERITED 1
++ 
++ struct intel_pipe_wm {
++ 	struct intel_wm_level wm[5];
++ 	struct intel_wm_level raw_wm[5];
++ 	uint32_t linetime;
++ 	bool fbc_wm_enabled;
++ 	bool pipe_enabled;
++ 	bool sprites_enabled;
++ 	bool sprites_scaled;
++ };
++ 
++ struct skl_pipe_wm {
++ 	struct skl_wm_level wm[8];
++ 	struct skl_wm_level trans_wm;
++ 	uint32_t linetime;
++ };
++ 
++ struct intel_crtc_wm_state {
++ 	union {
++ 		struct {
++ 			/*
++ 			 * Intermediate watermarks; these can be
++ 			 * programmed immediately since they satisfy
++ 			 * both the current configuration we're
++ 			 * switching away from and the new
++ 			 * configuration we're switching to.
++ 			 */
++ 			struct intel_pipe_wm intermediate;
++ 
++ 			/*
++ 			 * Optimal watermarks, programmed post-vblank
++ 			 * when this state is committed.
++ 			 */
++ 			struct intel_pipe_wm optimal;
++ 		} ilk;
++ 
++ 		struct {
++ 			/* gen9+ only needs 1-step wm programming */
++ 			struct skl_pipe_wm optimal;
++ 
++ 			/* cached plane data rate */
++ 			unsigned plane_data_rate[I915_MAX_PLANES];
++ 			unsigned plane_y_data_rate[I915_MAX_PLANES];
++ 
++ 			/* minimum block allocation */
++ 			uint16_t minimum_blocks[I915_MAX_PLANES];
++ 			uint16_t minimum_y_blocks[I915_MAX_PLANES];
++ 		} skl;
++ 	};
++ 
++ 	/*
++ 	 * Platforms with two-step watermark programming will need to
++ 	 * update watermark programming post-vblank to switch from the
++ 	 * safe intermediate watermarks to the optimal final
++ 	 * watermarks.
++ 	 */
++ 	bool need_postvbl_update;
++ };
++ 
+++>>>>>>> 86a2100a8b96 (drm/i915/gen9: Store plane minimum blocks in CRTC wm state (v2))
+  struct intel_crtc_state {
+  	struct drm_crtc_state base;
+  
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index cca54888a5ac,05b04a6ca37a..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -2652,11 -3066,12 +2652,16 @@@ skl_allocate_pipe_ddb(struct drm_crtc *
+  	enum pipe pipe = intel_crtc->pipe;
+  	struct skl_ddb_entry *alloc = &ddb->pipe[pipe];
+  	uint16_t alloc_size, start, cursor_blocks;
+++<<<<<<< HEAD
+ +	uint16_t minimum[I915_MAX_PLANES];
+++=======
++ 	uint16_t *minimum = cstate->wm.skl.minimum_blocks;
++ 	uint16_t *y_minimum = cstate->wm.skl.minimum_y_blocks;
+++>>>>>>> 86a2100a8b96 (drm/i915/gen9: Store plane minimum blocks in CRTC wm state (v2))
+  	unsigned int total_data_rate;
+ +	int plane;
+  
+ -	skl_ddb_get_pipe_allocation_limits(dev, cstate, config, alloc);
+ +	skl_ddb_get_pipe_allocation_limits(dev, crtc, config, params, alloc);
+  	alloc_size = skl_ddb_entry_size(alloc);
+  	if (alloc_size == 0) {
+  		memset(ddb->plane[pipe], 0, sizeof(ddb->plane[pipe]));
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
