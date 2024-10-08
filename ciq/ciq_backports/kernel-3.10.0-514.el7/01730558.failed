@@ -1,0 +1,291 @@
+mmc: dw_mmc: Support voltage changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Doug Anderson <dianders@chromium.org>
+commit 0173055842cd1d9ed3984e70891c22dbf2f29372
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/01730558.failed
+
+For UHS cards we need the ability to switch voltages from 3.3V to
+1.8V.  Add support to the dw_mmc driver to handle this.  Note that
+dw_mmc needs a little bit of extra code since the interface needs a
+special bit programmed to the CMD register while CMD11 is progressing.
+This means adding a few extra states to the state machine to track.
+
+	Signed-off-by: Doug Anderson <dianders@chromium.org>
+	Signed-off-by: Yuvaraj Kumar C D <yuvaraj.cd@samsung.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 0173055842cd1d9ed3984e70891c22dbf2f29372)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/dw_mmc.c
+#	drivers/mmc/host/dw_mmc.h
+diff --cc drivers/mmc/host/dw_mmc.c
+index 1add727a3cc5,23719249182b..000000000000
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@@ -29,6 -29,8 +29,11 @@@
+  #include <linux/irq.h>
+  #include <linux/mmc/host.h>
+  #include <linux/mmc/mmc.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/mmc/sd.h>
++ #include <linux/mmc/sdio.h>
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  #include <linux/mmc/dw_mmc.h>
+  #include <linux/bitops.h>
+  #include <linux/regulator/consumer.h>
+@@@ -228,11 -235,7 +233,15 @@@ err
+  }
+  #endif /* defined(CONFIG_DEBUG_FS) */
+  
+++<<<<<<< HEAD
+ +static void dw_mci_set_timeout(struct dw_mci *host)
+ +{
+ +	/* timeout (maximum) */
+ +	mci_writel(host, TMOUT, 0xffffffff);
+ +}
+++=======
++ static void mci_send_cmd(struct dw_mci_slot *slot, u32 cmd, u32 arg);
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  
+  static u32 dw_mci_prepare_command(struct mmc_host *mmc, struct mmc_command *cmd)
+  {
+@@@ -244,11 -248,43 +254,39 @@@
+  
+  	cmdr = cmd->opcode;
+  
+ -	if (cmd->opcode == MMC_STOP_TRANSMISSION ||
+ -	    cmd->opcode == MMC_GO_IDLE_STATE ||
+ -	    cmd->opcode == MMC_GO_INACTIVE_STATE ||
+ -	    (cmd->opcode == SD_IO_RW_DIRECT &&
+ -	     ((cmd->arg >> 9) & 0x1FFFF) == SDIO_CCCR_ABORT))
+ +	if (cmdr == MMC_STOP_TRANSMISSION)
+  		cmdr |= SDMMC_CMD_STOP;
+ -	else if (cmd->opcode != MMC_SEND_STATUS && cmd->data)
+ +	else
+  		cmdr |= SDMMC_CMD_PRV_DAT_WAIT;
+  
++ 	if (cmd->opcode == SD_SWITCH_VOLTAGE) {
++ 		u32 clk_en_a;
++ 
++ 		/* Special bit makes CMD11 not die */
++ 		cmdr |= SDMMC_CMD_VOLT_SWITCH;
++ 
++ 		/* Change state to continue to handle CMD11 weirdness */
++ 		WARN_ON(slot->host->state != STATE_SENDING_CMD);
++ 		slot->host->state = STATE_SENDING_CMD11;
++ 
++ 		/*
++ 		 * We need to disable low power mode (automatic clock stop)
++ 		 * while doing voltage switch so we don't confuse the card,
++ 		 * since stopping the clock is a specific part of the UHS
++ 		 * voltage change dance.
++ 		 *
++ 		 * Note that low power mode (SDMMC_CLKEN_LOW_PWR) will be
++ 		 * unconditionally turned back on in dw_mci_setup_bus() if it's
++ 		 * ever called with a non-zero clock.  That shouldn't happen
++ 		 * until the voltage change is all done.
++ 		 */
++ 		clk_en_a = mci_readl(host, CLKENA);
++ 		clk_en_a &= ~(SDMMC_CLKEN_LOW_PWR << slot->id);
++ 		mci_writel(host, CLKENA, clk_en_a);
++ 		mci_send_cmd(slot, SDMMC_CMD_UPD_CLK |
++ 			     SDMMC_CMD_PRV_DAT_WAIT, 0);
++ 	}
++ 
+  	if (cmd->flags & MMC_RSP_PRESENT) {
+  		/* We expect a response, so set this bit */
+  		cmdr |= SDMMC_CMD_RESP_EXP;
+@@@ -723,12 -804,21 +761,26 @@@ static void mci_send_cmd(struct dw_mci_
+  static void dw_mci_setup_bus(struct dw_mci_slot *slot, bool force_clkinit)
+  {
+  	struct dw_mci *host = slot->host;
+ -	unsigned int clock = slot->clock;
+  	u32 div;
+  	u32 clk_en_a;
++ 	u32 sdmmc_cmd_bits = SDMMC_CMD_UPD_CLK | SDMMC_CMD_PRV_DAT_WAIT;
++ 
++ 	/* We must continue to set bit 28 in CMD until the change is complete */
++ 	if (host->state == STATE_WAITING_CMD11_DONE)
++ 		sdmmc_cmd_bits |= SDMMC_CMD_VOLT_SWITCH;
+  
+++<<<<<<< HEAD
+ +	if (slot->clock != host->current_speed || force_clkinit) {
+ +		div = host->bus_hz / slot->clock;
+ +		if (host->bus_hz % slot->clock && host->bus_hz > slot->clock)
+++=======
++ 	if (!clock) {
++ 		mci_writel(host, CLKENA, 0);
++ 		mci_send_cmd(slot, sdmmc_cmd_bits, 0);
++ 	} else if (clock != host->current_speed || force_clkinit) {
++ 		div = host->bus_hz / clock;
++ 		if (host->bus_hz % clock && host->bus_hz > clock)
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  			/*
+  			 * move the + 1 after the divide to prevent
+  			 * over-clocking the card.
+@@@ -764,12 -854,14 +814,11 @@@
+  		mci_writel(host, CLKENA, clk_en_a);
+  
+  		/* inform CIU */
+- 		mci_send_cmd(slot,
+- 			     SDMMC_CMD_UPD_CLK | SDMMC_CMD_PRV_DAT_WAIT, 0);
++ 		mci_send_cmd(slot, sdmmc_cmd_bits, 0);
+  
+ -		/* keep the clock with reflecting clock dividor */
+ -		slot->__clk_old = clock << div;
+ +		host->current_speed = slot->clock;
+  	}
+  
+ -	host->current_speed = clock;
+ -
+  	/* Set the current slot bus width */
+  	mci_writel(host, CTYPE, (slot->ctype << slot->id));
+  }
+@@@ -913,12 -1017,30 +973,15 @@@ static void dw_mci_set_ios(struct mmc_h
+  	/* Slot specific timing and width adjustment */
+  	dw_mci_setup_bus(slot, false);
+  
++ 	if (slot->host->state == STATE_WAITING_CMD11_DONE && ios->clock != 0)
++ 		slot->host->state = STATE_IDLE;
++ 
+  	switch (ios->power_mode) {
+  	case MMC_POWER_UP:
+ -		if (!IS_ERR(mmc->supply.vmmc)) {
+ -			ret = mmc_regulator_set_ocr(mmc, mmc->supply.vmmc,
+ -					ios->vdd);
+ -			if (ret) {
+ -				dev_err(slot->host->dev,
+ -					"failed to enable vmmc regulator\n");
+ -				/*return, if failed turn on vmmc*/
+ -				return;
+ -			}
+ -		}
+ -		if (!IS_ERR(mmc->supply.vqmmc) && !slot->host->vqmmc_enabled) {
+ -			ret = regulator_enable(mmc->supply.vqmmc);
+ -			if (ret < 0)
+ -				dev_err(slot->host->dev,
+ -					"failed to enable vqmmc regulator\n");
+ -			else
+ -				slot->host->vqmmc_enabled = true;
+ -		}
+  		set_bit(DW_MMC_CARD_NEED_INIT, &slot->flags);
+ +		/* Power up slot */
+ +		if (slot->host->pdata->setpower)
+ +			slot->host->pdata->setpower(slot->id, mmc->ocr_avail);
+  		regs = mci_readl(slot->host, PWREN);
+  		regs |= (1 << slot->id);
+  		mci_writel(slot->host, PWREN, regs);
+@@@ -1040,6 -1257,10 +1156,13 @@@ static const struct mmc_host_ops dw_mci
+  	.get_ro			= dw_mci_get_ro,
+  	.get_cd			= dw_mci_get_cd,
+  	.enable_sdio_irq	= dw_mci_enable_sdio_irq,
+++<<<<<<< HEAD
+++=======
++ 	.execute_tuning		= dw_mci_execute_tuning,
++ 	.card_busy		= dw_mci_card_busy,
++ 	.start_signal_voltage_switch = dw_mci_switch_voltage,
++ 
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  };
+  
+  static void dw_mci_request_end(struct dw_mci *host, struct mmc_request *mrq)
+@@@ -1694,16 -1992,23 +1823,25 @@@ static irqreturn_t dw_mci_interrupt(in
+  
+  	pending = mci_readl(host, MINTSTS); /* read-only mask reg */
+  
+ -	/*
+ -	 * DTO fix - version 2.10a and below, and only if internal DMA
+ -	 * is configured.
+ -	 */
+ -	if (host->quirks & DW_MCI_QUIRK_IDMAC_DTO) {
+ -		if (!pending &&
+ -		    ((mci_readl(host, STATUS) >> 17) & 0x1fff))
+ -			pending |= SDMMC_INT_DATA_OVER;
+ -	}
+ -
+  	if (pending) {
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * DTO fix - version 2.10a and below, and only if internal DMA
+ +		 * is configured.
+ +		 */
+ +		if (host->quirks & DW_MCI_QUIRK_IDMAC_DTO) {
+ +			if (!pending &&
+ +			    ((mci_readl(host, STATUS) >> 17) & 0x1fff))
+ +				pending |= SDMMC_INT_DATA_OVER;
+++=======
++ 		/* Check volt switch first, since it can look like an error */
++ 		if ((host->state == STATE_SENDING_CMD11) &&
++ 		    (pending & SDMMC_INT_VOLT_SWITCH)) {
++ 			mci_writel(host, RINTSTS, SDMMC_INT_VOLT_SWITCH);
++ 			pending &= ~SDMMC_INT_VOLT_SWITCH;
++ 			dw_mci_cmd_interrupt(host, pending);
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  		}
+  
+  		if (pending & DW_MCI_CMD_ERROR_FLAGS) {
+diff --cc drivers/mmc/host/dw_mmc.h
+index f894414bb248,01b99e8a9190..000000000000
+--- a/drivers/mmc/host/dw_mmc.h
++++ b/drivers/mmc/host/dw_mmc.h
+@@@ -99,7 -99,8 +99,12 @@@
+  #define SDMMC_INT_HLE			BIT(12)
+  #define SDMMC_INT_FRUN			BIT(11)
+  #define SDMMC_INT_HTO			BIT(10)
+++<<<<<<< HEAD
+ +#define SDMMC_INT_DTO			BIT(9)
+++=======
++ #define SDMMC_INT_VOLT_SWITCH		BIT(10) /* overloads bit 10! */
++ #define SDMMC_INT_DRTO			BIT(9)
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  #define SDMMC_INT_RTO			BIT(8)
+  #define SDMMC_INT_DCRC			BIT(7)
+  #define SDMMC_INT_RCRC			BIT(6)
+@@@ -129,6 -131,8 +135,11 @@@
+  #define SDMMC_CMD_INDX(n)		((n) & 0x1F)
+  /* Status register defines */
+  #define SDMMC_GET_FCNT(x)		(((x)>>17) & 0x1FFF)
+++<<<<<<< HEAD
+++=======
++ #define SDMMC_STATUS_DMA_REQ		BIT(31)
++ #define SDMMC_STATUS_BUSY		BIT(9)
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  /* FIFOTH register defines */
+  #define SDMMC_SET_FIFOTH(m, r, t)	(((m) & 0x7) << 28 | \
+  					 ((r) & 0xFFF) << 16 | \
+@@@ -149,6 -153,10 +160,13 @@@
+  #define SDMMC_GET_VERID(x)		((x) & 0xFFFF)
+  /* Card read threshold */
+  #define SDMMC_SET_RD_THLD(v, x)		(((v) & 0x1FFF) << 16 | (x))
+++<<<<<<< HEAD
+++=======
++ #define SDMMC_UHS_18V			BIT(0)
++ /* All ctrl reset bits */
++ #define SDMMC_CTRL_ALL_RESET_FLAGS \
++ 	(SDMMC_CTRL_RESET | SDMMC_CTRL_FIFO_RESET | SDMMC_CTRL_DMA_RESET)
+++>>>>>>> 0173055842cd (mmc: dw_mmc: Support voltage changes)
+  
+  /* Register access macros */
+  #define mci_readl(dev, reg)			\
+* Unmerged path drivers/mmc/host/dw_mmc.c
+* Unmerged path drivers/mmc/host/dw_mmc.h
+diff --git a/include/linux/mmc/dw_mmc.h b/include/linux/mmc/dw_mmc.h
+index a578603b514c..42955bacc28a 100644
+--- a/include/linux/mmc/dw_mmc.h
++++ b/include/linux/mmc/dw_mmc.h
+@@ -25,6 +25,8 @@ enum dw_mci_state {
+ 	STATE_DATA_BUSY,
+ 	STATE_SENDING_STOP,
+ 	STATE_DATA_ERROR,
++	STATE_SENDING_CMD11,
++	STATE_WAITING_CMD11_DONE,
+ };
+ 
+ enum {
