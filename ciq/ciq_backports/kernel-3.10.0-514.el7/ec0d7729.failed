@@ -1,0 +1,176 @@
+perf: Add ITRACE_START record to indicate that tracing has started
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Shishkin <alexander.shishkin@linux.intel.com>
+commit ec0d7729bbaed4b9d2d3fada693278e13a3d1368
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ec0d7729.failed
+
+For counters that generate AUX data that is bound to the context of a
+running task, such as instruction tracing, the decoder needs to know
+exactly which task is running when the event is first scheduled in,
+before the first sched_switch. The decoder's need to know this stems
+from the fact that instruction flow trace decoding will almost always
+require program's object code in order to reconstruct said flow and
+for that we need at least its pid/tid in the perf stream.
+
+To single out such instruction tracing pmus, this patch introduces
+ITRACE PMU capability. The reason this is not part of RECORD_AUX
+record is that not all pmus capable of generating AUX data need this,
+and the opposite is *probably* also true.
+
+While sched_switch covers for most cases, there are two problems with it:
+the consumer will need to process events out of order (that is, having
+found RECORD_AUX, it will have to skip forward to the nearest sched_switch
+to figure out which task it was, then go back to the actual trace to
+decode it) and it completely misses the case when the tracing is enabled
+and disabled before sched_switch, for example, via PERF_EVENT_IOC_DISABLE.
+
+	Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Kaixu Xia <kaixu.xia@linaro.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Robert Richter <rric@kernel.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: acme@infradead.org
+	Cc: adrian.hunter@intel.com
+	Cc: kan.liang@intel.com
+	Cc: markus.t.metzger@intel.com
+	Cc: mathieu.poirier@linaro.org
+Link: http://lkml.kernel.org/r/1421237903-181015-15-git-send-email-alexander.shishkin@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ec0d7729bbaed4b9d2d3fada693278e13a3d1368)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+diff --cc include/linux/perf_event.h
+index 97ec7d6d934a,61992cf2e977..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -157,7 -129,9 +157,13 @@@ struct hw_perf_event 
+  			struct list_head	cqm_groups_entry;
+  			struct list_head	cqm_group_entry;
+  		};
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 		struct { /* itrace */
++ 			int			itrace_started;
++ 		};
+++>>>>>>> ec0d7729bbae (perf: Add ITRACE_START record to indicate that tracing has started)
+  #ifdef CONFIG_HAVE_HW_BREAKPOINT
+  		struct { /* breakpoint */
+  			/*
+@@@ -205,6 -176,11 +211,14 @@@ struct perf_event
+   * pmu::capabilities flags
+   */
+  #define PERF_PMU_CAP_NO_INTERRUPT		0x01
+++<<<<<<< HEAD
+++=======
++ #define PERF_PMU_CAP_NO_NMI			0x02
++ #define PERF_PMU_CAP_AUX_NO_SG			0x04
++ #define PERF_PMU_CAP_AUX_SW_DOUBLEBUF		0x08
++ #define PERF_PMU_CAP_EXCLUSIVE			0x10
++ #define PERF_PMU_CAP_ITRACE			0x20
+++>>>>>>> ec0d7729bbae (perf: Add ITRACE_START record to indicate that tracing has started)
+  
+  /**
+   * struct pmu - generic performance monitoring unit
+* Unmerged path include/linux/perf_event.h
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index 31428ba83f05..8d6a049c485c 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -772,6 +772,17 @@ enum perf_event_type {
+ 	 */
+ 	PERF_RECORD_AUX				= 11,
+ 
++	/*
++	 * Indicates that instruction trace has started
++	 *
++	 * struct {
++	 *	struct perf_event_header	header;
++	 *	u32				pid;
++	 *	u32				tid;
++	 * };
++	 */
++	PERF_RECORD_ITRACE_START		= 12,
++
+ 	PERF_RECORD_MAX,			/* non-ABI */
+ };
+ 
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index c71870e24d1d..d264357d2230 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -1833,6 +1833,7 @@ static void perf_set_shadow_time(struct perf_event *event,
+ #define MAX_INTERRUPTS (~0ULL)
+ 
+ static void perf_log_throttle(struct perf_event *event, int enable);
++static void perf_log_itrace_start(struct perf_event *event);
+ 
+ static int
+ event_sched_in(struct perf_event *event,
+@@ -1871,6 +1872,8 @@ event_sched_in(struct perf_event *event,
+ 
+ 	perf_set_shadow_time(event, ctx, tstamp);
+ 
++	perf_log_itrace_start(event);
++
+ 	if (event->pmu->add(event, PERF_EF_START)) {
+ 		event->state = PERF_EVENT_STATE_INACTIVE;
+ 		event->oncpu = -1;
+@@ -5791,6 +5794,44 @@ static void perf_log_throttle(struct perf_event *event, int enable)
+ 	perf_output_end(&handle);
+ }
+ 
++static void perf_log_itrace_start(struct perf_event *event)
++{
++	struct perf_output_handle handle;
++	struct perf_sample_data sample;
++	struct perf_aux_event {
++		struct perf_event_header        header;
++		u32				pid;
++		u32				tid;
++	} rec;
++	int ret;
++
++	if (event->parent)
++		event = event->parent;
++
++	if (!(event->pmu->capabilities & PERF_PMU_CAP_ITRACE) ||
++	    event->hw.itrace_started)
++		return;
++
++	event->hw.itrace_started = 1;
++
++	rec.header.type	= PERF_RECORD_ITRACE_START;
++	rec.header.misc	= 0;
++	rec.header.size	= sizeof(rec);
++	rec.pid	= perf_event_pid(event, current);
++	rec.tid	= perf_event_tid(event, current);
++
++	perf_event_header__init_id(&rec.header, &sample, event);
++	ret = perf_output_begin(&handle, event, rec.header.size);
++
++	if (ret)
++		return;
++
++	perf_output_put(&handle, rec);
++	perf_event__output_id_sample(event, &handle, &sample);
++
++	perf_output_end(&handle);
++}
++
+ /*
+  * Generic event overflow handling, sampling.
+  */
