@@ -1,0 +1,460 @@
+netfilter: conntrack: seperate expect locking from nf_conntrack_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit ca7433df3a672efc88e08222cfa4b3aa965ca324
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ca7433df.failed
+
+Netfilter expectations are protected with the same lock as conntrack
+entries (nf_conntrack_lock).  This patch split out expectations locking
+to use it's own lock (nf_conntrack_expect_lock).
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+	Reviewed-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit ca7433df3a672efc88e08222cfa4b3aa965ca324)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_helper.c
+diff --cc net/netfilter/nf_conntrack_helper.c
+index 21b7afa27567,29bd704edb85..000000000000
+--- a/net/netfilter/nf_conntrack_helper.c
++++ b/net/netfilter/nf_conntrack_helper.c
+@@@ -388,8 -394,10 +386,9 @@@ static void __nf_conntrack_helper_unreg
+  	const struct hlist_node *next;
+  	const struct hlist_nulls_node *nn;
+  	unsigned int i;
+ -	int cpu;
+  
+  	/* Get rid of expectations */
++ 	spin_lock_bh(&nf_conntrack_expect_lock);
+  	for (i = 0; i < nf_ct_expect_hsize; i++) {
+  		hlist_for_each_entry_safe(exp, next,
+  					  &net->ct.expect_hash[i], hnode) {
+@@@ -404,10 -412,18 +403,23 @@@
+  			}
+  		}
+  	}
++ 	spin_unlock_bh(&nf_conntrack_expect_lock);
+  
+  	/* Get rid of expecteds, set helpers to NULL. */
+++<<<<<<< HEAD
+ +	hlist_nulls_for_each_entry(h, nn, &net->ct.unconfirmed, hnnode)
+ +		unhelp(h, me);
+++=======
++ 	for_each_possible_cpu(cpu) {
++ 		struct ct_pcpu *pcpu = per_cpu_ptr(net->ct.pcpu_lists, cpu);
++ 
++ 		spin_lock_bh(&pcpu->lock);
++ 		hlist_nulls_for_each_entry(h, nn, &pcpu->unconfirmed, hnnode)
++ 			unhelp(h, me);
++ 		spin_unlock_bh(&pcpu->lock);
++ 	}
++ 	spin_lock_bh(&nf_conntrack_lock);
+++>>>>>>> ca7433df3a67 (netfilter: conntrack: seperate expect locking from nf_conntrack_lock)
+  	for (i = 0; i < net->ct.htable_size; i++) {
+  		hlist_nulls_for_each_entry(h, nn, &net->ct.hash[i], hnnode)
+  			unhelp(h, me);
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index fb2b6234e937..be25e7c44f39 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -86,4 +86,6 @@ print_tuple(struct seq_file *s, const struct nf_conntrack_tuple *tuple,
+ 
+ extern spinlock_t nf_conntrack_lock ;
+ 
++extern spinlock_t nf_conntrack_expect_lock;
++
+ #endif /* _NF_CONNTRACK_CORE_H */
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index b89f9c1c5b7a..957f9909a4ff 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -69,6 +69,9 @@ EXPORT_SYMBOL_GPL(nf_nat_seq_adjust_hook);
+ DEFINE_SPINLOCK(nf_conntrack_lock);
+ EXPORT_SYMBOL_GPL(nf_conntrack_lock);
+ 
++__cacheline_aligned_in_smp DEFINE_SPINLOCK(nf_conntrack_expect_lock);
++EXPORT_SYMBOL_GPL(nf_conntrack_expect_lock);
++
+ unsigned int nf_conntrack_htable_size __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_conntrack_htable_size);
+ 
+@@ -209,9 +212,6 @@ destroy_conntrack(struct nf_conntrack *nfct)
+ 	NF_CT_ASSERT(atomic_read(&nfct->use) == 0);
+ 	NF_CT_ASSERT(!timer_pending(&ct->timeout));
+ 
+-	/* To make sure we don't get any weird locking issues here:
+-	 * destroy_conntrack() MUST NOT be called with a write lock
+-	 * to nf_conntrack_lock!!! -HW */
+ 	rcu_read_lock();
+ 	l4proto = __nf_ct_l4proto_find(nf_ct_l3num(ct), nf_ct_protonum(ct));
+ 	if (l4proto && l4proto->destroy)
+@@ -219,11 +219,12 @@ destroy_conntrack(struct nf_conntrack *nfct)
+ 
+ 	rcu_read_unlock();
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
++	local_bh_disable();
+ 	/* Expectations will have been removed in clean_from_lists,
+ 	 * except TFTP can create an expectation on the first packet,
+ 	 * before connection is in the list, so we need to clean here,
+-	 * too. */
++	 * too.
++	 */
+ 	nf_ct_remove_expectations(ct);
+ 
+ 	/* We overload first tuple to link into unconfirmed or dying list.*/
+@@ -231,7 +232,7 @@ destroy_conntrack(struct nf_conntrack *nfct)
+ 	hlist_nulls_del_rcu(&ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode);
+ 
+ 	NF_CT_STAT_INC(net, delete);
+-	spin_unlock_bh(&nf_conntrack_lock);
++	local_bh_enable();
+ 
+ 	if (ct->master)
+ 		nf_ct_put(ct->master);
+@@ -820,7 +821,7 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
+ 	struct nf_conn_help *help;
+ 	struct nf_conntrack_tuple repl_tuple;
+ 	struct nf_conntrack_ecache *ecache;
+-	struct nf_conntrack_expect *exp;
++	struct nf_conntrack_expect *exp = NULL;
+ 	u16 zone = tmpl ? nf_ct_zone(tmpl) : NF_CT_DEFAULT_ZONE;
+ 	struct nf_conn_timeout *timeout_ext;
+ 	unsigned int *timeouts;
+@@ -864,30 +865,35 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
+ 				 ecache ? ecache->expmask : 0,
+ 			     GFP_ATOMIC);
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
+-	exp = nf_ct_find_expectation(net, zone, tuple);
+-	if (exp) {
+-		pr_debug("conntrack: expectation arrives ct=%p exp=%p\n",
+-			 ct, exp);
+-		/* Welcome, Mr. Bond.  We've been expecting you... */
+-		__set_bit(IPS_EXPECTED_BIT, &ct->status);
+-		/* exp->master safe, refcnt bumped in nf_ct_find_expectation */
+-		ct->master = exp->master;
+-		if (exp->helper) {
+-			help = nf_ct_helper_ext_add(ct, exp->helper,
+-						    GFP_ATOMIC);
+-			if (help)
+-				rcu_assign_pointer(help->helper, exp->helper);
+-		}
++	local_bh_disable();
++	if (net->ct.expect_count) {
++		spin_lock(&nf_conntrack_expect_lock);
++		exp = nf_ct_find_expectation(net, zone, tuple);
++		if (exp) {
++			pr_debug("conntrack: expectation arrives ct=%p exp=%p\n",
++				 ct, exp);
++			/* Welcome, Mr. Bond.  We've been expecting you... */
++			__set_bit(IPS_EXPECTED_BIT, &ct->status);
++			/* exp->master safe, refcnt bumped in nf_ct_find_expectation */
++			ct->master = exp->master;
++			if (exp->helper) {
++				help = nf_ct_helper_ext_add(ct, exp->helper,
++							    GFP_ATOMIC);
++				if (help)
++					rcu_assign_pointer(help->helper, exp->helper);
++			}
+ 
+ #ifdef CONFIG_NF_CONNTRACK_MARK
+-		ct->mark = exp->master->mark;
++			ct->mark = exp->master->mark;
+ #endif
+ #ifdef CONFIG_NF_CONNTRACK_SECMARK
+-		ct->secmark = exp->master->secmark;
++			ct->secmark = exp->master->secmark;
+ #endif
+-		NF_CT_STAT_INC(net, expect_new);
+-	} else {
++			NF_CT_STAT_INC(net, expect_new);
++		}
++		spin_unlock(&nf_conntrack_expect_lock);
++	}
++	if (!exp) {
+ 		__nf_ct_try_assign_helper(ct, tmpl, GFP_ATOMIC);
+ 		NF_CT_STAT_INC(net, new);
+ 	}
+@@ -899,7 +905,7 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
+ 	hlist_nulls_add_head_rcu(&ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode,
+ 		       &net->ct.unconfirmed);
+ 
+-	spin_unlock_bh(&nf_conntrack_lock);
++	local_bh_enable();
+ 
+ 	if (exp) {
+ 		if (exp->expectfn)
+diff --git a/net/netfilter/nf_conntrack_expect.c b/net/netfilter/nf_conntrack_expect.c
+index f02805e0c7c5..f87e8f68ad45 100644
+--- a/net/netfilter/nf_conntrack_expect.c
++++ b/net/netfilter/nf_conntrack_expect.c
+@@ -66,9 +66,9 @@ static void nf_ct_expectation_timed_out(unsigned long ul_expect)
+ {
+ 	struct nf_conntrack_expect *exp = (void *)ul_expect;
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	nf_ct_unlink_expect(exp);
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ 	nf_ct_expect_put(exp);
+ }
+ 
+@@ -191,12 +191,14 @@ void nf_ct_remove_expectations(struct nf_conn *ct)
+ 	if (!help)
+ 		return;
+ 
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	hlist_for_each_entry_safe(exp, next, &help->expectations, lnode) {
+ 		if (del_timer(&exp->timeout)) {
+ 			nf_ct_unlink_expect(exp);
+ 			nf_ct_expect_put(exp);
+ 		}
+ 	}
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_remove_expectations);
+ 
+@@ -231,12 +233,12 @@ static inline int expect_matches(const struct nf_conntrack_expect *a,
+ /* Generally a bad idea to call this: could have matched already. */
+ void nf_ct_unexpect_related(struct nf_conntrack_expect *exp)
+ {
+-	spin_lock_bh(&nf_conntrack_lock);
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	if (del_timer(&exp->timeout)) {
+ 		nf_ct_unlink_expect(exp);
+ 		nf_ct_expect_put(exp);
+ 	}
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_unexpect_related);
+ 
+@@ -349,7 +351,7 @@ static int nf_ct_expect_insert(struct nf_conntrack_expect *exp)
+ 	setup_timer(&exp->timeout, nf_ct_expectation_timed_out,
+ 		    (unsigned long)exp);
+ 	helper = rcu_dereference_protected(master_help->helper,
+-					   lockdep_is_held(&nf_conntrack_lock));
++					   lockdep_is_held(&nf_conntrack_expect_lock));
+ 	if (helper) {
+ 		exp->timeout.expires = jiffies +
+ 			helper->expect_policy[exp->class].timeout * HZ;
+@@ -409,7 +411,7 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect)
+ 	}
+ 	/* Will be over limit? */
+ 	helper = rcu_dereference_protected(master_help->helper,
+-					   lockdep_is_held(&nf_conntrack_lock));
++					   lockdep_is_held(&nf_conntrack_expect_lock));
+ 	if (helper) {
+ 		p = &helper->expect_policy[expect->class];
+ 		if (p->max_expected &&
+@@ -436,7 +438,7 @@ int nf_ct_expect_related_report(struct nf_conntrack_expect *expect,
+ {
+ 	int ret;
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	ret = __nf_ct_expect_check(expect);
+ 	if (ret <= 0)
+ 		goto out;
+@@ -444,11 +446,11 @@ int nf_ct_expect_related_report(struct nf_conntrack_expect *expect,
+ 	ret = nf_ct_expect_insert(expect);
+ 	if (ret < 0)
+ 		goto out;
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ 	nf_ct_expect_event_report(IPEXP_NEW, expect, portid, report);
+ 	return ret;
+ out:
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_related_report);
+diff --git a/net/netfilter/nf_conntrack_h323_main.c b/net/netfilter/nf_conntrack_h323_main.c
+index 70866d192efc..3a3a60b126e0 100644
+--- a/net/netfilter/nf_conntrack_h323_main.c
++++ b/net/netfilter/nf_conntrack_h323_main.c
+@@ -1476,7 +1476,7 @@ static int process_rcf(struct sk_buff *skb, struct nf_conn *ct,
+ 		nf_ct_refresh(ct, skb, info->timeout * HZ);
+ 
+ 		/* Set expect timeout */
+-		spin_lock_bh(&nf_conntrack_lock);
++		spin_lock_bh(&nf_conntrack_expect_lock);
+ 		exp = find_expect(ct, &ct->tuplehash[dir].tuple.dst.u3,
+ 				  info->sig_port[!dir]);
+ 		if (exp) {
+@@ -1486,7 +1486,7 @@ static int process_rcf(struct sk_buff *skb, struct nf_conn *ct,
+ 			nf_ct_dump_tuple(&exp->tuple);
+ 			set_expect_timeout(exp, info->timeout);
+ 		}
+-		spin_unlock_bh(&nf_conntrack_lock);
++		spin_unlock_bh(&nf_conntrack_expect_lock);
+ 	}
+ 
+ 	return 0;
+* Unmerged path net/netfilter/nf_conntrack_helper.c
+diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
+index 45b335fdc999..8539b9707632 100644
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -1363,14 +1363,14 @@ ctnetlink_change_helper(struct nf_conn *ct, const struct nlattr * const cda[])
+ 					    nf_ct_protonum(ct));
+ 	if (helper == NULL) {
+ #ifdef CONFIG_MODULES
+-		spin_unlock_bh(&nf_conntrack_lock);
++		spin_unlock_bh(&nf_conntrack_expect_lock);
+ 
+ 		if (request_module("nfct-helper-%s", helpname) < 0) {
+-			spin_lock_bh(&nf_conntrack_lock);
++			spin_lock_bh(&nf_conntrack_expect_lock);
+ 			return -EOPNOTSUPP;
+ 		}
+ 
+-		spin_lock_bh(&nf_conntrack_lock);
++		spin_lock_bh(&nf_conntrack_expect_lock);
+ 		helper = __nf_conntrack_helper_find(helpname, nf_ct_l3num(ct),
+ 						    nf_ct_protonum(ct));
+ 		if (helper)
+@@ -1806,9 +1806,9 @@ ctnetlink_new_conntrack(struct sock *ctnl, struct sk_buff *skb,
+ 	err = -EEXIST;
+ 	ct = nf_ct_tuplehash_to_ctrack(h);
+ 	if (!(nlh->nlmsg_flags & NLM_F_EXCL)) {
+-		spin_lock_bh(&nf_conntrack_lock);
++		spin_lock_bh(&nf_conntrack_expect_lock);
+ 		err = ctnetlink_change_conntrack(ct, cda);
+-		spin_unlock_bh(&nf_conntrack_lock);
++		spin_unlock_bh(&nf_conntrack_expect_lock);
+ 		if (err == 0) {
+ 			nf_conntrack_eventmask_report((1 << IPCT_REPLY) |
+ 						      (1 << IPCT_ASSURED) |
+@@ -2129,9 +2129,9 @@ ctnetlink_nfqueue_parse(const struct nlattr *attr, struct nf_conn *ct)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	ret = ctnetlink_nfqueue_parse_ct((const struct nlattr **)cda, ct);
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ 
+ 	return ret;
+ }
+@@ -2686,13 +2686,13 @@ ctnetlink_del_expect(struct sock *ctnl, struct sk_buff *skb,
+ 		}
+ 
+ 		/* after list removal, usage count == 1 */
+-		spin_lock_bh(&nf_conntrack_lock);
++		spin_lock_bh(&nf_conntrack_expect_lock);
+ 		if (del_timer(&exp->timeout)) {
+ 			nf_ct_unlink_expect_report(exp, NETLINK_CB(skb).portid,
+ 						   nlmsg_report(nlh));
+ 			nf_ct_expect_put(exp);
+ 		}
+-		spin_unlock_bh(&nf_conntrack_lock);
++		spin_unlock_bh(&nf_conntrack_expect_lock);
+ 		/* have to put what we 'get' above.
+ 		 * after this line usage count == 0 */
+ 		nf_ct_expect_put(exp);
+@@ -2701,7 +2701,7 @@ ctnetlink_del_expect(struct sock *ctnl, struct sk_buff *skb,
+ 		struct nf_conn_help *m_help;
+ 
+ 		/* delete all expectations for this helper */
+-		spin_lock_bh(&nf_conntrack_lock);
++		spin_lock_bh(&nf_conntrack_expect_lock);
+ 		for (i = 0; i < nf_ct_expect_hsize; i++) {
+ 			hlist_for_each_entry_safe(exp, next,
+ 						  &net->ct.expect_hash[i],
+@@ -2716,10 +2716,10 @@ ctnetlink_del_expect(struct sock *ctnl, struct sk_buff *skb,
+ 				}
+ 			}
+ 		}
+-		spin_unlock_bh(&nf_conntrack_lock);
++		spin_unlock_bh(&nf_conntrack_expect_lock);
+ 	} else {
+ 		/* This basically means we have to flush everything*/
+-		spin_lock_bh(&nf_conntrack_lock);
++		spin_lock_bh(&nf_conntrack_expect_lock);
+ 		for (i = 0; i < nf_ct_expect_hsize; i++) {
+ 			hlist_for_each_entry_safe(exp, next,
+ 						  &net->ct.expect_hash[i],
+@@ -2732,7 +2732,7 @@ ctnetlink_del_expect(struct sock *ctnl, struct sk_buff *skb,
+ 				}
+ 			}
+ 		}
+-		spin_unlock_bh(&nf_conntrack_lock);
++		spin_unlock_bh(&nf_conntrack_expect_lock);
+ 	}
+ 
+ 	return 0;
+@@ -2958,11 +2958,11 @@ ctnetlink_new_expect(struct sock *ctnl, struct sk_buff *skb,
+ 	if (err < 0)
+ 		return err;
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	exp = __nf_ct_expect_find(net, zone, &tuple);
+ 
+ 	if (!exp) {
+-		spin_unlock_bh(&nf_conntrack_lock);
++		spin_unlock_bh(&nf_conntrack_expect_lock);
+ 		err = -ENOENT;
+ 		if (nlh->nlmsg_flags & NLM_F_CREATE) {
+ 			err = ctnetlink_create_expect(net, zone, cda,
+@@ -2976,7 +2976,7 @@ ctnetlink_new_expect(struct sock *ctnl, struct sk_buff *skb,
+ 	err = -EEXIST;
+ 	if (!(nlh->nlmsg_flags & NLM_F_EXCL))
+ 		err = ctnetlink_change_expect(exp, cda);
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ 
+ 	return err;
+ }
+diff --git a/net/netfilter/nf_conntrack_sip.c b/net/netfilter/nf_conntrack_sip.c
+index e0c4373b4747..5564de11ec37 100644
+--- a/net/netfilter/nf_conntrack_sip.c
++++ b/net/netfilter/nf_conntrack_sip.c
+@@ -858,7 +858,7 @@ static int refresh_signalling_expectation(struct nf_conn *ct,
+ 	struct hlist_node *next;
+ 	int found = 0;
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	hlist_for_each_entry_safe(exp, next, &help->expectations, lnode) {
+ 		if (exp->class != SIP_EXPECT_SIGNALLING ||
+ 		    !nf_inet_addr_cmp(&exp->tuple.dst.u3, addr) ||
+@@ -873,7 +873,7 @@ static int refresh_signalling_expectation(struct nf_conn *ct,
+ 		found = 1;
+ 		break;
+ 	}
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ 	return found;
+ }
+ 
+@@ -883,7 +883,7 @@ static void flush_expectations(struct nf_conn *ct, bool media)
+ 	struct nf_conntrack_expect *exp;
+ 	struct hlist_node *next;
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
++	spin_lock_bh(&nf_conntrack_expect_lock);
+ 	hlist_for_each_entry_safe(exp, next, &help->expectations, lnode) {
+ 		if ((exp->class != SIP_EXPECT_SIGNALLING) ^ media)
+ 			continue;
+@@ -894,7 +894,7 @@ static void flush_expectations(struct nf_conn *ct, bool media)
+ 		if (!media)
+ 			break;
+ 	}
+-	spin_unlock_bh(&nf_conntrack_lock);
++	spin_unlock_bh(&nf_conntrack_expect_lock);
+ }
+ 
+ static int set_expected_rtp_rtcp(struct sk_buff *skb, unsigned int protoff,
