@@ -1,0 +1,801 @@
+s390/mm: implement software referenced bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] mm: implement software referenced bits (Hendrik Brueckner) [1182320]
+Rebuild_FUZZ: 93.83%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 0944fe3f4a323f436180d39402cae7f9c46ead17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0944fe3f.failed
+
+The last remaining use for the storage key of the s390 architecture
+is reference counting. The alternative is to make page table entries
+invalid while they are old. On access the fault handler marks the
+pte/pmd as young which makes the pte/pmd valid if the access rights
+allow read access. The pte/pmd invalidations required for software
+managed reference bits cost a bit of performance, on the other hand
+the RRBE/RRBM instructions to read and reset the referenced bits are
+quite expensive as well.
+
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 0944fe3f4a323f436180d39402cae7f9c46ead17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pgtable.h
+#	arch/s390/mm/hugetlbpage.c
+#	arch/s390/mm/pgtable.c
+#	arch/s390/mm/vmem.c
+diff --cc arch/s390/include/asm/pgtable.h
+index d80e1657c67e,9f215b40109e..000000000000
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@@ -220,63 -217,57 +220,100 @@@ extern unsigned long MODULES_END
+  
+  /* Hardware bits in the page table entry */
+  #define _PAGE_CO	0x100		/* HW Change-bit override */
+ -#define _PAGE_PROTECT	0x200		/* HW read-only bit  */
+ +#define _PAGE_RO	0x200		/* HW read-only bit  */
+  #define _PAGE_INVALID	0x400		/* HW invalid bit    */
+ -#define _PAGE_LARGE	0x800		/* Bit to mark a large pte */
+  
+  /* Software bits in the page table entry */
+++<<<<<<< HEAD
+ +#define _PAGE_SWT	0x001		/* SW pte type bit t */
+ +#define _PAGE_SWX	0x002		/* SW pte type bit x */
+ +#define _PAGE_SWC	0x004		/* SW pte changed bit */
+ +#define _PAGE_SWR	0x008		/* SW pte referenced bit */
+ +#define _PAGE_SWW	0x010		/* SW pte write bit */
+ +#define _PAGE_SPECIAL	0x020		/* SW associated with special page */
+++=======
++ #define _PAGE_PRESENT	0x001		/* SW pte present bit */
++ #define _PAGE_TYPE	0x002		/* SW pte type bit */
++ #define _PAGE_YOUNG	0x004		/* SW pte young bit */
++ #define _PAGE_DIRTY	0x008		/* SW pte dirty bit */
++ #define _PAGE_READ	0x010		/* SW pte read bit */
++ #define _PAGE_WRITE	0x020		/* SW pte write bit */
++ #define _PAGE_SPECIAL	0x040		/* SW associated with special page */
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  #define __HAVE_ARCH_PTE_SPECIAL
+  
+  /* Set of bits not changed in pte_modify */
+  #define _PAGE_CHG_MASK		(PAGE_MASK | _PAGE_SPECIAL | _PAGE_CO | \
+ -				 _PAGE_DIRTY | _PAGE_YOUNG)
+ +				 _PAGE_SWC | _PAGE_SWR)
+ +
+ +/* Six different types of pages. */
+ +#define _PAGE_TYPE_EMPTY	0x400
+ +#define _PAGE_TYPE_NONE		0x401
+ +#define _PAGE_TYPE_SWAP		0x403
+ +#define _PAGE_TYPE_FILE		0x601	/* bit 0x002 is used for offset !! */
+ +#define _PAGE_TYPE_RO		0x200
+ +#define _PAGE_TYPE_RW		0x000
+  
+  /*
+ - * handle_pte_fault uses pte_present, pte_none and pte_file to find out the
+ - * pte type WITHOUT holding the page table lock. The _PAGE_PRESENT bit
+ - * is used to distinguish present from not-present ptes. It is changed only
+ - * with the page table lock held.
+ + * Only four types for huge pages, using the invalid bit and protection bit
+ + * of a segment table entry.
+ + */
+ +#define _HPAGE_TYPE_EMPTY	0x020	/* _SEGMENT_ENTRY_INV */
+ +#define _HPAGE_TYPE_NONE	0x220
+ +#define _HPAGE_TYPE_RO		0x200	/* _SEGMENT_ENTRY_RO  */
+ +#define _HPAGE_TYPE_RW		0x000
+ +
+ +/*
+ + * PTE type bits are rather complicated. handle_pte_fault uses pte_present,
+ + * pte_none and pte_file to find out the pte type WITHOUT holding the page
+ + * table lock. ptep_clear_flush on the other hand uses ptep_clear_flush to
+ + * invalidate a given pte. ipte sets the hw invalid bit and clears all tlbs
+ + * for the page. The page table entry is set to _PAGE_TYPE_EMPTY afterwards.
+ + * This change is done while holding the lock, but the intermediate step
+ + * of a previously valid pte with the hw invalid bit set can be observed by
+ + * handle_pte_fault. That makes it necessary that all valid pte types with
+ + * the hw invalid bit set must be distinguishable from the four pte types
+ + * empty, none, swap and file.
+   *
+ - * The following table gives the different possible bit combinations for
+ - * the pte hardware and software bits in the last 12 bits of a pte:
+ + *			irxt  ipte  irxt
+ + * _PAGE_TYPE_EMPTY	1000   ->   1000
+ + * _PAGE_TYPE_NONE	1001   ->   1001
+ + * _PAGE_TYPE_SWAP	1011   ->   1011
+ + * _PAGE_TYPE_FILE	11?1   ->   11?1
+ + * _PAGE_TYPE_RO	0100   ->   1100
+ + * _PAGE_TYPE_RW	0000   ->   1000
+   *
+++<<<<<<< HEAD
+ + * pte_none is true for bits combinations 1000, 1010, 1100, 1110
+ + * pte_present is true for bits combinations 0000, 0010, 0100, 0110, 1001
+ + * pte_file is true for bits combinations 1101, 1111
+ + * swap pte is 1011 and 0001, 0011, 0101, 0111 are invalid.
+++=======
++  *				842100000000
++  *				000084210000
++  *				000000008421
++  *				.IR...wrdytp
++  * empty			.10...000000
++  * swap				.10...xxxx10
++  * file				.11...xxxxx0
++  * prot-none, clean, old	.11...000001
++  * prot-none, clean, young	.11...000101
++  * prot-none, dirty, old	.10...001001
++  * prot-none, dirty, young	.10...001101
++  * read-only, clean, old	.11...010001
++  * read-only, clean, young	.01...010101
++  * read-only, dirty, old	.11...011001
++  * read-only, dirty, young	.01...011101
++  * read-write, clean, old	.11...110001
++  * read-write, clean, young	.01...110101
++  * read-write, dirty, old	.10...111001
++  * read-write, dirty, young	.00...111101
++  *
++  * pte_present is true for the bit pattern .xx...xxxxx1, (pte & 0x001) == 0x001
++  * pte_none    is true for the bit pattern .10...xxxx00, (pte & 0x603) == 0x400
++  * pte_file    is true for the bit pattern .11...xxxxx0, (pte & 0x601) == 0x600
++  * pte_swap    is true for the bit pattern .10...xxxx10, (pte & 0x603) == 0x402
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+   */
+  
+  #ifndef CONFIG_64BIT
+@@@ -289,15 -280,26 +326,26 @@@
+  #define _ASCE_TABLE_LENGTH	0x7f	/* 128 x 64 entries = 8k	    */
+  
+  /* Bits in the segment table entry */
++ #define _SEGMENT_ENTRY_BITS	0x7fffffffUL	/* Valid segment table bits */
+  #define _SEGMENT_ENTRY_ORIGIN	0x7fffffc0UL	/* page table origin	    */
+ -#define _SEGMENT_ENTRY_PROTECT	0x200	/* page protection bit		    */
+ -#define _SEGMENT_ENTRY_INVALID	0x20	/* invalid segment table entry	    */
+ +#define _SEGMENT_ENTRY_RO	0x200	/* page protection bit		    */
+ +#define _SEGMENT_ENTRY_INV	0x20	/* invalid segment table entry	    */
+  #define _SEGMENT_ENTRY_COMMON	0x10	/* common segment bit		    */
+  #define _SEGMENT_ENTRY_PTL	0x0f	/* page table length		    */
++ #define _SEGMENT_ENTRY_NONE	_SEGMENT_ENTRY_PROTECT
+  
+  #define _SEGMENT_ENTRY		(_SEGMENT_ENTRY_PTL)
+ -#define _SEGMENT_ENTRY_EMPTY	(_SEGMENT_ENTRY_INVALID)
+ +#define _SEGMENT_ENTRY_EMPTY	(_SEGMENT_ENTRY_INV)
+  
++ /*
++  * Segment table entry encoding (I = invalid, R = read-only bit):
++  *		..R...I.....
++  * prot-none	..1...1.....
++  * read-only	..1...0.....
++  * read-write	..0...0.....
++  * empty	..0...1.....
++  */
++ 
+  /* Page status table bits for virtualization */
+  #define PGSTE_ACC_BITS	0xf0000000UL
+  #define PGSTE_FP_BIT	0x08000000UL
+@@@ -347,18 -347,36 +393,40 @@@
+  #define _REGION3_ENTRY_CO	0x100	/* change-recording override	    */
+  
+  /* Bits in the segment table entry */
++ #define _SEGMENT_ENTRY_BITS	0xfffffffffffffe33UL
++ #define _SEGMENT_ENTRY_BITS_LARGE 0xfffffffffff1ff33UL
+  #define _SEGMENT_ENTRY_ORIGIN_LARGE ~0xfffffUL /* large page address	    */
+  #define _SEGMENT_ENTRY_ORIGIN	~0x7ffUL/* segment table origin		    */
+ -#define _SEGMENT_ENTRY_PROTECT	0x200	/* page protection bit		    */
+ -#define _SEGMENT_ENTRY_INVALID	0x20	/* invalid segment table entry	    */
+ +#define _SEGMENT_ENTRY_RO	0x200	/* page protection bit		    */
+ +#define _SEGMENT_ENTRY_INV	0x20	/* invalid segment table entry	    */
+  
+  #define _SEGMENT_ENTRY		(0)
+ -#define _SEGMENT_ENTRY_EMPTY	(_SEGMENT_ENTRY_INVALID)
+ +#define _SEGMENT_ENTRY_EMPTY	(_SEGMENT_ENTRY_INV)
+  
+  #define _SEGMENT_ENTRY_LARGE	0x400	/* STE-format control, large page   */
+  #define _SEGMENT_ENTRY_CO	0x100	/* change-recording override   */
+++<<<<<<< HEAD
+++=======
++ #define _SEGMENT_ENTRY_SPLIT	0x001	/* THP splitting bit */
++ #define _SEGMENT_ENTRY_YOUNG	0x002	/* SW segment young bit */
++ #define _SEGMENT_ENTRY_NONE	_SEGMENT_ENTRY_YOUNG
++ 
++ /*
++  * Segment table entry encoding (R = read-only, I = invalid, y = young bit):
++  *			..R...I...y.
++  * prot-none, old	..0...1...1.
++  * prot-none, young	..1...1...1.
++  * read-only, old	..1...1...0.
++  * read-only, young	..1...0...1.
++  * read-write, old	..0...1...0.
++  * read-write, young	..0...0...1.
++  * The segment table origin is used to distinguish empty (origin==0) from
++  * read-write, old segment table entries (origin!=0)
++  */
++ 
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  #define _SEGMENT_ENTRY_SPLIT_BIT 0	/* THP splitting bit number */
+ +#define _SEGMENT_ENTRY_SPLIT	(1UL << _SEGMENT_ENTRY_SPLIT_BIT)
+  
+  /* Set of bits not changed in pmd_modify */
+  #define _SEGMENT_CHG_MASK	(_SEGMENT_ENTRY_ORIGIN | _SEGMENT_ENTRY_LARGE \
+@@@ -389,14 -405,18 +455,29 @@@
+  /*
+   * Page protection definitions.
+   */
+++<<<<<<< HEAD
+ +#define PAGE_NONE	__pgprot(_PAGE_TYPE_NONE)
+ +#define PAGE_RO		__pgprot(_PAGE_TYPE_RO)
+ +#define PAGE_RW		__pgprot(_PAGE_TYPE_RO | _PAGE_SWW)
+ +#define PAGE_RWC	__pgprot(_PAGE_TYPE_RW | _PAGE_SWW | _PAGE_SWC)
+ +
+ +#define PAGE_KERNEL	PAGE_RWC
+ +#define PAGE_SHARED	PAGE_KERNEL
+ +#define PAGE_COPY	PAGE_RO
+++=======
++ #define PAGE_NONE	__pgprot(_PAGE_PRESENT | _PAGE_INVALID)
++ #define PAGE_READ	__pgprot(_PAGE_PRESENT | _PAGE_READ | \
++ 				 _PAGE_INVALID | _PAGE_PROTECT)
++ #define PAGE_WRITE	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
++ 				 _PAGE_INVALID | _PAGE_PROTECT)
++ 
++ #define PAGE_SHARED	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
++ 				 _PAGE_YOUNG | _PAGE_DIRTY)
++ #define PAGE_KERNEL	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
++ 				 _PAGE_YOUNG | _PAGE_DIRTY)
++ #define PAGE_KERNEL_RO	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_YOUNG | \
++ 				 _PAGE_PROTECT)
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  
+  /*
+   * On s390 the page table entry has an invalid bit and a read-only bit.
+@@@ -425,15 -445,11 +506,23 @@@
+  /*
+   * Segment entry (large page) protection definitions.
+   */
+++<<<<<<< HEAD
+ +#define SEGMENT_NONE	__pgprot(_HPAGE_TYPE_NONE)
+ +#define SEGMENT_RO	__pgprot(_HPAGE_TYPE_RO)
+ +#define SEGMENT_RW	__pgprot(_HPAGE_TYPE_RW)
+ +
+ +static inline int mm_exclusive(struct mm_struct *mm)
+ +{
+ +	return likely(mm == current->active_mm &&
+ +		      atomic_read(&mm->context.attach_count) <= 1);
+ +}
+++=======
++ #define SEGMENT_NONE	__pgprot(_SEGMENT_ENTRY_INVALID | \
++ 				 _SEGMENT_ENTRY_NONE)
++ #define SEGMENT_READ	__pgprot(_SEGMENT_ENTRY_INVALID | \
++ 				 _SEGMENT_ENTRY_PROTECT)
++ #define SEGMENT_WRITE	__pgprot(_SEGMENT_ENTRY_INVALID)
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  
+  static inline int mm_has_pgste(struct mm_struct *mm)
+  {
+@@@ -544,10 -557,19 +633,24 @@@ static inline int pmd_large(pmd_t pmd
+  #endif
+  }
+  
++ static inline int pmd_prot_none(pmd_t pmd)
++ {
++ 	return (pmd_val(pmd) & _SEGMENT_ENTRY_INVALID) &&
++ 		(pmd_val(pmd) & _SEGMENT_ENTRY_NONE);
++ }
++ 
+  static inline int pmd_bad(pmd_t pmd)
+  {
+++<<<<<<< HEAD
+ +	unsigned long mask = ~_SEGMENT_ENTRY_ORIGIN & ~_SEGMENT_ENTRY_INV;
+ +	return (pmd_val(pmd) & mask) != _SEGMENT_ENTRY;
+++=======
++ #ifdef CONFIG_64BIT
++ 	if (pmd_large(pmd))
++ 		return (pmd_val(pmd) & ~_SEGMENT_ENTRY_BITS_LARGE) != 0;
++ #endif
++ 	return (pmd_val(pmd) & ~_SEGMENT_ENTRY_BITS) != 0;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  }
+  
+  #define __HAVE_ARCH_PMDP_SPLITTING_FLUSH
+@@@ -566,25 -588,33 +669,38 @@@ extern int pmdp_clear_flush_young(struc
+  #define __HAVE_ARCH_PMD_WRITE
+  static inline int pmd_write(pmd_t pmd)
+  {
+++<<<<<<< HEAD
+ +	return (pmd_val(pmd) & _SEGMENT_ENTRY_RO) == 0;
+++=======
++ 	if (pmd_prot_none(pmd))
++ 		return 0;
++ 	return (pmd_val(pmd) & _SEGMENT_ENTRY_PROTECT) == 0;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  }
+  
+  static inline int pmd_young(pmd_t pmd)
+  {
+- 	return 0;
++ 	int young = 0;
++ #ifdef CONFIG_64BIT
++ 	if (pmd_prot_none(pmd))
++ 		young = (pmd_val(pmd) & _SEGMENT_ENTRY_PROTECT) != 0;
++ 	else
++ 		young = (pmd_val(pmd) & _SEGMENT_ENTRY_YOUNG) != 0;
++ #endif
++ 	return young;
+  }
+  
+ -static inline int pte_present(pte_t pte)
+ +static inline int pte_none(pte_t pte)
+  {
+ -	/* Bit pattern: (pte & 0x001) == 0x001 */
+ -	return (pte_val(pte) & _PAGE_PRESENT) != 0;
+ +	return (pte_val(pte) & _PAGE_INVALID) && !(pte_val(pte) & _PAGE_SWT);
+  }
+  
+ -static inline int pte_none(pte_t pte)
+ +static inline int pte_present(pte_t pte)
+  {
+ -	/* Bit pattern: pte == 0x400 */
+ -	return pte_val(pte) == _PAGE_INVALID;
+ +	unsigned long mask = _PAGE_RO | _PAGE_INVALID | _PAGE_SWT | _PAGE_SWX;
+ +	return (pte_val(pte) & mask) == _PAGE_TYPE_NONE ||
+ +		(!(pte_val(pte) & _PAGE_INVALID) &&
+ +		 !(pte_val(pte) & _PAGE_SWT));
+  }
+  
+  static inline int pte_file(pte_t pte)
+@@@ -685,21 -720,8 +796,24 @@@ static inline pgste_t pgste_update_youn
+  	if (pte_val(*ptep) & _PAGE_INVALID)
+  		return pgste;
+  	/* Get referenced bit from storage key */
+++<<<<<<< HEAD
+ +	young = page_reset_referenced(pte_val(*ptep) & PAGE_MASK);
+ +	if (young)
+ +		pgste_val(pgste) |= PGSTE_GR_BIT;
+ +	/* Get host referenced bit from pgste */
+ +	if (pgste_val(pgste) & PGSTE_HR_BIT) {
+ +		pgste_val(pgste) &= ~PGSTE_HR_BIT;
+ +		young = 1;
+ +	}
+ +	/* Transfer referenced bit to kvm user bits and pte */
+ +	if (young) {
+ +		pgste_val(pgste) |= PGSTE_UR_BIT;
+ +		pte_val(*ptep) |= _PAGE_SWR;
+ +	}
+++=======
++ 	if (page_reset_referenced(pte_val(*ptep) & PAGE_MASK))
++ 		pgste_val(pgste) |= PGSTE_HR_BIT | PGSTE_GR_BIT;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  #endif
+  	return pgste;
+  }
+@@@ -854,11 -876,7 +968,15 @@@ static inline int pte_dirty(pte_t pte
+  
+  static inline int pte_young(pte_t pte)
+  {
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PGSTE
+ +	if (pte_val(pte) & _PAGE_SWR)
+ +		return 1;
+ +#endif
+ +	return 0;
+++=======
++ 	return (pte_val(pte) & _PAGE_YOUNG) != 0;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  }
+  
+  /*
+@@@ -899,8 -917,18 +1017,23 @@@ static inline pte_t pte_modify(pte_t pt
+  {
+  	pte_val(pte) &= _PAGE_CHG_MASK;
+  	pte_val(pte) |= pgprot_val(newprot);
+++<<<<<<< HEAD
+ +	if ((pte_val(pte) & _PAGE_SWC) && (pte_val(pte) & _PAGE_SWW))
+ +		pte_val(pte) &= ~_PAGE_RO;
+++=======
++ 	/*
++ 	 * newprot for PAGE_NONE, PAGE_READ and PAGE_WRITE has the
++ 	 * invalid bit set, clear it again for readable, young pages
++ 	 */
++ 	if ((pte_val(pte) & _PAGE_YOUNG) && (pte_val(pte) & _PAGE_READ))
++ 		pte_val(pte) &= ~_PAGE_INVALID;
++ 	/*
++ 	 * newprot for PAGE_READ and PAGE_WRITE has the page protection
++ 	 * bit set, clear it again for writable, dirty pages
++ 	 */
++ 	if ((pte_val(pte) & _PAGE_DIRTY) && (pte_val(pte) & _PAGE_WRITE))
++ 		pte_val(pte) &= ~_PAGE_PROTECT;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  	return pte;
+  }
+  
+@@@ -940,9 -964,8 +1073,14 @@@ static inline pte_t pte_mkdirty(pte_t p
+  
+  static inline pte_t pte_mkold(pte_t pte)
+  {
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PGSTE
+ +	pte_val(pte) &= ~_PAGE_SWR;
+ +#endif
+++=======
++ 	pte_val(pte) &= ~_PAGE_YOUNG;
++ 	pte_val(pte) |= _PAGE_INVALID;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  	return pte;
+  }
+  
+@@@ -1004,6 -1030,34 +1145,36 @@@ static inline int ptep_test_and_clear_u
+  	return young;
+  }
+  
++ static inline void __ptep_ipte(unsigned long address, pte_t *ptep)
++ {
++ 	if (!(pte_val(*ptep) & _PAGE_INVALID)) {
++ #ifndef CONFIG_64BIT
++ 		/* pto must point to the start of the segment table */
++ 		pte_t *pto = (pte_t *) (((unsigned long) ptep) & 0x7ffffc00);
++ #else
++ 		/* ipte in zarch mode can do the math */
++ 		pte_t *pto = ptep;
++ #endif
++ 		asm volatile(
++ 			"	ipte	%2,%3"
++ 			: "=m" (*ptep) : "m" (*ptep),
++ 			  "a" (pto), "a" (address));
++ 	}
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static inline void ptep_flush_lazy(struct mm_struct *mm,
++ 				   unsigned long address, pte_t *ptep)
++ {
++ 	int active = (mm == current->active_mm) ? 1 : 0;
++ 
++ 	if (atomic_read(&mm->context.attach_count) > active)
++ 		__ptep_ipte(address, ptep);
++ 	else
++ 		mm->context.flush_mm = 1;
++ }
++ 
+  #define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+  static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
+  					    unsigned long addr, pte_t *ptep)
+@@@ -1029,27 -1092,6 +1209,7 @@@ static inline int ptep_clear_flush_youn
+  	return ptep_test_and_clear_young(vma, address, ptep);
+  }
+  
+- static inline void __ptep_ipte(unsigned long address, pte_t *ptep)
+- {
+- 	if (!(pte_val(*ptep) & _PAGE_INVALID)) {
+- #ifndef CONFIG_64BIT
+- 		/* pto must point to the start of the segment table */
+- 		pte_t *pto = (pte_t *) (((unsigned long) ptep) & 0x7ffffc00);
+- #else
+- 		/* ipte in zarch mode can do the math */
+- 		pte_t *pto = ptep;
+- #endif
+- 		asm volatile(
+- 			"	ipte	%2,%3"
+- 			: "=m" (*ptep) : "m" (*ptep),
+- 			  "a" (pto), "a" (address));
+- 	}
+- }
+- 
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  /*
+   * This is hard to understand. ptep_get_and_clear and ptep_clear_flush
+   * both clear the TLB for the unmapped pte. The reason is that
+@@@ -1336,15 -1383,46 +1496,46 @@@ static inline unsigned long massage_pgp
+  	 */
+  	if (pgprot_val(pgprot) == pgprot_val(PAGE_NONE))
+  		return pgprot_val(SEGMENT_NONE);
+ -	if (pgprot_val(pgprot) == pgprot_val(PAGE_READ))
+ -		return pgprot_val(SEGMENT_READ);
+ -	return pgprot_val(SEGMENT_WRITE);
+ +	if (pgprot_val(pgprot) == pgprot_val(PAGE_RO))
+ +		return pgprot_val(SEGMENT_RO);
+ +	return pgprot_val(SEGMENT_RW);
+  }
+  
++ static inline pmd_t pmd_mkyoung(pmd_t pmd)
++ {
++ #ifdef CONFIG_64BIT
++ 	if (pmd_prot_none(pmd)) {
++ 		pmd_val(pmd) |= _SEGMENT_ENTRY_PROTECT;
++ 	} else {
++ 		pmd_val(pmd) |= _SEGMENT_ENTRY_YOUNG;
++ 		pmd_val(pmd) &= ~_SEGMENT_ENTRY_INVALID;
++ 	}
++ #endif
++ 	return pmd;
++ }
++ 
++ static inline pmd_t pmd_mkold(pmd_t pmd)
++ {
++ #ifdef CONFIG_64BIT
++ 	if (pmd_prot_none(pmd)) {
++ 		pmd_val(pmd) &= ~_SEGMENT_ENTRY_PROTECT;
++ 	} else {
++ 		pmd_val(pmd) &= ~_SEGMENT_ENTRY_YOUNG;
++ 		pmd_val(pmd) |= _SEGMENT_ENTRY_INVALID;
++ 	}
++ #endif
++ 	return pmd;
++ }
++ 
+  static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
+  {
++ 	int young;
++ 
++ 	young = pmd_young(pmd);
+  	pmd_val(pmd) &= _SEGMENT_CHG_MASK;
+  	pmd_val(pmd) |= massage_pgprot_pmd(newprot);
++ 	if (young)
++ 		pmd = pmd_mkyoung(pmd);
+  	return pmd;
+  }
+  
+@@@ -1357,9 -1435,9 +1548,15 @@@ static inline pmd_t mk_pmd_phys(unsigne
+  
+  static inline pmd_t pmd_mkwrite(pmd_t pmd)
+  {
+++<<<<<<< HEAD
+ +	/* Do not clobber _HPAGE_TYPE_NONE pages! */
+ +	if (!(pmd_val(pmd) & _SEGMENT_ENTRY_INV))
+ +		pmd_val(pmd) &= ~_SEGMENT_ENTRY_RO;
+++=======
++ 	/* Do not clobber PROT_NONE segments! */
++ 	if (!pmd_prot_none(pmd))
++ 		pmd_val(pmd) &= ~_SEGMENT_ENTRY_PROTECT;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  	return pmd;
+  }
+  #endif /* CONFIG_TRANSPARENT_HUGEPAGE || CONFIG_HUGETLB_PAGE */
+@@@ -1405,7 -1472,9 +1602,13 @@@ static inline pmd_t pmd_mkhuge(pmd_t pm
+  
+  static inline pmd_t pmd_wrprotect(pmd_t pmd)
+  {
+++<<<<<<< HEAD
+ +	pmd_val(pmd) |= _SEGMENT_ENTRY_RO;
+++=======
++ 	/* Do not clobber PROT_NONE segments! */
++ 	if (!pmd_prot_none(pmd))
++ 		pmd_val(pmd) |= _SEGMENT_ENTRY_PROTECT;
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  	return pmd;
+  }
+  
+diff --cc arch/s390/mm/hugetlbpage.c
+index 121089d57802,248445f92604..000000000000
+--- a/arch/s390/mm/hugetlbpage.c
++++ b/arch/s390/mm/hugetlbpage.c
+@@@ -8,21 -8,127 +8,104 @@@
+  #include <linux/mm.h>
+  #include <linux/hugetlb.h>
+  
+++<<<<<<< HEAD
+++=======
++ static inline pmd_t __pte_to_pmd(pte_t pte)
++ {
++ 	int none, young, prot;
++ 	pmd_t pmd;
++ 
++ 	/*
++ 	 * Convert encoding		  pte bits	  pmd bits
++ 	 *				.IR...wrdytp	..R...I...y.
++ 	 * empty			.10...000000 -> ..0...1...0.
++ 	 * prot-none, clean, old	.11...000001 -> ..0...1...1.
++ 	 * prot-none, clean, young	.11...000101 -> ..1...1...1.
++ 	 * prot-none, dirty, old	.10...001001 -> ..0...1...1.
++ 	 * prot-none, dirty, young	.10...001101 -> ..1...1...1.
++ 	 * read-only, clean, old	.11...010001 -> ..1...1...0.
++ 	 * read-only, clean, young	.01...010101 -> ..1...0...1.
++ 	 * read-only, dirty, old	.11...011001 -> ..1...1...0.
++ 	 * read-only, dirty, young	.01...011101 -> ..1...0...1.
++ 	 * read-write, clean, old	.11...110001 -> ..0...1...0.
++ 	 * read-write, clean, young	.01...110101 -> ..0...0...1.
++ 	 * read-write, dirty, old	.10...111001 -> ..0...1...0.
++ 	 * read-write, dirty, young	.00...111101 -> ..0...0...1.
++ 	 * Huge ptes are dirty by definition, a clean pte is made dirty
++ 	 * by the conversion.
++ 	 */
++ 	if (pte_present(pte)) {
++ 		pmd_val(pmd) = pte_val(pte) & PAGE_MASK;
++ 		if (pte_val(pte) & _PAGE_INVALID)
++ 			pmd_val(pmd) |= _SEGMENT_ENTRY_INVALID;
++ 		none = (pte_val(pte) & _PAGE_PRESENT) &&
++ 			!(pte_val(pte) & _PAGE_READ) &&
++ 			!(pte_val(pte) & _PAGE_WRITE);
++ 		prot = (pte_val(pte) & _PAGE_PROTECT) &&
++ 			!(pte_val(pte) & _PAGE_WRITE);
++ 		young = pte_val(pte) & _PAGE_YOUNG;
++ 		if (none || young)
++ 			pmd_val(pmd) |= _SEGMENT_ENTRY_YOUNG;
++ 		if (prot || (none && young))
++ 			pmd_val(pmd) |= _SEGMENT_ENTRY_PROTECT;
++ 	} else
++ 		pmd_val(pmd) = _SEGMENT_ENTRY_INVALID;
++ 	return pmd;
++ }
++ 
++ static inline pte_t __pmd_to_pte(pmd_t pmd)
++ {
++ 	pte_t pte;
++ 
++ 	/*
++ 	 * Convert encoding	  pmd bits	  pte bits
++ 	 *			..R...I...y.	.IR...wrdytp
++ 	 * empty		..0...1...0. -> .10...000000
++ 	 * prot-none, old	..0...1...1. -> .10...001001
++ 	 * prot-none, young	..1...1...1. -> .10...001101
++ 	 * read-only, old	..1...1...0. -> .11...011001
++ 	 * read-only, young	..1...0...1. -> .01...011101
++ 	 * read-write, old	..0...1...0. -> .10...111001
++ 	 * read-write, young	..0...0...1. -> .00...111101
++ 	 * Huge ptes are dirty by definition
++ 	 */
++ 	if (pmd_present(pmd)) {
++ 		pte_val(pte) = _PAGE_PRESENT | _PAGE_LARGE | _PAGE_DIRTY |
++ 			(pmd_val(pmd) & PAGE_MASK);
++ 		if (pmd_val(pmd) & _SEGMENT_ENTRY_INVALID)
++ 			pte_val(pte) |= _PAGE_INVALID;
++ 		if (pmd_prot_none(pmd)) {
++ 			if (pmd_val(pmd) & _SEGMENT_ENTRY_PROTECT)
++ 				pte_val(pte) |= _PAGE_YOUNG;
++ 		} else {
++ 			pte_val(pte) |= _PAGE_READ;
++ 			if (pmd_val(pmd) & _SEGMENT_ENTRY_PROTECT)
++ 				pte_val(pte) |= _PAGE_PROTECT;
++ 			else
++ 				pte_val(pte) |= _PAGE_WRITE;
++ 			if (pmd_val(pmd) & _SEGMENT_ENTRY_YOUNG)
++ 				pte_val(pte) |= _PAGE_YOUNG;
++ 		}
++ 	} else
++ 		pte_val(pte) = _PAGE_INVALID;
++ 	return pte;
++ }
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  
+  void set_huge_pte_at(struct mm_struct *mm, unsigned long addr,
+ -		     pte_t *ptep, pte_t pte)
+ +				   pte_t *pteptr, pte_t pteval)
+  {
+ -	pmd_t pmd;
+ +	pmd_t *pmdp = (pmd_t *) pteptr;
+ +	unsigned long mask;
+  
+ -	pmd = __pte_to_pmd(pte);
+  	if (!MACHINE_HAS_HPAGE) {
+ -		pmd_val(pmd) &= ~_SEGMENT_ENTRY_ORIGIN;
+ -		pmd_val(pmd) |= pte_page(pte)[1].index;
+ -	} else
+ -		pmd_val(pmd) |= _SEGMENT_ENTRY_LARGE | _SEGMENT_ENTRY_CO;
+ -	*(pmd_t *) ptep = pmd;
+ -}
+ -
+ -pte_t huge_ptep_get(pte_t *ptep)
+ -{
+ -	unsigned long origin;
+ -	pmd_t pmd;
+ -
+ -	pmd = *(pmd_t *) ptep;
+ -	if (!MACHINE_HAS_HPAGE && pmd_present(pmd)) {
+ -		origin = pmd_val(pmd) & _SEGMENT_ENTRY_ORIGIN;
+ -		pmd_val(pmd) &= ~_SEGMENT_ENTRY_ORIGIN;
+ -		pmd_val(pmd) |= *(unsigned long *) origin;
+ +		pteptr = (pte_t *) pte_page(pteval)[1].index;
+ +		mask = pte_val(pteval) &
+ +				(_SEGMENT_ENTRY_INV | _SEGMENT_ENTRY_RO);
+ +		pte_val(pteval) = (_SEGMENT_ENTRY + __pa(pteptr)) | mask;
+  	}
+ -	return __pmd_to_pte(pmd);
+ -}
+  
+ -pte_t huge_ptep_get_and_clear(struct mm_struct *mm,
+ -			      unsigned long addr, pte_t *ptep)
+ -{
+ -	pmd_t *pmdp = (pmd_t *) ptep;
+ -	pte_t pte = huge_ptep_get(ptep);
+ -
+ -	if (MACHINE_HAS_IDTE)
+ -		__pmd_idte(addr, pmdp);
+ -	else
+ -		__pmd_csp(pmdp);
+ -	pmd_val(*pmdp) = _SEGMENT_ENTRY_EMPTY;
+ -	return pte;
+ +	pmd_val(*pmdp) = pte_val(pteval);
+  }
+  
+  int arch_prepare_hugepage(struct page *page)
+diff --cc arch/s390/mm/pgtable.c
+index 5fe8a1e87784,6d16132d0850..000000000000
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@@ -780,10 -751,11 +780,16 @@@ static inline unsigned long *page_table
+  	mp->vmaddr = vmaddr & PMD_MASK;
+  	INIT_LIST_HEAD(&mp->mapper);
+  	page->index = (unsigned long) mp;
+ -	atomic_set(&page->_mapcount, 3);
+ +	atomic_set(&page->_mapcount, 0);
+  	table = (unsigned long *) page_to_phys(page);
+++<<<<<<< HEAD
+ +	clear_table(table, _PAGE_TYPE_EMPTY, PAGE_SIZE/2);
+ +	clear_table(table + PTRS_PER_PTE, 0, PAGE_SIZE/2);
+++=======
++ 	clear_table(table, _PAGE_INVALID, PAGE_SIZE/2);
++ 	clear_table(table + PTRS_PER_PTE, PGSTE_HR_BIT | PGSTE_HC_BIT,
++ 		    PAGE_SIZE/2);
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  	return table;
+  }
+  
+diff --cc arch/s390/mm/vmem.c
+index 8b268fcc4612,bcfb70b60be6..000000000000
+--- a/arch/s390/mm/vmem.c
++++ b/arch/s390/mm/vmem.c
+@@@ -118,7 -118,8 +118,12 @@@ static int vmem_add_mem(unsigned long s
+  		    !(address & ~PMD_MASK) && (address + PMD_SIZE <= end)) {
+  			pmd_val(*pm_dir) = __pa(address) |
+  				_SEGMENT_ENTRY | _SEGMENT_ENTRY_LARGE |
+++<<<<<<< HEAD
+ +				(ro ? _SEGMENT_ENTRY_RO : 0);
+++=======
++ 				_SEGMENT_ENTRY_YOUNG |
++ 				(ro ? _SEGMENT_ENTRY_PROTECT : 0);
+++>>>>>>> 0944fe3f4a32 (s390/mm: implement software referenced bits)
+  			address += PMD_SIZE;
+  			continue;
+  		}
+diff --git a/arch/s390/include/asm/page.h b/arch/s390/include/asm/page.h
+index 1d7b51b7a7d8..316c8503a3b4 100644
+--- a/arch/s390/include/asm/page.h
++++ b/arch/s390/include/asm/page.h
+@@ -145,15 +145,6 @@ static inline int page_reset_referenced(unsigned long addr)
+ #define _PAGE_FP_BIT		0x08	/* HW fetch protection bit	*/
+ #define _PAGE_ACC_BITS		0xf0	/* HW access control bits	*/
+ 
+-/*
+- * Test and clear referenced bit in storage key.
+- */
+-#define __HAVE_ARCH_PAGE_TEST_AND_CLEAR_YOUNG
+-static inline int page_test_and_clear_young(unsigned long pfn)
+-{
+-	return page_reset_referenced(pfn << PAGE_SHIFT);
+-}
+-
+ struct page;
+ void arch_free_page(struct page *page, int order);
+ void arch_alloc_page(struct page *page, int order);
+* Unmerged path arch/s390/include/asm/pgtable.h
+* Unmerged path arch/s390/mm/hugetlbpage.c
+* Unmerged path arch/s390/mm/pgtable.c
+* Unmerged path arch/s390/mm/vmem.c
+diff --git a/include/asm-generic/pgtable.h b/include/asm-generic/pgtable.h
+index 52e84dd2949b..34b45521969b 100644
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@ -208,10 +208,6 @@ static inline int pmd_same(pmd_t pmd_a, pmd_t pmd_b)
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ #endif
+ 
+-#ifndef __HAVE_ARCH_PAGE_TEST_AND_CLEAR_YOUNG
+-#define page_test_and_clear_young(pfn) (0)
+-#endif
+-
+ #ifndef __HAVE_ARCH_PGD_OFFSET_GATE
+ #define pgd_offset_gate(mm, addr)	pgd_offset(mm, addr)
+ #endif
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 1f95c591e5eb..5729f1a63270 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -870,9 +870,6 @@ int page_referenced(struct page *page,
+ 								vm_flags);
+ 		if (we_locked)
+ 			unlock_page(page);
+-
+-		if (page_test_and_clear_young(page_to_pfn(page)))
+-			referenced++;
+ 	}
+ out:
+ 	return referenced;
