@@ -1,0 +1,209 @@
+hv_netvsc: Eliminate send_completion from struct hv_netvsc_packet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author KY Srinivasan <kys@microsoft.com>
+commit 09215ef5dfd5a2c6c169733162091ca7e56a4890
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/09215ef5.failed
+
+Eliminate send_completion from struct hv_netvsc_packet.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 09215ef5dfd5a2c6c169733162091ca7e56a4890)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index cf498664d989,f096f2fd713d..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -128,28 -127,27 +128,44 @@@ struct ndis_tcp_ip_checksum_info
+   */
+  struct hv_netvsc_packet {
+  	/* Bookkeeping stuff */
+++<<<<<<< HEAD
+ +	u32 status;
+++=======
++ 	u8 status;
++ 	u8 is_data_pkt;
++ 	u8 xmit_more; /* from skb */
++ 	u8 cp_partial; /* partial copy into send buffer */
++ 
++ 	u8 rmsg_size; /* RNDIS header and PPI size */
++ 	u8 rmsg_pgcnt; /* page count of RNDIS header and PPI */
++ 	u8 page_buf_cnt;
++ 	u8 completion_func;
+++>>>>>>> 09215ef5dfd5 (hv_netvsc: Eliminate send_completion from struct hv_netvsc_packet)
+  
+ +	bool is_data_pkt;
+  	u16 vlan_tci;
+ -	u16 q_idx;
+ -	u32 send_buf_index;
+ -
+ -	u32 total_data_buflen;
+ -	u32 pad1;
+  
+ +	u16 q_idx;
+ +	struct vmbus_channel *channel;
+  
+  	u64 send_completion_tid;
+  	void *send_completion_ctx;
+++<<<<<<< HEAD
+ +	void (*send_completion)(void *context);
+ +
+ +	u32 send_buf_index;
+ +
+ +	/* This points to the memory after page_buf */
+ +	struct rndis_message *rndis_msg;
+ +
+ +	u32 total_data_buflen;
+ +	/* Points to the send/receive buffer where the ethernet frame is */
+ +	void *data;
+ +	u32 page_buf_cnt;
+ +	struct hv_page_buffer page_buf[0];
+++=======
++ 	struct hv_page_buffer *page_buf;
+++>>>>>>> 09215ef5dfd5 (hv_netvsc: Eliminate send_completion from struct hv_netvsc_packet)
+  };
+  
+  struct netvsc_device_info {
+diff --cc drivers/net/hyperv/netvsc.c
+index 74ee1b57e623,34c16d19f05d..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -642,9 -652,9 +642,15 @@@ static void netvsc_send_completion(stru
+  			if (send_index != NETVSC_INVALID_INDEX)
+  				netvsc_free_send_slot(net_device, send_index);
+  			q_idx = nvsc_packet->q_idx;
+++<<<<<<< HEAD
+ +			channel = nvsc_packet->channel;
+ +			nvsc_packet->send_completion(nvsc_packet->
+ +						     send_completion_ctx);
+++=======
++ 			channel = incoming_channel;
++ 			netvsc_xmit_completion(nvsc_packet->
++ 					       send_completion_ctx);
+++>>>>>>> 09215ef5dfd5 (hv_netvsc: Eliminate send_completion from struct hv_netvsc_packet)
+  		}
+  
+  		num_outstanding_sends =
+@@@ -714,55 -739,43 +720,55 @@@ u32 netvsc_copy_to_send_buf(struct netv
+  	return msg_size;
+  }
+  
+ -static inline int netvsc_send_pkt(
+ -	struct hv_netvsc_packet *packet,
+ -	struct netvsc_device *net_device)
+ +int netvsc_send(struct hv_device *device,
+ +			struct hv_netvsc_packet *packet)
+  {
+ -	struct nvsp_message nvmsg;
+ -	struct vmbus_channel *out_channel = get_channel(packet, net_device);
+ -	u16 q_idx = packet->q_idx;
+ -	struct net_device *ndev = net_device->ndev;
+ +	struct netvsc_device *net_device;
+ +	int ret = 0;
+ +	struct nvsp_message sendMessage;
+ +	struct net_device *ndev;
+ +	struct vmbus_channel *out_channel = NULL;
+  	u64 req_id;
+ -	int ret;
+ -	struct hv_page_buffer *pgbuf;
+ -	u32 ring_avail = hv_ringbuf_avail_percent(&out_channel->outbound);
+ +	unsigned int section_index = NETVSC_INVALID_INDEX;
+ +	u32 msg_size = 0;
+ +	struct sk_buff *skb = NULL;
+ +	u16 q_idx = packet->q_idx;
+ +
+  
+ -	nvmsg.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
+ +	net_device = get_outbound_net_device(device);
+ +	if (!net_device)
+ +		return -ENODEV;
+ +	ndev = net_device->ndev;
+ +
+ +	sendMessage.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
+  	if (packet->is_data_pkt) {
+  		/* 0 is RMC_DATA; */
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.channel_type = 0;
+ +		sendMessage.msg.v1_msg.send_rndis_pkt.channel_type = 0;
+  	} else {
+  		/* 1 is RMC_CONTROL; */
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.channel_type = 1;
+ +		sendMessage.msg.v1_msg.send_rndis_pkt.channel_type = 1;
+  	}
+  
+ -	nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_index =
+ -		packet->send_buf_index;
+ -	if (packet->send_buf_index == NETVSC_INVALID_INDEX)
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_size = 0;
+ -	else
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_size =
+ -			packet->total_data_buflen;
+ +	/* Attempt to send via sendbuf */
+ +	if (packet->total_data_buflen < net_device->send_section_size) {
+ +		section_index = netvsc_get_next_send_section(net_device);
+ +		if (section_index != NETVSC_INVALID_INDEX) {
+ +			msg_size = netvsc_copy_to_send_buf(net_device,
+ +							   section_index,
+ +							   packet);
+ +			skb = (struct sk_buff *)
+ +			      (unsigned long)packet->send_completion_tid;
+ +			packet->page_buf_cnt = 0;
+ +		}
+ +	}
+ +	packet->send_buf_index = section_index;
+ +
+ +
+ +	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_index =
+ +		section_index;
+ +	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_size = msg_size;
+  
+- 	if (packet->send_completion)
++ 	if (packet->completion_func)
+  		req_id = (ulong)packet;
+  	else
+  		req_id = 0;
+diff --cc drivers/net/hyperv/rndis_filter.c
+index 4f78abd49222,c8af172faee3..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -235,9 -237,10 +235,14 @@@ static int rndis_filter_send_request(st
+  			packet->page_buf[0].len;
+  	}
+  
+++<<<<<<< HEAD
+ +	packet->send_completion = NULL;
+++=======
++ 	packet->completion_func = 0;
++ 	packet->xmit_more = false;
+++>>>>>>> 09215ef5dfd5 (hv_netvsc: Eliminate send_completion from struct hv_netvsc_packet)
+  
+ -	ret = netvsc_send(dev->net_dev->dev, packet, NULL);
+ +	ret = netvsc_send(dev->net_dev->dev, packet);
+  	return ret;
+  }
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index 56b76b7b9a27..bce4bc505d53 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -466,7 +466,7 @@ static int netvsc_start_xmit(struct sk_buff *skb, struct net_device *net)
+ 				(num_data_pgs * sizeof(struct hv_page_buffer)));
+ 
+ 	/* Set the completion routine */
+-	packet->send_completion = netvsc_xmit_completion;
++	packet->completion_func = 1;
+ 	packet->send_completion_ctx = packet;
+ 	packet->send_completion_tid = (unsigned long)skb;
+ 
+* Unmerged path drivers/net/hyperv/rndis_filter.c
