@@ -1,0 +1,299 @@
+net/ipv4: bind ip_nonlocal_bind to current netns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] ipv4: bind ip_nonlocal_bind to current netns (Sabrina Dubroca) [1315968]
+Rebuild_FUZZ: 95.65%
+commit-author Vincent Bernat <vincent@bernat.im>
+commit 49a601589caaf0e93194c0cc9b4ecddbe75dd2d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/49a60158.failed
+
+net.ipv4.ip_nonlocal_bind sysctl was global to all network
+namespaces. This patch allows to set a different value for each
+network namespace.
+
+	Signed-off-by: Vincent Bernat <vincent@bernat.im>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 49a601589caaf0e93194c0cc9b4ecddbe75dd2d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+#	include/net/netns/ipv4.h
+#	net/ipv4/ping.c
+#	net/ipv4/sysctl_net_ipv4.c
+diff --cc include/net/ip.h
+index ac68d6939a5b,14bfc8e1bcf9..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -224,13 -209,25 +224,27 @@@ static inline void snmp_mib_free(void _
+  
+  void inet_get_local_port_range(struct net *net, int *low, int *high);
+  
+ -#ifdef CONFIG_SYSCTL
+ -static inline int inet_is_local_reserved_port(struct net *net, int port)
+ +extern unsigned long *sysctl_local_reserved_ports;
+ +static inline int inet_is_reserved_local_port(int port)
+  {
+ -	if (!net->ipv4.sysctl_local_reserved_ports)
+ -		return 0;
+ -	return test_bit(port, net->ipv4.sysctl_local_reserved_ports);
+ +	return test_bit(port, sysctl_local_reserved_ports);
+  }
+  
+++<<<<<<< HEAD
+ +extern int sysctl_ip_nonlocal_bind;
+++=======
++ static inline bool sysctl_dev_name_is_allowed(const char *name)
++ {
++ 	return strcmp(name, "default") != 0  && strcmp(name, "all") != 0;
++ }
++ 
++ #else
++ static inline int inet_is_local_reserved_port(struct net *net, int port)
++ {
++ 	return 0;
++ }
++ #endif
+++>>>>>>> 49a601589caa (net/ipv4: bind ip_nonlocal_bind to current netns)
+  
+  /* From inetpeer.c */
+  extern int inet_peer_threshold;
+diff --cc include/net/netns/ipv4.h
+index c79aa00fb6ec,24945cefc4fd..000000000000
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@@ -68,10 -71,17 +68,16 @@@ struct netns_ipv4 
+  	int sysctl_icmp_ratemask;
+  	int sysctl_icmp_errors_use_inbound_ifaddr;
+  
+ -	struct local_ports ip_local_ports;
+ -
+  	int sysctl_tcp_ecn;
+++<<<<<<< HEAD
+++=======
++ 	int sysctl_ip_no_pmtu_disc;
++ 	int sysctl_ip_fwd_use_pmtu;
++ 	int sysctl_ip_nonlocal_bind;
+++>>>>>>> 49a601589caa (net/ipv4: bind ip_nonlocal_bind to current netns)
+  
+ -	int sysctl_fwmark_reflect;
+ -	int sysctl_tcp_fwmark_accept;
+ -
+ -	struct ping_group_range ping_group_range;
+ +	kgid_t sysctl_ping_group_range[2];
+ +	long sysctl_tcp_mem[3];
+  
+  	atomic_t dev_addr_genid;
+  
+diff --cc net/ipv4/ping.c
+index e8952760c7ba,57f7c9804139..000000000000
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@@ -242,7 -290,110 +242,112 @@@ static void ping_close(struct sock *sk
+  
+  	sk_common_release(sk);
+  }
+ -EXPORT_SYMBOL_GPL(ping_close);
+  
+++<<<<<<< HEAD
+++=======
++ /* Checks the bind address and possibly modifies sk->sk_bound_dev_if. */
++ static int ping_check_bind_addr(struct sock *sk, struct inet_sock *isk,
++ 				struct sockaddr *uaddr, int addr_len) {
++ 	struct net *net = sock_net(sk);
++ 	if (sk->sk_family == AF_INET) {
++ 		struct sockaddr_in *addr = (struct sockaddr_in *) uaddr;
++ 		int chk_addr_ret;
++ 
++ 		if (addr_len < sizeof(*addr))
++ 			return -EINVAL;
++ 
++ 		pr_debug("ping_check_bind_addr(sk=%p,addr=%pI4,port=%d)\n",
++ 			 sk, &addr->sin_addr.s_addr, ntohs(addr->sin_port));
++ 
++ 		chk_addr_ret = inet_addr_type(net, addr->sin_addr.s_addr);
++ 
++ 		if (addr->sin_addr.s_addr == htonl(INADDR_ANY))
++ 			chk_addr_ret = RTN_LOCAL;
++ 
++ 		if ((net->ipv4.sysctl_ip_nonlocal_bind == 0 &&
++ 		    isk->freebind == 0 && isk->transparent == 0 &&
++ 		     chk_addr_ret != RTN_LOCAL) ||
++ 		    chk_addr_ret == RTN_MULTICAST ||
++ 		    chk_addr_ret == RTN_BROADCAST)
++ 			return -EADDRNOTAVAIL;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (sk->sk_family == AF_INET6) {
++ 		struct sockaddr_in6 *addr = (struct sockaddr_in6 *) uaddr;
++ 		int addr_type, scoped, has_addr;
++ 		struct net_device *dev = NULL;
++ 
++ 		if (addr_len < sizeof(*addr))
++ 			return -EINVAL;
++ 
++ 		if (addr->sin6_family != AF_INET6)
++ 			return -EINVAL;
++ 
++ 		pr_debug("ping_check_bind_addr(sk=%p,addr=%pI6c,port=%d)\n",
++ 			 sk, addr->sin6_addr.s6_addr, ntohs(addr->sin6_port));
++ 
++ 		addr_type = ipv6_addr_type(&addr->sin6_addr);
++ 		scoped = __ipv6_addr_needs_scope_id(addr_type);
++ 		if ((addr_type != IPV6_ADDR_ANY &&
++ 		     !(addr_type & IPV6_ADDR_UNICAST)) ||
++ 		    (scoped && !addr->sin6_scope_id))
++ 			return -EINVAL;
++ 
++ 		rcu_read_lock();
++ 		if (addr->sin6_scope_id) {
++ 			dev = dev_get_by_index_rcu(net, addr->sin6_scope_id);
++ 			if (!dev) {
++ 				rcu_read_unlock();
++ 				return -ENODEV;
++ 			}
++ 		}
++ 		has_addr = pingv6_ops.ipv6_chk_addr(net, &addr->sin6_addr, dev,
++ 						    scoped);
++ 		rcu_read_unlock();
++ 
++ 		if (!(isk->freebind || isk->transparent || has_addr ||
++ 		      addr_type == IPV6_ADDR_ANY))
++ 			return -EADDRNOTAVAIL;
++ 
++ 		if (scoped)
++ 			sk->sk_bound_dev_if = addr->sin6_scope_id;
++ #endif
++ 	} else {
++ 		return -EAFNOSUPPORT;
++ 	}
++ 	return 0;
++ }
++ 
++ static void ping_set_saddr(struct sock *sk, struct sockaddr *saddr)
++ {
++ 	if (saddr->sa_family == AF_INET) {
++ 		struct inet_sock *isk = inet_sk(sk);
++ 		struct sockaddr_in *addr = (struct sockaddr_in *) saddr;
++ 		isk->inet_rcv_saddr = isk->inet_saddr = addr->sin_addr.s_addr;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (saddr->sa_family == AF_INET6) {
++ 		struct sockaddr_in6 *addr = (struct sockaddr_in6 *) saddr;
++ 		struct ipv6_pinfo *np = inet6_sk(sk);
++ 		sk->sk_v6_rcv_saddr = np->saddr = addr->sin6_addr;
++ #endif
++ 	}
++ }
++ 
++ static void ping_clear_saddr(struct sock *sk, int dif)
++ {
++ 	sk->sk_bound_dev_if = dif;
++ 	if (sk->sk_family == AF_INET) {
++ 		struct inet_sock *isk = inet_sk(sk);
++ 		isk->inet_rcv_saddr = isk->inet_saddr = 0;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (sk->sk_family == AF_INET6) {
++ 		struct ipv6_pinfo *np = inet6_sk(sk);
++ 		memset(&sk->sk_v6_rcv_saddr, 0, sizeof(sk->sk_v6_rcv_saddr));
++ 		memset(&np->saddr, 0, sizeof(np->saddr));
++ #endif
++ 	}
++ }
+++>>>>>>> 49a601589caa (net/ipv4: bind ip_nonlocal_bind to current netns)
+  /*
+   * We need our own bind because there are no privileged id's == local ports.
+   * Moreover, we don't allow binding to multi- and broadcast addresses.
+diff --cc net/ipv4/sysctl_net_ipv4.c
+index eeb17b3922e6,1599966f4639..000000000000
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@@ -892,7 -836,28 +885,32 @@@ static struct ctl_table ipv4_net_table[
+  	},
+  	{
+  		.procname	= "ip_forward_use_pmtu",
+++<<<<<<< HEAD
+ +		.data		= &init_net.sysctl_ip_fwd_use_pmtu,
+++=======
++ 		.data		= &init_net.ipv4.sysctl_ip_fwd_use_pmtu,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec,
++ 	},
++ 	{
++ 		.procname	= "ip_nonlocal_bind",
++ 		.data		= &init_net.ipv4.sysctl_ip_nonlocal_bind,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "fwmark_reflect",
++ 		.data		= &init_net.ipv4.sysctl_fwmark_reflect,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec,
++ 	},
++ 	{
++ 		.procname	= "tcp_fwmark_accept",
++ 		.data		= &init_net.ipv4.sysctl_tcp_fwmark_accept,
+++>>>>>>> 49a601589caa (net/ipv4: bind ip_nonlocal_bind to current netns)
+  		.maxlen		= sizeof(int),
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec,
+* Unmerged path include/net/ip.h
+* Unmerged path include/net/netns/ipv4.h
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 96cfb62894e8..ea5c057cf10e 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -420,10 +420,6 @@ int inet_release(struct socket *sock)
+ }
+ EXPORT_SYMBOL(inet_release);
+ 
+-/* It is off by default, see below. */
+-int sysctl_ip_nonlocal_bind __read_mostly;
+-EXPORT_SYMBOL(sysctl_ip_nonlocal_bind);
+-
+ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ {
+ 	struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
+@@ -463,7 +459,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 	 *  is temporarily down)
+ 	 */
+ 	err = -EADDRNOTAVAIL;
+-	if (!sysctl_ip_nonlocal_bind &&
++	if (!net->ipv4.sysctl_ip_nonlocal_bind &&
+ 	    !(inet->freebind || inet->transparent) &&
+ 	    addr->sin_addr.s_addr != htonl(INADDR_ANY) &&
+ 	    chk_addr_ret != RTN_LOCAL &&
+* Unmerged path net/ipv4/ping.c
+* Unmerged path net/ipv4/sysctl_net_ipv4.c
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index f6f52bfe535a..f663b0412f4c 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -301,7 +301,7 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 		/* Reproduce AF_INET checks to make the bindings consistent */
+ 		v4addr = addr->sin6_addr.s6_addr32[3];
+ 		chk_addr_ret = inet_addr_type(net, v4addr);
+-		if (!sysctl_ip_nonlocal_bind &&
++		if (!net->ipv4.sysctl_ip_nonlocal_bind &&
+ 		    !(inet->freebind || inet->transparent) &&
+ 		    v4addr != htonl(INADDR_ANY) &&
+ 		    chk_addr_ret != RTN_LOCAL &&
+diff --git a/net/sctp/protocol.c b/net/sctp/protocol.c
+index e22202613c5c..92200d15a257 100644
+--- a/net/sctp/protocol.c
++++ b/net/sctp/protocol.c
+@@ -373,7 +373,7 @@ static int sctp_v4_available(union sctp_addr *addr, struct sctp_sock *sp)
+ 	if (addr->v4.sin_addr.s_addr != htonl(INADDR_ANY) &&
+ 	   ret != RTN_LOCAL &&
+ 	   !sp->inet.freebind &&
+-	   !sysctl_ip_nonlocal_bind)
++	   !net->ipv4.sysctl_ip_nonlocal_bind)
+ 		return 0;
+ 
+ 	if (ipv6_only_sock(sctp_opt2sk(sp)))
