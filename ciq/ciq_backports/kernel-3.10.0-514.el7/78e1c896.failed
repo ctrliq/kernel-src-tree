@@ -1,0 +1,244 @@
+pinctrl: baytrail: Use raw_spinlock for locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [pinctrl] baytrail: Use raw_spinlock for locking (Prarit Bhargava) [1339663]
+Rebuild_FUZZ: 89.41%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 78e1c896932df5b8bcdff7bf5417d8e72a4d0d6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/78e1c896.failed
+
+The Intel Baytrail pinctrl driver implements irqchip callbacks which are
+called with desc->lock raw_spinlock held. In mainline this is fine because
+spinlock resolves to raw_spinlock. However, running the same code in -rt we
+get:
+
+ BUG: sleeping function called from invalid context at kernel/locking/rtmutex.c:917
+ in_atomic(): 1, irqs_disabled(): 1, pid: 0, name: swapper/0
+ Preemption disabled at:[<ffffffff81092e9f>] cpu_startup_entry+0x17f/0x480
+
+ CPU: 0 PID: 0 Comm: swapper/0 Not tainted 4.1.5-rt5 #13
+  ...
+ Call Trace:
+  <IRQ>  [<ffffffff816283c6>] dump_stack+0x4a/0x61
+  [<ffffffff81077e17>] ___might_sleep+0xe7/0x170
+  [<ffffffff8162d6cf>] rt_spin_lock+0x1f/0x50
+  [<ffffffff812e3b88>] byt_gpio_clear_triggering+0x38/0x60
+  [<ffffffff812e3bc1>] byt_irq_mask+0x11/0x20
+  [<ffffffff810a7013>] handle_level_irq+0x83/0x150
+  [<ffffffff810a3457>] generic_handle_irq+0x27/0x40
+  [<ffffffff812e3a5f>] byt_gpio_irq_handler+0x7f/0xc0
+  [<ffffffff810050aa>] handle_irq+0xaa/0x190
+  ...
+
+This is because in -rt spinlocks are preemptible so taking the driver
+private spinlock in irqchip callbacks causes might_sleep() to trigger.
+
+In order to keep -rt happy but at the same time make sure that register
+accesses get serialized, convert the driver to use raw_spinlock instead.
+
+Also shorten the critical section a bit in few places.
+
+	Suggested-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 78e1c896932df5b8bcdff7bf5417d8e72a4d0d6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pinctrl/pinctrl-baytrail.c
+diff --cc drivers/pinctrl/pinctrl-baytrail.c
+index ad68bcc7f9f9,dac4865f3203..000000000000
+--- a/drivers/pinctrl/pinctrl-baytrail.c
++++ b/drivers/pinctrl/pinctrl-baytrail.c
+@@@ -132,13 -133,18 +132,13 @@@ static struct pinctrl_gpio_range byt_ra
+  	},
+  };
+  
+ -struct byt_gpio_pin_context {
+ -	u32 conf0;
+ -	u32 val;
+ -};
+ -
+  struct byt_gpio {
+  	struct gpio_chip		chip;
+ +	struct irq_domain		*domain;
+  	struct platform_device		*pdev;
+- 	spinlock_t			lock;
++ 	raw_spinlock_t			lock;
+  	void __iomem			*reg_base;
+  	struct pinctrl_gpio_range	*range;
+ -	struct byt_gpio_pin_context	*saved_context;
+  };
+  
+  #define to_byt_gpio(c)	container_of(c, struct byt_gpio, chip)
+@@@ -190,6 -196,9 +190,12 @@@ static int byt_gpio_request(struct gpio
+  	struct byt_gpio *vg = to_byt_gpio(chip);
+  	void __iomem *reg = byt_gpio_reg(chip, offset, BYT_CONF0_REG);
+  	u32 value, gpio_mux;
+++<<<<<<< HEAD:drivers/pinctrl/pinctrl-baytrail.c
+++=======
++ 	unsigned long flags;
++ 
++ 	raw_spin_lock_irqsave(&vg->lock, flags);
+++>>>>>>> 78e1c896932d (pinctrl: baytrail: Use raw_spinlock for locking):drivers/pinctrl/intel/pinctrl-baytrail.c
+  
+  	/*
+  	 * In most cases, func pin mux 000 means GPIO function.
+@@@ -215,6 -220,8 +221,11 @@@
+  			 "pin %u forcibly re-configured as GPIO\n", offset);
+  	}
+  
+++<<<<<<< HEAD:drivers/pinctrl/pinctrl-baytrail.c
+++=======
++ 	raw_spin_unlock_irqrestore(&vg->lock, flags);
++ 
+++>>>>>>> 78e1c896932d (pinctrl: baytrail: Use raw_spinlock for locking):drivers/pinctrl/intel/pinctrl-baytrail.c
+  	pm_runtime_get(&vg->pdev->dev);
+  
+  	return 0;
+@@@ -239,32 -246,26 +250,41 @@@ static int byt_irq_type(struct irq_dat
+  	if (offset >= vg->chip.ngpio)
+  		return -EINVAL;
+  
+- 	spin_lock_irqsave(&vg->lock, flags);
++ 	raw_spin_lock_irqsave(&vg->lock, flags);
+  	value = readl(reg);
+  
+ -	WARN(value & BYT_DIRECT_IRQ_EN,
+ -		"Bad pad config for io mode, force direct_irq_en bit clearing");
+ -
+  	/* For level trigges the BYT_TRIG_POS and BYT_TRIG_NEG bits
+  	 * are used to indicate high and low level triggering
+  	 */
+ -	value &= ~(BYT_DIRECT_IRQ_EN | BYT_TRIG_POS | BYT_TRIG_NEG |
+ -		   BYT_TRIG_LVL);
+ +	value &= ~(BYT_TRIG_POS | BYT_TRIG_NEG | BYT_TRIG_LVL);
+  
+ +	switch (type) {
+ +	case IRQ_TYPE_LEVEL_HIGH:
+ +		value |= BYT_TRIG_LVL;
+ +	case IRQ_TYPE_EDGE_RISING:
+ +		value |= BYT_TRIG_POS;
+ +		break;
+ +	case IRQ_TYPE_LEVEL_LOW:
+ +		value |= BYT_TRIG_LVL;
+ +	case IRQ_TYPE_EDGE_FALLING:
+ +		value |= BYT_TRIG_NEG;
+ +		break;
+ +	case IRQ_TYPE_EDGE_BOTH:
+ +		value |= (BYT_TRIG_NEG | BYT_TRIG_POS);
+ +		break;
+ +	}
+  	writel(value, reg);
+  
+++<<<<<<< HEAD:drivers/pinctrl/pinctrl-baytrail.c
+ +	spin_unlock_irqrestore(&vg->lock, flags);
+++=======
++ 	if (type & IRQ_TYPE_EDGE_BOTH)
++ 		irq_set_handler_locked(d, handle_edge_irq);
++ 	else if (type & IRQ_TYPE_LEVEL_MASK)
++ 		irq_set_handler_locked(d, handle_level_irq);
++ 
++ 	raw_spin_unlock_irqrestore(&vg->lock, flags);
+++>>>>>>> 78e1c896932d (pinctrl: baytrail: Use raw_spinlock for locking):drivers/pinctrl/intel/pinctrl-baytrail.c
+  
+  	return 0;
+  }
+@@@ -272,7 -273,15 +292,19 @@@
+  static int byt_gpio_get(struct gpio_chip *chip, unsigned offset)
+  {
+  	void __iomem *reg = byt_gpio_reg(chip, offset, BYT_VAL_REG);
+++<<<<<<< HEAD:drivers/pinctrl/pinctrl-baytrail.c
+ +	return readl(reg) & BYT_LEVEL;
+++=======
++ 	struct byt_gpio *vg = to_byt_gpio(chip);
++ 	unsigned long flags;
++ 	u32 val;
++ 
++ 	raw_spin_lock_irqsave(&vg->lock, flags);
++ 	val = readl(reg);
++ 	raw_spin_unlock_irqrestore(&vg->lock, flags);
++ 
++ 	return val & BYT_LEVEL;
+++>>>>>>> 78e1c896932d (pinctrl: baytrail: Use raw_spinlock for locking):drivers/pinctrl/intel/pinctrl-baytrail.c
+  }
+  
+  static void byt_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
+@@@ -413,15 -423,8 +446,14 @@@ static void byt_gpio_dbg_show(struct se
+  
+  		seq_puts(s, "\n");
+  	}
+- 	spin_unlock_irqrestore(&vg->lock, flags);
+  }
+  
+ +static int byt_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
+ +{
+ +	struct byt_gpio *vg = to_byt_gpio(chip);
+ +	return irq_create_mapping(vg->domain, offset);
+ +}
+ +
+  static void byt_gpio_irq_handler(unsigned irq, struct irq_desc *desc)
+  {
+  	struct irq_data *data = irq_desc_get_irq_data(desc);
+@@@ -469,8 -447,52 +501,57 @@@
+  	chip->irq_eoi(data);
+  }
+  
+++<<<<<<< HEAD:drivers/pinctrl/pinctrl-baytrail.c
+++static void byt_irq_unmask(struct irq_data *d)
+++{
+++=======
++ static void byt_irq_ack(struct irq_data *d)
++ {
++ 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++ 	struct byt_gpio *vg = to_byt_gpio(gc);
++ 	unsigned offset = irqd_to_hwirq(d);
++ 	void __iomem *reg;
++ 
++ 	raw_spin_lock(&vg->lock);
++ 	reg = byt_gpio_reg(&vg->chip, offset, BYT_INT_STAT_REG);
++ 	writel(BIT(offset % 32), reg);
++ 	raw_spin_unlock(&vg->lock);
++ }
++ 
+  static void byt_irq_unmask(struct irq_data *d)
+  {
++ 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++ 	struct byt_gpio *vg = to_byt_gpio(gc);
++ 	unsigned offset = irqd_to_hwirq(d);
++ 	unsigned long flags;
++ 	void __iomem *reg;
++ 	u32 value;
++ 
++ 	reg = byt_gpio_reg(&vg->chip, offset, BYT_CONF0_REG);
++ 
++ 	raw_spin_lock_irqsave(&vg->lock, flags);
++ 	value = readl(reg);
++ 
++ 	switch (irqd_get_trigger_type(d)) {
++ 	case IRQ_TYPE_LEVEL_HIGH:
++ 		value |= BYT_TRIG_LVL;
++ 	case IRQ_TYPE_EDGE_RISING:
++ 		value |= BYT_TRIG_POS;
++ 		break;
++ 	case IRQ_TYPE_LEVEL_LOW:
++ 		value |= BYT_TRIG_LVL;
++ 	case IRQ_TYPE_EDGE_FALLING:
++ 		value |= BYT_TRIG_NEG;
++ 		break;
++ 	case IRQ_TYPE_EDGE_BOTH:
++ 		value |= (BYT_TRIG_NEG | BYT_TRIG_POS);
++ 		break;
++ 	}
++ 
++ 	writel(value, reg);
++ 
++ 	raw_spin_unlock_irqrestore(&vg->lock, flags);
+++>>>>>>> 78e1c896932d (pinctrl: baytrail: Use raw_spinlock for locking):drivers/pinctrl/intel/pinctrl-baytrail.c
+  }
+  
+  static void byt_irq_mask(struct irq_data *d)
+* Unmerged path drivers/pinctrl/pinctrl-baytrail.c
