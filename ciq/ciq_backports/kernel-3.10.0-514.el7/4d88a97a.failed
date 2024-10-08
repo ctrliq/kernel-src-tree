@@ -1,0 +1,244 @@
+libnvdimm, nvdimm: dimm driver and base libnvdimm device-driver infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 4d88a97aa9e8cfa6460aab119c5da60ad2267423
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4d88a97a.failed
+
+* Implement the device-model infrastructure for loading modules and
+  attaching drivers to nvdimm devices.  This is a simple association of a
+  nd-device-type number with a driver that has a bitmask of supported
+  device types.  To facilitate userspace bind/unbind operations 'modalias'
+  and 'devtype', that also appear in the uevent, are added as generic
+  sysfs attributes for all nvdimm devices.  The reason for the device-type
+  number is to support sub-types within a given parent devtype, be it a
+  vendor-specific sub-type or otherwise.
+
+* The first consumer of this infrastructure is the driver
+  for dimm devices.  It simply uses control messages to retrieve and
+  store the configuration-data image (label set) from each dimm.
+
+Note: nd_device_register() arranges for asynchronous registration of
+      nvdimm bus devices by default.
+
+	Cc: Greg KH <gregkh@linuxfoundation.org>
+	Cc: Neil Brown <neilb@suse.de>
+	Acked-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 4d88a97aa9e8cfa6460aab119c5da60ad2267423)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/nfit.c
+#	drivers/nvdimm/Makefile
+#	drivers/nvdimm/bus.c
+#	drivers/nvdimm/core.c
+#	drivers/nvdimm/dimm_devs.c
+#	drivers/nvdimm/nd-core.h
+#	include/linux/libnvdimm.h
+#	include/uapi/linux/ndctl.h
+* Unmerged path drivers/acpi/nfit.c
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path drivers/nvdimm/bus.c
+* Unmerged path drivers/nvdimm/core.c
+* Unmerged path drivers/nvdimm/dimm_devs.c
+* Unmerged path drivers/nvdimm/nd-core.h
+* Unmerged path include/linux/libnvdimm.h
+* Unmerged path include/uapi/linux/ndctl.h
+* Unmerged path drivers/acpi/nfit.c
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path drivers/nvdimm/bus.c
+* Unmerged path drivers/nvdimm/core.c
+diff --git a/drivers/nvdimm/dimm.c b/drivers/nvdimm/dimm.c
+new file mode 100644
+index 000000000000..28001a6ccd4e
+--- /dev/null
++++ b/drivers/nvdimm/dimm.c
+@@ -0,0 +1,92 @@
++/*
++ * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#include <linux/vmalloc.h>
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/sizes.h>
++#include <linux/ndctl.h>
++#include <linux/slab.h>
++#include <linux/mm.h>
++#include <linux/nd.h>
++#include "nd.h"
++
++static void free_data(struct nvdimm_drvdata *ndd)
++{
++	if (!ndd)
++		return;
++
++	if (ndd->data && is_vmalloc_addr(ndd->data))
++		vfree(ndd->data);
++	else
++		kfree(ndd->data);
++	kfree(ndd);
++}
++
++static int nvdimm_probe(struct device *dev)
++{
++	struct nvdimm_drvdata *ndd;
++	int rc;
++
++	ndd = kzalloc(sizeof(*ndd), GFP_KERNEL);
++	if (!ndd)
++		return -ENOMEM;
++
++	dev_set_drvdata(dev, ndd);
++	ndd->dev = dev;
++
++	rc = nvdimm_init_nsarea(ndd);
++	if (rc)
++		goto err;
++
++	rc = nvdimm_init_config_data(ndd);
++	if (rc)
++		goto err;
++
++	dev_dbg(dev, "config data size: %d\n", ndd->nsarea.config_size);
++
++	return 0;
++
++ err:
++	free_data(ndd);
++	return rc;
++}
++
++static int nvdimm_remove(struct device *dev)
++{
++	struct nvdimm_drvdata *ndd = dev_get_drvdata(dev);
++
++	free_data(ndd);
++
++	return 0;
++}
++
++static struct nd_device_driver nvdimm_driver = {
++	.probe = nvdimm_probe,
++	.remove = nvdimm_remove,
++	.drv = {
++		.name = "nvdimm",
++	},
++	.type = ND_DRIVER_DIMM,
++};
++
++int __init nvdimm_init(void)
++{
++	return nd_driver_register(&nvdimm_driver);
++}
++
++void __exit nvdimm_exit(void)
++{
++	driver_unregister(&nvdimm_driver.drv);
++}
++
++MODULE_ALIAS_ND_DEVICE(ND_DEVICE_DIMM);
+* Unmerged path drivers/nvdimm/dimm_devs.c
+* Unmerged path drivers/nvdimm/nd-core.h
+diff --git a/drivers/nvdimm/nd.h b/drivers/nvdimm/nd.h
+new file mode 100644
+index 000000000000..1f7f6ecab0fc
+--- /dev/null
++++ b/drivers/nvdimm/nd.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#ifndef __ND_H__
++#define __ND_H__
++#include <linux/device.h>
++#include <linux/mutex.h>
++#include <linux/ndctl.h>
++
++struct nvdimm_drvdata {
++	struct device *dev;
++	struct nd_cmd_get_config_size nsarea;
++	void *data;
++};
++
++enum nd_async_mode {
++	ND_SYNC,
++	ND_ASYNC,
++};
++
++void nd_device_register(struct device *dev);
++void nd_device_unregister(struct device *dev, enum nd_async_mode mode);
++int __init nvdimm_init(void);
++void nvdimm_exit(void);
++int nvdimm_init_nsarea(struct nvdimm_drvdata *ndd);
++int nvdimm_init_config_data(struct nvdimm_drvdata *ndd);
++#endif /* __ND_H__ */
+* Unmerged path include/linux/libnvdimm.h
+diff --git a/include/linux/nd.h b/include/linux/nd.h
+new file mode 100644
+index 000000000000..e074f67e53a3
+--- /dev/null
++++ b/include/linux/nd.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#ifndef __LINUX_ND_H__
++#define __LINUX_ND_H__
++#include <linux/ndctl.h>
++#include <linux/device.h>
++
++struct nd_device_driver {
++	struct device_driver drv;
++	unsigned long type;
++	int (*probe)(struct device *dev);
++	int (*remove)(struct device *dev);
++};
++
++static inline struct nd_device_driver *to_nd_device_driver(
++		struct device_driver *drv)
++{
++	return container_of(drv, struct nd_device_driver, drv);
++}
++
++#define MODULE_ALIAS_ND_DEVICE(type) \
++	MODULE_ALIAS("nd:t" __stringify(type) "*")
++#define ND_DEVICE_MODALIAS_FMT "nd:t%d"
++
++int __must_check __nd_driver_register(struct nd_device_driver *nd_drv,
++		struct module *module, const char *mod_name);
++#define nd_driver_register(driver) \
++	__nd_driver_register(driver, THIS_MODULE, KBUILD_MODNAME)
++#endif /* __LINUX_ND_H__ */
+* Unmerged path include/uapi/linux/ndctl.h
