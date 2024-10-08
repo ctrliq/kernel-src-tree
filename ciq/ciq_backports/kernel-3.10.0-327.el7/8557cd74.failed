@@ -1,0 +1,320 @@
+bonding: replace SLAVE_IS_OK() with bond_slave_can_tx()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Veaceslav Falico <vfalico@gmail.com>
+commit 8557cd74ca8af9a71ae19d445e33d92bd50a6dc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8557cd74.failed
+
+They're verifying the same thing (except of IFF_UP, which is implied for
+netif_running(), which is also a prerequisite).
+
+CC: Jay Vosburgh <j.vosburgh@gmail.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Veaceslav Falico <vfalico@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8557cd74ca8af9a71ae19d445e33d92bd50a6dc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_3ad.c
+index dc508c87249d,0dfeaf5da3f2..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -2454,20 -2436,28 +2454,33 @@@ int bond_3ad_xmit_xor(struct sk_buff *s
+  	agg_id = ad_info.aggregator_id;
+  
+  	if (slaves_in_agg == 0) {
+ +		/*the aggregator is empty*/
+  		pr_debug("%s: Error: active aggregator is empty\n", dev->name);
+ -		goto err_free;
+ +		goto out;
+  	}
+  
+ -	slave_agg_no = bond_xmit_hash(bond, skb) % slaves_in_agg;
+ -	first_ok_slave = NULL;
+ +	slave_agg_no = bond->xmit_hash_policy(skb, slaves_in_agg);
+  
+ -	bond_for_each_slave_rcu(bond, slave, iter) {
+ -		agg = SLAVE_AD_INFO(slave)->port.aggregator;
+ -		if (!agg || agg->aggregator_identifier != agg_id)
+ -			continue;
+ +	bond_for_each_slave(bond, slave, i) {
+ +		struct aggregator *agg = SLAVE_AD_INFO(slave).port.aggregator;
+  
+++<<<<<<< HEAD
+ +		if (agg && (agg->aggregator_identifier == agg_id)) {
+ +			slave_agg_no--;
+ +			if (slave_agg_no < 0)
+ +				break;
+++=======
++ 		if (slave_agg_no >= 0) {
++ 			if (!first_ok_slave && bond_slave_can_tx(slave))
++ 				first_ok_slave = slave;
++ 			slave_agg_no--;
++ 			continue;
++ 		}
++ 
++ 		if (bond_slave_can_tx(slave)) {
++ 			bond_dev_queue_xmit(bond, skb, slave->dev);
++ 			goto out;
+++>>>>>>> 8557cd74ca8a (bonding: replace SLAVE_IS_OK() with bond_slave_can_tx())
+  		}
+  	}
+  
+diff --cc drivers/net/bonding/bond_alb.c
+index d3256b311be3,03e0bcade234..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -228,8 -227,8 +228,13 @@@ static struct slave *tlb_get_least_load
+  	max_gap = LLONG_MIN;
+  
+  	/* Find the slave with the largest gap */
+++<<<<<<< HEAD
+ +	bond_for_each_slave(bond, slave, i) {
+ +		if (SLAVE_IS_OK(slave)) {
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (bond_slave_can_tx(slave)) {
+++>>>>>>> 8557cd74ca8a (bonding: replace SLAVE_IS_OK() with bond_slave_can_tx())
+  			long long gap = compute_gap(slave);
+  
+  			if (max_gap < gap) {
+@@@ -379,30 -378,64 +384,67 @@@ out
+  static struct slave *rlb_next_rx_slave(struct bonding *bond)
+  {
+  	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct slave *before = NULL, *rx_slave = NULL, *slave;
+ -	struct list_head *iter;
+ -	bool found = false;
+ +	struct slave *rx_slave, *slave, *start_at;
+ +	int i = 0;
+  
+++<<<<<<< HEAD
+ +	if (bond_info->next_rx_slave) {
+ +		start_at = bond_info->next_rx_slave;
+ +	} else {
+ +		start_at = bond->first_slave;
+++=======
++ 	bond_for_each_slave(bond, slave, iter) {
++ 		if (!bond_slave_can_tx(slave))
++ 			continue;
++ 		if (!found) {
++ 			if (!before || before->speed < slave->speed)
++ 				before = slave;
++ 		} else {
++ 			if (!rx_slave || rx_slave->speed < slave->speed)
++ 				rx_slave = slave;
++ 		}
++ 		if (slave == bond_info->rx_slave)
++ 			found = true;
+++>>>>>>> 8557cd74ca8a (bonding: replace SLAVE_IS_OK() with bond_slave_can_tx())
+  	}
+ -	/* we didn't find anything after the current or we have something
+ -	 * better before and up to the current slave
+ -	 */
+ -	if (!rx_slave || (before && rx_slave->speed < before->speed))
+ -		rx_slave = before;
+  
+ -	if (rx_slave)
+ -		bond_info->rx_slave = rx_slave;
+ +	rx_slave = NULL;
+  
+++<<<<<<< HEAD
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		if (SLAVE_IS_OK(slave)) {
+ +			if (!rx_slave) {
+++=======
++ 	return rx_slave;
++ }
++ 
++ /* Caller must hold rcu_read_lock() for read */
++ static struct slave *__rlb_next_rx_slave(struct bonding *bond)
++ {
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct slave *before = NULL, *rx_slave = NULL, *slave;
++ 	struct list_head *iter;
++ 	bool found = false;
++ 
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (!bond_slave_can_tx(slave))
++ 			continue;
++ 		if (!found) {
++ 			if (!before || before->speed < slave->speed)
++ 				before = slave;
++ 		} else {
++ 			if (!rx_slave || rx_slave->speed < slave->speed)
+++>>>>>>> 8557cd74ca8a (bonding: replace SLAVE_IS_OK() with bond_slave_can_tx())
+ +				rx_slave = slave;
+ +			} else if (slave->speed > rx_slave->speed) {
+  				rx_slave = slave;
+ +			}
+  		}
+ -		if (slave == bond_info->rx_slave)
+ -			found = true;
+  	}
+ -	/* we didn't find anything after the current or we have something
+ -	 * better before and up to the current slave
+ -	 */
+ -	if (!rx_slave || (before && rx_slave->speed < before->speed))
+ -		rx_slave = before;
+  
+ -	if (rx_slave)
+ -		bond_info->rx_slave = rx_slave;
+ +	if (rx_slave) {
+ +		bond_info->next_rx_slave = rx_slave->next;
+ +	}
+  
+  	return rx_slave;
+  }
+@@@ -1314,9 -1343,79 +1356,69 @@@ void bond_alb_deinitialize(struct bondi
+  
+  	tlb_deinitialize(bond);
+  
+ -	if (bond_info->rlb_enabled)
+ +	if (bond_info->rlb_enabled) {
+  		rlb_deinitialize(bond);
+ -}
+ -
+ -static int bond_do_alb_xmit(struct sk_buff *skb, struct bonding *bond,
+ -		struct slave *tx_slave)
+ -{
+ -	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct ethhdr *eth_data = eth_hdr(skb);
+ -
+ -	if (!tx_slave) {
+ -		/* unbalanced or unassigned, send through primary */
+ -		tx_slave = rcu_dereference(bond->curr_active_slave);
+ -		if (bond->params.tlb_dynamic_lb)
+ -			bond_info->unbalanced_load += skb->len;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (tx_slave && bond_slave_can_tx(tx_slave)) {
++ 		if (tx_slave != rcu_dereference(bond->curr_active_slave)) {
++ 			ether_addr_copy(eth_data->h_source,
++ 					tx_slave->dev->dev_addr);
++ 		}
++ 
++ 		bond_dev_queue_xmit(bond, skb, tx_slave->dev);
++ 		goto out;
++ 	}
++ 
++ 	if (tx_slave && bond->params.tlb_dynamic_lb) {
++ 		_lock_tx_hashtbl(bond);
++ 		__tlb_clear_slave(bond, tx_slave, 0);
++ 		_unlock_tx_hashtbl(bond);
++ 	}
++ 
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ out:
++ 	return NETDEV_TX_OK;
++ }
++ 
++ int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct ethhdr *eth_data;
++ 	struct slave *tx_slave = NULL;
++ 	u32 hash_index;
++ 
++ 	skb_reset_mac_header(skb);
++ 	eth_data = eth_hdr(skb);
++ 
++ 	/* Do not TX balance any multicast or broadcast */
++ 	if (!is_multicast_ether_addr(eth_data->h_dest)) {
++ 		switch (skb->protocol) {
++ 		case htons(ETH_P_IP):
++ 		case htons(ETH_P_IPX):
++ 		    /* In case of IPX, it will falback to L2 hash */
++ 		case htons(ETH_P_IPV6):
++ 			hash_index = bond_xmit_hash(bond, skb);
++ 			if (bond->params.tlb_dynamic_lb) {
++ 				tx_slave = tlb_choose_channel(bond,
++ 							      hash_index & 0xFF,
++ 							      skb->len);
++ 			} else {
++ 				struct list_head *iter;
++ 				int idx = hash_index % bond->slave_cnt;
++ 
++ 				bond_for_each_slave_rcu(bond, tx_slave, iter)
++ 					if (--idx < 0)
++ 						break;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	return bond_do_alb_xmit(skb, bond, tx_slave);
+++>>>>>>> 8557cd74ca8a (bonding: replace SLAVE_IS_OK() with bond_slave_can_tx())
+  }
+  
+  int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+diff --cc drivers/net/bonding/bond_main.c
+index d0eec7c786f0,712320532105..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -4162,8 -3856,8 +4162,13 @@@ static int bond_ethtool_get_settings(st
+  	 * this is an accurate maximum.
+  	 */
+  	read_lock(&bond->lock);
+++<<<<<<< HEAD
+ +	bond_for_each_slave(bond, slave, i) {
+ +		if (SLAVE_IS_OK(slave)) {
+++=======
++ 	bond_for_each_slave(bond, slave, iter) {
++ 		if (bond_slave_can_tx(slave)) {
+++>>>>>>> 8557cd74ca8a (bonding: replace SLAVE_IS_OK() with bond_slave_can_tx())
+  			if (slave->speed != SPEED_UNKNOWN)
+  				speed += slave->speed;
+  			if (ecmd->duplex == DUPLEX_UNKNOWN &&
+diff --cc drivers/net/bonding/bonding.h
+index e1ca02f0b074,44334b3d3b88..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -35,30 -38,9 +35,33 @@@
+  
+  #define BOND_MAX_ARP_TARGETS	16
+  
+ -#define BOND_DEFAULT_MIIMON	100
+ +#define IS_UP(dev)					   \
+ +	      ((((dev)->flags & IFF_UP) == IFF_UP)	&& \
+ +	       netif_running(dev)			&& \
+ +	       netif_carrier_ok(dev))
+  
+  /*
+++<<<<<<< HEAD
+ + * Checks whether slave is ready for transmit.
+ + */
+ +#define SLAVE_IS_OK(slave)			        \
+ +		    (((slave)->dev->flags & IFF_UP)  && \
+ +		     netif_running((slave)->dev)     && \
+ +		     ((slave)->link == BOND_LINK_UP) && \
+ +		     bond_is_active_slave(slave))
+ +
+ +
+ +#define USES_PRIMARY(mode)				\
+ +		(((mode) == BOND_MODE_ACTIVEBACKUP) ||	\
+ +		 ((mode) == BOND_MODE_TLB)          ||	\
+ +		 ((mode) == BOND_MODE_ALB))
+ +
+ +#define TX_QUEUE_OVERRIDE(mode)				\
+ +			(((mode) == BOND_MODE_ACTIVEBACKUP) ||	\
+ +			 ((mode) == BOND_MODE_ROUNDROBIN))
+ +/*
+++=======
+++>>>>>>> 8557cd74ca8a (bonding: replace SLAVE_IS_OK() with bond_slave_can_tx())
+   * Less bad way to call ioctl from within the kernel; this needs to be
+   * done some other way to get the call out of interrupt context.
+   * Needs "ioctl" variable to be supplied by calling context.
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_alb.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bonding.h
