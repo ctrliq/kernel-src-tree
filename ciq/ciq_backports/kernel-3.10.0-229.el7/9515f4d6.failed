@@ -1,0 +1,211 @@
+cpufreq: remove policy from cpufreq_policy_list during suspend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] remove policy from cpufreq_policy_list during suspend (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 92.17%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 9515f4d69b92feafe37581047a1bb41e41602faa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9515f4d6.failed
+
+cpufreq_policy_list is a list of active policies.  We do remove
+policies from this list when all CPUs belonging to that policy are
+removed.  But during system suspend we don't really free a policy
+struct as it will be used again during resume, so we didn't remove
+it from cpufreq_policy_list as well..
+
+However, this is incorrect.  We are saying this policy isn't valid
+anymore and must not be referenced (though we haven't freed it), but
+it can still be used by code that iterates over cpufreq_policy_list.
+
+Remove policy from this list during system suspend as well.
+Of course, we must add it back whenever the first CPU belonging to
+that policy shows up.
+
+[rjw: Changelog]
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 9515f4d69b92feafe37581047a1bb41e41602faa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 7ca34bc0090e,030212104fe6..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -904,16 -909,54 +904,67 @@@ static int cpufreq_add_policy_cpu(unsig
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	INIT_LIST_HEAD(&policy->policy_list);
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
++ 			     bool frozen)
+++>>>>>>> 9515f4d69b92 (cpufreq: remove policy from cpufreq_policy_list during suspend)
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+@@@ -1017,9 -1059,15 +1068,21 @@@
+  	}
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+++<<<<<<< HEAD
+ +	ret = cpufreq_add_dev_interface(cpu, policy, dev);
+ +	if (ret)
+ +		goto err_out_unregister;
+++=======
++ 	if (!frozen) {
++ 		ret = cpufreq_add_dev_interface(policy, dev);
++ 		if (ret)
++ 			goto err_out_unregister;
++ 	}
+++>>>>>>> 9515f4d69b92 (cpufreq: remove policy from cpufreq_policy_list during suspend)
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	list_add(&policy->policy_list, &cpufreq_policy_list);
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+  	cpufreq_init_policy(policy);
+  
+@@@ -1162,33 -1239,56 +1225,43 @@@ static int __cpufreq_remove_dev(struct 
+  
+  	/* If cpu is last user of policy, free policy */
+  	if (cpus == 1) {
+ -		if (cpufreq_driver->target) {
+ -			ret = __cpufreq_governor(policy,
+ -					CPUFREQ_GOV_POLICY_EXIT);
+ -			if (ret) {
+ -				pr_err("%s: Failed to exit governor\n",
+ -						__func__);
+ -				return ret;
+ -			}
+ -		}
+ -
+ -		if (!frozen) {
+ -			lock_policy_rwsem_read(cpu);
+ -			kobj = &policy->kobj;
+ -			cmp = &policy->kobj_unregister;
+ -			unlock_policy_rwsem_read(cpu);
+ -			kobject_put(kobj);
+ -
+ -			/*
+ -			 * We need to make sure that the underlying kobj is
+ -			 * actually not referenced anymore by anybody before we
+ -			 * proceed with unloading.
+ -			 */
+ -			pr_debug("waiting for dropping of refcount\n");
+ -			wait_for_completion(cmp);
+ -			pr_debug("wait complete\n");
+ -		}
+ -
+ -		/*
+ -		 * Perform the ->exit() even during light-weight tear-down,
+ -		 * since this is a core component, and is essential for the
+ -		 * subsequent light-weight ->init() to succeed.
+ +		if (cpufreq_driver->target)
+ +			__cpufreq_governor(data, CPUFREQ_GOV_POLICY_EXIT);
+ +
+ +		lock_policy_rwsem_read(cpu);
+ +		kobj = &data->kobj;
+ +		cmp = &data->kobj_unregister;
+ +		unlock_policy_rwsem_read(cpu);
+ +		kobject_put(kobj);
+ +
+ +		/* we need to make sure that the underlying kobj is actually
+ +		 * not referenced anymore by anybody before we proceed with
+ +		 * unloading.
+  		 */
+ +		pr_debug("waiting for dropping of refcount\n");
+ +		wait_for_completion(cmp);
+ +		pr_debug("wait complete\n");
+ +
+++<<<<<<< HEAD
+  		if (cpufreq_driver->exit)
+ -			cpufreq_driver->exit(policy);
+ +			cpufreq_driver->exit(data);
+  
+ +		free_cpumask_var(data->related_cpus);
+ +		free_cpumask_var(data->cpus);
+ +		kfree(data);
+++=======
++ 		/* Remove policy from list of active policies */
++ 		write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 		list_del(&policy->policy_list);
++ 		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 		if (!frozen)
++ 			cpufreq_policy_free(policy);
+++>>>>>>> 9515f4d69b92 (cpufreq: remove policy from cpufreq_policy_list during suspend)
+  	} else {
+  		if (cpufreq_driver->target) {
+ -			if ((ret = __cpufreq_governor(policy, CPUFREQ_GOV_START)) ||
+ -					(ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))) {
+ -				pr_err("%s: Failed to start governor\n",
+ -						__func__);
+ -				return ret;
+ -			}
+ +			__cpufreq_governor(data, CPUFREQ_GOV_START);
+ +			__cpufreq_governor(data, CPUFREQ_GOV_LIMITS);
+  		}
+  	}
+  
+* Unmerged path drivers/cpufreq/cpufreq.c
