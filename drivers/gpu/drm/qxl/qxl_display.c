@@ -161,7 +161,9 @@ void qxl_display_read_client_monitors_config(struct qxl_device *qdev)
 	drm_sysfs_hotplug_event(qdev->ddev);
 }
 
-static int qxl_add_monitors_config_modes(struct drm_connector *connector)
+static int qxl_add_monitors_config_modes(struct drm_connector *connector,
+                                         unsigned *pwidth,
+                                         unsigned *pheight)
 {
 	struct drm_device *dev = connector->dev;
 	struct qxl_device *qdev = dev->dev_private;
@@ -177,11 +179,15 @@ static int qxl_add_monitors_config_modes(struct drm_connector *connector)
 	mode = drm_cvt_mode(dev, head->width, head->height, 60, false, false,
 			    false);
 	mode->type |= DRM_MODE_TYPE_PREFERRED;
+	*pwidth = head->width;
+	*pheight = head->height;
 	drm_mode_probed_add(connector, mode);
 	return 1;
 }
 
-static int qxl_add_common_modes(struct drm_connector *connector)
+static int qxl_add_common_modes(struct drm_connector *connector,
+                                unsigned pwidth,
+                                unsigned pheight)
 {
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode = NULL;
@@ -215,7 +221,7 @@ static int qxl_add_common_modes(struct drm_connector *connector)
 
 		mode = drm_cvt_mode(dev, common_modes[i].w, common_modes[i].h,
 				    60, false, false, false);
-		if (common_modes[i].w == 1024 && common_modes[i].h == 768)
+		if (common_modes[i].w == pwidth && common_modes[i].h == pheight)
 			mode->type |= DRM_MODE_TYPE_PREFERRED;
 		drm_mode_probed_add(connector, mode);
 	}
@@ -741,16 +747,18 @@ static int qxl_conn_get_modes(struct drm_connector *connector)
 {
 	int ret = 0;
 	struct qxl_device *qdev = connector->dev->dev_private;
+	unsigned pwidth = 1024;
+	unsigned pheight = 768;
 
 	DRM_DEBUG_KMS("monitors_config=%p\n", qdev->monitors_config);
 	/* TODO: what should we do here? only show the configured modes for the
 	 * device, or allow the full list, or both? */
 	if (qdev->monitors_config && qdev->monitors_config->count) {
-		ret = qxl_add_monitors_config_modes(connector);
+		ret = qxl_add_monitors_config_modes(connector, &pwidth, &pheight);
 		if (ret < 0)
 			return ret;
 	}
-	ret += qxl_add_common_modes(connector);
+	ret += qxl_add_common_modes(connector, pwidth, pheight);
 	return ret;
 }
 
