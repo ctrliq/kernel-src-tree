@@ -1,0 +1,283 @@
+uprobes/x86: Refuse to attach uprobe to "word-sized" branch insns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Refuse to attach uprobe to "word-sized" branch insns (Oleg Nesterov) [1073627]
+Rebuild_FUZZ: 96.83%
+commit-author Denys Vlasenko <dvlasenk@redhat.com>
+commit 250bbd12c2fe1221ec96d8087d63e982d4f2180a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/250bbd12.failed
+
+All branch insns on x86 can be prefixed with the operand-size
+override prefix, 0x66. It was only ever useful for performing
+jumps to 32-bit offsets in 16-bit code segments.
+
+In 32-bit code, such instructions are useless since
+they cause IP truncation to 16 bits, and in case of call insns,
+they save only 16 bits of return address and misalign
+the stack pointer as a "bonus".
+
+In 64-bit code, such instructions are treated differently by Intel
+and AMD CPUs: Intel ignores the prefix altogether,
+AMD treats them the same as in 32-bit mode.
+
+Before this patch, the emulation code would execute
+the instructions as if they have no 0x66 prefix.
+
+With this patch, we refuse to attach uprobes to such insns.
+
+	Signed-off-by: Denys Vlasenko <dvlasenk@redhat.com>
+	Acked-by: Jim Keniston <jkenisto@us.ibm.com>
+	Acked-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+(cherry picked from commit 250bbd12c2fe1221ec96d8087d63e982d4f2180a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/uprobes.c
+diff --cc arch/x86/kernel/uprobes.c
+index 7ea7d2b3594b,3cf24a218196..000000000000
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@@ -402,6 -402,235 +402,238 @@@ static int validate_insn_bits(struct ar
+  }
+  #endif /* CONFIG_X86_64 */
+  
+++<<<<<<< HEAD
+++=======
++ struct uprobe_xol_ops {
++ 	bool	(*emulate)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*pre_xol)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*post_xol)(struct arch_uprobe *, struct pt_regs *);
++ };
++ 
++ static inline int sizeof_long(void)
++ {
++ 	return is_ia32_task() ? 4 : 8;
++ }
++ 
++ static int default_pre_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	pre_xol_rip_insn(auprobe, regs, &current->utask->autask);
++ 	return 0;
++ }
++ 
++ /*
++  * Adjust the return address pushed by a call insn executed out of line.
++  */
++ static int adjust_ret_addr(unsigned long sp, long correction)
++ {
++ 	int rasize = sizeof_long();
++ 	long ra;
++ 
++ 	if (copy_from_user(&ra, (void __user *)sp, rasize))
++ 		return -EFAULT;
++ 
++ 	ra += correction;
++ 	if (copy_to_user((void __user *)sp, &ra, rasize))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	struct uprobe_task *utask = current->utask;
++ 	long correction = (long)(utask->vaddr - utask->xol_vaddr);
++ 
++ 	handle_riprel_post_xol(auprobe, regs, &correction);
++ 	if (auprobe->fixups & UPROBE_FIX_IP)
++ 		regs->ip += correction;
++ 
++ 	if (auprobe->fixups & UPROBE_FIX_CALL) {
++ 		if (adjust_ret_addr(regs->sp, correction)) {
++ 			regs->sp += sizeof_long();
++ 			return -ERESTART;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct uprobe_xol_ops default_xol_ops = {
++ 	.pre_xol  = default_pre_xol_op,
++ 	.post_xol = default_post_xol_op,
++ };
++ 
++ static bool branch_is_call(struct arch_uprobe *auprobe)
++ {
++ 	return auprobe->branch.opc1 == 0xe8;
++ }
++ 
++ #define CASE_COND					\
++ 	COND(70, 71, XF(OF))				\
++ 	COND(72, 73, XF(CF))				\
++ 	COND(74, 75, XF(ZF))				\
++ 	COND(78, 79, XF(SF))				\
++ 	COND(7a, 7b, XF(PF))				\
++ 	COND(76, 77, XF(CF) || XF(ZF))			\
++ 	COND(7c, 7d, XF(SF) != XF(OF))			\
++ 	COND(7e, 7f, XF(ZF) || XF(SF) != XF(OF))
++ 
++ #define COND(op_y, op_n, expr)				\
++ 	case 0x ## op_y: DO((expr) != 0)		\
++ 	case 0x ## op_n: DO((expr) == 0)
++ 
++ #define XF(xf)	(!!(flags & X86_EFLAGS_ ## xf))
++ 
++ static bool is_cond_jmp_opcode(u8 opcode)
++ {
++ 	switch (opcode) {
++ 	#define DO(expr)	\
++ 		return true;
++ 	CASE_COND
++ 	#undef	DO
++ 
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static bool check_jmp_cond(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	unsigned long flags = regs->flags;
++ 
++ 	switch (auprobe->branch.opc1) {
++ 	#define DO(expr)	\
++ 		return expr;
++ 	CASE_COND
++ 	#undef	DO
++ 
++ 	default:	/* not a conditional jmp */
++ 		return true;
++ 	}
++ }
++ 
++ #undef	XF
++ #undef	COND
++ #undef	CASE_COND
++ 
++ static bool branch_emulate_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	unsigned long new_ip = regs->ip += auprobe->branch.ilen;
++ 	unsigned long offs = (long)auprobe->branch.offs;
++ 
++ 	if (branch_is_call(auprobe)) {
++ 		unsigned long new_sp = regs->sp - sizeof_long();
++ 		/*
++ 		 * If it fails we execute this (mangled, see the comment in
++ 		 * branch_clear_offset) insn out-of-line. In the likely case
++ 		 * this should trigger the trap, and the probed application
++ 		 * should die or restart the same insn after it handles the
++ 		 * signal, arch_uprobe_post_xol() won't be even called.
++ 		 *
++ 		 * But there is corner case, see the comment in ->post_xol().
++ 		 */
++ 		if (copy_to_user((void __user *)new_sp, &new_ip, sizeof_long()))
++ 			return false;
++ 		regs->sp = new_sp;
++ 	} else if (!check_jmp_cond(auprobe, regs)) {
++ 		offs = 0;
++ 	}
++ 
++ 	regs->ip = new_ip + offs;
++ 	return true;
++ }
++ 
++ static int branch_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	BUG_ON(!branch_is_call(auprobe));
++ 	/*
++ 	 * We can only get here if branch_emulate_op() failed to push the ret
++ 	 * address _and_ another thread expanded our stack before the (mangled)
++ 	 * "call" insn was executed out-of-line. Just restore ->sp and restart.
++ 	 * We could also restore ->ip and try to call branch_emulate_op() again.
++ 	 */
++ 	regs->sp += sizeof_long();
++ 	return -ERESTART;
++ }
++ 
++ static void branch_clear_offset(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 	/*
++ 	 * Turn this insn into "call 1f; 1:", this is what we will execute
++ 	 * out-of-line if ->emulate() fails. We only need this to generate
++ 	 * a trap, so that the probed task receives the correct signal with
++ 	 * the properly filled siginfo.
++ 	 *
++ 	 * But see the comment in ->post_xol(), in the unlikely case it can
++ 	 * succeed. So we need to ensure that the new ->ip can not fall into
++ 	 * the non-canonical area and trigger #GP.
++ 	 *
++ 	 * We could turn it into (say) "pushf", but then we would need to
++ 	 * divorce ->insn[] and ->ixol[]. We need to preserve the 1st byte
++ 	 * of ->insn[] for set_orig_insn().
++ 	 */
++ 	memset(auprobe->insn + insn_offset_immediate(insn),
++ 		0, insn->immediate.nbytes);
++ }
++ 
++ static struct uprobe_xol_ops branch_xol_ops = {
++ 	.emulate  = branch_emulate_op,
++ 	.post_xol = branch_post_xol_op,
++ };
++ 
++ /* Returns -ENOSYS if branch_xol_ops doesn't handle this insn */
++ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 	u8 opc1 = OPCODE1(insn);
++ 	int i;
++ 
++ 	/* has the side-effect of processing the entire instruction */
++ 	insn_get_length(insn);
++ 	if (WARN_ON_ONCE(!insn_complete(insn)))
++ 		return -ENOEXEC;
++ 
++ 	switch (opc1) {
++ 	case 0xeb:	/* jmp 8 */
++ 	case 0xe9:	/* jmp 32 */
++ 	case 0x90:	/* prefix* + nop; same as jmp with .offs = 0 */
++ 		break;
++ 
++ 	case 0xe8:	/* call relative */
++ 		branch_clear_offset(auprobe, insn);
++ 		break;
++ 
++ 	case 0x0f:
++ 		if (insn->opcode.nbytes != 2)
++ 			return -ENOSYS;
++ 		/*
++ 		 * If it is a "near" conditional jmp, OPCODE2() - 0x10 matches
++ 		 * OPCODE1() of the "short" jmp which checks the same condition.
++ 		 */
++ 		opc1 = OPCODE2(insn) - 0x10;
++ 	default:
++ 		if (!is_cond_jmp_opcode(opc1))
++ 			return -ENOSYS;
++ 	}
++ 
++ 	/*
++ 	 * 16-bit overrides such as CALLW (66 e8 nn nn) are not supported.
++ 	 * Intel and AMD behavior differ in 64-bit mode: Intel ignores 66 prefix.
++ 	 * No one uses these insns, reject any branch insns with such prefix.
++ 	 */
++ 	for (i = 0; i < insn->prefixes.nbytes; i++) {
++ 		if (insn->prefixes.bytes[i] == 0x66)
++ 			return -ENOTSUPP;
++ 	}
++ 
++ 	auprobe->branch.opc1 = opc1;
++ 	auprobe->branch.ilen = insn->length;
++ 	auprobe->branch.offs = insn->immediate.value;
++ 
++ 	auprobe->ops = &branch_xol_ops;
++ 	return 0;
++ }
++ 
+++>>>>>>> 250bbd12c2fe (uprobes/x86: Refuse to attach uprobe to "word-sized" branch insns)
+  /**
+   * arch_uprobe_analyze_insn - instruction analysis including validity and fixups.
+   * @mm: the probed address space.
+* Unmerged path arch/x86/kernel/uprobes.c
