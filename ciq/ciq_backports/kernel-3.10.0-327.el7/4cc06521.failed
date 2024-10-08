@@ -1,0 +1,312 @@
+NVMe: add sysfs and ioctl controller reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 4cc06521ee1f153e0d292413a5bff7bbbdee92d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4cc06521.failed
+
+We need the ability to perform an nvme controller reset as discussed on
+the mailing list thread:
+
+  http://lists.infradead.org/pipermail/linux-nvme/2015-March/001585.html
+
+This adds a sysfs entry that when written to will reset perform an NVMe
+controller reset if the controller was successfully initialized in the
+first place.
+
+This also adds locking around resetting the device in the async probe
+method so the driver can't schedule two resets.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Cc: Brandon Schultz <brandon.schulz@hgst.com>
+	Cc: David Sariel <david.sariel@pmcs.com>
+
+Updated by Jens to:
+
+1) Merge this with the ioctl reset patch from David Sariel. The ioctl
+   path now shares the reset code from the sysfs path.
+
+2) Don't flush work if we fail issuing the reset.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 4cc06521ee1f153e0d292413a5bff7bbbdee92d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 29d2b5fb1975,9682e29b4171..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -74,7 -77,11 +74,12 @@@ static struct task_struct *nvme_thread
+  static struct workqueue_struct *nvme_workq;
+  static wait_queue_head_t nvme_kthread_wait;
+  
+ -static struct class *nvme_class;
+ -
+  static void nvme_reset_failed_dev(struct work_struct *ws);
+++<<<<<<< HEAD
+++=======
++ static int nvme_reset(struct nvme_dev *dev);
++ static int nvme_process_cq(struct nvme_queue *nvmeq);
+++>>>>>>> 4cc06521ee1f (NVMe: add sysfs and ioctl controller reset)
+  
+  struct async_cmd_info {
+  	struct kthread_work work;
+@@@ -2830,11 -2680,19 +2835,21 @@@ static int nvme_dev_release(struct inod
+  static long nvme_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+  {
+  	struct nvme_dev *dev = f->private_data;
+ -	struct nvme_ns *ns;
+ -
+  	switch (cmd) {
+  	case NVME_IOCTL_ADMIN_CMD:
+ -		return nvme_user_cmd(dev, NULL, (void __user *)arg);
+ +		return nvme_user_cmd(dev, (void __user *)arg, false);
+  	case NVME_IOCTL_IO_CMD:
+++<<<<<<< HEAD
+ +		return nvme_user_cmd(dev, (void __user *)arg, true);
+++=======
++ 		if (list_empty(&dev->namespaces))
++ 			return -ENOTTY;
++ 		ns = list_first_entry(&dev->namespaces, struct nvme_ns, list);
++ 		return nvme_user_cmd(dev, ns, (void __user *)arg);
++ 	case NVME_IOCTL_RESET:
++ 		dev_warn(dev->dev, "resetting controller\n");
++ 		return nvme_reset(dev);
+++>>>>>>> 4cc06521ee1f (NVMe: add sysfs and ioctl controller reset)
+  	default:
+  		return -ENOTTY;
+  	}
+@@@ -2952,30 -2837,76 +2967,78 @@@ static void nvme_reset_failed_dev(struc
+  	nvme_dev_reset(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_reset_workfn(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, reset_work);
++ 	dev->reset_workfn(work);
++ }
++ 
++ static int nvme_reset(struct nvme_dev *dev)
++ {
++ 	int ret = -EBUSY;
++ 
++ 	if (!dev->admin_q || blk_queue_dying(dev->admin_q))
++ 		return -ENODEV;
++ 
++ 	spin_lock(&dev_list_lock);
++ 	if (!work_pending(&dev->reset_work)) {
++ 		dev->reset_workfn = nvme_reset_failed_dev;
++ 		queue_work(nvme_workq, &dev->reset_work);
++ 		ret = 0;
++ 	}
++ 	spin_unlock(&dev_list_lock);
++ 
++ 	if (!ret) {
++ 		flush_work(&dev->reset_work);
++ 		return 0;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t nvme_sysfs_reset(struct device *dev,
++ 				struct device_attribute *attr, const char *buf,
++ 				size_t count)
++ {
++ 	struct nvme_dev *ndev = dev_get_drvdata(dev);
++ 	int ret;
++ 
++ 	ret = nvme_reset(ndev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return count;
++ }
++ static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
++ 
++ static void nvme_async_probe(struct work_struct *work);
+++>>>>>>> 4cc06521ee1f (NVMe: add sysfs and ioctl controller reset)
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+ -	int node, result = -ENOMEM;
+ +	int result = -ENOMEM;
+  	struct nvme_dev *dev;
+  
+ -	node = dev_to_node(&pdev->dev);
+ -	if (node == NUMA_NO_NODE)
+ -		set_dev_node(&pdev->dev, 0);
+ -
+ -	dev = kzalloc_node(sizeof(*dev), GFP_KERNEL, node);
+ +	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+  	if (!dev)
+  		return -ENOMEM;
+ -	dev->entry = kzalloc_node(num_possible_cpus() * sizeof(*dev->entry),
+ -							GFP_KERNEL, node);
+ +	dev->entry = kcalloc(num_possible_cpus(), sizeof(*dev->entry),
+ +								GFP_KERNEL);
+  	if (!dev->entry)
+  		goto free;
+ -	dev->queues = kzalloc_node((num_possible_cpus() + 1) * sizeof(void *),
+ -							GFP_KERNEL, node);
+ +	dev->queues = kcalloc(num_possible_cpus() + 1, sizeof(void *),
+ +								GFP_KERNEL);
+  	if (!dev->queues)
+  		goto free;
+ +	dev->io_queue = alloc_percpu(unsigned short);
+ +	if (!dev->io_queue)
+ +		goto free;
+  
+  	INIT_LIST_HEAD(&dev->namespaces);
+ -	dev->reset_workfn = nvme_reset_failed_dev;
+ -	INIT_WORK(&dev->reset_work, nvme_reset_workfn);
+ -	dev->dev = get_device(&pdev->dev);
+ +	INIT_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +	INIT_WORK(&dev->cpu_work, nvme_cpu_workfn);
+ +	dev->pci_dev = pci_dev_get(pdev);
+  	pci_set_drvdata(pdev, dev);
+  	result = nvme_set_instance(dev);
+  	if (result)
+@@@ -2986,45 -2917,64 +3049,100 @@@
+  		goto release;
+  
+  	kref_init(&dev->kref);
+++<<<<<<< HEAD
+++=======
++ 	dev->device = device_create(nvme_class, &pdev->dev,
++ 				MKDEV(nvme_char_major, dev->instance),
++ 				dev, "nvme%d", dev->instance);
++ 	if (IS_ERR(dev->device)) {
++ 		result = PTR_ERR(dev->device);
++ 		goto release_pools;
++ 	}
++ 	get_device(dev->device);
++ 	dev_set_drvdata(dev->device, dev);
++ 
++ 	result = device_create_file(dev->device, &dev_attr_reset_controller);
++ 	if (result)
++ 		goto put_dev;
++ 
++ 	INIT_LIST_HEAD(&dev->node);
++ 	INIT_WORK(&dev->probe_work, nvme_async_probe);
++ 	schedule_work(&dev->probe_work);
++ 	return 0;
++ 
++  put_dev:
++ 	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
++ 	put_device(dev->device);
++  release_pools:
++ 	nvme_release_prp_pools(dev);
++  release:
++ 	nvme_release_instance(dev);
++  put_pci:
++ 	put_device(dev->dev);
++  free:
++ 	kfree(dev->queues);
++ 	kfree(dev->entry);
++ 	kfree(dev);
++ 	return result;
++ }
++ 
++ static void nvme_async_probe(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, probe_work);
++ 	int result;
++ 
+++>>>>>>> 4cc06521ee1f (NVMe: add sysfs and ioctl controller reset)
+  	result = nvme_dev_start(dev);
+  	if (result)
+ -		goto reset;
+ +		goto release_pools;
+  
+  	if (dev->online_queues > 1)
+  		result = nvme_dev_add(dev);
+  	if (result)
+ -		goto reset;
+ +		goto shutdown;
+ +
+++<<<<<<< HEAD
+ +	scnprintf(dev->name, sizeof(dev->name), "nvme%d", dev->instance);
+ +	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+ +	dev->miscdev.parent = &pdev->dev;
+ +	dev->miscdev.name = dev->name;
+ +	dev->miscdev.fops = &nvme_dev_fops;
+ +	result = misc_register(&dev->miscdev);
+ +	if (result)
+ +		goto remove;
+ +
+ +	dev->initialized = 1;
+ +	return 0;
+  
+ + remove:
+ +	nvme_dev_remove(dev);
+ +	nvme_free_namespaces(dev);
+ + shutdown:
+ +	nvme_dev_shutdown(dev);
+ + release_pools:
+ +	nvme_free_queues(dev, 0);
+ +	nvme_release_prp_pools(dev);
+ + release:
+ +	nvme_release_instance(dev);
+ + put_pci:
+ +	pci_dev_put(dev->pci_dev);
+ + free:
+ +	free_percpu(dev->io_queue);
+ +	kfree(dev->queues);
+ +	kfree(dev->entry);
+ +	kfree(dev);
+ +	return result;
+++=======
++ 	nvme_set_irq_hints(dev);
++ 	return;
++  reset:
++ 	spin_lock(&dev_list_lock);
++ 	if (!work_busy(&dev->reset_work)) {
++ 		dev->reset_workfn = nvme_reset_failed_dev;
++ 		queue_work(nvme_workq, &dev->reset_work);
++ 	}
++ 	spin_unlock(&dev_list_lock);
+++>>>>>>> 4cc06521ee1f (NVMe: add sysfs and ioctl controller reset)
+  }
+  
+  static void nvme_reset_notify(struct pci_dev *pdev, bool prepare)
+@@@ -3052,13 -3002,14 +3170,17 @@@ static void nvme_remove(struct pci_dev 
+  	spin_unlock(&dev_list_lock);
+  
+  	pci_set_drvdata(pdev, NULL);
+ -	flush_work(&dev->probe_work);
+  	flush_work(&dev->reset_work);
+++<<<<<<< HEAD
+ +	flush_work(&dev->cpu_work);
+ +	misc_deregister(&dev->miscdev);
+++=======
++ 	device_remove_file(dev->device, &dev_attr_reset_controller);
+++>>>>>>> 4cc06521ee1f (NVMe: add sysfs and ioctl controller reset)
+  	nvme_dev_shutdown(dev);
+ -	nvme_dev_remove(dev);
+ -	nvme_dev_remove_admin(dev);
+ -	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+  	nvme_free_queues(dev, 0);
+ +	nvme_dev_remove(dev);
+ +	nvme_release_instance(dev);
+  	nvme_release_prp_pools(dev);
+  	kref_put(&dev->kref, nvme_free_dev);
+  }
+* Unmerged path drivers/block/nvme-core.c
+diff --git a/include/uapi/linux/nvme.h b/include/uapi/linux/nvme.h
+index 521ca5ae2746..048911e711e0 100644
+--- a/include/uapi/linux/nvme.h
++++ b/include/uapi/linux/nvme.h
+@@ -563,5 +563,6 @@ struct nvme_passthru_cmd {
+ #define NVME_IOCTL_ADMIN_CMD	_IOWR('N', 0x41, struct nvme_admin_cmd)
+ #define NVME_IOCTL_SUBMIT_IO	_IOW('N', 0x42, struct nvme_user_io)
+ #define NVME_IOCTL_IO_CMD	_IOWR('N', 0x43, struct nvme_passthru_cmd)
++#define NVME_IOCTL_RESET	_IO('N', 0x44)
+ 
+ #endif /* _UAPI_LINUX_NVME_H */
