@@ -1,0 +1,111 @@
+block: only allocate/free mq_usage_counter in blk-mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [block] only allocate/free mq_usage_counter in blk-mq (Mike Snitzer) [1105204]
+Rebuild_FUZZ: 92.78%
+commit-author Ming Lei <tom.leiming@gmail.com>
+commit 3d2936f457a847d9d88a9cc127e0eb7a0ebba0ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3d2936f4.failed
+
+The percpu counter is only used for blk-mq, so move
+its allocation and free inside blk-mq, and don't
+allocate it for legacy queue device.
+
+	Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 3d2936f457a847d9d88a9cc127e0eb7a0ebba0ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index a6fc109357ae,e8b5f74dc1a1..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1340,7 -1781,10 +1340,14 @@@ struct request_queue *blk_mq_init_queue
+  	if (!q)
+  		goto err_hctxs;
+  
+++<<<<<<< HEAD
+ +	q->mq_map = blk_mq_make_queue_map(reg);
+++=======
++ 	if (percpu_counter_init(&q->mq_usage_counter, 0))
++ 		goto err_map;
++ 
++ 	q->mq_map = blk_mq_make_queue_map(set);
+++>>>>>>> 3d2936f457a8 (block: only allocate/free mq_usage_counter in blk-mq)
+  	if (!q->mq_map)
+  		goto err_map;
+  
+@@@ -1407,20 -1863,15 +1414,22 @@@ EXPORT_SYMBOL(blk_mq_init_queue)
+  
+  void blk_mq_free_queue(struct request_queue *q)
+  {
+ -	struct blk_mq_tag_set	*set = q->tag_set;
+ -
+ -	blk_mq_del_queue_tag_set(q);
+ +	struct blk_mq_hw_ctx *hctx;
+ +	int i;
+  
+ -	blk_mq_exit_hw_queues(q, set, set->nr_hw_queues);
+ -	blk_mq_free_hw_queues(q, set);
+ +	queue_for_each_hw_ctx(q, hctx, i) {
+ +		kfree(hctx->ctx_map);
+ +		kfree(hctx->ctxs);
+ +		blk_mq_free_rq_map(hctx);
+ +		blk_mq_unregister_cpu_notifier(&hctx->cpu_notifier);
+ +		if (q->mq_ops->exit_hctx)
+ +			q->mq_ops->exit_hctx(hctx, i);
+ +		free_cpumask_var(hctx->cpumask);
+ +		q->mq_ops->free_hctx(hctx, i);
+ +	}
+  
++ 	percpu_counter_destroy(&q->mq_usage_counter);
++ 
+  	free_percpu(q->queue_ctx);
+  	kfree(q->queue_hw_ctx);
+  	kfree(q->mq_map);
+diff --git a/block/blk-core.c b/block/blk-core.c
+index f1dcd9e7e9cb..b61dc4ef54ff 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -574,12 +574,9 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ 	if (!q)
+ 		return NULL;
+ 
+-	if (percpu_counter_init(&q->mq_usage_counter, 0))
+-		goto fail_q;
+-
+ 	q->id = ida_simple_get(&blk_queue_ida, 0, 0, gfp_mask);
+ 	if (q->id < 0)
+-		goto fail_c;
++		goto fail_q;
+ 
+ 	q->backing_dev_info.ra_pages =
+ 			(VM_MAX_READAHEAD * 1024) / PAGE_CACHE_SIZE;
+@@ -637,8 +634,6 @@ fail_bdi:
+ 	bdi_destroy(&q->backing_dev_info);
+ fail_id:
+ 	ida_simple_remove(&blk_queue_ida, q->id);
+-fail_c:
+-	percpu_counter_destroy(&q->mq_usage_counter);
+ fail_q:
+ 	kmem_cache_free(blk_requestq_cachep, q);
+ 	return NULL;
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index fccaa5845434..e50a0dbc0a7e 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -577,8 +577,6 @@ static void blk_release_queue(struct kobject *kobj)
+ 	if (q->queue_tags)
+ 		__blk_queue_free_tags(q);
+ 
+-	percpu_counter_destroy(&q->mq_usage_counter);
+-
+ 	if (q->mq_ops)
+ 		blk_mq_free_queue(q);
+ 
