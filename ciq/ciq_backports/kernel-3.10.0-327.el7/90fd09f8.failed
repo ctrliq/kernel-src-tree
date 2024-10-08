@@ -1,0 +1,170 @@
+KVM: PPC: Book3S HV: Improve H_CONFER implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s hv: Improve H_CONFER implementation (Thomas Huth) [1226884 1227323]
+Rebuild_FUZZ: 94.95%
+commit-author Sam Bobroff <sam.bobroff@au1.ibm.com>
+commit 90fd09f804213bcb9e092314c25b49d95153ad28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/90fd09f8.failed
+
+Currently the H_CONFER hcall is implemented in kernel virtual mode,
+meaning that whenever a guest thread does an H_CONFER, all the threads
+in that virtual core have to exit the guest.  This is bad for
+performance because it interrupts the other threads even if they
+are doing useful work.
+
+The H_CONFER hcall is called by a guest VCPU when it is spinning on a
+spinlock and it detects that the spinlock is held by a guest VCPU that
+is currently not running on a physical CPU.  The idea is to give this
+VCPU's time slice to the holder VCPU so that it can make progress
+towards releasing the lock.
+
+To avoid having the other threads exit the guest unnecessarily,
+we add a real-mode implementation of H_CONFER that checks whether
+the other threads are doing anything.  If all the other threads
+are idle (i.e. in H_CEDE) or trying to confer (i.e. in H_CONFER),
+it returns H_TOO_HARD which causes a guest exit and allows the
+H_CONFER to be handled in virtual mode.
+
+Otherwise it spins for a short time (up to 10 microseconds) to give
+other threads the chance to observe that this thread is trying to
+confer.  The spin loop also terminates when any thread exits the guest
+or when all other threads are idle or trying to confer.  If the
+timeout is reached, the H_CONFER returns H_SUCCESS.  In this case the
+guest VCPU will recheck the spinlock word and most likely call
+H_CONFER again.
+
+This also improves the implementation of the H_CONFER virtual mode
+handler.  If the VCPU is part of a virtual core (vcore) which is
+runnable, there will be a 'runner' VCPU which has taken responsibility
+for running the vcore.  In this case we yield to the runner VCPU
+rather than the target VCPU.
+
+We also introduce a check on the target VCPU's yield count: if it
+differs from the yield count passed to H_CONFER, the target VCPU
+has run since H_CONFER was called and may have already released
+the lock.  This check is required by PAPR.
+
+	Signed-off-by: Sam Bobroff <sam.bobroff@au1.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 90fd09f804213bcb9e092314c25b49d95153ad28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_builtin.c
+diff --cc arch/powerpc/kvm/book3s_hv_builtin.c
+index f719a1437a31,3e43f815ac5d..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@@ -16,6 -16,8 +16,11 @@@
+  #include <linux/init.h>
+  #include <linux/memblock.h>
+  #include <linux/sizes.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/cma.h>
++ #include <linux/bitops.h>
+++>>>>>>> 90fd09f80421 (KVM: PPC: Book3S HV: Improve H_CONFER implementation)
+  
+  #include <asm/cputable.h>
+  #include <asm/kvm_ppc.h>
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 09895973b6c7..a9d839c8590d 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -318,6 +318,7 @@ struct kvmppc_vcore {
+ 	ulong dpdes;		/* doorbell state (POWER8) */
+ 	void *mpp_buffer; /* Micro Partition Prefetch buffer */
+ 	bool mpp_buffer_is_valid;
++	ulong conferring_threads;
+ };
+ 
+ #define VCORE_ENTRY_COUNT(vc)	((vc)->entry_exit_count & 0xff)
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index c9d09cd7cd1e..69a20766e6f4 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -607,10 +607,45 @@ static int kvmppc_h_set_mode(struct kvm_vcpu *vcpu, unsigned long mflags,
+ 	}
+ }
+ 
++static int kvm_arch_vcpu_yield_to(struct kvm_vcpu *target)
++{
++	struct kvmppc_vcore *vcore = target->arch.vcore;
++
++	/*
++	 * We expect to have been called by the real mode handler
++	 * (kvmppc_rm_h_confer()) which would have directly returned
++	 * H_SUCCESS if the source vcore wasn't idle (e.g. if it may
++	 * have useful work to do and should not confer) so we don't
++	 * recheck that here.
++	 */
++
++	spin_lock(&vcore->lock);
++	if (target->arch.state == KVMPPC_VCPU_RUNNABLE &&
++	    vcore->vcore_state != VCORE_INACTIVE)
++		target = vcore->runner;
++	spin_unlock(&vcore->lock);
++
++	return kvm_vcpu_yield_to(target);
++}
++
++static int kvmppc_get_yield_count(struct kvm_vcpu *vcpu)
++{
++	int yield_count = 0;
++	struct lppaca *lppaca;
++
++	spin_lock(&vcpu->arch.vpa_update_lock);
++	lppaca = (struct lppaca *)vcpu->arch.vpa.pinned_addr;
++	if (lppaca)
++		yield_count = lppaca->yield_count;
++	spin_unlock(&vcpu->arch.vpa_update_lock);
++	return yield_count;
++}
++
+ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long req = kvmppc_get_gpr(vcpu, 3);
+ 	unsigned long target, ret = H_SUCCESS;
++	int yield_count;
+ 	struct kvm_vcpu *tvcpu;
+ 	int idx, rc;
+ 
+@@ -654,7 +689,10 @@ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+ 			ret = H_PARAMETER;
+ 			break;
+ 		}
+-		kvm_vcpu_yield_to(tvcpu);
++		yield_count = kvmppc_get_gpr(vcpu, 5);
++		if (kvmppc_get_yield_count(tvcpu) != yield_count)
++			break;
++		kvm_arch_vcpu_yield_to(tvcpu);
+ 		break;
+ 	case H_REGISTER_VPA:
+ 		ret = do_h_register_vpa(vcpu, kvmppc_get_gpr(vcpu, 4),
+@@ -1699,6 +1737,7 @@ static void kvmppc_run_core(struct kvmppc_vcore *vc)
+ 	vc->vcore_state = VCORE_STARTING;
+ 	vc->in_guest = 0;
+ 	vc->napping_threads = 0;
++	vc->conferring_threads = 0;
+ 
+ 	/*
+ 	 * Updating any of the vpas requires calling kvmppc_pin_guest_page,
+* Unmerged path arch/powerpc/kvm/book3s_hv_builtin.c
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index a2df577911e2..d81b666f8271 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -2042,7 +2042,7 @@ hcall_real_table:
+ 	.long	0		/* 0xd8 */
+ 	.long	0		/* 0xdc */
+ 	.long	DOTSYM(kvmppc_h_cede) - hcall_real_table
+-	.long	0		/* 0xe4 */
++	.long	DOTSYM(kvmppc_rm_h_confer) - hcall_real_table
+ 	.long	0		/* 0xe8 */
+ 	.long	0		/* 0xec */
+ 	.long	0		/* 0xf0 */
