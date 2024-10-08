@@ -14,9 +14,9 @@
 #include <asm/eeh.h>
 
 /* We might build address mapping here for "fast" path later */
-int vfio_spapr_pci_eeh_open(struct pci_dev *pdev)
+void vfio_spapr_pci_eeh_open(struct pci_dev *pdev)
 {
-	return eeh_dev_open(pdev);
+	eeh_dev_open(pdev);
 }
 
 void vfio_spapr_pci_eeh_release(struct pci_dev *pdev)

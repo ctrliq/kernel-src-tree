@@ -184,11 +184,7 @@ static int vfio_pci_open(void *device_data)
 		if (ret)
 			goto error;
 
-		ret = vfio_spapr_pci_eeh_open(vdev->pdev);
-		if (ret) {
-			vfio_pci_disable(vdev);
-			goto error;
-		}
+		vfio_spapr_pci_eeh_open(vdev->pdev);
 	}
 
 	return 0;
