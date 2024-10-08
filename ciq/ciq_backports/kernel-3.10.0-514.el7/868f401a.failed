@@ -1,0 +1,149 @@
+btrfs: Use ref_cnt for set_block_group_ro()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Zhaolei <zhaolei@cn.fujitsu.com>
+commit 868f401ae38acb439005626c04d575e64c5ae760
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/868f401a.failed
+
+More than one code call set_block_group_ro() and restore rw in fail.
+
+Old code use bool bit to save blockgroup's ro state, it can not
+support parallel case(it is confirmd exist in my debug log).
+
+This patch use ref count to store ro state, and rename
+set_block_group_ro/set_block_group_rw
+to
+inc_block_group_ro/dec_block_group_ro.
+
+	Signed-off-by: Zhao Lei <zhaolei@cn.fujitsu.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 868f401ae38acb439005626c04d575e64c5ae760)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+diff --cc fs/btrfs/extent-tree.c
+index 055020779750,5cefa02b40a9..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -8680,13 -8776,49 +8680,58 @@@ int btrfs_inc_block_group_ro(struct btr
+  	u64 alloc_flags;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	BUG_ON(cache->ro);
+ +
+++=======
++ again:
+++>>>>>>> 868f401ae38a (btrfs: Use ref_cnt for set_block_group_ro())
+  	trans = btrfs_join_transaction(root);
+  	if (IS_ERR(trans))
+  		return PTR_ERR(trans);
+  
+++<<<<<<< HEAD
+ +	ret = set_block_group_ro(cache, 0);
+++=======
++ 	/*
++ 	 * we're not allowed to set block groups readonly after the dirty
++ 	 * block groups cache has started writing.  If it already started,
++ 	 * back off and let this transaction commit
++ 	 */
++ 	mutex_lock(&root->fs_info->ro_block_group_mutex);
++ 	if (trans->transaction->dirty_bg_run) {
++ 		u64 transid = trans->transid;
++ 
++ 		mutex_unlock(&root->fs_info->ro_block_group_mutex);
++ 		btrfs_end_transaction(trans, root);
++ 
++ 		ret = btrfs_wait_for_commit(root, transid);
++ 		if (ret)
++ 			return ret;
++ 		goto again;
++ 	}
++ 
++ 	/*
++ 	 * if we are changing raid levels, try to allocate a corresponding
++ 	 * block group with the new raid level.
++ 	 */
++ 	alloc_flags = update_block_group_flags(root, cache->flags);
++ 	if (alloc_flags != cache->flags) {
++ 		ret = do_chunk_alloc(trans, root, alloc_flags,
++ 				     CHUNK_ALLOC_FORCE);
++ 		/*
++ 		 * ENOSPC is allowed here, we may have enough space
++ 		 * already allocated at the new raid level to
++ 		 * carry on
++ 		 */
++ 		if (ret == -ENOSPC)
++ 			ret = 0;
++ 		if (ret < 0)
++ 			goto out;
++ 	}
++ 
++ 	ret = inc_block_group_ro(cache, 0);
+++>>>>>>> 868f401ae38a (btrfs: Use ref_cnt for set_block_group_ro())
+  	if (!ret)
+  		goto out;
+  	alloc_flags = get_alloc_profile(root, cache->space_info->flags);
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index c1c7d2fc3e1c..afca9f2cb1aa 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1297,7 +1297,7 @@ struct btrfs_block_group_cache {
+ 	/* for raid56, this is a full stripe, without parity */
+ 	unsigned long full_stripe_len;
+ 
+-	unsigned int ro:1;
++	unsigned int ro;
+ 	unsigned int iref:1;
+ 	unsigned int has_caching_ctl:1;
+ 	unsigned int removed:1;
+@@ -3482,9 +3482,9 @@ int btrfs_cond_migrate_bytes(struct btrfs_fs_info *fs_info,
+ void btrfs_block_rsv_release(struct btrfs_root *root,
+ 			     struct btrfs_block_rsv *block_rsv,
+ 			     u64 num_bytes);
+-int btrfs_set_block_group_ro(struct btrfs_root *root,
++int btrfs_inc_block_group_ro(struct btrfs_root *root,
+ 			     struct btrfs_block_group_cache *cache);
+-void btrfs_set_block_group_rw(struct btrfs_root *root,
++void btrfs_dec_block_group_ro(struct btrfs_root *root,
+ 			      struct btrfs_block_group_cache *cache);
+ void btrfs_put_block_group_cache(struct btrfs_fs_info *info);
+ u64 btrfs_account_ro_block_groups_free_space(struct btrfs_space_info *sinfo);
+* Unmerged path fs/btrfs/extent-tree.c
+diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+index b90301cd6ace..4bbea1723232 100644
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -4212,14 +4212,12 @@ int btrfs_relocate_block_group(struct btrfs_root *extent_root, u64 group_start)
+ 	rc->block_group = btrfs_lookup_block_group(fs_info, group_start);
+ 	BUG_ON(!rc->block_group);
+ 
+-	if (!rc->block_group->ro) {
+-		ret = btrfs_set_block_group_ro(extent_root, rc->block_group);
+-		if (ret) {
+-			err = ret;
+-			goto out;
+-		}
+-		rw = 1;
++	ret = btrfs_inc_block_group_ro(extent_root, rc->block_group);
++	if (ret) {
++		err = ret;
++		goto out;
+ 	}
++	rw = 1;
+ 
+ 	path = btrfs_alloc_path();
+ 	if (!path) {
+@@ -4291,7 +4289,7 @@ int btrfs_relocate_block_group(struct btrfs_root *extent_root, u64 group_start)
+ 	WARN_ON(btrfs_block_group_used(&rc->block_group->item) > 0);
+ out:
+ 	if (err && rw)
+-		btrfs_set_block_group_rw(extent_root, rc->block_group);
++		btrfs_dec_block_group_ro(extent_root, rc->block_group);
+ 	iput(rc->data_inode);
+ 	btrfs_put_block_group(rc->block_group);
+ 	kfree(rc);
