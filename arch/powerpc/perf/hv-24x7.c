@@ -1116,7 +1116,7 @@ static unsigned long single_24x7_request(struct perf_event *event, u64 *count)
 
 	ret = add_event_to_24x7_request(event, request_buffer);
 	if (ret)
-		return ret;
+		goto out;
 
 	ret = make_24x7_request(request_buffer, result_buffer);
 	if (ret) {
