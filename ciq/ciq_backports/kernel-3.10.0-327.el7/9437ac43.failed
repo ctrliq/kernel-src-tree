@@ -1,0 +1,233 @@
+hpsa: hpsa decode sense data for io and tmf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Stephen Cameron <stephenmcameron@gmail.com>
+commit 9437ac43ed0536efb3ede6c034a0b6f36c19a693
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9437ac43.failed
+
+In hba mode, we could get sense data in descriptor format so
+we need to handle that.
+
+It's possible for CommandStatus to have value 0x0D
+"TMF Function Status", which we should handle.  We will get
+this from a P1224 when aborting a non-existent tag, for
+example.  The "ScsiStatus" field of the errinfo field
+will contain the TMF function status value.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 9437ac43ed0536efb3ede6c034a0b6f36c19a693)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 4400efc84107,0c4751c0d144..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -1650,26 -1871,52 +1684,54 @@@ static void process_ioaccel2_completion
+  	if (is_logical_dev_addr_mode(dev->scsi3addr) &&
+  		c2->error_data.serv_response ==
+  			IOACCEL2_SERV_RESPONSE_FAILURE) {
+ -		if (c2->error_data.status ==
+ -			IOACCEL2_STATUS_SR_IOACCEL_DISABLED)
+ -			dev->offload_enabled = 0;
+ -		goto retry_cmd;
+ +		dev->offload_enabled = 0;
+ +		cmd->result = DID_SOFT_ERROR << 16;
+ +		cmd_free(h, c);
+ +		cmd->scsi_done(cmd);
+ +		return;
+ +	}
+ +	raid_retry = handle_ioaccel_mode2_error(h, c, cmd, c2);
+ +	/* If error found, disable Smart Path,
+ +	 * force a retry on the standard path.
+ +	 */
+ +	if (raid_retry) {
+ +		dev_warn(&h->pdev->dev, "%s: Retrying on standard path.\n",
+ +			"HP SSD Smart Path");
+ +		dev->offload_enabled = 0; /* Disable Smart Path */
+ +		cmd->result = DID_SOFT_ERROR << 16;
+  	}
+ -
+ -	if (handle_ioaccel_mode2_error(h, c, cmd, c2))
+ -		goto retry_cmd;
+ -
+  	cmd_free(h, c);
+  	cmd->scsi_done(cmd);
+ -	return;
+ -
+ -retry_cmd:
+ -	INIT_WORK(&c->work, hpsa_command_resubmit_worker);
+ -	queue_work_on(raw_smp_processor_id(), h->resubmit_wq, &c->work);
+  }
+  
++ /* Returns 0 on success, < 0 otherwise. */
++ static int hpsa_evaluate_tmf_status(struct ctlr_info *h,
++ 					struct CommandList *cp)
++ {
++ 	u8 tmf_status = cp->err_info->ScsiStatus;
++ 
++ 	switch (tmf_status) {
++ 	case CISS_TMF_COMPLETE:
++ 		/*
++ 		 * CISS_TMF_COMPLETE never happens, instead,
++ 		 * ei->CommandStatus == 0 for this case.
++ 		 */
++ 	case CISS_TMF_SUCCESS:
++ 		return 0;
++ 	case CISS_TMF_INVALID_FRAME:
++ 	case CISS_TMF_NOT_SUPPORTED:
++ 	case CISS_TMF_FAILED:
++ 	case CISS_TMF_WRONG_LUN:
++ 	case CISS_TMF_OVERLAPPED_TAG:
++ 		break;
++ 	default:
++ 		dev_warn(&h->pdev->dev, "Unknown TMF status: 0x%02x\n",
++ 				tmf_status);
++ 		break;
++ 	}
++ 	return -tmf_status;
++ }
++ 
+  static void complete_scsi_command(struct CommandList *cp)
+  {
+  	struct scsi_cmnd *cmd;
+@@@ -1698,10 -1945,26 +1760,8 @@@
+  	if (cp->cmd_type == CMD_IOACCEL2)
+  		return process_ioaccel2_completion(h, cp, cmd, dev);
+  
+- 	cmd->result |= ei->ScsiStatus;
+- 
+  	scsi_set_resid(cmd, ei->ResidualCnt);
+  	if (ei->CommandStatus == 0) {
+ -		if (cp->cmd_type == CMD_IOACCEL1)
+ -			atomic_dec(&cp->phys_disk->ioaccel_cmds_out);
+  		cmd_free(h, cp);
+  		cmd->scsi_done(cmd);
+  		return;
+@@@ -2480,8 -2822,10 +2545,15 @@@ static int hpsa_volume_offline(struct c
+  					unsigned char scsi3addr[])
+  {
+  	struct CommandList *c;
+++<<<<<<< HEAD
+ +	unsigned char *sense, sense_key, asc, ascq;
+ +	int ldstat = 0;
+++=======
++ 	unsigned char *sense;
++ 	u8 sense_key, asc, ascq;
++ 	int sense_len;
++ 	int rc, ldstat = 0;
+++>>>>>>> 9437ac43ed05 (hpsa: hpsa decode sense data for io and tmf)
+  	u16 cmd_status;
+  	u8 scsi_status;
+  #define ASC_LUN_NOT_READY 0x04
+@@@ -2492,11 -2836,17 +2564,13 @@@
+  	if (!c)
+  		return 0;
+  	(void) fill_cmd(c, TEST_UNIT_READY, h, NULL, 0, 0, scsi3addr, TYPE_CMD);
+ -	rc = hpsa_scsi_do_simple_cmd(h, c, DEFAULT_REPLY_QUEUE, NO_TIMEOUT);
+ -	if (rc) {
+ -		cmd_free(h, c);
+ -		return 0;
+ -	}
+ +	hpsa_scsi_do_simple_cmd_core(h, c);
+  	sense = c->err_info->SenseInfo;
+- 	sense_key = sense[2];
+- 	asc = sense[12];
+- 	ascq = sense[13];
++ 	if (c->err_info->SenseLen > sizeof(c->err_info->SenseInfo))
++ 		sense_len = sizeof(c->err_info->SenseInfo);
++ 	else
++ 		sense_len = c->err_info->SenseLen;
++ 	decode_sense_data(sense, sense_len, &sense_key, &asc, &ascq);
+  	cmd_status = c->err_info->CommandStatus;
+  	scsi_status = c->err_info->ScsiStatus;
+  	cmd_free(h, c);
+@@@ -2536,6 -2886,53 +2610,56 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Find out if a logical device supports aborts by simply trying one.
++  * Smart Array may claim not to support aborts on logical drives, but
++  * if a MSA2000 * is connected, the drives on that will be presented
++  * by the Smart Array as logical drives, and aborts may be sent to
++  * those devices successfully.  So the simplest way to find out is
++  * to simply try an abort and see how the device responds.
++  */
++ static int hpsa_device_supports_aborts(struct ctlr_info *h,
++ 					unsigned char *scsi3addr)
++ {
++ 	struct CommandList *c;
++ 	struct ErrorInfo *ei;
++ 	int rc = 0;
++ 
++ 	u64 tag = (u64) -1; /* bogus tag */
++ 
++ 	/* Assume that physical devices support aborts */
++ 	if (!is_logical_dev_addr_mode(scsi3addr))
++ 		return 1;
++ 
++ 	c = cmd_alloc(h);
++ 	if (!c)
++ 		return -ENOMEM;
++ 	(void) fill_cmd(c, HPSA_ABORT_MSG, h, &tag, 0, 0, scsi3addr, TYPE_MSG);
++ 	(void) hpsa_scsi_do_simple_cmd(h, c, DEFAULT_REPLY_QUEUE, NO_TIMEOUT);
++ 	/* no unmap needed here because no data xfer. */
++ 	ei = c->err_info;
++ 	switch (ei->CommandStatus) {
++ 	case CMD_INVALID:
++ 		rc = 0;
++ 		break;
++ 	case CMD_UNABORTABLE:
++ 	case CMD_ABORT_FAILED:
++ 		rc = 1;
++ 		break;
++ 	case CMD_TMF_STATUS:
++ 		rc = hpsa_evaluate_tmf_status(h, c);
++ 		break;
++ 	default:
++ 		rc = 0;
++ 		break;
++ 	}
++ 	cmd_free(h, c);
++ 	return rc;
++ }
++ 
+++>>>>>>> 9437ac43ed05 (hpsa: hpsa decode sense data for io and tmf)
+  static int hpsa_update_device_info(struct ctlr_info *h,
+  	unsigned char scsi3addr[], struct hpsa_scsi_dev_t *this_device,
+  	unsigned char *is_OBDR_device)
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/hpsa_cmd.h b/drivers/scsi/hpsa_cmd.h
+index d78e66629650..291b726f8ebc 100644
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@ -42,8 +42,17 @@
+ #define CMD_UNSOLICITED_ABORT   0x000A
+ #define CMD_TIMEOUT             0x000B
+ #define CMD_UNABORTABLE		0x000C
++#define CMD_TMF_STATUS		0x000D
+ #define CMD_IOACCEL_DISABLED	0x000E
+ 
++/* TMF function status values */
++#define CISS_TMF_COMPLETE	0x00
++#define CISS_TMF_INVALID_FRAME	0x02
++#define CISS_TMF_NOT_SUPPORTED	0x04
++#define CISS_TMF_FAILED		0x05
++#define CISS_TMF_SUCCESS	0x08
++#define CISS_TMF_WRONG_LUN	0x09
++#define CISS_TMF_OVERLAPPED_TAG 0x0a
+ 
+ /* Unit Attentions ASC's as defined for the MSA2012sa */
+ #define POWER_OR_RESET			0x29
