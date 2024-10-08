@@ -1,0 +1,177 @@
+lib/ioremap.c: add huge I/O map capability interfaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [lib] ioremap: add huge I/O map capability interfaces (Eric Sandeen) [1274459]
+Rebuild_FUZZ: 94.00%
+commit-author Toshi Kani <toshi.kani@hp.com>
+commit 0ddab1d2ed664c85c95488eef569786a84aedf37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0ddab1d2.failed
+
+Add ioremap_pud_enabled() and ioremap_pmd_enabled(), which return 1 when
+I/O mappings with pud/pmd are enabled on the kernel.
+
+ioremap_huge_init() calls arch_ioremap_pud_supported() and
+arch_ioremap_pmd_supported() to initialize the capabilities at boot-time.
+
+A new kernel option "nohugeiomap" is also added, so that user can disable
+the huge I/O map capabilities when necessary.
+
+	Signed-off-by: Toshi Kani <toshi.kani@hp.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Robert Elliott <Elliott@hp.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0ddab1d2ed664c85c95488eef569786a84aedf37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/Kconfig
+#	init/main.c
+diff --cc arch/Kconfig
+index 96ad1995a47a,c88c23f0a1da..000000000000
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@@ -429,6 -446,12 +429,15 @@@ config HAVE_IRQ_TIME_ACCOUNTIN
+  config HAVE_ARCH_TRANSPARENT_HUGEPAGE
+  	bool
+  
+++<<<<<<< HEAD
+++=======
++ config HAVE_ARCH_HUGE_VMAP
++ 	bool
++ 
++ config HAVE_ARCH_SOFT_DIRTY
++ 	bool
++ 
+++>>>>>>> 0ddab1d2ed66 (lib/ioremap.c: add huge I/O map capability interfaces)
+  config HAVE_MOD_ARCH_SPECIFIC
+  	bool
+  	help
+diff --cc init/main.c
+index 8678d709aacc,f6dd8fe1f22c..000000000000
+--- a/init/main.c
++++ b/init/main.c
+@@@ -74,9 -74,13 +74,15 @@@
+  #include <linux/ptrace.h>
+  #include <linux/blkdev.h>
+  #include <linux/elevator.h>
+ -#include <linux/sched_clock.h>
+ -#include <linux/context_tracking.h>
+  #include <linux/random.h>
+ +#include <linux/context_tracking.h>
+  #include <linux/list.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/integrity.h>
++ #include <linux/proc_ns.h>
++ #include <linux/io.h>
+++>>>>>>> 0ddab1d2ed66 (lib/ioremap.c: add huge I/O map capability interfaces)
+  
+  #include <asm/io.h>
+  #include <asm/bugs.h>
+@@@ -469,12 -485,13 +475,13 @@@ static void __init mm_init(void
+  	percpu_init_late();
+  	pgtable_init();
+  	vmalloc_init();
++ 	ioremap_huge_init();
+  }
+  
+ -asmlinkage __visible void __init start_kernel(void)
+ +asmlinkage void __init start_kernel(void)
+  {
+ -	char *command_line;
+ -	char *after_dashes;
+ +	char * command_line;
+ +	extern const struct kernel_param __start___param[], __stop___param[];
+  
+  	/*
+  	 * Need to run as early as possible, to initialize the
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index 01942669760b..3b759f6bdd10 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2055,6 +2055,8 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			register save and restore. The kernel will only save
+ 			legacy floating-point registers on task switch.
+ 
++	nohugeiomap	[KNL,x86] Disable kernel huge I/O mappings.
++
+ 	noxsave		[BUGS=X86] Disables x86 extended register state save
+ 			and restore using xsave. The kernel will fallback to
+ 			enabling legacy floating-point and sse state.
+* Unmerged path arch/Kconfig
+diff --git a/include/linux/io.h b/include/linux/io.h
+index 90b069e6a4c0..8c2abc17ea2e 100644
+--- a/include/linux/io.h
++++ b/include/linux/io.h
+@@ -38,6 +38,14 @@ static inline int ioremap_page_range(unsigned long addr, unsigned long end,
+ }
+ #endif
+ 
++#ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
++void __init ioremap_huge_init(void);
++int arch_ioremap_pud_supported(void);
++int arch_ioremap_pmd_supported(void);
++#else
++static inline void ioremap_huge_init(void) { }
++#endif
++
+ /*
+  * Managed iomap interface
+  */
+* Unmerged path init/main.c
+diff --git a/lib/ioremap.c b/lib/ioremap.c
+index 0c9216c48762..2008652c9a1f 100644
+--- a/lib/ioremap.c
++++ b/lib/ioremap.c
+@@ -13,6 +13,43 @@
+ #include <asm/cacheflush.h>
+ #include <asm/pgtable.h>
+ 
++#ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
++int __read_mostly ioremap_pud_capable;
++int __read_mostly ioremap_pmd_capable;
++int __read_mostly ioremap_huge_disabled;
++
++static int __init set_nohugeiomap(char *str)
++{
++	ioremap_huge_disabled = 1;
++	return 0;
++}
++early_param("nohugeiomap", set_nohugeiomap);
++
++void __init ioremap_huge_init(void)
++{
++	if (!ioremap_huge_disabled) {
++		if (arch_ioremap_pud_supported())
++			ioremap_pud_capable = 1;
++		if (arch_ioremap_pmd_supported())
++			ioremap_pmd_capable = 1;
++	}
++}
++
++static inline int ioremap_pud_enabled(void)
++{
++	return ioremap_pud_capable;
++}
++
++static inline int ioremap_pmd_enabled(void)
++{
++	return ioremap_pmd_capable;
++}
++
++#else	/* !CONFIG_HAVE_ARCH_HUGE_VMAP */
++static inline int ioremap_pud_enabled(void) { return 0; }
++static inline int ioremap_pmd_enabled(void) { return 0; }
++#endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */
++
+ static int ioremap_pte_range(pmd_t *pmd, unsigned long addr,
+ 		unsigned long end, phys_addr_t phys_addr, pgprot_t prot)
+ {
