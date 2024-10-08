@@ -1,0 +1,262 @@
+KVM: PPC: Book3S HV: Translate kvmhv_commence_exit to C
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s-hv: Translate kvmhv_commence_exit to C (Laurent Vivier) [1213669]
+Rebuild_FUZZ: 93.33%
+commit-author Paul Mackerras <paulus@samba.org>
+commit eddb60fb1443f85c5728f1b1cd4be608c6832a79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/eddb60fb.failed
+
+This replaces the assembler code for kvmhv_commence_exit() with C code
+in book3s_hv_builtin.c.  It also moves the IPI sending code that was
+in book3s_hv_rm_xics.c into a new kvmhv_rm_send_ipi() function so it
+can be used by kvmhv_commence_exit() as well as icp_rm_set_vcpu_irq().
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit eddb60fb1443f85c5728f1b1cd4be608c6832a79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s_64.h
+#	arch/powerpc/kvm/book3s_hv_builtin.c
+#	arch/powerpc/kvm/book3s_hv_rm_xics.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/include/asm/kvm_book3s_64.h
+index 893b466027eb,2b84e485a181..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@@ -414,6 -436,10 +414,13 @@@ static inline struct kvm_memslots *kvm_
+  	return rcu_dereference_raw_notrace(kvm->memslots);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ extern void kvmppc_mmu_debugfs_init(struct kvm *kvm);
++ 
++ extern void kvmhv_rm_send_ipi(int cpu);
++ 
+++>>>>>>> eddb60fb1443 (KVM: PPC: Book3S HV: Translate kvmhv_commence_exit to C)
+  #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+  
+  #endif /* __ASM_KVM_BOOK3S_64_H__ */
+diff --cc arch/powerpc/kvm/book3s_hv_builtin.c
+index f719a1437a31,c42aa55b885f..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@@ -20,8 -21,11 +20,15 @@@
+  #include <asm/cputable.h>
+  #include <asm/kvm_ppc.h>
+  #include <asm/kvm_book3s.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/archrandom.h>
++ #include <asm/xics.h>
++ 
++ #define KVM_CMA_CHUNK_ORDER	18
+++>>>>>>> eddb60fb1443 (KVM: PPC: Book3S HV: Translate kvmhv_commence_exit to C)
+  
+ +#include "book3s_hv_cma.h"
+  /*
+   * Hash page table alignment on newer cpus(CPU_FTR_ARCH_206)
+   * should be power of 2.
+@@@ -231,3 -171,79 +238,82 @@@ int kvmppc_hcall_impl_hv_realmode(unsig
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(kvmppc_hcall_impl_hv_realmode);
+++<<<<<<< HEAD
+++=======
++ 
++ int kvmppc_hwrng_present(void)
++ {
++ 	return powernv_hwrng_present();
++ }
++ EXPORT_SYMBOL_GPL(kvmppc_hwrng_present);
++ 
++ long kvmppc_h_random(struct kvm_vcpu *vcpu)
++ {
++ 	if (powernv_get_random_real_mode(&vcpu->arch.gpr[4]))
++ 		return H_SUCCESS;
++ 
++ 	return H_HARDWARE;
++ }
++ 
++ static inline void rm_writeb(unsigned long paddr, u8 val)
++ {
++ 	__asm__ __volatile__("stbcix %0,0,%1"
++ 		: : "r" (val), "r" (paddr) : "memory");
++ }
++ 
++ /*
++  * Send an interrupt to another CPU.
++  * This can only be called in real mode.
++  * The caller needs to include any barrier needed to order writes
++  * to memory vs. the IPI/message.
++  */
++ void kvmhv_rm_send_ipi(int cpu)
++ {
++ 	unsigned long xics_phys;
++ 
++ 	/* Poke the target */
++ 	xics_phys = paca[cpu].kvm_hstate.xics_phys;
++ 	rm_writeb(xics_phys + XICS_MFRR, IPI_PRIORITY);
++ }
++ 
++ /*
++  * The following functions are called from the assembly code
++  * in book3s_hv_rmhandlers.S.
++  */
++ static void kvmhv_interrupt_vcore(struct kvmppc_vcore *vc, int active)
++ {
++ 	int cpu = vc->pcpu;
++ 
++ 	/* Order setting of exit map vs. msgsnd/IPI */
++ 	smp_mb();
++ 	for (; active; active >>= 1, ++cpu)
++ 		if (active & 1)
++ 			kvmhv_rm_send_ipi(cpu);
++ }
++ 
++ void kvmhv_commence_exit(int trap)
++ {
++ 	struct kvmppc_vcore *vc = local_paca->kvm_hstate.kvm_vcore;
++ 	int ptid = local_paca->kvm_hstate.ptid;
++ 	int me, ee;
++ 
++ 	/* Set our bit in the threads-exiting-guest map in the 0xff00
++ 	   bits of vcore->entry_exit_map */
++ 	me = 0x100 << ptid;
++ 	do {
++ 		ee = vc->entry_exit_map;
++ 	} while (cmpxchg(&vc->entry_exit_map, ee, ee | me) != ee);
++ 
++ 	/* Are we the first here? */
++ 	if ((ee >> 8) != 0)
++ 		return;
++ 
++ 	/*
++ 	 * Trigger the other threads in this vcore to exit the guest.
++ 	 * If this is a hypervisor decrementer interrupt then they
++ 	 * will be already on their way out of the guest.
++ 	 */
++ 	if (trap != BOOK3S_INTERRUPT_HV_DECREMENTER)
++ 		kvmhv_interrupt_vcore(vc, ee & ~(1 << ptid));
++ }
+++>>>>>>> eddb60fb1443 (KVM: PPC: Book3S HV: Translate kvmhv_commence_exit to C)
+diff --cc arch/powerpc/kvm/book3s_hv_rm_xics.c
+index 7b066f6b02ad,00e45b6d4f24..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@@ -23,12 -23,33 +23,42 @@@
+  
+  #define DEBUG_PASSUP
+  
+++<<<<<<< HEAD
+ +static inline void rm_writeb(unsigned long paddr, u8 val)
+ +{
+ +	__asm__ __volatile__("sync; stbcix %0,0,%1"
+ +		: : "r" (val), "r" (paddr) : "memory");
+ +}
+ +
+++=======
++ static void icp_rm_deliver_irq(struct kvmppc_xics *xics, struct kvmppc_icp *icp,
++ 			    u32 new_irq);
++ 
++ /* -- ICS routines -- */
++ static void ics_rm_check_resend(struct kvmppc_xics *xics,
++ 				struct kvmppc_ics *ics, struct kvmppc_icp *icp)
++ {
++ 	int i;
++ 
++ 	arch_spin_lock(&ics->lock);
++ 
++ 	for (i = 0; i < KVMPPC_XICS_IRQ_PER_ICS; i++) {
++ 		struct ics_irq_state *state = &ics->irq_state[i];
++ 
++ 		if (!state->resend)
++ 			continue;
++ 
++ 		arch_spin_unlock(&ics->lock);
++ 		icp_rm_deliver_irq(xics, icp, state->number);
++ 		arch_spin_lock(&ics->lock);
++ 	}
++ 
++ 	arch_spin_unlock(&ics->lock);
++ }
++ 
++ /* -- ICP routines -- */
++ 
+++>>>>>>> eddb60fb1443 (KVM: PPC: Book3S HV: Translate kvmhv_commence_exit to C)
+  static void icp_rm_set_vcpu_irq(struct kvm_vcpu *vcpu,
+  				struct kvm_vcpu *this_vcpu)
+  {
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 499fdba9ddf8,fcf3a617cc8a..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -231,10 -242,34 +231,26 @@@ kvm_novcpu_wakeup
+  	/* Got an IPI but other vcpus aren't yet exiting, must be a latecomer */
+  	ld	r4, HSTATE_KVM_VCPU(r13)
+  	cmpdi	r4, 0
+ -	beq	kvmppc_primary_no_guest
+ -
+ -#ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
+ -	addi	r3, r4, VCPU_TB_RMENTRY
+ -	bl	kvmhv_start_timing
+ -#endif
+ -	b	kvmppc_got_guest
+ +	bne	kvmppc_got_guest
+  
+  kvm_novcpu_exit:
+++<<<<<<< HEAD
+ +	b	hdec_soon
+++=======
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	ld	r4, HSTATE_KVM_VCPU(r13)
++ 	cmpdi	r4, 0
++ 	beq	13f
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 13:	mr	r3, r12
++ 	stw	r12, 112-4(r1)
++ 	bl	kvmhv_commence_exit
++ 	nop
++ 	lwz	r12, 112-4(r1)
++ 	b	kvmhv_switch_to_host
+++>>>>>>> eddb60fb1443 (KVM: PPC: Book3S HV: Translate kvmhv_commence_exit to C)
+  
+  /*
+   * We come in here when wakened from nap mode.
+@@@ -1195,9 -1157,20 +1211,23 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206
+  	cmpwi	r12, BOOK3S_INTERRUPT_MACHINE_CHECK
+  	beq	machine_check_realmode
+  mc_cont:
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	addi	r3, r9, VCPU_TB_RMEXIT
++ 	mr	r4, r9
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 
++ 	/* Increment exit count, poke other threads to exit */
++ 	bl	kvmhv_commence_exit
++ 	nop
++ 	ld	r9, HSTATE_KVM_VCPU(r13)
++ 	lwz	r12, VCPU_TRAP(r9)
+++>>>>>>> eddb60fb1443 (KVM: PPC: Book3S HV: Translate kvmhv_commence_exit to C)
+  
+  	/* Save guest CTRL register, set runlatch to 1 */
+ -	mfspr	r6,SPRN_CTRLF
+ +6:	mfspr	r6,SPRN_CTRLF
+  	stw	r6,VCPU_CTRL(r9)
+  	andi.	r0,r6,1
+  	bne	4f
+* Unmerged path arch/powerpc/include/asm/kvm_book3s_64.h
+* Unmerged path arch/powerpc/kvm/book3s_hv_builtin.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_xics.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
