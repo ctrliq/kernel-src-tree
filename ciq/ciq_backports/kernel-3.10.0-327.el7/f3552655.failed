@@ -1,0 +1,142 @@
+block: introduce blk_init_flush and its pair
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [block] introduce blk_init_flush and its pair (Jeff Moyer) [1209624]
+Rebuild_FUZZ: 91.36%
+commit-author Ming Lei <ming.lei@canonical.com>
+commit f355265571440a7db16e784b6edf4e7d26971a03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f3552655.failed
+
+These two temporary functions are introduced for holding flush
+initialization and de-initialization, so that we can
+introduce 'flush queue' easier in the following patch. And
+once 'flush queue' and its allocation/free functions are ready,
+they will be removed for sake of code readability.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Ming Lei <ming.lei@canonical.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f355265571440a7db16e784b6edf4e7d26971a03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-sysfs.c
+diff --cc block/blk-sysfs.c
+index 10d2058fed92,949075952119..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -548,7 -517,10 +548,14 @@@ static void blk_release_queue(struct ko
+  	if (q->queue_tags)
+  		__blk_queue_free_tags(q);
+  
+++<<<<<<< HEAD
+ +	kfree(q->flush_rq);
+++=======
++ 	blk_exit_flush(q);
++ 
++ 	if (q->mq_ops)
++ 		blk_mq_free_queue(q);
+++>>>>>>> f35526557144 (block: introduce blk_init_flush and its pair)
+  
+  	blk_trace_shutdown(q);
+  
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 6c8ecd3370db..bd7865f87f59 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -708,8 +708,7 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
+ 	if (!q)
+ 		return NULL;
+ 
+-	q->flush_rq = kzalloc(sizeof(struct request), GFP_KERNEL);
+-	if (!q->flush_rq)
++	if (blk_init_flush(q))
+ 		return NULL;
+ 
+ 	if (blk_init_rl(&q->root_rl, q, GFP_KERNEL))
+@@ -745,7 +744,7 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
+ 	return q;
+ 
+ fail:
+-	kfree(q->flush_rq);
++	blk_exit_flush(q);
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(blk_init_allocated_queue);
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index d8b80a403a8f..f80a0db8135e 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -489,7 +489,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+ }
+ EXPORT_SYMBOL(blkdev_issue_flush);
+ 
+-int blk_mq_init_flush(struct request_queue *q)
++static int blk_mq_init_flush(struct request_queue *q)
+ {
+ 	struct blk_mq_tag_set *set = q->tag_set;
+ 
+@@ -502,3 +502,20 @@ int blk_mq_init_flush(struct request_queue *q)
+ 		return -ENOMEM;
+ 	return 0;
+ }
++
++int blk_init_flush(struct request_queue *q)
++{
++	if (q->mq_ops)
++		return blk_mq_init_flush(q);
++
++	q->flush_rq = kzalloc(sizeof(struct request), GFP_KERNEL);
++	if (!q->flush_rq)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void blk_exit_flush(struct request_queue *q)
++{
++	kfree(q->flush_rq);
++}
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 77afc91943c8..e9e7cfbd16de 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1863,7 +1863,7 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ 
+ 	blk_mq_add_queue_tag_set(set, q);
+ 
+-	if (blk_mq_init_flush(q))
++	if (blk_init_flush(q))
+ 		goto err_hw_queues;
+ 
+ 	blk_mq_map_swqueue(q);
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 888706800e67..dfa8dc6067a3 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -30,7 +30,6 @@ struct blk_mq_ctx {
+ 
+ void __blk_mq_complete_request(struct request *rq);
+ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
+-int blk_mq_init_flush(struct request_queue *q);
+ void blk_mq_freeze_queue(struct request_queue *q);
+ void blk_mq_free_queue(struct request_queue *q);
+ void blk_mq_clone_flush_request(struct request *flush_rq,
+* Unmerged path block/blk-sysfs.c
+diff --git a/block/blk.h b/block/blk.h
+index e515a285d4c9..c6fa3d4c6a89 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -22,6 +22,9 @@ static inline void __blk_get_queue(struct request_queue *q)
+ 	kobject_get(&q->kobj);
+ }
+ 
++int blk_init_flush(struct request_queue *q);
++void blk_exit_flush(struct request_queue *q);
++
+ int blk_init_rl(struct request_list *rl, struct request_queue *q,
+ 		gfp_t gfp_mask);
+ void blk_exit_rl(struct request_list *rl);
