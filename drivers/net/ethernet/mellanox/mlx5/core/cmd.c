@@ -516,10 +516,11 @@ static void cmd_work_handler(struct work_struct *work)
 	ktime_get_ts(&ent->ts1);
 
 	/* ring doorbell after the descriptor is valid */
+	mlx5_core_dbg(dev, "writing 0x%x to command doorbell\n", 1 << ent->idx);
 	wmb();
 	iowrite32be(1 << ent->idx, &dev->iseg->cmd_dbell);
-	mlx5_core_dbg(dev, "write 0x%x to command doorbell\n", 1 << ent->idx);
 	mmiowb();
+	/* if not in polling don't use ent after this point */
 	if (cmd->mode == CMD_MODE_POLLING) {
 		poll_timeout(ent);
 		/* make sure we read the descriptor after ownership is SW */
