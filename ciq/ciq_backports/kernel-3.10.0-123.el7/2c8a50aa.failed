@@ -1,0 +1,331 @@
+sched/numa: Favor placing a task on the preferred node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Mel Gorman <mgorman@suse.de>
+commit 2c8a50aa873a7e1d6cc0913362051ff9912dc6ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/2c8a50aa.failed
+
+A tasks preferred node is selected based on the number of faults
+recorded for a node but the actual task_numa_migate() conducts a global
+search regardless of the preferred nid. This patch checks if the
+preferred nid has capacity and if so, searches for a CPU within that
+node. This avoids a global search when the preferred node is not
+overloaded.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1381141781-10992-41-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2c8a50aa873a7e1d6cc0913362051ff9912dc6ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 98cee68da024,09aac90df89e..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -839,6 -879,292 +839,295 @@@ static unsigned int task_scan_max(struc
+  	return max(smin, smax);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Once a preferred node is selected the scheduler balancer will prefer moving
++  * a task to that node for sysctl_numa_balancing_settle_count number of PTE
++  * scans. This will give the process the chance to accumulate more faults on
++  * the preferred node but still allow the scheduler to move the task again if
++  * the nodes CPUs are overloaded.
++  */
++ unsigned int sysctl_numa_balancing_settle_count __read_mostly = 4;
++ 
++ static inline int task_faults_idx(int nid, int priv)
++ {
++ 	return 2 * nid + priv;
++ }
++ 
++ static inline unsigned long task_faults(struct task_struct *p, int nid)
++ {
++ 	if (!p->numa_faults)
++ 		return 0;
++ 
++ 	return p->numa_faults[task_faults_idx(nid, 0)] +
++ 		p->numa_faults[task_faults_idx(nid, 1)];
++ }
++ 
++ static unsigned long weighted_cpuload(const int cpu);
++ static unsigned long source_load(int cpu, int type);
++ static unsigned long target_load(int cpu, int type);
++ static unsigned long power_of(int cpu);
++ static long effective_load(struct task_group *tg, int cpu, long wl, long wg);
++ 
++ /* Cached statistics for all CPUs within a node */
++ struct numa_stats {
++ 	unsigned long nr_running;
++ 	unsigned long load;
++ 
++ 	/* Total compute capacity of CPUs on a node */
++ 	unsigned long power;
++ 
++ 	/* Approximate capacity in terms of runnable tasks on a node */
++ 	unsigned long capacity;
++ 	int has_capacity;
++ };
++ 
++ /*
++  * XXX borrowed from update_sg_lb_stats
++  */
++ static void update_numa_stats(struct numa_stats *ns, int nid)
++ {
++ 	int cpu;
++ 
++ 	memset(ns, 0, sizeof(*ns));
++ 	for_each_cpu(cpu, cpumask_of_node(nid)) {
++ 		struct rq *rq = cpu_rq(cpu);
++ 
++ 		ns->nr_running += rq->nr_running;
++ 		ns->load += weighted_cpuload(cpu);
++ 		ns->power += power_of(cpu);
++ 	}
++ 
++ 	ns->load = (ns->load * SCHED_POWER_SCALE) / ns->power;
++ 	ns->capacity = DIV_ROUND_CLOSEST(ns->power, SCHED_POWER_SCALE);
++ 	ns->has_capacity = (ns->nr_running < ns->capacity);
++ }
++ 
++ struct task_numa_env {
++ 	struct task_struct *p;
++ 
++ 	int src_cpu, src_nid;
++ 	int dst_cpu, dst_nid;
++ 
++ 	struct numa_stats src_stats, dst_stats;
++ 
++ 	int imbalance_pct, idx;
++ 
++ 	struct task_struct *best_task;
++ 	long best_imp;
++ 	int best_cpu;
++ };
++ 
++ static void task_numa_assign(struct task_numa_env *env,
++ 			     struct task_struct *p, long imp)
++ {
++ 	if (env->best_task)
++ 		put_task_struct(env->best_task);
++ 	if (p)
++ 		get_task_struct(p);
++ 
++ 	env->best_task = p;
++ 	env->best_imp = imp;
++ 	env->best_cpu = env->dst_cpu;
++ }
++ 
++ /*
++  * This checks if the overall compute and NUMA accesses of the system would
++  * be improved if the source tasks was migrated to the target dst_cpu taking
++  * into account that it might be best if task running on the dst_cpu should
++  * be exchanged with the source task
++  */
++ static void task_numa_compare(struct task_numa_env *env, long imp)
++ {
++ 	struct rq *src_rq = cpu_rq(env->src_cpu);
++ 	struct rq *dst_rq = cpu_rq(env->dst_cpu);
++ 	struct task_struct *cur;
++ 	long dst_load, src_load;
++ 	long load;
++ 
++ 	rcu_read_lock();
++ 	cur = ACCESS_ONCE(dst_rq->curr);
++ 	if (cur->pid == 0) /* idle */
++ 		cur = NULL;
++ 
++ 	/*
++ 	 * "imp" is the fault differential for the source task between the
++ 	 * source and destination node. Calculate the total differential for
++ 	 * the source task and potential destination task. The more negative
++ 	 * the value is, the more rmeote accesses that would be expected to
++ 	 * be incurred if the tasks were swapped.
++ 	 */
++ 	if (cur) {
++ 		/* Skip this swap candidate if cannot move to the source cpu */
++ 		if (!cpumask_test_cpu(env->src_cpu, tsk_cpus_allowed(cur)))
++ 			goto unlock;
++ 
++ 		imp += task_faults(cur, env->src_nid) -
++ 		       task_faults(cur, env->dst_nid);
++ 	}
++ 
++ 	if (imp < env->best_imp)
++ 		goto unlock;
++ 
++ 	if (!cur) {
++ 		/* Is there capacity at our destination? */
++ 		if (env->src_stats.has_capacity &&
++ 		    !env->dst_stats.has_capacity)
++ 			goto unlock;
++ 
++ 		goto balance;
++ 	}
++ 
++ 	/* Balance doesn't matter much if we're running a task per cpu */
++ 	if (src_rq->nr_running == 1 && dst_rq->nr_running == 1)
++ 		goto assign;
++ 
++ 	/*
++ 	 * In the overloaded case, try and keep the load balanced.
++ 	 */
++ balance:
++ 	dst_load = env->dst_stats.load;
++ 	src_load = env->src_stats.load;
++ 
++ 	/* XXX missing power terms */
++ 	load = task_h_load(env->p);
++ 	dst_load += load;
++ 	src_load -= load;
++ 
++ 	if (cur) {
++ 		load = task_h_load(cur);
++ 		dst_load -= load;
++ 		src_load += load;
++ 	}
++ 
++ 	/* make src_load the smaller */
++ 	if (dst_load < src_load)
++ 		swap(dst_load, src_load);
++ 
++ 	if (src_load * env->imbalance_pct < dst_load * 100)
++ 		goto unlock;
++ 
++ assign:
++ 	task_numa_assign(env, cur, imp);
++ unlock:
++ 	rcu_read_unlock();
++ }
++ 
++ static void task_numa_find_cpu(struct task_numa_env *env, long imp)
++ {
++ 	int cpu;
++ 
++ 	for_each_cpu(cpu, cpumask_of_node(env->dst_nid)) {
++ 		/* Skip this CPU if the source task cannot migrate */
++ 		if (!cpumask_test_cpu(cpu, tsk_cpus_allowed(env->p)))
++ 			continue;
++ 
++ 		env->dst_cpu = cpu;
++ 		task_numa_compare(env, imp);
++ 	}
++ }
++ 
++ static int task_numa_migrate(struct task_struct *p)
++ {
++ 	struct task_numa_env env = {
++ 		.p = p,
++ 
++ 		.src_cpu = task_cpu(p),
++ 		.src_nid = cpu_to_node(task_cpu(p)),
++ 
++ 		.imbalance_pct = 112,
++ 
++ 		.best_task = NULL,
++ 		.best_imp = 0,
++ 		.best_cpu = -1
++ 	};
++ 	struct sched_domain *sd;
++ 	unsigned long faults;
++ 	int nid, ret;
++ 	long imp;
++ 
++ 	/*
++ 	 * Pick the lowest SD_NUMA domain, as that would have the smallest
++ 	 * imbalance and would be the first to start moving tasks about.
++ 	 *
++ 	 * And we want to avoid any moving of tasks about, as that would create
++ 	 * random movement of tasks -- counter the numa conditions we're trying
++ 	 * to satisfy here.
++ 	 */
++ 	rcu_read_lock();
++ 	sd = rcu_dereference(per_cpu(sd_numa, env.src_cpu));
++ 	env.imbalance_pct = 100 + (sd->imbalance_pct - 100) / 2;
++ 	rcu_read_unlock();
++ 
++ 	faults = task_faults(p, env.src_nid);
++ 	update_numa_stats(&env.src_stats, env.src_nid);
++ 	env.dst_nid = p->numa_preferred_nid;
++ 	imp = task_faults(env.p, env.dst_nid) - faults;
++ 	update_numa_stats(&env.dst_stats, env.dst_nid);
++ 
++ 	/*
++ 	 * If the preferred nid has capacity then use it. Otherwise find an
++ 	 * alternative node with relatively better statistics.
++ 	 */
++ 	if (env.dst_stats.has_capacity) {
++ 		task_numa_find_cpu(&env, imp);
++ 	} else {
++ 		for_each_online_node(nid) {
++ 			if (nid == env.src_nid || nid == p->numa_preferred_nid)
++ 				continue;
++ 
++ 			/* Only consider nodes that recorded more faults */
++ 			imp = task_faults(env.p, nid) - faults;
++ 			if (imp < 0)
++ 				continue;
++ 
++ 			env.dst_nid = nid;
++ 			update_numa_stats(&env.dst_stats, env.dst_nid);
++ 			task_numa_find_cpu(&env, imp);
++ 		}
++ 	}
++ 
++ 	/* No better CPU than the current one was found. */
++ 	if (env.best_cpu == -1)
++ 		return -EAGAIN;
++ 
++ 	if (env.best_task == NULL) {
++ 		int ret = migrate_task_to(p, env.best_cpu);
++ 		return ret;
++ 	}
++ 
++ 	ret = migrate_swap(p, env.best_task);
++ 	put_task_struct(env.best_task);
++ 	return ret;
++ }
++ 
++ /* Attempt to migrate a task to a CPU on the preferred node. */
++ static void numa_migrate_preferred(struct task_struct *p)
++ {
++ 	/* Success if task is already running on preferred CPU */
++ 	p->numa_migrate_retry = 0;
++ 	if (cpu_to_node(task_cpu(p)) == p->numa_preferred_nid) {
++ 		/*
++ 		 * If migration is temporarily disabled due to a task migration
++ 		 * then re-enable it now as the task is running on its
++ 		 * preferred node and memory should migrate locally
++ 		 */
++ 		if (!p->numa_migrate_seq)
++ 			p->numa_migrate_seq++;
++ 		return;
++ 	}
++ 
++ 	/* This task has no NUMA fault statistics yet */
++ 	if (unlikely(p->numa_preferred_nid == -1))
++ 		return;
++ 
++ 	/* Otherwise, try migrate to a CPU on the preferred node */
++ 	if (task_numa_migrate(p) != 0)
++ 		p->numa_migrate_retry = jiffies + HZ*5;
++ }
++ 
+++>>>>>>> 2c8a50aa873a (sched/numa: Favor placing a task on the preferred node)
+  static void task_numa_placement(struct task_struct *p)
+  {
+  	int seq, nid, max_nid = -1;
+* Unmerged path kernel/sched/fair.c
