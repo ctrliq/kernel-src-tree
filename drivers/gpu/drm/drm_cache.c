@@ -140,7 +140,7 @@ drm_clflush_virt_range(void *addrv, unsigned long length)
 		mb();
 		for (; addr < end; addr += boot_cpu_data.x86_clflush_size)
 			clflush(addr);
-		clflush(end - 1);
+		clflushopt(end - 1);
 		mb();
 		return;
 	}
