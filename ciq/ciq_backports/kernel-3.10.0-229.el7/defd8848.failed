@@ -1,0 +1,203 @@
+iscsi/iser-target: Fix isert_conn->state hung shutdown issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [target] iscsi, iser: Fix isert_conn->state hung shutdown issues (Andy Grover) [1129387]
+Rebuild_FUZZ: 91.38%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit defd884845297fd5690594bfe89656b01f16d87e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/defd8848.failed
+
+This patch addresses a couple of different hug shutdown issues
+related to wait_event() + isert_conn->state.  First, it changes
+isert_conn->conn_wait + isert_conn->conn_wait_comp_err from
+waitqueues to completions, and sets ISER_CONN_TERMINATING from
+within isert_disconnect_work().
+
+Second, it splits isert_free_conn() into isert_wait_conn() that
+is called earlier in iscsit_close_connection() to ensure that
+all outstanding commands have completed before continuing.
+
+Finally, it breaks isert_cq_comp_err() into seperate TX / RX
+related code, and adds logic in isert_cq_rx_comp_err() to wait
+for outstanding commands to complete before setting ISER_CONN_DOWN
+and calling complete(&isert_conn->conn_wait_comp_err).
+
+	Acked-by: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Or Gerlitz <ogerlitz@mellanox.com>
+	Cc: <stable@vger.kernel.org> #3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit defd884845297fd5690594bfe89656b01f16d87e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 3d8fe41643f4,862d7b4b0411..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -1431,31 -1673,57 +1431,61 @@@ isert_send_completion(struct iser_tx_de
+  }
+  
+  static void
+++<<<<<<< HEAD
+ +isert_cq_comp_err(struct iser_tx_desc *tx_desc, struct isert_conn *isert_conn)
+++=======
++ isert_send_completion(struct iser_tx_desc *tx_desc,
++ 		      struct isert_conn *isert_conn)
++ {
++ 	struct llist_node *llnode = tx_desc->comp_llnode_batch;
++ 	struct iser_tx_desc *t;
++ 	/*
++ 	 * Drain coalesced completion llist starting from comp_llnode_batch
++ 	 * setup in isert_init_send_wr(), and then complete trailing tx_desc.
++ 	 */
++ 	while (llnode) {
++ 		t = llist_entry(llnode, struct iser_tx_desc, comp_llnode);
++ 		llnode = llist_next(llnode);
++ 		__isert_send_completion(t, isert_conn);
++ 	}
++ 	__isert_send_completion(tx_desc, isert_conn);
++ }
++ 
++ static void
++ isert_cq_tx_comp_err(struct iser_tx_desc *tx_desc, struct isert_conn *isert_conn)
+++>>>>>>> defd88484529 (iscsi/iser-target: Fix isert_conn->state hung shutdown issues)
+  {
+  	struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
++ 	struct isert_cmd *isert_cmd = tx_desc->isert_cmd;
+  
+- 	if (tx_desc) {
+- 		struct isert_cmd *isert_cmd = tx_desc->isert_cmd;
++ 	if (!isert_cmd)
++ 		isert_unmap_tx_desc(tx_desc, ib_dev);
++ 	else
++ 		isert_completion_put(tx_desc, isert_cmd, ib_dev);
++ }
+  
+- 		if (!isert_cmd)
+- 			isert_unmap_tx_desc(tx_desc, ib_dev);
+- 		else
+- 			isert_completion_put(tx_desc, isert_cmd, ib_dev);
++ static void
++ isert_cq_rx_comp_err(struct isert_conn *isert_conn)
++ {
++ 	struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
++ 	struct iscsi_conn *conn = isert_conn->conn;
++ 
++ 	if (isert_conn->post_recv_buf_count)
++ 		return;
++ 
++ 	if (conn->sess) {
++ 		target_sess_cmd_list_set_waiting(conn->sess->se_sess);
++ 		target_wait_for_sess_cmds(conn->sess->se_sess);
+  	}
+  
+- 	if (isert_conn->post_recv_buf_count == 0 &&
+- 	    atomic_read(&isert_conn->post_send_buf_count) == 0) {
+- 		pr_debug("isert_cq_comp_err >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n");
+- 		pr_debug("Calling wake_up from isert_cq_comp_err\n");
++ 	while (atomic_read(&isert_conn->post_send_buf_count))
++ 		msleep(3000);
+  
+- 		mutex_lock(&isert_conn->conn_mutex);
+- 		if (isert_conn->state != ISER_CONN_DOWN)
+- 			isert_conn->state = ISER_CONN_TERMINATING;
+- 		mutex_unlock(&isert_conn->conn_mutex);
++ 	mutex_lock(&isert_conn->conn_mutex);
++ 	isert_conn->state = ISER_CONN_DOWN;
++ 	mutex_unlock(&isert_conn->conn_mutex);
+  
+- 		wake_up(&isert_conn->conn_wait_comp_err);
+- 	}
++ 	complete(&isert_conn->conn_wait_comp_err);
+  }
+  
+  static void
+@@@ -1479,8 -1747,10 +1509,13 @@@ isert_cq_tx_work(struct work_struct *wo
+  		} else {
+  			pr_debug("TX wc.status != IB_WC_SUCCESS >>>>>>>>>>>>>>\n");
+  			pr_debug("TX wc.status: 0x%08x\n", wc.status);
+++<<<<<<< HEAD
+++=======
++ 			pr_debug("TX wc.vendor_err: 0x%08x\n", wc.vendor_err);
++ 
+++>>>>>>> defd88484529 (iscsi/iser-target: Fix isert_conn->state hung shutdown issues)
+  			atomic_dec(&isert_conn->post_send_buf_count);
+- 			isert_cq_comp_err(tx_desc, isert_conn);
++ 			isert_cq_tx_comp_err(tx_desc, isert_conn);
+  		}
+  	}
+  
+@@@ -1517,11 -1787,13 +1552,11 @@@ isert_cq_rx_work(struct work_struct *wo
+  			isert_rx_completion(rx_desc, isert_conn, xfer_len);
+  		} else {
+  			pr_debug("RX wc.status != IB_WC_SUCCESS >>>>>>>>>>>>>>\n");
+ -			if (wc.status != IB_WC_WR_FLUSH_ERR) {
+ +			if (wc.status != IB_WC_WR_FLUSH_ERR)
+  				pr_debug("RX wc.status: 0x%08x\n", wc.status);
+ -				pr_debug("RX wc.vendor_err: 0x%08x\n",
+ -					 wc.vendor_err);
+ -			}
+ +
+  			isert_conn->post_recv_buf_count--;
+- 			isert_cq_comp_err(NULL, isert_conn);
++ 			isert_cq_rx_comp_err(isert_conn);
+  		}
+  	}
+  
+@@@ -2275,8 -2760,8 +2290,9 @@@ static struct iscsit_transport iser_tar
+  	.iscsit_setup_np	= isert_setup_np,
+  	.iscsit_accept_np	= isert_accept_np,
+  	.iscsit_free_np		= isert_free_np,
++ 	.iscsit_wait_conn	= isert_wait_conn,
+  	.iscsit_free_conn	= isert_free_conn,
+ +	.iscsit_alloc_cmd	= isert_alloc_cmd,
+  	.iscsit_get_login_rx	= isert_get_login_rx,
+  	.iscsit_put_login_tx	= isert_put_login_tx,
+  	.iscsit_immediate_queue	= isert_immediate_queue,
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.h b/drivers/infiniband/ulp/isert/ib_isert.h
+index 3941be52b111..dfe4a2ebef0d 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.h
++++ b/drivers/infiniband/ulp/isert/ib_isert.h
+@@ -103,8 +103,8 @@ struct isert_conn {
+ 	struct isert_device	*conn_device;
+ 	struct work_struct	conn_logout_work;
+ 	struct mutex		conn_mutex;
+-	wait_queue_head_t	conn_wait;
+-	wait_queue_head_t	conn_wait_comp_err;
++	struct completion	conn_wait;
++	struct completion	conn_wait_comp_err;
+ 	struct kref		conn_kref;
+ };
+ 
+diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
+index f42130d7d1da..6e68cbddf4c3 100644
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -4142,6 +4142,10 @@ int iscsit_close_connection(
+ 	iscsit_stop_timers_for_cmds(conn);
+ 	iscsit_stop_nopin_response_timer(conn);
+ 	iscsit_stop_nopin_timer(conn);
++
++	if (conn->conn_transport->iscsit_wait_conn)
++		conn->conn_transport->iscsit_wait_conn(conn);
++
+ 	iscsit_free_queue_reqs_for_conn(conn);
+ 
+ 	/*
+diff --git a/include/target/iscsi/iscsi_transport.h b/include/target/iscsi/iscsi_transport.h
+index c5aade523863..4a5f00e2e6cd 100644
+--- a/include/target/iscsi/iscsi_transport.h
++++ b/include/target/iscsi/iscsi_transport.h
+@@ -11,6 +11,7 @@ struct iscsit_transport {
+ 	int (*iscsit_setup_np)(struct iscsi_np *, struct __kernel_sockaddr_storage *);
+ 	int (*iscsit_accept_np)(struct iscsi_np *, struct iscsi_conn *);
+ 	void (*iscsit_free_np)(struct iscsi_np *);
++	void (*iscsit_wait_conn)(struct iscsi_conn *);
+ 	void (*iscsit_free_conn)(struct iscsi_conn *);
+ 	struct iscsi_cmd *(*iscsit_alloc_cmd)(struct iscsi_conn *, gfp_t);
+ 	int (*iscsit_get_login_rx)(struct iscsi_conn *, struct iscsi_login *);
