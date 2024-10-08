@@ -1,0 +1,243 @@
+mmc: sdhci: move FSL ESDHC reset handling quirk into esdhc code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Russell King <rmk+kernel@arm.linux.org.uk>
+commit 0718e59ae259f7c48155b4e852d8b0632d59028e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0718e59a.failed
+
+The Freescale esdhc driver is the only driver which needs the interrupt
+registers restored after a reset.  Move this quirk to be part of the
+ESDHC driver implementation.
+
+	Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+	Tested-by: Markus Pargmann <mpa@pengutronix.de>
+	Tested-by: Stephen Warren <swarren@nvidia.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Chris Ball <chris@printf.net>
+(cherry picked from commit 0718e59ae259f7c48155b4e852d8b0632d59028e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/sdhci-esdhc-imx.c
+#	drivers/mmc/host/sdhci.c
+diff --cc drivers/mmc/host/sdhci-esdhc-imx.c
+index 98f46704baa6,812c5772d900..000000000000
+--- a/drivers/mmc/host/sdhci-esdhc-imx.c
++++ b/drivers/mmc/host/sdhci-esdhc-imx.c
+@@@ -432,17 -759,144 +432,152 @@@ static int esdhc_pltfm_bus_width(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct sdhci_ops sdhci_esdhc_ops = {
+++=======
++ static void esdhc_post_tuning(struct sdhci_host *host)
++ {
++ 	u32 reg;
++ 
++ 	reg = readl(host->ioaddr + ESDHC_MIX_CTRL);
++ 	reg &= ~ESDHC_MIX_CTRL_EXE_TUNE;
++ 	writel(reg, host->ioaddr + ESDHC_MIX_CTRL);
++ }
++ 
++ static int esdhc_executing_tuning(struct sdhci_host *host, u32 opcode)
++ {
++ 	int min, max, avg, ret;
++ 
++ 	/* find the mininum delay first which can pass tuning */
++ 	min = ESDHC_TUNE_CTRL_MIN;
++ 	while (min < ESDHC_TUNE_CTRL_MAX) {
++ 		esdhc_prepare_tuning(host, min);
++ 		if (!esdhc_send_tuning_cmd(host, opcode))
++ 			break;
++ 		min += ESDHC_TUNE_CTRL_STEP;
++ 	}
++ 
++ 	/* find the maxinum delay which can not pass tuning */
++ 	max = min + ESDHC_TUNE_CTRL_STEP;
++ 	while (max < ESDHC_TUNE_CTRL_MAX) {
++ 		esdhc_prepare_tuning(host, max);
++ 		if (esdhc_send_tuning_cmd(host, opcode)) {
++ 			max -= ESDHC_TUNE_CTRL_STEP;
++ 			break;
++ 		}
++ 		max += ESDHC_TUNE_CTRL_STEP;
++ 	}
++ 
++ 	/* use average delay to get the best timing */
++ 	avg = (min + max) / 2;
++ 	esdhc_prepare_tuning(host, avg);
++ 	ret = esdhc_send_tuning_cmd(host, opcode);
++ 	esdhc_post_tuning(host);
++ 
++ 	dev_dbg(mmc_dev(host->mmc), "tunning %s at 0x%x ret %d\n",
++ 		ret ? "failed" : "passed", avg, ret);
++ 
++ 	return ret;
++ }
++ 
++ static int esdhc_change_pinstate(struct sdhci_host *host,
++ 						unsigned int uhs)
++ {
++ 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++ 	struct pltfm_imx_data *imx_data = pltfm_host->priv;
++ 	struct pinctrl_state *pinctrl;
++ 
++ 	dev_dbg(mmc_dev(host->mmc), "change pinctrl state for uhs %d\n", uhs);
++ 
++ 	if (IS_ERR(imx_data->pinctrl) ||
++ 		IS_ERR(imx_data->pins_default) ||
++ 		IS_ERR(imx_data->pins_100mhz) ||
++ 		IS_ERR(imx_data->pins_200mhz))
++ 		return -EINVAL;
++ 
++ 	switch (uhs) {
++ 	case MMC_TIMING_UHS_SDR50:
++ 		pinctrl = imx_data->pins_100mhz;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR104:
++ 	case MMC_TIMING_MMC_HS200:
++ 		pinctrl = imx_data->pins_200mhz;
++ 		break;
++ 	default:
++ 		/* back to default state for other legacy timing */
++ 		pinctrl = imx_data->pins_default;
++ 	}
++ 
++ 	return pinctrl_select_state(imx_data->pinctrl, pinctrl);
++ }
++ 
++ static int esdhc_set_uhs_signaling(struct sdhci_host *host, unsigned int uhs)
++ {
++ 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++ 	struct pltfm_imx_data *imx_data = pltfm_host->priv;
++ 	struct esdhc_platform_data *boarddata = &imx_data->boarddata;
++ 
++ 	switch (uhs) {
++ 	case MMC_TIMING_UHS_SDR12:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR12;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR25:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR25;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR50:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR50;
++ 		break;
++ 	case MMC_TIMING_UHS_SDR104:
++ 	case MMC_TIMING_MMC_HS200:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_SDR104;
++ 		break;
++ 	case MMC_TIMING_UHS_DDR50:
++ 		imx_data->uhs_mode = SDHCI_CTRL_UHS_DDR50;
++ 		writel(readl(host->ioaddr + ESDHC_MIX_CTRL) |
++ 				ESDHC_MIX_CTRL_DDREN,
++ 				host->ioaddr + ESDHC_MIX_CTRL);
++ 		imx_data->is_ddr = 1;
++ 		if (boarddata->delay_line) {
++ 			u32 v;
++ 			v = boarddata->delay_line <<
++ 				ESDHC_DLL_OVERRIDE_VAL_SHIFT |
++ 				(1 << ESDHC_DLL_OVERRIDE_EN_SHIFT);
++ 			if (is_imx53_esdhc(imx_data))
++ 				v <<= 1;
++ 			writel(v, host->ioaddr + ESDHC_DLL_CTRL);
++ 		}
++ 		break;
++ 	}
++ 
++ 	return esdhc_change_pinstate(host, uhs);
++ }
++ 
++ static void esdhc_reset(struct sdhci_host *host, u8 mask)
++ {
++ 	sdhci_reset(host, mask);
++ 
++ 	sdhci_writel(host, host->ier, SDHCI_INT_ENABLE);
++ 	sdhci_writel(host, host->ier, SDHCI_SIGNAL_ENABLE);
++ }
++ 
++ static struct sdhci_ops sdhci_esdhc_ops = {
+++>>>>>>> 0718e59ae259 (mmc: sdhci: move FSL ESDHC reset handling quirk into esdhc code)
+  	.read_l = esdhc_readl_le,
+  	.read_w = esdhc_readw_le,
+  	.write_l = esdhc_writel_le,
+  	.write_w = esdhc_writew_le,
+  	.write_b = esdhc_writeb_le,
+ -	.set_clock = esdhc_pltfm_set_clock,
+ -	.get_max_clock = esdhc_pltfm_get_max_clock,
+ +	.set_clock = esdhc_set_clock,
+ +	.get_max_clock = sdhci_pltfm_clk_get_max_clock,
+  	.get_min_clock = esdhc_pltfm_get_min_clock,
+  	.get_ro = esdhc_pltfm_get_ro,
+++<<<<<<< HEAD
+ +	.platform_bus_width = esdhc_pltfm_bus_width,
+++=======
++ 	.set_bus_width = esdhc_pltfm_set_bus_width,
++ 	.set_uhs_signaling = esdhc_set_uhs_signaling,
++ 	.reset = esdhc_reset,
+++>>>>>>> 0718e59ae259 (mmc: sdhci: move FSL ESDHC reset handling quirk into esdhc code)
+  };
+  
+  static const struct sdhci_pltfm_data sdhci_esdhc_imx_pdata = {
+diff --cc drivers/mmc/host/sdhci.c
+index 9a66ab1fa866,074157e8e73d..000000000000
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@@ -220,12 -190,18 +220,16 @@@ static void sdhci_reset(struct sdhci_ho
+  		timeout--;
+  		mdelay(1);
+  	}
+ -}
+ -EXPORT_SYMBOL_GPL(sdhci_reset);
+  
+ -static void sdhci_do_reset(struct sdhci_host *host, u8 mask)
+ -{
+ -	if (host->quirks & SDHCI_QUIRK_NO_CARD_NO_RESET) {
+ -		if (!(sdhci_readl(host, SDHCI_PRESENT_STATE) &
+ -			SDHCI_CARD_PRESENT))
+ -			return;
+ -	}
+ +	if (host->ops->platform_reset_exit)
+ +		host->ops->platform_reset_exit(host, mask);
+  
+++<<<<<<< HEAD
+ +	if (host->quirks & SDHCI_QUIRK_RESTORE_IRQS_AFTER_RESET)
+ +		sdhci_clear_set_irqs(host, SDHCI_INT_ALL_MASK, ier);
+++=======
++ 	host->ops->reset(host, mask);
+++>>>>>>> 0718e59ae259 (mmc: sdhci: move FSL ESDHC reset handling quirk into esdhc code)
+  
+  	if (host->flags & (SDHCI_USE_SDMA | SDHCI_USE_ADMA)) {
+  		if ((host->ops->enable_dma) && (mask & SDHCI_RESET_ALL))
+* Unmerged path drivers/mmc/host/sdhci-esdhc-imx.c
+diff --git a/drivers/mmc/host/sdhci-esdhc.h b/drivers/mmc/host/sdhci-esdhc.h
+index d25f9ab9a54d..5b0ac1e407f3 100644
+--- a/drivers/mmc/host/sdhci-esdhc.h
++++ b/drivers/mmc/host/sdhci-esdhc.h
+@@ -22,8 +22,7 @@
+ 				SDHCI_QUIRK_NO_BUSY_IRQ | \
+ 				SDHCI_QUIRK_NONSTANDARD_CLOCK | \
+ 				SDHCI_QUIRK_DATA_TIMEOUT_USES_SDCLK | \
+-				SDHCI_QUIRK_PIO_NEEDS_DELAY | \
+-				SDHCI_QUIRK_RESTORE_IRQS_AFTER_RESET)
++				SDHCI_QUIRK_PIO_NEEDS_DELAY)
+ 
+ #define ESDHC_SYSTEM_CONTROL	0x2c
+ #define ESDHC_CLOCK_MASK	0x0000fff0
+* Unmerged path drivers/mmc/host/sdhci.c
+diff --git a/include/linux/mmc/sdhci.h b/include/linux/mmc/sdhci.h
+index 1f55d4bcbbfb..1b6367e2d2d5 100644
+--- a/include/linux/mmc/sdhci.h
++++ b/include/linux/mmc/sdhci.h
+@@ -61,8 +61,6 @@ struct sdhci_host {
+ #define SDHCI_QUIRK_NONSTANDARD_CLOCK			(1<<17)
+ /* Controller does not like fast PIO transfers */
+ #define SDHCI_QUIRK_PIO_NEEDS_DELAY			(1<<18)
+-/* Controller losing signal/interrupt enable states after reset */
+-#define SDHCI_QUIRK_RESTORE_IRQS_AFTER_RESET		(1<<19)
+ /* Controller has to be forced to use block size of 2048 bytes */
+ #define SDHCI_QUIRK_FORCE_BLK_SZ_2048			(1<<20)
+ /* Controller cannot do multi-block transfers */
