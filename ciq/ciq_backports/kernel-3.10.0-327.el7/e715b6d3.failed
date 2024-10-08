@@ -1,0 +1,284 @@
+net: fib6: convert cfg metric to u32 outside of table write lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] fib6: convert cfg metric to u32 outside of table write lock (Florian Westphal) [1212624]
+Rebuild_FUZZ: 95.93%
+commit-author Florian Westphal <fw@strlen.de>
+commit e715b6d3a5ef55834778d49224e60e8ccb5bf45f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e715b6d3.failed
+
+Do the nla validation earlier, outside the write lock.
+
+This is needed by followup patch which needs to be able to call
+request_module (which can sleep) if needed.
+
+Joint work with Daniel Borkmann.
+
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e715b6d3a5ef55834778d49224e60e8ccb5bf45f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_fib.h
+#	net/ipv6/ip6_fib.c
+#	net/ipv6/route.c
+diff --cc include/net/ip6_fib.h
+index 46fbf3d53f85,20e80fa7bbdd..000000000000
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@@ -272,47 -280,39 +277,53 @@@ typedef struct rt6_info *(*pol_lookup_t
+   *	exported functions
+   */
+  
+ -struct fib6_table *fib6_get_table(struct net *net, u32 id);
+ -struct fib6_table *fib6_new_table(struct net *net, u32 id);
+ -struct dst_entry *fib6_rule_lookup(struct net *net, struct flowi6 *fl6,
+ -				   int flags, pol_lookup_t lookup);
+ +extern struct fib6_table        *fib6_get_table(struct net *net, u32 id);
+ +extern struct fib6_table        *fib6_new_table(struct net *net, u32 id);
+ +extern struct dst_entry         *fib6_rule_lookup(struct net *net,
+ +						  struct flowi6 *fl6, int flags,
+ +						  pol_lookup_t lookup);
+ +
+ +extern struct fib6_node		*fib6_lookup(struct fib6_node *root,
+ +					     const struct in6_addr *daddr,
+ +					     const struct in6_addr *saddr);
+  
+ -struct fib6_node *fib6_lookup(struct fib6_node *root,
+ -			      const struct in6_addr *daddr,
+ -			      const struct in6_addr *saddr);
+ +struct fib6_node		*fib6_locate(struct fib6_node *root,
+ +					     const struct in6_addr *daddr, int dst_len,
+ +					     const struct in6_addr *saddr, int src_len);
+  
+ -struct fib6_node *fib6_locate(struct fib6_node *root,
+ -			      const struct in6_addr *daddr, int dst_len,
+ -			      const struct in6_addr *saddr, int src_len);
+ +extern void			fib6_clean_all(struct net *net,
+ +					       int (*func)(struct rt6_info *, void *arg),
+ +					       void *arg);
+  
+ -void fib6_clean_all(struct net *net, int (*func)(struct rt6_info *, void *arg),
+ -		    void *arg);
+++<<<<<<< HEAD
+ +extern int			fib6_add(struct fib6_node *root,
+ +					 struct rt6_info *rt,
+ +					 struct nl_info *info);
+  
+ +extern int			fib6_del(struct rt6_info *rt,
+ +					 struct nl_info *info);
+++=======
++ int fib6_add(struct fib6_node *root, struct rt6_info *rt,
++ 	     struct nl_info *info, struct mx6_config *mxc);
++ int fib6_del(struct rt6_info *rt, struct nl_info *info);
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  
+ -void inet6_rt_notify(int event, struct rt6_info *rt, struct nl_info *info);
+ +extern void			inet6_rt_notify(int event, struct rt6_info *rt,
+ +						struct nl_info *info);
+  
+ -void fib6_run_gc(unsigned long expires, struct net *net, bool force);
+ +extern void			fib6_run_gc(unsigned long expires,
+ +					    struct net *net);
+  
+ -void fib6_gc_cleanup(void);
+ +extern void			fib6_gc_cleanup(void);
+  
+ -int fib6_init(void);
+ +extern int			fib6_init(void);
+  
+ -int ipv6_route_open(struct inode *inode, struct file *file);
+ +extern int			ipv6_route_open(struct inode *inode,
+ +						struct file *file);
+  
+  #ifdef CONFIG_IPV6_MULTIPLE_TABLES
+ -int fib6_rules_init(void);
+ -void fib6_rules_cleanup(void);
+ +extern int			fib6_rules_init(void);
+ +extern void			fib6_rules_cleanup(void);
+  #else
+  static inline int               fib6_rules_init(void)
+  {
+diff --cc net/ipv6/ip6_fib.c
+index ebabac76c2ff,03c520a4ebeb..000000000000
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@@ -638,12 -630,44 +638,51 @@@ static inline bool rt6_qualify_for_ecmp
+  	       RTF_GATEWAY;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void fib6_copy_metrics(u32 *mp, const struct mx6_config *mxc)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < RTAX_MAX; i++) {
++ 		if (test_bit(i, mxc->mx_valid))
++ 			mp[i] = mxc->mx[i];
++ 	}
++ }
++ 
++ static int fib6_commit_metrics(struct dst_entry *dst, struct mx6_config *mxc)
++ {
++ 	if (!mxc->mx)
++ 		return 0;
++ 
++ 	if (dst->flags & DST_HOST) {
++ 		u32 *mp = dst_metrics_write_ptr(dst);
++ 
++ 		if (unlikely(!mp))
++ 			return -ENOMEM;
++ 
++ 		fib6_copy_metrics(mp, mxc);
++ 	} else {
++ 		dst_init_metrics(dst, mxc->mx, false);
++ 
++ 		/* We've stolen mx now. */
++ 		mxc->mx = NULL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  /*
+   *	Insert routing information in a node.
+   */
+  
+  static int fib6_add_rt2node(struct fib6_node *fn, struct rt6_info *rt,
+++<<<<<<< HEAD
+ +			    struct nl_info *info)
+++=======
++ 			    struct nl_info *info, struct mx6_config *mxc)
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  {
+  	struct rt6_info *iter = NULL;
+  	struct rt6_info **ins;
+@@@ -751,6 -776,10 +790,13 @@@
+  			pr_warn("NLM_F_CREATE should be set when creating new route\n");
+  
+  add:
+++<<<<<<< HEAD
+++=======
++ 		err = fib6_commit_metrics(&rt->dst, mxc);
++ 		if (err)
++ 			return err;
++ 
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  		rt->dst.rt6_next = iter;
+  		*ins = rt;
+  		rt->rt6i_node = fn;
+@@@ -770,6 -799,11 +816,14 @@@
+  			pr_warn("NLM_F_REPLACE set, but no existing node found!\n");
+  			return -ENOENT;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		err = fib6_commit_metrics(&rt->dst, mxc);
++ 		if (err)
++ 			return err;
++ 
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  		*ins = rt;
+  		rt->rt6i_node = fn;
+  		rt->dst.rt6_next = iter->dst.rt6_next;
+@@@ -806,7 -840,8 +860,12 @@@ void fib6_force_start_gc(struct net *ne
+   *	with source addr info in sub-trees
+   */
+  
+++<<<<<<< HEAD
+ +int fib6_add(struct fib6_node *root, struct rt6_info *rt, struct nl_info *info)
+++=======
++ int fib6_add(struct fib6_node *root, struct rt6_info *rt,
++ 	     struct nl_info *info, struct mx6_config *mxc)
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  {
+  	struct fib6_node *fn, *pn = NULL;
+  	int err = -ENOMEM;
+@@@ -900,7 -936,7 +959,11 @@@
+  	}
+  #endif
+  
+++<<<<<<< HEAD
+ +	err = fib6_add_rt2node(fn, rt, info);
+++=======
++ 	err = fib6_add_rt2node(fn, rt, info, mxc);
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  	if (!err) {
+  		fib6_start_gc(info->nl_net, rt);
+  		if (!(rt->rt6i_flags & RTF_CACHE))
+diff --cc net/ipv6/route.c
+index 2f320d61d648,454771d20b21..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -840,14 -852,15 +840,23 @@@ EXPORT_SYMBOL(rt6_lookup)
+     be destroyed.
+   */
+  
+++<<<<<<< HEAD
+ +static int __ip6_ins_rt(struct rt6_info *rt, struct nl_info *info)
+++=======
++ static int __ip6_ins_rt(struct rt6_info *rt, struct nl_info *info,
++ 			struct mx6_config *mxc)
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  {
+  	int err;
+  	struct fib6_table *table;
+  
+  	table = rt->rt6i_table;
+  	write_lock_bh(&table->tb6_lock);
+++<<<<<<< HEAD
+ +	err = fib6_add(&table->tb6_root, rt, info);
+++=======
++ 	err = fib6_add(&table->tb6_root, rt, info, mxc);
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  	write_unlock_bh(&table->tb6_lock);
+  
+  	return err;
+@@@ -855,10 -868,10 +864,17 @@@
+  
+  int ip6_ins_rt(struct rt6_info *rt)
+  {
+++<<<<<<< HEAD
+ +	struct nl_info info = {
+ +		.nl_net = dev_net(rt->dst.dev),
+ +	};
+ +	return __ip6_ins_rt(rt, &info);
+++=======
++ 	struct nl_info info = {	.nl_net = dev_net(rt->dst.dev), };
++ 	struct mx6_config mxc = { .mx = NULL, };
++ 
++ 	return __ip6_ins_rt(rt, &info, &mxc);
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  }
+  
+  static struct rt6_info *rt6_alloc_cow(struct rt6_info *ort,
+@@@ -1680,8 -1708,14 +1727,18 @@@ install_route
+  
+  	cfg->fc_nlinfo.nl_net = dev_net(dev);
+  
+++<<<<<<< HEAD
+ +	return __ip6_ins_rt(rt, &cfg->fc_nlinfo);
+++=======
++ 	err = ip6_convert_metrics(&mxc, cfg);
++ 	if (err)
++ 		goto out;
+++>>>>>>> e715b6d3a5ef (net: fib6: convert cfg metric to u32 outside of table write lock)
+  
++ 	err = __ip6_ins_rt(rt, &cfg->fc_nlinfo, &mxc);
++ 
++ 	kfree(mxc.mx);
++ 	return err;
+  out:
+  	if (dev)
+  		dev_put(dev);
+* Unmerged path include/net/ip6_fib.h
+* Unmerged path net/ipv6/ip6_fib.c
+* Unmerged path net/ipv6/route.c
