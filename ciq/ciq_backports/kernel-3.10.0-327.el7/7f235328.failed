@@ -1,0 +1,235 @@
+KVM: PPC: Book3S HV: Fix race in starting secondary threads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s-hv: Fix race in starting secondary threads (David Gibson) [1259571]
+Rebuild_FUZZ: 93.81%
+commit-author Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+commit 7f23532866f931be626e69ff55caf39e54516047
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7f235328.failed
+
+The current dynamic micro-threading code has a race due to which a
+secondary thread naps when it is supposed to be running a vcpu. As a
+side effect of this, on a guest exit, the primary thread in
+kvmppc_wait_for_nap() finds that this secondary thread hasn't cleared
+its vcore pointer. This results in "CPU X seems to be stuck!"
+warnings.
+
+The race is possible since the primary thread on exiting the guests
+only waits for all the secondaries to clear its vcore pointer. It
+subsequently expects the secondary threads to enter nap while it
+unsplits the core. A secondary thread which hasn't yet entered the nap
+will loop in kvm_no_guest until its vcore pointer and the do_nap flag
+are unset. Once the core has been unsplit, a new vcpu thread can grab
+the core and set the do_nap flag *before* setting the vcore pointers
+of the secondary. As a result, the secondary thread will now enter nap
+via kvm_unsplit_nap instead of running the guest vcpu.
+
+Fix this by setting the do_nap flag after setting the vcore pointer in
+the PACA of the secondary in kvmppc_run_core. Also, ensure that a
+secondary thread doesn't nap in kvm_unsplit_nap when the vcore pointer
+in its PACA struct is set.
+
+Fixes: b4deba5c41e9
+	Signed-off-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+(cherry picked from commit 7f23532866f931be626e69ff55caf39e54516047)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 077343fa2903,c5edf1719314..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -1737,16 -2349,114 +1737,112 @@@ static void kvmppc_run_core(struct kvmp
+  		goto out;
+  	}
+  
+ -	/*
+ -	 * See if we could run any other vcores on the physical core
+ -	 * along with this one.
+ -	 */
+ -	init_core_info(&core_info, vc);
+ -	pcpu = smp_processor_id();
+ -	target_threads = threads_per_subcore;
+ -	if (target_smt_mode && target_smt_mode < target_threads)
+ -		target_threads = target_smt_mode;
+ -	if (vc->num_threads < target_threads)
+ -		collect_piggybacks(&core_info, target_threads);
+  
+++<<<<<<< HEAD
+ +	vc->pcpu = smp_processor_id();
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		kvmppc_start_thread(vcpu);
+ +		kvmppc_create_dtl_entry(vcpu, vc);
+ +	}
+ +
+ +	/* Set this explicitly in case thread 0 doesn't have a vcpu */
+ +	get_paca()->kvm_hstate.kvm_vcore = vc;
+ +	get_paca()->kvm_hstate.ptid = 0;
+++=======
++ 	/* Decide on micro-threading (split-core) mode */
++ 	subcore_size = threads_per_subcore;
++ 	cmd_bit = stat_bit = 0;
++ 	split = core_info.n_subcores;
++ 	sip = NULL;
++ 	if (split > 1) {
++ 		/* threads_per_subcore must be MAX_SMT_THREADS (8) here */
++ 		if (split == 2 && (dynamic_mt_modes & 2)) {
++ 			cmd_bit = HID0_POWER8_1TO2LPAR;
++ 			stat_bit = HID0_POWER8_2LPARMODE;
++ 		} else {
++ 			split = 4;
++ 			cmd_bit = HID0_POWER8_1TO4LPAR;
++ 			stat_bit = HID0_POWER8_4LPARMODE;
++ 		}
++ 		subcore_size = MAX_SMT_THREADS / split;
++ 		sip = &split_info;
++ 		memset(&split_info, 0, sizeof(split_info));
++ 		split_info.rpr = mfspr(SPRN_RPR);
++ 		split_info.pmmar = mfspr(SPRN_PMMAR);
++ 		split_info.ldbar = mfspr(SPRN_LDBAR);
++ 		split_info.subcore_size = subcore_size;
++ 		for (sub = 0; sub < core_info.n_subcores; ++sub)
++ 			split_info.master_vcs[sub] =
++ 				list_first_entry(&core_info.vcs[sub],
++ 					struct kvmppc_vcore, preempt_list);
++ 		/* order writes to split_info before kvm_split_mode pointer */
++ 		smp_wmb();
++ 	}
++ 	pcpu = smp_processor_id();
++ 	for (thr = 0; thr < threads_per_subcore; ++thr)
++ 		paca[pcpu + thr].kvm_hstate.kvm_split_mode = sip;
++ 
++ 	/* Initiate micro-threading (split-core) if required */
++ 	if (cmd_bit) {
++ 		unsigned long hid0 = mfspr(SPRN_HID0);
++ 
++ 		hid0 |= cmd_bit | HID0_POWER8_DYNLPARDIS;
++ 		mb();
++ 		mtspr(SPRN_HID0, hid0);
++ 		isync();
++ 		for (;;) {
++ 			hid0 = mfspr(SPRN_HID0);
++ 			if (hid0 & stat_bit)
++ 				break;
++ 			cpu_relax();
++ 		}
++ 	}
++ 
++ 	/* Start all the threads */
++ 	active = 0;
++ 	for (sub = 0; sub < core_info.n_subcores; ++sub) {
++ 		thr = subcore_thread_map[sub];
++ 		thr0_done = false;
++ 		active |= 1 << thr;
++ 		list_for_each_entry(pvc, &core_info.vcs[sub], preempt_list) {
++ 			pvc->pcpu = pcpu + thr;
++ 			list_for_each_entry(vcpu, &pvc->runnable_threads,
++ 					    arch.run_list) {
++ 				kvmppc_start_thread(vcpu, pvc);
++ 				kvmppc_create_dtl_entry(vcpu, pvc);
++ 				trace_kvm_guest_enter(vcpu);
++ 				if (!vcpu->arch.ptid)
++ 					thr0_done = true;
++ 				active |= 1 << (thr + vcpu->arch.ptid);
++ 			}
++ 			/*
++ 			 * We need to start the first thread of each subcore
++ 			 * even if it doesn't have a vcpu.
++ 			 */
++ 			if (pvc->master_vcore == pvc && !thr0_done)
++ 				kvmppc_start_thread(NULL, pvc);
++ 			thr += pvc->num_threads;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Ensure that split_info.do_nap is set after setting
++ 	 * the vcore pointer in the PACA of the secondaries.
++ 	 */
++ 	smp_mb();
++ 	if (cmd_bit)
++ 		split_info.do_nap = 1;	/* ask secondaries to nap when done */
++ 
++ 	/*
++ 	 * When doing micro-threading, poke the inactive threads as well.
++ 	 * This gets them to the nap instruction after kvm_do_nap,
++ 	 * which reduces the time taken to unsplit later.
++ 	 */
++ 	if (split > 1)
++ 		for (thr = 1; thr < threads_per_subcore; ++thr)
++ 			if (!(active & (1 << thr)))
++ 				kvmppc_ipi_thread(pcpu + thr);
+++>>>>>>> 7f23532866f9 (KVM: PPC: Book3S HV: Fix race in starting secondary threads)
+  
+  	vc->vcore_state = VCORE_RUNNING;
+  	preempt_disable();
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 2d0869ef1418,b07f04550969..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -349,6 -416,53 +349,56 @@@ kvm_no_guest
+  	stb	r0, HSTATE_HWTHREAD_STATE(r13)
+  	b	kvm_no_guest
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Here the primary thread is trying to return the core to
++  * whole-core mode, so we need to nap.
++  */
++ kvm_unsplit_nap:
++ 	/*
++ 	 * Ensure that secondary doesn't nap when it has
++ 	 * its vcore pointer set.
++ 	 */
++ 	sync		/* matches smp_mb() before setting split_info.do_nap */
++ 	ld	r0, HSTATE_KVM_VCORE(r13)
++ 	cmpdi	r0, 0
++ 	bne	kvm_no_guest
++ 	/* clear any pending message */
++ BEGIN_FTR_SECTION
++ 	lis	r6, (PPC_DBELL_SERVER << (63-36))@h
++ 	PPC_MSGCLR(6)
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++ 	/* Set kvm_split_mode.napped[tid] = 1 */
++ 	ld	r3, HSTATE_SPLIT_MODE(r13)
++ 	li	r0, 1
++ 	lhz	r4, PACAPACAINDEX(r13)
++ 	clrldi	r4, r4, 61	/* micro-threading => P8 => 8 threads/core */
++ 	addi	r4, r4, KVM_SPLIT_NAPPED
++ 	stbx	r0, r3, r4
++ 	/* Check the do_nap flag again after setting napped[] */
++ 	sync
++ 	lbz	r0, KVM_SPLIT_DO_NAP(r3)
++ 	cmpwi	r0, 0
++ 	beq	57f
++ 	li	r3, (LPCR_PECEDH | LPCR_PECE0) >> 4
++ 	mfspr	r4, SPRN_LPCR
++ 	rlwimi	r4, r3, 4, (LPCR_PECEDP | LPCR_PECEDH | LPCR_PECE0 | LPCR_PECE1)
++ 	mtspr	SPRN_LPCR, r4
++ 	isync
++ 	std	r0, HSTATE_SCRATCH0(r13)
++ 	ptesync
++ 	ld	r0, HSTATE_SCRATCH0(r13)
++ 1:	cmpd	r0, r0
++ 	bne	1b
++ 	nap
++ 	b	.
++ 
++ 57:	li	r0, 0
++ 	stbx	r0, r3, r4
++ 	b	kvm_no_guest
++ 
+++>>>>>>> 7f23532866f9 (KVM: PPC: Book3S HV: Fix race in starting secondary threads)
+  /******************************************************************************
+   *                                                                            *
+   *                               Entry code                                   *
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
