@@ -271,7 +271,7 @@ static void genl_unregister_mc_groups(struct genl_family *family)
 		__genl_unregister_mc_group(family, grp);
 }
 
-static int genl_validate_ops(struct genl_family *family)
+static int genl_validate_ops(const struct genl_family *family)
 {
 	const struct genl_ops *ops = family->ops;
 	unsigned int n_ops = family->n_ops;
@@ -290,10 +290,6 @@ static int genl_validate_ops(struct genl_family *family)
 			if (ops[i].cmd == ops[j].cmd)
 				return -EINVAL;
 	}
-
-	/* family is not registered yet, so no locking needed */
-	family->ops = ops;
-	family->n_ops = n_ops;
 
 	return 0;
 }
