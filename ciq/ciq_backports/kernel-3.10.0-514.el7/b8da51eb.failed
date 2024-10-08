@@ -1,0 +1,158 @@
+tcp: introduce tcp_under_memory_pressure()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit b8da51ebb1aa93908350f95efae73aecbc2e266c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b8da51eb.failed
+
+Introduce an optimized version of sk_under_memory_pressure()
+for TCP. Our intent is to use it in fast paths.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b8da51ebb1aa93908350f95efae73aecbc2e266c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_output.c
+diff --cc net/ipv4/tcp_output.c
+index ddd2a6fe0e83,08c2cc40b26d..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -2730,32 -2835,38 +2730,39 @@@ begin_fwd
+   */
+  void tcp_send_fin(struct sock *sk)
+  {
+ -	struct sk_buff *skb, *tskb = tcp_write_queue_tail(sk);
+  	struct tcp_sock *tp = tcp_sk(sk);
+ +	struct sk_buff *skb = tcp_write_queue_tail(sk);
+ +	int mss_now;
+  
+ -	/* Optimization, tack on the FIN if we have one skb in write queue and
+ -	 * this skb was not yet sent, or we are under memory pressure.
+ -	 * Note: in the latter case, FIN packet will be sent after a timeout,
+ -	 * as TCP stack thinks it has already been transmitted.
+ +	/* Optimization, tack on the FIN if we have a queue of
+ +	 * unsent frames.  But be careful about outgoing SACKS
+ +	 * and IP options.
+  	 */
+++<<<<<<< HEAD
+ +	mss_now = tcp_current_mss(sk);
+ +
+ +	if (tcp_send_head(sk) != NULL) {
+ +		TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_FIN;
+ +		TCP_SKB_CB(skb)->end_seq++;
+++=======
++ 	if (tskb && (tcp_send_head(sk) || tcp_under_memory_pressure(sk))) {
++ coalesce:
++ 		TCP_SKB_CB(tskb)->tcp_flags |= TCPHDR_FIN;
++ 		TCP_SKB_CB(tskb)->end_seq++;
+++>>>>>>> b8da51ebb1aa (tcp: introduce tcp_under_memory_pressure())
+  		tp->write_seq++;
+ -		if (!tcp_send_head(sk)) {
+ -			/* This means tskb was already sent.
+ -			 * Pretend we included the FIN on previous transmit.
+ -			 * We need to set tp->snd_nxt to the value it would have
+ -			 * if FIN had been sent. This is because retransmit path
+ -			 * does not change tp->snd_nxt.
+ -			 */
+ -			tp->snd_nxt++;
+ -			return;
+ -		}
+  	} else {
+ -		skb = alloc_skb_fclone(MAX_TCP_HEADER, sk->sk_allocation);
+ -		if (unlikely(!skb)) {
+ -			if (tskb)
+ -				goto coalesce;
+ -			return;
+ +		/* Socket is locked, keep trying until memory is available. */
+ +		for (;;) {
+ +			skb = alloc_skb_fclone(MAX_TCP_HEADER,
+ +					       sk->sk_allocation);
+ +			if (skb)
+ +				break;
+ +			yield();
+  		}
+ +
+ +		/* Reserve space for headers and prepare control bits. */
+  		skb_reserve(skb, MAX_TCP_HEADER);
+ -		sk_forced_mem_schedule(sk, skb->truesize);
+  		/* FIN eats a sequence byte, write_seq advanced by tcp_queue_skb(). */
+  		tcp_init_nondata_skb(skb, tp->write_seq,
+  				     TCPHDR_ACK | TCPHDR_FIN);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 83fa42687eea..4a37cb339726 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -283,6 +283,14 @@ extern atomic_long_t tcp_memory_allocated;
+ extern struct percpu_counter tcp_sockets_allocated;
+ extern int tcp_memory_pressure;
+ 
++/* optimized version of sk_under_memory_pressure() for TCP sockets */
++static inline bool tcp_under_memory_pressure(const struct sock *sk)
++{
++	if (mem_cgroup_sockets_enabled && sk->sk_cgrp)
++		return !!sk->sk_cgrp->memory_pressure;
++
++	return tcp_memory_pressure;
++}
+ /*
+  * The next routines deal with comparing 32 bit unsigned ints
+  * and worry about wraparound (automatic with unsigned arithmetic).
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index fca2f300c9a3..acc7f3291230 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -355,7 +355,7 @@ static void tcp_grow_window(struct sock *sk, const struct sk_buff *skb)
+ 	/* Check #1 */
+ 	if (tp->rcv_ssthresh < tp->window_clamp &&
+ 	    (int)tp->rcv_ssthresh < tcp_space(sk) &&
+-	    !sk_under_memory_pressure(sk)) {
++	    !tcp_under_memory_pressure(sk)) {
+ 		int incr;
+ 
+ 		/* Check #2. Increase window, if skb with such overhead
+@@ -442,7 +442,7 @@ static void tcp_clamp_window(struct sock *sk)
+ 
+ 	if (sk->sk_rcvbuf < sysctl_tcp_rmem[2] &&
+ 	    !(sk->sk_userlocks & SOCK_RCVBUF_LOCK) &&
+-	    !sk_under_memory_pressure(sk) &&
++	    !tcp_under_memory_pressure(sk) &&
+ 	    sk_memory_allocated(sk) < sk_prot_mem_limits(sk, 0)) {
+ 		sk->sk_rcvbuf = min(atomic_read(&sk->sk_rmem_alloc),
+ 				    sysctl_tcp_rmem[2]);
+@@ -4704,7 +4704,7 @@ static int tcp_prune_queue(struct sock *sk)
+ 
+ 	if (atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf)
+ 		tcp_clamp_window(sk);
+-	else if (sk_under_memory_pressure(sk))
++	else if (tcp_under_memory_pressure(sk))
+ 		tp->rcv_ssthresh = min(tp->rcv_ssthresh, 4U * tp->advmss);
+ 
+ 	tcp_collapse_ofo_queue(sk);
+@@ -4748,7 +4748,7 @@ static bool tcp_should_expand_sndbuf(const struct sock *sk)
+ 		return false;
+ 
+ 	/* If we are under global TCP memory pressure, do not expand.  */
+-	if (sk_under_memory_pressure(sk))
++	if (tcp_under_memory_pressure(sk))
+ 		return false;
+ 
+ 	/* If we are under soft global TCP memory pressure, do not expand.  */
+* Unmerged path net/ipv4/tcp_output.c
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index dceaaccbea36..eecdc4f1a8d1 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -243,7 +243,7 @@ void tcp_delack_timer_handler(struct sock *sk)
+ 	}
+ 
+ out:
+-	if (sk_under_memory_pressure(sk))
++	if (tcp_under_memory_pressure(sk))
+ 		sk_mem_reclaim(sk);
+ }
+ 
