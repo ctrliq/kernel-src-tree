@@ -1,0 +1,342 @@
+netfilter: conntrack: remove central spinlock nf_conntrack_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 93bb0ceb75be2fdfa9fc0dd1fb522d9ada515d9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/93bb0ceb.failed
+
+nf_conntrack_lock is a monolithic lock and suffers from huge contention
+on current generation servers (8 or more core/threads).
+
+Perf locking congestion is clear on base kernel:
+
+-  72.56%  ksoftirqd/6  [kernel.kallsyms]    [k] _raw_spin_lock_bh
+   - _raw_spin_lock_bh
+      + 25.33% init_conntrack
+      + 24.86% nf_ct_delete_from_lists
+      + 24.62% __nf_conntrack_confirm
+      + 24.38% destroy_conntrack
+      + 0.70% tcp_packet
++   2.21%  ksoftirqd/6  [kernel.kallsyms]    [k] fib_table_lookup
++   1.15%  ksoftirqd/6  [kernel.kallsyms]    [k] __slab_free
++   0.77%  ksoftirqd/6  [kernel.kallsyms]    [k] inet_getpeer
++   0.70%  ksoftirqd/6  [nf_conntrack]       [k] nf_ct_delete
++   0.55%  ksoftirqd/6  [ip_tables]          [k] ipt_do_table
+
+This patch change conntrack locking and provides a huge performance
+improvement.  SYN-flood attack tested on a 24-core E5-2695v2(ES) with
+10Gbit/s ixgbe (with tool trafgen):
+
+ Base kernel:   810.405 new conntrack/sec
+ After patch: 2.233.876 new conntrack/sec
+
+Notice other floods attack (SYN+ACK or ACK) can easily be deflected using:
+ # iptables -A INPUT -m state --state INVALID -j DROP
+ # sysctl -w net/netfilter/nf_conntrack_tcp_loose=0
+
+Use an array of hashed spinlocks to protect insertions/deletions of
+conntracks into the hash table. 1024 spinlocks seem to give good
+results, at minimal cost (4KB memory). Due to lockdep max depth,
+1024 becomes 8 if CONFIG_LOCKDEP=y
+
+The hash resize is a bit tricky, because we need to take all locks in
+the array. A seqcount_t is used to synchronize the hash table users
+with the resizing process.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+	Reviewed-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 93bb0ceb75be2fdfa9fc0dd1fb522d9ada515d9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_core.c
+#	net/netfilter/nf_conntrack_helper.c
+diff --cc net/netfilter/nf_conntrack_core.c
+index b89f9c1c5b7a,5d1e7d126ebd..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -60,15 -60,60 +60,72 @@@ int (*nfnetlink_parse_nat_setup_hook)(s
+  				      const struct nlattr *attr) __read_mostly;
+  EXPORT_SYMBOL_GPL(nfnetlink_parse_nat_setup_hook);
+  
+++<<<<<<< HEAD
+ +int (*nf_nat_seq_adjust_hook)(struct sk_buff *skb,
+ +			      struct nf_conn *ct,
+ +			      enum ip_conntrack_info ctinfo,
+ +			      unsigned int protoff);
+ +EXPORT_SYMBOL_GPL(nf_nat_seq_adjust_hook);
+ +
+ +DEFINE_SPINLOCK(nf_conntrack_lock);
+ +EXPORT_SYMBOL_GPL(nf_conntrack_lock);
+ +
+++=======
++ __cacheline_aligned_in_smp spinlock_t nf_conntrack_locks[CONNTRACK_LOCKS];
++ EXPORT_SYMBOL_GPL(nf_conntrack_locks);
++ 
++ __cacheline_aligned_in_smp DEFINE_SPINLOCK(nf_conntrack_expect_lock);
++ EXPORT_SYMBOL_GPL(nf_conntrack_expect_lock);
++ 
++ static void nf_conntrack_double_unlock(unsigned int h1, unsigned int h2)
++ {
++ 	h1 %= CONNTRACK_LOCKS;
++ 	h2 %= CONNTRACK_LOCKS;
++ 	spin_unlock(&nf_conntrack_locks[h1]);
++ 	if (h1 != h2)
++ 		spin_unlock(&nf_conntrack_locks[h2]);
++ }
++ 
++ /* return true if we need to recompute hashes (in case hash table was resized) */
++ static bool nf_conntrack_double_lock(struct net *net, unsigned int h1,
++ 				     unsigned int h2, unsigned int sequence)
++ {
++ 	h1 %= CONNTRACK_LOCKS;
++ 	h2 %= CONNTRACK_LOCKS;
++ 	if (h1 <= h2) {
++ 		spin_lock(&nf_conntrack_locks[h1]);
++ 		if (h1 != h2)
++ 			spin_lock_nested(&nf_conntrack_locks[h2],
++ 					 SINGLE_DEPTH_NESTING);
++ 	} else {
++ 		spin_lock(&nf_conntrack_locks[h2]);
++ 		spin_lock_nested(&nf_conntrack_locks[h1],
++ 				 SINGLE_DEPTH_NESTING);
++ 	}
++ 	if (read_seqcount_retry(&net->ct.generation, sequence)) {
++ 		nf_conntrack_double_unlock(h1, h2);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ static void nf_conntrack_all_lock(void)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < CONNTRACK_LOCKS; i++)
++ 		spin_lock_nested(&nf_conntrack_locks[i], i);
++ }
++ 
++ static void nf_conntrack_all_unlock(void)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < CONNTRACK_LOCKS; i++)
++ 		spin_unlock(&nf_conntrack_locks[i]);
++ }
++ 
+++>>>>>>> 93bb0ceb75be (netfilter: conntrack: remove central spinlock nf_conntrack_lock)
+  unsigned int nf_conntrack_htable_size __read_mostly;
+  EXPORT_SYMBOL_GPL(nf_conntrack_htable_size);
+  
+@@@ -243,17 -328,28 +300,35 @@@ destroy_conntrack(struct nf_conntrack *
+  static void nf_ct_delete_from_lists(struct nf_conn *ct)
+  {
+  	struct net *net = nf_ct_net(ct);
++ 	unsigned int hash, reply_hash;
++ 	u16 zone = nf_ct_zone(ct);
++ 	unsigned int sequence;
+  
+  	nf_ct_helper_destroy(ct);
+- 	spin_lock_bh(&nf_conntrack_lock);
+- 	/* Inside lock so preempt is disabled on module removal path.
+- 	 * Otherwise we can get spurious warnings. */
+- 	NF_CT_STAT_INC(net, delete_list);
++ 
++ 	local_bh_disable();
++ 	do {
++ 		sequence = read_seqcount_begin(&net->ct.generation);
++ 		hash = hash_conntrack(net, zone,
++ 				      &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
++ 		reply_hash = hash_conntrack(net, zone,
++ 					   &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
++ 	} while (nf_conntrack_double_lock(net, hash, reply_hash, sequence));
++ 
+  	clean_from_lists(ct);
+++<<<<<<< HEAD
+ +	/* add this conntrack to the dying list */
+ +	hlist_nulls_add_head(&ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode,
+ +			     &net->ct.dying);
+ +	spin_unlock_bh(&nf_conntrack_lock);
+++=======
++ 	nf_conntrack_double_unlock(hash, reply_hash);
++ 
++ 	nf_ct_add_to_dying_list(ct);
++ 
++ 	NF_CT_STAT_INC(net, delete_list);
++ 	local_bh_enable();
+++>>>>>>> 93bb0ceb75be (netfilter: conntrack: remove central spinlock nf_conntrack_lock)
+  }
+  
+  static void death_by_event(unsigned long ul_conntrack)
+@@@ -1265,23 -1385,37 +1361,48 @@@ get_next_corpse(struct net *net, int (*
+  	struct nf_conntrack_tuple_hash *h;
+  	struct nf_conn *ct;
+  	struct hlist_nulls_node *n;
+++<<<<<<< HEAD
+++=======
++ 	int cpu;
++ 	spinlock_t *lockp;
+++>>>>>>> 93bb0ceb75be (netfilter: conntrack: remove central spinlock nf_conntrack_lock)
+  
+- 	spin_lock_bh(&nf_conntrack_lock);
+  	for (; *bucket < net->ct.htable_size; (*bucket)++) {
+- 		hlist_nulls_for_each_entry(h, n, &net->ct.hash[*bucket], hnnode) {
+- 			if (NF_CT_DIRECTION(h) != IP_CT_DIR_ORIGINAL)
+- 				continue;
+- 			ct = nf_ct_tuplehash_to_ctrack(h);
+- 			if (iter(ct, data))
+- 				goto found;
++ 		lockp = &nf_conntrack_locks[*bucket % CONNTRACK_LOCKS];
++ 		local_bh_disable();
++ 		spin_lock(lockp);
++ 		if (*bucket < net->ct.htable_size) {
++ 			hlist_nulls_for_each_entry(h, n, &net->ct.hash[*bucket], hnnode) {
++ 				if (NF_CT_DIRECTION(h) != IP_CT_DIR_ORIGINAL)
++ 					continue;
++ 				ct = nf_ct_tuplehash_to_ctrack(h);
++ 				if (iter(ct, data))
++ 					goto found;
++ 			}
+  		}
++ 		spin_unlock(lockp);
++ 		local_bh_enable();
+  	}
+++<<<<<<< HEAD
+ +	hlist_nulls_for_each_entry(h, n, &net->ct.unconfirmed, hnnode) {
+ +		ct = nf_ct_tuplehash_to_ctrack(h);
+ +		if (iter(ct, data))
+ +			set_bit(IPS_DYING_BIT, &ct->status);
+++=======
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct ct_pcpu *pcpu = per_cpu_ptr(net->ct.pcpu_lists, cpu);
++ 
++ 		spin_lock_bh(&pcpu->lock);
++ 		hlist_nulls_for_each_entry(h, n, &pcpu->unconfirmed, hnnode) {
++ 			ct = nf_ct_tuplehash_to_ctrack(h);
++ 			if (iter(ct, data))
++ 				set_bit(IPS_DYING_BIT, &ct->status);
++ 		}
++ 		spin_unlock_bh(&pcpu->lock);
+++>>>>>>> 93bb0ceb75be (netfilter: conntrack: remove central spinlock nf_conntrack_lock)
+  	}
+ +	spin_unlock_bh(&nf_conntrack_lock);
+  	return NULL;
+  found:
+  	atomic_inc(&ct->ct_general.use);
+diff --cc net/netfilter/nf_conntrack_helper.c
+index 21b7afa27567,5b3eae7d4c9a..000000000000
+--- a/net/netfilter/nf_conntrack_helper.c
++++ b/net/netfilter/nf_conntrack_helper.c
+@@@ -404,14 -412,27 +404,34 @@@ static void __nf_conntrack_helper_unreg
+  			}
+  		}
+  	}
+ -	spin_unlock_bh(&nf_conntrack_expect_lock);
+  
+  	/* Get rid of expecteds, set helpers to NULL. */
+++<<<<<<< HEAD
+ +	hlist_nulls_for_each_entry(h, nn, &net->ct.unconfirmed, hnnode)
+ +		unhelp(h, me);
+- 	for (i = 0; i < net->ct.htable_size; i++) {
+- 		hlist_nulls_for_each_entry(h, nn, &net->ct.hash[i], hnnode)
+++=======
++ 	for_each_possible_cpu(cpu) {
++ 		struct ct_pcpu *pcpu = per_cpu_ptr(net->ct.pcpu_lists, cpu);
++ 
++ 		spin_lock_bh(&pcpu->lock);
++ 		hlist_nulls_for_each_entry(h, nn, &pcpu->unconfirmed, hnnode)
+  			unhelp(h, me);
++ 		spin_unlock_bh(&pcpu->lock);
++ 	}
++ 	local_bh_disable();
+++>>>>>>> 93bb0ceb75be (netfilter: conntrack: remove central spinlock nf_conntrack_lock)
++ 	for (i = 0; i < net->ct.htable_size; i++) {
++ 		spin_lock(&nf_conntrack_locks[i % CONNTRACK_LOCKS]);
++ 		if (i < net->ct.htable_size) {
++ 			hlist_nulls_for_each_entry(h, nn, &net->ct.hash[i], hnnode)
++ 				unhelp(h, me);
++ 		}
++ 		spin_unlock(&nf_conntrack_locks[i % CONNTRACK_LOCKS]);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	local_bh_enable();
+++>>>>>>> 93bb0ceb75be (netfilter: conntrack: remove central spinlock nf_conntrack_lock)
+  }
+  
+  void nf_conntrack_helper_unregister(struct nf_conntrack_helper *me)
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index fb2b6234e937..2130935b40a7 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -84,6 +84,11 @@ print_tuple(struct seq_file *s, const struct nf_conntrack_tuple *tuple,
+             const struct nf_conntrack_l3proto *l3proto,
+             const struct nf_conntrack_l4proto *proto);
+ 
+-extern spinlock_t nf_conntrack_lock ;
++#ifdef CONFIG_LOCKDEP
++# define CONNTRACK_LOCKS 8
++#else
++# define CONNTRACK_LOCKS 1024
++#endif
++extern spinlock_t nf_conntrack_locks[CONNTRACK_LOCKS];
+ 
+ #endif /* _NF_CONNTRACK_CORE_H */
+* Unmerged path net/netfilter/nf_conntrack_core.c
+* Unmerged path net/netfilter/nf_conntrack_helper.c
+diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
+index 45b335fdc999..cbfd7f8fa62a 100644
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -763,14 +763,23 @@ ctnetlink_dump_table(struct sk_buff *skb, struct netlink_callback *cb)
+ 	struct nfgenmsg *nfmsg = nlmsg_data(cb->nlh);
+ 	u_int8_t l3proto = nfmsg->nfgen_family;
+ 	int res;
++	spinlock_t *lockp;
++
+ #ifdef CONFIG_NF_CONNTRACK_MARK
+ 	const struct ctnetlink_dump_filter *filter = cb->data;
+ #endif
+ 
+-	spin_lock_bh(&nf_conntrack_lock);
+ 	last = (struct nf_conn *)cb->args[1];
++
++	local_bh_disable();
+ 	for (; cb->args[0] < net->ct.htable_size; cb->args[0]++) {
+ restart:
++		lockp = &nf_conntrack_locks[cb->args[0] % CONNTRACK_LOCKS];
++		spin_lock(lockp);
++		if (cb->args[0] >= net->ct.htable_size) {
++			spin_unlock(lockp);
++			goto out;
++		}
+ 		hlist_nulls_for_each_entry(h, n, &net->ct.hash[cb->args[0]],
+ 					 hnnode) {
+ 			if (NF_CT_DIRECTION(h) != IP_CT_DIR_ORIGINAL)
+@@ -802,16 +811,18 @@ restart:
+ 			if (res < 0) {
+ 				nf_conntrack_get(&ct->ct_general);
+ 				cb->args[1] = (unsigned long)ct;
++				spin_unlock(lockp);
+ 				goto out;
+ 			}
+ 		}
++		spin_unlock(lockp);
+ 		if (cb->args[1]) {
+ 			cb->args[1] = 0;
+ 			goto restart;
+ 		}
+ 	}
+ out:
+-	spin_unlock_bh(&nf_conntrack_lock);
++	local_bh_enable();
+ 	if (last)
+ 		nf_ct_put(last);
+ 
