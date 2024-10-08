@@ -1,0 +1,218 @@
+cpufreq: Catch double invocations of cpufreq_freq_transition_begin/end
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Catch double invocations of cpufreq_freq_transition_begin/end (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 93.13%
+commit-author Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+commit ca654dc3a93d3b47dddc0c24a98043060bbb256b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ca654dc3.failed
+
+Some cpufreq drivers were redundantly invoking the _begin() and _end()
+APIs around frequency transitions, and this double invocation (one from
+the cpufreq core and the other from the cpufreq driver) used to result
+in a self-deadlock, leading to system hangs during boot. (The _begin()
+API makes contending callers wait until the previous invocation is
+complete. Hence, the cpufreq driver would end up waiting on itself!).
+
+Now all such drivers have been fixed, but debugging this issue was not
+very straight-forward (even lockdep didn't catch this). So let us add a
+debug infrastructure to the cpufreq core to catch such issues more easily
+in the future.
+
+We add a new field called 'transition_task' to the policy structure, to keep
+track of the task which is performing the frequency transition. Using this
+field, we make note of this task during _begin() and print a warning if we
+find a case where the same task is calling _begin() again, before completing
+the previous frequency transition using the corresponding _end().
+
+We have left out ASYNC_NOTIFICATION drivers from this debug infrastructure
+for 2 reasons:
+
+1. At the moment, we have no way to avoid a particular scenario where this
+   debug infrastructure can emit false-positive warnings for such drivers.
+   The scenario is depicted below:
+
+         Task A						Task B
+
+    /* 1st freq transition */
+    Invoke _begin() {
+            ...
+            ...
+    }
+
+    Change the frequency
+
+    /* 2nd freq transition */
+    Invoke _begin() {
+	    ...	//waiting for B to
+            ... //finish _end() for
+	    ... //the 1st transition
+	    ...	      |				Got interrupt for successful
+	    ...	      |				change of frequency (1st one).
+	    ...       |
+	    ...	      |				/* 1st freq transition */
+	    ...	      |				Invoke _end() {
+	    ...	      |					...
+	    ...	      V				}
+	    ...
+	    ...
+    }
+
+   This scenario is actually deadlock-free because, once Task A changes the
+   frequency, it is Task B's responsibility to invoke the corresponding
+   _end() for the 1st frequency transition. Hence it is perfectly legal for
+   Task A to go ahead and attempt another frequency transition in the meantime.
+   (Of course it won't be able to proceed until Task B finishes the 1st _end(),
+   but this doesn't cause a deadlock or a hang).
+
+   The debug infrastructure cannot handle this scenario and will treat it as
+   a deadlock and print a warning. To avoid this, we exclude such drivers
+   from the purview of this code.
+
+2. Luckily, we don't _need_ this infrastructure for ASYNC_NOTIFICATION drivers
+   at all! The cpufreq core does not automatically invoke the _begin() and
+   _end() APIs during frequency transitions in such drivers. Thus, the driver
+   alone is responsible for invoking _begin()/_end() and hence there shouldn't
+   be any conflicts which lead to double invocations. So, we can skip these
+   drivers, since the probability that such drivers will hit this problem is
+   extremely low, as outlined above.
+
+	Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit ca654dc3a93d3b47dddc0c24a98043060bbb256b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+#	include/linux/cpufreq.h
+diff --cc drivers/cpufreq/cpufreq.c
+index a029f5bcbc1e,bfe82b63875f..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -348,7 -348,68 +348,72 @@@ void cpufreq_notify_transition(struct c
+  	for_each_cpu(freqs->cpu, policy->cpus)
+  		__cpufreq_notify_transition(policy, freqs, state);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(cpufreq_notify_transition);
+++=======
++ 
++ /* Do post notifications when there are chances that transition has failed */
++ static void cpufreq_notify_post_transition(struct cpufreq_policy *policy,
++ 		struct cpufreq_freqs *freqs, int transition_failed)
++ {
++ 	cpufreq_notify_transition(policy, freqs, CPUFREQ_POSTCHANGE);
++ 	if (!transition_failed)
++ 		return;
++ 
++ 	swap(freqs->old, freqs->new);
++ 	cpufreq_notify_transition(policy, freqs, CPUFREQ_PRECHANGE);
++ 	cpufreq_notify_transition(policy, freqs, CPUFREQ_POSTCHANGE);
++ }
++ 
++ void cpufreq_freq_transition_begin(struct cpufreq_policy *policy,
++ 		struct cpufreq_freqs *freqs)
++ {
++ 
++ 	/*
++ 	 * Catch double invocations of _begin() which lead to self-deadlock.
++ 	 * ASYNC_NOTIFICATION drivers are left out because the cpufreq core
++ 	 * doesn't invoke _begin() on their behalf, and hence the chances of
++ 	 * double invocations are very low. Moreover, there are scenarios
++ 	 * where these checks can emit false-positive warnings in these
++ 	 * drivers; so we avoid that by skipping them altogether.
++ 	 */
++ 	WARN_ON(!(cpufreq_driver->flags & CPUFREQ_ASYNC_NOTIFICATION)
++ 				&& current == policy->transition_task);
++ 
++ wait:
++ 	wait_event(policy->transition_wait, !policy->transition_ongoing);
++ 
++ 	spin_lock(&policy->transition_lock);
++ 
++ 	if (unlikely(policy->transition_ongoing)) {
++ 		spin_unlock(&policy->transition_lock);
++ 		goto wait;
++ 	}
++ 
++ 	policy->transition_ongoing = true;
++ 	policy->transition_task = current;
++ 
++ 	spin_unlock(&policy->transition_lock);
++ 
++ 	cpufreq_notify_transition(policy, freqs, CPUFREQ_PRECHANGE);
++ }
++ EXPORT_SYMBOL_GPL(cpufreq_freq_transition_begin);
++ 
++ void cpufreq_freq_transition_end(struct cpufreq_policy *policy,
++ 		struct cpufreq_freqs *freqs, int transition_failed)
++ {
++ 	if (unlikely(WARN_ON(!policy->transition_ongoing)))
++ 		return;
++ 
++ 	cpufreq_notify_post_transition(policy, freqs, transition_failed);
++ 
++ 	policy->transition_ongoing = false;
++ 	policy->transition_task = NULL;
++ 
++ 	wake_up(&policy->transition_wait);
++ }
++ EXPORT_SYMBOL_GPL(cpufreq_freq_transition_end);
+++>>>>>>> ca654dc3a93d (cpufreq: Catch double invocations of cpufreq_freq_transition_begin/end)
+  
+  
+  /*********************************************************************
+diff --cc include/linux/cpufreq.h
+index 3972fb457f19,f3822f836e14..000000000000
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@@ -111,18 -86,33 +111,41 @@@ struct cpufreq_policy 
+  					 * called, but you're in IRQ context */
+  
+  	struct cpufreq_real_policy	user_policy;
+ -	struct cpufreq_frequency_table	*freq_table;
+  
+ -	struct list_head        policy_list;
+  	struct kobject		kobj;
+  	struct completion	kobj_unregister;
+++<<<<<<< HEAD
+ +	int			transition_ongoing; /* Tracks transition status */
+++=======
++ 
++ 	/*
++ 	 * The rules for this semaphore:
++ 	 * - Any routine that wants to read from the policy structure will
++ 	 *   do a down_read on this semaphore.
++ 	 * - Any routine that will write to the policy structure and/or may take away
++ 	 *   the policy altogether (eg. CPU hotplug), will hold this lock in write
++ 	 *   mode before doing so.
++ 	 *
++ 	 * Additional rules:
++ 	 * - Lock should not be held across
++ 	 *     __cpufreq_governor(data, CPUFREQ_GOV_POLICY_EXIT);
++ 	 */
++ 	struct rw_semaphore	rwsem;
++ 
++ 	/* Synchronization for frequency transitions */
++ 	bool			transition_ongoing; /* Tracks transition status */
++ 	spinlock_t		transition_lock;
++ 	wait_queue_head_t	transition_wait;
++ 	struct task_struct	*transition_task; /* Task which is doing the transition */
+++>>>>>>> ca654dc3a93d (cpufreq: Catch double invocations of cpufreq_freq_transition_begin/end)
+  };
+  
+ +#define CPUFREQ_ADJUST			(0)
+ +#define CPUFREQ_INCOMPATIBLE		(1)
+ +#define CPUFREQ_NOTIFY			(2)
+ +#define CPUFREQ_START			(3)
+ +#define CPUFREQ_UPDATE_POLICY_CPU	(4)
+ +
+  /* Only for ACPI */
+  #define CPUFREQ_SHARED_TYPE_NONE (0) /* None */
+  #define CPUFREQ_SHARED_TYPE_HW	 (1) /* HW does needed coordination */
+* Unmerged path drivers/cpufreq/cpufreq.c
+* Unmerged path include/linux/cpufreq.h
