@@ -1,0 +1,92 @@
+x86/smp/boot: Fix legacy SMP bootup slow-boot bug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] smpboot: Fix legacy SMP bootup slow-boot bug (Steve Best) [1365413]
+Rebuild_FUZZ: 94.62%
+commit-author Ingo Molnar <mingo@kernel.org>
+commit 7cb685982157567dcc55eb92d1c38d237465203b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7cb68598.failed
+
+So while testing kernels using tools/kvm/ (kvmtool) I noticed that it
+booted super slow:
+
+[    0.142991] Performance Events: no PMU driver, software events only.
+[    0.149265] x86: Booting SMP configuration:
+[    0.149765] .... node  #0, CPUs:          #1
+[    0.148304] kvm-clock: cpu 1, msr 2:1bfe9041, secondary cpu clock
+[   10.158813] KVM setup async PF for cpu 1
+[   10.159000]    #2
+[   10.159000] kvm-stealtime: cpu 1, msr 211a4d400
+[   10.158829] kvm-clock: cpu 2, msr 2:1bfe9081, secondary cpu clock
+[   20.167805] KVM setup async PF for cpu 2
+[   20.168000]    #3
+[   20.168000] kvm-stealtime: cpu 2, msr 211a8d400
+[   20.167818] kvm-clock: cpu 3, msr 2:1bfe90c1, secondary cpu clock
+[   30.176902] KVM setup async PF for cpu 3
+[   30.177000]    #4
+[   30.177000] kvm-stealtime: cpu 3, msr 211acd400
+
+One CPU booted up per 10 seconds. With 120 CPUs that takes a while.
+
+Bisection pinpointed this commit:
+
+  853b160aaafb ("Revert f5d6a52f5111 ("x86/smpboot: Skip delays during SMP initialization similar to Xen")")
+
+But that commit just restores previous behavior, so it cannot cause the
+problem. After some head scratching it turns out that these two commits:
+
+  1a744cb356c5 ("x86/smp/boot: Remove 10ms delay from cpu_up() on modern processors")
+  d68921f9bd14 ("x86/smp/boot: Add cmdline "cpu_init_udelay=N" to specify cpu_up() delay")
+
+added the following code to smpboot.c:
+
+-               mdelay(10);
++               mdelay(init_udelay);
+
+Note the mismatch in the units: the delay is called 'udelay' and is set
+to microseconds - while the function used here is actually 'mdelay',
+which counts in milliseconds ...
+
+So the delay for legacy systems is off by a factor of 1,000, so instead
+of 10 msecs we waited for 10 seconds ...
+
+The reason bisection pointed to 853b160aaafb was that 853b160aaafb removed
+a (broken) boot-time speedup patch, which masked the factor 1,000 bug.
+
+Fix it by using udelay(). This fixes my bootup problems.
+
+	Cc: Len Brown <len.brown@intel.com>
+	Cc: Alan Cox <alan@linux.intel.com>
+	Cc: Arjan van de Ven <arjan@linux.intel.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jan H. Schönherr <jschoenh@amazon.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 7cb685982157567dcc55eb92d1c38d237465203b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/kernel/smpboot.c
+index 7dbc496614e0,fd6291c921b6..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -552,7 -617,7 +552,11 @@@ wakeup_secondary_cpu_via_init(int phys_
+  	pr_debug("Waiting for send to finish...\n");
+  	send_status = safe_apic_wait_icr_idle();
+  
+++<<<<<<< HEAD
+ +	mdelay(10);
+++=======
++ 	udelay(init_udelay);
+++>>>>>>> 7cb685982157 (x86/smp/boot: Fix legacy SMP bootup slow-boot bug)
+  
+  	pr_debug("Deasserting INIT\n");
+  
+* Unmerged path arch/x86/kernel/smpboot.c
