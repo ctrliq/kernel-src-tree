@@ -1,0 +1,376 @@
+mlx5: remove unnecessary pci_set_drvdata()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [misc] mei: remove unnecessary pci_set_drvdata() (Prarit Bhargava) [1088953]
+Rebuild_FUZZ: 93.98%
+commit-author Zhu Yanjun <yanjun.zhu@oracle.com>
+commit 26d159482a0283568557eb606d7f869db7fa03d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/26d15948.failed
+
+The driver core clears the driver data to NULL after device_release
+or on probe failure. Thus, it is not necessary to manually clear the
+device driver data to NULL.
+
+	Cc: Joe Jin <joe.jin@oracle.com>
+	Cc: Junxiao Bi <junxiao.bi@oracle.com>
+	Signed-off-by: Zhu Yanjun <yanjun.zhu@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 26d159482a0283568557eb606d7f869db7fa03d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index a064f06e0cb8,7e6e24398926..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -512,16 -1288,334 +512,344 @@@ void mlx5_dev_cleanup(struct mlx5_core_
+  	}
+  	mlx5_pagealloc_stop(dev);
+  	mlx5_reclaim_startup_pages(dev);
+ -	mlx5_core_disable_hca(dev, 0);
+ +	mlx5_core_disable_hca(dev);
+ +	mlx5_pagealloc_cleanup(dev);
+  	mlx5_cmd_cleanup(dev);
+++<<<<<<< HEAD
+ +	iounmap(dev->iseg);
+ +	pci_clear_master(dev->pdev);
+ +	release_bar(dev->pdev);
+ +	pci_disable_device(dev->pdev);
+ +	debugfs_remove(priv->dbg_root);
+++=======
++ 
++ out:
++ 	mutex_unlock(&dev->intf_state_mutex);
++ 	return err;
++ }
++ 
++ struct mlx5_core_event_handler {
++ 	void (*event)(struct mlx5_core_dev *dev,
++ 		      enum mlx5_dev_event event,
++ 		      void *data);
++ };
++ 
++ static const struct devlink_ops mlx5_devlink_ops = {
++ #ifdef CONFIG_MLX5_ESWITCH
++ 	.eswitch_mode_set = mlx5_devlink_eswitch_mode_set,
++ 	.eswitch_mode_get = mlx5_devlink_eswitch_mode_get,
++ 	.eswitch_inline_mode_set = mlx5_devlink_eswitch_inline_mode_set,
++ 	.eswitch_inline_mode_get = mlx5_devlink_eswitch_inline_mode_get,
++ 	.eswitch_encap_mode_set = mlx5_devlink_eswitch_encap_mode_set,
++ 	.eswitch_encap_mode_get = mlx5_devlink_eswitch_encap_mode_get,
++ #endif
++ };
++ 
++ #define MLX5_IB_MOD "mlx5_ib"
++ static int init_one(struct pci_dev *pdev,
++ 		    const struct pci_device_id *id)
++ {
++ 	struct mlx5_core_dev *dev;
++ 	struct devlink *devlink;
++ 	struct mlx5_priv *priv;
++ 	int err;
++ 
++ 	devlink = devlink_alloc(&mlx5_devlink_ops, sizeof(*dev));
++ 	if (!devlink) {
++ 		dev_err(&pdev->dev, "kzalloc failed\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	dev = devlink_priv(devlink);
++ 	priv = &dev->priv;
++ 	priv->pci_dev_data = id->driver_data;
++ 
++ 	pci_set_drvdata(pdev, dev);
++ 
++ 	dev->pdev = pdev;
++ 	dev->event = mlx5_core_event;
++ 	dev->profile = &profile[prof_sel];
++ 
++ 	INIT_LIST_HEAD(&priv->ctx_list);
++ 	spin_lock_init(&priv->ctx_lock);
++ 	mutex_init(&dev->pci_status_mutex);
++ 	mutex_init(&dev->intf_state_mutex);
++ 
++ 	INIT_LIST_HEAD(&priv->waiting_events_list);
++ 	priv->is_accum_events = false;
++ 
++ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++ 	err = init_srcu_struct(&priv->pfault_srcu);
++ 	if (err) {
++ 		dev_err(&pdev->dev, "init_srcu_struct failed with error code %d\n",
++ 			err);
++ 		goto clean_dev;
++ 	}
++ #endif
++ 	mutex_init(&priv->bfregs.reg_head.lock);
++ 	mutex_init(&priv->bfregs.wc_head.lock);
++ 	INIT_LIST_HEAD(&priv->bfregs.reg_head.list);
++ 	INIT_LIST_HEAD(&priv->bfregs.wc_head.list);
++ 
++ 	err = mlx5_pci_init(dev, priv);
++ 	if (err) {
++ 		dev_err(&pdev->dev, "mlx5_pci_init failed with error code %d\n", err);
++ 		goto clean_srcu;
++ 	}
++ 
++ 	err = mlx5_health_init(dev);
++ 	if (err) {
++ 		dev_err(&pdev->dev, "mlx5_health_init failed with error code %d\n", err);
++ 		goto close_pci;
++ 	}
++ 
++ 	mlx5_pagealloc_init(dev);
++ 
++ 	err = mlx5_load_one(dev, priv, true);
++ 	if (err) {
++ 		dev_err(&pdev->dev, "mlx5_load_one failed with error code %d\n", err);
++ 		goto clean_health;
++ 	}
++ 
++ 	request_module_nowait(MLX5_IB_MOD);
++ 
++ 	err = devlink_register(devlink, &pdev->dev);
++ 	if (err)
++ 		goto clean_load;
++ 
++ 	pci_save_state(pdev);
++ 	return 0;
++ 
++ clean_load:
++ 	mlx5_unload_one(dev, priv, true);
++ clean_health:
++ 	mlx5_pagealloc_cleanup(dev);
++ 	mlx5_health_cleanup(dev);
++ close_pci:
++ 	mlx5_pci_close(dev, priv);
++ clean_srcu:
++ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++ 	cleanup_srcu_struct(&priv->pfault_srcu);
++ clean_dev:
++ #endif
++ 	devlink_free(devlink);
++ 
++ 	return err;
++ }
++ 
++ static void remove_one(struct pci_dev *pdev)
++ {
++ 	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
++ 	struct devlink *devlink = priv_to_devlink(dev);
++ 	struct mlx5_priv *priv = &dev->priv;
++ 
++ 	devlink_unregister(devlink);
++ 	mlx5_unregister_device(dev);
++ 
++ 	if (mlx5_unload_one(dev, priv, true)) {
++ 		dev_err(&dev->pdev->dev, "mlx5_unload_one failed\n");
++ 		mlx5_health_cleanup(dev);
++ 		return;
++ 	}
++ 
++ 	mlx5_pagealloc_cleanup(dev);
++ 	mlx5_health_cleanup(dev);
++ 	mlx5_pci_close(dev, priv);
++ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++ 	cleanup_srcu_struct(&priv->pfault_srcu);
++ #endif
++ 	devlink_free(devlink);
++ }
++ 
++ static pci_ers_result_t mlx5_pci_err_detected(struct pci_dev *pdev,
++ 					      pci_channel_state_t state)
++ {
++ 	struct mlx5_core_dev *dev = pci_get_drvdata(pdev);
++ 	struct mlx5_priv *priv = &dev->priv;
++ 
++ 	dev_info(&pdev->dev, "%s was called\n", __func__);
++ 
++ 	mlx5_enter_error_state(dev, false);
++ 	mlx5_unload_one(dev, priv, false);
++ 	/* In case of kernel call drain the health wq */
++ 	if (state) {
++ 		mlx5_drain_health_wq(dev);
++ 		mlx5_pci_disable_device(dev);
++ 	}
++ 
++ 	return state == pci_channel_io_perm_failure ?
++ 		PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_NEED_RESET;
++ }
++ 
++ /* wait for the device to show vital signs by waiting
++  * for the health counter to start counting.
++  */
++ static int wait_vital(struct pci_dev *pdev)
++ {
++ 	struct mlx5_core_dev *dev = pci_get_drvdata(pdev);
++ 	struct mlx5_core_health *health = &dev->priv.health;
++ 	const int niter = 100;
++ 	u32 last_count = 0;
++ 	u32 count;
++ 	int i;
++ 
++ 	for (i = 0; i < niter; i++) {
++ 		count = ioread32be(health->health_counter);
++ 		if (count && count != 0xffffffff) {
++ 			if (last_count && last_count != count) {
++ 				dev_info(&pdev->dev, "Counter value 0x%x after %d iterations\n", count, i);
++ 				return 0;
++ 			}
++ 			last_count = count;
++ 		}
++ 		msleep(50);
++ 	}
++ 
++ 	return -ETIMEDOUT;
++ }
++ 
++ static pci_ers_result_t mlx5_pci_slot_reset(struct pci_dev *pdev)
++ {
++ 	struct mlx5_core_dev *dev = pci_get_drvdata(pdev);
++ 	int err;
++ 
++ 	dev_info(&pdev->dev, "%s was called\n", __func__);
++ 
++ 	err = mlx5_pci_enable_device(dev);
++ 	if (err) {
++ 		dev_err(&pdev->dev, "%s: mlx5_pci_enable_device failed with error code: %d\n"
++ 			, __func__, err);
++ 		return PCI_ERS_RESULT_DISCONNECT;
++ 	}
++ 
++ 	pci_set_master(pdev);
++ 	pci_restore_state(pdev);
++ 	pci_save_state(pdev);
++ 
++ 	if (wait_vital(pdev)) {
++ 		dev_err(&pdev->dev, "%s: wait_vital timed out\n", __func__);
++ 		return PCI_ERS_RESULT_DISCONNECT;
++ 	}
++ 
++ 	return PCI_ERS_RESULT_RECOVERED;
++ }
++ 
++ static void mlx5_pci_resume(struct pci_dev *pdev)
++ {
++ 	struct mlx5_core_dev *dev = pci_get_drvdata(pdev);
++ 	struct mlx5_priv *priv = &dev->priv;
++ 	int err;
++ 
++ 	dev_info(&pdev->dev, "%s was called\n", __func__);
++ 
++ 	err = mlx5_load_one(dev, priv, false);
++ 	if (err)
++ 		dev_err(&pdev->dev, "%s: mlx5_load_one failed with error code: %d\n"
++ 			, __func__, err);
++ 	else
++ 		dev_info(&pdev->dev, "%s: device recovered\n", __func__);
++ }
++ 
++ static const struct pci_error_handlers mlx5_err_handler = {
++ 	.error_detected = mlx5_pci_err_detected,
++ 	.slot_reset	= mlx5_pci_slot_reset,
++ 	.resume		= mlx5_pci_resume
++ };
++ 
++ static int mlx5_try_fast_unload(struct mlx5_core_dev *dev)
++ {
++ 	int ret;
++ 
++ 	if (!MLX5_CAP_GEN(dev, force_teardown)) {
++ 		mlx5_core_dbg(dev, "force teardown is not supported in the firmware\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR) {
++ 		mlx5_core_dbg(dev, "Device in internal error state, giving up\n");
++ 		return -EAGAIN;
++ 	}
++ 
++ 	ret = mlx5_cmd_force_teardown_hca(dev);
++ 	if (ret) {
++ 		mlx5_core_dbg(dev, "Firmware couldn't do fast unload error: %d\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	mlx5_enter_error_state(dev, true);
++ 
++ 	return 0;
++ }
++ 
++ static void shutdown(struct pci_dev *pdev)
++ {
++ 	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
++ 	struct mlx5_priv *priv = &dev->priv;
++ 	int err;
++ 
++ 	dev_info(&pdev->dev, "Shutdown was called\n");
++ 	/* Notify mlx5 clients that the kernel is being shut down */
++ 	set_bit(MLX5_INTERFACE_STATE_SHUTDOWN, &dev->intf_state);
++ 	err = mlx5_try_fast_unload(dev);
++ 	if (err)
++ 		mlx5_unload_one(dev, priv, false);
++ 	mlx5_pci_disable_device(dev);
++ }
++ 
++ static const struct pci_device_id mlx5_core_pci_table[] = {
++ 	{ PCI_VDEVICE(MELLANOX, PCI_DEVICE_ID_MELLANOX_CONNECTIB) },
++ 	{ PCI_VDEVICE(MELLANOX, 0x1012), MLX5_PCI_DEV_IS_VF},	/* Connect-IB VF */
++ 	{ PCI_VDEVICE(MELLANOX, PCI_DEVICE_ID_MELLANOX_CONNECTX4) },
++ 	{ PCI_VDEVICE(MELLANOX, 0x1014), MLX5_PCI_DEV_IS_VF},	/* ConnectX-4 VF */
++ 	{ PCI_VDEVICE(MELLANOX, PCI_DEVICE_ID_MELLANOX_CONNECTX4_LX) },
++ 	{ PCI_VDEVICE(MELLANOX, 0x1016), MLX5_PCI_DEV_IS_VF},	/* ConnectX-4LX VF */
++ 	{ PCI_VDEVICE(MELLANOX, 0x1017) },			/* ConnectX-5, PCIe 3.0 */
++ 	{ PCI_VDEVICE(MELLANOX, 0x1018), MLX5_PCI_DEV_IS_VF},	/* ConnectX-5 VF */
++ 	{ PCI_VDEVICE(MELLANOX, 0x1019) },			/* ConnectX-5 Ex */
++ 	{ PCI_VDEVICE(MELLANOX, 0x101a), MLX5_PCI_DEV_IS_VF},	/* ConnectX-5 Ex VF */
++ 	{ PCI_VDEVICE(MELLANOX, 0x101b) },			/* ConnectX-6 */
++ 	{ PCI_VDEVICE(MELLANOX, 0x101c), MLX5_PCI_DEV_IS_VF},	/* ConnectX-6 VF */
++ 	{ PCI_VDEVICE(MELLANOX, 0xa2d2) },			/* BlueField integrated ConnectX-5 network controller */
++ 	{ PCI_VDEVICE(MELLANOX, 0xa2d3), MLX5_PCI_DEV_IS_VF},	/* BlueField integrated ConnectX-5 network controller VF */
++ 	{ 0, }
++ };
++ 
++ MODULE_DEVICE_TABLE(pci, mlx5_core_pci_table);
++ 
++ void mlx5_disable_device(struct mlx5_core_dev *dev)
++ {
++ 	mlx5_pci_err_detected(dev->pdev, 0);
++ }
++ 
++ void mlx5_recover_device(struct mlx5_core_dev *dev)
++ {
++ 	mlx5_pci_disable_device(dev);
++ 	if (mlx5_pci_slot_reset(dev->pdev) == PCI_ERS_RESULT_RECOVERED)
++ 		mlx5_pci_resume(dev->pdev);
++ }
++ 
++ static struct pci_driver mlx5_core_driver = {
++ 	.name           = DRIVER_NAME,
++ 	.id_table       = mlx5_core_pci_table,
++ 	.probe          = init_one,
++ 	.remove         = remove_one,
++ 	.shutdown	= shutdown,
++ 	.err_handler	= &mlx5_err_handler,
++ 	.sriov_configure   = mlx5_core_sriov_configure,
++ };
++ 
++ static void mlx5_core_verify_params(void)
++ {
++ 	if (prof_sel >= ARRAY_SIZE(profile)) {
++ 		pr_warn("mlx5_core: WARNING: Invalid module parameter prof_sel %d, valid range 0-%zu, changing back to default(%d)\n",
++ 			prof_sel,
++ 			ARRAY_SIZE(profile) - 1,
++ 			MLX5_DEFAULT_PROF);
++ 		prof_sel = MLX5_DEFAULT_PROF;
++ 	}
+++>>>>>>> 26d159482a02 (mlx5: remove unnecessary pci_set_drvdata())
+  }
+ +EXPORT_SYMBOL(mlx5_dev_cleanup);
+  
+  static int __init init(void)
+  {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
