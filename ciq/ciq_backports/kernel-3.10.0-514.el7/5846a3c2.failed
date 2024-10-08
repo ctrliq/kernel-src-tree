@@ -1,0 +1,194 @@
+btrfs: qgroup: Fix a race in delayed_ref which leads to abort trans
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Qu Wenruo <quwenruo@cn.fujitsu.com>
+commit 5846a3c26873e86b034c702a8bc202aa76082369
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5846a3c2.failed
+
+Between btrfs_allocerved_file_extent() and
+btrfs_add_delayed_qgroup_reserve(), there is a window that delayed_refs
+are run and delayed ref head maybe freed before
+btrfs_add_delayed_qgroup_reserve().
+
+This will cause btrfs_dad_delayed_qgroup_reserve() to return -ENOENT,
+and cause transaction to be aborted.
+
+This patch will record qgroup reserve space info into delayed_ref_head
+at btrfs_add_delayed_ref(), to eliminate the race window.
+
+	Reported-by: Filipe Manana <fdmanana@suse.com>
+	Signed-off-by: Qu Wenruo <quwenruo@cn.fujitsu.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 5846a3c26873e86b034c702a8bc202aa76082369)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/delayed-ref.c
+#	fs/btrfs/delayed-ref.h
+#	fs/btrfs/extent-tree.c
+diff --cc fs/btrfs/delayed-ref.c
+index 79a4c7d591cb,e06dd75ad13f..000000000000
+--- a/fs/btrfs/delayed-ref.c
++++ b/fs/btrfs/delayed-ref.c
+@@@ -594,7 -620,9 +603,13 @@@ add_delayed_ref_head(struct btrfs_fs_in
+  	existing = htree_insert(&delayed_refs->href_root,
+  				&head_ref->href_node);
+  	if (existing) {
+++<<<<<<< HEAD
+ +		update_existing_head_ref(&existing->node, ref);
+++=======
++ 		WARN_ON(ref_root && reserved && existing->qgroup_ref_root
++ 			&& existing->qgroup_reserved);
++ 		update_existing_head_ref(delayed_refs, &existing->node, ref);
+++>>>>>>> 5846a3c26873 (btrfs: qgroup: Fix a race in delayed_ref which leads to abort trans)
+  		/*
+  		 * we've updated the existing ref, free the newly
+  		 * allocated ref
+@@@ -764,11 -788,10 +779,11 @@@ int btrfs_add_delayed_tree_ref(struct b
+  	 * the spin lock
+  	 */
+  	head_ref = add_delayed_ref_head(fs_info, trans, &head_ref->node, record,
+- 					bytenr, num_bytes, action, 0);
++ 					bytenr, num_bytes, 0, 0, action, 0);
+  
+  	add_delayed_tree_ref(fs_info, trans, head_ref, &ref->node, bytenr,
+ -			     num_bytes, parent, ref_root, level, action);
+ +				   num_bytes, parent, ref_root, level, action,
+ +				   no_quota);
+  	spin_unlock(&delayed_refs->lock);
+  
+  	return 0;
+@@@ -788,9 -811,8 +803,14 @@@ int btrfs_add_delayed_data_ref(struct b
+  			       struct btrfs_trans_handle *trans,
+  			       u64 bytenr, u64 num_bytes,
+  			       u64 parent, u64 ref_root,
+++<<<<<<< HEAD
+ +			       u64 owner, u64 offset, int action,
+ +			       struct btrfs_delayed_extent_op *extent_op,
+ +			       int no_quota)
+++=======
++ 			       u64 owner, u64 offset, u64 reserved, int action,
++ 			       struct btrfs_delayed_extent_op *extent_op)
+++>>>>>>> 5846a3c26873 (btrfs: qgroup: Fix a race in delayed_ref which leads to abort trans)
+  {
+  	struct btrfs_delayed_data_ref *ref;
+  	struct btrfs_delayed_ref_head *head_ref;
+diff --cc fs/btrfs/delayed-ref.h
+index 07b701cffd0e,00ed02cbf3e9..000000000000
+--- a/fs/btrfs/delayed-ref.h
++++ b/fs/btrfs/delayed-ref.h
+@@@ -229,9 -248,11 +229,17 @@@ int btrfs_add_delayed_data_ref(struct b
+  			       struct btrfs_trans_handle *trans,
+  			       u64 bytenr, u64 num_bytes,
+  			       u64 parent, u64 ref_root,
+++<<<<<<< HEAD
+ +			       u64 owner, u64 offset, int action,
+ +			       struct btrfs_delayed_extent_op *extent_op,
+ +			       int no_quota);
+++=======
++ 			       u64 owner, u64 offset, u64 reserved, int action,
++ 			       struct btrfs_delayed_extent_op *extent_op);
++ int btrfs_add_delayed_qgroup_reserve(struct btrfs_fs_info *fs_info,
++ 				     struct btrfs_trans_handle *trans,
++ 				     u64 ref_root, u64 bytenr, u64 num_bytes);
+++>>>>>>> 5846a3c26873 (btrfs: qgroup: Fix a race in delayed_ref which leads to abort trans)
+  int btrfs_add_delayed_extent_op(struct btrfs_fs_info *fs_info,
+  				struct btrfs_trans_handle *trans,
+  				u64 bytenr, u64 num_bytes,
+diff --cc fs/btrfs/extent-tree.c
+index 14ca0e409685,f50c7c2e2b59..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -2086,12 -2084,12 +2086,18 @@@ int btrfs_inc_extent_ref(struct btrfs_t
+  		ret = btrfs_add_delayed_tree_ref(fs_info, trans, bytenr,
+  					num_bytes,
+  					parent, root_objectid, (int)owner,
+ -					BTRFS_ADD_DELAYED_REF, NULL);
+ +					BTRFS_ADD_DELAYED_REF, NULL, no_quota);
+  	} else {
+  		ret = btrfs_add_delayed_data_ref(fs_info, trans, bytenr,
+++<<<<<<< HEAD
+ +					num_bytes,
+ +					parent, root_objectid, owner, offset,
+ +					BTRFS_ADD_DELAYED_REF, NULL, no_quota);
+++=======
++ 					num_bytes, parent, root_objectid,
++ 					owner, offset, 0,
++ 					BTRFS_ADD_DELAYED_REF, NULL);
+++>>>>>>> 5846a3c26873 (btrfs: qgroup: Fix a race in delayed_ref which leads to abort trans)
+  	}
+  	return ret;
+  }
+@@@ -6632,8 -6832,8 +6638,13 @@@ int btrfs_free_extent(struct btrfs_tran
+  		ret = btrfs_add_delayed_data_ref(fs_info, trans, bytenr,
+  						num_bytes,
+  						parent, root_objectid, owner,
+++<<<<<<< HEAD
+ +						offset, BTRFS_DROP_DELAYED_REF,
+ +						NULL, no_quota);
+++=======
++ 						offset, 0,
++ 						BTRFS_DROP_DELAYED_REF, NULL);
+++>>>>>>> 5846a3c26873 (btrfs: qgroup: Fix a race in delayed_ref which leads to abort trans)
+  	}
+  	return ret;
+  }
+@@@ -7569,7 -7769,8 +7581,12 @@@ int btrfs_alloc_reserved_file_extent(st
+  	ret = btrfs_add_delayed_data_ref(root->fs_info, trans, ins->objectid,
+  					 ins->offset, 0,
+  					 root_objectid, owner, offset,
+++<<<<<<< HEAD
+ +					 BTRFS_ADD_DELAYED_EXTENT, NULL, 0);
+++=======
++ 					 ram_bytes, BTRFS_ADD_DELAYED_EXTENT,
++ 					 NULL);
+++>>>>>>> 5846a3c26873 (btrfs: qgroup: Fix a race in delayed_ref which leads to abort trans)
+  	return ret;
+  }
+  
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index a45445ac5f62..62a10cb737fe 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3417,7 +3417,8 @@ void btrfs_free_tree_block(struct btrfs_trans_handle *trans,
+ int btrfs_alloc_reserved_file_extent(struct btrfs_trans_handle *trans,
+ 				     struct btrfs_root *root,
+ 				     u64 root_objectid, u64 owner,
+-				     u64 offset, struct btrfs_key *ins);
++				     u64 offset, u64 ram_bytes,
++				     struct btrfs_key *ins);
+ int btrfs_alloc_logged_file_extent(struct btrfs_trans_handle *trans,
+ 				   struct btrfs_root *root,
+ 				   u64 root_objectid, u64 owner, u64 offset,
+* Unmerged path fs/btrfs/delayed-ref.c
+* Unmerged path fs/btrfs/delayed-ref.h
+* Unmerged path fs/btrfs/extent-tree.c
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index f1054e811dde..7d2a97815854 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -2124,17 +2124,13 @@ static int insert_reserved_file_extent(struct btrfs_trans_handle *trans,
+ 	ins.type = BTRFS_EXTENT_ITEM_KEY;
+ 	ret = btrfs_alloc_reserved_file_extent(trans, root,
+ 					root->root_key.objectid,
+-					btrfs_ino(inode), file_pos, &ins);
+-	if (ret < 0)
+-		goto out;
++					btrfs_ino(inode), file_pos,
++					ram_bytes, &ins);
+ 	/*
+-	 * Release the reserved range from inode dirty range map, and
+-	 * move it to delayed ref codes, as now accounting only happens at
+-	 * commit_transaction() time.
++	 * Release the reserved range from inode dirty range map, as it is
++	 * already moved into delayed_ref_head
+ 	 */
+ 	btrfs_qgroup_release_data(inode, file_pos, ram_bytes);
+-	ret = btrfs_add_delayed_qgroup_reserve(root->fs_info, trans,
+-			root->objectid, disk_bytenr, ram_bytes);
+ out:
+ 	btrfs_free_path(path);
+ 
