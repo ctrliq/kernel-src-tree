@@ -1,0 +1,498 @@
+qlcnic: Refactor interrupt coalescing code for all adapters.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [ethernet] qlcnic: Refactor interrupt coalescing code for all adapters (Chad Dupuis) [1089352]
+Rebuild_FUZZ: 99.16%
+commit-author Himanshu Madhani <himanshu.madhani@qlogic.com>
+commit a514722afebc59cf9d98387ee4db81ee62154df0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a514722a.failed
+
+o Refactor configuration of interrupt coalescing parameters for
+  all supported adapters.
+
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a514722afebc59cf9d98387ee4db81ee62154df0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+index bf20c3aeeeb2,f92485ca21d1..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+@@@ -545,13 -544,9 +545,12 @@@ void qlcnic_83xx_write_crb(struct qlcni
+  void qlcnic_83xx_read_crb(struct qlcnic_adapter *, char *, loff_t, size_t);
+  int qlcnic_83xx_rd_reg_indirect(struct qlcnic_adapter *, ulong, int *);
+  int qlcnic_83xx_wrt_reg_indirect(struct qlcnic_adapter *, ulong, u32);
+ +void qlcnic_83xx_process_rcv_diag(struct qlcnic_adapter *, int, u64 []);
+  int qlcnic_83xx_nic_set_promisc(struct qlcnic_adapter *, u32);
+ +int qlcnic_83xx_set_lb_mode(struct qlcnic_adapter *, u8);
+ +int qlcnic_83xx_clear_lb_mode(struct qlcnic_adapter *, u8);
+  int qlcnic_83xx_config_hw_lro(struct qlcnic_adapter *, int);
+  int qlcnic_83xx_config_rss(struct qlcnic_adapter *, int);
+- int qlcnic_83xx_config_intr_coalesce(struct qlcnic_adapter *);
+  void qlcnic_83xx_change_l2_filter(struct qlcnic_adapter *, u64 *, u16);
+  int qlcnic_83xx_get_pci_info(struct qlcnic_adapter *, struct qlcnic_pci_info *);
+  int qlcnic_83xx_set_nic_info(struct qlcnic_adapter *, struct qlcnic_info *);
+@@@ -583,8 -576,9 +582,14 @@@ int qlcnic_83xx_alloc_mbx_args(struct q
+  void qlcnic_free_mbx_args(struct qlcnic_cmd_args *);
+  void qlcnic_set_npar_data(struct qlcnic_adapter *, const struct qlcnic_info *,
+  			  struct qlcnic_info *);
+++<<<<<<< HEAD
+ +void qlcnic_83xx_config_intr_coal(struct qlcnic_adapter *);
+ +irqreturn_t qlcnic_83xx_handle_aen(int, void *);
+++=======
++ int qlcnic_83xx_config_intr_coal(struct qlcnic_adapter *,
++ 				 struct ethtool_coalesce *);
++ int qlcnic_83xx_set_rx_tx_intr_coal(struct qlcnic_adapter *);
+++>>>>>>> a514722afebc (qlcnic: Refactor interrupt coalescing code for all adapters.)
+  int qlcnic_83xx_get_port_info(struct qlcnic_adapter *);
+  void qlcnic_83xx_enable_mbx_interrupt(struct qlcnic_adapter *);
+  void qlcnic_83xx_disable_mbx_intr(struct qlcnic_adapter *);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+index 3c9a8d64fa52..baa6fe73b719 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@ -355,6 +355,7 @@ struct qlcnic_rx_buffer {
+  */
+ #define QLCNIC_INTR_COAL_TYPE_RX		1
+ #define QLCNIC_INTR_COAL_TYPE_TX		2
++#define QLCNIC_INTR_COAL_TYPE_RX_TX		3
+ 
+ #define QLCNIC_DEF_INTR_COALESCE_RX_TIME_US	3
+ #define QLCNIC_DEF_INTR_COALESCE_RX_PACKETS	256
+@@ -1737,7 +1738,8 @@ struct qlcnic_hardware_ops {
+ 	int (*change_macvlan) (struct qlcnic_adapter *, u8*, u16, u8);
+ 	void (*napi_enable) (struct qlcnic_adapter *);
+ 	void (*napi_disable) (struct qlcnic_adapter *);
+-	void (*config_intr_coal) (struct qlcnic_adapter *);
++	int (*config_intr_coal) (struct qlcnic_adapter *,
++				 struct ethtool_coalesce *);
+ 	int (*config_rss) (struct qlcnic_adapter *, int);
+ 	int (*config_hw_lro) (struct qlcnic_adapter *, int);
+ 	int (*config_loopback) (struct qlcnic_adapter *, u8);
+@@ -1925,9 +1927,10 @@ static inline void qlcnic_napi_disable(struct qlcnic_adapter *adapter)
+ 	adapter->ahw->hw_ops->napi_disable(adapter);
+ }
+ 
+-static inline void qlcnic_config_intr_coalesce(struct qlcnic_adapter *adapter)
++static inline int qlcnic_config_intr_coalesce(struct qlcnic_adapter *adapter,
++					      struct ethtool_coalesce *ethcoal)
+ {
+-	adapter->ahw->hw_ops->config_intr_coal(adapter);
++	return adapter->ahw->hw_ops->config_intr_coal(adapter, ethcoal);
+ }
+ 
+ static inline int qlcnic_config_rss(struct qlcnic_adapter *adapter, int enable)
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+index f3a48cd31299..1b41b01c0509 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+@@ -2065,37 +2065,130 @@ int qlcnic_83xx_get_mac_address(struct qlcnic_adapter *adapter, u8 *mac,
+ 	return err;
+ }
+ 
+-void qlcnic_83xx_config_intr_coal(struct qlcnic_adapter *adapter)
++static int qlcnic_83xx_set_rx_intr_coal(struct qlcnic_adapter *adapter)
+ {
+-	int err;
+-	u16 temp;
+-	struct qlcnic_cmd_args cmd;
+ 	struct qlcnic_nic_intr_coalesce *coal = &adapter->ahw->coal;
++	struct qlcnic_cmd_args cmd;
++	u16 temp;
++	int err;
+ 
+-	if (adapter->recv_ctx->state == QLCNIC_HOST_CTX_STATE_FREED)
+-		return;
++	err = qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_CONFIG_INTR_COAL);
++	if (err)
++		return err;
++
++	temp = adapter->recv_ctx->context_id;
++	cmd.req.arg[1] = QLCNIC_INTR_COAL_TYPE_RX | temp << 16;
++	temp = coal->rx_time_us;
++	cmd.req.arg[2] = coal->rx_packets | temp << 16;
++	cmd.req.arg[3] = coal->flag;
++
++	err = qlcnic_issue_cmd(adapter, &cmd);
++	if (err != QLCNIC_RCODE_SUCCESS)
++		netdev_err(adapter->netdev,
++			   "failed to set interrupt coalescing parameters\n");
++
++	qlcnic_free_mbx_args(&cmd);
++
++	return err;
++}
++
++static int qlcnic_83xx_set_tx_intr_coal(struct qlcnic_adapter *adapter)
++{
++	struct qlcnic_nic_intr_coalesce *coal = &adapter->ahw->coal;
++	struct qlcnic_cmd_args cmd;
++	u16 temp;
++	int err;
+ 
+ 	err = qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_CONFIG_INTR_COAL);
+ 	if (err)
+-		return;
++		return err;
+ 
+-	if (coal->type == QLCNIC_INTR_COAL_TYPE_RX) {
+-		temp = adapter->recv_ctx->context_id;
+-		cmd.req.arg[1] = QLCNIC_INTR_COAL_TYPE_RX | temp << 16;
+-		temp = coal->rx_time_us;
+-		cmd.req.arg[2] = coal->rx_packets | temp << 16;
+-	} else if (coal->type == QLCNIC_INTR_COAL_TYPE_TX) {
+-		temp = adapter->tx_ring->ctx_id;
+-		cmd.req.arg[1] = QLCNIC_INTR_COAL_TYPE_TX | temp << 16;
+-		temp = coal->tx_time_us;
+-		cmd.req.arg[2] = coal->tx_packets | temp << 16;
+-	}
++	temp = adapter->tx_ring->ctx_id;
++	cmd.req.arg[1] = QLCNIC_INTR_COAL_TYPE_TX | temp << 16;
++	temp = coal->tx_time_us;
++	cmd.req.arg[2] = coal->tx_packets | temp << 16;
+ 	cmd.req.arg[3] = coal->flag;
++
+ 	err = qlcnic_issue_cmd(adapter, &cmd);
+ 	if (err != QLCNIC_RCODE_SUCCESS)
+-		dev_info(&adapter->pdev->dev,
+-			 "Failed to send interrupt coalescence parameters\n");
++		netdev_err(adapter->netdev,
++			   "failed to set interrupt coalescing  parameters\n");
++
+ 	qlcnic_free_mbx_args(&cmd);
++
++	return err;
++}
++
++int qlcnic_83xx_set_rx_tx_intr_coal(struct qlcnic_adapter *adapter)
++{
++	int err = 0;
++
++	err = qlcnic_83xx_set_rx_intr_coal(adapter);
++	if (err)
++		netdev_err(adapter->netdev,
++			   "failed to set Rx coalescing parameters\n");
++
++	err = qlcnic_83xx_set_tx_intr_coal(adapter);
++	if (err)
++		netdev_err(adapter->netdev,
++			   "failed to set Tx coalescing parameters\n");
++
++	return err;
++}
++
++int qlcnic_83xx_config_intr_coal(struct qlcnic_adapter *adapter,
++				 struct ethtool_coalesce *ethcoal)
++{
++	struct qlcnic_nic_intr_coalesce *coal = &adapter->ahw->coal;
++	u32 rx_coalesce_usecs, rx_max_frames;
++	u32 tx_coalesce_usecs, tx_max_frames;
++	int err;
++
++	if (adapter->recv_ctx->state == QLCNIC_HOST_CTX_STATE_FREED)
++		return -EIO;
++
++	tx_coalesce_usecs = ethcoal->tx_coalesce_usecs;
++	tx_max_frames = ethcoal->tx_max_coalesced_frames;
++	rx_coalesce_usecs = ethcoal->rx_coalesce_usecs;
++	rx_max_frames = ethcoal->rx_max_coalesced_frames;
++	coal->flag = QLCNIC_INTR_DEFAULT;
++
++	if ((coal->rx_time_us == rx_coalesce_usecs) &&
++	    (coal->rx_packets == rx_max_frames)) {
++		coal->type = QLCNIC_INTR_COAL_TYPE_TX;
++		coal->tx_time_us = tx_coalesce_usecs;
++		coal->tx_packets = tx_max_frames;
++	} else if ((coal->tx_time_us == tx_coalesce_usecs) &&
++		   (coal->tx_packets == tx_max_frames)) {
++		coal->type = QLCNIC_INTR_COAL_TYPE_RX;
++		coal->rx_time_us = rx_coalesce_usecs;
++		coal->rx_packets = rx_max_frames;
++	} else {
++		coal->type = QLCNIC_INTR_COAL_TYPE_RX_TX;
++		coal->rx_time_us = rx_coalesce_usecs;
++		coal->rx_packets = rx_max_frames;
++		coal->tx_time_us = tx_coalesce_usecs;
++		coal->tx_packets = tx_max_frames;
++	}
++
++	switch (coal->type) {
++	case QLCNIC_INTR_COAL_TYPE_RX:
++		err = qlcnic_83xx_set_rx_intr_coal(adapter);
++		break;
++	case QLCNIC_INTR_COAL_TYPE_TX:
++		err = qlcnic_83xx_set_tx_intr_coal(adapter);
++		break;
++	case QLCNIC_INTR_COAL_TYPE_RX_TX:
++		err = qlcnic_83xx_set_rx_tx_intr_coal(adapter);
++		break;
++	default:
++		err = -EINVAL;
++		netdev_err(adapter->netdev,
++			   "Invalid Interrupt coalescing type\n");
++		break;
++	}
++
++	return err;
+ }
+ 
+ static void qlcnic_83xx_handle_link_aen(struct qlcnic_adapter *adapter,
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+index a39e2b629a03..45bd4e7e7641 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+@@ -1457,9 +1457,7 @@ static int qlcnic_set_intr_coalesce(struct net_device *netdev,
+ 			struct ethtool_coalesce *ethcoal)
+ {
+ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
+-	struct qlcnic_nic_intr_coalesce *coal;
+-	u32 rx_coalesce_usecs, rx_max_frames;
+-	u32 tx_coalesce_usecs, tx_max_frames;
++	int err;
+ 
+ 	if (!test_bit(__QLCNIC_DEV_UP, &adapter->state))
+ 		return -EINVAL;
+@@ -1469,82 +1467,31 @@ static int qlcnic_set_intr_coalesce(struct net_device *netdev,
+ 	* unsupported parameters are set.
+ 	*/
+ 	if (ethcoal->rx_coalesce_usecs > 0xffff ||
+-		ethcoal->rx_max_coalesced_frames > 0xffff ||
+-		ethcoal->tx_coalesce_usecs > 0xffff ||
+-		ethcoal->tx_max_coalesced_frames > 0xffff ||
+-		ethcoal->rx_coalesce_usecs_irq ||
+-		ethcoal->rx_max_coalesced_frames_irq ||
+-		ethcoal->tx_coalesce_usecs_irq ||
+-		ethcoal->tx_max_coalesced_frames_irq ||
+-		ethcoal->stats_block_coalesce_usecs ||
+-		ethcoal->use_adaptive_rx_coalesce ||
+-		ethcoal->use_adaptive_tx_coalesce ||
+-		ethcoal->pkt_rate_low ||
+-		ethcoal->rx_coalesce_usecs_low ||
+-		ethcoal->rx_max_coalesced_frames_low ||
+-		ethcoal->tx_coalesce_usecs_low ||
+-		ethcoal->tx_max_coalesced_frames_low ||
+-		ethcoal->pkt_rate_high ||
+-		ethcoal->rx_coalesce_usecs_high ||
+-		ethcoal->rx_max_coalesced_frames_high ||
+-		ethcoal->tx_coalesce_usecs_high ||
+-		ethcoal->tx_max_coalesced_frames_high)
++	    ethcoal->rx_max_coalesced_frames > 0xffff ||
++	    ethcoal->tx_coalesce_usecs > 0xffff ||
++	    ethcoal->tx_max_coalesced_frames > 0xffff ||
++	    ethcoal->rx_coalesce_usecs_irq ||
++	    ethcoal->rx_max_coalesced_frames_irq ||
++	    ethcoal->tx_coalesce_usecs_irq ||
++	    ethcoal->tx_max_coalesced_frames_irq ||
++	    ethcoal->stats_block_coalesce_usecs ||
++	    ethcoal->use_adaptive_rx_coalesce ||
++	    ethcoal->use_adaptive_tx_coalesce ||
++	    ethcoal->pkt_rate_low ||
++	    ethcoal->rx_coalesce_usecs_low ||
++	    ethcoal->rx_max_coalesced_frames_low ||
++	    ethcoal->tx_coalesce_usecs_low ||
++	    ethcoal->tx_max_coalesced_frames_low ||
++	    ethcoal->pkt_rate_high ||
++	    ethcoal->rx_coalesce_usecs_high ||
++	    ethcoal->rx_max_coalesced_frames_high ||
++	    ethcoal->tx_coalesce_usecs_high ||
++	    ethcoal->tx_max_coalesced_frames_high)
+ 		return -EINVAL;
+ 
+-	coal = &adapter->ahw->coal;
++	err = qlcnic_config_intr_coalesce(adapter, ethcoal);
+ 
+-	if (qlcnic_83xx_check(adapter)) {
+-		if (!ethcoal->tx_coalesce_usecs ||
+-		    !ethcoal->tx_max_coalesced_frames ||
+-		    !ethcoal->rx_coalesce_usecs ||
+-		    !ethcoal->rx_max_coalesced_frames) {
+-			coal->flag = QLCNIC_INTR_DEFAULT;
+-			coal->type = QLCNIC_INTR_COAL_TYPE_RX;
+-			coal->rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
+-			coal->rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
+-			coal->tx_time_us = QLCNIC_DEF_INTR_COALESCE_TX_TIME_US;
+-			coal->tx_packets = QLCNIC_DEF_INTR_COALESCE_TX_PACKETS;
+-		} else {
+-			tx_coalesce_usecs = ethcoal->tx_coalesce_usecs;
+-			tx_max_frames = ethcoal->tx_max_coalesced_frames;
+-			rx_coalesce_usecs = ethcoal->rx_coalesce_usecs;
+-			rx_max_frames = ethcoal->rx_max_coalesced_frames;
+-			coal->flag = 0;
+-
+-			if ((coal->rx_time_us == rx_coalesce_usecs) &&
+-			    (coal->rx_packets == rx_max_frames)) {
+-				coal->type = QLCNIC_INTR_COAL_TYPE_TX;
+-				coal->tx_time_us = tx_coalesce_usecs;
+-				coal->tx_packets = tx_max_frames;
+-			} else if ((coal->tx_time_us == tx_coalesce_usecs) &&
+-				   (coal->tx_packets == tx_max_frames)) {
+-				coal->type = QLCNIC_INTR_COAL_TYPE_RX;
+-				coal->rx_time_us = rx_coalesce_usecs;
+-				coal->rx_packets = rx_max_frames;
+-			} else {
+-				coal->type = QLCNIC_INTR_COAL_TYPE_RX;
+-				coal->rx_time_us = rx_coalesce_usecs;
+-				coal->rx_packets = rx_max_frames;
+-				coal->tx_time_us = tx_coalesce_usecs;
+-				coal->tx_packets = tx_max_frames;
+-			}
+-		}
+-	} else {
+-		if (!ethcoal->rx_coalesce_usecs ||
+-		    !ethcoal->rx_max_coalesced_frames) {
+-			coal->flag = QLCNIC_INTR_DEFAULT;
+-			coal->rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
+-			coal->rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
+-		} else {
+-			coal->flag = 0;
+-			coal->rx_time_us = ethcoal->rx_coalesce_usecs;
+-			coal->rx_packets = ethcoal->rx_max_coalesced_frames;
+-		}
+-	}
+-
+-	qlcnic_config_intr_coalesce(adapter);
+-
+-	return 0;
++	return err;
+ }
+ 
+ static int qlcnic_get_intr_coalesce(struct net_device *netdev,
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+index 3b8e5f53b573..4a363076c967 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+@@ -755,10 +755,7 @@ int qlcnic_82xx_read_phys_port_id(struct qlcnic_adapter *adapter)
+ 	return 0;
+ }
+ 
+-/*
+- * Send the interrupt coalescing parameter set by ethtool to the card.
+- */
+-void qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *adapter)
++int qlcnic_82xx_set_rx_coalesce(struct qlcnic_adapter *adapter)
+ {
+ 	struct qlcnic_nic_req req;
+ 	int rv;
+@@ -780,6 +777,28 @@ void qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *adapter)
+ 	if (rv != 0)
+ 		dev_err(&adapter->netdev->dev,
+ 			"Could not send interrupt coalescing parameters\n");
++
++	return rv;
++}
++
++/* Send the interrupt coalescing parameter set by ethtool to the card. */
++int qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *adapter,
++				     struct ethtool_coalesce *ethcoal)
++{
++	struct qlcnic_nic_intr_coalesce *coal = &adapter->ahw->coal;
++	int rv;
++
++	coal->flag = QLCNIC_INTR_DEFAULT;
++	coal->rx_time_us = ethcoal->rx_coalesce_usecs;
++	coal->rx_packets = ethcoal->rx_max_coalesced_frames;
++
++	rv = qlcnic_82xx_set_rx_coalesce(adapter);
++
++	if (rv)
++		netdev_err(adapter->netdev,
++			   "Failed to set Rx coalescing parametrs\n");
++
++	return rv;
+ }
+ 
+ #define QLCNIC_ENABLE_IPV4_LRO		BIT_0
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.h
+index 272c356cf9b2..8f9019fc7fd6 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.h
+@@ -165,7 +165,9 @@ int qlcnic_82xx_napi_add(struct qlcnic_adapter *adapter,
+ 			 struct net_device *netdev);
+ void qlcnic_82xx_change_filter(struct qlcnic_adapter *adapter,
+ 			       u64 *uaddr, u16 vlan_id);
+-void qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *adapter);
++int qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *,
++				     struct ethtool_coalesce *);
++int qlcnic_82xx_set_rx_coalesce(struct qlcnic_adapter *);
+ int qlcnic_82xx_config_rss(struct qlcnic_adapter *adapter, int);
+ void qlcnic_82xx_config_ipaddr(struct qlcnic_adapter *adapter,
+ 			       __be32, int);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index ecd8d1df8016..bf98742646a6 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -1652,6 +1652,33 @@ static void qlcnic_get_lro_mss_capability(struct qlcnic_adapter *adapter)
+ 	}
+ }
+ 
++static int qlcnic_config_def_intr_coalesce(struct qlcnic_adapter *adapter)
++{
++	struct qlcnic_hardware_context *ahw = adapter->ahw;
++	int err;
++
++	/* Initialize interrupt coalesce parameters */
++	ahw->coal.flag = QLCNIC_INTR_DEFAULT;
++
++	if (qlcnic_83xx_check(adapter)) {
++		ahw->coal.type = QLCNIC_INTR_COAL_TYPE_RX_TX;
++		ahw->coal.tx_time_us = QLCNIC_DEF_INTR_COALESCE_TX_TIME_US;
++		ahw->coal.tx_packets = QLCNIC_DEF_INTR_COALESCE_TX_PACKETS;
++		ahw->coal.rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
++		ahw->coal.rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
++
++		err = qlcnic_83xx_set_rx_tx_intr_coal(adapter);
++	} else {
++		ahw->coal.type = QLCNIC_INTR_COAL_TYPE_RX;
++		ahw->coal.rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
++		ahw->coal.rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
++
++		err = qlcnic_82xx_set_rx_coalesce(adapter);
++	}
++
++	return err;
++}
++
+ int __qlcnic_up(struct qlcnic_adapter *adapter, struct net_device *netdev)
+ {
+ 	int ring;
+@@ -1684,7 +1711,7 @@ int __qlcnic_up(struct qlcnic_adapter *adapter, struct net_device *netdev)
+ 	if (adapter->max_sds_rings > 1)
+ 		qlcnic_config_rss(adapter, 1);
+ 
+-	qlcnic_config_intr_coalesce(adapter);
++	qlcnic_config_def_intr_coalesce(adapter);
+ 
+ 	if (netdev->features & NETIF_F_LRO)
+ 		qlcnic_config_hw_lro(adapter, QLCNIC_LRO_ENABLED);
+@@ -1853,7 +1880,6 @@ out:
+ 
+ static int qlcnic_alloc_adapter_resources(struct qlcnic_adapter *adapter)
+ {
+-	struct qlcnic_hardware_context *ahw = adapter->ahw;
+ 	int err = 0;
+ 
+ 	adapter->recv_ctx = kzalloc(sizeof(struct qlcnic_recv_context),
+@@ -1862,15 +1888,7 @@ static int qlcnic_alloc_adapter_resources(struct qlcnic_adapter *adapter)
+ 		err = -ENOMEM;
+ 		goto err_out;
+ 	}
+-	/* Initialize interrupt coalesce parameters */
+-	ahw->coal.flag = QLCNIC_INTR_DEFAULT;
+-	ahw->coal.type = QLCNIC_INTR_COAL_TYPE_RX;
+-	ahw->coal.rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
+-	ahw->coal.rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
+-	if (qlcnic_83xx_check(adapter)) {
+-		ahw->coal.tx_time_us = QLCNIC_DEF_INTR_COALESCE_TX_TIME_US;
+-		ahw->coal.tx_packets = QLCNIC_DEF_INTR_COALESCE_TX_PACKETS;
+-	}
++
+ 	/* clear stats */
+ 	memset(&adapter->stats, 0, sizeof(adapter->stats));
+ err_out:
