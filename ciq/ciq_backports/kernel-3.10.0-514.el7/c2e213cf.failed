@@ -1,0 +1,304 @@
+rhashtable: Introduce max_size/min_size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit c2e213cff701fce71a0aba8de82f2c2a4acf52ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c2e213cf.failed
+
+This patch adds the parameters max_size and min_size which are
+meant to replace max_shift and min_shift.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c2e213cff701fce71a0aba8de82f2c2a4acf52ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rhashtable.h
+#	lib/rhashtable.c
+diff --cc include/linux/rhashtable.h
+index 0839d7b8cd60,81267fef85d7..000000000000
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@@ -42,30 -83,28 +42,44 @@@ struct rhashtable
+   * @key_len: Length of key
+   * @key_offset: Offset of key in struct to be hashed
+   * @head_offset: Offset of rhash_head in struct to be hashed
+ + * @hash_rnd: Seed to use while hashing
+   * @max_shift: Maximum number of shifts while expanding
+   * @min_shift: Minimum number of shifts while shrinking
+++<<<<<<< HEAD
+++=======
++  * @max_size: Maximum size while expanding
++  * @min_size: Minimum size while shrinking
++  * @nulls_base: Base value to generate nulls marker
++  * @locks_mul: Number of bucket locks to allocate per cpu (default: 128)
+++>>>>>>> c2e213cff701 (rhashtable: Introduce max_size/min_size)
+   * @hashfn: Function to hash key
+   * @obj_hashfn: Function to hash object
+ + * @grow_decision: If defined, may return true if table should expand
+ + * @shrink_decision: If defined, may return true if table should shrink
+ + * @mutex_is_held: Must return true if protecting mutex is held
+   */
+  struct rhashtable_params {
+  	size_t			nelem_hint;
+  	size_t			key_len;
+  	size_t			key_offset;
+  	size_t			head_offset;
+ +	u32			hash_rnd;
+  	size_t			max_shift;
+  	size_t			min_shift;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int		max_size;
++ 	unsigned int		min_size;
++ 	u32			nulls_base;
++ 	size_t			locks_mul;
+++>>>>>>> c2e213cff701 (rhashtable: Introduce max_size/min_size)
+  	rht_hashfn_t		hashfn;
+  	rht_obj_hashfn_t	obj_hashfn;
+ +	bool			(*grow_decision)(const struct rhashtable *ht,
+ +						 size_t new_size);
+ +	bool			(*shrink_decision)(const struct rhashtable *ht,
+ +						   size_t new_size);
+ +	int			(*mutex_is_held)(void);
+  };
+  
+  /**
+diff --cc lib/rhashtable.c
+index 6d0c4774001c,c4061bbd0113..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -26,23 -27,29 +26,28 @@@
+  #include <linux/err.h>
+  
+  #define HASH_DEFAULT_SIZE	64UL
+++<<<<<<< HEAD
+ +#define HASH_MIN_SIZE		4UL
+++=======
++ #define HASH_MIN_SIZE		4U
++ #define BUCKET_LOCKS_PER_CPU   128UL
+++>>>>>>> c2e213cff701 (rhashtable: Introduce max_size/min_size)
+  
+ -/* Base bits plus 1 bit for nulls marker */
+ -#define HASH_RESERVED_SPACE	(RHT_BASE_BITS + 1)
+ +#define ASSERT_RHT_MUTEX(HT) BUG_ON(!lockdep_rht_mutex_is_held(HT))
+  
+ -/* The bucket lock is selected based on the hash and protects mutations
+ - * on a group of hash buckets.
+ - *
+ - * A maximum of tbl->size/2 bucket locks is allocated. This ensures that
+ - * a single lock always covers both buckets which may both contains
+ - * entries which link to the same bucket of the old table during resizing.
+ - * This allows to simplify the locking as locking the bucket in both
+ - * tables during resize always guarantee protection.
+ - *
+ - * IMPORTANT: When holding the bucket lock of both the old and new table
+ - * during expansions and shrinking, the old bucket lock must always be
+ - * acquired first.
+ - */
+ -static spinlock_t *bucket_lock(const struct bucket_table *tbl, u32 hash)
+ +#ifdef CONFIG_PROVE_LOCKING
+ +int lockdep_rht_mutex_is_held(const struct rhashtable *ht)
+  {
+ -	return &tbl->locks[hash & tbl->locks_mask];
+ +	return ht->p.mutex_is_held();
+  }
+ +EXPORT_SYMBOL_GPL(lockdep_rht_mutex_is_held);
+ +
+ +int lockdep_rht_bucket_is_held(const struct bucket_table *tbl, u32 hash)
+ +{
+ +	return 1;
+ +}
+ +EXPORT_SYMBOL_GPL(lockdep_rht_bucket_is_held);
+ +#endif
+  
+  static void *rht_obj(const struct rhashtable *ht, const struct rhash_head *he)
+  {
+@@@ -122,68 -181,120 +127,80 @@@ static void bucket_table_free(const str
+  /**
+   * rht_grow_above_75 - returns true if nelems > 0.75 * table-size
+   * @ht:		hash table
+ - * @tbl:	current table
+ + * @new_size:	new table size
+   */
+ -static bool rht_grow_above_75(const struct rhashtable *ht,
+ -			      const struct bucket_table *tbl)
+ +bool rht_grow_above_75(const struct rhashtable *ht, size_t new_size)
+  {
+  	/* Expand table when exceeding 75% load */
+++<<<<<<< HEAD
+ +	return ht->nelems > (new_size / 4 * 3);
+++=======
++ 	return atomic_read(&ht->nelems) > (tbl->size / 4 * 3) &&
++ 	       (!ht->p.max_shift || tbl->size < (1 << ht->p.max_shift)) &&
++ 	       (!ht->p.max_size || tbl->size < ht->p.max_size);
+++>>>>>>> c2e213cff701 (rhashtable: Introduce max_size/min_size)
+  }
+ +EXPORT_SYMBOL_GPL(rht_grow_above_75);
+  
+  /**
+   * rht_shrink_below_30 - returns true if nelems < 0.3 * table-size
+   * @ht:		hash table
+ - * @tbl:	current table
+ + * @new_size:	new table size
+   */
+ -static bool rht_shrink_below_30(const struct rhashtable *ht,
+ -				const struct bucket_table *tbl)
+ +bool rht_shrink_below_30(const struct rhashtable *ht, size_t new_size)
+  {
+  	/* Shrink table beneath 30% load */
+++<<<<<<< HEAD
+ +	return ht->nelems < (new_size * 3 / 10);
+++=======
++ 	return atomic_read(&ht->nelems) < (tbl->size * 3 / 10) &&
++ 	       tbl->size > (1 << ht->p.min_shift) &&
++ 	       tbl->size > ht->p.min_size;
+++>>>>>>> c2e213cff701 (rhashtable: Introduce max_size/min_size)
+  }
+ +EXPORT_SYMBOL_GPL(rht_shrink_below_30);
+  
+ -static int rhashtable_rehash_one(struct rhashtable *ht, unsigned old_hash)
+ -{
+ -	struct bucket_table *old_tbl = rht_dereference(ht->tbl, ht);
+ -	struct bucket_table *new_tbl =
+ -		rht_dereference(old_tbl->future_tbl, ht) ?: old_tbl;
+ -	struct rhash_head __rcu **pprev = &old_tbl->buckets[old_hash];
+ -	int err = -ENOENT;
+ -	struct rhash_head *head, *next, *entry;
+ -	spinlock_t *new_bucket_lock;
+ -	unsigned new_hash;
+ -
+ -	rht_for_each(entry, old_tbl, old_hash) {
+ -		err = 0;
+ -		next = rht_dereference_bucket(entry->next, old_tbl, old_hash);
+ -
+ -		if (rht_is_a_nulls(next))
+ -			break;
+ -
+ -		pprev = &entry->next;
+ -	}
+ -
+ -	if (err)
+ -		goto out;
+ -
+ -	new_hash = head_hashfn(ht, new_tbl, entry);
+ -
+ -	new_bucket_lock = bucket_lock(new_tbl, new_hash);
+ -
+ -	spin_lock_nested(new_bucket_lock, SINGLE_DEPTH_NESTING);
+ -	head = rht_dereference_bucket(new_tbl->buckets[new_hash],
+ -				      new_tbl, new_hash);
+ -
+ -	if (rht_is_a_nulls(head))
+ -		INIT_RHT_NULLS_HEAD(entry->next, ht, new_hash);
+ -	else
+ -		RCU_INIT_POINTER(entry->next, head);
+ -
+ -	rcu_assign_pointer(new_tbl->buckets[new_hash], entry);
+ -	spin_unlock(new_bucket_lock);
+ -
+ -	rcu_assign_pointer(*pprev, next);
+ -
+ -out:
+ -	return err;
+ -}
+ -
+ -static void rhashtable_rehash_chain(struct rhashtable *ht, unsigned old_hash)
+ +static void hashtable_chain_unzip(const struct rhashtable *ht,
+ +				  const struct bucket_table *new_tbl,
+ +				  struct bucket_table *old_tbl, size_t n)
+  {
+ -	struct bucket_table *old_tbl = rht_dereference(ht->tbl, ht);
+ -	spinlock_t *old_bucket_lock;
+ -
+ -	old_bucket_lock = bucket_lock(old_tbl, old_hash);
+ +	struct rhash_head *he, *p, *next;
+ +	unsigned int h;
+  
+ -	spin_lock_bh(old_bucket_lock);
+ -	while (!rhashtable_rehash_one(ht, old_hash))
+ -		;
+ -	old_tbl->rehash++;
+ -	spin_unlock_bh(old_bucket_lock);
+ -}
+ -
+ -static void rhashtable_rehash(struct rhashtable *ht,
+ -			      struct bucket_table *new_tbl)
+ -{
+ -	struct bucket_table *old_tbl = rht_dereference(ht->tbl, ht);
+ -	struct rhashtable_walker *walker;
+ -	unsigned old_hash;
+ +	/* Old bucket empty, no work needed. */
+ +	p = rht_dereference(old_tbl->buckets[n], ht);
+ +	if (!p)
+ +		return;
+  
+ -	/* Make insertions go into the new, empty table right away. Deletions
+ -	 * and lookups will be attempted in both tables until we synchronize.
+ +	/* Advance the old bucket pointer one or more times until it
+ +	 * reaches a node that doesn't hash to the same bucket as the
+ +	 * previous node p. Call the previous node p;
+  	 */
+ -	rcu_assign_pointer(old_tbl->future_tbl, new_tbl);
+ -
+ -	/* Ensure the new table is visible to readers. */
+ -	smp_wmb();
+ -
+ -	for (old_hash = 0; old_hash < old_tbl->size; old_hash++)
+ -		rhashtable_rehash_chain(ht, old_hash);
+ -
+ -	/* Publish the new table pointer. */
+ -	rcu_assign_pointer(ht->tbl, new_tbl);
+ +	h = head_hashfn(ht, new_tbl, p);
+ +	rht_for_each_continue(he, p->next, old_tbl, n) {
+ +		if (head_hashfn(ht, new_tbl, he) != h)
+ +			break;
+ +		p = he;
+ +	}
+ +	RCU_INIT_POINTER(old_tbl->buckets[n], p->next);
+  
+ -	list_for_each_entry(walker, &old_tbl->walkers, list)
+ -		walker->tbl = NULL;
+ +	/* Find the subsequent node which does hash to the same
+ +	 * bucket as node P, or NULL if no such node exists.
+ +	 */
+ +	next = NULL;
+ +	if (he) {
+ +		rht_for_each_continue(he, he->next, old_tbl, n) {
+ +			if (head_hashfn(ht, new_tbl, he) == h) {
+ +				next = he;
+ +				break;
+ +			}
+ +		}
+ +	}
+  
+ -	/* Wait for readers. All new readers will see the new
+ -	 * table, and thus no references to the old table will
+ -	 * remain.
+ +	/* Set p's next pointer to that subsequent node pointer,
+ +	 * bypassing the nodes which do not hash to p's bucket
+  	 */
+ -	call_rcu(&old_tbl->rcu, bucket_table_free_rcu);
+ +	RCU_INIT_POINTER(p->next, next);
+  }
+  
+  /**
+@@@ -522,8 -933,12 +540,9 @@@ int rhashtable_init(struct rhashtable *
+  	    (!params->key_len && !params->obj_hashfn))
+  		return -EINVAL;
+  
+ -	if (params->nulls_base && params->nulls_base < (1U << RHT_BASE_SHIFT))
+ -		return -EINVAL;
+ -
+  	params->min_shift = max_t(size_t, params->min_shift,
+  				  ilog2(HASH_MIN_SIZE));
++ 	params->min_size = max(params->min_size, HASH_MIN_SIZE);
+  
+  	if (params->nelem_hint)
+  		size = rounded_hashtable_size(params);
+* Unmerged path include/linux/rhashtable.h
+* Unmerged path lib/rhashtable.c
