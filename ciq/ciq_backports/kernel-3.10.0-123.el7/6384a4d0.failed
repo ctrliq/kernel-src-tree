@@ -1,0 +1,246 @@
+be2net: add support for ndo_busy_poll
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Sathya Perla <sathya.perla@emulex.com>
+commit 6384a4d0dcf9e28f5aa5e0c8a7e58e7b4df19e68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6384a4d0.failed
+
+Includes:
+- ndo_busy_poll implementation
+- Locking between napi and busy_poll
+- Fix rx_post_starvation (replenish rx-queues in out-of-mememory scenario)
+  logic to accomodate busy_poll.
+
+v2 changes:
+[Eric D.'s comment] call alloc_pages() with GFP_ATOMIC even in ndo_busy_poll
+context as it is not allowed to sleep.
+
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6384a4d0dcf9e28f5aa5e0c8a7e58e7b4df19e68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be.h
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be.h
+index a99ea721f801,b2765ebb0268..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@@ -199,8 -199,37 +199,40 @@@ struct be_eq_obj 
+  	u16 spurious_intr;
+  	struct napi_struct napi;
+  	struct be_adapter *adapter;
++ 
++ #ifdef CONFIG_NET_RX_BUSY_POLL
++ #define BE_EQ_IDLE		0
++ #define BE_EQ_NAPI		1	/* napi owns this EQ */
++ #define BE_EQ_POLL		2	/* poll owns this EQ */
++ #define BE_EQ_LOCKED		(BE_EQ_NAPI | BE_EQ_POLL)
++ #define BE_EQ_NAPI_YIELD	4	/* napi yielded this EQ */
++ #define BE_EQ_POLL_YIELD	8	/* poll yielded this EQ */
++ #define BE_EQ_YIELD		(BE_EQ_NAPI_YIELD | BE_EQ_POLL_YIELD)
++ #define BE_EQ_USER_PEND		(BE_EQ_POLL | BE_EQ_POLL_YIELD)
++ 	unsigned int state;
++ 	spinlock_t lock;	/* lock to serialize napi and busy-poll */
++ #endif  /* CONFIG_NET_RX_BUSY_POLL */
+  } ____cacheline_aligned_in_smp;
+  
+++<<<<<<< HEAD
+++=======
++ struct be_aic_obj {		/* Adaptive interrupt coalescing (AIC) info */
++ 	bool enable;
++ 	u32 min_eqd;		/* in usecs */
++ 	u32 max_eqd;		/* in usecs */
++ 	u32 prev_eqd;		/* in usecs */
++ 	u32 et_eqd;		/* configured val when aic is off */
++ 	ulong jiffies;
++ 	u64 rx_pkts_prev;	/* Used to calculate RX pps */
++ 	u64 tx_reqs_prev;	/* Used to calculate TX pps */
++ };
++ 
++ enum {
++ 	NAPI_POLLING,
++ 	BUSY_POLLING
++ };
++ 
+++>>>>>>> 6384a4d0dcf9 (be2net: add support for ndo_busy_poll)
+  struct be_mcc_obj {
+  	struct be_queue_info q;
+  	struct be_queue_info cq;
+@@@ -702,23 -733,114 +738,134 @@@ static inline int qnq_async_evt_rcvd(st
+  	return adapter->flags & BE_FLAGS_QNQ_ASYNC_EVT_RCVD;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int fw_major_num(const char *fw_ver)
+ +{
+ +	int fw_major = 0;
+ +
+ +	sscanf(fw_ver, "%d.", &fw_major);
+ +
+ +	return fw_major;
+ +}
+ +
+ +extern void be_cq_notify(struct be_adapter *adapter, u16 qid, bool arm,
+ +		u16 num_popped);
+ +extern void be_link_status_update(struct be_adapter *adapter, u8 link_status);
+ +extern void be_parse_stats(struct be_adapter *adapter);
+ +extern int be_load_fw(struct be_adapter *adapter, u8 *func);
+ +extern bool be_is_wol_supported(struct be_adapter *adapter);
+ +extern bool be_pause_supported(struct be_adapter *adapter);
+ +extern u32 be_get_fw_log_level(struct be_adapter *adapter);
+++=======
++ #ifdef CONFIG_NET_RX_BUSY_POLL
++ static inline bool be_lock_napi(struct be_eq_obj *eqo)
++ {
++ 	bool status = true;
++ 
++ 	spin_lock(&eqo->lock); /* BH is already disabled */
++ 	if (eqo->state & BE_EQ_LOCKED) {
++ 		WARN_ON(eqo->state & BE_EQ_NAPI);
++ 		eqo->state |= BE_EQ_NAPI_YIELD;
++ 		status = false;
++ 	} else {
++ 		eqo->state = BE_EQ_NAPI;
++ 	}
++ 	spin_unlock(&eqo->lock);
++ 	return status;
++ }
++ 
++ static inline void be_unlock_napi(struct be_eq_obj *eqo)
++ {
++ 	spin_lock(&eqo->lock); /* BH is already disabled */
++ 
++ 	WARN_ON(eqo->state & (BE_EQ_POLL | BE_EQ_NAPI_YIELD));
++ 	eqo->state = BE_EQ_IDLE;
++ 
++ 	spin_unlock(&eqo->lock);
++ }
++ 
++ static inline bool be_lock_busy_poll(struct be_eq_obj *eqo)
++ {
++ 	bool status = true;
++ 
++ 	spin_lock_bh(&eqo->lock);
++ 	if (eqo->state & BE_EQ_LOCKED) {
++ 		eqo->state |= BE_EQ_POLL_YIELD;
++ 		status = false;
++ 	} else {
++ 		eqo->state |= BE_EQ_POLL;
++ 	}
++ 	spin_unlock_bh(&eqo->lock);
++ 	return status;
++ }
++ 
++ static inline void be_unlock_busy_poll(struct be_eq_obj *eqo)
++ {
++ 	spin_lock_bh(&eqo->lock);
++ 
++ 	WARN_ON(eqo->state & (BE_EQ_NAPI));
++ 	eqo->state = BE_EQ_IDLE;
++ 
++ 	spin_unlock_bh(&eqo->lock);
++ }
++ 
++ static inline void be_enable_busy_poll(struct be_eq_obj *eqo)
++ {
++ 	spin_lock_init(&eqo->lock);
++ 	eqo->state = BE_EQ_IDLE;
++ }
++ 
++ static inline void be_disable_busy_poll(struct be_eq_obj *eqo)
++ {
++ 	local_bh_disable();
++ 
++ 	/* It's enough to just acquire napi lock on the eqo to stop
++ 	 * be_busy_poll() from processing any queueus.
++ 	 */
++ 	while (!be_lock_napi(eqo))
++ 		mdelay(1);
++ 
++ 	local_bh_enable();
++ }
++ 
++ #else /* CONFIG_NET_RX_BUSY_POLL */
++ 
++ static inline bool be_lock_napi(struct be_eq_obj *eqo)
++ {
++ 	return true;
++ }
++ 
++ static inline void be_unlock_napi(struct be_eq_obj *eqo)
++ {
++ }
++ 
++ static inline bool be_lock_busy_poll(struct be_eq_obj *eqo)
++ {
++ 	return false;
++ }
++ 
++ static inline void be_unlock_busy_poll(struct be_eq_obj *eqo)
++ {
++ }
++ 
++ static inline void be_enable_busy_poll(struct be_eq_obj *eqo)
++ {
++ }
++ 
++ static inline void be_disable_busy_poll(struct be_eq_obj *eqo)
++ {
++ }
++ #endif /* CONFIG_NET_RX_BUSY_POLL */
++ 
++ void be_cq_notify(struct be_adapter *adapter, u16 qid, bool arm,
++ 		  u16 num_popped);
++ void be_link_status_update(struct be_adapter *adapter, u8 link_status);
++ void be_parse_stats(struct be_adapter *adapter);
++ int be_load_fw(struct be_adapter *adapter, u8 *func);
++ bool be_is_wol_supported(struct be_adapter *adapter);
++ bool be_pause_supported(struct be_adapter *adapter);
++ u32 be_get_fw_log_level(struct be_adapter *adapter);
+++>>>>>>> 6384a4d0dcf9 (be2net: add support for ndo_busy_poll)
+  int be_update_queues(struct be_adapter *adapter);
+  int be_poll(struct napi_struct *napi, int budget);
+  
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index 30cbf821167d,03e0c74f2516..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -2013,6 -2045,8 +2018,11 @@@ static int be_evt_queues_create(struct 
+  	for_all_evt_queues(adapter, eqo, i) {
+  		netif_napi_add(adapter->netdev, &eqo->napi, be_poll,
+  			       BE_NAPI_WEIGHT);
+++<<<<<<< HEAD
+++=======
++ 		napi_hash_add(&eqo->napi);
++ 		aic = &adapter->aic_obj[i];
+++>>>>>>> 6384a4d0dcf9 (be2net: add support for ndo_busy_poll)
+  		eqo->adapter = adapter;
+  		eqo->tx_budget = BE_TX_BUDGET;
+  		eqo->idx = i;
+@@@ -4355,14 -4422,14 +4405,15 @@@ static void be_worker(struct work_struc
+  		be_cmd_get_die_temperature(adapter);
+  
+  	for_all_rx_queues(adapter, rxo, i) {
+- 		if (rxo->rx_post_starved) {
+- 			rxo->rx_post_starved = false;
++ 		/* Replenish RX-queues starved due to memory
++ 		 * allocation failures.
++ 		 */
++ 		if (rxo->rx_post_starved)
+  			be_post_rx_frags(rxo, GFP_KERNEL);
+- 		}
+  	}
+  
+ -	be_eqd_update(adapter);
+ +	for_all_evt_queues(adapter, eqo, i)
+ +		be_eqd_update(adapter, eqo);
+  
+  reschedule:
+  	adapter->work_counter++;
+* Unmerged path drivers/net/ethernet/emulex/benet/be.h
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
