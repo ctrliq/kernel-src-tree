@@ -1,0 +1,179 @@
+perf tools: Support shortcuts for events in dynamic sort keys
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 5d0cff93bb7aa85349230d4e29902b2648640c53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5d0cff93.failed
+
+The dynamic sort key requires event name but specifying full event name
+is rather inconvenient.  This patch adds more ways to identify the event
+in a more compact way.
+
+  1. If session has just one event, event name can be omitted.
+  2. Events can be accessed by index preceded by a percent sign.
+  3. A part of the name can be used, if it's not ambiguous.  The partial
+     name should not contain ':' in it.
+  4. Full system + event name is still used, it should contain ':'.
+
+So in the below example all does same thing:
+
+  $ perf record -e sched:sched_switch -a sleep 1
+
+  $ perf report -s next_pid,next_comm
+  $ perf report -s %1.next_pid,%1.next_comm
+  $ perf report -s switch.next_pid,switch.next_comm
+  $ perf report -s sched:sched_switch.next_pid,sched:sched_switch.next_comm
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1450804030-29193-10-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 5d0cff93bb7aa85349230d4e29902b2648640c53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/sort.c
+diff --cc tools/perf/util/sort.c
+index 7a0efdc373c2,f3a98c25fb8d..000000000000
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@@ -1749,12 -1828,93 +1749,97 @@@ __alloc_dynamic_entry(struct perf_evse
+  	return hde;
+  }
+  
++ static int parse_field_name(char *str, char **event, char **field, char **opt)
++ {
++ 	char *event_name, *field_name, *opt_name;
++ 
++ 	event_name = str;
++ 	field_name = strchr(str, '.');
++ 
++ 	if (field_name) {
++ 		*field_name++ = '\0';
++ 	} else {
++ 		event_name = NULL;
++ 		field_name = str;
++ 	}
++ 
++ 	opt_name = strchr(field_name, '/');
++ 	if (opt_name)
++ 		*opt_name++ = '\0';
++ 
++ 	*event = event_name;
++ 	*field = field_name;
++ 	*opt   = opt_name;
++ 
++ 	return 0;
++ }
++ 
++ /* find match evsel using a given event name.  The event name can be:
++  *   1. NULL - only valid for single event session
++  *   2. '%' + event index (e.g. '%1' for first event)
++  *   3. full event name (e.g. sched:sched_switch)
++  *   4. partial event name (should not contain ':')
++  */
++ static struct perf_evsel *find_evsel(struct perf_evlist *evlist, char *event_name)
++ {
++ 	struct perf_evsel *evsel = NULL;
++ 	struct perf_evsel *pos;
++ 	bool full_name;
++ 
++ 	/* case 1 */
++ 	if (event_name == NULL) {
++ 		if (evlist->nr_entries != 1) {
++ 			pr_debug("event name should be given\n");
++ 			return NULL;
++ 		}
++ 
++ 		return perf_evlist__first(evlist);
++ 	}
++ 
++ 	/* case 2 */
++ 	if (event_name[0] == '%') {
++ 		int nr = strtol(event_name+1, NULL, 0);
++ 
++ 		if (nr > evlist->nr_entries)
++ 			return NULL;
++ 
++ 		evsel = perf_evlist__first(evlist);
++ 		while (--nr > 0)
++ 			evsel = perf_evsel__next(evsel);
++ 
++ 		return evsel;
++ 	}
++ 
++ 	full_name = !!strchr(event_name, ':');
++ 	evlist__for_each(evlist, pos) {
++ 		/* case 3 */
++ 		if (full_name && !strcmp(pos->name, event_name))
++ 			return pos;
++ 		/* case 4 */
++ 		if (!full_name && strstr(pos->name, event_name)) {
++ 			if (evsel) {
++ 				pr_debug("'%s' event is ambiguous: it can be %s or %s\n",
++ 					 event_name, evsel->name, pos->name);
++ 				return NULL;
++ 			}
++ 			evsel = pos;
++ 		}
++ 	}
++ 
++ 	return evsel;
++ }
++ 
+  static int add_dynamic_entry(struct perf_evlist *evlist, const char *tok)
+  {
+++<<<<<<< HEAD
+ +	char *str, *event_name, *field_name;
+ +	struct perf_evsel *evsel, *pos;
+++=======
++ 	char *str, *event_name, *field_name, *opt_name;
++ 	struct perf_evsel *evsel;
+++>>>>>>> 5d0cff93bb7a (perf tools: Support shortcuts for events in dynamic sort keys)
+  	struct format_field *field;
+  	struct hpp_dynamic_entry *hde;
+ -	bool raw_trace = symbol_conf.raw_trace;
+  	int ret = 0;
+  
+  	if (evlist == NULL)
+@@@ -1770,16 -1928,17 +1853,28 @@@
+  		ret = -EINVAL;
+  		goto out;
+  	}
+- 	*field_name++ = '\0';
+  
+++<<<<<<< HEAD
+ +	evsel = NULL;
+ +	evlist__for_each(evlist, pos) {
+ +		if (!strcmp(pos->name, event_name)) {
+ +			evsel = pos;
+ +			break;
+ +		}
+ +	}
+ +
+++=======
++ 	if (opt_name) {
++ 		if (strcmp(opt_name, "raw")) {
++ 			pr_debug("unsupported field option %s\n", opt_name);
++ 			ret = -EINVAL;
++ 			goto out;
++ 		}
++ 		raw_trace = true;
++ 	}
++ 
++ 	evsel = find_evsel(evlist, event_name);
+++>>>>>>> 5d0cff93bb7a (perf tools: Support shortcuts for events in dynamic sort keys)
+  	if (evsel == NULL) {
+  		pr_debug("Cannot find event: %s\n", event_name);
+  		ret = -ENOENT;
+* Unmerged path tools/perf/util/sort.c
