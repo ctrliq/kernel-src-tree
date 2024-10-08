@@ -5019,7 +5019,7 @@ pm8001_get_gsm_dump(struct device *cdev, u32 length, char *buf)
 	/* check max is 1 Mbytes */
 	if ((length > 0x100000) || (gsm_dump_offset & 3) ||
 		((gsm_dump_offset + length) > 0x1000000))
-			return 1;
+			return -EINVAL;
 
 	if (pm8001_ha->chip_id == chip_8001)
 		bar = 2;
@@ -5047,12 +5047,12 @@ pm8001_get_gsm_dump(struct device *cdev, u32 length, char *buf)
 				gsm_base = GSM_BASE;
 				if (-1 == pm8001_bar4_shift(pm8001_ha,
 						(gsm_base + shift_value)))
-					return 1;
+					return -EIO;
 			} else {
 				gsm_base = 0;
 				if (-1 == pm80xx_bar4_shift(pm8001_ha,
 						(gsm_base + shift_value)))
-					return 1;
+					return -EIO;
 			}
 			gsm_dump_offset = (gsm_dump_offset + offset) &
 						0xFFFF0000;
@@ -5072,7 +5072,7 @@ pm8001_get_gsm_dump(struct device *cdev, u32 length, char *buf)
 	}
 	/* Shift back to BAR4 original address */
 	if (-1 == pm8001_bar4_shift(pm8001_ha, 0))
-			return 1;
+			return -EIO;
 	pm8001_ha->fatal_forensic_shift_offset += 1024;
 
 	if (pm8001_ha->fatal_forensic_shift_offset >= 0x100000)
