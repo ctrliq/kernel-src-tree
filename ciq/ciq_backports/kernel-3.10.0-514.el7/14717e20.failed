@@ -1,0 +1,123 @@
+kvm: Conditionally register IRQ bypass consumer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 14717e2031862d9aa2512b24a7df42cf68a977ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/14717e20.failed
+
+If we don't support a mechanism for bypassing IRQs, don't register as
+a consumer.  This eliminates meaningless dev_info()s when the connect
+fails between producer and consumer, such as on AMD systems where
+kvm_x86_ops->update_pi_irte is not implemented
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 14717e2031862d9aa2512b24a7df42cf68a977ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kvm_host.h
+diff --cc include/linux/kvm_host.h
+index fa2bee22c9da,92a0229044fb..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -1097,5 -1183,17 +1097,21 @@@ static inline void kvm_vcpu_set_dy_elig
+  {
+  }
+  #endif /* CONFIG_HAVE_KVM_CPU_RELAX_INTERCEPT */
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
++ bool kvm_arch_has_irq_bypass(void);
++ int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *,
++ 			   struct irq_bypass_producer *);
++ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *,
++ 			   struct irq_bypass_producer *);
++ void kvm_arch_irq_bypass_stop(struct irq_bypass_consumer *);
++ void kvm_arch_irq_bypass_start(struct irq_bypass_consumer *);
++ int kvm_arch_update_irqfd_routing(struct kvm *kvm, unsigned int host_irq,
++ 				  uint32_t guest_irq, bool set);
++ #endif /* CONFIG_HAVE_KVM_IRQ_BYPASS */
++ 
+++>>>>>>> 14717e203186 (kvm: Conditionally register IRQ bypass consumer)
+  #endif
+ +
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 9891381973d7..c859b5dc330e 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8507,19 +8507,21 @@ bool kvm_arch_has_noncoherent_dma(struct kvm *kvm)
+ }
+ EXPORT_SYMBOL_GPL(kvm_arch_has_noncoherent_dma);
+ 
++bool kvm_arch_has_irq_bypass(void)
++{
++	return kvm_x86_ops->update_pi_irte != NULL;
++}
++
+ int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
+ 				      struct irq_bypass_producer *prod)
+ {
+ 	struct kvm_kernel_irqfd *irqfd =
+ 		container_of(cons, struct kvm_kernel_irqfd, consumer);
+ 
+-	if (kvm_x86_ops->update_pi_irte) {
+-		irqfd->producer = prod;
+-		return kvm_x86_ops->update_pi_irte(irqfd->kvm,
+-				prod->irq, irqfd->gsi, 1);
+-	}
++	irqfd->producer = prod;
+ 
+-	return -EINVAL;
++	return kvm_x86_ops->update_pi_irte(irqfd->kvm,
++					   prod->irq, irqfd->gsi, 1);
+ }
+ 
+ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
+@@ -8529,11 +8531,6 @@ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
+ 	struct kvm_kernel_irqfd *irqfd =
+ 		container_of(cons, struct kvm_kernel_irqfd, consumer);
+ 
+-	if (!kvm_x86_ops->update_pi_irte) {
+-		WARN_ON(irqfd->producer != NULL);
+-		return;
+-	}
+-
+ 	WARN_ON(irqfd->producer != prod);
+ 	irqfd->producer = NULL;
+ 
+* Unmerged path include/linux/kvm_host.h
+diff --git a/virt/kvm/eventfd.c b/virt/kvm/eventfd.c
+index cbd035d485e6..23715cf19f52 100644
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -381,15 +381,17 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+ 	 */
+ 	fdput(f);
+ #ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
+-	irqfd->consumer.token = (void *)irqfd->eventfd;
+-	irqfd->consumer.add_producer = kvm_arch_irq_bypass_add_producer;
+-	irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
+-	irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
+-	irqfd->consumer.start = kvm_arch_irq_bypass_start;
+-	ret = irq_bypass_register_consumer(&irqfd->consumer);
+-	if (ret)
+-		pr_info("irq bypass consumer (token %p) registration fails: %d\n",
++	if (kvm_arch_has_irq_bypass()) {
++		irqfd->consumer.token = (void *)irqfd->eventfd;
++		irqfd->consumer.add_producer = kvm_arch_irq_bypass_add_producer;
++		irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
++		irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
++		irqfd->consumer.start = kvm_arch_irq_bypass_start;
++		ret = irq_bypass_register_consumer(&irqfd->consumer);
++		if (ret)
++			pr_info("irq bypass consumer (token %p) registration fails: %d\n",
+ 				irqfd->consumer.token, ret);
++	}
+ #endif
+ 
+ 	return 0;
