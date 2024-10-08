@@ -1,0 +1,119 @@
+mm/memory-failure.c: move set_migratetype_isolate() outside get_any_page()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] memory-failure: move set_migratetype_isolate() outside get_any_page() (Naoya Horiguchi) [1051704]
+Rebuild_FUZZ: 96.50%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit 03b61ff3c324e094944b663cc611a8bab252539c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/03b61ff3.failed
+
+Chen Gong pointed out that set/unset_migratetype_isolate() was done in
+different functions in mm/memory-failure.c, which makes the code less
+readable/maintainable.  So this patch does it in soft_offline_page().
+
+With this patch, we get to hold lock_memory_hotplug() longer but it's
+not a problem because races between memory hotplug and soft offline are
+very rare.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Reviewed-by: Chen, Gong <gong.chen@linux.intel.com>
+	Acked-by: Andi Kleen <ak@linux.intel.com>
+	Reviewed-by: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 03b61ff3c324e094944b663cc611a8bab252539c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory-failure.c
+diff --cc mm/memory-failure.c
+index 033d5cf75fcf,f9d78ec7831f..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -1668,3 -1599,79 +1654,82 @@@ static int __soft_offline_page(struct p
+  	}
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * soft_offline_page - Soft offline a page.
++  * @page: page to offline
++  * @flags: flags. Same as memory_failure().
++  *
++  * Returns 0 on success, otherwise negated errno.
++  *
++  * Soft offline a page, by migration or invalidation,
++  * without killing anything. This is for the case when
++  * a page is not corrupted yet (so it's still valid to access),
++  * but has had a number of corrected errors and is better taken
++  * out.
++  *
++  * The actual policy on when to do that is maintained by
++  * user space.
++  *
++  * This should never impact any application or cause data loss,
++  * however it might take some time.
++  *
++  * This is not a 100% solution for all memory, but tries to be
++  * ``good enough'' for the majority of memory.
++  */
++ int soft_offline_page(struct page *page, int flags)
++ {
++ 	int ret;
++ 	unsigned long pfn = page_to_pfn(page);
++ 	struct page *hpage = compound_trans_head(page);
++ 
++ 	if (PageHWPoison(page)) {
++ 		pr_info("soft offline: %#lx page already poisoned\n", pfn);
++ 		return -EBUSY;
++ 	}
++ 	if (!PageHuge(page) && PageTransHuge(hpage)) {
++ 		if (PageAnon(hpage) && unlikely(split_huge_page(hpage))) {
++ 			pr_info("soft offline: %#lx: failed to split THP\n",
++ 				pfn);
++ 			return -EBUSY;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * The lock_memory_hotplug prevents a race with memory hotplug.
++ 	 * This is a big hammer, a better would be nicer.
++ 	 */
++ 	lock_memory_hotplug();
++ 
++ 	/*
++ 	 * Isolate the page, so that it doesn't get reallocated if it
++ 	 * was free. This flag should be kept set until the source page
++ 	 * is freed and PG_hwpoison on it is set.
++ 	 */
++ 	if (get_pageblock_migratetype(page) != MIGRATE_ISOLATE)
++ 		set_migratetype_isolate(page, true);
++ 
++ 	ret = get_any_page(page, pfn, flags);
++ 	unlock_memory_hotplug();
++ 	if (ret > 0) { /* for in-use pages */
++ 		if (PageHuge(page))
++ 			ret = soft_offline_huge_page(page, flags);
++ 		else
++ 			ret = __soft_offline_page(page, flags);
++ 	} else if (ret == 0) { /* for free pages */
++ 		if (PageHuge(page)) {
++ 			set_page_hwpoison_huge_page(hpage);
++ 			dequeue_hwpoisoned_huge_page(hpage);
++ 			atomic_long_add(1 << compound_order(hpage),
++ 					&num_poisoned_pages);
++ 		} else {
++ 			SetPageHWPoison(page);
++ 			atomic_long_inc(&num_poisoned_pages);
++ 		}
++ 	}
++ 	unset_migratetype_isolate(page, MIGRATE_MOVABLE);
++ 	return ret;
++ }
+++>>>>>>> 03b61ff3c324 (mm/memory-failure.c: move set_migratetype_isolate() outside get_any_page())
+* Unmerged path mm/memory-failure.c
