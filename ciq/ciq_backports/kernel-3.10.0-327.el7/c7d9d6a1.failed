@@ -1,0 +1,117 @@
+tcp: undo on DSACK during recovery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Yuchung Cheng <ycheng@google.com>
+commit c7d9d6a185a7ea383b719b79c428d34ec1470275
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c7d9d6a1.failed
+
+If the receiver supports DSACK, sender can detect false recoveries and
+revert cwnd reductions triggered by either severe network reordering or
+concurrent reordering and loss event.
+
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c7d9d6a185a7ea383b719b79c428d34ec1470275)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index a5777ec6c24c,907311c9a012..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -2370,40 -2321,40 +2370,42 @@@ static bool tcp_try_undo_dsack(struct s
+  
+  	if (tp->undo_marker && !tp->undo_retrans) {
+  		DBGUNDO(sk, "D-SACK");
+ -		tcp_undo_cwnd_reduction(sk, false);
+ +		tcp_undo_cwr(sk, true);
+ +		tp->undo_marker = 0;
+  		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPDSACKUNDO);
++ 		return true;
+  	}
++ 	return false;
+  }
+  
+ -/* We can clear retrans_stamp when there are no retransmissions in the
+ - * window. It would seem that it is trivially available for us in
+ - * tp->retrans_out, however, that kind of assumptions doesn't consider
+ - * what will happen if errors occur when sending retransmission for the
+ - * second time. ...It could the that such segment has only
+ - * TCPCB_EVER_RETRANS set at the present time. It seems that checking
+ - * the head skb is enough except for some reneging corner cases that
+ - * are not worth the effort.
+ - *
+ - * Main reason for all this complexity is the fact that connection dying
+ - * time now depends on the validity of the retrans_stamp, in particular,
+ - * that successive retransmissions of a segment must not advance
+ - * retrans_stamp under any conditions.
+ - */
+ -static bool tcp_any_retrans_done(const struct sock *sk)
+ +/* Undo during fast recovery after partial ACK. */
+ +
+ +static int tcp_try_undo_partial(struct sock *sk, int acked)
+  {
+ -	const struct tcp_sock *tp = tcp_sk(sk);
+ -	struct sk_buff *skb;
+ +	struct tcp_sock *tp = tcp_sk(sk);
+ +	/* Partial ACK arrived. Force Hoe's retransmit. */
+ +	int failed = tcp_is_reno(tp) || (tcp_fackets_out(tp) > tp->reordering);
+  
+ -	if (tp->retrans_out)
+ -		return true;
+ +	if (tcp_may_undo(tp)) {
+ +		/* Plain luck! Hole if filled with delayed
+ +		 * packet, rather than with a retransmit.
+ +		 */
+ +		if (!tcp_any_retrans_done(sk))
+ +			tp->retrans_stamp = 0;
+  
+ -	skb = tcp_write_queue_head(sk);
+ -	if (unlikely(skb && TCP_SKB_CB(skb)->sacked & TCPCB_EVER_RETRANS))
+ -		return true;
+ +		tcp_update_reordering(sk, tcp_fackets_out(tp) + acked, 1);
+  
+ -	return false;
+ +		DBGUNDO(sk, "Hoe");
+ +		tcp_undo_cwr(sk, false);
+ +		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPPARTIALUNDO);
+ +
+ +		/* So... Do not make Hoe's retransmit yet.
+ +		 * If the first packet was delayed, the rest
+ +		 * ones are most probably delayed as well.
+ +		 */
+ +		failed = 0;
+ +	}
+ +	return failed;
+  }
+  
+  /* Undo during loss recovery after partial ACK or using F-RTO. */
+@@@ -2771,8 -2746,17 +2773,22 @@@ static void tcp_fastretrans_alert(struc
+  		if (!(flag & FLAG_SND_UNA_ADVANCED)) {
+  			if (tcp_is_reno(tp) && is_dupack)
+  				tcp_add_reno_sack(sk);
+++<<<<<<< HEAD
+ +		} else
+ +			do_lost = tcp_try_undo_partial(sk, acked);
+++=======
++ 		} else {
++ 			if (tcp_try_undo_partial(sk, acked, prior_unsacked))
++ 				return;
++ 			/* Partial ACK arrived. Force fast retransmit. */
++ 			do_lost = tcp_is_reno(tp) ||
++ 				  tcp_fackets_out(tp) > tp->reordering;
++ 		}
++ 		if (tcp_try_undo_dsack(sk)) {
++ 			tcp_try_keep_open(sk);
++ 			return;
++ 		}
+++>>>>>>> c7d9d6a185a7 (tcp: undo on DSACK during recovery)
+  		break;
+  	case TCP_CA_Loss:
+  		tcp_process_loss(sk, flag, is_dupack);
+* Unmerged path net/ipv4/tcp_input.c
