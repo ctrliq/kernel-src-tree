@@ -1,0 +1,241 @@
+ACPI / hotplug / PCI: Fix NULL pointer dereference in cleanup_bridge()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Fix NULL pointer dereference in cleanup_bridge() (Myron Stowe) [1114228]
+Rebuild_FUZZ: 93.13%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 1aaac07112f04068d7e2fc47bb435cfd4f9d5468
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1aaac071.failed
+
+After commit bbd34fc (ACPI / hotplug / PCI: Register all devices
+under the given bridge) register_slot() is called for all PCI
+devices under a given bridge that have corresponding objects in
+the ACPI namespace, but it calls acpiphp_register_hotplug_slot()
+only for devices satisfying specific criteria.  Still,
+cleanup_bridge() calls acpiphp_unregister_hotplug_slot() for all
+objects created by register_slot(), although it should only call it
+for the ones that acpiphp_register_hotplug_slot() has been called
+for (successfully).  This causes a NULL pointer to be dereferenced
+by the acpiphp_unregister_hotplug_slot() executed by cleanup_bridge()
+if the object it is called for has not been passed to
+acpiphp_register_hotplug_slot().
+
+To fix this problem, check if the 'slot' field of the object passed
+to acpiphp_unregister_hotplug_slot() in cleanup_bridge() is not NULL,
+which only is the case if acpiphp_register_hotplug_slot() has been
+executed for that object.  In addition to that, make register_slot()
+reset the 'slot' field to NULL if acpiphp_register_hotplug_slot() has
+failed for the given object to prevent stale pointers from being
+used by acpiphp_unregister_hotplug_slot().
+
+Reported-and-tested-by: Yinghai Lu <yinghai@kernel.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1aaac07112f04068d7e2fc47bb435cfd4f9d5468)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index d210006fa4ad,8054ddcdaed0..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -221,86 -286,75 +221,128 @@@ register_slot(acpi_handle handle, u32 l
+  	device = (adr >> 16) & 0xffff;
+  	function = adr & 0xffff;
+  
+ -	mutex_lock(&acpiphp_context_lock);
+ -	context = acpiphp_init_context(handle);
+ -	if (!context) {
+ -		mutex_unlock(&acpiphp_context_lock);
+ -		acpi_handle_err(handle, "No hotplug context\n");
+ -		return AE_NOT_EXIST;
+ -	}
+ -	newfunc = &context->func;
+ +	pdev = bridge->pci_dev;
+ +	if (pdev && device_is_managed_by_native_pciehp(pdev))
+ +		return AE_OK;
+ +
+ +	newfunc = kzalloc(sizeof(struct acpiphp_func), GFP_KERNEL);
+ +	if (!newfunc)
+ +		return AE_NO_MEMORY;
+ +
+ +	newfunc->handle = handle;
+  	newfunc->function = function;
+ -	newfunc->parent = bridge;
+ -	mutex_unlock(&acpiphp_context_lock);
+  
+ -	if (acpi_has_method(handle, "_EJ0"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_EJ0", &tmp)))
+  		newfunc->flags = FUNC_HAS_EJ0;
+  
+ -	if (acpi_has_method(handle, "_STA"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_STA", &tmp)))
+  		newfunc->flags |= FUNC_HAS_STA;
+  
+ -	if (acpi_has_method(handle, "_DCK"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS0", &tmp)))
+ +		newfunc->flags |= FUNC_HAS_PS0;
+ +
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS3", &tmp)))
+ +		newfunc->flags |= FUNC_HAS_PS3;
+ +
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_DCK", &tmp)))
+  		newfunc->flags |= FUNC_HAS_DCK;
+  
+ +	status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ +	if (ACPI_FAILURE(status)) {
+ +		/*
+ +		 * use the count of the number of slots we've found
+ +		 * for the number of the slot
+ +		 */
+ +		sun = bridge->nr_slots+1;
+ +	}
+ +
+  	/* search for objects that share the same slot */
+  	list_for_each_entry(slot, &bridge->slots, node)
+++<<<<<<< HEAD
+ +		if (slot->device == device) {
+ +			if (slot->sun != sun)
+ +				pr_warn("sibling found, but _SUN doesn't match!\n");
+ +			found = 1;
+ +			break;
+ +		}
+ +
+ +	if (!found) {
+ +		slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ +		if (!slot) {
+ +			kfree(newfunc);
+ +			return AE_NO_MEMORY;
+ +		}
+ +
+ +		slot->bridge = bridge;
+ +		slot->device = device;
+ +		slot->sun = sun;
+ +		INIT_LIST_HEAD(&slot->funcs);
+ +		mutex_init(&slot->crit_sect);
+ +
+ +		mutex_lock(&bridge_mutex);
+ +		list_add_tail(&slot->node, &bridge->slots);
+ +		mutex_unlock(&bridge_mutex);
+ +		bridge->nr_slots++;
+ +
+ +		pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ +		    slot->sun, pci_domain_nr(pbus), pbus->number, device);
+ +		retval = acpiphp_register_hotplug_slot(slot);
+ +		if (retval) {
+ +			if (retval == -EBUSY)
+ +				pr_warn("Slot %llu already registered by another "
+ +					"hotplug driver\n", slot->sun);
+ +			else
+ +				pr_warn("acpiphp_register_hotplug_slot failed "
+ +					"(err code = 0x%x)\n", retval);
+ +			goto err_exit;
+++=======
++ 		if (slot->device == device)
++ 			goto slot_found;
++ 
++ 	slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
++ 	if (!slot) {
++ 		status = AE_NO_MEMORY;
++ 		goto err;
++ 	}
++ 
++ 	slot->bus = bridge->pci_bus;
++ 	slot->device = device;
++ 	INIT_LIST_HEAD(&slot->funcs);
++ 	mutex_init(&slot->crit_sect);
++ 
++ 	list_add_tail(&slot->node, &bridge->slots);
++ 
++ 	/* Register slots for ejectable funtions only. */
++ 	if (acpi_pci_check_ejectable(pbus, handle)  || is_dock_device(handle)) {
++ 		unsigned long long sun;
++ 		int retval;
++ 
++ 		bridge->nr_slots++;
++ 		status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
++ 		if (ACPI_FAILURE(status))
++ 			sun = bridge->nr_slots;
++ 
++ 		dbg("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
++ 		    sun, pci_domain_nr(pbus), pbus->number, device);
++ 
++ 		retval = acpiphp_register_hotplug_slot(slot, sun);
++ 		if (retval) {
++ 			slot->slot = NULL;
++ 			bridge->nr_slots--;
++ 			if (retval == -EBUSY)
++ 				warn("Slot %llu already registered by another "
++ 					"hotplug driver\n", sun);
++ 			else
++ 				warn("acpiphp_register_hotplug_slot failed "
++ 					"(err code = 0x%x)\n", retval);
+++>>>>>>> 1aaac07112f0 (ACPI / hotplug / PCI: Fix NULL pointer dereference in cleanup_bridge())
+  		}
+ -		/* Even if the slot registration fails, we can still use it. */
+  	}
+  
+ - slot_found:
+  	newfunc->slot = slot;
+ +	mutex_lock(&bridge_mutex);
+  	list_add_tail(&newfunc->sibling, &slot->funcs);
+ +	mutex_unlock(&bridge_mutex);
+  
+  	if (pci_bus_read_dev_vendor_id(pbus, PCI_DEVFN(device, function),
+  				       &val, 60*1000))
+@@@ -452,40 -414,24 +494,41 @@@ static void cleanup_bridge(struct acpip
+  	struct acpiphp_slot *slot;
+  	struct acpiphp_func *func;
+  	acpi_status status;
+ +	acpi_handle handle = bridge->handle;
+  
+ -	list_for_each_entry(slot, &bridge->slots, node) {
+ -		list_for_each_entry(func, &slot->funcs, sibling) {
+ -			acpi_handle handle = func_to_handle(func);
+ +	if (!pci_is_root_bus(bridge->pci_bus)) {
+ +		status = acpi_remove_notify_handler(handle,
+ +					    ACPI_SYSTEM_NOTIFY,
+ +					    handle_hotplug_event_bridge);
+ +		if (ACPI_FAILURE(status))
+ +			pr_err("failed to remove notify handler\n");
+ +	}
+  
+ -			if (is_dock_device(handle))
+ -				unregister_hotplug_dock_device(handle);
+ +	if ((bridge->flags & BRIDGE_HAS_EJ0) && bridge->func) {
+ +		status = acpi_install_notify_handler(bridge->func->handle,
+ +						ACPI_SYSTEM_NOTIFY,
+ +						handle_hotplug_event_func,
+ +						bridge->func);
+ +		if (ACPI_FAILURE(status))
+ +			pr_err("failed to install interrupt notify handler\n");
+ +	}
+  
+ +	list_for_each_entry(slot, &bridge->slots, node) {
+ +		list_for_each_entry(func, &slot->funcs, sibling) {
+ +			if (is_dock_device(func->handle)) {
+ +				unregister_hotplug_dock_device(func->handle);
+ +				unregister_dock_notifier(&func->nb);
+ +			}
+  			if (!(func->flags & FUNC_HAS_DCK)) {
+ -				status = acpi_remove_notify_handler(handle,
+ -							ACPI_SYSTEM_NOTIFY,
+ -							handle_hotplug_event);
+ +				status = acpi_remove_notify_handler(func->handle,
+ +						ACPI_SYSTEM_NOTIFY,
+ +						handle_hotplug_event_func);
+  				if (ACPI_FAILURE(status))
+ -					err("failed to remove notify handler\n");
+ +					pr_err("failed to remove notify handler\n");
+  			}
+  		}
+- 		acpiphp_unregister_hotplug_slot(slot);
++ 		if (slot->slot)
++ 			acpiphp_unregister_hotplug_slot(slot);
+  	}
+  
+  	mutex_lock(&bridge_mutex);
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
