@@ -39,7 +39,6 @@ struct virtrng_info {
 	bool hwrng_register_done;
 };
 
-
 static void random_recv_done(struct virtqueue *vq)
 {
 	struct virtrng_info *vi = vq->vdev->priv;
