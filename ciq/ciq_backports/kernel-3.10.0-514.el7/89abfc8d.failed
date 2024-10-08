@@ -1,0 +1,99 @@
+staging/rdma/hfi1: Change send_schedule counter to a per cpu counter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Change send_schedule counter to a per cpu counter (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 93.75%
+commit-author Vennila Megavannan <vennila.megavannan@intel.com>
+commit 89abfc8d64dd1ad32e6d96404eb0a1ea6cbb4ca4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/89abfc8d.failed
+
+A patch to fix fairness issues in QP scheduling requires
+n_send_schedule counter to be converted to a per cpu counter to reduce
+cache misses.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Vennila Megavannan <vennila.megavannan@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 89abfc8d64dd1ad32e6d96404eb0a1ea6cbb4ca4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/init.c
+#	drivers/staging/rdma/hfi1/verbs.h
+diff --cc drivers/staging/hfi1/init.c
+index a3dd5b341034,6ddf3c8bcc2e..000000000000
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@@ -987,7 -984,9 +987,13 @@@ void hfi1_free_devdata(struct hfi1_devd
+  	rcu_barrier(); /* wait for rcu callbacks to complete */
+  	free_percpu(dd->int_counter);
+  	free_percpu(dd->rcv_limit);
+++<<<<<<< HEAD:drivers/staging/hfi1/init.c
+ +	ib_dealloc_device(&dd->verbs_dev.ibdev);
+++=======
++ 	hfi1_dev_affinity_free(dd);
++ 	free_percpu(dd->send_schedule);
++ 	ib_dealloc_device(&dd->verbs_dev.rdi.ibdev);
+++>>>>>>> 89abfc8d64dd (staging/rdma/hfi1: Change send_schedule counter to a per cpu counter):drivers/staging/rdma/hfi1/init.c
+  }
+  
+  /*
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
+diff --git a/drivers/staging/hfi1/chip.c b/drivers/staging/hfi1/chip.c
+index 10123147fb89..08ff22924555 100644
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@ -1606,7 +1606,8 @@ static u64 access_sw_send_schedule(const struct cntr_entry *entry,
+ {
+ 	struct hfi1_devdata *dd = (struct hfi1_devdata *)context;
+ 
+-	return dd->verbs_dev.n_send_schedule;
++	return read_write_cpu(dd, &dd->z_send_schedule, dd->send_schedule, vl,
++			      mode, data);
+ }
+ 
+ /* Software counters for the error status bits within MISC_ERR_STATUS */
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index 8c6839cc9104..807f5d590f52 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -889,10 +889,11 @@ struct hfi1_devdata {
+ 	/* reset value */
+ 	u64 z_int_counter;
+ 	u64 z_rcv_limit;
++	u64 z_send_schedule;
+ 	/* percpu int_counter */
+ 	u64 __percpu *int_counter;
+ 	u64 __percpu *rcv_limit;
+-
++	u64 __percpu *send_schedule;
+ 	/* number of receive contexts in use by the driver */
+ 	u32 num_rcv_contexts;
+ 	/* number of pio send contexts in use by the driver */
+@@ -1861,6 +1862,7 @@ static inline void hfi1_reset_cpu_counters(struct hfi1_devdata *dd)
+ 
+ 	dd->z_int_counter = get_all_cpu_total(dd->int_counter);
+ 	dd->z_rcv_limit = get_all_cpu_total(dd->rcv_limit);
++	dd->z_send_schedule = get_all_cpu_total(dd->send_schedule);
+ 
+ 	ppd = (struct hfi1_pportdata *)(dd + 1);
+ 	for (i = 0; i < dd->num_pports; i++, ppd++) {
+* Unmerged path drivers/staging/hfi1/init.c
+diff --git a/drivers/staging/hfi1/ruc.c b/drivers/staging/hfi1/ruc.c
+index c4280b6f47d4..ea575bb19341 100644
+--- a/drivers/staging/hfi1/ruc.c
++++ b/drivers/staging/hfi1/ruc.c
+@@ -867,7 +867,7 @@ void hfi1_do_send(struct work_struct *work)
+ 		/* allow other tasks to run */
+ 		if (unlikely(time_after(jiffies, timeout))) {
+ 			cond_resched();
+-			ps.ppd->dd->verbs_dev.n_send_schedule++;
++			this_cpu_inc(*ps.ppd->dd->send_schedule);
+ 			timeout = jiffies + SEND_RESCHED_TIMEOUT;
+ 		}
+ 	} while (make_req(qp));
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
