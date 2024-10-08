@@ -1,0 +1,105 @@
+xprtrdma: Don't post a LOCAL_INV in rpcrdma_register_frmr_external()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 440ddad51b821a8ab9099addcc29d4d18d02f6ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/440ddad5.failed
+
+Any FRMR arriving in rpcrdma_register_frmr_external() is now
+guaranteed to be either invalid, or to be targeted by a queued
+LOCAL_INV that will invalidate it before the adapter processes
+the FAST_REG_MR being built here.
+
+The problem with current arrangement of chaining a LOCAL_INV to the
+FAST_REG_MR is that if the transport is not connected, the LOCAL_INV
+is flushed and the FAST_REG_MR is flushed. This leaves the FRMR
+valid with the old rkey. But rpcrdma_register_frmr_external() has
+already bumped the in-memory rkey.
+
+Next time through rpcrdma_register_frmr_external(), a LOCAL_INV and
+FAST_REG_MR is attempted again because the FRMR is still valid. But
+the rkey no longer matches the hardware's rkey, and a memory
+management operation error occurs.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Tested-by: Shirley Ma <shirley.ma@oracle.com>
+	Tested-by: Devesh Sharma <devesh.sharma@emulex.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 440ddad51b821a8ab9099addcc29d4d18d02f6ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 499e0d7e7773,7459b867d7d6..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1509,8 -1692,10 +1509,15 @@@ rpcrdma_register_frmr_external(struct r
+  			struct rpcrdma_xprt *r_xprt)
+  {
+  	struct rpcrdma_mr_seg *seg1 = seg;
+++<<<<<<< HEAD
+ +	struct ib_send_wr invalidate_wr, frmr_wr, *bad_wr, *post_wr;
+ +
+++=======
++ 	struct rpcrdma_mw *mw = seg1->mr_chunk.rl_mw;
++ 	struct rpcrdma_frmr *frmr = &mw->r.frmr;
++ 	struct ib_mr *mr = frmr->fr_mr;
++ 	struct ib_send_wr frmr_wr, *bad_wr;
+++>>>>>>> 440ddad51b82 (xprtrdma: Don't post a LOCAL_INV in rpcrdma_register_frmr_external())
+  	u8 key;
+  	int len, pageoff;
+  	int i, rc;
+@@@ -1541,28 -1725,10 +1548,31 @@@
+  			break;
+  	}
+  	dprintk("RPC:       %s: Using frmr %p to map %d segments\n",
+ -		__func__, mw, i);
+ +		__func__, seg1->mr_chunk.rl_mw, i);
+  
+++<<<<<<< HEAD
+ +	if (unlikely(seg1->mr_chunk.rl_mw->r.frmr.state == FRMR_IS_VALID)) {
+ +		dprintk("RPC:       %s: frmr %x left valid, posting invalidate.\n",
+ +			__func__,
+ +			seg1->mr_chunk.rl_mw->r.frmr.fr_mr->rkey);
+ +		/* Invalidate before using. */
+ +		memset(&invalidate_wr, 0, sizeof invalidate_wr);
+ +		invalidate_wr.wr_id = (unsigned long)(void *)seg1->mr_chunk.rl_mw;
+ +		invalidate_wr.next = &frmr_wr;
+ +		invalidate_wr.opcode = IB_WR_LOCAL_INV;
+ +		invalidate_wr.send_flags = IB_SEND_SIGNALED;
+ +		invalidate_wr.ex.invalidate_rkey =
+ +			seg1->mr_chunk.rl_mw->r.frmr.fr_mr->rkey;
+ +		DECR_CQCOUNT(&r_xprt->rx_ep);
+ +		post_wr = &invalidate_wr;
+ +	} else
+ +		post_wr = &frmr_wr;
+ +
+ +	/* Prepare FRMR WR */
+++=======
+++>>>>>>> 440ddad51b82 (xprtrdma: Don't post a LOCAL_INV in rpcrdma_register_frmr_external())
+  	memset(&frmr_wr, 0, sizeof frmr_wr);
+ -	frmr_wr.wr_id = (unsigned long)(void *)mw;
+ +	frmr_wr.wr_id = (unsigned long)(void *)seg1->mr_chunk.rl_mw;
+  	frmr_wr.opcode = IB_WR_FAST_REG_MR;
+  	frmr_wr.send_flags = IB_SEND_SIGNALED;
+  	frmr_wr.wr.fast_reg.iova_start = seg1->mr_dma;
+@@@ -1582,11 -1748,10 +1592,10 @@@
+  	frmr_wr.wr.fast_reg.access_flags = (writing ?
+  				IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE :
+  				IB_ACCESS_REMOTE_READ);
+ -	frmr_wr.wr.fast_reg.rkey = mr->rkey;
+ +	frmr_wr.wr.fast_reg.rkey = seg1->mr_chunk.rl_mw->r.frmr.fr_mr->rkey;
+  	DECR_CQCOUNT(&r_xprt->rx_ep);
+  
+- 	rc = ib_post_send(ia->ri_id->qp, post_wr, &bad_wr);
+- 
++ 	rc = ib_post_send(ia->ri_id->qp, &frmr_wr, &bad_wr);
+  	if (rc) {
+  		dprintk("RPC:       %s: failed ib_post_send for register,"
+  			" status %i\n", __func__, rc);
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
