@@ -26,6 +26,7 @@
 
 #include <linux/prefetch.h>
 #include "i40e.h"
+#include "i40e_prototype.h"
 
 static inline __le64 build_ctob(u32 td_cmd, u32 td_offset, unsigned int size,
 				u32 td_tag)
@@ -1248,6 +1249,29 @@ static inline u32 i40e_rx_hash(struct i40e_ring *ring,
 }
 
 /**
+ * i40e_ptype_to_hash - get a hash type
+ * @ptype: the ptype value from the descriptor
+ *
+ * Returns a hash type to be used by skb_set_hash
+ **/
+static inline enum pkt_hash_types i40e_ptype_to_hash(u8 ptype)
+{
+	struct i40e_rx_ptype_decoded decoded = decode_rx_desc_ptype(ptype);
+
+	if (!decoded.known)
+		return PKT_HASH_TYPE_NONE;
+
+	if (decoded.outer_ip == I40E_RX_PTYPE_OUTER_IP &&
+	    decoded.payload_layer == I40E_RX_PTYPE_PAYLOAD_LAYER_PAY4)
+		return PKT_HASH_TYPE_L4;
+	else if (decoded.outer_ip == I40E_RX_PTYPE_OUTER_IP &&
+		 decoded.payload_layer == I40E_RX_PTYPE_PAYLOAD_LAYER_PAY3)
+		return PKT_HASH_TYPE_L3;
+	else
+		return PKT_HASH_TYPE_L2;
+}
+
+/**
  * i40e_clean_rx_irq - Reclaim resources after receive completes
  * @rx_ring:  rx ring to clean
  * @budget:   how many cleans we're allowed
@@ -1264,8 +1288,8 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 	u16 i = rx_ring->next_to_clean;
 	union i40e_rx_desc *rx_desc;
 	u32 rx_error, rx_status;
+	u8 rx_ptype;
 	u64 qword;
-	u16 rx_ptype;
 
 	if (budget <= 0)
 		return 0;
@@ -1382,7 +1406,8 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 			goto next_desc;
 		}
 
-		skb->rxhash = i40e_rx_hash(rx_ring, rx_desc);
+		skb_set_hash(skb, i40e_rx_hash(rx_ring, rx_desc),
+			     i40e_ptype_to_hash(rx_ptype));
 		if (unlikely(rx_status & I40E_RXD_QW1_STATUS_TSYNVALID_MASK)) {
 			i40e_ptp_rx_hwtstamp(vsi->back, skb, (rx_status &
 					   I40E_RXD_QW1_STATUS_TSYNINDX_MASK) >>
