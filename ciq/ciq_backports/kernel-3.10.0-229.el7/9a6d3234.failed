@@ -1,0 +1,259 @@
+IB/iser: Replace connection waitqueue with completion object
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [infiniband] iser: Replace connection waitqueue with completion object (Amir Vadai) [1107622]
+Rebuild_FUZZ: 97.44%
+commit-author Ariel Nahum <arieln@mellanox.com>
+commit 9a6d3234a192d4a3a51df1042c13af13f996242a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9a6d3234.failed
+
+Instead of waiting for events and condition changes of the iser
+connection state, we wait for explicit completion of connection
+establishment and teardown.
+
+Separate connection establishment wait object from the teardown object
+to avoid a situation where racing connection establishment and
+teardown may concurrently wakeup each other.
+
+ep_poll will wait for up_completion invoked by
+iser_connected_handler() and iser release worker will wait for
+flush_completion before releasing the connection.
+
+Bound the completion wait with a 30 seconds timeout for cases where
+iscsid (the user space iscsi daemon) is too slow or gone.
+
+	Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 9a6d3234a192d4a3a51df1042c13af13f996242a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.c
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.c
+index ed0eb50fd5e9,61ee91d88380..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@@ -634,15 -627,16 +634,13 @@@ iscsi_iser_ep_poll(struct iscsi_endpoin
+  	int rc;
+  
+  	ib_conn = ep->dd_data;
+- 	rc = wait_event_interruptible_timeout(ib_conn->wait,
+- 			     ib_conn->state == ISER_CONN_UP,
+- 			     msecs_to_jiffies(timeout_ms));
+- 
++ 	rc = wait_for_completion_interruptible_timeout(&ib_conn->up_completion,
++ 						       msecs_to_jiffies(timeout_ms));
+  	/* if conn establishment failed, return error code to iscsi */
+ -	if (rc == 0) {
+ -		mutex_lock(&ib_conn->state_mutex);
+ -		if (ib_conn->state == ISER_CONN_TERMINATING ||
+ -		    ib_conn->state == ISER_CONN_DOWN)
+ -			rc = -1;
+ -		mutex_unlock(&ib_conn->state_mutex);
+ -	}
+ +	if (!rc &&
+ +	    (ib_conn->state == ISER_CONN_TERMINATING ||
+ +	     ib_conn->state == ISER_CONN_DOWN))
+ +		rc = -1;
+  
+  	iser_info("ib conn %p rc = %d\n", ib_conn, rc);
+  
+@@@ -660,19 -654,26 +658,38 @@@ iscsi_iser_ep_disconnect(struct iscsi_e
+  	struct iser_conn *ib_conn;
+  
+  	ib_conn = ep->dd_data;
+ -	iser_info("ep %p ib conn %p state %d\n", ep, ib_conn, ib_conn->state);
+ -	mutex_lock(&ib_conn->state_mutex);
+ +	if (ib_conn->iser_conn)
+ +		/*
+ +		 * Must suspend xmit path if the ep is bound to the
+ +		 * iscsi_conn, so we know we are not accessing the ib_conn
+ +		 * when we free it.
+ +		 *
+ +		 * This may not be bound if the ep poll failed.
+ +		 */
+ +		iscsi_suspend_tx(ib_conn->iser_conn->iscsi_conn);
+ +
+++<<<<<<< HEAD
+ +
+ +	iser_info("ib conn %p state %d\n", ib_conn, ib_conn->state);
+  	iser_conn_terminate(ib_conn);
+ -
+++=======
++ 	/*
++ 	 * if iser_conn and iscsi_conn are bound, we must wait for
++ 	 * iscsi_conn_stop and flush errors completion before freeing
++ 	 * the iser resources. Otherwise we are safe to free resources
++ 	 * immediately.
++ 	 */
++ 	if (ib_conn->iscsi_conn) {
++ 		INIT_WORK(&ib_conn->release_work, iser_release_work);
++ 		queue_work(release_wq, &ib_conn->release_work);
++ 		mutex_unlock(&ib_conn->state_mutex);
++ 	} else {
++ 		ib_conn->state = ISER_CONN_DOWN;
++ 		mutex_unlock(&ib_conn->state_mutex);
++ 		iser_conn_release(ib_conn);
++ 	}
++ 	iscsi_destroy_endpoint(ep);
+++>>>>>>> 9a6d3234a192 (IB/iser: Replace connection waitqueue with completion object)
+  }
+  
+  static umode_t iser_attr_is_visible(int param_type, int param)
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index 4067841520c9,c877dad381cb..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -334,6 -332,11 +333,14 @@@ struct iser_conn 
+  	int                          post_recv_buf_count; /* posted rx count  */
+  	atomic_t                     post_send_buf_count; /* posted tx count   */
+  	char 			     name[ISER_OBJECT_NAME_SIZE];
+++<<<<<<< HEAD
+++=======
++ 	struct work_struct	     release_work;
++ 	struct completion	     stop_completion;
++ 	struct mutex		     state_mutex;
++ 	struct completion	     flush_completion;
++ 	struct completion	     up_completion;
+++>>>>>>> 9a6d3234a192 (IB/iser: Replace connection waitqueue with completion object)
+  	struct list_head	     conn_list;       /* entry in ig conn list */
+  
+  	char  			     *login_buf;
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 51c7dac6fc0a,06a49b3df3fd..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -578,6 -579,30 +578,33 @@@ static int iser_conn_state_comp_exch(st
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void iser_release_work(struct work_struct *work)
++ {
++ 	struct iser_conn *ib_conn;
++ 	int rc;
++ 
++ 	ib_conn = container_of(work, struct iser_conn, release_work);
++ 
++ 	/* wait for .conn_stop callback */
++ 	rc = wait_for_completion_timeout(&ib_conn->stop_completion, 30 * HZ);
++ 	WARN_ON(rc == 0);
++ 
++ 	/* wait for the qp`s post send and post receive buffers to empty */
++ 	rc = wait_for_completion_timeout(&ib_conn->flush_completion, 30 * HZ);
++ 	WARN_ON(rc == 0);
++ 
++ 	ib_conn->state = ISER_CONN_DOWN;
++ 
++ 	mutex_lock(&ib_conn->state_mutex);
++ 	ib_conn->state = ISER_CONN_DOWN;
++ 	mutex_unlock(&ib_conn->state_mutex);
++ 
++ 	iser_conn_release(ib_conn);
++ }
++ 
+++>>>>>>> 9a6d3234a192 (IB/iser: Replace connection waitqueue with completion object)
+  /**
+   * Frees all conn objects and deallocs conn descriptor
+   */
+@@@ -635,24 -650,23 +662,26 @@@ void iser_conn_terminate(struct iser_co
+  	if (err)
+  		iser_err("Failed to disconnect, conn: 0x%p err %d\n",
+  			 ib_conn,err);
+ +
+ +	wait_event_interruptible(ib_conn->wait,
+ +				 ib_conn->state == ISER_CONN_DOWN);
+ +
+ +	iser_conn_put(ib_conn, 1); /* deref ib conn deallocate */
+  }
+  
+ -/**
+ - * Called with state mutex held
+ - **/
+ -static void iser_connect_error(struct rdma_cm_id *cma_id)
+ +static int iser_connect_error(struct rdma_cm_id *cma_id)
+  {
+  	struct iser_conn *ib_conn;
+ -
+  	ib_conn = (struct iser_conn *)cma_id->context;
+- 
+  	ib_conn->state = ISER_CONN_DOWN;
+++<<<<<<< HEAD
+ +	wake_up_interruptible(&ib_conn->wait);
+ +	return iser_conn_put(ib_conn, 0); /* deref ib conn's cma id */
+++=======
+++>>>>>>> 9a6d3234a192 (IB/iser: Replace connection waitqueue with completion object)
+  }
+  
+ -/**
+ - * Called with state mutex held
+ - **/
+ -static void iser_addr_handler(struct rdma_cm_id *cma_id)
+ +static int iser_addr_handler(struct rdma_cm_id *cma_id)
+  {
+  	struct iser_device *device;
+  	struct iser_conn   *ib_conn;
+@@@ -733,15 -758,18 +762,14 @@@ static void iser_connected_handler(stru
+  	(void)ib_query_qp(cma_id->qp, &attr, ~0, &init_attr);
+  	iser_info("remote qpn:%x my qpn:%x\n", attr.dest_qp_num, cma_id->qp->qp_num);
+  
+- 	ib_conn = (struct iser_conn *)cma_id->context;
+- 	if (iser_conn_state_comp_exch(ib_conn, ISER_CONN_PENDING, ISER_CONN_UP))
+- 		wake_up_interruptible(&ib_conn->wait);
++ 	ib_conn->state = ISER_CONN_UP;
++ 	complete(&ib_conn->up_completion);
+  }
+  
+ -static void iser_disconnected_handler(struct rdma_cm_id *cma_id)
+ +static int iser_disconnected_handler(struct rdma_cm_id *cma_id)
+  {
+  	struct iser_conn *ib_conn;
+ +	int ret;
+  
+  	ib_conn = (struct iser_conn *)cma_id->context;
+  
+@@@ -759,12 -786,8 +787,11 @@@
+  	/* Complete the termination process if no posts are pending */
+  	if (ib_conn->post_recv_buf_count == 0 &&
+  	    (atomic_read(&ib_conn->post_send_buf_count) == 0)) {
+- 		ib_conn->state = ISER_CONN_DOWN;
+- 		wake_up_interruptible(&ib_conn->wait);
++ 		complete(&ib_conn->flush_completion);
+  	}
+ +
+ +	ret = iser_conn_put(ib_conn, 0); /* deref ib conn's cma id */
+ +	return ret;
+  }
+  
+  static int iser_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+@@@ -806,12 -833,14 +833,17 @@@
+  void iser_conn_init(struct iser_conn *ib_conn)
+  {
+  	ib_conn->state = ISER_CONN_INIT;
+- 	init_waitqueue_head(&ib_conn->wait);
+  	ib_conn->post_recv_buf_count = 0;
+  	atomic_set(&ib_conn->post_send_buf_count, 0);
+++<<<<<<< HEAD
+ +	atomic_set(&ib_conn->refcount, 1); /* ref ib conn allocation */
+++=======
++ 	init_completion(&ib_conn->stop_completion);
++ 	init_completion(&ib_conn->flush_completion);
++ 	init_completion(&ib_conn->up_completion);
+++>>>>>>> 9a6d3234a192 (IB/iser: Replace connection waitqueue with completion object)
+  	INIT_LIST_HEAD(&ib_conn->conn_list);
+  	spin_lock_init(&ib_conn->lock);
+ -	mutex_init(&ib_conn->state_mutex);
+  }
+  
+   /**
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.c
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
