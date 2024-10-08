@@ -1,0 +1,471 @@
+IB/core: Add netdev and gid attributes paramteres to cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matan Barak <matanb@mellanox.com>
+commit 55ee3ab2e49a9ead850722ef47698243dd226d16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/55ee3ab2.failed
+
+Adding an ability to query the IB cache by a netdev and get the
+attributes of a GID. These parameters are necessary in order to
+successfully resolve the required GID (when the netdevice is known)
+and get the Ethernet L2 attributes from a GID.
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+Reviewed-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 55ee3ab2e49a9ead850722ef47698243dd226d16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx4/main.c
+diff --cc drivers/infiniband/hw/mlx4/main.c
+index 6c176c7cae81,f63d5427bfc0..000000000000
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@@ -763,10 -745,24 +763,27 @@@ static int iboe_query_gid(struct ib_dev
+  static int mlx4_ib_query_gid(struct ib_device *ibdev, u8 port, int index,
+  			     union ib_gid *gid)
+  {
+ -	int ret;
+ -
+ -	if (rdma_protocol_ib(ibdev, port))
+ +	if (rdma_port_get_link_layer(ibdev, port) == IB_LINK_LAYER_INFINIBAND)
+  		return __mlx4_ib_query_gid(ibdev, port, index, gid, 0);
+++<<<<<<< HEAD
+ +	else
+ +		return iboe_query_gid(ibdev, port, index, gid);
+++=======
++ 
++ 	if (!rdma_protocol_roce(ibdev, port))
++ 		return -ENODEV;
++ 
++ 	if (!rdma_cap_roce_gid_table(ibdev, port))
++ 		return -ENODEV;
++ 
++ 	ret = ib_get_cached_gid(ibdev, port, index, gid, NULL);
++ 	if (ret == -EAGAIN) {
++ 		memcpy(gid, &zgid, sizeof(*gid));
++ 		return 0;
++ 	}
++ 
++ 	return ret;
+++>>>>>>> 55ee3ab2e49a (IB/core: Add netdev and gid attributes paramteres to cache)
+  }
+  
+  int __mlx4_ib_query_pkey(struct ib_device *ibdev, u8 port, u16 index,
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index 87471ef37198..5c054072ef20 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -649,21 +649,23 @@ static int gid_table_setup_one(struct ib_device *ib_dev)
+ int ib_get_cached_gid(struct ib_device *device,
+ 		      u8                port_num,
+ 		      int               index,
+-		      union ib_gid     *gid)
++		      union ib_gid     *gid,
++		      struct ib_gid_attr *gid_attr)
+ {
+ 	if (port_num < rdma_start_port(device) || port_num > rdma_end_port(device))
+ 		return -EINVAL;
+ 
+-	return __ib_cache_gid_get(device, port_num, index, gid, NULL);
++	return __ib_cache_gid_get(device, port_num, index, gid, gid_attr);
+ }
+ EXPORT_SYMBOL(ib_get_cached_gid);
+ 
+ int ib_find_cached_gid(struct ib_device *device,
+ 		       const union ib_gid *gid,
++		       struct net_device *ndev,
+ 		       u8               *port_num,
+ 		       u16              *index)
+ {
+-	return ib_cache_gid_find(device, gid, NULL, port_num, index);
++	return ib_cache_gid_find(device, gid, ndev, port_num, index);
+ }
+ EXPORT_SYMBOL(ib_find_cached_gid);
+ 
+@@ -845,7 +847,7 @@ static void ib_cache_update(struct ib_device *device,
+ 	if (!use_roce_gid_table) {
+ 		for (i = 0;  i < gid_cache->table_len; ++i) {
+ 			ret = ib_query_gid(device, port, i,
+-					   gid_cache->table + i);
++					   gid_cache->table + i, NULL);
+ 			if (ret) {
+ 				printk(KERN_WARNING "ib_query_gid failed (%d) for %s (index %d)\n",
+ 				       ret, device->name, i);
+diff --git a/drivers/infiniband/core/cm.c b/drivers/infiniband/core/cm.c
+index 4f918b929eca..2d8a0e4c42d6 100644
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -365,7 +365,7 @@ static int cm_init_av_by_path(struct ib_sa_path_rec *path, struct cm_av *av)
+ 	read_lock_irqsave(&cm.device_lock, flags);
+ 	list_for_each_entry(cm_dev, &cm.device_list, list) {
+ 		if (!ib_find_cached_gid(cm_dev->ib_device, &path->sgid,
+-					&p, NULL)) {
++					NULL, &p, NULL)) {
+ 			port = cm_dev->port[p-1];
+ 			break;
+ 		}
+@@ -1643,7 +1643,8 @@ static int cm_req_handler(struct cm_work *work)
+ 	ret = cm_init_av_by_path(&work->path[0], &cm_id_priv->av);
+ 	if (ret) {
+ 		ib_get_cached_gid(work->port->cm_dev->ib_device,
+-				  work->port->port_num, 0, &work->path[0].sgid);
++				  work->port->port_num, 0, &work->path[0].sgid,
++				  NULL);
+ 		ib_send_cm_rej(cm_id, IB_CM_REJ_INVALID_GID,
+ 			       &work->path[0].sgid, sizeof work->path[0].sgid,
+ 			       NULL, 0);
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index 685c1992d48f..0d2001bb96a9 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -438,7 +438,7 @@ static inline int cma_validate_port(struct ib_device *device, u8 port,
+ 	if ((dev_type != ARPHRD_INFINIBAND) && rdma_protocol_ib(device, port))
+ 		return ret;
+ 
+-	ret = ib_find_cached_gid(device, gid, &found_port, NULL);
++	ret = ib_find_cached_gid(device, gid, NULL, &found_port, NULL);
+ 	if (port != found_port)
+ 		return -ENODEV;
+ 
+@@ -531,7 +531,9 @@ static int cma_resolve_ib_dev(struct rdma_id_private *id_priv)
+ 			if (ib_find_cached_pkey(cur_dev->device, p, pkey, &index))
+ 				continue;
+ 
+-			for (i = 0; !ib_get_cached_gid(cur_dev->device, p, i, &gid); i++) {
++			for (i = 0; !ib_get_cached_gid(cur_dev->device, p, i,
++						       &gid, NULL);
++			     i++) {
+ 				if (!memcmp(&gid, dgid, sizeof(gid))) {
+ 					cma_dev = cur_dev;
+ 					sgid = gid;
+@@ -718,7 +720,7 @@ static int cma_modify_qp_rtr(struct rdma_id_private *id_priv,
+ 		goto out;
+ 
+ 	ret = ib_query_gid(id_priv->id.device, id_priv->id.port_num,
+-			   qp_attr.ah_attr.grh.sgid_index, &sgid);
++			   qp_attr.ah_attr.grh.sgid_index, &sgid, NULL);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -2426,7 +2428,7 @@ static int cma_bind_loopback(struct rdma_id_private *id_priv)
+ 	p = 1;
+ 
+ port_found:
+-	ret = ib_get_cached_gid(cma_dev->device, p, 0, &gid);
++	ret = ib_get_cached_gid(cma_dev->device, p, 0, &gid, NULL);
+ 	if (ret)
+ 		goto out;
+ 
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index 17639117afc6..f22ce487fd3a 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -672,14 +672,20 @@ EXPORT_SYMBOL(ib_query_port);
+  * @port_num:Port number to query
+  * @index:GID table index to query
+  * @gid:Returned GID
++ * @attr: Returned GID attributes related to this GID index (only in RoCE).
++ *   NULL means ignore.
+  *
+  * ib_query_gid() fetches the specified GID table entry.
+  */
+ int ib_query_gid(struct ib_device *device,
+-		 u8 port_num, int index, union ib_gid *gid)
++		 u8 port_num, int index, union ib_gid *gid,
++		 struct ib_gid_attr *attr)
+ {
+ 	if (rdma_cap_roce_gid_table(device, port_num))
+-		return ib_get_cached_gid(device, port_num, index, gid);
++		return ib_get_cached_gid(device, port_num, index, gid, attr);
++
++	if (attr)
++		return -EINVAL;
+ 
+ 	return device->query_gid(device, port_num, index, gid);
+ }
+@@ -819,12 +825,13 @@ EXPORT_SYMBOL(ib_modify_port);
+  *   a specified GID value occurs.
+  * @device: The device to query.
+  * @gid: The GID value to search for.
++ * @ndev: The ndev related to the GID to search for.
+  * @port_num: The port number of the device where the GID value was found.
+  * @index: The index into the GID table where the GID was found.  This
+  *   parameter may be NULL.
+  */
+ int ib_find_gid(struct ib_device *device, union ib_gid *gid,
+-		u8 *port_num, u16 *index)
++		struct net_device *ndev, u8 *port_num, u16 *index)
+ {
+ 	union ib_gid tmp_gid;
+ 	int ret, port, i;
+@@ -832,14 +839,14 @@ int ib_find_gid(struct ib_device *device, union ib_gid *gid,
+ 	for (port = rdma_start_port(device); port <= rdma_end_port(device); ++port) {
+ 		if (rdma_cap_roce_gid_table(device, port)) {
+ 			if (!ib_cache_gid_find_by_port(device, gid, port,
+-						       NULL, index)) {
++						       ndev, index)) {
+ 				*port_num = port;
+ 				return 0;
+ 			}
+ 		}
+ 
+ 		for (i = 0; i < device->port_immutable[port].gid_tbl_len; ++i) {
+-			ret = ib_query_gid(device, port, i, &tmp_gid);
++			ret = ib_query_gid(device, port, i, &tmp_gid, NULL);
+ 			if (ret)
+ 				return ret;
+ 			if (!memcmp(&tmp_gid, gid, sizeof *gid)) {
+diff --git a/drivers/infiniband/core/mad.c b/drivers/infiniband/core/mad.c
+index 4b5c72311deb..fa63b89e15aa 100644
+--- a/drivers/infiniband/core/mad.c
++++ b/drivers/infiniband/core/mad.c
+@@ -1877,7 +1877,7 @@ static inline int rcv_has_same_gid(const struct ib_mad_agent_private *mad_agent_
+ 					  ((1 << lmc) - 1)));
+ 		} else {
+ 			if (ib_get_cached_gid(device, port_num,
+-					      attr.grh.sgid_index, &sgid))
++					      attr.grh.sgid_index, &sgid, NULL))
+ 				return 0;
+ 			return !memcmp(sgid.raw, rwc->recv_buf.grh->dgid.raw,
+ 				       16);
+diff --git a/drivers/infiniband/core/multicast.c b/drivers/infiniband/core/multicast.c
+index d38d8b2b2979..bb6685fb08c6 100644
+--- a/drivers/infiniband/core/multicast.c
++++ b/drivers/infiniband/core/multicast.c
+@@ -729,7 +729,8 @@ int ib_init_ah_from_mcmember(struct ib_device *device, u8 port_num,
+ 	u16 gid_index;
+ 	u8 p;
+ 
+-	ret = ib_find_cached_gid(device, &rec->port_gid, &p, &gid_index);
++	ret = ib_find_cached_gid(device, &rec->port_gid,
++				 NULL, &p, &gid_index);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/infiniband/core/sa_query.c b/drivers/infiniband/core/sa_query.c
+index 8c014b33d8e0..9a4e7891ada2 100644
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@ -1010,7 +1010,7 @@ int ib_init_ah_from_path(struct ib_device *device, u8 port_num,
+ 		ah_attr->ah_flags = IB_AH_GRH;
+ 		ah_attr->grh.dgid = rec->dgid;
+ 
+-		ret = ib_find_cached_gid(device, &rec->sgid, &port_num,
++		ret = ib_find_cached_gid(device, &rec->sgid, NULL, &port_num,
+ 					 &gid_index);
+ 		if (ret)
+ 			return ret;
+diff --git a/drivers/infiniband/core/sysfs.c b/drivers/infiniband/core/sysfs.c
+index 34cdd74b0a17..b1f37d4095fa 100644
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@ -289,7 +289,7 @@ static ssize_t show_port_gid(struct ib_port *p, struct port_attribute *attr,
+ 	union ib_gid gid;
+ 	ssize_t ret;
+ 
+-	ret = ib_query_gid(p->ibdev, p->port_num, tab_attr->index, &gid);
++	ret = ib_query_gid(p->ibdev, p->port_num, tab_attr->index, &gid, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index e1f2c9887f3f..6012f5e5b97c 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -344,8 +344,8 @@ int ib_init_ah_from_wc(struct ib_device *device, u8 port_num,
+ 		ah_attr->ah_flags = IB_AH_GRH;
+ 		ah_attr->grh.dgid = grh->sgid;
+ 
+-		ret = ib_find_cached_gid(device, &grh->dgid, &port_num,
+-					 &gid_index);
++		ret = ib_find_cached_gid(device, &grh->dgid,
++					 NULL, &port_num, &gid_index);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -988,7 +988,8 @@ int ib_resolve_eth_l2_attrs(struct ib_qp *qp,
+ 	if ((*qp_attr_mask & IB_QP_AV)  &&
+ 	    (rdma_cap_eth_ah(qp->device, qp_attr->ah_attr.port_num))) {
+ 		ret = ib_query_gid(qp->device, qp_attr->ah_attr.port_num,
+-				   qp_attr->ah_attr.grh.sgid_index, &sgid);
++				   qp_attr->ah_attr.grh.sgid_index, &sgid,
++				   NULL);
+ 		if (ret)
+ 			goto out;
+ 		if (rdma_link_local_addr((struct in6_addr *)qp_attr->ah_attr.grh.dgid.raw)) {
+* Unmerged path drivers/infiniband/hw/mlx4/main.c
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index c12d726340f5..9bc008c8d363 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -2265,7 +2265,8 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+ 		} else  {
+ 			err = ib_get_cached_gid(ib_dev,
+ 						be32_to_cpu(ah->av.ib.port_pd) >> 24,
+-						ah->av.ib.gid_index, &sgid);
++						ah->av.ib.gid_index, &sgid,
++						NULL);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -2307,7 +2308,7 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+ 			ib_get_cached_gid(ib_dev,
+ 					  be32_to_cpu(ah->av.ib.port_pd) >> 24,
+ 					  ah->av.ib.gid_index,
+-					  &sqp->ud_header.grh.source_gid);
++					  &sqp->ud_header.grh.source_gid, NULL);
+ 		}
+ 		memcpy(sqp->ud_header.grh.destination_gid.raw,
+ 		       ah->av.ib.dgid, 16);
+diff --git a/drivers/infiniband/hw/mthca/mthca_av.c b/drivers/infiniband/hw/mthca/mthca_av.c
+index 32f6c6315454..bcac294042f5 100644
+--- a/drivers/infiniband/hw/mthca/mthca_av.c
++++ b/drivers/infiniband/hw/mthca/mthca_av.c
+@@ -281,7 +281,7 @@ int mthca_read_ah(struct mthca_dev *dev, struct mthca_ah *ah,
+ 		ib_get_cached_gid(&dev->ib_dev,
+ 				  be32_to_cpu(ah->av->port_pd) >> 24,
+ 				  ah->av->gid_index % dev->limits.gid_table_len,
+-				  &header->grh.source_gid);
++				  &header->grh.source_gid, NULL);
+ 		memcpy(header->grh.destination_gid.raw,
+ 		       ah->av->dgid, 16);
+ 	}
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index 75025ecf2a57..5b734880d4fc 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -73,7 +73,7 @@ int ocrdma_query_gid(struct ib_device *ibdev, u8 port,
+ 	if (index >= OCRDMA_MAX_SGID)
+ 		return -EINVAL;
+ 
+-	ret = ib_get_cached_gid(ibdev, port, index, sgid);
++	ret = ib_get_cached_gid(ibdev, port, index, sgid, NULL);
+ 	if (ret == -EAGAIN) {
+ 		memcpy(sgid, &zgid, sizeof(*sgid));
+ 		return 0;
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 99e6cd24bcd7..9f71ca02e571 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -1860,7 +1860,7 @@ static struct net_device *ipoib_add_port(const char *format,
+ 	priv->dev->broadcast[8] = priv->pkey >> 8;
+ 	priv->dev->broadcast[9] = priv->pkey & 0xff;
+ 
+-	result = ib_query_gid(hca, port, 0, &priv->local_gid);
++	result = ib_query_gid(hca, port, 0, &priv->local_gid, NULL);
+ 	if (result) {
+ 		printk(KERN_WARNING "%s: ib_query_gid port %d failed (ret = %d)\n",
+ 		       hca->name, port, result);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index d750a86042f3..d4b97614196c 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -561,7 +561,7 @@ void ipoib_mcast_join_task(struct work_struct *work)
+ 	}
+ 	priv->local_lid = port_attr.lid;
+ 
+-	if (ib_query_gid(priv->ca, priv->port, 0, &priv->local_gid))
++	if (ib_query_gid(priv->ca, priv->port, 0, &priv->local_gid, NULL))
+ 		ipoib_warn(priv, "ib_query_gid() failed\n");
+ 	else
+ 		memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw, sizeof (union ib_gid));
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index feb0c8ea0788..39e1bc11a131 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -3248,7 +3248,7 @@ static ssize_t srp_create_target(struct device *dev,
+ 	INIT_WORK(&target->tl_err_work, srp_tl_err_work);
+ 	INIT_WORK(&target->remove_work, srp_remove_work);
+ 	spin_lock_init(&target->lock);
+-	ret = ib_query_gid(ibdev, host->port, 0, &target->sgid);
++	ret = ib_query_gid(ibdev, host->port, 0, &target->sgid, NULL);
+ 	if (ret)
+ 		goto out;
+ 
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 6df2d90f10ad..de661bc68664 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -547,7 +547,8 @@ static int srpt_refresh_port(struct srpt_port *sport)
+ 	sport->sm_lid = port_attr.sm_lid;
+ 	sport->lid = port_attr.lid;
+ 
+-	ret = ib_query_gid(sport->sdev->device, sport->port, 0, &sport->gid);
++	ret = ib_query_gid(sport->sdev->device, sport->port, 0, &sport->gid,
++			   NULL);
+ 	if (ret)
+ 		goto err_query_port;
+ 
+diff --git a/include/rdma/ib_cache.h b/include/rdma/ib_cache.h
+index bd92130f4ac5..dcc9bed9b69a 100644
+--- a/include/rdma/ib_cache.h
++++ b/include/rdma/ib_cache.h
+@@ -43,6 +43,8 @@
+  * @port_num: The port number of the device to query.
+  * @index: The index into the cached GID table to query.
+  * @gid: The GID value found at the specified index.
++ * @attr: The GID attribute found at the specified index (only in RoCE).
++ *   NULL means ignore (output parameter).
+  *
+  * ib_get_cached_gid() fetches the specified GID table entry stored in
+  * the local software cache.
+@@ -50,13 +52,15 @@
+ int ib_get_cached_gid(struct ib_device    *device,
+ 		      u8                   port_num,
+ 		      int                  index,
+-		      union ib_gid        *gid);
++		      union ib_gid        *gid,
++		      struct ib_gid_attr  *attr);
+ 
+ /**
+  * ib_find_cached_gid - Returns the port number and GID table index where
+  *   a specified GID value occurs.
+  * @device: The device to query.
+  * @gid: The GID value to search for.
++ * @ndev: In RoCE, the net device of the device. NULL means ignore.
+  * @port_num: The port number of the device where the GID value was found.
+  * @index: The index into the cached GID table where the GID was found.  This
+  *   parameter may be NULL.
+@@ -64,10 +68,11 @@ int ib_get_cached_gid(struct ib_device    *device,
+  * ib_find_cached_gid() searches for the specified GID value in
+  * the local software cache.
+  */
+-int ib_find_cached_gid(struct ib_device   *device,
++int ib_find_cached_gid(struct ib_device *device,
+ 		       const union ib_gid *gid,
+-		       u8                 *port_num,
+-		       u16                *index);
++		       struct net_device *ndev,
++		       u8               *port_num,
++		       u16              *index);
+ 
+ /**
+  * ib_get_cached_pkey - Returns a cached PKey table entry
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index e1f65e204d37..98ded0b749cd 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2177,7 +2177,8 @@ static inline bool rdma_cap_roce_gid_table(const struct ib_device *device,
+ }
+ 
+ int ib_query_gid(struct ib_device *device,
+-		 u8 port_num, int index, union ib_gid *gid);
++		 u8 port_num, int index, union ib_gid *gid,
++		 struct ib_gid_attr *attr);
+ 
+ int ib_query_pkey(struct ib_device *device,
+ 		  u8 port_num, u16 index, u16 *pkey);
+@@ -2191,7 +2192,7 @@ int ib_modify_port(struct ib_device *device,
+ 		   struct ib_port_modify *port_modify);
+ 
+ int ib_find_gid(struct ib_device *device, union ib_gid *gid,
+-		u8 *port_num, u16 *index);
++		struct net_device *ndev, u8 *port_num, u16 *index);
+ 
+ int ib_find_pkey(struct ib_device *device,
+ 		 u8 port_num, u16 pkey, u16 *index);
