@@ -2962,7 +2962,8 @@ static int azx_runtime_suspend(struct device *dev)
 	struct azx *chip = card->private_data;
 
 	azx_stop_chip(chip);
-	azx_enter_link_reset(chip);
+	if (!chip->bus->avoid_link_reset)
+		azx_enter_link_reset(chip);
 	azx_clear_irq_pending(chip);
 	return 0;
 }
