@@ -1,0 +1,668 @@
+net/mlx4: Add EQ pool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4: Add EQ pool (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 89.47%
+commit-author Matan Barak <matanb@mellanox.com>
+commit c66fa19c405a36673d4aab13658c8246413d5c0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c66fa19c.failed
+
+Previously, mlx4_en allocated EQs and used them exclusively.
+This affected RoCE performance, as applications which are
+events sensitive were limited to use only the legacy EQs.
+
+Change that by introducing an EQ pool. This pool is managed
+by mlx4_core. EQs are assigned to ports (when there are limited
+number of EQs, multiple ports could be assigned to the same EQs).
+
+An exception to this rule is the ASYNC EQ which handles various events.
+
+Legacy EQs are completely removed as all EQs could be shared.
+
+When a consumer (mlx4_ib/mlx4_en) requests an EQ, it asks for
+EQ serving on a specific port. The core driver calculates which
+EQ should be assigned to that request.
+
+Because IRQs are shared between IB and Ethernet modules, their
+names only include the PCI device BDF address.
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Signed-off-by: Ido Shamay <idos@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c66fa19c405a36673d4aab13658c8246413d5c0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx4/main.c
+#	drivers/net/ethernet/mellanox/mlx4/eq.c
+#	drivers/net/ethernet/mellanox/mlx4/main.c
+diff --cc drivers/infiniband/hw/mlx4/main.c
+index e08bbdccd500,024b0f745035..000000000000
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@@ -1978,47 -2041,24 +1978,62 @@@ static void init_pkeys(struct mlx4_ib_d
+  
+  static void mlx4_ib_alloc_eqs(struct mlx4_dev *dev, struct mlx4_ib_dev *ibdev)
+  {
+- 	char name[80];
+- 	int eq_per_port = 0;
+- 	int added_eqs = 0;
+- 	int total_eqs = 0;
+- 	int i, j, eq;
++ 	int i, j, eq = 0, total_eqs = 0;
+  
+++<<<<<<< HEAD
+ +	/* Legacy mode or comp_pool is not large enough */
+ +	if (dev->caps.comp_pool == 0 ||
+ +	    dev->caps.num_ports > dev->caps.comp_pool)
+ +		return;
+ +
+ +	eq_per_port = rounddown_pow_of_two(dev->caps.comp_pool/
+ +					dev->caps.num_ports);
+ +
+ +	/* Init eq table */
+ +	added_eqs = 0;
+ +	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_IB)
+ +		added_eqs += eq_per_port;
+ +
+ +	total_eqs = dev->caps.num_comp_vectors + added_eqs;
+ +
+ +	ibdev->eq_table = kzalloc(total_eqs * sizeof(int), GFP_KERNEL);
+ +	if (!ibdev->eq_table)
+ +		return;
+ +
+ +	ibdev->eq_added = added_eqs;
+ +
+ +	eq = 0;
+ +	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_IB) {
+ +		for (j = 0; j < eq_per_port; j++) {
+ +			snprintf(name, sizeof(name), "mlx4-ib-%d-%d@%s",
+ +				 i, j, dev->pdev->bus->name);
+ +			/* Set IRQ for specific name (per ring) */
+ +			if (mlx4_assign_eq(dev, name, NULL,
+ +					   &ibdev->eq_table[eq])) {
+ +				/* Use legacy (same as mlx4_en driver) */
+ +				pr_warn("Can't allocate EQ %d; reverting to legacy\n", eq);
+ +				ibdev->eq_table[eq] =
+ +					(eq % dev->caps.num_comp_vectors);
+ +			}
+ +			eq++;
+++=======
++ 	ibdev->eq_table = kcalloc(dev->caps.num_comp_vectors,
++ 				  sizeof(ibdev->eq_table[0]), GFP_KERNEL);
++ 	if (!ibdev->eq_table)
++ 		return;
++ 
++ 	for (i = 1; i <= dev->caps.num_ports; i++) {
++ 		for (j = 0; j < mlx4_get_eqs_per_port(dev, i);
++ 		     j++, total_eqs++) {
++ 			if (i > 1 &&  mlx4_is_eq_shared(dev, total_eqs))
++ 				continue;
++ 			ibdev->eq_table[eq] = total_eqs;
++ 			if (!mlx4_assign_eq(dev, i,
++ 					    &ibdev->eq_table[eq]))
++ 				eq++;
++ 			else
++ 				ibdev->eq_table[eq] = -1;
+++>>>>>>> c66fa19c405a (net/mlx4: Add EQ pool)
+  		}
+  	}
+  
+@@@ -2039,42 -2080,15 +2055,38 @@@ static void mlx4_ib_free_eqs(struct mlx
+  		return;
+  
+  	/* Reset the advertised EQ number */
+- 	ibdev->ib_dev.num_comp_vectors = dev->caps.num_comp_vectors;
++ 	ibdev->ib_dev.num_comp_vectors = 0;
+  
+- 	/* Free only the added eqs */
+- 	for (i = 0; i < ibdev->eq_added; i++) {
+- 		/* Don't free legacy eqs if used */
+- 		if (ibdev->eq_table[i] <= dev->caps.num_comp_vectors)
+- 			continue;
++ 	for (i = 0; i < total_eqs; i++)
+  		mlx4_release_eq(dev, ibdev->eq_table[i]);
+- 	}
+  
+  	kfree(ibdev->eq_table);
++ 	ibdev->eq_table = NULL;
+  }
+  
+ +static int mlx4_port_immutable(struct ib_device *ibdev, u8 port_num,
+ +			       struct ib_port_immutable *immutable)
+ +{
+ +	struct ib_port_attr attr;
+ +	int err;
+ +
+ +	err = mlx4_ib_query_port(ibdev, port_num, &attr);
+ +	if (err)
+ +		return err;
+ +
+ +	immutable->pkey_tbl_len = attr.pkey_tbl_len;
+ +	immutable->gid_tbl_len = attr.gid_tbl_len;
+ +
+ +	if (mlx4_ib_port_link_layer(ibdev, port_num) == IB_LINK_LAYER_INFINIBAND)
+ +		immutable->core_cap_flags = RDMA_CORE_PORT_IBA_IB;
+ +	else
+ +		immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE;
+ +
+ +	immutable->max_mad_size = IB_MGMT_MAD_SIZE;
+ +
+ +	return 0;
+ +}
+ +
+  static void *mlx4_ib_add(struct mlx4_dev *dev)
+  {
+  	struct mlx4_ib_dev *ibdev;
+diff --cc drivers/net/ethernet/mellanox/mlx4/eq.c
+index 25bcdb02089f,2e6fc6a860a7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/eq.c
+@@@ -1053,11 -1085,10 +1053,10 @@@ static void mlx4_free_eq(struct mlx4_de
+  static void mlx4_free_irqs(struct mlx4_dev *dev)
+  {
+  	struct mlx4_eq_table *eq_table = &mlx4_priv(dev)->eq_table;
+- 	struct mlx4_priv *priv = mlx4_priv(dev);
+- 	int	i, vec;
++ 	int	i;
+  
+  	if (eq_table->have_irq)
+ -		free_irq(dev->persist->pdev->irq, dev);
+ +		free_irq(dev->pdev->irq, dev);
+  
+  	for (i = 0; i < dev->caps.num_comp_vectors + 1; ++i)
+  		if (eq_table->eq[i].have_irq) {
+@@@ -1198,41 -1228,30 +1191,47 @@@ int mlx4_init_eq_table(struct mlx4_dev 
+  	if (dev->flags & MLX4_FLAG_MSI_X) {
+  		const char *eq_name;
+  
+++<<<<<<< HEAD
+ +		for (i = 0; i < dev->caps.num_comp_vectors + 1; ++i) {
+ +			if (i < dev->caps.num_comp_vectors) {
+ +				snprintf(priv->eq_table.irq_names +
+ +					 i * MLX4_IRQNAME_SIZE,
+ +					 MLX4_IRQNAME_SIZE,
+ +					 "mlx4-comp-%d@pci:%s", i,
+ +					 pci_name(dev->pdev));
+ +			} else {
+ +				snprintf(priv->eq_table.irq_names +
+ +					 i * MLX4_IRQNAME_SIZE,
+ +					 MLX4_IRQNAME_SIZE,
+ +					 "mlx4-async@pci:%s",
+ +					 pci_name(dev->pdev));
+ +			}
+++=======
++ 		snprintf(priv->eq_table.irq_names +
++ 			 MLX4_EQ_ASYNC * MLX4_IRQNAME_SIZE,
++ 			 MLX4_IRQNAME_SIZE,
++ 			 "mlx4-async@pci:%s",
++ 			 pci_name(dev->persist->pdev));
++ 		eq_name = priv->eq_table.irq_names +
++ 			MLX4_EQ_ASYNC * MLX4_IRQNAME_SIZE;
+++>>>>>>> c66fa19c405a (net/mlx4: Add EQ pool)
++ 
++ 		err = request_irq(priv->eq_table.eq[MLX4_EQ_ASYNC].irq,
++ 				  mlx4_msi_x_interrupt, 0, eq_name,
++ 				  priv->eq_table.eq + MLX4_EQ_ASYNC);
++ 		if (err)
++ 			goto err_out_unmap;
+  
+- 			eq_name = priv->eq_table.irq_names +
+- 				  i * MLX4_IRQNAME_SIZE;
+- 			err = request_irq(priv->eq_table.eq[i].irq,
+- 					  mlx4_msi_x_interrupt, 0, eq_name,
+- 					  priv->eq_table.eq + i);
+- 			if (err)
+- 				goto err_out_async;
+- 
+- 			priv->eq_table.eq[i].have_irq = 1;
+- 		}
++ 		priv->eq_table.eq[MLX4_EQ_ASYNC].have_irq = 1;
+  	} else {
+  		snprintf(priv->eq_table.irq_names,
+  			 MLX4_IRQNAME_SIZE,
+  			 DRV_NAME "@pci:%s",
+ -			 pci_name(dev->persist->pdev));
+ -		err = request_irq(dev->persist->pdev->irq, mlx4_interrupt,
+ +			 pci_name(dev->pdev));
+ +		err = request_irq(dev->pdev->irq, mlx4_interrupt,
+  				  IRQF_SHARED, priv->eq_table.irq_names, dev);
+  		if (err)
+- 			goto err_out_async;
++ 			goto err_out_unmap;
+  
+  		priv->eq_table.have_irq = 1;
+  	}
+diff --cc drivers/net/ethernet/mellanox/mlx4/main.c
+index 0632ee652e13,3ec5113c5a33..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@@ -2216,12 -2485,12 +2216,18 @@@ static void mlx4_enable_msi_x(struct ml
+  {
+  	struct mlx4_priv *priv = mlx4_priv(dev);
+  	struct msix_entry *entries;
+ +	int nreq = min_t(int, dev->caps.num_ports *
+ +			 min_t(int, num_online_cpus() + 1,
+ +			       MAX_MSIX_P_PORT) + MSIX_LEGACY_SZ, MAX_MSIX);
+  	int i;
++ 	int port = 0;
+  
+  	if (msi_x) {
+++<<<<<<< HEAD
+++=======
++ 		int nreq = dev->caps.num_ports * num_online_cpus() + 1;
++ 
+++>>>>>>> c66fa19c405a (net/mlx4: Add EQ pool)
+  		nreq = min_t(int, dev->caps.num_eqs - dev->caps.reserved_eqs,
+  			     nreq);
+  
+@@@ -2232,22 -2501,52 +2238,51 @@@
+  		for (i = 0; i < nreq; ++i)
+  			entries[i].entry = i;
+  
+ -		nreq = pci_enable_msix_range(dev->persist->pdev, entries, 2,
+ -					     nreq);
+ +		nreq = pci_enable_msix_range(dev->pdev, entries, 2, nreq);
+  
+- 		if (nreq < 0) {
++ 		if (nreq < 0 || nreq < MLX4_EQ_ASYNC) {
+  			kfree(entries);
+  			goto no_msi;
+- 		} else if (nreq < MSIX_LEGACY_SZ +
+- 			   dev->caps.num_ports * MIN_MSIX_P_PORT) {
+- 			/*Working in legacy mode , all EQ's shared*/
+- 			dev->caps.comp_pool           = 0;
+- 			dev->caps.num_comp_vectors = nreq - 1;
+- 		} else {
+- 			dev->caps.comp_pool           = nreq - MSIX_LEGACY_SZ;
+- 			dev->caps.num_comp_vectors = MSIX_LEGACY_SZ - 1;
+  		}
+- 		for (i = 0; i < nreq; ++i)
+- 			priv->eq_table.eq[i].irq = entries[i].vector;
++ 		/* 1 is reserved for events (asyncrounous EQ) */
++ 		dev->caps.num_comp_vectors = nreq - 1;
++ 
++ 		priv->eq_table.eq[MLX4_EQ_ASYNC].irq = entries[0].vector;
++ 		bitmap_zero(priv->eq_table.eq[MLX4_EQ_ASYNC].actv_ports.ports,
++ 			    dev->caps.num_ports);
++ 
++ 		for (i = 0; i < dev->caps.num_comp_vectors + 1; i++) {
++ 			if (i == MLX4_EQ_ASYNC)
++ 				continue;
++ 
++ 			priv->eq_table.eq[i].irq =
++ 				entries[i + 1 - !!(i > MLX4_EQ_ASYNC)].vector;
++ 
++ 			if (MLX4_IS_LEGACY_EQ_MODE(dev->caps)) {
++ 				bitmap_fill(priv->eq_table.eq[i].actv_ports.ports,
++ 					    dev->caps.num_ports);
++ 			} else {
++ 				set_bit(port,
++ 					priv->eq_table.eq[i].actv_ports.ports);
++ 			}
++ 			/* We divide the Eqs evenly between the two ports.
++ 			 * (dev->caps.num_comp_vectors / dev->caps.num_ports)
++ 			 * refers to the number of Eqs per port
++ 			 * (i.e eqs_per_port). Theoretically, we would like to
++ 			 * write something like (i + 1) % eqs_per_port == 0.
++ 			 * However, since there's an asynchronous Eq, we have
++ 			 * to skip over it by comparing this condition to
++ 			 * !!((i + 1) > MLX4_EQ_ASYNC).
++ 			 */
++ 			if ((dev->caps.num_comp_vectors > dev->caps.num_ports) &&
++ 			    ((i + 1) %
++ 			     (dev->caps.num_comp_vectors / dev->caps.num_ports)) ==
++ 			    !!((i + 1) > MLX4_EQ_ASYNC))
++ 				/* If dev->caps.num_comp_vectors < dev->caps.num_ports,
++ 				 * everything is shared anyway.
++ 				 */
++ 				port++;
++ 		}
+  
+  		dev->flags |= MLX4_FLAG_MSI_X;
+  
+@@@ -2257,10 -2556,15 +2292,20 @@@
+  
+  no_msi:
+  	dev->caps.num_comp_vectors = 1;
+- 	dev->caps.comp_pool	   = 0;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < 2; ++i)
+ +		priv->eq_table.eq[i].irq = dev->pdev->irq;
+++=======
++ 	BUG_ON(MLX4_EQ_ASYNC >= 2);
++ 	for (i = 0; i < 2; ++i) {
++ 		priv->eq_table.eq[i].irq = dev->persist->pdev->irq;
++ 		if (i != MLX4_EQ_ASYNC) {
++ 			bitmap_fill(priv->eq_table.eq[i].actv_ports.ports,
++ 				    dev->caps.num_ports);
++ 		}
++ 	}
+++>>>>>>> c66fa19c405a (net/mlx4: Add EQ pool)
+  }
+  
+  static int mlx4_init_port_info(struct mlx4_dev *dev, int port)
+@@@ -2320,8 -2626,13 +2365,18 @@@ static void mlx4_cleanup_port_info(stru
+  	if (info->port < 0)
+  		return;
+  
+++<<<<<<< HEAD
+ +	device_remove_file(&info->dev->pdev->dev, &info->port_attr);
+ +	device_remove_file(&info->dev->pdev->dev, &info->port_mtu_attr);
+++=======
++ 	device_remove_file(&info->dev->persist->pdev->dev, &info->port_attr);
++ 	device_remove_file(&info->dev->persist->pdev->dev,
++ 			   &info->port_mtu_attr);
++ #ifdef CONFIG_RFS_ACCEL
++ 	free_irq_cpu_rmap(info->rmap);
++ 	info->rmap = NULL;
++ #endif
+++>>>>>>> c66fa19c405a (net/mlx4: Add EQ pool)
+  }
+  
+  static int mlx4_init_steering(struct mlx4_dev *dev)
+* Unmerged path drivers/infiniband/hw/mlx4/main.c
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index 9f981ddd1fb6..9bf3718156a2 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -516,7 +516,6 @@ struct mlx4_ib_dev {
+ 	struct mlx4_ib_iboe	iboe;
+ 	int			counters[MLX4_MAX_PORTS];
+ 	int		       *eq_table;
+-	int			eq_added;
+ 	struct kobject	       *iov_parent;
+ 	struct kobject	       *ports_parent;
+ 	struct kobject	       *dev_ports_parent[MLX4_MFUNC_MAX];
+diff --git a/drivers/net/ethernet/mellanox/mlx4/cq.c b/drivers/net/ethernet/mellanox/mlx4/cq.c
+index a59d96b90f17..4fdbe91965cc 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/cq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cq.c
+@@ -293,7 +293,7 @@ int mlx4_cq_alloc(struct mlx4_dev *dev, int nent,
+ 	u64 mtt_addr;
+ 	int err;
+ 
+-	if (vector > dev->caps.num_comp_vectors + dev->caps.comp_pool)
++	if (vector >= dev->caps.num_comp_vectors)
+ 		return -EINVAL;
+ 
+ 	cq->vector = vector;
+@@ -320,7 +320,7 @@ int mlx4_cq_alloc(struct mlx4_dev *dev, int nent,
+ 		cq_context->flags  |= cpu_to_be32(1 << 19);
+ 
+ 	cq_context->logsize_usrpage = cpu_to_be32((ilog2(nent) << 24) | uar->index);
+-	cq_context->comp_eqn	    = priv->eq_table.eq[vector].eqn;
++	cq_context->comp_eqn	    = priv->eq_table.eq[MLX4_CQ_TO_EQ_VECTOR(vector)].eqn;
+ 	cq_context->log_page_size   = mtt->page_shift - MLX4_ICM_PAGE_SHIFT;
+ 
+ 	mtt_addr = mlx4_mtt_addr(dev, mtt);
+@@ -340,11 +340,11 @@ int mlx4_cq_alloc(struct mlx4_dev *dev, int nent,
+ 	init_completion(&cq->free);
+ 	cq->comp = mlx4_add_cq_to_tasklet;
+ 	cq->tasklet_ctx.priv =
+-		&priv->eq_table.eq[cq->vector].tasklet_ctx;
++		&priv->eq_table.eq[MLX4_CQ_TO_EQ_VECTOR(vector)].tasklet_ctx;
+ 	INIT_LIST_HEAD(&cq->tasklet_ctx.list);
+ 
+ 
+-	cq->irq = priv->eq_table.eq[cq->vector].irq;
++	cq->irq = priv->eq_table.eq[MLX4_CQ_TO_EQ_VECTOR(vector)].irq;
+ 	return 0;
+ 
+ err_radix:
+@@ -369,7 +369,7 @@ void mlx4_cq_free(struct mlx4_dev *dev, struct mlx4_cq *cq)
+ 	if (err)
+ 		mlx4_warn(dev, "HW2SW_CQ failed (%d) for CQN %06x\n", err, cq->cqn);
+ 
+-	synchronize_irq(priv->eq_table.eq[cq->vector].irq);
++	synchronize_irq(priv->eq_table.eq[MLX4_CQ_TO_EQ_VECTOR(cq->vector)].irq);
+ 
+ 	spin_lock_irq(&cq_table->lock);
+ 	radix_tree_delete(&cq_table->tree, cq->cqn);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_cq.c b/drivers/net/ethernet/mellanox/mlx4/en_cq.c
+index 5a19a55448f8..458b996bf2dc 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_cq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_cq.c
+@@ -67,6 +67,7 @@ int mlx4_en_create_cq(struct mlx4_en_priv *priv,
+ 
+ 	cq->ring = ring;
+ 	cq->is_tx = mode;
++	cq->vector = mdev->dev->caps.num_comp_vectors;
+ 
+ 	/* Allocate HW buffers on provided NUMA node.
+ 	 * dev->numa_node is used in mtt range allocation flow.
+@@ -102,12 +103,7 @@ int mlx4_en_activate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq,
+ 	int err = 0;
+ 	char name[25];
+ 	int timestamp_en = 0;
+-	struct cpu_rmap *rmap =
+-#ifdef CONFIG_RFS_ACCEL
+-		priv->dev->rx_cpu_rmap;
+-#else
+-		NULL;
+-#endif
++	bool assigned_eq = false;
+ 
+ 	cq->dev = mdev->pndev[priv->port];
+ 	cq->mcq.set_ci_db  = cq->wqres.db.db;
+@@ -117,23 +113,19 @@ int mlx4_en_activate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq,
+ 	memset(cq->buf, 0, cq->buf_size);
+ 
+ 	if (cq->is_tx == RX) {
+-		if (mdev->dev->caps.comp_pool) {
+-			if (!cq->vector) {
+-				sprintf(name, "%s-%d", priv->dev->name,
+-					cq->ring);
+-				/* Set IRQ for specific name (per ring) */
+-				if (mlx4_assign_eq(mdev->dev, name, rmap,
+-						   &cq->vector)) {
+-					cq->vector = (cq->ring + 1 + priv->port)
+-					    % mdev->dev->caps.num_comp_vectors;
+-					mlx4_warn(mdev, "Failed assigning an EQ to %s, falling back to legacy EQ's\n",
+-						  name);
+-				}
+-
++		if (!mlx4_is_eq_vector_valid(mdev->dev, priv->port,
++					     cq->vector)) {
++			cq->vector = cq_idx;
++
++			err = mlx4_assign_eq(mdev->dev, priv->port,
++					     &cq->vector);
++			if (err) {
++				mlx4_err(mdev, "Failed assigning an EQ to %s\n",
++					 name);
++				goto free_eq;
+ 			}
+-		} else {
+-			cq->vector = (cq->ring + 1 + priv->port) %
+-				mdev->dev->caps.num_comp_vectors;
++
++			assigned_eq = true;
+ 		}
+ 
+ #ifdef CONFIG_GENERIC_HARDIRQS
+@@ -162,7 +154,7 @@ int mlx4_en_activate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq,
+ 			    &mdev->priv_uar, cq->wqres.db.dma, &cq->mcq,
+ 			    cq->vector, 0, timestamp_en);
+ 	if (err)
+-		return err;
++		goto free_eq;
+ 
+ 	cq->mcq.comp  = cq->is_tx ? mlx4_en_tx_irq : mlx4_en_rx_irq;
+ 	cq->mcq.event = mlx4_en_cq_event;
+@@ -185,6 +177,12 @@ int mlx4_en_activate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq,
+ 	napi_enable(&cq->napi);
+ 
+ 	return 0;
++
++free_eq:
++	if (assigned_eq)
++		mlx4_release_eq(mdev->dev, cq->vector);
++	cq->vector = mdev->dev->caps.num_comp_vectors;
++	return err;
+ }
+ 
+ void mlx4_en_destroy_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq **pcq)
+@@ -194,9 +192,9 @@ void mlx4_en_destroy_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq **pcq)
+ 
+ 	mlx4_en_unmap_buffer(&cq->wqres.buf);
+ 	mlx4_free_hwq_res(mdev->dev, &cq->wqres, cq->buf_size);
+-	if (priv->mdev->dev->caps.comp_pool && cq->vector) {
++	if (mlx4_is_eq_vector_valid(mdev->dev, priv->port, cq->vector) &&
++	    cq->is_tx == RX)
+ 		mlx4_release_eq(priv->mdev->dev, cq->vector);
+-	}
+ 	cq->vector = 0;
+ 	cq->buf_size = 0;
+ 	cq->buf = NULL;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 9a988b45c844..23c8eb1c9b54 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1948,7 +1948,6 @@ void mlx4_en_free_resources(struct mlx4_en_priv *priv)
+ 	int i;
+ 
+ #ifdef CONFIG_RFS_ACCEL
+-	free_irq_cpu_rmap(priv->dev->rx_cpu_rmap);
+ 	priv->dev->rx_cpu_rmap = NULL;
+ #endif
+ 
+@@ -2006,11 +2005,7 @@ int mlx4_en_alloc_resources(struct mlx4_en_priv *priv)
+ 	}
+ 
+ #ifdef CONFIG_RFS_ACCEL
+-	if (priv->mdev->dev->caps.comp_pool) {
+-		priv->dev->rx_cpu_rmap = alloc_irq_cpu_rmap(priv->mdev->dev->caps.comp_pool);
+-		if (!priv->dev->rx_cpu_rmap)
+-			goto err;
+-	}
++	priv->dev->rx_cpu_rmap = mlx4_get_cpu_rmap(priv->mdev->dev, priv->port);
+ #endif
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index da4fcaaf21f9..90f855d30595 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -336,15 +336,10 @@ void mlx4_en_set_num_rx_rings(struct mlx4_en_dev *mdev)
+ 	struct mlx4_dev *dev = mdev->dev;
+ 
+ 	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_ETH) {
+-		if (!dev->caps.comp_pool)
+-			num_of_eqs = max_t(int, MIN_RX_RINGS,
+-					   min_t(int,
+-						 dev->caps.num_comp_vectors,
+-						 DEF_RX_RINGS));
+-		else
+-			num_of_eqs = min_t(int, MAX_MSIX_P_PORT,
+-					   dev->caps.comp_pool/
+-					   dev->caps.num_ports) - 1;
++		num_of_eqs = max_t(int, MIN_RX_RINGS,
++				   min_t(int,
++					 mlx4_get_eqs_per_port(mdev->dev, i),
++					 DEF_RX_RINGS));
+ 
+ 		num_rx_rings = mlx4_low_memory_profile() ? MIN_RX_RINGS :
+ 			min_t(int, num_of_eqs,
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/eq.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4.h b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+index 693d8152c03b..7592e1fa8426 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -279,6 +279,12 @@ struct mlx4_icm_table {
+ #define MLX4_CQE_SIZE_MASK_STRIDE	0x3
+ #define MLX4_EQE_SIZE_MASK_STRIDE	0x30
+ 
++#define MLX4_EQ_ASYNC			0
++#define MLX4_EQ_TO_CQ_VECTOR(vector)	((vector) - \
++					 !!((int)(vector) >= MLX4_EQ_ASYNC))
++#define MLX4_CQ_TO_EQ_VECTOR(vector)	((vector) + \
++					 !!((int)(vector) >= MLX4_EQ_ASYNC))
++
+ /*
+  * Must be packed because mtt_seg is 64 bits but only aligned to 32 bits.
+  */
+@@ -383,6 +389,8 @@ struct mlx4_eq {
+ 	struct mlx4_buf_list   *page_list;
+ 	struct mlx4_mtt		mtt;
+ 	struct mlx4_eq_tasklet	tasklet_ctx;
++	struct mlx4_active_ports actv_ports;
++	u32			ref_count;
+ };
+ 
+ struct mlx4_slave_eqe {
+@@ -798,6 +806,7 @@ struct mlx4_port_info {
+ 	struct mlx4_vlan_table	vlan_table;
+ 	struct mlx4_roce_gid_table gid_table;
+ 	int			base_qpn;
++	struct cpu_rmap		*rmap;
+ };
+ 
+ struct mlx4_sense {
+@@ -808,7 +817,7 @@ struct mlx4_sense {
+ };
+ 
+ struct mlx4_msix_ctl {
+-	u64		pool_bm;
++	DECLARE_BITMAP(pool_bm, MAX_MSIX);
+ 	struct mutex	pool_lock;
+ };
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 16811bfb94e5..e5600f7546f0 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -339,7 +339,7 @@ struct mlx4_en_cq {
+ 	struct napi_struct	napi;
+ 	int size;
+ 	int buf_size;
+-	unsigned vector;
++	int vector;
+ 	enum cq_type is_tx;
+ 	u16 moder_time;
+ 	u16 moder_cnt;
+diff --git a/include/linux/mlx4/device.h b/include/linux/mlx4/device.h
+index 7c7eeeb434eb..111b243e6dbc 100644
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -46,8 +46,9 @@
+ 
+ #define MAX_MSIX_P_PORT		17
+ #define MAX_MSIX		64
+-#define MSIX_LEGACY_SZ		4
+ #define MIN_MSIX_P_PORT		5
++#define MLX4_IS_LEGACY_EQ_MODE(dev_cap) ((dev_cap).num_comp_vectors < \
++					 (dev_cap).num_ports * MIN_MSIX_P_PORT)
+ 
+ #define MLX4_MAX_100M_UNITS_VAL		255	/*
+ 						 * work around: can't set values
+@@ -466,7 +467,6 @@ struct mlx4_caps {
+ 	int			num_eqs;
+ 	int			reserved_eqs;
+ 	int			num_comp_vectors;
+-	int			comp_pool;
+ 	int			num_mpts;
+ 	int			max_fmr_maps;
+ 	int			num_mtts;
+@@ -1245,10 +1245,13 @@ void mlx4_fmr_unmap(struct mlx4_dev *dev, struct mlx4_fmr *fmr,
+ int mlx4_fmr_free(struct mlx4_dev *dev, struct mlx4_fmr *fmr);
+ int mlx4_SYNC_TPT(struct mlx4_dev *dev);
+ int mlx4_test_interrupts(struct mlx4_dev *dev);
+-int mlx4_assign_eq(struct mlx4_dev *dev, char *name, struct cpu_rmap *rmap,
+-		   int *vector);
++u32 mlx4_get_eqs_per_port(struct mlx4_dev *dev, u8 port);
++bool mlx4_is_eq_vector_valid(struct mlx4_dev *dev, u8 port, int vector);
++struct cpu_rmap *mlx4_get_cpu_rmap(struct mlx4_dev *dev, int port);
++int mlx4_assign_eq(struct mlx4_dev *dev, u8 port, int *vector);
+ void mlx4_release_eq(struct mlx4_dev *dev, int vec);
+ 
++int mlx4_is_eq_shared(struct mlx4_dev *dev, int vector);
+ int mlx4_eq_get_irq(struct mlx4_dev *dev, int vec);
+ 
+ int mlx4_get_phys_port_id(struct mlx4_dev *dev);
