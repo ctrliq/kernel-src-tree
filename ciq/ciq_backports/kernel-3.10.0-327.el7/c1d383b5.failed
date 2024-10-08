@@ -1,0 +1,141 @@
+IB/core: dma map/unmap locking optimizations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Guy Shapiro <guysh@mellanox.com>
+commit c1d383b5785b1e0fb5fb862864712a7208219e6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c1d383b5.failed
+
+Currently, while mapping or unmapping pages for ODP, the umem mutex is locked
+and unlocked once for each page. Such lock/unlock operation take few tens to
+hundreds of nsecs. This makes a significant impact when mapping or unmapping few
+MBs of memory.
+
+To avoid this, the mutex should be locked only once per operation, and not per
+page.
+
+	Signed-off-by: Guy Shapiro <guysh@mellanox.com>
+	Acked-by: Shachar Raindel <raindel@mellanox.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit c1d383b5785b1e0fb5fb862864712a7208219e6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem_odp.c
+diff --cc drivers/infiniband/core/umem_odp.c
+index f889e8d793bd,aba47398880d..000000000000
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@@ -128,9 -443,18 +128,21 @@@ static int ib_umem_odp_map_dma_single_p
+  	struct ib_device *dev = umem->context->device;
+  	dma_addr_t dma_addr;
+  	int stored_page = 0;
+ -	int remove_existing_mapping = 0;
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&umem->odp_data->umem_mutex);
+++=======
++ 	/*
++ 	 * Note: we avoid writing if seq is different from the initial seq, to
++ 	 * handle case of a racing notifier. This check also allows us to bail
++ 	 * early if we have a notifier running in parallel with us.
++ 	 */
++ 	if (ib_umem_mmu_notifier_retry(umem, current_seq)) {
++ 		ret = -EAGAIN;
++ 		goto out;
++ 	}
+++>>>>>>> c1d383b5785b (IB/core: dma map/unmap locking optimizations)
+  	if (!(umem->odp_data->dma_list[page_index])) {
+  		dma_addr = ib_dma_map_page(dev,
+  					   page,
+@@@ -151,11 -475,22 +163,16 @@@
+  	}
+  
+  out:
+++<<<<<<< HEAD
+ +	mutex_unlock(&umem->odp_data->umem_mutex);
+ +
+ +	if (!stored_page)
+++=======
++ 	/* On Demand Paging - avoid pinning the page */
++ 	if (umem->context->invalidate_range || !stored_page)
+++>>>>>>> c1d383b5785b (IB/core: dma map/unmap locking optimizations)
+  		put_page(page);
+  
+ -	if (remove_existing_mapping && umem->context->invalidate_range) {
+ -		invalidate_page_trampoline(
+ -			umem,
+ -			base_virt_addr + (page_index * PAGE_SIZE),
+ -			base_virt_addr + ((page_index+1)*PAGE_SIZE),
+ -			NULL);
+ -		ret = -EAGAIN;
+ -	}
+ -
+  	return ret;
+  }
+  
+@@@ -244,10 -583,11 +261,11 @@@ int ib_umem_odp_map_dma_pages(struct ib
+  
+  		bcnt -= min_t(size_t, npages << PAGE_SHIFT, bcnt);
+  		user_virt += npages << PAGE_SHIFT;
++ 		mutex_lock(&umem->odp_data->umem_mutex);
+  		for (j = 0; j < npages; ++j) {
+  			ret = ib_umem_odp_map_dma_single_page(
+ -				umem, k, base_virt_addr, local_page_list[j],
+ -				access_mask, current_seq);
+ +				umem, k, local_page_list[j], access_mask,
+ +				current_seq);
+  			if (ret < 0)
+  				break;
+  			k++;
+@@@ -286,9 -627,14 +305,17 @@@ void ib_umem_odp_unmap_dma_pages(struc
+  
+  	virt  = max_t(u64, virt,  ib_umem_start(umem));
+  	bound = min_t(u64, bound, ib_umem_end(umem));
+++<<<<<<< HEAD
+++=======
++ 	/* Note that during the run of this function, the
++ 	 * notifiers_count of the MR is > 0, preventing any racing
++ 	 * faults from completion. We might be racing with other
++ 	 * invalidations, so we must make sure we free each page only
++ 	 * once. */
++ 	mutex_lock(&umem->odp_data->umem_mutex);
+++>>>>>>> c1d383b5785b (IB/core: dma map/unmap locking optimizations)
+  	for (addr = virt; addr < bound; addr += (u64)umem->page_size) {
+  		idx = (addr - ib_umem_start(umem)) / PAGE_SIZE;
+- 		mutex_lock(&umem->odp_data->umem_mutex);
+  		if (umem->odp_data->page_list[idx]) {
+  			struct page *page = umem->odp_data->page_list[idx];
+  			struct page *head_page = compound_head(page);
+@@@ -300,10 -646,23 +327,10 @@@
+  			ib_dma_unmap_page(dev, dma_addr, PAGE_SIZE,
+  					  DMA_BIDIRECTIONAL);
+  			if (dma & ODP_WRITE_ALLOWED_BIT)
+ -				/*
+ -				 * set_page_dirty prefers being called with
+ -				 * the page lock. However, MMU notifiers are
+ -				 * called sometimes with and sometimes without
+ -				 * the lock. We rely on the umem_mutex instead
+ -				 * to prevent other mmu notifiers from
+ -				 * continuing and allowing the page mapping to
+ -				 * be removed.
+ -				 */
+ -				set_page_dirty(head_page);
+ -			/* on demand pinning support */
+ -			if (!umem->context->invalidate_range)
+ -				put_page(page);
+ -			umem->odp_data->page_list[idx] = NULL;
+ -			umem->odp_data->dma_list[idx] = 0;
+ +				set_page_dirty_lock(head_page);
+ +			put_page(page);
+  		}
+- 		mutex_unlock(&umem->odp_data->umem_mutex);
+  	}
++ 	mutex_unlock(&umem->odp_data->umem_mutex);
+  }
+  EXPORT_SYMBOL(ib_umem_odp_unmap_dma_pages);
+* Unmerged path drivers/infiniband/core/umem_odp.c
