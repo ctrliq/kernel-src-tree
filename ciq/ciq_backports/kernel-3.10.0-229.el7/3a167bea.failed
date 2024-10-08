@@ -1,0 +1,1763 @@
+kvm: powerpc: Add kvmppc_ops callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: Add kvmppc_ops callback (Don Zickus) [1127366]
+Rebuild_FUZZ: 89.86%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit 3a167beac07cba597856c12b87638a06b0d53db7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3a167bea.failed
+
+This patch add a new callback kvmppc_ops. This will help us in enabling
+both HV and PR KVM together in the same kernel. The actual change to
+enable them together is done in the later patch in the series.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+[agraf: squash in booke changes]
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 3a167beac07cba597856c12b87638a06b0d53db7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/e500_emulate.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index b327916c88e9,3d7079a08d2a..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -1991,10 -2002,10 +2002,10 @@@ static int kvmppc_hv_setup_htab_rma(str
+  
+   up_out:
+  	up_read(&current->mm->mmap_sem);
+ -	goto out_srcu;
+ +	goto out;
+  }
+  
+- int kvmppc_core_init_vm(struct kvm *kvm)
++ static int kvmppc_core_init_vm_hv(struct kvm *kvm)
+  {
+  	unsigned long lpcr, lpid;
+  
+@@@ -2050,7 -2058,16 +2058,20 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +void kvmppc_core_destroy_vm(struct kvm *kvm)
+++=======
++ static void kvmppc_free_vcores(struct kvm *kvm)
++ {
++ 	long int i;
++ 
++ 	for (i = 0; i < KVM_MAX_VCORES; ++i)
++ 		kfree(kvm->arch.vcores[i]);
++ 	kvm->arch.online_vcores = 0;
++ }
++ 
++ static void kvmppc_core_destroy_vm_hv(struct kvm *kvm)
+++>>>>>>> 3a167beac07c (kvm: powerpc: Add kvmppc_ops callback)
+  {
+  	uninhibit_secondary_onlining();
+  
+diff --cc arch/powerpc/kvm/e500_emulate.c
+index b10a01243abd,89b7f821f6c4..000000000000
+--- a/arch/powerpc/kvm/e500_emulate.c
++++ b/arch/powerpc/kvm/e500_emulate.c
+@@@ -82,8 -83,28 +82,33 @@@ static int kvmppc_e500_emul_msgsnd(stru
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +int kvmppc_core_emulate_op(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ +                           unsigned int inst, int *advance)
+++=======
++ static int kvmppc_e500_emul_ehpriv(struct kvm_run *run, struct kvm_vcpu *vcpu,
++ 				   unsigned int inst, int *advance)
++ {
++ 	int emulated = EMULATE_DONE;
++ 
++ 	switch (get_oc(inst)) {
++ 	case EHPRIV_OC_DEBUG:
++ 		run->exit_reason = KVM_EXIT_DEBUG;
++ 		run->debug.arch.address = vcpu->arch.pc;
++ 		run->debug.arch.status = 0;
++ 		kvmppc_account_exit(vcpu, DEBUG_EXITS);
++ 		emulated = EMULATE_EXIT_USER;
++ 		*advance = 0;
++ 		break;
++ 	default:
++ 		emulated = EMULATE_FAIL;
++ 	}
++ 	return emulated;
++ }
++ 
++ int kvmppc_core_emulate_op_e500(struct kvm_run *run, struct kvm_vcpu *vcpu,
++ 				unsigned int inst, int *advance)
+++>>>>>>> 3a167beac07c (kvm: powerpc: Add kvmppc_ops callback)
+  {
+  	int emulated = EMULATE_DONE;
+  	int ra = get_ra(inst);
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 99ef8711e906..315a5d692417 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -124,7 +124,6 @@ extern void kvmppc_mmu_pte_flush(struct kvm_vcpu *vcpu, ulong ea, ulong ea_mask)
+ extern void kvmppc_mmu_pte_vflush(struct kvm_vcpu *vcpu, u64 vp, u64 vp_mask);
+ extern void kvmppc_mmu_pte_pflush(struct kvm_vcpu *vcpu, ulong pa_start, ulong pa_end);
+ extern void kvmppc_set_msr(struct kvm_vcpu *vcpu, u64 new_msr);
+-extern void kvmppc_set_pvr(struct kvm_vcpu *vcpu, u32 pvr);
+ extern void kvmppc_mmu_book3s_64_init(struct kvm_vcpu *vcpu);
+ extern void kvmppc_mmu_book3s_32_init(struct kvm_vcpu *vcpu);
+ extern void kvmppc_mmu_book3s_hv_init(struct kvm_vcpu *vcpu);
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 1823f38906c6..326033c99385 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -106,13 +106,6 @@ extern void kvmppc_core_queue_external(struct kvm_vcpu *vcpu,
+                                        struct kvm_interrupt *irq);
+ extern void kvmppc_core_dequeue_external(struct kvm_vcpu *vcpu);
+ extern void kvmppc_core_flush_tlb(struct kvm_vcpu *vcpu);
+-
+-extern int kvmppc_core_emulate_op(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                                  unsigned int op, int *advance);
+-extern int kvmppc_core_emulate_mtspr(struct kvm_vcpu *vcpu, int sprn,
+-				     ulong val);
+-extern int kvmppc_core_emulate_mfspr(struct kvm_vcpu *vcpu, int sprn,
+-				     ulong *val);
+ extern int kvmppc_core_check_requests(struct kvm_vcpu *vcpu);
+ 
+ extern int kvmppc_booke_init(void);
+@@ -135,8 +128,6 @@ extern long kvm_vm_ioctl_create_spapr_tce(struct kvm *kvm,
+ 				struct kvm_create_spapr_tce *args);
+ extern long kvmppc_h_put_tce(struct kvm_vcpu *vcpu, unsigned long liobn,
+ 			     unsigned long ioba, unsigned long tce);
+-extern long kvm_vm_ioctl_allocate_rma(struct kvm *kvm,
+-				struct kvm_allocate_rma *rma);
+ extern struct kvm_rma_info *kvm_alloc_rma(void);
+ extern void kvm_release_rma(struct kvm_rma_info *ri);
+ extern struct page *kvm_alloc_hpt(unsigned long nr_pages);
+@@ -177,6 +168,66 @@ extern int kvmppc_xics_get_xive(struct kvm *kvm, u32 irq, u32 *server,
+ extern int kvmppc_xics_int_on(struct kvm *kvm, u32 irq);
+ extern int kvmppc_xics_int_off(struct kvm *kvm, u32 irq);
+ 
++union kvmppc_one_reg {
++	u32	wval;
++	u64	dval;
++	vector128 vval;
++	u64	vsxval[2];
++	struct {
++		u64	addr;
++		u64	length;
++	}	vpaval;
++};
++
++struct kvmppc_ops {
++	int (*get_sregs)(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
++	int (*set_sregs)(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
++	int (*get_one_reg)(struct kvm_vcpu *vcpu, u64 id,
++			   union kvmppc_one_reg *val);
++	int (*set_one_reg)(struct kvm_vcpu *vcpu, u64 id,
++			   union kvmppc_one_reg *val);
++	void (*vcpu_load)(struct kvm_vcpu *vcpu, int cpu);
++	void (*vcpu_put)(struct kvm_vcpu *vcpu);
++	void (*set_msr)(struct kvm_vcpu *vcpu, u64 msr);
++	int (*vcpu_run)(struct kvm_run *run, struct kvm_vcpu *vcpu);
++	struct kvm_vcpu *(*vcpu_create)(struct kvm *kvm, unsigned int id);
++	void (*vcpu_free)(struct kvm_vcpu *vcpu);
++	int (*check_requests)(struct kvm_vcpu *vcpu);
++	int (*get_dirty_log)(struct kvm *kvm, struct kvm_dirty_log *log);
++	void (*flush_memslot)(struct kvm *kvm, struct kvm_memory_slot *memslot);
++	int (*prepare_memory_region)(struct kvm *kvm,
++				     struct kvm_memory_slot *memslot,
++				     struct kvm_userspace_memory_region *mem);
++	void (*commit_memory_region)(struct kvm *kvm,
++				     struct kvm_userspace_memory_region *mem,
++				     const struct kvm_memory_slot *old);
++	int (*unmap_hva)(struct kvm *kvm, unsigned long hva);
++	int (*unmap_hva_range)(struct kvm *kvm, unsigned long start,
++			   unsigned long end);
++	int (*age_hva)(struct kvm *kvm, unsigned long hva);
++	int (*test_age_hva)(struct kvm *kvm, unsigned long hva);
++	void (*set_spte_hva)(struct kvm *kvm, unsigned long hva, pte_t pte);
++	void (*mmu_destroy)(struct kvm_vcpu *vcpu);
++	void (*free_memslot)(struct kvm_memory_slot *free,
++			     struct kvm_memory_slot *dont);
++	int (*create_memslot)(struct kvm_memory_slot *slot,
++			      unsigned long npages);
++	int (*init_vm)(struct kvm *kvm);
++	void (*destroy_vm)(struct kvm *kvm);
++	int (*check_processor_compat)(void);
++	int (*get_smmu_info)(struct kvm *kvm, struct kvm_ppc_smmu_info *info);
++	int (*emulate_op)(struct kvm_run *run, struct kvm_vcpu *vcpu,
++			  unsigned int inst, int *advance);
++	int (*emulate_mtspr)(struct kvm_vcpu *vcpu, int sprn, ulong spr_val);
++	int (*emulate_mfspr)(struct kvm_vcpu *vcpu, int sprn, ulong *spr_val);
++	void (*fast_vcpu_kick)(struct kvm_vcpu *vcpu);
++	long (*arch_vm_ioctl)(struct file *filp, unsigned int ioctl,
++			      unsigned long arg);
++
++};
++
++extern struct kvmppc_ops *kvmppc_ops;
++
+ /*
+  * Cuts out inst bits with ordering according to spec.
+  * That means the leftmost bit is zero. All given bits are included.
+@@ -210,17 +261,6 @@ static inline u32 kvmppc_set_field(u64 inst, int msb, int lsb, int value)
+ 	return r;
+ }
+ 
+-union kvmppc_one_reg {
+-	u32	wval;
+-	u64	dval;
+-	vector128 vval;
+-	u64	vsxval[2];
+-	struct {
+-		u64	addr;
+-		u64	length;
+-	}	vpaval;
+-};
+-
+ #define one_reg_size(id)	\
+ 	(1ul << (((id) & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT))
+ 
+@@ -245,10 +285,10 @@ union kvmppc_one_reg {
+ 	__v;					\
+ })
+ 
+-void kvmppc_core_get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
++int kvmppc_core_get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
+ int kvmppc_core_set_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
+ 
+-void kvmppc_get_sregs_ivor(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
++int kvmppc_get_sregs_ivor(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
+ int kvmppc_set_sregs_ivor(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
+ 
+ int kvm_vcpu_ioctl_get_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg);
+@@ -281,7 +321,10 @@ static inline void kvmppc_set_host_ipi(int cpu, u8 host_ipi)
+ 	paca[cpu].kvm_hstate.host_ipi = host_ipi;
+ }
+ 
+-extern void kvmppc_fast_vcpu_kick(struct kvm_vcpu *vcpu);
++static inline void kvmppc_fast_vcpu_kick(struct kvm_vcpu *vcpu)
++{
++	kvmppc_ops->fast_vcpu_kick(vcpu);
++}
+ 
+ #else
+ static inline void __init kvm_cma_reserve(void)
+diff --git a/arch/powerpc/kernel/exceptions-64s.S b/arch/powerpc/kernel/exceptions-64s.S
+index 711e92e0a20c..39382e28fa5a 100644
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@ -126,7 +126,7 @@ BEGIN_FTR_SECTION
+ 	bgt	cr1,.
+ 	GET_PACA(r13)
+ 
+-#ifdef CONFIG_KVM_BOOK3S_64_HV
++#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	li	r0,KVM_HWTHREAD_IN_KERNEL
+ 	stb	r0,HSTATE_HWTHREAD_STATE(r13)
+ 	/* Order setting hwthread_state vs. testing hwthread_req */
+diff --git a/arch/powerpc/kvm/44x.c b/arch/powerpc/kvm/44x.c
+index 2f5c6b6d6877..a765bcd74fbb 100644
+--- a/arch/powerpc/kvm/44x.c
++++ b/arch/powerpc/kvm/44x.c
+@@ -31,13 +31,13 @@
+ #include "44x_tlb.h"
+ #include "booke.h"
+ 
+-void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++static void kvmppc_core_vcpu_load_44x(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	kvmppc_booke_vcpu_load(vcpu, cpu);
+ 	kvmppc_44x_tlb_load(vcpu);
+ }
+ 
+-void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_put_44x(struct kvm_vcpu *vcpu)
+ {
+ 	kvmppc_44x_tlb_put(vcpu);
+ 	kvmppc_booke_vcpu_put(vcpu);
+@@ -114,29 +114,32 @@ int kvmppc_core_vcpu_translate(struct kvm_vcpu *vcpu,
+ 	return 0;
+ }
+ 
+-void kvmppc_core_get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
++static int kvmppc_core_get_sregs_44x(struct kvm_vcpu *vcpu,
++				      struct kvm_sregs *sregs)
+ {
+-	kvmppc_get_sregs_ivor(vcpu, sregs);
++	return kvmppc_get_sregs_ivor(vcpu, sregs);
+ }
+ 
+-int kvmppc_core_set_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
++static int kvmppc_core_set_sregs_44x(struct kvm_vcpu *vcpu,
++				     struct kvm_sregs *sregs)
+ {
+ 	return kvmppc_set_sregs_ivor(vcpu, sregs);
+ }
+ 
+-int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id,
+-			union kvmppc_one_reg *val)
++static int kvmppc_get_one_reg_44x(struct kvm_vcpu *vcpu, u64 id,
++				  union kvmppc_one_reg *val)
+ {
+ 	return -EINVAL;
+ }
+ 
+-int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id,
+-		       union kvmppc_one_reg *val)
++static int kvmppc_set_one_reg_44x(struct kvm_vcpu *vcpu, u64 id,
++				  union kvmppc_one_reg *val)
+ {
+ 	return -EINVAL;
+ }
+ 
+-struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
++static struct kvm_vcpu *kvmppc_core_vcpu_create_44x(struct kvm *kvm,
++						    unsigned int id)
+ {
+ 	struct kvmppc_vcpu_44x *vcpu_44x;
+ 	struct kvm_vcpu *vcpu;
+@@ -167,7 +170,7 @@ out:
+ 	return ERR_PTR(err);
+ }
+ 
+-void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_free_44x(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvmppc_vcpu_44x *vcpu_44x = to_44x(vcpu);
+ 
+@@ -176,24 +179,46 @@ void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
+ 	kmem_cache_free(kvm_vcpu_cache, vcpu_44x);
+ }
+ 
+-int kvmppc_core_init_vm(struct kvm *kvm)
++static int kvmppc_core_init_vm_44x(struct kvm *kvm)
+ {
+ 	return 0;
+ }
+ 
+-void kvmppc_core_destroy_vm(struct kvm *kvm)
++static void kvmppc_core_destroy_vm_44x(struct kvm *kvm)
+ {
+ }
+ 
++static struct kvmppc_ops kvm_ops_44x = {
++	.get_sregs = kvmppc_core_get_sregs_44x,
++	.set_sregs = kvmppc_core_set_sregs_44x,
++	.get_one_reg = kvmppc_get_one_reg_44x,
++	.set_one_reg = kvmppc_set_one_reg_44x,
++	.vcpu_load   = kvmppc_core_vcpu_load_44x,
++	.vcpu_put    = kvmppc_core_vcpu_put_44x,
++	.vcpu_create = kvmppc_core_vcpu_create_44x,
++	.vcpu_free   = kvmppc_core_vcpu_free_44x,
++	.mmu_destroy  = kvmppc_mmu_destroy_44x,
++	.init_vm = kvmppc_core_init_vm_44x,
++	.destroy_vm = kvmppc_core_destroy_vm_44x,
++	.emulate_op = kvmppc_core_emulate_op_44x,
++	.emulate_mtspr = kvmppc_core_emulate_mtspr_44x,
++	.emulate_mfspr = kvmppc_core_emulate_mfspr_44x,
++};
++
+ static int __init kvmppc_44x_init(void)
+ {
+ 	int r;
+ 
+ 	r = kvmppc_booke_init();
+ 	if (r)
+-		return r;
++		goto err_out;
+ 
+-	return kvm_init(NULL, sizeof(struct kvmppc_vcpu_44x), 0, THIS_MODULE);
++	r = kvm_init(&kvm_ops_44x, sizeof(struct kvmppc_vcpu_44x),
++		     0, THIS_MODULE);
++	if (r)
++		goto err_out;
++err_out:
++	return r;
+ }
+ 
+ static void __exit kvmppc_44x_exit(void)
+diff --git a/arch/powerpc/kvm/44x_emulate.c b/arch/powerpc/kvm/44x_emulate.c
+index 35ec0a8547da..92c9ab4bcfec 100644
+--- a/arch/powerpc/kvm/44x_emulate.c
++++ b/arch/powerpc/kvm/44x_emulate.c
+@@ -91,8 +91,8 @@ static int emulate_mfdcr(struct kvm_vcpu *vcpu, int rt, int dcrn)
+ 	return EMULATE_DONE;
+ }
+ 
+-int kvmppc_core_emulate_op(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                           unsigned int inst, int *advance)
++int kvmppc_core_emulate_op_44x(struct kvm_run *run, struct kvm_vcpu *vcpu,
++			       unsigned int inst, int *advance)
+ {
+ 	int emulated = EMULATE_DONE;
+ 	int dcrn = get_dcrn(inst);
+@@ -152,7 +152,7 @@ int kvmppc_core_emulate_op(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	return emulated;
+ }
+ 
+-int kvmppc_core_emulate_mtspr(struct kvm_vcpu *vcpu, int sprn, ulong spr_val)
++int kvmppc_core_emulate_mtspr_44x(struct kvm_vcpu *vcpu, int sprn, ulong spr_val)
+ {
+ 	int emulated = EMULATE_DONE;
+ 
+@@ -172,7 +172,7 @@ int kvmppc_core_emulate_mtspr(struct kvm_vcpu *vcpu, int sprn, ulong spr_val)
+ 	return emulated;
+ }
+ 
+-int kvmppc_core_emulate_mfspr(struct kvm_vcpu *vcpu, int sprn, ulong *spr_val)
++int kvmppc_core_emulate_mfspr_44x(struct kvm_vcpu *vcpu, int sprn, ulong *spr_val)
+ {
+ 	int emulated = EMULATE_DONE;
+ 
+diff --git a/arch/powerpc/kvm/44x_tlb.c b/arch/powerpc/kvm/44x_tlb.c
+index ed0385448148..0deef1082e02 100644
+--- a/arch/powerpc/kvm/44x_tlb.c
++++ b/arch/powerpc/kvm/44x_tlb.c
+@@ -268,7 +268,7 @@ static void kvmppc_44x_shadow_release(struct kvmppc_vcpu_44x *vcpu_44x,
+ 	trace_kvm_stlb_inval(stlb_index);
+ }
+ 
+-void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
++void kvmppc_mmu_destroy_44x(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvmppc_vcpu_44x *vcpu_44x = to_44x(vcpu);
+ 	int i;
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index 807103ad2628..784a1d5ccb04 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -422,6 +422,18 @@ void kvmppc_subarch_vcpu_uninit(struct kvm_vcpu *vcpu)
+ {
+ }
+ 
++int kvm_arch_vcpu_ioctl_get_sregs(struct kvm_vcpu *vcpu,
++				  struct kvm_sregs *sregs)
++{
++	return kvmppc_ops->get_sregs(vcpu, sregs);
++}
++
++int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
++				  struct kvm_sregs *sregs)
++{
++	return kvmppc_ops->set_sregs(vcpu, sregs);
++}
++
+ int kvm_arch_vcpu_ioctl_get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
+ {
+ 	int i;
+@@ -498,8 +510,7 @@ int kvm_vcpu_ioctl_get_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+ 	if (size > sizeof(val))
+ 		return -EINVAL;
+ 
+-	r = kvmppc_get_one_reg(vcpu, reg->id, &val);
+-
++	r = kvmppc_ops->get_one_reg(vcpu, reg->id, &val);
+ 	if (r == -EINVAL) {
+ 		r = 0;
+ 		switch (reg->id) {
+@@ -578,8 +589,7 @@ int kvm_vcpu_ioctl_set_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+ 	if (copy_from_user(&val, (char __user *)(unsigned long)reg->addr, size))
+ 		return -EFAULT;
+ 
+-	r = kvmppc_set_one_reg(vcpu, reg->id, &val);
+-
++	r = kvmppc_ops->set_one_reg(vcpu, reg->id, &val);
+ 	if (r == -EINVAL) {
+ 		r = 0;
+ 		switch (reg->id) {
+@@ -638,6 +648,26 @@ int kvm_vcpu_ioctl_set_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+ 	return r;
+ }
+ 
++void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++{
++	kvmppc_ops->vcpu_load(vcpu, cpu);
++}
++
++void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
++{
++	kvmppc_ops->vcpu_put(vcpu);
++}
++
++void kvmppc_set_msr(struct kvm_vcpu *vcpu, u64 msr)
++{
++	kvmppc_ops->set_msr(vcpu, msr);
++}
++
++int kvmppc_vcpu_run(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
++{
++	return kvmppc_ops->vcpu_run(kvm_run, vcpu);
++}
++
+ int kvm_arch_vcpu_ioctl_translate(struct kvm_vcpu *vcpu,
+                                   struct kvm_translation *tr)
+ {
+@@ -657,3 +687,110 @@ void kvmppc_decrementer_func(unsigned long data)
+ 	kvmppc_core_queue_dec(vcpu);
+ 	kvm_vcpu_kick(vcpu);
+ }
++
++struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
++{
++	return kvmppc_ops->vcpu_create(kvm, id);
++}
++
++void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
++{
++	kvmppc_ops->vcpu_free(vcpu);
++}
++
++int kvmppc_core_check_requests(struct kvm_vcpu *vcpu)
++{
++	return kvmppc_ops->check_requests(vcpu);
++}
++
++int kvm_vm_ioctl_get_dirty_log(struct kvm *kvm, struct kvm_dirty_log *log)
++{
++	return kvmppc_ops->get_dirty_log(kvm, log);
++}
++
++void kvmppc_core_free_memslot(struct kvm_memory_slot *free,
++			      struct kvm_memory_slot *dont)
++{
++	kvmppc_ops->free_memslot(free, dont);
++}
++
++int kvmppc_core_create_memslot(struct kvm_memory_slot *slot,
++			       unsigned long npages)
++{
++	return kvmppc_ops->create_memslot(slot, npages);
++}
++
++void kvmppc_core_flush_memslot(struct kvm *kvm, struct kvm_memory_slot *memslot)
++{
++	kvmppc_ops->flush_memslot(kvm, memslot);
++}
++
++int kvmppc_core_prepare_memory_region(struct kvm *kvm,
++				struct kvm_memory_slot *memslot,
++				struct kvm_userspace_memory_region *mem)
++{
++	return kvmppc_ops->prepare_memory_region(kvm, memslot, mem);
++}
++
++void kvmppc_core_commit_memory_region(struct kvm *kvm,
++				struct kvm_userspace_memory_region *mem,
++				const struct kvm_memory_slot *old)
++{
++	kvmppc_ops->commit_memory_region(kvm, mem, old);
++}
++
++int kvm_unmap_hva(struct kvm *kvm, unsigned long hva)
++{
++	return kvmppc_ops->unmap_hva(kvm, hva);
++}
++
++int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end)
++{
++	return kvmppc_ops->unmap_hva_range(kvm, start, end);
++}
++
++int kvm_age_hva(struct kvm *kvm, unsigned long hva)
++{
++	return kvmppc_ops->age_hva(kvm, hva);
++}
++
++int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
++{
++	return kvmppc_ops->test_age_hva(kvm, hva);
++}
++
++void kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte)
++{
++	kvmppc_ops->set_spte_hva(kvm, hva, pte);
++}
++
++void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
++{
++	kvmppc_ops->mmu_destroy(vcpu);
++}
++
++int kvmppc_core_init_vm(struct kvm *kvm)
++{
++
++#ifdef CONFIG_PPC64
++	INIT_LIST_HEAD(&kvm->arch.spapr_tce_tables);
++	INIT_LIST_HEAD(&kvm->arch.rtas_tokens);
++#endif
++
++	return kvmppc_ops->init_vm(kvm);
++}
++
++void kvmppc_core_destroy_vm(struct kvm *kvm)
++{
++	kvmppc_ops->destroy_vm(kvm);
++
++#ifdef CONFIG_PPC64
++	kvmppc_rtas_tokens_free(kvm);
++	WARN_ON(!list_empty(&kvm->arch.spapr_tce_tables));
++#endif
++}
++
++int kvmppc_core_check_processor_compat(void)
++{
++	return kvmppc_ops->check_processor_compat();
++}
+diff --git a/arch/powerpc/kvm/book3s.h b/arch/powerpc/kvm/book3s.h
+new file mode 100644
+index 000000000000..9e5b3a341943
+--- /dev/null
++++ b/arch/powerpc/kvm/book3s.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright IBM Corporation, 2013
++ * Author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License or (at your optional) any later version of the license.
++ *
++ */
++
++#ifndef __POWERPC_KVM_BOOK3S_H__
++#define __POWERPC_KVM_BOOK3S_H__
++
++extern void kvmppc_core_flush_memslot_hv(struct kvm *kvm,
++					 struct kvm_memory_slot *memslot);
++extern int kvm_unmap_hva_hv(struct kvm *kvm, unsigned long hva);
++extern int kvm_unmap_hva_range_hv(struct kvm *kvm, unsigned long start,
++				  unsigned long end);
++extern int kvm_age_hva_hv(struct kvm *kvm, unsigned long hva);
++extern int kvm_test_age_hva_hv(struct kvm *kvm, unsigned long hva);
++extern void kvm_set_spte_hva_hv(struct kvm *kvm, unsigned long hva, pte_t pte);
++
++extern void kvmppc_mmu_destroy_pr(struct kvm_vcpu *vcpu);
++extern int kvmppc_core_emulate_op_pr(struct kvm_run *run, struct kvm_vcpu *vcpu,
++				     unsigned int inst, int *advance);
++extern int kvmppc_core_emulate_mtspr_pr(struct kvm_vcpu *vcpu,
++					int sprn, ulong spr_val);
++extern int kvmppc_core_emulate_mfspr_pr(struct kvm_vcpu *vcpu,
++					int sprn, ulong *spr_val);
++
++#endif
+diff --git a/arch/powerpc/kvm/book3s_32_mmu_host.c b/arch/powerpc/kvm/book3s_32_mmu_host.c
+index 673322329238..3a0abd2e5a15 100644
+--- a/arch/powerpc/kvm/book3s_32_mmu_host.c
++++ b/arch/powerpc/kvm/book3s_32_mmu_host.c
+@@ -349,7 +349,7 @@ void kvmppc_mmu_flush_segments(struct kvm_vcpu *vcpu)
+ 	svcpu_put(svcpu);
+ }
+ 
+-void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
++void kvmppc_mmu_destroy_pr(struct kvm_vcpu *vcpu)
+ {
+ 	int i;
+ 
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_host.c b/arch/powerpc/kvm/book3s_64_mmu_host.c
+index e2ab8a747fbe..819672c9d787 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_host.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_host.c
+@@ -378,7 +378,7 @@ void kvmppc_mmu_flush_segments(struct kvm_vcpu *vcpu)
+ 	svcpu_put(svcpu);
+ }
+ 
+-void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
++void kvmppc_mmu_destroy_pr(struct kvm_vcpu *vcpu)
+ {
+ 	kvmppc_mmu_hpte_destroy(vcpu);
+ 	__destroy_context(to_book3s(vcpu)->context_id[0]);
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 511548d43e27..6e1e31d820de 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -260,10 +260,6 @@ int kvmppc_mmu_hv_init(void)
+ 	return 0;
+ }
+ 
+-void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
+-{
+-}
+-
+ static void kvmppc_mmu_book3s_64_hv_reset_msr(struct kvm_vcpu *vcpu)
+ {
+ 	kvmppc_set_msr(vcpu, MSR_SF | MSR_ME);
+@@ -906,21 +902,22 @@ static int kvm_unmap_rmapp(struct kvm *kvm, unsigned long *rmapp,
+ 	return 0;
+ }
+ 
+-int kvm_unmap_hva(struct kvm *kvm, unsigned long hva)
++int kvm_unmap_hva_hv(struct kvm *kvm, unsigned long hva)
+ {
+ 	if (kvm->arch.using_mmu_notifiers)
+ 		kvm_handle_hva(kvm, hva, kvm_unmap_rmapp);
+ 	return 0;
+ }
+ 
+-int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end)
++int kvm_unmap_hva_range_hv(struct kvm *kvm, unsigned long start, unsigned long end)
+ {
+ 	if (kvm->arch.using_mmu_notifiers)
+ 		kvm_handle_hva_range(kvm, start, end, kvm_unmap_rmapp);
+ 	return 0;
+ }
+ 
+-void kvmppc_core_flush_memslot(struct kvm *kvm, struct kvm_memory_slot *memslot)
++void kvmppc_core_flush_memslot_hv(struct kvm *kvm,
++				  struct kvm_memory_slot *memslot)
+ {
+ 	unsigned long *rmapp;
+ 	unsigned long gfn;
+@@ -994,7 +991,7 @@ static int kvm_age_rmapp(struct kvm *kvm, unsigned long *rmapp,
+ 	return ret;
+ }
+ 
+-int kvm_age_hva(struct kvm *kvm, unsigned long hva)
++int kvm_age_hva_hv(struct kvm *kvm, unsigned long hva)
+ {
+ 	if (!kvm->arch.using_mmu_notifiers)
+ 		return 0;
+@@ -1032,14 +1029,14 @@ static int kvm_test_age_rmapp(struct kvm *kvm, unsigned long *rmapp,
+ 	return ret;
+ }
+ 
+-int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
++int kvm_test_age_hva_hv(struct kvm *kvm, unsigned long hva)
+ {
+ 	if (!kvm->arch.using_mmu_notifiers)
+ 		return 0;
+ 	return kvm_handle_hva(kvm, hva, kvm_test_age_rmapp);
+ }
+ 
+-void kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte)
++void kvm_set_spte_hva_hv(struct kvm *kvm, unsigned long hva, pte_t pte)
+ {
+ 	if (!kvm->arch.using_mmu_notifiers)
+ 		return;
+diff --git a/arch/powerpc/kvm/book3s_emulate.c b/arch/powerpc/kvm/book3s_emulate.c
+index 2a7210cb2844..56715cf6aaa5 100644
+--- a/arch/powerpc/kvm/book3s_emulate.c
++++ b/arch/powerpc/kvm/book3s_emulate.c
+@@ -86,8 +86,8 @@ static bool spr_allowed(struct kvm_vcpu *vcpu, enum priv_level level)
+ 	return true;
+ }
+ 
+-int kvmppc_core_emulate_op(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                           unsigned int inst, int *advance)
++int kvmppc_core_emulate_op_pr(struct kvm_run *run, struct kvm_vcpu *vcpu,
++			      unsigned int inst, int *advance)
+ {
+ 	int emulated = EMULATE_DONE;
+ 	int rt = get_rt(inst);
+@@ -345,7 +345,7 @@ static struct kvmppc_bat *kvmppc_find_bat(struct kvm_vcpu *vcpu, int sprn)
+ 	return bat;
+ }
+ 
+-int kvmppc_core_emulate_mtspr(struct kvm_vcpu *vcpu, int sprn, ulong spr_val)
++int kvmppc_core_emulate_mtspr_pr(struct kvm_vcpu *vcpu, int sprn, ulong spr_val)
+ {
+ 	int emulated = EMULATE_DONE;
+ 
+@@ -467,7 +467,7 @@ unprivileged:
+ 	return emulated;
+ }
+ 
+-int kvmppc_core_emulate_mfspr(struct kvm_vcpu *vcpu, int sprn, ulong *spr_val)
++int kvmppc_core_emulate_mfspr_pr(struct kvm_vcpu *vcpu, int sprn, ulong *spr_val)
+ {
+ 	int emulated = EMULATE_DONE;
+ 
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/kvm/book3s_interrupts.S b/arch/powerpc/kvm/book3s_interrupts.S
+index 38166ab2f19c..f4dd041c14ea 100644
+--- a/arch/powerpc/kvm/book3s_interrupts.S
++++ b/arch/powerpc/kvm/book3s_interrupts.S
+@@ -181,7 +181,7 @@ kvm_start_lightweight:
+ 
+ 	/* Restore r3 (kvm_run) and r4 (vcpu) */
+ 	REST_2GPRS(3, r1)
+-	bl	FUNC(kvmppc_handle_exit)
++	bl	FUNC(kvmppc_handle_exit_pr)
+ 
+ 	/* If RESUME_GUEST, get back in the loop */
+ 	cmpwi	r3, RESUME_GUEST
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index d10e1186f935..a208465c5674 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -41,6 +41,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/highmem.h>
+ 
++#include "book3s.h"
+ #include "trace.h"
+ 
+ /* #define EXIT_DEBUG */
+@@ -56,7 +57,7 @@ static int kvmppc_handle_ext(struct kvm_vcpu *vcpu, unsigned int exit_nr,
+ #define HW_PAGE_SIZE PAGE_SIZE
+ #endif
+ 
+-void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++static void kvmppc_core_vcpu_load_pr(struct kvm_vcpu *vcpu, int cpu)
+ {
+ #ifdef CONFIG_PPC_BOOK3S_64
+ 	struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+@@ -70,7 +71,7 @@ void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ #endif
+ }
+ 
+-void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_put_pr(struct kvm_vcpu *vcpu)
+ {
+ #ifdef CONFIG_PPC_BOOK3S_64
+ 	struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+@@ -137,7 +138,7 @@ void kvmppc_copy_from_svcpu(struct kvm_vcpu *vcpu,
+ 	vcpu->arch.last_inst   = svcpu->last_inst;
+ }
+ 
+-int kvmppc_core_check_requests(struct kvm_vcpu *vcpu)
++static int kvmppc_core_check_requests_pr(struct kvm_vcpu *vcpu)
+ {
+ 	int r = 1; /* Indicate we want to get back into the guest */
+ 
+@@ -180,7 +181,7 @@ static void do_kvm_unmap_hva(struct kvm *kvm, unsigned long start,
+ 	}
+ }
+ 
+-int kvm_unmap_hva(struct kvm *kvm, unsigned long hva)
++static int kvm_unmap_hva_pr(struct kvm *kvm, unsigned long hva)
+ {
+ 	trace_kvm_unmap_hva(hva);
+ 
+@@ -189,26 +190,27 @@ int kvm_unmap_hva(struct kvm *kvm, unsigned long hva)
+ 	return 0;
+ }
+ 
+-int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end)
++static int kvm_unmap_hva_range_pr(struct kvm *kvm, unsigned long start,
++				  unsigned long end)
+ {
+ 	do_kvm_unmap_hva(kvm, start, end);
+ 
+ 	return 0;
+ }
+ 
+-int kvm_age_hva(struct kvm *kvm, unsigned long hva)
++static int kvm_age_hva_pr(struct kvm *kvm, unsigned long hva)
+ {
+ 	/* XXX could be more clever ;) */
+ 	return 0;
+ }
+ 
+-int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
++static int kvm_test_age_hva_pr(struct kvm *kvm, unsigned long hva)
+ {
+ 	/* XXX could be more clever ;) */
+ 	return 0;
+ }
+ 
+-void kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte)
++static void kvm_set_spte_hva_pr(struct kvm *kvm, unsigned long hva, pte_t pte)
+ {
+ 	/* The page will get remapped properly on its next fault */
+ 	do_kvm_unmap_hva(kvm, hva, hva + PAGE_SIZE);
+@@ -233,7 +235,7 @@ static void kvmppc_recalc_shadow_msr(struct kvm_vcpu *vcpu)
+ 	vcpu->arch.shadow_msr = smsr;
+ }
+ 
+-void kvmppc_set_msr(struct kvm_vcpu *vcpu, u64 msr)
++static void kvmppc_set_msr_pr(struct kvm_vcpu *vcpu, u64 msr)
+ {
+ 	ulong old_msr = vcpu->arch.shared->msr;
+ 
+@@ -293,7 +295,7 @@ void kvmppc_set_msr(struct kvm_vcpu *vcpu, u64 msr)
+ 		kvmppc_handle_ext(vcpu, BOOK3S_INTERRUPT_FP_UNAVAIL, MSR_FP);
+ }
+ 
+-void kvmppc_set_pvr(struct kvm_vcpu *vcpu, u32 pvr)
++void kvmppc_set_pvr_pr(struct kvm_vcpu *vcpu, u32 pvr)
+ {
+ 	u32 host_pvr;
+ 
+@@ -723,8 +725,8 @@ static void kvmppc_handle_lost_ext(struct kvm_vcpu *vcpu)
+ 	current->thread.regs->msr |= lost_ext;
+ }
+ 
+-int kvmppc_handle_exit(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                       unsigned int exit_nr)
++int kvmppc_handle_exit_pr(struct kvm_run *run, struct kvm_vcpu *vcpu,
++			  unsigned int exit_nr)
+ {
+ 	int r = RESUME_HOST;
+ 	int s;
+@@ -1032,8 +1034,8 @@ program_interrupt:
+ 	return r;
+ }
+ 
+-int kvm_arch_vcpu_ioctl_get_sregs(struct kvm_vcpu *vcpu,
+-                                  struct kvm_sregs *sregs)
++static int kvm_arch_vcpu_ioctl_get_sregs_pr(struct kvm_vcpu *vcpu,
++					    struct kvm_sregs *sregs)
+ {
+ 	struct kvmppc_vcpu_book3s *vcpu3s = to_book3s(vcpu);
+ 	int i;
+@@ -1059,13 +1061,13 @@ int kvm_arch_vcpu_ioctl_get_sregs(struct kvm_vcpu *vcpu,
+ 	return 0;
+ }
+ 
+-int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
+-                                  struct kvm_sregs *sregs)
++static int kvm_arch_vcpu_ioctl_set_sregs_pr(struct kvm_vcpu *vcpu,
++					    struct kvm_sregs *sregs)
+ {
+ 	struct kvmppc_vcpu_book3s *vcpu3s = to_book3s(vcpu);
+ 	int i;
+ 
+-	kvmppc_set_pvr(vcpu, sregs->pvr);
++	kvmppc_set_pvr_pr(vcpu, sregs->pvr);
+ 
+ 	vcpu3s->sdr1 = sregs->u.s.sdr1;
+ 	if (vcpu->arch.hflags & BOOK3S_HFLAG_SLB) {
+@@ -1095,7 +1097,8 @@ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
+ 	return 0;
+ }
+ 
+-int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
++static int kvmppc_get_one_reg_pr(struct kvm_vcpu *vcpu, u64 id,
++				 union kvmppc_one_reg *val)
+ {
+ 	int r = 0;
+ 
+@@ -1124,7 +1127,8 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+ 	return r;
+ }
+ 
+-int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
++static int kvmppc_set_one_reg_pr(struct kvm_vcpu *vcpu, u64 id,
++				 union kvmppc_one_reg *val)
+ {
+ 	int r = 0;
+ 
+@@ -1154,12 +1158,8 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+ 	return r;
+ }
+ 
+-int kvmppc_core_check_processor_compat(void)
+-{
+-	return 0;
+-}
+-
+-struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
++static struct kvm_vcpu *kvmppc_core_vcpu_create_pr(struct kvm *kvm,
++						   unsigned int id)
+ {
+ 	struct kvmppc_vcpu_book3s *vcpu_book3s;
+ 	struct kvm_vcpu *vcpu;
+@@ -1206,7 +1206,7 @@ struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
+ 	/* default to book3s_32 (750) */
+ 	vcpu->arch.pvr = 0x84202;
+ #endif
+-	kvmppc_set_pvr(vcpu, vcpu->arch.pvr);
++	kvmppc_set_pvr_pr(vcpu, vcpu->arch.pvr);
+ 	vcpu->arch.slb_nr = 64;
+ 
+ 	vcpu->arch.shadow_msr = MSR_USER64;
+@@ -1231,7 +1231,7 @@ out:
+ 	return ERR_PTR(err);
+ }
+ 
+-void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_free_pr(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+ 
+@@ -1244,7 +1244,7 @@ void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
+ 	kmem_cache_free(kvm_vcpu_cache, vcpu);
+ }
+ 
+-int kvmppc_vcpu_run(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
++static int kvmppc_vcpu_run_pr(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
+ {
+ 	int ret;
+ 	struct thread_fp_state fp;
+@@ -1347,8 +1347,8 @@ out:
+ /*
+  * Get (and clear) the dirty memory log for a memory slot.
+  */
+-int kvm_vm_ioctl_get_dirty_log(struct kvm *kvm,
+-				      struct kvm_dirty_log *log)
++static int kvm_vm_ioctl_get_dirty_log_pr(struct kvm *kvm,
++					 struct kvm_dirty_log *log)
+ {
+ 	struct kvm_memory_slot *memslot;
+ 	struct kvm_vcpu *vcpu;
+@@ -1383,8 +1383,42 @@ out:
+ 	return r;
+ }
+ 
++static void kvmppc_core_flush_memslot_pr(struct kvm *kvm,
++					 struct kvm_memory_slot *memslot)
++{
++	return;
++}
++
++static int kvmppc_core_prepare_memory_region_pr(struct kvm *kvm,
++					struct kvm_memory_slot *memslot,
++					struct kvm_userspace_memory_region *mem)
++{
++	return 0;
++}
++
++static void kvmppc_core_commit_memory_region_pr(struct kvm *kvm,
++				struct kvm_userspace_memory_region *mem,
++				const struct kvm_memory_slot *old)
++{
++	return;
++}
++
++static void kvmppc_core_free_memslot_pr(struct kvm_memory_slot *free,
++					struct kvm_memory_slot *dont)
++{
++	return;
++}
++
++static int kvmppc_core_create_memslot_pr(struct kvm_memory_slot *slot,
++					 unsigned long npages)
++{
++	return 0;
++}
++
++
+ #ifdef CONFIG_PPC64
+-int kvm_vm_ioctl_get_smmu_info(struct kvm *kvm, struct kvm_ppc_smmu_info *info)
++static int kvm_vm_ioctl_get_smmu_info_pr(struct kvm *kvm,
++					 struct kvm_ppc_smmu_info *info)
+ {
+ 	long int i;
+ 	struct kvm_vcpu *vcpu;
+@@ -1428,45 +1462,20 @@ int kvm_vm_ioctl_get_smmu_info(struct kvm *kvm, struct kvm_ppc_smmu_info *info)
+ 
+ 	return 0;
+ }
+-#endif /* CONFIG_PPC64 */
+-
+-void kvmppc_core_free_memslot(struct kvm_memory_slot *free,
+-			      struct kvm_memory_slot *dont)
+-{
+-}
+-
+-int kvmppc_core_create_memslot(struct kvm_memory_slot *slot,
+-			       unsigned long npages)
+-{
+-	return 0;
+-}
+-
+-int kvmppc_core_prepare_memory_region(struct kvm *kvm,
+-				      struct kvm_memory_slot *memslot,
+-				      struct kvm_userspace_memory_region *mem)
+-{
+-	return 0;
+-}
+-
+-void kvmppc_core_commit_memory_region(struct kvm *kvm,
+-				struct kvm_userspace_memory_region *mem,
+-				const struct kvm_memory_slot *old)
+-{
+-}
+-
+-void kvmppc_core_flush_memslot(struct kvm *kvm, struct kvm_memory_slot *memslot)
++#else
++static int kvm_vm_ioctl_get_smmu_info_pr(struct kvm *kvm,
++					 struct kvm_ppc_smmu_info *info)
+ {
++	/* We should not get called */
++	BUG();
+ }
++#endif /* CONFIG_PPC64 */
+ 
+ static unsigned int kvm_global_user_count = 0;
+ static DEFINE_SPINLOCK(kvm_global_user_count_lock);
+ 
+-int kvmppc_core_init_vm(struct kvm *kvm)
++static int kvmppc_core_init_vm_pr(struct kvm *kvm)
+ {
+-#ifdef CONFIG_PPC64
+-	INIT_LIST_HEAD(&kvm->arch.spapr_tce_tables);
+-	INIT_LIST_HEAD(&kvm->arch.rtas_tokens);
+-#endif
+ 	mutex_init(&kvm->arch.hpt_mutex);
+ 
+ 	if (firmware_has_feature(FW_FEATURE_SET_MODE)) {
+@@ -1478,7 +1487,7 @@ int kvmppc_core_init_vm(struct kvm *kvm)
+ 	return 0;
+ }
+ 
+-void kvmppc_core_destroy_vm(struct kvm *kvm)
++static void kvmppc_core_destroy_vm_pr(struct kvm *kvm)
+ {
+ #ifdef CONFIG_PPC64
+ 	WARN_ON(!list_empty(&kvm->arch.spapr_tce_tables));
+@@ -1493,11 +1502,58 @@ void kvmppc_core_destroy_vm(struct kvm *kvm)
+ 	}
+ }
+ 
+-static int kvmppc_book3s_init(void)
++static int kvmppc_core_check_processor_compat_pr(void)
++{
++	/* we are always compatible */
++	return 0;
++}
++
++static long kvm_arch_vm_ioctl_pr(struct file *filp,
++				 unsigned int ioctl, unsigned long arg)
++{
++	return -ENOTTY;
++}
++
++static struct kvmppc_ops kvmppc_pr_ops = {
++	.get_sregs = kvm_arch_vcpu_ioctl_get_sregs_pr,
++	.set_sregs = kvm_arch_vcpu_ioctl_set_sregs_pr,
++	.get_one_reg = kvmppc_get_one_reg_pr,
++	.set_one_reg = kvmppc_set_one_reg_pr,
++	.vcpu_load   = kvmppc_core_vcpu_load_pr,
++	.vcpu_put    = kvmppc_core_vcpu_put_pr,
++	.set_msr     = kvmppc_set_msr_pr,
++	.vcpu_run    = kvmppc_vcpu_run_pr,
++	.vcpu_create = kvmppc_core_vcpu_create_pr,
++	.vcpu_free   = kvmppc_core_vcpu_free_pr,
++	.check_requests = kvmppc_core_check_requests_pr,
++	.get_dirty_log = kvm_vm_ioctl_get_dirty_log_pr,
++	.flush_memslot = kvmppc_core_flush_memslot_pr,
++	.prepare_memory_region = kvmppc_core_prepare_memory_region_pr,
++	.commit_memory_region = kvmppc_core_commit_memory_region_pr,
++	.unmap_hva = kvm_unmap_hva_pr,
++	.unmap_hva_range = kvm_unmap_hva_range_pr,
++	.age_hva  = kvm_age_hva_pr,
++	.test_age_hva = kvm_test_age_hva_pr,
++	.set_spte_hva = kvm_set_spte_hva_pr,
++	.mmu_destroy  = kvmppc_mmu_destroy_pr,
++	.free_memslot = kvmppc_core_free_memslot_pr,
++	.create_memslot = kvmppc_core_create_memslot_pr,
++	.init_vm = kvmppc_core_init_vm_pr,
++	.destroy_vm = kvmppc_core_destroy_vm_pr,
++	.check_processor_compat = kvmppc_core_check_processor_compat_pr,
++	.get_smmu_info = kvm_vm_ioctl_get_smmu_info_pr,
++	.emulate_op = kvmppc_core_emulate_op_pr,
++	.emulate_mtspr = kvmppc_core_emulate_mtspr_pr,
++	.emulate_mfspr = kvmppc_core_emulate_mfspr_pr,
++	.fast_vcpu_kick = kvm_vcpu_kick,
++	.arch_vm_ioctl  = kvm_arch_vm_ioctl_pr,
++};
++
++static int kvmppc_book3s_init_pr(void)
+ {
+ 	int r;
+ 
+-	r = kvm_init(NULL, sizeof(struct kvm_vcpu), 0, THIS_MODULE);
++	r = kvm_init(&kvmppc_pr_ops, sizeof(struct kvm_vcpu), 0, THIS_MODULE);
+ 
+ 	if (r)
+ 		return r;
+@@ -1507,11 +1563,11 @@ static int kvmppc_book3s_init(void)
+ 	return r;
+ }
+ 
+-static void kvmppc_book3s_exit(void)
++static void kvmppc_book3s_exit_pr(void)
+ {
+ 	kvmppc_mmu_hpte_sysexit();
+ 	kvm_exit();
+ }
+ 
+-module_init(kvmppc_book3s_init);
+-module_exit(kvmppc_book3s_exit);
++module_init(kvmppc_book3s_init_pr);
++module_exit(kvmppc_book3s_exit_pr);
+diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
+index a3a5cb8ee7ea..51ed1ea440e0 100644
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@ -1250,13 +1250,13 @@ static int kvmppc_xics_create(struct kvm_device *dev, u32 type)
+ 
+ 	xics_debugfs_init(xics);
+ 
+-#ifdef CONFIG_KVM_BOOK3S_64_HV
++#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	if (cpu_has_feature(CPU_FTR_ARCH_206)) {
+ 		/* Enable real mode support */
+ 		xics->real_mode = ENABLE_REALMODE;
+ 		xics->real_mode_dbg = DEBUG_REALMODE;
+ 	}
+-#endif /* CONFIG_KVM_BOOK3S_64_HV */
++#endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+ 
+ 	return 0;
+ }
+diff --git a/arch/powerpc/kvm/booke.c b/arch/powerpc/kvm/booke.c
+index 85c3c7dce77a..2acca772c63d 100644
+--- a/arch/powerpc/kvm/booke.c
++++ b/arch/powerpc/kvm/booke.c
+@@ -1360,7 +1360,7 @@ static int set_sregs_arch206(struct kvm_vcpu *vcpu,
+ 	return 0;
+ }
+ 
+-void kvmppc_get_sregs_ivor(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
++int kvmppc_get_sregs_ivor(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
+ {
+ 	sregs->u.e.features |= KVM_SREGS_E_IVOR;
+ 
+@@ -1380,6 +1380,7 @@ void kvmppc_get_sregs_ivor(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
+ 	sregs->u.e.ivor_low[13] = vcpu->arch.ivor[BOOKE_IRQPRIO_DTLB_MISS];
+ 	sregs->u.e.ivor_low[14] = vcpu->arch.ivor[BOOKE_IRQPRIO_ITLB_MISS];
+ 	sregs->u.e.ivor_low[15] = vcpu->arch.ivor[BOOKE_IRQPRIO_DEBUG];
++	return 0;
+ }
+ 
+ int kvmppc_set_sregs_ivor(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
+@@ -1414,8 +1415,7 @@ int kvm_arch_vcpu_ioctl_get_sregs(struct kvm_vcpu *vcpu,
+ 
+ 	get_sregs_base(vcpu, sregs);
+ 	get_sregs_arch206(vcpu, sregs);
+-	kvmppc_core_get_sregs(vcpu, sregs);
+-	return 0;
++	return kvmppc_ops->get_sregs(vcpu, sregs);
+ }
+ 
+ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
+@@ -1434,7 +1434,7 @@ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	return kvmppc_core_set_sregs(vcpu, sregs);
++	return kvmppc_ops->set_sregs(vcpu, sregs);
+ }
+ 
+ int kvm_vcpu_ioctl_get_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+@@ -1481,7 +1481,7 @@ int kvm_vcpu_ioctl_get_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+ 		val = get_reg_val(reg->id, KVMPPC_INST_EHPRIV);
+ 		break;
+ 	default:
+-		r = kvmppc_get_one_reg(vcpu, reg->id, &val);
++		r = kvmppc_ops->get_one_reg(vcpu, reg->id, &val);
+ 		break;
+ 	}
+ 
+@@ -1554,7 +1554,7 @@ int kvm_vcpu_ioctl_set_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+ 		break;
+ 	}
+ 	default:
+-		r = kvmppc_set_one_reg(vcpu, reg->id, &val);
++		r = kvmppc_ops->set_one_reg(vcpu, reg->id, &val);
+ 		break;
+ 	}
+ 
+@@ -1684,6 +1684,41 @@ void kvmppc_booke_vcpu_put(struct kvm_vcpu *vcpu)
+ 	vcpu->cpu = -1;
+ }
+ 
++void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
++{
++	kvmppc_ops->mmu_destroy(vcpu);
++}
++
++int kvmppc_core_init_vm(struct kvm *kvm)
++{
++	return kvmppc_ops->init_vm(kvm);
++}
++
++struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
++{
++	return kvmppc_ops->vcpu_create(kvm, id);
++}
++
++void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
++{
++	kvmppc_ops->vcpu_free(vcpu);
++}
++
++void kvmppc_core_destroy_vm(struct kvm *kvm)
++{
++	kvmppc_ops->destroy_vm(kvm);
++}
++
++void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++{
++	kvmppc_ops->vcpu_load(vcpu, cpu);
++}
++
++void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
++{
++	kvmppc_ops->vcpu_put(vcpu);
++}
++
+ int __init kvmppc_booke_init(void)
+ {
+ #ifndef CONFIG_KVM_BOOKE_HV
+diff --git a/arch/powerpc/kvm/booke.h b/arch/powerpc/kvm/booke.h
+index 5fd1ba693579..ef6354bafdef 100644
+--- a/arch/powerpc/kvm/booke.h
++++ b/arch/powerpc/kvm/booke.h
+@@ -99,6 +99,30 @@ enum int_class {
+ 
+ void kvmppc_set_pending_interrupt(struct kvm_vcpu *vcpu, enum int_class type);
+ 
++extern void kvmppc_mmu_destroy_44x(struct kvm_vcpu *vcpu);
++extern int kvmppc_core_emulate_op_44x(struct kvm_run *run, struct kvm_vcpu *vcpu,
++				      unsigned int inst, int *advance);
++extern int kvmppc_core_emulate_mtspr_44x(struct kvm_vcpu *vcpu, int sprn,
++					 ulong spr_val);
++extern int kvmppc_core_emulate_mfspr_44x(struct kvm_vcpu *vcpu, int sprn,
++					 ulong *spr_val);
++extern void kvmppc_mmu_destroy_e500(struct kvm_vcpu *vcpu);
++extern int kvmppc_core_emulate_op_e500(struct kvm_run *run,
++				       struct kvm_vcpu *vcpu,
++				       unsigned int inst, int *advance);
++extern int kvmppc_core_emulate_mtspr_e500(struct kvm_vcpu *vcpu, int sprn,
++					  ulong spr_val);
++extern int kvmppc_core_emulate_mfspr_e500(struct kvm_vcpu *vcpu, int sprn,
++					  ulong *spr_val);
++extern void kvmppc_mmu_destroy_e500(struct kvm_vcpu *vcpu);
++extern int kvmppc_core_emulate_op_e500(struct kvm_run *run,
++				       struct kvm_vcpu *vcpu,
++				       unsigned int inst, int *advance);
++extern int kvmppc_core_emulate_mtspr_e500(struct kvm_vcpu *vcpu, int sprn,
++					  ulong spr_val);
++extern int kvmppc_core_emulate_mfspr_e500(struct kvm_vcpu *vcpu, int sprn,
++					  ulong *spr_val);
++
+ /*
+  * Load up guest vcpu FP state if it's needed.
+  * It also set the MSR_FP in thread so that host know
+diff --git a/arch/powerpc/kvm/e500.c b/arch/powerpc/kvm/e500.c
+index ce6b73c29612..d225d5ebddcc 100644
+--- a/arch/powerpc/kvm/e500.c
++++ b/arch/powerpc/kvm/e500.c
+@@ -305,7 +305,7 @@ void kvmppc_core_load_guest_debugstate(struct kvm_vcpu *vcpu)
+ {
+ }
+ 
+-void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++static void kvmppc_core_vcpu_load_e500(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	kvmppc_booke_vcpu_load(vcpu, cpu);
+ 
+@@ -313,7 +313,7 @@ void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	kvmppc_e500_recalc_shadow_pid(to_e500(vcpu));
+ }
+ 
+-void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_put_e500(struct kvm_vcpu *vcpu)
+ {
+ #ifdef CONFIG_SPE
+ 	if (vcpu->arch.shadow_msr & MSR_SPE)
+@@ -367,7 +367,8 @@ int kvmppc_core_vcpu_setup(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
+-void kvmppc_core_get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
++static int kvmppc_core_get_sregs_e500(struct kvm_vcpu *vcpu,
++				      struct kvm_sregs *sregs)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500 = to_e500(vcpu);
+ 
+@@ -388,9 +389,11 @@ void kvmppc_core_get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
+ 
+ 	kvmppc_get_sregs_ivor(vcpu, sregs);
+ 	kvmppc_get_sregs_e500_tlb(vcpu, sregs);
++	return 0;
+ }
+ 
+-int kvmppc_core_set_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
++static int kvmppc_core_set_sregs_e500(struct kvm_vcpu *vcpu,
++				      struct kvm_sregs *sregs)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500 = to_e500(vcpu);
+ 	int ret;
+@@ -425,21 +428,22 @@ int kvmppc_core_set_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
+ 	return kvmppc_set_sregs_ivor(vcpu, sregs);
+ }
+ 
+-int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id,
+-			union kvmppc_one_reg *val)
++static int kvmppc_get_one_reg_e500(struct kvm_vcpu *vcpu, u64 id,
++				   union kvmppc_one_reg *val)
+ {
+ 	int r = kvmppc_get_one_reg_e500_tlb(vcpu, id, val);
+ 	return r;
+ }
+ 
+-int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id,
+-		       union kvmppc_one_reg *val)
++static int kvmppc_set_one_reg_e500(struct kvm_vcpu *vcpu, u64 id,
++				   union kvmppc_one_reg *val)
+ {
+ 	int r = kvmppc_get_one_reg_e500_tlb(vcpu, id, val);
+ 	return r;
+ }
+ 
+-struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
++static struct kvm_vcpu *kvmppc_core_vcpu_create_e500(struct kvm *kvm,
++						     unsigned int id)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500;
+ 	struct kvm_vcpu *vcpu;
+@@ -481,7 +485,7 @@ out:
+ 	return ERR_PTR(err);
+ }
+ 
+-void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_free_e500(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500 = to_e500(vcpu);
+ 
+@@ -492,15 +496,32 @@ void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
+ 	kmem_cache_free(kvm_vcpu_cache, vcpu_e500);
+ }
+ 
+-int kvmppc_core_init_vm(struct kvm *kvm)
++static int kvmppc_core_init_vm_e500(struct kvm *kvm)
+ {
+ 	return 0;
+ }
+ 
+-void kvmppc_core_destroy_vm(struct kvm *kvm)
++static void kvmppc_core_destroy_vm_e500(struct kvm *kvm)
+ {
+ }
+ 
++static struct kvmppc_ops kvm_ops_e500 = {
++	.get_sregs = kvmppc_core_get_sregs_e500,
++	.set_sregs = kvmppc_core_set_sregs_e500,
++	.get_one_reg = kvmppc_get_one_reg_e500,
++	.set_one_reg = kvmppc_set_one_reg_e500,
++	.vcpu_load   = kvmppc_core_vcpu_load_e500,
++	.vcpu_put    = kvmppc_core_vcpu_put_e500,
++	.vcpu_create = kvmppc_core_vcpu_create_e500,
++	.vcpu_free   = kvmppc_core_vcpu_free_e500,
++	.mmu_destroy  = kvmppc_mmu_destroy_e500,
++	.init_vm = kvmppc_core_init_vm_e500,
++	.destroy_vm = kvmppc_core_destroy_vm_e500,
++	.emulate_op = kvmppc_core_emulate_op_e500,
++	.emulate_mtspr = kvmppc_core_emulate_mtspr_e500,
++	.emulate_mfspr = kvmppc_core_emulate_mfspr_e500,
++};
++
+ static int __init kvmppc_e500_init(void)
+ {
+ 	int r, i;
+@@ -512,11 +533,11 @@ static int __init kvmppc_e500_init(void)
+ 
+ 	r = kvmppc_core_check_processor_compat();
+ 	if (r)
+-		return r;
++		goto err_out;
+ 
+ 	r = kvmppc_booke_init();
+ 	if (r)
+-		return r;
++		goto err_out;
+ 
+ 	/* copy extra E500 exception handlers */
+ 	ivor[0] = mfspr(SPRN_IVOR32);
+@@ -534,7 +555,9 @@ static int __init kvmppc_e500_init(void)
+ 	flush_icache_range(kvmppc_booke_handlers, kvmppc_booke_handlers +
+ 			   ivor[max_ivor] + handler_len);
+ 
+-	return kvm_init(NULL, sizeof(struct kvmppc_vcpu_e500), 0, THIS_MODULE);
++	r = kvm_init(&kvm_ops_e500, sizeof(struct kvmppc_vcpu_e500), 0, THIS_MODULE);
++err_out:
++	return r;
+ }
+ 
+ static void __exit kvmppc_e500_exit(void)
+* Unmerged path arch/powerpc/kvm/e500_emulate.c
+diff --git a/arch/powerpc/kvm/e500_mmu.c b/arch/powerpc/kvm/e500_mmu.c
+index 6d6f153b6c1d..d25bb75aec90 100644
+--- a/arch/powerpc/kvm/e500_mmu.c
++++ b/arch/powerpc/kvm/e500_mmu.c
+@@ -536,7 +536,7 @@ gpa_t kvmppc_mmu_xlate(struct kvm_vcpu *vcpu, unsigned int index,
+ 	return get_tlb_raddr(gtlbe) | (eaddr & pgmask);
+ }
+ 
+-void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
++void kvmppc_mmu_destroy_e500(struct kvm_vcpu *vcpu)
+ {
+ }
+ 
+diff --git a/arch/powerpc/kvm/e500mc.c b/arch/powerpc/kvm/e500mc.c
+index 19c8379575f7..db6a383401c7 100644
+--- a/arch/powerpc/kvm/e500mc.c
++++ b/arch/powerpc/kvm/e500mc.c
+@@ -110,7 +110,7 @@ void kvmppc_mmu_msr_notify(struct kvm_vcpu *vcpu, u32 old_msr)
+ 
+ static DEFINE_PER_CPU(struct kvm_vcpu *, last_vcpu_on_cpu);
+ 
+-void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++static void kvmppc_core_vcpu_load_e500mc(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500 = to_e500(vcpu);
+ 
+@@ -147,7 +147,7 @@ void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	kvmppc_load_guest_fp(vcpu);
+ }
+ 
+-void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_put_e500mc(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->arch.eplc = mfspr(SPRN_EPLC);
+ 	vcpu->arch.epsc = mfspr(SPRN_EPSC);
+@@ -204,7 +204,8 @@ int kvmppc_core_vcpu_setup(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
+-void kvmppc_core_get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
++static int kvmppc_core_get_sregs_e500mc(struct kvm_vcpu *vcpu,
++					struct kvm_sregs *sregs)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500 = to_e500(vcpu);
+ 
+@@ -224,10 +225,11 @@ void kvmppc_core_get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
+ 	sregs->u.e.ivor_high[4] = vcpu->arch.ivor[BOOKE_IRQPRIO_DBELL];
+ 	sregs->u.e.ivor_high[5] = vcpu->arch.ivor[BOOKE_IRQPRIO_DBELL_CRIT];
+ 
+-	kvmppc_get_sregs_ivor(vcpu, sregs);
++	return kvmppc_get_sregs_ivor(vcpu, sregs);
+ }
+ 
+-int kvmppc_core_set_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
++static int kvmppc_core_set_sregs_e500mc(struct kvm_vcpu *vcpu,
++					struct kvm_sregs *sregs)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500 = to_e500(vcpu);
+ 	int ret;
+@@ -260,21 +262,22 @@ int kvmppc_core_set_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
+ 	return kvmppc_set_sregs_ivor(vcpu, sregs);
+ }
+ 
+-int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id,
+-			union kvmppc_one_reg *val)
++static int kvmppc_get_one_reg_e500mc(struct kvm_vcpu *vcpu, u64 id,
++			      union kvmppc_one_reg *val)
+ {
+ 	int r = kvmppc_get_one_reg_e500_tlb(vcpu, id, val);
+ 	return r;
+ }
+ 
+-int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id,
+-		       union kvmppc_one_reg *val)
++static int kvmppc_set_one_reg_e500mc(struct kvm_vcpu *vcpu, u64 id,
++			      union kvmppc_one_reg *val)
+ {
+ 	int r = kvmppc_set_one_reg_e500_tlb(vcpu, id, val);
+ 	return r;
+ }
+ 
+-struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
++static struct kvm_vcpu *kvmppc_core_vcpu_create_e500mc(struct kvm *kvm,
++						       unsigned int id)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500;
+ 	struct kvm_vcpu *vcpu;
+@@ -315,7 +318,7 @@ out:
+ 	return ERR_PTR(err);
+ }
+ 
+-void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
++static void kvmppc_core_vcpu_free_e500mc(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvmppc_vcpu_e500 *vcpu_e500 = to_e500(vcpu);
+ 
+@@ -325,7 +328,7 @@ void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
+ 	kmem_cache_free(kvm_vcpu_cache, vcpu_e500);
+ }
+ 
+-int kvmppc_core_init_vm(struct kvm *kvm)
++static int kvmppc_core_init_vm_e500mc(struct kvm *kvm)
+ {
+ 	int lpid;
+ 
+@@ -337,23 +340,44 @@ int kvmppc_core_init_vm(struct kvm *kvm)
+ 	return 0;
+ }
+ 
+-void kvmppc_core_destroy_vm(struct kvm *kvm)
++static void kvmppc_core_destroy_vm_e500mc(struct kvm *kvm)
+ {
+ 	kvmppc_free_lpid(kvm->arch.lpid);
+ }
+ 
++static struct kvmppc_ops kvm_ops_e500mc = {
++	.get_sregs = kvmppc_core_get_sregs_e500mc,
++	.set_sregs = kvmppc_core_set_sregs_e500mc,
++	.get_one_reg = kvmppc_get_one_reg_e500mc,
++	.set_one_reg = kvmppc_set_one_reg_e500mc,
++	.vcpu_load   = kvmppc_core_vcpu_load_e500mc,
++	.vcpu_put    = kvmppc_core_vcpu_put_e500mc,
++	.vcpu_create = kvmppc_core_vcpu_create_e500mc,
++	.vcpu_free   = kvmppc_core_vcpu_free_e500mc,
++	.mmu_destroy  = kvmppc_mmu_destroy_e500,
++	.init_vm = kvmppc_core_init_vm_e500mc,
++	.destroy_vm = kvmppc_core_destroy_vm_e500mc,
++	.emulate_op = kvmppc_core_emulate_op_e500,
++	.emulate_mtspr = kvmppc_core_emulate_mtspr_e500,
++	.emulate_mfspr = kvmppc_core_emulate_mfspr_e500,
++};
++
+ static int __init kvmppc_e500mc_init(void)
+ {
+ 	int r;
+ 
+ 	r = kvmppc_booke_init();
+ 	if (r)
+-		return r;
++		goto err_out;
+ 
+ 	kvmppc_init_lpid(64);
+ 	kvmppc_claim_lpid(0); /* host */
+ 
+-	return kvm_init(NULL, sizeof(struct kvmppc_vcpu_e500), 0, THIS_MODULE);
++	r = kvm_init(&kvm_ops_e500mc, sizeof(struct kvmppc_vcpu_e500), 0, THIS_MODULE);
++	if (r)
++		goto err_out;
++err_out:
++	return r;
+ }
+ 
+ static void __exit kvmppc_e500mc_exit(void)
+diff --git a/arch/powerpc/kvm/emulate.c b/arch/powerpc/kvm/emulate.c
+index 6d20566d074e..f14f2e37540f 100644
+--- a/arch/powerpc/kvm/emulate.c
++++ b/arch/powerpc/kvm/emulate.c
+@@ -127,7 +127,7 @@ static int kvmppc_emulate_mtspr(struct kvm_vcpu *vcpu, int sprn, int rs)
+ 		break;
+ 
+ 	default:
+-		emulated = kvmppc_core_emulate_mtspr(vcpu, sprn,
++		emulated = kvmppc_ops->emulate_mtspr(vcpu, sprn,
+ 						     spr_val);
+ 		if (emulated == EMULATE_FAIL)
+ 			printk(KERN_INFO "mtspr: unknown spr "
+@@ -188,7 +188,7 @@ static int kvmppc_emulate_mfspr(struct kvm_vcpu *vcpu, int sprn, int rt)
+ 		spr_val = kvmppc_get_dec(vcpu, get_tb());
+ 		break;
+ 	default:
+-		emulated = kvmppc_core_emulate_mfspr(vcpu, sprn,
++		emulated = kvmppc_ops->emulate_mfspr(vcpu, sprn,
+ 						     &spr_val);
+ 		if (unlikely(emulated == EMULATE_FAIL)) {
+ 			printk(KERN_INFO "mfspr: unknown spr "
+@@ -461,7 +461,7 @@ int kvmppc_emulate_instruction(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (emulated == EMULATE_FAIL) {
+-		emulated = kvmppc_core_emulate_op(run, vcpu, inst, &advance);
++		emulated = kvmppc_ops->emulate_op(run, vcpu, inst, &advance);
+ 		if (emulated == EMULATE_AGAIN) {
+ 			advance = 0;
+ 		} else if (emulated == EMULATE_FAIL) {
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index f55e14cd1762..5e3ab806f23c 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -39,6 +39,8 @@
+ #define CREATE_TRACE_POINTS
+ #include "trace.h"
+ 
++struct kvmppc_ops *kvmppc_ops;
++
+ int kvm_arch_vcpu_runnable(struct kvm_vcpu *v)
+ {
+ 	return !!(v->arch.pending_exceptions) ||
+@@ -1024,52 +1026,11 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		r = kvm_vm_ioctl_create_spapr_tce(kvm, &create_tce);
+ 		goto out;
+ 	}
+-#endif /* CONFIG_PPC_BOOK3S_64 */
+-
+-#ifdef CONFIG_KVM_BOOK3S_64_HV
+-	case KVM_ALLOCATE_RMA: {
+-		struct kvm_allocate_rma rma;
+-		struct kvm *kvm = filp->private_data;
+-
+-		r = kvm_vm_ioctl_allocate_rma(kvm, &rma);
+-		if (r >= 0 && copy_to_user(argp, &rma, sizeof(rma)))
+-			r = -EFAULT;
+-		break;
+-	}
+-
+-	case KVM_PPC_ALLOCATE_HTAB: {
+-		u32 htab_order;
+-
+-		r = -EFAULT;
+-		if (get_user(htab_order, (u32 __user *)argp))
+-			break;
+-		r = kvmppc_alloc_reset_hpt(kvm, &htab_order);
+-		if (r)
+-			break;
+-		r = -EFAULT;
+-		if (put_user(htab_order, (u32 __user *)argp))
+-			break;
+-		r = 0;
+-		break;
+-	}
+-
+-	case KVM_PPC_GET_HTAB_FD: {
+-		struct kvm_get_htab_fd ghf;
+-
+-		r = -EFAULT;
+-		if (copy_from_user(&ghf, argp, sizeof(ghf)))
+-			break;
+-		r = kvm_vm_ioctl_get_htab_fd(kvm, &ghf);
+-		break;
+-	}
+-#endif /* CONFIG_KVM_BOOK3S_64_HV */
+-
+-#ifdef CONFIG_PPC_BOOK3S_64
+ 	case KVM_PPC_GET_SMMU_INFO: {
+ 		struct kvm_ppc_smmu_info info;
+ 
+ 		memset(&info, 0, sizeof(info));
+-		r = kvm_vm_ioctl_get_smmu_info(kvm, &info);
++		r = kvmppc_ops->get_smmu_info(kvm, &info);
+ 		if (r >= 0 && copy_to_user(argp, &info, sizeof(info)))
+ 			r = -EFAULT;
+ 		break;
+@@ -1080,11 +1041,14 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		r = kvm_vm_ioctl_rtas_define_token(kvm, argp);
+ 		break;
+ 	}
+-#endif /* CONFIG_PPC_BOOK3S_64 */
++	default:
++		r = kvmppc_ops->arch_vm_ioctl(filp, ioctl, arg);
++
++#else /* CONFIG_PPC_BOOK3S_64 */
+ 	default:
+ 		r = -ENOTTY;
++#endif
+ 	}
+-
+ out:
+ 	return r;
+ }
+@@ -1125,9 +1089,15 @@ void kvmppc_init_lpid(unsigned long nr_lpids_param)
+ 
+ int kvm_arch_init(void *opaque)
+ {
++	if (kvmppc_ops) {
++		printk(KERN_ERR "kvm: already loaded the other module\n");
++		return -EEXIST;
++	}
++	kvmppc_ops = (struct kvmppc_ops *)opaque;
+ 	return 0;
+ }
+ 
+ void kvm_arch_exit(void)
+ {
++	kvmppc_ops = NULL;
+ }
