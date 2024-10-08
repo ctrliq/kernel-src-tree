@@ -1,0 +1,365 @@
+ceph: avoid sending unnessesary FLUSHSNAP message
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 860560904962d08fd38666207c910065fe53e074
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/86056090.failed
+
+when a snap notification contains no new snapshot, we can avoid
+sending FLUSHSNAP message to MDS. But we still need to create
+cap_snap in some case because it's required by write path and
+page writeback path
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit 860560904962d08fd38666207c910065fe53e074)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/snap.c
+diff --cc fs/ceph/snap.c
+index a97e39f09ba6,ba708017d60b..000000000000
+--- a/fs/ceph/snap.c
++++ b/fs/ceph/snap.c
+@@@ -455,6 -463,7 +463,10 @@@ void ceph_queue_cap_snap(struct ceph_in
+  {
+  	struct inode *inode = &ci->vfs_inode;
+  	struct ceph_cap_snap *capsnap;
+++<<<<<<< HEAD
+++=======
++ 	struct ceph_snap_context *old_snapc, *new_snapc;
+++>>>>>>> 860560904962 (ceph: avoid sending unnessesary FLUSHSNAP message)
+  	int used, dirty;
+  
+  	capsnap = kzalloc(sizeof(*capsnap), GFP_NOFS);
+@@@ -467,6 -476,9 +479,12 @@@
+  	used = __ceph_caps_used(ci);
+  	dirty = __ceph_caps_dirty(ci);
+  
+++<<<<<<< HEAD
+++=======
++ 	old_snapc = ci->i_head_snapc;
++ 	new_snapc = ci->i_snap_realm->cached_context;
++ 
+++>>>>>>> 860560904962 (ceph: avoid sending unnessesary FLUSHSNAP message)
+  	/*
+  	 * If there is a write in progress, treat that as a dirty Fw,
+  	 * even though it hasn't completed yet; by the time we finish
+@@@ -481,76 -493,95 +499,142 @@@
+  		   writes in progress now were started before the previous
+  		   cap_snap.  lucky us. */
+  		dout("queue_cap_snap %p already pending\n", inode);
+++<<<<<<< HEAD
+ +		kfree(capsnap);
+ +	} else if (ci->i_snap_realm->cached_context == empty_snapc) {
+ +		dout("queue_cap_snap %p empty snapc\n", inode);
+ +		kfree(capsnap);
+ +	} else if (dirty & (CEPH_CAP_AUTH_EXCL|CEPH_CAP_XATTR_EXCL|
+ +			    CEPH_CAP_FILE_EXCL|CEPH_CAP_FILE_WR)) {
+ +		struct ceph_snap_context *snapc = ci->i_head_snapc;
+++=======
++ 		goto update_snapc;
++ 	}
++ 	if (ci->i_wrbuffer_ref_head == 0 &&
++ 	    !(dirty & (CEPH_CAP_ANY_EXCL|CEPH_CAP_FILE_WR))) {
++ 		dout("queue_cap_snap %p nothing dirty|writing\n", inode);
++ 		goto update_snapc;
++ 	}
+++>>>>>>> 860560904962 (ceph: avoid sending unnessesary FLUSHSNAP message)
+  
+ -	BUG_ON(!old_snapc);
+ +		/*
+ +		 * if we are a sync write, we may need to go to the snaprealm
+ +		 * to get the current snapc.
+ +		 */
+ +		if (!snapc)
+ +			snapc = ci->i_snap_realm->cached_context;
+  
+++<<<<<<< HEAD
+ +		dout("queue_cap_snap %p cap_snap %p queuing under %p %s\n",
+ +		     inode, capsnap, snapc, ceph_cap_string(dirty));
+ +		ihold(inode);
+++=======
++ 	/*
++ 	 * There is no need to send FLUSHSNAP message to MDS if there is
++ 	 * no new snapshot. But when there is dirty pages or on-going
++ 	 * writes, we still need to create cap_snap. cap_snap is needed
++ 	 * by the write path and page writeback path.
++ 	 *
++ 	 * also see ceph_try_drop_cap_snap()
++ 	 */
++ 	if (has_new_snaps(old_snapc, new_snapc)) {
++ 		if (dirty & (CEPH_CAP_ANY_EXCL|CEPH_CAP_FILE_WR))
++ 			capsnap->need_flush = true;
++ 	} else {
++ 		if (!(used & CEPH_CAP_FILE_WR) &&
++ 		    ci->i_wrbuffer_ref_head == 0) {
++ 			dout("queue_cap_snap %p "
++ 			     "no new_snap|dirty_page|writing\n", inode);
++ 			goto update_snapc;
++ 		}
++ 	}
++ 
++ 	dout("queue_cap_snap %p cap_snap %p queuing under %p %s %s\n",
++ 	     inode, capsnap, old_snapc, ceph_cap_string(dirty),
++ 	     capsnap->need_flush ? "" : "no_flush");
++ 	ihold(inode);
+++>>>>>>> 860560904962 (ceph: avoid sending unnessesary FLUSHSNAP message)
+ +
+ +		atomic_set(&capsnap->nref, 1);
+ +		capsnap->ci = ci;
+ +		INIT_LIST_HEAD(&capsnap->ci_item);
+ +		INIT_LIST_HEAD(&capsnap->flushing_item);
+ +
+ +		capsnap->follows = snapc->seq;
+ +		capsnap->issued = __ceph_caps_issued(ci, NULL);
+ +		capsnap->dirty = dirty;
+ +
+ +		capsnap->mode = inode->i_mode;
+ +		capsnap->uid = inode->i_uid;
+ +		capsnap->gid = inode->i_gid;
+ +
+ +		if (dirty & CEPH_CAP_XATTR_EXCL) {
+ +			__ceph_build_xattrs_blob(ci);
+ +			capsnap->xattr_blob =
+ +				ceph_buffer_get(ci->i_xattrs.blob);
+ +			capsnap->xattr_version = ci->i_xattrs.version;
+ +		} else {
+ +			capsnap->xattr_blob = NULL;
+ +			capsnap->xattr_version = 0;
+ +		}
+  
+ -	atomic_set(&capsnap->nref, 1);
+ -	capsnap->ci = ci;
+ -	INIT_LIST_HEAD(&capsnap->ci_item);
+ -	INIT_LIST_HEAD(&capsnap->flushing_item);
+ -
+ -	capsnap->follows = old_snapc->seq;
+ -	capsnap->issued = __ceph_caps_issued(ci, NULL);
+ -	capsnap->dirty = dirty;
+ -
+ -	capsnap->mode = inode->i_mode;
+ -	capsnap->uid = inode->i_uid;
+ -	capsnap->gid = inode->i_gid;
+ -
+ -	if (dirty & CEPH_CAP_XATTR_EXCL) {
+ -		__ceph_build_xattrs_blob(ci);
+ -		capsnap->xattr_blob =
+ -			ceph_buffer_get(ci->i_xattrs.blob);
+ -		capsnap->xattr_version = ci->i_xattrs.version;
+ -	} else {
+ -		capsnap->xattr_blob = NULL;
+ -		capsnap->xattr_version = 0;
+ -	}
+ -
+ -	capsnap->inline_data = ci->i_inline_version != CEPH_INLINE_NONE;
+ -
+ +		capsnap->inline_data = ci->i_inline_version != CEPH_INLINE_NONE;
+ +
+++<<<<<<< HEAD
+ +		/* dirty page count moved from _head to this cap_snap;
+ +		   all subsequent writes page dirties occur _after_ this
+ +		   snapshot. */
+ +		capsnap->dirty_pages = ci->i_wrbuffer_ref_head;
+ +		ci->i_wrbuffer_ref_head = 0;
+ +		capsnap->context = snapc;
+ +		ci->i_head_snapc =
+ +			ceph_get_snap_context(ci->i_snap_realm->cached_context);
+ +		dout(" new snapc is %p\n", ci->i_head_snapc);
+ +		list_add_tail(&capsnap->ci_item, &ci->i_cap_snaps);
+++=======
++ 	/* dirty page count moved from _head to this cap_snap;
++ 	   all subsequent writes page dirties occur _after_ this
++ 	   snapshot. */
++ 	capsnap->dirty_pages = ci->i_wrbuffer_ref_head;
++ 	ci->i_wrbuffer_ref_head = 0;
++ 	capsnap->context = old_snapc;
++ 	list_add_tail(&capsnap->ci_item, &ci->i_cap_snaps);
++ 	old_snapc = NULL;
++ 
++ 	if (used & CEPH_CAP_FILE_WR) {
++ 		dout("queue_cap_snap %p cap_snap %p snapc %p"
++ 		     " seq %llu used WR, now pending\n", inode,
++ 		     capsnap, old_snapc, old_snapc->seq);
++ 		capsnap->writing = 1;
++ 	} else {
++ 		/* note mtime, size NOW. */
++ 		__ceph_finish_cap_snap(ci, capsnap);
++ 	}
++ 	capsnap = NULL;
++ 
++ update_snapc:
++ 	if (ci->i_head_snapc) {
++ 		ci->i_head_snapc = ceph_get_snap_context(new_snapc);
++ 		dout(" new snapc is %p\n", new_snapc);
++ 	}
++ 	spin_unlock(&ci->i_ceph_lock);
+++>>>>>>> 860560904962 (ceph: avoid sending unnessesary FLUSHSNAP message)
+ +
+ +		if (used & CEPH_CAP_FILE_WR) {
+ +			dout("queue_cap_snap %p cap_snap %p snapc %p"
+ +			     " seq %llu used WR, now pending\n", inode,
+ +			     capsnap, snapc, snapc->seq);
+ +			capsnap->writing = 1;
+ +		} else {
+ +			/* note mtime, size NOW. */
+ +			__ceph_finish_cap_snap(ci, capsnap);
+ +		}
+ +	} else {
+ +		dout("queue_cap_snap %p nothing dirty|writing\n", inode);
+ +		kfree(capsnap);
+ +	}
+  
+ -	kfree(capsnap);
+ -	ceph_put_snap_context(old_snapc);
+ +	spin_unlock(&ci->i_ceph_lock);
+  }
+  
+  /*
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index abbec56e2313..64123f3105ed 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -1295,11 +1295,8 @@ retry:
+ 		if (capsnap->dirty_pages || capsnap->writing)
+ 			break;
+ 
+-		/*
+-		 * if cap writeback already occurred, we should have dropped
+-		 * the capsnap in ceph_put_wrbuffer_cap_refs.
+-		 */
+-		BUG_ON(capsnap->dirty == 0);
++		/* should be removed by ceph_try_drop_cap_snap() */
++		BUG_ON(!capsnap->need_flush);
+ 
+ 		/* pick mds, take s_mutex */
+ 		if (ci->i_auth_cap == NULL) {
+@@ -2288,6 +2285,27 @@ void ceph_get_cap_refs(struct ceph_inode_info *ci, int caps)
+ 	spin_unlock(&ci->i_ceph_lock);
+ }
+ 
++
++/*
++ * drop cap_snap that is not associated with any snapshot.
++ * we don't need to send FLUSHSNAP message for it.
++ */
++static int ceph_try_drop_cap_snap(struct ceph_cap_snap *capsnap)
++{
++	if (!capsnap->need_flush &&
++	    !capsnap->writing && !capsnap->dirty_pages) {
++
++		dout("dropping cap_snap %p follows %llu\n",
++		     capsnap, capsnap->follows);
++		ceph_put_snap_context(capsnap->context);
++		list_del(&capsnap->ci_item);
++		list_del(&capsnap->flushing_item);
++		ceph_put_cap_snap(capsnap);
++		return 1;
++	}
++	return 0;
++}
++
+ /*
+  * Release cap refs.
+  *
+@@ -2301,7 +2319,6 @@ void ceph_put_cap_refs(struct ceph_inode_info *ci, int had)
+ {
+ 	struct inode *inode = &ci->vfs_inode;
+ 	int last = 0, put = 0, flushsnaps = 0, wake = 0;
+-	struct ceph_cap_snap *capsnap;
+ 
+ 	spin_lock(&ci->i_ceph_lock);
+ 	if (had & CEPH_CAP_PIN)
+@@ -2323,17 +2340,17 @@ void ceph_put_cap_refs(struct ceph_inode_info *ci, int had)
+ 	if (had & CEPH_CAP_FILE_WR)
+ 		if (--ci->i_wr_ref == 0) {
+ 			last++;
+-			if (!list_empty(&ci->i_cap_snaps)) {
+-				capsnap = list_first_entry(&ci->i_cap_snaps,
+-						     struct ceph_cap_snap,
+-						     ci_item);
+-				if (capsnap->writing) {
+-					capsnap->writing = 0;
+-					flushsnaps =
+-						__ceph_finish_cap_snap(ci,
+-								       capsnap);
+-					wake = 1;
+-				}
++			if (__ceph_have_pending_cap_snap(ci)) {
++				struct ceph_cap_snap *capsnap =
++					list_last_entry(&ci->i_cap_snaps,
++							struct ceph_cap_snap,
++							ci_item);
++				capsnap->writing = 0;
++				if (ceph_try_drop_cap_snap(capsnap))
++					put++;
++				else if (__ceph_finish_cap_snap(ci, capsnap))
++					flushsnaps = 1;
++				wake = 1;
+ 			}
+ 			/* see comment in __ceph_remove_cap() */
+ 			if (!__ceph_is_any_caps(ci) && ci->i_snap_realm)
+@@ -2350,7 +2367,7 @@ void ceph_put_cap_refs(struct ceph_inode_info *ci, int had)
+ 		ceph_flush_snaps(ci);
+ 	if (wake)
+ 		wake_up_all(&ci->i_cap_wq);
+-	if (put)
++	while (put-- > 0)
+ 		iput(inode);
+ }
+ 
+@@ -2399,25 +2416,15 @@ void ceph_put_wrbuffer_cap_refs(struct ceph_inode_info *ci, int nr,
+ 		capsnap->dirty_pages -= nr;
+ 		if (capsnap->dirty_pages == 0) {
+ 			complete_capsnap = 1;
+-			if (capsnap->dirty == 0)
+-				/* cap writeback completed before we created
+-				 * the cap_snap; no FLUSHSNAP is needed */
+-				drop_capsnap = 1;
++			drop_capsnap = ceph_try_drop_cap_snap(capsnap);
+ 		}
+ 		dout("put_wrbuffer_cap_refs on %p cap_snap %p "
+-		     " snap %lld %d/%d -> %d/%d %s%s%s\n",
++		     " snap %lld %d/%d -> %d/%d %s%s\n",
+ 		     inode, capsnap, capsnap->context->seq,
+ 		     ci->i_wrbuffer_ref+nr, capsnap->dirty_pages + nr,
+ 		     ci->i_wrbuffer_ref, capsnap->dirty_pages,
+ 		     last ? " (wrbuffer last)" : "",
+-		     complete_capsnap ? " (complete capsnap)" : "",
+-		     drop_capsnap ? " (drop capsnap)" : "");
+-		if (drop_capsnap) {
+-			ceph_put_snap_context(capsnap->context);
+-			list_del(&capsnap->ci_item);
+-			list_del(&capsnap->flushing_item);
+-			ceph_put_cap_snap(capsnap);
+-		}
++		     complete_capsnap ? " (complete capsnap)" : "");
+ 	}
+ 
+ 	spin_unlock(&ci->i_ceph_lock);
+* Unmerged path fs/ceph/snap.c
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 8fe9664af43d..a36c58709144 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -152,6 +152,7 @@ struct ceph_cap_snap {
+ 	int writing;   /* a sync write is still in progress */
+ 	int dirty_pages;     /* dirty pages awaiting writeback */
+ 	bool inline_data;
++	bool need_flush;
+ };
+ 
+ static inline void ceph_put_cap_snap(struct ceph_cap_snap *capsnap)
+@@ -697,8 +698,8 @@ extern void ceph_snap_exit(void);
+ static inline bool __ceph_have_pending_cap_snap(struct ceph_inode_info *ci)
+ {
+ 	return !list_empty(&ci->i_cap_snaps) &&
+-		list_entry(ci->i_cap_snaps.prev, struct ceph_cap_snap,
+-			   ci_item)->writing;
++	       list_last_entry(&ci->i_cap_snaps, struct ceph_cap_snap,
++			       ci_item)->writing;
+ }
+ 
+ /* inode.c */
