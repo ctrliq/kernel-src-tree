@@ -1,0 +1,204 @@
+bonding: rename {, bond_}slave_can_tx and clean it up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Veaceslav Falico <vfalico@gmail.com>
+commit 891ab54d6636b7aa0da48b5a5dd738af8b75cafe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/891ab54d.failed
+
+CC: Jay Vosburgh <j.vosburgh@gmail.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Veaceslav Falico <vfalico@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 891ab54d6636b7aa0da48b5a5dd738af8b75cafe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_main.c
+index d0eec7c786f0,5a1e7b779cbe..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -3840,6 -3569,79 +3840,82 @@@ unwind
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * bond_xmit_slave_id - transmit skb through slave with slave_id
++  * @bond: bonding device that is transmitting
++  * @skb: buffer to transmit
++  * @slave_id: slave id up to slave_cnt-1 through which to transmit
++  *
++  * This function tries to transmit through slave with slave_id but in case
++  * it fails, it tries to find the first available slave for transmission.
++  * The skb is consumed in all cases, thus the function is void.
++  */
++ static void bond_xmit_slave_id(struct bonding *bond, struct sk_buff *skb, int slave_id)
++ {
++ 	struct list_head *iter;
++ 	struct slave *slave;
++ 	int i = slave_id;
++ 
++ 	/* Here we start from the slave with slave_id */
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (--i < 0) {
++ 			if (bond_slave_can_tx(slave)) {
++ 				bond_dev_queue_xmit(bond, skb, slave->dev);
++ 				return;
++ 			}
++ 		}
++ 	}
++ 
++ 	/* Here we start from the first slave up to slave_id */
++ 	i = slave_id;
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (--i < 0)
++ 			break;
++ 		if (bond_slave_can_tx(slave)) {
++ 			bond_dev_queue_xmit(bond, skb, slave->dev);
++ 			return;
++ 		}
++ 	}
++ 	/* no slave that can tx has been found */
++ 	dev_kfree_skb_any(skb);
++ }
++ 
++ /**
++  * bond_rr_gen_slave_id - generate slave id based on packets_per_slave
++  * @bond: bonding device to use
++  *
++  * Based on the value of the bonding device's packets_per_slave parameter
++  * this function generates a slave id, which is usually used as the next
++  * slave to transmit through.
++  */
++ static u32 bond_rr_gen_slave_id(struct bonding *bond)
++ {
++ 	u32 slave_id;
++ 	struct reciprocal_value reciprocal_packets_per_slave;
++ 	int packets_per_slave = bond->params.packets_per_slave;
++ 
++ 	switch (packets_per_slave) {
++ 	case 0:
++ 		slave_id = prandom_u32();
++ 		break;
++ 	case 1:
++ 		slave_id = bond->rr_tx_counter;
++ 		break;
++ 	default:
++ 		reciprocal_packets_per_slave =
++ 			bond->params.reciprocal_packets_per_slave;
++ 		slave_id = reciprocal_divide(bond->rr_tx_counter,
++ 					     reciprocal_packets_per_slave);
++ 		break;
++ 	}
++ 	bond->rr_tx_counter++;
++ 
++ 	return slave_id;
++ }
++ 
+++>>>>>>> 891ab54d6636 (bonding: rename {, bond_}slave_can_tx and clean it up)
+  static int bond_xmit_roundrobin(struct sk_buff *skb, struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+@@@ -3854,40 -3655,15 +3930,49 @@@
+  	 * send the join/membership reports.  The curr_active_slave found
+  	 * will send all of this type of traffic.
+  	 */
+++<<<<<<< HEAD
+ +	if ((iph->protocol == IPPROTO_IGMP) &&
+ +	    (skb->protocol == htons(ETH_P_IP))) {
+ +		slave = bond->curr_active_slave;
+ +		if (!slave)
+ +			goto out;
+++=======
++ 	if (iph->protocol == IPPROTO_IGMP && skb->protocol == htons(ETH_P_IP)) {
++ 		slave = rcu_dereference(bond->curr_active_slave);
++ 		if (slave && bond_slave_can_tx(slave))
++ 			bond_dev_queue_xmit(bond, skb, slave->dev);
++ 		else
++ 			bond_xmit_slave_id(bond, skb, 0);
+++>>>>>>> 891ab54d6636 (bonding: rename {, bond_}slave_can_tx and clean it up)
+  	} else {
+ -		slave_id = bond_rr_gen_slave_id(bond);
+ -		bond_xmit_slave_id(bond, skb, slave_id % bond->slave_cnt);
+ +		/*
+ +		 * Concurrent TX may collide on rr_tx_counter; we accept
+ +		 * that as being rare enough not to justify using an
+ +		 * atomic op here.
+ +		 */
+ +		slave_no = bond->rr_tx_counter++ % bond->slave_cnt;
+ +
+ +		bond_for_each_slave(bond, slave, i) {
+ +			slave_no--;
+ +			if (slave_no < 0)
+ +				break;
+ +		}
+ +	}
+ +
+ +	start_at = slave;
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		if (IS_UP(slave->dev) &&
+ +		    (slave->link == BOND_LINK_UP) &&
+ +		    bond_is_active_slave(slave)) {
+ +			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +			break;
+ +		}
+ +	}
+ +
+ +out:
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+  	}
+  
+  	return NETDEV_TX_OK;
+@@@ -4016,9 -3745,13 +4101,19 @@@ static inline int bond_slave_override(s
+  		return 1;
+  
+  	/* Find out if any slaves have the same mapping as this skb. */
+++<<<<<<< HEAD
+ +	bond_for_each_slave(bond, check_slave, i) {
+ +		if (check_slave->queue_id == skb->queue_mapping) {
+ +			slave = check_slave;
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (slave->queue_id == skb->queue_mapping) {
++ 			if (bond_slave_can_tx(slave)) {
++ 				bond_dev_queue_xmit(bond, skb, slave->dev);
++ 				return 0;
++ 			}
++ 			/* If the slave isn't UP, use default transmit policy. */
+++>>>>>>> 891ab54d6636 (bonding: rename {, bond_}slave_can_tx and clean it up)
+  			break;
+  		}
+  	}
+diff --cc drivers/net/bonding/bonding.h
+index e1ca02f0b074,60ffd57cf625..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -409,7 -491,14 +415,18 @@@ static inline __be32 bond_confirm_addr(
+  	return addr;
+  }
+  
+++<<<<<<< HEAD
+ +struct bond_net;
+++=======
++ struct bond_net {
++ 	struct net		*net;	/* Associated network namespace */
++ 	struct list_head	dev_list;
++ #ifdef CONFIG_PROC_FS
++ 	struct proc_dir_entry	*proc_dir;
++ #endif
++ 	struct class_attribute	class_attr_bonding_masters;
++ };
+++>>>>>>> 891ab54d6636 (bonding: rename {, bond_}slave_can_tx and clean it up)
+  
+  int bond_arp_rcv(const struct sk_buff *skb, struct bonding *bond, struct slave *slave);
+  void bond_dev_queue_xmit(struct bonding *bond, struct sk_buff *skb, struct net_device *slave_dev);
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bonding.h
