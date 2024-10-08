@@ -1,0 +1,191 @@
+cpuset: PF_SPREAD_PAGE and PF_SPREAD_SLAB should be atomic flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Zefan Li <lizefan@huawei.com>
+commit 2ad654bc5e2b211e92f66da1d819e47d79a866f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2ad654bc.failed
+
+When we change cpuset.memory_spread_{page,slab}, cpuset will flip
+PF_SPREAD_{PAGE,SLAB} bit of tsk->flags for each task in that cpuset.
+This should be done using atomic bitops, but currently we don't,
+which is broken.
+
+Tetsuo reported a hard-to-reproduce kernel crash on RHEL6, which happened
+when one thread tried to clear PF_USED_MATH while at the same time another
+thread tried to flip PF_SPREAD_PAGE/PF_SPREAD_SLAB. They both operate on
+the same task.
+
+Here's the full report:
+https://lkml.org/lkml/2014/9/19/230
+
+To fix this, we make PF_SPREAD_PAGE and PF_SPREAD_SLAB atomic flags.
+
+v4:
+- updated mm/slab.c. (Fengguang Wu)
+- updated Documentation.
+
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Miao Xie <miaox@cn.fujitsu.com>
+	Cc: Kees Cook <keescook@chromium.org>
+Fixes: 950592f7b991 ("cpusets: update tasks' page/slab spread flags in time")
+	Cc: <stable@vger.kernel.org> # 2.6.31+
+	Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Signed-off-by: Zefan Li <lizefan@huawei.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 2ad654bc5e2b211e92f66da1d819e47d79a866f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	mm/slab.c
+diff --cc include/linux/sched.h
+index eae94222e1e8,7b1cafefb05e..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1761,11 -1903,8 +1761,9 @@@ extern void thread_group_cputime_adjust
+  #define PF_KTHREAD	0x00200000	/* I am a kernel thread */
+  #define PF_RANDOMIZE	0x00400000	/* randomize virtual address space */
+  #define PF_SWAPWRITE	0x00800000	/* Allowed to write to swap */
+- #define PF_SPREAD_PAGE	0x01000000	/* Spread page cache over cpuset */
+- #define PF_SPREAD_SLAB	0x02000000	/* Spread some slab caches over cpuset */
+  #define PF_NO_SETAFFINITY 0x04000000	/* Userland is not allowed to meddle with cpus_allowed */
+  #define PF_MCE_EARLY    0x08000000      /* Early kill for mce process policy */
+ +#define PF_MEMPOLICY	0x10000000	/* Non-default NUMA mempolicy */
+  #define PF_MUTEX_TESTER	0x20000000	/* Thread belongs to the rt mutex tester */
+  #define PF_FREEZER_SKIP	0x40000000	/* Freezer should not count it as freezable */
+  #define PF_SUSPEND_TASK 0x80000000      /* this thread called freeze_processes and should not be frozen */
+@@@ -1815,6 -1954,33 +1813,36 @@@ static inline void memalloc_noio_restor
+  	current->flags = (current->flags & ~PF_MEMALLOC_NOIO) | flags;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Per-process atomic flags. */
++ #define PFA_NO_NEW_PRIVS 0	/* May not gain new privileges. */
++ #define PFA_SPREAD_PAGE  1      /* Spread page cache over cpuset */
++ #define PFA_SPREAD_SLAB  2      /* Spread some slab caches over cpuset */
++ 
++ 
++ #define TASK_PFA_TEST(name, func)					\
++ 	static inline bool task_##func(struct task_struct *p)		\
++ 	{ return test_bit(PFA_##name, &p->atomic_flags); }
++ #define TASK_PFA_SET(name, func)					\
++ 	static inline void task_set_##func(struct task_struct *p)	\
++ 	{ set_bit(PFA_##name, &p->atomic_flags); }
++ #define TASK_PFA_CLEAR(name, func)					\
++ 	static inline void task_clear_##func(struct task_struct *p)	\
++ 	{ clear_bit(PFA_##name, &p->atomic_flags); }
++ 
++ TASK_PFA_TEST(NO_NEW_PRIVS, no_new_privs)
++ TASK_PFA_SET(NO_NEW_PRIVS, no_new_privs)
++ 
++ TASK_PFA_TEST(SPREAD_PAGE, spread_page)
++ TASK_PFA_SET(SPREAD_PAGE, spread_page)
++ TASK_PFA_CLEAR(SPREAD_PAGE, spread_page)
++ 
++ TASK_PFA_TEST(SPREAD_SLAB, spread_slab)
++ TASK_PFA_SET(SPREAD_SLAB, spread_slab)
++ TASK_PFA_CLEAR(SPREAD_SLAB, spread_slab)
++ 
+++>>>>>>> 2ad654bc5e2b (cpuset: PF_SPREAD_PAGE and PF_SPREAD_SLAB should be atomic flags)
+  /*
+   * task->jobctl flags
+   */
+diff --cc mm/slab.c
+index bd88411595b9,881951e67f12..000000000000
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@@ -3168,7 -2994,7 +3168,11 @@@ out
+  
+  #ifdef CONFIG_NUMA
+  /*
+++<<<<<<< HEAD
+ + * Try allocating on another node if PF_SPREAD_SLAB|PF_MEMPOLICY.
+++=======
++  * Try allocating on another node if PFA_SPREAD_SLAB is a mempolicy is set.
+++>>>>>>> 2ad654bc5e2b (cpuset: PF_SPREAD_PAGE and PF_SPREAD_SLAB should be atomic flags)
+   *
+   * If we are in_interrupt, then process context, including cpusets and
+   * mempolicy, may not apply and should not be used for allocation policy.
+@@@ -3412,7 -3226,7 +3416,11 @@@ __do_cache_alloc(struct kmem_cache *cac
+  {
+  	void *objp;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(current->flags & (PF_SPREAD_SLAB | PF_MEMPOLICY))) {
+++=======
++ 	if (current->mempolicy || cpuset_do_slab_mem_spread()) {
+++>>>>>>> 2ad654bc5e2b (cpuset: PF_SPREAD_PAGE and PF_SPREAD_SLAB should be atomic flags)
+  		objp = alternate_node_alloc(cache, flags);
+  		if (objp)
+  			goto out;
+diff --git a/Documentation/cgroups/cpusets.txt b/Documentation/cgroups/cpusets.txt
+index 12e01d432bfe..09d58eac5106 100644
+--- a/Documentation/cgroups/cpusets.txt
++++ b/Documentation/cgroups/cpusets.txt
+@@ -345,14 +345,14 @@ the named feature on.
+ The implementation is simple.
+ 
+ Setting the flag 'cpuset.memory_spread_page' turns on a per-process flag
+-PF_SPREAD_PAGE for each task that is in that cpuset or subsequently
++PFA_SPREAD_PAGE for each task that is in that cpuset or subsequently
+ joins that cpuset.  The page allocation calls for the page cache
+-is modified to perform an inline check for this PF_SPREAD_PAGE task
++is modified to perform an inline check for this PFA_SPREAD_PAGE task
+ flag, and if set, a call to a new routine cpuset_mem_spread_node()
+ returns the node to prefer for the allocation.
+ 
+ Similarly, setting 'cpuset.memory_spread_slab' turns on the flag
+-PF_SPREAD_SLAB, and appropriately marked slab caches will allocate
++PFA_SPREAD_SLAB, and appropriately marked slab caches will allocate
+ pages from the node returned by cpuset_mem_spread_node().
+ 
+ The cpuset_mem_spread_node() routine is also simple.  It uses the
+diff --git a/include/linux/cpuset.h b/include/linux/cpuset.h
+index cc1b01cf2035..f4550a9dbf36 100644
+--- a/include/linux/cpuset.h
++++ b/include/linux/cpuset.h
+@@ -72,12 +72,12 @@ extern int cpuset_slab_spread_node(void);
+ 
+ static inline int cpuset_do_page_mem_spread(void)
+ {
+-	return current->flags & PF_SPREAD_PAGE;
++	return task_spread_page(current);
+ }
+ 
+ static inline int cpuset_do_slab_mem_spread(void)
+ {
+-	return current->flags & PF_SPREAD_SLAB;
++	return task_spread_slab(current);
+ }
+ 
+ extern int current_cpuset_is_being_rebound(void);
+* Unmerged path include/linux/sched.h
+diff --git a/kernel/cpuset.c b/kernel/cpuset.c
+index d313870dcd02..b14135aa8728 100644
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@ -362,13 +362,14 @@ static void cpuset_update_task_spread_flag(struct cpuset *cs,
+ 					struct task_struct *tsk)
+ {
+ 	if (is_spread_page(cs))
+-		tsk->flags |= PF_SPREAD_PAGE;
++		task_set_spread_page(tsk);
+ 	else
+-		tsk->flags &= ~PF_SPREAD_PAGE;
++		task_clear_spread_page(tsk);
++
+ 	if (is_spread_slab(cs))
+-		tsk->flags |= PF_SPREAD_SLAB;
++		task_set_spread_slab(tsk);
+ 	else
+-		tsk->flags &= ~PF_SPREAD_SLAB;
++		task_clear_spread_slab(tsk);
+ }
+ 
+ /*
+* Unmerged path mm/slab.c
