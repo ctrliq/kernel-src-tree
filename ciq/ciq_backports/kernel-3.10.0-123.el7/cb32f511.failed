@@ -1,0 +1,226 @@
+ipip: add GSO/TSO support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit cb32f511a70be8967ac9025cf49c44324ced9a39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/cb32f511.failed
+
+Now inet_gso_segment() is stackable, its relatively easy to
+implement GSO/TSO support for IPIP
+
+Performance results, when segmentation is done after tunnel
+device (as no NIC is yet enabled for TSO IPIP support) :
+
+Before patch :
+
+lpq83:~# ./netperf -H 7.7.9.84 -Cc
+MIGRATED TCP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 7.7.9.84 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+ 87380  16384  16384    10.00      3357.88   5.09     3.70     2.983   2.167
+
+After patch :
+
+lpq83:~# ./netperf -H 7.7.9.84 -Cc
+MIGRATED TCP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 7.7.9.84 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+ 87380  16384  16384    10.00      7710.19   4.52     6.62     1.152   1.687
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cb32f511a70be8967ac9025cf49c44324ced9a39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/gre_offload.c
+* Unmerged path net/ipv4/gre_offload.c
+diff --git a/include/linux/netdev_features.h b/include/linux/netdev_features.h
+index a2a89a5c7be5..8dad68cede1c 100644
+--- a/include/linux/netdev_features.h
++++ b/include/linux/netdev_features.h
+@@ -42,6 +42,7 @@ enum {
+ 	NETIF_F_TSO6_BIT,		/* ... TCPv6 segmentation */
+ 	NETIF_F_FSO_BIT,		/* ... FCoE segmentation */
+ 	NETIF_F_GSO_GRE_BIT,		/* ... GRE with TSO */
++	NETIF_F_GSO_IPIP_BIT,		/* ... IPIP tunnel with TSO */
+ 	NETIF_F_GSO_UDP_TUNNEL_BIT,	/* ... UDP TUNNEL with TSO */
+ 	NETIF_F_GSO_MPLS_BIT,		/* ... MPLS segmentation */
+ 	/**/NETIF_F_GSO_LAST =		/* last bit, see GSO_MASK */
+@@ -107,6 +108,7 @@ enum {
+ #define NETIF_F_RXFCS		__NETIF_F(RXFCS)
+ #define NETIF_F_RXALL		__NETIF_F(RXALL)
+ #define NETIF_F_GSO_GRE		__NETIF_F(GSO_GRE)
++#define NETIF_F_GSO_IPIP	__NETIF_F(GSO_IPIP)
+ #define NETIF_F_GSO_UDP_TUNNEL	__NETIF_F(GSO_UDP_TUNNEL)
+ #define NETIF_F_GSO_MPLS	__NETIF_F(GSO_MPLS)
+ #define NETIF_F_HW_VLAN_STAG_FILTER __NETIF_F(HW_VLAN_STAG_FILTER)
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 68e9d4dbcf3b..71c592a70982 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -318,9 +318,11 @@ enum {
+ 
+ 	SKB_GSO_GRE = 1 << 6,
+ 
+-	SKB_GSO_UDP_TUNNEL = 1 << 7,
++	SKB_GSO_IPIP = 1 << 7,
+ 
+-	SKB_GSO_MPLS = 1 << 8,
++	SKB_GSO_UDP_TUNNEL = 1 << 8,
++
++	SKB_GSO_MPLS = 1 << 9,
+ };
+ 
+ #if BITS_PER_LONG > 32
+diff --git a/net/core/ethtool.c b/net/core/ethtool.c
+index 65fb8fea6b05..a29b71d2ce21 100644
+--- a/net/core/ethtool.c
++++ b/net/core/ethtool.c
+@@ -81,6 +81,7 @@ static const char netdev_features_strings[NETDEV_FEATURE_COUNT][ETH_GSTRING_LEN]
+ 	[NETIF_F_TSO6_BIT] =             "tx-tcp6-segmentation",
+ 	[NETIF_F_FSO_BIT] =              "tx-fcoe-segmentation",
+ 	[NETIF_F_GSO_GRE_BIT] =		 "tx-gre-segmentation",
++	[NETIF_F_GSO_IPIP_BIT] =	 "tx-ipip-segmentation",
+ 	[NETIF_F_GSO_UDP_TUNNEL_BIT] =	 "tx-udp_tnl-segmentation",
+ 	[NETIF_F_GSO_MPLS_BIT] =	 "tx-mpls-segmentation",
+ 
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 513d75835e6b..c827a2dc0303 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1293,6 +1293,7 @@ static struct sk_buff *inet_gso_segment(struct sk_buff *skb,
+ 		       SKB_GSO_DODGY |
+ 		       SKB_GSO_TCP_ECN |
+ 		       SKB_GSO_GRE |
++		       SKB_GSO_IPIP |
+ 		       SKB_GSO_TCPV6 |
+ 		       SKB_GSO_UDP_TUNNEL |
+ 		       SKB_GSO_MPLS |
+@@ -1657,6 +1658,13 @@ static struct packet_offload ip_packet_offload __read_mostly = {
+ 	},
+ };
+ 
++static const struct net_offload ipip_offload = {
++	.callbacks = {
++		.gso_send_check = inet_gso_send_check,
++		.gso_segment	= inet_gso_segment,
++	},
++};
++
+ static int __init ipv4_offload_init(void)
+ {
+ 	/*
+@@ -1668,6 +1676,7 @@ static int __init ipv4_offload_init(void)
+ 		pr_crit("%s: Cannot add TCP protocol offload\n", __func__);
+ 
+ 	dev_add_offload(&ip_packet_offload);
++	inet_add_offload(&ipip_offload, IPPROTO_IPIP);
+ 	return 0;
+ }
+ 
+* Unmerged path net/ipv4/gre_offload.c
+diff --git a/net/ipv4/ipip.c b/net/ipv4/ipip.c
+index e6905fbda2a2..3b027824259b 100644
+--- a/net/ipv4/ipip.c
++++ b/net/ipv4/ipip.c
+@@ -221,17 +221,17 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	if (unlikely(skb->protocol != htons(ETH_P_IP)))
+ 		goto tx_error;
+ 
+-	if (likely(!skb->encapsulation)) {
+-		skb_reset_inner_headers(skb);
+-		skb->encapsulation = 1;
+-	}
++	skb = iptunnel_handle_offloads(skb, false, SKB_GSO_IPIP);
++	if (IS_ERR(skb))
++		goto out;
+ 
+ 	ip_tunnel_xmit(skb, dev, tiph, tiph->protocol);
+ 	return NETDEV_TX_OK;
+ 
+ tx_error:
+-	dev->stats.tx_errors++;
+ 	dev_kfree_skb(skb);
++out:
++	dev->stats.tx_errors++;
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -274,6 +274,7 @@ static const struct net_device_ops ipip_netdev_ops = {
+ #define IPIP_FEATURES (NETIF_F_SG |		\
+ 		       NETIF_F_FRAGLIST |	\
+ 		       NETIF_F_HIGHDMA |	\
++		       NETIF_F_GSO_SOFTWARE |	\
+ 		       NETIF_F_HW_CSUM)
+ 
+ static void ipip_tunnel_setup(struct net_device *dev)
+diff --git a/net/ipv4/tcp_offload.c b/net/ipv4/tcp_offload.c
+index 3a7525e6c086..c4be4f2e8693 100644
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -56,6 +56,7 @@ struct sk_buff *tcp_tso_segment(struct sk_buff *skb,
+ 			       SKB_GSO_TCP_ECN |
+ 			       SKB_GSO_TCPV6 |
+ 			       SKB_GSO_GRE |
++			       SKB_GSO_IPIP |
+ 			       SKB_GSO_MPLS |
+ 			       SKB_GSO_UDP_TUNNEL |
+ 			       0) ||
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index f35eccaa855e..83206de2bc76 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -52,6 +52,7 @@ static struct sk_buff *udp4_ufo_fragment(struct sk_buff *skb,
+ 
+ 		if (unlikely(type & ~(SKB_GSO_UDP | SKB_GSO_DODGY |
+ 				      SKB_GSO_UDP_TUNNEL |
++				      SKB_GSO_IPIP |
+ 				      SKB_GSO_GRE | SKB_GSO_MPLS) ||
+ 			     !(type & (SKB_GSO_UDP))))
+ 			goto out;
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+index d82de7228100..548036a1cba0 100644
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -98,6 +98,7 @@ static struct sk_buff *ipv6_gso_segment(struct sk_buff *skb,
+ 		       SKB_GSO_DODGY |
+ 		       SKB_GSO_TCP_ECN |
+ 		       SKB_GSO_GRE |
++		       SKB_GSO_IPIP |
+ 		       SKB_GSO_UDP_TUNNEL |
+ 		       SKB_GSO_MPLS |
+ 		       SKB_GSO_TCPV6 |
+diff --git a/net/ipv6/udp_offload.c b/net/ipv6/udp_offload.c
+index c5b2d71cecdf..0cc17c6456f2 100644
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@ -118,6 +118,7 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
+ 				      SKB_GSO_DODGY |
+ 				      SKB_GSO_UDP_TUNNEL |
+ 				      SKB_GSO_GRE |
++				      SKB_GSO_IPIP |
+ 				      SKB_GSO_MPLS) ||
+ 			     !(type & (SKB_GSO_UDP))))
+ 			goto out;
+diff --git a/net/mpls/mpls_gso.c b/net/mpls/mpls_gso.c
+index 1bec1219ab81..851cd880b0c0 100644
+--- a/net/mpls/mpls_gso.c
++++ b/net/mpls/mpls_gso.c
+@@ -33,6 +33,7 @@ static struct sk_buff *mpls_gso_segment(struct sk_buff *skb,
+ 				  SKB_GSO_DODGY |
+ 				  SKB_GSO_TCP_ECN |
+ 				  SKB_GSO_GRE |
++				  SKB_GSO_IPIP |
+ 				  SKB_GSO_MPLS)))
+ 		goto out;
+ 
