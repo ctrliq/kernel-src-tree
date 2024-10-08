@@ -330,6 +330,9 @@ static void watchdog_interrupt_count(void)
 static int watchdog_nmi_enable(unsigned int cpu);
 static void watchdog_nmi_disable(unsigned int cpu);
 
+static int watchdog_enable_all_cpus(void);
+static void watchdog_disable_all_cpus(void);
+
 /* watchdog kicker functions */
 static enum hrtimer_restart watchdog_timer_fn(struct hrtimer *hrtimer)
 {
@@ -769,9 +772,6 @@ static int watchdog_enable_all_cpus(bool sample_period_changed)
 	return err;
 }
 
-/* prepare/enable/disable routines */
-/* sysctl functions */
-#ifdef CONFIG_SYSCTL
 static void watchdog_disable_all_cpus(void)
 {
 	if (watchdog_running) {
@@ -779,6 +779,8 @@ static void watchdog_disable_all_cpus(void)
 		smpboot_unregister_percpu_thread(&watchdog_threads);
 	}
 }
+
+#ifdef CONFIG_SYSCTL
 
 /*
  * Update the run state of the lockup detectors.
