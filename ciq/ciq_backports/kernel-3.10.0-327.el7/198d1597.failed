@@ -1,0 +1,126 @@
+fs: proc: task_mmu: show page size in /proc/<pid>/numa_maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [fs] proc/task_mmu: show page size in /proc/<pid>/numa_maps (Petr Holasek) [1071987]
+Rebuild_FUZZ: 93.81%
+commit-author Rafael Aquini <aquini@redhat.com>
+commit 198d1597cc5a12d04af18b69338a5b1d66ee7020
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/198d1597.failed
+
+The output of /proc/$pid/numa_maps is in terms of number of pages like
+anon=22 or dirty=54.  Here's some output:
+
+  7f4680000000 default file=/hugetlb/bigfile anon=50 dirty=50 N0=50
+  7f7659600000 default file=/anon_hugepage\040(deleted) anon=50 dirty=50 N0=50
+  7fff8d425000 default stack anon=50 dirty=50 N0=50
+
+Looks like we have a stack and a couple of anonymous hugetlbfs
+areas page which both use the same amount of memory.  They don't.
+
+The 'bigfile' uses 1GB pages and takes up ~50GB of space.  The
+anon_hugepage uses 2MB pages and takes up ~100MB of space while the stack
+uses normal 4k pages.  You can go over to smaps to figure out what the
+page size _really_ is with KernelPageSize or MMUPageSize.  But, I think
+this is a pretty nasty and counterintuitive interface as it stands.
+
+This patch introduces 'kernelpagesize_kB' line element to
+/proc/<pid>/numa_maps report file in order to help identifying the size of
+pages that are backing memory areas mapped by a given task.  This is
+specially useful to help differentiating between HUGE and GIGANTIC page
+backed VMAs.
+
+This patch is based on Dave Hansen's proposal and reviewer's follow-ups
+taken from the following dicussion threads:
+ * https://lkml.org/lkml/2011/9/21/454
+ * https://lkml.org/lkml/2014/12/20/66
+
+	Signed-off-by: Rafael Aquini <aquini@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 198d1597cc5a12d04af18b69338a5b1d66ee7020)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/proc.txt
+#	fs/proc/task_mmu.c
+diff --cc Documentation/filesystems/proc.txt
+index 159deb079c5a,a07ba61662ed..000000000000
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@@ -488,6 -501,37 +488,40 @@@ The /proc/pid/pagemap gives the PFN, wh
+  using /proc/kpageflags and number of times a page is mapped using
+  /proc/kpagecount. For detailed explanation, see Documentation/vm/pagemap.txt.
+  
+++<<<<<<< HEAD
+++=======
++ The /proc/pid/numa_maps is an extension based on maps, showing the memory
++ locality and binding policy, as well as the memory usage (in pages) of
++ each mapping. The output follows a general format where mapping details get
++ summarized separated by blank spaces, one mapping per each file line:
++ 
++ address   policy    mapping details
++ 
++ 00400000 default file=/usr/local/bin/app mapped=1 active=0 N3=1 kernelpagesize_kB=4
++ 00600000 default file=/usr/local/bin/app anon=1 dirty=1 N3=1 kernelpagesize_kB=4
++ 3206000000 default file=/lib64/ld-2.12.so mapped=26 mapmax=6 N0=24 N3=2 kernelpagesize_kB=4
++ 320621f000 default file=/lib64/ld-2.12.so anon=1 dirty=1 N3=1 kernelpagesize_kB=4
++ 3206220000 default file=/lib64/ld-2.12.so anon=1 dirty=1 N3=1 kernelpagesize_kB=4
++ 3206221000 default anon=1 dirty=1 N3=1 kernelpagesize_kB=4
++ 3206800000 default file=/lib64/libc-2.12.so mapped=59 mapmax=21 active=55 N0=41 N3=18 kernelpagesize_kB=4
++ 320698b000 default file=/lib64/libc-2.12.so
++ 3206b8a000 default file=/lib64/libc-2.12.so anon=2 dirty=2 N3=2 kernelpagesize_kB=4
++ 3206b8e000 default file=/lib64/libc-2.12.so anon=1 dirty=1 N3=1 kernelpagesize_kB=4
++ 3206b8f000 default anon=3 dirty=3 active=1 N3=3 kernelpagesize_kB=4
++ 7f4dc10a2000 default anon=3 dirty=3 N3=3 kernelpagesize_kB=4
++ 7f4dc10b4000 default anon=2 dirty=2 active=1 N3=2 kernelpagesize_kB=4
++ 7f4dc1200000 default file=/anon_hugepage\040(deleted) huge anon=1 dirty=1 N3=1 kernelpagesize_kB=2048
++ 7fff335f0000 default stack anon=3 dirty=3 N3=3 kernelpagesize_kB=4
++ 7fff3369d000 default mapped=1 mapmax=35 active=0 N3=1 kernelpagesize_kB=4
++ 
++ Where:
++ "address" is the starting address for the mapping;
++ "policy" reports the NUMA memory policy set for the mapping (see vm/numa_memory_policy.txt);
++ "mapping details" summarizes mapping data such as mapping type, page usage counters,
++ node locality page counters (N0 == node0, N1 == node1, ...) and the kernel page
++ size, in KB, that is backing the mapping up.
++ 
+++>>>>>>> 198d1597cc5a (fs: proc: task_mmu: show page size in /proc/<pid>/numa_maps)
+  1.2 Kernel data
+  ---------------
+  
+diff --cc fs/proc/task_mmu.c
+index feaf02c9e427,956b75d61809..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -1334,14 -1554,14 +1334,22 @@@ static int show_numa_map(struct seq_fil
+  	if (md->writeback)
+  		seq_printf(m, " writeback=%lu", md->writeback);
+  
+++<<<<<<< HEAD
+ +	for_each_node_state(n, N_MEMORY)
+ +		if (md->node[n])
+ +			seq_printf(m, " N%d=%lu", n, md->node[n]);
+++=======
++ 	for_each_node_state(nid, N_MEMORY)
++ 		if (md->node[nid])
++ 			seq_printf(m, " N%d=%lu", nid, md->node[nid]);
++ 
++ 	seq_printf(m, " kernelpagesize_kB=%lu", vma_kernel_pagesize(vma) >> 10);
+++>>>>>>> 198d1597cc5a (fs: proc: task_mmu: show page size in /proc/<pid>/numa_maps)
+  out:
+  	seq_putc(m, '\n');
+ -	m_cache_vma(m, vma);
+ +
+ +	if (m->count < m->size)
+ +		m->version = (vma != proc_priv->tail_vma) ? vma->vm_start : 0;
+  	return 0;
+  }
+  
+* Unmerged path Documentation/filesystems/proc.txt
+* Unmerged path fs/proc/task_mmu.c
