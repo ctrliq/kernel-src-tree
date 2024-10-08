@@ -1,0 +1,150 @@
+mm: numa: call MMU notifiers on THP migration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] numa: Call MMU notifiers on THP migration (Rik van Riel) [1040200]
+Rebuild_FUZZ: 95.35%
+commit-author Mel Gorman <mgorman@suse.de>
+commit f714f4f20e59ea6eea264a86b9a51fd51b88fc54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/f714f4f2.failed
+
+MMU notifiers must be called on THP page migration or secondary MMUs
+will get very confused.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Alex Thorlton <athorlton@sgi.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f714f4f20e59ea6eea264a86b9a51fd51b88fc54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index feecd7fd3496,be787d506fbb..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1661,12 -1716,15 +1662,22 @@@ int migrate_misplaced_transhuge_page(st
+  				unsigned long address,
+  				struct page *page, int node)
+  {
+++<<<<<<< HEAD
+ +	unsigned long haddr = address & HPAGE_PMD_MASK;
+++=======
++ 	spinlock_t *ptl;
+++>>>>>>> f714f4f20e59 (mm: numa: call MMU notifiers on THP migration)
+  	pg_data_t *pgdat = NODE_DATA(node);
+  	int isolated = 0;
+  	struct page *new_page = NULL;
+  	struct mem_cgroup *memcg = NULL;
+  	int page_lru = page_is_file_cache(page);
+++<<<<<<< HEAD
+++=======
++ 	unsigned long mmun_start = address & HPAGE_PMD_MASK;
++ 	unsigned long mmun_end = mmun_start + HPAGE_PMD_SIZE;
++ 	pmd_t orig_entry;
+++>>>>>>> f714f4f20e59 (mm: numa: call MMU notifiers on THP migration)
+  
+  	/*
+  	 * Rate-limit the amount of data that is being migrated to a node.
+@@@ -1700,9 -1758,12 +1711,18 @@@
+  	WARN_ON(PageLRU(new_page));
+  
+  	/* Recheck the target PMD */
+++<<<<<<< HEAD
+ +	spin_lock(&mm->page_table_lock);
+ +	if (unlikely(!pmd_same(*pmd, entry))) {
+ +		spin_unlock(&mm->page_table_lock);
+++=======
++ 	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
++ 	ptl = pmd_lock(mm, pmd);
++ 	if (unlikely(!pmd_same(*pmd, entry) || page_count(page) != 2)) {
++ fail_putback:
++ 		spin_unlock(ptl);
++ 		mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+++>>>>>>> f714f4f20e59 (mm: numa: call MMU notifiers on THP migration)
+  
+  		/* Reverse changes made by migrate_page_copy() */
+  		if (TestClearPageActive(new_page))
+@@@ -1731,23 -1792,43 +1751,53 @@@
+  	 */
+  	mem_cgroup_prepare_migration(page, new_page, &memcg);
+  
+ -	orig_entry = *pmd;
+  	entry = mk_pmd(new_page, vma->vm_page_prot);
+ -	entry = pmd_mkhuge(entry);
+ +	entry = pmd_mknonnuma(entry);
+  	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ +	entry = pmd_mkhuge(entry);
+  
+++<<<<<<< HEAD
+ +	pmdp_clear_flush(vma, haddr, pmd);
+ +	set_pmd_at(mm, haddr, pmd, entry);
+ +	page_add_new_anon_rmap(new_page, vma, haddr);
+ +	update_mmu_cache_pmd(vma, address, &entry);
+++=======
++ 	/*
++ 	 * Clear the old entry under pagetable lock and establish the new PTE.
++ 	 * Any parallel GUP will either observe the old page blocking on the
++ 	 * page lock, block on the page table lock or observe the new page.
++ 	 * The SetPageUptodate on the new page and page_add_new_anon_rmap
++ 	 * guarantee the copy is visible before the pagetable update.
++ 	 */
++ 	flush_cache_range(vma, mmun_start, mmun_end);
++ 	page_add_new_anon_rmap(new_page, vma, mmun_start);
++ 	pmdp_clear_flush(vma, mmun_start, pmd);
++ 	set_pmd_at(mm, mmun_start, pmd, entry);
++ 	flush_tlb_range(vma, mmun_start, mmun_end);
++ 	update_mmu_cache_pmd(vma, address, &entry);
++ 
++ 	if (page_count(page) != 2) {
++ 		set_pmd_at(mm, mmun_start, pmd, orig_entry);
++ 		flush_tlb_range(vma, mmun_start, mmun_end);
++ 		update_mmu_cache_pmd(vma, address, &entry);
++ 		page_remove_rmap(new_page);
++ 		goto fail_putback;
++ 	}
++ 
+++>>>>>>> f714f4f20e59 (mm: numa: call MMU notifiers on THP migration)
+  	page_remove_rmap(page);
+ -
+  	/*
+  	 * Finish the charge transaction under the page table lock to
+  	 * prevent split_huge_page() from dividing up the charge
+  	 * before it's fully transferred to the new page.
+  	 */
+  	mem_cgroup_end_migration(memcg, page, new_page, true);
+++<<<<<<< HEAD
+ +	spin_unlock(&mm->page_table_lock);
+++=======
++ 	spin_unlock(ptl);
++ 	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+++>>>>>>> f714f4f20e59 (mm: numa: call MMU notifiers on THP migration)
+  
+  	unlock_page(new_page);
+  	unlock_page(page);
+@@@ -1765,9 -1846,13 +1815,19 @@@
+  out_fail:
+  	count_vm_events(PGMIGRATE_FAIL, HPAGE_PMD_NR);
+  out_dropref:
+++<<<<<<< HEAD
+ +	entry = pmd_mknonnuma(entry);
+ +	set_pmd_at(mm, haddr, pmd, entry);
+ +	update_mmu_cache_pmd(vma, address, &entry);
+++=======
++ 	ptl = pmd_lock(mm, pmd);
++ 	if (pmd_same(*pmd, entry)) {
++ 		entry = pmd_mknonnuma(entry);
++ 		set_pmd_at(mm, mmun_start, pmd, entry);
++ 		update_mmu_cache_pmd(vma, address, &entry);
++ 	}
++ 	spin_unlock(ptl);
+++>>>>>>> f714f4f20e59 (mm: numa: call MMU notifiers on THP migration)
+  
+  	unlock_page(page);
+  	put_page(page);
+* Unmerged path mm/migrate.c
