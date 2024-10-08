@@ -1,0 +1,1261 @@
+s390: add support for vector extension
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] add support for vector extension (Hendrik Brueckner) [1102206]
+Rebuild_FUZZ: 91.43%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 8070361799ae1e3f4ef347bd10f0a508ac10acfb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/80703617.failed
+
+The vector extension introduces 32 128-bit vector registers and a set of
+instruction to operate on the vector registers.
+
+The kernel can control the use of vector registers for the problem state
+program with a bit in control register 0. Once enabled for a process the
+kernel needs to retain the content of the vector registers on context
+switch. The signal frame is extended to include the vector registers.
+Two new register sets NT_S390_VXRS_LOW and NT_S390_VXRS_HIGH are added
+to the regset interface for the debugger and core dumps.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 8070361799ae1e3f4ef347bd10f0a508ac10acfb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/setup.h
+#	arch/s390/include/asm/switch_to.h
+#	arch/s390/kernel/compat_signal.c
+#	arch/s390/kernel/early.c
+#	arch/s390/kernel/ptrace.c
+#	arch/s390/kernel/signal.c
+diff --cc arch/s390/include/asm/setup.h
+index 406f3a1e63ef,7736fdd72595..000000000000
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@@ -67,7 -55,8 +67,12 @@@ void create_mem_hole(struct mem_chunk m
+  #define MACHINE_FLAG_LPP	(1UL << 13)
+  #define MACHINE_FLAG_TOPOLOGY	(1UL << 14)
+  #define MACHINE_FLAG_TE		(1UL << 15)
+++<<<<<<< HEAD
+ +#define MACHINE_FLAG_RRBM	(1UL << 16)
+++=======
++ #define MACHINE_FLAG_TLB_LC	(1UL << 17)
++ #define MACHINE_FLAG_VX		(1UL << 18)
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  
+  #define MACHINE_IS_VM		(S390_lowcore.machine_flags & MACHINE_FLAG_VM)
+  #define MACHINE_IS_KVM		(S390_lowcore.machine_flags & MACHINE_FLAG_KVM)
+@@@ -89,7 -78,8 +94,12 @@@
+  #define MACHINE_HAS_LPP		(0)
+  #define MACHINE_HAS_TOPOLOGY	(0)
+  #define MACHINE_HAS_TE		(0)
+++<<<<<<< HEAD
+ +#define MACHINE_HAS_RRBM	(0)
+++=======
++ #define MACHINE_HAS_TLB_LC	(0)
++ #define MACHINE_HAS_VX		(0)
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  #else /* CONFIG_64BIT */
+  #define MACHINE_HAS_IEEE	(1)
+  #define MACHINE_HAS_CSP		(1)
+@@@ -101,7 -91,8 +111,12 @@@
+  #define MACHINE_HAS_LPP		(S390_lowcore.machine_flags & MACHINE_FLAG_LPP)
+  #define MACHINE_HAS_TOPOLOGY	(S390_lowcore.machine_flags & MACHINE_FLAG_TOPOLOGY)
+  #define MACHINE_HAS_TE		(S390_lowcore.machine_flags & MACHINE_FLAG_TE)
+++<<<<<<< HEAD
+ +#define MACHINE_HAS_RRBM	(S390_lowcore.machine_flags & MACHINE_FLAG_RRBM)
+++=======
++ #define MACHINE_HAS_TLB_LC	(S390_lowcore.machine_flags & MACHINE_FLAG_TLB_LC)
++ #define MACHINE_HAS_VX		(S390_lowcore.machine_flags & MACHINE_FLAG_VX)
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  #endif /* CONFIG_64BIT */
+  
+  /*
+diff --cc arch/s390/include/asm/switch_to.h
+index b6d9247bf9b3,0e0109578021..000000000000
+--- a/arch/s390/include/asm/switch_to.h
++++ b/arch/s390/include/asm/switch_to.h
+@@@ -102,9 -103,53 +102,51 @@@ static inline void restore_fp_regs(freg
+  	asm volatile("ld 15,%0" : : "Q" (fprs[15]));
+  }
+  
++ static inline void save_vx_regs(__vector128 *vxrs)
++ {
++ 	typedef struct { __vector128 _[__NUM_VXRS]; } addrtype;
++ 
++ 	asm volatile(
++ 		"	la	1,%0\n"
++ 		"	.word	0xe70f,0x1000,0x003e\n"	/* vstm 0,15,0(1) */
++ 		"	.word	0xe70f,0x1100,0x0c3e\n"	/* vstm 16,31,256(1) */
++ 		: "=Q" (*(addrtype *) vxrs) : : "1");
++ }
++ 
++ static inline void restore_vx_regs(__vector128 *vxrs)
++ {
++ 	typedef struct { __vector128 _[__NUM_VXRS]; } addrtype;
++ 
++ 	asm volatile(
++ 		"	la	1,%0\n"
++ 		"	.word	0xe70f,0x1000,0x0036\n"	/* vlm 0,15,0(1) */
++ 		"	.word	0xe70f,0x1100,0x0c36\n"	/* vlm 16,31,256(1) */
++ 		: : "Q" (*(addrtype *) vxrs) : "1");
++ }
++ 
++ static inline void save_fp_vx_regs(struct task_struct *task)
++ {
++ #ifdef CONFIG_64BIT
++ 	if (task->thread.vxrs)
++ 		save_vx_regs(task->thread.vxrs);
++ 	else
++ #endif
++ 	save_fp_regs(task->thread.fp_regs.fprs);
++ }
++ 
++ static inline void restore_fp_vx_regs(struct task_struct *task)
++ {
++ #ifdef CONFIG_64BIT
++ 	if (task->thread.vxrs)
++ 		restore_vx_regs(task->thread.vxrs);
++ 	else
++ #endif
++ 	restore_fp_regs(task->thread.fp_regs.fprs);
++ }
++ 
+  static inline void save_access_regs(unsigned int *acrs)
+  {
+ -	typedef struct { int _[NUM_ACRS]; } acrstype;
+ -
+ -	asm volatile("stam 0,15,%0" : "=Q" (*(acrstype *)acrs));
+ +	asm volatile("stam 0,15,%0" : "=Q" (*acrs));
+  }
+  
+  static inline void restore_access_regs(unsigned int *acrs)
+@@@ -120,18 -167,13 +162,22 @@@
+  		save_ri_cb(prev->thread.ri_cb);				\
+  	}								\
+  	if (next->mm) {							\
++ 		update_cr_regs(next);					\
+  		restore_fp_ctl(&next->thread.fp_regs.fpc);		\
+- 		restore_fp_regs(next->thread.fp_regs.fprs);		\
++ 		restore_fp_vx_regs(next);				\
+  		restore_access_regs(&next->thread.acrs[0]);		\
+  		restore_ri_cb(next->thread.ri_cb, prev->thread.ri_cb);	\
+++<<<<<<< HEAD
+ +		update_per_regs(next);					\
+++=======
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	}								\
+  	prev = __switch_to(prev,next);					\
+ +	update_primary_asce(current);					\
+ +} while (0)
+ +
+ +#define finish_arch_switch(prev) do {					     \
+ +	set_fs(current->thread.mm_segment);				     \
+  } while (0)
+  
+  #endif /* __ASM_SWITCH_TO_H */
+diff --cc arch/s390/kernel/compat_signal.c
+index 9f263b2f3793,009f5eb11125..000000000000
+--- a/arch/s390/kernel/compat_signal.c
++++ b/arch/s390/kernel/compat_signal.c
+@@@ -43,13 -43,12 +43,12 @@@ typedef struc
+  typedef struct 
+  {
+  	__u8 callee_used_stack[__SIGNAL_FRAMESIZE32];
+- 	__u8 retcode[S390_SYSCALL_SIZE];
++ 	__u16 svc_insn;
+  	compat_siginfo_t info;
+  	struct ucontext32 uc;
+- 	__u32 gprs_high[NUM_GPRS];
+  } rt_sigframe32;
+  
+ -int copy_siginfo_to_user32(compat_siginfo_t __user *to, const siginfo_t *from)
+ +int copy_siginfo_to_user32(compat_siginfo_t __user *to, siginfo_t *from)
+  {
+  	int err;
+  
+@@@ -148,9 -147,41 +147,41 @@@ int copy_siginfo_from_user32(siginfo_t 
+  			break;
+  		}
+  	}
+ -	return err ? -EFAULT : 0;
+ +	return err;
+  }
+  
++ /* Store registers needed to create the signal frame */
++ static void store_sigregs(void)
++ {
++ 	int i;
++ 
++ 	save_access_regs(current->thread.acrs);
++ 	save_fp_ctl(&current->thread.fp_regs.fpc);
++ 	if (current->thread.vxrs) {
++ 		save_vx_regs(current->thread.vxrs);
++ 		for (i = 0; i < __NUM_FPRS; i++)
++ 			current->thread.fp_regs.fprs[i] =
++ 				*(freg_t *)(current->thread.vxrs + i);
++ 	} else
++ 		save_fp_regs(current->thread.fp_regs.fprs);
++ }
++ 
++ /* Load registers after signal return */
++ static void load_sigregs(void)
++ {
++ 	int i;
++ 
++ 	restore_access_regs(current->thread.acrs);
++ 	/* restore_fp_ctl is done in restore_sigregs */
++ 	if (current->thread.vxrs) {
++ 		for (i = 0; i < __NUM_FPRS; i++)
++ 			*(freg_t *)(current->thread.vxrs + i) =
++ 				current->thread.fp_regs.fprs[i];
++ 		restore_vx_regs(current->thread.vxrs);
++ 	} else
++ 		restore_fp_regs(current->thread.fp_regs.fprs);
++ }
++ 
+  static int save_sigregs32(struct pt_regs *regs, _sigregs32 __user *sregs)
+  {
+  	_sigregs32 user_sregs;
+@@@ -212,8 -239,7 +239,12 @@@ static int restore_sigregs32(struct pt_
+  	memcpy(&current->thread.fp_regs, &user_sregs.fpregs,
+  	       sizeof(current->thread.fp_regs));
+  
+++<<<<<<< HEAD
+ +	restore_fp_regs(current->thread.fp_regs.fprs);
+ +	clear_thread_flag(TIF_SYSCALL);	/* No longer in a system call */
+++=======
++ 	clear_pt_regs_flag(regs, PIF_SYSCALL); /* No longer in a system call */
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	return 0;
+  }
+  
+@@@ -320,40 -380,68 +385,96 @@@ static inline int map_signal(int sig
+  		return sig;
+  }
+  
+ -static int setup_frame32(struct ksignal *ksig, sigset_t *set,
+ -			 struct pt_regs *regs)
+ +static int setup_frame32(int sig, struct k_sigaction *ka,
+ +			sigset_t *set, struct pt_regs * regs)
+  {
+++<<<<<<< HEAD
+ +	sigframe32 __user *frame = get_sigframe(ka, regs, sizeof(sigframe32));
+- 
+++=======
++ 	int sig = ksig->sig;
++ 	sigframe32 __user *frame;
++ 	struct sigcontext32 sc;
++ 	unsigned long restorer;
++ 	size_t frame_size;
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
++ 
++ 	/*
++ 	 * gprs_high are always present for 31-bit compat tasks.
++ 	 * The space for vector registers is only allocated if
++ 	 * the machine supports it
++ 	 */
++ 	frame_size = sizeof(*frame) - sizeof(frame->sregs_ext.__reserved);
++ 	if (!MACHINE_HAS_VX)
++ 		frame_size -= sizeof(frame->sregs_ext.vxrs_low) +
++ 			      sizeof(frame->sregs_ext.vxrs_high);
++ 	frame = get_sigframe(&ksig->ka, regs, frame_size);
+  	if (frame == (void __user *) -1UL)
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+ +
+++<<<<<<< HEAD
+ +	if (__copy_to_user(&frame->sc.oldmask, &set->sig, _SIGMASK_COPY_SIZE32))
+ +		goto give_sigsegv;
+ +
+ +	if (save_sigregs32(regs, &frame->sregs))
+ +		goto give_sigsegv;
+ +	if (save_sigregs_gprs_high(regs, frame->gprs_high))
+ +		goto give_sigsegv;
+ +	if (__put_user((unsigned long) &frame->sregs, &frame->sc.sregs))
+ +		goto give_sigsegv;
+ +
+ +	/* Set up to return from userspace.  If provided, use a stub
+ +	   already in userspace.  */
+ +	if (ka->sa.sa_flags & SA_RESTORER) {
+ +		regs->gprs[14] = (__u64) ka->sa.sa_restorer | PSW32_ADDR_AMODE;
+ +	} else {
+ +		regs->gprs[14] = (__u64) frame->retcode | PSW32_ADDR_AMODE;
+ +		if (__put_user(S390_SYSCALL_OPCODE | __NR_sigreturn,
+ +			       (u16 __force __user *)(frame->retcode)))
+ +			goto give_sigsegv;
+ +        }
+  
+++=======
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	/* Set up backchain. */
+  	if (__put_user(regs->gprs[15], (unsigned int __user *) frame))
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+  
++ 	/* Create struct sigcontext32 on the signal stack */
++ 	memcpy(&sc.oldmask, &set->sig, _SIGMASK_COPY_SIZE32);
++ 	sc.sregs = (__u32)(unsigned long __force) &frame->sregs;
++ 	if (__copy_to_user(&frame->sc, &sc, sizeof(frame->sc)))
++ 		return -EFAULT;
++ 
++ 	/* Store registers needed to create the signal frame */
++ 	store_sigregs();
++ 
++ 	/* Create _sigregs32 on the signal stack */
++ 	if (save_sigregs32(regs, &frame->sregs))
++ 		return -EFAULT;
++ 
++ 	/* Place signal number on stack to allow backtrace from handler.  */
++ 	if (__put_user(regs->gprs[2], (int __force __user *) &frame->signo))
++ 		return -EFAULT;
++ 
++ 	/* Create _sigregs_ext32 on the signal stack */
++ 	if (save_sigregs_ext32(regs, &frame->sregs_ext))
++ 		return -EFAULT;
++ 
++ 	/* Set up to return from userspace.  If provided, use a stub
++ 	   already in userspace.  */
++ 	if (ksig->ka.sa.sa_flags & SA_RESTORER) {
++ 		restorer = (unsigned long __force)
++ 			ksig->ka.sa.sa_restorer | PSW32_ADDR_AMODE;
++ 	} else {
++ 		/* Signal frames without vectors registers are short ! */
++ 		__u16 __user *svc = (void *) frame + frame_size - 2;
++ 		if (__put_user(S390_SYSCALL_OPCODE | __NR_sigreturn, svc))
++ 			return -EFAULT;
++ 		restorer = (unsigned long __force) svc | PSW32_ADDR_AMODE;
++         }
++ 
+  	/* Set up registers for signal handler */
++ 	regs->gprs[14] = restorer;
+  	regs->gprs[15] = (__force __u64) frame;
+  	/* Force 31 bit amode and default user address space control. */
+  	regs->psw.mask = PSW_MASK_BA |
+@@@ -374,53 -462,69 +495,110 @@@
+  		regs->gprs[6] = task_thread_info(current)->last_break;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Place signal number on stack to allow backtrace from handler.  */
+ +	if (__put_user(regs->gprs[2], (int __force __user *) &frame->signo))
+ +		goto give_sigsegv;
+++=======
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	return 0;
+ +
+ +give_sigsegv:
+ +	force_sigsegv(sig, current);
+ +	return -EFAULT;
+  }
+  
+ -static int setup_rt_frame32(struct ksignal *ksig, sigset_t *set,
+ -			    struct pt_regs *regs)
+ +static int setup_rt_frame32(int sig, struct k_sigaction *ka, siginfo_t *info,
+ +			   sigset_t *set, struct pt_regs * regs)
+  {
+++<<<<<<< HEAD
+ +	int err = 0;
+ +	rt_sigframe32 __user *frame = get_sigframe(ka, regs, sizeof(rt_sigframe32));
+- 
+++=======
++ 	rt_sigframe32 __user *frame;
++ 	unsigned long restorer;
++ 	size_t frame_size;
++ 	u32 uc_flags;
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
++ 
++ 	frame_size = sizeof(*frame) -
++ 		     sizeof(frame->uc.uc_mcontext_ext.__reserved);
++ 	/*
++ 	 * gprs_high are always present for 31-bit compat tasks.
++ 	 * The space for vector registers is only allocated if
++ 	 * the machine supports it
++ 	 */
++ 	uc_flags = UC_GPRS_HIGH;
++ 	if (MACHINE_HAS_VX) {
++ 		if (current->thread.vxrs)
++ 			uc_flags |= UC_VXRS;
++ 	} else
++ 		frame_size -= sizeof(frame->uc.uc_mcontext_ext.vxrs_low) +
++ 			      sizeof(frame->uc.uc_mcontext_ext.vxrs_high);
++ 	frame = get_sigframe(&ksig->ka, regs, frame_size);
+  	if (frame == (void __user *) -1UL)
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+ +
+++<<<<<<< HEAD
+ +	if (copy_siginfo_to_user32(&frame->info, info))
+ +		goto give_sigsegv;
+ +
+ +	/* Create the ucontext.  */
+ +	err |= __put_user(UC_EXTENDED, &frame->uc.uc_flags);
+ +	err |= __put_user(0, &frame->uc.uc_link);
+ +	err |= __compat_save_altstack(&frame->uc.uc_stack, regs->gprs[15]);
+ +	err |= save_sigregs32(regs, &frame->uc.uc_mcontext);
+ +	err |= save_sigregs_gprs_high(regs, frame->gprs_high);
+ +	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
+ +	if (err)
+ +		goto give_sigsegv;
+  
+ +	/* Set up to return from userspace.  If provided, use a stub
+ +	   already in userspace.  */
+ +	if (ka->sa.sa_flags & SA_RESTORER) {
+ +		regs->gprs[14] = (__u64) ka->sa.sa_restorer | PSW32_ADDR_AMODE;
+ +	} else {
+ +		regs->gprs[14] = (__u64) frame->retcode | PSW32_ADDR_AMODE;
+ +		err |= __put_user(S390_SYSCALL_OPCODE | __NR_rt_sigreturn,
+ +				  (u16 __force __user *)(frame->retcode));
+ +	}
+ +
+++=======
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	/* Set up backchain. */
+  	if (__put_user(regs->gprs[15], (unsigned int __force __user *) frame))
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+  
++ 	/* Set up to return from userspace.  If provided, use a stub
++ 	   already in userspace.  */
++ 	if (ksig->ka.sa.sa_flags & SA_RESTORER) {
++ 		restorer = (unsigned long __force)
++ 			ksig->ka.sa.sa_restorer | PSW32_ADDR_AMODE;
++ 	} else {
++ 		__u16 __user *svc = &frame->svc_insn;
++ 		if (__put_user(S390_SYSCALL_OPCODE | __NR_rt_sigreturn, svc))
++ 			return -EFAULT;
++ 		restorer = (unsigned long __force) svc | PSW32_ADDR_AMODE;
++ 	}
++ 
++ 	/* Create siginfo on the signal stack */
++ 	if (copy_siginfo_to_user32(&frame->info, &ksig->info))
++ 		return -EFAULT;
++ 
++ 	/* Store registers needed to create the signal frame */
++ 	store_sigregs();
++ 
++ 	/* Create ucontext on the signal stack. */
++ 	if (__put_user(uc_flags, &frame->uc.uc_flags) ||
++ 	    __put_user(0, &frame->uc.uc_link) ||
++ 	    __compat_save_altstack(&frame->uc.uc_stack, regs->gprs[15]) ||
++ 	    save_sigregs32(regs, &frame->uc.uc_mcontext) ||
++ 	    __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set)) ||
++ 	    save_sigregs_ext32(regs, &frame->uc.uc_mcontext_ext))
++ 		return -EFAULT;
++ 
+  	/* Set up registers for signal handler */
++ 	regs->gprs[14] = restorer;
+  	regs->gprs[15] = (__force __u64) frame;
+  	/* Force 31 bit amode and default user address space control. */
+  	regs->psw.mask = PSW_MASK_BA |
+diff --cc arch/s390/kernel/early.c
+index 6b594439cca5,cef2879edff3..000000000000
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@@ -384,8 -390,10 +384,15 @@@ static __init void detect_machine_facil
+  		S390_lowcore.machine_flags |= MACHINE_FLAG_LPP;
+  	if (test_facility(50) && test_facility(73))
+  		S390_lowcore.machine_flags |= MACHINE_FLAG_TE;
+++<<<<<<< HEAD
+ +	if (test_facility(66))
+ +		S390_lowcore.machine_flags |= MACHINE_FLAG_RRBM;
+++=======
++ 	if (test_facility(51))
++ 		S390_lowcore.machine_flags |= MACHINE_FLAG_TLB_LC;
++ 	if (test_facility(129))
++ 		S390_lowcore.machine_flags |= MACHINE_FLAG_VX;
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  #endif
+  }
+  
+diff --cc arch/s390/kernel/ptrace.c
+index b113cc3c32f6,0ecfdb3c6f8e..000000000000
+--- a/arch/s390/kernel/ptrace.c
++++ b/arch/s390/kernel/ptrace.c
+@@@ -38,16 -38,7 +38,20 @@@
+  #define CREATE_TRACE_POINTS
+  #include <trace/events/syscalls.h>
+  
+++<<<<<<< HEAD
+ +enum s390_regset {
+ +	REGSET_GENERAL,
+ +	REGSET_FP,
+ +	REGSET_LAST_BREAK,
+ +	REGSET_TDB,
+ +	REGSET_SYSTEM_CALL,
+ +	REGSET_GENERAL_EXTENDED,
+ +};
+ +
+ +void update_per_regs(struct task_struct *task)
+++=======
++ void update_cr_regs(struct task_struct *task)
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  {
+  	struct pt_regs *regs = task_pt_regs(task);
+  	struct thread_struct *thread = &task->thread;
+@@@ -55,18 -46,39 +59,54 @@@
+  
+  #ifdef CONFIG_64BIT
+  	/* Take care of the enable/disable of transactional execution. */
+++<<<<<<< HEAD
+ +	if (MACHINE_HAS_TE) {
+ +		unsigned long cr0, cr0_new;
+ +
+ +		__ctl_store(cr0, 0, 0);
+ +		/* set or clear transaction execution bit 8. */
+ +		if (task->thread.per_flags & PER_FLAG_NO_TE)
+ +			cr0_new = cr0 & ~(1UL << 55);
+ +		else
+ +			cr0_new = cr0 | (1UL << 55);
+ +		/* Only load control register 0 if necessary. */
+ +		if (cr0 != cr0_new)
+ +			__ctl_load(cr0_new, 0, 0);
+++=======
++ 	if (MACHINE_HAS_TE || MACHINE_HAS_VX) {
++ 		unsigned long cr, cr_new;
++ 
++ 		__ctl_store(cr, 0, 0);
++ 		cr_new = cr;
++ 		if (MACHINE_HAS_TE) {
++ 			/* Set or clear transaction execution TXC bit 8. */
++ 			cr_new |= (1UL << 55);
++ 			if (task->thread.per_flags & PER_FLAG_NO_TE)
++ 				cr_new &= ~(1UL << 55);
++ 		}
++ 		if (MACHINE_HAS_VX) {
++ 			/* Enable/disable of vector extension */
++ 			cr_new &= ~(1UL << 17);
++ 			if (task->thread.vxrs)
++ 				cr_new |= (1UL << 17);
++ 		}
++ 		if (cr_new != cr)
++ 			__ctl_load(cr_new, 0, 0);
++ 		if (MACHINE_HAS_TE) {
++ 			/* Set/clear transaction execution TDC bits 62/63. */
++ 			__ctl_store(cr, 2, 2);
++ 			cr_new = cr & ~3UL;
++ 			if (task->thread.per_flags & PER_FLAG_TE_ABORT_RAND) {
++ 				if (task->thread.per_flags &
++ 				    PER_FLAG_TE_ABORT_RAND_TEND)
++ 					cr_new |= 1UL;
++ 				else
++ 					cr_new |= 2UL;
++ 			}
++ 			if (cr_new != cr)
++ 				__ctl_load(cr_new, 2, 2);
++ 		}
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	}
+  #endif
+  	/* Copy user specified PER registers */
+diff --cc arch/s390/kernel/signal.c
+index d8fd508ccd1e,0c1a0ff0a558..000000000000
+--- a/arch/s390/kernel/signal.c
++++ b/arch/s390/kernel/signal.c
+@@@ -112,8 -192,52 +192,57 @@@ static int restore_sigregs(struct pt_re
+  	memcpy(&current->thread.fp_regs, &user_sregs.fpregs,
+  	       sizeof(current->thread.fp_regs));
+  
+++<<<<<<< HEAD
+ +	restore_fp_regs(current->thread.fp_regs.fprs);
+ +	clear_thread_flag(TIF_SYSCALL);	/* No longer in a system call */
+++=======
++ 	clear_pt_regs_flag(regs, PIF_SYSCALL); /* No longer in a system call */
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
++ 	return 0;
++ }
++ 
++ /* Returns non-zero on fault. */
++ static int save_sigregs_ext(struct pt_regs *regs,
++ 			    _sigregs_ext __user *sregs_ext)
++ {
++ #ifdef CONFIG_64BIT
++ 	__u64 vxrs[__NUM_VXRS_LOW];
++ 	int i;
++ 
++ 	/* Save vector registers to signal stack */
++ 	if (current->thread.vxrs) {
++ 		for (i = 0; i < __NUM_VXRS_LOW; i++)
++ 			vxrs[i] = *((__u64 *)(current->thread.vxrs + i) + 1);
++ 		if (__copy_to_user(&sregs_ext->vxrs_low, vxrs,
++ 				   sizeof(sregs_ext->vxrs_low)) ||
++ 		    __copy_to_user(&sregs_ext->vxrs_high,
++ 				   current->thread.vxrs + __NUM_VXRS_LOW,
++ 				   sizeof(sregs_ext->vxrs_high)))
++ 			return -EFAULT;
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
++ static int restore_sigregs_ext(struct pt_regs *regs,
++ 			       _sigregs_ext __user *sregs_ext)
++ {
++ #ifdef CONFIG_64BIT
++ 	__u64 vxrs[__NUM_VXRS_LOW];
++ 	int i;
++ 
++ 	/* Restore vector registers from signal stack */
++ 	if (current->thread.vxrs) {
++ 		if (__copy_from_user(vxrs, &sregs_ext->vxrs_low,
++ 				     sizeof(sregs_ext->vxrs_low)) ||
++ 		    __copy_from_user(current->thread.vxrs + __NUM_VXRS_LOW,
++ 				     &sregs_ext->vxrs_high,
++ 				     sizeof(sregs_ext->vxrs_high)))
++ 			return -EFAULT;
++ 		for (i = 0; i < __NUM_VXRS_LOW; i++)
++ 			*((__u64 *)(current->thread.vxrs + i) + 1) = vxrs[i];
++ 	}
++ #endif
+  	return 0;
+  }
+  
+@@@ -195,39 -322,63 +327,87 @@@ static inline int map_signal(int sig
+  static int setup_frame(int sig, struct k_sigaction *ka,
+  		       sigset_t *set, struct pt_regs * regs)
+  {
+- 	sigframe __user *frame;
+- 
+- 	frame = get_sigframe(ka, regs, sizeof(sigframe));
+- 
++ 	struct sigframe __user *frame;
++ 	struct sigcontext sc;
++ 	unsigned long restorer;
++ 	size_t frame_size;
++ 
++ 	/*
++ 	 * gprs_high are only present for a 31-bit task running on
++ 	 * a 64-bit kernel (see compat_signal.c) but the space for
++ 	 * gprs_high need to be allocated if vector registers are
++ 	 * included in the signal frame on a 31-bit system.
++ 	 */
++ 	frame_size = sizeof(*frame) - sizeof(frame->sregs_ext);
++ 	if (MACHINE_HAS_VX)
++ 		frame_size += sizeof(frame->sregs_ext);
++ 	frame = get_sigframe(ka, regs, frame_size);
+  	if (frame == (void __user *) -1UL)
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+ +
+++<<<<<<< HEAD
+ +	if (__copy_to_user(&frame->sc.oldmask, &set->sig, _SIGMASK_COPY_SIZE))
+ +		goto give_sigsegv;
+ +
+ +	if (save_sigregs(regs, &frame->sregs))
+ +		goto give_sigsegv;
+ +	if (__put_user(&frame->sregs, &frame->sc.sregs))
+ +		goto give_sigsegv;
+ +
+ +	/* Set up to return from userspace.  If provided, use a stub
+ +	   already in userspace.  */
+ +	if (ka->sa.sa_flags & SA_RESTORER) {
+ +                regs->gprs[14] = (unsigned long)
+ +			ka->sa.sa_restorer | PSW_ADDR_AMODE;
+ +	} else {
+ +                regs->gprs[14] = (unsigned long)
+ +			frame->retcode | PSW_ADDR_AMODE;
+ +		if (__put_user(S390_SYSCALL_OPCODE | __NR_sigreturn,
+ +	                       (u16 __user *)(frame->retcode)))
+ +			goto give_sigsegv;
+ +	}
+  
+++=======
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	/* Set up backchain. */
+  	if (__put_user(regs->gprs[15], (addr_t __user *) frame))
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+  
++ 	/* Create struct sigcontext on the signal stack */
++ 	memcpy(&sc.oldmask, &set->sig, _SIGMASK_COPY_SIZE);
++ 	sc.sregs = (_sigregs __user __force *) &frame->sregs;
++ 	if (__copy_to_user(&frame->sc, &sc, sizeof(frame->sc)))
++ 		return -EFAULT;
++ 
++ 	/* Store registers needed to create the signal frame */
++ 	store_sigregs();
++ 
++ 	/* Create _sigregs on the signal stack */
++ 	if (save_sigregs(regs, &frame->sregs))
++ 		return -EFAULT;
++ 
++ 	/* Place signal number on stack to allow backtrace from handler.  */
++ 	if (__put_user(regs->gprs[2], (int __user *) &frame->signo))
++ 		return -EFAULT;
++ 
++ 	/* Create _sigregs_ext on the signal stack */
++ 	if (save_sigregs_ext(regs, &frame->sregs_ext))
++ 		return -EFAULT;
++ 
++ 	/* Set up to return from userspace.  If provided, use a stub
++ 	   already in userspace.  */
++ 	if (ka->sa.sa_flags & SA_RESTORER) {
++ 		restorer = (unsigned long) ka->sa.sa_restorer | PSW_ADDR_AMODE;
++ 	} else {
++ 		/* Signal frame without vector registers are short ! */
++ 		__u16 __user *svc = (void *) frame + frame_size - 2;
++ 		if (__put_user(S390_SYSCALL_OPCODE | __NR_sigreturn, svc))
++ 			return -EFAULT;
++ 		restorer = (unsigned long) svc | PSW_ADDR_AMODE;
++ 	}
++ 
+  	/* Set up registers for signal handler */
++ 	regs->gprs[14] = restorer;
+  	regs->gprs[15] = (unsigned long) frame;
+  	/* Force default amode and default user address space control. */
+  	regs->psw.mask = PSW_MASK_EA | PSW_MASK_BA |
+@@@ -247,58 -398,69 +427,115 @@@
+  		regs->gprs[5] = regs->int_parm_long;
+  		regs->gprs[6] = task_thread_info(current)->last_break;
+  	}
+++<<<<<<< HEAD
+ +
+ +	/* Place signal number on stack to allow backtrace from handler.  */
+ +	if (__put_user(regs->gprs[2], (int __user *) &frame->signo))
+ +		goto give_sigsegv;
+++=======
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	return 0;
+ +
+ +give_sigsegv:
+ +	force_sigsegv(sig, current);
+ +	return -EFAULT;
+  }
+  
+ -static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
+ -			  struct pt_regs *regs)
+ +static int setup_rt_frame(int sig, struct k_sigaction *ka, siginfo_t *info,
+ +			   sigset_t *set, struct pt_regs * regs)
+  {
+++<<<<<<< HEAD
+ +	int err = 0;
+ +	rt_sigframe __user *frame;
+ +
+ +	frame = get_sigframe(ka, regs, sizeof(rt_sigframe));
+- 
+++=======
++ 	struct rt_sigframe __user *frame;
++ 	unsigned long uc_flags, restorer;
++ 	size_t frame_size;
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
++ 
++ 	frame_size = sizeof(struct rt_sigframe) - sizeof(_sigregs_ext);
++ 	/*
++ 	 * gprs_high are only present for a 31-bit task running on
++ 	 * a 64-bit kernel (see compat_signal.c) but the space for
++ 	 * gprs_high need to be allocated if vector registers are
++ 	 * included in the signal frame on a 31-bit system.
++ 	 */
++ 	uc_flags = 0;
++ #ifdef CONFIG_64BIT
++ 	if (MACHINE_HAS_VX) {
++ 		frame_size += sizeof(_sigregs_ext);
++ 		if (current->thread.vxrs)
++ 			uc_flags |= UC_VXRS;
++ 	}
++ #endif
++ 	frame = get_sigframe(&ksig->ka, regs, frame_size);
+  	if (frame == (void __user *) -1UL)
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+ +
+++<<<<<<< HEAD
+ +	if (copy_siginfo_to_user(&frame->info, info))
+ +		goto give_sigsegv;
+  
+ +	/* Create the ucontext.  */
+ +	err |= __put_user(0, &frame->uc.uc_flags);
+ +	err |= __put_user(NULL, &frame->uc.uc_link);
+ +	err |= __save_altstack(&frame->uc.uc_stack, regs->gprs[15]);
+ +	err |= save_sigregs(regs, &frame->uc.uc_mcontext);
+ +	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
+ +	if (err)
+ +		goto give_sigsegv;
+ +
+ +	/* Set up to return from userspace.  If provided, use a stub
+ +	   already in userspace.  */
+ +	if (ka->sa.sa_flags & SA_RESTORER) {
+ +                regs->gprs[14] = (unsigned long)
+ +			ka->sa.sa_restorer | PSW_ADDR_AMODE;
+ +	} else {
+ +                regs->gprs[14] = (unsigned long)
+ +			frame->retcode | PSW_ADDR_AMODE;
+ +		if (__put_user(S390_SYSCALL_OPCODE | __NR_rt_sigreturn,
+ +			       (u16 __user *)(frame->retcode)))
+ +			goto give_sigsegv;
+ +	}
+ +
+++=======
+++>>>>>>> 8070361799ae (s390: add support for vector extension)
+  	/* Set up backchain. */
+  	if (__put_user(regs->gprs[15], (addr_t __user *) frame))
+ -		return -EFAULT;
+ +		goto give_sigsegv;
+  
++ 	/* Set up to return from userspace.  If provided, use a stub
++ 	   already in userspace.  */
++ 	if (ksig->ka.sa.sa_flags & SA_RESTORER) {
++ 		restorer = (unsigned long)
++ 			ksig->ka.sa.sa_restorer | PSW_ADDR_AMODE;
++ 	} else {
++ 		__u16 __user *svc = &frame->svc_insn;
++ 		if (__put_user(S390_SYSCALL_OPCODE | __NR_rt_sigreturn, svc))
++ 			return -EFAULT;
++ 		restorer = (unsigned long) svc | PSW_ADDR_AMODE;
++ 	}
++ 
++ 	/* Create siginfo on the signal stack */
++ 	if (copy_siginfo_to_user(&frame->info, &ksig->info))
++ 		return -EFAULT;
++ 
++ 	/* Store registers needed to create the signal frame */
++ 	store_sigregs();
++ 
++ 	/* Create ucontext on the signal stack. */
++ 	if (__put_user(uc_flags, &frame->uc.uc_flags) ||
++ 	    __put_user(NULL, &frame->uc.uc_link) ||
++ 	    __save_altstack(&frame->uc.uc_stack, regs->gprs[15]) ||
++ 	    save_sigregs(regs, &frame->uc.uc_mcontext) ||
++ 	    __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set)) ||
++ 	    save_sigregs_ext(regs, &frame->uc.uc_mcontext_ext))
++ 		return -EFAULT;
++ 
+  	/* Set up registers for signal handler */
++ 	regs->gprs[14] = restorer;
+  	regs->gprs[15] = (unsigned long) frame;
+  	/* Force default amode and default user address space control. */
+  	regs->psw.mask = PSW_MASK_EA | PSW_MASK_BA |
+diff --git a/arch/s390/include/asm/elf.h b/arch/s390/include/asm/elf.h
+index 78f4f8711d58..27735ae06a78 100644
+--- a/arch/s390/include/asm/elf.h
++++ b/arch/s390/include/asm/elf.h
+@@ -102,6 +102,7 @@
+ #define HWCAP_S390_ETF3EH	256
+ #define HWCAP_S390_HIGH_GPRS	512
+ #define HWCAP_S390_TE		1024
++#define HWCAP_S390_VXRS		2048
+ 
+ /*
+  * These are used to set parameters in the core dumps.
+diff --git a/arch/s390/include/asm/lowcore.h b/arch/s390/include/asm/lowcore.h
+index bbf8141408cd..a4a71740d0f6 100644
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -309,7 +309,10 @@ struct _lowcore {
+ 
+ 	/* Extended facility list */
+ 	__u64	stfle_fac_list[32];		/* 0x0f00 */
+-	__u8	pad_0x1000[0x11b8-0x1000];	/* 0x1000 */
++	__u8	pad_0x1000[0x11b0-0x1000];	/* 0x1000 */
++
++	/* Pointer to vector register save area */
++	__u64	vector_save_area_addr;		/* 0x11b0 */
+ 
+ 	/* 64 bit extparam used for pfault/diag 250: defined by architecture */
+ 	__u64	ext_params2;			/* 0x11B8 */
+@@ -333,9 +336,10 @@ struct _lowcore {
+ 
+ 	/* Transaction abort diagnostic block */
+ 	__u8	pgm_tdb[256];			/* 0x1800 */
++	__u8	pad_0x1900[0x1c00-0x1900];	/* 0x1900 */
+ 
+-	/* align to the top of the prefix area */
+-	__u8	pad_0x1900[0x2000-0x1900];	/* 0x1900 */
++	/* Software defined save area for vector registers */
++	__u8	vector_save_area[1024];		/* 0x1c00 */
+ } __packed;
+ 
+ #endif /* CONFIG_32BIT */
+diff --git a/arch/s390/include/asm/nmi.h b/arch/s390/include/asm/nmi.h
+index 35f8ec185616..3027a5a72b74 100644
+--- a/arch/s390/include/asm/nmi.h
++++ b/arch/s390/include/asm/nmi.h
+@@ -38,7 +38,7 @@ struct mci {
+ 	__u32 pm :  1; /* 22 psw program mask and cc validity */
+ 	__u32 ia :  1; /* 23 psw instruction address validity */
+ 	__u32 fa :  1; /* 24 failing storage address validity */
+-	__u32	 :  1; /* 25 */
++	__u32 vr :  1; /* 25 vector register validity */
+ 	__u32 ec :  1; /* 26 external damage code validity */
+ 	__u32 fp :  1; /* 27 floating point register validity */
+ 	__u32 gr :  1; /* 28 general register validity */
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index db0bd08402b3..f7d0cc40ff81 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -90,6 +90,7 @@ struct thread_struct {
+ 	int ri_signum;
+ #ifdef CONFIG_64BIT
+ 	unsigned char trap_tdb[256];	/* Transaction abort diagnose block */
++	__vector128 *vxrs;		/* Vector register save area */
+ #endif
+ };
+ 
+* Unmerged path arch/s390/include/asm/setup.h
+* Unmerged path arch/s390/include/asm/switch_to.h
+diff --git a/arch/s390/include/uapi/asm/sigcontext.h b/arch/s390/include/uapi/asm/sigcontext.h
+index b30de9c01bbe..5f0b8d7ddb0b 100644
+--- a/arch/s390/include/uapi/asm/sigcontext.h
++++ b/arch/s390/include/uapi/asm/sigcontext.h
+@@ -7,10 +7,14 @@
+ #define _ASM_S390_SIGCONTEXT_H
+ 
+ #include <linux/compiler.h>
++#include <linux/types.h>
+ 
+-#define __NUM_GPRS 16
+-#define __NUM_FPRS 16
+-#define __NUM_ACRS 16
++#define __NUM_GPRS		16
++#define __NUM_FPRS		16
++#define __NUM_ACRS		16
++#define __NUM_VXRS		32
++#define __NUM_VXRS_LOW		16
++#define __NUM_VXRS_HIGH		16
+ 
+ #ifndef __s390x__
+ 
+@@ -59,6 +63,16 @@ typedef struct
+ 	_s390_fp_regs     fpregs;
+ } _sigregs;
+ 
++typedef struct
++{
++#ifndef __s390x__
++	unsigned long gprs_high[__NUM_GPRS];
++#endif
++	unsigned long long vxrs_low[__NUM_VXRS_LOW];
++	__vector128 vxrs_high[__NUM_VXRS_HIGH];
++	unsigned char __reserved[128];
++} _sigregs_ext;
++
+ struct sigcontext
+ {
+ 	unsigned long	oldmask[_SIGCONTEXT_NSIG_WORDS];
+diff --git a/arch/s390/include/uapi/asm/types.h b/arch/s390/include/uapi/asm/types.h
+index 038f2b9178a4..3c3951e3415b 100644
+--- a/arch/s390/include/uapi/asm/types.h
++++ b/arch/s390/include/uapi/asm/types.h
+@@ -17,6 +17,10 @@
+ typedef unsigned long addr_t; 
+ typedef __signed__ long saddr_t;
+ 
++typedef struct {
++	__u32 u[4];
++} __vector128;
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _UAPI_S390_TYPES_H */
+diff --git a/arch/s390/include/uapi/asm/ucontext.h b/arch/s390/include/uapi/asm/ucontext.h
+index 3e077b2a4705..64a69aa5dde0 100644
+--- a/arch/s390/include/uapi/asm/ucontext.h
++++ b/arch/s390/include/uapi/asm/ucontext.h
+@@ -7,10 +7,15 @@
+ #ifndef _ASM_S390_UCONTEXT_H
+ #define _ASM_S390_UCONTEXT_H
+ 
+-#define UC_EXTENDED	0x00000001
+-
+-#ifndef __s390x__
++#define UC_GPRS_HIGH	1	/* uc_mcontext_ext has valid high gprs */
++#define UC_VXRS		2	/* uc_mcontext_ext has valid vector regs */
+ 
++/*
++ * The struct ucontext_extended describes how the registers are stored
++ * on a rt signal frame. Please note that the structure is not fixed,
++ * if new CPU registers are added to the user state the size of the
++ * struct ucontext_extended will increase.
++ */
+ struct ucontext_extended {
+ 	unsigned long	  uc_flags;
+ 	struct ucontext  *uc_link;
+@@ -19,11 +24,9 @@ struct ucontext_extended {
+ 	sigset_t	  uc_sigmask;
+ 	/* Allow for uc_sigmask growth.  Glibc uses a 1024-bit sigset_t.  */
+ 	unsigned char	  __unused[128 - sizeof(sigset_t)];
+-	unsigned long	  uc_gprs_high[16];
++	_sigregs_ext	  uc_mcontext_ext;
+ };
+ 
+-#endif
+-
+ struct ucontext {
+ 	unsigned long	  uc_flags;
+ 	struct ucontext  *uc_link;
+diff --git a/arch/s390/kernel/compat_linux.h b/arch/s390/kernel/compat_linux.h
+index c6357c44a58f..264413515942 100644
+--- a/arch/s390/kernel/compat_linux.h
++++ b/arch/s390/kernel/compat_linux.h
+@@ -50,6 +50,14 @@ typedef struct
+ 	_s390_fp_regs32     fpregs;
+ } _sigregs32;
+ 
++typedef struct
++{
++	__u32 gprs_high[__NUM_GPRS];
++	__u64 vxrs_low[__NUM_VXRS_LOW];
++	__vector128 vxrs_high[__NUM_VXRS_HIGH];
++	__u8 __reserved[128];
++} _sigregs_ext32;
++
+ #define _SIGCONTEXT_NSIG32	64
+ #define _SIGCONTEXT_NSIG_BPW32	32
+ #define __SIGNAL_FRAMESIZE32	96
+@@ -72,6 +80,7 @@ struct ucontext32 {
+ 	compat_sigset_t		uc_sigmask;
+ 	/* Allow for uc_sigmask growth.  Glibc uses a 1024-bit sigset_t.  */
+ 	unsigned char		__unused[128 - sizeof(compat_sigset_t)];
++	_sigregs_ext32		uc_mcontext_ext;
+ };
+ 
+ struct stat64_emu31;
+* Unmerged path arch/s390/kernel/compat_signal.c
+* Unmerged path arch/s390/kernel/early.c
+diff --git a/arch/s390/kernel/entry.h b/arch/s390/kernel/entry.h
+index 93afeee4ca12..b64be3ab171c 100644
+--- a/arch/s390/kernel/entry.h
++++ b/arch/s390/kernel/entry.h
+@@ -21,6 +21,8 @@ void psw_idle(struct s390_idle_data *, unsigned long);
+ asmlinkage long do_syscall_trace_enter(struct pt_regs *regs);
+ asmlinkage void do_syscall_trace_exit(struct pt_regs *regs);
+ 
++int alloc_vector_registers(struct task_struct *tsk);
++
+ void do_protection_exception(struct pt_regs *regs);
+ void do_dat_exception(struct pt_regs *regs);
+ 
+@@ -43,6 +45,7 @@ void special_op_exception(struct pt_regs *regs);
+ void specification_exception(struct pt_regs *regs);
+ void transaction_exception(struct pt_regs *regs);
+ void translation_exception(struct pt_regs *regs);
++void vector_exception(struct pt_regs *regs);
+ 
+ void do_per_trap(struct pt_regs *regs);
+ void syscall_trace(struct pt_regs *regs, int entryexit);
+diff --git a/arch/s390/kernel/nmi.c b/arch/s390/kernel/nmi.c
+index 504175ebf8b0..b0c6aef7b106 100644
+--- a/arch/s390/kernel/nmi.c
++++ b/arch/s390/kernel/nmi.c
+@@ -20,6 +20,7 @@
+ #include <asm/cputime.h>
+ #include <asm/nmi.h>
+ #include <asm/crw.h>
++#include <asm/switch_to.h>
+ 
+ struct mcck_struct {
+ 	int kill_task;
+@@ -163,6 +164,21 @@ static int notrace s390_revalidate_registers(struct mci *mci)
+ 			"	ld	15,120(%0)\n"
+ 			: : "a" (fpt_save_area));
+ 	}
++
++#ifdef CONFIG_64BIT
++	/* Revalidate vector registers */
++	if (MACHINE_HAS_VX && current->thread.vxrs) {
++		if (!mci->vr) {
++			/*
++			 * Vector registers can't be restored and therefore
++			 * the process needs to be terminated.
++			 */
++			kill_task = 1;
++		}
++		restore_vx_regs((__vector128 *)
++				S390_lowcore.vector_save_area_addr);
++	}
++#endif
+ 	/* Revalidate access registers */
+ 	asm volatile(
+ 		"	lam	0,15,0(%0)"
+diff --git a/arch/s390/kernel/pgm_check.S b/arch/s390/kernel/pgm_check.S
+index 813ec7260878..f6f8886399f6 100644
+--- a/arch/s390/kernel/pgm_check.S
++++ b/arch/s390/kernel/pgm_check.S
+@@ -49,7 +49,7 @@ PGM_CHECK_DEFAULT			/* 17 */
+ PGM_CHECK_64BIT(transaction_exception)	/* 18 */
+ PGM_CHECK_DEFAULT			/* 19 */
+ PGM_CHECK_DEFAULT			/* 1a */
+-PGM_CHECK_DEFAULT			/* 1b */
++PGM_CHECK_64BIT(vector_exception)	/* 1b */
+ PGM_CHECK(space_switch_exception)	/* 1c */
+ PGM_CHECK(hfp_sqrt_exception)		/* 1d */
+ PGM_CHECK_DEFAULT			/* 1e */
+diff --git a/arch/s390/kernel/processor.c b/arch/s390/kernel/processor.c
+index 24612029f450..ff842f2eef51 100644
+--- a/arch/s390/kernel/processor.c
++++ b/arch/s390/kernel/processor.c
+@@ -41,7 +41,7 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ {
+ 	static const char *hwcap_str[] = {
+ 		"esan3", "zarch", "stfle", "msa", "ldisp", "eimm", "dfp",
+-		"edat", "etf3eh", "highgprs", "te"
++		"edat", "etf3eh", "highgprs", "te", "vx"
+ 	};
+ 	unsigned long n = (unsigned long) v - 1;
+ 	int i;
+* Unmerged path arch/s390/kernel/ptrace.c
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 4f03e6e1cd12..1a5dbd486957 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -341,6 +341,9 @@ static void __init setup_lowcore(void)
+ 		__ctl_set_bit(14, 29);
+ 	}
+ #else
++	if (MACHINE_HAS_VX)
++		lc->vector_save_area_addr =
++			(unsigned long) &lc->vector_save_area;
+ 	lc->vdso_per_cpu_data = (unsigned long) &lc->paste[0];
+ #endif
+ 	lc->sync_enter_timer = S390_lowcore.sync_enter_timer;
+@@ -915,6 +918,12 @@ static void __init setup_hwcaps(void)
+ 	 */
+ 	if (test_facility(50) && test_facility(73))
+ 		elf_hwcap |= HWCAP_S390_TE;
++
++	/*
++	 * Vector extension HWCAP_S390_VXRS is bit 11.
++	 */
++	if (test_facility(129))
++		elf_hwcap |= HWCAP_S390_VXRS;
+ #endif
+ 
+ 	get_cpu_id(&cpu_id);
+* Unmerged path arch/s390/kernel/signal.c
+diff --git a/arch/s390/kernel/smp.c b/arch/s390/kernel/smp.c
+index 6055d9cfb3ce..91e720589c83 100644
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -193,6 +193,9 @@ static int pcpu_alloc_lowcore(struct pcpu *pcpu, int cpu)
+ 			goto out;
+ 	}
+ #else
++	if (MACHINE_HAS_VX)
++		lc->vector_save_area_addr =
++			(unsigned long) &lc->vector_save_area;
+ 	if (vdso_alloc_per_cpu(lc))
+ 		goto out;
+ #endif
+diff --git a/arch/s390/kernel/traps.c b/arch/s390/kernel/traps.c
+index c5762324d9ee..4ab6d50dbc0b 100644
+--- a/arch/s390/kernel/traps.c
++++ b/arch/s390/kernel/traps.c
+@@ -18,6 +18,8 @@
+ #include <linux/ptrace.h>
+ #include <linux/sched.h>
+ #include <linux/mm.h>
++#include <linux/slab.h>
++#include <asm/switch_to.h>
+ #include "entry.h"
+ 
+ int show_unhandled_signals = 1;
+@@ -292,6 +294,74 @@ DO_ERROR_INFO(specification_exception, SIGILL, ILL_ILLOPN,
+ 	      "specification exception");
+ #endif
+ 
++#ifdef CONFIG_64BIT
++int alloc_vector_registers(struct task_struct *tsk)
++{
++	__vector128 *vxrs;
++	int i;
++
++	/* Allocate vector register save area. */
++	vxrs = kzalloc(sizeof(__vector128) * __NUM_VXRS,
++		       GFP_KERNEL|__GFP_REPEAT);
++	if (!vxrs)
++		return -ENOMEM;
++	preempt_disable();
++	if (tsk == current)
++		save_fp_regs(tsk->thread.fp_regs.fprs);
++	/* Copy the 16 floating point registers */
++	for (i = 0; i < 16; i++)
++		*(freg_t *) &vxrs[i] = tsk->thread.fp_regs.fprs[i];
++	tsk->thread.vxrs = vxrs;
++	if (tsk == current) {
++		__ctl_set_bit(0, 17);
++		restore_vx_regs(vxrs);
++	}
++	preempt_enable();
++	return 0;
++}
++
++void vector_exception(struct pt_regs *regs)
++{
++	int si_code, vic;
++
++	if (!MACHINE_HAS_VX) {
++		do_trap(regs, SIGILL, ILL_ILLOPN, "illegal operation");
++		return;
++	}
++
++	/* get vector interrupt code from fpc */
++	asm volatile("stfpc %0" : "=m" (current->thread.fp_regs.fpc));
++	vic = (current->thread.fp_regs.fpc & 0xf00) >> 8;
++	switch (vic) {
++	case 1: /* invalid vector operation */
++		si_code = FPE_FLTINV;
++		break;
++	case 2: /* division by zero */
++		si_code = FPE_FLTDIV;
++		break;
++	case 3: /* overflow */
++		si_code = FPE_FLTOVF;
++		break;
++	case 4: /* underflow */
++		si_code = FPE_FLTUND;
++		break;
++	case 5:	/* inexact */
++		si_code = FPE_FLTRES;
++		break;
++	default: /* unknown cause */
++		si_code = 0;
++	}
++	do_trap(regs, SIGFPE, si_code, "vector exception");
++}
++
++static int __init disable_vector_extension(char *str)
++{
++	S390_lowcore.machine_flags &= ~MACHINE_FLAG_VX;
++	return 1;
++}
++__setup("novx", disable_vector_extension);
++#endif
++
+ void data_exception(struct pt_regs *regs)
+ {
+ 	__u16 __user *location;
+@@ -357,6 +427,18 @@ void data_exception(struct pt_regs *regs)
+                 }
+         }
+ #endif 
++#ifdef CONFIG_64BIT
++	/* Check for vector register enablement */
++	if (MACHINE_HAS_VX && !current->thread.vxrs &&
++	    (current->thread.fp_regs.fpc & FPC_DXC_MASK) == 0xfe00) {
++		alloc_vector_registers(current);
++		/* Vector data exception is suppressing, rewind psw. */
++		regs->psw.addr = __rewind_psw(regs->psw, regs->int_code >> 16);
++		clear_pt_regs_flag(regs, PIF_PER_TRAP);
++		return;
++	}
++#endif
++
+ 	if (current->thread.fp_regs.fpc & FPC_DXC_MASK)
+ 		signal = SIGFPE;
+ 	else
+diff --git a/include/uapi/linux/elf.h b/include/uapi/linux/elf.h
+index ef6103bf1f9b..ea9bf2561b9e 100644
+--- a/include/uapi/linux/elf.h
++++ b/include/uapi/linux/elf.h
+@@ -391,6 +391,8 @@ typedef struct elf64_shdr {
+ #define NT_S390_LAST_BREAK	0x306	/* s390 breaking event address */
+ #define NT_S390_SYSTEM_CALL	0x307	/* s390 system call restart data */
+ #define NT_S390_TDB	0x308		/* s390 transaction diagnostic block */
++#define NT_S390_VXRS_LOW	0x309	/* s390 vector registers 0-15 upper half */
++#define NT_S390_VXRS_HIGH	0x30a	/* s390 vector registers 16-31 */
+ #define NT_ARM_VFP	0x400		/* ARM VFP/NEON registers */
+ #define NT_ARM_TLS	0x401		/* ARM TLS register */
+ #define NT_ARM_HW_BREAK	0x402		/* ARM hardware breakpoint registers */
