@@ -1,0 +1,290 @@
+be2net: implement .sriov_configure() PCI callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Vasundhara Volam <vasundhara.volam@emulex.com>
+commit ace40aff3cee8a82c39375761ea65cc748aa1623
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ace40aff.failed
+
+This patch implements the .sriov_configure() PCI method to allow for
+runtime enabling/disabling of VFs. The module param "num_vfs" is now
+deprecated.
+At the time of driver load the PF-pool resources are allocated to the PF.
+When the user enables VFs, the resources are then re-distributed across
+PFs and VFs based on the number of VFs enabled.
+	Signed-off-by: Vasundhara Volam <vasundhara.volam@emulex.com>
+
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ace40aff3cee8a82c39375761ea65cc748aa1623)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index eca58bf09969,5652b005947f..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -3594,41 -3823,14 +3614,10 @@@ static int be_get_resources(struct be_a
+  	return 0;
+  }
+  
+- static void be_sriov_config(struct be_adapter *adapter)
+- {
+- 	struct device *dev = &adapter->pdev->dev;
+- 	u16 num_vf_qs;
+- 	int status;
+- 
+- 	status = be_get_sriov_config(adapter);
+- 	if (status) {
+- 		dev_err(dev, "Failed to query SR-IOV configuration\n");
+- 		dev_err(dev, "SR-IOV cannot be enabled\n");
+- 		return;
+- 	}
+- 
+- 	/* When the HW is in SRIOV capable configuration, the PF-pool
+- 	 * resources are equally distributed across the max-number of
+- 	 * VFs. The user may request only a subset of the max-vfs to be
+- 	 * enabled. Based on num_vfs, redistribute the resources across
+- 	 * num_vfs so that each VF will have access to more number of
+- 	 * resources. This facility is not available in BE3 FW.
+- 	 * Also, this is done by FW in Lancer chip.
+- 	 */
+- 	if (be_max_vfs(adapter) && !pci_num_vf(adapter->pdev)) {
+- 		num_vf_qs = be_calculate_vf_qs(adapter, adapter->num_vfs);
+- 		status = be_cmd_set_sriov_config(adapter,
+- 						 adapter->pool_res,
+- 						 adapter->num_vfs, num_vf_qs);
+- 		if (status)
+- 			dev_err(dev, "Failed to optimize SR-IOV resources\n");
+- 	}
+- }
+- 
+  static int be_get_config(struct be_adapter *adapter)
+  {
+ -	int status, level;
+  	u16 profile_id;
+ -
+ -	status = be_cmd_get_cntl_attributes(adapter);
+ -	if (status)
+ -		return status;
+ +	int status;
+  
+  	status = be_cmd_query_fw_cfg(adapter);
+  	if (status)
+@@@ -5024,10 -5124,181 +5010,186 @@@ reschedule
+  	schedule_delayed_work(&adapter->work, msecs_to_jiffies(1000));
+  }
+  
+ -static void be_unmap_pci_bars(struct be_adapter *adapter)
+ +/* If any VFs are already enabled don't FLR the PF */
+ +static bool be_reset_required(struct be_adapter *adapter)
+  {
+++<<<<<<< HEAD
+ +	return pci_num_vf(adapter->pdev) ? false : true;
+++=======
++ 	if (adapter->csr)
++ 		pci_iounmap(adapter->pdev, adapter->csr);
++ 	if (adapter->db)
++ 		pci_iounmap(adapter->pdev, adapter->db);
++ }
++ 
++ static int db_bar(struct be_adapter *adapter)
++ {
++ 	if (lancer_chip(adapter) || !be_physfn(adapter))
++ 		return 0;
++ 	else
++ 		return 4;
++ }
++ 
++ static int be_roce_map_pci_bars(struct be_adapter *adapter)
++ {
++ 	if (skyhawk_chip(adapter)) {
++ 		adapter->roce_db.size = 4096;
++ 		adapter->roce_db.io_addr = pci_resource_start(adapter->pdev,
++ 							      db_bar(adapter));
++ 		adapter->roce_db.total_size = pci_resource_len(adapter->pdev,
++ 							       db_bar(adapter));
++ 	}
++ 	return 0;
++ }
++ 
++ static int be_map_pci_bars(struct be_adapter *adapter)
++ {
++ 	u8 __iomem *addr;
++ 	u32 sli_intf;
++ 
++ 	pci_read_config_dword(adapter->pdev, SLI_INTF_REG_OFFSET, &sli_intf);
++ 	adapter->sli_family = (sli_intf & SLI_INTF_FAMILY_MASK) >>
++ 				SLI_INTF_FAMILY_SHIFT;
++ 	adapter->virtfn = (sli_intf & SLI_INTF_FT_MASK) ? 1 : 0;
++ 
++ 	if (BEx_chip(adapter) && be_physfn(adapter)) {
++ 		adapter->csr = pci_iomap(adapter->pdev, 2, 0);
++ 		if (!adapter->csr)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	addr = pci_iomap(adapter->pdev, db_bar(adapter), 0);
++ 	if (!addr)
++ 		goto pci_map_err;
++ 	adapter->db = addr;
++ 
++ 	be_roce_map_pci_bars(adapter);
++ 	return 0;
++ 
++ pci_map_err:
++ 	dev_err(&adapter->pdev->dev, "Error in mapping PCI BARs\n");
++ 	be_unmap_pci_bars(adapter);
++ 	return -ENOMEM;
++ }
++ 
++ static void be_drv_cleanup(struct be_adapter *adapter)
++ {
++ 	struct be_dma_mem *mem = &adapter->mbox_mem_alloced;
++ 	struct device *dev = &adapter->pdev->dev;
++ 
++ 	if (mem->va)
++ 		dma_free_coherent(dev, mem->size, mem->va, mem->dma);
++ 
++ 	mem = &adapter->rx_filter;
++ 	if (mem->va)
++ 		dma_free_coherent(dev, mem->size, mem->va, mem->dma);
++ 
++ 	mem = &adapter->stats_cmd;
++ 	if (mem->va)
++ 		dma_free_coherent(dev, mem->size, mem->va, mem->dma);
++ }
++ 
++ /* Allocate and initialize various fields in be_adapter struct */
++ static int be_drv_init(struct be_adapter *adapter)
++ {
++ 	struct be_dma_mem *mbox_mem_alloc = &adapter->mbox_mem_alloced;
++ 	struct be_dma_mem *mbox_mem_align = &adapter->mbox_mem;
++ 	struct be_dma_mem *rx_filter = &adapter->rx_filter;
++ 	struct be_dma_mem *stats_cmd = &adapter->stats_cmd;
++ 	struct device *dev = &adapter->pdev->dev;
++ 	int status = 0;
++ 
++ 	mbox_mem_alloc->size = sizeof(struct be_mcc_mailbox) + 16;
++ 	mbox_mem_alloc->va = dma_alloc_coherent(dev, mbox_mem_alloc->size,
++ 						&mbox_mem_alloc->dma,
++ 						GFP_KERNEL);
++ 	if (!mbox_mem_alloc->va)
++ 		return -ENOMEM;
++ 
++ 	mbox_mem_align->size = sizeof(struct be_mcc_mailbox);
++ 	mbox_mem_align->va = PTR_ALIGN(mbox_mem_alloc->va, 16);
++ 	mbox_mem_align->dma = PTR_ALIGN(mbox_mem_alloc->dma, 16);
++ 	memset(mbox_mem_align->va, 0, sizeof(struct be_mcc_mailbox));
++ 
++ 	rx_filter->size = sizeof(struct be_cmd_req_rx_filter);
++ 	rx_filter->va = dma_zalloc_coherent(dev, rx_filter->size,
++ 					    &rx_filter->dma, GFP_KERNEL);
++ 	if (!rx_filter->va) {
++ 		status = -ENOMEM;
++ 		goto free_mbox;
++ 	}
++ 
++ 	if (lancer_chip(adapter))
++ 		stats_cmd->size = sizeof(struct lancer_cmd_req_pport_stats);
++ 	else if (BE2_chip(adapter))
++ 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v0);
++ 	else if (BE3_chip(adapter))
++ 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v1);
++ 	else
++ 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v2);
++ 	stats_cmd->va = dma_zalloc_coherent(dev, stats_cmd->size,
++ 					    &stats_cmd->dma, GFP_KERNEL);
++ 	if (!stats_cmd->va) {
++ 		status = -ENOMEM;
++ 		goto free_rx_filter;
++ 	}
++ 
++ 	mutex_init(&adapter->mbox_lock);
++ 	spin_lock_init(&adapter->mcc_lock);
++ 	spin_lock_init(&adapter->mcc_cq_lock);
++ 	init_completion(&adapter->et_cmd_compl);
++ 
++ 	pci_save_state(adapter->pdev);
++ 
++ 	INIT_DELAYED_WORK(&adapter->work, be_worker);
++ 	INIT_DELAYED_WORK(&adapter->be_err_detection_work,
++ 			  be_err_detection_task);
++ 
++ 	adapter->rx_fc = true;
++ 	adapter->tx_fc = true;
++ 
++ 	/* Must be a power of 2 or else MODULO will BUG_ON */
++ 	adapter->be_get_temp_freq = 64;
++ 
++ 	return 0;
++ 
++ free_rx_filter:
++ 	dma_free_coherent(dev, rx_filter->size, rx_filter->va, rx_filter->dma);
++ free_mbox:
++ 	dma_free_coherent(dev, mbox_mem_alloc->size, mbox_mem_alloc->va,
++ 			  mbox_mem_alloc->dma);
++ 	return status;
++ }
++ 
++ static void be_remove(struct pci_dev *pdev)
++ {
++ 	struct be_adapter *adapter = pci_get_drvdata(pdev);
++ 
++ 	if (!adapter)
++ 		return;
++ 
++ 	be_roce_dev_remove(adapter);
++ 	be_intr_set(adapter, false);
++ 
++ 	be_cancel_err_detection(adapter);
++ 
++ 	unregister_netdev(adapter->netdev);
++ 
++ 	be_clear(adapter);
++ 
++ 	/* tell fw we're done with firing cmds */
++ 	be_cmd_fw_clean(adapter);
++ 
++ 	be_unmap_pci_bars(adapter);
++ 	be_drv_cleanup(adapter);
++ 
++ 	pci_disable_pcie_error_reporting(pdev);
++ 
++ 	pci_release_regions(pdev);
++ 	pci_disable_device(pdev);
++ 
++ 	free_netdev(adapter->netdev);
+++>>>>>>> ace40aff3cee (be2net: implement .sriov_configure() PCI callback)
+  }
+  
+  static char *mc_name(struct be_adapter *adapter)
+@@@ -5398,8 -5649,9 +5614,9 @@@ static struct pci_driver be_driver = 
+  	.probe = be_probe,
+  	.remove = be_remove,
+  	.suspend = be_suspend,
+ -	.resume = be_pci_resume,
+ +	.resume = be_resume,
+  	.shutdown = be_shutdown,
++ 	.sriov_configure = be_pci_sriov_configure,
+  	.err_handler = &be_eeh_handlers
+  };
+  
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index c946a2a4828c..de9695b9ca8a 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -3918,9 +3918,6 @@ int be_cmd_set_sriov_config(struct be_adapter *adapter,
+ 		struct be_nic_res_desc nic_vft;
+ 	} __packed desc;
+ 
+-	if (BEx_chip(adapter) || lancer_chip(adapter))
+-		return 0;
+-
+ 	/* PF PCIE descriptor */
+ 	be_reset_pcie_desc(&desc.pcie);
+ 	desc.pcie.hdr.desc_type = PCIE_RESOURCE_DESC_TYPE_V1;
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
