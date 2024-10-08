@@ -1,0 +1,217 @@
+drm/i915: set proper N/CTS in modeset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] alsa: drm/i915: set proper N/CTS in modeset (Jaroslav Kysela) [1288993]
+Rebuild_FUZZ: 92.50%
+commit-author Libin Yang <libin.yang@intel.com>
+commit 7e8275c2f2bbb384e18af37066b8b2f32b7d092f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7e8275c2.failed
+
+When modeset occurs and the TMDS frequency is set to some
+speical values, the N/CTS need to be set manually if audio
+is playing.
+
+	Signed-off-by: Libin Yang <libin.yang@intel.com>
+	Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 7e8275c2f2bbb384e18af37066b8b2f32b7d092f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_audio.c
+diff --cc drivers/gpu/drm/i915/intel_audio.c
+index e35997ebb331,30f6859dcb36..000000000000
+--- a/drivers/gpu/drm/i915/intel_audio.c
++++ b/drivers/gpu/drm/i915/intel_audio.c
+@@@ -90,6 -115,45 +90,48 @@@ static u32 audio_config_hdmi_pixel_cloc
+  	return hdmi_audio_clock[i].config;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int audio_config_get_n(const struct drm_display_mode *mode, int rate)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(aud_ncts); i++) {
++ 		if ((rate == aud_ncts[i].sample_rate) &&
++ 			(mode->clock == aud_ncts[i].clock)) {
++ 			return aud_ncts[i].n;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static uint32_t audio_config_setup_n_reg(int n, uint32_t val)
++ {
++ 	int n_low, n_up;
++ 	uint32_t tmp = val;
++ 
++ 	n_low = n & 0xfff;
++ 	n_up = (n >> 12) & 0xff;
++ 	tmp &= ~(AUD_CONFIG_UPPER_N_MASK | AUD_CONFIG_LOWER_N_MASK);
++ 	tmp |= ((n_up << AUD_CONFIG_UPPER_N_SHIFT) |
++ 			(n_low << AUD_CONFIG_LOWER_N_SHIFT) |
++ 			AUD_CONFIG_N_PROG_ENABLE);
++ 	return tmp;
++ }
++ 
++ /* check whether N/CTS/M need be set manually */
++ static bool audio_rate_need_prog(struct intel_crtc *crtc,
++ 					struct drm_display_mode *mode)
++ {
++ 	if (((mode->clock == TMDS_297M) ||
++ 		 (mode->clock == TMDS_296M)) &&
++ 		intel_pipe_has_type(crtc, INTEL_OUTPUT_HDMI))
++ 		return true;
++ 	else
++ 		return false;
++ }
++ 
+++>>>>>>> 7e8275c2f2bb (drm/i915: set proper N/CTS in modeset)
+  static bool intel_eld_uptodate(struct drm_connector *connector,
+  			       int reg_eldv, uint32_t bits_eldv,
+  			       int reg_elda, uint32_t bits_elda,
+@@@ -252,7 -326,27 +298,25 @@@ static void hsw_audio_codec_enable(stru
+  		tmp |= AUD_CONFIG_N_VALUE_INDEX;
+  	else
+  		tmp |= audio_config_hdmi_pixel_clock(mode);
++ 
++ 	tmp &= ~AUD_CONFIG_N_PROG_ENABLE;
++ 	if (audio_rate_need_prog(intel_crtc, mode)) {
++ 		if (!acomp)
++ 			rate = 0;
++ 		else if (port >= PORT_A && port <= PORT_E)
++ 			rate = acomp->aud_sample_rate[port];
++ 		else {
++ 			DRM_ERROR("invalid port: %d\n", port);
++ 			rate = 0;
++ 		}
++ 		n = audio_config_get_n(mode, rate);
++ 		if (n != 0)
++ 			tmp = audio_config_setup_n_reg(n, tmp);
++ 		else
++ 			DRM_DEBUG_KMS("no suitable N value is found\n");
++ 	}
++ 
+  	I915_WRITE(HSW_AUD_CFG(pipe), tmp);
+ -
+ -	mutex_unlock(&dev_priv->av_mutex);
+  }
+  
+  static void ilk_audio_codec_disable(struct intel_encoder *encoder)
+@@@ -527,6 -621,84 +591,87 @@@ static int i915_audio_component_get_cdc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int i915_audio_component_sync_audio_rate(struct device *dev,
++ 						int port, int rate)
++ {
++ 	struct drm_i915_private *dev_priv = dev_to_i915(dev);
++ 	struct drm_device *drm_dev = dev_priv->dev;
++ 	struct intel_encoder *intel_encoder;
++ 	struct intel_digital_port *intel_dig_port;
++ 	struct intel_crtc *crtc;
++ 	struct drm_display_mode *mode;
++ 	struct i915_audio_component *acomp = dev_priv->audio_component;
++ 	enum pipe pipe = -1;
++ 	u32 tmp;
++ 	int n;
++ 
++ 	/* HSW, BDW SKL need this fix */
++ 	if (!IS_SKYLAKE(dev_priv) &&
++ 		!IS_BROADWELL(dev_priv) &&
++ 		!IS_HASWELL(dev_priv))
++ 		return 0;
++ 
++ 	mutex_lock(&dev_priv->av_mutex);
++ 	/* 1. get the pipe */
++ 	for_each_intel_encoder(drm_dev, intel_encoder) {
++ 		if (intel_encoder->type != INTEL_OUTPUT_HDMI)
++ 			continue;
++ 		intel_dig_port = enc_to_dig_port(&intel_encoder->base);
++ 		if (port == intel_dig_port->port) {
++ 			crtc = to_intel_crtc(intel_encoder->base.crtc);
++ 			if (!crtc) {
++ 				DRM_DEBUG_KMS("%s: crtc is NULL\n", __func__);
++ 				continue;
++ 			}
++ 			pipe = crtc->pipe;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (pipe == INVALID_PIPE) {
++ 		DRM_DEBUG_KMS("no pipe for the port %c\n", port_name(port));
++ 		mutex_unlock(&dev_priv->av_mutex);
++ 		return -ENODEV;
++ 	}
++ 	DRM_DEBUG_KMS("pipe %c connects port %c\n",
++ 				  pipe_name(pipe), port_name(port));
++ 	mode = &crtc->config->base.adjusted_mode;
++ 
++ 	/* port must be valid now, otherwise the pipe will be invalid */
++ 	acomp->aud_sample_rate[port] = rate;
++ 
++ 	/* 2. check whether to set the N/CTS/M manually or not */
++ 	if (!audio_rate_need_prog(crtc, mode)) {
++ 		tmp = I915_READ(HSW_AUD_CFG(pipe));
++ 		tmp &= ~AUD_CONFIG_N_PROG_ENABLE;
++ 		I915_WRITE(HSW_AUD_CFG(pipe), tmp);
++ 		mutex_unlock(&dev_priv->av_mutex);
++ 		return 0;
++ 	}
++ 
++ 	n = audio_config_get_n(mode, rate);
++ 	if (n == 0) {
++ 		DRM_DEBUG_KMS("Using automatic mode for N value on port %c\n",
++ 					  port_name(port));
++ 		tmp = I915_READ(HSW_AUD_CFG(pipe));
++ 		tmp &= ~AUD_CONFIG_N_PROG_ENABLE;
++ 		I915_WRITE(HSW_AUD_CFG(pipe), tmp);
++ 		mutex_unlock(&dev_priv->av_mutex);
++ 		return 0;
++ 	}
++ 
++ 	/* 3. set the N/CTS/M */
++ 	tmp = I915_READ(HSW_AUD_CFG(pipe));
++ 	tmp = audio_config_setup_n_reg(n, tmp);
++ 	I915_WRITE(HSW_AUD_CFG(pipe), tmp);
++ 
++ 	mutex_unlock(&dev_priv->av_mutex);
++ 	return 0;
++ }
++ 
+++>>>>>>> 7e8275c2f2bb (drm/i915: set proper N/CTS in modeset)
+  static const struct i915_audio_component_ops i915_audio_component_ops = {
+  	.owner		= THIS_MODULE,
+  	.get_power	= i915_audio_component_get_power,
+* Unmerged path drivers/gpu/drm/i915/intel_audio.c
+diff --git a/include/drm/i915_component.h b/include/drm/i915_component.h
+index e6d35d7239c0..89dc7d6bc1cc 100644
+--- a/include/drm/i915_component.h
++++ b/include/drm/i915_component.h
+@@ -24,8 +24,18 @@
+ #ifndef _I915_COMPONENT_H_
+ #define _I915_COMPONENT_H_
+ 
++/* MAX_PORT is the number of port
++ * It must be sync with I915_MAX_PORTS defined i915_drv.h
++ * 5 should be enough as only HSW, BDW, SKL need such fix.
++ */
++#define MAX_PORTS 5
++
+ struct i915_audio_component {
+ 	struct device *dev;
++	/**
++	 * @aud_sample_rate: the array of audio sample rate per port
++	 */
++	int aud_sample_rate[MAX_PORTS];
+ 
+ 	const struct i915_audio_component_ops {
+ 		struct module *owner;
