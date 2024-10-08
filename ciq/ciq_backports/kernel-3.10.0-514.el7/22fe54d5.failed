@@ -1,0 +1,601 @@
+netfilter: nf_tables: add support for dynamic set updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 22fe54d5fefcfa98c58cc2f4607dd26d9648b3f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/22fe54d5.failed
+
+Add a new "dynset" expression for dynamic set updates.
+
+A new set op ->update() is added which, for non existant elements,
+invokes an initialization callback and inserts the new element.
+For both new or existing elements the extenstion pointer is returned
+to the caller to optionally perform timer updates or other actions.
+
+Element removal is not supported so far, however that seems to be a
+rather exotic need and can be added later on.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 22fe54d5fefcfa98c58cc2f4607dd26d9648b3f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nf_tables_core.c
+diff --cc include/net/netfilter/nf_tables.h
+index 4ab50d820db0,38c3496f7bf2..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -201,6 -195,9 +201,12 @@@ struct nft_set_estimate 
+  	enum nft_set_class	class;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nft_set_ext;
++ struct nft_expr;
++ 
+++>>>>>>> 22fe54d5fefc (netfilter: nf_tables: add support for dynamic set updates)
+  /**
+   *	struct nft_set_ops - nf_tables set operations
+   *
+@@@ -218,11 -218,22 +224,24 @@@
+  struct nft_set_ops {
+  	bool				(*lookup)(const struct nft_set *set,
+  						  const struct nft_data *key,
+++<<<<<<< HEAD
+ +						  struct nft_data *data);
+ +	int				(*get)(const struct nft_set *set,
+ +					       struct nft_set_elem *elem);
+++=======
++ 						  const struct nft_set_ext **ext);
++ 	bool				(*update)(struct nft_set *set,
++ 						  const struct nft_data *key,
++ 						  void *(*new)(struct nft_set *,
++ 							       const struct nft_expr *,
++ 							       struct nft_data []),
++ 						  const struct nft_expr *expr,
++ 						  struct nft_data data[],
++ 						  const struct nft_set_ext **ext);
++ 
+++>>>>>>> 22fe54d5fefc (netfilter: nf_tables: add support for dynamic set updates)
+  	int				(*insert)(const struct nft_set *set,
+  						  const struct nft_set_elem *elem);
+ -	void				(*activate)(const struct nft_set *set,
+ -						    const struct nft_set_elem *elem);
+ -	void *				(*deactivate)(const struct nft_set *set,
+ -						      const struct nft_set_elem *elem);
+  	void				(*remove)(const struct nft_set *set,
+  						  const struct nft_set_elem *elem);
+  	void				(*walk)(const struct nft_ctx *ctx,
+@@@ -427,6 -454,35 +446,38 @@@ static inline u8 *nft_set_ext_flags(con
+  	return nft_set_ext(ext, NFT_SET_EXT_FLAGS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64 *nft_set_ext_timeout(const struct nft_set_ext *ext)
++ {
++ 	return nft_set_ext(ext, NFT_SET_EXT_TIMEOUT);
++ }
++ 
++ static inline unsigned long *nft_set_ext_expiration(const struct nft_set_ext *ext)
++ {
++ 	return nft_set_ext(ext, NFT_SET_EXT_EXPIRATION);
++ }
++ 
++ static inline bool nft_set_elem_expired(const struct nft_set_ext *ext)
++ {
++ 	return nft_set_ext_exists(ext, NFT_SET_EXT_EXPIRATION) &&
++ 	       time_is_before_eq_jiffies(*nft_set_ext_expiration(ext));
++ }
++ 
++ static inline struct nft_set_ext *nft_set_elem_ext(const struct nft_set *set,
++ 						   void *elem)
++ {
++ 	return elem + set->ops->elemsize;
++ }
++ 
++ void *nft_set_elem_init(const struct nft_set *set,
++ 			const struct nft_set_ext_tmpl *tmpl,
++ 			const struct nft_data *key,
++ 			const struct nft_data *data,
++ 			u64 timeout, gfp_t gfp);
++ void nft_set_elem_destroy(const struct nft_set *set, void *elem);
++ 
+++>>>>>>> 22fe54d5fefc (netfilter: nf_tables: add support for dynamic set updates)
+  /**
+   *	struct nft_set_gc_batch_head - nf_tables set garbage collection batch
+   *
+@@@ -804,6 -860,59 +855,62 @@@ static inline u8 nft_genmask_cur(const 
+  	return 1 << ACCESS_ONCE(net->nft.gencursor);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define NFT_GENMASK_ANY		((1 << 0) | (1 << 1))
++ 
++ /*
++  * Set element transaction helpers
++  */
++ 
++ static inline bool nft_set_elem_active(const struct nft_set_ext *ext,
++ 				       u8 genmask)
++ {
++ 	return !(ext->genmask & genmask);
++ }
++ 
++ static inline void nft_set_elem_change_active(const struct nft_set *set,
++ 					      struct nft_set_ext *ext)
++ {
++ 	ext->genmask ^= nft_genmask_next(read_pnet(&set->pnet));
++ }
++ 
++ /*
++  * We use a free bit in the genmask field to indicate the element
++  * is busy, meaning it is currently being processed either by
++  * the netlink API or GC.
++  *
++  * Even though the genmask is only a single byte wide, this works
++  * because the extension structure if fully constant once initialized,
++  * so there are no non-atomic write accesses unless it is already
++  * marked busy.
++  */
++ #define NFT_SET_ELEM_BUSY_MASK	(1 << 2)
++ 
++ #if defined(__LITTLE_ENDIAN_BITFIELD)
++ #define NFT_SET_ELEM_BUSY_BIT	2
++ #elif defined(__BIG_ENDIAN_BITFIELD)
++ #define NFT_SET_ELEM_BUSY_BIT	(BITS_PER_LONG - BITS_PER_BYTE + 2)
++ #else
++ #error
++ #endif
++ 
++ static inline int nft_set_elem_mark_busy(struct nft_set_ext *ext)
++ {
++ 	unsigned long *word = (unsigned long *)ext;
++ 
++ 	BUILD_BUG_ON(offsetof(struct nft_set_ext, genmask) != 0);
++ 	return test_and_set_bit(NFT_SET_ELEM_BUSY_BIT, word);
++ }
++ 
++ static inline void nft_set_elem_clear_busy(struct nft_set_ext *ext)
++ {
++ 	unsigned long *word = (unsigned long *)ext;
++ 
++ 	clear_bit(NFT_SET_ELEM_BUSY_BIT, word);
++ }
++ 
+++>>>>>>> 22fe54d5fefc (netfilter: nf_tables: add support for dynamic set updates)
+  /**
+   *	struct nft_trans - nf_tables object update in transaction
+   *
+diff --cc net/netfilter/nf_tables_api.c
+index 399ca83793bb,598e53eb64b3..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3147,6 -3183,46 +3147,49 @@@ static struct nft_trans *nft_trans_elem
+  	return trans;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void *nft_set_elem_init(const struct nft_set *set,
++ 			const struct nft_set_ext_tmpl *tmpl,
++ 			const struct nft_data *key,
++ 			const struct nft_data *data,
++ 			u64 timeout, gfp_t gfp)
++ {
++ 	struct nft_set_ext *ext;
++ 	void *elem;
++ 
++ 	elem = kzalloc(set->ops->elemsize + tmpl->len, gfp);
++ 	if (elem == NULL)
++ 		return NULL;
++ 
++ 	ext = nft_set_elem_ext(set, elem);
++ 	nft_set_ext_init(ext, tmpl);
++ 
++ 	memcpy(nft_set_ext_key(ext), key, set->klen);
++ 	if (nft_set_ext_exists(ext, NFT_SET_EXT_DATA))
++ 		memcpy(nft_set_ext_data(ext), data, set->dlen);
++ 	if (nft_set_ext_exists(ext, NFT_SET_EXT_EXPIRATION))
++ 		*nft_set_ext_expiration(ext) =
++ 			jiffies + msecs_to_jiffies(timeout);
++ 	if (nft_set_ext_exists(ext, NFT_SET_EXT_TIMEOUT))
++ 		*nft_set_ext_timeout(ext) = timeout;
++ 
++ 	return elem;
++ }
++ 
++ void nft_set_elem_destroy(const struct nft_set *set, void *elem)
++ {
++ 	struct nft_set_ext *ext = nft_set_elem_ext(set, elem);
++ 
++ 	nft_data_uninit(nft_set_ext_key(ext), NFT_DATA_VALUE);
++ 	if (nft_set_ext_exists(ext, NFT_SET_EXT_DATA))
++ 		nft_data_uninit(nft_set_ext_data(ext), set->dtype);
++ 
++ 	kfree(elem);
++ }
++ EXPORT_SYMBOL_GPL(nft_set_elem_destroy);
++ 
+++>>>>>>> 22fe54d5fefc (netfilter: nf_tables: add support for dynamic set updates)
+  static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
+  			    const struct nlattr *attr)
+  {
+diff --cc net/netfilter/nf_tables_core.c
+index 8c00baffe14b,7caf08a9225d..000000000000
+--- a/net/netfilter/nf_tables_core.c
++++ b/net/netfilter/nf_tables_core.c
+@@@ -238,9 -239,14 +238,18 @@@ int __init nf_tables_core_module_init(v
+  	if (err < 0)
+  		goto err6;
+  
+++<<<<<<< HEAD
+ +	mark_tech_preview("nf_tables", THIS_MODULE);
+++=======
++ 	err = nft_dynset_module_init();
++ 	if (err < 0)
++ 		goto err7;
++ 
+++>>>>>>> 22fe54d5fefc (netfilter: nf_tables: add support for dynamic set updates)
+  	return 0;
+  
++ err7:
++ 	nft_payload_module_exit();
+  err6:
+  	nft_byteorder_module_exit();
+  err5:
+* Unmerged path include/net/netfilter/nf_tables.h
+diff --git a/include/net/netfilter/nf_tables_core.h b/include/net/netfilter/nf_tables_core.h
+index a75fc8e27cd6..c6f400cfaac8 100644
+--- a/include/net/netfilter/nf_tables_core.h
++++ b/include/net/netfilter/nf_tables_core.h
+@@ -31,6 +31,9 @@ void nft_cmp_module_exit(void);
+ int nft_lookup_module_init(void);
+ void nft_lookup_module_exit(void);
+ 
++int nft_dynset_module_init(void);
++void nft_dynset_module_exit(void);
++
+ int nft_bitwise_module_init(void);
+ void nft_bitwise_module_exit(void);
+ 
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index 971d245e7378..c26de9630e59 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -511,6 +511,33 @@ enum nft_lookup_attributes {
+ };
+ #define NFTA_LOOKUP_MAX		(__NFTA_LOOKUP_MAX - 1)
+ 
++enum nft_dynset_ops {
++	NFT_DYNSET_OP_ADD,
++	NFT_DYNSET_OP_UPDATE,
++};
++
++/**
++ * enum nft_dynset_attributes - dynset expression attributes
++ *
++ * @NFTA_DYNSET_SET_NAME: name of set the to add data to (NLA_STRING)
++ * @NFTA_DYNSET_SET_ID: uniquely identifier of the set in the transaction (NLA_U32)
++ * @NFTA_DYNSET_OP: operation (NLA_U32)
++ * @NFTA_DYNSET_SREG_KEY: source register of the key (NLA_U32)
++ * @NFTA_DYNSET_SREG_DATA: source register of the data (NLA_U32)
++ * @NFTA_DYNSET_TIMEOUT: timeout value for the new element (NLA_U64)
++ */
++enum nft_dynset_attributes {
++	NFTA_DYNSET_UNSPEC,
++	NFTA_DYNSET_SET_NAME,
++	NFTA_DYNSET_SET_ID,
++	NFTA_DYNSET_OP,
++	NFTA_DYNSET_SREG_KEY,
++	NFTA_DYNSET_SREG_DATA,
++	NFTA_DYNSET_TIMEOUT,
++	__NFTA_DYNSET_MAX,
++};
++#define NFTA_DYNSET_MAX		(__NFTA_DYNSET_MAX - 1)
++
+ /**
+  * enum nft_payload_bases - nf_tables payload expression offset bases
+  *
+diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
+index 27c21a9d4d02..5908afb2ae3f 100644
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -70,7 +70,7 @@ obj-$(CONFIG_NETFILTER_SYNPROXY) += nf_synproxy_core.o
+ 
+ # nf_tables
+ nf_tables-objs += nf_tables_core.o nf_tables_api.o
+-nf_tables-objs += nft_immediate.o nft_cmp.o nft_lookup.o
++nf_tables-objs += nft_immediate.o nft_cmp.o nft_lookup.o nft_dynset.o
+ nf_tables-objs += nft_bitwise.o nft_byteorder.o nft_payload.o
+ 
+ obj-$(CONFIG_NF_TABLES)		+= nf_tables.o
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nf_tables_core.c
+diff --git a/net/netfilter/nft_dynset.c b/net/netfilter/nft_dynset.c
+new file mode 100644
+index 000000000000..eeb72dee78ef
+--- /dev/null
++++ b/net/netfilter/nft_dynset.c
+@@ -0,0 +1,218 @@
++/*
++ * Copyright (c) 2015 Patrick McHardy <kaber@trash.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/netlink.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter/nf_tables.h>
++#include <net/netfilter/nf_tables.h>
++#include <net/netfilter/nf_tables_core.h>
++
++struct nft_dynset {
++	struct nft_set			*set;
++	struct nft_set_ext_tmpl		tmpl;
++	enum nft_dynset_ops		op:8;
++	enum nft_registers		sreg_key:8;
++	enum nft_registers		sreg_data:8;
++	u64				timeout;
++	struct nft_set_binding		binding;
++};
++
++static void *nft_dynset_new(struct nft_set *set, const struct nft_expr *expr,
++			    struct nft_data data[NFT_REG_MAX + 1])
++{
++	const struct nft_dynset *priv = nft_expr_priv(expr);
++	u64 timeout;
++	void *elem;
++
++	if (set->size && !atomic_add_unless(&set->nelems, 1, set->size))
++		return NULL;
++
++	timeout = priv->timeout ? : set->timeout;
++	elem = nft_set_elem_init(set, &priv->tmpl,
++				 &data[priv->sreg_key], &data[priv->sreg_data],
++				 timeout, GFP_ATOMIC);
++	if (elem == NULL) {
++		if (set->size)
++			atomic_dec(&set->nelems);
++	}
++	return elem;
++}
++
++static void nft_dynset_eval(const struct nft_expr *expr,
++			    struct nft_data data[NFT_REG_MAX + 1],
++			    const struct nft_pktinfo *pkt)
++{
++	const struct nft_dynset *priv = nft_expr_priv(expr);
++	struct nft_set *set = priv->set;
++	const struct nft_set_ext *ext;
++	u64 timeout;
++
++	if (set->ops->update(set, &data[priv->sreg_key], nft_dynset_new,
++			     expr, data, &ext)) {
++		if (priv->op == NFT_DYNSET_OP_UPDATE &&
++		    nft_set_ext_exists(ext, NFT_SET_EXT_EXPIRATION)) {
++			timeout = priv->timeout ? : set->timeout;
++			*nft_set_ext_expiration(ext) = jiffies + timeout;
++			return;
++		}
++	}
++
++	data[NFT_REG_VERDICT].verdict = NFT_BREAK;
++}
++
++static const struct nla_policy nft_dynset_policy[NFTA_DYNSET_MAX + 1] = {
++	[NFTA_DYNSET_SET_NAME]	= { .type = NLA_STRING },
++	[NFTA_DYNSET_SET_ID]	= { .type = NLA_U32 },
++	[NFTA_DYNSET_OP]	= { .type = NLA_U32 },
++	[NFTA_DYNSET_SREG_KEY]	= { .type = NLA_U32 },
++	[NFTA_DYNSET_SREG_DATA]	= { .type = NLA_U32 },
++	[NFTA_DYNSET_TIMEOUT]	= { .type = NLA_U64 },
++};
++
++static int nft_dynset_init(const struct nft_ctx *ctx,
++			   const struct nft_expr *expr,
++			   const struct nlattr * const tb[])
++{
++	struct nft_dynset *priv = nft_expr_priv(expr);
++	struct nft_set *set;
++	u64 timeout;
++	int err;
++
++	if (tb[NFTA_DYNSET_SET_NAME] == NULL ||
++	    tb[NFTA_DYNSET_OP] == NULL ||
++	    tb[NFTA_DYNSET_SREG_KEY] == NULL)
++		return -EINVAL;
++
++	set = nf_tables_set_lookup(ctx->table, tb[NFTA_DYNSET_SET_NAME]);
++	if (IS_ERR(set)) {
++		if (tb[NFTA_DYNSET_SET_ID])
++			set = nf_tables_set_lookup_byid(ctx->net,
++							tb[NFTA_DYNSET_SET_ID]);
++		if (IS_ERR(set))
++			return PTR_ERR(set);
++	}
++
++	if (set->flags & NFT_SET_CONSTANT)
++		return -EBUSY;
++
++	priv->op = ntohl(nla_get_be32(tb[NFTA_DYNSET_OP]));
++	switch (priv->op) {
++	case NFT_DYNSET_OP_ADD:
++		break;
++	case NFT_DYNSET_OP_UPDATE:
++		if (!(set->flags & NFT_SET_TIMEOUT))
++			return -EOPNOTSUPP;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	timeout = 0;
++	if (tb[NFTA_DYNSET_TIMEOUT] != NULL) {
++		if (!(set->flags & NFT_SET_TIMEOUT))
++			return -EINVAL;
++		timeout = be64_to_cpu(nla_get_be64(tb[NFTA_DYNSET_TIMEOUT]));
++	}
++
++	priv->sreg_key = ntohl(nla_get_be32(tb[NFTA_DYNSET_SREG_KEY]));
++	err = nft_validate_input_register(priv->sreg_key);
++	if (err < 0)
++		return err;
++
++	if (tb[NFTA_DYNSET_SREG_DATA] != NULL) {
++		if (!(set->flags & NFT_SET_MAP))
++			return -EINVAL;
++		if (set->dtype == NFT_DATA_VERDICT)
++			return -EOPNOTSUPP;
++
++		priv->sreg_data = ntohl(nla_get_be32(tb[NFTA_DYNSET_SREG_DATA]));
++		err = nft_validate_input_register(priv->sreg_data);
++		if (err < 0)
++			return err;
++	} else if (set->flags & NFT_SET_MAP)
++		return -EINVAL;
++
++	nft_set_ext_prepare(&priv->tmpl);
++	nft_set_ext_add_length(&priv->tmpl, NFT_SET_EXT_KEY, set->klen);
++	if (set->flags & NFT_SET_MAP)
++		nft_set_ext_add_length(&priv->tmpl, NFT_SET_EXT_DATA, set->dlen);
++	if (set->flags & NFT_SET_TIMEOUT) {
++		if (timeout || set->timeout)
++			nft_set_ext_add(&priv->tmpl, NFT_SET_EXT_EXPIRATION);
++	}
++
++	priv->timeout = timeout;
++
++	err = nf_tables_bind_set(ctx, set, &priv->binding);
++	if (err < 0)
++		return err;
++
++	priv->set = set;
++	return 0;
++}
++
++static void nft_dynset_destroy(const struct nft_ctx *ctx,
++			       const struct nft_expr *expr)
++{
++	struct nft_dynset *priv = nft_expr_priv(expr);
++
++	nf_tables_unbind_set(ctx, priv->set, &priv->binding);
++}
++
++static int nft_dynset_dump(struct sk_buff *skb, const struct nft_expr *expr)
++{
++	const struct nft_dynset *priv = nft_expr_priv(expr);
++
++	if (nla_put_be32(skb, NFTA_DYNSET_SREG_KEY, htonl(priv->sreg_key)))
++		goto nla_put_failure;
++	if (priv->set->flags & NFT_SET_MAP &&
++	    nla_put_be32(skb, NFTA_DYNSET_SREG_DATA, htonl(priv->sreg_data)))
++		goto nla_put_failure;
++	if (nla_put_be32(skb, NFTA_DYNSET_OP, htonl(priv->op)))
++		goto nla_put_failure;
++	if (nla_put_string(skb, NFTA_DYNSET_SET_NAME, priv->set->name))
++		goto nla_put_failure;
++	if (nla_put_be64(skb, NFTA_DYNSET_TIMEOUT, cpu_to_be64(priv->timeout)))
++		goto nla_put_failure;
++	return 0;
++
++nla_put_failure:
++	return -1;
++}
++
++static struct nft_expr_type nft_dynset_type;
++static const struct nft_expr_ops nft_dynset_ops = {
++	.type		= &nft_dynset_type,
++	.size		= NFT_EXPR_SIZE(sizeof(struct nft_dynset)),
++	.eval		= nft_dynset_eval,
++	.init		= nft_dynset_init,
++	.destroy	= nft_dynset_destroy,
++	.dump		= nft_dynset_dump,
++};
++
++static struct nft_expr_type nft_dynset_type __read_mostly = {
++	.name		= "dynset",
++	.ops		= &nft_dynset_ops,
++	.policy		= nft_dynset_policy,
++	.maxattr	= NFTA_DYNSET_MAX,
++	.owner		= THIS_MODULE,
++};
++
++int __init nft_dynset_module_init(void)
++{
++	return nft_register_expr(&nft_dynset_type);
++}
++
++void nft_dynset_module_exit(void)
++{
++	nft_unregister_expr(&nft_dynset_type);
++}
+diff --git a/net/netfilter/nft_hash.c b/net/netfilter/nft_hash.c
+index f14a5e14123a..7e7889985333 100644
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@ -43,6 +43,42 @@ static bool nft_hash_lookup(const struct nft_set *set,
+ 	return !!he;
+ }
+ 
++static bool nft_hash_update(struct nft_set *set, const struct nft_data *key,
++			    void *(*new)(struct nft_set *,
++					 const struct nft_expr *,
++					 struct nft_data []),
++			    const struct nft_expr *expr,
++			    struct nft_data data[],
++			    const struct nft_set_ext **ext)
++{
++	struct nft_hash *priv = nft_set_priv(set);
++	struct nft_hash_elem *he;
++	struct nft_hash_cmp_arg arg = {
++		.genmask = NFT_GENMASK_ANY,
++		.set	 = set,
++		.key	 = key,
++	};
++
++	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
++	if (he != NULL)
++		goto out;
++
++	he = new(set, expr, data);
++	if (he == NULL)
++		goto err1;
++	if (rhashtable_lookup_insert_key(&priv->ht, &arg, &he->node,
++					 nft_hash_params))
++		goto err2;
++out:
++	*ext = &he->ext;
++	return true;
++
++err2:
++	nft_set_elem_destroy(set, he);
++err1:
++	return false;
++}
++
+ static int nft_hash_insert(const struct nft_set *set,
+ 			   const struct nft_set_elem *elem)
+ {
+@@ -238,6 +274,7 @@ static struct nft_set_ops nft_hash_ops __read_mostly = {
+ 	.insert		= nft_hash_insert,
+ 	.remove		= nft_hash_remove,
+ 	.lookup		= nft_hash_lookup,
++	.update		= nft_hash_update,
+ 	.walk		= nft_hash_walk,
+ 	.features	= NFT_SET_MAP,
+ 	.owner		= THIS_MODULE,
