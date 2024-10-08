@@ -759,7 +759,7 @@ static ssize_t reset_store(struct device *dev,
 		return -ENOMEM;
 
 	/* Do not reset an active device! */
-	if (bdev->bd_holders) {
+	if (bdev->bd_openers) {
 		ret = -EBUSY;
 		goto out;
 	}
