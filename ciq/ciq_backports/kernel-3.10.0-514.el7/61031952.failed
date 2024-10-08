@@ -1,0 +1,508 @@
+arch, x86: pmem api for ensuring durability of persistent memory updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] pmem api for ensuring durability of persistent memory updates (Eric Sandeen) [1028649 1269626 1271953 1274043 1274459]
+Rebuild_FUZZ: 91.73%
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 61031952f4c89dba1065f7a5b9419badb112554c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/61031952.failed
+
+Based on an original patch by Ross Zwisler [1].
+
+Writes to persistent memory have the potential to be posted to cpu
+cache, cpu write buffers, and platform write buffers (memory controller)
+before being committed to persistent media.  Provide apis,
+memcpy_to_pmem(), wmb_pmem(), and memremap_pmem(), to write data to
+pmem and assert that it is durable in PMEM (a persistent linear address
+range).  A '__pmem' attribute is added so sparse can track proper usage
+of pointers to pmem.
+
+This continues the status quo of pmem being x86 only for 4.2, but
+reworks to ioremap, and wider implementation of memremap() will enable
+other archs in 4.3.
+
+[1]: https://lists.01.org/pipermail/linux-nvdimm/2015-May/000932.html
+
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+[djbw: various reworks]
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 61031952f4c89dba1065f7a5b9419badb112554c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	drivers/block/pmem.c
+#	lib/Kconfig
+diff --cc arch/x86/Kconfig
+index eca69935277c,62564ddf7f78..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -21,12 -22,18 +21,20 @@@ config X86_6
+  ### Arch settings
+  config X86
+  	def_bool y
+ -	select ACPI_SYSTEM_POWER_STATES_SUPPORT if ACPI
+ -	select ARCH_MIGHT_HAVE_ACPI_PDC if ACPI
+  	select ARCH_HAS_DEBUG_STRICT_USER_COPY_CHECKS
+++<<<<<<< HEAD
+++=======
++ 	select ARCH_HAS_FAST_MULTIPLIER
++ 	select ARCH_HAS_GCOV_PROFILE_ALL
++ 	select ARCH_HAS_PMEM_API
++ 	select ARCH_MIGHT_HAVE_PC_PARPORT
++ 	select ARCH_MIGHT_HAVE_PC_SERIO
+++>>>>>>> 61031952f4c8 (arch, x86: pmem api for ensuring durability of persistent memory updates)
+  	select HAVE_AOUT if X86_32
+  	select HAVE_UNSTABLE_SCHED_CLOCK
+ -	select ARCH_SUPPORTS_NUMA_BALANCING if X86_64
+ +	select ARCH_SUPPORTS_NUMA_BALANCING
+  	select ARCH_SUPPORTS_INT128 if X86_64
+ +	select ARCH_WANTS_PROT_NUMA_PROT_NONE
+  	select HAVE_IDE
+  	select HAVE_OPROFILE
+  	select HAVE_PCSPKR_PLATFORM
+diff --cc drivers/block/pmem.c
+index b5ba004a1153,ade9eb917a4d..000000000000
+--- a/drivers/block/pmem.c
++++ b/drivers/block/pmem.c
+@@@ -66,6 -70,13 +68,15 @@@ static void pmem_make_request(struct re
+  	bio_for_each_segment(bvec, bio, iter)
+  		pmem_do_bvec(pmem, bvec.bv_page, bvec.bv_len, bvec.bv_offset,
+  				bio_data_dir(bio), iter.bi_sector);
+++<<<<<<< HEAD:drivers/block/pmem.c
+++=======
++ 	if (do_acct)
++ 		nd_iostat_end(bio, start);
++ 
++ 	if (bio_data_dir(bio))
++ 		wmb_pmem();
++ 
+++>>>>>>> 61031952f4c8 (arch, x86: pmem api for ensuring durability of persistent memory updates):drivers/nvdimm/pmem.c
+  	bio_endio(bio, 0);
+  }
+  
+@@@ -115,22 -125,37 +127,48 @@@ static struct pmem_device *pmem_alloc(s
+  
+  	pmem->phys_addr = res->start;
+  	pmem->size = resource_size(res);
++ 	if (!arch_has_pmem_api())
++ 		dev_warn(dev, "unable to guarantee persistence of writes\n");
+  
+ -	if (!request_mem_region(pmem->phys_addr, pmem->size, dev_name(dev))) {
+ +	err = -EINVAL;
+ +	if (!request_mem_region(pmem->phys_addr, pmem->size, "pmem")) {
+  		dev_warn(dev, "could not reserve region [0x%pa:0x%zx]\n",
+  				&pmem->phys_addr, pmem->size);
+ -		kfree(pmem);
+ -		return ERR_PTR(-EBUSY);
+ +		goto out_free_dev;
+  	}
+  
+++<<<<<<< HEAD:drivers/block/pmem.c
+ +	/*
+ +	 * Map the memory as non-cachable, as we can't write back the contents
+ +	 * of the CPU caches in case of a crash.
+ +	 */
+ +	err = -ENOMEM;
+ +	pmem->virt_addr = ioremap_nocache(pmem->phys_addr, pmem->size);
+ +	if (!pmem->virt_addr)
+ +		goto out_release_region;
+++=======
++ 	pmem->virt_addr = memremap_pmem(pmem->phys_addr, pmem->size);
++ 	if (!pmem->virt_addr) {
++ 		release_mem_region(pmem->phys_addr, pmem->size);
++ 		kfree(pmem);
++ 		return ERR_PTR(-ENXIO);
++ 	}
++ 
++ 	return pmem;
++ }
++ 
++ static void pmem_detach_disk(struct pmem_device *pmem)
++ {
++ 	del_gendisk(pmem->pmem_disk);
++ 	put_disk(pmem->pmem_disk);
++ 	blk_cleanup_queue(pmem->pmem_queue);
++ }
++ 
++ static int pmem_attach_disk(struct nd_namespace_common *ndns,
++ 		struct pmem_device *pmem)
++ {
++ 	struct gendisk *disk;
+++>>>>>>> 61031952f4c8 (arch, x86: pmem api for ensuring durability of persistent memory updates):drivers/nvdimm/pmem.c
+  
+  	pmem->pmem_queue = blk_alloc_queue(GFP_KERNEL);
+  	if (!pmem->pmem_queue)
+@@@ -157,27 -184,34 +195,52 @@@
+  	pmem->pmem_disk = disk;
+  
+  	add_disk(disk);
+ -	revalidate_disk(disk);
+  
+ -	return 0;
+ -}
+ +	return pmem;
+  
+++<<<<<<< HEAD:drivers/block/pmem.c
+ +out_free_queue:
+ +	blk_cleanup_queue(pmem->pmem_queue);
+ +out_unmap:
+ +	iounmap(pmem->virt_addr);
+ +out_release_region:
+ +	release_mem_region(pmem->phys_addr, pmem->size);
+ +out_free_dev:
+ +	kfree(pmem);
+ +out:
+ +	return ERR_PTR(err);
+++=======
++ static int pmem_rw_bytes(struct nd_namespace_common *ndns,
++ 		resource_size_t offset, void *buf, size_t size, int rw)
++ {
++ 	struct pmem_device *pmem = dev_get_drvdata(ndns->claim);
++ 
++ 	if (unlikely(offset + size > pmem->size)) {
++ 		dev_WARN_ONCE(&ndns->dev, 1, "request out of range\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	if (rw == READ)
++ 		memcpy_from_pmem(buf, pmem->virt_addr + offset, size);
++ 	else {
++ 		memcpy_to_pmem(pmem->virt_addr + offset, buf, size);
++ 		wmb_pmem();
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 61031952f4c8 (arch, x86: pmem api for ensuring durability of persistent memory updates):drivers/nvdimm/pmem.c
+  }
+  
+  static void pmem_free(struct pmem_device *pmem)
+  {
+++<<<<<<< HEAD:drivers/block/pmem.c
+ +	del_gendisk(pmem->pmem_disk);
+ +	put_disk(pmem->pmem_disk);
+ +	blk_cleanup_queue(pmem->pmem_queue);
+ +	iounmap(pmem->virt_addr);
+++=======
++ 	memunmap_pmem(pmem->virt_addr);
+++>>>>>>> 61031952f4c8 (arch, x86: pmem api for ensuring durability of persistent memory updates):drivers/nvdimm/pmem.c
+  	release_mem_region(pmem->phys_addr, pmem->size);
+  	kfree(pmem);
+  }
+diff --cc lib/Kconfig
+index 59a911fd065e,d27c13a91c28..000000000000
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@@ -460,4 -513,16 +460,19 @@@ config OID_REGISTR
+  config UCS2_STRING
+          tristate
+  
+++<<<<<<< HEAD
+++=======
++ source "lib/fonts/Kconfig"
++ 
++ #
++ # sg chaining option
++ #
++ 
++ config ARCH_HAS_SG_CHAIN
++ 	def_bool n
++ 
++ config ARCH_HAS_PMEM_API
++ 	bool
++ 
+++>>>>>>> 61031952f4c8 (arch, x86: pmem api for ensuring durability of persistent memory updates)
+  endmenu
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/include/asm/cacheflush.h b/arch/x86/include/asm/cacheflush.h
+index 9863ee3747da..f695db4c3e7c 100644
+--- a/arch/x86/include/asm/cacheflush.h
++++ b/arch/x86/include/asm/cacheflush.h
+@@ -4,6 +4,7 @@
+ /* Caches aren't brain-dead on the intel. */
+ #include <asm-generic/cacheflush.h>
+ #include <asm/special_insns.h>
++#include <asm/uaccess.h>
+ 
+ #ifdef CONFIG_X86_PAT
+ /*
+@@ -163,4 +164,75 @@ static inline int rodata_test(void)
+ }
+ #endif
+ 
++#ifdef ARCH_HAS_NOCACHE_UACCESS
++
++/**
++ * arch_memcpy_to_pmem - copy data to persistent memory
++ * @dst: destination buffer for the copy
++ * @src: source buffer for the copy
++ * @n: length of the copy in bytes
++ *
++ * Copy data to persistent memory media via non-temporal stores so that
++ * a subsequent arch_wmb_pmem() can flush cpu and memory controller
++ * write buffers to guarantee durability.
++ */
++static inline void arch_memcpy_to_pmem(void __pmem *dst, const void *src,
++		size_t n)
++{
++	int unwritten;
++
++	/*
++	 * We are copying between two kernel buffers, if
++	 * __copy_from_user_inatomic_nocache() returns an error (page
++	 * fault) we would have already reported a general protection fault
++	 * before the WARN+BUG.
++	 */
++	unwritten = __copy_from_user_inatomic_nocache((void __force *) dst,
++			(void __user *) src, n);
++	if (WARN(unwritten, "%s: fault copying %p <- %p unwritten: %d\n",
++				__func__, dst, src, unwritten))
++		BUG();
++}
++
++/**
++ * arch_wmb_pmem - synchronize writes to persistent memory
++ *
++ * After a series of arch_memcpy_to_pmem() operations this drains data
++ * from cpu write buffers and any platform (memory controller) buffers
++ * to ensure that written data is durable on persistent memory media.
++ */
++static inline void arch_wmb_pmem(void)
++{
++	/*
++	 * wmb() to 'sfence' all previous writes such that they are
++	 * architecturally visible to 'pcommit'.  Note, that we've
++	 * already arranged for pmem writes to avoid the cache via
++	 * arch_memcpy_to_pmem().
++	 */
++	wmb();
++	pcommit_sfence();
++}
++
++static inline bool __arch_has_wmb_pmem(void)
++{
++#ifdef CONFIG_X86_64
++	/*
++	 * We require that wmb() be an 'sfence', that is only guaranteed on
++	 * 64-bit builds
++	 */
++	return static_cpu_has(X86_FEATURE_PCOMMIT);
++#else
++	return false;
++#endif
++}
++#else /* ARCH_HAS_NOCACHE_UACCESS i.e. ARCH=um */
++extern void arch_memcpy_to_pmem(void __pmem *dst, const void *src, size_t n);
++extern void arch_wmb_pmem(void);
++
++static inline bool __arch_has_wmb_pmem(void)
++{
++	return false;
++}
++#endif
++
+ #endif /* _ASM_X86_CACHEFLUSH_H */
+diff --git a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
+index 91d9c69a629e..fe3bdda650a6 100644
+--- a/arch/x86/include/asm/io.h
++++ b/arch/x86/include/asm/io.h
+@@ -242,6 +242,12 @@ static inline void flush_write_buffers(void)
+ #endif
+ }
+ 
++static inline void __pmem *arch_memremap_pmem(resource_size_t offset,
++	unsigned long size)
++{
++	return (void __force __pmem *) ioremap_cache(offset, size);
++}
++
+ #endif /* __KERNEL__ */
+ 
+ extern void native_io_delay(void);
+* Unmerged path drivers/block/pmem.c
+diff --git a/include/linux/compiler.h b/include/linux/compiler.h
+index fa911f3d4d81..3b33038dbe96 100644
+--- a/include/linux/compiler.h
++++ b/include/linux/compiler.h
+@@ -21,6 +21,7 @@
+ # define __rcu		__attribute__((noderef, address_space(4)))
+ #else
+ # define __rcu
++# define __pmem		__attribute__((noderef, address_space(5)))
+ #endif
+ extern void __chk_user_ptr(const volatile void __user *);
+ extern void __chk_io_ptr(const volatile void __iomem *);
+@@ -42,6 +43,7 @@ extern void __chk_io_ptr(const volatile void __iomem *);
+ # define __cond_lock(x,c) (c)
+ # define __percpu
+ # define __rcu
++# define __pmem
+ #endif
+ 
+ /* Indirect macros required for expanded argument pasting, eg. __LINE__. */
+diff --git a/include/linux/pmem.h b/include/linux/pmem.h
+new file mode 100644
+index 000000000000..f6481a0b1d4f
+--- /dev/null
++++ b/include/linux/pmem.h
+@@ -0,0 +1,153 @@
++/*
++ * Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#ifndef __PMEM_H__
++#define __PMEM_H__
++
++#include <linux/io.h>
++
++#ifdef CONFIG_ARCH_HAS_PMEM_API
++#include <asm/cacheflush.h>
++#else
++static inline void arch_wmb_pmem(void)
++{
++	BUG();
++}
++
++static inline bool __arch_has_wmb_pmem(void)
++{
++	return false;
++}
++
++static inline void __pmem *arch_memremap_pmem(resource_size_t offset,
++		unsigned long size)
++{
++	return NULL;
++}
++
++static inline void arch_memcpy_to_pmem(void __pmem *dst, const void *src,
++		size_t n)
++{
++	BUG();
++}
++#endif
++
++/*
++ * Architectures that define ARCH_HAS_PMEM_API must provide
++ * implementations for arch_memremap_pmem(), arch_memcpy_to_pmem(),
++ * arch_wmb_pmem(), and __arch_has_wmb_pmem().
++ */
++
++static inline void memcpy_from_pmem(void *dst, void __pmem const *src, size_t size)
++{
++	memcpy(dst, (void __force const *) src, size);
++}
++
++static inline void memunmap_pmem(void __pmem *addr)
++{
++	iounmap((void __force __iomem *) addr);
++}
++
++/**
++ * arch_has_wmb_pmem - true if wmb_pmem() ensures durability
++ *
++ * For a given cpu implementation within an architecture it is possible
++ * that wmb_pmem() resolves to a nop.  In the case this returns
++ * false, pmem api users are unable to ensure durability and may want to
++ * fall back to a different data consistency model, or otherwise notify
++ * the user.
++ */
++static inline bool arch_has_wmb_pmem(void)
++{
++	if (IS_ENABLED(CONFIG_ARCH_HAS_PMEM_API))
++		return __arch_has_wmb_pmem();
++	return false;
++}
++
++static inline bool arch_has_pmem_api(void)
++{
++	return IS_ENABLED(CONFIG_ARCH_HAS_PMEM_API) && arch_has_wmb_pmem();
++}
++
++/*
++ * These defaults seek to offer decent performance and minimize the
++ * window between i/o completion and writes being durable on media.
++ * However, it is undefined / architecture specific whether
++ * default_memremap_pmem + default_memcpy_to_pmem is sufficient for
++ * making data durable relative to i/o completion.
++ */
++static void default_memcpy_to_pmem(void __pmem *dst, const void *src,
++		size_t size)
++{
++	memcpy((void __force *) dst, src, size);
++}
++
++static void __pmem *default_memremap_pmem(resource_size_t offset,
++		unsigned long size)
++{
++	/* TODO: convert to ioremap_wt() */
++	return (void __pmem __force *)ioremap_nocache(offset, size);
++}
++
++/**
++ * memremap_pmem - map physical persistent memory for pmem api
++ * @offset: physical address of persistent memory
++ * @size: size of the mapping
++ *
++ * Establish a mapping of the architecture specific memory type expected
++ * by memcpy_to_pmem() and wmb_pmem().  For example, it may be
++ * the case that an uncacheable or writethrough mapping is sufficient,
++ * or a writeback mapping provided memcpy_to_pmem() and
++ * wmb_pmem() arrange for the data to be written through the
++ * cache to persistent media.
++ */
++static inline void __pmem *memremap_pmem(resource_size_t offset,
++		unsigned long size)
++{
++	if (arch_has_pmem_api())
++		return arch_memremap_pmem(offset, size);
++	return default_memremap_pmem(offset, size);
++}
++
++/**
++ * memcpy_to_pmem - copy data to persistent memory
++ * @dst: destination buffer for the copy
++ * @src: source buffer for the copy
++ * @n: length of the copy in bytes
++ *
++ * Perform a memory copy that results in the destination of the copy
++ * being effectively evicted from, or never written to, the processor
++ * cache hierarchy after the copy completes.  After memcpy_to_pmem()
++ * data may still reside in cpu or platform buffers, so this operation
++ * must be followed by a wmb_pmem().
++ */
++static inline void memcpy_to_pmem(void __pmem *dst, const void *src, size_t n)
++{
++	if (arch_has_pmem_api())
++		arch_memcpy_to_pmem(dst, src, n);
++	else
++		default_memcpy_to_pmem(dst, src, n);
++}
++
++/**
++ * wmb_pmem - synchronize writes to persistent memory
++ *
++ * After a series of memcpy_to_pmem() operations this drains data from
++ * cpu write buffers and any platform (memory controller) buffers to
++ * ensure that written data is durable on persistent memory media.
++ */
++static inline void wmb_pmem(void)
++{
++	if (arch_has_pmem_api())
++		arch_wmb_pmem();
++}
++#endif /* __PMEM_H__ */
+* Unmerged path lib/Kconfig
