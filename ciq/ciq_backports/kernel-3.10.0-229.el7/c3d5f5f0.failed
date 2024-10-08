@@ -1,0 +1,161 @@
+mm: use a dedicated lock to protect totalram_pages and zone->managed_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [mm] use a dedicated lock to protect totalram_pages and zone->managed_pages (Motohiro Kosaki) [1156396]
+Rebuild_FUZZ: 97.22%
+commit-author Jiang Liu <liuj97@gmail.com>
+commit c3d5f5f0c2bc4eabeaf49f1a21e1aeb965246cd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c3d5f5f0.failed
+
+Currently lock_memory_hotplug()/unlock_memory_hotplug() are used to
+protect totalram_pages and zone->managed_pages.  Other than the memory
+hotplug driver, totalram_pages and zone->managed_pages may also be
+modified at runtime by other drivers, such as Xen balloon,
+virtio_balloon etc.  For those cases, memory hotplug lock is a little
+too heavy, so introduce a dedicated lock to protect totalram_pages and
+zone->managed_pages.
+
+Now we have a simplified locking rules totalram_pages and
+zone->managed_pages as:
+
+1) no locking for read accesses because they are unsigned long.
+2) no locking for write accesses at boot time in single-threaded context.
+3) serialize write accesses at runtime by acquiring the dedicated
+   managed_page_count_lock.
+
+Also adjust zone->managed_pages when freeing reserved pages into the
+buddy system, to keep totalram_pages and zone->managed_pages in
+consistence.
+
+[akpm@linux-foundation.org: don't export adjust_managed_page_count to modules (for now)]
+	Signed-off-by: Jiang Liu <jiang.liu@huawei.com>
+	Cc: Mel Gorman <mel@csn.ul.ie>
+	Cc: Michel Lespinasse <walken@google.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: "Michael S. Tsirkin" <mst@redhat.com>
+	Cc: <sworddragon2@aol.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Chris Metcalf <cmetcalf@tilera.com>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jeremy Fitzhardinge <jeremy@goop.org>
+	Cc: Jianguo Wu <wujianguo@huawei.com>
+	Cc: Joonsoo Kim <js1304@gmail.com>
+	Cc: Kamezawa Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+	Cc: Rusty Russell <rusty@rustcorp.com.au>
+	Cc: Tang Chen <tangchen@cn.fujitsu.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Wen Congyang <wency@cn.fujitsu.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Russell King <rmk@arm.linux.org.uk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c3d5f5f0c2bc4eabeaf49f1a21e1aeb965246cd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index 2edffd6cea25,93f292a60cb0..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -5253,17 -5209,25 +5256,29 @@@ early_param("movablecore", cmdline_pars
+  
+  #endif /* CONFIG_HAVE_MEMBLOCK_NODE_MAP */
+  
+++<<<<<<< HEAD
+ +unsigned long free_reserved_area(unsigned long start, unsigned long end,
+ +				 int poison, char *s)
+++=======
++ void adjust_managed_page_count(struct page *page, long count)
++ {
++ 	spin_lock(&managed_page_count_lock);
++ 	page_zone(page)->managed_pages += count;
++ 	totalram_pages += count;
++ 	spin_unlock(&managed_page_count_lock);
++ }
++ 
++ unsigned long free_reserved_area(void *start, void *end, int poison, char *s)
+++>>>>>>> c3d5f5f0c2bc (mm: use a dedicated lock to protect totalram_pages and zone->managed_pages)
+  {
+ -	void *pos;
+ -	unsigned long pages = 0;
+ +	unsigned long pages, pos;
+  
+ -	start = (void *)PAGE_ALIGN((unsigned long)start);
+ -	end = (void *)((unsigned long)end & PAGE_MASK);
+ -	for (pos = start; pos < end; pos += PAGE_SIZE, pages++) {
+ -		if ((unsigned int)poison <= 0xFF)
+ -			memset(pos, poison, PAGE_SIZE);
+ -		free_reserved_page(virt_to_page(pos));
+ +	pos = start = PAGE_ALIGN(start);
+ +	end &= PAGE_MASK;
+ +	for (pages = 0; pos < end; pos += PAGE_SIZE, pages++) {
+ +		if (poison)
+ +			memset((void *)pos, poison, PAGE_SIZE);
+ +		free_reserved_page(virt_to_page((void *)pos));
+  	}
+  
+  	if (pages && s)
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 28efdd22e5c5..cc22292971f1 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1518,6 +1518,7 @@ extern void free_initmem(void);
+  */
+ extern unsigned long free_reserved_area(unsigned long start, unsigned long end,
+ 					int poison, char *s);
++
+ #ifdef	CONFIG_HIGHMEM
+ /*
+  * Free a highmem page into the buddy system, adjusting totalhigh_pages
+@@ -1526,10 +1527,7 @@ extern unsigned long free_reserved_area(unsigned long start, unsigned long end,
+ extern void free_highmem_page(struct page *page);
+ #endif
+ 
+-static inline void adjust_managed_page_count(struct page *page, long count)
+-{
+-	totalram_pages += count;
+-}
++extern void adjust_managed_page_count(struct page *page, long count);
+ 
+ /* Free the reserved page into the buddy system, so it gets managed. */
+ static inline void __free_reserved_page(struct page *page)
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index e663dc6fa0e1..6a9f8c7e6216 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -481,10 +481,16 @@ struct zone {
+ 	 * frequently read in proximity to zone->lock.  It's good to
+ 	 * give them a chance of being in the same cacheline.
+ 	 *
+-	 * Write access to present_pages and managed_pages at runtime should
+-	 * be protected by lock_memory_hotplug()/unlock_memory_hotplug().
+-	 * Any reader who can't tolerant drift of present_pages and
+-	 * managed_pages should hold memory hotplug lock to get a stable value.
++	 * Write access to present_pages at runtime should be protected by
++	 * lock_memory_hotplug()/unlock_memory_hotplug().  Any reader who can't
++	 * tolerant drift of present_pages should hold memory hotplug lock to
++	 * get a stable value.
++	 *
++	 * Read access to managed_pages should be safe because it's unsigned
++	 * long. Write access to zone->managed_pages and totalram_pages are
++	 * protected by managed_page_count_lock at runtime. Idealy only
++	 * adjust_managed_page_count() should be used instead of directly
++	 * touching zone->managed_pages and totalram_pages.
+ 	 */
+ 	unsigned long		spanned_pages;
+ 	unsigned long		present_pages;
+* Unmerged path mm/page_alloc.c
