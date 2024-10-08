@@ -1,0 +1,100 @@
+RDMA/iw_cxgb4: release ep resources on accept arp failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hariprasad S <hariprasad@chelsio.com>
+commit 9dec900c20d95ef1f3c40bc5d5901499f5d63381
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9dec900c.failed
+
+If ARP fails before the CPL_PASS_ACCEPT_RPL is seen by hardware, the tid
+will be stuck in SYN_PEND and never released.  So create an arp failure
+handler specifically for this message to release the endpoint resources.
+
+In pass_accept_rpl_arp_failure(), put the parent endpoint so it will
+be freed when destroyed.  Also we don't need to call release_tid() here
+because _c4iw_free_ep() calls cxgb4_remove_tid() which releases the
+hwtid.
+
+If we get an ABORT_REQ_RSS instead of a PASS_ESTABLISH (because the
+peer's ACK to our SYN is never received), then put the parent as well
+in peer_abort().
+
+Treat accept_cr() failures just like arp failures: put the parent ep
+and release the ep resources destroying the tid
+
+The ARP failure handlers are called in an atomic context, so we need to
+schedule some of the processing which might block.  Namely _c4iw_free_ep()
+which needs a mutex.  So create a "special" CPL opcode and handler and
+schedule it via sched() to be run by process_work() in a blockable context.
+
+Also rework the active open arp failure handler to make use of
+release_ep_resources().  This allows both the active and passive arp
+failure handlers to use the same deferred cleanup function.
+
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 9dec900c20d95ef1f3c40bc5d5901499f5d63381)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/cm.c
+diff --cc drivers/infiniband/hw/cxgb4/cm.c
+index 3c0604d61712,49784a40d1d1..000000000000
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@@ -438,15 -491,18 +486,25 @@@ static void act_open_req_arp_failure(vo
+  {
+  	struct c4iw_ep *ep = handle;
+  
+++<<<<<<< HEAD
+ +	printk(KERN_ERR MOD "ARP failure duing connect\n");
+ +	kfree_skb(skb);
+ +	connect_reply_upcall(ep, -EHOSTUNREACH);
+ +	state_set(&ep->com, DEAD);
+++=======
++ 	printk(KERN_ERR MOD "ARP failure during connect\n");
++ 	connect_reply_upcall(ep, -EHOSTUNREACH);
++ 	__state_set(&ep->com, DEAD);
++ 	if (ep->com.remote_addr.ss_family == AF_INET6) {
++ 		struct sockaddr_in6 *sin6 =
++ 			(struct sockaddr_in6 *)&ep->com.local_addr;
++ 		cxgb4_clip_release(ep->com.dev->rdev.lldi.ports[0],
++ 				   (const u32 *)&sin6->sin6_addr.s6_addr, 1);
++ 	}
+++>>>>>>> 9dec900c20d9 (RDMA/iw_cxgb4: release ep resources on accept arp failure)
+  	remove_handle(ep->com.dev, &ep->com.dev->atid_idr, ep->atid);
+  	cxgb4_free_atid(ep->com.dev->rdev.lldi.tids, ep->atid);
+- 	dst_release(ep->dst);
+- 	cxgb4_l2t_release(ep->l2t);
+- 	c4iw_put_ep(&ep->com);
++ 	queue_arp_failure_cpl(ep, skb);
+  }
+  
+  /*
+@@@ -2435,8 -2513,17 +2492,22 @@@ static int pass_accept_req(struct c4iw_
+  	init_timer(&child_ep->timer);
+  	cxgb4_insert_tid(t, child_ep, hwtid);
+  	insert_handle(dev, &dev->hwtid_idr, child_ep, child_ep->hwtid);
+++<<<<<<< HEAD
+ +	accept_cr(child_ep, skb, req);
+ +	set_bit(PASS_ACCEPT_REQ, &child_ep->com.history);
+++=======
++ 	if (accept_cr(child_ep, skb, req)) {
++ 		c4iw_put_ep(&parent_ep->com);
++ 		release_ep_resources(child_ep);
++ 	} else {
++ 		set_bit(PASS_ACCEPT_REQ, &child_ep->com.history);
++ 	}
++ 	if (iptype == 6) {
++ 		sin6 = (struct sockaddr_in6 *)&child_ep->com.local_addr;
++ 		cxgb4_clip_get(child_ep->com.dev->rdev.lldi.ports[0],
++ 			       (const u32 *)&sin6->sin6_addr.s6_addr, 1);
++ 	}
+++>>>>>>> 9dec900c20d9 (RDMA/iw_cxgb4: release ep resources on accept arp failure)
+  	goto out;
+  reject:
+  	reject_cr(dev, hwtid, skb);
+* Unmerged path drivers/infiniband/hw/cxgb4/cm.c
