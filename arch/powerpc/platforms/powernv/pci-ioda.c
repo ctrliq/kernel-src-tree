@@ -465,7 +465,7 @@ static void pnv_ioda_setup_bus_dma(struct pnv_ioda_pe *pe, struct pci_bus *bus)
 static void pnv_pci_ioda1_tce_invalidate(struct iommu_table *tbl,
 					 u64 *startp, u64 *endp)
 {
-	u64 __iomem *invalidate = (u64 __iomem *)tbl->it_index;
+	__be64 __iomem *invalidate = (__be64 __iomem *)tbl->it_index;
 	unsigned long start, end, inc;
 
 	start = __pa(startp);
@@ -492,7 +492,7 @@ static void pnv_pci_ioda1_tce_invalidate(struct iommu_table *tbl,
 
         mb(); /* Ensure above stores are visible */
         while (start <= end) {
-                __raw_writeq(start, invalidate);
+                __raw_writeq(cpu_to_be64(start), invalidate);
                 start += inc;
         }
 
@@ -507,7 +507,7 @@ static void pnv_pci_ioda2_tce_invalidate(struct pnv_ioda_pe *pe,
 					 u64 *startp, u64 *endp)
 {
 	unsigned long start, end, inc;
-	u64 __iomem *invalidate = (u64 __iomem *)tbl->it_index;
+	__be64 __iomem *invalidate = (__be64 __iomem *)tbl->it_index;
 
 	/* We'll invalidate DMA address in PE scope */
 	start = 0x2ul << 60;
@@ -523,7 +523,7 @@ static void pnv_pci_ioda2_tce_invalidate(struct pnv_ioda_pe *pe,
 	mb();
 
 	while (start <= end) {
-		__raw_writeq(start, invalidate);
+		__raw_writeq(cpu_to_be64(start), invalidate);
 		start += inc;
 	}
 }
@@ -793,8 +793,7 @@ static int pnv_pci_ioda_msi_setup(struct pnv_phb *phb, struct pci_dev *dev,
 	struct irq_data *idata;
 	struct irq_chip *ichip;
 	unsigned int xive_num = hwirq - phb->msi_base;
-	uint64_t addr64;
-	uint32_t addr32, data;
+	__be32 data;
 	int rc;
 
 	/* No PE assigned ? bail out ... no MSI for you ! */
@@ -818,6 +817,8 @@ static int pnv_pci_ioda_msi_setup(struct pnv_phb *phb, struct pci_dev *dev,
 	}
 
 	if (is_64) {
+		__be64 addr64;
+
 		rc = opal_get_msi_64(phb->opal_id, pe->mve_number, xive_num, 1,
 				     &addr64, &data);
 		if (rc) {
@@ -825,9 +826,11 @@ static int pnv_pci_ioda_msi_setup(struct pnv_phb *phb, struct pci_dev *dev,
 				pci_name(dev), rc);
 			return -EIO;
 		}
-		msg->address_hi = addr64 >> 32;
-		msg->address_lo = addr64 & 0xfffffffful;
+		msg->address_hi = be64_to_cpu(addr64) >> 32;
+		msg->address_lo = be64_to_cpu(addr64) & 0xfffffffful;
 	} else {
+		__be32 addr32;
+
 		rc = opal_get_msi_32(phb->opal_id, pe->mve_number, xive_num, 1,
 				     &addr32, &data);
 		if (rc) {
@@ -836,9 +839,9 @@ static int pnv_pci_ioda_msi_setup(struct pnv_phb *phb, struct pci_dev *dev,
 			return -EIO;
 		}
 		msg->address_hi = 0;
-		msg->address_lo = addr32;
+		msg->address_lo = be32_to_cpu(addr32);
 	}
-	msg->data = data;
+	msg->data = be32_to_cpu(data);
 
 	/*
 	 * Change the IRQ chip for the MSI interrupts on PHB3.
@@ -1093,7 +1096,7 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 	struct pnv_phb *phb;
 	unsigned long size, m32map_off, iomap_off, pemap_off;
 	const __be64 *prop64;
-	const u32 *prop32;
+	const __be32 *prop32;
 	int len;
 	u64 phb_id;
 	void *aux;
@@ -1128,8 +1131,8 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 	spin_lock_init(&phb->lock);
 	prop32 = of_get_property(np, "bus-range", &len);
 	if (prop32 && len == 8) {
-		hose->first_busno = prop32[0];
-		hose->last_busno = prop32[1];
+		hose->first_busno = be32_to_cpu(prop32[0]);
+		hose->last_busno = be32_to_cpu(prop32[1]);
 	} else {
 		pr_warn("  Broken <bus-range> on %s\n", np->full_name);
 		hose->first_busno = 0;
@@ -1161,7 +1164,7 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 	if (!prop32)
 		phb->ioda.total_pe = 1;
 	else
-		phb->ioda.total_pe = *prop32;
+		phb->ioda.total_pe = be32_to_cpup(prop32);
 
 	phb->ioda.m32_size = resource_size(&hose->mem_resources[0]);
 	/* FW Has already off top 64k of M32 space (MSI space) */
