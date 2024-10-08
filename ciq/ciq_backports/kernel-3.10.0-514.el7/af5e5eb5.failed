@@ -1,0 +1,84 @@
+ceph: fix race during filling readdir cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit af5e5eb574776cdf1b756a27cc437bff257e22fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/af5e5eb5.failed
+
+Readdir cache uses page cache to save dentry pointers. When adding
+dentry pointers to middle of a page, we need to make sure the page
+already exists. Otherwise the beginning part of the page will be
+invalid pointers.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit af5e5eb574776cdf1b756a27cc437bff257e22fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/inode.c
+diff --cc fs/ceph/inode.c
+index a649a586cda7,495decfc4b34..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -1322,6 -1329,54 +1322,57 @@@ static int readdir_prepopulate_inodes_o
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void ceph_readdir_cache_release(struct ceph_readdir_cache_control *ctl)
++ {
++ 	if (ctl->page) {
++ 		kunmap(ctl->page);
++ 		page_cache_release(ctl->page);
++ 		ctl->page = NULL;
++ 	}
++ }
++ 
++ static int fill_readdir_cache(struct inode *dir, struct dentry *dn,
++ 			      struct ceph_readdir_cache_control *ctl,
++ 			      struct ceph_mds_request *req)
++ {
++ 	struct ceph_inode_info *ci = ceph_inode(dir);
++ 	unsigned nsize = PAGE_CACHE_SIZE / sizeof(struct dentry*);
++ 	unsigned idx = ctl->index % nsize;
++ 	pgoff_t pgoff = ctl->index / nsize;
++ 
++ 	if (!ctl->page || pgoff != page_index(ctl->page)) {
++ 		ceph_readdir_cache_release(ctl);
++ 		if (idx == 0)
++ 			ctl->page = grab_cache_page(&dir->i_data, pgoff);
++ 		else
++ 			ctl->page = find_lock_page(&dir->i_data, pgoff);
++ 		if (!ctl->page) {
++ 			ctl->index = -1;
++ 			return idx == 0 ? -ENOMEM : 0;
++ 		}
++ 		/* reading/filling the cache are serialized by
++ 		 * i_mutex, no need to use page lock */
++ 		unlock_page(ctl->page);
++ 		ctl->dentries = kmap(ctl->page);
++ 		if (idx == 0)
++ 			memset(ctl->dentries, 0, PAGE_CACHE_SIZE);
++ 	}
++ 
++ 	if (req->r_dir_release_cnt == atomic64_read(&ci->i_release_count) &&
++ 	    req->r_dir_ordered_cnt == atomic64_read(&ci->i_ordered_count)) {
++ 		dout("readdir cache dn %p idx %d\n", dn, ctl->index);
++ 		ctl->dentries[idx] = dn;
++ 		ctl->index++;
++ 	} else {
++ 		dout("disable readdir cache\n");
++ 		ctl->index = -1;
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> af5e5eb57477 (ceph: fix race during filling readdir cache)
+  int ceph_readdir_prepopulate(struct ceph_mds_request *req,
+  			     struct ceph_mds_session *session)
+  {
+* Unmerged path fs/ceph/inode.c
