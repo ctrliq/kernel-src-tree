@@ -1,0 +1,155 @@
+NVMe: Reference count admin queue usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit ea191d2f36b0f577ce5377c3e72aedc34282969d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ea191d2f.failed
+
+Since there is no gendisk associated with the admin queue, the driver
+needs to hold a reference to it until all open references to the
+controller are closed.
+
+This also combines queue cleanup with freeing the tag set since these
+should not be separate.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit ea191d2f36b0f577ce5377c3e72aedc34282969d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 48e1152870d9,beb8d48f8560..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1561,6 -1351,60 +1561,63 @@@ static int nvme_shutdown_ctrl(struct nv
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct blk_mq_ops nvme_mq_admin_ops = {
++ 	.queue_rq	= nvme_admin_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_admin_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_admin_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static struct blk_mq_ops nvme_mq_ops = {
++ 	.queue_rq	= nvme_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static void nvme_dev_remove_admin(struct nvme_dev *dev)
++ {
++ 	if (dev->admin_q && !blk_queue_dying(dev->admin_q)) {
++ 		blk_cleanup_queue(dev->admin_q);
++ 		blk_mq_free_tag_set(&dev->admin_tagset);
++ 	}
++ }
++ 
++ static int nvme_alloc_admin_tags(struct nvme_dev *dev)
++ {
++ 	if (!dev->admin_q) {
++ 		dev->admin_tagset.ops = &nvme_mq_admin_ops;
++ 		dev->admin_tagset.nr_hw_queues = 1;
++ 		dev->admin_tagset.queue_depth = NVME_AQ_DEPTH - 1;
++ 		dev->admin_tagset.timeout = ADMIN_TIMEOUT;
++ 		dev->admin_tagset.numa_node = dev_to_node(&dev->pci_dev->dev);
++ 		dev->admin_tagset.cmd_size = sizeof(struct nvme_cmd_info);
++ 		dev->admin_tagset.driver_data = dev;
++ 
++ 		if (blk_mq_alloc_tag_set(&dev->admin_tagset))
++ 			return -ENOMEM;
++ 
++ 		dev->admin_q = blk_mq_init_queue(&dev->admin_tagset);
++ 		if (IS_ERR(dev->admin_q)) {
++ 			blk_mq_free_tag_set(&dev->admin_tagset);
++ 			return -ENOMEM;
++ 		}
++ 		if (!blk_get_queue(dev->admin_q)) {
++ 			nvme_dev_remove_admin(dev);
++ 			return -ENODEV;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> ea191d2f36b0 (NVMe: Reference count admin queue usage)
+  static int nvme_configure_admin_queue(struct nvme_dev *dev)
+  {
+  	int result;
+@@@ -1594,13 -1457,24 +1651,22 @@@
+  
+  	result = nvme_enable_ctrl(dev, cap);
+  	if (result)
+ -		goto free_nvmeq;
+ -
+ -	result = nvme_alloc_admin_tags(dev);
+ -	if (result)
+ -		goto free_nvmeq;
+ +		return result;
+  
+ -	nvmeq->cq_vector = 0;
+  	result = queue_request_irq(dev, nvmeq, nvmeq->irqname);
+  	if (result)
+ -		goto free_tags;
+ +		return result;
+  
+  	return result;
+++<<<<<<< HEAD
+++=======
++ 
++  free_tags:
++ 	nvme_dev_remove_admin(dev);
++  free_nvmeq:
++ 	nvme_free_queues(dev, 0);
++ 	return result;
+++>>>>>>> ea191d2f36b0 (NVMe: Reference count admin queue usage)
+  }
+  
+  struct nvme_iod *nvme_map_user_pages(struct nvme_dev *dev, int write,
+@@@ -2811,7 -2508,9 +2877,13 @@@ static void nvme_free_dev(struct kref *
+  
+  	pci_dev_put(dev->pci_dev);
+  	nvme_free_namespaces(dev);
+++<<<<<<< HEAD
+ +	free_percpu(dev->io_queue);
+++=======
++ 	nvme_release_instance(dev);
++ 	blk_mq_free_tag_set(&dev->tagset);
++ 	blk_put_queue(dev->admin_q);
+++>>>>>>> ea191d2f36b0 (NVMe: Reference count admin queue usage)
+  	kfree(dev->queues);
+  	kfree(dev->entry);
+  	kfree(dev);
+@@@ -3059,12 -2791,11 +3131,15 @@@ static void nvme_remove(struct pci_dev 
+  
+  	pci_set_drvdata(pdev, NULL);
+  	flush_work(&dev->reset_work);
+ +	flush_work(&dev->cpu_work);
+  	misc_deregister(&dev->miscdev);
+ -	nvme_dev_remove(dev);
+  	nvme_dev_shutdown(dev);
+ -	nvme_dev_remove_admin(dev);
+  	nvme_free_queues(dev, 0);
+++<<<<<<< HEAD
+ +	nvme_dev_remove(dev);
+ +	nvme_release_instance(dev);
+++=======
+++>>>>>>> ea191d2f36b0 (NVMe: Reference count admin queue usage)
+  	nvme_release_prp_pools(dev);
+  	kref_put(&dev->kref, nvme_free_dev);
+  }
+* Unmerged path drivers/block/nvme-core.c
