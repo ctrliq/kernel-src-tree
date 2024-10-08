@@ -1,0 +1,195 @@
+powerpc/perf: Export PERF_EVENT_CONFIG_EBB_SHIFT to userspace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [powerpc] perf: Export PERF_EVENT_CONFIG_EBB_SHIFT to userspace (Steve Best) [997646]
+Rebuild_FUZZ: 92.98%
+commit-author Michael Ellerman <michael@ellerman.id.au>
+commit 8d7c55d01e4648605fd0dacc82d8d3989ead4db7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/8d7c55d0.failed
+
+We use bit 63 of the event code for userspace to request that the event
+be counted using EBB (Event Based Branches). Export this value, making
+it part of the API - though only on processors that support EBB.
+
+	Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 8d7c55d01e4648605fd0dacc82d8d3989ead4db7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/perf/core-book3s.c
+diff --cc arch/powerpc/perf/core-book3s.c
+index d3ee2e50a3a6,eeae308cf982..000000000000
+--- a/arch/powerpc/perf/core-book3s.c
++++ b/arch/powerpc/perf/core-book3s.c
+@@@ -464,6 -476,89 +464,92 @@@ void power_pmu_bhrb_read(struct cpu_hw_
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool is_ebb_event(struct perf_event *event)
++ {
++ 	/*
++ 	 * This could be a per-PMU callback, but we'd rather avoid the cost. We
++ 	 * check that the PMU supports EBB, meaning those that don't can still
++ 	 * use bit 63 of the event code for something else if they wish.
++ 	 */
++ 	return (ppmu->flags & PPMU_EBB) &&
++ 	       ((event->attr.config >> PERF_EVENT_CONFIG_EBB_SHIFT) & 1);
++ }
++ 
++ static int ebb_event_check(struct perf_event *event)
++ {
++ 	struct perf_event *leader = event->group_leader;
++ 
++ 	/* Event and group leader must agree on EBB */
++ 	if (is_ebb_event(leader) != is_ebb_event(event))
++ 		return -EINVAL;
++ 
++ 	if (is_ebb_event(event)) {
++ 		if (!(event->attach_state & PERF_ATTACH_TASK))
++ 			return -EINVAL;
++ 
++ 		if (!leader->attr.pinned || !leader->attr.exclusive)
++ 			return -EINVAL;
++ 
++ 		if (event->attr.inherit || event->attr.sample_period ||
++ 		    event->attr.enable_on_exec || event->attr.freq)
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void ebb_event_add(struct perf_event *event)
++ {
++ 	if (!is_ebb_event(event) || current->thread.used_ebb)
++ 		return;
++ 
++ 	/*
++ 	 * IFF this is the first time we've added an EBB event, set
++ 	 * PMXE in the user MMCR0 so we can detect when it's cleared by
++ 	 * userspace. We need this so that we can context switch while
++ 	 * userspace is in the EBB handler (where PMXE is 0).
++ 	 */
++ 	current->thread.used_ebb = 1;
++ 	current->thread.mmcr0 |= MMCR0_PMXE;
++ }
++ 
++ static void ebb_switch_out(unsigned long mmcr0)
++ {
++ 	if (!(mmcr0 & MMCR0_EBE))
++ 		return;
++ 
++ 	current->thread.siar  = mfspr(SPRN_SIAR);
++ 	current->thread.sier  = mfspr(SPRN_SIER);
++ 	current->thread.sdar  = mfspr(SPRN_SDAR);
++ 	current->thread.mmcr0 = mmcr0 & MMCR0_USER_MASK;
++ 	current->thread.mmcr2 = mfspr(SPRN_MMCR2) & MMCR2_USER_MASK;
++ }
++ 
++ static unsigned long ebb_switch_in(bool ebb, unsigned long mmcr0)
++ {
++ 	if (!ebb)
++ 		goto out;
++ 
++ 	/* Enable EBB and read/write to all 6 PMCs for userspace */
++ 	mmcr0 |= MMCR0_EBE | MMCR0_PMCC_U6;
++ 
++ 	/* Add any bits from the user reg, FC or PMAO */
++ 	mmcr0 |= current->thread.mmcr0;
++ 
++ 	/* Be careful not to set PMXE if userspace had it cleared */
++ 	if (!(current->thread.mmcr0 & MMCR0_PMXE))
++ 		mmcr0 &= ~MMCR0_PMXE;
++ 
++ 	mtspr(SPRN_SIAR, current->thread.siar);
++ 	mtspr(SPRN_SIER, current->thread.sier);
++ 	mtspr(SPRN_SDAR, current->thread.sdar);
++ 	mtspr(SPRN_MMCR2, current->thread.mmcr2);
++ out:
++ 	return mmcr0;
++ }
+++>>>>>>> 8d7c55d01e46 (powerpc/perf: Export PERF_EVENT_CONFIG_EBB_SHIFT to userspace)
+  #endif /* CONFIG_PPC64 */
+  
+  static void perf_event_interrupt(struct pt_regs *regs);
+diff --git a/arch/powerpc/include/asm/perf_event_server.h b/arch/powerpc/include/asm/perf_event_server.h
+index f265049dd7d6..268ca93ad49f 100644
+--- a/arch/powerpc/include/asm/perf_event_server.h
++++ b/arch/powerpc/include/asm/perf_event_server.h
+@@ -12,6 +12,7 @@
+ #include <linux/types.h>
+ #include <asm/hw_irq.h>
+ #include <linux/device.h>
++#include <uapi/asm/perf_event.h>
+ 
+ #define MAX_HWEVENTS		8
+ #define MAX_EVENT_ALTERNATIVES	8
+diff --git a/arch/powerpc/include/uapi/asm/Kbuild b/arch/powerpc/include/uapi/asm/Kbuild
+index 5182c8622b54..48be855ef37b 100644
+--- a/arch/powerpc/include/uapi/asm/Kbuild
++++ b/arch/powerpc/include/uapi/asm/Kbuild
+@@ -20,6 +20,7 @@ header-y += mman.h
+ header-y += msgbuf.h
+ header-y += nvram.h
+ header-y += param.h
++header-y += perf_event.h
+ header-y += poll.h
+ header-y += posix_types.h
+ header-y += ps3fb.h
+diff --git a/arch/powerpc/include/uapi/asm/perf_event.h b/arch/powerpc/include/uapi/asm/perf_event.h
+new file mode 100644
+index 000000000000..80a4d40cf5bc
+--- /dev/null
++++ b/arch/powerpc/include/uapi/asm/perf_event.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright 2013 Michael Ellerman, IBM Corp.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2 of the
++ * License.
++ */
++
++#ifndef _UAPI_ASM_POWERPC_PERF_EVENT_H
++#define _UAPI_ASM_POWERPC_PERF_EVENT_H
++
++/*
++ * We use bit 63 of perf_event_attr.config as a flag to request EBB.
++ */
++#define PERF_EVENT_CONFIG_EBB_SHIFT	63
++
++#endif /* _UAPI_ASM_POWERPC_PERF_EVENT_H */
+* Unmerged path arch/powerpc/perf/core-book3s.c
+diff --git a/arch/powerpc/perf/power8-pmu.c b/arch/powerpc/perf/power8-pmu.c
+index 09def196f5c4..98862891b685 100644
+--- a/arch/powerpc/perf/power8-pmu.c
++++ b/arch/powerpc/perf/power8-pmu.c
+@@ -118,7 +118,7 @@
+ 	 (EVENT_UNIT_MASK      << EVENT_UNIT_SHIFT)		|	\
+ 	 (EVENT_COMBINE_MASK   << EVENT_COMBINE_SHIFT)		|	\
+ 	 (EVENT_MARKED_MASK    << EVENT_MARKED_SHIFT)		|	\
+-	 (EVENT_EBB_MASK       << EVENT_CONFIG_EBB_SHIFT)	|	\
++	 (EVENT_EBB_MASK       << PERF_EVENT_CONFIG_EBB_SHIFT)	|	\
+ 	  EVENT_PSEL_MASK)
+ 
+ /* MMCRA IFM bits - POWER8 */
+@@ -233,10 +233,10 @@ static int power8_get_constraint(u64 event, unsigned long *maskp, unsigned long
+ 	pmc   = (event >> EVENT_PMC_SHIFT)        & EVENT_PMC_MASK;
+ 	unit  = (event >> EVENT_UNIT_SHIFT)       & EVENT_UNIT_MASK;
+ 	cache = (event >> EVENT_CACHE_SEL_SHIFT)  & EVENT_CACHE_SEL_MASK;
+-	ebb   = (event >> EVENT_CONFIG_EBB_SHIFT) & EVENT_EBB_MASK;
++	ebb   = (event >> PERF_EVENT_CONFIG_EBB_SHIFT) & EVENT_EBB_MASK;
+ 
+ 	/* Clear the EBB bit in the event, so event checks work below */
+-	event &= ~(EVENT_EBB_MASK << EVENT_CONFIG_EBB_SHIFT);
++	event &= ~(EVENT_EBB_MASK << PERF_EVENT_CONFIG_EBB_SHIFT);
+ 
+ 	if (pmc) {
+ 		if (pmc > 6)
