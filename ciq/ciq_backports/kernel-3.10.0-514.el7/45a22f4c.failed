@@ -1,0 +1,463 @@
+inotify: Fix reporting of cookies for inotify events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 45a22f4c11fef4ecd5c61c0a299cd3f23d77be8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/45a22f4c.failed
+
+My rework of handling of notification events (namely commit 7053aee26a35
+"fsnotify: do not share events between notification groups") broke
+sending of cookies with inotify events. We didn't propagate the value
+passed to fsnotify() properly and passed 4 uninitialized bytes to
+userspace instead (so it is also an information leak). Sadly I didn't
+notice this during my testing because inotify cookies aren't used very
+much and LTP inotify tests ignore them.
+
+Fix the problem by passing the cookie value properly.
+
+Fixes: 7053aee26a3548ebaba046ae2e52396ccf56ac6c
+	Reported-by: Vegard Nossum <vegard.nossum@oracle.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 45a22f4c11fef4ecd5c61c0a299cd3f23d77be8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/dnotify/dnotify.c
+#	fs/notify/fanotify/fanotify.c
+#	fs/notify/fsnotify.c
+#	fs/notify/inotify/inotify.h
+#	fs/notify/inotify/inotify_fsnotify.c
+#	fs/notify/inotify/inotify_user.c
+#	include/linux/fsnotify_backend.h
+#	kernel/audit_tree.c
+#	kernel/audit_watch.c
+diff --cc fs/notify/dnotify/dnotify.c
+index 2bfe6dc413a0,abc8cbcfe90e..000000000000
+--- a/fs/notify/dnotify/dnotify.c
++++ b/fs/notify/dnotify/dnotify.c
+@@@ -83,12 -82,13 +83,17 @@@ static void dnotify_recalc_inode_mask(s
+   * events.
+   */
+  static int dnotify_handle_event(struct fsnotify_group *group,
+ -				struct inode *inode,
+  				struct fsnotify_mark *inode_mark,
+  				struct fsnotify_mark *vfsmount_mark,
+++<<<<<<< HEAD
+ +				struct fsnotify_event *event)
+++=======
++ 				u32 mask, void *data, int data_type,
++ 				const unsigned char *file_name, u32 cookie)
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  {
+  	struct dnotify_mark *dn_mark;
+ +	struct inode *to_tell;
+  	struct dnotify_struct *dn;
+  	struct dnotify_struct **prev;
+  	struct fown_struct *fown;
+diff --cc fs/notify/fanotify/fanotify.c
+index 0c2f9122b262,205dc2163822..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -217,6 -142,71 +217,74 @@@ static bool fanotify_should_send_event(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int fanotify_handle_event(struct fsnotify_group *group,
++ 				 struct inode *inode,
++ 				 struct fsnotify_mark *inode_mark,
++ 				 struct fsnotify_mark *fanotify_mark,
++ 				 u32 mask, void *data, int data_type,
++ 				 const unsigned char *file_name, u32 cookie)
++ {
++ 	int ret = 0;
++ 	struct fanotify_event_info *event;
++ 	struct fsnotify_event *fsn_event;
++ 
++ 	BUILD_BUG_ON(FAN_ACCESS != FS_ACCESS);
++ 	BUILD_BUG_ON(FAN_MODIFY != FS_MODIFY);
++ 	BUILD_BUG_ON(FAN_CLOSE_NOWRITE != FS_CLOSE_NOWRITE);
++ 	BUILD_BUG_ON(FAN_CLOSE_WRITE != FS_CLOSE_WRITE);
++ 	BUILD_BUG_ON(FAN_OPEN != FS_OPEN);
++ 	BUILD_BUG_ON(FAN_EVENT_ON_CHILD != FS_EVENT_ON_CHILD);
++ 	BUILD_BUG_ON(FAN_Q_OVERFLOW != FS_Q_OVERFLOW);
++ 	BUILD_BUG_ON(FAN_OPEN_PERM != FS_OPEN_PERM);
++ 	BUILD_BUG_ON(FAN_ACCESS_PERM != FS_ACCESS_PERM);
++ 	BUILD_BUG_ON(FAN_ONDIR != FS_ISDIR);
++ 
++ 	if (!fanotify_should_send_event(inode_mark, fanotify_mark, mask, data,
++ 					data_type))
++ 		return 0;
++ 
++ 	pr_debug("%s: group=%p inode=%p mask=%x\n", __func__, group, inode,
++ 		 mask);
++ 
++ 	event = kmem_cache_alloc(fanotify_event_cachep, GFP_KERNEL);
++ 	if (unlikely(!event))
++ 		return -ENOMEM;
++ 
++ 	fsn_event = &event->fse;
++ 	fsnotify_init_event(fsn_event, inode, mask);
++ 	event->tgid = get_pid(task_tgid(current));
++ 	if (data_type == FSNOTIFY_EVENT_PATH) {
++ 		struct path *path = data;
++ 		event->path = *path;
++ 		path_get(&event->path);
++ 	} else {
++ 		event->path.mnt = NULL;
++ 		event->path.dentry = NULL;
++ 	}
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	event->response = 0;
++ #endif
++ 
++ 	ret = fsnotify_add_notify_event(group, fsn_event, fanotify_merge);
++ 	if (ret) {
++ 		BUG_ON(mask & FAN_ALL_PERM_EVENTS);
++ 		/* Our event wasn't used in the end. Free it. */
++ 		fsnotify_destroy_event(group, fsn_event);
++ 		ret = 0;
++ 	}
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS) {
++ 		ret = fanotify_get_response_from_access(group, event);
++ 		fsnotify_destroy_event(group, fsn_event);
++ 	}
++ #endif
++ 	return ret;
++ }
++ 
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  static void fanotify_free_group_priv(struct fsnotify_group *group)
+  {
+  	struct user_struct *user;
+diff --cc fs/notify/fsnotify.c
+index 4bb21d67d9b1,9d3e9c50066a..000000000000
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@@ -178,19 -177,9 +178,25 @@@ static int send_to_group(struct inode *
+  	if (!inode_test_mask && !vfsmount_test_mask)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (group->ops->should_send_event(group, to_tell, inode_mark,
+ +					  vfsmount_mark, mask, data,
+ +					  data_is) == false)
+ +		return 0;
+ +
+ +	if (!*event) {
+ +		*event = fsnotify_create_event(to_tell, mask, data,
+ +						data_is, file_name,
+ +						cookie, GFP_KERNEL);
+ +		if (!*event)
+ +			return -ENOMEM;
+ +	}
+ +	return group->ops->handle_event(group, inode_mark, vfsmount_mark, *event);
+++=======
++ 	return group->ops->handle_event(group, to_tell, inode_mark,
++ 					vfsmount_mark, mask, data, data_is,
++ 					file_name, cookie);
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  }
+  
+  /*
+diff --cc fs/notify/inotify/inotify.h
+index b6642e4de4bf,ed855ef6f077..000000000000
+--- a/fs/notify/inotify/inotify.h
++++ b/fs/notify/inotify/inotify.h
+@@@ -14,8 -15,18 +14,17 @@@ struct inotify_inode_mark 
+  	int wd;
+  };
+  
+ -static inline struct inotify_event_info *INOTIFY_E(struct fsnotify_event *fse)
+ -{
+ -	return container_of(fse, struct inotify_event_info, fse);
+ -}
+ -
+  extern void inotify_ignored_and_remove_idr(struct fsnotify_mark *fsn_mark,
+  					   struct fsnotify_group *group);
+++<<<<<<< HEAD
+ +extern void inotify_free_event_priv(struct fsnotify_event_private_data *event_priv);
+++=======
++ extern int inotify_handle_event(struct fsnotify_group *group,
++ 				struct inode *inode,
++ 				struct fsnotify_mark *inode_mark,
++ 				struct fsnotify_mark *vfsmount_mark,
++ 				u32 mask, void *data, int data_type,
++ 				const unsigned char *file_name, u32 cookie);
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  
+  extern const struct fsnotify_ops inotify_fsnotify_ops;
+diff --cc fs/notify/inotify/inotify_fsnotify.c
+index 4216308b81b4,43ab1e1a07a2..000000000000
+--- a/fs/notify/inotify/inotify_fsnotify.c
++++ b/fs/notify/inotify/inotify_fsnotify.c
+@@@ -68,38 -53,28 +68,47 @@@ static bool event_compare(struct fsnoti
+  	return false;
+  }
+  
+ -static int inotify_merge(struct list_head *list,
+ -			  struct fsnotify_event *event)
+ +static struct fsnotify_event *inotify_merge(struct list_head *list,
+ +					    struct fsnotify_event *event)
+  {
+ +	struct fsnotify_event_holder *last_holder;
+  	struct fsnotify_event *last_event;
+  
+ -	last_event = list_entry(list->prev, struct fsnotify_event, list);
+ -	return event_compare(last_event, event);
+ +	/* and the list better be locked by something too */
+ +	spin_lock(&event->lock);
+ +
+ +	last_holder = list_entry(list->prev, struct fsnotify_event_holder, event_list);
+ +	last_event = last_holder->event;
+ +	if (event_compare(last_event, event))
+ +		fsnotify_get_event(last_event);
+ +	else
+ +		last_event = NULL;
+ +
+ +	spin_unlock(&event->lock);
+ +
+ +	return last_event;
+  }
+  
+++<<<<<<< HEAD
+ +static int inotify_handle_event(struct fsnotify_group *group,
+ +				struct fsnotify_mark *inode_mark,
+ +				struct fsnotify_mark *vfsmount_mark,
+ +				struct fsnotify_event *event)
+++=======
++ int inotify_handle_event(struct fsnotify_group *group,
++ 			 struct inode *inode,
++ 			 struct fsnotify_mark *inode_mark,
++ 			 struct fsnotify_mark *vfsmount_mark,
++ 			 u32 mask, void *data, int data_type,
++ 			 const unsigned char *file_name, u32 cookie)
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  {
+  	struct inotify_inode_mark *i_mark;
+ -	struct inotify_event_info *event;
+ -	struct fsnotify_event *fsn_event;
+ -	int ret;
+ -	int len = 0;
+ -	int alloc_len = sizeof(struct inotify_event_info);
+ +	struct inode *to_tell;
+ +	struct inotify_event_private_data *event_priv;
+ +	struct fsnotify_event_private_data *fsn_event_priv;
+ +	struct fsnotify_event *added_event;
+ +	int wd, ret = 0;
+  
+  	BUG_ON(vfsmount_mark);
+  
+@@@ -110,25 -95,23 +119,35 @@@
+  
+  	i_mark = container_of(inode_mark, struct inotify_inode_mark,
+  			      fsn_mark);
+ +	wd = i_mark->wd;
+  
+ -	event = kmalloc(alloc_len, GFP_KERNEL);
+ -	if (unlikely(!event))
+ +	event_priv = kmem_cache_alloc(event_priv_cachep, GFP_KERNEL);
+ +	if (unlikely(!event_priv))
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	fsn_event_priv = &event_priv->fsnotify_event_priv_data;
+++=======
++ 	fsn_event = &event->fse;
++ 	fsnotify_init_event(fsn_event, inode, mask);
++ 	event->wd = i_mark->wd;
++ 	event->sync_cookie = cookie;
++ 	event->name_len = len;
++ 	if (len)
++ 		strcpy(event->name, file_name);
+ -
+ -	ret = fsnotify_add_notify_event(group, fsn_event, inotify_merge);
+ -	if (ret) {
+ -		/* Our event wasn't used in the end. Free it. */
+ -		fsnotify_destroy_event(group, fsn_event);
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+ +
+ +	fsnotify_get_group(group);
+ +	fsn_event_priv->group = group;
+ +	event_priv->wd = wd;
+ +
+ +	added_event = fsnotify_add_notify_event(group, event, fsn_event_priv, inotify_merge);
+ +	if (added_event) {
+ +		inotify_free_event_priv(fsn_event_priv);
+ +		if (!IS_ERR(added_event))
+ +			fsnotify_put_event(added_event);
+ +		else
+ +			ret = PTR_ERR(added_event);
+  	}
+  
+  	if (inode_mark->mask & IN_ONESHOT)
+diff --cc fs/notify/inotify/inotify_user.c
+index 5fc2bfa3a6c1,6528b5a54ca0..000000000000
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@@ -504,43 -492,12 +504,50 @@@ void inotify_ignored_and_remove_idr(str
+  				    struct fsnotify_group *group)
+  {
+  	struct inotify_inode_mark *i_mark;
+++<<<<<<< HEAD
+ +	struct fsnotify_event *ignored_event, *notify_event;
+ +	struct inotify_event_private_data *event_priv;
+ +	struct fsnotify_event_private_data *fsn_event_priv;
+ +	int ret;
+++=======
++ 
++ 	/* Queue ignore event for the watch */
++ 	inotify_handle_event(group, NULL, fsn_mark, NULL, FS_IN_IGNORED,
++ 			     NULL, FSNOTIFY_EVENT_NONE, NULL, 0);
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  
+  	i_mark = container_of(fsn_mark, struct inotify_inode_mark, fsn_mark);
+ +
+ +	ignored_event = fsnotify_create_event(NULL, FS_IN_IGNORED, NULL,
+ +					      FSNOTIFY_EVENT_NONE, NULL, 0,
+ +					      GFP_NOFS);
+ +	if (!ignored_event)
+ +		goto skip_send_ignore;
+ +
+ +	event_priv = kmem_cache_alloc(event_priv_cachep, GFP_NOFS);
+ +	if (unlikely(!event_priv))
+ +		goto skip_send_ignore;
+ +
+ +	fsn_event_priv = &event_priv->fsnotify_event_priv_data;
+ +
+ +	fsnotify_get_group(group);
+ +	fsn_event_priv->group = group;
+ +	event_priv->wd = i_mark->wd;
+ +
+ +	notify_event = fsnotify_add_notify_event(group, ignored_event, fsn_event_priv, NULL);
+ +	if (notify_event) {
+ +		if (IS_ERR(notify_event))
+ +			ret = PTR_ERR(notify_event);
+ +		else
+ +			fsnotify_put_event(notify_event);
+ +		inotify_free_event_priv(fsn_event_priv);
+ +	}
+ +
+ +skip_send_ignore:
+ +	/* matches the reference taken when the event was created */
+ +	if (ignored_event)
+ +		fsnotify_put_event(ignored_event);
+ +
+  	/* remove this mark from the idr */
+  	inotify_remove_from_idr(group, i_mark);
+  
+diff --cc include/linux/fsnotify_backend.h
+index 4b2ee8d12f5e,c84bc7c2bfc8..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -94,17 -94,27 +94,22 @@@ struct fsnotify_event_private_data
+   * 		userspace messages that marks have been removed.
+   */
+  struct fsnotify_ops {
+ +	bool (*should_send_event)(struct fsnotify_group *group, struct inode *inode,
+ +				  struct fsnotify_mark *inode_mark,
+ +				  struct fsnotify_mark *vfsmount_mark,
+ +				  __u32 mask, void *data, int data_type);
+  	int (*handle_event)(struct fsnotify_group *group,
+ -			    struct inode *inode,
+  			    struct fsnotify_mark *inode_mark,
+  			    struct fsnotify_mark *vfsmount_mark,
+++<<<<<<< HEAD
+ +			    struct fsnotify_event *event);
+++=======
++ 			    u32 mask, void *data, int data_type,
++ 			    const unsigned char *file_name, u32 cookie);
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  	void (*free_group_priv)(struct fsnotify_group *group);
+  	void (*freeing_mark)(struct fsnotify_mark *mark, struct fsnotify_group *group);
+ -	void (*free_event)(struct fsnotify_event *event);
+ -};
+ -
+ -/*
+ - * all of the information about the original object we want to now send to
+ - * a group.  If you want to carry more info from the accessing task to the
+ - * listener this structure is where you need to be adding fields.
+ - */
+ -struct fsnotify_event {
+ -	struct list_head list;
+ -	/* inode may ONLY be dereferenced during handle_event(). */
+ -	struct inode *inode;	/* either the inode the event happened to or its parent */
+ -	u32 mask;		/* the type of access, bitwise OR for FS_* event types */
+ +	void (*free_event_priv)(struct fsnotify_event_private_data *priv);
+  };
+  
+  /*
+diff --cc kernel/audit_tree.c
+index ea4c1d0e95c8,135944a7b28a..000000000000
+--- a/kernel/audit_tree.c
++++ b/kernel/audit_tree.c
+@@@ -913,12 -912,13 +913,18 @@@ static void evict_chunk(struct audit_ch
+  }
+  
+  static int audit_tree_handle_event(struct fsnotify_group *group,
+ -				   struct inode *to_tell,
+  				   struct fsnotify_mark *inode_mark,
+++<<<<<<< HEAD
+ +				   struct fsnotify_mark *vfsmonut_mark,
+ +				   struct fsnotify_event *event)
+++=======
++ 				   struct fsnotify_mark *vfsmount_mark,
++ 				   u32 mask, void *data, int data_type,
++ 				   const unsigned char *file_name, u32 cookie)
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  {
+ -	return 0;
+ +	BUG();
+ +	return -EOPNOTSUPP;
+  }
+  
+  static void audit_tree_freeing_mark(struct fsnotify_mark *entry, struct fsnotify_group *group)
+diff --cc kernel/audit_watch.c
+index c7d454ea3ffd,70b4554d2fbe..000000000000
+--- a/kernel/audit_watch.c
++++ b/kernel/audit_watch.c
+@@@ -465,23 -465,15 +465,28 @@@ void audit_remove_watch_rule(struct aud
+  	}
+  }
+  
+ +static bool audit_watch_should_send_event(struct fsnotify_group *group, struct inode *inode,
+ +					  struct fsnotify_mark *inode_mark,
+ +					  struct fsnotify_mark *vfsmount_mark,
+ +					  __u32 mask, void *data, int data_type)
+ +{
+ +       return true;
+ +}
+ +
+  /* Update watch data in audit rules based on fsnotify events. */
+  static int audit_watch_handle_event(struct fsnotify_group *group,
+ -				    struct inode *to_tell,
+  				    struct fsnotify_mark *inode_mark,
+  				    struct fsnotify_mark *vfsmount_mark,
+++<<<<<<< HEAD
+ +				    struct fsnotify_event *event)
+++=======
++ 				    u32 mask, void *data, int data_type,
++ 				    const unsigned char *dname, u32 cookie)
+++>>>>>>> 45a22f4c11fe (inotify: Fix reporting of cookies for inotify events)
+  {
+  	struct inode *inode;
+ +	__u32 mask = event->mask;
+ +	const char *dname = event->file_name;
+  	struct audit_parent *parent;
+  
+  	parent = container_of(inode_mark, struct audit_parent, mark);
+* Unmerged path fs/notify/dnotify/dnotify.c
+* Unmerged path fs/notify/fanotify/fanotify.c
+* Unmerged path fs/notify/fsnotify.c
+* Unmerged path fs/notify/inotify/inotify.h
+* Unmerged path fs/notify/inotify/inotify_fsnotify.c
+* Unmerged path fs/notify/inotify/inotify_user.c
+* Unmerged path include/linux/fsnotify_backend.h
+* Unmerged path kernel/audit_tree.c
+* Unmerged path kernel/audit_watch.c
