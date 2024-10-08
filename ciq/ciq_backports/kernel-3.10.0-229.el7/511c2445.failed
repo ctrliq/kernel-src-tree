@@ -1,0 +1,165 @@
+qeth: don't query for info if hardware not ready.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [s390] qeth: don't query for info if hardware not ready (Hendrik Brueckner) [1147573]
+Rebuild_FUZZ: 98.97%
+commit-author Eugene Crosser <Eugene.Crosser@ru.ibm.com>
+commit 511c24456ad19d51fcdbc5eda9df7be98c20e6b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/511c2445.failed
+
+When qeth device is queried for ethtool data, hardware operation
+is performed to extract the necessary information from the card.
+If the card is not online at the moment (e.g. it is undergoing
+recovery), this operation produces undesired effects like
+temporarily freezing the system. This patch prevents execution
+of the hardware query operation when the card is not online.
+In such case, ioctl() operation returns error with errno ENODEV.
+
+	Reviewed-by: Ursula Braun <ursula.braun@de.ibm.com>
+	Signed-off-by: Eugene Crosser <Eugene.Crosser@ru.ibm.com>
+	Signed-off-by: Frank Blaschka <blaschka@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 511c24456ad19d51fcdbc5eda9df7be98c20e6b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_l2_sys.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index f4e4ebae338c,fd22c811cbe1..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -68,8 -70,16 +68,15 @@@ static void qeth_clear_output_buffer(st
+  		enum qeth_qdio_buffer_states newbufstate);
+  static int qeth_init_qdio_out_buf(struct qeth_qdio_out_q *, int);
+  
+ -struct workqueue_struct *qeth_wq;
+ -EXPORT_SYMBOL_GPL(qeth_wq);
+ +static struct workqueue_struct *qeth_wq;
+  
++ int qeth_card_hw_is_reachable(struct qeth_card *card)
++ {
++ 	return (card->state == CARD_STATE_SOFTSETUP) ||
++ 		(card->state == CARD_STATE_UP);
++ }
++ EXPORT_SYMBOL_GPL(qeth_card_hw_is_reachable);
++ 
+  static void qeth_close_dev_handler(struct work_struct *work)
+  {
+  	struct qeth_card *card;
+@@@ -5612,6 -5796,9 +5619,12 @@@ int qeth_core_ethtool_get_settings(stru
+  {
+  	struct qeth_card *card = netdev->ml_priv;
+  	enum qeth_link_types link_type;
+++<<<<<<< HEAD
+++=======
++ 	struct carrier_info carrier_info;
++ 	int rc;
++ 	u32 speed;
+++>>>>>>> 511c24456ad1 (qeth: don't query for info if hardware not ready.)
+  
+  	if ((card->info.type == QETH_CARD_TYPE_IQD) || (card->info.guestlan))
+  		link_type = QETH_LINK_TYPE_10GBIT_ETH;
+@@@ -5683,15 -5831,74 +5696,82 @@@
+  		break;
+  
+  	default:
+ -		qeth_set_ecmd_adv_sup(ecmd, SPEED_10, PORT_TP);
+ -		speed = SPEED_10;
+ +		ecmd->supported |= SUPPORTED_10baseT_Half |
+ +					SUPPORTED_10baseT_Full |
+ +					SUPPORTED_TP;
+ +		ecmd->advertising |= ADVERTISED_10baseT_Half |
+ +					ADVERTISED_10baseT_Full |
+ +					ADVERTISED_TP;
+ +		ecmd->speed = SPEED_10;
+  		ecmd->port = PORT_TP;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	ethtool_cmd_speed_set(ecmd, speed);
++ 
++ 	/* Check if we can obtain more accurate information.	 */
++ 	/* If QUERY_CARD_INFO command is not supported or fails, */
++ 	/* just return the heuristics that was filled above.	 */
++ 	if (!qeth_card_hw_is_reachable(card))
++ 		return -ENODEV;
++ 	rc = qeth_query_card_info(card, &carrier_info);
++ 	if (rc == -EOPNOTSUPP) /* for old hardware, return heuristic */
++ 		return 0;
++ 	if (rc) /* report error from the hardware operation */
++ 		return rc;
++ 	/* on success, fill in the information got from the hardware */
++ 
++ 	netdev_dbg(netdev,
++ 	"card info: card_type=0x%02x, port_mode=0x%04x, port_speed=0x%08x\n",
++ 			carrier_info.card_type,
++ 			carrier_info.port_mode,
++ 			carrier_info.port_speed);
++ 
++ 	/* Update attributes for which we've obtained more authoritative */
++ 	/* information, leave the rest the way they where filled above.  */
++ 	switch (carrier_info.card_type) {
++ 	case CARD_INFO_TYPE_1G_COPPER_A:
++ 	case CARD_INFO_TYPE_1G_COPPER_B:
++ 		qeth_set_ecmd_adv_sup(ecmd, SPEED_1000, PORT_TP);
++ 		ecmd->port = PORT_TP;
++ 		break;
++ 	case CARD_INFO_TYPE_1G_FIBRE_A:
++ 	case CARD_INFO_TYPE_1G_FIBRE_B:
++ 		qeth_set_ecmd_adv_sup(ecmd, SPEED_1000, PORT_FIBRE);
++ 		ecmd->port = PORT_FIBRE;
++ 		break;
++ 	case CARD_INFO_TYPE_10G_FIBRE_A:
++ 	case CARD_INFO_TYPE_10G_FIBRE_B:
++ 		qeth_set_ecmd_adv_sup(ecmd, SPEED_10000, PORT_FIBRE);
++ 		ecmd->port = PORT_FIBRE;
++ 		break;
++ 	}
++ 
++ 	switch (carrier_info.port_mode) {
++ 	case CARD_INFO_PORTM_FULLDUPLEX:
++ 		ecmd->duplex = DUPLEX_FULL;
++ 		break;
++ 	case CARD_INFO_PORTM_HALFDUPLEX:
++ 		ecmd->duplex = DUPLEX_HALF;
++ 		break;
++ 	}
++ 
++ 	switch (carrier_info.port_speed) {
++ 	case CARD_INFO_PORTS_10M:
++ 		speed = SPEED_10;
++ 		break;
++ 	case CARD_INFO_PORTS_100M:
++ 		speed = SPEED_100;
++ 		break;
++ 	case CARD_INFO_PORTS_1G:
++ 		speed = SPEED_1000;
++ 		break;
++ 	case CARD_INFO_PORTS_10G:
++ 		speed = SPEED_10000;
++ 		break;
++ 	}
++ 	ethtool_cmd_speed_set(ecmd, speed);
+++>>>>>>> 511c24456ad1 (qeth: don't query for info if hardware not ready.)
+  
+  	return 0;
+  }
+* Unmerged path drivers/s390/net/qeth_l2_sys.c
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index c4f392d5db4c..b218141da744 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -852,6 +852,7 @@ extern struct qeth_discipline qeth_l3_discipline;
+ extern const struct attribute_group *qeth_generic_attr_groups[];
+ extern const struct attribute_group *qeth_osn_attr_groups[];
+ 
++int qeth_card_hw_is_reachable(struct qeth_card *);
+ const char *qeth_get_cardname_short(struct qeth_card *);
+ int qeth_realloc_buffer_pool(struct qeth_card *, int);
+ int qeth_core_load_discipline(struct qeth_card *, enum qeth_discipline_id);
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_l2_sys.c
