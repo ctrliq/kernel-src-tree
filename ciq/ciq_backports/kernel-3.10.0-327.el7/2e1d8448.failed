@@ -1,0 +1,203 @@
+NVMe: Asynchronous controller probe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 2e1d8448196ba85cd78a18723413a3c92aabe0f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2e1d8448.failed
+
+This performs the longest parts of nvme device probe in scheduled work.
+This speeds up probe significantly when multiple devices are in use.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+(cherry picked from commit 2e1d8448196ba85cd78a18723413a3c92aabe0f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	include/linux/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 4365f3348321,a57685f74e5e..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -2819,11 -2793,27 +2819,35 @@@ static void nvme_free_dev(struct kref *
+  
+  static int nvme_dev_open(struct inode *inode, struct file *f)
+  {
+++<<<<<<< HEAD
+ +	struct nvme_dev *dev = container_of(f->private_data, struct nvme_dev,
+ +								miscdev);
+ +	kref_get(&dev->kref);
+ +	f->private_data = dev;
+ +	return 0;
+++=======
++ 	struct nvme_dev *dev;
++ 	int instance = iminor(inode);
++ 	int ret = -ENODEV;
++ 
++ 	spin_lock(&dev_list_lock);
++ 	list_for_each_entry(dev, &dev_list, node) {
++ 		if (dev->instance == instance) {
++ 			if (!dev->admin_q) {
++ 				ret = -EWOULDBLOCK;
++ 				break;
++ 			}
++ 			if (!kref_get_unless_zero(&dev->kref))
++ 				break;
++ 			f->private_data = dev;
++ 			ret = 0;
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock(&dev_list_lock);
++ 
++ 	return ret;
+++>>>>>>> 2e1d8448196b (NVMe: Asynchronous controller probe)
+  }
+  
+  static int nvme_dev_release(struct inode *inode, struct file *f)
+@@@ -2958,29 -2980,37 +2982,39 @@@ static void nvme_reset_failed_dev(struc
+  	nvme_dev_reset(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_reset_workfn(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, reset_work);
++ 	dev->reset_workfn(work);
++ }
++ 
++ static void nvme_async_probe(struct work_struct *work);
+++>>>>>>> 2e1d8448196b (NVMe: Asynchronous controller probe)
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+ -	int node, result = -ENOMEM;
+ +	int result = -ENOMEM;
+  	struct nvme_dev *dev;
+  
+ -	node = dev_to_node(&pdev->dev);
+ -	if (node == NUMA_NO_NODE)
+ -		set_dev_node(&pdev->dev, 0);
+ -
+ -	dev = kzalloc_node(sizeof(*dev), GFP_KERNEL, node);
+ +	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+  	if (!dev)
+  		return -ENOMEM;
+ -	dev->entry = kzalloc_node(num_possible_cpus() * sizeof(*dev->entry),
+ -							GFP_KERNEL, node);
+ +	dev->entry = kcalloc(num_possible_cpus(), sizeof(*dev->entry),
+ +								GFP_KERNEL);
+  	if (!dev->entry)
+  		goto free;
+ -	dev->queues = kzalloc_node((num_possible_cpus() + 1) * sizeof(void *),
+ -							GFP_KERNEL, node);
+ +	dev->queues = kcalloc(num_possible_cpus() + 1, sizeof(void *),
+ +								GFP_KERNEL);
+  	if (!dev->queues)
+  		goto free;
+ +	dev->io_queue = alloc_percpu(unsigned short);
+ +	if (!dev->io_queue)
+ +		goto free;
+  
+  	INIT_LIST_HEAD(&dev->namespaces);
+ -	dev->reset_workfn = nvme_reset_failed_dev;
+ -	INIT_WORK(&dev->reset_work, nvme_reset_workfn);
+ +	INIT_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +	INIT_WORK(&dev->cpu_work, nvme_cpu_workfn);
+  	dev->pci_dev = pci_dev_get(pdev);
+  	pci_set_drvdata(pdev, dev);
+  	result = nvme_set_instance(dev);
+@@@ -2992,34 -3022,20 +3026,49 @@@
+  		goto release;
+  
+  	kref_init(&dev->kref);
+++<<<<<<< HEAD
+ +	result = nvme_dev_start(dev);
+ +	if (result)
+ +		goto release_pools;
+ +
+ +	if (dev->online_queues > 1)
+ +		result = nvme_dev_add(dev);
+ +	if (result)
+ +		goto shutdown;
+ +
+ +	scnprintf(dev->name, sizeof(dev->name), "nvme%d", dev->instance);
+ +	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+ +	dev->miscdev.parent = &pdev->dev;
+ +	dev->miscdev.name = dev->name;
+ +	dev->miscdev.fops = &nvme_dev_fops;
+ +	result = misc_register(&dev->miscdev);
+ +	if (result)
+ +		goto remove;
+ +
+ +	dev->initialized = 1;
+ +	return 0;
+ +
+ + remove:
+ +	nvme_dev_remove(dev);
+ +	nvme_free_namespaces(dev);
+ + shutdown:
+ +	nvme_dev_shutdown(dev);
+++=======
++ 	dev->device = device_create(nvme_class, &pdev->dev,
++ 				MKDEV(nvme_char_major, dev->instance),
++ 				dev, "nvme%d", dev->instance);
++ 	if (IS_ERR(dev->device)) {
++ 		result = PTR_ERR(dev->device);
++ 		goto release_pools;
++ 	}
++ 	get_device(dev->device);
++ 
++ 	INIT_WORK(&dev->probe_work, nvme_async_probe);
++ 	schedule_work(&dev->probe_work);
++ 	return 0;
++ 
+++>>>>>>> 2e1d8448196b (NVMe: Asynchronous controller probe)
+   release_pools:
+- 	nvme_free_queues(dev, 0);
+  	nvme_release_prp_pools(dev);
+   release:
+  	nvme_release_instance(dev);
+@@@ -3058,13 -3095,13 +3129,14 @@@ static void nvme_remove(struct pci_dev 
+  	spin_unlock(&dev_list_lock);
+  
+  	pci_set_drvdata(pdev, NULL);
++ 	flush_work(&dev->probe_work);
+  	flush_work(&dev->reset_work);
+ +	flush_work(&dev->cpu_work);
+ +	misc_deregister(&dev->miscdev);
+  	nvme_dev_shutdown(dev);
+ -	nvme_dev_remove(dev);
+ -	nvme_dev_remove_admin(dev);
+ -	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+  	nvme_free_queues(dev, 0);
+ +	nvme_dev_remove(dev);
+ +	nvme_release_instance(dev);
+  	nvme_release_prp_pools(dev);
+  	kref_put(&dev->kref, nvme_free_dev);
+  }
+diff --cc include/linux/nvme.h
+index 0ee15565532d,e2429e8cdab4..000000000000
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@@ -85,9 -88,10 +85,13 @@@ struct nvme_dev 
+  	struct nvme_bar __iomem *bar;
+  	struct list_head namespaces;
+  	struct kref kref;
+ -	struct device *device;
+ -	work_func_t reset_workfn;
+ +	struct miscdevice miscdev;
+  	struct work_struct reset_work;
+++<<<<<<< HEAD
+ +	struct work_struct cpu_work;
+++=======
++ 	struct work_struct probe_work;
+++>>>>>>> 2e1d8448196b (NVMe: Asynchronous controller probe)
+  	char name[12];
+  	char serial[20];
+  	char model[40];
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path include/linux/nvme.h
