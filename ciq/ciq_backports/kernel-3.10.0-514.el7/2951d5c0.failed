@@ -1,0 +1,102 @@
+tick: broadcast: Prevent livelock from event handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 2951d5c031a3aaefa31b688fbf229e75692f4786
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2951d5c0.failed
+
+With the removal of the hrtimer softirq the switch to highres/nohz
+mode happens in the tick interrupt. That leads to a livelock when the
+per cpu event handler is directly called from the broadcast handler
+under broadcast lock because broadcast lock needs to be taken for the
+highres/nohz switch as well.
+
+Solve this by calling the cpu local handler outside the broadcast_lock
+held region.
+
+Fixes: c6eb3f70d448 "hrtimer: Get rid of hrtimer softirq"
+Reported-and-tested-by: Borislav Petkov <bp@alien8.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 2951d5c031a3aaefa31b688fbf229e75692f4786)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/time/tick-broadcast.c
+diff --cc kernel/time/tick-broadcast.c
+index a219e68a2957,5d9e4aab9797..000000000000
+--- a/kernel/time/tick-broadcast.c
++++ b/kernel/time/tick-broadcast.c
+@@@ -290,41 -297,40 +291,55 @@@ static bool tick_do_periodic_broadcast(
+   */
+  static void tick_handle_periodic_broadcast(struct clock_event_device *dev)
+  {
+- 	ktime_t next;
++ 	struct tick_device *td = this_cpu_ptr(&tick_cpu_device);
++ 	bool bc_local;
+  
+  	raw_spin_lock(&tick_broadcast_lock);
++ 	bc_local = tick_do_periodic_broadcast();
+  
+- 	tick_do_periodic_broadcast();
++ 	if (dev->state == CLOCK_EVT_STATE_ONESHOT) {
++ 		ktime_t next = ktime_add(dev->next_event, tick_period);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * The device is in periodic mode. No reprogramming necessary:
+ +	 */
+ +	if (dev->mode == CLOCK_EVT_MODE_PERIODIC)
+ +		goto unlock;
+ +
+ +	/*
+ +	 * Setup the next period for devices, which do not have
+ +	 * periodic mode. We read dev->next_event first and add to it
+ +	 * when the event already expired. clockevents_program_event()
+ +	 * sets dev->next_event only when the event is really
+ +	 * programmed to the device.
+ +	 */
+ +	for (next = dev->next_event; ;) {
+ +		next = ktime_add(next, tick_period);
+ +
+ +		if (!clockevents_program_event(dev, next, false))
+ +			goto unlock;
+ +		tick_do_periodic_broadcast();
+++=======
++ 		clockevents_program_event(dev, next, true);
+++>>>>>>> 2951d5c031a3 (tick: broadcast: Prevent livelock from event handler)
+  	}
+- unlock:
+  	raw_spin_unlock(&tick_broadcast_lock);
++ 
++ 	/*
++ 	 * We run the handler of the local cpu after dropping
++ 	 * tick_broadcast_lock because the handler might deadlock when
++ 	 * trying to switch to oneshot mode.
++ 	 */
++ 	if (bc_local)
++ 		td->evtdev->event_handler(td->evtdev);
+  }
+  
+ -/**
+ - * tick_broadcast_control - Enable/disable or force broadcast mode
+ - * @mode:	The selected broadcast mode
+ - *
+ - * Called when the system enters a state where affected tick devices
+ - * might stop. Note: TICK_BROADCAST_FORCE cannot be undone.
+ - *
+ - * Called with interrupts disabled, so clockevents_lock is not
+ - * required here because the local clock event device cannot go away
+ - * under us.
+ +/*
+ + * Powerstate information: The system enters/leaves a state, where
+ + * affected devices might stop
+   */
+ -void tick_broadcast_control(enum tick_broadcast_mode mode)
+ +static void tick_do_broadcast_on_off(unsigned long *reason)
+  {
+  	struct clock_event_device *bc, *dev;
+  	struct tick_device *td;
+* Unmerged path kernel/time/tick-broadcast.c
