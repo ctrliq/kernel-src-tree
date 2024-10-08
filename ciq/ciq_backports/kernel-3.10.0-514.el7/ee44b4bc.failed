@@ -1,0 +1,499 @@
+dlm: use sctp 1-to-1 API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+commit ee44b4bc054afc586c92558a225055ef9fd25d17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ee44b4bc.failed
+
+DLM is using 1-to-many API but in a 1-to-1 fashion. That is, it's not
+needed but this causes it to use sctp_do_peeloff() to mimic an
+kernel_accept() and this causes a symbol dependency on sctp module.
+
+By switching it to 1-to-1 API we can avoid this dependency and also
+reduce quite a lot of SCTP-specific code in lowcomms.c.
+
+The caveat is that now DLM won't always use the same src port. It will
+choose a random one, just like TCP code. This allows the peers to
+attempt simultaneous connections, which now are handled just like for
+TCP.
+
+Even more sharing between TCP and SCTP code on DLM is possible, but it
+is intentionally left for a later commit.
+
+Note that for using nodes with this commit, you have to have at least
+the early fixes on this patchset otherwise it will trigger some issues
+on old nodes.
+
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David Teigland <teigland@redhat.com>
+(cherry picked from commit ee44b4bc054afc586c92558a225055ef9fd25d17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dlm/lowcomms.c
+diff --cc fs/dlm/lowcomms.c
+index 07abd39b991a,856d750be96b..000000000000
+--- a/fs/dlm/lowcomms.c
++++ b/fs/dlm/lowcomms.c
+@@@ -125,7 -124,6 +124,10 @@@ struct connection 
+  	struct connection *othercon;
+  	struct work_struct rwork; /* Receive workqueue */
+  	struct work_struct swork; /* Send workqueue */
+++<<<<<<< HEAD
+ +	void (*orig_error_report)(struct sock *sk);
+++=======
+++>>>>>>> ee44b4bc054a (dlm: use sctp 1-to-1 API)
+  };
+  #define sock2con(x) ((struct connection *)(x)->sk_user_data)
+  
+@@@ -320,8 -299,16 +302,21 @@@ static int nodeid_to_addr(int nodeid, s
+  
+  	spin_lock(&dlm_node_addrs_spin);
+  	na = find_node_addr(nodeid);
+++<<<<<<< HEAD
+ +	if (na && na->addr_count)
+ +		memcpy(&sas, na->addr[0], sizeof(struct sockaddr_storage));
+++=======
++ 	if (na && na->addr_count) {
++ 		memcpy(&sas, na->addr[na->curr_addr_index],
++ 		       sizeof(struct sockaddr_storage));
++ 
++ 		if (try_new_addr) {
++ 			na->curr_addr_index++;
++ 			if (na->curr_addr_index == na->addr_count)
++ 				na->curr_addr_index = 0;
++ 		}
++ 	}
+++>>>>>>> ee44b4bc054a (dlm: use sctp 1-to-1 API)
+  	spin_unlock(&dlm_node_addrs_spin);
+  
+  	if (!na)
+@@@ -569,248 -525,6 +569,251 @@@ static void close_connection(struct con
+  	mutex_unlock(&con->sock_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +/* We only send shutdown messages to nodes that are not part of the cluster
+ + * or if we get multiple connections from a node.
+ + */
+ +static void sctp_send_shutdown(sctp_assoc_t associd)
+ +{
+ +	static char outcmsg[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
+ +	struct msghdr outmessage;
+ +	struct cmsghdr *cmsg;
+ +	struct sctp_sndrcvinfo *sinfo;
+ +	int ret;
+ +	struct connection *con;
+ +
+ +	con = nodeid2con(0,0);
+ +	BUG_ON(con == NULL);
+ +
+ +	outmessage.msg_name = NULL;
+ +	outmessage.msg_namelen = 0;
+ +	outmessage.msg_control = outcmsg;
+ +	outmessage.msg_controllen = sizeof(outcmsg);
+ +	outmessage.msg_flags = MSG_EOR;
+ +
+ +	cmsg = CMSG_FIRSTHDR(&outmessage);
+ +	cmsg->cmsg_level = IPPROTO_SCTP;
+ +	cmsg->cmsg_type = SCTP_SNDRCV;
+ +	cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndrcvinfo));
+ +	outmessage.msg_controllen = cmsg->cmsg_len;
+ +	sinfo = CMSG_DATA(cmsg);
+ +	memset(sinfo, 0x00, sizeof(struct sctp_sndrcvinfo));
+ +
+ +	sinfo->sinfo_flags |= MSG_EOF;
+ +	sinfo->sinfo_assoc_id = associd;
+ +
+ +	ret = kernel_sendmsg(con->sock, &outmessage, NULL, 0, 0);
+ +
+ +	if (ret != 0)
+ +		log_print("send EOF to node failed: %d", ret);
+ +}
+ +
+ +static void sctp_init_failed_foreach(struct connection *con)
+ +{
+ +	con->sctp_assoc = 0;
+ +	if (test_and_clear_bit(CF_INIT_PENDING, &con->flags)) {
+ +		if (!test_and_set_bit(CF_WRITE_PENDING, &con->flags))
+ +			queue_work(send_workqueue, &con->swork);
+ +	}
+ +}
+ +
+ +/* INIT failed but we don't know which node...
+ +   restart INIT on all pending nodes */
+ +static void sctp_init_failed(void)
+ +{
+ +	mutex_lock(&connections_lock);
+ +
+ +	foreach_conn(sctp_init_failed_foreach);
+ +
+ +	mutex_unlock(&connections_lock);
+ +}
+ +
+ +static void retry_failed_sctp_send(struct connection *recv_con,
+ +				   struct sctp_send_failed *sn_send_failed,
+ +				   char *buf)
+ +{
+ +	int len = sn_send_failed->ssf_length - sizeof(struct sctp_send_failed);
+ +	struct dlm_mhandle *mh;
+ +	struct connection *con;
+ +	char *retry_buf;
+ +	int nodeid = sn_send_failed->ssf_info.sinfo_ppid;
+ +
+ +	log_print("Retry sending %d bytes to node id %d", len, nodeid);
+ +	
+ +	if (!nodeid) {
+ +		log_print("Shouldn't resend data via listening connection.");
+ +		return;
+ +	}
+ +
+ +	con = nodeid2con(nodeid, 0);
+ +	if (!con) {
+ +		log_print("Could not look up con for nodeid %d\n",
+ +			  nodeid);
+ +		return;
+ +	}
+ +
+ +	mh = dlm_lowcomms_get_buffer(nodeid, len, GFP_NOFS, &retry_buf);
+ +	if (!mh) {
+ +		log_print("Could not allocate buf for retry.");
+ +		return;
+ +	}
+ +	memcpy(retry_buf, buf + sizeof(struct sctp_send_failed), len);
+ +	dlm_lowcomms_commit_buffer(mh);
+ +
+ +	/*
+ +	 * If we got a assoc changed event before the send failed event then
+ +	 * we only need to retry the send.
+ +	 */
+ +	if (con->sctp_assoc) {
+ +		if (!test_and_set_bit(CF_WRITE_PENDING, &con->flags))
+ +			queue_work(send_workqueue, &con->swork);
+ +	} else
+ +		sctp_init_failed_foreach(con);
+ +}
+ +
+ +/* Something happened to an association */
+ +static void process_sctp_notification(struct connection *con,
+ +				      struct msghdr *msg, char *buf)
+ +{
+ +	union sctp_notification *sn = (union sctp_notification *)buf;
+ +	struct linger linger;
+ +
+ +	switch (sn->sn_header.sn_type) {
+ +	case SCTP_SEND_FAILED:
+ +		retry_failed_sctp_send(con, &sn->sn_send_failed, buf);
+ +		break;
+ +	case SCTP_ASSOC_CHANGE:
+ +		switch (sn->sn_assoc_change.sac_state) {
+ +		case SCTP_COMM_UP:
+ +		case SCTP_RESTART:
+ +		{
+ +			/* Check that the new node is in the lockspace */
+ +			struct sctp_prim prim;
+ +			int nodeid;
+ +			int prim_len, ret;
+ +			int addr_len;
+ +			struct connection *new_con;
+ +
+ +			/*
+ +			 * We get this before any data for an association.
+ +			 * We verify that the node is in the cluster and
+ +			 * then peel off a socket for it.
+ +			 */
+ +			if ((int)sn->sn_assoc_change.sac_assoc_id <= 0) {
+ +				log_print("COMM_UP for invalid assoc ID %d",
+ +					 (int)sn->sn_assoc_change.sac_assoc_id);
+ +				sctp_init_failed();
+ +				return;
+ +			}
+ +			memset(&prim, 0, sizeof(struct sctp_prim));
+ +			prim_len = sizeof(struct sctp_prim);
+ +			prim.ssp_assoc_id = sn->sn_assoc_change.sac_assoc_id;
+ +
+ +			ret = kernel_getsockopt(con->sock,
+ +						IPPROTO_SCTP,
+ +						SCTP_PRIMARY_ADDR,
+ +						(char*)&prim,
+ +						&prim_len);
+ +			if (ret < 0) {
+ +				log_print("getsockopt/sctp_primary_addr on "
+ +					  "new assoc %d failed : %d",
+ +					  (int)sn->sn_assoc_change.sac_assoc_id,
+ +					  ret);
+ +
+ +				/* Retry INIT later */
+ +				new_con = assoc2con(sn->sn_assoc_change.sac_assoc_id);
+ +				if (new_con)
+ +					clear_bit(CF_CONNECT_PENDING, &con->flags);
+ +				return;
+ +			}
+ +			make_sockaddr(&prim.ssp_addr, 0, &addr_len);
+ +			if (addr_to_nodeid(&prim.ssp_addr, &nodeid)) {
+ +				unsigned char *b=(unsigned char *)&prim.ssp_addr;
+ +				log_print("reject connect from unknown addr");
+ +				print_hex_dump_bytes("ss: ", DUMP_PREFIX_NONE, 
+ +						     b, sizeof(struct sockaddr_storage));
+ +				sctp_send_shutdown(prim.ssp_assoc_id);
+ +				return;
+ +			}
+ +
+ +			new_con = nodeid2con(nodeid, GFP_NOFS);
+ +			if (!new_con)
+ +				return;
+ +
+ +			if (new_con->sock) {
+ +				log_print("reject connect from node %d: "
+ +					  "already has a connection.",
+ +					  nodeid);
+ +				sctp_send_shutdown(prim.ssp_assoc_id);
+ +				return;
+ +			}
+ +
+ +			/* Peel off a new sock */
+ +			sctp_lock_sock(con->sock->sk);
+ +			ret = sctp_do_peeloff(con->sock->sk,
+ +				sn->sn_assoc_change.sac_assoc_id,
+ +				&new_con->sock);
+ +			sctp_release_sock(con->sock->sk);
+ +			if (ret < 0) {
+ +				log_print("Can't peel off a socket for "
+ +					  "connection %d to node %d: err=%d",
+ +					  (int)sn->sn_assoc_change.sac_assoc_id,
+ +					  nodeid, ret);
+ +				return;
+ +			}
+ +			add_sock(new_con->sock, new_con);
+ +
+ +			linger.l_onoff = 1;
+ +			linger.l_linger = 0;
+ +			ret = kernel_setsockopt(new_con->sock, SOL_SOCKET, SO_LINGER,
+ +						(char *)&linger, sizeof(linger));
+ +			if (ret < 0)
+ +				log_print("set socket option SO_LINGER failed");
+ +
+ +			log_print("connecting to %d sctp association %d",
+ +				 nodeid, (int)sn->sn_assoc_change.sac_assoc_id);
+ +
+ +			new_con->sctp_assoc = sn->sn_assoc_change.sac_assoc_id;
+ +			/* Send any pending writes */
+ +			clear_bit(CF_CONNECT_PENDING, &new_con->flags);
+ +			clear_bit(CF_INIT_PENDING, &new_con->flags);
+ +			if (!test_and_set_bit(CF_WRITE_PENDING, &new_con->flags)) {
+ +				queue_work(send_workqueue, &new_con->swork);
+ +			}
+ +			if (!test_and_set_bit(CF_READ_PENDING, &new_con->flags))
+ +				queue_work(recv_workqueue, &new_con->rwork);
+ +		}
+ +		break;
+ +
+ +		case SCTP_COMM_LOST:
+ +		case SCTP_SHUTDOWN_COMP:
+ +		{
+ +			con = assoc2con(sn->sn_assoc_change.sac_assoc_id);
+ +			if (con) {
+ +				con->sctp_assoc = 0;
+ +			}
+ +		}
+ +		break;
+ +
+ +		case SCTP_CANT_STR_ASSOC:
+ +		{
+ +			/* Will retry init when we get the send failed notification */
+ +			log_print("Can't start SCTP association - retrying");
+ +		}
+ +		break;
+ +
+ +		default:
+ +			log_print("unexpected SCTP assoc change id=%d state=%d",
+ +				  (int)sn->sn_assoc_change.sac_assoc_id,
+ +				  sn->sn_assoc_change.sac_state);
+ +		}
+ +	default:
+ +		; /* fall through */
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> ee44b4bc054a (dlm: use sctp 1-to-1 API)
+  /* Data received from remote end */
+  static int receive_from_sock(struct connection *con)
+  {
+@@@ -1090,81 -931,92 +1220,107 @@@ static int sctp_bind_addrs(struct conne
+     peeled-off socket for this association, so we use the listening socket
+     and add the primary IP address of the remote node.
+   */
+- static void sctp_init_assoc(struct connection *con)
++ static void sctp_connect_to_sock(struct connection *con)
+  {
+- 	struct sockaddr_storage rem_addr;
+- 	char outcmsg[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
+- 	struct msghdr outmessage;
+- 	struct cmsghdr *cmsg;
+- 	struct sctp_sndrcvinfo *sinfo;
+- 	struct connection *base_con;
+- 	struct writequeue_entry *e;
+- 	int len, offset;
+- 	int ret;
+- 	int addrlen;
+- 	struct kvec iov[1];
+- 
+- 	mutex_lock(&con->sock_mutex);
+- 	if (test_and_set_bit(CF_INIT_PENDING, &con->flags))
+- 		goto unlock;
++ 	struct sockaddr_storage daddr;
++ 	int one = 1;
++ 	int result;
++ 	int addr_len;
++ 	struct socket *sock;
+  
+- 	if (nodeid_to_addr(con->nodeid, NULL, (struct sockaddr *)&rem_addr)) {
+- 		log_print("no address for nodeid %d", con->nodeid);
+- 		goto unlock;
++ 	if (con->nodeid == 0) {
++ 		log_print("attempt to connect sock 0 foiled");
++ 		return;
+  	}
+- 	base_con = nodeid2con(0, 0);
+- 	BUG_ON(base_con == NULL);
+  
+- 	make_sockaddr(&rem_addr, dlm_config.ci_tcp_port, &addrlen);
++ 	mutex_lock(&con->sock_mutex);
+  
+- 	outmessage.msg_name = &rem_addr;
+- 	outmessage.msg_namelen = addrlen;
+- 	outmessage.msg_control = outcmsg;
+- 	outmessage.msg_controllen = sizeof(outcmsg);
+- 	outmessage.msg_flags = MSG_EOR;
+++<<<<<<< HEAD
+++	if (nodeid_to_addr(con->nodeid, NULL, (struct sockaddr *)&rem_addr)) {
+++=======
++ 	/* Some odd races can cause double-connects, ignore them */
++ 	if (con->retries++ > MAX_CONNECT_RETRIES)
++ 		goto out;
+  
+- 	spin_lock(&con->writequeue_lock);
++ 	if (con->sock) {
++ 		log_print("node %d already connected.", con->nodeid);
++ 		goto out;
++ 	}
+  
+- 	if (list_empty(&con->writequeue)) {
+- 		spin_unlock(&con->writequeue_lock);
+- 		log_print("writequeue empty for nodeid %d", con->nodeid);
+- 		goto unlock;
++ 	memset(&daddr, 0, sizeof(daddr));
++ 	result = nodeid_to_addr(con->nodeid, &daddr, NULL, true);
++ 	if (result < 0) {
+++>>>>>>> ee44b4bc054a (dlm: use sctp 1-to-1 API)
++ 		log_print("no address for nodeid %d", con->nodeid);
++ 		goto out;
+  	}
+  
+- 	e = list_first_entry(&con->writequeue, struct writequeue_entry, list);
+- 	len = e->len;
+- 	offset = e->offset;
++ 	/* Create a socket to communicate with */
++ 	result = sock_create_kern(&init_net, dlm_local_addr[0]->ss_family,
++ 				  SOCK_STREAM, IPPROTO_SCTP, &sock);
++ 	if (result < 0)
++ 		goto socket_err;
+  
+- 	/* Send the first block off the write queue */
+- 	iov[0].iov_base = page_address(e->page)+offset;
+- 	iov[0].iov_len = len;
+- 	spin_unlock(&con->writequeue_lock);
++ 	sock->sk->sk_user_data = con;
++ 	con->rx_action = receive_from_sock;
++ 	con->connect_action = sctp_connect_to_sock;
++ 	add_sock(sock, con);
+  
+++<<<<<<< HEAD
+ +	cmsg = CMSG_FIRSTHDR(&outmessage);
+ +	cmsg->cmsg_level = IPPROTO_SCTP;
+ +	cmsg->cmsg_type = SCTP_SNDRCV;
+ +	cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndrcvinfo));
+ +	sinfo = CMSG_DATA(cmsg);
+ +	memset(sinfo, 0x00, sizeof(struct sctp_sndrcvinfo));
+ +	sinfo->sinfo_ppid = cpu_to_le32(con->nodeid);
+ +	outmessage.msg_controllen = cmsg->cmsg_len;
+++=======
++ 	/* Bind to all addresses. */
++ 	if (sctp_bind_addrs(con, 0))
++ 		goto bind_err;
+  
+- 	ret = kernel_sendmsg(base_con->sock, &outmessage, iov, 1, len);
+- 	if (ret < 0) {
+- 		log_print("Send first packet to node %d failed: %d",
+- 			  con->nodeid, ret);
++ 	make_sockaddr(&daddr, dlm_config.ci_tcp_port, &addr_len);
+++>>>>>>> ee44b4bc054a (dlm: use sctp 1-to-1 API)
+  
+- 		/* Try again later */
++ 	log_print("connecting to %d", con->nodeid);
++ 
++ 	/* Turn off Nagle's algorithm */
++ 	kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY, (char *)&one,
++ 			  sizeof(one));
++ 
++ 	result = sock->ops->connect(sock, (struct sockaddr *)&daddr, addr_len,
++ 				   O_NONBLOCK);
++ 	if (result == -EINPROGRESS)
++ 		result = 0;
++ 	if (result == 0)
++ 		goto out;
++ 
++ 
++ bind_err:
++ 	con->sock = NULL;
++ 	sock_release(sock);
++ 
++ socket_err:
++ 	/*
++ 	 * Some errors are fatal and this list might need adjusting. For other
++ 	 * errors we try again until the max number of retries is reached.
++ 	 */
++ 	if (result != -EHOSTUNREACH &&
++ 	    result != -ENETUNREACH &&
++ 	    result != -ENETDOWN &&
++ 	    result != -EINVAL &&
++ 	    result != -EPROTONOSUPPORT) {
++ 		log_print("connect %d try %d error %d", con->nodeid,
++ 			  con->retries, result);
++ 		mutex_unlock(&con->sock_mutex);
++ 		msleep(1000);
+  		clear_bit(CF_CONNECT_PENDING, &con->flags);
+- 		clear_bit(CF_INIT_PENDING, &con->flags);
+- 	}
+- 	else {
+- 		spin_lock(&con->writequeue_lock);
+- 		writequeue_entry_complete(e, ret);
+- 		spin_unlock(&con->writequeue_lock);
++ 		lowcomms_connect_sock(con);
++ 		return;
+  	}
+  
+- unlock:
++ out:
+  	mutex_unlock(&con->sock_mutex);
+  }
+  
+@@@ -1384,8 -1210,8 +1514,13 @@@ static int sctp_listen_for_all(void
+  
+  	log_print("Using SCTP for communications");
+  
+++<<<<<<< HEAD
+ +	result = sock_create_kern(dlm_local_addr[0]->ss_family, SOCK_SEQPACKET,
+ +				  IPPROTO_SCTP, &sock);
+++=======
++ 	result = sock_create_kern(&init_net, dlm_local_addr[0]->ss_family,
++ 				  SOCK_STREAM, IPPROTO_SCTP, &sock);
+++>>>>>>> ee44b4bc054a (dlm: use sctp 1-to-1 API)
+  	if (result < 0) {
+  		log_print("Can't create comms socket, check SCTP is loaded");
+  		goto out;
+* Unmerged path fs/dlm/lowcomms.c
