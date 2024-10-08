@@ -1,0 +1,377 @@
+IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Harish Chegondi <harish.chegondi@intel.com>
+commit 1cefc2cd20f1d2b4e84bba14d5a5bf5d44936dc6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1cefc2cd.failed
+
+Add calls to rcu_read_lock()/rcu_read_unlock() as rvt_lookup_qpn callers
+must hold the rcu_read_lock before calling and keep the lock until the
+returned qp is no longer in use.
+
+Remove lookaside qp and some qp refcount atomics in the sdma send code
+that is redundant with the s_dma_busy refcount, which will also stall
+the state processing to the reset state.
+
+Change the qpn hash function to hash_32 which is hash function used
+in rvt_lookup_qpn. qpn_hash function would be eliminated in later patches.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 1cefc2cd20f1d2b4e84bba14d5a5bf5d44936dc6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qib/qib.h
+#	drivers/infiniband/hw/qib/qib_driver.c
+#	drivers/infiniband/hw/qib/qib_qp.c
+#	drivers/infiniband/hw/qib/qib_ruc.c
+#	drivers/infiniband/hw/qib/qib_ud.c
+#	drivers/infiniband/hw/qib/qib_verbs.h
+diff --cc drivers/infiniband/hw/qib/qib.h
+index 2c9672d7da79,751c9d79afd2..000000000000
+--- a/drivers/infiniband/hw/qib/qib.h
++++ b/drivers/infiniband/hw/qib/qib.h
+@@@ -230,9 -230,6 +230,12 @@@ struct qib_ctxtdata 
+  	u8 redirect_seq_cnt;
+  	/* ctxt rcvhdrq head offset */
+  	u32 head;
+++<<<<<<< HEAD
+ +	/* lookaside fields */
+ +	struct qib_qp *lookaside_qp;
+ +	u32 lookaside_qpn;
+++=======
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  	/* QPs waiting for context processing */
+  	struct list_head qp_wait_list;
+  #ifdef CONFIG_DEBUG_FS
+diff --cc drivers/infiniband/hw/qib/qib_driver.c
+index 323352f4bb60,707d789d0b67..000000000000
+--- a/drivers/infiniband/hw/qib/qib_driver.c
++++ b/drivers/infiniband/hw/qib/qib_driver.c
+@@@ -322,7 -322,9 +322,13 @@@ static u32 qib_rcv_hdrerr(struct qib_ct
+  		struct qib_ib_header *hdr = (struct qib_ib_header *) rhdr;
+  		struct qib_other_headers *ohdr = NULL;
+  		struct qib_ibport *ibp = &ppd->ibport_data;
+++<<<<<<< HEAD
+ +		struct qib_qp *qp = NULL;
+++=======
++ 		struct qib_devdata *dd = ppd->dd;
++ 		struct rvt_dev_info *rdi = &dd->verbs_dev.rdi;
++ 		struct rvt_qp *qp = NULL;
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  		u32 tlen = qib_hdrget_length_in_bytes(rhf_addr);
+  		u16 lid  = be16_to_cpu(hdr->lrh[1]);
+  		int lnh = be16_to_cpu(hdr->lrh[0]) & 3;
+diff --cc drivers/infiniband/hw/qib/qib_qp.c
+index cf1dd6e9d434,8508e69f530c..000000000000
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@@ -212,8 -220,7 +211,12 @@@ static void free_qpn(struct qib_qpn_tab
+  
+  static inline unsigned qpn_hash(struct qib_ibdev *dev, u32 qpn)
+  {
+++<<<<<<< HEAD
+ +	return jhash_1word(qpn, dev->qp_rnd) &
+ +		(dev->qp_table_size - 1);
+++=======
++ 	return hash_32(qpn, dev->rdi.qp_dev->qp_table_bits);
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  }
+  
+  
+@@@ -279,10 -288,11 +282,11 @@@ static void remove_qp(struct qib_ibdev 
+  			}
+  	}
+  
+ -	spin_unlock_irqrestore(&dev->rdi.qp_dev->qpt_lock, flags);
+ +	spin_unlock_irqrestore(&dev->qpt_lock, flags);
+  	if (removed) {
+  		synchronize_rcu();
+- 		atomic_dec(&qp->refcount);
++ 		if (atomic_dec_and_test(&qp->refcount))
++ 			wake_up(&qp->wait);
+  	}
+  }
+  
+@@@ -329,95 -319,14 +333,99 @@@ unsigned qib_free_all_qps(struct qib_de
+  	return qp_inuse;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * qib_lookup_qpn - return the QP with the given QPN
+ + * @qpt: the QP table
+ + * @qpn: the QP number to look up
+ + *
+ + * The caller is responsible for decrementing the QP reference count
+ + * when done.
+ + */
+ +struct qib_qp *qib_lookup_qpn(struct qib_ibport *ibp, u32 qpn)
+ +{
+ +	struct qib_qp *qp = NULL;
+ +
+ +	rcu_read_lock();
+ +	if (unlikely(qpn <= 1)) {
+ +		if (qpn == 0)
+ +			qp = rcu_dereference(ibp->qp0);
+ +		else
+ +			qp = rcu_dereference(ibp->qp1);
+ +		if (qp)
+ +			atomic_inc(&qp->refcount);
+ +	} else {
+ +		struct qib_ibdev *dev = &ppd_from_ibp(ibp)->dd->verbs_dev;
+ +		unsigned n = qpn_hash(dev, qpn);
+ +
+ +		for (qp = rcu_dereference(dev->qp_table[n]); qp;
+ +			qp = rcu_dereference(qp->next))
+ +			if (qp->ibqp.qp_num == qpn) {
+ +				atomic_inc(&qp->refcount);
+ +				break;
+ +			}
+ +	}
+ +	rcu_read_unlock();
+ +	return qp;
+ +}
+ +
+ +/**
+ + * qib_reset_qp - initialize the QP state to the reset state
+ + * @qp: the QP to reset
+ + * @type: the QP type
+ + */
+ +static void qib_reset_qp(struct qib_qp *qp, enum ib_qp_type type)
+++=======
++ void notify_qp_reset(struct rvt_qp *qp)
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  {
+  	struct qib_qp_priv *priv = qp->priv;
+ -
+ +	qp->remote_qpn = 0;
+ +	qp->qkey = 0;
+ +	qp->qp_access_flags = 0;
+  	atomic_set(&priv->s_dma_busy, 0);
+ +	qp->s_flags &= QIB_S_SIGNAL_REQ_WR;
+ +	qp->s_hdrwords = 0;
+ +	qp->s_wqe = NULL;
+ +	qp->s_draining = 0;
+ +	qp->s_next_psn = 0;
+ +	qp->s_last_psn = 0;
+ +	qp->s_sending_psn = 0;
+ +	qp->s_sending_hpsn = 0;
+ +	qp->s_psn = 0;
+ +	qp->r_psn = 0;
+ +	qp->r_msn = 0;
+ +	if (type == IB_QPT_RC) {
+ +		qp->s_state = IB_OPCODE_RC_SEND_LAST;
+ +		qp->r_state = IB_OPCODE_RC_SEND_LAST;
+ +	} else {
+ +		qp->s_state = IB_OPCODE_UC_SEND_LAST;
+ +		qp->r_state = IB_OPCODE_UC_SEND_LAST;
+ +	}
+ +	qp->s_ack_state = IB_OPCODE_RC_ACKNOWLEDGE;
+ +	qp->r_nak_state = 0;
+ +	qp->r_aflags = 0;
+ +	qp->r_flags = 0;
+ +	qp->s_head = 0;
+ +	qp->s_tail = 0;
+ +	qp->s_cur = 0;
+ +	qp->s_acked = 0;
+ +	qp->s_last = 0;
+ +	qp->s_ssn = 1;
+ +	qp->s_lsn = 0;
+ +	qp->s_mig_state = IB_MIG_MIGRATED;
+ +	memset(qp->s_ack_queue, 0, sizeof(qp->s_ack_queue));
+ +	qp->r_head_ack_queue = 0;
+ +	qp->s_tail_ack_queue = 0;
+ +	qp->s_num_rd_atomic = 0;
+ +	if (qp->r_rq.wq) {
+ +		qp->r_rq.wq->head = 0;
+ +		qp->r_rq.wq->tail = 0;
+ +	}
+ +	qp->r_sge.num_sge = 0;
+  }
+  
+ -static void clear_mr_refs(struct rvt_qp *qp, int clr_sends)
+ +static void clear_mr_refs(struct qib_qp *qp, int clr_sends)
+  {
+  	unsigned n;
+  
+diff --cc drivers/infiniband/hw/qib/qib_ruc.c
+index e9132f7a68b0,e1d1a1511a38..000000000000
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@@ -353,12 -355,15 +353,21 @@@ err
+   * receive interrupts since this is a connected protocol and all packets
+   * will pass through here.
+   */
+ -static void qib_ruc_loopback(struct rvt_qp *sqp)
+ +static void qib_ruc_loopback(struct qib_qp *sqp)
+  {
+  	struct qib_ibport *ibp = to_iport(sqp->ibqp.device, sqp->port_num);
+++<<<<<<< HEAD
+ +	struct qib_qp *qp;
+ +	struct qib_swqe *wqe;
+ +	struct qib_sge *sge;
+++=======
++ 	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
++ 	struct qib_devdata *dd = ppd->dd;
++ 	struct rvt_dev_info *rdi = &dd->verbs_dev.rdi;
++ 	struct rvt_qp *qp;
++ 	struct rvt_swqe *wqe;
++ 	struct rvt_sge *sge;
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  	unsigned long flags;
+  	struct ib_wc wc;
+  	u64 sdata;
+diff --cc drivers/infiniband/hw/qib/qib_ud.c
+index 75faa5bd8dd6,98bccb549d3a..000000000000
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@@ -46,22 -47,26 +46,37 @@@
+   * Note that the receive interrupt handler may be calling qib_ud_rcv()
+   * while this is being called.
+   */
+ -static void qib_ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ +static void qib_ud_loopback(struct qib_qp *sqp, struct qib_swqe *swqe)
+  {
+  	struct qib_ibport *ibp = to_iport(sqp->ibqp.device, sqp->port_num);
+++<<<<<<< HEAD
+ +	struct qib_pportdata *ppd;
+ +	struct qib_qp *qp;
+++=======
++ 	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
++ 	struct qib_devdata *dd = ppd->dd;
++ 	struct rvt_dev_info *rdi = &dd->verbs_dev.rdi;
++ 	struct rvt_qp *qp;
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  	struct ib_ah_attr *ah_attr;
+  	unsigned long flags;
+ -	struct rvt_sge_state ssge;
+ -	struct rvt_sge *sge;
+ +	struct qib_sge_state ssge;
+ +	struct qib_sge *sge;
+  	struct ib_wc wc;
+  	u32 length;
+  	enum ib_qp_type sqptype, dqptype;
+  
+++<<<<<<< HEAD
+ +	qp = qib_lookup_qpn(ibp, swqe->wr.wr.ud.remote_qpn);
+ +	if (!qp) {
+ +		ibp->n_pkt_drops++;
+++=======
++ 	rcu_read_lock();
++ 	qp = rvt_lookup_qpn(rdi, &ibp->rvp, swqe->ud_wr.remote_qpn);
++ 	if (!qp) {
++ 		ibp->rvp.n_pkt_drops++;
++ 		rcu_read_unlock();
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  		return;
+  	}
+  
+diff --cc drivers/infiniband/hw/qib/qib_verbs.h
+index ca366073af4f,6ad924fe0118..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@@ -913,23 -357,11 +913,26 @@@ int qib_snapshot_counters(struct qib_pp
+  int qib_get_counters(struct qib_pportdata *ppd,
+  		     struct qib_verbs_counters *cntrs);
+  
+ -__be32 qib_compute_aeth(struct rvt_qp *qp);
+ +int qib_multicast_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid);
+ +
+++<<<<<<< HEAD
+ +int qib_multicast_detach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid);
+ +
+ +int qib_mcast_tree_empty(struct qib_ibport *ibp);
+ +
+ +__be32 qib_compute_aeth(struct qib_qp *qp);
+  
+ +struct qib_qp *qib_lookup_qpn(struct qib_ibport *ibp, u32 qpn);
+ +
+ +struct ib_qp *qib_create_qp(struct ib_pd *ibpd,
+ +			    struct ib_qp_init_attr *init_attr,
+ +			    struct ib_udata *udata);
+ +
+++=======
+++>>>>>>> 1cefc2cd20f1 (IB/qib: Remove qib_lookup_qpn and use rvt_lookup_qpn instead)
+  int qib_destroy_qp(struct ib_qp *ibqp);
+  
+ -int qib_error_qp(struct rvt_qp *qp, enum ib_wc_status err);
+ +int qib_error_qp(struct qib_qp *qp, enum ib_wc_status err);
+  
+  int qib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+  		  int attr_mask, struct ib_udata *udata);
+* Unmerged path drivers/infiniband/hw/qib/qib.h
+* Unmerged path drivers/infiniband/hw/qib/qib_driver.c
+* Unmerged path drivers/infiniband/hw/qib/qib_qp.c
+* Unmerged path drivers/infiniband/hw/qib/qib_ruc.c
+* Unmerged path drivers/infiniband/hw/qib/qib_ud.c
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.c b/drivers/infiniband/hw/qib/qib_verbs.c
+index c4417a1f33be..9a895f00a9e6 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@ -613,6 +613,8 @@ void qib_ib_rcv(struct qib_ctxtdata *rcd, void *rhdr, void *data, u32 tlen)
+ 	struct qib_pportdata *ppd = rcd->ppd;
+ 	struct qib_ibport *ibp = &ppd->ibport_data;
+ 	struct qib_ib_header *hdr = rhdr;
++	struct qib_devdata *dd = ppd->dd;
++	struct rvt_dev_info *rdi = &dd->verbs_dev.rdi;
+ 	struct qib_other_headers *ohdr;
+ 	struct qib_qp *qp;
+ 	u32 qp_num;
+@@ -675,25 +677,15 @@ void qib_ib_rcv(struct qib_ctxtdata *rcd, void *rhdr, void *data, u32 tlen)
+ 		if (atomic_dec_return(&mcast->refcount) <= 1)
+ 			wake_up(&mcast->wait);
+ 	} else {
+-		if (rcd->lookaside_qp) {
+-			if (rcd->lookaside_qpn != qp_num) {
+-				if (atomic_dec_and_test(
+-					&rcd->lookaside_qp->refcount))
+-					wake_up(
+-					 &rcd->lookaside_qp->wait);
+-				rcd->lookaside_qp = NULL;
+-			}
++		rcu_read_lock();
++		qp = rvt_lookup_qpn(rdi, &ibp->rvp, qp_num);
++		if (!qp) {
++			rcu_read_unlock();
++			goto drop;
+ 		}
+-		if (!rcd->lookaside_qp) {
+-			qp = qib_lookup_qpn(ibp, qp_num);
+-			if (!qp)
+-				goto drop;
+-			rcd->lookaside_qp = qp;
+-			rcd->lookaside_qpn = qp_num;
+-		} else
+-			qp = rcd->lookaside_qp;
+ 		this_cpu_inc(ibp->pmastats->n_unicast_rcv);
+ 		qib_qp_rcv(rcd, hdr, lnh == QIB_LRH_GRH, data, tlen, qp);
++		rcu_read_unlock();
+ 	}
+ 	return;
+ 
+@@ -993,8 +985,6 @@ void qib_put_txreq(struct qib_verbs_txreq *tx)
+ 	qp = tx->qp;
+ 	dev = to_idev(qp->ibqp.device);
+ 
+-	if (atomic_dec_and_test(&qp->refcount))
+-		wake_up(&qp->wait);
+ 	if (tx->mr) {
+ 		qib_put_mr(tx->mr);
+ 		tx->mr = NULL;
+@@ -1175,7 +1165,6 @@ static int qib_verbs_send_dma(struct qib_qp *qp, struct qib_ib_header *hdr,
+ 	control = dd->f_setpbc_control(ppd, plen, qp->s_srate,
+ 				       be16_to_cpu(hdr->lrh[0]) >> 12);
+ 	tx->qp = qp;
+-	atomic_inc(&qp->refcount);
+ 	tx->wqe = qp->s_wqe;
+ 	tx->mr = qp->s_rdma_mr;
+ 	if (qp->s_rdma_mr)
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.h
