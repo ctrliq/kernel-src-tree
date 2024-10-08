@@ -1,0 +1,268 @@
+qla2xxx: Prevent removal and board_disable race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Joe Lawrence <joe.lawrence@stratus.com>
+commit beb9e315e6e0d8d1d7d3a79d2e5d4664aa8f8796
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/beb9e315.failed
+
+Introduce mutual exclusion between the qla2xxx_remove_one PCI driver
+callback and qla2x00_disable_board_on_pci_error, which is scheduled as
+board_disable work by qla2x00_check_reg{32,16}_for_disconnect:
+
+* Leave the driver-specific data attached to the underlying PCI device
+intact in qla2x00_disable_board_on_pci_error, so that qla2x00_remove_one
+has enough breadcrumbs to determine that any board_disable work has been
+completed.
+
+* In qla2xxx_remove_one, set a bit to prevent any subsequent
+board_disable work from scheduling, then cancel and wait until pending
+work has completed.
+
+* Reuse the PCI device enable count check in qla2x00_remove_one to
+determine if board_disable has occured. The original purpose of this
+check was unnecessary since the driver remove function wasn't called
+when the probe fails.
+
+	Signed-off-by: Joe Lawrence <joe.lawrence@stratus.com>
+	Acked-by: Chad Dupuis <chad.dupuis@qlogic.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit beb9e315e6e0d8d1d7d3a79d2e5d4664aa8f8796)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_isr.c
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 1322f35afaab,13988180a48c..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -3504,6 -3402,10 +3504,13 @@@ typedef struct scsi_qla_host 
+  #define FX00_CRITEMP_RECOVERY	25
+  #define FX00_HOST_INFO_RESEND	26
+  
+++<<<<<<< HEAD
+++=======
++ 	unsigned long	pci_flags;
++ #define PFLG_DISCONNECTED	0	/* PCI device removed */
++ #define PFLG_DRIVER_REMOVING	1	/* PCI driver .remove */
++ 
+++>>>>>>> beb9e315e6e0 (qla2xxx: Prevent removal and board_disable race)
+  	uint32_t	device_flags;
+  #define SWITCH_FOUND		BIT_0
+  #define DFLG_NO_CABLE		BIT_1
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index f12cf90f18f9,341c64daa959..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -110,6 -112,31 +110,34 @@@ qla2100_intr_handler(int irq, void *dev
+  	return (IRQ_HANDLED);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool
++ qla2x00_check_reg32_for_disconnect(scsi_qla_host_t *vha, uint32_t reg)
++ {
++ 	/* Check for PCI disconnection */
++ 	if (reg == 0xffffffff) {
++ 		if (!test_and_set_bit(PFLG_DISCONNECTED, &vha->pci_flags) &&
++ 		    !test_bit(PFLG_DRIVER_REMOVING, &vha->pci_flags)) {
++ 			/*
++ 			 * Schedule this (only once) on the default system
++ 			 * workqueue so that all the adapter workqueues and the
++ 			 * DPC thread can be shutdown cleanly.
++ 			 */
++ 			schedule_work(&vha->hw->board_disable);
++ 		}
++ 		return true;
++ 	} else
++ 		return false;
++ }
++ 
++ bool
++ qla2x00_check_reg16_for_disconnect(scsi_qla_host_t *vha, uint16_t reg)
++ {
++ 	return qla2x00_check_reg32_for_disconnect(vha, 0xffff0000 | reg);
++ }
++ 
+++>>>>>>> beb9e315e6e0 (qla2xxx: Prevent removal and board_disable race)
+  /**
+   * qla2300_intr_handler() - Process interrupts for the ISP23xx and ISP63xx.
+   * @irq:
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index be94eef42519,84d4df6e6221..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -3175,8 -3109,95 +3175,93 @@@ qla2x00_remove_one(struct pci_dev *pdev
+  		if ((IS_QLA83XX(ha) || IS_QLA27XX(ha)) && ha->msixbase)
+  			iounmap(ha->msixbase);
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static void
++ qla2x00_clear_drv_active(struct qla_hw_data *ha)
++ {
++ 	if (IS_QLA8044(ha)) {
++ 		qla8044_idc_lock(ha);
++ 		qla8044_clear_drv_active(ha);
++ 		qla8044_idc_unlock(ha);
++ 	} else if (IS_QLA82XX(ha)) {
++ 		qla82xx_idc_lock(ha);
++ 		qla82xx_clear_drv_active(ha);
++ 		qla82xx_idc_unlock(ha);
++ 	}
++ }
++ 
++ static void
++ qla2x00_remove_one(struct pci_dev *pdev)
++ {
++ 	scsi_qla_host_t *base_vha;
++ 	struct qla_hw_data  *ha;
++ 
++ 	base_vha = pci_get_drvdata(pdev);
++ 	ha = base_vha->hw;
++ 
++ 	/* Indicate device removal to prevent future board_disable and wait
++ 	 * until any pending board_disable has completed. */
++ 	set_bit(PFLG_DRIVER_REMOVING, &base_vha->pci_flags);
++ 	cancel_work_sync(&ha->board_disable);
++ 
++ 	/*
++ 	 * If the PCI device is disabled then there was a PCI-disconnect and
++ 	 * qla2x00_disable_board_on_pci_error has taken care of most of the
++ 	 * resources.
++ 	 */
++ 	if (!atomic_read(&pdev->enable_cnt)) {
++ 		scsi_host_put(base_vha->host);
++ 		kfree(ha);
++ 		pci_set_drvdata(pdev, NULL);
++ 		return;
++ 	}
++ 
++ 	qla2x00_wait_for_hba_ready(base_vha);
++ 
++ 	set_bit(UNLOADING, &base_vha->dpc_flags);
++ 
++ 	if (IS_QLAFX00(ha))
++ 		qlafx00_driver_shutdown(base_vha, 20);
++ 
++ 	qla2x00_delete_all_vps(ha, base_vha);
++ 
++ 	if (IS_QLA8031(ha)) {
++ 		ql_dbg(ql_dbg_p3p, base_vha, 0xb07e,
++ 		    "Clearing fcoe driver presence.\n");
++ 		if (qla83xx_clear_drv_presence(base_vha) != QLA_SUCCESS)
++ 			ql_dbg(ql_dbg_p3p, base_vha, 0xb079,
++ 			    "Error while clearing DRV-Presence.\n");
++ 	}
++ 
++ 	qla2x00_abort_all_cmds(base_vha, DID_NO_CONNECT << 16);
++ 
++ 	qla2x00_dfs_remove(base_vha);
++ 
++ 	qla84xx_put_chip(base_vha);
++ 
++ 	/* Disable timer */
++ 	if (base_vha->timer_active)
++ 		qla2x00_stop_timer(base_vha);
++ 
++ 	base_vha->flags.online = 0;
++ 
++ 	qla2x00_destroy_deferred_work(ha);
++ 
++ 	qlt_remove_target(ha, base_vha);
++ 
++ 	qla2x00_free_sysfs_attr(base_vha, true);
++ 
++ 	fc_remove_host(base_vha->host);
++ 
++ 	scsi_remove_host(base_vha->host);
++ 
++ 	qla2x00_free_device(base_vha);
+++>>>>>>> beb9e315e6e0 (qla2xxx: Prevent removal and board_disable race)
+  
+  	scsi_host_put(base_vha->host);
+ -
+ -	qla2x00_clear_drv_active(ha);
+ -
+ -	qla2x00_unmap_iobases(ha);
+ -
+  	pci_release_selected_regions(ha->pdev, ha->bars);
+  	kfree(ha);
+  	ha = NULL;
+@@@ -4745,6 -4763,63 +4830,66 @@@ exit
+  	return rval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void
++ qla2x00_disable_board_on_pci_error(struct work_struct *work)
++ {
++ 	struct qla_hw_data *ha = container_of(work, struct qla_hw_data,
++ 	    board_disable);
++ 	struct pci_dev *pdev = ha->pdev;
++ 	scsi_qla_host_t *base_vha = pci_get_drvdata(ha->pdev);
++ 
++ 	ql_log(ql_log_warn, base_vha, 0x015b,
++ 	    "Disabling adapter.\n");
++ 
++ 	set_bit(UNLOADING, &base_vha->dpc_flags);
++ 
++ 	qla2x00_delete_all_vps(ha, base_vha);
++ 
++ 	qla2x00_abort_all_cmds(base_vha, DID_NO_CONNECT << 16);
++ 
++ 	qla2x00_dfs_remove(base_vha);
++ 
++ 	qla84xx_put_chip(base_vha);
++ 
++ 	if (base_vha->timer_active)
++ 		qla2x00_stop_timer(base_vha);
++ 
++ 	base_vha->flags.online = 0;
++ 
++ 	qla2x00_destroy_deferred_work(ha);
++ 
++ 	/*
++ 	 * Do not try to stop beacon blink as it will issue a mailbox
++ 	 * command.
++ 	 */
++ 	qla2x00_free_sysfs_attr(base_vha, false);
++ 
++ 	fc_remove_host(base_vha->host);
++ 
++ 	scsi_remove_host(base_vha->host);
++ 
++ 	base_vha->flags.init_done = 0;
++ 	qla25xx_delete_queues(base_vha);
++ 	qla2x00_free_irqs(base_vha);
++ 	qla2x00_free_fcports(base_vha);
++ 	qla2x00_mem_free(ha);
++ 	qla82xx_md_free(base_vha);
++ 	qla2x00_free_queues(ha);
++ 
++ 	qla2x00_unmap_iobases(ha);
++ 
++ 	pci_release_selected_regions(ha->pdev, ha->bars);
++ 	pci_disable_pcie_error_reporting(pdev);
++ 	pci_disable_device(pdev);
++ 
++ 	/*
++ 	 * Let qla2x00_remove_one cleanup qla_hw_data on device removal.
++ 	 */
++ }
++ 
+++>>>>>>> beb9e315e6e0 (qla2xxx: Prevent removal and board_disable race)
+  /**************************************************************************
+  * qla2x00_do_dpc
+  *   This kernel thread is a task that is schedule by the interrupt handler
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
