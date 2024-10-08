@@ -1,0 +1,190 @@
+virtio-mmio: Update the device to OASIS spec version
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Pawel Moll <pawel.moll@arm.com>
+commit 1862ee22ce2e28087299aebb6556a5cdc122d0ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1862ee22.failed
+
+This patch add a support for second version of the virtio-mmio device,
+which follows OASIS "Virtual I/O Device (VIRTIO) Version 1.0"
+specification.
+
+Main changes:
+
+1. The control register symbolic names use the new device/driver
+   nomenclature rather than the old guest/host one.
+
+2. The driver detect the device version (version 1 is the pre-OASIS
+   spec, version 2 is compatible with fist revision of the OASIS spec)
+   and drives the device accordingly.
+
+3. New version uses direct addressing (64 bit address split into two
+   low/high register) instead of the guest page size based one,
+   and addresses each part of the queue (descriptors, available, used)
+   separately.
+
+4. The device activity is now explicitly triggered by writing to the
+   "queue ready" register.
+
+5. Whole 64 bit features are properly handled now (both ways).
+
+	Signed-off-by: Pawel Moll <pawel.moll@arm.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+(cherry picked from commit 1862ee22ce2e28087299aebb6556a5cdc122d0ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/virtio/virtio_mmio.c
+diff --cc drivers/virtio/virtio_mmio.c
+index e9fdeb861992,cad569890908..000000000000
+--- a/drivers/virtio/virtio_mmio.c
++++ b/drivers/virtio/virtio_mmio.c
+@@@ -142,29 -112,44 +112,53 @@@ struct virtio_mmio_vq_info 
+  
+  /* Configuration interface */
+  
+ -static u64 vm_get_features(struct virtio_device *vdev)
+ +static u32 vm_get_features(struct virtio_device *vdev)
+  {
+  	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
++ 	u64 features;
+  
+- 	/* TODO: Features > 32 bits */
+- 	writel(0, vm_dev->base + VIRTIO_MMIO_HOST_FEATURES_SEL);
++ 	writel(1, vm_dev->base + VIRTIO_MMIO_DEVICE_FEATURES_SEL);
++ 	features = readl(vm_dev->base + VIRTIO_MMIO_DEVICE_FEATURES);
++ 	features <<= 32;
+  
+- 	return readl(vm_dev->base + VIRTIO_MMIO_HOST_FEATURES);
++ 	writel(0, vm_dev->base + VIRTIO_MMIO_DEVICE_FEATURES_SEL);
++ 	features |= readl(vm_dev->base + VIRTIO_MMIO_DEVICE_FEATURES);
++ 
++ 	return features;
+  }
+  
+ -static int vm_finalize_features(struct virtio_device *vdev)
+ +static void vm_finalize_features(struct virtio_device *vdev)
+  {
+  	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+ +	int i;
+  
+  	/* Give virtio_ring a chance to accept features. */
+  	vring_transport_features(vdev);
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < ARRAY_SIZE(vdev->features); i++) {
+ +		writel(i, vm_dev->base + VIRTIO_MMIO_GUEST_FEATURES_SEL);
+ +		writel(vdev->features[i],
+ +				vm_dev->base + VIRTIO_MMIO_GUEST_FEATURES);
+ +	}
+++=======
++ 	/* Make sure there is are no mixed devices */
++ 	if (vm_dev->version == 2 &&
++ 			!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
++ 		dev_err(&vdev->dev, "New virtio-mmio devices (version 2) must provide VIRTIO_F_VERSION_1 feature!\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	writel(1, vm_dev->base + VIRTIO_MMIO_DRIVER_FEATURES_SEL);
++ 	writel((u32)(vdev->features >> 32),
++ 			vm_dev->base + VIRTIO_MMIO_DRIVER_FEATURES);
++ 
++ 	writel(0, vm_dev->base + VIRTIO_MMIO_DRIVER_FEATURES_SEL);
++ 	writel((u32)vdev->features,
++ 			vm_dev->base + VIRTIO_MMIO_DRIVER_FEATURES);
++ 
++ 	return 0;
+++>>>>>>> 1862ee22ce2e (virtio-mmio: Update the device to OASIS spec version)
+  }
+  
+  static void vm_get(struct virtio_device *vdev, unsigned offset,
+* Unmerged path drivers/virtio/virtio_mmio.c
+diff --git a/include/linux/virtio_mmio.h b/include/linux/virtio_mmio.h
+index 5c7b6f0daef8..c4b09689ab64 100644
+--- a/include/linux/virtio_mmio.h
++++ b/include/linux/virtio_mmio.h
+@@ -51,23 +51,29 @@
+ /* Virtio vendor ID - Read Only */
+ #define VIRTIO_MMIO_VENDOR_ID		0x00c
+ 
+-/* Bitmask of the features supported by the host
++/* Bitmask of the features supported by the device (host)
+  * (32 bits per set) - Read Only */
+-#define VIRTIO_MMIO_HOST_FEATURES	0x010
++#define VIRTIO_MMIO_DEVICE_FEATURES	0x010
+ 
+-/* Host features set selector - Write Only */
+-#define VIRTIO_MMIO_HOST_FEATURES_SEL	0x014
++/* Device (host) features set selector - Write Only */
++#define VIRTIO_MMIO_DEVICE_FEATURES_SEL	0x014
+ 
+-/* Bitmask of features activated by the guest
++/* Bitmask of features activated by the driver (guest)
+  * (32 bits per set) - Write Only */
+-#define VIRTIO_MMIO_GUEST_FEATURES	0x020
++#define VIRTIO_MMIO_DRIVER_FEATURES	0x020
+ 
+ /* Activated features set selector - Write Only */
+-#define VIRTIO_MMIO_GUEST_FEATURES_SEL	0x024
++#define VIRTIO_MMIO_DRIVER_FEATURES_SEL	0x024
++
++
++#ifndef VIRTIO_MMIO_NO_LEGACY /* LEGACY DEVICES ONLY! */
+ 
+ /* Guest's memory page size in bytes - Write Only */
+ #define VIRTIO_MMIO_GUEST_PAGE_SIZE	0x028
+ 
++#endif
++
++
+ /* Queue selector - Write Only */
+ #define VIRTIO_MMIO_QUEUE_SEL		0x030
+ 
+@@ -77,12 +83,21 @@
+ /* Queue size for the currently selected queue - Write Only */
+ #define VIRTIO_MMIO_QUEUE_NUM		0x038
+ 
++
++#ifndef VIRTIO_MMIO_NO_LEGACY /* LEGACY DEVICES ONLY! */
++
+ /* Used Ring alignment for the currently selected queue - Write Only */
+ #define VIRTIO_MMIO_QUEUE_ALIGN		0x03c
+ 
+ /* Guest's PFN for the currently selected queue - Read Write */
+ #define VIRTIO_MMIO_QUEUE_PFN		0x040
+ 
++#endif
++
++
++/* Ready bit for the currently selected queue - Read Write */
++#define VIRTIO_MMIO_QUEUE_READY		0x044
++
+ /* Queue notifier - Write Only */
+ #define VIRTIO_MMIO_QUEUE_NOTIFY	0x050
+ 
+@@ -95,6 +110,21 @@
+ /* Device status register - Read Write */
+ #define VIRTIO_MMIO_STATUS		0x070
+ 
++/* Selected queue's Descriptor Table address, 64 bits in two halves */
++#define VIRTIO_MMIO_QUEUE_DESC_LOW	0x080
++#define VIRTIO_MMIO_QUEUE_DESC_HIGH	0x084
++
++/* Selected queue's Available Ring address, 64 bits in two halves */
++#define VIRTIO_MMIO_QUEUE_AVAIL_LOW	0x090
++#define VIRTIO_MMIO_QUEUE_AVAIL_HIGH	0x094
++
++/* Selected queue's Used Ring address, 64 bits in two halves */
++#define VIRTIO_MMIO_QUEUE_USED_LOW	0x0a0
++#define VIRTIO_MMIO_QUEUE_USED_HIGH	0x0a4
++
++/* Configuration atomicity value */
++#define VIRTIO_MMIO_CONFIG_GENERATION	0x0fc
++
+ /* The config space is defined by each driver as
+  * the per-driver configuration space - Read Write */
+ #define VIRTIO_MMIO_CONFIG		0x100
