@@ -1,0 +1,127 @@
+smp: Teach __smp_call_function_single() to check for offline cpus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 08eed44c7249d381a099bc55577e55c6bb533160
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/08eed44c.failed
+
+Align __smp_call_function_single() with smp_call_function_single() so
+that it also checks whether requested cpu is still online.
+
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Jens Axboe <axboe@fb.com>
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 08eed44c7249d381a099bc55577e55c6bb533160)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/smp.h
+diff --cc include/linux/smp.h
+index 2bbbb7e1e96a,c39074c794c5..000000000000
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@@ -29,8 -29,28 +29,33 @@@ extern unsigned int total_cpus
+  int smp_call_function_single(int cpuid, smp_call_func_t func, void *info,
+  			     int wait);
+  
+++<<<<<<< HEAD
+ +void __smp_call_function_single(int cpuid, struct call_single_data *data,
+ +				int wait);
+++=======
++ /*
++  * Call a function on all processors
++  */
++ int on_each_cpu(smp_call_func_t func, void *info, int wait);
++ 
++ /*
++  * Call a function on processors specified by mask, which might include
++  * the local one.
++  */
++ void on_each_cpu_mask(const struct cpumask *mask, smp_call_func_t func,
++ 		void *info, bool wait);
++ 
++ /*
++  * Call a function on each processor for which the supplied function
++  * cond_func returns a positive value. This may include the local
++  * processor.
++  */
++ void on_each_cpu_cond(bool (*cond_func)(int cpu, void *info),
++ 		smp_call_func_t func, void *info, bool wait,
++ 		gfp_t gfp_flags);
++ 
++ int __smp_call_function_single(int cpu, struct call_single_data *csd, int wait);
+++>>>>>>> 08eed44c7249 (smp: Teach __smp_call_function_single() to check for offline cpus)
+  
+  #ifdef CONFIG_SMP
+  
+* Unmerged path include/linux/smp.h
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 74100ac030d3..0019b2d7292c 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -310,18 +310,18 @@ EXPORT_SYMBOL_GPL(smp_call_function_any);
+ /**
+  * __smp_call_function_single(): Run a function on a specific CPU
+  * @cpu: The CPU to run on.
+- * @data: Pre-allocated and setup data structure
++ * @csd: Pre-allocated and setup data structure
+  * @wait: If true, wait until function has completed on specified CPU.
+  *
+  * Like smp_call_function_single(), but allow caller to pass in a
+  * pre-allocated data structure. Useful for embedding @data inside
+  * other structures, for instance.
+  */
+-void __smp_call_function_single(int cpu, struct call_single_data *csd,
+-				int wait)
++int __smp_call_function_single(int cpu, struct call_single_data *csd, int wait)
+ {
+ 	unsigned int this_cpu;
+ 	unsigned long flags;
++	int err = 0;
+ 
+ 	this_cpu = get_cpu();
+ 	/*
+@@ -337,11 +337,14 @@ void __smp_call_function_single(int cpu, struct call_single_data *csd,
+ 		local_irq_save(flags);
+ 		csd->func(csd->info);
+ 		local_irq_restore(flags);
+-	} else {
++	} else if ((unsigned)cpu < nr_cpu_ids && cpu_online(cpu)) {
+ 		csd_lock(csd);
+ 		generic_exec_single(cpu, csd, wait);
++	} else {
++		err = -ENXIO;	/* CPU not online */
+ 	}
+ 	put_cpu();
++	return err;
+ }
+ EXPORT_SYMBOL(__smp_call_function_single);
+ 
+diff --git a/kernel/up.c b/kernel/up.c
+index 7841a634056c..3b07a39a0e8a 100644
+--- a/kernel/up.c
++++ b/kernel/up.c
+@@ -20,13 +20,14 @@ int smp_call_function_single(int cpu, void (*func) (void *info), void *info,
+ }
+ EXPORT_SYMBOL(smp_call_function_single);
+ 
+-void __smp_call_function_single(int cpu, struct call_single_data *csd,
+-				int wait)
++int __smp_call_function_single(int cpu, struct call_single_data *csd,
++			       int wait)
+ {
+ 	unsigned long flags;
+ 
+ 	local_irq_save(flags);
+ 	csd->func(csd->info);
+ 	local_irq_restore(flags);
++	return 0;
+ }
+ EXPORT_SYMBOL(__smp_call_function_single);
