@@ -1,0 +1,267 @@
+IB/iser: Change the increment rkey flow logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit e26d2d21ff8e3e4f9768960a83e4b7be43f0aeed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e26d2d21.failed
+
+When we enable remote invalidate support we won't want to perform
+local invalidates at the same time we do today, but we still need
+to get new rkeys.  So, decouple the rkey update from the local
+invalidate and tie it to memory reg instead.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Jenny Derzhavetz <jennyf@mellanox.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e26d2d21ff8e3e4f9768960a83e4b7be43f0aeed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_memory.c
+diff --cc drivers/infiniband/ulp/iser/iser_memory.c
+index 5502beb685d5,722b8aa703c7..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@@ -697,41 -352,26 +697,54 @@@ iser_set_sig_attrs(struct scsi_cmnd *sc
+  	return 0;
+  }
+  
+ -static inline void
+ +static int
+  iser_set_prot_checks(struct scsi_cmnd *sc, u8 *mask)
+  {
+ -	*mask = 0;
+ -	if (sc->prot_flags & SCSI_PROT_REF_CHECK)
+ -		*mask |= ISER_CHECK_REFTAG;
+ -	if (sc->prot_flags & SCSI_PROT_GUARD_CHECK)
+ -		*mask |= ISER_CHECK_GUARD;
+ +	switch (scsi_get_prot_type(sc)) {
+ +	case SCSI_PROT_DIF_TYPE0:
+ +		*mask = 0x0;
+ +		break;
+ +	case SCSI_PROT_DIF_TYPE1:
+ +	case SCSI_PROT_DIF_TYPE2:
+ +		*mask = ISER_CHECK_GUARD | ISER_CHECK_REFTAG;
+ +		break;
+ +	case SCSI_PROT_DIF_TYPE3:
+ +		*mask = ISER_CHECK_GUARD;
+ +		break;
+ +	default:
+ +		iser_err("Unsupported protection type %d\n",
+ +			 scsi_get_prot_type(sc));
+ +		return -EINVAL;
+ +	}
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +iser_inv_rkey(struct ib_send_wr *inv_wr, struct ib_mr *mr)
+ +{
+ +	u32 rkey;
+ +
+ +	memset(inv_wr, 0, sizeof(*inv_wr));
+++=======
++ static inline void
++ iser_inv_rkey(struct ib_send_wr *inv_wr,
++ 	      struct ib_mr *mr,
++ 	      struct ib_cqe *cqe)
++ {
+++>>>>>>> e26d2d21ff8e (IB/iser: Change the increment rkey flow logic)
+  	inv_wr->opcode = IB_WR_LOCAL_INV;
+ -	inv_wr->wr_cqe = cqe;
+ +	inv_wr->wr_id = ISER_FASTREG_LI_WRID;
+  	inv_wr->ex.invalidate_rkey = mr->rkey;
+++<<<<<<< HEAD
+ +
+ +	rkey = ib_inc_rkey(mr->rkey);
+ +	ib_update_fast_reg_key(mr, rkey);
+++=======
++ 	inv_wr->send_flags = 0;
++ 	inv_wr->num_sge = 0;
+++>>>>>>> e26d2d21ff8e (IB/iser: Change the increment rkey flow logic)
+  }
+  
+  static int
+@@@ -741,53 -381,44 +754,77 @@@ iser_reg_sig_mr(struct iscsi_iser_task 
+  		struct iser_mem_reg *prot_reg,
+  		struct iser_mem_reg *sig_reg)
+  {
+++<<<<<<< HEAD
+ +	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+ +	struct ib_send_wr sig_wr, inv_wr;
+ +	struct ib_send_wr *bad_wr, *wr = NULL;
+ +	struct ib_sig_attrs sig_attrs;
+++=======
++ 	struct iser_tx_desc *tx_desc = &iser_task->desc;
++ 	struct ib_sig_attrs *sig_attrs = &tx_desc->sig_attrs;
++ 	struct ib_cqe *cqe = &iser_task->iser_conn->ib_conn.reg_cqe;
++ 	struct ib_sig_handover_wr *wr;
++ 	struct ib_mr *mr = pi_ctx->sig_mr;
+++>>>>>>> e26d2d21ff8e (IB/iser: Change the increment rkey flow logic)
+  	int ret;
+  
+ -	memset(sig_attrs, 0, sizeof(*sig_attrs));
+ -	ret = iser_set_sig_attrs(iser_task->sc, sig_attrs);
+ +	memset(&sig_attrs, 0, sizeof(sig_attrs));
+ +	ret = iser_set_sig_attrs(iser_task->sc, &sig_attrs);
+ +	if (ret)
+ +		goto err;
+ +
+ +	ret = iser_set_prot_checks(iser_task->sc, &sig_attrs.check_mask);
+  	if (ret)
+  		goto err;
+  
+ -	iser_set_prot_checks(iser_task->sc, &sig_attrs->check_mask);
+++<<<<<<< HEAD
+ +	if (!pi_ctx->sig_mr_valid) {
+ +		iser_inv_rkey(&inv_wr, pi_ctx->sig_mr);
+ +		wr = &inv_wr;
+ +	}
+  
+ +	memset(&sig_wr, 0, sizeof(sig_wr));
+ +	sig_wr.opcode = IB_WR_REG_SIG_MR;
+ +	sig_wr.wr_id = ISER_FASTREG_LI_WRID;
+ +	sig_wr.sg_list = &data_reg->sge;
+ +	sig_wr.num_sge = 1;
+ +	sig_wr.wr.sig_handover.sig_attrs = &sig_attrs;
+ +	sig_wr.wr.sig_handover.sig_mr = pi_ctx->sig_mr;
+++=======
++ 	if (pi_ctx->sig_mr_valid)
++ 		iser_inv_rkey(iser_tx_next_wr(tx_desc), mr, cqe);
++ 
++ 	ib_update_fast_reg_key(mr, ib_inc_rkey(mr->rkey));
++ 
++ 	wr = sig_handover_wr(iser_tx_next_wr(tx_desc));
++ 	wr->wr.opcode = IB_WR_REG_SIG_MR;
++ 	wr->wr.wr_cqe = cqe;
++ 	wr->wr.sg_list = &data_reg->sge;
++ 	wr->wr.num_sge = 1;
++ 	wr->wr.send_flags = 0;
++ 	wr->sig_attrs = sig_attrs;
++ 	wr->sig_mr = mr;
+++>>>>>>> e26d2d21ff8e (IB/iser: Change the increment rkey flow logic)
+  	if (scsi_prot_sg_count(iser_task->sc))
+ -		wr->prot = &prot_reg->sge;
+ +		sig_wr.wr.sig_handover.prot = &prot_reg->sge;
+ +	sig_wr.wr.sig_handover.access_flags = IB_ACCESS_LOCAL_WRITE |
+ +					      IB_ACCESS_REMOTE_READ |
+ +					      IB_ACCESS_REMOTE_WRITE;
+ +
+ +	if (!wr)
+ +		wr = &sig_wr;
+  	else
+ -		wr->prot = NULL;
+ -	wr->access_flags = IB_ACCESS_LOCAL_WRITE |
+ -			   IB_ACCESS_REMOTE_READ |
+ -			   IB_ACCESS_REMOTE_WRITE;
+ -	pi_ctx->sig_mr_valid = 1;
+ +		wr->next = &sig_wr;
+ +
+ +	ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+ +	if (ret) {
+ +		iser_err("reg_sig_mr failed, ret:%d\n", ret);
+ +		goto err;
+ +	}
+ +	pi_ctx->sig_mr_valid = 0;
+  
+- 	sig_reg->sge.lkey = pi_ctx->sig_mr->lkey;
+- 	sig_reg->rkey = pi_ctx->sig_mr->rkey;
++ 	sig_reg->sge.lkey = mr->lkey;
++ 	sig_reg->rkey = mr->rkey;
+  	sig_reg->sge.addr = 0;
+  	sig_reg->sge.length = scsi_transfer_length(iser_task->sc);
+  
+@@@ -803,58 -434,36 +840,68 @@@ static int iser_fast_reg_mr(struct iscs
+  			    struct iser_reg_resources *rsc,
+  			    struct iser_mem_reg *reg)
+  {
+ -	struct iser_tx_desc *tx_desc = &iser_task->desc;
+ -	struct ib_cqe *cqe = &iser_task->iser_conn->ib_conn.reg_cqe;
+ -	struct ib_mr *mr = rsc->mr;
+ -	struct ib_reg_wr *wr;
+ -	int n;
+ +	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+ +	struct iser_device *device = ib_conn->device;
+ +	struct ib_mr *mr;
+ +	struct ib_fast_reg_page_list *frpl;
+ +	struct ib_send_wr fastreg_wr, inv_wr;
+ +	struct ib_send_wr *bad_wr, *wr = NULL;
+ +	int ret, offset, size, plen;
+ +
+ +	/* if there a single dma entry, dma mr suffices */
+ +	if (mem->dma_nents == 1)
+ +		return iser_reg_dma(device, mem, reg);
+  
+ -	if (rsc->mr_valid)
+ -		iser_inv_rkey(iser_tx_next_wr(tx_desc), mr, cqe);
+++<<<<<<< HEAD
+ +	mr = rsc->mr;
+ +	frpl = rsc->frpl;
+  
+ +	plen = iser_sg_to_page_vec(mem, device->ib_device, frpl->page_list,
+ +				   &offset, &size);
+ +	if (plen * SIZE_4K < size) {
+ +		iser_err("fast reg page_list too short to hold this SG\n");
+ +		return -EINVAL;
+++=======
++ 	ib_update_fast_reg_key(mr, ib_inc_rkey(mr->rkey));
++ 
++ 	n = ib_map_mr_sg(mr, mem->sg, mem->size, SIZE_4K);
++ 	if (unlikely(n != mem->size)) {
++ 		iser_err("failed to map sg (%d/%d)\n",
++ 			 n, mem->size);
++ 		return n < 0 ? n : -EINVAL;
+++>>>>>>> e26d2d21ff8e (IB/iser: Change the increment rkey flow logic)
+  	}
+  
+ -	wr = reg_wr(iser_tx_next_wr(tx_desc));
+ -	wr->wr.opcode = IB_WR_REG_MR;
+ -	wr->wr.wr_cqe = cqe;
+ -	wr->wr.send_flags = 0;
+ -	wr->wr.num_sge = 0;
+ -	wr->mr = mr;
+ -	wr->key = mr->rkey;
+ -	wr->access = IB_ACCESS_LOCAL_WRITE  |
+ -		     IB_ACCESS_REMOTE_WRITE |
+ -		     IB_ACCESS_REMOTE_READ;
+ +	if (!rsc->mr_valid) {
+ +		iser_inv_rkey(&inv_wr, mr);
+ +		wr = &inv_wr;
+ +	}
+  
+ -	rsc->mr_valid = 1;
+ +	/* Prepare FASTREG WR */
+ +	memset(&fastreg_wr, 0, sizeof(fastreg_wr));
+ +	fastreg_wr.wr_id = ISER_FASTREG_LI_WRID;
+ +	fastreg_wr.opcode = IB_WR_FAST_REG_MR;
+ +	fastreg_wr.wr.fast_reg.iova_start = frpl->page_list[0] + offset;
+ +	fastreg_wr.wr.fast_reg.page_list = frpl;
+ +	fastreg_wr.wr.fast_reg.page_list_len = plen;
+ +	fastreg_wr.wr.fast_reg.page_shift = SHIFT_4K;
+ +	fastreg_wr.wr.fast_reg.length = size;
+ +	fastreg_wr.wr.fast_reg.rkey = mr->rkey;
+ +	fastreg_wr.wr.fast_reg.access_flags = (IB_ACCESS_LOCAL_WRITE  |
+ +					       IB_ACCESS_REMOTE_WRITE |
+ +					       IB_ACCESS_REMOTE_READ);
+ +
+ +	if (!wr)
+ +		wr = &fastreg_wr;
+ +	else
+ +		wr->next = &fastreg_wr;
+ +
+ +	ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+ +	if (ret) {
+ +		iser_err("fast registration failed, ret:%d\n", ret);
+ +		return ret;
+ +	}
+ +	rsc->mr_valid = 0;
+  
+  	reg->sge.lkey = mr->lkey;
+  	reg->rkey = mr->rkey;
+* Unmerged path drivers/infiniband/ulp/iser/iser_memory.c
