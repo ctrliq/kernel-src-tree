@@ -1,0 +1,228 @@
+8250_dw: Support all baudrates on baytrail
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Loic Poulain <loic.poulain@intel.com>
+commit c439c33d85e252d3b2b454ab7ba38b62d6e0a830
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c439c33d.failed
+
+In the same manner as 8250_pci, 8250_dw needs some
+baytrail specific quirks to be used. The reference
+clock needs to be adjusted before divided in order
+to have the minimum error rate on the baudrate.
+
+The specific byt set termios function is stored in
+the driver_data field of the acpi device id via the
+dw8250_acpi_desc structure.
+
+Remove the uartclk field which is no longer delivered
+as driver data.
+
+	Signed-off-by: Loic Poulain <loic.poulain@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit c439c33d85e252d3b2b454ab7ba38b62d6e0a830)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/serial/8250/8250_dw.c
+diff --cc drivers/tty/serial/8250/8250_dw.c
+index 19f1fa08014f,51b307aab75e..000000000000
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@@ -54,12 -55,77 +54,76 @@@
+  
+  
+  struct dw8250_data {
+ -	u8			usr_reg;
+ -	int			last_mcr;
+ -	int			line;
+ -	struct clk		*clk;
+ -	struct uart_8250_dma	dma;
+ +	int		last_lcr;
+ +	int		last_mcr;
+ +	int		line;
+ +	struct clk	*clk;
+  };
+  
++ struct dw8250_acpi_desc {
++ 	void (*set_termios)(struct uart_port *p, struct ktermios *termios,
++ 			    struct ktermios *old);
++ };
++ 
++ #define BYT_PRV_CLK			0x800
++ #define BYT_PRV_CLK_EN			(1 << 0)
++ #define BYT_PRV_CLK_M_VAL_SHIFT		1
++ #define BYT_PRV_CLK_N_VAL_SHIFT		16
++ #define BYT_PRV_CLK_UPDATE		(1 << 31)
++ 
++ static void byt_set_termios(struct uart_port *p, struct ktermios *termios,
++ 			    struct ktermios *old)
++ {
++ 	unsigned int baud = tty_termios_baud_rate(termios);
++ 	unsigned int m, n;
++ 	u32 reg;
++ 
++ 	/*
++ 	* For baud rates 0.5M, 1M, 1.5M, 2M, 2.5M, 3M, 3.5M and 4M the
++ 	* dividers must be adjusted.
++ 	*
++ 	* uartclk = (m / n) * 100 MHz, where m <= n
++ 	*/
++ 	switch (baud) {
++ 	case 500000:
++ 	case 1000000:
++ 	case 2000000:
++ 	case 4000000:
++ 		m = 64;
++ 		n = 100;
++ 		p->uartclk = 64000000;
++ 		break;
++ 	case 3500000:
++ 		m = 56;
++ 		n = 100;
++ 		p->uartclk = 56000000;
++ 		break;
++ 	case 1500000:
++ 	case 3000000:
++ 		m = 48;
++ 		n = 100;
++ 		p->uartclk = 48000000;
++ 		break;
++ 	case 2500000:
++ 		m = 40;
++ 		n = 100;
++ 		p->uartclk = 40000000;
++ 		break;
++ 	default:
++ 		m = 2304;
++ 		n = 3125;
++ 		p->uartclk = 73728000;
++ 	}
++ 
++ 	/* Reset the clock */
++ 	reg = (m << BYT_PRV_CLK_M_VAL_SHIFT) | (n << BYT_PRV_CLK_N_VAL_SHIFT);
++ 	writel(reg, p->membase + BYT_PRV_CLK);
++ 	reg |= BYT_PRV_CLK_EN | BYT_PRV_CLK_UPDATE;
++ 	writel(reg, p->membase + BYT_PRV_CLK);
++ 
++ 	serial8250_do_set_termios(p, termios, old);
++ }
++ 
+  static inline int dw8250_modify_msr(struct uart_port *p, int offset, int value)
+  {
+  	struct dw8250_data *d = p->private_data;
+@@@ -246,6 -282,94 +310,97 @@@ static void dw8250_setup_port(struct ua
+  		up->capabilities |= UART_CAP_AFE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dw8250_probe_of(struct uart_port *p,
++ 			   struct dw8250_data *data)
++ {
++ 	struct device_node	*np = p->dev->of_node;
++ 	u32			val;
++ 	bool has_ucv = true;
++ 
++ 	if (of_device_is_compatible(np, "cavium,octeon-3860-uart")) {
++ #ifdef __BIG_ENDIAN
++ 		/*
++ 		 * Low order bits of these 64-bit registers, when
++ 		 * accessed as a byte, are 7 bytes further down in the
++ 		 * address space in big endian mode.
++ 		 */
++ 		p->membase += 7;
++ #endif
++ 		p->serial_out = dw8250_serial_out_rb;
++ 		p->flags = ASYNC_SKIP_TEST | UPF_SHARE_IRQ | UPF_FIXED_TYPE;
++ 		p->type = PORT_OCTEON;
++ 		data->usr_reg = 0x27;
++ 		has_ucv = false;
++ 	} else if (!of_property_read_u32(np, "reg-io-width", &val)) {
++ 		switch (val) {
++ 		case 1:
++ 			break;
++ 		case 4:
++ 			p->iotype = UPIO_MEM32;
++ 			p->serial_in = dw8250_serial_in32;
++ 			p->serial_out = dw8250_serial_out32;
++ 			break;
++ 		default:
++ 			dev_err(p->dev, "unsupported reg-io-width (%u)\n", val);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	if (has_ucv)
++ 		dw8250_setup_port(container_of(p, struct uart_8250_port, port));
++ 
++ 	if (!of_property_read_u32(np, "reg-shift", &val))
++ 		p->regshift = val;
++ 
++ 	/* clock got configured through clk api, all done */
++ 	if (p->uartclk)
++ 		return 0;
++ 
++ 	/* try to find out clock frequency from DT as fallback */
++ 	if (of_property_read_u32(np, "clock-frequency", &val)) {
++ 		dev_err(p->dev, "clk or clock-frequency not defined\n");
++ 		return -EINVAL;
++ 	}
++ 	p->uartclk = val;
++ 
++ 	return 0;
++ }
++ 
++ static int dw8250_probe_acpi(struct uart_8250_port *up,
++ 			     struct dw8250_data *data)
++ {
++ 	const struct acpi_device_id *id;
++ 	struct uart_port *p = &up->port;
++ 	struct dw8250_acpi_desc *acpi_desc;
++ 
++ 	dw8250_setup_port(up);
++ 
++ 	id = acpi_match_device(p->dev->driver->acpi_match_table, p->dev);
++ 	if (!id)
++ 		return -ENODEV;
++ 
++ 	p->iotype = UPIO_MEM32;
++ 	p->serial_in = dw8250_serial_in32;
++ 	p->serial_out = dw8250_serial_out32;
++ 	p->regshift = 2;
++ 
++ 	up->dma = &data->dma;
++ 
++ 	up->dma->rxconf.src_maxburst = p->fifosize / 4;
++ 	up->dma->txconf.dst_maxburst = p->fifosize / 4;
++ 
++ 	acpi_desc = (struct dw8250_acpi_desc *)id->driver_data;
++ 	if (!acpi_desc)
++ 		return 0;
++ 
++ 	if (acpi_desc->set_termios)
++ 		p->set_termios = acpi_desc->set_termios;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c439c33d85e2 (8250_dw: Support all baudrates on baytrail)
+  static int dw8250_probe(struct platform_device *pdev)
+  {
+  	struct uart_8250_port uart = {};
+@@@ -387,7 -521,9 +546,13 @@@ static struct dw8250_acpi_desc byt_8250
+  static const struct acpi_device_id dw8250_acpi_match[] = {
+  	{ "INT33C4", 0 },
+  	{ "INT33C5", 0 },
+++<<<<<<< HEAD
+ +	{ "80860F0A", 0 },
+++=======
++ 	{ "INT3434", 0 },
++ 	{ "INT3435", 0 },
++ 	{ "80860F0A", (kernel_ulong_t)&byt_8250_desc},
+++>>>>>>> c439c33d85e2 (8250_dw: Support all baudrates on baytrail)
+  	{ },
+  };
+  MODULE_DEVICE_TABLE(acpi, dw8250_acpi_match);
+* Unmerged path drivers/tty/serial/8250/8250_dw.c
