@@ -1,0 +1,173 @@
+blk-mq: remove blk_mq_wait_for_tags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit a3bd77567cae6af700dcd245148befc73fc89a50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a3bd7756.failed
+
+The current logic for blocking tag allocation is rather confusing, as we
+first allocated and then free again a tag in blk_mq_wait_for_tags, just
+to attempt a non-blocking allocation and then repeat if someone else
+managed to grab the tag before us.
+
+Instead change blk_mq_alloc_request_pinned to simply do a blocking tag
+allocation itself and use the request we get back from it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit a3bd77567cae6af700dcd245148befc73fc89a50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq-tag.h
+#	block/blk-mq.c
+diff --cc block/blk-mq-tag.c
+index 83ae96c51a27,0d0640d38a06..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -7,23 -7,20 +7,40 @@@
+  #include "blk-mq.h"
+  #include "blk-mq-tag.h"
+  
+++<<<<<<< HEAD
+ +/*
+ + * Per tagged queue (tag address space) map
+ + */
+ +struct blk_mq_tags {
+ +	unsigned int nr_tags;
+ +	unsigned int nr_reserved_tags;
+ +	unsigned int nr_batch_move;
+ +	unsigned int nr_max_cache;
+ +
+ +	struct percpu_ida free_tags;
+ +	struct percpu_ida reserved_tags;
+ +};
+ +
+ +void blk_mq_wait_for_tags(struct blk_mq_tags *tags)
+ +{
+ +	int tag = blk_mq_get_tag(tags, __GFP_WAIT, false);
+ +	blk_mq_put_tag(tags, tag);
+++=======
++ static bool bt_has_free_tags(struct blk_mq_bitmap_tags *bt)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		struct blk_align_bitmap *bm = &bt->map[i];
++ 		int ret;
++ 
++ 		ret = find_first_zero_bit(&bm->word, bm->depth);
++ 		if (ret < bm->depth)
++ 			return true;
++ 	}
++ 
++ 	return false;
+++>>>>>>> a3bd77567cae (blk-mq: remove blk_mq_wait_for_tags)
+  }
+  
+  bool blk_mq_has_free_tags(struct blk_mq_tags *tags)
+diff --cc block/blk-mq-tag.h
+index 947ba2c6148e,c959de58d2a5..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -6,12 -48,12 +6,17 @@@ struct blk_mq_tags
+  extern struct blk_mq_tags *blk_mq_init_tags(unsigned int nr_tags, unsigned int reserved_tags, int node);
+  extern void blk_mq_free_tags(struct blk_mq_tags *tags);
+  
+++<<<<<<< HEAD
+ +extern unsigned int blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp, bool reserved);
+ +extern void blk_mq_wait_for_tags(struct blk_mq_tags *tags);
+ +extern void blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag);
+ +extern void blk_mq_tag_busy_iter(struct blk_mq_tags *tags, void (*fn)(void *data, unsigned long *), void *data);
+++=======
++ extern unsigned int blk_mq_get_tag(struct blk_mq_hw_ctx *hctx, unsigned int *last_tag, gfp_t gfp, bool reserved);
++ extern void blk_mq_put_tag(struct blk_mq_hw_ctx *hctx, unsigned int tag, unsigned int *last_tag);
+++>>>>>>> a3bd77567cae (blk-mq: remove blk_mq_wait_for_tags)
+  extern bool blk_mq_has_free_tags(struct blk_mq_tags *tags);
+  extern ssize_t blk_mq_tag_sysfs_show(struct blk_mq_tags *tags, char *page);
+ -extern void blk_mq_tag_init_last_tag(struct blk_mq_tags *tags, unsigned int *last_tag);
+ -extern int blk_mq_tag_update_depth(struct blk_mq_tags *tags, unsigned int depth);
+  
+  enum {
+  	BLK_MQ_TAG_CACHE_MIN	= 1,
+diff --cc block/blk-mq.c
+index 2ab20aca2fd8,3224888d329a..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -193,6 -212,58 +193,34 @@@ static void blk_mq_rq_ctx_init(struct r
+  	ctx->rq_dispatched[rw_is_sync(rw_flags)]++;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct request *
++ __blk_mq_alloc_request(struct request_queue *q, struct blk_mq_hw_ctx *hctx,
++ 		struct blk_mq_ctx *ctx, int rw, gfp_t gfp, bool reserved)
++ {
++ 	struct request *rq;
++ 	unsigned int tag;
++ 
++ 	tag = blk_mq_get_tag(hctx, &ctx->last_tag, gfp, reserved);
++ 	if (tag != BLK_MQ_TAG_FAIL) {
++ 		rq = hctx->tags->rqs[tag];
++ 
++ 		rq->cmd_flags = 0;
++ 		if (blk_mq_tag_busy(hctx)) {
++ 			rq->cmd_flags = REQ_MQ_INFLIGHT;
++ 			atomic_inc(&hctx->nr_active);
++ 		}
++ 
++ 		rq->tag = tag;
++ 		blk_mq_rq_ctx_init(q, ctx, rq, rw);
++ 		return rq;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
+++>>>>>>> a3bd77567cae (blk-mq: remove blk_mq_wait_for_tags)
+  static struct request *blk_mq_alloc_request_pinned(struct request_queue *q,
+  						   int rw, gfp_t gfp,
+  						   bool reserved)
+@@@ -203,21 -275,19 +232,30 @@@
+  		struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
+  		struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q, ctx->cpu);
+  
+++<<<<<<< HEAD
+ +		rq = __blk_mq_alloc_request(hctx, gfp & ~__GFP_WAIT, reserved);
+ +		if (rq) {
+ +			blk_mq_rq_ctx_init(q, ctx, rq, rw);
+++=======
++ 		rq = __blk_mq_alloc_request(q, hctx, ctx, rw, gfp_mask,
++ 						reserved);
++ 		if (rq)
+++>>>>>>> a3bd77567cae (blk-mq: remove blk_mq_wait_for_tags)
+  			break;
+ +		}
+  
+- 		if (gfp & __GFP_WAIT) {
+- 			__blk_mq_run_hw_queue(hctx);
+- 			blk_mq_put_ctx(ctx);
+- 		} else {
++ 		if (!(gfp & __GFP_WAIT)) {
+  			blk_mq_put_ctx(ctx);
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		blk_mq_wait_for_tags(hctx->tags);
+++=======
++ 		__blk_mq_run_hw_queue(hctx);
++ 		blk_mq_put_ctx(ctx);
++ 		gfp_mask = gfp;
+++>>>>>>> a3bd77567cae (blk-mq: remove blk_mq_wait_for_tags)
+  	} while (1);
+  
+  	return rq;
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq-tag.h
+* Unmerged path block/blk-mq.c
