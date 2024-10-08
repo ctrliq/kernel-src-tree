@@ -1,0 +1,153 @@
+ipv4: ICMP packet inspection for multipath
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Nørlund <pch@ordbogen.com>
+commit 79a131592dbb81a2dba208622a2ffbfc53f28bc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/79a13159.failed
+
+ICMP packets are inspected to let them route together with the flow they
+belong to, minimizing the chance that a problematic path will affect flows
+on other paths, and so that anycast environments can work with ECMP.
+
+	Signed-off-by: Peter Nørlund <pch@ordbogen.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 79a131592dbb81a2dba208622a2ffbfc53f28bc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/route.h
+#	net/ipv4/route.c
+diff --cc include/net/route.h
+index 3765d2348b06,d32cb76f5302..000000000000
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@@ -28,6 -28,8 +28,11 @@@
+  #include <net/inetpeer.h>
+  #include <net/flow.h>
+  #include <net/inet_sock.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/ip_fib.h>
++ #include <net/l3mdev.h>
+++>>>>>>> 79a131592dbb (ipv4: ICMP packet inspection for multipath)
+  #include <linux/in_route.h>
+  #include <linux/rtnetlink.h>
+  #include <linux/rcupdate.h>
+@@@ -104,13 -110,23 +109,33 @@@ struct rt_cache_stat 
+  extern struct ip_rt_acct __percpu *ip_rt_acct;
+  
+  struct in_device;
+++<<<<<<< HEAD
+ +extern int		ip_rt_init(void);
+ +extern void		rt_cache_flush(struct net *net);
+ +extern void		rt_flush_dev(struct net_device *dev);
+ +extern struct rtable *__ip_route_output_key(struct net *, struct flowi4 *flp);
+ +extern struct rtable *ip_route_output_flow(struct net *, struct flowi4 *flp,
+ +					   struct sock *sk);
+ +extern struct dst_entry *ipv4_blackhole_route(struct net *net, struct dst_entry *dst_orig);
+++=======
++ 
++ int ip_rt_init(void);
++ void rt_cache_flush(struct net *net);
++ void rt_flush_dev(struct net_device *dev);
++ struct rtable *__ip_route_output_key_hash(struct net *, struct flowi4 *flp,
++ 					  int mp_hash);
++ 
++ static inline struct rtable *__ip_route_output_key(struct net *net,
++ 						   struct flowi4 *flp)
++ {
++ 	return __ip_route_output_key_hash(net, flp, -1);
++ }
++ 
++ struct rtable *ip_route_output_flow(struct net *, struct flowi4 *flp,
++ 				    const struct sock *sk);
++ struct dst_entry *ipv4_blackhole_route(struct net *net,
++ 				       struct dst_entry *dst_orig);
+++>>>>>>> 79a131592dbb (ipv4: ICMP packet inspection for multipath)
+  
+  static inline struct rtable *ip_route_output_key(struct net *net, struct flowi4 *flp)
+  {
+diff --cc net/ipv4/route.c
+index 92306c5a6897,54297d3a0559..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -1579,8 -1700,15 +1621,20 @@@ static int ip_mkroute_input(struct sk_b
+  			    __be32 daddr, __be32 saddr, u32 tos)
+  {
+  #ifdef CONFIG_IP_ROUTE_MULTIPATH
+++<<<<<<< HEAD
+ +	if (res->fi && res->fi->fib_nhs > 1)
+ +		fib_select_multipath(res);
+++=======
++ 	if (res->fi && res->fi->fib_nhs > 1) {
++ 		int h;
++ 
++ 		if (unlikely(ip_hdr(skb)->protocol == IPPROTO_ICMP))
++ 			h = ip_multipath_icmp_hash(skb);
++ 		else
++ 			h = fib_multipath_hash(saddr, daddr);
++ 		fib_select_multipath(res, h);
++ 	}
+++>>>>>>> 79a131592dbb (ipv4: ICMP packet inspection for multipath)
+  #endif
+  
+  	/* create a routing cache entry */
+@@@ -2107,8 -2239,11 +2162,16 @@@ struct rtable *__ip_route_output_key_ha
+  	}
+  
+  #ifdef CONFIG_IP_ROUTE_MULTIPATH
+++<<<<<<< HEAD
+ +	if (res.fi->fib_nhs > 1 && fl4->flowi4_oif == 0)
+ +		fib_select_multipath(&res);
+++=======
++ 	if (res.fi->fib_nhs > 1 && fl4->flowi4_oif == 0) {
++ 		if (mp_hash < 0)
++ 			mp_hash = fib_multipath_hash(fl4->saddr, fl4->daddr);
++ 		fib_select_multipath(&res, mp_hash);
++ 	}
+++>>>>>>> 79a131592dbb (ipv4: ICMP packet inspection for multipath)
+  	else
+  #endif
+  	if (!res.prefixlen &&
+* Unmerged path include/net/route.h
+diff --git a/net/ipv4/icmp.c b/net/ipv4/icmp.c
+index f4c71714a70c..e79a7c7c452f 100644
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -378,6 +378,22 @@ out_unlock:
+ 	icmp_xmit_unlock(sk);
+ }
+ 
++#ifdef CONFIG_IP_ROUTE_MULTIPATH
++
++/* Source and destination is swapped. See ip_multipath_icmp_hash */
++static int icmp_multipath_hash_skb(const struct sk_buff *skb)
++{
++	const struct iphdr *iph = ip_hdr(skb);
++
++	return fib_multipath_hash(iph->daddr, iph->saddr);
++}
++
++#else
++
++#define icmp_multipath_hash_skb(skb) (-1)
++
++#endif
++
+ static struct rtable *icmp_route_lookup(struct net *net,
+ 					struct flowi4 *fl4,
+ 					struct sk_buff *skb_in,
+@@ -399,7 +415,8 @@ static struct rtable *icmp_route_lookup(struct net *net,
+ 	fl4->fl4_icmp_type = type;
+ 	fl4->fl4_icmp_code = code;
+ 	security_skb_classify_flow(skb_in, flowi4_to_flowi(fl4));
+-	rt = __ip_route_output_key(net, fl4);
++	rt = __ip_route_output_key_hash(net, fl4,
++					icmp_multipath_hash_skb(skb_in));
+ 	if (IS_ERR(rt))
+ 		return rt;
+ 
+* Unmerged path net/ipv4/route.c
