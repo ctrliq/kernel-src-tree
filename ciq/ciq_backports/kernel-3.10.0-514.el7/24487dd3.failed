@@ -1,0 +1,155 @@
+staging/rdma/hfi1: Check interrupt registers mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Check interrupt registers mapping (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 91.67%
+commit-author Kaike Wan <kaike.wan@intel.com>
+commit 24487dd39cb24c23560c2dc726c6d3375f42a697
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/24487dd3.failed
+
+This patch tests the interrupt registers when the driver has no access to
+its upstream component. In this case, it is highly likely that it is
+running in a virtual machine (eg, Qemu-kvm guest). If the interrupt
+registers are not mapped properly by the virtual machine monitor, an
+error message will be printed and the probing will be terminated. This
+will help the user identify the issue. On the other hand, if the driver
+is running in a host or has access to its upstream component in some
+other VM, it will do nothing.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Kaike Wan <kaike.wan@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 24487dd39cb24c23560c2dc726c6d3375f42a697)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/chip.c
+diff --cc drivers/staging/hfi1/chip.c
+index 1bc8fcce8194,7799652773d5..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -13998,6 -13917,76 +13998,79 @@@ static void asic_should_init(struct hfi
+  	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+++=======
++ /*
++  * Set dd->boardname.  Use a generic name if a name is not returned from
++  * EFI variable space.
++  *
++  * Return 0 on success, -ENOMEM if space could not be allocated.
++  */
++ static int obtain_boardname(struct hfi1_devdata *dd)
++ {
++ 	/* generic board description */
++ 	const char generic[] =
++ 		"Intel Omni-Path Host Fabric Interface Adapter 100 Series";
++ 	unsigned long size;
++ 	int ret;
++ 
++ 	ret = read_hfi1_efi_var(dd, "description", &size,
++ 				(void **)&dd->boardname);
++ 	if (ret) {
++ 		dd_dev_info(dd, "Board description not found\n");
++ 		/* use generic description */
++ 		dd->boardname = kstrdup(generic, GFP_KERNEL);
++ 		if (!dd->boardname)
++ 			return -ENOMEM;
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * Check the interrupt registers to make sure that they are mapped correctly.
++  * It is intended to help user identify any mismapping by VMM when the driver
++  * is running in a VM. This function should only be called before interrupt
++  * is set up properly.
++  *
++  * Return 0 on success, -EINVAL on failure.
++  */
++ static int check_int_registers(struct hfi1_devdata *dd)
++ {
++ 	u64 reg;
++ 	u64 all_bits = ~(u64)0;
++ 	u64 mask;
++ 
++ 	/* Clear CceIntMask[0] to avoid raising any interrupts */
++ 	mask = read_csr(dd, CCE_INT_MASK);
++ 	write_csr(dd, CCE_INT_MASK, 0ull);
++ 	reg = read_csr(dd, CCE_INT_MASK);
++ 	if (reg)
++ 		goto err_exit;
++ 
++ 	/* Clear all interrupt status bits */
++ 	write_csr(dd, CCE_INT_CLEAR, all_bits);
++ 	reg = read_csr(dd, CCE_INT_STATUS);
++ 	if (reg)
++ 		goto err_exit;
++ 
++ 	/* Set all interrupt status bits */
++ 	write_csr(dd, CCE_INT_FORCE, all_bits);
++ 	reg = read_csr(dd, CCE_INT_STATUS);
++ 	if (reg != all_bits)
++ 		goto err_exit;
++ 
++ 	/* Restore the interrupt mask */
++ 	write_csr(dd, CCE_INT_CLEAR, all_bits);
++ 	write_csr(dd, CCE_INT_MASK, mask);
++ 
++ 	return 0;
++ err_exit:
++ 	write_csr(dd, CCE_INT_MASK, mask);
++ 	dd_dev_err(dd, "Interrupt registers not properly mapped by VMM\n");
++ 	return -EINVAL;
++ }
++ 
+++>>>>>>> 24487dd39cb2 (staging/rdma/hfi1: Check interrupt registers mapping):drivers/staging/rdma/hfi1/chip.c
+  /**
+   * Allocate and initialize the device structure for the hfi.
+   * @dev: the pci_dev for hfi1_ib device
+@@@ -14022,9 -14011,10 +14095,10 @@@ struct hfi1_devdata *hfi1_init_dd(struc
+  		"RTL FPGA emulation",
+  		"Functional simulator"
+  	};
++ 	struct pci_dev *parent = pdev->bus->self;
+  
+ -	dd = hfi1_alloc_devdata(pdev, NUM_IB_PORTS *
+ -				sizeof(struct hfi1_pportdata));
+ +	dd = hfi1_alloc_devdata(pdev,
+ +		NUM_IB_PORTS * sizeof(struct hfi1_pportdata));
+  	if (IS_ERR(dd))
+  		goto bail;
+  	ppd = dd->pport;
+@@@ -14100,8 -14090,21 +14174,26 @@@
+  	dd->minrev = (dd->revision >> CCE_REVISION_CHIP_REV_MINOR_SHIFT)
+  			& CCE_REVISION_CHIP_REV_MINOR_MASK;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+ +	/* obtain the hardware ID - NOT related to unit, which is a
+ +	   software enumeration */
+++=======
++ 	/*
++ 	 * Check interrupt registers mapping if the driver has no access to
++ 	 * the upstream component. In this case, it is likely that the driver
++ 	 * is running in a VM.
++ 	 */
++ 	if (!parent) {
++ 		ret = check_int_registers(dd);
++ 		if (ret)
++ 			goto bail_cleanup;
++ 	}
++ 
++ 	/*
++ 	 * obtain the hardware ID - NOT related to unit, which is a
++ 	 * software enumeration
++ 	 */
+++>>>>>>> 24487dd39cb2 (staging/rdma/hfi1: Check interrupt registers mapping):drivers/staging/rdma/hfi1/chip.c
+  	reg = read_csr(dd, CCE_REVISION2);
+  	dd->hfi1_id = (reg >> CCE_REVISION2_HFI_ID_SHIFT)
+  					& CCE_REVISION2_HFI_ID_MASK;
+* Unmerged path drivers/staging/hfi1/chip.c
