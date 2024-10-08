@@ -1,0 +1,473 @@
+ceph: Asynchronous IO support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit c8fe9b17d055fe80e1a1591f5900ce41fbf6b796
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c8fe9b17.failed
+
+The basic idea of AIO support is simple, just call kiocb::ki_complete()
+in OSD request's complete callback. But there are several special cases.
+
+when IO span multiple objects, we need to wait until all OSD requests
+are complete, then call kiocb::ki_complete(). Error handling in this case
+is tricky too. For simplify, AIO both span multiple objects and extends
+i_size are not allowed.
+
+Another special case is check EOF for reading (other client can write to
+the file and extend i_size concurrently). For simplify, the direct-IO/AIO
+code path does do the check, fallback to normal syn read instead.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit c8fe9b17d055fe80e1a1591f5900ce41fbf6b796)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,8e924b7dd498..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -425,62 -514,28 +418,86 @@@ static ssize_t ceph_sync_read(struct ki
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	if (file->f_flags & O_DIRECT) {
+ +		while (iov_iter_count(i)) {
+ +			void __user *data = i->iov[0].iov_base + i->iov_offset;
+ +			size_t len = i->iov[0].iov_len - i->iov_offset;
+ +
+ +			num_pages = calc_pages_for((unsigned long)data, len);
+ +			pages = ceph_get_direct_page_vector(data,
+ +							    num_pages, true);
+ +			if (IS_ERR(pages))
+ +				return PTR_ERR(pages);
+ +
+ +			ret = striped_read(inode, off, len,
+ +					   pages, num_pages, checkeof,
+ +					   1, (unsigned long)data & ~PAGE_MASK);
+ +			ceph_put_page_vector(pages, num_pages, true);
+ +
+ +			if (ret <= 0)
+ +				break;
+ +			off += ret;
+ +			iov_iter_advance(i, ret);
+ +			if (ret < len)
+ +				break;
+ +		}
+ +	} else {
+ +		num_pages = calc_pages_for(off, len);
+ +		pages = ceph_alloc_page_vector(num_pages, GFP_NOFS);
+ +		if (IS_ERR(pages))
+ +			return PTR_ERR(pages);
+ +		ret = striped_read(inode, off, len, pages,
+ +					num_pages, checkeof, 0, 0);
+ +		if (ret > 0) {
+ +			int l, k = 0;
+ +			size_t left = len = ret;
+ +
+ +			while (left) {
+ +				void __user *data = i->iov[0].iov_base
+ +							+ i->iov_offset;
+ +				l = min(i->iov[0].iov_len - i->iov_offset,
+ +					left);
+ +
+ +				ret = ceph_copy_page_vector_to_user(&pages[k],
+ +								    data, off,
+ +								    l);
+ +				if (ret > 0) {
+ +					iov_iter_advance(i, ret);
+ +					left -= ret;
+ +					off += ret;
+ +					k = calc_pages_for(iocb->ki_pos,
+ +							   len - left + 1) - 1;
+ +					BUG_ON(k >= num_pages && left);
+ +				} else
+ +					break;
+ +			}
+ +		}
+ +		ceph_release_page_vector(pages, num_pages);
+++=======
++ 	num_pages = calc_pages_for(off, len);
++ 	pages = ceph_alloc_page_vector(num_pages, GFP_KERNEL);
++ 	if (IS_ERR(pages))
++ 		return PTR_ERR(pages);
++ 	ret = striped_read(inode, off, len, pages,
++ 				num_pages, checkeof);
++ 	if (ret > 0) {
++ 		int l, k = 0;
++ 		size_t left = ret;
++ 
++ 		while (left) {
++ 			size_t page_off = off & ~PAGE_MASK;
++ 			size_t copy = min_t(size_t, left,
++ 					    PAGE_SIZE - page_off);
++ 			l = copy_page_to_iter(pages[k++], page_off, copy, i);
++ 			off += l;
++ 			left -= l;
++ 			if (l < copy)
++ 				break;
++ 		}
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  	}
++ 	ceph_release_page_vector(pages, num_pages);
+  
+  	if (off > iocb->ki_pos) {
+  		ret = off - iocb->ki_pos;
+@@@ -524,16 -686,10 +648,15 @@@ static void ceph_sync_write_unsafe(stru
+  }
+  
+  
+- /*
+-  * Synchronous write, straight from __user pointer or user pages.
+-  *
+-  * If write spans object boundary, just do multiple writes.  (For a
+-  * correct atomic write, we should e.g. take write locks on all
+-  * objects, rollback on failure, etc.)
+-  */
+  static ssize_t
+++<<<<<<< HEAD
+ +ceph_sync_direct_write(struct kiocb *iocb, const struct iovec *iov,
+ +		       unsigned long nr_segs, size_t count)
+++=======
++ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
++ 		       struct ceph_snap_context *snapc,
++ 		       struct ceph_cap_flush **pcf)
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  {
+  	struct file *file = iocb->ki_filp;
+  	struct inode *inode = file_inode(file);
+@@@ -543,50 -698,52 +666,72 @@@
+  	struct ceph_vino vino;
+  	struct ceph_osd_request *req;
+  	struct page **pages;
+- 	int num_pages;
+- 	int written = 0;
++ 	struct ceph_aio_request *aio_req = NULL;
++ 	int num_pages = 0;
+  	int flags;
+++<<<<<<< HEAD
+ +	int check_caps = 0;
+ +	int page_align;
+ +	int ret;
+ +	struct timespec mtime = CURRENT_TIME;
+ +	loff_t pos = iocb->ki_pos;
+ +	struct iov_iter i;
+++=======
++ 	int ret;
++ 	struct timespec mtime = CURRENT_TIME;
++ 	size_t count = iov_iter_count(iter);
++ 	loff_t pos = iocb->ki_pos;
++ 	bool write = iov_iter_rw(iter) == WRITE;
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  
+- 	if (ceph_snap(file_inode(file)) != CEPH_NOSNAP)
++ 	if (write && ceph_snap(file_inode(file)) != CEPH_NOSNAP)
+  		return -EROFS;
+  
+- 	dout("sync_direct_write on file %p %lld~%u\n", file, pos,
+- 	     (unsigned)count);
++ 	dout("sync_direct_read_write (%s) on file %p %lld~%u\n",
++ 	     (write ? "write" : "read"), file, pos, (unsigned)count);
+  
+  	ret = filemap_write_and_wait_range(inode->i_mapping, pos, pos + count);
+  	if (ret < 0)
+  		return ret;
+  
+- 	ret = invalidate_inode_pages2_range(inode->i_mapping,
+- 					    pos >> PAGE_CACHE_SHIFT,
+- 					    (pos + count) >> PAGE_CACHE_SHIFT);
+- 	if (ret < 0)
+- 		dout("invalidate_inode_pages2_range returned %d\n", ret);
++ 	if (write) {
++ 		ret = invalidate_inode_pages2_range(inode->i_mapping,
++ 					pos >> PAGE_CACHE_SHIFT,
++ 					(pos + count) >> PAGE_CACHE_SHIFT);
++ 		if (ret < 0)
++ 			dout("invalidate_inode_pages2_range returned %d\n", ret);
+  
+- 	flags = CEPH_OSD_FLAG_ORDERSNAP |
+- 		CEPH_OSD_FLAG_ONDISK |
+- 		CEPH_OSD_FLAG_WRITE;
++ 		flags = CEPH_OSD_FLAG_ORDERSNAP |
++ 			CEPH_OSD_FLAG_ONDISK |
++ 			CEPH_OSD_FLAG_WRITE;
++ 	} else {
++ 		flags = CEPH_OSD_FLAG_READ;
++ 	}
+  
+++<<<<<<< HEAD
+ +	iov_iter_init(&i, iov, nr_segs, count, 0);
+++=======
++ 	while (iov_iter_count(iter) > 0) {
++ 		u64 size = dio_get_pagev_size(iter);
++ 		size_t start = 0;
++ 		ssize_t len;
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+ +
+ +	while (iov_iter_count(&i) > 0) {
+ +		void __user *data = i.iov->iov_base + i.iov_offset;
+ +		u64 len = i.iov->iov_len - i.iov_offset;
+ +
+ +		page_align = (unsigned long)data & ~PAGE_MASK;
+  
+ +		snapc = ci->i_snap_realm->cached_context;
+  		vino = ceph_vino(inode);
+  		req = ceph_osdc_new_request(&fsc->client->osdc, &ci->i_layout,
+- 					    vino, pos, &len, 0,
+- 					    2,/*include a 'startsync' command*/
+- 					    CEPH_OSD_OP_WRITE, flags, snapc,
++ 					    vino, pos, &size, 0,
++ 					    /*include a 'startsync' command*/
++ 					    write ? 2 : 1,
++ 					    write ? CEPH_OSD_OP_WRITE :
++ 						    CEPH_OSD_OP_READ,
++ 					    flags, snapc,
+  					    ci->i_truncate_seq,
+  					    ci->i_truncate_size,
+  					    false);
+@@@ -595,54 -752,131 +740,162 @@@
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
+ +
+ +		num_pages = calc_pages_for(page_align, len);
+ +		pages = ceph_get_direct_page_vector(data, num_pages, false);
+++=======
++ 		len = size;
++ 		pages = dio_get_pages_alloc(iter, len, &start, &num_pages);
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  		if (IS_ERR(pages)) {
+ -			ceph_osdc_put_request(req);
+  			ret = PTR_ERR(pages);
+ -			break;
+ +			goto out;
+  		}
+  
+  		/*
+- 		 * throw out any page cache pages in this range. this
+- 		 * may block.
++ 		 * To simplify error handling, allow AIO when IO within i_size
++ 		 * or IO can be satisfied by single OSD request.
+  		 */
+++<<<<<<< HEAD
+ +		truncate_inode_pages_range(inode->i_mapping, pos,
+ +				   (pos+len) | (PAGE_CACHE_SIZE-1));
+ +		osd_req_op_extent_osd_data_pages(req, 0, pages, len, page_align,
+ +						false, false);
+++=======
++ 		if (pos == iocb->ki_pos && !is_sync_kiocb(iocb) &&
++ 		    (len == count || pos + count <= i_size_read(inode))) {
++ 			aio_req = kzalloc(sizeof(*aio_req), GFP_KERNEL);
++ 			if (aio_req) {
++ 				aio_req->iocb = iocb;
++ 				aio_req->write = write;
++ 				INIT_LIST_HEAD(&aio_req->osd_reqs);
++ 				if (write) {
++ 					swap(aio_req->prealloc_cf, *pcf);
++ 				}
++ 			}
++ 			/* ignore error */
++ 		}
++ 
++ 		if (write) {
++ 			/*
++ 			 * throw out any page cache pages in this range. this
++ 			 * may block.
++ 			 */
++ 			truncate_inode_pages_range(inode->i_mapping, pos,
++ 					(pos+len) | (PAGE_CACHE_SIZE - 1));
++ 
++ 			osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
++ 		}
++ 
++ 
++ 		osd_req_op_extent_osd_data_pages(req, 0, pages, len, start,
++ 						 false, false);
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  
+- 		/* BUG_ON(vino.snap != CEPH_NOSNAP); */
+  		ceph_osdc_build_request(req, pos, snapc, vino.snap, &mtime);
+  
+- 		ret = ceph_osdc_start_request(&fsc->client->osdc, req, false);
++ 		if (aio_req) {
++ 			aio_req->total_len += len;
++ 			aio_req->num_reqs++;
++ 			atomic_inc(&aio_req->pending_reqs);
++ 
++ 			req->r_callback = ceph_aio_complete_req;
++ 			req->r_inode = inode;
++ 			req->r_priv = aio_req;
++ 			list_add_tail(&req->r_unsafe_item, &aio_req->osd_reqs);
++ 
++ 			pos += len;
++ 			iov_iter_advance(iter, len);
++ 			continue;
++ 		}
++ 
++ 		ret = ceph_osdc_start_request(req->r_osdc, req, false);
+  		if (!ret)
+  			ret = ceph_osdc_wait_request(&fsc->client->osdc, req);
+  
++ 		size = i_size_read(inode);
++ 		if (!write) {
++ 			if (ret == -ENOENT)
++ 				ret = 0;
++ 			if (ret >= 0 && ret < len && pos + ret < size) {
++ 				int zlen = min_t(size_t, len - ret,
++ 						 size - pos - ret);
++ 				ceph_zero_page_vector_range(start + ret, zlen,
++ 							    pages);
++ 				ret += zlen;
++ 			}
++ 			if (ret >= 0)
++ 				len = ret;
++ 		}
++ 
+  		ceph_put_page_vector(pages, num_pages, false);
+  
+ +out:
+  		ceph_osdc_put_request(req);
+++<<<<<<< HEAD
+ +		if (ret == 0) {
+ +			pos += len;
+ +			written += len;
+ +			iov_iter_advance(&i, (size_t)len);
+ +
+ +			if (pos > i_size_read(inode)) {
+ +				check_caps = ceph_inode_set_size(inode, pos);
+ +				if (check_caps)
+ +					ceph_check_caps(ceph_inode(inode),
+ +							CHECK_CAPS_AUTHONLY,
+ +							NULL);
+ +			}
+ +		} else
+ +			break;
+++=======
++ 		if (ret < 0)
++ 			break;
++ 
++ 		pos += len;
++ 		iov_iter_advance(iter, len);
++ 
++ 		if (!write && pos >= size)
++ 			break;
++ 
++ 		if (write && pos > size) {
++ 			if (ceph_inode_set_size(inode, pos))
++ 				ceph_check_caps(ceph_inode(inode),
++ 						CHECK_CAPS_AUTHONLY,
++ 						NULL);
++ 		}
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  	}
+  
+- 	if (ret != -EOLDSNAPC && written > 0) {
++ 	if (aio_req) {
++ 		if (aio_req->num_reqs == 0) {
++ 			kfree(aio_req);
++ 			return ret;
++ 		}
++ 
++ 		ceph_get_cap_refs(ci, write ? CEPH_CAP_FILE_WR :
++ 					      CEPH_CAP_FILE_RD);
++ 
++ 		while (!list_empty(&aio_req->osd_reqs)) {
++ 			req = list_first_entry(&aio_req->osd_reqs,
++ 					       struct ceph_osd_request,
++ 					       r_unsafe_item);
++ 			list_del_init(&req->r_unsafe_item);
++ 			if (ret >= 0)
++ 				ret = ceph_osdc_start_request(req->r_osdc,
++ 							      req, false);
++ 			if (ret < 0) {
++ 				req->r_result = ret;
++ 				ceph_aio_complete_req(req, NULL);
++ 			}
++ 		}
++ 		return -EIOCBQUEUED;
++ 	}
++ 
++ 	if (ret != -EOLDSNAPC && pos > iocb->ki_pos) {
++ 		ret = pos - iocb->ki_pos;
+  		iocb->ki_pos = pos;
+- 		ret = written;
+  	}
+  	return ret;
+  }
+@@@ -881,18 -1049,15 +1133,29 @@@ again
+  		     inode, ceph_vinop(inode), iocb->ki_pos, (unsigned)len,
+  		     ceph_cap_string(got));
+  
+ +		if (!read) {
+ +			ret = generic_segment_checks(iov, &nr_segs,
+ +							&len, VERIFY_WRITE);
+ +			if (ret)
+ +				goto out;
+ +		}
+ +
+ +		iov_iter_init(&i, iov, nr_segs, len, read);
+ +
+  		if (ci->i_inline_version == CEPH_INLINE_NONE) {
+++<<<<<<< HEAD
+ +			/* hmm, this isn't really async... */
+ +			ret = ceph_sync_read(iocb, &i, &retry_op);
+++=======
++ 			if (!retry_op && (iocb->ki_flags & IOCB_DIRECT)) {
++ 				ret = ceph_direct_read_write(iocb, to,
++ 							     NULL, NULL);
++ 				if (ret >= 0 && ret < len)
++ 					retry_op = CHECK_EOF;
++ 			} else {
++ 				ret = ceph_sync_read(iocb, to, &retry_op);
++ 			}
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  		} else {
+  			retry_op = READ_INLINE;
+  		}
+@@@ -1046,13 -1226,31 +1309,35 @@@ retry_snap
+  	     inode, ceph_vinop(inode), pos, count, ceph_cap_string(got));
+  
+  	if ((got & (CEPH_CAP_FILE_BUFFER|CEPH_CAP_FILE_LAZYIO)) == 0 ||
+ -	    (iocb->ki_flags & IOCB_DIRECT) || (fi->flags & CEPH_F_SYNC)) {
+ -		struct ceph_snap_context *snapc;
+ -		struct iov_iter data;
+ +	    (file->f_flags & O_DIRECT) || (fi->flags & CEPH_F_SYNC)) {
+  		mutex_unlock(&inode->i_mutex);
+++<<<<<<< HEAD
+ +		if (file->f_flags & O_DIRECT)
+ +			written = ceph_sync_direct_write(iocb, iov,
+ +							 nr_segs, count);
+++=======
++ 
++ 		spin_lock(&ci->i_ceph_lock);
++ 		if (__ceph_have_pending_cap_snap(ci)) {
++ 			struct ceph_cap_snap *capsnap =
++ 					list_last_entry(&ci->i_cap_snaps,
++ 							struct ceph_cap_snap,
++ 							ci_item);
++ 			snapc = ceph_get_snap_context(capsnap->context);
++ 		} else {
++ 			BUG_ON(!ci->i_head_snapc);
++ 			snapc = ceph_get_snap_context(ci->i_head_snapc);
++ 		}
++ 		spin_unlock(&ci->i_ceph_lock);
++ 
++ 		/* we might need to revert back to that point */
++ 		data = *from;
++ 		if (iocb->ki_flags & IOCB_DIRECT)
++ 			written = ceph_direct_read_write(iocb, &data, snapc,
++ 							 &prealloc_cf);
+++>>>>>>> c8fe9b17d055 (ceph: Asynchronous IO support)
+  		else
+ -			written = ceph_sync_write(iocb, &data, pos, snapc);
+ +			written = ceph_sync_write(iocb, iov, nr_segs, count);
+  		if (written == -EOLDSNAPC) {
+  			dout("aio_write %p %llx.%llx %llu~%u"
+  				"got EOLDSNAPC, retrying\n",
+* Unmerged path fs/ceph/file.c
