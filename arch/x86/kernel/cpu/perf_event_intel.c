@@ -1577,6 +1577,7 @@ static int intel_pmu_handle_irq(struct pt_regs *regs)
 
 	loops = 0;
 again:
+	intel_pmu_lbr_read();
 	intel_pmu_ack_status(status);
 	if (++loops > 100) {
 		WARN_ONCE(1, "perfevents: irq loop stuck!\n");
@@ -1587,7 +1588,6 @@ again:
 
 	inc_irq_stat(apic_perf_irqs);
 
-	intel_pmu_lbr_read();
 
 	/*
 	 * Ignore a range of extra bits in status that do not indicate
