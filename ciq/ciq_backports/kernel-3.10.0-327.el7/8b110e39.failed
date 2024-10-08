@@ -1,0 +1,701 @@
+Btrfs: implement repair function when direct read fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Miao Xie <miaox@cn.fujitsu.com>
+commit 8b110e393c5a6e72d50fcdf9fa7ed8b647cfdfc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8b110e39.failed
+
+This patch implement data repair function when direct read fails.
+
+The detail of the implementation is:
+- When we find the data is not right, we try to read the data from the other
+  mirror.
+- When the io on the mirror ends, we will insert the endio work into the
+  dedicated btrfs workqueue, not common read endio workqueue, because the
+  original endio work is still blocked in the btrfs endio workqueue, if we
+  insert the endio work of the io on the mirror into that workqueue, deadlock
+  would happen.
+- After we get right data, we write it back to the corrupted mirror.
+- And if the data on the new mirror is still corrupted, we will try next
+  mirror until we read right data or all the mirrors are traversed.
+- After the above work, we set the uptodate flag according to the result.
+
+	Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 8b110e393c5a6e72d50fcdf9fa7ed8b647cfdfc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/btrfs_inode.h
+#	fs/btrfs/extent_io.c
+#	fs/btrfs/extent_io.h
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/btrfs_inode.h
+index 1aa38414f6c8,7a7521c87c88..000000000000
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@@ -272,7 -266,12 +272,16 @@@ struct btrfs_dio_private 
+  
+  	/* dio_bio came from fs/direct-io.c */
+  	struct bio *dio_bio;
+++<<<<<<< HEAD
+ +	u8 csum[0];
+++=======
++ 
++ 	/*
++ 	 * The original bio may be splited to several sub-bios, this is
++ 	 * done during endio of sub-bios
++ 	 */
++ 	int (*subio_endio)(struct inode *, struct btrfs_io_bio *, int);
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  };
+  
+  /*
+diff --cc fs/btrfs/extent_io.c
+index ef4a66010819,9e2ef27672e5..000000000000
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@@ -1962,26 -1962,7 +1962,30 @@@ static void check_page_uptodate(struct 
+  		SetPageUptodate(page);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * When IO fails, either with EIO or csum verification fails, we
+ + * try other mirrors that might have a good copy of the data.  This
+ + * io_failure_record is used to record state as we go through all the
+ + * mirrors.  If another mirror has good data, the page is set up to date
+ + * and things continue.  If a good mirror can't be found, the original
+ + * bio end_io callback is called to indicate things have failed.
+ + */
+ +struct io_failure_record {
+ +	struct page *page;
+ +	u64 start;
+ +	u64 len;
+ +	u64 logical;
+ +	unsigned long bio_flags;
+ +	int this_mirror;
+ +	int failed_mirror;
+ +	int in_validation;
+ +};
+ +
+ +static int free_io_failure(struct inode *inode, struct io_failure_record *rec)
+++=======
++ int free_io_failure(struct inode *inode, struct io_failure_record *rec)
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  {
+  	int ret;
+  	int err = 0;
+@@@ -2305,21 -2279,33 +2309,42 @@@ static int bio_readpage_error(struct bi
+  	}
+  
+  	if (failrec->this_mirror > num_copies) {
+ -		pr_debug("Check Repairable: (fail) num_copies=%d, next_mirror %d, failed_mirror %d\n",
+ +		pr_debug("bio_readpage_error: (fail) num_copies=%d, next_mirror %d, failed_mirror %d\n",
+  			 num_copies, failrec->this_mirror, failed_mirror);
+ -		return 0;
+ +		free_io_failure(inode, failrec);
+ +		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return 1;
++ }
++ 
++ 
++ struct bio *btrfs_create_repair_bio(struct inode *inode, struct bio *failed_bio,
++ 				    struct io_failure_record *failrec,
++ 				    struct page *page, int pg_offset, int icsum,
++ 				    bio_end_io_t *endio_func, void *data)
++ {
++ 	struct bio *bio;
++ 	struct btrfs_io_bio *btrfs_failed_bio;
++ 	struct btrfs_io_bio *btrfs_bio;
++ 
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  	bio = btrfs_io_bio_alloc(GFP_NOFS, 1);
+ -	if (!bio)
+ -		return NULL;
+ -
+ -	bio->bi_end_io = endio_func;
+ -	bio->bi_iter.bi_sector = failrec->logical >> 9;
+ +	if (!bio) {
+ +		free_io_failure(inode, failrec);
+ +		return -EIO;
+ +	}
+ +	bio->bi_end_io = failed_bio->bi_end_io;
+ +	bio->bi_sector = failrec->logical >> 9;
+  	bio->bi_bdev = BTRFS_I(inode)->root->fs_info->fs_devices->latest_bdev;
+++<<<<<<< HEAD
+ +	bio->bi_size = 0;
+++=======
++ 	bio->bi_iter.bi_size = 0;
++ 	bio->bi_private = data;
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  
+  	btrfs_failed_bio = btrfs_io_bio(failed_bio);
+  	if (btrfs_failed_bio->csum) {
+@@@ -2334,11 -2319,59 +2359,65 @@@
+  		       csum_size);
+  	}
+  
+ -	bio_add_page(bio, page, failrec->len, pg_offset);
+ +	bio_add_page(bio, page, failrec->len, start - page_offset(page));
+  
+++<<<<<<< HEAD
+ +	pr_debug("bio_readpage_error: submitting new read[%#x] to "
+ +		 "this_mirror=%d, num_copies=%d, in_validation=%d\n", read_mode,
+ +		 failrec->this_mirror, num_copies, failrec->in_validation);
+++=======
++ 	return bio;
++ }
++ 
++ /*
++  * this is a generic handler for readpage errors (default
++  * readpage_io_failed_hook). if other copies exist, read those and write back
++  * good data to the failed position. does not investigate in remapping the
++  * failed extent elsewhere, hoping the device will be smart enough to do this as
++  * needed
++  */
++ 
++ static int bio_readpage_error(struct bio *failed_bio, u64 phy_offset,
++ 			      struct page *page, u64 start, u64 end,
++ 			      int failed_mirror)
++ {
++ 	struct io_failure_record *failrec;
++ 	struct inode *inode = page->mapping->host;
++ 	struct extent_io_tree *tree = &BTRFS_I(inode)->io_tree;
++ 	struct bio *bio;
++ 	int read_mode;
++ 	int ret;
++ 
++ 	BUG_ON(failed_bio->bi_rw & REQ_WRITE);
++ 
++ 	ret = btrfs_get_io_failure_record(inode, start, end, &failrec);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = btrfs_check_repairable(inode, failed_bio, failrec, failed_mirror);
++ 	if (!ret) {
++ 		free_io_failure(inode, failrec);
++ 		return -EIO;
++ 	}
++ 
++ 	if (failed_bio->bi_vcnt > 1)
++ 		read_mode = READ_SYNC | REQ_FAILFAST_DEV;
++ 	else
++ 		read_mode = READ_SYNC;
++ 
++ 	phy_offset >>= inode->i_sb->s_blocksize_bits;
++ 	bio = btrfs_create_repair_bio(inode, failed_bio, failrec, page,
++ 				      start - page_offset(page),
++ 				      (int)phy_offset, failed_bio->bi_end_io,
++ 				      NULL);
++ 	if (!bio) {
++ 		free_io_failure(inode, failrec);
++ 		return -EIO;
++ 	}
++ 
++ 	pr_debug("Repair Read Error: submitting new read[%#x] to this_mirror=%d, in_validation=%d\n",
++ 		 read_mode, failrec->this_mirror, failrec->in_validation);
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  
+  	ret = tree->ops->submit_bio_hook(inode, read_mode, bio,
+  					 failrec->this_mirror,
+diff --cc fs/btrfs/extent_io.h
+index c1d5f491439f,176a4b1ed520..000000000000
+--- a/fs/btrfs/extent_io.h
++++ b/fs/btrfs/extent_io.h
+@@@ -344,6 -346,35 +346,38 @@@ int clean_io_failure(struct inode *inod
+  int end_extent_writepage(struct page *page, int err, u64 start, u64 end);
+  int repair_eb_io_failure(struct btrfs_root *root, struct extent_buffer *eb,
+  			 int mirror_num);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * When IO fails, either with EIO or csum verification fails, we
++  * try other mirrors that might have a good copy of the data.  This
++  * io_failure_record is used to record state as we go through all the
++  * mirrors.  If another mirror has good data, the page is set up to date
++  * and things continue.  If a good mirror can't be found, the original
++  * bio end_io callback is called to indicate things have failed.
++  */
++ struct io_failure_record {
++ 	struct page *page;
++ 	u64 start;
++ 	u64 len;
++ 	u64 logical;
++ 	unsigned long bio_flags;
++ 	int this_mirror;
++ 	int failed_mirror;
++ 	int in_validation;
++ };
++ 
++ int btrfs_get_io_failure_record(struct inode *inode, u64 start, u64 end,
++ 				struct io_failure_record **failrec_ret);
++ int btrfs_check_repairable(struct inode *inode, struct bio *failed_bio,
++ 			   struct io_failure_record *failrec, int fail_mirror);
++ struct bio *btrfs_create_repair_bio(struct inode *inode, struct bio *failed_bio,
++ 				    struct io_failure_record *failrec,
++ 				    struct page *page, int pg_offset, int icsum,
++ 				    bio_end_io_t *endio_func, void *data);
++ int free_io_failure(struct inode *inode, struct io_failure_record *rec);
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+  noinline u64 find_lock_delalloc_range(struct inode *inode,
+  				      struct extent_io_tree *tree,
+diff --cc fs/btrfs/inode.c
+index a4bd5317d647,c3c3269a9e08..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -7186,47 -7242,276 +7186,316 @@@ unlock_err
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int submit_dio_repair_bio(struct inode *inode, struct bio *bio,
++ 					int rw, int mirror_num)
++ {
++ 	struct btrfs_root *root = BTRFS_I(inode)->root;
++ 	int ret;
++ 
++ 	BUG_ON(rw & REQ_WRITE);
++ 
++ 	bio_get(bio);
++ 
++ 	ret = btrfs_bio_wq_end_io(root->fs_info, bio,
++ 				  BTRFS_WQ_ENDIO_DIO_REPAIR);
++ 	if (ret)
++ 		goto err;
++ 
++ 	ret = btrfs_map_bio(root, rw, bio, mirror_num, 0);
++ err:
++ 	bio_put(bio);
++ 	return ret;
++ }
++ 
++ static int btrfs_check_dio_repairable(struct inode *inode,
++ 				      struct bio *failed_bio,
++ 				      struct io_failure_record *failrec,
++ 				      int failed_mirror)
++ {
++ 	int num_copies;
++ 
++ 	num_copies = btrfs_num_copies(BTRFS_I(inode)->root->fs_info,
++ 				      failrec->logical, failrec->len);
++ 	if (num_copies == 1) {
++ 		/*
++ 		 * we only have a single copy of the data, so don't bother with
++ 		 * all the retry and error correction code that follows. no
++ 		 * matter what the error is, it is very likely to persist.
++ 		 */
++ 		pr_debug("Check DIO Repairable: cannot repair, num_copies=%d, next_mirror %d, failed_mirror %d\n",
++ 			 num_copies, failrec->this_mirror, failed_mirror);
++ 		return 0;
++ 	}
++ 
++ 	failrec->failed_mirror = failed_mirror;
++ 	failrec->this_mirror++;
++ 	if (failrec->this_mirror == failed_mirror)
++ 		failrec->this_mirror++;
++ 
++ 	if (failrec->this_mirror > num_copies) {
++ 		pr_debug("Check DIO Repairable: (fail) num_copies=%d, next_mirror %d, failed_mirror %d\n",
++ 			 num_copies, failrec->this_mirror, failed_mirror);
++ 		return 0;
++ 	}
++ 
++ 	return 1;
++ }
++ 
++ static int dio_read_error(struct inode *inode, struct bio *failed_bio,
++ 			  struct page *page, u64 start, u64 end,
++ 			  int failed_mirror, bio_end_io_t *repair_endio,
++ 			  void *repair_arg)
++ {
++ 	struct io_failure_record *failrec;
++ 	struct bio *bio;
++ 	int isector;
++ 	int read_mode;
++ 	int ret;
++ 
++ 	BUG_ON(failed_bio->bi_rw & REQ_WRITE);
++ 
++ 	ret = btrfs_get_io_failure_record(inode, start, end, &failrec);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = btrfs_check_dio_repairable(inode, failed_bio, failrec,
++ 					 failed_mirror);
++ 	if (!ret) {
++ 		free_io_failure(inode, failrec);
++ 		return -EIO;
++ 	}
++ 
++ 	if (failed_bio->bi_vcnt > 1)
++ 		read_mode = READ_SYNC | REQ_FAILFAST_DEV;
++ 	else
++ 		read_mode = READ_SYNC;
++ 
++ 	isector = start - btrfs_io_bio(failed_bio)->logical;
++ 	isector >>= inode->i_sb->s_blocksize_bits;
++ 	bio = btrfs_create_repair_bio(inode, failed_bio, failrec, page,
++ 				      0, isector, repair_endio, repair_arg);
++ 	if (!bio) {
++ 		free_io_failure(inode, failrec);
++ 		return -EIO;
++ 	}
++ 
++ 	btrfs_debug(BTRFS_I(inode)->root->fs_info,
++ 		    "Repair DIO Read Error: submitting new dio read[%#x] to this_mirror=%d, in_validation=%d\n",
++ 		    read_mode, failrec->this_mirror, failrec->in_validation);
++ 
++ 	ret = submit_dio_repair_bio(inode, bio, read_mode,
++ 				    failrec->this_mirror);
++ 	if (ret) {
++ 		free_io_failure(inode, failrec);
++ 		bio_put(bio);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ struct btrfs_retry_complete {
++ 	struct completion done;
++ 	struct inode *inode;
++ 	u64 start;
++ 	int uptodate;
++ };
++ 
++ static void btrfs_retry_endio_nocsum(struct bio *bio, int err)
++ {
++ 	struct btrfs_retry_complete *done = bio->bi_private;
++ 	struct bio_vec *bvec;
++ 	int i;
++ 
++ 	if (err)
++ 		goto end;
++ 
++ 	done->uptodate = 1;
++ 	bio_for_each_segment_all(bvec, bio, i)
++ 		clean_io_failure(done->inode, done->start, bvec->bv_page, 0);
++ end:
++ 	complete(&done->done);
++ 	bio_put(bio);
++ }
++ 
++ static int __btrfs_correct_data_nocsum(struct inode *inode,
++ 				       struct btrfs_io_bio *io_bio)
++ {
++ 	struct bio_vec *bvec;
++ 	struct btrfs_retry_complete done;
++ 	u64 start;
++ 	int i;
++ 	int ret;
++ 
++ 	start = io_bio->logical;
++ 	done.inode = inode;
++ 
++ 	bio_for_each_segment_all(bvec, &io_bio->bio, i) {
++ try_again:
++ 		done.uptodate = 0;
++ 		done.start = start;
++ 		init_completion(&done.done);
++ 
++ 		ret = dio_read_error(inode, &io_bio->bio, bvec->bv_page, start,
++ 				     start + bvec->bv_len - 1,
++ 				     io_bio->mirror_num,
++ 				     btrfs_retry_endio_nocsum, &done);
++ 		if (ret)
++ 			return ret;
++ 
++ 		wait_for_completion(&done.done);
++ 
++ 		if (!done.uptodate) {
++ 			/* We might have another mirror, so try again */
++ 			goto try_again;
++ 		}
++ 
++ 		start += bvec->bv_len;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void btrfs_retry_endio(struct bio *bio, int err)
++ {
++ 	struct btrfs_retry_complete *done = bio->bi_private;
++ 	struct btrfs_io_bio *io_bio = btrfs_io_bio(bio);
++ 	struct bio_vec *bvec;
++ 	int uptodate;
++ 	int ret;
++ 	int i;
++ 
++ 	if (err)
++ 		goto end;
++ 
++ 	uptodate = 1;
++ 	bio_for_each_segment_all(bvec, bio, i) {
++ 		ret = __readpage_endio_check(done->inode, io_bio, i,
++ 					     bvec->bv_page, 0,
++ 					     done->start, bvec->bv_len);
++ 		if (!ret)
++ 			clean_io_failure(done->inode, done->start,
++ 					 bvec->bv_page, 0);
++ 		else
++ 			uptodate = 0;
++ 	}
++ 
++ 	done->uptodate = uptodate;
++ end:
++ 	complete(&done->done);
++ 	bio_put(bio);
++ }
++ 
++ static int __btrfs_subio_endio_read(struct inode *inode,
++ 				    struct btrfs_io_bio *io_bio, int err)
++ {
++ 	struct bio_vec *bvec;
++ 	struct btrfs_retry_complete done;
++ 	u64 start;
++ 	u64 offset = 0;
++ 	int i;
++ 	int ret;
++ 
++ 	err = 0;
++ 	start = io_bio->logical;
++ 	done.inode = inode;
++ 
++ 	bio_for_each_segment_all(bvec, &io_bio->bio, i) {
++ 		ret = __readpage_endio_check(inode, io_bio, i, bvec->bv_page,
++ 					     0, start, bvec->bv_len);
++ 		if (likely(!ret))
++ 			goto next;
++ try_again:
++ 		done.uptodate = 0;
++ 		done.start = start;
++ 		init_completion(&done.done);
++ 
++ 		ret = dio_read_error(inode, &io_bio->bio, bvec->bv_page, start,
++ 				     start + bvec->bv_len - 1,
++ 				     io_bio->mirror_num,
++ 				     btrfs_retry_endio, &done);
++ 		if (ret) {
++ 			err = ret;
++ 			goto next;
++ 		}
++ 
++ 		wait_for_completion(&done.done);
++ 
++ 		if (!done.uptodate) {
++ 			/* We might have another mirror, so try again */
++ 			goto try_again;
++ 		}
++ next:
++ 		offset += bvec->bv_len;
++ 		start += bvec->bv_len;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int btrfs_subio_endio_read(struct inode *inode,
++ 				  struct btrfs_io_bio *io_bio, int err)
++ {
++ 	bool skip_csum = BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM;
++ 
++ 	if (skip_csum) {
++ 		if (unlikely(err))
++ 			return __btrfs_correct_data_nocsum(inode, io_bio);
++ 		else
++ 			return 0;
++ 	} else {
++ 		return __btrfs_subio_endio_read(inode, io_bio, err);
++ 	}
++ }
++ 
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  static void btrfs_endio_direct_read(struct bio *bio, int err)
+  {
+  	struct btrfs_dio_private *dip = bio->bi_private;
+ +	struct bio_vec *bvec_end = bio->bi_io_vec + bio->bi_vcnt - 1;
+ +	struct bio_vec *bvec = bio->bi_io_vec;
+  	struct inode *inode = dip->inode;
+ +	struct btrfs_root *root = BTRFS_I(inode)->root;
+  	struct bio *dio_bio;
+ -	struct btrfs_io_bio *io_bio = btrfs_io_bio(bio);
+ +	u32 *csums = (u32 *)dip->csum;
+ +	int index = 0;
+ +	u64 start;
+ +
+++<<<<<<< HEAD
+ +	start = dip->logical_offset;
+ +	do {
+ +		if (!(BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)) {
+ +			struct page *page = bvec->bv_page;
+ +			char *kaddr;
+ +			u32 csum = ~(u32)0;
+ +			unsigned long flags;
+ +
+ +			local_irq_save(flags);
+ +			kaddr = kmap_atomic(page);
+ +			csum = btrfs_csum_data(kaddr + bvec->bv_offset,
+ +					       csum, bvec->bv_len);
+ +			btrfs_csum_final(csum, (char *)&csum);
+ +			kunmap_atomic(kaddr);
+ +			local_irq_restore(flags);
+ +
+ +			flush_dcache_page(bvec->bv_page);
+ +			if (csum != csums[index]) {
+ +				btrfs_err(root->fs_info, "csum failed ino %llu off %llu csum %u expected csum %u",
+ +					  btrfs_ino(inode), start, csum,
+ +					  csums[index]);
+ +				err = -EIO;
+ +			}
+ +		}
+  
+ +		start += bvec->bv_len;
+ +		bvec++;
+ +		index++;
+ +	} while (bvec <= bvec_end);
+++=======
++ 	if (dip->flags & BTRFS_DIO_ORIG_BIO_SUBMITTED)
++ 		err = btrfs_subio_endio_read(inode, io_bio, err);
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  
+  	unlock_extent(&BTRFS_I(inode)->io_tree, dip->logical_offset,
+  		      dip->logical_offset + dip->bytes - 1);
+@@@ -7303,11 -7591,17 +7572,25 @@@ static void btrfs_end_dio_bio(struct bi
+  {
+  	struct btrfs_dio_private *dip = bio->bi_private;
+  
+++<<<<<<< HEAD
+ +	if (err) {
+ +		btrfs_err(BTRFS_I(dip->inode)->root->fs_info,
+ +			  "direct IO failed ino %llu rw %lu sector %#Lx len %u err no %d",
+ +		      btrfs_ino(dip->inode), bio->bi_rw,
+ +		      (unsigned long long)bio->bi_sector, bio->bi_size, err);
+++=======
++ 	if (err)
++ 		btrfs_warn(BTRFS_I(dip->inode)->root->fs_info,
++ 			   "direct IO failed ino %llu rw %lu sector %#Lx len %u err no %d",
++ 			   btrfs_ino(dip->inode), bio->bi_rw,
++ 			   (unsigned long long)bio->bi_iter.bi_sector,
++ 			   bio->bi_iter.bi_size, err);
++ 
++ 	if (dip->subio_endio)
++ 		err = dip->subio_endio(dip->inode, btrfs_io_bio(bio), err);
++ 
++ 	if (err) {
+++>>>>>>> 8b110e393c5a (Btrfs: implement repair function when direct read fails)
+  		dip->errors = 1;
+  
+  		/*
+diff --git a/fs/btrfs/async-thread.c b/fs/btrfs/async-thread.c
+index fbd76ded9a34..2da0a66790ba 100644
+--- a/fs/btrfs/async-thread.c
++++ b/fs/btrfs/async-thread.c
+@@ -74,6 +74,7 @@ BTRFS_WORK_HELPER(endio_helper);
+ BTRFS_WORK_HELPER(endio_meta_helper);
+ BTRFS_WORK_HELPER(endio_meta_write_helper);
+ BTRFS_WORK_HELPER(endio_raid56_helper);
++BTRFS_WORK_HELPER(endio_repair_helper);
+ BTRFS_WORK_HELPER(rmw_helper);
+ BTRFS_WORK_HELPER(endio_write_helper);
+ BTRFS_WORK_HELPER(freespace_write_helper);
+diff --git a/fs/btrfs/async-thread.h b/fs/btrfs/async-thread.h
+index e9e31c94758f..e386c29ef1f6 100644
+--- a/fs/btrfs/async-thread.h
++++ b/fs/btrfs/async-thread.h
+@@ -53,6 +53,7 @@ BTRFS_WORK_HELPER_PROTO(endio_helper);
+ BTRFS_WORK_HELPER_PROTO(endio_meta_helper);
+ BTRFS_WORK_HELPER_PROTO(endio_meta_write_helper);
+ BTRFS_WORK_HELPER_PROTO(endio_raid56_helper);
++BTRFS_WORK_HELPER_PROTO(endio_repair_helper);
+ BTRFS_WORK_HELPER_PROTO(rmw_helper);
+ BTRFS_WORK_HELPER_PROTO(endio_write_helper);
+ BTRFS_WORK_HELPER_PROTO(freespace_write_helper);
+* Unmerged path fs/btrfs/btrfs_inode.h
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index fa328cfbd485..174e3750f137 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1538,6 +1538,7 @@ struct btrfs_fs_info {
+ 	struct btrfs_workqueue *endio_workers;
+ 	struct btrfs_workqueue *endio_meta_workers;
+ 	struct btrfs_workqueue *endio_raid56_workers;
++	struct btrfs_workqueue *endio_repair_workers;
+ 	struct btrfs_workqueue *rmw_workers;
+ 	struct btrfs_workqueue *endio_meta_write_workers;
+ 	struct btrfs_workqueue *endio_write_workers;
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 4e2b3dcf79c5..158e4b182afe 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -713,7 +713,11 @@ static void end_workqueue_bio(struct bio *bio, int err)
+ 			func = btrfs_endio_write_helper;
+ 		}
+ 	} else {
+-		if (end_io_wq->metadata == BTRFS_WQ_ENDIO_RAID56) {
++		if (unlikely(end_io_wq->metadata ==
++			     BTRFS_WQ_ENDIO_DIO_REPAIR)) {
++			wq = fs_info->endio_repair_workers;
++			func = btrfs_endio_repair_helper;
++		} else if (end_io_wq->metadata == BTRFS_WQ_ENDIO_RAID56) {
+ 			wq = fs_info->endio_raid56_workers;
+ 			func = btrfs_endio_raid56_helper;
+ 		} else if (end_io_wq->metadata) {
+@@ -741,6 +745,7 @@ int btrfs_bio_wq_end_io(struct btrfs_fs_info *info, struct bio *bio,
+ 			int metadata)
+ {
+ 	struct end_io_wq *end_io_wq;
++
+ 	end_io_wq = kmalloc(sizeof(*end_io_wq), GFP_NOFS);
+ 	if (!end_io_wq)
+ 		return -ENOMEM;
+@@ -2057,6 +2062,7 @@ static void btrfs_stop_all_workers(struct btrfs_fs_info *fs_info)
+ 	btrfs_destroy_workqueue(fs_info->endio_workers);
+ 	btrfs_destroy_workqueue(fs_info->endio_meta_workers);
+ 	btrfs_destroy_workqueue(fs_info->endio_raid56_workers);
++	btrfs_destroy_workqueue(fs_info->endio_repair_workers);
+ 	btrfs_destroy_workqueue(fs_info->rmw_workers);
+ 	btrfs_destroy_workqueue(fs_info->endio_meta_write_workers);
+ 	btrfs_destroy_workqueue(fs_info->endio_write_workers);
+@@ -2574,6 +2580,8 @@ int open_ctree(struct super_block *sb,
+ 		btrfs_alloc_workqueue("endio-meta-write", flags, max_active, 2);
+ 	fs_info->endio_raid56_workers =
+ 		btrfs_alloc_workqueue("endio-raid56", flags, max_active, 4);
++	fs_info->endio_repair_workers =
++		btrfs_alloc_workqueue("endio-repair", flags, 1, 0);
+ 	fs_info->rmw_workers =
+ 		btrfs_alloc_workqueue("rmw", flags, max_active, 2);
+ 	fs_info->endio_write_workers =
+@@ -2595,6 +2603,7 @@ int open_ctree(struct super_block *sb,
+ 	      fs_info->submit_workers && fs_info->flush_workers &&
+ 	      fs_info->endio_workers && fs_info->endio_meta_workers &&
+ 	      fs_info->endio_meta_write_workers &&
++	      fs_info->endio_repair_workers &&
+ 	      fs_info->endio_write_workers && fs_info->endio_raid56_workers &&
+ 	      fs_info->endio_freespace_worker && fs_info->rmw_workers &&
+ 	      fs_info->caching_workers && fs_info->readahead_workers &&
+diff --git a/fs/btrfs/disk-io.h b/fs/btrfs/disk-io.h
+index 52a17db700fc..14d06ee1e143 100644
+--- a/fs/btrfs/disk-io.h
++++ b/fs/btrfs/disk-io.h
+@@ -30,6 +30,7 @@ enum {
+ 	BTRFS_WQ_ENDIO_METADATA = 1,
+ 	BTRFS_WQ_ENDIO_FREE_SPACE = 2,
+ 	BTRFS_WQ_ENDIO_RAID56 = 3,
++	BTRFS_WQ_ENDIO_DIO_REPAIR = 4,
+ };
+ 
+ static inline u64 btrfs_sb_offset(int mirror)
+* Unmerged path fs/btrfs/extent_io.c
+* Unmerged path fs/btrfs/extent_io.h
+* Unmerged path fs/btrfs/inode.c
