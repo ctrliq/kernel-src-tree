@@ -1,0 +1,375 @@
+bridge: Automatically manage port promiscuous mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] bridge: Automatically manage port promiscuous mode (Vlad Yasevich) [896669]
+Rebuild_FUZZ: 99.01%
+commit-author Vlad Yasevich <vyasevic@redhat.com>
+commit 2796d0c648c940b4796f84384fbcfb0a2399db84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2796d0c6.failed
+
+There exist configurations where the administrator or another management
+entity has the foreknowledge of all the mac addresses of end systems
+that are being bridged together.
+
+In these environments, the administrator can statically configure known
+addresses in the bridge FDB and disable flooding and learning on ports.
+This makes it possible to turn off promiscuous mode on the interfaces
+connected to the bridge.
+
+Here is why disabling flooding and learning allows us to control
+promiscuity:
+ Consider port X.  All traffic coming into this port from outside the
+bridge (ingress) will be either forwarded through other ports of the
+bridge (egress) or dropped.  Forwarding (egress) is defined by FDB
+entries and by flooding in the event that no FDB entry exists.
+In the event that flooding is disabled, only FDB entries define
+the egress.  Once learning is disabled, only static FDB entries
+provided by a management entity define the egress.  If we provide
+information from these static FDBs to the ingress port X, then we'll
+be able to accept all traffic that can be successfully forwarded and
+drop all the other traffic sooner without spending CPU cycles to
+process it.
+ Another way to define the above is as following equations:
+    ingress = egress + drop
+ expanding egress
+    ingress = static FDB + learned FDB + flooding + drop
+ disabling flooding and learning we a left with
+    ingress = static FDB + drop
+
+By adding addresses from the static FDB entries to the MAC address
+filter of an ingress port X, we fully define what the bridge can
+process without dropping and can thus turn off promiscuous mode,
+thus dropping packets sooner.
+
+There have been suggestions that we may want to allow learning
+and update the filters with learned addresses as well.  This
+would require mac-level authentication similar to 802.1x to
+prevent attacks against the hw filters as they are limited
+resource.
+
+Additionally, if the user places the bridge device in promiscuous mode,
+all ports are placed in promiscuous mode regardless of the changes
+to flooding and learning.
+
+Since the above functionality depends on full static configuration,
+we have also require that vlan filtering be enabled to take
+advantage of this.  The reason is that the bridge has to be
+able to receive and process VLAN-tagged frames and the there
+are only 2 ways to accomplish this right now: promiscuous mode
+or vlan filtering.
+
+	Suggested-by: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2796d0c648c940b4796f84384fbcfb0a2399db84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_if.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_if.c
+index 2f236b5d13fb,091d39f5067c..000000000000
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@@ -85,6 -85,110 +85,113 @@@ void br_port_carrier_check(struct net_b
+  	spin_unlock_bh(&br->lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void br_port_set_promisc(struct net_bridge_port *p)
++ {
++ 	int err = 0;
++ 
++ 	if (br_promisc_port(p))
++ 		return;
++ 
++ 	err = dev_set_promiscuity(p->dev, 1);
++ 	if (err)
++ 		return;
++ 
++ 	br_fdb_unsync_static(p->br, p);
++ 	p->flags |= BR_PROMISC;
++ }
++ 
++ static void br_port_clear_promisc(struct net_bridge_port *p)
++ {
++ 	int err;
++ 
++ 	/* Check if the port is already non-promisc or if it doesn't
++ 	 * support UNICAST filtering.  Without unicast filtering support
++ 	 * we'll end up re-enabling promisc mode anyway, so just check for
++ 	 * it here.
++ 	 */
++ 	if (!br_promisc_port(p) || !(p->dev->priv_flags & IFF_UNICAST_FLT))
++ 		return;
++ 
++ 	/* Since we'll be clearing the promisc mode, program the port
++ 	 * first so that we don't have interruption in traffic.
++ 	 */
++ 	err = br_fdb_sync_static(p->br, p);
++ 	if (err)
++ 		return;
++ 
++ 	dev_set_promiscuity(p->dev, -1);
++ 	p->flags &= ~BR_PROMISC;
++ }
++ 
++ /* When a port is added or removed or when certain port flags
++  * change, this function is called to automatically manage
++  * promiscuity setting of all the bridge ports.  We are always called
++  * under RTNL so can skip using rcu primitives.
++  */
++ void br_manage_promisc(struct net_bridge *br)
++ {
++ 	struct net_bridge_port *p;
++ 	bool set_all = false;
++ 
++ 	/* If vlan filtering is disabled or bridge interface is placed
++ 	 * into promiscuous mode, place all ports in promiscuous mode.
++ 	 */
++ 	if ((br->dev->flags & IFF_PROMISC) || !br_vlan_enabled(br))
++ 		set_all = true;
++ 
++ 	list_for_each_entry(p, &br->port_list, list) {
++ 		if (set_all) {
++ 			br_port_set_promisc(p);
++ 		} else {
++ 			/* If the number of auto-ports is <= 1, then all other
++ 			 * ports will have their output configuration
++ 			 * statically specified through fdbs.  Since ingress
++ 			 * on the auto-port becomes forwarding/egress to other
++ 			 * ports and egress configuration is statically known,
++ 			 * we can say that ingress configuration of the
++ 			 * auto-port is also statically known.
++ 			 * This lets us disable promiscuous mode and write
++ 			 * this config to hw.
++ 			 */
++ 			if (br->auto_cnt <= br_auto_port(p))
++ 				br_port_clear_promisc(p);
++ 			else
++ 				br_port_set_promisc(p);
++ 		}
++ 	}
++ }
++ 
++ static void nbp_update_port_count(struct net_bridge *br)
++ {
++ 	struct net_bridge_port *p;
++ 	u32 cnt = 0;
++ 
++ 	list_for_each_entry(p, &br->port_list, list) {
++ 		if (br_auto_port(p))
++ 			cnt++;
++ 	}
++ 	if (br->auto_cnt != cnt) {
++ 		br->auto_cnt = cnt;
++ 		br_manage_promisc(br);
++ 	}
++ }
++ 
++ static void nbp_delete_promisc(struct net_bridge_port *p)
++ {
++ 	/* If port is currently promiscous, unset promiscuity.
++ 	 * Otherwise, it is a static port so remove all addresses
++ 	 * from it.
++ 	 */
++ 	dev_set_allmulti(p->dev, -1);
++ 	if (br_promisc_port(p))
++ 		dev_set_promiscuity(p->dev, -1);
++ 	else
++ 		br_fdb_unsync_static(p->br, p);
++ }
++ 
+++>>>>>>> 2796d0c648c9 (bridge: Automatically manage port promiscuous mode.)
+  static void release_nbp(struct kobject *kobj)
+  {
+  	struct net_bridge_port *p
+@@@ -141,11 -245,12 +248,15 @@@ static void del_nbp(struct net_bridge_p
+  
+  	br_ifinfo_notify(RTM_DELLINK, p);
+  
++ 	list_del_rcu(&p->list);
++ 
+++<<<<<<< HEAD
+++=======
+  	nbp_vlan_flush(p);
+  	br_fdb_delete_by_port(br, p, 1);
++ 	nbp_update_port_count(br);
+  
+- 	list_del_rcu(&p->list);
+- 
+++>>>>>>> 2796d0c648c9 (bridge: Automatically manage port promiscuous mode.)
+  	dev->priv_flags &= ~IFF_BRIDGE_PORT;
+  
+  	netdev_rx_handler_unregister(dev);
+diff --cc net/bridge/br_private.h
+index 10b5654d52ef,2b2286d8572d..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -385,71 -374,61 +385,84 @@@ static inline void br_netpoll_disable(s
+  #endif
+  
+  /* br_fdb.c */
+ -int br_fdb_init(void);
+ -void br_fdb_fini(void);
+ -void br_fdb_flush(struct net_bridge *br);
+ -void br_fdb_find_delete_local(struct net_bridge *br,
+ -			      const struct net_bridge_port *p,
+ -			      const unsigned char *addr, u16 vid);
+ -void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr);
+ -void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr);
+ -void br_fdb_cleanup(unsigned long arg);
+ -void br_fdb_delete_by_port(struct net_bridge *br,
+ -			   const struct net_bridge_port *p, int do_all);
+ -struct net_bridge_fdb_entry *__br_fdb_get(struct net_bridge *br,
+ -					  const unsigned char *addr, __u16 vid);
+ -int br_fdb_test_addr(struct net_device *dev, unsigned char *addr);
+ -int br_fdb_fillbuf(struct net_bridge *br, void *buf, unsigned long count,
+ -		   unsigned long off);
+ -int br_fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
+ -		  const unsigned char *addr, u16 vid);
+ -void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ -		   const unsigned char *addr, u16 vid, bool added_by_user);
+ -
+ -int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
+ -		  struct net_device *dev, const unsigned char *addr);
+ -int br_fdb_add(struct ndmsg *nlh, struct nlattr *tb[], struct net_device *dev,
+ -	       const unsigned char *addr, u16 nlh_flags);
+ -int br_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ -		struct net_device *dev, int idx);
+ -int br_fdb_sync_static(struct net_bridge *br, struct net_bridge_port *p);
+ -void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p);
+ +extern int br_fdb_init(void);
+ +extern void br_fdb_fini(void);
+ +extern void br_fdb_flush(struct net_bridge *br);
+ +extern void br_fdb_changeaddr(struct net_bridge_port *p,
+ +			      const unsigned char *newaddr);
+ +extern void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr);
+ +extern void br_fdb_cleanup(unsigned long arg);
+ +extern void br_fdb_delete_by_port(struct net_bridge *br,
+ +				  const struct net_bridge_port *p, int do_all);
+ +extern struct net_bridge_fdb_entry *__br_fdb_get(struct net_bridge *br,
+ +						 const unsigned char *addr,
+ +						 __u16 vid);
+ +extern int br_fdb_test_addr(struct net_device *dev, unsigned char *addr);
+ +extern int br_fdb_fillbuf(struct net_bridge *br, void *buf,
+ +			  unsigned long count, unsigned long off);
+ +extern int br_fdb_insert(struct net_bridge *br,
+ +			 struct net_bridge_port *source,
+ +			 const unsigned char *addr,
+ +			 u16 vid);
+ +extern void br_fdb_update(struct net_bridge *br,
+ +			  struct net_bridge_port *source,
+ +			  const unsigned char *addr,
+ +			  u16 vid);
+ +extern int fdb_delete_by_addr(struct net_bridge *br, const u8 *addr, u16 vid);
+ +
+ +extern int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
+ +			 struct net_device *dev,
+ +			 const unsigned char *addr);
+ +extern int br_fdb_add(struct ndmsg *nlh, struct nlattr *tb[],
+ +		      struct net_device *dev,
+ +		      const unsigned char *addr,
+ +		      u16 nlh_flags);
+ +extern int br_fdb_dump(struct sk_buff *skb,
+ +		       struct netlink_callback *cb,
+ +		       struct net_device *dev,
+ +		       int idx);
+  
+  /* br_forward.c */
+ -void br_deliver(const struct net_bridge_port *to, struct sk_buff *skb);
+ -int br_dev_queue_push_xmit(struct sk_buff *skb);
+ -void br_forward(const struct net_bridge_port *to,
+ +extern void br_deliver(const struct net_bridge_port *to,
+ +		struct sk_buff *skb);
+ +extern int br_dev_queue_push_xmit(struct sk_buff *skb);
+ +extern void br_forward(const struct net_bridge_port *to,
+  		struct sk_buff *skb, struct sk_buff *skb0);
+ -int br_forward_finish(struct sk_buff *skb);
+ -void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb, bool unicast);
+ -void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
+ -		      struct sk_buff *skb2, bool unicast);
+ +extern int br_forward_finish(struct sk_buff *skb);
+ +extern void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb,
+ +			     bool unicast);
+ +extern void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
+ +			     struct sk_buff *skb2, bool unicast);
+  
+  /* br_if.c */
+++<<<<<<< HEAD
+ +extern void br_port_carrier_check(struct net_bridge_port *p);
+ +extern int br_add_bridge(struct net *net, const char *name);
+ +extern int br_del_bridge(struct net *net, const char *name);
+ +extern void br_net_exit(struct net *net);
+ +extern int br_add_if(struct net_bridge *br,
+ +	      struct net_device *dev);
+ +extern int br_del_if(struct net_bridge *br,
+ +	      struct net_device *dev);
+ +extern int br_min_mtu(const struct net_bridge *br);
+ +extern netdev_features_t br_features_recompute(struct net_bridge *br,
+ +	netdev_features_t features);
+++=======
++ void br_port_carrier_check(struct net_bridge_port *p);
++ int br_add_bridge(struct net *net, const char *name);
++ int br_del_bridge(struct net *net, const char *name);
++ int br_add_if(struct net_bridge *br, struct net_device *dev);
++ int br_del_if(struct net_bridge *br, struct net_device *dev);
++ int br_min_mtu(const struct net_bridge *br);
++ netdev_features_t br_features_recompute(struct net_bridge *br,
++ 					netdev_features_t features);
++ void br_port_flags_change(struct net_bridge_port *port, unsigned long mask);
++ void br_manage_promisc(struct net_bridge *br);
+++>>>>>>> 2796d0c648c9 (bridge: Automatically manage port promiscuous mode.)
+  
+  /* br_input.c */
+ -int br_handle_frame_finish(struct sk_buff *skb);
+ -rx_handler_result_t br_handle_frame(struct sk_buff **pskb);
+ +extern int br_handle_frame_finish(struct sk_buff *skb);
+ +extern rx_handler_result_t br_handle_frame(struct sk_buff **pskb);
+  
+  static inline bool br_rx_handler_check_rcu(const struct net_device *dev)
+  {
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index 81af363dda66..c0b4a75ae9b1 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -112,6 +112,12 @@ static void br_dev_set_multicast_list(struct net_device *dev)
+ {
+ }
+ 
++static void br_dev_change_rx_flags(struct net_device *dev, int change)
++{
++	if (change & IFF_PROMISC)
++		br_manage_promisc(netdev_priv(dev));
++}
++
+ static int br_dev_stop(struct net_device *dev)
+ {
+ 	struct net_bridge *br = netdev_priv(dev);
+@@ -306,6 +312,7 @@ static const struct net_device_ops br_netdev_ops = {
+ 	.ndo_get_stats64	 = br_get_stats64,
+ 	.ndo_set_mac_address	 = br_set_mac_address,
+ 	.ndo_set_rx_mode	 = br_dev_set_multicast_list,
++	.ndo_change_rx_flags	 = br_dev_change_rx_flags,
+ 	.ndo_change_mtu		 = br_change_mtu,
+ 	.ndo_do_ioctl		 = br_dev_ioctl,
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+* Unmerged path net/bridge/br_if.c
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index af5ebd18d705..a3e3257e6d42 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -325,6 +325,7 @@ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ 		goto unlock;
+ 
+ 	br->vlan_enabled = val;
++	br_manage_promisc(br);
+ 
+ unlock:
+ 	rtnl_unlock();
