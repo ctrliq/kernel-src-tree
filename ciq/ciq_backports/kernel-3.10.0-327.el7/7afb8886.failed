@@ -1,0 +1,98 @@
+rtnetlink: call ->dellink on failure when ->newlink exists
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 7afb8886a05be68e376655539a064ec672de8a8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7afb8886.failed
+
+Ignacy reported that when eth0 is down and add a vlan device
+on top of it like:
+
+  ip link add link eth0 name eth0.1 up type vlan id 1
+
+We will get a refcount leak:
+
+  unregister_netdevice: waiting for eth0.1 to become free. Usage count = 2
+
+The problem is when rtnl_configure_link() fails in rtnl_newlink(),
+we simply call unregister_device(), but for stacked device like vlan,
+we almost do nothing when we unregister the upper device, more work
+is done when we unregister the lower device, so call its ->dellink().
+
+	Reported-by: Ignacy Gawedzki <ignacy.gawedzki@green-communications.fr>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7afb8886a05be68e376655539a064ec672de8a8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/rtnetlink.c
+diff --cc net/core/rtnetlink.c
+index 164916e79775,ab293a3066b3..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1917,20 -2141,46 +1917,40 @@@ replay
+  
+  		dev->ifindex = ifm->ifi_index;
+  
+ -		if (ops->newlink) {
+ -			err = ops->newlink(link_net ? : net, dev, tb, data);
+ -			/* Drivers should call free_netdev() in ->destructor
+ -			 * and unregister it on failure after registration
+ -			 * so that device could be finally freed in rtnl_unlock.
+ -			 */
+ -			if (err < 0) {
+ -				/* If device is not registered at all, free it now */
+ -				if (dev->reg_state == NETREG_UNINITIALIZED)
+ -					free_netdev(dev);
+ -				goto out;
+ -			}
+ -		} else {
+ +		if (ops->newlink)
+ +			err = ops->newlink(net, dev, tb, data);
+ +		else
+  			err = register_netdevice(dev);
+++<<<<<<< HEAD
+++=======
++ 			if (err < 0) {
++ 				free_netdev(dev);
++ 				goto out;
++ 			}
++ 		}
++ 		err = rtnl_configure_link(dev, ifm);
++ 		if (err < 0) {
++ 			if (ops->newlink) {
++ 				LIST_HEAD(list_kill);
++ 
++ 				ops->dellink(dev, &list_kill);
++ 				unregister_netdevice_many(&list_kill);
++ 			} else {
++ 				unregister_netdevice(dev);
++ 			}
++ 			goto out;
++ 		}
+++>>>>>>> 7afb8886a05b (rtnetlink: call ->dellink on failure when ->newlink exists)
+  
+ -		if (link_net) {
+ -			err = dev_change_net_namespace(dev, dest_net, ifname);
+ -			if (err < 0)
+ -				unregister_netdevice(dev);
+ -		}
+ +		if (err < 0 && !IS_ERR(dev))
+ +			free_netdev(dev);
+ +		if (err < 0)
+ +			goto out;
+ +
+ +		err = rtnl_configure_link(dev, ifm);
+ +		if (err < 0)
+ +			unregister_netdevice(dev);
+  out:
+ -		if (link_net)
+ -			put_net(link_net);
+  		put_net(dest_net);
+  		return err;
+  	}
+* Unmerged path net/core/rtnetlink.c
