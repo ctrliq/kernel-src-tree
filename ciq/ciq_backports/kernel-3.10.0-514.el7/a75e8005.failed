@@ -1,0 +1,446 @@
+i40e: queue-specific settings for interrupt moderation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit a75e8005d506f374554b17383c39aa82db0ea860
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a75e8005.failed
+
+For i40e driver, each vector has its own ITR register. However, there
+are no concept of queue-specific settings in the driver proper. Only
+global variable is used to store ITR values. That will cause problems
+especially when resetting the vector. The specific ITR values could be
+lost.
+This patch move rx_itr_setting and tx_itr_setting to i40e_ring to store
+specific ITR register for each queue.
+i40e_get_coalesce and i40e_set_coalesce are also modified accordingly to
+support queue-specific settings. To make it compatible with old ethtool,
+if user doesn't specify the queue number, i40e_get_coalesce will return
+queue 0's value. While i40e_set_coalesce will apply value to all queues.
+
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Acked-by: Shannon Nelson <shannon.nelson@intel.com>
+	Acked-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a75e8005d506f374554b17383c39aa82db0ea860)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e.h
+#	drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e.h
+index 93e17a9fb144,2f6210ae8ba0..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@@ -498,16 -521,10 +498,20 @@@ struct i40e_vsi 
+  	struct i40e_ring **tx_rings;
+  
+  	u16 work_limit;
+++<<<<<<< HEAD
+ +	/* high bit set means dynamic, use accessor routines to read/write.
+ +	 * hardware only supports 2us resolution for the ITR registers.
+ +	 * these values always store the USER setting, and must be converted
+ +	 * before programming to a register.
+ +	 */
+ +	u16 rx_itr_setting;
+ +	u16 tx_itr_setting;
+++=======
++ 	u16 int_rate_limit;  /* value in usecs */
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  
+ -	u16 rss_table_size; /* HW RSS table size */
+ -	u16 rss_size;       /* Allocated RSS queues */
+ +	u16 rss_table_size;
+ +	u16 rss_size;
+  	u8  *rss_hkey_user; /* User configured hash keys */
+  	u8  *rss_lut_user;  /* User configured lookup table entries */
+  
+diff --cc drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index d917fccb5422,a4705999cbc9..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@@ -1812,14 -1889,32 +1813,37 @@@ static int __i40e_get_coalesce(struct n
+  	ec->tx_max_coalesced_frames_irq = vsi->work_limit;
+  	ec->rx_max_coalesced_frames_irq = vsi->work_limit;
+  
+- 	if (ITR_IS_DYNAMIC(vsi->rx_itr_setting))
++ 	/* rx and tx usecs has per queue value. If user doesn't specify the queue,
++ 	 * return queue 0's value to represent.
++ 	 */
++ 	if (queue < 0) {
++ 		queue = 0;
++ 	} else if (queue >= vsi->num_queue_pairs) {
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ITR_IS_DYNAMIC(vsi->rx_rings[queue]->rx_itr_setting))
+  		ec->use_adaptive_rx_coalesce = 1;
+  
+- 	if (ITR_IS_DYNAMIC(vsi->tx_itr_setting))
++ 	if (ITR_IS_DYNAMIC(vsi->tx_rings[queue]->tx_itr_setting))
+  		ec->use_adaptive_tx_coalesce = 1;
+  
+++<<<<<<< HEAD
+ +	ec->rx_coalesce_usecs = vsi->rx_itr_setting & ~I40E_ITR_DYNAMIC;
+ +	ec->tx_coalesce_usecs = vsi->tx_itr_setting & ~I40E_ITR_DYNAMIC;
+++=======
++ 	ec->rx_coalesce_usecs = vsi->rx_rings[queue]->rx_itr_setting & ~I40E_ITR_DYNAMIC;
++ 	ec->tx_coalesce_usecs = vsi->tx_rings[queue]->tx_itr_setting & ~I40E_ITR_DYNAMIC;
++ 
++ 	/* we use the _usecs_high to store/set the interrupt rate limit
++ 	 * that the hardware supports, that almost but not quite
++ 	 * fits the original intent of the ethtool variable,
++ 	 * the rx_coalesce_usecs_high limits total interrupts
++ 	 * per second from both tx/rx sources.
++ 	 */
++ 	ec->rx_coalesce_usecs_high = vsi->int_rate_limit;
++ 	ec->tx_coalesce_usecs_high = vsi->int_rate_limit;
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  
+  	return 0;
+  }
+@@@ -1838,51 -1975,51 +1904,90 @@@ static int __i40e_set_coalesce(struct n
+  	if (ec->tx_max_coalesced_frames_irq || ec->rx_max_coalesced_frames_irq)
+  		vsi->work_limit = ec->tx_max_coalesced_frames_irq;
+  
+++<<<<<<< HEAD
+ +	vector = vsi->base_vector;
+ +	if ((ec->rx_coalesce_usecs >= (I40E_MIN_ITR << 1)) &&
+ +	    (ec->rx_coalesce_usecs <= (I40E_MAX_ITR << 1))) {
+ +		vsi->rx_itr_setting = ec->rx_coalesce_usecs;
+ +	} else if (ec->rx_coalesce_usecs == 0) {
+ +		vsi->rx_itr_setting = ec->rx_coalesce_usecs;
+++=======
++ 	/* tx_coalesce_usecs_high is ignored, use rx-usecs-high instead */
++ 	if (ec->tx_coalesce_usecs_high != vsi->int_rate_limit) {
++ 		netif_info(pf, drv, netdev, "tx-usecs-high is not used, please program rx-usecs-high\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ec->rx_coalesce_usecs_high >= INTRL_REG_TO_USEC(I40E_MAX_INTRL)) {
++ 		netif_info(pf, drv, netdev, "Invalid value, rx-usecs-high range is 0-235\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ec->rx_coalesce_usecs == 0) {
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  		if (ec->use_adaptive_rx_coalesce)
+  			netif_info(pf, drv, netdev, "rx-usecs=0, need to disable adaptive-rx for a complete disable\n");
+- 	} else {
+- 		netif_info(pf, drv, netdev, "Invalid value, rx-usecs range is 0-8160\n");
+- 		return -EINVAL;
++ 	} else if ((ec->rx_coalesce_usecs < (I40E_MIN_ITR << 1)) ||
++ 		   (ec->rx_coalesce_usecs > (I40E_MAX_ITR << 1))) {
++ 			netif_info(pf, drv, netdev, "Invalid value, rx-usecs range is 0-8160\n");
++ 			return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if ((ec->tx_coalesce_usecs >= (I40E_MIN_ITR << 1)) &&
+ +	    (ec->tx_coalesce_usecs <= (I40E_MAX_ITR << 1))) {
+ +		vsi->tx_itr_setting = ec->tx_coalesce_usecs;
+ +	} else if (ec->tx_coalesce_usecs == 0) {
+ +		vsi->tx_itr_setting = ec->tx_coalesce_usecs;
+++=======
++ 	vsi->int_rate_limit = ec->rx_coalesce_usecs_high;
++ 
++ 	if (ec->tx_coalesce_usecs == 0) {
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  		if (ec->use_adaptive_tx_coalesce)
+  			netif_info(pf, drv, netdev, "tx-usecs=0, need to disable adaptive-tx for a complete disable\n");
++ 	} else if ((ec->tx_coalesce_usecs < (I40E_MIN_ITR << 1)) ||
++ 		   (ec->tx_coalesce_usecs > (I40E_MAX_ITR << 1))) {
++ 			netif_info(pf, drv, netdev, "Invalid value, tx-usecs range is 0-8160\n");
++ 			return -EINVAL;
++ 	}
++ 
++ 	/* rx and tx usecs has per queue value. If user doesn't specify the queue,
++ 	 * apply to all queues.
++ 	 */
++ 	if (queue < 0) {
++ 		for (i = 0; i < vsi->num_queue_pairs; i++)
++ 			i40e_set_itr_per_queue(vsi, ec, i);
++ 	} else if (queue < vsi->num_queue_pairs) {
++ 		i40e_set_itr_per_queue(vsi, ec, queue);
+  	} else {
+- 		netif_info(pf, drv, netdev,
+- 			   "Invalid value, tx-usecs range is 0-8160\n");
++ 		netif_info(pf, drv, netdev, "Invalid queue value, queue range is 0 - %d\n",
++ 			   vsi->num_queue_pairs - 1);
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ec->use_adaptive_rx_coalesce)
+ +		vsi->rx_itr_setting |= I40E_ITR_DYNAMIC;
+ +	else
+ +		vsi->rx_itr_setting &= ~I40E_ITR_DYNAMIC;
+ +
+ +	if (ec->use_adaptive_tx_coalesce)
+ +		vsi->tx_itr_setting |= I40E_ITR_DYNAMIC;
+ +	else
+ +		vsi->tx_itr_setting &= ~I40E_ITR_DYNAMIC;
+ +
+ +	for (i = 0; i < vsi->num_q_vectors; i++, vector++) {
+ +		q_vector = vsi->q_vectors[i];
+ +		q_vector->rx.itr = ITR_TO_REG(vsi->rx_itr_setting);
+ +		wr32(hw, I40E_PFINT_ITRN(0, vector - 1), q_vector->rx.itr);
+ +		q_vector->tx.itr = ITR_TO_REG(vsi->tx_itr_setting);
+ +		wr32(hw, I40E_PFINT_ITRN(1, vector - 1), q_vector->tx.itr);
+ +		i40e_flush(hw);
+ +	}
+ +
+++=======
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  	return 0;
+  }
+  
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index fcfe8c6ef967,70d9605a0d9e..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -3133,8 -3121,10 +3133,15 @@@ static void i40e_vsi_configure_msix(str
+  	qp = vsi->base_queue;
+  	vector = vsi->base_vector;
+  	for (i = 0; i < vsi->num_q_vectors; i++, vector++) {
+++<<<<<<< HEAD
+ +		q_vector = vsi->q_vectors[i];
+ +		q_vector->rx.itr = ITR_TO_REG(vsi->rx_itr_setting);
+++=======
++ 		struct i40e_q_vector *q_vector = vsi->q_vectors[i];
++ 
++ 		q_vector->itr_countdown = ITR_COUNTDOWN_START;
++ 		q_vector->rx.itr = ITR_TO_REG(vsi->rx_rings[i]->rx_itr_setting);
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  		q_vector->rx.latency_range = I40E_LOW_LATENCY;
+  		wr32(hw, I40E_PFINT_ITRN(I40E_RX_ITR, vector - 1),
+  		     q_vector->rx.itr);
+@@@ -3225,10 -3219,11 +3232,15 @@@ static void i40e_configure_msi_and_lega
+  	u32 val;
+  
+  	/* set the ITR configuration */
+++<<<<<<< HEAD
+ +	q_vector->rx.itr = ITR_TO_REG(vsi->rx_itr_setting);
+++=======
++ 	q_vector->itr_countdown = ITR_COUNTDOWN_START;
++ 	q_vector->rx.itr = ITR_TO_REG(vsi->rx_rings[0]->rx_itr_setting);
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  	q_vector->rx.latency_range = I40E_LOW_LATENCY;
+  	wr32(hw, I40E_PFINT_ITR0(I40E_RX_ITR), q_vector->rx.itr);
+- 	q_vector->tx.itr = ITR_TO_REG(vsi->tx_itr_setting);
++ 	q_vector->tx.itr = ITR_TO_REG(vsi->tx_rings[0]->tx_itr_setting);
+  	q_vector->tx.latency_range = I40E_LOW_LATENCY;
+  	wr32(hw, I40E_PFINT_ITR0(I40E_TX_ITR), q_vector->tx.itr);
+  
+@@@ -7291,8 -7322,7 +7303,12 @@@ static int i40e_vsi_mem_alloc(struct i4
+  	set_bit(__I40E_DOWN, &vsi->state);
+  	vsi->flags = 0;
+  	vsi->idx = vsi_idx;
+++<<<<<<< HEAD
+ +	vsi->rx_itr_setting = pf->rx_itr_default;
+ +	vsi->tx_itr_setting = pf->tx_itr_default;
+++=======
++ 	vsi->int_rate_limit = 0;
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  	vsi->rss_table_size = (vsi->type == I40E_VSI_MAIN) ?
+  				pf->rss_table_size : 64;
+  	vsi->netdev_registered = false;
+@@@ -7458,8 -7488,7 +7474,12 @@@ static int i40e_alloc_rings(struct i40e
+  		tx_ring->dcb_tc = 0;
+  		if (vsi->back->flags & I40E_FLAG_WB_ON_ITR_CAPABLE)
+  			tx_ring->flags = I40E_TXR_FLAGS_WB_ON_ITR;
+++<<<<<<< HEAD
+ +		if (vsi->back->flags & I40E_FLAG_OUTER_UDP_CSUM_CAPABLE)
+ +			tx_ring->flags |= I40E_TXR_FLAGS_OUTER_UDP_CSUM;
+++=======
++ 		tx_ring->tx_itr_setting = pf->tx_itr_default;
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  		vsi->tx_rings[i] = tx_ring;
+  
+  		rx_ring = &tx_ring[1];
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 421c31de3d59,084d0ab316b7..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -1764,54 -1879,69 +1764,80 @@@ static inline void i40e_update_enable_i
+  					  struct i40e_q_vector *q_vector)
+  {
+  	struct i40e_hw *hw = &vsi->back->hw;
+ -	bool rx = false, tx = false;
+ -	u32 rxval, txval;
+ +	u16 old_itr;
+  	int vector;
+++<<<<<<< HEAD
+ +	u32 val;
+ +
+ +	vector = (q_vector->v_idx + vsi->base_vector);
+ +	if (ITR_IS_DYNAMIC(vsi->rx_itr_setting)) {
+ +		old_itr = q_vector->rx.itr;
+ +		i40e_set_new_dynamic_itr(&q_vector->rx);
+ +		if (old_itr != q_vector->rx.itr) {
+ +			val = I40E_PFINT_DYN_CTLN_INTENA_MASK |
+ +			I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
+ +			(I40E_RX_ITR <<
+ +				I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT) |
+ +			(q_vector->rx.itr <<
+ +				I40E_PFINT_DYN_CTLN_INTERVAL_SHIFT);
+ +		} else {
+ +			val = I40E_PFINT_DYN_CTLN_INTENA_MASK |
+ +			I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
+ +			(I40E_ITR_NONE <<
+ +				I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT);
+ +		}
+ +		if (!test_bit(__I40E_DOWN, &vsi->state))
+ +			wr32(hw, I40E_PFINT_DYN_CTLN(vector - 1), val);
+ +	} else {
+ +		i40e_irq_dynamic_enable(vsi, q_vector->v_idx);
+ +	}
+ +	if (ITR_IS_DYNAMIC(vsi->tx_itr_setting)) {
+ +		old_itr = q_vector->tx.itr;
+ +		i40e_set_new_dynamic_itr(&q_vector->tx);
+ +		if (old_itr != q_vector->tx.itr) {
+ +			val = I40E_PFINT_DYN_CTLN_INTENA_MASK |
+ +				I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
+ +				(I40E_TX_ITR <<
+ +				   I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT) |
+ +				(q_vector->tx.itr <<
+ +				   I40E_PFINT_DYN_CTLN_INTERVAL_SHIFT);
+ +		} else {
+ +			val = I40E_PFINT_DYN_CTLN_INTENA_MASK |
+ +				I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
+ +				(I40E_ITR_NONE <<
+ +				   I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT);
+ +		}
+ +		if (!test_bit(__I40E_DOWN, &vsi->state))
+ +			wr32(hw, I40E_PFINT_DYN_CTLN(q_vector->v_idx +
+ +			      vsi->base_vector - 1), val);
+ +	} else {
+ +		i40e_irq_dynamic_enable(vsi, q_vector->v_idx);
+++=======
++ 	int idx = q_vector->v_idx;
++ 
++ 	vector = (q_vector->v_idx + vsi->base_vector);
++ 
++ 	/* avoid dynamic calculation if in countdown mode OR if
++ 	 * all dynamic is disabled
++ 	 */
++ 	rxval = txval = i40e_buildreg_itr(I40E_ITR_NONE, 0);
++ 
++ 	if (q_vector->itr_countdown > 0 ||
++ 	    (!ITR_IS_DYNAMIC(vsi->rx_rings[idx]->rx_itr_setting) &&
++ 	     !ITR_IS_DYNAMIC(vsi->tx_rings[idx]->tx_itr_setting))) {
++ 		goto enable_int;
++ 	}
++ 
++ 	if (ITR_IS_DYNAMIC(vsi->rx_rings[idx]->rx_itr_setting)) {
++ 		rx = i40e_set_new_dynamic_itr(&q_vector->rx);
++ 		rxval = i40e_buildreg_itr(I40E_RX_ITR, q_vector->rx.itr);
++ 	}
++ 
++ 	if (ITR_IS_DYNAMIC(vsi->tx_rings[idx]->tx_itr_setting)) {
++ 		tx = i40e_set_new_dynamic_itr(&q_vector->tx);
++ 		txval = i40e_buildreg_itr(I40E_TX_ITR, q_vector->tx.itr);
+++>>>>>>> a75e8005d506 (i40e: queue-specific settings for interrupt moderation)
+  	}
+ -
+ -	if (rx || tx) {
+ -		/* get the higher of the two ITR adjustments and
+ -		 * use the same value for both ITR registers
+ -		 * when in adaptive mode (Rx and/or Tx)
+ -		 */
+ -		u16 itr = max(q_vector->tx.itr, q_vector->rx.itr);
+ -
+ -		q_vector->tx.itr = q_vector->rx.itr = itr;
+ -		txval = i40e_buildreg_itr(I40E_TX_ITR, itr);
+ -		tx = true;
+ -		rxval = i40e_buildreg_itr(I40E_RX_ITR, itr);
+ -		rx = true;
+ -	}
+ -
+ -	/* only need to enable the interrupt once, but need
+ -	 * to possibly update both ITR values
+ -	 */
+ -	if (rx) {
+ -		/* set the INTENA_MSK_MASK so that this first write
+ -		 * won't actually enable the interrupt, instead just
+ -		 * updating the ITR (it's bit 31 PF and VF)
+ -		 */
+ -		rxval |= BIT(31);
+ -		/* don't check _DOWN because interrupt isn't being enabled */
+ -		wr32(hw, INTREG(vector - 1), rxval);
+ -	}
+ -
+ -enable_int:
+ -	if (!test_bit(__I40E_DOWN, &vsi->state))
+ -		wr32(hw, INTREG(vector - 1), txval);
+ -
+ -	if (q_vector->itr_countdown)
+ -		q_vector->itr_countdown--;
+ -	else
+ -		q_vector->itr_countdown = ITR_COUNTDOWN_START;
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e.h
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_debugfs.c b/drivers/net/ethernet/intel/i40e/i40e_debugfs.c
+index 714209d7ab77..3f57cf61048c 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_debugfs.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_debugfs.c
+@@ -296,6 +296,10 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
+ 			 "    rx_rings[%i]: vsi = %p, q_vector = %p\n",
+ 			 i, rx_ring->vsi,
+ 			 rx_ring->q_vector);
++		dev_info(&pf->pdev->dev,
++			 "    rx_rings[%i]: rx_itr_setting = %d (%s)\n",
++			 i, rx_ring->rx_itr_setting,
++			 ITR_IS_DYNAMIC(rx_ring->rx_itr_setting) ? "dynamic" : "fixed");
+ 	}
+ 	for (i = 0; i < vsi->num_queue_pairs; i++) {
+ 		struct i40e_ring *tx_ring = ACCESS_ONCE(vsi->tx_rings[i]);
+@@ -345,14 +349,15 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
+ 		dev_info(&pf->pdev->dev,
+ 			 "    tx_rings[%i]: DCB tc = %d\n",
+ 			 i, tx_ring->dcb_tc);
++		dev_info(&pf->pdev->dev,
++			 "    tx_rings[%i]: tx_itr_setting = %d (%s)\n",
++			 i, tx_ring->tx_itr_setting,
++			 ITR_IS_DYNAMIC(tx_ring->tx_itr_setting) ? "dynamic" : "fixed");
+ 	}
+ 	rcu_read_unlock();
+ 	dev_info(&pf->pdev->dev,
+-		 "    work_limit = %d, rx_itr_setting = %d (%s), tx_itr_setting = %d (%s)\n",
+-		 vsi->work_limit, vsi->rx_itr_setting,
+-		 ITR_IS_DYNAMIC(vsi->rx_itr_setting) ? "dynamic" : "fixed",
+-		 vsi->tx_itr_setting,
+-		 ITR_IS_DYNAMIC(vsi->tx_itr_setting) ? "dynamic" : "fixed");
++		 "    work_limit = %d\n",
++		 vsi->work_limit);
+ 	dev_info(&pf->pdev->dev,
+ 		 "    max_frame = %d, rx_hdr_len = %d, rx_buf_len = %d dtype = %d\n",
+ 		 vsi->max_frame, vsi->rx_hdr_len, vsi->rx_buf_len, vsi->dtype);
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.h b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+index 7579856a2e7c..c52f7e1c32d4 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+@@ -231,6 +231,14 @@ struct i40e_ring {
+ 	u8 dcb_tc;			/* Traffic class of ring */
+ 	u8 __iomem *tail;
+ 
++	/* high bit set means dynamic, use accessor routines to read/write.
++	 * hardware only supports 2us resolution for the ITR registers.
++	 * these values always store the USER setting, and must be converted
++	 * before programming to a register.
++	 */
++	u16 rx_itr_setting;
++	u16 tx_itr_setting;
++
+ 	u16 count;			/* Number of descriptors */
+ 	u16 reg_idx;			/* HW register index of the ring */
+ 	u16 rx_hdr_len;
