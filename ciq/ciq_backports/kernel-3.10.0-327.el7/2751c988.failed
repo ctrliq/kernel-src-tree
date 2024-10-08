@@ -1,0 +1,233 @@
+vhost: cross-endian support for legacy devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [vhost] cross-endian support for legacy devices (Thomas Huth) [1213658]
+Rebuild_FUZZ: 91.76%
+commit-author Greg Kurz <gkurz@linux.vnet.ibm.com>
+commit 2751c9882b947292fcfb084c4f604e01724af804
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2751c988.failed
+
+This patch brings cross-endian support to vhost when used to implement
+legacy virtio devices. Since it is a relatively rare situation, the
+feature availability is controlled by a kernel config option (not set
+by default).
+
+The vq->is_le boolean field is added to cache the endianness to be
+used for ring accesses. It defaults to native endian, as expected
+by legacy virtio devices. When the ring gets active, we force little
+endian if the device is modern. When the ring is deactivated, we
+revert to the native endian default.
+
+If cross-endian was compiled in, a vq->user_be boolean field is added
+so that userspace may request a specific endianness. This field is
+used to override the default when activating the ring of a legacy
+device. It has no effect on modern devices.
+
+	Signed-off-by: Greg Kurz <gkurz@linux.vnet.ibm.com>
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+(cherry picked from commit 2751c9882b947292fcfb084c4f604e01724af804)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/Kconfig
+#	drivers/vhost/vhost.c
+#	drivers/vhost/vhost.h
+diff --cc drivers/vhost/Kconfig
+index 8b9226da3f54,533eaf04f12f..000000000000
+--- a/drivers/vhost/Kconfig
++++ b/drivers/vhost/Kconfig
+@@@ -24,3 -26,24 +24,27 @@@ config VHOST_RIN
+  	---help---
+  	  This option is selected by any driver which needs to access
+  	  the host side of a virtio ring.
+++<<<<<<< HEAD
+++=======
++ 
++ config VHOST
++ 	tristate
++ 	---help---
++ 	  This option is selected by any driver which needs to access
++ 	  the core of vhost.
++ 
++ config VHOST_CROSS_ENDIAN_LEGACY
++ 	bool "Cross-endian support for vhost"
++ 	default n
++ 	---help---
++ 	  This option allows vhost to support guests with a different byte
++ 	  ordering from host while using legacy virtio.
++ 
++ 	  Userspace programs can control the feature using the
++ 	  VHOST_SET_VRING_ENDIAN and VHOST_GET_VRING_ENDIAN ioctls.
++ 
++ 	  This is only useful on a few platforms (ppc64 and arm64). Since it
++ 	  adds some overhead, it is disabled by default.
++ 
++ 	  If unsure, say "N".
+++>>>>>>> 2751c9882b94 (vhost: cross-endian support for legacy devices)
+diff --cc drivers/vhost/vhost.c
+index 292d482f1320,9e8e004bb1c3..000000000000
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@@ -33,9 -33,80 +33,80 @@@ enum 
+  	VHOST_MEMORY_F_LOG = 0x1,
+  };
+  
+ -#define vhost_used_event(vq) ((__virtio16 __user *)&vq->avail->ring[vq->num])
+ -#define vhost_avail_event(vq) ((__virtio16 __user *)&vq->used->ring[vq->num])
+ +#define vhost_used_event(vq) ((u16 __user *)&vq->avail->ring[vq->num])
+ +#define vhost_avail_event(vq) ((u16 __user *)&vq->used->ring[vq->num])
+  
++ #ifdef CONFIG_VHOST_CROSS_ENDIAN_LEGACY
++ static void vhost_vq_reset_user_be(struct vhost_virtqueue *vq)
++ {
++ 	vq->user_be = !virtio_legacy_is_little_endian();
++ }
++ 
++ static long vhost_set_vring_endian(struct vhost_virtqueue *vq, int __user *argp)
++ {
++ 	struct vhost_vring_state s;
++ 
++ 	if (vq->private_data)
++ 		return -EBUSY;
++ 
++ 	if (copy_from_user(&s, argp, sizeof(s)))
++ 		return -EFAULT;
++ 
++ 	if (s.num != VHOST_VRING_LITTLE_ENDIAN &&
++ 	    s.num != VHOST_VRING_BIG_ENDIAN)
++ 		return -EINVAL;
++ 
++ 	vq->user_be = s.num;
++ 
++ 	return 0;
++ }
++ 
++ static long vhost_get_vring_endian(struct vhost_virtqueue *vq, u32 idx,
++ 				   int __user *argp)
++ {
++ 	struct vhost_vring_state s = {
++ 		.index = idx,
++ 		.num = vq->user_be
++ 	};
++ 
++ 	if (copy_to_user(argp, &s, sizeof(s)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static void vhost_init_is_le(struct vhost_virtqueue *vq)
++ {
++ 	/* Note for legacy virtio: user_be is initialized at reset time
++ 	 * according to the host endianness. If userspace does not set an
++ 	 * explicit endianness, the default behavior is native endian, as
++ 	 * expected by legacy virtio.
++ 	 */
++ 	vq->is_le = vhost_has_feature(vq, VIRTIO_F_VERSION_1) || !vq->user_be;
++ }
++ #else
++ static void vhost_vq_reset_user_be(struct vhost_virtqueue *vq)
++ {
++ }
++ 
++ static long vhost_set_vring_endian(struct vhost_virtqueue *vq, int __user *argp)
++ {
++ 	return -ENOIOCTLCMD;
++ }
++ 
++ static long vhost_get_vring_endian(struct vhost_virtqueue *vq, u32 idx,
++ 				   int __user *argp)
++ {
++ 	return -ENOIOCTLCMD;
++ }
++ 
++ static void vhost_init_is_le(struct vhost_virtqueue *vq)
++ {
++ 	if (vhost_has_feature(vq, VIRTIO_F_VERSION_1))
++ 		vq->is_le = true;
++ }
++ #endif /* CONFIG_VHOST_CROSS_ENDIAN_LEGACY */
++ 
+  static void vhost_poll_func(struct file *file, wait_queue_head_t *wqh,
+  			    poll_table *pt)
+  {
+@@@ -187,6 -269,9 +258,12 @@@ static void vhost_vq_reset(struct vhost
+  	vq->call_ctx = NULL;
+  	vq->call = NULL;
+  	vq->log_ctx = NULL;
+++<<<<<<< HEAD
+++=======
++ 	vq->memory = NULL;
++ 	vq->is_le = virtio_legacy_is_little_endian();
++ 	vhost_vq_reset_user_be(vq);
+++>>>>>>> 2751c9882b94 (vhost: cross-endian support for legacy devices)
+  }
+  
+  static int vhost_worker(void *data)
+@@@ -1009,10 -1121,14 +1092,14 @@@ static int vhost_update_avail_event(str
+  
+  int vhost_init_used(struct vhost_virtqueue *vq)
+  {
+ -	__virtio16 last_used_idx;
+ +	u16 last_used_idx;
+  	int r;
+- 	if (!vq->private_data)
++ 	if (!vq->private_data) {
++ 		vq->is_le = virtio_legacy_is_little_endian();
+  		return 0;
++ 	}
++ 
++ 	vhost_init_is_le(vq);
+  
+  	r = vhost_update_used_flags(vq);
+  	if (r)
+diff --cc drivers/vhost/vhost.h
+index 3f6aaf03d116,ce6f6da4b09f..000000000000
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@@ -190,7 -183,7 +198,11 @@@ static inline int vhost_has_feature(str
+  
+  static inline bool vhost_is_little_endian(struct vhost_virtqueue *vq)
+  {
+++<<<<<<< HEAD
+ +	return vhost_has_feature(vq, VIRTIO_F_VERSION_1);
+++=======
++ 	return vq->is_le;
+++>>>>>>> 2751c9882b94 (vhost: cross-endian support for legacy devices)
+  }
+  
+  /* Memory accessors */
+* Unmerged path drivers/vhost/Kconfig
+* Unmerged path drivers/vhost/vhost.c
+* Unmerged path drivers/vhost/vhost.h
+diff --git a/include/uapi/linux/vhost.h b/include/uapi/linux/vhost.h
+index bb6a5b4cb3c5..ab3731917bac 100644
+--- a/include/uapi/linux/vhost.h
++++ b/include/uapi/linux/vhost.h
+@@ -103,6 +103,20 @@ struct vhost_memory {
+ /* Get accessor: reads index, writes value in num */
+ #define VHOST_GET_VRING_BASE _IOWR(VHOST_VIRTIO, 0x12, struct vhost_vring_state)
+ 
++/* Set the vring byte order in num. Valid values are VHOST_VRING_LITTLE_ENDIAN
++ * or VHOST_VRING_BIG_ENDIAN (other values return -EINVAL).
++ * The byte order cannot be changed while the device is active: trying to do so
++ * returns -EBUSY.
++ * This is a legacy only API that is simply ignored when VIRTIO_F_VERSION_1 is
++ * set.
++ * Not all kernel configurations support this ioctl, but all configurations that
++ * support SET also support GET.
++ */
++#define VHOST_VRING_LITTLE_ENDIAN 0
++#define VHOST_VRING_BIG_ENDIAN 1
++#define VHOST_SET_VRING_ENDIAN _IOW(VHOST_VIRTIO, 0x13, struct vhost_vring_state)
++#define VHOST_GET_VRING_ENDIAN _IOW(VHOST_VIRTIO, 0x14, struct vhost_vring_state)
++
+ /* The following ioctls use eventfd file descriptors to signal and poll
+  * for events. */
+ 
