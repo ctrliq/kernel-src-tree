@@ -1,0 +1,228 @@
+net: sctp: migrate most recently used transport to ktime
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] sctp: migrate most recently used transport to ktime (Xin Long) [1333696]
+Rebuild_FUZZ: 95.33%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit e575235fc6026bb75e166ff68f84118c62d73f94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e575235f.failed
+
+Be more precise in transport path selection and use ktime
+helpers instead of jiffies to compare and pick the better
+primary and secondary recently used transports. This also
+avoids any side-effects during a possible roll-over, and
+could lead to better path decision-making.
+
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e575235fc6026bb75e166ff68f84118c62d73f94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/associola.c
+diff --cc net/sctp/associola.c
+index 95613ef42a0c,620c99e19e77..000000000000
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@@ -1295,53 -1185,112 +1295,84 @@@ void sctp_assoc_update(struct sctp_asso
+  }
+  
+  /* Update the retran path for sending a retransmitted packet.
+ - * See also RFC4960, 6.4. Multi-Homed SCTP Endpoints:
+ - *
+ - *   When there is outbound data to send and the primary path
+ - *   becomes inactive (e.g., due to failures), or where the
+ - *   SCTP user explicitly requests to send data to an
+ - *   inactive destination transport address, before reporting
+ - *   an error to its ULP, the SCTP endpoint should try to send
+ - *   the data to an alternate active destination transport
+ - *   address if one exists.
+ - *
+ - *   When retransmitting data that timed out, if the endpoint
+ - *   is multihomed, it should consider each source-destination
+ - *   address pair in its retransmission selection policy.
+ - *   When retransmitting timed-out data, the endpoint should
+ - *   attempt to pick the most divergent source-destination
+ - *   pair from the original source-destination pair to which
+ - *   the packet was transmitted.
+ - *
+ - *   Note: Rules for picking the most divergent source-destination
+ - *   pair are an implementation decision and are not specified
+ - *   within this document.
+ - *
+ - * Our basic strategy is to round-robin transports in priorities
+ - * according to sctp_state_prio_map[] e.g., if no such
+ - * transport with state SCTP_ACTIVE exists, round-robin through
+ - * SCTP_UNKNOWN, etc. You get the picture.
+ + * Round-robin through the active transports, else round-robin
+ + * through the inactive transports as this is the next best thing
+ + * we can try.
+   */
+ -static const u8 sctp_trans_state_to_prio_map[] = {
+ -	[SCTP_ACTIVE]	= 3,	/* best case */
+ -	[SCTP_UNKNOWN]	= 2,
+ -	[SCTP_PF]	= 1,
+ -	[SCTP_INACTIVE] = 0,	/* worst case */
+ -};
+ -
+ -static u8 sctp_trans_score(const struct sctp_transport *trans)
+ -{
+ -	return sctp_trans_state_to_prio_map[trans->state];
+ -}
+ -
+ -static struct sctp_transport *sctp_trans_elect_best(struct sctp_transport *curr,
+ -						    struct sctp_transport *best)
+ -{
+ -	if (best == NULL)
+ -		return curr;
+ -
+ -	return sctp_trans_score(curr) > sctp_trans_score(best) ? curr : best;
+ -}
+ -
+  void sctp_assoc_update_retran_path(struct sctp_association *asoc)
+  {
+ -	struct sctp_transport *trans = asoc->peer.retran_path;
+ -	struct sctp_transport *trans_next = NULL;
+ +	struct sctp_transport *t, *next;
+ +	struct list_head *head = &asoc->peer.transport_addr_list;
+ +	struct list_head *pos;
+  
+ -	/* We're done as we only have the one and only path. */
+  	if (asoc->peer.transport_count == 1)
+  		return;
+ -	/* If active_path and retran_path are the same and active,
+ -	 * then this is the only active path. Use it.
+ -	 */
+ -	if (asoc->peer.active_path == asoc->peer.retran_path &&
+ -	    asoc->peer.active_path->state == SCTP_ACTIVE)
+ -		return;
+  
+ -	/* Iterate from retran_path's successor back to retran_path. */
+ -	for (trans = list_next_entry(trans, transports); 1;
+ -	     trans = list_next_entry(trans, transports)) {
+ -		/* Manually skip the head element. */
+ -		if (&trans->transports == &asoc->peer.transport_addr_list)
+ -			continue;
+ -		if (trans->state == SCTP_UNCONFIRMED)
+ -			continue;
+ -		trans_next = sctp_trans_elect_best(trans, trans_next);
+ -		/* Active is good enough for immediate return. */
+ -		if (trans_next->state == SCTP_ACTIVE)
+ +	/* Find the next transport in a round-robin fashion. */
+ +	t = asoc->peer.retran_path;
+ +	pos = &t->transports;
+ +	next = NULL;
+ +
+ +	while (1) {
+ +		/* Skip the head. */
+ +		if (pos->next == head)
+ +			pos = head->next;
+ +		else
+ +			pos = pos->next;
+ +
+ +		t = list_entry(pos, struct sctp_transport, transports);
+ +
+ +		/* We have exhausted the list, but didn't find any
+ +		 * other active transports.  If so, use the next
+ +		 * transport.
+ +		 */
+ +		if (t == asoc->peer.retran_path) {
+ +			t = next;
+  			break;
+ -		/* We've reached the end, time to update path. */
+ -		if (trans == asoc->peer.retran_path)
+ +		}
+ +
+ +		/* Try to find an active transport. */
+ +
+ +		if ((t->state == SCTP_ACTIVE) ||
+ +		    (t->state == SCTP_UNKNOWN)) {
+  			break;
+++<<<<<<< HEAD
+ +		} else {
+ +			/* Keep track of the next transport in case
+ +			 * we don't find any active transport.
+ +			 */
+ +			if (t->state != SCTP_UNCONFIRMED && !next)
+ +				next = t;
+++=======
++ 	}
++ 
++ 	asoc->peer.retran_path = trans_next;
++ 
++ 	pr_debug("%s: association:%p updated new path to addr:%pISpc\n",
++ 		 __func__, asoc, &asoc->peer.retran_path->ipaddr.sa);
++ }
++ 
++ static void sctp_select_active_and_retran_path(struct sctp_association *asoc)
++ {
++ 	struct sctp_transport *trans, *trans_pri = NULL, *trans_sec = NULL;
++ 
++ 	/* Look for the two most recently used active transports. */
++ 	list_for_each_entry(trans, &asoc->peer.transport_addr_list,
++ 			    transports) {
++ 		if (trans->state == SCTP_INACTIVE ||
++ 		    trans->state == SCTP_UNCONFIRMED ||
++ 		    trans->state == SCTP_PF)
++ 			continue;
++ 		if (trans_pri == NULL ||
++ 		    ktime_after(trans->last_time_heard,
++ 				trans_pri->last_time_heard)) {
++ 			trans_sec = trans_pri;
++ 			trans_pri = trans;
++ 		} else if (trans_sec == NULL ||
++ 			   ktime_after(trans->last_time_heard,
++ 				       trans_sec->last_time_heard)) {
++ 			trans_sec = trans;
+++>>>>>>> e575235fc602 (net: sctp: migrate most recently used transport to ktime)
+  		}
+  	}
+  
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index 7a7c7cb8b173..4c6203454f6d 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -853,10 +853,10 @@ struct sctp_transport {
+ 	unsigned long sackdelay;
+ 	__u32 sackfreq;
+ 
+-	/* When was the last time (in jiffies) that we heard from this
+-	 * transport?  We use this to pick new active and retran paths.
++	/* When was the last time that we heard from this transport? We use
++	 * this to pick new active and retran paths.
+ 	 */
+-	unsigned long last_time_heard;
++	ktime_t last_time_heard;
+ 
+ 	/* Last time(in jiffies) when cwnd is reduced due to the congestion
+ 	 * indication based on ECNE chunk.
+* Unmerged path net/sctp/associola.c
+diff --git a/net/sctp/endpointola.c b/net/sctp/endpointola.c
+index e09f906514db..aeefe463a3f4 100644
+--- a/net/sctp/endpointola.c
++++ b/net/sctp/endpointola.c
+@@ -483,7 +483,7 @@ normal:
+ 		}
+ 
+ 		if (chunk->transport)
+-			chunk->transport->last_time_heard = jiffies;
++			chunk->transport->last_time_heard = ktime_get();
+ 
+ 		error = sctp_do_sm(net, SCTP_EVENT_T_CHUNK, subtype, state,
+ 				   ep, asoc, chunk, GFP_ATOMIC);
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 098f1d5f769e..4fbaf67369cf 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -79,7 +79,7 @@ static struct sctp_transport *sctp_transport_init(struct net *net,
+ 	 */
+ 	peer->rto = msecs_to_jiffies(net->sctp.rto_initial);
+ 
+-	peer->last_time_heard = jiffies;
++	peer->last_time_heard = ktime_get();
+ 	peer->last_time_ecne_reduced = jiffies;
+ 
+ 	peer->param_flags = SPP_HB_DISABLE |
