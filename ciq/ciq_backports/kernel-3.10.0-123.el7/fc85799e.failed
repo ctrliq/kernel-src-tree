@@ -1,0 +1,199 @@
+[SCSI] fnic: fnic Driver Tuneables Exposed through CLI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [scsi] fnic: fnic Driver Tuneables Exposed through CLI (Chris Leech) [831836]
+Rebuild_FUZZ: 93.07%
+commit-author Hiral Patel <hiralpat@cisco.com>
+commit fc85799ee362e3ef13b8f2f5c687101490aaaa7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/fc85799e.failed
+
+Introduced module params to provide dynamic way of configuring
+queue depth.
+
+Added support to get max io throttle count through UCSM to
+configure maximum outstanding IOs supported by fnic and push
+that value to scsi mid-layer.
+
+  Supported IO throttle values:
+
+  UCSM IO THROTTLE VALUE        FNIC MAX OUTSTANDING IOS
+  ------------------------------------------------------
+        16 (Default)                    2048
+        <= 256                          256
+        > 256                           <ucsm value>
+
+	Signed-off-by: Hiral Patel <hiralpat@cisco.com>
+	Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit fc85799ee362e3ef13b8f2f5c687101490aaaa7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fnic_scsi.c
+diff --cc drivers/scsi/fnic/fnic_scsi.c
+index 668511b82a8b,d014aae19134..000000000000
+--- a/drivers/scsi/fnic/fnic_scsi.c
++++ b/drivers/scsi/fnic/fnic_scsi.c
+@@@ -1308,14 -1314,15 +1308,14 @@@ static void fnic_rport_exch_reset(struc
+  	if (fnic->in_remove)
+  		return;
+  
+- 	for (tag = 0; tag < FNIC_MAX_IO_REQ; tag++) {
++ 	for (tag = 0; tag < fnic->fnic_max_tag_id; tag++) {
+  		abt_tag = tag;
+ -		io_lock = fnic_io_lock_tag(fnic, tag);
+ -		spin_lock_irqsave(io_lock, flags);
+  		sc = scsi_host_find_tag(fnic->lport->host, tag);
+ -		if (!sc) {
+ -			spin_unlock_irqrestore(io_lock, flags);
+ +		if (!sc)
+  			continue;
+ -		}
+ +
+ +		io_lock = fnic_io_lock_hash(fnic, sc);
+ +		spin_lock_irqsave(io_lock, flags);
+  
+  		io_req = (struct fnic_io_req *)CMD_SP(sc);
+  
+@@@ -1441,18 -1448,21 +1441,18 @@@ void fnic_terminate_rport_io(struct fc_
+  	if (fnic->in_remove)
+  		return;
+  
+- 	for (tag = 0; tag < FNIC_MAX_IO_REQ; tag++) {
++ 	for (tag = 0; tag < fnic->fnic_max_tag_id; tag++) {
+  		abt_tag = tag;
+ -		io_lock = fnic_io_lock_tag(fnic, tag);
+ -		spin_lock_irqsave(io_lock, flags);
+  		sc = scsi_host_find_tag(fnic->lport->host, tag);
+ -		if (!sc) {
+ -			spin_unlock_irqrestore(io_lock, flags);
+ +		if (!sc)
+  			continue;
+ -		}
+  
+  		cmd_rport = starget_to_rport(scsi_target(sc->device));
+ -		if (rport != cmd_rport) {
+ -			spin_unlock_irqrestore(io_lock, flags);
+ +		if (rport != cmd_rport)
+  			continue;
+ -		}
+ +
+ +		io_lock = fnic_io_lock_hash(fnic, sc);
+ +		spin_lock_irqsave(io_lock, flags);
+  
+  		io_req = (struct fnic_io_req *)CMD_SP(sc);
+  
+@@@ -1769,7 -1781,9 +1769,13 @@@ static int fnic_clean_pending_aborts(st
+  	DECLARE_COMPLETION_ONSTACK(tm_done);
+  	enum fnic_ioreq_state old_ioreq_state;
+  
+++<<<<<<< HEAD
+ +	for (tag = 0; tag < FNIC_MAX_IO_REQ; tag++) {
+++=======
++ 	for (tag = 0; tag < fnic->fnic_max_tag_id; tag++) {
++ 		io_lock = fnic_io_lock_tag(fnic, tag);
++ 		spin_lock_irqsave(io_lock, flags);
+++>>>>>>> fc85799ee362 ([SCSI] fnic: fnic Driver Tuneables Exposed through CLI)
+  		sc = scsi_host_find_tag(fnic->lport->host, tag);
+  		/*
+  		 * ignore this lun reset cmd or cmds that do not belong to
+diff --git a/drivers/scsi/fnic/fnic.h b/drivers/scsi/fnic/fnic.h
+index b6d1f92ed33c..179322a1a5c2 100644
+--- a/drivers/scsi/fnic/fnic.h
++++ b/drivers/scsi/fnic/fnic.h
+@@ -43,6 +43,8 @@
+ #define DFX                     DRV_NAME "%d: "
+ 
+ #define DESC_CLEAN_LOW_WATERMARK 8
++#define FNIC_UCSM_DFLT_THROTTLE_CNT_BLD	16 /* UCSM default throttle count */
++#define FNIC_MIN_IO_REQ			256 /* Min IO throttle count */
+ #define FNIC_MAX_IO_REQ		2048 /* scsi_cmnd tag map entries */
+ #define	FNIC_IO_LOCKS		64 /* IO locks: power of 2 */
+ #define FNIC_DFLT_QUEUE_DEPTH	32
+@@ -219,6 +221,7 @@ struct fnic {
+ 	char name[IFNAMSIZ];
+ 	struct timer_list notify_timer; /* used for MSI interrupts */
+ 
++	unsigned int fnic_max_tag_id;
+ 	unsigned int err_intr_offset;
+ 	unsigned int link_intr_offset;
+ 
+diff --git a/drivers/scsi/fnic/fnic_main.c b/drivers/scsi/fnic/fnic_main.c
+index 5f09d1814d26..e9aec8f75656 100644
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@ -74,6 +74,10 @@ module_param(fnic_trace_max_pages, uint, S_IRUGO|S_IWUSR);
+ MODULE_PARM_DESC(fnic_trace_max_pages, "Total allocated memory pages "
+ 					"for fnic trace buffer");
+ 
++static unsigned int fnic_max_qdepth = FNIC_DFLT_QUEUE_DEPTH;
++module_param(fnic_max_qdepth, uint, S_IRUGO|S_IWUSR);
++MODULE_PARM_DESC(fnic_max_qdepth, "Queue depth to report for each LUN");
++
+ static struct libfc_function_template fnic_transport_template = {
+ 	.frame_send = fnic_send,
+ 	.lport_set_port_id = fnic_set_port_id,
+@@ -91,7 +95,7 @@ static int fnic_slave_alloc(struct scsi_device *sdev)
+ 	if (!rport || fc_remote_port_chkready(rport))
+ 		return -ENXIO;
+ 
+-	scsi_activate_tcq(sdev, FNIC_DFLT_QUEUE_DEPTH);
++	scsi_activate_tcq(sdev, fnic_max_qdepth);
+ 	return 0;
+ }
+ 
+@@ -447,13 +451,6 @@ static int fnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	host->transportt = fnic_fc_transport;
+ 
+-	err = scsi_init_shared_tag_map(host, FNIC_MAX_IO_REQ);
+-	if (err) {
+-		shost_printk(KERN_ERR, fnic->lport->host,
+-			     "Unable to alloc shared tag map\n");
+-		goto err_out_free_hba;
+-	}
+-
+ 	/* Setup PCI resources */
+ 	pci_set_drvdata(pdev, fnic);
+ 
+@@ -566,6 +563,22 @@ static int fnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 			     "aborting.\n");
+ 		goto err_out_dev_close;
+ 	}
++
++	/* Configure Maximum Outstanding IO reqs*/
++	if (fnic->config.io_throttle_count != FNIC_UCSM_DFLT_THROTTLE_CNT_BLD) {
++		host->can_queue = min_t(u32, FNIC_MAX_IO_REQ,
++					max_t(u32, FNIC_MIN_IO_REQ,
++					fnic->config.io_throttle_count));
++	}
++	fnic->fnic_max_tag_id = host->can_queue;
++
++	err = scsi_init_shared_tag_map(host, fnic->fnic_max_tag_id);
++	if (err) {
++		shost_printk(KERN_ERR, fnic->lport->host,
++			  "Unable to alloc shared tag map\n");
++		goto err_out_dev_close;
++	}
++
+ 	host->max_lun = fnic->config.luns_per_tgt;
+ 	host->max_id = FNIC_MAX_FCP_TARGET;
+ 	host->max_cmd_len = FCOE_MAX_CMD_LEN;
+* Unmerged path drivers/scsi/fnic/fnic_scsi.c
+diff --git a/drivers/scsi/fnic/vnic_scsi.h b/drivers/scsi/fnic/vnic_scsi.h
+index fbb55364e272..e343e1d0f801 100644
+--- a/drivers/scsi/fnic/vnic_scsi.h
++++ b/drivers/scsi/fnic/vnic_scsi.h
+@@ -54,8 +54,8 @@
+ #define VNIC_FNIC_PLOGI_TIMEOUT_MIN         1000
+ #define VNIC_FNIC_PLOGI_TIMEOUT_MAX         255000
+ 
+-#define VNIC_FNIC_IO_THROTTLE_COUNT_MIN     256
+-#define VNIC_FNIC_IO_THROTTLE_COUNT_MAX     4096
++#define VNIC_FNIC_IO_THROTTLE_COUNT_MIN     1
++#define VNIC_FNIC_IO_THROTTLE_COUNT_MAX     2048
+ 
+ #define VNIC_FNIC_LINK_DOWN_TIMEOUT_MIN     0
+ #define VNIC_FNIC_LINK_DOWN_TIMEOUT_MAX     240000
