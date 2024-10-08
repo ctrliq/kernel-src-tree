@@ -1,0 +1,125 @@
+ext4: add ext4_get_block_dax()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matthew Wilcox <willy@linux.intel.com>
+commit ed923b5776a2d2e949bd5b20f3956d68f3c826b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ed923b57.failed
+
+DAX wants different semantics from any currently-existing ext4 get_block
+callback.  Unlike ext4_get_block_write(), it needs to honour the
+'create' flag, and unlike ext4_get_block(), it needs to be able to
+return unwritten extents.  So introduce a new ext4_get_block_dax() which
+has those semantics.
+
+We could also change ext4_get_block_write() to honour the 'create' flag,
+but that might have consequences on other users that I do not currently
+understand.
+
+	Signed-off-by: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ed923b5776a2d2e949bd5b20f3956d68f3c826b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,d5219e4cd91d..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -200,10 -188,55 +200,54 @@@ ext4_file_write(struct kiocb *iocb, con
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ static void ext4_end_io_unwritten(struct buffer_head *bh, int uptodate)
++ {
++ 	struct inode *inode = bh->b_assoc_map->host;
++ 	/* XXX: breaks on 32-bit > 16TB. Is that even supported? */
++ 	loff_t offset = (loff_t)(uintptr_t)bh->b_private << inode->i_blkbits;
++ 	int err;
++ 	if (!uptodate)
++ 		return;
++ 	WARN_ON(!buffer_unwritten(bh));
++ 	err = ext4_convert_unwritten_extents(NULL, inode, offset, bh->b_size);
++ }
++ 
++ static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_fault(vma, vmf, ext4_get_block_dax, ext4_end_io_unwritten);
++ }
++ 
++ static int ext4_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
++ 						pmd_t *pmd, unsigned int flags)
++ {
++ 	return dax_pmd_fault(vma, addr, pmd, flags, ext4_get_block_dax,
++ 				ext4_end_io_unwritten);
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_mkwrite(vma, vmf, ext4_get_block_dax,
++ 				ext4_end_io_unwritten);
++ }
++ 
++ static const struct vm_operations_struct ext4_dax_vm_ops = {
++ 	.fault		= ext4_dax_fault,
++ 	.pmd_fault	= ext4_dax_pmd_fault,
++ 	.page_mkwrite	= ext4_dax_mkwrite,
++ 	.pfn_mkwrite	= dax_pfn_mkwrite,
++ };
++ #else
++ #define ext4_dax_vm_ops	ext4_file_vm_ops
++ #endif
++ 
+++>>>>>>> ed923b5776a2 (ext4: add ext4_get_block_dax())
+  static const struct vm_operations_struct ext4_file_vm_ops = {
+  	.fault		= filemap_fault,
+ -	.map_pages	= filemap_map_pages,
+  	.page_mkwrite   = ext4_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+  };
+  
+  static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 5dda1d21c88f..82e27b6f9a07 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2090,6 +2090,8 @@ struct buffer_head *ext4_bread(handle_t *, struct inode *,
+ 						ext4_lblk_t, int, int *);
+ int ext4_get_block_write(struct inode *inode, sector_t iblock,
+ 			 struct buffer_head *bh_result, int create);
++int ext4_get_block_dax(struct inode *inode, sector_t iblock,
++			 struct buffer_head *bh_result, int create);
+ int ext4_get_block(struct inode *inode, sector_t iblock,
+ 				struct buffer_head *bh_result, int create);
+ int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
+* Unmerged path fs/ext4/file.c
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 235a73f02c8d..c92d76f59b21 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2933,6 +2933,17 @@ static int ext4_get_block_write_nolock(struct inode *inode, sector_t iblock,
+ 			       EXT4_GET_BLOCKS_NO_LOCK);
+ }
+ 
++int ext4_get_block_dax(struct inode *inode, sector_t iblock,
++		   struct buffer_head *bh_result, int create)
++{
++	int flags = EXT4_GET_BLOCKS_PRE_IO | EXT4_GET_BLOCKS_UNWRIT_EXT;
++	if (create)
++		flags |= EXT4_GET_BLOCKS_CREATE;
++	ext4_debug("ext4_get_block_dax: inode %lu, create flag %d\n",
++		   inode->i_ino, create);
++	return _ext4_get_block(inode, iblock, bh_result, flags);
++}
++
+ static void ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
+ 			    ssize_t size, void *private, int ret,
+ 			    bool is_async)
