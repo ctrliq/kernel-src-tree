@@ -1609,3 +1609,9 @@ int hists__init(void)
 
 	return err;
 }
+
+void perf_hpp_list__init(struct perf_hpp_list *list)
+{
+	INIT_LIST_HEAD(&list->fields);
+	INIT_LIST_HEAD(&list->sorts);
+}
