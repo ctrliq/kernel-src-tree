@@ -1,0 +1,164 @@
+x86/platform/UV: Fix problem with UV4 Socket IDs not being contiguous
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] platform/uv: Fix problem with UV4 Socket IDs not being contiguous (Frank Ramsay) [1366020]
+Rebuild_FUZZ: 97.01%
+commit-author Mike Travis <travis@sgi.com>
+commit 054f621fd5b1c7245710f5d3935c94ce6ae4b3b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/054f621f.failed
+
+The UV4 Socket IDs are not guaranteed to equate to Node values which
+can cause the GAM (Global Addressable Memory) table lookups to fail.
+Fix this by using an independent index into the GAM table instead of
+the Socket ID to reference the base address.
+
+	Tested-by: Frank Ramsay <framsay@sgi.com>
+	Tested-by: John Estabrook <estabrook@sgi.com>
+	Signed-off-by: Mike Travis <travis@sgi.com>
+	Reviewed-by: Dimitri Sivanich <sivanich@sgi.com>
+	Reviewed-by: Nathan Zimmer <nzimmer@sgi.com>
+	Cc: Alex Thorlton <athorlton@sgi.com>
+	Cc: Andrew Banman <abanman@sgi.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Russ Anderson <rja@sgi.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20160801184050.048755337@asylum.americas.sgi.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 054f621fd5b1c7245710f5d3935c94ce6ae4b3b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/x2apic_uv_x.c
+diff --cc arch/x86/kernel/apic/x2apic_uv_x.c
+index fd86a4f25c81,d9187336aa2e..000000000000
+--- a/arch/x86/kernel/apic/x2apic_uv_x.c
++++ b/arch/x86/kernel/apic/x2apic_uv_x.c
+@@@ -306,9 -301,118 +306,122 @@@ EXPORT_SYMBOL_GPL(uv_possible_blades)
+  unsigned long sn_rtc_cycles_per_second;
+  EXPORT_SYMBOL(sn_rtc_cycles_per_second);
+  
+++<<<<<<< HEAD
+++=======
++ /* the following values are used for the per node hub info struct */
++ static __initdata unsigned short *_node_to_pnode;
++ static __initdata unsigned short _min_socket, _max_socket;
++ static __initdata unsigned short _min_pnode, _max_pnode, _gr_table_len;
++ static __initdata struct uv_gam_range_entry *uv_gre_table;
++ static __initdata struct uv_gam_parameters *uv_gp_table;
++ static __initdata unsigned short *_socket_to_node;
++ static __initdata unsigned short *_socket_to_pnode;
++ static __initdata unsigned short *_pnode_to_socket;
++ static __initdata struct uv_gam_range_s *_gr_table;
++ #define	SOCK_EMPTY	((unsigned short)~0)
++ 
++ extern int uv_hub_info_version(void)
++ {
++ 	return UV_HUB_INFO_VERSION;
++ }
++ EXPORT_SYMBOL(uv_hub_info_version);
++ 
++ /* Build GAM range lookup table */
++ static __init void build_uv_gr_table(void)
++ {
++ 	struct uv_gam_range_entry *gre = uv_gre_table;
++ 	struct uv_gam_range_s *grt;
++ 	unsigned long last_limit = 0, ram_limit = 0;
++ 	int bytes, i, sid, lsid = -1, indx = 0, lindx = -1;
++ 
++ 	if (!gre)
++ 		return;
++ 
++ 	bytes = _gr_table_len * sizeof(struct uv_gam_range_s);
++ 	grt = kzalloc(bytes, GFP_KERNEL);
++ 	BUG_ON(!grt);
++ 	_gr_table = grt;
++ 
++ 	for (; gre->type != UV_GAM_RANGE_TYPE_UNUSED; gre++) {
++ 		if (gre->type == UV_GAM_RANGE_TYPE_HOLE) {
++ 			if (!ram_limit) {   /* mark hole between ram/non-ram */
++ 				ram_limit = last_limit;
++ 				last_limit = gre->limit;
++ 				lsid++;
++ 				continue;
++ 			}
++ 			last_limit = gre->limit;
++ 			pr_info("UV: extra hole in GAM RE table @%d\n",
++ 				(int)(gre - uv_gre_table));
++ 			continue;
++ 		}
++ 		if (_max_socket < gre->sockid) {
++ 			pr_err("UV: GAM table sockid(%d) too large(>%d) @%d\n",
++ 				gre->sockid, _max_socket,
++ 				(int)(gre - uv_gre_table));
++ 			continue;
++ 		}
++ 		sid = gre->sockid - _min_socket;
++ 		if (lsid < sid) {		/* new range */
++ 			grt = &_gr_table[indx];
++ 			grt->base = lindx;
++ 			grt->nasid = gre->nasid;
++ 			grt->limit = last_limit = gre->limit;
++ 			lsid = sid;
++ 			lindx = indx++;
++ 			continue;
++ 		}
++ 		if (lsid == sid && !ram_limit) {	/* update range */
++ 			if (grt->limit == last_limit) {	/* .. if contiguous */
++ 				grt->limit = last_limit = gre->limit;
++ 				continue;
++ 			}
++ 		}
++ 		if (!ram_limit) {		/* non-contiguous ram range */
++ 			grt++;
++ 			grt->base = lindx;
++ 			grt->nasid = gre->nasid;
++ 			grt->limit = last_limit = gre->limit;
++ 			continue;
++ 		}
++ 		grt++;				/* non-contiguous/non-ram */
++ 		grt->base = grt - _gr_table;	/* base is this entry */
++ 		grt->nasid = gre->nasid;
++ 		grt->limit = last_limit = gre->limit;
++ 		lsid++;
++ 	}
++ 
++ 	/* shorten table if possible */
++ 	grt++;
++ 	i = grt - _gr_table;
++ 	if (i < _gr_table_len) {
++ 		void *ret;
++ 
++ 		bytes = i * sizeof(struct uv_gam_range_s);
++ 		ret = krealloc(_gr_table, bytes, GFP_KERNEL);
++ 		if (ret) {
++ 			_gr_table = ret;
++ 			_gr_table_len = i;
++ 		}
++ 	}
++ 
++ 	/* display resultant gam range table */
++ 	for (i = 0, grt = _gr_table; i < _gr_table_len; i++, grt++) {
++ 		int gb = grt->base;
++ 		unsigned long start = gb < 0 ?  0 :
++ 			(unsigned long)_gr_table[gb].limit << UV_GAM_RANGE_SHFT;
++ 		unsigned long end =
++ 			(unsigned long)grt->limit << UV_GAM_RANGE_SHFT;
++ 
++ 		pr_info("UV: GAM Range %2d %04x 0x%013lx-0x%013lx (%d)\n",
++ 			i, grt->nasid, start, end, gb);
++ 	}
++ }
++ 
+++>>>>>>> 054f621fd5b1 (x86/platform/UV: Fix problem with UV4 Socket IDs not being contiguous)
+  static int uv_wakeup_secondary(int phys_apicid, unsigned long start_rip)
+  {
+ +#ifdef CONFIG_SMP
+  	unsigned long val;
+  	int pnode;
+  
+* Unmerged path arch/x86/kernel/apic/x2apic_uv_x.c
