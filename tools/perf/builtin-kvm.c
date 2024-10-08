@@ -1273,7 +1273,6 @@ kvm_events_record(struct perf_kvm_stat *kvm, int argc, const char **argv)
 	const char * const record_args[] = {
 		"record",
 		"-R",
-		"-f",
 		"-m", "1024",
 		"-c", "1",
 	};
