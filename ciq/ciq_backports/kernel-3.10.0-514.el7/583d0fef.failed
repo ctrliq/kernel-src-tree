@@ -1,0 +1,125 @@
+libceph: clear msg->con in ceph_msg_release() only
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 583d0fef756a7615e50f0f68ea0892a497d03971
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/583d0fef.failed
+
+The following bit in ceph_msg_revoke_incoming() is unsafe:
+
+    struct ceph_connection *con = msg->con;
+    if (!con)
+            return;
+    mutex_lock(&con->mutex);
+    <more msg->con use>
+
+There is nothing preventing con from getting destroyed right after
+msg->con test.  One easy way to reproduce this is to disable message
+signing only on the server side and try to map an image.  The system
+will go into a
+
+    libceph: read_partial_message ffff880073f0ab68 signature check failed
+    libceph: osd0 192.168.255.155:6801 bad crc/signature
+    libceph: read_partial_message ffff880073f0ab68 signature check failed
+    libceph: osd0 192.168.255.155:6801 bad crc/signature
+
+loop which has to be interrupted with Ctrl-C.  Hit Ctrl-C and you are
+likely to end up with a random GP fault if the reset handler executes
+"within" ceph_msg_revoke_incoming():
+
+                     <yet another reply w/o a signature>
+                                   ...
+          <Ctrl-C>
+    rbd_obj_request_end
+      ceph_osdc_cancel_request
+        __unregister_request
+          ceph_osdc_put_request
+            ceph_msg_revoke_incoming
+                                   ...
+                                osd_reset
+                                  __kick_osd_requests
+                                    __reset_osd
+                                      remove_osd
+                                        ceph_con_close
+                                          reset_connection
+                                            <clear con->in_msg->con>
+                                            <put con ref>
+                                              put_osd
+                                                <free osd/con>
+              <msg->con use> <-- !!!
+
+If ceph_msg_revoke_incoming() executes "before" the reset handler,
+osd/con will be leaked because ceph_msg_revoke_incoming() clears
+con->in_msg but doesn't put con ref, while reset_connection() only puts
+con ref if con->in_msg != NULL.
+
+The current msg->con scheme was introduced by commits 38941f8031bf
+("libceph: have messages point to their connection") and 92ce034b5a74
+("libceph: have messages take a connection reference"), which defined
+when messages get associated with a connection and when that
+association goes away.  Part of the problem is that this association is
+supposed to go away in much too many places; closing this race entirely
+requires either a rework of the existing or an addition of a new layer
+of synchronization.
+
+In lieu of that, we can make it *much* less likely to hit by
+disassociating messages only on their destruction and resend through
+a different connection.  This makes the code simpler and is probably
+a good thing to do regardless - this patch adds a msg_con_set() helper
+which is is called from only three places: ceph_con_send() and
+ceph_con_in_msg_alloc() to set msg->con and ceph_msg_release() to clear
+it.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 583d0fef756a7615e50f0f68ea0892a497d03971)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/messenger.c
+diff --cc net/ceph/messenger.c
+index ed9bce506e5f,9981039ef4ff..000000000000
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@@ -2943,6 -2962,21 +2934,24 @@@ void ceph_messenger_init(struct ceph_me
+  }
+  EXPORT_SYMBOL(ceph_messenger_init);
+  
+++<<<<<<< HEAD
+++=======
++ void ceph_messenger_fini(struct ceph_messenger *msgr)
++ {
++ 	put_net(read_pnet(&msgr->net));
++ }
++ EXPORT_SYMBOL(ceph_messenger_fini);
++ 
++ static void msg_con_set(struct ceph_msg *msg, struct ceph_connection *con)
++ {
++ 	if (msg->con)
++ 		msg->con->ops->put(msg->con);
++ 
++ 	msg->con = con ? con->ops->get(con) : NULL;
++ 	BUG_ON(msg->con != con);
++ }
++ 
+++>>>>>>> 583d0fef756a (libceph: clear msg->con in ceph_msg_release() only)
+  static void clear_standby(struct ceph_connection *con)
+  {
+  	/* come back from STANDBY? */
+* Unmerged path net/ceph/messenger.c
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index cfa03d62ee47..f618ad977885 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -2853,9 +2853,6 @@ static struct ceph_msg *get_reply(struct ceph_connection *con,
+ 		goto out;
+ 	}
+ 
+-	if (req->r_reply->con)
+-		dout("%s revoking msg %p from old con %p\n", __func__,
+-		     req->r_reply, req->r_reply->con);
+ 	ceph_msg_revoke_incoming(req->r_reply);
+ 
+ 	if (front_len > req->r_reply->front_alloc_len) {
