@@ -1,0 +1,144 @@
+perf/x86: Fix shared register mutual exclusion enforcement
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [x86] perf: Fix shared register mutual exclusion enforcement (Jiri Olsa) [1032093]
+Rebuild_FUZZ: 96.43%
+commit-author Stephane Eranian <eranian@google.com>
+commit 2f7f73a52078b667d64df16eaebdb97d98c9a410
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/2f7f73a5.failed
+
+This patch fixes a problem with the shared registers mutual
+exclusion code and incremental event scheduling by the
+generic perf_event code.
+
+There was a bug whereby the mutual exclusion on the shared
+registers was not enforced because of incremental scheduling
+abort due to event constraints. As an example on Intel
+Nehalem, consider the following events:
+
+group1= L1D_CACHE_LD:E_STATE,OFFCORE_RESPONSE_0:PF_RFO,L1D_CACHE_LD:I_STATE
+group2= L1D_CACHE_LD:I_STATE
+
+The L1D_CACHE_LD event can only be measured by 2 counters. Yet, there
+are 3 instances here. The first group can be scheduled and is committed.
+Then, the generic code tries to schedule group2 and this fails (because
+there is no more counter to support the 3rd instance of L1D_CACHE_LD).
+But in x86_schedule_events() error path, put_event_contraints() is invoked
+on ALL the events and not just the ones that just failed. That causes the
+"lock" on the shared offcore_response MSR to be released. Yet the first group
+is actually scheduled and is exposed to reprogramming of that shared msr by
+the sibling HT thread. In other words, there is no guarantee on what is
+measured.
+
+This patch fixes the problem by tagging committed events with the
+PERF_X86_EVENT_COMMITTED tag. In the error path of x86_schedule_events(),
+only the events NOT tagged have their constraint released. The tag
+is eventually removed when the event in descheduled.
+
+	Signed-off-by: Stephane Eranian <eranian@google.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20130620164254.GA3556@quad
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2f7f73a52078b667d64df16eaebdb97d98c9a410)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/perf_event.h
+diff --cc arch/x86/kernel/cpu/perf_event.h
+index 3e6c653ea085,97e557bc4c91..000000000000
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@@ -67,6 -67,8 +67,11 @@@ struct event_constraint 
+   */
+  #define PERF_X86_EVENT_PEBS_LDLAT	0x1 /* ld+ldlat data address sampling */
+  #define PERF_X86_EVENT_PEBS_ST		0x2 /* st data address sampling */
+++<<<<<<< HEAD
+++=======
++ #define PERF_X86_EVENT_PEBS_ST_HSW	0x4 /* haswell style st data sampling */
++ #define PERF_X86_EVENT_COMMITTED	0x8 /* event passed commit_txn */
+++>>>>>>> 2f7f73a52078 (perf/x86: Fix shared register mutual exclusion enforcement)
+  
+  struct amd_nb {
+  	int nb_id;  /* NorthBridge id */
+diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
+index 8694be927b5f..6eaf12e368b1 100644
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@ -726,6 +726,7 @@ int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
+ {
+ 	struct event_constraint *c, *constraints[X86_PMC_IDX_MAX];
+ 	unsigned long used_mask[BITS_TO_LONGS(X86_PMC_IDX_MAX)];
++	struct perf_event *e;
+ 	int i, wmin, wmax, num = 0;
+ 	struct hw_perf_event *hwc;
+ 
+@@ -766,14 +767,32 @@ int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
+ 	if (i != n)
+ 		num = perf_assign_events(constraints, n, wmin, wmax, assign);
+ 
++	/*
++	 * Mark the event as committed, so we do not put_constraint()
++	 * in case new events are added and fail scheduling.
++	 */
++	if (!num && assign) {
++		for (i = 0; i < n; i++) {
++			e = cpuc->event_list[i];
++			e->hw.flags |= PERF_X86_EVENT_COMMITTED;
++		}
++	}
+ 	/*
+ 	 * scheduling failed or is just a simulation,
+ 	 * free resources if necessary
+ 	 */
+ 	if (!assign || num) {
+ 		for (i = 0; i < n; i++) {
++			e = cpuc->event_list[i];
++			/*
++			 * do not put_constraint() on comitted events,
++			 * because they are good to go
++			 */
++			if ((e->hw.flags & PERF_X86_EVENT_COMMITTED))
++				continue;
++
+ 			if (x86_pmu.put_event_constraints)
+-				x86_pmu.put_event_constraints(cpuc, cpuc->event_list[i]);
++				x86_pmu.put_event_constraints(cpuc, e);
+ 		}
+ 	}
+ 	return num ? -EINVAL : 0;
+@@ -1152,6 +1171,11 @@ static void x86_pmu_del(struct perf_event *event, int flags)
+ 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
+ 	int i;
+ 
++	/*
++	 * event is descheduled
++	 */
++	event->hw.flags &= ~PERF_X86_EVENT_COMMITTED;
++
+ 	/*
+ 	 * If we're called during a txn, we don't need to do anything.
+ 	 * The events never got scheduled and ->cancel_txn will truncate
+* Unmerged path arch/x86/kernel/cpu/perf_event.h
+diff --git a/arch/x86/kernel/cpu/perf_event_intel.c b/arch/x86/kernel/cpu/perf_event_intel.c
+index d9cb6a758470..79821f83d1ed 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -1442,7 +1442,6 @@ x86_get_event_constraints(struct cpu_hw_events *cpuc, struct perf_event *event)
+ 	if (x86_pmu.event_constraints) {
+ 		for_each_event_constraint(c, x86_pmu.event_constraints) {
+ 			if ((event->hw.config & c->cmask) == c->code) {
+-				/* hw.flags zeroed at initialization */
+ 				event->hw.flags |= c->flags;
+ 				return c;
+ 			}
+@@ -1490,7 +1489,6 @@ intel_put_shared_regs_event_constraints(struct cpu_hw_events *cpuc,
+ static void intel_put_event_constraints(struct cpu_hw_events *cpuc,
+ 					struct perf_event *event)
+ {
+-	event->hw.flags = 0;
+ 	intel_put_shared_regs_event_constraints(cpuc, event);
+ }
+ 
