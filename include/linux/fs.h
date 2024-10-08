@@ -2288,6 +2288,7 @@ extern int notify_change(struct dentry *, struct iattr *, struct inode **);
 extern int inode_permission(struct inode *, int);
 extern int __inode_permission(struct inode *, int);
 extern int generic_permission(struct inode *, int);
+extern int __check_sticky(struct inode *dir, struct inode *inode);
 
 static inline bool execute_ok(struct inode *inode)
 {
@@ -2771,6 +2772,14 @@ int __init get_filesystem_list(char *buf);
 static inline int is_sxid(umode_t mode)
 {
 	return (mode & S_ISUID) || ((mode & S_ISGID) && (mode & S_IXGRP));
+}
+
+static inline int check_sticky(struct inode *dir, struct inode *inode)
+{
+	if (!(dir->i_mode & S_ISVTX))
+		return 0;
+
+	return __check_sticky(dir, inode);
 }
 
 static inline void inode_has_no_xattr(struct inode *inode)
