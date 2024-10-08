@@ -2901,6 +2901,8 @@ static ssize_t mem_read(struct file *file, char __user *buf, size_t count,
 	loff_t avail = file_inode(file)->i_size;
 	unsigned int mem = (uintptr_t)file->private_data & 3;
 	struct adapter *adap = file->private_data - mem;
+	__be32 *data;
+	int ret;
 
 	if (pos < 0)
 		return -EINVAL;
@@ -2909,29 +2911,24 @@ static ssize_t mem_read(struct file *file, char __user *buf, size_t count,
 	if (count > avail - pos)
 		count = avail - pos;
 
-	while (count) {
-		size_t len;
-		int ret, ofst;
-		__be32 data[16];
+	data = t4_alloc_mem(count);
+	if (!data)
+		return -ENOMEM;
 
-		if ((mem == MEM_MC) || (mem == MEM_MC1))
-			ret = t4_mc_read(adap, mem % MEM_MC, pos, data, NULL);
-		else
-			ret = t4_edc_read(adap, mem, pos, data, NULL);
-		if (ret)
-			return ret;
-
-		ofst = pos % sizeof(data);
-		len = min(count, sizeof(data) - ofst);
-		if (copy_to_user(buf, (u8 *)data + ofst, len))
-			return -EFAULT;
-
-		buf += len;
-		pos += len;
-		count -= len;
+	spin_lock(&adap->win0_lock);
+	ret = t4_memory_rw(adap, 0, mem, pos, count, data, T4_MEMORY_READ);
+	spin_unlock(&adap->win0_lock);
+	if (ret) {
+		t4_free_mem(data);
+		return ret;
 	}
-	count = pos - *ppos;
-	*ppos = pos;
+	ret = copy_to_user(buf, data, count);
+
+	t4_free_mem(data);
+	if (ret)
+		return -EFAULT;
+
+	*ppos = pos + count;
 	return count;
 }
 
@@ -3521,7 +3518,11 @@ static int read_eq_indices(struct adapter *adap, u16 qid, u16 *pidx, u16 *cidx)
 	__be64 indices;
 	int ret;
 
-	ret = t4_mem_win_read_len(adap, addr, (__be32 *)&indices, 8);
+	spin_lock(&adap->win0_lock);
+	ret = t4_memory_rw(adap, 0, MEM_EDC0, addr,
+			   sizeof(indices), (__be32 *)&indices,
+			   T4_MEMORY_READ);
+	spin_unlock(&adap->win0_lock);
 	if (!ret) {
 		*cidx = (be64_to_cpu(indices) >> 25) & 0xffff;
 		*pidx = (be64_to_cpu(indices) >> 9) & 0xffff;
@@ -4839,7 +4840,7 @@ static int adap_init0_config(struct adapter *adapter, int reset)
 					      adapter->fn, 0, 1, params, val);
 			if (ret == 0) {
 				/*
-				 * For t4_memory_write() below addresses and
+				 * For t4_memory_rw() below addresses and
 				 * sizes have to be in terms of multiples of 4
 				 * bytes.  So, if the Configuration File isn't
 				 * a multiple of 4 bytes in length we'll have
@@ -4855,8 +4856,9 @@ static int adap_init0_config(struct adapter *adapter, int reset)
 				mtype = FW_PARAMS_PARAM_Y_GET(val[0]);
 				maddr = FW_PARAMS_PARAM_Z_GET(val[0]) << 16;
 
-				ret = t4_memory_write(adapter, mtype, maddr,
-						      size, data);
+				spin_lock(&adapter->win0_lock);
+				ret = t4_memory_rw(adapter, 0, mtype, maddr,
+						   size, data, T4_MEMORY_WRITE);
 				if (ret == 0 && resid != 0) {
 					union {
 						__be32 word;
@@ -4867,10 +4869,12 @@ static int adap_init0_config(struct adapter *adapter, int reset)
 					last.word = data[size >> 2];
 					for (i = resid; i < 4; i++)
 						last.buf[i] = 0;
-					ret = t4_memory_write(adapter, mtype,
-							      maddr + size,
-							      4, &last.word);
+					ret = t4_memory_rw(adapter, 0, mtype,
+							   maddr + size,
+							   4, &last.word,
+							   T4_MEMORY_WRITE);
 				}
+				spin_unlock(&adapter->win0_lock);
 			}
 		}
 
