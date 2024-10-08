@@ -1,0 +1,108 @@
+macvlan: optimize the receive path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author jbaron@akamai.com <jbaron@akamai.com>
+commit d1dd911930885659420421cfe123957610c54299
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d1dd9119.failed
+
+The netif_rx() call on the fast path of macvlan_handle_frame() appears to
+be there to ensure that we properly throttle incoming packets. However, it
+would appear as though the proper throttling is already in place for all
+possible ingress paths, and that the call is redundant. If packets are arriving
+from the physical NIC, we've already throttled them by this point. Otherwise,
+if they are coming via macvlan_queue_xmit(), it calls either
+'dev_forward_skb()', which ends up calling netif_rx_internal(), or else in
+the broadcast case, we are throttling via macvlan_broadcast_enqueue().
+
+The test results below are from off the box to an lxc instance running macvlan.
+Once the tranactions/sec stop increasing, the cpu idle time has gone to 0.
+Results are from a quad core Intel E3-1270 V2@3.50GHz box with bnx2x 10G card.
+
+for i in {10,100,200,300,400,500};
+do super_netperf $i -H $ip -t TCP_RR; done
+Average of 5 runs.
+
+trans/sec 		 trans/sec
+(3.17-rc7-net-next)      (3.17-rc7-net-next + this patch)
+----------               ----------
+208101                   211534 (+1.6%)
+839493                   850162 (+1.3%)
+845071                   844053 (-.12%)
+816330                   819623 (+.4%)
+778700                   789938 (+1.4%)
+735984                   754408 (+2.5%)
+
+	Signed-off-by: Jason Baron <jbaron@akamai.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d1dd911930885659420421cfe123957610c54299)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macvlan.c
+diff --cc drivers/net/macvlan.c
+index 6af48508e014,29b3bb410781..000000000000
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@@ -198,30 -416,15 +199,36 @@@ static rx_handler_result_t macvlan_hand
+  		if (!skb)
+  			return RX_HANDLER_CONSUMED;
+  		eth = eth_hdr(skb);
+ -		macvlan_forward_source(skb, port, eth->h_source);
+  		src = macvlan_hash_lookup(port, eth->h_source);
+ -		if (src && src->mode != MACVLAN_MODE_VEPA &&
+ -		    src->mode != MACVLAN_MODE_BRIDGE) {
+ +		if (!src)
+ +			/* frame comes from an external address */
+ +			macvlan_broadcast(skb, port, NULL,
+ +					  MACVLAN_MODE_PRIVATE |
+ +					  MACVLAN_MODE_VEPA    |
+ +					  MACVLAN_MODE_PASSTHRU|
+ +					  MACVLAN_MODE_BRIDGE);
+ +		else if (src->mode == MACVLAN_MODE_VEPA)
+ +			/* flood to everyone except source */
+ +			macvlan_broadcast(skb, port, src->dev,
+ +					  MACVLAN_MODE_VEPA |
+ +					  MACVLAN_MODE_BRIDGE);
+ +		else if (src->mode == MACVLAN_MODE_BRIDGE)
+ +			/*
+ +			 * flood only to VEPA ports, bridge ports
+ +			 * already saw the frame on the way out.
+ +			 */
+ +			macvlan_broadcast(skb, port, src->dev,
+ +					  MACVLAN_MODE_VEPA);
+ +		else {
+  			/* forward to original port. */
+  			vlan = src;
+++<<<<<<< HEAD
+ +			ret = macvlan_broadcast_one(skb, vlan, eth, 0);
+++=======
++ 			ret = macvlan_broadcast_one(skb, vlan, eth, 0) ?:
++ 			      netif_rx(skb);
++ 			handle_res = RX_HANDLER_CONSUMED;
+++>>>>>>> d1dd91193088 (macvlan: optimize the receive path)
+  			goto out;
+  		}
+  
+@@@ -249,11 -459,11 +259,16 @@@
+  	skb->dev = dev;
+  	skb->pkt_type = PACKET_HOST;
+  
+- 	ret = netif_rx(skb);
+- 
++ 	ret = NET_RX_SUCCESS;
++ 	handle_res = RX_HANDLER_ANOTHER;
+  out:
+++<<<<<<< HEAD
+ +	macvlan_count_rx(vlan, len, ret == NET_RX_SUCCESS, 0);
+ +	return RX_HANDLER_CONSUMED;
+++=======
++ 	macvlan_count_rx(vlan, len, ret == NET_RX_SUCCESS, false);
++ 	return handle_res;
+++>>>>>>> d1dd91193088 (macvlan: optimize the receive path)
+  }
+  
+  static int macvlan_queue_xmit(struct sk_buff *skb, struct net_device *dev)
+* Unmerged path drivers/net/macvlan.c
