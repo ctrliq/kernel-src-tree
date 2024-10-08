@@ -1,0 +1,412 @@
+IB/core: Add IP to GID netlink offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mark Bloch <markb@mellanox.com>
+commit ae43f8286730d1f2d241c34601df59f6d2286ac4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ae43f828.failed
+
+There is an assumption that rdmacm is used only between nodes
+in the same IB subnet, this why ARP resolution can be used to turn
+IP to GID in rdmacm.
+
+When dealing with IB communication between subnets this assumption
+is no longer valid. ARP resolution will get us the next hop device
+address and not the peer node's device address.
+
+To solve this issue, we will check user space if it can provide the
+GID of the peer node, and fail if not.
+
+We add a sequence number to identify each request and fill in the GID
+upon answer from userspace.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ae43f8286730d1f2d241c34601df59f6d2286ac4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/addr.c
+#	drivers/infiniband/core/core_priv.h
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/addr.c
+index 746cdf56bc76,1374541a4528..000000000000
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@@ -46,11 -46,11 +46,15 @@@
+  #include <net/ip6_route.h>
+  #include <rdma/ib_addr.h>
+  #include <rdma/ib.h>
++ #include <rdma/rdma_netlink.h>
++ #include <net/netlink.h>
++ 
++ #include "core_priv.h"
+  
+ +MODULE_AUTHOR("Sean Hefty");
+ +MODULE_DESCRIPTION("IB Address Translation");
+ +MODULE_LICENSE("Dual BSD/GPL");
+ +
+  struct addr_req {
+  	struct list_head list;
+  	struct sockaddr_storage src_addr;
+@@@ -199,7 -322,19 +326,23 @@@ static void queue_req(struct addr_req *
+  	mutex_unlock(&lock);
+  }
+  
+++<<<<<<< HEAD
+ +static int dst_fetch_ha(struct dst_entry *dst, struct rdma_dev_addr *dev_addr, void *daddr)
+++=======
++ static int ib_nl_fetch_ha(struct dst_entry *dst, struct rdma_dev_addr *dev_addr,
++ 			  const void *daddr, u32 seq, u16 family)
++ {
++ 	if (ibnl_chk_listeners(RDMA_NL_GROUP_LS))
++ 		return -EADDRNOTAVAIL;
++ 
++ 	/* We fill in what we can, the response will fill the rest */
++ 	rdma_copy_addr(dev_addr, dst->dev, NULL);
++ 	return ib_nl_ip_send_msg(dev_addr, daddr, seq, family);
++ }
++ 
++ static int dst_fetch_ha(struct dst_entry *dst, struct rdma_dev_addr *dev_addr,
++ 			const void *daddr)
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  {
+  	struct neighbour *n;
+  	int ret;
+@@@ -222,9 -357,43 +365,42 @@@
+  	return ret;
+  }
+  
++ static bool has_gateway(struct dst_entry *dst, sa_family_t family)
++ {
++ 	struct rtable *rt;
++ 	struct rt6_info *rt6;
++ 
++ 	if (family == AF_INET) {
++ 		rt = container_of(dst, struct rtable, dst);
++ 		return rt->rt_uses_gateway;
++ 	}
++ 
++ 	rt6 = container_of(dst, struct rt6_info, dst);
++ 	return rt6->rt6i_flags & RTF_GATEWAY;
++ }
++ 
++ static int fetch_ha(struct dst_entry *dst, struct rdma_dev_addr *dev_addr,
++ 		    const struct sockaddr *dst_in, u32 seq)
++ {
++ 	const struct sockaddr_in *dst_in4 =
++ 		(const struct sockaddr_in *)dst_in;
++ 	const struct sockaddr_in6 *dst_in6 =
++ 		(const struct sockaddr_in6 *)dst_in;
++ 	const void *daddr = (dst_in->sa_family == AF_INET) ?
++ 		(const void *)&dst_in4->sin_addr.s_addr :
++ 		(const void *)&dst_in6->sin6_addr;
++ 	sa_family_t family = dst_in->sa_family;
++ 
++ 	/* Gateway + ARPHRD_INFINIBAND -> IB router */
++ 	if (has_gateway(dst, family) && dst->dev->type == ARPHRD_INFINIBAND)
++ 		return ib_nl_fetch_ha(dst, dev_addr, daddr, seq, family);
++ 	else
++ 		return dst_fetch_ha(dst, dev_addr, daddr);
++ }
++ 
+  static int addr4_resolve(struct sockaddr_in *src_in,
+ -			 const struct sockaddr_in *dst_in,
+ -			 struct rdma_dev_addr *addr,
+ -			 struct rtable **prt)
+ +			 struct sockaddr_in *dst_in,
+ +			 struct rdma_dev_addr *addr)
+  {
+  	__be32 src_ip = src_in->sin_addr.s_addr;
+  	__be32 dst_ip = dst_in->sin_addr.s_addr;
+@@@ -244,22 -413,17 +420,31 @@@
+  	src_in->sin_family = AF_INET;
+  	src_in->sin_addr.s_addr = fl4.saddr;
+  
+++<<<<<<< HEAD
+ +	if (rt->dst.dev->flags & IFF_LOOPBACK) {
+ +		ret = rdma_translate_ip((struct sockaddr *)dst_in, addr, NULL);
+ +		if (!ret)
+ +			memcpy(addr->dst_dev_addr, addr->src_dev_addr, MAX_ADDR_LEN);
+ +		goto put;
+ +	}
+++=======
++ 	/* If there's a gateway and type of device not ARPHRD_INFINIBAND, we're
++ 	 * definitely in RoCE v2 (as RoCE v1 isn't routable) set the network
++ 	 * type accordingly.
++ 	 */
++ 	if (rt->rt_uses_gateway && rt->dst.dev->type != ARPHRD_INFINIBAND)
++ 		addr->network = RDMA_NETWORK_IPV4;
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  
+ -	addr->hoplimit = ip4_dst_hoplimit(&rt->dst);
+ +	/* If the device does ARP internally, return 'done' */
+ +	if (rt->dst.dev->flags & IFF_NOARP) {
+ +		ret = rdma_copy_addr(addr, rt->dst.dev, NULL);
+ +		goto put;
+ +	}
+  
+ -	*prt = rt;
+ -	return 0;
+ +	ret = dst_fetch_ha(&rt->dst, addr, &fl4.daddr);
+ +put:
+ +	ip_rt_put(rt);
+  out:
+  	return ret;
+  }
+@@@ -292,20 -459,18 +477,30 @@@ static int addr6_resolve(struct sockadd
+  		src_in->sin6_addr = fl6.saddr;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (dst->dev->flags & IFF_LOOPBACK) {
+ +		ret = rdma_translate_ip((struct sockaddr *)dst_in, addr, NULL);
+ +		if (!ret)
+ +			memcpy(addr->dst_dev_addr, addr->src_dev_addr, MAX_ADDR_LEN);
+ +		goto put;
+ +	}
+++=======
++ 	/* If there's a gateway and type of device not ARPHRD_INFINIBAND, we're
++ 	 * definitely in RoCE v2 (as RoCE v1 isn't routable) set the network
++ 	 * type accordingly.
++ 	 */
++ 	if (rt->rt6i_flags & RTF_GATEWAY &&
++ 	    ip6_dst_idev(dst)->dev->type != ARPHRD_INFINIBAND)
++ 		addr->network = RDMA_NETWORK_IPV6;
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  
+ -	addr->hoplimit = ip6_dst_hoplimit(dst);
+ +	/* If the device does ARP internally, return 'done' */
+ +	if (dst->dev->flags & IFF_NOARP) {
+ +		ret = rdma_copy_addr(addr, dst->dev, NULL);
+ +		goto put;
+ +	}
+  
+ -	*pdst = dst;
+ -	return 0;
+ +	ret = dst_fetch_ha(dst, addr, &fl6.daddr);
+  put:
+  	dst_release(dst);
+  	return ret;
+@@@ -319,16 -485,80 +514,90 @@@ static int addr6_resolve(struct sockadd
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static int addr_resolve(struct sockaddr *src_in,
+ +			struct sockaddr *dst_in,
+ +			struct rdma_dev_addr *addr)
+++=======
++ static int addr_resolve_neigh(struct dst_entry *dst,
++ 			      const struct sockaddr *dst_in,
++ 			      struct rdma_dev_addr *addr,
++ 			      u32 seq)
++ {
++ 	if (dst->dev->flags & IFF_LOOPBACK) {
++ 		int ret;
++ 
++ 		ret = rdma_translate_ip(dst_in, addr, NULL);
++ 		if (!ret)
++ 			memcpy(addr->dst_dev_addr, addr->src_dev_addr,
++ 			       MAX_ADDR_LEN);
++ 
++ 		return ret;
++ 	}
++ 
++ 	/* If the device doesn't do ARP internally */
++ 	if (!(dst->dev->flags & IFF_NOARP))
++ 		return fetch_ha(dst, addr, dst_in, seq);
++ 
++ 	return rdma_copy_addr(addr, dst->dev, NULL);
++ }
++ 
++ static int addr_resolve(struct sockaddr *src_in,
++ 			const struct sockaddr *dst_in,
++ 			struct rdma_dev_addr *addr,
++ 			bool resolve_neigh,
++ 			u32 seq)
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  {
+ -	struct net_device *ndev;
+ -	struct dst_entry *dst;
+ -	int ret;
+ -
+  	if (src_in->sa_family == AF_INET) {
+++<<<<<<< HEAD
+ +		return addr4_resolve((struct sockaddr_in *) src_in,
+ +			(struct sockaddr_in *) dst_in, addr);
+ +	} else
+ +		return addr6_resolve((struct sockaddr_in6 *) src_in,
+ +			(struct sockaddr_in6 *) dst_in, addr);
+++=======
++ 		struct rtable *rt = NULL;
++ 		const struct sockaddr_in *dst_in4 =
++ 			(const struct sockaddr_in *)dst_in;
++ 
++ 		ret = addr4_resolve((struct sockaddr_in *)src_in,
++ 				    dst_in4, addr, &rt);
++ 		if (ret)
++ 			return ret;
++ 
++ 		if (resolve_neigh)
++ 			ret = addr_resolve_neigh(&rt->dst, dst_in, addr, seq);
++ 
++ 		ndev = rt->dst.dev;
++ 		dev_hold(ndev);
++ 
++ 		ip_rt_put(rt);
++ 	} else {
++ 		const struct sockaddr_in6 *dst_in6 =
++ 			(const struct sockaddr_in6 *)dst_in;
++ 
++ 		ret = addr6_resolve((struct sockaddr_in6 *)src_in,
++ 				    dst_in6, addr,
++ 				    &dst);
++ 		if (ret)
++ 			return ret;
++ 
++ 		if (resolve_neigh)
++ 			ret = addr_resolve_neigh(dst, dst_in, addr, seq);
++ 
++ 		ndev = dst->dev;
++ 		dev_hold(ndev);
++ 
++ 		dst_release(dst);
++ 	}
++ 
++ 	addr->bound_dev_if = ndev->ifindex;
++ 	addr->net = dev_net(ndev);
++ 	dev_put(ndev);
++ 
++ 	return ret;
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  }
+  
+  static void process_req(struct work_struct *work)
+@@@ -344,7 -574,8 +613,12 @@@
+  		if (req->status == -ENODATA) {
+  			src_in = (struct sockaddr *) &req->src_addr;
+  			dst_in = (struct sockaddr *) &req->dst_addr;
+++<<<<<<< HEAD
+ +			req->status = addr_resolve(src_in, dst_in, req->addr);
+++=======
++ 			req->status = addr_resolve(src_in, dst_in, req->addr,
++ 						   true, req->seq);
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  			if (req->status && time_after_eq(jiffies, req->timeout))
+  				req->status = -ETIMEDOUT;
+  			else if (req->status == -ENODATA)
+@@@ -403,8 -634,9 +677,13 @@@ int rdma_resolve_ip(struct rdma_addr_cl
+  	req->context = context;
+  	req->client = client;
+  	atomic_inc(&client->refcount);
++ 	req->seq = (u32)atomic_inc_return(&ib_nl_addr_request_seq);
+  
+++<<<<<<< HEAD
+ +	req->status = addr_resolve(src_in, dst_in, addr);
+++=======
++ 	req->status = addr_resolve(src_in, dst_in, addr, true, req->seq);
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  	switch (req->status) {
+  	case 0:
+  		req->timeout = jiffies;
+@@@ -426,6 -658,26 +705,29 @@@ err
+  }
+  EXPORT_SYMBOL(rdma_resolve_ip);
+  
+++<<<<<<< HEAD
+++=======
++ int rdma_resolve_ip_route(struct sockaddr *src_addr,
++ 			  const struct sockaddr *dst_addr,
++ 			  struct rdma_dev_addr *addr)
++ {
++ 	struct sockaddr_storage ssrc_addr = {};
++ 	struct sockaddr *src_in = (struct sockaddr *)&ssrc_addr;
++ 
++ 	if (src_addr) {
++ 		if (src_addr->sa_family != dst_addr->sa_family)
++ 			return -EINVAL;
++ 
++ 		memcpy(src_in, src_addr, rdma_addr_size(src_addr));
++ 	} else {
++ 		src_in->sa_family = dst_addr->sa_family;
++ 	}
++ 
++ 	return addr_resolve(src_in, dst_addr, addr, false, 0);
++ }
++ EXPORT_SYMBOL(rdma_resolve_ip_route);
++ 
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  void rdma_addr_cancel(struct rdma_dev_addr *addr)
+  {
+  	struct addr_req *req, *temp_req;
+diff --cc drivers/infiniband/core/core_priv.h
+index 0d01fb95d944,19d499dcab76..000000000000
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@@ -114,4 -137,20 +114,23 @@@ static inline bool rdma_is_upper_dev_rc
+  	return _upper == upper;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int addr_init(void);
++ void addr_cleanup(void);
++ 
++ int ib_mad_init(void);
++ void ib_mad_cleanup(void);
++ 
++ int ib_sa_init(void);
++ void ib_sa_cleanup(void);
++ 
++ int ib_nl_handle_resolve_resp(struct sk_buff *skb,
++ 			      struct netlink_callback *cb);
++ int ib_nl_handle_set_timeout(struct sk_buff *skb,
++ 			     struct netlink_callback *cb);
++ int ib_nl_handle_ip_res_resp(struct sk_buff *skb,
++ 			     struct netlink_callback *cb);
++ 
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  #endif /* _CORE_PRIV_H */
+diff --cc drivers/infiniband/core/device.c
+index 84b0c0c4193b,5516fb070344..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -946,6 -955,29 +946,32 @@@ struct net_device *ib_get_net_dev_by_pa
+  }
+  EXPORT_SYMBOL(ib_get_net_dev_by_params);
+  
+++<<<<<<< HEAD
+++=======
++ static struct ibnl_client_cbs ibnl_ls_cb_table[] = {
++ 	[RDMA_NL_LS_OP_RESOLVE] = {
++ 		.dump = ib_nl_handle_resolve_resp,
++ 		.module = THIS_MODULE },
++ 	[RDMA_NL_LS_OP_SET_TIMEOUT] = {
++ 		.dump = ib_nl_handle_set_timeout,
++ 		.module = THIS_MODULE },
++ 	[RDMA_NL_LS_OP_IP_RESOLVE] = {
++ 		.dump = ib_nl_handle_ip_res_resp,
++ 		.module = THIS_MODULE },
++ };
++ 
++ static int ib_add_ibnl_clients(void)
++ {
++ 	return ibnl_add_client(RDMA_NL_LS, ARRAY_SIZE(ibnl_ls_cb_table),
++ 			       ibnl_ls_cb_table);
++ }
++ 
++ static void ib_remove_ibnl_clients(void)
++ {
++ 	ibnl_remove_client(RDMA_NL_LS);
++ }
++ 
+++>>>>>>> ae43f8286730 (IB/core: Add IP to GID netlink offload)
+  static int __init ib_core_init(void)
+  {
+  	int ret;
+* Unmerged path drivers/infiniband/core/addr.c
+* Unmerged path drivers/infiniband/core/core_priv.h
+* Unmerged path drivers/infiniband/core/device.c
