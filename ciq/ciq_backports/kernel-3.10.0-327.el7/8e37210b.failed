@@ -1,0 +1,596 @@
+IB/core: Change ib_create_cq to use struct ib_cq_init_attr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [inifniband] core: Change ib_create_cq to use struct ib_cq_init_attr (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 97.35%
+commit-author Matan Barak <matanb@mellanox.com>
+commit 8e37210b38fb7d6aa06aebde763316ee955d44c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8e37210b.failed
+
+Currently, ib_create_cq uses cqe and comp_vecotr instead
+of the extendible ib_cq_init_attr struct.
+
+Earlier patches already changed the vendors to work with
+ib_cq_init_attr. This patch changes the consumers too.
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 8e37210b38fb7d6aa06aebde763316ee955d44c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+#	drivers/infiniband/ulp/isert/ib_isert.c
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+#	drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.c
+diff --cc drivers/infiniband/core/verbs.c
+index 658c2835a11d,bac3fb406a74..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -1080,7 -1081,7 +1081,11 @@@ struct ib_cq *ib_create_cq(struct ib_de
+  {
+  	struct ib_cq *cq;
+  
+++<<<<<<< HEAD
+ +	cq = device->create_cq(device, cqe, comp_vector, NULL, NULL);
+++=======
++ 	cq = device->create_cq(device, cq_attr, NULL, NULL);
+++>>>>>>> 8e37210b38fb (IB/core: Change ib_create_cq to use struct ib_cq_init_attr)
+  
+  	if (!IS_ERR(cq)) {
+  		cq->device        = device;
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index a18cbdeda89b,5c9f565ea0e8..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -116,29 -125,20 +116,46 @@@ static int iser_create_device_ib_res(st
+  	if (IS_ERR(device->pd))
+  		goto pd_err;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < device->cqs_used; i++) {
+ +		cq_desc[i].device   = device;
+ +		cq_desc[i].cq_index = i;
+ +
+ +		max_cqe = min(ISER_MAX_RX_CQ_LEN, dev_attr->max_cqe);
+ +		device->rx_cq[i] = ib_create_cq(device->ib_device,
+ +					  iser_cq_callback,
+ +					  iser_cq_event_callback,
+ +					  (void *)&cq_desc[i],
+ +					  max_cqe, i);
+ +		if (IS_ERR(device->rx_cq[i])) {
+ +			device->rx_cq[i] = NULL;
+++=======
++ 	for (i = 0; i < device->comps_used; i++) {
++ 		struct ib_cq_init_attr cq_attr = {};
++ 		struct iser_comp *comp = &device->comps[i];
++ 
++ 		comp->device = device;
++ 		cq_attr.cqe = max_cqe;
++ 		cq_attr.comp_vector = i;
++ 		comp->cq = ib_create_cq(device->ib_device,
++ 					iser_cq_callback,
++ 					iser_cq_event_callback,
++ 					(void *)comp,
++ 					&cq_attr);
++ 		if (IS_ERR(comp->cq)) {
++ 			comp->cq = NULL;
+++>>>>>>> 8e37210b38fb (IB/core: Change ib_create_cq to use struct ib_cq_init_attr)
+ +			goto cq_err;
+ +		}
+ +
+ +		max_cqe = min(ISER_MAX_TX_CQ_LEN, dev_attr->max_cqe);
+ +		device->tx_cq[i] = ib_create_cq(device->ib_device,
+ +					  NULL, iser_cq_event_callback,
+ +					  (void *)&cq_desc[i],
+ +					  max_cqe, i);
+ +
+ +		if (IS_ERR(device->tx_cq[i])) {
+ +			device->tx_cq[i] = NULL;
+  			goto cq_err;
+  		}
+  
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 6b6eb8b033b8,9e7b4927265c..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -202,14 -270,83 +202,90 @@@ isert_free_rx_descriptors(struct isert_
+  				    ISER_RX_PAYLOAD_SIZE, DMA_FROM_DEVICE);
+  	}
+  
+ -	kfree(isert_conn->rx_descs);
+ -	isert_conn->rx_descs = NULL;
+ +	kfree(isert_conn->conn_rx_descs);
+ +	isert_conn->conn_rx_descs = NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static void isert_cq_tx_work(struct work_struct *);
+ +static void isert_cq_tx_callback(struct ib_cq *, void *);
+ +static void isert_cq_rx_work(struct work_struct *);
+ +static void isert_cq_rx_callback(struct ib_cq *, void *);
+++=======
++ static void isert_cq_work(struct work_struct *);
++ static void isert_cq_callback(struct ib_cq *, void *);
++ 
++ static void
++ isert_free_comps(struct isert_device *device)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < device->comps_used; i++) {
++ 		struct isert_comp *comp = &device->comps[i];
++ 
++ 		if (comp->cq) {
++ 			cancel_work_sync(&comp->work);
++ 			ib_destroy_cq(comp->cq);
++ 		}
++ 	}
++ 	kfree(device->comps);
++ }
++ 
++ static int
++ isert_alloc_comps(struct isert_device *device,
++ 		  struct ib_device_attr *attr)
++ {
++ 	int i, max_cqe, ret = 0;
++ 
++ 	device->comps_used = min(ISERT_MAX_CQ, min_t(int, num_online_cpus(),
++ 				 device->ib_device->num_comp_vectors));
++ 
++ 	isert_info("Using %d CQs, %s supports %d vectors support "
++ 		   "Fast registration %d pi_capable %d\n",
++ 		   device->comps_used, device->ib_device->name,
++ 		   device->ib_device->num_comp_vectors, device->use_fastreg,
++ 		   device->pi_capable);
++ 
++ 	device->comps = kcalloc(device->comps_used, sizeof(struct isert_comp),
++ 				GFP_KERNEL);
++ 	if (!device->comps) {
++ 		isert_err("Unable to allocate completion contexts\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	max_cqe = min(ISER_MAX_CQ_LEN, attr->max_cqe);
++ 
++ 	for (i = 0; i < device->comps_used; i++) {
++ 		struct ib_cq_init_attr cq_attr = {};
++ 		struct isert_comp *comp = &device->comps[i];
++ 
++ 		comp->device = device;
++ 		INIT_WORK(&comp->work, isert_cq_work);
++ 		cq_attr.cqe = max_cqe;
++ 		cq_attr.comp_vector = i;
++ 		comp->cq = ib_create_cq(device->ib_device,
++ 					isert_cq_callback,
++ 					isert_cq_event_callback,
++ 					(void *)comp,
++ 					&cq_attr);
++ 		if (IS_ERR(comp->cq)) {
++ 			isert_err("Unable to allocate cq\n");
++ 			ret = PTR_ERR(comp->cq);
++ 			comp->cq = NULL;
++ 			goto out_cq;
++ 		}
++ 
++ 		ret = ib_req_notify_cq(comp->cq, IB_CQ_NEXT_COMP);
++ 		if (ret)
++ 			goto out_cq;
++ 	}
++ 
++ 	return 0;
++ out_cq:
++ 	isert_free_comps(device);
++ 	return ret;
++ }
+++>>>>>>> 8e37210b38fb (IB/core: Change ib_create_cq to use struct ib_cq_init_attr)
+  
+  static int
+  isert_create_device_ib_res(struct isert_device *device)
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 81bcd7750442,783efe1a3a28..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -2100,8 -2090,10 +2101,13 @@@ static int srpt_create_ch_ib(struct srp
+  	if (!qp_init)
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ retry:
++ 	cq_attr.cqe = ch->rq_size + srp_sq_size;
+++>>>>>>> 8e37210b38fb (IB/core: Change ib_create_cq to use struct ib_cq_init_attr)
+  	ch->cq = ib_create_cq(sdev->device, srpt_completion, NULL, ch,
+- 			      ch->rq_size + srp_sq_size, 0);
++ 			      &cq_attr);
+  	if (IS_ERR(ch->cq)) {
+  		ret = PTR_ERR(ch->cq);
+  		pr_err("failed to create CQ cqe= %d ret= %d\n",
+* Unmerged path drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.c
+diff --git a/drivers/infiniband/core/mad.c b/drivers/infiniband/core/mad.c
+index 835e4dd8a613..a4b1466c1bf6 100644
+--- a/drivers/infiniband/core/mad.c
++++ b/drivers/infiniband/core/mad.c
+@@ -3155,6 +3155,7 @@ static int ib_mad_port_open(struct ib_device *device,
+ 	unsigned long flags;
+ 	char name[sizeof "ib_mad123"];
+ 	int has_smi;
++	struct ib_cq_init_attr cq_attr = {};
+ 
+ 	if (WARN_ON(rdma_max_mad_size(device, port_num) < IB_MGMT_MAD_SIZE))
+ 		return -EFAULT;
+@@ -3182,9 +3183,10 @@ static int ib_mad_port_open(struct ib_device *device,
+ 	if (has_smi)
+ 		cq_size *= 2;
+ 
++	cq_attr.cqe = cq_size;
+ 	port_priv->cq = ib_create_cq(port_priv->device,
+ 				     ib_mad_thread_completion_handler,
+-				     NULL, port_priv, cq_size, 0);
++				     NULL, port_priv, &cq_attr);
+ 	if (IS_ERR(port_priv->cq)) {
+ 		dev_err(&device->dev, "Couldn't create ib_mad CQ\n");
+ 		ret = PTR_ERR(port_priv->cq);
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/drivers/infiniband/hw/ehca/ehca_main.c b/drivers/infiniband/hw/ehca/ehca_main.c
+index ad773ca2aa41..385e075e819f 100644
+--- a/drivers/infiniband/hw/ehca/ehca_main.c
++++ b/drivers/infiniband/hw/ehca/ehca_main.c
+@@ -553,6 +553,7 @@ static int ehca_create_aqp1(struct ehca_shca *shca, u32 port)
+ 	struct ib_cq *ibcq;
+ 	struct ib_qp *ibqp;
+ 	struct ib_qp_init_attr qp_init_attr;
++	struct ib_cq_init_attr cq_attr = {};
+ 	int ret;
+ 
+ 	if (sport->ibcq_aqp1) {
+@@ -560,7 +561,9 @@ static int ehca_create_aqp1(struct ehca_shca *shca, u32 port)
+ 		return -EPERM;
+ 	}
+ 
+-	ibcq = ib_create_cq(&shca->ib_device, NULL, NULL, (void *)(-1), 10, 0);
++	cq_attr.cqe = 10;
++	ibcq = ib_create_cq(&shca->ib_device, NULL, NULL, (void *)(-1),
++			    &cq_attr);
+ 	if (IS_ERR(ibcq)) {
+ 		ehca_err(&shca->ib_device, "Cannot create AQP1 CQ.");
+ 		return PTR_ERR(ibcq);
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index f2b6b625c2e9..4953831098c8 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -1786,6 +1786,7 @@ static int create_pv_resources(struct ib_device *ibdev, int slave, int port,
+ 			       int create_tun, struct mlx4_ib_demux_pv_ctx *ctx)
+ {
+ 	int ret, cq_size;
++	struct ib_cq_init_attr cq_attr = {};
+ 
+ 	if (ctx->state != DEMUX_PV_STATE_DOWN)
+ 		return -EEXIST;
+@@ -1814,8 +1815,9 @@ static int create_pv_resources(struct ib_device *ibdev, int slave, int port,
+ 	if (ctx->has_smi)
+ 		cq_size *= 2;
+ 
++	cq_attr.cqe = cq_size;
+ 	ctx->cq = ib_create_cq(ctx->ib_dev, mlx4_ib_tunnel_comp_handler,
+-			       NULL, ctx, cq_size, 0);
++			       NULL, ctx, &cq_attr);
+ 	if (IS_ERR(ctx->cq)) {
+ 		ret = PTR_ERR(ctx->cq);
+ 		pr_err("Couldn't create tunnel CQ (%d)\n", ret);
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index a0eb941cd8b1..22c894889056 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -758,6 +758,7 @@ static struct ib_xrcd *mlx4_ib_alloc_xrcd(struct ib_device *ibdev,
+ 					  struct ib_udata *udata)
+ {
+ 	struct mlx4_ib_xrcd *xrcd;
++	struct ib_cq_init_attr cq_attr = {};
+ 	int err;
+ 
+ 	if (!(to_mdev(ibdev)->dev->caps.flags & MLX4_DEV_CAP_FLAG_XRC))
+@@ -777,7 +778,8 @@ static struct ib_xrcd *mlx4_ib_alloc_xrcd(struct ib_device *ibdev,
+ 		goto err2;
+ 	}
+ 
+-	xrcd->cq = ib_create_cq(ibdev, NULL, NULL, xrcd, 1, 0);
++	cq_attr.cqe = 1;
++	xrcd->cq = ib_create_cq(ibdev, NULL, NULL, xrcd, &cq_attr);
+ 	if (IS_ERR(xrcd->cq)) {
+ 		err = PTR_ERR(xrcd->cq);
+ 		goto err3;
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 86005fa8c936..e9ca6e97e1bc 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -971,6 +971,7 @@ static int create_umr_res(struct mlx5_ib_dev *dev)
+ 	struct ib_cq *cq;
+ 	struct ib_qp *qp;
+ 	struct ib_mr *mr;
++	struct ib_cq_init_attr cq_attr = {};
+ 	int ret;
+ 
+ 	attr = kzalloc(sizeof(*attr), GFP_KERNEL);
+@@ -994,8 +995,9 @@ static int create_umr_res(struct mlx5_ib_dev *dev)
+ 		goto error_1;
+ 	}
+ 
+-	cq = ib_create_cq(&dev->ib_dev, mlx5_umr_cq_handler, NULL, NULL, 128,
+-			  0);
++	cq_attr.cqe = 128;
++	cq = ib_create_cq(&dev->ib_dev, mlx5_umr_cq_handler, NULL, NULL,
++			  &cq_attr);
+ 	if (IS_ERR(cq)) {
+ 		mlx5_ib_dbg(dev, "Couldn't create CQ for sync UMR QP\n");
+ 		ret = PTR_ERR(cq);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+index 1c48b9628133..e15a27e73f7d 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+@@ -141,6 +141,7 @@ int ipoib_transport_dev_init(struct net_device *dev, struct ib_device *ca)
+ 		.sq_sig_type = IB_SIGNAL_ALL_WR,
+ 		.qp_type     = IB_QPT_UD
+ 	};
++	struct ib_cq_init_attr cq_attr = {};
+ 
+ 	int ret, size;
+ 	int i;
+@@ -167,14 +168,17 @@ int ipoib_transport_dev_init(struct net_device *dev, struct ib_device *ca)
+ 			size += ipoib_recvq_size * ipoib_max_conn_qp;
+ 	}
+ 
+-	priv->recv_cq = ib_create_cq(priv->ca, ipoib_ib_completion, NULL, dev, size, 0);
++	cq_attr.cqe = size;
++	priv->recv_cq = ib_create_cq(priv->ca, ipoib_ib_completion, NULL,
++				     dev, &cq_attr);
+ 	if (IS_ERR(priv->recv_cq)) {
+ 		printk(KERN_WARNING "%s: failed to create receive CQ\n", ca->name);
+ 		goto out_free_mr;
+ 	}
+ 
++	cq_attr.cqe = ipoib_sendq_size;
+ 	priv->send_cq = ib_create_cq(priv->ca, ipoib_send_comp_handler, NULL,
+-				     dev, ipoib_sendq_size, 0);
++				     dev, &cq_attr);
+ 	if (IS_ERR(priv->send_cq)) {
+ 		printk(KERN_WARNING "%s: failed to create send CQ\n", ca->name);
+ 		goto out_free_recv_cq;
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index aac280420243..e274bfe64789 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -494,6 +494,7 @@ static int srp_create_ch_ib(struct srp_rdma_ch *ch)
+ 	struct ib_fmr_pool *fmr_pool = NULL;
+ 	struct srp_fr_pool *fr_pool = NULL;
+ 	const int m = 1 + dev->use_fast_reg;
++	struct ib_cq_init_attr cq_attr = {};
+ 	int ret;
+ 
+ 	init_attr = kzalloc(sizeof *init_attr, GFP_KERNEL);
+@@ -501,15 +502,19 @@ static int srp_create_ch_ib(struct srp_rdma_ch *ch)
+ 		return -ENOMEM;
+ 
+ 	/* + 1 for SRP_LAST_WR_ID */
++	cq_attr.cqe = target->queue_size + 1;
++	cq_attr.comp_vector = ch->comp_vector;
+ 	recv_cq = ib_create_cq(dev->dev, srp_recv_completion, NULL, ch,
+-			       target->queue_size + 1, ch->comp_vector);
++			       &cq_attr);
+ 	if (IS_ERR(recv_cq)) {
+ 		ret = PTR_ERR(recv_cq);
+ 		goto err;
+ 	}
+ 
++	cq_attr.cqe = m * target->queue_size;
++	cq_attr.comp_vector = ch->comp_vector;
+ 	send_cq = ib_create_cq(dev->dev, srp_send_completion, NULL, ch,
+-			       m * target->queue_size, ch->comp_vector);
++			       &cq_attr);
+ 	if (IS_ERR(send_cq)) {
+ 		ret = PTR_ERR(send_cq);
+ 		goto err_recv_cq;
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+* Unmerged path drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 694968172984..466d885933b9 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2321,16 +2321,15 @@ static inline int ib_post_recv(struct ib_qp *qp,
+  *   asynchronous event not associated with a completion occurs on the CQ.
+  * @cq_context: Context associated with the CQ returned to the user via
+  *   the associated completion and event handlers.
+- * @cqe: The minimum size of the CQ.
+- * @comp_vector - Completion vector used to signal completion events.
+- *     Must be >= 0 and < context->num_comp_vectors.
++ * @cq_attr: The attributes the CQ should be created upon.
+  *
+  * Users can examine the cq structure to determine the actual CQ size.
+  */
+ struct ib_cq *ib_create_cq(struct ib_device *device,
+ 			   ib_comp_handler comp_handler,
+ 			   void (*event_handler)(struct ib_event *, void *),
+-			   void *cq_context, int cqe, int comp_vector);
++			   void *cq_context,
++			   const struct ib_cq_init_attr *cq_attr);
+ 
+ /**
+  * ib_resize_cq - Modifies the capacity of the CQ.
+diff --git a/net/9p/trans_rdma.c b/net/9p/trans_rdma.c
+index 2c69ddd691a1..6595b934ac65 100644
+--- a/net/9p/trans_rdma.c
++++ b/net/9p/trans_rdma.c
+@@ -577,6 +577,7 @@ rdma_create_trans(struct p9_client *client, const char *addr, char *args)
+ 	struct rdma_conn_param conn_param;
+ 	struct ib_qp_init_attr qp_attr;
+ 	struct ib_device_attr devattr;
++	struct ib_cq_init_attr cq_attr = {};
+ 
+ 	/* Parse the transport specific mount options */
+ 	err = parse_opts(args, &opts);
+@@ -624,9 +625,10 @@ rdma_create_trans(struct p9_client *client, const char *addr, char *args)
+ 		goto error;
+ 
+ 	/* Create the Completion Queue */
++	cq_attr.cqe = opts.sq_depth + opts.rq_depth + 1;
+ 	rdma->cq = ib_create_cq(rdma->cm_id->device, cq_comp_handler,
+ 				cq_event_handler, client,
+-				opts.sq_depth + opts.rq_depth + 1, 0);
++				&cq_attr);
+ 	if (IS_ERR(rdma->cq))
+ 		goto error;
+ 	ib_req_notify_cq(rdma->cq, IB_CQ_NEXT_COMP);
+diff --git a/net/rds/ib_cm.c b/net/rds/ib_cm.c
+index 6e33061ac0fb..174241d3d076 100644
+--- a/net/rds/ib_cm.c
++++ b/net/rds/ib_cm.c
+@@ -238,6 +238,7 @@ static int rds_ib_setup_qp(struct rds_connection *conn)
+ 	struct rds_ib_connection *ic = conn->c_transport_data;
+ 	struct ib_device *dev = ic->i_cm_id->device;
+ 	struct ib_qp_init_attr attr;
++	struct ib_cq_init_attr cq_attr = {};
+ 	struct rds_ib_device *rds_ibdev;
+ 	int ret;
+ 
+@@ -261,9 +262,10 @@ static int rds_ib_setup_qp(struct rds_connection *conn)
+ 	ic->i_pd = rds_ibdev->pd;
+ 	ic->i_mr = rds_ibdev->mr;
+ 
++	cq_attr.cqe = ic->i_send_ring.w_nr + 1;
+ 	ic->i_send_cq = ib_create_cq(dev, rds_ib_send_cq_comp_handler,
+ 				     rds_ib_cq_event_handler, conn,
+-				     ic->i_send_ring.w_nr + 1, 0);
++				     &cq_attr);
+ 	if (IS_ERR(ic->i_send_cq)) {
+ 		ret = PTR_ERR(ic->i_send_cq);
+ 		ic->i_send_cq = NULL;
+@@ -271,9 +273,10 @@ static int rds_ib_setup_qp(struct rds_connection *conn)
+ 		goto out;
+ 	}
+ 
++	cq_attr.cqe = ic->i_recv_ring.w_nr;
+ 	ic->i_recv_cq = ib_create_cq(dev, rds_ib_recv_cq_comp_handler,
+ 				     rds_ib_cq_event_handler, conn,
+-				     ic->i_recv_ring.w_nr, 0);
++				     &cq_attr);
+ 	if (IS_ERR(ic->i_recv_cq)) {
+ 		ret = PTR_ERR(ic->i_recv_cq);
+ 		ic->i_recv_cq = NULL;
+diff --git a/net/rds/iw_cm.c b/net/rds/iw_cm.c
+index a91e1db62ee6..adadc0ae4211 100644
+--- a/net/rds/iw_cm.c
++++ b/net/rds/iw_cm.c
+@@ -179,6 +179,7 @@ static int rds_iw_init_qp_attrs(struct ib_qp_init_attr *attr,
+ 		void *context)
+ {
+ 	struct ib_device *dev = rds_iwdev->dev;
++	struct ib_cq_init_attr cq_attr = {};
+ 	unsigned int send_size, recv_size;
+ 	int ret;
+ 
+@@ -198,9 +199,10 @@ static int rds_iw_init_qp_attrs(struct ib_qp_init_attr *attr,
+ 	attr->sq_sig_type = IB_SIGNAL_REQ_WR;
+ 	attr->qp_type = IB_QPT_RC;
+ 
++	cq_attr.cqe = send_size;
+ 	attr->send_cq = ib_create_cq(dev, send_cq_handler,
+ 				     rds_iw_cq_event_handler,
+-				     context, send_size, 0);
++				     context, &cq_attr);
+ 	if (IS_ERR(attr->send_cq)) {
+ 		ret = PTR_ERR(attr->send_cq);
+ 		attr->send_cq = NULL;
+@@ -208,9 +210,10 @@ static int rds_iw_init_qp_attrs(struct ib_qp_init_attr *attr,
+ 		goto out;
+ 	}
+ 
++	cq_attr.cqe = recv_size;
+ 	attr->recv_cq = ib_create_cq(dev, recv_cq_handler,
+ 				     rds_iw_cq_event_handler,
+-				     context, recv_size, 0);
++				     context, &cq_attr);
+ 	if (IS_ERR(attr->recv_cq)) {
+ 		ret = PTR_ERR(attr->recv_cq);
+ 		attr->recv_cq = NULL;
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_transport.c b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+index 6fa51528efe8..15beef849493 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@ -844,6 +844,7 @@ static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt)
+ 	struct svcxprt_rdma *listen_rdma;
+ 	struct svcxprt_rdma *newxprt = NULL;
+ 	struct rdma_conn_param conn_param;
++	struct ib_cq_init_attr cq_attr = {};
+ 	struct ib_qp_init_attr qp_attr;
+ 	struct ib_device_attr devattr;
+ 	int uninitialized_var(dma_mr_acc);
+@@ -896,22 +897,22 @@ static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt)
+ 		dprintk("svcrdma: error creating PD for connect request\n");
+ 		goto errout;
+ 	}
++	cq_attr.cqe = newxprt->sc_sq_depth;
+ 	newxprt->sc_sq_cq = ib_create_cq(newxprt->sc_cm_id->device,
+ 					 sq_comp_handler,
+ 					 cq_event_handler,
+ 					 newxprt,
+-					 newxprt->sc_sq_depth,
+-					 0);
++					 &cq_attr);
+ 	if (IS_ERR(newxprt->sc_sq_cq)) {
+ 		dprintk("svcrdma: error creating SQ CQ for connect request\n");
+ 		goto errout;
+ 	}
++	cq_attr.cqe = newxprt->sc_max_requests;
+ 	newxprt->sc_rq_cq = ib_create_cq(newxprt->sc_cm_id->device,
+ 					 rq_comp_handler,
+ 					 cq_event_handler,
+ 					 newxprt,
+-					 newxprt->sc_max_requests,
+-					 0);
++					 &cq_attr);
+ 	if (IS_ERR(newxprt->sc_rq_cq)) {
+ 		dprintk("svcrdma: error creating RQ CQ for connect request\n");
+ 		goto errout;
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 61c41298b4ea..5b24be66c497 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -657,6 +657,7 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
+ {
+ 	struct ib_device_attr devattr;
+ 	struct ib_cq *sendcq, *recvcq;
++	struct ib_cq_init_attr cq_attr = {};
+ 	int rc, err;
+ 
+ 	rc = ib_query_device(ia->ri_id->device, &devattr);
+@@ -740,9 +741,9 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
+ 	init_waitqueue_head(&ep->rep_connect_wait);
+ 	INIT_DELAYED_WORK(&ep->rep_connect_worker, rpcrdma_connect_worker);
+ 
++	cq_attr.cqe = ep->rep_attr.cap.max_send_wr + 1;
+ 	sendcq = ib_create_cq(ia->ri_id->device, rpcrdma_sendcq_upcall,
+-				  rpcrdma_cq_async_error_upcall, ep,
+-				  ep->rep_attr.cap.max_send_wr + 1, 0);
++				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
+ 	if (IS_ERR(sendcq)) {
+ 		rc = PTR_ERR(sendcq);
+ 		dprintk("RPC:       %s: failed to create send CQ: %i\n",
+@@ -757,9 +758,9 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
+ 		goto out2;
+ 	}
+ 
++	cq_attr.cqe = ep->rep_attr.cap.max_recv_wr + 1;
+ 	recvcq = ib_create_cq(ia->ri_id->device, rpcrdma_recvcq_upcall,
+-				  rpcrdma_cq_async_error_upcall, ep,
+-				  ep->rep_attr.cap.max_recv_wr + 1, 0);
++				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
+ 	if (IS_ERR(recvcq)) {
+ 		rc = PTR_ERR(recvcq);
+ 		dprintk("RPC:       %s: failed to create recv CQ: %i\n",
