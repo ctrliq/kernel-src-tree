@@ -354,6 +354,7 @@ static void amd_detect_cmp(struct cpuinfo_x86 *c)
 #ifdef CONFIG_X86_HT
 	unsigned bits;
 	int cpu = smp_processor_id();
+	unsigned int socket_id, core_complex_id;
 
 	bits = c->x86_coreid_bits;
 	/* Low order bits define the core id (index of core in socket) */
@@ -363,6 +364,18 @@ static void amd_detect_cmp(struct cpuinfo_x86 *c)
 	/* use socket ID also for last level cache */
 	per_cpu(cpu_llc_id, cpu) = c->phys_proc_id;
 	amd_get_topology(c);
+
+	/*
+	 * Fix percpu cpu_llc_id here as LLC topology is different
+	 * for Fam17h systems.
+	 */
+	 if (c->x86 != 0x17 || !cpuid_edx(0x80000006))
+		return;
+
+	socket_id	= (c->apicid >> bits) - 1;
+	core_complex_id	= (c->apicid & ((1 << bits) - 1)) >> 3;
+
+	per_cpu(cpu_llc_id, cpu) = (socket_id << 3) | core_complex_id;
 #endif
 }
 
