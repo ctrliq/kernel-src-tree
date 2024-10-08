@@ -1,0 +1,147 @@
+ACPI / hotplug / PCI: Do not clear event callback pointer for docks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Do not clear event callback pointer for docks (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 92.80%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit d7c7c0256b936901eb7a70fbc6d674a6bdfd463e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d7c7c025.failed
+
+After recent changes adding dock station handling to the ACPI hotplug
+core, it is not necessary to clear the .event() pointer in the
+ACPIPHP device hotplug context for dock stations any more, so don't
+do that.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit d7c7c0256b936901eb7a70fbc6d674a6bdfd463e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index 0f3f960473bc,db81412cacb0..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -221,75 -287,64 +221,79 @@@ register_slot(acpi_handle handle, u32 l
+  	device = (adr >> 16) & 0xffff;
+  	function = adr & 0xffff;
+  
+ -	acpi_lock_hp_context();
+ -	context = acpiphp_init_context(adev);
+ -	if (!context) {
+ -		acpi_unlock_hp_context();
+ -		acpi_handle_err(handle, "No hotplug context\n");
+ -		return AE_NOT_EXIST;
+ -	}
+ -	newfunc = &context->func;
+ +	pdev = bridge->pci_dev;
+ +	if (pdev && device_is_managed_by_native_pciehp(pdev))
+ +		return AE_OK;
+ +
+ +	newfunc = kzalloc(sizeof(struct acpiphp_func), GFP_KERNEL);
+ +	if (!newfunc)
+ +		return AE_NO_MEMORY;
+ +
+ +	newfunc->handle = handle;
+  	newfunc->function = function;
+ -	newfunc->parent = bridge;
+  
+ -	if (acpi_has_method(handle, "_EJ0"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_EJ0", &tmp)))
+  		newfunc->flags = FUNC_HAS_EJ0;
+  
+ -	if (acpi_has_method(handle, "_STA"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_STA", &tmp)))
+  		newfunc->flags |= FUNC_HAS_STA;
+  
+ -	acpi_unlock_hp_context();
+++<<<<<<< HEAD
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS0", &tmp)))
+ +		newfunc->flags |= FUNC_HAS_PS0;
+  
+ -	/* search for objects that share the same slot */
+ -	list_for_each_entry(slot, &bridge->slots, node)
+ -		if (slot->device == device)
+ -			goto slot_found;
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS3", &tmp)))
+ +		newfunc->flags |= FUNC_HAS_PS3;
+  
+ -	slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ -	if (!slot) {
+ -		acpi_lock_hp_context();
+ -		acpiphp_put_context(context);
+ -		acpi_unlock_hp_context();
+ -		return AE_NO_MEMORY;
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_DCK", &tmp)))
+ +		newfunc->flags |= FUNC_HAS_DCK;
+ +
+ +	status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ +	if (ACPI_FAILURE(status)) {
+ +		/*
+ +		 * use the count of the number of slots we've found
+ +		 * for the number of the slot
+ +		 */
+ +		sun = bridge->nr_slots+1;
+  	}
+++=======
+++	acpi_unlock_hp_context();
+++>>>>>>> d7c7c0256b93 (ACPI / hotplug / PCI: Do not clear event callback pointer for docks)
+  
+ -	slot->bus = bridge->pci_bus;
+ -	slot->device = device;
+ -	INIT_LIST_HEAD(&slot->funcs);
+ +	/* search for objects that share the same slot */
+ +	list_for_each_entry(slot, &bridge->slots, node)
+ +		if (slot->device == device) {
+ +			if (slot->sun != sun)
+ +				pr_warn("sibling found, but _SUN doesn't match!\n");
+ +			found = 1;
+ +			break;
+ +		}
+  
+ -	list_add_tail(&slot->node, &bridge->slots);
+ +	if (!found) {
+ +		slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ +		if (!slot) {
+ +			kfree(newfunc);
+ +			return AE_NO_MEMORY;
+ +		}
+  
+ -	/* Register slots for ejectable functions only. */
+ -	if (acpi_pci_check_ejectable(pbus, handle)  || is_dock_device(handle)) {
+ -		unsigned long long sun;
+ -		int retval;
+ +		slot->bridge = bridge;
+ +		slot->device = device;
+ +		slot->sun = sun;
+ +		INIT_LIST_HEAD(&slot->funcs);
+ +		mutex_init(&slot->crit_sect);
+  
+ +		mutex_lock(&bridge_mutex);
+ +		list_add_tail(&slot->node, &bridge->slots);
+ +		mutex_unlock(&bridge_mutex);
+  		bridge->nr_slots++;
+ -		status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ -		if (ACPI_FAILURE(status))
+ -			sun = bridge->nr_slots;
+  
+  		pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ -		    sun, pci_domain_nr(pbus), pbus->number, device);
+ -
+ -		retval = acpiphp_register_hotplug_slot(slot, sun);
+ +		    slot->sun, pci_domain_nr(pbus), pbus->number, device);
+ +		retval = acpiphp_register_hotplug_slot(slot);
+  		if (retval) {
+ -			slot->slot = NULL;
+ -			bridge->nr_slots--;
+  			if (retval == -EBUSY)
+  				pr_warn("Slot %llu already registered by another "
+ -					"hotplug driver\n", sun);
+ +					"hotplug driver\n", slot->sun);
+  			else
+  				pr_warn("acpiphp_register_hotplug_slot failed "
+  					"(err code = 0x%x)\n", retval);
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
