@@ -512,6 +512,9 @@ struct i40e_hw {
 	struct i40e_dcbx_config local_dcbx_config;
 	struct i40e_dcbx_config remote_dcbx_config;
 
+#define I40E_HW_FLAG_AQ_SRCTL_ACCESS_ENABLE BIT_ULL(0)
+	u64 flags;
+
 	/* debug mask */
 	u32 debug_mask;
 	char err_str[16];
