@@ -1,0 +1,105 @@
+sunrpc: fix UDP memory accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit a41bd25ae67d3e4052c7f00ee9f2b4ba9219309e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a41bd25a.failed
+
+The commit f9b2ee714c5c ("SUNRPC: Move UDP receive data path
+into a workqueue context"), as a side effect, moved the
+skb_free_datagram() call outside the scope of the related socket
+lock, but UDP sockets require such lock to be held for proper
+memory accounting.
+Fix it by replacing skb_free_datagram() with
+skb_free_datagram_locked().
+
+Fixes: f9b2ee714c5c ("SUNRPC: Move UDP receive data path into a workqueue context")
+Reported-and-tested-by: Jan Stancek <jstancek@redhat.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Cc: stable@vger.kernel.org # 4.4+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit a41bd25ae67d3e4052c7f00ee9f2b4ba9219309e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtsock.c
+diff --cc net/sunrpc/xprtsock.c
+index 1df21a7be71e,bf168838a029..000000000000
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@@ -1090,10 -1057,64 +1090,71 @@@ static void xs_udp_data_ready(struct so
+  	xprt_complete_rqst(task, copied);
+  
+   out_unlock:
+++<<<<<<< HEAD
+ +	spin_unlock(&xprt->transport_lock);
+ + dropit:
+ +	skb_free_datagram(sk, skb);
+ + out:
+++=======
++ 	spin_unlock_bh(&xprt->transport_lock);
++ }
++ 
++ static void xs_udp_data_receive(struct sock_xprt *transport)
++ {
++ 	struct sk_buff *skb;
++ 	struct sock *sk;
++ 	int err;
++ 
++ 	mutex_lock(&transport->recv_mutex);
++ 	sk = transport->inet;
++ 	if (sk == NULL)
++ 		goto out;
++ 	for (;;) {
++ 		skb = skb_recv_datagram(sk, 0, 1, &err);
++ 		if (skb != NULL) {
++ 			xs_udp_data_read_skb(&transport->xprt, sk, skb);
++ 			skb_free_datagram_locked(sk, skb);
++ 			continue;
++ 		}
++ 		if (!test_and_clear_bit(XPRT_SOCK_DATA_READY, &transport->sock_state))
++ 			break;
++ 	}
++ out:
++ 	mutex_unlock(&transport->recv_mutex);
++ }
++ 
++ static void xs_udp_data_receive_workfn(struct work_struct *work)
++ {
++ 	struct sock_xprt *transport =
++ 		container_of(work, struct sock_xprt, recv_worker);
++ 	xs_udp_data_receive(transport);
++ }
++ 
++ /**
++  * xs_data_ready - "data ready" callback for UDP sockets
++  * @sk: socket with data to read
++  *
++  */
++ static void xs_data_ready(struct sock *sk)
++ {
++ 	struct rpc_xprt *xprt;
++ 
++ 	read_lock_bh(&sk->sk_callback_lock);
++ 	dprintk("RPC:       xs_data_ready...\n");
++ 	xprt = xprt_from_sock(sk);
++ 	if (xprt != NULL) {
++ 		struct sock_xprt *transport = container_of(xprt,
++ 				struct sock_xprt, xprt);
++ 		transport->old_data_ready(sk);
++ 		/* Any data means we had a useful conversation, so
++ 		 * then we don't need to delay the next reconnect
++ 		 */
++ 		if (xprt->reestablish_timeout)
++ 			xprt->reestablish_timeout = 0;
++ 		if (!test_and_set_bit(XPRT_SOCK_DATA_READY, &transport->sock_state))
++ 			queue_work(xprtiod_workqueue, &transport->recv_worker);
++ 	}
+++>>>>>>> a41bd25ae67d (sunrpc: fix UDP memory accounting)
+  	read_unlock_bh(&sk->sk_callback_lock);
+  }
+  
+* Unmerged path net/sunrpc/xprtsock.c
