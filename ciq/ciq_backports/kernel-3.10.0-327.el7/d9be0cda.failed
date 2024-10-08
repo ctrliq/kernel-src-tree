@@ -1,0 +1,122 @@
+gfs2: allow fallocate to max out quotas/fs efficiently
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Abhi Das <adas@redhat.com>
+commit d9be0cda774e7fe36651b04a89a42e9e354e43c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d9be0cda.failed
+
+We can quickly get an estimate of how many blocks are available
+for allocation restricted by quota and fs size respectively, using
+the ap->allowed field in the gfs2_alloc_parms structure.
+gfs2_quota_check() and gfs2_inplace_reserve() provide these values.
+
+Once we have the total number of blocks available to us, we can
+compute how many bytes of data can be written using those blocks
+instead of guessing inefficiently.
+
+	Signed-off-by: Abhi Das <adas@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+(cherry picked from commit d9be0cda774e7fe36651b04a89a42e9e354e43c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/file.c
+diff --cc fs/gfs2/file.c
+index fd5c82990c75,4d3108792172..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -838,19 -825,11 +846,22 @@@ static long gfs2_fallocate(struct file 
+  	if (bytes == 0)
+  		bytes = sdp->sd_sb.sb_bsize;
+  
+ +	error = gfs2_rs_alloc(ip);
+ +	if (error)
+ +		return error;
+ +
+ +	mutex_lock(&inode->i_mutex);
+ +
+ +	gfs2_holder_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &gh);
+ +	error = gfs2_glock_nq(&gh);
+ +	if (unlikely(error))
+ +		goto out_uninit;
+ +
+  	gfs2_size_hint(file, offset, len);
+  
++ 	gfs2_write_calc_reserv(ip, PAGE_SIZE, &data_blocks, &ind_blocks);
++ 	ap.min_target = data_blocks + ind_blocks;
++ 
+  	while (len > 0) {
+  		if (len < bytes)
+  			bytes = len;
+@@@ -859,28 -838,41 +870,61 @@@
+  			offset += bytes;
+  			continue;
+  		}
+++<<<<<<< HEAD
+ +		error = gfs2_quota_lock_check(ip);
+ +		if (error)
+ +			goto out_unlock;
+ +
+ +retry:
+++=======
++ 
++ 		/* We need to determine how many bytes we can actually
++ 		 * fallocate without exceeding quota or going over the
++ 		 * end of the fs. We start off optimistically by assuming
++ 		 * we can write max_bytes */
++ 		max_bytes = (len > max_chunk_size) ? max_chunk_size : len;
++ 
++ 		/* Since max_bytes is most likely a theoretical max, we
++ 		 * calculate a more realistic 'bytes' to serve as a good
++ 		 * starting point for the number of bytes we may be able
++ 		 * to write */
+++>>>>>>> d9be0cda774e (gfs2: allow fallocate to max out quotas/fs efficiently)
+  		gfs2_write_calc_reserv(ip, bytes, &data_blocks, &ind_blocks);
+ -		ap.target = data_blocks + ind_blocks;
+  
+++<<<<<<< HEAD
+ +		ap.target = data_blocks + ind_blocks;
+ +		error = gfs2_inplace_reserve(ip, &ap);
+ +		if (error) {
+ +			if (error == -ENOSPC && bytes > sdp->sd_sb.sb_bsize) {
+ +				bytes >>= 1;
+ +				bytes &= bsize_mask;
+ +				if (bytes == 0)
+ +					bytes = sdp->sd_sb.sb_bsize;
+ +				goto retry;
+ +			}
+++=======
++ 		error = gfs2_quota_lock_check(ip, &ap);
++ 		if (error)
++ 			return error;
++ 		/* ap.allowed tells us how many blocks quota will allow
++ 		 * us to write. Check if this reduces max_blks */
++ 		if (ap.allowed && ap.allowed < max_blks)
++ 			max_blks = ap.allowed;
++ 
++ 		error = gfs2_inplace_reserve(ip, &ap);
++ 		if (error)
+++>>>>>>> d9be0cda774e (gfs2: allow fallocate to max out quotas/fs efficiently)
+  			goto out_qunlock;
+- 		}
+- 		max_bytes = bytes;
+- 		calc_max_reserv(ip, (len > max_chunk_size)? max_chunk_size: len,
+- 				&max_bytes, &data_blocks, &ind_blocks);
++ 
++ 		/* check if the selected rgrp limits our max_blks further */
++ 		if (ap.allowed && ap.allowed < max_blks)
++ 			max_blks = ap.allowed;
++ 
++ 		/* Almost done. Calculate bytes that can be written using
++ 		 * max_blks. We also recompute max_bytes, data_blocks and
++ 		 * ind_blocks */
++ 		calc_max_reserv(ip, &max_bytes, &data_blocks,
++ 				&ind_blocks, max_blks);
+  
+  		rblocks = RES_DINODE + ind_blocks + RES_STATFS + RES_QUOTA +
+  			  RES_RG_HDR + gfs2_rg_blocks(ip, data_blocks + ind_blocks);
+* Unmerged path fs/gfs2/file.c
