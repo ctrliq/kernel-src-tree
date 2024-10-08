@@ -1,0 +1,136 @@
+crypto: qat - fix double release_firmware on error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [crypto] qat - fix double release_firmware on error path (Nikolay Aleksandrov) [1173791]
+Rebuild_FUZZ: 92.16%
+commit-author Tadeusz Struk <tadeusz.struk@intel.com>
+commit b4e97050248d9cbf84a5fd023eb20c253b7ab35b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b4e97050.failed
+
+release_firmware was called twice on error path causing an Oops.
+
+	Reported-by: Ahsan Atta  <ahsan.atta@intel.com>
+	Signed-off-by: Tadeusz Struk <tadeusz.struk@intel.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit b4e97050248d9cbf84a5fd023eb20c253b7ab35b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/qat/qat_common/adf_init.c
+diff --cc drivers/crypto/qat/qat_common/adf_init.c
+index fa1971bb1e88,245f43237a2d..000000000000
+--- a/drivers/crypto/qat/qat_common/adf_init.c
++++ b/drivers/crypto/qat/qat_common/adf_init.c
+@@@ -136,8 -158,8 +136,13 @@@ int adf_dev_start(struct adf_accel_dev 
+  	set_bit(ADF_STATUS_AE_INITIALISED, &accel_dev->status);
+  
+  	if (adf_ae_fw_load(accel_dev)) {
+++<<<<<<< HEAD
+ +		pr_err("QAT: Failed to load acceleration FW\n");
+ +		adf_ae_fw_release(accel_dev);
+++=======
++ 		dev_err(&GET_DEV(accel_dev),
++ 			"Failed to load acceleration FW\n");
+++>>>>>>> b4e97050248d (crypto: qat - fix double release_firmware on error path)
+  		return -EFAULT;
+  	}
+  	set_bit(ADF_STATUS_AE_UCODE_LOADED, &accel_dev->status);
+@@@ -286,12 -334,32 +291,17 @@@ int adf_dev_stop(struct adf_accel_dev *
+  			clear_bit(ADF_STATUS_AE_STARTED, &accel_dev->status);
+  	}
+  
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL_GPL(adf_dev_stop);
+ -
+ -/**
+ - * adf_dev_shutdown() - shutdown acceleration services and data strucutures
+ - * @accel_dev: Pointer to acceleration device
+ - *
+ - * Cleanup the ring data structures and the admin comms and arbitration
+ - * services.
+ - */
+ -void adf_dev_shutdown(struct adf_accel_dev *accel_dev)
+ -{
+ -	struct adf_hw_device_data *hw_data = accel_dev->hw_device;
+ -	struct service_hndl *service;
+ -	struct list_head *list_itr;
+ -
+ -	if (!hw_data) {
+ -		dev_err(&GET_DEV(accel_dev),
+ -			"QAT: Failed to shutdown device - hw_data not set\n");
+ -		return;
+ -	}
+ -
+  	if (test_bit(ADF_STATUS_AE_UCODE_LOADED, &accel_dev->status)) {
+++<<<<<<< HEAD
+ +		if (adf_ae_fw_release(accel_dev))
+ +			pr_err("QAT: Failed to release the ucode\n");
+ +		else
+ +			clear_bit(ADF_STATUS_AE_UCODE_LOADED,
+ +				  &accel_dev->status);
+++=======
++ 		adf_ae_fw_release(accel_dev);
++ 		clear_bit(ADF_STATUS_AE_UCODE_LOADED, &accel_dev->status);
+++>>>>>>> b4e97050248d (crypto: qat - fix double release_firmware on error path)
+  	}
+  
+  	if (test_bit(ADF_STATUS_AE_INITIALISED, &accel_dev->status)) {
+diff --git a/drivers/crypto/qat/qat_common/adf_accel_engine.c b/drivers/crypto/qat/qat_common/adf_accel_engine.c
+index c77453b900a3..9be98613f9cf 100644
+--- a/drivers/crypto/qat/qat_common/adf_accel_engine.c
++++ b/drivers/crypto/qat/qat_common/adf_accel_engine.c
+@@ -77,19 +77,22 @@ int adf_ae_fw_load(struct adf_accel_dev *accel_dev)
+ 	return 0;
+ 
+ out_err:
+-	release_firmware(loader_data->uof_fw);
++	adf_ae_fw_release(accel_dev);
+ 	return -EFAULT;
+ }
+ 
+-int adf_ae_fw_release(struct adf_accel_dev *accel_dev)
++void adf_ae_fw_release(struct adf_accel_dev *accel_dev)
+ {
+ 	struct adf_fw_loader_data *loader_data = accel_dev->fw_loader;
+ 
+-	release_firmware(loader_data->uof_fw);
+ 	qat_uclo_del_uof_obj(loader_data->fw_loader);
+ 	qat_hal_deinit(loader_data->fw_loader);
++
++	if (loader_data->uof_fw)
++		release_firmware(loader_data->uof_fw);
++
++	loader_data->uof_fw = NULL;
+ 	loader_data->fw_loader = NULL;
+-	return 0;
+ }
+ 
+ int adf_ae_start(struct adf_accel_dev *accel_dev)
+@@ -162,6 +165,9 @@ int adf_ae_init(struct adf_accel_dev *accel_dev)
+ 
+ int adf_ae_shutdown(struct adf_accel_dev *accel_dev)
+ {
++	struct adf_fw_loader_data *loader_data = accel_dev->fw_loader;
++
++	qat_hal_deinit(loader_data->fw_loader);
+ 	kfree(accel_dev->fw_loader);
+ 	accel_dev->fw_loader = NULL;
+ 	return 0;
+diff --git a/drivers/crypto/qat/qat_common/adf_common_drv.h b/drivers/crypto/qat/qat_common/adf_common_drv.h
+index 5e8f9d431e5d..0e8c72e68cd3 100644
+--- a/drivers/crypto/qat/qat_common/adf_common_drv.h
++++ b/drivers/crypto/qat/qat_common/adf_common_drv.h
+@@ -115,7 +115,7 @@ int adf_dev_restarted_notify(struct adf_accel_dev *accel_dev);
+ int adf_ae_init(struct adf_accel_dev *accel_dev);
+ int adf_ae_shutdown(struct adf_accel_dev *accel_dev);
+ int adf_ae_fw_load(struct adf_accel_dev *accel_dev);
+-int adf_ae_fw_release(struct adf_accel_dev *accel_dev);
++void adf_ae_fw_release(struct adf_accel_dev *accel_dev);
+ int adf_ae_start(struct adf_accel_dev *accel_dev);
+ int adf_ae_stop(struct adf_accel_dev *accel_dev);
+ 
+* Unmerged path drivers/crypto/qat/qat_common/adf_init.c
