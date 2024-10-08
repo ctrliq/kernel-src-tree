@@ -1487,6 +1487,7 @@ static int __mark_caps_flushing(struct inode *inode,
 
 	cf = kmalloc(sizeof(*cf), GFP_ATOMIC);
 	cf->caps = flushing;
+	cf->kick = false;
 
 	spin_lock(&mdsc->cap_dirty_lock);
 	list_del_init(&ci->i_dirty_item);
@@ -2047,7 +2048,8 @@ static void kick_flushing_capsnaps(struct ceph_mds_client *mdsc,
 
 static int __kick_flushing_caps(struct ceph_mds_client *mdsc,
 				struct ceph_mds_session *session,
-				struct ceph_inode_info *ci)
+				struct ceph_inode_info *ci,
+				bool kick_all)
 {
 	struct inode *inode = &ci->vfs_inode;
 	struct ceph_cap *cap;
@@ -2073,7 +2075,9 @@ static int __kick_flushing_caps(struct ceph_mds_client *mdsc,
 
 		for (n = rb_first(&ci->i_cap_flush_tree); n; n = rb_next(n)) {
 			cf = rb_entry(n, struct ceph_cap_flush, i_node);
-			if (cf->tid >= first_tid)
+			if (cf->tid < first_tid)
+				continue;
+			if (kick_all || cf->kick)
 				break;
 		}
 		if (!n) {
@@ -2082,6 +2086,8 @@ static int __kick_flushing_caps(struct ceph_mds_client *mdsc,
 		}
 
 		cf = rb_entry(n, struct ceph_cap_flush, i_node);
+		cf->kick = false;
+
 		first_tid = cf->tid + 1;
 
 		dout("kick_flushing_caps %p cap %p tid %llu %s\n", inode,
@@ -2095,6 +2101,49 @@ static int __kick_flushing_caps(struct ceph_mds_client *mdsc,
 	return delayed;
 }
 
+void ceph_early_kick_flushing_caps(struct ceph_mds_client *mdsc,
+				   struct ceph_mds_session *session)
+{
+	struct ceph_inode_info *ci;
+	struct ceph_cap *cap;
+	struct ceph_cap_flush *cf;
+	struct rb_node *n;
+
+	dout("early_kick_flushing_caps mds%d\n", session->s_mds);
+	list_for_each_entry(ci, &session->s_cap_flushing, i_flushing_item) {
+		spin_lock(&ci->i_ceph_lock);
+		cap = ci->i_auth_cap;
+		if (!(cap && cap->session == session)) {
+			pr_err("%p auth cap %p not mds%d ???\n",
+				&ci->vfs_inode, cap, session->s_mds);
+			spin_unlock(&ci->i_ceph_lock);
+			continue;
+		}
+
+
+		/*
+		 * if flushing caps were revoked, we re-send the cap flush
+		 * in client reconnect stage. This guarantees MDS * processes
+		 * the cap flush message before issuing the flushing caps to
+		 * other client.
+		 */
+		if ((cap->issued & ci->i_flushing_caps) !=
+		    ci->i_flushing_caps) {
+			spin_unlock(&ci->i_ceph_lock);
+			if (!__kick_flushing_caps(mdsc, session, ci, true))
+				continue;
+			spin_lock(&ci->i_ceph_lock);
+		}
+
+		for (n = rb_first(&ci->i_cap_flush_tree); n; n = rb_next(n)) {
+			cf = rb_entry(n, struct ceph_cap_flush, i_node);
+			cf->kick = true;
+		}
+
+		spin_unlock(&ci->i_ceph_lock);
+	}
+}
+
 void ceph_kick_flushing_caps(struct ceph_mds_client *mdsc,
 			     struct ceph_mds_session *session)
 {
@@ -2104,7 +2153,7 @@ void ceph_kick_flushing_caps(struct ceph_mds_client *mdsc,
 
 	dout("kick_flushing_caps mds%d\n", session->s_mds);
 	list_for_each_entry(ci, &session->s_cap_flushing, i_flushing_item) {
-		int delayed = __kick_flushing_caps(mdsc, session, ci);
+		int delayed = __kick_flushing_caps(mdsc, session, ci, false);
 		if (delayed) {
 			spin_lock(&ci->i_ceph_lock);
 			__cap_delay_requeue(mdsc, ci);
@@ -2137,7 +2186,7 @@ static void kick_flushing_inode_caps(struct ceph_mds_client *mdsc,
 
 		spin_unlock(&ci->i_ceph_lock);
 
-		delayed = __kick_flushing_caps(mdsc, session, ci);
+		delayed = __kick_flushing_caps(mdsc, session, ci, true);
 		if (delayed) {
 			spin_lock(&ci->i_ceph_lock);
 			__cap_delay_requeue(mdsc, ci);
