@@ -19,7 +19,7 @@
 #include <asm/machdep.h>
 #include <asm/sparsemem.h>
 
-static unsigned long get_memblock_size(void)
+unsigned long pseries_memory_block_size(void)
 {
 	struct device_node *np;
 	unsigned int memblock_size = MIN_MEMORY_BLOCK_SIZE;
@@ -62,17 +62,6 @@ static unsigned long get_memblock_size(void)
 	return memblock_size;
 }
 
-/* WARNING: This is going to override the generic definition whenever
- * pseries is built-in regardless of what platform is active at boot
- * time. This is fine for now as this is the only "option" and it
- * should work everywhere. If not, we'll have to turn this into a
- * ppc_md. callback
- */
-unsigned long memory_block_size_bytes(void)
-{
-	return get_memblock_size();
-}
-
 #ifdef CONFIG_MEMORY_HOTREMOVE
 static int pseries_remove_memory(u64 start, u64 size)
 {
@@ -103,7 +92,7 @@ static int pseries_remove_memblock(unsigned long base, unsigned int memblock_siz
 	if (!pfn_valid(start_pfn))
 		goto out;
 
-	block_sz = memory_block_size_bytes();
+	block_sz = pseries_memory_block_size();
 	sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
 	nid = memory_add_physaddr_to_nid(base);
 
@@ -199,7 +188,7 @@ static int pseries_update_drconf_memory(struct of_prop_reconfig *pr)
 	u32 *p;
 	int i, rc = -EINVAL;
 
-	memblock_size = get_memblock_size();
+	memblock_size = pseries_memory_block_size();
 	if (!memblock_size)
 		return -EINVAL;
 
