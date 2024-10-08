@@ -343,7 +343,7 @@ static int lnw_gpio_probe(struct pci_dev *pdev,
 
 	lnw = devm_kzalloc(&pdev->dev, sizeof(*lnw), GFP_KERNEL);
 	if (!lnw) {
-		dev_err(&pdev->dev, "can't allocate langwell_gpio chip data\n");
+		dev_err(&pdev->dev, "can't allocate chip data\n");
 		return -ENOMEM;
 	}
 
@@ -370,7 +370,7 @@ static int lnw_gpio_probe(struct pci_dev *pdev,
 	pci_set_drvdata(pdev, lnw);
 	retval = gpiochip_add(&lnw->chip);
 	if (retval) {
-		dev_err(&pdev->dev, "langwell gpiochip_add error %d\n", retval);
+		dev_err(&pdev->dev, "gpiochip_add error %d\n", retval);
 		return retval;
 	}
 
@@ -404,8 +404,7 @@ static int wp_gpio_probe(struct platform_device *pdev)
 
 	lnw = devm_kzalloc(&pdev->dev, sizeof(struct lnw_gpio), GFP_KERNEL);
 	if (!lnw) {
-		dev_err(&pdev->dev,
-			"can't allocate whitneypoint_gpio chip data\n");
+		dev_err(&pdev->dev, "can't allocate chip data\n");
 		return -ENOMEM;
 	}
 
@@ -428,8 +427,7 @@ static int wp_gpio_probe(struct platform_device *pdev)
 	gc->can_sleep = 0;
 	retval = gpiochip_add(gc);
 	if (retval) {
-		dev_err(&pdev->dev, "whitneypoint gpiochip_add error %d\n",
-								retval);
+		dev_err(&pdev->dev, "gpiochip_add error %d\n", retval);
 		return retval;
 	}
 	platform_set_drvdata(pdev, lnw);
