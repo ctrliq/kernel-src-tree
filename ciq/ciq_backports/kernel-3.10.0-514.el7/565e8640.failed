@@ -1,0 +1,105 @@
+rhashtable: Fix rhashtable_remove failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 565e86404e4c40e03f602ef0d6d490328f28c493
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/565e8640.failed
+
+The commit 9d901bc05153bbf33b5da2cd6266865e531f0545 ("rhashtable:
+Free bucket tables asynchronously after rehash") causes gratuitous
+failures in rhashtable_remove.
+
+The reason is that it inadvertently introduced multiple rehashing
+from the perspective of readers.  IOW it is now possible to see
+more than two tables during a single RCU critical section.
+
+Fortunately the other reader rhashtable_lookup already deals with
+this correctly thanks to c4db8848af6af92f90462258603be844baeab44d
+("rhashtable: rhashtable: Move future_tbl into struct bucket_table")
+so only rhashtable_remove is broken by this change.
+
+This patch fixes this by looping over every table from the first
+one to the last or until we find the element that we were trying
+to delete.
+
+Incidentally the simple test for detecting rehashing to prevent
+starting another shrinking no longer works.  Since it isn't needed
+anyway (the work queue and the mutex serves as a natural barrier
+to unnecessary rehashes) I've simply killed the test.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 565e86404e4c40e03f602ef0d6d490328f28c493)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index 6d0c4774001c,c523d3a563aa..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -364,33 -511,31 +364,56 @@@ EXPORT_SYMBOL_GPL(rhashtable_insert)
+   */
+  bool rhashtable_remove(struct rhashtable *ht, struct rhash_head *obj)
+  {
+++<<<<<<< HEAD
+ +	struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+ +	struct rhash_head __rcu **pprev;
+ +	struct rhash_head *he;
+ +	u32 h;
+++=======
++ 	struct bucket_table *tbl;
++ 	bool ret;
+++>>>>>>> 565e86404e4c (rhashtable: Fix rhashtable_remove failures)
+  
+ -	rcu_read_lock();
+ +	ASSERT_RHT_MUTEX(ht);
+ +
+++<<<<<<< HEAD
+ +	h = head_hashfn(ht, tbl, obj);
+ +
+ +	pprev = &tbl->buckets[h];
+ +	rht_for_each(he, tbl, h) {
+ +		if (he != obj) {
+ +			pprev = &he->next;
+ +			continue;
+ +		}
+  
+ +		RCU_INIT_POINTER(*pprev, he->next);
+ +		ht->nelems--;
+ +
+ +		if (ht->p.shrink_decision &&
+ +		    ht->p.shrink_decision(ht, tbl->size))
+ +			rhashtable_shrink(ht);
+ +
+ +		return true;
+++=======
++ 	tbl = rht_dereference_rcu(ht->tbl, ht);
++ 
++ 	/* Because we have already taken (and released) the bucket
++ 	 * lock in old_tbl, if we find that future_tbl is not yet
++ 	 * visible then that guarantees the entry to still be in
++ 	 * the old tbl if it exists.
++ 	 */
++ 	while (!(ret = __rhashtable_remove(ht, tbl, obj)) &&
++ 	       (tbl = rht_dereference_rcu(tbl->future_tbl, ht)))
++ 		;
++ 
++ 	if (ret) {
++ 		atomic_dec(&ht->nelems);
++ 		if (rht_shrink_below_30(ht, tbl))
++ 			schedule_work(&ht->run_work);
+++>>>>>>> 565e86404e4c (rhashtable: Fix rhashtable_remove failures)
+  	}
+  
+ -	rcu_read_unlock();
+ -
+ -	return ret;
+ +	return false;
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_remove);
+  
+* Unmerged path lib/rhashtable.c
