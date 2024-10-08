@@ -1,0 +1,157 @@
+sched/numa: Reschedule task on preferred NUMA node once selected
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Mel Gorman <mgorman@suse.de>
+commit e6628d5b0a2979f3e0ee6f7783ede5df50cb9ede
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/e6628d5b.failed
+
+A preferred node is selected based on the node the most NUMA hinting
+faults was incurred on. There is no guarantee that the task is running
+on that node at the time so this patch rescheules the task to run on
+the most idle CPU of the selected node when selected. This avoids
+waiting for the balancer to make a decision.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1381141781-10992-25-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e6628d5b0a2979f3e0ee6f7783ede5df50cb9ede)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index b231594d7817,8b15e9e1d1b8..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -839,6 -877,40 +839,43 @@@ static unsigned int task_scan_max(struc
+  	return max(smin, smax);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Once a preferred node is selected the scheduler balancer will prefer moving
++  * a task to that node for sysctl_numa_balancing_settle_count number of PTE
++  * scans. This will give the process the chance to accumulate more faults on
++  * the preferred node but still allow the scheduler to move the task again if
++  * the nodes CPUs are overloaded.
++  */
++ unsigned int sysctl_numa_balancing_settle_count __read_mostly = 3;
++ 
++ static unsigned long weighted_cpuload(const int cpu);
++ 
++ 
++ static int
++ find_idlest_cpu_node(int this_cpu, int nid)
++ {
++ 	unsigned long load, min_load = ULONG_MAX;
++ 	int i, idlest_cpu = this_cpu;
++ 
++ 	BUG_ON(cpu_to_node(this_cpu) == nid);
++ 
++ 	rcu_read_lock();
++ 	for_each_cpu(i, cpumask_of_node(nid)) {
++ 		load = weighted_cpuload(i);
++ 
++ 		if (load < min_load) {
++ 			min_load = load;
++ 			idlest_cpu = i;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return idlest_cpu;
++ }
++ 
+++>>>>>>> e6628d5b0a29 (sched/numa: Reschedule task on preferred NUMA node once selected)
+  static void task_numa_placement(struct task_struct *p)
+  {
+  	int seq, nid, max_nid = -1;
+@@@ -868,9 -941,30 +905,36 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Update the tasks preferred node if necessary */
+ +	if (max_faults && max_nid != p->numa_preferred_nid)
+ +		p->numa_preferred_nid = max_nid;
+++=======
++ 	/*
++ 	 * Record the preferred node as the node with the most faults,
++ 	 * requeue the task to be running on the idlest CPU on the
++ 	 * preferred node and reset the scanning rate to recheck
++ 	 * the working set placement.
++ 	 */
++ 	if (max_faults && max_nid != p->numa_preferred_nid) {
++ 		int preferred_cpu;
++ 
++ 		/*
++ 		 * If the task is not on the preferred node then find the most
++ 		 * idle CPU to migrate to.
++ 		 */
++ 		preferred_cpu = task_cpu(p);
++ 		if (cpu_to_node(preferred_cpu) != max_nid) {
++ 			preferred_cpu = find_idlest_cpu_node(preferred_cpu,
++ 							     max_nid);
++ 		}
++ 
++ 		/* Update the preferred nid and migrate task if possible */
++ 		p->numa_preferred_nid = max_nid;
++ 		p->numa_migrate_seq = 0;
++ 		migrate_task_to(p, preferred_cpu);
++ 	}
+++>>>>>>> e6628d5b0a29 (sched/numa: Reschedule task on preferred NUMA node once selected)
+  }
+  
+  /*
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index e7a70e97bb75..8afdeb808a23 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4928,6 +4928,25 @@ fail:
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_NUMA_BALANCING
++/* Migrate current task p to target_cpu */
++int migrate_task_to(struct task_struct *p, int target_cpu)
++{
++	struct migration_arg arg = { p, target_cpu };
++	int curr_cpu = task_cpu(p);
++
++	if (curr_cpu == target_cpu)
++		return 0;
++
++	if (!cpumask_test_cpu(target_cpu, tsk_cpus_allowed(p)))
++		return -EINVAL;
++
++	/* TODO: This is not properly updating schedstats */
++
++	return stop_one_cpu(curr_cpu, migration_cpu_stop, &arg);
++}
++#endif
++
+ /*
+  * migration_cpu_stop - this will be executed by a highprio stopper thread
+  * and performs thread migration by bumping thread off CPU then
+* Unmerged path kernel/sched/fair.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 5abdf358588f..983c39ba24a2 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -552,6 +552,7 @@ static inline u64 rq_clock_task(struct rq *rq)
+ }
+ 
+ #ifdef CONFIG_NUMA_BALANCING
++extern int migrate_task_to(struct task_struct *p, int cpu);
+ static inline void task_numa_free(struct task_struct *p)
+ {
+ 	kfree(p->numa_faults);
