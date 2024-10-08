@@ -1,0 +1,272 @@
+cxgb4: Add MPS tracing support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 8e3d04fd7d70679eed631ba5889f81b2d9415404
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8e3d04fd.failed
+
+Handle TRACE_PKT, stack can sniff them on the first port
+Add debubfs enrty to configure tracing for offload traffic like iWARP
+& iSCSI for debugging purpose.
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8e3d04fd7d70679eed631ba5889f81b2d9415404)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 17d67dc9b0fa,3c99454aac0a..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@@ -751,6 -767,11 +751,14 @@@ struct adapter 
+  	bool tid_release_task_busy;
+  
+  	struct dentry *debugfs_root;
+++<<<<<<< HEAD
+++=======
++ 	u32 use_bd;     /* Use SGE Back Door intfc for reading SGE Contexts */
++ 	u32 trace_rss;	/* 1 implies that different RSS flit per filter is
++ 			 * used per filter else if 0 default RSS flit is
++ 			 * used for all 4 filters.
++ 			 */
+++>>>>>>> 8e3d04fd7d70 (cxgb4: Add MPS tracing support)
+  
+  	spinlock_t stats_lock;
+  	spinlock_t win0_lock ____cacheline_aligned_in_smp;
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+index 6e7613cab75a,1732e29253cd..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+@@@ -2348,11 -3073,20 +2644,20 @@@ int t4_setup_debugfs(struct adapter *ad
+  			add_debugfs_mem(adap, "mc1", MEM_MC1,
+  					EXT_MEM1_SIZE_G(size));
+  		}
+ -	} else {
+ -		if (i & EXT_MEM_ENABLE_F) {
+ -			size = t4_read_reg(adap, MA_EXT_MEMORY_BAR_A);
+ -			add_debugfs_mem(adap, "mc", MEM_MC,
+ -					EXT_MEM_SIZE_G(size));
+ -		}
+  	}
+  
+++<<<<<<< HEAD
+ +	de = debugfs_create_file("flash", S_IRUSR, adap->debugfs_root, adap,
+ +				 &flash_debugfs_fops);
+ +	set_debugfs_file_size(de, adap->params.sf_size);
+++=======
++ 	de = debugfs_create_file_size("flash", S_IRUSR, adap->debugfs_root, adap,
++ 				      &flash_debugfs_fops, adap->params.sf_size);
++ 	debugfs_create_bool("use_backdoor", S_IWUSR | S_IRUSR,
++ 			    adap->debugfs_root, &adap->use_bd);
++ 	debugfs_create_bool("trace_rss", S_IWUSR | S_IRUSR,
++ 			    adap->debugfs_root, &adap->trace_rss);
+++>>>>>>> 8e3d04fd7d70 (cxgb4: Add MPS tracing support)
+  
+  	return 0;
+  }
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index 2aa4f2418463..67c16b84a9c0 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -4205,6 +4205,119 @@ void t4_get_chan_txrate(struct adapter *adap, u64 *nic_rate, u64 *ofld_rate)
+ 	}
+ }
+ 
++/**
++ *	t4_set_trace_filter - configure one of the tracing filters
++ *	@adap: the adapter
++ *	@tp: the desired trace filter parameters
++ *	@idx: which filter to configure
++ *	@enable: whether to enable or disable the filter
++ *
++ *	Configures one of the tracing filters available in HW.  If @enable is
++ *	%0 @tp is not examined and may be %NULL. The user is responsible to
++ *	set the single/multiple trace mode by writing to MPS_TRC_CFG_A register
++ */
++int t4_set_trace_filter(struct adapter *adap, const struct trace_params *tp,
++			int idx, int enable)
++{
++	int i, ofst = idx * 4;
++	u32 data_reg, mask_reg, cfg;
++	u32 multitrc = TRCMULTIFILTER_F;
++
++	if (!enable) {
++		t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst, 0);
++		return 0;
++	}
++
++	cfg = t4_read_reg(adap, MPS_TRC_CFG_A);
++	if (cfg & TRCMULTIFILTER_F) {
++		/* If multiple tracers are enabled, then maximum
++		 * capture size is 2.5KB (FIFO size of a single channel)
++		 * minus 2 flits for CPL_TRACE_PKT header.
++		 */
++		if (tp->snap_len > ((10 * 1024 / 4) - (2 * 8)))
++			return -EINVAL;
++	} else {
++		/* If multiple tracers are disabled, to avoid deadlocks
++		 * maximum packet capture size of 9600 bytes is recommended.
++		 * Also in this mode, only trace0 can be enabled and running.
++		 */
++		multitrc = 0;
++		if (tp->snap_len > 9600 || idx)
++			return -EINVAL;
++	}
++
++	if (tp->port > (is_t4(adap->params.chip) ? 11 : 19) || tp->invert > 1 ||
++	    tp->skip_len > TFLENGTH_M || tp->skip_ofst > TFOFFSET_M ||
++	    tp->min_len > TFMINPKTSIZE_M)
++		return -EINVAL;
++
++	/* stop the tracer we'll be changing */
++	t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst, 0);
++
++	idx *= (MPS_TRC_FILTER1_MATCH_A - MPS_TRC_FILTER0_MATCH_A);
++	data_reg = MPS_TRC_FILTER0_MATCH_A + idx;
++	mask_reg = MPS_TRC_FILTER0_DONT_CARE_A + idx;
++
++	for (i = 0; i < TRACE_LEN / 4; i++, data_reg += 4, mask_reg += 4) {
++		t4_write_reg(adap, data_reg, tp->data[i]);
++		t4_write_reg(adap, mask_reg, ~tp->mask[i]);
++	}
++	t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_B_A + ofst,
++		     TFCAPTUREMAX_V(tp->snap_len) |
++		     TFMINPKTSIZE_V(tp->min_len));
++	t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst,
++		     TFOFFSET_V(tp->skip_ofst) | TFLENGTH_V(tp->skip_len) |
++		     (is_t4(adap->params.chip) ?
++		     TFPORT_V(tp->port) | TFEN_F | TFINVERTMATCH_V(tp->invert) :
++		     T5_TFPORT_V(tp->port) | T5_TFEN_F |
++		     T5_TFINVERTMATCH_V(tp->invert)));
++
++	return 0;
++}
++
++/**
++ *	t4_get_trace_filter - query one of the tracing filters
++ *	@adap: the adapter
++ *	@tp: the current trace filter parameters
++ *	@idx: which trace filter to query
++ *	@enabled: non-zero if the filter is enabled
++ *
++ *	Returns the current settings of one of the HW tracing filters.
++ */
++void t4_get_trace_filter(struct adapter *adap, struct trace_params *tp, int idx,
++			 int *enabled)
++{
++	u32 ctla, ctlb;
++	int i, ofst = idx * 4;
++	u32 data_reg, mask_reg;
++
++	ctla = t4_read_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst);
++	ctlb = t4_read_reg(adap, MPS_TRC_FILTER_MATCH_CTL_B_A + ofst);
++
++	if (is_t4(adap->params.chip)) {
++		*enabled = !!(ctla & TFEN_F);
++		tp->port =  TFPORT_G(ctla);
++		tp->invert = !!(ctla & TFINVERTMATCH_F);
++	} else {
++		*enabled = !!(ctla & T5_TFEN_F);
++		tp->port = T5_TFPORT_G(ctla);
++		tp->invert = !!(ctla & T5_TFINVERTMATCH_F);
++	}
++	tp->snap_len = TFCAPTUREMAX_G(ctlb);
++	tp->min_len = TFMINPKTSIZE_G(ctlb);
++	tp->skip_ofst = TFOFFSET_G(ctla);
++	tp->skip_len = TFLENGTH_G(ctla);
++
++	ofst = (MPS_TRC_FILTER1_MATCH_A - MPS_TRC_FILTER0_MATCH_A) * idx;
++	data_reg = MPS_TRC_FILTER0_MATCH_A + ofst;
++	mask_reg = MPS_TRC_FILTER0_DONT_CARE_A + ofst;
++
++	for (i = 0; i < TRACE_LEN / 4; i++, data_reg += 4, mask_reg += 4) {
++		tp->mask[i] = ~t4_read_reg(adap, mask_reg);
++		tp->data[i] = t4_read_reg(adap, data_reg) & tp->mask[i];
++	}
++}
++
+ /**
+  *	t4_pmtx_get_stats - returns the HW stats from PMTX
+  *	@adap: the adapter
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+index 83c5d48c7f6b..521c9e39b0aa 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+@@ -1791,6 +1791,9 @@
+ #define TRCMULTIFILTER_F    TRCMULTIFILTER_V(1U)
+ 
+ #define MPS_TRC_RSS_CONTROL_A		0x9808
++#define MPS_TRC_FILTER1_RSS_CONTROL_A	0x9ff4
++#define MPS_TRC_FILTER2_RSS_CONTROL_A	0x9ffc
++#define MPS_TRC_FILTER3_RSS_CONTROL_A	0xa004
+ #define MPS_T5_TRC_RSS_CONTROL_A	0xa00c
+ 
+ #define RSSCONTROL_S    16
+@@ -1799,6 +1802,59 @@
+ #define QUEUENUMBER_S    0
+ #define QUEUENUMBER_V(x) ((x) << QUEUENUMBER_S)
+ 
++#define TFINVERTMATCH_S    24
++#define TFINVERTMATCH_V(x) ((x) << TFINVERTMATCH_S)
++#define TFINVERTMATCH_F    TFINVERTMATCH_V(1U)
++
++#define TFEN_S    22
++#define TFEN_V(x) ((x) << TFEN_S)
++#define TFEN_F    TFEN_V(1U)
++
++#define TFPORT_S    18
++#define TFPORT_M    0xfU
++#define TFPORT_V(x) ((x) << TFPORT_S)
++#define TFPORT_G(x) (((x) >> TFPORT_S) & TFPORT_M)
++
++#define TFLENGTH_S    8
++#define TFLENGTH_M    0x1fU
++#define TFLENGTH_V(x) ((x) << TFLENGTH_S)
++#define TFLENGTH_G(x) (((x) >> TFLENGTH_S) & TFLENGTH_M)
++
++#define TFOFFSET_S    0
++#define TFOFFSET_M    0x1fU
++#define TFOFFSET_V(x) ((x) << TFOFFSET_S)
++#define TFOFFSET_G(x) (((x) >> TFOFFSET_S) & TFOFFSET_M)
++
++#define T5_TFINVERTMATCH_S    25
++#define T5_TFINVERTMATCH_V(x) ((x) << T5_TFINVERTMATCH_S)
++#define T5_TFINVERTMATCH_F    T5_TFINVERTMATCH_V(1U)
++
++#define T5_TFEN_S    23
++#define T5_TFEN_V(x) ((x) << T5_TFEN_S)
++#define T5_TFEN_F    T5_TFEN_V(1U)
++
++#define T5_TFPORT_S    18
++#define T5_TFPORT_M    0x1fU
++#define T5_TFPORT_V(x) ((x) << T5_TFPORT_S)
++#define T5_TFPORT_G(x) (((x) >> T5_TFPORT_S) & T5_TFPORT_M)
++
++#define MPS_TRC_FILTER_MATCH_CTL_A_A 0x9810
++#define MPS_TRC_FILTER_MATCH_CTL_B_A 0x9820
++
++#define TFMINPKTSIZE_S    16
++#define TFMINPKTSIZE_M    0x1ffU
++#define TFMINPKTSIZE_V(x) ((x) << TFMINPKTSIZE_S)
++#define TFMINPKTSIZE_G(x) (((x) >> TFMINPKTSIZE_S) & TFMINPKTSIZE_M)
++
++#define TFCAPTUREMAX_S    0
++#define TFCAPTUREMAX_M    0x3fffU
++#define TFCAPTUREMAX_V(x) ((x) << TFCAPTUREMAX_S)
++#define TFCAPTUREMAX_G(x) (((x) >> TFCAPTUREMAX_S) & TFCAPTUREMAX_M)
++
++#define MPS_TRC_FILTER0_MATCH_A 0x9c00
++#define MPS_TRC_FILTER0_DONT_CARE_A 0x9c80
++#define MPS_TRC_FILTER1_MATCH_A 0x9d00
++
+ #define TP_RSS_CONFIG_A 0x7df0
+ 
+ #define TNL4TUPENIPV6_S    31
