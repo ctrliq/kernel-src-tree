@@ -1,0 +1,291 @@
+netfilter: nf_tables: convert sets to u32 data pointers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 8cd8937ac0d68435b4ca9bd3c987c3cfea269b4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8cd8937a.failed
+
+Simple conversion to use u32 pointers to the beginning of the data
+area to keep follow up patches smaller.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 8cd8937ac0d68435b4ca9bd3c987c3cfea269b4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nft_hash.c
+#	net/netfilter/nft_rbtree.c
+diff --cc include/net/netfilter/nf_tables.h
+index 4ab50d820db0,efcf46ddd1d5..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -217,12 -231,23 +217,26 @@@ struct nft_set_estimate 
+   */
+  struct nft_set_ops {
+  	bool				(*lookup)(const struct nft_set *set,
+++<<<<<<< HEAD
+ +						  const struct nft_data *key,
+ +						  struct nft_data *data);
+ +	int				(*get)(const struct nft_set *set,
+ +					       struct nft_set_elem *elem);
+++=======
++ 						  const u32 *key,
++ 						  const struct nft_set_ext **ext);
++ 	bool				(*update)(struct nft_set *set,
++ 						  const u32 *key,
++ 						  void *(*new)(struct nft_set *,
++ 							       const struct nft_expr *,
++ 							       struct nft_regs *),
++ 						  const struct nft_expr *expr,
++ 						  struct nft_regs *regs,
++ 						  const struct nft_set_ext **ext);
++ 
+++>>>>>>> 8cd8937ac0d6 (netfilter: nf_tables: convert sets to u32 data pointers)
+  	int				(*insert)(const struct nft_set *set,
+  						  const struct nft_set_elem *elem);
+ -	void				(*activate)(const struct nft_set *set,
+ -						    const struct nft_set_elem *elem);
+ -	void *				(*deactivate)(const struct nft_set *set,
+ -						      const struct nft_set_elem *elem);
+  	void				(*remove)(const struct nft_set *set,
+  						  const struct nft_set_elem *elem);
+  	void				(*walk)(const struct nft_ctx *ctx,
+diff --cc net/netfilter/nft_hash.c
+index f14a5e14123a,767df41d28ea..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -23,60 -24,153 +23,175 @@@
+  /* We target a hash table size of 4, element hint is 75% of final size */
+  #define NFT_HASH_ELEMENT_HINT 3
+  
+ -struct nft_hash {
+ -	struct rhashtable		ht;
+ -	struct delayed_work		gc_work;
+ -};
+ -
+  struct nft_hash_elem {
+  	struct rhash_head		node;
+ -	struct nft_set_ext		ext;
+ +	struct nft_data			key;
+ +	struct nft_data			data[];
+  };
+  
+++<<<<<<< HEAD
+ +static bool nft_hash_lookup(const struct nft_set *set,
+ +			    const struct nft_data *key,
+ +			    struct nft_data *data)
+++=======
++ struct nft_hash_cmp_arg {
++ 	const struct nft_set		*set;
++ 	const u32			*key;
++ 	u8				genmask;
++ };
++ 
++ static const struct rhashtable_params nft_hash_params;
++ 
++ static inline u32 nft_hash_key(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nft_hash_cmp_arg *arg = data;
++ 
++ 	return jhash(arg->key, len, seed);
++ }
++ 
++ static inline u32 nft_hash_obj(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nft_hash_elem *he = data;
++ 
++ 	return jhash(nft_set_ext_key(&he->ext), len, seed);
++ }
++ 
++ static inline int nft_hash_cmp(struct rhashtable_compare_arg *arg,
++ 			       const void *ptr)
++ {
++ 	const struct nft_hash_cmp_arg *x = arg->key;
++ 	const struct nft_hash_elem *he = ptr;
++ 
++ 	if (memcmp(nft_set_ext_key(&he->ext), x->key, x->set->klen))
++ 		return 1;
++ 	if (nft_set_elem_expired(&he->ext))
++ 		return 1;
++ 	if (!nft_set_elem_active(&he->ext, x->genmask))
++ 		return 1;
++ 	return 0;
++ }
++ 
++ static bool nft_hash_lookup(const struct nft_set *set, const u32 *key,
++ 			    const struct nft_set_ext **ext)
+++>>>>>>> 8cd8937ac0d6 (netfilter: nf_tables: convert sets to u32 data pointers)
+  {
+ -	struct nft_hash *priv = nft_set_priv(set);
+ +	const struct rhashtable *priv = nft_set_priv(set);
+  	const struct nft_hash_elem *he;
+ -	struct nft_hash_cmp_arg arg = {
+ -		.genmask = nft_genmask_cur(read_pnet(&set->pnet)),
+ -		.set	 = set,
+ -		.key	 = key,
+ -	};
+  
+ -	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+ -	if (he != NULL)
+ -		*ext = &he->ext;
+ +	he = rhashtable_lookup(priv, key);
+ +	if (he && set->flags & NFT_SET_MAP)
+ +		nft_data_copy(data, he->data);
+  
+  	return !!he;
+  }
+  
+++<<<<<<< HEAD
+ +static int nft_hash_insert(const struct nft_set *set,
+ +			   const struct nft_set_elem *elem)
+ +{
+ +	struct rhashtable *priv = nft_set_priv(set);
+ +	struct nft_hash_elem *he;
+ +	unsigned int size;
+++=======
++ static bool nft_hash_update(struct nft_set *set, const u32 *key,
++ 			    void *(*new)(struct nft_set *,
++ 					 const struct nft_expr *,
++ 					 struct nft_regs *regs),
++ 			    const struct nft_expr *expr,
++ 			    struct nft_regs *regs,
++ 			    const struct nft_set_ext **ext)
++ {
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he;
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = NFT_GENMASK_ANY,
++ 		.set	 = set,
++ 		.key	 = key,
++ 	};
++ 
++ 	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
++ 	if (he != NULL)
++ 		goto out;
++ 
++ 	he = new(set, expr, regs);
++ 	if (he == NULL)
++ 		goto err1;
++ 	if (rhashtable_lookup_insert_key(&priv->ht, &arg, &he->node,
++ 					 nft_hash_params))
++ 		goto err2;
++ out:
++ 	*ext = &he->ext;
++ 	return true;
++ 
++ err2:
++ 	nft_set_elem_destroy(set, he);
++ err1:
++ 	return false;
++ }
++ 
++ static int nft_hash_insert(const struct nft_set *set,
++ 			   const struct nft_set_elem *elem)
++ {
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he = elem->priv;
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = nft_genmask_next(read_pnet(&set->pnet)),
++ 		.set	 = set,
++ 		.key	 = elem->key.data,
++ 	};
++ 
++ 	return rhashtable_lookup_insert_key(&priv->ht, &arg, &he->node,
++ 					    nft_hash_params);
++ }
++ 
++ static void nft_hash_activate(const struct nft_set *set,
++ 			      const struct nft_set_elem *elem)
++ {
++ 	struct nft_hash_elem *he = elem->priv;
++ 
++ 	nft_set_elem_change_active(set, &he->ext);
++ 	nft_set_elem_clear_busy(&he->ext);
++ }
++ 
++ static void *nft_hash_deactivate(const struct nft_set *set,
++ 				 const struct nft_set_elem *elem)
++ {
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he;
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = nft_genmask_next(read_pnet(&set->pnet)),
++ 		.set	 = set,
++ 		.key	 = elem->key.data,
++ 	};
+++>>>>>>> 8cd8937ac0d6 (netfilter: nf_tables: convert sets to u32 data pointers)
+  
+ -	rcu_read_lock();
+ -	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+ -	if (he != NULL) {
+ -		if (!nft_set_elem_mark_busy(&he->ext))
+ -			nft_set_elem_change_active(set, &he->ext);
+ -		else
+ -			he = NULL;
+ -	}
+ -	rcu_read_unlock();
+ +	if (elem->flags != 0)
+ +		return -EINVAL;
+ +
+ +	size = sizeof(*he);
+ +	if (set->flags & NFT_SET_MAP)
+ +		size += sizeof(he->data[0]);
+ +
+ +	he = kzalloc(size, GFP_KERNEL);
+ +	if (he == NULL)
+ +		return -ENOMEM;
+  
+ -	return he;
+ +	nft_data_copy(&he->key, &elem->key);
+ +	if (set->flags & NFT_SET_MAP)
+ +		nft_data_copy(he->data, &elem->data);
+ +
+ +	rhashtable_insert(priv, &he->node);
+ +
+ +	return 0;
+ +}
+ +
+ +static void nft_hash_elem_destroy(const struct nft_set *set,
+ +				  struct nft_hash_elem *he)
+ +{
+ +	nft_data_uninit(&he->key, NFT_DATA_VALUE);
+ +	if (set->flags & NFT_SET_MAP)
+ +		nft_data_uninit(he->data, set->dtype);
+ +	kfree(he);
+  }
+  
+  static void nft_hash_remove(const struct nft_set *set,
+diff --cc net/netfilter/nft_rbtree.c
+index 2c75361077f7,b888e0cdf1e2..000000000000
+--- a/net/netfilter/nft_rbtree.c
++++ b/net/netfilter/nft_rbtree.c
+@@@ -26,14 -26,12 +26,20 @@@ struct nft_rbtree 
+  
+  struct nft_rbtree_elem {
+  	struct rb_node		node;
+ -	struct nft_set_ext	ext;
+ +	u16			flags;
+ +	struct nft_data		key;
+ +	struct nft_data		data[];
+  };
+  
+++<<<<<<< HEAD
+ +static bool nft_rbtree_lookup(const struct nft_set *set,
+ +			      const struct nft_data *key,
+ +			      struct nft_data *data)
+++=======
++ 
++ static bool nft_rbtree_lookup(const struct nft_set *set, const u32 *key,
++ 			      const struct nft_set_ext **ext)
+++>>>>>>> 8cd8937ac0d6 (netfilter: nf_tables: convert sets to u32 data pointers)
+  {
+  	const struct nft_rbtree *priv = nft_set_priv(set);
+  	const struct nft_rbtree_elem *rbe, *interval = NULL;
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nft_hash.c
+* Unmerged path net/netfilter/nft_rbtree.c
