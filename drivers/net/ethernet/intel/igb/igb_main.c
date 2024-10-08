@@ -2155,11 +2155,11 @@ static void igb_init_mas(struct igb_adapter *adapter)
  **/
 static s32 igb_init_i2c(struct igb_adapter *adapter)
 {
-	s32 status = E1000_SUCCESS;
+	s32 status = 0;
 
 	/* I2C interface supported on i350 devices */
 	if (adapter->hw.mac.type != e1000_i350)
-		return E1000_SUCCESS;
+		return 0;
 
 	/* Initialize the i2c bus which is controlled by the registers.
 	 * This bus will use the i2c_algo_bit structue that implements
@@ -7866,7 +7866,7 @@ static int igb_ndo_set_vf_spoofchk(struct net_device *netdev, int vf,
 	wr32(reg_offset, reg_val);
 
 	adapter->vf_data[vf].spoofchk_enabled = setting;
-	return E1000_SUCCESS;
+	return 0;
 }
 
 static int igb_ndo_get_vf_config(struct net_device *netdev,
@@ -8027,8 +8027,7 @@ s32 igb_read_i2c_byte(struct e1000_hw *hw, u8 byte_offset,
 
 	swfw_mask = E1000_SWFW_PHY0_SM;
 
-	if (hw->mac.ops.acquire_swfw_sync(hw, swfw_mask)
-	    != E1000_SUCCESS)
+	if (hw->mac.ops.acquire_swfw_sync(hw, swfw_mask))
 		return E1000_ERR_SWFW_SYNC;
 
 	status = i2c_smbus_read_byte_data(this_client, byte_offset);
@@ -8038,7 +8037,7 @@ s32 igb_read_i2c_byte(struct e1000_hw *hw, u8 byte_offset,
 		return E1000_ERR_I2C;
 	else {
 		*data = status;
-		return E1000_SUCCESS;
+		return 0;
 	}
 }
 
@@ -8063,7 +8062,7 @@ s32 igb_write_i2c_byte(struct e1000_hw *hw, u8 byte_offset,
 	if (!this_client)
 		return E1000_ERR_I2C;
 
-	if (hw->mac.ops.acquire_swfw_sync(hw, swfw_mask) != E1000_SUCCESS)
+	if (hw->mac.ops.acquire_swfw_sync(hw, swfw_mask))
 		return E1000_ERR_SWFW_SYNC;
 	status = i2c_smbus_write_byte_data(this_client, byte_offset, data);
 	hw->mac.ops.release_swfw_sync(hw, swfw_mask);
@@ -8071,7 +8070,7 @@ s32 igb_write_i2c_byte(struct e1000_hw *hw, u8 byte_offset,
 	if (status)
 		return E1000_ERR_I2C;
 	else
-		return E1000_SUCCESS;
+		return 0;
 
 }
 /* igb_main.c */
