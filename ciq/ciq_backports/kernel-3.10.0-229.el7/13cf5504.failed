@@ -1,0 +1,870 @@
+drm/i915: rework digital port IRQ handling (v2)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] i915: rework digital port IRQ handling (v2) (Dave Airlie) [1140440]
+Rebuild_FUZZ: 95.56%
+commit-author Dave Airlie <airlied@redhat.com>
+commit 13cf550448b58abf8f44f5d6a560f2d20871c965
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/13cf5504.failed
+
+The digital ports from Ironlake and up have the ability to distinguish
+between long and short HPD pulses. Displayport 1.1 only uses the short
+form to request link retraining usually, so we haven't really needed
+support for it until now.
+
+However with DP 1.2 MST we need to handle the short irqs on their
+own outside the modesetting locking the long hpd's involve. This
+patch adds the framework to distinguish between short/long to the
+current code base, to lay the basis for future DP 1.2 MST work.
+
+This should mean we get better bisectability in case of regression
+due to the new irq handling.
+
+v2: add GM45 support (untested, due to lack of hw)
+
+	Signed-off-by: Dave Airlie <airlied@redhat.com>
+	Reviewed-by: Todd Previte <tprevite@gmail.com>
+[danvet: Fix conflicts in i915_irq.c with Oscar Mateo's irq handling
+race fixes and a trivial one in intel_drv.h with the psr code.]
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 13cf550448b58abf8f44f5d6a560f2d20871c965)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_irq.c
+#	drivers/gpu/drm/i915/intel_ddi.c
+#	drivers/gpu/drm/i915/intel_drv.h
+diff --cc drivers/gpu/drm/i915/i915_irq.c
+index 94d4a6c2b196,c50e3b41d6fe..000000000000
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@@ -673,13 -1078,65 +673,60 @@@ static int intel_hpd_irq_event(struct d
+  	old_status = connector->status;
+  
+  	connector->status = connector->funcs->detect(connector, false);
+ -	if (old_status == connector->status)
+ -		return false;
+ -
+ -	DRM_DEBUG_KMS("[CONNECTOR:%d:%s] status updated from %s to %s\n",
+ +	DRM_DEBUG_KMS("[CONNECTOR:%d:%s] status updated from %d to %d\n",
+  		      connector->base.id,
+ -		      connector->name,
+ -		      drm_get_connector_status_name(old_status),
+ -		      drm_get_connector_status_name(connector->status));
+ -
+ -	return true;
+ +		      drm_get_connector_name(connector),
+ +		      old_status, connector->status);
+ +	return (old_status != connector->status);
+  }
+  
++ static void i915_digport_work_func(struct work_struct *work)
++ {
++ 	struct drm_i915_private *dev_priv =
++ 		container_of(work, struct drm_i915_private, dig_port_work);
++ 	unsigned long irqflags;
++ 	u32 long_port_mask, short_port_mask;
++ 	struct intel_digital_port *intel_dig_port;
++ 	int i, ret;
++ 	u32 old_bits = 0;
++ 
++ 	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
++ 	long_port_mask = dev_priv->long_hpd_port_mask;
++ 	dev_priv->long_hpd_port_mask = 0;
++ 	short_port_mask = dev_priv->short_hpd_port_mask;
++ 	dev_priv->short_hpd_port_mask = 0;
++ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
++ 
++ 	for (i = 0; i < I915_MAX_PORTS; i++) {
++ 		bool valid = false;
++ 		bool long_hpd = false;
++ 		intel_dig_port = dev_priv->hpd_irq_port[i];
++ 		if (!intel_dig_port || !intel_dig_port->hpd_pulse)
++ 			continue;
++ 
++ 		if (long_port_mask & (1 << i))  {
++ 			valid = true;
++ 			long_hpd = true;
++ 		} else if (short_port_mask & (1 << i))
++ 			valid = true;
++ 
++ 		if (valid) {
++ 			ret = intel_dig_port->hpd_pulse(intel_dig_port, long_hpd);
++ 			if (ret == true) {
++ 				/* if we get true fallback to old school hpd */
++ 				old_bits |= (1 << intel_dig_port->base.hpd_pin);
++ 			}
++ 		}
++ 	}
++ 
++ 	if (old_bits) {
++ 		spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
++ 		dev_priv->hpd_event_bits |= old_bits;
++ 		spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
++ 		schedule_work(&dev_priv->hotplug_work);
++ 	}
++ }
++ 
+  /*
+   * Handle hotplug events outside the interrupt handler proper.
+   */
+@@@ -982,23 -1568,118 +1029,127 @@@ static void snb_gt_irq_handler(struct d
+  #define HPD_STORM_DETECT_PERIOD 1000
+  #define HPD_STORM_THRESHOLD 5
+  
++ static int ilk_port_to_hotplug_shift(enum port port)
++ {
++ 	switch (port) {
++ 	case PORT_A:
++ 	case PORT_E:
++ 	default:
++ 		return -1;
++ 	case PORT_B:
++ 		return 0;
++ 	case PORT_C:
++ 		return 8;
++ 	case PORT_D:
++ 		return 16;
++ 	}
++ }
++ 
++ static int g4x_port_to_hotplug_shift(enum port port)
++ {
++ 	switch (port) {
++ 	case PORT_A:
++ 	case PORT_E:
++ 	default:
++ 		return -1;
++ 	case PORT_B:
++ 		return 17;
++ 	case PORT_C:
++ 		return 19;
++ 	case PORT_D:
++ 		return 21;
++ 	}
++ }
++ 
++ static inline enum port get_port_from_pin(enum hpd_pin pin)
++ {
++ 	switch (pin) {
++ 	case HPD_PORT_B:
++ 		return PORT_B;
++ 	case HPD_PORT_C:
++ 		return PORT_C;
++ 	case HPD_PORT_D:
++ 		return PORT_D;
++ 	default:
++ 		return PORT_A; /* no hpd */
++ 	}
++ }
++ 
+  static inline void intel_hpd_irq_handler(struct drm_device *dev,
+  					 u32 hotplug_trigger,
++ 					 u32 dig_hotplug_reg,
+  					 const u32 *hpd)
+  {
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	drm_i915_private_t *dev_priv = dev->dev_private;
+  	int i;
++ 	enum port port;
+  	bool storm_detected = false;
++ 	bool queue_dig = false, queue_hp = false;
++ 	u32 dig_shift;
++ 	u32 dig_port_mask = 0;
+  
+  	if (!hotplug_trigger)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	DRM_DEBUG_DRIVER("hotplug event received, stat 0x%08x, dig 0x%08x\n",
++ 			 hotplug_trigger, dig_hotplug_reg);
++ 
+++>>>>>>> 13cf550448b5 (drm/i915: rework digital port IRQ handling (v2))
+  	spin_lock(&dev_priv->irq_lock);
+  	for (i = 1; i < HPD_NUM_PINS; i++) {
++ 		if (!(hpd[i] & hotplug_trigger))
++ 			continue;
+  
+++<<<<<<< HEAD
+ +		WARN(((hpd[i] & hotplug_trigger) &&
+ +		      dev_priv->hpd_stats[i].hpd_mark != HPD_ENABLED),
+ +		     "Received HPD interrupt although disabled\n");
+++=======
++ 		port = get_port_from_pin(i);
++ 		if (port && dev_priv->hpd_irq_port[port]) {
++ 			bool long_hpd;
++ 
++ 			if (IS_G4X(dev)) {
++ 				dig_shift = g4x_port_to_hotplug_shift(port);
++ 				long_hpd = (hotplug_trigger >> dig_shift) & PORTB_HOTPLUG_LONG_DETECT;
++ 			} else {
++ 				dig_shift = ilk_port_to_hotplug_shift(port);
++ 				long_hpd = (dig_hotplug_reg >> dig_shift) & PORTB_HOTPLUG_LONG_DETECT;
++ 			}
++ 
++ 			DRM_DEBUG_DRIVER("digital hpd port %d %d\n", port, long_hpd);
++ 			/* for long HPD pulses we want to have the digital queue happen,
++ 			   but we still want HPD storm detection to function. */
++ 			if (long_hpd) {
++ 				dev_priv->long_hpd_port_mask |= (1 << port);
++ 				dig_port_mask |= hpd[i];
++ 			} else {
++ 				/* for short HPD just trigger the digital queue */
++ 				dev_priv->short_hpd_port_mask |= (1 << port);
++ 				hotplug_trigger &= ~hpd[i];
++ 			}
++ 			queue_dig = true;
++ 		}
++ 	}
++ 
++ 	for (i = 1; i < HPD_NUM_PINS; i++) {
++ 		if (hpd[i] & hotplug_trigger &&
++ 		    dev_priv->hpd_stats[i].hpd_mark == HPD_DISABLED) {
++ 			/*
++ 			 * On GMCH platforms the interrupt mask bits only
++ 			 * prevent irq generation, not the setting of the
++ 			 * hotplug bits itself. So only WARN about unexpected
++ 			 * interrupts on saner platforms.
++ 			 */
++ 			WARN_ONCE(INTEL_INFO(dev)->gen >= 5 && !IS_VALLEYVIEW(dev),
++ 				  "Received HPD interrupt (0x%08x) on pin %d (0x%08x) although disabled\n",
++ 				  hotplug_trigger, i, hpd[i]);
++ 
++ 			continue;
++ 		}
+++>>>>>>> 13cf550448b5 (drm/i915: rework digital port IRQ handling (v2))
+  
+  		if (!(hpd[i] & hotplug_trigger) ||
+  		    dev_priv->hpd_stats[i].hpd_mark != HPD_ENABLED)
+@@@ -1075,22 -1860,146 +1233,140 @@@ static void gen6_rps_irq_handler(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool intel_pipe_handle_vblank(struct drm_device *dev, enum pipe pipe)
++ {
++ 	struct intel_crtc *crtc;
++ 
++ 	if (!drm_handle_vblank(dev, pipe))
++ 		return false;
++ 
++ 	crtc = to_intel_crtc(intel_get_crtc_for_pipe(dev, pipe));
++ 	wake_up(&crtc->vbl_wait);
++ 
++ 	return true;
++ }
++ 
++ static void valleyview_pipestat_irq_handler(struct drm_device *dev, u32 iir)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	u32 pipe_stats[I915_MAX_PIPES] = { };
++ 	int pipe;
++ 
++ 	spin_lock(&dev_priv->irq_lock);
++ 	for_each_pipe(pipe) {
++ 		int reg;
++ 		u32 mask, iir_bit = 0;
++ 
++ 		/*
++ 		 * PIPESTAT bits get signalled even when the interrupt is
++ 		 * disabled with the mask bits, and some of the status bits do
++ 		 * not generate interrupts at all (like the underrun bit). Hence
++ 		 * we need to be careful that we only handle what we want to
++ 		 * handle.
++ 		 */
++ 		mask = 0;
++ 		if (__cpu_fifo_underrun_reporting_enabled(dev, pipe))
++ 			mask |= PIPE_FIFO_UNDERRUN_STATUS;
++ 
++ 		switch (pipe) {
++ 		case PIPE_A:
++ 			iir_bit = I915_DISPLAY_PIPE_A_EVENT_INTERRUPT;
++ 			break;
++ 		case PIPE_B:
++ 			iir_bit = I915_DISPLAY_PIPE_B_EVENT_INTERRUPT;
++ 			break;
++ 		case PIPE_C:
++ 			iir_bit = I915_DISPLAY_PIPE_C_EVENT_INTERRUPT;
++ 			break;
++ 		}
++ 		if (iir & iir_bit)
++ 			mask |= dev_priv->pipestat_irq_mask[pipe];
++ 
++ 		if (!mask)
++ 			continue;
++ 
++ 		reg = PIPESTAT(pipe);
++ 		mask |= PIPESTAT_INT_ENABLE_MASK;
++ 		pipe_stats[pipe] = I915_READ(reg) & mask;
++ 
++ 		/*
++ 		 * Clear the PIPE*STAT regs before the IIR
++ 		 */
++ 		if (pipe_stats[pipe] & (PIPE_FIFO_UNDERRUN_STATUS |
++ 					PIPESTAT_INT_STATUS_MASK))
++ 			I915_WRITE(reg, pipe_stats[pipe]);
++ 	}
++ 	spin_unlock(&dev_priv->irq_lock);
++ 
++ 	for_each_pipe(pipe) {
++ 		if (pipe_stats[pipe] & PIPE_START_VBLANK_INTERRUPT_STATUS)
++ 			intel_pipe_handle_vblank(dev, pipe);
++ 
++ 		if (pipe_stats[pipe] & PLANE_FLIP_DONE_INT_STATUS_VLV) {
++ 			intel_prepare_page_flip(dev, pipe);
++ 			intel_finish_page_flip(dev, pipe);
++ 		}
++ 
++ 		if (pipe_stats[pipe] & PIPE_CRC_DONE_INTERRUPT_STATUS)
++ 			i9xx_pipe_crc_irq_handler(dev, pipe);
++ 
++ 		if (pipe_stats[pipe] & PIPE_FIFO_UNDERRUN_STATUS &&
++ 		    intel_set_cpu_fifo_underrun_reporting(dev, pipe, false))
++ 			DRM_ERROR("pipe %c underrun\n", pipe_name(pipe));
++ 	}
++ 
++ 	if (pipe_stats[0] & PIPE_GMBUS_INTERRUPT_STATUS)
++ 		gmbus_irq_handler(dev);
++ }
++ 
++ static void i9xx_hpd_irq_handler(struct drm_device *dev)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	u32 hotplug_status = I915_READ(PORT_HOTPLUG_STAT);
++ 
++ 	if (hotplug_status) {
++ 		I915_WRITE(PORT_HOTPLUG_STAT, hotplug_status);
++ 		/*
++ 		 * Make sure hotplug status is cleared before we clear IIR, or else we
++ 		 * may miss hotplug events.
++ 		 */
++ 		POSTING_READ(PORT_HOTPLUG_STAT);
++ 
++ 		if (IS_G4X(dev)) {
++ 			u32 hotplug_trigger = hotplug_status & HOTPLUG_INT_STATUS_G4X;
++ 
++ 			intel_hpd_irq_handler(dev, hotplug_trigger, 0, hpd_status_g4x);
++ 		} else {
++ 			u32 hotplug_trigger = hotplug_status & HOTPLUG_INT_STATUS_I915;
++ 
++ 			intel_hpd_irq_handler(dev, hotplug_trigger, 0, hpd_status_i915);
++ 		}
++ 
++ 		if ((IS_G4X(dev) || IS_VALLEYVIEW(dev)) &&
++ 		    hotplug_status & DP_AUX_CHANNEL_MASK_INT_STATUS_G4X)
++ 			dp_aux_irq_handler(dev);
++ 	}
++ }
++ 
+++>>>>>>> 13cf550448b5 (drm/i915: rework digital port IRQ handling (v2))
+  static irqreturn_t valleyview_irq_handler(int irq, void *arg)
+  {
+ -	struct drm_device *dev = arg;
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct drm_device *dev = (struct drm_device *) arg;
+ +	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+  	u32 iir, gt_iir, pm_iir;
+  	irqreturn_t ret = IRQ_NONE;
+ +	unsigned long irqflags;
+ +	int pipe;
+ +	u32 pipe_stats[I915_MAX_PIPES];
+  
+ -	while (true) {
+ -		/* Find, clear, then process each source of interrupt */
+ +	atomic_inc(&dev_priv->irq_received);
+  
+ +	while (true) {
+ +		iir = I915_READ(VLV_IIR);
+  		gt_iir = I915_READ(GTIIR);
+ -		if (gt_iir)
+ -			I915_WRITE(GTIIR, gt_iir);
+ -
+  		pm_iir = I915_READ(GEN6_PMIIR);
+ -		if (pm_iir)
+ -			I915_WRITE(GEN6_PMIIR, pm_iir);
+ -
+ -		iir = I915_READ(VLV_IIR);
+ -		if (iir) {
+ -			/* Consume port before clearing IIR or we'll miss events */
+ -			if (iir & I915_DISPLAY_PORT_INTERRUPT)
+ -				i9xx_hpd_irq_handler(dev);
+ -			I915_WRITE(VLV_IIR, iir);
+ -		}
+  
+  		if (gt_iir == 0 && pm_iir == 0 && iir == 0)
+  			goto out;
+@@@ -1157,11 -2061,15 +1433,15 @@@ out
+  
+  static void ibx_irq_handler(struct drm_device *dev, u32 pch_iir)
+  {
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+  	int pipe;
+  	u32 hotplug_trigger = pch_iir & SDE_HOTPLUG_MASK;
++ 	u32 dig_hotplug_reg;
++ 
++ 	dig_hotplug_reg = I915_READ(PCH_PORT_HOTPLUG);
++ 	I915_WRITE(PCH_PORT_HOTPLUG, dig_hotplug_reg);
+  
+- 	intel_hpd_irq_handler(dev, hotplug_trigger, hpd_ibx);
++ 	intel_hpd_irq_handler(dev, hotplug_trigger, dig_hotplug_reg, hpd_ibx);
+  
+  	if (pch_iir & SDE_AUDIO_POWER_MASK) {
+  		int port = ffs((pch_iir & SDE_AUDIO_POWER_MASK) >>
+@@@ -1259,11 -2172,15 +1539,15 @@@ static void cpt_serr_int_handler(struc
+  
+  static void cpt_irq_handler(struct drm_device *dev, u32 pch_iir)
+  {
+ -	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+  	int pipe;
+  	u32 hotplug_trigger = pch_iir & SDE_HOTPLUG_MASK_CPT;
++ 	u32 dig_hotplug_reg;
++ 
++ 	dig_hotplug_reg = I915_READ(PCH_PORT_HOTPLUG);
++ 	I915_WRITE(PCH_PORT_HOTPLUG, dig_hotplug_reg);
+  
+- 	intel_hpd_irq_handler(dev, hotplug_trigger, hpd_cpt);
++ 	intel_hpd_irq_handler(dev, hotplug_trigger, dig_hotplug_reg, hpd_cpt);
+  
+  	if (pch_iir & SDE_AUDIO_POWER_MASK_CPT) {
+  		int port = ffs((pch_iir & SDE_AUDIO_POWER_MASK_CPT) >>
+diff --cc drivers/gpu/drm/i915/intel_ddi.c
+index a069b5e2a2d2,efaf44b5ff25..000000000000
+--- a/drivers/gpu/drm/i915/intel_ddi.c
++++ b/drivers/gpu/drm/i915/intel_ddi.c
+@@@ -1376,24 -1702,22 +1376,39 @@@ void intel_ddi_init(struct drm_device *
+  
+  	intel_encoder->type = INTEL_OUTPUT_UNKNOWN;
+  	intel_encoder->crtc_mask =  (1 << 0) | (1 << 1) | (1 << 2);
+ -	intel_encoder->cloneable = 0;
+ +	intel_encoder->cloneable = false;
+  	intel_encoder->hot_plug = intel_ddi_hot_plug;
+  
+++<<<<<<< HEAD
+ +	if (!intel_dp_init_connector(intel_dig_port, dp_connector)) {
+++=======
++ 	intel_dig_port->hpd_pulse = intel_dp_hpd_pulse;
++ 	dev_priv->hpd_irq_port[port] = intel_dig_port;
++ 
++ 	if (init_dp)
++ 		dp_connector = intel_ddi_init_dp_connector(intel_dig_port);
++ 
++ 	/* In theory we don't need the encoder->type check, but leave it just in
++ 	 * case we have some really bad VBTs... */
++ 	if (intel_encoder->type != INTEL_OUTPUT_EDP && init_hdmi)
++ 		hdmi_connector = intel_ddi_init_hdmi_connector(intel_dig_port);
++ 
++ 	if (!dp_connector && !hdmi_connector) {
+++>>>>>>> 13cf550448b5 (drm/i915: rework digital port IRQ handling (v2))
+  		drm_encoder_cleanup(encoder);
+  		kfree(intel_dig_port);
+ +		kfree(dp_connector);
+ +		return;
+ +	}
+ +
+ +	if (intel_encoder->type != INTEL_OUTPUT_EDP) {
+ +		hdmi_connector = kzalloc(sizeof(struct intel_connector),
+ +					 GFP_KERNEL);
+ +		if (!hdmi_connector) {
+ +			return;
+ +		}
+ +
+ +		intel_dig_port->hdmi.hdmi_reg = DDI_BUF_CTL(port);
+ +		intel_hdmi_init_connector(intel_dig_port, hdmi_connector);
+  	}
+  }
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 7f2b384ac939,45afd25f9362..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -696,104 -807,223 +697,136 @@@ void assert_fdi_rx_pll(struct drm_i915_
+  		       enum pipe pipe, bool state);
+  #define assert_fdi_rx_pll_enabled(d, p) assert_fdi_rx_pll(d, p, true)
+  #define assert_fdi_rx_pll_disabled(d, p) assert_fdi_rx_pll(d, p, false)
+ -void assert_pipe(struct drm_i915_private *dev_priv, enum pipe pipe, bool state);
+ +extern void assert_pipe(struct drm_i915_private *dev_priv, enum pipe pipe,
+ +			bool state);
+  #define assert_pipe_enabled(d, p) assert_pipe(d, p, true)
+  #define assert_pipe_disabled(d, p) assert_pipe(d, p, false)
+ -void intel_write_eld(struct drm_encoder *encoder,
+ -		     struct drm_display_mode *mode);
+ -unsigned long intel_gen4_compute_page_offset(int *x, int *y,
+ -					     unsigned int tiling_mode,
+ -					     unsigned int bpp,
+ -					     unsigned int pitch);
+ -void intel_display_handle_reset(struct drm_device *dev);
+ -void hsw_enable_pc8(struct drm_i915_private *dev_priv);
+ -void hsw_disable_pc8(struct drm_i915_private *dev_priv);
+ -void intel_dp_get_m_n(struct intel_crtc *crtc,
+ -		      struct intel_crtc_config *pipe_config);
+ -int intel_dotclock_calculate(int link_freq, const struct intel_link_m_n *m_n);
+ -void
+ -ironlake_check_encoder_dotclock(const struct intel_crtc_config *pipe_config,
+ -				int dotclock);
+ -bool intel_crtc_active(struct drm_crtc *crtc);
+ -void hsw_enable_ips(struct intel_crtc *crtc);
+ -void hsw_disable_ips(struct intel_crtc *crtc);
+ -void intel_display_set_init_power(struct drm_i915_private *dev, bool enable);
+ -enum intel_display_power_domain
+ -intel_display_port_power_domain(struct intel_encoder *intel_encoder);
+ -void intel_mode_from_pipe_config(struct drm_display_mode *mode,
+ -				 struct intel_crtc_config *pipe_config);
+ -int intel_format_to_fourcc(int format);
+ -void intel_crtc_wait_for_pending_flips(struct drm_crtc *crtc);
+ -
+  
+ +extern void intel_init_clock_gating(struct drm_device *dev);
+ +extern void intel_suspend_hw(struct drm_device *dev);
+ +extern void intel_write_eld(struct drm_encoder *encoder,
+ +			    struct drm_display_mode *mode);
+ +extern void intel_prepare_ddi(struct drm_device *dev);
+ +extern void hsw_fdi_link_train(struct drm_crtc *crtc);
+ +extern void intel_ddi_init(struct drm_device *dev, enum port port);
+ +
+++<<<<<<< HEAD
+ +/* For use by IVB LP watermark workaround in intel_sprite.c */
+ +extern void intel_update_watermarks(struct drm_device *dev);
+ +extern void intel_update_sprite_watermarks(struct drm_plane *plane,
+ +					   struct drm_crtc *crtc,
+ +					   uint32_t sprite_width, int pixel_size,
+ +					   bool enabled, bool scaled);
+ +
+ +extern unsigned long intel_gen4_compute_page_offset(int *x, int *y,
+ +						    unsigned int tiling_mode,
+ +						    unsigned int bpp,
+ +						    unsigned int pitch);
+ +
+ +extern int intel_sprite_set_colorkey(struct drm_device *dev, void *data,
+ +				     struct drm_file *file_priv);
+ +extern int intel_sprite_get_colorkey(struct drm_device *dev, void *data,
+ +				     struct drm_file *file_priv);
+++=======
++ /* intel_dp.c */
++ void intel_dp_init(struct drm_device *dev, int output_reg, enum port port);
++ bool intel_dp_init_connector(struct intel_digital_port *intel_dig_port,
++ 			     struct intel_connector *intel_connector);
++ void intel_dp_start_link_train(struct intel_dp *intel_dp);
++ void intel_dp_complete_link_train(struct intel_dp *intel_dp);
++ void intel_dp_stop_link_train(struct intel_dp *intel_dp);
++ void intel_dp_sink_dpms(struct intel_dp *intel_dp, int mode);
++ void intel_dp_encoder_destroy(struct drm_encoder *encoder);
++ void intel_dp_check_link_status(struct intel_dp *intel_dp);
++ int intel_dp_sink_crc(struct intel_dp *intel_dp, u8 *crc);
++ bool intel_dp_compute_config(struct intel_encoder *encoder,
++ 			     struct intel_crtc_config *pipe_config);
++ bool intel_dp_is_edp(struct drm_device *dev, enum port port);
++ bool intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port,
++ 			bool long_hpd);
++ void intel_edp_backlight_on(struct intel_dp *intel_dp);
++ void intel_edp_backlight_off(struct intel_dp *intel_dp);
++ void intel_edp_panel_vdd_on(struct intel_dp *intel_dp);
++ void intel_edp_panel_on(struct intel_dp *intel_dp);
++ void intel_edp_panel_off(struct intel_dp *intel_dp);
++ void intel_edp_psr_enable(struct intel_dp *intel_dp);
++ void intel_edp_psr_disable(struct intel_dp *intel_dp);
++ void intel_dp_set_drrs_state(struct drm_device *dev, int refresh_rate);
++ void intel_edp_psr_exit(struct drm_device *dev);
++ void intel_edp_psr_init(struct drm_device *dev);
++ 
++ /* intel_dsi.c */
++ void intel_dsi_init(struct drm_device *dev);
+++>>>>>>> 13cf550448b5 (drm/i915: rework digital port IRQ handling (v2))
+ +
+ +/* Power-related functions, located in intel_pm.c */
+ +extern void intel_init_pm(struct drm_device *dev);
+ +/* FBC */
+ +extern bool intel_fbc_enabled(struct drm_device *dev);
+ +extern void intel_update_fbc(struct drm_device *dev);
+ +/* IPS */
+ +extern void intel_gpu_ips_init(struct drm_i915_private *dev_priv);
+ +extern void intel_gpu_ips_teardown(void);
+ +
+ +/* Power well */
+ +extern int i915_init_power_well(struct drm_device *dev);
+ +extern void i915_remove_power_well(struct drm_device *dev);
+ +
+ +extern bool intel_display_power_enabled(struct drm_device *dev,
+ +					enum intel_display_power_domain domain);
+ +extern void intel_init_power_well(struct drm_device *dev);
+ +extern void intel_set_power_well(struct drm_device *dev, bool enable);
+ +extern void intel_enable_gt_powersave(struct drm_device *dev);
+ +extern void intel_disable_gt_powersave(struct drm_device *dev);
+ +extern void ironlake_teardown_rc6(struct drm_device *dev);
+ +void gen6_update_ring_freq(struct drm_device *dev);
+  
+ +extern bool intel_ddi_get_hw_state(struct intel_encoder *encoder,
+ +				   enum pipe *pipe);
+ +extern int intel_ddi_get_cdclk_freq(struct drm_i915_private *dev_priv);
+ +extern void intel_ddi_pll_init(struct drm_device *dev);
+ +extern void intel_ddi_enable_transcoder_func(struct drm_crtc *crtc);
+ +extern void intel_ddi_disable_transcoder_func(struct drm_i915_private *dev_priv,
+ +					      enum transcoder cpu_transcoder);
+ +extern void intel_ddi_enable_pipe_clock(struct intel_crtc *intel_crtc);
+ +extern void intel_ddi_disable_pipe_clock(struct intel_crtc *intel_crtc);
+ +extern void intel_ddi_setup_hw_pll_state(struct drm_device *dev);
+ +extern bool intel_ddi_pll_mode_set(struct drm_crtc *crtc);
+ +extern void intel_ddi_put_crtc_pll(struct drm_crtc *crtc);
+ +extern void intel_ddi_set_pipe_settings(struct drm_crtc *crtc);
+ +extern void intel_ddi_prepare_link_retrain(struct drm_encoder *encoder);
+ +extern bool
+ +intel_ddi_connector_get_hw_state(struct intel_connector *intel_connector);
+ +extern void intel_ddi_fdi_disable(struct drm_crtc *crtc);
+ +extern void intel_ddi_get_config(struct intel_encoder *encoder,
+ +				 struct intel_crtc_config *pipe_config);
+  
+ -/* intel_dvo.c */
+ -void intel_dvo_init(struct drm_device *dev);
+ -
+ -
+ -/* legacy fbdev emulation in intel_fbdev.c */
+ -#ifdef CONFIG_DRM_I915_FBDEV
+ -extern int intel_fbdev_init(struct drm_device *dev);
+ -extern void intel_fbdev_initial_config(struct drm_device *dev);
+ -extern void intel_fbdev_fini(struct drm_device *dev);
+ -extern void intel_fbdev_set_suspend(struct drm_device *dev, int state);
+ -extern void intel_fbdev_output_poll_changed(struct drm_device *dev);
+ -extern void intel_fbdev_restore_mode(struct drm_device *dev);
+ -#else
+ -static inline int intel_fbdev_init(struct drm_device *dev)
+ -{
+ -	return 0;
+ -}
+ -
+ -static inline void intel_fbdev_initial_config(struct drm_device *dev)
+ -{
+ -}
+ -
+ -static inline void intel_fbdev_fini(struct drm_device *dev)
+ -{
+ -}
+ -
+ -static inline void intel_fbdev_set_suspend(struct drm_device *dev, int state)
+ -{
+ -}
+ -
+ -static inline void intel_fbdev_restore_mode(struct drm_device *dev)
+ -{
+ -}
+ -#endif
+ -
+ -/* intel_hdmi.c */
+ -void intel_hdmi_init(struct drm_device *dev, int hdmi_reg, enum port port);
+ -void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
+ -			       struct intel_connector *intel_connector);
+ -struct intel_hdmi *enc_to_intel_hdmi(struct drm_encoder *encoder);
+ -bool intel_hdmi_compute_config(struct intel_encoder *encoder,
+ -			       struct intel_crtc_config *pipe_config);
+ -
+ -
+ -/* intel_lvds.c */
+ -void intel_lvds_init(struct drm_device *dev);
+ -bool intel_is_dual_link_lvds(struct drm_device *dev);
+ -
+ -
+ -/* intel_modes.c */
+ -int intel_connector_update_modes(struct drm_connector *connector,
+ -				 struct edid *edid);
+ -int intel_ddc_get_modes(struct drm_connector *c, struct i2c_adapter *adapter);
+ -void intel_attach_force_audio_property(struct drm_connector *connector);
+ -void intel_attach_broadcast_rgb_property(struct drm_connector *connector);
+ -
+ -
+ -/* intel_overlay.c */
+ -void intel_setup_overlay(struct drm_device *dev);
+ -void intel_cleanup_overlay(struct drm_device *dev);
+ -int intel_overlay_switch_off(struct intel_overlay *overlay);
+ -int intel_overlay_put_image(struct drm_device *dev, void *data,
+ -			    struct drm_file *file_priv);
+ -int intel_overlay_attrs(struct drm_device *dev, void *data,
+ -			struct drm_file *file_priv);
+ -
+ -
+ -/* intel_panel.c */
+ -int intel_panel_init(struct intel_panel *panel,
+ -		     struct drm_display_mode *fixed_mode,
+ -		     struct drm_display_mode *downclock_mode);
+ -void intel_panel_fini(struct intel_panel *panel);
+ -void intel_fixed_panel_mode(const struct drm_display_mode *fixed_mode,
+ -			    struct drm_display_mode *adjusted_mode);
+ -void intel_pch_panel_fitting(struct intel_crtc *crtc,
+ -			     struct intel_crtc_config *pipe_config,
+ -			     int fitting_mode);
+ -void intel_gmch_panel_fitting(struct intel_crtc *crtc,
+ -			      struct intel_crtc_config *pipe_config,
+ -			      int fitting_mode);
+ -void intel_panel_set_backlight(struct intel_connector *connector, u32 level,
+ -			       u32 max);
+ -int intel_panel_setup_backlight(struct drm_connector *connector);
+ -void intel_panel_enable_backlight(struct intel_connector *connector);
+ -void intel_panel_disable_backlight(struct intel_connector *connector);
+ -void intel_panel_destroy_backlight(struct drm_connector *connector);
+ -void intel_panel_init_backlight_funcs(struct drm_device *dev);
+ -enum drm_connector_status intel_panel_detect(struct drm_device *dev);
+ -extern struct drm_display_mode *intel_find_panel_downclock(
+ -				struct drm_device *dev,
+ -				struct drm_display_mode *fixed_mode,
+ -				struct drm_connector *connector);
+ -
+ -/* intel_pm.c */
+ -void intel_init_clock_gating(struct drm_device *dev);
+ -void intel_suspend_hw(struct drm_device *dev);
+ -int ilk_wm_max_level(const struct drm_device *dev);
+ -void intel_update_watermarks(struct drm_crtc *crtc);
+ -void intel_update_sprite_watermarks(struct drm_plane *plane,
+ -				    struct drm_crtc *crtc,
+ -				    uint32_t sprite_width, int pixel_size,
+ -				    bool enabled, bool scaled);
+ -void intel_init_pm(struct drm_device *dev);
+ -void intel_pm_setup(struct drm_device *dev);
+ -bool intel_fbc_enabled(struct drm_device *dev);
+ -void intel_update_fbc(struct drm_device *dev);
+ -void intel_gpu_ips_init(struct drm_i915_private *dev_priv);
+ -void intel_gpu_ips_teardown(void);
+ -int intel_power_domains_init(struct drm_i915_private *);
+ -void intel_power_domains_remove(struct drm_i915_private *);
+ -bool intel_display_power_enabled(struct drm_i915_private *dev_priv,
+ -				 enum intel_display_power_domain domain);
+ -bool intel_display_power_enabled_unlocked(struct drm_i915_private *dev_priv,
+ -					  enum intel_display_power_domain domain);
+ -void intel_display_power_get(struct drm_i915_private *dev_priv,
+ -			     enum intel_display_power_domain domain);
+ -void intel_display_power_put(struct drm_i915_private *dev_priv,
+ -			     enum intel_display_power_domain domain);
+ -void intel_power_domains_init_hw(struct drm_i915_private *dev_priv);
+ -void intel_init_gt_powersave(struct drm_device *dev);
+ -void intel_cleanup_gt_powersave(struct drm_device *dev);
+ -void intel_enable_gt_powersave(struct drm_device *dev);
+ -void intel_disable_gt_powersave(struct drm_device *dev);
+ -void intel_suspend_gt_powersave(struct drm_device *dev);
+ -void intel_reset_gt_powersave(struct drm_device *dev);
+ -void ironlake_teardown_rc6(struct drm_device *dev);
+ -void gen6_update_ring_freq(struct drm_device *dev);
+ -void gen6_rps_idle(struct drm_i915_private *dev_priv);
+ -void gen6_rps_boost(struct drm_i915_private *dev_priv);
+ -void intel_aux_display_runtime_get(struct drm_i915_private *dev_priv);
+ -void intel_aux_display_runtime_put(struct drm_i915_private *dev_priv);
+ -void intel_runtime_pm_get(struct drm_i915_private *dev_priv);
+ -void intel_runtime_pm_get_noresume(struct drm_i915_private *dev_priv);
+ -void intel_runtime_pm_put(struct drm_i915_private *dev_priv);
+ -void intel_init_runtime_pm(struct drm_i915_private *dev_priv);
+ -void intel_fini_runtime_pm(struct drm_i915_private *dev_priv);
+ -void ilk_wm_get_hw_state(struct drm_device *dev);
+ -
+ -
+ -/* intel_sdvo.c */
+ -bool intel_sdvo_init(struct drm_device *dev, uint32_t sdvo_reg, bool is_sdvob);
+ -
+ -
+ -/* intel_sprite.c */
+ -int intel_plane_init(struct drm_device *dev, enum pipe pipe, int plane);
+ -void intel_flush_primary_plane(struct drm_i915_private *dev_priv,
+ -			       enum plane plane);
+ -void intel_plane_restore(struct drm_plane *plane);
+ -void intel_plane_disable(struct drm_plane *plane);
+ -int intel_sprite_set_colorkey(struct drm_device *dev, void *data,
+ -			      struct drm_file *file_priv);
+ -int intel_sprite_get_colorkey(struct drm_device *dev, void *data,
+ -			      struct drm_file *file_priv);
+ -
+ -
+ -/* intel_tv.c */
+ -void intel_tv_init(struct drm_device *dev);
+ +extern void intel_display_handle_reset(struct drm_device *dev);
+ +extern bool intel_set_cpu_fifo_underrun_reporting(struct drm_device *dev,
+ +						  enum pipe pipe,
+ +						  bool enable);
+ +extern bool intel_set_pch_fifo_underrun_reporting(struct drm_device *dev,
+ +						 enum transcoder pch_transcoder,
+ +						 bool enable);
+ +
+ +extern void intel_edp_psr_enable(struct intel_dp *intel_dp);
+ +extern void intel_edp_psr_disable(struct intel_dp *intel_dp);
+ +extern void intel_edp_psr_update(struct drm_device *dev);
+ +extern void hsw_disable_lcpll(struct drm_i915_private *dev_priv,
+ +			      bool switch_to_fclk, bool allow_power_down);
+ +extern void hsw_restore_lcpll(struct drm_i915_private *dev_priv);
+ +extern void ilk_enable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ +extern void ilk_disable_gt_irq(struct drm_i915_private *dev_priv,
+ +			       uint32_t mask);
+ +extern void snb_enable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ +extern void snb_disable_pm_irq(struct drm_i915_private *dev_priv,
+ +			       uint32_t mask);
+ +extern void hsw_enable_pc8_work(struct work_struct *__work);
+ +extern void hsw_enable_package_c8(struct drm_i915_private *dev_priv);
+ +extern void hsw_disable_package_c8(struct drm_i915_private *dev_priv);
+ +extern void hsw_pc8_disable_interrupts(struct drm_device *dev);
+ +extern void hsw_pc8_restore_interrupts(struct drm_device *dev);
+ +extern void intel_aux_display_runtime_get(struct drm_i915_private *dev_priv);
+ +extern void intel_aux_display_runtime_put(struct drm_i915_private *dev_priv);
+  
+  #endif /* __INTEL_DRV_H__ */
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index ab0f2c0a440c..baf26aea04c9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1341,6 +1341,11 @@ typedef struct drm_i915_private {
+ 
+ 	struct i915_package_c8 pc8;
+ 
++	struct intel_digital_port *hpd_irq_port[I915_MAX_PORTS];
++	u32 long_hpd_port_mask;
++	u32 short_hpd_port_mask;
++	struct work_struct dig_port_work;
++
+ 	/* Old dri1 support infrastructure, beware the dragons ya fools entering
+ 	 * here! */
+ 	struct i915_dri1_state dri1;
+* Unmerged path drivers/gpu/drm/i915/i915_irq.c
+* Unmerged path drivers/gpu/drm/i915/intel_ddi.c
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 1a431377d83b..db11788f4125 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -3098,6 +3098,22 @@ intel_dp_hot_plug(struct intel_encoder *intel_encoder)
+ 	intel_dp_check_link_status(intel_dp);
+ }
+ 
++bool
++intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port, bool long_hpd)
++{
++	struct intel_dp *intel_dp = &intel_dig_port->dp;
++
++	if (long_hpd)
++		return true;
++
++	/*
++	 * we'll check the link status via the normal hot plug path later -
++	 * but for short hpds we should check it now
++	 */
++	intel_dp_check_link_status(intel_dp);
++	return false;
++}
++
+ /* Return which DP Port should be selected for Transcoder DP control */
+ int
+ intel_trans_dp_port_sel(struct drm_crtc *crtc)
+@@ -3531,6 +3547,7 @@ intel_dp_init_connector(struct intel_digital_port *intel_dig_port,
+ void
+ intel_dp_init(struct drm_device *dev, int output_reg, enum port port)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_digital_port *intel_dig_port;
+ 	struct intel_encoder *intel_encoder;
+ 	struct drm_encoder *encoder;
+@@ -3575,6 +3592,9 @@ intel_dp_init(struct drm_device *dev, int output_reg, enum port port)
+ 	intel_encoder->cloneable = false;
+ 	intel_encoder->hot_plug = intel_dp_hot_plug;
+ 
++	intel_dig_port->hpd_pulse = intel_dp_hpd_pulse;
++	dev_priv->hpd_irq_port[port] = intel_dig_port;
++
+ 	if (!intel_dp_init_connector(intel_dig_port, intel_connector)) {
+ 		drm_encoder_cleanup(encoder);
+ 		kfree(intel_dig_port);
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
