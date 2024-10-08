@@ -8393,6 +8393,7 @@ static int __start_delalloc_inodes(struct btrfs_root *root, int delay_iput,
 	INIT_LIST_HEAD(&works);
 	INIT_LIST_HEAD(&splice);
 
+	mutex_lock(&root->delalloc_mutex);
 	spin_lock(&root->delalloc_lock);
 	list_splice_init(&root->delalloc_inodes, &splice);
 	while (!list_empty(&splice)) {
@@ -8438,6 +8439,7 @@ static int __start_delalloc_inodes(struct btrfs_root *root, int delay_iput,
 		list_splice_tail(&splice, &root->delalloc_inodes);
 		spin_unlock(&root->delalloc_lock);
 	}
+	mutex_unlock(&root->delalloc_mutex);
 	return ret;
 }
 
@@ -8479,6 +8481,7 @@ int btrfs_start_delalloc_roots(struct btrfs_fs_info *fs_info, int delay_iput,
 
 	INIT_LIST_HEAD(&splice);
 
+	mutex_lock(&fs_info->delalloc_root_mutex);
 	spin_lock(&fs_info->delalloc_root_lock);
 	list_splice_init(&fs_info->delalloc_roots, &splice);
 	while (!list_empty(&splice) && nr) {
@@ -8518,6 +8521,7 @@ out:
 		list_splice_tail(&splice, &fs_info->delalloc_roots);
 		spin_unlock(&fs_info->delalloc_root_lock);
 	}
+	mutex_unlock(&fs_info->delalloc_root_mutex);
 	return ret;
 }
 
