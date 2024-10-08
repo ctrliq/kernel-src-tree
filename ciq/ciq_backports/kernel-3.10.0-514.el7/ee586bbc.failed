@@ -1,0 +1,298 @@
+netfilter: reject: don't send icmp error if csum is invalid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit ee586bbc28fb7128133457cf711880d13a3b7ce4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ee586bbc.failed
+
+tcp resets are never emitted if the packet that triggers the
+reject/reset has an invalid checksum.
+
+For icmp error responses there was no such check.
+It allows to distinguish icmp response generated via
+
+iptables -I INPUT -p udp --dport 42 -j REJECT
+
+and those emitted by network stack (won't respond if csum is invalid,
+REJECT does).
+
+Arguably its possible to avoid this by using conntrack and only
+using REJECT with -m conntrack NEW/RELATED.
+
+However, this doesn't work when connection tracking is not in use
+or when using nf_conntrack_checksum=0.
+
+Furthermore, sending errors in response to invalid csums doesn't make
+much sense so just add similar test as in nf_send_reset.
+
+Validate csum if needed and only send the response if it is ok.
+
+Reference: http://bugzilla.redhat.com/show_bug.cgi?id=1169829
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit ee586bbc28fb7128133457cf711880d13a3b7ce4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/ipv4/nf_reject.h
+#	net/ipv4/netfilter/nf_reject_ipv4.c
+#	net/ipv6/netfilter/nf_reject_ipv6.c
+diff --cc include/net/netfilter/ipv4/nf_reject.h
+index 00e9cef81939,864127573c32..000000000000
+--- a/include/net/netfilter/ipv4/nf_reject.h
++++ b/include/net/netfilter/ipv4/nf_reject.h
+@@@ -1,129 -1,19 +1,134 @@@
+  #ifndef _IPV4_NF_REJECT_H
+  #define _IPV4_NF_REJECT_H
+  
+ -#include <linux/skbuff.h>
+  #include <net/ip.h>
+ +#include <net/tcp.h>
+ +#include <net/route.h>
+ +#include <net/dst.h>
+  #include <net/icmp.h>
+  
+++<<<<<<< HEAD
+ +static inline void nf_send_unreach(struct sk_buff *skb_in, int code)
+ +{
+ +	icmp_send(skb_in, ICMP_DEST_UNREACH, code, 0);
+ +}
+ +
+ +/* Send RST reply */
+ +static void nf_send_reset(struct sk_buff *oldskb, int hook)
+ +{
+ +	struct sk_buff *nskb;
+ +	const struct iphdr *oiph;
+ +	struct iphdr *niph;
+ +	const struct tcphdr *oth;
+ +	struct tcphdr _otcph, *tcph;
+ +
+ +	/* IP header checks: fragment. */
+ +	if (ip_hdr(oldskb)->frag_off & htons(IP_OFFSET))
+ +		return;
+ +
+ +	oth = skb_header_pointer(oldskb, ip_hdrlen(oldskb),
+ +				 sizeof(_otcph), &_otcph);
+ +	if (oth == NULL)
+ +		return;
+ +
+ +	/* No RST for RST. */
+ +	if (oth->rst)
+ +		return;
+ +
+ +	if (skb_rtable(oldskb)->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))
+ +		return;
+ +
+ +	/* Check checksum */
+ +	if (nf_ip_checksum(oldskb, hook, ip_hdrlen(oldskb), IPPROTO_TCP))
+ +		return;
+ +	oiph = ip_hdr(oldskb);
+ +
+ +	nskb = alloc_skb(sizeof(struct iphdr) + sizeof(struct tcphdr) +
+ +			 LL_MAX_HEADER, GFP_ATOMIC);
+ +	if (!nskb)
+ +		return;
+ +
+ +	skb_reserve(nskb, LL_MAX_HEADER);
+ +
+ +	skb_reset_network_header(nskb);
+ +	niph = (struct iphdr *)skb_put(nskb, sizeof(struct iphdr));
+ +	niph->version	= 4;
+ +	niph->ihl	= sizeof(struct iphdr) / 4;
+ +	niph->tos	= 0;
+ +	niph->id	= 0;
+ +	niph->frag_off	= htons(IP_DF);
+ +	niph->protocol	= IPPROTO_TCP;
+ +	niph->check	= 0;
+ +	niph->saddr	= oiph->daddr;
+ +	niph->daddr	= oiph->saddr;
+ +
+ +	skb_reset_transport_header(nskb);
+ +	tcph = (struct tcphdr *)skb_put(nskb, sizeof(struct tcphdr));
+ +	memset(tcph, 0, sizeof(*tcph));
+ +	tcph->source	= oth->dest;
+ +	tcph->dest	= oth->source;
+ +	tcph->doff	= sizeof(struct tcphdr) / 4;
+ +
+ +	if (oth->ack)
+ +		tcph->seq = oth->ack_seq;
+ +	else {
+ +		tcph->ack_seq = htonl(ntohl(oth->seq) + oth->syn + oth->fin +
+ +				      oldskb->len - ip_hdrlen(oldskb) -
+ +				      (oth->doff << 2));
+ +		tcph->ack = 1;
+ +	}
+ +
+ +	tcph->rst	= 1;
+ +	tcph->check = ~tcp_v4_check(sizeof(struct tcphdr), niph->saddr,
+ +				    niph->daddr, 0);
+ +	nskb->ip_summed = CHECKSUM_PARTIAL;
+ +	nskb->csum_start = (unsigned char *)tcph - nskb->head;
+ +	nskb->csum_offset = offsetof(struct tcphdr, check);
+ +
+ +	/* ip_route_me_harder expects skb->dst to be set */
+ +	skb_dst_set_noref(nskb, skb_dst(oldskb));
+ +
+ +	nskb->protocol = htons(ETH_P_IP);
+ +	if (ip_route_me_harder(nskb, RTN_UNSPEC))
+ +		goto free_nskb;
+ +
+ +	niph->ttl	= ip4_dst_hoplimit(skb_dst(nskb));
+ +
+ +	/* "Never happens" */
+ +	if (nskb->len > dst_mtu(skb_dst(nskb)))
+ +		goto free_nskb;
+ +
+ +	nf_ct_attach(nskb, oldskb);
+ +
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	/* If we use ip_local_out for bridged traffic, the MAC source on
+ +	 * the RST will be ours, instead of the destination's.  This confuses
+ +	 * some routers/firewalls, and they drop the packet.  So we need to
+ +	 * build the eth header using the original destination's MAC as the
+ +	 * source, and send the RST packet directly.
+ +	 */
+ +	if (oldskb->nf_bridge) {
+ +		struct ethhdr *oeth = eth_hdr(oldskb);
+ +		nskb->dev = oldskb->nf_bridge->physindev;
+ +		niph->tot_len = htons(nskb->len);
+ +		ip_send_check(niph);
+ +		if (dev_hard_header(nskb, nskb->dev, ntohs(nskb->protocol),
+ +				    oeth->h_source, oeth->h_dest, nskb->len) < 0)
+ +			goto free_nskb;
+ +		dev_queue_xmit(nskb);
+ +	} else
+ +#endif
+ +		ip_local_out(nskb);
+ +
+ +	return;
+ +
+ + free_nskb:
+ +	kfree_skb(nskb);
+ +}
+++=======
++ void nf_send_unreach(struct sk_buff *skb_in, int code, int hook);
++ void nf_send_reset(struct sk_buff *oldskb, int hook);
+++>>>>>>> ee586bbc28fb (netfilter: reject: don't send icmp error if csum is invalid)
+  
+ -const struct tcphdr *nf_reject_ip_tcphdr_get(struct sk_buff *oldskb,
+ -					     struct tcphdr *_oth, int hook);
+ -struct iphdr *nf_reject_iphdr_put(struct sk_buff *nskb,
+ -				  const struct sk_buff *oldskb,
+ -				  __be16 protocol, int ttl);
+ -void nf_reject_ip_tcphdr_put(struct sk_buff *nskb, const struct sk_buff *oldskb,
+ -			     const struct tcphdr *oth);
+  
+  #endif /* _IPV4_NF_REJECT_H */
+* Unmerged path net/ipv4/netfilter/nf_reject_ipv4.c
+* Unmerged path net/ipv6/netfilter/nf_reject_ipv6.c
+* Unmerged path include/net/netfilter/ipv4/nf_reject.h
+diff --git a/include/net/netfilter/ipv6/nf_reject.h b/include/net/netfilter/ipv6/nf_reject.h
+index 710d17ed70b4..c5e4a11209df 100644
+--- a/include/net/netfilter/ipv6/nf_reject.h
++++ b/include/net/netfilter/ipv6/nf_reject.h
+@@ -7,15 +7,8 @@
+ #include <net/ip6_checksum.h>
+ #include <linux/netfilter_ipv6.h>
+ 
+-static inline void
+-nf_send_unreach6(struct net *net, struct sk_buff *skb_in, unsigned char code,
+-	     unsigned int hooknum)
+-{
+-	if (hooknum == NF_INET_LOCAL_OUT && skb_in->dev == NULL)
+-		skb_in->dev = net->loopback_dev;
+-
+-	icmpv6_send(skb_in, ICMPV6_DEST_UNREACH, code, 0);
+-}
++void nf_send_unreach6(struct net *net, struct sk_buff *skb_in, unsigned char code,
++		      unsigned int hooknum);
+ 
+ /* Send RST reply */
+ static void nf_send_reset6(struct net *net, struct sk_buff *oldskb, int hook)
+diff --git a/net/ipv4/netfilter/ipt_REJECT.c b/net/ipv4/netfilter/ipt_REJECT.c
+index 5b6e0df4ccff..ffd319bd08d7 100644
+--- a/net/ipv4/netfilter/ipt_REJECT.c
++++ b/net/ipv4/netfilter/ipt_REJECT.c
+@@ -34,31 +34,32 @@ static unsigned int
+ reject_tg(struct sk_buff *skb, const struct xt_action_param *par)
+ {
+ 	const struct ipt_reject_info *reject = par->targinfo;
++	int hook = par->hooknum;
+ 
+ 	switch (reject->with) {
+ 	case IPT_ICMP_NET_UNREACHABLE:
+-		nf_send_unreach(skb, ICMP_NET_UNREACH);
++		nf_send_unreach(skb, ICMP_NET_UNREACH, hook);
+ 		break;
+ 	case IPT_ICMP_HOST_UNREACHABLE:
+-		nf_send_unreach(skb, ICMP_HOST_UNREACH);
++		nf_send_unreach(skb, ICMP_HOST_UNREACH, hook);
+ 		break;
+ 	case IPT_ICMP_PROT_UNREACHABLE:
+-		nf_send_unreach(skb, ICMP_PROT_UNREACH);
++		nf_send_unreach(skb, ICMP_PROT_UNREACH, hook);
+ 		break;
+ 	case IPT_ICMP_PORT_UNREACHABLE:
+-		nf_send_unreach(skb, ICMP_PORT_UNREACH);
++		nf_send_unreach(skb, ICMP_PORT_UNREACH, hook);
+ 		break;
+ 	case IPT_ICMP_NET_PROHIBITED:
+-		nf_send_unreach(skb, ICMP_NET_ANO);
++		nf_send_unreach(skb, ICMP_NET_ANO, hook);
+ 		break;
+ 	case IPT_ICMP_HOST_PROHIBITED:
+-		nf_send_unreach(skb, ICMP_HOST_ANO);
++		nf_send_unreach(skb, ICMP_HOST_ANO, hook);
+ 		break;
+ 	case IPT_ICMP_ADMIN_PROHIBITED:
+-		nf_send_unreach(skb, ICMP_PKT_FILTERED);
++		nf_send_unreach(skb, ICMP_PKT_FILTERED, hook);
+ 		break;
+ 	case IPT_TCP_RESET:
+-		nf_send_reset(skb, par->hooknum);
++		nf_send_reset(skb, hook);
+ 	case IPT_ICMP_ECHOREPLY:
+ 		/* Doesn't happen. */
+ 		break;
+* Unmerged path net/ipv4/netfilter/nf_reject_ipv4.c
+diff --git a/net/ipv4/netfilter/nft_reject_ipv4.c b/net/ipv4/netfilter/nft_reject_ipv4.c
+index ed33299c56d1..339b74d921b8 100644
+--- a/net/ipv4/netfilter/nft_reject_ipv4.c
++++ b/net/ipv4/netfilter/nft_reject_ipv4.c
+@@ -27,7 +27,8 @@ void nft_reject_ipv4_eval(const struct nft_expr *expr,
+ 
+ 	switch (priv->type) {
+ 	case NFT_REJECT_ICMP_UNREACH:
+-		nf_send_unreach(pkt->skb, priv->icmp_code);
++		nf_send_unreach(pkt->skb, priv->icmp_code,
++				pkt->ops->hooknum);
+ 		break;
+ 	case NFT_REJECT_TCP_RST:
+ 		nf_send_reset(pkt->skb, pkt->ops->hooknum);
+* Unmerged path net/ipv6/netfilter/nf_reject_ipv6.c
+diff --git a/net/netfilter/nft_reject_inet.c b/net/netfilter/nft_reject_inet.c
+index 7b5f9d58680a..92877114aff4 100644
+--- a/net/netfilter/nft_reject_inet.c
++++ b/net/netfilter/nft_reject_inet.c
+@@ -28,14 +28,16 @@ static void nft_reject_inet_eval(const struct nft_expr *expr,
+ 	case NFPROTO_IPV4:
+ 		switch (priv->type) {
+ 		case NFT_REJECT_ICMP_UNREACH:
+-			nf_send_unreach(pkt->skb, priv->icmp_code);
++			nf_send_unreach(pkt->skb, priv->icmp_code,
++					pkt->ops->hooknum);
+ 			break;
+ 		case NFT_REJECT_TCP_RST:
+ 			nf_send_reset(pkt->skb, pkt->ops->hooknum);
+ 			break;
+ 		case NFT_REJECT_ICMPX_UNREACH:
+ 			nf_send_unreach(pkt->skb,
+-					nft_reject_icmp_code(priv->icmp_code));
++					nft_reject_icmp_code(priv->icmp_code),
++					pkt->ops->hooknum);
+ 			break;
+ 		}
+ 		break;
