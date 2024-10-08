@@ -1,0 +1,117 @@
+fs: create proper filename objects using getname_kernel()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [fs] namei: create proper filename objects using getname_kernel() (Paul Moore) [1155208]
+Rebuild_FUZZ: 94.02%
+commit-author Paul Moore <pmoore@redhat.com>
+commit 5168910413830435fa3f0a593933a83721ec8bad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/51689104.failed
+
+There are several areas in the kernel that create temporary filename
+objects using the following pattern:
+
+	int func(const char *name)
+	{
+		struct filename *file = { .name = name };
+		...
+		return 0;
+	}
+
+... which for the most part works okay, but it causes havoc within the
+audit subsystem as the filename object does not persist beyond the
+lifetime of the function.  This patch converts all of these temporary
+filename objects into proper filename objects using getname_kernel()
+and putname() which ensure that the filename object persists until the
+audit subsystem is finished with it.
+
+Also, a special thanks to Al Viro, Guenter Roeck, and Sabrina Dubroca
+for helping resolve a difficult kernel panic on boot related to a
+use-after-free problem in kern_path_create(); the thread can be seen
+at the link below:
+
+ * https://lkml.org/lkml/2015/1/20/710
+
+This patch includes code that was either based on, or directly written
+by Al in the above thread.
+
+CC: viro@zeniv.linux.org.uk
+CC: linux@roeck-us.net
+CC: sd@queasysnail.net
+CC: linux-fsdevel@vger.kernel.org
+	Signed-off-by: Paul Moore <pmoore@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 5168910413830435fa3f0a593933a83721ec8bad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+#	fs/namei.c
+diff --cc fs/exec.c
+index d5973c813868,c7f9b733406d..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -783,6 -791,18 +783,21 @@@ exit
+  	fput(file);
+  	return ERR_PTR(err);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct file *open_exec(const char *name)
++ {
++ 	struct filename *filename = getname_kernel(name);
++ 	struct file *f = ERR_CAST(filename);
++ 
++ 	if (!IS_ERR(filename)) {
++ 		f = do_open_execat(AT_FDCWD, filename, 0);
++ 		putname(filename);
++ 	}
++ 	return f;
++ }
+++>>>>>>> 516891041383 (fs: create proper filename objects using getname_kernel())
+  EXPORT_SYMBOL(open_exec);
+  
+  int kernel_read(struct file *file, loff_t offset,
+diff --cc fs/namei.c
+index 72c9894b9e82,0bc7742a591d..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -3205,7 -3301,8 +3226,12 @@@ struct file *do_file_open_root(struct d
+  {
+  	struct nameidata nd;
+  	struct file *file;
+++<<<<<<< HEAD
+ +	struct filename filename = { .name = name };
+++=======
++ 	struct filename *filename;
++ 	int flags = op->lookup_flags | LOOKUP_ROOT;
+++>>>>>>> 516891041383 (fs: create proper filename objects using getname_kernel())
+  
+  	nd.root.mnt = mnt;
+  	nd.root.dentry = dentry;
+* Unmerged path fs/exec.c
+* Unmerged path fs/namei.c
+diff --git a/fs/open.c b/fs/open.c
+index 5cf4cfd348d4..7fbf3330a705 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -979,8 +979,14 @@ struct file *file_open_name(struct filename *name, int flags, umode_t mode)
+  */
+ struct file *filp_open(const char *filename, int flags, umode_t mode)
+ {
+-	struct filename name = {.name = filename};
+-	return file_open_name(&name, flags, mode);
++	struct filename *name = getname_kernel(filename);
++	struct file *file = ERR_CAST(name);
++	
++	if (!IS_ERR(name)) {
++		file = file_open_name(name, flags, mode);
++		putname(name);
++	}
++	return file;
+ }
+ EXPORT_SYMBOL(filp_open);
+ 
