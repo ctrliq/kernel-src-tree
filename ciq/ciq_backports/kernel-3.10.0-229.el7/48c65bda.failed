@@ -1,0 +1,164 @@
+perf annotate: Check availability of annotate when processing samples
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf/annotate: Check availability of annotate when processing samples (Jiri Olsa) [1133083]
+Rebuild_FUZZ: 98.55%
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 48c65bda95d692076de7e5eae3188ddae8635dca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/48c65bda.failed
+
+The TUI of perf report and top support annotation, but stdio and GTK
+don't.  So it should be checked before calling hist_entry__inc_addr_
+samples() to avoid wasting resources that will never be used.
+
+perf annotate need it regardless of UI and sort keys, so the check
+of whether to allocate resources should be on the tools that have
+annotate as an option in the TUI, 'report' and 'top', not on the
+function called by all of them.
+
+It caused perf annotate on ppc64 to produce zero output, since the
+buckets were not being allocated.
+
+	Reported-by: Anton Blanchard <anton@samba.org>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: Anton Blanchard <anton@samba.org>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Namhyung Kim <namhyung.kim@lge.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/1392859976-32760-1-git-send-email-namhyung@kernel.org
+[ Renamed (report,top)__needs_annotate() to ui__has_annotation() ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 48c65bda95d692076de7e5eae3188ddae8635dca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/annotate.c
+diff --cc tools/perf/util/annotate.c
+index e3281495d59d,3aa555ff9d89..000000000000
+--- a/tools/perf/util/annotate.c
++++ b/tools/perf/util/annotate.c
+@@@ -1393,3 -1396,13 +1395,16 @@@ int symbol__tty_annotate(struct symbol 
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int hist_entry__annotate(struct hist_entry *he, size_t privsize)
++ {
++ 	return symbol__annotate(he->ms.sym, he->ms.map, privsize);
++ }
++ 
++ bool ui__has_annotation(void)
++ {
++ 	return use_browser == 1 && sort__has_sym;
++ }
+++>>>>>>> 48c65bda95d6 (perf annotate: Check availability of annotate when processing samples)
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index e3b253d3e27e..42f7a90ad6b6 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -130,14 +130,16 @@ static int report__add_mem_hist_entry(struct perf_tool *tool, struct addr_locati
+ 	if (!he)
+ 		return -ENOMEM;
+ 
+-	err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
+-	if (err)
+-		goto out;
++	if (ui__has_annotation()) {
++		err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
++		if (err)
++			goto out;
+ 
+-	mx = he->mem_info;
+-	err = addr_map_symbol__inc_samples(&mx->daddr, evsel->idx);
+-	if (err)
+-		goto out;
++		mx = he->mem_info;
++		err = addr_map_symbol__inc_samples(&mx->daddr, evsel->idx);
++		if (err)
++			goto out;
++	}
+ 
+ 	evsel->hists.stats.total_period += cost;
+ 	hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+@@ -182,14 +184,18 @@ static int report__add_branch_hist_entry(struct perf_tool *tool, struct addr_loc
+ 		he = __hists__add_entry(&evsel->hists, al, parent, &bi[i], NULL,
+ 					1, 1, 0);
+ 		if (he) {
+-			bx = he->branch_info;
+-			err = addr_map_symbol__inc_samples(&bx->from, evsel->idx);
+-			if (err)
+-				goto out;
+-
+-			err = addr_map_symbol__inc_samples(&bx->to, evsel->idx);
+-			if (err)
+-				goto out;
++			if (ui__has_annotation()) {
++				bx = he->branch_info;
++				err = addr_map_symbol__inc_samples(&bx->from,
++								   evsel->idx);
++				if (err)
++					goto out;
++
++				err = addr_map_symbol__inc_samples(&bx->to,
++								   evsel->idx);
++				if (err)
++					goto out;
++			}
+ 
+ 			evsel->hists.stats.total_period += 1;
+ 			hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+@@ -224,7 +230,9 @@ static int report__add_hist_entry(struct perf_tool *tool, struct perf_evsel *evs
+ 	if (err)
+ 		goto out;
+ 
+-	err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
++	if (ui__has_annotation())
++		err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
++
+ 	evsel->hists.stats.total_period += sample->period;
+ 	hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+ out:
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index c1b5d3b13b56..f41ac373f665 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -176,7 +176,7 @@ static void perf_top__record_precise_ip(struct perf_top *top,
+ {
+ 	struct annotation *notes;
+ 	struct symbol *sym;
+-	int err;
++	int err = 0;
+ 
+ 	if (he == NULL || he->ms.sym == NULL ||
+ 	    ((top->sym_filter_entry == NULL ||
+@@ -190,7 +190,9 @@ static void perf_top__record_precise_ip(struct perf_top *top,
+ 		return;
+ 
+ 	ip = he->ms.map->map_ip(he->ms.map, ip);
+-	err = hist_entry__inc_addr_samples(he, counter, ip);
++
++	if (ui__has_annotation())
++		err = hist_entry__inc_addr_samples(he, counter, ip);
+ 
+ 	pthread_mutex_unlock(&notes->lock);
+ 
+* Unmerged path tools/perf/util/annotate.c
+diff --git a/tools/perf/util/annotate.h b/tools/perf/util/annotate.h
+index 3024adbcb025..8a2faf3a5eb8 100644
+--- a/tools/perf/util/annotate.h
++++ b/tools/perf/util/annotate.h
+@@ -146,6 +146,8 @@ void symbol__annotate_zero_histogram(struct symbol *sym, int evidx);
+ void symbol__annotate_decay_histogram(struct symbol *sym, int evidx);
+ void disasm__purge(struct list_head *head);
+ 
++bool ui__has_annotation(void);
++
+ int symbol__tty_annotate(struct symbol *sym, struct map *map,
+ 			 struct perf_evsel *evsel, bool print_lines,
+ 			 bool full_paths, int min_pcnt, int max_lines);
