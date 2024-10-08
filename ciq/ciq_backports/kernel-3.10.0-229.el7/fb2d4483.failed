@@ -1,0 +1,108 @@
+aio: report error from io_destroy() when threads race in io_destroy()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Benjamin LaHaise <bcrl@kvack.org>
+commit fb2d44838320b78e6e3b5eb2e35b70f62f262e4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/fb2d4483.failed
+
+As reported by Anatol Pomozov, io_destroy() fails to report an error when
+it loses the race to destroy a given ioctx.  Since there is a difference in
+behaviour between the thread that wins the race (which blocks on outstanding
+io requests) versus lthe thread that loses (which returns immediately), wire
+up a return code from kill_ioctx() to the io_destroy() syscall.
+
+	Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+	Cc: Anatol Pomozov <anatol.pomozov@gmail.com>
+(cherry picked from commit fb2d44838320b78e6e3b5eb2e35b70f62f262e4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/aio.c
+diff --cc fs/aio.c
+index e90f40ffd1ab,044c1c86decc..000000000000
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@@ -636,13 -727,24 +636,18 @@@ static void kill_ioctx_rcu(struct rcu_h
+   *	when the processes owning a context have all exited to encourage
+   *	the rapid destruction of the kioctx.
+   */
+++<<<<<<< HEAD
+ +static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx)
+++=======
++ static int kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
++ 		struct completion *requests_done)
+++>>>>>>> fb2d44838320 (aio: report error from io_destroy() when threads race in io_destroy())
+  {
+  	if (!atomic_xchg(&ctx->dead, 1)) {
+ -		struct kioctx_table *table;
+ -
+  		spin_lock(&mm->ioctx_lock);
+ -		rcu_read_lock();
+ -		table = rcu_dereference(mm->ioctx_table);
+ -
+ -		WARN_ON(ctx != table->table[ctx->id]);
+ -		table->table[ctx->id] = NULL;
+ -		rcu_read_unlock();
+ +		hlist_del_rcu(&ctx->list);
+  		spin_unlock(&mm->ioctx_lock);
+  
+ -		/* percpu_ref_kill() will do the necessary call_rcu() */
+ -		wake_up_all(&ctx->wait);
+ -
+  		/*
+  		 * It'd be more correct to do this in free_ioctx(), after all
+  		 * the outstanding kiocbs have finished - but by then io_destroy
+@@@ -658,9 -757,12 +663,17 @@@
+  		if (ctx->mmap_size)
+  			vm_munmap(ctx->mmap_base, ctx->mmap_size);
+  
+++<<<<<<< HEAD
+ +		/* Between hlist_del_rcu() and dropping the initial ref */
+ +		call_rcu(&ctx->rcu_head, kill_ioctx_rcu);
+++=======
++ 		ctx->requests_done = requests_done;
++ 		percpu_ref_kill(&ctx->users);
++ 		return 0;
+++>>>>>>> fb2d44838320 (aio: report error from io_destroy() when threads race in io_destroy())
+  	}
++ 
++ 	return -EINVAL;
+  }
+  
+  /* wait_on_sync_kiocb:
+@@@ -1096,9 -1217,25 +1109,31 @@@ SYSCALL_DEFINE1(io_destroy, aio_context
+  {
+  	struct kioctx *ioctx = lookup_ioctx(ctx);
+  	if (likely(NULL != ioctx)) {
+++<<<<<<< HEAD
+ +		kill_ioctx(current->mm, ioctx);
+ +		put_ioctx(ioctx);
+ +		return 0;
+++=======
++ 		struct completion requests_done =
++ 			COMPLETION_INITIALIZER_ONSTACK(requests_done);
++ 		int ret;
++ 
++ 		/* Pass requests_done to kill_ioctx() where it can be set
++ 		 * in a thread-safe way. If we try to set it here then we have
++ 		 * a race condition if two io_destroy() called simultaneously.
++ 		 */
++ 		ret = kill_ioctx(current->mm, ioctx, &requests_done);
++ 		percpu_ref_put(&ioctx->users);
++ 
++ 		/* Wait until all IO for the context are done. Otherwise kernel
++ 		 * keep using user-space buffers even if user thinks the context
++ 		 * is destroyed.
++ 		 */
++ 		if (!ret)
++ 			wait_for_completion(&requests_done);
++ 
++ 		return ret;
+++>>>>>>> fb2d44838320 (aio: report error from io_destroy() when threads race in io_destroy())
+  	}
+  	pr_debug("EINVAL: io_destroy: invalid context id\n");
+  	return -EINVAL;
+* Unmerged path fs/aio.c
