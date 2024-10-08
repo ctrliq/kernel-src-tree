@@ -1,0 +1,187 @@
+sfc: update netdevice statistics to use vadaptor stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Daniel Pieczko <dpieczko@solarflare.com>
+commit 0fc95fca5a95170a3615557218d98b6dff52ad36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0fc95fca.failed
+
+The netdevice statistics (in /proc/net/dev) are per-function
+stats so they must use the vadaptor stats. Change the use of
+MAC stats to vadaptor stats, and remove any statistics that
+can only be measured per-port.  All stats that are removed
+will be shown as zeroes when these statistics are displayed.
+
+	Signed-off-by: Shradha Shah <sshah@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0fc95fca5a95170a3615557218d98b6dff52ad36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index a248a452bb8b,b880d984a649..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -988,7 -1190,51 +988,55 @@@ static size_t efx_ef10_describe_stats(s
+  				      mask, names);
+  }
+  
+++<<<<<<< HEAD
+ +static int efx_ef10_try_update_nic_stats(struct efx_nic *efx)
+++=======
++ static size_t efx_ef10_update_stats_common(struct efx_nic *efx, u64 *full_stats,
++ 					   struct rtnl_link_stats64 *core_stats)
++ {
++ 	DECLARE_BITMAP(mask, EF10_STAT_COUNT);
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 	u64 *stats = nic_data->stats;
++ 	size_t stats_count = 0, index;
++ 
++ 	efx_ef10_get_stat_mask(efx, mask);
++ 
++ 	if (full_stats) {
++ 		for_each_set_bit(index, mask, EF10_STAT_COUNT) {
++ 			if (efx_ef10_stat_desc[index].name) {
++ 				*full_stats++ = stats[index];
++ 				++stats_count;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (core_stats) {
++ 		core_stats->rx_packets = stats[EF10_STAT_rx_unicast] +
++ 					 stats[EF10_STAT_rx_multicast] +
++ 					 stats[EF10_STAT_rx_broadcast];
++ 		core_stats->tx_packets = stats[EF10_STAT_tx_unicast] +
++ 					 stats[EF10_STAT_tx_multicast] +
++ 					 stats[EF10_STAT_tx_broadcast];
++ 		core_stats->rx_bytes = stats[EF10_STAT_rx_unicast_bytes] +
++ 				       stats[EF10_STAT_rx_multicast_bytes] +
++ 				       stats[EF10_STAT_rx_broadcast_bytes];
++ 		core_stats->tx_bytes = stats[EF10_STAT_tx_unicast_bytes] +
++ 				       stats[EF10_STAT_tx_multicast_bytes] +
++ 				       stats[EF10_STAT_tx_broadcast_bytes];
++ 		core_stats->rx_dropped = stats[GENERIC_STAT_rx_nodesc_trunc] +
++ 					 stats[GENERIC_STAT_rx_noskb_drops];
++ 		core_stats->multicast = stats[EF10_STAT_rx_multicast];
++ 		core_stats->rx_crc_errors = stats[EF10_STAT_rx_bad];
++ 		core_stats->rx_fifo_errors = stats[EF10_STAT_rx_overflow];
++ 		core_stats->rx_errors = core_stats->rx_crc_errors;
++ 		core_stats->tx_errors = stats[EF10_STAT_tx_bad];
++ 	}
++ 
++ 	return stats_count;
++ }
++ 
++ static int efx_ef10_try_update_nic_stats_pf(struct efx_nic *efx)
+++>>>>>>> 0fc95fca5a95 (sfc: update netdevice statistics to use vadaptor stats)
+  {
+  	struct efx_ef10_nic_data *nic_data = efx->nic_data;
+  	DECLARE_BITMAP(mask, EF10_STAT_COUNT);
+@@@ -1045,37 -1285,71 +1093,90 @@@ static size_t efx_ef10_update_stats(str
+  		udelay(100);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (full_stats) {
+ +		for_each_set_bit(index, mask, EF10_STAT_COUNT) {
+ +			if (efx_ef10_stat_desc[index].name) {
+ +				*full_stats++ = stats[index];
+ +				++stats_count;
+ +			}
+ +		}
+++=======
++ 	return efx_ef10_update_stats_common(efx, full_stats, core_stats);
++ }
++ 
++ static int efx_ef10_try_update_nic_stats_vf(struct efx_nic *efx)
++ {
++ 	MCDI_DECLARE_BUF(inbuf, MC_CMD_MAC_STATS_IN_LEN);
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 	DECLARE_BITMAP(mask, EF10_STAT_COUNT);
++ 	__le64 generation_start, generation_end;
++ 	u64 *stats = nic_data->stats;
++ 	u32 dma_len = MC_CMD_MAC_NSTATS * sizeof(u64);
++ 	struct efx_buffer stats_buf;
++ 	__le64 *dma_stats;
++ 	int rc;
++ 
++ 	efx_ef10_get_stat_mask(efx, mask);
++ 
++ 	rc = efx_nic_alloc_buffer(efx, &stats_buf, dma_len, GFP_ATOMIC);
++ 	if (rc)
++ 		return rc;
++ 
++ 	dma_stats = stats_buf.addr;
++ 	dma_stats[MC_CMD_MAC_GENERATION_END] = EFX_MC_STATS_GENERATION_INVALID;
++ 
++ 	MCDI_SET_QWORD(inbuf, MAC_STATS_IN_DMA_ADDR, stats_buf.dma_addr);
++ 	MCDI_POPULATE_DWORD_1(inbuf, MAC_STATS_IN_CMD,
++ 			      MAC_STATS_IN_DMA, 1);
++ 	MCDI_SET_DWORD(inbuf, MAC_STATS_IN_DMA_LEN, dma_len);
++ 	MCDI_SET_DWORD(inbuf, MAC_STATS_IN_PORT_ID, EVB_PORT_ID_ASSIGNED);
++ 
++ 	spin_unlock_bh(&efx->stats_lock);
++ 	rc = efx_mcdi_rpc(efx, MC_CMD_MAC_STATS, inbuf, sizeof(inbuf), NULL,
++ 			  0, NULL);
++ 	spin_lock_bh(&efx->stats_lock);
++ 	if (rc)
++ 		goto out;
++ 
++ 	generation_end = dma_stats[MC_CMD_MAC_GENERATION_END];
++ 	if (generation_end == EFX_MC_STATS_GENERATION_INVALID) {
++ 		WARN_ON_ONCE(1);
++ 		goto out;
++ 	}
++ 	rmb();
++ 	efx_nic_update_stats(efx_ef10_stat_desc, EF10_STAT_COUNT, mask,
++ 			     stats, stats_buf.addr, false);
++ 	rmb();
++ 	generation_start = dma_stats[MC_CMD_MAC_GENERATION_START];
++ 	if (generation_end != generation_start) {
++ 		rc = -EAGAIN;
++ 		goto out;
+++>>>>>>> 0fc95fca5a95 (sfc: update netdevice statistics to use vadaptor stats)
+  	}
+  
+ -	efx_update_sw_stats(efx, stats);
+ -out:
+ -	efx_nic_free_buffer(efx, &stats_buf);
+ -	return rc;
+ -}
+ -
+ -static size_t efx_ef10_update_stats_vf(struct efx_nic *efx, u64 *full_stats,
+ -				       struct rtnl_link_stats64 *core_stats)
+ -{
+ -	if (efx_ef10_try_update_nic_stats_vf(efx))
+ -		return 0;
+ +	if (core_stats) {
+ +		core_stats->rx_packets = stats[EF10_STAT_port_rx_packets];
+ +		core_stats->tx_packets = stats[EF10_STAT_port_tx_packets];
+ +		core_stats->rx_bytes = stats[EF10_STAT_port_rx_bytes];
+ +		core_stats->tx_bytes = stats[EF10_STAT_port_tx_bytes];
+ +		core_stats->rx_dropped = stats[EF10_STAT_port_rx_nodesc_drops] +
+ +					 stats[GENERIC_STAT_rx_nodesc_trunc] +
+ +					 stats[GENERIC_STAT_rx_noskb_drops];
+ +		core_stats->multicast = stats[EF10_STAT_port_rx_multicast];
+ +		core_stats->rx_length_errors =
+ +			stats[EF10_STAT_port_rx_gtjumbo] +
+ +			stats[EF10_STAT_port_rx_length_error];
+ +		core_stats->rx_crc_errors = stats[EF10_STAT_port_rx_bad];
+ +		core_stats->rx_frame_errors =
+ +			stats[EF10_STAT_port_rx_align_error];
+ +		core_stats->rx_fifo_errors = stats[EF10_STAT_port_rx_overflow];
+ +		core_stats->rx_errors = (core_stats->rx_length_errors +
+ +					 core_stats->rx_crc_errors +
+ +					 core_stats->rx_frame_errors);
+ +	}
+  
+ -	return efx_ef10_update_stats_common(efx, full_stats, core_stats);
+ +	return stats_count;
+  }
+  
+  static void efx_ef10_push_irq_moderation(struct efx_channel *channel)
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
