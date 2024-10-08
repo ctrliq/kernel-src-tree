@@ -1,0 +1,103 @@
+Btrfs: fix very slow inode eviction and fs unmount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Filipe David Borba Manana <fdmanana@gmail.com>
+commit 131e404a2a54d30f894425ef723f9867a43bff4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/131e404a.failed
+
+The inode eviction can be very slow, because during eviction we
+tell the VFS to truncate all of the inode's pages. This results
+in calls to btrfs_invalidatepage() which in turn does calls to
+lock_extent_bits() and clear_extent_bit(). These calls result in
+too many merges and splits of extent_state structures, which
+consume a lot of time and cpu when the inode has many pages. In
+some scenarios I have experienced umount times higher than 15
+minutes, even when there's no pending IO (after a btrfs fs sync).
+
+A quick way to reproduce this issue:
+
+$ mkfs.btrfs -f /dev/sdb3
+$ mount /dev/sdb3 /mnt/btrfs
+$ cd /mnt/btrfs
+$ sysbench --test=fileio --file-num=128 --file-total-size=16G \
+    --file-test-mode=seqwr --num-threads=128 \
+    --file-block-size=16384 --max-time=60 --max-requests=0 run
+$ time btrfs fi sync .
+FSSync '.'
+
+real	0m25.457s
+user	0m0.000s
+sys	0m0.092s
+$ cd ..
+$ time umount /mnt/btrfs
+
+real	1m38.234s
+user	0m0.000s
+sys	1m25.760s
+
+The same test on ext4 runs much faster:
+
+$ mkfs.ext4 /dev/sdb3
+$ mount /dev/sdb3 /mnt/ext4
+$ cd /mnt/ext4
+$ sysbench --test=fileio --file-num=128 --file-total-size=16G \
+    --file-test-mode=seqwr --num-threads=128 \
+    --file-block-size=16384 --max-time=60 --max-requests=0 run
+$ sync
+$ cd ..
+$ time umount /mnt/ext4
+
+real	0m3.626s
+user	0m0.004s
+sys	0m3.012s
+
+After this patch, the unmount (inode evictions) is much faster:
+
+$ mkfs.btrfs -f /dev/sdb3
+$ mount /dev/sdb3 /mnt/btrfs
+$ cd /mnt/btrfs
+$ sysbench --test=fileio --file-num=128 --file-total-size=16G \
+    --file-test-mode=seqwr --num-threads=128 \
+    --file-block-size=16384 --max-time=60 --max-requests=0 run
+$ time btrfs fi sync .
+FSSync '.'
+
+real	0m26.774s
+user	0m0.000s
+sys	0m0.084s
+$ cd ..
+$ time umount /mnt/btrfs
+
+real	0m1.811s
+user	0m0.000s
+sys	0m1.564s
+
+	Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 131e404a2a54d30f894425ef723f9867a43bff4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/inode.c
+index 55dd917d5c80,e889779c9b37..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -4498,7 -4554,8 +4554,12 @@@ void btrfs_evict_inode(struct inode *in
+  
+  	trace_btrfs_inode_evict(inode);
+  
+++<<<<<<< HEAD
+ +	truncate_inode_pages_final(&inode->i_data);
+++=======
++ 	evict_inode_truncate_pages(inode);
++ 
+++>>>>>>> 131e404a2a54 (Btrfs: fix very slow inode eviction and fs unmount)
+  	if (inode->i_nlink &&
+  	    ((btrfs_root_refs(&root->root_item) != 0 &&
+  	      root->root_key.objectid != BTRFS_ROOT_TREE_OBJECTID) ||
+* Unmerged path fs/btrfs/inode.c
