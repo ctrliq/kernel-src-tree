@@ -1,0 +1,191 @@
+perf tools: Introduce new sort type "socket" for the processor socket
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit 2e7ea3ab8282f6bb1d211d8af760a734c055f493
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2e7ea3ab.failed
+
+This patch enable perf report to sort by processor socket:
+
+  $ perf report --stdio --sort socket,comm,dso,symbol
+  # To display the perf.data header info, please use --header/--header-only options.
+  #
+  # Total Lost Samples: 0
+  #
+  # Samples: 686  of event 'cycles'
+  # Event count (approx.): 349215462
+  #
+  # Overhead SOCKET Command Shared Object    Symbol
+  # ........ ...... ....... ................ ............................
+  #
+    97.05%    000   test    test             [.] plusB_c
+     0.98%    000   test    test             [.] plusA_c
+     0.93%    001   perf    [kernel.vmlinux] [k] smp_call_function_single
+     0.19%    001   perf    [kernel.vmlinux] [k] page_fault
+     0.19%    001   swapper [kernel.vmlinux] [k] pm_qos_request
+     0.16%    000   test    [kernel.vmlinux] [k] add_mm_counter_fast
+
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/r/1441377946-44429-2-git-send-email-kan.liang@intel.com
+[ Fix col calc, un-allcapsify col header & read the topology when not using perf.data ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 2e7ea3ab8282f6bb1d211d8af760a734c055f493)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-top.c
+diff --cc tools/perf/builtin-top.c
+index 0ad31f0dc87a,bdaf44f24d5d..000000000000
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@@ -959,7 -962,14 +959,18 @@@ static int __cmd_top(struct perf_top *t
+  		goto out_delete;
+  
+  	machine__synthesize_threads(&top->session->machines.host, &opts->target,
+++<<<<<<< HEAD
+ +				    top->evlist->threads, false);
+++=======
++ 				    top->evlist->threads, false, opts->proc_map_timeout);
++ 
++ 	if (sort__has_socket) {
++ 		ret = perf_env__read_cpu_topology_map(&perf_env);
++ 		if (ret < 0)
++ 			goto out_err_cpu_topo;
++ 	}
++ 
+++>>>>>>> 2e7ea3ab8282 (perf tools: Introduce new sort type "socket" for the processor socket)
+  	ret = perf_top__start_counters(top);
+  	if (ret)
+  		goto out_delete;
+diff --git a/tools/perf/Documentation/perf-report.txt b/tools/perf/Documentation/perf-report.txt
+index 412082f9c666..b1d7c169ac6d 100644
+--- a/tools/perf/Documentation/perf-report.txt
++++ b/tools/perf/Documentation/perf-report.txt
+@@ -68,7 +68,7 @@ OPTIONS
+ --sort=::
+ 	Sort histogram entries by given key(s) - multiple keys can be specified
+ 	in CSV format.  Following sort keys are available:
+-	pid, comm, dso, symbol, parent, cpu, srcline, weight, local_weight.
++	pid, comm, dso, symbol, parent, cpu, socket, srcline, weight, local_weight.
+ 
+ 	Each key has following meaning:
+ 
+@@ -79,6 +79,7 @@ OPTIONS
+ 	- parent: name of function matched to the parent regex filter. Unmatched
+ 	entries are displayed as "[other]".
+ 	- cpu: cpu number the task ran at the time of sample
++	- socket: processor socket number the task ran at the time of sample
+ 	- srcline: filename and line number executed at the time of sample.  The
+ 	DWARF debugging info must be provided.
+ 	- srcfile: file name of the source file of the same. Requires dwarf
+* Unmerged path tools/perf/builtin-top.c
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 5c7cab6b7767..c34bd4a59616 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -145,6 +145,7 @@ void hists__calc_col_len(struct hists *hists, struct hist_entry *h)
+ 	}
+ 
+ 	hists__new_col_len(hists, HISTC_CPU, 3);
++	hists__new_col_len(hists, HISTC_SOCKET, 6);
+ 	hists__new_col_len(hists, HISTC_MEM_LOCKED, 6);
+ 	hists__new_col_len(hists, HISTC_MEM_TLB, 22);
+ 	hists__new_col_len(hists, HISTC_MEM_SNOOP, 12);
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index de6d58e7f0d5..5d04d28eedd7 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -29,6 +29,7 @@ enum hist_column {
+ 	HISTC_COMM,
+ 	HISTC_PARENT,
+ 	HISTC_CPU,
++	HISTC_SOCKET,
+ 	HISTC_SRCLINE,
+ 	HISTC_SRCFILE,
+ 	HISTC_MISPREDICT,
+diff --git a/tools/perf/util/sort.c b/tools/perf/util/sort.c
+index a97bceeac0e7..6b9556d298c9 100644
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@ -21,6 +21,7 @@ int		sort__need_collapse = 0;
+ int		sort__has_parent = 0;
+ int		sort__has_sym = 0;
+ int		sort__has_dso = 0;
++int		sort__has_socket = 0;
+ enum sort_mode	sort__mode = SORT_MODE__NORMAL;
+ 
+ 
+@@ -421,6 +422,27 @@ struct sort_entry sort_cpu = {
+ 	.se_width_idx	= HISTC_CPU,
+ };
+ 
++/* --sort socket */
++
++static int64_t
++sort__socket_cmp(struct hist_entry *left, struct hist_entry *right)
++{
++	return right->socket - left->socket;
++}
++
++static int hist_entry__socket_snprintf(struct hist_entry *he, char *bf,
++				    size_t size, unsigned int width)
++{
++	return repsep_snprintf(bf, size, "%*.*d", width, width-3, he->socket);
++}
++
++struct sort_entry sort_socket = {
++	.se_header      = "Socket",
++	.se_cmp	        = sort__socket_cmp,
++	.se_snprintf    = hist_entry__socket_snprintf,
++	.se_width_idx	= HISTC_SOCKET,
++};
++
+ /* sort keys for branch stacks */
+ 
+ static int64_t
+@@ -1248,6 +1270,7 @@ static struct sort_dimension common_sort_dimensions[] = {
+ 	DIM(SORT_SYM, "symbol", sort_sym),
+ 	DIM(SORT_PARENT, "parent", sort_parent),
+ 	DIM(SORT_CPU, "cpu", sort_cpu),
++	DIM(SORT_SOCKET, "socket", sort_socket),
+ 	DIM(SORT_SRCLINE, "srcline", sort_srcline),
+ 	DIM(SORT_SRCFILE, "srcfile", sort_srcfile),
+ 	DIM(SORT_LOCAL_WEIGHT, "local_weight", sort_local_weight),
+@@ -1550,6 +1573,8 @@ int sort_dimension__add(const char *tok)
+ 
+ 		} else if (sd->entry == &sort_dso) {
+ 			sort__has_dso = 1;
++		} else if (sd->entry == &sort_socket) {
++			sort__has_socket = 1;
+ 		}
+ 
+ 		return __sort_dimension__add(sd);
+diff --git a/tools/perf/util/sort.h b/tools/perf/util/sort.h
+index 7cf1cf7d2406..c06b75746613 100644
+--- a/tools/perf/util/sort.h
++++ b/tools/perf/util/sort.h
+@@ -34,6 +34,7 @@ extern int have_ignore_callees;
+ extern int sort__need_collapse;
+ extern int sort__has_parent;
+ extern int sort__has_sym;
++extern int sort__has_socket;
+ extern enum sort_mode sort__mode;
+ extern struct sort_entry sort_comm;
+ extern struct sort_entry sort_dso;
+@@ -173,6 +174,7 @@ enum sort_type {
+ 	SORT_SYM,
+ 	SORT_PARENT,
+ 	SORT_CPU,
++	SORT_SOCKET,
+ 	SORT_SRCLINE,
+ 	SORT_SRCFILE,
+ 	SORT_LOCAL_WEIGHT,
