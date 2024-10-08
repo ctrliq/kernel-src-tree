@@ -1,0 +1,241 @@
+netfilter: use sk_fullsock() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit a8399231f0b6e72bc140bcc4fecb0c622298a6bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a8399231.failed
+
+Upcoming request sockets have TCP_NEW_SYN_RECV state and should
+be special cased a bit like TCP_TIME_WAIT sockets.
+
+	Signed-off-by; Eric Dumazet <edumazet@google.com>
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a8399231f0b6e72bc140bcc4fecb0c622298a6bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_xmit.c
+#	net/netfilter/nfnetlink_queue_core.c
+diff --cc net/netfilter/ipvs/ip_vs_xmit.c
+index 3e26710a0a98,f35c15b0de6b..000000000000
+--- a/net/netfilter/ipvs/ip_vs_xmit.c
++++ b/net/netfilter/ipvs/ip_vs_xmit.c
+@@@ -156,18 -157,113 +156,119 @@@ retry
+  	return rt;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_IP_VS_IPV6
++ static inline int __ip_vs_is_local_route6(struct rt6_info *rt)
++ {
++ 	return rt->dst.dev && rt->dst.dev->flags & IFF_LOOPBACK;
++ }
++ #endif
++ 
++ static inline bool crosses_local_route_boundary(int skb_af, struct sk_buff *skb,
++ 						int rt_mode,
++ 						bool new_rt_is_local)
++ {
++ 	bool rt_mode_allow_local = !!(rt_mode & IP_VS_RT_MODE_LOCAL);
++ 	bool rt_mode_allow_non_local = !!(rt_mode & IP_VS_RT_MODE_LOCAL);
++ 	bool rt_mode_allow_redirect = !!(rt_mode & IP_VS_RT_MODE_RDR);
++ 	bool source_is_loopback;
++ 	bool old_rt_is_local;
++ 
++ #ifdef CONFIG_IP_VS_IPV6
++ 	if (skb_af == AF_INET6) {
++ 		int addr_type = ipv6_addr_type(&ipv6_hdr(skb)->saddr);
++ 
++ 		source_is_loopback =
++ 			(!skb->dev || skb->dev->flags & IFF_LOOPBACK) &&
++ 			(addr_type & IPV6_ADDR_LOOPBACK);
++ 		old_rt_is_local = __ip_vs_is_local_route6(
++ 			(struct rt6_info *)skb_dst(skb));
++ 	} else
++ #endif
++ 	{
++ 		source_is_loopback = ipv4_is_loopback(ip_hdr(skb)->saddr);
++ 		old_rt_is_local = skb_rtable(skb)->rt_flags & RTCF_LOCAL;
++ 	}
++ 
++ 	if (unlikely(new_rt_is_local)) {
++ 		if (!rt_mode_allow_local)
++ 			return true;
++ 		if (!rt_mode_allow_redirect && !old_rt_is_local)
++ 			return true;
++ 	} else {
++ 		if (!rt_mode_allow_non_local)
++ 			return true;
++ 		if (source_is_loopback)
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ static inline void maybe_update_pmtu(int skb_af, struct sk_buff *skb, int mtu)
++ {
++ 	struct sock *sk = skb->sk;
++ 	struct rtable *ort = skb_rtable(skb);
++ 
++ 	if (!skb->dev && sk && sk_fullsock(sk))
++ 		ort->dst.ops->update_pmtu(&ort->dst, sk, NULL, mtu);
++ }
++ 
++ static inline bool ensure_mtu_is_adequate(int skb_af, int rt_mode,
++ 					  struct ip_vs_iphdr *ipvsh,
++ 					  struct sk_buff *skb, int mtu)
++ {
++ #ifdef CONFIG_IP_VS_IPV6
++ 	if (skb_af == AF_INET6) {
++ 		struct net *net = dev_net(skb_dst(skb)->dev);
++ 
++ 		if (unlikely(__mtu_check_toobig_v6(skb, mtu))) {
++ 			if (!skb->dev)
++ 				skb->dev = net->loopback_dev;
++ 			/* only send ICMP too big on first fragment */
++ 			if (!ipvsh->fragoffs)
++ 				icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
++ 			IP_VS_DBG(1, "frag needed for %pI6c\n",
++ 				  &ipv6_hdr(skb)->saddr);
++ 			return false;
++ 		}
++ 	} else
++ #endif
++ 	{
++ 		struct netns_ipvs *ipvs = net_ipvs(skb_net(skb));
++ 
++ 		/* If we're going to tunnel the packet and pmtu discovery
++ 		 * is disabled, we'll just fragment it anyway
++ 		 */
++ 		if ((rt_mode & IP_VS_RT_MODE_TUNNEL) && !sysctl_pmtu_disc(ipvs))
++ 			return true;
++ 
++ 		if (unlikely(ip_hdr(skb)->frag_off & htons(IP_DF) &&
++ 			     skb->len > mtu && !skb_is_gso(skb))) {
++ 			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
++ 				  htonl(mtu));
++ 			IP_VS_DBG(1, "frag needed for %pI4\n",
++ 				  &ip_hdr(skb)->saddr);
++ 			return false;
++ 		}
++ 	}
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> a8399231f0b6 (netfilter: use sk_fullsock() helper)
+  /* Get route to destination or remote server */
+  static int
+ -__ip_vs_get_out_rt(int skb_af, struct sk_buff *skb, struct ip_vs_dest *dest,
+ -		   __be32 daddr, int rt_mode, __be32 *ret_saddr,
+ -		   struct ip_vs_iphdr *ipvsh)
+ +__ip_vs_get_out_rt(struct sk_buff *skb, struct ip_vs_dest *dest,
+ +		   __be32 daddr, int rt_mode, __be32 *ret_saddr)
+  {
+  	struct net *net = dev_net(skb_dst(skb)->dev);
+ +	struct netns_ipvs *ipvs = net_ipvs(net);
+  	struct ip_vs_dest_dst *dest_dst;
+  	struct rtable *rt;			/* Route to the other host */
+ +	struct rtable *ort;			/* Original route */
+ +	struct iphdr *iph;
+ +	__be16 df;
+  	int mtu;
+  	int local, noref = 1;
+  
+diff --cc net/netfilter/nfnetlink_queue_core.c
+index b5cda594b57a,86ee8b05adae..000000000000
+--- a/net/netfilter/nfnetlink_queue_core.c
++++ b/net/netfilter/nfnetlink_queue_core.c
+@@@ -244,8 -253,33 +244,36 @@@ nfqnl_put_packet_info(struct sk_buff *n
+  	return flags ? nla_put_be32(nlskb, NFQA_SKB_INFO, htonl(flags)) : 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nfqnl_put_sk_uidgid(struct sk_buff *skb, struct sock *sk)
++ {
++ 	const struct cred *cred;
++ 
++ 	if (!sk_fullsock(sk))
++ 		return 0;
++ 
++ 	read_lock_bh(&sk->sk_callback_lock);
++ 	if (sk->sk_socket && sk->sk_socket->file) {
++ 		cred = sk->sk_socket->file->f_cred;
++ 		if (nla_put_be32(skb, NFQA_UID,
++ 		    htonl(from_kuid_munged(&init_user_ns, cred->fsuid))))
++ 			goto nla_put_failure;
++ 		if (nla_put_be32(skb, NFQA_GID,
++ 		    htonl(from_kgid_munged(&init_user_ns, cred->fsgid))))
++ 			goto nla_put_failure;
++ 	}
++ 	read_unlock_bh(&sk->sk_callback_lock);
++ 	return 0;
++ 
++ nla_put_failure:
++ 	read_unlock_bh(&sk->sk_callback_lock);
++ 	return -1;
++ }
++ 
+++>>>>>>> a8399231f0b6 (netfilter: use sk_fullsock() helper)
+  static struct sk_buff *
+ -nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
+ +nfqnl_build_packet_message(struct nfqnl_instance *queue,
+  			   struct nf_queue_entry *entry,
+  			   __be32 **packet_id_ptr)
+  {
+* Unmerged path net/netfilter/ipvs/ip_vs_xmit.c
+diff --git a/net/netfilter/nf_log_common.c b/net/netfilter/nf_log_common.c
+index eeb8ef4ff1a3..a3263b501e9c 100644
+--- a/net/netfilter/nf_log_common.c
++++ b/net/netfilter/nf_log_common.c
+@@ -133,7 +133,7 @@ EXPORT_SYMBOL_GPL(nf_log_dump_tcp_header);
+ 
+ void nf_log_dump_sk_uid_gid(struct nf_log_buf *m, struct sock *sk)
+ {
+-	if (!sk || sk->sk_state == TCP_TIME_WAIT)
++	if (!sk || !sk_fullsock(sk))
+ 		return;
+ 
+ 	read_lock_bh(&sk->sk_callback_lock);
+diff --git a/net/netfilter/nfnetlink_log.c b/net/netfilter/nfnetlink_log.c
+index 096d94c457ab..1325ee55db5c 100644
+--- a/net/netfilter/nfnetlink_log.c
++++ b/net/netfilter/nfnetlink_log.c
+@@ -536,7 +536,7 @@ __build_packet_message(struct nfnl_log_net *log,
+ 
+ 	/* UID */
+ 	sk = skb->sk;
+-	if (sk && sk->sk_state != TCP_TIME_WAIT) {
++	if (sk && sk_fullsock(sk)) {
+ 		read_lock_bh(&sk->sk_callback_lock);
+ 		if (sk->sk_socket && sk->sk_socket->file) {
+ 			struct file *file = sk->sk_socket->file;
+* Unmerged path net/netfilter/nfnetlink_queue_core.c
+diff --git a/net/netfilter/nft_meta.c b/net/netfilter/nft_meta.c
+index e99911eda915..abe68119a76c 100644
+--- a/net/netfilter/nft_meta.c
++++ b/net/netfilter/nft_meta.c
+@@ -83,7 +83,7 @@ void nft_meta_get_eval(const struct nft_expr *expr,
+ 		*(u16 *)dest->data = out->type;
+ 		break;
+ 	case NFT_META_SKUID:
+-		if (skb->sk == NULL || skb->sk->sk_state == TCP_TIME_WAIT)
++		if (skb->sk == NULL || !sk_fullsock(skb->sk))
+ 			goto err;
+ 
+ 		read_lock_bh(&skb->sk->sk_callback_lock);
+@@ -99,7 +99,7 @@ void nft_meta_get_eval(const struct nft_expr *expr,
+ 		read_unlock_bh(&skb->sk->sk_callback_lock);
+ 		break;
+ 	case NFT_META_SKGID:
+-		if (skb->sk == NULL || skb->sk->sk_state == TCP_TIME_WAIT)
++		if (skb->sk == NULL || !sk_fullsock(skb->sk))
+ 			goto err;
+ 
+ 		read_lock_bh(&skb->sk->sk_callback_lock);
