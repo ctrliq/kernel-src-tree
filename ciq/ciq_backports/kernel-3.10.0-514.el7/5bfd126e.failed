@@ -1,0 +1,193 @@
+sched/deadline: Fix sched_yield() behavior
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@gmail.com>
+commit 5bfd126e80dca70431aef8fdbc1cf14535f3c338
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5bfd126e.failed
+
+yield_task_dl() is broken:
+
+ o it forces current to be throttled setting its runtime to zero;
+ o it sets current's dl_se->dl_new to one, expecting that dl_task_timer()
+   will queue it back with proper parameters at replenish time.
+
+Unfortunately, dl_task_timer() has this check at the very beginning:
+
+	if (!dl_task(p) || dl_se->dl_new)
+		goto unlock;
+
+So, it just bails out and the task is never replenished. It actually
+yielded forever.
+
+To fix this, introduce a new flag indicating that the task properly yielded
+the CPU before its current runtime expired. While this is a little overdoing
+at the moment, the flag would be useful in the future to discriminate between
+"good" jobs (of which remaining runtime could be reclaimed, i.e. recycled)
+and "bad" jobs (for which dl_throttled task has been set) that needed to be
+stopped.
+
+	Reported-by: yjay.kim <yjay.kim@lge.com>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20140429103953.e68eba1b2ac3309214e3dc5a@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 5bfd126e80dca70431aef8fdbc1cf14535f3c338)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+diff --cc include/linux/sched.h
+index e57aba91f593,2a4298fb0d85..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1104,6 -1118,54 +1104,57 @@@ struct sched_rt_entity 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct sched_dl_entity {
++ 	struct rb_node	rb_node;
++ 
++ 	/*
++ 	 * Original scheduling parameters. Copied here from sched_attr
++ 	 * during sched_setscheduler2(), they will remain the same until
++ 	 * the next sched_setscheduler2().
++ 	 */
++ 	u64 dl_runtime;		/* maximum runtime for each instance	*/
++ 	u64 dl_deadline;	/* relative deadline of each instance	*/
++ 	u64 dl_period;		/* separation of two instances (period) */
++ 	u64 dl_bw;		/* dl_runtime / dl_deadline		*/
++ 
++ 	/*
++ 	 * Actual scheduling parameters. Initialized with the values above,
++ 	 * they are continously updated during task execution. Note that
++ 	 * the remaining runtime could be < 0 in case we are in overrun.
++ 	 */
++ 	s64 runtime;		/* remaining runtime for this instance	*/
++ 	u64 deadline;		/* absolute deadline for this instance	*/
++ 	unsigned int flags;	/* specifying the scheduler behaviour	*/
++ 
++ 	/*
++ 	 * Some bool flags:
++ 	 *
++ 	 * @dl_throttled tells if we exhausted the runtime. If so, the
++ 	 * task has to wait for a replenishment to be performed at the
++ 	 * next firing of dl_timer.
++ 	 *
++ 	 * @dl_new tells if a new instance arrived. If so we must
++ 	 * start executing it with full runtime and reset its absolute
++ 	 * deadline;
++ 	 *
++ 	 * @dl_boosted tells if we are boosted due to DI. If so we are
++ 	 * outside bandwidth enforcement mechanism (but only until we
++ 	 * exit the critical section);
++ 	 *
++ 	 * @dl_yielded tells if task gave up the cpu before consuming
++ 	 * all its available runtime during the last job.
++ 	 */
++ 	int dl_throttled, dl_new, dl_boosted, dl_yielded;
++ 
++ 	/*
++ 	 * Bandwidth enforcement timer. Each -deadline task has its
++ 	 * own bandwidth to be enforced, thus we need one timer per task.
++ 	 */
++ 	struct hrtimer dl_timer;
++ };
+++>>>>>>> 5bfd126e80dc (sched/deadline: Fix sched_yield() behavior)
+  
+  struct rcu_node;
+  
+diff --cc kernel/sched/core.c
+index f8654b1100de,e62c65a12d5b..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4083,16 -3103,70 +4083,40 @@@ static struct task_struct *find_process
+  	return pid ? find_task_by_vpid(pid) : current;
+  }
+  
+ -/*
+ - * This function initializes the sched_dl_entity of a newly becoming
+ - * SCHED_DEADLINE task.
+ - *
+ - * Only the static values are considered here, the actual runtime and the
+ - * absolute deadline will be properly calculated when the task is enqueued
+ - * for the first time with its new policy.
+ - */
+ +/* Actually do priority change: must hold rq lock. */
+  static void
+ -__setparam_dl(struct task_struct *p, const struct sched_attr *attr)
+ +__setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	init_dl_task_timer(dl_se);
++ 	dl_se->dl_runtime = attr->sched_runtime;
++ 	dl_se->dl_deadline = attr->sched_deadline;
++ 	dl_se->dl_period = attr->sched_period ?: dl_se->dl_deadline;
++ 	dl_se->flags = attr->sched_flags;
++ 	dl_se->dl_bw = to_ratio(dl_se->dl_period, dl_se->dl_runtime);
++ 	dl_se->dl_throttled = 0;
++ 	dl_se->dl_new = 1;
++ 	dl_se->dl_yielded = 0;
++ }
++ 
++ static void __setscheduler_params(struct task_struct *p,
++ 		const struct sched_attr *attr)
++ {
++ 	int policy = attr->sched_policy;
++ 
++ 	if (policy == -1) /* setparam */
++ 		policy = p->policy;
++ 
+++>>>>>>> 5bfd126e80dc (sched/deadline: Fix sched_yield() behavior)
+  	p->policy = policy;
+ -
+ -	if (dl_policy(policy))
+ -		__setparam_dl(p, attr);
+ -	else if (fair_policy(policy))
+ -		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ -
+ -	/*
+ -	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+ -	 * !rt_policy. Always setting this ensures that things like
+ -	 * getparam()/getattr() don't report silly values for !rt tasks.
+ -	 */
+ -	p->rt_priority = attr->sched_priority;
+ +	p->rt_priority = prio;
+  	p->normal_prio = normal_prio(p);
+ -	set_load_weight(p);
+ -}
+ -
+ -/* Actually do priority change: must hold pi & rq lock. */
+ -static void __setscheduler(struct rq *rq, struct task_struct *p,
+ -			   const struct sched_attr *attr)
+ -{
+ -	__setscheduler_params(p, attr);
+ -
+ -	/*
+ -	 * If we get here, there was no pi waiters boosting the
+ -	 * task. It is safe to use the normal prio.
+ -	 */
+ -	p->prio = normal_prio(p);
+ -
+ -	if (dl_prio(p->prio))
+ -		p->sched_class = &dl_sched_class;
+ -	else if (rt_prio(p->prio))
+ +	/* we are holding p->pi_lock already */
+ +	p->prio = rt_mutex_getprio(p);
+ +	if (rt_prio(p->prio))
+  		p->sched_class = &rt_sched_class;
+  	else
+  		p->sched_class = &fair_sched_class;
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
