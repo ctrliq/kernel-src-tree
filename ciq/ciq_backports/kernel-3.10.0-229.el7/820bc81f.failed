@@ -1,0 +1,225 @@
+perf tools: Account entry stats when it's added to the output tree
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf: Account entry stats when it's added to the output tree (Jiri Olsa) [1134356]
+Rebuild_FUZZ: 95.24%
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 820bc81f4cdaac09a8f25040d3a20d86f3da292b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/820bc81f.failed
+
+Currently, accounting each sample is done in multiple places - once
+when adding them to the input tree, other when adding them to the
+output tree.  It's not only confusing but also can cause a subtle
+problem since concurrent processing like in perf top might see the
+updated stats before adding entries into the output tree - like seeing
+more (blank) lines at the end and/or slight inaccurate percentage.
+
+To fix this, only account the entries when it's moved into the output
+tree so that they cannot be seen prematurely.  There're some
+exceptional cases here and there - they should be addressed separately
+with comments.
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/1398327843-31845-7-git-send-email-namhyung@kernel.org
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+(cherry picked from commit 820bc81f4cdaac09a8f25040d3a20d86f3da292b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-report.c
+diff --cc tools/perf/builtin-report.c
+index e5db3d32cbee,89c95289fd51..000000000000
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@@ -74,31 -76,31 +74,51 @@@ static int report__config(const char *v
+  	return perf_default_config(var, value, cb);
+  }
+  
+ -static void report__inc_stats(struct report *rep, struct hist_entry *he)
+ +static int report__resolve_callchain(struct report *rep, struct symbol **parent,
+ +				     struct perf_evsel *evsel, struct addr_location *al,
+ +				     struct perf_sample *sample, struct machine *machine)
+  {
+++<<<<<<< HEAD
+ +	if ((sort__has_parent || symbol_conf.use_callchain) && sample->callchain) {
+ +		return machine__resolve_callchain(machine, evsel, al->thread, sample,
+ +						  parent, al, rep->max_stack);
+ +	}
+ +	return 0;
+++=======
++ 	/*
++ 	 * The @he is either of a newly created one or an existing one
++ 	 * merging current sample.  We only want to count a new one so
++ 	 * checking ->nr_events being 1.
++ 	 */
++ 	if (he->stat.nr_events == 1)
++ 		rep->nr_entries++;
++ 
++ 	/*
++ 	 * Only counts number of samples at this stage as it's more
++ 	 * natural to do it here and non-sample events are also
++ 	 * counted in perf_session_deliver_event().  The dump_trace
++ 	 * requires this info is ready before going to the output tree.
++ 	 */
++ 	hists__inc_nr_events(he->hists, PERF_RECORD_SAMPLE);
++ 	if (!he->filtered)
++ 		he->hists->stats.nr_non_filtered_samples++;
+++>>>>>>> 820bc81f4cda (perf tools: Account entry stats when it's added to the output tree)
+ +}
+ +
+ +static int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample)
+ +{
+ +	if (!symbol_conf.use_callchain)
+ +		return 0;
+ +	return callchain_append(he->callchain, &callchain_cursor, sample->period);
+  }
+  
+ -static int report__add_mem_hist_entry(struct report *rep, struct addr_location *al,
+ -				      struct perf_sample *sample, struct perf_evsel *evsel)
+ +static int report__add_mem_hist_entry(struct perf_tool *tool, struct addr_location *al,
+ +				      struct perf_sample *sample, struct perf_evsel *evsel,
+ +				      struct machine *machine, union perf_event *event)
+  {
+ +	struct report *rep = container_of(tool, struct report, tool);
+  	struct symbol *parent = NULL;
+ +	u8 cpumode = event->header.misc & PERF_RECORD_MISC_CPUMODE_MASK;
+  	struct hist_entry *he;
+  	struct mem_info *mi, *mx;
+  	uint64_t cost;
+@@@ -130,19 -132,19 +150,15 @@@
+  	if (!he)
+  		return -ENOMEM;
+  
+ -	if (ui__has_annotation()) {
+ -		err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
+ -		if (err)
+ -			goto out;
+ -
+ -		mx = he->mem_info;
+ -		err = addr_map_symbol__inc_samples(&mx->daddr, evsel->idx);
+ -		if (err)
+ -			goto out;
+ -	}
+ +	err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
+ +	if (err)
+ +		goto out;
+  
+ -	report__inc_stats(rep, he);
+ +	mx = he->mem_info;
+ +	err = addr_map_symbol__inc_samples(&mx->daddr, evsel->idx);
+ +	if (err)
+ +		goto out;
+  
+- 	evsel->hists.stats.total_period += cost;
+- 	hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+- 	if (!he->filtered)
+- 		evsel->hists.stats.nr_non_filtered_samples++;
+  	err = hist_entry__append_callchain(he, sample);
+  out:
+  	return err;
+@@@ -184,19 -183,19 +200,28 @@@ static int report__add_branch_hist_entr
+  		he = __hists__add_entry(&evsel->hists, al, parent, &bi[i], NULL,
+  					1, 1, 0);
+  		if (he) {
+ -			if (ui__has_annotation()) {
+ -				bx = he->branch_info;
+ -				err = addr_map_symbol__inc_samples(&bx->from,
+ -								   evsel->idx);
+ -				if (err)
+ -					goto out;
+ -
+ +			bx = he->branch_info;
+ +			err = addr_map_symbol__inc_samples(&bx->from, evsel->idx);
+ +			if (err)
+ +				goto out;
+ +
+++<<<<<<< HEAD
+ +			err = addr_map_symbol__inc_samples(&bx->to, evsel->idx);
+ +			if (err)
+ +				goto out;
+ +
+ +			evsel->hists.stats.total_period += 1;
+ +			hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+ +			if (!he->filtered)
+ +				evsel->hists.stats.nr_non_filtered_samples++;
+++=======
++ 				err = addr_map_symbol__inc_samples(&bx->to,
++ 								   evsel->idx);
++ 				if (err)
++ 					goto out;
++ 			}
++ 			report__inc_stats(rep, he);
+++>>>>>>> 820bc81f4cda (perf tools: Account entry stats when it's added to the output tree)
+  		} else
+  			goto out;
+  	}
+@@@ -228,11 -225,11 +253,19 @@@ static int report__add_hist_entry(struc
+  	if (err)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
+ +	evsel->hists.stats.total_period += sample->period;
+ +	if (!he->filtered)
+ +		evsel->hists.stats.nr_non_filtered_samples++;
+ +	hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+++=======
++ 	if (ui__has_annotation())
++ 		err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
++ 
++ 	report__inc_stats(rep, he);
++ 
+++>>>>>>> 820bc81f4cda (perf tools: Account entry stats when it's added to the output tree)
+  out:
+  	return err;
+  }
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index 36e3a284497c..b825225a409c 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -45,7 +45,7 @@ struct perf_annotate {
+ };
+ 
+ static int perf_evsel__add_sample(struct perf_evsel *evsel,
+-				  struct perf_sample *sample,
++				  struct perf_sample *sample __maybe_unused,
+ 				  struct addr_location *al,
+ 				  struct perf_annotate *ann)
+ {
+@@ -69,7 +69,6 @@ static int perf_evsel__add_sample(struct perf_evsel *evsel,
+ 		return -ENOMEM;
+ 
+ 	ret = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
+-	evsel->hists.stats.total_period += sample->period;
+ 	hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+ 	return ret;
+ }
+diff --git a/tools/perf/builtin-diff.c b/tools/perf/builtin-diff.c
+index 891f993f523b..1d51a949762f 100644
+--- a/tools/perf/builtin-diff.c
++++ b/tools/perf/builtin-diff.c
+@@ -341,11 +341,16 @@ static int diff__process_sample_event(struct perf_tool *tool __maybe_unused,
+ 		return -1;
+ 	}
+ 
+-	if (al.filtered == 0) {
+-		evsel->hists.stats.total_non_filtered_period += sample->period;
+-		evsel->hists.nr_non_filtered_entries++;
+-	}
++	/*
++	 * The total_period is updated here before going to the output
++	 * tree since normally only the baseline hists will call
++	 * hists__output_resort() and precompute needs the total
++	 * period in order to sort entries by percentage delta.
++	 */
+ 	evsel->hists.stats.total_period += sample->period;
++	if (!al.filtered)
++		evsel->hists.stats.total_non_filtered_period += sample->period;
++
+ 	return 0;
+ }
+ 
+* Unmerged path tools/perf/builtin-report.c
