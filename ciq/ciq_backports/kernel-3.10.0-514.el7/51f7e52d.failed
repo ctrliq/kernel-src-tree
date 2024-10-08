@@ -1,0 +1,370 @@
+ovl: share inode for hard link
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 51f7e52dc943468c6929fa0a82d4afac3c8e9636
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/51f7e52d.failed
+
+Inode attributes are copied up to overlay inode (uid, gid, mode, atime,
+mtime, ctime) so generic code using these fields works correcty.  If a hard
+link is created in overlayfs separate inodes are allocated for each link.
+If chmod/chown/etc. is performed on one of the links then the inode
+belonging to the other ones won't be updated.
+
+This patch attempts to fix this by sharing inodes for hard links.
+
+Use inode hash (with real inode pointer as a key) to make sure overlay
+inodes are shared for hard links on upper.  Hard links on lower are still
+split (which is not user observable until the copy-up happens, see
+Documentation/filesystems/overlayfs.txt under "Non-standard behavior").
+
+The inode is only inserted in the hash if it is non-directoy and upper.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 51f7e52dc943468c6929fa0a82d4afac3c8e9636)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/dir.c
+#	fs/overlayfs/inode.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/super.c
+diff --cc fs/overlayfs/dir.c
+index 02a117bdec65,d456e9fb012a..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -164,7 -167,13 +164,17 @@@ static void ovl_instantiate(struct dent
+  {
+  	ovl_dentry_version_inc(dentry->d_parent);
+  	ovl_dentry_update(dentry, newdentry);
+++<<<<<<< HEAD
+ +	ovl_copyattr(newdentry->d_inode, inode);
+++=======
++ 	if (!hardlink) {
++ 		ovl_inode_update(inode, d_inode(newdentry));
++ 		ovl_copyattr(newdentry->d_inode, inode);
++ 	} else {
++ 		WARN_ON(ovl_inode_real(inode, NULL) != d_inode(newdentry));
++ 		inc_nlink(inode);
++ 	}
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  	d_instantiate(dentry, inode);
+  }
+  
+@@@ -354,7 -363,23 +364,27 @@@ static int ovl_create_over_whiteout(str
+  	if (err)
+  		goto out_dput2;
+  
+++<<<<<<< HEAD
+ +	if (S_ISDIR(stat->mode)) {
+++=======
++ 	/*
++ 	 * mode could have been mutilated due to umask (e.g. sgid directory)
++ 	 */
++ 	if (!hardlink &&
++ 	    !S_ISLNK(stat->mode) && newdentry->d_inode->i_mode != stat->mode) {
++ 		struct iattr attr = {
++ 			.ia_valid = ATTR_MODE,
++ 			.ia_mode = stat->mode,
++ 		};
++ 		inode_lock(newdentry->d_inode);
++ 		err = notify_change(newdentry, &attr, NULL);
++ 		inode_unlock(newdentry->d_inode);
++ 		if (err)
++ 			goto out_cleanup;
++ 	}
++ 
++ 	if (!hardlink && S_ISDIR(stat->mode)) {
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  		err = ovl_set_opaque(newdentry);
+  		if (err)
+  			goto out_cleanup;
+@@@ -386,52 -411,42 +416,78 @@@ out_cleanup
+  	goto out_dput2;
+  }
+  
+- static int ovl_create_or_link(struct dentry *dentry, int mode, dev_t rdev,
+- 			      const char *link, struct dentry *hardlink)
++ static int ovl_create_or_link(struct dentry *dentry, struct inode *inode,
++ 			      struct kstat *stat, const char *link,
++ 			      struct dentry *hardlink)
+  {
+  	int err;
+++<<<<<<< HEAD
+ +	struct inode *inode;
+ +	struct kstat stat = {
+ +		.mode = mode,
+ +		.rdev = rdev,
+ +	};
+ +
+ +	err = -ENOMEM;
+ +	inode = ovl_new_inode(dentry->d_sb, mode, dentry->d_fsdata);
+ +	if (!inode)
+ +		goto out;
+ +
+ +	err = ovl_copy_up(dentry->d_parent);
+ +	if (err)
+ +		goto out_iput;
+ +
+ +	if (!ovl_dentry_is_opaque(dentry)) {
+ +		err = ovl_create_upper(dentry, inode, &stat, link, hardlink);
+ +	} else {
+ +		const struct cred *old_cred;
+ +		struct cred *override_cred;
+++=======
++ 	const struct cred *old_cred;
++ 	struct cred *override_cred;
++ 
++ 	err = ovl_copy_up(dentry->d_parent);
++ 	if (err)
++ 		return err;
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  
+ -	old_cred = ovl_override_creds(dentry->d_sb);
+ -	err = -ENOMEM;
+ -	override_cred = prepare_creds();
+ -	if (override_cred) {
+ -		override_cred->fsuid = inode->i_uid;
+ -		override_cred->fsgid = inode->i_gid;
+ -		put_cred(override_creds(override_cred));
+ -		put_cred(override_cred);
+ +		old_cred = ovl_override_creds(dentry->d_sb);
+ +
+ +		err = -ENOMEM;
+ +		override_cred = prepare_creds();
+ +		if (override_cred) {
+ +			override_cred->fsuid = old_cred->fsuid;
+ +			override_cred->fsgid = old_cred->fsgid;
+ +			put_cred(override_creds(override_cred));
+ +			put_cred(override_cred);
+  
+++<<<<<<< HEAD
+ +			err = ovl_create_over_whiteout(dentry, inode, &stat,
+ +						       link, hardlink);
+ +		}
+ +		revert_creds(old_cred);
+++=======
++ 		if (!ovl_dentry_is_opaque(dentry))
++ 			err = ovl_create_upper(dentry, inode, stat, link,
++ 						hardlink);
++ 		else
++ 			err = ovl_create_over_whiteout(dentry, inode, stat,
++ 							link, hardlink);
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  	}
+ -	revert_creds(old_cred);
+ -	if (!err) {
+ -		struct inode *realinode = d_inode(ovl_dentry_upper(dentry));
+  
+++<<<<<<< HEAD
+ +	if (!err)
+ +		inode = NULL;
+ +out_iput:
+ +	iput(inode);
+ +out:
+++=======
++ 		WARN_ON(inode->i_mode != realinode->i_mode);
++ 		WARN_ON(!uid_eq(inode->i_uid, realinode->i_uid));
++ 		WARN_ON(!gid_eq(inode->i_gid, realinode->i_gid));
++ 	}
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  	return err;
+  }
+  
+@@@ -645,15 -689,15 +722,21 @@@ static int ovl_do_remove(struct dentry 
+  		goto out_drop_write;
+  
+  	type = ovl_path_type(dentry);
+ -
+ -	old_cred = ovl_override_creds(dentry->d_sb);
+ -	if (OVL_TYPE_PURE_UPPER(type))
+ +	if (OVL_TYPE_PURE_UPPER(type)) {
+  		err = ovl_remove_upper(dentry, is_dir);
+ -	else
+ +	} else {
+ +		const struct cred *old_cred = ovl_override_creds(dentry->d_sb);
+ +
+  		err = ovl_remove_and_whiteout(dentry, is_dir);
+++<<<<<<< HEAD
+ +
+ +		revert_creds(old_cred);
+ +	}
+++=======
++ 	revert_creds(old_cred);
++ 	if (!err && !is_dir)
++ 		drop_nlink(dentry->d_inode);
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  out_drop_write:
+  	ovl_drop_write(dentry);
+  out:
+diff --cc fs/overlayfs/inode.c
+index f3730d33febd,6be0d276fd05..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -411,20 -406,14 +411,18 @@@ static const struct inode_operations ov
+  	.getxattr	= ovl_getxattr,
+  	.listxattr	= ovl_listxattr,
+  	.removexattr	= ovl_removexattr,
+ -	.update_time	= ovl_update_time,
+  };
+  
+++<<<<<<< HEAD
+ +struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+ +			    struct ovl_entry *oe)
+++=======
++ static void ovl_fill_inode(struct inode *inode, umode_t mode)
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  {
+- 	struct inode *inode;
+- 
+- 	inode = new_inode(sb);
+- 	if (!inode)
+- 		return NULL;
+- 
+  	inode->i_ino = get_next_ino();
+  	inode->i_mode = mode;
+ -	inode->i_flags |= S_NOCMTIME;
+ +	inode->i_flags |= S_NOATIME | S_NOCMTIME;
+  
+  	mode &= S_IFMT;
+  	switch (mode) {
+@@@ -444,14 -435,44 +446,45 @@@
+  	case S_IFBLK:
+  	case S_IFCHR:
+  	case S_IFIFO:
+ -		inode->i_op = &ovl_file_inode_operations;
+ +		inode->i_op = &ovl_file_inode_operations.ops;
+ +		inode->i_flags |= S_IOPS_WRAPPER;
+  		break;
++ 	}
++ }
+  
+- 	default:
+- 		WARN(1, "illegal file type: %i\n", mode);
+- 		iput(inode);
+- 		inode = NULL;
++ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode)
++ {
++ 	struct inode *inode;
++ 
++ 	inode = new_inode(sb);
++ 	if (inode)
++ 		ovl_fill_inode(inode, mode);
++ 
++ 	return inode;
++ }
++ 
++ static int ovl_inode_test(struct inode *inode, void *data)
++ {
++ 	return ovl_inode_real(inode, NULL) == data;
++ }
++ 
++ static int ovl_inode_set(struct inode *inode, void *data)
++ {
++ 	inode->i_private = (void *) (((unsigned long) data) | OVL_ISUPPER_MASK);
++ 	return 0;
++ }
++ 
++ struct inode *ovl_get_inode(struct super_block *sb, struct inode *realinode)
++ 
++ {
++ 	struct inode *inode;
++ 
++ 	inode = iget5_locked(sb, (unsigned long) realinode,
++ 			     ovl_inode_test, ovl_inode_set, realinode);
++ 	if (inode && inode->i_state & I_NEW) {
++ 		ovl_fill_inode(inode, realinode->i_mode);
++ 		set_nlink(inode, realinode->i_nlink);
++ 		unlock_new_inode(inode);
+  	}
+  
+  	return inode;
+diff --cc fs/overlayfs/overlayfs.h
+index 759da49141dd,abeef1e6db56..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -172,15 -183,19 +172,20 @@@ int ovl_check_d_type_supported(struct p
+  /* inode.c */
+  int ovl_setattr(struct dentry *dentry, struct iattr *attr);
+  int ovl_permission(struct inode *inode, int mask);
+ -int ovl_setxattr(struct dentry *dentry, struct inode *inode,
+ -		 const char *name, const void *value,
+ -		 size_t size, int flags);
+ -ssize_t ovl_getxattr(struct dentry *dentry, struct inode *inode,
+ -		     const char *name, void *value, size_t size);
+ +int ovl_setxattr(struct dentry *dentry, const char *name,
+ +		 const void *value, size_t size, int flags);
+ +ssize_t ovl_getxattr(struct dentry *dentry, const char *name,
+ +		     void *value, size_t size);
+  ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size);
+  int ovl_removexattr(struct dentry *dentry, const char *name);
+ -struct posix_acl *ovl_get_acl(struct inode *inode, int type);
+ -int ovl_open_maybe_copy_up(struct dentry *dentry, unsigned int file_flags);
+ -int ovl_update_time(struct inode *inode, struct timespec *ts, int flags);
+  
+++<<<<<<< HEAD
+ +struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+ +			    struct ovl_entry *oe);
+++=======
++ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode);
++ struct inode *ovl_get_inode(struct super_block *sb, struct inode *realinode);
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  static inline void ovl_copyattr(struct inode *from, struct inode *to)
+  {
+  	to->i_uid = from->i_uid;
+diff --cc fs/overlayfs/super.c
+index 0c25e8accae5,44c4510f5adf..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -243,6 -229,16 +243,19 @@@ void ovl_dentry_update(struct dentry *d
+  	oe->__upperdentry = upperdentry;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void ovl_inode_update(struct inode *inode, struct inode *upperinode)
++ {
++ 	WARN_ON(!upperinode);
++ 	WARN_ON(!inode_unhashed(inode));
++ 	WRITE_ONCE(inode->i_private,
++ 		   (unsigned long) upperinode | OVL_ISUPPER_MASK);
++ 	if (!S_ISDIR(upperinode->i_mode))
++ 		__insert_inode_hash(inode, (unsigned long) upperinode);
++ }
++ 
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  void ovl_dentry_version_inc(struct dentry *dentry)
+  {
+  	struct ovl_entry *oe = dentry->d_fsdata;
+@@@ -528,12 -569,19 +541,22 @@@ struct dentry *ovl_lookup(struct inode 
+  
+  	if (upperdentry || ctr) {
+  		struct dentry *realdentry;
+ -		struct inode *realinode;
+  
+  		realdentry = upperdentry ? upperdentry : stack[0].dentry;
+ -		realinode = d_inode(realdentry);
+  
+  		err = -ENOMEM;
+++<<<<<<< HEAD
+ +		inode = ovl_new_inode(dentry->d_sb, realdentry->d_inode->i_mode,
+ +				      oe);
+++=======
++ 		if (upperdentry && !d_is_dir(upperdentry)) {
++ 			inode = ovl_get_inode(dentry->d_sb, realinode);
++ 		} else {
++ 			inode = ovl_new_inode(dentry->d_sb, realinode->i_mode);
++ 			if (inode)
++ 				ovl_inode_init(inode, realinode, !!upperdentry);
++ 		}
+++>>>>>>> 51f7e52dc943 (ovl: share inode for hard link)
+  		if (!inode)
+  			goto out_free_oe;
+  		ovl_copyattr(realdentry->d_inode, inode);
+* Unmerged path fs/overlayfs/dir.c
+* Unmerged path fs/overlayfs/inode.c
+* Unmerged path fs/overlayfs/overlayfs.h
+* Unmerged path fs/overlayfs/super.c
