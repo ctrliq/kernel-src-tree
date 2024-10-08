@@ -1,0 +1,201 @@
+bonding: move bond-specific init after enslave happens
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Veaceslav Falico <vfalico@redhat.com>
+commit 5378c2e6ea236de847a39bdb6f3aa83137120d26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5378c2e6.failed
+
+As Jiri noted, currently we first do all bonding-specific initialization
+(specifically - bond_select_active_slave(bond)) before we actually attach
+the slave (so that it becomes visible through bond_for_each_slave() and
+friends). This might result in bond_select_active_slave() not seeing the
+first/new slave and, thus, not actually selecting an active slave.
+
+Fix this by moving all the bond-related init part after we've actually
+completely initialized and linked (via bond_master_upper_dev_link()) the
+new slave.
+
+Also, remove the bond_(de/a)ttach_slave(), it's useless to have functions
+to ++/-- one int.
+
+After this we have all the initialization of the new slave *before*
+linking, and all the stuff that needs to be done on bonding *after* it. It
+has also a bonus effect - we can remove the locking on the new slave init
+completely, and only use it for bond_select_active_slave().
+
+	Reported-by: Jiri Pirko <jiri@resnulli.us>
+CC: Jay Vosburgh <fubar@us.ibm.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Veaceslav Falico <vfalico@redhat.com>
+	Acked-by: Ding Tianhong@huawei.com
+	Reviewed-by: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5378c2e6ea236de847a39bdb6f3aa83137120d26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index f2744db511b6,2daa066c6cdd..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1172,60 -967,6 +1172,63 @@@ void bond_select_active_slave(struct bo
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*--------------------------- slave list handling ---------------------------*/
+ +
+ +/*
+ + * This function attaches the slave to the end of list.
+ + *
+ + * bond->lock held for writing by caller.
+ + */
+ +static void bond_attach_slave(struct bonding *bond, struct slave *new_slave)
+ +{
+ +	if (bond->first_slave == NULL) { /* attaching the first slave */
+ +		new_slave->next = new_slave;
+ +		new_slave->prev = new_slave;
+ +		bond->first_slave = new_slave;
+ +	} else {
+ +		new_slave->next = bond->first_slave;
+ +		new_slave->prev = bond->first_slave->prev;
+ +		new_slave->next->prev = new_slave;
+ +		new_slave->prev->next = new_slave;
+ +	}
+ +
+ +	bond->slave_cnt++;
+ +}
+ +
+ +/*
+ + * This function detaches the slave from the list.
+ + * WARNING: no check is made to verify if the slave effectively
+ + * belongs to <bond>.
+ + * Nothing is freed on return, structures are just unchained.
+ + * If any slave pointer in bond was pointing to <slave>,
+ + * it should be changed by the calling function.
+ + *
+ + * bond->lock held for writing by caller.
+ + */
+ +static void bond_detach_slave(struct bonding *bond, struct slave *slave)
+ +{
+ +	if (slave->next)
+ +		slave->next->prev = slave->prev;
+ +
+ +	if (slave->prev)
+ +		slave->prev->next = slave->next;
+ +
+ +	if (bond->first_slave == slave) { /* slave is the first slave */
+ +		if (bond->slave_cnt > 1) { /* there are more slave */
+ +			bond->first_slave = slave->next;
+ +		} else {
+ +			bond->first_slave = NULL; /* slave was the last one */
+ +		}
+ +	}
+ +
+ +	slave->next = NULL;
+ +	slave->prev = NULL;
+ +	bond->slave_cnt--;
+ +}
+ +
+++=======
+++>>>>>>> 5378c2e6ea23 (bonding: move bond-specific init after enslave happens)
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  static inline int slave_enable_netpoll(struct slave *slave)
+  {
+@@@ -1698,11 -1437,14 +1701,15 @@@ int bond_enslave(struct net_device *bon
+  		dev_mc_add(slave_dev, lacpdu_multicast);
+  	}
+  
+ -	res = vlan_vids_add_by_dev(slave_dev, bond_dev);
+ -	if (res) {
+ -		pr_err("%s: Error: Couldn't add bond vlan ids to %s\n",
+ -		       bond_dev->name, slave_dev->name);
+ -		goto err_close;
+ -	}
+ +	bond_add_vlans_on_slave(bond, slave_dev);
+ +
+++<<<<<<< HEAD
+ +	write_lock_bh(&bond->lock);
+  
+ +	bond_attach_slave(bond, new_slave);
+++=======
++ 	prev_slave = bond_last_slave(bond);
+++>>>>>>> 5378c2e6ea23 (bonding: move bond-specific init after enslave happens)
+  
+  	new_slave->delay = 0;
+  	new_slave->link_failure_count = 0;
+@@@ -1842,12 -1570,6 +1835,15 @@@
+  	}
+  #endif
+  
+++<<<<<<< HEAD
+ +	read_unlock(&bond->lock);
+ +
+ +	res = bond_create_slave_symlinks(bond_dev, slave_dev);
+ +	if (res)
+ +		goto err_detach;
+ +
+++=======
+++>>>>>>> 5378c2e6ea23 (bonding: move bond-specific init after enslave happens)
+  	res = netdev_rx_handler_register(slave_dev, bond_handle_frame,
+  					 new_slave);
+  	if (res) {
+@@@ -1874,18 -1607,12 +1881,17 @@@
+  err_unregister:
+  	netdev_rx_handler_unregister(slave_dev);
+  
+ -err_detach:
+ -	if (!USES_PRIMARY(bond->params.mode))
+ -		bond_hw_addr_flush(bond_dev, slave_dev);
+ +err_dest_symlinks:
+ +	bond_destroy_slave_symlinks(bond_dev, slave_dev);
+  
+ -	vlan_vids_del_by_dev(slave_dev, bond_dev);
+ +err_detach:
+ +	if (!USES_PRIMARY(bond->params.mode)) {
+ +		netif_addr_lock_bh(bond_dev);
+ +		bond_mc_list_flush(bond_dev, slave_dev);
+ +		netif_addr_unlock_bh(bond_dev);
+ +	}
+ +	bond_del_vlans_from_slave(bond, slave_dev);
+  	write_lock_bh(&bond->lock);
+- 	bond_detach_slave(bond, new_slave);
+  	if (bond->primary_slave == new_slave)
+  		bond->primary_slave = NULL;
+  	if (bond->curr_active_slave == new_slave) {
+@@@ -1923,9 -1650,8 +1929,8 @@@ err_free
+  	kfree(new_slave);
+  
+  err_undo_flags:
+- 	bond_compute_features(bond);
+  	/* Enslave of first slave has failed and we need to fix master's mac */
+ -	if (!bond_has_slaves(bond) &&
+ +	if (bond->slave_cnt == 0 &&
+  	    ether_addr_equal(bond_dev->dev_addr, slave_dev->dev_addr))
+  		eth_hw_addr_random(bond_dev);
+  
+@@@ -2010,8 -1730,14 +2018,19 @@@ static int __bond_release_one(struct ne
+  
+  	bond->current_arp_slave = NULL;
+  
+++<<<<<<< HEAD
+ +	/* release the slave from its bond */
+ +	bond_detach_slave(bond, slave);
+++=======
++ 	if (!all && !bond->params.fail_over_mac) {
++ 		if (ether_addr_equal(bond_dev->dev_addr, slave->perm_hwaddr) &&
++ 		    bond_has_slaves(bond))
++ 			pr_warn("%s: Warning: the permanent HWaddr of %s - %pM - is still in use by %s. Set the HWaddr of %s to a different address to avoid conflicts.\n",
++ 				   bond_dev->name, slave_dev->name,
++ 				   slave->perm_hwaddr,
++ 				   bond_dev->name, slave_dev->name);
++ 	}
+++>>>>>>> 5378c2e6ea23 (bonding: move bond-specific init after enslave happens)
+  
+  	if (bond->primary_slave == slave)
+  		bond->primary_slave = NULL;
+* Unmerged path drivers/net/bonding/bond_main.c
