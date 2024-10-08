@@ -1,0 +1,272 @@
+sctp: avoid refreshing heartbeat timer too often
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+commit ba6f5e33bdbb9ed2014b778fbbaecf20060ca989
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ba6f5e33.failed
+
+Currently on high rate SCTP streams the heartbeat timer refresh can
+consume quite a lot of resources as timer updates are costly and it
+contains a random factor, which a) is also costly and b) invalidates
+mod_timer() optimization for not editing a timer to the same value.
+It may even cause the timer to be slightly advanced, for no good reason.
+
+As suggested by David Laight this patch now removes this timer update
+from hot path by leaving the timer on and re-evaluating upon its
+expiration if the heartbeat is still needed or not, similarly to what is
+done for TCP. If it's not needed anymore the timer is re-scheduled to
+the new timeout, considering the time already elapsed.
+
+For this, we now record the last tx timestamp per transport, updated in
+the same spots as hb timer was restarted on tx. Also split up
+sctp_transport_reset_timers into sctp_transport_reset_t3_rtx and
+sctp_transport_reset_hb_timer, so we can re-arm T3 without re-arming the
+heartbeat one.
+
+On loopback with MTU of 65535 and data chunks with 1636, so that we
+have a considerable amount of chunks without stressing system calls,
+netperf -t SCTP_STREAM -l 30, perf looked like this before:
+
+Samples: 103K of event 'cpu-clock', Event count (approx.): 25833000000
+  Overhead  Command  Shared Object      Symbol
++    6,15%  netperf  [kernel.vmlinux]   [k] copy_user_enhanced_fast_string
+-    5,43%  netperf  [kernel.vmlinux]   [k] _raw_write_unlock_irqrestore
+   - _raw_write_unlock_irqrestore
+      - 96,54% _raw_spin_unlock_irqrestore
+         - 36,14% mod_timer
+            + 97,24% sctp_transport_reset_timers
+            + 2,76% sctp_do_sm
+         + 33,65% __wake_up_sync_key
+         + 28,77% sctp_ulpq_tail_event
+         + 1,40% del_timer
+      - 1,84% mod_timer
+         + 99,03% sctp_transport_reset_timers
+         + 0,97% sctp_do_sm
+      + 1,50% sctp_ulpq_tail_event
+
+And after this patch, now with netperf -l 60:
+
+Samples: 230K of event 'cpu-clock', Event count (approx.): 57707250000
+  Overhead  Command  Shared Object      Symbol
++    5,65%  netperf  [kernel.vmlinux]   [k] memcpy_erms
++    5,59%  netperf  [kernel.vmlinux]   [k] copy_user_enhanced_fast_string
+-    5,05%  netperf  [kernel.vmlinux]   [k] _raw_spin_unlock_irqrestore
+   - _raw_spin_unlock_irqrestore
+      + 49,89% __wake_up_sync_key
+      + 45,68% sctp_ulpq_tail_event
+      - 2,85% mod_timer
+         + 76,51% sctp_transport_reset_t3_rtx
+         + 23,49% sctp_do_sm
+      + 1,55% del_timer
++    2,50%  netperf  [sctp]             [k] sctp_datamsg_from_user
++    2,26%  netperf  [sctp]             [k] sctp_sendmsg
+
+Throughput-wise, from 6800mbps without the patch to 7050mbps with it,
+~3.7%.
+
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ba6f5e33bdbb9ed2014b778fbbaecf20060ca989)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/structs.h
+#	net/sctp/sm_sideeffect.c
+diff --cc include/net/sctp/structs.h
+index f67eb807b1dd,5a404c354f4c..000000000000
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@@ -854,11 -842,16 +854,16 @@@ struct sctp_transport 
+  	unsigned long sackdelay;
+  	__u32 sackfreq;
+  
+ -	/* When was the last time that we heard from this transport? We use
+ -	 * this to pick new active and retran paths.
+ +	/* When was the last time (in jiffies) that we heard from this
+ +	 * transport?  We use this to pick new active and retran paths.
+  	 */
+ -	ktime_t last_time_heard;
+ +	unsigned long last_time_heard;
+  
++ 	/* When was the last time that we sent a chunk using this
++ 	 * transport? We use this to check for idle transports
++ 	 */
++ 	unsigned long last_time_sent;
++ 
+  	/* Last time(in jiffies) when cwnd is reduced due to the congestion
+  	 * indication based on ECNE chunk.
+  	 */
+@@@ -964,8 -957,9 +969,14 @@@ void sctp_transport_route(struct sctp_t
+  			  struct sctp_sock *);
+  void sctp_transport_pmtu(struct sctp_transport *, struct sock *sk);
+  void sctp_transport_free(struct sctp_transport *);
+++<<<<<<< HEAD
+ +void sctp_transport_reset_timers(struct sctp_transport *);
+ +void sctp_transport_hold(struct sctp_transport *);
+++=======
++ void sctp_transport_reset_t3_rtx(struct sctp_transport *);
++ void sctp_transport_reset_hb_timer(struct sctp_transport *);
++ int sctp_transport_hold(struct sctp_transport *);
+++>>>>>>> ba6f5e33bdbb (sctp: avoid refreshing heartbeat timer too often)
+  void sctp_transport_put(struct sctp_transport *);
+  void sctp_transport_update_rto(struct sctp_transport *, __u32);
+  void sctp_transport_raise_cwnd(struct sctp_transport *, __u32, __u32);
+diff --cc net/sctp/sm_sideeffect.c
+index 3850ffd28208,41b081a64752..000000000000
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@@ -377,11 -363,13 +375,17 @@@ void sctp_generate_heartbeat_event(unsi
+  	int error = 0;
+  	struct sctp_transport *transport = (struct sctp_transport *) data;
+  	struct sctp_association *asoc = transport->asoc;
+++<<<<<<< HEAD
+ +	struct net *net = sock_net(asoc->base.sk);
+++=======
++ 	struct sock *sk = asoc->base.sk;
++ 	struct net *net = sock_net(sk);
++ 	u32 elapsed, timeout;
+++>>>>>>> ba6f5e33bdbb (sctp: avoid refreshing heartbeat timer too often)
+  
+ -	bh_lock_sock(sk);
+ -	if (sock_owned_by_user(sk)) {
+ -		pr_debug("%s: sock is busy\n", __func__);
+ +	sctp_bh_lock_sock(asoc->base.sk);
+ +	if (sock_owned_by_user(asoc->base.sk)) {
+ +		SCTP_DEBUG_PRINTK("%s:Sock is busy.\n", __func__);
+  
+  		/* Try again later.  */
+  		if (!mod_timer(&transport->hb_timer, jiffies + (HZ/20)))
+@@@ -389,11 -377,15 +393,23 @@@
+  		goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Is this structure just waiting around for us to actually
+ +	 * get destroyed?
+ +	 */
+ +	if (transport->dead)
+ +		goto out_unlock;
+++=======
++ 	/* Check if we should still send the heartbeat or reschedule */
++ 	elapsed = jiffies - transport->last_time_sent;
++ 	timeout = sctp_transport_timeout(transport);
++ 	if (elapsed < timeout) {
++ 		elapsed = timeout - elapsed;
++ 		if (!mod_timer(&transport->hb_timer, jiffies + elapsed))
++ 			sctp_transport_hold(transport);
++ 		goto out_unlock;
++ 	}
+++>>>>>>> ba6f5e33bdbb (sctp: avoid refreshing heartbeat timer too often)
+  
+  	error = sctp_do_sm(net, SCTP_EVENT_T_TIMEOUT,
+  			   SCTP_ST_TIMEOUT(SCTP_EVENT_TIMEOUT_HEARTBEAT),
+* Unmerged path include/net/sctp/structs.h
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index cb1123e96285..59ef5ad6b895 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -880,8 +880,10 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 				 * sender MUST assure that at least one T3-rtx
+ 				 * timer is running.
+ 				 */
+-				if (chunk->chunk_hdr->type == SCTP_CID_FWD_TSN)
+-					sctp_transport_reset_timers(transport);
++				if (chunk->chunk_hdr->type == SCTP_CID_FWD_TSN) {
++					sctp_transport_reset_t3_rtx(transport);
++					transport->last_time_sent = jiffies;
++				}
+ 			}
+ 			break;
+ 
+@@ -938,8 +940,10 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 			error = sctp_outq_flush_rtx(q, packet,
+ 						    rtx_timeout, &start_timer);
+ 
+-			if (start_timer)
+-				sctp_transport_reset_timers(transport);
++			if (start_timer) {
++				sctp_transport_reset_t3_rtx(transport);
++				transport->last_time_sent = jiffies;
++			}
+ 
+ 			/* This can happen on COOKIE-ECHO resend.  Only
+ 			 * one chunk can get bundled with a COOKIE-ECHO.
+@@ -1079,7 +1083,8 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 			list_add_tail(&chunk->transmitted_list,
+ 				      &transport->transmitted);
+ 
+-			sctp_transport_reset_timers(transport);
++			sctp_transport_reset_t3_rtx(transport);
++			transport->last_time_sent = jiffies;
+ 
+ 			q->empty = 0;
+ 
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index 226deffa4e7d..79fc3e55e39e 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -3039,8 +3039,7 @@ static __be16 sctp_process_asconf_param(struct sctp_association *asoc,
+ 			return SCTP_ERROR_RSRC_LOW;
+ 
+ 		/* Start the heartbeat timer. */
+-		if (!mod_timer(&peer->hb_timer, sctp_transport_timeout(peer)))
+-			sctp_transport_hold(peer);
++		sctp_transport_reset_hb_timer(peer);
+ 		asoc->new_transport = peer;
+ 		break;
+ 	case SCTP_PARAM_DEL_IP:
+* Unmerged path net/sctp/sm_sideeffect.c
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 5387cb44ad90..bff3af49fba6 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -189,7 +189,7 @@ static void sctp_transport_destroy(struct sctp_transport *transport)
+ /* Start T3_rtx timer if it is not already running and update the heartbeat
+  * timer.  This routine is called every time a DATA chunk is sent.
+  */
+-void sctp_transport_reset_timers(struct sctp_transport *transport)
++void sctp_transport_reset_t3_rtx(struct sctp_transport *transport)
+ {
+ 	/* RFC 2960 6.3.2 Retransmission Timer Rules
+ 	 *
+@@ -203,11 +203,18 @@ void sctp_transport_reset_timers(struct sctp_transport *transport)
+ 		if (!mod_timer(&transport->T3_rtx_timer,
+ 			       jiffies + transport->rto))
+ 			sctp_transport_hold(transport);
++}
++
++void sctp_transport_reset_hb_timer(struct sctp_transport *transport)
++{
++	unsigned long expires;
+ 
+ 	/* When a data chunk is sent, reset the heartbeat interval.  */
+-	if (!mod_timer(&transport->hb_timer,
+-		       sctp_transport_timeout(transport)))
+-	    sctp_transport_hold(transport);
++	expires = jiffies + sctp_transport_timeout(transport);
++	if (time_before(transport->hb_timer.expires, expires) &&
++	    !mod_timer(&transport->hb_timer,
++		       expires + prandom_u32_max(transport->rto)))
++		sctp_transport_hold(transport);
+ }
+ 
+ /* This transport has been assigned to an association.
+@@ -605,13 +612,13 @@ void sctp_transport_burst_reset(struct sctp_transport *t)
+ unsigned long sctp_transport_timeout(struct sctp_transport *trans)
+ {
+ 	/* RTO + timer slack +/- 50% of RTO */
+-	unsigned long timeout = (trans->rto >> 1) + prandom_u32_max(trans->rto);
++	unsigned long timeout = trans->rto >> 1;
+ 
+ 	if (trans->state != SCTP_UNCONFIRMED &&
+ 	    trans->state != SCTP_PF)
+ 		timeout += trans->hbinterval;
+ 
+-	return timeout + jiffies;
++	return timeout;
+ }
+ 
+ /* Reset transport variables to their initial values */
