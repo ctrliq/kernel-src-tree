@@ -1,0 +1,352 @@
+powerpc/eeh: Rename flag EEH_PE_RESET to EEH_PE_CFG_BLOCKED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Rename flag EEH_PE_RESET to EEH_PE_CFG_BLOCKED (Laurent Vivier) [1213675]
+Rebuild_FUZZ: 92.73%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit 8a6b3710ccc33da1fd5c85144ad3db01c4457552
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8a6b3710.failed
+
+The flag EEH_PE_RESET indicates blocking config space of the PE
+during reset time. We potentially need block PE's config space
+other than reset time. So it's reasonable to replace it with
+EEH_PE_CFG_BLOCKED to indicate its usage.
+
+There are no substantial code or logic changes in this patch.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8a6b3710ccc33da1fd5c85144ad3db01c4457552)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/eeh.c
+#	arch/powerpc/kernel/eeh_driver.c
+#	arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --cc arch/powerpc/kernel/eeh.c
+index 512a1e0cfb54,4d83f50cc614..000000000000
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@@ -1481,6 -1523,7 +1481,10 @@@ int eeh_pe_reset(struct eeh_pe *pe, in
+  	switch (option) {
+  	case EEH_RESET_DEACTIVATE:
+  		ret = eeh_ops->reset(pe, option);
+++<<<<<<< HEAD
+++=======
++ 		eeh_pe_state_clear(pe, EEH_PE_CFG_BLOCKED);
+++>>>>>>> 8a6b3710ccc3 (powerpc/eeh: Rename flag EEH_PE_RESET to EEH_PE_CFG_BLOCKED)
+  		if (ret)
+  			break;
+  
+@@@ -1488,6 -1531,14 +1492,17 @@@
+  		break;
+  	case EEH_RESET_HOT:
+  	case EEH_RESET_FUNDAMENTAL:
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * Proactively freeze the PE to drop all MMIO access
++ 		 * during reset, which should be banned as it's always
++ 		 * cause recursive EEH error.
++ 		 */
++ 		eeh_ops->set_option(pe, EEH_OPT_FREEZE_PE);
++ 
++ 		eeh_pe_state_mark(pe, EEH_PE_CFG_BLOCKED);
+++>>>>>>> 8a6b3710ccc3 (powerpc/eeh: Rename flag EEH_PE_RESET to EEH_PE_CFG_BLOCKED)
+  		ret = eeh_ops->reset(pe, option);
+  		break;
+  	default:
+diff --cc arch/powerpc/kernel/eeh_driver.c
+index 420da61d4ce0,6535936bdf27..000000000000
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@@ -482,6 -510,54 +482,57 @@@ static int eeh_clear_pe_frozen_state(st
+  	return rc ? -EIO : 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int eeh_pe_reset_and_recover(struct eeh_pe *pe)
++ {
++ 	int result, ret;
++ 
++ 	/* Bail if the PE is being recovered */
++ 	if (pe->state & EEH_PE_RECOVERING)
++ 		return 0;
++ 
++ 	/* Put the PE into recovery mode */
++ 	eeh_pe_state_mark(pe, EEH_PE_RECOVERING);
++ 
++ 	/* Save states */
++ 	eeh_pe_dev_traverse(pe, eeh_dev_save_state, NULL);
++ 
++ 	/* Report error */
++ 	eeh_pe_dev_traverse(pe, eeh_report_error, &result);
++ 
++ 	/* Issue reset */
++ 	eeh_pe_state_mark(pe, EEH_PE_CFG_BLOCKED);
++ 	ret = eeh_reset_pe(pe);
++ 	if (ret) {
++ 		eeh_pe_state_clear(pe, EEH_PE_RECOVERING | EEH_PE_CFG_BLOCKED);
++ 		return ret;
++ 	}
++ 	eeh_pe_state_clear(pe, EEH_PE_CFG_BLOCKED);
++ 
++ 	/* Unfreeze the PE */
++ 	ret = eeh_clear_pe_frozen_state(pe, true);
++ 	if (ret) {
++ 		eeh_pe_state_clear(pe, EEH_PE_RECOVERING);
++ 		return ret;
++ 	}
++ 
++ 	/* Notify completion of reset */
++ 	eeh_pe_dev_traverse(pe, eeh_report_reset, &result);
++ 
++ 	/* Restore device state */
++ 	eeh_pe_dev_traverse(pe, eeh_dev_restore_state, NULL);
++ 
++ 	/* Resume */
++ 	eeh_pe_dev_traverse(pe, eeh_report_resume, NULL);
++ 
++ 	/* Clear recovery mode */
++ 	eeh_pe_state_clear(pe, EEH_PE_RECOVERING);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 8a6b3710ccc3 (powerpc/eeh: Rename flag EEH_PE_RESET to EEH_PE_CFG_BLOCKED)
+  /**
+   * eeh_reset_device - Perform actual reset of a pci slot
+   * @pe: EEH PE
+@@@ -537,10 -613,10 +588,10 @@@ static int eeh_reset_device(struct eeh_
+  	/* Restore PE */
+  	eeh_ops->configure_bridge(pe);
+  	eeh_pe_restore_bars(pe);
+- 	eeh_pe_state_clear(pe, EEH_PE_RESET);
++ 	eeh_pe_state_clear(pe, EEH_PE_CFG_BLOCKED);
+  
+  	/* Clear frozen state */
+ -	rc = eeh_clear_pe_frozen_state(pe, false);
+ +	rc = eeh_clear_pe_frozen_state(pe);
+  	if (rc)
+  		return rc;
+  
+diff --cc arch/powerpc/platforms/powernv/eeh-ioda.c
+index 47d55b12a81e,eba9cb10619c..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@@ -291,20 -278,183 +291,136 @@@ static int ioda_eeh_set_option(struct e
+  	return ret;
+  }
+  
+ -static void ioda_eeh_phb_diag(struct eeh_pe *pe)
+ +static void ioda_eeh_phb_diag(struct pci_controller *hose)
+  {
+ -	struct pnv_phb *phb = pe->phb->private_data;
+ +	struct pnv_phb *phb = hose->private_data;
+  	long rc;
+  
+ -	rc = opal_pci_get_phb_diag_data2(phb->opal_id, pe->data,
+ +	rc = opal_pci_get_phb_diag_data2(phb->opal_id, phb->diag.blob,
+  					 PNV_PCI_DIAG_BUF_SIZE);
+ -	if (rc != OPAL_SUCCESS)
+ -		pr_warn("%s: Failed to get diag-data for PHB#%x (%ld)\n",
+ -			__func__, pe->phb->global_number, rc);
+ -}
+ -
+ -static int ioda_eeh_get_phb_state(struct eeh_pe *pe)
+ -{
+ -	struct pnv_phb *phb = pe->phb->private_data;
+ -	u8 fstate;
+ -	__be16 pcierr;
+ -	s64 rc;
+ -	int result = 0;
+ -
+ -	rc = opal_pci_eeh_freeze_status(phb->opal_id,
+ -					pe->addr,
+ -					&fstate,
+ -					&pcierr,
+ -					NULL);
+  	if (rc != OPAL_SUCCESS) {
+ -		pr_warn("%s: Failure %lld getting PHB#%x state\n",
+ -			__func__, rc, phb->hose->global_number);
+ -		return EEH_STATE_NOT_SUPPORT;
+ +		pr_warning("%s: Failed to get diag-data for PHB#%x (%ld)\n",
+ +			    __func__, hose->global_number, rc);
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	pnv_pci_dump_phb_diag_data(hose, phb->diag.blob);
+++=======
++ 	/*
++ 	 * Check PHB state. If the PHB is frozen for the
++ 	 * first time, to dump the PHB diag-data.
++ 	 */
++ 	if (be16_to_cpu(pcierr) != OPAL_EEH_PHB_ERROR) {
++ 		result = (EEH_STATE_MMIO_ACTIVE  |
++ 			  EEH_STATE_DMA_ACTIVE   |
++ 			  EEH_STATE_MMIO_ENABLED |
++ 			  EEH_STATE_DMA_ENABLED);
++ 	} else if (!(pe->state & EEH_PE_ISOLATED)) {
++ 		eeh_pe_state_mark(pe, EEH_PE_ISOLATED);
++ 		ioda_eeh_phb_diag(pe);
++ 	}
++ 
++ 	return result;
++ }
++ 
++ static int ioda_eeh_get_pe_state(struct eeh_pe *pe)
++ {
++ 	struct pnv_phb *phb = pe->phb->private_data;
++ 	u8 fstate;
++ 	__be16 pcierr;
++ 	s64 rc;
++ 	int result;
++ 
++ 	/*
++ 	 * We don't clobber hardware frozen state until PE
++ 	 * reset is completed. In order to keep EEH core
++ 	 * moving forward, we have to return operational
++ 	 * state during PE reset.
++ 	 */
++ 	if (pe->state & EEH_PE_CFG_BLOCKED) {
++ 		result = (EEH_STATE_MMIO_ACTIVE  |
++ 			  EEH_STATE_DMA_ACTIVE   |
++ 			  EEH_STATE_MMIO_ENABLED |
++ 			  EEH_STATE_DMA_ENABLED);
++ 		return result;
++ 	}
++ 
++ 	/*
++ 	 * Fetch PE state from hardware. If the PHB
++ 	 * supports compound PE, let it handle that.
++ 	 */
++ 	if (phb->get_pe_state) {
++ 		fstate = phb->get_pe_state(phb, pe->addr);
++ 	} else {
++ 		rc = opal_pci_eeh_freeze_status(phb->opal_id,
++ 						pe->addr,
++ 						&fstate,
++ 						&pcierr,
++ 						NULL);
++ 		if (rc != OPAL_SUCCESS) {
++ 			pr_warn("%s: Failure %lld getting PHB#%x-PE%x state\n",
++ 				__func__, rc, phb->hose->global_number, pe->addr);
++ 			return EEH_STATE_NOT_SUPPORT;
++ 		}
++ 	}
++ 
++ 	/* Figure out state */
++ 	switch (fstate) {
++ 	case OPAL_EEH_STOPPED_NOT_FROZEN:
++ 		result = (EEH_STATE_MMIO_ACTIVE  |
++ 			  EEH_STATE_DMA_ACTIVE   |
++ 			  EEH_STATE_MMIO_ENABLED |
++ 			  EEH_STATE_DMA_ENABLED);
++ 		break;
++ 	case OPAL_EEH_STOPPED_MMIO_FREEZE:
++ 		result = (EEH_STATE_DMA_ACTIVE |
++ 			  EEH_STATE_DMA_ENABLED);
++ 		break;
++ 	case OPAL_EEH_STOPPED_DMA_FREEZE:
++ 		result = (EEH_STATE_MMIO_ACTIVE |
++ 			  EEH_STATE_MMIO_ENABLED);
++ 		break;
++ 	case OPAL_EEH_STOPPED_MMIO_DMA_FREEZE:
++ 		result = 0;
++ 		break;
++ 	case OPAL_EEH_STOPPED_RESET:
++ 		result = EEH_STATE_RESET_ACTIVE;
++ 		break;
++ 	case OPAL_EEH_STOPPED_TEMP_UNAVAIL:
++ 		result = EEH_STATE_UNAVAILABLE;
++ 		break;
++ 	case OPAL_EEH_STOPPED_PERM_UNAVAIL:
++ 		result = EEH_STATE_NOT_SUPPORT;
++ 		break;
++ 	default:
++ 		result = EEH_STATE_NOT_SUPPORT;
++ 		pr_warn("%s: Invalid PHB#%x-PE#%x state %x\n",
++ 			__func__, phb->hose->global_number,
++ 			pe->addr, fstate);
++ 	}
++ 
++ 	/*
++ 	 * If PHB supports compound PE, to freeze all
++ 	 * slave PEs for consistency.
++ 	 *
++ 	 * If the PE is switching to frozen state for the
++ 	 * first time, to dump the PHB diag-data.
++ 	 */
++ 	if (!(result & EEH_STATE_NOT_SUPPORT) &&
++ 	    !(result & EEH_STATE_UNAVAILABLE) &&
++ 	    !(result & EEH_STATE_MMIO_ACTIVE) &&
++ 	    !(result & EEH_STATE_DMA_ACTIVE)  &&
++ 	    !(pe->state & EEH_PE_ISOLATED)) {
++ 		if (phb->freeze_pe)
++ 			phb->freeze_pe(phb, pe->addr);
++ 
++ 		eeh_pe_state_mark(pe, EEH_PE_ISOLATED);
++ 		ioda_eeh_phb_diag(pe);
++ 	}
++ 
++ 	return result;
+++>>>>>>> 8a6b3710ccc3 (powerpc/eeh: Rename flag EEH_PE_RESET to EEH_PE_CFG_BLOCKED)
+  }
+  
+  /**
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 52bd2259c082..3e355ff349ea 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -72,7 +72,7 @@ struct device_node;
+ 
+ #define EEH_PE_ISOLATED		(1 << 0)	/* Isolated PE		*/
+ #define EEH_PE_RECOVERING	(1 << 1)	/* Recovering PE	*/
+-#define EEH_PE_RESET		(1 << 2)	/* PE reset in progress	*/
++#define EEH_PE_CFG_BLOCKED	(1 << 2)	/* Block config access	*/
+ 
+ #define EEH_PE_KEEP		(1 << 8)	/* Keep PE on hotplug	*/
+ 
+* Unmerged path arch/powerpc/kernel/eeh.c
+* Unmerged path arch/powerpc/kernel/eeh_driver.c
+diff --git a/arch/powerpc/kernel/rtas_pci.c b/arch/powerpc/kernel/rtas_pci.c
+index c168337aef9d..ce7c8b6a8602 100644
+--- a/arch/powerpc/kernel/rtas_pci.c
++++ b/arch/powerpc/kernel/rtas_pci.c
+@@ -111,7 +111,7 @@ static int rtas_pci_read_config(struct pci_bus *bus,
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+ #ifdef CONFIG_EEH
+ 	edev = of_node_to_eeh_dev(dn);
+-	if (edev && edev->pe && edev->pe->state & EEH_PE_RESET)
++	if (edev && edev->pe && edev->pe->state & EEH_PE_CFG_BLOCKED)
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+ #endif
+ 
+@@ -175,7 +175,7 @@ static int rtas_pci_write_config(struct pci_bus *bus,
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+ #ifdef CONFIG_EEH
+ 	edev = of_node_to_eeh_dev(dn);
+-	if (edev && edev->pe && (edev->pe->state & EEH_PE_RESET))
++	if (edev && edev->pe && (edev->pe->state & EEH_PE_CFG_BLOCKED))
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+ #endif
+ 	ret = rtas_write_config(pdn, where, size, val);
+* Unmerged path arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --git a/arch/powerpc/platforms/powernv/pci.c b/arch/powerpc/platforms/powernv/pci.c
+index 56cabf7d960c..2e16b7d0996a 100644
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@ -513,7 +513,7 @@ static bool pnv_pci_cfg_check(struct pci_controller *hose,
+ 	edev = of_node_to_eeh_dev(dn);
+ 	if (edev) {
+ 		if (edev->pe &&
+-		    (edev->pe->state & EEH_PE_RESET))
++		    (edev->pe->state & EEH_PE_CFG_BLOCKED))
+ 			return false;
+ 
+ 		if (edev->mode & EEH_DEV_REMOVED)
