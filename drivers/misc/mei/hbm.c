@@ -59,6 +59,34 @@ static int mei_cl_conn_status_to_errno(enum mei_cl_connect_status status)
 }
 
 /**
+ * mei_hbm_idle - set hbm to idle state
+ *
+ * @dev: the device structure
+ */
+void mei_hbm_idle(struct mei_device *dev)
+{
+	dev->init_clients_timer = 0;
+	dev->hbm_state = MEI_HBM_IDLE;
+}
+
+/**
+ * mei_hbm_reset - reset hbm counters and book keeping data structurs
+ *
+ * @dev: the device structure
+ */
+void mei_hbm_reset(struct mei_device *dev)
+{
+	dev->me_clients_num = 0;
+	dev->me_client_presentation_num = 0;
+	dev->me_client_index = 0;
+
+	kfree(dev->me_clients);
+	dev->me_clients = NULL;
+
+	mei_hbm_idle(dev);
+}
+
+/**
  * mei_hbm_me_cl_allocate - allocates storage for me clients
  *
  * @dev: the device structure
@@ -70,9 +98,7 @@ static int mei_hbm_me_cl_allocate(struct mei_device *dev)
 	struct mei_me_client *clients;
 	int b;
 
-	dev->me_clients_num = 0;
-	dev->me_client_presentation_num = 0;
-	dev->me_client_index = 0;
+	mei_hbm_reset(dev);
 
 	/* count how many ME clients we have */
 	for_each_set_bit(b, dev->me_clients_map, MEI_CLIENTS_MAX)
@@ -80,9 +106,6 @@ static int mei_hbm_me_cl_allocate(struct mei_device *dev)
 
 	if (dev->me_clients_num == 0)
 		return 0;
-
-	kfree(dev->me_clients);
-	dev->me_clients = NULL;
 
 	dev_dbg(&dev->pdev->dev, "memory allocation for ME clients size=%ld.\n",
 		dev->me_clients_num * sizeof(struct mei_me_client));
@@ -133,17 +156,6 @@ bool mei_hbm_cl_addr_equal(struct mei_cl *cl, void *buf)
 		cl->me_client_id == cmd->me_addr;
 }
 
-
-/**
- * mei_hbm_idle - set hbm to idle state
- *
- * @dev: the device structure
- */
-void mei_hbm_idle(struct mei_device *dev)
-{
-	dev->init_clients_timer = 0;
-	dev->hbm_state = MEI_HBM_IDLE;
-}
 
 int mei_hbm_start_wait(struct mei_device *dev)
 {
