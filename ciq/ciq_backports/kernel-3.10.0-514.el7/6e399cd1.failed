@@ -1,0 +1,128 @@
+prctl: avoid using mmap_sem for exe_file serialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 6e399cd144d8500ffb5d40fa6848890e2580a80a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6e399cd1.failed
+
+Oleg cleverly suggested using xchg() to set the new mm->exe_file instead
+of calling set_mm_exe_file() which requires some form of serialization --
+mmap_sem in this case.  For archs that do not have atomic rmw instructions
+we still fallback to a spinlock alternative, so this should always be
+safe.  As such, we only need the mmap_sem for looking up the backing
+vm_file, which can be done sharing the lock.  Naturally, this means we
+need to manually deal with both the new and old file reference counting,
+and we need not worry about the MMF_EXE_FILE_CHANGED bits, which can
+probably be deleted in the future anyway.
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Suggested-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6e399cd144d8500ffb5d40fa6848890e2580a80a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+#	kernel/fork.c
+#	kernel/sys.c
+diff --cc fs/exec.c
+index 1cf07afbf942,a5fef835ebc5..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -1083,9 -1078,13 +1083,17 @@@ int flush_old_exec(struct linux_binprm 
+  	if (retval)
+  		goto out;
+  
++ 	/*
++ 	 * Must be called _before_ exec_mmap() as bprm->mm is
++ 	 * not visibile until then. This also enables the update
++ 	 * to be lockless.
++ 	 */
+  	set_mm_exe_file(bprm->mm, bprm->file);
+  
+++<<<<<<< HEAD
+ +	filename_to_taskname(bprm->tcomm, bprm->filename, sizeof(bprm->tcomm));
+++=======
+++>>>>>>> 6e399cd144d8 (prctl: avoid using mmap_sem for exe_file serialization)
+  	/*
+  	 * Release all of the old mmap stuff
+  	 */
+diff --cc kernel/fork.c
+index a14b2bbebc6a,0d23e76a0c61..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -637,15 -706,41 +637,40 @@@ void mmput(struct mm_struct *mm
+  }
+  EXPORT_SYMBOL_GPL(mmput);
+  
+++<<<<<<< HEAD
+ +void set_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file)
+ +{
+++=======
++ /**
++  * set_mm_exe_file - change a reference to the mm's executable file
++  *
++  * This changes mm's executable file (shown as symlink /proc/[pid]/exe).
++  *
++  * Main users are mmput() and sys_execve(). Callers prevent concurrent
++  * invocations: in mmput() nobody alive left, in execve task is single
++  * threaded. sys_prctl(PR_SET_MM_MAP/EXE_FILE) also needs to set the
++  * mm->exe_file, but does so without using set_mm_exe_file() in order
++  * to do avoid the need for any locks.
++  */
++ void set_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file)
++ {
++ 	struct file *old_exe_file;
++ 
++ 	/*
++ 	 * It is safe to dereference the exe_file without RCU as
++ 	 * this function is only called if nobody else can access
++ 	 * this mm -- see comment above for justification.
++ 	 */
++ 	old_exe_file = rcu_dereference_raw(mm->exe_file);
++ 
+++>>>>>>> 6e399cd144d8 (prctl: avoid using mmap_sem for exe_file serialization)
+  	if (new_exe_file)
+  		get_file(new_exe_file);
+ -	rcu_assign_pointer(mm->exe_file, new_exe_file);
+ -	if (old_exe_file)
+ -		fput(old_exe_file);
+ +	if (mm->exe_file)
+ +		fput(mm->exe_file);
+ +	mm->exe_file = new_exe_file;
+  }
+  
+ -/**
+ - * get_mm_exe_file - acquire a reference to the mm's executable file
+ - *
+ - * Returns %NULL if mm has no associated executable file.
+ - * User must release file via fput().
+ - */
+  struct file *get_mm_exe_file(struct mm_struct *mm)
+  {
+  	struct file *exe_file;
+diff --cc kernel/sys.c
+index 685c2635c752,a4e372b798a5..000000000000
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@@ -1898,8 -1656,6 +1899,11 @@@ static int prctl_set_mm_exe_file(struc
+  	struct inode *inode;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	VM_BUG_ON(!rwsem_is_locked(&mm->mmap_sem));
+ +
+++=======
+++>>>>>>> 6e399cd144d8 (prctl: avoid using mmap_sem for exe_file serialization)
+  	exe = fdget(fd);
+  	if (!exe.file)
+  		return -EBADF;
+* Unmerged path fs/exec.c
+* Unmerged path kernel/fork.c
+* Unmerged path kernel/sys.c
