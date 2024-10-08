@@ -1,0 +1,178 @@
+rhashtable: don't test for shrink on insert, expansion on delete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 342100d937ed6e5faf1e7ee7dcd7b3935fec8877
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/342100d9.failed
+
+Restore pre 54c5b7d311c8 behaviour and only probe for expansions on inserts
+and shrinks on deletes. Currently, it will happen that on initial inserts
+into a sparse hash table, we may i.e. shrink it first simply because it's
+not fully populated yet, only to later realize that we need to grow again.
+
+This however is counter intuitive, e.g. an initial default size of 64
+elements is already small enough, and in case an elements size hint is given
+to the hash table by a user, we should avoid unnecessary expansion steps,
+so a shrink is clearly unintended here.
+
+Fixes: 54c5b7d311c8 ("rhashtable: introduce rhashtable_wakeup_worker helper function")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: Ying Xue <ying.xue@windriver.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 342100d937ed6e5faf1e7ee7dcd7b3935fec8877)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index de2f35737e17,38f7879df0d8..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -319,8 -512,77 +319,80 @@@ int rhashtable_shrink(struct rhashtabl
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_shrink);
+  
+++<<<<<<< HEAD
+++=======
++ static void rht_deferred_worker(struct work_struct *work)
++ {
++ 	struct rhashtable *ht;
++ 	struct bucket_table *tbl;
++ 	struct rhashtable_walker *walker;
++ 
++ 	ht = container_of(work, struct rhashtable, run_work);
++ 	mutex_lock(&ht->mutex);
++ 	if (ht->being_destroyed)
++ 		goto unlock;
++ 
++ 	tbl = rht_dereference(ht->tbl, ht);
++ 
++ 	list_for_each_entry(walker, &ht->walkers, list)
++ 		walker->resize = true;
++ 
++ 	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
++ 		rhashtable_expand(ht);
++ 	else if (ht->p.shrink_decision && ht->p.shrink_decision(ht, tbl->size))
++ 		rhashtable_shrink(ht);
++ 
++ unlock:
++ 	mutex_unlock(&ht->mutex);
++ }
++ 
++ static void rhashtable_probe_expand(struct rhashtable *ht)
++ {
++ 	const struct bucket_table *new_tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	const struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
++ 
++ 	/* Only adjust the table if no resizing is currently in progress. */
++ 	if (tbl == new_tbl && ht->p.grow_decision &&
++ 	    ht->p.grow_decision(ht, tbl->size))
++ 		schedule_work(&ht->run_work);
++ }
++ 
++ static void rhashtable_probe_shrink(struct rhashtable *ht)
++ {
++ 	const struct bucket_table *new_tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	const struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
++ 
++ 	/* Only adjust the table if no resizing is currently in progress. */
++ 	if (tbl == new_tbl && ht->p.shrink_decision &&
++ 	    ht->p.shrink_decision(ht, tbl->size))
++ 		schedule_work(&ht->run_work);
++ }
++ 
++ static void __rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj,
++ 				struct bucket_table *tbl, u32 hash)
++ {
++ 	struct rhash_head *head;
++ 
++ 	hash = rht_bucket_index(tbl, hash);
++ 	head = rht_dereference_bucket(tbl->buckets[hash], tbl, hash);
++ 
++ 	ASSERT_BUCKET_LOCK(ht, tbl, hash);
++ 
++ 	if (rht_is_a_nulls(head))
++ 		INIT_RHT_NULLS_HEAD(obj->next, ht, hash);
++ 	else
++ 		RCU_INIT_POINTER(obj->next, head);
++ 
++ 	rcu_assign_pointer(tbl->buckets[hash], obj);
++ 
++ 	atomic_inc(&ht->nelems);
++ 
++ 	rhashtable_probe_expand(ht);
++ }
++ 
+++>>>>>>> 342100d937ed (rhashtable: don't test for shrink on insert, expansion on delete)
+  /**
+ - * rhashtable_insert - insert object into hash table
+ + * rhashtable_insert - insert object into hash hash table
+   * @ht:		hash table
+   * @obj:	pointer to hash head inside object
+   *
+@@@ -380,17 -653,50 +452,40 @@@ bool rhashtable_remove(struct rhashtabl
+  			continue;
+  		}
+  
+ -		ASSERT_BUCKET_LOCK(ht, tbl, hash);
+ -
+ -		if (old_tbl->size > new_tbl->size && tbl == old_tbl &&
+ -		    !rht_is_a_nulls(obj->next) &&
+ -		    head_hashfn(ht, tbl, obj->next) != hash) {
+ -			rcu_assign_pointer(*pprev, (struct rhash_head *) rht_marker(ht, hash));
+ -		} else if (unlikely(old_tbl->size < new_tbl->size && tbl == new_tbl)) {
+ -			rht_for_each_continue(he2, obj->next, tbl, hash) {
+ -				if (head_hashfn(ht, tbl, he2) == hash) {
+ -					rcu_assign_pointer(*pprev, he2);
+ -					goto found;
+ -				}
+ -			}
+ +		RCU_INIT_POINTER(*pprev, he->next);
+ +		ht->nelems--;
+  
+ -			rcu_assign_pointer(*pprev, (struct rhash_head *) rht_marker(ht, hash));
+ -		} else {
+ -			rcu_assign_pointer(*pprev, obj->next);
+ -		}
+ +		if (ht->p.shrink_decision &&
+ +		    ht->p.shrink_decision(ht, tbl->size))
+ +			rhashtable_shrink(ht);
+  
+ -found:
+ -		ret = true;
+ -		break;
+ +		return true;
+  	}
+  
+++<<<<<<< HEAD
+ +	return false;
+++=======
++ 	/* The entry may be linked in either 'tbl', 'future_tbl', or both.
++ 	 * 'future_tbl' only exists for a short period of time during
++ 	 * resizing. Thus traversing both is fine and the added cost is
++ 	 * very rare.
++ 	 */
++ 	if (tbl != old_tbl) {
++ 		tbl = old_tbl;
++ 		goto restart;
++ 	}
++ 
++ 	unlock_buckets(new_tbl, old_tbl, new_hash);
++ 
++ 	if (ret) {
++ 		atomic_dec(&ht->nelems);
++ 		rhashtable_probe_shrink(ht);
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	return ret;
+++>>>>>>> 342100d937ed (rhashtable: don't test for shrink on insert, expansion on delete)
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_remove);
+  
+* Unmerged path lib/rhashtable.c
