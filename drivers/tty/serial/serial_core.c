@@ -1385,7 +1385,6 @@ static void uart_close(struct tty_struct *tty, struct file *filp)
 	clear_bit(ASYNCB_CLOSING, &port->flags);
 	spin_unlock_irqrestore(&port->lock, flags);
 	wake_up_interruptible(&port->open_wait);
-	wake_up_interruptible(&port->close_wait);
 
 	mutex_unlock(&port->mutex);
 }
