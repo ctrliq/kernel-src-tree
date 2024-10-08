@@ -1,0 +1,270 @@
+udp: Add GRO functions to UDP socket
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tom Herbert <tom@herbertland.com>
+commit a6024562ffd7e0f31bc6671817840ad1e91de7b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a6024562.failed
+
+This patch adds GRO functions (gro_receive and gro_complete) to UDP
+sockets. udp_gro_receive is changed to perform socket lookup on a
+packet. If a socket is found the related GRO functions are called.
+
+This features obsoletes using UDP offload infrastructure for GRO
+(udp_offload). This has the advantage of not being limited to provide
+offload on a per port basis, GRO is now applied to whatever individual
+UDP sockets are bound to.  This also allows the possbility of
+"application defined GRO"-- that is we can attach something like
+a BPF program to a UDP socket to perfrom GRO on an application
+layer protocol.
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6024562ffd7e0f31bc6671817840ad1e91de7b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/udp.h
+#	net/ipv4/udp_offload.c
+#	net/ipv6/Makefile
+diff --cc include/net/udp.h
+index 912b9df8457c,3c5a65e0946d..000000000000
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@@ -158,9 -158,21 +158,24 @@@ static inline __sum16 udp_v4_check(int 
+  void udp_set_csum(bool nocheck, struct sk_buff *skb,
+  		  __be32 saddr, __be32 daddr, int len);
+  
+++<<<<<<< HEAD
+++=======
++ static inline void udp_csum_pull_header(struct sk_buff *skb)
++ {
++ 	if (skb->ip_summed == CHECKSUM_NONE)
++ 		skb->csum = csum_partial(udp_hdr(skb), sizeof(struct udphdr),
++ 					 skb->csum);
++ 	skb_pull_rcsum(skb, sizeof(struct udphdr));
++ 	UDP_SKB_CB(skb)->cscov -= sizeof(struct udphdr);
++ }
++ 
++ typedef struct sock *(*udp_lookup_t)(struct sk_buff *skb, __be16 sport,
++ 				     __be16 dport);
++ 
+++>>>>>>> a6024562ffd7 (udp: Add GRO functions to UDP socket)
+  struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb,
+- 				 struct udphdr *uh);
+- int udp_gro_complete(struct sk_buff *skb, int nhoff);
++ 				 struct udphdr *uh, udp_lookup_t lookup);
++ int udp_gro_complete(struct sk_buff *skb, int nhoff, udp_lookup_t lookup);
+  
+  static inline struct udphdr *udp_gro_udphdr(struct sk_buff *skb)
+  {
+diff --cc net/ipv4/udp_offload.c
+index ecc9ae7d83dd,65c3fd34b363..000000000000
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@@ -301,24 -311,23 +301,23 @@@ struct sk_buff **udp_gro_receive(struc
+  	struct udphdr *uh2;
+  	unsigned int off = skb_gro_offset(skb);
+  	int flush = 1;
++ 	struct sock *sk;
+  
+ -	if (NAPI_GRO_CB(skb)->encap_mark ||
+ +	if (NAPI_GRO_CB(skb)->udp_mark ||
+  	    (skb->ip_summed != CHECKSUM_PARTIAL &&
+  	     NAPI_GRO_CB(skb)->csum_cnt == 0 &&
+  	     !NAPI_GRO_CB(skb)->csum_valid))
+  		goto out;
+  
+ -	/* mark that this skb passed once through the tunnel gro layer */
+ -	NAPI_GRO_CB(skb)->encap_mark = 1;
+ +	/* mark that this skb passed once through the udp gro layer */
+ +	NAPI_GRO_CB(skb)->udp_mark = 1;
+  
+  	rcu_read_lock();
+- 	uo_priv = rcu_dereference(udp_offload_base);
+- 	for (; uo_priv != NULL; uo_priv = rcu_dereference(uo_priv->next)) {
+- 		if (net_eq(read_pnet(&uo_priv->net), dev_net(skb->dev)) &&
+- 		    uo_priv->offload->port == uh->dest &&
+- 		    uo_priv->offload->callbacks.gro_receive)
+- 			goto unflush;
+- 	}
++ 	sk = (*lookup)(skb, uh->source, uh->dest);
++ 
++ 	if (sk && udp_sk(sk)->gro_receive)
++ 		goto unflush;
++ 
+  	goto out_unlock;
+  
+  unflush:
+@@@ -390,22 -399,10 +389,29 @@@ int udp_gro_complete(struct sk_buff *sk
+  	uh->len = newlen;
+  
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +
+ +	uo_priv = rcu_dereference(udp_offload_base);
+ +	for (; uo_priv != NULL; uo_priv = rcu_dereference(uo_priv->next)) {
+ +		if (net_eq(read_pnet(&uo_priv->net), dev_net(skb->dev)) &&
+ +		    uo_priv->offload->port == uh->dest &&
+ +		    uo_priv->offload->callbacks.gro_complete)
+ +			break;
+ +	}
+ +
+ +	if (uo_priv != NULL) {
+ +		NAPI_GRO_CB(skb)->proto = uo_priv->offload->ipproto;
+ +		err = uo_priv->offload->callbacks.gro_complete(skb,
+ +				nhoff + sizeof(struct udphdr),
+ +				uo_priv->offload);
+ +	}
+ +
+++=======
++ 	sk = (*lookup)(skb, uh->source, uh->dest);
++ 	if (sk && udp_sk(sk)->gro_complete)
++ 		err = udp_sk(sk)->gro_complete(sk, skb,
++ 				nhoff + sizeof(struct udphdr));
+++>>>>>>> a6024562ffd7 (udp: Add GRO functions to UDP socket)
+  	rcu_read_unlock();
+  
+  	if (skb->remcsum_offload)
+diff --cc net/ipv6/Makefile
+index b450a17eda2e,5e9d6bf4aaca..000000000000
+--- a/net/ipv6/Makefile
++++ b/net/ipv6/Makefile
+@@@ -7,10 -7,11 +7,16 @@@ obj-$(CONFIG_IPV6) += ipv6.
+  ipv6-objs :=	af_inet6.o anycast.o ip6_output.o ip6_input.o addrconf.o \
+  		addrlabel.o \
+  		route.o ip6_fib.o ipv6_sockglue.o ndisc.o udp.o udplite.o \
+++<<<<<<< HEAD
+ +		raw.o icmp.o mcast.o reassembly.o tcp_ipv6.o \
+ +		exthdrs.o datagram.o ip6_flowlabel.o inet6_connection_sock.o
+++=======
++ 		raw.o icmp.o mcast.o reassembly.o tcp_ipv6.o ping.o \
++ 		exthdrs.o datagram.o ip6_flowlabel.o inet6_connection_sock.o \
++ 		udp_offload.o
+++>>>>>>> a6024562ffd7 (udp: Add GRO functions to UDP socket)
+  
+- ipv6-offload :=	ip6_offload.o tcpv6_offload.o udp_offload.o exthdrs_offload.o
++ ipv6-offload :=	ip6_offload.o tcpv6_offload.o exthdrs_offload.o
+  
+  ipv6-$(CONFIG_SYSCTL) = sysctl_net_ipv6.o
+  ipv6-$(CONFIG_IPV6_MROUTE) += ip6mr.o
+diff --git a/include/linux/udp.h b/include/linux/udp.h
+index 247cfdcc4b08..33da22a7fe02 100644
+--- a/include/linux/udp.h
++++ b/include/linux/udp.h
+@@ -71,6 +71,14 @@ struct udp_sock {
+ 	 */
+ 	int (*encap_rcv)(struct sock *sk, struct sk_buff *skb);
+ 	void (*encap_destroy)(struct sock *sk);
++
++	/* GRO functions for UDP socket */
++	struct sk_buff **	(*gro_receive)(struct sock *sk,
++					       struct sk_buff **head,
++					       struct sk_buff *skb);
++	int			(*gro_complete)(struct sock *sk,
++						struct sk_buff *skb,
++						int nhoff);
+ };
+ 
+ static inline struct udp_sock *udp_sk(const struct sock *sk)
+* Unmerged path include/net/udp.h
+* Unmerged path net/ipv4/udp_offload.c
+* Unmerged path net/ipv6/Makefile
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index f6f52bfe535a..8d529746d69a 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -63,6 +63,8 @@
+ #include <asm/uaccess.h>
+ #include <linux/mroute6.h>
+ 
++#include "ip6_offload.h"
++
+ MODULE_AUTHOR("Cast of dozens");
+ MODULE_DESCRIPTION("IPv6 protocol stack for Linux");
+ MODULE_LICENSE("GPL");
+@@ -930,6 +932,10 @@ static int __init inet6_init(void)
+ 	if (err)
+ 		goto udplitev6_fail;
+ 
++	err = udpv6_offload_init();
++	if (err)
++		goto udpv6_offload_fail;
++
+ 	err = tcpv6_init();
+ 	if (err)
+ 		goto tcpv6_fail;
+@@ -953,6 +959,8 @@ sysctl_fail:
+ ipv6_packet_fail:
+ 	tcpv6_exit();
+ tcpv6_fail:
++	udpv6_offload_exit();
++udpv6_offload_fail:
+ 	udplitev6_exit();
+ udplitev6_fail:
+ 	udpv6_exit();
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+index b2a15198951d..ab16b2cd39b1 100644
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -297,8 +297,6 @@ static int __init ipv6_offload_init(void)
+ 
+ 	if (tcpv6_offload_init() < 0)
+ 		pr_crit("%s: Cannot add TCP protocol offload\n", __func__);
+-	if (udp_offload_init() < 0)
+-		pr_crit("%s: Cannot add UDP protocol offload\n", __func__);
+ 	if (ipv6_exthdrs_offload_init() < 0)
+ 		pr_crit("%s: Cannot add EXTHDRS protocol offload\n", __func__);
+ 
+diff --git a/net/ipv6/ip6_offload.h b/net/ipv6/ip6_offload.h
+index 2e155c651b35..96b40e41ac53 100644
+--- a/net/ipv6/ip6_offload.h
++++ b/net/ipv6/ip6_offload.h
+@@ -12,7 +12,8 @@
+ #define __ip6_offload_h
+ 
+ int ipv6_exthdrs_offload_init(void);
+-int udp_offload_init(void);
++int udpv6_offload_init(void);
++int udpv6_offload_exit(void);
+ int tcpv6_offload_init(void);
+ 
+ #endif
+diff --git a/net/ipv6/udp_offload.c b/net/ipv6/udp_offload.c
+index e44dc2e981e4..43e9a0c017ba 100644
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@ -142,7 +142,7 @@ static struct sk_buff **udp6_gro_receive(struct sk_buff **head,
+ 
+ skip:
+ 	NAPI_GRO_CB(skb)->is_ipv6 = 1;
+-	return udp_gro_receive(head, skb, uh);
++	return udp_gro_receive(head, skb, uh, udp6_lib_lookup_skb);
+ 
+ flush:
+ 	NAPI_GRO_CB(skb)->flush = 1;
+@@ -162,7 +162,7 @@ int udp6_gro_complete(struct sk_buff *skb, int nhoff)
+ 		skb_shinfo(skb)->gso_type |= SKB_GSO_UDP_TUNNEL;
+ 	}
+ 
+-	return udp_gro_complete(skb, nhoff);
++	return udp_gro_complete(skb, nhoff, udp6_lib_lookup_skb);
+ }
+ 
+ static const struct net_offload udpv6_offload = {
+@@ -173,7 +173,12 @@ static const struct net_offload udpv6_offload = {
+ 	},
+ };
+ 
+-int __init udp_offload_init(void)
++int udpv6_offload_init(void)
+ {
+ 	return inet6_add_offload(&udpv6_offload, IPPROTO_UDP);
+ }
++
++int udpv6_offload_exit(void)
++{
++	return inet6_del_offload(&udpv6_offload, IPPROTO_UDP);
++}
