@@ -1,0 +1,85 @@
+IB/hfi1: Fix user SDMA racy user request claim
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit 7b3256e331270c7de43ccf3879b7c289cdc3ff28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7b3256e3.failed
+
+The user SDMA in-use claim bit is in the structure that gets zeroed out
+once the claim is made.  Move the request in-use flag into its own bit
+array and use that for atomic claims.  This cleans up the claim code and
+removes any race possibility.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 7b3256e331270c7de43ccf3879b7c289cdc3ff28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/user_sdma.c
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 47c9c87af47a,e88d555389f4..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -148,10 -145,7 +148,14 @@@ MODULE_PARM_DESC(sdma_comp_size, "Size 
+  /* Last packet in the request */
+  #define TXREQ_FLAGS_REQ_LAST_PKT BIT(0)
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +/* Last packet that uses a particular io vector */
+ +#define TXREQ_FLAGS_IOVEC_LAST_PKT BIT(0)
+ +
+ +#define SDMA_REQ_IN_USE     0
+++=======
++ /* SDMA request flag bits */
+++>>>>>>> 7b3256e33127 (IB/hfi1: Fix user SDMA racy user request claim):drivers/infiniband/hw/hfi1/user_sdma.c
+  #define SDMA_REQ_FOR_THREAD 1
+  #define SDMA_REQ_SEND_DONE  2
+  #define SDMA_REQ_HAVE_AHG   3
+@@@ -1460,15 -1601,24 +1470,15 @@@ static void user_sdma_free_request(stru
+  			kmem_cache_free(req->pq->txreq_cache, tx);
+  		}
+  	}
+ -	if (req->data_iovs) {
+ -		struct sdma_mmu_node *node;
+ +	if (req->data_iovs && unpin) {
+  		int i;
+  
+ -		for (i = 0; i < req->data_iovs; i++) {
+ -			node = req->iovs[i].node;
+ -			if (!node)
+ -				continue;
+ -
+ -			if (unpin)
+ -				hfi1_mmu_rb_remove(&req->pq->sdma_rb_root,
+ -						   &node->rb);
+ -			else
+ -				atomic_dec(&node->refcount);
+ -		}
+ +		for (i = 0; i < req->data_iovs; i++)
+ +			if (req->iovs[i].npages && req->iovs[i].pages)
+ +				unpin_vector_pages(&req->iovs[i]);
+  	}
+  	kfree(req->tids);
+- 	clear_bit(SDMA_REQ_IN_USE, &req->flags);
++ 	clear_bit(req->info.comp_idx, req->pq->req_in_use);
+  }
+  
+  static inline void set_comp_state(struct hfi1_user_sdma_pkt_q *pq,
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+diff --git a/drivers/staging/hfi1/user_sdma.h b/drivers/staging/hfi1/user_sdma.h
+index 7ebbc4634989..ed9cf83ae9a3 100644
+--- a/drivers/staging/hfi1/user_sdma.h
++++ b/drivers/staging/hfi1/user_sdma.h
+@@ -74,6 +74,7 @@ struct hfi1_user_sdma_pkt_q {
+ 	struct hfi1_devdata *dd;
+ 	struct kmem_cache *txreq_cache;
+ 	struct user_sdma_request *reqs;
++	unsigned long *req_in_use;
+ 	struct iowait busy;
+ 	unsigned state;
+ 	wait_queue_head_t wait;
