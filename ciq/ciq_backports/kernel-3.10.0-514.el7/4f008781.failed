@@ -1,0 +1,218 @@
+sctp: apply rhashtable api to send/recv path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 4f0087812648b7611157ae22954acfaed820d24e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4f008781.failed
+
+apply lookup apis to two functions, for __sctp_endpoint_lookup_assoc
+and __sctp_lookup_association, it's invoked in the protection of sock
+lock, it will be safe, but sctp_lookup_association need to call
+rcu_read_lock() and to detect the t->dead to protect it.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f0087812648b7611157ae22954acfaed820d24e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/input.c
+diff --cc net/sctp/input.c
+index e6d42da26807,6f075d835764..000000000000
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@@ -997,39 -981,20 +997,25 @@@ static struct sctp_association *__sctp_
+  					const union sctp_addr *peer,
+  					struct sctp_transport **pt)
+  {
+- 	struct sctp_hashbucket *head;
+- 	struct sctp_ep_common *epb;
+- 	struct sctp_association *asoc;
+- 	struct sctp_transport *transport;
+- 	int hash;
+- 
+- 	/* Optimize here for direct hit, only listening connections can
+- 	 * have wildcards anyways.
+- 	 */
+- 	hash = sctp_assoc_hashfn(net, ntohs(local->v4.sin_port),
+- 				 ntohs(peer->v4.sin_port));
+- 	head = &sctp_assoc_hashtable[hash];
+- 	read_lock(&head->lock);
+- 	sctp_for_each_hentry(epb, &head->chain) {
+- 		asoc = sctp_assoc(epb);
+- 		transport = sctp_assoc_is_match(asoc, net, local, peer);
+- 		if (transport)
+- 			goto hit;
+- 	}
++ 	struct sctp_transport *t;
+  
+- 	read_unlock(&head->lock);
++ 	t = sctp_addrs_lookup_transport(net, local, peer);
++ 	if (!t || t->dead || t->asoc->temp)
++ 		return NULL;
+  
+- 	return NULL;
++ 	sctp_association_hold(t->asoc);
++ 	*pt = t;
+  
+- hit:
+- 	*pt = transport;
+- 	sctp_association_hold(asoc);
+- 	read_unlock(&head->lock);
+- 	return asoc;
++ 	return t->asoc;
+  }
+  
+++<<<<<<< HEAD
+ +/* Look up an association. BH-safe. */
+ +SCTP_STATIC
+++=======
++ /* Look up an association. protected by RCU read lock */
++ static
+++>>>>>>> 4f0087812648 (sctp: apply rhashtable api to send/recv path)
+  struct sctp_association *sctp_lookup_association(struct net *net,
+  						 const union sctp_addr *laddr,
+  						 const union sctp_addr *paddr,
+@@@ -1037,9 -1002,9 +1023,15 @@@
+  {
+  	struct sctp_association *asoc;
+  
+++<<<<<<< HEAD
+ +	sctp_local_bh_disable();
+ +	asoc = __sctp_lookup_association(net, laddr, paddr, transportp);
+ +	sctp_local_bh_enable();
+++=======
++ 	rcu_read_lock();
++ 	asoc = __sctp_lookup_association(net, laddr, paddr, transportp);
++ 	rcu_read_unlock();
+++>>>>>>> 4f0087812648 (sctp: apply rhashtable api to send/recv path)
+  
+  	return asoc;
+  }
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index 95613ef42a0c..5a963c84a0f4 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -433,6 +433,7 @@ void sctp_association_free(struct sctp_association *asoc)
+ 	list_for_each_safe(pos, temp, &asoc->peer.transport_addr_list) {
+ 		transport = list_entry(pos, struct sctp_transport, transports);
+ 		list_del_rcu(pos);
++		sctp_unhash_transport(transport);
+ 		sctp_transport_free(transport);
+ 	}
+ 
+@@ -551,6 +552,8 @@ void sctp_assoc_rm_peer(struct sctp_association *asoc,
+ 
+ 	/* Remove this peer from the list. */
+ 	list_del_rcu(&peer->transports);
++	/* Remove this peer from the transport hashtable */
++	sctp_unhash_transport(peer);
+ 
+ 	/* Get the first transport of asoc. */
+ 	pos = asoc->peer.transport_addr_list.next;
+@@ -753,6 +756,8 @@ struct sctp_transport *sctp_assoc_add_peer(struct sctp_association *asoc,
+ 	/* Attach the remote transport to our asoc.  */
+ 	list_add_tail_rcu(&peer->transports, &asoc->peer.transport_addr_list);
+ 	asoc->peer.transport_count++;
++	/* Add this peer into the transport hashtable */
++	sctp_hash_transport(peer);
+ 
+ 	/* If we do not yet have a primary path, set one.  */
+ 	if (!asoc->peer.primary_path) {
+diff --git a/net/sctp/endpointola.c b/net/sctp/endpointola.c
+index e09f906514db..4ec23500ce38 100644
+--- a/net/sctp/endpointola.c
++++ b/net/sctp/endpointola.c
+@@ -316,8 +316,8 @@ struct sctp_endpoint *sctp_endpoint_is_match(struct sctp_endpoint *ep,
+ }
+ 
+ /* Find the association that goes with this chunk.
+- * We do a linear search of the associations for this endpoint.
+- * We return the matching transport address too.
++ * We lookup the transport from hashtable at first, then get association
++ * through t->assoc.
+  */
+ static struct sctp_association *__sctp_endpoint_lookup_assoc(
+ 	const struct sctp_endpoint *ep,
+@@ -325,12 +325,7 @@ static struct sctp_association *__sctp_endpoint_lookup_assoc(
+ 	struct sctp_transport **transport)
+ {
+ 	struct sctp_association *asoc = NULL;
+-	struct sctp_association *tmp;
+-	struct sctp_transport *t = NULL;
+-	struct sctp_hashbucket *head;
+-	struct sctp_ep_common *epb;
+-	int hash;
+-	int rport;
++	struct sctp_transport *t;
+ 
+ 	*transport = NULL;
+ 
+@@ -339,26 +334,12 @@ static struct sctp_association *__sctp_endpoint_lookup_assoc(
+ 	 */
+ 	if (!ep->base.bind_addr.port)
+ 		goto out;
++	t = sctp_epaddr_lookup_transport(ep, paddr);
++	if (!t || t->asoc->temp)
++		goto out;
+ 
+-	rport = ntohs(paddr->v4.sin_port);
+-
+-	hash = sctp_assoc_hashfn(sock_net(ep->base.sk), ep->base.bind_addr.port,
+-				 rport);
+-	head = &sctp_assoc_hashtable[hash];
+-	read_lock(&head->lock);
+-	sctp_for_each_hentry(epb, &head->chain) {
+-		tmp = sctp_assoc(epb);
+-		if (tmp->ep != ep || rport != tmp->peer.port)
+-			continue;
+-
+-		t = sctp_assoc_lookup_paddr(tmp, paddr);
+-		if (t) {
+-			asoc = tmp;
+-			*transport = t;
+-			break;
+-		}
+-	}
+-	read_unlock(&head->lock);
++	*transport = t;
++	asoc = t->asoc;
+ out:
+ 	return asoc;
+ }
+* Unmerged path net/sctp/input.c
+diff --git a/net/sctp/protocol.c b/net/sctp/protocol.c
+index 95b4d5441395..fb18cc98f11b 100644
+--- a/net/sctp/protocol.c
++++ b/net/sctp/protocol.c
+@@ -1468,6 +1468,9 @@ SCTP_STATIC __init int sctp_init(void)
+ 		INIT_HLIST_HEAD(&sctp_port_hashtable[i].chain);
+ 	}
+ 
++	if (sctp_transport_hashtable_init())
++		goto err_thash_alloc;
++
+ 	pr_info("Hash tables configured (established %d bind %d)\n",
+ 		sctp_assoc_hashsize, sctp_port_hashsize);
+ 
+@@ -1523,6 +1526,8 @@ err_register_defaults:
+ 		   get_order(sctp_port_hashsize *
+ 			     sizeof(struct sctp_bind_hashbucket)));
+ err_bhash_alloc:
++	sctp_transport_hashtable_destroy();
++err_thash_alloc:
+ 	kfree(sctp_ep_hashtable);
+ err_ehash_alloc:
+ 	free_pages((unsigned long)sctp_assoc_hashtable,
+@@ -1569,6 +1574,7 @@ SCTP_STATIC __exit void sctp_exit(void)
+ 	free_pages((unsigned long)sctp_port_hashtable,
+ 		   get_order(sctp_port_hashsize *
+ 			     sizeof(struct sctp_bind_hashbucket)));
++	sctp_transport_hashtable_destroy();
+ 
+ 	percpu_counter_destroy(&sctp_sockets_allocated);
+ 
