@@ -1,0 +1,475 @@
+xfs: add missing bmap cancel calls in error paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit d4a97a04227d5ba91b91888a016e2300861cfbc7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d4a97a04.failed
+
+If a failure occurs after the bmap free list is populated and before
+xfs_bmap_finish() completes successfully (which returns a partial
+list on failure), the bmap free list must be cancelled. Otherwise,
+the extent items on the list are never freed and a memory leak
+occurs.
+
+Several random error paths throughout the code suffer this problem.
+Fix these up such that xfs_bmap_cancel() is always called on error.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit d4a97a04227d5ba91b91888a016e2300861cfbc7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/xfs_bmap_util.c
+#	fs/xfs/xfs_inode.c
+#	fs/xfs/xfs_rtalloc.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 0c6fa1592d0d,8e2010d53b07..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5678,3 -5763,189 +5678,192 @@@ del_cursor
+  
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Splits an extent into two extents at split_fsb block such that it is
++  * the first block of the current_ext. @current_ext is a target extent
++  * to be split. @split_fsb is a block where the extents is split.
++  * If split_fsb lies in a hole or the first block of extents, just return 0.
++  */
++ STATIC int
++ xfs_bmap_split_extent_at(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		split_fsb,
++ 	xfs_fsblock_t		*firstfsb,
++ 	struct xfs_bmap_free	*free_list)
++ {
++ 	int				whichfork = XFS_DATA_FORK;
++ 	struct xfs_btree_cur		*cur = NULL;
++ 	struct xfs_bmbt_rec_host	*gotp;
++ 	struct xfs_bmbt_irec		got;
++ 	struct xfs_bmbt_irec		new; /* split extent */
++ 	struct xfs_mount		*mp = ip->i_mount;
++ 	struct xfs_ifork		*ifp;
++ 	xfs_fsblock_t			gotblkcnt; /* new block count for got */
++ 	xfs_extnum_t			current_ext;
++ 	int				error = 0;
++ 	int				logflags = 0;
++ 	int				i = 0;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT, XFS_RANDOM_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT("xfs_bmap_split_extent_at",
++ 				 XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		/* Read in all the extents */
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * gotp can be null in 2 cases: 1) if there are no extents
++ 	 * or 2) split_fsb lies in a hole beyond which there are
++ 	 * no extents. Either way, we are done.
++ 	 */
++ 	gotp = xfs_iext_bno_to_ext(ifp, split_fsb, &current_ext);
++ 	if (!gotp)
++ 		return 0;
++ 
++ 	xfs_bmbt_get_all(gotp, &got);
++ 
++ 	/*
++ 	 * Check split_fsb lies in a hole or the start boundary offset
++ 	 * of the extent.
++ 	 */
++ 	if (got.br_startoff >= split_fsb)
++ 		return 0;
++ 
++ 	gotblkcnt = split_fsb - got.br_startoff;
++ 	new.br_startoff = split_fsb;
++ 	new.br_startblock = got.br_startblock + gotblkcnt;
++ 	new.br_blockcount = got.br_blockcount - gotblkcnt;
++ 	new.br_state = got.br_state;
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstfsb;
++ 		cur->bc_private.b.flist = free_list;
++ 		cur->bc_private.b.flags = 0;
++ 		error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	xfs_bmbt_set_blockcount(gotp, gotblkcnt);
++ 	got.br_blockcount = gotblkcnt;
++ 
++ 	logflags = XFS_ILOG_CORE;
++ 	if (cur) {
++ 		error = xfs_bmbt_update(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				got.br_state);
++ 		if (error)
++ 			goto del_cursor;
++ 	} else
++ 		logflags |= XFS_ILOG_DEXT;
++ 
++ 	/* Add new extent */
++ 	current_ext++;
++ 	xfs_iext_insert(ip, current_ext, 1, &new, 0);
++ 	XFS_IFORK_NEXT_SET(ip, whichfork,
++ 			   XFS_IFORK_NEXTENTS(ip, whichfork) + 1);
++ 
++ 	if (cur) {
++ 		error = xfs_bmbt_lookup_eq(cur, new.br_startoff,
++ 				new.br_startblock, new.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 0, del_cursor);
++ 		cur->bc_rec.b.br_state = new.br_state;
++ 
++ 		error = xfs_btree_insert(cur, &i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	/*
++ 	 * Convert to a btree if necessary.
++ 	 */
++ 	if (xfs_bmap_needs_btree(ip, whichfork)) {
++ 		int tmp_logflags; /* partial log flag return val */
++ 
++ 		ASSERT(cur == NULL);
++ 		error = xfs_bmap_extents_to_btree(tp, ip, firstfsb, free_list,
++ 				&cur, 0, &tmp_logflags, whichfork);
++ 		logflags |= tmp_logflags;
++ 	}
++ 
++ del_cursor:
++ 	if (cur) {
++ 		cur->bc_private.b.allocated = 0;
++ 		xfs_btree_del_cursor(cur,
++ 				error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 	}
++ 
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 	return error;
++ }
++ 
++ int
++ xfs_bmap_split_extent(
++ 	struct xfs_inode        *ip,
++ 	xfs_fileoff_t           split_fsb)
++ {
++ 	struct xfs_mount        *mp = ip->i_mount;
++ 	struct xfs_trans        *tp;
++ 	struct xfs_bmap_free    free_list;
++ 	xfs_fsblock_t           firstfsb;
++ 	int                     committed;
++ 	int                     error;
++ 
++ 	tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
++ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
++ 			XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
++ 	if (error) {
++ 		xfs_trans_cancel(tp);
++ 		return error;
++ 	}
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 	xfs_bmap_init(&free_list, &firstfsb);
++ 
++ 	error = xfs_bmap_split_extent_at(tp, ip, split_fsb,
++ 			&firstfsb, &free_list);
++ 	if (error)
++ 		goto out;
++ 
++ 	error = xfs_bmap_finish(&tp, &free_list, &committed);
++ 	if (error)
++ 		goto out;
++ 
++ 	return xfs_trans_commit(tp);
++ 
++ out:
++ 	xfs_bmap_cancel(&free_list);
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
+++>>>>>>> d4a97a04227d (xfs: add missing bmap cancel calls in error paths)
+diff --cc fs/xfs/xfs_bmap_util.c
+index 8eece46acdbc,3bf4ad0d19e4..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1389,6 -1378,135 +1389,138 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * @next_fsb will keep track of the extent currently undergoing shift.
++  * @stop_fsb will keep track of the extent at which we have to stop.
++  * If we are shifting left, we will start with block (offset + len) and
++  * shift each extent till last extent.
++  * If we are shifting right, we will start with last extent inside file space
++  * and continue until we reach the block corresponding to offset.
++  */
++ static int
++ xfs_shift_file_space(
++ 	struct xfs_inode        *ip,
++ 	xfs_off_t               offset,
++ 	xfs_off_t               len,
++ 	enum shift_direction	direction)
++ {
++ 	int			done = 0;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 	struct xfs_bmap_free	free_list;
++ 	xfs_fsblock_t		first_block;
++ 	int			committed;
++ 	xfs_fileoff_t		stop_fsb;
++ 	xfs_fileoff_t		next_fsb;
++ 	xfs_fileoff_t		shift_fsb;
++ 
++ 	ASSERT(direction == SHIFT_LEFT || direction == SHIFT_RIGHT);
++ 
++ 	if (direction == SHIFT_LEFT) {
++ 		next_fsb = XFS_B_TO_FSB(mp, offset + len);
++ 		stop_fsb = XFS_B_TO_FSB(mp, VFS_I(ip)->i_size);
++ 	} else {
++ 		/*
++ 		 * If right shift, delegate the work of initialization of
++ 		 * next_fsb to xfs_bmap_shift_extent as it has ilock held.
++ 		 */
++ 		next_fsb = NULLFSBLOCK;
++ 		stop_fsb = XFS_B_TO_FSB(mp, offset);
++ 	}
++ 
++ 	shift_fsb = XFS_B_TO_FSB(mp, len);
++ 
++ 	/*
++ 	 * Trim eofblocks to avoid shifting uninitialized post-eof preallocation
++ 	 * into the accessible region of the file.
++ 	 */
++ 	if (xfs_can_free_eofblocks(ip, true)) {
++ 		error = xfs_free_eofblocks(mp, ip, false);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * Writeback and invalidate cache for the remainder of the file as we're
++ 	 * about to shift down every extent from offset to EOF.
++ 	 */
++ 	error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
++ 					     offset, -1);
++ 	if (error)
++ 		return error;
++ 	error = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
++ 					offset >> PAGE_CACHE_SHIFT, -1);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * The extent shiting code works on extent granularity. So, if
++ 	 * stop_fsb is not the starting block of extent, we need to split
++ 	 * the extent at stop_fsb.
++ 	 */
++ 	if (direction == SHIFT_RIGHT) {
++ 		error = xfs_bmap_split_extent(ip, stop_fsb);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	while (!error && !done) {
++ 		tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
++ 		/*
++ 		 * We would need to reserve permanent block for transaction.
++ 		 * This will come into picture when after shifting extent into
++ 		 * hole we found that adjacent extents can be merged which
++ 		 * may lead to freeing of a block during record update.
++ 		 */
++ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
++ 		if (error) {
++ 			xfs_trans_cancel(tp);
++ 			break;
++ 		}
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		error = xfs_trans_reserve_quota(tp, mp, ip->i_udquot,
++ 				ip->i_gdquot, ip->i_pdquot,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0,
++ 				XFS_QMOPT_RES_REGBLKS);
++ 		if (error)
++ 			goto out_trans_cancel;
++ 
++ 		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 		xfs_bmap_init(&free_list, &first_block);
++ 
++ 		/*
++ 		 * We are using the write transaction in which max 2 bmbt
++ 		 * updates are allowed
++ 		 */
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &free_list,
++ 				direction, XFS_BMAP_MAX_SHIFT_EXTENTS);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 
++ 		error = xfs_bmap_finish(&tp, &free_list, &committed);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 
++ 		error = xfs_trans_commit(tp);
++ 	}
++ 
++ 	return error;
++ 
++ out_bmap_cancel:
++ 	xfs_bmap_cancel(&free_list);
++ out_trans_cancel:
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> d4a97a04227d (xfs: add missing bmap cancel calls in error paths)
+   * xfs_collapse_file_space()
+   *	This routine frees disk space and shift extent for the given file.
+   *	The first thing we do is to free data blocks in the specified range
+diff --cc fs/xfs/xfs_inode.c
+index e92152b360c6,cee2f69d2469..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -1809,15 -1791,16 +1809,20 @@@ xfs_inactive_ifree
+  	xfs_trans_mod_dquot_byino(tp, ip, XFS_TRANS_DQ_ICOUNT, -1);
+  
+  	/*
+- 	 * Just ignore errors at this point.  There is nothing we can
+- 	 * do except to try to keep going. Make sure it's not a silent
+- 	 * error.
++ 	 * Just ignore errors at this point.  There is nothing we can do except
++ 	 * to try to keep going. Make sure it's not a silent error.
+  	 */
+  	error = xfs_bmap_finish(&tp,  &free_list, &committed);
+- 	if (error)
++ 	if (error) {
+  		xfs_notice(mp, "%s: xfs_bmap_finish returned error %d",
+  			__func__, error);
+++<<<<<<< HEAD
+ +	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+++=======
++ 		xfs_bmap_cancel(&free_list);
++ 	}
++ 	error = xfs_trans_commit(tp);
+++>>>>>>> d4a97a04227d (xfs: add missing bmap cancel calls in error paths)
+  	if (error)
+  		xfs_notice(mp, "%s: xfs_trans_commit returned error %d",
+  			__func__, error);
+diff --cc fs/xfs/xfs_rtalloc.c
+index f2079b6911cc,ab1bac6a3a1c..000000000000
+--- a/fs/xfs/xfs_rtalloc.c
++++ b/fs/xfs/xfs_rtalloc.c
+@@@ -780,9 -781,6 +781,12 @@@ xfs_growfs_rt_alloc
+  	 * Allocate space to the file, as necessary.
+  	 */
+  	while (oblocks < nblocks) {
+++<<<<<<< HEAD
+ +		int		cancelflags = 0;
+ +		xfs_trans_t	*tp;
+ +
+++=======
+++>>>>>>> d4a97a04227d (xfs: add missing bmap cancel calls in error paths)
+  		tp = xfs_trans_alloc(mp, XFS_TRANS_GROWFSRT_ALLOC);
+  		resblks = XFS_GROWFSRT_SPACE_RES(mp, nblocks - oblocks);
+  		/*
+@@@ -791,8 -789,7 +795,12 @@@
+  		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_growrtalloc,
+  					  resblks, 0);
+  		if (error)
+++<<<<<<< HEAD
+ +			goto error_cancel;
+ +		cancelflags = XFS_TRANS_RELEASE_LOG_RES;
+++=======
++ 			goto out_trans_cancel;
+++>>>>>>> d4a97a04227d (xfs: add missing bmap cancel calls in error paths)
+  		/*
+  		 * Lock the inode.
+  		 */
+@@@ -817,10 -813,10 +825,15 @@@
+  		 */
+  		error = xfs_bmap_finish(&tp, &flist, &committed);
+  		if (error)
+++<<<<<<< HEAD
+ +			goto error_cancel;
+ +		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+++=======
++ 			goto out_bmap_cancel;
++ 		error = xfs_trans_commit(tp);
+++>>>>>>> d4a97a04227d (xfs: add missing bmap cancel calls in error paths)
+  		if (error)
+- 			goto error;
++ 			return error;
+  		/*
+  		 * Now we need to clear the allocated blocks.
+  		 * Do this one block per transaction, to keep it simple.
+@@@ -850,18 -845,16 +863,22 @@@
+  				mp->m_bsize, 0);
+  			if (bp == NULL) {
+  				error = -EIO;
+++<<<<<<< HEAD
+ +error_cancel:
+ +				xfs_trans_cancel(tp, cancelflags);
+ +				goto error;
+++=======
++ 				goto out_trans_cancel;
+++>>>>>>> d4a97a04227d (xfs: add missing bmap cancel calls in error paths)
+  			}
+  			memset(bp->b_addr, 0, mp->m_sb.sb_blocksize);
+  			xfs_trans_log_buf(tp, bp, 0, mp->m_sb.sb_blocksize - 1);
+  			/*
+  			 * Commit the transaction.
+  			 */
+ -			error = xfs_trans_commit(tp);
+ +			error = xfs_trans_commit(tp, 0);
+  			if (error)
+- 				goto error;
++ 				return error;
+  		}
+  		/*
+  		 * Go on to the next extent, if any.
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/xfs_bmap_util.c
+* Unmerged path fs/xfs/xfs_inode.c
+* Unmerged path fs/xfs/xfs_rtalloc.c
