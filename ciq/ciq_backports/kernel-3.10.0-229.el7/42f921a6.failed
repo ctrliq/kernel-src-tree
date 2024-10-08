@@ -1,0 +1,475 @@
+cpufreq: remove sysfs files for CPUs which failed to come back after resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] remove sysfs files for CPUs which failed to come back after resume (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 93.62%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 42f921a6f10c6c2079b093a115eb7e3c3508357f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/42f921a6.failed
+
+There are cases where cpufreq_add_dev() may fail for some CPUs
+during system resume. With the current code we will still have
+sysfs cpufreq files for those CPUs and struct cpufreq_policy
+would be already freed for them. Hence any operation on those
+sysfs files would result in kernel warnings.
+
+Example of problems resulting from resume errors (from Bjørn Mork):
+
+WARNING: CPU: 0 PID: 6055 at fs/sysfs/file.c:343 sysfs_open_file+0x77/0x212()
+missing sysfs attribute operations for kobject: (null)
+Modules linked in: [stripped as irrelevant]
+CPU: 0 PID: 6055 Comm: grep Tainted: G      D      3.13.0-rc2 #153
+Hardware name: LENOVO 2776LEG/2776LEG, BIOS 6EET55WW (3.15 ) 12/19/2011
+ 0000000000000009 ffff8802327ebb78 ffffffff81380b0e 0000000000000006
+ ffff8802327ebbc8 ffff8802327ebbb8 ffffffff81038635 0000000000000000
+ ffffffff811823c7 ffff88021a19e688 ffff88021a19e688 ffff8802302f9310
+Call Trace:
+ [<ffffffff81380b0e>] dump_stack+0x55/0x76
+ [<ffffffff81038635>] warn_slowpath_common+0x7c/0x96
+ [<ffffffff811823c7>] ? sysfs_open_file+0x77/0x212
+ [<ffffffff810386e3>] warn_slowpath_fmt+0x41/0x43
+ [<ffffffff81182dec>] ? sysfs_get_active+0x6b/0x82
+ [<ffffffff81182382>] ? sysfs_open_file+0x32/0x212
+ [<ffffffff811823c7>] sysfs_open_file+0x77/0x212
+ [<ffffffff81182350>] ? sysfs_schedule_callback+0x1ac/0x1ac
+ [<ffffffff81122562>] do_dentry_open+0x17c/0x257
+ [<ffffffff8112267e>] finish_open+0x41/0x4f
+ [<ffffffff81130225>] do_last+0x80c/0x9ba
+ [<ffffffff8112dbbd>] ? inode_permission+0x40/0x42
+ [<ffffffff81130606>] path_openat+0x233/0x4a1
+ [<ffffffff81130b7e>] do_filp_open+0x35/0x85
+ [<ffffffff8113b787>] ? __alloc_fd+0x172/0x184
+ [<ffffffff811232ea>] do_sys_open+0x6b/0xfa
+ [<ffffffff811233a7>] SyS_openat+0xf/0x11
+ [<ffffffff8138c812>] system_call_fastpath+0x16/0x1b
+
+To fix this, remove those sysfs files or put the associated kobject
+in case of such errors. Also, to make it simple, remove the cpufreq
+sysfs links from all the CPUs (except for the policy->cpu) during
+suspend, as that operation won't result in a loss of sysfs file
+permissions and we can create those links during resume just fine.
+
+Fixes: 5302c3fb2e62 ("cpufreq: Perform light-weight init/teardown during suspend/resume")
+Reported-and-tested-by: Bjørn Mork <bjorn@mork.no>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Cc: 3.12+ <stable@vger.kernel.org> # 3.12+
+[rjw: Changelog]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 42f921a6f10c6c2079b093a115eb7e3c3508357f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 7e78bc2de297,fab042e1ee90..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -874,21 -844,21 +874,26 @@@ static void cpufreq_init_policy(struct 
+  }
+  
+  #ifdef CONFIG_HOTPLUG_CPU
+++<<<<<<< HEAD
+ +static int cpufreq_add_policy_cpu(unsigned int cpu, unsigned int sibling,
+ +				  struct device *dev)
+++=======
++ static int cpufreq_add_policy_cpu(struct cpufreq_policy *policy,
++ 				  unsigned int cpu, struct device *dev)
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  {
+ -	int ret = 0;
+ +	struct cpufreq_policy *policy;
+ +	int ret = 0, has_target = !!cpufreq_driver->target;
+  	unsigned long flags;
+  
+ -	if (has_target()) {
+ -		ret = __cpufreq_governor(policy, CPUFREQ_GOV_STOP);
+ -		if (ret) {
+ -			pr_err("%s: Failed to stop governor\n", __func__);
+ -			return ret;
+ -		}
+ -	}
+ +	policy = cpufreq_cpu_get(sibling);
+ +	if (WARN_ON_ONCE(!policy))
+ +		return -ENODATA;
+  
+ -	down_write(&policy->rwsem);
+ +	if (has_target)
+ +		__cpufreq_governor(policy, CPUFREQ_GOV_STOP);
+ +
+ +	lock_policy_rwsem_write(sibling);
+  
+  	write_lock_irqsave(&cpufreq_driver_lock, flags);
+  
+@@@ -897,30 -866,108 +902,125 @@@
+  	per_cpu(cpufreq_cpu_data, cpu) = policy;
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+ -	up_write(&policy->rwsem);
+ +	unlock_policy_rwsem_write(sibling);
+  
+ -	if (has_target()) {
+ -		if ((ret = __cpufreq_governor(policy, CPUFREQ_GOV_START)) ||
+ -			(ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))) {
+ -			pr_err("%s: Failed to start governor\n", __func__);
+ -			return ret;
+ -		}
+ +	if (has_target) {
+ +		__cpufreq_governor(policy, CPUFREQ_GOV_START);
+ +		__cpufreq_governor(policy, CPUFREQ_GOV_LIMITS);
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = sysfs_create_link(&dev->kobj, &policy->kobj, "cpufreq");
+ +
+ +	cpufreq_cpu_put(policy);
+ +	return ret;
+ +}
+ +#endif
+ +
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ 	return sysfs_create_link(&dev->kobj, &policy->kobj, "cpufreq");
++ }
++ #endif
++ 
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	INIT_LIST_HEAD(&policy->policy_list);
++ 	init_rwsem(&policy->rwsem);
++ 
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_put_kobj(struct cpufreq_policy *policy)
++ {
++ 	struct kobject *kobj;
++ 	struct completion *cmp;
++ 
++ 	down_read(&policy->rwsem);
++ 	kobj = &policy->kobj;
++ 	cmp = &policy->kobj_unregister;
++ 	up_read(&policy->rwsem);
++ 	kobject_put(kobj);
++ 
++ 	/*
++ 	 * We need to make sure that the underlying kobj is
++ 	 * actually not referenced anymore by anybody before we
++ 	 * proceed with unloading.
++ 	 */
++ 	pr_debug("waiting for dropping of refcount\n");
++ 	wait_for_completion(cmp);
++ 	pr_debug("wait complete\n");
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
++ {
++ 	if (WARN_ON(cpu == policy->cpu))
++ 		return;
++ 
++ 	down_write(&policy->rwsem);
++ 
++ 	policy->last_cpu = policy->cpu;
++ 	policy->cpu = cpu;
++ 
++ 	up_write(&policy->rwsem);
++ 
++ 	cpufreq_frequency_table_update_policy_cpu(policy);
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_UPDATE_POLICY_CPU, policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
++ 			     bool frozen)
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+@@@ -952,11 -999,10 +1052,15 @@@
+  #ifdef CONFIG_HOTPLUG_CPU
+  	/* Check if this cpu was hot-unplugged earlier and has siblings */
+  	read_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	list_for_each_entry(tpolicy, &cpufreq_policy_list, policy_list) {
+ -		if (cpumask_test_cpu(cpu, tpolicy->related_cpus)) {
+ +	for_each_online_cpu(sibling) {
+ +		struct cpufreq_policy *cp = per_cpu(cpufreq_cpu_data, sibling);
+ +		if (cp && cpumask_test_cpu(cpu, cp->related_cpus)) {
+  			read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+++<<<<<<< HEAD
+ +			ret = cpufreq_add_policy_cpu(cpu, sibling, dev);
+++=======
++ 			ret = cpufreq_add_policy_cpu(tpolicy, cpu, dev);
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  			up_read(&cpufreq_rwsem);
+  			return ret;
+  		}
+@@@ -1057,35 -1112,31 +1161,46 @@@ err_get_freq
+  	if (cpufreq_driver->exit)
+  		cpufreq_driver->exit(policy);
+  err_set_policy_cpu:
+++<<<<<<< HEAD
+ +	per_cpu(cpufreq_policy_cpu, cpu) = -1;
+ +	free_cpumask_var(policy->related_cpus);
+ +err_free_cpumask:
+ +	free_cpumask_var(policy->cpus);
+ +err_free_policy:
+ +	kfree(policy);
+++=======
++ 	if (frozen)
++ 		cpufreq_policy_put_kobj(policy);
++ 	cpufreq_policy_free(policy);
++ 
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  nomem_out:
+  	up_read(&cpufreq_rwsem);
+ -
+  	return ret;
+  }
+  
+ -/**
+ - * cpufreq_add_dev - add a CPU device
+ - *
+ - * Adds the cpufreq interface for a CPU device.
+ - *
+ - * The Oracle says: try running cpufreq registration/unregistration concurrently
+ - * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ - * mess up, but more thorough testing is needed. - Mathieu
+ - */
+ -static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+ +static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
+  {
+ -	return __cpufreq_add_dev(dev, sif, false);
+ +	int j;
+ +
+ +	policy->last_cpu = policy->cpu;
+ +	policy->cpu = cpu;
+ +
+ +	for_each_cpu(j, policy->cpus)
+ +		per_cpu(cpufreq_policy_cpu, j) = cpu;
+ +
+ +#ifdef CONFIG_CPU_FREQ_TABLE
+ +	cpufreq_frequency_table_update_policy_cpu(policy);
+ +#endif
+ +	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+ +			CPUFREQ_UPDATE_POLICY_CPU, policy);
+  }
+  
+++<<<<<<< HEAD
+ +static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *data,
+++=======
++ static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *policy,
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  					   unsigned int old_cpu)
+  {
+  	struct device *cpu_dev;
+@@@ -1093,9 -1143,10 +1208,14 @@@
+  	int ret;
+  
+  	/* first sibling now owns the new sysfs dir */
+++<<<<<<< HEAD
+ +	cpu_dev = get_cpu_device(cpumask_first(data->cpus));
+++=======
++ 	cpu_dev = get_cpu_device(cpumask_any_but(policy->cpus, old_cpu));
++ 
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  	sysfs_remove_link(&cpu_dev->kobj, "cpufreq");
+ -	ret = kobject_move(&policy->kobj, &cpu_dev->kobj);
+ +	ret = kobject_move(&data->kobj, &cpu_dev->kobj);
+  	if (ret) {
+  		pr_err("%s: Failed to move kobj: %d", __func__, ret);
+  
+@@@ -1152,59 -1200,94 +1272,114 @@@ static int __cpufreq_remove_dev(struct 
+  #ifdef CONFIG_HOTPLUG_CPU
+  	if (!cpufreq_driver->setpolicy)
+  		strncpy(per_cpu(cpufreq_cpu_governor, cpu),
+ -			policy->governor->name, CPUFREQ_NAME_LEN);
+ +			data->governor->name, CPUFREQ_NAME_LEN);
+  #endif
+  
+++<<<<<<< HEAD
+ +	WARN_ON(lock_policy_rwsem_write(cpu));
+ +	cpus = cpumask_weight(data->cpus);
+++=======
++ 	down_read(&policy->rwsem);
++ 	cpus = cpumask_weight(policy->cpus);
++ 	up_read(&policy->rwsem);
++ 
++ 	if (cpu != policy->cpu) {
++ 		if (!frozen)
++ 			sysfs_remove_link(&dev->kobj, "cpufreq");
++ 	} else if (cpus > 1) {
++ 		new_cpu = cpufreq_nominate_new_policy_cpu(policy, cpu);
++ 		if (new_cpu >= 0) {
++ 			update_policy_cpu(policy, new_cpu);
++ 
++ 			if (!frozen) {
++ 				pr_debug("%s: policy Kobject moved to cpu: %d from: %d\n",
++ 						__func__, new_cpu, cpu);
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int __cpufreq_remove_dev_finish(struct device *dev,
++ 				       struct subsys_interface *sif,
++ 				       bool frozen)
++ {
++ 	unsigned int cpu = dev->id, cpus;
++ 	int ret;
++ 	unsigned long flags;
++ 	struct cpufreq_policy *policy;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy) {
++ 		pr_debug("%s: No cpu_data found\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	down_write(&policy->rwsem);
++ 	cpus = cpumask_weight(policy->cpus);
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  
+  	if (cpus > 1)
+ -		cpumask_clear_cpu(cpu, policy->cpus);
+ -	up_write(&policy->rwsem);
+ +		cpumask_clear_cpu(cpu, data->cpus);
+ +	unlock_policy_rwsem_write(cpu);
+  
+ -	/* If cpu is last user of policy, free policy */
+ -	if (cpus == 1) {
+ -		if (has_target()) {
+ -			ret = __cpufreq_governor(policy,
+ -					CPUFREQ_GOV_POLICY_EXIT);
+ -			if (ret) {
+ -				pr_err("%s: Failed to exit governor\n",
+ -						__func__);
+ -				return ret;
+ -			}
+ +	if (cpu != data->cpu) {
+ +		sysfs_remove_link(&dev->kobj, "cpufreq");
+ +	} else if (cpus > 1) {
+ +
+ +		new_cpu = cpufreq_nominate_new_policy_cpu(data, cpu);
+ +		if (new_cpu >= 0) {
+ +			WARN_ON(lock_policy_rwsem_write(cpu));
+ +			update_policy_cpu(data, new_cpu);
+ +			unlock_policy_rwsem_write(cpu);
+ +			pr_debug("%s: policy Kobject moved to cpu: %d "
+ +				 "from: %d\n",__func__, new_cpu, cpu);
+  		}
+ +	}
+  
+ +	/* If cpu is last user of policy, free policy */
+ +	if (cpus == 1) {
+ +		if (cpufreq_driver->target)
+ +			__cpufreq_governor(data, CPUFREQ_GOV_POLICY_EXIT);
+ +
+++<<<<<<< HEAD
+ +		lock_policy_rwsem_read(cpu);
+ +		kobj = &data->kobj;
+ +		cmp = &data->kobj_unregister;
+ +		unlock_policy_rwsem_read(cpu);
+ +		kobject_put(kobj);
+ +
+ +		/* we need to make sure that the underlying kobj is actually
+ +		 * not referenced anymore by anybody before we proceed with
+ +		 * unloading.
+++=======
++ 		if (!frozen)
++ 			cpufreq_policy_put_kobj(policy);
++ 
++ 		/*
++ 		 * Perform the ->exit() even during light-weight tear-down,
++ 		 * since this is a core component, and is essential for the
++ 		 * subsequent light-weight ->init() to succeed.
+++>>>>>>> 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+  		 */
+ -		if (cpufreq_driver->exit)
+ -			cpufreq_driver->exit(policy);
+ +		pr_debug("waiting for dropping of refcount\n");
+ +		wait_for_completion(cmp);
+ +		pr_debug("wait complete\n");
+  
+ -		/* Remove policy from list of active policies */
+ -		write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -		list_del(&policy->policy_list);
+ -		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +		if (cpufreq_driver->exit)
+ +			cpufreq_driver->exit(data);
+  
+ -		if (!frozen)
+ -			cpufreq_policy_free(policy);
+ +		free_cpumask_var(data->related_cpus);
+ +		free_cpumask_var(data->cpus);
+ +		kfree(data);
+  	} else {
+ -		if (has_target()) {
+ -			if ((ret = __cpufreq_governor(policy, CPUFREQ_GOV_START)) ||
+ -					(ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))) {
+ -				pr_err("%s: Failed to start governor\n",
+ -						__func__);
+ -				return ret;
+ -			}
+ +		if (cpufreq_driver->target) {
+ +			__cpufreq_governor(data, CPUFREQ_GOV_START);
+ +			__cpufreq_governor(data, CPUFREQ_GOV_LIMITS);
+  		}
+  	}
+  
+* Unmerged path drivers/cpufreq/cpufreq.c
