@@ -6153,11 +6153,9 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	/* We control everything through one PF */
 	func = SOURCEPF_GET(readl(adapter->regs + PL_WHOAMI));
-	if ((pdev->device == 0xa000 && func != 0) ||
-	    func != ent->driver_data) {
+	if (func != ent->driver_data) {
 		pci_save_state(pdev);        /* to restore SR-IOV later */
-		err = 0;
-		goto out_unmap_bar0;
+		goto sriov;
 	}
 
 	adapter->pdev = pdev;
@@ -6319,6 +6317,7 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (is_offload(adapter))
 		attach_ulds(adapter);
 
+sriov:
 #ifdef CONFIG_PCI_IOV
 	if (func < ARRAY_SIZE(num_vf) && num_vf[func] > 0)
 		if (pci_enable_sriov(pdev, num_vf[func]) == 0)
