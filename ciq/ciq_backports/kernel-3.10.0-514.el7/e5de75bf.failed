@@ -1,0 +1,148 @@
+netfilter: bridge: move DNAT helper to br_netfilter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit e5de75bf88858f5b3ab11e2504b86ec059f03102
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e5de75bf.failed
+
+Only one caller, there is no need to keep this in a header.
+Move it to br_netfilter.c where this belongs to.
+
+Based on patch from Florian Westphal.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit e5de75bf88858f5b3ab11e2504b86ec059f03102)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter_bridge.h
+#	net/bridge/br_device.c
+#	net/bridge/br_private.h
+diff --cc include/linux/netfilter_bridge.h
+index 754600083b7e,bb39113ea596..000000000000
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@@ -81,19 -43,7 +81,23 @@@ static inline unsigned int nf_bridge_mt
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb);
+ +/* Only used in br_device.c */
+ +static inline int br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
+ +{
+ +	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+ +
+ +	skb_pull(skb, ETH_HLEN);
+ +	nf_bridge->mask ^= BRNF_BRIDGED_DNAT;
+ +	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN-ETH_ALEN),
+ +				       skb->nf_bridge->data, ETH_HLEN-ETH_ALEN);
+ +	skb->dev = nf_bridge->physindev;
+ +	return br_handle_frame_finish(NULL, skb);
+ +}
+++=======
++ int br_handle_frame_finish(struct sk_buff *skb);
+++>>>>>>> e5de75bf8885 (netfilter: bridge: move DNAT helper to br_netfilter)
+  
+  /* This is called by the IP fragmenting code and it ensures there is
+   * enough room for the encapsulating header (if there is one). */
+diff --cc net/bridge/br_device.c
+index 5e3347b02745,294cbcc49263..000000000000
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@@ -36,9 -36,7 +36,13 @@@ netdev_tx_t br_dev_xmit(struct sk_buff 
+  	u16 vid = 0;
+  
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
+ +		br_nf_pre_routing_finish_bridge_slow(skb);
+++=======
++ 	if (br_nf_prerouting_finish_bridge(skb)) {
+++>>>>>>> e5de75bf8885 (netfilter: bridge: move DNAT helper to br_netfilter)
+  		rcu_read_unlock();
+  		return NETDEV_TX_OK;
+  	}
+diff --cc net/bridge/br_private.h
+index 42f63e0bc8cf,d63fc17fe4f4..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -744,13 -763,18 +744,28 @@@ static inline int br_vlan_enabled(struc
+  #endif
+  
+  /* br_netfilter.c */
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +int br_netfilter_init(void);
+ +void br_netfilter_fini(void);
+ +void br_netfilter_rtable_init(struct net_bridge *);
+ +#else
+ +#define br_netfilter_init()	(0)
+ +#define br_netfilter_fini()	do { } while(0)
+++=======
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ int br_nf_prerouting_finish_bridge(struct sk_buff *skb);
++ int br_nf_core_init(void);
++ void br_nf_core_fini(void);
++ void br_netfilter_rtable_init(struct net_bridge *);
++ #else
++ static inline int br_nf_prerouting_finish_bridge(struct sk_buff *skb)
++ {
++         return 0;
++ }
++ static inline int br_nf_core_init(void) { return 0; }
++ static inline void br_nf_core_fini(void) {}
+++>>>>>>> e5de75bf8885 (netfilter: bridge: move DNAT helper to br_netfilter)
+  #define br_netfilter_rtable_init(x)
+  #endif
+  
+* Unmerged path include/linux/netfilter_bridge.h
+* Unmerged path net/bridge/br_device.c
+diff --git a/net/bridge/br_netfilter.c b/net/bridge/br_netfilter.c
+index d354bf857875..0f52496b467d 100644
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@ -908,6 +908,38 @@ static unsigned int ip_sabotage_in(const struct nf_hook_ops *ops,
+ 	return NF_ACCEPT;
+ }
+ 
++/* This is called when br_netfilter has called into iptables/netfilter,
++ * and DNAT has taken place on a bridge-forwarded packet.
++ *
++ * neigh->output has created a new MAC header, with local br0 MAC
++ * as saddr.
++ *
++ * This restores the original MAC saddr of the bridged packet
++ * before invoking bridge forward logic to transmit the packet.
++ */
++static void br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
++{
++	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
++
++	skb_pull(skb, ETH_HLEN);
++	nf_bridge->mask &= ~BRNF_BRIDGED_DNAT;
++
++	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN-ETH_ALEN),
++				       skb->nf_bridge->data, ETH_HLEN-ETH_ALEN);
++	skb->dev = nf_bridge->physindev;
++	br_handle_frame_finish(skb);
++}
++
++int br_nf_prerouting_finish_bridge(struct sk_buff *skb)
++{
++	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
++		br_nf_pre_routing_finish_bridge_slow(skb);
++		return 1;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(br_nf_prerouting_finish_bridge);
++
+ void br_netfilter_enable(void)
+ {
+ }
+* Unmerged path net/bridge/br_private.h
