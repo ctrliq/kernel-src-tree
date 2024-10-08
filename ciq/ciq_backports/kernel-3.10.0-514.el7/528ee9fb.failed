@@ -1,0 +1,362 @@
+IB/hfi1: Add adaptive cacheless verbs copy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit 528ee9fbf0244406a76cb5e37406eef303b09a46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/528ee9fb.failed
+
+The kernel memcpy is faster than a cacheless copy.  However,
+if too much of the L3 cache is overwritten by one-time copies
+then overall bandwidth suffers.  Implement an adaptive scheme
+where full page copies are tracked and if the number of unique
+entries are larger than a threshold, verbs will use a cacheless
+copy.  Tracked entries are gradually cleaned, allowing memcpy to
+resume once the larger copies have stopped.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 528ee9fbf0244406a76cb5e37406eef303b09a46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/verbs.c
+#	drivers/staging/rdma/hfi1/verbs.h
+diff --cc drivers/staging/hfi1/verbs.c
+index d228eb7fc4f0,82097571aa85..000000000000
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@@ -124,46 -121,182 +124,213 @@@ unsigned int hfi1_max_srq_wrs = 0x1FFFF
+  module_param_named(max_srq_wrs, hfi1_max_srq_wrs, uint, S_IRUGO);
+  MODULE_PARM_DESC(max_srq_wrs, "Maximum number of SRQ WRs support");
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+++=======
++ unsigned short piothreshold;
++ module_param(piothreshold, ushort, S_IRUGO);
++ MODULE_PARM_DESC(piothreshold, "size used to determine sdma vs. pio");
++ 
++ #define COPY_CACHELESS 1
++ #define COPY_ADAPTIVE  2
++ static unsigned int sge_copy_mode;
++ module_param(sge_copy_mode, uint, S_IRUGO);
++ MODULE_PARM_DESC(sge_copy_mode,
++ 		 "Verbs copy mode: 0 use memcpy, 1 use cacheless copy, 2 adapt based on WSS");
++ 
+++>>>>>>> 528ee9fbf024 (IB/hfi1: Add adaptive cacheless verbs copy):drivers/staging/rdma/hfi1/verbs.c
+  static void verbs_sdma_complete(
+  	struct sdma_txreq *cookie,
+ -	int status);
+ -
+ -static int pio_wait(struct rvt_qp *qp,
+ -		    struct send_context *sc,
+ -		    struct hfi1_pkt_state *ps,
+ -		    u32 flag);
+ +	int status,
+ +	int drained);
+  
+  /* Length of buffer to create verbs txreq cache name */
+  #define TXREQ_NAME_LEN 24
+  
++ static uint wss_threshold;
++ module_param(wss_threshold, uint, S_IRUGO);
++ MODULE_PARM_DESC(wss_threshold, "Percentage (1-100) of LLC to use as a threshold for a cacheless copy");
++ static uint wss_clean_period = 256;
++ module_param(wss_clean_period, uint, S_IRUGO);
++ MODULE_PARM_DESC(wss_clean_period, "Count of verbs copies before an entry in the page copy table is cleaned");
++ 
++ /* memory working set size */
++ struct hfi1_wss {
++ 	unsigned long *entries;
++ 	atomic_t total_count;
++ 	atomic_t clean_counter;
++ 	atomic_t clean_entry;
++ 
++ 	int threshold;
++ 	int num_entries;
++ 	long pages_mask;
++ };
++ 
++ static struct hfi1_wss wss;
++ 
++ int hfi1_wss_init(void)
++ {
++ 	long llc_size;
++ 	long llc_bits;
++ 	long table_size;
++ 	long table_bits;
++ 
++ 	/* check for a valid percent range - default to 80 if none or invalid */
++ 	if (wss_threshold < 1 || wss_threshold > 100)
++ 		wss_threshold = 80;
++ 	/* reject a wildly large period */
++ 	if (wss_clean_period > 1000000)
++ 		wss_clean_period = 256;
++ 	/* reject a zero period */
++ 	if (wss_clean_period == 0)
++ 		wss_clean_period = 1;
++ 
++ 	/*
++ 	 * Calculate the table size - the next power of 2 larger than the
++ 	 * LLC size.  LLC size is in KiB.
++ 	 */
++ 	llc_size = wss_llc_size() * 1024;
++ 	table_size = roundup_pow_of_two(llc_size);
++ 
++ 	/* one bit per page in rounded up table */
++ 	llc_bits = llc_size / PAGE_SIZE;
++ 	table_bits = table_size / PAGE_SIZE;
++ 	wss.pages_mask = table_bits - 1;
++ 	wss.num_entries = table_bits / BITS_PER_LONG;
++ 
++ 	wss.threshold = (llc_bits * wss_threshold) / 100;
++ 	if (wss.threshold == 0)
++ 		wss.threshold = 1;
++ 
++ 	atomic_set(&wss.clean_counter, wss_clean_period);
++ 
++ 	wss.entries = kcalloc(wss.num_entries, sizeof(*wss.entries),
++ 			      GFP_KERNEL);
++ 	if (!wss.entries) {
++ 		hfi1_wss_exit();
++ 		return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void hfi1_wss_exit(void)
++ {
++ 	/* coded to handle partially initialized and repeat callers */
++ 	kfree(wss.entries);
++ 	wss.entries = NULL;
++ }
++ 
++ /*
++  * Advance the clean counter.  When the clean period has expired,
++  * clean an entry.
++  *
++  * This is implemented in atomics to avoid locking.  Because multiple
++  * variables are involved, it can be racy which can lead to slightly
++  * inaccurate information.  Since this is only a heuristic, this is
++  * OK.  Any innaccuracies will clean themselves out as the counter
++  * advances.  That said, it is unlikely the entry clean operation will
++  * race - the next possible racer will not start until the next clean
++  * period.
++  *
++  * The clean counter is implemented as a decrement to zero.  When zero
++  * is reached an entry is cleaned.
++  */
++ static void wss_advance_clean_counter(void)
++ {
++ 	int entry;
++ 	int weight;
++ 	unsigned long bits;
++ 
++ 	/* become the cleaner if we decrement the counter to zero */
++ 	if (atomic_dec_and_test(&wss.clean_counter)) {
++ 		/*
++ 		 * Set, not add, the clean period.  This avoids an issue
++ 		 * where the counter could decrement below the clean period.
++ 		 * Doing a set can result in lost decrements, slowing the
++ 		 * clean advance.  Since this a heuristic, this possible
++ 		 * slowdown is OK.
++ 		 *
++ 		 * An alternative is to loop, advancing the counter by a
++ 		 * clean period until the result is > 0. However, this could
++ 		 * lead to several threads keeping another in the clean loop.
++ 		 * This could be mitigated by limiting the number of times
++ 		 * we stay in the loop.
++ 		 */
++ 		atomic_set(&wss.clean_counter, wss_clean_period);
++ 
++ 		/*
++ 		 * Uniquely grab the entry to clean and move to next.
++ 		 * The current entry is always the lower bits of
++ 		 * wss.clean_entry.  The table size, wss.num_entries,
++ 		 * is always a power-of-2.
++ 		 */
++ 		entry = (atomic_inc_return(&wss.clean_entry) - 1)
++ 			& (wss.num_entries - 1);
++ 
++ 		/* clear the entry and count the bits */
++ 		bits = xchg(&wss.entries[entry], 0);
++ 		weight = hweight64((u64)bits);
++ 		/* only adjust the contended total count if needed */
++ 		if (weight)
++ 			atomic_sub(weight, &wss.total_count);
++ 	}
++ }
++ 
++ /*
++  * Insert the given address into the working set array.
++  */
++ static void wss_insert(void *address)
++ {
++ 	u32 page = ((unsigned long)address >> PAGE_SHIFT) & wss.pages_mask;
++ 	u32 entry = page / BITS_PER_LONG; /* assumes this ends up a shift */
++ 	u32 nr = page & (BITS_PER_LONG - 1);
++ 
++ 	if (!test_and_set_bit(nr, &wss.entries[entry]))
++ 		atomic_inc(&wss.total_count);
++ 
++ 	wss_advance_clean_counter();
++ }
++ 
++ /*
++  * Is the working set larger than the threshold?
++  */
++ static inline int wss_exceeds_threshold(void)
++ {
++ 	return atomic_read(&wss.total_count) >= wss.threshold;
++ }
++ 
+ +/*
+ + * Note that it is OK to post send work requests in the SQE and ERR
+ + * states; hfi1_do_send() will process them and generate error
+ + * completions as per IB 1.2 C10-96.
+ + */
+ +const int ib_hfi1_state_ops[IB_QPS_ERR + 1] = {
+ +	[IB_QPS_RESET] = 0,
+ +	[IB_QPS_INIT] = HFI1_POST_RECV_OK,
+ +	[IB_QPS_RTR] = HFI1_POST_RECV_OK | HFI1_PROCESS_RECV_OK,
+ +	[IB_QPS_RTS] = HFI1_POST_RECV_OK | HFI1_PROCESS_RECV_OK |
+ +	    HFI1_POST_SEND_OK | HFI1_PROCESS_SEND_OK |
+ +	    HFI1_PROCESS_NEXT_SEND_OK,
+ +	[IB_QPS_SQD] = HFI1_POST_RECV_OK | HFI1_PROCESS_RECV_OK |
+ +	    HFI1_POST_SEND_OK | HFI1_PROCESS_SEND_OK,
+ +	[IB_QPS_SQE] = HFI1_POST_RECV_OK | HFI1_PROCESS_RECV_OK |
+ +	    HFI1_POST_SEND_OK | HFI1_FLUSH_SEND,
+ +	[IB_QPS_ERR] = HFI1_POST_RECV_OK | HFI1_FLUSH_RECV |
+ +	    HFI1_POST_SEND_OK | HFI1_FLUSH_SEND,
+ +};
+ +
+ +struct hfi1_ucontext {
+ +	struct ib_ucontext ibucontext;
+ +};
+ +
+ +static inline struct hfi1_ucontext *to_iucontext(struct ib_ucontext
+ +						  *ibucontext)
+ +{
+ +	return container_of(ibucontext, struct hfi1_ucontext, ibucontext);
+ +}
+ +
+ +static inline void _hfi1_schedule_send(struct hfi1_qp *qp);
+ +
+  /*
+   * Translate ib_wr_opcode into ib_wc_opcode.
+   */
+@@@ -274,14 -407,47 +441,50 @@@ __be64 ib_hfi1_sys_image_guid
+   * @ss: the SGE state
+   * @data: the data to copy
+   * @length: the length of the data
+ - * @copy_last: do a separate copy of the last 8 bytes
+   */
+  void hfi1_copy_sge(
+ -	struct rvt_sge_state *ss,
+ +	struct hfi1_sge_state *ss,
+  	void *data, u32 length,
+ -	int release,
+ -	int copy_last)
+ +	int release)
+  {
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	struct hfi1_sge *sge = &ss->sge;
+ +
+++=======
++ 	struct rvt_sge *sge = &ss->sge;
++ 	int in_last = 0;
++ 	int i;
++ 	int cacheless_copy = 0;
++ 
++ 	if (sge_copy_mode == COPY_CACHELESS) {
++ 		cacheless_copy = length >= PAGE_SIZE;
++ 	} else if (sge_copy_mode == COPY_ADAPTIVE) {
++ 		if (length >= PAGE_SIZE) {
++ 			/*
++ 			 * NOTE: this *assumes*:
++ 			 * o The first vaddr is the dest.
++ 			 * o If multiple pages, then vaddr is sequential.
++ 			 */
++ 			wss_insert(sge->vaddr);
++ 			if (length >= (2 * PAGE_SIZE))
++ 				wss_insert(sge->vaddr + PAGE_SIZE);
++ 
++ 			cacheless_copy = wss_exceeds_threshold();
++ 		} else {
++ 			wss_advance_clean_counter();
++ 		}
++ 	}
++ 	if (copy_last) {
++ 		if (length > 8) {
++ 			length -= 8;
++ 		} else {
++ 			copy_last = 0;
++ 			in_last = 1;
++ 		}
++ 	}
++ 
++ again:
+++>>>>>>> 528ee9fbf024 (IB/hfi1: Add adaptive cacheless verbs copy):drivers/staging/rdma/hfi1/verbs.c
+  	while (length) {
+  		u32 len = sge->length;
+  
+@@@ -290,7 -456,15 +493,19 @@@
+  		if (len > sge->sge_length)
+  			len = sge->sge_length;
+  		WARN_ON_ONCE(len == 0);
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +		memcpy(sge->vaddr, data, len);
+++=======
++ 		if (unlikely(in_last)) {
++ 			/* enforce byte transfer ordering */
++ 			for (i = 0; i < len; i++)
++ 				((u8 *)sge->vaddr)[i] = ((u8 *)data)[i];
++ 		} else if (cacheless_copy) {
++ 			cacheless_memcpy(sge->vaddr, data, len);
++ 		} else {
++ 			memcpy(sge->vaddr, data, len);
++ 		}
+++>>>>>>> 528ee9fbf024 (IB/hfi1: Add adaptive cacheless verbs copy):drivers/staging/rdma/hfi1/verbs.c
+  		sge->vaddr += len;
+  		sge->length -= len;
+  		sge->sge_length -= len;
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
+diff --git a/drivers/staging/hfi1/init.c b/drivers/staging/hfi1/init.c
+index 9c4bb834cbe9..59c3504fc0bd 100644
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@ -1217,6 +1217,9 @@ static int __init hfi1_mod_init(void)
+ 	idr_init(&hfi1_unit_table);
+ 
+ 	hfi1_dbg_init();
++	ret = hfi1_wss_init();
++	if (ret < 0)
++		goto bail_wss;
+ 	ret = pci_register_driver(&hfi1_pci_driver);
+ 	if (ret < 0) {
+ 		pr_err("Unable to register driver: error %d\n", -ret);
+@@ -1225,6 +1228,8 @@ static int __init hfi1_mod_init(void)
+ 	goto bail; /* all OK */
+ 
+ bail_dev:
++	hfi1_wss_exit();
++bail_wss:
+ 	hfi1_dbg_exit();
+ 	idr_destroy(&hfi1_unit_table);
+ 	dev_cleanup();
+@@ -1240,6 +1245,7 @@ module_init(hfi1_mod_init);
+ static void __exit hfi1_mod_cleanup(void)
+ {
+ 	pci_unregister_driver(&hfi1_pci_driver);
++	hfi1_wss_exit();
+ 	hfi1_dbg_exit();
+ 	hfi1_cpulist_count = 0;
+ 	kfree(hfi1_cpulist);
+* Unmerged path drivers/staging/hfi1/verbs.c
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
