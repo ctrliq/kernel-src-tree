@@ -1,0 +1,544 @@
+bnx2x: VF can report link speed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Dmitry Kravkov <Dmitry.Kravkov@qlogic.com>
+commit 6495d15a7cb1f3328dc38557c48afb754f900c14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/6495d15a.failed
+
+Until now VFs were oblvious to the actual configured link parameters.
+This patch does 2 things:
+
+  1. It enables a PF to inform its VF using the bulletin board of the link
+     configured, and allows the VF to present that information.
+
+  2. It adds support of `ndo_set_vf_link_state', allowing the hypervisor
+     to set the VF link state.
+
+	Signed-off-by: Dmitry Kravkov <Dmitry.Kravkov@qlogic.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@qlogic.com>
+	Signed-off-by: Ariel Elior <Ariel.Elior@qlogic.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6495d15a7cb1f3328dc38557c48afb754f900c14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+diff --cc drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+index 084a07375094,662310c5f4e9..000000000000
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+@@@ -2862,47 -2984,74 +2984,79 @@@ u32 bnx2x_crc_vf_bulletin(struct pf_vf_
+  /* Check for new posts on the bulletin board */
+  enum sample_bulletin_result bnx2x_sample_bulletin(struct bnx2x *bp)
+  {
+- 	struct pf_vf_bulletin_content bulletin = bp->pf2vf_bulletin->content;
++ 	struct pf_vf_bulletin_content *bulletin;
+  	int attempts;
+  
+- 	/* bulletin board hasn't changed since last sample */
+- 	if (bp->old_bulletin.version == bulletin.version)
+- 		return PFVF_BULLETIN_UNCHANGED;
++ 	/* sampling structure in mid post may result with corrupted data
++ 	 * validate crc to ensure coherency.
++ 	 */
++ 	for (attempts = 0; attempts < BULLETIN_ATTEMPTS; attempts++) {
++ 		u32 crc;
+  
+- 	/* validate crc of new bulletin board */
+- 	if (bp->old_bulletin.version != bp->pf2vf_bulletin->content.version) {
+- 		/* sampling structure in mid post may result with corrupted data
+- 		 * validate crc to ensure coherency.
+- 		 */
+- 		for (attempts = 0; attempts < BULLETIN_ATTEMPTS; attempts++) {
+- 			bulletin = bp->pf2vf_bulletin->content;
+- 			if (bulletin.crc == bnx2x_crc_vf_bulletin(bp,
+- 								  &bulletin))
+- 				break;
+- 			BNX2X_ERR("bad crc on bulletin board. Contained %x computed %x\n",
+- 				  bulletin.crc,
+- 				  bnx2x_crc_vf_bulletin(bp, &bulletin));
+- 		}
+- 		if (attempts >= BULLETIN_ATTEMPTS) {
+- 			BNX2X_ERR("pf to vf bulletin board crc was wrong %d consecutive times. Aborting\n",
+- 				  attempts);
+- 			return PFVF_BULLETIN_CRC_ERR;
+- 		}
++ 		/* sample the bulletin board */
++ 		memcpy(&bp->shadow_bulletin, bp->pf2vf_bulletin,
++ 		       sizeof(union pf_vf_bulletin));
++ 
++ 		crc = bnx2x_crc_vf_bulletin(&bp->shadow_bulletin.content);
++ 
++ 		if (bp->shadow_bulletin.content.crc == crc)
++ 			break;
++ 
++ 		BNX2X_ERR("bad crc on bulletin board. Contained %x computed %x\n",
++ 			  bp->shadow_bulletin.content.crc, crc);
++ 	}
++ 
++ 	if (attempts >= BULLETIN_ATTEMPTS) {
++ 		BNX2X_ERR("pf to vf bulletin board crc was wrong %d consecutive times. Aborting\n",
++ 			  attempts);
++ 		return PFVF_BULLETIN_CRC_ERR;
+  	}
++ 	bulletin = &bp->shadow_bulletin.content;
++ 
++ 	/* bulletin board hasn't changed since last sample */
++ 	if (bp->old_bulletin.version == bulletin->version)
++ 		return PFVF_BULLETIN_UNCHANGED;
+  
+  	/* the mac address in bulletin board is valid and is new */
+++<<<<<<< HEAD
+ +	if (bulletin.valid_bitmap & 1 << MAC_ADDR_VALID &&
+ +	    memcmp(bulletin.mac, bp->old_bulletin.mac, ETH_ALEN)) {
+++=======
++ 	if (bulletin->valid_bitmap & 1 << MAC_ADDR_VALID &&
++ 	    !ether_addr_equal(bulletin->mac, bp->old_bulletin.mac)) {
+++>>>>>>> 6495d15a7cb1 (bnx2x: VF can report link speed)
+  		/* update new mac to net device */
+- 		memcpy(bp->dev->dev_addr, bulletin.mac, ETH_ALEN);
++ 		memcpy(bp->dev->dev_addr, bulletin->mac, ETH_ALEN);
++ 	}
++ 
++ 	if (bulletin->valid_bitmap & (1 << LINK_VALID)) {
++ 		DP(BNX2X_MSG_IOV, "link update speed %d flags %x\n",
++ 		   bulletin->link_speed, bulletin->link_flags);
++ 
++ 		bp->vf_link_vars.line_speed = bulletin->link_speed;
++ 		bp->vf_link_vars.link_report_flags = 0;
++ 		/* Link is down */
++ 		if (bulletin->link_flags & VFPF_LINK_REPORT_LINK_DOWN)
++ 			__set_bit(BNX2X_LINK_REPORT_LINK_DOWN,
++ 				  &bp->vf_link_vars.link_report_flags);
++ 		/* Full DUPLEX */
++ 		if (bulletin->link_flags & VFPF_LINK_REPORT_FULL_DUPLEX)
++ 			__set_bit(BNX2X_LINK_REPORT_FD,
++ 				  &bp->vf_link_vars.link_report_flags);
++ 		/* Rx Flow Control is ON */
++ 		if (bulletin->link_flags & VFPF_LINK_REPORT_RX_FC_ON)
++ 			__set_bit(BNX2X_LINK_REPORT_RX_FC_ON,
++ 				  &bp->vf_link_vars.link_report_flags);
++ 		/* Tx Flow Control is ON */
++ 		if (bulletin->link_flags & VFPF_LINK_REPORT_TX_FC_ON)
++ 			__set_bit(BNX2X_LINK_REPORT_TX_FC_ON,
++ 				  &bp->vf_link_vars.link_report_flags);
++ 		__bnx2x_link_report(bp);
+  	}
+  
+- 	/* the vlan in bulletin board is valid and is new */
+- 	if (bulletin.valid_bitmap & 1 << VLAN_VALID)
+- 		memcpy(&bulletin.vlan, &bp->old_bulletin.vlan, VLAN_HLEN);
+- 
+  	/* copy new bulletin board to bp */
+- 	bp->old_bulletin = bulletin;
++ 	memcpy(&bp->old_bulletin, bulletin,
++ 	       sizeof(struct pf_vf_bulletin_content));
+  
+  	return PFVF_BULLETIN_UPDATED;
+  }
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+index b87434c99f4d..43de8fc78895 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+@@ -1483,6 +1483,7 @@ struct bnx2x {
+ 	union pf_vf_bulletin   *pf2vf_bulletin;
+ 	dma_addr_t		pf2vf_bulletin_mapping;
+ 
++	union pf_vf_bulletin		shadow_bulletin;
+ 	struct pf_vf_bulletin_content	old_bulletin;
+ 
+ 	u16 requested_nr_virtfn;
+@@ -1929,6 +1930,8 @@ struct bnx2x {
+ 	struct semaphore			stats_sema;
+ 
+ 	u8					phys_port_id[ETH_ALEN];
++
++	struct bnx2x_link_report_data		vf_link_vars;
+ };
+ 
+ /* Tx queues may be less or equal to Rx queues */
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+index fd1c59fe4813..215a78aeccd2 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@ -1191,29 +1191,38 @@ u16 bnx2x_get_mf_speed(struct bnx2x *bp)
+ static void bnx2x_fill_report_data(struct bnx2x *bp,
+ 				   struct bnx2x_link_report_data *data)
+ {
+-	u16 line_speed = bnx2x_get_mf_speed(bp);
+-
+ 	memset(data, 0, sizeof(*data));
+ 
+-	/* Fill the report data: effective line speed */
+-	data->line_speed = line_speed;
+-
+-	/* Link is down */
+-	if (!bp->link_vars.link_up || (bp->flags & MF_FUNC_DIS))
+-		__set_bit(BNX2X_LINK_REPORT_LINK_DOWN,
+-			  &data->link_report_flags);
+-
+-	/* Full DUPLEX */
+-	if (bp->link_vars.duplex == DUPLEX_FULL)
+-		__set_bit(BNX2X_LINK_REPORT_FD, &data->link_report_flags);
+-
+-	/* Rx Flow Control is ON */
+-	if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_RX)
+-		__set_bit(BNX2X_LINK_REPORT_RX_FC_ON, &data->link_report_flags);
+-
+-	/* Tx Flow Control is ON */
+-	if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_TX)
+-		__set_bit(BNX2X_LINK_REPORT_TX_FC_ON, &data->link_report_flags);
++	if (IS_PF(bp)) {
++		/* Fill the report data: effective line speed */
++		data->line_speed = bnx2x_get_mf_speed(bp);
++
++		/* Link is down */
++		if (!bp->link_vars.link_up || (bp->flags & MF_FUNC_DIS))
++			__set_bit(BNX2X_LINK_REPORT_LINK_DOWN,
++				  &data->link_report_flags);
++
++		if (!BNX2X_NUM_ETH_QUEUES(bp))
++			__set_bit(BNX2X_LINK_REPORT_LINK_DOWN,
++				  &data->link_report_flags);
++
++		/* Full DUPLEX */
++		if (bp->link_vars.duplex == DUPLEX_FULL)
++			__set_bit(BNX2X_LINK_REPORT_FD,
++				  &data->link_report_flags);
++
++		/* Rx Flow Control is ON */
++		if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_RX)
++			__set_bit(BNX2X_LINK_REPORT_RX_FC_ON,
++				  &data->link_report_flags);
++
++		/* Tx Flow Control is ON */
++		if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_TX)
++			__set_bit(BNX2X_LINK_REPORT_TX_FC_ON,
++				  &data->link_report_flags);
++	} else { /* VF */
++		*data = bp->vf_link_vars;
++	}
+ }
+ 
+ /**
+@@ -1267,6 +1276,10 @@ void __bnx2x_link_report(struct bnx2x *bp)
+ 	 */
+ 	memcpy(&bp->last_reported_link, &cur_data, sizeof(cur_data));
+ 
++	/* propagate status to VFs */
++	if (IS_PF(bp))
++		bnx2x_iov_link_update(bp);
++
+ 	if (test_bit(BNX2X_LINK_REPORT_LINK_DOWN,
+ 		     &cur_data.link_report_flags)) {
+ 		netif_carrier_off(bp->dev);
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
+index b6de05e3149b..ae799786583b 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
+@@ -216,6 +216,43 @@ static int bnx2x_get_port_type(struct bnx2x *bp)
+ 	return port_type;
+ }
+ 
++static int bnx2x_get_vf_settings(struct net_device *dev,
++				 struct ethtool_cmd *cmd)
++{
++	struct bnx2x *bp = netdev_priv(dev);
++
++	if (bp->state == BNX2X_STATE_OPEN) {
++		if (test_bit(BNX2X_LINK_REPORT_FD,
++			     &bp->vf_link_vars.link_report_flags))
++			cmd->duplex = DUPLEX_FULL;
++		else
++			cmd->duplex = DUPLEX_HALF;
++
++		ethtool_cmd_speed_set(cmd, bp->vf_link_vars.line_speed);
++	} else {
++		cmd->duplex = DUPLEX_UNKNOWN;
++		ethtool_cmd_speed_set(cmd, SPEED_UNKNOWN);
++	}
++
++	cmd->port		= PORT_OTHER;
++	cmd->phy_address	= 0;
++	cmd->transceiver	= XCVR_INTERNAL;
++	cmd->autoneg		= AUTONEG_DISABLE;
++	cmd->maxtxpkt		= 0;
++	cmd->maxrxpkt		= 0;
++
++	DP(BNX2X_MSG_ETHTOOL, "ethtool_cmd: cmd %d\n"
++	   "  supported 0x%x  advertising 0x%x  speed %u\n"
++	   "  duplex %d  port %d  phy_address %d  transceiver %d\n"
++	   "  autoneg %d  maxtxpkt %d  maxrxpkt %d\n",
++	   cmd->cmd, cmd->supported, cmd->advertising,
++	   ethtool_cmd_speed(cmd),
++	   cmd->duplex, cmd->port, cmd->phy_address, cmd->transceiver,
++	   cmd->autoneg, cmd->maxtxpkt, cmd->maxrxpkt);
++
++	return 0;
++}
++
+ static int bnx2x_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+ {
+ 	struct bnx2x *bp = netdev_priv(dev);
+@@ -1110,6 +1147,10 @@ static u32 bnx2x_get_link(struct net_device *dev)
+ 	if (bp->flags & MF_FUNC_DIS || (bp->state != BNX2X_STATE_OPEN))
+ 		return 0;
+ 
++	if (IS_VF(bp))
++		return !test_bit(BNX2X_LINK_REPORT_LINK_DOWN,
++				 &bp->vf_link_vars.link_report_flags);
++
+ 	return bp->link_vars.link_up;
+ }
+ 
+@@ -3483,8 +3524,7 @@ static const struct ethtool_ops bnx2x_ethtool_ops = {
+ };
+ 
+ static const struct ethtool_ops bnx2x_vf_ethtool_ops = {
+-	.get_settings		= bnx2x_get_settings,
+-	.set_settings		= bnx2x_set_settings,
++	.get_settings		= bnx2x_get_vf_settings,
+ 	.get_drvinfo		= bnx2x_get_drvinfo,
+ 	.get_msglevel		= bnx2x_get_msglevel,
+ 	.set_msglevel		= bnx2x_set_msglevel,
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index a6ad44c451f4..45bdfeac6a70 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -2698,6 +2698,14 @@ void bnx2x__link_status_update(struct bnx2x *bp)
+ 		bp->link_vars.duplex = DUPLEX_FULL;
+ 		bp->link_vars.flow_ctrl = BNX2X_FLOW_CTRL_NONE;
+ 		__bnx2x_link_report(bp);
++
++		bnx2x_sample_bulletin(bp);
++
++		/* if bulletin board did not have an update for link status
++		 * __bnx2x_link_report will report current status
++		 * but it will NOT duplicate report in case of already reported
++		 * during sampling bulletin board.
++		 */
+ 		bnx2x_stats_handle(bp, STATS_EVENT_LINK_UP);
+ 	}
+ }
+@@ -12424,6 +12432,7 @@ static const struct net_device_ops bnx2x_netdev_ops = {
+ 	.ndo_busy_poll		= bnx2x_low_latency_recv,
+ #endif
+ 	.ndo_get_phys_port_id	= bnx2x_get_phys_port_id,
++	.ndo_set_vf_link_state	= bnx2x_set_vf_link_state,
+ };
+ 
+ static int bnx2x_set_coherency_mask(struct bnx2x *bp)
+* Unmerged path drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h
+index cd4d624d8485..4befa7493a0f 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h
+@@ -126,7 +126,11 @@ struct bnx2x_virtf {
+ #define VF_CACHE_LINE		0x0010
+ #define VF_CFG_VLAN		0x0020
+ #define VF_CFG_STATS_COALESCE	0x0040
+-
++#define VF_CFG_EXT_BULLETIN	0x0080
++	u8 link_cfg;		/* IFLA_VF_LINK_STATE_AUTO
++				 * IFLA_VF_LINK_STATE_ENABLE
++				 * IFLA_VF_LINK_STATE_DISABLE
++				 */
+ 	u8 state;
+ #define VF_FREE		0	/* VF ready to be acquired holds no resc */
+ #define VF_ACQUIRED	1	/* VF acquired, but not initialized */
+@@ -295,22 +299,22 @@ struct bnx2x_vfdb {
+ #define BP_VFDB(bp)		((bp)->vfdb)
+ 	/* vf array */
+ 	struct bnx2x_virtf	*vfs;
+-#define BP_VF(bp, idx)		(&((bp)->vfdb->vfs[(idx)]))
+-#define bnx2x_vf(bp, idx, var)	((bp)->vfdb->vfs[(idx)].var)
++#define BP_VF(bp, idx)		(&((bp)->vfdb->vfs[idx]))
++#define bnx2x_vf(bp, idx, var)	((bp)->vfdb->vfs[idx].var)
+ 
+ 	/* queue array - for all vfs */
+ 	struct bnx2x_vf_queue *vfqs;
+ 
+ 	/* vf HW contexts */
+ 	struct hw_dma		context[BNX2X_VF_CIDS/ILT_PAGE_CIDS];
+-#define	BP_VF_CXT_PAGE(bp, i)	(&(bp)->vfdb->context[(i)])
++#define	BP_VF_CXT_PAGE(bp, i)	(&(bp)->vfdb->context[i])
+ 
+ 	/* SR-IOV information */
+ 	struct bnx2x_sriov	sriov;
+ 	struct hw_dma		mbx_dma;
+ #define BP_VF_MBX_DMA(bp)	(&((bp)->vfdb->mbx_dma))
+ 	struct bnx2x_vf_mbx	mbxs[BNX2X_MAX_NUM_OF_VFS];
+-#define BP_VF_MBX(bp, vfid)	(&((bp)->vfdb->mbxs[(vfid)]))
++#define BP_VF_MBX(bp, vfid)	(&((bp)->vfdb->mbxs[vfid]))
+ 
+ 	struct hw_dma		bulletin_dma;
+ #define BP_VF_BULLETIN_DMA(bp)	(&((bp)->vfdb->bulletin_dma))
+@@ -336,6 +340,9 @@ struct bnx2x_vfdb {
+ 	/* sp_rtnl synchronization */
+ 	struct mutex			event_mutex;
+ 	u64				event_occur;
++
++	/* bulletin board update synchronization */
++	struct mutex			bulletin_mutex;
+ };
+ 
+ /* queue access */
+@@ -467,9 +474,10 @@ void bnx2x_vf_handle_flr_event(struct bnx2x *bp);
+ 
+ bool bnx2x_tlv_supported(u16 tlvtype);
+ 
+-u32 bnx2x_crc_vf_bulletin(struct bnx2x *bp,
+-			  struct pf_vf_bulletin_content *bulletin);
++u32 bnx2x_crc_vf_bulletin(struct pf_vf_bulletin_content *bulletin);
+ int bnx2x_post_vf_bulletin(struct bnx2x *bp, int vf);
++void bnx2x_vf_bulletin_finalize(struct pf_vf_bulletin_content *bulletin,
++				bool support_long);
+ 
+ enum sample_bulletin_result bnx2x_sample_bulletin(struct bnx2x *bp);
+ 
+@@ -520,6 +528,11 @@ void bnx2x_iov_task(struct work_struct *work);
+ 
+ void bnx2x_schedule_iov_task(struct bnx2x *bp, enum bnx2x_iov_flag flag);
+ 
++void bnx2x_iov_link_update(struct bnx2x *bp);
++int bnx2x_iov_link_update_vf(struct bnx2x *bp, int idx);
++
++int bnx2x_set_vf_link_state(struct net_device *dev, int vf, int link_state);
++
+ #else /* CONFIG_BNX2X_SRIOV */
+ 
+ static inline void bnx2x_iov_set_queue_sp_obj(struct bnx2x *bp, int vf_cid,
+@@ -579,6 +592,14 @@ static inline void bnx2x_iov_channel_down(struct bnx2x *bp) {}
+ 
+ static inline void bnx2x_iov_task(struct work_struct *work) {}
+ static inline void bnx2x_schedule_iov_task(struct bnx2x *bp, enum bnx2x_iov_flag flag) {}
++static inline void bnx2x_iov_link_update(struct bnx2x *bp) {}
++static inline int bnx2x_iov_link_update_vf(struct bnx2x *bp, int idx) {return 0; }
++
++static inline int bnx2x_set_vf_link_state(struct net_device *dev, int vf,
++					  int link_state) {return 0; }
++struct pf_vf_bulletin_content;
++static inline void bnx2x_vf_bulletin_finalize(struct pf_vf_bulletin_content *bulletin,
++					      bool support_long) {}
+ 
+ #endif /* CONFIG_BNX2X_SRIOV */
+ #endif /* bnx2x_sriov.h */
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
+index d39b8fcedc31..6d7d60a9cef1 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
+@@ -251,6 +251,9 @@ int bnx2x_vfpf_acquire(struct bnx2x *bp, u8 tx_count, u8 rx_count)
+ 	bnx2x_add_tlv(bp, req, req->first_tlv.tl.length,
+ 		      CHANNEL_TLV_PHYS_PORT_ID, sizeof(struct channel_tlv));
+ 
++	/* Bulletin support for bulletin board with length > legacy length */
++	req->vfdev_info.caps |= VF_CAP_SUPPORT_EXT_BULLETIN;
++
+ 	/* add list termination tlv */
+ 	bnx2x_add_tlv(bp, req,
+ 		      req->first_tlv.tl.length + sizeof(struct channel_tlv),
+@@ -1252,6 +1255,13 @@ static void bnx2x_vf_mbx_acquire(struct bnx2x *bp, struct bnx2x_virtf *vf,
+ 
+ 	/* store address of vf's bulletin board */
+ 	vf->bulletin_map = acquire->bulletin_addr;
++	if (acquire->vfdev_info.caps & VF_CAP_SUPPORT_EXT_BULLETIN) {
++		DP(BNX2X_MSG_IOV, "VF[%d] supports long bulletin boards\n",
++		   vf->abs_vfid);
++		vf->cfg_flags |= VF_CFG_EXT_BULLETIN;
++	} else {
++		vf->cfg_flags &= ~VF_CFG_EXT_BULLETIN;
++	}
+ 
+ 	/* response */
+ 	bnx2x_vf_mbx_acquire_resp(bp, vf, mbx, rc);
+@@ -1273,6 +1283,10 @@ static void bnx2x_vf_mbx_init_vf(struct bnx2x *bp, struct bnx2x_virtf *vf,
+ 	if (init->flags & VFPF_INIT_FLG_STATS_COALESCE)
+ 		vf->cfg_flags |= VF_CFG_STATS_COALESCE;
+ 
++	/* Update VF's view of link state */
++	if (vf->cfg_flags & VF_CFG_EXT_BULLETIN)
++		bnx2x_iov_link_update_vf(bp, vf->index);
++
+ 	/* response */
+ 	bnx2x_vf_mbx_resp(bp, vf, rc);
+ }
+@@ -2007,6 +2021,17 @@ void bnx2x_vf_mbx(struct bnx2x *bp)
+ 	}
+ }
+ 
++void bnx2x_vf_bulletin_finalize(struct pf_vf_bulletin_content *bulletin,
++				bool support_long)
++{
++	/* Older VFs contain a bug where they can't check CRC for bulletin
++	 * boards of length greater than legacy size.
++	 */
++	bulletin->length = support_long ? BULLETIN_CONTENT_SIZE :
++					  BULLETIN_CONTENT_LEGACY_SIZE;
++	bulletin->crc = bnx2x_crc_vf_bulletin(bulletin);
++}
++
+ /* propagate local bulletin board to vf */
+ int bnx2x_post_vf_bulletin(struct bnx2x *bp, int vf)
+ {
+@@ -2023,8 +2048,9 @@ int bnx2x_post_vf_bulletin(struct bnx2x *bp, int vf)
+ 
+ 	/* increment bulletin board version and compute crc */
+ 	bulletin->version++;
+-	bulletin->length = BULLETIN_CONTENT_SIZE;
+-	bulletin->crc = bnx2x_crc_vf_bulletin(bp, bulletin);
++	bnx2x_vf_bulletin_finalize(bulletin,
++				   (bnx2x_vf(bp, vf, cfg_flags) &
++				    VF_CFG_EXT_BULLETIN) ? true : false);
+ 
+ 	/* propagate bulletin board via dmae to vm memory */
+ 	rc = bnx2x_copy32_vf_dmae(bp, false, pf_addr,
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
+index c922b81170e5..ac0f90b0ae44 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
+@@ -65,6 +65,7 @@ struct hw_sb_info {
+ #define VFPF_RX_MASK_ACCEPT_ALL_MULTICAST	0x00000008
+ #define VFPF_RX_MASK_ACCEPT_BROADCAST		0x00000010
+ #define BULLETIN_CONTENT_SIZE		(sizeof(struct pf_vf_bulletin_content))
++#define BULLETIN_CONTENT_LEGACY_SIZE	(32)
+ #define BULLETIN_ATTEMPTS	5 /* crc failures before throwing towel */
+ #define BULLETIN_CRC_SEED	0
+ 
+@@ -117,7 +118,9 @@ struct vfpf_acquire_tlv {
+ 		/* the following fields are for debug purposes */
+ 		u8  vf_id;		/* ME register value */
+ 		u8  vf_os;		/* e.g. Linux, W2K8 */
+-		u8 padding[2];
++		u8 padding;
++		u8 caps;
++#define VF_CAP_SUPPORT_EXT_BULLETIN	(1 << 0)
+ 	} vfdev_info;
+ 
+ 	struct vf_pf_resc_request resc_request;
+@@ -393,11 +396,23 @@ struct pf_vf_bulletin_content {
+ 					 * to attempt to send messages on the
+ 					 * channel after this bit is set
+ 					 */
++#define LINK_VALID		3	/* alert the VF thet a new link status
++					 * update is available for it
++					 */
+ 	u8 mac[ETH_ALEN];
+ 	u8 mac_padding[2];
+ 
+ 	u16 vlan;
+ 	u8 vlan_padding[6];
++
++	u16 link_speed;			 /* Effective line speed */
++	u8 link_speed_padding[6];
++	u32 link_flags;			 /* VFPF_LINK_REPORT_XXX flags */
++#define VFPF_LINK_REPORT_LINK_DOWN	 (1 << 0)
++#define VFPF_LINK_REPORT_FULL_DUPLEX	 (1 << 1)
++#define VFPF_LINK_REPORT_RX_FC_ON	 (1 << 2)
++#define VFPF_LINK_REPORT_TX_FC_ON	 (1 << 3)
++	u8 link_flags_padding[4];
+ };
+ 
+ union pf_vf_bulletin {
