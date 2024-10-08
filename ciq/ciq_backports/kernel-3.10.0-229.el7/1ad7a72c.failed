@@ -1,0 +1,209 @@
+powerpc/eeh: Report frozen parent PE prior to child PE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Report frozen parent PE prior to child PE (Don Zickus) [1127366]
+Rebuild_FUZZ: 92.00%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit 1ad7a72c5e57bc6a7a3190c580df14dc3642febf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1ad7a72c.failed
+
+When we have the corner case of frozen parent and child PE at the
+same time, we have to handle the frozen parent PE prior to the
+child. Without clearning the frozen state on parent PE, the child
+PE can't be recovered successfully.
+
+The patch searches the EEH PE hierarchy tree and returns the toppest
+frozen PE to be handled. It ensures the frozen parent PE will be
+handled prior to child PE.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 1ad7a72c5e57bc6a7a3190c580df14dc3642febf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --cc arch/powerpc/platforms/powernv/eeh-ioda.c
+index be33a16408be,68167cd9ea97..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@@ -750,12 -703,14 +750,21 @@@ static int ioda_eeh_get_pe(struct pci_c
+   */
+  static int ioda_eeh_next_error(struct eeh_pe **pe)
+  {
+ -	struct pci_controller *hose;
+ +	struct pci_controller *hose, *tmp;
+  	struct pnv_phb *phb;
+++<<<<<<< HEAD
+ +	u64 frozen_pe_no;
+ +	u16 err_type, severity;
+ +	long rc;
+ +	int ret = 1;
+++=======
++ 	struct eeh_pe *phb_pe, *parent_pe;
++ 	__be64 frozen_pe_no;
++ 	__be16 err_type, severity;
++ 	int active_flags = (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE);
++ 	long rc;
++ 	int state, ret = EEH_NEXT_ERR_NONE;
+++>>>>>>> 1ad7a72c5e57 (powerpc/eeh: Report frozen parent PE prior to child PE)
+  
+  	/*
+  	 * While running here, it's safe to purge the event queue.
+@@@ -847,18 -793,87 +856,69 @@@
+  
+  			break;
+  		case OPAL_EEH_PE_ERROR:
+ -			/*
+ -			 * If we can't find the corresponding PE, the
+ -			 * PEEV / PEST would be messy. So we force an
+ -			 * fenced PHB so that it can be recovered.
+ -			 *
+ -			 * If the PE has been marked as isolated, that
+ -			 * should have been removed permanently or in
+ -			 * progress with recovery. We needn't report
+ -			 * it again.
+ -			 */
+ -			if (ioda_eeh_get_pe(hose,
+ -					be64_to_cpu(frozen_pe_no), pe)) {
+ -				*pe = phb_pe;
+ -				pr_err("EEH: Escalated fenced PHB#%x "
+ -				       "detected for PE#%llx\n",
+ -					hose->global_number,
+ -					be64_to_cpu(frozen_pe_no));
+ -				ret = EEH_NEXT_ERR_FENCED_PHB;
+ -			} else if ((*pe)->state & EEH_PE_ISOLATED) {
+ -				ret = EEH_NEXT_ERR_NONE;
+ -			} else {
+ -				pr_err("EEH: Frozen PE#%x on PHB#%x detected\n",
+ -					(*pe)->addr, (*pe)->phb->global_number);
+ -				ret = EEH_NEXT_ERR_FROZEN_PE;
+ -			}
+ +			if (ioda_eeh_get_pe(hose, frozen_pe_no, pe))
+ +				break;
+  
+ -			break;
+ -		default:
+ -			pr_warn("%s: Unexpected error type %d\n",
+ -				__func__, be16_to_cpu(err_type));
+ +			pr_err("EEH: Frozen PE#%x on PHB#%x detected\n",
+ +				(*pe)->addr, (*pe)->phb->global_number);
+ +			ret = 1;
+ +			goto out;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		/*
++ 		 * EEH core will try recover from fenced PHB or
++ 		 * frozen PE. In the time for frozen PE, EEH core
++ 		 * enable IO path for that before collecting logs,
++ 		 * but it ruins the site. So we have to dump the
++ 		 * log in advance here.
++ 		 */
++ 		if ((ret == EEH_NEXT_ERR_FROZEN_PE  ||
++ 		    ret == EEH_NEXT_ERR_FENCED_PHB) &&
++ 		    !((*pe)->state & EEH_PE_ISOLATED)) {
++ 			eeh_pe_state_mark(*pe, EEH_PE_ISOLATED);
++ 			ioda_eeh_phb_diag(hose);
++ 		}
++ 
++ 		/*
++ 		 * We probably have the frozen parent PE out there and
++ 		 * we need have to handle frozen parent PE firstly.
++ 		 */
++ 		if (ret == EEH_NEXT_ERR_FROZEN_PE) {
++ 			parent_pe = (*pe)->parent;
++ 			while (parent_pe) {
++ 				/* Hit the ceiling ? */
++ 				if (parent_pe->type & EEH_PE_PHB)
++ 					break;
++ 
++ 				/* Frozen parent PE ? */
++ 				state = ioda_eeh_get_state(parent_pe);
++ 				if (state > 0 &&
++ 				    (state & active_flags) != active_flags)
++ 					*pe = parent_pe;
++ 
++ 				/* Next parent level */
++ 				parent_pe = parent_pe->parent;
++ 			}
++ 
++ 			/* We possibly migrate to another PE */
++ 			eeh_pe_state_mark(*pe, EEH_PE_ISOLATED);
++ 		}
++ 
++ 		/*
++ 		 * If we have no errors on the specific PHB or only
++ 		 * informative error there, we continue poking it.
++ 		 * Otherwise, we need actions to be taken by upper
++ 		 * layer.
++ 		 */
++ 		if (ret > EEH_NEXT_ERR_INF)
++ 			break;
+++>>>>>>> 1ad7a72c5e57 (powerpc/eeh: Report frozen parent PE prior to child PE)
+  	}
+  
+ +	ret = 0;
+ +out:
+  	return ret;
+  }
+  
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 72341d901d08..ca82848e8810 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -358,10 +358,11 @@ out:
+ int eeh_dev_check_failure(struct eeh_dev *edev)
+ {
+ 	int ret;
++	int active_flags = (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE);
+ 	unsigned long flags;
+ 	struct device_node *dn;
+ 	struct pci_dev *dev;
+-	struct eeh_pe *pe;
++	struct eeh_pe *pe, *parent_pe;
+ 	int rc = 0;
+ 	const char *location;
+ 
+@@ -439,14 +440,34 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
+ 	 */
+ 	if ((ret < 0) ||
+ 	    (ret == EEH_STATE_NOT_SUPPORT) ||
+-	    (ret & (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE)) ==
+-	    (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE)) {
++	    ((ret & active_flags) == active_flags)) {
+ 		eeh_stats.false_positives++;
+ 		pe->false_positives++;
+ 		rc = 0;
+ 		goto dn_unlock;
+ 	}
+ 
++	/*
++	 * It should be corner case that the parent PE has been
++	 * put into frozen state as well. We should take care
++	 * that at first.
++	 */
++	parent_pe = pe->parent;
++	while (parent_pe) {
++		/* Hit the ceiling ? */
++		if (parent_pe->type & EEH_PE_PHB)
++			break;
++
++		/* Frozen parent PE ? */
++		ret = eeh_ops->get_state(parent_pe, NULL);
++		if (ret > 0 &&
++		    (ret & active_flags) != active_flags)
++			pe = parent_pe;
++
++		/* Next parent level */
++		parent_pe = parent_pe->parent;
++	}
++
+ 	eeh_stats.slot_resets++;
+ 
+ 	/* Avoid repeated reports of this failure, including problems
+* Unmerged path arch/powerpc/platforms/powernv/eeh-ioda.c
