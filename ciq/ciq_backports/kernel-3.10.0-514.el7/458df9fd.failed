@@ -1,0 +1,139 @@
+printk: remove separate printk_sched buffers and use printk buf instead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Steven Rostedt <rostedt@goodmis.org>
+commit 458df9fd4815b47809875d57f42e16401674b621
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/458df9fd.failed
+
+To prevent deadlocks with doing a printk inside the scheduler,
+printk_sched() was created.  The issue is that printk has a console_sem
+that it can grab and release.  The release does a wake up if there's a
+task pending on the sem, and this wake up grabs the rq locks that is
+held in the scheduler.  This leads to a possible deadlock if the wake up
+uses the same rq as the one with the rq lock held already.
+
+What printk_sched() does is to save the printk write in a per cpu buffer
+and sets the PRINTK_PENDING_SCHED flag.  On a timer tick, if this flag is
+set, the printk() is done against the buffer.
+
+There's a couple of issues with this approach.
+
+1) If two printk_sched()s are called before the tick, the second one
+   will overwrite the first one.
+
+2) The temporary buffer is 512 bytes and is per cpu.  This is a quite a
+   bit of space wasted for something that is seldom used.
+
+In order to remove this, the printk_sched() can use the printk buffer
+instead, and delay the console_trylock()/console_unlock() to the queued
+work.
+
+Because printk_sched() would then be taking the logbuf_lock, the
+logbuf_lock must not be held while doing anything that may call into the
+scheduler functions, which includes wake ups.  Unfortunately, printk()
+also has a console_sem that it uses, and on release, the up(&console_sem)
+may do a wake up of any pending waiters.  This must be avoided while
+holding the logbuf_lock.
+
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 458df9fd4815b47809875d57f42e16401674b621)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk.c
+diff --cc kernel/printk.c
+index 6881a4f0352d,247b0c1fadfc..000000000000
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@@ -211,8 -232,9 +214,14 @@@ struct log 
+  };
+  
+  /*
+++<<<<<<< HEAD:kernel/printk.c
+ + * The logbuf_lock protects kmsg buffer, indices, counters. It is also
+ + * used in interesting ways to provide interlocking in console_unlock();
+++=======
++  * The logbuf_lock protects kmsg buffer, indices, counters.  This can be taken
++  * within the scheduler's rq lock. It must be released before calling
++  * console_unlock() or anything else that might wake up a process.
+++>>>>>>> 458df9fd4815 (printk: remove separate printk_sched buffers and use printk buf instead):kernel/printk/printk.c
+   */
+  static DEFINE_RAW_SPINLOCK(logbuf_lock);
+  
+@@@ -1517,6 -1587,14 +1526,17 @@@ asmlinkage int vprintk_emit(int facilit
+  	unsigned long flags;
+  	int this_cpu;
+  	int printed_len = 0;
+++<<<<<<< HEAD:kernel/printk.c
+++=======
++ 	bool in_sched = false;
++ 	/* cpu currently holding logbuf_lock in this function */
++ 	static volatile unsigned int logbuf_cpu = UINT_MAX;
++ 
++ 	if (level == SCHED_MESSAGE_LOGLEVEL) {
++ 		level = -1;
++ 		in_sched = true;
++ 	}
+++>>>>>>> 458df9fd4815 (printk: remove separate printk_sched buffers and use printk buf instead):kernel/printk/printk.c
+  
+  	boot_delay_msec(level);
+  	printk_delay();
+@@@ -1623,12 -1716,27 +1648,29 @@@
+  			cont_flush(LOG_NEWLINE);
+  		}
+  
+ -		if (stored)
+ -			printed_len += text_len;
+ -		else
+ -			printed_len += log_store(facility, level, lflags, 0,
+ -						 dict, dictlen, text, text_len);
+ +		if (!stored)
+ +			log_store(facility, level, lflags, 0,
+ +				  dict, dictlen, text, text_len);
+  	}
+ +	printed_len += text_len;
+  
+++<<<<<<< HEAD:kernel/printk.c
+++=======
++ 	logbuf_cpu = UINT_MAX;
++ 	raw_spin_unlock(&logbuf_lock);
++ 	lockdep_on();
++ 	local_irq_restore(flags);
++ 
++ 	/* If called from the scheduler, we can not call up(). */
++ 	if (in_sched)
++ 		return printed_len;
++ 
++ 	/*
++ 	 * Disable preemption to avoid being preempted while holding
++ 	 * console_sem which would prevent anyone from printing to console
++ 	 */
++ 	preempt_disable();
+++>>>>>>> 458df9fd4815 (printk: remove separate printk_sched buffers and use printk buf instead):kernel/printk/printk.c
+  	/*
+  	 * Try to acquire and then immediately release the console semaphore.
+  	 * The release will print out buffers and wake up /dev/kmsg and syslog()
+@@@ -2480,9 -2560,10 +2519,16 @@@ static void wake_up_klogd_work_func(str
+  {
+  	int pending = __this_cpu_xchg(printk_pending, 0);
+  
+++<<<<<<< HEAD:kernel/printk.c
+ +	if (pending & PRINTK_PENDING_SCHED) {
+ +		char *buf = __get_cpu_var(printk_sched_buf);
+ +		printk(KERN_WARNING "[sched_delayed] %s", buf);
+++=======
++ 	if (pending & PRINTK_PENDING_OUTPUT) {
++ 		/* If trylock fails, someone else is doing the printing */
++ 		if (console_trylock())
++ 			console_unlock();
+++>>>>>>> 458df9fd4815 (printk: remove separate printk_sched buffers and use printk buf instead):kernel/printk/printk.c
+  	}
+  
+  	if (pending & PRINTK_PENDING_WAKEUP)
+* Unmerged path kernel/printk.c
