@@ -1,0 +1,967 @@
+KVM: PPC: Book3S HV: Context-switch new POWER8 SPRs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: book3s hv - Context-switch new POWER8 SPRs (Don Zickus) [1127366]
+Rebuild_FUZZ: 94.12%
+commit-author Michael Neuling <mikey@neuling.org>
+commit b005255e12a311d2c87ea70a7c7b192b2187c22c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b005255e.failed
+
+This adds fields to the struct kvm_vcpu_arch to store the new
+guest-accessible SPRs on POWER8, adds code to the get/set_one_reg
+functions to allow userspace to access this state, and adds code to
+the guest entry and exit to context-switch these SPRs between host
+and guest.
+
+Note that DPDES (Directed Privileged Doorbell Exception State) is
+shared between threads on a core; hence we store it in struct
+kvmppc_vcore and have the master thread save and restore it.
+
+	Signed-off-by: Michael Neuling <mikey@neuling.org>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit b005255e12a311d2c87ea70a7c7b192b2187c22c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index a13f539b4888,691dd1ef555b..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -289,6 -370,255 +289,258 @@@ kvmppc_hv_entry
+  	std	r0, PPC_LR_STKOFF(r1)
+  	stdu	r1, -112(r1)
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Save R1 in the PACA */
++ 	std	r1, HSTATE_HOST_R1(r13)
++ 
++ 	li	r6, KVM_GUEST_MODE_HOST_HV
++ 	stb	r6, HSTATE_IN_GUEST(r13)
++ 
++ 	/* Clear out SLB */
++ 	li	r6,0
++ 	slbmte	r6,r6
++ 	slbia
++ 	ptesync
++ 
++ BEGIN_FTR_SECTION
++ 	b	30f
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
++ 	/*
++ 	 * POWER7 host -> guest partition switch code.
++ 	 * We don't have to lock against concurrent tlbies,
++ 	 * but we do have to coordinate across hardware threads.
++ 	 */
++ 	/* Increment entry count iff exit count is zero. */
++ 	ld	r5,HSTATE_KVM_VCORE(r13)
++ 	addi	r9,r5,VCORE_ENTRY_EXIT
++ 21:	lwarx	r3,0,r9
++ 	cmpwi	r3,0x100		/* any threads starting to exit? */
++ 	bge	secondary_too_late	/* if so we're too late to the party */
++ 	addi	r3,r3,1
++ 	stwcx.	r3,0,r9
++ 	bne	21b
++ 
++ 	/* Primary thread switches to guest partition. */
++ 	ld	r9,VCORE_KVM(r5)	/* pointer to struct kvm */
++ 	lbz	r6,HSTATE_PTID(r13)
++ 	cmpwi	r6,0
++ 	bne	20f
++ 	ld	r6,KVM_SDR1(r9)
++ 	lwz	r7,KVM_LPID(r9)
++ 	li	r0,LPID_RSVD		/* switch to reserved LPID */
++ 	mtspr	SPRN_LPID,r0
++ 	ptesync
++ 	mtspr	SPRN_SDR1,r6		/* switch to partition page table */
++ 	mtspr	SPRN_LPID,r7
++ 	isync
++ 
++ 	/* See if we need to flush the TLB */
++ 	lhz	r6,PACAPACAINDEX(r13)	/* test_bit(cpu, need_tlb_flush) */
++ 	clrldi	r7,r6,64-6		/* extract bit number (6 bits) */
++ 	srdi	r6,r6,6			/* doubleword number */
++ 	sldi	r6,r6,3			/* address offset */
++ 	add	r6,r6,r9
++ 	addi	r6,r6,KVM_NEED_FLUSH	/* dword in kvm->arch.need_tlb_flush */
++ 	li	r0,1
++ 	sld	r0,r0,r7
++ 	ld	r7,0(r6)
++ 	and.	r7,r7,r0
++ 	beq	22f
++ 23:	ldarx	r7,0,r6			/* if set, clear the bit */
++ 	andc	r7,r7,r0
++ 	stdcx.	r7,0,r6
++ 	bne	23b
++ 	li	r6,128			/* and flush the TLB */
++ 	mtctr	r6
++ 	li	r7,0x800		/* IS field = 0b10 */
++ 	ptesync
++ 28:	tlbiel	r7
++ 	addi	r7,r7,0x1000
++ 	bdnz	28b
++ 	ptesync
++ 
++ 	/* Add timebase offset onto timebase */
++ 22:	ld	r8,VCORE_TB_OFFSET(r5)
++ 	cmpdi	r8,0
++ 	beq	37f
++ 	mftb	r6		/* current host timebase */
++ 	add	r8,r8,r6
++ 	mtspr	SPRN_TBU40,r8	/* update upper 40 bits */
++ 	mftb	r7		/* check if lower 24 bits overflowed */
++ 	clrldi	r6,r6,40
++ 	clrldi	r7,r7,40
++ 	cmpld	r7,r6
++ 	bge	37f
++ 	addis	r8,r8,0x100	/* if so, increment upper 40 bits */
++ 	mtspr	SPRN_TBU40,r8
++ 
++ 	/* Load guest PCR value to select appropriate compat mode */
++ 37:	ld	r7, VCORE_PCR(r5)
++ 	cmpdi	r7, 0
++ 	beq	38f
++ 	mtspr	SPRN_PCR, r7
++ 38:
++ 
++ BEGIN_FTR_SECTION
++ 	/* DPDES is shared between threads */
++ 	ld	r8, VCORE_DPDES(r5)
++ 	mtspr	SPRN_DPDES, r8
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++ 
++ 	li	r0,1
++ 	stb	r0,VCORE_IN_GUEST(r5)	/* signal secondaries to continue */
++ 	b	10f
++ 
++ 	/* Secondary threads wait for primary to have done partition switch */
++ 20:	lbz	r0,VCORE_IN_GUEST(r5)
++ 	cmpwi	r0,0
++ 	beq	20b
++ 
++ 	/* Set LPCR and RMOR. */
++ 10:	ld	r8,VCORE_LPCR(r5)
++ 	mtspr	SPRN_LPCR,r8
++ 	ld	r8,KVM_RMOR(r9)
++ 	mtspr	SPRN_RMOR,r8
++ 	isync
++ 
++ 	/* Check if HDEC expires soon */
++ 	mfspr	r3,SPRN_HDEC
++ 	cmpwi	r3,512		/* 1 microsecond */
++ 	li	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
++ 	blt	hdec_soon
++ 	b	31f
++ 
++ 	/*
++ 	 * PPC970 host -> guest partition switch code.
++ 	 * We have to lock against concurrent tlbies,
++ 	 * using native_tlbie_lock to lock against host tlbies
++ 	 * and kvm->arch.tlbie_lock to lock against guest tlbies.
++ 	 * We also have to invalidate the TLB since its
++ 	 * entries aren't tagged with the LPID.
++ 	 */
++ 30:	ld	r5,HSTATE_KVM_VCORE(r13)
++ 	ld	r9,VCORE_KVM(r5)	/* pointer to struct kvm */
++ 
++ 	/* first take native_tlbie_lock */
++ 	.section ".toc","aw"
++ toc_tlbie_lock:
++ 	.tc	native_tlbie_lock[TC],native_tlbie_lock
++ 	.previous
++ 	ld	r3,toc_tlbie_lock@toc(2)
++ #ifdef __BIG_ENDIAN__
++ 	lwz	r8,PACA_LOCK_TOKEN(r13)
++ #else
++ 	lwz	r8,PACAPACAINDEX(r13)
++ #endif
++ 24:	lwarx	r0,0,r3
++ 	cmpwi	r0,0
++ 	bne	24b
++ 	stwcx.	r8,0,r3
++ 	bne	24b
++ 	isync
++ 
++ 	ld	r5,HSTATE_KVM_VCORE(r13)
++ 	ld	r7,VCORE_LPCR(r5)	/* use vcore->lpcr to store HID4 */
++ 	li	r0,0x18f
++ 	rotldi	r0,r0,HID4_LPID5_SH	/* all lpid bits in HID4 = 1 */
++ 	or	r0,r7,r0
++ 	ptesync
++ 	sync
++ 	mtspr	SPRN_HID4,r0		/* switch to reserved LPID */
++ 	isync
++ 	li	r0,0
++ 	stw	r0,0(r3)		/* drop native_tlbie_lock */
++ 
++ 	/* invalidate the whole TLB */
++ 	li	r0,256
++ 	mtctr	r0
++ 	li	r6,0
++ 25:	tlbiel	r6
++ 	addi	r6,r6,0x1000
++ 	bdnz	25b
++ 	ptesync
++ 
++ 	/* Take the guest's tlbie_lock */
++ 	addi	r3,r9,KVM_TLBIE_LOCK
++ 24:	lwarx	r0,0,r3
++ 	cmpwi	r0,0
++ 	bne	24b
++ 	stwcx.	r8,0,r3
++ 	bne	24b
++ 	isync
++ 	ld	r6,KVM_SDR1(r9)
++ 	mtspr	SPRN_SDR1,r6		/* switch to partition page table */
++ 
++ 	/* Set up HID4 with the guest's LPID etc. */
++ 	sync
++ 	mtspr	SPRN_HID4,r7
++ 	isync
++ 
++ 	/* drop the guest's tlbie_lock */
++ 	li	r0,0
++ 	stw	r0,0(r3)
++ 
++ 	/* Check if HDEC expires soon */
++ 	mfspr	r3,SPRN_HDEC
++ 	cmpwi	r3,10
++ 	li	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
++ 	blt	hdec_soon
++ 
++ 	/* Enable HDEC interrupts */
++ 	mfspr	r0,SPRN_HID0
++ 	li	r3,1
++ 	rldimi	r0,r3, HID0_HDICE_SH, 64-HID0_HDICE_SH-1
++ 	sync
++ 	mtspr	SPRN_HID0,r0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 31:
++ 	/* Do we have a guest vcpu to run? */
++ 	cmpdi	r4, 0
++ 	beq	kvmppc_primary_no_guest
++ kvmppc_got_guest:
++ 
++ 	/* Load up guest SLB entries */
++ 	lwz	r5,VCPU_SLB_MAX(r4)
++ 	cmpwi	r5,0
++ 	beq	9f
++ 	mtctr	r5
++ 	addi	r6,r4,VCPU_SLB
++ 1:	ld	r8,VCPU_SLB_E(r6)
++ 	ld	r9,VCPU_SLB_V(r6)
++ 	slbmte	r9,r8
++ 	addi	r6,r6,VCPU_SLB_SIZE
++ 	bdnz	1b
++ 9:
++ 	/* Increment yield count if they have a VPA */
++ 	ld	r3, VCPU_VPA(r4)
++ 	cmpdi	r3, 0
++ 	beq	25f
++ 	lwz	r5, LPPACA_YIELDCOUNT(r3)
++ 	addi	r5, r5, 1
++ 	stw	r5, LPPACA_YIELDCOUNT(r3)
++ 	li	r6, 1
++ 	stb	r6, VCPU_VPA_DIRTY(r4)
++ 25:
++ 
++ BEGIN_FTR_SECTION
++ 	/* Save purr/spurr */
++ 	mfspr	r5,SPRN_PURR
++ 	mfspr	r6,SPRN_SPURR
++ 	std	r5,HSTATE_PURR(r13)
++ 	std	r6,HSTATE_SPURR(r13)
++ 	ld	r7,VCPU_PURR(r4)
++ 	ld	r8,VCPU_SPURR(r4)
++ 	mtspr	SPRN_PURR,r7
++ 	mtspr	SPRN_SPURR,r8
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
++ 
+++>>>>>>> b005255e12a3 (KVM: PPC: Book3S HV: Context-switch new POWER8 SPRs)
+  BEGIN_FTR_SECTION
+  	/* Set partition DABR */
+  	/* Do this before re-enabling PMU to avoid P7 DABR corruption bug */
+@@@ -1328,25 -1312,244 +1695,182 @@@ BEGIN_FTR_SECTIO
+  	stw	r10, VCPU_PMC + 24(r9)
+  	stw	r11, VCPU_PMC + 28(r9)
+  END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
++ BEGIN_FTR_SECTION
++ 	mfspr	r4, SPRN_MMCR2
++ 	mfspr	r5, SPRN_SIER
++ 	mfspr	r6, SPRN_SPMC1
++ 	mfspr	r7, SPRN_SPMC2
++ 	mfspr	r8, SPRN_MMCRS
++ 	std	r4, VCPU_MMCR + 24(r9)
++ 	std	r5, VCPU_SIER(r9)
++ 	stw	r6, VCPU_PMC + 24(r9)
++ 	stw	r7, VCPU_PMC + 28(r9)
++ 	std	r8, VCPU_MMCR + 32(r9)
++ 	lis	r4, 0x8000
++ 	mtspr	SPRN_MMCRS, r4
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+  22:
+ -	/* Clear out SLB */
+ -	li	r5,0
+ -	slbmte	r5,r5
+ -	slbia
+ -	ptesync
+ -
+ -hdec_soon:			/* r12 = trap, r13 = paca */
+ -BEGIN_FTR_SECTION
+ -	b	32f
+ -END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ -	/*
+ -	 * POWER7 guest -> host partition switch code.
+ -	 * We don't have to lock against tlbies but we do
+ -	 * have to coordinate the hardware threads.
+ -	 */
+ -	/* Increment the threads-exiting-guest count in the 0xff00
+ -	   bits of vcore->entry_exit_count */
+ -	lwsync
+ -	ld	r5,HSTATE_KVM_VCORE(r13)
+ -	addi	r6,r5,VCORE_ENTRY_EXIT
+ -41:	lwarx	r3,0,r6
+ -	addi	r0,r3,0x100
+ -	stwcx.	r0,0,r6
+ -	bne	41b
+ -	lwsync
+ -
+ -	/*
+ -	 * At this point we have an interrupt that we have to pass
+ -	 * up to the kernel or qemu; we can't handle it in real mode.
+ -	 * Thus we have to do a partition switch, so we have to
+ -	 * collect the other threads, if we are the first thread
+ -	 * to take an interrupt.  To do this, we set the HDEC to 0,
+ -	 * which causes an HDEC interrupt in all threads within 2ns
+ -	 * because the HDEC register is shared between all 4 threads.
+ -	 * However, we don't need to bother if this is an HDEC
+ -	 * interrupt, since the other threads will already be on their
+ -	 * way here in that case.
+ -	 */
+ -	cmpwi	r3,0x100	/* Are we the first here? */
+ -	bge	43f
+ -	cmpwi	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
+ -	beq	40f
+ -	li	r0,0
+ -	mtspr	SPRN_HDEC,r0
+ -40:
+ -	/*
+ -	 * Send an IPI to any napping threads, since an HDEC interrupt
+ -	 * doesn't wake CPUs up from nap.
+ -	 */
+ -	lwz	r3,VCORE_NAPPING_THREADS(r5)
+ -	lbz	r4,HSTATE_PTID(r13)
+ -	li	r0,1
+ -	sld	r0,r0,r4
+ -	andc.	r3,r3,r0		/* no sense IPI'ing ourselves */
+ -	beq	43f
+ -	mulli	r4,r4,PACA_SIZE		/* get paca for thread 0 */
+ -	subf	r6,r4,r13
+ -42:	andi.	r0,r3,1
+ -	beq	44f
+ -	ld	r8,HSTATE_XICS_PHYS(r6)	/* get thread's XICS reg addr */
+ -	li	r0,IPI_PRIORITY
+ -	li	r7,XICS_MFRR
+ -	stbcix	r0,r7,r8		/* trigger the IPI */
+ -44:	srdi.	r3,r3,1
+ -	addi	r6,r6,PACA_SIZE
+ -	bne	42b
+ -
+ +	ld	r0, 112+PPC_LR_STKOFF(r1)
+ +	addi	r1, r1, 112
+ +	mtlr	r0
+ +	blr
+  secondary_too_late:
+ -	/* Secondary threads wait for primary to do partition switch */
+ -43:	ld	r5,HSTATE_KVM_VCORE(r13)
+ -	ld	r4,VCORE_KVM(r5)	/* pointer to struct kvm */
+ -	lbz	r3,HSTATE_PTID(r13)
+ -	cmpwi	r3,0
+ -	beq	15f
+ +	ld	r5,HSTATE_KVM_VCORE(r13)
+  	HMT_LOW
+  13:	lbz	r3,VCORE_IN_GUEST(r5)
+  	cmpwi	r3,0
+  	bne	13b
+  	HMT_MEDIUM
+++<<<<<<< HEAD
+ +	li	r0, KVM_GUEST_MODE_NONE
+ +	stb	r0, HSTATE_IN_GUEST(r13)
+ +	ld	r11,PACA_SLBSHADOWPTR(r13)
+++=======
++ 	b	16f
++ 
++ 	/* Primary thread waits for all the secondaries to exit guest */
++ 15:	lwz	r3,VCORE_ENTRY_EXIT(r5)
++ 	srwi	r0,r3,8
++ 	clrldi	r3,r3,56
++ 	cmpw	r3,r0
++ 	bne	15b
++ 	isync
++ 
++ 	/* Primary thread switches back to host partition */
++ 	ld	r6,KVM_HOST_SDR1(r4)
++ 	lwz	r7,KVM_HOST_LPID(r4)
++ 	li	r8,LPID_RSVD		/* switch to reserved LPID */
++ 	mtspr	SPRN_LPID,r8
++ 	ptesync
++ 	mtspr	SPRN_SDR1,r6		/* switch to partition page table */
++ 	mtspr	SPRN_LPID,r7
++ 	isync
++ 
++ BEGIN_FTR_SECTION
++ 	/* DPDES is shared between threads */
++ 	mfspr	r7, SPRN_DPDES
++ 	std	r7, VCORE_DPDES(r5)
++ 	/* clear DPDES so we don't get guest doorbells in the host */
++ 	li	r8, 0
++ 	mtspr	SPRN_DPDES, r8
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++ 
++ 	/* Subtract timebase offset from timebase */
++ 	ld	r8,VCORE_TB_OFFSET(r5)
++ 	cmpdi	r8,0
++ 	beq	17f
++ 	mftb	r6			/* current host timebase */
++ 	subf	r8,r8,r6
++ 	mtspr	SPRN_TBU40,r8		/* update upper 40 bits */
++ 	mftb	r7			/* check if lower 24 bits overflowed */
++ 	clrldi	r6,r6,40
++ 	clrldi	r7,r7,40
++ 	cmpld	r7,r6
++ 	bge	17f
++ 	addis	r8,r8,0x100		/* if so, increment upper 40 bits */
++ 	mtspr	SPRN_TBU40,r8
++ 
++ 	/* Reset PCR */
++ 17:	ld	r0, VCORE_PCR(r5)
++ 	cmpdi	r0, 0
++ 	beq	18f
++ 	li	r0, 0
++ 	mtspr	SPRN_PCR, r0
++ 18:
++ 	/* Signal secondary CPUs to continue */
++ 	stb	r0,VCORE_IN_GUEST(r5)
++ 	lis	r8,0x7fff		/* MAX_INT@h */
++ 	mtspr	SPRN_HDEC,r8
++ 
++ 16:	ld	r8,KVM_HOST_LPCR(r4)
++ 	mtspr	SPRN_LPCR,r8
++ 	isync
++ 	b	33f
++ 
++ 	/*
++ 	 * PPC970 guest -> host partition switch code.
++ 	 * We have to lock against concurrent tlbies, and
++ 	 * we have to flush the whole TLB.
++ 	 */
++ 32:	ld	r5,HSTATE_KVM_VCORE(r13)
++ 	ld	r4,VCORE_KVM(r5)	/* pointer to struct kvm */
++ 
++ 	/* Take the guest's tlbie_lock */
++ #ifdef __BIG_ENDIAN__
++ 	lwz	r8,PACA_LOCK_TOKEN(r13)
++ #else
++ 	lwz	r8,PACAPACAINDEX(r13)
++ #endif
++ 	addi	r3,r4,KVM_TLBIE_LOCK
++ 24:	lwarx	r0,0,r3
++ 	cmpwi	r0,0
++ 	bne	24b
++ 	stwcx.	r8,0,r3
++ 	bne	24b
++ 	isync
++ 
++ 	ld	r7,KVM_HOST_LPCR(r4)	/* use kvm->arch.host_lpcr for HID4 */
++ 	li	r0,0x18f
++ 	rotldi	r0,r0,HID4_LPID5_SH	/* all lpid bits in HID4 = 1 */
++ 	or	r0,r7,r0
++ 	ptesync
++ 	sync
++ 	mtspr	SPRN_HID4,r0		/* switch to reserved LPID */
++ 	isync
++ 	li	r0,0
++ 	stw	r0,0(r3)		/* drop guest tlbie_lock */
++ 
++ 	/* invalidate the whole TLB */
++ 	li	r0,256
++ 	mtctr	r0
++ 	li	r6,0
++ 25:	tlbiel	r6
++ 	addi	r6,r6,0x1000
++ 	bdnz	25b
++ 	ptesync
++ 
++ 	/* take native_tlbie_lock */
++ 	ld	r3,toc_tlbie_lock@toc(2)
++ 24:	lwarx	r0,0,r3
++ 	cmpwi	r0,0
++ 	bne	24b
++ 	stwcx.	r8,0,r3
++ 	bne	24b
++ 	isync
++ 
++ 	ld	r6,KVM_HOST_SDR1(r4)
++ 	mtspr	SPRN_SDR1,r6		/* switch to host page table */
++ 
++ 	/* Set up host HID4 value */
++ 	sync
++ 	mtspr	SPRN_HID4,r7
++ 	isync
++ 	li	r0,0
++ 	stw	r0,0(r3)		/* drop native_tlbie_lock */
++ 
++ 	lis	r8,0x7fff		/* MAX_INT@h */
++ 	mtspr	SPRN_HDEC,r8
++ 
++ 	/* Disable HDEC interrupts */
++ 	mfspr	r0,SPRN_HID0
++ 	li	r3,0
++ 	rldimi	r0,r3, HID0_HDICE_SH, 64-HID0_HDICE_SH-1
++ 	sync
++ 	mtspr	SPRN_HID0,r0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 	mfspr	r0,SPRN_HID0
++ 
++ 	/* load host SLB entries */
++ 33:	ld	r8,PACA_SLBSHADOWPTR(r13)
+++>>>>>>> b005255e12a3 (KVM: PPC: Book3S HV: Context-switch new POWER8 SPRs)
+  
+  	.rept	SLB_NUM_BOLTED
+ -	ld	r5,SLBSHADOW_SAVEAREA(r8)
+ -	ld	r6,SLBSHADOW_SAVEAREA+8(r8)
+ +	ld	r5,SLBSHADOW_SAVEAREA(r11)
+ +	ld	r6,SLBSHADOW_SAVEAREA+8(r11)
+  	andis.	r7,r5,SLB_ESID_V@h
+  	beq	1f
+  	slbmte	r6,r5
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 80c8a73bb706..46d52e956acb 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -306,6 +306,7 @@ struct kvmppc_vcore {
+ 	ulong lpcr;
+ 	u32 arch_compat;
+ 	ulong pcr;
++	ulong dpdes;		/* doorbell state (POWER8) */
+ };
+ 
+ #define VCORE_ENTRY_COUNT(vc)	((vc)->entry_exit_count & 0xff)
+@@ -461,6 +462,7 @@ struct kvm_vcpu_arch {
+ 	ulong pc;
+ 	ulong ctr;
+ 	ulong lr;
++	ulong tar;
+ 
+ 	ulong xer;
+ 	u32 cr;
+@@ -470,13 +472,32 @@ struct kvm_vcpu_arch {
+ 	ulong guest_owned_ext;
+ 	ulong purr;
+ 	ulong spurr;
++	ulong ic;
++	ulong vtb;
+ 	ulong dscr;
+ 	ulong amr;
+ 	ulong uamor;
++	ulong iamr;
+ 	u32 ctrl;
+ 	ulong dabr;
++	ulong dawr;
++	ulong dawrx;
++	ulong ciabr;
+ 	ulong cfar;
+ 	ulong ppr;
++	ulong pspb;
++	ulong fscr;
++	ulong tfhar;
++	ulong tfiar;
++	ulong texasr;
++	ulong ebbhr;
++	ulong ebbrr;
++	ulong bescr;
++	ulong csigr;
++	ulong tacr;
++	ulong tcscr;
++	ulong acop;
++	ulong wort;
+ 	ulong shadow_srr1;
+ #endif
+ 	u32 vrsave; /* also USPRG0 */
+@@ -511,10 +532,12 @@ struct kvm_vcpu_arch {
+ 	u32 ccr1;
+ 	u32 dbsr;
+ 
+-	u64 mmcr[3];
++	u64 mmcr[5];
+ 	u32 pmc[8];
++	u32 spmc[2];
+ 	u64 siar;
+ 	u64 sdar;
++	u64 sier;
+ 
+ #ifdef CONFIG_KVM_EXIT_TIMING
+ 	struct mutex exit_timing_lock;
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index 625cb67ff02a..bbffd6fac8b7 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -223,6 +223,11 @@
+ #define   CTRL_TE	0x00c00000	/* thread enable */
+ #define   CTRL_RUNLATCH	0x1
+ #define SPRN_DAWR	0xB4
++#define SPRN_CIABR	0xBB
++#define   CIABR_PRIV		0x3
++#define   CIABR_PRIV_USER	1
++#define   CIABR_PRIV_SUPER	2
++#define   CIABR_PRIV_HYPER	3
+ #define SPRN_DAWRX	0xBC
+ #define   DAWRX_USER	(1UL << 0)
+ #define   DAWRX_KERNEL	(1UL << 1)
+@@ -260,6 +265,8 @@
+ #define SPRN_HRMOR	0x139	/* Real mode offset register */
+ #define SPRN_HSRR0	0x13A	/* Hypervisor Save/Restore 0 */
+ #define SPRN_HSRR1	0x13B	/* Hypervisor Save/Restore 1 */
++#define SPRN_IC		0x350	/* Virtual Instruction Count */
++#define SPRN_VTB	0x351	/* Virtual Time Base */
+ /* HFSCR and FSCR bit numbers are the same */
+ #define FSCR_TAR_LG	8	/* Enable Target Address Register */
+ #define FSCR_EBB_LG	7	/* Enable Event Based Branching */
+@@ -368,6 +375,8 @@
+ #define DER_EBRKE	0x00000002	/* External Breakpoint Interrupt */
+ #define DER_DPIE	0x00000001	/* Dev. Port Nonmaskable Request */
+ #define SPRN_DMISS	0x3D0		/* Data TLB Miss Register */
++#define SPRN_DHDES	0x0B1		/* Directed Hyp. Doorbell Exc. State */
++#define SPRN_DPDES	0x0B0		/* Directed Priv. Doorbell Exc. State */
+ #define SPRN_EAR	0x11A		/* External Address Register */
+ #define SPRN_HASH1	0x3D2		/* Primary Hash Address Register */
+ #define SPRN_HASH2	0x3D3		/* Secondary Hash Address Resgister */
+@@ -427,6 +436,7 @@
+ #define SPRN_IABR	0x3F2	/* Instruction Address Breakpoint Register */
+ #define SPRN_IABR2	0x3FA		/* 83xx */
+ #define SPRN_IBCR	0x135		/* 83xx Insn Breakpoint Control Reg */
++#define SPRN_IAMR	0x03D		/* Instr. Authority Mask Reg */
+ #define SPRN_HID4	0x3F4		/* 970 HID4 */
+ #define  HID4_LPES0	 (1ul << (63-0)) /* LPAR env. sel. bit 0 */
+ #define	 HID4_RMLS2_SH	 (63 - 2)	/* Real mode limit bottom 2 bits */
+@@ -541,6 +551,7 @@
+ #define SPRN_PIR	0x3FF	/* Processor Identification Register */
+ #endif
+ #define SPRN_TIR	0x1BE	/* Thread Identification Register */
++#define SPRN_PSPB	0x09F	/* Problem State Priority Boost reg */
+ #define SPRN_PTEHI	0x3D5	/* 981 7450 PTE HI word (S/W TLB load) */
+ #define SPRN_PTELO	0x3D6	/* 982 7450 PTE LO word (S/W TLB load) */
+ #define SPRN_PURR	0x135	/* Processor Utilization of Resources Reg */
+@@ -683,6 +694,7 @@
+ #define SPRN_EBBHR	804	/* Event based branch handler register */
+ #define SPRN_EBBRR	805	/* Event based branch return register */
+ #define SPRN_BESCR	806	/* Branch event status and control register */
++#define SPRN_WORT	895	/* Workload optimization register - thread */
+ 
+ #define SPRN_PMC1	787
+ #define SPRN_PMC2	788
+@@ -699,6 +711,11 @@
+ #define   SIER_SIHV		0x1000000	/* Sampled MSR_HV */
+ #define   SIER_SIAR_VALID	0x0400000	/* SIAR contents valid */
+ #define   SIER_SDAR_VALID	0x0200000	/* SDAR contents valid */
++#define SPRN_TACR	888
++#define SPRN_TCSCR	889
++#define SPRN_CSIGR	890
++#define SPRN_SPMC1	892
++#define SPRN_SPMC2	893
+ 
+ /* When EBB is enabled, some of MMCR0/MMCR2/SIER are user accessible */
+ #define MMCR0_USER_MASK	(MMCR0_FC | MMCR0_PMXE | MMCR0_PMAO)
+diff --git a/arch/powerpc/include/uapi/asm/kvm.h b/arch/powerpc/include/uapi/asm/kvm.h
+index e420d46d363f..26d3fd6200b0 100644
+--- a/arch/powerpc/include/uapi/asm/kvm.h
++++ b/arch/powerpc/include/uapi/asm/kvm.h
+@@ -531,6 +531,7 @@ struct kvm_get_htab_header {
+ #define KVM_REG_PPC_TCSCR	(KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb1)
+ #define KVM_REG_PPC_PID		(KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb2)
+ #define KVM_REG_PPC_ACOP	(KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb3)
++#define KVM_REG_PPC_WORT	(KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb4)
+ 
+ #define KVM_REG_PPC_VRSAVE	(KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb4)
+ #define KVM_REG_PPC_LPCR	(KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb5)
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 79fa5c26d629..63dab613fe8b 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -437,6 +437,7 @@ int main(void)
+ 	DEFINE(VCPU_XER, offsetof(struct kvm_vcpu, arch.xer));
+ 	DEFINE(VCPU_CTR, offsetof(struct kvm_vcpu, arch.ctr));
+ 	DEFINE(VCPU_LR, offsetof(struct kvm_vcpu, arch.lr));
++	DEFINE(VCPU_TAR, offsetof(struct kvm_vcpu, arch.tar));
+ 	DEFINE(VCPU_CR, offsetof(struct kvm_vcpu, arch.cr));
+ 	DEFINE(VCPU_PC, offsetof(struct kvm_vcpu, arch.pc));
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+@@ -489,11 +490,17 @@ int main(void)
+ 	DEFINE(VCPU_VCPUID, offsetof(struct kvm_vcpu, vcpu_id));
+ 	DEFINE(VCPU_PURR, offsetof(struct kvm_vcpu, arch.purr));
+ 	DEFINE(VCPU_SPURR, offsetof(struct kvm_vcpu, arch.spurr));
++	DEFINE(VCPU_IC, offsetof(struct kvm_vcpu, arch.ic));
++	DEFINE(VCPU_VTB, offsetof(struct kvm_vcpu, arch.vtb));
+ 	DEFINE(VCPU_DSCR, offsetof(struct kvm_vcpu, arch.dscr));
+ 	DEFINE(VCPU_AMR, offsetof(struct kvm_vcpu, arch.amr));
+ 	DEFINE(VCPU_UAMOR, offsetof(struct kvm_vcpu, arch.uamor));
++	DEFINE(VCPU_IAMR, offsetof(struct kvm_vcpu, arch.iamr));
+ 	DEFINE(VCPU_CTRL, offsetof(struct kvm_vcpu, arch.ctrl));
+ 	DEFINE(VCPU_DABR, offsetof(struct kvm_vcpu, arch.dabr));
++	DEFINE(VCPU_DAWR, offsetof(struct kvm_vcpu, arch.dawr));
++	DEFINE(VCPU_DAWRX, offsetof(struct kvm_vcpu, arch.dawrx));
++	DEFINE(VCPU_CIABR, offsetof(struct kvm_vcpu, arch.ciabr));
+ 	DEFINE(VCPU_HFLAGS, offsetof(struct kvm_vcpu, arch.hflags));
+ 	DEFINE(VCPU_DEC, offsetof(struct kvm_vcpu, arch.dec));
+ 	DEFINE(VCPU_DEC_EXPIRES, offsetof(struct kvm_vcpu, arch.dec_expires));
+@@ -502,8 +509,10 @@ int main(void)
+ 	DEFINE(VCPU_PRODDED, offsetof(struct kvm_vcpu, arch.prodded));
+ 	DEFINE(VCPU_MMCR, offsetof(struct kvm_vcpu, arch.mmcr));
+ 	DEFINE(VCPU_PMC, offsetof(struct kvm_vcpu, arch.pmc));
++	DEFINE(VCPU_SPMC, offsetof(struct kvm_vcpu, arch.spmc));
+ 	DEFINE(VCPU_SIAR, offsetof(struct kvm_vcpu, arch.siar));
+ 	DEFINE(VCPU_SDAR, offsetof(struct kvm_vcpu, arch.sdar));
++	DEFINE(VCPU_SIER, offsetof(struct kvm_vcpu, arch.sier));
+ 	DEFINE(VCPU_SLB, offsetof(struct kvm_vcpu, arch.slb));
+ 	DEFINE(VCPU_SLB_MAX, offsetof(struct kvm_vcpu, arch.slb_max));
+ 	DEFINE(VCPU_SLB_NR, offsetof(struct kvm_vcpu, arch.slb_nr));
+@@ -514,6 +523,19 @@ int main(void)
+ 	DEFINE(VCPU_PTID, offsetof(struct kvm_vcpu, arch.ptid));
+ 	DEFINE(VCPU_CFAR, offsetof(struct kvm_vcpu, arch.cfar));
+ 	DEFINE(VCPU_PPR, offsetof(struct kvm_vcpu, arch.ppr));
++	DEFINE(VCPU_FSCR, offsetof(struct kvm_vcpu, arch.fscr));
++	DEFINE(VCPU_PSPB, offsetof(struct kvm_vcpu, arch.pspb));
++	DEFINE(VCPU_TFHAR, offsetof(struct kvm_vcpu, arch.tfhar));
++	DEFINE(VCPU_TFIAR, offsetof(struct kvm_vcpu, arch.tfiar));
++	DEFINE(VCPU_TEXASR, offsetof(struct kvm_vcpu, arch.texasr));
++	DEFINE(VCPU_EBBHR, offsetof(struct kvm_vcpu, arch.ebbhr));
++	DEFINE(VCPU_EBBRR, offsetof(struct kvm_vcpu, arch.ebbrr));
++	DEFINE(VCPU_BESCR, offsetof(struct kvm_vcpu, arch.bescr));
++	DEFINE(VCPU_CSIGR, offsetof(struct kvm_vcpu, arch.csigr));
++	DEFINE(VCPU_TACR, offsetof(struct kvm_vcpu, arch.tacr));
++	DEFINE(VCPU_TCSCR, offsetof(struct kvm_vcpu, arch.tcscr));
++	DEFINE(VCPU_ACOP, offsetof(struct kvm_vcpu, arch.acop));
++	DEFINE(VCPU_WORT, offsetof(struct kvm_vcpu, arch.wort));
+ 	DEFINE(VCPU_SHADOW_SRR1, offsetof(struct kvm_vcpu, arch.shadow_srr1));
+ 	DEFINE(VCORE_ENTRY_EXIT, offsetof(struct kvmppc_vcore, entry_exit_count));
+ 	DEFINE(VCORE_NAP_COUNT, offsetof(struct kvmppc_vcore, nap_count));
+@@ -522,6 +544,7 @@ int main(void)
+ 	DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
+ 	DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
+ 	DEFINE(VCORE_PCR, offsetof(struct kvmppc_vcore, pcr));
++	DEFINE(VCORE_DPDES, offsetof(struct kvmppc_vcore, dpdes));
+ 	DEFINE(VCPU_SLB_E, offsetof(struct kvmppc_slb, orige));
+ 	DEFINE(VCPU_SLB_V, offsetof(struct kvmppc_slb, origv));
+ 	DEFINE(VCPU_SLB_SIZE, sizeof(struct kvmppc_slb));
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 71043f429f30..538ddb9f593c 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -796,7 +796,7 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+ 	case KVM_REG_PPC_UAMOR:
+ 		*val = get_reg_val(id, vcpu->arch.uamor);
+ 		break;
+-	case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRA:
++	case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRS:
+ 		i = id - KVM_REG_PPC_MMCR0;
+ 		*val = get_reg_val(id, vcpu->arch.mmcr[i]);
+ 		break;
+@@ -804,12 +804,85 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+ 		i = id - KVM_REG_PPC_PMC1;
+ 		*val = get_reg_val(id, vcpu->arch.pmc[i]);
+ 		break;
++	case KVM_REG_PPC_SPMC1 ... KVM_REG_PPC_SPMC2:
++		i = id - KVM_REG_PPC_SPMC1;
++		*val = get_reg_val(id, vcpu->arch.spmc[i]);
++		break;
+ 	case KVM_REG_PPC_SIAR:
+ 		*val = get_reg_val(id, vcpu->arch.siar);
+ 		break;
+ 	case KVM_REG_PPC_SDAR:
+ 		*val = get_reg_val(id, vcpu->arch.sdar);
+ 		break;
++	case KVM_REG_PPC_SIER:
++		*val = get_reg_val(id, vcpu->arch.sier);
++		break;
++	case KVM_REG_PPC_IAMR:
++		*val = get_reg_val(id, vcpu->arch.iamr);
++		break;
++	case KVM_REG_PPC_TFHAR:
++		*val = get_reg_val(id, vcpu->arch.tfhar);
++		break;
++	case KVM_REG_PPC_TFIAR:
++		*val = get_reg_val(id, vcpu->arch.tfiar);
++		break;
++	case KVM_REG_PPC_TEXASR:
++		*val = get_reg_val(id, vcpu->arch.texasr);
++		break;
++	case KVM_REG_PPC_FSCR:
++		*val = get_reg_val(id, vcpu->arch.fscr);
++		break;
++	case KVM_REG_PPC_PSPB:
++		*val = get_reg_val(id, vcpu->arch.pspb);
++		break;
++	case KVM_REG_PPC_EBBHR:
++		*val = get_reg_val(id, vcpu->arch.ebbhr);
++		break;
++	case KVM_REG_PPC_EBBRR:
++		*val = get_reg_val(id, vcpu->arch.ebbrr);
++		break;
++	case KVM_REG_PPC_BESCR:
++		*val = get_reg_val(id, vcpu->arch.bescr);
++		break;
++	case KVM_REG_PPC_TAR:
++		*val = get_reg_val(id, vcpu->arch.tar);
++		break;
++	case KVM_REG_PPC_DPDES:
++		*val = get_reg_val(id, vcpu->arch.vcore->dpdes);
++		break;
++	case KVM_REG_PPC_DAWR:
++		*val = get_reg_val(id, vcpu->arch.dawr);
++		break;
++	case KVM_REG_PPC_DAWRX:
++		*val = get_reg_val(id, vcpu->arch.dawrx);
++		break;
++	case KVM_REG_PPC_CIABR:
++		*val = get_reg_val(id, vcpu->arch.ciabr);
++		break;
++	case KVM_REG_PPC_IC:
++		*val = get_reg_val(id, vcpu->arch.ic);
++		break;
++	case KVM_REG_PPC_VTB:
++		*val = get_reg_val(id, vcpu->arch.vtb);
++		break;
++	case KVM_REG_PPC_CSIGR:
++		*val = get_reg_val(id, vcpu->arch.csigr);
++		break;
++	case KVM_REG_PPC_TACR:
++		*val = get_reg_val(id, vcpu->arch.tacr);
++		break;
++	case KVM_REG_PPC_TCSCR:
++		*val = get_reg_val(id, vcpu->arch.tcscr);
++		break;
++	case KVM_REG_PPC_PID:
++		*val = get_reg_val(id, vcpu->arch.pid);
++		break;
++	case KVM_REG_PPC_ACOP:
++		*val = get_reg_val(id, vcpu->arch.acop);
++		break;
++	case KVM_REG_PPC_WORT:
++		*val = get_reg_val(id, vcpu->arch.wort);
++		break;
+ 	case KVM_REG_PPC_VPA_ADDR:
+ 		spin_lock(&vcpu->arch.vpa_update_lock);
+ 		*val = get_reg_val(id, vcpu->arch.vpa.next_gpa);
+@@ -877,7 +950,7 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+ 	case KVM_REG_PPC_UAMOR:
+ 		vcpu->arch.uamor = set_reg_val(id, *val);
+ 		break;
+-	case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRA:
++	case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRS:
+ 		i = id - KVM_REG_PPC_MMCR0;
+ 		vcpu->arch.mmcr[i] = set_reg_val(id, *val);
+ 		break;
+@@ -885,12 +958,88 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+ 		i = id - KVM_REG_PPC_PMC1;
+ 		vcpu->arch.pmc[i] = set_reg_val(id, *val);
+ 		break;
++	case KVM_REG_PPC_SPMC1 ... KVM_REG_PPC_SPMC2:
++		i = id - KVM_REG_PPC_SPMC1;
++		vcpu->arch.spmc[i] = set_reg_val(id, *val);
++		break;
+ 	case KVM_REG_PPC_SIAR:
+ 		vcpu->arch.siar = set_reg_val(id, *val);
+ 		break;
+ 	case KVM_REG_PPC_SDAR:
+ 		vcpu->arch.sdar = set_reg_val(id, *val);
+ 		break;
++	case KVM_REG_PPC_SIER:
++		vcpu->arch.sier = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_IAMR:
++		vcpu->arch.iamr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_TFHAR:
++		vcpu->arch.tfhar = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_TFIAR:
++		vcpu->arch.tfiar = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_TEXASR:
++		vcpu->arch.texasr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_FSCR:
++		vcpu->arch.fscr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_PSPB:
++		vcpu->arch.pspb = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_EBBHR:
++		vcpu->arch.ebbhr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_EBBRR:
++		vcpu->arch.ebbrr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_BESCR:
++		vcpu->arch.bescr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_TAR:
++		vcpu->arch.tar = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_DPDES:
++		vcpu->arch.vcore->dpdes = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_DAWR:
++		vcpu->arch.dawr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_DAWRX:
++		vcpu->arch.dawrx = set_reg_val(id, *val) & ~DAWRX_HYP;
++		break;
++	case KVM_REG_PPC_CIABR:
++		vcpu->arch.ciabr = set_reg_val(id, *val);
++		/* Don't allow setting breakpoints in hypervisor code */
++		if ((vcpu->arch.ciabr & CIABR_PRIV) == CIABR_PRIV_HYPER)
++			vcpu->arch.ciabr &= ~CIABR_PRIV;	/* disable */
++		break;
++	case KVM_REG_PPC_IC:
++		vcpu->arch.ic = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_VTB:
++		vcpu->arch.vtb = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_CSIGR:
++		vcpu->arch.csigr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_TACR:
++		vcpu->arch.tacr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_TCSCR:
++		vcpu->arch.tcscr = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_PID:
++		vcpu->arch.pid = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_ACOP:
++		vcpu->arch.acop = set_reg_val(id, *val);
++		break;
++	case KVM_REG_PPC_WORT:
++		vcpu->arch.wort = set_reg_val(id, *val);
++		break;
+ 	case KVM_REG_PPC_VPA_ADDR:
+ 		addr = set_reg_val(id, *val);
+ 		r = -EINVAL;
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
