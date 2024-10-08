@@ -1,0 +1,236 @@
+fanotify: Handle overflow in case of permission events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 482ef06c5e946aae360f247dc69471ec031e09d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/482ef06c.failed
+
+If the event queue overflows when we are handling permission event, we
+will never get response from userspace. So we must avoid waiting for it.
+Change fsnotify_add_notify_event() to return whether overflow has
+happened so that we can detect it in fanotify_handle_event() and act
+accordingly.
+
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 482ef06c5e946aae360f247dc69471ec031e09d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+#	fs/notify/notification.c
+diff --cc fs/notify/fanotify/fanotify.c
+index 0c2f9122b262,dc638f786d5c..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -217,6 -142,73 +217,76 @@@ static bool fanotify_should_send_event(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int fanotify_handle_event(struct fsnotify_group *group,
++ 				 struct inode *inode,
++ 				 struct fsnotify_mark *inode_mark,
++ 				 struct fsnotify_mark *fanotify_mark,
++ 				 u32 mask, void *data, int data_type,
++ 				 const unsigned char *file_name, u32 cookie)
++ {
++ 	int ret = 0;
++ 	struct fanotify_event_info *event;
++ 	struct fsnotify_event *fsn_event;
++ 
++ 	BUILD_BUG_ON(FAN_ACCESS != FS_ACCESS);
++ 	BUILD_BUG_ON(FAN_MODIFY != FS_MODIFY);
++ 	BUILD_BUG_ON(FAN_CLOSE_NOWRITE != FS_CLOSE_NOWRITE);
++ 	BUILD_BUG_ON(FAN_CLOSE_WRITE != FS_CLOSE_WRITE);
++ 	BUILD_BUG_ON(FAN_OPEN != FS_OPEN);
++ 	BUILD_BUG_ON(FAN_EVENT_ON_CHILD != FS_EVENT_ON_CHILD);
++ 	BUILD_BUG_ON(FAN_Q_OVERFLOW != FS_Q_OVERFLOW);
++ 	BUILD_BUG_ON(FAN_OPEN_PERM != FS_OPEN_PERM);
++ 	BUILD_BUG_ON(FAN_ACCESS_PERM != FS_ACCESS_PERM);
++ 	BUILD_BUG_ON(FAN_ONDIR != FS_ISDIR);
++ 
++ 	if (!fanotify_should_send_event(inode_mark, fanotify_mark, mask, data,
++ 					data_type))
++ 		return 0;
++ 
++ 	pr_debug("%s: group=%p inode=%p mask=%x\n", __func__, group, inode,
++ 		 mask);
++ 
++ 	event = kmem_cache_alloc(fanotify_event_cachep, GFP_KERNEL);
++ 	if (unlikely(!event))
++ 		return -ENOMEM;
++ 
++ 	fsn_event = &event->fse;
++ 	fsnotify_init_event(fsn_event, inode, mask);
++ 	event->tgid = get_pid(task_tgid(current));
++ 	if (data_type == FSNOTIFY_EVENT_PATH) {
++ 		struct path *path = data;
++ 		event->path = *path;
++ 		path_get(&event->path);
++ 	} else {
++ 		event->path.mnt = NULL;
++ 		event->path.dentry = NULL;
++ 	}
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	event->response = 0;
++ #endif
++ 
++ 	ret = fsnotify_add_notify_event(group, fsn_event, fanotify_merge);
++ 	if (ret) {
++ 		/* Permission events shouldn't be merged */
++ 		BUG_ON(ret == 1 && mask & FAN_ALL_PERM_EVENTS);
++ 		/* Our event wasn't used in the end. Free it. */
++ 		fsnotify_destroy_event(group, fsn_event);
++ 
++ 		return 0;
++ 	}
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS) {
++ 		ret = fanotify_get_response_from_access(group, event);
++ 		fsnotify_destroy_event(group, fsn_event);
++ 	}
++ #endif
++ 	return ret;
++ }
++ 
+++>>>>>>> 482ef06c5e94 (fanotify: Handle overflow in case of permission events)
+  static void fanotify_free_group_priv(struct fsnotify_group *group)
+  {
+  	struct user_struct *user;
+diff --cc fs/notify/notification.c
+index a03904d119e4,6a4ba17c0395..000000000000
+--- a/fs/notify/notification.c
++++ b/fs/notify/notification.c
+@@@ -134,62 -79,31 +134,79 @@@ struct fsnotify_event_private_data *fsn
+  
+  /*
+   * Add an event to the group notification queue.  The group can later pull this
+++<<<<<<< HEAD
+ + * event off the queue to deal with.  If the event is successfully added to the
+ + * group's notification queue, a reference is taken on event.
+++=======
++  * event off the queue to deal with.  The function returns 0 if the event was
++  * added to the queue, 1 if the event was merged with some other queued event,
++  * 2 if the queue of events has overflown.
+++>>>>>>> 482ef06c5e94 (fanotify: Handle overflow in case of permission events)
+   */
+ -int fsnotify_add_notify_event(struct fsnotify_group *group,
+ -			      struct fsnotify_event *event,
+ -			      int (*merge)(struct list_head *,
+ -					   struct fsnotify_event *))
+ +struct fsnotify_event *fsnotify_add_notify_event(struct fsnotify_group *group, struct fsnotify_event *event,
+ +						 struct fsnotify_event_private_data *priv,
+ +						 struct fsnotify_event *(*merge)(struct list_head *,
+ +										 struct fsnotify_event *))
+  {
+ -	int ret = 0;
+ +	struct fsnotify_event *return_event = NULL;
+ +	struct fsnotify_event_holder *holder = NULL;
+  	struct list_head *list = &group->notification_list;
+  
+ -	pr_debug("%s: group=%p event=%p\n", __func__, group, event);
+ +	pr_debug("%s: group=%p event=%p priv=%p\n", __func__, group, event, priv);
+ +
+ +	/*
+ +	 * There is one fsnotify_event_holder embedded inside each fsnotify_event.
+ +	 * Check if we expect to be able to use that holder.  If not alloc a new
+ +	 * holder.
+ +	 * For the overflow event it's possible that something will use the in
+ +	 * event holder before we get the lock so we may need to jump back and
+ +	 * alloc a new holder, this can't happen for most events...
+ +	 */
+ +	if (!list_empty(&event->holder.event_list)) {
+ +alloc_holder:
+ +		holder = fsnotify_alloc_event_holder();
+ +		if (!holder)
+ +			return ERR_PTR(-ENOMEM);
+ +	}
+  
+  	mutex_lock(&group->notification_mutex);
+  
+  	if (group->q_len >= group->max_events) {
+++<<<<<<< HEAD
+ +		struct fsnotify_event_holder *last_holder;
+ +
+ +		last_holder = list_entry(list->prev, struct fsnotify_event_holder, event_list);
+ +
+ +		/* overflow event already last?  Don't add another */
+ +		if (last_holder->event == q_overflow_event) {
+ +			if (holder != &q_overflow_event->holder)
+ +				fsnotify_destroy_event_holder(holder);
+ +			fsnotify_get_event(q_overflow_event);
+ +			mutex_unlock(&group->notification_mutex);
+ +			return q_overflow_event;
+ +		}
+ +
+ +		event = q_overflow_event;
+ +
+ +		/*
+ +		 * we need to return the overflow event
+ +		 * which means we need a ref
+ +		 */
+ +		fsnotify_get_event(event);
+ +		return_event = event;
+ +
+ +		/* sorry, no private data on the overflow event */
+ +		priv = NULL;
+++=======
++ 		ret = 2;
++ 		/* Queue overflow event only if it isn't already queued */
++ 		if (!list_empty(&group->overflow_event.list)) {
++ 			mutex_unlock(&group->notification_mutex);
++ 			return ret;
++ 		}
++ 		event = &group->overflow_event;
++ 		goto queue;
+++>>>>>>> 482ef06c5e94 (fanotify: Handle overflow in case of permission events)
+  	}
+  
+  	if (!list_empty(list) && merge) {
+@@@ -207,34 -114,9 +224,38 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock(&event->lock);
+ +
+ +	if (list_empty(&event->holder.event_list)) {
+ +		if (unlikely(holder))
+ +			fsnotify_destroy_event_holder(holder);
+ +		holder = &event->holder;
+ +	} else if (unlikely(!holder)) {
+ +		/* between the time we checked above and got the lock the in
+ +		 * event holder was used, go back and get a new one */
+ +		spin_unlock(&event->lock);
+ +		mutex_unlock(&group->notification_mutex);
+ +
+ +		if (return_event) {
+ +			fsnotify_put_event(return_event);
+ +			return_event = NULL;
+ +		}
+ +
+ +		goto alloc_holder;
+ +	}
+ +
+++=======
++ queue:
+++>>>>>>> 482ef06c5e94 (fanotify: Handle overflow in case of permission events)
+  	group->q_len++;
+ -	list_add_tail(&event->list, list);
+ +	holder->event = event;
+ +
+ +	fsnotify_get_event(event);
+ +	list_add_tail(&holder->event_list, list);
+ +	if (priv)
+ +		list_add_tail(&priv->event_list, &event->private_data_list);
+ +	spin_unlock(&event->lock);
+  	mutex_unlock(&group->notification_mutex);
+  
+  	wake_up(&group->notification_waitq);
+* Unmerged path fs/notify/fanotify/fanotify.c
+* Unmerged path fs/notify/notification.c
