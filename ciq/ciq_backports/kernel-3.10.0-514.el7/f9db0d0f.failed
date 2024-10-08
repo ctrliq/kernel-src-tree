@@ -1,0 +1,320 @@
+perf callchain: Allow disabling call graphs per event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit f9db0d0f1b2cf030083c83d3ed3a4bbae6bdc8b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f9db0d0f.failed
+
+This patch introduce "call-graph=no" to disable per-event callgraph.
+
+Here is an example.
+
+  perf record -e 'cpu/cpu-cycles,call-graph=fp/,cpu/instructions,call-graph=no/' sleep 1
+
+  perf report --stdio
+
+  # To display the perf.data header info, please use
+  --header/--header-only options.
+  #
+  #
+  # Total Lost Samples: 0
+  #
+  # Samples: 6  of event 'cpu/cpu-cycles,call-graph=fp/'
+  # Event count (approx.): 774218
+  #
+  # Children      Self  Command  Shared Object     Symbol
+  # ........  ........  .......  ................  ........................................
+  #
+    61.94%     0.00%  sleep    [kernel.vmlinux]  [k] entry_SYSCALL_64_fastpath
+              |
+              ---entry_SYSCALL_64_fastpath
+                 |
+                 |--97.30%-- __brk
+                 |
+                  --2.70%-- mmap64
+                            _dl_check_map_versions
+                            _dl_check_all_versions
+
+    61.94%     0.00%  sleep    [kernel.vmlinux]  [k] perf_event_mmap
+              |
+              ---perf_event_mmap
+                 |
+                 |--97.30%-- do_brk
+                 |          sys_brk
+                 |          entry_SYSCALL_64_fastpath
+                 |          __brk
+                 |
+                  --2.70%-- mmap_region
+                            do_mmap_pgoff
+                            vm_mmap_pgoff
+                            sys_mmap_pgoff
+                            sys_mmap
+                            entry_SYSCALL_64_fastpath
+                            mmap64
+                            _dl_check_map_versions
+                            _dl_check_all_versions
+  ......
+
+  # Samples: 6  of event 'cpu/instructions,call-graph=no/'
+  # Event count (approx.): 359692
+  #
+  # Children      Self  Command  Shared Object     Symbol
+  # ........  ........  .......  ................  .................................
+  #
+     89.03%     0.00%  sleep    [unknown]         [.] 0xffff6598ffff6598
+     89.03%     0.00%  sleep    ld-2.17.so        [.] _dl_resolve_conflicts
+     89.03%     0.00%  sleep    [kernel.vmlinux]  [k] page_fault
+
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/1439289050-40510-2-git-send-email-kan.liang@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit f9db0d0f1b2cf030083c83d3ed3a4bbae6bdc8b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-record.txt
+#	tools/perf/util/evsel.c
+diff --cc tools/perf/Documentation/perf-record.txt
+index 1c99db2877d3,347a27322ed8..000000000000
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@@ -46,10 -46,17 +46,21 @@@ OPTION
+            /sys/bus/event_sources/devices/<pmu>/format/*
+  
+  	  There are also some params which are not defined in .../<pmu>/format/*.
+ -	  These params can be used to overload default config values per event.
+ +	  These params can be used to set event defaults.
+  	  Here is a list of the params.
+  	  - 'period': Set event sampling period
+- 
+++<<<<<<< HEAD
+++
+++=======
++ 	  - 'freq': Set event sampling frequency
++ 	  - 'time': Disable/enable time stamping. Acceptable values are 1 for
++ 		    enabling time stamping. 0 for disabling time stamping.
++ 		    The default is 1.
++ 	  - 'call-graph': Disable/enable callgraph. Acceptable str are "fp" for
++ 			 FP mode, "dwarf" for DWARF mode, "lbr" for LBR mode and
++ 			 "no" for disable callgraph.
++ 	  - 'stack-size': user stack size for dwarf mode
+++>>>>>>> f9db0d0f1b2c (perf callchain: Allow disabling call graphs per event)
+  	  Note: If user explicitly sets options which conflict with the params,
+  	  the value set by the params will be overridden.
+  
+diff --cc tools/perf/util/evsel.c
+index 79e3bf22feec,b096ef7a240c..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -583,6 -588,97 +583,100 @@@ perf_evsel__config_callgraph(struct per
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ perf_evsel__reset_callgraph(struct perf_evsel *evsel,
++ 			    struct callchain_param *param)
++ {
++ 	struct perf_event_attr *attr = &evsel->attr;
++ 
++ 	perf_evsel__reset_sample_bit(evsel, CALLCHAIN);
++ 	if (param->record_mode == CALLCHAIN_LBR) {
++ 		perf_evsel__reset_sample_bit(evsel, BRANCH_STACK);
++ 		attr->branch_sample_type &= ~(PERF_SAMPLE_BRANCH_USER |
++ 					      PERF_SAMPLE_BRANCH_CALL_STACK);
++ 	}
++ 	if (param->record_mode == CALLCHAIN_DWARF) {
++ 		perf_evsel__reset_sample_bit(evsel, REGS_USER);
++ 		perf_evsel__reset_sample_bit(evsel, STACK_USER);
++ 	}
++ }
++ 
++ static void apply_config_terms(struct perf_evsel *evsel,
++ 			       struct record_opts *opts)
++ {
++ 	struct perf_evsel_config_term *term;
++ 	struct list_head *config_terms = &evsel->config_terms;
++ 	struct perf_event_attr *attr = &evsel->attr;
++ 	struct callchain_param param;
++ 	u32 dump_size = 0;
++ 	char *callgraph_buf = NULL;
++ 
++ 	/* callgraph default */
++ 	param.record_mode = callchain_param.record_mode;
++ 
++ 	list_for_each_entry(term, config_terms, list) {
++ 		switch (term->type) {
++ 		case PERF_EVSEL__CONFIG_TERM_PERIOD:
++ 			attr->sample_period = term->val.period;
++ 			attr->freq = 0;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_FREQ:
++ 			attr->sample_freq = term->val.freq;
++ 			attr->freq = 1;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_TIME:
++ 			if (term->val.time)
++ 				perf_evsel__set_sample_bit(evsel, TIME);
++ 			else
++ 				perf_evsel__reset_sample_bit(evsel, TIME);
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_CALLGRAPH:
++ 			callgraph_buf = term->val.callgraph;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_STACK_USER:
++ 			dump_size = term->val.stack_user;
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
++ 	/* User explicitly set per-event callgraph, clear the old setting and reset. */
++ 	if ((callgraph_buf != NULL) || (dump_size > 0)) {
++ 
++ 		/* parse callgraph parameters */
++ 		if (callgraph_buf != NULL) {
++ 			if (!strcmp(callgraph_buf, "no")) {
++ 				param.enabled = false;
++ 				param.record_mode = CALLCHAIN_NONE;
++ 			} else {
++ 				param.enabled = true;
++ 				if (parse_callchain_record(callgraph_buf, &param)) {
++ 					pr_err("per-event callgraph setting for %s failed. "
++ 					       "Apply callgraph global setting for it\n",
++ 					       evsel->name);
++ 					return;
++ 				}
++ 			}
++ 		}
++ 		if (dump_size > 0) {
++ 			dump_size = round_up(dump_size, sizeof(u64));
++ 			param.dump_size = dump_size;
++ 		}
++ 
++ 		/* If global callgraph set, clear it */
++ 		if (callchain_param.enabled)
++ 			perf_evsel__reset_callgraph(evsel, &callchain_param);
++ 
++ 		/* set perf-event callgraph */
++ 		if (param.enabled)
++ 			perf_evsel__config_callgraph(evsel, opts, &param);
++ 	}
++ }
++ 
+++>>>>>>> f9db0d0f1b2c (perf callchain: Allow disabling call graphs per event)
+  /*
+   * The enable_on_exec/disabled value strategy:
+   *
+* Unmerged path tools/perf/Documentation/perf-record.txt
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index 467a23b14e2f..a32a64ef08e2 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -239,6 +239,8 @@ static int __cmd_annotate(struct perf_annotate *ann)
+ 		if (nr_samples > 0) {
+ 			total_nr_samples += nr_samples;
+ 			hists__collapse_resort(hists, NULL);
++			/* Don't sort callchain */
++			perf_evsel__reset_sample_bit(pos, CALLCHAIN);
+ 			hists__output_resort(hists, NULL);
+ 
+ 			if (symbol_conf.event_group &&
+diff --git a/tools/perf/builtin-diff.c b/tools/perf/builtin-diff.c
+index daaa7dca9c3b..0b180a885ba3 100644
+--- a/tools/perf/builtin-diff.c
++++ b/tools/perf/builtin-diff.c
+@@ -722,6 +722,9 @@ static void data_process(void)
+ 		if (verbose || data__files_cnt > 2)
+ 			data__fprintf();
+ 
++		/* Don't sort callchain for perf diff */
++		perf_evsel__reset_sample_bit(evsel_base, CALLCHAIN);
++
+ 		hists__process(hists_base);
+ 	}
+ }
+diff --git a/tools/perf/tests/hists_cumulate.c b/tools/perf/tests/hists_cumulate.c
+index 7d82c8be5e36..7ed737019de7 100644
+--- a/tools/perf/tests/hists_cumulate.c
++++ b/tools/perf/tests/hists_cumulate.c
+@@ -279,6 +279,7 @@ static int test1(struct perf_evsel *evsel, struct machine *machine)
+ 
+ 	symbol_conf.use_callchain = false;
+ 	symbol_conf.cumulate_callchain = false;
++	perf_evsel__reset_sample_bit(evsel, CALLCHAIN);
+ 
+ 	setup_sorting();
+ 	callchain_register_param(&callchain_param);
+@@ -425,6 +426,7 @@ static int test2(struct perf_evsel *evsel, struct machine *machine)
+ 
+ 	symbol_conf.use_callchain = true;
+ 	symbol_conf.cumulate_callchain = false;
++	perf_evsel__set_sample_bit(evsel, CALLCHAIN);
+ 
+ 	setup_sorting();
+ 	callchain_register_param(&callchain_param);
+@@ -482,6 +484,7 @@ static int test3(struct perf_evsel *evsel, struct machine *machine)
+ 
+ 	symbol_conf.use_callchain = false;
+ 	symbol_conf.cumulate_callchain = true;
++	perf_evsel__reset_sample_bit(evsel, CALLCHAIN);
+ 
+ 	setup_sorting();
+ 	callchain_register_param(&callchain_param);
+@@ -665,6 +668,7 @@ static int test4(struct perf_evsel *evsel, struct machine *machine)
+ 
+ 	symbol_conf.use_callchain = true;
+ 	symbol_conf.cumulate_callchain = true;
++	perf_evsel__set_sample_bit(evsel, CALLCHAIN);
+ 
+ 	setup_sorting();
+ 	callchain_register_param(&callchain_param);
+* Unmerged path tools/perf/util/evsel.c
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 6bccfae334b1..1cd785b5b56e 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -1109,13 +1109,14 @@ void hists__inc_stats(struct hists *hists, struct hist_entry *h)
+ 
+ static void __hists__insert_output_entry(struct rb_root *entries,
+ 					 struct hist_entry *he,
+-					 u64 min_callchain_hits)
++					 u64 min_callchain_hits,
++					 bool use_callchain)
+ {
+ 	struct rb_node **p = &entries->rb_node;
+ 	struct rb_node *parent = NULL;
+ 	struct hist_entry *iter;
+ 
+-	if (symbol_conf.use_callchain)
++	if (use_callchain)
+ 		callchain_param.sort(&he->sorted_chain, he->callchain,
+ 				      min_callchain_hits, &callchain_param);
+ 
+@@ -1139,6 +1140,8 @@ void hists__output_resort(struct hists *hists, struct ui_progress *prog)
+ 	struct rb_node *next;
+ 	struct hist_entry *n;
+ 	u64 min_callchain_hits;
++	struct perf_evsel *evsel = hists_to_evsel(hists);
++	bool use_callchain = evsel ? (evsel->attr.sample_type & PERF_SAMPLE_CALLCHAIN) : symbol_conf.use_callchain;
+ 
+ 	min_callchain_hits = hists->stats.total_period * (callchain_param.min_percent / 100);
+ 
+@@ -1157,7 +1160,7 @@ void hists__output_resort(struct hists *hists, struct ui_progress *prog)
+ 		n = rb_entry(next, struct hist_entry, rb_node_in);
+ 		next = rb_next(&n->rb_node_in);
+ 
+-		__hists__insert_output_entry(&hists->entries, n, min_callchain_hits);
++		__hists__insert_output_entry(&hists->entries, n, min_callchain_hits, use_callchain);
+ 		hists__inc_stats(hists, n);
+ 
+ 		if (!n->filtered)
