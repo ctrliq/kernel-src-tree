@@ -1,0 +1,139 @@
+KVM: x86: add tracepoint to wait_lapic_expire
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] kvm: add tracepoint to wait_lapic_expire (Marcelo Tosatti) [1175445]
+Rebuild_FUZZ: 94.12%
+commit-author Marcelo Tosatti <mtosatti@redhat.com>
+commit 6c19b7538f5ae2b6cdf91ab29f7fddf7320ece5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6c19b753.failed
+
+Add tracepoint to wait_lapic_expire.
+
+	Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+[Remind reader if early or late. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 6c19b7538f5ae2b6cdf91ab29f7fddf7320ece5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+diff --cc arch/x86/kvm/lapic.c
+index f1502c81f308,3eb7f8d9992c..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1015,6 -1070,77 +1015,80 @@@ static void update_divide_count(struct 
+  				   apic->divide_count);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void apic_timer_expired(struct kvm_lapic *apic)
++ {
++ 	struct kvm_vcpu *vcpu = apic->vcpu;
++ 	wait_queue_head_t *q = &vcpu->wq;
++ 	struct kvm_timer *ktimer = &apic->lapic_timer;
++ 
++ 	/*
++ 	 * Note: KVM_REQ_PENDING_TIMER is implicitly checked in
++ 	 * vcpu_enter_guest.
++ 	 */
++ 	if (atomic_read(&apic->lapic_timer.pending))
++ 		return;
++ 
++ 	atomic_inc(&apic->lapic_timer.pending);
++ 	/* FIXME: this code should not know anything about vcpus */
++ 	kvm_make_request(KVM_REQ_PENDING_TIMER, vcpu);
++ 
++ 	if (waitqueue_active(q))
++ 		wake_up_interruptible(q);
++ 
++ 	if (apic_lvtt_tscdeadline(apic))
++ 		ktimer->expired_tscdeadline = ktimer->tscdeadline;
++ }
++ 
++ /*
++  * On APICv, this test will cause a busy wait
++  * during a higher-priority task.
++  */
++ 
++ static bool lapic_timer_int_injected(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 	u32 reg = kvm_apic_get_reg(apic, APIC_LVTT);
++ 
++ 	if (kvm_apic_hw_enabled(apic)) {
++ 		int vec = reg & APIC_VECTOR_MASK;
++ 
++ 		if (kvm_x86_ops->test_posted_interrupt)
++ 			return kvm_x86_ops->test_posted_interrupt(vcpu, vec);
++ 		else {
++ 			if (apic_test_vector(vec, apic->regs + APIC_ISR))
++ 				return true;
++ 		}
++ 	}
++ 	return false;
++ }
++ 
++ void wait_lapic_expire(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 	u64 guest_tsc, tsc_deadline;
++ 
++ 	if (!kvm_vcpu_has_lapic(vcpu))
++ 		return;
++ 
++ 	if (apic->lapic_timer.expired_tscdeadline == 0)
++ 		return;
++ 
++ 	if (!lapic_timer_int_injected(vcpu))
++ 		return;
++ 
++ 	tsc_deadline = apic->lapic_timer.expired_tscdeadline;
++ 	apic->lapic_timer.expired_tscdeadline = 0;
++ 	guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu, native_read_tsc());
++ 	trace_kvm_wait_lapic_expire(vcpu->vcpu_id, guest_tsc - tsc_deadline);
++ 
++ 	/* __delay is delay_tsc whenever the hardware has TSC, thus always.  */
++ 	if (guest_tsc < tsc_deadline)
++ 		__delay(tsc_deadline - guest_tsc);
++ }
++ 
+++>>>>>>> 6c19b7538f5a (KVM: x86: add tracepoint to wait_lapic_expire)
+  static void start_apic_timer(struct kvm_lapic *apic)
+  {
+  	ktime_t now;
+* Unmerged path arch/x86/kvm/lapic.c
+diff --git a/arch/x86/kvm/trace.h b/arch/x86/kvm/trace.h
+index 23246cfd6b01..340b91ff0ac9 100644
+--- a/arch/x86/kvm/trace.h
++++ b/arch/x86/kvm/trace.h
+@@ -880,6 +880,26 @@ TRACE_EVENT(kvm_ple_window,
+ 
+ #endif /* CONFIG_X86_64 */
+ 
++TRACE_EVENT(kvm_wait_lapic_expire,
++	TP_PROTO(unsigned int vcpu_id, s64 delta),
++	TP_ARGS(vcpu_id, delta),
++
++	TP_STRUCT__entry(
++		__field(	unsigned int,	vcpu_id		)
++		__field(	s64,		delta		)
++	),
++
++	TP_fast_assign(
++		__entry->vcpu_id	   = vcpu_id;
++		__entry->delta             = delta;
++	),
++
++	TP_printk("vcpu %u: delta %lld (%s)",
++		  __entry->vcpu_id,
++		  __entry->delta,
++		  __entry->delta < 0 ? "early" : "late")
++);
++
+ #endif /* _TRACE_KVM_H */
+ 
+ #undef TRACE_INCLUDE_PATH
