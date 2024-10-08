@@ -1,0 +1,177 @@
+mm: migrate: make core migration code aware of hugepage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [mm] migrate: make core migration code aware of hugepage (Tomoaki Nishimura) [1226196]
+Rebuild_FUZZ: 96.23%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit 31caf665e666b51fe36efd1e54031ed29e86c0b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/31caf665.failed
+
+Currently hugepage migration is available only for soft offlining, but
+it's also useful for some other users of page migration (clearly because
+users of hugepage can enjoy the benefit of mempolicy and memory hotplug.)
+So this patchset tries to extend such users to support hugepage migration.
+
+The target of this patchset is to enable hugepage migration for NUMA
+related system calls (migrate_pages(2), move_pages(2), and mbind(2)), and
+memory hotplug.
+
+This patchset does not add hugepage migration for memory compaction,
+because users of memory compaction mainly expect to construct thp by
+arranging raw pages, and there's little or no need to compact hugepages.
+CMA, another user of page migration, can have benefit from hugepage
+migration, but is not enabled to support it for now (just because of lack
+of testing and expertise in CMA.)
+
+Hugepage migration of non pmd-based hugepage (for example 1GB hugepage in
+x86_64, or hugepages in architectures like ia64) is not enabled for now
+(again, because of lack of testing.)
+
+As for how these are achived, I extended the API (migrate_pages()) to
+handle hugepage (with patch 1 and 2) and adjusted code of each caller to
+check and collect movable hugepages (with patch 3-7).  Remaining 2 patches
+are kind of miscellaneous ones to avoid unexpected behavior.  Patch 8 is
+about making sure that we only migrate pmd-based hugepages.  And patch 9
+is about choosing appropriate zone for hugepage allocation.
+
+My test is mainly functional one, simply kicking hugepage migration via
+each entry point and confirm that migration is done correctly.  Test code
+is available here:
+
+  git://github.com/Naoya-Horiguchi/test_hugepage_migration_extension.git
+
+And I always run libhugetlbfs test when changing hugetlbfs's code.  With
+this patchset, no regression was found in the test.
+
+This patch (of 9):
+
+Before enabling each user of page migration to support hugepage,
+this patch enables the list of pages for migration to link not only
+LRU pages, but also hugepages. As a result, putback_movable_pages()
+and migrate_pages() can handle both of LRU pages and hugepages.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Acked-by: Andi Kleen <ak@linux.intel.com>
+	Reviewed-by: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+	Acked-by: Hillf Danton <dhillf@gmail.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 31caf665e666b51fe36efd1e54031ed29e86c0b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+diff --cc include/linux/hugetlb.h
+index 3a38f8dbb7ef,bc8d8370cd0d..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -68,7 -66,13 +68,17 @@@ int hugetlb_reserve_pages(struct inode 
+  						vm_flags_t vm_flags);
+  void hugetlb_unreserve_pages(struct inode *inode, long offset, long freed);
+  int dequeue_hwpoisoned_huge_page(struct page *page);
+++<<<<<<< HEAD
+ +void free_huge_page(struct page *page);
+++=======
++ bool isolate_huge_page(struct page *page, struct list_head *list);
++ void putback_active_hugepage(struct page *page);
++ void copy_huge_page(struct page *dst, struct page *src);
++ 
++ #ifdef CONFIG_ARCH_WANT_HUGE_PMD_SHARE
++ pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud);
++ #endif
+++>>>>>>> 31caf665e666 (mm: migrate: make core migration code aware of hugepage)
+  
+  extern unsigned long hugepages_treat_as_movable;
+  extern const unsigned long hugetlb_zero, hugetlb_infinity;
+@@@ -133,6 -136,12 +143,15 @@@ static inline int dequeue_hwpoisoned_hu
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define isolate_huge_page(p, l) false
++ #define putback_active_hugepage(p)	do {} while (0)
++ static inline void copy_huge_page(struct page *dst, struct page *src)
++ {
++ }
++ 
+++>>>>>>> 31caf665e666 (mm: migrate: make core migration code aware of hugepage)
+  static inline unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
+  		unsigned long address, unsigned long end, pgprot_t newprot)
+  {
+* Unmerged path include/linux/hugetlb.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 567a4225dad3..8b1870fa6263 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -49,7 +49,8 @@ static unsigned long __initdata default_hstate_max_huge_pages;
+ static unsigned long __initdata default_hstate_size;
+ 
+ /*
+- * Protects updates to hugepage_freelists, nr_huge_pages, and free_huge_pages
++ * Protects updates to hugepage_freelists, hugepage_activelist, nr_huge_pages,
++ * free_huge_pages, and surplus_huge_pages.
+  */
+ DEFINE_SPINLOCK(hugetlb_lock);
+ 
+@@ -3467,3 +3468,23 @@ int dequeue_hwpoisoned_huge_page(struct page *hpage)
+ 	return ret;
+ }
+ #endif
++
++bool isolate_huge_page(struct page *page, struct list_head *list)
++{
++	VM_BUG_ON(!PageHead(page));
++	if (!get_page_unless_zero(page))
++		return false;
++	spin_lock(&hugetlb_lock);
++	list_move_tail(&page->lru, list);
++	spin_unlock(&hugetlb_lock);
++	return true;
++}
++
++void putback_active_hugepage(struct page *page)
++{
++	VM_BUG_ON(!PageHead(page));
++	spin_lock(&hugetlb_lock);
++	list_move_tail(&page->lru, &(page_hstate(page))->hugepage_activelist);
++	spin_unlock(&hugetlb_lock);
++	put_page(page);
++}
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 8abc33e454b2..e734617c787b 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -101,6 +101,10 @@ void putback_movable_pages(struct list_head *l)
+ 	struct page *page2;
+ 
+ 	list_for_each_entry_safe(page, page2, l, lru) {
++		if (unlikely(PageHuge(page))) {
++			putback_active_hugepage(page);
++			continue;
++		}
+ 		list_del(&page->lru);
+ 		dec_zone_page_state(page, NR_ISOLATED_ANON +
+ 				page_is_file_cache(page));
+@@ -1085,7 +1089,11 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+ 		list_for_each_entry_safe(page, page2, from, lru) {
+ 			cond_resched();
+ 
+-			rc = unmap_and_move(get_new_page, private,
++			if (PageHuge(page))
++				rc = unmap_and_move_huge_page(get_new_page,
++						private, page, pass > 2, mode);
++			else
++				rc = unmap_and_move(get_new_page, private,
+ 						page, pass > 2, mode);
+ 
+ 			switch(rc) {
