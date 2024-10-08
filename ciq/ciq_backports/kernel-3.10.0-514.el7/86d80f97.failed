@@ -1,0 +1,100 @@
+NFSv4.1/pnfs: Fix atomicity of commit list updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 86d80f973434de24d8a807a92cd59d5ced7bd519
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/86d80f97.failed
+
+pnfs_layout_mark_request_commit() needs to ensure that it adds the
+request to the commit list atomically with all the other updates
+in order to prevent corruption to buckets[ds_commit_idx].wlseg
+due to races with pnfs_generic_clear_request_commit().
+
+Fixes: 338d00cfef07d ("pnfs: Refactor the *_layout_mark_request_commit...")
+	Cc: stable@vger.kernel.org # v4.0+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 86d80f973434de24d8a807a92cd59d5ced7bd519)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/internal.h
+#	fs/nfs/write.c
+diff --cc fs/nfs/internal.h
+index 7da300acfa93,1dad18105ed0..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -622,6 -623,21 +625,24 @@@ void nfs_super_set_maxbytes(struct supe
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Record the page as unstable and mark its inode as dirty.
++  */
++ static inline
++ void nfs_mark_page_unstable(struct page *page, struct nfs_commit_info *cinfo)
++ {
++ 	if (!cinfo->dreq) {
++ 		struct inode *inode = page_file_mapping(page)->host;
++ 
++ 		inc_zone_page_state(page, NR_UNSTABLE_NFS);
++ 		inc_wb_stat(&inode_to_bdi(inode)->wb, WB_RECLAIMABLE);
++ 		__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
++ 	}
++ }
++ 
++ /*
+++>>>>>>> 86d80f973434 (NFSv4.1/pnfs: Fix atomicity of commit list updates)
+   * Determine the number of bytes of data the page contains
+   */
+  static inline
+diff --cc fs/nfs/write.c
+index 7c80154a7fa3,fdee9270ca15..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -784,18 -806,10 +806,20 @@@ voi
+  nfs_request_add_commit_list(struct nfs_page *req, struct list_head *dst,
+  			    struct nfs_commit_info *cinfo)
+  {
+- 	set_bit(PG_CLEAN, &(req)->wb_flags);
+  	spin_lock(cinfo->lock);
+- 	nfs_list_add_request(req, dst);
+- 	cinfo->mds->ncommit++;
++ 	nfs_request_add_commit_list_locked(req, dst, cinfo);
+  	spin_unlock(cinfo->lock);
+++<<<<<<< HEAD
+ +	if (!cinfo->dreq) {
+ +		inc_zone_page_state(req->wb_page, NR_UNSTABLE_NFS);
+ +		inc_bdi_stat(page_file_mapping(req->wb_page)->backing_dev_info,
+ +			     BDI_RECLAIMABLE);
+ +		__mark_inode_dirty(req->wb_context->dentry->d_inode,
+ +				   I_DIRTY_DATASYNC);
+ +	}
+++=======
++ 	nfs_mark_page_unstable(req->wb_page, cinfo);
+++>>>>>>> 86d80f973434 (NFSv4.1/pnfs: Fix atomicity of commit list updates)
+  }
+  EXPORT_SYMBOL_GPL(nfs_request_add_commit_list);
+  
+* Unmerged path fs/nfs/internal.h
+diff --git a/fs/nfs/pnfs_nfs.c b/fs/nfs/pnfs_nfs.c
+index 8f5751a7d5fa..4f4c9dfed2db 100644
+--- a/fs/nfs/pnfs_nfs.c
++++ b/fs/nfs/pnfs_nfs.c
+@@ -863,9 +863,10 @@ pnfs_layout_mark_request_commit(struct nfs_page *req,
+ 	}
+ 	set_bit(PG_COMMIT_TO_DS, &req->wb_flags);
+ 	cinfo->ds->nwritten++;
+-	spin_unlock(cinfo->lock);
+ 
+-	nfs_request_add_commit_list(req, list, cinfo);
++	nfs_request_add_commit_list_locked(req, list, cinfo);
++	spin_unlock(cinfo->lock);
++	nfs_mark_page_unstable(req->wb_page, cinfo);
+ }
+ EXPORT_SYMBOL_GPL(pnfs_layout_mark_request_commit);
+ 
+* Unmerged path fs/nfs/write.c
