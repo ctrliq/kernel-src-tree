@@ -1,0 +1,437 @@
+cxgb4: Added support in debugfs to dump cim ingress bound queue contents
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit e5f0e43bee31d38fa5a2e9f9c0fc288b2bca6c88
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e5f0e43b.failed
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e5f0e43bee31d38fa5a2e9f9c0fc288b2bca6c88)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+#	drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+#	drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+#	drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 067eaa5ac000,368b5ad20835..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@@ -1015,6 -1054,14 +1015,17 @@@ int t4_mc_read(struct adapter *adap, in
+  	       u64 *parity);
+  int t4_edc_read(struct adapter *adap, int idx, u32 addr, __be32 *data,
+  		u64 *parity);
+++<<<<<<< HEAD
+++=======
++ int t4_read_cim_ibq(struct adapter *adap, unsigned int qid, u32 *data,
++ 		    size_t n);
++ int t4_cim_read(struct adapter *adap, unsigned int addr, unsigned int n,
++ 		unsigned int *valp);
++ int t4_cim_write(struct adapter *adap, unsigned int addr, unsigned int n,
++ 		 const unsigned int *valp);
++ int t4_cim_read_la(struct adapter *adap, u32 *la_buf, unsigned int *wrptr);
++ void t4_read_cimq_cfg(struct adapter *adap, u16 *base, u16 *size, u16 *thres);
+++>>>>>>> e5f0e43bee31 (cxgb4: Added support in debugfs to dump cim ingress bound queue contents)
+  const char *t4_get_port_type_description(enum fw_port_type port_type);
+  void t4_get_port_stats(struct adapter *adap, int idx, struct port_stats *p);
+  void t4_read_mtu_tbl(struct adapter *adap, u16 *mtus, u8 *mtu_log);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index 500e399e494e,4ea4a4a9c426..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@@ -4255,3 -4489,199 +4255,202 @@@ int t4_port_init(struct adapter *adap, 
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  *	t4_read_cimq_cfg - read CIM queue configuration
++  *	@adap: the adapter
++  *	@base: holds the queue base addresses in bytes
++  *	@size: holds the queue sizes in bytes
++  *	@thres: holds the queue full thresholds in bytes
++  *
++  *	Returns the current configuration of the CIM queues, starting with
++  *	the IBQs, then the OBQs.
++  */
++ void t4_read_cimq_cfg(struct adapter *adap, u16 *base, u16 *size, u16 *thres)
++ {
++ 	unsigned int i, v;
++ 	int cim_num_obq = is_t4(adap->params.chip) ?
++ 				CIM_NUM_OBQ : CIM_NUM_OBQ_T5;
++ 
++ 	for (i = 0; i < CIM_NUM_IBQ; i++) {
++ 		t4_write_reg(adap, CIM_QUEUE_CONFIG_REF_A, IBQSELECT_F |
++ 			     QUENUMSELECT_V(i));
++ 		v = t4_read_reg(adap, CIM_QUEUE_CONFIG_CTRL_A);
++ 		/* value is in 256-byte units */
++ 		*base++ = CIMQBASE_G(v) * 256;
++ 		*size++ = CIMQSIZE_G(v) * 256;
++ 		*thres++ = QUEFULLTHRSH_G(v) * 8; /* 8-byte unit */
++ 	}
++ 	for (i = 0; i < cim_num_obq; i++) {
++ 		t4_write_reg(adap, CIM_QUEUE_CONFIG_REF_A, OBQSELECT_F |
++ 			     QUENUMSELECT_V(i));
++ 		v = t4_read_reg(adap, CIM_QUEUE_CONFIG_CTRL_A);
++ 		/* value is in 256-byte units */
++ 		*base++ = CIMQBASE_G(v) * 256;
++ 		*size++ = CIMQSIZE_G(v) * 256;
++ 	}
++ }
++ 
++ /**
++  *	t4_read_cim_ibq - read the contents of a CIM inbound queue
++  *	@adap: the adapter
++  *	@qid: the queue index
++  *	@data: where to store the queue contents
++  *	@n: capacity of @data in 32-bit words
++  *
++  *	Reads the contents of the selected CIM queue starting at address 0 up
++  *	to the capacity of @data.  @n must be a multiple of 4.  Returns < 0 on
++  *	error and the number of 32-bit words actually read on success.
++  */
++ int t4_read_cim_ibq(struct adapter *adap, unsigned int qid, u32 *data, size_t n)
++ {
++ 	int i, err, attempts;
++ 	unsigned int addr;
++ 	const unsigned int nwords = CIM_IBQ_SIZE * 4;
++ 
++ 	if (qid > 5 || (n & 3))
++ 		return -EINVAL;
++ 
++ 	addr = qid * nwords;
++ 	if (n > nwords)
++ 		n = nwords;
++ 
++ 	/* It might take 3-10ms before the IBQ debug read access is allowed.
++ 	 * Wait for 1 Sec with a delay of 1 usec.
++ 	 */
++ 	attempts = 1000000;
++ 
++ 	for (i = 0; i < n; i++, addr++) {
++ 		t4_write_reg(adap, CIM_IBQ_DBG_CFG_A, IBQDBGADDR_V(addr) |
++ 			     IBQDBGEN_F);
++ 		err = t4_wait_op_done(adap, CIM_IBQ_DBG_CFG_A, IBQDBGBUSY_F, 0,
++ 				      attempts, 1);
++ 		if (err)
++ 			return err;
++ 		*data++ = t4_read_reg(adap, CIM_IBQ_DBG_DATA_A);
++ 	}
++ 	t4_write_reg(adap, CIM_IBQ_DBG_CFG_A, 0);
++ 	return i;
++ }
++ 
++ /**
++  *	t4_cim_read - read a block from CIM internal address space
++  *	@adap: the adapter
++  *	@addr: the start address within the CIM address space
++  *	@n: number of words to read
++  *	@valp: where to store the result
++  *
++  *	Reads a block of 4-byte words from the CIM intenal address space.
++  */
++ int t4_cim_read(struct adapter *adap, unsigned int addr, unsigned int n,
++ 		unsigned int *valp)
++ {
++ 	int ret = 0;
++ 
++ 	if (t4_read_reg(adap, CIM_HOST_ACC_CTRL_A) & HOSTBUSY_F)
++ 		return -EBUSY;
++ 
++ 	for ( ; !ret && n--; addr += 4) {
++ 		t4_write_reg(adap, CIM_HOST_ACC_CTRL_A, addr);
++ 		ret = t4_wait_op_done(adap, CIM_HOST_ACC_CTRL_A, HOSTBUSY_F,
++ 				      0, 5, 2);
++ 		if (!ret)
++ 			*valp++ = t4_read_reg(adap, CIM_HOST_ACC_DATA_A);
++ 	}
++ 	return ret;
++ }
++ 
++ /**
++  *	t4_cim_write - write a block into CIM internal address space
++  *	@adap: the adapter
++  *	@addr: the start address within the CIM address space
++  *	@n: number of words to write
++  *	@valp: set of values to write
++  *
++  *	Writes a block of 4-byte words into the CIM intenal address space.
++  */
++ int t4_cim_write(struct adapter *adap, unsigned int addr, unsigned int n,
++ 		 const unsigned int *valp)
++ {
++ 	int ret = 0;
++ 
++ 	if (t4_read_reg(adap, CIM_HOST_ACC_CTRL_A) & HOSTBUSY_F)
++ 		return -EBUSY;
++ 
++ 	for ( ; !ret && n--; addr += 4) {
++ 		t4_write_reg(adap, CIM_HOST_ACC_DATA_A, *valp++);
++ 		t4_write_reg(adap, CIM_HOST_ACC_CTRL_A, addr | HOSTWRITE_F);
++ 		ret = t4_wait_op_done(adap, CIM_HOST_ACC_CTRL_A, HOSTBUSY_F,
++ 				      0, 5, 2);
++ 	}
++ 	return ret;
++ }
++ 
++ static int t4_cim_write1(struct adapter *adap, unsigned int addr,
++ 			 unsigned int val)
++ {
++ 	return t4_cim_write(adap, addr, 1, &val);
++ }
++ 
++ /**
++  *	t4_cim_read_la - read CIM LA capture buffer
++  *	@adap: the adapter
++  *	@la_buf: where to store the LA data
++  *	@wrptr: the HW write pointer within the capture buffer
++  *
++  *	Reads the contents of the CIM LA buffer with the most recent entry at
++  *	the end	of the returned data and with the entry at @wrptr first.
++  *	We try to leave the LA in the running state we find it in.
++  */
++ int t4_cim_read_la(struct adapter *adap, u32 *la_buf, unsigned int *wrptr)
++ {
++ 	int i, ret;
++ 	unsigned int cfg, val, idx;
++ 
++ 	ret = t4_cim_read(adap, UP_UP_DBG_LA_CFG_A, 1, &cfg);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (cfg & UPDBGLAEN_F) {	/* LA is running, freeze it */
++ 		ret = t4_cim_write1(adap, UP_UP_DBG_LA_CFG_A, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	ret = t4_cim_read(adap, UP_UP_DBG_LA_CFG_A, 1, &val);
++ 	if (ret)
++ 		goto restart;
++ 
++ 	idx = UPDBGLAWRPTR_G(val);
++ 	if (wrptr)
++ 		*wrptr = idx;
++ 
++ 	for (i = 0; i < adap->params.cim_la_size; i++) {
++ 		ret = t4_cim_write1(adap, UP_UP_DBG_LA_CFG_A,
++ 				    UPDBGLARDPTR_V(idx) | UPDBGLARDEN_F);
++ 		if (ret)
++ 			break;
++ 		ret = t4_cim_read(adap, UP_UP_DBG_LA_CFG_A, 1, &val);
++ 		if (ret)
++ 			break;
++ 		if (val & UPDBGLARDEN_F) {
++ 			ret = -ETIMEDOUT;
++ 			break;
++ 		}
++ 		ret = t4_cim_read(adap, UP_UP_DBG_LA_DATA_A, 1, &la_buf[i]);
++ 		if (ret)
++ 			break;
++ 		idx = (idx + 1) & UPDBGLARDPTR_M;
++ 	}
++ restart:
++ 	if (cfg & UPDBGLAEN_F) {
++ 		int r = t4_cim_write1(adap, UP_UP_DBG_LA_CFG_A,
++ 				      cfg & ~UPDBGLARDEN_F);
++ 		if (!ret)
++ 			ret = r;
++ 	}
++ 	return ret;
++ }
+++>>>>>>> e5f0e43bee31 (cxgb4: Added support in debugfs to dump cim ingress bound queue contents)
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+index c19a90e7f7d1,6581cd5949d1..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+@@@ -56,6 -56,14 +56,17 @@@ enum 
+  };
+  
+  enum {
+++<<<<<<< HEAD
+++=======
++ 	CIM_NUM_IBQ    = 6,     /* # of CIM IBQs */
++ 	CIM_NUM_OBQ    = 6,     /* # of CIM OBQs */
++ 	CIM_NUM_OBQ_T5 = 8,     /* # of CIM OBQs for T5 adapter */
++ 	CIMLA_SIZE     = 2048,  /* # of 32-bit words in CIM LA */
++ 	CIM_IBQ_SIZE   = 128,   /* # of 128-bit words in a CIM IBQ */
++ };
++ 
++ enum {
+++>>>>>>> e5f0e43bee31 (cxgb4: Added support in debugfs to dump cim ingress bound queue contents)
+  	SF_PAGE_SIZE = 256,           /* serial flash page size */
+  	SF_SEC_SIZE = 64 * 1024,      /* serial flash sector size */
+  };
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+index ca17cd6178d0,39e4b7565a34..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+@@@ -1422,46 -2520,114 +1422,69 @@@
+  #define EDC_STRIDE_T5 (EDC_T51_BASE_ADDR - EDC_T50_BASE_ADDR)
+  #define EDC_REG_T5(reg, idx) (reg + EDC_STRIDE_T5 * idx)
+  
+ -#define PL_VF_REV_A 0x4
+ -#define PL_VF_WHOAMI_A 0x0
+ -#define PL_VF_REVISION_A 0x8
+ -
+ -/* registers for module CIM */
+ -#define CIM_HOST_ACC_CTRL_A	0x7b50
+ -#define CIM_HOST_ACC_DATA_A	0x7b54
+ -#define UP_UP_DBG_LA_CFG_A	0x140
+ -#define UP_UP_DBG_LA_DATA_A	0x144
+ -
+ -#define HOSTBUSY_S	17
+ -#define HOSTBUSY_V(x)	((x) << HOSTBUSY_S)
+ -#define HOSTBUSY_F	HOSTBUSY_V(1U)
+ +#define A_PL_VF_REV 0x4
+ +#define A_PL_VF_WHOAMI 0x0
+ +#define A_PL_VF_REVISION 0x8
+  
+ -#define HOSTWRITE_S	16
+ -#define HOSTWRITE_V(x)	((x) << HOSTWRITE_S)
+ -#define HOSTWRITE_F	HOSTWRITE_V(1U)
+ +#define S_CHIPID    4
+ +#define M_CHIPID    0xfU
+ +#define V_CHIPID(x) ((x) << S_CHIPID)
+ +#define G_CHIPID(x) (((x) >> S_CHIPID) & M_CHIPID)
+  
+ +/* TP_VLAN_PRI_MAP controls which subset of fields will be present in the
+ + * Compressed Filter Tuple for LE filters.  Each bit set in TP_VLAN_PRI_MAP
+ + * selects for a particular field being present.  These fields, when present
+ + * in the Compressed Filter Tuple, have the following widths in bits.
+ + */
+ +#define W_FT_FCOE                       1
+ +#define W_FT_PORT                       3
+ +#define W_FT_VNIC_ID                    17
+ +#define W_FT_VLAN                       17
+ +#define W_FT_TOS                        8
+ +#define W_FT_PROTOCOL                   8
+ +#define W_FT_ETHERTYPE                  16
+ +#define W_FT_MACMATCH                   9
+ +#define W_FT_MPSHITTYPE                 3
+ +#define W_FT_FRAGMENTATION              1
+ +
+ +/* Some of the Compressed Filter Tuple fields have internal structure.  These
+ + * bit shifts/masks describe those structures.  All shifts are relative to the
+ + * base position of the fields within the Compressed Filter Tuple
+ + */
+ +#define S_FT_VLAN_VLD                   16
+ +#define V_FT_VLAN_VLD(x)                ((x) << S_FT_VLAN_VLD)
+ +#define F_FT_VLAN_VLD                   V_FT_VLAN_VLD(1U)
+ +
+++<<<<<<< HEAD
+ +#define S_FT_VNID_ID_VF                 0
+ +#define V_FT_VNID_ID_VF(x)              ((x) << S_FT_VNID_ID_VF)
+++=======
++ #define CIM_IBQ_DBG_CFG_A 0x7b60
++ 
++ #define IBQDBGADDR_S    16
++ #define IBQDBGADDR_M    0xfffU
++ #define IBQDBGADDR_V(x) ((x) << IBQDBGADDR_S)
++ #define IBQDBGADDR_G(x) (((x) >> IBQDBGADDR_S) & IBQDBGADDR_M)
++ 
++ #define IBQDBGBUSY_S    1
++ #define IBQDBGBUSY_V(x) ((x) << IBQDBGBUSY_S)
++ #define IBQDBGBUSY_F    IBQDBGBUSY_V(1U)
++ 
++ #define IBQDBGEN_S    0
++ #define IBQDBGEN_V(x) ((x) << IBQDBGEN_S)
++ #define IBQDBGEN_F    IBQDBGEN_V(1U)
++ 
++ #define CIM_IBQ_DBG_DATA_A 0x7b68
++ 
++ #define UPDBGLARDEN_S		1
++ #define UPDBGLARDEN_V(x)	((x) << UPDBGLARDEN_S)
++ #define UPDBGLARDEN_F		UPDBGLARDEN_V(1U)
+++>>>>>>> e5f0e43bee31 (cxgb4: Added support in debugfs to dump cim ingress bound queue contents)
+  
+ -#define UPDBGLAEN_S	0
+ -#define UPDBGLAEN_V(x)	((x) << UPDBGLAEN_S)
+ -#define UPDBGLAEN_F	UPDBGLAEN_V(1U)
+ -
+ -#define UPDBGLARDPTR_S		2
+ -#define UPDBGLARDPTR_M		0xfffU
+ -#define UPDBGLARDPTR_V(x)	((x) << UPDBGLARDPTR_S)
+ -
+ -#define UPDBGLAWRPTR_S    16
+ -#define UPDBGLAWRPTR_M    0xfffU
+ -#define UPDBGLAWRPTR_G(x) (((x) >> UPDBGLAWRPTR_S) & UPDBGLAWRPTR_M)
+ -
+ -#define UPDBGLACAPTPCONLY_S	30
+ -#define UPDBGLACAPTPCONLY_V(x)	((x) << UPDBGLACAPTPCONLY_S)
+ -#define UPDBGLACAPTPCONLY_F	UPDBGLACAPTPCONLY_V(1U)
+ -
+ -#define CIM_QUEUE_CONFIG_REF_A 0x7b48
+ -#define CIM_QUEUE_CONFIG_CTRL_A 0x7b4c
+ -
+ -#define CIMQSIZE_S    24
+ -#define CIMQSIZE_M    0x3fU
+ -#define CIMQSIZE_G(x) (((x) >> CIMQSIZE_S) & CIMQSIZE_M)
+ -
+ -#define CIMQBASE_S    16
+ -#define CIMQBASE_M    0x3fU
+ -#define CIMQBASE_G(x) (((x) >> CIMQBASE_S) & CIMQBASE_M)
+ -
+ -#define QUEFULLTHRSH_S    0
+ -#define QUEFULLTHRSH_M    0x1ffU
+ -#define QUEFULLTHRSH_G(x) (((x) >> QUEFULLTHRSH_S) & QUEFULLTHRSH_M)
+ -
+ -#define UP_IBQ_0_RDADDR_A 0x10
+ -#define UP_IBQ_0_SHADOW_RDADDR_A 0x280
+ -#define UP_OBQ_0_REALADDR_A 0x104
+ -#define UP_OBQ_0_SHADOW_REALADDR_A 0x394
+ -
+ -#define IBQRDADDR_S    0
+ -#define IBQRDADDR_M    0x1fffU
+ -#define IBQRDADDR_G(x) (((x) >> IBQRDADDR_S) & IBQRDADDR_M)
+ -
+ -#define IBQWRADDR_S    0
+ -#define IBQWRADDR_M    0x1fffU
+ -#define IBQWRADDR_G(x) (((x) >> IBQWRADDR_S) & IBQWRADDR_M)
+ -
+ -#define QUERDADDR_S    0
+ -#define QUERDADDR_M    0x7fffU
+ -#define QUERDADDR_G(x) (((x) >> QUERDADDR_S) & QUERDADDR_M)
+ -
+ -#define QUEREMFLITS_S    0
+ -#define QUEREMFLITS_M    0x7ffU
+ -#define QUEREMFLITS_G(x) (((x) >> QUEREMFLITS_S) & QUEREMFLITS_M)
+ -
+ -#define QUEEOPCNT_S    16
+ -#define QUEEOPCNT_M    0xfffU
+ -#define QUEEOPCNT_G(x) (((x) >> QUEEOPCNT_S) & QUEEOPCNT_M)
+ -
+ -#define QUESOPCNT_S    0
+ -#define QUESOPCNT_M    0xfffU
+ -#define QUESOPCNT_G(x) (((x) >> QUESOPCNT_S) & QUESOPCNT_M)
+ -
+ -#define OBQSELECT_S    4
+ -#define OBQSELECT_V(x) ((x) << OBQSELECT_S)
+ -#define OBQSELECT_F    OBQSELECT_V(1U)
+ -
+ -#define IBQSELECT_S    3
+ -#define IBQSELECT_V(x) ((x) << IBQSELECT_S)
+ -#define IBQSELECT_F    IBQSELECT_V(1U)
+ +#define S_FT_VNID_ID_PF                 7
+ +#define V_FT_VNID_ID_PF(x)              ((x) << S_FT_VNID_ID_PF)
+  
+ -#define QUENUMSELECT_S    0
+ -#define QUENUMSELECT_V(x) ((x) << QUENUMSELECT_S)
+ +#define S_FT_VNID_ID_VLD                16
+ +#define V_FT_VNID_ID_VLD(x)             ((x) << S_FT_VNID_ID_VLD)
+  
+  #endif /* __T4_REGS_H */
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
