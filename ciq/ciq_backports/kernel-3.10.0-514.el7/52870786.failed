@@ -1,0 +1,157 @@
+ACPI: Use ACPI companion to match only the first physical device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 52870786ff5d06540efacc64ca8faa74221f10dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/52870786.failed
+
+Commit 6ab3430129e2 ("mfd: Add ACPI support") made the MFD subdevices
+share the parent MFD ACPI companion if no _HID/_CID is specified for
+the subdevice in mfd_cell description. However, since all the subdevices
+share the ACPI companion, the match and modalias generation logic started
+to use the ACPI companion as well resulting this:
+
+  # cat /sys/bus/platform/devices/HID-SENSOR-200041.6.auto/modalias
+  acpi:INT33D1:PNP0C50:
+
+instead of the expected one
+
+  # cat /sys/bus/platform/devices/HID-SENSOR-200041.6.auto/modalias
+  platform:HID-SENSOR-200041
+
+In other words the subdevice modalias is overwritten by the one taken from
+ACPI companion. This causes udev not to load the driver anymore.
+
+It is useful to be able to share the ACPI companion so that MFD subdevices
+(and possibly other devices as well) can access the ACPI resources even if
+they do not have ACPI representation in the namespace themselves.
+
+An example where this is used is Minnowboard LPC driver that creates GPIO
+as a subdevice among other things. Without the ACPI companion gpiolib is
+not able to lookup the corresponding GPIO controller from ACPI GpioIo
+resource.
+
+To fix this, restrict the match and modalias logic to be limited to the
+first (primary) physical device associated with the given ACPI comapnion.
+The secondary devices will still be able to access the ACPI companion,
+but they will be matched in a different way.
+
+Fixes: 6ab3430129e2 (mfd: Add ACPI support)
+	Reported-by: Jarkko Nikula <jarkko.nikula@linux.intel.com>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 52870786ff5d06540efacc64ca8faa74221f10dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/scan.c
+diff --cc drivers/acpi/scan.c
+index a53f9f1ef42f,0476e90b2091..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -138,6 -141,98 +138,101 @@@ static int create_modalias(struct acpi_
+  	return len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * acpi_companion_match() - Can we match via ACPI companion device
++  * @dev: Device in question
++  *
++  * Check if the given device has an ACPI companion and if that companion has
++  * a valid list of PNP IDs, and if the device is the first (primary) physical
++  * device associated with it.
++  *
++  * If multiple physical devices are attached to a single ACPI companion, we need
++  * to be careful.  The usage scenario for this kind of relationship is that all
++  * of the physical devices in question use resources provided by the ACPI
++  * companion.  A typical case is an MFD device where all the sub-devices share
++  * the parent's ACPI companion.  In such cases we can only allow the primary
++  * (first) physical device to be matched with the help of the companion's PNP
++  * IDs.
++  *
++  * Additional physical devices sharing the ACPI companion can still use
++  * resources available from it but they will be matched normally using functions
++  * provided by their bus types (and analogously for their modalias).
++  */
++ static bool acpi_companion_match(const struct device *dev)
++ {
++ 	struct acpi_device *adev;
++ 	bool ret;
++ 
++ 	adev = ACPI_COMPANION(dev);
++ 	if (!adev)
++ 		return false;
++ 
++ 	if (list_empty(&adev->pnp.ids))
++ 		return false;
++ 
++ 	mutex_lock(&adev->physical_node_lock);
++ 	if (list_empty(&adev->physical_node_list)) {
++ 		ret = false;
++ 	} else {
++ 		const struct acpi_device_physical_node *node;
++ 
++ 		node = list_first_entry(&adev->physical_node_list,
++ 					struct acpi_device_physical_node, node);
++ 		ret = node->dev == dev;
++ 	}
++ 	mutex_unlock(&adev->physical_node_lock);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Creates uevent modalias field for ACPI enumerated devices.
++  * Because the other buses does not support ACPI HIDs & CIDs.
++  * e.g. for a device with hid:IBM0001 and cid:ACPI0001 you get:
++  * "acpi:IBM0001:ACPI0001"
++  */
++ int acpi_device_uevent_modalias(struct device *dev, struct kobj_uevent_env *env)
++ {
++ 	int len;
++ 
++ 	if (!acpi_companion_match(dev))
++ 		return -ENODEV;
++ 
++ 	if (add_uevent_var(env, "MODALIAS="))
++ 		return -ENOMEM;
++ 	len = create_modalias(ACPI_COMPANION(dev), &env->buf[env->buflen - 1],
++ 				sizeof(env->buf) - env->buflen);
++ 	if (len <= 0)
++ 		return len;
++ 	env->buflen += len;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(acpi_device_uevent_modalias);
++ 
++ /*
++  * Creates modalias sysfs attribute for ACPI enumerated devices.
++  * Because the other buses does not support ACPI HIDs & CIDs.
++  * e.g. for a device with hid:IBM0001 and cid:ACPI0001 you get:
++  * "acpi:IBM0001:ACPI0001"
++  */
++ int acpi_device_modalias(struct device *dev, char *buf, int size)
++ {
++ 	int len;
++ 
++ 	if (!acpi_companion_match(dev))
++ 		return -ENODEV;
++ 
++ 	len = create_modalias(ACPI_COMPANION(dev), buf, size -1);
++ 	if (len <= 0)
++ 		return len;
++ 	buf[len++] = '\n';
++ 	return len;
++ }
++ EXPORT_SYMBOL_GPL(acpi_device_modalias);
++ 
+++>>>>>>> 52870786ff5d (ACPI: Use ACPI companion to match only the first physical device)
+  static ssize_t
+  acpi_device_modalias_show(struct device *dev, struct device_attribute *attr, char *buf) {
+  	struct acpi_device *acpi_dev = to_acpi_device(dev);
+* Unmerged path drivers/acpi/scan.c
