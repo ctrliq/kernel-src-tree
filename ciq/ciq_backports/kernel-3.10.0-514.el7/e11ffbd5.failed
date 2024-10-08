@@ -1,0 +1,221 @@
+IB/hfi1: Do not free hfi1 cdev parent structure early
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dennis Dalessandro <dennis.dalessandro@intel.com>
+commit e11ffbd57520c3832e05f2f5f19e9ff6adbb7cdc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e11ffbd5.failed
+
+The deletion of a cdev is not a fence for holding off references to the
+structure. The driver attempts to delete the cdev and then proceeds to
+free the parent structure, the hfi1_devdata, or dd. This can potentially
+lead to a kernel panic in situations where a user has an FD for the cdev
+open, and the pci device gets removed. If the user then closes the FD
+there will be a NULL dereference when trying to do put on the cdev's
+kobject.
+
+Fix this by pointing the cdev's kobject.parent at a new kobject embedded
+in its parent structure. Also take a reference when the device is opened
+and put it back when it is closed.
+
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e11ffbd57520c3832e05f2f5f19e9ff6adbb7cdc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/hfi.h
+#	drivers/staging/hfi1/init.c
+diff --cc drivers/staging/hfi1/hfi.h
+index df3a4d4d0748,4417a0fd3ef9..000000000000
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@@ -1137,6 -1159,17 +1137,20 @@@ struct hfi1_devdata 
+  	/* receive context tail dummy address */
+  	__le64 *rcvhdrtail_dummy_kvaddr;
+  	dma_addr_t rcvhdrtail_dummy_physaddr;
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+++=======
++ 
++ 	bool eprom_available;	/* true if EPROM is available for this device */
++ 	bool aspm_supported;	/* Does HW support ASPM */
++ 	bool aspm_enabled;	/* ASPM state: enabled/disabled */
++ 	/* Serialize ASPM enable/disable between multiple verbs contexts */
++ 	spinlock_t aspm_lock;
++ 	/* Number of verbs contexts which have disabled ASPM */
++ 	atomic_t aspm_disabled_cnt;
++ 
++ 	struct hfi1_affinity *affinity;
++ 	struct kobject kobj;
+++>>>>>>> e11ffbd57520 (IB/hfi1: Do not free hfi1 cdev parent structure early):drivers/staging/rdma/hfi1/hfi.h
+  };
+  
+  /* 8051 firmware version helper */
+diff --cc drivers/staging/hfi1/init.c
+index 8a9276b28f8a,5cc492e5776d..000000000000
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@@ -975,8 -970,29 +975,33 @@@ void hfi1_free_ctxtdata(struct hfi1_dev
+  	kfree(rcd);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/init.c
+ +void hfi1_free_devdata(struct hfi1_devdata *dd)
+++=======
++ /*
++  * Release our hold on the shared asic data.  If we are the last one,
++  * free the structure.  Must be holding hfi1_devs_lock.
++  */
++ static void release_asic_data(struct hfi1_devdata *dd)
+  {
++ 	int other;
++ 
++ 	if (!dd->asic_data)
++ 		return;
++ 	dd->asic_data->dds[dd->hfi1_id] = NULL;
++ 	other = dd->hfi1_id ? 0 : 1;
++ 	if (!dd->asic_data->dds[other]) {
++ 		/* we are the last holder, free it */
++ 		kfree(dd->asic_data);
++ 	}
++ 	dd->asic_data = NULL;
++ }
++ 
++ static void __hfi1_free_devdata(struct kobject *kobj)
+++>>>>>>> e11ffbd57520 (IB/hfi1: Do not free hfi1 cdev parent structure early):drivers/staging/rdma/hfi1/init.c
++ {
++ 	struct hfi1_devdata *dd =
++ 		container_of(kobj, struct hfi1_devdata, kobj);
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&hfi1_devs_lock, flags);
+@@@ -987,9 -1004,20 +1012,18 @@@
+  	rcu_barrier(); /* wait for rcu callbacks to complete */
+  	free_percpu(dd->int_counter);
+  	free_percpu(dd->rcv_limit);
+ -	hfi1_dev_affinity_free(dd);
+ -	free_percpu(dd->send_schedule);
+ -	rvt_dealloc_device(&dd->verbs_dev.rdi);
+ +	ib_dealloc_device(&dd->verbs_dev.ibdev);
+  }
+  
++ static struct kobj_type hfi1_devdata_type = {
++ 	.release = __hfi1_free_devdata,
++ };
++ 
++ void hfi1_free_devdata(struct hfi1_devdata *dd)
++ {
++ 	kobject_put(&dd->kobj);
++ }
++ 
+  /*
+   * Allocate our primary per-unit data structure.  Must be done via verbs
+   * allocator, because the verbs cleanup process both does cleanup and
+@@@ -1080,7 -1113,7 +1114,11 @@@ struct hfi1_devdata *hfi1_alloc_devdata
+  			&pdev->dev,
+  			"Could not alloc cpulist info, cpu affinity might be wrong\n");
+  	}
+++<<<<<<< HEAD:drivers/staging/hfi1/init.c
+ +	hfi1_dbg_ibdev_init(&dd->verbs_dev);
+++=======
++ 	kobject_init(&dd->kobj, &hfi1_devdata_type);
+++>>>>>>> e11ffbd57520 (IB/hfi1: Do not free hfi1 cdev parent structure early):drivers/staging/rdma/hfi1/init.c
+  	return dd;
+  
+  bail:
+diff --git a/drivers/staging/hfi1/device.c b/drivers/staging/hfi1/device.c
+index f35f58a22959..304150b8ce5e 100644
+--- a/drivers/staging/hfi1/device.c
++++ b/drivers/staging/hfi1/device.c
+@@ -63,7 +63,8 @@ static dev_t hfi1_dev;
+ int hfi1_cdev_init(int minor, const char *name,
+ 		   const struct file_operations *fops,
+ 		   struct cdev *cdev, struct device **devp,
+-		   bool user_accessible)
++		   bool user_accessible,
++		   struct kobject *parent)
+ {
+ 	const dev_t dev = MKDEV(MAJOR(hfi1_dev), minor);
+ 	struct device *device = NULL;
+@@ -71,6 +72,7 @@ int hfi1_cdev_init(int minor, const char *name,
+ 
+ 	cdev_init(cdev, fops);
+ 	cdev->owner = THIS_MODULE;
++	cdev->kobj.parent = parent;
+ 	kobject_set_name(&cdev->kobj, name);
+ 
+ 	ret = cdev_add(cdev, dev, 1);
+diff --git a/drivers/staging/hfi1/device.h b/drivers/staging/hfi1/device.h
+index 2850ff739d81..5b4e174fe906 100644
+--- a/drivers/staging/hfi1/device.h
++++ b/drivers/staging/hfi1/device.h
+@@ -53,7 +53,8 @@
+ int hfi1_cdev_init(int minor, const char *name,
+ 		   const struct file_operations *fops,
+ 		   struct cdev *cdev, struct device **devp,
+-		   bool user_accessible);
++		   bool user_accessible,
++		   struct kobject *parent);
+ void hfi1_cdev_cleanup(struct cdev *cdev, struct device **devp);
+ const char *class_name(void);
+ int __init dev_init(void);
+diff --git a/drivers/staging/hfi1/file_ops.c b/drivers/staging/hfi1/file_ops.c
+index 89c4fc4847ca..0df5eb4daded 100644
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@ -194,6 +194,13 @@ static inline int is_valid_mmap(u64 token)
+ 
+ static int hfi1_file_open(struct inode *inode, struct file *fp)
+ {
++	struct hfi1_devdata *dd = container_of(inode->i_cdev,
++					       struct hfi1_devdata,
++					       user_cdev);
++
++	/* Just take a ref now. Not all opens result in a context assign */
++	kobject_get(&dd->kobj);
++
+ 	/* The real work is performed later in assign_ctxt() */
+ 	fp->private_data = kzalloc(sizeof(struct hfi1_filedata), GFP_KERNEL);
+ 	if (fp->private_data) /* no cpu affinity by default */
+@@ -736,7 +743,9 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
+ {
+ 	struct hfi1_filedata *fdata = fp->private_data;
+ 	struct hfi1_ctxtdata *uctxt = fdata->uctxt;
+-	struct hfi1_devdata *dd;
++	struct hfi1_devdata *dd = container_of(inode->i_cdev,
++					       struct hfi1_devdata,
++					       user_cdev);
+ 	unsigned long flags, *ev;
+ 
+ 	fp->private_data = NULL;
+@@ -745,7 +754,6 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
+ 		goto done;
+ 
+ 	hfi1_cdbg(PROC, "freeing ctxt %u:%u", uctxt->ctxt, fdata->subctxt);
+-	dd = uctxt->dd;
+ 	mutex_lock(&hfi1_mutex);
+ 
+ 	flush_wc();
+@@ -809,6 +817,7 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
+ 	mutex_unlock(&hfi1_mutex);
+ 	hfi1_free_ctxtdata(dd, uctxt);
+ done:
++	kobject_put(&dd->kobj);
+ 	kfree(fdata);
+ 	return 0;
+ }
+@@ -2038,7 +2047,7 @@ static int user_add(struct hfi1_devdata *dd)
+ 	snprintf(name, sizeof(name), "%s_%d", class_name(), dd->unit);
+ 	ret = hfi1_cdev_init(dd->unit, name, &hfi1_file_ops,
+ 			     &dd->user_cdev, &dd->user_device,
+-			     true);
++			     true, &dd->kobj);
+ 	if (ret)
+ 		goto done;
+ 
+* Unmerged path drivers/staging/hfi1/hfi.h
+* Unmerged path drivers/staging/hfi1/init.c
