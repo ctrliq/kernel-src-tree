@@ -1,0 +1,617 @@
+x86/efi: Build our own EFI services pointer table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matt Fleming <matt.fleming@intel.com>
+commit 54b52d87268034859191d671505bb1cfce6bd74d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/54b52d87.failed
+
+It's not possible to dereference the EFI System table directly when
+booting a 64-bit kernel on a 32-bit EFI firmware because the size of
+pointers don't match.
+
+In preparation for supporting the above use case, build a list of
+function pointers on boot so that callers don't have to worry about
+converting pointer sizes through multiple levels of indirection.
+
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 54b52d87268034859191d671505bb1cfce6bd74d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+#	drivers/firmware/efi/efi-stub-helper.c
+diff --cc arch/x86/boot/compressed/eboot.c
+index a1ae20b40077,42548168bdc3..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -421,56 -555,6 +556,59 @@@ void setup_graphics(struct boot_params 
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +
+ +static int get_secure_boot(void)
+ +{
+ +	u8 sb, setup, moksbstate;
+ +	unsigned long datasize = sizeof(sb);
+ +	u32 attr;
+ +	efi_guid_t var_guid = EFI_GLOBAL_VARIABLE_GUID;
+ +	efi_status_t status;
+ +
+ +	status = efi_call_phys5(sys_table->runtime->get_variable,
+ +				L"SecureBoot", &var_guid, NULL, &datasize, &sb);
+ +
+ +	if (status != EFI_SUCCESS)
+ +		return 0;
+ +
+ +	if (sb == 0)
+ +		return 0;
+ +
+ +
+ +	status = efi_call_phys5(sys_table->runtime->get_variable,
+ +				L"SetupMode", &var_guid, NULL, &datasize,
+ +				&setup);
+ +
+ +	if (status != EFI_SUCCESS)
+ +		return 0;
+ +
+ +	if (setup == 1)
+ +		return 0;
+ +
+ +	/* See if a user has put shim into insecure_mode.  If so, and the variable
+ +	 * doesn't have the runtime attribute set, we might as well honor that.
+ +	 */
+ +	var_guid = EFI_SHIM_LOCK_GUID;
+ +	status = efi_call_phys5(sys_table->runtime->get_variable,
+ +				L"MokSBState", &var_guid, &attr, &datasize,
+ +				&moksbstate);
+ +
+ +	/* If it fails, we don't care why.  Default to secure */
+ +	if (status != EFI_SUCCESS)
+ +		return 1;
+ +
+ +	if (!(attr & EFI_VARIABLE_RUNTIME_ACCESS)) {
+ +		if (moksbstate == 1)
+ +			return 0;
+ +	}
+ +
+ +	return 1;
+ +}
+ +
+ +
+++=======
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  /*
+   * Because the x86 boot code expects to be passed a boot_params we
+   * need to create one ourselves (usually the bootloader would create
+@@@ -492,8 -576,12 +630,10 @@@ struct boot_params *make_boot_params(st
+  	u16 *s2;
+  	u8 *s1;
+  	int i;
+ -	unsigned long ramdisk_addr;
+ -	unsigned long ramdisk_size;
+  
+- 	sys_table = _table;
++ 	efi_early = c;
++ 	sys_table = (efi_system_table_t *)(unsigned long)efi_early->table;
++ 	handle = (void *)(unsigned long)efi_early->image_handle;
+  
+  	/* Check if we were booted by the EFI firmware */
+  	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+@@@ -807,9 -907,10 +958,16 @@@ struct boot_params *efi_main(struct efi
+  	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+  		goto fail;
+  
+++<<<<<<< HEAD
+ +	sanitize_boot_params(boot_params);
+ +
+ +	boot_params->secure_boot = get_secure_boot();
+++=======
++ 	if (is64)
++ 		setup_boot_services64(efi_early);
++ 	else
++ 		setup_boot_services32(efi_early);
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  
+  	setup_graphics(boot_params);
+  
+diff --cc drivers/firmware/efi/efi-stub-helper.c
+index f243c3499856,a0282872d97d..000000000000
+--- a/drivers/firmware/efi/efi-stub-helper.c
++++ b/drivers/firmware/efi/efi-stub-helper.c
+@@@ -246,23 -252,24 +236,29 @@@ static void efi_free(efi_system_table_
+  
+  
+  /*
+ - * Check the cmdline for a LILO-style file= arguments.
+ + * Check the cmdline for a LILO-style initrd= arguments.
+   *
+ - * We only support loading a file from the same filesystem as
+ - * the kernel image.
+ + * We only support loading an initrd from the same filesystem as the
+ + * kernel image.
+   */
+ -static efi_status_t handle_cmdline_files(efi_system_table_t *sys_table_arg,
+ -					 efi_loaded_image_t *image,
+ -					 char *cmd_line, char *option_string,
+ -					 unsigned long max_addr,
+ -					 unsigned long *load_addr,
+ -					 unsigned long *load_size)
+ +static efi_status_t handle_ramdisks(efi_system_table_t *sys_table_arg,
+ +				    efi_loaded_image_t *image,
+ +				    struct setup_header *hdr)
+  {
+++<<<<<<< HEAD
+ +	struct initrd *initrds;
+ +	unsigned long initrd_addr;
+ +	efi_guid_t fs_proto = EFI_FILE_SYSTEM_GUID;
+ +	u64 initrd_total;
+ +	efi_file_io_interface_t *io;
+++=======
++ 	struct file_info *files;
++ 	unsigned long file_addr;
++ 	u64 file_size_total;
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  	efi_file_handle_t *fh;
+  	efi_status_t status;
+ -	int nr_files;
+ +	int nr_initrds;
+  	char *str;
+  	int i, j, k;
+  
+@@@ -291,30 -304,23 +287,38 @@@
+  			str++;
+  	}
+  
+ -	if (!nr_files)
+ +	if (!nr_initrds)
+  		return EFI_SUCCESS;
+  
+++<<<<<<< HEAD
+ +	status = efi_call_phys3(sys_table_arg->boottime->allocate_pool,
+ +				EFI_LOADER_DATA,
+ +				nr_initrds * sizeof(*initrds),
+ +				&initrds);
+++=======
++ 	status = efi_early->call(efi_early->allocate_pool, EFI_LOADER_DATA,
++ 				 nr_files * sizeof(*files), (void **)&files);
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  	if (status != EFI_SUCCESS) {
+ -		efi_printk(sys_table_arg, "Failed to alloc mem for file handle list\n");
+ +		efi_printk(sys_table_arg, "Failed to alloc mem for initrds\n");
+  		goto fail;
+  	}
+  
+++<<<<<<< HEAD
+ +	str = (char *)(unsigned long)hdr->cmd_line_ptr;
+ +	for (i = 0; i < nr_initrds; i++) {
+ +		struct initrd *initrd;
+ +		efi_file_handle_t *h;
+ +		efi_file_info_t *info;
+++=======
++ 	str = cmd_line;
++ 	for (i = 0; i < nr_files; i++) {
++ 		struct file_info *file;
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  		efi_char16_t filename_16[256];
+- 		unsigned long info_sz;
+- 		efi_guid_t info_guid = EFI_FILE_INFO_ID;
+  		efi_char16_t *p;
+- 		u64 file_sz;
+  
+ -		str = strstr(str, option_string);
+ +		str = strstr(str, "initrd=");
+  		if (!str)
+  			break;
+  
+@@@ -343,72 -349,21 +347,87 @@@
+  
+  		/* Only open the volume once. */
+  		if (!i) {
+++<<<<<<< HEAD
+ +			efi_boot_services_t *boottime;
+ +
+ +			boottime = sys_table_arg->boottime;
+ +
+ +			status = efi_call_phys3(boottime->handle_protocol,
+ +					image->device_handle, &fs_proto, &io);
+ +			if (status != EFI_SUCCESS) {
+ +				efi_printk(sys_table_arg, "Failed to handle fs_proto\n");
+ +				goto free_initrds;
+ +			}
+ +
+ +			status = efi_call_phys2(io->open_volume, io, &fh);
+ +			if (status != EFI_SUCCESS) {
+ +				efi_printk(sys_table_arg, "Failed to open volume\n");
+ +				goto free_initrds;
+ +			}
+ +		}
+ +
+ +		status = efi_call_phys5(fh->open, fh, &h, filename_16,
+ +					EFI_FILE_MODE_READ, (u64)0);
+ +		if (status != EFI_SUCCESS) {
+ +			efi_printk(sys_table_arg, "Failed to open initrd file: ");
+ +			efi_char16_printk(sys_table_arg, filename_16);
+ +			efi_printk(sys_table_arg, "\n");
+- 			goto close_handles;
+++=======
++ 			status = efi_open_volume(sys_table_arg, image,
++ 						 (void **)&fh);
++ 			if (status != EFI_SUCCESS)
++ 				goto free_files;
+  		}
+  
++ 		status = efi_file_size(sys_table_arg, fh, filename_16,
++ 				       (void **)&file->handle, &file->size);
++ 		if (status != EFI_SUCCESS)
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+++			goto close_handles;
+++
+++<<<<<<< HEAD
+ +		initrd->handle = h;
+ +
+ +		info_sz = 0;
+ +		status = efi_call_phys4(h->get_info, h, &info_guid,
+ +					&info_sz, NULL);
+ +		if (status != EFI_BUFFER_TOO_SMALL) {
+ +			efi_printk(sys_table_arg, "Failed to get initrd info size\n");
+ +			goto close_handles;
+ +		}
+ +
+ +grow:
+ +		status = efi_call_phys3(sys_table_arg->boottime->allocate_pool,
+ +					EFI_LOADER_DATA, info_sz, &info);
+ +		if (status != EFI_SUCCESS) {
+ +			efi_printk(sys_table_arg, "Failed to alloc mem for initrd info\n");
+  			goto close_handles;
+ +		}
+ +
+ +		status = efi_call_phys4(h->get_info, h, &info_guid,
+ +					&info_sz, info);
+ +		if (status == EFI_BUFFER_TOO_SMALL) {
+ +			efi_call_phys1(sys_table_arg->boottime->free_pool,
+ +				       info);
+ +			goto grow;
+ +		}
+ +
+ +		file_sz = info->file_size;
+ +		efi_call_phys1(sys_table_arg->boottime->free_pool, info);
+  
+ +		if (status != EFI_SUCCESS) {
+ +			efi_printk(sys_table_arg, "Failed to get initrd info\n");
+ +			goto close_handles;
+ +		}
+ +
+ +		initrd->size = file_sz;
+ +		initrd_total += file_sz;
+++=======
++ 		file_size_total += file->size;
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  	}
+  
+ -	if (file_size_total) {
+ +	if (initrd_total) {
+  		unsigned long addr;
+  
+  		/*
+@@@ -441,26 -396,27 +460,41 @@@
+  					chunksize = EFI_READ_CHUNK_SIZE;
+  				else
+  					chunksize = size;
+++<<<<<<< HEAD
+ +				status = efi_call_phys3(fh->read,
+ +							initrds[j].handle,
+ +							&chunksize, addr);
+++=======
++ 
++ 				status = efi_file_read(fh, files[j].handle,
++ 						       &chunksize,
++ 						       (void *)addr);
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  				if (status != EFI_SUCCESS) {
+ -					efi_printk(sys_table_arg, "Failed to read file\n");
+ -					goto free_file_total;
+ +					efi_printk(sys_table_arg, "Failed to read initrd\n");
+ +					goto free_initrd_total;
+  				}
+  				addr += chunksize;
+  				size -= chunksize;
+  			}
+  
+++<<<<<<< HEAD
+ +			efi_call_phys1(fh->close, initrds[j].handle);
+++=======
++ 			efi_file_close(fh, files[j].handle);
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  		}
+  
+  	}
+  
+++<<<<<<< HEAD
+ +	efi_call_phys1(sys_table_arg->boottime->free_pool, initrds);
+++=======
++ 	efi_early->call(efi_early->free_pool, files);
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  
+ -	*load_addr = file_addr;
+ -	*load_size = file_size_total;
+ +	hdr->ramdisk_image = initrd_addr;
+ +	hdr->ramdisk_size = initrd_total;
+  
+  	return status;
+  
+@@@ -469,12 -425,12 +503,18 @@@ free_initrd_total
+  
+  close_handles:
+  	for (k = j; k < i; k++)
+++<<<<<<< HEAD
+ +		efi_call_phys1(fh->close, initrds[k].handle);
+ +free_initrds:
+ +	efi_call_phys1(sys_table_arg->boottime->free_pool, initrds);
+++=======
++ 		efi_file_close(fh, files[k].handle);
++ free_files:
++ 	efi_early->call(efi_early->free_pool, files);
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  fail:
+ -	*load_addr = 0;
+ -	*load_size = 0;
+ +	hdr->ramdisk_image = 0;
+ +	hdr->ramdisk_size = 0;
+  
+  	return status;
+  }
+@@@ -486,30 -457,47 +526,46 @@@ static efi_status_t relocate_kernel(str
+  
+  	/*
+  	 * The EFI firmware loader could have placed the kernel image
+++<<<<<<< HEAD
+ +	 * anywhere in memory, but the kernel has various restrictions
+ +	 * on the max physical address it can run at. Attempt to move
+ +	 * the kernel to boot_params.pref_address, or as low as
+++=======
++ 	 * anywhere in memory, but the kernel has restrictions on the
++ 	 * max physical address it can run at.  Some architectures
++ 	 * also have a prefered address, so first try to relocate
++ 	 * to the preferred address.  If that fails, allocate as low
++ 	 * as possible while respecting the required alignment.
++ 	 */
++ 	nr_pages = round_up(alloc_size, EFI_PAGE_SIZE) / EFI_PAGE_SIZE;
++ 	status = efi_early->call(efi_early->allocate_pages,
++ 				 EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
++ 				 nr_pages, &efi_addr);
++ 	new_addr = efi_addr;
++ 	/*
++ 	 * If preferred address allocation failed allocate as low as
+++>>>>>>> 54b52d872680 (x86/efi: Build our own EFI services pointer table)
+  	 * possible.
+  	 */
+ +	start = hdr->pref_address;
+ +	nr_pages = round_up(hdr->init_size, EFI_PAGE_SIZE) / EFI_PAGE_SIZE;
+ +
+ +	status = efi_call_phys4(sys_table->boottime->allocate_pages,
+ +				EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
+ +				nr_pages, &start);
+  	if (status != EFI_SUCCESS) {
+ -		status = efi_low_alloc(sys_table_arg, alloc_size, alignment,
+ -				       &new_addr);
+ -	}
+ -	if (status != EFI_SUCCESS) {
+ -		efi_printk(sys_table_arg, "ERROR: Failed to allocate usable memory for kernel.\n");
+ -		return status;
+ +		status = efi_low_alloc(sys_table, hdr->init_size,
+ +				   hdr->kernel_alignment, &start);
+ +		if (status != EFI_SUCCESS)
+ +			efi_printk(sys_table, "Failed to alloc mem for kernel\n");
+  	}
+  
+ -	/*
+ -	 * We know source/dest won't overlap since both memory ranges
+ -	 * have been allocated by UEFI, so we can safely use memcpy.
+ -	 */
+ -	memcpy((void *)new_addr, (void *)cur_image_addr, image_size);
+ +	if (status == EFI_SUCCESS)
+ +		memcpy((void *)start, (void *)(unsigned long)hdr->code32_start,
+ +		       hdr->init_size);
+  
+ -	/* Return the new address of the relocated image. */
+ -	*image_addr = new_addr;
+ +	hdr->pref_address = hdr->code32_start;
+ +	hdr->code32_start = (__u32)start;
+  
+  	return status;
+  }
+* Unmerged path arch/x86/boot/compressed/eboot.c
+diff --git a/arch/x86/boot/compressed/eboot.h b/arch/x86/boot/compressed/eboot.h
+index d487e727f1ec..c88c31ecad12 100644
+--- a/arch/x86/boot/compressed/eboot.h
++++ b/arch/x86/boot/compressed/eboot.h
+@@ -103,4 +103,20 @@ struct efi_uga_draw_protocol {
+ 	void *blt;
+ };
+ 
++struct efi_config {
++	u64 image_handle;
++	u64 table;
++	u64 allocate_pool;
++	u64 allocate_pages;
++	u64 get_memory_map;
++	u64 free_pool;
++	u64 free_pages;
++	u64 locate_handle;
++	u64 handle_protocol;
++	u64 exit_boot_services;
++	u64 text_output;
++	efi_status_t (*call)(unsigned long, ...);
++	bool is64;
++} __packed;
++
+ #endif /* BOOT_COMPRESSED_EBOOT_H */
+diff --git a/arch/x86/boot/compressed/head_32.S b/arch/x86/boot/compressed/head_32.S
+index 1e3184f6072f..2071789d3669 100644
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@ -42,26 +42,53 @@ ENTRY(startup_32)
+ ENTRY(efi_pe_entry)
+ 	add	$0x4, %esp
+ 
++	call	1f
++1:	popl	%esi
++	subl	$1b, %esi
++
++	popl	%ecx
++	movl	%ecx, efi32_config(%esi)	/* Handle */
++	popl	%ecx
++	movl	%ecx, efi32_config+8(%esi)	/* EFI System table pointer */
++
++	/* Relocate efi_config->call() */
++	leal	efi32_config(%esi), %eax
++	add	%esi, 88(%eax)
++	pushl	%eax
++
+ 	call	make_boot_params
+ 	cmpl	$0, %eax
+-	je	1f
+-	movl	0x4(%esp), %esi
+-	movl	(%esp), %ecx
++	je	fail
++	popl	%ecx
+ 	pushl	%eax
+-	pushl	%esi
+ 	pushl	%ecx
+-	sub	$0x4, %esp
++	jmp	2f		/* Skip efi_config initialization */
+ 
+ ENTRY(efi_stub_entry)
+ 	add	$0x4, %esp
++	popl	%ecx
++	popl	%edx
++
++	call	1f
++1:	popl	%esi
++	subl	$1b, %esi
++
++	movl	%ecx, efi32_config(%esi)	/* Handle */
++	movl	%edx, efi32_config+8(%esi)	/* EFI System table pointer */
++
++	/* Relocate efi_config->call() */
++	leal	efi32_config(%esi), %eax
++	add	%esi, 88(%eax)
++	pushl	%eax
++2:
+ 	call	efi_main
+ 	cmpl	$0, %eax
+ 	movl	%eax, %esi
+ 	jne	2f
+-1:
++fail:
+ 	/* EFI init failed, so hang. */
+ 	hlt
+-	jmp	1b
++	jmp	fail
+ 2:
+ 	call	3f
+ 3:
+@@ -225,6 +252,13 @@ relocated:
+ 	xorl	%ebx, %ebx
+ 	jmp	*%ebp
+ 
++	.data
++efi32_config:
++	.fill 11,8,0
++	.long efi_call_phys
++	.long 0
++	.byte 0
++
+ /*
+  * Stack and heap for uncompression
+  */
+diff --git a/arch/x86/boot/compressed/head_64.S b/arch/x86/boot/compressed/head_64.S
+index 16f24e6dad79..dbf83c1bd2e6 100644
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -209,26 +209,55 @@ ENTRY(startup_64)
+ 	jmp	preferred_addr
+ 
+ ENTRY(efi_pe_entry)
+-	mov	%rcx, %rdi
+-	mov	%rdx, %rsi
+-	pushq	%rdi
+-	pushq	%rsi
++	movq	%rcx, efi64_config(%rip)	/* Handle */
++	movq	%rdx, efi64_config+8(%rip) /* EFI System table pointer */
++
++	leaq	efi64_config(%rip), %rax
++	movq	%rax, efi_config(%rip)
++
++	call	1f
++1:	popq	%rbp
++	subq	$1b, %rbp
++
++	/*
++	 * Relocate efi_config->call().
++	 */
++	addq	%rbp, efi64_config+88(%rip)
++
++	movq	%rax, %rdi
+ 	call	make_boot_params
+ 	cmpq	$0,%rax
+-	je	1f
+-	mov	%rax, %rdx
+-	popq	%rsi
+-	popq	%rdi
++	je	fail
++	mov	%rax, %rsi
++	jmp	2f		/* Skip the relocation */
+ 
+ ENTRY(efi_stub_entry)
++	movq	%rdi, efi64_config(%rip)	/* Handle */
++	movq	%rsi, efi64_config+8(%rip) /* EFI System table pointer */
++
++	leaq	efi64_config(%rip), %rax
++	movq	%rax, efi_config(%rip)
++
++	call	1f
++1:	popq	%rbp
++	subq	$1b, %rbp
++
++	/*
++	 * Relocate efi_config->call().
++	 */
++	movq	efi_config(%rip), %rax
++	addq	%rbp, 88(%rax)
++	movq	%rdx, %rsi
++2:
++	movq	efi_config(%rip), %rdi
+ 	call	efi_main
+ 	movq	%rax,%rsi
+ 	cmpq	$0,%rax
+ 	jne	2f
+-1:
++fail:
+ 	/* EFI init failed, so hang. */
+ 	hlt
+-	jmp	1b
++	jmp	fail
+ 2:
+ 	call	3f
+ 3:
+@@ -369,6 +398,14 @@ gdt:
+ 	.quad   0x0000000000000000	/* TS continued */
+ gdt_end:
+ 
++efi_config:
++	.quad	0
++
++	.global efi64_config
++efi64_config:
++	.fill	11,8,0
++	.quad	efi_call6
++	.byte	1
+ /*
+  * Stack and heap for uncompression
+  */
+* Unmerged path drivers/firmware/efi/efi-stub-helper.c
