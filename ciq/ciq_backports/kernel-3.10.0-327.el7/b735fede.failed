@@ -1,0 +1,148 @@
+dm snapshot: suspend origin when doing exception handover
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] dm-snapshot: suspend origin when doing exception handover (Mike Snitzer) [1205955]
+Rebuild_FUZZ: 98.25%
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit b735fede8d957d9d255e9c5cf3964cfa59799637
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b735fede.failed
+
+In the function snapshot_resume we perform exception store handover.  If
+there is another active snapshot target, the exception store is moved
+from this target to the target that is being resumed.
+
+The problem is that if there is some pending exception, it will point to
+an incorrect exception store after that handover, causing a crash due to
+dm-snap-persistent.c:get_exception()'s BUG_ON.
+
+This bug can be triggered by repeatedly changing snapshot permissions
+with "lvchange -p r" and "lvchange -p rw" while there are writes on the
+associated origin device.
+
+To fix this bug, we must suspend the origin device when doing the
+exception store handover to make sure that there are no pending
+exceptions:
+- introduce _origin_hash that keeps track of dm_origin structures.
+- introduce functions __lookup_dm_origin, __insert_dm_origin and
+  __remove_dm_origin that manipulate the origin hash.
+- modify snapshot_resume so that it calls dm_internal_suspend_fast() and
+  dm_internal_resume_fast() on the origin device.
+
+NOTE to stable@ people:
+
+When backporting to kernels 3.12-3.18, use dm_internal_suspend and
+dm_internal_resume instead of dm_internal_suspend_fast and
+dm_internal_resume_fast.
+
+When backporting to kernels older than 3.12, you need to pick functions
+dm_internal_suspend and dm_internal_resume from the commit
+fd2ed4d252701d3bbed4cd3e3d267ad469bb832a.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit b735fede8d957d9d255e9c5cf3964cfa59799637)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-snap.c
+diff --cc drivers/md/dm-snap.c
+index 4b4bf607855a,c2bf822bad6f..000000000000
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@@ -2155,13 -2212,21 +2219,18 @@@ static int origin_ctr(struct dm_target 
+  		return -EINVAL;
+  	}
+  
+ -	o = kmalloc(sizeof(struct dm_origin), GFP_KERNEL);
+ -	if (!o) {
+ -		ti->error = "Cannot allocate private origin structure";
+ -		r = -ENOMEM;
+ -		goto bad_alloc;
+ -	}
+ -
+ -	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &o->dev);
+ +	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dev);
+  	if (r) {
+  		ti->error = "Cannot get target device";
+ -		goto bad_open;
+ +		return r;
+  	}
+  
+++<<<<<<< HEAD
+ +	ti->private = dev;
+++=======
++ 	o->ti = ti;
++ 	ti->private = o;
+++>>>>>>> b735fede8d95 (dm snapshot: suspend origin when doing exception handover)
+  	ti->num_flush_bios = 1;
+  
+  	return 0;
+@@@ -2169,8 -2239,10 +2238,15 @@@
+  
+  static void origin_dtr(struct dm_target *ti)
+  {
+++<<<<<<< HEAD
+ +	struct dm_dev *dev = ti->private;
+ +	dm_put_device(ti, dev);
+++=======
++ 	struct dm_origin *o = ti->private;
++ 
++ 	dm_put_device(ti, o->dev);
++ 	kfree(o);
+++>>>>>>> b735fede8d95 (dm snapshot: suspend origin when doing exception handover)
+  }
+  
+  static int origin_map(struct dm_target *ti, struct bio *bio)
+@@@ -2191,9 -2274,22 +2267,26 @@@
+   */
+  static void origin_resume(struct dm_target *ti)
+  {
+ -	struct dm_origin *o = ti->private;
+ +	struct dm_dev *dev = ti->private;
+  
+++<<<<<<< HEAD
+ +	ti->max_io_len = get_origin_minimum_chunksize(dev->bdev);
+++=======
++ 	o->split_boundary = get_origin_minimum_chunksize(o->dev->bdev);
++ 
++ 	down_write(&_origins_lock);
++ 	__insert_dm_origin(o);
++ 	up_write(&_origins_lock);
++ }
++ 
++ static void origin_postsuspend(struct dm_target *ti)
++ {
++ 	struct dm_origin *o = ti->private;
++ 
++ 	down_write(&_origins_lock);
++ 	__remove_dm_origin(o);
++ 	up_write(&_origins_lock);
+++>>>>>>> b735fede8d95 (dm snapshot: suspend origin when doing exception handover)
+  }
+  
+  static void origin_status(struct dm_target *ti, status_type_t type,
+* Unmerged path drivers/md/dm-snap.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index a7c19b8d2242..639721c26732 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -3238,6 +3238,7 @@ void dm_internal_suspend_fast(struct mapped_device *md)
+ 	flush_workqueue(md->wq);
+ 	dm_wait_for_completion(md, TASK_UNINTERRUPTIBLE);
+ }
++EXPORT_SYMBOL_GPL(dm_internal_suspend_fast);
+ 
+ void dm_internal_resume_fast(struct mapped_device *md)
+ {
+@@ -3249,6 +3250,7 @@ void dm_internal_resume_fast(struct mapped_device *md)
+ done:
+ 	mutex_unlock(&md->suspend_lock);
+ }
++EXPORT_SYMBOL_GPL(dm_internal_resume_fast);
+ 
+ /*-----------------------------------------------------------------
+  * Event notification.
