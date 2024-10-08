@@ -1,0 +1,760 @@
+sched/numa, mm: Use active_nodes nodemask to limit numa migrations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] sched/numa: Use active_nodes nodemask to limit numa migrations (Rik van Riel) [1049096]
+Rebuild_FUZZ: 96.88%
+commit-author Rik van Riel <riel@redhat.com>
+commit 10f39042711ba21773763f267b4943a2c66c8bef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/10f39042.failed
+
+Use the active_nodes nodemask to make smarter decisions on NUMA migrations.
+
+In order to maximize performance of workloads that do not fit in one NUMA
+node, we want to satisfy the following criteria:
+
+  1) keep private memory local to each thread
+
+  2) avoid excessive NUMA migration of pages
+
+  3) distribute shared memory across the active nodes, to
+     maximize memory bandwidth available to the workload
+
+This patch accomplishes that by implementing the following policy for
+NUMA migrations:
+
+  1) always migrate on a private fault
+
+  2) never migrate to a node that is not in the set of active nodes
+     for the numa_group
+
+  3) always migrate from a node outside of the set of active nodes,
+     to a node that is in that set
+
+  4) within the set of active nodes in the numa_group, only migrate
+     from a node with more NUMA page faults, to a node with fewer
+     NUMA page faults, with a 25% margin to avoid ping-ponging
+
+This results in most pages of a workload ending up on the actively
+used nodes, with reduced ping-ponging of pages between those nodes.
+
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Chegu Vinod <chegu_vinod@hp.com>
+Link: http://lkml.kernel.org/r/1390860228-21539-6-git-send-email-riel@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 10f39042711ba21773763f267b4943a2c66c8bef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/fair.c
+#	mm/mempolicy.c
+diff --cc include/linux/sched.h
+index 933a94b9c8f9,5ab3b89fc33e..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1449,16 -1579,38 +1449,33 @@@ struct task_struct 
+  /* Future-safe accessor for struct task_struct's cpus_allowed. */
+  #define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
+  
+ -#define TNF_MIGRATED	0x01
+ -#define TNF_NO_GROUP	0x02
+ -#define TNF_SHARED	0x04
+ -#define TNF_FAULT_LOCAL	0x08
+ -
+  #ifdef CONFIG_NUMA_BALANCING
+ -extern void task_numa_fault(int last_node, int node, int pages, int flags);
+ -extern pid_t task_numa_group_id(struct task_struct *p);
+ +extern void task_numa_fault(int node, int pages, bool migrated);
+  extern void set_numabalancing_state(bool enabled);
+++<<<<<<< HEAD
+++=======
++ extern void task_numa_free(struct task_struct *p);
++ extern bool should_numa_migrate_memory(struct task_struct *p, struct page *page,
++ 					int src_nid, int dst_cpu);
+++>>>>>>> 10f39042711b (sched/numa, mm: Use active_nodes nodemask to limit numa migrations)
+  #else
+ -static inline void task_numa_fault(int last_node, int node, int pages,
+ -				   int flags)
+ -{
+ -}
+ -static inline pid_t task_numa_group_id(struct task_struct *p)
+ +static inline void task_numa_fault(int node, int pages, bool migrated)
+  {
+ -	return 0;
+  }
+  static inline void set_numabalancing_state(bool enabled)
+  {
+  }
+++<<<<<<< HEAD
+++=======
++ static inline void task_numa_free(struct task_struct *p)
++ {
++ }
++ static inline bool should_numa_migrate_memory(struct task_struct *p,
++ 				struct page *page, int src_nid, int dst_cpu)
++ {
++ 	return true;
++ }
+++>>>>>>> 10f39042711b (sched/numa, mm: Use active_nodes nodemask to limit numa migrations)
+  #endif
+  
+  static inline struct pid *task_pid(struct task_struct *task)
+diff --cc kernel/sched/fair.c
+index c33e42bc435b,eeabb33f349e..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -839,13 -864,595 +839,598 @@@ static unsigned int task_scan_max(struc
+  	return max(smin, smax);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void account_numa_enqueue(struct rq *rq, struct task_struct *p)
++ {
++ 	rq->nr_numa_running += (p->numa_preferred_nid != -1);
++ 	rq->nr_preferred_running += (p->numa_preferred_nid == task_node(p));
++ }
++ 
++ static void account_numa_dequeue(struct rq *rq, struct task_struct *p)
++ {
++ 	rq->nr_numa_running -= (p->numa_preferred_nid != -1);
++ 	rq->nr_preferred_running -= (p->numa_preferred_nid == task_node(p));
++ }
++ 
++ struct numa_group {
++ 	atomic_t refcount;
++ 
++ 	spinlock_t lock; /* nr_tasks, tasks */
++ 	int nr_tasks;
++ 	pid_t gid;
++ 	struct list_head task_list;
++ 
++ 	struct rcu_head rcu;
++ 	nodemask_t active_nodes;
++ 	unsigned long total_faults;
++ 	unsigned long *faults_cpu;
++ 	unsigned long faults[0];
++ };
++ 
++ pid_t task_numa_group_id(struct task_struct *p)
++ {
++ 	return p->numa_group ? p->numa_group->gid : 0;
++ }
++ 
++ static inline int task_faults_idx(int nid, int priv)
++ {
++ 	return 2 * nid + priv;
++ }
++ 
++ static inline unsigned long task_faults(struct task_struct *p, int nid)
++ {
++ 	if (!p->numa_faults_memory)
++ 		return 0;
++ 
++ 	return p->numa_faults_memory[task_faults_idx(nid, 0)] +
++ 		p->numa_faults_memory[task_faults_idx(nid, 1)];
++ }
++ 
++ static inline unsigned long group_faults(struct task_struct *p, int nid)
++ {
++ 	if (!p->numa_group)
++ 		return 0;
++ 
++ 	return p->numa_group->faults[task_faults_idx(nid, 0)] +
++ 		p->numa_group->faults[task_faults_idx(nid, 1)];
++ }
++ 
++ static inline unsigned long group_faults_cpu(struct numa_group *group, int nid)
++ {
++ 	return group->faults_cpu[task_faults_idx(nid, 0)] +
++ 		group->faults_cpu[task_faults_idx(nid, 1)];
++ }
++ 
++ /*
++  * These return the fraction of accesses done by a particular task, or
++  * task group, on a particular numa node.  The group weight is given a
++  * larger multiplier, in order to group tasks together that are almost
++  * evenly spread out between numa nodes.
++  */
++ static inline unsigned long task_weight(struct task_struct *p, int nid)
++ {
++ 	unsigned long total_faults;
++ 
++ 	if (!p->numa_faults_memory)
++ 		return 0;
++ 
++ 	total_faults = p->total_numa_faults;
++ 
++ 	if (!total_faults)
++ 		return 0;
++ 
++ 	return 1000 * task_faults(p, nid) / total_faults;
++ }
++ 
++ static inline unsigned long group_weight(struct task_struct *p, int nid)
++ {
++ 	if (!p->numa_group || !p->numa_group->total_faults)
++ 		return 0;
++ 
++ 	return 1000 * group_faults(p, nid) / p->numa_group->total_faults;
++ }
++ 
++ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
++ 				int src_nid, int dst_cpu)
++ {
++ 	struct numa_group *ng = p->numa_group;
++ 	int dst_nid = cpu_to_node(dst_cpu);
++ 	int last_cpupid, this_cpupid;
++ 
++ 	this_cpupid = cpu_pid_to_cpupid(dst_cpu, current->pid);
++ 
++ 	/*
++ 	 * Multi-stage node selection is used in conjunction with a periodic
++ 	 * migration fault to build a temporal task<->page relation. By using
++ 	 * a two-stage filter we remove short/unlikely relations.
++ 	 *
++ 	 * Using P(p) ~ n_p / n_t as per frequentist probability, we can equate
++ 	 * a task's usage of a particular page (n_p) per total usage of this
++ 	 * page (n_t) (in a given time-span) to a probability.
++ 	 *
++ 	 * Our periodic faults will sample this probability and getting the
++ 	 * same result twice in a row, given these samples are fully
++ 	 * independent, is then given by P(n)^2, provided our sample period
++ 	 * is sufficiently short compared to the usage pattern.
++ 	 *
++ 	 * This quadric squishes small probabilities, making it less likely we
++ 	 * act on an unlikely task<->page relation.
++ 	 */
++ 	last_cpupid = page_cpupid_xchg_last(page, this_cpupid);
++ 	if (!cpupid_pid_unset(last_cpupid) &&
++ 				cpupid_to_nid(last_cpupid) != dst_nid)
++ 		return false;
++ 
++ 	/* Always allow migrate on private faults */
++ 	if (cpupid_match_pid(p, last_cpupid))
++ 		return true;
++ 
++ 	/* A shared fault, but p->numa_group has not been set up yet. */
++ 	if (!ng)
++ 		return true;
++ 
++ 	/*
++ 	 * Do not migrate if the destination is not a node that
++ 	 * is actively used by this numa group.
++ 	 */
++ 	if (!node_isset(dst_nid, ng->active_nodes))
++ 		return false;
++ 
++ 	/*
++ 	 * Source is a node that is not actively used by this
++ 	 * numa group, while the destination is. Migrate.
++ 	 */
++ 	if (!node_isset(src_nid, ng->active_nodes))
++ 		return true;
++ 
++ 	/*
++ 	 * Both source and destination are nodes in active
++ 	 * use by this numa group. Maximize memory bandwidth
++ 	 * by migrating from more heavily used groups, to less
++ 	 * heavily used ones, spreading the load around.
++ 	 * Use a 1/4 hysteresis to avoid spurious page movement.
++ 	 */
++ 	return group_faults(p, dst_nid) < (group_faults(p, src_nid) * 3 / 4);
++ }
++ 
++ static unsigned long weighted_cpuload(const int cpu);
++ static unsigned long source_load(int cpu, int type);
++ static unsigned long target_load(int cpu, int type);
++ static unsigned long power_of(int cpu);
++ static long effective_load(struct task_group *tg, int cpu, long wl, long wg);
++ 
++ /* Cached statistics for all CPUs within a node */
++ struct numa_stats {
++ 	unsigned long nr_running;
++ 	unsigned long load;
++ 
++ 	/* Total compute capacity of CPUs on a node */
++ 	unsigned long power;
++ 
++ 	/* Approximate capacity in terms of runnable tasks on a node */
++ 	unsigned long capacity;
++ 	int has_capacity;
++ };
++ 
++ /*
++  * XXX borrowed from update_sg_lb_stats
++  */
++ static void update_numa_stats(struct numa_stats *ns, int nid)
++ {
++ 	int cpu, cpus = 0;
++ 
++ 	memset(ns, 0, sizeof(*ns));
++ 	for_each_cpu(cpu, cpumask_of_node(nid)) {
++ 		struct rq *rq = cpu_rq(cpu);
++ 
++ 		ns->nr_running += rq->nr_running;
++ 		ns->load += weighted_cpuload(cpu);
++ 		ns->power += power_of(cpu);
++ 
++ 		cpus++;
++ 	}
++ 
++ 	/*
++ 	 * If we raced with hotplug and there are no CPUs left in our mask
++ 	 * the @ns structure is NULL'ed and task_numa_compare() will
++ 	 * not find this node attractive.
++ 	 *
++ 	 * We'll either bail at !has_capacity, or we'll detect a huge imbalance
++ 	 * and bail there.
++ 	 */
++ 	if (!cpus)
++ 		return;
++ 
++ 	ns->load = (ns->load * SCHED_POWER_SCALE) / ns->power;
++ 	ns->capacity = DIV_ROUND_CLOSEST(ns->power, SCHED_POWER_SCALE);
++ 	ns->has_capacity = (ns->nr_running < ns->capacity);
++ }
++ 
++ struct task_numa_env {
++ 	struct task_struct *p;
++ 
++ 	int src_cpu, src_nid;
++ 	int dst_cpu, dst_nid;
++ 
++ 	struct numa_stats src_stats, dst_stats;
++ 
++ 	int imbalance_pct;
++ 
++ 	struct task_struct *best_task;
++ 	long best_imp;
++ 	int best_cpu;
++ };
++ 
++ static void task_numa_assign(struct task_numa_env *env,
++ 			     struct task_struct *p, long imp)
++ {
++ 	if (env->best_task)
++ 		put_task_struct(env->best_task);
++ 	if (p)
++ 		get_task_struct(p);
++ 
++ 	env->best_task = p;
++ 	env->best_imp = imp;
++ 	env->best_cpu = env->dst_cpu;
++ }
++ 
++ /*
++  * This checks if the overall compute and NUMA accesses of the system would
++  * be improved if the source tasks was migrated to the target dst_cpu taking
++  * into account that it might be best if task running on the dst_cpu should
++  * be exchanged with the source task
++  */
++ static void task_numa_compare(struct task_numa_env *env,
++ 			      long taskimp, long groupimp)
++ {
++ 	struct rq *src_rq = cpu_rq(env->src_cpu);
++ 	struct rq *dst_rq = cpu_rq(env->dst_cpu);
++ 	struct task_struct *cur;
++ 	long dst_load, src_load;
++ 	long load;
++ 	long imp = (groupimp > 0) ? groupimp : taskimp;
++ 
++ 	rcu_read_lock();
++ 	cur = ACCESS_ONCE(dst_rq->curr);
++ 	if (cur->pid == 0) /* idle */
++ 		cur = NULL;
++ 
++ 	/*
++ 	 * "imp" is the fault differential for the source task between the
++ 	 * source and destination node. Calculate the total differential for
++ 	 * the source task and potential destination task. The more negative
++ 	 * the value is, the more rmeote accesses that would be expected to
++ 	 * be incurred if the tasks were swapped.
++ 	 */
++ 	if (cur) {
++ 		/* Skip this swap candidate if cannot move to the source cpu */
++ 		if (!cpumask_test_cpu(env->src_cpu, tsk_cpus_allowed(cur)))
++ 			goto unlock;
++ 
++ 		/*
++ 		 * If dst and source tasks are in the same NUMA group, or not
++ 		 * in any group then look only at task weights.
++ 		 */
++ 		if (cur->numa_group == env->p->numa_group) {
++ 			imp = taskimp + task_weight(cur, env->src_nid) -
++ 			      task_weight(cur, env->dst_nid);
++ 			/*
++ 			 * Add some hysteresis to prevent swapping the
++ 			 * tasks within a group over tiny differences.
++ 			 */
++ 			if (cur->numa_group)
++ 				imp -= imp/16;
++ 		} else {
++ 			/*
++ 			 * Compare the group weights. If a task is all by
++ 			 * itself (not part of a group), use the task weight
++ 			 * instead.
++ 			 */
++ 			if (env->p->numa_group)
++ 				imp = groupimp;
++ 			else
++ 				imp = taskimp;
++ 
++ 			if (cur->numa_group)
++ 				imp += group_weight(cur, env->src_nid) -
++ 				       group_weight(cur, env->dst_nid);
++ 			else
++ 				imp += task_weight(cur, env->src_nid) -
++ 				       task_weight(cur, env->dst_nid);
++ 		}
++ 	}
++ 
++ 	if (imp < env->best_imp)
++ 		goto unlock;
++ 
++ 	if (!cur) {
++ 		/* Is there capacity at our destination? */
++ 		if (env->src_stats.has_capacity &&
++ 		    !env->dst_stats.has_capacity)
++ 			goto unlock;
++ 
++ 		goto balance;
++ 	}
++ 
++ 	/* Balance doesn't matter much if we're running a task per cpu */
++ 	if (src_rq->nr_running == 1 && dst_rq->nr_running == 1)
++ 		goto assign;
++ 
++ 	/*
++ 	 * In the overloaded case, try and keep the load balanced.
++ 	 */
++ balance:
++ 	dst_load = env->dst_stats.load;
++ 	src_load = env->src_stats.load;
++ 
++ 	/* XXX missing power terms */
++ 	load = task_h_load(env->p);
++ 	dst_load += load;
++ 	src_load -= load;
++ 
++ 	if (cur) {
++ 		load = task_h_load(cur);
++ 		dst_load -= load;
++ 		src_load += load;
++ 	}
++ 
++ 	/* make src_load the smaller */
++ 	if (dst_load < src_load)
++ 		swap(dst_load, src_load);
++ 
++ 	if (src_load * env->imbalance_pct < dst_load * 100)
++ 		goto unlock;
++ 
++ assign:
++ 	task_numa_assign(env, cur, imp);
++ unlock:
++ 	rcu_read_unlock();
++ }
++ 
++ static void task_numa_find_cpu(struct task_numa_env *env,
++ 				long taskimp, long groupimp)
++ {
++ 	int cpu;
++ 
++ 	for_each_cpu(cpu, cpumask_of_node(env->dst_nid)) {
++ 		/* Skip this CPU if the source task cannot migrate */
++ 		if (!cpumask_test_cpu(cpu, tsk_cpus_allowed(env->p)))
++ 			continue;
++ 
++ 		env->dst_cpu = cpu;
++ 		task_numa_compare(env, taskimp, groupimp);
++ 	}
++ }
++ 
++ static int task_numa_migrate(struct task_struct *p)
++ {
++ 	struct task_numa_env env = {
++ 		.p = p,
++ 
++ 		.src_cpu = task_cpu(p),
++ 		.src_nid = task_node(p),
++ 
++ 		.imbalance_pct = 112,
++ 
++ 		.best_task = NULL,
++ 		.best_imp = 0,
++ 		.best_cpu = -1
++ 	};
++ 	struct sched_domain *sd;
++ 	unsigned long taskweight, groupweight;
++ 	int nid, ret;
++ 	long taskimp, groupimp;
++ 
++ 	/*
++ 	 * Pick the lowest SD_NUMA domain, as that would have the smallest
++ 	 * imbalance and would be the first to start moving tasks about.
++ 	 *
++ 	 * And we want to avoid any moving of tasks about, as that would create
++ 	 * random movement of tasks -- counter the numa conditions we're trying
++ 	 * to satisfy here.
++ 	 */
++ 	rcu_read_lock();
++ 	sd = rcu_dereference(per_cpu(sd_numa, env.src_cpu));
++ 	if (sd)
++ 		env.imbalance_pct = 100 + (sd->imbalance_pct - 100) / 2;
++ 	rcu_read_unlock();
++ 
++ 	/*
++ 	 * Cpusets can break the scheduler domain tree into smaller
++ 	 * balance domains, some of which do not cross NUMA boundaries.
++ 	 * Tasks that are "trapped" in such domains cannot be migrated
++ 	 * elsewhere, so there is no point in (re)trying.
++ 	 */
++ 	if (unlikely(!sd)) {
++ 		p->numa_preferred_nid = task_node(p);
++ 		return -EINVAL;
++ 	}
++ 
++ 	taskweight = task_weight(p, env.src_nid);
++ 	groupweight = group_weight(p, env.src_nid);
++ 	update_numa_stats(&env.src_stats, env.src_nid);
++ 	env.dst_nid = p->numa_preferred_nid;
++ 	taskimp = task_weight(p, env.dst_nid) - taskweight;
++ 	groupimp = group_weight(p, env.dst_nid) - groupweight;
++ 	update_numa_stats(&env.dst_stats, env.dst_nid);
++ 
++ 	/* If the preferred nid has capacity, try to use it. */
++ 	if (env.dst_stats.has_capacity)
++ 		task_numa_find_cpu(&env, taskimp, groupimp);
++ 
++ 	/* No space available on the preferred nid. Look elsewhere. */
++ 	if (env.best_cpu == -1) {
++ 		for_each_online_node(nid) {
++ 			if (nid == env.src_nid || nid == p->numa_preferred_nid)
++ 				continue;
++ 
++ 			/* Only consider nodes where both task and groups benefit */
++ 			taskimp = task_weight(p, nid) - taskweight;
++ 			groupimp = group_weight(p, nid) - groupweight;
++ 			if (taskimp < 0 && groupimp < 0)
++ 				continue;
++ 
++ 			env.dst_nid = nid;
++ 			update_numa_stats(&env.dst_stats, env.dst_nid);
++ 			task_numa_find_cpu(&env, taskimp, groupimp);
++ 		}
++ 	}
++ 
++ 	/* No better CPU than the current one was found. */
++ 	if (env.best_cpu == -1)
++ 		return -EAGAIN;
++ 
++ 	sched_setnuma(p, env.dst_nid);
++ 
++ 	/*
++ 	 * Reset the scan period if the task is being rescheduled on an
++ 	 * alternative node to recheck if the tasks is now properly placed.
++ 	 */
++ 	p->numa_scan_period = task_scan_min(p);
++ 
++ 	if (env.best_task == NULL) {
++ 		int ret = migrate_task_to(p, env.best_cpu);
++ 		return ret;
++ 	}
++ 
++ 	ret = migrate_swap(p, env.best_task);
++ 	put_task_struct(env.best_task);
++ 	return ret;
++ }
++ 
++ /* Attempt to migrate a task to a CPU on the preferred node. */
++ static void numa_migrate_preferred(struct task_struct *p)
++ {
++ 	/* This task has no NUMA fault statistics yet */
++ 	if (unlikely(p->numa_preferred_nid == -1 || !p->numa_faults_memory))
++ 		return;
++ 
++ 	/* Periodically retry migrating the task to the preferred node */
++ 	p->numa_migrate_retry = jiffies + HZ;
++ 
++ 	/* Success if task is already running on preferred CPU */
++ 	if (task_node(p) == p->numa_preferred_nid)
++ 		return;
++ 
++ 	/* Otherwise, try migrate to a CPU on the preferred node */
++ 	task_numa_migrate(p);
++ }
++ 
++ /*
++  * Find the nodes on which the workload is actively running. We do this by
++  * tracking the nodes from which NUMA hinting faults are triggered. This can
++  * be different from the set of nodes where the workload's memory is currently
++  * located.
++  *
++  * The bitmask is used to make smarter decisions on when to do NUMA page
++  * migrations, To prevent flip-flopping, and excessive page migrations, nodes
++  * are added when they cause over 6/16 of the maximum number of faults, but
++  * only removed when they drop below 3/16.
++  */
++ static void update_numa_active_node_mask(struct numa_group *numa_group)
++ {
++ 	unsigned long faults, max_faults = 0;
++ 	int nid;
++ 
++ 	for_each_online_node(nid) {
++ 		faults = group_faults_cpu(numa_group, nid);
++ 		if (faults > max_faults)
++ 			max_faults = faults;
++ 	}
++ 
++ 	for_each_online_node(nid) {
++ 		faults = group_faults_cpu(numa_group, nid);
++ 		if (!node_isset(nid, numa_group->active_nodes)) {
++ 			if (faults > max_faults * 6 / 16)
++ 				node_set(nid, numa_group->active_nodes);
++ 		} else if (faults < max_faults * 3 / 16)
++ 			node_clear(nid, numa_group->active_nodes);
++ 	}
++ }
++ 
++ /*
++  * When adapting the scan rate, the period is divided into NUMA_PERIOD_SLOTS
++  * increments. The more local the fault statistics are, the higher the scan
++  * period will be for the next scan window. If local/remote ratio is below
++  * NUMA_PERIOD_THRESHOLD (where range of ratio is 1..NUMA_PERIOD_SLOTS) the
++  * scan period will decrease
++  */
++ #define NUMA_PERIOD_SLOTS 10
++ #define NUMA_PERIOD_THRESHOLD 3
++ 
++ /*
++  * Increase the scan period (slow down scanning) if the majority of
++  * our memory is already on our local node, or if the majority of
++  * the page accesses are shared with other processes.
++  * Otherwise, decrease the scan period.
++  */
++ static void update_task_scan_period(struct task_struct *p,
++ 			unsigned long shared, unsigned long private)
++ {
++ 	unsigned int period_slot;
++ 	int ratio;
++ 	int diff;
++ 
++ 	unsigned long remote = p->numa_faults_locality[0];
++ 	unsigned long local = p->numa_faults_locality[1];
++ 
++ 	/*
++ 	 * If there were no record hinting faults then either the task is
++ 	 * completely idle or all activity is areas that are not of interest
++ 	 * to automatic numa balancing. Scan slower
++ 	 */
++ 	if (local + shared == 0) {
++ 		p->numa_scan_period = min(p->numa_scan_period_max,
++ 			p->numa_scan_period << 1);
++ 
++ 		p->mm->numa_next_scan = jiffies +
++ 			msecs_to_jiffies(p->numa_scan_period);
++ 
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Prepare to scale scan period relative to the current period.
++ 	 *	 == NUMA_PERIOD_THRESHOLD scan period stays the same
++ 	 *       <  NUMA_PERIOD_THRESHOLD scan period decreases (scan faster)
++ 	 *	 >= NUMA_PERIOD_THRESHOLD scan period increases (scan slower)
++ 	 */
++ 	period_slot = DIV_ROUND_UP(p->numa_scan_period, NUMA_PERIOD_SLOTS);
++ 	ratio = (local * NUMA_PERIOD_SLOTS) / (local + remote);
++ 	if (ratio >= NUMA_PERIOD_THRESHOLD) {
++ 		int slot = ratio - NUMA_PERIOD_THRESHOLD;
++ 		if (!slot)
++ 			slot = 1;
++ 		diff = slot * period_slot;
++ 	} else {
++ 		diff = -(NUMA_PERIOD_THRESHOLD - ratio) * period_slot;
++ 
++ 		/*
++ 		 * Scale scan rate increases based on sharing. There is an
++ 		 * inverse relationship between the degree of sharing and
++ 		 * the adjustment made to the scanning period. Broadly
++ 		 * speaking the intent is that there is little point
++ 		 * scanning faster if shared accesses dominate as it may
++ 		 * simply bounce migrations uselessly
++ 		 */
++ 		ratio = DIV_ROUND_UP(private * NUMA_PERIOD_SLOTS, (private + shared));
++ 		diff = (diff * ratio) / NUMA_PERIOD_SLOTS;
++ 	}
++ 
++ 	p->numa_scan_period = clamp(p->numa_scan_period + diff,
++ 			task_scan_min(p), task_scan_max(p));
++ 	memset(p->numa_faults_locality, 0, sizeof(p->numa_faults_locality));
++ }
++ 
+++>>>>>>> 10f39042711b (sched/numa, mm: Use active_nodes nodemask to limit numa migrations)
+  static void task_numa_placement(struct task_struct *p)
+  {
+ -	int seq, nid, max_nid = -1, max_group_nid = -1;
+ -	unsigned long max_faults = 0, max_group_faults = 0;
+ -	unsigned long fault_types[2] = { 0, 0 };
+ -	spinlock_t *group_lock = NULL;
+ +	int seq, nid, max_nid = -1;
+ +	unsigned long max_faults = 0;
+  
+ +	if (!p->mm)	/* for example, ksmd faulting in a user's mm */
+ +		return;
+  	seq = ACCESS_ONCE(p->mm->numa_scan_seq);
+  	if (p->numa_scan_seq == seq)
+  		return;
+diff --cc mm/mempolicy.c
+index f05aa4c2c73c,784c11ef7719..000000000000
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@@ -2312,33 -2377,9 +2312,39 @@@ int mpol_misplaced(struct page *page, s
+  
+  	/* Migrate the page towards the node whose CPU is referencing it */
+  	if (pol->flags & MPOL_F_MORON) {
+++<<<<<<< HEAD
+ +		int last_nid;
+ +
+ +		polnid = numa_node_id();
+ +
+ +		/*
+ +		 * Multi-stage node selection is used in conjunction
+ +		 * with a periodic migration fault to build a temporal
+ +		 * task<->page relation. By using a two-stage filter we
+ +		 * remove short/unlikely relations.
+ +		 *
+ +		 * Using P(p) ~ n_p / n_t as per frequentist
+ +		 * probability, we can equate a task's usage of a
+ +		 * particular page (n_p) per total usage of this
+ +		 * page (n_t) (in a given time-span) to a probability.
+ +		 *
+ +		 * Our periodic faults will sample this probability and
+ +		 * getting the same result twice in a row, given these
+ +		 * samples are fully independent, is then given by
+ +		 * P(n)^2, provided our sample period is sufficiently
+ +		 * short compared to the usage pattern.
+ +		 *
+ +		 * This quadric squishes small probabilities, making
+ +		 * it less likely we act on an unlikely task<->page
+ +		 * relation.
+ +		 */
+ +		last_nid = page_nid_xchg_last(page, polnid);
+ +		if (last_nid != polnid)
+++=======
++ 		polnid = thisnid;
++ 
++ 		if (!should_numa_migrate_memory(current, page, curnid, thiscpu))
+++>>>>>>> 10f39042711b (sched/numa, mm: Use active_nodes nodemask to limit numa migrations)
+  			goto out;
+  	}
+  
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/fair.c
+* Unmerged path mm/mempolicy.c
