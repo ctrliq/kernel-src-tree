@@ -1,0 +1,229 @@
+perf tools: Add all matching dynamic sort keys for field name
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 9735be24ec086fbccee321471cc21dedefa956a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9735be24.failed
+
+When a perf.data file has multiple events, it's likely to be similar
+(tracepoint) events.  In that case, they might have same field name so
+add all of them to sort keys instead of bailing out.
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1451991518-25673-2-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 9735be24ec086fbccee321471cc21dedefa956a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/sort.c
+diff --cc tools/perf/util/sort.c
+index fba68d2598ff,04e2a5cb19e3..000000000000
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@@ -1750,12 -1837,151 +1750,154 @@@ __alloc_dynamic_entry(struct perf_evse
+  	return hde;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int parse_field_name(char *str, char **event, char **field, char **opt)
++ {
++ 	char *event_name, *field_name, *opt_name;
++ 
++ 	event_name = str;
++ 	field_name = strchr(str, '.');
++ 
++ 	if (field_name) {
++ 		*field_name++ = '\0';
++ 	} else {
++ 		event_name = NULL;
++ 		field_name = str;
++ 	}
++ 
++ 	opt_name = strchr(field_name, '/');
++ 	if (opt_name)
++ 		*opt_name++ = '\0';
++ 
++ 	*event = event_name;
++ 	*field = field_name;
++ 	*opt   = opt_name;
++ 
++ 	return 0;
++ }
++ 
++ /* find match evsel using a given event name.  The event name can be:
++  *   1. '%' + event index (e.g. '%1' for first event)
++  *   2. full event name (e.g. sched:sched_switch)
++  *   3. partial event name (should not contain ':')
++  */
++ static struct perf_evsel *find_evsel(struct perf_evlist *evlist, char *event_name)
++ {
++ 	struct perf_evsel *evsel = NULL;
++ 	struct perf_evsel *pos;
++ 	bool full_name;
++ 
++ 	/* case 1 */
++ 	if (event_name[0] == '%') {
++ 		int nr = strtol(event_name+1, NULL, 0);
++ 
++ 		if (nr > evlist->nr_entries)
++ 			return NULL;
++ 
++ 		evsel = perf_evlist__first(evlist);
++ 		while (--nr > 0)
++ 			evsel = perf_evsel__next(evsel);
++ 
++ 		return evsel;
++ 	}
++ 
++ 	full_name = !!strchr(event_name, ':');
++ 	evlist__for_each(evlist, pos) {
++ 		/* case 2 */
++ 		if (full_name && !strcmp(pos->name, event_name))
++ 			return pos;
++ 		/* case 3 */
++ 		if (!full_name && strstr(pos->name, event_name)) {
++ 			if (evsel) {
++ 				pr_debug("'%s' event is ambiguous: it can be %s or %s\n",
++ 					 event_name, evsel->name, pos->name);
++ 				return NULL;
++ 			}
++ 			evsel = pos;
++ 		}
++ 	}
++ 
++ 	return evsel;
++ }
++ 
++ static int __dynamic_dimension__add(struct perf_evsel *evsel,
++ 				    struct format_field *field,
++ 				    bool raw_trace)
++ {
++ 	struct hpp_dynamic_entry *hde;
++ 
++ 	hde = __alloc_dynamic_entry(evsel, field);
++ 	if (hde == NULL)
++ 		return -ENOMEM;
++ 
++ 	hde->raw_trace = raw_trace;
++ 
++ 	perf_hpp__register_sort_field(&hde->hpp);
++ 	return 0;
++ }
++ 
++ static int add_evsel_fields(struct perf_evsel *evsel, bool raw_trace)
++ {
++ 	int ret;
++ 	struct format_field *field;
++ 
++ 	field = evsel->tp_format->format.fields;
++ 	while (field) {
++ 		ret = __dynamic_dimension__add(evsel, field, raw_trace);
++ 		if (ret < 0)
++ 			return ret;
++ 
++ 		field = field->next;
++ 	}
++ 	return 0;
++ }
++ 
++ static int add_all_dynamic_fields(struct perf_evlist *evlist, bool raw_trace)
++ {
++ 	int ret;
++ 	struct perf_evsel *evsel;
++ 
++ 	evlist__for_each(evlist, evsel) {
++ 		if (evsel->attr.type != PERF_TYPE_TRACEPOINT)
++ 			continue;
++ 
++ 		ret = add_evsel_fields(evsel, raw_trace);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 	return 0;
++ }
++ 
++ static int add_all_matching_fields(struct perf_evlist *evlist,
++ 				   char *field_name, bool raw_trace)
++ {
++ 	int ret = -ESRCH;
++ 	struct perf_evsel *evsel;
++ 	struct format_field *field;
++ 
++ 	evlist__for_each(evlist, evsel) {
++ 		if (evsel->attr.type != PERF_TYPE_TRACEPOINT)
++ 			continue;
++ 
++ 		field = pevent_find_any_field(evsel->tp_format, field_name);
++ 		if (field == NULL)
++ 			continue;
++ 
++ 		ret = __dynamic_dimension__add(evsel, field, raw_trace);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 	return ret;
++ }
++ 
+++>>>>>>> 9735be24ec08 (perf tools: Add all matching dynamic sort keys for field name)
+  static int add_dynamic_entry(struct perf_evlist *evlist, const char *tok)
+  {
+ -	char *str, *event_name, *field_name, *opt_name;
+ -	struct perf_evsel *evsel;
+ +	char *str, *event_name, *field_name;
+ +	struct perf_evsel *evsel, *pos;
+  	struct format_field *field;
+ -	bool raw_trace = symbol_conf.raw_trace;
+ +	struct hpp_dynamic_entry *hde;
+  	int ret = 0;
+  
+  	if (evlist == NULL)
+@@@ -1771,16 -1995,27 +1913,30 @@@
+  		ret = -EINVAL;
+  		goto out;
+  	}
+ +	*field_name++ = '\0';
+  
+ -	if (opt_name) {
+ -		if (strcmp(opt_name, "raw")) {
+ -			pr_debug("unsupported field option %s\n", opt_name);
+ -			ret = -EINVAL;
+ -			goto out;
+ +	evsel = NULL;
+ +	evlist__for_each(evlist, pos) {
+ +		if (!strcmp(pos->name, event_name)) {
+ +			evsel = pos;
+ +			break;
+  		}
+ -		raw_trace = true;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!strcmp(field_name, "trace_fields")) {
++ 		ret = add_all_dynamic_fields(evlist, raw_trace);
++ 		goto out;
++ 	}
++ 
++ 	if (event_name == NULL) {
++ 		ret = add_all_matching_fields(evlist, field_name, raw_trace);
++ 		goto out;
++ 	}
++ 
++ 	evsel = find_evsel(evlist, event_name);
+++>>>>>>> 9735be24ec08 (perf tools: Add all matching dynamic sort keys for field name)
+  	if (evsel == NULL) {
+  		pr_debug("Cannot find event: %s\n", event_name);
+  		ret = -ENOENT;
+* Unmerged path tools/perf/util/sort.c
