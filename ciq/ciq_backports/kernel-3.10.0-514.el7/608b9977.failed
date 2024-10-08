@@ -1,0 +1,210 @@
+tun: use per cpu variables for stats accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 608b9977260f67d8b032ea170666a6174a48e2f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/608b9977.failed
+
+Currently the tun device accounting uses dev->stats without applying any
+kind of protection, regardless that accounting happens in preemptible
+process context.
+This patch move the tun stats to a per cpu data structure, and protect
+the updates with  u64_stats_update_begin()/u64_stats_update_end() or
+this_cpu_inc according to the stat type. The per cpu stats are
+aggregated by the newly added ndo_get_stats64 ops.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 608b9977260f67d8b032ea170666a6174a48e2f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+diff --cc drivers/net/tun.c
+index 877daee1a855,faf9297db2cf..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -129,8 -131,19 +129,19 @@@ struct tap_filter 
+  
+  #define TUN_FLOW_EXPIRE (3 * HZ)
+  
++ struct tun_pcpu_stats {
++ 	u64 rx_packets;
++ 	u64 rx_bytes;
++ 	u64 tx_packets;
++ 	u64 tx_bytes;
++ 	struct u64_stats_sync syncp;
++ 	u32 rx_dropped;
++ 	u32 tx_dropped;
++ 	u32 rx_frame_errors;
++ };
++ 
+  /* A tun_file connects an open character device to a tuntap netdevice. It
+ - * also contains all socket related structures (except sock_fprog and tap_filter)
+ + * also contains all socket related strctures (except sock_fprog and tap_filter)
+   * to serve as one transmit queue for tuntap device. The sock_fprog and
+   * tap_filter were kept in tun_struct since they were used for filtering for the
+   * netdevice not for a specific queue (at least I didn't see the requirement for
+@@@ -893,6 -950,54 +905,57 @@@ static void tun_poll_controller(struct 
+  	return;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ static void tun_set_headroom(struct net_device *dev, int new_hr)
++ {
++ 	struct tun_struct *tun = netdev_priv(dev);
++ 
++ 	if (new_hr < NET_SKB_PAD)
++ 		new_hr = NET_SKB_PAD;
++ 
++ 	tun->align = new_hr;
++ }
++ 
++ static struct rtnl_link_stats64 *
++ tun_net_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
++ {
++ 	u32 rx_dropped = 0, tx_dropped = 0, rx_frame_errors = 0;
++ 	struct tun_struct *tun = netdev_priv(dev);
++ 	struct tun_pcpu_stats *p;
++ 	int i;
++ 
++ 	for_each_possible_cpu(i) {
++ 		u64 rxpackets, rxbytes, txpackets, txbytes;
++ 		unsigned int start;
++ 
++ 		p = per_cpu_ptr(tun->pcpu_stats, i);
++ 		do {
++ 			start = u64_stats_fetch_begin(&p->syncp);
++ 			rxpackets	= p->rx_packets;
++ 			rxbytes		= p->rx_bytes;
++ 			txpackets	= p->tx_packets;
++ 			txbytes		= p->tx_bytes;
++ 		} while (u64_stats_fetch_retry(&p->syncp, start));
++ 
++ 		stats->rx_packets	+= rxpackets;
++ 		stats->rx_bytes		+= rxbytes;
++ 		stats->tx_packets	+= txpackets;
++ 		stats->tx_bytes		+= txbytes;
++ 
++ 		/* u32 counters */
++ 		rx_dropped	+= p->rx_dropped;
++ 		rx_frame_errors	+= p->rx_frame_errors;
++ 		tx_dropped	+= p->tx_dropped;
++ 	}
++ 	stats->rx_dropped  = rx_dropped;
++ 	stats->rx_frame_errors = rx_frame_errors;
++ 	stats->tx_dropped = tx_dropped;
++ 	return stats;
++ }
++ 
+++>>>>>>> 608b9977260f (tun: use per cpu variables for stats accounting)
+  static const struct net_device_ops tun_netdev_ops = {
+  	.ndo_uninit		= tun_net_uninit,
+  	.ndo_open		= tun_net_open,
+@@@ -904,6 -1009,8 +967,11 @@@
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller	= tun_poll_controller,
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	.ndo_set_rx_headroom	= tun_set_headroom,
++ 	.ndo_get_stats64	= tun_net_get_stats64,
+++>>>>>>> 608b9977260f (tun: use per cpu variables for stats accounting)
+  };
+  
+  static const struct net_device_ops tap_netdev_ops = {
+@@@ -920,9 -1027,12 +988,15 @@@
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller	= tun_poll_controller,
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	.ndo_features_check	= passthru_features_check,
++ 	.ndo_set_rx_headroom	= tun_set_headroom,
++ 	.ndo_get_stats64	= tun_net_get_stats64,
+++>>>>>>> 608b9977260f (tun: use per cpu variables for stats accounting)
+  };
+  
+ -static void tun_flow_init(struct tun_struct *tun)
+ +static int tun_flow_init(struct tun_struct *tun)
+  {
+  	int i;
+  
+@@@ -1146,10 -1151,11 +1220,11 @@@ static ssize_t tun_get_user(struct tun_
+  {
+  	struct tun_pi pi = { 0, cpu_to_be16(ETH_P_IP) };
+  	struct sk_buff *skb;
+ -	size_t total_len = iov_iter_count(from);
+ -	size_t len = total_len, align = tun->align, linear;
+ +	size_t len = total_len, align = NET_SKB_PAD, linear;
+  	struct virtio_net_hdr gso = { 0 };
++ 	struct tun_pcpu_stats *stats;
+  	int good_linear;
+ +	int offset = 0;
+  	int copylen;
+  	bool zerocopy = false;
+  	int err;
+@@@ -1347,11 -1361,12 +1426,17 @@@ static ssize_t tun_chr_aio_write(struc
+  static ssize_t tun_put_user(struct tun_struct *tun,
+  			    struct tun_file *tfile,
+  			    struct sk_buff *skb,
+ -			    struct iov_iter *iter)
+ +			    const struct iovec *iv, int len)
+  {
+  	struct tun_pi pi = { 0, skb->protocol };
+++<<<<<<< HEAD
+ +	ssize_t total = 0;
+ +	int vlan_offset = 0, copied;
+++=======
++ 	struct tun_pcpu_stats *stats;
++ 	ssize_t total;
++ 	int vlan_offset = 0;
+++>>>>>>> 608b9977260f (tun: use per cpu variables for stats accounting)
+  	int vlan_hlen = 0;
+  	int vnet_hdr_sz = 0;
+  
+@@@ -1454,11 -1462,16 +1539,21 @@@
+  			goto done;
+  	}
+  
+ -	skb_copy_datagram_iter(skb, vlan_offset, iter, skb->len - vlan_offset);
+ +	skb_copy_datagram_const_iovec(skb, vlan_offset, iv, copied, len);
+  
+  done:
+++<<<<<<< HEAD
+ +	tun->dev->stats.tx_packets++;
+ +	tun->dev->stats.tx_bytes += len;
+++=======
++ 	/* caller is in process context, */
++ 	stats = get_cpu_ptr(tun->pcpu_stats);
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->tx_packets++;
++ 	stats->tx_bytes += skb->len + vlan_hlen;
++ 	u64_stats_update_end(&stats->syncp);
++ 	put_cpu_ptr(tun->pcpu_stats);
+++>>>>>>> 608b9977260f (tun: use per cpu variables for stats accounting)
+  
+  	return total;
+  }
+@@@ -1786,13 -1788,10 +1888,13 @@@ static int tun_set_iff(struct net *net
+  
+  		err = security_tun_dev_alloc_security(&tun->security);
+  		if (err < 0)
+- 			goto err_free_dev;
++ 			goto err_free_stat;
+  
+  		tun_net_init(dev);
+ -		tun_flow_init(tun);
+ +
+ +		err = tun_flow_init(tun);
+ +		if (err < 0)
+ +			goto err_free_dev;
+  
+  		dev->hw_features = NETIF_F_SG | NETIF_F_FRAGLIST |
+  				   TUN_USER_FEATURES | NETIF_F_HW_VLAN_CTAG_TX |
+* Unmerged path drivers/net/tun.c
