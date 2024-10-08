@@ -41,6 +41,8 @@
 #define NMI_WATCHDOG_ENABLED      (1 << NMI_WATCHDOG_ENABLED_BIT)
 #define SOFT_WATCHDOG_ENABLED     (1 << SOFT_WATCHDOG_ENABLED_BIT)
 
+static DEFINE_MUTEX(watchdog_proc_mutex);
+
 #ifdef CONFIG_HARDLOCKUP_DETECTOR
 static unsigned long __read_mostly watchdog_enabled = SOFT_WATCHDOG_ENABLED|NMI_WATCHDOG_ENABLED;
 #else
@@ -623,26 +625,36 @@ void watchdog_nmi_enable_all(void)
 {
 	int cpu;
 
-	if (!watchdog_user_enabled)
-		return;
+	mutex_lock(&watchdog_proc_mutex);
+
+	if (!(watchdog_enabled & NMI_WATCHDOG_ENABLED))
+		goto unlock;
 
 	get_online_cpus();
 	for_each_online_cpu(cpu)
 		watchdog_nmi_enable(cpu);
 	put_online_cpus();
+
+unlock:
+	mutex_lock(&watchdog_proc_mutex);
 }
 
 void watchdog_nmi_disable_all(void)
 {
 	int cpu;
 
+	mutex_lock(&watchdog_proc_mutex);
+
 	if (!watchdog_running)
-		return;
+		goto unlock;
 
 	get_online_cpus();
 	for_each_online_cpu(cpu)
 		watchdog_nmi_disable(cpu);
 	put_online_cpus();
+
+unlock:
+	mutex_unlock(&watchdog_proc_mutex);
 }
 #else
 static int watchdog_nmi_enable(unsigned int cpu) { return 0; }
@@ -754,8 +766,6 @@ static int proc_watchdog_update(void)
 	return err;
 
 }
-
-static DEFINE_MUTEX(watchdog_proc_mutex);
 
 /*
  * common function for watchdog, nmi_watchdog and soft_watchdog parameter
