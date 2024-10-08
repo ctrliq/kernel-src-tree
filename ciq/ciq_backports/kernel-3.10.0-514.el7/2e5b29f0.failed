@@ -1,0 +1,208 @@
+pNFS/flexfiles: Don't prevent flexfiles client from retrying LAYOUTGET
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] pnfs: Don't prevent flexfiles client from retrying LAYOUTGET (Benjamin Coddington) [1358386]
+Rebuild_FUZZ: 92.31%
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 2e5b29f0448be9ea8da3ee0412a2043fee59e131
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2e5b29f0.failed
+
+Fix a bug in which flexfiles clients are falling back to I/O through the
+MDS even when the FF_FLAGS_NO_IO_THRU_MDS flag is set.
+
+The flexfiles client will always report errors through the LAYOUTRETURN
+and/or LAYOUTERROR mechanisms, so it should normally be safe for it
+to retry the LAYOUTGET until it fails or succeeds.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 2e5b29f0448be9ea8da3ee0412a2043fee59e131)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/pnfs.c
+index 33459a5d39d8,6b42362cdbb0..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1073,16 -1069,33 +1072,40 @@@ bool pnfs_roc(struct inode *ino
+  	struct pnfs_layout_segment *lseg, *tmp;
+  	nfs4_stateid stateid;
+  	LIST_HEAD(tmp_list);
+ -	bool found = false, layoutreturn = false, roc = false;
+ +	bool found = false, layoutreturn = false;
+  
+  	spin_lock(&ino->i_lock);
+++<<<<<<< HEAD
+ +	lo = NFS_I(ino)->layout;
+ +	if (!lo || !test_and_clear_bit(NFS_LAYOUT_ROC, &lo->plh_flags) ||
+ +	    test_bit(NFS_LAYOUT_BULK_RECALL, &lo->plh_flags))
+ +		goto out_nolayout;
+ +	pnfs_clear_retry_layoutget(lo);
+++=======
++ 	lo = nfsi->layout;
++ 	if (!lo || test_bit(NFS_LAYOUT_BULK_RECALL, &lo->plh_flags))
++ 		goto out_noroc;
++ 
++ 	/* no roc if we hold a delegation */
++ 	if (nfs4_check_delegation(ino, FMODE_READ))
++ 		goto out_noroc;
++ 
++ 	list_for_each_entry(ctx, &nfsi->open_files, list) {
++ 		state = ctx->state;
++ 		/* Don't return layout if there is open file state */
++ 		if (state != NULL && state->state != 0)
++ 			goto out_noroc;
++ 	}
++ 
++ 	stateid = lo->plh_stateid;
++ 	/* always send layoutreturn if being marked so */
++ 	if (test_and_clear_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
++ 				   &lo->plh_flags))
++ 		layoutreturn = pnfs_prepare_layoutreturn(lo);
++ 
+++>>>>>>> 2e5b29f0448b (pNFS/flexfiles: Don't prevent flexfiles client from retrying LAYOUTGET)
+  	list_for_each_entry_safe(lseg, tmp, &lo->plh_segs, pls_list)
+ -		/* If we are sending layoutreturn, invalidate all valid lsegs */
+ -		if (layoutreturn || test_bit(NFS_LSEG_ROC, &lseg->pls_flags)) {
+ +		if (test_bit(NFS_LSEG_ROC, &lseg->pls_flags)) {
+  			mark_lseg_invalid(lseg, &tmp_list);
+  			found = true;
+  		}
+@@@ -1427,27 -1455,15 +1450,33 @@@ static bool pnfs_within_mdsthreshold(st
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +/* stop waiting if someone clears NFS_LAYOUT_RETRY_LAYOUTGET bit. */
+ +static int pnfs_layoutget_retry_bit_wait(void *_key)
+ +{
+ +	struct wait_bit_key *key = _key;
+ +
+ +	if (!test_bit(NFS_LAYOUT_RETRY_LAYOUTGET, key->flags))
+ +		return 1;
+ +	return nfs_wait_bit_killable(_key);
+ +}
+ +
+++=======
+++>>>>>>> 2e5b29f0448b (pNFS/flexfiles: Don't prevent flexfiles client from retrying LAYOUTGET)
+  static bool pnfs_prepare_to_retry_layoutget(struct pnfs_layout_hdr *lo)
+  {
+- 	if (!pnfs_should_retry_layoutget(lo))
+- 		return false;
+  	/*
+  	 * send layoutcommit as it can hold up layoutreturn due to lseg
+  	 * reference
+  	 */
+  	pnfs_layoutcommit_inode(lo->plh_inode, false);
+++<<<<<<< HEAD
+ +	return !wait_on_bit(&lo->plh_flags, NFS_LAYOUT_RETURN,
+ +				   pnfs_layoutget_retry_bit_wait,
+++=======
++ 	return !wait_on_bit_action(&lo->plh_flags, NFS_LAYOUT_RETURN,
++ 				   nfs_wait_bit_killable,
+++>>>>>>> 2e5b29f0448b (pNFS/flexfiles: Don't prevent flexfiles client from retrying LAYOUTGET)
+  				   TASK_UNINTERRUPTIBLE);
+  }
+  
+diff --git a/fs/nfs/flexfilelayout/flexfilelayout.c b/fs/nfs/flexfilelayout/flexfilelayout.c
+index 21aee85d8861..2cbf99a036f5 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@ -1229,11 +1229,9 @@ static int ff_layout_write_done_cb(struct rpc_task *task,
+ 
+ 	switch (err) {
+ 	case -NFS4ERR_RESET_TO_PNFS:
+-		pnfs_set_retry_layoutget(hdr->lseg->pls_layout);
+ 		ff_layout_reset_write(hdr, true);
+ 		return task->tk_status;
+ 	case -NFS4ERR_RESET_TO_MDS:
+-		pnfs_clear_retry_layoutget(hdr->lseg->pls_layout);
+ 		ff_layout_reset_write(hdr, false);
+ 		return task->tk_status;
+ 	case -EAGAIN:
+@@ -1269,11 +1267,9 @@ static int ff_layout_commit_done_cb(struct rpc_task *task,
+ 
+ 	switch (err) {
+ 	case -NFS4ERR_RESET_TO_PNFS:
+-		pnfs_set_retry_layoutget(data->lseg->pls_layout);
+ 		pnfs_generic_prepare_to_resend_writes(data);
+ 		return -EAGAIN;
+ 	case -NFS4ERR_RESET_TO_MDS:
+-		pnfs_clear_retry_layoutget(data->lseg->pls_layout);
+ 		pnfs_generic_prepare_to_resend_writes(data);
+ 		return -EAGAIN;
+ 	case -EAGAIN:
+diff --git a/fs/nfs/flexfilelayout/flexfilelayoutdev.c b/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+index e125e55de86d..bd0327541366 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayoutdev.c
++++ b/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+@@ -429,22 +429,14 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
+ 					 mirror, lseg->pls_range.offset,
+ 					 lseg->pls_range.length, NFS4ERR_NXIO,
+ 					 OP_ILLEGAL, GFP_NOIO);
+-		if (fail_return) {
+-			pnfs_error_mark_layout_for_return(ino, lseg);
+-			if (ff_layout_has_available_ds(lseg))
+-				pnfs_set_retry_layoutget(lseg->pls_layout);
+-			else
+-				pnfs_clear_retry_layoutget(lseg->pls_layout);
+-
+-		} else {
++		if (!fail_return) {
+ 			if (ff_layout_has_available_ds(lseg))
+ 				set_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
+ 					&lseg->pls_layout->plh_flags);
+-			else {
++			else
+ 				pnfs_error_mark_layout_for_return(ino, lseg);
+-				pnfs_clear_retry_layoutget(lseg->pls_layout);
+-			}
+-		}
++		} else
++			pnfs_error_mark_layout_for_return(ino, lseg);
+ 	}
+ out_update_creds:
+ 	if (ff_layout_update_mirror_cred(mirror, ds))
+* Unmerged path fs/nfs/pnfs.c
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 36a0c1c82c9e..50846bae0030 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -99,7 +99,6 @@ enum {
+ 	NFS_LAYOUT_RETURN_BEFORE_CLOSE,	/* Return this layout before close */
+ 	NFS_LAYOUT_INVALID_STID,	/* layout stateid id is invalid */
+ 	NFS_LAYOUT_FIRST_LAYOUTGET,	/* Serialize first layoutget */
+-	NFS_LAYOUT_RETRY_LAYOUTGET,	/* Retry layoutget */
+ };
+ 
+ enum layoutdriver_policy_flags {
+@@ -373,26 +372,6 @@ nfs4_get_deviceid(struct nfs4_deviceid_node *d)
+ 	return d;
+ }
+ 
+-static inline void pnfs_set_retry_layoutget(struct pnfs_layout_hdr *lo)
+-{
+-	if (!test_and_set_bit(NFS_LAYOUT_RETRY_LAYOUTGET, &lo->plh_flags))
+-		atomic_inc(&lo->plh_refcount);
+-}
+-
+-static inline void pnfs_clear_retry_layoutget(struct pnfs_layout_hdr *lo)
+-{
+-	if (test_and_clear_bit(NFS_LAYOUT_RETRY_LAYOUTGET, &lo->plh_flags)) {
+-		atomic_dec(&lo->plh_refcount);
+-		/* wake up waiters for LAYOUTRETURN as that is not needed */
+-		wake_up_bit(&lo->plh_flags, NFS_LAYOUT_RETURN);
+-	}
+-}
+-
+-static inline bool pnfs_should_retry_layoutget(struct pnfs_layout_hdr *lo)
+-{
+-	return test_bit(NFS_LAYOUT_RETRY_LAYOUTGET, &lo->plh_flags);
+-}
+-
+ static inline struct pnfs_layout_segment *
+ pnfs_get_lseg(struct pnfs_layout_segment *lseg)
+ {
