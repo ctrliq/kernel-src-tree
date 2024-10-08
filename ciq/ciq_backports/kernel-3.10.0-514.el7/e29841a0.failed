@@ -1,0 +1,138 @@
+ovl: dilute permission checks on lower only if not special file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit e29841a0ab3d03e77313abd8fb4c16e80fb26e29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e29841a0.failed
+
+Right now if file is on lower/, we remove MAY_WRITE/MAY_APPEND bits from
+mask as lower/ will never be written and file will be copied up. But this
+is not true for special files. These files are not copied up and are opened
+in place. So don't dilute the checks for these types of files.
+
+	Reported-by: Dan Walsh <dwalsh@redhat.com>
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit e29841a0ab3d03e77313abd8fb4c16e80fb26e29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+diff --cc fs/overlayfs/inode.c
+index f3730d33febd,76cfe9d04e64..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -73,89 -117,31 +73,97 @@@ static int ovl_getattr(struct vfsmount 
+  
+  int ovl_permission(struct inode *inode, int mask)
+  {
+ +	struct ovl_entry *oe;
+ +	struct dentry *alias = NULL;
+ +	struct inode *realinode;
+ +	struct dentry *realdentry;
+  	bool is_upper;
+ -	struct inode *realinode = ovl_inode_real(inode, &is_upper);
+ -	const struct cred *old_cred;
+  	int err;
+  
+ -	/* Careful in RCU walk mode */
+ -	if (!realinode) {
+ -		WARN_ON(!(mask & MAY_NOT_BLOCK));
+ +	if (S_ISDIR(inode->i_mode)) {
+ +		oe = inode->i_private;
+ +	} else if (mask & MAY_NOT_BLOCK) {
+  		return -ECHILD;
+ +	} else {
+ +		/*
+ +		 * For non-directories find an alias and get the info
+ +		 * from there.
+ +		 */
+ +		alias = d_find_any_alias(inode);
+ +		if (WARN_ON(!alias))
+ +			return -ENOENT;
+ +
+ +		oe = alias->d_fsdata;
+  	}
+  
+ -	/*
+ -	 * Check overlay inode with the creds of task and underlying inode
+ -	 * with creds of mounter
+ -	 */
+ -	err = generic_permission(inode, mask);
+ -	if (err)
+ -		return err;
+ +	realdentry = ovl_entry_real(oe, &is_upper);
+  
+++<<<<<<< HEAD
+ +	if (ovl_is_default_permissions(inode)) {
+ +		struct kstat stat;
+ +		struct path realpath = { .dentry = realdentry };
+++=======
++ 	old_cred = ovl_override_creds(inode->i_sb);
++ 	if (!is_upper && !special_file(realinode->i_mode))
++ 		mask &= ~(MAY_WRITE | MAY_APPEND);
++ 	err = inode_permission(realinode, mask);
++ 	revert_creds(old_cred);
+++>>>>>>> e29841a0ab3d (ovl: dilute permission checks on lower only if not special file)
+ +
+ +		if (mask & MAY_NOT_BLOCK)
+ +			return -ECHILD;
+ +
+ +		realpath.mnt = ovl_entry_mnt_real(oe, inode, is_upper);
+ +
+ +		err = vfs_getattr(&realpath, &stat);
+ +		if (err)
+ +			goto out_dput;
+ +
+ +		err = -ESTALE;
+ +		if ((stat.mode ^ inode->i_mode) & S_IFMT)
+ +			goto out_dput;
+ +
+ +		inode->i_mode = stat.mode;
+ +		inode->i_uid = stat.uid;
+ +		inode->i_gid = stat.gid;
+ +
+ +		err = generic_permission(inode, mask);
+ +		goto out_dput;
+ +	}
+ +
+ +	/* Careful in RCU walk mode */
+ +	realinode = ACCESS_ONCE(realdentry->d_inode);
+ +	if (!realinode) {
+ +		WARN_ON(!(mask & MAY_NOT_BLOCK));
+ +		err = -ENOENT;
+ +		goto out_dput;
+ +	}
+ +
+ +	if (mask & MAY_WRITE) {
+ +		umode_t mode = realinode->i_mode;
+ +
+ +		/*
+ +		 * Writes will always be redirected to upper layer, so
+ +		 * ignore lower layer being read-only.
+ +		 *
+ +		 * If the overlay itself is read-only then proceed
+ +		 * with the permission check, don't return EROFS.
+ +		 * This will only happen if this is the lower layer of
+ +		 * another overlayfs.
+ +		 *
+ +		 * If upper fs becomes read-only after the overlay was
+ +		 * constructed return EROFS to prevent modification of
+ +		 * upper layer.
+ +		 */
+ +		err = -EROFS;
+ +		if (is_upper && !IS_RDONLY(inode) && IS_RDONLY(realinode) &&
+ +		    (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
+ +			goto out_dput;
+ +	}
+  
+ +	err = __inode_permission(realinode, mask);
+ +out_dput:
+ +	dput(alias);
+  	return err;
+  }
+  
+* Unmerged path fs/overlayfs/inode.c
