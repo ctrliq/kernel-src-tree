@@ -1,0 +1,187 @@
+mm: fix GFP_THISNODE callers and clarify
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] fix GFP_THISNODE callers and clarify (Johannes Weiner) [1069551 1069639]
+Rebuild_FUZZ: 94.74%
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit e97ca8e5b864f88b028c1759ba8536fa827d6d96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/e97ca8e5.failed
+
+GFP_THISNODE is for callers that implement their own clever fallback to
+remote nodes.  It restricts the allocation to the specified node and
+does not invoke reclaim, assuming that the caller will take care of it
+when the fallback fails, e.g.  through a subsequent allocation request
+without GFP_THISNODE set.
+
+However, many current GFP_THISNODE users only want the node exclusive
+aspect of the flag, without actually implementing their own fallback or
+triggering reclaim if necessary.  This results in things like page
+migration failing prematurely even when there is easily reclaimable
+memory available, unless kswapd happens to be running already or a
+concurrent allocation attempt triggers the necessary reclaim.
+
+Convert all callsites that don't implement their own fallback strategy
+to __GFP_THISNODE.  This restricts the allocation a single node too, but
+at the same time allows the allocator to enter the slowpath, wake
+kswapd, and invoke direct reclaim if necessary, to make the allocation
+happen when memory is full.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Cc: Jan Stancek <jstancek@redhat.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e97ca8e5b864f88b028c1759ba8536fa827d6d96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index 40c5b97e9161,b494fdb9a636..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1117,8 -1153,12 +1117,17 @@@ static struct page *new_page_node(struc
+  
+  	*result = &pm->status;
+  
+++<<<<<<< HEAD
+ +	return alloc_pages_exact_node(pm->node,
+ +				GFP_HIGHUSER_MOVABLE | GFP_THISNODE, 0);
+++=======
++ 	if (PageHuge(p))
++ 		return alloc_huge_page_node(page_hstate(compound_head(p)),
++ 					pm->node);
++ 	else
++ 		return alloc_pages_exact_node(pm->node,
++ 				GFP_HIGHUSER_MOVABLE | __GFP_THISNODE, 0);
+++>>>>>>> e97ca8e5b864 (mm: fix GFP_THISNODE callers and clarify)
+  }
+  
+  /*
+@@@ -1499,12 -1544,10 +1508,12 @@@ static struct page *alloc_misplaced_dst
+  	struct page *newpage;
+  
+  	newpage = alloc_pages_exact_node(nid,
+- 					 (GFP_HIGHUSER_MOVABLE | GFP_THISNODE |
+- 					  __GFP_NOMEMALLOC | __GFP_NORETRY |
+- 					  __GFP_NOWARN) &
++ 					 (GFP_HIGHUSER_MOVABLE |
++ 					  __GFP_THISNODE | __GFP_NOMEMALLOC |
++ 					  __GFP_NORETRY | __GFP_NOWARN) &
+  					 ~GFP_IOFS, 0);
+ +	if (newpage)
+ +		page_nid_xchg_last(newpage, page_nid_last(page));
+  
+  	return newpage;
+  }
+diff --git a/arch/ia64/kernel/uncached.c b/arch/ia64/kernel/uncached.c
+index a96bcf83a735..20e8a9b21d75 100644
+--- a/arch/ia64/kernel/uncached.c
++++ b/arch/ia64/kernel/uncached.c
+@@ -98,7 +98,7 @@ static int uncached_add_chunk(struct uncached_pool *uc_pool, int nid)
+ 	/* attempt to allocate a granule's worth of cached memory pages */
+ 
+ 	page = alloc_pages_exact_node(nid,
+-				GFP_KERNEL | __GFP_ZERO | GFP_THISNODE,
++				GFP_KERNEL | __GFP_ZERO | __GFP_THISNODE,
+ 				IA64_GRANULE_SHIFT-PAGE_SHIFT);
+ 	if (!page) {
+ 		mutex_unlock(&uc_pool->add_chunk_mutex);
+diff --git a/arch/powerpc/platforms/cell/ras.c b/arch/powerpc/platforms/cell/ras.c
+index 5ec1e47a0d77..e865d748179b 100644
+--- a/arch/powerpc/platforms/cell/ras.c
++++ b/arch/powerpc/platforms/cell/ras.c
+@@ -123,7 +123,8 @@ static int __init cbe_ptcal_enable_on_node(int nid, int order)
+ 
+ 	area->nid = nid;
+ 	area->order = order;
+-	area->pages = alloc_pages_exact_node(area->nid, GFP_KERNEL|GFP_THISNODE,
++	area->pages = alloc_pages_exact_node(area->nid,
++						GFP_KERNEL|__GFP_THISNODE,
+ 						area->order);
+ 
+ 	if (!area->pages) {
+diff --git a/drivers/misc/sgi-xp/xpc_uv.c b/drivers/misc/sgi-xp/xpc_uv.c
+index b9e2000969f0..95c894482fdd 100644
+--- a/drivers/misc/sgi-xp/xpc_uv.c
++++ b/drivers/misc/sgi-xp/xpc_uv.c
+@@ -240,7 +240,7 @@ xpc_create_gru_mq_uv(unsigned int mq_size, int cpu, char *irq_name,
+ 
+ 	nid = cpu_to_node(cpu);
+ 	page = alloc_pages_exact_node(nid,
+-				      GFP_KERNEL | __GFP_ZERO | GFP_THISNODE,
++				      GFP_KERNEL | __GFP_ZERO | __GFP_THISNODE,
+ 				      pg_order);
+ 	if (page == NULL) {
+ 		dev_err(xpc_part, "xpc_create_gru_mq_uv() failed to alloc %d "
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 0f615eb23d05..f29149ee6121 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -122,6 +122,10 @@ struct vm_area_struct;
+ 			 __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN | \
+ 			 __GFP_NO_KSWAPD)
+ 
++/*
++ * GFP_THISNODE does not perform any reclaim, you most likely want to
++ * use __GFP_THISNODE to allocate from a given node without fallback!
++ */
+ #ifdef CONFIG_NUMA
+ #define GFP_THISNODE	(__GFP_THISNODE | __GFP_NOWARN | __GFP_NORETRY)
+ #else
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 493d0844aa75..95968875aafc 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -585,10 +585,10 @@ static inline bool zone_is_empty(struct zone *zone)
+ 
+ /*
+  * The NUMA zonelists are doubled because we need zonelists that restrict the
+- * allocations to a single node for GFP_THISNODE.
++ * allocations to a single node for __GFP_THISNODE.
+  *
+  * [0]	: Zonelist with fallback
+- * [1]	: No fallback (GFP_THISNODE)
++ * [1]	: No fallback (__GFP_THISNODE)
+  */
+ #define MAX_ZONELISTS 2
+ 
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 0c621752caa6..d19ce80ae5b6 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -378,7 +378,7 @@ void print_slabinfo_header(struct seq_file *m);
+  *
+  * %GFP_NOWAIT - Allocation will not sleep.
+  *
+- * %GFP_THISNODE - Allocate node-local memory only.
++ * %__GFP_THISNODE - Allocate node-local memory only.
+  *
+  * %GFP_DMA - Allocation suitable for DMA.
+  *   Should only be used for kmalloc() caches. Otherwise, use a
+diff --git a/kernel/profile.c b/kernel/profile.c
+index 0bf400737660..0ef6ce6a2921 100644
+--- a/kernel/profile.c
++++ b/kernel/profile.c
+@@ -549,14 +549,14 @@ static int create_hash_tables(void)
+ 		struct page *page;
+ 
+ 		page = alloc_pages_exact_node(node,
+-				GFP_KERNEL | __GFP_ZERO | GFP_THISNODE,
++				GFP_KERNEL | __GFP_ZERO | __GFP_THISNODE,
+ 				0);
+ 		if (!page)
+ 			goto out_cleanup;
+ 		per_cpu(cpu_profile_hits, cpu)[1]
+ 				= (struct profile_hit *)page_address(page);
+ 		page = alloc_pages_exact_node(node,
+-				GFP_KERNEL | __GFP_ZERO | GFP_THISNODE,
++				GFP_KERNEL | __GFP_ZERO | __GFP_THISNODE,
+ 				0);
+ 		if (!page)
+ 			goto out_cleanup;
+* Unmerged path mm/migrate.c
