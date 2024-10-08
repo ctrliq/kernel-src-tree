@@ -1,0 +1,153 @@
+xprtrdma: Chain together all MWs in same buffer pool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3111d72c7ced444b1034f6e365e0e02444c68aa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3111d72c.failed
+
+During connection loss recovery, need to visit every MW in a
+buffer pool. Any MW that is in use by an RPC will not be on the
+rb_mws list.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Tested-by: Shirley Ma <shirley.ma@oracle.com>
+	Tested-by: Devesh Sharma <devesh.sharma@emulex.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3111d72c7ced444b1034f6e365e0e02444c68aa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 499e0d7e7773,0ad7d10f13a7..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1054,12 -1073,8 +1054,13 @@@ rpcrdma_buffer_create(struct rpcrdma_bu
+  	}
+  	p += cdata->padding;
+  
+ +	/*
+ +	 * Allocate the fmr's, or mw's for mw_bind chunk registration.
+ +	 * We "cycle" the mw's in order to minimize rkey reuse,
+ +	 * and also reduce unbind-to-bind collision.
+ +	 */
+  	INIT_LIST_HEAD(&buf->rb_mws);
++ 	INIT_LIST_HEAD(&buf->rb_all);
+  	r = (struct rpcrdma_mw *)p;
+  	switch (ia->ri_memreg_strategy) {
+  	case RPCRDMA_FRMR:
+@@@ -1080,8 -1095,11 +1081,9 @@@
+  				dprintk("RPC:       %s: "
+  					"ib_alloc_fast_reg_page_list "
+  					"failed %i\n", __func__, rc);
+ -
+ -				ib_dereg_mr(r->r.frmr.fr_mr);
+  				goto out;
+  			}
++ 			list_add(&r->mw_all, &buf->rb_all);
+  			list_add(&r->mw_list, &buf->rb_mws);
+  			++r;
+  		}
+@@@ -1258,6 -1225,34 +1261,37 @@@ rpcrdma_buffer_destroy(struct rpcrdma_b
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	while (!list_empty(&buf->rb_mws)) {
++ 		r = list_entry(buf->rb_mws.next,
++ 			struct rpcrdma_mw, mw_list);
++ 		list_del(&r->mw_all);
++ 		list_del(&r->mw_list);
++ 		switch (ia->ri_memreg_strategy) {
++ 		case RPCRDMA_FRMR:
++ 			rc = ib_dereg_mr(r->r.frmr.fr_mr);
++ 			if (rc)
++ 				dprintk("RPC:       %s:"
++ 					" ib_dereg_mr"
++ 					" failed %i\n",
++ 					__func__, rc);
++ 			ib_free_fast_reg_page_list(r->r.frmr.fr_pgl);
++ 			break;
++ 		case RPCRDMA_MTHCAFMR:
++ 			rc = ib_dealloc_fmr(r->r.fmr);
++ 			if (rc)
++ 				dprintk("RPC:       %s:"
++ 					" ib_dealloc_fmr"
++ 					" failed %i\n",
++ 					__func__, rc);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
+++>>>>>>> 3111d72c7ced (xprtrdma: Chain together all MWs in same buffer pool)
+  	kfree(buf->rb_pool);
+  }
+  
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index 4ef6e3f9b67c,c1d865287b0e..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -135,6 -146,39 +135,42 @@@ struct rpcrdma_rep 
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * struct rpcrdma_mw - external memory region metadata
++  *
++  * An external memory region is any buffer or page that is registered
++  * on the fly (ie, not pre-registered).
++  *
++  * Each rpcrdma_buffer has a list of free MWs anchored in rb_mws. During
++  * call_allocate, rpcrdma_buffer_get() assigns one to each segment in
++  * an rpcrdma_req. Then rpcrdma_register_external() grabs these to keep
++  * track of registration metadata while each RPC is pending.
++  * rpcrdma_deregister_external() uses this metadata to unmap and
++  * release these resources when an RPC is complete.
++  */
++ enum rpcrdma_frmr_state {
++ 	FRMR_IS_INVALID,	/* ready to be used */
++ 	FRMR_IS_VALID,		/* in use */
++ };
++ 
++ struct rpcrdma_frmr {
++ 	struct ib_fast_reg_page_list	*fr_pgl;
++ 	struct ib_mr			*fr_mr;
++ 	enum rpcrdma_frmr_state		fr_state;
++ };
++ 
++ struct rpcrdma_mw {
++ 	union {
++ 		struct ib_fmr		*fmr;
++ 		struct rpcrdma_frmr	frmr;
++ 	} r;
++ 	struct list_head	mw_list;
++ 	struct list_head	mw_all;
++ };
++ 
++ /*
+++>>>>>>> 3111d72c7ced (xprtrdma: Chain together all MWs in same buffer pool)
+   * struct rpcrdma_req -- structure central to the request/reply sequence.
+   *
+   * N of these are associated with a transport instance, and stored in
+@@@ -211,9 -245,9 +247,10 @@@ struct rpcrdma_req 
+  struct rpcrdma_buffer {
+  	spinlock_t	rb_lock;	/* protects indexes */
+  	atomic_t	rb_credits;	/* most recent server credits */
+ +	unsigned long	rb_cwndscale;	/* cached framework rpc_cwndscale */
+  	int		rb_max_requests;/* client max requests */
+  	struct list_head rb_mws;	/* optional memory windows/fmrs/frmrs */
++ 	struct list_head rb_all;
+  	int		rb_send_index;
+  	struct rpcrdma_req	**rb_send_bufs;
+  	int		rb_recv_index;
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
