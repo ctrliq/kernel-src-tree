@@ -2845,6 +2845,7 @@ int open_ctree(struct super_block *sb,
 	    !extent_buffer_uptodate(chunk_root->node)) {
 		printk(KERN_ERR "BTRFS: failed to read chunk root on %s\n",
 		       sb->s_id);
+		chunk_root->node = NULL;
 		goto fail_tree_roots;
 	}
 	btrfs_set_root_node(&chunk_root->root_item, chunk_root->node);
@@ -2882,7 +2883,7 @@ retry_root_backup:
 	    !extent_buffer_uptodate(tree_root->node)) {
 		printk(KERN_WARNING "BTRFS: failed to read tree root on %s\n",
 		       sb->s_id);
-
+		tree_root->node = NULL;
 		goto recovery_tree_root;
 	}
 
