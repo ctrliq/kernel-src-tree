@@ -1,0 +1,171 @@
+rhashtable: Avoid bucket cross reference after removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit cf52d52f9ccb9966ac019d9f79824195583e3e6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cf52d52f.failed
+
+During a resize, when two buckets in the larger table map to
+a single bucket in the smaller table and the new table has already
+been (partially) linked to the old table. Removal of an element
+may result the bucket in the larger table to point to entries
+which all hash to a different value than the bucket index. Thus
+causing two buckets to point to the same sub chain after unzipping.
+This is not illegal *during* the resize phase but after it has
+completed.
+
+Keep the old table around until all of the unzipping is done to
+allow the removal code to only search for matching hashed entries
+during this special period.
+
+	Reported-by: Ying Xue <ying.xue@windriver.com>
+Fixes: 97defe1ecf86 ("rhashtable: Per bucket locks & deferred expansion/shrinking")
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cf52d52f9ccb9966ac019d9f79824195583e3e6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index 91429a30ff68,5919d63f58e4..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -232,16 -412,11 +232,10 @@@ int rhashtable_expand(struct rhashtabl
+  				break;
+  			}
+  		}
+ -		unlock_buckets(new_tbl, old_tbl, new_hash);
+  	}
+  
+- 	/* Publish the new table pointer. Lookups may now traverse
+- 	 * the new table, but they will not benefit from any
+- 	 * additional efficiency until later steps unzip the buckets.
+- 	 */
+- 	rcu_assign_pointer(ht->tbl, new_tbl);
+- 
+  	/* Unzip interleaved hash chains */
+ -	while (!complete && !ht->being_destroyed) {
+ +	do {
+  		/* Wait for readers. All new readers will see the new
+  		 * table, and thus no references to the old table will
+  		 * remain.
+@@@ -253,13 -428,18 +247,14 @@@
+  		 * table): ...
+  		 */
+  		complete = true;
+ -		for (old_hash = 0; old_hash < old_tbl->size; old_hash++) {
+ -			lock_buckets(new_tbl, old_tbl, old_hash);
+ -
+ -			if (hashtable_chain_unzip(ht, new_tbl, old_tbl,
+ -						  old_hash))
+ +		for (i = 0; i < old_tbl->size; i++) {
+ +			hashtable_chain_unzip(ht, new_tbl, old_tbl, i);
+ +			if (old_tbl->buckets[i] != NULL)
+  				complete = false;
+ -
+ -			unlock_buckets(new_tbl, old_tbl, old_hash);
+  		}
+ -	}
+ +	} while (!complete);
+  
++ 	rcu_assign_pointer(ht->tbl, new_tbl);
+  	synchronize_rcu();
+  
+  	bucket_table_free(old_tbl);
+@@@ -363,33 -620,67 +358,65 @@@ EXPORT_SYMBOL_GPL(rhashtable_insert)
+   */
+  bool rhashtable_remove(struct rhashtable *ht, struct rhash_head *obj)
+  {
+ -	struct bucket_table *tbl, *new_tbl, *old_tbl;
+ +	struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+  	struct rhash_head __rcu **pprev;
+++<<<<<<< HEAD
+ +	struct rhash_head *he;
+ +	u32 h;
+ +
+ +	ASSERT_RHT_MUTEX(ht);
+++=======
++ 	struct rhash_head *he, *he2;
++ 	unsigned int hash, new_hash;
++ 	bool ret = false;
++ 
++ 	rcu_read_lock();
++ 	tbl = old_tbl = rht_dereference_rcu(ht->tbl, ht);
++ 	new_tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	new_hash = obj_raw_hashfn(ht, rht_obj(ht, obj));
+++>>>>>>> cf52d52f9ccb (rhashtable: Avoid bucket cross reference after removal)
+ +
+ +	h = head_hashfn(ht, tbl, obj);
+  
+ -	lock_buckets(new_tbl, old_tbl, new_hash);
+ -restart:
+ -	hash = rht_bucket_index(tbl, new_hash);
+ -	pprev = &tbl->buckets[hash];
+ -	rht_for_each(he, tbl, hash) {
+ +	pprev = &tbl->buckets[h];
+ +	rht_for_each(he, tbl, h) {
+  		if (he != obj) {
+  			pprev = &he->next;
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		RCU_INIT_POINTER(*pprev, he->next);
+ +		ht->nelems--;
+ +
+ +		if (ht->p.shrink_decision &&
+ +		    ht->p.shrink_decision(ht, tbl->size))
+ +			rhashtable_shrink(ht);
+ +
+ +		return true;
+++=======
++ 		ASSERT_BUCKET_LOCK(ht, tbl, hash);
++ 
++ 		if (unlikely(new_tbl != tbl)) {
++ 			rht_for_each_continue(he2, he->next, tbl, hash) {
++ 				if (head_hashfn(ht, tbl, he2) == hash) {
++ 					rcu_assign_pointer(*pprev, he2);
++ 					goto found;
++ 				}
++ 			}
++ 
++ 			INIT_RHT_NULLS_HEAD(*pprev, ht, hash);
++ 		} else {
++ 			rcu_assign_pointer(*pprev, obj->next);
++ 		}
++ 
++ found:
++ 		ret = true;
++ 		break;
+++>>>>>>> cf52d52f9ccb (rhashtable: Avoid bucket cross reference after removal)
+  	}
+  
+ -	/* The entry may be linked in either 'tbl', 'future_tbl', or both.
+ -	 * 'future_tbl' only exists for a short period of time during
+ -	 * resizing. Thus traversing both is fine and the added cost is
+ -	 * very rare.
+ -	 */
+ -	if (tbl != new_tbl) {
+ -		tbl = new_tbl;
+ -		goto restart;
+ -	}
+ -
+ -	unlock_buckets(new_tbl, old_tbl, new_hash);
+ -
+ -	if (ret) {
+ -		atomic_dec(&ht->nelems);
+ -		rhashtable_wakeup_worker(ht);
+ -	}
+ -
+ -	rcu_read_unlock();
+ -
+ -	return ret;
+ +	return false;
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_remove);
+  
+* Unmerged path lib/rhashtable.c
