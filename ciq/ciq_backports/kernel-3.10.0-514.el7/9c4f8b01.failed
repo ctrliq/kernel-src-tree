@@ -1,0 +1,240 @@
+be2iscsi: Fix async link event processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jitendra Bhivare <jitendra.bhivare@avagotech.com>
+commit 9c4f8b01731c4ccf369a34f40f5eb384548af46a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9c4f8b01.failed
+
+Use only port_link_status only to determine link state change.  Only bit
+0 is used to get the state.  Remove code for processing port_fault.
+
+Fixed get_nic_conf structure definition. Removed rsvd[23] field in
+be_cmd_get_nic_conf_resp.
+
+Moved definitions of struct field values below the field.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@avagotech.com>
+	Reviewed-by: Hannes Reinicke <hare@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9c4f8b01731c4ccf369a34f40f5eb384548af46a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_cmds.c
+#	drivers/scsi/be2iscsi/be_cmds.h
+diff --cc drivers/scsi/be2iscsi/be_cmds.c
+index 3a78e054ddea,34c33d422ec4..000000000000
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@@ -425,34 -405,127 +425,151 @@@ void beiscsi_fail_session(struct iscsi_
+  	iscsi_session_failure(cls_session->dd_data, ISCSI_ERR_CONN_FAILED);
+  }
+  
+++<<<<<<< HEAD
+ +void beiscsi_async_link_state_process(struct beiscsi_hba *phba,
+ +		struct be_async_event_link_state *evt)
+ +{
+ +	if ((evt->port_link_status == ASYNC_EVENT_LINK_DOWN) ||
+ +	    ((evt->port_link_status & ASYNC_EVENT_LOGICAL) &&
+ +	     (evt->port_fault != BEISCSI_PHY_LINK_FAULT_NONE))) {
+ +		phba->state = BE_ADAPTER_LINK_DOWN;
+ +
+ +		beiscsi_log(phba, KERN_ERR,
+ +			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_INIT,
+ +			    "BC_%d : Link Down on Port %d\n",
+ +			    evt->physical_port);
+ +
+ +		iscsi_host_for_each_session(phba->shost,
+ +					    beiscsi_fail_session);
+ +	} else if ((evt->port_link_status & ASYNC_EVENT_LINK_UP) ||
+ +		    ((evt->port_link_status & ASYNC_EVENT_LOGICAL) &&
+ +		     (evt->port_fault == BEISCSI_PHY_LINK_FAULT_NONE))) {
+++=======
++ static void beiscsi_process_async_link(struct beiscsi_hba *phba,
++ 				       struct be_mcc_compl *compl)
++ {
++ 	struct be_async_event_link_state *evt;
++ 
++ 	evt = (struct be_async_event_link_state *)compl;
++ 
++ 	phba->port_speed = evt->port_speed;
++ 	/**
++ 	 * Check logical link status in ASYNC event.
++ 	 * This has been newly introduced in SKH-R Firmware 10.0.338.45.
++ 	 **/
++ 	if (evt->port_link_status & BE_ASYNC_LINK_UP_MASK) {
+++>>>>>>> 9c4f8b01731c (be2iscsi: Fix async link event processing)
+  		phba->state = BE_ADAPTER_LINK_UP | BE_ADAPTER_CHECK_BOOT;
+  		phba->get_boot = BE_GET_BOOT_RETRIES;
++ 		__beiscsi_log(phba, KERN_ERR,
++ 			      "BC_%d : Link Up on Port %d tag 0x%x\n",
++ 			      evt->physical_port, evt->event_tag);
++ 	} else {
++ 		phba->state = BE_ADAPTER_LINK_DOWN;
++ 		__beiscsi_log(phba, KERN_ERR,
++ 			      "BC_%d : Link Down on Port %d tag 0x%x\n",
++ 			      evt->physical_port, evt->event_tag);
++ 		iscsi_host_for_each_session(phba->shost,
++ 					    beiscsi_fail_session);
++ 	}
++ }
+  
+- 		beiscsi_log(phba, KERN_ERR,
+- 			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_INIT,
+- 			    "BC_%d : Link UP on Port %d\n",
+- 			    evt->physical_port);
+++<<<<<<< HEAD
+++=======
++ static char *beiscsi_port_misconf_event_msg[] = {
++ 	"Physical Link is functional.",
++ 	"Optics faulted/incorrectly installed/not installed - Reseat optics, if issue not resolved, replace.",
++ 	"Optics of two types installed - Remove one optic or install matching pair of optics.",
++ 	"Incompatible optics - Replace with compatible optics for card to function.",
++ 	"Unqualified optics - Replace with Avago optics for Warranty and Technical Support.",
++ 	"Uncertified optics - Replace with Avago Certified optics to enable link operation."
++ };
++ 
++ static void beiscsi_process_async_sli(struct beiscsi_hba *phba,
++ 				      struct be_mcc_compl *compl)
++ {
++ 	struct be_async_event_sli *async_sli;
++ 	u8 evt_type, state, old_state, le;
++ 	char *sev = KERN_WARNING;
++ 	char *msg = NULL;
++ 
++ 	evt_type = compl->flags >> ASYNC_TRAILER_EVENT_TYPE_SHIFT;
++ 	evt_type &= ASYNC_TRAILER_EVENT_TYPE_MASK;
++ 
++ 	/* processing only MISCONFIGURED physical port event */
++ 	if (evt_type != ASYNC_SLI_EVENT_TYPE_MISCONFIGURED)
++ 		return;
++ 
++ 	async_sli = (struct be_async_event_sli *)compl;
++ 	state = async_sli->event_data1 >>
++ 		 (phba->fw_config.phys_port * 8) & 0xff;
++ 	le = async_sli->event_data2 >>
++ 		 (phba->fw_config.phys_port * 8) & 0xff;
++ 
++ 	old_state = phba->optic_state;
++ 	phba->optic_state = state;
++ 
++ 	if (state >= ARRAY_SIZE(beiscsi_port_misconf_event_msg)) {
++ 		/* fw is reporting a state we don't know, log and return */
++ 		__beiscsi_log(phba, KERN_ERR,
++ 			    "BC_%d : Port %c: Unrecognized optic state 0x%x\n",
++ 			    phba->port_name, async_sli->event_data1);
++ 		return;
++ 	}
++ 
++ 	if (ASYNC_SLI_LINK_EFFECT_VALID(le)) {
++ 		/* log link effect for unqualified-4, uncertified-5 optics */
++ 		if (state > 3)
++ 			msg = (ASYNC_SLI_LINK_EFFECT_STATE(le)) ?
++ 				" Link is non-operational." :
++ 				" Link is operational.";
++ 		/* 1 - info */
++ 		if (ASYNC_SLI_LINK_EFFECT_SEV(le) == 1)
++ 			sev = KERN_INFO;
++ 		/* 2 - error */
++ 		if (ASYNC_SLI_LINK_EFFECT_SEV(le) == 2)
++ 			sev = KERN_ERR;
++ 	}
++ 
++ 	if (old_state != phba->optic_state)
++ 		__beiscsi_log(phba, sev, "BC_%d : Port %c: %s%s\n",
++ 			      phba->port_name,
++ 			      beiscsi_port_misconf_event_msg[state],
++ 			      !msg ? "" : msg);
++ }
++ 
++ void beiscsi_process_async_event(struct beiscsi_hba *phba,
++ 				struct be_mcc_compl *compl)
++ {
++ 	char *sev = KERN_INFO;
++ 	u8 evt_code;
++ 
++ 	/* interpret flags as an async trailer */
++ 	evt_code = compl->flags >> ASYNC_TRAILER_EVENT_CODE_SHIFT;
++ 	evt_code &= ASYNC_TRAILER_EVENT_CODE_MASK;
++ 	switch (evt_code) {
++ 	case ASYNC_EVENT_CODE_LINK_STATE:
++ 		beiscsi_process_async_link(phba, compl);
++ 		break;
++ 	case ASYNC_EVENT_CODE_ISCSI:
++ 		phba->state |= BE_ADAPTER_CHECK_BOOT;
++ 		phba->get_boot = BE_GET_BOOT_RETRIES;
++ 		sev = KERN_ERR;
++ 		break;
++ 	case ASYNC_EVENT_CODE_SLI:
++ 		beiscsi_process_async_sli(phba, compl);
++ 		break;
++ 	default:
++ 		/* event not registered */
++ 		sev = KERN_ERR;
+  	}
++ 
++ 	beiscsi_log(phba, sev, BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
++ 		    "BC_%d : ASYNC Event %x: status 0x%08x flags 0x%08x\n",
++ 		    evt_code, compl->status, compl->flags);
+  }
+  
+++>>>>>>> 9c4f8b01731c (be2iscsi: Fix async link event processing)
+  int beiscsi_process_mcc(struct beiscsi_hba *phba)
+  {
+  	struct be_mcc_compl *compl;
+diff --cc drivers/scsi/be2iscsi/be_cmds.h
+index 39004db0b47d,7caf585e4c2a..000000000000
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@@ -143,13 -151,26 +142,30 @@@ enum 
+  struct be_async_event_link_state {
+  	u8 physical_port;
+  	u8 port_link_status;
++ /**
++  * ASYNC_EVENT_LINK_DOWN		0x0
++  * ASYNC_EVENT_LINK_UP			0x1
++  * ASYNC_EVENT_LINK_LOGICAL_DOWN	0x2
++  * ASYNC_EVENT_LINK_LOGICAL_UP		0x3
++  */
++ #define BE_ASYNC_LINK_UP_MASK		0x01
+  	u8 port_duplex;
+  	u8 port_speed;
+++<<<<<<< HEAD
+ +#define BEISCSI_PHY_LINK_FAULT_NONE	0x00
+ +#define BEISCSI_PHY_LINK_FAULT_LOCAL	0x01
+ +#define BEISCSI_PHY_LINK_FAULT_REMOTE	0x02
+++=======
++ /* BE2ISCSI_LINK_SPEED_ZERO	0x00 - no link */
++ #define BE2ISCSI_LINK_SPEED_10MBPS	0x01
++ #define BE2ISCSI_LINK_SPEED_100MBPS	0x02
++ #define BE2ISCSI_LINK_SPEED_1GBPS	0x03
++ #define BE2ISCSI_LINK_SPEED_10GBPS	0x04
++ #define BE2ISCSI_LINK_SPEED_25GBPS	0x06
++ #define BE2ISCSI_LINK_SPEED_40GBPS	0x07
+++>>>>>>> 9c4f8b01731c (be2iscsi: Fix async link event processing)
+  	u8 port_fault;
+ -	u8 event_reason;
+ -	u16 qos_link_speed;
+ -	u32 event_tag;
+ +	u8 rsvd0[7];
+  	struct be_async_event_trailer trailer;
+  } __packed;
+  
+* Unmerged path drivers/scsi/be2iscsi/be_cmds.c
+* Unmerged path drivers/scsi/be2iscsi/be_cmds.h
+diff --git a/drivers/scsi/be2iscsi/be_iscsi.c b/drivers/scsi/be2iscsi/be_iscsi.c
+index 1f1ae87225b9..112540a1b9b6 100644
+--- a/drivers/scsi/be2iscsi/be_iscsi.c
++++ b/drivers/scsi/be2iscsi/be_iscsi.c
+@@ -760,7 +760,7 @@ static void beiscsi_get_port_state(struct Scsi_Host *shost)
+ 	struct beiscsi_hba *phba = iscsi_host_priv(shost);
+ 	struct iscsi_cls_host *ihost = shost->shost_data;
+ 
+-	ihost->port_state = (phba->state == BE_ADAPTER_LINK_UP) ?
++	ihost->port_state = (phba->state & BE_ADAPTER_LINK_UP) ?
+ 		ISCSI_PORT_STATE_UP : ISCSI_PORT_STATE_DOWN;
+ }
+ 
