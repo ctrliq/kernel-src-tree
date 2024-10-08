@@ -1,0 +1,168 @@
+nfs: get a reference to the credential in ff_layout_alloc_lseg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jeff Layton <jlayton@poochiereds.net>
+commit 90a0be00e9d29d9baac27c0c63a5e71ca1334001
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/90a0be00.failed
+
+We're just as likely to have allocation problems here as we would if we
+delay looking up the credential like we currently do. Fix the code to
+get a rpc_cred reference early, as soon as the mirror is set up.
+
+This allows us to eliminate the mirror early if there is a problem
+getting an rpc credential. This also allows us to drop the uid/gid
+from the layout_mirror struct as well.
+
+In the event that we find an existing mirror where this one would go, we
+swap in the new creds unconditionally, and drop the reference to the old
+one.
+
+Note that the old ff_layout_update_mirror_cred function wouldn't set
+this pointer unless the DS version was 3, but we don't know what the DS
+version is at this point. I'm a little unclear on why it did that as you
+still need creds to talk to v4 servers as well. I have the code set
+it regardless of the DS version here.
+
+Also note the change to using generic creds instead of calling
+lookup_cred directly. With that change, we also need to populate the
+group_info pointer in the acred as some functions expect that to never
+be NULL. Instead of allocating one every time however, we can allocate
+one when the module is loaded and share it since the group_info is
+refcounted.
+
+	Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 90a0be00e9d29d9baac27c0c63a5e71ca1334001)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/flexfilelayout/flexfilelayout.c
+#	fs/nfs/flexfilelayout/flexfilelayoutdev.c
+diff --cc fs/nfs/flexfilelayout/flexfilelayout.c
+index 6af5423f4768,ee87c0f9fd55..000000000000
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@@ -282,10 -406,12 +284,11 @@@ ff_layout_alloc_lseg(struct pnfs_layout
+  		goto out_err_free;
+  
+  	for (i = 0; i < fls->mirror_array_cnt; i++) {
+ -		struct nfs4_ff_layout_mirror *mirror;
+  		struct nfs4_deviceid devid;
+  		struct nfs4_deviceid_node *idnode;
+- 		u32 ds_count;
+- 		u32 fh_count;
++ 		struct auth_cred acred = { .group_info = ff_zero_group };
++ 		struct rpc_cred	*cred;
++ 		u32 ds_count, fh_count, id;
+  		int j;
+  
+  		rc = -EIO;
+@@@ -371,9 -498,28 +376,34 @@@
+  		if (rc)
+  			goto out_err_free;
+  
+++<<<<<<< HEAD
+ +		dprintk("%s: uid %d gid %d\n", __func__,
+ +			fls->mirror_array[i]->uid,
+ +			fls->mirror_array[i]->gid);
+++=======
++ 		acred.gid = make_kgid(&init_user_ns, id);
++ 
++ 		/* find the cred for it */
++ 		cred = rpc_lookup_generic_cred(&acred, 0, gfp_flags);
++ 		if (IS_ERR(cred)) {
++ 			rc = PTR_ERR(cred);
++ 			goto out_err_free;
++ 		}
++ 
++ 		rcu_assign_pointer(fls->mirror_array[i]->cred, cred);
++ 
++ 		mirror = ff_layout_add_mirror(lh, fls->mirror_array[i]);
++ 		if (mirror != fls->mirror_array[i]) {
++ 			/* swap cred ptrs so free_mirror will clean up old */
++ 			fls->mirror_array[i]->cred = xchg(&mirror->cred, cred);
++ 			ff_layout_free_mirror(fls->mirror_array[i]);
++ 			fls->mirror_array[i] = mirror;
++ 		}
++ 
++ 		dprintk("%s: uid %u gid %u\n", __func__,
++ 			from_kuid(&init_user_ns, acred.uid),
++ 			from_kgid(&init_user_ns, acred.gid));
+++>>>>>>> 90a0be00e9d2 (nfs: get a reference to the credential in ff_layout_alloc_lseg)
+  	}
+  
+  	p = xdr_inline_decode(&stream, 4);
+@@@ -2006,7 -2244,11 +2036,15 @@@ static int __init nfs4flexfilelayout_in
+  {
+  	printk(KERN_INFO "%s: NFSv4 Flexfile Layout Driver Registering...\n",
+  	       __func__);
+++<<<<<<< HEAD
+ +	mark_tech_preview("NFSv4 Flexfile Layout Driver", NULL);
+++=======
++ 	if (!ff_zero_group) {
++ 		ff_zero_group = groups_alloc(0);
++ 		if (!ff_zero_group)
++ 			return -ENOMEM;
++ 	}
+++>>>>>>> 90a0be00e9d2 (nfs: get a reference to the credential in ff_layout_alloc_lseg)
+  	return pnfs_register_layoutdriver(&flexfilelayout_type);
+  }
+  
+diff --cc fs/nfs/flexfilelayout/flexfilelayoutdev.c
+index 74421a65cd15,6ddd8a5c5ae0..000000000000
+--- a/fs/nfs/flexfilelayout/flexfilelayoutdev.c
++++ b/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+@@@ -448,26 -390,16 +409,27 @@@ nfs4_ff_layout_prepare_ds(struct pnfs_l
+  					 mirror, lseg->pls_range.offset,
+  					 lseg->pls_range.length, NFS4ERR_NXIO,
+  					 OP_ILLEGAL, GFP_NOIO);
+ -		if (!fail_return) {
+ +		if (fail_return) {
+ +			pnfs_error_mark_layout_for_return(ino, lseg);
+++<<<<<<< HEAD
+  			if (ff_layout_has_available_ds(lseg))
+ -				set_bit(NFS_LAYOUT_RETURN_REQUESTED,
+ -					&lseg->pls_layout->plh_flags);
+ +				pnfs_set_retry_layoutget(lseg->pls_layout);
+  			else
+ +				pnfs_clear_retry_layoutget(lseg->pls_layout);
+ +
+ +		} else {
+ +			if (ff_layout_has_available_ds(lseg))
+ +				set_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
+ +					&lseg->pls_layout->plh_flags);
+ +			else {
+  				pnfs_error_mark_layout_for_return(ino, lseg);
+ -		} else
+ -			pnfs_error_mark_layout_for_return(ino, lseg);
+ +				pnfs_clear_retry_layoutget(lseg->pls_layout);
+ +			}
+ +		}
+- 	}
+- out_update_creds:
+- 	if (ff_layout_update_mirror_cred(mirror, ds))
+++=======
+  		ds = NULL;
+++>>>>>>> 90a0be00e9d2 (nfs: get a reference to the credential in ff_layout_alloc_lseg)
++ 	}
+  out:
+  	return ds;
+  }
+* Unmerged path fs/nfs/flexfilelayout/flexfilelayout.c
+diff --git a/fs/nfs/flexfilelayout/flexfilelayout.h b/fs/nfs/flexfilelayout/flexfilelayout.h
+index 291bbdbc6e03..ac6d50e61e40 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayout.h
++++ b/fs/nfs/flexfilelayout/flexfilelayout.h
+@@ -75,8 +75,6 @@ struct nfs4_ff_layout_mirror {
+ 	u32				fh_versions_cnt;
+ 	struct nfs_fh			*fh_versions;
+ 	nfs4_stateid			stateid;
+-	u32				uid;
+-	u32				gid;
+ 	struct rpc_cred			*cred;
+ 	atomic_t			ref;
+ 	spinlock_t			lock;
+* Unmerged path fs/nfs/flexfilelayout/flexfilelayoutdev.c
