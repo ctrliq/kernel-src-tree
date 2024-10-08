@@ -1,0 +1,346 @@
+net: Validate xmit SKBs right when we pull them out of the qdisc.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Validate xmit SKBs right when we pull them out of the qdisc (Alexander Duyck) [1205266]
+Rebuild_FUZZ: 95.16%
+commit-author David S. Miller <davem@davemloft.net>
+commit 50cbe9ab5f8d92d2d4a327b56e96559d8f63a1fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/50cbe9ab.failed
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 50cbe9ab5f8d92d2d4a327b56e96559d8f63a1fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index dba59a041ff6,47c49ba2dcf4..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -2471,37 -2805,34 +2471,63 @@@ static inline void napi_free_frags(stru
+  	napi->skb = NULL;
+  }
+  
+ -int netdev_rx_handler_register(struct net_device *dev,
+ -			       rx_handler_func_t *rx_handler,
+ -			       void *rx_handler_data);
+ -void netdev_rx_handler_unregister(struct net_device *dev);
+ -
+ +extern int netdev_rx_handler_register(struct net_device *dev,
+ +				      rx_handler_func_t *rx_handler,
+ +				      void *rx_handler_data);
+ +extern void netdev_rx_handler_unregister(struct net_device *dev);
+ +
+++<<<<<<< HEAD
+ +extern bool		dev_valid_name(const char *name);
+ +extern int		dev_ioctl(struct net *net, unsigned int cmd, void __user *);
+ +extern int		dev_ethtool(struct net *net, struct ifreq *);
+ +extern unsigned int	dev_get_flags(const struct net_device *);
+ +extern int		__dev_change_flags(struct net_device *, unsigned int flags);
+ +extern int		dev_change_flags(struct net_device *, unsigned int);
+ +void			__dev_notify_flags(struct net_device *,
+ +					   unsigned int old_flags,
+ +					   unsigned int gchanges);
+ +extern int		dev_change_name(struct net_device *, const char *);
+ +extern int		dev_set_alias(struct net_device *, const char *, size_t);
+ +extern int		dev_change_net_namespace(struct net_device *,
+ +						 struct net *, const char *);
+ +extern int		dev_set_mtu(struct net_device *, int);
+ +extern void		dev_set_group(struct net_device *, int);
+ +extern int		dev_set_mac_address(struct net_device *,
+ +					    struct sockaddr *);
+ +extern int		dev_change_carrier(struct net_device *,
+ +					   bool new_carrier);
+ +extern int		dev_get_phys_port_id(struct net_device *dev,
+ +					     struct netdev_phys_port_id *ppid);
+ +extern int		dev_hard_start_xmit(struct sk_buff *skb,
+ +					    struct net_device *dev,
+ +					    struct netdev_queue *txq);
+ +extern int		dev_forward_skb(struct net_device *dev,
+ +					struct sk_buff *skb);
+++=======
++ bool dev_valid_name(const char *name);
++ int dev_ioctl(struct net *net, unsigned int cmd, void __user *);
++ int dev_ethtool(struct net *net, struct ifreq *);
++ unsigned int dev_get_flags(const struct net_device *);
++ int __dev_change_flags(struct net_device *, unsigned int flags);
++ int dev_change_flags(struct net_device *, unsigned int);
++ void __dev_notify_flags(struct net_device *, unsigned int old_flags,
++ 			unsigned int gchanges);
++ int dev_change_name(struct net_device *, const char *);
++ int dev_set_alias(struct net_device *, const char *, size_t);
++ int dev_change_net_namespace(struct net_device *, struct net *, const char *);
++ int dev_set_mtu(struct net_device *, int);
++ void dev_set_group(struct net_device *, int);
++ int dev_set_mac_address(struct net_device *, struct sockaddr *);
++ int dev_change_carrier(struct net_device *, bool new_carrier);
++ int dev_get_phys_port_id(struct net_device *dev,
++ 			 struct netdev_phys_port_id *ppid);
++ struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev);
++ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
++ 			struct netdev_queue *txq);
++ int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
++ int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
++ bool is_skb_forwardable(struct net_device *dev, struct sk_buff *skb);
+++>>>>>>> 50cbe9ab5f8d (net: Validate xmit SKBs right when we pull them out of the qdisc.)
+  
+  extern int		netdev_budget;
+  
+diff --cc net/core/dev.c
+index 1924c9647d47,75bc5b068a13..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2485,106 -2599,130 +2485,229 @@@ netdev_features_t netif_skb_features(st
+  }
+  EXPORT_SYMBOL(netif_skb_features);
+  
+++<<<<<<< HEAD
+++=======
++ static int xmit_one(struct sk_buff *skb, struct net_device *dev,
++ 		    struct netdev_queue *txq, bool more)
++ {
++ 	unsigned int len;
++ 	int rc;
++ 
++ 	if (!list_empty(&ptype_all))
++ 		dev_queue_xmit_nit(skb, dev);
++ 
++ 	len = skb->len;
++ 	trace_net_dev_start_xmit(skb, dev);
++ 	rc = netdev_start_xmit(skb, dev, txq, more);
++ 	trace_net_dev_xmit(skb, rc, dev, len);
++ 
++ 	return rc;
++ }
++ 
++ static struct sk_buff *xmit_list(struct sk_buff *first, struct net_device *dev,
++ 				 struct netdev_queue *txq, int *ret)
++ {
++ 	struct sk_buff *skb = first;
++ 	int rc = NETDEV_TX_OK;
++ 
++ 	while (skb) {
++ 		struct sk_buff *next = skb->next;
++ 
++ 		skb->next = NULL;
++ 		rc = xmit_one(skb, dev, txq, next != NULL);
++ 		if (unlikely(!dev_xmit_complete(rc))) {
++ 			skb->next = next;
++ 			goto out;
++ 		}
++ 
++ 		skb = next;
++ 		if (netif_xmit_stopped(txq) && skb) {
++ 			rc = NETDEV_TX_BUSY;
++ 			break;
++ 		}
++ 	}
++ 
++ out:
++ 	*ret = rc;
++ 	return skb;
++ }
++ 
++ struct sk_buff *validate_xmit_vlan(struct sk_buff *skb, netdev_features_t features)
++ {
++ 	if (vlan_tx_tag_present(skb) &&
++ 	    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
++ 		skb = __vlan_put_tag(skb, skb->vlan_proto,
++ 				     vlan_tx_tag_get(skb));
++ 		if (skb)
++ 			skb->vlan_tci = 0;
++ 	}
++ 	return skb;
++ }
++ 
++ struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	netdev_features_t features;
++ 
++ 	if (skb->next)
++ 		return skb;
++ 
++ 	/* If device doesn't need skb->dst, release it right now while
++ 	 * its hot in this cpu cache
++ 	 */
++ 	if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
++ 		skb_dst_drop(skb);
++ 
++ 	features = netif_skb_features(skb);
++ 	skb = validate_xmit_vlan(skb, features);
++ 	if (unlikely(!skb))
++ 		goto out_null;
++ 
++ 	/* If encapsulation offload request, verify we are testing
++ 	 * hardware encapsulation features instead of standard
++ 	 * features for the netdev
++ 	 */
++ 	if (skb->encapsulation)
++ 		features &= dev->hw_enc_features;
++ 
++ 	if (netif_needs_gso(skb, features)) {
++ 		if (unlikely(dev_gso_segment(skb, features)))
++ 			goto out_kfree_skb;
++ 	} else {
++ 		if (skb_needs_linearize(skb, features) &&
++ 		    __skb_linearize(skb))
++ 			goto out_kfree_skb;
++ 
++ 		/* If packet is not checksummed and device does not
++ 		 * support checksumming for this protocol, complete
++ 		 * checksumming here.
++ 		 */
++ 		if (skb->ip_summed == CHECKSUM_PARTIAL) {
++ 			if (skb->encapsulation)
++ 				skb_set_inner_transport_header(skb,
++ 							       skb_checksum_start_offset(skb));
++ 			else
++ 				skb_set_transport_header(skb,
++ 							 skb_checksum_start_offset(skb));
++ 			if (!(features & NETIF_F_ALL_CSUM) &&
++ 			    skb_checksum_help(skb))
++ 				goto out_kfree_skb;
++ 		}
++ 	}
++ 
++ 	return skb;
++ 
++ out_kfree_skb:
++ 	kfree_skb(skb);
++ out_null:
++ 	return NULL;
++ }
++ 
+++>>>>>>> 50cbe9ab5f8d (net: Validate xmit SKBs right when we pull them out of the qdisc.)
+  int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+  			struct netdev_queue *txq)
+  {
+ +	const struct net_device_ops *ops = dev->netdev_ops;
+  	int rc = NETDEV_TX_OK;
+ +	unsigned int skb_len;
+ +
+++<<<<<<< HEAD
+ +	if (likely(!skb->next)) {
+ +		netdev_features_t features;
+ +
+ +		/*
+ +		 * If device doesn't need skb->dst, release it right now while
+ +		 * its hot in this cpu cache
+ +		 */
+ +		if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
+ +			skb_dst_drop(skb);
+ +
+ +		features = netif_skb_features(skb);
+ +
+ +		if (vlan_tx_tag_present(skb) &&
+ +		    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
+ +			skb = __vlan_put_tag(skb, skb->vlan_proto,
+ +					     vlan_tx_tag_get(skb));
+ +			if (unlikely(!skb))
+ +				goto out;
+ +
+ +			skb->vlan_tci = 0;
+ +		}
+ +
+ +		/* If encapsulation offload request, verify we are testing
+ +		 * hardware encapsulation features instead of standard
+ +		 * features for the netdev
+ +		 */
+ +		if (skb->encapsulation)
+ +			features &= dev->hw_enc_features;
+ +
+ +		if (netif_needs_gso(skb, features)) {
+ +			if (unlikely(dev_gso_segment(skb, features)))
+ +				goto out_kfree_skb;
+ +			if (skb->next)
+ +				goto gso;
+ +		} else {
+ +			if (skb_needs_linearize(skb, features) &&
+ +			    __skb_linearize(skb))
+ +				goto out_kfree_skb;
+ +
+ +			/* If packet is not checksummed and device does not
+ +			 * support checksumming for this protocol, complete
+ +			 * checksumming here.
+ +			 */
+ +			if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ +				if (skb->encapsulation)
+ +					skb_set_inner_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				else
+ +					skb_set_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				if (!(features & NETIF_F_ALL_CSUM) &&
+ +				     skb_checksum_help(skb))
+ +					goto out_kfree_skb;
+ +			}
+ +		}
+ +
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(skb, dev);
+  
+ +		skb_len = skb->len;
+ +		rc = ops->ndo_start_xmit(skb, dev);
+ +		trace_net_dev_xmit(skb, rc, dev, skb_len);
+ +		if (rc == NETDEV_TX_OK)
+ +			txq_trans_update(txq);
+ +		return rc;
+ +	}
+ +
+ +gso:
+ +	do {
+ +		struct sk_buff *nskb = skb->next;
+++=======
++ 	if (likely(!skb->next))
++ 		return xmit_one(skb, dev, txq, false);
+++>>>>>>> 50cbe9ab5f8d (net: Validate xmit SKBs right when we pull them out of the qdisc.)
+ +
+ +		skb->next = nskb->next;
+ +		nskb->next = NULL;
+ +
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(nskb, dev);
+ +
+ +		skb_len = nskb->len;
+ +		rc = ops->ndo_start_xmit(nskb, dev);
+ +		trace_net_dev_xmit(nskb, rc, dev, skb_len);
+ +		if (unlikely(rc != NETDEV_TX_OK)) {
+ +			if (rc & ~NETDEV_TX_MASK)
+ +				goto out_kfree_gso_skb;
+ +			nskb->next = skb->next;
+ +			skb->next = nskb;
+ +			return rc;
+ +		}
+ +		txq_trans_update(txq);
+ +		if (unlikely(netif_xmit_stopped(txq) && skb->next))
+ +			return NETDEV_TX_BUSY;
+ +	} while (skb->next);
+  
+ -	skb->next = xmit_list(skb->next, dev, txq, &rc);
+ +out_kfree_gso_skb:
+  	if (likely(skb->next == NULL)) {
+  		skb->destructor = DEV_GSO_CB(skb)->destructor;
+  		consume_skb(skb);
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 7fbf6a59446f..b54d71681e6f 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -69,8 +69,11 @@ static inline struct sk_buff *dequeue_skb(struct Qdisc *q)
+ 		} else
+ 			skb = NULL;
+ 	} else {
+-		if (!(q->flags & TCQ_F_ONETXQUEUE) || !netif_xmit_frozen_or_stopped(txq))
++		if (!(q->flags & TCQ_F_ONETXQUEUE) || !netif_xmit_frozen_or_stopped(txq)) {
+ 			skb = q->dequeue(q);
++			if (skb)
++				skb = validate_xmit_skb(skb, qdisc_dev(q));
++		}
+ 	}
+ 
+ 	return skb;
