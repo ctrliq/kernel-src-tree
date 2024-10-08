@@ -1,0 +1,460 @@
+sched/deadline: Add SCHED_DEADLINE inheritance logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dario Faggioli <raistlin@linux.it>
+commit 2d3d891d3344159d5b452a645e355bbe29591e8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2d3d891d.failed
+
+Some method to deal with rt-mutexes and make sched_dl interact with
+the current PI-coded is needed, raising all but trivial issues, that
+needs (according to us) to be solved with some restructuring of
+the pi-code (i.e., going toward a proxy execution-ish implementation).
+
+This is under development, in the meanwhile, as a temporary solution,
+what this commits does is:
+
+ - ensure a pi-lock owner with waiters is never throttled down. Instead,
+   when it runs out of runtime, it immediately gets replenished and it's
+   deadline is postponed;
+
+ - the scheduling parameters (relative deadline and default runtime)
+   used for that replenishments --during the whole period it holds the
+   pi-lock-- are the ones of the waiting task with earliest deadline.
+
+Acting this way, we provide some kind of boosting to the lock-owner,
+still by using the existing (actually, slightly modified by the previous
+commit) pi-architecture.
+
+We would stress the fact that this is only a surely needed, all but
+clean solution to the problem. In the end it's only a way to re-start
+discussion within the community. So, as always, comments, ideas, rants,
+etc.. are welcome! :-)
+
+	Signed-off-by: Dario Faggioli <raistlin@linux.it>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+[ Added !RT_MUTEXES build fix. ]
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1383831828-15501-11-git-send-email-juri.lelli@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2d3d891d3344159d5b452a645e355bbe29591e8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/rtmutex.c
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+#	kernel/sched/sched.h
+diff --cc include/linux/sched.h
+index e57aba91f593,13c53a99920f..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1104,6 -1093,50 +1104,53 @@@ struct sched_rt_entity 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct sched_dl_entity {
++ 	struct rb_node	rb_node;
++ 
++ 	/*
++ 	 * Original scheduling parameters. Copied here from sched_attr
++ 	 * during sched_setscheduler2(), they will remain the same until
++ 	 * the next sched_setscheduler2().
++ 	 */
++ 	u64 dl_runtime;		/* maximum runtime for each instance	*/
++ 	u64 dl_deadline;	/* relative deadline of each instance	*/
++ 	u64 dl_period;		/* separation of two instances (period) */
++ 
++ 	/*
++ 	 * Actual scheduling parameters. Initialized with the values above,
++ 	 * they are continously updated during task execution. Note that
++ 	 * the remaining runtime could be < 0 in case we are in overrun.
++ 	 */
++ 	s64 runtime;		/* remaining runtime for this instance	*/
++ 	u64 deadline;		/* absolute deadline for this instance	*/
++ 	unsigned int flags;	/* specifying the scheduler behaviour	*/
++ 
++ 	/*
++ 	 * Some bool flags:
++ 	 *
++ 	 * @dl_throttled tells if we exhausted the runtime. If so, the
++ 	 * task has to wait for a replenishment to be performed at the
++ 	 * next firing of dl_timer.
++ 	 *
++ 	 * @dl_new tells if a new instance arrived. If so we must
++ 	 * start executing it with full runtime and reset its absolute
++ 	 * deadline;
++ 	 *
++ 	 * @dl_boosted tells if we are boosted due to DI. If so we are
++ 	 * outside bandwidth enforcement mechanism (but only until we
++ 	 * exit the critical section).
++ 	 */
++ 	int dl_throttled, dl_new, dl_boosted;
++ 
++ 	/*
++ 	 * Bandwidth enforcement timer. Each -deadline task has its
++ 	 * own bandwidth to be enforced, thus we need one timer per task.
++ 	 */
++ 	struct hrtimer dl_timer;
++ };
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic)
+  
+  struct rcu_node;
+  
+@@@ -1330,9 -1359,12 +1377,11 @@@ struct task_struct 
+  
+  #ifdef CONFIG_RT_MUTEXES
+  	/* PI waiters blocked on a rt_mutex held by this task */
+ -	struct rb_root pi_waiters;
+ -	struct rb_node *pi_waiters_leftmost;
+ +	struct plist_head pi_waiters;
+  	/* Deadlock detection and priority inheritance handling */
+  	struct rt_mutex_waiter *pi_blocked_on;
++ 	/* Top pi_waiters task */
++ 	struct task_struct *pi_top_task;
+  #endif
+  
+  #ifdef CONFIG_DEBUG_MUTEXES
+diff --cc kernel/rtmutex.c
+index 8fcd41faae71,2e960a2bab81..000000000000
+--- a/kernel/rtmutex.c
++++ b/kernel/rtmutex.c
+@@@ -91,10 -92,107 +91,110 @@@ static inline void mark_rt_mutex_waiter
+  }
+  #endif
+  
+++<<<<<<< HEAD:kernel/rtmutex.c
+++=======
++ static inline int
++ rt_mutex_waiter_less(struct rt_mutex_waiter *left,
++ 		     struct rt_mutex_waiter *right)
++ {
++ 	if (left->prio < right->prio)
++ 		return 1;
++ 
++ 	/*
++ 	 * If both waiters have dl_prio(), we check the deadlines of the
++ 	 * associated tasks.
++ 	 * If left waiter has a dl_prio(), and we didn't return 1 above,
++ 	 * then right waiter has a dl_prio() too.
++ 	 */
++ 	if (dl_prio(left->prio))
++ 		return (left->task->dl.deadline < right->task->dl.deadline);
++ 
++ 	return 0;
++ }
++ 
++ static void
++ rt_mutex_enqueue(struct rt_mutex *lock, struct rt_mutex_waiter *waiter)
++ {
++ 	struct rb_node **link = &lock->waiters.rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct rt_mutex_waiter *entry;
++ 	int leftmost = 1;
++ 
++ 	while (*link) {
++ 		parent = *link;
++ 		entry = rb_entry(parent, struct rt_mutex_waiter, tree_entry);
++ 		if (rt_mutex_waiter_less(waiter, entry)) {
++ 			link = &parent->rb_left;
++ 		} else {
++ 			link = &parent->rb_right;
++ 			leftmost = 0;
++ 		}
++ 	}
++ 
++ 	if (leftmost)
++ 		lock->waiters_leftmost = &waiter->tree_entry;
++ 
++ 	rb_link_node(&waiter->tree_entry, parent, link);
++ 	rb_insert_color(&waiter->tree_entry, &lock->waiters);
++ }
++ 
++ static void
++ rt_mutex_dequeue(struct rt_mutex *lock, struct rt_mutex_waiter *waiter)
++ {
++ 	if (RB_EMPTY_NODE(&waiter->tree_entry))
++ 		return;
++ 
++ 	if (lock->waiters_leftmost == &waiter->tree_entry)
++ 		lock->waiters_leftmost = rb_next(&waiter->tree_entry);
++ 
++ 	rb_erase(&waiter->tree_entry, &lock->waiters);
++ 	RB_CLEAR_NODE(&waiter->tree_entry);
++ }
++ 
++ static void
++ rt_mutex_enqueue_pi(struct task_struct *task, struct rt_mutex_waiter *waiter)
++ {
++ 	struct rb_node **link = &task->pi_waiters.rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct rt_mutex_waiter *entry;
++ 	int leftmost = 1;
++ 
++ 	while (*link) {
++ 		parent = *link;
++ 		entry = rb_entry(parent, struct rt_mutex_waiter, pi_tree_entry);
++ 		if (rt_mutex_waiter_less(waiter, entry)) {
++ 			link = &parent->rb_left;
++ 		} else {
++ 			link = &parent->rb_right;
++ 			leftmost = 0;
++ 		}
++ 	}
++ 
++ 	if (leftmost)
++ 		task->pi_waiters_leftmost = &waiter->pi_tree_entry;
++ 
++ 	rb_link_node(&waiter->pi_tree_entry, parent, link);
++ 	rb_insert_color(&waiter->pi_tree_entry, &task->pi_waiters);
++ }
++ 
++ static void
++ rt_mutex_dequeue_pi(struct task_struct *task, struct rt_mutex_waiter *waiter)
++ {
++ 	if (RB_EMPTY_NODE(&waiter->pi_tree_entry))
++ 		return;
++ 
++ 	if (task->pi_waiters_leftmost == &waiter->pi_tree_entry)
++ 		task->pi_waiters_leftmost = rb_next(&waiter->pi_tree_entry);
++ 
++ 	rb_erase(&waiter->pi_tree_entry, &task->pi_waiters);
++ 	RB_CLEAR_NODE(&waiter->pi_tree_entry);
++ }
++ 
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic):kernel/locking/rtmutex.c
+  /*
+ - * Calculate task priority from the waiter tree priority
+ + * Calculate task priority from the waiter list priority
+   *
+ - * Return task->normal_prio when the waiter tree is empty or when
+ + * Return task->normal_prio when the waiter list is empty or when
+   * the waiter is not allowed to do priority boosting
+   */
+  int rt_mutex_getprio(struct task_struct *task)
+@@@ -102,7 -200,7 +202,11 @@@
+  	if (likely(!task_has_pi_waiters(task)))
+  		return task->normal_prio;
+  
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +	return min(task_top_pi_waiter(task)->pi_list_entry.prio,
+++=======
++ 	return min(task_top_pi_waiter(task)->prio,
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic):kernel/locking/rtmutex.c
+  		   task->normal_prio);
+  }
+  
+@@@ -220,7 -339,7 +332,11 @@@ static int rt_mutex_adjust_prio_chain(s
+  	 * When deadlock detection is off then we check, if further
+  	 * priority adjustment is necessary.
+  	 */
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +	if (!detect_deadlock && waiter->list_entry.prio == task->prio)
+++=======
++ 	if (!detect_deadlock && waiter->prio == task->prio)
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic):kernel/locking/rtmutex.c
+  		goto out_unlock_pi;
+  
+  	lock = waiter->lock;
+@@@ -241,9 -360,9 +357,15 @@@
+  	top_waiter = rt_mutex_top_waiter(lock);
+  
+  	/* Requeue the waiter */
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +	plist_del(&waiter->list_entry, &lock->wait_list);
+ +	waiter->list_entry.prio = task->prio;
+ +	plist_add(&waiter->list_entry, &lock->wait_list);
+++=======
++ 	rt_mutex_dequeue(lock, waiter);
++ 	waiter->prio = task->prio;
++ 	rt_mutex_enqueue(lock, waiter);
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic):kernel/locking/rtmutex.c
+  
+  	/* Release the task */
+  	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+@@@ -342,7 -459,7 +464,11 @@@ static int try_to_take_rt_mutex(struct 
+  	 * 3) it is top waiter
+  	 */
+  	if (rt_mutex_has_waiters(lock)) {
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +		if (task->prio >= rt_mutex_top_waiter(lock)->list_entry.prio) {
+++=======
++ 		if (task->prio >= rt_mutex_top_waiter(lock)->prio) {
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic):kernel/locking/rtmutex.c
+  			if (!waiter || waiter != rt_mutex_top_waiter(lock))
+  				return 0;
+  		}
+@@@ -403,8 -519,7 +529,12 @@@ static int task_blocks_on_rt_mutex(stru
+  	__rt_mutex_adjust_prio(task);
+  	waiter->task = task;
+  	waiter->lock = lock;
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +	plist_node_init(&waiter->list_entry, task->prio);
+ +	plist_node_init(&waiter->pi_list_entry, task->prio);
+++=======
++ 	waiter->prio = task->prio;
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic):kernel/locking/rtmutex.c
+  
+  	/* Get the top priority waiter on the lock */
+  	if (rt_mutex_has_waiters(lock))
+@@@ -552,7 -665,8 +682,12 @@@ void rt_mutex_adjust_pi(struct task_str
+  	raw_spin_lock_irqsave(&task->pi_lock, flags);
+  
+  	waiter = task->pi_blocked_on;
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +	if (!waiter || waiter->list_entry.prio == task->prio) {
+++=======
++ 	if (!waiter || (waiter->prio == task->prio &&
++ 			!dl_prio(task->prio))) {
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic):kernel/locking/rtmutex.c
+  		raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+  		return;
+  	}
+diff --cc kernel/sched/core.c
+index f167fdc57a94,599ee3b11b44..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -3892,10 -2818,35 +3893,39 @@@ void rt_mutex_setprio(struct task_struc
+  	if (running)
+  		p->sched_class->put_prev_task(rq, p);
+  
+++<<<<<<< HEAD
+ +	if (rt_prio(prio))
+++=======
++ 	/*
++ 	 * Boosting condition are:
++ 	 * 1. -rt task is running and holds mutex A
++ 	 *      --> -dl task blocks on mutex A
++ 	 *
++ 	 * 2. -dl task is running and holds mutex A
++ 	 *      --> -dl task blocks on mutex A and could preempt the
++ 	 *          running task
++ 	 */
++ 	if (dl_prio(prio)) {
++ 		if (!dl_prio(p->normal_prio) || (p->pi_top_task &&
++ 			dl_entity_preempt(&p->pi_top_task->dl, &p->dl))) {
++ 			p->dl.dl_boosted = 1;
++ 			p->dl.dl_throttled = 0;
++ 			enqueue_flag = ENQUEUE_REPLENISH;
++ 		} else
++ 			p->dl.dl_boosted = 0;
++ 		p->sched_class = &dl_sched_class;
++ 	} else if (rt_prio(prio)) {
++ 		if (dl_prio(oldprio))
++ 			p->dl.dl_boosted = 0;
++ 		if (oldprio < prio)
++ 			enqueue_flag = ENQUEUE_HEAD;
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic)
+  		p->sched_class = &rt_sched_class;
+- 	else
++ 	} else {
++ 		if (dl_prio(oldprio))
++ 			p->dl.dl_boosted = 0;
+  		p->sched_class = &fair_sched_class;
++ 	}
+  
+  	p->prio = prio;
+  
+diff --cc kernel/sched/sched.h
+index b976abe32e72,52453a2d0a79..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -87,6 -102,25 +87,28 @@@ static inline int task_has_rt_policy(st
+  	return rt_policy(p->policy);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int task_has_dl_policy(struct task_struct *p)
++ {
++ 	return dl_policy(p->policy);
++ }
++ 
++ static inline int dl_time_before(u64 a, u64 b)
++ {
++ 	return (s64)(a - b) < 0;
++ }
++ 
++ /*
++  * Tells if entity @a should preempt entity @b.
++  */
++ static inline
++ int dl_entity_preempt(struct sched_dl_entity *a, struct sched_dl_entity *b)
++ {
++ 	return dl_time_before(a->deadline, b->deadline);
++ }
++ 
+++>>>>>>> 2d3d891d3344 (sched/deadline: Add SCHED_DEADLINE inheritance logic)
+  /*
+   * This is the priority-queue data structure of the RT scheduling class:
+   */
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path include/linux/sched.h
+diff --git a/include/linux/sched/rt.h b/include/linux/sched/rt.h
+index 440434df3627..34e4ebea8fce 100644
+--- a/include/linux/sched/rt.h
++++ b/include/linux/sched/rt.h
+@@ -35,6 +35,7 @@ static inline int rt_task(struct task_struct *p)
+ #ifdef CONFIG_RT_MUTEXES
+ extern int rt_mutex_getprio(struct task_struct *p);
+ extern void rt_mutex_setprio(struct task_struct *p, int prio);
++extern struct task_struct *rt_mutex_get_top_task(struct task_struct *task);
+ extern void rt_mutex_adjust_pi(struct task_struct *p);
+ static inline bool tsk_is_pi_blocked(struct task_struct *tsk)
+ {
+@@ -45,6 +46,10 @@ static inline int rt_mutex_getprio(struct task_struct *p)
+ {
+ 	return p->normal_prio;
+ }
++static inline struct task_struct *rt_mutex_get_top_task(struct task_struct *task)
++{
++	return NULL;
++}
+ # define rt_mutex_adjust_pi(p)		do { } while (0)
+ static inline bool tsk_is_pi_blocked(struct task_struct *tsk)
+ {
+diff --git a/kernel/fork.c b/kernel/fork.c
+index a14b2bbebc6a..b0cb9ffd30d2 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1108,6 +1108,7 @@ static void rt_mutex_init_task(struct task_struct *p)
+ #ifdef CONFIG_RT_MUTEXES
+ 	plist_head_init(&p->pi_waiters);
+ 	p->pi_blocked_on = NULL;
++	p->pi_top_task = NULL;
+ #endif
+ }
+ 
+* Unmerged path kernel/rtmutex.c
+diff --git a/kernel/rtmutex_common.h b/kernel/rtmutex_common.h
+index 53a66c85261b..f655b80e0cbc 100644
+--- a/kernel/rtmutex_common.h
++++ b/kernel/rtmutex_common.h
+@@ -54,6 +54,7 @@ struct rt_mutex_waiter {
+ 	struct pid		*deadlock_task_pid;
+ 	struct rt_mutex		*deadlock_lock;
+ #endif
++	int prio;
+ };
+ 
+ /*
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/sched.h
+diff --git a/kernel/trace/trace_sched_wakeup.c b/kernel/trace/trace_sched_wakeup.c
+index 090c4d9dcf16..6e32635e5e57 100644
+--- a/kernel/trace/trace_sched_wakeup.c
++++ b/kernel/trace/trace_sched_wakeup.c
+@@ -16,6 +16,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/ftrace.h>
+ #include <linux/sched/rt.h>
++#include <linux/sched/deadline.h>
+ #include <trace/events/sched.h>
+ #include "trace.h"
+ 
