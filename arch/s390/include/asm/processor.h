@@ -179,10 +179,7 @@ static inline unsigned short stap(void)
 /*
  * Give up the time slice of the virtual PU.
  */
-static inline void cpu_relax(void)
-{
-	barrier();
-}
+void cpu_relax(void);
 
 #define arch_mutex_cpu_relax()  barrier()
 
