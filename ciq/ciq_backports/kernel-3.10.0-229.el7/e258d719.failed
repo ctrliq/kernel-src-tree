@@ -1,0 +1,995 @@
+s390/uaccess: always run the kernel in home space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [s390] uaccess: always run the kernel in home space (Hendrik Brueckner) [1099147]
+Rebuild_FUZZ: 94.62%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit e258d719ff28ecc7a048eb8f78380e68c4b3a3f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e258d719.failed
+
+Simplify the uaccess code by removing the user_mode=home option.
+The kernel will now always run in the home space mode.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit e258d719ff28ecc7a048eb8f78380e68c4b3a3f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/ptrace.c
+#	arch/s390/kernel/signal.c
+#	arch/s390/lib/Makefile
+diff --cc arch/s390/kernel/ptrace.c
+index a98157c38e11,e6abd5bd31b0..000000000000
+--- a/arch/s390/kernel/ptrace.c
++++ b/arch/s390/kernel/ptrace.c
+@@@ -190,11 -198,9 +190,15 @@@ static unsigned long __peek_user(struc
+  		 * psw and gprs are stored on the stack
+  		 */
+  		tmp = *(addr_t *)((addr_t) &task_pt_regs(child)->psw + addr);
+ -		if (addr == (addr_t) &dummy->regs.psw.mask)
+ +		if (addr == (addr_t) &dummy->regs.psw.mask) {
+  			/* Return a clean psw mask. */
+++<<<<<<< HEAD
+ +			tmp &= PSW_MASK_USER | PSW_MASK_RI;
+ +			tmp |= psw_user_bits;
+ +		}
+++=======
++ 			tmp = PSW_USER_BITS | (tmp & PSW_MASK_USER);
+++>>>>>>> e258d719ff28 (s390/uaccess: always run the kernel in home space)
+  
+  	} else if (addr < (addr_t) &dummy->regs.orig_gpr2) {
+  		/*
+@@@ -314,15 -321,11 +318,23 @@@ static int __poke_user(struct task_stru
+  		/*
+  		 * psw and gprs are stored on the stack
+  		 */
+++<<<<<<< HEAD
+ +		if (addr == (addr_t) &dummy->regs.psw.mask) {
+ +			unsigned long mask = PSW_MASK_USER;
+ +
+ +			mask |= is_ri_task(child) ? PSW_MASK_RI : 0;
+ +			if ((data & ~mask) != psw_user_bits)
+ +				return -EINVAL;
+ +			if ((data & PSW_MASK_EA) && !(data & PSW_MASK_BA))
+ +				return -EINVAL;
+ +		}
+++=======
++ 		if (addr == (addr_t) &dummy->regs.psw.mask &&
++ 		    ((data & ~PSW_MASK_USER) != PSW_USER_BITS ||
++ 		     ((data & PSW_MASK_EA) && !(data & PSW_MASK_BA))))
++ 			/* Invalid psw mask. */
++ 			return -EINVAL;
+++>>>>>>> e258d719ff28 (s390/uaccess: always run the kernel in home space)
+  		*(addr_t *)((addr_t) &task_pt_regs(child)->psw + addr) = data;
+  
+  	} else if (addr < (addr_t) (&dummy->regs.orig_gpr2)) {
+diff --cc arch/s390/kernel/signal.c
+index a4202e703485,b4fa7c0223e5..000000000000
+--- a/arch/s390/kernel/signal.c
++++ b/arch/s390/kernel/signal.c
+@@@ -57,8 -57,8 +57,13 @@@ static int save_sigregs(struct pt_regs 
+  
+  	/* Copy a 'clean' PSW mask to the user to avoid leaking
+  	   information about whether PER is currently on.  */
+++<<<<<<< HEAD
+ +	user_sregs.regs.psw.mask = psw_user_bits |
+ +		(regs->psw.mask & (PSW_MASK_USER | PSW_MASK_RI));
+++=======
++ 	user_sregs.regs.psw.mask = PSW_USER_BITS |
++ 		(regs->psw.mask & PSW_MASK_USER);
+++>>>>>>> e258d719ff28 (s390/uaccess: always run the kernel in home space)
+  	user_sregs.regs.psw.addr = regs->psw.addr;
+  	memcpy(&user_sregs.regs.gprs, &regs->gprs, sizeof(sregs->regs.gprs));
+  	memcpy(&user_sregs.regs.acrs, current->thread.acrs,
+@@@ -83,22 -82,15 +88,31 @@@ static int restore_sigregs(struct pt_re
+  	/* Alwys make any pending restarted system call return -EINTR */
+  	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+  
+++<<<<<<< HEAD
+ +	if (__copy_from_user(&user_sregs, sregs, sizeof(user_sregs)))
+ +		return -EFAULT;
+ +
+ +	if (!is_ri_task(current) && (user_sregs.regs.psw.mask & PSW_MASK_RI))
+ +		return -EINVAL;
+ +
+ +	/* Loading the floating-point-control word can fail. Do that first. */
+ +	if (restore_fp_ctl(&user_sregs.fpregs.fpc))
+ +		return -EINVAL;
+ +
+ +	/* Use regs->psw.mask instead of psw_user_bits to preserve PER bit. */
+ +	regs->psw.mask = (regs->psw.mask & ~(PSW_MASK_USER | PSW_MASK_RI)) |
+ +		(user_sregs.regs.psw.mask & (PSW_MASK_USER | PSW_MASK_RI));
+++=======
++ 	err = __copy_from_user(&user_sregs, sregs, sizeof(_sigregs));
++ 	if (err)
++ 		return err;
++ 	/* Use regs->psw.mask instead of PSW_USER_BITS to preserve PER bit. */
++ 	regs->psw.mask = (regs->psw.mask & ~PSW_MASK_USER) |
++ 		(user_sregs.regs.psw.mask & PSW_MASK_USER);
+++>>>>>>> e258d719ff28 (s390/uaccess: always run the kernel in home space)
+  	/* Check for invalid user address space control. */
+- 	if ((regs->psw.mask & PSW_MASK_ASC) >= (psw_kernel_bits & PSW_MASK_ASC))
+- 		regs->psw.mask = (psw_user_bits & PSW_MASK_ASC) |
++ 	if ((regs->psw.mask & PSW_MASK_ASC) == PSW_ASC_HOME)
++ 		regs->psw.mask = PSW_ASC_PRIMARY |
+  			(regs->psw.mask & ~PSW_MASK_ASC);
+  	/* Check for invalid amode */
+  	if (regs->psw.mask & PSW_MASK_EA)
+diff --cc arch/s390/lib/Makefile
+index 20b0e97a7df2,b068729e50ac..000000000000
+--- a/arch/s390/lib/Makefile
++++ b/arch/s390/lib/Makefile
+@@@ -2,7 -2,7 +2,11 @@@
+  # Makefile for s390-specific library files..
+  #
+  
+++<<<<<<< HEAD
+ +lib-y += delay.o string.o uaccess_std.o uaccess_pt.o
+++=======
++ lib-y += delay.o string.o uaccess_pt.o find.o
+++>>>>>>> e258d719ff28 (s390/uaccess: always run the kernel in home space)
+  obj-$(CONFIG_32BIT) += div64.o qrnnd.o ucmpdi2.o mem32.o
+  obj-$(CONFIG_64BIT) += mem64.o
+  lib-$(CONFIG_64BIT) += uaccess_mvcos.o
+diff --git a/arch/s390/include/asm/mmu_context.h b/arch/s390/include/asm/mmu_context.h
+index 4fb67a0e4ddf..62ad36558015 100644
+--- a/arch/s390/include/asm/mmu_context.h
++++ b/arch/s390/include/asm/mmu_context.h
+@@ -40,14 +40,8 @@ static inline void update_mm(struct mm_struct *mm, struct task_struct *tsk)
+ 	pgd_t *pgd = mm->pgd;
+ 
+ 	S390_lowcore.user_asce = mm->context.asce_bits | __pa(pgd);
+-	if (s390_user_mode != HOME_SPACE_MODE) {
+-		/* Load primary space page table origin. */
+-		asm volatile(LCTL_OPCODE" 1,1,%0\n"
+-			     : : "m" (S390_lowcore.user_asce) );
+-	} else
+-		/* Load home space page table origin. */
+-		asm volatile(LCTL_OPCODE" 13,13,%0"
+-			     : : "m" (S390_lowcore.user_asce) );
++	/* Load primary space page table origin. */
++	asm volatile(LCTL_OPCODE" 1,1,%0\n" : : "m" (S390_lowcore.user_asce));
+ 	set_fs(current->thread.mm_segment);
+ }
+ 
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index a34b2636d337..8879150e41e8 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -126,14 +126,14 @@ struct stack_frame {
+  * Do necessary setup to start up a new thread.
+  */
+ #define start_thread(regs, new_psw, new_stackp) do {			\
+-	regs->psw.mask	= psw_user_bits | PSW_MASK_EA | PSW_MASK_BA;	\
++	regs->psw.mask	= PSW_USER_BITS | PSW_MASK_EA | PSW_MASK_BA;	\
+ 	regs->psw.addr	= new_psw | PSW_ADDR_AMODE;			\
+ 	regs->gprs[15]	= new_stackp;					\
+ 	execve_tail();							\
+ } while (0)
+ 
+ #define start_thread31(regs, new_psw, new_stackp) do {			\
+-	regs->psw.mask	= psw_user_bits | PSW_MASK_BA;			\
++	regs->psw.mask	= PSW_USER_BITS | PSW_MASK_BA;			\
+ 	regs->psw.addr	= new_psw | PSW_ADDR_AMODE;			\
+ 	regs->gprs[15]	= new_stackp;					\
+ 	crst_table_downgrade(current->mm, 1UL << 31);			\
+@@ -341,9 +341,9 @@ __set_psw_mask(unsigned long mask)
+ }
+ 
+ #define local_mcck_enable() \
+-	__set_psw_mask(psw_kernel_bits | PSW_MASK_DAT | PSW_MASK_MCHECK)
++	__set_psw_mask(PSW_KERNEL_BITS | PSW_MASK_DAT | PSW_MASK_MCHECK)
+ #define local_mcck_disable() \
+-	__set_psw_mask(psw_kernel_bits | PSW_MASK_DAT)
++	__set_psw_mask(PSW_KERNEL_BITS | PSW_MASK_DAT)
+ 
+ /*
+  * Basic Machine Check/Program Check Handler.
+diff --git a/arch/s390/include/asm/ptrace.h b/arch/s390/include/asm/ptrace.h
+index 559512a455da..d78639e76a2a 100644
+--- a/arch/s390/include/asm/ptrace.h
++++ b/arch/s390/include/asm/ptrace.h
+@@ -10,8 +10,11 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
+-extern long psw_kernel_bits;
+-extern long psw_user_bits;
++#define PSW_KERNEL_BITS	(PSW_DEFAULT_KEY | PSW_MASK_BASE | PSW_ASC_HOME | \
++			 PSW_MASK_EA | PSW_MASK_BA)
++#define PSW_USER_BITS	(PSW_MASK_DAT | PSW_MASK_IO | PSW_MASK_EXT | \
++			 PSW_DEFAULT_KEY | PSW_MASK_BASE | PSW_MASK_MCHECK | \
++			 PSW_MASK_PSTATE | PSW_ASC_PRIMARY)
+ 
+ /*
+  * The pt_regs struct defines the way the registers are stored on
+diff --git a/arch/s390/include/asm/setup.h b/arch/s390/include/asm/setup.h
+index 28cda86bf38e..94cfbe442f12 100644
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -48,13 +48,6 @@ void detect_memory_layout(struct mem_chunk chunk[], unsigned long maxsize);
+ void create_mem_hole(struct mem_chunk mem_chunk[], unsigned long addr,
+ 		     unsigned long size);
+ 
+-#define PRIMARY_SPACE_MODE	0
+-#define ACCESS_REGISTER_MODE	1
+-#define SECONDARY_SPACE_MODE	2
+-#define HOME_SPACE_MODE		3
+-
+-extern unsigned int s390_user_mode;
+-
+ /*
+  * Machine features detected in head.S
+  */
+diff --git a/arch/s390/include/asm/uaccess.h b/arch/s390/include/asm/uaccess.h
+index 9c33ed4e666f..79330af9a5f8 100644
+--- a/arch/s390/include/asm/uaccess.h
++++ b/arch/s390/include/asm/uaccess.h
+@@ -94,9 +94,7 @@ static inline unsigned long extable_fixup(const struct exception_table_entry *x)
+ 
+ struct uaccess_ops {
+ 	size_t (*copy_from_user)(size_t, const void __user *, void *);
+-	size_t (*copy_from_user_small)(size_t, const void __user *, void *);
+ 	size_t (*copy_to_user)(size_t, void __user *, const void *);
+-	size_t (*copy_to_user_small)(size_t, void __user *, const void *);
+ 	size_t (*copy_in_user)(size_t, void __user *, const void __user *);
+ 	size_t (*clear_user)(size_t, void __user *);
+ 	size_t (*strnlen_user)(size_t, const char __user *);
+@@ -106,22 +104,20 @@ struct uaccess_ops {
+ };
+ 
+ extern struct uaccess_ops uaccess;
+-extern struct uaccess_ops uaccess_std;
+ extern struct uaccess_ops uaccess_mvcos;
+-extern struct uaccess_ops uaccess_mvcos_switch;
+ extern struct uaccess_ops uaccess_pt;
+ 
+ extern int __handle_fault(unsigned long, unsigned long, int);
+ 
+ static inline int __put_user_fn(size_t size, void __user *ptr, void *x)
+ {
+-	size = uaccess.copy_to_user_small(size, ptr, x);
++	size = uaccess.copy_to_user(size, ptr, x);
+ 	return size ? -EFAULT : size;
+ }
+ 
+ static inline int __get_user_fn(size_t size, const void __user *ptr, void *x)
+ {
+-	size = uaccess.copy_from_user_small(size, ptr, x);
++	size = uaccess.copy_from_user(size, ptr, x);
+ 	return size ? -EFAULT : size;
+ }
+ 
+@@ -226,10 +222,7 @@ extern int __get_user_bad(void) __attribute__((noreturn));
+ static inline unsigned long __must_check
+ __copy_to_user(void __user *to, const void *from, unsigned long n)
+ {
+-	if (__builtin_constant_p(n) && (n <= 256))
+-		return uaccess.copy_to_user_small(n, to, from);
+-	else
+-		return uaccess.copy_to_user(n, to, from);
++	return uaccess.copy_to_user(n, to, from);
+ }
+ 
+ #define __copy_to_user_inatomic __copy_to_user
+@@ -275,10 +268,7 @@ copy_to_user(void __user *to, const void *from, unsigned long n)
+ static inline unsigned long __must_check
+ __copy_from_user(void *to, const void __user *from, unsigned long n)
+ {
+-	if (__builtin_constant_p(n) && (n <= 256))
+-		return uaccess.copy_from_user_small(n, from, to);
+-	else
+-		return uaccess.copy_from_user(n, from, to);
++	return uaccess.copy_from_user(n, from, to);
+ }
+ 
+ extern void copy_from_user_overflow(void)
+diff --git a/arch/s390/kernel/compat_signal.c b/arch/s390/kernel/compat_signal.c
+index 09850da9dc10..958818cf4771 100644
+--- a/arch/s390/kernel/compat_signal.c
++++ b/arch/s390/kernel/compat_signal.c
+@@ -199,8 +199,8 @@ static int restore_sigregs32(struct pt_regs *regs,_sigregs32 __user *sregs)
+ 		(__u64)(user_sregs.regs.psw.mask & PSW32_MASK_RI) << 32 |
+ 		(__u64)(user_sregs.regs.psw.addr & PSW32_ADDR_AMODE);
+ 	/* Check for invalid user address space control. */
+-	if ((regs->psw.mask & PSW_MASK_ASC) >= (psw_kernel_bits & PSW_MASK_ASC))
+-		regs->psw.mask = (psw_user_bits & PSW_MASK_ASC) |
++	if ((regs->psw.mask & PSW_MASK_ASC) == PSW_ASC_HOME)
++		regs->psw.mask = PSW_ASC_PRIMARY |
+ 			(regs->psw.mask & ~PSW_MASK_ASC);
+ 	regs->psw.addr = (__u64)(user_sregs.regs.psw.addr & PSW32_ADDR_INSN);
+ 	for (i = 0; i < NUM_GPRS; i++)
+@@ -357,7 +357,7 @@ static int setup_frame32(int sig, struct k_sigaction *ka,
+ 	regs->gprs[15] = (__force __u64) frame;
+ 	/* Force 31 bit amode and default user address space control. */
+ 	regs->psw.mask = PSW_MASK_BA |
+-		(psw_user_bits & PSW_MASK_ASC) |
++		(PSW_USER_BITS & PSW_MASK_ASC) |
+ 		(regs->psw.mask & ~PSW_MASK_ASC);
+ 	regs->psw.addr = (__force __u64) ka->sa.sa_handler;
+ 
+@@ -424,7 +424,7 @@ static int setup_rt_frame32(int sig, struct k_sigaction *ka, siginfo_t *info,
+ 	regs->gprs[15] = (__force __u64) frame;
+ 	/* Force 31 bit amode and default user address space control. */
+ 	regs->psw.mask = PSW_MASK_BA |
+-		(psw_user_bits & PSW_MASK_ASC) |
++		(PSW_USER_BITS & PSW_MASK_ASC) |
+ 		(regs->psw.mask & ~PSW_MASK_ASC);
+ 	regs->psw.addr = (__u64) ka->sa.sa_handler;
+ 
+diff --git a/arch/s390/kernel/ipl.c b/arch/s390/kernel/ipl.c
+index feb719d3c851..633ca7504536 100644
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -2051,12 +2051,12 @@ void s390_reset_system(void (*func)(void *), void *data)
+ 	__ctl_clear_bit(0,28);
+ 
+ 	/* Set new machine check handler */
+-	S390_lowcore.mcck_new_psw.mask = psw_kernel_bits | PSW_MASK_DAT;
++	S390_lowcore.mcck_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_DAT;
+ 	S390_lowcore.mcck_new_psw.addr =
+ 		PSW_ADDR_AMODE | (unsigned long) s390_base_mcck_handler;
+ 
+ 	/* Set new program check handler */
+-	S390_lowcore.program_new_psw.mask = psw_kernel_bits | PSW_MASK_DAT;
++	S390_lowcore.program_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_DAT;
+ 	S390_lowcore.program_new_psw.addr =
+ 		PSW_ADDR_AMODE | (unsigned long) s390_base_pgm_handler;
+ 
+diff --git a/arch/s390/kernel/process.c b/arch/s390/kernel/process.c
+index a2e8819f74e9..7ed0d4e2a435 100644
+--- a/arch/s390/kernel/process.c
++++ b/arch/s390/kernel/process.c
+@@ -139,7 +139,7 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
+ 	if (unlikely(p->flags & PF_KTHREAD)) {
+ 		/* kernel thread */
+ 		memset(&frame->childregs, 0, sizeof(struct pt_regs));
+-		frame->childregs.psw.mask = psw_kernel_bits | PSW_MASK_DAT |
++		frame->childregs.psw.mask = PSW_KERNEL_BITS | PSW_MASK_DAT |
+ 				PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
+ 		frame->childregs.psw.addr = PSW_ADDR_AMODE |
+ 				(unsigned long) kernel_thread_starter;
+* Unmerged path arch/s390/kernel/ptrace.c
+diff --git a/arch/s390/kernel/runtime_instr.c b/arch/s390/kernel/runtime_instr.c
+index 077a99389b07..040d596c7c47 100644
+--- a/arch/s390/kernel/runtime_instr.c
++++ b/arch/s390/kernel/runtime_instr.c
+@@ -40,8 +40,6 @@ static void disable_runtime_instr(void)
+ static void init_runtime_instr_cb(struct runtime_instr_cb *cb)
+ {
+ 	cb->buf_limit = 0xfff;
+-	if (s390_user_mode == HOME_SPACE_MODE)
+-		cb->home_space = 1;
+ 	cb->int_requested = 1;
+ 	cb->pstate = 1;
+ 	cb->pstate_set_buf = 1;
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 77adf32d5eaa..1a68794eb912 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -64,12 +64,6 @@
+ #include <asm/sclp.h>
+ #include "entry.h"
+ 
+-long psw_kernel_bits	= PSW_DEFAULT_KEY | PSW_MASK_BASE | PSW_ASC_PRIMARY |
+-			  PSW_MASK_EA | PSW_MASK_BA;
+-long psw_user_bits	= PSW_MASK_DAT | PSW_MASK_IO | PSW_MASK_EXT |
+-			  PSW_DEFAULT_KEY | PSW_MASK_BASE | PSW_MASK_MCHECK |
+-			  PSW_MASK_PSTATE | PSW_ASC_HOME;
+-
+ /*
+  * User copy operations.
+  */
+@@ -300,43 +294,14 @@ static int __init parse_vmalloc(char *arg)
+ }
+ early_param("vmalloc", parse_vmalloc);
+ 
+-unsigned int s390_user_mode = PRIMARY_SPACE_MODE;
+-EXPORT_SYMBOL_GPL(s390_user_mode);
+-
+-static void __init set_user_mode_primary(void)
+-{
+-	psw_kernel_bits = (psw_kernel_bits & ~PSW_MASK_ASC) | PSW_ASC_HOME;
+-	psw_user_bits = (psw_user_bits & ~PSW_MASK_ASC) | PSW_ASC_PRIMARY;
+-#ifdef CONFIG_COMPAT
+-	psw32_user_bits =
+-		(psw32_user_bits & ~PSW32_MASK_ASC) | PSW32_ASC_PRIMARY;
+-#endif
+-	uaccess = MACHINE_HAS_MVCOS ? uaccess_mvcos_switch : uaccess_pt;
+-}
+-
+ static int __init early_parse_user_mode(char *p)
+ {
+-	if (p && strcmp(p, "primary") == 0)
+-		s390_user_mode = PRIMARY_SPACE_MODE;
+-	else if (!p || strcmp(p, "home") == 0)
+-		s390_user_mode = HOME_SPACE_MODE;
+-	else
+-		return 1;
+-	return 0;
++	if (!p || strcmp(p, "primary") == 0)
++		return 0;
++	return 1;
+ }
+ early_param("user_mode", early_parse_user_mode);
+ 
+-static void __init setup_addressing_mode(void)
+-{
+-	if (s390_user_mode != PRIMARY_SPACE_MODE)
+-		return;
+-	set_user_mode_primary();
+-	if (MACHINE_HAS_MVCOS)
+-		pr_info("Address spaces switched, mvcos available\n");
+-	else
+-		pr_info("Address spaces switched, mvcos not available\n");
+-}
+-
+ void *restart_stack __attribute__((__section__(".data")));
+ 
+ static void __init setup_lowcore(void)
+@@ -348,24 +313,24 @@ static void __init setup_lowcore(void)
+ 	 */
+ 	BUILD_BUG_ON(sizeof(struct _lowcore) != LC_PAGES * 4096);
+ 	lc = __alloc_bootmem_low(LC_PAGES * PAGE_SIZE, LC_PAGES * PAGE_SIZE, 0);
+-	lc->restart_psw.mask = psw_kernel_bits;
++	lc->restart_psw.mask = PSW_KERNEL_BITS;
+ 	lc->restart_psw.addr =
+ 		PSW_ADDR_AMODE | (unsigned long) restart_int_handler;
+-	lc->external_new_psw.mask = psw_kernel_bits |
++	lc->external_new_psw.mask = PSW_KERNEL_BITS |
+ 		PSW_MASK_DAT | PSW_MASK_MCHECK;
+ 	lc->external_new_psw.addr =
+ 		PSW_ADDR_AMODE | (unsigned long) ext_int_handler;
+-	lc->svc_new_psw.mask = psw_kernel_bits |
++	lc->svc_new_psw.mask = PSW_KERNEL_BITS |
+ 		PSW_MASK_DAT | PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
+ 	lc->svc_new_psw.addr = PSW_ADDR_AMODE | (unsigned long) system_call;
+-	lc->program_new_psw.mask = psw_kernel_bits |
++	lc->program_new_psw.mask = PSW_KERNEL_BITS |
+ 		PSW_MASK_DAT | PSW_MASK_MCHECK;
+ 	lc->program_new_psw.addr =
+ 		PSW_ADDR_AMODE | (unsigned long) pgm_check_handler;
+-	lc->mcck_new_psw.mask = psw_kernel_bits;
++	lc->mcck_new_psw.mask = PSW_KERNEL_BITS;
+ 	lc->mcck_new_psw.addr =
+ 		PSW_ADDR_AMODE | (unsigned long) mcck_int_handler;
+-	lc->io_new_psw.mask = psw_kernel_bits |
++	lc->io_new_psw.mask = PSW_KERNEL_BITS |
+ 		PSW_MASK_DAT | PSW_MASK_MCHECK;
+ 	lc->io_new_psw.addr = PSW_ADDR_AMODE | (unsigned long) io_int_handler;
+ 	lc->clock_comparator = -1ULL;
+@@ -1048,10 +1013,7 @@ void __init setup_arch(char **cmdline_p)
+ 	init_mm.end_data = (unsigned long) &_edata;
+ 	init_mm.brk = (unsigned long) &_end;
+ 
+-	if (MACHINE_HAS_MVCOS)
+-		memcpy(&uaccess, &uaccess_mvcos, sizeof(uaccess));
+-	else
+-		memcpy(&uaccess, &uaccess_std, sizeof(uaccess));
++	uaccess = MACHINE_HAS_MVCOS ? uaccess_mvcos : uaccess_pt;
+ 
+ 	parse_early_param();
+ 	detect_memory_layout(memory_chunk, memory_end);
+@@ -1059,7 +1021,6 @@ void __init setup_arch(char **cmdline_p)
+ 	setup_ipl();
+ 	reserve_oldmem();
+ 	setup_memory_end();
+-	setup_addressing_mode();
+ 	reserve_crashkernel();
+ 	setup_memory();
+ 	setup_resources();
+* Unmerged path arch/s390/kernel/signal.c
+diff --git a/arch/s390/kernel/smp.c b/arch/s390/kernel/smp.c
+index b1956e25a26b..4d78f1bd2d7d 100644
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -284,7 +284,7 @@ static void pcpu_delegate(struct pcpu *pcpu, void (*func)(void *),
+ 	struct _lowcore *lc = lowcore_ptr[pcpu - pcpu_devices];
+ 	unsigned long source_cpu = stap();
+ 
+-	__load_psw_mask(psw_kernel_bits);
++	__load_psw_mask(PSW_KERNEL_BITS);
+ 	if (pcpu->address == source_cpu)
+ 		func(data);	/* should not return */
+ 	/* Stop target cpu (if func returns this stops the current cpu). */
+@@ -396,7 +396,7 @@ void smp_send_stop(void)
+ 	int cpu;
+ 
+ 	/* Disable all interrupts/machine checks */
+-	__load_psw_mask(psw_kernel_bits | PSW_MASK_DAT);
++	__load_psw_mask(PSW_KERNEL_BITS | PSW_MASK_DAT);
+ 	trace_hardirqs_off();
+ 
+ 	debug_set_critical();
+@@ -696,7 +696,7 @@ static void smp_start_secondary(void *cpuvoid)
+ 	S390_lowcore.restart_source = -1UL;
+ 	restore_access_regs(S390_lowcore.access_regs_save_area);
+ 	__ctl_load(S390_lowcore.cregs_save_area, 0, 15);
+-	__load_psw_mask(psw_kernel_bits | PSW_MASK_DAT);
++	__load_psw_mask(PSW_KERNEL_BITS | PSW_MASK_DAT);
+ 	cpu_init();
+ 	preempt_disable();
+ 	init_cpu_timer();
+diff --git a/arch/s390/kernel/vdso.c b/arch/s390/kernel/vdso.c
+index 70f6093d37d0..176f909b1c82 100644
+--- a/arch/s390/kernel/vdso.c
++++ b/arch/s390/kernel/vdso.c
+@@ -84,8 +84,7 @@ struct vdso_data *vdso_data = &vdso_data_store.data;
+  */
+ static void vdso_init_data(struct vdso_data *vd)
+ {
+-	vd->ectg_available =
+-		s390_user_mode != HOME_SPACE_MODE && test_facility(31);
++	vd->ectg_available = test_facility(31);
+ }
+ 
+ #ifdef CONFIG_64BIT
+@@ -102,7 +101,7 @@ int vdso_alloc_per_cpu(struct _lowcore *lowcore)
+ 
+ 	lowcore->vdso_per_cpu_data = __LC_PASTE;
+ 
+-	if (s390_user_mode == HOME_SPACE_MODE || !vdso_enabled)
++	if (!vdso_enabled)
+ 		return 0;
+ 
+ 	segment_table = __get_free_pages(GFP_KERNEL, SEGMENT_ORDER);
+@@ -147,7 +146,7 @@ void vdso_free_per_cpu(struct _lowcore *lowcore)
+ 	unsigned long segment_table, page_table, page_frame;
+ 	u32 *psal, *aste;
+ 
+-	if (s390_user_mode == HOME_SPACE_MODE || !vdso_enabled)
++	if (!vdso_enabled)
+ 		return;
+ 
+ 	psal = (u32 *)(addr_t) lowcore->paste[4];
+@@ -165,7 +164,7 @@ static void vdso_init_cr5(void)
+ {
+ 	unsigned long cr5;
+ 
+-	if (s390_user_mode == HOME_SPACE_MODE || !vdso_enabled)
++	if (!vdso_enabled)
+ 		return;
+ 	cr5 = offsetof(struct _lowcore, paste);
+ 	__ctl_load(cr5, 5, 5);
+diff --git a/arch/s390/kernel/vtime.c b/arch/s390/kernel/vtime.c
+index bb06a76040bf..8c34363d6f1e 100644
+--- a/arch/s390/kernel/vtime.c
++++ b/arch/s390/kernel/vtime.c
+@@ -161,7 +161,7 @@ void __kprobes vtime_stop_cpu(void)
+ 	trace_hardirqs_on();
+ 
+ 	/* Wait for external, I/O or machine check interrupt. */
+-	psw_mask = psw_kernel_bits | PSW_MASK_WAIT | PSW_MASK_DAT |
++	psw_mask = PSW_KERNEL_BITS | PSW_MASK_WAIT | PSW_MASK_DAT |
+ 		PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
+ 	idle->nohz_delay = 0;
+ 
+* Unmerged path arch/s390/lib/Makefile
+diff --git a/arch/s390/lib/uaccess_mvcos.c b/arch/s390/lib/uaccess_mvcos.c
+index 1829742bf479..4b7993bf69b9 100644
+--- a/arch/s390/lib/uaccess_mvcos.c
++++ b/arch/s390/lib/uaccess_mvcos.c
+@@ -65,13 +65,6 @@ static size_t copy_from_user_mvcos(size_t size, const void __user *ptr, void *x)
+ 	return size;
+ }
+ 
+-static size_t copy_from_user_mvcos_check(size_t size, const void __user *ptr, void *x)
+-{
+-	if (size <= 256)
+-		return copy_from_user_std(size, ptr, x);
+-	return copy_from_user_mvcos(size, ptr, x);
+-}
+-
+ static size_t copy_to_user_mvcos(size_t size, void __user *ptr, const void *x)
+ {
+ 	register unsigned long reg0 asm("0") = 0x810000UL;
+@@ -101,14 +94,6 @@ static size_t copy_to_user_mvcos(size_t size, void __user *ptr, const void *x)
+ 	return size;
+ }
+ 
+-static size_t copy_to_user_mvcos_check(size_t size, void __user *ptr,
+-				       const void *x)
+-{
+-	if (size <= 256)
+-		return copy_to_user_std(size, ptr, x);
+-	return copy_to_user_mvcos(size, ptr, x);
+-}
+-
+ static size_t copy_in_user_mvcos(size_t size, void __user *to,
+ 				 const void __user *from)
+ {
+@@ -201,23 +186,8 @@ static size_t strncpy_from_user_mvcos(size_t count, const char __user *src,
+ }
+ 
+ struct uaccess_ops uaccess_mvcos = {
+-	.copy_from_user = copy_from_user_mvcos_check,
+-	.copy_from_user_small = copy_from_user_std,
+-	.copy_to_user = copy_to_user_mvcos_check,
+-	.copy_to_user_small = copy_to_user_std,
+-	.copy_in_user = copy_in_user_mvcos,
+-	.clear_user = clear_user_mvcos,
+-	.strnlen_user = strnlen_user_std,
+-	.strncpy_from_user = strncpy_from_user_std,
+-	.futex_atomic_op = futex_atomic_op_std,
+-	.futex_atomic_cmpxchg = futex_atomic_cmpxchg_std,
+-};
+-
+-struct uaccess_ops uaccess_mvcos_switch = {
+ 	.copy_from_user = copy_from_user_mvcos,
+-	.copy_from_user_small = copy_from_user_mvcos,
+ 	.copy_to_user = copy_to_user_mvcos,
+-	.copy_to_user_small = copy_to_user_mvcos,
+ 	.copy_in_user = copy_in_user_mvcos,
+ 	.clear_user = clear_user_mvcos,
+ 	.strnlen_user = strnlen_user_mvcos,
+diff --git a/arch/s390/lib/uaccess_pt.c b/arch/s390/lib/uaccess_pt.c
+index 1bf40ef57cf6..b74ca95d6a86 100644
+--- a/arch/s390/lib/uaccess_pt.c
++++ b/arch/s390/lib/uaccess_pt.c
+@@ -464,9 +464,7 @@ int futex_atomic_cmpxchg_pt(u32 *uval, u32 __user *uaddr,
+ 
+ struct uaccess_ops uaccess_pt = {
+ 	.copy_from_user		= copy_from_user_pt,
+-	.copy_from_user_small	= copy_from_user_pt,
+ 	.copy_to_user		= copy_to_user_pt,
+-	.copy_to_user_small	= copy_to_user_pt,
+ 	.copy_in_user		= copy_in_user_pt,
+ 	.clear_user		= clear_user_pt,
+ 	.strnlen_user		= strnlen_user_pt,
+diff --git a/arch/s390/lib/uaccess_std.c b/arch/s390/lib/uaccess_std.c
+deleted file mode 100644
+index 4a75d475b06a..000000000000
+--- a/arch/s390/lib/uaccess_std.c
++++ /dev/null
+@@ -1,305 +0,0 @@
+-/*
+- *  Standard user space access functions based on mvcp/mvcs and doing
+- *  interesting things in the secondary space mode.
+- *
+- *    Copyright IBM Corp. 2006
+- *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
+- *		 Gerald Schaefer (gerald.schaefer@de.ibm.com)
+- */
+-
+-#include <linux/errno.h>
+-#include <linux/mm.h>
+-#include <linux/uaccess.h>
+-#include <asm/futex.h>
+-#include "uaccess.h"
+-
+-#ifndef CONFIG_64BIT
+-#define AHI	"ahi"
+-#define ALR	"alr"
+-#define CLR	"clr"
+-#define LHI	"lhi"
+-#define SLR	"slr"
+-#else
+-#define AHI	"aghi"
+-#define ALR	"algr"
+-#define CLR	"clgr"
+-#define LHI	"lghi"
+-#define SLR	"slgr"
+-#endif
+-
+-size_t copy_from_user_std(size_t size, const void __user *ptr, void *x)
+-{
+-	unsigned long tmp1, tmp2;
+-
+-	tmp1 = -256UL;
+-	asm volatile(
+-		"0: mvcp  0(%0,%2),0(%1),%3\n"
+-		"10:jz    8f\n"
+-		"1:"ALR"  %0,%3\n"
+-		"   la    %1,256(%1)\n"
+-		"   la    %2,256(%2)\n"
+-		"2: mvcp  0(%0,%2),0(%1),%3\n"
+-		"11:jnz   1b\n"
+-		"   j     8f\n"
+-		"3: la    %4,255(%1)\n"	/* %4 = ptr + 255 */
+-		"  "LHI"  %3,-4096\n"
+-		"   nr    %4,%3\n"	/* %4 = (ptr + 255) & -4096 */
+-		"  "SLR"  %4,%1\n"
+-		"  "CLR"  %0,%4\n"	/* copy crosses next page boundary? */
+-		"   jnh   5f\n"
+-		"4: mvcp  0(%4,%2),0(%1),%3\n"
+-		"12:"SLR"  %0,%4\n"
+-		"  "ALR"  %2,%4\n"
+-		"5:"LHI"  %4,-1\n"
+-		"  "ALR"  %4,%0\n"	/* copy remaining size, subtract 1 */
+-		"   bras  %3,7f\n"	/* memset loop */
+-		"   xc    0(1,%2),0(%2)\n"
+-		"6: xc    0(256,%2),0(%2)\n"
+-		"   la    %2,256(%2)\n"
+-		"7:"AHI"  %4,-256\n"
+-		"   jnm   6b\n"
+-		"   ex    %4,0(%3)\n"
+-		"   j     9f\n"
+-		"8:"SLR"  %0,%0\n"
+-		"9: \n"
+-		EX_TABLE(0b,3b) EX_TABLE(2b,3b) EX_TABLE(4b,5b)
+-		EX_TABLE(10b,3b) EX_TABLE(11b,3b) EX_TABLE(12b,5b)
+-		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
+-		: : "cc", "memory");
+-	return size;
+-}
+-
+-static size_t copy_from_user_std_check(size_t size, const void __user *ptr,
+-				       void *x)
+-{
+-	if (size <= 1024)
+-		return copy_from_user_std(size, ptr, x);
+-	return copy_from_user_pt(size, ptr, x);
+-}
+-
+-size_t copy_to_user_std(size_t size, void __user *ptr, const void *x)
+-{
+-	unsigned long tmp1, tmp2;
+-
+-	tmp1 = -256UL;
+-	asm volatile(
+-		"0: mvcs  0(%0,%1),0(%2),%3\n"
+-		"7: jz    5f\n"
+-		"1:"ALR"  %0,%3\n"
+-		"   la    %1,256(%1)\n"
+-		"   la    %2,256(%2)\n"
+-		"2: mvcs  0(%0,%1),0(%2),%3\n"
+-		"8: jnz   1b\n"
+-		"   j     5f\n"
+-		"3: la    %4,255(%1)\n" /* %4 = ptr + 255 */
+-		"  "LHI"  %3,-4096\n"
+-		"   nr    %4,%3\n"	/* %4 = (ptr + 255) & -4096 */
+-		"  "SLR"  %4,%1\n"
+-		"  "CLR"  %0,%4\n"	/* copy crosses next page boundary? */
+-		"   jnh   6f\n"
+-		"4: mvcs  0(%4,%1),0(%2),%3\n"
+-		"9:"SLR"  %0,%4\n"
+-		"   j     6f\n"
+-		"5:"SLR"  %0,%0\n"
+-		"6: \n"
+-		EX_TABLE(0b,3b) EX_TABLE(2b,3b) EX_TABLE(4b,6b)
+-		EX_TABLE(7b,3b) EX_TABLE(8b,3b) EX_TABLE(9b,6b)
+-		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
+-		: : "cc", "memory");
+-	return size;
+-}
+-
+-static size_t copy_to_user_std_check(size_t size, void __user *ptr,
+-				     const void *x)
+-{
+-	if (size <= 1024)
+-		return copy_to_user_std(size, ptr, x);
+-	return copy_to_user_pt(size, ptr, x);
+-}
+-
+-static size_t copy_in_user_std(size_t size, void __user *to,
+-			       const void __user *from)
+-{
+-	unsigned long tmp1;
+-
+-	asm volatile(
+-		"   sacf  256\n"
+-		"  "AHI"  %0,-1\n"
+-		"   jo    5f\n"
+-		"   bras  %3,3f\n"
+-		"0:"AHI"  %0,257\n"
+-		"1: mvc   0(1,%1),0(%2)\n"
+-		"   la    %1,1(%1)\n"
+-		"   la    %2,1(%2)\n"
+-		"  "AHI"  %0,-1\n"
+-		"   jnz   1b\n"
+-		"   j     5f\n"
+-		"2: mvc   0(256,%1),0(%2)\n"
+-		"   la    %1,256(%1)\n"
+-		"   la    %2,256(%2)\n"
+-		"3:"AHI"  %0,-256\n"
+-		"   jnm   2b\n"
+-		"4: ex    %0,1b-0b(%3)\n"
+-		"5: "SLR"  %0,%0\n"
+-		"6: sacf  0\n"
+-		EX_TABLE(1b,6b) EX_TABLE(2b,0b) EX_TABLE(4b,0b)
+-		: "+a" (size), "+a" (to), "+a" (from), "=a" (tmp1)
+-		: : "cc", "memory");
+-	return size;
+-}
+-
+-static size_t clear_user_std(size_t size, void __user *to)
+-{
+-	unsigned long tmp1, tmp2;
+-
+-	asm volatile(
+-		"   sacf  256\n"
+-		"  "AHI"  %0,-1\n"
+-		"   jo    5f\n"
+-		"   bras  %3,3f\n"
+-		"   xc    0(1,%1),0(%1)\n"
+-		"0:"AHI"  %0,257\n"
+-		"   la    %2,255(%1)\n" /* %2 = ptr + 255 */
+-		"   srl   %2,12\n"
+-		"   sll   %2,12\n"	/* %2 = (ptr + 255) & -4096 */
+-		"  "SLR"  %2,%1\n"
+-		"  "CLR"  %0,%2\n"	/* clear crosses next page boundary? */
+-		"   jnh   5f\n"
+-		"  "AHI"  %2,-1\n"
+-		"1: ex    %2,0(%3)\n"
+-		"  "AHI"  %2,1\n"
+-		"  "SLR"  %0,%2\n"
+-		"   j     5f\n"
+-		"2: xc    0(256,%1),0(%1)\n"
+-		"   la    %1,256(%1)\n"
+-		"3:"AHI"  %0,-256\n"
+-		"   jnm   2b\n"
+-		"4: ex    %0,0(%3)\n"
+-		"5: "SLR"  %0,%0\n"
+-		"6: sacf  0\n"
+-		EX_TABLE(1b,6b) EX_TABLE(2b,0b) EX_TABLE(4b,0b)
+-		: "+a" (size), "+a" (to), "=a" (tmp1), "=a" (tmp2)
+-		: : "cc", "memory");
+-	return size;
+-}
+-
+-size_t strnlen_user_std(size_t size, const char __user *src)
+-{
+-	register unsigned long reg0 asm("0") = 0UL;
+-	unsigned long tmp1, tmp2;
+-
+-	if (unlikely(!size))
+-		return 0;
+-	asm volatile(
+-		"   la    %2,0(%1)\n"
+-		"   la    %3,0(%0,%1)\n"
+-		"  "SLR"  %0,%0\n"
+-		"   sacf  256\n"
+-		"0: srst  %3,%2\n"
+-		"   jo    0b\n"
+-		"   la    %0,1(%3)\n"	/* strnlen_user results includes \0 */
+-		"  "SLR"  %0,%1\n"
+-		"1: sacf  0\n"
+-		EX_TABLE(0b,1b)
+-		: "+a" (size), "+a" (src), "=a" (tmp1), "=a" (tmp2)
+-		: "d" (reg0) : "cc", "memory");
+-	return size;
+-}
+-
+-size_t strncpy_from_user_std(size_t count, const char __user *src, char *dst)
+-{
+-	size_t done, len, offset, len_str;
+-
+-	if (unlikely(!count))
+-		return 0;
+-	done = 0;
+-	do {
+-		offset = (size_t)src & ~PAGE_MASK;
+-		len = min(count - done, PAGE_SIZE - offset);
+-		if (copy_from_user_std(len, src, dst))
+-			return -EFAULT;
+-		len_str = strnlen(dst, len);
+-		done += len_str;
+-		src += len_str;
+-		dst += len_str;
+-	} while ((len_str == len) && (done < count));
+-	return done;
+-}
+-
+-#define __futex_atomic_op(insn, ret, oldval, newval, uaddr, oparg)	\
+-	asm volatile(							\
+-		"   sacf  256\n"					\
+-		"0: l     %1,0(%6)\n"					\
+-		"1:"insn						\
+-		"2: cs    %1,%2,0(%6)\n"				\
+-		"3: jl    1b\n"						\
+-		"   lhi   %0,0\n"					\
+-		"4: sacf  0\n"						\
+-		EX_TABLE(0b,4b) EX_TABLE(2b,4b) EX_TABLE(3b,4b)		\
+-		: "=d" (ret), "=&d" (oldval), "=&d" (newval),		\
+-		  "=m" (*uaddr)						\
+-		: "0" (-EFAULT), "d" (oparg), "a" (uaddr),		\
+-		  "m" (*uaddr) : "cc");
+-
+-int futex_atomic_op_std(int op, u32 __user *uaddr, int oparg, int *old)
+-{
+-	int oldval = 0, newval, ret;
+-
+-	switch (op) {
+-	case FUTEX_OP_SET:
+-		__futex_atomic_op("lr %2,%5\n",
+-				  ret, oldval, newval, uaddr, oparg);
+-		break;
+-	case FUTEX_OP_ADD:
+-		__futex_atomic_op("lr %2,%1\nar %2,%5\n",
+-				  ret, oldval, newval, uaddr, oparg);
+-		break;
+-	case FUTEX_OP_OR:
+-		__futex_atomic_op("lr %2,%1\nor %2,%5\n",
+-				  ret, oldval, newval, uaddr, oparg);
+-		break;
+-	case FUTEX_OP_ANDN:
+-		__futex_atomic_op("lr %2,%1\nnr %2,%5\n",
+-				  ret, oldval, newval, uaddr, oparg);
+-		break;
+-	case FUTEX_OP_XOR:
+-		__futex_atomic_op("lr %2,%1\nxr %2,%5\n",
+-				  ret, oldval, newval, uaddr, oparg);
+-		break;
+-	default:
+-		ret = -ENOSYS;
+-	}
+-	*old = oldval;
+-	return ret;
+-}
+-
+-int futex_atomic_cmpxchg_std(u32 *uval, u32 __user *uaddr,
+-			     u32 oldval, u32 newval)
+-{
+-	int ret;
+-
+-	asm volatile(
+-		"   sacf 256\n"
+-		"0: cs   %1,%4,0(%5)\n"
+-		"1: la   %0,0\n"
+-		"2: sacf 0\n"
+-		EX_TABLE(0b,2b) EX_TABLE(1b,2b)
+-		: "=d" (ret), "+d" (oldval), "=m" (*uaddr)
+-		: "0" (-EFAULT), "d" (newval), "a" (uaddr), "m" (*uaddr)
+-		: "cc", "memory" );
+-	*uval = oldval;
+-	return ret;
+-}
+-
+-struct uaccess_ops uaccess_std = {
+-	.copy_from_user = copy_from_user_std_check,
+-	.copy_from_user_small = copy_from_user_std,
+-	.copy_to_user = copy_to_user_std_check,
+-	.copy_to_user_small = copy_to_user_std,
+-	.copy_in_user = copy_in_user_std,
+-	.clear_user = clear_user_std,
+-	.strnlen_user = strnlen_user_std,
+-	.strncpy_from_user = strncpy_from_user_std,
+-	.futex_atomic_op = futex_atomic_op_std,
+-	.futex_atomic_cmpxchg = futex_atomic_cmpxchg_std,
+-};
+diff --git a/arch/s390/mm/fault.c b/arch/s390/mm/fault.c
+index de0adedcdf2d..92d2409d6aaa 100644
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -115,13 +115,8 @@ static inline int user_space_fault(unsigned long trans_exc_code)
+ 	if (trans_exc_code == 2)
+ 		/* Access via secondary space, set_fs setting decides */
+ 		return current->thread.mm_segment.ar4;
+-	if (s390_user_mode == HOME_SPACE_MODE)
+-		/* User space if the access has been done via home space. */
+-		return trans_exc_code == 3;
+ 	/*
+-	 * If the user space is not the home space the kernel runs in home
+-	 * space. Access via secondary space has already been covered,
+-	 * access via primary space or access register is from user space
++	 * Access via primary space or access register is from user space
+ 	 * and access via home space is from the kernel.
+ 	 */
+ 	return trans_exc_code != 3;
+@@ -432,7 +427,7 @@ int __handle_fault(unsigned long uaddr, unsigned long pgm_int_code, int write)
+ 	int access, fault;
+ 
+ 	/* Emulate a uaccess fault from kernel mode. */
+-	regs.psw.mask = psw_kernel_bits | PSW_MASK_DAT | PSW_MASK_MCHECK;
++	regs.psw.mask = PSW_KERNEL_BITS | PSW_MASK_DAT | PSW_MASK_MCHECK;
+ 	if (!irqs_disabled())
+ 		regs.psw.mask |= PSW_MASK_IO | PSW_MASK_EXT;
+ 	regs.psw.addr = (unsigned long) __builtin_return_address(0);
+diff --git a/arch/s390/mm/pgtable.c b/arch/s390/mm/pgtable.c
+index a5d23aa7eac7..8a900901053f 100644
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@ -1188,10 +1188,6 @@ int s390_enable_sie(void)
+ 	struct mm_struct *mm = tsk->mm;
+ 	struct mmu_gather tlb;
+ 
+-	/* Do we have switched amode? If no, we cannot do sie */
+-	if (s390_user_mode == HOME_SPACE_MODE)
+-		return -EINVAL;
+-
+ 	/* Do we have pgstes? if yes, we are done */
+ 	if (mm_has_pgste(tsk->mm))
+ 		return 0;
