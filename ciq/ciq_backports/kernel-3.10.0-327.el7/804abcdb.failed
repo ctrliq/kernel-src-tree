@@ -1,0 +1,188 @@
+be2net: Refactor wrb_fill_hdr() routine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Sriharsha Basavapatna <sriharsha.basavapatna@emulex.com>
+commit 804abcdbdbb68df5ca8cf7e70366522f02298029
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/804abcdb.failed
+
+The WRB header is setup by wrb_fill_hdr() routine. This routine currently
+gets some of the WRB params as args and figures out rest of the WRB params
+by looking at various fields in skb (like gso, checksum, vlan-tag etc).
+All these params could instead be retrieved from the skb into a structure
+and passed to this routine. This separates wrb_fill_hdr() to only provide
+chip-specific code to fill the WRB. This also makes it simple to support
+chips with different WRB formats.
+
+	Signed-off-by: Sriharsha Basavapatna <sriharsha.basavapatna@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 804abcdbdbb68df5ca8cf7e70366522f02298029)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index c937ac36edcc,8477fb4de614..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -751,25 -746,52 +747,59 @@@ static void be_get_wrb_params_from_skb(
+  			proto = skb_ip_proto(skb);
+  		}
+  		if (proto == IPPROTO_TCP)
+- 			SET_TX_WRB_HDR_BITS(tcpcs, hdr, 1);
++ 			BE_WRB_F_SET(wrb_params->features, TCPCS, 1);
+  		else if (proto == IPPROTO_UDP)
+- 			SET_TX_WRB_HDR_BITS(udpcs, hdr, 1);
++ 			BE_WRB_F_SET(wrb_params->features, UDPCS, 1);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vlan_tx_tag_present(skb)) {
+ +		SET_TX_WRB_HDR_BITS(vlan, hdr, 1);
+ +		vlan_tag = be_get_tx_vlan_tag(adapter, skb);
+ +		SET_TX_WRB_HDR_BITS(vlan_tag, hdr, vlan_tag);
+++=======
++ 	if (skb_vlan_tag_present(skb)) {
++ 		BE_WRB_F_SET(wrb_params->features, VLAN, 1);
++ 		wrb_params->vlan_tag = be_get_tx_vlan_tag(adapter, skb);
+++>>>>>>> 804abcdbdbb6 (be2net: Refactor wrb_fill_hdr() routine)
+  	}
+  
+- 	SET_TX_WRB_HDR_BITS(num_wrb, hdr, wrb_cnt);
+- 	SET_TX_WRB_HDR_BITS(len, hdr, len);
++ 	BE_WRB_F_SET(wrb_params->features, CRC, 1);
++ }
+  
+- 	/* Hack to skip HW VLAN tagging needs evt = 1, compl = 0
+- 	 * When this hack is not needed, the evt bit is set while ringing DB
++ static void wrb_fill_hdr(struct be_adapter *adapter,
++ 			 struct be_eth_hdr_wrb *hdr,
++ 			 struct be_wrb_params *wrb_params,
++ 			 struct sk_buff *skb)
++ {
++ 	memset(hdr, 0, sizeof(*hdr));
++ 
++ 	SET_TX_WRB_HDR_BITS(crc, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, CRC));
++ 	SET_TX_WRB_HDR_BITS(ipcs, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, IPCS));
++ 	SET_TX_WRB_HDR_BITS(tcpcs, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, TCPCS));
++ 	SET_TX_WRB_HDR_BITS(udpcs, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, UDPCS));
++ 
++ 	SET_TX_WRB_HDR_BITS(lso, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, LSO));
++ 	SET_TX_WRB_HDR_BITS(lso6, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, LSO6));
++ 	SET_TX_WRB_HDR_BITS(lso_mss, hdr, wrb_params->lso_mss);
++ 
++ 	/* Hack to skip HW VLAN tagging needs evt = 1, compl = 0. When this
++ 	 * hack is not needed, the evt bit is set while ringing DB.
+  	 */
+- 	if (skip_hw_vlan)
+- 		SET_TX_WRB_HDR_BITS(event, hdr, 1);
++ 	SET_TX_WRB_HDR_BITS(event, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, VLAN_SKIP_HW));
++ 	SET_TX_WRB_HDR_BITS(vlan, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, VLAN));
++ 	SET_TX_WRB_HDR_BITS(vlan_tag, hdr, wrb_params->vlan_tag);
++ 
++ 	SET_TX_WRB_HDR_BITS(num_wrb, hdr, skb_wrb_cnt(skb));
++ 	SET_TX_WRB_HDR_BITS(len, hdr, skb->len);
+  }
+  
+  static void unmap_tx_frag(struct device *dev, struct be_eth_wrb *wrb,
+@@@ -863,9 -886,15 +894,10 @@@ dma_err
+  	return 0;
+  }
+  
+ -static inline int qnq_async_evt_rcvd(struct be_adapter *adapter)
+ -{
+ -	return adapter->flags & BE_FLAGS_QNQ_ASYNC_EVT_RCVD;
+ -}
+ -
+  static struct sk_buff *be_insert_vlan_in_pkt(struct be_adapter *adapter,
+  					     struct sk_buff *skb,
+- 					     bool *skip_hw_vlan)
++ 					     struct be_wrb_params
++ 					     *wrb_params)
+  {
+  	u16 vlan_tag = 0;
+  
+@@@ -896,11 -925,11 +927,10 @@@
+  	/* Insert the outer VLAN, if any */
+  	if (adapter->qnq_vid) {
+  		vlan_tag = adapter->qnq_vid;
+ -		skb = vlan_insert_tag_set_proto(skb, htons(ETH_P_8021Q),
+ -						vlan_tag);
+ +		skb = __vlan_put_tag(skb, htons(ETH_P_8021Q), vlan_tag);
+  		if (unlikely(!skb))
+  			return skb;
+- 		if (skip_hw_vlan)
+- 			*skip_hw_vlan = true;
++ 		BE_WRB_F_SET(wrb_params->features, VLAN_SKIP_HW, 1);
+  	}
+  
+  	return skb;
+@@@ -971,8 -1001,8 +1002,13 @@@ static struct sk_buff *be_lancer_xmit_w
+  	 * Manually insert VLAN in pkt.
+  	 */
+  	if (skb->ip_summed != CHECKSUM_PARTIAL &&
+++<<<<<<< HEAD
+ +	    vlan_tx_tag_present(skb)) {
+ +		skb = be_insert_vlan_in_pkt(adapter, skb, skip_hw_vlan);
+++=======
++ 	    skb_vlan_tag_present(skb)) {
++ 		skb = be_insert_vlan_in_pkt(adapter, skb, wrb_params);
+++>>>>>>> 804abcdbdbb6 (be2net: Refactor wrb_fill_hdr() routine)
+  		if (unlikely(!skb))
+  			goto err;
+  	}
+diff --git a/drivers/net/ethernet/emulex/benet/be.h b/drivers/net/ethernet/emulex/benet/be.h
+index 57e9eb883540..62f3c5e42e2a 100644
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -439,6 +439,39 @@ struct rss_info {
+ 	u8 rss_hkey[RSS_HASH_KEY_LEN];
+ };
+ 
++/* Macros to read/write the 'features' word of be_wrb_params structure.
++ */
++#define	BE_WRB_F_BIT(name)			BE_WRB_F_##name##_BIT
++#define	BE_WRB_F_MASK(name)			BIT_MASK(BE_WRB_F_##name##_BIT)
++
++#define	BE_WRB_F_GET(word, name)	\
++	(((word) & (BE_WRB_F_MASK(name))) >> BE_WRB_F_BIT(name))
++
++#define	BE_WRB_F_SET(word, name, val)	\
++	((word) |= (((val) << BE_WRB_F_BIT(name)) & BE_WRB_F_MASK(name)))
++
++/* Feature/offload bits */
++enum {
++	BE_WRB_F_CRC_BIT,		/* Ethernet CRC */
++	BE_WRB_F_IPCS_BIT,		/* IP csum */
++	BE_WRB_F_TCPCS_BIT,		/* TCP csum */
++	BE_WRB_F_UDPCS_BIT,		/* UDP csum */
++	BE_WRB_F_LSO_BIT,		/* LSO */
++	BE_WRB_F_LSO6_BIT,		/* LSO6 */
++	BE_WRB_F_VLAN_BIT,		/* VLAN */
++	BE_WRB_F_VLAN_SKIP_HW_BIT	/* Skip VLAN tag (workaround) */
++};
++
++/* The structure below provides a HW-agnostic abstraction of WRB params
++ * retrieved from a TX skb. This is in turn passed to chip specific routines
++ * during transmit, to set the corresponding params in the WRB.
++ */
++struct be_wrb_params {
++	u32 features;	/* Feature bits */
++	u16 vlan_tag;	/* VLAN tag */
++	u16 lso_mss;	/* MSS for LSO */
++};
++
+ struct be_adapter {
+ 	struct pci_dev *pdev;
+ 	struct net_device *netdev;
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
