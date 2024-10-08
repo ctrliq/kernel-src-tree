@@ -1,0 +1,205 @@
+igb: Change to use statically allocated array for MSIx entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Carolyn Wyborny <carolyn.wyborny@intel.com>
+commit cd14ef54d25bcf0b8e9205e75369e33b1d188417
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/cd14ef54.failed
+
+This patch changes how the driver initializes MSIx and checks
+for MSIx configuration.  This change makes it easier to reconfigure the
+device when queue changes happen at runtime using ethtool's set_channels
+feature.
+
+	Signed-off-by: Carolyn Wyborny <carolyn.wyborny@intel.com>
+	Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit cd14ef54d25bcf0b8e9205e75369e33b1d188417)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igb/igb_ethtool.c
+#	drivers/net/ethernet/intel/igb/igb_main.c
+diff --cc drivers/net/ethernet/intel/igb/igb_ethtool.c
+index d790e8de28a9,1df02378de69..000000000000
+--- a/drivers/net/ethernet/intel/igb/igb_ethtool.c
++++ b/drivers/net/ethernet/intel/igb/igb_ethtool.c
+@@@ -2889,6 -2889,88 +2889,91 @@@ static int igb_set_rxfh_indir(struct ne
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int igb_max_channels(struct igb_adapter *adapter)
++ {
++ 	struct e1000_hw *hw = &adapter->hw;
++ 	unsigned int max_combined = 0;
++ 
++ 	switch (hw->mac.type) {
++ 	case e1000_i211:
++ 		max_combined = IGB_MAX_RX_QUEUES_I211;
++ 		break;
++ 	case e1000_82575:
++ 	case e1000_i210:
++ 		max_combined = IGB_MAX_RX_QUEUES_82575;
++ 		break;
++ 	case e1000_i350:
++ 		if (!!adapter->vfs_allocated_count) {
++ 			max_combined = 1;
++ 			break;
++ 		}
++ 		/* fall through */
++ 	case e1000_82576:
++ 		if (!!adapter->vfs_allocated_count) {
++ 			max_combined = 2;
++ 			break;
++ 		}
++ 		/* fall through */
++ 	case e1000_82580:
++ 	case e1000_i354:
++ 	default:
++ 		max_combined = IGB_MAX_RX_QUEUES;
++ 		break;
++ 	}
++ 
++ 	return max_combined;
++ }
++ 
++ static void igb_get_channels(struct net_device *netdev,
++ 			     struct ethtool_channels *ch)
++ {
++ 	struct igb_adapter *adapter = netdev_priv(netdev);
++ 
++ 	/* Report maximum channels */
++ 	ch->max_combined = igb_max_channels(adapter);
++ 
++ 	/* Report info for other vector */
++ 	if (adapter->flags & IGB_FLAG_HAS_MSIX) {
++ 		ch->max_other = NON_Q_VECTORS;
++ 		ch->other_count = NON_Q_VECTORS;
++ 	}
++ 
++ 	ch->combined_count = adapter->rss_queues;
++ }
++ 
++ static int igb_set_channels(struct net_device *netdev,
++ 			    struct ethtool_channels *ch)
++ {
++ 	struct igb_adapter *adapter = netdev_priv(netdev);
++ 	unsigned int count = ch->combined_count;
++ 
++ 	/* Verify they are not requesting separate vectors */
++ 	if (!count || ch->rx_count || ch->tx_count)
++ 		return -EINVAL;
++ 
++ 	/* Verify other_count is valid and has not been changed */
++ 	if (ch->other_count != NON_Q_VECTORS)
++ 		return -EINVAL;
++ 
++ 	/* Verify the number of channels doesn't exceed hw limits */
++ 	if (count > igb_max_channels(adapter))
++ 		return -EINVAL;
++ 
++ 	if (count != adapter->rss_queues) {
++ 		adapter->rss_queues = count;
++ 
++ 		/* Hardware has to reinitialize queues and interrupts to
++ 		 * match the new configuration.
++ 		 */
++ 		return igb_reinit_queues(adapter);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> cd14ef54d25b (igb: Change to use statically allocated array for MSIx entries)
+  static const struct ethtool_ops igb_ethtool_ops = {
+  	.get_settings		= igb_get_settings,
+  	.set_settings		= igb_set_settings,
+diff --cc drivers/net/ethernet/intel/igb/igb_main.c
+index 7436ed1f84b3,46d31a49f5ea..000000000000
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@@ -1013,13 -1020,21 +1013,29 @@@ static void igb_free_q_vector(struct ig
+  	if (q_vector->rx.ring)
+  		adapter->tx_ring[q_vector->rx.ring->queue_index] = NULL;
+  
+ +	adapter->q_vector[v_idx] = NULL;
+  	netif_napi_del(&q_vector->napi);
+  
+++<<<<<<< HEAD
+ +	/* igb_get_stats64() might access the rings on this vector,
+ +	 * we must wait a grace period before freeing it.
+ +	 */
+ +	kfree_rcu(q_vector, rcu);
+++=======
++ }
++ 
++ static void igb_reset_interrupt_capability(struct igb_adapter *adapter)
++ {
++ 	int v_idx = adapter->num_q_vectors;
++ 
++ 	if (adapter->flags & IGB_FLAG_HAS_MSIX)
++ 		pci_disable_msix(adapter->pdev);
++ 	else if (adapter->flags & IGB_FLAG_HAS_MSI)
++ 		pci_disable_msi(adapter->pdev);
++ 
++ 	while (v_idx--)
++ 		igb_reset_q_vector(adapter, v_idx);
+++>>>>>>> cd14ef54d25b (igb: Change to use statically allocated array for MSIx entries)
+  }
+  
+  /**
+diff --git a/drivers/net/ethernet/intel/igb/igb.h b/drivers/net/ethernet/intel/igb/igb.h
+index 0eba9baf7fd7..d37eca5011ca 100644
+--- a/drivers/net/ethernet/intel/igb/igb.h
++++ b/drivers/net/ethernet/intel/igb/igb.h
+@@ -41,6 +41,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/i2c.h>
+ #include <linux/i2c-algo-bit.h>
++#include <linux/pci.h>
+ 
+ struct igb_adapter;
+ 
+@@ -67,6 +68,7 @@ struct igb_adapter;
+ #define IGB_MIN_ITR_USECS	10
+ #define NON_Q_VECTORS		1
+ #define MAX_Q_VECTORS		8
++#define MAX_MSIX_ENTRIES	10
+ 
+ /* Transmit and receive queues */
+ #define IGB_MAX_RX_QUEUES	8
+@@ -127,9 +129,9 @@ struct vf_data_storage {
+ #define IGB_TX_PTHRESH	((hw->mac.type == e1000_i354) ? 20 : 8)
+ #define IGB_TX_HTHRESH	1
+ #define IGB_RX_WTHRESH	((hw->mac.type == e1000_82576 && \
+-			  adapter->msix_entries) ? 1 : 4)
++			  (adapter->flags & IGB_FLAG_HAS_MSIX)) ? 1 : 4)
+ #define IGB_TX_WTHRESH	((hw->mac.type == e1000_82576 && \
+-			  adapter->msix_entries) ? 1 : 16)
++			  (adapter->flags & IGB_FLAG_HAS_MSIX)) ? 1 : 16)
+ 
+ /* this is the size past which hardware will drop packets when setting LPE=0 */
+ #define MAXIMUM_ETHERNET_VLAN_SIZE 1522
+@@ -355,7 +357,7 @@ struct igb_adapter {
+ 	unsigned int flags;
+ 
+ 	unsigned int num_q_vectors;
+-	struct msix_entry *msix_entries;
++	struct msix_entry msix_entries[MAX_MSIX_ENTRIES];
+ 
+ 	/* Interrupt Throttle Rate */
+ 	u32 rx_itr_setting;
+@@ -467,6 +469,7 @@ struct igb_adapter {
+ #define IGB_FLAG_MEDIA_RESET		(1 << 10)
+ #define IGB_FLAG_MAS_CAPABLE		(1 << 11)
+ #define IGB_FLAG_MAS_ENABLE		(1 << 12)
++#define IGB_FLAG_HAS_MSIX		(1 << 13)
+ 
+ /* Media Auto Sense */
+ #define IGB_MAS_ENABLE_0		0X0001
+* Unmerged path drivers/net/ethernet/intel/igb/igb_ethtool.c
+* Unmerged path drivers/net/ethernet/intel/igb/igb_main.c
