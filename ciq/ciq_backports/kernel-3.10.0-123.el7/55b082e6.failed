@@ -1,0 +1,184 @@
+dm snapshot: use dm-bufio prefetch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [md] dm-snapshot: use dm-bufio prefetch (Mike Snitzer) [1057197]
+Rebuild_FUZZ: 97.06%
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 55b082e614e219fb5199a6f93e648ed35d3c96d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/55b082e6.failed
+
+This patch modifies dm-snapshot so that it prefetches the buffers when
+loading the exceptions.
+
+The number of buffers read ahead is specified in the DM_PREFETCH_CHUNKS
+macro.  The current value for DM_PREFETCH_CHUNKS (12) was found to
+provide the best performance on a single 15k SCSI spindle.  In the
+future we may modify this default or make it configurable.
+
+Also, introduce the function dm_bufio_set_minimum_buffers to setup
+bufio's number of internal buffers before freeing happens.  dm-bufio may
+hold more buffers if enough memory is available.  There is no guarantee
+that the specified number of buffers will be available - if you need a
+guarantee, use the argument reserved_buffers for
+dm_bufio_client_create.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 55b082e614e219fb5199a6f93e648ed35d3c96d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-bufio.c
+#	drivers/md/dm-bufio.h
+#	drivers/md/dm-snap-persistent.c
+diff --cc drivers/md/dm-bufio.c
+index dcb867c9eb3b,9ed42125514b..000000000000
+--- a/drivers/md/dm-bufio.c
++++ b/drivers/md/dm-bufio.c
+@@@ -1350,6 -1352,34 +1352,37 @@@ retry
+  }
+  EXPORT_SYMBOL_GPL(dm_bufio_release_move);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Free the given buffer.
++  *
++  * This is just a hint, if the buffer is in use or dirty, this function
++  * does nothing.
++  */
++ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
++ {
++ 	struct dm_buffer *b;
++ 
++ 	dm_bufio_lock(c);
++ 
++ 	b = __find(c, block);
++ 	if (b && likely(!b->hold_count) && likely(!b->state)) {
++ 		__unlink_buffer(b);
++ 		__free_buffer_wake(b);
++ 	}
++ 
++ 	dm_bufio_unlock(c);
++ }
++ EXPORT_SYMBOL(dm_bufio_forget);
++ 
++ void dm_bufio_set_minimum_buffers(struct dm_bufio_client *c, unsigned n)
++ {
++ 	c->minimum_buffers = n;
++ }
++ EXPORT_SYMBOL(dm_bufio_set_minimum_buffers);
++ 
+++>>>>>>> 55b082e614e2 (dm snapshot: use dm-bufio prefetch)
+  unsigned dm_bufio_get_block_size(struct dm_bufio_client *c)
+  {
+  	return c->block_size;
+diff --cc drivers/md/dm-bufio.h
+index b142946a9e32,c096779a7292..000000000000
+--- a/drivers/md/dm-bufio.h
++++ b/drivers/md/dm-bufio.h
+@@@ -108,6 -108,18 +108,21 @@@ int dm_bufio_issue_flush(struct dm_bufi
+   */
+  void dm_bufio_release_move(struct dm_buffer *b, sector_t new_block);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Free the given buffer.
++  * This is just a hint, if the buffer is in use or dirty, this function
++  * does nothing.
++  */
++ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block);
++ 
++ /*
++  * Set the minimum number of buffers before cleanup happens.
++  */
++ void dm_bufio_set_minimum_buffers(struct dm_bufio_client *c, unsigned n);
++ 
+++>>>>>>> 55b082e614e2 (dm snapshot: use dm-bufio prefetch)
+  unsigned dm_bufio_get_block_size(struct dm_bufio_client *c);
+  sector_t dm_bufio_get_device_size(struct dm_bufio_client *c);
+  sector_t dm_bufio_get_block_number(struct dm_buffer *b);
+diff --cc drivers/md/dm-snap-persistent.c
+index 2ccf2ffda715,afc3d017de4c..000000000000
+--- a/drivers/md/dm-snap-persistent.c
++++ b/drivers/md/dm-snap-persistent.c
+@@@ -487,20 -498,60 +489,58 @@@ static int read_exceptions(struct pstor
+  			   void *callback_context)
+  {
+  	int r, full = 1;
+++<<<<<<< HEAD
+++=======
++ 	struct dm_bufio_client *client;
++ 	chunk_t prefetch_area = 0;
++ 
++ 	client = dm_bufio_client_create(dm_snap_cow(ps->store->snap)->bdev,
++ 					ps->store->chunk_size << SECTOR_SHIFT,
++ 					1, 0, NULL, NULL);
++ 
++ 	if (IS_ERR(client))
++ 		return PTR_ERR(client);
+++>>>>>>> 55b082e614e2 (dm snapshot: use dm-bufio prefetch)
++ 
++ 	/*
++ 	 * Setup for one current buffer + desired readahead buffers.
++ 	 */
++ 	dm_bufio_set_minimum_buffers(client, 1 + DM_PREFETCH_CHUNKS);
+  
+  	/*
+  	 * Keeping reading chunks and inserting exceptions until
+  	 * we find a partially full area.
+  	 */
+  	for (ps->current_area = 0; full; ps->current_area++) {
+++<<<<<<< HEAD
+ +		r = area_io(ps, READ);
+ +		if (r)
+ +			return r;
+++=======
++ 		struct dm_buffer *bp;
++ 		void *area;
++ 		chunk_t chunk;
++ 
++ 		if (unlikely(prefetch_area < ps->current_area))
++ 			prefetch_area = ps->current_area;
++ 
++ 		if (DM_PREFETCH_CHUNKS) do {
++ 			chunk_t pf_chunk = area_location(ps, prefetch_area);
++ 			if (unlikely(pf_chunk >= dm_bufio_get_device_size(client)))
++ 				break;
++ 			dm_bufio_prefetch(client, pf_chunk, 1);
++ 			prefetch_area++;
++ 			if (unlikely(!prefetch_area))
++ 				break;
++ 		} while (prefetch_area <= ps->current_area + DM_PREFETCH_CHUNKS);
++ 
++ 		chunk = area_location(ps, ps->current_area);
+++>>>>>>> 55b082e614e2 (dm snapshot: use dm-bufio prefetch)
+  
+ -		area = dm_bufio_read(client, chunk, &bp);
+ -		if (unlikely(IS_ERR(area))) {
+ -			r = PTR_ERR(area);
+ -			goto ret_destroy_bufio;
+ -		}
+ -
+ -		r = insert_exceptions(ps, area, callback, callback_context,
+ +		r = insert_exceptions(ps, ps->area, callback, callback_context,
+  				      &full);
+ -
+ -		dm_bufio_release(bp);
+ -
+ -		dm_bufio_forget(client, chunk);
+ -
+ -		if (unlikely(r))
+ -			goto ret_destroy_bufio;
+ +		if (r)
+ +			return r;
+  	}
+  
+  	ps->current_area--;
+* Unmerged path drivers/md/dm-bufio.c
+* Unmerged path drivers/md/dm-bufio.h
+* Unmerged path drivers/md/dm-snap-persistent.c
