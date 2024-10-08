@@ -331,46 +331,103 @@ void scsi_put_command(struct scsi_cmnd *cmd)
 }
 EXPORT_SYMBOL(scsi_put_command);
 
-static struct scsi_host_cmd_pool *scsi_get_host_cmd_pool(gfp_t gfp_mask)
+static struct scsi_host_cmd_pool *
+scsi_find_host_cmd_pool(struct Scsi_Host *shost)
 {
+	if (shost->hostt->cmd_size)
+		return shost->hostt->cmd_pool;
+	if (shost->unchecked_isa_dma)
+		return &scsi_cmd_dma_pool;
+	return &scsi_cmd_pool;
+}
+
+static void
+scsi_free_host_cmd_pool(struct scsi_host_cmd_pool *pool)
+{
+	kfree(pool->sense_name);
+	kfree(pool->cmd_name);
+	kfree(pool);
+}
+
+static struct scsi_host_cmd_pool *
+scsi_alloc_host_cmd_pool(struct Scsi_Host *shost)
+{
+	struct scsi_host_template *hostt = shost->hostt;
+	struct scsi_host_cmd_pool *pool;
+
+	pool = kzalloc(sizeof(*pool), GFP_KERNEL);
+	if (!pool)
+		return NULL;
+
+	pool->cmd_name = kasprintf(GFP_KERNEL, "%s_cmd", hostt->name);
+	pool->sense_name = kasprintf(GFP_KERNEL, "%s_sense", hostt->name);
+	if (!pool->cmd_name || !pool->sense_name) {
+		scsi_free_host_cmd_pool(pool);
+		return NULL;
+	}
+
+	pool->slab_flags = SLAB_HWCACHE_ALIGN;
+	if (shost->unchecked_isa_dma) {
+		pool->slab_flags |= SLAB_CACHE_DMA;
+		pool->gfp_mask = __GFP_DMA;
+	}
+	return pool;
+}
+
+static struct scsi_host_cmd_pool *
+scsi_get_host_cmd_pool(struct Scsi_Host *shost)
+{
+	struct scsi_host_template *hostt = shost->hostt;
 	struct scsi_host_cmd_pool *retval = NULL, *pool;
+	size_t cmd_size = sizeof(struct scsi_cmnd) + hostt->cmd_size;
+
 	/*
 	 * Select a command slab for this host and create it if not
 	 * yet existent.
 	 */
 	mutex_lock(&host_cmd_pool_mutex);
-	pool = (gfp_mask & __GFP_DMA) ? &scsi_cmd_dma_pool :
-		&scsi_cmd_pool;
+	pool = scsi_find_host_cmd_pool(shost);
+	if (!pool) {
+		pool = scsi_alloc_host_cmd_pool(shost);
+		if (!pool)
+			goto out;
+	}
+
 	if (!pool->users) {
-		pool->cmd_slab = kmem_cache_create(pool->cmd_name,
-						   sizeof(struct scsi_cmnd), 0,
+		pool->cmd_slab = kmem_cache_create(pool->cmd_name, cmd_size, 0,
 						   pool->slab_flags, NULL);
 		if (!pool->cmd_slab)
-			goto fail;
+			goto out_free_pool;
 
 		pool->sense_slab = kmem_cache_create(pool->sense_name,
 						     SCSI_SENSE_BUFFERSIZE, 0,
 						     pool->slab_flags, NULL);
-		if (!pool->sense_slab) {
-			kmem_cache_destroy(pool->cmd_slab);
-			goto fail;
-		}
+		if (!pool->sense_slab)
+			goto out_free_slab;
 	}
 
 	pool->users++;
 	retval = pool;
- fail:
+out:
 	mutex_unlock(&host_cmd_pool_mutex);
 	return retval;
+
+out_free_slab:
+	kmem_cache_destroy(pool->cmd_slab);
+out_free_pool:
+	if (hostt->cmd_size)
+		scsi_free_host_cmd_pool(pool);
+	goto out;
 }
 
-static void scsi_put_host_cmd_pool(gfp_t gfp_mask)
+static void scsi_put_host_cmd_pool(struct Scsi_Host *shost)
 {
+	struct scsi_host_template *hostt = shost->hostt;
 	struct scsi_host_cmd_pool *pool;
 
 	mutex_lock(&host_cmd_pool_mutex);
-	pool = (gfp_mask & __GFP_DMA) ? &scsi_cmd_dma_pool :
-		&scsi_cmd_pool;
+	pool = scsi_find_host_cmd_pool(shost);
+
 	/*
 	 * This may happen if a driver has a mismatched get and put
 	 * of the command pool; the driver should be implicated in
@@ -381,6 +438,8 @@ static void scsi_put_host_cmd_pool(gfp_t gfp_mask)
 	if (!--pool->users) {
 		kmem_cache_destroy(pool->cmd_slab);
 		kmem_cache_destroy(pool->sense_slab);
+		if (hostt->cmd_size)
+			scsi_free_host_cmd_pool(pool);
 	}
 	mutex_unlock(&host_cmd_pool_mutex);
 }
@@ -397,14 +456,13 @@ static void scsi_put_host_cmd_pool(gfp_t gfp_mask)
  */
 int scsi_setup_command_freelist(struct Scsi_Host *shost)
 {
-	struct scsi_cmnd *cmd;
 	const gfp_t gfp_mask = shost->unchecked_isa_dma ? GFP_DMA : GFP_KERNEL;
+	struct scsi_cmnd *cmd;
 
 	spin_lock_init(&shost->free_list_lock);
 	INIT_LIST_HEAD(&shost->free_list);
 
-	shost->cmd_pool = scsi_get_host_cmd_pool(gfp_mask);
-
+	shost->cmd_pool = scsi_get_host_cmd_pool(shost);
 	if (!shost->cmd_pool)
 		return -ENOMEM;
 
@@ -413,7 +471,7 @@ int scsi_setup_command_freelist(struct Scsi_Host *shost)
 	 */
 	cmd = scsi_host_alloc_command(shost, gfp_mask);
 	if (!cmd) {
-		scsi_put_host_cmd_pool(gfp_mask);
+		scsi_put_host_cmd_pool(shost);
 		shost->cmd_pool = NULL;
 		return -ENOMEM;
 	}
@@ -442,7 +500,7 @@ void scsi_destroy_command_freelist(struct Scsi_Host *shost)
 		scsi_host_free_command(shost, cmd);
 	}
 	shost->cmd_pool = NULL;
-	scsi_put_host_cmd_pool(shost->unchecked_isa_dma ? GFP_DMA : GFP_KERNEL);
+	scsi_put_host_cmd_pool(shost);
 }
 
 #ifdef CONFIG_SCSI_LOGGING
@@ -588,7 +646,7 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 
 	/* Check to see if the scsi lld made this device blocked. */
 	if (unlikely(scsi_device_blocked(cmd->device))) {
-		/* 
+		/*
 		 * in blocked state, the command is just put back on
 		 * the device queue.  The suspend state has already
 		 * blocked the queue so future requests should not
@@ -598,7 +656,8 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 
 		scsi_queue_insert(cmd, SCSI_MLQUEUE_DEVICE_BUSY);
 
-		SCSI_LOG_MLQUEUE(3, printk("queuecommand : device blocked \n"));
+		SCSI_LOG_MLQUEUE(3, scmd_printk(KERN_INFO, cmd,
+			"queuecommand : device blocked\n"));
 
 		/*
 		 * NOTE: rtn is still zero here because we don't need the
@@ -607,7 +666,7 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 		goto out;
 	}
 
-	/* 
+	/*
 	 * If SCSI-2 or lower, store the LUN value in cmnd.
 	 */
 	if (cmd->device->scsi_level <= SCSI_2 &&
@@ -623,8 +682,8 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 	 * length exceeds what the host adapter can handle.
 	 */
 	if (cmd->cmd_len > cmd->device->host->max_cmd_len) {
-		SCSI_LOG_MLQUEUE(3,
-			printk("queuecommand : command too long. "
+		SCSI_LOG_MLQUEUE(3, scmd_printk(KERN_INFO, cmd,
+			       "queuecommand : command too long. "
 			       "cdb_size=%d host->max_cmd_len=%d\n",
 			       cmd->cmd_len, cmd->device->host->max_cmd_len));
 		cmd->result = (DID_ABORT << 16);
@@ -648,14 +707,13 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 		    rtn != SCSI_MLQUEUE_TARGET_BUSY)
 			rtn = SCSI_MLQUEUE_HOST_BUSY;
 
-		scsi_queue_insert(cmd, rtn);
+		SCSI_LOG_MLQUEUE(3, scmd_printk(KERN_INFO, cmd,
+			"queuecommand : request rejected\n"));
 
-		SCSI_LOG_MLQUEUE(3,
-		    printk("queuecommand : request rejected\n"));
+		scsi_queue_insert(cmd, rtn);
 	}
 
  out:
-	SCSI_LOG_MLQUEUE(3, printk("leaving scsi_dispatch_cmnd()\n"));
 	return rtn;
 }
 
@@ -957,6 +1015,93 @@ int scsi_get_vpd_page(struct scsi_device *sdev, u8 page, unsigned char *buf,
 	return -EINVAL;
 }
 EXPORT_SYMBOL_GPL(scsi_get_vpd_page);
+
+/**
+ * scsi_attach_vpd - Attach Vital Product Data to a SCSI device structure
+ * @sdev: The device to ask
+ *
+ * Attach the 'Device Identification' VPD page (0x83) and the
+ * 'Unit Serial Number' VPD page (0x80) to a SCSI device
+ * structure. This information can be used to identify the device
+ * uniquely.
+ */
+void scsi_attach_vpd(struct scsi_device *sdev)
+{
+	int result, i;
+	int vpd_len = SCSI_VPD_PG_LEN;
+	int pg80_supported = 0;
+	int pg83_supported = 0;
+	unsigned char *vpd_buf;
+
+	if (sdev->skip_vpd_pages)
+		return;
+retry_pg0:
+	vpd_buf = kmalloc(vpd_len, GFP_KERNEL);
+	if (!vpd_buf)
+		return;
+
+	/* Ask for all the pages supported by this device */
+	result = scsi_vpd_inquiry(sdev, vpd_buf, 0, vpd_len);
+	if (result < 0) {
+		kfree(vpd_buf);
+		return;
+	}
+	if (result > vpd_len) {
+		vpd_len = result;
+		kfree(vpd_buf);
+		goto retry_pg0;
+	}
+
+	for (i = 4; i < result; i++) {
+		if (vpd_buf[i] == 0x80)
+			pg80_supported = 1;
+		if (vpd_buf[i] == 0x83)
+			pg83_supported = 1;
+	}
+	kfree(vpd_buf);
+	vpd_len = SCSI_VPD_PG_LEN;
+
+	if (pg80_supported) {
+retry_pg80:
+		vpd_buf = kmalloc(vpd_len, GFP_KERNEL);
+		if (!vpd_buf)
+			return;
+
+		result = scsi_vpd_inquiry(sdev, vpd_buf, 0x80, vpd_len);
+		if (result < 0) {
+			kfree(vpd_buf);
+			return;
+		}
+		if (result > vpd_len) {
+			vpd_len = result;
+			kfree(vpd_buf);
+			goto retry_pg80;
+		}
+		sdev->vpd_pg80_len = result;
+		sdev->vpd_pg80 = vpd_buf;
+		vpd_len = SCSI_VPD_PG_LEN;
+	}
+
+	if (pg83_supported) {
+retry_pg83:
+		vpd_buf = kmalloc(vpd_len, GFP_KERNEL);
+		if (!vpd_buf)
+			return;
+
+		result = scsi_vpd_inquiry(sdev, vpd_buf, 0x83, vpd_len);
+		if (result < 0) {
+			kfree(vpd_buf);
+			return;
+		}
+		if (result > vpd_len) {
+			vpd_len = result;
+			kfree(vpd_buf);
+			goto retry_pg83;
+		}
+		sdev->vpd_pg83_len = result;
+		sdev->vpd_pg83 = vpd_buf;
+	}
+}
 
 /**
  * scsi_report_opcode - Find out if a given command opcode is supported

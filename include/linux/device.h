@@ -28,6 +28,8 @@
 #include <linux/uidgid.h>
 #include <asm/device.h>
 
+#include <linux/rh_kabi.h>
+
 struct device;
 struct device_private;
 struct device_driver;
@@ -181,17 +183,21 @@ extern int bus_unregister_notifier(struct bus_type *bus,
 /* All 4 notifers below get called with the target struct device *
  * as an argument. Note that those functions are likely to be called
  * with the device lock held in the core, so be careful.
+ *
+ * RHEL7 - Note that the following notifier values differ from upstream.
+ * This was due to KABI and upstream commit 599bad38cf71.
  */
 #define BUS_NOTIFY_ADD_DEVICE		0x00000001 /* device added */
 #define BUS_NOTIFY_DEL_DEVICE		0x00000002 /* device to be removed */
-#define BUS_NOTIFY_REMOVED_DEVICE	0x00000003 /* device removed */
-#define BUS_NOTIFY_BIND_DRIVER		0x00000004 /* driver about to be
+#define BUS_NOTIFY_BIND_DRIVER		0x00000003 /* driver about to be
 						      bound */
-#define BUS_NOTIFY_BOUND_DRIVER		0x00000005 /* driver bound to device */
-#define BUS_NOTIFY_UNBIND_DRIVER	0x00000006 /* driver about to be
+#define BUS_NOTIFY_BOUND_DRIVER		0x00000004 /* driver bound to device */
+#define BUS_NOTIFY_UNBIND_DRIVER	0x00000005 /* driver about to be
 						      unbound */
-#define BUS_NOTIFY_UNBOUND_DRIVER	0x00000007 /* driver is unbound
+#define BUS_NOTIFY_UNBOUND_DRIVER	0x00000006 /* driver is unbound
 						      from the device */
+#define BUS_NOTIFY_REMOVED_DEVICE	0x00000007 /* device removed */
+
 
 extern struct kset *bus_get_kset(struct bus_type *bus);
 extern struct klist *bus_get_device_klist(struct bus_type *bus);
@@ -635,9 +641,13 @@ struct device_dma_parameters {
 	unsigned long segment_boundary_mask;
 };
 
+struct acpi_device;
+
 struct acpi_dev_node {
 #ifdef CONFIG_ACPI
-	void	*handle;
+	RH_KABI_REPLACE_P(void	*handle,
+		          struct acpi_device *companion)
+
 #endif
 };
 
@@ -790,14 +800,6 @@ static inline struct device *kobj_to_dev(struct kobject *kobj)
 {
 	return container_of(kobj, struct device, kobj);
 }
-
-#ifdef CONFIG_ACPI
-#define ACPI_HANDLE(dev)	((dev)->acpi_node.handle)
-#define ACPI_HANDLE_SET(dev, _handle_)	(dev)->acpi_node.handle = (_handle_)
-#else
-#define ACPI_HANDLE(dev)	(NULL)
-#define ACPI_HANDLE_SET(dev, _handle_)	do { } while (0)
-#endif
 
 /* Get the wakeup routines, which depend on struct device */
 #include <linux/pm_wakeup.h>

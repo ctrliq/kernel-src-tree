@@ -247,6 +247,7 @@ struct cxgb4_lld_info {
 	unsigned char fw_api_ver;            /* FW API version */
 	unsigned int fw_vers;                /* FW version */
 	unsigned int iscsi_iolen;            /* iSCSI max I/O length */
+	unsigned int cclk_ps;                /* Core clock period in psec */
 	unsigned short udb_density;          /* # of user DB/page */
 	unsigned short ucq_density;          /* # of user CQs/page */
 	unsigned short filt_mode;            /* filter optional components */
@@ -285,6 +286,11 @@ unsigned int cxgb4_port_viid(const struct net_device *dev);
 unsigned int cxgb4_port_idx(const struct net_device *dev);
 unsigned int cxgb4_best_mtu(const unsigned short *mtus, unsigned short mtu,
 			    unsigned int *idx);
+unsigned int cxgb4_best_aligned_mtu(const unsigned short *mtus,
+				    unsigned short header_size,
+				    unsigned short data_size_max,
+				    unsigned short data_size_align,
+				    unsigned int *mtu_idxp);
 void cxgb4_get_tcp_stats(struct pci_dev *pdev, struct tp_tcp_stats *v4,
 			 struct tp_tcp_stats *v6);
 void cxgb4_iscsi_init(struct net_device *dev, unsigned int tag_mask,
@@ -295,5 +301,7 @@ int cxgb4_sync_txq_pidx(struct net_device *dev, u16 qid, u16 pidx, u16 size);
 int cxgb4_flush_eq_cache(struct net_device *dev);
 void cxgb4_disable_db_coalescing(struct net_device *dev);
 void cxgb4_enable_db_coalescing(struct net_device *dev);
+int cxgb4_read_tpte(struct net_device *dev, u32 stag, __be32 *tpte);
+u64 cxgb4_read_sge_timestamp(struct net_device *dev);
 
 #endif  /* !__CXGB4_OFLD_H */

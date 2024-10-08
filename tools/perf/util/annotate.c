@@ -8,6 +8,8 @@
  */
 
 #include "util.h"
+#include "ui/ui.h"
+#include "sort.h"
 #include "build-id.h"
 #include "color.h"
 #include "cache.h"
@@ -26,10 +28,10 @@ static int disasm_line__parse(char *line, char **namep, char **rawp);
 
 static void ins__delete(struct ins_operands *ops)
 {
-	free(ops->source.raw);
-	free(ops->source.name);
-	free(ops->target.raw);
-	free(ops->target.name);
+	zfree(&ops->source.raw);
+	zfree(&ops->source.name);
+	zfree(&ops->target.raw);
+	zfree(&ops->target.name);
 }
 
 static int ins__raw_scnprintf(struct ins *ins, char *bf, size_t size,
@@ -185,8 +187,7 @@ static int lock__parse(struct ins_operands *ops)
 	return 0;
 
 out_free_ops:
-	free(ops->locked.ops);
-	ops->locked.ops = NULL;
+	zfree(&ops->locked.ops);
 	return 0;
 }
 
@@ -205,9 +206,9 @@ static int lock__scnprintf(struct ins *ins, char *bf, size_t size,
 
 static void lock__delete(struct ins_operands *ops)
 {
-	free(ops->locked.ops);
-	free(ops->target.raw);
-	free(ops->target.name);
+	zfree(&ops->locked.ops);
+	zfree(&ops->target.raw);
+	zfree(&ops->target.name);
 }
 
 static struct ins_ops lock_ops = {
@@ -256,8 +257,7 @@ static int mov__parse(struct ins_operands *ops)
 	return 0;
 
 out_free_source:
-	free(ops->source.raw);
-	ops->source.raw = NULL;
+	zfree(&ops->source.raw);
 	return -1;
 }
 
@@ -491,7 +491,7 @@ static int symbol__inc_addr_samples(struct symbol *sym, struct map *map,
 {
 	struct annotation *notes;
 
-	if (sym == NULL || use_browser != 1 || !sort__has_sym)
+	if (sym == NULL)
 		return 0;
 
 	notes = symbol__annotation(sym);
@@ -506,6 +506,11 @@ static int symbol__inc_addr_samples(struct symbol *sym, struct map *map,
 int addr_map_symbol__inc_samples(struct addr_map_symbol *ams, int evidx)
 {
 	return symbol__inc_addr_samples(ams->sym, ams->map, evidx, ams->al_addr);
+}
+
+int hist_entry__inc_addr_samples(struct hist_entry *he, int evidx, u64 ip)
+{
+	return symbol__inc_addr_samples(he->ms.sym, he->ms.map, evidx, ip);
 }
 
 static void disasm_line__init_ins(struct disasm_line *dl)
@@ -555,8 +560,7 @@ static int disasm_line__parse(char *line, char **namep, char **rawp)
 	return 0;
 
 out_free_name:
-	free(*namep);
-	*namep = NULL;
+	zfree(namep);
 	return -1;
 }
 
@@ -581,7 +585,7 @@ static struct disasm_line *disasm_line__new(s64 offset, char *line, size_t privs
 	return dl;
 
 out_free_line:
-	free(dl->line);
+	zfree(&dl->line);
 out_delete:
 	free(dl);
 	return NULL;
@@ -589,8 +593,8 @@ out_delete:
 
 void disasm_line__free(struct disasm_line *dl)
 {
-	free(dl->line);
-	free(dl->name);
+	zfree(&dl->line);
+	zfree(&dl->name);
 	if (dl->ins && dl->ins->ops->free)
 		dl->ins->ops->free(&dl->ops);
 	else
@@ -1108,8 +1112,7 @@ static void symbol__free_source_line(struct symbol *sym, int len)
 		src_line = (void *)src_line + sizeof_src_line;
 	}
 
-	free(notes->src->lines);
-	notes->src->lines = NULL;
+	zfree(&notes->src->lines);
 }
 
 /* Get the filename:line for the colored entries */
@@ -1396,4 +1399,14 @@ int symbol__tty_annotate(struct symbol *sym, struct map *map,
 	disasm__purge(&symbol__annotation(sym)->src->source);
 
 	return 0;
+}
+
+int hist_entry__annotate(struct hist_entry *he, size_t privsize)
+{
+	return symbol__annotate(he->ms.sym, he->ms.map, privsize);
+}
+
+bool ui__has_annotation(void)
+{
+	return use_browser == 1 && sort__has_sym;
 }

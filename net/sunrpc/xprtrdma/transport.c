@@ -414,7 +414,7 @@ xprt_rdma_close(struct rpc_xprt *xprt)
 	if (r_xprt->rx_ep.rep_connected > 0)
 		xprt->reestablish_timeout = 0;
 	xprt_disconnect_done(xprt);
-	(void) rpcrdma_ep_disconnect(&r_xprt->rx_ep, &r_xprt->rx_ia);
+	rpcrdma_ep_disconnect(&r_xprt->rx_ep, &r_xprt->rx_ia);
 }
 
 static void
@@ -448,23 +448,6 @@ xprt_rdma_connect(struct rpc_xprt *xprt, struct rpc_task *task)
 		if (!RPC_IS_ASYNC(task))
 			flush_delayed_work(&r_xprt->rdma_connect);
 	}
-}
-
-static int
-xprt_rdma_reserve_xprt(struct rpc_xprt *xprt, struct rpc_task *task)
-{
-	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
-	int credits = atomic_read(&r_xprt->rx_buf.rb_credits);
-
-	/* == RPC_CWNDSCALE @ init, but *after* setup */
-	if (r_xprt->rx_buf.rb_cwndscale == 0UL) {
-		r_xprt->rx_buf.rb_cwndscale = xprt->cwnd;
-		dprintk("RPC:       %s: cwndscale %lu\n", __func__,
-			r_xprt->rx_buf.rb_cwndscale);
-		BUG_ON(r_xprt->rx_buf.rb_cwndscale <= 0);
-	}
-	xprt->cwnd = credits * r_xprt->rx_buf.rb_cwndscale;
-	return xprt_reserve_xprt_cong(xprt, task);
 }
 
 /*
@@ -570,9 +553,7 @@ xprt_rdma_free(void *buffer)
 		__func__, rep, (rep && rep->rr_func) ? " (with waiter)" : "");
 
 	/*
-	 * Finish the deregistration. When using mw bind, this was
-	 * begun in rpcrdma_reply_handler(). In all other modes, we
-	 * do it here, in thread context. The process is considered
+	 * Finish the deregistration.  The process is considered
 	 * complete when the rr_func vector becomes NULL - this
 	 * was put in place during rpcrdma_reply_handler() - the wait
 	 * call below will not block if the dereg is "done". If
@@ -582,11 +563,6 @@ xprt_rdma_free(void *buffer)
 		--req->rl_nchunks;
 		i += rpcrdma_deregister_external(
 			&req->rl_segments[i], r_xprt);
-	}
-
-	if (rep && wait_event_interruptible(rep->rr_unbind, !rep->rr_func)) {
-		rep->rr_func = NULL;	/* abandon the callback */
-		req->rl_reply = NULL;
 	}
 
 	if (req->rl_iov.length == 0) {	/* see allocate above */
@@ -621,14 +597,14 @@ xprt_rdma_send_request(struct rpc_task *task)
 	struct rpc_xprt *xprt = rqst->rq_xprt;
 	struct rpcrdma_req *req = rpcr_to_rdmar(rqst);
 	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
+	int rc = 0;
 
-	/* marshal the send itself */
-	if (req->rl_niovs == 0 && rpcrdma_marshal_req(rqst) != 0) {
-		r_xprt->rx_stats.failed_marshal_count++;
-		dprintk("RPC:       %s: rpcrdma_marshal_req failed\n",
-			__func__);
-		return -EIO;
-	}
+	if (req->rl_niovs == 0)
+		rc = rpcrdma_marshal_req(rqst);
+	else if (r_xprt->rx_ia.ri_memreg_strategy == RPCRDMA_FRMR)
+		rc = rpcrdma_marshal_chunks(rqst, 0);
+	if (rc < 0)
+		goto failed_marshal;
 
 	if (req->rl_reply == NULL) 		/* e.g. reconnection */
 		rpcrdma_recv_buffer_get(req);
@@ -651,6 +627,12 @@ xprt_rdma_send_request(struct rpc_task *task)
 	rqst->rq_bytes_sent = 0;
 	return 0;
 
+failed_marshal:
+	r_xprt->rx_stats.failed_marshal_count++;
+	dprintk("RPC:       %s: rpcrdma_marshal_req failed, status %i\n",
+		__func__, rc);
+	if (rc == -EIO)
+		return -EIO;
 drop_connection:
 	xprt_disconnect_done(xprt);
 	return -ENOTCONN;	/* implies disconnect */
@@ -696,7 +678,7 @@ static void xprt_rdma_print_stats(struct rpc_xprt *xprt, struct seq_file *seq)
  */
 
 static struct rpc_xprt_ops xprt_rdma_procs = {
-	.reserve_xprt		= xprt_rdma_reserve_xprt,
+	.reserve_xprt		= xprt_reserve_xprt_cong,
 	.release_xprt		= xprt_release_xprt_cong, /* sunrpc/xprt.c */
 	.alloc_slot		= xprt_alloc_slot,
 	.release_request	= xprt_release_rqst_cong,       /* ditto */

@@ -38,6 +38,7 @@ struct dm_cell_key {
  * themselves.
  */
 struct dm_bio_prison_cell {
+	struct list_head user_list;	/* for client use */
 	struct rb_node node;
 
 	struct dm_cell_key key;
@@ -91,6 +92,14 @@ void dm_cell_release_no_holder(struct dm_bio_prison *prison,
 			       struct bio_list *inmates);
 void dm_cell_error(struct dm_bio_prison *prison,
 		   struct dm_bio_prison_cell *cell, int error);
+
+/*
+ * Visits the cell and then releases.  Guarantees no new inmates are
+ * inserted between the visit and release.
+ */
+void dm_cell_visit_release(struct dm_bio_prison *prison,
+			   void (*visit_fn)(void *, struct dm_bio_prison_cell *),
+			   void *context, struct dm_bio_prison_cell *cell);
 
 /*----------------------------------------------------------------*/
 

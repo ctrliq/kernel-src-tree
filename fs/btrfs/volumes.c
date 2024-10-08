@@ -5691,6 +5691,7 @@ int btrfs_map_bio(struct btrfs_root *root, int rw, struct bio *bio,
 			BUG_ON(!bio); /* -ENOMEM */
 		} else {
 			bio = first_bio;
+			bbio->flags |= BTRFS_BIO_ORIG_BIO_SUBMITTED;
 		}
 
 		submit_stripe_bio(root, bbio, bio,

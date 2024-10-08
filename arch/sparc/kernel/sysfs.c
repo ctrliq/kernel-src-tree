@@ -300,7 +300,7 @@ static int __init topology_init(void)
 
 	check_mmu_stats();
 
-	cpu_notifier_register_begin();
+	register_cpu_notifier(&sysfs_cpu_nb);
 
 	for_each_possible_cpu(cpu) {
 		struct cpu *c = &per_cpu(cpu_devices, cpu);
@@ -309,10 +309,6 @@ static int __init topology_init(void)
 		if (cpu_online(cpu))
 			register_cpu_online(cpu);
 	}
-
-	__register_cpu_notifier(&sysfs_cpu_nb);
-
-	cpu_notifier_register_done();
 
 	return 0;
 }

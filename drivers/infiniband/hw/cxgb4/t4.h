@@ -73,7 +73,14 @@ struct t4_status_page {
 			sizeof(struct fw_ri_isgl)) / sizeof(struct fw_ri_sge))
 #define T4_MAX_FR_IMMD ((T4_SQ_NUM_BYTES - sizeof(struct fw_ri_fr_nsmr_wr) - \
 			sizeof(struct fw_ri_immd)) & ~31UL)
-#define T4_MAX_FR_DEPTH (1024 / sizeof(u64))
+#define T4_MAX_FR_IMMD_DEPTH (T4_MAX_FR_IMMD / sizeof(u64))
+#define T4_MAX_FR_DSGL 1024
+#define T4_MAX_FR_DSGL_DEPTH (T4_MAX_FR_DSGL / sizeof(u64))
+
+static inline int t4_max_fr_depth(int use_dsgl)
+{
+	return use_dsgl ? T4_MAX_FR_DSGL_DEPTH : T4_MAX_FR_IMMD_DEPTH;
+}
 
 #define T4_RQ_NUM_SLOTS 2
 #define T4_RQ_NUM_BYTES (T4_EQ_ENTRY_SIZE * T4_RQ_NUM_SLOTS)
@@ -226,8 +233,8 @@ struct t4_cqe {
 #define CQE_WRID_SQ_IDX(x)	((x)->u.scqe.cidx)
 
 /* generic accessor macros */
-#define CQE_WRID_HI(x)		((x)->u.gen.wrid_hi)
-#define CQE_WRID_LOW(x)		((x)->u.gen.wrid_low)
+#define CQE_WRID_HI(x)		(be32_to_cpu((x)->u.gen.wrid_hi))
+#define CQE_WRID_LOW(x)		(be32_to_cpu((x)->u.gen.wrid_low))
 
 /* macros for flit 3 of the cqe */
 #define S_CQE_GENBIT	63
@@ -259,6 +266,8 @@ struct t4_swsqe {
 	int			signaled;
 	u16			idx;
 	int                     flushed;
+	struct timespec         host_ts;
+	u64                     sge_ts;
 };
 
 static inline pgprot_t t4_pgprot_wc(pgprot_t prot)
@@ -296,6 +305,8 @@ struct t4_sq {
 
 struct t4_swrqe {
 	u64 wr_id;
+	struct timespec host_ts;
+	u64 sge_ts;
 };
 
 struct t4_rq {

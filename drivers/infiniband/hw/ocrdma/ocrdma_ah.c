@@ -113,16 +113,16 @@ struct ib_ah *ocrdma_create_ah(struct ib_pd *ibpd, struct ib_ah_attr *attr)
 	status = ocrdma_query_gid(&dev->ibdev, 1, attr->grh.sgid_index, &sgid);
 	if (status) {
 		pr_err("%s(): Failed to query sgid, status = %d\n",
-		      __func__, status);
+		       __func__, status);
 		goto av_conf_err;
 	}
 
 	if (pd->uctx) {
 		status = rdma_addr_find_dmac_by_grh(&sgid, &attr->grh.dgid,
-                                        attr->dmac, &attr->vlan_id);
+						    attr->dmac, &attr->vlan_id);
 		if (status) {
-			pr_err("%s(): Failed to resolve dmac from gid." 
-				"status = %d\n", __func__, status);
+			pr_err("%s(): Failed to resolve dmac from gid. status = %d\n",
+			       __func__, status);
 			goto av_conf_err;
 		}
 	}

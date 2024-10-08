@@ -195,6 +195,16 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
 	col_idx = 0;
 
 	perf_hpp__for_each_format(fmt) {
+		if (perf_hpp__should_skip(fmt))
+			continue;
+
+		/*
+		 * XXX no way to determine where symcol column is..
+		 *     Just use last column for now.
+		 */
+		if (perf_hpp__is_sort_entry(fmt))
+			sym_col = col_idx;
+
 		fmt->header(fmt, &hpp, hists_to_evsel(hists));
 
 		gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(view),
@@ -223,14 +233,12 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
 		struct hist_entry *h = rb_entry(nd, struct hist_entry, rb_node);
 		GtkTreeIter iter;
 		u64 total = hists__total_period(h->hists);
-		float percent = 0.0;
+		float percent;
 
 		if (h->filtered)
 			continue;
 
-		if (total)
-			percent = h->stat.period * 100.0 / total;
-
+		percent = hist_entry__get_percent_limit(h);
 		if (percent < min_pcnt)
 			continue;
 
@@ -239,6 +247,9 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
 		col_idx = 0;
 
 		perf_hpp__for_each_format(fmt) {
+			if (perf_hpp__should_skip(fmt))
+				continue;
+
 			if (fmt->color)
 				fmt->color(fmt, &hpp, h);
 			else
@@ -249,7 +260,8 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
 
 		if (symbol_conf.use_callchain && sort__has_sym) {
 			if (callchain_param.mode == CHAIN_GRAPH_REL)
-				total = h->stat.period;
+				total = symbol_conf.cumulate_callchain ?
+					h->stat_acc->period : h->stat.period;
 
 			perf_gtk__add_callchain(&h->sorted_chain, store, &iter,
 						sym_col, total);
@@ -306,7 +318,7 @@ int perf_evlist__gtk_browse_hists(struct perf_evlist *evlist,
 
 	gtk_container_add(GTK_CONTAINER(window), vbox);
 
-	list_for_each_entry(pos, &evlist->entries, node) {
+	evlist__for_each(evlist, pos) {
 		struct hists *hists = &pos->hists;
 		const char *evname = perf_evsel__name(pos);
 		GtkWidget *scrolled_window;

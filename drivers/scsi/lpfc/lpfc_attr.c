@@ -919,10 +919,15 @@ lpfc_sli4_pdev_reg_request(struct lpfc_hba *phba, uint32_t opcode)
 		phba->cfg_sriov_nr_virtfn = 0;
 	}
 
+	if (opcode == LPFC_FW_DUMP)
+		phba->hba_flag |= HBA_FW_DUMP_OP;
+
 	status = lpfc_do_offline(phba, LPFC_EVT_OFFLINE);
 
-	if (status != 0)
+	if (status != 0) {
+		phba->hba_flag &= ~HBA_FW_DUMP_OP;
 		return status;
+	}
 
 	/* wait for the device to be quiesced before firmware reset */
 	msleep(100);
@@ -4655,7 +4660,7 @@ LPFC_ATTR_R(EnableXLane, 0, 0, 1, "Enable Express Lane Feature.");
 #       0x0 - 0x7f  = CS_CTL field in FC header (high 7 bits)
 # Value range is [0x0,0x7f]. Default value is 0
 */
-LPFC_ATTR_R(XLanePriority, 0, 0x0, 0x7f, "CS_CTL for Express Lane Feature.");
+LPFC_ATTR_RW(XLanePriority, 0, 0x0, 0x7f, "CS_CTL for Express Lane Feature.");
 
 /*
 # lpfc_enable_bg: Enable BlockGuard (Emulex's Implementation of T10-DIF)

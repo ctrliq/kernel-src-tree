@@ -1,6 +1,6 @@
 /*
  * QLogic Fibre Channel HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2014 QLogic Corporation
  *
  * See LICENSE.qla2xxx for copyright and licensing details.
  */
@@ -1934,8 +1934,8 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
 	if (fx_type == FXDISC_GET_CONFIG_INFO) {
 		struct config_info_data *pinfo =
 		    (struct config_info_data *) fdisc->u.fxiocb.rsp_addr;
-		memcpy(&vha->hw->mr.product_name, pinfo->product_name,
-		    sizeof(vha->hw->mr.product_name));
+		strcpy(vha->hw->model_number, pinfo->model_num);
+		strcpy(vha->hw->model_desc, pinfo->model_description);
 		memcpy(&vha->hw->mr.symbolic_name, pinfo->symbolic_name,
 		    sizeof(vha->hw->mr.symbolic_name));
 		memcpy(&vha->hw->mr.serial_num, pinfo->serial_num,
@@ -1981,7 +1981,8 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
 		memcpy(vha->hw->gid_list, pinfo, QLAFX00_TGT_NODE_LIST_SIZE);
 	} else if (fx_type == FXDISC_ABORT_IOCTL)
 		fdisc->u.fxiocb.result =
-		    (fdisc->u.fxiocb.result == cpu_to_le32(0x68)) ?
+		    (fdisc->u.fxiocb.result ==
+			cpu_to_le32(QLAFX00_IOCTL_ICOB_ABORT_SUCCESS)) ?
 		    cpu_to_le32(QLA_SUCCESS) : cpu_to_le32(QLA_FUNCTION_FAILED);
 
 	rval = le32_to_cpu(fdisc->u.fxiocb.result);
@@ -2904,6 +2905,7 @@ qlafx00_intr_handler(int irq, void *dev_id)
 	struct rsp_que *rsp;
 	unsigned long	flags;
 	uint32_t clr_intr = 0;
+	uint32_t intr_stat = 0;
 
 	rsp = (struct rsp_que *) dev_id;
 	if (!rsp) {
@@ -2923,34 +2925,26 @@ qlafx00_intr_handler(int irq, void *dev_id)
 	vha = pci_get_drvdata(ha->pdev);
 	for (iter = 50; iter--; clr_intr = 0) {
 		stat = QLAFX00_RD_INTR_REG(ha);
-		if ((stat & QLAFX00_HST_INT_STS_BITS) == 0)
+		intr_stat = stat & QLAFX00_HST_INT_STS_BITS;
+		if (!intr_stat)
 			break;
 
-		switch (stat & QLAFX00_HST_INT_STS_BITS) {
-		case QLAFX00_INTR_MB_CMPLT:
-		case QLAFX00_INTR_MB_RSP_CMPLT:
-		case QLAFX00_INTR_MB_ASYNC_CMPLT:
-		case QLAFX00_INTR_ALL_CMPLT:
+		if (stat & QLAFX00_INTR_MB_CMPLT) {
 			mb[0] = RD_REG_WORD(&reg->mailbox16);
 			qlafx00_mbx_completion(vha, mb[0]);
 			status |= MBX_INTERRUPT;
 			clr_intr |= QLAFX00_INTR_MB_CMPLT;
-			break;
-		case QLAFX00_INTR_ASYNC_CMPLT:
-		case QLAFX00_INTR_RSP_ASYNC_CMPLT:
+		}
+		if (intr_stat & QLAFX00_INTR_ASYNC_CMPLT) {
 			ha->aenmb[0] = RD_REG_WORD(&reg->aenmailbox0);
 			qlafx00_async_event(vha);
 			clr_intr |= QLAFX00_INTR_ASYNC_CMPLT;
-			break;
-		case QLAFX00_INTR_RSP_CMPLT:
+		}
+		if (intr_stat & QLAFX00_INTR_RSP_CMPLT) {
 			qlafx00_process_response_queue(vha, rsp);
 			clr_intr |= QLAFX00_INTR_RSP_CMPLT;
-			break;
-		default:
-			ql_dbg(ql_dbg_async, vha, 0x507a,
-			    "Unrecognized interrupt type (%d).\n", stat);
-			break;
 		}
+
 		QLAFX00_CLR_INTR_REG(ha, clr_intr);
 		QLAFX00_RD_INTR_REG(ha);
 	}

@@ -42,6 +42,8 @@
 #include <asm/trace.h>
 #include <asm/firmware.h>
 #include <asm/plpar_wrappers.h>
+#include <asm/kexec.h>
+#include <asm/fadump.h>
 
 #include "pseries.h"
 
@@ -92,7 +94,7 @@ void vpa_init(int cpu)
 	 * PAPR says this feature is SLB-Buffer but firmware never
 	 * reports that.  All SPLPAR support SLB shadow buffer.
 	 */
-	addr = __pa(&slb_shadow[cpu]);
+	addr = __pa(paca[cpu].slb_shadow_ptr);
 	if (firmware_has_feature(FW_FEATURE_SPLPAR)) {
 		ret = register_slb_shadow(hwcpu, addr);
 		if (ret)
@@ -152,7 +154,7 @@ static long pSeries_lpar_hpte_insert(unsigned long hpte_group,
 	flags = 0;
 
 	/* Make pHyp happy */
-	if ((rflags & _PAGE_NO_CACHE) & !(rflags & _PAGE_WRITETHRU))
+	if ((rflags & _PAGE_NO_CACHE) && !(rflags & _PAGE_WRITETHRU))
 		hpte_r &= ~HPTE_R_M;
 
 	if (firmware_has_feature(FW_FEATURE_XCMO) && !(hpte_r & HPTE_R_N))
@@ -248,8 +250,17 @@ static void pSeries_lpar_hptab_clear(void)
 	}
 
 #ifdef __LITTLE_ENDIAN__
-	/* Reset exceptions to big endian */
-	if (firmware_has_feature(FW_FEATURE_SET_MODE)) {
+	/*
+	 * Reset exceptions to big endian.
+	 *
+	 * FIXME this is a hack for kexec, we need to reset the exception
+	 * endian before starting the new kernel and this is a convenient place
+	 * to do it.
+	 *
+	 * This is also called on boot when a fadump happens. In that case we
+	 * must not change the exception endian mode.
+	 */
+	if (firmware_has_feature(FW_FEATURE_SET_MODE) && !is_fadump_active()) {
 		long rc;
 
 		rc = pseries_big_endian_exceptions();
@@ -258,8 +269,13 @@ static void pSeries_lpar_hptab_clear(void)
 		 * out to the user, but at least this will stop us from
 		 * continuing on further and creating an even more
 		 * difficult to debug situation.
+		 *
+		 * There is a known problem when kdump'ing, if cpus are offline
+		 * the above call will fail. Rather than panicking again, keep
+		 * going and hope the kdump kernel is also little endian, which
+		 * it usually is.
 		 */
-		if (rc)
+		if (rc && !kdump_in_progress())
 			panic("Could not enable big endian exceptions");
 	}
 #endif

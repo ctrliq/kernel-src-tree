@@ -154,7 +154,7 @@ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr)
 			struct net_bridge_fdb_entry *f;
 
 			f = hlist_entry(h, struct net_bridge_fdb_entry, hlist);
-			if (f->dst == p && f->is_local) {
+			if (f->dst == p && f->is_local && !f->added_by_user) {
 				/* maybe another port has same hw addr? */
 				struct net_bridge_port *op;
 				u16 vid = f->vlan_id;
@@ -162,10 +162,18 @@ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr)
 					if (op != p &&
 					    ether_addr_equal(op->dev->dev_addr,
 							     f->addr.addr) &&
-					    nbp_vlan_find(op, vid)) {
+					    (!vid || nbp_vlan_find(op, vid))) {
 						f->dst = op;
 						goto skip_delete;
 					}
+				}
+
+				/* maybe bridge device has same hw addr? */
+				if (ether_addr_equal(br->dev->dev_addr,
+						     f->addr.addr) &&
+				    (!vid || br_vlan_find(br, vid))) {
+					f->dst = NULL;
+					goto skip_delete;
 				}
 
 				/* delete old one */
@@ -306,6 +314,7 @@ void br_fdb_delete_by_port(struct net_bridge *br,
 					    ether_addr_equal(op->dev->dev_addr,
 							     f->addr.addr)) {
 						f->dst = op;
+						f->added_by_user = 0;
 						goto skip_delete;
 					}
 				}
@@ -456,6 +465,7 @@ static struct net_bridge_fdb_entry *fdb_create(struct hlist_head *head,
 		fdb->vlan_id = vid;
 		fdb->is_local = 0;
 		fdb->is_static = 0;
+		fdb->added_by_user = 0;
 		fdb->updated = fdb->used = jiffies;
 		hlist_add_head_rcu(&fdb->hlist, head);
 	}
@@ -507,10 +517,11 @@ int br_fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
 }
 
 void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
-		   const unsigned char *addr, u16 vid)
+		   const unsigned char *addr, u16 vid, bool added_by_user)
 {
 	struct hlist_head *head = &br->hash[br_mac_hash(addr, vid)];
 	struct net_bridge_fdb_entry *fdb;
+	bool fdb_modified = false;
 
 	/* some users want to always flood. */
 	if (hold_time(br) == 0)
@@ -531,15 +542,25 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
 					source->dev->name);
 		} else {
 			/* fastpath: update of existing entry */
-			fdb->dst = source;
+			if (unlikely(source != fdb->dst)) {
+				fdb->dst = source;
+				fdb_modified = true;
+			}
 			fdb->updated = jiffies;
+			if (unlikely(added_by_user))
+				fdb->added_by_user = 1;
+			if (unlikely(fdb_modified))
+				fdb_notify(br, fdb, RTM_NEWNEIGH);
 		}
 	} else {
 		spin_lock(&br->hash_lock);
 		if (likely(!fdb_find(head, addr, vid))) {
 			fdb = fdb_create(head, source, addr, vid);
-			if (fdb)
+			if (fdb) {
+				if (unlikely(added_by_user))
+					fdb->added_by_user = 1;
 				fdb_notify(br, fdb, RTM_NEWNEIGH);
+			}
 		}
 		/* else  we lose race and someone else inserts
 		 * it first, don't bother updating
@@ -720,6 +741,7 @@ static int fdb_add_entry(struct net_bridge_port *source, const __u8 *addr,
 
 		modified = true;
 	}
+	fdb->added_by_user = 1;
 
 	fdb->used = jiffies;
 	if (modified) {
@@ -737,7 +759,7 @@ static int __br_fdb_add(struct ndmsg *ndm, struct net_bridge_port *p,
 
 	if (ndm->ndm_flags & NTF_USE) {
 		rcu_read_lock();
-		br_fdb_update(p->br, p, addr, vid);
+		br_fdb_update(p->br, p, addr, vid, true);
 		rcu_read_unlock();
 	} else {
 		spin_lock_bh(&p->br->hash_lock);
@@ -900,4 +922,60 @@ int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
 	}
 out:
 	return err;
+}
+
+int br_fdb_sync_static(struct net_bridge *br, struct net_bridge_port *p)
+{
+	struct net_bridge_fdb_entry *fdb, *tmp;
+	int i;
+	int err;
+
+	ASSERT_RTNL();
+
+	for (i = 0; i < BR_HASH_SIZE; i++) {
+		hlist_for_each_entry(fdb, &br->hash[i], hlist) {
+			/* We only care for static entries */
+			if (!fdb->is_static)
+				continue;
+
+			err = dev_uc_add(p->dev, fdb->addr.addr);
+			if (err)
+				goto rollback;
+		}
+	}
+	return 0;
+
+rollback:
+	for (i = 0; i < BR_HASH_SIZE; i++) {
+		hlist_for_each_entry(tmp, &br->hash[i], hlist) {
+			/* If we reached the fdb that failed, we can stop */
+			if (tmp == fdb)
+				break;
+
+			/* We only care for static entries */
+			if (!tmp->is_static)
+				continue;
+
+			dev_uc_del(p->dev, tmp->addr.addr);
+		}
+	}
+	return err;
+}
+
+void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p)
+{
+	struct net_bridge_fdb_entry *fdb;
+	int i;
+
+	ASSERT_RTNL();
+
+	for (i = 0; i < BR_HASH_SIZE; i++) {
+		hlist_for_each_entry_rcu(fdb, &br->hash[i], hlist) {
+			/* We only care for static entries */
+			if (!fdb->is_static)
+				continue;
+
+			dev_uc_del(p->dev, fdb->addr.addr);
+		}
+	}
 }

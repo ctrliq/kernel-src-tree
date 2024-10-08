@@ -95,15 +95,6 @@ static inline struct udp_hslot *udp_hashslot2(struct udp_table *table,
 	return &table->hash2[hash & table->mask];
 }
 
-/* Note: this must match 'valbool' in sock_setsockopt */
-#define UDP_CSUM_NOXMIT		1
-
-/* Used by SunRPC/xprt layer. */
-#define UDP_CSUM_NORCV		2
-
-/* Default, as per the RFC, is to always do csums. */
-#define UDP_CSUM_DEFAULT	0
-
 extern struct proto udp_prot;
 
 extern atomic_long_t udp_memory_allocated;
@@ -203,14 +194,14 @@ extern int udp_lib_get_port(struct sock *sk, unsigned short snum,
 			    int (*)(const struct sock *,const struct sock *),
 			    unsigned int hash2_nulladdr);
 
-static inline __be16 udp_flow_src_port(struct net *net, struct sk_buff *skb,
+static inline __be16 udp_flow_src_port(struct net __attribute__((unused)) *net, struct sk_buff *skb,
 				       int min, int max, bool use_eth)
 {
 	u32 hash;
 
 	if (min >= max) {
 		/* Use default range */
-		inet_get_local_port_range(net, &min, &max);
+		inet_get_local_port_range(&min, &max);
 	}
 
 	hash = skb_get_hash(skb);

@@ -439,7 +439,7 @@ static void ext4_es_insert_extent_ext_check(struct inode *inode,
 		ee_start = ext4_ext_pblock(ex);
 		ee_len = ext4_ext_get_actual_len(ex);
 
-		ee_status = ext4_ext_is_uninitialized(ex) ? 1 : 0;
+		ee_status = ext4_ext_is_unwritten(ex) ? 1 : 0;
 		es_status = ext4_es_is_unwritten(es) ? 1 : 0;
 
 		/*
@@ -964,10 +964,10 @@ retry:
 			continue;
 		}
 
-		if (ei->i_es_lru_nr == 0 || ei == locked_ei)
+		if (ei->i_es_lru_nr == 0 || ei == locked_ei ||
+		    !write_trylock(&ei->i_es_lock))
 			continue;
 
-		write_lock(&ei->i_es_lock);
 		ret = __es_try_to_reclaim_extents(ei, nr_to_scan);
 		if (ei->i_es_lru_nr == 0)
 			list_del_init(&ei->i_es_lru);

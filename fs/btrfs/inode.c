@@ -65,7 +65,7 @@ struct btrfs_iget_args {
 	struct btrfs_root *root;
 };
 
-static const struct inode_operations btrfs_dir_inode_operations;
+static const struct inode_operations_wrapper btrfs_dir_inode_operations;
 static const struct inode_operations btrfs_symlink_inode_operations;
 static const struct inode_operations btrfs_dir_ro_inode_operations;
 static const struct inode_operations btrfs_special_inode_operations;
@@ -125,7 +125,7 @@ static int btrfs_init_inode_security(struct btrfs_trans_handle *trans,
  * the btree.  The caller should have done a btrfs_drop_extents so that
  * no overlapping inline items exist in the btree
  */
-static noinline int insert_inline_extent(struct btrfs_trans_handle *trans,
+static int insert_inline_extent(struct btrfs_trans_handle *trans,
 				struct btrfs_path *path, int extent_inserted,
 				struct btrfs_root *root, struct inode *inode,
 				u64 start, size_t size, size_t compressed_size,
@@ -3514,10 +3514,12 @@ cache_acl:
 		break;
 	case S_IFDIR:
 		inode->i_fop = &btrfs_dir_file_operations;
-		if (root == root->fs_info->tree_root)
+		if (root == root->fs_info->tree_root) {
 			inode->i_op = &btrfs_dir_ro_inode_operations;
-		else
-			inode->i_op = &btrfs_dir_inode_operations;
+		} else {
+			inode->i_op = &btrfs_dir_inode_operations.ops;
+			inode->i_flags |= S_IOPS_WRAPPER;
+		}
 		break;
 	case S_IFLNK:
 		inode->i_op = &btrfs_symlink_inode_operations;
@@ -4627,6 +4629,64 @@ static int btrfs_setattr(struct dentry *dentry, struct iattr *attr)
 	return err;
 }
 
+/*
+ * While truncating the inode pages during eviction, we get the VFS calling
+ * btrfs_invalidatepage() against each page of the inode. This is slow because
+ * the calls to btrfs_invalidatepage() result in a huge amount of calls to
+ * lock_extent_bits() and clear_extent_bit(), which keep merging and splitting
+ * extent_state structures over and over, wasting lots of time.
+ *
+ * Therefore if the inode is being evicted, let btrfs_invalidatepage() skip all
+ * those expensive operations on a per page basis and do only the ordered io
+ * finishing, while we release here the extent_map and extent_state structures,
+ * without the excessive merging and splitting.
+ */
+static void evict_inode_truncate_pages(struct inode *inode)
+{
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct extent_map_tree *map_tree = &BTRFS_I(inode)->extent_tree;
+	struct rb_node *node;
+
+	ASSERT(inode->i_state & I_FREEING);
+	truncate_inode_pages(&inode->i_data, 0);
+
+	write_lock(&map_tree->lock);
+	while (!RB_EMPTY_ROOT(&map_tree->map)) {
+		struct extent_map *em;
+
+		node = rb_first(&map_tree->map);
+		em = rb_entry(node, struct extent_map, rb_node);
+		clear_bit(EXTENT_FLAG_PINNED, &em->flags);
+		clear_bit(EXTENT_FLAG_LOGGING, &em->flags);
+		remove_extent_mapping(map_tree, em);
+		free_extent_map(em);
+	}
+	write_unlock(&map_tree->lock);
+
+	spin_lock(&io_tree->lock);
+	while (!RB_EMPTY_ROOT(&io_tree->state)) {
+		struct extent_state *state;
+		struct extent_state *cached_state = NULL;
+
+		node = rb_first(&io_tree->state);
+		state = rb_entry(node, struct extent_state, rb_node);
+		atomic_inc(&state->refs);
+		spin_unlock(&io_tree->lock);
+
+		lock_extent_bits(io_tree, state->start, state->end,
+				 0, &cached_state);
+		clear_extent_bit(io_tree, state->start, state->end,
+				 EXTENT_LOCKED | EXTENT_DIRTY |
+				 EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING |
+				 EXTENT_DEFRAG, 1, 1,
+				 &cached_state, GFP_NOFS);
+		free_extent_state(state);
+
+		spin_lock(&io_tree->lock);
+	}
+	spin_unlock(&io_tree->lock);
+}
+
 void btrfs_evict_inode(struct inode *inode)
 {
 	struct btrfs_trans_handle *trans;
@@ -4637,7 +4697,8 @@ void btrfs_evict_inode(struct inode *inode)
 
 	trace_btrfs_inode_evict(inode);
 
-	truncate_inode_pages_final(&inode->i_data);
+	evict_inode_truncate_pages(inode);
+
 	if (inode->i_nlink &&
 	    ((btrfs_root_refs(&root->root_item) != 0 &&
 	      root->root_key.objectid != BTRFS_ROOT_TREE_OBJECTID) ||
@@ -5989,7 +6050,7 @@ static int btrfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	if (err)
 		goto out_fail;
 
-	inode->i_op = &btrfs_dir_inode_operations;
+	inode->i_op = &btrfs_dir_inode_operations.ops;
 	inode->i_fop = &btrfs_dir_file_operations;
 
 	btrfs_i_size_write(inode, 0);
@@ -7599,6 +7660,7 @@ static void btrfs_invalidatepage(struct page *page, unsigned long offset)
 	struct extent_state *cached_state = NULL;
 	u64 page_start = page_offset(page);
 	u64 page_end = page_start + PAGE_CACHE_SIZE - 1;
+	int inode_evicting = inode->i_state & I_FREEING;
 
 	/*
 	 * we have the page locked, so new writeback can't start,
@@ -7614,17 +7676,21 @@ static void btrfs_invalidatepage(struct page *page, unsigned long offset)
 		btrfs_releasepage(page, GFP_NOFS);
 		return;
 	}
-	lock_extent_bits(tree, page_start, page_end, 0, &cached_state);
-	ordered = btrfs_lookup_ordered_extent(inode, page_offset(page));
+
+	if (!inode_evicting)
+		lock_extent_bits(tree, page_start, page_end, 0, &cached_state);
+	ordered = btrfs_lookup_ordered_extent(inode, page_start);
 	if (ordered) {
 		/*
 		 * IO on this page will never be started, so we need
 		 * to account for any ordered extents now
 		 */
-		clear_extent_bit(tree, page_start, page_end,
-				 EXTENT_DIRTY | EXTENT_DELALLOC |
-				 EXTENT_LOCKED | EXTENT_DO_ACCOUNTING |
-				 EXTENT_DEFRAG, 1, 0, &cached_state, GFP_NOFS);
+		if (!inode_evicting)
+			clear_extent_bit(tree, page_start, page_end,
+					 EXTENT_DIRTY | EXTENT_DELALLOC |
+					 EXTENT_LOCKED | EXTENT_DO_ACCOUNTING |
+					 EXTENT_DEFRAG, 1, 0, &cached_state,
+					 GFP_NOFS);
 		/*
 		 * whoever cleared the private bit is responsible
 		 * for the finish_ordered_io
@@ -7648,14 +7714,22 @@ static void btrfs_invalidatepage(struct page *page, unsigned long offset)
 				btrfs_finish_ordered_io(ordered);
 		}
 		btrfs_put_ordered_extent(ordered);
-		cached_state = NULL;
-		lock_extent_bits(tree, page_start, page_end, 0, &cached_state);
+		if (!inode_evicting) {
+			cached_state = NULL;
+			lock_extent_bits(tree, page_start, page_end, 0,
+					 &cached_state);
+		}
 	}
-	clear_extent_bit(tree, page_start, page_end,
-		 EXTENT_LOCKED | EXTENT_DIRTY | EXTENT_DELALLOC |
-		 EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG, 1, 1,
-		 &cached_state, GFP_NOFS);
-	__btrfs_releasepage(page, GFP_NOFS);
+
+	if (!inode_evicting) {
+		clear_extent_bit(tree, page_start, page_end,
+				 EXTENT_LOCKED | EXTENT_DIRTY |
+				 EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING |
+				 EXTENT_DEFRAG, 1, 1,
+				 &cached_state, GFP_NOFS);
+
+		__btrfs_releasepage(page, GFP_NOFS);
+	}
 
 	ClearPageChecked(page);
 	if (PagePrivate(page)) {
@@ -7979,7 +8053,7 @@ int btrfs_create_subvol_root(struct btrfs_trans_handle *trans,
 				&index);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
-	inode->i_op = &btrfs_dir_inode_operations;
+	inode->i_op = &btrfs_dir_inode_operations.ops;
 	inode->i_fop = &btrfs_dir_file_operations;
 
 	set_nlink(inode, 1);
@@ -8895,7 +8969,8 @@ static int btrfs_permission(struct inode *inode, int mask)
 	return generic_permission(inode, mask);
 }
 
-static const struct inode_operations btrfs_dir_inode_operations = {
+static const struct inode_operations_wrapper btrfs_dir_inode_operations = {
+	.ops = {
 	.getattr	= btrfs_getattr,
 	.lookup		= btrfs_lookup,
 	.create		= btrfs_create,
@@ -8903,7 +8978,7 @@ static const struct inode_operations btrfs_dir_inode_operations = {
 	.link		= btrfs_link,
 	.mkdir		= btrfs_mkdir,
 	.rmdir		= btrfs_rmdir,
-	.rename2	= btrfs_rename2,
+	.rename		= btrfs_rename,
 	.symlink	= btrfs_symlink,
 	.setattr	= btrfs_setattr,
 	.mknod		= btrfs_mknod,
@@ -8914,6 +8989,8 @@ static const struct inode_operations btrfs_dir_inode_operations = {
 	.permission	= btrfs_permission,
 	.get_acl	= btrfs_get_acl,
 	.update_time	= btrfs_update_time,
+	},
+	.rename2	= btrfs_rename2,
 };
 static const struct inode_operations btrfs_dir_ro_inode_operations = {
 	.lookup		= btrfs_lookup,

@@ -14,7 +14,7 @@
 #include "build-id.h"
 #include "event.h"
 
-#ifdef LIBELF_SUPPORT
+#ifdef HAVE_LIBELF_SUPPORT
 #include <libelf.h>
 #include <gelf.h>
 #endif
@@ -22,7 +22,7 @@
 
 #include "dso.h"
 
-#ifdef HAVE_CPLUS_DEMANGLE
+#ifdef HAVE_CPLUS_DEMANGLE_SUPPORT
 extern char *cplus_demangle(const char *, int);
 
 static inline char *bfd_demangle(void __maybe_unused *v, const char *c, int i)
@@ -47,10 +47,15 @@ static inline char *bfd_demangle(void __maybe_unused *v,
  * libelf 0.8.x and earlier do not support ELF_C_READ_MMAP;
  * for newer versions we can use mmap to reduce memory usage:
  */
-#ifdef LIBELF_MMAP
+#ifdef HAVE_LIBELF_MMAP_SUPPORT
 # define PERF_ELF_C_READ_MMAP ELF_C_READ_MMAP
 #else
 # define PERF_ELF_C_READ_MMAP ELF_C_READ
+#endif
+
+#ifdef HAVE_LIBELF_SUPPORT
+extern Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
+				GElf_Shdr *shp, const char *name, size_t *idx);
 #endif
 
 #ifndef DMGL_PARAMS
@@ -76,6 +81,17 @@ struct symbol {
 void symbol__delete(struct symbol *sym);
 void symbols__delete(struct rb_root *symbols);
 
+/* symbols__for_each_entry - iterate over symbols (rb_root)
+ *
+ * @symbols: the rb_root of symbols
+ * @pos: the 'struct symbol *' to use as a loop cursor
+ * @nd: the 'struct rb_node *' to use as a temporary storage
+ */
+#define symbols__for_each_entry(symbols, pos, nd)			\
+	for (nd = rb_first(symbols);					\
+	     nd && (pos = rb_entry(nd, struct symbol, rb_node));	\
+	     nd = rb_next(nd))
+
 static inline size_t symbol__size(const struct symbol *sym)
 {
 	return sym->end - sym->start + 1;
@@ -94,6 +110,7 @@ struct symbol_conf {
 			show_nr_samples,
 			show_total_period,
 			use_callchain,
+			cumulate_callchain,
 			exclude_other,
 			show_cpu_utilization,
 			initialized,
@@ -102,6 +119,7 @@ struct symbol_conf {
 			annotate_src,
 			event_group,
 			demangle,
+			demangle_kernel,
 			filter_relative;
 	const char	*vmlinux_name,
 			*kallsyms_name,
@@ -167,6 +185,7 @@ struct mem_info {
 };
 
 struct addr_location {
+	struct machine *machine;
 	struct thread *thread;
 	struct map    *map;
 	struct symbol *sym;
@@ -182,7 +201,7 @@ struct symsrc {
 	int fd;
 	enum dso_binary_type type;
 
-#ifdef LIBELF_SUPPORT
+#ifdef HAVE_LIBELF_SUPPORT
 	Elf *elf;
 	GElf_Ehdr ehdr;
 

@@ -1048,9 +1048,9 @@ int gfs2_glock_nq(struct gfs2_holder *gh)
 	if (unlikely((LM_FLAG_NOEXP & gh->gh_flags) &&
 		     test_and_clear_bit(GLF_FROZEN, &gl->gl_flags))) {
 		set_bit(GLF_REPLY_PENDING, &gl->gl_flags);
-		atomic_inc(&gl->gl_ref);
+		gl->gl_lockref.count++;
 		if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
-			atomic_dec(&gl->gl_ref);
+			gl->gl_lockref.count--;
 	}
 	run_queue(gl, 1);
 	spin_unlock(&gl->gl_spin);

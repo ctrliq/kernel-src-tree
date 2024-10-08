@@ -1,6 +1,6 @@
 /*
  * QLogic Fibre Channel HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2014 QLogic Corporation
  *
  * See LICENSE.qla2xxx for copyright and licensing details.
  */
@@ -844,11 +844,8 @@ qla2x00_wait_for_hba_online(scsi_qla_host_t *vha)
 }
 
 /*
- * qla2x00_wait_for_reset_ready
- *    Wait till the HBA is online after going through
- *    <= MAX_RETRIES_OF_ISP_ABORT  or
- *    finally HBA is disabled ie marked offline or flash
- *    operations are in progress.
+ * qla2x00_wait_for_hba_ready
+ * Wait till the HBA is ready before doing driver unload
  *
  * Input:
  *     ha - pointer to host adapter structure
@@ -857,35 +854,15 @@ qla2x00_wait_for_hba_online(scsi_qla_host_t *vha)
  *    Does context switching-Release SPIN_LOCK
  *    (if any) before calling this routine.
  *
- * Return:
- *    Success (Adapter is online/no flash ops) : 0
- *    Failed  (Adapter is offline/disabled/flash ops in progress) : 1
  */
-static int
-qla2x00_wait_for_reset_ready(scsi_qla_host_t *vha)
+static void
+qla2x00_wait_for_hba_ready(scsi_qla_host_t *vha)
 {
-	int		return_status;
-	unsigned long	wait_online;
 	struct qla_hw_data *ha = vha->hw;
-	scsi_qla_host_t *base_vha = pci_get_drvdata(ha->pdev);
 
-	wait_online = jiffies + (MAX_LOOP_TIMEOUT * HZ);
-	while (((test_bit(ISP_ABORT_NEEDED, &base_vha->dpc_flags)) ||
-	    test_bit(ABORT_ISP_ACTIVE, &base_vha->dpc_flags) ||
-	    test_bit(ISP_ABORT_RETRY, &base_vha->dpc_flags) ||
-	    ha->optrom_state != QLA_SWAITING ||
-	    ha->dpc_active) && time_before(jiffies, wait_online))
+	while ((!(vha->flags.online) || ha->dpc_active ||
+	    ha->flags.mbox_busy))
 		msleep(1000);
-
-	if (base_vha->flags.online &&  ha->optrom_state == QLA_SWAITING)
-		return_status = QLA_SUCCESS;
-	else
-		return_status = QLA_FUNCTION_FAILED;
-
-	ql_dbg(ql_dbg_taskm, vha, 0x8019,
-	    "%s return status=%d.\n", __func__, return_status);
-
-	return return_status;
 }
 
 int
@@ -1252,7 +1229,11 @@ qla2xxx_eh_host_reset(struct scsi_cmnd *cmd)
 	ql_log(ql_log_info, vha, 0x8018,
 	    "ADAPTER RESET ISSUED nexus=%ld:%d:%d.\n", vha->host_no, id, lun);
 
-	if (qla2x00_wait_for_reset_ready(vha) != QLA_SUCCESS)
+	/*
+	 * No point in issuing another reset if one is active.  Also do not
+	 * attempt a reset if we are updating flash.
+	 */
+	if (qla2x00_reset_active(vha) || ha->optrom_state != QLA_SWAITING)
 		goto eh_host_reset_lock;
 
 	if (vha != base_vha) {
@@ -1993,7 +1974,7 @@ static struct isp_operations qla82xx_isp_ops = {
 	.prep_ms_fdmi_iocb	= qla24xx_prep_ms_fdmi_iocb,
 	.read_nvram		= qla24xx_read_nvram_data,
 	.write_nvram		= qla24xx_write_nvram_data,
-	.fw_dump		= qla24xx_fw_dump,
+	.fw_dump		= qla82xx_fw_dump,
 	.beacon_on		= qla82xx_beacon_on,
 	.beacon_off		= qla82xx_beacon_off,
 	.beacon_blink		= NULL,
@@ -2031,7 +2012,7 @@ static struct isp_operations qla8044_isp_ops = {
 	.prep_ms_fdmi_iocb	= qla24xx_prep_ms_fdmi_iocb,
 	.read_nvram		= NULL,
 	.write_nvram		= NULL,
-	.fw_dump		= qla24xx_fw_dump,
+	.fw_dump		= qla8044_fw_dump,
 	.beacon_on		= qla82xx_beacon_on,
 	.beacon_off		= qla82xx_beacon_off,
 	.beacon_blink		= NULL,
@@ -2244,7 +2225,7 @@ qla2x00_set_isp_flags(struct qla_hw_data *ha)
 	}
 
 	if (IS_QLA82XX(ha))
-		ha->port_no = !(ha->portnum & 1);
+		ha->port_no = ha->portnum & 1;
 	else
 		/* Get adapter physical port no from interrupt pin register. */
 		pci_read_config_byte(ha->pdev, PCI_INTERRUPT_PIN, &ha->port_no);
@@ -2717,7 +2698,7 @@ que_init:
 	}
 
 	if (IS_QLAFX00(ha))
-		host->can_queue = 1024;
+		host->can_queue = QLAFX00_MAX_CANQUEUE;
 	else
 		host->can_queue = req->num_outstanding_cmds - 10;
 
@@ -2855,12 +2836,8 @@ skip_dpc:
 
 	qla2x00_dfs_setup(base_vha);
 
-	if (IS_QLAFX00(ha))
-		ql_log(ql_log_info, base_vha, 0x015a,
-		    "QLogic %s.\n", ha->mr.product_name);
-	else
-		ql_log(ql_log_info, base_vha, 0x00fb,
-		    "QLogic %s - %s.\n", ha->model_number, ha->model_desc);
+	ql_log(ql_log_info, base_vha, 0x00fb,
+	    "QLogic %s - %s.\n", ha->model_number, ha->model_desc);
 	ql_log(ql_log_info, base_vha, 0x00fc,
 	    "ISP%04X: %s @ %s hdma%c host#=%ld fw=%s.\n",
 	    pdev->device, ha->isp_ops->pci_info_str(base_vha, pci_info),
@@ -2904,7 +2881,7 @@ probe_hw_failed:
 	}
 	if (IS_QLA8044(ha)) {
 		qla8044_idc_lock(ha);
-		qla8044_clear_drv_active(base_vha);
+		qla8044_clear_drv_active(ha);
 		qla8044_idc_unlock(ha);
 	}
 iospace_config_failed:
@@ -3007,6 +2984,8 @@ qla2x00_remove_one(struct pci_dev *pdev)
 	base_vha = pci_get_drvdata(pdev);
 	ha = base_vha->hw;
 
+	qla2x00_wait_for_hba_ready(base_vha);
+
 	ha->flags.host_shutting_down = 1;
 
 	set_bit(UNLOADING, &base_vha->dpc_flags);
@@ -3099,7 +3078,7 @@ qla2x00_remove_one(struct pci_dev *pdev)
 
 	if (IS_QLA8044(ha)) {
 		qla8044_idc_lock(ha);
-		qla8044_clear_drv_active(base_vha);
+		qla8044_clear_drv_active(ha);
 		qla8044_idc_unlock(ha);
 	}
 	if (IS_QLA82XX(ha)) {
@@ -3588,6 +3567,7 @@ qla2x00_free_fw_dump(struct qla_hw_data *ha)
 	ha->eft_dma = 0;
 	ha->fw_dump = NULL;
 	ha->fw_dumped = 0;
+	ha->fw_dump_cap_flags = 0;
 	ha->fw_dump_reading = 0;
 }
 

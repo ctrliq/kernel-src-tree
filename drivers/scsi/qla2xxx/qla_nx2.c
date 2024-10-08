@@ -1,6 +1,6 @@
 /*
  * QLogic Fibre Channel HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2014 QLogic Corporation
  *
  * See LICENSE.qla2xxx for copyright and licensing details.
  */
@@ -1349,10 +1349,10 @@ exit_start_fw:
 }
 
 void
-qla8044_clear_drv_active(struct scsi_qla_host *vha)
+qla8044_clear_drv_active(struct qla_hw_data *ha)
 {
 	uint32_t drv_active;
-	struct qla_hw_data *ha = vha->hw;
+	struct scsi_qla_host *vha = pci_get_drvdata(ha->pdev);
 
 	drv_active = qla8044_rd_direct(vha, QLA8044_CRB_DRV_ACTIVE_INDEX);
 	drv_active &= ~(1 << (ha->portnum));
@@ -1416,7 +1416,7 @@ qla8044_device_bootstrap(struct scsi_qla_host *vha)
 	if (rval != QLA_SUCCESS) {
 		ql_log(ql_log_info, vha, 0xb0b3,
 		     "%s: HW State: FAILED\n", __func__);
-		qla8044_clear_drv_active(vha);
+		qla8044_clear_drv_active(ha);
 		qla8044_wr_direct(vha, QLA8044_CRB_DEV_STATE_INDEX,
 		    QLA8XXX_DEV_FAILED);
 		return rval;
@@ -1836,7 +1836,7 @@ qla8044_update_idc_reg(struct scsi_qla_host *vha)
 
 	rval = qla8044_set_idc_ver(vha);
 	if (rval == QLA_FUNCTION_FAILED)
-		qla8044_clear_drv_active(vha);
+		qla8044_clear_drv_active(ha);
 	qla8044_idc_unlock(ha);
 
 exit_update_idc_reg:
@@ -4061,3 +4061,19 @@ exit_isp_reset:
 	return rval;
 }
 
+void
+qla8044_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
+{
+	struct qla_hw_data *ha = vha->hw;
+
+	if (!ha->allow_cna_fw_dump)
+		return;
+
+	scsi_block_requests(vha->host);
+	ha->flags.isp82xx_no_md_cap = 1;
+	qla8044_idc_lock(ha);
+	qla82xx_set_reset_owner(vha);
+	qla8044_idc_unlock(ha);
+	qla2x00_wait_for_chip_reset(vha);
+	scsi_unblock_requests(vha->host);
+}

@@ -7,6 +7,7 @@
  * Copyright (C) 2006 Hannes Reinecke
  */
 
+#include <linux/acpi.h>
 #include <linux/ata.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -18,8 +19,6 @@
 #include <linux/pci.h>
 #include <linux/dmi.h>
 #include <linux/module.h>
-
-#include <acpi/acpi_bus.h>
 
 #define REGS_PER_GTF		7
 
@@ -97,6 +96,17 @@ int ide_acpi_init(void)
 bool ide_port_acpi(ide_hwif_t *hwif)
 {
 	return ide_noacpi == 0 && hwif->acpidata;
+}
+
+static acpi_handle acpi_get_child(acpi_handle handle, u64 addr)
+{
+	struct acpi_device *adev;
+
+	if (!handle || acpi_bus_get_device(handle, &adev))
+		return NULL;
+
+	adev = acpi_find_child_device(adev, addr, false);
+	return adev ? adev->handle : NULL;
 }
 
 /**

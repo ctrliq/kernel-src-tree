@@ -125,6 +125,34 @@ static struct test {
 		.desc = "Test parsing with no sample_id_all bit set",
 		.func = test__parse_no_sample_id_all,
 	},
+#if defined(__x86_64__) || defined(__i386__) || defined(__arm__)
+#ifdef HAVE_DWARF_UNWIND_SUPPORT
+	{
+		.desc = "Test dwarf unwind",
+		.func = test__dwarf_unwind,
+	},
+#endif
+#endif
+	{
+		.desc = "Test filtering hist entries",
+		.func = test__hists_filter,
+	},
+	{
+		.desc = "Test mmap thread lookup",
+		.func = test__mmap_thread_lookup,
+	},
+	{
+		.desc = "Test thread mg sharing",
+		.func = test__thread_mg_share,
+	},
+	{
+		.desc = "Test output sorting of hist entries",
+		.func = test__hists_output,
+	},
+	{
+		.desc = "Test cumulation of child hist entries",
+		.func = test__hists_cumulate,
+	},
 	{
 		.func = NULL,
 	},

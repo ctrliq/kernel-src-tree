@@ -17,6 +17,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/rbtree.h>
 
 #define	DM_MSG_PREFIX	"thin"
@@ -204,7 +205,10 @@ struct pool_features {
 
 struct thin_c;
 typedef void (*process_bio_fn)(struct thin_c *tc, struct bio *bio);
+typedef void (*process_cell_fn)(struct thin_c *tc, struct dm_bio_prison_cell *cell);
 typedef void (*process_mapping_fn)(struct dm_thin_new_mapping *m);
+
+#define CELL_SORT_ARRAY_SIZE 8192
 
 struct pool {
 	struct list_head list;
@@ -249,8 +253,13 @@ struct pool {
 	process_bio_fn process_bio;
 	process_bio_fn process_discard;
 
+	process_cell_fn process_cell;
+	process_cell_fn process_discard_cell;
+
 	process_mapping_fn process_prepared_mapping;
 	process_mapping_fn process_prepared_discard;
+
+	struct dm_bio_prison_cell *cell_sort_array[CELL_SORT_ARRAY_SIZE];
 };
 
 static enum pool_mode get_pool_mode(struct pool *pool);
@@ -287,6 +296,7 @@ struct thin_c {
 
 	bool requeue_mode:1;
 	spinlock_t lock;
+	struct list_head deferred_cells;
 	struct bio_list deferred_bio_list;
 	struct bio_list retry_on_resume_list;
 	struct rb_root sort_bio_list; /* sorted list of deferred bios */
@@ -343,25 +353,21 @@ static void cell_release(struct pool *pool,
 	dm_bio_prison_free_cell(pool->prison, cell);
 }
 
+static void cell_visit_release(struct pool *pool,
+			       void (*fn)(void *, struct dm_bio_prison_cell *),
+			       void *context,
+			       struct dm_bio_prison_cell *cell)
+{
+	dm_cell_visit_release(pool->prison, fn, context, cell);
+	dm_bio_prison_free_cell(pool->prison, cell);
+}
+
 static void cell_release_no_holder(struct pool *pool,
 				   struct dm_bio_prison_cell *cell,
 				   struct bio_list *bios)
 {
 	dm_cell_release_no_holder(pool->prison, cell, bios);
 	dm_bio_prison_free_cell(pool->prison, cell);
-}
-
-static void cell_defer_no_holder_no_free(struct thin_c *tc,
-					 struct dm_bio_prison_cell *cell)
-{
-	struct pool *pool = tc->pool;
-	unsigned long flags;
-
-	spin_lock_irqsave(&tc->lock, flags);
-	dm_cell_release_no_holder(pool->prison, cell, &tc->deferred_bio_list);
-	spin_unlock_irqrestore(&tc->lock, flags);
-
-	wake_worker(pool);
 }
 
 static void cell_error_with_code(struct pool *pool,
@@ -374,6 +380,16 @@ static void cell_error_with_code(struct pool *pool,
 static void cell_error(struct pool *pool, struct dm_bio_prison_cell *cell)
 {
 	cell_error_with_code(pool, cell, -EIO);
+}
+
+static void cell_success(struct pool *pool, struct dm_bio_prison_cell *cell)
+{
+	cell_error_with_code(pool, cell, 0);
+}
+
+static void cell_requeue(struct pool *pool, struct dm_bio_prison_cell *cell)
+{
+	cell_error_with_code(pool, cell, DM_ENDIO_REQUEUE);
 }
 
 /*----------------------------------------------------------------*/
@@ -446,44 +462,65 @@ struct dm_thin_endio_hook {
 	struct rb_node rb_node;
 };
 
-static void requeue_bio_list(struct thin_c *tc, struct bio_list *master)
+static void __merge_bio_list(struct bio_list *bios, struct bio_list *master)
+{
+	bio_list_merge(bios, master);
+	bio_list_init(master);
+}
+
+static void error_bio_list(struct bio_list *bios, int error)
 {
 	struct bio *bio;
+
+	while ((bio = bio_list_pop(bios)))
+		bio_endio(bio, error);
+}
+
+static void error_thin_bio_list(struct thin_c *tc, struct bio_list *master, int error)
+{
 	struct bio_list bios;
 	unsigned long flags;
 
 	bio_list_init(&bios);
 
 	spin_lock_irqsave(&tc->lock, flags);
-	bio_list_merge(&bios, master);
-	bio_list_init(master);
+	__merge_bio_list(&bios, master);
 	spin_unlock_irqrestore(&tc->lock, flags);
 
-	while ((bio = bio_list_pop(&bios)))
-		bio_endio(bio, DM_ENDIO_REQUEUE);
+	error_bio_list(&bios, error);
+}
+
+static void requeue_deferred_cells(struct thin_c *tc)
+{
+	struct pool *pool = tc->pool;
+	unsigned long flags;
+	struct list_head cells;
+	struct dm_bio_prison_cell *cell, *tmp;
+
+	INIT_LIST_HEAD(&cells);
+
+	spin_lock_irqsave(&tc->lock, flags);
+	list_splice_init(&tc->deferred_cells, &cells);
+	spin_unlock_irqrestore(&tc->lock, flags);
+
+	list_for_each_entry_safe(cell, tmp, &cells, user_list)
+		cell_requeue(pool, cell);
 }
 
 static void requeue_io(struct thin_c *tc)
 {
-	requeue_bio_list(tc, &tc->deferred_bio_list);
-	requeue_bio_list(tc, &tc->retry_on_resume_list);
-}
-
-static void error_thin_retry_list(struct thin_c *tc)
-{
-	struct bio *bio;
-	unsigned long flags;
 	struct bio_list bios;
+	unsigned long flags;
 
 	bio_list_init(&bios);
 
 	spin_lock_irqsave(&tc->lock, flags);
-	bio_list_merge(&bios, &tc->retry_on_resume_list);
-	bio_list_init(&tc->retry_on_resume_list);
+	__merge_bio_list(&bios, &tc->deferred_bio_list);
+	__merge_bio_list(&bios, &tc->retry_on_resume_list);
 	spin_unlock_irqrestore(&tc->lock, flags);
 
-	while ((bio = bio_list_pop(&bios)))
-		bio_io_error(bio);
+	error_bio_list(&bios, DM_ENDIO_REQUEUE);
+	requeue_deferred_cells(tc);
 }
 
 static void error_retry_list(struct pool *pool)
@@ -492,7 +529,7 @@ static void error_retry_list(struct pool *pool)
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(tc, &pool->active_thins, list)
-		error_thin_retry_list(tc);
+		error_thin_bio_list(tc, &tc->retry_on_resume_list, -EIO);
 	rcu_read_unlock();
 }
 
@@ -681,22 +718,8 @@ static void overwrite_endio(struct bio *bio, int err)
  */
 
 /*
- * This sends the bios in the cell back to the deferred_bios list.
- */
-static void cell_defer(struct thin_c *tc, struct dm_bio_prison_cell *cell)
-{
-	struct pool *pool = tc->pool;
-	unsigned long flags;
-
-	spin_lock_irqsave(&tc->lock, flags);
-	cell_release(pool, cell, &tc->deferred_bio_list);
-	spin_unlock_irqrestore(&tc->lock, flags);
-
-	wake_worker(pool);
-}
-
-/*
- * Same as cell_defer above, except it omits the original holder of the cell.
+ * This sends the bios in the cell, except the original holder, back
+ * to the deferred_bios list.
  */
 static void cell_defer_no_holder(struct thin_c *tc, struct dm_bio_prison_cell *cell)
 {
@@ -708,6 +731,62 @@ static void cell_defer_no_holder(struct thin_c *tc, struct dm_bio_prison_cell *c
 	spin_unlock_irqrestore(&tc->lock, flags);
 
 	wake_worker(pool);
+}
+
+static void thin_defer_bio(struct thin_c *tc, struct bio *bio);
+
+struct remap_info {
+	struct thin_c *tc;
+	struct bio_list defer_bios;
+	struct bio_list issue_bios;
+};
+
+static void __inc_remap_and_issue_cell(void *context,
+				       struct dm_bio_prison_cell *cell)
+{
+	struct remap_info *info = context;
+	struct bio *bio;
+
+	while ((bio = bio_list_pop(&cell->bios))) {
+		if (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA))
+			bio_list_add(&info->defer_bios, bio);
+		else {
+			inc_all_io_entry(info->tc->pool, bio);
+
+			/*
+			 * We can't issue the bios with the bio prison lock
+			 * held, so we add them to a list to issue on
+			 * return from this function.
+			 */
+			bio_list_add(&info->issue_bios, bio);
+		}
+	}
+}
+
+static void inc_remap_and_issue_cell(struct thin_c *tc,
+				     struct dm_bio_prison_cell *cell,
+				     dm_block_t block)
+{
+	struct bio *bio;
+	struct remap_info info;
+
+	info.tc = tc;
+	bio_list_init(&info.defer_bios);
+	bio_list_init(&info.issue_bios);
+
+	/*
+	 * We have to be careful to inc any bios we're about to issue
+	 * before the cell is released, and avoid a race with new bios
+	 * being added to the cell.
+	 */
+	cell_visit_release(tc->pool, __inc_remap_and_issue_cell,
+			   &info, cell);
+
+	while ((bio = bio_list_pop(&info.defer_bios)))
+		thin_defer_bio(tc, bio);
+
+	while ((bio = bio_list_pop(&info.issue_bios)))
+		remap_and_issue(info.tc, bio, block);
 }
 
 static void process_prepared_mapping_fail(struct dm_thin_new_mapping *m)
@@ -754,10 +833,13 @@ static void process_prepared_mapping(struct dm_thin_new_mapping *m)
 	 * the bios in the cell.
 	 */
 	if (bio) {
-		cell_defer_no_holder(tc, m->cell);
+		inc_remap_and_issue_cell(tc, m->cell, m->data_block);
 		bio_endio(bio, 0);
-	} else
-		cell_defer(tc, m->cell);
+	} else {
+		inc_all_io_entry(tc->pool, m->cell->holder);
+		remap_and_issue(tc, m->cell->holder, m->data_block);
+		inc_remap_and_issue_cell(tc, m->cell, m->data_block);
+	}
 
 out:
 	list_del(&m->list);
@@ -1205,19 +1287,21 @@ static void retry_bios_on_resume(struct pool *pool, struct dm_bio_prison_cell *c
 		retry_on_resume(bio);
 }
 
-static void process_discard(struct thin_c *tc, struct bio *bio)
+static void process_discard_cell(struct thin_c *tc, struct dm_bio_prison_cell *cell)
 {
 	int r;
+	struct bio *bio = cell->holder;
 	struct pool *pool = tc->pool;
-	struct dm_bio_prison_cell *cell, *cell2;
-	struct dm_cell_key key, key2;
+	struct dm_bio_prison_cell *cell2;
+	struct dm_cell_key key2;
 	dm_block_t block = get_bio_block(tc, bio);
 	struct dm_thin_lookup_result lookup_result;
 	struct dm_thin_new_mapping *m;
 
-	build_virtual_key(tc->td, block, &key);
-	if (bio_detain(tc->pool, &key, bio, &cell))
+	if (tc->requeue_mode) {
+		cell_requeue(pool, cell);
 		return;
+	}
 
 	r = dm_thin_find_block(tc->td, block, 1, &lookup_result);
 	switch (r) {
@@ -1285,6 +1369,19 @@ static void process_discard(struct thin_c *tc, struct bio *bio)
 	}
 }
 
+static void process_discard_bio(struct thin_c *tc, struct bio *bio)
+{
+	struct dm_bio_prison_cell *cell;
+	struct dm_cell_key key;
+	dm_block_t block = get_bio_block(tc, bio);
+
+	build_virtual_key(tc->td, block, &key);
+	if (bio_detain(tc->pool, &key, bio, &cell))
+		return;
+
+	process_discard_cell(tc, cell);
+}
+
 static void break_sharing(struct thin_c *tc, struct bio *bio, dm_block_t block,
 			  struct dm_cell_key *key,
 			  struct dm_thin_lookup_result *lookup_result,
@@ -1313,11 +1410,53 @@ static void break_sharing(struct thin_c *tc, struct bio *bio, dm_block_t block,
 	}
 }
 
+static void __remap_and_issue_shared_cell(void *context,
+					  struct dm_bio_prison_cell *cell)
+{
+	struct remap_info *info = context;
+	struct bio *bio;
+
+	while ((bio = bio_list_pop(&cell->bios))) {
+		if ((bio_data_dir(bio) == WRITE) ||
+		    (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA)))
+			bio_list_add(&info->defer_bios, bio);
+		else {
+			struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));;
+
+			h->shared_read_entry = dm_deferred_entry_inc(info->tc->pool->shared_read_ds);
+			inc_all_io_entry(info->tc->pool, bio);
+			bio_list_add(&info->issue_bios, bio);
+		}
+	}
+}
+
+static void remap_and_issue_shared_cell(struct thin_c *tc,
+					struct dm_bio_prison_cell *cell,
+					dm_block_t block)
+{
+	struct bio *bio;
+	struct remap_info info;
+
+	info.tc = tc;
+	bio_list_init(&info.defer_bios);
+	bio_list_init(&info.issue_bios);
+
+	cell_visit_release(tc->pool, __remap_and_issue_shared_cell,
+			   &info, cell);
+
+	while ((bio = bio_list_pop(&info.defer_bios)))
+		thin_defer_bio(tc, bio);
+
+	while ((bio = bio_list_pop(&info.issue_bios)))
+		remap_and_issue(tc, bio, block);
+}
+
 static void process_shared_bio(struct thin_c *tc, struct bio *bio,
 			       dm_block_t block,
-			       struct dm_thin_lookup_result *lookup_result)
+			       struct dm_thin_lookup_result *lookup_result,
+			       struct dm_bio_prison_cell *virt_cell)
 {
-	struct dm_bio_prison_cell *cell;
+	struct dm_bio_prison_cell *data_cell;
 	struct pool *pool = tc->pool;
 	struct dm_cell_key key;
 
@@ -1326,19 +1465,23 @@ static void process_shared_bio(struct thin_c *tc, struct bio *bio,
 	 * of being broken so we have nothing further to do here.
 	 */
 	build_data_key(tc->td, lookup_result->block, &key);
-	if (bio_detain(pool, &key, bio, &cell))
+	if (bio_detain(pool, &key, bio, &data_cell)) {
+		cell_defer_no_holder(tc, virt_cell);
 		return;
+	}
 
-	if (bio_data_dir(bio) == WRITE && bio->bi_size)
-		break_sharing(tc, bio, block, &key, lookup_result, cell);
-	else {
+	if (bio_data_dir(bio) == WRITE && bio->bi_size) {
+		break_sharing(tc, bio, block, &key, lookup_result, data_cell);
+		cell_defer_no_holder(tc, virt_cell);
+	} else {
 		struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
 
 		h->shared_read_entry = dm_deferred_entry_inc(pool->shared_read_ds);
 		inc_all_io_entry(pool, bio);
-		cell_defer_no_holder(tc, cell);
-
 		remap_and_issue(tc, bio, lookup_result->block);
+
+		remap_and_issue_shared_cell(tc, data_cell, lookup_result->block);
+		remap_and_issue_shared_cell(tc, virt_cell, lookup_result->block);
 	}
 }
 
@@ -1391,34 +1534,28 @@ static void provision_block(struct thin_c *tc, struct bio *bio, dm_block_t block
 	}
 }
 
-static void process_bio(struct thin_c *tc, struct bio *bio)
+static void process_cell(struct thin_c *tc, struct dm_bio_prison_cell *cell)
 {
 	int r;
 	struct pool *pool = tc->pool;
+	struct bio *bio = cell->holder;
 	dm_block_t block = get_bio_block(tc, bio);
-	struct dm_bio_prison_cell *cell;
-	struct dm_cell_key key;
 	struct dm_thin_lookup_result lookup_result;
 
-	/*
-	 * If cell is already occupied, then the block is already
-	 * being provisioned so we have nothing further to do here.
-	 */
-	build_virtual_key(tc->td, block, &key);
-	if (bio_detain(pool, &key, bio, &cell))
+	if (tc->requeue_mode) {
+		cell_requeue(pool, cell);
 		return;
+	}
 
 	r = dm_thin_find_block(tc->td, block, 1, &lookup_result);
 	switch (r) {
 	case 0:
-		if (lookup_result.shared) {
-			process_shared_bio(tc, bio, block, &lookup_result);
-			cell_defer_no_holder(tc, cell); /* FIXME: pass this cell into process_shared? */
-		} else {
+		if (lookup_result.shared)
+			process_shared_bio(tc, bio, block, &lookup_result, cell);
+		else {
 			inc_all_io_entry(pool, bio);
-			cell_defer_no_holder(tc, cell);
-
 			remap_and_issue(tc, bio, lookup_result.block);
+			inc_remap_and_issue_cell(tc, cell, lookup_result.block);
 		}
 		break;
 
@@ -1430,9 +1567,9 @@ static void process_bio(struct thin_c *tc, struct bio *bio)
 			if (bio_end_sector(bio) <= tc->origin_size)
 				remap_to_origin_and_issue(tc, bio);
 
-			else if (bio->bi_iter.bi_sector < tc->origin_size) {
+			else if (bio->bi_sector < tc->origin_size) {
 				zero_fill_bio(bio);
-				bio->bi_iter.bi_size = (tc->origin_size - bio->bi_iter.bi_sector) << SECTOR_SHIFT;
+				bio->bi_size = (tc->origin_size - bio->bi_sector) << SECTOR_SHIFT;
 				remap_to_origin_and_issue(tc, bio);
 
 			} else {
@@ -1452,7 +1589,26 @@ static void process_bio(struct thin_c *tc, struct bio *bio)
 	}
 }
 
-static void process_bio_read_only(struct thin_c *tc, struct bio *bio)
+static void process_bio(struct thin_c *tc, struct bio *bio)
+{
+	struct pool *pool = tc->pool;
+	dm_block_t block = get_bio_block(tc, bio);
+	struct dm_bio_prison_cell *cell;
+	struct dm_cell_key key;
+
+	/*
+	 * If cell is already occupied, then the block is already
+	 * being provisioned so we have nothing further to do here.
+	 */
+	build_virtual_key(tc->td, block, &key);
+	if (bio_detain(pool, &key, bio, &cell))
+		return;
+
+	process_cell(tc, cell);
+}
+
+static void __process_bio_read_only(struct thin_c *tc, struct bio *bio,
+				    struct dm_bio_prison_cell *cell)
 {
 	int r;
 	int rw = bio_data_dir(bio);
@@ -1462,15 +1618,21 @@ static void process_bio_read_only(struct thin_c *tc, struct bio *bio)
 	r = dm_thin_find_block(tc->td, block, 1, &lookup_result);
 	switch (r) {
 	case 0:
-		if (lookup_result.shared && (rw == WRITE) && bio->bi_size)
+		if (lookup_result.shared && (rw == WRITE) && bio->bi_size) {
 			handle_unserviceable_bio(tc->pool, bio);
-		else {
+			if (cell)
+				cell_defer_no_holder(tc, cell);
+		} else {
 			inc_all_io_entry(tc->pool, bio);
 			remap_and_issue(tc, bio, lookup_result.block);
+			if (cell)
+				inc_remap_and_issue_cell(tc, cell, lookup_result.block);
 		}
 		break;
 
 	case -ENODATA:
+		if (cell)
+			cell_defer_no_holder(tc, cell);
 		if (rw != READ) {
 			handle_unserviceable_bio(tc->pool, bio);
 			break;
@@ -1489,9 +1651,21 @@ static void process_bio_read_only(struct thin_c *tc, struct bio *bio)
 	default:
 		DMERR_LIMIT("%s: dm_thin_find_block() failed: error = %d",
 			    __func__, r);
+		if (cell)
+			cell_defer_no_holder(tc, cell);
 		bio_io_error(bio);
 		break;
 	}
+}
+
+static void process_bio_read_only(struct thin_c *tc, struct bio *bio)
+{
+	__process_bio_read_only(tc, bio, NULL);
+}
+
+static void process_cell_read_only(struct thin_c *tc, struct dm_bio_prison_cell *cell)
+{
+	__process_bio_read_only(tc, cell->holder, cell);
 }
 
 static void process_bio_success(struct thin_c *tc, struct bio *bio)
@@ -1502,6 +1676,16 @@ static void process_bio_success(struct thin_c *tc, struct bio *bio)
 static void process_bio_fail(struct thin_c *tc, struct bio *bio)
 {
 	bio_io_error(bio);
+}
+
+static void process_cell_success(struct thin_c *tc, struct dm_bio_prison_cell *cell)
+{
+	cell_success(tc->pool, cell);
+}
+
+static void process_cell_fail(struct thin_c *tc, struct dm_bio_prison_cell *cell)
+{
+	cell_error(tc->pool, cell);
 }
 
 /*
@@ -1521,7 +1705,7 @@ static void __thin_bio_rb_add(struct thin_c *tc, struct bio *bio)
 {
 	struct rb_node **rbp, *parent;
 	struct dm_thin_endio_hook *pbd;
-	sector_t bi_sector = bio->bi_iter.bi_sector;
+	sector_t bi_sector = bio->bi_sector;
 
 	rbp = &tc->sort_bio_list.rb_node;
 	parent = NULL;
@@ -1529,7 +1713,7 @@ static void __thin_bio_rb_add(struct thin_c *tc, struct bio *bio)
 		parent = *rbp;
 		pbd = thin_pbd(parent);
 
-		if (bi_sector < thin_bio(pbd)->bi_iter.bi_sector)
+		if (bi_sector < thin_bio(pbd)->bi_sector)
 			rbp = &(*rbp)->rb_left;
 		else
 			rbp = &(*rbp)->rb_right;
@@ -1588,7 +1772,7 @@ static void process_thin_deferred_bios(struct thin_c *tc)
 	unsigned count = 0;
 
 	if (tc->requeue_mode) {
-		requeue_bio_list(tc, &tc->deferred_bio_list);
+		error_thin_bio_list(tc, &tc->deferred_bio_list, DM_ENDIO_REQUEUE);
 		return;
 	}
 
@@ -1634,6 +1818,88 @@ static void process_thin_deferred_bios(struct thin_c *tc)
 		}
 	}
 	blk_finish_plug(&plug);
+}
+
+static int cmp_cells(const void *lhs, const void *rhs)
+{
+	struct dm_bio_prison_cell *lhs_cell = *((struct dm_bio_prison_cell **) lhs);
+	struct dm_bio_prison_cell *rhs_cell = *((struct dm_bio_prison_cell **) rhs);
+
+	BUG_ON(!lhs_cell->holder);
+	BUG_ON(!rhs_cell->holder);
+
+	if (lhs_cell->holder->bi_sector < rhs_cell->holder->bi_sector)
+		return -1;
+
+	if (lhs_cell->holder->bi_sector > rhs_cell->holder->bi_sector)
+		return 1;
+
+	return 0;
+}
+
+static unsigned sort_cells(struct pool *pool, struct list_head *cells)
+{
+	unsigned count = 0;
+	struct dm_bio_prison_cell *cell, *tmp;
+
+	list_for_each_entry_safe(cell, tmp, cells, user_list) {
+		if (count >= CELL_SORT_ARRAY_SIZE)
+			break;
+
+		pool->cell_sort_array[count++] = cell;
+		list_del(&cell->user_list);
+	}
+
+	sort(pool->cell_sort_array, count, sizeof(cell), cmp_cells, NULL);
+
+	return count;
+}
+
+static void process_thin_deferred_cells(struct thin_c *tc)
+{
+	struct pool *pool = tc->pool;
+	unsigned long flags;
+	struct list_head cells;
+	struct dm_bio_prison_cell *cell;
+	unsigned i, j, count;
+
+	INIT_LIST_HEAD(&cells);
+
+	spin_lock_irqsave(&tc->lock, flags);
+	list_splice_init(&tc->deferred_cells, &cells);
+	spin_unlock_irqrestore(&tc->lock, flags);
+
+	if (list_empty(&cells))
+		return;
+
+	do {
+		count = sort_cells(tc->pool, &cells);
+
+		for (i = 0; i < count; i++) {
+			cell = pool->cell_sort_array[i];
+			BUG_ON(!cell->holder);
+
+			/*
+			 * If we've got no free new_mapping structs, and processing
+			 * this bio might require one, we pause until there are some
+			 * prepared mappings to process.
+			 */
+			if (ensure_next_mapping(pool)) {
+				for (j = i; j < count; j++)
+					list_add(&pool->cell_sort_array[j]->user_list, &cells);
+
+				spin_lock_irqsave(&tc->lock, flags);
+				list_splice(&cells, &tc->deferred_cells);
+				spin_unlock_irqrestore(&tc->lock, flags);
+				return;
+			}
+
+			if (cell->holder->bi_rw & REQ_DISCARD)
+				pool->process_discard_cell(tc, cell);
+			else
+				pool->process_cell(tc, cell);
+		}
+	} while (!list_empty(&cells));
 }
 
 static void thin_get(struct thin_c *tc);
@@ -1684,6 +1950,7 @@ static void process_deferred_bios(struct pool *pool)
 
 	tc = get_first_thin(pool);
 	while (tc) {
+		process_thin_deferred_cells(tc);
 		process_thin_deferred_bios(tc);
 		tc = get_next_thin(pool, tc);
 	}
@@ -1862,6 +2129,8 @@ static void set_pool_mode(struct pool *pool, enum pool_mode new_mode)
 		dm_pool_metadata_read_only(pool->pmd);
 		pool->process_bio = process_bio_fail;
 		pool->process_discard = process_bio_fail;
+		pool->process_cell = process_cell_fail;
+		pool->process_discard_cell = process_cell_fail;
 		pool->process_prepared_mapping = process_prepared_mapping_fail;
 		pool->process_prepared_discard = process_prepared_discard_fail;
 
@@ -1874,6 +2143,8 @@ static void set_pool_mode(struct pool *pool, enum pool_mode new_mode)
 		dm_pool_metadata_read_only(pool->pmd);
 		pool->process_bio = process_bio_read_only;
 		pool->process_discard = process_bio_success;
+		pool->process_cell = process_cell_read_only;
+		pool->process_discard_cell = process_cell_success;
 		pool->process_prepared_mapping = process_prepared_mapping_fail;
 		pool->process_prepared_discard = process_prepared_discard_passdown;
 
@@ -1892,7 +2163,9 @@ static void set_pool_mode(struct pool *pool, enum pool_mode new_mode)
 		if (old_mode != new_mode)
 			notify_of_pool_mode_change(pool, "out-of-data-space");
 		pool->process_bio = process_bio_read_only;
-		pool->process_discard = process_discard;
+		pool->process_discard = process_discard_bio;
+		pool->process_cell = process_cell_read_only;
+		pool->process_discard_cell = process_discard_cell;
 		pool->process_prepared_mapping = process_prepared_mapping;
 		pool->process_prepared_discard = process_prepared_discard;
 
@@ -1905,7 +2178,9 @@ static void set_pool_mode(struct pool *pool, enum pool_mode new_mode)
 			notify_of_pool_mode_change(pool, "write");
 		dm_pool_metadata_read_write(pool->pmd);
 		pool->process_bio = process_bio;
-		pool->process_discard = process_discard;
+		pool->process_discard = process_discard_bio;
+		pool->process_cell = process_cell;
+		pool->process_discard_cell = process_discard_cell;
 		pool->process_prepared_mapping = process_prepared_mapping;
 		pool->process_prepared_discard = process_prepared_discard;
 		break;
@@ -1974,6 +2249,20 @@ static void thin_defer_bio_with_throttle(struct thin_c *tc, struct bio *bio)
 	throttle_unlock(&pool->throttle);
 }
 
+static void thin_defer_cell(struct thin_c *tc, struct dm_bio_prison_cell *cell)
+{
+	unsigned long flags;
+	struct pool *pool = tc->pool;
+
+	throttle_lock(&pool->throttle);
+	spin_lock_irqsave(&tc->lock, flags);
+	list_add_tail(&cell->user_list, &tc->deferred_cells);
+	spin_unlock_irqrestore(&tc->lock, flags);
+	throttle_unlock(&pool->throttle);
+
+	wake_worker(pool);
+}
+
 static void thin_hook_bio(struct thin_c *tc, struct bio *bio)
 {
 	struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
@@ -1994,8 +2283,7 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 	dm_block_t block = get_bio_block(tc, bio);
 	struct dm_thin_device *td = tc->td;
 	struct dm_thin_lookup_result result;
-	struct dm_bio_prison_cell cell1, cell2;
-	struct dm_bio_prison_cell *cell_result;
+	struct dm_bio_prison_cell *virt_cell, *data_cell;
 	struct dm_cell_key key;
 
 	thin_hook_bio(tc, bio);
@@ -2020,7 +2308,7 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 	 * there's a race with discard.
 	 */
 	build_virtual_key(tc->td, block, &key);
-	if (dm_bio_detain(tc->pool->prison, &key, bio, &cell1, &cell_result))
+	if (bio_detain(tc->pool, &key, bio, &virt_cell))
 		return DM_MAPIO_SUBMITTED;
 
 	r = dm_thin_find_block(td, block, 0, &result);
@@ -2045,20 +2333,19 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 			 * More distant ancestors are irrelevant. The
 			 * shared flag will be set in their case.
 			 */
-			thin_defer_bio(tc, bio);
-			cell_defer_no_holder_no_free(tc, &cell1);
+			thin_defer_cell(tc, virt_cell);
 			return DM_MAPIO_SUBMITTED;
 		}
 
 		build_data_key(tc->td, result.block, &key);
-		if (dm_bio_detain(tc->pool->prison, &key, bio, &cell2, &cell_result)) {
-			cell_defer_no_holder_no_free(tc, &cell1);
+		if (bio_detain(tc->pool, &key, bio, &data_cell)) {
+			cell_defer_no_holder(tc, virt_cell);
 			return DM_MAPIO_SUBMITTED;
 		}
 
 		inc_all_io_entry(tc->pool, bio);
-		cell_defer_no_holder_no_free(tc, &cell2);
-		cell_defer_no_holder_no_free(tc, &cell1);
+		cell_defer_no_holder(tc, data_cell);
+		cell_defer_no_holder(tc, virt_cell);
 
 		remap(tc, bio, result.block);
 		return DM_MAPIO_REMAPPED;
@@ -2070,14 +2357,13 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 			 * of doing so.
 			 */
 			handle_unserviceable_bio(tc->pool, bio);
-			cell_defer_no_holder_no_free(tc, &cell1);
+			cell_defer_no_holder(tc, virt_cell);
 			return DM_MAPIO_SUBMITTED;
 		}
 		/* fall through */
 
 	case -EWOULDBLOCK:
-		thin_defer_bio(tc, bio);
-		cell_defer_no_holder_no_free(tc, &cell1);
+		thin_defer_cell(tc, virt_cell);
 		return DM_MAPIO_SUBMITTED;
 
 	default:
@@ -2087,7 +2373,7 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 		 * pool is switched to fail-io mode.
 		 */
 		bio_io_error(bio);
-		cell_defer_no_holder_no_free(tc, &cell1);
+		cell_defer_no_holder(tc, virt_cell);
 		return DM_MAPIO_SUBMITTED;
 	}
 }
@@ -3459,6 +3745,7 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 	tc->thin_md = dm_table_get_md(ti->table);
 	spin_lock_init(&tc->lock);
+	INIT_LIST_HEAD(&tc->deferred_cells);
 	bio_list_init(&tc->deferred_bio_list);
 	bio_list_init(&tc->retry_on_resume_list);
 	tc->sort_bio_list = RB_ROOT;

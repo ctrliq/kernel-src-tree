@@ -209,7 +209,7 @@ static int perf_event__inject_buildid(struct perf_tool *tool,
 
 	cpumode = event->header.misc & PERF_RECORD_MISC_CPUMODE_MASK;
 
-	thread = machine__findnew_thread(machine, sample->pid, sample->pid);
+	thread = machine__findnew_thread(machine, sample->pid, sample->tid);
 	if (thread == NULL) {
 		pr_err("problem processing %d event, skipping it.\n",
 		       event->header.type);
@@ -229,7 +229,7 @@ static int perf_event__inject_buildid(struct perf_tool *tool,
 				 * account this as unresolved.
 				 */
 			} else {
-#ifdef LIBELF_SUPPORT
+#ifdef HAVE_LIBELF_SUPPORT
 				pr_warning("no symbols found in %s, maybe "
 					   "install a debug package?\n",
 					   al.map->dso->long_name);
@@ -312,7 +312,6 @@ found:
 	sample_sw.period = sample->period;
 	sample_sw.time	 = sample->time;
 	perf_event__synthesize_sample(event_sw, evsel->attr.sample_type,
-				      evsel->attr.sample_regs_user,
 				      evsel->attr.read_format, &sample_sw,
 				      false);
 	build_id__mark_dso_hit(tool, event_sw, &sample_sw, evsel, machine);
@@ -369,7 +368,7 @@ static int __cmd_inject(struct perf_inject *inject)
 
 		inject->tool.ordered_samples = true;
 
-		list_for_each_entry(evsel, &session->evlist->entries, node) {
+		evlist__for_each(session->evlist, evsel) {
 			const char *name = perf_evsel__name(evsel);
 
 			if (!strcmp(name, "sched:sched_switch")) {

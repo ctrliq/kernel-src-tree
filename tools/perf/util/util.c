@@ -1,8 +1,8 @@
 #include "../perf.h"
 #include "util.h"
-#include "fs.h"
+#include <api/fs/fs.h>
 #include <sys/mman.h>
-#ifdef BACKTRACE_SUPPORT
+#ifdef HAVE_BACKTRACE_SUPPORT
 #include <execinfo.h>
 #endif
 #include <stdio.h>
@@ -240,7 +240,7 @@ int hex2u64(const char *ptr, u64 *long_val)
 }
 
 /* Obtain a backtrace and print it to stdout. */
-#ifdef BACKTRACE_SUPPORT
+#ifdef HAVE_BACKTRACE_SUPPORT
 void dump_stack(void)
 {
 	void *array[16];

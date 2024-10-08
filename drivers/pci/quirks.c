@@ -344,7 +344,7 @@ static void quirk_io_region(struct pci_dev *dev, int port,
 	/* Convert from PCI bus to resource space */
 	bus_region.start = region;
 	bus_region.end = region + size - 1;
-	pcibios_bus_to_resource(dev, res, &bus_region);
+	pcibios_bus_to_resource(dev->bus, res, &bus_region);
 
 	if (!pci_claim_resource(dev, nr))
 		dev_info(&dev->dev, "quirk: %pR claimed by %s\n", res, name);
@@ -3340,7 +3340,8 @@ int pci_dev_specific_reset(struct pci_dev *dev, int probe)
 static void quirk_dma_func0_alias(struct pci_dev *dev)
 {
 	if (PCI_FUNC(dev->devfn) != 0) {
-		dev->dma_alias_devfn = PCI_DEVFN(PCI_SLOT(dev->devfn), 0);
+		dev->pci_dev_rh->dma_alias_devfn =
+			PCI_DEVFN(PCI_SLOT(dev->devfn), 0);
 		dev->dev_flags |= PCI_DEV_FLAGS_DMA_ALIAS_DEVFN;
 	}
 }
@@ -3356,7 +3357,8 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_RICOH, 0xe476, quirk_dma_func0_alias);
 static void quirk_dma_func1_alias(struct pci_dev *dev)
 {
 	if (PCI_FUNC(dev->devfn) != 1) {
-		dev->dma_alias_devfn = PCI_DEVFN(PCI_SLOT(dev->devfn), 1);
+		dev->pci_dev_rh->dma_alias_devfn =
+			PCI_DEVFN(PCI_SLOT(dev->devfn), 1);
 		dev->dev_flags |= PCI_DEV_FLAGS_DMA_ALIAS_DEVFN;
 	}
 }

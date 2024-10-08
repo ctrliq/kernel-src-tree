@@ -21,41 +21,41 @@ struct sample {
 /* For the numbers, see hists_common.c */
 static struct sample fake_common_samples[] = {
 	/* perf [kernel] schedule() */
-	{ .pid = 100, .ip = 0xf0000 + 700, },
+	{ .pid = FAKE_PID_PERF1, .ip = FAKE_IP_KERNEL_SCHEDULE, },
 	/* perf [perf]   main() */
-	{ .pid = 200, .ip = 0x40000 + 700, },
+	{ .pid = FAKE_PID_PERF2, .ip = FAKE_IP_PERF_MAIN, },
 	/* perf [perf]   cmd_record() */
-	{ .pid = 200, .ip = 0x40000 + 900, },
+	{ .pid = FAKE_PID_PERF2, .ip = FAKE_IP_PERF_CMD_RECORD, },
 	/* bash [bash]   xmalloc() */
-	{ .pid = 300, .ip = 0x40000 + 800, },
+	{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_BASH_XMALLOC, },
 	/* bash [libc]   malloc() */
-	{ .pid = 300, .ip = 0x50000 + 700, },
+	{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_LIBC_MALLOC, },
 };
 
 static struct sample fake_samples[][5] = {
 	{
 		/* perf [perf]   run_command() */
-		{ .pid = 100, .ip = 0x40000 + 800, },
+		{ .pid = FAKE_PID_PERF1, .ip = FAKE_IP_PERF_RUN_COMMAND, },
 		/* perf [libc]   malloc() */
-		{ .pid = 100, .ip = 0x50000 + 700, },
+		{ .pid = FAKE_PID_PERF1, .ip = FAKE_IP_LIBC_MALLOC, },
 		/* perf [kernel] page_fault() */
-		{ .pid = 100, .ip = 0xf0000 + 800, },
+		{ .pid = FAKE_PID_PERF1, .ip = FAKE_IP_KERNEL_PAGE_FAULT, },
 		/* perf [kernel] sys_perf_event_open() */
-		{ .pid = 200, .ip = 0xf0000 + 900, },
+		{ .pid = FAKE_PID_PERF2, .ip = FAKE_IP_KERNEL_SYS_PERF_EVENT_OPEN, },
 		/* bash [libc]   free() */
-		{ .pid = 300, .ip = 0x50000 + 800, },
+		{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_LIBC_FREE, },
 	},
 	{
 		/* perf [libc]   free() */
-		{ .pid = 200, .ip = 0x50000 + 800, },
+		{ .pid = FAKE_PID_PERF2, .ip = FAKE_IP_LIBC_FREE, },
 		/* bash [libc]   malloc() */
-		{ .pid = 300, .ip = 0x50000 + 700, }, /* will be merged */
+		{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_LIBC_MALLOC, }, /* will be merged */
 		/* bash [bash]   xfee() */
-		{ .pid = 300, .ip = 0x40000 + 900, },
+		{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_BASH_XFREE, },
 		/* bash [libc]   realloc() */
-		{ .pid = 300, .ip = 0x50000 + 900, },
+		{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_LIBC_REALLOC, },
 		/* bash [kernel] page_fault() */
-		{ .pid = 300, .ip = 0xf0000 + 800, },
+		{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_KERNEL_PAGE_FAULT, },
 	},
 };
 
@@ -64,7 +64,7 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
 	struct perf_evsel *evsel;
 	struct addr_location al;
 	struct hist_entry *he;
-	struct perf_sample sample = { .cpu = 0, };
+	struct perf_sample sample = { .period = 1, };
 	size_t i = 0, k;
 
 	/*
@@ -72,7 +72,7 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
 	 * However the second evsel also has a collapsed entry for
 	 * "bash [libc] malloc" so total 9 entries will be in the tree.
 	 */
-	list_for_each_entry(evsel, &evlist->entries, node) {
+	evlist__for_each(evlist, evsel) {
 		for (k = 0; k < ARRAY_SIZE(fake_common_samples); k++) {
 			const union perf_event event = {
 				.header = {
@@ -81,13 +81,14 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
 			};
 
 			sample.pid = fake_common_samples[k].pid;
+			sample.tid = fake_common_samples[k].pid;
 			sample.ip = fake_common_samples[k].ip;
 			if (perf_event__preprocess_sample(&event, machine, &al,
 							  &sample) < 0)
 				goto out;
 
 			he = __hists__add_entry(&evsel->hists, &al, NULL,
-						NULL, NULL, 1, 1, 0);
+						NULL, NULL, 1, 1, 0, true);
 			if (he == NULL)
 				goto out;
 
@@ -104,13 +105,14 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
 			};
 
 			sample.pid = fake_samples[i][k].pid;
+			sample.tid = fake_samples[i][k].pid;
 			sample.ip = fake_samples[i][k].ip;
 			if (perf_event__preprocess_sample(&event, machine, &al,
 							  &sample) < 0)
 				goto out;
 
 			he = __hists__add_entry(&evsel->hists, &al, NULL,
-						NULL, NULL, 1, 1, 0);
+						NULL, NULL, 1, 1, 0, true);
 			if (he == NULL)
 				goto out;
 
@@ -266,33 +268,6 @@ static int validate_link(struct hists *leader, struct hists *other)
 	return __validate_link(leader, 0) || __validate_link(other, 1);
 }
 
-static void print_hists(struct hists *hists)
-{
-	int i = 0;
-	struct rb_root *root;
-	struct rb_node *node;
-
-	if (sort__need_collapse)
-		root = &hists->entries_collapsed;
-	else
-		root = hists->entries_in;
-
-	pr_info("----- %s --------\n", __func__);
-	node = rb_first(root);
-	while (node) {
-		struct hist_entry *he;
-
-		he = rb_entry(node, struct hist_entry, rb_node_in);
-
-		pr_info("%2d: entry: %-8s [%-8s] %20s: period = %"PRIu64"\n",
-			i, thread__comm_str(he->thread), he->ms.map->dso->short_name,
-			he->ms.sym->name, he->stat.period);
-
-		i++;
-		node = rb_next(node);
-	}
-}
-
 int test__hists_link(void)
 {
 	int err = -1;
@@ -330,11 +305,11 @@ int test__hists_link(void)
 	if (err < 0)
 		goto out;
 
-	list_for_each_entry(evsel, &evlist->entries, node) {
-		hists__collapse_resort(&evsel->hists);
+	evlist__for_each(evlist, evsel) {
+		hists__collapse_resort(&evsel->hists, NULL);
 
 		if (verbose > 2)
-			print_hists(&evsel->hists);
+			print_hists_in(&evsel->hists);
 	}
 
 	first = perf_evlist__first(evlist);
@@ -357,6 +332,7 @@ int test__hists_link(void)
 out:
 	/* tear down everything */
 	perf_evlist__delete(evlist);
+	reset_output_field();
 	machines__exit(&machines);
 
 	return err;

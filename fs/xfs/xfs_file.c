@@ -38,6 +38,7 @@
 #include "xfs_trace.h"
 #include "xfs_log.h"
 #include "xfs_dinode.h"
+#include "xfs_icache.h"
 
 #include <linux/aio.h>
 #include <linux/dcache.h>
@@ -297,7 +298,7 @@ xfs_file_aio_read(
 		if (inode->i_mapping->nrpages) {
 			ret = filemap_write_and_wait_range(
 							VFS_I(ip)->i_mapping,
-							pos, -1);
+							pos, pos + size - 1);
 			if (ret) {
 				xfs_rw_iunlock(ip, XFS_IOLOCK_EXCL);
 				return ret;
@@ -309,7 +310,8 @@ xfs_file_aio_read(
 			 * happen on XFS. Warn if it does fail.
 			 */
 			ret = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
-						pos >> PAGE_CACHE_SHIFT, -1);
+					pos >> PAGE_CACHE_SHIFT,
+					(pos + size - 1) >> PAGE_CACHE_SHIFT);
 			WARN_ON_ONCE(ret);
 			ret = 0;
 		}
@@ -689,10 +691,19 @@ xfs_file_dio_aio_write(
 
 	if (mapping->nrpages) {
 		ret = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
-						    pos, -1);
+						    pos, pos + count - 1);
 		if (ret)
 			goto out;
-		truncate_pagecache_range(VFS_I(ip), pos, -1);
+		/*
+		 * Invalidate whole pages. This can return an error if
+		 * we fail to invalidate a page, but this should never
+		 * happen on XFS. Warn if it does fail.
+		 */
+		ret = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
+					pos >> PAGE_CACHE_SHIFT,
+					(pos + count - 1) >> PAGE_CACHE_SHIFT);
+		WARN_ON_ONCE(ret);
+		ret = 0;
 	}
 
 	/*
@@ -750,13 +761,26 @@ write_retry:
 			pos, &iocb->ki_pos, count, 0);
 
 	/*
-	 * If we just got an ENOSPC, try to write back all dirty inodes to
-	 * convert delalloc space to free up some of the excess reserved
-	 * metadata space.
+	 * If we hit a space limit, try to free up some lingering preallocated
+	 * space before returning an error. In the case of ENOSPC, first try to
+	 * write back all dirty inodes to free up some of the excess reserved
+	 * metadata space. This reduces the chances that the eofblocks scan
+	 * waits on dirty mappings. Since xfs_flush_inodes() is serialized, this
+	 * also behaves as a filter to prevent too many eofblocks scans from
+	 * running at the same time.
 	 */
-	if (ret == -ENOSPC && !enospc) {
+	if (ret == -EDQUOT && !enospc) {
+		enospc = xfs_inode_free_quota_eofblocks(ip);
+		if (enospc)
+			goto write_retry;
+	} else if (ret == -ENOSPC && !enospc) {
+		struct xfs_eofblocks eofb = {0};
+
 		enospc = 1;
 		xfs_flush_inodes(ip->i_mount);
+		eofb.eof_scan_owner = ip->i_ino; /* for locking */
+		eofb.eof_flags = XFS_EOF_FLAGS_SYNC;
+		xfs_icache_free_eofblocks(ip->i_mount, &eofb);
 		goto write_retry;
 	}
 

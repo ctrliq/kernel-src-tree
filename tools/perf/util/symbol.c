@@ -33,6 +33,7 @@ struct symbol_conf symbol_conf = {
 	.try_vmlinux_path	= true,
 	.annotate_src		= true,
 	.demangle		= true,
+	.demangle_kernel	= false,
 	.cumulate_callchain	= true,
 	.symfs			= "",
 };
@@ -807,7 +808,7 @@ static void delete_modules(struct rb_root *modules)
 		mi = rb_entry(next, struct module_info, rb_node);
 		next = rb_next(&mi->rb_node);
 		rb_erase(&mi->rb_node, modules);
-		free(mi->name);
+		zfree(&mi->name);
 		free(mi);
 	}
 }
@@ -1117,9 +1118,9 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
 	 * dso__data_read_addr().
 	 */
 	if (dso->kernel == DSO_TYPE_GUEST_KERNEL)
-		dso->data_type = DSO_BINARY_TYPE__GUEST_KCORE;
+		dso->binary_type = DSO_BINARY_TYPE__GUEST_KCORE;
 	else
-		dso->data_type = DSO_BINARY_TYPE__KCORE;
+		dso->binary_type = DSO_BINARY_TYPE__KCORE;
 	dso__set_long_name(dso, strdup(kcore_filename), true);
 
 	close(fd);
@@ -1252,6 +1253,46 @@ out_failure:
 	return -1;
 }
 
+static bool dso__is_compatible_symtab_type(struct dso *dso, bool kmod,
+					   enum dso_binary_type type)
+{
+	switch (type) {
+	case DSO_BINARY_TYPE__JAVA_JIT:
+	case DSO_BINARY_TYPE__DEBUGLINK:
+	case DSO_BINARY_TYPE__SYSTEM_PATH_DSO:
+	case DSO_BINARY_TYPE__FEDORA_DEBUGINFO:
+	case DSO_BINARY_TYPE__UBUNTU_DEBUGINFO:
+	case DSO_BINARY_TYPE__BUILDID_DEBUGINFO:
+	case DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO:
+		return !kmod && dso->kernel == DSO_TYPE_USER;
+
+	case DSO_BINARY_TYPE__KALLSYMS:
+	case DSO_BINARY_TYPE__VMLINUX:
+	case DSO_BINARY_TYPE__KCORE:
+		return dso->kernel == DSO_TYPE_KERNEL;
+
+	case DSO_BINARY_TYPE__GUEST_KALLSYMS:
+	case DSO_BINARY_TYPE__GUEST_VMLINUX:
+	case DSO_BINARY_TYPE__GUEST_KCORE:
+		return dso->kernel == DSO_TYPE_GUEST_KERNEL;
+
+	case DSO_BINARY_TYPE__GUEST_KMODULE:
+	case DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE:
+		/*
+		 * kernel modules know their symtab type - it's set when
+		 * creating a module dso in machine__new_module().
+		 */
+		return kmod && dso->symtab_type == type;
+
+	case DSO_BINARY_TYPE__BUILD_ID_CACHE:
+		return true;
+
+	case DSO_BINARY_TYPE__NOT_FOUND:
+	default:
+		return false;
+	}
+}
+
 int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 {
 	char *name;
@@ -1262,6 +1303,7 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 	int ss_pos = 0;
 	struct symsrc ss_[2];
 	struct symsrc *syms_ss = NULL, *runtime_ss = NULL;
+	bool kmod;
 
 	dso__set_loaded(dso, map->type);
 
@@ -1302,7 +1344,11 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 	if (!name)
 		return -1;
 
-	/* Iterate over candidate debug images.
+	kmod = dso->symtab_type == DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE ||
+		dso->symtab_type == DSO_BINARY_TYPE__GUEST_KMODULE;
+
+	/*
+	 * Iterate over candidate debug images.
 	 * Keep track of "interesting" ones (those which have a symtab, dynsym,
 	 * and/or opd section) for processing.
 	 */
@@ -1312,8 +1358,11 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 
 		enum dso_binary_type symtab_type = binary_type_symtab[i];
 
-		if (dso__binary_type_file(dso, symtab_type,
-					  root_dir, name, PATH_MAX))
+		if (!dso__is_compatible_symtab_type(dso, kmod, symtab_type))
+			continue;
+
+		if (dso__read_binary_type_filename(dso, symtab_type,
+						   root_dir, name, PATH_MAX))
 			continue;
 
 		/* Name is now the name of the next image to try */
@@ -1354,15 +1403,10 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 	if (!runtime_ss && syms_ss)
 		runtime_ss = syms_ss;
 
-	if (syms_ss) {
-		int km;
-
-		km = dso->symtab_type == DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE ||
-		     dso->symtab_type == DSO_BINARY_TYPE__GUEST_KMODULE;
-		ret = dso__load_sym(dso, map, syms_ss, runtime_ss, filter, km);
-	} else {
+	if (syms_ss)
+		ret = dso__load_sym(dso, map, syms_ss, runtime_ss, filter, kmod);
+	else
 		ret = -1;
-	}
 
 	if (ret > 0) {
 		int nr_plt;
@@ -1424,9 +1468,9 @@ int dso__load_vmlinux(struct dso *dso, struct map *map,
 
 	if (err > 0) {
 		if (dso->kernel == DSO_TYPE_GUEST_KERNEL)
-			dso->data_type = DSO_BINARY_TYPE__GUEST_VMLINUX;
+			dso->binary_type = DSO_BINARY_TYPE__GUEST_VMLINUX;
 		else
-			dso->data_type = DSO_BINARY_TYPE__VMLINUX;
+			dso->binary_type = DSO_BINARY_TYPE__VMLINUX;
 		dso__set_long_name(dso, vmlinux, vmlinux_allocated);
 		dso__set_loaded(dso, map->type);
 		pr_debug("Using %s for symbols\n", symfs_vmlinux);
@@ -1677,13 +1721,10 @@ static int dso__load_guest_kernel_sym(struct dso *dso, struct map *map,
 
 static void vmlinux_path__exit(void)
 {
-	while (--vmlinux_path__nr_entries >= 0) {
-		free(vmlinux_path[vmlinux_path__nr_entries]);
-		vmlinux_path[vmlinux_path__nr_entries] = NULL;
-	}
+	while (--vmlinux_path__nr_entries >= 0)
+		zfree(&vmlinux_path[vmlinux_path__nr_entries]);
 
-	free(vmlinux_path);
-	vmlinux_path = NULL;
+	zfree(&vmlinux_path);
 }
 
 static int vmlinux_path__init(void)

@@ -104,6 +104,18 @@ int __hpp__fmt(struct perf_hpp *hpp, struct hist_entry *he,
 	return ret;
 }
 
+int __hpp__fmt_acc(struct perf_hpp *hpp, struct hist_entry *he,
+		   hpp_field_fn get_field, const char *fmt,
+		   hpp_snprint_fn print_fn, bool fmt_percent)
+{
+	if (!symbol_conf.cumulate_callchain) {
+		return snprintf(hpp->buf, hpp->size, "%*s",
+				fmt_percent ? 8 : 12, "N/A");
+	}
+
+	return __hpp__fmt(hpp, he, get_field, fmt, print_fn, fmt_percent);
+}
+
 static int field_cmp(u64 field_a, u64 field_b)
 {
 	if (field_a > field_b)
@@ -157,6 +169,24 @@ out:
 	free(fields_a);
 	free(fields_b);
 
+	return ret;
+}
+
+static int __hpp__sort_acc(struct hist_entry *a, struct hist_entry *b,
+			   hpp_field_fn get_field)
+{
+	s64 ret = 0;
+
+	if (symbol_conf.cumulate_callchain) {
+		/*
+		 * Put caller above callee when they have equal period.
+		 */
+		ret = field_cmp(get_field(a), get_field(b));
+		if (ret)
+			return ret;
+
+		ret = b->callchain->max_depth - a->callchain->max_depth;
+	}
 	return ret;
 }
 
@@ -242,6 +272,34 @@ static int64_t hpp__sort_##_type(struct hist_entry *a, struct hist_entry *b)	\
 	return __hpp__sort(a, b, he_get_##_field);				\
 }
 
+#define __HPP_COLOR_ACC_PERCENT_FN(_type, _field)				\
+static u64 he_get_acc_##_field(struct hist_entry *he)				\
+{										\
+	return he->stat_acc->_field;						\
+}										\
+										\
+static int hpp__color_##_type(struct perf_hpp_fmt *fmt __maybe_unused,		\
+			      struct perf_hpp *hpp, struct hist_entry *he) 	\
+{										\
+	return __hpp__fmt_acc(hpp, he, he_get_acc_##_field, " %6.2f%%",		\
+			      hpp_color_scnprintf, true);			\
+}
+
+#define __HPP_ENTRY_ACC_PERCENT_FN(_type, _field)				\
+static int hpp__entry_##_type(struct perf_hpp_fmt *_fmt __maybe_unused,		\
+			      struct perf_hpp *hpp, struct hist_entry *he) 	\
+{										\
+	const char *fmt = symbol_conf.field_sep ? " %.2f" : " %6.2f%%";		\
+	return __hpp__fmt_acc(hpp, he, he_get_acc_##_field, fmt,		\
+			      hpp_entry_scnprintf, true);			\
+}
+
+#define __HPP_SORT_ACC_FN(_type, _field)					\
+static int64_t hpp__sort_##_type(struct hist_entry *a, struct hist_entry *b)	\
+{										\
+	return __hpp__sort_acc(a, b, he_get_acc_##_field);			\
+}
+
 #define __HPP_ENTRY_RAW_FN(_type, _field)					\
 static u64 he_get_raw_##_field(struct hist_entry *he)				\
 {										\
@@ -270,18 +328,27 @@ __HPP_COLOR_PERCENT_FN(_type, _field)					\
 __HPP_ENTRY_PERCENT_FN(_type, _field)					\
 __HPP_SORT_FN(_type, _field)
 
+#define HPP_PERCENT_ACC_FNS(_type, _str, _field, _min_width, _unit_width)\
+__HPP_HEADER_FN(_type, _str, _min_width, _unit_width)			\
+__HPP_WIDTH_FN(_type, _min_width, _unit_width)				\
+__HPP_COLOR_ACC_PERCENT_FN(_type, _field)				\
+__HPP_ENTRY_ACC_PERCENT_FN(_type, _field)				\
+__HPP_SORT_ACC_FN(_type, _field)
+
 #define HPP_RAW_FNS(_type, _str, _field, _min_width, _unit_width)	\
 __HPP_HEADER_FN(_type, _str, _min_width, _unit_width)			\
 __HPP_WIDTH_FN(_type, _min_width, _unit_width)				\
 __HPP_ENTRY_RAW_FN(_type, _field)					\
 __HPP_SORT_RAW_FN(_type, _field)
 
+__HPP_HEADER_FN(overhead_self, "Self", 8, 8)
 
 HPP_PERCENT_FNS(overhead, "Overhead", period, 8, 8)
 HPP_PERCENT_FNS(overhead_sys, "sys", period_sys, 8, 8)
 HPP_PERCENT_FNS(overhead_us, "usr", period_us, 8, 8)
 HPP_PERCENT_FNS(overhead_guest_sys, "guest sys", period_guest_sys, 9, 8)
 HPP_PERCENT_FNS(overhead_guest_us, "guest usr", period_guest_us, 9, 8)
+HPP_PERCENT_ACC_FNS(overhead_acc, "Children", period, 8, 8)
 
 HPP_RAW_FNS(samples, "Samples", nr_events, 12, 12)
 HPP_RAW_FNS(period, "Period", period, 12, 12)
@@ -293,6 +360,17 @@ static int64_t hpp__nop_cmp(struct hist_entry *a __maybe_unused,
 }
 
 #define HPP__COLOR_PRINT_FNS(_name)			\
+	{						\
+		.header	= hpp__header_ ## _name,	\
+		.width	= hpp__width_ ## _name,		\
+		.color	= hpp__color_ ## _name,		\
+		.entry	= hpp__entry_ ## _name,		\
+		.cmp	= hpp__nop_cmp,			\
+		.collapse = hpp__nop_cmp,		\
+		.sort	= hpp__sort_ ## _name,		\
+	}
+
+#define HPP__COLOR_ACC_PRINT_FNS(_name)			\
 	{						\
 		.header	= hpp__header_ ## _name,	\
 		.width	= hpp__width_ ## _name,		\
@@ -319,6 +397,7 @@ struct perf_hpp_fmt perf_hpp__format[] = {
 	HPP__COLOR_PRINT_FNS(overhead_us),
 	HPP__COLOR_PRINT_FNS(overhead_guest_sys),
 	HPP__COLOR_PRINT_FNS(overhead_guest_us),
+	HPP__COLOR_ACC_PRINT_FNS(overhead_acc),
 	HPP__PRINT_FNS(samples),
 	HPP__PRINT_FNS(period)
 };
@@ -328,16 +407,23 @@ LIST_HEAD(perf_hpp__sort_list);
 
 
 #undef HPP__COLOR_PRINT_FNS
+#undef HPP__COLOR_ACC_PRINT_FNS
 #undef HPP__PRINT_FNS
 
 #undef HPP_PERCENT_FNS
+#undef HPP_PERCENT_ACC_FNS
 #undef HPP_RAW_FNS
 
 #undef __HPP_HEADER_FN
 #undef __HPP_WIDTH_FN
 #undef __HPP_COLOR_PERCENT_FN
 #undef __HPP_ENTRY_PERCENT_FN
+#undef __HPP_COLOR_ACC_PERCENT_FN
+#undef __HPP_ENTRY_ACC_PERCENT_FN
 #undef __HPP_ENTRY_RAW_FN
+#undef __HPP_SORT_FN
+#undef __HPP_SORT_ACC_FN
+#undef __HPP_SORT_RAW_FN
 
 
 void perf_hpp__init(void)
@@ -353,6 +439,19 @@ void perf_hpp__init(void)
 		/* sort_list may be linked by setup_sorting() */
 		if (fmt->sort_list.next == NULL)
 			INIT_LIST_HEAD(&fmt->sort_list);
+	}
+
+	/*
+	 * If user specified field order, no need to setup default fields.
+	 */
+	if (field_order)
+		return;
+
+	if (symbol_conf.cumulate_callchain) {
+		perf_hpp__column_enable(PERF_HPP__OVERHEAD_ACC);
+
+		perf_hpp__format[PERF_HPP__OVERHEAD].header =
+						hpp__header_overhead_self;
 	}
 
 	perf_hpp__column_enable(PERF_HPP__OVERHEAD);
@@ -378,7 +477,11 @@ void perf_hpp__init(void)
 	if (list_empty(list))
 		list_add(list, &perf_hpp__sort_list);
 
-	perf_hpp__setup_output_field();
+	if (symbol_conf.cumulate_callchain) {
+		list = &perf_hpp__format[PERF_HPP__OVERHEAD_ACC].sort_list;
+		if (list_empty(list))
+			list_add(list, &perf_hpp__sort_list);
+	}
 }
 
 void perf_hpp__column_register(struct perf_hpp_fmt *format)
@@ -423,28 +526,73 @@ void perf_hpp__setup_output_field(void)
 
 	/* append sort keys to output field */
 	perf_hpp__for_each_sort_list(fmt) {
-		if (list_empty(&fmt->list))
-			perf_hpp__column_register(fmt);
+		if (!list_empty(&fmt->list))
+			continue;
+
+		/*
+		 * sort entry fields are dynamically created,
+		 * so they can share a same sort key even though
+		 * the list is empty.
+		 */
+		if (perf_hpp__is_sort_entry(fmt)) {
+			struct perf_hpp_fmt *pos;
+
+			perf_hpp__for_each_format(pos) {
+				if (perf_hpp__same_sort_entry(pos, fmt))
+					goto next;
+			}
+		}
+
+		perf_hpp__column_register(fmt);
+next:
+		continue;
 	}
 }
 
-int hist_entry__sort_snprintf(struct hist_entry *he, char *s, size_t size,
-			      struct hists *hists)
+void perf_hpp__append_sort_keys(void)
 {
-	const char *sep = symbol_conf.field_sep;
-	struct sort_entry *se;
-	int ret = 0;
+	struct perf_hpp_fmt *fmt;
 
-	list_for_each_entry(se, &hist_entry__sort_list, list) {
-		if (se->elide)
+	/* append output fields to sort keys */
+	perf_hpp__for_each_format(fmt) {
+		if (!list_empty(&fmt->sort_list))
 			continue;
 
-		ret += scnprintf(s + ret, size - ret, "%s", sep ?: "  ");
-		ret += se->se_snprintf(he, s + ret, size - ret,
-				       hists__col_len(hists, se->se_width_idx));
+		/*
+		 * sort entry fields are dynamically created,
+		 * so they can share a same sort key even though
+		 * the list is empty.
+		 */
+		if (perf_hpp__is_sort_entry(fmt)) {
+			struct perf_hpp_fmt *pos;
+
+			perf_hpp__for_each_sort_list(pos) {
+				if (perf_hpp__same_sort_entry(pos, fmt))
+					goto next;
+			}
+		}
+
+		perf_hpp__register_sort_field(fmt);
+next:
+		continue;
+	}
+}
+
+void perf_hpp__reset_output_field(void)
+{
+	struct perf_hpp_fmt *fmt, *tmp;
+
+	/* reset output fields */
+	perf_hpp__for_each_format_safe(fmt, tmp) {
+		list_del_init(&fmt->list);
+		list_del_init(&fmt->sort_list);
 	}
 
-	return ret;
+	/* reset sort keys */
+	perf_hpp__for_each_sort_list_safe(fmt, tmp) {
+		list_del_init(&fmt->list);
+		list_del_init(&fmt->sort_list);
+	}
 }
 
 /*
@@ -453,22 +601,23 @@ int hist_entry__sort_snprintf(struct hist_entry *he, char *s, size_t size,
 unsigned int hists__sort_list_width(struct hists *hists)
 {
 	struct perf_hpp_fmt *fmt;
-	struct sort_entry *se;
-	int i = 0, ret = 0;
+	int ret = 0;
+	bool first = true;
 	struct perf_hpp dummy_hpp;
 
 	perf_hpp__for_each_format(fmt) {
-		if (i)
+		if (perf_hpp__should_skip(fmt))
+			continue;
+
+		if (first)
+			first = false;
+		else
 			ret += 2;
 
 		ret += fmt->width(fmt, &dummy_hpp, hists_to_evsel(hists));
 	}
 
-	list_for_each_entry(se, &hist_entry__sort_list, list)
-		if (!se->elide)
-			ret += 2 + hists__col_len(hists, se->se_width_idx);
-
-	if (verbose) /* Addr + origin */
+	if (verbose && sort__has_sym) /* Addr + origin */
 		ret += 3 + BITS_PER_LONG / 4;
 
 	return ret;

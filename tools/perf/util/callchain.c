@@ -19,6 +19,8 @@
 
 #include "hist.h"
 #include "util.h"
+#include "sort.h"
+#include "machine.h"
 #include "callchain.h"
 
 __thread struct callchain_cursor callchain_cursor;
@@ -605,4 +607,68 @@ int callchain_cursor_append(struct callchain_cursor *cursor,
 	cursor->last = &node->next;
 
 	return 0;
+}
+
+int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent,
+			      struct perf_evsel *evsel, struct addr_location *al,
+			      int max_stack)
+{
+	if (sample->callchain == NULL)
+		return 0;
+
+	if (symbol_conf.use_callchain || symbol_conf.cumulate_callchain ||
+	    sort__has_parent) {
+		return machine__resolve_callchain(al->machine, evsel, al->thread,
+						  sample, parent, al, max_stack);
+	}
+	return 0;
+}
+
+int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample)
+{
+	if (!symbol_conf.use_callchain)
+		return 0;
+	return callchain_append(he->callchain, &callchain_cursor, sample->period);
+}
+
+int fill_callchain_info(struct addr_location *al, struct callchain_cursor_node *node,
+			bool hide_unresolved)
+{
+	al->map = node->map;
+	al->sym = node->sym;
+	if (node->map)
+		al->addr = node->map->map_ip(node->map, node->ip);
+	else
+		al->addr = node->ip;
+
+	if (al->sym == NULL) {
+		if (hide_unresolved)
+			return 0;
+		if (al->map == NULL)
+			goto out;
+	}
+
+	if (al->map->groups == &al->machine->kmaps) {
+		if (machine__is_host(al->machine)) {
+			al->cpumode = PERF_RECORD_MISC_KERNEL;
+			al->level = 'k';
+		} else {
+			al->cpumode = PERF_RECORD_MISC_GUEST_KERNEL;
+			al->level = 'g';
+		}
+	} else {
+		if (machine__is_host(al->machine)) {
+			al->cpumode = PERF_RECORD_MISC_USER;
+			al->level = '.';
+		} else if (perf_guest) {
+			al->cpumode = PERF_RECORD_MISC_GUEST_USER;
+			al->level = 'u';
+		} else {
+			al->cpumode = PERF_RECORD_MISC_HYPERVISOR;
+			al->level = 'H';
+		}
+	}
+
+out:
+	return 1;
 }

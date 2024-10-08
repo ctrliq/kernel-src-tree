@@ -308,8 +308,6 @@ static void be_async_grp5_evt_process(struct be_adapter *adapter,
 		be_async_grp5_pvid_state_process(adapter, compl);
 		break;
 	default:
-		dev_warn(&adapter->pdev->dev, "Unknown grp5 event 0x%x!\n",
-			 event_type);
 		break;
 	}
 }
@@ -1783,8 +1781,11 @@ int be_cmd_get_fw_ver(struct be_adapter *adapter)
 	status = be_mcc_notify_wait(adapter);
 	if (!status) {
 		struct be_cmd_resp_get_fw_version *resp = embedded_payload(wrb);
-		strcpy(adapter->fw_ver, resp->firmware_version_string);
-		strcpy(adapter->fw_on_flash, resp->fw_on_flash_version_string);
+
+		strlcpy(adapter->fw_ver, resp->firmware_version_string,
+			sizeof(adapter->fw_ver));
+		strlcpy(adapter->fw_on_flash, resp->fw_on_flash_version_string,
+			sizeof(adapter->fw_on_flash));
 	}
 err:
 	spin_unlock_bh(&adapter->mcc_lock);
@@ -2056,6 +2057,9 @@ int be_cmd_query_fw_cfg(struct be_adapter *adapter)
 		adapter->function_mode = le32_to_cpu(resp->function_mode);
 		adapter->function_caps = le32_to_cpu(resp->function_caps);
 		adapter->asic_rev = le32_to_cpu(resp->asic_revision) & 0xFF;
+		dev_info(&adapter->pdev->dev,
+			 "FW config: function_mode=0x%x, function_caps=0x%x\n",
+			 adapter->function_mode, adapter->function_caps);
 	}
 
 	mutex_unlock(&adapter->mbox_lock);
@@ -2100,7 +2104,7 @@ int be_cmd_reset_function(struct be_adapter *adapter)
 }
 
 int be_cmd_rss_config(struct be_adapter *adapter, u8 *rsstable,
-		      u32 rss_hash_opts, u16 table_size, u8 *rss_hkey)
+		      u32 rss_hash_opts, u16 table_size, const u8 *rss_hkey)
 {
 	struct be_mcc_wrb *wrb;
 	struct be_cmd_req_rss_config *req;
@@ -2293,7 +2297,7 @@ int lancer_cmd_write_object(struct be_adapter *adapter, struct be_dma_mem *cmd,
 
 	be_dws_cpu_to_le(ctxt, sizeof(req->context));
 	req->write_offset = cpu_to_le32(data_offset);
-	strcpy(req->object_name, obj_name);
+	strlcpy(req->object_name, obj_name, sizeof(req->object_name));
 	req->descriptor_count = cpu_to_le32(1);
 	req->buf_len = cpu_to_le32(data_size);
 	req->addr_low = cpu_to_le32((cmd->dma +
@@ -2371,7 +2375,7 @@ int lancer_cmd_delete_object(struct be_adapter *adapter, const char *obj_name)
 			       OPCODE_COMMON_DELETE_OBJECT,
 			       sizeof(*req), wrb, NULL);
 
-	strcpy(req->object_name, obj_name);
+	strlcpy(req->object_name, obj_name, sizeof(req->object_name));
 
 	status = be_mcc_notify_wait(adapter);
 err:
@@ -3667,38 +3671,39 @@ err:
 	return status;
 }
 
-int be_cmd_set_profile_config(struct be_adapter *adapter, void *desc,
-			      int size, u8 version, u8 domain)
+/* Will use MBOX only if MCCQ has not been created */
+static int be_cmd_set_profile_config(struct be_adapter *adapter, void *desc,
+				     int size, int count, u8 version, u8 domain)
 {
 	struct be_cmd_req_set_profile_config *req;
-	struct be_mcc_wrb *wrb;
+	struct be_mcc_wrb wrb = {0};
+	struct be_dma_mem cmd;
 	int status;
 
-	spin_lock_bh(&adapter->mcc_lock);
+	memset(&cmd, 0, sizeof(struct be_dma_mem));
+	cmd.size = sizeof(struct be_cmd_req_set_profile_config);
+	cmd.va = pci_alloc_consistent(adapter->pdev, cmd.size, &cmd.dma);
+	if (!cmd.va)
+		return -ENOMEM;
 
-	wrb = wrb_from_mccq(adapter);
-	if (!wrb) {
-		status = -EBUSY;
-		goto err;
-	}
-
-	req = embedded_payload(wrb);
+	req = cmd.va;
 	be_wrb_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_COMMON,
-			       OPCODE_COMMON_SET_PROFILE_CONFIG, sizeof(*req),
-			       wrb, NULL);
+			       OPCODE_COMMON_SET_PROFILE_CONFIG, cmd.size,
+			       &wrb, &cmd);
 	req->hdr.version = version;
 	req->hdr.domain = domain;
-	req->desc_count = cpu_to_le32(1);
+	req->desc_count = cpu_to_le32(count);
 	memcpy(req->desc, desc, size);
 
-	status = be_mcc_notify_wait(adapter);
-err:
-	spin_unlock_bh(&adapter->mcc_lock);
+	status = be_cmd_notify_wait(adapter, &wrb);
+
+	if (cmd.va)
+		pci_free_consistent(adapter->pdev, cmd.size, cmd.va, cmd.dma);
 	return status;
 }
 
 /* Mark all fields invalid */
-void be_reset_nic_desc(struct be_nic_res_desc *nic)
+static void be_reset_nic_desc(struct be_nic_res_desc *nic)
 {
 	memset(nic, 0, sizeof(*nic));
 	nic->unicast_mac_count = 0xFFFF;
@@ -3712,33 +3717,114 @@ void be_reset_nic_desc(struct be_nic_res_desc *nic)
 	nic->cq_count = 0xFFFF;
 	nic->toe_conn_count = 0xFFFF;
 	nic->eq_count = 0xFFFF;
+	nic->iface_count = 0xFFFF;
 	nic->link_param = 0xFF;
+	nic->channel_id_param = cpu_to_le16(0xF000);
 	nic->acpi_params = 0xFF;
 	nic->wol_param = 0x0F;
+	nic->tunnel_iface_count = 0xFFFF;
+	nic->direct_tenant_iface_count = 0xFFFF;
 	nic->bw_min = 0xFFFFFFFF;
 	nic->bw_max = 0xFFFFFFFF;
 }
 
-int be_cmd_config_qos(struct be_adapter *adapter, u32 bps, u8 domain)
+/* Mark all fields invalid */
+static void be_reset_pcie_desc(struct be_pcie_res_desc *pcie)
 {
-	if (lancer_chip(adapter)) {
-		struct be_nic_res_desc nic_desc;
+	memset(pcie, 0, sizeof(*pcie));
+	pcie->sriov_state = 0xFF;
+	pcie->pf_state = 0xFF;
+	pcie->pf_type = 0xFF;
+	pcie->num_vfs = 0xFFFF;
+}
 
-		be_reset_nic_desc(&nic_desc);
+int be_cmd_config_qos(struct be_adapter *adapter, u32 max_rate, u16 link_speed,
+		      u8 domain)
+{
+	struct be_nic_res_desc nic_desc;
+	u32 bw_percent;
+	u16 version = 0;
+
+	if (BE3_chip(adapter))
+		return be_cmd_set_qos(adapter, max_rate / 10, domain);
+
+	be_reset_nic_desc(&nic_desc);
+	nic_desc.pf_num = adapter->pf_number;
+	nic_desc.vf_num = domain;
+	if (lancer_chip(adapter)) {
 		nic_desc.hdr.desc_type = NIC_RESOURCE_DESC_TYPE_V0;
 		nic_desc.hdr.desc_len = RESOURCE_DESC_SIZE_V0;
 		nic_desc.flags = (1 << QUN_SHIFT) | (1 << IMM_SHIFT) |
 					(1 << NOSV_SHIFT);
-		nic_desc.pf_num = adapter->pf_number;
-		nic_desc.vf_num = domain;
-		nic_desc.bw_max = cpu_to_le32(bps);
-
-		return be_cmd_set_profile_config(adapter, &nic_desc,
-						 RESOURCE_DESC_SIZE_V0,
-						 0, domain);
+		nic_desc.bw_max = cpu_to_le32(max_rate / 10);
 	} else {
-		return be_cmd_set_qos(adapter, bps, domain);
+		version = 1;
+		nic_desc.hdr.desc_type = NIC_RESOURCE_DESC_TYPE_V1;
+		nic_desc.hdr.desc_len = RESOURCE_DESC_SIZE_V1;
+		nic_desc.flags = (1 << IMM_SHIFT) | (1 << NOSV_SHIFT);
+		bw_percent = max_rate ? (max_rate * 100) / link_speed : 100;
+		nic_desc.bw_max = cpu_to_le32(bw_percent);
 	}
+
+	return be_cmd_set_profile_config(adapter, &nic_desc,
+					 nic_desc.hdr.desc_len,
+					 1, version, domain);
+}
+
+int be_cmd_set_sriov_config(struct be_adapter *adapter,
+			    struct be_resources res, u16 num_vfs)
+{
+	struct {
+		struct be_pcie_res_desc pcie;
+		struct be_nic_res_desc nic_vft;
+	} __packed desc;
+	u16 vf_q_count;
+
+	if (BEx_chip(adapter) || lancer_chip(adapter))
+		return 0;
+
+	/* PF PCIE descriptor */
+	be_reset_pcie_desc(&desc.pcie);
+	desc.pcie.hdr.desc_type = PCIE_RESOURCE_DESC_TYPE_V1;
+	desc.pcie.hdr.desc_len = RESOURCE_DESC_SIZE_V1;
+	desc.pcie.flags = (1 << IMM_SHIFT) | (1 << NOSV_SHIFT);
+	desc.pcie.pf_num = adapter->pdev->devfn;
+	desc.pcie.sriov_state = num_vfs ? 1 : 0;
+	desc.pcie.num_vfs = cpu_to_le16(num_vfs);
+
+	/* VF NIC Template descriptor */
+	be_reset_nic_desc(&desc.nic_vft);
+	desc.nic_vft.hdr.desc_type = NIC_RESOURCE_DESC_TYPE_V1;
+	desc.nic_vft.hdr.desc_len = RESOURCE_DESC_SIZE_V1;
+	desc.nic_vft.flags = (1 << VFT_SHIFT) | (1 << IMM_SHIFT) |
+				(1 << NOSV_SHIFT);
+	desc.nic_vft.pf_num = adapter->pdev->devfn;
+	desc.nic_vft.vf_num = 0;
+
+	if (num_vfs && res.vf_if_cap_flags & BE_IF_FLAGS_RSS) {
+		/* If number of VFs requested is 8 less than max supported,
+		 * assign 8 queue pairs to the PF and divide the remaining
+		 * resources evenly among the VFs
+		 */
+		if (num_vfs < (be_max_vfs(adapter) - 8))
+			vf_q_count = (res.max_rss_qs - 8) / num_vfs;
+		else
+			vf_q_count = res.max_rss_qs / num_vfs;
+
+		desc.nic_vft.rq_count = cpu_to_le16(vf_q_count);
+		desc.nic_vft.txq_count = cpu_to_le16(vf_q_count);
+		desc.nic_vft.rssq_count = cpu_to_le16(vf_q_count - 1);
+		desc.nic_vft.cq_count = cpu_to_le16(3 * vf_q_count);
+	} else {
+		desc.nic_vft.txq_count = cpu_to_le16(1);
+		desc.nic_vft.rq_count = cpu_to_le16(1);
+		desc.nic_vft.rssq_count = cpu_to_le16(0);
+		/* One CQ for each TX, RX and MCCQ */
+		desc.nic_vft.cq_count = cpu_to_le16(3);
+	}
+
+	return be_cmd_set_profile_config(adapter, &desc,
+					 2 * RESOURCE_DESC_SIZE_V1, 2, 1, 0);
 }
 
 int be_cmd_manage_iface(struct be_adapter *adapter, u32 iface, u8 op)
@@ -3790,7 +3876,7 @@ int be_cmd_set_vxlan_port(struct be_adapter *adapter, __be16 port)
 	}
 
 	return be_cmd_set_profile_config(adapter, &port_desc,
-					 RESOURCE_DESC_SIZE_V1, 1, 0);
+					 RESOURCE_DESC_SIZE_V1, 1, 1, 0);
 }
 
 int be_cmd_get_if_id(struct be_adapter *adapter, struct be_vf_cfg *vf_cfg,

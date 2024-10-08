@@ -898,11 +898,14 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 
 	/* If we used up all the quota - we're probably not done yet... */
 	if (done == budget) {
+#ifdef CONFIG_GENERIC_HARDIRQS
 		int cpu_curr;
 		const struct cpumask *aff;
+#endif
 
 		INC_PERF_COUNTER(priv->pstats.napi_quota);
 
+#ifdef CONFIG_GENERIC_HARDIRQS
 		cpu_curr = smp_processor_id();
 		aff = irq_desc_get_irq_data(cq->irq_desc)->affinity;
 
@@ -915,6 +918,7 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 			mlx4_en_arm_cq(priv, cq);
 			return 0;
 		}
+#endif
 	} else {
 		/* Done for now */
 		napi_complete(napi);

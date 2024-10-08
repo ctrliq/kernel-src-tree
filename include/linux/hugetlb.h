@@ -2,6 +2,7 @@
 #define _LINUX_HUGETLB_H
 
 #include <linux/mm_types.h>
+#include <linux/mmdebug.h>
 #include <linux/fs.h>
 #include <linux/hugetlb_inline.h>
 #include <linux/cgroup.h>
@@ -67,6 +68,7 @@ int hugetlb_reserve_pages(struct inode *inode, long from, long to,
 						vm_flags_t vm_flags);
 void hugetlb_unreserve_pages(struct inode *inode, long offset, long freed);
 int dequeue_hwpoisoned_huge_page(struct page *page);
+void free_huge_page(struct page *page);
 
 extern unsigned long hugepages_treat_as_movable;
 extern const unsigned long hugetlb_zero, hugetlb_infinity;
@@ -318,6 +320,11 @@ static inline unsigned huge_page_shift(struct hstate *h)
 	return h->order + PAGE_SHIFT;
 }
 
+static inline bool hstate_is_gigantic(struct hstate *h)
+{
+	return huge_page_order(h) >= MAX_ORDER;
+}
+
 static inline unsigned int pages_per_huge_page(struct hstate *h)
 {
 	return 1 << h->order;
@@ -340,7 +347,7 @@ static inline pte_t arch_make_huge_pte(pte_t entry, struct vm_area_struct *vma,
 
 static inline struct hstate *page_hstate(struct page *page)
 {
-	VM_BUG_ON(!PageHuge(page));
+	VM_BUG_ON_PAGE(!PageHuge(page), page);
 	return size_to_hstate(PAGE_SIZE << compound_order(page));
 }
 
@@ -372,6 +379,16 @@ static inline spinlock_t *huge_pte_lockptr(struct hstate *h,
 		return pmd_lockptr(mm, (pmd_t *) pte);
 	VM_BUG_ON(huge_page_size(h) == PAGE_SIZE);
 	return &mm->page_table_lock;
+}
+
+static inline bool hugepages_supported(void)
+{
+	/*
+	 * Some platform decide whether they support huge pages at boot
+	 * time. On these, such as powerpc, HPAGE_SHIFT is set to 0 when
+	 * there is no such support
+	 */
+	return HPAGE_SHIFT != 0;
 }
 
 #else	/* CONFIG_HUGETLB_PAGE */

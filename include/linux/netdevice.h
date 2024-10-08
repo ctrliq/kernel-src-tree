@@ -51,6 +51,8 @@
 #include <linux/neighbour.h>
 #include <uapi/linux/netdevice.h>
 
+#include <linux/rh_kabi.h>
+
 struct netpoll_info;
 struct device;
 struct phy_device;
@@ -1105,22 +1107,22 @@ struct net_device_ops {
 	 * to replace reserved slots with required structure field
 	 * additions of your backport.
 	 */
-	void			(*rh_reserved1)(void);
-	void			(*rh_reserved2)(void);
-	void			(*rh_reserved3)(void);
-	void			(*rh_reserved4)(void);
-	void			(*rh_reserved5)(void);
-	void			(*rh_reserved6)(void);
-	void			(*rh_reserved7)(void);
-	void			(*rh_reserved8)(void);
-	void			(*rh_reserved9)(void);
-	void			(*rh_reserved10)(void);
-	void			(*rh_reserved11)(void);
-	void			(*rh_reserved12)(void);
-	void			(*rh_reserved13)(void);
-	void			(*rh_reserved14)(void);
-	void			(*rh_reserved15)(void);
-	void			(*rh_reserved16)(void);
+	RH_KABI_RESERVE_P(1)
+	RH_KABI_RESERVE_P(2)
+	RH_KABI_RESERVE_P(3)
+	RH_KABI_RESERVE_P(4)
+	RH_KABI_RESERVE_P(5)
+	RH_KABI_RESERVE_P(6)
+	RH_KABI_RESERVE_P(7)
+	RH_KABI_RESERVE_P(8)
+	RH_KABI_RESERVE_P(9)
+	RH_KABI_RESERVE_P(10)
+	RH_KABI_RESERVE_P(11)
+	RH_KABI_RESERVE_P(12)
+	RH_KABI_RESERVE_P(13)
+	RH_KABI_RESERVE_P(14)
+	RH_KABI_RESERVE_P(15)
+	RH_KABI_RESERVE_P(16)
 };
 
 /*
@@ -1240,6 +1242,10 @@ struct net_device {
 	unsigned short		neigh_priv_len;
 	unsigned short          dev_id;		/* for shared network cards */
 
+	RH_KABI_FILL_HOLE(unsigned short dev_port) /* Used to differentiate
+						 * devices that share the same
+						 * function
+						 */
 	spinlock_t		addr_list_lock;
 	struct netdev_hw_addr_list	uc;	/* Unicast mac addresses */
 	struct netdev_hw_addr_list	mc;	/* Multicast mac addresses */
@@ -1441,22 +1447,22 @@ struct net_device {
 	 * to replace reserved slots with required structure field
 	 * additions of your backport.
 	 */
-	void			(*rh_reserved1)(void);
-	void			(*rh_reserved2)(void);
-	void			(*rh_reserved3)(void);
-	void			(*rh_reserved4)(void);
-	void			(*rh_reserved5)(void);
-	void			(*rh_reserved6)(void);
-	void			(*rh_reserved7)(void);
-	void			(*rh_reserved8)(void);
-	void			(*rh_reserved9)(void);
-	void			(*rh_reserved10)(void);
-	void			(*rh_reserved11)(void);
-	void			(*rh_reserved12)(void);
-	void			(*rh_reserved13)(void);
-	void			(*rh_reserved14)(void);
-	void			(*rh_reserved15)(void);
-	void			(*rh_reserved16)(void);
+	RH_KABI_RESERVE_P(1)
+	RH_KABI_RESERVE_P(2)
+	RH_KABI_RESERVE_P(3)
+	RH_KABI_RESERVE_P(4)
+	RH_KABI_RESERVE_P(5)
+	RH_KABI_RESERVE_P(6)
+	RH_KABI_RESERVE_P(7)
+	RH_KABI_RESERVE_P(8)
+	RH_KABI_RESERVE_P(9)
+	RH_KABI_RESERVE_P(10)
+	RH_KABI_RESERVE_P(11)
+	RH_KABI_RESERVE_P(12)
+	RH_KABI_RESERVE_P(13)
+	RH_KABI_RESERVE_P(14)
+	RH_KABI_RESERVE_P(15)
+	RH_KABI_RESERVE_P(16)
 };
 #define to_net_dev(d) container_of(d, struct net_device, dev)
 
@@ -1661,8 +1667,8 @@ struct napi_gro_cb {
 	/* GRO checksum is valid */
 	u8	csum_valid:1;
 
-	/* Number encapsulation layers crossed */
-	u8	encapsulation;
+	/* Number of checksums via CHECKSUM_UNNECESSARY */
+	u8	csum_cnt:3;
 
 	/* used to support CHECKSUM_COMPLETE for tunneling protocols */
 	__wsum	csum;
@@ -1705,6 +1711,20 @@ struct udp_offload {
 	__be16			 port;
 	struct offload_callbacks callbacks;
 };
+
+#define netdev_alloc_pcpu_stats(type)				\
+({								\
+	typeof(type) *pcpu_stats = alloc_percpu(type);		\
+	if (pcpu_stats)	{					\
+		int i;						\
+		for_each_possible_cpu(i) {			\
+			typeof(type) *stat;			\
+			stat = per_cpu_ptr(pcpu_stats, i);	\
+			u64_stats_init(&stat->syncp);		\
+		}						\
+	}							\
+	pcpu_stats;						\
+})
 
 #include <linux/notifier.h>
 
@@ -1883,11 +1903,6 @@ static inline void *skb_gro_header_slow(struct sk_buff *skb, unsigned int hlen,
 	return skb->data + offset;
 }
 
-static inline void *skb_gro_mac_header(struct sk_buff *skb)
-{
-	return NAPI_GRO_CB(skb)->frag0 ?: skb_mac_header(skb);
-}
-
 static inline void *skb_gro_network_header(struct sk_buff *skb)
 {
 	return (NAPI_GRO_CB(skb)->frag0 ?: skb->data) +
@@ -1914,8 +1929,7 @@ static inline bool __skb_gro_checksum_validate_needed(struct sk_buff *skb,
 						      __sum16 check)
 {
 	return (skb->ip_summed != CHECKSUM_PARTIAL &&
-		(skb->ip_summed != CHECKSUM_UNNECESSARY ||
-		 (NAPI_GRO_CB(skb)->encapsulation > skb->encapsulation)) &&
+		NAPI_GRO_CB(skb)->csum_cnt == 0 &&
 		(!zero_okay || check));
 }
 
@@ -1931,18 +1945,17 @@ static inline __sum16 __skb_gro_checksum_validate_complete(struct sk_buff *skb,
 	return __skb_gro_checksum_complete(skb);
 }
 
-/* Update skb for CHECKSUM_UNNECESSARY when we verified a top level
- * checksum or an encapsulated one during GRO. This saves work
- * if we fallback to normal path with the packet.
- */
 static inline void skb_gro_incr_csum_unnecessary(struct sk_buff *skb)
 {
-	if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
-		if (NAPI_GRO_CB(skb)->encapsulation)
-			skb->encapsulation = 1;
-	} else if (skb->ip_summed != CHECKSUM_PARTIAL) {
-		skb->ip_summed = CHECKSUM_UNNECESSARY;
-		skb->encapsulation = 0;
+	if (NAPI_GRO_CB(skb)->csum_cnt > 0) {
+		/* Consume a checksum from CHECKSUM_UNNECESSARY */
+		NAPI_GRO_CB(skb)->csum_cnt--;
+	} else {
+		/* Update skb for CHECKSUM_UNNECESSARY and csum_level when we
+		 * verified a new top level checksum or an encapsulated one
+		 * during GRO. This saves work if we fallback to normal path.
+		 */
+		__skb_incr_checksum_unnecessary(skb);
 	}
 }
 
@@ -1953,7 +1966,9 @@ static inline void skb_gro_incr_csum_unnecessary(struct sk_buff *skb)
 	if (__skb_gro_checksum_validate_needed(skb, zero_okay, check))	\
 		__ret = __skb_gro_checksum_validate_complete(skb,	\
 				compute_pseudo(skb, proto));		\
-	if (!__ret)							\
+	if (__ret)							\
+		__skb_mark_checksum_bad(skb);				\
+	else								\
 		skb_gro_incr_csum_unnecessary(skb);			\
 	__ret;								\
 })
@@ -3004,16 +3019,19 @@ void netdev_change_features(struct net_device *dev);
 void netif_stacked_transfer_operstate(const struct net_device *rootdev,
 					struct net_device *dev);
 
-netdev_features_t netif_skb_dev_features(struct sk_buff *skb,
-					 const struct net_device *dev);
-static inline netdev_features_t netif_skb_features(struct sk_buff *skb)
-{
-	return netif_skb_dev_features(skb, skb->dev);
-}
+netdev_features_t netif_skb_features(struct sk_buff *skb);
 
 static inline bool net_gso_ok(netdev_features_t features, int gso_type)
 {
-	netdev_features_t feature = gso_type << NETIF_F_GSO_SHIFT;
+	netdev_features_t feature = gso_type & SKB_GSO1_MASK;
+
+	feature <<= NETIF_F_GSO_SHIFT;
+
+	if (gso_type & SKB_GSO2_MASK) {
+		netdev_features_t f = gso_type & SKB_GSO2_MASK;
+		f <<= NETIF_F_GSO2_SHIFT;
+		feature |= f;
+	}
 
 	/* check flags correspondence */
 	BUILD_BUG_ON(SKB_GSO_TCPV4   != (NETIF_F_TSO >> NETIF_F_GSO_SHIFT));
@@ -3023,12 +3041,14 @@ static inline bool net_gso_ok(netdev_features_t features, int gso_type)
 	BUILD_BUG_ON(SKB_GSO_TCPV6   != (NETIF_F_TSO6 >> NETIF_F_GSO_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_FCOE    != (NETIF_F_FSO >> NETIF_F_GSO_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_GRE     != (NETIF_F_GSO_GRE >> NETIF_F_GSO_SHIFT));
-	BUILD_BUG_ON(SKB_GSO_GRE_CSUM != (NETIF_F_GSO_GRE_CSUM >> NETIF_F_GSO_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_IPIP    != (NETIF_F_GSO_IPIP >> NETIF_F_GSO_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_SIT     != (NETIF_F_GSO_SIT >> NETIF_F_GSO_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL != (NETIF_F_GSO_UDP_TUNNEL >> NETIF_F_GSO_SHIFT));
-	BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL_CSUM != (NETIF_F_GSO_UDP_TUNNEL_CSUM >> NETIF_F_GSO_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_MPLS    != (NETIF_F_GSO_MPLS >> NETIF_F_GSO_SHIFT));
+
+	/* GSO2 flags, see netdev_features.h */
+	BUILD_BUG_ON(SKB_GSO_GRE_CSUM != (NETIF_F_GSO_GRE_CSUM >> NETIF_F_GSO2_SHIFT));
+	BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL_CSUM != (NETIF_F_GSO_UDP_TUNNEL_CSUM >> NETIF_F_GSO2_SHIFT));
 
 	return (features & feature) == feature;
 }

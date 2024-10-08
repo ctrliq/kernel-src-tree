@@ -374,8 +374,9 @@ extern const char *ceph_mds_op_name(int op);
 /*
  * Ceph setxattr request flags.
  */
-#define CEPH_XATTR_CREATE  1
-#define CEPH_XATTR_REPLACE 2
+#define CEPH_XATTR_CREATE  (1 << 0)
+#define CEPH_XATTR_REPLACE (1 << 1)
+#define CEPH_XATTR_REMOVE  (1 << 31)
 
 union ceph_mds_request_args {
 	struct {
@@ -624,6 +625,8 @@ int ceph_flags_to_mode(int flags);
 			   CEPH_CAP_LINK_EXCL |		\
 			   CEPH_CAP_XATTR_EXCL |	\
 			   CEPH_CAP_FILE_EXCL)
+#define CEPH_CAP_ANY_FILE_RD (CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE | \
+			      CEPH_CAP_FILE_SHARED)
 #define CEPH_CAP_ANY_FILE_WR (CEPH_CAP_FILE_WR | CEPH_CAP_FILE_BUFFER |	\
 			      CEPH_CAP_FILE_EXCL)
 #define CEPH_CAP_ANY_WR   (CEPH_CAP_ANY_EXCL | CEPH_CAP_ANY_FILE_WR)

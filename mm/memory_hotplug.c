@@ -30,6 +30,8 @@
 #include <linux/mm_inline.h>
 #include <linux/firmware-map.h>
 #include <linux/stop_machine.h>
+#include <linux/memblock.h>
+#include <linux/bootmem.h>
 
 #include <asm/tlbflush.h>
 
@@ -1008,6 +1010,16 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_typ
 }
 #endif /* CONFIG_MEMORY_HOTPLUG_SPARSE */
 
+static void reset_node_present_pages(pg_data_t *pgdat)
+{
+	struct zone *z;
+
+	for (z = pgdat->node_zones; z < pgdat->node_zones + MAX_NR_ZONES; z++)
+		z->present_pages = 0;
+
+	pgdat->node_present_pages = 0;
+}
+
 /* we are OK calling __meminit stuff here - we have CONFIG_MEMORY_HOTPLUG */
 static pg_data_t __ref *hotadd_new_pgdat(int nid, u64 start)
 {
@@ -1037,6 +1049,21 @@ static pg_data_t __ref *hotadd_new_pgdat(int nid, u64 start)
 	mutex_lock(&zonelists_mutex);
 	build_all_zonelists(pgdat, NULL);
 	mutex_unlock(&zonelists_mutex);
+
+	/*
+	 * zone->managed_pages is set to an approximate value in
+	 * free_area_init_core(), which will cause
+	 * /sys/device/system/node/nodeX/meminfo has wrong data.
+	 * So reset it to 0 before any memory is onlined.
+	 */
+	reset_node_managed_pages(pgdat);
+
+	/*
+	 * When memory is hot-added, all the memory is in offline state. So
+	 * clear all zones' present_pages because they will be updated in
+	 * online_pages() and offline_pages().
+	 */
+	reset_node_present_pages(pgdat);
 
 	return pgdat;
 }
@@ -1373,6 +1400,37 @@ static bool can_offline_normal(struct zone *zone, unsigned long nr_pages)
 	return present_pages == 0;
 }
 #endif /* CONFIG_MOVABLE_NODE */
+
+static int __init cmdline_parse_movable_node(char *p)
+{
+#ifdef CONFIG_MOVABLE_NODE
+	/*
+	 * Memory used by the kernel cannot be hot-removed because Linux
+	 * cannot migrate the kernel pages. When memory hotplug is
+	 * enabled, we should prevent memblock from allocating memory
+	 * for the kernel.
+	 *
+	 * ACPI SRAT records all hotpluggable memory ranges. But before
+	 * SRAT is parsed, we don't know about it.
+	 *
+	 * The kernel image is loaded into memory at very early time. We
+	 * cannot prevent this anyway. So on NUMA system, we set any
+	 * node the kernel resides in as un-hotpluggable.
+	 *
+	 * Since on modern servers, one node could have double-digit
+	 * gigabytes memory, we can assume the memory around the kernel
+	 * image is also un-hotpluggable. So before SRAT is parsed, just
+	 * allocate memory near the kernel image to try the best to keep
+	 * the kernel away from hotpluggable memory.
+	 */
+	memblock_set_bottom_up(true);
+	movable_node_enabled = true;
+#else
+	pr_warn("movable_node option not supported\n");
+#endif
+	return 0;
+}
+early_param("movable_node", cmdline_parse_movable_node);
 
 /* check which state of node_states will be changed when offline memory */
 static void node_states_check_changes_offline(unsigned long nr_pages,

@@ -130,7 +130,7 @@
 #define IPR_IOASC_HW_DEV_BUS_STATUS			0x04448500
 #define	IPR_IOASC_IOASC_MASK			0xFFFFFF00
 #define	IPR_IOASC_SCSI_STATUS_MASK		0x000000FF
-#define IPR_IOASC_HW_CMD_FAILEd			0x046E0000
+#define IPR_IOASC_HW_CMD_FAILED			0x046E0000
 #define IPR_IOASC_IR_INVALID_REQ_TYPE_OR_PKT	0x05240000
 #define IPR_IOASC_IR_RESOURCE_HANDLE		0x05250000
 #define IPR_IOASC_IR_NO_CMDS_TO_2ND_IOA		0x05258100
@@ -235,6 +235,7 @@
 #define IPR_WAIT_FOR_RESET_TIMEOUT		(2 * HZ)
 #define IPR_CHECK_FOR_RESET_TIMEOUT		(HZ / 10)
 #define IPR_WAIT_FOR_BIST_TIMEOUT		(2 * HZ)
+#define IPR_PCI_ERROR_RECOVERY_TIMEOUT	(120 * HZ)
 #define IPR_PCI_RESET_TIMEOUT			(HZ / 2)
 #define IPR_SIS32_DUMP_TIMEOUT			(15 * HZ)
 #define IPR_SIS64_DUMP_TIMEOUT			(40 * HZ)
@@ -1461,6 +1462,7 @@ struct ipr_ioa_cfg {
 	u8 dump_timeout:1;
 	u8 cfg_locked:1;
 	u8 clear_isr:1;
+	u8 probe_done:1;
 
 	u8 revid;
 
@@ -1539,6 +1541,7 @@ struct ipr_ioa_cfg {
 
 	wait_queue_head_t reset_wait_q;
 	wait_queue_head_t msi_wait_q;
+	wait_queue_head_t eeh_wait_q;
 
 	struct ipr_dump *dump;
 	enum ipr_sdt_state sdt_state;

@@ -679,7 +679,11 @@ static int powernow_cpu_init(struct cpufreq_policy *policy)
 	policy->cpuinfo.transition_latency =
 		cpufreq_scale(2000000UL, fsb, latency);
 
-	return cpufreq_table_validate_and_show(policy, powernow_table);
+	policy->cur = powernow_get(0);
+
+	cpufreq_frequency_table_get_attr(powernow_table, policy->cpu);
+
+	return cpufreq_frequency_table_cpuinfo(policy, powernow_table);
 }
 
 static int powernow_cpu_exit(struct cpufreq_policy *policy)

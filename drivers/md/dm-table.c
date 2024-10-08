@@ -1404,6 +1404,62 @@ static bool dm_table_supports_write_same(struct dm_table *t)
 	return true;
 }
 
+void dm_table_run_md_queue_async(struct dm_table *t)
+{
+	struct mapped_device *md;
+	struct request_queue *queue;
+	unsigned long flags;
+
+	if (!dm_table_request_based(t))
+		return;
+
+	md = dm_table_get_md(t);
+	queue = dm_get_md_queue(md);
+	if (queue) {
+		spin_lock_irqsave(queue->queue_lock, flags);
+		blk_run_queue_async(queue);
+		spin_unlock_irqrestore(queue->queue_lock, flags);
+	}
+}
+EXPORT_SYMBOL(dm_table_run_md_queue_async);
+
+static int device_discard_capable(struct dm_target *ti, struct dm_dev *dev,
+				  sector_t start, sector_t len, void *data)
+{
+	struct request_queue *q = bdev_get_queue(dev->bdev);
+
+	return q && blk_queue_discard(q);
+}
+
+static bool dm_table_supports_discards(struct dm_table *t)
+{
+	struct dm_target *ti;
+	unsigned i = 0;
+
+	/*
+	 * Unless any target used by the table set discards_supported,
+	 * require at least one underlying device to support discards.
+	 * t->devices includes internal dm devices such as mirror logs
+	 * so we need to use iterate_devices here, which targets
+	 * supporting discard selectively must provide.
+	 */
+	while (i < dm_table_get_num_targets(t)) {
+		ti = dm_table_get_target(t, i++);
+
+		if (!ti->num_discard_bios)
+			continue;
+
+		if (ti->discards_supported)
+			return 1;
+
+		if (ti->type->iterate_devices &&
+		    ti->type->iterate_devices(ti, device_discard_capable, NULL))
+			return 1;
+	}
+
+	return 0;
+}
+
 void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 			       struct queue_limits *limits)
 {
@@ -1618,58 +1674,3 @@ struct mapped_device *dm_table_get_md(struct dm_table *t)
 }
 EXPORT_SYMBOL(dm_table_get_md);
 
-void dm_table_run_md_queue_async(struct dm_table *t)
-{
-	struct mapped_device *md;
-	struct request_queue *queue;
-	unsigned long flags;
-
-	if (!dm_table_request_based(t))
-		return;
-
-	md = dm_table_get_md(t);
-	queue = dm_get_md_queue(md);
-	if (queue) {
-		spin_lock_irqsave(queue->queue_lock, flags);
-		blk_run_queue_async(queue);
-		spin_unlock_irqrestore(queue->queue_lock, flags);
-	}
-}
-EXPORT_SYMBOL(dm_table_run_md_queue_async);
-
-static int device_discard_capable(struct dm_target *ti, struct dm_dev *dev,
-				  sector_t start, sector_t len, void *data)
-{
-	struct request_queue *q = bdev_get_queue(dev->bdev);
-
-	return q && blk_queue_discard(q);
-}
-
-bool dm_table_supports_discards(struct dm_table *t)
-{
-	struct dm_target *ti;
-	unsigned i = 0;
-
-	/*
-	 * Unless any target used by the table set discards_supported,
-	 * require at least one underlying device to support discards.
-	 * t->devices includes internal dm devices such as mirror logs
-	 * so we need to use iterate_devices here, which targets
-	 * supporting discard selectively must provide.
-	 */
-	while (i < dm_table_get_num_targets(t)) {
-		ti = dm_table_get_target(t, i++);
-
-		if (!ti->num_discard_bios)
-			continue;
-
-		if (ti->discards_supported)
-			return 1;
-
-		if (ti->type->iterate_devices &&
-		    ti->type->iterate_devices(ti, device_discard_capable, NULL))
-			return 1;
-	}
-
-	return 0;
-}

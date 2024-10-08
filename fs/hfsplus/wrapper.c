@@ -24,6 +24,13 @@ struct hfsplus_wd {
 	u16 embed_count;
 };
 
+static void hfsplus_end_io_sync(struct bio *bio, int err)
+{
+	if (err)
+		clear_bit(BIO_UPTODATE, &bio->bi_flags);
+	complete(bio->bi_private);
+}
+
 /*
  * hfsplus_submit_bio - Perfrom block I/O
  * @sb: super block of volume for I/O
@@ -46,6 +53,7 @@ struct hfsplus_wd {
 int hfsplus_submit_bio(struct super_block *sb, sector_t sector,
 		void *buf, void **data, int rw)
 {
+	DECLARE_COMPLETION_ONSTACK(wait);
 	struct bio *bio;
 	int ret = 0;
 	u64 io_size;
@@ -65,6 +73,8 @@ int hfsplus_submit_bio(struct super_block *sb, sector_t sector,
 	bio = bio_alloc(GFP_NOIO, 1);
 	bio->bi_sector = sector;
 	bio->bi_bdev = sb->s_bdev;
+	bio->bi_end_io = hfsplus_end_io_sync;
+	bio->bi_private = &wait;
 
 	if (!(rw & WRITE) && data)
 		*data = (u8 *)buf + offset;
@@ -83,7 +93,12 @@ int hfsplus_submit_bio(struct super_block *sb, sector_t sector,
 		buf = (u8 *)buf + len;
 	}
 
-	ret = submit_bio_wait(rw, bio);
+	submit_bio(rw, bio);
+	wait_for_completion(&wait);
+
+	if (!bio_flagged(bio, BIO_UPTODATE))
+		ret = -EIO;
+
 out:
 	bio_put(bio);
 	return ret < 0 ? ret : 0;

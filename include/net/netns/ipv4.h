@@ -63,7 +63,6 @@ struct netns_ipv4 {
 	int sysctl_icmp_errors_use_inbound_ifaddr;
 
 	int sysctl_tcp_ecn;
-	int sysctl_ip_no_pmtu_disc;
 
 	kgid_t sysctl_ping_group_range[2];
 	long sysctl_tcp_mem[3];
@@ -78,6 +77,5 @@ struct netns_ipv4 {
 	struct fib_rules_ops	*mr_rules_ops;
 #endif
 #endif
-	atomic_t	rt_genid;
 };
 #endif

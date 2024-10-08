@@ -386,7 +386,7 @@ static void free_tx_desc(struct adapter *adap, struct sge_txq *q,
 		if (d->skb) {                       /* an SGL is present */
 			if (unmap)
 				unmap_sgl(dev, d->skb, d->sgl, q);
-			dev_consume_skb_any(d->skb);
+			kfree_skb(d->skb);
 			d->skb = NULL;
 		}
 		++d;
@@ -1160,7 +1160,7 @@ out_free:	dev_kfree_skb_any(skb);
 
 	if (immediate) {
 		inline_tx_skb(skb, &q->q, cpl + 1);
-		dev_consume_skb_any(skb);
+		consume_skb(skb);
 	} else {
 		int last_desc;
 

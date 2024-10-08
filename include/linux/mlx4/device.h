@@ -33,10 +33,12 @@
 #ifndef MLX4_DEVICE_H
 #define MLX4_DEVICE_H
 
+#include <linux/if_ether.h>
 #include <linux/pci.h>
 #include <linux/completion.h>
 #include <linux/radix-tree.h>
 #include <linux/cpu_rmap.h>
+#include <linux/crash_dump.h>
 
 #include <linux/atomic.h>
 
@@ -181,20 +183,28 @@ enum {
 	MLX4_DEV_CAP_FLAG2_FSM			= 1LL <<  7,
 	MLX4_DEV_CAP_FLAG2_UPDATE_QP		= 1LL <<  8,
 	MLX4_DEV_CAP_FLAG2_VXLAN_OFFLOADS	= 1LL <<  9,
-	MLX4_DEV_CAP_FLAG2_DMFS_IPOIB		= 1LL << 10
+	MLX4_DEV_CAP_FLAG2_DMFS_IPOIB		= 1LL << 10,
+	MLX4_DEV_CAP_FLAG2_MAD_DEMUX		= 1LL <<  11,
+	MLX4_DEV_CAP_FLAG2_CQE_STRIDE		= 1LL <<  12,
+	MLX4_DEV_CAP_FLAG2_EQE_STRIDE		= 1LL <<  13,
+	MLX4_DEV_CAP_FLAG2_ETH_PROT_CTRL        = 1LL <<  14,
+	MLX4_DEV_CAP_FLAG2_ETH_BACKPL_AN_REP	= 1LL <<  15
 };
 
 enum {
 	MLX4_DEV_CAP_64B_EQE_ENABLED	= 1LL << 0,
-	MLX4_DEV_CAP_64B_CQE_ENABLED	= 1LL << 1
+	MLX4_DEV_CAP_64B_CQE_ENABLED	= 1LL << 1,
+	MLX4_DEV_CAP_CQE_STRIDE_ENABLED	= 1LL << 2,
+	MLX4_DEV_CAP_EQE_STRIDE_ENABLED	= 1LL << 3
 };
 
 enum {
-	MLX4_USER_DEV_CAP_64B_CQE	= 1L << 0
+	MLX4_USER_DEV_CAP_LARGE_CQE	= 1L << 0
 };
 
 enum {
-	MLX4_FUNC_CAP_64B_EQE_CQE	= 1L << 0
+	MLX4_FUNC_CAP_64B_EQE_CQE	= 1L << 0,
+	MLX4_FUNC_CAP_EQE_CQE_STRIDE	= 1L << 1
 };
 
 
@@ -273,6 +283,7 @@ enum {
 	MLX4_PERM_REMOTE_WRITE	= 1 << 13,
 	MLX4_PERM_ATOMIC	= 1 << 14,
 	MLX4_PERM_BIND_MW	= 1 << 15,
+	MLX4_PERM_MASK		= 0xFC00
 };
 
 enum {
@@ -370,6 +381,13 @@ enum {
 #define MSTR_SM_CHANGE_MASK (MLX4_EQ_PORT_INFO_MSTR_SM_SL_CHANGE_MASK | \
 			     MLX4_EQ_PORT_INFO_MSTR_SM_LID_CHANGE_MASK)
 
+enum mlx4_module_id {
+	MLX4_MODULE_ID_SFP              = 0x3,
+	MLX4_MODULE_ID_QSFP             = 0xC,
+	MLX4_MODULE_ID_QSFP_PLUS        = 0xD,
+	MLX4_MODULE_ID_QSFP28           = 0x11,
+};
+
 static inline u64 mlx4_fw_ver(u64 major, u64 minor, u64 subminor)
 {
 	return (major << 32) | (minor << 16) | subminor;
@@ -412,6 +430,7 @@ struct mlx4_caps {
 	int			max_rq_desc_sz;
 	int			max_qp_init_rdma;
 	int			max_qp_dest_rdma;
+	u32			*qp0_qkey;
 	u32			*qp0_proxy;
 	u32			*qp1_proxy;
 	u32			*qp0_tunnel;
@@ -647,7 +666,7 @@ struct mlx4_eth_av {
 	u8		s_mac[6];
 	u8		reserved4[2];
 	__be16		vlan;
-	u8		mac[6];
+	u8		mac[ETH_ALEN];
 };
 
 union mlx4_ext_av {
@@ -787,6 +806,26 @@ struct mlx4_init_port_param {
 	u64			node_guid;
 	u64			si_guid;
 };
+
+#define MAD_IFC_DATA_SZ 192
+/* MAD IFC Mailbox */
+struct mlx4_mad_ifc {
+	u8	base_version;
+	u8	mgmt_class;
+	u8	class_version;
+	u8	method;
+	__be16	status;
+	__be16	class_specific;
+	__be64	tid;
+	__be16	attr_id;
+	__be16	resv;
+	__be32	attr_mod;
+	__be64	mkey;
+	__be16	dr_slid;
+	__be16	dr_dlid;
+	u8	reserved[28];
+	u8	data[MAD_IFC_DATA_SZ];
+} __packed;
 
 #define mlx4_foreach_port(port, dev, type)				\
 	for ((port) = 1; (port) <= (dev)->caps.num_ports; (port)++)	\
@@ -968,10 +1007,10 @@ enum mlx4_net_trans_promisc_mode {
 };
 
 struct mlx4_spec_eth {
-	u8	dst_mac[6];
-	u8	dst_mac_msk[6];
-	u8	src_mac[6];
-	u8	src_mac_msk[6];
+	u8	dst_mac[ETH_ALEN];
+	u8	dst_mac_msk[ETH_ALEN];
+	u8	src_mac[ETH_ALEN];
+	u8	src_mac_msk[ETH_ALEN];
 	u8	ether_type_enable;
 	__be16	ether_type;
 	__be16	vlan_id_msk;
@@ -1252,4 +1291,70 @@ int mlx4_phys_to_slave_port(struct mlx4_dev *dev, int slave, int port);
 int mlx4_get_base_gid_ix(struct mlx4_dev *dev, int slave, int port);
 
 int mlx4_config_vxlan_port(struct mlx4_dev *dev, __be16 udp_port);
+int mlx4_vf_smi_enabled(struct mlx4_dev *dev, int slave, int port);
+int mlx4_vf_get_enable_smi_admin(struct mlx4_dev *dev, int slave, int port);
+int mlx4_vf_set_enable_smi_admin(struct mlx4_dev *dev, int slave, int port,
+				 int enable);
+int mlx4_mr_hw_get_mpt(struct mlx4_dev *dev, struct mlx4_mr *mmr,
+		       struct mlx4_mpt_entry ***mpt_entry);
+int mlx4_mr_hw_write_mpt(struct mlx4_dev *dev, struct mlx4_mr *mmr,
+			 struct mlx4_mpt_entry **mpt_entry);
+int mlx4_mr_hw_change_pd(struct mlx4_dev *dev, struct mlx4_mpt_entry *mpt_entry,
+			 u32 pdn);
+int mlx4_mr_hw_change_access(struct mlx4_dev *dev,
+			     struct mlx4_mpt_entry *mpt_entry,
+			     u32 access);
+void mlx4_mr_hw_put_mpt(struct mlx4_dev *dev,
+			struct mlx4_mpt_entry **mpt_entry);
+void mlx4_mr_rereg_mem_cleanup(struct mlx4_dev *dev, struct mlx4_mr *mr);
+int mlx4_mr_rereg_mem_write(struct mlx4_dev *dev, struct mlx4_mr *mr,
+			    u64 iova, u64 size, int npages,
+			    int page_shift, struct mlx4_mpt_entry *mpt_entry);
+
+int mlx4_get_module_info(struct mlx4_dev *dev, u8 port,
+			 u16 offset, u16 size, u8 *data);
+
+/* Returns true if running in low memory profile (kdump kernel) */
+static inline bool mlx4_low_memory_profile(void)
+{
+	return is_kdump_kernel();
+}
+
+/* ACCESS REG commands */
+enum mlx4_access_reg_method {
+	MLX4_ACCESS_REG_QUERY = 0x1,
+	MLX4_ACCESS_REG_WRITE = 0x2,
+};
+
+/* ACCESS PTYS Reg command */
+enum mlx4_ptys_proto {
+	MLX4_PTYS_IB = 1<<0,
+	MLX4_PTYS_EN = 1<<2,
+};
+
+struct mlx4_ptys_reg {
+	u8 resrvd1;
+	u8 local_port;
+	u8 resrvd2;
+	u8 proto_mask;
+	__be32 resrvd3[2];
+	__be32 eth_proto_cap;
+	__be16 ib_width_cap;
+	__be16 ib_speed_cap;
+	__be32 resrvd4;
+	__be32 eth_proto_admin;
+	__be16 ib_width_admin;
+	__be16 ib_speed_admin;
+	__be32 resrvd5;
+	__be32 eth_proto_oper;
+	__be16 ib_width_oper;
+	__be16 ib_speed_oper;
+	__be32 resrvd6;
+	__be32 eth_proto_lp_adv;
+} __packed;
+
+int mlx4_ACCESS_PTYS_REG(struct mlx4_dev *dev,
+			 enum mlx4_access_reg_method method,
+			 struct mlx4_ptys_reg *ptys_reg);
+
 #endif /* MLX4_DEVICE_H */

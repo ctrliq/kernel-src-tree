@@ -46,6 +46,7 @@ unsigned int rapl_verbose;	/* set with -R */
 unsigned int rapl_joules;	/* set with -J */
 unsigned int thermal_verbose;	/* set with -T */
 unsigned int summary_only;	/* set with -S */
+unsigned int dump_only;		/* set with -s */
 unsigned int skip_c0;
 unsigned int skip_c1;
 unsigned int do_nhm_cstates;
@@ -55,7 +56,7 @@ unsigned int do_slm_cstates;
 unsigned int use_c1_residency_msr;
 unsigned int has_aperf;
 unsigned int has_epb;
-unsigned int units = 1000000000;	/* Ghz etc */
+unsigned int units = 1000000;	/* MHz etc */
 unsigned int genuine_intel;
 unsigned int has_invariant_tsc;
 unsigned int do_nehalem_platform_info;
@@ -241,7 +242,7 @@ int cpu_migrate(int cpu)
 		return 0;
 }
 
-int _get_msr(int cpu, off_t offset, unsigned long long *msr, int warn)
+int get_msr(int cpu, off_t offset, unsigned long long *msr)
 {
 	ssize_t retval;
 	char pathname[32];
@@ -256,44 +257,37 @@ int _get_msr(int cpu, off_t offset, unsigned long long *msr, int warn)
 	close(fd);
 
 	if (retval != sizeof *msr) {
-		if (warn)
-			fprintf(stderr, "%s offset 0x%zx read failed\n",
-				pathname, offset);
+		fprintf(stderr, "%s offset 0x%llx read failed\n", pathname, (unsigned long long)offset);
 		return -1;
 	}
 
 	return 0;
 }
 
-int get_msr(int cpu, off_t offset, unsigned long long *msr)
-{
-	return _get_msr(cpu, offset, msr, 1);
-}
-
-int get_msr_nowarn(int cpu, off_t offset, unsigned long long *msr)
-{
-	return _get_msr(cpu, offset, msr, 0);
-}
+/*
+ * Example Format w/ field column widths:
+ *
+ *  Package    Core     CPU Avg_MHz Bzy_MHz TSC_MHz     SMI   %Busy CPU_%c1 CPU_%c3 CPU_%c6 CPU_%c7 CoreTmp  PkgTmp Pkg%pc2 Pkg%pc3 Pkg%pc6 Pkg%pc7 PkgWatt CorWatt GFXWatt
+ * 123456781234567812345678123456781234567812345678123456781234567812345678123456781234567812345678123456781234567812345678123456781234567812345678123456781234567812345678
+ */
 
 void print_header(void)
 {
 	if (show_pkg)
-		outp += sprintf(outp, "pk");
-	if (show_pkg)
-		outp += sprintf(outp, " ");
+		outp += sprintf(outp, " Package");
 	if (show_core)
-		outp += sprintf(outp, "cor");
+		outp += sprintf(outp, "    Core");
 	if (show_cpu)
-		outp += sprintf(outp, " CPU");
-	if (show_pkg || show_core || show_cpu)
-		outp += sprintf(outp, " ");
-	if (do_nhm_cstates)
-		outp += sprintf(outp, "   %%c0");
+		outp += sprintf(outp, "     CPU");
 	if (has_aperf)
-		outp += sprintf(outp, "  GHz");
-	outp += sprintf(outp, "  TSC");
+		outp += sprintf(outp, " Avg_MHz");
+	if (do_nhm_cstates)
+		outp += sprintf(outp, "   %%Busy");
+	if (has_aperf)
+		outp += sprintf(outp, " Bzy_MHz");
+	outp += sprintf(outp, " TSC_MHz");
 	if (do_smi)
-		outp += sprintf(outp, " SMI");
+		outp += sprintf(outp, "     SMI");
 	if (extra_delta_offset32)
 		outp += sprintf(outp, "  count 0x%03X", extra_delta_offset32);
 	if (extra_delta_offset64)
@@ -303,60 +297,60 @@ void print_header(void)
 	if (extra_msr_offset64)
 		outp += sprintf(outp, "           MSR 0x%03X", extra_msr_offset64);
 	if (do_nhm_cstates)
-		outp += sprintf(outp, "    %%c1");
+		outp += sprintf(outp, "  CPU%%c1");
 	if (do_nhm_cstates && !do_slm_cstates)
-		outp += sprintf(outp, "    %%c3");
+		outp += sprintf(outp, "  CPU%%c3");
 	if (do_nhm_cstates)
-		outp += sprintf(outp, "    %%c6");
+		outp += sprintf(outp, "  CPU%%c6");
 	if (do_snb_cstates)
-		outp += sprintf(outp, "    %%c7");
+		outp += sprintf(outp, "  CPU%%c7");
 
 	if (do_dts)
-		outp += sprintf(outp, " CTMP");
+		outp += sprintf(outp, " CoreTmp");
 	if (do_ptm)
-		outp += sprintf(outp, " PTMP");
+		outp += sprintf(outp, "  PkgTmp");
 
 	if (do_snb_cstates)
-		outp += sprintf(outp, "   %%pc2");
+		outp += sprintf(outp, " Pkg%%pc2");
 	if (do_nhm_cstates && !do_slm_cstates)
-		outp += sprintf(outp, "   %%pc3");
+		outp += sprintf(outp, " Pkg%%pc3");
 	if (do_nhm_cstates && !do_slm_cstates)
-		outp += sprintf(outp, "   %%pc6");
+		outp += sprintf(outp, " Pkg%%pc6");
 	if (do_snb_cstates)
-		outp += sprintf(outp, "   %%pc7");
+		outp += sprintf(outp, " Pkg%%pc7");
 	if (do_c8_c9_c10) {
-		outp += sprintf(outp, "   %%pc8");
-		outp += sprintf(outp, "   %%pc9");
-		outp += sprintf(outp, "  %%pc10");
+		outp += sprintf(outp, " Pkg%%pc8");
+		outp += sprintf(outp, " Pkg%%pc9");
+		outp += sprintf(outp, " Pk%%pc10");
 	}
 
 	if (do_rapl && !rapl_joules) {
 		if (do_rapl & RAPL_PKG)
-			outp += sprintf(outp, "  Pkg_W");
+			outp += sprintf(outp, " PkgWatt");
 		if (do_rapl & RAPL_CORES)
-			outp += sprintf(outp, "  Cor_W");
+			outp += sprintf(outp, " CorWatt");
 		if (do_rapl & RAPL_GFX)
-			outp += sprintf(outp, " GFX_W");
+			outp += sprintf(outp, " GFXWatt");
 		if (do_rapl & RAPL_DRAM)
-			outp += sprintf(outp, " RAM_W");
+			outp += sprintf(outp, " RAMWatt");
 		if (do_rapl & RAPL_PKG_PERF_STATUS)
-			outp += sprintf(outp, " PKG_%%");
+			outp += sprintf(outp, "   PKG_%%");
 		if (do_rapl & RAPL_DRAM_PERF_STATUS)
-			outp += sprintf(outp, " RAM_%%");
+			outp += sprintf(outp, "   RAM_%%");
 	} else {
 		if (do_rapl & RAPL_PKG)
-			outp += sprintf(outp, "  Pkg_J");
+			outp += sprintf(outp, "   Pkg_J");
 		if (do_rapl & RAPL_CORES)
-			outp += sprintf(outp, "  Cor_J");
+			outp += sprintf(outp, "   Cor_J");
 		if (do_rapl & RAPL_GFX)
-			outp += sprintf(outp, " GFX_J");
+			outp += sprintf(outp, "   GFX_J");
 		if (do_rapl & RAPL_DRAM)
-			outp += sprintf(outp, " RAM_W");
+			outp += sprintf(outp, "   RAM_W");
 		if (do_rapl & RAPL_PKG_PERF_STATUS)
-			outp += sprintf(outp, " PKG_%%");
+			outp += sprintf(outp, "   PKG_%%");
 		if (do_rapl & RAPL_DRAM_PERF_STATUS)
-			outp += sprintf(outp, " RAM_%%");
-		outp += sprintf(outp, " time");
+			outp += sprintf(outp, "   RAM_%%");
+		outp += sprintf(outp, "   time");
 
 	}
 	outp += sprintf(outp, "\n");
@@ -365,75 +359,68 @@ void print_header(void)
 int dump_counters(struct thread_data *t, struct core_data *c,
 	struct pkg_data *p)
 {
-	fprintf(stderr, "t %p, c %p, p %p\n", t, c, p);
+	outp += sprintf(outp, "t %p, c %p, p %p\n", t, c, p);
 
 	if (t) {
-		fprintf(stderr, "CPU: %d flags 0x%x\n", t->cpu_id, t->flags);
-		fprintf(stderr, "TSC: %016llX\n", t->tsc);
-		fprintf(stderr, "aperf: %016llX\n", t->aperf);
-		fprintf(stderr, "mperf: %016llX\n", t->mperf);
-		fprintf(stderr, "c1: %016llX\n", t->c1);
-		fprintf(stderr, "msr0x%x: %08llX\n",
+		outp += sprintf(outp, "CPU: %d flags 0x%x\n",
+			t->cpu_id, t->flags);
+		outp += sprintf(outp, "TSC: %016llX\n", t->tsc);
+		outp += sprintf(outp, "aperf: %016llX\n", t->aperf);
+		outp += sprintf(outp, "mperf: %016llX\n", t->mperf);
+		outp += sprintf(outp, "c1: %016llX\n", t->c1);
+		outp += sprintf(outp, "msr0x%x: %08llX\n",
 			extra_delta_offset32, t->extra_delta32);
-		fprintf(stderr, "msr0x%x: %016llX\n",
+		outp += sprintf(outp, "msr0x%x: %016llX\n",
 			extra_delta_offset64, t->extra_delta64);
-		fprintf(stderr, "msr0x%x: %08llX\n",
+		outp += sprintf(outp, "msr0x%x: %08llX\n",
 			extra_msr_offset32, t->extra_msr32);
-		fprintf(stderr, "msr0x%x: %016llX\n",
+		outp += sprintf(outp, "msr0x%x: %016llX\n",
 			extra_msr_offset64, t->extra_msr64);
 		if (do_smi)
-			fprintf(stderr, "SMI: %08X\n", t->smi_count);
+			outp += sprintf(outp, "SMI: %08X\n", t->smi_count);
 	}
 
 	if (c) {
-		fprintf(stderr, "core: %d\n", c->core_id);
-		fprintf(stderr, "c3: %016llX\n", c->c3);
-		fprintf(stderr, "c6: %016llX\n", c->c6);
-		fprintf(stderr, "c7: %016llX\n", c->c7);
-		fprintf(stderr, "DTS: %dC\n", c->core_temp_c);
+		outp += sprintf(outp, "core: %d\n", c->core_id);
+		outp += sprintf(outp, "c3: %016llX\n", c->c3);
+		outp += sprintf(outp, "c6: %016llX\n", c->c6);
+		outp += sprintf(outp, "c7: %016llX\n", c->c7);
+		outp += sprintf(outp, "DTS: %dC\n", c->core_temp_c);
 	}
 
 	if (p) {
-		fprintf(stderr, "package: %d\n", p->package_id);
-		fprintf(stderr, "pc2: %016llX\n", p->pc2);
-		fprintf(stderr, "pc3: %016llX\n", p->pc3);
-		fprintf(stderr, "pc6: %016llX\n", p->pc6);
-		fprintf(stderr, "pc7: %016llX\n", p->pc7);
-		fprintf(stderr, "pc8: %016llX\n", p->pc8);
-		fprintf(stderr, "pc9: %016llX\n", p->pc9);
-		fprintf(stderr, "pc10: %016llX\n", p->pc10);
-		fprintf(stderr, "Joules PKG: %0X\n", p->energy_pkg);
-		fprintf(stderr, "Joules COR: %0X\n", p->energy_cores);
-		fprintf(stderr, "Joules GFX: %0X\n", p->energy_gfx);
-		fprintf(stderr, "Joules RAM: %0X\n", p->energy_dram);
-		fprintf(stderr, "Throttle PKG: %0X\n", p->rapl_pkg_perf_status);
-		fprintf(stderr, "Throttle RAM: %0X\n", p->rapl_dram_perf_status);
-		fprintf(stderr, "PTM: %dC\n", p->pkg_temp_c);
+		outp += sprintf(outp, "package: %d\n", p->package_id);
+		outp += sprintf(outp, "pc2: %016llX\n", p->pc2);
+		outp += sprintf(outp, "pc3: %016llX\n", p->pc3);
+		outp += sprintf(outp, "pc6: %016llX\n", p->pc6);
+		outp += sprintf(outp, "pc7: %016llX\n", p->pc7);
+		outp += sprintf(outp, "pc8: %016llX\n", p->pc8);
+		outp += sprintf(outp, "pc9: %016llX\n", p->pc9);
+		outp += sprintf(outp, "pc10: %016llX\n", p->pc10);
+		outp += sprintf(outp, "Joules PKG: %0X\n", p->energy_pkg);
+		outp += sprintf(outp, "Joules COR: %0X\n", p->energy_cores);
+		outp += sprintf(outp, "Joules GFX: %0X\n", p->energy_gfx);
+		outp += sprintf(outp, "Joules RAM: %0X\n", p->energy_dram);
+		outp += sprintf(outp, "Throttle PKG: %0X\n",
+			p->rapl_pkg_perf_status);
+		outp += sprintf(outp, "Throttle RAM: %0X\n",
+			p->rapl_dram_perf_status);
+		outp += sprintf(outp, "PTM: %dC\n", p->pkg_temp_c);
 	}
+
+	outp += sprintf(outp, "\n");
+
 	return 0;
 }
 
 /*
  * column formatting convention & formats
- * package: "pk" 2 columns %2d
- * core: "cor" 3 columns %3d
- * CPU: "CPU" 3 columns %3d
- * Pkg_W: %6.2
- * Cor_W: %6.2
- * GFX_W: %5.2
- * RAM_W: %5.2
- * GHz: "GHz" 3 columns %3.2
- * TSC: "TSC" 3 columns %3.2
- * SMI: "SMI" 4 columns %4d
- * percentage " %pc3" %6.2
- * Perf Status percentage: %5.2
- * "CTMP" 4 columns %4d
  */
 int format_counters(struct thread_data *t, struct core_data *c,
 	struct pkg_data *p)
 {
 	double interval_float;
-	char *fmt5, *fmt6;
+	char *fmt8;
 
 	 /* if showing only 1st thread in core and this isn't one, bail out */
 	if (show_core_only && !(t->flags & CPU_IS_FIRST_THREAD_IN_CORE))
@@ -448,65 +435,52 @@ int format_counters(struct thread_data *t, struct core_data *c,
 	/* topo columns, print blanks on 1st (average) line */
 	if (t == &average.threads) {
 		if (show_pkg)
-			outp += sprintf(outp, "  ");
-		if (show_pkg && show_core)
-			outp += sprintf(outp, " ");
+			outp += sprintf(outp, "       -");
 		if (show_core)
-			outp += sprintf(outp, "   ");
+			outp += sprintf(outp, "       -");
 		if (show_cpu)
-			outp += sprintf(outp, " " "   ");
+			outp += sprintf(outp, "       -");
 	} else {
 		if (show_pkg) {
 			if (p)
-				outp += sprintf(outp, "%2d", p->package_id);
+				outp += sprintf(outp, "%8d", p->package_id);
 			else
-				outp += sprintf(outp, "  ");
+				outp += sprintf(outp, "       -");
 		}
-		if (show_pkg && show_core)
-			outp += sprintf(outp, " ");
 		if (show_core) {
 			if (c)
-				outp += sprintf(outp, "%3d", c->core_id);
+				outp += sprintf(outp, "%8d", c->core_id);
 			else
-				outp += sprintf(outp, "   ");
+				outp += sprintf(outp, "       -");
 		}
 		if (show_cpu)
-			outp += sprintf(outp, " %3d", t->cpu_id);
+			outp += sprintf(outp, "%8d", t->cpu_id);
 	}
+
+	/* AvgMHz */
+	if (has_aperf)
+		outp += sprintf(outp, "%8.0f",
+			1.0 / units * t->aperf / interval_float);
+
 	/* %c0 */
 	if (do_nhm_cstates) {
-		if (show_pkg || show_core || show_cpu)
-			outp += sprintf(outp, " ");
 		if (!skip_c0)
-			outp += sprintf(outp, "%6.2f", 100.0 * t->mperf/t->tsc);
+			outp += sprintf(outp, "%8.2f", 100.0 * t->mperf/t->tsc);
 		else
-			outp += sprintf(outp, "  ****");
+			outp += sprintf(outp, "********");
 	}
 
-	/* GHz */
-	if (has_aperf) {
-		if (!aperf_mperf_unstable) {
-			outp += sprintf(outp, " %3.2f",
-				1.0 * t->tsc / units * t->aperf /
-				t->mperf / interval_float);
-		} else {
-			if (t->aperf > t->tsc || t->mperf > t->tsc) {
-				outp += sprintf(outp, " ***");
-			} else {
-				outp += sprintf(outp, "%3.1f*",
-					1.0 * t->tsc /
-					units * t->aperf /
-					t->mperf / interval_float);
-			}
-		}
-	}
+	/* BzyMHz */
+	if (has_aperf)
+		outp += sprintf(outp, "%8.0f",
+			1.0 * t->tsc / units * t->aperf / t->mperf / interval_float);
 
 	/* TSC */
-	outp += sprintf(outp, "%5.2f", 1.0 * t->tsc/units/interval_float);
+	outp += sprintf(outp, "%8.0f", 1.0 * t->tsc/units/interval_float);
 
 	/* SMI */
 	if (do_smi)
-		outp += sprintf(outp, "%4d", t->smi_count);
+		outp += sprintf(outp, "%8d", t->smi_count);
 
 	/* delta */
 	if (extra_delta_offset32)
@@ -525,9 +499,9 @@ int format_counters(struct thread_data *t, struct core_data *c,
 
 	if (do_nhm_cstates) {
 		if (!skip_c1)
-			outp += sprintf(outp, " %6.2f", 100.0 * t->c1/t->tsc);
+			outp += sprintf(outp, "%8.2f", 100.0 * t->c1/t->tsc);
 		else
-			outp += sprintf(outp, "  ****");
+			outp += sprintf(outp, "********");
 	}
 
 	/* print per-core data only for 1st thread in core */
@@ -535,79 +509,76 @@ int format_counters(struct thread_data *t, struct core_data *c,
 		goto done;
 
 	if (do_nhm_cstates && !do_slm_cstates)
-		outp += sprintf(outp, " %6.2f", 100.0 * c->c3/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * c->c3/t->tsc);
 	if (do_nhm_cstates)
-		outp += sprintf(outp, " %6.2f", 100.0 * c->c6/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * c->c6/t->tsc);
 	if (do_snb_cstates)
-		outp += sprintf(outp, " %6.2f", 100.0 * c->c7/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * c->c7/t->tsc);
 
 	if (do_dts)
-		outp += sprintf(outp, " %4d", c->core_temp_c);
+		outp += sprintf(outp, "%8d", c->core_temp_c);
 
 	/* print per-package data only for 1st core in package */
 	if (!(t->flags & CPU_IS_FIRST_CORE_IN_PACKAGE))
 		goto done;
 
 	if (do_ptm)
-		outp += sprintf(outp, " %4d", p->pkg_temp_c);
+		outp += sprintf(outp, "%8d", p->pkg_temp_c);
 
 	if (do_snb_cstates)
-		outp += sprintf(outp, " %6.2f", 100.0 * p->pc2/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * p->pc2/t->tsc);
 	if (do_nhm_cstates && !do_slm_cstates)
-		outp += sprintf(outp, " %6.2f", 100.0 * p->pc3/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * p->pc3/t->tsc);
 	if (do_nhm_cstates && !do_slm_cstates)
-		outp += sprintf(outp, " %6.2f", 100.0 * p->pc6/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * p->pc6/t->tsc);
 	if (do_snb_cstates)
-		outp += sprintf(outp, " %6.2f", 100.0 * p->pc7/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * p->pc7/t->tsc);
 	if (do_c8_c9_c10) {
-		outp += sprintf(outp, " %6.2f", 100.0 * p->pc8/t->tsc);
-		outp += sprintf(outp, " %6.2f", 100.0 * p->pc9/t->tsc);
-		outp += sprintf(outp, " %6.2f", 100.0 * p->pc10/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * p->pc8/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * p->pc9/t->tsc);
+		outp += sprintf(outp, "%8.2f", 100.0 * p->pc10/t->tsc);
 	}
 
 	/*
  	 * If measurement interval exceeds minimum RAPL Joule Counter range,
  	 * indicate that results are suspect by printing "**" in fraction place.
  	 */
-	if (interval_float < rapl_joule_counter_range) {
-		fmt5 = " %5.2f";
-		fmt6 = " %6.2f";
-	} else {
-		fmt5 = " %3.0f**";
-		fmt6 = " %4.0f**";
-	}
+	if (interval_float < rapl_joule_counter_range)
+		fmt8 = "%8.2f";
+	else
+		fmt8 = " %6.0f**";
 
 	if (do_rapl && !rapl_joules) {
 		if (do_rapl & RAPL_PKG)
-			outp += sprintf(outp, fmt6, p->energy_pkg * rapl_energy_units / interval_float);
+			outp += sprintf(outp, fmt8, p->energy_pkg * rapl_energy_units / interval_float);
 		if (do_rapl & RAPL_CORES)
-			outp += sprintf(outp, fmt6, p->energy_cores * rapl_energy_units / interval_float);
+			outp += sprintf(outp, fmt8, p->energy_cores * rapl_energy_units / interval_float);
 		if (do_rapl & RAPL_GFX)
-			outp += sprintf(outp, fmt5, p->energy_gfx * rapl_energy_units / interval_float);
+			outp += sprintf(outp, fmt8, p->energy_gfx * rapl_energy_units / interval_float);
 		if (do_rapl & RAPL_DRAM)
-			outp += sprintf(outp, fmt5, p->energy_dram * rapl_energy_units / interval_float);
+			outp += sprintf(outp, fmt8, p->energy_dram * rapl_energy_units / interval_float);
 		if (do_rapl & RAPL_PKG_PERF_STATUS)
-			outp += sprintf(outp, fmt5, 100.0 * p->rapl_pkg_perf_status * rapl_time_units / interval_float);
+			outp += sprintf(outp, fmt8, 100.0 * p->rapl_pkg_perf_status * rapl_time_units / interval_float);
 		if (do_rapl & RAPL_DRAM_PERF_STATUS)
-			outp += sprintf(outp, fmt5, 100.0 * p->rapl_dram_perf_status * rapl_time_units / interval_float);
+			outp += sprintf(outp, fmt8, 100.0 * p->rapl_dram_perf_status * rapl_time_units / interval_float);
 	} else {
 		if (do_rapl & RAPL_PKG)
-			outp += sprintf(outp, fmt6,
+			outp += sprintf(outp, fmt8,
 					p->energy_pkg * rapl_energy_units);
 		if (do_rapl & RAPL_CORES)
-			outp += sprintf(outp, fmt6,
+			outp += sprintf(outp, fmt8,
 					p->energy_cores * rapl_energy_units);
 		if (do_rapl & RAPL_GFX)
-			outp += sprintf(outp, fmt5,
+			outp += sprintf(outp, fmt8,
 					p->energy_gfx * rapl_energy_units);
 		if (do_rapl & RAPL_DRAM)
-			outp += sprintf(outp, fmt5,
+			outp += sprintf(outp, fmt8,
 					p->energy_dram * rapl_energy_units);
 		if (do_rapl & RAPL_PKG_PERF_STATUS)
-			outp += sprintf(outp, fmt5, 100.0 * p->rapl_pkg_perf_status * rapl_time_units / interval_float);
+			outp += sprintf(outp, fmt8, 100.0 * p->rapl_pkg_perf_status * rapl_time_units / interval_float);
 		if (do_rapl & RAPL_DRAM_PERF_STATUS)
-			outp += sprintf(outp, fmt5, 100.0 * p->rapl_dram_perf_status * rapl_time_units / interval_float);
-	outp += sprintf(outp, fmt5, interval_float);
+			outp += sprintf(outp, fmt8, 100.0 * p->rapl_dram_perf_status * rapl_time_units / interval_float);
+	outp += sprintf(outp, fmt8, interval_float);
 
 	}
 done:
@@ -1021,10 +992,9 @@ int get_counters(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 		p->energy_dram = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_GFX) {
-		if (get_msr_nowarn(cpu, MSR_PP1_ENERGY_STATUS, &msr))
-			do_rapl &= ~RAPL_GFX; /* unsupported on servers */
-		else
-			p->energy_gfx = msr & 0xFFFFFFFF;
+		if (get_msr(cpu, MSR_PP1_ENERGY_STATUS, &msr))
+			return -16;
+		p->energy_gfx = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_PKG_PERF_STATUS) {
 		if (get_msr(cpu, MSR_PKG_PERF_STATUS, &msr))
@@ -1642,12 +1612,12 @@ void rapl_probe(unsigned int family, unsigned int model)
 		do_rapl = RAPL_PKG | RAPL_CORES | RAPL_CORE_POLICY | RAPL_GFX | RAPL_PKG_POWER_INFO;
 		break;
 	case 0x3F:	/* HSX */
-	case 0x4F:	/* BDX */
-	case 0x56:	/* BDX-DE */
 		do_rapl = RAPL_PKG | RAPL_DRAM | RAPL_DRAM_PERF_STATUS | RAPL_PKG_PERF_STATUS | RAPL_PKG_POWER_INFO;
 		break;
 	case 0x2D:
 	case 0x3E:
+	case 0x4F:	/* BDX */
+	case 0x56:	/* BDX-DE */
 		do_rapl = RAPL_PKG | RAPL_CORES | RAPL_CORE_POLICY | RAPL_DRAM | RAPL_PKG_PERF_STATUS | RAPL_DRAM_PERF_STATUS | RAPL_PKG_POWER_INFO;
 		break;
 	case 0x37:	/* BYT */
@@ -2001,13 +1971,13 @@ int set_temperature_target(struct thread_data *t, struct core_data *c, struct pk
 	if (get_msr(0, MSR_IA32_TEMPERATURE_TARGET, &msr))
 		goto guess;
 
-	target_c_local = (msr >> 16) & 0x7F;
+	target_c_local = (msr >> 16) & 0xFF;
 
 	if (verbose)
 		fprintf(stderr, "cpu%d: MSR_IA32_TEMPERATURE_TARGET: 0x%08llx (%d C)\n",
 			cpu, msr, target_c_local);
 
-	if (target_c_local < 85 || target_c_local > 127)
+	if (!target_c_local)
 		goto guess;
 
 	tcc_activation_temp = target_c_local;
@@ -2312,7 +2282,7 @@ int initialize_counters(int cpu_id)
 
 void allocate_output_buffer()
 {
-	output_buffer = calloc(1, (1 + topo.num_cpus) * 256);
+	output_buffer = calloc(1, (1 + topo.num_cpus) * 1024);
 	outp = output_buffer;
 	if (outp == NULL)
 		err(-1, "calloc output buffer");
@@ -2326,6 +2296,7 @@ void setup_all_buffers(void)
 	allocate_output_buffer();
 	for_all_proc_cpus(initialize_counters);
 }
+
 void turbostat_init()
 {
 	check_cpuid();
@@ -2394,19 +2365,39 @@ int fork_it(char **argv)
 	return status;
 }
 
+int get_and_dump_counters(void)
+{
+	int status;
+
+	status = for_all_cpus(get_counters, ODD_COUNTERS);
+	if (status)
+		return status;
+
+	status = for_all_cpus(dump_counters, ODD_COUNTERS);
+	if (status)
+		return status;
+
+	flush_stdout();
+
+	return status;
+}
+
 void cmdline(int argc, char **argv)
 {
 	int opt;
 
 	progname = argv[0];
 
-	while ((opt = getopt(argc, argv, "+pPSvi:c:C:m:M:RJT:")) != -1) {
+	while ((opt = getopt(argc, argv, "+pPsSvi:c:C:m:M:RJT:")) != -1) {
 		switch (opt) {
 		case 'p':
 			show_core_only++;
 			break;
 		case 'P':
 			show_pkg_only++;
+			break;
+		case 's':
+			dump_only++;
 			break;
 		case 'S':
 			summary_only++;
@@ -2450,10 +2441,14 @@ int main(int argc, char **argv)
 	cmdline(argc, argv);
 
 	if (verbose)
-		fprintf(stderr, "turbostat v3.6 Dec 2, 2013"
+		fprintf(stderr, "turbostat v3.7 Feb 6, 2014"
 			" - Len Brown <lenb@kernel.org>\n");
 
 	turbostat_init();
+
+	/* dump counters and exit */
+	if (dump_only)
+		return get_and_dump_counters();
 
 	/*
 	 * if any params left, it must be a command to fork

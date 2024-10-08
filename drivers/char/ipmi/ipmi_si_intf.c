@@ -61,7 +61,6 @@
 #include <linux/ipmi_smi.h>
 #include <asm/io.h>
 #include "ipmi_si_sm.h"
-#include <linux/init.h>
 #include <linux/dmi.h>
 #include <linux/string.h>
 #include <linux/ctype.h>
@@ -1230,7 +1229,6 @@ static struct ipmi_smi_handlers handlers = {
 	.get_smi_info		= get_smi_info,
 	.sender			= sender,
 	.request_events		= request_events,
-	.set_need_watch		= set_need_watch,
 	.set_maintenance_mode   = set_maintenance_mode,
 	.set_run_to_completion  = set_run_to_completion,
 	.poll			= poll,
@@ -1877,11 +1875,15 @@ static int hotmod_handler(const char *val, struct kernel_param *kp)
 				info->irq_setup = std_irq_setup;
 			info->slave_addr = ipmb;
 
-			if (!add_smi(info)) {
-				if (try_smi_init(info))
-					cleanup_one_si(info);
-			} else {
+			rv = add_smi(info);
+			if (rv) {
 				kfree(info);
+				goto out;
+			}
+			rv = try_smi_init(info);
+			if (rv) {
+				cleanup_one_si(info);
+				goto out;
 			}
 		} else {
 			/* remove */
@@ -2095,6 +2097,7 @@ struct SPMITable {
 static int try_init_spmi(struct SPMITable *spmi)
 {
 	struct smi_info  *info;
+	int rv;
 
 	if (spmi->IPMIlegacy != 1) {
 		printk(KERN_INFO PFX "Bad SPMI legacy %d\n", spmi->IPMIlegacy);
@@ -2169,10 +2172,11 @@ static int try_init_spmi(struct SPMITable *spmi)
 		 info->io.addr_data, info->io.regsize, info->io.regspacing,
 		 info->irq);
 
-	if (add_smi(info))
+	rv = add_smi(info);
+	if (rv)
 		kfree(info);
 
-	return 0;
+	return rv;
 }
 
 static void spmi_find_bmc(void)
@@ -2206,6 +2210,7 @@ static int ipmi_pnp_probe(struct pnp_dev *dev,
 	acpi_handle handle;
 	acpi_status status;
 	unsigned long long tmp;
+	int rv;
 
 	acpi_dev = pnp_acpi_device(dev);
 	if (!acpi_dev)
@@ -2287,10 +2292,11 @@ static int ipmi_pnp_probe(struct pnp_dev *dev,
 		 res, info->io.regsize, info->io.regspacing,
 		 info->irq);
 
-	if (add_smi(info))
-		goto err_free;
+	rv = add_smi(info);
+	if (rv)
+		kfree(info);
 
-	return 0;
+	return rv;
 
 err_free:
 	kfree(info);
@@ -2594,16 +2600,20 @@ static int ipmi_pci_probe(struct pci_dev *pdev,
 		&pdev->resource[0], info->io.regsize, info->io.regspacing,
 		info->irq);
 
-	if (add_smi(info))
+	rv = add_smi(info);
+	if (rv) {
 		kfree(info);
+		pci_disable_device(pdev);
+	}
 
-	return 0;
+	return rv;
 }
 
 static void ipmi_pci_remove(struct pci_dev *pdev)
 {
 	struct smi_info *info = pci_get_drvdata(pdev);
 	cleanup_one_si(info);
+	pci_disable_device(pdev);
 }
 
 static struct pci_device_id ipmi_pci_devices[] = {
@@ -2698,9 +2708,10 @@ static int ipmi_probe(struct platform_device *dev)
 
 	dev_set_drvdata(&dev->dev, info);
 
-	if (add_smi(info)) {
+	ret = add_smi(info);
+	if (ret) {
 		kfree(info);
-		return -EBUSY;
+		return ret;
 	}
 #endif
 	return 0;
@@ -3220,6 +3231,7 @@ static int try_smi_init(struct smi_info *new_smi)
 {
 	int rv = 0;
 	int i;
+	struct ipmi_shadow_smi_handlers *shadow_handlers;
 
 	printk(KERN_INFO PFX "Trying %s-specified %s state"
 	       " machine at %s address 0x%lx, slave address 0x%x,"
@@ -3355,6 +3367,11 @@ static int try_smi_init(struct smi_info *new_smi)
 		goto out_err_stop_timer;
 	}
 
+	/* RHEL7-only - Init ipmi_shadow_smi_handlers
+	 */
+	shadow_handlers = ipmi_get_shadow_smi_handlers();
+	shadow_handlers->set_need_watch = set_need_watch;
+
 	rv = ipmi_smi_add_proc_entry(new_smi->intf, "type",
 				     &smi_type_proc_ops,
 				     new_smi);
@@ -3438,10 +3455,21 @@ static int init_ipmi_si(void)
 	int  rv;
 	struct smi_info *e;
 	enum ipmi_addr_src type = SI_INVALID;
+	struct ipmi_shadow_smi_handlers *shadow_handlers;
 
 	if (initialized)
 		return 0;
 	initialized = 1;
+
+	/* RHEL7-only - Init ipmi_shadow_smi_handlers
+	 * The instance of struct ipmi_shadow_smi_handlers is located in
+	 * ipmi_msghandler.c. Locating it in this file would cause a
+	 * module dependency loop, because ipmi_msghandler would then
+	 * depend on ipmi_si, which already depends on ipmi_msghandler.
+	 */
+	shadow_handlers = ipmi_get_shadow_smi_handlers();
+	shadow_handlers->handlers = &handlers;
+	shadow_handlers->set_need_watch = set_need_watch;
 
 	if (si_tryplatform) {
 		rv = platform_driver_register(&ipmi_driver);

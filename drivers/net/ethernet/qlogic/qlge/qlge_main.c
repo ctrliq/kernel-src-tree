@@ -6,7 +6,6 @@
  *                      Ron Mercer <ron.mercer@qlogic.com>
  */
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/bitops.h>
 #include <linux/types.h>
 #include <linux/module.h>
@@ -87,7 +86,7 @@ MODULE_PARM_DESC(qlge_force_coredump,
 		"Option to allow force of firmware core dump. "
 		"Default is OFF - Do not allow.");
 
-static DEFINE_PCI_DEVICE_TABLE(qlge_pci_tbl) = {
+static const struct pci_device_id qlge_pci_tbl[] = {
 	{PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, QLGE_DEVICE_ID_8012)},
 	{PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, QLGE_DEVICE_ID_8000)},
 	/* required last entry */
@@ -2557,6 +2556,7 @@ static int ql_tso(struct sk_buff *skb, struct ob_mac_tso_iocb_req *mac_iocb_ptr)
 
 	if (skb_is_gso(skb)) {
 		int err;
+		__be16 l3_proto = vlan_get_protocol(skb);
 
 		err = skb_cow_head(skb, 0);
 		if (err < 0)
@@ -2573,7 +2573,7 @@ static int ql_tso(struct sk_buff *skb, struct ob_mac_tso_iocb_req *mac_iocb_ptr)
 				<< OB_MAC_TRANSPORT_HDR_SHIFT);
 		mac_iocb_ptr->mss = cpu_to_le16(skb_shinfo(skb)->gso_size);
 		mac_iocb_ptr->flags2 |= OB_MAC_TSO_IOCB_LSO;
-		if (likely(skb->protocol == htons(ETH_P_IP))) {
+		if (likely(l3_proto == htons(ETH_P_IP))) {
 			struct iphdr *iph = ip_hdr(skb);
 			iph->check = 0;
 			mac_iocb_ptr->flags1 |= OB_MAC_TSO_IOCB_IP4;
@@ -2581,7 +2581,7 @@ static int ql_tso(struct sk_buff *skb, struct ob_mac_tso_iocb_req *mac_iocb_ptr)
 								 iph->daddr, 0,
 								 IPPROTO_TCP,
 								 0);
-		} else if (skb->protocol == htons(ETH_P_IPV6)) {
+		} else if (l3_proto == htons(ETH_P_IPV6)) {
 			mac_iocb_ptr->flags1 |= OB_MAC_TSO_IOCB_IP6;
 			tcp_hdr(skb)->check =
 			    ~csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
@@ -4778,7 +4778,7 @@ static int qlge_probe(struct pci_dev *pdev,
 	ndev->irq = pdev->irq;
 
 	ndev->netdev_ops = &qlge_netdev_ops;
-	SET_ETHTOOL_OPS(ndev, &qlge_ethtool_ops);
+	ndev->ethtool_ops = &qlge_ethtool_ops;
 	ndev->watchdog_timeo = 10 * HZ;
 
 	err = register_netdev(ndev);

@@ -304,8 +304,7 @@ static int l2tp_nl_tunnel_send(struct sk_buff *skb, u32 portid, u32 seq, int fla
 	case L2TP_ENCAPTYPE_UDP:
 		if (nla_put_u16(skb, L2TP_ATTR_UDP_SPORT, ntohs(inet->inet_sport)) ||
 		    nla_put_u16(skb, L2TP_ATTR_UDP_DPORT, ntohs(inet->inet_dport)) ||
-		    nla_put_u8(skb, L2TP_ATTR_UDP_CSUM,
-			       (sk->sk_no_check != UDP_CSUM_NOXMIT)))
+		    nla_put_u8(skb, L2TP_ATTR_UDP_CSUM, !sk->sk_no_check_tx))
 			goto nla_put_failure;
 		/* NOBREAK */
 	case L2TP_ENCAPTYPE_IP:
@@ -800,7 +799,7 @@ static struct nla_policy l2tp_nl_policy[L2TP_ATTR_MAX + 1] = {
 	},
 };
 
-static struct genl_ops l2tp_nl_ops[] = {
+static const struct genl_ops l2tp_nl_ops[] = {
 	{
 		.cmd = L2TP_CMD_NOOP,
 		.doit = l2tp_nl_cmd_noop,
@@ -894,13 +893,8 @@ EXPORT_SYMBOL_GPL(l2tp_nl_unregister_ops);
 
 static int l2tp_nl_init(void)
 {
-	int err;
-
 	pr_info("L2TP netlink interface\n");
-	err = genl_register_family_with_ops(&l2tp_nl_family, l2tp_nl_ops,
-					    ARRAY_SIZE(l2tp_nl_ops));
-
-	return err;
+	return genl_register_family_with_ops(&l2tp_nl_family, l2tp_nl_ops);
 }
 
 static void l2tp_nl_cleanup(void)

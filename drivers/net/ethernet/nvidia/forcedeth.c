@@ -4278,8 +4278,8 @@ static int nv_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
 		if (np->duplex)
 			ecmd->duplex = DUPLEX_FULL;
 	} else {
-		speed = SPEED_UNKNOWN;
-		ecmd->duplex = DUPLEX_UNKNOWN;
+		speed = -1;
+		ecmd->duplex = -1;
 	}
 	ethtool_cmd_speed_set(ecmd, speed);
 	ecmd->autoneg = np->autoneg;

@@ -20,6 +20,7 @@
 #include <linux/delay.h>
 #include <linux/hardirq.h>
 #include <linux/scatterlist.h>
+#include <linux/ratelimit.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -68,57 +69,12 @@ static struct scsi_host_sg_pool scsi_sg_pools[] = {
 
 struct kmem_cache *scsi_sdb_cache;
 
-#ifdef CONFIG_ACPI
-#include <acpi/acpi_bus.h>
-
-static bool acpi_scsi_bus_match(struct device *dev)
-{
-	return dev->bus == &scsi_bus_type;
-}
-
-int scsi_register_acpi_bus_type(struct acpi_bus_type *bus)
-{
-        bus->match = acpi_scsi_bus_match;
-        return register_acpi_bus_type(bus);
-}
-EXPORT_SYMBOL_GPL(scsi_register_acpi_bus_type);
-
-void scsi_unregister_acpi_bus_type(struct acpi_bus_type *bus)
-{
-	unregister_acpi_bus_type(bus);
-}
-EXPORT_SYMBOL_GPL(scsi_unregister_acpi_bus_type);
-#endif
-
 /*
  * When to reinvoke queueing after a resource shortage. It's 3 msecs to
  * not change behaviour from the previous unplug mechanism, experimentation
  * may prove this needs changing.
  */
 #define SCSI_QUEUE_DELAY	3
-
-/*
- * Function:	scsi_unprep_request()
- *
- * Purpose:	Remove all preparation done for a request, including its
- *		associated scsi_cmnd, so that it can be requeued.
- *
- * Arguments:	req	- request to unprepare
- *
- * Lock status:	Assumed that no locks are held upon entry.
- *
- * Returns:	Nothing.
- */
-static void scsi_unprep_request(struct request *req)
-{
-	struct scsi_cmnd *cmd = req->special;
-
-	blk_unprep_request(req);
-	req->special = NULL;
-
-	scsi_put_command(cmd);
-	put_device(&cmd->device->sdev_gendev);
-}
 
 /**
  * __scsi_queue_insert - private queue insertion
@@ -140,8 +96,8 @@ static void __scsi_queue_insert(struct scsi_cmnd *cmd, int reason, int unbusy)
 	struct request_queue *q = device->request_queue;
 	unsigned long flags;
 
-	SCSI_LOG_MLQUEUE(1,
-		 printk("Inserting command %p into mlqueue\n", cmd));
+	SCSI_LOG_MLQUEUE(1, scmd_printk(KERN_INFO, cmd,
+		"Inserting command %p into mlqueue\n", cmd));
 
 	/*
 	 * Set the appropriate busy bit for the device/host.
@@ -502,16 +458,6 @@ void scsi_requeue_run_queue(struct work_struct *work)
 	scsi_run_queue(q);
 }
 
-static void scsi_uninit_command(struct scsi_cmnd *cmd)
-{
-	if (cmd->request->cmd_type == REQ_TYPE_FS) {
-		struct scsi_driver *drv = scsi_cmd_to_driver(cmd);
-
-		if (drv->uninit_command)
-			drv->uninit_command(cmd);
-	}
-}
-
 /*
  * Function:	scsi_requeue_command()
  *
@@ -536,18 +482,10 @@ static void scsi_requeue_command(struct request_queue *q, struct scsi_cmnd *cmd)
 	struct request *req = cmd->request;
 	unsigned long flags;
 
-	/*
-	 * We need to hold a reference on the device to avoid the queue being
-	 * killed after the unlock and before scsi_run_queue is invoked which
-	 * may happen because scsi_unprep_request() puts the command which
-	 * releases its reference on the device.
-	 */
-	get_device(&sdev->sdev_gendev);
-
-	scsi_uninit_command(cmd);
-
 	spin_lock_irqsave(q->queue_lock, flags);
-	scsi_unprep_request(req);
+	blk_unprep_request(req);
+	req->special = NULL;
+	scsi_put_command(cmd);
 	blk_requeue_request(q, req);
 	spin_unlock_irqrestore(q->queue_lock, flags);
 
@@ -749,6 +687,8 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 	int sense_deferred = 0;
 	enum {ACTION_FAIL, ACTION_REPREP, ACTION_RETRY,
 	      ACTION_DELAYED_RETRY} action;
+	static DEFINE_RATELIMIT_STATE(rs,  DEFAULT_RATELIMIT_INTERVAL,
+					DEFAULT_RATELIMIT_BURST);
 	unsigned long wait_for = (cmd->allowed + 1) * req->timeout;
 
 	if (result) {
@@ -804,9 +744,9 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 	 * Next deal with any sectors which we were able to correctly
 	 * handle.
 	 */
-	SCSI_LOG_HLCOMPLETE(1, printk("%u sectors total, "
-				      "%d bytes done.\n",
-				      blk_rq_sectors(req), good_bytes));
+	SCSI_LOG_HLCOMPLETE(1, scmd_printk(KERN_INFO, cmd,
+		"%u sectors total, %d bytes done.\n",
+		blk_rq_sectors(req), good_bytes));
 
 	/*
 	 * Recovered errors need reporting, but they're always treated
@@ -947,7 +887,7 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 	switch (action) {
 	case ACTION_FAIL:
 		/* Give up and fail the remainder of the request */
-		if (!(req->cmd_flags & REQ_QUIET)) {
+		if (!(req->cmd_flags & REQ_QUIET) && __ratelimit(&rs)) {
 			scsi_print_result(cmd);
 			if (driver_byte(result) & DRIVER_SENSE)
 				scsi_print_sense("", cmd);
@@ -1291,6 +1231,17 @@ out:
 	return scsi_prep_return(q, req, ret);
 }
 
+static void scsi_unprep_fn(struct request_queue *q, struct request *req)
+{
+	if (req->cmd_type == REQ_TYPE_FS) {
+		struct scsi_cmnd *cmd = req->special;
+		struct scsi_driver *drv = scsi_cmd_to_driver(cmd);
+
+		if (drv->uninit_command)
+			drv->uninit_command(cmd);
+	}
+}
+
 /*
  * scsi_dev_queue_ready: if we can send requests to sdev, return 1 else
  * return 0.
@@ -1376,8 +1327,8 @@ static inline int scsi_host_queue_ready(struct request_queue *q,
 		 */
 		if (--shost->host_blocked == 0) {
 			SCSI_LOG_MLQUEUE(3,
-				printk("scsi%d unblocking host at zero depth\n",
-					shost->host_no));
+				shost_printk(KERN_INFO, shost,
+					     "unblocking host at zero depth\n"));
 		} else {
 			return 0;
 		}
@@ -1486,7 +1437,7 @@ static void scsi_softirq_done(struct request *rq)
 			    wait_for/HZ);
 		disposition = SUCCESS;
 	}
-			
+
 	scsi_log_completion(cmd, disposition);
 
 	switch (disposition) {
@@ -1534,7 +1485,7 @@ static void scsi_request_fn(struct request_queue *q)
 		int rtn;
 		/*
 		 * get next queueable request.  We do this early to make sure
-		 * that the request is fully prepared even if we cannot 
+		 * that the request is fully prepared even if we cannot
 		 * accept it.
 		 */
 		req = blk_peek_request(q);
@@ -1710,6 +1661,7 @@ struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
 		return NULL;
 
 	blk_queue_prep_rq(q, scsi_prep_fn);
+	blk_queue_unprep_rq(q, scsi_unprep_fn);
 	blk_queue_softirq_done(q, scsi_softirq_done);
 	blk_queue_rq_timed_out(q, scsi_times_out);
 	blk_queue_lld_busy(q, scsi_lld_busy);
@@ -2171,9 +2123,9 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 	return 0;
 
  illegal:
-	SCSI_LOG_ERROR_RECOVERY(1, 
+	SCSI_LOG_ERROR_RECOVERY(1,
 				sdev_printk(KERN_ERR, sdev,
-					    "Illegal state transition %s->%s\n",
+					    "Illegal state transition %s->%s",
 					    scsi_device_state_name(oldstate),
 					    scsi_device_state_name(state))
 				);

@@ -47,31 +47,82 @@ void ext4_exit_pageio(void)
 }
 
 /*
- * This function is called by ext4_evict_inode() to make sure there is
- * no more pending I/O completion work left to do.
+ * Print an buffer I/O error compatible with the fs/buffer.c.  This
+ * provides compatibility with dmesg scrapers that look for a specific
+ * buffer I/O error message.  We really need a unified error reporting
+ * structure to userspace ala Digital Unix's uerf system, but it's
+ * probably not going to happen in my lifetime, due to LKML politics...
  */
-void ext4_ioend_shutdown(struct inode *inode)
+static void buffer_io_error(struct buffer_head *bh)
 {
-	wait_queue_head_t *wq = ext4_ioend_wq(inode);
+	char b[BDEVNAME_SIZE];
+	printk(KERN_ERR "Buffer I/O error on device %s, logical block %llu\n",
+			bdevname(bh->b_bdev, b),
+			(unsigned long long)bh->b_blocknr);
+}
 
-	wait_event(*wq, (atomic_read(&EXT4_I(inode)->i_ioend_count) == 0));
-	/*
-	 * We need to make sure the work structure is finished being
-	 * used before we let the inode get destroyed.
-	 */
-	if (work_pending(&EXT4_I(inode)->i_rsv_conversion_work))
-		cancel_work_sync(&EXT4_I(inode)->i_rsv_conversion_work);
-	if (work_pending(&EXT4_I(inode)->i_unrsv_conversion_work))
-		cancel_work_sync(&EXT4_I(inode)->i_unrsv_conversion_work);
+static void ext4_finish_bio(struct bio *bio)
+{
+	int i;
+	int error = !test_bit(BIO_UPTODATE, &bio->bi_flags);
+
+	for (i = 0; i < bio->bi_vcnt; i++) {
+		struct bio_vec *bvec = &bio->bi_io_vec[i];
+		struct page *page = bvec->bv_page;
+		struct buffer_head *bh, *head;
+		unsigned bio_start = bvec->bv_offset;
+		unsigned bio_end = bio_start + bvec->bv_len;
+		unsigned under_io = 0;
+		unsigned long flags;
+
+		if (!page)
+			continue;
+
+		if (error) {
+			SetPageError(page);
+			set_bit(AS_EIO, &page->mapping->flags);
+		}
+		bh = head = page_buffers(page);
+		/*
+		 * We check all buffers in the page under BH_Uptodate_Lock
+		 * to avoid races with other end io clearing async_write flags
+		 */
+		local_irq_save(flags);
+		bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
+		do {
+			if (bh_offset(bh) < bio_start ||
+			    bh_offset(bh) + bh->b_size > bio_end) {
+				if (buffer_async_write(bh))
+					under_io++;
+				continue;
+			}
+			clear_buffer_async_write(bh);
+			if (error)
+				buffer_io_error(bh);
+		} while ((bh = bh->b_this_page) != head);
+		bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
+		local_irq_restore(flags);
+		if (!under_io)
+			end_page_writeback(page);
+	}
 }
 
 static void ext4_release_io_end(ext4_io_end_t *io_end)
 {
+	struct bio *bio, *next_bio;
+
 	BUG_ON(!list_empty(&io_end->list));
 	BUG_ON(io_end->flag & EXT4_IO_END_UNWRITTEN);
+	WARN_ON(io_end->handle);
 
 	if (atomic_dec_and_test(&EXT4_I(io_end->inode)->i_ioend_count))
 		wake_up_all(ext4_ioend_wq(io_end->inode));
+
+	for (bio = io_end->bio; bio; bio = next_bio) {
+		next_bio = bio->bi_private;
+		ext4_finish_bio(bio);
+		bio_put(bio);
+	}
 	if (io_end->flag & EXT4_IO_END_DIRECT)
 		inode_dio_done(io_end->inode);
 	if (io_end->iocb)
@@ -102,13 +153,15 @@ static int ext4_end_io(ext4_io_end_t *io)
 	struct inode *inode = io->inode;
 	loff_t offset = io->offset;
 	ssize_t size = io->size;
+	handle_t *handle = io->handle;
 	int ret = 0;
 
 	ext4_debug("ext4_end_io_nolock: io 0x%p from inode %lu,list->next 0x%p,"
 		   "list->prev 0x%p\n",
 		   io, inode->i_ino, io->list.next, io->list.prev);
 
-	ret = ext4_convert_unwritten_extents(inode, offset, size);
+	io->handle = NULL;	/* Following call will use up the handle */
+	ret = ext4_convert_unwritten_extents(handle, inode, offset, size);
 	if (ret < 0) {
 		ext4_msg(inode->i_sb, KERN_EMERG,
 			 "failed to convert unwritten extents to written "
@@ -239,8 +292,10 @@ int ext4_put_io_end(ext4_io_end_t *io_end)
 
 	if (atomic_dec_and_test(&io_end->count)) {
 		if (io_end->flag & EXT4_IO_END_UNWRITTEN) {
-			err = ext4_convert_unwritten_extents(io_end->inode,
-						io_end->offset, io_end->size);
+			err = ext4_convert_unwritten_extents(io_end->handle,
+						io_end->inode, io_end->offset,
+						io_end->size);
+			io_end->handle = NULL;
 			ext4_clear_io_unwritten_flag(io_end);
 		}
 		ext4_release_io_end(io_end);
@@ -254,89 +309,47 @@ ext4_io_end_t *ext4_get_io_end(ext4_io_end_t *io_end)
 	return io_end;
 }
 
-/*
- * Print an buffer I/O error compatible with the fs/buffer.c.  This
- * provides compatibility with dmesg scrapers that look for a specific
- * buffer I/O error message.  We really need a unified error reporting
- * structure to userspace ala Digital Unix's uerf system, but it's
- * probably not going to happen in my lifetime, due to LKML politics...
- */
-static void buffer_io_error(struct buffer_head *bh)
-{
-	char b[BDEVNAME_SIZE];
-	printk_ratelimited(KERN_ERR "Buffer I/O error on device %s, logical block %llu\n",
-			bdevname(bh->b_bdev, b),
-			(unsigned long long)bh->b_blocknr);
-}
-
+/* BIO completion function for page writeback */
 static void ext4_end_bio(struct bio *bio, int error)
 {
 	ext4_io_end_t *io_end = bio->bi_private;
-	struct inode *inode;
-	int i;
-	int blocksize;
 	sector_t bi_sector = bio->bi_sector;
 
 	BUG_ON(!io_end);
-	inode = io_end->inode;
-	blocksize = 1 << inode->i_blkbits;
-	bio->bi_private = NULL;
 	bio->bi_end_io = NULL;
 	if (test_bit(BIO_UPTODATE, &bio->bi_flags))
 		error = 0;
-	for (i = 0; i < bio->bi_vcnt; i++) {
-		struct bio_vec *bvec = &bio->bi_io_vec[i];
-		struct page *page = bvec->bv_page;
-		struct buffer_head *bh, *head;
-		unsigned bio_start = bvec->bv_offset;
-		unsigned bio_end = bio_start + bvec->bv_len;
-		unsigned under_io = 0;
-		unsigned long flags;
-
-		if (!page)
-			continue;
-
-		if (error) {
-			SetPageError(page);
-			set_bit(AS_EIO, &page->mapping->flags);
-		}
-		bh = head = page_buffers(page);
-		/*
-		 * We check all buffers in the page under BH_Uptodate_Lock
-		 * to avoid races with other end io clearing async_write flags
-		 */
-		local_irq_save(flags);
-		bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
-		do {
-			if (bh_offset(bh) < bio_start ||
-			    bh_offset(bh) + blocksize > bio_end) {
-				if (buffer_async_write(bh))
-					under_io++;
-				continue;
-			}
-			clear_buffer_async_write(bh);
-			if (error)
-				buffer_io_error(bh);
-		} while ((bh = bh->b_this_page) != head);
-		bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
-		local_irq_restore(flags);
-		if (!under_io)
-			end_page_writeback(page);
-	}
-	bio_put(bio);
 
 	if (error) {
-		io_end->flag |= EXT4_IO_END_ERROR;
-		ext4_warning(inode->i_sb, "I/O error writing to inode %lu "
+		struct inode *inode = io_end->inode;
+
+		ext4_warning(inode->i_sb, "I/O error %d writing to inode %lu "
 			     "(offset %llu size %ld starting block %llu)",
-			     inode->i_ino,
+			     error, inode->i_ino,
 			     (unsigned long long) io_end->offset,
 			     (long) io_end->size,
 			     (unsigned long long)
 			     bi_sector >> (inode->i_blkbits - 9));
+		mapping_set_error(inode->i_mapping, error);
 	}
 
-	ext4_put_io_end_defer(io_end);
+	if (io_end->flag & EXT4_IO_END_UNWRITTEN) {
+		/*
+		 * Link bio into list hanging from io_end. We have to do it
+		 * atomically as bio completions can be racing against each
+		 * other.
+		 */
+		bio->bi_private = xchg(&io_end->bio, bio);
+		ext4_put_io_end_defer(io_end);
+	} else {
+		/*
+		 * Drop io_end reference early. Inode can get freed once
+		 * we finish the bio.
+		 */
+		ext4_put_io_end_defer(io_end);
+		ext4_finish_bio(bio);
+		bio_put(bio);
+	}
 }
 
 void ext4_io_submit(struct ext4_io_submit *io)
@@ -373,9 +386,6 @@ static int io_submit_init_bio(struct ext4_io_submit *io,
 	bio->bi_bdev = bh->b_bdev;
 	bio->bi_end_io = ext4_end_bio;
 	bio->bi_private = ext4_get_io_end(io->io_end);
-	if (!io->io_end->size)
-		io->io_end->offset = (bh->b_page->index << PAGE_CACHE_SHIFT)
-				     + bh_offset(bh);
 	io->io_bio = bio;
 	io->io_next_block = bh->b_blocknr;
 	return 0;
@@ -385,7 +395,6 @@ static int io_submit_add_bh(struct ext4_io_submit *io,
 			    struct inode *inode,
 			    struct buffer_head *bh)
 {
-	ext4_io_end_t *io_end;
 	int ret;
 
 	if (io->io_bio && bh->b_blocknr != io->io_next_block) {
@@ -400,10 +409,6 @@ submit_and_retry:
 	ret = bio_add_page(io->io_bio, bh->b_page, bh->b_size, bh_offset(bh));
 	if (ret != bh->b_size)
 		goto submit_and_retry;
-	io_end = io->io_end;
-	if (test_clear_buffer_uninit(bh))
-		ext4_set_io_unwritten_flag(inode, io_end);
-	io_end->size += bh->b_size;
 	io->io_next_block++;
 	return 0;
 }
@@ -411,7 +416,8 @@ submit_and_retry:
 int ext4_bio_write_page(struct ext4_io_submit *io,
 			struct page *page,
 			int len,
-			struct writeback_control *wbc)
+			struct writeback_control *wbc,
+			bool keep_towrite)
 {
 	struct inode *inode = page->mapping->host;
 	unsigned block_start, blocksize;
@@ -424,7 +430,10 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 	BUG_ON(!PageLocked(page));
 	BUG_ON(PageWriteback(page));
 
-	set_page_writeback(page);
+	if (keep_towrite)
+		set_page_writeback_keepwrite(page);
+	else
+		set_page_writeback(page);
 	ClearPageError(page);
 
 	/*

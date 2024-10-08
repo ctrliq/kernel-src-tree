@@ -3,7 +3,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <dirent.h>
-#include "fs.h"
+#include <api/fs/fs.h>
 #include <locale.h>
 #include "util.h"
 #include "pmu.h"
@@ -771,7 +771,7 @@ void print_pmu_events(const char *event_glob, bool name_only)
 			continue;
 		}
 		printf("  %-50s [Kernel PMU event]\n", aliases[j]);
-		free(aliases[j]);
+		zfree(&aliases[j]);
 		printed++;
 	}
 	if (printed)

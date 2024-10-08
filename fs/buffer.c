@@ -1503,18 +1503,38 @@ static void discard_buffer(struct buffer_head * bh)
  */
 void block_invalidatepage(struct page *page, unsigned long offset)
 {
+	return block_invalidatepage_range(page, offset,
+					  PAGE_CACHE_SIZE - offset);
+}
+EXPORT_SYMBOL(block_invalidatepage);
+
+void block_invalidatepage_range(struct page *page, unsigned int offset,
+				unsigned int length)
+{
 	struct buffer_head *head, *bh, *next;
 	unsigned int curr_off = 0;
+	unsigned int stop = length + offset;
 
 	BUG_ON(!PageLocked(page));
 	if (!page_has_buffers(page))
 		goto out;
+
+	/*
+	 * Check for overflow
+	 */
+	BUG_ON(stop > PAGE_CACHE_SIZE || stop < length);
 
 	head = page_buffers(page);
 	bh = head;
 	do {
 		unsigned int next_off = curr_off + bh->b_size;
 		next = bh->b_this_page;
+
+		/*
+		 * Are we still fully in range ?
+		 */
+		if (next_off > stop)
+			goto out;
 
 		/*
 		 * is this block fully invalidated?
@@ -1535,7 +1555,7 @@ void block_invalidatepage(struct page *page, unsigned long offset)
 out:
 	return;
 }
-EXPORT_SYMBOL(block_invalidatepage);
+EXPORT_SYMBOL(block_invalidatepage_range);
 
 /*
  * We attach and possibly dirty the buffers atomically wrt

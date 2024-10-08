@@ -1,6 +1,6 @@
 /*
  * QLogic Fibre Channel HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2014 QLogic Corporation
  *
  * See LICENSE.qla2xxx for copyright and licensing details.
  */
@@ -280,7 +280,9 @@ struct register_host_info {
 #define QLAFX00_TGT_NODE_LIST_SIZE (sizeof(uint32_t) * 32)
 
 struct config_info_data {
-	uint8_t		product_name[256];
+	uint8_t		model_num[16];
+	uint8_t		model_description[80];
+	uint8_t		reserved0[160];
 	uint8_t		symbolic_name[64];
 	uint8_t		serial_num[32];
 	uint8_t		hw_version[16];
@@ -334,11 +336,7 @@ struct config_info_data {
 
 #define QLAFX00_INTR_MB_CMPLT		0x1
 #define QLAFX00_INTR_RSP_CMPLT		0x2
-#define QLAFX00_INTR_MB_RSP_CMPLT	0x3
 #define QLAFX00_INTR_ASYNC_CMPLT	0x4
-#define QLAFX00_INTR_MB_ASYNC_CMPLT	0x5
-#define QLAFX00_INTR_RSP_ASYNC_CMPLT	0x6
-#define QLAFX00_INTR_ALL_CMPLT		0x7
 
 #define QLAFX00_MBA_SYSTEM_ERR		0x8002
 #define QLAFX00_MBA_TEMP_OVER		0x8005
@@ -468,7 +466,6 @@ struct qla_mt_iocb_rsp_fx00 {
 #define FX00_DEF_RATOV	10
 
 struct mr_data_fx00 {
-	uint8_t	product_name[256];
 	uint8_t	symbolic_name[64];
 	uint8_t	serial_num[32];
 	uint8_t	hw_version[16];
@@ -520,5 +517,11 @@ struct mr_data_fx00 {
 #define QLAFX00_HINFO_RESEND_INTERVAL	60	/* number of seconds */
 
 #define QLAFX00_CRITEMP_THRSHLD		80	/* Celsius degrees */
+
+/* Max conncurrent IOs that can be queued */
+#define QLAFX00_MAX_CANQUEUE		1024
+
+/* IOCTL IOCB abort success */
+#define QLAFX00_IOCTL_ICOB_ABORT_SUCCESS	0x68
 
 #endif

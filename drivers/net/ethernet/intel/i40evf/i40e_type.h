@@ -35,22 +35,20 @@
 #include "i40e_lan_hmc.h"
 
 /* Device IDs */
-#define I40E_SFP_XL710_DEVICE_ID	0x1572
-#define I40E_SFP_X710_DEVICE_ID		0x1573
-#define I40E_QEMU_DEVICE_ID		0x1574
-#define I40E_KX_A_DEVICE_ID		0x157F
-#define I40E_KX_B_DEVICE_ID		0x1580
-#define I40E_KX_C_DEVICE_ID		0x1581
-#define I40E_KX_D_DEVICE_ID		0x1582
-#define I40E_QSFP_A_DEVICE_ID		0x1583
-#define I40E_QSFP_B_DEVICE_ID		0x1584
-#define I40E_QSFP_C_DEVICE_ID		0x1585
-#define I40E_VF_DEVICE_ID		0x154C
-#define I40E_VF_HV_DEVICE_ID		0x1571
+#define I40E_DEV_ID_SFP_XL710		0x1572
+#define I40E_DEV_ID_QEMU		0x1574
+#define I40E_DEV_ID_KX_A		0x157F
+#define I40E_DEV_ID_KX_B		0x1580
+#define I40E_DEV_ID_KX_C		0x1581
+#define I40E_DEV_ID_QSFP_A		0x1583
+#define I40E_DEV_ID_QSFP_B		0x1584
+#define I40E_DEV_ID_QSFP_C		0x1585
+#define I40E_DEV_ID_VF		0x154C
+#define I40E_DEV_ID_VF_HV		0x1571
 
-#define i40e_is_40G_device(d)		((d) == I40E_QSFP_A_DEVICE_ID  || \
-					 (d) == I40E_QSFP_B_DEVICE_ID  || \
-					 (d) == I40E_QSFP_C_DEVICE_ID)
+#define i40e_is_40G_device(d)		((d) == I40E_DEV_ID_QSFP_A  || \
+					 (d) == I40E_DEV_ID_QSFP_B  || \
+					 (d) == I40E_DEV_ID_QSFP_C)
 
 /* I40E_MASK is a macro used on 32 bit registers */
 #define I40E_MASK(mask, shift) (mask << shift)
@@ -1043,8 +1041,6 @@ struct i40e_eth_stats {
 	u64 rx_multicast;		/* mprc */
 	u64 rx_broadcast;		/* bprc */
 	u64 rx_discards;		/* rdpc */
-	u64 rx_errors;			/* repc */
-	u64 rx_missed;			/* rmpc */
 	u64 rx_unknown_protocol;	/* rupp */
 	u64 tx_bytes;			/* gotc */
 	u64 tx_unicast;			/* uptc */
@@ -1096,6 +1092,9 @@ struct i40e_hw_port_stats {
 	u64 tx_size_big;		/* ptc9522 */
 	u64 mac_short_packet_dropped;	/* mspdc */
 	u64 checksum_error;		/* xec */
+	/* flow director stats */
+	u64 fd_atr_match;
+	u64 fd_sb_match;
 	/* EEE LPI */
 	u32 tx_lpi_status;
 	u32 rx_lpi_status;

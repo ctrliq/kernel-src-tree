@@ -126,25 +126,15 @@ static void blk_flush_restore_request(struct request *rq)
 	/* make @rq a normal request */
 	rq->cmd_flags &= ~REQ_FLUSH_SEQ;
 	rq->end_io = rq->flush.saved_end_io;
-
-	blk_clear_rq_complete(rq);
-}
-
-static void mq_flush_run(struct work_struct *work)
-{
-	struct request *rq;
-
-	rq = container_of(work, struct request, requeue_work);
-
-	memset(&rq->csd, 0, sizeof(rq->csd));
-	blk_mq_insert_request(rq, false, true, false);
 }
 
 static bool blk_flush_queue_rq(struct request *rq, bool add_front)
 {
 	if (rq->q->mq_ops) {
-		INIT_WORK(&rq->requeue_work, mq_flush_run);
-		kblockd_schedule_work(&rq->requeue_work);
+		struct request_queue *q = rq->q;
+
+		blk_mq_add_to_requeue_list(rq, add_front);
+		blk_mq_kick_requeue_list(q);
 		return false;
 	} else {
 		if (add_front)
@@ -210,7 +200,7 @@ static bool blk_flush_complete_seq(struct request *rq, unsigned int seq,
 		list_del_init(&rq->flush.list);
 		blk_flush_restore_request(rq);
 		if (q->mq_ops)
-			blk_mq_end_io(rq, error);
+			blk_mq_end_request(rq, error);
 		else
 			__blk_end_request_all(rq, error);
 		break;
@@ -231,8 +221,10 @@ static void flush_end_io(struct request *flush_rq, int error)
 	struct request *rq, *n;
 	unsigned long flags = 0;
 
-	if (q->mq_ops)
+	if (q->mq_ops) {
 		spin_lock_irqsave(&q->mq_flush_lock, flags);
+		q->flush_rq->tag = -1;
+	}
 
 	running = &q->flush_queue[q->flush_running_idx];
 	BUG_ON(q->flush_pending_idx == q->flush_running_idx);
@@ -306,23 +298,9 @@ static bool blk_kick_flush(struct request_queue *q)
 	 */
 	q->flush_pending_idx ^= 1;
 
-	if (q->mq_ops) {
-		struct blk_mq_ctx *ctx = first_rq->mq_ctx;
-		struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q, ctx->cpu);
-
-		blk_mq_rq_init(hctx, q->flush_rq);
-		q->flush_rq->mq_ctx = ctx;
-
-		/*
-		 * Reuse the tag value from the fist waiting request,
-		 * with blk-mq the tag is generated during request
-		 * allocation and drivers can rely on it being inside
-		 * the range they asked for.
-		 */
-		q->flush_rq->tag = first_rq->tag;
-	} else {
-		blk_rq_init(q, q->flush_rq);
-	}
+	blk_rq_init(q, q->flush_rq);
+	if (q->mq_ops)
+		blk_mq_clone_flush_request(q->flush_rq, first_rq);
 
 	q->flush_rq->cmd_type = REQ_TYPE_FS;
 	q->flush_rq->cmd_flags = WRITE_FLUSH | REQ_FLUSH_SEQ;
@@ -398,7 +376,7 @@ void blk_insert_flush(struct request *rq)
 	 */
 	if (!policy) {
 		if (q->mq_ops)
-			blk_mq_end_io(rq, 0);
+			blk_mq_end_request(rq, 0);
 		else
 			__blk_end_bidi_request(rq, 0, 0, 0);
 		return;
@@ -441,42 +419,13 @@ void blk_insert_flush(struct request *rq)
 	blk_flush_complete_seq(rq, REQ_FSEQ_ACTIONS & ~policy, 0);
 }
 
-/**
- * blk_abort_flushes - @q is being aborted, abort flush requests
- * @q: request_queue being aborted
- *
- * To be called from elv_abort_queue().  @q is being aborted.  Prepare all
- * FLUSH/FUA requests for abortion.
- *
- * CONTEXT:
- * spin_lock_irq(q->queue_lock)
- */
-void blk_abort_flushes(struct request_queue *q)
+static void bio_end_flush(struct bio *bio, int err)
 {
-	struct request *rq, *n;
-	int i;
-
-	/*
-	 * Requests in flight for data are already owned by the dispatch
-	 * queue or the device driver.  Just restore for normal completion.
-	 */
-	list_for_each_entry_safe(rq, n, &q->flush_data_in_flight, flush.list) {
-		list_del_init(&rq->flush.list);
-		blk_flush_restore_request(rq);
-	}
-
-	/*
-	 * We need to give away requests on flush queues.  Restore for
-	 * normal completion and put them on the dispatch queue.
-	 */
-	for (i = 0; i < ARRAY_SIZE(q->flush_queue); i++) {
-		list_for_each_entry_safe(rq, n, &q->flush_queue[i],
-					 flush.list) {
-			list_del_init(&rq->flush.list);
-			blk_flush_restore_request(rq);
-			list_add_tail(&rq->queuelist, &q->queue_head);
-		}
-	}
+	if (err)
+		clear_bit(BIO_UPTODATE, &bio->bi_flags);
+	if (bio->bi_private)
+		complete(bio->bi_private);
+	bio_put(bio);
 }
 
 /**
@@ -494,6 +443,7 @@ void blk_abort_flushes(struct request_queue *q)
 int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
 		sector_t *error_sector)
 {
+	DECLARE_COMPLETION_ONSTACK(wait);
 	struct request_queue *q;
 	struct bio *bio;
 	int ret = 0;
@@ -515,9 +465,13 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
 		return -ENXIO;
 
 	bio = bio_alloc(gfp_mask, 0);
+	bio->bi_end_io = bio_end_flush;
 	bio->bi_bdev = bdev;
+	bio->bi_private = &wait;
 
-	ret = submit_bio_wait(WRITE_FLUSH, bio);
+	bio_get(bio);
+	submit_bio(WRITE_FLUSH, bio);
+	wait_for_completion_io(&wait);
 
 	/*
 	 * The driver must store the error location in ->bi_sector, if
@@ -526,6 +480,9 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
 	 */
 	if (error_sector)
 		*error_sector = bio->bi_sector;
+
+	if (!bio_flagged(bio, BIO_UPTODATE))
+		ret = -EIO;
 
 	bio_put(bio);
 	return ret;

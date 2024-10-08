@@ -20,6 +20,8 @@
 #include <linux/blkdev.h>
 #include <linux/atomic.h>
 
+#include <linux/rh_kabi.h>
+
 /* Max limits for throttle policy */
 #define THROTL_IOPS_MAX		UINT_MAX
 
@@ -104,8 +106,14 @@ struct blkcg_gq {
 	/* request allocation list for this blkcg-q pair */
 	struct request_list		rl;
 
-	/* reference count */
-	atomic_t			refcnt;
+	/*
+	 * blkcg_gq is visible in request_queue and other places. So any
+	 * changes to it break kabi. This is an internal structure and
+	 * all group creation and desctruction is managed by kernel. No
+	 * module should be touching it. So it should be safe to use
+	 * __GENKSYMS__ trick.
+	 */
+	RH_KABI_CHANGE_TYPE(int refcnt, atomic_t refcnt)
 
 	/* is this blkg online? protected by both blkcg and q locks */
 	bool				online;

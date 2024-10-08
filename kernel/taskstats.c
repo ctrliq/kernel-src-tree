@@ -667,7 +667,7 @@ err:
 	nlmsg_free(rep_skb);
 }
 
-static struct genl_ops taskstats_ops[] = {
+static const struct genl_ops taskstats_ops[] = {
 	{
 		.cmd		= TASKSTATS_CMD_GET,
 		.doit		= taskstats_user_cmd,
@@ -697,8 +697,7 @@ static int __init taskstats_init(void)
 {
 	int rc;
 
-	rc = genl_register_family_with_ops(&family, taskstats_ops,
-					   ARRAY_SIZE(taskstats_ops));
+	rc = genl_register_family_with_ops(&family, taskstats_ops);
 	if (rc)
 		return rc;
 

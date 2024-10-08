@@ -128,6 +128,11 @@ enum {
 	MLX4_COMM_CMD_FLR = 254
 };
 
+enum {
+	MLX4_VF_SMI_DISABLED,
+	MLX4_VF_SMI_ENABLED
+};
+
 /*The flag indicates that the slave should delay the RESET cmd*/
 #define MLX4_DELAY_RESET_SLAVE 0xbbbbbbb
 /*indicates how many retries will be done if we are in the middle of FLR*/
@@ -269,6 +274,8 @@ struct mlx4_icm_table {
 #define MLX4_MPT_FLAG_PHYSICAL	    (1 <<  9)
 #define MLX4_MPT_FLAG_REGION	    (1 <<  8)
 
+#define MLX4_MPT_PD_MASK	    (0x1FFFFUL)
+#define MLX4_MPT_PD_VF_MASK	    (0xFE0000UL)
 #define MLX4_MPT_PD_FLAG_FAST_REG   (1 << 27)
 #define MLX4_MPT_PD_FLAG_RAE	    (1 << 28)
 #define MLX4_MPT_PD_FLAG_EN_INV	    (3 << 24)
@@ -277,6 +284,9 @@ struct mlx4_icm_table {
 
 #define MLX4_MPT_STATUS_SW		0xF0
 #define MLX4_MPT_STATUS_HW		0x00
+
+#define MLX4_CQE_SIZE_MASK_STRIDE	0x3
+#define MLX4_EQE_SIZE_MASK_STRIDE	0x30
 
 /*
  * Must be packed because mtt_seg is 64 bits but only aligned to 32 bits.
@@ -484,6 +494,7 @@ struct mlx4_vport_state {
 
 struct mlx4_vf_admin_state {
 	struct mlx4_vport_state vport[MLX4_MAX_PORTS + 1];
+	u8 enable_smi[MLX4_MAX_PORTS + 1];
 };
 
 struct mlx4_vport_oper_state {
@@ -491,8 +502,10 @@ struct mlx4_vport_oper_state {
 	int mac_idx;
 	int vlan_idx;
 };
+
 struct mlx4_vf_oper_state {
 	struct mlx4_vport_oper_state vport[MLX4_MAX_PORTS + 1];
+	u8 smi_enabled[MLX4_MAX_PORTS + 1];
 };
 
 struct slave_list {
@@ -1298,5 +1311,6 @@ void mlx4_init_quotas(struct mlx4_dev *dev);
 int mlx4_get_slave_num_gids(struct mlx4_dev *dev, int slave, int port);
 /* Returns the VF index of slave */
 int mlx4_get_vf_indx(struct mlx4_dev *dev, int slave);
+int mlx4_config_mad_demux(struct mlx4_dev *dev);
 
 #endif /* MLX4_H */

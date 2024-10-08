@@ -1134,13 +1134,13 @@ static bool pvscsi_setup_req_threshold(struct pvscsi_adapter *adapter,
 			 PVSCSI_CMD_SETUP_REQCALLTHRESHOLD);
 	val = pvscsi_reg_read(adapter, PVSCSI_REG_OFFSET_COMMAND_STATUS);
 	if (val == -1) {
-		printk(KERN_INFO "vmw_pvscsi: device does not support req_threshold\n");
+		printk(KERN_INFO "pvscsi: device does not support req_threshold\n");
 		return false;
 	} else {
 		struct PVSCSICmdDescSetupReqCall cmd_msg = { 0 };
 		cmd_msg.enable = enable;
 		printk(KERN_INFO
-		       "vmw_pvscsi: %sabling reqCallThreshold\n",
+		       "pvscsi: %sabling reqCallThreshold\n",
 			enable ? "en" : "dis");
 		pvscsi_write_cmd_desc(adapter,
 				      PVSCSI_CMD_SETUP_REQCALLTHRESHOLD,
@@ -1519,7 +1519,7 @@ static int pvscsi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	adapter->use_req_threshold = pvscsi_setup_req_threshold(adapter, true);
-	printk(KERN_DEBUG "vmw_pvscsi: driver-based request coalescing %sabled\n",
+	printk(KERN_DEBUG "pvscsi: driver-based request coalescing %sabled\n",
 	       adapter->use_req_threshold ? "en" : "dis");
 
 	error = request_irq(adapter->irq, pvscsi_isr, flags,

@@ -104,7 +104,8 @@ module_param(enable_64b_cqe_eqe, bool, 0444);
 MODULE_PARM_DESC(enable_64b_cqe_eqe,
 		 "Enable 64 byte CQEs/EQEs when the FW supports this (default: True)");
 
-#define PF_CONTEXT_BEHAVIOUR_MASK	MLX4_FUNC_CAP_64B_EQE_CQE
+#define PF_CONTEXT_BEHAVIOUR_MASK	(MLX4_FUNC_CAP_64B_EQE_CQE | \
+					 MLX4_FUNC_CAP_EQE_CQE_STRIDE)
 
 static char mlx4_version[] =
 	DRV_NAME ": Mellanox ConnectX core driver v"
@@ -120,6 +121,16 @@ static struct mlx4_profile default_profile = {
 	.num_mtt	= 1 << 20, /* It is really num mtt segements */
 };
 
+static struct mlx4_profile low_mem_profile = {
+	.num_qp		= 1 << 17,
+	.num_srq	= 1 << 6,
+	.rdmarc_per_qp	= 1 << 4,
+	.num_cq		= 1 << 8,
+	.num_mcg	= 1 << 8,
+	.num_mpt	= 1 << 9,
+	.num_mtt	= 1 << 7,
+};
+
 static int log_num_mac = 7;
 module_param_named(log_num_mac, log_num_mac, int, 0444);
 MODULE_PARM_DESC(log_num_mac, "Log2 max number of MACs per ETH port (1-7)");
@@ -129,6 +140,8 @@ module_param_named(log_num_vlan, log_num_vlan, int, 0444);
 MODULE_PARM_DESC(log_num_vlan, "Log2 max number of VLANs per ETH port (0-7)");
 /* Log2 max number of VLANs per ETH port (0-7) */
 #define MLX4_LOG_NUM_VLANS 7
+#define MLX4_MIN_LOG_NUM_VLANS 0
+#define MLX4_MIN_LOG_NUM_MAC 1
 
 static bool use_prio;
 module_param_named(use_prio, use_prio, bool, 0444);
@@ -182,6 +195,40 @@ static void mlx4_set_port_mask(struct mlx4_dev *dev)
 
 	for (i = 1; i <= dev->caps.num_ports; ++i)
 		dev->caps.port_mask[i] = dev->caps.port_type[i];
+}
+
+static void mlx4_enable_cqe_eqe_stride(struct mlx4_dev *dev)
+{
+	struct mlx4_caps *dev_cap = &dev->caps;
+
+	/* FW not supporting or cancelled by user */
+	if (!(dev_cap->flags2 & MLX4_DEV_CAP_FLAG2_EQE_STRIDE) ||
+	    !(dev_cap->flags2 & MLX4_DEV_CAP_FLAG2_CQE_STRIDE))
+		return;
+
+	/* Must have 64B CQE_EQE enabled by FW to use bigger stride
+	 * When FW has NCSI it may decide not to report 64B CQE/EQEs
+	 */
+	if (!(dev_cap->flags & MLX4_DEV_CAP_FLAG_64B_EQE) ||
+	    !(dev_cap->flags & MLX4_DEV_CAP_FLAG_64B_CQE)) {
+		dev_cap->flags2 &= ~MLX4_DEV_CAP_FLAG2_CQE_STRIDE;
+		dev_cap->flags2 &= ~MLX4_DEV_CAP_FLAG2_EQE_STRIDE;
+		return;
+	}
+
+	if (cache_line_size() == 128 || cache_line_size() == 256) {
+		mlx4_dbg(dev, "Enabling CQE stride cacheLine supported\n");
+		/* Changing the real data inside CQE size to 32B */
+		dev_cap->flags &= ~MLX4_DEV_CAP_FLAG_64B_CQE;
+		dev_cap->flags &= ~MLX4_DEV_CAP_FLAG_64B_EQE;
+
+		if (mlx4_is_master(dev))
+			dev_cap->function_caps |= MLX4_FUNC_CAP_EQE_CQE_STRIDE;
+	} else {
+		mlx4_dbg(dev, "Disabling CQE stride cacheLine unsupported\n");
+		dev_cap->flags2 &= ~MLX4_DEV_CAP_FLAG2_CQE_STRIDE;
+		dev_cap->flags2 &= ~MLX4_DEV_CAP_FLAG2_EQE_STRIDE;
+	}
 }
 
 static int mlx4_dev_cap(struct mlx4_dev *dev, struct mlx4_dev_cap *dev_cap)
@@ -287,8 +334,13 @@ static int mlx4_dev_cap(struct mlx4_dev *dev, struct mlx4_dev_cap *dev_cap)
 	if (mlx4_is_mfunc(dev))
 		dev->caps.flags &= ~MLX4_DEV_CAP_FLAG_SENSE_SUPPORT;
 
-	dev->caps.log_num_macs  = log_num_mac;
-	dev->caps.log_num_vlans = MLX4_LOG_NUM_VLANS;
+	if (mlx4_low_memory_profile()) {
+		dev->caps.log_num_macs  = MLX4_MIN_LOG_NUM_MAC;
+		dev->caps.log_num_vlans = MLX4_MIN_LOG_NUM_VLANS;
+	} else {
+		dev->caps.log_num_macs  = log_num_mac;
+		dev->caps.log_num_vlans = MLX4_LOG_NUM_VLANS;
+	}
 
 	for (i = 1; i <= dev->caps.num_ports; ++i) {
 		dev->caps.port_type[i] = MLX4_PORT_TYPE_NONE;
@@ -373,12 +425,23 @@ static int mlx4_dev_cap(struct mlx4_dev *dev, struct mlx4_dev_cap *dev_cap)
 			dev->caps.flags &= ~MLX4_DEV_CAP_FLAG_64B_CQE;
 			dev->caps.flags &= ~MLX4_DEV_CAP_FLAG_64B_EQE;
 		}
+
+		if (dev_cap->flags2 &
+		    (MLX4_DEV_CAP_FLAG2_CQE_STRIDE |
+		     MLX4_DEV_CAP_FLAG2_EQE_STRIDE)) {
+			mlx4_warn(dev, "Disabling EQE/CQE stride per user request\n");
+			dev_cap->flags2 &= ~MLX4_DEV_CAP_FLAG2_CQE_STRIDE;
+			dev_cap->flags2 &= ~MLX4_DEV_CAP_FLAG2_EQE_STRIDE;
+		}
 	}
 
 	if ((dev->caps.flags &
 	    (MLX4_DEV_CAP_FLAG_64B_CQE | MLX4_DEV_CAP_FLAG_64B_EQE)) &&
 	    mlx4_is_master(dev))
 		dev->caps.function_caps |= MLX4_FUNC_CAP_64B_EQE_CQE;
+
+	if (!mlx4_is_slave(dev))
+		mlx4_enable_cqe_eqe_stride(dev);
 
 	return 0;
 }
@@ -655,13 +718,15 @@ static int mlx4_slave_cap(struct mlx4_dev *dev)
 		return -ENODEV;
 	}
 
+	dev->caps.qp0_qkey = kcalloc(dev->caps.num_ports, sizeof(u32), GFP_KERNEL);
 	dev->caps.qp0_tunnel = kcalloc(dev->caps.num_ports, sizeof (u32), GFP_KERNEL);
 	dev->caps.qp0_proxy = kcalloc(dev->caps.num_ports, sizeof (u32), GFP_KERNEL);
 	dev->caps.qp1_tunnel = kcalloc(dev->caps.num_ports, sizeof (u32), GFP_KERNEL);
 	dev->caps.qp1_proxy = kcalloc(dev->caps.num_ports, sizeof (u32), GFP_KERNEL);
 
 	if (!dev->caps.qp0_tunnel || !dev->caps.qp0_proxy ||
-	    !dev->caps.qp1_tunnel || !dev->caps.qp1_proxy) {
+	    !dev->caps.qp1_tunnel || !dev->caps.qp1_proxy ||
+	    !dev->caps.qp0_qkey) {
 		err = -ENOMEM;
 		goto err_mem;
 	}
@@ -673,6 +738,7 @@ static int mlx4_slave_cap(struct mlx4_dev *dev)
 				 i, err);
 			goto err_mem;
 		}
+		dev->caps.qp0_qkey[i - 1] = func_cap.qp0_qkey;
 		dev->caps.qp0_tunnel[i - 1] = func_cap.qp0_tunnel_qpn;
 		dev->caps.qp0_proxy[i - 1] = func_cap.qp0_proxy_qpn;
 		dev->caps.qp1_tunnel[i - 1] = func_cap.qp1_tunnel_qpn;
@@ -704,9 +770,20 @@ static int mlx4_slave_cap(struct mlx4_dev *dev)
 
 	if (hca_param.dev_cap_enabled & MLX4_DEV_CAP_64B_CQE_ENABLED) {
 		dev->caps.cqe_size   = 64;
-		dev->caps.userspace_caps |= MLX4_USER_DEV_CAP_64B_CQE;
+		dev->caps.userspace_caps |= MLX4_USER_DEV_CAP_LARGE_CQE;
 	} else {
 		dev->caps.cqe_size   = 32;
+	}
+
+	if (hca_param.dev_cap_enabled & MLX4_DEV_CAP_EQE_STRIDE_ENABLED) {
+		dev->caps.eqe_size = hca_param.eqe_size;
+		dev->caps.eqe_factor = 0;
+	}
+
+	if (hca_param.dev_cap_enabled & MLX4_DEV_CAP_CQE_STRIDE_ENABLED) {
+		dev->caps.cqe_size = hca_param.cqe_size;
+		/* User still need to know when CQE > 32B */
+		dev->caps.userspace_caps |= MLX4_USER_DEV_CAP_LARGE_CQE;
 	}
 
 	dev->caps.flags2 &= ~MLX4_DEV_CAP_FLAG2_TS;
@@ -717,12 +794,16 @@ static int mlx4_slave_cap(struct mlx4_dev *dev)
 	return 0;
 
 err_mem:
+	kfree(dev->caps.qp0_qkey);
 	kfree(dev->caps.qp0_tunnel);
 	kfree(dev->caps.qp0_proxy);
 	kfree(dev->caps.qp1_tunnel);
 	kfree(dev->caps.qp1_proxy);
-	dev->caps.qp0_tunnel = dev->caps.qp0_proxy =
-		dev->caps.qp1_tunnel = dev->caps.qp1_proxy = NULL;
+	dev->caps.qp0_qkey = NULL;
+	dev->caps.qp0_tunnel = NULL;
+	dev->caps.qp0_proxy = NULL;
+	dev->caps.qp1_tunnel = NULL;
+	dev->caps.qp1_proxy = NULL;
 
 	return err;
 }
@@ -742,10 +823,10 @@ static void mlx4_request_modules(struct mlx4_dev *dev)
 			has_eth_port = true;
 	}
 
-	if (has_ib_port || (dev->caps.flags & MLX4_DEV_CAP_FLAG_IBOE))
-		request_module_nowait(IB_DRV_NAME);
 	if (has_eth_port)
 		request_module_nowait(EN_DRV_NAME);
+	if (has_ib_port || (dev->caps.flags & MLX4_DEV_CAP_FLAG_IBOE))
+		request_module_nowait(IB_DRV_NAME);
 }
 
 /*
@@ -1587,7 +1668,12 @@ static int mlx4_init_hca(struct mlx4_dev *dev)
 		if (mlx4_is_master(dev))
 			mlx4_parav_master_pf_caps(dev);
 
-		profile = default_profile;
+		if (mlx4_low_memory_profile()) {
+			mlx4_info(dev, "Running from within kdump kernel. Using low memory profile\n");
+			profile = low_mem_profile;
+		} else {
+			profile = default_profile;
+		}
 		if (dev->caps.steering_mode ==
 		    MLX4_STEERING_MODE_DEVICE_MANAGED)
 			profile.num_mcg = MLX4_FS_NUM_MCG;
@@ -1686,6 +1772,7 @@ unmap_bf:
 	unmap_bf_area(dev);
 
 	if (mlx4_is_slave(dev)) {
+		kfree(dev->caps.qp0_qkey);
 		kfree(dev->caps.qp0_tunnel);
 		kfree(dev->caps.qp0_proxy);
 		kfree(dev->caps.qp1_tunnel);
@@ -1829,6 +1916,11 @@ static int mlx4_setup_hca(struct mlx4_dev *dev)
 		if (err) {
 			mlx4_err(dev, "Failed to initialize multicast group table, aborting\n");
 			goto err_mr_table_free;
+		}
+		err = mlx4_config_mad_demux(dev);
+		if (err) {
+			mlx4_err(dev, "Failed in config_mad_demux, aborting\n");
+			goto err_mcg_table_free;
 		}
 	}
 
@@ -2539,6 +2631,7 @@ err_master_mfunc:
 		mlx4_multi_func_cleanup(dev);
 
 	if (mlx4_is_slave(dev)) {
+		kfree(dev->caps.qp0_qkey);
 		kfree(dev->caps.qp0_tunnel);
 		kfree(dev->caps.qp0_proxy);
 		kfree(dev->caps.qp1_tunnel);
@@ -2668,6 +2761,7 @@ static void __mlx4_remove_one(struct pci_dev *pdev)
 	if (!mlx4_is_slave(dev))
 		mlx4_free_ownership(dev);
 
+	kfree(dev->caps.qp0_qkey);
 	kfree(dev->caps.qp0_tunnel);
 	kfree(dev->caps.qp0_proxy);
 	kfree(dev->caps.qp1_tunnel);

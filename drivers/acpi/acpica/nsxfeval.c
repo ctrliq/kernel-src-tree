@@ -612,7 +612,7 @@ acpi_walk_namespace(acpi_object_type type,
 
 	(void)acpi_ut_release_mutex(ACPI_MTX_NAMESPACE);
 
-      unlock_and_exit:
+unlock_and_exit:
 	(void)acpi_ut_release_read_lock(&acpi_gbl_namespace_rw_lock);
 	return_ACPI_STATUS(status);
 }

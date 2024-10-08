@@ -73,7 +73,7 @@ int acpi_map_pxm_to_node(int pxm)
 {
 	int node = pxm_to_node_map[pxm];
 
-	if (node < 0) {
+	if (node == NUMA_NO_NODE) {
 		if (nodes_weight(nodes_found_map) >= MAX_NUMNODES)
 			return NUMA_NO_NODE;
 		node = first_unset_node(nodes_found_map);
@@ -334,12 +334,12 @@ static int acpi_get_pxm(acpi_handle h)
 
 int acpi_get_node(acpi_handle handle)
 {
-	int pxm, node = -1;
+	int pxm;
 
 	pxm = acpi_get_pxm(handle);
-	if (pxm >= 0 && pxm < MAX_PXM_DOMAINS)
-		node = acpi_map_pxm_to_node(pxm);
+	if (pxm < 0 || pxm >= MAX_PXM_DOMAINS)
+		return NUMA_NO_NODE;
 
-	return node;
+	return acpi_map_pxm_to_node(pxm);
 }
 EXPORT_SYMBOL(acpi_get_node);

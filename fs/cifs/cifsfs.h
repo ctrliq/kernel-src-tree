@@ -54,7 +54,7 @@ extern void cifs_sb_active(struct super_block *sb);
 extern void cifs_sb_deactive(struct super_block *sb);
 
 /* Functions related to inodes */
-extern const struct inode_operations cifs_dir_inode_ops;
+extern const struct inode_operations_wrapper cifs_dir_inode_ops;
 extern struct inode *cifs_root_iget(struct super_block *);
 extern int cifs_create(struct inode *, struct dentry *, umode_t,
 		       bool excl);
@@ -125,8 +125,6 @@ extern struct vfsmount *cifs_dfs_d_automount(struct path *path);
 
 /* Functions related to symlinks */
 extern void *cifs_follow_link(struct dentry *direntry, struct nameidata *nd);
-extern void cifs_put_link(struct dentry *direntry,
-			  struct nameidata *nd, void *);
 extern int cifs_readlink(struct dentry *direntry, char __user *buffer,
 			 int buflen);
 extern int cifs_symlink(struct inode *inode, struct dentry *direntry,

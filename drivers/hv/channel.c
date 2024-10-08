@@ -208,8 +208,10 @@ int vmbus_open(struct vmbus_channel *newchannel, u32 send_ringbuffer_size,
 	ret = vmbus_post_msg(open_msg,
 			       sizeof(struct vmbus_channel_open_channel));
 
-	if (ret != 0)
+	if (ret != 0) {
+		err = ret;
 		goto error1;
+	}
 
 	t = wait_for_completion_timeout(&open_info->waitevent, 5*HZ);
 	if (t == 0) {
@@ -529,11 +531,14 @@ static void vmbus_close_internal(struct vmbus_channel *channel)
 	channel->state = CHANNEL_OPEN_STATE;
 	channel->sc_creation_callback = NULL;
 	/* Stop callback and cancel the timer asap */
-	if (channel->target_cpu != smp_processor_id())
+	if (channel->target_cpu != get_cpu()) {
+		put_cpu();
 		smp_call_function_single(channel->target_cpu, reset_channel_cb,
 					 channel, true);
-	else
+	} else {
 		reset_channel_cb(channel);
+		put_cpu();
+	}
 
 	/* Send a closing message */
 

@@ -10,7 +10,7 @@
 #include <symbol/kallsyms.h>
 #include "debug.h"
 
-#ifndef HAVE_ELF_GETPHDRNUM
+#ifndef HAVE_ELF_GETPHDRNUM_SUPPORT
 static int elf_getphdrnum(Elf *elf, size_t *dst)
 {
 	GElf_Ehdr gehdr;
@@ -137,9 +137,8 @@ static size_t elf_addr_to_index(Elf *elf, GElf_Addr addr)
 	return -1;
 }
 
-static Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
-				    GElf_Shdr *shp, const char *name,
-				    size_t *idx)
+Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
+			     GElf_Shdr *shp, const char *name, size_t *idx)
 {
 	Elf_Scn *sec = NULL;
 	size_t cnt = 1;
@@ -508,6 +507,8 @@ int filename__read_debuglink(const char *filename, char *debuglink,
 	/* the start of this section is a zero-terminated string */
 	strncpy(debuglink, data->d_buf, size);
 
+	err = 0;
+
 out_elf_end:
 	elf_end(elf);
 out_close:
@@ -555,7 +556,7 @@ bool symsrc__has_symtab(struct symsrc *ss)
 
 void symsrc__destroy(struct symsrc *ss)
 {
-	free(ss->name);
+	zfree(&ss->name);
 	elf_end(ss->elf);
 	close(ss->fd);
 }
@@ -674,6 +675,11 @@ static u64 ref_reloc(struct kmap *kmap)
 		return kmap->ref_reloc_sym->addr -
 		       kmap->ref_reloc_sym->unrelocated_addr;
 	return 0;
+}
+
+static bool want_demangle(bool is_kernel_sym)
+{
+	return is_kernel_sym ? symbol_conf.demangle_kernel : symbol_conf.demangle;
 }
 
 int dso__load_sym(struct dso *dso, struct map *map,
@@ -933,7 +939,7 @@ new_symbol:
 		 * DWARF DW_compile_unit has this, but we don't always have access
 		 * to it...
 		 */
-		if (symbol_conf.demangle) {
+		if (want_demangle(dso->kernel || kmodule)) {
 			int demangle_flags = DMGL_NO_OPTS;
 			if (verbose)
 				demangle_flags = DMGL_PARAMS | DMGL_ANSI;

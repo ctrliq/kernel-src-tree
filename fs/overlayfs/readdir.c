@@ -34,6 +34,11 @@ struct ovl_dir_cache {
 	struct list_head entries;
 };
 
+struct dir_context {
+	const filldir_t actor;
+	//loff_t pos;
+};
+
 struct ovl_readdir_data {
 	struct dir_context ctx;
 	bool is_merge;
@@ -183,7 +188,9 @@ static void ovl_cache_put(struct ovl_dir_file *od, struct dentry *dentry)
 static int ovl_fill_merge(void *buf, const char *name, int namelen,
 			  loff_t offset, u64 ino, unsigned int d_type)
 {
-	struct ovl_readdir_data *rdd = buf;
+	struct dir_context *ctx = buf;
+	struct ovl_readdir_data *rdd =
+		container_of(ctx, struct ovl_readdir_data, ctx);
 
 	rdd->count++;
 	if (!rdd->is_merge)
@@ -202,11 +209,11 @@ static inline int ovl_dir_read(struct path *realpath,
 	if (IS_ERR(realfile))
 		return PTR_ERR(realfile);
 
-	rdd->ctx.pos = 0;
+	//rdd->ctx.pos = 0;
 	do {
 		rdd->count = 0;
 		rdd->err = 0;
-		err = iterate_dir(realfile, &rdd->ctx);
+		err = vfs_readdir(realfile, rdd->ctx.actor, rdd);
 		if (err >= 0)
 			err = rdd->err;
 	} while (!err && rdd->count);
@@ -361,16 +368,21 @@ static struct ovl_dir_cache *ovl_cache_get(struct dentry *dentry)
 	return cache;
 }
 
-static int ovl_iterate(struct file *file, struct dir_context *ctx)
+static int ovl_readdir(struct file *file, void *buf, filldir_t filler)
 {
 	struct ovl_dir_file *od = file->private_data;
 	struct dentry *dentry = file->f_path.dentry;
+	int res;
 
-	if (!ctx->pos)
+	if (!file->f_pos)
 		ovl_dir_reset(file);
 
-	if (od->is_real)
-		return iterate_dir(od->realfile, ctx);
+	if (od->is_real) {
+		res = vfs_readdir(od->realfile, filler, buf);
+		file->f_pos = od->realfile->f_pos;
+
+		return res;
+	}
 
 	if (!od->cache) {
 		struct ovl_dir_cache *cache;
@@ -380,20 +392,25 @@ static int ovl_iterate(struct file *file, struct dir_context *ctx)
 			return PTR_ERR(cache);
 
 		od->cache = cache;
-		ovl_seek_cursor(od, ctx->pos);
+		ovl_seek_cursor(od, file->f_pos);
 	}
 
 	while (od->cursor.l_node.next != &od->cache->entries) {
+		int over;
+		loff_t off;
 		struct ovl_cache_entry *p;
 
 		p = list_entry(od->cursor.l_node.next, struct ovl_cache_entry, l_node);
+		off = file->f_pos;
 		/* Skip cursors */
 		if (!p->is_cursor) {
 			if (!p->is_whiteout) {
-				if (!dir_emit(ctx, p->name, p->len, p->ino, p->type))
+				over = filler(buf, p->name, p->len, off, p->ino,
+					      p->type);
+				if (over)
 					break;
 			}
-			ctx->pos++;
+			file->f_pos++;
 		}
 		list_move(&od->cursor.l_node, &p->l_node);
 	}
@@ -527,7 +544,7 @@ static int ovl_dir_open(struct inode *inode, struct file *file)
 const struct file_operations ovl_dir_operations = {
 	.read		= generic_read_dir,
 	.open		= ovl_dir_open,
-	.iterate	= ovl_iterate,
+	.readdir	= ovl_readdir,
 	.llseek		= ovl_dir_llseek,
 	.fsync		= ovl_dir_fsync,
 	.release	= ovl_dir_release,

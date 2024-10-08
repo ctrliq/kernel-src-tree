@@ -357,6 +357,7 @@ enum {
 	GIF_ALLOC_FAILED	= 2,
 	GIF_SW_PAGED		= 3,
 	GIF_ORDERED		= 4,
+	GIF_FREE_VFS_INODE      = 5,
 };
 
 struct gfs2_inode {
@@ -414,12 +415,14 @@ enum {
 };
 
 struct gfs2_quota_data {
+	struct hlist_bl_node qd_hlist;
 	struct list_head qd_list;
-	struct list_head qd_reclaim;
-
-	struct lockref qd_lockref;
-
 	struct kqid qd_id;
+	struct gfs2_sbd *qd_sbd;
+	struct lockref qd_lockref;
+	struct list_head qd_lru;
+	unsigned qd_hash;
+
 	unsigned long qd_flags;		/* QDF_... */
 
 	s64 qd_change;
@@ -437,6 +440,7 @@ struct gfs2_quota_data {
 
 	u64 qd_sync_gen;
 	unsigned long qd_last_warn;
+	struct rcu_head qd_rcu;
 };
 
 struct gfs2_trans {
@@ -727,8 +731,8 @@ struct gfs2_sbd {
 	spinlock_t sd_trunc_lock;
 
 	unsigned int sd_quota_slots;
-	unsigned int sd_quota_chunks;
-	unsigned char **sd_quota_bitmap;
+	unsigned long *sd_quota_bitmap;
+	spinlock_t sd_bitmap_lock;
 
 	u64 sd_quota_sync_gen;
 

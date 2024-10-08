@@ -71,8 +71,9 @@ static void cifs_set_ops(struct inode *inode)
 #else /* NO DFS support, treat as a directory */
 		{
 #endif
-			inode->i_op = &cifs_dir_inode_ops;
+			inode->i_op = &cifs_dir_inode_ops.ops;
 			inode->i_fop = &cifs_dir_ops;
+			inode->i_flags |= S_IOPS_WRAPPER;
 		}
 		break;
 	case S_IFLNK:

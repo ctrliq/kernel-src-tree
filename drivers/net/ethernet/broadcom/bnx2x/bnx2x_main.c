@@ -6,7 +6,7 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation.
  *
- * Maintained by: Eilon Greenstein <eilong@broadcom.com>
+ * Maintained by: Ariel Elior <ariel.elior@qlogic.com>
  * Written by: Eliezer Tamir
  * Based on code from Michael Chan's bnx2 driver
  * UDP CSUM errata workaround by Arik Gendelman
@@ -64,7 +64,6 @@
 #include "bnx2x_vfpf.h"
 #include "bnx2x_dcb.h"
 #include "bnx2x_sp.h"
-
 #include <linux/firmware.h>
 #include "bnx2x_fw_file_hdr.h"
 /* FW files */
@@ -250,7 +249,7 @@ static struct {
 #define PCI_DEVICE_ID_NX2_57811_VF	CHIP_NUM_57811_VF
 #endif
 
-static DEFINE_PCI_DEVICE_TABLE(bnx2x_pci_tbl) = {
+static const struct pci_device_id bnx2x_pci_tbl[] = {
 	{ PCI_VDEVICE(BROADCOM, PCI_DEVICE_ID_NX2_57710), BCM57710 },
 	{ PCI_VDEVICE(BROADCOM, PCI_DEVICE_ID_NX2_57711), BCM57711 },
 	{ PCI_VDEVICE(BROADCOM, PCI_DEVICE_ID_NX2_57711E), BCM57711E },
@@ -290,6 +289,8 @@ static int bnx2x_set_storm_rx_mode(struct bnx2x *bp);
 /****************************************************************************
 * General service functions
 ****************************************************************************/
+
+static int bnx2x_hwtstamp_ioctl(struct bnx2x *bp, struct ifreq *ifr);
 
 static void __storm_memset_dma_mapping(struct bnx2x *bp,
 				       u32 addr, dma_addr_t mapping)
@@ -524,6 +525,7 @@ int bnx2x_issue_dmae_with_comp(struct bnx2x *bp, struct dmae_command *dmae,
 	 * as long as this code is called both from syscall context and
 	 * from ndo_set_rx_mode() flow that may be called from BH.
 	 */
+
 	spin_lock_bh(&bp->dmae_lock);
 
 	/* reset completion */
@@ -552,7 +554,9 @@ int bnx2x_issue_dmae_with_comp(struct bnx2x *bp, struct dmae_command *dmae,
 	}
 
 unlock:
+
 	spin_unlock_bh(&bp->dmae_lock);
+
 	return rc;
 }
 
@@ -2080,8 +2084,6 @@ int bnx2x_get_gpio(struct bnx2x *bp, int gpio_num, u8 port)
 	else
 		value = 0;
 
-	DP(NETIF_MSG_LINK, "pin %d  value 0x%x\n", gpio_num, value);
-
 	return value;
 }
 
@@ -2707,6 +2709,14 @@ void bnx2x__link_status_update(struct bnx2x *bp)
 		bp->link_vars.duplex = DUPLEX_FULL;
 		bp->link_vars.flow_ctrl = BNX2X_FLOW_CTRL_NONE;
 		__bnx2x_link_report(bp);
+
+		bnx2x_sample_bulletin(bp);
+
+		/* if bulletin board did not have an update for link status
+		 * __bnx2x_link_report will report current status
+		 * but it will NOT duplicate report in case of already reported
+		 * during sampling bulletin board.
+		 */
 		bnx2x_stats_handle(bp, STATS_EVENT_LINK_UP);
 	}
 }
@@ -4679,7 +4689,7 @@ static bool bnx2x_check_blocks_with_parity2(struct bnx2x *bp, u32 sig,
 	for (i = 0; sig; i++) {
 		cur_bit = (0x1UL << i);
 		if (sig & cur_bit) {
-			res |= true; /* Each bit is real error! */
+			res = true; /* Each bit is real error! */
 			if (print) {
 				switch (cur_bit) {
 				case AEU_INPUTS_ATTN_BITS_CSEMI_PARITY_ERROR:
@@ -4758,21 +4768,21 @@ static bool bnx2x_check_blocks_with_parity3(struct bnx2x *bp, u32 sig,
 					_print_next_block((*par_num)++,
 							  "MCP ROM");
 				*global = true;
-				res |= true;
+				res = true;
 				break;
 			case AEU_INPUTS_ATTN_BITS_MCP_LATCHED_UMP_RX_PARITY:
 				if (print)
 					_print_next_block((*par_num)++,
 							  "MCP UMP RX");
 				*global = true;
-				res |= true;
+				res = true;
 				break;
 			case AEU_INPUTS_ATTN_BITS_MCP_LATCHED_UMP_TX_PARITY:
 				if (print)
 					_print_next_block((*par_num)++,
 							  "MCP UMP TX");
 				*global = true;
-				res |= true;
+				res = true;
 				break;
 			case AEU_INPUTS_ATTN_BITS_MCP_LATCHED_SCPAD_PARITY:
 				if (print)
@@ -4804,7 +4814,7 @@ static bool bnx2x_check_blocks_with_parity4(struct bnx2x *bp, u32 sig,
 	for (i = 0; sig; i++) {
 		cur_bit = (0x1UL << i);
 		if (sig & cur_bit) {
-			res |= true; /* Each bit is real error! */
+			res = true; /* Each bit is real error! */
 			if (print) {
 				switch (cur_bit) {
 				case AEU_INPUTS_ATTN_BITS_PGLUE_PARITY_ERROR:
@@ -5452,6 +5462,14 @@ static void bnx2x_eq_int(struct bnx2x *bp)
 			if (f_obj->complete_cmd(bp, f_obj, BNX2X_F_CMD_STOP))
 				break;
 
+			goto next_spqe;
+
+		case EVENT_RING_OPCODE_SET_TIMESYNC:
+			DP(BNX2X_MSG_SP | BNX2X_MSG_PTP,
+			   "got set_timesync ramrod completion\n");
+			if (f_obj->complete_cmd(bp, f_obj,
+						BNX2X_F_CMD_SET_TIMESYNC))
+				break;
 			goto next_spqe;
 		}
 
@@ -6103,7 +6121,7 @@ static int bnx2x_fill_accept_flags(struct bnx2x *bp, u32 rx_mode,
 	}
 
 	/* Set ACCEPT_ANY_VLAN as we do not enable filtering by VLAN */
-	if (bp->rx_mode != BNX2X_RX_MODE_NONE) {
+	if (rx_mode != BNX2X_RX_MODE_NONE) {
 		__set_bit(BNX2X_ACCEPT_ANY_VLAN, rx_accept_flags);
 		__set_bit(BNX2X_ACCEPT_ANY_VLAN, tx_accept_flags);
 	}
@@ -9030,7 +9048,7 @@ static int bnx2x_func_wait_started(struct bnx2x *bp)
 		struct bnx2x_func_state_params func_params = {NULL};
 
 		DP(NETIF_MSG_IFDOWN,
-		   "Hmmm... Unexpected function state! Forcing STARTED-->TX_ST0PPED-->STARTED\n");
+		   "Hmmm... Unexpected function state! Forcing STARTED-->TX_STOPPED-->STARTED\n");
 
 		func_params.f_obj = &bp->func_obj;
 		__set_bit(RAMROD_DRV_CLR_ONLY,
@@ -9047,6 +9065,48 @@ static int bnx2x_func_wait_started(struct bnx2x *bp)
 	}
 
 	return 0;
+}
+
+static void bnx2x_disable_ptp(struct bnx2x *bp)
+{
+	int port = BP_PORT(bp);
+
+	/* Disable sending PTP packets to host */
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_TO_HOST :
+	       NIG_REG_P0_LLH_PTP_TO_HOST, 0x0);
+
+	/* Reset PTP event detection rules */
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_PARAM_MASK :
+	       NIG_REG_P0_LLH_PTP_PARAM_MASK, 0x7FF);
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_RULE_MASK :
+	       NIG_REG_P0_LLH_PTP_RULE_MASK, 0x3FFF);
+	REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_PARAM_MASK :
+	       NIG_REG_P0_TLLH_PTP_PARAM_MASK, 0x7FF);
+	REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_RULE_MASK :
+	       NIG_REG_P0_TLLH_PTP_RULE_MASK, 0x3FFF);
+
+	/* Disable the PTP feature */
+	REG_WR(bp, port ? NIG_REG_P1_PTP_EN :
+	       NIG_REG_P0_PTP_EN, 0x0);
+}
+
+/* Called during unload, to stop PTP-related stuff */
+void bnx2x_stop_ptp(struct bnx2x *bp)
+{
+	/* Cancel PTP work queue. Should be done after the Tx queues are
+	 * drained to prevent additional scheduling.
+	 */
+	cancel_work_sync(&bp->ptp_task);
+
+	if (bp->ptp_tx_skb) {
+		dev_kfree_skb_any(bp->ptp_tx_skb);
+		bp->ptp_tx_skb = NULL;
+	}
+
+	/* Disable PTP in HW */
+	bnx2x_disable_ptp(bp);
+
+	DP(BNX2X_MSG_PTP, "PTP stop ended successfully\n");
 }
 
 void bnx2x_chip_cleanup(struct bnx2x *bp, int unload_mode, bool keep_link)
@@ -9166,6 +9226,13 @@ unload_error:
 		return;
 #endif
 	}
+
+	/* stop_ptp should be after the Tx queues are drained to prevent
+	 * scheduling to the cancelled PTP work queue. It should also be after
+	 * function stop ramrod is sent, since as part of this ramrod FW access
+	 * PTP registers.
+	 */
+	bnx2x_stop_ptp(bp);
 
 	/* Disable HW interrupts, NAPI */
 	bnx2x_netif_stop(bp, 1);
@@ -11981,6 +12048,9 @@ static int bnx2x_init_bp(struct bnx2x *bp)
 
 	bp->dump_preset_idx = 1;
 
+	if (CHIP_IS_E3B0(bp))
+		bp->flags |= PTP_SUPPORTED;
+
 	return rc;
 }
 
@@ -12313,13 +12383,17 @@ static int bnx2x_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	struct bnx2x *bp = netdev_priv(dev);
 	struct mii_ioctl_data *mdio = if_mii(ifr);
 
-	DP(NETIF_MSG_LINK, "ioctl: phy id 0x%x, reg 0x%x, val_in 0x%x\n",
-	   mdio->phy_id, mdio->reg_num, mdio->val_in);
-
 	if (!netif_running(dev))
 		return -EAGAIN;
 
-	return mdio_mii_ioctl(&bp->mdio, mdio, cmd);
+	switch (cmd) {
+	case SIOCSHWTSTAMP:
+		return bnx2x_hwtstamp_ioctl(bp, ifr);
+	default:
+		DP(NETIF_MSG_LINK, "ioctl: phy id 0x%x, reg 0x%x, val_in 0x%x\n",
+		   mdio->phy_id, mdio->reg_num, mdio->val_in);
+		return mdio_mii_ioctl(&bp->mdio, mdio, cmd);
+	}
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -12394,6 +12468,7 @@ static const struct net_device_ops bnx2x_netdev_ops = {
 	.ndo_busy_poll		= bnx2x_low_latency_recv,
 #endif
 	.ndo_get_phys_port_id	= bnx2x_get_phys_port_id,
+	.ndo_set_vf_link_state	= bnx2x_set_vf_link_state,
 };
 
 static int bnx2x_set_coherency_mask(struct bnx2x *bp)
@@ -12962,6 +13037,191 @@ static int set_is_vf(int chip_id)
 	}
 }
 
+/* nig_tsgen registers relative address */
+#define tsgen_ctrl 0x0
+#define tsgen_freecount 0x10
+#define tsgen_synctime_t0 0x20
+#define tsgen_offset_t0 0x28
+#define tsgen_drift_t0 0x30
+#define tsgen_synctime_t1 0x58
+#define tsgen_offset_t1 0x60
+#define tsgen_drift_t1 0x68
+
+/* FW workaround for setting drift */
+static int bnx2x_send_update_drift_ramrod(struct bnx2x *bp, int drift_dir,
+					  int best_val, int best_period)
+{
+	struct bnx2x_func_state_params func_params = {NULL};
+	struct bnx2x_func_set_timesync_params *set_timesync_params =
+		&func_params.params.set_timesync;
+
+	/* Prepare parameters for function state transitions */
+	__set_bit(RAMROD_COMP_WAIT, &func_params.ramrod_flags);
+	__set_bit(RAMROD_RETRY, &func_params.ramrod_flags);
+
+	func_params.f_obj = &bp->func_obj;
+	func_params.cmd = BNX2X_F_CMD_SET_TIMESYNC;
+
+	/* Function parameters */
+	set_timesync_params->drift_adjust_cmd = TS_DRIFT_ADJUST_SET;
+	set_timesync_params->offset_cmd = TS_OFFSET_KEEP;
+	set_timesync_params->add_sub_drift_adjust_value =
+		drift_dir ? TS_ADD_VALUE : TS_SUB_VALUE;
+	set_timesync_params->drift_adjust_value = best_val;
+	set_timesync_params->drift_adjust_period = best_period;
+
+	return bnx2x_func_state_change(bp, &func_params);
+}
+
+static int bnx2x_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
+{
+	struct bnx2x *bp = container_of(ptp, struct bnx2x, ptp_clock_info);
+	int rc;
+	int drift_dir = 1;
+	int val, period, period1, period2, dif, dif1, dif2;
+	int best_dif = BNX2X_MAX_PHC_DRIFT, best_period = 0, best_val = 0;
+
+	DP(BNX2X_MSG_PTP, "PTP adjfreq called, ppb = %d\n", ppb);
+
+	if (!netif_running(bp->dev)) {
+		DP(BNX2X_MSG_PTP,
+		   "PTP adjfreq called while the interface is down\n");
+		return -EFAULT;
+	}
+
+	if (ppb < 0) {
+		ppb = -ppb;
+		drift_dir = 0;
+	}
+
+	if (ppb == 0) {
+		best_val = 1;
+		best_period = 0x1FFFFFF;
+	} else if (ppb >= BNX2X_MAX_PHC_DRIFT) {
+		best_val = 31;
+		best_period = 1;
+	} else {
+		/* Changed not to allow val = 8, 16, 24 as these values
+		 * are not supported in workaround.
+		 */
+		for (val = 0; val <= 31; val++) {
+			if ((val & 0x7) == 0)
+				continue;
+			period1 = val * 1000000 / ppb;
+			period2 = period1 + 1;
+			if (period1 != 0)
+				dif1 = ppb - (val * 1000000 / period1);
+			else
+				dif1 = BNX2X_MAX_PHC_DRIFT;
+			if (dif1 < 0)
+				dif1 = -dif1;
+			dif2 = ppb - (val * 1000000 / period2);
+			if (dif2 < 0)
+				dif2 = -dif2;
+			dif = (dif1 < dif2) ? dif1 : dif2;
+			period = (dif1 < dif2) ? period1 : period2;
+			if (dif < best_dif) {
+				best_dif = dif;
+				best_val = val;
+				best_period = period;
+			}
+		}
+	}
+
+	rc = bnx2x_send_update_drift_ramrod(bp, drift_dir, best_val,
+					    best_period);
+	if (rc) {
+		BNX2X_ERR("Failed to set drift\n");
+		return -EFAULT;
+	}
+
+	DP(BNX2X_MSG_PTP, "Configrued val = %d, period = %d\n", best_val,
+	   best_period);
+
+	return 0;
+}
+
+static int bnx2x_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
+{
+	struct bnx2x *bp = container_of(ptp, struct bnx2x, ptp_clock_info);
+	u64 now;
+
+	DP(BNX2X_MSG_PTP, "PTP adjtime called, delta = %llx\n", delta);
+
+	now = timecounter_read(&bp->timecounter);
+	now += delta;
+	/* Re-init the timecounter */
+	timecounter_init(&bp->timecounter, &bp->cyclecounter, now);
+
+	return 0;
+}
+
+static int bnx2x_ptp_gettime(struct ptp_clock_info *ptp, struct timespec *ts)
+{
+	struct bnx2x *bp = container_of(ptp, struct bnx2x, ptp_clock_info);
+	u64 ns;
+	u32 remainder;
+
+	ns = timecounter_read(&bp->timecounter);
+
+	DP(BNX2X_MSG_PTP, "PTP gettime called, ns = %llu\n", ns);
+
+	ts->tv_sec = div_u64_rem(ns, 1000000000ULL, &remainder);
+	ts->tv_nsec = remainder;
+
+	return 0;
+}
+
+static int bnx2x_ptp_settime(struct ptp_clock_info *ptp,
+			     const struct timespec *ts)
+{
+	struct bnx2x *bp = container_of(ptp, struct bnx2x, ptp_clock_info);
+	u64 ns;
+
+	ns = ts->tv_sec * 1000000000ULL;
+	ns += ts->tv_nsec;
+
+	DP(BNX2X_MSG_PTP, "PTP settime called, ns = %llu\n", ns);
+
+	/* Re-init the timecounter */
+	timecounter_init(&bp->timecounter, &bp->cyclecounter, ns);
+
+	return 0;
+}
+
+/* Enable (or disable) ancillary features of the phc subsystem */
+static int bnx2x_ptp_enable(struct ptp_clock_info *ptp,
+			    struct ptp_clock_request *rq, int on)
+{
+	struct bnx2x *bp = container_of(ptp, struct bnx2x, ptp_clock_info);
+
+	BNX2X_ERR("PHC ancillary features are not supported\n");
+	return -ENOTSUPP;
+}
+
+void bnx2x_register_phc(struct bnx2x *bp)
+{
+	/* Fill the ptp_clock_info struct and register PTP clock*/
+	bp->ptp_clock_info.owner = THIS_MODULE;
+	snprintf(bp->ptp_clock_info.name, 16, "%s", bp->dev->name);
+	bp->ptp_clock_info.max_adj = BNX2X_MAX_PHC_DRIFT; /* In PPB */
+	bp->ptp_clock_info.n_alarm = 0;
+	bp->ptp_clock_info.n_ext_ts = 0;
+	bp->ptp_clock_info.n_per_out = 0;
+	bp->ptp_clock_info.pps = 0;
+	bp->ptp_clock_info.adjfreq = bnx2x_ptp_adjfreq;
+	bp->ptp_clock_info.adjtime = bnx2x_ptp_adjtime;
+	bp->ptp_clock_info.gettime = bnx2x_ptp_gettime;
+	bp->ptp_clock_info.settime = bnx2x_ptp_settime;
+	bp->ptp_clock_info.enable = bnx2x_ptp_enable;
+
+	bp->ptp_clock = ptp_clock_register(&bp->ptp_clock_info, &bp->pdev->dev);
+	if (IS_ERR(bp->ptp_clock)) {
+		bp->ptp_clock = NULL;
+		BNX2X_ERR("PTP clock registeration failed\n");
+	}
+}
+
 static int bnx2x_init_one(struct pci_dev *pdev,
 				    const struct pci_device_id *ent)
 {
@@ -13133,6 +13393,8 @@ static int bnx2x_init_one(struct pci_dev *pdev,
 		       "Unknown",
 		       dev->base_addr, bp->pdev->irq, dev->dev_addr);
 
+	bnx2x_register_phc(bp);
+
 	return 0;
 
 init_one_exit:
@@ -13159,6 +13421,11 @@ static void __bnx2x_remove(struct pci_dev *pdev,
 			   struct bnx2x *bp,
 			   bool remove_netdev)
 {
+	if (bp->ptp_clock) {
+		ptp_clock_unregister(bp->ptp_clock);
+		bp->ptp_clock = NULL;
+	}
+
 	/* Delete storage MAC address */
 	if (!NO_FCOE(bp)) {
 		rtnl_lock();
@@ -14139,4 +14406,333 @@ int bnx2x_pretend_func(struct bnx2x *bp, u16 pretend_func_val)
 	REG_WR(bp, pretend_reg, pretend_func_val);
 	REG_RD(bp, pretend_reg);
 	return 0;
+}
+
+static void bnx2x_ptp_task(struct work_struct *work)
+{
+	struct bnx2x *bp = container_of(work, struct bnx2x, ptp_task);
+	int port = BP_PORT(bp);
+	u32 val_seq;
+	u64 timestamp, ns;
+	struct skb_shared_hwtstamps shhwtstamps;
+
+	/* Read Tx timestamp registers */
+	val_seq = REG_RD(bp, port ? NIG_REG_P1_TLLH_PTP_BUF_SEQID :
+			 NIG_REG_P0_TLLH_PTP_BUF_SEQID);
+	if (val_seq & 0x10000) {
+		/* There is a valid timestamp value */
+		timestamp = REG_RD(bp, port ? NIG_REG_P1_TLLH_PTP_BUF_TS_MSB :
+				   NIG_REG_P0_TLLH_PTP_BUF_TS_MSB);
+		timestamp <<= 32;
+		timestamp |= REG_RD(bp, port ? NIG_REG_P1_TLLH_PTP_BUF_TS_LSB :
+				    NIG_REG_P0_TLLH_PTP_BUF_TS_LSB);
+		/* Reset timestamp register to allow new timestamp */
+		REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_BUF_SEQID :
+		       NIG_REG_P0_TLLH_PTP_BUF_SEQID, 0x10000);
+		ns = timecounter_cyc2time(&bp->timecounter, timestamp);
+
+		memset(&shhwtstamps, 0, sizeof(shhwtstamps));
+		shhwtstamps.hwtstamp = ns_to_ktime(ns);
+		skb_tstamp_tx(bp->ptp_tx_skb, &shhwtstamps);
+		dev_kfree_skb_any(bp->ptp_tx_skb);
+		bp->ptp_tx_skb = NULL;
+
+		DP(BNX2X_MSG_PTP, "Tx timestamp, timestamp cycles = %llu, ns = %llu\n",
+		   timestamp, ns);
+	} else {
+		DP(BNX2X_MSG_PTP, "There is no valid Tx timestamp yet\n");
+		/* Reschedule to keep checking for a valid timestamp value */
+		schedule_work(&bp->ptp_task);
+	}
+}
+
+void bnx2x_set_rx_ts(struct bnx2x *bp, struct sk_buff *skb)
+{
+	int port = BP_PORT(bp);
+	u64 timestamp, ns;
+
+	timestamp = REG_RD(bp, port ? NIG_REG_P1_LLH_PTP_HOST_BUF_TS_MSB :
+			    NIG_REG_P0_LLH_PTP_HOST_BUF_TS_MSB);
+	timestamp <<= 32;
+	timestamp |= REG_RD(bp, port ? NIG_REG_P1_LLH_PTP_HOST_BUF_TS_LSB :
+			    NIG_REG_P0_LLH_PTP_HOST_BUF_TS_LSB);
+
+	/* Reset timestamp register to allow new timestamp */
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_HOST_BUF_SEQID :
+	       NIG_REG_P0_LLH_PTP_HOST_BUF_SEQID, 0x10000);
+
+	ns = timecounter_cyc2time(&bp->timecounter, timestamp);
+
+	skb_hwtstamps(skb)->hwtstamp = ns_to_ktime(ns);
+
+	DP(BNX2X_MSG_PTP, "Rx timestamp, timestamp cycles = %llu, ns = %llu\n",
+	   timestamp, ns);
+}
+
+/* Read the PHC */
+static cycle_t bnx2x_cyclecounter_read(const struct cyclecounter *cc)
+{
+	struct bnx2x *bp = container_of(cc, struct bnx2x, cyclecounter);
+	int port = BP_PORT(bp);
+	u32 wb_data[2];
+	u64 phc_cycles;
+
+	REG_RD_DMAE(bp, port ? NIG_REG_TIMESYNC_GEN_REG + tsgen_synctime_t1 :
+		    NIG_REG_TIMESYNC_GEN_REG + tsgen_synctime_t0, wb_data, 2);
+	phc_cycles = wb_data[1];
+	phc_cycles = (phc_cycles << 32) + wb_data[0];
+
+	DP(BNX2X_MSG_PTP, "PHC read cycles = %llu\n", phc_cycles);
+
+	return phc_cycles;
+}
+
+static void bnx2x_init_cyclecounter(struct bnx2x *bp)
+{
+	memset(&bp->cyclecounter, 0, sizeof(bp->cyclecounter));
+	bp->cyclecounter.read = bnx2x_cyclecounter_read;
+	bp->cyclecounter.mask = CLOCKSOURCE_MASK(64);
+	bp->cyclecounter.shift = 1;
+	bp->cyclecounter.mult = 1;
+}
+
+static int bnx2x_send_reset_timesync_ramrod(struct bnx2x *bp)
+{
+	struct bnx2x_func_state_params func_params = {NULL};
+	struct bnx2x_func_set_timesync_params *set_timesync_params =
+		&func_params.params.set_timesync;
+
+	/* Prepare parameters for function state transitions */
+	__set_bit(RAMROD_COMP_WAIT, &func_params.ramrod_flags);
+	__set_bit(RAMROD_RETRY, &func_params.ramrod_flags);
+
+	func_params.f_obj = &bp->func_obj;
+	func_params.cmd = BNX2X_F_CMD_SET_TIMESYNC;
+
+	/* Function parameters */
+	set_timesync_params->drift_adjust_cmd = TS_DRIFT_ADJUST_RESET;
+	set_timesync_params->offset_cmd = TS_OFFSET_KEEP;
+
+	return bnx2x_func_state_change(bp, &func_params);
+}
+
+int bnx2x_enable_ptp_packets(struct bnx2x *bp)
+{
+	struct bnx2x_queue_state_params q_params;
+	int rc, i;
+
+	/* send queue update ramrod to enable PTP packets */
+	memset(&q_params, 0, sizeof(q_params));
+	__set_bit(RAMROD_COMP_WAIT, &q_params.ramrod_flags);
+	q_params.cmd = BNX2X_Q_CMD_UPDATE;
+	__set_bit(BNX2X_Q_UPDATE_PTP_PKTS_CHNG,
+		  &q_params.params.update.update_flags);
+	__set_bit(BNX2X_Q_UPDATE_PTP_PKTS,
+		  &q_params.params.update.update_flags);
+
+	/* send the ramrod on all the queues of the PF */
+	for_each_eth_queue(bp, i) {
+		struct bnx2x_fastpath *fp = &bp->fp[i];
+
+		/* Set the appropriate Queue object */
+		q_params.q_obj = &bnx2x_sp_obj(bp, fp).q_obj;
+
+		/* Update the Queue state */
+		rc = bnx2x_queue_state_change(bp, &q_params);
+		if (rc) {
+			BNX2X_ERR("Failed to enable PTP packets\n");
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+int bnx2x_configure_ptp_filters(struct bnx2x *bp)
+{
+	int port = BP_PORT(bp);
+	int rc;
+
+	if (!bp->hwtstamp_ioctl_called)
+		return 0;
+
+	switch (bp->tx_type) {
+	case HWTSTAMP_TX_ON:
+		bp->flags |= TX_TIMESTAMPING_EN;
+		REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_PARAM_MASK :
+		       NIG_REG_P0_TLLH_PTP_PARAM_MASK, 0x6AA);
+		REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_RULE_MASK :
+		       NIG_REG_P0_TLLH_PTP_RULE_MASK, 0x3EEE);
+		break;
+	case HWTSTAMP_TX_ONESTEP_SYNC:
+		BNX2X_ERR("One-step timestamping is not supported\n");
+		return -ERANGE;
+	}
+
+	switch (bp->rx_filter) {
+	case HWTSTAMP_FILTER_NONE:
+		break;
+	case HWTSTAMP_FILTER_ALL:
+	case HWTSTAMP_FILTER_SOME:
+		bp->rx_filter = HWTSTAMP_FILTER_NONE;
+		break;
+	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
+	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
+	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
+		bp->rx_filter = HWTSTAMP_FILTER_PTP_V1_L4_EVENT;
+		/* Initialize PTP detection for UDP/IPv4 events */
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_PARAM_MASK :
+		       NIG_REG_P0_LLH_PTP_PARAM_MASK, 0x7EE);
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_RULE_MASK :
+		       NIG_REG_P0_LLH_PTP_RULE_MASK, 0x3FFE);
+		break;
+	case HWTSTAMP_FILTER_PTP_V2_L4_EVENT:
+	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
+	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
+		bp->rx_filter = HWTSTAMP_FILTER_PTP_V2_L4_EVENT;
+		/* Initialize PTP detection for UDP/IPv4 or UDP/IPv6 events */
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_PARAM_MASK :
+		       NIG_REG_P0_LLH_PTP_PARAM_MASK, 0x7EA);
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_RULE_MASK :
+		       NIG_REG_P0_LLH_PTP_RULE_MASK, 0x3FEE);
+		break;
+	case HWTSTAMP_FILTER_PTP_V2_L2_EVENT:
+	case HWTSTAMP_FILTER_PTP_V2_L2_SYNC:
+	case HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ:
+		bp->rx_filter = HWTSTAMP_FILTER_PTP_V2_L2_EVENT;
+		/* Initialize PTP detection L2 events */
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_PARAM_MASK :
+		       NIG_REG_P0_LLH_PTP_PARAM_MASK, 0x6BF);
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_RULE_MASK :
+		       NIG_REG_P0_LLH_PTP_RULE_MASK, 0x3EFF);
+
+		break;
+	case HWTSTAMP_FILTER_PTP_V2_EVENT:
+	case HWTSTAMP_FILTER_PTP_V2_SYNC:
+	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
+		bp->rx_filter = HWTSTAMP_FILTER_PTP_V2_EVENT;
+		/* Initialize PTP detection L2, UDP/IPv4 or UDP/IPv6 events */
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_PARAM_MASK :
+		       NIG_REG_P0_LLH_PTP_PARAM_MASK, 0x6AA);
+		REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_RULE_MASK :
+		       NIG_REG_P0_LLH_PTP_RULE_MASK, 0x3EEE);
+		break;
+	}
+
+	/* Indicate to FW that this PF expects recorded PTP packets */
+	rc = bnx2x_enable_ptp_packets(bp);
+	if (rc)
+		return rc;
+
+	/* Enable sending PTP packets to host */
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_TO_HOST :
+	       NIG_REG_P0_LLH_PTP_TO_HOST, 0x1);
+
+	return 0;
+}
+
+static int bnx2x_hwtstamp_ioctl(struct bnx2x *bp, struct ifreq *ifr)
+{
+	struct hwtstamp_config config;
+	int rc;
+
+	DP(BNX2X_MSG_PTP, "HWTSTAMP IOCTL called\n");
+
+	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+		return -EFAULT;
+
+	DP(BNX2X_MSG_PTP, "Requested tx_type: %d, requested rx_filters = %d\n",
+	   config.tx_type, config.rx_filter);
+
+	if (config.flags) {
+		BNX2X_ERR("config.flags is reserved for future use\n");
+		return -EINVAL;
+	}
+
+	bp->hwtstamp_ioctl_called = 1;
+	bp->tx_type = config.tx_type;
+	bp->rx_filter = config.rx_filter;
+
+	rc = bnx2x_configure_ptp_filters(bp);
+	if (rc)
+		return rc;
+
+	config.rx_filter = bp->rx_filter;
+
+	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
+		-EFAULT : 0;
+}
+
+/* Configrues HW for PTP */
+static int bnx2x_configure_ptp(struct bnx2x *bp)
+{
+	int rc, port = BP_PORT(bp);
+	u32 wb_data[2];
+
+	/* Reset PTP event detection rules - will be configured in the IOCTL */
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_PARAM_MASK :
+	       NIG_REG_P0_LLH_PTP_PARAM_MASK, 0x7FF);
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_RULE_MASK :
+	       NIG_REG_P0_LLH_PTP_RULE_MASK, 0x3FFF);
+	REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_PARAM_MASK :
+	       NIG_REG_P0_TLLH_PTP_PARAM_MASK, 0x7FF);
+	REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_RULE_MASK :
+	       NIG_REG_P0_TLLH_PTP_RULE_MASK, 0x3FFF);
+
+	/* Disable PTP packets to host - will be configured in the IOCTL*/
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_TO_HOST :
+	       NIG_REG_P0_LLH_PTP_TO_HOST, 0x0);
+
+	/* Enable the PTP feature */
+	REG_WR(bp, port ? NIG_REG_P1_PTP_EN :
+	       NIG_REG_P0_PTP_EN, 0x3F);
+
+	/* Enable the free-running counter */
+	wb_data[0] = 0;
+	wb_data[1] = 0;
+	REG_WR_DMAE(bp, NIG_REG_TIMESYNC_GEN_REG + tsgen_ctrl, wb_data, 2);
+
+	/* Reset drift register (offset register is not reset) */
+	rc = bnx2x_send_reset_timesync_ramrod(bp);
+	if (rc) {
+		BNX2X_ERR("Failed to reset PHC drift register\n");
+		return -EFAULT;
+	}
+
+	/* Reset possibly old timestamps */
+	REG_WR(bp, port ? NIG_REG_P1_LLH_PTP_HOST_BUF_SEQID :
+	       NIG_REG_P0_LLH_PTP_HOST_BUF_SEQID, 0x10000);
+	REG_WR(bp, port ? NIG_REG_P1_TLLH_PTP_BUF_SEQID :
+	       NIG_REG_P0_TLLH_PTP_BUF_SEQID, 0x10000);
+
+	return 0;
+}
+
+/* Called during load, to initialize PTP-related stuff */
+void bnx2x_init_ptp(struct bnx2x *bp)
+{
+	int rc;
+
+	/* Configure PTP in HW */
+	rc = bnx2x_configure_ptp(bp);
+	if (rc) {
+		BNX2X_ERR("Stopping PTP initialization\n");
+		return;
+	}
+
+	/* Init work queue for Tx timestamping */
+	INIT_WORK(&bp->ptp_task, bnx2x_ptp_task);
+
+	/* Init cyclecounter and timecounter. This is done only in the first
+	 * load. If done in every load, PTP application will fail when doing
+	 * unload / load (e.g. MTU change) while it is running.
+	 */
+	if (!bp->timecounter_init_done) {
+		bnx2x_init_cyclecounter(bp);
+		timecounter_init(&bp->timecounter, &bp->cyclecounter,
+				 ktime_to_ns(ktime_get_real()));
+		bp->timecounter_init_done = 1;
+	}
+
+	DP(BNX2X_MSG_PTP, "PTP initialization ended successfully\n");
 }

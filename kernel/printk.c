@@ -258,6 +258,18 @@ static u32 log_buf_len = __LOG_BUF_LEN;
 /* cpu currently holding logbuf_lock */
 static volatile unsigned int logbuf_cpu = UINT_MAX;
 
+/* Return log buffer address */
+char *log_buf_addr_get(void)
+{
+	return log_buf;
+}
+
+/* Return log buffer size */
+u32 log_buf_len_get(void)
+{
+	return log_buf_len;
+}
+
 /* human readable text of the record */
 static char *log_text(const struct log *msg)
 {
@@ -1921,7 +1933,7 @@ void resume_console(void)
  * called when a new CPU comes online (or fails to come up), and ensures
  * that any such output gets printed.
  */
-static int __cpuinit console_cpu_notify(struct notifier_block *self,
+static int console_cpu_notify(struct notifier_block *self,
 	unsigned long action, void *hcpu)
 {
 	switch (action) {

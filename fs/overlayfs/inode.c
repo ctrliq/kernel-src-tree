@@ -366,7 +366,8 @@ out:
 	return err;
 }
 
-static const struct inode_operations ovl_file_inode_operations = {
+static const struct inode_operations_wrapper ovl_file_inode_operations = {
+	.ops = {
 	.setattr	= ovl_setattr,
 	.permission	= ovl_permission,
 	.getattr	= ovl_getattr,
@@ -374,6 +375,7 @@ static const struct inode_operations ovl_file_inode_operations = {
 	.getxattr	= ovl_getxattr,
 	.listxattr	= ovl_listxattr,
 	.removexattr	= ovl_removexattr,
+	},
 	.dentry_open	= ovl_dentry_open,
 };
 
@@ -407,8 +409,9 @@ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
 	switch (mode) {
 	case S_IFDIR:
 		inode->i_private = oe;
-		inode->i_op = &ovl_dir_inode_operations;
+		inode->i_op = &ovl_dir_inode_operations.ops;
 		inode->i_fop = &ovl_dir_operations;
+		inode->i_flags |= S_IOPS_WRAPPER;
 		break;
 
 	case S_IFLNK:
@@ -420,7 +423,8 @@ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
 	case S_IFBLK:
 	case S_IFCHR:
 	case S_IFIFO:
-		inode->i_op = &ovl_file_inode_operations;
+		inode->i_op = &ovl_file_inode_operations.ops;
+		inode->i_flags |= S_IOPS_WRAPPER;
 		break;
 
 	default:

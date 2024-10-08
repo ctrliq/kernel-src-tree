@@ -7,7 +7,6 @@
 */
 
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/tty.h>
 #include <linux/module.h>
 #include <linux/usb.h>
@@ -54,7 +53,7 @@ MODULE_DEVICE_TABLE(usb, id_table);
 #define UNI_CMD_OPEN	0x80
 #define UNI_CMD_CLOSE	0xFF
 
-inline int metrousb_is_unidirectional_mode(struct usb_serial_port *port)
+static inline int metrousb_is_unidirectional_mode(struct usb_serial_port *port)
 {
 	__u16 product_id = le16_to_cpu(
 		port->serial->dev->descriptor.idProduct);

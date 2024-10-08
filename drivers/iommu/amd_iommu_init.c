@@ -26,7 +26,7 @@
 #include <linux/msi.h>
 #include <linux/amd-iommu.h>
 #include <linux/export.h>
-#include <acpi/acpi.h>
+#include <linux/iommu.h>
 #include <asm/pci-direct.h>
 #include <asm/iommu.h>
 #include <asm/gart.h>
@@ -1160,6 +1160,40 @@ static int __init init_iommu_all(struct acpi_table_header *table)
 	return 0;
 }
 
+static ssize_t amd_iommu_show_cap(struct device *dev,
+				  struct device_attribute *attr,
+				  char *buf)
+{
+	struct amd_iommu *iommu = dev_get_drvdata(dev);
+	return sprintf(buf, "%x\n", iommu->cap);
+}
+static DEVICE_ATTR(cap, S_IRUGO, amd_iommu_show_cap, NULL);
+
+static ssize_t amd_iommu_show_features(struct device *dev,
+				       struct device_attribute *attr,
+				       char *buf)
+{
+	struct amd_iommu *iommu = dev_get_drvdata(dev);
+	return sprintf(buf, "%llx\n", iommu->features);
+}
+static DEVICE_ATTR(features, S_IRUGO, amd_iommu_show_features, NULL);
+
+static struct attribute *amd_iommu_attrs[] = {
+	&dev_attr_cap.attr,
+	&dev_attr_features.attr,
+	NULL,
+};
+
+static struct attribute_group amd_iommu_group = {
+	.name = "amd-iommu",
+	.attrs = amd_iommu_attrs,
+};
+
+static const struct attribute_group *amd_iommu_groups[] = {
+	&amd_iommu_group,
+	NULL,
+};
+
 static int iommu_init_pci(struct amd_iommu *iommu)
 {
 	int cap_ptr = iommu->cap_ptr;
@@ -1256,6 +1290,10 @@ static int iommu_init_pci(struct amd_iommu *iommu)
 	}
 
 	amd_iommu_erratum_746_workaround(iommu);
+
+	iommu->iommu_dev = iommu_device_create(&iommu->dev->dev, iommu,
+					       amd_iommu_groups, "ivhd%d",
+					       iommu->index);
 
 	return pci_enable_device(iommu->dev);
 }

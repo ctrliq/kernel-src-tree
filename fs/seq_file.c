@@ -11,7 +11,9 @@
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/cred.h>
+#ifndef __GENKSYMS__
 #include <linux/mm.h>
+#endif
 
 #include <asm/uaccess.h>
 #include <asm/page.h>
@@ -40,6 +42,14 @@ static void *seq_buf_alloc(unsigned long size)
 	if (!buf && size > PAGE_SIZE)
 		buf = vmalloc(size);
 	return buf;
+}
+
+static void seq_buf_free(const void *buf)
+{
+	if (unlikely(is_vmalloc_addr(buf)))
+		vfree(buf);
+	else
+		kfree(buf);
 }
 
 /**
@@ -147,7 +157,7 @@ static int traverse(struct seq_file *m, loff_t offset)
 
 Eoverflow:
 	m->op->stop(m, p);
-	kvfree(m->buf);
+	seq_buf_free(m->buf);
 	m->count = 0;
 	m->buf = seq_buf_alloc(m->size <<= 1);
 	return !m->buf ? -ENOMEM : -EAGAIN;
@@ -244,7 +254,7 @@ ssize_t seq_read(struct file *file, char __user *buf, size_t size, loff_t *ppos)
 		if (m->count < m->size)
 			goto Fill;
 		m->op->stop(m, p);
-		kvfree(m->buf);
+		seq_buf_free(m->buf);
 		m->count = 0;
 		m->buf = seq_buf_alloc(m->size <<= 1);
 		if (!m->buf)
@@ -362,7 +372,7 @@ EXPORT_SYMBOL(seq_lseek);
 int seq_release(struct inode *inode, struct file *file)
 {
 	struct seq_file *m = file->private_data;
-	kvfree(m->buf);
+	seq_buf_free(m->buf);
 	kfree(m);
 	return 0;
 }
@@ -623,7 +633,7 @@ int single_open_size(struct file *file, int (*show)(struct seq_file *, void *),
 		return -ENOMEM;
 	ret = single_open(file, show, data);
 	if (ret) {
-		kvfree(buf);
+		seq_buf_free(buf);
 		return ret;
 	}
 	((struct seq_file *)file->private_data)->buf = buf;

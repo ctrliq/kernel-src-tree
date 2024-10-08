@@ -1,6 +1,6 @@
 /*
  * QLogic Fibre Channel HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2014 QLogic Corporation
  *
  * See LICENSE.qla2xxx for copyright and licensing details.
  */
@@ -2800,6 +2800,147 @@ qla2x00_system_error(scsi_qla_host_t *vha)
 		ql_dbg(ql_dbg_mbx, vha, 0x109c, "Failed=%x.\n", rval);
 	} else {
 		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x109d,
+		    "Done %s.\n", __func__);
+	}
+
+	return rval;
+}
+
+int
+qla2x00_write_serdes_word(scsi_qla_host_t *vha, uint16_t addr, uint16_t data)
+{
+	int rval;
+	mbx_cmd_t mc;
+	mbx_cmd_t *mcp = &mc;
+
+	if (!IS_QLA2031(vha->hw))
+		return QLA_FUNCTION_FAILED;
+
+	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1182,
+	    "Entered %s.\n", __func__);
+
+	mcp->mb[0] = MBC_WRITE_SERDES;
+	mcp->mb[1] = addr;
+	mcp->mb[2] = data & 0xff;
+	mcp->mb[3] = 0;
+	mcp->out_mb = MBX_3|MBX_2|MBX_1|MBX_0;
+	mcp->in_mb = MBX_0;
+	mcp->tov = MBX_TOV_SECONDS;
+	mcp->flags = 0;
+	rval = qla2x00_mailbox_command(vha, mcp);
+
+	if (rval != QLA_SUCCESS) {
+		ql_dbg(ql_dbg_mbx, vha, 0x1183,
+		    "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
+	} else {
+		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1184,
+		    "Done %s.\n", __func__);
+	}
+
+	return rval;
+}
+
+int
+qla2x00_read_serdes_word(scsi_qla_host_t *vha, uint16_t addr, uint16_t *data)
+{
+	int rval;
+	mbx_cmd_t mc;
+	mbx_cmd_t *mcp = &mc;
+
+	if (!IS_QLA2031(vha->hw))
+		return QLA_FUNCTION_FAILED;
+
+	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1185,
+	    "Entered %s.\n", __func__);
+
+	mcp->mb[0] = MBC_READ_SERDES;
+	mcp->mb[1] = addr;
+	mcp->mb[3] = 0;
+	mcp->out_mb = MBX_3|MBX_1|MBX_0;
+	mcp->in_mb = MBX_1|MBX_0;
+	mcp->tov = MBX_TOV_SECONDS;
+	mcp->flags = 0;
+	rval = qla2x00_mailbox_command(vha, mcp);
+
+	*data = mcp->mb[1] & 0xff;
+
+	if (rval != QLA_SUCCESS) {
+		ql_dbg(ql_dbg_mbx, vha, 0x1186,
+		    "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
+	} else {
+		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1187,
+		    "Done %s.\n", __func__);
+	}
+
+	return rval;
+}
+
+int
+qla8044_write_serdes_word(scsi_qla_host_t *vha, uint32_t addr, uint32_t data)
+{
+	int rval;
+	mbx_cmd_t mc;
+	mbx_cmd_t *mcp = &mc;
+
+	if (!IS_QLA8044(vha->hw))
+		return QLA_FUNCTION_FAILED;
+
+	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1186,
+	    "Entered %s.\n", __func__);
+
+	mcp->mb[0] = MBC_SET_GET_ETH_SERDES_REG;
+	mcp->mb[1] = HCS_WRITE_SERDES;
+	mcp->mb[3] = LSW(addr);
+	mcp->mb[4] = MSW(addr);
+	mcp->mb[5] = LSW(data);
+	mcp->mb[6] = MSW(data);
+	mcp->out_mb = MBX_6|MBX_5|MBX_4|MBX_3|MBX_1|MBX_0;
+	mcp->in_mb = MBX_0;
+	mcp->tov = MBX_TOV_SECONDS;
+	mcp->flags = 0;
+	rval = qla2x00_mailbox_command(vha, mcp);
+
+	if (rval != QLA_SUCCESS) {
+		ql_dbg(ql_dbg_mbx, vha, 0x1187,
+		    "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
+	} else {
+		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1188,
+		    "Done %s.\n", __func__);
+	}
+
+	return rval;
+}
+
+int
+qla8044_read_serdes_word(scsi_qla_host_t *vha, uint32_t addr, uint32_t *data)
+{
+	int rval;
+	mbx_cmd_t mc;
+	mbx_cmd_t *mcp = &mc;
+
+	if (!IS_QLA8044(vha->hw))
+		return QLA_FUNCTION_FAILED;
+
+	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1189,
+	    "Entered %s.\n", __func__);
+
+	mcp->mb[0] = MBC_SET_GET_ETH_SERDES_REG;
+	mcp->mb[1] = HCS_READ_SERDES;
+	mcp->mb[3] = LSW(addr);
+	mcp->mb[4] = MSW(addr);
+	mcp->out_mb = MBX_4|MBX_3|MBX_1|MBX_0;
+	mcp->in_mb = MBX_2|MBX_1|MBX_0;
+	mcp->tov = MBX_TOV_SECONDS;
+	mcp->flags = 0;
+	rval = qla2x00_mailbox_command(vha, mcp);
+
+	*data = mcp->mb[2] << 16 | mcp->mb[1];
+
+	if (rval != QLA_SUCCESS) {
+		ql_dbg(ql_dbg_mbx, vha, 0x118a,
+		    "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
+	} else {
+		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x118b,
 		    "Done %s.\n", __func__);
 	}
 

@@ -846,7 +846,7 @@ static int sd_setup_write_same_cmnd(struct scsi_device *sdp, struct request *rq)
 
 static int scsi_setup_flush_cmnd(struct scsi_device *sdp, struct request *rq)
 {
-	rq->timeout *= SD_FLUSH_TIMEOUT_MULTIPLIER;
+	rq->timeout = rq->q->rq_timeout * SD_FLUSH_TIMEOUT_MULTIPLIER;
 	rq->retries = SD_MAX_RETRIES;
 	rq->cmd[0] = SYNCHRONIZE_CACHE;
 	rq->cmd_len = 10;
@@ -1645,8 +1645,6 @@ static int sd_done(struct scsi_cmnd *SCpnt)
 	int sense_deferred = 0;
 	unsigned char op = SCpnt->cmnd[0];
 	unsigned char unmap = SCpnt->cmnd[1] & 8;
-
-	sd_uninit_command(SCpnt);
 
 	if (req->cmd_flags & REQ_DISCARD || req->cmd_flags & REQ_WRITE_SAME) {
 		if (!result) {
@@ -2614,8 +2612,10 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
 
 	rot = get_unaligned_be16(&buffer[4]);
 
-	if (rot == 1)
+	if (rot == 1) {
 		queue_flag_set_unlocked(QUEUE_FLAG_NONROT, sdkp->disk->queue);
+		queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, sdkp->disk->queue);
+	}
 
  out:
 	kfree(buffer);

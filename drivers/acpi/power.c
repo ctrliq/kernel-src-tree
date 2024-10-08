@@ -47,8 +47,6 @@
 #include "sleep.h"
 #include "internal.h"
 
-#define PREFIX "ACPI: "
-
 #define _COMPONENT			ACPI_POWER_COMPONENT
 ACPI_MODULE_NAME("power");
 #define ACPI_POWER_CLASS		"power_resource"

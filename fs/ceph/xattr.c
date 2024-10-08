@@ -12,6 +12,9 @@
 #define XATTR_CEPH_PREFIX "ceph."
 #define XATTR_CEPH_PREFIX_LEN (sizeof (XATTR_CEPH_PREFIX) - 1)
 
+static int __remove_xattr(struct ceph_inode_info *ci,
+			  struct ceph_inode_xattr *xattr);
+
 static bool ceph_is_valid_xattr(const char *name)
 {
 	return !strncmp(name, XATTR_CEPH_PREFIX, XATTR_CEPH_PREFIX_LEN) ||
@@ -360,6 +363,12 @@ static int __set_xattr(struct ceph_inode_info *ci,
 			kfree(name);
 			kfree(val);
 			return err;
+		}
+		if (update_xattr < 0) {
+			if (xattr)
+				__remove_xattr(ci, xattr);
+			kfree(name);
+			return 0;
 		}
 	}
 
@@ -940,8 +949,8 @@ retry:
 		goto retry;
 	}
 
-	err = __set_xattr(ci, newname, name_len, newval,
-			  val_len, flags, 1, &xattr);
+	err = __set_xattr(ci, newname, name_len, newval, val_len,
+			  flags, value ? 1 : -1, &xattr);
 
 	if (!err) {
 		dirty = __ceph_mark_dirty_caps(ci, CEPH_CAP_XATTR_EXCL);

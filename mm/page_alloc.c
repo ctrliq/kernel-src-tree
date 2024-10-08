@@ -61,6 +61,7 @@
 #include <linux/hugetlb.h>
 #include <linux/sched/rt.h>
 
+#include <asm/sections.h>
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
 #include "internal.h"
@@ -100,6 +101,9 @@ nodemask_t node_states[NR_NODE_STATES] __read_mostly = {
 #endif	/* NUMA */
 };
 EXPORT_SYMBOL(node_states);
+
+/* Protect totalram_pages and zone->managed_pages */
+static DEFINE_SPINLOCK(managed_page_count_lock);
 
 unsigned long totalram_pages __read_mostly;
 unsigned long totalreserve_pages __read_mostly;
@@ -362,9 +366,11 @@ void prep_compound_page(struct page *page, unsigned long order)
 	__SetPageHead(page);
 	for (i = 1; i < nr_pages; i++) {
 		struct page *p = page + i;
-		__SetPageTail(p);
 		set_page_count(p, 0);
 		p->first_page = page;
+		/* Make sure p->first_page is always valid for PageTail() */
+		smp_wmb();
+		__SetPageTail(p);
 	}
 }
 
@@ -500,12 +506,12 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
 		return 0;
 
 	if (page_is_guard(buddy) && page_order(buddy) == order) {
-		VM_BUG_ON(page_count(buddy) != 0);
+		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
 		return 1;
 	}
 
 	if (PageBuddy(buddy) && page_order(buddy) == order) {
-		VM_BUG_ON(page_count(buddy) != 0);
+		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
 		return 1;
 	}
 	return 0;
@@ -554,8 +560,8 @@ static inline void __free_one_page(struct page *page,
 
 	page_idx = page_to_pfn(page) & ((1 << MAX_ORDER) - 1);
 
-	VM_BUG_ON(page_idx & ((1 << order) - 1));
-	VM_BUG_ON(bad_range(zone, page));
+	VM_BUG_ON_PAGE(page_idx & ((1 << order) - 1), page);
+	VM_BUG_ON_PAGE(bad_range(zone, page), page);
 
 	while (order < MAX_ORDER-1) {
 		buddy_idx = __find_buddy_index(page_idx, order);
@@ -822,7 +828,7 @@ static inline void expand(struct zone *zone, struct page *page,
 		area--;
 		high--;
 		size >>= 1;
-		VM_BUG_ON(bad_range(zone, &page[size]));
+		VM_BUG_ON_PAGE(bad_range(zone, &page[size]), &page[size]);
 
 #ifdef CONFIG_DEBUG_PAGEALLOC
 		if (high < debug_guardpage_minorder()) {
@@ -885,8 +891,6 @@ static int prep_new_page(struct page *page, int order, gfp_t gfp_flags)
 	}
 
 	set_page_private(page, 0);
-	set_page_refcounted(page);
-
 	arch_alloc_page(page, order);
 	kernel_map_pages(page, 1 << order, 1);
 
@@ -895,6 +899,14 @@ static int prep_new_page(struct page *page, int order, gfp_t gfp_flags)
 
 	if (order && (gfp_flags & __GFP_COMP))
 		prep_compound_page(page, order);
+
+	/*
+	 * Make sure the caller of get_page_unless_zero() will see the
+	 * fully initialized page. Say, to ensure that compound_lock()
+	 * can't race with the non-atomic __SetPage*() above.
+	 */
+	smp_wmb();
+	set_page_refcounted(page);
 
 	return 0;
 }
@@ -975,7 +987,7 @@ int move_freepages(struct zone *zone,
 
 	for (page = start_page; page <= end_page;) {
 		/* Make sure we are not inadvertently changing nodes */
-		VM_BUG_ON(page_to_nid(page) != zone_to_nid(zone));
+		VM_BUG_ON_PAGE(page_to_nid(page) != zone_to_nid(zone), page);
 
 		if (!pfn_valid_within(page_to_pfn(page))) {
 			page++;
@@ -1403,8 +1415,8 @@ void split_page(struct page *page, unsigned int order)
 {
 	int i;
 
-	VM_BUG_ON(PageCompound(page));
-	VM_BUG_ON(!page_count(page));
+	VM_BUG_ON_PAGE(PageCompound(page), page);
+	VM_BUG_ON_PAGE(!page_count(page), page);
 
 #ifdef CONFIG_KMEMCHECK
 	/*
@@ -1552,7 +1564,7 @@ again:
 	zone_statistics(preferred_zone, zone, gfp_flags);
 	local_irq_restore(flags);
 
-	VM_BUG_ON(bad_range(zone, page));
+	VM_BUG_ON_PAGE(bad_range(zone, page), page);
 	if (prep_new_page(page, order, gfp_flags))
 		goto again;
 	return page;
@@ -1821,16 +1833,8 @@ static bool zone_local(struct zone *local_zone, struct zone *zone)
 
 static bool zone_allows_reclaim(struct zone *local_zone, struct zone *zone)
 {
-	return node_isset(local_zone->node, zone->zone_pgdat->reclaim_nodes);
-}
-
-static void __paginginit init_zone_allows_reclaim(int nid)
-{
-	int i;
-
-	for_each_node_state(i, N_MEMORY)
-		if (node_distance(nid, i) <= RECLAIM_DISTANCE)
-			node_set(i, NODE_DATA(nid)->reclaim_nodes);
+	return node_distance(zone_to_nid(local_zone), zone_to_nid(zone)) <
+				RECLAIM_DISTANCE;
 }
 
 #else	/* CONFIG_NUMA */
@@ -1864,9 +1868,6 @@ static bool zone_allows_reclaim(struct zone *local_zone, struct zone *zone)
 	return true;
 }
 
-static inline void init_zone_allows_reclaim(int nid)
-{
-}
 #endif	/* CONFIG_NUMA */
 
 /*
@@ -4828,8 +4829,6 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 
 	pgdat->node_id = nid;
 	pgdat->node_start_pfn = node_start_pfn;
-	if (node_state(nid, N_MEMORY))
-		init_zone_allows_reclaim(nid);
 	calculate_node_totalpages(pgdat, zones_size, zholes_size);
 
 	alloc_node_mem_map(pgdat);
@@ -4975,9 +4974,33 @@ static void __init find_zone_movable_pfns_for_nodes(void)
 	nodemask_t saved_node_state = node_states[N_MEMORY];
 	unsigned long totalpages = early_calculate_totalpages();
 	int usable_nodes = nodes_weight(node_states[N_MEMORY]);
+	struct memblock_type *type = &memblock.memory;
+
+	/* Need to find movable_zone earlier when movable_node is specified. */
+	find_usable_zone_for_movable();
 
 	/*
-	 * If movablecore was specified, calculate what size of
+	 * If movable_node is specified, ignore kernelcore and movablecore
+	 * options.
+	 */
+	if (movable_node_is_enabled()) {
+		for (i = 0; i < type->cnt; i++) {
+			if (!memblock_is_hotpluggable(&type->regions[i]))
+				continue;
+
+			nid = type->regions[i].nid;
+
+			usable_startpfn = PFN_DOWN(type->regions[i].base);
+			zone_movable_pfn[nid] = zone_movable_pfn[nid] ?
+				min(usable_startpfn, zone_movable_pfn[nid]) :
+				usable_startpfn;
+		}
+
+		goto out2;
+	}
+
+	/*
+	 * If movablecore=nn[KMG] was specified, calculate what size of
 	 * kernelcore that corresponds so that memory usable for
 	 * any allocation type is evenly spread. If both kernelcore
 	 * and movablecore are specified, then the value of kernelcore
@@ -5003,7 +5026,6 @@ static void __init find_zone_movable_pfns_for_nodes(void)
 		goto out;
 
 	/* usable_startpfn is the lowest possible pfn ZONE_MOVABLE can be at */
-	find_usable_zone_for_movable();
 	usable_startpfn = arch_zone_lowest_possible_pfn[movable_zone];
 
 restart:
@@ -5094,6 +5116,7 @@ restart:
 	if (usable_nodes && required_kernelcore > usable_nodes)
 		goto restart;
 
+out2:
 	/* Align start of ZONE_MOVABLE on all nids to MAX_ORDER_NR_PAGES */
 	for (nid = 0; nid < MAX_NUMNODES; nid++)
 		zone_movable_pfn[nid] =
@@ -5247,6 +5270,14 @@ early_param("movablecore", cmdline_parse_movablecore);
 
 #endif /* CONFIG_HAVE_MEMBLOCK_NODE_MAP */
 
+void adjust_managed_page_count(struct page *page, long count)
+{
+	spin_lock(&managed_page_count_lock);
+	page_zone(page)->managed_pages += count;
+	totalram_pages += count;
+	spin_unlock(&managed_page_count_lock);
+}
+
 unsigned long free_reserved_area(unsigned long start, unsigned long end,
 				 int poison, char *s)
 {
@@ -5276,6 +5307,57 @@ void free_highmem_page(struct page *page)
 	totalhigh_pages++;
 }
 #endif
+
+
+void __init mem_init_print_info(const char *str)
+{
+	unsigned long physpages, codesize, datasize, rosize, bss_size;
+	unsigned long init_code_size, init_data_size;
+
+	physpages = get_num_physpages();
+	codesize = _etext - _stext;
+	datasize = _edata - _sdata;
+	rosize = __end_rodata - __start_rodata;
+	bss_size = __bss_stop - __bss_start;
+	init_data_size = __init_end - __init_begin;
+	init_code_size = _einittext - _sinittext;
+
+	/*
+	 * Detect special cases and adjust section sizes accordingly:
+	 * 1) .init.* may be embedded into .data sections
+	 * 2) .init.text.* may be out of [__init_begin, __init_end],
+	 *    please refer to arch/tile/kernel/vmlinux.lds.S.
+	 * 3) .rodata.* may be embedded into .text or .data sections.
+	 */
+#define adj_init_size(start, end, size, pos, adj) \
+	if (start <= pos && pos < end && size > adj) \
+		size -= adj;
+
+	adj_init_size(__init_begin, __init_end, init_data_size,
+		     _sinittext, init_code_size);
+	adj_init_size(_stext, _etext, codesize, _sinittext, init_code_size);
+	adj_init_size(_sdata, _edata, datasize, __init_begin, init_data_size);
+	adj_init_size(_stext, _etext, codesize, __start_rodata, rosize);
+	adj_init_size(_sdata, _edata, datasize, __start_rodata, rosize);
+
+#undef	adj_init_size
+
+	printk("Memory: %luK/%luK available "
+	       "(%luK kernel code, %luK rwdata, %luK rodata, "
+	       "%luK init, %luK bss, %luK reserved"
+#ifdef	CONFIG_HIGHMEM
+	       ", %luK highmem"
+#endif
+	       "%s%s)\n",
+	       nr_free_pages() << (PAGE_SHIFT-10), physpages << (PAGE_SHIFT-10),
+	       codesize >> 10, datasize >> 10, rosize >> 10,
+	       (init_data_size + init_code_size) >> 10, bss_size >> 10,
+	       (physpages - totalram_pages) << (PAGE_SHIFT-10),
+#ifdef	CONFIG_HIGHMEM
+	       totalhigh_pages << (PAGE_SHIFT-10),
+#endif
+	       str ? ", " : "", str ? str : "");
+}
 
 /**
  * set_dma_reserve - set the specified number of pages reserved in the first zone
@@ -5323,7 +5405,7 @@ static int page_alloc_cpu_notify(struct notifier_block *self,
 		 * This is only okay since the processor is dead and cannot
 		 * race with what we are doing.
 		 */
-		cpu_vm_stats_fold(cpu);
+		refresh_cpu_vm_stats(cpu);
 	}
 	return NOTIFY_OK;
 }
@@ -5858,7 +5940,7 @@ void set_pageblock_flags_group(struct page *page, unsigned long flags,
 	pfn = page_to_pfn(page);
 	bitmap = get_pageblock_bitmap(zone, pfn);
 	bitidx = pfn_to_bitidx(zone, pfn);
-	VM_BUG_ON(!zone_spans_pfn(zone, pfn));
+	VM_BUG_ON_PAGE(!zone_spans_pfn(zone, pfn), page);
 
 	for (; start_bitidx <= end_bitidx; start_bitidx++, value <<= 1)
 		if (flags & value)
@@ -6379,3 +6461,4 @@ void dump_page(struct page *page, char *reason)
 {
 	dump_page_badflags(page, reason, 0);
 }
+EXPORT_SYMBOL(dump_page);

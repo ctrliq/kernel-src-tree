@@ -3739,7 +3739,7 @@ static struct st_buffer *new_tape_buffer(int need_dma, int max_sg)
 
 static int enlarge_buffer(struct st_buffer * STbuffer, int new_size, int need_dma)
 {
-	int segs, nbr, max_segs, b_size, order, got;
+	int segs, max_segs, b_size, order, got;
 	gfp_t priority;
 
 	if (new_size <= STbuffer->buffer_size)
@@ -3749,9 +3749,6 @@ static int enlarge_buffer(struct st_buffer * STbuffer, int new_size, int need_dm
 		normalize_buffer(STbuffer);  /* Avoid extra segment */
 
 	max_segs = STbuffer->use_sg;
-	nbr = max_segs - STbuffer->frp_segs;
-	if (nbr <= 0)
-		return 0;
 
 	priority = GFP_KERNEL | __GFP_NOWARN;
 	if (need_dma)

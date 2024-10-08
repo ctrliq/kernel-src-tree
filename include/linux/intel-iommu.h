@@ -55,7 +55,7 @@
 #define DMAR_IQT_REG	0x88	/* Invalidation queue tail register */
 #define DMAR_IQ_SHIFT	4	/* Invalidation queue head/tail shift */
 #define DMAR_IQA_REG	0x90	/* Invalidation queue addr register */
-#define DMAR_ICS_REG	0x98	/* Invalidation complete status register */
+#define DMAR_ICS_REG	0x9c	/* Invalidation complete status register */
 #define DMAR_IRTA_REG	0xb8    /* Interrupt remapping table addr register */
 
 #define OFFSET_STRIDE		(9)
@@ -336,6 +336,7 @@ struct intel_iommu {
 #ifdef CONFIG_IRQ_REMAP
 	struct ir_table *ir_table;	/* Interrupt remapping info */
 #endif
+	struct device	*iommu_dev; /* IOMMU-sysfs device */
 	int		node;
 };
 
@@ -349,7 +350,6 @@ static inline void __iommu_flush_cache(
 extern struct dmar_drhd_unit * dmar_find_matched_drhd_unit(struct pci_dev *dev);
 extern int dmar_find_matched_atsr_unit(struct pci_dev *dev);
 
-extern void free_iommu(struct intel_iommu *iommu);
 extern int dmar_enable_qi(struct intel_iommu *iommu);
 extern void dmar_disable_qi(struct intel_iommu *iommu);
 extern int dmar_reenable_qi(struct intel_iommu *iommu);
@@ -365,5 +365,7 @@ extern void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 qdep,
 extern int qi_submit_sync(struct qi_desc *desc, struct intel_iommu *iommu);
 
 extern int dmar_ir_support(void);
+
+extern const struct attribute_group *intel_iommu_groups[];
 
 #endif

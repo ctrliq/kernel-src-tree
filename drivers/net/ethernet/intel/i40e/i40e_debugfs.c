@@ -697,6 +697,25 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 			 vsi->bw_ets_limit_credits[i],
 			 vsi->bw_ets_max_quanta[i]);
 	}
+#ifdef I40E_FCOE
+	if (vsi->type == I40E_VSI_FCOE) {
+		dev_info(&pf->pdev->dev,
+			 "    fcoe_stats: rx_packets = %llu, rx_dwords = %llu, rx_dropped = %llu\n",
+			 vsi->fcoe_stats.rx_fcoe_packets,
+			 vsi->fcoe_stats.rx_fcoe_dwords,
+			 vsi->fcoe_stats.rx_fcoe_dropped);
+		dev_info(&pf->pdev->dev,
+			 "    fcoe_stats: tx_packets = %llu, tx_dwords = %llu\n",
+			 vsi->fcoe_stats.tx_fcoe_packets,
+			 vsi->fcoe_stats.tx_fcoe_dwords);
+		dev_info(&pf->pdev->dev,
+			 "    fcoe_stats: bad_crc = %llu, last_error = %llu\n",
+			 vsi->fcoe_stats.fcoe_bad_fccrc,
+			 vsi->fcoe_stats.fcoe_last_error);
+		dev_info(&pf->pdev->dev, "    fcoe_stats: ddp_count = %llu\n",
+			 vsi->fcoe_stats.fcoe_ddp_count);
+	}
+#endif
 }
 
 /**
@@ -862,12 +881,11 @@ static void i40e_dbg_dump_eth_stats(struct i40e_pf *pf,
 		 "    rx_bytes = \t%lld \trx_unicast = \t\t%lld \trx_multicast = \t%lld\n",
 		estats->rx_bytes, estats->rx_unicast, estats->rx_multicast);
 	dev_info(&pf->pdev->dev,
-		 "    rx_broadcast = \t%lld \trx_discards = \t\t%lld \trx_errors = \t%lld\n",
-		 estats->rx_broadcast, estats->rx_discards, estats->rx_errors);
+		 "    rx_broadcast = \t%lld \trx_discards = \t\t%lld\n",
+		 estats->rx_broadcast, estats->rx_discards);
 	dev_info(&pf->pdev->dev,
-		 "    rx_missed = \t%lld \trx_unknown_protocol = \t%lld \ttx_bytes = \t%lld\n",
-		 estats->rx_missed, estats->rx_unknown_protocol,
-		 estats->tx_bytes);
+		 "    rx_unknown_protocol = \t%lld \ttx_bytes = \t%lld\n",
+		 estats->rx_unknown_protocol, estats->tx_bytes);
 	dev_info(&pf->pdev->dev,
 		 "    tx_unicast = \t%lld \ttx_multicast = \t\t%lld \ttx_broadcast = \t%lld\n",
 		 estats->tx_unicast, estats->tx_multicast, estats->tx_broadcast);

@@ -104,7 +104,12 @@ static int i40e_add_fdir_ethtool(struct i40e_vsi *vsi,
 static struct i40e_stats i40e_gstrings_stats[] = {
 	I40E_PF_STAT("rx_bytes", stats.eth.rx_bytes),
 	I40E_PF_STAT("tx_bytes", stats.eth.tx_bytes),
-	I40E_PF_STAT("rx_errors", stats.eth.rx_errors),
+	I40E_PF_STAT("rx_unicast", stats.eth.rx_unicast),
+	I40E_PF_STAT("tx_unicast", stats.eth.tx_unicast),
+	I40E_PF_STAT("rx_multicast", stats.eth.rx_multicast),
+	I40E_PF_STAT("tx_multicast", stats.eth.tx_multicast),
+	I40E_PF_STAT("rx_broadcast", stats.eth.rx_broadcast),
+	I40E_PF_STAT("tx_broadcast", stats.eth.tx_broadcast),
 	I40E_PF_STAT("tx_errors", stats.eth.tx_errors),
 	I40E_PF_STAT("rx_dropped", stats.eth.rx_discards),
 	I40E_PF_STAT("tx_dropped", stats.eth.tx_discards),
@@ -140,6 +145,10 @@ static struct i40e_stats i40e_gstrings_stats[] = {
 	I40E_PF_STAT("rx_jabber", stats.rx_jabber),
 	I40E_PF_STAT("VF_admin_queue_requests", vf_aq_requests),
 	I40E_PF_STAT("rx_hwtstamp_cleared", rx_hwtstamp_cleared),
+	I40E_PF_STAT("fdir_flush_cnt", fd_flush_cnt),
+	I40E_PF_STAT("fdir_atr_match", stats.fd_atr_match),
+	I40E_PF_STAT("fdir_sb_match", stats.fd_sb_match),
+
 	/* LPI stats */
 	I40E_PF_STAT("tx_lpi_status", stats.tx_lpi_status),
 	I40E_PF_STAT("rx_lpi_status", stats.rx_lpi_status),
@@ -147,6 +156,19 @@ static struct i40e_stats i40e_gstrings_stats[] = {
 	I40E_PF_STAT("rx_lpi_count", stats.rx_lpi_count),
 };
 
+#ifdef I40E_FCOE
+static const struct i40e_stats i40e_gstrings_fcoe_stats[] = {
+	I40E_VSI_STAT("fcoe_bad_fccrc", fcoe_stats.fcoe_bad_fccrc),
+	I40E_VSI_STAT("rx_fcoe_dropped", fcoe_stats.rx_fcoe_dropped),
+	I40E_VSI_STAT("rx_fcoe_packets", fcoe_stats.rx_fcoe_packets),
+	I40E_VSI_STAT("rx_fcoe_dwords", fcoe_stats.rx_fcoe_dwords),
+	I40E_VSI_STAT("fcoe_ddp_count", fcoe_stats.fcoe_ddp_count),
+	I40E_VSI_STAT("fcoe_last_error", fcoe_stats.fcoe_last_error),
+	I40E_VSI_STAT("tx_fcoe_packets", fcoe_stats.tx_fcoe_packets),
+	I40E_VSI_STAT("tx_fcoe_dwords", fcoe_stats.tx_fcoe_dwords),
+};
+
+#endif /* I40E_FCOE */
 #define I40E_QUEUE_STATS_LEN(n) \
 	(((struct i40e_netdev_priv *)netdev_priv((n)))->vsi->num_queue_pairs \
 	    * 2 /* Tx and Rx together */                                     \
@@ -154,9 +176,17 @@ static struct i40e_stats i40e_gstrings_stats[] = {
 #define I40E_GLOBAL_STATS_LEN	ARRAY_SIZE(i40e_gstrings_stats)
 #define I40E_NETDEV_STATS_LEN   ARRAY_SIZE(i40e_gstrings_net_stats)
 #define I40E_MISC_STATS_LEN	ARRAY_SIZE(i40e_gstrings_misc_stats)
+#ifdef I40E_FCOE
+#define I40E_FCOE_STATS_LEN	ARRAY_SIZE(i40e_gstrings_fcoe_stats)
+#define I40E_VSI_STATS_LEN(n)	(I40E_NETDEV_STATS_LEN + \
+				 I40E_FCOE_STATS_LEN + \
+				 I40E_MISC_STATS_LEN + \
+				 I40E_QUEUE_STATS_LEN((n)))
+#else
 #define I40E_VSI_STATS_LEN(n)   (I40E_NETDEV_STATS_LEN + \
 				 I40E_MISC_STATS_LEN + \
 				 I40E_QUEUE_STATS_LEN((n)))
+#endif /* I40E_FCOE */
 #define I40E_PFC_STATS_LEN ( \
 		(FIELD_SIZEOF(struct i40e_pf, stats.priority_xoff_rx) + \
 		 FIELD_SIZEOF(struct i40e_pf, stats.priority_xon_rx) + \
@@ -1090,6 +1120,7 @@ static void i40e_get_ethtool_stats(struct net_device *netdev,
 				   struct ethtool_stats *stats, u64 *data)
 {
 	struct i40e_netdev_priv *np = netdev_priv(netdev);
+	struct i40e_ring *tx_ring, *rx_ring;
 	struct i40e_vsi *vsi = np->vsi;
 	struct i40e_pf *pf = vsi->back;
 	int i = 0;
@@ -1110,10 +1141,16 @@ static void i40e_get_ethtool_stats(struct net_device *netdev,
 		data[i++] = (i40e_gstrings_misc_stats[j].sizeof_stat ==
 			    sizeof(u64)) ? *(u64 *)p : *(u32 *)p;
 	}
+#ifdef I40E_FCOE
+	for (j = 0; j < I40E_FCOE_STATS_LEN; j++) {
+		p = (char *)vsi + i40e_gstrings_fcoe_stats[j].stat_offset;
+		data[i++] = (i40e_gstrings_fcoe_stats[j].sizeof_stat ==
+			sizeof(u64)) ? *(u64 *)p : *(u32 *)p;
+	}
+#endif
 	rcu_read_lock();
-	for (j = 0; j < vsi->num_queue_pairs; j++, i += 4) {
-		struct i40e_ring *tx_ring = ACCESS_ONCE(vsi->tx_rings[j]);
-		struct i40e_ring *rx_ring;
+	for (j = 0; j < vsi->num_queue_pairs; j++) {
+		tx_ring = ACCESS_ONCE(vsi->tx_rings[j]);
 
 		if (!tx_ring)
 			continue;
@@ -1124,14 +1161,16 @@ static void i40e_get_ethtool_stats(struct net_device *netdev,
 			data[i] = tx_ring->stats.packets;
 			data[i + 1] = tx_ring->stats.bytes;
 		} while (u64_stats_fetch_retry_bh(&tx_ring->syncp, start));
+		i += 2;
 
 		/* Rx ring is the 2nd half of the queue pair */
 		rx_ring = &tx_ring[1];
 		do {
 			start = u64_stats_fetch_begin_bh(&rx_ring->syncp);
-			data[i + 2] = rx_ring->stats.packets;
-			data[i + 3] = rx_ring->stats.bytes;
+			data[i] = rx_ring->stats.packets;
+			data[i + 1] = rx_ring->stats.bytes;
 		} while (u64_stats_fetch_retry_bh(&rx_ring->syncp, start));
+		i += 2;
 	}
 	rcu_read_unlock();
 	if (vsi != pf->vsi[pf->lan_vsi])
@@ -1190,6 +1229,13 @@ static void i40e_get_strings(struct net_device *netdev, u32 stringset,
 				 i40e_gstrings_misc_stats[i].stat_string);
 			p += ETH_GSTRING_LEN;
 		}
+#ifdef I40E_FCOE
+		for (i = 0; i < I40E_FCOE_STATS_LEN; i++) {
+			snprintf(p, ETH_GSTRING_LEN, "%s",
+				 i40e_gstrings_fcoe_stats[i].stat_string);
+			p += ETH_GSTRING_LEN;
+		}
+#endif
 		for (i = 0; i < vsi->num_queue_pairs; i++) {
 			snprintf(p, ETH_GSTRING_LEN, "tx-%u.tx_packets", i);
 			p += ETH_GSTRING_LEN;
@@ -1499,17 +1545,36 @@ static int i40e_set_coalesce(struct net_device *netdev,
 	if (ec->tx_max_coalesced_frames_irq || ec->rx_max_coalesced_frames_irq)
 		vsi->work_limit = ec->tx_max_coalesced_frames_irq;
 
+	vector = vsi->base_vector;
 	if ((ec->rx_coalesce_usecs >= (I40E_MIN_ITR << 1)) &&
-	    (ec->rx_coalesce_usecs <= (I40E_MAX_ITR << 1)))
+	    (ec->rx_coalesce_usecs <= (I40E_MAX_ITR << 1))) {
 		vsi->rx_itr_setting = ec->rx_coalesce_usecs;
-	else
+	} else if (ec->rx_coalesce_usecs == 0) {
+		vsi->rx_itr_setting = ec->rx_coalesce_usecs;
+		i40e_irq_dynamic_disable(vsi, vector);
+		if (ec->use_adaptive_rx_coalesce)
+			netif_info(pf, drv, netdev,
+				   "Rx-secs=0, need to disable adaptive-Rx for a complete disable\n");
+	} else {
+		netif_info(pf, drv, netdev,
+			   "Invalid value, Rx-usecs range is 0, 8-8160\n");
 		return -EINVAL;
+	}
 
 	if ((ec->tx_coalesce_usecs >= (I40E_MIN_ITR << 1)) &&
-	    (ec->tx_coalesce_usecs <= (I40E_MAX_ITR << 1)))
+	    (ec->tx_coalesce_usecs <= (I40E_MAX_ITR << 1))) {
 		vsi->tx_itr_setting = ec->tx_coalesce_usecs;
-	else
+	} else if (ec->tx_coalesce_usecs == 0) {
+		vsi->tx_itr_setting = ec->tx_coalesce_usecs;
+		i40e_irq_dynamic_disable(vsi, vector);
+		if (ec->use_adaptive_tx_coalesce)
+			netif_info(pf, drv, netdev,
+				   "Tx-secs=0, need to disable adaptive-Tx for a complete disable\n");
+	} else {
+		netif_info(pf, drv, netdev,
+			   "Invalid value, Tx-usecs range is 0, 8-8160\n");
 		return -EINVAL;
+	}
 
 	if (ec->use_adaptive_rx_coalesce)
 		vsi->rx_itr_setting |= I40E_ITR_DYNAMIC;
@@ -1521,7 +1586,6 @@ static int i40e_set_coalesce(struct net_device *netdev,
 	else
 		vsi->tx_itr_setting &= ~I40E_ITR_DYNAMIC;
 
-	vector = vsi->base_vector;
 	for (i = 0; i < vsi->num_q_vectors; i++, vector++) {
 		q_vector = vsi->q_vectors[i];
 		q_vector->rx.itr = ITR_TO_REG(vsi->rx_itr_setting);
@@ -1921,6 +1985,13 @@ static int i40e_del_fdir_entry(struct i40e_vsi *vsi,
 	struct i40e_pf *pf = vsi->back;
 	int ret = 0;
 
+	if (test_bit(__I40E_RESET_RECOVERY_PENDING, &pf->state) ||
+	    test_bit(__I40E_RESET_INTR_RECEIVED, &pf->state))
+		return -EBUSY;
+
+	if (test_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state))
+		return -EBUSY;
+
 	ret = i40e_update_ethtool_fdir_entry(vsi, NULL, fsp->location, cmd);
 
 	i40e_fdir_check_and_reenable(pf);
@@ -1954,6 +2025,13 @@ static int i40e_add_fdir_ethtool(struct i40e_vsi *vsi,
 	if (pf->auto_disable_flags & I40E_FLAG_FD_SB_ENABLED)
 		return -ENOSPC;
 
+	if (test_bit(__I40E_RESET_RECOVERY_PENDING, &pf->state) ||
+	    test_bit(__I40E_RESET_INTR_RECEIVED, &pf->state))
+		return -EBUSY;
+
+	if (test_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state))
+		return -EBUSY;
+
 	fsp = (struct ethtool_rx_flow_spec *)&cmd->fs;
 
 	if (fsp->location >= (pf->hw.func_caps.fd_filters_best_effort +
@@ -1983,7 +2061,7 @@ static int i40e_add_fdir_ethtool(struct i40e_vsi *vsi,
 	input->pctype = 0;
 	input->dest_vsi = vsi->id;
 	input->fd_status = I40E_FILTER_PROGRAM_DESC_FD_STATUS_FD_ID;
-	input->cnt_index = 0;
+	input->cnt_index  = pf->fd_sb_cnt_idx;
 	input->flow_type = fsp->flow_type;
 	input->ip4_proto = fsp->h_u.usr_ip4_spec.proto;
 
@@ -2158,5 +2236,5 @@ static const struct ethtool_ops i40e_ethtool_ops = {
 
 void i40e_set_ethtool_ops(struct net_device *netdev)
 {
-	SET_ETHTOOL_OPS(netdev, &i40e_ethtool_ops);
+	netdev->ethtool_ops = &i40e_ethtool_ops;
 }

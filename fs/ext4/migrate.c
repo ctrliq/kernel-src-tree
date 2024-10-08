@@ -501,7 +501,7 @@ int ext4_ext_migrate(struct inode *inode)
 	 * superblock modification.
 	 *
 	 * For the tmp_inode we already have committed the
-	 * trascation that created the inode. Later as and
+	 * transaction that created the inode. Later as and
 	 * when we add extents we extent the journal
 	 */
 	/*
@@ -512,7 +512,7 @@ int ext4_ext_migrate(struct inode *inode)
 	 * with i_data_sem held to prevent racing with block
 	 * allocation.
 	 */
-	down_read((&EXT4_I(inode)->i_data_sem));
+	down_read(&EXT4_I(inode)->i_data_sem);
 	ext4_set_inode_state(inode, EXT4_STATE_EXT_MIGRATE);
 	up_read((&EXT4_I(inode)->i_data_sem));
 

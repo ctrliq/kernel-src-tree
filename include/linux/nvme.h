@@ -70,13 +70,17 @@ extern unsigned char nvme_io_timeout;
  */
 struct nvme_dev {
 	struct list_head node;
-	struct nvme_queue **queues;
+	struct nvme_queue __rcu **queues;
+	unsigned short __percpu *io_queue;
 	u32 __iomem *dbs;
 	struct pci_dev *pci_dev;
 	struct dma_pool *prp_page_pool;
 	struct dma_pool *prp_small_pool;
 	int instance;
-	int queue_count;
+	unsigned queue_count;
+	unsigned online_queues;
+	unsigned max_qid;
+	int q_depth;
 	u32 db_stride;
 	u32 ctrl_config;
 	struct msix_entry *entry;
@@ -85,7 +89,7 @@ struct nvme_dev {
 	struct kref kref;
 	struct miscdevice miscdev;
 	struct work_struct reset_work;
-	struct notifier_block nb;
+	struct work_struct cpu_work;
 	char name[12];
 	char serial[20];
 	char model[40];
@@ -129,6 +133,7 @@ struct nvme_iod {
 	int length;		/* Of data, in bytes */
 	unsigned long start_time;
 	dma_addr_t first_dma;
+	struct list_head node;
 	struct scatterlist sg[0];
 };
 
@@ -144,17 +149,12 @@ static inline u64 nvme_block_nr(struct nvme_ns *ns, sector_t sector)
  */
 void nvme_free_iod(struct nvme_dev *dev, struct nvme_iod *iod);
 
-int nvme_setup_prps(struct nvme_dev *dev, struct nvme_common_command *cmd,
-			struct nvme_iod *iod, int total_len, gfp_t gfp);
+int nvme_setup_prps(struct nvme_dev *, struct nvme_iod *, int , gfp_t);
 struct nvme_iod *nvme_map_user_pages(struct nvme_dev *dev, int write,
 				unsigned long addr, unsigned length);
 void nvme_unmap_user_pages(struct nvme_dev *dev, int write,
 			struct nvme_iod *iod);
-struct nvme_queue *get_nvmeq(struct nvme_dev *dev);
-void put_nvmeq(struct nvme_queue *nvmeq);
-int nvme_submit_sync_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
-						u32 *result, unsigned timeout);
-int nvme_submit_flush_data(struct nvme_queue *nvmeq, struct nvme_ns *ns);
+int nvme_submit_io_cmd(struct nvme_dev *, struct nvme_command *, u32 *);
 int nvme_submit_admin_cmd(struct nvme_dev *, struct nvme_command *,
 							u32 *result);
 int nvme_identify(struct nvme_dev *, unsigned nsid, unsigned cns,

@@ -287,6 +287,10 @@ int i40e_init_pf_fcoe(struct i40e_pf *pf)
 	struct i40e_hw *hw = &pf->hw;
 	u32 val;
 
+	/* RHEL7.1 has FCoE disabled */
+	dev_info(&pf->pdev->dev, "FCoE capability is disabled\n");
+	return 0;
+
 	pf->flags &= ~I40E_FLAG_FCOE_ENABLED;
 	pf->num_fcoe_qps = 0;
 	pf->fcoe_hmc_cntx_num = 0;
@@ -1364,8 +1368,6 @@ static netdev_tx_t i40e_fcoe_xmit_frame(struct sk_buff *skb,
 	struct i40e_vsi *vsi = np->vsi;
 	struct i40e_ring *tx_ring = vsi->tx_rings[skb->queue_mapping];
 	struct i40e_tx_buffer *first;
-	__be16 protocol = skb->protocol;
-
 	u32 tx_flags = 0;
 	u8 hdr_len = 0;
 	u8 sof = 0;
@@ -1385,13 +1387,8 @@ static netdev_tx_t i40e_fcoe_xmit_frame(struct sk_buff *skb,
 	/* record the location of the first descriptor for this packet */
 	first = &tx_ring->tx_bi[tx_ring->next_to_use];
 
-	if (protocol == htons(ETH_P_8021Q)) {
-		struct vlan_ethhdr *veth = (struct vlan_ethhdr *)eth_hdr(skb);
-
-		protocol = veth->h_vlan_encapsulated_proto;
-	}
 	/* FIP is a regular L2 traffic w/o offload */
-	if (protocol == htons(ETH_P_FIP))
+	if (skb->protocol == htons(ETH_P_FIP))
 		goto out_send;
 
 	/* check sof and eof, only supports FC Class 2 or 3 */

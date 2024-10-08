@@ -162,12 +162,13 @@ struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb,
 	int flush = 1;
 
 	if (NAPI_GRO_CB(skb)->udp_mark ||
-	    (!skb->encapsulation && !NAPI_GRO_CB(skb)->csum_valid))
+	    (skb->ip_summed != CHECKSUM_PARTIAL &&
+	     NAPI_GRO_CB(skb)->csum_cnt == 0 &&
+	     !NAPI_GRO_CB(skb)->csum_valid))
 		goto out;
 
 	/* mark that this skb passed once through the udp gro layer */
 	NAPI_GRO_CB(skb)->udp_mark = 1;
-	NAPI_GRO_CB(skb)->encapsulation++;
 
 	rcu_read_lock();
 	uo_priv = rcu_dereference(udp_offload_base);
@@ -213,16 +214,25 @@ static struct sk_buff **udp4_gro_receive(struct sk_buff **head,
 {
 	struct udphdr *uh = udp_gro_udphdr(skb);
 
-	/* Don't bother verifying checksum if we're going to flush anyway. */
-	if (unlikely(!uh) ||
-	    (!NAPI_GRO_CB(skb)->flush &&
-	     skb_gro_checksum_validate_zero_check(skb, IPPROTO_UDP, uh->check,
-						  inet_gro_compute_pseudo))) {
-		NAPI_GRO_CB(skb)->flush = 1;
-		return NULL;
-	}
+	if (unlikely(!uh))
+		goto flush;
 
+	/* Don't bother verifying checksum if we're going to flush anyway. */
+	if (NAPI_GRO_CB(skb)->flush)
+		goto skip;
+
+	if (skb_gro_checksum_validate_zero_check(skb, IPPROTO_UDP, uh->check,
+						 inet_gro_compute_pseudo))
+		goto flush;
+	else if (uh->check)
+		skb_gro_checksum_try_convert(skb, IPPROTO_UDP, uh->check,
+					     inet_gro_compute_pseudo);
+skip:
 	return udp_gro_receive(head, skb, uh);
+
+flush:
+	NAPI_GRO_CB(skb)->flush = 1;
+	return NULL;
 }
 
 int udp_gro_complete(struct sk_buff *skb, int nhoff)

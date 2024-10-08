@@ -184,9 +184,15 @@ static ssize_t mei_read(struct file *file, char __user *ubuf,
 
 	dev = cl->dev;
 
+
 	mutex_lock(&dev->device_lock);
 	if (dev->dev_state != MEI_DEV_ENABLED) {
 		rets = -ENODEV;
+		goto out;
+	}
+
+	if (length == 0) {
+		rets = 0;
 		goto out;
 	}
 
@@ -338,11 +344,17 @@ static ssize_t mei_write(struct file *file, const char __user *ubuf,
 
 	id = mei_me_cl_by_id(dev, cl->me_client_id);
 	if (id < 0) {
-		rets = -ENODEV;
+		rets = -ENOTTY;
 		goto out;
 	}
-	if (length > dev->me_clients[id].props.max_msg_length || length <= 0) {
-		rets = -EMSGSIZE;
+
+	if (length == 0) {
+		rets = 0;
+		goto out;
+	}
+
+	if (length > dev->me_clients[id].props.max_msg_length) {
+		rets = -EFBIG;
 		goto out;
 	}
 

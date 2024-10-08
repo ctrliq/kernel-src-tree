@@ -1,6 +1,8 @@
 #ifndef __LINUX_LOCKREF_H
 #define __LINUX_LOCKREF_H
 
+#include <linux/rh_kabi.h>
+
 /*
  * Locked reference counts.
  *
@@ -18,9 +20,15 @@
 
 struct lockref {
 	union {
+#ifdef CONFIG_PPC64
+#ifdef CONFIG_CMPXCHG_LOCKREF
+		RH_KABI_EXTEND(aligned_u64 lock_count)
+#endif
+#else /* CONFIG_PPC64 */
 #ifdef CONFIG_CMPXCHG_LOCKREF
 		aligned_u64 lock_count;
 #endif
+#endif /* CONFIG_PPC64 */
 		struct {
 			spinlock_t lock;
 			unsigned int count;

@@ -1,7 +1,7 @@
 /*******************************************************************************
 
   Intel 82599 Virtual Function driver
-  Copyright(c) 1999 - 2012 Intel Corporation.
+  Copyright(c) 1999 - 2014 Intel Corporation.
 
   This program is free software; you can redistribute it and/or modify it
   under the terms and conditions of the GNU General Public License,
@@ -62,6 +62,29 @@ struct ixgbevf_rx_buffer {
 	dma_addr_t dma;
 };
 
+struct ixgbevf_stats {
+	u64 packets;
+	u64 bytes;
+#ifdef BP_EXTENDED_STATS
+	u64 yields;
+	u64 misses;
+	u64 cleaned;
+#endif
+};
+
+struct ixgbevf_tx_queue_stats {
+	u64 restart_queue;
+	u64 tx_busy;
+	u64 tx_done_old;
+};
+
+struct ixgbevf_rx_queue_stats {
+	u64 non_eop_descs;
+	u64 alloc_rx_page_failed;
+	u64 alloc_rx_buff_failed;
+	u64 csum_err;
+};
+
 struct ixgbevf_ring {
 	struct ixgbevf_ring *next;
 	struct net_device *netdev;
@@ -73,22 +96,19 @@ struct ixgbevf_ring {
 	unsigned int next_to_use;
 	unsigned int next_to_clean;
 
-	int queue_index; /* needed for multiqueue queue management */
 	union {
 		struct ixgbevf_tx_buffer *tx_buffer_info;
 		struct ixgbevf_rx_buffer *rx_buffer_info;
 	};
 
-	u64			total_bytes;
-	u64			total_packets;
-	struct u64_stats_sync	syncp;
+	struct ixgbevf_stats stats;
+	struct u64_stats_sync syncp;
+	union {
+		struct ixgbevf_tx_queue_stats tx_stats;
+		struct ixgbevf_rx_queue_stats rx_stats;
+	};
+
 	u64 hw_csum_rx_error;
-	u64 hw_csum_rx_good;
-#ifdef BP_EXTENDED_STATS
-	u64 bp_yields;
-	u64 bp_misses;
-	u64 bp_cleaned;
-#endif
 	u8 __iomem *tail;
 
 	u16 reg_idx; /* holds the special value that gets the hardware register
@@ -96,6 +116,7 @@ struct ixgbevf_ring {
 		      * for DCB and RSS modes */
 
 	u16 rx_buf_len;
+	int queue_index; /* needed for multiqueue queue management */
 };
 
 /* How many Rx Buffers do we bundle into one write to the hardware ? */
@@ -187,7 +208,7 @@ static inline bool ixgbevf_qv_lock_napi(struct ixgbevf_q_vector *q_vector)
 		q_vector->state |= IXGBEVF_QV_STATE_NAPI_YIELD;
 		rc = false;
 #ifdef BP_EXTENDED_STATS
-		q_vector->tx.ring->bp_yields++;
+		q_vector->tx.ring->stats.yields++;
 #endif
 	} else {
 		/* we don't care if someone yielded */
@@ -222,7 +243,7 @@ static inline bool ixgbevf_qv_lock_poll(struct ixgbevf_q_vector *q_vector)
 		q_vector->state |= IXGBEVF_QV_STATE_POLL_YIELD;
 		rc = false;
 #ifdef BP_EXTENDED_STATS
-		q_vector->rx.ring->bp_yields++;
+		q_vector->rx.ring->stats.yields++;
 #endif
 	} else {
 		/* preserve yield marks */
@@ -320,7 +341,6 @@ static inline void ixgbevf_write_tail(struct ixgbevf_ring *ring, u32 value)
 struct ixgbevf_adapter {
 	struct timer_list watchdog_timer;
 	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
-	u16 bd_number;
 	struct work_struct reset_task;
 	struct ixgbevf_q_vector *q_vector[MAX_MSIX_Q_VECTORS];
 
@@ -333,25 +353,18 @@ struct ixgbevf_adapter {
 	u32 eims_other;
 
 	/* TX */
-	struct ixgbevf_ring *tx_ring[MAX_TX_QUEUES]; /* One per active queue */
 	int num_tx_queues;
+	struct ixgbevf_ring *tx_ring[MAX_TX_QUEUES]; /* One per active queue */
 	u64 restart_queue;
-	u64 hw_csum_tx_good;
-	u64 lsc_int;
-	u64 hw_tso_ctxt;
-	u64 hw_tso6_ctxt;
 	u32 tx_timeout_count;
 
 	/* RX */
-	struct ixgbevf_ring *rx_ring[MAX_TX_QUEUES]; /* One per active queue */
 	int num_rx_queues;
+	struct ixgbevf_ring *rx_ring[MAX_TX_QUEUES]; /* One per active queue */
 	u64 hw_csum_rx_error;
 	u64 hw_rx_no_dma_resources;
-	u64 hw_csum_rx_good;
 	u64 non_eop_descs;
 	int num_msix_vectors;
-	struct msix_entry *msix_entries;
-
 	u32 alloc_rx_page_failed;
 	u32 alloc_rx_buff_failed;
 
@@ -363,6 +376,8 @@ struct ixgbevf_adapter {
 #define IXGBE_FLAG_IN_NETPOLL                   (u32)(1 << 1)
 #define IXGBEVF_FLAG_QUEUE_RESET_REQUESTED	(u32)(1 << 2)
 
+	struct msix_entry *msix_entries;
+
 	/* OS defined structs */
 	struct net_device *netdev;
 	struct pci_dev *pdev;
@@ -370,9 +385,11 @@ struct ixgbevf_adapter {
 	/* structs defined in ixgbe_vf.h */
 	struct ixgbe_hw hw;
 	u16 msg_enable;
-	struct ixgbevf_hw_stats stats;
+	u16 bd_number;
 	/* Interrupt Throttle Rate */
 	u32 eitr_param;
+
+	struct ixgbevf_hw_stats stats;
 
 	unsigned long state;
 	u64 tx_busy;
@@ -393,15 +410,18 @@ struct ixgbevf_adapter {
 	u32 link_speed;
 	bool link_up;
 
-	struct work_struct watchdog_task;
-
 	spinlock_t mbx_lock;
+
+	struct work_struct watchdog_task;
 };
 
 enum ixbgevf_state_t {
 	__IXGBEVF_TESTING,
 	__IXGBEVF_RESETTING,
-	__IXGBEVF_DOWN
+	__IXGBEVF_DOWN,
+	__IXGBEVF_DISABLED,
+	__IXGBEVF_REMOVING,
+	__IXGBEVF_WORK_INIT,
 };
 
 struct ixgbevf_cb {
@@ -422,27 +442,23 @@ extern const struct ixgbe_mbx_operations ixgbevf_mbx_ops;
 extern const char ixgbevf_driver_name[];
 extern const char ixgbevf_driver_version[];
 
-extern void ixgbevf_up(struct ixgbevf_adapter *adapter);
-extern void ixgbevf_down(struct ixgbevf_adapter *adapter);
-extern void ixgbevf_reinit_locked(struct ixgbevf_adapter *adapter);
-extern void ixgbevf_reset(struct ixgbevf_adapter *adapter);
-extern void ixgbevf_set_ethtool_ops(struct net_device *netdev);
-extern int ixgbevf_setup_rx_resources(struct ixgbevf_adapter *,
-				      struct ixgbevf_ring *);
-extern int ixgbevf_setup_tx_resources(struct ixgbevf_adapter *,
-				      struct ixgbevf_ring *);
-extern void ixgbevf_free_rx_resources(struct ixgbevf_adapter *,
-				      struct ixgbevf_ring *);
-extern void ixgbevf_free_tx_resources(struct ixgbevf_adapter *,
-				      struct ixgbevf_ring *);
-extern void ixgbevf_update_stats(struct ixgbevf_adapter *adapter);
-extern int ethtool_ioctl(struct ifreq *ifr);
+void ixgbevf_up(struct ixgbevf_adapter *adapter);
+void ixgbevf_down(struct ixgbevf_adapter *adapter);
+void ixgbevf_reinit_locked(struct ixgbevf_adapter *adapter);
+void ixgbevf_reset(struct ixgbevf_adapter *adapter);
+void ixgbevf_set_ethtool_ops(struct net_device *netdev);
+int ixgbevf_setup_rx_resources(struct ixgbevf_ring *);
+int ixgbevf_setup_tx_resources(struct ixgbevf_ring *);
+void ixgbevf_free_rx_resources(struct ixgbevf_ring *);
+void ixgbevf_free_tx_resources(struct ixgbevf_ring *);
+void ixgbevf_update_stats(struct ixgbevf_adapter *adapter);
+int ethtool_ioctl(struct ifreq *ifr);
 
-extern void ixgbe_napi_add_all(struct ixgbevf_adapter *adapter);
-extern void ixgbe_napi_del_all(struct ixgbevf_adapter *adapter);
+void ixgbe_napi_add_all(struct ixgbevf_adapter *adapter);
+void ixgbe_napi_del_all(struct ixgbevf_adapter *adapter);
 
 #ifdef DEBUG
-extern char *ixgbevf_get_hw_dev_name(struct ixgbe_hw *hw);
+char *ixgbevf_get_hw_dev_name(struct ixgbe_hw *hw);
 #define hw_dbg(hw, format, arg...) \
 	printk(KERN_DEBUG "%s: " format, ixgbevf_get_hw_dev_name(hw), ##arg)
 #else

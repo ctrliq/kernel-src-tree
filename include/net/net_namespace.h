@@ -25,6 +25,8 @@
 #include <net/netns/nftables.h>
 #include <net/netns/xfrm.h>
 
+#include <linux/rh_kabi.h>
+
 struct user_namespace;
 struct proc_dir_entry;
 struct net_device;
@@ -75,7 +77,6 @@ struct net {
 	struct hlist_head	*dev_index_head;
 	unsigned int		dev_base_seq;	/* protected by rtnl_mutex */
 	int			ifindex;
-	unsigned int		dev_unreg_count;
 
 	/* core fib_rules */
 	struct list_head	rules_ops;
@@ -122,7 +123,12 @@ struct net {
 #endif
 	struct netns_ipvs	*ipvs;
 	struct sock		*diag_nlsk;
-	atomic_t		fnhe_genid;
+	atomic_t		rt_genid;
+
+	RH_KABI_EXTEND(unsigned int	dev_unreg_count)
+	RH_KABI_EXTEND(atomic_t		fnhe_genid)
+	RH_KABI_EXTEND(int		sysctl_ip_no_pmtu_disc)
+	RH_KABI_EXTEND(int		sysctl_ip_fwd_use_pmtu)
 };
 
 /*
@@ -337,12 +343,12 @@ static inline void unregister_net_sysctl_table(struct ctl_table_header *header)
 
 static inline int rt_genid_ipv4(struct net *net)
 {
-	return atomic_read(&net->ipv4.rt_genid);
+	return atomic_read(&net->rt_genid);
 }
 
 static inline void rt_genid_bump_ipv4(struct net *net)
 {
-	atomic_inc(&net->ipv4.rt_genid);
+	atomic_inc(&net->rt_genid);
 }
 
 extern void (*__fib6_flush_trees)(struct net *net);

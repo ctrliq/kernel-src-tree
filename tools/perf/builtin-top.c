@@ -176,7 +176,7 @@ static void perf_top__record_precise_ip(struct perf_top *top,
 {
 	struct annotation *notes;
 	struct symbol *sym;
-	int err;
+	int err = 0;
 
 	if (he == NULL || he->ms.sym == NULL ||
 	    ((top->sym_filter_entry == NULL ||
@@ -190,9 +190,17 @@ static void perf_top__record_precise_ip(struct perf_top *top,
 		return;
 
 	ip = he->ms.map->map_ip(he->ms.map, ip);
-	err = hist_entry__inc_addr_samples(he, counter, ip);
+
+	if (ui__has_annotation())
+		err = hist_entry__inc_addr_samples(he, counter, ip);
 
 	pthread_mutex_unlock(&notes->lock);
+
+	/*
+	 * This function is now called with he->hists->lock held.
+	 * Release it before going to sleep.
+	 */
+	pthread_mutex_unlock(&he->hists->lock);
 
 	if (err == -ERANGE && !he->ms.map->erange_warned)
 		ui__warn_map_erange(he->ms.map, sym, ip);
@@ -201,6 +209,8 @@ static void perf_top__record_precise_ip(struct perf_top *top,
 		       sym->name);
 		sleep(1);
 	}
+
+	pthread_mutex_lock(&he->hists->lock);
 }
 
 static void perf_top__show_details(struct perf_top *top)
@@ -236,27 +246,6 @@ out_unlock:
 	pthread_mutex_unlock(&notes->lock);
 }
 
-static struct hist_entry *perf_evsel__add_hist_entry(struct perf_evsel *evsel,
-						     struct addr_location *al,
-						     struct perf_sample *sample)
-{
-	struct hist_entry *he;
-
-	pthread_mutex_lock(&evsel->hists.lock);
-	he = __hists__add_entry(&evsel->hists, al, NULL, NULL, NULL,
-				sample->period, sample->weight,
-				sample->transaction);
-	pthread_mutex_unlock(&evsel->hists.lock);
-	if (he == NULL)
-		return NULL;
-
-	hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
-	if (!he->filtered)
-		evsel->hists.stats.nr_non_filtered_samples++;
-
-	return he;
-}
-
 static void perf_top__print_sym_table(struct perf_top *top)
 {
 	char bf[160];
@@ -287,7 +276,7 @@ static void perf_top__print_sym_table(struct perf_top *top)
 		return;
 	}
 
-	hists__collapse_resort(&top->sym_evsel->hists);
+	hists__collapse_resort(&top->sym_evsel->hists, NULL);
 	hists__output_resort(&top->sym_evsel->hists);
 	hists__decay_entries(&top->sym_evsel->hists,
 			     top->hide_user_symbols,
@@ -485,7 +474,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 
 				fprintf(stderr, "\nAvailable events:");
 
-				list_for_each_entry(top->sym_evsel, &top->evlist->entries, node)
+				evlist__for_each(top->evlist, top->sym_evsel)
 					fprintf(stderr, "\n\t%d %s", top->sym_evsel->idx, perf_evsel__name(top->sym_evsel));
 
 				prompt_integer(&counter, "Enter details event counter");
@@ -496,7 +485,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 					sleep(1);
 					break;
 				}
-				list_for_each_entry(top->sym_evsel, &top->evlist->entries, node)
+				evlist__for_each(top->evlist, top->sym_evsel)
 					if (top->sym_evsel->idx == counter)
 						break;
 			} else
@@ -553,7 +542,7 @@ static void perf_top__sort_new_samples(void *arg)
 	if (t->evlist->selected != NULL)
 		t->sym_evsel = t->evlist->selected;
 
-	hists__collapse_resort(&t->sym_evsel->hists);
+	hists__collapse_resort(&t->sym_evsel->hists, NULL);
 	hists__output_resort(&t->sym_evsel->hists);
 	hists__decay_entries(&t->sym_evsel->hists,
 			     t->hide_user_symbols,
@@ -578,7 +567,7 @@ static void *display_thread_tui(void *arg)
 	 * Zooming in/out UIDs. For now juse use whatever the user passed
 	 * via --uid.
 	 */
-	list_for_each_entry(pos, &top->evlist->entries, node)
+	evlist__for_each(top->evlist, pos)
 		pos->hists.uid_filter_str = top->record_opts.target.uid_str;
 
 	perf_evlist__tui_browse_hists(top->evlist, help, &hbt, top->min_percent,
@@ -660,6 +649,26 @@ static int symbol_filter(struct map *map __maybe_unused, struct symbol *sym)
 	return 0;
 }
 
+static int hist_iter__top_callback(struct hist_entry_iter *iter,
+				   struct addr_location *al, bool single,
+				   void *arg)
+{
+	struct perf_top *top = arg;
+	struct hist_entry *he = iter->he;
+	struct perf_evsel *evsel = iter->evsel;
+
+	if (sort__has_sym && single) {
+		u64 ip = al->addr;
+
+		if (al->map)
+			ip = al->map->unmap_ip(al->map, ip);
+
+		perf_top__record_precise_ip(top, he, evsel->idx, ip);
+	}
+
+	return 0;
+}
+
 static void perf_event__process_sample(struct perf_tool *tool,
 				       const union perf_event *event,
 				       struct perf_evsel *evsel,
@@ -667,8 +676,6 @@ static void perf_event__process_sample(struct perf_tool *tool,
 				       struct machine *machine)
 {
 	struct perf_top *top = container_of(tool, struct perf_top, tool);
-	struct symbol *parent = NULL;
-	u64 ip = sample->ip;
 	struct addr_location al;
 	int err;
 
@@ -695,8 +702,7 @@ static void perf_event__process_sample(struct perf_tool *tool,
 	if (event->header.misc & PERF_RECORD_MISC_EXACT_IP)
 		top->exact_samples++;
 
-	if (perf_event__preprocess_sample(event, machine, &al, sample) < 0 ||
-	    al.filtered)
+	if (perf_event__preprocess_sample(event, machine, &al, sample) < 0)
 		return;
 
 	if (!top->kptr_restrict_warned &&
@@ -744,33 +750,23 @@ static void perf_event__process_sample(struct perf_tool *tool,
 	}
 
 	if (al.sym == NULL || !al.sym->ignore) {
-		struct hist_entry *he;
+		struct hist_entry_iter iter = {
+			.add_entry_cb = hist_iter__top_callback,
+		};
 
-		if ((sort__has_parent || symbol_conf.use_callchain) &&
-		    sample->callchain) {
-			err = machine__resolve_callchain(machine, evsel,
-							 al.thread, sample,
-							 &parent, &al,
-							 PERF_MAX_STACK_DEPTH);
-			if (err)
-				return;
-		}
+		if (symbol_conf.cumulate_callchain)
+			iter.ops = &hist_iter_cumulative;
+		else
+			iter.ops = &hist_iter_normal;
 
-		he = perf_evsel__add_hist_entry(evsel, &al, sample);
-		if (he == NULL) {
+		pthread_mutex_lock(&evsel->hists.lock);
+
+		err = hist_entry_iter__add(&iter, &al, evsel, sample,
+					   top->max_stack, top);
+		if (err < 0)
 			pr_err("Problem incrementing symbol period, skipping event\n");
-			return;
-		}
 
-		if (symbol_conf.use_callchain) {
-			err = callchain_append(he->callchain, &callchain_cursor,
-					       sample->period);
-			if (err)
-				return;
-		}
-
-		if (sort__has_sym)
-			perf_top__record_precise_ip(top, he, evsel->idx, ip);
+		pthread_mutex_unlock(&evsel->hists.lock);
 	}
 
 	return;
@@ -861,7 +857,7 @@ static int perf_top__start_counters(struct perf_top *top)
 
 	perf_evlist__config(evlist, opts);
 
-	list_for_each_entry(counter, &evlist->entries, node) {
+	evlist__for_each(evlist, counter) {
 try_again:
 		if (perf_evsel__open(counter, top->evlist->cpus,
 				     top->evlist->threads) < 0) {
@@ -1038,10 +1034,11 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 			.user_freq	= UINT_MAX,
 			.user_interval	= ULLONG_MAX,
 			.freq		= 4000, /* 4 KHz */
-			.target		     = {
+			.target		= {
 				.uses_mmap   = true,
 			},
 		},
+		.max_stack	     = PERF_MAX_STACK_DEPTH,
 		.sym_pcnt_filter     = 5,
 	};
 	struct record_opts *opts = &top.record_opts;
@@ -1095,6 +1092,8 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 	OPT_STRING('s', "sort", &sort_order, "key[,key2...]",
 		   "sort by key(s): pid, comm, dso, symbol, parent, cpu, srcline, ..."
 		   " Please refer the man page for the complete list."),
+	OPT_STRING(0, "fields", &field_order, "key[,keys...]",
+		   "output field(s): overhead, period, sample plus all of sort keys"),
 	OPT_BOOLEAN('n', "show-nr-samples", &symbol_conf.show_nr_samples,
 		    "Show a column with the number of samples"),
 	OPT_CALLBACK_NOOPT('g', NULL, &top.record_opts,
@@ -1103,6 +1102,11 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 	OPT_CALLBACK(0, "call-graph", &top.record_opts,
 		     "mode[,dump_size]", record_callchain_help,
 		     &parse_callchain_opt),
+	OPT_BOOLEAN(0, "children", &symbol_conf.cumulate_callchain,
+		    "Accumulate callchains of children and show total overhead as well"),
+	OPT_INTEGER(0, "max-stack", &top.max_stack,
+		    "Set the maximum stack depth when parsing the callchain. "
+		    "Default: " __stringify(PERF_MAX_STACK_DEPTH)),
 	OPT_CALLBACK(0, "ignore-callees", NULL, "regex",
 		   "ignore callees of these functions in call graphs",
 		   report_parse_ignore_callees_opt),
@@ -1118,6 +1122,8 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 		    "Interleave source code with assembly code (default)"),
 	OPT_BOOLEAN(0, "asm-raw", &symbol_conf.annotate_asm_raw,
 		    "Display raw encoding of assembly instructions (default)"),
+	OPT_BOOLEAN(0, "demangle-kernel", &symbol_conf.demangle_kernel,
+		    "Enable kernel symbol demangling"),
 	OPT_STRING(0, "objdump", &objdump_path, "path",
 		    "objdump binary to use for disassembly and annotations"),
 	OPT_STRING('M', "disassembler-style", &disassembler_style, "disassembler style",
@@ -1125,6 +1131,8 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 	OPT_STRING('u', "uid", &target->uid_str, "user", "user to profile"),
 	OPT_CALLBACK(0, "percent-limit", &top, "percent",
 		     "Don't show entries under that percent", parse_percent_limit),
+	OPT_CALLBACK(0, "percentage", NULL, "relative|absolute",
+		     "How to display percentage of filtered entries", parse_filter_percentage),
 	OPT_END()
 	};
 	const char * const top_usage[] = {
@@ -1142,18 +1150,18 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 	if (argc)
 		usage_with_options(top_usage, options);
 
-	if (sort_order == default_sort_order)
-		sort_order = "dso,symbol";
-
-	if (setup_sorting() < 0) {
-		parse_options_usage(top_usage, options, "s", 1);
-		goto out_delete_evlist;
-	}
-
+	sort__mode = SORT_MODE__TOP;
 	/* display thread wants entries to be collapsed in a different tree */
 	sort__need_collapse = 1;
 
-	perf_hpp__init();
+	if (setup_sorting() < 0) {
+		if (sort_order)
+			parse_options_usage(top_usage, options, "s", 1);
+		if (field_order)
+			parse_options_usage(sort_order ? NULL : top_usage,
+					    options, "fields", 0);
+		goto out_delete_evlist;
+	}
 
 	if (top.use_stdio)
 		use_browser = 0;
@@ -1202,6 +1210,11 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 	}
 
 	top.sym_evsel = perf_evlist__first(top.evlist);
+
+	if (!symbol_conf.use_callchain) {
+		symbol_conf.cumulate_callchain = false;
+		perf_hpp__cancel_cumulate();
+	}
 
 	symbol_conf.priv_size = sizeof(struct annotation);
 

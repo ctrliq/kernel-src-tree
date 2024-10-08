@@ -52,6 +52,7 @@ enum qlcnic_bc_commands {
 	QLCNIC_BC_CMD_CFG_GUEST_VLAN = 0x3,
 };
 
+#define QLCNIC_83XX_SRIOV_VF_MAX_MAC 2
 #define QLC_BC_CMD 1
 
 struct qlcnic_trans_list {
@@ -151,13 +152,14 @@ struct qlcnic_vf_info {
 	struct qlcnic_trans_list	rcv_pend;
 	struct qlcnic_adapter		*adapter;
 	struct qlcnic_vport		*vp;
-	struct mutex			vlan_list_lock;	/* Lock for VLAN list */
+	spinlock_t			vlan_list_lock;	/* Lock for VLAN list */
 };
 
 struct qlcnic_async_work_list {
 	struct list_head	list;
 	struct work_struct	work;
 	void			*ptr;
+	struct qlcnic_cmd_args	*cmd;
 };
 
 struct qlcnic_back_channel {
@@ -188,7 +190,6 @@ void qlcnic_sriov_vf_register_map(struct qlcnic_hardware_context *);
 int qlcnic_sriov_vf_init(struct qlcnic_adapter *, int);
 void qlcnic_sriov_vf_set_ops(struct qlcnic_adapter *);
 int qlcnic_sriov_func_to_index(struct qlcnic_adapter *, u8);
-int qlcnic_sriov_channel_cfg_cmd(struct qlcnic_adapter *, u8);
 void qlcnic_sriov_handle_bc_event(struct qlcnic_adapter *, u32);
 int qlcnic_sriov_cfg_bc_intr(struct qlcnic_adapter *, u8);
 void qlcnic_sriov_cleanup_async_list(struct qlcnic_back_channel *);
@@ -198,8 +199,6 @@ int __qlcnic_sriov_add_act_list(struct qlcnic_sriov *, struct qlcnic_vf_info *,
 int qlcnic_sriov_get_vf_vport_info(struct qlcnic_adapter *,
 				   struct qlcnic_info *, u16);
 int qlcnic_sriov_cfg_vf_guest_vlan(struct qlcnic_adapter *, u16, u8);
-int qlcnic_sriov_vf_shutdown(struct pci_dev *);
-int qlcnic_sriov_vf_resume(struct qlcnic_adapter *);
 void qlcnic_sriov_free_vlans(struct qlcnic_adapter *);
 void qlcnic_sriov_alloc_vlans(struct qlcnic_adapter *);
 bool qlcnic_sriov_check_any_vlan(struct qlcnic_vf_info *);

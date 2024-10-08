@@ -687,6 +687,7 @@ extern int __init efi_setup_pcdp_console(char *);
 #define EFI_MEMMAP		4	/* Can we use EFI memory map? */
 #define EFI_64BIT		5	/* Is the firmware 64-bit? */
 #define EFI_SECURE_BOOT		6	/* Area we in Secure Boot mode? */
+#define EFI_ARCH_1		7	/* First arch-specific bit */
 
 #ifdef CONFIG_EFI
 # ifdef CONFIG_X86
@@ -905,5 +906,37 @@ int efivars_sysfs_init(void);
 #define EFIVARS_DATA_SIZE_MAX 1024
 
 #endif /* CONFIG_EFI_VARS */
+
+#ifdef CONFIG_EFI_RUNTIME_MAP
+int efi_runtime_map_init(struct kobject *);
+void efi_runtime_map_setup(void *, int, u32);
+int efi_get_runtime_map_size(void);
+int efi_get_runtime_map_desc_size(void);
+int efi_runtime_map_copy(void *buf, size_t bufsz);
+#else
+static inline int efi_runtime_map_init(struct kobject *kobj)
+{
+	return 0;
+}
+
+static inline void
+efi_runtime_map_setup(void *map, int nr_entries, u32 desc_size) {}
+
+static inline int efi_get_runtime_map_size(void)
+{
+	return 0;
+}
+
+static inline int efi_get_runtime_map_desc_size(void)
+{
+	return 0;
+}
+
+static inline int efi_runtime_map_copy(void *buf, size_t bufsz)
+{
+	return 0;
+}
+
+#endif
 
 #endif /* _LINUX_EFI_H */

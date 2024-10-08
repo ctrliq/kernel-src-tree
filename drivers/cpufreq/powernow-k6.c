@@ -145,6 +145,7 @@ static int powernow_k6_target(struct cpufreq_policy *policy,
 static int powernow_k6_cpu_init(struct cpufreq_policy *policy)
 {
 	unsigned int i, f;
+	int result;
 
 	if (policy->cpu != 0)
 		return -ENODEV;
@@ -164,8 +165,15 @@ static int powernow_k6_cpu_init(struct cpufreq_policy *policy)
 
 	/* cpuinfo and default policy values */
 	policy->cpuinfo.transition_latency = 200000;
+	policy->cur = busfreq * max_multiplier;
 
-	return cpufreq_table_validate_and_show(policy, clock_ratio);
+	result = cpufreq_frequency_table_cpuinfo(policy, clock_ratio);
+	if (result)
+		return result;
+
+	cpufreq_frequency_table_get_attr(clock_ratio, policy->cpu);
+
+	return 0;
 }
 
 

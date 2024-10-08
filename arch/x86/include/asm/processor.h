@@ -30,6 +30,8 @@ struct mm_struct;
 #include <linux/err.h>
 #include <linux/irqflags.h>
 
+#include <linux/rh_kabi.h>
+
 /*
  * We handle most unaligned accesses in hardware.  On the other hand
  * unaligned DMA can be quite expensive on some Nehalem processors.
@@ -404,9 +406,9 @@ struct xsave_struct {
 	struct i387_fxsave_struct i387;
 	struct xsave_hdr_struct xsave_hdr;
 	struct ymmh_struct ymmh;
-	struct lwp_struct lwp;
-	struct bndregs_struct bndregs;
-	struct bndcsr_struct bndcsr;
+	RH_KABI_EXTEND(struct lwp_struct lwp)
+	RH_KABI_EXTEND(struct bndregs_struct bndregs)
+	RH_KABI_EXTEND(struct bndcsr_struct bndcsr)
 	/* new processor state extensions will go here */
 } __attribute__ ((packed, aligned (64)));
 
@@ -945,35 +947,6 @@ extern int get_tsc_mode(unsigned long adr);
 extern int set_tsc_mode(unsigned int val);
 
 extern u16 amd_get_nb_id(int cpu);
-
-struct aperfmperf {
-	u64 aperf, mperf;
-};
-
-static inline void get_aperfmperf(struct aperfmperf *am)
-{
-	WARN_ON_ONCE(!boot_cpu_has(X86_FEATURE_APERFMPERF));
-
-	rdmsrl(MSR_IA32_APERF, am->aperf);
-	rdmsrl(MSR_IA32_MPERF, am->mperf);
-}
-
-#define APERFMPERF_SHIFT 10
-
-static inline
-unsigned long calc_aperfmperf_ratio(struct aperfmperf *old,
-				    struct aperfmperf *new)
-{
-	u64 aperf = new->aperf - old->aperf;
-	u64 mperf = new->mperf - old->mperf;
-	unsigned long ratio = aperf;
-
-	mperf >>= APERFMPERF_SHIFT;
-	if (mperf)
-		ratio = div64_u64(aperf, mperf);
-
-	return ratio;
-}
 
 static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
 {

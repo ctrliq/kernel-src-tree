@@ -65,7 +65,7 @@ static irqreturn_t xen_reschedule_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static void __cpuinit cpu_bringup(void)
+static void cpu_bringup(void)
 {
 	int cpu;
 
@@ -97,7 +97,7 @@ static void __cpuinit cpu_bringup(void)
 	wmb();			/* make sure everything is out */
 }
 
-static void __cpuinit cpu_bringup_and_idle(void)
+static void cpu_bringup_and_idle(void)
 {
 	cpu_bringup();
 	cpu_startup_entry(CPUHP_ONLINE);
@@ -335,13 +335,15 @@ static void __init xen_smp_prepare_cpus(unsigned int max_cpus)
 		set_cpu_present(cpu, true);
 }
 
-static int __cpuinit
+static int
 cpu_initialize_context(unsigned int cpu, struct task_struct *idle)
 {
 	struct vcpu_guest_context *ctxt;
 	struct desc_struct *gdt;
 	unsigned long gdt_mfn;
 
+	/* used to tell cpu_init() that it can proceed with initialization */
+	cpumask_set_cpu(cpu, cpu_callout_mask);
 	if (cpumask_test_and_set_cpu(cpu, xen_cpu_initialized_map))
 		return 0;
 
@@ -406,7 +408,7 @@ cpu_initialize_context(unsigned int cpu, struct task_struct *idle)
 	return 0;
 }
 
-static int __cpuinit xen_cpu_up(unsigned int cpu, struct task_struct *idle)
+static int xen_cpu_up(unsigned int cpu, struct task_struct *idle)
 {
 	int rc;
 
@@ -418,6 +420,9 @@ static int __cpuinit xen_cpu_up(unsigned int cpu, struct task_struct *idle)
 	per_cpu(kernel_stack, cpu) =
 		(unsigned long)task_stack_page(idle) -
 		KERNEL_STACK_OFFSET + THREAD_SIZE;
+	per_cpu(__kernel_stack_70__, cpu) =
+		(unsigned long)task_stack_page(idle) -
+		KERNEL_STACK_OFFSET + THREAD_SIZE - 8192;
 #endif
 	xen_setup_runstate_info(cpu);
 	xen_setup_timer(cpu);
@@ -479,7 +484,7 @@ static void xen_cpu_die(unsigned int cpu)
 	xen_teardown_timer(cpu);
 }
 
-static void __cpuinit xen_play_dead(void) /* used only with HOTPLUG_CPU */
+static void xen_play_dead(void) /* used only with HOTPLUG_CPU */
 {
 	play_dead_common();
 	HYPERVISOR_vcpu_op(VCPUOP_down, smp_processor_id(), NULL);
@@ -699,7 +704,7 @@ static void __init xen_hvm_smp_prepare_cpus(unsigned int max_cpus)
 	xen_init_lock_cpu(0);
 }
 
-static int __cpuinit xen_hvm_cpu_up(unsigned int cpu, struct task_struct *tidle)
+static int xen_hvm_cpu_up(unsigned int cpu, struct task_struct *tidle)
 {
 	int rc;
 	/*

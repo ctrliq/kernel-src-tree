@@ -258,7 +258,7 @@ int qlcnic_82xx_fw_cmd_create_rx_ctx(struct qlcnic_adapter *adapter)
 	int err;
 
 	nrds_rings = adapter->max_rds_rings;
-	nsds_rings = adapter->max_sds_rings;
+	nsds_rings = adapter->drv_sds_rings;
 
 	rq_size = SIZEOF_HOSTRQ_RX(struct qlcnic_hostrq_rx_ctx, nrds_rings,
 				   nsds_rings);
@@ -436,14 +436,14 @@ int qlcnic_82xx_fw_cmd_create_tx_ctx(struct qlcnic_adapter *adapter,
 	*(tx_ring->hw_consumer) = 0;
 
 	rq_size = SIZEOF_HOSTRQ_TX(struct qlcnic_hostrq_tx_ctx);
-	rq_addr = dma_alloc_coherent(&adapter->pdev->dev, rq_size,
-				     &rq_phys_addr, GFP_KERNEL | __GFP_ZERO);
+	rq_addr = dma_zalloc_coherent(&adapter->pdev->dev, rq_size,
+				      &rq_phys_addr, GFP_KERNEL);
 	if (!rq_addr)
 		return -ENOMEM;
 
 	rsp_size = SIZEOF_CARDRSP_TX(struct qlcnic_cardrsp_tx_ctx);
-	rsp_addr = dma_alloc_coherent(&adapter->pdev->dev, rsp_size,
-				      &rsp_phys_addr, GFP_KERNEL | __GFP_ZERO);
+	rsp_addr = dma_zalloc_coherent(&adapter->pdev->dev, rsp_size,
+				       &rsp_phys_addr, GFP_KERNEL);
 	if (!rsp_addr) {
 		err = -ENOMEM;
 		goto out_free_rq;
@@ -463,7 +463,7 @@ int qlcnic_82xx_fw_cmd_create_tx_ctx(struct qlcnic_adapter *adapter,
 
 	if (qlcnic_check_multi_tx(adapter) &&
 	    !adapter->ahw->diag_test) {
-		temp_nsds_rings = adapter->max_sds_rings;
+		temp_nsds_rings = adapter->drv_sds_rings;
 		index = temp_nsds_rings + ring;
 		msix_id = ahw->intr_tbl[index].id;
 		prq->msi_index = cpu_to_le16(msix_id);
@@ -500,7 +500,7 @@ int qlcnic_82xx_fw_cmd_create_tx_ctx(struct qlcnic_adapter *adapter,
 		if (qlcnic_check_multi_tx(adapter) &&
 		    !adapter->ahw->diag_test &&
 		    (adapter->flags & QLCNIC_MSIX_ENABLED)) {
-			index = adapter->max_sds_rings + ring;
+			index = adapter->drv_sds_rings + ring;
 			intr_mask = ahw->intr_tbl[index].src;
 			tx_ring->crb_intr_mask = ahw->pci_base0 + intr_mask;
 		}
@@ -570,7 +570,7 @@ int qlcnic_alloc_hw_resources(struct qlcnic_adapter *adapter)
 
 	recv_ctx = adapter->recv_ctx;
 
-	for (ring = 0; ring < adapter->max_drv_tx_rings; ring++) {
+	for (ring = 0; ring < adapter->drv_tx_rings; ring++) {
 		tx_ring = &adapter->tx_ring[ring];
 		ptr = (__le32 *)dma_alloc_coherent(&pdev->dev, sizeof(u32),
 						   &tx_ring->hw_cons_phys_addr,
@@ -604,7 +604,7 @@ int qlcnic_alloc_hw_resources(struct qlcnic_adapter *adapter)
 
 	}
 
-	for (ring = 0; ring < adapter->max_sds_rings; ring++) {
+	for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
 		sds_ring = &recv_ctx->sds_rings[ring];
 
 		addr = dma_alloc_coherent(&adapter->pdev->dev,
@@ -652,7 +652,7 @@ int qlcnic_fw_create_ctx(struct qlcnic_adapter *dev)
 	if (err)
 		goto err_out;
 
-	for (ring = 0; ring < dev->max_drv_tx_rings; ring++) {
+	for (ring = 0; ring < dev->drv_tx_rings; ring++) {
 		err = qlcnic_fw_cmd_create_tx_ctx(dev,
 						  &dev->tx_ring[ring],
 						  ring);
@@ -691,7 +691,7 @@ void qlcnic_fw_destroy_ctx(struct qlcnic_adapter *adapter)
 
 	if (test_and_clear_bit(__QLCNIC_FW_ATTACHED, &adapter->state)) {
 		qlcnic_fw_cmd_del_rx_ctx(adapter);
-		for (ring = 0; ring < adapter->max_drv_tx_rings; ring++)
+		for (ring = 0; ring < adapter->drv_tx_rings; ring++)
 			qlcnic_fw_cmd_del_tx_ctx(adapter,
 						 &adapter->tx_ring[ring]);
 
@@ -721,7 +721,7 @@ void qlcnic_free_hw_resources(struct qlcnic_adapter *adapter)
 
 	recv_ctx = adapter->recv_ctx;
 
-	for (ring = 0; ring < adapter->max_drv_tx_rings; ring++) {
+	for (ring = 0; ring < adapter->drv_tx_rings; ring++) {
 		tx_ring = &adapter->tx_ring[ring];
 		if (tx_ring->hw_consumer != NULL) {
 			dma_free_coherent(&adapter->pdev->dev, sizeof(u32),
@@ -752,7 +752,7 @@ void qlcnic_free_hw_resources(struct qlcnic_adapter *adapter)
 		}
 	}
 
-	for (ring = 0; ring < adapter->max_sds_rings; ring++) {
+	for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
 		sds_ring = &recv_ctx->sds_rings[ring];
 
 		if (sds_ring->desc_head != NULL) {
@@ -853,8 +853,8 @@ int qlcnic_82xx_get_nic_info(struct qlcnic_adapter *adapter,
 	struct qlcnic_cmd_args cmd;
 	size_t  nic_size = sizeof(struct qlcnic_info_le);
 
-	nic_info_addr = dma_alloc_coherent(&adapter->pdev->dev, nic_size,
-					   &nic_dma_t, GFP_KERNEL | __GFP_ZERO);
+	nic_info_addr = dma_zalloc_coherent(&adapter->pdev->dev, nic_size,
+					    &nic_dma_t, GFP_KERNEL);
 	if (!nic_info_addr)
 		return -ENOMEM;
 
@@ -907,8 +907,8 @@ int qlcnic_82xx_set_nic_info(struct qlcnic_adapter *adapter,
 	if (adapter->ahw->op_mode != QLCNIC_MGMT_FUNC)
 		return err;
 
-	nic_info_addr = dma_alloc_coherent(&adapter->pdev->dev, nic_size,
-					   &nic_dma_t, GFP_KERNEL | __GFP_ZERO);
+	nic_info_addr = dma_zalloc_coherent(&adapter->pdev->dev, nic_size,
+					    &nic_dma_t, GFP_KERNEL);
 	if (!nic_info_addr)
 		return -ENOMEM;
 
@@ -962,9 +962,8 @@ int qlcnic_82xx_get_pci_info(struct qlcnic_adapter *adapter,
 	void *pci_info_addr;
 	int err = 0, i;
 
-	pci_info_addr = dma_alloc_coherent(&adapter->pdev->dev, pci_size,
-					   &pci_info_dma_t,
-					   GFP_KERNEL | __GFP_ZERO);
+	pci_info_addr = dma_zalloc_coherent(&adapter->pdev->dev, pci_size,
+					    &pci_info_dma_t, GFP_KERNEL);
 	if (!pci_info_addr)
 		return -ENOMEM;
 
@@ -1077,8 +1076,8 @@ int qlcnic_get_port_stats(struct qlcnic_adapter *adapter, const u8 func,
 		return -EIO;
 	}
 
-	stats_addr = dma_alloc_coherent(&adapter->pdev->dev, stats_size,
-					&stats_dma_t, GFP_KERNEL | __GFP_ZERO);
+	stats_addr = dma_zalloc_coherent(&adapter->pdev->dev, stats_size,
+					 &stats_dma_t, GFP_KERNEL);
 	if (!stats_addr)
 		return -ENOMEM;
 
@@ -1133,8 +1132,8 @@ int qlcnic_get_mac_stats(struct qlcnic_adapter *adapter,
 	if (mac_stats == NULL)
 		return -ENOMEM;
 
-	stats_addr = dma_alloc_coherent(&adapter->pdev->dev, stats_size,
-					&stats_dma_t, GFP_KERNEL | __GFP_ZERO);
+	stats_addr = dma_zalloc_coherent(&adapter->pdev->dev, stats_size,
+					 &stats_dma_t, GFP_KERNEL);
 	if (!stats_addr)
 		return -ENOMEM;
 

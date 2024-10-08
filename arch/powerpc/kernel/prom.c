@@ -33,6 +33,7 @@
 #include <linux/irq.h>
 #include <linux/memblock.h>
 #include <linux/of.h>
+#include <linux/libfdt.h>
 
 #include <asm/prom.h>
 #include <asm/rtas.h>
@@ -117,14 +118,14 @@ static void __init move_device_tree(void)
 	DBG("-> move_device_tree\n");
 
 	start = __pa(initial_boot_params);
-	size = be32_to_cpu(initial_boot_params->totalsize);
+	size = fdt_totalsize(initial_boot_params);
 
 	if ((memory_limit && (start + size) > PHYSICAL_START + memory_limit) ||
 			overlaps_crashkernel(start, size) ||
 			overlaps_initrd(start, size)) {
 		p = __va(memblock_alloc(size, PAGE_SIZE));
 		memcpy(p, initial_boot_params, size);
-		initial_boot_params = (struct boot_param_header *)p;
+		initial_boot_params = p;
 		DBG("Moved device tree to 0x%p\n", p);
 	}
 
@@ -324,9 +325,9 @@ static int __init early_init_dt_scan_cpus(unsigned long node,
 		 * version 2 of the kexec param format adds the phys cpuid of
 		 * booted proc.
 		 */
-		if (be32_to_cpu(initial_boot_params->version) >= 2) {
+		if (fdt_version(initial_boot_params) >= 2) {
 			if (be32_to_cpu(intserv[i]) ==
-			    be32_to_cpu(initial_boot_params->boot_cpuid_phys)) {
+			    fdt_boot_cpuid_phys(initial_boot_params)) {
 				found = boot_cpu_count;
 				found_thread = i;
 			}
@@ -598,7 +599,7 @@ static void __init early_reserve_mem(void)
 	unsigned long self_size;
 
 	reserve_map = (__be64 *)(((unsigned long)initial_boot_params) +
-			be32_to_cpu(initial_boot_params->off_mem_rsvmap));
+			fdt_off_mem_rsvmap(initial_boot_params));
 
 	/* before we do anything, lets reserve the dt blob */
 	self_base = __pa((unsigned long)initial_boot_params);
@@ -678,13 +679,6 @@ void __init early_init_devtree(void *params)
 	/* scan tree to see if dump is active during last boot */
 	of_scan_flat_dt(early_init_dt_scan_fw_dump, NULL);
 #endif
-
-	/* Pre-initialize the cmd_line with the content of boot_commmand_line,
-	 * which will be empty except when the content of the variable has
-	 * been overriden by a bootloading mechanism. This happens typically
-	 * with HAL takeover
-	 */
-	strlcpy(cmd_line, boot_command_line, COMMAND_LINE_SIZE);
 
 	/* Retrieve various informations from the /chosen node of the
 	 * device-tree, including the platform type, initrd location and
@@ -922,45 +916,63 @@ static int __init prom_reconfig_setup(void)
 __initcall(prom_reconfig_setup);
 #endif
 
+bool arch_match_cpu_phys_id(int cpu, u64 phys_id)
+{
+	return (int)phys_id == get_hard_smp_processor_id(cpu);
+}
+
+static bool __of_find_n_match_cpu_property(struct device_node *cpun,
+			const char *prop_name, int cpu, unsigned int *thread)
+{
+	const __be32 *cell;
+	int ac, prop_len, tid;
+	u64 hwid;
+
+	ac = of_n_addr_cells(cpun);
+	cell = of_get_property(cpun, prop_name, &prop_len);
+	if (!cell)
+		return false;
+	prop_len /= sizeof(*cell);
+	for (tid = 0; tid < prop_len; tid++) {
+		hwid = of_read_number(cell, ac);
+		if (arch_match_cpu_phys_id(cpu, hwid)) {
+			if (thread)
+				*thread = tid;
+			return true;
+		}
+		cell += ac;
+	}
+	return false;
+}
+
 /* Find the device node for a given logical cpu number, also returns the cpu
  * local thread number (index in ibm,interrupt-server#s) if relevant and
  * asked for (non NULL)
  */
 struct device_node *of_get_cpu_node(int cpu, unsigned int *thread)
 {
-	int hardid;
-	struct device_node *np;
+	struct device_node *cpun, *cpus;
 
-	hardid = get_hard_smp_processor_id(cpu);
+	cpus = of_find_node_by_path("/cpus");
+	if (!cpus) {
+		pr_warn("Missing cpus node, bailing out\n");
+		return NULL;
+	}
 
-	for_each_node_by_type(np, "cpu") {
-		const __be32 *intserv;
-		unsigned int plen, t;
+	for_each_child_of_node(cpus, cpun) {
+		if (of_node_cmp(cpun->type, "cpu"))
+			continue;
 
-		/* Check for ibm,ppc-interrupt-server#s. If it doesn't exist
-		 * fallback to "reg" property and assume no threads
+		/* Check for non-standard "ibm,ppc-interrupt-server#s" property
+		 * for thread ids on PowerPC. If it doesn't exist fallback to
+		 * standard "reg" property.
 		 */
-		intserv = of_get_property(np, "ibm,ppc-interrupt-server#s",
-				&plen);
-		if (intserv == NULL) {
-			const __be32 *reg = of_get_property(np, "reg", NULL);
-			if (reg == NULL)
-				continue;
-			if (be32_to_cpup(reg) == hardid) {
-				if (thread)
-					*thread = 0;
-				return np;
-			}
-		} else {
-			plen /= sizeof(u32);
-			for (t = 0; t < plen; t++) {
-				if (hardid == be32_to_cpu(intserv[t])) {
-					if (thread)
-						*thread = t;
-					return np;
-				}
-			}
-		}
+		if (__of_find_n_match_cpu_property(cpun,
+				"ibm,ppc-interrupt-server#s", cpu, thread))
+			return cpun;
+
+		if (__of_find_n_match_cpu_property(cpun, "reg", cpu, thread))
+			return cpun;
 	}
 	return NULL;
 }

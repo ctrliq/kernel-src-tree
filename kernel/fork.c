@@ -1056,6 +1056,7 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 	sig->curr_target = tsk;
 	init_sigpending(&sig->shared_pending);
 	INIT_LIST_HEAD(&sig->posix_timers);
+	seqlock_init(&sig->stats_lock);
 
 	hrtimer_init(&sig->real_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	sig->real_timer.function = it_real_fn;
@@ -1269,7 +1270,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 
 	posix_cpu_timers_init(p);
 
-	ktime_get_ts(&p->start_time);
+	do_posix_clock_monotonic_gettime(&p->start_time);
 	p->real_start_time = p->start_time;
 	monotonic_to_bootbased(&p->real_start_time);
 	p->io_context = NULL;
@@ -1561,7 +1562,7 @@ static inline void init_idle_pids(struct pid_link *links)
 	}
 }
 
-struct task_struct * __cpuinit fork_idle(int cpu)
+struct task_struct *fork_idle(int cpu)
 {
 	struct task_struct *task;
 	task = copy_process(CLONE_VM, 0, 0, NULL, &init_struct_pid, 0);

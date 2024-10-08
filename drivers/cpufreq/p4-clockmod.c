@@ -92,49 +92,29 @@ static int cpufreq_p4_setdc(unsigned int cpu, unsigned int newstate)
 
 
 static struct cpufreq_frequency_table p4clockmod_table[] = {
-	{DC_RESV, CPUFREQ_ENTRY_INVALID},
-	{DC_DFLT, 0},
-	{DC_25PT, 0},
-	{DC_38PT, 0},
-	{DC_50PT, 0},
-	{DC_64PT, 0},
-	{DC_75PT, 0},
-	{DC_88PT, 0},
-	{DC_DISABLE, 0},
-	{DC_RESV, CPUFREQ_TABLE_END},
+	{0, DC_RESV, CPUFREQ_ENTRY_INVALID},
+	{0, DC_DFLT, 0},
+	{0, DC_25PT, 0},
+	{0, DC_38PT, 0},
+	{0, DC_50PT, 0},
+	{0, DC_64PT, 0},
+	{0, DC_75PT, 0},
+	{0, DC_88PT, 0},
+	{0, DC_DISABLE, 0},
+	{0, DC_RESV, CPUFREQ_TABLE_END},
 };
 
 
-static int cpufreq_p4_target(struct cpufreq_policy *policy,
-			     unsigned int target_freq,
-			     unsigned int relation)
+static int cpufreq_p4_target(struct cpufreq_policy *policy, unsigned int index)
 {
-	unsigned int    newstate = DC_RESV;
-	struct cpufreq_freqs freqs;
 	int i;
-
-	if (cpufreq_frequency_table_target(policy, &p4clockmod_table[0],
-				target_freq, relation, &newstate))
-		return -EINVAL;
-
-	freqs.old = cpufreq_p4_get(policy->cpu);
-	freqs.new = stock_freq * p4clockmod_table[newstate].driver_data / 8;
-
-	if (freqs.new == freqs.old)
-		return 0;
-
-	/* notifiers */
-	cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
 
 	/* run on each logical CPU,
 	 * see section 13.15.3 of IA32 Intel Architecture Software
 	 * Developer's Manual, Volume 3
 	 */
 	for_each_cpu(i, policy->cpus)
-		cpufreq_p4_setdc(i, p4clockmod_table[newstate].driver_data);
-
-	/* notifiers */
-	cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
+		cpufreq_p4_setdc(i, p4clockmod_table[index].driver_data);
 
 	return 0;
 }
@@ -255,9 +235,8 @@ static unsigned int cpufreq_p4_get(unsigned int cpu)
 
 static struct cpufreq_driver p4clockmod_driver = {
 	.verify		= cpufreq_generic_frequency_table_verify,
-	.target		= cpufreq_p4_target,
+	.target_index	= cpufreq_p4_target,
 	.init		= cpufreq_p4_cpu_init,
-	.exit		= cpufreq_generic_exit,
 	.get		= cpufreq_p4_get,
 	.name		= "p4-clockmod",
 	.attr		= cpufreq_generic_attr,

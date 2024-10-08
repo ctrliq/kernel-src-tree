@@ -283,6 +283,8 @@ static DEFINE_PCI_DEVICE_TABLE(cxgb4_pci_tbl) = {
 	CH_DEVICE(0x5084, 4),
 	CH_DEVICE(0x5085, 4),
 	CH_DEVICE(0x5086, 4),
+	CH_DEVICE(0x5087, 4),
+	CH_DEVICE(0x5088, 4),
 	CH_DEVICE(0x5401, 4),
 	CH_DEVICE(0x5402, 4),
 	CH_DEVICE(0x5403, 4),
@@ -311,6 +313,8 @@ static DEFINE_PCI_DEVICE_TABLE(cxgb4_pci_tbl) = {
 	CH_DEVICE(0x5484, 4),
 	CH_DEVICE(0x5485, 4),
 	CH_DEVICE(0x5486, 4),
+	CH_DEVICE(0x5487, 4),
+	CH_DEVICE(0x5488, 4),
 	{ 0, }
 };
 
@@ -3496,6 +3500,77 @@ unsigned int cxgb4_best_mtu(const unsigned short *mtus, unsigned short mtu,
 EXPORT_SYMBOL(cxgb4_best_mtu);
 
 /**
+ *     cxgb4_best_aligned_mtu - find best MTU, [hopefully] data size aligned
+ *     @mtus: the HW MTU table
+ *     @header_size: Header Size
+ *     @data_size_max: maximum Data Segment Size
+ *     @data_size_align: desired Data Segment Size Alignment (2^N)
+ *     @mtu_idxp: HW MTU Table Index return value pointer (possibly NULL)
+ *
+ *     Similar to cxgb4_best_mtu() but instead of searching the Hardware
+ *     MTU Table based solely on a Maximum MTU parameter, we break that
+ *     parameter up into a Header Size and Maximum Data Segment Size, and
+ *     provide a desired Data Segment Size Alignment.  If we find an MTU in
+ *     the Hardware MTU Table which will result in a Data Segment Size with
+ *     the requested alignment _and_ that MTU isn't "too far" from the
+ *     closest MTU, then we'll return that rather than the closest MTU.
+ */
+unsigned int cxgb4_best_aligned_mtu(const unsigned short *mtus,
+				    unsigned short header_size,
+				    unsigned short data_size_max,
+				    unsigned short data_size_align,
+				    unsigned int *mtu_idxp)
+{
+	unsigned short max_mtu = header_size + data_size_max;
+	unsigned short data_size_align_mask = data_size_align - 1;
+	int mtu_idx, aligned_mtu_idx;
+
+	/* Scan the MTU Table till we find an MTU which is larger than our
+	 * Maximum MTU or we reach the end of the table.  Along the way,
+	 * record the last MTU found, if any, which will result in a Data
+	 * Segment Length matching the requested alignment.
+	 */
+	for (mtu_idx = 0, aligned_mtu_idx = -1; mtu_idx < NMTUS; mtu_idx++) {
+		unsigned short data_size = mtus[mtu_idx] - header_size;
+
+		/* If this MTU minus the Header Size would result in a
+		 * Data Segment Size of the desired alignment, remember it.
+		 */
+		if ((data_size & data_size_align_mask) == 0)
+			aligned_mtu_idx = mtu_idx;
+
+		/* If we're not at the end of the Hardware MTU Table and the
+		 * next element is larger than our Maximum MTU, drop out of
+		 * the loop.
+		 */
+		if (mtu_idx+1 < NMTUS && mtus[mtu_idx+1] > max_mtu)
+			break;
+	}
+
+	/* If we fell out of the loop because we ran to the end of the table,
+	 * then we just have to use the last [largest] entry.
+	 */
+	if (mtu_idx == NMTUS)
+		mtu_idx--;
+
+	/* If we found an MTU which resulted in the requested Data Segment
+	 * Length alignment and that's "not far" from the largest MTU which is
+	 * less than or equal to the maximum MTU, then use that.
+	 */
+	if (aligned_mtu_idx >= 0 &&
+	    mtu_idx - aligned_mtu_idx <= 1)
+		mtu_idx = aligned_mtu_idx;
+
+	/* If the caller has passed in an MTU Index pointer, pass the
+	 * MTU Index back.  Return the MTU value.
+	 */
+	if (mtu_idxp)
+		*mtu_idxp = mtu_idx;
+	return mtus[mtu_idx];
+}
+EXPORT_SYMBOL(cxgb4_best_aligned_mtu);
+
+/**
  *	cxgb4_port_chan - get the HW channel of a port
  *	@dev: the net device for the port
  *
@@ -3646,6 +3721,85 @@ void cxgb4_enable_db_coalescing(struct net_device *dev)
 	t4_set_reg_field(adap, A_SGE_DOORBELL_CONTROL, F_NOCOALESCE, 0);
 }
 EXPORT_SYMBOL(cxgb4_enable_db_coalescing);
+
+int cxgb4_read_tpte(struct net_device *dev, u32 stag, __be32 *tpte)
+{
+	struct adapter *adap;
+	u32 offset, memtype, memaddr;
+	u32 edc0_size, edc1_size, mc0_size, mc1_size;
+	u32 edc0_end, edc1_end, mc0_end, mc1_end;
+	int ret;
+
+	adap = netdev2adap(dev);
+
+	offset = ((stag >> 8) * 32) + adap->vres.stag.start;
+
+	/* Figure out where the offset lands in the Memory Type/Address scheme.
+	 * This code assumes that the memory is laid out starting at offset 0
+	 * with no breaks as: EDC0, EDC1, MC0, MC1. All cards have both EDC0
+	 * and EDC1.  Some cards will have neither MC0 nor MC1, most cards have
+	 * MC0, and some have both MC0 and MC1.
+	 */
+	edc0_size = EDRAM_SIZE_GET(t4_read_reg(adap, MA_EDRAM0_BAR)) << 20;
+	edc1_size = EDRAM_SIZE_GET(t4_read_reg(adap, MA_EDRAM1_BAR)) << 20;
+	mc0_size = EXT_MEM_SIZE_GET(t4_read_reg(adap, MA_EXT_MEMORY_BAR)) << 20;
+
+	edc0_end = edc0_size;
+	edc1_end = edc0_end + edc1_size;
+	mc0_end = edc1_end + mc0_size;
+
+	if (offset < edc0_end) {
+		memtype = MEM_EDC0;
+		memaddr = offset;
+	} else if (offset < edc1_end) {
+		memtype = MEM_EDC1;
+		memaddr = offset - edc0_end;
+	} else {
+		if (offset < mc0_end) {
+			memtype = MEM_MC0;
+			memaddr = offset - edc1_end;
+		} else if (is_t4(adap->params.chip)) {
+			/* T4 only has a single memory channel */
+			goto err;
+		} else {
+			mc1_size = EXT_MEM_SIZE_GET(
+					t4_read_reg(adap,
+						    MA_EXT_MEMORY1_BAR)) << 20;
+			mc1_end = mc0_end + mc1_size;
+			if (offset < mc1_end) {
+				memtype = MEM_MC1;
+				memaddr = offset - mc0_end;
+			} else {
+				/* offset beyond the end of any memory */
+				goto err;
+			}
+		}
+	}
+
+	spin_lock(&adap->win0_lock);
+	ret = t4_memory_rw(adap, 0, memtype, memaddr, 32, tpte, T4_MEMORY_READ);
+	spin_unlock(&adap->win0_lock);
+	return ret;
+
+err:
+	dev_err(adap->pdev_dev, "stag %#x, offset %#x out of range\n",
+		stag, offset);
+	return -EINVAL;
+}
+EXPORT_SYMBOL(cxgb4_read_tpte);
+
+u64 cxgb4_read_sge_timestamp(struct net_device *dev)
+{
+	u32 hi, lo;
+	struct adapter *adap;
+
+	adap = netdev2adap(dev);
+	lo = t4_read_reg(adap, SGE_TIMESTAMP_LO);
+	hi = GET_TSVAL(t4_read_reg(adap, SGE_TIMESTAMP_HI));
+
+	return ((u64)hi << 32) | (u64)lo;
+}
+EXPORT_SYMBOL(cxgb4_read_sge_timestamp);
 
 static struct pci_driver cxgb4_driver;
 
@@ -3910,6 +4064,7 @@ static void uld_attach(struct adapter *adap, unsigned int uld)
 	lli.wr_cred = adap->params.ofldq_wr_cred;
 	lli.adapter_type = adap->params.chip;
 	lli.iscsi_iolen = MAXRXDATA_GET(t4_read_reg(adap, TP_PARA_REG2));
+	lli.cclk_ps = 1000000000 / adap->params.vpd.cclk;
 	lli.udb_density = 1 << QUEUESPERPAGEPF0_GET(
 			t4_read_reg(adap, SGE_EGRESS_QUEUES_PER_PAGE_PF) >>
 			(adap->fn * 4));
@@ -4179,6 +4334,13 @@ static int update_root_dev_clip(struct net_device *dev)
 		return ret;
 
 	/* Parse all bond and vlan devices layered on top of the physical dev */
+	root_dev = netdev_master_upper_dev_get_rcu(dev);
+	if (root_dev) {
+		ret = update_dev_clip(root_dev, dev);
+		if (ret)
+			return ret;
+	}
+
 	for (i = 0; i < VLAN_N_VID; i++) {
 		root_dev = __vlan_find_dev_deep(dev, htons(ETH_P_8021Q), i);
 		if (!root_dev)
@@ -5729,13 +5891,41 @@ static int adap_init0(struct adapter *adap)
 #undef FW_PARAM_PFVF
 #undef FW_PARAM_DEV
 
-	/*
-	 * These are finalized by FW initialization, load their values now.
+	/* The MTU/MSS Table is initialized by now, so load their values.  If
+	 * we're initializing the adapter, then we'll make any modifications
+	 * we want to the MTU/MSS Table and also initialize the congestion
+	 * parameters.
 	 */
 	t4_read_mtu_tbl(adap, adap->params.mtus, NULL);
-	t4_load_mtus(adap, adap->params.mtus, adap->params.a_wnd,
-		     adap->params.b_wnd);
+	if (state != DEV_STATE_INIT) {
+		int i;
 
+		/* The default MTU Table contains values 1492 and 1500.
+		 * However, for TCP, it's better to have two values which are
+		 * a multiple of 8 +/- 4 bytes apart near this popular MTU.
+		 * This allows us to have a TCP Data Payload which is a
+		 * multiple of 8 regardless of what combination of TCP Options
+		 * are in use (always a multiple of 4 bytes) which is
+		 * important for performance reasons.  For instance, if no
+		 * options are in use, then we have a 20-byte IP header and a
+		 * 20-byte TCP header.  In this case, a 1500-byte MSS would
+		 * result in a TCP Data Payload of 1500 - 40 == 1460 bytes
+		 * which is not a multiple of 8.  So using an MSS of 1488 in
+		 * this case results in a TCP Data Payload of 1448 bytes which
+		 * is a multiple of 8.  On the other hand, if 12-byte TCP Time
+		 * Stamps have been negotiated, then an MTU of 1500 bytes
+		 * results in a TCP Data Payload of 1448 bytes which, as
+		 * above, is a multiple of 8 bytes ...
+		 */
+		for (i = 0; i < NMTUS; i++)
+			if (adap->params.mtus[i] == 1492) {
+				adap->params.mtus[i] = 1488;
+				break;
+			}
+
+		t4_load_mtus(adap, adap->params.mtus, adap->params.a_wnd,
+			     adap->params.b_wnd);
+	}
 	t4_init_tp_params(adap);
 	adap->flags |= FW_OK;
 	return 0;
@@ -6441,8 +6631,7 @@ static void remove_one(struct pci_dev *pdev)
 			if (adapter->port[i]->reg_state == NETREG_REGISTERED)
 				unregister_netdev(adapter->port[i]);
 
-		if (adapter->debugfs_root)
-			debugfs_remove_recursive(adapter->debugfs_root);
+		debugfs_remove_recursive(adapter->debugfs_root);
 
 		/* If we allocated filters, free up state associated with any
 		 * valid filters ...

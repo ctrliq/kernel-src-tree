@@ -306,15 +306,6 @@ int x86_setup_perfctr(struct perf_event *event)
 		hwc->sample_period = x86_pmu.max_period;
 		hwc->last_period = hwc->sample_period;
 		local64_set(&hwc->period_left, hwc->sample_period);
-	} else {
-		/*
-		 * If we have a PMU initialized but no APIC
-		 * interrupts, we cannot sample hardware
-		 * events (user-space has to fall back and
-		 * sample via a hrtimer based software event):
-		 */
-		if (!x86_pmu.apic)
-			return -EOPNOTSUPP;
 	}
 
 	if (attr->type == PERF_TYPE_RAW)
@@ -1316,7 +1307,7 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 struct event_constraint emptyconstraint;
 struct event_constraint unconstrained;
 
-static int __cpuinit
+static int
 x86_pmu_notifier(struct notifier_block *self, unsigned long action, void *hcpu)
 {
 	unsigned int cpu = (long)hcpu;
@@ -1367,6 +1358,15 @@ static void __init pmu_check_apic(void)
 	x86_pmu.apic = 0;
 	pr_info("no APIC, boot with the \"lapic\" boot parameter to force-enable it.\n");
 	pr_info("no hardware sampling interrupt available.\n");
+
+	/*
+	 * If we have a PMU initialized but no APIC
+	 * interrupts, we cannot sample hardware
+	 * events (user-space has to fall back and
+	 * sample via a hrtimer based software event):
+	 */
+	pmu.capabilities |= PERF_PMU_CAP_NO_INTERRUPT;
+
 }
 
 static struct attribute_group x86_pmu_format_group = {
@@ -1542,6 +1542,8 @@ static int __init init_hw_perf_events(void)
 
 	pr_cont("%s PMU driver.\n", x86_pmu.name);
 
+	x86_pmu.attr_rdpmc = 1; /* enable userspace RDPMC usage by default */
+
 	for (quirk = x86_pmu.quirks; quirk; quirk = quirk->next)
 		quirk->func();
 
@@ -1555,7 +1557,6 @@ static int __init init_hw_perf_events(void)
 		__EVENT_CONSTRAINT(0, (1ULL << x86_pmu.num_counters) - 1,
 				   0, x86_pmu.num_counters, 0, 0);
 
-	x86_pmu.attr_rdpmc = 1; /* enable userspace RDPMC usage by default */
 	x86_pmu_format_group.attrs = x86_pmu.format_attrs;
 
 	if (x86_pmu.event_attrs)
@@ -1843,6 +1844,9 @@ static ssize_t set_attr_rdpmc(struct device *cdev,
 	ret = kstrtoul(buf, 0, &val);
 	if (ret)
 		return ret;
+
+	if (x86_pmu.attr_rdpmc_broken)
+		return -ENOTSUPP;
 
 	if (!!val != !!x86_pmu.attr_rdpmc) {
 		x86_pmu.attr_rdpmc = !!val;

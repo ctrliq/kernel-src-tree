@@ -268,7 +268,8 @@ int snd_hda_input_mux_put(struct hda_codec *codec,
 			  const struct hda_input_mux *imux,
 			  struct snd_ctl_elem_value *ucontrol, hda_nid_t nid,
 			  unsigned int *cur_val);
-int snd_hda_add_imux_item(struct hda_input_mux *imux, const char *label,
+int snd_hda_add_imux_item(struct hda_codec *codec,
+			  struct hda_input_mux *imux, const char *label,
 			  int index, int *type_index_ret);
 
 /*
@@ -370,12 +371,6 @@ void snd_print_pcm_bits(int pcm, char *buf, int buflen);
 /*
  * Misc
  */
-int snd_hda_check_board_config(struct hda_codec *codec, int num_configs,
-			       const char * const *modelnames,
-			       const struct snd_pci_quirk *pci_list);
-int snd_hda_check_board_codec_sid_config(struct hda_codec *codec,
-                               int num_configs, const char * const *models,
-                               const struct snd_pci_quirk *tbl);
 int snd_hda_add_new_ctls(struct hda_codec *codec,
 			 const struct snd_kcontrol_new *knew);
 
@@ -437,6 +432,8 @@ struct snd_hda_pin_quirk {
 
 #endif
 
+#define HDA_FIXUP_ID_NOT_SET -1
+#define HDA_FIXUP_ID_NO_FIXUP -2
 
 /* fixup types */
 enum {
@@ -632,6 +629,11 @@ int snd_hda_create_hwdep(struct hda_codec *codec);
 static inline int snd_hda_create_hwdep(struct hda_codec *codec) { return 0; }
 #endif
 
+void snd_hda_sysfs_init(struct hda_codec *codec);
+void snd_hda_sysfs_clear(struct hda_codec *codec);
+
+extern const struct attribute_group *snd_hda_dev_attr_groups[];
+
 #ifdef CONFIG_SND_HDA_RECONFIG
 const char *snd_hda_get_hint(struct hda_codec *codec, const char *key);
 int snd_hda_get_bool_hint(struct hda_codec *codec, const char *key);
@@ -787,5 +789,12 @@ void snd_hdmi_write_eld_info(struct hdmi_eld *eld,
 
 #define SND_PRINT_CHANNEL_ALLOCATION_ADVISED_BUFSIZE 80
 void snd_print_channel_allocation(int spk_alloc, char *buf, int buflen);
+
+/*
+ */
+#define codec_err(codec, fmt, args...) dev_err(&(codec)->dev, fmt, ##args)
+#define codec_warn(codec, fmt, args...) dev_warn(&(codec)->dev, fmt, ##args)
+#define codec_info(codec, fmt, args...) dev_info(&(codec)->dev, fmt, ##args)
+#define codec_dbg(codec, fmt, args...) dev_dbg(&(codec)->dev, fmt, ##args)
 
 #endif /* __SOUND_HDA_LOCAL_H */

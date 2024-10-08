@@ -31,6 +31,8 @@
 #include "e1000_hw.h"
 #include "e1000_i210.h"
 
+static s32 igb_update_flash_i210(struct e1000_hw *hw);
+
 /**
  * igb_get_hw_semaphore_i210 - Acquire hardware semaphore
  *  @hw: pointer to the HW structure
@@ -107,7 +109,7 @@ static s32 igb_get_hw_semaphore_i210(struct e1000_hw *hw)
  *  Return successful if access grant bit set, else clear the request for
  *  EEPROM access and return -E1000_ERR_NVM (-1).
  **/
-s32 igb_acquire_nvm_i210(struct e1000_hw *hw)
+static s32 igb_acquire_nvm_i210(struct e1000_hw *hw)
 {
 	return igb_acquire_swfw_sync_i210(hw, E1000_SWFW_EEP_SM);
 }
@@ -119,7 +121,7 @@ s32 igb_acquire_nvm_i210(struct e1000_hw *hw)
  *  Stop any current commands to the EEPROM and clear the EEPROM request bit,
  *  then release the semaphores acquired.
  **/
-void igb_release_nvm_i210(struct e1000_hw *hw)
+static void igb_release_nvm_i210(struct e1000_hw *hw)
 {
 	igb_release_swfw_sync_i210(hw, E1000_SWFW_EEP_SM);
 }
@@ -202,8 +204,8 @@ void igb_release_swfw_sync_i210(struct e1000_hw *hw, u16 mask)
  *  Reads a 16 bit word from the Shadow Ram using the EERD register.
  *  Uses necessary synchronization semaphores.
  **/
-s32 igb_read_nvm_srrd_i210(struct e1000_hw *hw, u16 offset, u16 words,
-			     u16 *data)
+static s32 igb_read_nvm_srrd_i210(struct e1000_hw *hw, u16 offset, u16 words,
+				  u16 *data)
 {
 	s32 status = 0;
 	u16 i, count;
@@ -302,8 +304,8 @@ out:
  *  If error code is returned, data and Shadow RAM may be inconsistent - buffer
  *  partially written.
  **/
-s32 igb_write_nvm_srwr_i210(struct e1000_hw *hw, u16 offset, u16 words,
-			      u16 *data)
+static s32 igb_write_nvm_srwr_i210(struct e1000_hw *hw, u16 offset, u16 words,
+				   u16 *data)
 {
 	s32 status = 0;
 	u16 i, count;
@@ -360,7 +362,7 @@ static s32 igb_read_invm_word_i210(struct e1000_hw *hw, u8 address, u16 *data)
 			word_address = INVM_DWORD_TO_WORD_ADDRESS(invm_dword);
 			if (word_address == address) {
 				*data = INVM_DWORD_TO_WORD_DATA(invm_dword);
-				hw_dbg("Read INVM Word 0x%02x = %x",
+				hw_dbg("Read INVM Word 0x%02x = %x\n",
 					  address, *data);
 				status = 0;
 				break;
@@ -552,7 +554,7 @@ s32 igb_read_invm_version(struct e1000_hw *hw,
  *  Calculates the EEPROM checksum by reading/adding each word of the EEPROM
  *  and then verifies that the sum of the EEPROM is equal to 0xBABA.
  **/
-s32 igb_validate_nvm_checksum_i210(struct e1000_hw *hw)
+static s32 igb_validate_nvm_checksum_i210(struct e1000_hw *hw)
 {
 	s32 status = 0;
 	s32 (*read_op_ptr)(struct e1000_hw *, u16, u16, u16 *);
@@ -587,7 +589,7 @@ s32 igb_validate_nvm_checksum_i210(struct e1000_hw *hw)
  *  up to the checksum.  Then calculates the EEPROM checksum and writes the
  *  value to the EEPROM. Next commit EEPROM data onto the Flash.
  **/
-s32 igb_update_nvm_checksum_i210(struct e1000_hw *hw)
+static s32 igb_update_nvm_checksum_i210(struct e1000_hw *hw)
 {
 	s32 ret_val = 0;
 	u16 checksum = 0;
@@ -681,7 +683,7 @@ bool igb_get_flash_presence_i210(struct e1000_hw *hw)
  *  @hw: pointer to the HW structure
  *
  **/
-s32 igb_update_flash_i210(struct e1000_hw *hw)
+static s32 igb_update_flash_i210(struct e1000_hw *hw)
 {
 	s32 ret_val = 0;
 	u32 flup;
@@ -830,5 +832,71 @@ s32 igb_init_nvm_params_i210(struct e1000_hw *hw)
 		nvm->ops.validate = NULL;
 		nvm->ops.update   = NULL;
 	}
+	return ret_val;
+}
+
+/**
+ * igb_pll_workaround_i210
+ * @hw: pointer to the HW structure
+ *
+ * Works around an errata in the PLL circuit where it occasionally
+ * provides the wrong clock frequency after power up.
+ **/
+s32 igb_pll_workaround_i210(struct e1000_hw *hw)
+{
+	s32 ret_val;
+	u32 wuc, mdicnfg, ctrl, ctrl_ext, reg_val;
+	u16 nvm_word, phy_word, pci_word, tmp_nvm;
+	int i;
+
+	/* Get and set needed register values */
+	wuc = rd32(E1000_WUC);
+	mdicnfg = rd32(E1000_MDICNFG);
+	reg_val = mdicnfg & ~E1000_MDICNFG_EXT_MDIO;
+	wr32(E1000_MDICNFG, reg_val);
+
+	/* Get data from NVM, or set default */
+	ret_val = igb_read_invm_word_i210(hw, E1000_INVM_AUTOLOAD,
+					  &nvm_word);
+	if (ret_val)
+		nvm_word = E1000_INVM_DEFAULT_AL;
+	tmp_nvm = nvm_word | E1000_INVM_PLL_WO_VAL;
+	for (i = 0; i < E1000_MAX_PLL_TRIES; i++) {
+		/* check current state directly from internal PHY */
+		igb_read_phy_reg_gs40g(hw, (E1000_PHY_PLL_FREQ_PAGE |
+					 E1000_PHY_PLL_FREQ_REG), &phy_word);
+		if ((phy_word & E1000_PHY_PLL_UNCONF)
+		    != E1000_PHY_PLL_UNCONF) {
+			ret_val = 0;
+			break;
+		} else {
+			ret_val = -E1000_ERR_PHY;
+		}
+		/* directly reset the internal PHY */
+		ctrl = rd32(E1000_CTRL);
+		wr32(E1000_CTRL, ctrl|E1000_CTRL_PHY_RST);
+
+		ctrl_ext = rd32(E1000_CTRL_EXT);
+		ctrl_ext |= (E1000_CTRL_EXT_PHYPDEN | E1000_CTRL_EXT_SDLPE);
+		wr32(E1000_CTRL_EXT, ctrl_ext);
+
+		wr32(E1000_WUC, 0);
+		reg_val = (E1000_INVM_AUTOLOAD << 4) | (tmp_nvm << 16);
+		wr32(E1000_EEARBC_I210, reg_val);
+
+		igb_read_pci_cfg(hw, E1000_PCI_PMCSR, &pci_word);
+		pci_word |= E1000_PCI_PMCSR_D3;
+		igb_write_pci_cfg(hw, E1000_PCI_PMCSR, &pci_word);
+		usleep_range(1000, 2000);
+		pci_word &= ~E1000_PCI_PMCSR_D3;
+		igb_write_pci_cfg(hw, E1000_PCI_PMCSR, &pci_word);
+		reg_val = (E1000_INVM_AUTOLOAD << 4) | (nvm_word << 16);
+		wr32(E1000_EEARBC_I210, reg_val);
+
+		/* restore WUC register */
+		wr32(E1000_WUC, wuc);
+	}
+	/* restore MDICNFG setting */
+	wr32(E1000_MDICNFG, mdicnfg);
 	return ret_val;
 }

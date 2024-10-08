@@ -69,9 +69,9 @@
 #include <sys/ioctl.h>
 #include <inttypes.h>
 #include <linux/magic.h>
-#include "types.h"
+#include <linux/types.h>
 #include <sys/ttydefaults.h>
-#include <lk/debugfs.h>
+#include <api/fs/debugfs.h>
 #include <termios.h>
 #include <linux/bitops.h>
 
@@ -129,6 +129,8 @@ void put_tracing_file(char *file);
 #endif
 #endif
 
+#define PERF_GTK_DSO  "libperf-gtk.so"
+
 /* General helper functions */
 extern void usage(const char *err) NORETURN;
 extern void die(const char *err, ...) NORETURN __attribute__((format (printf, 1, 2)));
@@ -183,6 +185,8 @@ static inline void *zalloc(size_t size)
 {
 	return calloc(1, size);
 }
+
+#define zfree(ptr) ({ free(*ptr); *ptr = NULL; })
 
 static inline int has_extension(const char *filename, const char *ext)
 {

@@ -158,7 +158,6 @@ struct ext4_allocation_request {
 #define EXT4_MAP_MAPPED		(1 << BH_Mapped)
 #define EXT4_MAP_UNWRITTEN	(1 << BH_Unwritten)
 #define EXT4_MAP_BOUNDARY	(1 << BH_Boundary)
-#define EXT4_MAP_UNINIT		(1 << BH_Uninit)
 /* Sometimes (in the bigalloc case, from ext4_da_get_block_prep) the caller of
  * ext4_map_blocks wants to know whether or not the underlying cluster has
  * already been accounted for. EXT4_MAP_FROM_CLUSTER conveys to the caller that
@@ -169,7 +168,7 @@ struct ext4_allocation_request {
 #define EXT4_MAP_FROM_CLUSTER	(1 << BH_AllocFromCluster)
 #define EXT4_MAP_FLAGS		(EXT4_MAP_NEW | EXT4_MAP_MAPPED |\
 				 EXT4_MAP_UNWRITTEN | EXT4_MAP_BOUNDARY |\
-				 EXT4_MAP_UNINIT | EXT4_MAP_FROM_CLUSTER)
+				 EXT4_MAP_FROM_CLUSTER)
 
 struct ext4_map_blocks {
 	ext4_fsblk_t m_pblk;
@@ -179,33 +178,22 @@ struct ext4_map_blocks {
 };
 
 /*
- * For delayed allocation tracking
- */
-struct mpage_da_data {
-	struct inode *inode;
-	sector_t b_blocknr;		/* start block number of extent */
-	size_t b_size;			/* size of extent */
-	unsigned long b_state;		/* state of the extent */
-	unsigned long first_page, next_page;	/* extent of pages */
-	struct writeback_control *wbc;
-	int io_done;
-	int pages_written;
-	int retval;
-};
-
-/*
  * Flags for ext4_io_end->flags
  */
 #define	EXT4_IO_END_UNWRITTEN	0x0001
-#define EXT4_IO_END_ERROR	0x0002
-#define EXT4_IO_END_DIRECT	0x0004
+#define EXT4_IO_END_DIRECT	0x0002
 
 /*
- * For converting uninitialized extents on a work queue.
+ * For converting unwritten extents on a work queue. 'handle' is used for
+ * buffered writeback.
  */
 typedef struct ext4_io_end {
 	struct list_head	list;		/* per-file finished IO list */
+	handle_t		*handle;	/* handle reserved for extent
+						 * conversion */
 	struct inode		*inode;		/* file being written to */
+	struct bio		*bio;		/* Linked list of completed
+						 * bios covering the extent */
 	unsigned int		flag;		/* unwritten or not */
 	loff_t			offset;		/* offset in the file */
 	ssize_t			size;		/* size of the extent */
@@ -551,26 +539,26 @@ enum {
 /*
  * Flags used by ext4_map_blocks()
  */
-	/* Allocate any needed blocks and/or convert an unitialized
+	/* Allocate any needed blocks and/or convert an unwritten
 	   extent to be an initialized ext4 */
 #define EXT4_GET_BLOCKS_CREATE			0x0001
-	/* Request the creation of an unitialized extent */
-#define EXT4_GET_BLOCKS_UNINIT_EXT		0x0002
-#define EXT4_GET_BLOCKS_CREATE_UNINIT_EXT	(EXT4_GET_BLOCKS_UNINIT_EXT|\
+	/* Request the creation of an unwritten extent */
+#define EXT4_GET_BLOCKS_UNWRIT_EXT		0x0002
+#define EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT	(EXT4_GET_BLOCKS_UNWRIT_EXT|\
 						 EXT4_GET_BLOCKS_CREATE)
 	/* Caller is from the delayed allocation writeout path
 	 * finally doing the actual allocation of delayed blocks */
 #define EXT4_GET_BLOCKS_DELALLOC_RESERVE	0x0004
 	/* caller is from the direct IO path, request to creation of an
-	unitialized extents if not allocated, split the uninitialized
+	unwritten extents if not allocated, split the unwritten
 	extent if blocks has been preallocated already*/
 #define EXT4_GET_BLOCKS_PRE_IO			0x0008
 #define EXT4_GET_BLOCKS_CONVERT			0x0010
 #define EXT4_GET_BLOCKS_IO_CREATE_EXT		(EXT4_GET_BLOCKS_PRE_IO|\
-					 EXT4_GET_BLOCKS_CREATE_UNINIT_EXT)
+					 EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT)
 	/* Convert extent to initialized after IO complete */
 #define EXT4_GET_BLOCKS_IO_CONVERT_EXT		(EXT4_GET_BLOCKS_CONVERT|\
-					 EXT4_GET_BLOCKS_CREATE_UNINIT_EXT)
+					 EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT)
 	/* Eventual metadata allocation (due to growing extent tree)
 	 * should not fail, so try to use reserved blocks for that.*/
 #define EXT4_GET_BLOCKS_METADATA_NOFAIL		0x0020
@@ -582,6 +570,8 @@ enum {
 #define EXT4_GET_BLOCKS_NO_LOCK			0x0100
 	/* Do not put hole in extent cache */
 #define EXT4_GET_BLOCKS_NO_PUT_HOLE		0x0200
+	/* Convert written extents to unwritten */
+#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0400
 
 /*
  * The bit position of these flags must not overlap with any of the
@@ -592,8 +582,8 @@ enum {
  * caching the extents when reading from the extent tree while a
  * truncate or punch hole operation is in progress.
  */
-#define EXT4_EX_NOCACHE				0x0400
-#define EXT4_EX_FORCE_CACHE			0x0800
+#define EXT4_EX_NOCACHE				0x40000000
+#define EXT4_EX_FORCE_CACHE			0x20000000
 
 /*
  * Flags used by ext4_free_blocks
@@ -1388,6 +1378,9 @@ static inline void ext4_set_io_unwritten_flag(struct inode *inode,
 					      struct ext4_io_end *io_end)
 {
 	if (!(io_end->flag & EXT4_IO_END_UNWRITTEN)) {
+		/* Writeback has to have coversion transaction reserved */
+		WARN_ON(EXT4_SB(inode->i_sb)->s_journal && !io_end->handle &&
+			!(io_end->flag & EXT4_IO_END_DIRECT));
 		io_end->flag |= EXT4_IO_END_UNWRITTEN;
 		atomic_inc(&EXT4_I(inode)->i_unwritten);
 	}
@@ -1841,7 +1834,7 @@ ext4_group_first_block_no(struct super_block *sb, ext4_group_t group_no)
 /*
  * Special error return code only used by dx_probe() and its callers.
  */
-#define ERR_BAD_DX_DIR	-75000
+#define ERR_BAD_DX_DIR	(-(MAX_ERRNO - 1))
 
 /*
  * Timeout and state flag for lazy initialization inode thread.
@@ -2136,6 +2129,7 @@ extern int  ext4_sync_inode(handle_t *, struct inode *);
 extern void ext4_dirty_inode(struct inode *, int);
 extern int ext4_change_inode_journal_flag(struct inode *, int);
 extern int ext4_get_inode_loc(struct inode *, struct ext4_iloc *);
+extern int ext4_inode_attach_jinode(struct inode *inode);
 extern int ext4_can_truncate(struct inode *inode);
 extern void ext4_truncate(struct inode *);
 extern int ext4_punch_hole(struct inode *inode, loff_t offset, loff_t length);
@@ -2468,16 +2462,31 @@ do {								\
 #define EXT4_FREECLUSTERS_WATERMARK 0
 #endif
 
+/* Update i_disksize. Requires i_mutex to avoid races with truncate */
 static inline void ext4_update_i_disksize(struct inode *inode, loff_t newsize)
 {
-	/*
-	 * XXX: replace with spinlock if seen contended -bzzz
-	 */
+	WARN_ON_ONCE(S_ISREG(inode->i_mode) &&
+		     !mutex_is_locked(&inode->i_mutex));
 	down_write(&EXT4_I(inode)->i_data_sem);
 	if (newsize > EXT4_I(inode)->i_disksize)
 		EXT4_I(inode)->i_disksize = newsize;
 	up_write(&EXT4_I(inode)->i_data_sem);
-	return ;
+}
+
+/* Update i_size, i_disksize. Requires i_mutex to avoid races with truncate */
+static inline int ext4_update_inode_size(struct inode *inode, loff_t newsize)
+{
+	int changed = 0;
+
+	if (newsize > inode->i_size) {
+		i_size_write(inode, newsize);
+		changed = 1;
+	}
+	if (newsize > EXT4_I(inode)->i_disksize) {
+		ext4_update_i_disksize(inode, newsize);
+		changed |= 2;
+	}
+	return changed;
 }
 
 struct ext4_group_info {
@@ -2659,7 +2668,7 @@ static inline int ext4_has_inline_data(struct inode *inode)
 }
 
 /* namei.c */
-extern const struct inode_operations ext4_dir_inode_operations;
+extern const struct inode_operations_wrapper ext4_dir_inode_operations;
 extern const struct inode_operations ext4_special_inode_operations;
 extern struct dentry *ext4_get_parent(struct dentry *child);
 extern struct ext4_dir_entry_2 *ext4_init_dot_dotdot(struct inode *inode,
@@ -2727,8 +2736,8 @@ extern void ext4_ext_init(struct super_block *);
 extern void ext4_ext_release(struct super_block *);
 extern long ext4_fallocate(struct file *file, int mode, loff_t offset,
 			  loff_t len);
-extern int ext4_convert_unwritten_extents(struct inode *inode, loff_t offset,
-			  ssize_t len);
+extern int ext4_convert_unwritten_extents(handle_t *handle, struct inode *inode,
+					  loff_t offset, ssize_t len);
 extern int ext4_map_blocks(handle_t *handle, struct inode *inode,
 			   struct ext4_map_blocks *map, int flags);
 extern int ext4_ext_calc_metadata_amount(struct inode *inode,
@@ -2771,7 +2780,6 @@ extern int mext_next_extent(struct inode *inode, struct ext4_ext_path *path,
 /* page-io.c */
 extern int __init ext4_init_pageio(void);
 extern void ext4_exit_pageio(void);
-extern void ext4_ioend_shutdown(struct inode *);
 extern ext4_io_end_t *ext4_init_io_end(struct inode *inode, gfp_t flags);
 extern ext4_io_end_t *ext4_get_io_end(ext4_io_end_t *io_end);
 extern int ext4_put_io_end(ext4_io_end_t *io_end);
@@ -2784,24 +2792,21 @@ extern void ext4_io_submit(struct ext4_io_submit *io);
 extern int ext4_bio_write_page(struct ext4_io_submit *io,
 			       struct page *page,
 			       int len,
-			       struct writeback_control *wbc);
+			       struct writeback_control *wbc,
+			       bool keep_towrite);
 
 /* mmp.c */
 extern int ext4_multi_mount_protect(struct super_block *, ext4_fsblk_t);
 
-/* BH_Uninit flag: blocks are allocated but uninitialized on disk */
+/*
+ * Note that these flags will never ever appear in a buffer_head's state flag.
+ * See EXT4_MAP_... to see where this is used.
+ */
 enum ext4_state_bits {
-	BH_Uninit	/* blocks are allocated but uninitialized on disk */
-	  = BH_JBDPrivateStart,
-	BH_AllocFromCluster,	/* allocated blocks were part of already
-				 * allocated cluster. Note that this flag will
-				 * never, ever appear in a buffer_head's state
-				 * flag. See EXT4_MAP_FROM_CLUSTER to see where
-				 * this is used. */
+	BH_AllocFromCluster	/* allocated blocks were part of already
+				 * allocated cluster. */
+	= BH_JBDPrivateStart
 };
-
-BUFFER_FNS(Uninit, uninit)
-TAS_BUFFER_FNS(Uninit, uninit)
 
 /*
  * Add new method to test whether block and inode bitmaps are properly

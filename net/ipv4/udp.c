@@ -802,7 +802,7 @@ static int udp_send_skb(struct sk_buff *skb, struct flowi4 *fl4)
 	if (is_udplite)  				 /*     UDP-Lite      */
 		csum = udplite_csum(skb);
 
-	else if (sk->sk_no_check == UDP_CSUM_NOXMIT) {   /* UDP csum disabled */
+	else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
 
 		skb->ip_summed = CHECKSUM_NONE;
 		goto send;
@@ -1440,8 +1440,10 @@ static int __udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	int rc;
 
-	if (inet_sk(sk)->inet_daddr)
+	if (inet_sk(sk)->inet_daddr) {
 		sock_rps_save_rxhash(sk, skb);
+		sk_mark_napi_id(sk, skb);
+	}
 
 	rc = sock_queue_rcv_skb(sk, skb);
 	if (rc < 0) {
@@ -1740,7 +1742,10 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	if (sk != NULL) {
 		int ret;
 
-		sk_mark_napi_id(sk, skb);
+		if (udp_sk(sk)->convert_csum && uh->check && !IS_UDPLITE(sk))
+			skb_checksum_try_convert(skb, IPPROTO_UDP, uh->check,
+						 inet_compute_pseudo);
+
 		ret = udp_queue_rcv_skb(sk, skb);
 		sock_put(sk);
 
@@ -1821,7 +1826,7 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 		       int (*push_pending_frames)(struct sock *))
 {
 	struct udp_sock *up = udp_sk(sk);
-	int val;
+	int val, valbool;
 	int err = 0;
 	int is_udplite = IS_UDPLITE(sk);
 
@@ -1830,6 +1835,8 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 
 	if (get_user(val, (int __user *)optval))
 		return -EFAULT;
+
+	valbool = val ? 1 : 0;
 
 	switch (optname) {
 	case UDP_CORK:
@@ -1858,6 +1865,14 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 			err = -ENOPROTOOPT;
 			break;
 		}
+		break;
+
+	case UDP_NO_CHECK6_TX:
+		up->no_check6_tx = valbool;
+		break;
+
+	case UDP_NO_CHECK6_RX:
+		up->no_check6_rx = valbool;
 		break;
 
 	/*
@@ -1940,6 +1955,14 @@ int udp_lib_getsockopt(struct sock *sk, int level, int optname,
 
 	case UDP_ENCAP:
 		val = up->encap_type;
+		break;
+
+	case UDP_NO_CHECK6_TX:
+		val = up->no_check6_tx;
+		break;
+
+	case UDP_NO_CHECK6_RX:
+		val = up->no_check6_rx;
 		break;
 
 	/* The following two cannot be changed on UDP sockets, the return is
@@ -2346,9 +2369,9 @@ struct sk_buff *skb_udp_tunnel_segment(struct sk_buff *skb,
 		skb->encap_hdr_csum = 1;
 
 	/* segment inner packet. */
-	enc_features = skb->dev->hw_enc_features & netif_skb_features(skb);
+	enc_features = skb->dev->hw_enc_features & features;
 	segs = skb_mac_gso_segment(skb, enc_features);
-	if (!segs || IS_ERR(segs)) {
+	if (IS_ERR_OR_NULL(segs)) {
 		skb_gso_error_unwind(skb, protocol, tnl_hlen, mac_offset,
 				     mac_len);
 		goto out;

@@ -71,7 +71,6 @@
 static const char	hcd_name [] = "ehci_hcd";
 
 
-#undef VERBOSE_DEBUG
 #undef EHCI_URB_TRACE
 
 /* magic numbers that can affect system performance */
@@ -1184,7 +1183,7 @@ static const struct hc_driver ehci_hc_driver = {
 	 * generic hardware linkage
 	 */
 	.irq =			ehci_irq,
-	.flags =		HCD_MEMORY | HCD_USB2,
+	.flags =		HCD_MEMORY | HCD_USB2 | HCD_BH,
 
 	/*
 	 * basic lifecycle operations

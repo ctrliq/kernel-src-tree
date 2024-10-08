@@ -47,6 +47,8 @@
 #include <linux/rcupdate.h>
 #include <linux/interrupt.h>
 
+#include <linux/rh_kabi.h>
+
 #define PFX "IPMI message handler: "
 
 #define IPMI_DRIVER_VERSION "39.2"
@@ -107,7 +109,7 @@ struct ipmi_user {
 	ipmi_smi_t intf;
 
 	/* Does this interface receive IPMI events? */
-	bool gets_events;
+	int gets_events;
 };
 
 struct cmd_rcvr {
@@ -398,9 +400,6 @@ struct ipmi_smi {
 	unsigned int     waiting_events_count; /* How many events in queue? */
 	char             delivering_events;
 	char             event_msg_printed;
-	atomic_t         event_waiters;
-	unsigned int     ticks_to_req_ev;
-	int              last_needs_timer;
 
 	/*
 	 * The event receiver for my BMC, only really used at panic
@@ -446,8 +445,23 @@ struct ipmi_smi {
 	 * parameters passed by "low" level IPMI code.
 	 */
 	int run_to_completion;
+
+	/*
+	 * More events that were queued because no one was there to receive
+	 * them.
+	 */
+	RH_KABI_EXTEND(atomic_t         event_waiters)
+	RH_KABI_EXTEND(unsigned int     ticks_to_req_ev)
+	RH_KABI_EXTEND(int              last_needs_timer)
 };
 #define to_si_intf_from_dev(device) container_of(device, struct ipmi_smi, dev)
+
+struct ipmi_shadow_smi_handlers shadow_smi_handlers;
+struct ipmi_shadow_smi_handlers *ipmi_get_shadow_smi_handlers(void)
+{
+	return &shadow_smi_handlers;
+}
+EXPORT_SYMBOL_GPL(ipmi_get_shadow_smi_handlers);
 
 /**
  * The driver model view of the IPMI messaging driver.
@@ -1213,7 +1227,7 @@ int ipmi_set_maintenance_mode(ipmi_user_t user, int mode)
 }
 EXPORT_SYMBOL(ipmi_set_maintenance_mode);
 
-int ipmi_set_gets_events(ipmi_user_t user, bool val)
+int ipmi_set_gets_events(ipmi_user_t user, int val)
 {
 	unsigned long        flags;
 	ipmi_smi_t           intf = user->intf;
@@ -4184,8 +4198,11 @@ static void ipmi_timeout(unsigned long data)
 
 		lnt = !!lnt;
 		if (lnt != intf->last_needs_timer &&
-					intf->handlers->set_need_watch)
-			intf->handlers->set_need_watch(intf->send_info, lnt);
+				shadow_smi_handlers.set_need_watch &&
+				shadow_smi_handlers.handlers == intf->handlers)
+			shadow_smi_handlers.set_need_watch
+				(intf->send_info, lnt);
+
 		intf->last_needs_timer = lnt;
 
 		nt += lnt;

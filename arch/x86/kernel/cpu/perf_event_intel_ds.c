@@ -311,9 +311,11 @@ static int alloc_bts_buffer(int cpu)
 	if (!x86_pmu.bts)
 		return 0;
 
-	buffer = kmalloc_node(BTS_BUFFER_SIZE, GFP_KERNEL | __GFP_ZERO, node);
-	if (unlikely(!buffer))
+	buffer = kmalloc_node(BTS_BUFFER_SIZE, GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN, node);
+	if (unlikely(!buffer)) {
+		WARN_ONCE(1, "%s: BTS buffer allocation failure\n", __func__);
 		return -ENOMEM;
+	}
 
 	max = BTS_BUFFER_SIZE / BTS_RECORD_SIZE;
 	thresh = max / 16;

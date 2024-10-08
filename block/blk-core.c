@@ -43,6 +43,7 @@
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_complete);
+EXPORT_TRACEPOINT_SYMBOL_GPL(block_split);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
 
 DEFINE_IDA(blk_queue_ida);
@@ -247,8 +248,10 @@ void blk_sync_queue(struct request_queue *q)
 		struct blk_mq_hw_ctx *hctx;
 		int i;
 
-		queue_for_each_hw_ctx(q, hctx, i)
-			cancel_delayed_work_sync(&hctx->delayed_work);
+		queue_for_each_hw_ctx(q, hctx, i) {
+			cancel_delayed_work_sync(&hctx->run_work);
+			cancel_delayed_work_sync(&hctx->delay_work);
+		}
 	} else {
 		cancel_delayed_work_sync(&q->delay_work);
 	}
@@ -520,6 +523,9 @@ void blk_cleanup_queue(struct request_queue *q)
 	del_timer_sync(&q->backing_dev_info.laptop_mode_wb_timer);
 	blk_sync_queue(q);
 
+	if (q->mq_ops)
+		blk_mq_free_queue(q);
+
 	spin_lock_irq(lock);
 	if (q->queue_lock != &q->__queue_lock)
 		q->queue_lock = &q->__queue_lock;
@@ -573,12 +579,9 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 	if (!q)
 		return NULL;
 
-	if (percpu_counter_init(&q->mq_usage_counter, 0))
-		goto fail_q;
-
 	q->id = ida_simple_get(&blk_queue_ida, 0, 0, gfp_mask);
 	if (q->id < 0)
-		goto fail_c;
+		goto fail_q;
 
 	q->backing_dev_info.ra_pages =
 			(VM_MAX_READAHEAD * 1024) / PAGE_CACHE_SIZE;
@@ -636,8 +639,6 @@ fail_bdi:
 	bdi_destroy(&q->backing_dev_info);
 fail_id:
 	ida_simple_remove(&blk_queue_ida, q->id);
-fail_c:
-	percpu_counter_destroy(&q->mq_usage_counter);
 fail_q:
 	kmem_cache_free(blk_requestq_cachep, q);
 	return NULL;
@@ -716,6 +717,7 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
 
 	q->request_fn		= rfn;
 	q->prep_rq_fn		= NULL;
+	q->unprep_rq_fn		= NULL;
 	q->queue_flags		|= QUEUE_FLAG_DEFAULT;
 
 	/* Override internal queue lock with supplied lock pointer */
@@ -842,6 +844,47 @@ static void freed_request(struct request_list *rl, unsigned int flags)
 
 	if (unlikely(rl->starved[sync ^ 1]))
 		__freed_request(rl, sync ^ 1);
+}
+
+int blk_update_nr_requests(struct request_queue *q, unsigned int nr)
+{
+	struct request_list *rl;
+
+	spin_lock_irq(q->queue_lock);
+	q->nr_requests = nr;
+	blk_queue_congestion_threshold(q);
+
+	/* congestion isn't cgroup aware and follows root blkcg for now */
+	rl = &q->root_rl;
+
+	if (rl->count[BLK_RW_SYNC] >= queue_congestion_on_threshold(q))
+		blk_set_queue_congested(q, BLK_RW_SYNC);
+	else if (rl->count[BLK_RW_SYNC] < queue_congestion_off_threshold(q))
+		blk_clear_queue_congested(q, BLK_RW_SYNC);
+
+	if (rl->count[BLK_RW_ASYNC] >= queue_congestion_on_threshold(q))
+		blk_set_queue_congested(q, BLK_RW_ASYNC);
+	else if (rl->count[BLK_RW_ASYNC] < queue_congestion_off_threshold(q))
+		blk_clear_queue_congested(q, BLK_RW_ASYNC);
+
+	blk_queue_for_each_rl(rl, q) {
+		if (rl->count[BLK_RW_SYNC] >= q->nr_requests) {
+			blk_set_rl_full(rl, BLK_RW_SYNC);
+		} else {
+			blk_clear_rl_full(rl, BLK_RW_SYNC);
+			wake_up(&rl->wait[BLK_RW_SYNC]);
+		}
+
+		if (rl->count[BLK_RW_ASYNC] >= q->nr_requests) {
+			blk_set_rl_full(rl, BLK_RW_ASYNC);
+		} else {
+			blk_clear_rl_full(rl, BLK_RW_ASYNC);
+			wake_up(&rl->wait[BLK_RW_ASYNC]);
+		}
+	}
+
+	spin_unlock_irq(q->queue_lock);
+	return 0;
 }
 
 /*
@@ -1133,7 +1176,7 @@ static struct request *blk_old_get_request(struct request_queue *q, int rw,
 struct request *blk_get_request(struct request_queue *q, int rw, gfp_t gfp_mask)
 {
 	if (q->mq_ops)
-		return blk_mq_alloc_request(q, rw, gfp_mask);
+		return blk_mq_alloc_request(q, rw, gfp_mask, false);
 	else
 		return blk_old_get_request(q, rw, gfp_mask);
 }
@@ -1326,7 +1369,7 @@ void __blk_put_request(struct request_queue *q, struct request *req)
 		struct request_list *rl = blk_rq_rl(req);
 
 		BUG_ON(!list_empty(&req->queuelist));
-		BUG_ON(!hlist_unhashed(&req->hash));
+		BUG_ON(ELV_ON_HASH(req));
 
 		blk_free_request(rl, req);
 		freed_request(rl, flags);
@@ -2372,7 +2415,7 @@ bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
 	if (!req->bio)
 		return false;
 
-	trace_block_rq_complete(req->q, req);
+	trace_block_rq_complete(req->q, req, nr_bytes);
 
 	/*
 	 * For fs requests, rq is just carrier of independent bio's
@@ -2501,12 +2544,18 @@ static bool blk_update_bidi_request(struct request *rq, int error,
  * @req:	the request
  *
  * This function makes a request ready for complete resubmission (or
- * completion).  It happens only after all error handling is complete.
- * The queue lock is held when calling this.
+ * completion).  It happens only after all error handling is complete,
+ * so represents the appropriate moment to deallocate any resources
+ * that were allocated to the request in the prep_rq_fn.  The queue
+ * lock is held when calling this.
  */
 void blk_unprep_request(struct request *req)
 {
+	struct request_queue *q = req->q;
+
 	req->cmd_flags &= ~REQ_DONTPREP;
+	if (q->unprep_rq_fn)
+		q->unprep_rq_fn(q, req);
 }
 EXPORT_SYMBOL_GPL(blk_unprep_request);
 

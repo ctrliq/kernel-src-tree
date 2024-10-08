@@ -705,6 +705,9 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	new->ooo_okay		= old->ooo_okay;
 	new->no_fcs		= old->no_fcs;
 	new->encapsulation	= old->encapsulation;
+	new->encap_hdr_csum	= old->encap_hdr_csum;
+	new->csum_valid		= old->csum_valid;
+	new->csum_complete_sw	= old->csum_complete_sw;
 #ifdef CONFIG_XFRM
 	new->sp			= secpath_get(old->sp);
 #endif
@@ -1925,9 +1928,8 @@ fault:
 EXPORT_SYMBOL(skb_store_bits);
 
 /* Checksum skb data. */
-
-__wsum skb_checksum(const struct sk_buff *skb, int offset,
-			  int len, __wsum csum)
+__wsum __skb_checksum(const struct sk_buff *skb, int offset, int len,
+		      __wsum csum, const struct skb_checksum_ops *ops)
 {
 	int start = skb_headlen(skb);
 	int i, copy = start - offset;
@@ -1938,7 +1940,7 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
 	if (copy > 0) {
 		if (copy > len)
 			copy = len;
-		csum = csum_partial(skb->data + offset, copy, csum);
+		csum = ops->update(skb->data + offset, copy, csum);
 		if ((len -= copy) == 0)
 			return csum;
 		offset += copy;
@@ -1959,10 +1961,10 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
 			if (copy > len)
 				copy = len;
 			vaddr = kmap_atomic(skb_frag_page(frag));
-			csum2 = csum_partial(vaddr + frag->page_offset +
-					     offset - start, copy, 0);
+			csum2 = ops->update(vaddr + frag->page_offset +
+					    offset - start, copy, 0);
 			kunmap_atomic(vaddr);
-			csum = csum_block_add(csum, csum2, pos);
+			csum = ops->combine(csum, csum2, pos, copy);
 			if (!(len -= copy))
 				return csum;
 			offset += copy;
@@ -1981,9 +1983,9 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
 			__wsum csum2;
 			if (copy > len)
 				copy = len;
-			csum2 = skb_checksum(frag_iter, offset - start,
-					     copy, 0);
-			csum = csum_block_add(csum, csum2, pos);
+			csum2 = __skb_checksum(frag_iter, offset - start,
+					       copy, 0, ops);
+			csum = ops->combine(csum, csum2, pos, copy);
 			if ((len -= copy) == 0)
 				return csum;
 			offset += copy;
@@ -1994,6 +1996,18 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
 	BUG_ON(len);
 
 	return csum;
+}
+EXPORT_SYMBOL(__skb_checksum);
+
+__wsum skb_checksum(const struct sk_buff *skb, int offset,
+		    int len, __wsum csum)
+{
+	const struct skb_checksum_ops ops = {
+		.update  = csum_partial_ext,
+		.combine = csum_block_add_ext,
+	};
+
+	return __skb_checksum(skb, offset, len, csum, &ops);
 }
 EXPORT_SYMBOL(skb_checksum);
 
@@ -2112,25 +2126,31 @@ EXPORT_SYMBOL_GPL(skb_zerocopy_headlen);
  *
  *	The `hlen` as calculated by skb_zerocopy_headlen() specifies the
  *	headroom in the `to` buffer.
+ *
+ *	Return value:
+ *	0: everything is OK
+ *	-ENOMEM: couldn't orphan frags of @from due to lack of memory
+ *	-EFAULT: skb_copy_bits() found some problem with skb geometry
  */
-void
-skb_zerocopy(struct sk_buff *to, const struct sk_buff *from, int len, int hlen)
+int
+skb_zerocopy(struct sk_buff *to, struct sk_buff *from, int len, int hlen)
 {
 	int i, j = 0;
 	int plen = 0; /* length of skb->head fragment */
+	int ret;
 	struct page *page;
 	unsigned int offset;
 
 	BUG_ON(!from->head_frag && !hlen);
 
 	/* dont bother with small payloads */
-	if (len <= skb_tailroom(to)) {
-		skb_copy_bits(from, 0, skb_put(to, len), len);
-		return;
-	}
+	if (len <= skb_tailroom(to))
+		return skb_copy_bits(from, 0, skb_put(to, len), len);
 
 	if (hlen) {
-		skb_copy_bits(from, 0, skb_put(to, hlen), hlen);
+		ret = skb_copy_bits(from, 0, skb_put(to, hlen), hlen);
+		if (unlikely(ret))
+			return ret;
 		len -= hlen;
 	} else {
 		plen = min_t(int, skb_headlen(from), len);
@@ -2148,6 +2168,11 @@ skb_zerocopy(struct sk_buff *to, const struct sk_buff *from, int len, int hlen)
 	to->len += len + plen;
 	to->data_len += len + plen;
 
+	if (unlikely(skb_orphan_frags(from, GFP_ATOMIC))) {
+		skb_tx_error(from);
+		return -ENOMEM;
+	}
+
 	for (i = 0; i < skb_shinfo(from)->nr_frags; i++) {
 		if (!len)
 			break;
@@ -2158,6 +2183,8 @@ skb_zerocopy(struct sk_buff *to, const struct sk_buff *from, int len, int hlen)
 		j++;
 	}
 	skb_shinfo(to)->nr_frags = j;
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(skb_zerocopy);
 
@@ -2847,12 +2874,14 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	int i = 0;
 	int pos;
 
+	__skb_push(head_skb, doffset);
 	proto = skb_network_protocol(head_skb);
 	if (unlikely(!proto))
 		return ERR_PTR(-EINVAL);
 
-	csum = !!can_checksum_protocol(features, proto);
-	__skb_push(head_skb, doffset);
+	csum = !head_skb->encap_hdr_csum &&
+	    !!can_checksum_protocol(features, proto);
+
 	headroom = skb_headroom(head_skb);
 	pos = skb_headlen(head_skb);
 
@@ -2949,6 +2978,8 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 			nskb->csum = skb_copy_and_csum_bits(head_skb, offset,
 							    skb_put(nskb, len),
 							    len, 0);
+			SKB_GSO_CB(nskb)->csum_start =
+			    skb_headroom(nskb) + doffset;
 			continue;
 		}
 
@@ -3018,6 +3049,8 @@ perform_csum_check:
 			nskb->csum = skb_checksum(nskb, doffset,
 						  nskb->len - doffset, 0);
 			nskb->ip_summed = CHECKSUM_NONE;
+			SKB_GSO_CB(nskb)->csum_start =
+			    skb_headroom(nskb) + doffset;
 		}
 	} while ((offset += len) < head_skb->len);
 
@@ -3607,17 +3640,22 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 EXPORT_SYMBOL(skb_try_coalesce);
 
 /**
- * skb_scrub_packet - scrub an skb before sending it to another netns
+ * skb_scrub_packet - scrub an skb
  *
  * @skb: buffer to clean
+ * @xnet: packet is crossing netns
  *
- * skb_scrub_packet can be used to clean an skb before injecting it in
- * another namespace. We have to clear all information in the skb that
- * could impact namespace isolation.
+ * skb_scrub_packet can be used after encapsulating or decapsulting a packet
+ * into/from a tunnel. Some information have to be cleared during these
+ * operations.
+ * skb_scrub_packet can also be used to clean a skb before injecting it in
+ * another namespace (@xnet == true). We have to clear all information in the
+ * skb that could impact namespace isolation.
  */
-void skb_scrub_packet(struct sk_buff *skb)
+void skb_scrub_packet(struct sk_buff *skb, bool xnet)
 {
-	skb_orphan(skb);
+	if (xnet)
+		skb_orphan(skb);
 	skb->tstamp.tv64 = 0;
 	skb->pkt_type = PACKET_HOST;
 	skb->skb_iif = 0;

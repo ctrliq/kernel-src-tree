@@ -36,7 +36,6 @@
 
 #include <linux/slab.h>
 #include <linux/nfs_fs.h>
-#include <linux/export.h>
 #include "nfsd.h"
 #include "acl.h"
 
@@ -150,9 +149,10 @@ nfs4_acl_posix_to_nfsv4(struct posix_acl *pacl, struct posix_acl *dpacl,
 	}
 
 	/* Allocate for worst case: one (deny, allow) pair each: */
-	acl = nfs4_acl_new(size);
+	acl = kmalloc(nfs4_acl_bytes(size), GFP_KERNEL);
 	if (acl == NULL)
 		return ERR_PTR(-ENOMEM);
+	acl->naces = 0;
 
 	if (pacl)
 		_posix_to_nfsv4_one(pacl, acl, flags & ~NFS4_ACL_TYPE_DEFAULT);
@@ -807,16 +807,13 @@ ace2type(struct nfs4_ace *ace)
 EXPORT_SYMBOL(nfs4_acl_posix_to_nfsv4);
 EXPORT_SYMBOL(nfs4_acl_nfsv4_to_posix);
 
-struct nfs4_acl *
-nfs4_acl_new(int n)
+/*
+ * return the size of the struct nfs4_acl required to represent an acl
+ * with @entries entries.
+ */
+int nfs4_acl_bytes(int entries)
 {
-	struct nfs4_acl *acl;
-
-	acl = kmalloc(sizeof(*acl) + n*sizeof(struct nfs4_ace), GFP_KERNEL);
-	if (acl == NULL)
-		return NULL;
-	acl->naces = 0;
-	return acl;
+	return sizeof(struct nfs4_acl) + entries * sizeof(struct nfs4_ace);
 }
 
 static struct {
@@ -873,6 +870,5 @@ __be32 nfs4_acl_write_who(struct xdr_stream *xdr, int who)
 	return nfserr_serverfault;
 }
 
-EXPORT_SYMBOL(nfs4_acl_new);
 EXPORT_SYMBOL(nfs4_acl_get_whotype);
 EXPORT_SYMBOL(nfs4_acl_write_who);

@@ -69,21 +69,28 @@ const struct address_space_operations nfs_dir_aops = {
 
 static struct nfs_open_dir_context *alloc_nfs_open_dir_context(struct inode *dir, struct rpc_cred *cred)
 {
+	struct nfs_inode *nfsi = NFS_I(dir);
 	struct nfs_open_dir_context *ctx;
 	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
 	if (ctx != NULL) {
 		ctx->duped = 0;
-		ctx->attr_gencount = NFS_I(dir)->attr_gencount;
+		ctx->attr_gencount = nfsi->attr_gencount;
 		ctx->dir_cookie = 0;
 		ctx->dup_cookie = 0;
 		ctx->cred = get_rpccred(cred);
+		spin_lock(&dir->i_lock);
+		list_add(&ctx->list, &nfsi->open_files);
+		spin_unlock(&dir->i_lock);
 		return ctx;
 	}
 	return  ERR_PTR(-ENOMEM);
 }
 
-static void put_nfs_open_dir_context(struct nfs_open_dir_context *ctx)
+static void put_nfs_open_dir_context(struct inode *dir, struct nfs_open_dir_context *ctx)
 {
+	spin_lock(&dir->i_lock);
+	list_del(&ctx->list);
+	spin_unlock(&dir->i_lock);
 	put_rpccred(ctx->cred);
 	kfree(ctx);
 }
@@ -126,7 +133,7 @@ out:
 static int
 nfs_closedir(struct inode *inode, struct file *filp)
 {
-	put_nfs_open_dir_context(filp->private_data);
+	put_nfs_open_dir_context(filp->f_path.dentry->d_inode, filp->private_data);
 	return 0;
 }
 
@@ -433,6 +440,22 @@ static
 void nfs_advise_use_readdirplus(struct inode *dir)
 {
 	set_bit(NFS_INO_ADVISE_RDPLUS, &NFS_I(dir)->flags);
+}
+
+/*
+ * This function is mainly for use by nfs_getattr().
+ *
+ * If this is an 'ls -l', we want to force use of readdirplus.
+ * Do this by checking if there is an active file descriptor
+ * and calling nfs_advise_use_readdirplus, then forcing a
+ * cache flush.
+ */
+void nfs_force_use_readdirplus(struct inode *dir)
+{
+	if (!list_empty(&NFS_I(dir)->open_files)) {
+		nfs_advise_use_readdirplus(dir);
+		nfs_zap_mapping(dir, dir->i_mapping);
+	}
 }
 
 static
@@ -816,6 +839,17 @@ int uncached_readdir(nfs_readdir_descriptor_t *desc, void *dirent,
 	goto out;
 }
 
+static bool nfs_dir_mapping_need_revalidate(struct inode *dir)
+{
+	struct nfs_inode *nfsi = NFS_I(dir);
+
+	if (nfs_attribute_cache_expired(dir))
+		return true;
+	if (nfsi->cache_validity & NFS_INO_INVALID_DATA)
+		return true;
+	return false;
+}
+
 /* The file offset position represents the dirent entry number.  A
    last cookie cache takes care of the common case of reading the
    whole directory.
@@ -847,7 +881,7 @@ static int nfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 	desc->plus = nfs_use_readdirplus(inode, filp) ? 1 : 0;
 
 	nfs_block_sillyrename(dentry);
-	if (filp->f_pos == 0 || nfs_attribute_cache_expired(inode))
+	if (filp->f_pos == 0 || nfs_dir_mapping_need_revalidate(inode))
 		res = nfs_revalidate_mapping(inode, filp->f_mapping);
 	if (res < 0)
 		goto out;
@@ -2042,7 +2076,7 @@ static atomic_long_t nfs_access_nr_entries;
 static void nfs_access_free_entry(struct nfs_access_entry *entry)
 {
 	put_rpccred(entry->cred);
-	kfree(entry);
+	kfree_rcu(entry, rcu_head);
 	smp_mb__before_atomic_dec();
 	atomic_long_dec(&nfs_access_nr_entries);
 	smp_mb__after_atomic_dec();
@@ -2189,6 +2223,38 @@ out_zap:
 	return -ENOENT;
 }
 
+static int nfs_access_get_cached_rcu(struct inode *inode, struct rpc_cred *cred, struct nfs_access_entry *res)
+{
+	/* Only check the most recently returned cache entry,
+	 * but do it without locking.
+	 */
+	struct nfs_inode *nfsi = NFS_I(inode);
+	struct nfs_access_entry *cache;
+	int err = -ECHILD;
+	struct list_head *lh;
+
+	rcu_read_lock();
+	if (nfsi->cache_validity & NFS_INO_INVALID_ACCESS)
+		goto out;
+	lh = rcu_dereference(nfsi->access_cache_entry_lru.prev);
+	cache = list_entry(lh, struct nfs_access_entry, lru);
+	if (lh == &nfsi->access_cache_entry_lru ||
+	    cred != cache->cred)
+		cache = NULL;
+	if (cache == NULL)
+		goto out;
+	if (!nfs_have_delegated_attributes(inode) &&
+	    !time_in_range_open(jiffies, cache->jiffies, cache->jiffies + nfsi->attrtimeo))
+		goto out;
+	res->jiffies = cache->jiffies;
+	res->cred = cache->cred;
+	res->mask = cache->mask;
+	err = 0;
+out:
+	rcu_read_unlock();
+	return err;
+}
+
 static void nfs_access_add_rbtree(struct inode *inode, struct nfs_access_entry *set)
 {
 	struct nfs_inode *nfsi = NFS_I(inode);
@@ -2232,6 +2298,11 @@ void nfs_access_add_cache(struct inode *inode, struct nfs_access_entry *set)
 	cache->cred = get_rpccred(set->cred);
 	cache->mask = set->mask;
 
+	/* The above field assignments must be visible
+	 * before this item appears on the lru.  We cannot easily
+	 * use rcu_assign_pointer, so just force the memory barrier.
+	 */
+	smp_wmb();
 	nfs_access_add_rbtree(inode, cache);
 
 	/* Update accounting */
@@ -2270,7 +2341,9 @@ static int nfs_do_access(struct inode *inode, struct rpc_cred *cred, int mask)
 
 	trace_nfs_access_enter(inode);
 
-	status = nfs_access_get_cached(inode, cred, &cache);
+	status = nfs_access_get_cached_rcu(inode, cred, &cache);
+	if (status != 0)
+		status = nfs_access_get_cached(inode, cred, &cache);
 	if (status == 0)
 		goto out_cached;
 

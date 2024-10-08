@@ -10,7 +10,7 @@
 #include "symbol.h"
 #include "cache.h"
 #include "header.h"
-#include <lk/debugfs.h>
+#include <api/fs/debugfs.h>
 #include "parse-events-bison.h"
 #define YY_EXTRA_TYPE int
 #include "parse-events-flex.h"
@@ -204,7 +204,7 @@ struct tracepoint_path *tracepoint_id_to_path(u64 config)
 				}
 				path->name = malloc(MAX_EVENT_LENGTH);
 				if (!path->name) {
-					free(path->system);
+					zfree(&path->system);
 					free(path);
 					return NULL;
 				}
@@ -236,8 +236,8 @@ struct tracepoint_path *tracepoint_name_to_path(const char *name)
 	path->name = strdup(str+1);
 
 	if (path->system == NULL || path->name == NULL) {
-		free(path->system);
-		free(path->name);
+		zfree(&path->system);
+		zfree(&path->name);
 		free(path);
 		path = NULL;
 	}
@@ -820,8 +820,7 @@ int parse_events__modifier_event(struct list_head *list, char *str, bool add)
 	if (!add && get_event_modifier(&mod, str, NULL))
 		return -EINVAL;
 
-	list_for_each_entry(evsel, list, node) {
-
+	__evlist__for_each(list, evsel) {
 		if (add && get_event_modifier(&mod, str, evsel))
 			return -EINVAL;
 
@@ -845,7 +844,7 @@ int parse_events_name(struct list_head *list, char *name)
 {
 	struct perf_evsel *evsel;
 
-	list_for_each_entry(evsel, list, node) {
+	__evlist__for_each(list, evsel) {
 		if (!evsel->name)
 			evsel->name = strdup(name);
 	}
@@ -917,7 +916,7 @@ int parse_events_terms(struct list_head *terms, const char *str)
 	ret = parse_events__scanner(str, &data, PE_START_TERMS);
 	if (!ret) {
 		list_splice(data.terms, terms);
-		free(data.terms);
+		zfree(&data.terms);
 		return 0;
 	}
 

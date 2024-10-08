@@ -19,8 +19,9 @@
 #include <linux/cpu.h>
 #include <linux/pm_runtime.h>
 #include <linux/suspend.h>
-#include <linux/kexec.h>
 #include "pci.h"
+
+extern bool kexec_in_progress;
 
 struct pci_dynid {
 	struct list_head node;

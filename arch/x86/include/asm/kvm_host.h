@@ -32,7 +32,7 @@
 #include <asm/asm.h>
 
 #define KVM_MAX_VCPUS 255
-#define KVM_SOFT_MAX_VCPUS 160
+#define KVM_SOFT_MAX_VCPUS 240
 #define KVM_USER_MEM_SLOTS 125
 /* memory slots that are not exposed to userspace */
 #define KVM_PRIVATE_MEM_SLOTS 3
@@ -255,7 +255,6 @@ struct kvm_pio_request {
  * mode.
  */
 struct kvm_mmu {
-	void (*new_cr3)(struct kvm_vcpu *vcpu);
 	void (*set_cr3)(struct kvm_vcpu *vcpu, unsigned long root);
 	unsigned long (*get_cr3)(struct kvm_vcpu *vcpu);
 	u64 (*get_pdptr)(struct kvm_vcpu *vcpu, int index);
@@ -263,7 +262,6 @@ struct kvm_mmu {
 			  bool prefault);
 	void (*inject_page_fault)(struct kvm_vcpu *vcpu,
 				  struct x86_exception *fault);
-	void (*free)(struct kvm_vcpu *vcpu);
 	gpa_t (*gva_to_gpa)(struct kvm_vcpu *vcpu, gva_t gva, u32 access,
 			    struct x86_exception *exception);
 	gpa_t (*translate_gpa)(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access);
@@ -288,6 +286,7 @@ struct kvm_mmu {
 	u64 *pae_root;
 	u64 *lm_root;
 	u64 rsvd_bits_mask[2][4];
+	u64 bad_mt_xwr;
 
 	/*
 	 * Bitmap: bit set = last pte in walk
@@ -521,6 +520,9 @@ struct kvm_vcpu_arch {
 	 */
 	bool write_fault_to_shadow_pgtable;
 
+	/* set at EPT violation at this point */
+	unsigned long exit_qualification;
+
 	/* pv related host specific info */
 	struct {
 		bool pv_unhalted;
@@ -572,7 +574,7 @@ struct kvm_arch {
 	struct kvm_apic_map *apic_map;
 
 	unsigned int tss_addr;
-	struct page *apic_access_page;
+	bool apic_access_page_done;
 
 	gpa_t wall_clock;
 
@@ -729,14 +731,15 @@ struct kvm_x86_ops {
 	int (*nmi_allowed)(struct kvm_vcpu *vcpu);
 	bool (*get_nmi_mask)(struct kvm_vcpu *vcpu);
 	void (*set_nmi_mask)(struct kvm_vcpu *vcpu, bool masked);
-	int (*enable_nmi_window)(struct kvm_vcpu *vcpu);
-	int (*enable_irq_window)(struct kvm_vcpu *vcpu);
+	void (*enable_nmi_window)(struct kvm_vcpu *vcpu);
+	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
 	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
 	int (*vm_has_apicv)(struct kvm *kvm);
 	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
 	void (*hwapic_isr_update)(struct kvm *kvm, int isr);
 	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
 	void (*set_virtual_x2apic_mode)(struct kvm_vcpu *vcpu, bool set);
+	void (*set_apic_access_page_addr)(struct kvm_vcpu *vcpu, hpa_t hpa);
 	void (*deliver_posted_interrupt)(struct kvm_vcpu *vcpu, int vector);
 	void (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
 	int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
@@ -767,6 +770,10 @@ struct kvm_x86_ops {
 			       enum x86_intercept_stage stage);
 	void (*handle_external_intr)(struct kvm_vcpu *vcpu);
 	bool (*mpx_supported)(void);
+
+	int (*check_nested_events)(struct kvm_vcpu *vcpu, bool external_intr);
+
+	void (*sched_in)(struct kvm_vcpu *kvm, int cpu);
 };
 
 struct kvm_arch_async_pf {
@@ -794,11 +801,11 @@ void kvm_mmu_module_exit(void);
 
 void kvm_mmu_destroy(struct kvm_vcpu *vcpu);
 int kvm_mmu_create(struct kvm_vcpu *vcpu);
-int kvm_mmu_setup(struct kvm_vcpu *vcpu);
+void kvm_mmu_setup(struct kvm_vcpu *vcpu);
 void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
 		u64 dirty_mask, u64 nx_mask, u64 x_mask);
 
-int kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
+void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
 void kvm_mmu_slot_remove_write_access(struct kvm *kvm, int slot);
 void kvm_mmu_write_protect_pt_masked(struct kvm *kvm,
 				     struct kvm_memory_slot *slot,
@@ -936,6 +943,7 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
 int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gva_t gva, u32 error_code,
 		       void *insn, int insn_len);
 void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva);
+void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu);
 
 void kvm_enable_tdp(void);
 void kvm_disable_tdp(void);
@@ -1040,6 +1048,9 @@ int kvm_cpu_has_interrupt(struct kvm_vcpu *vcpu);
 int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu);
 int kvm_cpu_get_interrupt(struct kvm_vcpu *v);
 void kvm_vcpu_reset(struct kvm_vcpu *vcpu);
+void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu);
+void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
+					   unsigned long address);
 
 void kvm_define_shared_msr(unsigned index, u32 msr);
 void kvm_set_shared_msr(unsigned index, u64 val, u64 mask);

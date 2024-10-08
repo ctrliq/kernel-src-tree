@@ -60,7 +60,6 @@ static int data__files_cnt;
 #define data__for_each_file(i, d) data__for_each_file_start(i, d, 0)
 #define data__for_each_file_new(i, d) data__for_each_file_start(i, d, 1)
 
-static char diff__default_sort_order[] = "dso,symbol";
 static bool force;
 static bool show_period;
 static bool show_formula;
@@ -316,7 +315,7 @@ static int hists__add_entry(struct hists *hists,
 			    u64 weight, u64 transaction)
 {
 	if (__hists__add_entry(hists, al, NULL, NULL, NULL, period, weight,
-			       transaction) != NULL)
+			       transaction, true) != NULL)
 		return 0;
 	return -ENOMEM;
 }
@@ -341,11 +340,16 @@ static int diff__process_sample_event(struct perf_tool *tool __maybe_unused,
 		return -1;
 	}
 
-	if (al.filtered == 0) {
-		evsel->hists.stats.total_non_filtered_period += sample->period;
-		evsel->hists.nr_non_filtered_entries++;
-	}
+	/*
+	 * The total_period is updated here before going to the output
+	 * tree since normally only the baseline hists will call
+	 * hists__output_resort() and precompute needs the total
+	 * period in order to sort entries by percentage delta.
+	 */
 	evsel->hists.stats.total_period += sample->period;
+	if (!al.filtered)
+		evsel->hists.stats.total_non_filtered_period += sample->period;
+
 	return 0;
 }
 
@@ -365,9 +369,10 @@ static struct perf_evsel *evsel_match(struct perf_evsel *evsel,
 {
 	struct perf_evsel *e;
 
-	list_for_each_entry(e, &evlist->entries, node)
+	evlist__for_each(evlist, e) {
 		if (perf_evsel__match2(evsel, e))
 			return e;
+	}
 
 	return NULL;
 }
@@ -376,10 +381,10 @@ static void perf_evlist__collapse_resort(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel;
 
-	list_for_each_entry(evsel, &evlist->entries, node) {
+	evlist__for_each(evlist, evsel) {
 		struct hists *hists = &evsel->hists;
 
-		hists__collapse_resort(hists);
+		hists__collapse_resort(hists, NULL);
 	}
 }
 
@@ -572,10 +577,7 @@ static void hists__compute_resort(struct hists *hists)
 	hists->entries = RB_ROOT;
 	next = rb_first(root);
 
-	hists->nr_entries = 0;
-	hists->nr_non_filtered_entries = 0;
-	hists->stats.total_period = 0;
-	hists->stats.total_non_filtered_period = 0;
+	hists__reset_stats(hists);
 	hists__reset_col_len(hists);
 
 	while (next != NULL) {
@@ -585,7 +587,10 @@ static void hists__compute_resort(struct hists *hists)
 		next = rb_next(&he->rb_node_in);
 
 		insert_hist_entry_by_compute(&hists->entries, he, compute);
-		hists__inc_nr_entries(hists, he);
+		hists__inc_stats(hists, he);
+
+		if (!he->filtered)
+			hists__calc_col_len(hists, he);
 	}
 }
 
@@ -625,7 +630,7 @@ static void data_process(void)
 	struct perf_evsel *evsel_base;
 	bool first = true;
 
-	list_for_each_entry(evsel_base, &evlist_base->entries, node) {
+	evlist__for_each(evlist_base, evsel_base) {
 		struct data__file *d;
 		int i;
 
@@ -665,7 +670,7 @@ static void data__free(struct data__file *d)
 	for (col = 0; col < PERF_HPP_DIFF__MAX_INDEX; col++) {
 		struct diff_hpp_fmt *fmt = &d->fmt[col];
 
-		free(fmt->header);
+		zfree(&fmt->header);
 	}
 }
 
@@ -1134,7 +1139,8 @@ static int data_init(int argc, const char **argv)
 
 int cmd_diff(int argc, const char **argv, const char *prefix __maybe_unused)
 {
-	sort_order = diff__default_sort_order;
+	perf_config(perf_default_config, NULL);
+
 	argc = parse_options(argc, argv, options, diff_usage, 0);
 
 	if (symbol__init() < 0)
@@ -1144,6 +1150,8 @@ int cmd_diff(int argc, const char **argv, const char *prefix __maybe_unused)
 		return -1;
 
 	ui_init();
+
+	sort__mode = SORT_MODE__DIFF;
 
 	if (setup_sorting() < 0)
 		usage_with_options(diff_usage, options);

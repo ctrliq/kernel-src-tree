@@ -267,4 +267,3 @@ int gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
 		sdp->sd_fsname, function, file, line);
 	return rv;
 }
-

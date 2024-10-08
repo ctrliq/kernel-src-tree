@@ -70,7 +70,8 @@ MODULE_LICENSE("GPL");
  * 		kvm->lock --> kvm->slots_lock --> kvm->irq_lock
  */
 
-DEFINE_RAW_SPINLOCK(kvm_lock);
+DEFINE_SPINLOCK(kvm_lock);
+static DEFINE_RAW_SPINLOCK(kvm_count_lock);
 LIST_HEAD(vm_list);
 
 static cpumask_var_t cpus_hardware_enabled;
@@ -192,6 +193,7 @@ void kvm_flush_remote_tlbs(struct kvm *kvm)
 		++kvm->stat.remote_tlb_flush;
 	cmpxchg(&kvm->tlbs_dirty, dirty_count, 0);
 }
+EXPORT_SYMBOL_GPL(kvm_flush_remote_tlbs);
 
 void kvm_reload_remote_mmus(struct kvm *kvm)
 {
@@ -293,6 +295,9 @@ static void kvm_mmu_notifier_invalidate_page(struct mmu_notifier *mn,
 		kvm_flush_remote_tlbs(kvm);
 
 	spin_unlock(&kvm->mmu_lock);
+
+	kvm_arch_mmu_notifier_invalidate_page(kvm, address);
+
 	srcu_read_unlock(&kvm->srcu, idx);
 }
 
@@ -500,9 +505,9 @@ static struct kvm *kvm_create_vm(unsigned long type)
 	if (r)
 		goto out_err;
 
-	raw_spin_lock(&kvm_lock);
+	spin_lock(&kvm_lock);
 	list_add(&kvm->vm_list, &vm_list);
-	raw_spin_unlock(&kvm_lock);
+	spin_unlock(&kvm_lock);
 
 	return kvm;
 
@@ -552,13 +557,13 @@ static void kvm_destroy_dirty_bitmap(struct kvm_memory_slot *memslot)
 /*
  * Free any memory in @free but not in @dont.
  */
-static void kvm_free_physmem_slot(struct kvm_memory_slot *free,
+static void kvm_free_physmem_slot(struct kvm *kvm, struct kvm_memory_slot *free,
 				  struct kvm_memory_slot *dont)
 {
 	if (!dont || free->dirty_bitmap != dont->dirty_bitmap)
 		kvm_destroy_dirty_bitmap(free);
 
-	kvm_arch_free_memslot(free, dont);
+	kvm_arch_free_memslot(kvm, free, dont);
 
 	free->npages = 0;
 }
@@ -569,7 +574,7 @@ static void kvm_free_physmem(struct kvm *kvm)
 	struct kvm_memory_slot *memslot;
 
 	kvm_for_each_memslot(memslot, slots)
-		kvm_free_physmem_slot(memslot, NULL);
+		kvm_free_physmem_slot(kvm, memslot, NULL);
 
 	kfree(kvm->memslots);
 }
@@ -593,9 +598,9 @@ static void kvm_destroy_vm(struct kvm *kvm)
 	struct mm_struct *mm = kvm->mm;
 
 	kvm_arch_sync_events(kvm);
-	raw_spin_lock(&kvm_lock);
+	spin_lock(&kvm_lock);
 	list_del(&kvm->vm_list);
-	raw_spin_unlock(&kvm_lock);
+	spin_unlock(&kvm_lock);
 	kvm_free_irq_routing(kvm);
 	for (i = 0; i < KVM_NR_BUSES; i++)
 		kvm_io_bus_destroy(kvm->buses[i]);
@@ -835,7 +840,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	if (change == KVM_MR_CREATE) {
 		new.userspace_addr = mem->userspace_addr;
 
-		if (kvm_arch_create_memslot(&new, npages))
+		if (kvm_arch_create_memslot(kvm, &new, npages))
 			goto out_free;
 	}
 
@@ -896,7 +901,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 
 	kvm_arch_commit_memory_region(kvm, mem, &old, change);
 
-	kvm_free_physmem_slot(&old, &new);
+	kvm_free_physmem_slot(kvm, &old, &new);
 	kfree(old_memslots);
 
 	/*
@@ -918,7 +923,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 out_slots:
 	kfree(slots);
 out_free:
-	kvm_free_physmem_slot(&new, &old);
+	kvm_free_physmem_slot(kvm, &new, &old);
 out:
 	return r;
 }
@@ -977,6 +982,7 @@ int kvm_get_dirty_log(struct kvm *kvm,
 out:
 	return r;
 }
+EXPORT_SYMBOL_GPL(kvm_get_dirty_log);
 
 bool kvm_largepages_enabled(void)
 {
@@ -1662,6 +1668,7 @@ void mark_page_dirty(struct kvm *kvm, gfn_t gfn)
 	memslot = gfn_to_memslot(kvm, gfn);
 	mark_page_dirty_in_slot(kvm, memslot, gfn);
 }
+EXPORT_SYMBOL_GPL(mark_page_dirty);
 
 /*
  * The vCPU has executed a HLT instruction with in-kernel mode enabled.
@@ -1687,6 +1694,7 @@ void kvm_vcpu_block(struct kvm_vcpu *vcpu)
 
 	finish_wait(&vcpu->wq, &wait);
 }
+EXPORT_SYMBOL_GPL(kvm_vcpu_block);
 
 #ifndef CONFIG_S390
 /*
@@ -2573,7 +2581,7 @@ static long kvm_dev_ioctl_check_extension_generic(long arg)
 #ifdef CONFIG_HAVE_KVM_MSI
 	case KVM_CAP_SIGNAL_MSI:
 #endif
-#ifdef CONFIG_HAVE_KVM_IRQ_ROUTING
+#ifdef CONFIG_HAVE_KVM_IRQFD
 	case KVM_CAP_IRQFD_RESAMPLE:
 #endif
 		return 1;
@@ -2663,10 +2671,10 @@ static void hardware_enable_nolock(void *junk)
 
 static void hardware_enable(void)
 {
-	raw_spin_lock(&kvm_lock);
+	raw_spin_lock(&kvm_count_lock);
 	if (kvm_usage_count)
 		hardware_enable_nolock(NULL);
-	raw_spin_unlock(&kvm_lock);
+	raw_spin_unlock(&kvm_count_lock);
 }
 
 static void hardware_disable_nolock(void *junk)
@@ -2681,10 +2689,10 @@ static void hardware_disable_nolock(void *junk)
 
 static void hardware_disable(void)
 {
-	raw_spin_lock(&kvm_lock);
+	raw_spin_lock(&kvm_count_lock);
 	if (kvm_usage_count)
 		hardware_disable_nolock(NULL);
-	raw_spin_unlock(&kvm_lock);
+	raw_spin_unlock(&kvm_count_lock);
 }
 
 static void hardware_disable_all_nolock(void)
@@ -2703,10 +2711,10 @@ static void hardware_disable_all(void)
 	char event_string[] = "EVENT=terminate";
 	char *envp[] = { event_string, count_string, NULL };
 
-	raw_spin_lock(&kvm_lock);
+	raw_spin_lock(&kvm_count_lock);
 	hardware_disable_all_nolock();
 	count = kvm_usage_count;
-	raw_spin_unlock(&kvm_lock);
+	raw_spin_unlock(&kvm_count_lock);
 
 	sprintf(count_string, "COUNT=%d", count);
 	kobject_uevent_env(&kvm_dev.this_device->kobj, KOBJ_CHANGE, envp);
@@ -2717,7 +2725,7 @@ static int hardware_enable_all(void)
 	int r = 0;
 	int count;
 
-	raw_spin_lock(&kvm_lock);
+	raw_spin_lock(&kvm_count_lock);
 
 	count = ++kvm_usage_count;
 	if (kvm_usage_count == 1) {
@@ -2730,7 +2738,7 @@ static int hardware_enable_all(void)
 		}
 	}
 
-	raw_spin_unlock(&kvm_lock);
+	raw_spin_unlock(&kvm_count_lock);
 
 	if (r == 0) {
 		char count_string[20];
@@ -3025,10 +3033,10 @@ static int vm_stat_get(void *_offset, u64 *val)
 	struct kvm *kvm;
 
 	*val = 0;
-	raw_spin_lock(&kvm_lock);
+	spin_lock(&kvm_lock);
 	list_for_each_entry(kvm, &vm_list, vm_list)
 		*val += *(u32 *)((void *)kvm + offset);
-	raw_spin_unlock(&kvm_lock);
+	spin_unlock(&kvm_lock);
 	return 0;
 }
 
@@ -3042,12 +3050,12 @@ static int vcpu_stat_get(void *_offset, u64 *val)
 	int i;
 
 	*val = 0;
-	raw_spin_lock(&kvm_lock);
+	spin_lock(&kvm_lock);
 	list_for_each_entry(kvm, &vm_list, vm_list)
 		kvm_for_each_vcpu(i, vcpu, kvm)
 			*val += *(u32 *)((void *)vcpu + offset);
 
-	raw_spin_unlock(&kvm_lock);
+	spin_unlock(&kvm_lock);
 	return 0;
 }
 
@@ -3102,7 +3110,7 @@ static int kvm_suspend(void)
 static void kvm_resume(void)
 {
 	if (kvm_usage_count) {
-		WARN_ON(raw_spin_is_locked(&kvm_lock));
+		WARN_ON(raw_spin_is_locked(&kvm_count_lock));
 		hardware_enable_nolock(NULL);
 	}
 }
@@ -3123,6 +3131,8 @@ static void kvm_sched_in(struct preempt_notifier *pn, int cpu)
 	struct kvm_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
 	if (vcpu->preempted)
 		vcpu->preempted = false;
+
+	kvm_arch_sched_in(vcpu, cpu);
 
 	kvm_arch_vcpu_load(vcpu, cpu);
 }

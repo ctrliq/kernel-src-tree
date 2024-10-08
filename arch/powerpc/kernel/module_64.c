@@ -44,8 +44,58 @@
 
 #if defined(_CALL_ELF) && _CALL_ELF == 2
 #define R2_STACK_OFFSET 24
+
+/* An address is simply the address of the function. */
+typedef unsigned long func_desc_t;
+
+static func_desc_t func_desc(unsigned long addr)
+{
+	return addr;
+}
+static unsigned long func_addr(unsigned long addr)
+{
+	return addr;
+}
+static unsigned long stub_func_addr(func_desc_t func)
+{
+	return func;
+}
+
+/* PowerPC64 specific values for the Elf64_Sym st_other field.  */
+#define STO_PPC64_LOCAL_BIT	5
+#define STO_PPC64_LOCAL_MASK	(7 << STO_PPC64_LOCAL_BIT)
+#define PPC64_LOCAL_ENTRY_OFFSET(other)					\
+ (((1 << (((other) & STO_PPC64_LOCAL_MASK) >> STO_PPC64_LOCAL_BIT)) >> 2) << 2)
+
+static unsigned int local_entry_offset(const Elf64_Sym *sym)
+{
+	/* sym->st_other indicates offset to local entry point
+	 * (otherwise it will assume r12 is the address of the start
+	 * of function and try to derive r2 from it). */
+	return PPC64_LOCAL_ENTRY_OFFSET(sym->st_other);
+}
 #else
 #define R2_STACK_OFFSET 40
+
+/* An address is address of the OPD entry, which contains address of fn. */
+typedef struct ppc64_opd_entry func_desc_t;
+
+static func_desc_t func_desc(unsigned long addr)
+{
+	return *(struct ppc64_opd_entry *)addr;
+}
+static unsigned long func_addr(unsigned long addr)
+{
+	return func_desc(addr).funcaddr;
+}
+static unsigned long stub_func_addr(func_desc_t func)
+{
+	return func.funcaddr;
+}
+static unsigned int local_entry_offset(const Elf64_Sym *sym)
+{
+	return 0;
+}
 #endif
 
 /* Like PPC32, we need little trampolines to do > 24-bit jumps (into
@@ -59,7 +109,7 @@ struct ppc64_stub_entry
 	u32 jump[7];
 	u32 unused;
 	/* Data for the above code */
-	struct ppc64_opd_entry opd;
+	func_desc_t funcdata;
 };
 
 /*
@@ -84,7 +134,7 @@ static u32 ppc64_stub_insns[] = {
 	0xe98b0020,			/* ld      r12,32(r11) */
 #if !defined(_CALL_ELF) || _CALL_ELF != 2
 	/* Set up new r2 from function descriptor */
-	0xe84b0026,			/* ld      r2,40(r11) */
+	0xe84b0028,			/* ld      r2,40(r11) */
 #endif
 	0x7d8903a6,			/* mtctr   r12 */
 	0x4e800420			/* bctr */
@@ -265,8 +315,17 @@ static void dedotify_versions(struct modversion_info *vers,
 	struct modversion_info *end;
 
 	for (end = (void *)vers + size; vers < end; vers++)
-		if (vers->name[0] == '.')
+		if (vers->name[0] == '.') {
 			memmove(vers->name, vers->name+1, strlen(vers->name));
+#ifdef ARCH_RELOCATES_KCRCTAB
+			/* The TOC symbol has no CRC computed. To avoid CRC
+			 * check failing, we must force it to the expected
+			 * value (see CRC check in module.c).
+			 */
+			if (!strcmp(vers->name, "TOC."))
+				vers->crc = -(unsigned long)reloc_start;
+#endif
+		}
 }
 
 /* Undefined symbols which refer to .funcname, hack to funcname (or .TOC.) */
@@ -281,6 +340,24 @@ static void dedotify(Elf64_Sym *syms, unsigned int numsyms, char *strtab)
 				memmove(name, name+1, strlen(name));
 		}
 	}
+}
+
+static Elf64_Sym *find_dot_toc(Elf64_Shdr *sechdrs,
+			       const char *strtab,
+			       unsigned int symindex)
+{
+	unsigned int i, numsyms;
+	Elf64_Sym *syms;
+
+	syms = (Elf64_Sym *)sechdrs[symindex].sh_addr;
+	numsyms = sechdrs[symindex].sh_size / sizeof(Elf64_Sym);
+
+	for (i = 1; i < numsyms; i++) {
+		if (syms[i].st_shndx == SHN_UNDEF
+		    && strcmp(strtab + syms[i].st_name, "TOC.") == 0)
+			return &syms[i];
+	}
+	return NULL;
 }
 
 int module_frob_arch_sections(Elf64_Ehdr *hdr,
@@ -347,7 +424,7 @@ static inline unsigned long my_r2(Elf64_Shdr *sechdrs, struct module *me)
 /* Patch stub to reference function and correct r2 value. */
 static inline int create_stub(Elf64_Shdr *sechdrs,
 			      struct ppc64_stub_entry *entry,
-			      struct ppc64_opd_entry *opd,
+			      unsigned long addr,
 			      struct module *me)
 {
 	long reladdr;
@@ -365,33 +442,31 @@ static inline int create_stub(Elf64_Shdr *sechdrs,
 
 	entry->jump[0] |= PPC_HA(reladdr);
 	entry->jump[1] |= PPC_LO(reladdr);
-	entry->opd.funcaddr = opd->funcaddr;
-	entry->opd.r2 = opd->r2;
+	entry->funcdata = func_desc(addr);
 	return 1;
 }
 
-/* Create stub to jump to function described in this OPD: we need the
+/* Create stub to jump to function described in this OPD/ptr: we need the
    stub to set up the TOC ptr (r2) for the function. */
 static unsigned long stub_for_addr(Elf64_Shdr *sechdrs,
-				   unsigned long opdaddr,
+				   unsigned long addr,
 				   struct module *me)
 {
 	struct ppc64_stub_entry *stubs;
-	struct ppc64_opd_entry *opd = (void *)opdaddr;
 	unsigned int i, num_stubs;
 
 	num_stubs = sechdrs[me->arch.stubs_section].sh_size / sizeof(*stubs);
 
 	/* Find this stub, or if that fails, the next avail. entry */
 	stubs = (void *)sechdrs[me->arch.stubs_section].sh_addr;
-	for (i = 0; stubs[i].opd.funcaddr; i++) {
+	for (i = 0; stub_func_addr(stubs[i].funcdata); i++) {
 		BUG_ON(i >= num_stubs);
 
-		if (stubs[i].opd.funcaddr == opd->funcaddr)
+		if (stub_func_addr(stubs[i].funcdata) == func_addr(addr))
 			return (unsigned long)&stubs[i];
 	}
 
-	if (!create_stub(sechdrs, &stubs[i], opd, me))
+	if (!create_stub(sechdrs, &stubs[i], addr, me))
 		return 0;
 
 	return (unsigned long)&stubs[i];
@@ -425,6 +500,17 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 
 	DEBUGP("Applying ADD relocate section %u to %u\n", relsec,
 	       sechdrs[relsec].sh_info);
+
+	/* First time we're called, we can fix up .TOC. */
+	if (!me->arch.toc_fixed) {
+		sym = find_dot_toc(sechdrs, strtab, symindex);
+		/* It's theoretically possible that a module doesn't want a
+		 * .TOC. so don't fail it just for that. */
+		if (sym)
+			sym->st_value = my_r2(sechdrs, me);
+		me->arch.toc_fixed = true;
+	}
+
 	for (i = 0; i < sechdrs[relsec].sh_size / sizeof(*rela); i++) {
 		/* This is where to make the change */
 		location = (void *)sechdrs[sechdrs[relsec].sh_info].sh_addr
@@ -521,7 +607,8 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 					return -ENOENT;
 				if (!restore_r2((u32 *)location + 1, me))
 					return -ENOEXEC;
-			}
+			} else
+				value += local_entry_offset(sym);
 
 			/* Convert value to relative */
 			value -= (unsigned long)location;

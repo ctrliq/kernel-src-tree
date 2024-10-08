@@ -1479,6 +1479,13 @@ static s32 igb_init_hw_82575(struct e1000_hw *hw)
 	s32 ret_val;
 	u16 i, rar_count = mac->rar_entry_count;
 
+	if ((hw->mac.type >= e1000_i210) &&
+	    !(igb_get_flash_presence_i210(hw))) {
+		ret_val = igb_pll_workaround_i210(hw);
+		if (ret_val)
+			return ret_val;
+	}
+
 	/* Initialize identification LED */
 	ret_val = igb_id_led_init(hw);
 	if (ret_val) {
@@ -2705,7 +2712,7 @@ static const u8 e1000_emc_therm_limit[4] = {
  *
  *  Updates the temperatures in mac.thermal_sensor_data
  **/
-s32 igb_get_thermal_sensor_data_generic(struct e1000_hw *hw)
+static s32 igb_get_thermal_sensor_data_generic(struct e1000_hw *hw)
 {
 	u16 ets_offset;
 	u16 ets_cfg;
@@ -2758,7 +2765,7 @@ s32 igb_get_thermal_sensor_data_generic(struct e1000_hw *hw)
  *  Sets the thermal sensor thresholds according to the NVM map
  *  and save off the threshold and location values into mac.thermal_sensor_data
  **/
-s32 igb_init_thermal_sensor_thresh_generic(struct e1000_hw *hw)
+static s32 igb_init_thermal_sensor_thresh_generic(struct e1000_hw *hw)
 {
 	u16 ets_offset;
 	u16 ets_cfg;

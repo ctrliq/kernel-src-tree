@@ -1120,7 +1120,7 @@ static void *worker_thread(void *__tdata)
 		/* Check whether our max runtime timed out: */
 		if (g->p.nr_secs) {
 			timersub(&stop, &start0, &diff);
-			if ((u32)diff.tv_sec >= g->p.nr_secs) {
+			if ((u32)diff.tv_sec >= (time_t)g->p.nr_secs) {
 				g->stop_work = true;
 				break;
 			}
@@ -1594,6 +1594,10 @@ static void init_params(struct params *p, const char *name, int argc, const char
 	p->nr_loops			= -1;
 	p->init_random			= true;
 	p->run_all			= argc == 1;
+	p->mb_global_str		= "1";
+	p->nr_proc			= 1;
+	p->nr_threads			= 1;
+	p->nr_secs			= 5;
 }
 
 static int run_bench_numa(const char *name, const char **argv)

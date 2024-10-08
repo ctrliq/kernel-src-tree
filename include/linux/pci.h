@@ -33,6 +33,8 @@
 
 #include <linux/pci_ids.h>
 
+#include <linux/rh_kabi.h>
+
 /*
  * The PCI interface treats multi-function devices as independent
  * devices.  The slot/function address of each device is encoded
@@ -272,7 +274,6 @@ struct pci_dev {
 	u8		rom_base_reg;	/* which config register controls the ROM */
 	u8		pin;		/* which interrupt pin this device uses */
 	u16		pcie_flags_reg;	/* cached PCIe Capabilities Register */
-	u8		dma_alias_devfn;/* devfn of DMA alias, if any */
 
 	struct pci_driver *driver;	/* which driver has allocated this device */
 	u64		dma_mask;	/* Mask of the bits of bus address this
@@ -358,7 +359,7 @@ struct pci_dev {
 	struct bin_attribute *res_attr_wc[DEVICE_COUNT_RESOURCE]; /* sysfs file for WC mapping of resources */
 #ifdef CONFIG_PCI_MSI
 	struct list_head msi_list;
-	struct kset *msi_kset;
+	struct kset *msi_kset;		/* obsolete as of RHEL7.1 */
 	const struct attribute_group **msi_irq_groups;
 #endif
 	struct pci_vpd *vpd;
@@ -383,8 +384,7 @@ struct pci_dev {
  * going forward.  This structure will never be under KABI restrictions.
  */
 struct pci_dev_rh {
-#ifndef __GENKSYMS__
-#endif
+	RH_KABI_EXTEND(u8		dma_alias_devfn) /* devfn of DMA alias, if any */
 };
 
 static inline struct pci_dev *pci_physfn(struct pci_dev *dev)
@@ -405,8 +405,6 @@ static inline int pci_channel_offline(struct pci_dev *pdev)
 {
 	return (pdev->error_state != pci_channel_io_normal);
 }
-
-extern struct resource busn_resource;
 
 struct pci_host_bridge_window {
 	struct list_head list;
@@ -811,9 +809,9 @@ void pci_fixup_cardbus(struct pci_bus *);
 
 /* Generic PCI functions used internally */
 
-void pcibios_resource_to_bus(struct pci_dev *dev, struct pci_bus_region *region,
+void pcibios_resource_to_bus(struct pci_bus *bus, struct pci_bus_region *region,
 			     struct resource *res);
-void pcibios_bus_to_resource(struct pci_dev *dev, struct resource *res,
+void pcibios_bus_to_resource(struct pci_bus *bus, struct resource *res,
 			     struct pci_bus_region *region);
 void pcibios_scan_specific_bus(int busn);
 struct pci_bus *pci_find_bus(int domain, int busnr);
@@ -1014,7 +1012,6 @@ void __iomem __must_check *pci_platform_rom(struct pci_dev *pdev, size_t *size);
 int pci_save_state(struct pci_dev *dev);
 void pci_restore_state(struct pci_dev *dev);
 struct pci_saved_state *pci_store_saved_state(struct pci_dev *dev);
-int pci_load_saved_state(struct pci_dev *dev, struct pci_saved_state *state);
 int pci_load_and_free_saved_state(struct pci_dev *dev,
 				  struct pci_saved_state **state);
 struct pci_cap_saved_state *pci_find_saved_cap(struct pci_dev *dev, char cap);
@@ -1031,7 +1028,6 @@ void pci_pme_active(struct pci_dev *dev, bool enable);
 int __pci_enable_wake(struct pci_dev *dev, pci_power_t state,
 		      bool runtime, bool enable);
 int pci_wake_from_d3(struct pci_dev *dev, bool enable);
-pci_power_t pci_target_state(struct pci_dev *dev);
 int pci_prepare_to_sleep(struct pci_dev *dev);
 int pci_back_from_sleep(struct pci_dev *dev);
 bool pci_dev_run_wake(struct pci_dev *dev);
@@ -1158,7 +1154,6 @@ int pci_scan_bridge(struct pci_bus *bus, struct pci_dev *dev, int max,
 
 void pci_walk_bus(struct pci_bus *top, int (*cb)(struct pci_dev *, void *),
 		  void *userdata);
-int pci_cfg_space_size_ext(struct pci_dev *dev);
 int pci_cfg_space_size(struct pci_dev *dev);
 unsigned char pci_bus_max_busnr(struct pci_bus *bus);
 void pci_setup_bridge(struct pci_bus *bus);

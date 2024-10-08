@@ -56,6 +56,7 @@ extern struct ppc_emulated {
 #ifdef CONFIG_PPC64
 	struct ppc_emulated_entry mfdscr;
 	struct ppc_emulated_entry mtdscr;
+	struct ppc_emulated_entry lq_stq;
 #endif
 } ppc_emulated;
 

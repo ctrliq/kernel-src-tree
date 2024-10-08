@@ -249,14 +249,24 @@ static void vmemmap_remove_mapping(unsigned long start,
 #endif /* CONFIG_PPC_BOOK3E */
 
 struct vmemmap_backing *vmemmap_list;
+static struct vmemmap_backing *next;
+static int num_left;
+static int num_freed;
 
 static __meminit struct vmemmap_backing * vmemmap_list_alloc(int node)
 {
-	static struct vmemmap_backing *next;
-	static int num_left;
+	struct vmemmap_backing *vmem_back;
+	/* get from freed entries first */
+	if (num_freed) {
+		num_freed--;
+		vmem_back = next;
+		next = next->list;
+
+		return vmem_back;
+	}
 
 	/* allocate a page when required and hand out chunks */
-	if (!next || !num_left) {
+	if (!num_left) {
 		next = vmemmap_alloc_block(PAGE_SIZE, node);
 		if (unlikely(!next)) {
 			WARN_ON(1);
@@ -319,10 +329,85 @@ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
 	return 0;
 }
 
-void vmemmap_free(unsigned long start, unsigned long end)
+#ifdef CONFIG_MEMORY_HOTPLUG
+static unsigned long vmemmap_list_free(unsigned long start)
 {
+	struct vmemmap_backing *vmem_back, *vmem_back_prev;
+
+	vmem_back_prev = vmem_back = vmemmap_list;
+
+	/* look for it with prev pointer recorded */
+	for (; vmem_back; vmem_back = vmem_back->list) {
+		if (vmem_back->virt_addr == start)
+			break;
+		vmem_back_prev = vmem_back;
+	}
+
+	if (unlikely(!vmem_back)) {
+		WARN_ON(1);
+		return 0;
+	}
+
+	/* remove it from vmemmap_list */
+	if (vmem_back == vmemmap_list) /* remove head */
+		vmemmap_list = vmem_back->list;
+	else
+		vmem_back_prev->list = vmem_back->list;
+
+	/* next point to this freed entry */
+	vmem_back->list = next;
+	next = vmem_back;
+	num_freed++;
+
+	return vmem_back->phys;
 }
 
+void __ref vmemmap_free(unsigned long start, unsigned long end)
+{
+	unsigned long page_size = 1 << mmu_psize_defs[mmu_vmemmap_psize].shift;
+
+	start = _ALIGN_DOWN(start, page_size);
+
+	pr_debug("vmemmap_free %lx...%lx\n", start, end);
+
+	for (; start < end; start += page_size) {
+		unsigned long addr;
+
+		/*
+		 * the section has already be marked as invalid, so
+		 * vmemmap_populated() true means some other sections still
+		 * in this page, so skip it.
+		 */
+		if (vmemmap_populated(start, page_size))
+			continue;
+
+		addr = vmemmap_list_free(start);
+		if (addr) {
+			struct page *page = pfn_to_page(addr >> PAGE_SHIFT);
+
+			if (PageReserved(page)) {
+				/* allocated from bootmem */
+				if (page_size < PAGE_SIZE) {
+					/*
+					 * this shouldn't happen, but if it is
+					 * the case, leave the memory there
+					 */
+					WARN_ON_ONCE(1);
+				} else {
+					unsigned int nr_pages =
+						1 << get_order(page_size);
+					while (nr_pages--)
+						free_reserved_page(page++);
+				}
+			} else
+				free_pages((unsigned long)(__va(addr)),
+							get_order(page_size));
+
+			vmemmap_remove_mapping(start, page_size);
+		}
+	}
+}
+#endif
 void register_page_bootmem_memmap(unsigned long section_nr,
 				  struct page *start_page, unsigned long size)
 {

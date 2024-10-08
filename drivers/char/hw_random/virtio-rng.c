@@ -24,11 +24,11 @@
 #include <linux/virtio.h>
 #include <linux/virtio_rng.h>
 #include <linux/module.h>
+#include <linux/idr.h>
 
 static DEFINE_IDA(rng_index_ida);
 
 struct virtrng_info {
-	struct virtio_device *vdev;
 	struct hwrng hwrng;
 	struct virtqueue *vq;
 	struct completion have_data;

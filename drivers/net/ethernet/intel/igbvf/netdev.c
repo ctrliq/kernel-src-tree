@@ -2635,21 +2635,15 @@ static int igbvf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		return err;
 
 	pci_using_dac = 0;
-	err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (!err) {
-		err = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
-		if (!err)
-			pci_using_dac = 1;
+		pci_using_dac = 1;
 	} else {
-		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
+		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 		if (err) {
-			err = dma_set_coherent_mask(&pdev->dev,
-						    DMA_BIT_MASK(32));
-			if (err) {
-				dev_err(&pdev->dev, "No usable DMA "
-				        "configuration, aborting\n");
-				goto err_dma;
-			}
+			dev_err(&pdev->dev, "No usable DMA "
+			        "configuration, aborting\n");
+			goto err_dma;
 		}
 	}
 
@@ -2859,7 +2853,7 @@ static const struct pci_error_handlers igbvf_err_handler = {
 	.resume = igbvf_io_resume,
 };
 
-static DEFINE_PCI_DEVICE_TABLE(igbvf_pci_tbl) = {
+static const struct pci_device_id igbvf_pci_tbl[] = {
 	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_82576_VF), board_vf },
 	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_I350_VF), board_i350_vf },
 	{ } /* terminate list */

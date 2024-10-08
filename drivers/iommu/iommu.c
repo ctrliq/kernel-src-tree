@@ -588,9 +588,9 @@ static struct iommu_group *get_pci_alias_group(struct pci_dev *pdev,
 
 		/* We alias them or they alias us */
 		if (((pdev->dev_flags & PCI_DEV_FLAGS_DMA_ALIAS_DEVFN) &&
-		     pdev->dma_alias_devfn == tmp->devfn) ||
+		     pdev->pci_dev_rh->dma_alias_devfn == tmp->devfn) ||
 		    ((tmp->dev_flags & PCI_DEV_FLAGS_DMA_ALIAS_DEVFN) &&
-		     tmp->dma_alias_devfn == pdev->devfn)) {
+		     tmp->pci_dev_rh->dma_alias_devfn == pdev->devfn)) {
 
 			group = get_pci_alias_group(tmp, devfns);
 			if (group) {

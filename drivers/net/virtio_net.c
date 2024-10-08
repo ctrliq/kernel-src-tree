@@ -309,10 +309,10 @@ static struct sk_buff *receive_small(void *buf, unsigned int len)
 
 static struct sk_buff *receive_big(struct net_device *dev,
 				   struct receive_queue *rq,
-				   void *buf)
+				   void *buf, unsigned int len)
 {
 	struct page *page = buf;
-	struct sk_buff *skb = page_to_skb(rq, page, 0);
+	struct sk_buff *skb = page_to_skb(rq, page, len);
 
 	if (unlikely(!skb))
 		goto err;
@@ -402,7 +402,7 @@ static void receive_buf(struct receive_queue *rq, void *buf, unsigned int len)
 	if (vi->mergeable_rx_bufs)
 		skb = receive_mergeable(dev, rq, buf, len);
 	else if (vi->big_packets)
-		skb = receive_big(dev, rq, buf);
+		skb = receive_big(dev, rq, buf, len);
 	else
 		skb = receive_small(buf, len);
 
@@ -858,8 +858,7 @@ static bool virtnet_send_command(struct virtnet_info *vi, u8 class, u8 cmd,
 	sgs[out_num + in_num++] = &stat;
 
 	BUG_ON(out_num + in_num > ARRAY_SIZE(sgs));
-	BUG_ON(virtqueue_add_sgs(vi->cvq, sgs, out_num, in_num, vi, GFP_ATOMIC)
-	       < 0);
+	virtqueue_add_sgs(vi->cvq, sgs, out_num, in_num, vi, GFP_ATOMIC);
 
 	virtqueue_kick(vi->cvq);
 

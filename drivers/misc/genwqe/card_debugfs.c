@@ -26,7 +26,6 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
@@ -481,6 +480,13 @@ int genwqe_init_debugfs(struct genwqe_dev *cd)
 
 	file = debugfs_create_u32("skip_recovery", 0666, root,
 				  &cd->skip_recovery);
+	if (!file) {
+		ret = -ENOMEM;
+		goto err1;
+	}
+
+	file = debugfs_create_u32("use_platform_recovery", 0666, root,
+				  &cd->use_platform_recovery);
 	if (!file) {
 		ret = -ENOMEM;
 		goto err1;

@@ -112,8 +112,6 @@
 #define RT_FL_TOS(oldflp4) \
 	((oldflp4)->flowi4_tos & (IPTOS_RT_MASK | RTO_ONLINK))
 
-#define IP_MAX_MTU	0xFFF0
-
 #define RT_GC_TIMEOUT (300*HZ)
 
 static int ip_rt_max_size;
@@ -1009,24 +1007,24 @@ void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 	const struct iphdr *iph = (const struct iphdr *) skb->data;
 	struct flowi4 fl4;
 	struct rtable *rt;
-	struct dst_entry *dst;
+	struct dst_entry *odst = NULL;
 	bool new = false;
 
 	bh_lock_sock(sk);
-
 	if (!ip_sk_accept_pmtu(sk))
 		goto out;
 
-	rt = (struct rtable *) __sk_dst_get(sk);
+	odst = sk_dst_get(sk);
 
-	if (sock_owned_by_user(sk) || !rt) {
+	if (sock_owned_by_user(sk) || !odst) {
 		__ipv4_sk_update_pmtu(skb, sk, mtu);
 		goto out;
 	}
 
 	__build_flow_key(&fl4, sk, iph, 0, 0, 0, 0, 0);
 
-	if (!__sk_dst_check(sk, 0)) {
+	rt = (struct rtable *)odst;
+	if (odst->obsolete && odst->ops->check(odst, 0) == NULL) {
 		rt = ip_route_output_flow(sock_net(sk), &fl4, sk);
 		if (IS_ERR(rt))
 			goto out;
@@ -1036,8 +1034,7 @@ void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 
 	__ip_rt_update_pmtu((struct rtable *) rt->dst.path, &fl4, mtu);
 
-	dst = dst_check(&rt->dst, 0);
-	if (!dst) {
+	if (!dst_check(&rt->dst, 0)) {
 		if (new)
 			dst_release(&rt->dst);
 
@@ -1049,10 +1046,11 @@ void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 	}
 
 	if (new)
-		__sk_dst_set(sk, &rt->dst);
+		sk_dst_set(sk, &rt->dst);
 
 out:
 	bh_unlock_sock(sk);
+	dst_release(odst);
 }
 EXPORT_SYMBOL_GPL(ipv4_sk_update_pmtu);
 
@@ -1116,7 +1114,7 @@ static void ipv4_link_failure(struct sk_buff *skb)
 		dst_set_expires(&rt->dst, 0);
 }
 
-static int ip_rt_bug(struct sk_buff *skb)
+static int ip_rt_bug(struct sock *sk, struct sk_buff *skb)
 {
 	pr_debug("%s: %pI4 -> %pI4, %s\n",
 		 __func__, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr,
@@ -2185,7 +2183,7 @@ struct dst_entry *ipv4_blackhole_route(struct net *net, struct dst_entry *dst_or
 
 		new->__use = 1;
 		new->input = dst_discard;
-		new->output = dst_discard;
+		new->output = dst_discard_sk;
 
 		new->dev = ort->dst.dev;
 		if (new->dev)
@@ -2635,7 +2633,7 @@ static __net_initdata struct pernet_operations sysctl_route_ops = {
 
 static __net_init int rt_genid_init(struct net *net)
 {
-	atomic_set(&net->ipv4.rt_genid, 0);
+	atomic_set(&net->rt_genid, 0);
 	atomic_set(&net->fnhe_genid, 0);
 	get_random_bytes(&net->ipv4.dev_addr_genid,
 			 sizeof(net->ipv4.dev_addr_genid));

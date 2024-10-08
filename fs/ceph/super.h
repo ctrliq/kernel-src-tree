@@ -256,7 +256,6 @@ struct ceph_inode_info {
 	struct timespec i_rctime;
 	u64 i_rbytes, i_rfiles, i_rsubdirs;
 	u64 i_files, i_subdirs;
-	u64 i_max_offset;  /* largest readdir offset, set with complete dir */
 
 	struct rb_root i_fragtree;
 	struct mutex i_fragtree_mutex;
@@ -283,7 +282,6 @@ struct ceph_inode_info {
 	struct ceph_snap_context *i_head_snapc;  /* set if wr_buffer_head > 0 or
 						    dirty|flushing caps */
 	unsigned i_snap_caps;           /* cap bits for snapped files */
-	unsigned i_cap_exporting_issued;
 
 	int i_nr_by_mode[CEPH_FILE_MODE_NUM];  /* open file counts */
 
@@ -562,7 +560,7 @@ struct ceph_file_info {
 
 	/* readdir: position within a frag */
 	unsigned offset;       /* offset of last chunk, adjusted for . and .. */
-	u64 next_offset;       /* offset of next chunk (last_name's + 1) */
+	unsigned next_offset;  /* offset of next chunk (last_name's + 1) */
 	char *last_name;       /* last entry in previous chunk */
 	struct dentry *dentry; /* next dentry (for dcache readdir) */
 	int dir_release_count;
@@ -676,6 +674,7 @@ extern const struct inode_operations ceph_file_iops;
 
 extern struct inode *ceph_alloc_inode(struct super_block *sb);
 extern void ceph_destroy_inode(struct inode *inode);
+extern int ceph_drop_inode(struct inode *inode);
 
 extern struct inode *ceph_get_inode(struct super_block *sb,
 				    struct ceph_vino vino);
@@ -721,11 +720,13 @@ extern void ceph_xattr_exit(void);
 extern const char *ceph_cap_string(int c);
 extern void ceph_handle_caps(struct ceph_mds_session *session,
 			     struct ceph_msg *msg);
-extern int ceph_add_cap(struct inode *inode,
-			struct ceph_mds_session *session, u64 cap_id,
-			int fmode, unsigned issued, unsigned wanted,
-			unsigned cap, unsigned seq, u64 realmino, int flags,
-			struct ceph_cap_reservation *caps_reservation);
+extern struct ceph_cap *ceph_get_cap(struct ceph_mds_client *mdsc,
+				     struct ceph_cap_reservation *ctx);
+extern void ceph_add_cap(struct inode *inode,
+			 struct ceph_mds_session *session, u64 cap_id,
+			 int fmode, unsigned issued, unsigned wanted,
+			 unsigned cap, unsigned seq, u64 realmino, int flags,
+			 struct ceph_cap **new_cap);
 extern void __ceph_remove_cap(struct ceph_cap *cap, bool queue_release);
 extern void ceph_put_cap(struct ceph_mds_client *mdsc,
 			 struct ceph_cap *cap);
@@ -775,6 +776,7 @@ extern int ceph_mmap(struct file *file, struct vm_area_struct *vma);
 
 /* file.c */
 extern const struct file_operations ceph_file_fops;
+extern const struct address_space_operations ceph_aops;
 
 extern int ceph_open(struct inode *inode, struct file *file);
 extern int ceph_atomic_open(struct inode *dir, struct dentry *dentry,

@@ -410,9 +410,12 @@ static void ttm_dma_page_put(struct dma_pool *pool, struct dma_page *d_page)
  *
  * @pool: to free the pages from
  * @nr_free: If set to true will free all pages in pool
+ * @use_static: Safe to use static buffer
+ *
  **/
-static unsigned ttm_dma_page_pool_free(struct dma_pool *pool, unsigned nr_free)
+static unsigned ttm_dma_page_pool_free(struct dma_pool *pool, unsigned nr_free, bool use_static)
 {
+	static struct page *static_buf[NUM_PAGES_TO_ALLOC];
 	unsigned long irq_flags;
 	struct dma_page *dma_p, *tmp;
 	struct page **pages_to_free;
@@ -429,8 +432,11 @@ static unsigned ttm_dma_page_pool_free(struct dma_pool *pool, unsigned nr_free)
 			 npages_to_free, nr_free);
 	}
 #endif
-	pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
-			GFP_KERNEL);
+	if (use_static)
+		pages_to_free = static_buf;
+	else
+		pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
+				GFP_KERNEL);
 
 	if (!pages_to_free) {
 		pr_err("%s: Failed to allocate memory for pool free operation\n",
@@ -500,7 +506,8 @@ restart:
 	if (freed_pages)
 		ttm_dma_pages_put(pool, &d_pages, pages_to_free, freed_pages);
 out:
-	kfree(pages_to_free);
+	if (pages_to_free != static_buf)
+		kfree(pages_to_free);
 	return nr_free;
 }
 
@@ -529,7 +536,8 @@ static void ttm_dma_free_pool(struct device *dev, enum pool_type type)
 		if (pool->type != type)
 			continue;
 		/* Takes a spinlock.. */
-		ttm_dma_page_pool_free(pool, FREE_ALL_PAGES);
+		/* OK to use static buffer since global mutex is held. */
+		ttm_dma_page_pool_free(pool, FREE_ALL_PAGES, true);
 		WARN_ON(((pool->npages_in_use + pool->npages_free) != 0));
 		/* This code path is called after _all_ references to the
 		 * struct device has been dropped - so nobody should be
@@ -995,7 +1003,7 @@ void ttm_dma_unpopulate(struct ttm_dma_tt *ttm_dma, struct device *dev)
 
 	/* shrink pool if necessary (only on !is_cached pools)*/
 	if (npages)
-		ttm_dma_page_pool_free(pool, npages);
+		ttm_dma_page_pool_free(pool, npages, false);
 	ttm->state = tt_unpopulated;
 }
 EXPORT_SYMBOL_GPL(ttm_dma_unpopulate);
@@ -1015,7 +1023,8 @@ static int ttm_dma_pool_mm_shrink(struct shrinker *shrink,
 	if (list_empty(&_manager->pools))
 		return 0;
 
-	mutex_lock(&_manager->lock);
+	if (!mutex_trylock(&_manager->lock))
+		return 0;
 	if (!_manager->npools)
 		goto out;
 	pool_offset = ++start_pool % _manager->npools;
@@ -1030,7 +1039,7 @@ static int ttm_dma_pool_mm_shrink(struct shrinker *shrink,
 		if (++idx < pool_offset)
 			continue;
 		nr_free = shrink_pages;
-		shrink_pages = ttm_dma_page_pool_free(p->pool, nr_free);
+		shrink_pages = ttm_dma_page_pool_free(p->pool, nr_free, true);
 		pr_debug("%s: (%s:%d) Asked to shrink %d, have %d more to go\n",
 			 p->pool->dev_name, p->pool->name, current->pid,
 			 nr_free, shrink_pages);

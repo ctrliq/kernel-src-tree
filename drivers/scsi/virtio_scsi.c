@@ -120,6 +120,7 @@ struct virtio_scsi {
 
 static struct kmem_cache *virtscsi_cmd_cache;
 static mempool_t *virtscsi_cmd_pool;
+static struct workqueue_struct *virtscsi_scan_wq;
 
 static inline struct Scsi_Host *virtio_scsi_host(struct virtio_device *vdev)
 {
@@ -428,7 +429,7 @@ static void virtscsi_complete_event(struct virtio_scsi *vscsi, void *buf)
 {
 	struct virtio_scsi_event_node *event_node = buf;
 
-	schedule_work(&event_node->work);
+	queue_work(virtscsi_scan_wq, &event_node->work);
 }
 
 static void virtscsi_event_done(struct virtqueue *vq)
@@ -1050,6 +1051,14 @@ static int __init init(void)
 		pr_err("mempool_create() for virtscsi_cmd_pool failed\n");
 		goto error;
 	}
+
+	virtscsi_scan_wq =
+		alloc_ordered_workqueue("virtscsi-scan", WQ_FREEZABLE | WQ_MEM_RECLAIM);
+	if (!virtscsi_scan_wq) {
+		pr_err("create_singlethread_workqueue() for virtscsi_scan_wq failed\n");
+		goto error;
+	}
+
 	ret = register_virtio_driver(&virtio_scsi_driver);
 	if (ret < 0)
 		goto error;
@@ -1057,6 +1066,8 @@ static int __init init(void)
 	return 0;
 
 error:
+	if (virtscsi_scan_wq)
+		destroy_workqueue(virtscsi_scan_wq);
 	if (virtscsi_cmd_pool) {
 		mempool_destroy(virtscsi_cmd_pool);
 		virtscsi_cmd_pool = NULL;
@@ -1071,6 +1082,7 @@ error:
 static void __exit fini(void)
 {
 	unregister_virtio_driver(&virtio_scsi_driver);
+	destroy_workqueue(virtscsi_scan_wq);
 	mempool_destroy(virtscsi_cmd_pool);
 	kmem_cache_destroy(virtscsi_cmd_cache);
 }

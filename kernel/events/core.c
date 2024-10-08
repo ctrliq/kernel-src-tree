@@ -2986,6 +2986,22 @@ out:
 	local_irq_restore(flags);
 }
 
+void perf_event_exec(void)
+{
+	struct perf_event_context *ctx;
+	int ctxn;
+
+	rcu_read_lock();
+	for_each_task_context_nr(ctxn) {
+		ctx = current->perf_event_ctxp[ctxn];
+		if (!ctx)
+			continue;
+
+		perf_event_enable_on_exec(ctx);
+	}
+	rcu_read_unlock();
+}
+
 /*
  * Cross CPU call to read the hardware event
  */
@@ -5080,21 +5096,9 @@ static void perf_event_comm_event(struct perf_comm_event *comm_event)
 		       NULL);
 }
 
-void perf_event_comm(struct task_struct *task)
+void perf_event_comm(struct task_struct *task, bool exec)
 {
 	struct perf_comm_event comm_event;
-	struct perf_event_context *ctx;
-	int ctxn;
-
-	rcu_read_lock();
-	for_each_task_context_nr(ctxn) {
-		ctx = task->perf_event_ctxp[ctxn];
-		if (!ctx)
-			continue;
-
-		perf_event_enable_on_exec(ctx);
-	}
-	rcu_read_unlock();
 
 	if (!atomic_read(&nr_comm_events))
 		return;
@@ -5106,7 +5110,7 @@ void perf_event_comm(struct task_struct *task)
 		.event_id  = {
 			.header = {
 				.type = PERF_RECORD_COMM,
-				.misc = 0,
+				.misc = exec ? PERF_RECORD_MISC_COMM_EXEC : 0,
 				/* .size */
 			},
 			/* .pid */
@@ -6780,6 +6784,7 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 	INIT_LIST_HEAD(&event->sibling_list);
 	INIT_LIST_HEAD(&event->rb_entry);
 	INIT_LIST_HEAD(&event->active_entry);
+	INIT_HLIST_NODE(&event->hlist_entry);
 
 	init_waitqueue_head(&event->waitq);
 	init_irq_work(&event->pending, perf_pending_event);
@@ -7471,7 +7476,19 @@ __perf_event_exit_task(struct perf_event *child_event,
 			 struct perf_event_context *child_ctx,
 			 struct task_struct *child)
 {
-	perf_remove_from_context(child_event, true);
+	/*
+	 * Do not destroy the 'original' grouping; because of the context
+	 * switch optimization the original events could've ended up in a
+	 * random child task.
+	 *
+	 * If we were to destroy the original group, all group related
+	 * operations would cease to function properly after this random
+	 * child dies.
+	 *
+	 * Do destroy all inherited groups, we don't care about those
+	 * and being thorough is better.
+	 */
+	perf_remove_from_context(child_event, !!child_event->parent);
 
 	/*
 	 * It can happen that the parent exits first, and has events
@@ -7931,7 +7948,7 @@ static void __init perf_event_init_all_cpus(void)
 	}
 }
 
-static void __cpuinit perf_event_init_cpu(int cpu)
+static void perf_event_init_cpu(int cpu)
 {
 	struct swevent_htable *swhash = &per_cpu(swevent_htable, cpu);
 
@@ -8022,7 +8039,7 @@ static struct notifier_block perf_reboot_notifier = {
 	.priority = INT_MIN,
 };
 
-static int __cpuinit
+static int
 perf_cpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
 {
 	unsigned int cpu = (long)hcpu;

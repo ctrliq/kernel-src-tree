@@ -644,6 +644,8 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
 	struct ovl_entry *oe;
 	struct ovl_fs *ufs;
 	struct kstatfs statfs;
+	const int *upper_stack_depth, *lower_stack_depth;
+	int *overlay_stack_depth;
 	int err;
 
 	err = -ENOMEM;
@@ -713,6 +715,23 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
 		goto out_put_workpath;
 	}
 	ufs->lower_namelen = statfs.f_namelen;
+
+	upper_stack_depth = get_s_stack_depth(upperpath.mnt->mnt_sb);
+	lower_stack_depth = get_s_stack_depth(lowerpath.mnt->mnt_sb);
+	overlay_stack_depth = get_s_stack_depth(sb);
+	err = -EOPNOTSUPP;
+	if (!upper_stack_depth || !lower_stack_depth || !overlay_stack_depth) {
+		pr_err("overlayfs: superblock missing extension wrapper (old kernel?)\n");
+		goto out_put_workpath;
+	}
+
+	*overlay_stack_depth = max(*upper_stack_depth, *lower_stack_depth) + 1;
+
+	err = -EINVAL;
+	if (*overlay_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
+		pr_err("overlayfs: maximum fs stacking depth exceeded\n");
+		goto out_put_workpath;
+	}
 
 	ufs->upper_mnt = clone_private_mount(&upperpath);
 	err = PTR_ERR(ufs->upper_mnt);
@@ -799,6 +818,13 @@ out:
 static struct dentry *ovl_mount(struct file_system_type *fs_type, int flags,
 				const char *dev_name, void *raw_data)
 {
+	static bool seen = false;
+
+	if (!seen) {
+		mark_tech_preview("Overlay filesystem", THIS_MODULE);
+		seen = true;
+	}
+
 	return mount_nodev(fs_type, flags, raw_data, ovl_fill_super);
 }
 

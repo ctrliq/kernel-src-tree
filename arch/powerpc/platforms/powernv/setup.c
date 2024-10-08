@@ -23,8 +23,11 @@
 #include <linux/irq.h>
 #include <linux/seq_file.h>
 #include <linux/of.h>
+#include <linux/of_fdt.h>
 #include <linux/interrupt.h>
 #include <linux/bug.h>
+#include <linux/pci.h>
+#include <linux/cpufreq.h>
 
 #include <asm/machdep.h>
 #include <asm/firmware.h>
@@ -163,6 +166,13 @@ static void pnv_progress(char *s, unsigned short hex)
 {
 }
 
+static int pnv_dma_set_mask(struct device *dev, u64 dma_mask)
+{
+	if (dev_is_pci(dev))
+		return pnv_pci_dma_set_mask(to_pci_dev(dev), dma_mask);
+	return __dma_set_mask(dev, dma_mask);
+}
+
 static void pnv_shutdown(void)
 {
 	/* Let the PCI code clear up IODA tables */
@@ -291,6 +301,25 @@ static int __init pnv_probe(void)
 	return 1;
 }
 
+/*
+ * Returns the cpu frequency for 'cpu' in Hz. This is used by
+ * /proc/cpuinfo
+ */
+unsigned long pnv_get_proc_freq(unsigned int cpu)
+{
+	unsigned long ret_freq;
+
+	ret_freq = cpufreq_quick_get(cpu) * 1000ul;
+
+	/*
+	 * If the backend cpufreq driver does not exist,
+         * then fallback to old way of reporting the clockrate.
+	 */
+	if (!ret_freq)
+		ret_freq = ppc_proc_freq;
+	return ret_freq;
+}
+
 define_machine(powernv) {
 	.name			= "PowerNV",
 	.probe			= pnv_probe,
@@ -298,10 +327,12 @@ define_machine(powernv) {
 	.setup_arch		= pnv_setup_arch,
 	.init_IRQ		= pnv_init_IRQ,
 	.show_cpuinfo		= pnv_show_cpuinfo,
+	.get_proc_freq          = pnv_get_proc_freq,
 	.progress		= pnv_progress,
 	.machine_shutdown	= pnv_shutdown,
 	.power_save             = power7_idle,
 	.calibrate_decr		= generic_calibrate_decr,
+	.dma_set_mask		= pnv_dma_set_mask,
 #ifdef CONFIG_KEXEC
 	.kexec_cpu_down		= pnv_kexec_cpu_down,
 #endif

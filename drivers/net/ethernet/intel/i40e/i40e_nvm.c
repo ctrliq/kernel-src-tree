@@ -160,7 +160,7 @@ static i40e_status i40e_poll_sr_srctl_done_bit(struct i40e_hw *hw)
 		udelay(5);
 	}
 	if (ret_code == I40E_ERR_TIMEOUT)
-		hw_dbg(hw, "Done bit in GLNVM_SRCTL not set");
+		hw_dbg(hw, "Done bit in GLNVM_SRCTL not set\n");
 	return ret_code;
 }
 
@@ -251,9 +251,9 @@ i40e_status i40e_read_nvm_buffer(struct i40e_hw *hw, u16 offset,
  *
  * Writes a 16 bit words buffer to the Shadow RAM using the admin command.
  **/
-i40e_status i40e_write_nvm_aq(struct i40e_hw *hw, u8 module_pointer,
-			      u32 offset, u16 words, void *data,
-			      bool last_command)
+static i40e_status i40e_write_nvm_aq(struct i40e_hw *hw, u8 module_pointer,
+				     u32 offset, u16 words, void *data,
+				     bool last_command)
 {
 	i40e_status ret_code = I40E_ERR_NVM;
 

@@ -150,8 +150,7 @@ static int perf_evsel__init_tp_ptr_field(struct perf_evsel *evsel,
 
 static void perf_evsel__delete_priv(struct perf_evsel *evsel)
 {
-	free(evsel->priv);
-	evsel->priv = NULL;
+	zfree(&evsel->priv);
 	perf_evsel__delete(evsel);
 }
 
@@ -169,8 +168,7 @@ static int perf_evsel__init_syscall_tp(struct perf_evsel *evsel, void *handler)
 	return -ENOMEM;
 
 out_delete:
-	free(evsel->priv);
-	evsel->priv = NULL;
+	zfree(&evsel->priv);
 	return -ENOENT;
 }
 
@@ -285,6 +283,11 @@ static size_t syscall_arg__scnprintf_strarray(char *bf, size_t size,
 
 #define SCA_STRARRAY syscall_arg__scnprintf_strarray
 
+#if defined(__i386__) || defined(__x86_64__)
+/*
+ * FIXME: Make this available to all arches as soon as the ioctl beautifier
+ * 	  gets rewritten to support all arches.
+ */
 static size_t syscall_arg__scnprintf_strhexarray(char *bf, size_t size,
 						 struct syscall_arg *arg)
 {
@@ -292,6 +295,7 @@ static size_t syscall_arg__scnprintf_strhexarray(char *bf, size_t size,
 }
 
 #define SCA_STRHEXARRAY syscall_arg__scnprintf_strhexarray
+#endif /* defined(__i386__) || defined(__x86_64__) */
 
 static size_t syscall_arg__scnprintf_fd(char *bf, size_t size,
 					struct syscall_arg *arg);
@@ -853,6 +857,10 @@ static size_t syscall_arg__scnprintf_signum(char *bf, size_t size, struct syscal
 
 #define SCA_SIGNUM syscall_arg__scnprintf_signum
 
+#if defined(__i386__) || defined(__x86_64__)
+/*
+ * FIXME: Make this available to all arches.
+ */
 #define TCGETS		0x5401
 
 static const char *tioctls[] = {
@@ -874,6 +882,7 @@ static const char *tioctls[] = {
 };
 
 static DEFINE_STRARRAY_OFFSET(tioctls, 0x5401);
+#endif /* defined(__i386__) || defined(__x86_64__) */
 
 #define STRARRAY(arg, name, array) \
 	  .arg_scnprintf = { [arg] = SCA_STRARRAY, }, \
@@ -955,9 +964,16 @@ static struct syscall_fmt {
 	{ .name	    = "getrlimit",  .errmsg = true, STRARRAY(0, resource, rlimit_resources), },
 	{ .name	    = "ioctl",	    .errmsg = true,
 	  .arg_scnprintf = { [0] = SCA_FD, /* fd */ 
+#if defined(__i386__) || defined(__x86_64__)
+/*
+ * FIXME: Make this available to all arches.
+ */
 			     [1] = SCA_STRHEXARRAY, /* cmd */
 			     [2] = SCA_HEX, /* arg */ },
 	  .arg_parm	 = { [1] = &strarray__tioctls, /* cmd */ }, },
+#else
+			     [2] = SCA_HEX, /* arg */ }, },
+#endif
 	{ .name	    = "kill",	    .errmsg = true,
 	  .arg_scnprintf = { [1] = SCA_SIGNUM, /* sig */ }, },
 	{ .name	    = "linkat",	    .errmsg = true,
@@ -1291,10 +1307,8 @@ static size_t syscall_arg__scnprintf_close_fd(char *bf, size_t size,
 	size_t printed = syscall_arg__scnprintf_fd(bf, size, arg);
 	struct thread_trace *ttrace = arg->thread->priv;
 
-	if (ttrace && fd >= 0 && fd <= ttrace->paths.max) {
-		free(ttrace->paths.table[fd]);
-		ttrace->paths.table[fd] = NULL;
-	}
+	if (ttrace && fd >= 0 && fd <= ttrace->paths.max)
+		zfree(&ttrace->paths.table[fd]);
 
 	return printed;
 }

@@ -1,7 +1,7 @@
 /*******************************************************************************
 
   Intel 82599 Virtual Function driver
-  Copyright(c) 1999 - 2012 Intel Corporation.
+  Copyright(c) 1999 - 2014 Intel Corporation.
 
   This program is free software; you can redistribute it and/or modify it
   under the terms and conditions of the GNU General Public License,
@@ -107,7 +107,8 @@ static void ixgbevf_remove_adapter(struct ixgbe_hw *hw)
 		return;
 	hw->hw_addr = NULL;
 	dev_err(&adapter->pdev->dev, "Adapter removed\n");
-	schedule_work(&adapter->watchdog_task);
+	if (test_bit(__IXGBEVF_WORK_INIT, &adapter->state))
+		schedule_work(&adapter->watchdog_task);
 }
 
 static void ixgbevf_check_remove(struct ixgbe_hw *hw, u32 reg)
@@ -315,8 +316,8 @@ static bool ixgbevf_clean_tx_irq(struct ixgbevf_q_vector *q_vector,
 	i += tx_ring->count;
 	tx_ring->next_to_clean = i;
 	u64_stats_update_begin(&tx_ring->syncp);
-	tx_ring->total_bytes += total_bytes;
-	tx_ring->total_packets += total_packets;
+	tx_ring->stats.bytes += total_bytes;
+	tx_ring->stats.packets += total_packets;
 	u64_stats_update_end(&tx_ring->syncp);
 	q_vector->tx.total_bytes += total_bytes;
 	q_vector->tx.total_packets += total_packets;
@@ -407,7 +408,7 @@ static inline void ixgbevf_rx_checksum(struct ixgbevf_ring *ring,
 	/* if IP and error */
 	if ((status_err & IXGBE_RXD_STAT_IPCS) &&
 	    (status_err & IXGBE_RXDADV_ERR_IPE)) {
-		ring->hw_csum_rx_error++;
+		ring->rx_stats.csum_err++;
 		return;
 	}
 
@@ -415,51 +416,46 @@ static inline void ixgbevf_rx_checksum(struct ixgbevf_ring *ring,
 		return;
 
 	if (status_err & IXGBE_RXDADV_ERR_TCPE) {
-		ring->hw_csum_rx_error++;
+		ring->rx_stats.csum_err++;
 		return;
 	}
 
 	/* It must be a TCP or UDP packet with a valid checksum */
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
-	ring->hw_csum_rx_good++;
 }
 
 /**
  * ixgbevf_alloc_rx_buffers - Replace used receive buffers; packet split
- * @adapter: address of board private structure
+ * @rx_ring: rx descriptor ring (for a specific queue) to setup buffers on
  **/
-static void ixgbevf_alloc_rx_buffers(struct ixgbevf_adapter *adapter,
-				     struct ixgbevf_ring *rx_ring,
+static void ixgbevf_alloc_rx_buffers(struct ixgbevf_ring *rx_ring,
 				     int cleaned_count)
 {
-	struct pci_dev *pdev = adapter->pdev;
 	union ixgbe_adv_rx_desc *rx_desc;
 	struct ixgbevf_rx_buffer *bi;
 	unsigned int i = rx_ring->next_to_use;
 
-	bi = &rx_ring->rx_buffer_info[i];
-
 	while (cleaned_count--) {
 		rx_desc = IXGBEVF_RX_DESC(rx_ring, i);
+		bi = &rx_ring->rx_buffer_info[i];
 
 		if (!bi->skb) {
 			struct sk_buff *skb;
 
 			skb = netdev_alloc_skb_ip_align(rx_ring->netdev,
 							rx_ring->rx_buf_len);
-			if (!skb) {
-				adapter->alloc_rx_buff_failed++;
+			if (!skb)
 				goto no_buffers;
-			}
+
 			bi->skb = skb;
 
-			bi->dma = dma_map_single(&pdev->dev, skb->data,
+			bi->dma = dma_map_single(rx_ring->dev, skb->data,
 						 rx_ring->rx_buf_len,
 						 DMA_FROM_DEVICE);
-			if (dma_mapping_error(&pdev->dev, bi->dma)) {
+			if (dma_mapping_error(rx_ring->dev, bi->dma)) {
 				dev_kfree_skb(skb);
 				bi->skb = NULL;
-				dev_err(&pdev->dev, "RX DMA map failed\n");
+				dev_err(rx_ring->dev, "Rx DMA map failed\n");
 				break;
 			}
 		}
@@ -468,10 +464,10 @@ static void ixgbevf_alloc_rx_buffers(struct ixgbevf_adapter *adapter,
 		i++;
 		if (i == rx_ring->count)
 			i = 0;
-		bi = &rx_ring->rx_buffer_info[i];
 	}
 
 no_buffers:
+	rx_ring->rx_stats.alloc_rx_buff_failed++;
 	if (rx_ring->next_to_use != i)
 		ixgbevf_release_rx_desc(rx_ring, i);
 }
@@ -488,8 +484,6 @@ static int ixgbevf_clean_rx_irq(struct ixgbevf_q_vector *q_vector,
 				struct ixgbevf_ring *rx_ring,
 				int budget)
 {
-	struct ixgbevf_adapter *adapter = q_vector->adapter;
-	struct pci_dev *pdev = adapter->pdev;
 	union ixgbe_adv_rx_desc *rx_desc, *next_rxd;
 	struct ixgbevf_rx_buffer *rx_buffer_info, *next_buffer;
 	struct sk_buff *skb;
@@ -515,7 +509,7 @@ static int ixgbevf_clean_rx_irq(struct ixgbevf_q_vector *q_vector,
 		rx_buffer_info->skb = NULL;
 
 		if (rx_buffer_info->dma) {
-			dma_unmap_single(&pdev->dev, rx_buffer_info->dma,
+			dma_unmap_single(rx_ring->dev, rx_buffer_info->dma,
 					 rx_ring->rx_buf_len,
 					 DMA_FROM_DEVICE);
 			rx_buffer_info->dma = 0;
@@ -535,7 +529,7 @@ static int ixgbevf_clean_rx_irq(struct ixgbevf_q_vector *q_vector,
 		if (!(staterr & IXGBE_RXD_STAT_EOP)) {
 			skb->next = next_buffer->skb;
 			IXGBE_CB(skb->next)->prev = skb;
-			adapter->non_eop_descs++;
+			rx_ring->rx_stats.non_eop_descs++;
 			goto next_desc;
 		}
 
@@ -566,9 +560,10 @@ static int ixgbevf_clean_rx_irq(struct ixgbevf_q_vector *q_vector,
 		/* Workaround hardware that can't do proper VEPA multicast
 		 * source pruning.
 		 */
-		if ((skb->pkt_type & (PACKET_BROADCAST | PACKET_MULTICAST)) &&
-		    !(compare_ether_addr(adapter->netdev->dev_addr,
-					eth_hdr(skb)->h_source))) {
+		if ((skb->pkt_type == PACKET_BROADCAST ||
+		    skb->pkt_type == PACKET_MULTICAST) &&
+		    ether_addr_equal(rx_ring->netdev->dev_addr,
+				     eth_hdr(skb)->h_source)) {
 			dev_kfree_skb_irq(skb);
 			goto next_desc;
 		}
@@ -580,8 +575,7 @@ next_desc:
 
 		/* return some buffers to hardware, one at a time is too slow */
 		if (cleaned_count >= IXGBEVF_RX_BUFFER_WRITE) {
-			ixgbevf_alloc_rx_buffers(adapter, rx_ring,
-						 cleaned_count);
+			ixgbevf_alloc_rx_buffers(rx_ring, cleaned_count);
 			cleaned_count = 0;
 		}
 
@@ -596,11 +590,11 @@ next_desc:
 	cleaned_count = ixgbevf_desc_unused(rx_ring);
 
 	if (cleaned_count)
-		ixgbevf_alloc_rx_buffers(adapter, rx_ring, cleaned_count);
+		ixgbevf_alloc_rx_buffers(rx_ring, cleaned_count);
 
 	u64_stats_update_begin(&rx_ring->syncp);
-	rx_ring->total_packets += total_rx_packets;
-	rx_ring->total_bytes += total_rx_bytes;
+	rx_ring->stats.packets += total_rx_packets;
+	rx_ring->stats.bytes += total_rx_bytes;
 	u64_stats_update_end(&rx_ring->syncp);
 	q_vector->rx.total_packets += total_rx_packets;
 	q_vector->rx.total_bytes += total_rx_bytes;
@@ -658,7 +652,8 @@ static int ixgbevf_poll(struct napi_struct *napi, int budget)
 	napi_complete(napi);
 	if (adapter->rx_itr_setting & 1)
 		ixgbevf_set_itr(q_vector);
-	if (!test_bit(__IXGBEVF_DOWN, &adapter->state))
+	if (!test_bit(__IXGBEVF_DOWN, &adapter->state) &&
+	    !test_bit(__IXGBEVF_REMOVING, &adapter->state))
 		ixgbevf_irq_enable_queues(adapter,
 					  1 << q_vector->v_idx);
 
@@ -705,9 +700,9 @@ static int ixgbevf_busy_poll_recv(struct napi_struct *napi)
 		found = ixgbevf_clean_rx_irq(q_vector, ring, 4);
 #ifdef BP_EXTENDED_STATS
 		if (found)
-			ring->bp_cleaned += found;
+			ring->stats.cleaned += found;
 		else
-			ring->bp_misses++;
+			ring->stats.misses++;
 #endif
 		if (found)
 			break;
@@ -879,37 +874,13 @@ static void ixgbevf_set_itr(struct ixgbevf_q_vector *q_vector)
 static irqreturn_t ixgbevf_msix_other(int irq, void *data)
 {
 	struct ixgbevf_adapter *adapter = data;
-	struct pci_dev *pdev = adapter->pdev;
 	struct ixgbe_hw *hw = &adapter->hw;
-	u32 msg;
-	bool got_ack = false;
 
 	hw->mac.get_link_status = 1;
-	if (!hw->mbx.ops.check_for_ack(hw))
-		got_ack = true;
 
-	if (!hw->mbx.ops.check_for_msg(hw)) {
-		hw->mbx.ops.read(hw, &msg, 1);
-
-		if ((msg & IXGBE_MBVFICR_VFREQ_MASK) == IXGBE_PF_CONTROL_MSG) {
-			mod_timer(&adapter->watchdog_timer,
-				  round_jiffies(jiffies + 1));
-			adapter->link_up = false;
-		}
-
-		if (msg & IXGBE_VT_MSGTYPE_NACK)
-			dev_info(&pdev->dev,
-				 "Last Request of type %2.2x to PF Nacked\n",
-				 msg & 0xFF);
-		hw->mbx.v2p_mailbox |= IXGBE_VFMAILBOX_PFSTS;
-	}
-
-	/* checking for the ack clears the PFACK bit.  Place
-	 * it back in the v2p_mailbox cache so that anyone
-	 * polling for an ack will not miss it
-	 */
-	if (got_ack)
-		hw->mbx.v2p_mailbox |= IXGBE_VFMAILBOX_PFACK;
+	if (!test_bit(__IXGBEVF_DOWN, &adapter->state) &&
+	    !test_bit(__IXGBEVF_REMOVING, &adapter->state))
+		mod_timer(&adapter->watchdog_timer, jiffies);
 
 	IXGBE_WRITE_REG(hw, IXGBE_VTEIMS, adapter->eims_other);
 
@@ -1410,7 +1381,7 @@ static void ixgbevf_configure_rx_ring(struct ixgbevf_adapter *adapter,
 	IXGBE_WRITE_REG(hw, IXGBE_VFRXDCTL(reg_idx), rxdctl);
 
 	ixgbevf_rx_desc_queue_enable(adapter, ring);
-	ixgbevf_alloc_rx_buffers(adapter, ring, ixgbevf_desc_unused(ring));
+	ixgbevf_alloc_rx_buffers(ring, ixgbevf_desc_unused(ring));
 }
 
 /**
@@ -1727,13 +1698,10 @@ void ixgbevf_up(struct ixgbevf_adapter *adapter)
 
 /**
  * ixgbevf_clean_rx_ring - Free Rx Buffers per Queue
- * @adapter: board private structure
  * @rx_ring: ring to free buffers from
  **/
-static void ixgbevf_clean_rx_ring(struct ixgbevf_adapter *adapter,
-				  struct ixgbevf_ring *rx_ring)
+static void ixgbevf_clean_rx_ring(struct ixgbevf_ring *rx_ring)
 {
-	struct pci_dev *pdev = adapter->pdev;
 	unsigned long size;
 	unsigned int i;
 
@@ -1746,7 +1714,7 @@ static void ixgbevf_clean_rx_ring(struct ixgbevf_adapter *adapter,
 
 		rx_buffer_info = &rx_ring->rx_buffer_info[i];
 		if (rx_buffer_info->dma) {
-			dma_unmap_single(&pdev->dev, rx_buffer_info->dma,
+			dma_unmap_single(rx_ring->dev, rx_buffer_info->dma,
 					 rx_ring->rx_buf_len,
 					 DMA_FROM_DEVICE);
 			rx_buffer_info->dma = 0;
@@ -1771,11 +1739,9 @@ static void ixgbevf_clean_rx_ring(struct ixgbevf_adapter *adapter,
 
 /**
  * ixgbevf_clean_tx_ring - Free Tx Buffers
- * @adapter: board private structure
  * @tx_ring: ring to be cleaned
  **/
-static void ixgbevf_clean_tx_ring(struct ixgbevf_adapter *adapter,
-				  struct ixgbevf_ring *tx_ring)
+static void ixgbevf_clean_tx_ring(struct ixgbevf_ring *tx_ring)
 {
 	struct ixgbevf_tx_buffer *tx_buffer_info;
 	unsigned long size;
@@ -1805,7 +1771,7 @@ static void ixgbevf_clean_all_rx_rings(struct ixgbevf_adapter *adapter)
 	int i;
 
 	for (i = 0; i < adapter->num_rx_queues; i++)
-		ixgbevf_clean_rx_ring(adapter, adapter->rx_ring[i]);
+		ixgbevf_clean_rx_ring(adapter->rx_ring[i]);
 }
 
 /**
@@ -1817,7 +1783,7 @@ static void ixgbevf_clean_all_tx_rings(struct ixgbevf_adapter *adapter)
 	int i;
 
 	for (i = 0; i < adapter->num_tx_queues; i++)
-		ixgbevf_clean_tx_ring(adapter, adapter->tx_ring[i]);
+		ixgbevf_clean_tx_ring(adapter->tx_ring[i]);
 }
 
 void ixgbevf_down(struct ixgbevf_adapter *adapter)
@@ -2360,10 +2326,7 @@ void ixgbevf_update_stats(struct ixgbevf_adapter *adapter)
 	for (i = 0;  i  < adapter->num_rx_queues;  i++) {
 		adapter->hw_csum_rx_error +=
 			adapter->rx_ring[i]->hw_csum_rx_error;
-		adapter->hw_csum_rx_good +=
-			adapter->rx_ring[i]->hw_csum_rx_good;
 		adapter->rx_ring[i]->hw_csum_rx_error = 0;
-		adapter->rx_ring[i]->hw_csum_rx_good = 0;
 	}
 }
 
@@ -2418,6 +2381,7 @@ static void ixgbevf_reset_task(struct work_struct *work)
 
 	/* If we're already down or resetting, just bail */
 	if (test_bit(__IXGBEVF_DOWN, &adapter->state) ||
+	    test_bit(__IXGBEVF_REMOVING, &adapter->state) ||
 	    test_bit(__IXGBEVF_RESETTING, &adapter->state))
 		return;
 
@@ -2510,7 +2474,8 @@ static void ixgbevf_watchdog_task(struct work_struct *work)
 
 pf_has_reset:
 	/* Reset the timer */
-	if (!test_bit(__IXGBEVF_DOWN, &adapter->state))
+	if (!test_bit(__IXGBEVF_DOWN, &adapter->state) &&
+	    !test_bit(__IXGBEVF_REMOVING, &adapter->state))
 		mod_timer(&adapter->watchdog_timer,
 			  round_jiffies(jiffies + (2 * HZ)));
 
@@ -2519,17 +2484,13 @@ pf_has_reset:
 
 /**
  * ixgbevf_free_tx_resources - Free Tx Resources per Queue
- * @adapter: board private structure
  * @tx_ring: Tx descriptor ring for a specific queue
  *
  * Free all transmit software resources
  **/
-void ixgbevf_free_tx_resources(struct ixgbevf_adapter *adapter,
-			       struct ixgbevf_ring *tx_ring)
+void ixgbevf_free_tx_resources(struct ixgbevf_ring *tx_ring)
 {
-	struct pci_dev *pdev = adapter->pdev;
-
-	ixgbevf_clean_tx_ring(adapter, tx_ring);
+	ixgbevf_clean_tx_ring(tx_ring);
 
 	vfree(tx_ring->tx_buffer_info);
 	tx_ring->tx_buffer_info = NULL;
@@ -2538,7 +2499,7 @@ void ixgbevf_free_tx_resources(struct ixgbevf_adapter *adapter,
 	if (!tx_ring->desc)
 		return;
 
-	dma_free_coherent(&pdev->dev, tx_ring->size, tx_ring->desc,
+	dma_free_coherent(tx_ring->dev, tx_ring->size, tx_ring->desc,
 			  tx_ring->dma);
 
 	tx_ring->desc = NULL;
@@ -2556,20 +2517,17 @@ static void ixgbevf_free_all_tx_resources(struct ixgbevf_adapter *adapter)
 
 	for (i = 0; i < adapter->num_tx_queues; i++)
 		if (adapter->tx_ring[i]->desc)
-			ixgbevf_free_tx_resources(adapter, adapter->tx_ring[i]);
+			ixgbevf_free_tx_resources(adapter->tx_ring[i]);
 }
 
 /**
  * ixgbevf_setup_tx_resources - allocate Tx resources (Descriptors)
- * @adapter: board private structure
  * @tx_ring:    tx descriptor ring (for a specific queue) to setup
  *
  * Return 0 on success, negative on failure
  **/
-int ixgbevf_setup_tx_resources(struct ixgbevf_adapter *adapter,
-			       struct ixgbevf_ring *tx_ring)
+int ixgbevf_setup_tx_resources(struct ixgbevf_ring *tx_ring)
 {
-	struct pci_dev *pdev = adapter->pdev;
 	int size;
 
 	size = sizeof(struct ixgbevf_tx_buffer) * tx_ring->count;
@@ -2581,7 +2539,7 @@ int ixgbevf_setup_tx_resources(struct ixgbevf_adapter *adapter,
 	tx_ring->size = tx_ring->count * sizeof(union ixgbe_adv_tx_desc);
 	tx_ring->size = ALIGN(tx_ring->size, 4096);
 
-	tx_ring->desc = dma_alloc_coherent(&pdev->dev, tx_ring->size,
+	tx_ring->desc = dma_alloc_coherent(tx_ring->dev, tx_ring->size,
 					   &tx_ring->dma, GFP_KERNEL);
 	if (!tx_ring->desc)
 		goto err;
@@ -2611,7 +2569,7 @@ static int ixgbevf_setup_all_tx_resources(struct ixgbevf_adapter *adapter)
 	int i, err = 0;
 
 	for (i = 0; i < adapter->num_tx_queues; i++) {
-		err = ixgbevf_setup_tx_resources(adapter, adapter->tx_ring[i]);
+		err = ixgbevf_setup_tx_resources(adapter->tx_ring[i]);
 		if (!err)
 			continue;
 		hw_dbg(&adapter->hw,
@@ -2624,37 +2582,34 @@ static int ixgbevf_setup_all_tx_resources(struct ixgbevf_adapter *adapter)
 
 /**
  * ixgbevf_setup_rx_resources - allocate Rx resources (Descriptors)
- * @adapter: board private structure
  * @rx_ring:    rx descriptor ring (for a specific queue) to setup
  *
  * Returns 0 on success, negative on failure
  **/
-int ixgbevf_setup_rx_resources(struct ixgbevf_adapter *adapter,
-			       struct ixgbevf_ring *rx_ring)
+int ixgbevf_setup_rx_resources(struct ixgbevf_ring *rx_ring)
 {
-	struct pci_dev *pdev = adapter->pdev;
 	int size;
 
 	size = sizeof(struct ixgbevf_rx_buffer) * rx_ring->count;
 	rx_ring->rx_buffer_info = vzalloc(size);
 	if (!rx_ring->rx_buffer_info)
-		goto alloc_failed;
+		goto err;
 
 	/* Round up to nearest 4K */
 	rx_ring->size = rx_ring->count * sizeof(union ixgbe_adv_rx_desc);
 	rx_ring->size = ALIGN(rx_ring->size, 4096);
 
-	rx_ring->desc = dma_alloc_coherent(&pdev->dev, rx_ring->size,
+	rx_ring->desc = dma_alloc_coherent(rx_ring->dev, rx_ring->size,
 					   &rx_ring->dma, GFP_KERNEL);
 
-	if (!rx_ring->desc) {
-		vfree(rx_ring->rx_buffer_info);
-		rx_ring->rx_buffer_info = NULL;
-		goto alloc_failed;
-	}
+	if (!rx_ring->desc)
+		goto err;
 
 	return 0;
-alloc_failed:
+err:
+	vfree(rx_ring->rx_buffer_info);
+	rx_ring->rx_buffer_info = NULL;
+	dev_err(rx_ring->dev, "Unable to allocate memory for the Rx descriptor ring\n");
 	return -ENOMEM;
 }
 
@@ -2673,7 +2628,7 @@ static int ixgbevf_setup_all_rx_resources(struct ixgbevf_adapter *adapter)
 	int i, err = 0;
 
 	for (i = 0; i < adapter->num_rx_queues; i++) {
-		err = ixgbevf_setup_rx_resources(adapter, adapter->rx_ring[i]);
+		err = ixgbevf_setup_rx_resources(adapter->rx_ring[i]);
 		if (!err)
 			continue;
 		hw_dbg(&adapter->hw,
@@ -2685,22 +2640,18 @@ static int ixgbevf_setup_all_rx_resources(struct ixgbevf_adapter *adapter)
 
 /**
  * ixgbevf_free_rx_resources - Free Rx Resources
- * @adapter: board private structure
  * @rx_ring: ring to clean the resources from
  *
  * Free all receive software resources
  **/
-void ixgbevf_free_rx_resources(struct ixgbevf_adapter *adapter,
-			       struct ixgbevf_ring *rx_ring)
+void ixgbevf_free_rx_resources(struct ixgbevf_ring *rx_ring)
 {
-	struct pci_dev *pdev = adapter->pdev;
-
-	ixgbevf_clean_rx_ring(adapter, rx_ring);
+	ixgbevf_clean_rx_ring(rx_ring);
 
 	vfree(rx_ring->rx_buffer_info);
 	rx_ring->rx_buffer_info = NULL;
 
-	dma_free_coherent(&pdev->dev, rx_ring->size, rx_ring->desc,
+	dma_free_coherent(rx_ring->dev, rx_ring->size, rx_ring->desc,
 			  rx_ring->dma);
 
 	rx_ring->desc = NULL;
@@ -2718,7 +2669,7 @@ static void ixgbevf_free_all_rx_resources(struct ixgbevf_adapter *adapter)
 
 	for (i = 0; i < adapter->num_rx_queues; i++)
 		if (adapter->rx_ring[i]->desc)
-			ixgbevf_free_rx_resources(adapter, adapter->rx_ring[i]);
+			ixgbevf_free_rx_resources(adapter->rx_ring[i]);
 }
 
 /**
@@ -3186,8 +3137,6 @@ dma_error:
 
 static int __ixgbevf_maybe_stop_tx(struct ixgbevf_ring *tx_ring, int size)
 {
-	struct ixgbevf_adapter *adapter = netdev_priv(tx_ring->netdev);
-
 	netif_stop_subqueue(tx_ring->netdev, tx_ring->queue_index);
 	/* Herbert's original patch had:
 	 *  smp_mb__after_netif_stop_queue();
@@ -3201,7 +3150,8 @@ static int __ixgbevf_maybe_stop_tx(struct ixgbevf_ring *tx_ring, int size)
 
 	/* A reprieve! - use start_queue because it doesn't call schedule */
 	netif_start_subqueue(tx_ring->netdev, tx_ring->queue_index);
-	++adapter->restart_queue;
+	++tx_ring->tx_stats.restart_queue;
+
 	return 0;
 }
 
@@ -3247,7 +3197,7 @@ static int ixgbevf_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 	count += skb_shinfo(skb)->nr_frags;
 #endif
 	if (ixgbevf_maybe_stop_tx(tx_ring, count + 3)) {
-		adapter->tx_busy++;
+		tx_ring->tx_stats.tx_busy++;
 		return NETDEV_TX_BUSY;
 	}
 
@@ -3379,7 +3329,8 @@ static int ixgbevf_suspend(struct pci_dev *pdev, pm_message_t state)
 		return retval;
 
 #endif
-	pci_disable_device(pdev);
+	if (!test_and_set_bit(__IXGBEVF_DISABLED, &adapter->state))
+		pci_disable_device(pdev);
 
 	return 0;
 }
@@ -3403,6 +3354,8 @@ static int ixgbevf_resume(struct pci_dev *pdev)
 		dev_err(&pdev->dev, "Cannot enable PCI device from suspend\n");
 		return err;
 	}
+	smp_mb__before_clear_bit();
+	clear_bit(__IXGBEVF_DISABLED, &adapter->state);
 	pci_set_master(pdev);
 
 	ixgbevf_reset(adapter);
@@ -3449,8 +3402,8 @@ static struct rtnl_link_stats64 *ixgbevf_get_stats(struct net_device *netdev,
 		ring = adapter->rx_ring[i];
 		do {
 			start = u64_stats_fetch_begin_bh(&ring->syncp);
-			bytes = ring->total_bytes;
-			packets = ring->total_packets;
+			bytes = ring->stats.bytes;
+			packets = ring->stats.packets;
 		} while (u64_stats_fetch_retry_bh(&ring->syncp, start));
 		stats->rx_bytes += bytes;
 		stats->rx_packets += packets;
@@ -3460,8 +3413,8 @@ static struct rtnl_link_stats64 *ixgbevf_get_stats(struct net_device *netdev,
 		ring = adapter->tx_ring[i];
 		do {
 			start = u64_stats_fetch_begin_bh(&ring->syncp);
-			bytes = ring->total_bytes;
-			packets = ring->total_packets;
+			bytes = ring->stats.bytes;
+			packets = ring->stats.packets;
 		} while (u64_stats_fetch_retry_bh(&ring->syncp, start));
 		stats->tx_bytes += bytes;
 		stats->tx_packets += packets;
@@ -3518,19 +3471,14 @@ static int ixgbevf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (err)
 		return err;
 
-	if (!dma_set_mask(&pdev->dev, DMA_BIT_MASK(64)) &&
-	    !dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64))) {
+	if (!dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 		pci_using_dac = 1;
 	} else {
-		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
+		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 		if (err) {
-			err = dma_set_coherent_mask(&pdev->dev,
-						    DMA_BIT_MASK(32));
-			if (err) {
-				dev_err(&pdev->dev, "No usable DMA "
-					"configuration, aborting\n");
-				goto err_dma;
-			}
+			dev_err(&pdev->dev, "No usable DMA "
+				"configuration, aborting\n");
+			goto err_dma;
 		}
 		pci_using_dac = 0;
 	}
@@ -3625,8 +3573,13 @@ static int ixgbevf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	adapter->watchdog_timer.function = ixgbevf_watchdog;
 	adapter->watchdog_timer.data = (unsigned long)adapter;
 
+	if (IXGBE_REMOVED(hw->hw_addr)) {
+		err = -EIO;
+		goto err_sw_init;
+	}
 	INIT_WORK(&adapter->reset_task, ixgbevf_reset_task);
 	INIT_WORK(&adapter->watchdog_task, ixgbevf_watchdog_task);
+	set_bit(__IXGBEVF_WORK_INIT, &adapter->state);
 
 	err = ixgbevf_init_interrupt_scheme(adapter);
 	if (err)
@@ -3662,7 +3615,8 @@ err_alloc_etherdev:
 	pci_release_regions(pdev);
 err_pci_reg:
 err_dma:
-	pci_disable_device(pdev);
+	if (!test_and_set_bit(__IXGBEVF_DISABLED, &adapter->state))
+		pci_disable_device(pdev);
 	return err;
 }
 
@@ -3680,7 +3634,7 @@ static void ixgbevf_remove(struct pci_dev *pdev)
 	struct net_device *netdev = pci_get_drvdata(pdev);
 	struct ixgbevf_adapter *adapter = netdev_priv(netdev);
 
-	set_bit(__IXGBEVF_DOWN, &adapter->state);
+	set_bit(__IXGBEVF_REMOVING, &adapter->state);
 
 	del_timer_sync(&adapter->watchdog_timer);
 
@@ -3700,7 +3654,8 @@ static void ixgbevf_remove(struct pci_dev *pdev)
 
 	free_netdev(netdev);
 
-	pci_disable_device(pdev);
+	if (!test_and_set_bit(__IXGBEVF_DISABLED, &adapter->state))
+		pci_disable_device(pdev);
 }
 
 /**
@@ -3717,15 +3672,23 @@ static pci_ers_result_t ixgbevf_io_error_detected(struct pci_dev *pdev,
 	struct net_device *netdev = pci_get_drvdata(pdev);
 	struct ixgbevf_adapter *adapter = netdev_priv(netdev);
 
+	if (!test_bit(__IXGBEVF_WORK_INIT, &adapter->state))
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	rtnl_lock();
 	netif_device_detach(netdev);
 
-	if (state == pci_channel_io_perm_failure)
+	if (state == pci_channel_io_perm_failure) {
+		rtnl_unlock();
 		return PCI_ERS_RESULT_DISCONNECT;
+	}
 
 	if (netif_running(netdev))
 		ixgbevf_down(adapter);
 
-	pci_disable_device(pdev);
+	if (!test_and_set_bit(__IXGBEVF_DISABLED, &adapter->state))
+		pci_disable_device(pdev);
+	rtnl_unlock();
 
 	/* Request a slot slot reset. */
 	return PCI_ERS_RESULT_NEED_RESET;
@@ -3749,6 +3712,8 @@ static pci_ers_result_t ixgbevf_io_slot_reset(struct pci_dev *pdev)
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 
+	smp_mb__before_clear_bit();
+	clear_bit(__IXGBEVF_DISABLED, &adapter->state);
 	pci_set_master(pdev);
 
 	ixgbevf_reset(adapter);

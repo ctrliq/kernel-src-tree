@@ -1886,16 +1886,20 @@ struct be_nic_res_desc {
 	u16 cq_count;
 	u16 toe_conn_count;
 	u16 eq_count;
-	u32 rsvd5;
+	u16 vlan_id;
+	u16 iface_count;
 	u32 cap_flags;
 	u8 link_param;
-	u8 rsvd6[3];
+	u8 rsvd6;
+	u16 channel_id_param;
 	u32 bw_min;
 	u32 bw_max;
 	u8 acpi_params;
 	u8 wol_param;
 	u16 rsvd7;
-	u32 rsvd8[7];
+	u16 tunnel_iface_count;
+	u16 direct_tenant_iface_count;
+	u32 rsvd8[6];
 } __packed;
 
 /************ Multi-Channel type ***********/
@@ -1943,8 +1947,8 @@ struct be_cmd_req_set_profile_config {
 	struct be_cmd_req_hdr hdr;
 	u32 rsvd;
 	u32 desc_count;
-	u8 desc[RESOURCE_DESC_SIZE_V1];
-};
+	u8 desc[2 * RESOURCE_DESC_SIZE_V1];
+} __packed;
 
 struct be_cmd_req_get_active_profile {
 	struct be_cmd_req_hdr hdr;
@@ -2057,7 +2061,7 @@ int be_cmd_get_flow_control(struct be_adapter *adapter, u32 *tx_fc, u32 *rx_fc);
 int be_cmd_query_fw_cfg(struct be_adapter *adapter);
 int be_cmd_reset_function(struct be_adapter *adapter);
 int be_cmd_rss_config(struct be_adapter *adapter, u8 *rsstable,
-		      u32 rss_hash_opts, u16 table_size, u8 *rss_hkey);
+		      u32 rss_hash_opts, u16 table_size, const u8 *rss_hkey);
 int be_process_mcc(struct be_adapter *adapter);
 int be_cmd_set_beacon_state(struct be_adapter *adapter, u8 port_num, u8 beacon,
 			    u8 status, u8 state);
@@ -2094,7 +2098,8 @@ int be_cmd_get_seeprom_data(struct be_adapter *adapter,
 int be_cmd_set_loopback(struct be_adapter *adapter, u8 port_num,
 			u8 loopback_type, u8 enable);
 int be_cmd_get_phy_info(struct be_adapter *adapter);
-int be_cmd_config_qos(struct be_adapter *adapter, u32 bps, u8 domain);
+int be_cmd_config_qos(struct be_adapter *adapter, u32 max_rate,
+		      u16 link_speed, u8 domain);
 void be_detect_error(struct be_adapter *adapter);
 int be_cmd_get_die_temperature(struct be_adapter *adapter);
 int be_cmd_get_cntl_attributes(struct be_adapter *adapter);
@@ -2136,8 +2141,6 @@ int be_cmd_get_func_config(struct be_adapter *adapter,
 			   struct be_resources *res);
 int be_cmd_get_profile_config(struct be_adapter *adapter,
 			      struct be_resources *res, u8 domain);
-int be_cmd_set_profile_config(struct be_adapter *adapter, void *desc,
-			      int size, u8 version, u8 domain);
 int be_cmd_get_active_profile(struct be_adapter *adapter, u16 *profile);
 int be_cmd_get_if_id(struct be_adapter *adapter, struct be_vf_cfg *vf_cfg,
 		     int vf_num);
@@ -2147,3 +2150,5 @@ int be_cmd_set_logical_link_config(struct be_adapter *adapter,
 					  int link_state, u8 domain);
 int be_cmd_set_vxlan_port(struct be_adapter *adapter, __be16 port);
 int be_cmd_manage_iface(struct be_adapter *adapter, u32 iface, u8 op);
+int be_cmd_set_sriov_config(struct be_adapter *adapter,
+			    struct be_resources res, u16 num_vfs);

@@ -8,6 +8,8 @@
 #include <linux/workqueue.h>
 #include <linux/fs.h>
 
+#include <linux/rh_kabi.h>
+
 DECLARE_PER_CPU(int, dirty_throttle_leaks);
 
 /*
@@ -81,8 +83,8 @@ struct writeback_control {
 	unsigned for_sync:1;		/* sync(2) WB_SYNC_ALL writeback */
 
 	/* reserved for Red Hat */
-	unsigned long rh_reserved1;
-	unsigned long rh_reserved2;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 /*

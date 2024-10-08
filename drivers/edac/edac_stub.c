@@ -29,7 +29,7 @@ EXPORT_SYMBOL_GPL(edac_err_assert);
 
 static atomic_t edac_subsys_valid = ATOMIC_INIT(0);
 
-int edac_report_status = EDAC_REPORTING_ENABLED;
+int edac_report_status = EDAC_REPORTING_FORCE;
 EXPORT_SYMBOL_GPL(edac_report_status);
 
 static int __init edac_report_setup(char *str)

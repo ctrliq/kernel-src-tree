@@ -48,12 +48,13 @@
 #include <linux/bitmap.h>
 #include <linux/atomic.h>
 #include <linux/jiffies.h>
+#include <linux/percpu.h>
 #include <asm/div64.h>
 #include "hpsa_cmd.h"
 #include "hpsa.h"
 
 /* HPSA_DRIVER_VERSION must be 3 byte values (0-255) separated by '.' */
-#define HPSA_DRIVER_VERSION "3.4.2-RH5"
+#define HPSA_DRIVER_VERSION "3.4.4-1-RH1"
 #define DRIVER_NAME "HP HPSA Driver (v " HPSA_DRIVER_VERSION ")"
 #define HPSA "hpsa"
 
@@ -126,6 +127,11 @@ static const struct pci_device_id hpsa_pci_device_id[] = {
 	{PCI_VENDOR_ID_HP,     PCI_DEVICE_ID_HP_CISSI,     0x103C, 0x21CC},
 	{PCI_VENDOR_ID_HP,     PCI_DEVICE_ID_HP_CISSI,     0x103C, 0x21CD},
 	{PCI_VENDOR_ID_HP,     PCI_DEVICE_ID_HP_CISSI,     0x103C, 0x21CE},
+	{PCI_VENDOR_ID_HP_3PAR, 0x0075, 0x1590, 0x0076},
+	{PCI_VENDOR_ID_HP_3PAR, 0x0075, 0x1590, 0x0087},
+	{PCI_VENDOR_ID_HP_3PAR, 0x0075, 0x1590, 0x007D},
+	{PCI_VENDOR_ID_HP_3PAR, 0x0075, 0x1590, 0x0088},
+	{PCI_VENDOR_ID_HP, 0x333f, 0x103c, 0x333f},
 	{PCI_VENDOR_ID_HP,     PCI_ANY_ID,	PCI_ANY_ID, PCI_ANY_ID,
 		PCI_CLASS_STORAGE_RAID << 8, 0xffff << 8, 0},
 	{0,}
@@ -163,24 +169,29 @@ static struct board_type products[] = {
 	{0x1928103C, "Smart Array P230i", &SA5_access},
 	{0x1929103C, "Smart Array P530", &SA5_access},
 	{0x192A103C, "Smart Array P531", &SA5_access},
-	{0x21BD103C, "Smart Array", &SA5_access},
-	{0x21BE103C, "Smart Array", &SA5_access},
-	{0x21BF103C, "Smart Array", &SA5_access},
-	{0x21C0103C, "Smart Array", &SA5_access},
-	{0x21C1103C, "Smart Array", &SA5_access},
-	{0x21C2103C, "Smart Array", &SA5_access},
-	{0x21C3103C, "Smart Array", &SA5_access},
+	{0x21BD103C, "Smart Array P244br", &SA5_access},
+	{0x21BE103C, "Smart Array P741m", &SA5_access},
+	{0x21BF103C, "Smart HBA H240ar", &SA5_access},
+	{0x21C0103C, "Smart Array P440ar", &SA5_access},
+	{0x21C1103C, "Smart Array P840ar", &SA5_access},
+	{0x21C2103C, "Smart Array P440", &SA5_access},
+	{0x21C3103C, "Smart Array P441", &SA5_access},
 	{0x21C4103C, "Smart Array", &SA5_access},
-	{0x21C5103C, "Smart Array", &SA5_access},
-	{0x21C6103C, "Smart Array", &SA5_access},
-	{0x21C7103C, "Smart Array", &SA5_access},
-	{0x21C8103C, "Smart Array", &SA5_access},
+	{0x21C5103C, "Smart Array P841", &SA5_access},
+	{0x21C6103C, "Smart HBA H244br", &SA5_access},
+	{0x21C7103C, "Smart HBA H240", &SA5_access},
+	{0x21C8103C, "Smart HBA H241", &SA5_access},
 	{0x21C9103C, "Smart Array", &SA5_access},
-	{0x21CA103C, "Smart Array", &SA5_access},
-	{0x21CB103C, "Smart Array", &SA5_access},
+	{0x21CA103C, "Smart Array P246br", &SA5_access},
+	{0x21CB103C, "Smart Array P840", &SA5_access},
 	{0x21CC103C, "Smart Array", &SA5_access},
 	{0x21CD103C, "Smart Array", &SA5_access},
-	{0x21CE103C, "Smart Array", &SA5_access},
+	{0x21CE103C, "Smart HBA", &SA5_access},
+	{0x00761590, "HP Storage P1224 Array Controller", &SA5_access},
+	{0x00871590, "HP Storage P1224e Array Controller", &SA5_access},
+	{0x007D1590, "HP Storage P1228 Array Controller", &SA5_access},
+	{0x00881590, "HP Storage P1228e Array Controller", &SA5_access},
+	{0x333f103c, "HP StorageWorks 1210m Array Controller", &SA5_access},
 	{0xFFFF103C, "Unknown Smart Array", &SA5_access},
 };
 
@@ -189,7 +200,8 @@ static int number_of_controllers;
 static irqreturn_t do_hpsa_intr_intx(int irq, void *dev_id);
 static irqreturn_t do_hpsa_intr_msi(int irq, void *dev_id);
 static int hpsa_ioctl(struct scsi_device *dev, int cmd, void *arg);
-static void start_io(struct ctlr_info *h);
+static void lock_and_start_io(struct ctlr_info *h);
+static void start_io(struct ctlr_info *h, unsigned long *flags);
 
 #ifdef CONFIG_COMPAT
 static int hpsa_compat_ioctl(struct scsi_device *dev, int cmd, void *arg);
@@ -840,8 +852,8 @@ static void enqueue_cmd_and_start_io(struct ctlr_info *h,
 	spin_lock_irqsave(&h->lock, flags);
 	addQ(&h->reqQ, c);
 	h->Qdepth++;
+	start_io(h, &flags);
 	spin_unlock_irqrestore(&h->lock, flags);
-	start_io(h);
 }
 
 static inline void removeQ(struct CommandList *c)
@@ -1980,20 +1992,26 @@ static inline void hpsa_scsi_do_simple_cmd_core(struct ctlr_info *h,
 	wait_for_completion(&wait);
 }
 
+static u32 lockup_detected(struct ctlr_info *h)
+{
+	int cpu;
+	u32 rc, *lockup_detected;
+
+	cpu = get_cpu();
+	lockup_detected = per_cpu_ptr(h->lockup_detected, cpu);
+	rc = *lockup_detected;
+	put_cpu();
+	return rc;
+}
+
 static void hpsa_scsi_do_simple_cmd_core_if_no_lockup(struct ctlr_info *h,
 	struct CommandList *c)
 {
-	unsigned long flags;
-
 	/* If controller lockup detected, fake a hardware error. */
-	spin_lock_irqsave(&h->lock, flags);
-	if (unlikely(h->lockup_detected)) {
-		spin_unlock_irqrestore(&h->lock, flags);
+	if (unlikely(lockup_detected(h)))
 		c->err_info->CommandStatus = CMD_HARDWARE_ERR;
-	} else {
-		spin_unlock_irqrestore(&h->lock, flags);
+	else
 		hpsa_scsi_do_simple_cmd_core(h, c);
-	}
 }
 
 #define MAX_DRIVER_CMD_RETRIES 25
@@ -3954,7 +3972,6 @@ static int hpsa_scsi_queue_command_lck(struct scsi_cmnd *cmd,
 	struct hpsa_scsi_dev_t *dev;
 	unsigned char scsi3addr[8];
 	struct CommandList *c;
-	unsigned long flags;
 	int rc = 0;
 
 	/* Get the ptr to our adapter structure out of cmd->host. */
@@ -3967,14 +3984,11 @@ static int hpsa_scsi_queue_command_lck(struct scsi_cmnd *cmd,
 	}
 	memcpy(scsi3addr, dev->scsi3addr, sizeof(scsi3addr));
 
-	spin_lock_irqsave(&h->lock, flags);
-	if (unlikely(h->lockup_detected)) {
-		spin_unlock_irqrestore(&h->lock, flags);
+	if (unlikely(lockup_detected(h))) {
 		cmd->result = DID_ERROR << 16;
 		done(cmd);
 		return 0;
 	}
-	spin_unlock_irqrestore(&h->lock, flags);
 	c = cmd_alloc(h);
 	if (c == NULL) {			/* trouble... */
 		dev_err(&h->pdev->dev, "cmd_alloc returned NULL!\n");
@@ -4086,16 +4100,13 @@ static int do_not_scan_if_controller_locked_up(struct ctlr_info *h)
 	 * we can prevent new rescan threads from piling up on a
 	 * locked up controller.
 	 */
-	spin_lock_irqsave(&h->lock, flags);
-	if (unlikely(h->lockup_detected)) {
-		spin_unlock_irqrestore(&h->lock, flags);
+	if (unlikely(lockup_detected(h))) {
 		spin_lock_irqsave(&h->scan_lock, flags);
 		h->scan_finished = 1;
 		wake_up_all(&h->scan_wait_queue);
 		spin_unlock_irqrestore(&h->scan_lock, flags);
 		return 1;
 	}
-	spin_unlock_irqrestore(&h->lock, flags);
 	return 0;
 }
 
@@ -5442,20 +5453,21 @@ static void __iomem *remap_pci_mem(ulong base, ulong size)
 
 /* Takes cmds off the submission queue and sends them to the hardware,
  * then puts them on the queue of cmds waiting for completion.
+ * Assumes h->lock is held
  */
-static void start_io(struct ctlr_info *h)
+static void start_io(struct ctlr_info *h, unsigned long *flags)
 {
 	struct CommandList *c;
-	unsigned long flags;
 
-	spin_lock_irqsave(&h->lock, flags);
 	while (!list_empty(&h->reqQ)) {
 		c = list_entry(h->reqQ.next, struct CommandList, list);
 		/* can't do anything if fifo is full */
 		if ((h->access.fifo_full(h))) {
+			h->fifo_recently_full = 1;
 			dev_warn(&h->pdev->dev, "fifo full\n");
 			break;
 		}
+		h->fifo_recently_full = 0;
 
 		/* Get the first entry from the Request Q */
 		removeQ(c);
@@ -5471,10 +5483,18 @@ static void start_io(struct ctlr_info *h)
 		h->commands_outstanding++;
 
 		/* Tell the controller execute command */
-		spin_unlock_irqrestore(&h->lock, flags);
+		spin_unlock_irqrestore(&h->lock, *flags);
 		h->access.submit_command(h, c);
-		spin_lock_irqsave(&h->lock, flags);
+		spin_lock_irqsave(&h->lock, *flags);
 	}
+}
+
+static void lock_and_start_io(struct ctlr_info *h)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&h->lock, flags);
+	start_io(h, &flags);
 	spin_unlock_irqrestore(&h->lock, flags);
 }
 
@@ -5507,16 +5527,42 @@ static inline int bad_tag(struct ctlr_info *h, u32 tag_index,
 static inline void finish_cmd(struct CommandList *c)
 {
 	unsigned long flags;
+	int io_may_be_stalled = 0;
+	struct ctlr_info *h = c->h;
 
-	spin_lock_irqsave(&c->h->lock, flags);
+	spin_lock_irqsave(&h->lock, flags);
 	removeQ(c);
-	spin_unlock_irqrestore(&c->h->lock, flags);
+
+	/*
+	 * Check for possibly stalled i/o.
+	 *
+	 * If a fifo_full condition is encountered, requests will back up
+	 * in h->reqQ.  This queue is only emptied out by start_io which is
+	 * only called when a new i/o request comes in.  If no i/o's are
+	 * forthcoming, the i/o's in h->reqQ can get stuck.  So we call
+	 * start_io from here if we detect such a danger.
+	 *
+	 * Normally, we shouldn't hit this case, but pounding on the
+	 * CCISS_PASSTHRU ioctl can provoke it.  Only call start_io if
+	 * commands_outstanding is low.  We want to avoid calling
+	 * start_io from in here as much as possible, and esp. don't
+	 * want to get in a cycle where we call start_io every time
+	 * through here.
+	 */
+	if (unlikely(h->fifo_recently_full) &&
+		h->commands_outstanding < 5)
+		io_may_be_stalled = 1;
+
+	spin_unlock_irqrestore(&h->lock, flags);
+
 	dial_up_lockup_detection_on_fw_flash_complete(c->h, c);
 	if (likely(c->cmd_type == CMD_IOACCEL1 || c->cmd_type == CMD_SCSI
 			|| c->cmd_type == CMD_IOACCEL2))
 		complete_scsi_command(c);
 	else if (c->cmd_type == CMD_IOCTL_PEND)
 		complete(c->waiting);
+	if (unlikely(io_may_be_stalled))
+		lock_and_start_io(h);
 }
 
 static inline u32 hpsa_tag_contains_index(u32 tag)
@@ -5792,6 +5838,13 @@ static int hpsa_controller_hard_reset(struct pci_dev *pdev,
 		 */
 		dev_info(&pdev->dev, "using doorbell to reset controller\n");
 		writel(use_doorbell, vaddr + SA5_DOORBELL);
+
+		/* PMC hardware guys tell us we need a 10 second delay after
+		 * doorbell reset and before any attempt to talk to the board
+		 * at all to ensure that this actually works and doesn't fall
+		 * over in some weird corner cases.
+		 */
+		msleep(10000);
 	} else { /* Try to do it the PCI power state way */
 
 		/* Quoting from the Open CISS Specification: "The Power
@@ -6151,6 +6204,7 @@ static int hpsa_lookup_board_id(struct pci_dev *pdev, u32 *board_id)
 {
 	int i;
 	u32 subsystem_vendor_id, subsystem_device_id;
+	char msg[80];
 
 	subsystem_vendor_id = pdev->subsystem_vendor;
 	subsystem_device_id = pdev->subsystem_device;
@@ -6169,7 +6223,8 @@ static int hpsa_lookup_board_id(struct pci_dev *pdev, u32 *board_id)
 			return -ENODEV;
 	}
 
-	mark_tech_preview("hpsa: this controller", THIS_MODULE);
+	sprintf(msg, "hpsa: this controller (%#x)", subsystem_device_id);
+	mark_tech_preview(msg, THIS_MODULE);
 
 	return ARRAY_SIZE(products) - 1; /* generic unknown smart array */
 }
@@ -6719,16 +6774,38 @@ static void fail_all_cmds_on_list(struct ctlr_info *h, struct list_head *list)
 	}
 }
 
+static void set_lockup_detected_for_all_cpus(struct ctlr_info *h, u32 value)
+{
+	int i, cpu;
+
+	cpu = cpumask_first(cpu_online_mask);
+	for (i = 0; i < num_online_cpus(); i++) {
+		u32 *lockup_detected;
+		lockup_detected = per_cpu_ptr(h->lockup_detected, cpu);
+		*lockup_detected = value;
+		cpu = cpumask_next(cpu, cpu_online_mask);
+	}
+	wmb(); /* be sure the per-cpu variables are out to memory */
+}
+
 static void controller_lockup_detected(struct ctlr_info *h)
 {
 	unsigned long flags;
+	u32 lockup_detected;
 
 	h->access.set_intr_mask(h, HPSA_INTR_OFF);
 	spin_lock_irqsave(&h->lock, flags);
-	h->lockup_detected = readl(h->vaddr + SA5_SCRATCHPAD_OFFSET);
+	lockup_detected = readl(h->vaddr + SA5_SCRATCHPAD_OFFSET);
+	if (!lockup_detected) {
+		/* no heartbeat, but controller gave us a zero. */
+		dev_warn(&h->pdev->dev,
+			"lockup detected but scratchpad register is zero\n");
+		lockup_detected = 0xffffffff;
+	}
+	set_lockup_detected_for_all_cpus(h, lockup_detected);
 	spin_unlock_irqrestore(&h->lock, flags);
 	dev_warn(&h->pdev->dev, "Controller lockup detected: 0x%08x\n",
-			h->lockup_detected);
+			lockup_detected);
 	pci_disable_device(h->pdev);
 	spin_lock_irqsave(&h->lock, flags);
 	fail_all_cmds_on_list(h, &h->cmpQ);
@@ -6867,7 +6944,7 @@ static void hpsa_monitor_ctlr_worker(struct work_struct *work)
 	struct ctlr_info *h = container_of(to_delayed_work(work),
 					struct ctlr_info, monitor_ctlr_work);
 	detect_controller_lockup(h);
-	if (h->lockup_detected)
+	if (lockup_detected(h))
 		return;
 
 	if (hpsa_ctlr_needs_rescan(h) || hpsa_offline_devices_ready(h)) {
@@ -6931,6 +7008,15 @@ reinit_after_soft_reset:
 	spin_lock_init(&h->offline_device_lock);
 	spin_lock_init(&h->scan_lock);
 	spin_lock_init(&h->passthru_count_lock);
+
+	/* Allocate and clear per-cpu variable lockup_detected */
+	h->lockup_detected = alloc_percpu(u32);
+	if (!h->lockup_detected) {
+		rc = -ENOMEM;
+		goto clean1;
+	}
+	set_lockup_detected_for_all_cpus(h, 0);
+
 	rc = hpsa_pci_init(h);
 	if (rc != 0)
 		goto clean1;
@@ -7054,6 +7140,8 @@ clean4:
 	free_irqs(h);
 clean2:
 clean1:
+	if (h->lockup_detected)
+		free_percpu(h->lockup_detected);
 	kfree(h);
 	return rc;
 }
@@ -7062,16 +7150,10 @@ static void hpsa_flush_cache(struct ctlr_info *h)
 {
 	char *flush_buf;
 	struct CommandList *c;
-	unsigned long flags;
 
 	/* Don't bother trying to flush the cache if locked up */
-	spin_lock_irqsave(&h->lock, flags);
-	if (unlikely(h->lockup_detected)) {
-		spin_unlock_irqrestore(&h->lock, flags);
+	if (unlikely(lockup_detected(h)))
 		return;
-	}
-	spin_unlock_irqrestore(&h->lock, flags);
-
 	flush_buf = kzalloc(4, GFP_KERNEL);
 	if (!flush_buf)
 		return;
@@ -7155,7 +7237,7 @@ static void hpsa_remove_one(struct pci_dev *pdev)
 	kfree(h->hba_inquiry_data);
 	pci_disable_device(pdev);
 	pci_release_regions(pdev);
-	pci_set_drvdata(pdev, NULL);
+	free_percpu(h->lockup_detected);
 	kfree(h);
 }
 

@@ -22,15 +22,11 @@
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
 
-#include <linux/device.h>
+#include <linux/acpi.h>
 #include <linux/export.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
 #include <linux/pm_runtime.h>
-
-#include <acpi/acpi.h>
-#include <acpi/acpi_bus.h>
-#include <acpi/acpi_drivers.h>
 
 #include "internal.h"
 
@@ -265,6 +261,8 @@ int acpi_bus_init_power(struct acpi_device *device)
 		return -EINVAL;
 
 	device->power.state = ACPI_STATE_UNKNOWN;
+	if (!acpi_device_is_present(device))
+		return 0;
 
 	result = acpi_device_get_power(device, &state);
 	if (result)
@@ -311,15 +309,18 @@ int acpi_device_fix_up_power(struct acpi_device *device)
 	return ret;
 }
 
-int acpi_bus_update_power(acpi_handle handle, int *state_p)
+int acpi_device_update_power(struct acpi_device *device, int *state_p)
 {
-	struct acpi_device *device;
 	int state;
 	int result;
 
-	result = acpi_bus_get_device(handle, &device);
-	if (result)
+	if (device->power.state == ACPI_STATE_UNKNOWN) {
+		result = acpi_bus_init_power(device);
+		if (!result && state_p)
+			*state_p = device->power.state;
+
 		return result;
+	}
 
 	result = acpi_device_get_power(device, &state);
 	if (result)
@@ -346,6 +347,15 @@ int acpi_bus_update_power(acpi_handle handle, int *state_p)
 		*state_p = state;
 
 	return 0;
+}
+
+int acpi_bus_update_power(acpi_handle handle, int *state_p)
+{
+	struct acpi_device *device;
+	int result;
+
+	result = acpi_bus_get_device(handle, &device);
+	return result ? result : acpi_device_update_power(device, state_p);
 }
 EXPORT_SYMBOL_GPL(acpi_bus_update_power);
 

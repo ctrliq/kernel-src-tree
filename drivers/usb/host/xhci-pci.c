@@ -144,6 +144,9 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
 		xhci->quirks |= XHCI_RESET_ON_RESUME;
 		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
 	}
+	if (pdev->vendor == PCI_VENDOR_ID_RENESAS &&
+			pdev->device == 0x0015)
+		xhci->quirks |= XHCI_RESET_ON_RESUME;
 	if (pdev->vendor == PCI_VENDOR_ID_VIA)
 		xhci->quirks |= XHCI_RESET_ON_RESUME;
 
@@ -227,11 +230,8 @@ static int xhci_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		goto put_usb3_hcd;
 	/* Roothub already marked as USB 3.0 speed */
 
-	/* We know the LPM timeout algorithms for this host, let the USB core
-	 * enable and disable LPM for devices under the USB 3.0 roothub.
-	 */
-	if (xhci->quirks & XHCI_LPM_SUPPORT)
-		hcd_to_bus(xhci->shared_hcd)->root_hub->lpm_capable = 1;
+	if (HCC_MAX_PSA(xhci->hcc_params) >= 4)
+		xhci->shared_hcd->can_do_streams = 1;
 
 	/* USB-2 and USB-3 roothubs initialized, allow runtime pm suspend */
 	pm_runtime_put_noidle(&dev->dev);

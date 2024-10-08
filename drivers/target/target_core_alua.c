@@ -416,7 +416,7 @@ static inline int core_alua_state_standby(
 		case SAI_READ_CAPACITY_16:
 			return 0;
 		default:
-			set_ascq(cmd, ASCQ_04H_ALUA_TG_PT_STANDBY);
+			*alua_ascq = ASCQ_04H_ALUA_TG_PT_STANDBY;
 			return 1;
 		}
 	case MAINTENANCE_IN:

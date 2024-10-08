@@ -6,7 +6,7 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation.
  *
- * Maintained by: Eilon Greenstein <eilong@broadcom.com>
+ * Maintained by: Ariel Elior <ariel.elior@qlogic.com>
  * Written by: Eliezer Tamir
  * Based on code from Michael Chan's bnx2 driver
  * UDP CSUM errata workaround by Arik Gendelman
@@ -484,11 +484,7 @@ static void bnx2x_tpa_start(struct bnx2x_fastpath *fp, u16 queue,
 
 #ifdef BNX2X_STOP_ON_ERROR
 	fp->tpa_queue_used |= (1 << queue);
-#ifdef _ASM_GENERIC_INT_L64_H
-	DP(NETIF_MSG_RX_STATUS, "fp->tpa_queue_used = 0x%lx\n",
-#else
 	DP(NETIF_MSG_RX_STATUS, "fp->tpa_queue_used = 0x%llx\n",
-#endif
 	   fp->tpa_queue_used);
 #endif
 }
@@ -1068,6 +1064,11 @@ reuse_rx:
 
 		skb_record_rx_queue(skb, fp->rx_queue);
 
+		/* Check if this packet was timestamped */
+		if (unlikely(cqe->fast_path_cqe.type_error_flags &
+			     (1 << ETH_FAST_PATH_RX_CQE_PTP_PKT_SHIFT)))
+			bnx2x_set_rx_ts(bp, skb);
+
 		if (le16_to_cpu(cqe_fp->pars_flags.flags) &
 		    PARSING_FLAGS_VLAN)
 			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
@@ -1193,29 +1194,38 @@ u16 bnx2x_get_mf_speed(struct bnx2x *bp)
 static void bnx2x_fill_report_data(struct bnx2x *bp,
 				   struct bnx2x_link_report_data *data)
 {
-	u16 line_speed = bnx2x_get_mf_speed(bp);
-
 	memset(data, 0, sizeof(*data));
 
-	/* Fill the report data: effective line speed */
-	data->line_speed = line_speed;
+	if (IS_PF(bp)) {
+		/* Fill the report data: effective line speed */
+		data->line_speed = bnx2x_get_mf_speed(bp);
 
-	/* Link is down */
-	if (!bp->link_vars.link_up || (bp->flags & MF_FUNC_DIS))
-		__set_bit(BNX2X_LINK_REPORT_LINK_DOWN,
-			  &data->link_report_flags);
+		/* Link is down */
+		if (!bp->link_vars.link_up || (bp->flags & MF_FUNC_DIS))
+			__set_bit(BNX2X_LINK_REPORT_LINK_DOWN,
+				  &data->link_report_flags);
 
-	/* Full DUPLEX */
-	if (bp->link_vars.duplex == DUPLEX_FULL)
-		__set_bit(BNX2X_LINK_REPORT_FD, &data->link_report_flags);
+		if (!BNX2X_NUM_ETH_QUEUES(bp))
+			__set_bit(BNX2X_LINK_REPORT_LINK_DOWN,
+				  &data->link_report_flags);
 
-	/* Rx Flow Control is ON */
-	if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_RX)
-		__set_bit(BNX2X_LINK_REPORT_RX_FC_ON, &data->link_report_flags);
+		/* Full DUPLEX */
+		if (bp->link_vars.duplex == DUPLEX_FULL)
+			__set_bit(BNX2X_LINK_REPORT_FD,
+				  &data->link_report_flags);
 
-	/* Tx Flow Control is ON */
-	if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_TX)
-		__set_bit(BNX2X_LINK_REPORT_TX_FC_ON, &data->link_report_flags);
+		/* Rx Flow Control is ON */
+		if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_RX)
+			__set_bit(BNX2X_LINK_REPORT_RX_FC_ON,
+				  &data->link_report_flags);
+
+		/* Tx Flow Control is ON */
+		if (bp->link_vars.flow_ctrl & BNX2X_FLOW_CTRL_TX)
+			__set_bit(BNX2X_LINK_REPORT_TX_FC_ON,
+				  &data->link_report_flags);
+	} else { /* VF */
+		*data = bp->vf_link_vars;
+	}
 }
 
 /**
@@ -1268,6 +1278,10 @@ void __bnx2x_link_report(struct bnx2x *bp)
 	 * remember the current data for the next time.
 	 */
 	memcpy(&bp->last_reported_link, &cur_data, sizeof(cur_data));
+
+	/* propagate status to VFs */
+	if (IS_PF(bp))
+		bnx2x_iov_link_update(bp);
 
 	if (test_bit(BNX2X_LINK_REPORT_LINK_DOWN,
 		     &cur_data.link_report_flags)) {
@@ -2795,7 +2809,11 @@ int bnx2x_nic_load(struct bnx2x *bp, int load_mode)
 	/* Initialize Rx filter. */
 	bnx2x_set_rx_mode_inner(bp);
 
-	/* Start the Tx */
+	if (bp->flags & PTP_SUPPORTED) {
+		bnx2x_init_ptp(bp);
+		bnx2x_configure_ptp_filters(bp);
+	}
+	/* Start Tx */
 	switch (load_mode) {
 	case LOAD_NORMAL:
 		/* Tx queue should be only re-enabled */
@@ -3819,6 +3837,20 @@ netdev_tx_t bnx2x_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	first_bd = tx_start_bd;
 
 	tx_start_bd->bd_flags.as_bitfield = ETH_TX_BD_FLAGS_START_BD;
+
+	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) {
+		if (!(bp->flags & TX_TIMESTAMPING_EN)) {
+			BNX2X_ERR("Tx timestamping was not enabled, this packet will not be timestamped\n");
+		} else if (bp->ptp_tx_skb) {
+			BNX2X_ERR("The device supports only a single outstanding packet to timestamp, this packet will not be timestamped\n");
+		} else {
+			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+			/* schedule check for Tx timestamp */
+			bp->ptp_tx_skb = skb_get(skb);
+			bp->ptp_tx_start = jiffies;
+			schedule_work(&bp->ptp_task);
+		}
+	}
 
 	/* header nbd: indirectly zero other flags! */
 	tx_start_bd->general_data = 1 << ETH_TX_START_BD_HDR_NBDS_SHIFT;

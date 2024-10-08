@@ -9,7 +9,7 @@
 
 #include <byteswap.h>
 #include <linux/bitops.h>
-#include <lk/debugfs.h>
+#include <api/fs/debugfs.h>
 #include <traceevent/event-parse.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/perf_event.h>
@@ -208,7 +208,7 @@ struct perf_evsel *perf_evsel__newtp_idx(const char *sys, const char *name, int 
 	return evsel;
 
 out_free:
-	free(evsel->name);
+	zfree(&evsel->name);
 	free(evsel);
 	return NULL;
 }
@@ -659,6 +659,7 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 		perf_evsel__set_sample_bit(evsel, WEIGHT);
 
 	attr->mmap  = track;
+	attr->mmap2 = track && !perf_missing_features.mmap2;
 	attr->comm  = track;
 
 	if (opts->sample_transaction)
@@ -770,8 +771,7 @@ void perf_evsel__free_id(struct perf_evsel *evsel)
 {
 	xyarray__delete(evsel->sample_id);
 	evsel->sample_id = NULL;
-	free(evsel->id);
-	evsel->id = NULL;
+	zfree(&evsel->id);
 }
 
 void perf_evsel__close_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
@@ -787,7 +787,7 @@ void perf_evsel__close_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
 
 void perf_evsel__free_counts(struct perf_evsel *evsel)
 {
-	free(evsel->counts);
+	zfree(&evsel->counts);
 }
 
 void perf_evsel__exit(struct perf_evsel *evsel)
@@ -801,10 +801,10 @@ void perf_evsel__delete(struct perf_evsel *evsel)
 {
 	perf_evsel__exit(evsel);
 	close_cgroup(evsel->cgrp);
-	free(evsel->group_name);
+	zfree(&evsel->group_name);
 	if (evsel->tp_format)
 		pevent_free_format(evsel->tp_format);
-	free(evsel->name);
+	zfree(&evsel->name);
 	free(evsel);
 }
 
@@ -1416,10 +1416,11 @@ int perf_evsel__parse_sample(struct perf_evsel *evsel, union perf_event *event,
 		array++;
 
 		if (data->user_regs.abi) {
-			u64 regs_user = evsel->attr.sample_regs_user;
+			u64 mask = evsel->attr.sample_regs_user;
 
-			sz = hweight_long(regs_user) * sizeof(u64);
+			sz = hweight_long(mask) * sizeof(u64);
 			OVERFLOW_CHECK(array, sz, max_size);
+			data->user_regs.mask = mask;
 			data->user_regs.regs = (u64 *)array;
 			array = (void *)array + sz;
 		}
@@ -1471,7 +1472,7 @@ int perf_evsel__parse_sample(struct perf_evsel *evsel, union perf_event *event,
 }
 
 size_t perf_event__sample_event_size(const struct perf_sample *sample, u64 type,
-				     u64 sample_regs_user, u64 read_format)
+				     u64 read_format)
 {
 	size_t sz, result = sizeof(struct sample_event);
 
@@ -1537,7 +1538,7 @@ size_t perf_event__sample_event_size(const struct perf_sample *sample, u64 type,
 	if (type & PERF_SAMPLE_REGS_USER) {
 		if (sample->user_regs.abi) {
 			result += sizeof(u64);
-			sz = hweight_long(sample_regs_user) * sizeof(u64);
+			sz = hweight_long(sample->user_regs.mask) * sizeof(u64);
 			result += sz;
 		} else {
 			result += sizeof(u64);
@@ -1566,7 +1567,7 @@ size_t perf_event__sample_event_size(const struct perf_sample *sample, u64 type,
 }
 
 int perf_event__synthesize_sample(union perf_event *event, u64 type,
-				  u64 sample_regs_user, u64 read_format,
+				  u64 read_format,
 				  const struct perf_sample *sample,
 				  bool swapped)
 {
@@ -1707,7 +1708,7 @@ int perf_event__synthesize_sample(union perf_event *event, u64 type,
 	if (type & PERF_SAMPLE_REGS_USER) {
 		if (sample->user_regs.abi) {
 			*array++ = sample->user_regs.abi;
-			sz = hweight_long(sample_regs_user) * sizeof(u64);
+			sz = hweight_long(sample->user_regs.mask) * sizeof(u64);
 			memcpy(array, sample->user_regs.regs, sz);
 			array = (void *)array + sz;
 		} else {
@@ -1979,8 +1980,7 @@ bool perf_evsel__fallback(struct perf_evsel *evsel, int err,
 		evsel->attr.type   = PERF_TYPE_SOFTWARE;
 		evsel->attr.config = PERF_COUNT_SW_CPU_CLOCK;
 
-		free(evsel->name);
-		evsel->name = NULL;
+		zfree(&evsel->name);
 		return true;
 	}
 

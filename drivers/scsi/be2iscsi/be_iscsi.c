@@ -541,8 +541,10 @@ static int be2iscsi_get_if_param(struct beiscsi_hba *phba,
 		ip_type = BE2_IPV6;
 
 	len = mgmt_get_if_info(phba, ip_type, &if_info);
-	if (len)
+	if (len) {
+		kfree(if_info);
 		return len;
+	}
 
 	switch (param) {
 	case ISCSI_NET_PARAM_IPV4_ADDR:
@@ -567,7 +569,7 @@ static int be2iscsi_get_if_param(struct beiscsi_hba *phba,
 		break;
 	case ISCSI_NET_PARAM_VLAN_ID:
 		if (if_info->vlan_priority == BEISCSI_VLAN_DISABLE)
-			len = -EINVAL;
+			return -EINVAL;
 		else
 			len = sprintf(buf, "%d\n",
 				     (if_info->vlan_priority &
@@ -575,7 +577,7 @@ static int be2iscsi_get_if_param(struct beiscsi_hba *phba,
 		break;
 	case ISCSI_NET_PARAM_VLAN_PRIORITY:
 		if (if_info->vlan_priority == BEISCSI_VLAN_DISABLE)
-			len = -EINVAL;
+			return -EINVAL;
 		else
 			len = sprintf(buf, "%d\n",
 				     ((if_info->vlan_priority >> 13) &

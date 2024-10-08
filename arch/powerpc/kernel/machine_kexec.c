@@ -129,10 +129,10 @@ unsigned long long __init arch_default_crash_size(unsigned long long total_size)
 #ifdef CONFIG_64BIT
 	/*
 	 * crashkernel 'auto' reservation scheme
-	 * 2G-4G:256M,4G-32G:512M,32G-64G:1G,64G-128G:2G,128G-:4G
+	 * 2G-4G:320M,4G-32G:512M,32G-64G:1G,64G-128G:2G,128G-:4G
 	 */
 	if (total_size < (1ULL<<32)) /* 4G */
-		return 1ULL<<28; /* 256M */
+		return ((1ULL<<28) + (1ULL<<26)); /* 320M */
 	if (total_size < (1ULL<<35)) /* 32G */
 		return 1ULL<<29; /* 512M */
 	if (total_size < (1ULL<<36)) /* 64G */

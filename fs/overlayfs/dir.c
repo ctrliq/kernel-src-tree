@@ -908,13 +908,20 @@ out:
 	return err;
 }
 
-const struct inode_operations ovl_dir_inode_operations = {
+static int ovl_rename(struct inode *olddir, struct dentry *old,
+		      struct inode *newdir, struct dentry *new)
+{
+	return ovl_rename2(olddir, old, newdir, new, 0);
+}
+
+const struct inode_operations_wrapper ovl_dir_inode_operations = {
+	.ops = {
 	.lookup		= ovl_lookup,
 	.mkdir		= ovl_mkdir,
 	.symlink	= ovl_symlink,
 	.unlink		= ovl_unlink,
 	.rmdir		= ovl_rmdir,
-	.rename2	= ovl_rename2,
+	.rename		= ovl_rename,
 	.link		= ovl_link,
 	.setattr	= ovl_setattr,
 	.create		= ovl_create,
@@ -925,4 +932,6 @@ const struct inode_operations ovl_dir_inode_operations = {
 	.getxattr	= ovl_getxattr,
 	.listxattr	= ovl_listxattr,
 	.removexattr	= ovl_removexattr,
+	},
+	.rename2	= ovl_rename2,
 };

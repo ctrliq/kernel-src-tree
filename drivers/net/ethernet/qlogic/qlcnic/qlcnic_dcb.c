@@ -245,7 +245,7 @@ static inline void __qlcnic_init_dcbnl_ops(struct qlcnic_dcb *dcb)
 		dcb->adapter->netdev->dcbnl_ops = &qlcnic_dcbnl_ops;
 }
 
-void qlcnic_set_dcb_ops(struct qlcnic_adapter *adapter)
+static void qlcnic_set_dcb_ops(struct qlcnic_adapter *adapter)
 {
 	if (qlcnic_82xx_check(adapter))
 		adapter->dcb->ops = &qlcnic_82xx_dcb_ops;
@@ -256,6 +256,9 @@ void qlcnic_set_dcb_ops(struct qlcnic_adapter *adapter)
 int qlcnic_register_dcb(struct qlcnic_adapter *adapter)
 {
 	struct qlcnic_dcb *dcb;
+
+	if (qlcnic_sriov_vf_check(adapter))
+		return 0;
 
 	dcb = kzalloc(sizeof(struct qlcnic_dcb), GFP_ATOMIC);
 	if (!dcb)
@@ -326,8 +329,6 @@ static int __qlcnic_dcb_attach(struct qlcnic_dcb *dcb)
 		err = -ENOMEM;
 		goto out_free_cfg;
 	}
-
-	qlcnic_dcb_get_info(dcb);
 
 	return 0;
 out_free_cfg:

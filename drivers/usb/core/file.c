@@ -8,7 +8,7 @@
  * (C) Copyright Deti Fliegl 1999 (new USB architecture)
  * (C) Copyright Randy Dunlap 2000
  * (C) Copyright David Brownell 2000-2001 (kernel hotplug, usb_device_id,
- 	more docs, etc)
+ *	more docs, etc)
  * (C) Copyright Yggdrasil Computing, Inc. 2000
  *     (usb_device_id matching changes by Adam J. Richter)
  * (C) Copyright Greg Kroah-Hartman 2002-2003
@@ -27,21 +27,29 @@
 static const struct file_operations *usb_minors[MAX_USB_MINORS];
 static DECLARE_RWSEM(minor_rwsem);
 
-static int usb_open(struct inode * inode, struct file * file)
+static int usb_open(struct inode *inode, struct file *file)
 {
+	int minor = iminor(inode);
+	const struct file_operations *c;
 	int err = -ENODEV;
-	const struct file_operations *new_fops;
+	const struct file_operations *old_fops, *new_fops = NULL;
 
 	down_read(&minor_rwsem);
-	new_fops = fops_get(usb_minors[iminor(inode)]);
+	c = usb_minors[minor];
 
-	if (!new_fops)
+	if (!c || !(new_fops = fops_get(c)))
 		goto done;
 
-	replace_fops(file, new_fops);
+	old_fops = file->f_op;
+	file->f_op = new_fops;
 	/* Curiouser and curiouser... NULL ->open() as "no device" ? */
 	if (file->f_op->open)
-		err = file->f_op->open(inode,file);
+		err = file->f_op->open(inode, file);
+	if (err) {
+		fops_put(file->f_op);
+		file->f_op = fops_get(old_fops);
+	}
+	fops_put(old_fops);
  done:
 	up_read(&minor_rwsem);
 	return err;
@@ -158,7 +166,7 @@ int usb_register_dev(struct usb_interface *intf,
 	char *temp;
 
 #ifdef CONFIG_USB_DYNAMIC_MINORS
-	/* 
+	/*
 	 * We don't care what the device tries to start at, we want to start
 	 * at zero to pack the devices into the smallest available space with
 	 * no holes in the minor range.

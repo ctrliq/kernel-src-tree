@@ -2908,6 +2908,12 @@ static int __dm_suspend(struct mapped_device *md, struct dm_table *map,
 	return r;
 }
 
+static int wait_schedule_interruptible(void *ptr)
+{
+	schedule();
+	return signal_pending(current);;
+}
+
 /*
  * We need to be able to change a mapping table under a mounted
  * filesystem.  For example we might want to move some data in
@@ -2940,7 +2946,8 @@ retry:
 	if (dm_suspended_internally_md(md)) {
 		/* already internally suspended, wait for internal resume */
 		mutex_unlock(&md->suspend_lock);
-		r = wait_on_bit(&md->flags, DMF_SUSPENDED_INTERNALLY, TASK_INTERRUPTIBLE);
+		r = wait_on_bit(&md->flags, DMF_SUSPENDED_INTERNALLY,
+				wait_schedule_interruptible, TASK_INTERRUPTIBLE);
 		if (r)
 			return r;
 		goto retry;
@@ -2998,7 +3005,8 @@ retry:
 	if (dm_suspended_internally_md(md)) {
 		/* already internally suspended, wait for internal resume */
 		mutex_unlock(&md->suspend_lock);
-		r = wait_on_bit(&md->flags, DMF_SUSPENDED_INTERNALLY, TASK_INTERRUPTIBLE);
+		r = wait_on_bit(&md->flags, DMF_SUSPENDED_INTERNALLY,
+				wait_schedule_interruptible, TASK_INTERRUPTIBLE);
 		if (r)
 			return r;
 		goto retry;

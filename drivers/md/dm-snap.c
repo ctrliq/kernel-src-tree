@@ -2140,10 +2140,6 @@ static int origin_write_extent(struct dm_snapshot *merging_snap,
  * Origin: maps a linear range of a device, with hooks for snapshotting.
  */
 
-struct dm_origin {
-	struct dm_dev *dev;
-};
-
 /*
  * Construct an origin mapping: <dev_path>
  * The context for an origin is merely a 'struct dm_dev *'
@@ -2152,54 +2148,41 @@ struct dm_origin {
 static int origin_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	int r;
-	struct dm_origin *o;
+	struct dm_dev *dev;
 
 	if (argc != 1) {
 		ti->error = "origin: incorrect number of arguments";
 		return -EINVAL;
 	}
 
-	o = kmalloc(sizeof(struct dm_origin), GFP_KERNEL);
-	if (!o) {
-		ti->error = "Cannot allocate private origin structure";
-		r = -ENOMEM;
-		goto bad_alloc;
-	}
-
-	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &o->dev);
+	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dev);
 	if (r) {
 		ti->error = "Cannot get target device";
-		goto bad_open;
+		return r;
 	}
 
-	ti->private = o;
+	ti->private = dev;
 	ti->num_flush_bios = 1;
 
 	return 0;
-
-bad_open:
-	kfree(o);
-bad_alloc:
-	return r;
 }
 
 static void origin_dtr(struct dm_target *ti)
 {
-	struct dm_origin *o = ti->private;
-	dm_put_device(ti, o->dev);
-	kfree(o);
+	struct dm_dev *dev = ti->private;
+	dm_put_device(ti, dev);
 }
 
 static int origin_map(struct dm_target *ti, struct bio *bio)
 {
-	struct dm_origin *o = ti->private;
-	bio->bi_bdev = o->dev->bdev;
+	struct dm_dev *dev = ti->private;
+	bio->bi_bdev = dev->bdev;
 
 	if (bio->bi_rw & REQ_FLUSH)
 		return DM_MAPIO_REMAPPED;
 
 	/* Only tell snapshots if this is a write */
-	return (bio_rw(bio) == WRITE) ? do_origin(o->dev, bio) : DM_MAPIO_REMAPPED;
+	return (bio_rw(bio) == WRITE) ? do_origin(dev, bio) : DM_MAPIO_REMAPPED;
 }
 
 /*
@@ -2208,15 +2191,15 @@ static int origin_map(struct dm_target *ti, struct bio *bio)
  */
 static void origin_resume(struct dm_target *ti)
 {
-	struct dm_origin *o = ti->private;
+	struct dm_dev *dev = ti->private;
 
-	ti->max_io_len = get_origin_minimum_chunksize(o->dev->bdev);
+	ti->max_io_len = get_origin_minimum_chunksize(dev->bdev);
 }
 
 static void origin_status(struct dm_target *ti, status_type_t type,
 			  unsigned status_flags, char *result, unsigned maxlen)
 {
-	struct dm_origin *o = ti->private;
+	struct dm_dev *dev = ti->private;
 
 	switch (type) {
 	case STATUSTYPE_INFO:
@@ -2224,7 +2207,7 @@ static void origin_status(struct dm_target *ti, status_type_t type,
 		break;
 
 	case STATUSTYPE_TABLE:
-		snprintf(result, maxlen, "%s", o->dev->name);
+		snprintf(result, maxlen, "%s", dev->name);
 		break;
 	}
 }
@@ -2232,13 +2215,13 @@ static void origin_status(struct dm_target *ti, status_type_t type,
 static int origin_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 			struct bio_vec *biovec, int max_size)
 {
-	struct dm_origin *o = ti->private;
-	struct request_queue *q = bdev_get_queue(o->dev->bdev);
+	struct dm_dev *dev = ti->private;
+	struct request_queue *q = bdev_get_queue(dev->bdev);
 
 	if (!q->merge_bvec_fn)
 		return max_size;
 
-	bvm->bi_bdev = o->dev->bdev;
+	bvm->bi_bdev = dev->bdev;
 
 	return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
 }
@@ -2246,9 +2229,9 @@ static int origin_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 static int origin_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
-	struct dm_origin *o = ti->private;
+	struct dm_dev *dev = ti->private;
 
-	return fn(ti, o->dev, 0, ti->len, data);
+	return fn(ti, dev, 0, ti->len, data);
 }
 
 static struct target_type origin_target = {

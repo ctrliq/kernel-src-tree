@@ -4261,6 +4261,8 @@ static int hba_setup_cid_tbls(struct beiscsi_hba *phba)
 		kfree(phba->ep_array);
 		phba->ep_array = NULL;
 		ret = -ENOMEM;
+
+		goto free_memory;
 	}
 
 	for (i = 0; i < phba->params.cxns_per_ctrl; i++) {
@@ -5371,13 +5373,13 @@ static void be_eqd_update(struct beiscsi_hba *phba)
 		aic = &phba->aic_obj[i];
 		pbe_eq = &phwi_context->be_eq[i];
 		now = jiffies;
-		if (!aic->jiffs || time_before(now, aic->jiffs) ||
+		if (!aic->jiffies || time_before(now, aic->jiffies) ||
 		    pbe_eq->cq_count < aic->eq_prev) {
-			aic->jiffs = now;
+			aic->jiffies = now;
 			aic->eq_prev = pbe_eq->cq_count;
 			continue;
 		}
-		delta = jiffies_to_msecs(now - aic->jiffs);
+		delta = jiffies_to_msecs(now - aic->jiffies);
 		pps = (((u32)(pbe_eq->cq_count - aic->eq_prev) * 1000) / delta);
 		eqd = (pps / 1500) << 2;
 
@@ -5386,7 +5388,7 @@ static void be_eqd_update(struct beiscsi_hba *phba)
 		eqd = min_t(u32, eqd, phwi_context->max_eqd);
 		eqd = max_t(u32, eqd, phwi_context->min_eqd);
 
-		aic->jiffs = now;
+		aic->jiffies = now;
 		aic->eq_prev = pbe_eq->cq_count;
 
 		if (eqd != aic->prev_eqd) {

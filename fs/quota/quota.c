@@ -283,7 +283,7 @@ static int quota_rmxquota(struct super_block *sb, void __user *addr)
 
 	if (copy_from_user(&flags, addr, sizeof(flags)))
 		return -EFAULT;
-	if (!sb->s_qcop->rm_xquota)
+	if (!sb_has_rm_xquota(sb) || !sb->s_qcop->rm_xquota)
 		return -ENOSYS;
 	return sb->s_qcop->rm_xquota(sb, flags);
 }

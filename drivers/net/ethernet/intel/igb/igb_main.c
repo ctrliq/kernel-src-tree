@@ -816,7 +816,7 @@ static void igb_assign_vector(struct igb_q_vector *q_vector, int msix_vector)
 			msixbm = E1000_EICR_RX_QUEUE0 << rx_queue;
 		if (tx_queue > IGB_N0_QUEUE)
 			msixbm |= E1000_EICR_TX_QUEUE0 << tx_queue;
-		if (!adapter->msix_entries && msix_vector == 0)
+		if (!(adapter->flags & IGB_FLAG_HAS_MSIX) && msix_vector == 0)
 			msixbm |= E1000_EIMS_OTHER;
 		array_wr32(E1000_MSIXBM(0), msix_vector, msixbm);
 		q_vector->eims_value = msixbm;
@@ -996,29 +996,42 @@ err_out:
 	return err;
 }
 
-static void igb_reset_interrupt_capability(struct igb_adapter *adapter)
-{
-	if (adapter->msix_entries) {
-		pci_disable_msix(adapter->pdev);
-		kfree(adapter->msix_entries);
-		adapter->msix_entries = NULL;
-	} else if (adapter->flags & IGB_FLAG_HAS_MSI) {
-		pci_disable_msi(adapter->pdev);
-	}
-}
-
 /**
  *  igb_free_q_vector - Free memory allocated for specific interrupt vector
  *  @adapter: board private structure to initialize
  *  @v_idx: Index of vector to be freed
  *
- *  This function frees the memory allocated to the q_vector.  In addition if
- *  NAPI is enabled it will delete any references to the NAPI struct prior
- *  to freeing the q_vector.
+ *  This function frees the memory allocated to the q_vector.
  **/
 static void igb_free_q_vector(struct igb_adapter *adapter, int v_idx)
 {
 	struct igb_q_vector *q_vector = adapter->q_vector[v_idx];
+
+	adapter->q_vector[v_idx] = NULL;
+
+	/* igb_get_stats64() might access the rings on this vector,
+	 * we must wait a grace period before freeing it.
+	 */
+	kfree_rcu(q_vector, rcu);
+}
+
+/**
+ *  igb_reset_q_vector - Reset config for interrupt vector
+ *  @adapter: board private structure to initialize
+ *  @v_idx: Index of vector to be reset
+ *
+ *  If NAPI is enabled it will delete any references to the
+ *  NAPI struct. This is preparation for igb_free_q_vector.
+ **/
+static void igb_reset_q_vector(struct igb_adapter *adapter, int v_idx)
+{
+	struct igb_q_vector *q_vector = adapter->q_vector[v_idx];
+
+	/* Coming from igb_set_interrupt_capability, the vectors are not yet
+	 * allocated. So, q_vector is NULL so we should stop here.
+	 */
+	if (!q_vector)
+		return;
 
 	if (q_vector->tx.ring)
 		adapter->tx_ring[q_vector->tx.ring->queue_index] = NULL;
@@ -1026,13 +1039,21 @@ static void igb_free_q_vector(struct igb_adapter *adapter, int v_idx)
 	if (q_vector->rx.ring)
 		adapter->tx_ring[q_vector->rx.ring->queue_index] = NULL;
 
-	adapter->q_vector[v_idx] = NULL;
 	netif_napi_del(&q_vector->napi);
 
-	/* igb_get_stats64() might access the rings on this vector,
-	 * we must wait a grace period before freeing it.
-	 */
-	kfree_rcu(q_vector, rcu);
+}
+
+static void igb_reset_interrupt_capability(struct igb_adapter *adapter)
+{
+	int v_idx = adapter->num_q_vectors;
+
+	if (adapter->flags & IGB_FLAG_HAS_MSIX)
+		pci_disable_msix(adapter->pdev);
+	else if (adapter->flags & IGB_FLAG_HAS_MSI)
+		pci_disable_msi(adapter->pdev);
+
+	while (v_idx--)
+		igb_reset_q_vector(adapter, v_idx);
 }
 
 /**
@@ -1051,8 +1072,10 @@ static void igb_free_q_vectors(struct igb_adapter *adapter)
 	adapter->num_rx_queues = 0;
 	adapter->num_q_vectors = 0;
 
-	while (v_idx--)
+	while (v_idx--) {
+		igb_reset_q_vector(adapter, v_idx);
 		igb_free_q_vector(adapter, v_idx);
+	}
 }
 
 /**
@@ -1083,6 +1106,7 @@ static void igb_set_interrupt_capability(struct igb_adapter *adapter, bool msix)
 
 	if (!msix)
 		goto msi_only;
+	adapter->flags |= IGB_FLAG_HAS_MSIX;
 
 	/* Number of supported queues. */
 	adapter->num_rx_queues = adapter->rss_queues;
@@ -1103,12 +1127,6 @@ static void igb_set_interrupt_capability(struct igb_adapter *adapter, bool msix)
 
 	/* add 1 vector for link status interrupts */
 	numvecs++;
-	adapter->msix_entries = kcalloc(numvecs, sizeof(struct msix_entry),
-					GFP_KERNEL);
-
-	if (!adapter->msix_entries)
-		goto msi_only;
-
 	for (i = 0; i < numvecs; i++)
 		adapter->msix_entries[i].entry = i;
 
@@ -1187,7 +1205,9 @@ static int igb_alloc_q_vector(struct igb_adapter *adapter,
 	       (sizeof(struct igb_ring) * ring_count);
 
 	/* allocate q_vector and rings */
-	q_vector = kzalloc(size, GFP_KERNEL);
+	q_vector = adapter->q_vector[v_idx];
+	if (!q_vector)
+		q_vector = kzalloc(size, GFP_KERNEL);
 	if (!q_vector)
 		return -ENOMEM;
 
@@ -1239,6 +1259,9 @@ static int igb_alloc_q_vector(struct igb_adapter *adapter,
 		ring->count = adapter->tx_ring_count;
 		ring->queue_index = txr_idx;
 
+		u64_stats_init(&ring->tx_syncp);
+		u64_stats_init(&ring->tx_syncp2);
+
 		/* assign ring to adapter */
 		adapter->tx_ring[txr_idx] = ring;
 
@@ -1270,6 +1293,8 @@ static int igb_alloc_q_vector(struct igb_adapter *adapter,
 		/* apply Rx specific ring traits */
 		ring->count = adapter->rx_ring_count;
 		ring->queue_index = rxr_idx;
+
+		u64_stats_init(&ring->rx_syncp);
 
 		/* assign ring to adapter */
 		adapter->rx_ring[rxr_idx] = ring;
@@ -1380,7 +1405,7 @@ static int igb_request_irq(struct igb_adapter *adapter)
 	struct pci_dev *pdev = adapter->pdev;
 	int err = 0;
 
-	if (adapter->msix_entries) {
+	if (adapter->flags & IGB_FLAG_HAS_MSIX) {
 		err = igb_request_msix(adapter);
 		if (!err)
 			goto request_done;
@@ -1424,7 +1449,7 @@ request_done:
 
 static void igb_free_irq(struct igb_adapter *adapter)
 {
-	if (adapter->msix_entries) {
+	if (adapter->flags & IGB_FLAG_HAS_MSIX) {
 		int vector = 0, i;
 
 		free_irq(adapter->msix_entries[vector++].vector, adapter);
@@ -1449,7 +1474,7 @@ static void igb_irq_disable(struct igb_adapter *adapter)
 	 * mapped into these registers and so clearing the bits can cause
 	 * issues on the VF drivers so we only need to clear what we set
 	 */
-	if (adapter->msix_entries) {
+	if (adapter->flags & IGB_FLAG_HAS_MSIX) {
 		u32 regval = rd32(E1000_EIAM);
 
 		wr32(E1000_EIAM, regval & ~adapter->eims_enable_mask);
@@ -1461,7 +1486,7 @@ static void igb_irq_disable(struct igb_adapter *adapter)
 	wr32(E1000_IAM, 0);
 	wr32(E1000_IMC, ~0);
 	wrfl();
-	if (adapter->msix_entries) {
+	if (adapter->flags & IGB_FLAG_HAS_MSIX) {
 		int i;
 
 		for (i = 0; i < adapter->num_q_vectors; i++)
@@ -1479,7 +1504,7 @@ static void igb_irq_enable(struct igb_adapter *adapter)
 {
 	struct e1000_hw *hw = &adapter->hw;
 
-	if (adapter->msix_entries) {
+	if (adapter->flags & IGB_FLAG_HAS_MSIX) {
 		u32 ims = E1000_IMS_LSC | E1000_IMS_DOUTSYNC | E1000_IMS_DRSTA;
 		u32 regval = rd32(E1000_EIAC);
 
@@ -1705,7 +1730,7 @@ int igb_up(struct igb_adapter *adapter)
 	for (i = 0; i < adapter->num_q_vectors; i++)
 		napi_enable(&(adapter->q_vector[i]->napi));
 
-	if (adapter->msix_entries)
+	if (adapter->flags & IGB_FLAG_HAS_MSIX)
 		igb_configure_msix(adapter);
 	else
 		igb_assign_vector(adapter->q_vector[0], 0);
@@ -1727,6 +1752,10 @@ int igb_up(struct igb_adapter *adapter)
 	/* start the watchdog. */
 	hw->mac.get_link_status = 1;
 	schedule_work(&adapter->watchdog_task);
+
+	if ((adapter->flags & IGB_FLAG_EEE) &&
+	    (!hw->dev_spec._82575.eee_disable))
+		adapter->eee_advert = MDIO_EEE_100TX | MDIO_EEE_1000T;
 
 	return 0;
 }
@@ -1977,6 +2006,21 @@ void igb_reset(struct igb_adapter *adapter)
 		}
 	}
 #endif
+	/* Re-establish EEE setting */
+	if (hw->phy.media_type == e1000_media_type_copper) {
+		switch (mac->type) {
+		case e1000_i350:
+		case e1000_i210:
+		case e1000_i211:
+			igb_set_eee_i350(hw);
+			break;
+		case e1000_i354:
+			igb_set_eee_i354(hw);
+			break;
+		default:
+			break;
+		}
+	}
 	if (!netif_running(adapter->netdev))
 		igb_power_down_link(adapter);
 
@@ -2097,7 +2141,6 @@ void igb_set_fw_version(struct igb_adapter *adapter)
 		}
 		break;
 	}
-	return;
 }
 
 /**
@@ -2216,21 +2259,15 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		return err;
 
 	pci_using_dac = 0;
-	err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (!err) {
-		err = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
-		if (!err)
-			pci_using_dac = 1;
+		pci_using_dac = 1;
 	} else {
-		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
+		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 		if (err) {
-			err = dma_set_coherent_mask(&pdev->dev,
-						    DMA_BIT_MASK(32));
-			if (err) {
-				dev_err(&pdev->dev,
-					"No usable DMA configuration, aborting\n");
-				goto err_dma;
-			}
+			dev_err(&pdev->dev,
+				"No usable DMA configuration, aborting\n");
+			goto err_dma;
 		}
 	}
 
@@ -2573,26 +2610,39 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	dev_info(&pdev->dev, "%s: PBA No: %s\n", netdev->name, part_str);
 	dev_info(&pdev->dev,
 		"Using %s interrupts. %d rx queue(s), %d tx queue(s)\n",
-		adapter->msix_entries ? "MSI-X" :
+		(adapter->flags & IGB_FLAG_HAS_MSIX) ? "MSI-X" :
 		(adapter->flags & IGB_FLAG_HAS_MSI) ? "MSI" : "legacy",
 		adapter->num_rx_queues, adapter->num_tx_queues);
-	switch (hw->mac.type) {
-	case e1000_i350:
-	case e1000_i210:
-	case e1000_i211:
-		igb_set_eee_i350(hw);
-		break;
-	case e1000_i354:
-		if (hw->phy.media_type == e1000_media_type_copper) {
+	if (hw->phy.media_type == e1000_media_type_copper) {
+		switch (hw->mac.type) {
+		case e1000_i350:
+		case e1000_i210:
+		case e1000_i211:
+			/* Enable EEE for internal copper PHY devices */
+			err = igb_set_eee_i350(hw);
+			if ((!err) &&
+			    (!hw->dev_spec._82575.eee_disable)) {
+				adapter->eee_advert =
+					MDIO_EEE_100TX | MDIO_EEE_1000T;
+				adapter->flags |= IGB_FLAG_EEE;
+			}
+			break;
+		case e1000_i354:
 			if ((rd32(E1000_CTRL_EXT) &
-			    E1000_CTRL_EXT_LINK_MODE_SGMII))
-				igb_set_eee_i354(hw);
+			    E1000_CTRL_EXT_LINK_MODE_SGMII)) {
+				err = igb_set_eee_i354(hw);
+				if ((!err) &&
+					(!hw->dev_spec._82575.eee_disable)) {
+					adapter->eee_advert =
+					   MDIO_EEE_100TX | MDIO_EEE_1000T;
+					adapter->flags |= IGB_FLAG_EEE;
+				}
+			}
+			break;
+		default:
+			break;
 		}
-		break;
-	default:
-		break;
 	}
-
 	pm_runtime_put_noidle(&pdev->dev);
 	return 0;
 
@@ -2661,7 +2711,7 @@ static int igb_enable_sriov(struct pci_dev *pdev, int num_vfs)
 	int err = 0;
 	int i;
 
-	if (!adapter->msix_entries || num_vfs > 7) {
+	if (!(adapter->flags & IGB_FLAG_HAS_MSIX) || num_vfs > 7) {
 		err = -EPERM;
 		goto out;
 	}
@@ -4206,6 +4256,15 @@ static void igb_watchdog_task(struct work_struct *work)
 			       (ctrl & E1000_CTRL_RFCE) ?  "RX" :
 			       (ctrl & E1000_CTRL_TFCE) ?  "TX" : "None");
 
+			/* disable EEE if enabled */
+			if ((adapter->flags & IGB_FLAG_EEE) &&
+				(adapter->link_duplex == HALF_DUPLEX)) {
+				dev_info(&adapter->pdev->dev,
+				"EEE Disabled: unsupported at half duplex. Re-enable using ethtool when at full duplex.\n");
+				adapter->hw.dev_spec._82575.eee_disable = true;
+				adapter->flags &= ~IGB_FLAG_EEE;
+			}
+
 			/* check if SmartSpeed worked */
 			igb_check_downshift(hw);
 			if (phy->speed_downgraded)
@@ -4309,7 +4368,7 @@ static void igb_watchdog_task(struct work_struct *work)
 	}
 
 	/* Cause software interrupt to ensure Rx ring is cleaned */
-	if (adapter->msix_entries) {
+	if (adapter->flags & IGB_FLAG_HAS_MSIX) {
 		u32 eics = 0;
 
 		for (i = 0; i < adapter->num_q_vectors; i++)
@@ -4356,8 +4415,7 @@ enum latency_range {
  *  were determined based on theoretical maximum wire speed and testing
  *  data, in order to minimize response time while increasing bulk
  *  throughput.
- *  This functionality is controlled by the InterruptThrottleRate module
- *  parameter (see igb_param.c)
+ *  This functionality is controlled by ethtool's coalescing settings.
  *  NOTE:  This function is called only when operating in a multiqueue
  *         receive environment.
  **/
@@ -4431,8 +4489,7 @@ clear_counts:
  *  based on theoretical maximum wire speed and thresholds were set based
  *  on testing data as well as attempting to minimize response time
  *  while increasing bulk throughput.
- *  this functionality is controlled by the InterruptThrottleRate module
- *  parameter (see igb_param.c)
+ *  This functionality is controlled by ethtool's coalescing settings.
  *  NOTE:  These calculations are only valid when operating in a single-
  *         queue environment.
  **/
@@ -5968,7 +6025,7 @@ static void igb_vf_reset_msg(struct igb_adapter *adapter, u32 vf)
 
 	/* reply to reset with ack and vf mac address */
 	msgbuf[0] = E1000_VF_RESET | E1000_VT_MSGTYPE_ACK;
-	memcpy(addr, vf_mac, 6);
+	memcpy(addr, vf_mac, ETH_ALEN);
 	igb_write_mbx(hw, msgbuf, 3, vf);
 }
 
@@ -6243,7 +6300,7 @@ static void igb_ring_irq_enable(struct igb_q_vector *q_vector)
 	}
 
 	if (!test_bit(__IGB_DOWN, &adapter->state)) {
-		if (adapter->msix_entries)
+		if (adapter->flags & IGB_FLAG_HAS_MSIX)
 			wr32(E1000_EIMS, q_vector->eims_value);
 		else
 			igb_irq_enable(adapter);
@@ -6677,7 +6734,9 @@ static inline void igb_rx_hash(struct igb_ring *ring,
 			       struct sk_buff *skb)
 {
 	if (ring->netdev->features & NETIF_F_RXHASH)
-		skb->rxhash = le32_to_cpu(rx_desc->wb.lower.hi_dword.rss);
+		skb_set_hash(skb,
+			     le32_to_cpu(rx_desc->wb.lower.hi_dword.rss),
+			     PKT_HASH_TYPE_L3);
 }
 
 /**
@@ -6934,7 +6993,9 @@ static void igb_process_skb_fields(struct igb_ring *rx_ring,
 
 	igb_rx_checksum(rx_ring, rx_desc, skb);
 
-	igb_ptp_rx_hwtstamp(rx_ring, rx_desc, skb);
+	if (igb_test_staterr(rx_desc, E1000_RXDADV_STAT_TS) &&
+	    !igb_test_staterr(rx_desc, E1000_RXDADV_STAT_TSIP))
+		igb_ptp_rx_rgtstamp(rx_ring->q_vector, skb);
 
 	if ((dev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
 	    igb_test_staterr(rx_desc, E1000_RXD_STAT_VP)) {
@@ -7172,11 +7233,27 @@ static int igb_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 	case SIOCGMIIREG:
 	case SIOCSMIIREG:
 		return igb_mii_ioctl(netdev, ifr, cmd);
+	case SIOCGHWTSTAMP:
+		return igb_ptp_get_ts_config(netdev, ifr);
 	case SIOCSHWTSTAMP:
-		return igb_ptp_hwtstamp_ioctl(netdev, ifr, cmd);
+		return igb_ptp_set_ts_config(netdev, ifr);
 	default:
 		return -EOPNOTSUPP;
 	}
+}
+
+void igb_read_pci_cfg(struct e1000_hw *hw, u32 reg, u16 *value)
+{
+	struct igb_adapter *adapter = hw->back;
+
+	pci_read_config_word(adapter->pdev, reg, value);
+}
+
+void igb_write_pci_cfg(struct e1000_hw *hw, u32 reg, u16 *value)
+{
+	struct igb_adapter *adapter = hw->back;
+
+	pci_write_config_word(adapter->pdev, reg, *value);
 }
 
 s32 igb_read_pcie_cap_reg(struct e1000_hw *hw, u32 reg, u16 *value)
@@ -7613,7 +7690,7 @@ static void igb_netpoll(struct net_device *netdev)
 
 	for (i = 0; i < adapter->num_q_vectors; i++) {
 		q_vector = adapter->q_vector[i];
-		if (adapter->msix_entries)
+		if (adapter->flags & IGB_FLAG_HAS_MSIX)
 			wr32(E1000_EIMC, q_vector->eims_value);
 		else
 			igb_irq_disable(adapter);
@@ -8102,5 +8179,27 @@ s32 igb_write_i2c_byte(struct e1000_hw *hw, u8 byte_offset,
 	else
 		return 0;
 
+}
+
+int igb_reinit_queues(struct igb_adapter *adapter)
+{
+	struct net_device *netdev = adapter->netdev;
+	struct pci_dev *pdev = adapter->pdev;
+	int err = 0;
+
+	if (netif_running(netdev))
+		igb_close(netdev);
+
+	igb_reset_interrupt_capability(adapter);
+
+	if (igb_init_interrupt_scheme(adapter, true)) {
+		dev_err(&pdev->dev, "Unable to allocate memory for queues\n");
+		return -ENOMEM;
+	}
+
+	if (netif_running(netdev))
+		err = igb_open(netdev);
+
+	return err;
 }
 /* igb_main.c */

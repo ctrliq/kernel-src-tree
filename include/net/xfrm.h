@@ -20,10 +20,11 @@
 #include <net/route.h>
 #include <net/ipv6.h>
 #include <net/ip6_fib.h>
-#include <net/ip6_route.h>
 #include <net/flow.h>
 
 #include <linux/interrupt.h>
+
+#include <linux/rh_kabi.h>
 
 #ifdef CONFIG_XFRM_STATISTICS
 #include <net/snmp.h>
@@ -334,7 +335,8 @@ struct xfrm_state_afinfo {
 						const xfrm_address_t *saddr);
 	int			(*tmpl_sort)(struct xfrm_tmpl **dst, struct xfrm_tmpl **src, int n);
 	int			(*state_sort)(struct xfrm_state **dst, struct xfrm_state **src, int n);
-	int			(*output)(struct sk_buff *skb);
+	RH_KABI_REPLACE_P(int			(*output)(struct sk_buff *skb),
+		          int			(*output)(struct sock *sk, struct sk_buff *skb))
 	int			(*output_finish)(struct sk_buff *skb);
 	int			(*extract_input)(struct xfrm_state *x,
 						 struct sk_buff *skb);
@@ -596,16 +598,27 @@ struct xfrm_mgr {
 extern int xfrm_register_km(struct xfrm_mgr *km);
 extern int xfrm_unregister_km(struct xfrm_mgr *km);
 
+struct xfrm_tunnel_skb_cb {
+	union {
+		struct inet_skb_parm h4;
+		struct inet6_skb_parm h6;
+	} header;
+
+	union {
+		struct ip_tunnel *ip4;
+		struct ip6_tnl *ip6;
+	} tunnel;
+};
+
+#define XFRM_TUNNEL_SKB_CB(__skb) ((struct xfrm_tunnel_skb_cb *)&((__skb)->cb[0]))
+
 /*
  * This structure is used for the duration where packets are being
  * transformed by IPsec.  As soon as the packet leaves IPsec the
  * area beyond the generic IP part may be overwritten.
  */
 struct xfrm_skb_cb {
-	union {
-		struct inet_skb_parm h4;
-		struct inet6_skb_parm h6;
-        } header;
+	struct xfrm_tunnel_skb_cb header;
 
         /* Sequence number for replay protection. */
 	union {
@@ -627,10 +640,7 @@ struct xfrm_skb_cb {
  * to transmit header information to the mode input/output functions.
  */
 struct xfrm_mode_skb_cb {
-	union {
-		struct inet_skb_parm h4;
-		struct inet6_skb_parm h6;
-	} header;
+	struct xfrm_tunnel_skb_cb header;
 
 	/* Copied from header for IPv4, always set to zero and DF for IPv6. */
 	__be16 id;
@@ -662,10 +672,7 @@ struct xfrm_mode_skb_cb {
  * related information.
  */
 struct xfrm_spi_skb_cb {
-	union {
-		struct inet_skb_parm h4;
-		struct inet6_skb_parm h6;
-	} header;
+	struct xfrm_tunnel_skb_cb header;
 
 	unsigned int daddroff;
 	unsigned int family;
@@ -1344,6 +1351,18 @@ struct xfrm_algo_desc {
 	struct sadb_alg desc;
 };
 
+/* XFRM protocol handlers.  */
+struct xfrm4_protocol {
+	int (*handler)(struct sk_buff *skb);
+	int (*input_handler)(struct sk_buff *skb, int nexthdr, __be32 spi,
+			     int encap_type);
+	int (*cb_handler)(struct sk_buff *skb, int err);
+	int (*err_handler)(struct sk_buff *skb, u32 info);
+
+	struct xfrm4_protocol __rcu *next;
+	int priority;
+};
+
 /* XFRM tunnel handlers.  */
 struct xfrm_tunnel {
 	int (*handler)(struct sk_buff *skb);
@@ -1493,13 +1512,19 @@ extern int xfrm4_rcv(struct sk_buff *skb);
 
 static inline int xfrm4_rcv_spi(struct sk_buff *skb, int nexthdr, __be32 spi)
 {
-	return xfrm4_rcv_encap(skb, nexthdr, spi, 0);
+	XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4 = NULL;
+	XFRM_SPI_SKB_CB(skb)->family = AF_INET;
+	XFRM_SPI_SKB_CB(skb)->daddroff = offsetof(struct iphdr, daddr);
+	return xfrm_input(skb, nexthdr, spi, 0);
 }
 
 extern int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb);
 extern int xfrm4_prepare_output(struct xfrm_state *x, struct sk_buff *skb);
-extern int xfrm4_output(struct sk_buff *skb);
+extern int xfrm4_output(struct sock *sk, struct sk_buff *skb);
 extern int xfrm4_output_finish(struct sk_buff *skb);
+extern int xfrm4_rcv_cb(struct sk_buff *skb, u8 protocol, int err);
+extern int xfrm4_protocol_register(struct xfrm4_protocol *handler, unsigned char protocol);
+extern int xfrm4_protocol_deregister(struct xfrm4_protocol *handler, unsigned char protocol);
 extern int xfrm4_tunnel_register(struct xfrm_tunnel *handler, unsigned short family);
 extern int xfrm4_tunnel_deregister(struct xfrm_tunnel *handler, unsigned short family);
 extern int xfrm4_mode_tunnel_input_register(struct xfrm_tunnel_notifier *handler);
@@ -1517,7 +1542,7 @@ extern __be32 xfrm6_tunnel_alloc_spi(struct net *net, xfrm_address_t *saddr);
 extern __be32 xfrm6_tunnel_spi_lookup(struct net *net, const xfrm_address_t *saddr);
 extern int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb);
 extern int xfrm6_prepare_output(struct xfrm_state *x, struct sk_buff *skb);
-extern int xfrm6_output(struct sk_buff *skb);
+extern int xfrm6_output(struct sock *sk, struct sk_buff *skb);
 extern int xfrm6_output_finish(struct sk_buff *skb);
 extern int xfrm6_find_1stfragopt(struct xfrm_state *x, struct sk_buff *skb,
 				 u8 **prevhdr);
@@ -1724,15 +1749,37 @@ static inline int xfrm_mark_put(struct sk_buff *skb, const struct xfrm_mark *m)
 	return ret;
 }
 
-static inline int xfrm_skb_dst_mtu(struct sk_buff *skb)
+static inline int xfrm_rcv_cb(struct sk_buff *skb, unsigned int family,
+			      u8 protocol, int err)
 {
-	struct sock *sk = skb->sk;
+	switch(family) {
+#ifdef CONFIG_INET
+	case AF_INET:
+		return xfrm4_rcv_cb(skb, protocol, err);
+#endif
+	}
+	return 0;
+}
 
-	if (sk && sk->sk_family == AF_INET6)
-		return ip6_skb_dst_mtu(skb);
-	else if (sk && sk->sk_family == AF_INET)
-		return ip_skb_dst_mtu(skb);
-	return dst_mtu(skb_dst(skb));
+static inline int xfrm_tunnel_check(struct sk_buff *skb, struct xfrm_state *x,
+				    unsigned int family)
+{
+	bool tunnel = false;
+
+	switch(family) {
+	case AF_INET:
+		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4)
+			tunnel = true;
+		break;
+	case AF_INET6:
+		if (XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6)
+			tunnel = true;
+		break;
+	}
+	if (tunnel && !(x->outer_mode->flags & XFRM_MODE_FLAG_TUNNEL))
+		return -EINVAL;
+
+	return 0;
 }
 
 #endif	/* _NET_XFRM_H */

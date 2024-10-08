@@ -272,13 +272,15 @@ static inline struct vxlan_rdst *first_remote_rtnl(struct vxlan_fdb *fdb)
 	return list_first_entry(&fdb->remotes, struct vxlan_rdst, list);
 }
 
-/* Find VXLAN socket based on network namespace and UDP port */
-static struct vxlan_sock *vxlan_find_sock(struct net *net, __be16 port)
+/* Find VXLAN socket based on network namespace, address family and UDP port */
+static struct vxlan_sock *vxlan_find_sock(struct net *net,
+					  sa_family_t family, __be16 port)
 {
 	struct vxlan_sock *vs;
 
 	hlist_for_each_entry_rcu(vs, vs_head(net, port), hlist) {
-		if (inet_sk(vs->sock->sk)->inet_sport == port)
+		if (inet_sk(vs->sock->sk)->inet_sport == port &&
+		    inet_sk(vs->sock->sk)->sk.sk_family == family)
 			return vs;
 	}
 	return NULL;
@@ -297,11 +299,12 @@ static struct vxlan_dev *vxlan_vs_find_vni(struct vxlan_sock *vs, u32 id)
 }
 
 /* Look up VNI in a per net namespace table */
-static struct vxlan_dev *vxlan_find_vni(struct net *net, u32 id, __be16 port)
+static struct vxlan_dev *vxlan_find_vni(struct net *net, u32 id,
+					sa_family_t family, __be16 port)
 {
 	struct vxlan_sock *vs;
 
-	vs = vxlan_find_sock(net, port);
+	vs = vxlan_find_sock(net, family, port);
 	if (!vs)
 		return NULL;
 
@@ -1142,8 +1145,6 @@ static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 	if (!vs)
 		goto drop;
 
-	skb_pop_rcv_encapsulation(skb);
-
 	vs->rcv(vs, skb, vxh->vx_vni);
 	return 0;
 
@@ -1556,25 +1557,6 @@ static bool route_shortcircuit(struct net_device *dev, struct sk_buff *skb)
 	return false;
 }
 
-/* Compute source port for outgoing packet
- *   first choice to use L4 flow hash since it will spread
- *     better and maybe available from hardware
- *   secondary choice is to use jhash on the Ethernet header
- */
-__be16 vxlan_src_port(__u16 port_min, __u16 port_max, struct sk_buff *skb)
-{
-	unsigned int range = (port_max - port_min) + 1;
-	u32 hash;
-
-	hash = skb_get_rxhash(skb);
-	if (!hash)
-		hash = jhash(skb->data, 2 * ETH_ALEN,
-			     (__force u32) skb->protocol);
-
-	return htons((((u64) hash * range) >> 32) + port_min);
-}
-EXPORT_SYMBOL_GPL(vxlan_src_port);
-
 static inline struct sk_buff *vxlan_handle_offloads(struct sk_buff *skb,
 						    bool udp_csum)
 {
@@ -1706,8 +1688,8 @@ int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
 	udp_set_csum(vs->sock->sk->sk_no_check_tx, skb,
 		     src, dst, skb->len);
 
-	return iptunnel_xmit(net, rt, skb, src, dst,
-			IPPROTO_UDP, tos, ttl, df);
+	return iptunnel_xmit(vs->sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+			     tos, ttl, df);
 }
 EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
 
@@ -1790,7 +1772,8 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 	if (tos == 1)
 		tos = ip_tunnel_get_dsfield(old_iph, skb);
 
-	src_port = vxlan_src_port(vxlan->port_min, vxlan->port_max, skb);
+	src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->port_min,
+				     vxlan->port_max, true);
 
 	if (dst->sa.sa_family == AF_INET) {
 		memset(&fl4, 0, sizeof(fl4));
@@ -1820,7 +1803,8 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 			struct vxlan_dev *dst_vxlan;
 
 			ip_rt_put(rt);
-			dst_vxlan = vxlan_find_vni(dev_net(dev), vni, dst_port);
+			dst_vxlan = vxlan_find_vni(dev_net(dev), vni,
+						   dst->sa.sa_family, dst_port);
 			if (!dst_vxlan)
 				goto tx_error;
 			vxlan_encap_bypass(skb, vxlan, dst_vxlan);
@@ -1873,7 +1857,8 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 			struct vxlan_dev *dst_vxlan;
 
 			dst_release(ndst);
-			dst_vxlan = vxlan_find_vni(dev_net(dev), vni, dst_port);
+			dst_vxlan = vxlan_find_vni(dev_net(dev), vni,
+						   dst->sa.sa_family, dst_port);
 			if (!dst_vxlan)
 				goto tx_error;
 			vxlan_encap_bypass(skb, vxlan, dst_vxlan);
@@ -2030,13 +2015,15 @@ static int vxlan_init(struct net_device *dev)
 	struct vxlan_dev *vxlan = netdev_priv(dev);
 	struct vxlan_net *vn = net_generic(dev_net(dev), vxlan_net_id);
 	struct vxlan_sock *vs;
+	bool ipv6 = vxlan->flags & VXLAN_F_IPV6;
 
 	dev->tstats = alloc_percpu(struct pcpu_tstats);
 	if (!dev->tstats)
 		return -ENOMEM;
 
 	spin_lock(&vn->sock_lock);
-	vs = vxlan_find_sock(dev_net(dev), vxlan->dst_port);
+	vs = vxlan_find_sock(dev_net(dev), ipv6 ? AF_INET6 : AF_INET,
+			     vxlan->dst_port);
 	if (vs) {
 		/* If we have a socket with same port already, reuse it */
 		atomic_inc(&vs->refcnt);
@@ -2216,7 +2203,6 @@ static void vxlan_setup(struct net_device *dev)
 {
 	struct vxlan_dev *vxlan = netdev_priv(dev);
 	unsigned int h;
-	int low, high;
 
 	eth_hw_addr_random(dev);
 	ether_setup(dev);
@@ -2254,9 +2240,6 @@ static void vxlan_setup(struct net_device *dev)
 	vxlan->age_timer.function = vxlan_cleanup;
 	vxlan->age_timer.data = (unsigned long) vxlan;
 
-	inet_get_local_port_range(&low, &high);
-	vxlan->port_min = low;
-	vxlan->port_max = high;
 	vxlan->dst_port = htons(vxlan_port);
 
 	vxlan->dev = dev;
@@ -2510,6 +2493,7 @@ struct vxlan_sock *vxlan_sock_add(struct net *net, __be16 port,
 {
 	struct vxlan_net *vn = net_generic(net, vxlan_net_id);
 	struct vxlan_sock *vs;
+	bool ipv6 = flags & VXLAN_F_IPV6;
 
 	vs = vxlan_socket_create(net, port, rcv, data, flags);
 	if (!IS_ERR(vs))
@@ -2519,7 +2503,7 @@ struct vxlan_sock *vxlan_sock_add(struct net *net, __be16 port,
 		return vs;
 
 	spin_lock(&vn->sock_lock);
-	vs = vxlan_find_sock(net, port);
+	vs = vxlan_find_sock(net, ipv6 ? AF_INET6 : AF_INET, port);
 	if (vs) {
 		if (vs->rcv == rcv)
 			atomic_inc(&vs->refcnt);
@@ -2677,7 +2661,8 @@ static int vxlan_newlink(struct net *net, struct net_device *dev,
 	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
 		vxlan->flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
 
-	if (vxlan_find_vni(net, vni, vxlan->dst_port)) {
+	if (vxlan_find_vni(net, vni, use_ipv6 ? AF_INET6 : AF_INET,
+			   vxlan->dst_port)) {
 		pr_info("duplicate VNI %u\n", vni);
 		return -EEXIST;
 	}
@@ -2859,7 +2844,7 @@ static void vxlan_handle_lowerdev_unregister(struct vxlan_net *vn,
 static int vxlan_lowerdev_event(struct notifier_block *unused,
 				unsigned long event, void *ptr)
 {
-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct net_device *dev = ptr;
 	struct vxlan_net *vn = net_generic(dev_net(dev), vxlan_net_id);
 
 	if (event == NETDEV_UNREGISTER)

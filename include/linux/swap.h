@@ -13,6 +13,8 @@
 #include <linux/page-flags.h>
 #include <asm/page.h>
 
+#include <linux/rh_kabi.h>
+
 struct notifier_block;
 
 struct bio;
@@ -188,7 +190,7 @@ struct swap_info_struct {
 	unsigned long	flags;		/* SWP_USED etc: see above */
 	signed short	prio;		/* swap priority of this type */
 	signed char	type;		/* strange name for an index */
-	signed char	next;		/* next type on the swap list */
+	signed char     next;           /* unused: kept for kABI */
 	unsigned int	max;		/* extent of the swap_map */
 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
 	unsigned int lowest_bit;	/* index of first free in swap_map */
@@ -220,11 +222,8 @@ struct swap_info_struct {
 					 * swap_lock. If both locks need hold,
 					 * hold swap_lock first.
 					 */
-};
-
-struct swap_list_t {
-	int head;	/* head of priority-ordered swapfile list */
-	int next;	/* swapfile to be used next */
+	RH_KABI_EXTEND(struct plist_node list)		/* entry in swap_active_head */
+	RH_KABI_EXTEND(struct plist_node avail_list)	/* entry in swap_avail_head */
 };
 
 /* linux/mm/workingset.c */

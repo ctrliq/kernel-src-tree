@@ -98,6 +98,7 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
 	init_waitqueue_head(&sdp->sd_quota_wait);
 	INIT_LIST_HEAD(&sdp->sd_trunc_list);
 	spin_lock_init(&sdp->sd_trunc_lock);
+	spin_lock_init(&sdp->sd_bitmap_lock);
 
 	spin_lock_init(&sdp->sd_log_lock);
 	atomic_set(&sdp->sd_log_pinned, 0);
@@ -958,40 +959,6 @@ fail:
 	return error;
 }
 
-static int init_threads(struct gfs2_sbd *sdp, int undo)
-{
-	struct task_struct *p;
-	int error = 0;
-
-	if (undo)
-		goto fail_quotad;
-
-	p = kthread_run(gfs2_logd, sdp, "gfs2_logd");
-	error = IS_ERR(p);
-	if (error) {
-		fs_err(sdp, "can't start logd thread: %d\n", error);
-		return error;
-	}
-	sdp->sd_logd_process = p;
-
-	p = kthread_run(gfs2_quotad, sdp, "gfs2_quotad");
-	error = IS_ERR(p);
-	if (error) {
-		fs_err(sdp, "can't start quotad thread: %d\n", error);
-		goto fail;
-	}
-	sdp->sd_quotad_process = p;
-
-	return 0;
-
-
-fail_quotad:
-	kthread_stop(sdp->sd_quotad_process);
-fail:
-	kthread_stop(sdp->sd_logd_process);
-	return error;
-}
-
 static const match_table_t nolock_tokens = {
 	{ Opt_jid, "jid=%d\n", },
 	{ Opt_err, NULL },
@@ -1256,15 +1223,11 @@ static int fill_super(struct super_block *sb, struct gfs2_args *args, int silent
 		goto fail_per_node;
 	}
 
-	error = init_threads(sdp, DO);
-	if (error)
-		goto fail_per_node;
-
 	if (!(sb->s_flags & MS_RDONLY)) {
 		error = gfs2_make_fs_rw(sdp);
 		if (error) {
 			fs_err(sdp, "can't make FS RW: %d\n", error);
-			goto fail_threads;
+			goto fail_per_node;
 		}
 	}
 
@@ -1272,8 +1235,6 @@ static int fill_super(struct super_block *sb, struct gfs2_args *args, int silent
 	gfs2_online_uevent(sdp);
 	return 0;
 
-fail_threads:
-	init_threads(sdp, UNDO);
 fail_per_node:
 	init_per_node(sdp, UNDO);
 fail_inodes:

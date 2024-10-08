@@ -373,12 +373,16 @@ int qlcnic_ind_rd(struct qlcnic_adapter *adapter, u32 addr)
 	return data;
 }
 
-void qlcnic_ind_wr(struct qlcnic_adapter *adapter, u32 addr, u32 data)
+int qlcnic_ind_wr(struct qlcnic_adapter *adapter, u32 addr, u32 data)
 {
+	int ret = 0;
+
 	if (qlcnic_82xx_check(adapter))
 		qlcnic_write_window_reg(addr, adapter->ahw->pci_base0, data);
 	else
-		qlcnic_83xx_wrt_reg_indirect(adapter, addr, data);
+		ret = qlcnic_83xx_wrt_reg_indirect(adapter, addr, data);
+
+	return ret;
 }
 
 static int
@@ -453,7 +457,7 @@ int qlcnic_82xx_sre_macaddr_change(struct qlcnic_adapter *adapter, u8 *addr,
 
 	mac_req = (struct qlcnic_mac_req *)&req.words[0];
 	mac_req->op = op;
-	memcpy(mac_req->mac_addr, addr, 6);
+	memcpy(mac_req->mac_addr, addr, ETH_ALEN);
 
 	vlan_req = (struct qlcnic_vlan_req *)&req.words[1];
 	vlan_req->vlan_id = cpu_to_le16(vlan_id);
@@ -513,7 +517,7 @@ int qlcnic_nic_add_mac(struct qlcnic_adapter *adapter, const u8 *addr, u16 vlan)
 	return 0;
 }
 
-void __qlcnic_set_multi(struct net_device *netdev, u16 vlan)
+static void __qlcnic_set_multi(struct net_device *netdev, u16 vlan)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
 	struct qlcnic_hardware_context *ahw = adapter->ahw;
@@ -567,28 +571,14 @@ void __qlcnic_set_multi(struct net_device *netdev, u16 vlan)
 void qlcnic_set_multi(struct net_device *netdev)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
-	struct qlcnic_mac_vlan_list *cur;
-	struct netdev_hw_addr *ha;
-	size_t temp;
 
 	if (!test_bit(__QLCNIC_FW_ATTACHED, &adapter->state))
 		return;
-	if (qlcnic_sriov_vf_check(adapter)) {
-		if (!netdev_mc_empty(netdev)) {
-			netdev_for_each_mc_addr(ha, netdev) {
-				temp = sizeof(struct qlcnic_mac_vlan_list);
-				cur = kzalloc(temp, GFP_ATOMIC);
-				if (cur == NULL)
-					break;
-				memcpy(cur->mac_addr,
-				       ha->addr, ETH_ALEN);
-				list_add_tail(&cur->list, &adapter->vf_mc_list);
-			}
-		}
-		qlcnic_sriov_vf_schedule_multi(adapter->netdev);
-		return;
-	}
-	__qlcnic_set_multi(netdev, 0);
+
+	if (qlcnic_sriov_vf_check(adapter))
+		qlcnic_sriov_vf_set_multi(netdev);
+	else
+		__qlcnic_set_multi(netdev, 0);
 }
 
 int qlcnic_82xx_nic_set_promisc(struct qlcnic_adapter *adapter, u32 mode)
@@ -763,10 +753,7 @@ int qlcnic_82xx_read_phys_port_id(struct qlcnic_adapter *adapter)
 	return 0;
 }
 
-/*
- * Send the interrupt coalescing parameter set by ethtool to the card.
- */
-void qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *adapter)
+int qlcnic_82xx_set_rx_coalesce(struct qlcnic_adapter *adapter)
 {
 	struct qlcnic_nic_req req;
 	int rv;
@@ -788,6 +775,28 @@ void qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *adapter)
 	if (rv != 0)
 		dev_err(&adapter->netdev->dev,
 			"Could not send interrupt coalescing parameters\n");
+
+	return rv;
+}
+
+/* Send the interrupt coalescing parameter set by ethtool to the card. */
+int qlcnic_82xx_config_intr_coalesce(struct qlcnic_adapter *adapter,
+				     struct ethtool_coalesce *ethcoal)
+{
+	struct qlcnic_nic_intr_coalesce *coal = &adapter->ahw->coal;
+	int rv;
+
+	coal->flag = QLCNIC_INTR_DEFAULT;
+	coal->rx_time_us = ethcoal->rx_coalesce_usecs;
+	coal->rx_packets = ethcoal->rx_max_coalesced_frames;
+
+	rv = qlcnic_82xx_set_rx_coalesce(adapter);
+
+	if (rv)
+		netdev_err(adapter->netdev,
+			   "Failed to set Rx coalescing parametrs\n");
+
+	return rv;
 }
 
 #define QLCNIC_ENABLE_IPV4_LRO		BIT_0
@@ -955,7 +964,7 @@ int qlcnic_82xx_linkevent_request(struct qlcnic_adapter *adapter, int enable)
 	return rv;
 }
 
-int qlcnic_send_lro_cleanup(struct qlcnic_adapter *adapter)
+static int qlcnic_send_lro_cleanup(struct qlcnic_adapter *adapter)
 {
 	struct qlcnic_nic_req req;
 	u64 word;
@@ -1254,7 +1263,7 @@ static int qlcnic_pci_mem_access_direct(struct qlcnic_adapter *adapter,
 	return 0;
 }
 
-void
+static void
 qlcnic_pci_camqm_read_2M(struct qlcnic_adapter *adapter, u64 off, u64 *data)
 {
 	void __iomem *addr = adapter->ahw->pci_base0 +
@@ -1265,7 +1274,7 @@ qlcnic_pci_camqm_read_2M(struct qlcnic_adapter *adapter, u64 off, u64 *data)
 	mutex_unlock(&adapter->ahw->mem_lock);
 }
 
-void
+static void
 qlcnic_pci_camqm_write_2M(struct qlcnic_adapter *adapter, u64 off, u64 data)
 {
 	void __iomem *addr = adapter->ahw->pci_base0 +
@@ -1501,7 +1510,7 @@ int qlcnic_82xx_get_board_info(struct qlcnic_adapter *adapter)
 	return 0;
 }
 
-int
+static int
 qlcnic_wol_supported(struct qlcnic_adapter *adapter)
 {
 	u32 wol_cfg;
@@ -1541,19 +1550,34 @@ int qlcnic_82xx_config_led(struct qlcnic_adapter *adapter, u32 state, u32 rate)
 	return rv;
 }
 
-int qlcnic_get_beacon_state(struct qlcnic_adapter *adapter, u8 *h_state)
+void qlcnic_82xx_get_beacon_state(struct qlcnic_adapter *adapter)
 {
+	struct qlcnic_hardware_context *ahw = adapter->ahw;
 	struct qlcnic_cmd_args cmd;
-	int err;
+	u8 beacon_state;
+	int err = 0;
 
-	err = qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_GET_LED_STATUS);
-	if (!err) {
-		err = qlcnic_issue_cmd(adapter, &cmd);
-		if (!err)
-			*h_state = cmd.rsp.arg[1];
+	if (ahw->extra_capability[0] & QLCNIC_FW_CAPABILITY_2_BEACON) {
+		err = qlcnic_alloc_mbx_args(&cmd, adapter,
+					    QLCNIC_CMD_GET_LED_STATUS);
+		if (!err) {
+			err = qlcnic_issue_cmd(adapter, &cmd);
+			if (err) {
+				netdev_err(adapter->netdev,
+					   "Failed to get current beacon state, err=%d\n",
+					   err);
+			} else {
+				beacon_state = cmd.rsp.arg[1];
+				if (beacon_state == QLCNIC_BEACON_DISABLE)
+					ahw->beacon_state = QLCNIC_BEACON_OFF;
+				else if (beacon_state == QLCNIC_BEACON_EANBLE)
+					ahw->beacon_state = QLCNIC_BEACON_ON;
+			}
+		}
+		qlcnic_free_mbx_args(&cmd);
 	}
-	qlcnic_free_mbx_args(&cmd);
-	return err;
+
+	return;
 }
 
 void qlcnic_82xx_get_func_no(struct qlcnic_adapter *adapter)

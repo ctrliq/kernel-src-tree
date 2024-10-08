@@ -1982,11 +1982,9 @@ static void nested_svm_inject_npf_exit(struct kvm_vcpu *vcpu,
 	nested_svm_vmexit(svm);
 }
 
-static int nested_svm_init_mmu_context(struct kvm_vcpu *vcpu)
+static void nested_svm_init_mmu_context(struct kvm_vcpu *vcpu)
 {
-	int r;
-
-	r = kvm_init_shadow_mmu(vcpu, &vcpu->arch.mmu);
+	kvm_init_shadow_mmu(vcpu, &vcpu->arch.mmu);
 
 	vcpu->arch.mmu.set_cr3           = nested_svm_set_tdp_cr3;
 	vcpu->arch.mmu.get_cr3           = nested_svm_get_tdp_cr3;
@@ -1994,8 +1992,6 @@ static int nested_svm_init_mmu_context(struct kvm_vcpu *vcpu)
 	vcpu->arch.mmu.inject_page_fault = nested_svm_inject_npf_exit;
 	vcpu->arch.mmu.shadow_root_level = get_npt_level();
 	vcpu->arch.walk_mmu              = &vcpu->arch.nested_mmu;
-
-	return r;
 }
 
 static void nested_svm_uninit_mmu_context(struct kvm_vcpu *vcpu)
@@ -3687,7 +3683,7 @@ static int svm_interrupt_allowed(struct kvm_vcpu *vcpu)
 	return ret;
 }
 
-static int enable_irq_window(struct kvm_vcpu *vcpu)
+static void enable_irq_window(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 
@@ -3701,16 +3697,15 @@ static int enable_irq_window(struct kvm_vcpu *vcpu)
 		svm_set_vintr(svm);
 		svm_inject_irq(svm, 0x0);
 	}
-	return 0;
 }
 
-static int enable_nmi_window(struct kvm_vcpu *vcpu)
+static void enable_nmi_window(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 
 	if ((svm->vcpu.arch.hflags & (HF_NMI_MASK | HF_IRET_MASK))
 	    == HF_NMI_MASK)
-		return 0; /* IRET will cause a vm exit */
+		return; /* IRET will cause a vm exit */
 
 	/*
 	 * Something prevents NMI from been injected. Single step over possible
@@ -3719,7 +3714,6 @@ static int enable_nmi_window(struct kvm_vcpu *vcpu)
 	svm->nmi_singlestep = true;
 	svm->vmcb->save.rflags |= (X86_EFLAGS_TF | X86_EFLAGS_RF);
 	update_db_bp_intercept(vcpu);
-	return 0;
 }
 
 static int svm_set_tss_addr(struct kvm *kvm, unsigned int addr)
@@ -4305,6 +4299,10 @@ static void svm_handle_external_intr(struct kvm_vcpu *vcpu)
 	local_irq_enable();
 }
 
+static void svm_sched_in(struct kvm_vcpu *vcpu, int cpu)
+{
+}
+
 static struct kvm_x86_ops svm_x86_ops = {
 	.cpu_has_kvm_support = has_svm,
 	.disabled_by_bios = is_disabled,
@@ -4406,6 +4404,8 @@ static struct kvm_x86_ops svm_x86_ops = {
 
 	.check_intercept = svm_check_intercept,
 	.handle_external_intr = svm_handle_external_intr,
+
+	.sched_in = svm_sched_in,
 };
 
 static int __init svm_init(void)

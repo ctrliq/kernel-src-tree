@@ -740,7 +740,7 @@ set_rcvbuf:
 		break;
 
 	case SO_NO_CHECK:
-		sk->sk_no_check = valbool;
+		sk->sk_no_check_tx = valbool;
 		break;
 
 	case SO_PRIORITY:
@@ -1014,7 +1014,7 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 		break;
 
 	case SO_NO_CHECK:
-		v.val = sk->sk_no_check;
+		v.val = sk->sk_no_check_tx;
 		break;
 
 	case SO_PRIORITY:
@@ -1164,6 +1164,10 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 
 	case SO_LOCK_FILTER:
 		v.val = sock_flag(sk, SOCK_FILTER_LOCKED);
+		break;
+
+	case SO_BPF_EXTENSIONS:
+		v.val = bpf_tell_extensions();
 		break;
 
 	case SO_SELECT_ERR_QUEUE:
@@ -1455,9 +1459,6 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 		atomic_set(&newsk->sk_omem_alloc, 0);
 		skb_queue_head_init(&newsk->sk_receive_queue);
 		skb_queue_head_init(&newsk->sk_write_queue);
-#ifdef CONFIG_NET_DMA
-		skb_queue_head_init(&newsk->sk_async_wait_queue);
-#endif
 
 		spin_lock_init(&newsk->sk_dst_lock);
 		rwlock_init(&newsk->sk_callback_lock);
@@ -2244,9 +2245,6 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	skb_queue_head_init(&sk->sk_receive_queue);
 	skb_queue_head_init(&sk->sk_write_queue);
 	skb_queue_head_init(&sk->sk_error_queue);
-#ifdef CONFIG_NET_DMA
-	skb_queue_head_init(&sk->sk_async_wait_queue);
-#endif
 
 	sk->sk_send_head	=	NULL;
 

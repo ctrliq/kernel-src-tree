@@ -7,6 +7,7 @@
 #include "../perf.h"
 #include "map.h"
 #include "build-id.h"
+#include "perf_regs.h"
 
 struct mmap_event {
 	struct perf_event_header header;
@@ -87,7 +88,12 @@ struct sample_event {
 
 struct regs_dump {
 	u64 abi;
+	u64 mask;
 	u64 *regs;
+
+	/* Cached values/mask filled by first register access. */
+	u64 cache_regs[PERF_REGS_MAX];
+	u64 cache_mask;
 };
 
 struct stack_dump {
@@ -276,7 +282,8 @@ int perf_event__process(struct perf_tool *tool,
 			struct machine *machine);
 
 struct addr_location;
-int perf_event__preprocess_sample(const union perf_event *self,
+
+int perf_event__preprocess_sample(const union perf_event *event,
 				  struct machine *machine,
 				  struct addr_location *al,
 				  struct perf_sample *sample);
@@ -284,9 +291,9 @@ int perf_event__preprocess_sample(const union perf_event *self,
 const char *perf_event__name(unsigned int id);
 
 size_t perf_event__sample_event_size(const struct perf_sample *sample, u64 type,
-				     u64 sample_regs_user, u64 read_format);
+				     u64 read_format);
 int perf_event__synthesize_sample(union perf_event *event, u64 type,
-				  u64 sample_regs_user, u64 read_format,
+				  u64 read_format,
 				  const struct perf_sample *sample,
 				  bool swapped);
 

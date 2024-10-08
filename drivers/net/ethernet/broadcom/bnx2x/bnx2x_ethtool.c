@@ -6,7 +6,7 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation.
  *
- * Maintained by: Eilon Greenstein <eilong@broadcom.com>
+ * Maintained by: Ariel Elior <ariel.elior@qlogic.com>
  * Written by: Eliezer Tamir
  * Based on code from Michael Chan's bnx2 driver
  * UDP CSUM errata workaround by Arik Gendelman
@@ -214,6 +214,43 @@ static int bnx2x_get_port_type(struct bnx2x *bp)
 		break;
 	}
 	return port_type;
+}
+
+static int bnx2x_get_vf_settings(struct net_device *dev,
+				 struct ethtool_cmd *cmd)
+{
+	struct bnx2x *bp = netdev_priv(dev);
+
+	if (bp->state == BNX2X_STATE_OPEN) {
+		if (test_bit(BNX2X_LINK_REPORT_FD,
+			     &bp->vf_link_vars.link_report_flags))
+			cmd->duplex = DUPLEX_FULL;
+		else
+			cmd->duplex = DUPLEX_HALF;
+
+		ethtool_cmd_speed_set(cmd, bp->vf_link_vars.line_speed);
+	} else {
+		cmd->duplex = DUPLEX_UNKNOWN;
+		ethtool_cmd_speed_set(cmd, SPEED_UNKNOWN);
+	}
+
+	cmd->port		= PORT_OTHER;
+	cmd->phy_address	= 0;
+	cmd->transceiver	= XCVR_INTERNAL;
+	cmd->autoneg		= AUTONEG_DISABLE;
+	cmd->maxtxpkt		= 0;
+	cmd->maxrxpkt		= 0;
+
+	DP(BNX2X_MSG_ETHTOOL, "ethtool_cmd: cmd %d\n"
+	   "  supported 0x%x  advertising 0x%x  speed %u\n"
+	   "  duplex %d  port %d  phy_address %d  transceiver %d\n"
+	   "  autoneg %d  maxtxpkt %d  maxrxpkt %d\n",
+	   cmd->cmd, cmd->supported, cmd->advertising,
+	   ethtool_cmd_speed(cmd),
+	   cmd->duplex, cmd->port, cmd->phy_address, cmd->transceiver,
+	   cmd->autoneg, cmd->maxtxpkt, cmd->maxrxpkt);
+
+	return 0;
 }
 
 static int bnx2x_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
@@ -1110,6 +1147,10 @@ static u32 bnx2x_get_link(struct net_device *dev)
 
 	if (bp->flags & MF_FUNC_DIS || (bp->state != BNX2X_STATE_OPEN))
 		return 0;
+
+	if (IS_VF(bp))
+		return !test_bit(BNX2X_LINK_REPORT_LINK_DOWN,
+				 &bp->vf_link_vars.link_report_flags);
 
 	return bp->link_vars.link_up;
 }
@@ -3439,6 +3480,46 @@ static int bnx2x_set_channels(struct net_device *dev,
 	return bnx2x_nic_load(bp, LOAD_NORMAL);
 }
 
+static int bnx2x_get_ts_info(struct net_device *dev,
+			     struct ethtool_ts_info *info)
+{
+	struct bnx2x *bp = netdev_priv(dev);
+
+	if (bp->flags & PTP_SUPPORTED) {
+		info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
+					SOF_TIMESTAMPING_RX_SOFTWARE |
+					SOF_TIMESTAMPING_SOFTWARE |
+					SOF_TIMESTAMPING_TX_HARDWARE |
+					SOF_TIMESTAMPING_RX_HARDWARE |
+					SOF_TIMESTAMPING_RAW_HARDWARE;
+
+		if (bp->ptp_clock)
+			info->phc_index = ptp_clock_index(bp->ptp_clock);
+		else
+			info->phc_index = -1;
+
+		info->rx_filters = (1 << HWTSTAMP_FILTER_NONE) |
+				   (1 << HWTSTAMP_FILTER_PTP_V1_L4_EVENT) |
+				   (1 << HWTSTAMP_FILTER_PTP_V1_L4_SYNC) |
+				   (1 << HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_L4_EVENT) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_L4_SYNC) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_L2_EVENT) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_L2_SYNC) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_EVENT) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_SYNC) |
+				   (1 << HWTSTAMP_FILTER_PTP_V2_DELAY_REQ);
+
+		info->tx_types = (1 << HWTSTAMP_TX_OFF)|(1 << HWTSTAMP_TX_ON);
+
+		return 0;
+	}
+
+	return ethtool_op_get_ts_info(dev, info);
+}
+
 static const struct ethtool_ops bnx2x_ethtool_ops = {
 	.get_settings		= bnx2x_get_settings,
 	.set_settings		= bnx2x_set_settings,
@@ -3480,12 +3561,11 @@ static const struct ethtool_ops bnx2x_ethtool_ops = {
 	.get_module_eeprom	= bnx2x_get_module_eeprom,
 	.get_eee		= bnx2x_get_eee,
 	.set_eee		= bnx2x_set_eee,
-	.get_ts_info		= ethtool_op_get_ts_info,
+	.get_ts_info		= bnx2x_get_ts_info,
 };
 
 static const struct ethtool_ops bnx2x_vf_ethtool_ops = {
-	.get_settings		= bnx2x_get_settings,
-	.set_settings		= bnx2x_set_settings,
+	.get_settings		= bnx2x_get_vf_settings,
 	.get_drvinfo		= bnx2x_get_drvinfo,
 	.get_msglevel		= bnx2x_get_msglevel,
 	.set_msglevel		= bnx2x_set_msglevel,
@@ -3507,8 +3587,6 @@ static const struct ethtool_ops bnx2x_vf_ethtool_ops = {
 
 void bnx2x_set_ethtool_ops(struct bnx2x *bp, struct net_device *netdev)
 {
-	if (IS_PF(bp))
-		SET_ETHTOOL_OPS(netdev, &bnx2x_ethtool_ops);
-	else /* vf */
-		SET_ETHTOOL_OPS(netdev, &bnx2x_vf_ethtool_ops);
+	netdev->ethtool_ops = (IS_PF(bp)) ?
+		&bnx2x_ethtool_ops : &bnx2x_vf_ethtool_ops;
 }

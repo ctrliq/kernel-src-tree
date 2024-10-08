@@ -277,15 +277,15 @@ bool is_link_state_evt(u32 trailer)
 
 static bool is_iscsi_evt(u32 trailer)
 {
-	return ((trailer >> ASYNC_TRAILER_EVENT_CODE_SHIFT) &
+	return (((trailer >> ASYNC_TRAILER_EVENT_CODE_SHIFT) &
 		  ASYNC_TRAILER_EVENT_CODE_MASK) ==
-		  ASYNC_EVENT_CODE_ISCSI;
+		  ASYNC_EVENT_CODE_ISCSI);
 }
 
 static int iscsi_evt_type(u32 trailer)
 {
-	return (trailer >> ASYNC_TRAILER_EVENT_TYPE_SHIFT) &
-		 ASYNC_TRAILER_EVENT_TYPE_MASK;
+	return ((trailer >> ASYNC_TRAILER_EVENT_TYPE_SHIFT) &
+		 ASYNC_TRAILER_EVENT_TYPE_MASK);
 }
 
 static inline bool be_mcc_compl_is_new(struct be_mcc_compl *compl)
@@ -483,16 +483,16 @@ int beiscsi_process_mcc(struct beiscsi_hba *phba)
 					beiscsi_log(phba, KERN_ERR,
 						    BEISCSI_LOG_CONFIG |
 						    BEISCSI_LOG_MBOX,
-						    "BC_%d : Async iscsi Event,"
-						    " flags handled = 0x%08x\n",
+						    "BC_%d : Async iscsi Event, flags "
+						    "handled = 0x%08x\n",
 						    compl->flags);
 					break;
 				default:
 					beiscsi_log(phba, KERN_ERR,
 						    BEISCSI_LOG_CONFIG |
 						    BEISCSI_LOG_MBOX,
-						    "BC_%d : Unsupported Async"
-						    " Event, flags = 0x%08x\n",
+						    "BC_%d : Unsupported Async iscsi "
+						    "Event, flags = 0x%08x\n",
 						    compl->flags);
 				}
 			} else

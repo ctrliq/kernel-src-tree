@@ -118,6 +118,9 @@ ifeq ($(CONFIG_KMEMCHECK),y)
 	KBUILD_CFLAGS += $(call cc-option,-fno-builtin-memcpy)
 endif
 
+# RHEL frame check
+KBUILD_CFLAGS += -Wframe-larger-than=2048
+
 # Stackpointer is addressed different for 32 bit and 64 bit x86
 sp-$(CONFIG_X86_32) := esp
 sp-$(CONFIG_X86_64) := rsp
@@ -161,11 +164,8 @@ archheaders:
 	$(Q)$(MAKE) $(build)=arch/x86/syscalls all
 
 archprepare:
-ifeq ($(CONFIG_KEXEC),y)
-# Build only for 64bit. No loaders for 32bit yet.
- ifeq ($(CONFIG_X86_64),y)
+ifeq ($(CONFIG_KEXEC_FILE),y)
 	$(Q)$(MAKE) $(build)=arch/x86/purgatory arch/x86/purgatory/kexec-purgatory.c
- endif
 endif
 
 ###

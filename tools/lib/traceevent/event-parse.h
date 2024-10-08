@@ -105,10 +105,10 @@ typedef int (*pevent_event_handler_func)(struct trace_seq *s,
 					 void *context);
 
 typedef int (*pevent_plugin_load_func)(struct pevent *pevent);
-typedef int (*pevent_plugin_unload_func)(void);
+typedef int (*pevent_plugin_unload_func)(struct pevent *pevent);
 
-struct plugin_option {
-	struct plugin_option		*next;
+struct pevent_plugin_option {
+	struct pevent_plugin_option	*next;
 	void				*handle;
 	char				*file;
 	char				*name;
@@ -130,12 +130,12 @@ struct plugin_option {
  * PEVENT_PLUGIN_UNLOADER:  (optional)
  *   The function called just before unloading
  *
- *   int PEVENT_PLUGIN_UNLOADER(void)
+ *   int PEVENT_PLUGIN_UNLOADER(struct pevent *pevent)
  *
  * PEVENT_PLUGIN_OPTIONS:  (optional)
  *   Plugin options that can be set before loading
  *
- *   struct plugin_option PEVENT_PLUGIN_OPTIONS[] = {
+ *   struct pevent_plugin_option PEVENT_PLUGIN_OPTIONS[] = {
  *	{
  *		.name = "option-name",
  *		.plugin_alias = "overide-file-name", (optional)
@@ -419,8 +419,19 @@ enum pevent_errno {
 
 struct plugin_list;
 
+#define INVALID_PLUGIN_LIST_OPTION	((char **)((unsigned long)-1))
+
 struct plugin_list *traceevent_load_plugins(struct pevent *pevent);
-void traceevent_unload_plugins(struct plugin_list *plugin_list);
+void traceevent_unload_plugins(struct plugin_list *plugin_list,
+			       struct pevent *pevent);
+char **traceevent_plugin_list_options(void);
+void traceevent_plugin_free_options_list(char **list);
+int traceevent_plugin_add_options(const char *name,
+				  struct pevent_plugin_option *options);
+void traceevent_plugin_remove_options(struct pevent_plugin_option *options);
+void traceevent_print_plugins(struct trace_seq *s,
+			      const char *prefix, const char *suffix,
+			      const struct plugin_list *list);
 
 struct cmdline;
 struct cmdline_list;
@@ -589,7 +600,7 @@ int pevent_register_comm(struct pevent *pevent, const char *comm, int pid);
 void pevent_register_trace_clock(struct pevent *pevent, char *trace_clock);
 int pevent_register_function(struct pevent *pevent, char *name,
 			     unsigned long long addr, char *mod);
-int pevent_register_print_string(struct pevent *pevent, char *fmt,
+int pevent_register_print_string(struct pevent *pevent, const char *fmt,
 				 unsigned long long addr);
 int pevent_pid_is_registered(struct pevent *pevent, int pid);
 

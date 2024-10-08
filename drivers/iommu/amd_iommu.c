@@ -322,7 +322,7 @@ static u16 get_alias(struct device *dev)
 	if (pci_alias == devid &&
 	    PCI_BUS_NUM(ivrs_alias) == pdev->bus->number) {
 		pdev->dev_flags |= PCI_DEV_FLAGS_DMA_ALIAS_DEVFN;
-		pdev->dma_alias_devfn = ivrs_alias & 0xff;
+		pdev->pci_dev_rh->dma_alias_devfn = ivrs_alias & 0xff;
 		pr_info("AMD-Vi: Added PCI DMA alias %02x.%d for %s\n",
 			PCI_SLOT(ivrs_alias), PCI_FUNC(ivrs_alias),
 			dev_name(dev));
@@ -368,6 +368,9 @@ static int iommu_init_device(struct device *dev)
 
 	dev->archdata.iommu = dev_data;
 
+	iommu_device_link(amd_iommu_rlookup_table[dev_data->devid]->iommu_dev,
+			  dev);
+
 	return 0;
 }
 
@@ -391,6 +394,9 @@ static void iommu_uninit_device(struct device *dev)
 
 	if (!dev_data)
 		return;
+
+	iommu_device_unlink(amd_iommu_rlookup_table[dev_data->devid]->iommu_dev,
+			    dev);
 
 	iommu_group_remove_device(dev);
 

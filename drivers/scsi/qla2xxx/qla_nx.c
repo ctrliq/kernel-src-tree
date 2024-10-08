@@ -1,6 +1,6 @@
 /*
  * QLogic Fibre Channel HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2014 QLogic Corporation
  *
  * See LICENSE.qla2xxx for copyright and licensing details.
  */
@@ -2234,8 +2234,8 @@ qla82xx_poll(int irq, void *dev_id)
 			    stat * 0xff);
 			break;
 		}
+		WRT_REG_DWORD(&reg->host_int, 0);
 	}
-	WRT_REG_DWORD(&reg->host_int, 0);
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 }
 
@@ -2998,7 +2998,7 @@ qla8xxx_dev_failed_handler(scsi_qla_host_t *vha)
 		qla82xx_clear_drv_active(ha);
 		qla82xx_idc_unlock(ha);
 	} else if (IS_QLA8044(ha)) {
-		qla8044_clear_drv_active(vha);
+		qla8044_clear_drv_active(ha);
 		qla8044_idc_unlock(ha);
 	}
 
@@ -4484,4 +4484,21 @@ qla82xx_beacon_off(struct scsi_qla_host *vha)
 exit:
 	qla82xx_idc_unlock(ha);
 	return rval;
+}
+
+void
+qla82xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
+{
+	struct qla_hw_data *ha = vha->hw;
+
+	if (!ha->allow_cna_fw_dump)
+		return;
+
+	scsi_block_requests(vha->host);
+	ha->flags.isp82xx_no_md_cap = 1;
+	qla82xx_idc_lock(ha);
+	qla82xx_set_reset_owner(vha);
+	qla82xx_idc_unlock(ha);
+	qla2x00_wait_for_chip_reset(vha);
+	scsi_unblock_requests(vha->host);
 }

@@ -321,7 +321,7 @@ static void kvm_guest_apic_eoi_write(u32 reg, u32 val)
 	apic_write(APIC_EOI, APIC_EOI_ACK);
 }
 
-void __cpuinit kvm_guest_cpu_init(void)
+void kvm_guest_cpu_init(void)
 {
 	if (!kvm_para_available())
 		return;
@@ -422,7 +422,7 @@ static void __init kvm_smp_prepare_boot_cpu(void)
 	kvm_spinlock_init();
 }
 
-static void __cpuinit kvm_guest_cpu_online(void *dummy)
+static void kvm_guest_cpu_online(void *dummy)
 {
 	kvm_guest_cpu_init();
 }
@@ -436,8 +436,8 @@ static void kvm_guest_cpu_offline(void *dummy)
 	apf_task_wake_all();
 }
 
-static int __cpuinit kvm_cpu_notify(struct notifier_block *self,
-				    unsigned long action, void *hcpu)
+static int kvm_cpu_notify(struct notifier_block *self, unsigned long action,
+			  void *hcpu)
 {
 	int cpu = (unsigned long)hcpu;
 	switch (action) {
@@ -456,7 +456,7 @@ static int __cpuinit kvm_cpu_notify(struct notifier_block *self,
 	return NOTIFY_OK;
 }
 
-static struct notifier_block __cpuinitdata kvm_cpu_notifier = {
+static struct notifier_block kvm_cpu_notifier = {
         .notifier_call  = kvm_cpu_notify,
 };
 #endif

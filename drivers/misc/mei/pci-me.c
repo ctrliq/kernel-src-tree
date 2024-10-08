@@ -234,7 +234,7 @@ static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	mutex_unlock(&mei_mutex);
 
-	pr_debug("initialization successful.\n");
+	dev_dbg(&pdev->dev, "initialization successful.\n");
 
 	return 0;
 
@@ -290,7 +290,6 @@ static void mei_me_remove(struct pci_dev *pdev)
 
 	free_irq(pdev->irq, dev);
 	pci_disable_msi(pdev);
-	pci_set_drvdata(pdev, NULL);
 
 	if (hw->mem_addr)
 		pci_iounmap(pdev, hw->mem_addr);

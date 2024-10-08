@@ -214,7 +214,6 @@ struct iser_data_buf {
 /* fwd declarations */
 struct iser_device;
 struct iser_cq_desc;
-struct iscsi_iser_conn;
 struct iscsi_iser_task;
 struct iscsi_endpoint;
 
@@ -319,7 +318,7 @@ struct fast_reg_descriptor {
 };
 
 struct iser_conn {
-	struct iscsi_iser_conn       *iser_conn; /* iser conn for upcalls  */
+	struct iscsi_conn	     *iscsi_conn;
 	struct iscsi_endpoint	     *ep;
 	enum iser_ib_conn_state	     state;	    /* rdma connection state   */
 	atomic_t		     refcount;
@@ -327,13 +326,17 @@ struct iser_conn {
 	struct iser_device           *device;       /* device context          */
 	struct rdma_cm_id            *cma_id;       /* CMA ID		       */
 	struct ib_qp	             *qp;           /* QP 		       */
-	wait_queue_head_t	     wait;          /* waitq for conn/disconn  */
 	unsigned		     qp_max_recv_dtos; /* num of rx buffers */
 	unsigned		     qp_max_recv_dtos_mask; /* above minus 1 */
 	unsigned		     min_posted_rx; /* qp_max_recv_dtos >> 2 */
 	int                          post_recv_buf_count; /* posted rx count  */
 	atomic_t                     post_send_buf_count; /* posted tx count   */
 	char 			     name[ISER_OBJECT_NAME_SIZE];
+	struct work_struct	     release_work;
+	struct completion	     stop_completion;
+	struct mutex		     state_mutex;
+	struct completion	     flush_completion;
+	struct completion	     up_completion;
 	struct list_head	     conn_list;       /* entry in ig conn list */
 
 	char  			     *login_buf;
@@ -358,14 +361,9 @@ struct iser_conn {
 	};
 };
 
-struct iscsi_iser_conn {
-	struct iscsi_conn            *iscsi_conn;/* ptr to iscsi conn */
-	struct iser_conn             *ib_conn;   /* iSER IB conn      */
-};
-
 struct iscsi_iser_task {
 	struct iser_tx_desc          desc;
-	struct iscsi_iser_conn	     *iser_conn;
+	struct iser_conn	     *ib_conn;
 	enum iser_task_status 	     status;
 	struct scsi_cmnd	     *sc;
 	int                          command_sent;  /* set if command  sent  */
@@ -423,11 +421,11 @@ void iscsi_iser_recv(struct iscsi_conn *conn,
 
 void iser_conn_init(struct iser_conn *ib_conn);
 
-void iser_conn_get(struct iser_conn *ib_conn);
-
-int iser_conn_put(struct iser_conn *ib_conn, int destroy_cma_id_allowed);
+void iser_conn_release(struct iser_conn *ib_conn);
 
 void iser_conn_terminate(struct iser_conn *ib_conn);
+
+void iser_release_work(struct work_struct *work);
 
 void iser_rcv_completion(struct iser_rx_desc *desc,
 			 unsigned long    dto_xfer_len,

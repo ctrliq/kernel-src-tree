@@ -135,6 +135,13 @@ static void ceph_invalidatepage(struct page *page, unsigned long offset)
 	struct ceph_snap_context *snapc = page_snap_context(page);
 
 	inode = page->mapping->host;
+	ci = ceph_inode(inode);
+
+	if (offset != 0) {
+		dout("%p invalidatepage %p idx %lu partial dirty page %lu\n",
+		     inode, page, page->index, offset);
+		return;
+	}
 
 	/*
 	 * We can get non-dirty pages here due to races between
@@ -144,21 +151,15 @@ static void ceph_invalidatepage(struct page *page, unsigned long offset)
 	if (!PageDirty(page))
 		pr_err("%p invalidatepage %p page not dirty\n", inode, page);
 
-	if (offset == 0)
-		ClearPageChecked(page);
+	ClearPageChecked(page);
 
-	ci = ceph_inode(inode);
-	if (offset == 0) {
-		dout("%p invalidatepage %p idx %lu full dirty page %lu\n",
-		     inode, page, page->index, offset);
-		ceph_put_wrbuffer_cap_refs(ci, 1, snapc);
-		ceph_put_snap_context(snapc);
-		page->private = 0;
-		ClearPagePrivate(page);
-	} else {
-		dout("%p invalidatepage %p idx %lu partial dirty page\n",
-		     inode, page, page->index);
-	}
+	dout("%p invalidatepage %p idx %lu full dirty page\n",
+	     inode, page, page->index);
+
+	ceph_put_wrbuffer_cap_refs(ci, 1, snapc);
+	ceph_put_snap_context(snapc);
+	page->private = 0;
+	ClearPagePrivate(page);
 }
 
 /* just a sanity check */
@@ -194,16 +195,15 @@ static int readpage_nounlock(struct file *filp, struct page *page)
 	if (err < 0) {
 		SetPageError(page);
 		goto out;
-	} else {
-		if (err < PAGE_CACHE_SIZE) {
-		/* zero fill remainder of page */
-			zero_user_segment(page, err, PAGE_CACHE_SIZE);
-		} else {
-			flush_dcache_page(page);
-		}
 	}
-	SetPageUptodate(page);
 
+	if (err < PAGE_CACHE_SIZE)
+		/* zero fill remainder of page */
+		zero_user_segment(page, err, PAGE_CACHE_SIZE);
+	else
+		flush_dcache_page(page);
+
+	SetPageUptodate(page);
 out:
 	return err < 0 ? err : 0;
 }
@@ -237,6 +237,8 @@ static void finish_read(struct ceph_osd_request *req, struct ceph_msg *msg)
 	for (i = 0; i < num_pages; i++) {
 		struct page *page = osd_data->pages[i];
 
+		if (rc < 0)
+			goto unlock;
 		if (bytes < (int)PAGE_CACHE_SIZE) {
 			/* zero (remainder of) page */
 			int s = bytes < 0 ? 0 : bytes;
@@ -246,6 +248,7 @@ static void finish_read(struct ceph_osd_request *req, struct ceph_msg *msg)
 		     page->index);
 		flush_dcache_page(page);
 		SetPageUptodate(page);
+unlock:
 		unlock_page(page);
 		page_cache_release(page);
 		bytes -= PAGE_CACHE_SIZE;
@@ -1045,12 +1048,6 @@ retry_locked:
 	/* past end of file? */
 	i_size = inode->i_size;   /* caller holds i_mutex */
 
-	if (i_size + len > inode->i_sb->s_maxbytes) {
-		/* file is too big */
-		r = -EINVAL;
-		goto fail;
-	}
-
 	if (page_off >= i_size ||
 	    (pos_in_page == 0 && (pos+len) >= i_size &&
 	     end_in_page - pos_in_page != PAGE_CACHE_SIZE)) {
@@ -1068,9 +1065,6 @@ retry_locked:
 	if (r < 0)
 		goto fail_nosnap;
 	goto retry_locked;
-
-fail:
-	up_read(&mdsc->snap_rwsem);
 fail_nosnap:
 	unlock_page(page);
 	return r;

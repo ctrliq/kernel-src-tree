@@ -9,6 +9,8 @@
 #include <linux/scatterlist.h>
 #include <scsi/scsi_device.h>
 
+#include <linux/rh_kabi.h>
+
 struct Scsi_Host;
 struct scsi_device;
 struct scsi_driver;
@@ -138,10 +140,10 @@ struct scsi_cmnd {
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserve ABI.
 	 */
-	void			(*rh_reserved1)(void);
-	void			(*rh_reserved2)(void);
-	void			(*rh_reserved3)(void);
-	void			(*rh_reserved4)(void);
+	RH_KABI_RESERVE_P(1)
+	RH_KABI_RESERVE_P(2)
+	RH_KABI_RESERVE_P(3)
+	RH_KABI_RESERVE_P(4)
 
 };
 

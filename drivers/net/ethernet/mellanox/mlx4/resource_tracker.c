@@ -2627,12 +2627,34 @@ int mlx4_QUERY_MPT_wrapper(struct mlx4_dev *dev, int slave,
 	if (err)
 		return err;
 
-	if (mpt->com.from_state != RES_MPT_HW) {
+	if (mpt->com.from_state == RES_MPT_MAPPED) {
+		/* In order to allow rereg in SRIOV, we need to alter the MPT entry. To do
+		 * that, the VF must read the MPT. But since the MPT entry memory is not
+		 * in the VF's virtual memory space, it must use QUERY_MPT to obtain the
+		 * entry contents. To guarantee that the MPT cannot be changed, the driver
+		 * must perform HW2SW_MPT before this query and return the MPT entry to HW
+		 * ownership fofollowing the change. The change here allows the VF to
+		 * perform QUERY_MPT also when the entry is in SW ownership.
+		 */
+		struct mlx4_mpt_entry *mpt_entry = mlx4_table_find(
+					&mlx4_priv(dev)->mr_table.dmpt_table,
+					mpt->key, NULL);
+
+		if (NULL == mpt_entry || NULL == outbox->buf) {
+			err = -EINVAL;
+			goto out;
+		}
+
+		memcpy(outbox->buf, mpt_entry, sizeof(*mpt_entry));
+
+		err = 0;
+	} else if (mpt->com.from_state == RES_MPT_HW) {
+		err = mlx4_DMA_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
+	} else {
 		err = -EBUSY;
 		goto out;
 	}
 
-	err = mlx4_DMA_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
 
 out:
 	put_res(dev, slave, id, RES_MPT);
@@ -2875,10 +2897,12 @@ static int get_containing_mtt(struct mlx4_dev *dev, int slave, int start,
 }
 
 static int verify_qp_parameters(struct mlx4_dev *dev,
+				struct mlx4_vhcr *vhcr,
 				struct mlx4_cmd_mailbox *inbox,
 				enum qp_transition transition, u8 slave)
 {
 	u32			qp_type;
+	u32			qpn;
 	struct mlx4_qp_context	*qp_ctx;
 	enum mlx4_qp_optpar	optpar;
 	int port;
@@ -2921,8 +2945,22 @@ static int verify_qp_parameters(struct mlx4_dev *dev,
 		default:
 			break;
 		}
-
 		break;
+
+	case MLX4_QP_ST_MLX:
+		qpn = vhcr->in_modifier & 0x7fffff;
+		port = (qp_ctx->pri_path.sched_queue >> 6 & 1) + 1;
+		if (transition == QP_TRANS_INIT2RTR &&
+		    slave != mlx4_master_func_num(dev) &&
+		    mlx4_is_qp_reserved(dev, qpn) &&
+		    !mlx4_vf_smi_enabled(dev, slave, port)) {
+			/* only enabled VFs may create MLX proxy QPs */
+			mlx4_err(dev, "%s: unprivileged slave %d attempting to create an MLX proxy special QP on port %d\n",
+				 __func__, slave, port);
+			return -EPERM;
+		}
+		break;
+
 	default:
 		break;
 	}
@@ -3502,7 +3540,7 @@ int mlx4_INIT2RTR_QP_wrapper(struct mlx4_dev *dev, int slave,
 	err = adjust_qp_sched_queue(dev, slave, qpc, inbox);
 	if (err)
 		return err;
-	err = verify_qp_parameters(dev, inbox, QP_TRANS_INIT2RTR, slave);
+	err = verify_qp_parameters(dev, vhcr, inbox, QP_TRANS_INIT2RTR, slave);
 	if (err)
 		return err;
 
@@ -3556,7 +3594,7 @@ int mlx4_RTR2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
 	err = adjust_qp_sched_queue(dev, slave, context, inbox);
 	if (err)
 		return err;
-	err = verify_qp_parameters(dev, inbox, QP_TRANS_RTR2RTS, slave);
+	err = verify_qp_parameters(dev, vhcr, inbox, QP_TRANS_RTR2RTS, slave);
 	if (err)
 		return err;
 
@@ -3578,7 +3616,7 @@ int mlx4_RTS2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
 	err = adjust_qp_sched_queue(dev, slave, context, inbox);
 	if (err)
 		return err;
-	err = verify_qp_parameters(dev, inbox, QP_TRANS_RTS2RTS, slave);
+	err = verify_qp_parameters(dev, vhcr, inbox, QP_TRANS_RTS2RTS, slave);
 	if (err)
 		return err;
 
@@ -3615,7 +3653,7 @@ int mlx4_SQD2SQD_QP_wrapper(struct mlx4_dev *dev, int slave,
 	err = adjust_qp_sched_queue(dev, slave, context, inbox);
 	if (err)
 		return err;
-	err = verify_qp_parameters(dev, inbox, QP_TRANS_SQD2SQD, slave);
+	err = verify_qp_parameters(dev, vhcr, inbox, QP_TRANS_SQD2SQD, slave);
 	if (err)
 		return err;
 
@@ -3637,7 +3675,7 @@ int mlx4_SQD2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
 	err = adjust_qp_sched_queue(dev, slave, context, inbox);
 	if (err)
 		return err;
-	err = verify_qp_parameters(dev, inbox, QP_TRANS_SQD2RTS, slave);
+	err = verify_qp_parameters(dev, vhcr, inbox, QP_TRANS_SQD2RTS, slave);
 	if (err)
 		return err;
 

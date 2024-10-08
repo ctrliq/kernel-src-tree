@@ -163,6 +163,7 @@ void __init free_bootmem_cpumask_var(cpumask_var_t mask)
 {
 	free_bootmem(__pa(mask), cpumask_size());
 }
+#endif
 
 /**
  * cpumask_set_cpu_local_first - set i'th cpu with local numa cpu's first
@@ -226,5 +227,3 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(cpumask_set_cpu_local_first);
-
-#endif

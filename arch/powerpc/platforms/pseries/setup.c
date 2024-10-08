@@ -476,7 +476,7 @@ static void __init pSeries_setup_arch(void)
 	if (!strncmp(cur_cpu_spec->platform, "power6", 6))
 		mark_hardware_unsupported("Power6 Processor");
 
-	panic_timeout = 10;
+	set_arch_panic_timeout(10, ARCH_PANIC_TIMEOUT);
 
 	/* Discover PIC type and setup ppc_md accordingly */
 	pseries_discover_pic();

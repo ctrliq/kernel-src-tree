@@ -58,7 +58,7 @@ static void mei_wd_set_start_timeout(struct mei_device *dev, u16 timeout)
  *
  * @dev: the device structure
  *
- * returns -ENENT if wd client cannot be found
+ * returns -ENOTTY if wd client cannot be found
  *         -EIO if write has failed
  *         0 on success
  */
@@ -78,7 +78,7 @@ int mei_wd_host_init(struct mei_device *dev)
 	id = mei_me_cl_by_uuid(dev, &mei_wd_guid);
 	if (id < 0) {
 		dev_info(&dev->pdev->dev, "wd: failed to find the client\n");
-		return id;
+		return -ENOTTY;
 	}
 
 	cl->me_client_id = dev->me_clients[id].client_id;
@@ -116,13 +116,16 @@ int mei_wd_host_init(struct mei_device *dev)
  * returns 0 if success,
  *	-EIO when message send fails
  *	-EINVAL when invalid message is to be sent
+ *	-ENODEV on flow control failure
  */
 int mei_wd_send(struct mei_device *dev)
 {
+	struct mei_cl *cl = &dev->wd_cl;
 	struct mei_msg_hdr hdr;
+	int ret;
 
-	hdr.host_addr = dev->wd_cl.host_client_id;
-	hdr.me_addr = dev->wd_cl.me_client_id;
+	hdr.host_addr = cl->host_client_id;
+	hdr.me_addr = cl->me_client_id;
 	hdr.msg_complete = 1;
 	hdr.reserved = 0;
 	hdr.internal = 0;
@@ -131,10 +134,24 @@ int mei_wd_send(struct mei_device *dev)
 		hdr.length = MEI_WD_START_MSG_SIZE;
 	else if (!memcmp(dev->wd_data, mei_stop_wd_params, MEI_WD_HDR_SIZE))
 		hdr.length = MEI_WD_STOP_MSG_SIZE;
-	else
+	else {
+		dev_err(&dev->pdev->dev, "wd: invalid message is to be sent, aborting\n");
 		return -EINVAL;
+	}
 
-	return mei_write_message(dev, &hdr, dev->wd_data);
+	ret = mei_write_message(dev, &hdr, dev->wd_data);
+	if (ret) {
+		dev_err(&dev->pdev->dev, "wd: write message failed\n");
+		return ret;
+	}
+
+	ret = mei_cl_flow_ctrl_reduce(cl);
+	if (ret) {
+		dev_err(&dev->pdev->dev, "wd: flow_ctrl_reduce failed.\n");
+		return ret;
+	}
+
+	return 0;
 }
 
 /**
@@ -143,9 +160,11 @@ int mei_wd_send(struct mei_device *dev)
  * @dev: the device structure
  * @preserve: indicate if to keep the timeout value
  *
- * returns 0 if success,
- *	-EIO when message send fails
+ * returns 0 if success
+ * on error:
+ *	-EIO    when message send fails
  *	-EINVAL when invalid message is to be sent
+ *	-ETIME  on message timeout
  */
 int mei_wd_stop(struct mei_device *dev)
 {
@@ -161,19 +180,12 @@ int mei_wd_stop(struct mei_device *dev)
 
 	ret = mei_cl_flow_ctrl_creds(&dev->wd_cl);
 	if (ret < 0)
-		goto out;
+		goto err;
 
 	if (ret && mei_hbuf_acquire(dev)) {
-		ret = 0;
-
-		if (!mei_wd_send(dev)) {
-			ret = mei_cl_flow_ctrl_reduce(&dev->wd_cl);
-			if (ret)
-				goto out;
-		} else {
-			dev_err(&dev->pdev->dev, "wd: send stop failed\n");
-		}
-
+		ret = mei_wd_send(dev);
+		if (ret)
+			goto err;
 		dev->wd_pending = false;
 	} else {
 		dev->wd_pending = true;
@@ -181,21 +193,21 @@ int mei_wd_stop(struct mei_device *dev)
 
 	mutex_unlock(&dev->device_lock);
 
-	ret = wait_event_interruptible_timeout(dev->wait_stop_wd,
-					dev->wd_state == MEI_WD_IDLE,
-					msecs_to_jiffies(MEI_WD_STOP_TIMEOUT));
+	ret = wait_event_timeout(dev->wait_stop_wd,
+				dev->wd_state == MEI_WD_IDLE,
+				msecs_to_jiffies(MEI_WD_STOP_TIMEOUT));
 	mutex_lock(&dev->device_lock);
-	if (dev->wd_state == MEI_WD_IDLE) {
-		dev_dbg(&dev->pdev->dev, "wd: stop completed ret=%d.\n", ret);
-		ret = 0;
-	} else {
-		if (!ret)
-			ret = -ETIMEDOUT;
+	if (dev->wd_state != MEI_WD_IDLE) {
+		/* timeout */
+		ret = -ETIME;
 		dev_warn(&dev->pdev->dev,
 			"wd: stop failed to complete ret=%d.\n", ret);
+		goto err;
 	}
-
-out:
+	dev_dbg(&dev->pdev->dev, "wd: stop completed after %u msec\n",
+			MEI_WD_STOP_TIMEOUT - jiffies_to_msecs(ret));
+	return 0;
+err:
 	return ret;
 }
 
@@ -294,18 +306,10 @@ static int mei_wd_ops_ping(struct watchdog_device *wd_dev)
 
 		dev_dbg(&dev->pdev->dev, "wd: sending ping\n");
 
-		if (mei_wd_send(dev)) {
-			dev_err(&dev->pdev->dev, "wd: send failed.\n");
-			ret = -EIO;
+		ret = mei_wd_send(dev);
+		if (ret)
 			goto end;
-		}
-
-		if (mei_cl_flow_ctrl_reduce(&dev->wd_cl)) {
-			dev_err(&dev->pdev->dev, "wd: mei_cl_flow_ctrl_reduce() failed.\n");
-			ret = -EIO;
-			goto end;
-		}
-
+		dev->wd_pending = false;
 	} else {
 		dev->wd_pending = true;
 	}
@@ -375,7 +379,6 @@ static struct watchdog_device amt_wd_dev = {
 
 int mei_watchdog_register(struct mei_device *dev)
 {
-
 	int ret;
 
 	/* unlock to perserve correct locking order */

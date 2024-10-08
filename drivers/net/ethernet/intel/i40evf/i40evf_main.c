@@ -36,7 +36,7 @@ char i40evf_driver_name[] = "i40evf";
 static const char i40evf_driver_string[] =
 	"Intel(R) XL710/X710 Virtual Function Network Driver";
 
-#define DRV_VERSION "0.9.12"
+#define DRV_VERSION "1.0.1"
 const char i40evf_driver_version[] = DRV_VERSION;
 static const char i40evf_copyright[] =
 	"Copyright (c) 2013 - 2014 Intel Corporation.";
@@ -49,8 +49,8 @@ static const char i40evf_copyright[] =
  * { Vendor ID, Device ID, SubVendor ID, SubDevice ID,
  *   Class, Class Mask, private data (not used) }
  */
-static DEFINE_PCI_DEVICE_TABLE(i40evf_pci_tbl) = {
-	{PCI_VDEVICE(INTEL, I40E_VF_DEVICE_ID), 0},
+static const struct pci_device_id i40evf_pci_tbl[] = {
+	{PCI_VDEVICE(INTEL, I40E_DEV_ID_VF), 0},
 	/* required last entry */
 	{0, }
 };
@@ -697,7 +697,6 @@ static void i40evf_del_vlan(struct i40evf_adapter *adapter, u16 vlan)
 		f->remove = true;
 		adapter->aq_required |= I40EVF_FLAG_AQ_DEL_VLAN_FILTER;
 	}
-	return;
 }
 
 /**
@@ -1141,9 +1140,6 @@ static int i40evf_set_interrupt_capability(struct i40evf_adapter *adapter)
 	v_budget = min_t(int, pairs, (int)(num_online_cpus() * 2)) + NONQ_VECS;
 	v_budget = min_t(int, v_budget, (int)adapter->vf_res->max_vectors);
 
-	/* A failure in MSI-X entry allocation isn't fatal, but it does
-	 * mean we disable MSI-X capabilities of the adapter.
-	 */
 	adapter->msix_entries = kcalloc(v_budget,
 					sizeof(struct msix_entry), GFP_KERNEL);
 	if (!adapter->msix_entries) {
@@ -1236,8 +1232,6 @@ void i40evf_reset_interrupt_capability(struct i40evf_adapter *adapter)
 	pci_disable_msix(adapter->pdev);
 	kfree(adapter->msix_entries);
 	adapter->msix_entries = NULL;
-
-	return;
 }
 
 /**
@@ -2120,6 +2114,7 @@ static void i40evf_init_task(struct work_struct *work)
 			    NETIF_F_IPV6_CSUM |
 			    NETIF_F_TSO |
 			    NETIF_F_TSO6 |
+			    NETIF_F_RXCSUM |
 			    NETIF_F_GRO;
 
 	if (adapter->vf_res->vf_offload_flags
@@ -2129,6 +2124,10 @@ static void i40evf_init_task(struct work_struct *work)
 				    NETIF_F_HW_VLAN_CTAG_RX |
 				    NETIF_F_HW_VLAN_CTAG_FILTER;
 	}
+
+	/* copy netdev features into list of user selectable features */
+	netdev->hw_features |= netdev->features;
+	netdev->hw_features &= ~NETIF_F_RXCSUM;
 
 	if (!is_valid_ether_addr(adapter->hw.mac.addr)) {
 		dev_info(&pdev->dev, "Invalid MAC address %pM, using random\n",
@@ -2216,7 +2215,6 @@ err:
 		return; /* do not reschedule */
 	}
 	schedule_delayed_work(&adapter->init_task, HZ * 3);
-	return;
 }
 
 /**

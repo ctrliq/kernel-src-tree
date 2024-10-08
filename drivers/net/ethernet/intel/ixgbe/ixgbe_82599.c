@@ -1,7 +1,7 @@
 /*******************************************************************************
 
   Intel 10 Gigabit PCI Express Linux driver
-  Copyright(c) 1999 - 2013 Intel Corporation.
+  Copyright(c) 1999 - 2014 Intel Corporation.
 
   This program is free software; you can redistribute it and/or modify it
   under the terms and conditions of the GNU General Public License,
@@ -64,8 +64,10 @@ static s32 ixgbe_read_i2c_byte_82599(struct ixgbe_hw *hw, u8 byte_offset,
 				     u8 dev_addr, u8 *data);
 static s32 ixgbe_write_i2c_byte_82599(struct ixgbe_hw *hw, u8 byte_offset,
 				      u8 dev_addr, u8 data);
+static s32 ixgbe_reset_pipeline_82599(struct ixgbe_hw *hw);
+static bool ixgbe_verify_lesm_fw_enabled_82599(struct ixgbe_hw *hw);
 
-static bool ixgbe_mng_enabled(struct ixgbe_hw *hw)
+bool ixgbe_mng_enabled(struct ixgbe_hw *hw)
 {
 	u32 fwsm, manc, factps;
 
@@ -92,7 +94,7 @@ static void ixgbe_init_mac_link_ops_82599(struct ixgbe_hw *hw)
 	 * and MNG not enabled
 	 */
 	if ((mac->ops.get_media_type(hw) == ixgbe_media_type_fiber) &&
-	    !hw->mng_fw_enabled) {
+	    !ixgbe_mng_enabled(hw)) {
 		mac->ops.disable_tx_laser =
 		                       &ixgbe_disable_tx_laser_multispeed_fiber;
 		mac->ops.enable_tx_laser =
@@ -123,7 +125,6 @@ static s32 ixgbe_setup_sfp_modules_82599(struct ixgbe_hw *hw)
 {
 	s32 ret_val = 0;
 	u16 list_offset, data_offset, data_value;
-	bool got_lock = false;
 
 	if (hw->phy.sfp_type != ixgbe_sfp_type_unknown) {
 		ixgbe_init_mac_link_ops_82599(hw);
@@ -161,30 +162,10 @@ static s32 ixgbe_setup_sfp_modules_82599(struct ixgbe_hw *hw)
 		usleep_range(hw->eeprom.semaphore_delay * 1000,
 			     hw->eeprom.semaphore_delay * 2000);
 
-		/* Need SW/FW semaphore around AUTOC writes if LESM on,
-		 * likewise reset_pipeline requires lock as it also writes
-		 * AUTOC.
-		 */
-		if (ixgbe_verify_lesm_fw_enabled_82599(hw)) {
-			ret_val = hw->mac.ops.acquire_swfw_sync(hw,
-							IXGBE_GSSR_MAC_CSR_SM);
-			if (ret_val)
-				goto setup_sfp_out;
-
-			got_lock = true;
-		}
-
 		/* Restart DSP and set SFI mode */
-		IXGBE_WRITE_REG(hw, IXGBE_AUTOC, ((hw->mac.orig_autoc) |
-				IXGBE_AUTOC_LMS_10G_SERIAL));
-		hw->mac.cached_autoc = IXGBE_READ_REG(hw, IXGBE_AUTOC);
-		ret_val = ixgbe_reset_pipeline_82599(hw);
-
-		if (got_lock) {
-			hw->mac.ops.release_swfw_sync(hw,
-						      IXGBE_GSSR_MAC_CSR_SM);
-			got_lock = false;
-		}
+		ret_val = hw->mac.ops.prot_autoc_write(hw,
+			hw->mac.orig_autoc | IXGBE_AUTOC_LMS_10G_SERIAL,
+			false);
 
 		if (ret_val) {
 			hw_dbg(hw, " sfp module setup not complete\n");
@@ -206,6 +187,81 @@ setup_sfp_err:
 		     hw->eeprom.semaphore_delay * 2000);
 	hw_err(hw, "eeprom read at offset %d failed\n", data_offset);
 	return IXGBE_ERR_SFP_SETUP_NOT_COMPLETE;
+}
+
+/**
+ *  prot_autoc_read_82599 - Hides MAC differences needed for AUTOC read
+ *  @hw: pointer to hardware structure
+ *  @locked: Return the if we locked for this read.
+ *  @reg_val: Value we read from AUTOC
+ *
+ *  For this part (82599) we need to wrap read-modify-writes with a possible
+ *  FW/SW lock.  It is assumed this lock will be freed with the next
+ *  prot_autoc_write_82599().  Note, that locked can only be true in cases
+ *  where this function doesn't return an error.
+ **/
+static s32 prot_autoc_read_82599(struct ixgbe_hw *hw, bool *locked,
+				 u32 *reg_val)
+{
+	s32 ret_val;
+
+	*locked = false;
+	/* If LESM is on then we need to hold the SW/FW semaphore. */
+	if (ixgbe_verify_lesm_fw_enabled_82599(hw)) {
+		ret_val = hw->mac.ops.acquire_swfw_sync(hw,
+					IXGBE_GSSR_MAC_CSR_SM);
+		if (ret_val)
+			return IXGBE_ERR_SWFW_SYNC;
+
+		*locked = true;
+	}
+
+	*reg_val = IXGBE_READ_REG(hw, IXGBE_AUTOC);
+	return 0;
+}
+
+/**
+ * prot_autoc_write_82599 - Hides MAC differences needed for AUTOC write
+ * @hw: pointer to hardware structure
+ * @reg_val: value to write to AUTOC
+ * @locked: bool to indicate whether the SW/FW lock was already taken by
+ *	     previous proc_autoc_read_82599.
+ *
+ * This part (82599) may need to hold a the SW/FW lock around all writes to
+ * AUTOC. Likewise after a write we need to do a pipeline reset.
+ **/
+static s32 prot_autoc_write_82599(struct ixgbe_hw *hw, u32 autoc, bool locked)
+{
+	s32 ret_val = 0;
+
+	/* Blocked by MNG FW so bail */
+	if (ixgbe_check_reset_blocked(hw))
+		goto out;
+
+	/* We only need to get the lock if:
+	 *  - We didn't do it already (in the read part of a read-modify-write)
+	 *  - LESM is enabled.
+	 */
+	if (!locked && ixgbe_verify_lesm_fw_enabled_82599(hw)) {
+		ret_val = hw->mac.ops.acquire_swfw_sync(hw,
+					IXGBE_GSSR_MAC_CSR_SM);
+		if (ret_val)
+			return IXGBE_ERR_SWFW_SYNC;
+
+		locked = true;
+	}
+
+	IXGBE_WRITE_REG(hw, IXGBE_AUTOC, autoc);
+	ret_val = ixgbe_reset_pipeline_82599(hw);
+
+out:
+	/* Free the SW/FW semaphore as we either grabbed it here or
+	 * already had it when this function was called.
+	 */
+	if (locked)
+		hw->mac.ops.release_swfw_sync(hw, IXGBE_GSSR_MAC_CSR_SM);
+
+	return ret_val;
 }
 
 static s32 ixgbe_get_invariants_82599(struct ixgbe_hw *hw)
@@ -552,6 +608,10 @@ static void ixgbe_disable_tx_laser_multispeed_fiber(struct ixgbe_hw *hw)
 {
 	u32 esdp_reg = IXGBE_READ_REG(hw, IXGBE_ESDP);
 
+	/* Blocked by MNG FW so bail */
+	if (ixgbe_check_reset_blocked(hw))
+		return;
+
 	/* Disable tx laser; allow 100us to go dark per spec */
 	esdp_reg |= IXGBE_ESDP_SDP3;
 	IXGBE_WRITE_REG(hw, IXGBE_ESDP, esdp_reg);
@@ -592,80 +652,15 @@ static void ixgbe_enable_tx_laser_multispeed_fiber(struct ixgbe_hw *hw)
  **/
 static void ixgbe_flap_tx_laser_multispeed_fiber(struct ixgbe_hw *hw)
 {
+	/* Blocked by MNG FW so bail */
+	if (ixgbe_check_reset_blocked(hw))
+		return;
+
 	if (hw->mac.autotry_restart) {
 		ixgbe_disable_tx_laser_multispeed_fiber(hw);
 		ixgbe_enable_tx_laser_multispeed_fiber(hw);
 		hw->mac.autotry_restart = false;
 	}
-}
-
-/**
- *  ixgbe_set_fiber_fixed_speed - Set module link speed for fixed fiber
- *  @hw: pointer to hardware structure
- *  @speed: link speed to set
- *
- *  We set the module speed differently for fixed fiber.  For other
- *  multi-speed devices we don't have an error value so here if we
- *  detect an error we just log it and exit.
- */
-static void ixgbe_set_fiber_fixed_speed(struct ixgbe_hw *hw,
-					ixgbe_link_speed speed)
-{
-	s32 status;
-	u8 rs, eeprom_data;
-
-	switch (speed) {
-	case IXGBE_LINK_SPEED_10GB_FULL:
-		/* one bit mask same as setting on */
-		rs = IXGBE_SFF_SOFT_RS_SELECT_10G;
-		break;
-	case IXGBE_LINK_SPEED_1GB_FULL:
-		rs = IXGBE_SFF_SOFT_RS_SELECT_1G;
-		break;
-	default:
-		hw_dbg(hw, "Invalid fixed module speed\n");
-		return;
-	}
-
-	/* Set RS0 */
-	status = hw->phy.ops.read_i2c_byte(hw, IXGBE_SFF_SFF_8472_OSCB,
-					   IXGBE_I2C_EEPROM_DEV_ADDR2,
-					   &eeprom_data);
-	if (status) {
-		hw_dbg(hw, "Failed to read Rx Rate Select RS0\n");
-		goto out;
-	}
-
-	eeprom_data = (eeprom_data & ~IXGBE_SFF_SOFT_RS_SELECT_MASK) & rs;
-
-	status = hw->phy.ops.write_i2c_byte(hw, IXGBE_SFF_SFF_8472_OSCB,
-					    IXGBE_I2C_EEPROM_DEV_ADDR2,
-					    eeprom_data);
-	if (status) {
-		hw_dbg(hw, "Failed to write Rx Rate Select RS0\n");
-		goto out;
-	}
-
-	/* Set RS1 */
-	status = hw->phy.ops.read_i2c_byte(hw, IXGBE_SFF_SFF_8472_ESCB,
-					   IXGBE_I2C_EEPROM_DEV_ADDR2,
-					   &eeprom_data);
-	if (status) {
-		hw_dbg(hw, "Failed to read Rx Rate Select RS1\n");
-		goto out;
-	}
-
-	eeprom_data = (eeprom_data & ~IXGBE_SFF_SOFT_RS_SELECT_MASK) & rs;
-
-	status = hw->phy.ops.write_i2c_byte(hw, IXGBE_SFF_SFF_8472_ESCB,
-					    IXGBE_I2C_EEPROM_DEV_ADDR2,
-					    eeprom_data);
-	if (status) {
-		hw_dbg(hw, "Failed to write Rx Rate Select RS1\n");
-		goto out;
-	}
-out:
-	return;
 }
 
 /**
@@ -778,10 +773,6 @@ static s32 ixgbe_setup_mac_link_multispeed_fiber(struct ixgbe_hw *hw,
 
 		/* Set the module link speed */
 		switch (hw->phy.media_type) {
-		case ixgbe_media_type_fiber_fixed:
-			ixgbe_set_fiber_fixed_speed(hw,
-						IXGBE_LINK_SPEED_1GB_FULL);
-			break;
 		case ixgbe_media_type_fiber:
 			esdp_reg &= ~IXGBE_ESDP_SDP5;
 			esdp_reg |= IXGBE_ESDP_SDP5_DIR;
@@ -967,16 +958,19 @@ static s32 ixgbe_setup_mac_link_82599(struct ixgbe_hw *hw,
 				      ixgbe_link_speed speed,
 				      bool autoneg_wait_to_complete)
 {
-	s32 status = 0;
-	u32 autoc, pma_pmd_1g, link_mode, start_autoc;
-	u32 autoc2 = IXGBE_READ_REG(hw, IXGBE_AUTOC2);
-	u32 orig_autoc = 0;
-	u32 pma_pmd_10g_serial = autoc2 & IXGBE_AUTOC2_10G_SERIAL_PMA_PMD_MASK;
-	u32 links_reg;
-	u32 i;
-	ixgbe_link_speed link_capabilities = IXGBE_LINK_SPEED_UNKNOWN;
-	bool got_lock = false;
 	bool autoneg = false;
+	s32 status = 0;
+	u32 pma_pmd_1g, link_mode, links_reg, i;
+	u32 autoc2 = IXGBE_READ_REG(hw, IXGBE_AUTOC2);
+	u32 pma_pmd_10g_serial = autoc2 & IXGBE_AUTOC2_10G_SERIAL_PMA_PMD_MASK;
+	ixgbe_link_speed link_capabilities = IXGBE_LINK_SPEED_UNKNOWN;
+
+	/* holds the value of AUTOC register at this current point in time */
+	u32 current_autoc = IXGBE_READ_REG(hw, IXGBE_AUTOC);
+	/* holds the cached value of AUTOC register */
+	u32 orig_autoc = 0;
+	/* temporary variable used for comparison purposes */
+	u32 autoc = current_autoc;
 
 	/* Check to see if speed passed in is supported. */
 	status = hw->mac.ops.get_link_capabilities(hw, &link_capabilities,
@@ -993,12 +987,10 @@ static s32 ixgbe_setup_mac_link_82599(struct ixgbe_hw *hw,
 
 	/* Use stored value (EEPROM defaults) of AUTOC to find KR/KX4 support*/
 	if (hw->mac.orig_link_settings_stored)
-		autoc = hw->mac.orig_autoc;
+		orig_autoc = hw->mac.orig_autoc;
 	else
-		autoc = IXGBE_READ_REG(hw, IXGBE_AUTOC);
+		orig_autoc = autoc;
 
-	orig_autoc = autoc;
-	start_autoc = hw->mac.cached_autoc;
 	link_mode = autoc & IXGBE_AUTOC_LMS_MASK;
 	pma_pmd_1g = autoc & IXGBE_AUTOC_1G_PMA_PMD_MASK;
 
@@ -1038,28 +1030,11 @@ static s32 ixgbe_setup_mac_link_82599(struct ixgbe_hw *hw,
 		}
 	}
 
-	if (autoc != start_autoc) {
-		/* Need SW/FW semaphore around AUTOC writes if LESM is on,
-		 * likewise reset_pipeline requires us to hold this lock as
-		 * it also writes to AUTOC.
-		 */
-		if (ixgbe_verify_lesm_fw_enabled_82599(hw)) {
-			status = hw->mac.ops.acquire_swfw_sync(hw,
-							IXGBE_GSSR_MAC_CSR_SM);
-			if (status != 0)
-				goto out;
-
-			got_lock = true;
-		}
-
+	if (autoc != current_autoc) {
 		/* Restart link */
-		IXGBE_WRITE_REG(hw, IXGBE_AUTOC, autoc);
-		hw->mac.cached_autoc = autoc;
-		ixgbe_reset_pipeline_82599(hw);
-
-		if (got_lock)
-			hw->mac.ops.release_swfw_sync(hw,
-						      IXGBE_GSSR_MAC_CSR_SM);
+		status = hw->mac.ops.prot_autoc_write(hw, autoc, false);
+		if (status)
+			goto out;
 
 		/* Only poll for autoneg to complete if specified to do so */
 		if (autoneg_wait_to_complete) {
@@ -1125,7 +1100,7 @@ static s32 ixgbe_reset_hw_82599(struct ixgbe_hw *hw)
 {
 	ixgbe_link_speed link_speed;
 	s32 status;
-	u32 ctrl, i, autoc2;
+	u32 ctrl, i, autoc, autoc2;
 	u32 curr_lms;
 	bool link_up = false;
 
@@ -1159,11 +1134,7 @@ static s32 ixgbe_reset_hw_82599(struct ixgbe_hw *hw)
 		hw->phy.ops.reset(hw);
 
 	/* remember AUTOC from before we reset */
-	if (hw->mac.cached_autoc)
-		curr_lms = hw->mac.cached_autoc & IXGBE_AUTOC_LMS_MASK;
-	else
-		curr_lms = IXGBE_READ_REG(hw, IXGBE_AUTOC) &
-			   IXGBE_AUTOC_LMS_MASK;
+	curr_lms = IXGBE_READ_REG(hw, IXGBE_AUTOC) & IXGBE_AUTOC_LMS_MASK;
 
 mac_reset_top:
 	/*
@@ -1213,7 +1184,7 @@ mac_reset_top:
 	 * stored off yet.  Otherwise restore the stored original
 	 * values since the reset operation sets back to defaults.
 	 */
-	hw->mac.cached_autoc = IXGBE_READ_REG(hw, IXGBE_AUTOC);
+	autoc = IXGBE_READ_REG(hw, IXGBE_AUTOC);
 	autoc2 = IXGBE_READ_REG(hw, IXGBE_AUTOC2);
 
 	/* Enable link if disabled in NVM */
@@ -1224,7 +1195,7 @@ mac_reset_top:
 	}
 
 	if (hw->mac.orig_link_settings_stored == false) {
-		hw->mac.orig_autoc = hw->mac.cached_autoc;
+		hw->mac.orig_autoc = autoc;
 		hw->mac.orig_autoc2 = autoc2;
 		hw->mac.orig_link_settings_stored = true;
 	} else {
@@ -1235,34 +1206,18 @@ mac_reset_top:
 		 * Likewise if we support WoL we don't want change the
 		 * LMS state either.
 		 */
-		if ((hw->phy.multispeed_fiber && hw->mng_fw_enabled) ||
+		if ((hw->phy.multispeed_fiber && ixgbe_mng_enabled(hw)) ||
 		    hw->wol_enabled)
 			hw->mac.orig_autoc =
 				(hw->mac.orig_autoc & ~IXGBE_AUTOC_LMS_MASK) |
 				curr_lms;
 
-		if (hw->mac.cached_autoc != hw->mac.orig_autoc) {
-			/* Need SW/FW semaphore around AUTOC writes if LESM is
-			 * on, likewise reset_pipeline requires us to hold
-			 * this lock as it also writes to AUTOC.
-			 */
-			bool got_lock = false;
-			if (ixgbe_verify_lesm_fw_enabled_82599(hw)) {
-				status = hw->mac.ops.acquire_swfw_sync(hw,
-							IXGBE_GSSR_MAC_CSR_SM);
-				if (status)
-					goto reset_hw_out;
-
-				got_lock = true;
-			}
-
-			IXGBE_WRITE_REG(hw, IXGBE_AUTOC, hw->mac.orig_autoc);
-			hw->mac.cached_autoc = hw->mac.orig_autoc;
-			ixgbe_reset_pipeline_82599(hw);
-
-			if (got_lock)
-				hw->mac.ops.release_swfw_sync(hw,
-							IXGBE_GSSR_MAC_CSR_SM);
+		if (autoc != hw->mac.orig_autoc) {
+			status = hw->mac.ops.prot_autoc_write(hw,
+							hw->mac.orig_autoc,
+							false);
+			if (status)
+				goto reset_hw_out;
 		}
 
 		if ((autoc2 & IXGBE_AUTOC2_UPPER_MASK) !=
@@ -2239,7 +2194,7 @@ fw_version_err:
  *  Returns true if the LESM FW module is present and enabled. Otherwise
  *  returns false. Smart Speed must be disabled if LESM FW module is enabled.
  **/
-bool ixgbe_verify_lesm_fw_enabled_82599(struct ixgbe_hw *hw)
+static bool ixgbe_verify_lesm_fw_enabled_82599(struct ixgbe_hw *hw)
 {
 	bool lesm_enabled = false;
 	u16 fw_offset, fw_lesm_param_offset, fw_lesm_state;
@@ -2345,7 +2300,7 @@ static s32 ixgbe_read_eeprom_82599(struct ixgbe_hw *hw,
  * full pipeline reset.  Note - We must hold the SW/FW semaphore before writing
  * to AUTOC, so this function assumes the semaphore is held.
  **/
-s32 ixgbe_reset_pipeline_82599(struct ixgbe_hw *hw)
+static s32 ixgbe_reset_pipeline_82599(struct ixgbe_hw *hw)
 {
 	s32 ret_val;
 	u32 anlp1_reg = 0;
@@ -2359,7 +2314,7 @@ s32 ixgbe_reset_pipeline_82599(struct ixgbe_hw *hw)
 		IXGBE_WRITE_FLUSH(hw);
 	}
 
-	autoc_reg = hw->mac.cached_autoc;
+	autoc_reg = IXGBE_READ_REG(hw, IXGBE_AUTOC);
 	autoc_reg |= IXGBE_AUTOC_AN_RESTART;
 
 	/* Write AUTOC register with toggled LMS[2] bit and Restart_AN */
@@ -2545,7 +2500,8 @@ static struct ixgbe_mac_operations mac_ops_82599 = {
 	.release_swfw_sync      = &ixgbe_release_swfw_sync,
 	.get_thermal_sensor_data = &ixgbe_get_thermal_sensor_data_generic,
 	.init_thermal_sensor_thresh = &ixgbe_init_thermal_sensor_thresh_generic,
-	.mng_fw_enabled		= &ixgbe_mng_enabled,
+	.prot_autoc_read	= &prot_autoc_read_82599,
+	.prot_autoc_write	= &prot_autoc_write_82599,
 };
 
 static struct ixgbe_eeprom_operations eeprom_ops_82599 = {

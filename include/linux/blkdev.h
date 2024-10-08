@@ -24,6 +24,8 @@
 
 #include <asm/scatterlist.h>
 
+#include <linux/rh_kabi.h>
+
 struct module;
 struct scsi_ioctl_command;
 
@@ -90,19 +92,24 @@ enum rq_cmd_type_bits {
 #define BLK_MAX_CDB	16
 
 /*
- * try to put the fields that are referenced together in the same cacheline.
- * if you modify this structure, be sure to check block/blk-core.c:blk_rq_init()
- * as well!
+ * Try to put the fields that are referenced together in the same cacheline.
+ *
+ * If you modify this structure, make sure to update blk_rq_init() and
+ * especially blk_mq_rq_ctx_init() to take care of the added fields.
  */
 struct request {
+#ifdef __GENKSYMS__
 	union {
 		struct list_head queuelist;
 		struct llist_node ll_list;
 	};
+#else
+	struct list_head queuelist;
+#endif
 	union {
 		struct call_single_data csd;
-		struct work_struct requeue_work;
-		unsigned long fifo_time;
+		RH_KABI_REPLACE(struct work_struct mq_flush_work,
+			        unsigned long fifo_time)
 	};
 
 	struct request_queue *q;
@@ -121,7 +128,22 @@ struct request {
 	struct bio *bio;
 	struct bio *biotail;
 
+#ifdef __GENKSYMS__
 	struct hlist_node hash;	/* merge hash */
+#else
+	/*
+	 * The hash is used inside the scheduler, and killed once the
+	 * request reaches the dispatch list. The ipi_list is only used
+	 * to queue the request for softirq completion, which is long
+	 * after the request has been unhashed (and even removed from
+	 * the dispatch list).
+	 */
+	union {
+		struct hlist_node hash;	/* merge hash */
+		struct list_head ipi_list;
+	};
+#endif
+
 	/*
 	 * The rb_node is only used inside the io scheduler, requests
 	 * are pruned when moved to the dispatch queue. So let the
@@ -227,6 +249,7 @@ struct blk_queue_ctx;
 typedef void (request_fn_proc) (struct request_queue *q);
 typedef void (make_request_fn) (struct request_queue *q, struct bio *bio);
 typedef int (prep_rq_fn) (struct request_queue *, struct request *);
+typedef void (unprep_rq_fn) (struct request_queue *, struct request *);
 
 struct bio_vec;
 struct bvec_merge_data {
@@ -272,7 +295,6 @@ struct queue_limits {
 	unsigned long		seg_boundary_mask;
 
 	unsigned int		max_hw_sectors;
-	unsigned int		chunk_sectors;
 	unsigned int		max_sectors;
 	unsigned int		max_segment_size;
 	unsigned int		physical_block_size;
@@ -299,10 +321,9 @@ struct queue_limits {
 	 * allow extending the structure while preserving ABI.
 	 */
 	unsigned int		xcopy_reserved;
-
-	unsigned long		rh_reserved1;
-	unsigned long		rh_reserved2;
-	unsigned long		rh_reserved3;
+	RH_KABI_USE(1, unsigned int chunk_sectors)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
 };
 
 struct request_queue {
@@ -337,7 +358,9 @@ struct request_queue {
 	unsigned int		*mq_map;
 
 	/* sw queues */
-	struct blk_mq_ctx __percpu	*queue_ctx;
+	RH_KABI_REPLACE_P(struct blk_mq_ctx	*queue_ctx,
+		          struct blk_mq_ctx __percpu	*queue_ctx)
+
 	unsigned int		nr_queues;
 
 	/* hw dispatch queues */
@@ -467,7 +490,6 @@ struct request_queue {
 	struct mutex		sysfs_lock;
 
 	int			bypass_depth;
-	int			mq_freeze_depth;
 
 #if defined(CONFIG_BLK_DEV_BSG)
 	bsg_job_fn		*bsg_job_fn;
@@ -483,6 +505,16 @@ struct request_queue {
 	wait_queue_head_t	mq_freeze_wq;
 	struct percpu_counter	mq_usage_counter;
 	struct list_head	all_q_node;
+
+	RH_KABI_EXTEND(unprep_rq_fn		*unprep_rq_fn)
+
+	RH_KABI_EXTEND(struct blk_mq_tag_set	*tag_set)
+	RH_KABI_EXTEND(struct list_head		tag_set_list)
+
+	RH_KABI_EXTEND(struct list_head		requeue_list)
+	RH_KABI_EXTEND(spinlock_t			requeue_lock)
+	RH_KABI_EXTEND(struct work_struct		requeue_work)
+	RH_KABI_EXTEND(int				mq_freeze_depth)
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
@@ -507,6 +539,8 @@ struct request_queue {
 #define QUEUE_FLAG_DEAD        19	/* queue tear-down finished */
 #define QUEUE_FLAG_INIT_DONE   20	/* queue is initialized */
 #define QUEUE_FLAG_UNPRIV_SGIO 21	/* SG_IO free for unprivileged users */
+#define QUEUE_FLAG_NO_SG_MERGE 22	/* don't attempt to merge SG segments*/
+#define QUEUE_FLAG_SG_GAPS     23	/* queue doesn't support SG gaps */
 
 #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
 				 (1 << QUEUE_FLAG_STACKABLE)	|	\
@@ -1031,6 +1065,7 @@ extern int blk_queue_dma_drain(struct request_queue *q,
 extern void blk_queue_lld_busy(struct request_queue *q, lld_busy_fn *fn);
 extern void blk_queue_segment_boundary(struct request_queue *, unsigned long);
 extern void blk_queue_prep_rq(struct request_queue *, prep_rq_fn *pfn);
+extern void blk_queue_unprep_rq(struct request_queue *, unprep_rq_fn *ufn);
 extern void blk_queue_merge_bvec(struct request_queue *, merge_bvec_fn *);
 extern void blk_queue_dma_alignment(struct request_queue *, int);
 extern void blk_queue_update_dma_alignment(struct request_queue *, int);

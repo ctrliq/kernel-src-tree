@@ -232,7 +232,12 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 
 	/* Return error if mode is not supported */
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
-		     FALLOC_FL_COLLAPSE_RANGE))
+		     FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE))
+		return -EOPNOTSUPP;
+
+	/* Punch hole and zero range are mutually exclusive */
+	if ((mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) ==
+	    (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
 		return -EOPNOTSUPP;
 
 	/* Punch hole must have keep size set */
@@ -260,6 +265,13 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -EPERM;
 
 	/*
+	 * We can not allow to do any fallocate operation on an active
+	 * swapfile
+	 */
+	if (IS_SWAPFILE(inode))
+		ret = -ETXTBSY;
+
+	/*
 	 * Revalidate the write permissions, in case security policy has
 	 * changed since the files were opened.
 	 */
@@ -280,14 +292,6 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	/* Check for wrap through zero too */
 	if (((offset + len) > inode->i_sb->s_maxbytes) || ((offset + len) < 0))
 		return -EFBIG;
-
-	/*
-	 * There is no need to overlap collapse range with EOF, in which case
-	 * it is effectively a truncate operation
-	 */
-	if ((mode & FALLOC_FL_COLLAPSE_RANGE) &&
-	    (offset + len >= i_size_read(inode)))
-		return -EINVAL;
 
 	if (!file->f_op->fallocate)
 		return -EOPNOTSUPP;
@@ -718,7 +722,6 @@ static int do_dentry_open(struct file *f,
 	}
 
 	f->f_mapping = inode->i_mapping;
-	file_sb_list_add(f, inode->i_sb);
 
 	if (unlikely(f->f_mode & FMODE_PATH)) {
 		f->f_op = &empty_fops;
@@ -753,7 +756,6 @@ static int do_dentry_open(struct file *f,
 
 cleanup_all:
 	fops_put(f->f_op);
-	file_sb_list_del(f);
 	if (f->f_mode & FMODE_WRITE) {
 		put_write_access(inode);
 		if (!special_file(inode->i_mode)) {
@@ -847,8 +849,7 @@ struct file *dentry_open(const struct path *path, int flags,
 	f = get_empty_filp();
 	if (!IS_ERR(f)) {
 		f->f_flags = flags;
-		f->f_path = *path;
-		error = do_dentry_open(f, NULL, cred);
+		error = vfs_open(path, f, cred);
 		if (!error) {
 			/* from now on we need fput() to dispose of f */
 			error = open_check_o_direct(f);
@@ -864,6 +865,27 @@ struct file *dentry_open(const struct path *path, int flags,
 	return f;
 }
 EXPORT_SYMBOL(dentry_open);
+
+/**
+ * vfs_open - open the file at the given path
+ * @path: path to open
+ * @filp: newly allocated file with f_flag initialized
+ * @cred: credentials to use
+ */
+int vfs_open(const struct path *path, struct file *filp,
+	     const struct cred *cred)
+{
+	struct inode *inode = path->dentry->d_inode;
+	iop_dentry_open_t dentry_open = get_dentry_open_iop(inode);
+
+	if (dentry_open)
+		return dentry_open(path->dentry, filp, cred);
+	else {
+		filp->f_path = *path;
+		return do_dentry_open(filp, NULL, cred);
+	}
+}
+EXPORT_SYMBOL(vfs_open);
 
 static inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
 {

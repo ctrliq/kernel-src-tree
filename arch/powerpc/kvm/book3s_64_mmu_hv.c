@@ -249,13 +249,16 @@ int kvmppc_mmu_hv_init(void)
 	return 0;
 }
 
-void kvmppc_mmu_destroy(struct kvm_vcpu *vcpu)
-{
-}
-
 static void kvmppc_mmu_book3s_64_hv_reset_msr(struct kvm_vcpu *vcpu)
 {
-	kvmppc_set_msr(vcpu, MSR_SF | MSR_ME);
+	unsigned long msr = vcpu->arch.intr_msr;
+
+	/* If transactional, change to suspend mode on IRQ delivery */
+	if (MSR_TM_TRANSACTIONAL(vcpu->arch.shregs.msr))
+		msr |= MSR_TS_S;
+	else
+		msr |= vcpu->arch.shregs.msr & MSR_TS_MASK;
+	kvmppc_set_msr(vcpu, msr);
 }
 
 /*
@@ -555,7 +558,7 @@ static int kvmppc_hv_emulate_mmio(struct kvm_run *run, struct kvm_vcpu *vcpu,
 	 * we just return and retry the instruction.
 	 */
 
-	if (instruction_is_store(vcpu->arch.last_inst) != !!is_store)
+	if (instruction_is_store(kvmppc_get_last_inst(vcpu)) != !!is_store)
 		return RESUME_GUEST;
 
 	/*
@@ -916,21 +919,22 @@ static int kvm_unmap_rmapp(struct kvm *kvm, unsigned long *rmapp,
 	return 0;
 }
 
-int kvm_unmap_hva(struct kvm *kvm, unsigned long hva)
+int kvm_unmap_hva_hv(struct kvm *kvm, unsigned long hva)
 {
 	if (kvm->arch.using_mmu_notifiers)
 		kvm_handle_hva(kvm, hva, kvm_unmap_rmapp);
 	return 0;
 }
 
-int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end)
+int kvm_unmap_hva_range_hv(struct kvm *kvm, unsigned long start, unsigned long end)
 {
 	if (kvm->arch.using_mmu_notifiers)
 		kvm_handle_hva_range(kvm, start, end, kvm_unmap_rmapp);
 	return 0;
 }
 
-void kvmppc_core_flush_memslot(struct kvm *kvm, struct kvm_memory_slot *memslot)
+void kvmppc_core_flush_memslot_hv(struct kvm *kvm,
+				  struct kvm_memory_slot *memslot)
 {
 	unsigned long *rmapp;
 	unsigned long gfn;
@@ -1004,7 +1008,7 @@ static int kvm_age_rmapp(struct kvm *kvm, unsigned long *rmapp,
 	return ret;
 }
 
-int kvm_age_hva(struct kvm *kvm, unsigned long hva)
+int kvm_age_hva_hv(struct kvm *kvm, unsigned long hva)
 {
 	if (!kvm->arch.using_mmu_notifiers)
 		return 0;
@@ -1042,14 +1046,14 @@ static int kvm_test_age_rmapp(struct kvm *kvm, unsigned long *rmapp,
 	return ret;
 }
 
-int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
+int kvm_test_age_hva_hv(struct kvm *kvm, unsigned long hva)
 {
 	if (!kvm->arch.using_mmu_notifiers)
 		return 0;
 	return kvm_handle_hva(kvm, hva, kvm_test_age_rmapp);
 }
 
-void kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte)
+void kvm_set_spte_hva_hv(struct kvm *kvm, unsigned long hva, pte_t pte)
 {
 	if (!kvm->arch.using_mmu_notifiers)
 		return;
@@ -1630,7 +1634,7 @@ int kvm_vm_ioctl_get_htab_fd(struct kvm *kvm, struct kvm_get_htab_fd *ghf)
 	ctx->first_pass = 1;
 
 	rwflag = (ghf->flags & KVM_GET_HTAB_WRITE) ? O_WRONLY : O_RDONLY;
-	ret = anon_inode_getfd("kvm-htab", &kvm_htab_fops, ctx, rwflag);
+	ret = anon_inode_getfd("kvm-htab", &kvm_htab_fops, ctx, rwflag | O_CLOEXEC);
 	if (ret < 0) {
 		kvm_put_kvm(kvm);
 		return ret;

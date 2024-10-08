@@ -1,7 +1,8 @@
 /*
  *  Linux MegaRAID driver for SAS based RAID controllers
  *
- *  Copyright (c) 2003-2012  LSI Corporation.
+ *  Copyright (c) 2003-2013  LSI Corporation
+ *  Copyright (c) 2013-2014  Avago Technologies
  *
  *  This program is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU General Public License
@@ -14,22 +15,20 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
- *  FILE: megaraid_sas_base.c
- *  Version : 06.700.06.00-rc1
- *
- *  Authors: LSI Corporation
+ *  Authors: Avago Technologies
  *           Sreenivas Bagalkote
  *           Sumant Patro
  *           Bo Yang
- *           Adam Radford <linuxraid@lsi.com>
+ *           Adam Radford
+ *           Kashyap Desai <kashyap.desai@avagotech.com>
+ *           Sumit Saxena <sumit.saxena@avagotech.com>
  *
- *  Send feedback to: <megaraidlinux@lsi.com>
+ *  Send feedback to: megaraidlinux.pdl@avagotech.com
  *
- *  Mail to: LSI Corporation, 1621 Barber Lane, Milpitas, CA 95035
- *     ATTN: Linuxraid
+ *  Mail to: Avago Technologies, 350 West Trimble Road, Building 90,
+ *  San Jose, California 95131
  */
 
 #include <linux/kernel.h>
@@ -6480,16 +6479,6 @@ static ssize_t megasas_sysfs_show_version(struct device_driver *dd, char *buf)
 static DRIVER_ATTR(version, S_IRUGO, megasas_sysfs_show_version, NULL);
 
 static ssize_t
-megasas_sysfs_show_release_date(struct device_driver *dd, char *buf)
-{
-	return snprintf(buf, strlen(MEGASAS_RELDATE) + 2, "%s\n",
-			MEGASAS_RELDATE);
-}
-
-static DRIVER_ATTR(release_date, S_IRUGO, megasas_sysfs_show_release_date,
-		   NULL);
-
-static ssize_t
 megasas_sysfs_show_support_poll_for_event(struct device_driver *dd, char *buf)
 {
 	return sprintf(buf, "%u\n", support_poll_for_event);
@@ -6792,8 +6781,7 @@ static int __init megasas_init(void)
 	/*
 	 * Announce driver version and other information
 	 */
-	printk(KERN_INFO "megasas: %s %s\n", MEGASAS_VERSION,
-	       MEGASAS_EXT_VERSION);
+	pr_info("megasas: %s\n", MEGASAS_VERSION);
 
 	spin_lock_init(&poll_aen_lock);
 
@@ -6828,10 +6816,6 @@ static int __init megasas_init(void)
 				  &driver_attr_version);
 	if (rval)
 		goto err_dcf_attr_ver;
-	rval = driver_create_file(&megasas_pci_driver.driver,
-				  &driver_attr_release_date);
-	if (rval)
-		goto err_dcf_rel_date;
 
 	rval = driver_create_file(&megasas_pci_driver.driver,
 				&driver_attr_support_poll_for_event);
@@ -6855,12 +6839,7 @@ err_dcf_support_device_change:
 err_dcf_dbg_lvl:
 	driver_remove_file(&megasas_pci_driver.driver,
 			&driver_attr_support_poll_for_event);
-
 err_dcf_support_poll_for_event:
-	driver_remove_file(&megasas_pci_driver.driver,
-			   &driver_attr_release_date);
-
-err_dcf_rel_date:
 	driver_remove_file(&megasas_pci_driver.driver, &driver_attr_version);
 err_dcf_attr_ver:
 	pci_unregister_driver(&megasas_pci_driver);
@@ -6880,8 +6859,6 @@ static void __exit megasas_exit(void)
 			&driver_attr_support_poll_for_event);
 	driver_remove_file(&megasas_pci_driver.driver,
 			&driver_attr_support_device_change);
-	driver_remove_file(&megasas_pci_driver.driver,
-			   &driver_attr_release_date);
 	driver_remove_file(&megasas_pci_driver.driver, &driver_attr_version);
 
 	pci_unregister_driver(&megasas_pci_driver);

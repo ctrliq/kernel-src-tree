@@ -654,6 +654,9 @@ int kvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
 	if (!guest_cpuid_has_smep(vcpu) && (cr4 & X86_CR4_SMEP))
 		return 1;
 
+	if (!guest_cpuid_has_smap(vcpu) && (cr4 & X86_CR4_SMAP))
+		return 1;
+
 	if (!guest_cpuid_has_fsgsbase(vcpu) && (cr4 & X86_CR4_FSGSBASE))
 		return 1;
 
@@ -682,6 +685,9 @@ int kvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
 	    (!(cr4 & X86_CR4_PCIDE) && (old_cr4 & X86_CR4_PCIDE)))
 		kvm_mmu_reset_context(vcpu);
 
+	if ((cr4 ^ old_cr4) & X86_CR4_SMAP)
+		update_permission_bitmask(vcpu, vcpu->arch.walk_mmu, false);
+
 	if ((cr4 ^ old_cr4) & X86_CR4_OSXSAVE)
 		kvm_update_cpuid(vcpu);
 
@@ -706,7 +712,7 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 
 	vcpu->arch.cr3 = cr3;
 	__set_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->arch.regs_avail);
-	vcpu->arch.mmu.new_cr3(vcpu);
+	kvm_mmu_new_cr3(vcpu);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(kvm_set_cr3);
@@ -2637,6 +2643,7 @@ int kvm_dev_ioctl_check_extension(long ext)
 	case KVM_CAP_MMU_SHADOW_CACHE_CONTROL:
 	case KVM_CAP_SET_TSS_ADDR:
 	case KVM_CAP_EXT_CPUID:
+	case KVM_CAP_EXT_EMUL_CPUID:
 	case KVM_CAP_CLOCKSOURCE:
 	case KVM_CAP_PIT:
 	case KVM_CAP_NOP_IO_DELAY:
@@ -2647,6 +2654,7 @@ int kvm_dev_ioctl_check_extension(long ext)
 	case KVM_CAP_IRQ_INJECT_STATUS:
 	case KVM_CAP_IRQFD:
 	case KVM_CAP_IOEVENTFD:
+	case KVM_CAP_IOEVENTFD_NO_LENGTH:
 	case KVM_CAP_PIT2:
 	case KVM_CAP_PIT_STATE2:
 	case KVM_CAP_SET_IDENTITY_MAP_ADDR:
@@ -2748,15 +2756,17 @@ long kvm_arch_dev_ioctl(struct file *filp,
 		r = 0;
 		break;
 	}
-	case KVM_GET_SUPPORTED_CPUID: {
+	case KVM_GET_SUPPORTED_CPUID:
+	case KVM_GET_EMULATED_CPUID: {
 		struct kvm_cpuid2 __user *cpuid_arg = argp;
 		struct kvm_cpuid2 cpuid;
 
 		r = -EFAULT;
 		if (copy_from_user(&cpuid, cpuid_arg, sizeof cpuid))
 			goto out;
-		r = kvm_dev_ioctl_get_supported_cpuid(&cpuid,
-						      cpuid_arg->entries);
+
+		r = kvm_dev_ioctl_get_cpuid(&cpuid, cpuid_arg->entries,
+					    ioctl);
 		if (r)
 			goto out;
 
@@ -4170,7 +4180,8 @@ static int vcpu_mmio_gva_to_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
 		| (write ? PFERR_WRITE_MASK : 0);
 
 	if (vcpu_match_mmio_gva(vcpu, gva)
-	    && !permission_fault(vcpu->arch.walk_mmu, vcpu->arch.access, access)) {
+	    && !permission_fault(vcpu, vcpu->arch.walk_mmu,
+				 vcpu->arch.access, access)) {
 		*gpa = vcpu->arch.mmio_gfn << PAGE_SHIFT |
 					(gva & (PAGE_SIZE - 1));
 		trace_vcpu_match_mmio(gva, *gpa, write, false);
@@ -5361,7 +5372,7 @@ static int kvmclock_cpufreq_notifier(struct notifier_block *nb, unsigned long va
 
 	smp_call_function_single(freq->cpu, tsc_khz_changed, freq, 1);
 
-	raw_spin_lock(&kvm_lock);
+	spin_lock(&kvm_lock);
 	list_for_each_entry(kvm, &vm_list, vm_list) {
 		kvm_for_each_vcpu(i, vcpu, kvm) {
 			if (vcpu->cpu != freq->cpu)
@@ -5371,7 +5382,7 @@ static int kvmclock_cpufreq_notifier(struct notifier_block *nb, unsigned long va
 				send_ipi = 1;
 		}
 	}
-	raw_spin_unlock(&kvm_lock);
+	spin_unlock(&kvm_lock);
 
 	if (freq->old < freq->new && send_ipi) {
 		/*
@@ -5529,12 +5540,12 @@ static void pvclock_gtod_update_fn(struct work_struct *work)
 	struct kvm_vcpu *vcpu;
 	int i;
 
-	raw_spin_lock(&kvm_lock);
+	spin_lock(&kvm_lock);
 	list_for_each_entry(kvm, &vm_list, vm_list)
 		kvm_for_each_vcpu(i, vcpu, kvm)
 			set_bit(KVM_REQ_MASTERCLOCK_UPDATE, &vcpu->requests);
 	atomic_set(&kvm_guest_has_master_clock, 0);
-	raw_spin_unlock(&kvm_lock);
+	spin_unlock(&kvm_lock);
 }
 
 static DECLARE_WORK(pvclock_gtod_work, pvclock_gtod_update_fn);
@@ -5845,8 +5856,10 @@ static void update_cr8_intercept(struct kvm_vcpu *vcpu)
 	kvm_x86_ops->update_cr8_intercept(vcpu, tpr, max_irr);
 }
 
-static void inject_pending_event(struct kvm_vcpu *vcpu)
+static int inject_pending_event(struct kvm_vcpu *vcpu, bool req_int_win)
 {
+	int r;
+
 	/* try to reinject previous events if any */
 	if (vcpu->arch.exception.pending) {
 		trace_kvm_inj_exception(vcpu->arch.exception.nr,
@@ -5856,17 +5869,23 @@ static void inject_pending_event(struct kvm_vcpu *vcpu)
 					  vcpu->arch.exception.has_error_code,
 					  vcpu->arch.exception.error_code,
 					  vcpu->arch.exception.reinject);
-		return;
+		return 0;
 	}
 
 	if (vcpu->arch.nmi_injected) {
 		kvm_x86_ops->set_nmi(vcpu);
-		return;
+		return 0;
 	}
 
 	if (vcpu->arch.interrupt.pending) {
 		kvm_x86_ops->set_irq(vcpu);
-		return;
+		return 0;
+	}
+
+	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events) {
+		r = kvm_x86_ops->check_nested_events(vcpu, req_int_win);
+		if (r != 0)
+			return r;
 	}
 
 	/* try to inject new event if pending */
@@ -5878,11 +5897,12 @@ static void inject_pending_event(struct kvm_vcpu *vcpu)
 		}
 	} else if (kvm_cpu_has_injectable_intr(vcpu)) {
 		/*
-		 * Because interrupts can be injected asynchronously, we are
-		 * calling check_nested_events again here to avoid a race condition.
-		 * See https://lkml.org/lkml/2014/7/2/60 for discussion about this
-		 * proposal and current concerns.  Perhaps we should be setting
-		 * KVM_REQ_EVENT only on certain events and not unconditionally?
+		 * TODO/FIXME: We are calling check_nested_events again
+		 * here to avoid a race condition. We should really be
+		 * setting KVM_REQ_EVENT only on certain events
+		 * and not unconditionally.
+		 * See https://lkml.org/lkml/2014/7/2/60 for discussion
+		 * about this proposal and current concerns
 		 */
 		if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events) {
 			r = kvm_x86_ops->check_nested_events(vcpu, req_int_win);
@@ -5895,6 +5915,7 @@ static void inject_pending_event(struct kvm_vcpu *vcpu)
 			kvm_x86_ops->set_irq(vcpu);
 		}
 	}
+	return 0;
 }
 
 static void process_nmi(struct kvm_vcpu *vcpu)
@@ -5928,6 +5949,38 @@ static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
 	kvm_ioapic_scan_entry(vcpu, eoi_exit_bitmap, tmr);
 	kvm_x86_ops->load_eoi_exitmap(vcpu, eoi_exit_bitmap);
 	kvm_apic_update_tmr(vcpu, tmr);
+}
+
+void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
+{
+	struct page *page = NULL;
+
+	if (!irqchip_in_kernel(vcpu->kvm))
+		return;
+
+	if (!kvm_x86_ops->set_apic_access_page_addr)
+		return;
+
+	page = gfn_to_page(vcpu->kvm, APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT);
+	kvm_x86_ops->set_apic_access_page_addr(vcpu, page_to_phys(page));
+
+	/*
+	 * Do not pin apic access page in memory, the MMU notifier
+	 * will call us again if it is migrated or swapped out.
+	 */
+	put_page(page);
+}
+EXPORT_SYMBOL_GPL(kvm_vcpu_reload_apic_access_page);
+
+void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
+					   unsigned long address)
+{
+	/*
+	 * The physical address of apic access page is stored in the VMCS.
+	 * Update it when it becomes invalid.
+	 */
+	if (address == gfn_to_hva(kvm, APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT))
+		kvm_make_all_cpus_request(kvm, KVM_REQ_APIC_PAGE_RELOAD);
 }
 
 /*
@@ -5990,6 +6043,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			kvm_deliver_pmi(vcpu);
 		if (kvm_check_request(KVM_REQ_SCAN_IOAPIC, vcpu))
 			vcpu_scan_ioapic(vcpu);
+		if (kvm_check_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu))
+			kvm_vcpu_reload_apic_access_page(vcpu);
 	}
 
 	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
@@ -5999,15 +6054,13 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			goto out;
 		}
 
-		inject_pending_event(vcpu);
-
+		if (inject_pending_event(vcpu, req_int_win) != 0)
+			req_immediate_exit = true;
 		/* enable NMI/IRQ window open exits if needed */
-		if (vcpu->arch.nmi_pending)
-			req_immediate_exit =
-				kvm_x86_ops->enable_nmi_window(vcpu) != 0;
+		else if (vcpu->arch.nmi_pending)
+			kvm_x86_ops->enable_nmi_window(vcpu);
 		else if (kvm_cpu_has_injectable_intr(vcpu) || req_int_win)
-			req_immediate_exit =
-				kvm_x86_ops->enable_irq_window(vcpu) != 0;
+			kvm_x86_ops->enable_irq_window(vcpu);
 
 		if (kvm_lapic_enabled(vcpu)) {
 			/*
@@ -6791,7 +6844,7 @@ int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
 	if (r)
 		return r;
 	kvm_vcpu_reset(vcpu);
-	r = kvm_mmu_setup(vcpu);
+	kvm_mmu_setup(vcpu);
 	vcpu_put(vcpu);
 
 	return r;
@@ -7086,6 +7139,11 @@ void kvm_arch_vcpu_uninit(struct kvm_vcpu *vcpu)
 		static_key_slow_dec(&kvm_no_apic_vcpu);
 }
 
+void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu)
+{
+	kvm_x86_ops->sched_in(vcpu, cpu);
+}
+
 int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 {
 	if (type)
@@ -7177,12 +7235,10 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 	kfree(kvm->arch.vpic);
 	kfree(kvm->arch.vioapic);
 	kvm_free_vcpus(kvm);
-	if (kvm->arch.apic_access_page)
-		put_page(kvm->arch.apic_access_page);
 	kfree(rcu_dereference_check(kvm->arch.apic_map, 1));
 }
 
-void kvm_arch_free_memslot(struct kvm_memory_slot *free,
+void kvm_arch_free_memslot(struct kvm *kvm, struct kvm_memory_slot *free,
 			   struct kvm_memory_slot *dont)
 {
 	int i;
@@ -7203,7 +7259,8 @@ void kvm_arch_free_memslot(struct kvm_memory_slot *free,
 	}
 }
 
-int kvm_arch_create_memslot(struct kvm_memory_slot *slot, unsigned long npages)
+int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
+			    unsigned long npages)
 {
 	int i;
 
@@ -7345,6 +7402,9 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
 
 int kvm_arch_vcpu_runnable(struct kvm_vcpu *vcpu)
 {
+	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events)
+		kvm_x86_ops->check_nested_events(vcpu, false);
+
 	return (vcpu->arch.mp_state == KVM_MP_STATE_RUNNABLE &&
 		!vcpu->arch.apf.halted)
 		|| !list_empty_careful(&vcpu->async_pf.done)
@@ -7568,3 +7628,4 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_invlpga);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_skinit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_nested_intercepts);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_write_tsc_offset);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_ple_window);

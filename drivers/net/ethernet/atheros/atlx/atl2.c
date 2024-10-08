@@ -1770,8 +1770,8 @@ static int atl2_get_settings(struct net_device *netdev,
 		else
 			ecmd->duplex = DUPLEX_HALF;
 	} else {
-		ethtool_cmd_speed_set(ecmd, SPEED_UNKNOWN);
-		ecmd->duplex = DUPLEX_UNKNOWN;
+		ethtool_cmd_speed_set(ecmd, -1);
+		ecmd->duplex = -1;
 	}
 
 	ecmd->autoneg = AUTONEG_ENABLE;

@@ -28,7 +28,7 @@ static int xfrm4_tunnel_check_size(struct sk_buff *skb)
 	if (!(ip_hdr(skb)->frag_off & htons(IP_DF)) || skb->local_df)
 		goto out;
 
-	mtu = xfrm_skb_dst_mtu(skb);
+	mtu = dst_mtu(skb_dst(skb));
 	if (skb->len > mtu) {
 		if (skb->sk)
 			ip_local_error(skb->sk, EMSGSIZE, ip_hdr(skb)->daddr,
@@ -87,7 +87,7 @@ int xfrm4_output_finish(struct sk_buff *skb)
 	return xfrm_output(skb);
 }
 
-int xfrm4_output(struct sk_buff *skb)
+int xfrm4_output(struct sock *sk, struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
 	struct xfrm_state *x = dst->xfrm;

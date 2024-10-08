@@ -1376,6 +1376,8 @@ xfs_zero_file_space(
 	xfs_off_t		end_boundary;
 	int			error;
 
+	trace_xfs_zero_file_space(ip);
+
 	granularity = max_t(uint, 1 << mp->m_sb.sb_blocklog, PAGE_CACHE_SIZE);
 
 	/*
@@ -1390,9 +1392,18 @@ xfs_zero_file_space(
 	ASSERT(end_boundary <= offset + len);
 
 	if (start_boundary < end_boundary - 1) {
-		/* punch out the page cache over the conversion range */
+		/*
+		 * Writeback the range to ensure any inode size updates due to
+		 * appending writes make it to disk (otherwise we could just
+		 * punch out the delalloc blocks).
+		 */
+		error = -filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
+				start_boundary, end_boundary - 1);
+		if (error)
+			goto out;
 		truncate_pagecache_range(VFS_I(ip), start_boundary,
 					 end_boundary - 1);
+
 		/* convert the blocks */
 		error = xfs_alloc_file_space(ip, start_boundary,
 					end_boundary - start_boundary - 1,
@@ -1515,6 +1526,30 @@ xfs_swap_extents_check_format(
 }
 
 int
+xfs_swap_extent_flush(
+	struct xfs_inode	*ip)
+{
+	int	error;
+
+	error = -filemap_write_and_wait(VFS_I(ip)->i_mapping);
+	if (error)
+		return error;
+	truncate_pagecache_range(VFS_I(ip), 0, -1);
+
+	/* Verify O_DIRECT for ftmp */
+	if (VFS_I(ip)->i_mapping->nrpages)
+		return EINVAL;
+
+	/*
+	 * Don't try to swap extents on mmap()d files because we can't lock
+	 * out races against page faults safely.
+	 */
+	if (mapping_mapped(VFS_I(ip)->i_mapping))
+		return EBUSY;
+	return 0;
+}
+
+int
 xfs_swap_extents(
 	xfs_inode_t	*ip,	/* target inode */
 	xfs_inode_t	*tip,	/* tmp inode */
@@ -1558,26 +1593,28 @@ xfs_swap_extents(
 		goto out_unlock;
 	}
 
-	error = -filemap_write_and_wait(VFS_I(tip)->i_mapping);
+	error = xfs_swap_extent_flush(ip);
 	if (error)
 		goto out_unlock;
-	truncate_pagecache_range(VFS_I(tip), 0, -1);
+	error = xfs_swap_extent_flush(tip);
+	if (error)
+		goto out_unlock;
 
-	xfs_lock_two_inodes(ip, tip, XFS_ILOCK_EXCL);
-	lock_flags |= XFS_ILOCK_EXCL;
-
-	/* Verify O_DIRECT for ftmp */
-	if (VN_CACHED(VFS_I(tip)) != 0) {
-		error = XFS_ERROR(EINVAL);
+	tp = xfs_trans_alloc(mp, XFS_TRANS_SWAPEXT);
+	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
+	if (error) {
+		xfs_trans_cancel(tp, 0);
 		goto out_unlock;
 	}
+	xfs_lock_two_inodes(ip, tip, XFS_ILOCK_EXCL);
+	lock_flags |= XFS_ILOCK_EXCL;
 
 	/* Verify all data are being swapped */
 	if (sxp->sx_offset != 0 ||
 	    sxp->sx_length != ip->i_d.di_size ||
 	    sxp->sx_length != tip->i_d.di_size) {
 		error = XFS_ERROR(EFAULT);
-		goto out_unlock;
+		goto out_trans_cancel;
 	}
 
 	trace_xfs_swap_extent_before(ip, 0);
@@ -1589,7 +1626,7 @@ xfs_swap_extents(
 		xfs_notice(mp,
 		    "%s: inode 0x%llx format is incompatible for exchanging.",
 				__func__, ip->i_ino);
-		goto out_unlock;
+		goto out_trans_cancel;
 	}
 
 	/*
@@ -1604,41 +1641,8 @@ xfs_swap_extents(
 	    (sbp->bs_mtime.tv_sec != VFS_I(ip)->i_mtime.tv_sec) ||
 	    (sbp->bs_mtime.tv_nsec != VFS_I(ip)->i_mtime.tv_nsec)) {
 		error = XFS_ERROR(EBUSY);
-		goto out_unlock;
-	}
-
-	/* We need to fail if the file is memory mapped.  Once we have tossed
-	 * all existing pages, the page fault will have no option
-	 * but to go to the filesystem for pages. By making the page fault call
-	 * vop_read (or write in the case of autogrow) they block on the iolock
-	 * until we have switched the extents.
-	 */
-	if (VN_MAPPED(VFS_I(ip))) {
-		error = XFS_ERROR(EBUSY);
-		goto out_unlock;
-	}
-
-	xfs_iunlock(ip, XFS_ILOCK_EXCL);
-	xfs_iunlock(tip, XFS_ILOCK_EXCL);
-	lock_flags &= ~XFS_ILOCK_EXCL;
-
-	/*
-	 * There is a race condition here since we gave up the
-	 * ilock.  However, the data fork will not change since
-	 * we have the iolock (locked for truncation too) so we
-	 * are safe.  We don't really care if non-io related
-	 * fields change.
-	 */
-	truncate_pagecache_range(VFS_I(ip), 0, -1);
-
-	tp = xfs_trans_alloc(mp, XFS_TRANS_SWAPEXT);
-	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
-	if (error)
 		goto out_trans_cancel;
-
-	xfs_lock_two_inodes(ip, tip, XFS_ILOCK_EXCL);
-	lock_flags |= XFS_ILOCK_EXCL;
-
+	}
 	/*
 	 * Count the number of extended attribute blocks
 	 */

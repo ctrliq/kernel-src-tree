@@ -89,7 +89,7 @@ struct be_aic_obj {		/* Adaptive interrupt coalescing (AIC) info */
 	u32 max_eqd;		/* in usecs */
 	u32 prev_eqd;		/* in usecs */
 	u32 et_eqd;		/* configured val when aic is off */
-	ulong jiffs;
+	ulong jiffies;
 	u64 eq_prev;		/* Used to calculate eqe */
 };
 

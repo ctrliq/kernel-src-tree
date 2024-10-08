@@ -134,7 +134,7 @@ int i40e_program_fdir_filter(struct i40e_fdir_filter *fdir_data, u8 *raw_packet,
 		dcc |= I40E_TXD_FLTR_QW1_CNT_ENA_MASK;
 		dcc |= ((u32)fdir_data->cnt_index <<
 			I40E_TXD_FLTR_QW1_CNTINDEX_SHIFT) &
-		       I40E_TXD_FLTR_QW1_CNTINDEX_MASK;
+			I40E_TXD_FLTR_QW1_CNTINDEX_MASK;
 	}
 
 	fdir_desc->qindex_flex_ptype_vsi = cpu_to_le32(fpt);
@@ -224,15 +224,19 @@ static int i40e_add_del_fdir_udpv4(struct i40e_vsi *vsi,
 	ret = i40e_program_fdir_filter(fd_data, raw_packet, pf, add);
 	if (ret) {
 		dev_info(&pf->pdev->dev,
-			 "Filter command send failed for PCTYPE %d (ret = %d)\n",
-			 fd_data->pctype, ret);
+			 "PCTYPE:%d, Filter command send failed for fd_id:%d (ret = %d)\n",
+			 fd_data->pctype, fd_data->fd_id, ret);
 		err = true;
 	} else {
-		dev_info(&pf->pdev->dev,
-			 "Filter OK for PCTYPE %d (ret = %d)\n",
-			 fd_data->pctype, ret);
+		if (add)
+			dev_info(&pf->pdev->dev,
+				 "Filter OK for PCTYPE %d loc = %d\n",
+				 fd_data->pctype, fd_data->fd_id);
+		else
+			dev_info(&pf->pdev->dev,
+				 "Filter deleted for PCTYPE %d loc = %d\n",
+				 fd_data->pctype, fd_data->fd_id);
 	}
-
 	return err ? -EOPNOTSUPP : 0;
 }
 
@@ -276,9 +280,17 @@ static int i40e_add_del_fdir_tcpv4(struct i40e_vsi *vsi,
 	tcp->source = fd_data->src_port;
 
 	if (add) {
+		pf->fd_tcp_rule++;
 		if (pf->flags & I40E_FLAG_FD_ATR_ENABLED) {
 			dev_info(&pf->pdev->dev, "Forcing ATR off, sideband rules for TCP/IPv4 flow being applied\n");
 			pf->flags &= ~I40E_FLAG_FD_ATR_ENABLED;
+		}
+	} else {
+		pf->fd_tcp_rule = (pf->fd_tcp_rule > 0) ?
+				  (pf->fd_tcp_rule - 1) : 0;
+		if (pf->fd_tcp_rule == 0) {
+			pf->flags |= I40E_FLAG_FD_ATR_ENABLED;
+			dev_info(&pf->pdev->dev, "ATR re-enabled due to no sideband TCP/IPv4 rules\n");
 		}
 	}
 
@@ -287,12 +299,17 @@ static int i40e_add_del_fdir_tcpv4(struct i40e_vsi *vsi,
 
 	if (ret) {
 		dev_info(&pf->pdev->dev,
-			 "Filter command send failed for PCTYPE %d (ret = %d)\n",
-			 fd_data->pctype, ret);
+			 "PCTYPE:%d, Filter command send failed for fd_id:%d (ret = %d)\n",
+			 fd_data->pctype, fd_data->fd_id, ret);
 		err = true;
 	} else {
-		dev_info(&pf->pdev->dev, "Filter OK for PCTYPE %d (ret = %d)\n",
-			 fd_data->pctype, ret);
+		if (add)
+			dev_info(&pf->pdev->dev, "Filter OK for PCTYPE %d loc = %d)\n",
+				 fd_data->pctype, fd_data->fd_id);
+		else
+			dev_info(&pf->pdev->dev,
+				 "Filter deleted for PCTYPE %d loc = %d\n",
+				 fd_data->pctype, fd_data->fd_id);
 	}
 
 	return err ? -EOPNOTSUPP : 0;
@@ -355,13 +372,18 @@ static int i40e_add_del_fdir_ipv4(struct i40e_vsi *vsi,
 
 		if (ret) {
 			dev_info(&pf->pdev->dev,
-				 "Filter command send failed for PCTYPE %d (ret = %d)\n",
-				 fd_data->pctype, ret);
+				 "PCTYPE:%d, Filter command send failed for fd_id:%d (ret = %d)\n",
+				 fd_data->pctype, fd_data->fd_id, ret);
 			err = true;
 		} else {
-			dev_info(&pf->pdev->dev,
-				 "Filter OK for PCTYPE %d (ret = %d)\n",
-				 fd_data->pctype, ret);
+			if (add)
+				dev_info(&pf->pdev->dev,
+					 "Filter OK for PCTYPE %d loc = %d\n",
+					 fd_data->pctype, fd_data->fd_id);
+			else
+				dev_info(&pf->pdev->dev,
+					 "Filter deleted for PCTYPE %d loc = %d\n",
+					 fd_data->pctype, fd_data->fd_id);
 		}
 	}
 
@@ -411,7 +433,7 @@ int i40e_add_del_fdir(struct i40e_vsi *vsi,
 		}
 		break;
 	default:
-		dev_info(&pf->pdev->dev, "Could not specify spec type %d",
+		dev_info(&pf->pdev->dev, "Could not specify spec type %d\n",
 			 input->flow_type);
 		ret = -EINVAL;
 	}
@@ -443,8 +465,14 @@ static void i40e_fd_handle_status(struct i40e_ring *rx_ring,
 		I40E_RX_PROG_STATUS_DESC_QW1_ERROR_SHIFT;
 
 	if (error == (0x1 << I40E_RX_PROG_STATUS_DESC_FD_TBL_FULL_SHIFT)) {
-		dev_warn(&pdev->dev, "ntuple filter loc = %d, could not be added\n",
-			 rx_desc->wb.qword0.hi_dword.fd_id);
+		if ((rx_desc->wb.qword0.hi_dword.fd_id != 0) ||
+		    (I40E_DEBUG_FD & pf->hw.debug_mask))
+			dev_warn(&pdev->dev, "ntuple filter loc = %d, could not be added\n",
+				 rx_desc->wb.qword0.hi_dword.fd_id);
+
+		pf->fd_add_err++;
+		/* store the current atr filter count */
+		pf->fd_atr_cnt = i40e_get_current_atr_cnt(pf);
 
 		/* filter programming failed most likely due to table full */
 		fcnt_prog = i40e_get_cur_guaranteed_fd_count(pf);
@@ -454,29 +482,21 @@ static void i40e_fd_handle_status(struct i40e_ring *rx_ring,
 		 * FD ATR/SB and then re-enable it when there is room.
 		 */
 		if (fcnt_prog >= (fcnt_avail - I40E_FDIR_BUFFER_FULL_MARGIN)) {
-			/* Turn off ATR first */
-			if ((pf->flags & I40E_FLAG_FD_ATR_ENABLED) &&
+			if ((pf->flags & I40E_FLAG_FD_SB_ENABLED) &&
 			    !(pf->auto_disable_flags &
-			      I40E_FLAG_FD_ATR_ENABLED)) {
-				dev_warn(&pdev->dev, "FD filter space full, ATR for further flows will be turned off\n");
-				pf->auto_disable_flags |=
-						       I40E_FLAG_FD_ATR_ENABLED;
-				pf->flags |= I40E_FLAG_FDIR_REQUIRES_REINIT;
-			} else if ((pf->flags & I40E_FLAG_FD_SB_ENABLED) &&
-				   !(pf->auto_disable_flags &
 				     I40E_FLAG_FD_SB_ENABLED)) {
 				dev_warn(&pdev->dev, "FD filter space full, new ntuple rules will not be added\n");
 				pf->auto_disable_flags |=
 							I40E_FLAG_FD_SB_ENABLED;
-				pf->flags |= I40E_FLAG_FDIR_REQUIRES_REINIT;
 			}
 		} else {
-			dev_info(&pdev->dev, "FD filter programming error");
+			dev_info(&pdev->dev,
+				"FD filter programming failed due to incorrect filter parameters\n");
 		}
 	} else if (error ==
 			  (0x1 << I40E_RX_PROG_STATUS_DESC_NO_FD_ENTRY_SHIFT)) {
 		if (I40E_DEBUG_FD & pf->hw.debug_mask)
-			dev_info(&pdev->dev, "ntuple filter loc = %d, could not be removed\n",
+			dev_info(&pdev->dev, "ntuple filter fd_id = %d, could not be removed\n",
 				 rx_desc->wb.qword0.hi_dword.fd_id);
 	}
 }
@@ -904,6 +924,11 @@ static void i40e_clean_programming_status(struct i40e_ring *rx_ring,
 
 	if (id == I40E_RX_PROG_STATUS_DESC_FD_FILTER_STATUS)
 		i40e_fd_handle_status(rx_ring, rx_desc, id);
+#ifdef I40E_FCOE
+	else if ((id == I40E_RX_PROG_STATUS_DESC_FCOE_CTXT_PROG_STATUS) ||
+		 (id == I40E_RX_PROG_STATUS_DESC_FCOE_CTXT_INVL_STATUS))
+		i40e_fcoe_handle_status(rx_ring, rx_desc, id);
+#endif
 }
 
 /**
@@ -1497,6 +1522,12 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 		vlan_tag = rx_status & (1 << I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
 			 ? le16_to_cpu(rx_desc->wb.qword0.lo_dword.l2tag1)
 			 : 0;
+#ifdef I40E_FCOE
+		if (!i40e_fcoe_handle_offload(rx_ring, rx_desc, skb)) {
+			dev_kfree_skb_any(skb);
+			goto next_desc;
+		}
+#endif
 		i40e_receive_skb(rx_ring, skb, vlan_tag);
 
 		rx_ring->netdev->last_rx = jiffies;
@@ -1704,6 +1735,11 @@ static void i40e_atr(struct i40e_ring *tx_ring, struct sk_buff *skb,
 	dtype_cmd |= I40E_FILTER_PROGRAM_DESC_FD_STATUS_FD_ID <<
 		     I40E_TXD_FLTR_QW1_FD_STATUS_SHIFT;
 
+	dtype_cmd |= I40E_TXD_FLTR_QW1_CNT_ENA_MASK;
+	dtype_cmd |=
+		((u32)pf->fd_atr_cnt_idx << I40E_TXD_FLTR_QW1_CNTINDEX_SHIFT) &
+		I40E_TXD_FLTR_QW1_CNTINDEX_MASK;
+
 	fdir_desc->qindex_flex_ptype_vsi = cpu_to_le32(flex_ptype);
 	fdir_desc->rsvd = cpu_to_le32(0);
 	fdir_desc->dtype_cmd_cntindex = cpu_to_le32(dtype_cmd);
@@ -1722,9 +1758,15 @@ static void i40e_atr(struct i40e_ring *tx_ring, struct sk_buff *skb,
  * Returns error code indicate the frame should be dropped upon error and the
  * otherwise  returns 0 to indicate the flags has been set properly.
  **/
+#ifdef I40E_FCOE
+int i40e_tx_prepare_vlan_flags(struct sk_buff *skb,
+			       struct i40e_ring *tx_ring,
+			       u32 *flags)
+#else
 static int i40e_tx_prepare_vlan_flags(struct sk_buff *skb,
 				      struct i40e_ring *tx_ring,
 				      u32 *flags)
+#endif
 {
 	__be16 protocol = skb->protocol;
 	u32  tx_flags = 0;
@@ -1746,9 +1788,8 @@ static int i40e_tx_prepare_vlan_flags(struct sk_buff *skb,
 	}
 
 	/* Insert 802.1p priority into VLAN header */
-	if ((tx_ring->vsi->back->flags & I40E_FLAG_DCB_ENABLED) &&
-	    ((tx_flags & (I40E_TX_FLAGS_HW_VLAN | I40E_TX_FLAGS_SW_VLAN)) ||
-	     (skb->priority != TC_PRIO_CONTROL))) {
+	if ((tx_flags & (I40E_TX_FLAGS_HW_VLAN | I40E_TX_FLAGS_SW_VLAN)) ||
+	    (skb->priority != TC_PRIO_CONTROL)) {
 		tx_flags &= ~I40E_TX_FLAGS_VLAN_PRIO_MASK;
 		tx_flags |= (skb->priority & 0x7) <<
 				I40E_TX_FLAGS_VLAN_PRIO_SHIFT;
@@ -1866,9 +1907,6 @@ static int i40e_tsyn(struct i40e_ring *tx_ring, struct sk_buff *skb,
 
 	*cd_type_cmd_tso_mss |= (u64)I40E_TX_CTX_DESC_TSYN <<
 				I40E_TXD_CTX_QW1_CMD_SHIFT;
-
-	pf->ptp_tx_start = jiffies;
-	schedule_work(&pf->ptp_tx_work);
 
 	return 1;
 }
@@ -2024,9 +2062,15 @@ static void i40e_create_tx_ctx(struct i40e_ring *tx_ring,
  * @td_cmd:   the command field in the descriptor
  * @td_offset: offset for checksum or crc
  **/
+#ifdef I40E_FCOE
+void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
+		 struct i40e_tx_buffer *first, u32 tx_flags,
+		 const u8 hdr_len, u32 td_cmd, u32 td_offset)
+#else
 static void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
 			struct i40e_tx_buffer *first, u32 tx_flags,
 			const u8 hdr_len, u32 td_cmd, u32 td_offset)
+#endif
 {
 	unsigned int data_len = skb->data_len;
 	unsigned int size = skb_headlen(skb);
@@ -2203,7 +2247,11 @@ static inline int __i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
  *
  * Returns 0 if stop is not needed
  **/
+#ifdef I40E_FCOE
+int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
+#else
 static int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
+#endif
 {
 	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
 		return 0;
@@ -2219,8 +2267,13 @@ static int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
  * there is not enough descriptors available in this ring since we need at least
  * one descriptor.
  **/
+#ifdef I40E_FCOE
+int i40e_xmit_descriptor_count(struct sk_buff *skb,
+			       struct i40e_ring *tx_ring)
+#else
 static int i40e_xmit_descriptor_count(struct sk_buff *skb,
 				      struct i40e_ring *tx_ring)
+#endif
 {
 	unsigned int f;
 	int count = 0;

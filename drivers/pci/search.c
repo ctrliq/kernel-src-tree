@@ -43,7 +43,8 @@ int pci_for_each_dma_alias(struct pci_dev *pdev,
 	 */
 	if (unlikely(pdev->dev_flags & PCI_DEV_FLAGS_DMA_ALIAS_DEVFN)) {
 		ret = fn(pdev, PCI_DEVID(pdev->bus->number,
-					 pdev->dma_alias_devfn), data);
+					 pdev->pci_dev_rh->dma_alias_devfn),
+					 data);
 		if (ret)
 			return ret;
 	}

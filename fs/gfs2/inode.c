@@ -558,7 +558,7 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
 	struct gfs2_glock *io_gl;
 	struct dentry *d;
-	int error;
+	int error, free_vfs_inode = 0;
 	u32 aflags = 0;
 	int arq;
 
@@ -586,8 +586,10 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	if (!IS_ERR(inode)) {
 		d = d_splice_alias(inode, dentry);
 		error = PTR_ERR(d);
-		if (IS_ERR(d))
+		if (IS_ERR(d)) {
+			inode = ERR_CAST(d);
 			goto fail_gunlock;
+		}
 		error = 0;
 		if (file) {
 			if (S_ISREG(inode->i_mode)) {
@@ -720,14 +722,15 @@ fail_free_inode:
 	if (ip->i_gl)
 		gfs2_glock_put(ip->i_gl);
 	gfs2_rs_delete(ip);
-	free_inode_nonrcu(inode);
-	inode = NULL;
+	free_vfs_inode = 1;
 fail_gunlock:
 	gfs2_glock_dq_uninit(ghs);
 	if (inode && !IS_ERR(inode)) {
 		clear_nlink(inode);
-		mark_inode_dirty(inode);
-		set_bit(GIF_ALLOC_FAILED, &GFS2_I(inode)->i_flags);
+		if (!free_vfs_inode)
+			mark_inode_dirty(inode);
+		set_bit(free_vfs_inode ? GIF_FREE_VFS_INODE : GIF_ALLOC_FAILED,
+			&GFS2_I(inode)->i_flags);
 		iput(inode);
 	}
 fail:
@@ -786,7 +789,6 @@ static struct dentry *__gfs2_lookup(struct inode *dir, struct dentry *dentry,
 
 	d = d_splice_alias(inode, dentry);
 	if (IS_ERR(d)) {
-		iput(inode);
 		gfs2_glock_dq_uninit(&gh);
 		return d;
 	}
@@ -1537,13 +1539,6 @@ out:
 	return NULL;
 }
 
-static void gfs2_put_link(struct dentry *dentry, struct nameidata *nd, void *p)
-{
-	char *s = nd_get_link(nd);
-	if (!IS_ERR(s))
-		kfree(s);
-}
-
 /**
  * gfs2_permission -
  * @inode: The inode
@@ -1909,7 +1904,7 @@ const struct inode_operations gfs2_dir_iops = {
 const struct inode_operations gfs2_symlink_iops = {
 	.readlink = generic_readlink,
 	.follow_link = gfs2_follow_link,
-	.put_link = gfs2_put_link,
+	.put_link = kfree_put_link,
 	.permission = gfs2_permission,
 	.setattr = gfs2_setattr,
 	.getattr = gfs2_getattr,

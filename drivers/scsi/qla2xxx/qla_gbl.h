@@ -1,6 +1,6 @@
 /*
  * QLogic Fibre Channel HBA Driver
- * Copyright (c)  2003-2013 QLogic Corporation
+ * Copyright (c)  2003-2014 QLogic Corporation
  *
  * See LICENSE.qla2xxx for copyright and licensing details.
  */
@@ -339,6 +339,16 @@ extern int
 qla2x00_system_error(scsi_qla_host_t *);
 
 extern int
+qla2x00_write_serdes_word(scsi_qla_host_t *, uint16_t, uint16_t);
+extern int
+qla2x00_read_serdes_word(scsi_qla_host_t *, uint16_t, uint16_t *);
+
+extern int
+qla8044_write_serdes_word(scsi_qla_host_t *, uint32_t, uint32_t);
+extern int
+qla8044_read_serdes_word(scsi_qla_host_t *, uint32_t, uint32_t *);
+
+extern int
 qla2x00_set_serdes_params(scsi_qla_host_t *, uint16_t, uint16_t, uint16_t);
 
 extern int
@@ -503,6 +513,9 @@ extern void qla2300_fw_dump(scsi_qla_host_t *, int);
 extern void qla24xx_fw_dump(scsi_qla_host_t *, int);
 extern void qla25xx_fw_dump(scsi_qla_host_t *, int);
 extern void qla81xx_fw_dump(scsi_qla_host_t *, int);
+extern void qla82xx_fw_dump(scsi_qla_host_t *, int);
+extern void qla8044_fw_dump(scsi_qla_host_t *, int);
+
 extern void qla2x00_dump_regs(scsi_qla_host_t *);
 extern void qla2x00_dump_buffer(uint8_t *, uint32_t);
 extern void qla2x00_dump_buffer_zipped(uint8_t *, uint32_t);
@@ -724,7 +737,7 @@ extern inline void qla8044_set_qsnt_ready(struct scsi_qla_host *vha);
 extern inline void qla8044_need_reset_handler(struct scsi_qla_host *vha);
 extern int qla8044_device_state_handler(struct scsi_qla_host *vha);
 extern void qla8044_clear_qsnt_ready(struct scsi_qla_host *vha);
-extern void qla8044_clear_drv_active(struct scsi_qla_host *vha);
+extern void qla8044_clear_drv_active(struct qla_hw_data *);
 void qla8044_get_minidump(struct scsi_qla_host *vha);
 int qla8044_collect_md_data(struct scsi_qla_host *vha);
 extern int qla8044_md_get_template(scsi_qla_host_t *);

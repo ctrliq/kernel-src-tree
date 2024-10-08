@@ -38,7 +38,7 @@
 #include <linux/dmi.h>
 #include <linux/pci.h>
 
-#define PREFIX "ACPI: "
+#include "internal.h"
 
 ACPI_MODULE_NAME("video");
 #define _COMPONENT		ACPI_VIDEO_COMPONENT

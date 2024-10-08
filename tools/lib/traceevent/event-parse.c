@@ -616,10 +616,11 @@ find_printk(struct pevent *pevent, unsigned long long addr)
  * This registers a string by the address it was stored in the kernel.
  * The @fmt passed in is duplicated.
  */
-int pevent_register_print_string(struct pevent *pevent, char *fmt,
+int pevent_register_print_string(struct pevent *pevent, const char *fmt,
 				 unsigned long long addr)
 {
 	struct printk_list *item = malloc(sizeof(*item));
+	char *p;
 
 	if (!item)
 		return -1;
@@ -627,9 +628,20 @@ int pevent_register_print_string(struct pevent *pevent, char *fmt,
 	item->next = pevent->printklist;
 	item->addr = addr;
 
+	/* Strip off quotes and '\n' from the end */
+	if (fmt[0] == '"')
+		fmt++;
 	item->printk = strdup(fmt);
 	if (!item->printk)
 		goto out_free;
+
+	p = item->printk + strlen(item->printk) - 1;
+	if (*p == '"')
+		*p = 0;
+
+	p -= 2;
+	if (strcmp(p, "\\n") == 0)
+		*p = 0;
 
 	pevent->printklist = item;
 	pevent->printk_count++;
@@ -2764,14 +2776,16 @@ process_func_handler(struct event_format *event, struct pevent_function_handler 
 		type = process_arg(event, farg, &token);
 		if (i < (func->nr_args - 1)) {
 			if (type != EVENT_DELIM || strcmp(token, ",") != 0) {
-				warning("Error: function '%s()' expects %d arguments but event %s only uses %d",
+				do_warning_event(event,
+					"Error: function '%s()' expects %d arguments but event %s only uses %d",
 					func->name, func->nr_args,
 					event->name, i + 1);
 				goto err;
 			}
 		} else {
 			if (type != EVENT_DELIM || strcmp(token, ")") != 0) {
-				warning("Error: function '%s()' only expects %d arguments but event %s has more",
+				do_warning_event(event,
+					"Error: function '%s()' only expects %d arguments but event %s has more",
 					func->name, func->nr_args, event->name);
 				goto err;
 			}
@@ -3504,6 +3518,19 @@ eval_num_arg(void *data, int size, struct event_format *event, struct print_arg 
 			goto out_warning_op;
 		}
 		break;
+	case PRINT_DYNAMIC_ARRAY:
+		/* Without [], we pass the address to the dynamic data */
+		offset = pevent_read_number(pevent,
+					    data + arg->dynarray.field->offset,
+					    arg->dynarray.field->size);
+		/*
+		 * The actual length of the dynamic array is stored
+		 * in the top half of the field, and the offset
+		 * is in the bottom half of the 32 bit field.
+		 */
+		offset &= 0xffff;
+		val = (unsigned long long)((unsigned long)data + offset);
+		break;
 	default: /* not sure what to do there */
 		return 0;
 	}
@@ -3629,6 +3656,7 @@ static void print_str_arg(struct trace_seq *s, void *data, int size,
 	struct pevent *pevent = event->pevent;
 	struct print_flag_sym *flag;
 	struct format_field *field;
+	struct printk_map *printk;
 	unsigned long long val, fval;
 	unsigned long addr;
 	char *str;
@@ -3664,7 +3692,12 @@ static void print_str_arg(struct trace_seq *s, void *data, int size,
 		if (!(field->flags & FIELD_IS_ARRAY) &&
 		    field->size == pevent->long_size) {
 			addr = *(unsigned long *)(data + field->offset);
-			trace_seq_printf(s, "%lx", addr);
+			/* Check if it matches a print format */
+			printk = find_printk(pevent, addr);
+			if (printk)
+				trace_seq_puts(s, printk->printk);
+			else
+				trace_seq_printf(s, "%lx", addr);
 			break;
 		}
 		str = malloc(len + 1);
@@ -3942,8 +3975,8 @@ static struct print_arg *make_bprint_args(char *fmt, void *data, int size, struc
 	if (asprintf(&arg->atom.atom, "%lld", ip) < 0)
 		goto out_free;
 
-	/* skip the first "%pf : " */
-	for (ptr = fmt + 6, bptr = data + field->offset;
+	/* skip the first "%pf: " */
+	for (ptr = fmt + 5, bptr = data + field->offset;
 	     bptr < data + size && *ptr; ptr++) {
 		int ls = 0;
 
@@ -4053,7 +4086,6 @@ get_bprint_format(void *data, int size __maybe_unused,
 	struct format_field *field;
 	struct printk_map *printk;
 	char *format;
-	char *p;
 
 	field = pevent->bprint_fmt_field;
 
@@ -4070,25 +4102,13 @@ get_bprint_format(void *data, int size __maybe_unused,
 
 	printk = find_printk(pevent, addr);
 	if (!printk) {
-		if (asprintf(&format, "%%pf : (NO FORMAT FOUND at %llx)\n", addr) < 0)
+		if (asprintf(&format, "%%pf: (NO FORMAT FOUND at %llx)\n", addr) < 0)
 			return NULL;
 		return format;
 	}
 
-	p = printk->printk;
-	/* Remove any quotes. */
-	if (*p == '"')
-		p++;
-	if (asprintf(&format, "%s : %s", "%pf", p) < 0)
+	if (asprintf(&format, "%s: %s", "%pf", printk->printk) < 0)
 		return NULL;
-	/* remove ending quotes and new line since we will add one too */
-	p = format + strlen(format) - 1;
-	if (*p == '"')
-		*p = 0;
-
-	p -= 2;
-	if (strcmp(p, "\\n") == 0)
-		*p = 0;
 
 	return format;
 }
@@ -4134,7 +4154,7 @@ static int is_printable_array(char *p, unsigned int len)
 	unsigned int i;
 
 	for (i = 0; i < len && p[i]; i++)
-		if (!isprint(p[i]))
+		if (!isprint(p[i]) && !isspace(p[i]))
 		    return 0;
 	return 1;
 }

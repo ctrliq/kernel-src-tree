@@ -44,7 +44,7 @@
 #include <linux/suspend.h>
 #include <acpi/video.h>
 
-#define PREFIX "ACPI: "
+#include "internal.h"
 
 #define ACPI_VIDEO_BUS_NAME		"Video Bus"
 #define ACPI_VIDEO_DEVICE_NAME		"Video Device"

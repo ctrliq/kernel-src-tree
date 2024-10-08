@@ -90,7 +90,7 @@ static struct file_system_type ext2_fs_type = {
 	.name		= "ext2",
 	.mount		= ext4_mount,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_INVALIDATE_RANGE,
 };
 MODULE_ALIAS_FS("ext2");
 MODULE_ALIAS("ext2");
@@ -106,7 +106,7 @@ static struct file_system_type ext3_fs_type = {
 	.name		= "ext3",
 	.mount		= ext4_mount,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_INVALIDATE_RANGE,
 };
 MODULE_ALIAS_FS("ext3");
 MODULE_ALIAS("ext3");
@@ -1892,7 +1892,7 @@ static int ext4_setup_super(struct super_block *sb, struct ext4_super_block *es,
 	if (!(sbi->s_mount_state & EXT4_VALID_FS))
 		ext4_msg(sb, KERN_WARNING, "warning: mounting unchecked fs, "
 			 "running e2fsck is recommended");
-	else if ((sbi->s_mount_state & EXT4_ERROR_FS))
+	else if (sbi->s_mount_state & EXT4_ERROR_FS)
 		ext4_msg(sb, KERN_WARNING,
 			 "warning: mounting fs with errors, "
 			 "running e2fsck is recommended");
@@ -3384,7 +3384,7 @@ static ext4_fsblk_t ext4_calculate_resv_clusters(struct super_block *sb)
 	 * By default we reserve 2% or 4096 clusters, whichever is smaller.
 	 * This should cover the situations where we can not afford to run
 	 * out of space like for example punch hole, or converting
-	 * uninitialized extents in delalloc path. In most cases such
+	 * unwritten extents in delalloc path. In most cases such
 	 * allocation would require 1, or 2 blocks, higher numbers are
 	 * very rare.
 	 */
@@ -5417,6 +5417,7 @@ static ssize_t ext4_quota_write(struct super_block *sb, int type,
 	bh = ext4_bread(handle, inode, blk, 1, &err);
 	if (!bh)
 		goto out;
+	BUFFER_TRACE(bh, "get write access");
 	err = ext4_journal_get_write_access(handle, bh);
 	if (err) {
 		brelse(bh);
@@ -5514,7 +5515,7 @@ static struct file_system_type ext4_fs_type = {
 	.name		= "ext4",
 	.mount		= ext4_mount,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_INVALIDATE_RANGE,
 };
 MODULE_ALIAS_FS("ext4");
 

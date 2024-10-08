@@ -30,7 +30,6 @@
 #include <linux/types.h>
 #include <linux/scatterlist.h>
 #include <linux/list.h>
-#include <linux/uuid.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <linux/completion.h>
@@ -157,15 +156,17 @@ hv_get_ringbuffer_availbytes(struct hv_ring_buffer_info *rbi,
  * 0 . 13 (Windows Server 2008)
  * 1 . 1  (Windows 7)
  * 2 . 4  (Windows 8)
+ * 3 . 0  (Windows 8 R2)
  */
 
 #define VERSION_WS2008  ((0 << 16) | (13))
 #define VERSION_WIN7    ((1 << 16) | (1))
 #define VERSION_WIN8    ((2 << 16) | (4))
+#define VERSION_WIN8_1    ((3 << 16) | (0))
 
 #define VERSION_INVAL -1
 
-#define VERSION_CURRENT VERSION_WIN8
+#define VERSION_CURRENT VERSION_WIN8_1
 
 /* Make maximum size of pipe payload of 16K */
 #define MAX_PIPE_DATA_PAYLOAD		(sizeof(u8) * 16384)
@@ -755,11 +756,30 @@ struct vmbus_channel {
 	 * This will be NULL for the primary channel.
 	 */
 	struct vmbus_channel *primary_channel;
+	/*
+	 * Support per-channel state for use by vmbus drivers.
+	 */
+	void *per_channel_state;
+	/*
+	 * To support per-cpu lookup mapping of relid to channel,
+	 * link up channels based on their CPU affinity.
+	 */
+	struct list_head percpu_list;
 };
 
 static inline void set_channel_read_state(struct vmbus_channel *c, bool state)
 {
 	c->batched_reading = state;
+}
+
+static inline void set_per_channel_state(struct vmbus_channel *c, void *s)
+{
+	c->per_channel_state = s;
+}
+
+static inline void *get_per_channel_state(struct vmbus_channel *c)
+{
+	return c->per_channel_state;
 }
 
 void vmbus_onmessage(void *context);
@@ -1072,6 +1092,17 @@ void vmbus_driver_unregister(struct hv_driver *hv_driver);
 	.guid = { \
 			0x4A, 0xCC, 0x9B, 0x2F, 0x69, 0x00, 0xF3, 0x4A, \
 			0xB7, 0x6B, 0x6F, 0xD0, 0xBE, 0x52, 0x8C, 0xDA \
+		}
+
+/*
+ * Guest File Copy Service
+ * {34D14BE3-DEE4-41c8-9AE7-6B174977C192}
+ */
+
+#define HV_FCOPY_GUID \
+	.guid = { \
+			0xE3, 0x4B, 0xD1, 0x34, 0xE4, 0xDE, 0xC8, 0x41, \
+			0x9A, 0xE7, 0x6B, 0x17, 0x49, 0x77, 0xC1, 0x92 \
 		}
 
 /*

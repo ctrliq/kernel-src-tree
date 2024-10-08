@@ -505,16 +505,13 @@ struct pci_bus *pci_acpi_scan_root(struct acpi_pci_root *root)
 	sd = &info->sd;
 	sd->domain = domain;
 	sd->node = node;
-	sd->acpi = device->handle;
-	/*
-	 * Maybe the desired pci bus has been already scanned. In such case
-	 * it is unnecessary to scan the pci bus with the given domain,busnum.
-	 */
+	sd->companion = device;
+
 	bus = pci_find_bus(domain, busnum);
 	if (bus) {
 		/*
-		 * If the desired bus exits, the content of bus->sysdata will
-		 * be replaced by sd.
+		 * If the desired bus has been scanned already, replace
+		 * its bus->sysdata.
 		 */
 		memcpy(bus->sysdata, sd, sizeof(*sd));
 		kfree(info);
@@ -569,7 +566,7 @@ int pcibios_root_bridge_prepare(struct pci_host_bridge *bridge)
 {
 	struct pci_sysdata *sd = bridge->bus->sysdata;
 
-	ACPI_HANDLE_SET(&bridge->dev, sd->acpi);
+	ACPI_COMPANION_SET(&bridge->dev, sd->companion);
 	return 0;
 }
 
