@@ -1,0 +1,209 @@
+drivers:hv: Make a function to free mmio regions through vmbus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] hv: Make a function to free mmio regions through vmbus (Vitaly Kuznetsov) [1302147]
+Rebuild_FUZZ: 93.10%
+commit-author Jake Oshins <jakeo@microsoft.com>
+commit 97fb77dc87582300fa3c141b63699f853576cab1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/97fb77dc.failed
+
+This patch introduces a function that reverses everything
+done by vmbus_allocate_mmio().  Existing code just called
+release_mem_region().  Future patches in this series
+require a more complex sequence of actions, so this function
+is introduced to wrap those actions.
+
+	Signed-off-by: Jake Oshins <jakeo@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 97fb77dc87582300fa3c141b63699f853576cab1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+#	include/linux/hyperv.h
+diff --cc drivers/hv/vmbus_drv.c
+index 7882a259dbd0,60553c156f90..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -1045,6 -1086,139 +1045,142 @@@ static acpi_status vmbus_walk_resources
+  	return AE_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vmbus_acpi_remove(struct acpi_device *device)
++ {
++ 	struct resource *cur_res;
++ 	struct resource *next_res;
++ 
++ 	if (hyperv_mmio) {
++ 		for (cur_res = hyperv_mmio; cur_res; cur_res = next_res) {
++ 			next_res = cur_res->sibling;
++ 			kfree(cur_res);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * vmbus_allocate_mmio() - Pick a memory-mapped I/O range.
++  * @new:		If successful, supplied a pointer to the
++  *			allocated MMIO space.
++  * @device_obj:		Identifies the caller
++  * @min:		Minimum guest physical address of the
++  *			allocation
++  * @max:		Maximum guest physical address
++  * @size:		Size of the range to be allocated
++  * @align:		Alignment of the range to be allocated
++  * @fb_overlap_ok:	Whether this allocation can be allowed
++  *			to overlap the video frame buffer.
++  *
++  * This function walks the resources granted to VMBus by the
++  * _CRS object in the ACPI namespace underneath the parent
++  * "bridge" whether that's a root PCI bus in the Generation 1
++  * case or a Module Device in the Generation 2 case.  It then
++  * attempts to allocate from the global MMIO pool in a way that
++  * matches the constraints supplied in these parameters and by
++  * that _CRS.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ int vmbus_allocate_mmio(struct resource **new, struct hv_device *device_obj,
++ 			resource_size_t min, resource_size_t max,
++ 			resource_size_t size, resource_size_t align,
++ 			bool fb_overlap_ok)
++ {
++ 	struct resource *iter;
++ 	resource_size_t range_min, range_max, start, local_min, local_max;
++ 	const char *dev_n = dev_name(&device_obj->device);
++ 	u32 fb_end = screen_info.lfb_base + (screen_info.lfb_size << 1);
++ 	int i, retval;
++ 
++ 	retval = -ENXIO;
++ 	down(&hyperv_mmio_lock);
++ 
++ 	for (iter = hyperv_mmio; iter; iter = iter->sibling) {
++ 		if ((iter->start >= max) || (iter->end <= min))
++ 			continue;
++ 
++ 		range_min = iter->start;
++ 		range_max = iter->end;
++ 
++ 		/* If this range overlaps the frame buffer, split it into
++ 		   two tries. */
++ 		for (i = 0; i < 2; i++) {
++ 			local_min = range_min;
++ 			local_max = range_max;
++ 			if (fb_overlap_ok || (range_min >= fb_end) ||
++ 			    (range_max <= screen_info.lfb_base)) {
++ 				i++;
++ 			} else {
++ 				if ((range_min <= screen_info.lfb_base) &&
++ 				    (range_max >= screen_info.lfb_base)) {
++ 					/*
++ 					 * The frame buffer is in this window,
++ 					 * so trim this into the part that
++ 					 * preceeds the frame buffer.
++ 					 */
++ 					local_max = screen_info.lfb_base - 1;
++ 					range_min = fb_end;
++ 				} else {
++ 					range_min = fb_end;
++ 					continue;
++ 				}
++ 			}
++ 
++ 			start = (local_min + align - 1) & ~(align - 1);
++ 			for (; start + size - 1 <= local_max; start += align) {
++ 				*new = request_mem_region_exclusive(start, size,
++ 								    dev_n);
++ 				if (*new) {
++ 					retval = 0;
++ 					goto exit;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ exit:
++ 	up(&hyperv_mmio_lock);
++ 	return retval;
++ }
++ EXPORT_SYMBOL_GPL(vmbus_allocate_mmio);
++ 
++ /**
++  * vmbus_free_mmio() - Free a memory-mapped I/O range.
++  * @start:		Base address of region to release.
++  * @size:		Size of the range to be allocated
++  *
++  * This function releases anything requested by
++  * vmbus_mmio_allocate().
++  */
++ void vmbus_free_mmio(resource_size_t start, resource_size_t size)
++ {
++ 	release_mem_region(start, size);
++ 
++ }
++ EXPORT_SYMBOL_GPL(vmbus_free_mmio);
++ 
++ /**
++  * vmbus_cpu_number_to_vp_number() - Map CPU to VP.
++  * @cpu_number: CPU number in Linux terms
++  *
++  * This function returns the mapping between the Linux processor
++  * number and the hypervisor's virtual processor number, useful
++  * in making hypercalls and such that talk about specific
++  * processors.
++  *
++  * Return: Virtual processor number in Hyper-V terms
++  */
++ int vmbus_cpu_number_to_vp_number(int cpu_number)
++ {
++ 	return hv_context.vp_index[cpu_number];
++ }
++ EXPORT_SYMBOL_GPL(vmbus_cpu_number_to_vp_number);
++ 
+++>>>>>>> 97fb77dc8758 (drivers:hv: Make a function to free mmio regions through vmbus)
+  static int vmbus_acpi_add(struct acpi_device *device)
+  {
+  	acpi_status result;
+diff --cc include/linux/hyperv.h
+index 50e20e4283f6,b10954a66939..000000000000
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@@ -960,16 -1114,15 +960,28 @@@ int __must_check __vmbus_driver_registe
+  					 const char *mod_name);
+  void vmbus_driver_unregister(struct hv_driver *hv_driver);
+  
+++<<<<<<< HEAD
+ +/**
+ + * VMBUS_DEVICE - macro used to describe a specific hyperv vmbus device
+ + *
+ + * This macro is used to create a struct hv_vmbus_device_id that matches a
+ + * specific device.
+ + */
+ +#define VMBUS_DEVICE(g0, g1, g2, g3, g4, g5, g6, g7,	\
+ +		     g8, g9, ga, gb, gc, gd, ge, gf)	\
+ +	.guid = { g0, g1, g2, g3, g4, g5, g6, g7,	\
+ +		  g8, g9, ga, gb, gc, gd, ge, gf },
+++=======
++ void vmbus_hvsock_device_unregister(struct vmbus_channel *channel);
++ 
++ int vmbus_allocate_mmio(struct resource **new, struct hv_device *device_obj,
++ 			resource_size_t min, resource_size_t max,
++ 			resource_size_t size, resource_size_t align,
++ 			bool fb_overlap_ok);
++ void vmbus_free_mmio(resource_size_t start, resource_size_t size);
++ int vmbus_cpu_number_to_vp_number(int cpu_number);
++ u64 hv_do_hypercall(u64 control, void *input, void *output);
+++>>>>>>> 97fb77dc8758 (drivers:hv: Make a function to free mmio regions through vmbus)
+  
+  /*
+   * GUID definitions of various offer types - services offered to the guest.
+* Unmerged path drivers/hv/vmbus_drv.c
+* Unmerged path include/linux/hyperv.h
