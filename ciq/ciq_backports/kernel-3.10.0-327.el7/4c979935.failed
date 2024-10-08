@@ -1,0 +1,183 @@
+macvlan: pass 'bool' type to macvlan_count_rx()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author jbaron@akamai.com <jbaron@akamai.com>
+commit 4c9799359bc691becc888f97a4b5bb035cb206f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4c979935.failed
+
+Pass last argument to macvlan_count_rx() as the correct bool type.
+
+	Signed-off-by: Jason Baron <jbaron@akamai.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4c9799359bc691becc888f97a4b5bb035cb206f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macvlan.c
+diff --cc drivers/net/macvlan.c
+index 6af48508e014,c7c58aff1ff7..000000000000
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@@ -171,15 -251,152 +171,150 @@@ static void macvlan_broadcast(struct sk
+  			hash = mc_hash(vlan, eth->h_dest);
+  			if (!test_bit(hash, vlan->mc_filter))
+  				continue;
+ -
+ -			err = NET_RX_DROP;
+  			nskb = skb_clone(skb, GFP_ATOMIC);
+ -			if (likely(nskb))
+ -				err = macvlan_broadcast_one(
+ -					nskb, vlan, eth,
+ -					mode == MACVLAN_MODE_BRIDGE) ?:
+ -				      netif_rx_ni(nskb);
+ +			err = macvlan_broadcast_one(nskb, vlan, eth,
+ +					 mode == MACVLAN_MODE_BRIDGE);
+  			macvlan_count_rx(vlan, skb->len + ETH_HLEN,
+- 					 err == NET_RX_SUCCESS, 1);
++ 					 err == NET_RX_SUCCESS, true);
+  		}
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void macvlan_process_broadcast(struct work_struct *w)
++ {
++ 	struct macvlan_port *port = container_of(w, struct macvlan_port,
++ 						 bc_work);
++ 	struct sk_buff *skb;
++ 	struct sk_buff_head list;
++ 
++ 	skb_queue_head_init(&list);
++ 
++ 	spin_lock_bh(&port->bc_queue.lock);
++ 	skb_queue_splice_tail_init(&port->bc_queue, &list);
++ 	spin_unlock_bh(&port->bc_queue.lock);
++ 
++ 	while ((skb = __skb_dequeue(&list))) {
++ 		const struct macvlan_dev *src = MACVLAN_SKB_CB(skb)->src;
++ 
++ 		rcu_read_lock();
++ 
++ 		if (!src)
++ 			/* frame comes from an external address */
++ 			macvlan_broadcast(skb, port, NULL,
++ 					  MACVLAN_MODE_PRIVATE |
++ 					  MACVLAN_MODE_VEPA    |
++ 					  MACVLAN_MODE_PASSTHRU|
++ 					  MACVLAN_MODE_BRIDGE);
++ 		else if (src->mode == MACVLAN_MODE_VEPA)
++ 			/* flood to everyone except source */
++ 			macvlan_broadcast(skb, port, src->dev,
++ 					  MACVLAN_MODE_VEPA |
++ 					  MACVLAN_MODE_BRIDGE);
++ 		else
++ 			/*
++ 			 * flood only to VEPA ports, bridge ports
++ 			 * already saw the frame on the way out.
++ 			 */
++ 			macvlan_broadcast(skb, port, src->dev,
++ 					  MACVLAN_MODE_VEPA);
++ 
++ 		rcu_read_unlock();
++ 
++ 		kfree_skb(skb);
++ 	}
++ }
++ 
++ static void macvlan_broadcast_enqueue(struct macvlan_port *port,
++ 				      struct sk_buff *skb)
++ {
++ 	struct sk_buff *nskb;
++ 	int err = -ENOMEM;
++ 
++ 	nskb = skb_clone(skb, GFP_ATOMIC);
++ 	if (!nskb)
++ 		goto err;
++ 
++ 	spin_lock(&port->bc_queue.lock);
++ 	if (skb_queue_len(&port->bc_queue) < MACVLAN_BC_QUEUE_LEN) {
++ 		__skb_queue_tail(&port->bc_queue, nskb);
++ 		err = 0;
++ 	}
++ 	spin_unlock(&port->bc_queue.lock);
++ 
++ 	if (err)
++ 		goto free_nskb;
++ 
++ 	schedule_work(&port->bc_work);
++ 	return;
++ 
++ free_nskb:
++ 	kfree_skb(nskb);
++ err:
++ 	atomic_long_inc(&skb->dev->rx_dropped);
++ }
++ 
++ static void macvlan_flush_sources(struct macvlan_port *port,
++ 				  struct macvlan_dev *vlan)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < MACVLAN_HASH_SIZE; i++) {
++ 		struct hlist_node *h, *n;
++ 
++ 		hlist_for_each_safe(h, n, &port->vlan_source_hash[i]) {
++ 			struct macvlan_source_entry *entry;
++ 
++ 			entry = hlist_entry(h, struct macvlan_source_entry,
++ 					    hlist);
++ 			if (entry->vlan == vlan)
++ 				macvlan_hash_del_source(entry);
++ 		}
++ 	}
++ 	vlan->macaddr_count = 0;
++ }
++ 
++ static void macvlan_forward_source_one(struct sk_buff *skb,
++ 				       struct macvlan_dev *vlan)
++ {
++ 	struct sk_buff *nskb;
++ 	struct net_device *dev;
++ 	int len;
++ 	int ret;
++ 
++ 	dev = vlan->dev;
++ 	if (unlikely(!(dev->flags & IFF_UP)))
++ 		return;
++ 
++ 	nskb = skb_clone(skb, GFP_ATOMIC);
++ 	if (!nskb)
++ 		return;
++ 
++ 	len = nskb->len + ETH_HLEN;
++ 	nskb->dev = dev;
++ 	nskb->pkt_type = PACKET_HOST;
++ 
++ 	ret = netif_rx(nskb);
++ 	macvlan_count_rx(vlan, len, ret == NET_RX_SUCCESS, false);
++ }
++ 
++ static void macvlan_forward_source(struct sk_buff *skb,
++ 				   struct macvlan_port *port,
++ 				   const unsigned char *addr)
++ {
++ 	struct macvlan_source_entry *entry;
++ 	u32 idx = macvlan_eth_hash(addr);
++ 	struct hlist_head *h = &port->vlan_source_hash[idx];
++ 
++ 	hlist_for_each_entry_rcu(entry, h, hlist) {
++ 		if (ether_addr_equal_64bits(entry->addr, addr))
++ 			if (entry->vlan->dev->flags & IFF_UP)
++ 				macvlan_forward_source_one(skb, entry->vlan);
++ 	}
++ }
++ 
+++>>>>>>> 4c9799359bc6 (macvlan: pass 'bool' type to macvlan_count_rx())
+  /* called under rcu_read_lock() from netif_receive_skb */
+  static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
+  {
+* Unmerged path drivers/net/macvlan.c
