@@ -985,4 +985,5 @@ void ixgbe_sriov_reinit(struct ixgbe_adapter *adapter);
 #endif
 
 u32 ixgbe_rss_indir_tbl_entries(struct ixgbe_adapter *adapter);
+void ixgbe_store_reta(struct ixgbe_adapter *adapter);
 #endif /* _IXGBE_H_ */
