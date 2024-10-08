@@ -1,0 +1,113 @@
+Btrfs: add helper btrfs_fdatawrite_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Filipe Manana <fdmanana@suse.com>
+commit 728404dacfddb5364d7256d821a2ea482159cbe7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/728404da.failed
+
+To avoid duplicating this double filemap_fdatawrite_range() call for
+inodes with async extents (compressed writes) so often.
+
+	Signed-off-by: Filipe Manana <fdmanana@suse.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 728404dacfddb5364d7256d821a2ea482159cbe7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/file.c
+diff --cc fs/btrfs/file.c
+index 56f9dab2b04a,0fbf0e7bc606..000000000000
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@@ -1679,12 -1672,11 +1679,16 @@@ again
+  }
+  
+  static ssize_t __btrfs_direct_write(struct kiocb *iocb,
+ -				    struct iov_iter *from,
+ -				    loff_t pos)
+ +				    const struct iovec *iov,
+ +				    unsigned long nr_segs, loff_t pos,
+ +				    loff_t *ppos, size_t count, size_t ocount)
+  {
+  	struct file *file = iocb->ki_filp;
+++<<<<<<< HEAD
+ +	struct iov_iter i;
+++=======
++ 	struct inode *inode = file_inode(file);
+++>>>>>>> 728404dacfdd (Btrfs: add helper btrfs_fdatawrite_range)
+  	ssize_t written;
+  	ssize_t written_buffered;
+  	loff_t endbyte;
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 7d817fe479fd..60b7f93d4323 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3950,6 +3950,7 @@ int btrfs_dirty_pages(struct btrfs_root *root, struct inode *inode,
+ 		      struct page **pages, size_t num_pages,
+ 		      loff_t pos, size_t write_bytes,
+ 		      struct extent_state **cached);
++int btrfs_fdatawrite_range(struct inode *inode, loff_t start, loff_t end);
+ 
+ /* tree-defrag.c */
+ int btrfs_defrag_leaves(struct btrfs_trans_handle *trans,
+* Unmerged path fs/btrfs/file.c
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 7a7b39cdf300..9a8758321d72 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6953,14 +6953,7 @@ static int lock_extent_direct(struct inode *inode, u64 lockstart, u64 lockend,
+ 			btrfs_put_ordered_extent(ordered);
+ 		} else {
+ 			/* Screw you mmap */
+-			ret = filemap_fdatawrite_range(inode->i_mapping,
+-						       lockstart,
+-						       lockend);
+-			if (!ret && test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+-					     &BTRFS_I(inode)->runtime_flags))
+-				ret = filemap_fdatawrite_range(inode->i_mapping,
+-							       lockstart,
+-							       lockend);
++			ret = btrfs_fdatawrite_range(inode, lockstart, lockend);
+ 			if (ret)
+ 				break;
+ 			ret = filemap_fdatawait_range(inode->i_mapping,
+diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+index ac734ec4cc20..1401b1af4f06 100644
+--- a/fs/btrfs/ordered-data.c
++++ b/fs/btrfs/ordered-data.c
+@@ -725,30 +725,10 @@ int btrfs_wait_ordered_range(struct inode *inode, u64 start, u64 len)
+ 	/* start IO across the range first to instantiate any delalloc
+ 	 * extents
+ 	 */
+-	ret = filemap_fdatawrite_range(inode->i_mapping, start, orig_end);
++	ret = btrfs_fdatawrite_range(inode, start, orig_end);
+ 	if (ret)
+ 		return ret;
+-	/*
+-	 * So with compression we will find and lock a dirty page and clear the
+-	 * first one as dirty, setup an async extent, and immediately return
+-	 * with the entire range locked but with nobody actually marked with
+-	 * writeback.  So we can't just filemap_write_and_wait_range() and
+-	 * expect it to work since it will just kick off a thread to do the
+-	 * actual work.  So we need to call filemap_fdatawrite_range _again_
+-	 * since it will wait on the page lock, which won't be unlocked until
+-	 * after the pages have been marked as writeback and so we're good to go
+-	 * from there.  We have to do this otherwise we'll miss the ordered
+-	 * extents and that results in badness.  Please Josef, do not think you
+-	 * know better and pull this out at some point in the future, it is
+-	 * right and you are wrong.
+-	 */
+-	if (test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+-		     &BTRFS_I(inode)->runtime_flags)) {
+-		ret = filemap_fdatawrite_range(inode->i_mapping, start,
+-					       orig_end);
+-		if (ret)
+-			return ret;
+-	}
++
+ 	ret = filemap_fdatawait_range(inode->i_mapping, start, orig_end);
+ 	if (ret)
+ 		return ret;
