@@ -1,0 +1,90 @@
+sctp: start t5 timer only when peer rwnd is 0 and local state is SHUTDOWN_PENDING
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author lucien <lucien.xin@gmail.com>
+commit 8a0d19c5ed417c78d03f4e0fa7215e58c40896d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8a0d19c5.failed
+
+when A sends a data to B, then A close() and enter into SHUTDOWN_PENDING
+state, if B neither claim his rwnd is 0 nor send SACK for this data, A
+will keep retransmitting this data until t5 timeout, Max.Retrans times
+can't work anymore, which is bad.
+
+if B's rwnd is not 0, it should send abort after Max.Retrans times, only
+when B's rwnd == 0 and A's retransmitting beyonds Max.Retrans times, A
+will start t5 timer, which is also commit f8d960524328 ("sctp: Enforce
+retransmission limit during shutdown") means, but it lacks the condition
+peer rwnd == 0.
+
+so fix it by adding a bit (zero_window_announced) in peer to record if
+the last rwnd is 0. If it was, zero_window_announced will be set. and use
+this bit to decide if start t5 timer when local.state is SHUTDOWN_PENDING.
+
+Fixes: commit f8d960524328 ("sctp: Enforce retransmission limit during shutdown")
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8a0d19c5ed417c78d03f4e0fa7215e58c40896d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/structs.h
+diff --cc include/net/sctp/structs.h
+index 7a7c7cb8b173,eea9bdeecba2..000000000000
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@@ -1491,18 -1492,10 +1491,24 @@@ struct sctp_association 
+  		 *             : order.  When DATA chunks are out of order,
+  		 *             : SACK's are not delayed (see Section 6).
+  		 */
+++<<<<<<< HEAD
+ +		__u8    sack_needed;     /* Do we need to sack the peer? */
+++=======
++ 		__u8    sack_needed:1,     /* Do we need to sack the peer? */
++ 			sack_generation:1,
++ 			zero_window_announced:1;
+++>>>>>>> 8a0d19c5ed41 (sctp: start t5 timer only when peer rwnd is 0 and local state is SHUTDOWN_PENDING)
+  		__u32	sack_cnt;
+ +		__u32	sack_generation;
+ +
+ +		/* These are capabilities which our peer advertised.  */
+ +		__u8	ecn_capable:1,	    /* Can peer do ECN? */
+ +			ipv4_address:1,	    /* Peer understands IPv4 addresses? */
+ +			ipv6_address:1,	    /* Peer understands IPv6 addresses? */
+ +			hostname_address:1, /* Peer understands DNS addresses? */
+ +			asconf_capable:1,   /* Does peer support ADDIP? */
+ +			prsctp_capable:1,   /* Can peer do PR-SCTP? */
+ +			auth_capable:1;	    /* Is peer doing SCTP-AUTH? */
+  
+  		__u32   adaptation_ind;	 /* Adaptation Code point. */
+  
+* Unmerged path include/net/sctp/structs.h
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index bd35dc2b52ec..7a7272d2fc1a 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -1273,6 +1273,7 @@ int sctp_outq_sack(struct sctp_outq *q, struct sctp_chunk *chunk)
+ 	 */
+ 
+ 	sack_a_rwnd = ntohl(sack->a_rwnd);
++	asoc->peer.zero_window_announced = !sack_a_rwnd;
+ 	outstanding = q->outstanding_bytes;
+ 
+ 	if (outstanding < sack_a_rwnd)
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+index e717a4d4dcaa..8c8788cd0b9e 100644
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -5421,7 +5421,8 @@ sctp_disposition_t sctp_sf_do_6_3_3_rtx(struct net *net,
+ 	SCTP_INC_STATS(net, SCTP_MIB_T3_RTX_EXPIREDS);
+ 
+ 	if (asoc->overall_error_count >= asoc->max_retrans) {
+-		if (asoc->state == SCTP_STATE_SHUTDOWN_PENDING) {
++		if (asoc->peer.zero_window_announced &&
++		    asoc->state == SCTP_STATE_SHUTDOWN_PENDING) {
+ 			/*
+ 			 * We are here likely because the receiver had its rwnd
+ 			 * closed for a while and we have not been able to
