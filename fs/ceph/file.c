@@ -583,7 +583,7 @@ ceph_sync_direct_write(struct kiocb *iocb, const struct iovec *iov,
 					    false);
 		if (IS_ERR(req)) {
 			ret = PTR_ERR(req);
-			goto out;
+			break;
 		}
 
 		num_pages = calc_pages_for(page_align, len);
@@ -701,7 +701,7 @@ static ssize_t ceph_sync_write(struct kiocb *iocb, const struct iovec *iov,
 					    false);
 		if (IS_ERR(req)) {
 			ret = PTR_ERR(req);
-			goto out;
+			break;
 		}
 
 		/*
