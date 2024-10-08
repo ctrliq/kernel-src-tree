@@ -31,6 +31,7 @@
 
 #include <net/ip.h>
 #include <net/ipv6.h>
+#include <net/ip6_fib.h>
 #include <net/checksum.h>
 #include <net/dsfield.h>
 #include <net/mpls.h>
