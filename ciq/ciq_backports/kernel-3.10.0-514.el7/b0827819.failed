@@ -1,0 +1,126 @@
+sched/deadline: Restrict user params max value to 2^63 ns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@gmail.com>
+commit b0827819b0da4acfbc1df1e05edcf50efd07cbd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b0827819.failed
+
+Michael Kerrisk noticed that creating SCHED_DEADLINE reservations
+with certain parameters (e.g, a runtime of something near 2^64 ns)
+can cause a system freeze for some amount of time.
+
+The problem is that in the interface we have
+
+ u64 sched_runtime;
+
+while internally we need to have a signed runtime (to cope with
+budget overruns)
+
+ s64 runtime;
+
+At the time we setup a new dl_entity we copy the first value in
+the second. The cast turns out with negative values when
+sched_runtime is too big, and this causes the scheduler to go crazy
+right from the start.
+
+Moreover, considering how we deal with deadlines wraparound
+
+ (s64)(a - b) < 0
+
+we also have to restrict acceptable values for sched_{deadline,period}.
+
+This patch fixes the thing checking that user parameters are always
+below 2^63 ns (still large enough for everyone).
+
+It also rewrites other conditions that we check, since in
+__checkparam_dl we don't have to deal with deadline wraparounds
+and what we have now erroneously fails when the difference between
+values is too big.
+
+	Reported-by: Michael Kerrisk <mtk.manpages@gmail.com>
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: <stable@vger.kernel.org>
+	Cc: Dario Faggioli<raistlin@linux.it>
+	Cc: Dave Jones <davej@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/20140513141131.20d944f81633ee937f256385@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b0827819b0da4acfbc1df1e05edcf50efd07cbd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index f8654b1100de,44e00abece09..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4096,7 -3176,59 +4096,63 @@@ __setscheduler(struct rq *rq, struct ta
+  		p->sched_class = &rt_sched_class;
+  	else
+  		p->sched_class = &fair_sched_class;
+++<<<<<<< HEAD
+ +	set_load_weight(p);
+++=======
++ }
++ 
++ static void
++ __getparam_dl(struct task_struct *p, struct sched_attr *attr)
++ {
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	attr->sched_priority = p->rt_priority;
++ 	attr->sched_runtime = dl_se->dl_runtime;
++ 	attr->sched_deadline = dl_se->dl_deadline;
++ 	attr->sched_period = dl_se->dl_period;
++ 	attr->sched_flags = dl_se->flags;
++ }
++ 
++ /*
++  * This function validates the new parameters of a -deadline task.
++  * We ask for the deadline not being zero, and greater or equal
++  * than the runtime, as well as the period of being zero or
++  * greater than deadline. Furthermore, we have to be sure that
++  * user parameters are above the internal resolution of 1us (we
++  * check sched_runtime only since it is always the smaller one) and
++  * below 2^63 ns (we have to check both sched_deadline and
++  * sched_period, as the latter can be zero).
++  */
++ static bool
++ __checkparam_dl(const struct sched_attr *attr)
++ {
++ 	/* deadline != 0 */
++ 	if (attr->sched_deadline == 0)
++ 		return false;
++ 
++ 	/*
++ 	 * Since we truncate DL_SCALE bits, make sure we're at least
++ 	 * that big.
++ 	 */
++ 	if (attr->sched_runtime < (1ULL << DL_SCALE))
++ 		return false;
++ 
++ 	/*
++ 	 * Since we use the MSB for wrap-around and sign issues, make
++ 	 * sure it's not set (mind that period can be equal to zero).
++ 	 */
++ 	if (attr->sched_deadline & (1ULL << 63) ||
++ 	    attr->sched_period & (1ULL << 63))
++ 		return false;
++ 
++ 	/* runtime <= deadline <= period (if period != 0) */
++ 	if ((attr->sched_period != 0 &&
++ 	     attr->sched_period < attr->sched_deadline) ||
++ 	    attr->sched_deadline < attr->sched_runtime)
++ 		return false;
++ 
++ 	return true;
+++>>>>>>> b0827819b0da (sched/deadline: Restrict user params max value to 2^63 ns)
+  }
+  
+  /*
+* Unmerged path kernel/sched/core.c
