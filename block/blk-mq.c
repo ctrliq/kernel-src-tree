@@ -411,7 +411,7 @@ void blk_mq_end_io(struct request *rq, int error)
 }
 EXPORT_SYMBOL(blk_mq_end_io);
 
-static void blk_mq_start_request(struct request *rq)
+static void blk_mq_start_request(struct request *rq, bool last)
 {
 	struct request_queue *q = rq->q;
 
@@ -424,6 +424,25 @@ static void blk_mq_start_request(struct request *rq)
 	 */
 	rq->deadline = jiffies + q->rq_timeout;
 	set_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+
+	if (q->dma_drain_size && blk_rq_bytes(rq)) {
+		/*
+		 * Make sure space for the drain appears.  We know we can do
+		 * this because max_hw_segments has been adjusted to be one
+		 * fewer than the device can handle.
+		 */
+		rq->nr_phys_segments++;
+	}
+
+	/*
+	 * Flag the last request in the series so that drivers know when IO
+	 * should be kicked off, if they don't do it on a per-request basis.
+	 *
+	 * Note: the flag isn't the only condition drivers should do kick off.
+	 * If drive is busy, the last request might not have the bit set.
+	 */
+	if (last)
+		rq->cmd_flags |= REQ_END;
 }
 
 static void blk_mq_requeue_request(struct request *rq)
@@ -432,6 +451,11 @@ static void blk_mq_requeue_request(struct request *rq)
 
 	trace_block_rq_requeue(q, rq);
 	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+
+	rq->cmd_flags &= ~REQ_END;
+
+	if (q->dma_drain_size && blk_rq_bytes(rq))
+		rq->nr_phys_segments--;
 }
 
 struct blk_mq_timeout_data {
@@ -599,29 +623,8 @@ static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
 
 		rq = list_first_entry(&rq_list, struct request, queuelist);
 		list_del_init(&rq->queuelist);
-		blk_mq_start_request(rq);
 
-		if (q->dma_drain_size && blk_rq_bytes(rq)) {
-			/*
-			 * make sure space for the drain appears we
-			 * know we can do this because max_hw_segments
-			 * has been adjusted to be one fewer than the
-			 * device can handle
-			 */
-			rq->nr_phys_segments++;
-		}
-
-		/*
-		 * Last request in the series. Flag it as such, this
-		 * enables drivers to know when IO should be kicked off,
-		 * if they don't do it on a per-request basis.
-		 *
-		 * Note: the flag isn't the only condition drivers
-		 * should do kick off. If drive is busy, the last
-		 * request might not have the bit set.
-		 */
-		if (list_empty(&rq_list))
-			rq->cmd_flags |= REQ_END;
+		blk_mq_start_request(rq, list_empty(&rq_list));
 
 		ret = q->mq_ops->queue_rq(hctx, rq);
 		switch (ret) {
