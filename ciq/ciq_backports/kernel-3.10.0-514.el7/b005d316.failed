@@ -1,0 +1,124 @@
+mlx5: Add arbitrary sg list support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit b005d316471374b1ff26df8c8460cc1ea9186647
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b005d316.failed
+
+Allocate proper context for arbitrary scatterlist registration
+If ib_alloc_mr is called with IB_MR_MAP_ARB_SG, the driver
+allocate a private klm list instead of a private page list.
+Set the UMR wqe correctly when posting the fast registration.
+
+Also, expose device cap IB_DEVICE_MAP_ARB_SG according to the
+device id (until we have a FW bit that correctly exposes it).
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit b005d316471374b1ff26df8c8460cc1ea9186647)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index bf776c322904,7e89a547bf34..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -488,6 -487,13 +488,16 @@@ static int mlx5_ib_query_device(struct 
+  		props->device_cap_flags |= IB_DEVICE_AUTO_PATH_MIG;
+  	if (MLX5_CAP_GEN(mdev, xrc))
+  		props->device_cap_flags |= IB_DEVICE_XRC;
+++<<<<<<< HEAD
+++=======
++ 	if (MLX5_CAP_GEN(mdev, imaicl)) {
++ 		props->device_cap_flags |= IB_DEVICE_MEM_WINDOW |
++ 					   IB_DEVICE_MEM_WINDOW_TYPE_2B;
++ 		props->max_mw = 1 << MLX5_CAP_GEN(mdev, log_max_mkey);
++ 		/* We support 'Gappy' memory registration too */
++ 		props->device_cap_flags |= IB_DEVICE_SG_GAPS_REG;
++ 	}
+++>>>>>>> b005d3164713 (mlx5: Add arbitrary sg list support)
+  	props->device_cap_flags |= IB_DEVICE_MEM_MGT_EXTENSIONS;
+  	if (MLX5_CAP_GEN(mdev, sho)) {
+  		props->device_cap_flags |= IB_DEVICE_SIGNATURE_HANDOVER;
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 262b860a11ee,60b89629f091..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -390,7 -447,8 +390,12 @@@ struct mlx5_ib_mr 
+  	int			ndescs;
+  	int			max_descs;
+  	int			desc_size;
+++<<<<<<< HEAD
+ +	struct mlx5_core_mr	mmr;
+++=======
++ 	int			access_mode;
++ 	struct mlx5_core_mkey	mmkey;
+++>>>>>>> b005d3164713 (mlx5: Add arbitrary sg list support)
+  	struct ib_umem	       *umem;
+  	struct mlx5_shared_mr_info	*smr_info;
+  	struct list_head	list;
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 9a8b4ea88eb7,4d5bff151cdf..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1584,8 -1591,8 +1593,13 @@@ struct ib_mr *mlx5_ib_alloc_mr(struct i
+  		goto err_free_in;
+  	}
+  
+++<<<<<<< HEAD
+ +	in->seg.flags = MLX5_PERM_UMR_EN | access_mode;
+ +	err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in, sizeof(*in),
+++=======
++ 	in->seg.flags = MLX5_PERM_UMR_EN | mr->access_mode;
++ 	err = mlx5_core_create_mkey(dev->mdev, &mr->mmkey, in, sizeof(*in),
+++>>>>>>> b005d3164713 (mlx5: Add arbitrary sg list support)
+  				    NULL, NULL, NULL);
+  	if (err)
+  		goto err_destroy_psv;
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 93bacd3a81a6..bc2191a9775c 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -2091,6 +2091,11 @@ static void set_reg_umr_seg(struct mlx5_wqe_umr_ctrl_seg *umr,
+ 	int ndescs = mr->ndescs;
+ 
+ 	memset(umr, 0, sizeof(*umr));
++
++	if (mr->access_mode == MLX5_ACCESS_MODE_KLM)
++		/* KLMs take twice the size of MTTs */
++		ndescs *= 2;
++
+ 	umr->flags = MLX5_UMR_CHECK_NOT_FREE;
+ 	umr->klm_octowords = get_klm_octo(ndescs);
+ 	umr->mkey_mask = frwr_mkey_mask();
+@@ -2238,13 +2243,19 @@ static void set_reg_mkey_seg(struct mlx5_mkey_seg *seg,
+ 	int ndescs = ALIGN(mr->ndescs, 8) >> 1;
+ 
+ 	memset(seg, 0, sizeof(*seg));
+-	seg->flags = get_umr_flags(access) | MLX5_ACCESS_MODE_MTT;
++
++	if (mr->access_mode == MLX5_ACCESS_MODE_MTT)
++		seg->log2_page_size = ilog2(mr->ibmr.page_size);
++	else if (mr->access_mode == MLX5_ACCESS_MODE_KLM)
++		/* KLMs take twice the size of MTTs */
++		ndescs *= 2;
++
++	seg->flags = get_umr_flags(access) | mr->access_mode;
+ 	seg->qpn_mkey7_0 = cpu_to_be32((key & 0xff) | 0xffffff00);
+ 	seg->flags_pd = cpu_to_be32(MLX5_MKEY_REMOTE_INVAL);
+ 	seg->start_addr = cpu_to_be64(mr->ibmr.iova);
+ 	seg->len = cpu_to_be64(mr->ibmr.length);
+ 	seg->xlt_oct_size = cpu_to_be32(ndescs);
+-	seg->log2_page_size = ilog2(mr->ibmr.page_size);
+ }
+ 
+ static void set_mkey_segment(struct mlx5_mkey_seg *seg, struct ib_send_wr *wr,
