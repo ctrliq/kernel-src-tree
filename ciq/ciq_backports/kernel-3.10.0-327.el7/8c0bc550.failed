@@ -1,0 +1,249 @@
+bonding: adjust locking comments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit 8c0bc550288d81e9ad8a2ed9136a72140b9ef507
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8c0bc550.failed
+
+Now that locks have been removed, remove some unnecessary comments and
+adjust others to reflect reality. Also add a comment to "mode_lock" to
+describe its current users and give a brief summary why they need it.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8c0bc550288d81e9ad8a2ed9136a72140b9ef507)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_alb.c
+index 06a8df1ef842,85af961f1317..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -376,31 -337,64 +373,52 @@@ out
+  static struct slave *rlb_next_rx_slave(struct bonding *bond)
+  {
+  	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct slave *before = NULL, *rx_slave = NULL, *slave;
+ -	struct list_head *iter;
+ -	bool found = false;
+ +	struct slave *rx_slave, *slave, *start_at;
+ +	int i = 0;
+  
+ -	bond_for_each_slave(bond, slave, iter) {
+ -		if (!bond_slave_can_tx(slave))
+ -			continue;
+ -		if (!found) {
+ -			if (!before || before->speed < slave->speed)
+ -				before = slave;
+ -		} else {
+ -			if (!rx_slave || rx_slave->speed < slave->speed)
+ -				rx_slave = slave;
+ -		}
+ -		if (slave == bond_info->rx_slave)
+ -			found = true;
+ +	if (bond_info->next_rx_slave) {
+ +		start_at = bond_info->next_rx_slave;
+ +	} else {
+ +		start_at = bond->first_slave;
+  	}
+ -	/* we didn't find anything after the current or we have something
+ -	 * better before and up to the current slave
+ -	 */
+ -	if (!rx_slave || (before && rx_slave->speed < before->speed))
+ -		rx_slave = before;
+  
+ -	if (rx_slave)
+ -		bond_info->rx_slave = rx_slave;
+ +	rx_slave = NULL;
+  
+++<<<<<<< HEAD
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		if (SLAVE_IS_OK(slave)) {
+ +			if (!rx_slave) {
+++=======
++ 	return rx_slave;
++ }
++ 
++ /* Caller must hold rcu_read_lock() */
++ static struct slave *__rlb_next_rx_slave(struct bonding *bond)
++ {
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct slave *before = NULL, *rx_slave = NULL, *slave;
++ 	struct list_head *iter;
++ 	bool found = false;
++ 
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (!bond_slave_can_tx(slave))
++ 			continue;
++ 		if (!found) {
++ 			if (!before || before->speed < slave->speed)
++ 				before = slave;
++ 		} else {
++ 			if (!rx_slave || rx_slave->speed < slave->speed)
+++>>>>>>> 8c0bc550288d (bonding: adjust locking comments)
+ +				rx_slave = slave;
+ +			} else if (slave->speed > rx_slave->speed) {
+  				rx_slave = slave;
+ +			}
+  		}
+ -		if (slave == bond_info->rx_slave)
+ -			found = true;
+  	}
+ -	/* we didn't find anything after the current or we have something
+ -	 * better before and up to the current slave
+ -	 */
+ -	if (!rx_slave || (before && rx_slave->speed < before->speed))
+ -		rx_slave = before;
+  
+ -	if (rx_slave)
+ -		bond_info->rx_slave = rx_slave;
+ +	if (rx_slave) {
+ +		bond_info->next_rx_slave = rx_slave->next;
+ +	}
+  
+  	return rx_slave;
+  }
+@@@ -1592,12 -1662,16 +1609,11 @@@ void bond_alb_deinit_slave(struct bondi
+  	tlb_clear_slave(bond, slave, 0);
+  
+  	if (bond->alb_info.rlb_enabled) {
+ -		bond->alb_info.rx_slave = NULL;
+ +		bond->alb_info.next_rx_slave = NULL;
+  		rlb_clear_slave(bond, slave);
+  	}
+ -
+ -	if (bond_is_nondyn_tlb(bond))
+ -		if (bond_tlb_update_slave_arr(bond, slave))
+ -			pr_err("Failed to build slave-array for TLB mode.\n");
+ -
+  }
+  
+- /* Caller must hold bond lock for read */
+  void bond_alb_handle_link_change(struct bonding *bond, struct slave *slave, char link)
+  {
+  	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+diff --cc drivers/net/bonding/bond_main.c
+index b4cb8784d691,2d90a8b7f62e..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2758,30 -2494,21 +2758,34 @@@ re_arm
+   * place for the slave.  Returns 0 if no changes are found, >0 if changes
+   * to link states must be committed.
+   *
+++<<<<<<< HEAD
+ + * Called with bond->lock held for read.
+++=======
++  * Called with rcu_read_lock held.
+++>>>>>>> 8c0bc550288d (bonding: adjust locking comments)
+   */
+ -static int bond_ab_arp_inspect(struct bonding *bond)
+ +static int bond_ab_arp_inspect(struct bonding *bond, int delta_in_ticks)
+  {
+ -	unsigned long trans_start, last_rx;
+ -	struct list_head *iter;
+  	struct slave *slave;
+ -	int commit = 0;
+ +	int i, commit = 0;
+ +	unsigned long trans_start;
+ +	int extra_ticks;
+  
+ -	bond_for_each_slave_rcu(bond, slave, iter) {
+ +	/* All the time comparisons below need some extra time. Otherwise, on
+ +	 * fast networks the ARP probe/reply may arrive within the same jiffy
+ +	 * as it was sent.  Then, the next time the ARP monitor is run, one
+ +	 * arp_interval will already have passed in the comparisons.
+ +	 */
+ +	extra_ticks = delta_in_ticks / 2;
+ +
+ +	bond_for_each_slave(bond, slave, i) {
+  		slave->new_link = BOND_LINK_NOCHANGE;
+ -		last_rx = slave_last_rx(bond, slave);
+  
+  		if (slave->link != BOND_LINK_UP) {
+ -			if (bond_time_in_interval(bond, last_rx, 1)) {
+ +			if (time_in_range(jiffies,
+ +				slave_last_rx(bond, slave) - delta_in_ticks,
+ +				slave_last_rx(bond, slave) + delta_in_ticks + extra_ticks)) {
+ +
+  				slave->new_link = BOND_LINK_UP;
+  				commit++;
+  			}
+@@@ -2926,28 -2642,27 +2930,32 @@@ do_failover
+  /*
+   * Send ARP probes for active-backup mode ARP monitor.
+   *
+++<<<<<<< HEAD
+ + * Called with bond->lock held for read.
+++=======
++  * Called with rcu_read_lock held.
+++>>>>>>> 8c0bc550288d (bonding: adjust locking comments)
+   */
+ -static bool bond_ab_arp_probe(struct bonding *bond)
+ +static void bond_ab_arp_probe(struct bonding *bond)
+  {
+ -	struct slave *slave, *before = NULL, *new_slave = NULL,
+ -		     *curr_arp_slave = rcu_dereference(bond->current_arp_slave),
+ -		     *curr_active_slave = rcu_dereference(bond->curr_active_slave);
+ -	struct list_head *iter;
+ -	bool found = false;
+ -	bool should_notify_rtnl = BOND_SLAVE_NOTIFY_LATER;
+ +	struct slave *slave;
+ +	int i;
+  
+ -	if (curr_arp_slave && curr_active_slave)
+ -		netdev_info(bond->dev, "PROBE: c_arp %s && cas %s BAD\n",
+ -			    curr_arp_slave->dev->name,
+ -			    curr_active_slave->dev->name);
+ +	read_lock(&bond->curr_slave_lock);
+  
+ -	if (curr_active_slave) {
+ -		bond_arp_send_all(bond, curr_active_slave);
+ -		return should_notify_rtnl;
+ +	if (bond->current_arp_slave && bond->curr_active_slave)
+ +		pr_info("PROBE: c_arp %s && cas %s BAD\n",
+ +			bond->current_arp_slave->dev->name,
+ +			bond->curr_active_slave->dev->name);
+ +
+ +	if (bond->curr_active_slave) {
+ +		bond_arp_send_all(bond, bond->curr_active_slave);
+ +		read_unlock(&bond->curr_slave_lock);
+ +		return;
+  	}
+  
+ +	read_unlock(&bond->curr_slave_lock);
+ +
+  	/* if we don't have a curr_active_slave, search for the next available
+  	 * backup slave from the current_arp_slave and make it the candidate
+  	 * for becoming the curr_active_slave
+diff --cc drivers/net/bonding/bonding.h
+index 64c0cb81e478,3aff1a815e89..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -224,8 -195,13 +224,18 @@@ struct bonding 
+  	s32      slave_cnt; /* never change this value outside the attach/detach wrappers */
+  	int     (*recv_probe)(const struct sk_buff *, struct bonding *,
+  			      struct slave *);
+++<<<<<<< HEAD
+ +	rwlock_t lock;
+ +	rwlock_t curr_slave_lock;
+++=======
++ 	/* mode_lock is used for mode-specific locking needs, currently used by:
++ 	 * 3ad mode (4) - protect against running bond_3ad_unbind_slave() and
++ 	 *                bond_3ad_state_machine_handler() concurrently.
++ 	 * TLB mode (5) - to sync the use and modifications of its hash table
++ 	 * ALB mode (6) - to sync the use and modifications of its hash table
++ 	 */
++ 	spinlock_t mode_lock;
+++>>>>>>> 8c0bc550288d (bonding: adjust locking comments)
+  	u8	 send_peer_notif;
+  	u8       igmp_retrans;
+  #ifdef CONFIG_PROC_FS
+* Unmerged path drivers/net/bonding/bond_alb.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bonding.h
