@@ -1,0 +1,214 @@
+IB/hfi1: Remove unneeded mm argument in remove function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit 082b3532915395ea6620ba691138baf151a543b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/082b3532.failed
+
+The reworked mmu_rb interface allows the unused mm argument to be removed.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 082b3532915395ea6620ba691138baf151a543b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/mmu_rb.c
+#	drivers/infiniband/hw/hfi1/user_exp_rcv.c
+#	drivers/staging/hfi1/user_sdma.c
+#	drivers/staging/hfi1/user_sdma.h
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 47c9c87af47a,0ecf27903dc2..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -297,6 -306,20 +297,23 @@@ static int defer_packet_queue
+  	struct sdma_txreq *,
+  	unsigned seq);
+  static void activate_packet_queue(struct iowait *, int);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ static bool sdma_rb_filter(struct mmu_rb_node *, unsigned long, unsigned long);
++ static int sdma_rb_insert(void *, struct mmu_rb_node *);
++ static int sdma_rb_evict(void *arg, struct mmu_rb_node *mnode,
++ 			 void *arg2, bool *stop);
++ static void sdma_rb_remove(void *, struct mmu_rb_node *);
++ static int sdma_rb_invalidate(void *, struct mmu_rb_node *);
++ 
++ static struct mmu_rb_ops sdma_rb_ops = {
++ 	.filter = sdma_rb_filter,
++ 	.insert = sdma_rb_insert,
++ 	.evict = sdma_rb_evict,
++ 	.remove = sdma_rb_remove,
++ 	.invalidate = sdma_rb_invalidate
++ };
+++>>>>>>> 082b35329153 (IB/hfi1: Remove unneeded mm argument in remove function):drivers/infiniband/hw/hfi1/user_sdma.c
+  
+  static int defer_packet_queue(
+  	struct sdma_engine *sde,
+@@@ -1484,3 -1601,66 +1501,69 @@@ static inline void set_comp_state(struc
+  	trace_hfi1_sdma_user_completion(pq->dd, pq->ctxt, pq->subctxt,
+  					idx, state, ret);
+  }
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 
++ static bool sdma_rb_filter(struct mmu_rb_node *node, unsigned long addr,
++ 			   unsigned long len)
++ {
++ 	return (bool)(node->addr == addr);
++ }
++ 
++ static int sdma_rb_insert(void *arg, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	atomic_inc(&node->refcount);
++ 	return 0;
++ }
++ 
++ /*
++  * Return 1 to remove the node from the rb tree and call the remove op.
++  *
++  * Called with the rb tree lock held.
++  */
++ static int sdma_rb_evict(void *arg, struct mmu_rb_node *mnode,
++ 			 void *evict_arg, bool *stop)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 	struct evict_data *evict_data = evict_arg;
++ 
++ 	/* is this node still being used? */
++ 	if (atomic_read(&node->refcount))
++ 		return 0; /* keep this node */
++ 
++ 	/* this node will be evicted, add its pages to our count */
++ 	evict_data->cleared += node->npages;
++ 
++ 	/* have enough pages been cleared? */
++ 	if (evict_data->cleared >= evict_data->target)
++ 		*stop = true;
++ 
++ 	return 1; /* remove this node */
++ }
++ 
++ static void sdma_rb_remove(void *arg, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	atomic_sub(node->npages, &node->pq->n_locked);
++ 
++ 	unpin_vector_pages(node->pq->mm, node->pages, 0, node->npages);
++ 
++ 	kfree(node);
++ }
++ 
++ static int sdma_rb_invalidate(void *arg, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	if (!atomic_read(&node->refcount))
++ 		return 1;
++ 	return 0;
++ }
+++>>>>>>> 082b35329153 (IB/hfi1: Remove unneeded mm argument in remove function):drivers/infiniband/hw/hfi1/user_sdma.c
+diff --cc drivers/staging/hfi1/user_sdma.h
+index 7ebbc4634989,754f6ebf13fb..000000000000
+--- a/drivers/staging/hfi1/user_sdma.h
++++ b/drivers/staging/hfi1/user_sdma.h
+@@@ -47,45 -44,44 +47,60 @@@
+   * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   *
+   */
+ -#ifndef _HFI1_MMU_RB_H
+ -#define _HFI1_MMU_RB_H
+ +#include <linux/device.h>
+ +#include <linux/wait.h>
+ +
+ +#include "common.h"
+ +#include "iowait.h"
+  
+ -#include "hfi.h"
+ +#define EXP_TID_TIDLEN_MASK   0x7FFULL
+ +#define EXP_TID_TIDLEN_SHIFT  0
+ +#define EXP_TID_TIDCTRL_MASK  0x3ULL
+ +#define EXP_TID_TIDCTRL_SHIFT 20
+ +#define EXP_TID_TIDIDX_MASK   0x7FFULL
+ +#define EXP_TID_TIDIDX_SHIFT  22
+ +#define EXP_TID_GET(tid, field)	\
+ +	(((tid) >> EXP_TID_TID##field##_SHIFT) & EXP_TID_TID##field##_MASK)
+  
+ -struct mmu_rb_node {
+ -	unsigned long addr;
+ -	unsigned long len;
+ -	unsigned long __last;
+ -	struct rb_node node;
+ +extern uint extended_psn;
+ +
+ +struct hfi1_user_sdma_pkt_q {
+  	struct list_head list;
+ +	unsigned ctxt;
+ +	unsigned subctxt;
+ +	u16 n_max_reqs;
+ +	atomic_t n_reqs;
+ +	u16 reqidx;
+ +	struct hfi1_devdata *dd;
+ +	struct kmem_cache *txreq_cache;
+ +	struct user_sdma_request *reqs;
+ +	struct iowait busy;
+ +	unsigned state;
+ +	wait_queue_head_t wait;
+ +	unsigned long unpinned;
+  };
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.h
+ +struct hfi1_user_sdma_comp_q {
+ +	u16 nentries;
+ +	struct hfi1_sdma_comp_entry *comps;
+++=======
++ /*
++  * NOTE: filter, insert, invalidate, and evict must not sleep.  Only remove is
++  * allowed to sleep.
++  */
++ struct mmu_rb_ops {
++ 	bool (*filter)(struct mmu_rb_node *node, unsigned long addr,
++ 		       unsigned long len);
++ 	int (*insert)(void *ops_arg, struct mmu_rb_node *mnode);
++ 	void (*remove)(void *ops_arg, struct mmu_rb_node *mnode);
++ 	int (*invalidate)(void *ops_arg, struct mmu_rb_node *node);
++ 	int (*evict)(void *ops_arg, struct mmu_rb_node *mnode,
++ 		     void *evict_arg, bool *stop);
+++>>>>>>> 082b35329153 (IB/hfi1: Remove unneeded mm argument in remove function):drivers/infiniband/hw/hfi1/mmu_rb.h
+  };
+  
+ -int hfi1_mmu_rb_register(void *ops_arg, struct mm_struct *mm,
+ -			 struct mmu_rb_ops *ops,
+ -			 struct workqueue_struct *wq,
+ -			 struct mmu_rb_handler **handler);
+ -void hfi1_mmu_rb_unregister(struct mmu_rb_handler *handler);
+ -int hfi1_mmu_rb_insert(struct mmu_rb_handler *handler,
+ -		       struct mmu_rb_node *mnode);
+ -void hfi1_mmu_rb_evict(struct mmu_rb_handler *handler, void *evict_arg);
+ -void hfi1_mmu_rb_remove(struct mmu_rb_handler *handler,
+ -			struct mmu_rb_node *mnode);
+ -struct mmu_rb_node *hfi1_mmu_rb_extract(struct mmu_rb_handler *handler,
+ -					unsigned long addr, unsigned long len);
+ -
+ -#endif /* _HFI1_MMU_RB_H */
+ +int hfi1_user_sdma_alloc_queues(struct hfi1_ctxtdata *, struct file *);
+ +int hfi1_user_sdma_free_queues(struct hfi1_filedata *);
+ +int hfi1_user_sdma_process_request(struct file *, struct iovec *, unsigned long,
+ +				   unsigned long *);
+* Unmerged path drivers/infiniband/hw/hfi1/mmu_rb.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.c
+* Unmerged path drivers/infiniband/hw/hfi1/mmu_rb.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.c
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+* Unmerged path drivers/staging/hfi1/user_sdma.h
