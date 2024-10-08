@@ -1,0 +1,293 @@
+net: replace dst_cache ip6_tunnel implementation with the generic one
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] replace dst_cache ip6_tunnel implementation with the generic one (Jiri Benc) [1323141]
+Rebuild_FUZZ: 96.24%
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 607f725f6f7d5ec3759fbc16224afb60e2152a5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/607f725f.failed
+
+This also fix a potential race into the existing tunnel code, which
+could lead to the wrong dst to be permanenty cached:
+
+CPU1:					CPU2:
+  <xmit on ip6_tunnel>
+  <cache lookup fails>
+  dst = ip6_route_output(...)
+					<tunnel params are changed via nl>
+					dst_cache_reset() // no effect,
+							// the cache is empty
+  dst_cache_set() // the wrong dst
+	// is permanenty stored
+	// into the cache
+
+With the new dst implementation the above race is not possible
+since the first cache lookup after dst_cache_reset will fail due
+to the timestamp check
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Suggested-and-acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 607f725f6f7d5ec3759fbc16224afb60e2152a5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_tunnel.h
+#	net/ipv6/ip6_gre.c
+#	net/ipv6/ip6_tunnel.c
+diff --cc include/net/ip6_tunnel.h
+index ae57d0975630,499a707765ea..000000000000
+--- a/include/net/ip6_tunnel.h
++++ b/include/net/ip6_tunnel.h
+@@@ -5,6 -5,8 +5,11 @@@
+  #include <linux/netdevice.h>
+  #include <linux/if_tunnel.h>
+  #include <linux/ip6_tunnel.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/ip_tunnels.h>
++ #include <net/dst_cache.h>
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  
+  #define IP6TUNNEL_ERR_TIMEO (30*HZ)
+  
+@@@ -39,8 -41,7 +44,12 @@@ struct ip6_tnl 
+  	struct net *net;	/* netns for packet i/o */
+  	struct __ip6_tnl_parm parms;	/* tunnel configuration parameters */
+  	struct flowi fl;	/* flowi template for xmit */
+++<<<<<<< HEAD
+ +	struct dst_entry *dst_cache;    /* cached dst */
+ +	u32 dst_cookie;
+++=======
++ 	struct dst_cache dst_cache;	/* cached dst */
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  
+  	int err_count;
+  	unsigned long err_time;
+@@@ -60,9 -61,6 +69,12 @@@ struct ipv6_tlv_tnl_enc_lim 
+  	__u8 encap_limit;	/* tunnel encapsulation limit   */
+  } __packed;
+  
+++<<<<<<< HEAD
+ +struct dst_entry *ip6_tnl_dst_get(struct ip6_tnl *t);
+ +void ip6_tnl_dst_reset(struct ip6_tnl *t);
+ +void ip6_tnl_dst_set(struct ip6_tnl *t, struct dst_entry *dst);
+++=======
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  int ip6_tnl_rcv_ctl(struct ip6_tnl *t, const struct in6_addr *laddr,
+  		const struct in6_addr *raddr);
+  int ip6_tnl_xmit_ctl(struct ip6_tnl *t, const struct in6_addr *laddr,
+diff --cc net/ipv6/ip6_gre.c
+index 9376a33fe2bb,a94e50602813..000000000000
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@@ -635,20 -633,20 +635,20 @@@ static netdev_tx_t ip6gre_xmit2(struct 
+  	}
+  
+  	if (!fl6->flowi6_mark)
+- 		dst = ip6_tnl_dst_get(tunnel);
++ 		dst = dst_cache_get(&tunnel->dst_cache);
+  
+  	if (!dst) {
+ -		dst = ip6_route_output(net, NULL, fl6);
+ +		ndst = ip6_route_output(net, NULL, fl6);
+  
+ -		if (dst->error)
+ +		if (ndst->error)
+  			goto tx_err_link_failure;
+ -		dst = xfrm_lookup(net, dst, flowi6_to_flowi(fl6), NULL, 0);
+ -		if (IS_ERR(dst)) {
+ -			err = PTR_ERR(dst);
+ -			dst = NULL;
+ +		ndst = xfrm_lookup(net, ndst, flowi6_to_flowi(fl6), NULL, 0);
+ +		if (IS_ERR(ndst)) {
+ +			err = PTR_ERR(ndst);
+ +			ndst = NULL;
+  			goto tx_err_link_failure;
+  		}
+ -		ndst = dst;
+ +		dst = ndst;
+  	}
+  
+  	tdev = dst->dev;
+@@@ -703,12 -701,9 +703,18 @@@
+  		skb = new_skb;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (fl6->flowi6_mark) {
+ +		skb_dst_set(skb, dst);
+ +		ndst = NULL;
+ +	} else {
+ +		skb_dst_set_noref(skb, dst);
+ +	}
+++=======
++ 	if (!fl6->flowi6_mark && ndst)
++ 		dst_cache_set_ip6(&tunnel->dst_cache, ndst, &fl6->saddr);
++ 	skb_dst_set(skb, dst);
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  
+  	proto = NEXTHDR_GRE;
+  	if (encap_limit >= 0) {
+@@@ -1221,6 -1217,9 +1227,12 @@@ static const struct net_device_ops ip6g
+  
+  static void ip6gre_dev_free(struct net_device *dev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct ip6_tnl *t = netdev_priv(dev);
++ 
++ 	dst_cache_destroy(&t->dst_cache);
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  	free_percpu(dev->tstats);
+  	free_netdev(dev);
+  }
+@@@ -1257,6 -1257,13 +1269,16 @@@ static int ip6gre_tunnel_init_common(st
+  	if (!dev->tstats)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = dst_cache_init(&tunnel->dst_cache, GFP_KERNEL);
++ 	if (ret) {
++ 		free_percpu(dev->tstats);
++ 		dev->tstats = NULL;
++ 		return ret;
++ 	}
++ 
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  	return 0;
+  }
+  
+diff --cc net/ipv6/ip6_tunnel.c
+index da3fa47becb4,3f3aabd2f07b..000000000000
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@@ -124,41 -122,6 +124,44 @@@ static struct net_device_stats *ip6_get
+  	return &dev->stats;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Locking : hash tables are protected by RCU and RTNL
+ + */
+ +
+ +struct dst_entry *ip6_tnl_dst_get(struct ip6_tnl *t)
+ +{
+ +	struct dst_entry *dst = t->dst_cache;
+ +
+ +	if (dst && dst->obsolete &&
+ +	    dst->ops->check(dst, t->dst_cookie) == NULL) {
+ +		t->dst_cache = NULL;
+ +		dst_release(dst);
+ +		return NULL;
+ +	}
+ +
+ +	return dst;
+ +}
+ +EXPORT_SYMBOL_GPL(ip6_tnl_dst_get);
+ +
+ +void ip6_tnl_dst_reset(struct ip6_tnl *t)
+ +{
+ +	dst_release(t->dst_cache);
+ +	t->dst_cache = NULL;
+ +}
+ +EXPORT_SYMBOL_GPL(ip6_tnl_dst_reset);
+ +
+ +void ip6_tnl_dst_set(struct ip6_tnl *t, struct dst_entry *dst)
+ +{
+ +	struct rt6_info *rt = (struct rt6_info *) dst;
+ +	t->dst_cookie = rt->rt6i_node ? rt->rt6i_node->fn_sernum : 0;
+ +	dst_release(t->dst_cache);
+ +	t->dst_cache = dst;
+ +}
+ +EXPORT_SYMBOL_GPL(ip6_tnl_dst_set);
+ +
+++=======
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  /**
+   * ip6_tnl_lookup - fetch tunnel matching the end-point addresses
+   *   @remote: the address of the tunnel exit-point
+@@@ -273,6 -236,9 +276,12 @@@ ip6_tnl_unlink(struct ip6_tnl_net *ip6n
+  
+  static void ip6_dev_free(struct net_device *dev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct ip6_tnl *t = netdev_priv(dev);
++ 
++ 	dst_cache_destroy(&t->dst_cache);
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  	free_percpu(dev->tstats);
+  	free_netdev(dev);
+  }
+@@@ -1072,12 -1040,11 +1081,20 @@@ static int ip6_tnl_xmit2(struct sk_buf
+  		consume_skb(skb);
+  		skb = new_skb;
+  	}
+++<<<<<<< HEAD
+ +	if (fl6->flowi6_mark) {
+ +		skb_dst_set(skb, dst);
+ +		ndst = NULL;
+ +	} else {
+ +		skb_dst_set_noref(skb, dst);
+ +	}
+++=======
++ 
++ 	if (!fl6->flowi6_mark && ndst)
++ 		dst_cache_set_ip6(&t->dst_cache, ndst, &fl6->saddr);
++ 	skb_dst_set(skb, dst);
++ 
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  	skb->transport_header = skb->network_header;
+  
+  	proto = fl6->flowi6_proto;
+@@@ -1578,6 -1545,14 +1595,17 @@@ ip6_tnl_dev_init_gen(struct net_device 
+  	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+  	if (!dev->tstats)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+++=======
++ 
++ 	ret = dst_cache_init(&t->dst_cache, GFP_KERNEL);
++ 	if (ret) {
++ 		free_percpu(dev->tstats);
++ 		dev->tstats = NULL;
++ 		return ret;
++ 	}
++ 
+++>>>>>>> 607f725f6f7d (net: replace dst_cache ip6_tunnel implementation with the generic one)
+  	return 0;
+  }
+  
+* Unmerged path include/net/ip6_tunnel.h
+diff --git a/net/ipv6/Kconfig b/net/ipv6/Kconfig
+index d92e5586783e..761ed3bfe89b 100644
+--- a/net/ipv6/Kconfig
++++ b/net/ipv6/Kconfig
+@@ -186,6 +186,7 @@ config IPV6_NDISC_NODETYPE
+ config IPV6_TUNNEL
+ 	tristate "IPv6: IP-in-IPv6 tunnel (RFC2473)"
+ 	select INET6_TUNNEL
++	select DST_CACHE
+ 	---help---
+ 	  Support for IPv6-in-IPv6 and IPv4-in-IPv6 tunnels described in
+ 	  RFC 2473.
+* Unmerged path net/ipv6/ip6_gre.c
+* Unmerged path net/ipv6/ip6_tunnel.c
+diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
+index 5c92f01e403f..3bc0836313ad 100644
+--- a/net/ipv6/ip6_vti.c
++++ b/net/ipv6/ip6_vti.c
+@@ -640,7 +640,7 @@ vti6_tnl_change(struct ip6_tnl *t, const struct __ip6_tnl_parm *p)
+ 	t->parms.i_key = p->i_key;
+ 	t->parms.o_key = p->o_key;
+ 	t->parms.proto = p->proto;
+-	ip6_tnl_dst_reset(t);
++	dst_cache_reset(&t->dst_cache);
+ 	vti6_link_config(t);
+ 	return 0;
+ }
