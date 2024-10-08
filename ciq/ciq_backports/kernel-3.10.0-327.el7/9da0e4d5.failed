@@ -1,0 +1,313 @@
+KVM: x86: work on all available address spaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] x86: work on all available address spaces (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 94.25%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 9da0e4d5ac969909f6b435ce28ea28135a9cbd69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9da0e4d5.failed
+
+This patch has no semantic change, but it prepares for the introduction
+of a second address space for system management mode.
+
+A new function x86_set_memory_region (and the "slots_lock taken"
+counterpart __x86_set_memory_region) is introduced in order to
+operate on all address spaces when adding or deleting private
+memory slots.
+
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9da0e4d5ac969909f6b435ce28ea28135a9cbd69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 46149ec9abf3,7619e9e1745c..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -1342,48 -1499,36 +1342,75 @@@ static int kvm_handle_hva_range(struct 
+  					       int level,
+  					       unsigned long data))
+  {
+ +	int j;
+ +	int ret = 0;
+  	struct kvm_memslots *slots;
+  	struct kvm_memory_slot *memslot;
+++<<<<<<< HEAD
+++=======
++ 	struct slot_rmap_walk_iterator iterator;
++ 	int ret = 0;
++ 	int i;
+++>>>>>>> 9da0e4d5ac96 (KVM: x86: work on all available address spaces)
++ 
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 		kvm_for_each_memslot(memslot, slots) {
++ 			unsigned long hva_start, hva_end;
++ 			gfn_t gfn_start, gfn_end;
++ 
++ 			hva_start = max(start, memslot->userspace_addr);
++ 			hva_end = min(end, memslot->userspace_addr +
++ 				      (memslot->npages << PAGE_SHIFT));
++ 			if (hva_start >= hva_end)
++ 				continue;
++ 			/*
++ 			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
++ 			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
++ 			 */
++ 			gfn_start = hva_to_gfn_memslot(hva_start, memslot);
++ 			gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+  
+- 	slots = kvm_memslots(kvm);
+- 
+- 	kvm_for_each_memslot(memslot, slots) {
+- 		unsigned long hva_start, hva_end;
+- 		gfn_t gfn_start, gfn_end;
+- 
+++<<<<<<< HEAD
+ +		hva_start = max(start, memslot->userspace_addr);
+ +		hva_end = min(end, memslot->userspace_addr +
+ +					(memslot->npages << PAGE_SHIFT));
+ +		if (hva_start >= hva_end)
+ +			continue;
+ +		/*
+ +		 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+ +		 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+ +		 */
+ +		gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+ +		gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+ +
+ +		for (j = PT_PAGE_TABLE_LEVEL;
+ +		     j < PT_PAGE_TABLE_LEVEL + KVM_NR_PAGE_SIZES; ++j) {
+ +			unsigned long idx, idx_end;
+ +			unsigned long *rmapp;
+ +			gfn_t gfn = gfn_start;
+ +
+ +			/*
+ +			 * {idx(page_j) | page_j intersects with
+ +			 *  [hva_start, hva_end)} = {idx, idx+1, ..., idx_end}.
+ +			 */
+ +			idx = gfn_to_index(gfn_start, memslot->base_gfn, j);
+ +			idx_end = gfn_to_index(gfn_end - 1, memslot->base_gfn, j);
+ +
+ +			rmapp = __gfn_to_rmap(gfn_start, j, memslot);
+ +
+ +			for (; idx <= idx_end;
+ +			       ++idx, gfn += (1UL << KVM_HPAGE_GFN_SHIFT(j)))
+ +				ret |= handler(kvm, rmapp++, memslot,
+ +					       gfn, j, data);
+++=======
++ 			for_each_slot_rmap_range(memslot, PT_PAGE_TABLE_LEVEL,
++ 						 PT_MAX_HUGEPAGE_LEVEL,
++ 						 gfn_start, gfn_end - 1,
++ 						 &iterator)
++ 				ret |= handler(kvm, iterator.rmap, memslot,
++ 					       iterator.gfn, iterator.level, data);
+++>>>>>>> 9da0e4d5ac96 (KVM: x86: work on all available address spaces)
+  		}
+  	}
+  
+@@@ -4357,6 -4492,88 +4384,91 @@@ void kvm_mmu_slot_remove_write_access(s
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (flush && lock_flush_tlb) {
++ 		kvm_flush_remote_tlbs(kvm);
++ 		flush = false;
++ 	}
++ 
++ 	return flush;
++ }
++ 
++ static bool
++ slot_handle_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		  slot_level_handler fn, int start_level, int end_level,
++ 		  bool lock_flush_tlb)
++ {
++ 	return slot_handle_level_range(kvm, memslot, fn, start_level,
++ 			end_level, memslot->base_gfn,
++ 			memslot->base_gfn + memslot->npages - 1,
++ 			lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_all_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		      slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL,
++ 				 PT_MAX_HUGEPAGE_LEVEL, lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_large_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 			slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL + 1,
++ 				 PT_MAX_HUGEPAGE_LEVEL, lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_leaf(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		 slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL,
++ 				 PT_PAGE_TABLE_LEVEL, lock_flush_tlb);
++ }
++ 
++ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
++ {
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memory_slot *memslot;
++ 	int i;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 		kvm_for_each_memslot(memslot, slots) {
++ 			gfn_t start, end;
++ 
++ 			start = max(gfn_start, memslot->base_gfn);
++ 			end = min(gfn_end, memslot->base_gfn + memslot->npages);
++ 			if (start >= end)
++ 				continue;
++ 
++ 			slot_handle_level_range(kvm, memslot, kvm_zap_rmapp,
++ 						PT_PAGE_TABLE_LEVEL, PT_MAX_HUGEPAGE_LEVEL,
++ 						start, end - 1, true);
++ 		}
++ 	}
++ 
++ 	spin_unlock(&kvm->mmu_lock);
++ }
++ 
++ static bool slot_rmap_write_protect(struct kvm *kvm, unsigned long *rmapp)
++ {
++ 	return __rmap_write_protect(kvm, rmapp, false);
++ }
++ 
++ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
++ 				      struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_all_level(kvm, memslot, slot_rmap_write_protect,
++ 				      false);
+++>>>>>>> 9da0e4d5ac96 (KVM: x86: work on all available address spaces)
+  	spin_unlock(&kvm->mmu_lock);
+  
+  	/*
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 1442e6fbe132..0de32382a775 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1130,4 +1130,9 @@ int kvm_pmu_read_pmc(struct kvm_vcpu *vcpu, unsigned pmc, u64 *data);
+ void kvm_handle_pmu_event(struct kvm_vcpu *vcpu);
+ void kvm_deliver_pmi(struct kvm_vcpu *vcpu);
+ 
++int __x86_set_memory_region(struct kvm *kvm,
++			    const struct kvm_userspace_memory_region *mem);
++int x86_set_memory_region(struct kvm *kvm,
++			  const struct kvm_userspace_memory_region *mem);
++
+ #endif /* _ASM_X86_KVM_HOST_H */
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 85e82f921250..3553c16af109 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -3974,7 +3974,7 @@ static int alloc_apic_access_page(struct kvm *kvm)
+ 	kvm_userspace_mem.flags = 0;
+ 	kvm_userspace_mem.guest_phys_addr = APIC_DEFAULT_PHYS_BASE;
+ 	kvm_userspace_mem.memory_size = PAGE_SIZE;
+-	r = __kvm_set_memory_region(kvm, &kvm_userspace_mem);
++	r = __x86_set_memory_region(kvm, &kvm_userspace_mem);
+ 	if (r)
+ 		goto out;
+ 
+@@ -4009,7 +4009,7 @@ static int alloc_identity_pagetable(struct kvm *kvm)
+ 	kvm_userspace_mem.guest_phys_addr =
+ 		kvm->arch.ept_identity_map_addr;
+ 	kvm_userspace_mem.memory_size = PAGE_SIZE;
+-	r = __kvm_set_memory_region(kvm, &kvm_userspace_mem);
++	r = __x86_set_memory_region(kvm, &kvm_userspace_mem);
+ 
+ 	return r;
+ }
+@@ -4696,7 +4696,7 @@ static int vmx_set_tss_addr(struct kvm *kvm, unsigned int addr)
+ 		.flags = 0,
+ 	};
+ 
+-	ret = kvm_set_memory_region(kvm, &tss_mem);
++	ret = x86_set_memory_region(kvm, &tss_mem);
+ 	if (ret)
+ 		return ret;
+ 	kvm->arch.tss_addr = addr;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 44ac86d26f9f..dc172871ab85 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7362,6 +7362,40 @@ void kvm_arch_sync_events(struct kvm *kvm)
+ 	kvm_free_pit(kvm);
+ }
+ 
++int __x86_set_memory_region(struct kvm *kvm,
++			    const struct kvm_userspace_memory_region *mem)
++{
++	int i, r;
++
++	/* Called with kvm->slots_lock held.  */
++	BUG_ON(mem->slot >= KVM_MEM_SLOTS_NUM);
++
++	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++		struct kvm_userspace_memory_region m = *mem;
++
++		m.slot |= i << 16;
++		r = __kvm_set_memory_region(kvm, &m);
++		if (r < 0)
++			return r;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(__x86_set_memory_region);
++
++int x86_set_memory_region(struct kvm *kvm,
++			  const struct kvm_userspace_memory_region *mem)
++{
++	int r;
++
++	mutex_lock(&kvm->slots_lock);
++	r = __x86_set_memory_region(kvm, mem);
++	mutex_unlock(&kvm->slots_lock);
++
++	return r;
++}
++EXPORT_SYMBOL_GPL(x86_set_memory_region);
++
+ void kvm_arch_destroy_vm(struct kvm *kvm)
+ {
+ 	if (current->mm == kvm->mm) {
+@@ -7373,13 +7407,13 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 		struct kvm_userspace_memory_region mem;
+ 		memset(&mem, 0, sizeof(mem));
+ 		mem.slot = APIC_ACCESS_PAGE_PRIVATE_MEMSLOT;
+-		kvm_set_memory_region(kvm, &mem);
++		x86_set_memory_region(kvm, &mem);
+ 
+ 		mem.slot = IDENTITY_PAGETABLE_PRIVATE_MEMSLOT;
+-		kvm_set_memory_region(kvm, &mem);
++		x86_set_memory_region(kvm, &mem);
+ 
+ 		mem.slot = TSS_PRIVATE_MEMSLOT;
+-		kvm_set_memory_region(kvm, &mem);
++		x86_set_memory_region(kvm, &mem);
+ 	}
+ 	kvm_iommu_unmap_guest(kvm);
+ 	kfree(kvm->arch.vpic);
