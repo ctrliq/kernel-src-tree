@@ -1,0 +1,199 @@
+zram: replace global tb_lock with fine grain lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Weijie Yang <weijie.yang@samsung.com>
+commit d2d5e762c8990c4031890e03565983a05febd64a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d2d5e762.failed
+
+Currently, we use a rwlock tb_lock to protect concurrent access to the
+whole zram meta table.  However, according to the actual access model,
+there is only a small chance for upper user to access the same
+table[index], so the current lock granularity is too big.
+
+The idea of optimization is to change the lock granularity from whole
+meta table to per table entry (table -> table[index]), so that we can
+protect concurrent access to the same table[index], meanwhile allow the
+maximum concurrency.
+
+With this in mind, several kinds of locks which could be used as a
+per-entry lock were tested and compared:
+
+Test environment:
+x86-64 Intel Core2 Q8400, system memory 4GB, Ubuntu 12.04,
+kernel v3.15.0-rc3 as base, zram with 4 max_comp_streams LZO.
+
+iozone test:
+iozone -t 4 -R -r 16K -s 200M -I +Z
+(1GB zram with ext4 filesystem, take the average of 10 tests, KB/s)
+
+      Test       base      CAS    spinlock    rwlock   bit_spinlock
+-------------------------------------------------------------------
+ Initial write  1381094   1425435   1422860   1423075   1421521
+       Rewrite  1529479   1641199   1668762   1672855   1654910
+          Read  8468009  11324979  11305569  11117273  10997202
+       Re-read  8467476  11260914  11248059  11145336  10906486
+  Reverse Read  6821393   8106334   8282174   8279195   8109186
+   Stride read  7191093   8994306   9153982   8961224   9004434
+   Random read  7156353   8957932   9167098   8980465   8940476
+Mixed workload  4172747   5680814   5927825   5489578   5972253
+  Random write  1483044   1605588   1594329   1600453   1596010
+        Pwrite  1276644   1303108   1311612   1314228   1300960
+         Pread  4324337   4632869   4618386   4457870   4500166
+
+To enhance the possibility of access the same table[index] concurrently,
+set zram a small disksize(10MB) and let threads run with large loop
+count.
+
+fio test:
+fio --bs=32k --randrepeat=1 --randseed=100 --refill_buffers
+--scramble_buffers=1 --direct=1 --loops=3000 --numjobs=4
+--filename=/dev/zram0 --name=seq-write --rw=write --stonewall
+--name=seq-read --rw=read --stonewall --name=seq-readwrite
+--rw=rw --stonewall --name=rand-readwrite --rw=randrw --stonewall
+(10MB zram raw block device, take the average of 10 tests, KB/s)
+
+    Test     base     CAS    spinlock    rwlock  bit_spinlock
+-------------------------------------------------------------
+seq-write   933789   999357   1003298    995961   1001958
+ seq-read  5634130  6577930   6380861   6243912   6230006
+   seq-rw  1405687  1638117   1640256   1633903   1634459
+  rand-rw  1386119  1614664   1617211   1609267   1612471
+
+All the optimization methods show a higher performance than the base,
+however, it is hard to say which method is the most appropriate.
+
+On the other hand, zram is mostly used on small embedded system, so we
+don't want to increase any memory footprint.
+
+This patch pick the bit_spinlock method, pack object size and page_flag
+into an unsigned long table.value, so as to not increase any memory
+overhead on both 32-bit and 64-bit system.
+
+On the third hand, even though different kinds of locks have different
+performances, we can ignore this difference, because: if zram is used as
+zram swapfile, the swap subsystem can prevent concurrent access to the
+same swapslot; if zram is used as zram-blk for set up filesystem on it,
+the upper filesystem and the page cache also prevent concurrent access
+of the same block mostly.  So we can ignore the different performances
+among locks.
+
+	Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Reviewed-by: Davidlohr Bueso <davidlohr@hp.com>
+	Signed-off-by: Weijie Yang <weijie.yang@samsung.com>
+	Signed-off-by: Minchan Kim <minchan@kernel.org>
+	Cc: Jerome Marchand <jmarchan@redhat.com>
+	Cc: Nitin Gupta <ngupta@vflare.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d2d5e762c8990c4031890e03565983a05febd64a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/zram/zram_drv.c
+diff --cc drivers/block/zram/zram_drv.c
+index ce8a84d761eb,dfa4024c448a..000000000000
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@@ -546,6 -569,44 +564,47 @@@ static int zram_bvec_rw(struct zram *zr
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * zram_bio_discard - handler on discard request
++  * @index: physical block index in PAGE_SIZE units
++  * @offset: byte offset within physical block
++  */
++ static void zram_bio_discard(struct zram *zram, u32 index,
++ 			     int offset, struct bio *bio)
++ {
++ 	size_t n = bio->bi_iter.bi_size;
++ 	struct zram_meta *meta = zram->meta;
++ 
++ 	/*
++ 	 * zram manages data in physical block size units. Because logical block
++ 	 * size isn't identical with physical block size on some arch, we
++ 	 * could get a discard request pointing to a specific offset within a
++ 	 * certain physical block.  Although we can handle this request by
++ 	 * reading that physiclal block and decompressing and partially zeroing
++ 	 * and re-compressing and then re-storing it, this isn't reasonable
++ 	 * because our intent with a discard request is to save memory.  So
++ 	 * skipping this logical block is appropriate here.
++ 	 */
++ 	if (offset) {
++ 		if (n <= (PAGE_SIZE - offset))
++ 			return;
++ 
++ 		n -= (PAGE_SIZE - offset);
++ 		index++;
++ 	}
++ 
++ 	while (n >= PAGE_SIZE) {
++ 		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
++ 		zram_free_page(zram, index);
++ 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
++ 		index++;
++ 		n -= PAGE_SIZE;
++ 	}
++ }
++ 
+++>>>>>>> d2d5e762c899 (zram: replace global tb_lock with fine grain lock)
+  static void zram_reset_device(struct zram *zram, bool reset_capacity)
+  {
+  	size_t index;
+* Unmerged path drivers/block/zram/zram_drv.c
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index c8161bd8969c..5b0afde729cd 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -50,10 +50,24 @@ static const size_t max_zpage_size = PAGE_SIZE / 4 * 3;
+ #define ZRAM_SECTOR_PER_LOGICAL_BLOCK	\
+ 	(1 << (ZRAM_LOGICAL_BLOCK_SHIFT - SECTOR_SHIFT))
+ 
+-/* Flags for zram pages (table[page_no].flags) */
++
++/*
++ * The lower ZRAM_FLAG_SHIFT bits of table.value is for
++ * object size (excluding header), the higher bits is for
++ * zram_pageflags.
++ *
++ * zram is mainly used for memory efficiency so we want to keep memory
++ * footprint small so we can squeeze size and flags into a field.
++ * The lower ZRAM_FLAG_SHIFT bits is for object size (excluding header),
++ * the higher bits is for zram_pageflags.
++ */
++#define ZRAM_FLAG_SHIFT 24
++
++/* Flags for zram pages (table[page_no].value) */
+ enum zram_pageflags {
+ 	/* Page consists entirely of zeros */
+-	ZRAM_ZERO,
++	ZRAM_ZERO = ZRAM_FLAG_SHIFT + 1,
++	ZRAM_ACCESS,	/* page in now accessed */
+ 
+ 	__NR_ZRAM_PAGEFLAGS,
+ };
+@@ -63,9 +77,8 @@ enum zram_pageflags {
+ /* Allocated for each disk page */
+ struct zram_table_entry {
+ 	unsigned long handle;
+-	u16 size;	/* object size (excluding header) */
+-	u8 flags;
+-} __aligned(4);
++	unsigned long value;
++};
+ 
+ struct zram_stats {
+ 	atomic64_t compr_data_size;	/* compressed size of pages stored */
+@@ -80,7 +93,6 @@ struct zram_stats {
+ };
+ 
+ struct zram_meta {
+-	rwlock_t tb_lock;	/* protect table */
+ 	struct zram_table_entry *table;
+ 	struct zs_pool *mem_pool;
+ };
