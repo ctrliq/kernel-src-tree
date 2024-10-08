@@ -40,6 +40,7 @@ static void gfs2_init_inode_once(void *foo)
 	INIT_LIST_HEAD(&ip->i_trunc_list);
 	ip->i_res = NULL;
 	ip->i_hash_cache = NULL;
+	ip->i_iopen_gh.gh_gl = NULL;
 }
 
 static void gfs2_init_glock_once(void *foo)
