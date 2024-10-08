@@ -1,0 +1,167 @@
+powerpc/powernv: Support OPAL requested heartbeat
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Support OPAL requested heartbeat (Steve Best) [1221071]
+Rebuild_FUZZ: 91.11%
+commit-author Benjamin Herrenschmidt <benh@kernel.crashing.org>
+commit 3bf57561d4dbd36ba45ce05656b0469bfdcc7ef2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3bf57561.failed
+
+If OPAL requests it, call it back via opal_poll_events() at a
+regular interval. Some versions of OPAL on some machines require
+this to operate some internal timeouts properly.
+
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 3bf57561d4dbd36ba45ce05656b0469bfdcc7ef2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/opal.c
+diff --cc arch/powerpc/platforms/powernv/opal.c
+index 2542700371c7,70a6c14cacb6..000000000000
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@@ -589,6 -686,87 +592,90 @@@ static void __init opal_dump_region_ini
+  		pr_warn("DUMP: Failed to register kernel log buffer. "
+  			"rc = %d\n", rc);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void opal_ipmi_init(struct device_node *opal_node)
++ {
++ 	struct device_node *np;
++ 
++ 	for_each_child_of_node(opal_node, np)
++ 		if (of_device_is_compatible(np, "ibm,opal-ipmi"))
++ 			of_platform_device_create(np, NULL, NULL);
++ }
++ 
++ static void opal_i2c_create_devs(void)
++ {
++ 	struct device_node *np;
++ 
++ 	for_each_compatible_node(np, NULL, "ibm,opal-i2c")
++ 		of_platform_device_create(np, NULL, NULL);
++ }
++ 
++ static void __init opal_irq_init(struct device_node *dn)
++ {
++ 	const __be32 *irqs;
++ 	int i, irqlen;
++ 
++ 	/* Get interrupt property */
++ 	irqs = of_get_property(opal_node, "opal-interrupts", &irqlen);
++ 	opal_irq_count = irqs ? (irqlen / 4) : 0;
++ 	pr_debug("Found %d interrupts reserved for OPAL\n", opal_irq_count);
++ 	if (!opal_irq_count)
++ 		return;
++ 
++ 	/* Install interrupt handlers */
++ 	opal_irqs = kzalloc(opal_irq_count * sizeof(unsigned int), GFP_KERNEL);
++ 	for (i = 0; irqs && i < opal_irq_count; i++, irqs++) {
++ 		unsigned int irq, virq;
++ 		int rc;
++ 
++ 		/* Get hardware and virtual IRQ */
++ 		irq = be32_to_cpup(irqs);
++ 		virq = irq_create_mapping(NULL, irq);
++ 		if (virq == NO_IRQ) {
++ 			pr_warn("Failed to map irq 0x%x\n", irq);
++ 			continue;
++ 		}
++ 
++ 		/* Install interrupt handler */
++ 		rc = request_irq(virq, opal_interrupt, 0, "opal", NULL);
++ 		if (rc) {
++ 			irq_dispose_mapping(virq);
++ 			pr_warn("Error %d requesting irq %d (0x%x)\n",
++ 				 rc, virq, irq);
++ 			continue;
++ 		}
++ 
++ 		/* Cache IRQ */
++ 		opal_irqs[i] = virq;
++ 	}
++ }
++ 
++ static int kopald(void *unused)
++ {
++ 	set_freezable();
++ 	do {
++ 		try_to_freeze();
++ 		opal_poll_events(NULL);
++ 		msleep_interruptible(opal_heartbeat);
++ 	} while (!kthread_should_stop());
++ 
++ 	return 0;
++ }
++ 
++ static void opal_init_heartbeat(void)
++ {
++ 	/* Old firwmware, we assume the HVC heartbeat is sufficient */
++ 	if (of_property_read_u32(opal_node, "ibm,heartbeat-ms",
++ 				 &opal_heartbeat) != 0)
++ 		opal_heartbeat = 0;
++ 
++ 	if (opal_heartbeat)
++ 		kthread_run(kopald, NULL, "kopald");
++ }
++ 
+++>>>>>>> 3bf57561d4db (powerpc/powernv: Support OPAL requested heartbeat)
+  static int __init opal_init(void)
+  {
+  	struct device_node *np, *consoles;
+@@@ -615,25 -792,14 +702,34 @@@
+  		of_node_put(consoles);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Create i2c platform devices */
++ 	opal_i2c_create_devs();
++ 
++ 	/* Setup a heatbeat thread if requested by OPAL */
++ 	opal_init_heartbeat();
++ 
+++>>>>>>> 3bf57561d4db (powerpc/powernv: Support OPAL requested heartbeat)
+  	/* Find all OPAL interrupts and request them */
+ -	opal_irq_init(opal_node);
+ +	irqs = of_get_property(opal_node, "opal-interrupts", &irqlen);
+ +	pr_debug("opal: Found %d interrupts reserved for OPAL\n",
+ +		 irqs ? (irqlen / 4) : 0);
+ +	opal_irq_count = irqlen / 4;
+ +	opal_irqs = kzalloc(opal_irq_count * sizeof(unsigned int), GFP_KERNEL);
+ +	for (i = 0; irqs && i < (irqlen / 4); i++, irqs++) {
+ +		unsigned int hwirq = be32_to_cpup(irqs);
+ +		unsigned int irq = irq_create_mapping(NULL, hwirq);
+ +		if (irq == NO_IRQ) {
+ +			pr_warning("opal: Failed to map irq 0x%x\n", hwirq);
+ +			continue;
+ +		}
+ +		rc = request_irq(irq, opal_interrupt, 0, "opal", NULL);
+ +		if (rc)
+ +			pr_warning("opal: Error %d requesting irq %d"
+ +				   " (0x%x)\n", rc, irq, hwirq);
+ +		opal_irqs[i] = irq;
+ +	}
+  
+  	/* Create "opal" kobject under /sys/firmware */
+  	rc = opal_sysfs_init();
+@@@ -652,6 -820,9 +748,12 @@@
+  		opal_msglog_init();
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Initialize OPAL IPMI backend */
++ 	opal_ipmi_init(opal_node);
++ 
+++>>>>>>> 3bf57561d4db (powerpc/powernv: Support OPAL requested heartbeat)
+  	return 0;
+  }
+  machine_subsys_initcall(powernv, opal_init);
+* Unmerged path arch/powerpc/platforms/powernv/opal.c
