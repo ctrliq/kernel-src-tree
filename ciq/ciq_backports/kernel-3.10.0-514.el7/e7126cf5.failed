@@ -1,0 +1,208 @@
+x86/mpx: Trace #BR exceptions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mpx: Trace #BR exceptions (Rui Wang) [1138650]
+Rebuild_FUZZ: 92.59%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit e7126cf5f10aef1555cb99eddb7efff41bdf9566
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e7126cf5.failed
+
+This is the first in a series of MPX tracing patches.
+I've found these extremely useful in the process of
+debugging applications and the kernel code itself.
+
+This exception hooks in to the bounds (#BR) exception
+very early and allows capturing the key registers which
+would influence how the exception is handled.
+
+Note that bndcfgu/bndstatus are technically still
+64-bit registers even in 32-bit mode.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20150607183703.5FE2619A@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e7126cf5f10aef1555cb99eddb7efff41bdf9566)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+#	arch/x86/mm/mpx.c
+diff --cc arch/x86/kernel/traps.c
+index 9823443df079,36cb15b7b367..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -58,6 -58,10 +58,13 @@@
+  #include <asm/mce.h>
+  #include <asm/fixmap.h>
+  #include <asm/mach_traps.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/alternative.h>
++ #include <asm/fpu/xstate.h>
++ #include <asm/trace/mpx.h>
++ #include <asm/mpx.h>
+++>>>>>>> e7126cf5f10a (x86/mpx: Trace #BR exceptions)
+  
+  #ifdef CONFIG_X86_64
+  #include <asm/x86_init.h>
+@@@ -247,7 -370,88 +254,92 @@@ dotraplinkage void do_double_fault(stru
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +dotraplinkage void __kprobes
+++=======
++ dotraplinkage void do_bounds(struct pt_regs *regs, long error_code)
++ {
++ 	enum ctx_state prev_state;
++ 	const struct bndcsr *bndcsr;
++ 	siginfo_t *info;
++ 
++ 	prev_state = exception_enter();
++ 	if (notify_die(DIE_TRAP, "bounds", regs, error_code,
++ 			X86_TRAP_BR, SIGSEGV) == NOTIFY_STOP)
++ 		goto exit;
++ 	conditional_sti(regs);
++ 
++ 	if (!user_mode(regs))
++ 		die("bounds", regs, error_code);
++ 
++ 	if (!cpu_feature_enabled(X86_FEATURE_MPX)) {
++ 		/* The exception is not from Intel MPX */
++ 		goto exit_trap;
++ 	}
++ 
++ 	/*
++ 	 * We need to look at BNDSTATUS to resolve this exception.
++ 	 * A NULL here might mean that it is in its 'init state',
++ 	 * which is all zeros which indicates MPX was not
++ 	 * responsible for the exception.
++ 	 */
++ 	bndcsr = get_xsave_field_ptr(XSTATE_BNDCSR);
++ 	if (!bndcsr)
++ 		goto exit_trap;
++ 
++ 	trace_bounds_exception_mpx(bndcsr);
++ 	/*
++ 	 * The error code field of the BNDSTATUS register communicates status
++ 	 * information of a bound range exception #BR or operation involving
++ 	 * bound directory.
++ 	 */
++ 	switch (bndcsr->bndstatus & MPX_BNDSTA_ERROR_CODE) {
++ 	case 2:	/* Bound directory has invalid entry. */
++ 		if (mpx_handle_bd_fault())
++ 			goto exit_trap;
++ 		break; /* Success, it was handled */
++ 	case 1: /* Bound violation. */
++ 		info = mpx_generate_siginfo(regs);
++ 		if (IS_ERR(info)) {
++ 			/*
++ 			 * We failed to decode the MPX instruction.  Act as if
++ 			 * the exception was not caused by MPX.
++ 			 */
++ 			goto exit_trap;
++ 		}
++ 		/*
++ 		 * Success, we decoded the instruction and retrieved
++ 		 * an 'info' containing the address being accessed
++ 		 * which caused the exception.  This information
++ 		 * allows and application to possibly handle the
++ 		 * #BR exception itself.
++ 		 */
++ 		do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, info);
++ 		kfree(info);
++ 		break;
++ 	case 0: /* No exception caused by Intel MPX operations. */
++ 		goto exit_trap;
++ 	default:
++ 		die("bounds", regs, error_code);
++ 	}
++ 
++ exit:
++ 	exception_exit(prev_state);
++ 	return;
++ exit_trap:
++ 	/*
++ 	 * This path out is for all the cases where we could not
++ 	 * handle the exception in some way (like allocating a
++ 	 * table or telling userspace about it.  We will also end
++ 	 * up here if the kernel has MPX turned off at compile
++ 	 * time..
++ 	 */
++ 	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, NULL);
++ 	exception_exit(prev_state);
++ }
++ 
++ dotraplinkage void
+++>>>>>>> e7126cf5f10a (x86/mpx: Trace #BR exceptions)
+  do_general_protection(struct pt_regs *regs, long error_code)
+  {
+  	struct task_struct *tsk;
+* Unmerged path arch/x86/mm/mpx.c
+diff --git a/arch/x86/include/asm/trace/mpx.h b/arch/x86/include/asm/trace/mpx.h
+new file mode 100644
+index 000000000000..5c03ec8a90d6
+--- /dev/null
++++ b/arch/x86/include/asm/trace/mpx.h
+@@ -0,0 +1,50 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM mpx
++
++#if !defined(_TRACE_MPX_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_MPX_H
++
++#include <linux/tracepoint.h>
++
++#ifdef CONFIG_X86_INTEL_MPX
++
++TRACE_EVENT(bounds_exception_mpx,
++
++	TP_PROTO(const struct bndcsr *bndcsr),
++	TP_ARGS(bndcsr),
++
++	TP_STRUCT__entry(
++		__field(u64, bndcfgu)
++		__field(u64, bndstatus)
++	),
++
++	TP_fast_assign(
++		/* need to get rid of the 'const' on bndcsr */
++		__entry->bndcfgu   = (u64)bndcsr->bndcfgu;
++		__entry->bndstatus = (u64)bndcsr->bndstatus;
++	),
++
++	TP_printk("bndcfgu:0x%llx bndstatus:0x%llx",
++		__entry->bndcfgu,
++		__entry->bndstatus)
++);
++
++#else
++
++/*
++ * This gets used outside of MPX-specific code, so we need a stub.
++ */
++static inline void trace_bounds_exception_mpx(const struct bndcsr *bndcsr)
++{
++}
++
++#endif /* CONFIG_X86_INTEL_MPX */
++
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH asm/trace/
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_FILE mpx
++#endif /* _TRACE_MPX_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+* Unmerged path arch/x86/kernel/traps.c
+* Unmerged path arch/x86/mm/mpx.c
