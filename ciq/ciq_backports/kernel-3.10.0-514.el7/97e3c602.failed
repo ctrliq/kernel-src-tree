@@ -1,0 +1,133 @@
+x86/mm: Ignore A/D bits in pte/pmd/pud_none()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] Ignore A/D bits in pte/pmd/pud_none() (Larry Woodman) [1347159]
+Rebuild_FUZZ: 90.24%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 97e3c602ccbdd7db54e92fe05675c664c052a466
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/97e3c602.failed
+
+The erratum we are fixing here can lead to stray setting of the
+A and D bits.  That means that a pte that we cleared might
+suddenly have A/D set.  So, stop considering those bits when
+determining if a pte is pte_none().  The same goes for the
+other pmd_none() and pud_none().  pgd_none() can be skipped
+because it is not affected; we do not use PGD entries for
+anything other than pagetables on affected configurations.
+
+This adds a tiny amount of overhead to all pte_none() checks.
+I doubt we'll be able to measure it anywhere.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Luis R. Rodriguez <mcgrof@suse.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Toshi Kani <toshi.kani@hp.com>
+	Cc: dave.hansen@intel.com
+	Cc: linux-mm@kvack.org
+	Cc: mhocko@suse.com
+Link: http://lkml.kernel.org/r/20160708001912.5216F89C@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 97e3c602ccbdd7db54e92fe05675c664c052a466)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pgtable_types.h
+diff --cc arch/x86/include/asm/pgtable_types.h
+index 6fdbf77a317c,d14d0a55322a..000000000000
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@@ -47,10 -52,30 +47,24 @@@
+  #define _PAGE_PAT_LARGE (_AT(pteval_t, 1) << _PAGE_BIT_PAT_LARGE)
+  #define _PAGE_SPECIAL	(_AT(pteval_t, 1) << _PAGE_BIT_SPECIAL)
+  #define _PAGE_CPA_TEST	(_AT(pteval_t, 1) << _PAGE_BIT_CPA_TEST)
+ -#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
+ -#define _PAGE_PKEY_BIT0	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT0)
+ -#define _PAGE_PKEY_BIT1	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT1)
+ -#define _PAGE_PKEY_BIT2	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT2)
+ -#define _PAGE_PKEY_BIT3	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT3)
+ -#else
+ -#define _PAGE_PKEY_BIT0	(_AT(pteval_t, 0))
+ -#define _PAGE_PKEY_BIT1	(_AT(pteval_t, 0))
+ -#define _PAGE_PKEY_BIT2	(_AT(pteval_t, 0))
+ -#define _PAGE_PKEY_BIT3	(_AT(pteval_t, 0))
+ -#endif
+ +#define _PAGE_SPLITTING	(_AT(pteval_t, 1) << _PAGE_BIT_SPLITTING)
+ +#define _PAGE_SOFTDIRTY	(_AT(pteval_t, 1) << _PAGE_BIT_SOFTDIRTY)
+  #define __HAVE_ARCH_PTE_SPECIAL
+  
+++<<<<<<< HEAD
+++=======
++ #define _PAGE_PKEY_MASK (_PAGE_PKEY_BIT0 | \
++ 			 _PAGE_PKEY_BIT1 | \
++ 			 _PAGE_PKEY_BIT2 | \
++ 			 _PAGE_PKEY_BIT3)
++ 
++ #if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
++ #define _PAGE_KNL_ERRATUM_MASK (_PAGE_DIRTY | _PAGE_ACCESSED)
++ #else
++ #define _PAGE_KNL_ERRATUM_MASK 0
++ #endif
++ 
+++>>>>>>> 97e3c602ccbd (x86/mm: Ignore A/D bits in pte/pmd/pud_none())
+  #ifdef CONFIG_KMEMCHECK
+  #define _PAGE_HIDDEN	(_AT(pteval_t, 1) << _PAGE_BIT_HIDDEN)
+  #else
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index baa6c1dd0ecb..ecf862881974 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -400,7 +400,7 @@ pte_t *populate_extra_pte(unsigned long vaddr);
+ 
+ static inline int pte_none(pte_t pte)
+ {
+-	return !pte.pte;
++	return !(pte.pte & ~(_PAGE_KNL_ERRATUM_MASK));
+ }
+ 
+ #define __HAVE_ARCH_PTE_SAME
+@@ -449,7 +449,8 @@ static inline int pmd_none(pmd_t pmd)
+ {
+ 	/* Only check low word on 32-bit platforms, since it might be
+ 	   out of sync with upper half. */
+-	return (unsigned long)native_pmd_val(pmd) == 0;
++	unsigned long val = native_pmd_val(pmd);
++	return (val & ~_PAGE_KNL_ERRATUM_MASK) == 0;
+ }
+ 
+ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+@@ -520,7 +521,7 @@ static inline unsigned long pages_to_mb(unsigned long npg)
+ #if PAGETABLE_LEVELS > 2
+ static inline int pud_none(pud_t pud)
+ {
+-	return native_pud_val(pud) == 0;
++	return (native_pud_val(pud) & ~(_PAGE_KNL_ERRATUM_MASK)) == 0;
+ }
+ 
+ static inline int pud_present(pud_t pud)
+@@ -597,6 +598,12 @@ static inline int pgd_bad(pgd_t pgd)
+ 
+ static inline int pgd_none(pgd_t pgd)
+ {
++	/*
++	 * There is no need to do a workaround for the KNL stray
++	 * A/D bit erratum here.  PGDs only point to page tables
++	 * except on 32-bit non-PAE which is not supported on
++	 * KNL.
++	 */
+ 	return !native_pgd_val(pgd);
+ }
+ #endif	/* PAGETABLE_LEVELS > 3 */
+* Unmerged path arch/x86/include/asm/pgtable_types.h
