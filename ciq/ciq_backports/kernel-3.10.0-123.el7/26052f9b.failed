@@ -1,0 +1,316 @@
+crypto: crct10dif - Add fallback for broken initrds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [crypto] crct10dif: Add fallback for broken initrds (Kyle McMartin) [968869]
+Rebuild_FUZZ: 88.17%
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 26052f9b9bb8de4f6a57165b0a803de9c26138bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/26052f9b.failed
+
+Unfortunately, even with a softdep some distros fail to include
+the necessary modules in the initrd.  Therefore this patch adds
+a fallback path to restore existing behaviour where we cannot
+load the new crypto crct10dif algorithm.
+
+In order to do this, the underlying crct10dif has been split out
+from the crypto implementation so that it can be used on the
+fallback path.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 26052f9b9bb8de4f6a57165b0a803de9c26138bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/crc-t10dif.c
+diff --cc lib/crc-t10dif.c
+index 0cb64634f513,dfe6ec17c0a5..000000000000
+--- a/lib/crc-t10dif.c
++++ b/lib/crc-t10dif.c
+@@@ -39,8 -44,10 +44,15 @@@ EXPORT_SYMBOL(crc_t10dif)
+  static int __init crc_t10dif_mod_init(void)
+  {
+  	crct10dif_tfm = crypto_alloc_shash("crct10dif", 0, 0);
+++<<<<<<< HEAD
+ +	if (IS_ERR(crct10dif_tfm))
+ +		return PTR_ERR(crct10dif_tfm);
+++=======
++ 	if (IS_ERR(crct10dif_tfm)) {
++ 		static_key_slow_inc(&crct10dif_fallback);
++ 		crct10dif_tfm = NULL;
++ 	}
+++>>>>>>> 26052f9b9bb8 (crypto: crct10dif - Add fallback for broken initrds)
+  	return 0;
+  }
+  
+diff --git a/crypto/Makefile b/crypto/Makefile
+index 62af87df8729..e9643dcd3faf 100644
+--- a/crypto/Makefile
++++ b/crypto/Makefile
+@@ -83,7 +83,7 @@ obj-$(CONFIG_CRYPTO_ZLIB) += zlib.o
+ obj-$(CONFIG_CRYPTO_MICHAEL_MIC) += michael_mic.o
+ obj-$(CONFIG_CRYPTO_CRC32C) += crc32c.o
+ obj-$(CONFIG_CRYPTO_CRC32) += crc32.o
+-obj-$(CONFIG_CRYPTO_CRCT10DIF) += crct10dif.o
++obj-$(CONFIG_CRYPTO_CRCT10DIF) += crct10dif_common.o crct10dif_generic.o
+ obj-$(CONFIG_CRYPTO_AUTHENC) += authenc.o authencesn.o
+ obj-$(CONFIG_CRYPTO_LZO) += lzo.o
+ obj-$(CONFIG_CRYPTO_842) += 842.o
+diff --git a/crypto/crct10dif.c b/crypto/crct10dif_common.c
+similarity index 63%
+rename from crypto/crct10dif.c
+rename to crypto/crct10dif_common.c
+index 92aca96d6b98..b2fab366f518 100644
+--- a/crypto/crct10dif.c
++++ b/crypto/crct10dif_common.c
+@@ -24,18 +24,10 @@
+  *
+  */
+ 
+-#include <linux/types.h>
+-#include <linux/module.h>
+ #include <linux/crc-t10dif.h>
+-#include <crypto/internal/hash.h>
+-#include <linux/init.h>
+-#include <linux/string.h>
++#include <linux/module.h>
+ #include <linux/kernel.h>
+ 
+-struct chksum_desc_ctx {
+-	__u16 crc;
+-};
+-
+ /* Table generated using the following polynomium:
+  * x^16 + x^15 + x^11 + x^9 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1
+  * gt: 0x8bb7
+@@ -86,93 +78,5 @@ __u16 crc_t10dif_generic(__u16 crc, const unsigned char *buffer, size_t len)
+ }
+ EXPORT_SYMBOL(crc_t10dif_generic);
+ 
+-/*
+- * Steps through buffer one byte at at time, calculates reflected
+- * crc using table.
+- */
+-
+-static int chksum_init(struct shash_desc *desc)
+-{
+-	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+-
+-	ctx->crc = 0;
+-
+-	return 0;
+-}
+-
+-static int chksum_update(struct shash_desc *desc, const u8 *data,
+-			 unsigned int length)
+-{
+-	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+-
+-	ctx->crc = crc_t10dif_generic(ctx->crc, data, length);
+-	return 0;
+-}
+-
+-static int chksum_final(struct shash_desc *desc, u8 *out)
+-{
+-	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+-
+-	*(__u16 *)out = ctx->crc;
+-	return 0;
+-}
+-
+-static int __chksum_finup(__u16 *crcp, const u8 *data, unsigned int len,
+-			u8 *out)
+-{
+-	*(__u16 *)out = crc_t10dif_generic(*crcp, data, len);
+-	return 0;
+-}
+-
+-static int chksum_finup(struct shash_desc *desc, const u8 *data,
+-			unsigned int len, u8 *out)
+-{
+-	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+-
+-	return __chksum_finup(&ctx->crc, data, len, out);
+-}
+-
+-static int chksum_digest(struct shash_desc *desc, const u8 *data,
+-			 unsigned int length, u8 *out)
+-{
+-	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+-
+-	return __chksum_finup(&ctx->crc, data, length, out);
+-}
+-
+-static struct shash_alg alg = {
+-	.digestsize		=	CRC_T10DIF_DIGEST_SIZE,
+-	.init		=	chksum_init,
+-	.update		=	chksum_update,
+-	.final		=	chksum_final,
+-	.finup		=	chksum_finup,
+-	.digest		=	chksum_digest,
+-	.descsize		=	sizeof(struct chksum_desc_ctx),
+-	.base			=	{
+-		.cra_name		=	"crct10dif",
+-		.cra_driver_name	=	"crct10dif-generic",
+-		.cra_priority		=	100,
+-		.cra_blocksize		=	CRC_T10DIF_BLOCK_SIZE,
+-		.cra_module		=	THIS_MODULE,
+-	}
+-};
+-
+-static int __init crct10dif_mod_init(void)
+-{
+-	int ret;
+-
+-	ret = crypto_register_shash(&alg);
+-	return ret;
+-}
+-
+-static void __exit crct10dif_mod_fini(void)
+-{
+-	crypto_unregister_shash(&alg);
+-}
+-
+-module_init(crct10dif_mod_init);
+-module_exit(crct10dif_mod_fini);
+-
+-MODULE_AUTHOR("Tim Chen <tim.c.chen@linux.intel.com>");
+-MODULE_DESCRIPTION("T10 DIF CRC calculation.");
++MODULE_DESCRIPTION("T10 DIF CRC calculation common code");
+ MODULE_LICENSE("GPL");
+diff --git a/crypto/crct10dif_generic.c b/crypto/crct10dif_generic.c
+new file mode 100644
+index 000000000000..877e7114ec5c
+--- /dev/null
++++ b/crypto/crct10dif_generic.c
+@@ -0,0 +1,127 @@
++/*
++ * Cryptographic API.
++ *
++ * T10 Data Integrity Field CRC16 Crypto Transform
++ *
++ * Copyright (c) 2007 Oracle Corporation.  All rights reserved.
++ * Written by Martin K. Petersen <martin.petersen@oracle.com>
++ * Copyright (C) 2013 Intel Corporation
++ * Author: Tim Chen <tim.c.chen@linux.intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the Free
++ * Software Foundation; either version 2 of the License, or (at your option)
++ * any later version.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/crc-t10dif.h>
++#include <crypto/internal/hash.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++
++struct chksum_desc_ctx {
++	__u16 crc;
++};
++
++/*
++ * Steps through buffer one byte at at time, calculates reflected
++ * crc using table.
++ */
++
++static int chksum_init(struct shash_desc *desc)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	ctx->crc = 0;
++
++	return 0;
++}
++
++static int chksum_update(struct shash_desc *desc, const u8 *data,
++			 unsigned int length)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	ctx->crc = crc_t10dif_generic(ctx->crc, data, length);
++	return 0;
++}
++
++static int chksum_final(struct shash_desc *desc, u8 *out)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	*(__u16 *)out = ctx->crc;
++	return 0;
++}
++
++static int __chksum_finup(__u16 *crcp, const u8 *data, unsigned int len,
++			u8 *out)
++{
++	*(__u16 *)out = crc_t10dif_generic(*crcp, data, len);
++	return 0;
++}
++
++static int chksum_finup(struct shash_desc *desc, const u8 *data,
++			unsigned int len, u8 *out)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	return __chksum_finup(&ctx->crc, data, len, out);
++}
++
++static int chksum_digest(struct shash_desc *desc, const u8 *data,
++			 unsigned int length, u8 *out)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	return __chksum_finup(&ctx->crc, data, length, out);
++}
++
++static struct shash_alg alg = {
++	.digestsize		=	CRC_T10DIF_DIGEST_SIZE,
++	.init		=	chksum_init,
++	.update		=	chksum_update,
++	.final		=	chksum_final,
++	.finup		=	chksum_finup,
++	.digest		=	chksum_digest,
++	.descsize		=	sizeof(struct chksum_desc_ctx),
++	.base			=	{
++		.cra_name		=	"crct10dif",
++		.cra_driver_name	=	"crct10dif-generic",
++		.cra_priority		=	100,
++		.cra_blocksize		=	CRC_T10DIF_BLOCK_SIZE,
++		.cra_module		=	THIS_MODULE,
++	}
++};
++
++static int __init crct10dif_mod_init(void)
++{
++	int ret;
++
++	ret = crypto_register_shash(&alg);
++	return ret;
++}
++
++static void __exit crct10dif_mod_fini(void)
++{
++	crypto_unregister_shash(&alg);
++}
++
++module_init(crct10dif_mod_init);
++module_exit(crct10dif_mod_fini);
++
++MODULE_AUTHOR("Tim Chen <tim.c.chen@linux.intel.com>");
++MODULE_DESCRIPTION("T10 DIF CRC calculation.");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("crct10dif");
+* Unmerged path lib/crc-t10dif.c
