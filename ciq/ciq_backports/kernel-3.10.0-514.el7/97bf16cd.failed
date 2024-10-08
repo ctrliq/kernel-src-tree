@@ -1,0 +1,148 @@
+Drivers: hv: kvp: switch to using the hvutil_device_state state machine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hv] kvp: switch to using the hvutil_device_state state machine (Vitaly Kuznetsov) [1074407 1309368]
+Rebuild_FUZZ: 89.92%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 97bf16cd309805ebf82ffcc4063a65e06169651f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/97bf16cd.failed
+
+Switch to using the hvutil_device_state state machine from using 2 different state variables: kvp_transaction.active and
+in_hand_shake.
+
+State transitions are:
+-> HVUTIL_DEVICE_INIT when driver loads or on device release
+-> HVUTIL_READY if the handshake was successful
+-> HVUTIL_HOSTMSG_RECEIVED when there is a non-negotiation message from the host
+-> HVUTIL_USERSPACE_REQ after we sent the message to the userspace daemon
+   -> HVUTIL_USERSPACE_RECV after/if the userspace daemon has replied
+-> HVUTIL_READY after we respond to the host
+-> HVUTIL_DEVICE_DYING on driver unload
+
+In hv_kvp_onchannelcallback() process ICMSGTYPE_NEGOTIATE messages even when
+the userspace daemon is disconnected, otherwise we can make the host think
+we don't support KVP and disable the service completely.
+
+Unfortunately there is no good way we can figure out that the userspace daemon
+has died (unless we start treating all timeouts as such). In case the daemon
+restarts we skip the negotiation procedure (so the daemon is supposed to has
+the same version). This behavior is unchanged from in_handshake approach.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Tested-by: Alex Ng <alexng@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 97bf16cd309805ebf82ffcc4063a65e06169651f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/hv_kvp.c
+diff --cc drivers/hv/hv_kvp.c
+index 0353aa1d6ef0,a70d20262540..000000000000
+--- a/drivers/hv/hv_kvp.c
++++ b/drivers/hv/hv_kvp.c
+@@@ -126,19 -124,15 +124,26 @@@ kvp_work_func(struct work_struct *dummy
+  	 * process the pending transaction.
+  	 */
+  	kvp_respond_to_host(NULL, HV_E_FAIL);
++ 
++ 	/* Transaction is finished, reset the state. */
++ 	if (kvp_transaction.state > HVUTIL_READY)
++ 		kvp_transaction.state = HVUTIL_READY;
++ 
++ 	hv_poll_channel(kvp_transaction.kvp_context,
++ 			hv_kvp_onchannelcallback);
+  }
+  
+ +static void poll_channel(struct vmbus_channel *channel)
+ +{
+ +	if (channel->target_cpu != smp_processor_id())
+ +		smp_call_function_single(channel->target_cpu,
+ +					 hv_kvp_onchannelcallback,
+ +					 channel, true);
+ +	else
+ +		hv_kvp_onchannelcallback(channel);
+ +}
+ +
+ +
+  static int kvp_handle_handshake(struct hv_kvp_msg *msg)
+  {
+  	int ret = 1;
+@@@ -165,9 -159,7 +170,13 @@@
+  		 */
+  		pr_info("KVP: user-mode registering done.\n");
+  		kvp_register(dm_reg_value);
+++<<<<<<< HEAD
+ +		kvp_transaction.active = false;
+ +		if (kvp_transaction.kvp_context)
+ +			poll_channel(kvp_transaction.kvp_context);
+++=======
++ 		kvp_transaction.state = HVUTIL_READY;
+++>>>>>>> 97bf16cd3098 (Drivers: hv: kvp: switch to using the hvutil_device_state state machine)
+  	}
+  	return ret;
+  }
+@@@ -226,8 -222,12 +239,16 @@@ kvp_cn_callback(struct cn_msg *msg, str
+  	 * Complete the transaction by forwarding the key value
+  	 * to the host. But first, cancel the timeout.
+  	 */
+++<<<<<<< HEAD
+ +	if (cancel_delayed_work_sync(&kvp_work))
+++=======
++ 	if (cancel_delayed_work_sync(&kvp_timeout_work)) {
+++>>>>>>> 97bf16cd3098 (Drivers: hv: kvp: switch to using the hvutil_device_state state machine)
+  		kvp_respond_to_host(message, error);
++ 		kvp_transaction.state = HVUTIL_READY;
++ 		hv_poll_channel(kvp_transaction.kvp_context,
++ 				hv_kvp_onchannelcallback);
++ 	}
+  }
+  
+  
+@@@ -448,11 -452,14 +473,21 @@@ kvp_send_key(struct work_struct *dummy
+  	}
+  
+  	msg->len = sizeof(struct hv_kvp_msg);
+++<<<<<<< HEAD
+ +	rc = cn_netlink_send(msg, 0, GFP_ATOMIC);
+ +	if (rc) {
+ +		pr_debug("KVP: failed to communicate to the daemon: %d\n", rc);
+ +		if (cancel_delayed_work_sync(&kvp_work))
+++=======
++ 	kvp_transaction.state = HVUTIL_USERSPACE_REQ;
++ 	rc = cn_netlink_send(msg, 0, 0, GFP_ATOMIC);
++ 	if (rc) {
++ 		pr_debug("KVP: failed to communicate to the daemon: %d\n", rc);
++ 		if (cancel_delayed_work_sync(&kvp_timeout_work)) {
+++>>>>>>> 97bf16cd3098 (Drivers: hv: kvp: switch to using the hvutil_device_state state machine)
+  			kvp_respond_to_host(message, HV_E_FAIL);
++ 			kvp_transaction.state = HVUTIL_READY;
++ 		}
+  	}
+  
+  	kfree(msg);
+@@@ -587,7 -581,6 +609,10 @@@ response_done
+  
+  	vmbus_sendpacket(channel, recv_buffer, buf_len, req_id,
+  				VM_PKT_DATA_INBAND, 0);
+++<<<<<<< HEAD
+ +	poll_channel(channel);
+++=======
+++>>>>>>> 97bf16cd3098 (Drivers: hv: kvp: switch to using the hvutil_device_state state machine)
+  }
+  
+  /*
+@@@ -717,7 -717,8 +748,8 @@@ hv_kvp_init(struct hv_util_service *srv
+  
+  void hv_kvp_deinit(void)
+  {
++ 	kvp_transaction.state = HVUTIL_DEVICE_DYING;
+  	cn_del_callback(&kvp_id);
+ -	cancel_delayed_work_sync(&kvp_timeout_work);
+ +	cancel_delayed_work_sync(&kvp_work);
+  	cancel_work_sync(&kvp_sendkey_work);
+  }
+* Unmerged path drivers/hv/hv_kvp.c
