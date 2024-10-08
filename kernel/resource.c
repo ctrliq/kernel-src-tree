@@ -854,6 +854,7 @@ int insert_resource(struct resource *parent, struct resource *new)
 	conflict = insert_resource_conflict(parent, new);
 	return conflict ? -EBUSY : 0;
 }
+EXPORT_SYMBOL_GPL(insert_resource);
 
 /**
  * insert_resource_expand_to_fit - Insert a resource into the resource tree
@@ -913,6 +914,7 @@ int remove_resource(struct resource *old)
 	write_unlock(&resource_lock);
 	return retval;
 }
+EXPORT_SYMBOL_GPL(remove_resource);
 
 static int __adjust_resource(struct resource *res, resource_size_t start,
 				resource_size_t size)
