@@ -818,7 +818,10 @@ static enum drm_connector_status qxl_conn_detect(
 		    (qdev->monitors_config &&
 		     qdev->monitors_config->count > output->index);
 
-	DRM_DEBUG("\n");
+	DRM_DEBUG("#%d connected: %d\n", output->index, connected);
+	if (!connected)
+		qxl_monitors_config_set(qdev, output->index, 0, 0, 0, 0, 0);
+
 	return connected ? connector_status_connected
 			 : connector_status_disconnected;
 }
