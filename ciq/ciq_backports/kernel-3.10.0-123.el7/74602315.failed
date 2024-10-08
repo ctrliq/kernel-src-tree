@@ -1,0 +1,391 @@
+sched: Fix race in migrate_swap_stop()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [kernel] sched: fix race in migrate_swap_stop (Rik van Riel) [683513]
+Rebuild_FUZZ: 97.30%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 746023159c40c523b08a3bc3d213dac212385895
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/74602315.failed
+
+There is a subtle race in migrate_swap, when task P, on CPU A, decides to swap
+places with task T, on CPU B.
+
+Task P:
+  - call migrate_swap
+Task T:
+  - go to sleep, removing itself from the runqueue
+Task P:
+  - double lock the runqueues on CPU A & B
+Task T:
+  - get woken up, place itself on the runqueue of CPU C
+Task P:
+  - see that task T is on a runqueue, and pretend to remove it
+    from the runqueue on CPU B
+
+Now CPUs B & C both have corrupted scheduler data structures.
+
+This patch fixes it, by holding the pi_lock for both of the tasks
+involved in the migrate swap. This prevents task T from waking up,
+and placing itself onto another runqueue, until after migrate_swap
+has released all locks.
+
+This means that, when migrate_swap checks, task T will be either
+on the runqueue where it was originally seen, or not on any
+runqueue at all. Migrate_swap deals correctly with of those cases.
+
+	Tested-by: Joe Mario <jmario@redhat.com>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: hannes@cmpxchg.org
+	Cc: aarcange@redhat.com
+	Cc: srikar@linux.vnet.ibm.com
+	Cc: tglx@linutronix.de
+	Cc: hpa@zytor.com
+Link: http://lkml.kernel.org/r/20131010181722.GO13848@laptop.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 746023159c40c523b08a3bc3d213dac212385895)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/fair.c
+diff --cc kernel/sched/core.c
+index 2902fa55d246,a972acd468b0..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1030,6 -1013,106 +1030,109 @@@ void set_task_cpu(struct task_struct *p
+  	__set_task_cpu(p, new_cpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __migrate_swap_task(struct task_struct *p, int cpu)
++ {
++ 	if (p->on_rq) {
++ 		struct rq *src_rq, *dst_rq;
++ 
++ 		src_rq = task_rq(p);
++ 		dst_rq = cpu_rq(cpu);
++ 
++ 		deactivate_task(src_rq, p, 0);
++ 		set_task_cpu(p, cpu);
++ 		activate_task(dst_rq, p, 0);
++ 		check_preempt_curr(dst_rq, p, 0);
++ 	} else {
++ 		/*
++ 		 * Task isn't running anymore; make it appear like we migrated
++ 		 * it before it went to sleep. This means on wakeup we make the
++ 		 * previous cpu our targer instead of where it really is.
++ 		 */
++ 		p->wake_cpu = cpu;
++ 	}
++ }
++ 
++ struct migration_swap_arg {
++ 	struct task_struct *src_task, *dst_task;
++ 	int src_cpu, dst_cpu;
++ };
++ 
++ static int migrate_swap_stop(void *data)
++ {
++ 	struct migration_swap_arg *arg = data;
++ 	struct rq *src_rq, *dst_rq;
++ 	int ret = -EAGAIN;
++ 
++ 	src_rq = cpu_rq(arg->src_cpu);
++ 	dst_rq = cpu_rq(arg->dst_cpu);
++ 
++ 	double_raw_lock(&arg->src_task->pi_lock,
++ 			&arg->dst_task->pi_lock);
++ 	double_rq_lock(src_rq, dst_rq);
++ 	if (task_cpu(arg->dst_task) != arg->dst_cpu)
++ 		goto unlock;
++ 
++ 	if (task_cpu(arg->src_task) != arg->src_cpu)
++ 		goto unlock;
++ 
++ 	if (!cpumask_test_cpu(arg->dst_cpu, tsk_cpus_allowed(arg->src_task)))
++ 		goto unlock;
++ 
++ 	if (!cpumask_test_cpu(arg->src_cpu, tsk_cpus_allowed(arg->dst_task)))
++ 		goto unlock;
++ 
++ 	__migrate_swap_task(arg->src_task, arg->dst_cpu);
++ 	__migrate_swap_task(arg->dst_task, arg->src_cpu);
++ 
++ 	ret = 0;
++ 
++ unlock:
++ 	double_rq_unlock(src_rq, dst_rq);
++ 	raw_spin_unlock(&arg->dst_task->pi_lock);
++ 	raw_spin_unlock(&arg->src_task->pi_lock);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Cross migrate two tasks
++  */
++ int migrate_swap(struct task_struct *cur, struct task_struct *p)
++ {
++ 	struct migration_swap_arg arg;
++ 	int ret = -EINVAL;
++ 
++ 	get_online_cpus();
++ 
++ 	arg = (struct migration_swap_arg){
++ 		.src_task = cur,
++ 		.src_cpu = task_cpu(cur),
++ 		.dst_task = p,
++ 		.dst_cpu = task_cpu(p),
++ 	};
++ 
++ 	if (arg.src_cpu == arg.dst_cpu)
++ 		goto out;
++ 
++ 	if (!cpu_active(arg.src_cpu) || !cpu_active(arg.dst_cpu))
++ 		goto out;
++ 
++ 	if (!cpumask_test_cpu(arg.dst_cpu, tsk_cpus_allowed(arg.src_task)))
++ 		goto out;
++ 
++ 	if (!cpumask_test_cpu(arg.src_cpu, tsk_cpus_allowed(arg.dst_task)))
++ 		goto out;
++ 
++ 	ret = stop_two_cpus(arg.dst_cpu, arg.src_cpu, migrate_swap_stop, &arg);
++ 
++ out:
++ 	put_online_cpus();
++ 	return ret;
++ }
++ 
+++>>>>>>> 746023159c40 (sched: Fix race in migrate_swap_stop())
+  struct migration_arg {
+  	struct task_struct *task;
+  	int dest_cpu;
+diff --cc kernel/sched/fair.c
+index 98cee68da024,813dd61a9b43..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -866,11 -1400,180 +866,181 @@@ static void task_numa_placement(struct 
+  			max_faults = faults;
+  			max_nid = nid;
+  		}
+ -
+ -		if (group_faults > max_group_faults) {
+ -			max_group_faults = group_faults;
+ -			max_group_nid = nid;
+ -		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Update the tasks preferred node if necessary */
+ +	if (max_faults && max_nid != p->numa_preferred_nid)
+ +		p->numa_preferred_nid = max_nid;
+++=======
++ 	update_task_scan_period(p, fault_types[0], fault_types[1]);
++ 
++ 	if (p->numa_group) {
++ 		/*
++ 		 * If the preferred task and group nids are different,
++ 		 * iterate over the nodes again to find the best place.
++ 		 */
++ 		if (max_nid != max_group_nid) {
++ 			unsigned long weight, max_weight = 0;
++ 
++ 			for_each_online_node(nid) {
++ 				weight = task_weight(p, nid) + group_weight(p, nid);
++ 				if (weight > max_weight) {
++ 					max_weight = weight;
++ 					max_nid = nid;
++ 				}
++ 			}
++ 		}
++ 
++ 		spin_unlock(group_lock);
++ 	}
++ 
++ 	/* Preferred node as the node with the most faults */
++ 	if (max_faults && max_nid != p->numa_preferred_nid) {
++ 		/* Update the preferred nid and migrate task if possible */
++ 		sched_setnuma(p, max_nid);
++ 		numa_migrate_preferred(p);
++ 	}
++ }
++ 
++ static inline int get_numa_group(struct numa_group *grp)
++ {
++ 	return atomic_inc_not_zero(&grp->refcount);
++ }
++ 
++ static inline void put_numa_group(struct numa_group *grp)
++ {
++ 	if (atomic_dec_and_test(&grp->refcount))
++ 		kfree_rcu(grp, rcu);
++ }
++ 
++ static void task_numa_group(struct task_struct *p, int cpupid, int flags,
++ 			int *priv)
++ {
++ 	struct numa_group *grp, *my_grp;
++ 	struct task_struct *tsk;
++ 	bool join = false;
++ 	int cpu = cpupid_to_cpu(cpupid);
++ 	int i;
++ 
++ 	if (unlikely(!p->numa_group)) {
++ 		unsigned int size = sizeof(struct numa_group) +
++ 				    2*nr_node_ids*sizeof(unsigned long);
++ 
++ 		grp = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
++ 		if (!grp)
++ 			return;
++ 
++ 		atomic_set(&grp->refcount, 1);
++ 		spin_lock_init(&grp->lock);
++ 		INIT_LIST_HEAD(&grp->task_list);
++ 		grp->gid = p->pid;
++ 
++ 		for (i = 0; i < 2*nr_node_ids; i++)
++ 			grp->faults[i] = p->numa_faults[i];
++ 
++ 		grp->total_faults = p->total_numa_faults;
++ 
++ 		list_add(&p->numa_entry, &grp->task_list);
++ 		grp->nr_tasks++;
++ 		rcu_assign_pointer(p->numa_group, grp);
++ 	}
++ 
++ 	rcu_read_lock();
++ 	tsk = ACCESS_ONCE(cpu_rq(cpu)->curr);
++ 
++ 	if (!cpupid_match_pid(tsk, cpupid))
++ 		goto no_join;
++ 
++ 	grp = rcu_dereference(tsk->numa_group);
++ 	if (!grp)
++ 		goto no_join;
++ 
++ 	my_grp = p->numa_group;
++ 	if (grp == my_grp)
++ 		goto no_join;
++ 
++ 	/*
++ 	 * Only join the other group if its bigger; if we're the bigger group,
++ 	 * the other task will join us.
++ 	 */
++ 	if (my_grp->nr_tasks > grp->nr_tasks)
++ 		goto no_join;
++ 
++ 	/*
++ 	 * Tie-break on the grp address.
++ 	 */
++ 	if (my_grp->nr_tasks == grp->nr_tasks && my_grp > grp)
++ 		goto no_join;
++ 
++ 	/* Always join threads in the same process. */
++ 	if (tsk->mm == current->mm)
++ 		join = true;
++ 
++ 	/* Simple filter to avoid false positives due to PID collisions */
++ 	if (flags & TNF_SHARED)
++ 		join = true;
++ 
++ 	/* Update priv based on whether false sharing was detected */
++ 	*priv = !join;
++ 
++ 	if (join && !get_numa_group(grp))
++ 		goto no_join;
++ 
++ 	rcu_read_unlock();
++ 
++ 	if (!join)
++ 		return;
++ 
++ 	double_lock(&my_grp->lock, &grp->lock);
++ 
++ 	for (i = 0; i < 2*nr_node_ids; i++) {
++ 		my_grp->faults[i] -= p->numa_faults[i];
++ 		grp->faults[i] += p->numa_faults[i];
++ 	}
++ 	my_grp->total_faults -= p->total_numa_faults;
++ 	grp->total_faults += p->total_numa_faults;
++ 
++ 	list_move(&p->numa_entry, &grp->task_list);
++ 	my_grp->nr_tasks--;
++ 	grp->nr_tasks++;
++ 
++ 	spin_unlock(&my_grp->lock);
++ 	spin_unlock(&grp->lock);
++ 
++ 	rcu_assign_pointer(p->numa_group, grp);
++ 
++ 	put_numa_group(my_grp);
++ 	return;
++ 
++ no_join:
++ 	rcu_read_unlock();
++ 	return;
++ }
++ 
++ void task_numa_free(struct task_struct *p)
++ {
++ 	struct numa_group *grp = p->numa_group;
++ 	int i;
++ 	void *numa_faults = p->numa_faults;
++ 
++ 	if (grp) {
++ 		spin_lock(&grp->lock);
++ 		for (i = 0; i < 2*nr_node_ids; i++)
++ 			grp->faults[i] -= p->numa_faults[i];
++ 		grp->total_faults -= p->total_numa_faults;
++ 
++ 		list_del(&p->numa_entry);
++ 		grp->nr_tasks--;
++ 		spin_unlock(&grp->lock);
++ 		rcu_assign_pointer(p->numa_group, NULL);
++ 		put_numa_group(grp);
++ 	}
++ 
++ 	p->numa_faults = NULL;
++ 	p->numa_faults_buffer = NULL;
++ 	kfree(numa_faults);
+++>>>>>>> 746023159c40 (sched: Fix race in migrate_swap_stop())
+  }
+  
+  /*
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/fair.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 5abdf358588f..1747a1635af2 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1256,6 +1256,24 @@ static inline void double_unlock_balance(struct rq *this_rq, struct rq *busiest)
+ 	lock_set_subclass(&this_rq->lock.dep_map, 0, _RET_IP_);
+ }
+ 
++static inline void double_lock(spinlock_t *l1, spinlock_t *l2)
++{
++	if (l1 > l2)
++		swap(l1, l2);
++
++	spin_lock(l1);
++	spin_lock_nested(l2, SINGLE_DEPTH_NESTING);
++}
++
++static inline void double_raw_lock(raw_spinlock_t *l1, raw_spinlock_t *l2)
++{
++	if (l1 > l2)
++		swap(l1, l2);
++
++	raw_spin_lock(l1);
++	raw_spin_lock_nested(l2, SINGLE_DEPTH_NESTING);
++}
++
+ /*
+  * double_rq_lock - safely lock two runqueues
+  *
