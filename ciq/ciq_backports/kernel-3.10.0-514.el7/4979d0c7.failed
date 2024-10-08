@@ -1,0 +1,335 @@
+perf stat record: Add record command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 4979d0c7d0c73a3e799d4dcfbacd3cd11cc55638
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4979d0c7.failed
+
+Add 'perf stat record' command support. It creates simple (header only)
+perf.data file ATM.
+
+The record command could be specified anywhere among stat options. All
+stat command options are valid for stat record command with '-o' option
+exception. If specified for record command it denotes the perf data file
+name.
+
+Committer note:
+
+Set sample_type to PERF_SAMPLE_IDENTIFIER, which should be harmless
+while avoiding that older tools show confusing messages, for instance,
+with sample_type = 0, we get:
+
+  $ perf stat record usleep 1
+
+   Performance counter stats for 'usleep 1':
+
+          0.630237      task-clock (msec)         #    0.528 CPUs utilized
+                 1      context-switches          #    0.002 M/sec
+                 0      cpu-migrations            #    0.000 K/sec
+                52      page-faults               #    0.083 M/sec
+           978,312      cycles                    #    1.552 GHz
+           671,931      stalled-cycles-frontend   #   68.68% frontend cycles idle
+   <not supported>      stalled-cycles-backend
+           646,379      instructions              #    0.66  insns per cycle
+                                                  #    1.04  stalled cycles per insn
+           131,046      branches                  #  207.931 M/sec
+             7,073      branch-misses             #    5.40% of all branches
+
+       0.001193240 seconds time elapsed
+
+  $ oldperf evlist
+  WARNING: The perf.data file's data size field is 0 which is unexpected.
+  Was the 'perf record' command properly terminated?
+  non matching sample_type
+  $
+
+While with sample_type set to PERF_SAMPLE_IDENTIFIER, after we re-run 'perf
+stat record usleep' we get:
+
+  $ oldperf evlist
+  WARNING: The perf.data file's data size field is 0 which is unexpected.
+  Was the 'perf record' command properly terminated?
+  task-clock
+  context-switches
+  cpu-migrations
+  page-faults
+  cycles
+  stalled-cycles-frontend
+  stalled-cycles-backend
+  instructions
+  branches
+  branch-misses
+  $
+
+Which at least shows the names of the events in the perf.data file.
+
+Additionally, such files, when passed to 'perf report' will produce:
+
+  $ oldperf report --stdio
+  WARNING: The perf.data file's data size field is 0 which is unexpected.
+  Was the 'perf record' command properly terminated?
+  Warning:
+  Kernel address maps (/proc/{kallsyms,modules}) were restricted.
+
+  Check /proc/sys/kernel/kptr_restrict before running 'perf record'.
+
+  As no suitable kallsyms nor vmlinux was found, kernel samples
+  can't be resolved.
+
+  Samples in kernel modules can't be resolved as well.
+
+  Error:
+  The perf.data file has no samples!
+  # To display the perf.data header info, please use --header/--header-only options.
+  #
+  $
+
+Which is confusing and can be solved by just adding the kernel mmap record,
+which will also remove that warning about the data size field being equal to
+zero, after generating the mmap record:
+
+  $ perf stat record usleep 1
+
+   Performance counter stats for 'usleep 1':
+
+          0.600796      task-clock (msec)         #    0.478 CPUs utilized
+                 1      context-switches          #    0.002 M/sec
+                 0      cpu-migrations            #    0.000 K/sec
+                54      page-faults               #    0.090 M/sec
+           886,844      cycles                    #    1.476 GHz
+           582,169      stalled-cycles-frontend   #   65.65% frontend cycles idle
+   <not supported>      stalled-cycles-backend
+           638,344      instructions              #    0.72  insns per cycle
+                                                  #    0.91  stalled cycles per insn
+           130,204      branches                  #  216.719 M/sec
+             7,500      branch-misses             #    5.76% of all branches
+
+       0.001255897 seconds time elapsed
+
+  $ oldperf evlist
+  task-clock
+  context-switches
+  cpu-migrations
+  page-faults
+  cycles
+  stalled-cycles-frontend
+  stalled-cycles-backend
+  instructions
+  branches
+  branch-misses
+  $ oldperf report --stdio
+  Error:
+  The perf.data file has no samples!
+  # To display the perf.data header info, please use --header/--header-only options.
+  #
+  [acme@zoo linux]$
+
+No warnings, sensible output about what are the events in the perf.data file and also
+a "file has no samples" message, which indeed it doesn't.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Tested-by: Kan Liang <kan.liang@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: htp://lkml.kernel.org/r/1446734469-11352-3-git-send-email-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 4979d0c7d0c73a3e799d4dcfbacd3cd11cc55638)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-stat.c
+diff --cc tools/perf/builtin-stat.c
+index 473fc692d35a,af2a3bf659f7..000000000000
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@@ -119,8 -122,21 +120,18 @@@ static unsigned int		unit_width			= 4; 
+  static bool			forever				= false;
+  static struct timespec		ref_time;
+  static struct cpu_map		*aggr_map;
+ -static aggr_get_id_t		aggr_get_id;
+ -static bool			append_file;
+ -static const char		*output_name;
+ -static int			output_fd;
+ +static int			(*aggr_get_id)(struct cpu_map *m, int cpu);
+  
++ struct perf_stat {
++ 	bool			 record;
++ 	struct perf_data_file	 file;
++ 	struct perf_session	*session;
++ 	u64			 bytes_written;
++ };
++ 
++ static struct perf_stat		perf_stat;
++ #define STAT_RECORD		perf_stat.record
++ 
+  static volatile int done = 0;
+  
+  static struct perf_stat_config stat_config = {
+@@@ -1136,71 -1305,40 +1180,103 @@@ static int add_default_attributes(void
+  	return perf_evlist__add_default_attrs(evsel_list, very_very_detailed_attrs);
+  }
+  
++ static const char * const recort_usage[] = {
++ 	"perf stat record [<options>]",
++ 	NULL,
++ };
++ 
++ static int __cmd_record(int argc, const char **argv)
++ {
++ 	struct perf_session *session;
++ 	struct perf_data_file *file = &perf_stat.file;
++ 
++ 	argc = parse_options(argc, argv, stat_options, record_usage,
++ 			     PARSE_OPT_STOP_AT_NON_OPTION);
++ 
++ 	if (output_name)
++ 		file->path = output_name;
++ 
++ 	session = perf_session__new(file, false, NULL);
++ 	if (session == NULL) {
++ 		pr_err("Perf session creation failed.\n");
++ 		return -1;
++ 	}
++ 
++ 	/* No pipe support ATM */
++ 	if (perf_stat.file.is_pipe)
++ 		return -EINVAL;
++ 
++ 	session->evlist   = evsel_list;
++ 	perf_stat.session = session;
++ 	perf_stat.record  = true;
++ 	return argc;
++ }
++ 
+  int cmd_stat(int argc, const char **argv, const char *prefix __maybe_unused)
+  {
+ +	bool append_file = false;
+ +	int output_fd = 0;
+ +	const char *output_name	= NULL;
+ +	const struct option options[] = {
+ +	OPT_BOOLEAN('T', "transaction", &transaction_run,
+ +		    "hardware transaction statistics"),
+ +	OPT_CALLBACK('e', "event", &evsel_list, "event",
+ +		     "event selector. use 'perf list' to list available events",
+ +		     parse_events_option),
+ +	OPT_CALLBACK(0, "filter", &evsel_list, "filter",
+ +		     "event filter", parse_filter),
+ +	OPT_BOOLEAN('i', "no-inherit", &no_inherit,
+ +		    "child tasks do not inherit counters"),
+ +	OPT_STRING('p', "pid", &target.pid, "pid",
+ +		   "stat events on existing process id"),
+ +	OPT_STRING('t', "tid", &target.tid, "tid",
+ +		   "stat events on existing thread id"),
+ +	OPT_BOOLEAN('a', "all-cpus", &target.system_wide,
+ +		    "system-wide collection from all CPUs"),
+ +	OPT_BOOLEAN('g', "group", &group,
+ +		    "put the counters into a counter group"),
+ +	OPT_BOOLEAN('c', "scale", &stat_config.scale, "scale/normalize counters"),
+ +	OPT_INCR('v', "verbose", &verbose,
+ +		    "be more verbose (show counter open errors, etc)"),
+ +	OPT_INTEGER('r', "repeat", &run_count,
+ +		    "repeat command and print average + stddev (max: 100, forever: 0)"),
+ +	OPT_BOOLEAN('n', "null", &null_run,
+ +		    "null run - dont start any counters"),
+ +	OPT_INCR('d', "detailed", &detailed_run,
+ +		    "detailed run - start a lot of events"),
+ +	OPT_BOOLEAN('S', "sync", &sync_run,
+ +		    "call sync() before starting a run"),
+ +	OPT_CALLBACK_NOOPT('B', "big-num", NULL, NULL,
+ +			   "print large numbers with thousands\' separators",
+ +			   stat__set_big_num),
+ +	OPT_STRING('C', "cpu", &target.cpu_list, "cpu",
+ +		    "list of cpus to monitor in system-wide"),
+ +	OPT_SET_UINT('A', "no-aggr", &stat_config.aggr_mode,
+ +		    "disable CPU count aggregation", AGGR_NONE),
+ +	OPT_STRING('x', "field-separator", &csv_sep, "separator",
+ +		   "print counts with custom separator"),
+ +	OPT_CALLBACK('G', "cgroup", &evsel_list, "name",
+ +		     "monitor event in cgroup name only", parse_cgroups),
+ +	OPT_STRING('o', "output", &output_name, "file", "output file name"),
+ +	OPT_BOOLEAN(0, "append", &append_file, "append to the output file"),
+ +	OPT_INTEGER(0, "log-fd", &output_fd,
+ +		    "log output to fd, instead of stderr"),
+ +	OPT_STRING(0, "pre", &pre_cmd, "command",
+ +			"command to run prior to the measured command"),
+ +	OPT_STRING(0, "post", &post_cmd, "command",
+ +			"command to run after to the measured command"),
+ +	OPT_UINTEGER('I', "interval-print", &stat_config.interval,
+ +		    "print counts at regular interval in ms (>= 10)"),
+ +	OPT_SET_UINT(0, "per-socket", &stat_config.aggr_mode,
+ +		     "aggregate counts per processor socket", AGGR_SOCKET),
+ +	OPT_SET_UINT(0, "per-core", &stat_config.aggr_mode,
+ +		     "aggregate counts per physical processor core", AGGR_CORE),
+ +	OPT_SET_UINT(0, "per-thread", &stat_config.aggr_mode,
+ +		     "aggregate counts per thread", AGGR_THREAD),
+ +	OPT_UINTEGER('D', "delay", &initial_delay,
+ +		     "ms to wait before starting measurement after program start"),
+ +	OPT_END()
+ +	};
+  	const char * const stat_usage[] = {
+  		"perf stat [<options>] [<command>]",
+  		NULL
+@@@ -1216,8 -1355,15 +1293,20 @@@
+  	if (evsel_list == NULL)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	argc = parse_options(argc, argv, options, stat_usage,
+ +		PARSE_OPT_STOP_AT_NON_OPTION);
+++=======
++ 	argc = parse_options_subcommand(argc, argv, stat_options, stat_subcommands,
++ 					(const char **) stat_usage,
++ 					PARSE_OPT_STOP_AT_NON_OPTION);
++ 
++ 	if (argc && !strncmp(argv[0], "rec", 3)) {
++ 		argc = __cmd_record(argc, argv);
++ 		if (argc < 0)
++ 			return -1;
++ 	}
+++>>>>>>> 4979d0c7d0c7 (perf stat record: Add record command)
+  
+  	interval = stat_config.interval;
+  
+diff --git a/tools/perf/Documentation/perf-stat.txt b/tools/perf/Documentation/perf-stat.txt
+index 4e074a660826..70eee1c2c444 100644
+--- a/tools/perf/Documentation/perf-stat.txt
++++ b/tools/perf/Documentation/perf-stat.txt
+@@ -10,6 +10,7 @@ SYNOPSIS
+ [verse]
+ 'perf stat' [-e <EVENT> | --event=EVENT] [-a] <command>
+ 'perf stat' [-e <EVENT> | --event=EVENT] [-a] -- <command> [<options>]
++'perf stat' [-e <EVENT> | --event=EVENT] [-a] record [-o file] -- <command> [<options>]
+ 
+ DESCRIPTION
+ -----------
+@@ -22,6 +23,8 @@ OPTIONS
+ <command>...::
+ 	Any command you can specify in a shell.
+ 
++record::
++	See STAT RECORD.
+ 
+ -e::
+ --event=::
+@@ -159,6 +162,15 @@ filter out the startup phase of the program, which is often very different.
+ 
+ Print statistics of transactional execution if supported.
+ 
++STAT RECORD
++-----------
++Stores stat data into perf data file.
++
++-o file::
++--output file::
++Output file name.
++
++
+ EXAMPLES
+ --------
+ 
+* Unmerged path tools/perf/builtin-stat.c
