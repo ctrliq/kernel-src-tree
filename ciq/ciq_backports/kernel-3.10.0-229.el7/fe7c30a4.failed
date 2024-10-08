@@ -1,0 +1,160 @@
+s390/airq: add support for irq ranges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit fe7c30a420761654777d3cc15412fc7626407e93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/fe7c30a4.failed
+
+Add airq_iv_alloc and airq_iv_free to allocate and free consecutive
+ranges of irqs from the interrupt vector.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit fe7c30a420761654777d3cc15412fc7626407e93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/cio/airq.c
+diff --cc drivers/s390/cio/airq.c
+index 6ead6d076445,445564c790f6..000000000000
+--- a/drivers/s390/cio/airq.c
++++ b/drivers/s390/cio/airq.c
+@@@ -169,54 -186,67 +169,98 @@@ void airq_iv_release(struct airq_iv *iv
+  EXPORT_SYMBOL(airq_iv_release);
+  
+  /**
+-  * airq_iv_alloc_bit - allocate an irq bit from an interrupt vector
++  * airq_iv_alloc - allocate irq bits from an interrupt vector
+   * @iv: pointer to an interrupt vector structure
++  * @num: number of consecutive irq bits to allocate
+   *
+-  * Returns the bit number of the allocated irq, or -1UL if no bit
+-  * is available or the AIRQ_IV_ALLOC flag has not been specified
++  * Returns the bit number of the first irq in the allocated block of irqs,
++  * or -1UL if no bit is available or the AIRQ_IV_ALLOC flag has not been
++  * specified
+   */
+- unsigned long airq_iv_alloc_bit(struct airq_iv *iv)
++ unsigned long airq_iv_alloc(struct airq_iv *iv, unsigned long num)
+  {
+++<<<<<<< HEAD
+ +	const unsigned long be_to_le = BITS_PER_LONG - 1;
+ +	unsigned long bit;
+++=======
++ 	unsigned long bit, i;
+++>>>>>>> fe7c30a42076 (s390/airq: add support for irq ranges)
+  
+- 	if (!iv->avail)
++ 	if (!iv->avail || num == 0)
+  		return -1UL;
+  	spin_lock(&iv->lock);
+++<<<<<<< HEAD
+ +	bit = find_first_bit_left(iv->avail, iv->bits);
+ +	if (bit < iv->bits) {
+ +		clear_bit(bit ^ be_to_le, iv->avail);
+ +		if (bit >= iv->end)
+ +			iv->end = bit + 1;
+ +	} else
+++=======
++ 	bit = find_first_bit_inv(iv->avail, iv->bits);
++ 	while (bit + num <= iv->bits) {
++ 		for (i = 1; i < num; i++)
++ 			if (!test_bit_inv(bit + i, iv->avail))
++ 				break;
++ 		if (i >= num) {
++ 			/* Found a suitable block of irqs */
++ 			for (i = 0; i < num; i++)
++ 				clear_bit_inv(bit + i, iv->avail);
++ 			if (bit + num >= iv->end)
++ 				iv->end = bit + num + 1;
++ 			break;
++ 		}
++ 		bit = find_next_bit_inv(iv->avail, iv->bits, bit + i + 1);
++ 	}
++ 	if (bit + num > iv->bits)
+++>>>>>>> fe7c30a42076 (s390/airq: add support for irq ranges)
+  		bit = -1UL;
+  	spin_unlock(&iv->lock);
+  	return bit;
+  
+  }
+- EXPORT_SYMBOL(airq_iv_alloc_bit);
++ EXPORT_SYMBOL(airq_iv_alloc);
+  
+  /**
+-  * airq_iv_free_bit - free an irq bit of an interrupt vector
++  * airq_iv_free - free irq bits of an interrupt vector
+   * @iv: pointer to interrupt vector structure
+-  * @bit: number of the irq bit to free
++  * @bit: number of the first irq bit to free
++  * @num: number of consecutive irq bits to free
+   */
+- void airq_iv_free_bit(struct airq_iv *iv, unsigned long bit)
++ void airq_iv_free(struct airq_iv *iv, unsigned long bit, unsigned long num)
+  {
+++<<<<<<< HEAD
+ +	const unsigned long be_to_le = BITS_PER_LONG - 1;
+ +
+ +	if (!iv->avail)
+ +		return;
+ +	spin_lock(&iv->lock);
+ +	/* Clear (possibly left over) interrupt bit */
+ +	clear_bit(bit ^ be_to_le, iv->vector);
+ +	/* Make the bit position available again */
+ +	set_bit(bit ^ be_to_le, iv->avail);
+ +	if (bit == iv->end - 1) {
+ +		/* Find new end of bit-field */
+ +		while (--iv->end > 0)
+ +			if (!test_bit((iv->end - 1) ^ be_to_le, iv->avail))
+ +				break;
+++=======
++ 	unsigned long i;
++ 
++ 	if (!iv->avail || num == 0)
++ 		return;
++ 	spin_lock(&iv->lock);
++ 	for (i = 0; i < num; i++) {
++ 		/* Clear (possibly left over) interrupt bit */
++ 		clear_bit_inv(bit + i, iv->vector);
++ 		/* Make the bit positions available again */
++ 		set_bit_inv(bit + i, iv->avail);
++ 	}
++ 	if (bit + num >= iv->end) {
++ 		/* Find new end of bit-field */
++ 		while (iv->end > 0 && !test_bit_inv(iv->end - 1, iv->avail))
++ 			iv->end--;
+++>>>>>>> fe7c30a42076 (s390/airq: add support for irq ranges)
+  	}
+  	spin_unlock(&iv->lock);
+  }
+diff --git a/arch/s390/include/asm/airq.h b/arch/s390/include/asm/airq.h
+index 4bbb5957ed1b..bd93ff6661b8 100644
+--- a/arch/s390/include/asm/airq.h
++++ b/arch/s390/include/asm/airq.h
+@@ -44,11 +44,21 @@ struct airq_iv {
+ 
+ struct airq_iv *airq_iv_create(unsigned long bits, unsigned long flags);
+ void airq_iv_release(struct airq_iv *iv);
+-unsigned long airq_iv_alloc_bit(struct airq_iv *iv);
+-void airq_iv_free_bit(struct airq_iv *iv, unsigned long bit);
++unsigned long airq_iv_alloc(struct airq_iv *iv, unsigned long num);
++void airq_iv_free(struct airq_iv *iv, unsigned long bit, unsigned long num);
+ unsigned long airq_iv_scan(struct airq_iv *iv, unsigned long start,
+ 			   unsigned long end);
+ 
++static inline unsigned long airq_iv_alloc_bit(struct airq_iv *iv)
++{
++	return airq_iv_alloc(iv, 1);
++}
++
++static inline void airq_iv_free_bit(struct airq_iv *iv, unsigned long bit)
++{
++	airq_iv_free(iv, bit, 1);
++}
++
+ static inline unsigned long airq_iv_end(struct airq_iv *iv)
+ {
+ 	return iv->end;
+* Unmerged path drivers/s390/cio/airq.c
