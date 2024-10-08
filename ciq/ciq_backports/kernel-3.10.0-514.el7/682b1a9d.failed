@@ -1,0 +1,136 @@
+ipv6: no CHECKSUM_PARTIAL on MSG_MORE corked sockets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 682b1a9d3f9686ee43fd66b48605daff00522157
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/682b1a9d.failed
+
+We cannot reliable calculate packet size on MSG_MORE corked sockets
+and thus cannot decide if they are going to be fragmented later on,
+so better not use CHECKSUM_PARTIAL in the first place.
+
+The IPv6 code also intended to protect and not use CHECKSUM_PARTIAL in
+the existence of IPv6 extension headers, but the condition was wrong. Fix
+it up, too. Also the condition to check whether the packet fits into
+one fragment was wrong and has been corrected.
+
+Fixes: commit 32dce968dd987 ("ipv6: Allow for partial checksums on non-ufo packets")
+See-also: commit 72e843bb09d45 ("ipv6: ip6_fragment() should check CHECKSUM_PARTIAL")
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Vlad Yasevich <vyasevich@gmail.com>
+	Cc: Benjamin Coddington <bcodding@redhat.com>
+	Cc: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 682b1a9d3f9686ee43fd66b48605daff00522157)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_output.c
+diff --cc net/ipv6/ip6_output.c
+index 6e24dc6ba803,81ac5a970e43..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -1220,53 -1288,50 +1221,65 @@@ static int __ip6_append_data(struct soc
+  	maxfraglen = ((mtu - fragheaderlen) & ~7) + fragheaderlen -
+  		     sizeof(struct frag_hdr);
+  
+- 	if (mtu <= sizeof(struct ipv6hdr) + IPV6_MAXPLEN) {
+- 		unsigned int maxnonfragsize, headersize;
+- 
+- 		headersize = sizeof(struct ipv6hdr) +
+- 			     (opt ? opt->opt_flen + opt->opt_nflen : 0) +
+- 			     (dst_allfrag(&rt->dst) ?
+- 			      sizeof(struct frag_hdr) : 0) +
+- 			     rt->rt6i_nfheader_len;
+- 
+- 		if (ip6_sk_ignore_df(sk))
+- 			maxnonfragsize = sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
+- 		else
+- 			maxnonfragsize = mtu;
++ 	headersize = sizeof(struct ipv6hdr) +
++ 		     (opt ? opt->opt_flen + opt->opt_nflen : 0) +
++ 		     (dst_allfrag(&rt->dst) ?
++ 		      sizeof(struct frag_hdr) : 0) +
++ 		     rt->rt6i_nfheader_len;
++ 
++ 	if (cork->length + length > mtu - headersize && dontfrag &&
++ 	    (sk->sk_protocol == IPPROTO_UDP ||
++ 	     sk->sk_protocol == IPPROTO_RAW)) {
++ 		ipv6_local_rxpmtu(sk, fl6, mtu - headersize +
++ 				sizeof(struct ipv6hdr));
++ 		goto emsgsize;
++ 	}
+  
+- 		/* dontfrag active */
+- 		if ((cork->length + length > mtu - headersize) && dontfrag &&
+- 		    (sk->sk_protocol == IPPROTO_UDP ||
+- 		     sk->sk_protocol == IPPROTO_RAW)) {
+- 			ipv6_local_rxpmtu(sk, fl6, mtu - headersize +
+- 						   sizeof(struct ipv6hdr));
+- 			goto emsgsize;
+- 		}
+++<<<<<<< HEAD
+++	/* For UDP, check if TX timestamp is enabled */
+++	if (sk->sk_type == SOCK_DGRAM)
+++=======
++ 	if (ip6_sk_ignore_df(sk))
++ 		maxnonfragsize = sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
++ 	else
++ 		maxnonfragsize = mtu;
+  
+- 		if (cork->length + length > maxnonfragsize - headersize) {
++ 	if (cork->length + length > maxnonfragsize - headersize) {
+  emsgsize:
+- 			ipv6_local_error(sk, EMSGSIZE, fl6,
+- 					 mtu - headersize +
+- 					 sizeof(struct ipv6hdr));
+- 			return -EMSGSIZE;
+- 		}
++ 		ipv6_local_error(sk, EMSGSIZE, fl6,
++ 				 mtu - headersize +
++ 				 sizeof(struct ipv6hdr));
++ 		return -EMSGSIZE;
+  	}
+  
+- 	/* For UDP, check if TX timestamp is enabled */
+- 	if (sk->sk_type == SOCK_DGRAM)
++ 	/* CHECKSUM_PARTIAL only with no extension headers and when
++ 	 * we are not going to fragment
++ 	 */
++ 	if (transhdrlen && sk->sk_protocol == IPPROTO_UDP &&
++ 	    headersize == sizeof(struct ipv6hdr) &&
++ 	    length < mtu - headersize &&
++ 	    !(flags & MSG_MORE) &&
++ 	    rt->dst.dev->features & NETIF_F_V6_CSUM)
++ 		csummode = CHECKSUM_PARTIAL;
++ 
++ 	if (sk->sk_type == SOCK_DGRAM || sk->sk_type == SOCK_RAW) {
+++>>>>>>> 682b1a9d3f96 (ipv6: no CHECKSUM_PARTIAL on MSG_MORE corked sockets)
+  		sock_tx_timestamp(sk, &tx_flags);
+ -		if (tx_flags & SKBTX_ANY_SW_TSTAMP &&
+ -		    sk->sk_tsflags & SOF_TIMESTAMPING_OPT_ID)
+ -			tskey = sk->sk_tskey++;
+ -	}
+  
+++<<<<<<< HEAD
+ +	/* If this is the first and only packet and device
+ +	 * supports checksum offloading, let's use it.
+ +	 * Use transhdrlen, same as IPv4, because partial
+ +	 * sums only work when transhdrlen is set.
+ +	 */
+ +	if (transhdrlen && sk->sk_protocol == IPPROTO_UDP &&
+ +	    !(flags & MSG_MORE) &&
+ +	    length + fragheaderlen < mtu &&
+ +	    rt->dst.dev->features & NETIF_F_V6_CSUM &&
+ +	    !exthdrlen)
+ +		csummode = CHECKSUM_PARTIAL;
+++=======
+++>>>>>>> 682b1a9d3f96 (ipv6: no CHECKSUM_PARTIAL on MSG_MORE corked sockets)
+  	/*
+  	 * Let's try using as much space as possible.
+  	 * Use MTU if total length of the message fits into the MTU.
+* Unmerged path net/ipv6/ip6_output.c
