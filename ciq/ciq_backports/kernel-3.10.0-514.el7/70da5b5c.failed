@@ -1,0 +1,199 @@
+ipv6: Replace spinlock with seqlock and rcu in ip6_tunnel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 70da5b5c532f0ec8aa76b4f46158da5f010f34b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/70da5b5c.failed
+
+This patch uses a seqlock to ensure consistency between idst->dst and
+idst->cookie.  It also makes dst freeing from fib tree to undergo a
+rcu grace period.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 70da5b5c532f0ec8aa76b4f46158da5f010f34b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_tunnel.h
+#	net/ipv6/ip6_fib.c
+#	net/ipv6/ip6_tunnel.c
+diff --cc include/net/ip6_tunnel.h
+index ae57d0975630,65c2a9397b3c..000000000000
+--- a/include/net/ip6_tunnel.h
++++ b/include/net/ip6_tunnel.h
+@@@ -32,6 -32,12 +32,15 @@@ struct __ip6_tnl_parm 
+  	__be32			o_key;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct ip6_tnl_dst {
++ 	seqlock_t lock;
++ 	struct dst_entry __rcu *dst;
++ 	u32 cookie;
++ };
++ 
+++>>>>>>> 70da5b5c532f (ipv6: Replace spinlock with seqlock and rcu in ip6_tunnel)
+  /* IPv6 tunnel */
+  struct ip6_tnl {
+  	struct ip6_tnl __rcu *next;	/* next tunnel in list */
+diff --cc net/ipv6/ip6_fib.c
+index 052ec06f45c0,8a9ec01f4d01..000000000000
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@@ -160,10 -155,39 +160,46 @@@ static __inline__ void node_free(struc
+  	kmem_cache_free(fib6_node_kmem, fn);
+  }
+  
+++<<<<<<< HEAD
+ +static __inline__ void rt6_release(struct rt6_info *rt)
+ +{
+ +	if (atomic_dec_and_test(&rt->rt6i_ref))
+ +		dst_free(&rt->dst);
+++=======
++ static void rt6_rcu_free(struct rt6_info *rt)
++ {
++ 	call_rcu(&rt->dst.rcu_head, dst_rcu_free);
++ }
++ 
++ static void rt6_free_pcpu(struct rt6_info *non_pcpu_rt)
++ {
++ 	int cpu;
++ 
++ 	if (!non_pcpu_rt->rt6i_pcpu)
++ 		return;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct rt6_info **ppcpu_rt;
++ 		struct rt6_info *pcpu_rt;
++ 
++ 		ppcpu_rt = per_cpu_ptr(non_pcpu_rt->rt6i_pcpu, cpu);
++ 		pcpu_rt = *ppcpu_rt;
++ 		if (pcpu_rt) {
++ 			rt6_rcu_free(pcpu_rt);
++ 			*ppcpu_rt = NULL;
++ 		}
++ 	}
++ 
++ 	non_pcpu_rt->rt6i_pcpu = NULL;
++ }
++ 
++ static void rt6_release(struct rt6_info *rt)
++ {
++ 	if (atomic_dec_and_test(&rt->rt6i_ref)) {
++ 		rt6_free_pcpu(rt);
++ 		rt6_rcu_free(rt);
++ 	}
+++>>>>>>> 70da5b5c532f (ipv6: Replace spinlock with seqlock and rcu in ip6_tunnel)
+  }
+  
+  static void fib6_link_table(struct net *net, struct fib6_table *tb)
+diff --cc net/ipv6/ip6_tunnel.c
+index da3fa47becb4,983f0d20f96d..000000000000
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@@ -128,17 -126,48 +128,62 @@@ static struct net_device_stats *ip6_get
+   * Locking : hash tables are protected by RCU and RTNL
+   */
+  
+++<<<<<<< HEAD
+ +struct dst_entry *ip6_tnl_dst_get(struct ip6_tnl *t)
+ +{
+ +	struct dst_entry *dst = t->dst_cache;
+ +
+ +	if (dst && dst->obsolete &&
+ +	    dst->ops->check(dst, t->dst_cookie) == NULL) {
+ +		t->dst_cache = NULL;
+ +		dst_release(dst);
+ +		return NULL;
+ +	}
+ +
+++=======
++ static void ip6_tnl_per_cpu_dst_set(struct ip6_tnl_dst *idst,
++ 				    struct dst_entry *dst)
++ {
++ 	write_seqlock_bh(&idst->lock);
++ 	dst_release(rcu_dereference_protected(
++ 			    idst->dst,
++ 			    lockdep_is_held(&idst->lock.lock)));
++ 	if (dst) {
++ 		dst_hold(dst);
++ 		idst->cookie = rt6_get_cookie((struct rt6_info *)dst);
++ 	} else {
++ 		idst->cookie = 0;
++ 	}
++ 	rcu_assign_pointer(idst->dst, dst);
++ 	write_sequnlock_bh(&idst->lock);
++ }
++ 
++ struct dst_entry *ip6_tnl_dst_get(struct ip6_tnl *t)
++ {
++ 	struct ip6_tnl_dst *idst;
++ 	struct dst_entry *dst;
++ 	unsigned int seq;
++ 	u32 cookie;
++ 
++ 	idst = raw_cpu_ptr(t->dst_cache);
++ 
++ 	rcu_read_lock();
++ 	do {
++ 		seq = read_seqbegin(&idst->lock);
++ 		dst = rcu_dereference(idst->dst);
++ 		cookie = idst->cookie;
++ 	} while (read_seqretry(&idst->lock, seq));
++ 
++ 	if (dst && !atomic_inc_not_zero(&dst->__refcnt))
++ 		dst = NULL;
++ 	rcu_read_unlock();
++ 
++ 	if (dst && dst->obsolete && !dst->ops->check(dst, cookie)) {
++ 		ip6_tnl_per_cpu_dst_set(idst, NULL);
++ 		dst_release(dst);
++ 		dst = NULL;
++ 	}
+++>>>>>>> 70da5b5c532f (ipv6: Replace spinlock with seqlock and rcu in ip6_tunnel)
+  	return dst;
+  }
+  EXPORT_SYMBOL_GPL(ip6_tnl_dst_get);
+@@@ -159,6 -188,31 +204,34 @@@ void ip6_tnl_dst_set(struct ip6_tnl *t
+  }
+  EXPORT_SYMBOL_GPL(ip6_tnl_dst_set);
+  
+++<<<<<<< HEAD
+++=======
++ void ip6_tnl_dst_destroy(struct ip6_tnl *t)
++ {
++ 	if (!t->dst_cache)
++ 		return;
++ 
++ 	ip6_tnl_dst_reset(t);
++ 	free_percpu(t->dst_cache);
++ }
++ EXPORT_SYMBOL_GPL(ip6_tnl_dst_destroy);
++ 
++ int ip6_tnl_dst_init(struct ip6_tnl *t)
++ {
++ 	int i;
++ 
++ 	t->dst_cache = alloc_percpu(struct ip6_tnl_dst);
++ 	if (!t->dst_cache)
++ 		return -ENOMEM;
++ 
++ 	for_each_possible_cpu(i)
++ 		seqlock_init(&per_cpu_ptr(t->dst_cache, i)->lock);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(ip6_tnl_dst_init);
++ 
+++>>>>>>> 70da5b5c532f (ipv6: Replace spinlock with seqlock and rcu in ip6_tunnel)
+  /**
+   * ip6_tnl_lookup - fetch tunnel matching the end-point addresses
+   *   @remote: the address of the tunnel exit-point
+* Unmerged path include/net/ip6_tunnel.h
+* Unmerged path net/ipv6/ip6_fib.c
+* Unmerged path net/ipv6/ip6_tunnel.c
