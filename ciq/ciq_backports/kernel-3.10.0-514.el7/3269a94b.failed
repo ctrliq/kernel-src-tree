@@ -1,0 +1,183 @@
+xprtrdma: Remove ->ro_reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3269a94b6206d4fe10dd96cb37e6b0035ee42cd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3269a94b.failed
+
+An RPC can exit at any time. When it does so, xprt_rdma_free() is
+called, and it calls ->op_unmap().
+
+If ->ro_reset() is running due to a transport disconnect, the two
+methods can race while processing the same rpcrdma_mw. The results
+are unpredictable.
+
+Because of this, in previous patches I've altered ->ro_map() to
+handle MR reset. ->ro_reset() is no longer needed and can be
+removed.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Reviewed-by: Devesh Sharma <devesh.sharma@avagotech.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Reviewed-by: Doug Ledford <dledford@redhat.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3269a94b6206d4fe10dd96cb37e6b0035ee42cd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index d34a3451a7e9,862279267fb8..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -359,48 -429,14 +359,51 @@@ out_err
+  	return nsegs;
+  }
+  
+++<<<<<<< HEAD
+ +/* After a disconnect, a flushed FAST_REG_MR can leave an FRMR in
+ + * an unusable state. Find FRMRs in this state and dereg / reg
+ + * each.  FRMRs that are VALID and attached to an rpcrdma_req are
+ + * also torn down.
+ + *
+ + * This gives all in-use FRMRs a fresh rkey and leaves them INVALID.
+ + *
+ + * This is invoked only in the transport connect worker in order
+ + * to serialize with rpcrdma_register_frmr_external().
+ + */
+  static void
+ -frwr_op_destroy(struct rpcrdma_buffer *buf)
+ +frwr_op_reset(struct rpcrdma_xprt *r_xprt)
+  {
+ +	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+ +	struct ib_device *device = r_xprt->rx_ia.ri_id->device;
+ +	unsigned int depth = r_xprt->rx_ia.ri_max_frmr_depth;
+ +	struct ib_pd *pd = r_xprt->rx_ia.ri_pd;
+  	struct rpcrdma_mw *r;
+ +	int rc;
+ +
+ +	list_for_each_entry(r, &buf->rb_all, mw_all) {
+ +		if (r->r.frmr.fr_state == FRMR_IS_INVALID)
+ +			continue;
+  
+ -	/* Ensure stale MWs for "buf" are no longer in flight */
+ -	flush_workqueue(frwr_recovery_wq);
+ +		__frwr_release(r);
+ +		rc = __frwr_init(r, pd, device, depth);
+ +		if (rc) {
+ +			dprintk("RPC:       %s: mw %p left %s\n",
+ +				__func__, r,
+ +				(r->r.frmr.fr_state == FRMR_IS_STALE ?
+ +					"stale" : "valid"));
+ +			continue;
+ +		}
+ +
+ +		r->r.frmr.fr_state = FRMR_IS_INVALID;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 3269a94b6206 (xprtrdma: Remove ->ro_reset)
+ +static void
+ +frwr_op_destroy(struct rpcrdma_buffer *buf)
+ +{
+ +	struct rpcrdma_mw *r;
+  
+  	while (!list_empty(&buf->rb_all)) {
+  		r = list_entry(buf->rb_all.next, struct rpcrdma_mw, mw_all);
+diff --git a/net/sunrpc/xprtrdma/fmr_ops.c b/net/sunrpc/xprtrdma/fmr_ops.c
+index a91ba2c8ef1e..ac6207e08761 100644
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@ -157,28 +157,6 @@ out_err:
+ 	return nsegs;
+ }
+ 
+-/* After a disconnect, unmap all FMRs.
+- *
+- * This is invoked only in the transport connect worker in order
+- * to serialize with rpcrdma_register_fmr_external().
+- */
+-static void
+-fmr_op_reset(struct rpcrdma_xprt *r_xprt)
+-{
+-	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+-	struct rpcrdma_mw *r;
+-	LIST_HEAD(list);
+-	int rc;
+-
+-	list_for_each_entry(r, &buf->rb_all, mw_all)
+-		list_add(&r->r.fmr->list, &list);
+-
+-	rc = ib_unmap_fmr(&list);
+-	if (rc)
+-		dprintk("RPC:       %s: ib_unmap_fmr failed %i\n",
+-			__func__, rc);
+-}
+-
+ static void
+ fmr_op_destroy(struct rpcrdma_buffer *buf)
+ {
+@@ -202,7 +180,6 @@ const struct rpcrdma_memreg_ops rpcrdma_fmr_memreg_ops = {
+ 	.ro_open			= fmr_op_open,
+ 	.ro_maxpages			= fmr_op_maxpages,
+ 	.ro_init			= fmr_op_init,
+-	.ro_reset			= fmr_op_reset,
+ 	.ro_destroy			= fmr_op_destroy,
+ 	.ro_displayname			= "fmr",
+ };
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/physical_ops.c b/net/sunrpc/xprtrdma/physical_ops.c
+index ba518af16787..50b39a870461 100644
+--- a/net/sunrpc/xprtrdma/physical_ops.c
++++ b/net/sunrpc/xprtrdma/physical_ops.c
+@@ -72,11 +72,6 @@ physical_op_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg)
+ 	return 1;
+ }
+ 
+-static void
+-physical_op_reset(struct rpcrdma_xprt *r_xprt)
+-{
+-}
+-
+ static void
+ physical_op_destroy(struct rpcrdma_buffer *buf)
+ {
+@@ -88,7 +83,6 @@ const struct rpcrdma_memreg_ops rpcrdma_physical_memreg_ops = {
+ 	.ro_open			= physical_op_open,
+ 	.ro_maxpages			= physical_op_maxpages,
+ 	.ro_init			= physical_op_init,
+-	.ro_reset			= physical_op_reset,
+ 	.ro_destroy			= physical_op_destroy,
+ 	.ro_displayname			= "physical",
+ };
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index a035813686ee..55d74bc00c65 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -893,8 +893,6 @@ retry:
+ 		rpcrdma_flush_cqs(ep);
+ 
+ 		xprt = container_of(ia, struct rpcrdma_xprt, rx_ia);
+-		ia->ri_ops->ro_reset(xprt);
+-
+ 		id = rpcrdma_create_id(xprt, ia,
+ 				(struct sockaddr *)&xprt->rx_data.addr);
+ 		if (IS_ERR(id)) {
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 0c08c849fe08..236be0816367 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -350,7 +350,6 @@ struct rpcrdma_memreg_ops {
+ 				   struct rpcrdma_create_data_internal *);
+ 	size_t		(*ro_maxpages)(struct rpcrdma_xprt *);
+ 	int		(*ro_init)(struct rpcrdma_xprt *);
+-	void		(*ro_reset)(struct rpcrdma_xprt *);
+ 	void		(*ro_destroy)(struct rpcrdma_buffer *);
+ 	const char	*ro_displayname;
+ };
