@@ -1169,7 +1169,7 @@ struct i40e_mac_filter *i40e_add_filter(struct i40e_vsi *vsi,
 		if (!f)
 			goto add_filter_out;
 
-		memcpy(f->macaddr, macaddr, ETH_ALEN);
+		ether_addr_copy(f->macaddr, macaddr);
 		f->vlan = vlan;
 		f->changed = true;
 
@@ -1293,7 +1293,7 @@ static int i40e_set_mac(struct net_device *netdev, void *p)
 			return -EADDRNOTAVAIL;
 		}
 
-		memcpy(vsi->back->hw.mac.addr, addr->sa_data, netdev->addr_len);
+		ether_addr_copy(vsi->back->hw.mac.addr, addr->sa_data);
 	}
 
 	/* In order to be sure to not drop any packets, add the new address
@@ -1307,7 +1307,7 @@ static int i40e_set_mac(struct net_device *netdev, void *p)
 	i40e_del_filter(vsi, netdev->dev_addr, I40E_VLAN_ANY, false, false);
 	i40e_sync_vsi_filters(vsi);
 
-	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
+	ether_addr_copy(netdev->dev_addr, addr->sa_data);
 
 	return 0;
 }
@@ -1564,8 +1564,7 @@ int i40e_sync_vsi_filters(struct i40e_vsi *vsi)
 			cmd_flags = 0;
 
 			/* add to delete list */
-			memcpy(del_list[num_del].mac_addr,
-			       f->macaddr, ETH_ALEN);
+			ether_addr_copy(del_list[num_del].mac_addr, f->macaddr);
 			del_list[num_del].vlan_tag =
 				cpu_to_le16((u16)(f->vlan ==
 					    I40E_VLAN_ANY ? 0 : f->vlan));
@@ -1630,8 +1629,7 @@ int i40e_sync_vsi_filters(struct i40e_vsi *vsi)
 			cmd_flags = 0;
 
 			/* add to add array */
-			memcpy(add_list[num_add].mac_addr,
-			       f->macaddr, ETH_ALEN);
+			ether_addr_copy(add_list[num_add].mac_addr, f->macaddr);
 			add_list[num_add].vlan_tag =
 				cpu_to_le16(
 				 (u16)(f->vlan == I40E_VLAN_ANY ? 0 : f->vlan));
@@ -7081,7 +7079,7 @@ static int i40e_config_netdev(struct i40e_vsi *vsi)
 
 	if (vsi->type == I40E_VSI_MAIN) {
 		SET_NETDEV_DEV(netdev, &pf->pdev->dev);
-		memcpy(mac_addr, hw->mac.perm_addr, ETH_ALEN);
+		ether_addr_copy(mac_addr, hw->mac.perm_addr);
 		/* The following two steps are necessary to prevent reception
 		 * of tagged packets - by default the NVM loads a MAC-VLAN
 		 * filter that will accept any tagged packet.  This is to
@@ -7099,8 +7097,8 @@ static int i40e_config_netdev(struct i40e_vsi *vsi)
 	}
 	i40e_add_filter(vsi, brdcast, I40E_VLAN_ANY, false, false);
 
-	memcpy(netdev->dev_addr, mac_addr, ETH_ALEN);
-	memcpy(netdev->perm_addr, mac_addr, ETH_ALEN);
+	ether_addr_copy(netdev->dev_addr, mac_addr);
+	ether_addr_copy(netdev->perm_addr, mac_addr);
 	/* vlan gets same features (except vlan offload)
 	 * after any tweaks for specific VSI types
 	 */
@@ -8615,7 +8613,7 @@ static int i40e_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto err_mac_addr;
 	}
 	dev_info(&pdev->dev, "MAC address: %pM\n", hw->mac.addr);
-	memcpy(hw->mac.perm_addr, hw->mac.addr, ETH_ALEN);
+	ether_addr_copy(hw->mac.perm_addr, hw->mac.addr);
 
 	pci_set_drvdata(pdev, pf);
 	pci_save_state(pdev);
