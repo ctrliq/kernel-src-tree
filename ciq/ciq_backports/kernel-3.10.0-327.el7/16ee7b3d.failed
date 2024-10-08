@@ -1,0 +1,476 @@
+x86, irq: Simplify the way to handle ISA IRQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] irq: Simplify the way to handle ISA IRQ (Steve Best) [1231358]
+Rebuild_FUZZ: 93.98%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 16ee7b3dcc56be14b9a813612cff2cc2339cdced
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/16ee7b3d.failed
+
+On startup, setup_IO_APIC_irqs() will program all IOAPIC pins for ISA
+IRQs. Later when mp_map_pin_to_irq() is called, it just returns ISA IRQ
+number without programming corresponding IOAPIC pin.
+
+This patch consolidates the way to program IOAPIC pins for both ISA and
+non-ISA IRQs into mp_map_pin_to_irq() as below:
+1) For ISA IRQs, mp_irqs array is used to map IOAPIC pin to IRQ and
+   mp_irqdomain_map() is used to actually program the pin.
+2) For non-ISA IRQs, irqdomain is used to map IOAPIC pin to IRQ, and
+   mp_irqdomain_map() is also used to actually program the pin.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Grant Likely <grant.likely@linaro.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Len Brown <len.brown@intel.com>
+	Cc: Pavel Machek <pavel@ucw.cz>
+Link: http://lkml.kernel.org/r/1402302011-23642-36-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 16ee7b3dcc56be14b9a813612cff2cc2339cdced)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/acpi/boot.c
+#	arch/x86/kernel/apic/io_apic.c
+diff --cc arch/x86/kernel/acpi/boot.c
+index e90087442d73,fd4b6d2e436c..000000000000
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@@ -102,40 -99,11 +102,44 @@@ static u32 isa_irq_to_gsi[NR_IRQS_LEGAC
+  	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+  };
+  
+++<<<<<<< HEAD
+ +static unsigned int gsi_to_irq(unsigned int gsi)
+ +{
+ +	unsigned int irq = gsi + NR_IRQS_LEGACY;
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < NR_IRQS_LEGACY; i++) {
+ +		if (isa_irq_to_gsi[i] == gsi) {
+ +			return i;
+ +		}
+ +	}
+ +
+ +	/* Provide an identity mapping of gsi == irq
+ +	 * except on truly weird platforms that have
+ +	 * non isa irqs in the first 16 gsis.
+ +	 */
+ +	if (gsi >= NR_IRQS_LEGACY)
+ +		irq = gsi;
+ +	else
+ +		irq = gsi_top + gsi;
+ +
+ +	return irq;
+ +}
+++=======
++ #define	ACPI_INVALID_GSI		INT_MIN
+++>>>>>>> 16ee7b3dcc56 (x86, irq: Simplify the way to handle ISA IRQ)
+  
+  /*
+ - * This is just a simple wrapper around early_ioremap(),
+ - * with sanity checks for phys == 0 and size == 0.
+ + * Temporarily use the virtual area starting from FIX_IO_APIC_BASE_END,
+ + * to map the target physical address. The problem is that set_fixmap()
+ + * provides a single page, and it is possible that the page is not
+ + * sufficient.
+ + * By using this area, we can map up to MAX_IO_APICS pages temporarily,
+ + * i.e. until the next __va_range() call.
+ + *
+ + * Important Safety Note:  The fixed I/O APIC page numbers are *subtracted*
+ + * from the fixed base.  That's why we start at FIX_IO_APIC_BASE_END and
+ + * count idx down while incrementing the phys address.
+   */
+  char *__init __acpi_map_table(unsigned long phys, unsigned long size)
+  {
+@@@ -334,6 -310,120 +338,123 @@@ acpi_parse_lapic_nmi(struct acpi_subtab
+  #endif				/*CONFIG_X86_LOCAL_APIC */
+  
+  #ifdef CONFIG_X86_IO_APIC
+++<<<<<<< HEAD
+++=======
++ #define MP_ISA_BUS		0
++ 
++ static void __init mp_override_legacy_irq(u8 bus_irq, u8 polarity, u8 trigger,
++ 					  u32 gsi)
++ {
++ 	int ioapic;
++ 	int pin;
++ 	struct mpc_intsrc mp_irq;
++ 
++ 	/*
++ 	 * Convert 'gsi' to 'ioapic.pin'.
++ 	 */
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0)
++ 		return;
++ 	pin = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	/*
++ 	 * TBD: This check is for faulty timer entries, where the override
++ 	 *      erroneously sets the trigger to level, resulting in a HUGE
++ 	 *      increase of timer interrupts!
++ 	 */
++ 	if ((bus_irq == 0) && (trigger == 3))
++ 		trigger = 1;
++ 
++ 	mp_irq.type = MP_INTSRC;
++ 	mp_irq.irqtype = mp_INT;
++ 	mp_irq.irqflag = (trigger << 2) | polarity;
++ 	mp_irq.srcbus = MP_ISA_BUS;
++ 	mp_irq.srcbusirq = bus_irq;	/* IRQ */
++ 	mp_irq.dstapic = mpc_ioapic_id(ioapic); /* APIC ID */
++ 	mp_irq.dstirq = pin;	/* INTIN# */
++ 
++ 	mp_save_irq(&mp_irq);
++ 
++ 	/*
++ 	 * Reset default identity mapping if gsi is also an legacy IRQ,
++ 	 * otherwise there will be more than one entry with the same GSI
++ 	 * and acpi_isa_irq_to_gsi() may give wrong result.
++ 	 */
++ 	if (gsi < nr_legacy_irqs() && isa_irq_to_gsi[gsi] == gsi)
++ 		isa_irq_to_gsi[gsi] = ACPI_INVALID_GSI;
++ 	isa_irq_to_gsi[bus_irq] = gsi;
++ }
++ 
++ static int mp_config_acpi_gsi(struct device *dev, u32 gsi, int trigger,
++ 			int polarity)
++ {
++ #ifdef CONFIG_X86_MPPARSE
++ 	struct mpc_intsrc mp_irq;
++ 	struct pci_dev *pdev;
++ 	unsigned char number;
++ 	unsigned int devfn;
++ 	int ioapic;
++ 	u8 pin;
++ 
++ 	if (!acpi_ioapic)
++ 		return 0;
++ 	if (!dev || !dev_is_pci(dev))
++ 		return 0;
++ 
++ 	pdev = to_pci_dev(dev);
++ 	number = pdev->bus->number;
++ 	devfn = pdev->devfn;
++ 	pin = pdev->pin;
++ 	/* print the entry should happen on mptable identically */
++ 	mp_irq.type = MP_INTSRC;
++ 	mp_irq.irqtype = mp_INT;
++ 	mp_irq.irqflag = (trigger == ACPI_EDGE_SENSITIVE ? 4 : 0x0c) |
++ 				(polarity == ACPI_ACTIVE_HIGH ? 1 : 3);
++ 	mp_irq.srcbus = number;
++ 	mp_irq.srcbusirq = (((devfn >> 3) & 0x1f) << 2) | ((pin - 1) & 3);
++ 	ioapic = mp_find_ioapic(gsi);
++ 	mp_irq.dstapic = mpc_ioapic_id(ioapic);
++ 	mp_irq.dstirq = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	mp_save_irq(&mp_irq);
++ #endif
++ 	return 0;
++ }
++ 
++ static int mp_register_gsi(struct device *dev, u32 gsi, int trigger,
++ 			   int polarity)
++ {
++ 	int irq, node;
++ 
++ 	if (acpi_irq_model != ACPI_IRQ_MODEL_IOAPIC)
++ 		return gsi;
++ 
++ 	/* Don't set up the ACPI SCI because it's already set up */
++ 	if (acpi_gbl_FADT.sci_interrupt == gsi)
++ 		return gsi;
++ 
++ 	trigger = trigger == ACPI_EDGE_SENSITIVE ? 0 : 1;
++ 	polarity = polarity == ACPI_ACTIVE_HIGH ? 0 : 1;
++ 	node = dev ? dev_to_node(dev) : NUMA_NO_NODE;
++ 	if (mp_set_gsi_attr(gsi, trigger, polarity, node)) {
++ 		pr_warn("Failed to set pin attr for GSI%d\n", gsi);
++ 		return -1;
++ 	}
++ 
++ 	irq = mp_map_gsi_to_irq(gsi, IOAPIC_MAP_ALLOC);
++ 	if (irq < 0)
++ 		return irq;
++ 
++ 	if (enable_update_mptable)
++ 		mp_config_acpi_gsi(dev, gsi, trigger, polarity);
++ 
++ 	return irq;
++ }
++ 
++ static struct irq_domain_ops acpi_irqdomain_ops = {
++ 	.map = mp_irqdomain_map,
++ };
+++>>>>>>> 16ee7b3dcc56 (x86, irq: Simplify the way to handle ISA IRQ)
+  
+  static int __init
+  acpi_parse_ioapic(struct acpi_subtable_header * header, const unsigned long end)
+@@@ -492,16 -590,16 +613,20 @@@ void __init acpi_pic_sci_set_trigger(un
+  	outb(new >> 8, 0x4d1);
+  }
+  
+ -int acpi_gsi_to_irq(u32 gsi, unsigned int *irqp)
+ +int acpi_gsi_to_irq(u32 gsi, unsigned int *irq)
+  {
+++<<<<<<< HEAD
+ +	*irq = gsi_to_irq(gsi);
+++=======
++ 	int irq = mp_map_gsi_to_irq(gsi, IOAPIC_MAP_ALLOC | IOAPIC_MAP_CHECK);
+++>>>>>>> 16ee7b3dcc56 (x86, irq: Simplify the way to handle ISA IRQ)
+  
+ -	if (irq >= 0) {
+ -		*irqp = irq;
+ -		return 0;
+ -	}
+ +#ifdef CONFIG_X86_IO_APIC
+ +	if (acpi_irq_model == ACPI_IRQ_MODEL_IOAPIC)
+ +		setup_IO_APIC_irq_extra(gsi);
+ +#endif
+  
+ -	return -1;
+ +	return 0;
+  }
+  EXPORT_SYMBOL_GPL(acpi_gsi_to_irq);
+  
+diff --cc arch/x86/kernel/apic/io_apic.c
+index 07a33b81b46c,8485d904b653..000000000000
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@@ -180,8 -204,7 +180,12 @@@ static int __init parse_noapic(char *st
+  }
+  early_param("noapic", parse_noapic);
+  
+++<<<<<<< HEAD
+ +static int io_apic_setup_irq_pin(unsigned int irq, int node,
+ +				 struct io_apic_irq_attr *attr);
+++=======
++ static struct irq_cfg *alloc_irq_and_cfg_at(unsigned int at, int node);
+++>>>>>>> 16ee7b3dcc56 (x86, irq: Simplify the way to handle ISA IRQ)
+  
+  /* Will be called in mpparse/acpi/sfi codes for saving IRQ info */
+  void mp_save_irq(struct mpc_intsrc *m)
+@@@ -984,11 -980,99 +988,71 @@@ static int irq_trigger(int idx
+  	return trigger;
+  }
+  
+ -static int alloc_irq_from_domain(struct irq_domain *domain, u32 gsi, int pin)
+ -{
+ -	int irq = -1;
+ -	int ioapic = (int)(long)domain->host_data;
+ -	int type = ioapics[ioapic].irqdomain_cfg.type;
+ -
+ -	switch (type) {
+ -	case IOAPIC_DOMAIN_LEGACY:
+ -		/*
+ -		 * Dynamically allocate IRQ number for non-ISA IRQs in the first 16
+ -		 * GSIs on some weird platforms.
+ -		 */
+ -		if (gsi < nr_legacy_irqs())
+ -			irq = irq_create_mapping(domain, pin);
+ -		else if (irq_create_strict_mappings(domain, gsi, pin, 1) == 0)
+ -			irq = gsi;
+ -		break;
+ -	case IOAPIC_DOMAIN_STRICT:
+ -		if (irq_create_strict_mappings(domain, gsi, pin, 1) == 0)
+ -			irq = gsi;
+ -		break;
+ -	case IOAPIC_DOMAIN_DYNAMIC:
+ -		irq = irq_create_mapping(domain, pin);
+ -		break;
+ -	default:
+ -		WARN(1, "ioapic: unknown irqdomain type %d\n", type);
+ -		break;
+ -	}
+ -
+ -	return irq > 0 ? irq : -1;
+ -}
+ -
+ -static int mp_map_pin_to_irq(u32 gsi, int idx, int ioapic, int pin,
+ -			     unsigned int flags)
+ +static int pin_2_irq(int idx, int apic, int pin)
+  {
+  	int irq;
+++<<<<<<< HEAD
+ +	int bus = mp_irqs[idx].srcbus;
+ +	struct mp_ioapic_gsi *gsi_cfg = mp_ioapic_gsi_routing(apic);
+++=======
++ 	struct irq_domain *domain = mp_ioapic_irqdomain(ioapic);
++ 	struct mp_pin_info *info = mp_pin_info(ioapic, pin);
++ 
++ 	if (!domain) {
++ 		/*
++ 		 * Provide an identity mapping of gsi == irq except on truly
++ 		 * weird platforms that have non isa irqs in the first 16 gsis.
++ 		 */
++ 		return gsi >= nr_legacy_irqs() ? gsi : gsi_top + gsi;
++ 	}
++ 
++ 	mutex_lock(&ioapic_mutex);
++ 
++ 	/*
++ 	 * Don't use irqdomain to manage ISA IRQs because there may be
++ 	 * multiple IOAPIC pins sharing the same ISA IRQ number and
++ 	 * irqdomain only supports 1:1 mapping between IOAPIC pin and
++ 	 * IRQ number. A typical IOAPIC has 24 pins, pin 0-15 are used
++ 	 * for legacy IRQs and pin 16-23 are used for PCI IRQs (PIRQ A-H).
++ 	 * When ACPI is disabled, only legacy IRQ numbers (IRQ0-15) are
++ 	 * available, and some BIOSes may use MP Interrupt Source records
++ 	 * to override IRQ numbers for PIRQs instead of reprogramming
++ 	 * the interrupt routing logic. Thus there may be multiple pins
++ 	 * sharing the same legacy IRQ number when ACPI is disabled.
++ 	 */
++ 	if (idx >= 0 && test_bit(mp_irqs[idx].srcbus, mp_bus_not_pci)) {
++ 		irq = mp_irqs[idx].srcbusirq;
++ 		if (flags & IOAPIC_MAP_ALLOC) {
++ 			if (info->count == 0 &&
++ 			    mp_irqdomain_map(domain, irq, pin) != 0)
++ 				irq = -1;
++ 
++ 			/* special handling for timer IRQ0 */
++ 			if (irq == 0)
++ 				info->count++;
++ 		}
++ 	} else {
++ 		irq = irq_find_mapping(domain, pin);
++ 		if (irq <= 0 && (flags & IOAPIC_MAP_ALLOC))
++ 			irq = alloc_irq_from_domain(domain, gsi, pin);
++ 	}
++ 
++ 	if (flags & IOAPIC_MAP_ALLOC) {
++ 		if (irq > 0)
++ 			info->count++;
++ 		else if (info->count == 0)
++ 			info->set = 0;
++ 	}
++ 
++ 	mutex_unlock(&ioapic_mutex);
++ 
++ 	return irq > 0 ? irq : -1;
++ }
++ 
++ static int pin_2_irq(int idx, int ioapic, int pin, unsigned int flags)
++ {
++ 	u32 gsi = mp_pin_to_gsi(ioapic, pin);
+++>>>>>>> 16ee7b3dcc56 (x86, irq: Simplify the way to handle ISA IRQ)
+  
+  	/*
+  	 * Debugging check, we are in big trouble if this message pops up!
+@@@ -1384,88 -1481,25 +1448,100 @@@ static void setup_ioapic_irq(unsigned i
+  	ioapic_write_entry(attr->ioapic, attr->ioapic_pin, entry);
+  }
+  
+++<<<<<<< HEAD
+ +static bool __init io_apic_pin_not_connected(int idx, int ioapic_idx, int pin)
+ +{
+ +	if (idx != -1)
+ +		return false;
+ +
+ +	apic_printk(APIC_VERBOSE, KERN_DEBUG " apic %d pin %d not connected\n",
+ +		    mpc_ioapic_id(ioapic_idx), pin);
+ +	return true;
+ +}
+ +
+ +static void __init __io_apic_setup_irqs(unsigned int ioapic_idx)
+ +{
+ +	int idx, node = cpu_to_node(0);
+ +	struct io_apic_irq_attr attr;
+ +	unsigned int pin, irq;
+ +
+ +	for_each_pin(ioapic_idx, pin) {
+ +		idx = find_irq_entry(ioapic_idx, pin, mp_INT);
+ +		if (io_apic_pin_not_connected(idx, ioapic_idx, pin))
+ +			continue;
+ +
+ +		irq = pin_2_irq(idx, ioapic_idx, pin);
+ +		if (!mp_init_irq_at_boot(ioapic_idx, irq))
+ +			continue;
+ +
+ +		/*
+ +		 * Skip the timer IRQ if there's a quirk handler
+ +		 * installed and if it returns 1:
+ +		 */
+ +		if (apic->multi_timer_check &&
+ +		    apic->multi_timer_check(ioapic_idx, irq))
+ +			continue;
+ +
+ +		set_io_apic_irq_attr(&attr, ioapic_idx, pin, irq_trigger(idx),
+ +				     irq_polarity(idx));
+ +
+ +		io_apic_setup_irq_pin(irq, node, &attr);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 16ee7b3dcc56 (x86, irq: Simplify the way to handle ISA IRQ)
+  static void __init setup_IO_APIC_irqs(void)
+  {
+- 	unsigned int ioapic_idx;
++ 	unsigned int ioapic, pin;
++ 	int idx;
+  
+  	apic_printk(APIC_VERBOSE, KERN_DEBUG "init IO_APIC IRQs\n");
+  
+- 	for_each_ioapic(ioapic_idx)
+- 		__io_apic_setup_irqs(ioapic_idx);
++ 	for_each_ioapic_pin(ioapic, pin) {
++ 		idx = find_irq_entry(ioapic, pin, mp_INT);
++ 		if (idx < 0)
++ 			apic_printk(APIC_VERBOSE,
++ 				    KERN_DEBUG " apic %d pin %d not connected\n",
++ 				    mpc_ioapic_id(ioapic), pin);
++ 		else
++ 			pin_2_irq(idx, ioapic, pin,
++ 				  ioapic ? 0 : IOAPIC_MAP_ALLOC);
++ 	}
+  }
+  
+ +/*
+ + * for the gsi that is not in first ioapic
+ + * but could not use acpi_register_gsi()
+ + * like some special sci in IBM x3330
+ + */
+ +void setup_IO_APIC_irq_extra(u32 gsi)
+ +{
+ +	int ioapic_idx = 0, pin, idx, irq, node = cpu_to_node(0);
+ +	struct io_apic_irq_attr attr;
+ +
+ +	/*
+ +	 * Convert 'gsi' to 'ioapic.pin'.
+ +	 */
+ +	ioapic_idx = mp_find_ioapic(gsi);
+ +	if (ioapic_idx < 0)
+ +		return;
+ +
+ +	pin = mp_find_ioapic_pin(ioapic_idx, gsi);
+ +	idx = find_irq_entry(ioapic_idx, pin, mp_INT);
+ +	if (idx == -1)
+ +		return;
+ +
+ +	irq = pin_2_irq(idx, ioapic_idx, pin);
+ +	if (mp_init_irq_at_boot(ioapic_idx, irq))
+ +		return;
+ +
+ +	set_io_apic_irq_attr(&attr, ioapic_idx, pin, irq_trigger(idx),
+ +			     irq_polarity(idx));
+ +
+ +	io_apic_setup_irq_pin_once(irq, node, &attr);
+ +}
+ +
+  /*
+   * Set up the timer pin, possibly with the 8259A-master behind.
+   */
+* Unmerged path arch/x86/kernel/acpi/boot.c
+* Unmerged path arch/x86/kernel/apic/io_apic.c
