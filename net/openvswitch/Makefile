@@ -12,10 +12,13 @@ openvswitch-y := \
 	flow_netlink.o \
 	flow_table.o \
 	vport.o \
-	vport-gre.o \
 	vport-internal_dev.o \
 	vport-netdev.o
 
 ifneq ($(CONFIG_OPENVSWITCH_VXLAN),)
 openvswitch-y += vport-vxlan.o
+endif
+
+ifneq ($(CONFIG_OPENVSWITCH_GRE),)
+openvswitch-y += vport-gre.o
 endif
