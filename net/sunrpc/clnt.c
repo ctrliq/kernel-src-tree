@@ -1727,8 +1727,7 @@ call_transmit(struct rpc_task *task)
 	task->tk_action = call_status;
 	if (task->tk_status < 0)
 		return;
-	task->tk_status = xprt_prepare_transmit(task);
-	if (task->tk_status != 0)
+	if (!xprt_prepare_transmit(task))
 		return;
 	task->tk_action = call_transmit_status;
 	/* Encode here so that rpcsec_gss can use correct sequence number. */
@@ -1816,8 +1815,7 @@ call_bc_transmit(struct rpc_task *task)
 {
 	struct rpc_rqst *req = task->tk_rqstp;
 
-	task->tk_status = xprt_prepare_transmit(task);
-	if (task->tk_status == -EAGAIN) {
+	if (!xprt_prepare_transmit(task)) {
 		/*
 		 * Could not reserve the transport. Try again after the
 		 * transport is released.
