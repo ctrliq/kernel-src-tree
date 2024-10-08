@@ -159,6 +159,11 @@ static inline float hist_entry__get_percent_limit(struct hist_entry *he)
 	return period * 100.0 / total_period;
 }
 
+static inline u64 cl_address(u64 address)
+{
+	/* return the cacheline of the address */
+	return (address & ~(cacheline_size - 1));
+}
 
 enum sort_mode {
 	SORT_MODE__NORMAL,
