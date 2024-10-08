@@ -2049,7 +2049,7 @@ static void xs_local_connect(struct rpc_xprt *xprt, struct rpc_task *task)
 		msleep_interruptible(15000);
 }
 
-#ifdef CONFIG_SUNRPC_SWAP
+#if IS_ENABLED(CONFIG_SUNRPC_SWAP)
 static void xs_set_memalloc(struct rpc_xprt *xprt)
 {
 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt,
@@ -2081,7 +2081,6 @@ int xs_swapper(struct rpc_xprt *xprt, int enable)
 
 	return err;
 }
-EXPORT_SYMBOL_GPL(xs_swapper);
 #else
 static void xs_set_memalloc(struct rpc_xprt *xprt)
 {
