@@ -1,0 +1,147 @@
+mm, procfs: breakdown RSS for anon, shmem and file in /proc/pid/status
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] procfs: breakdown RSS for anon, shmem and file in /proc/pid/status (Jerome Marchand) [838926]
+Rebuild_FUZZ: 97.06%
+commit-author Jerome Marchand <jmarchan@redhat.com>
+commit 8cee852ec53fb530f10ccabf1596734209ae336b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8cee852e.failed
+
+There are several shortcomings with the accounting of shared memory
+(SysV shm, shared anonymous mapping, mapping of a tmpfs file).  The
+values in /proc/<pid>/status and <...>/statm don't allow to distinguish
+between shmem memory and a shared mapping to a regular file, even though
+theirs implication on memory usage are quite different: during reclaim,
+file mapping can be dropped or written back on disk, while shmem needs a
+place in swap.
+
+Also, to distinguish the memory occupied by anonymous and file mappings,
+one has to read the /proc/pid/statm file, which has a field for the file
+mappings (again, including shmem) and total memory occupied by these
+mappings (i.e.  equivalent to VmRSS in the <...>/status file.  Getting
+the value for anonymous mappings only is thus not exactly user-friendly
+(the statm file is intended to be rather efficiently machine-readable).
+
+To address both of these shortcomings, this patch adds a breakdown of
+VmRSS in /proc/<pid>/status via new fields RssAnon, RssFile and
+RssShmem, making use of the previous preparatory patch.  These fields
+tell the user the memory occupied by private anonymous pages, mapped
+regular files and shmem, respectively.  Other existing fields in /status
+and /statm files are left without change.  The /statm file can be
+extended in the future, if there's a need for that.
+
+Example (part of) /proc/pid/status output including the new Rss* fields:
+
+VmPeak:  2001008 kB
+VmSize:  2001004 kB
+VmLck:         0 kB
+VmPin:         0 kB
+VmHWM:      5108 kB
+VmRSS:      5108 kB
+RssAnon:              92 kB
+RssFile:            1324 kB
+RssShmem:           3692 kB
+VmData:      192 kB
+VmStk:       136 kB
+VmExe:         4 kB
+VmLib:      1784 kB
+VmPTE:      3928 kB
+VmPMD:        20 kB
+VmSwap:        0 kB
+HugetlbPages:          0 kB
+
+[vbabka@suse.cz: forward-porting, tweak changelog]
+	Signed-off-by: Jerome Marchand <jmarchan@redhat.com>
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8cee852ec53fb530f10ccabf1596734209ae336b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+diff --cc fs/proc/task_mmu.c
+index c6ef0c3195c7,18a30aedfa5d..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -19,9 -23,13 +19,17 @@@
+  
+  void task_mem(struct seq_file *m, struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	unsigned long data, text, lib, swap;
+++=======
++ 	unsigned long data, text, lib, swap, ptes, pmds, anon, file, shmem;
+++>>>>>>> 8cee852ec53f (mm, procfs: breakdown RSS for anon, shmem and file in /proc/pid/status)
+  	unsigned long hiwater_vm, total_vm, hiwater_rss, total_rss;
+  
++ 	anon = get_mm_counter(mm, MM_ANONPAGES);
++ 	file = get_mm_counter(mm, MM_FILEPAGES);
++ 	shmem = get_mm_counter(mm, MM_SHMEMPAGES);
++ 
+  	/*
+  	 * Note: to minimize their overhead, mm maintains hiwater_vm and
+  	 * hiwater_rss only when about to *lower* total_vm or rss.  Any
+@@@ -59,11 -73,15 +70,14 @@@
+  		mm->pinned_vm << (PAGE_SHIFT-10),
+  		hiwater_rss << (PAGE_SHIFT-10),
+  		total_rss << (PAGE_SHIFT-10),
++ 		anon << (PAGE_SHIFT-10),
++ 		file << (PAGE_SHIFT-10),
++ 		shmem << (PAGE_SHIFT-10),
+  		data << (PAGE_SHIFT-10),
+  		mm->stack_vm << (PAGE_SHIFT-10), text, lib,
+ -		ptes >> 10,
+ -		pmds >> 10,
+ +		(PTRS_PER_PTE * sizeof(pte_t) *
+ +		 atomic_long_read(&mm->nr_ptes)) >> 10,
+  		swap << (PAGE_SHIFT-10));
+ -	hugetlb_report_usage(m, mm);
+  }
+  
+  unsigned long task_vsize(struct mm_struct *mm)
+diff --git a/Documentation/filesystems/proc.txt b/Documentation/filesystems/proc.txt
+index d473932953e7..f87e0c436886 100644
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@ -167,6 +167,9 @@ read the file /proc/PID/status:
+   VmLck:         0 kB
+   VmHWM:       476 kB
+   VmRSS:       476 kB
++  RssAnon:             352 kB
++  RssFile:             120 kB
++  RssShmem:              4 kB
+   VmData:      156 kB
+   VmStk:        88 kB
+   VmExe:        68 kB
+@@ -223,7 +226,12 @@ Table 1-2: Contents of the status files (as of 2.6.30-rc7)
+  VmSize                      total program size
+  VmLck                       locked memory size
+  VmHWM                       peak resident set size ("high water mark")
+- VmRSS                       size of memory portions
++ VmRSS                       size of memory portions. It contains the three
++                             following parts (VmRSS = RssAnon + RssFile + RssShmem)
++ RssAnon                     size of resident anonymous memory
++ RssFile                     size of resident file mappings
++ RssShmem                    size of resident shmem memory (includes SysV shm,
++                             mapping of tmpfs and shared anonymous mappings)
+  VmData                      size of data, stack, and text segments
+  VmStk                       size of data, stack, and text segments
+  VmExe                       size of text segment
+@@ -255,7 +263,8 @@ Table 1-3: Contents of the statm files (as of 2.6.8-rc3)
+  Field    Content
+  size     total program size (pages)		(same as VmSize in status)
+  resident size of memory portions (pages)	(same as VmRSS in status)
+- shared   number of pages that are shared	(i.e. backed by a file)
++ shared   number of pages that are shared	(i.e. backed by a file, same
++						as RssFile+RssShmem in status)
+  trs      number of pages that are 'code'	(not including libs; broken,
+ 							includes data segment)
+  lrs      number of pages of library		(always 0 on 2.6)
+* Unmerged path fs/proc/task_mmu.c
