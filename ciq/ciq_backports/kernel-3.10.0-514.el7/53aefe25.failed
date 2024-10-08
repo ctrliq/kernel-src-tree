@@ -1,0 +1,375 @@
+be2iscsi: Fix to handle misconfigured optics events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jitendra Bhivare <jitendra.bhivare@avagotech.com>
+commit 53aefe2552e6efadb0e1a12c2c3adb12105a64f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/53aefe25.failed
+
+Log messages for misconfigured transceivers reported by FW.
+
+Register async events that driver handles using MCC_CREATE_EXT ioctl.
+Errors messages for faulted/uncertified/unqualified optics are logged.
+Added IOCTL to get port_name to be displayed in error message.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@avagotech.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 53aefe2552e6efadb0e1a12c2c3adb12105a64f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_cmds.c
+diff --cc drivers/scsi/be2iscsi/be_cmds.c
+index 505ce3742951,533060e12c7f..000000000000
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@@ -267,26 -267,6 +267,29 @@@ void free_mcc_tag(struct be_ctrl_info *
+  	spin_unlock(&ctrl->mcc_lock);
+  }
+  
+++<<<<<<< HEAD
+ +bool is_link_state_evt(u32 trailer)
+ +{
+ +	return (((trailer >> ASYNC_TRAILER_EVENT_CODE_SHIFT) &
+ +		  ASYNC_TRAILER_EVENT_CODE_MASK) ==
+ +		  ASYNC_EVENT_CODE_LINK_STATE);
+ +}
+ +
+ +static bool is_iscsi_evt(u32 trailer)
+ +{
+ +	return (((trailer >> ASYNC_TRAILER_EVENT_CODE_SHIFT) &
+ +		  ASYNC_TRAILER_EVENT_CODE_MASK) ==
+ +		  ASYNC_EVENT_CODE_ISCSI);
+ +}
+ +
+ +static int iscsi_evt_type(u32 trailer)
+ +{
+ +	return ((trailer >> ASYNC_TRAILER_EVENT_TYPE_SHIFT) &
+ +		 ASYNC_TRAILER_EVENT_TYPE_MASK);
+ +}
+ +
+++=======
+++>>>>>>> 53aefe2552e6 (be2iscsi: Fix to handle misconfigured optics events)
+  static inline bool be_mcc_compl_is_new(struct be_mcc_compl *compl)
+  {
+  	if (compl->flags != 0) {
+@@@ -462,45 -536,10 +559,49 @@@ int beiscsi_process_mcc(struct beiscsi_
+  	spin_lock_bh(&phba->ctrl.mcc_cq_lock);
+  	while ((compl = be_mcc_compl_get(phba))) {
+  		if (compl->flags & CQE_FLAGS_ASYNC_MASK) {
+++<<<<<<< HEAD
+ +			/* Interpret flags as an async trailer */
+ +			if (is_link_state_evt(compl->flags))
+ +				/* Interpret compl as a async link evt */
+ +				beiscsi_async_link_state_process(phba,
+ +				   (struct be_async_event_link_state *) compl);
+ +			else if (is_iscsi_evt(compl->flags)) {
+ +				switch (iscsi_evt_type(compl->flags)) {
+ +				case ASYNC_EVENT_NEW_ISCSI_TGT_DISC:
+ +				case ASYNC_EVENT_NEW_ISCSI_CONN:
+ +				case ASYNC_EVENT_NEW_TCP_CONN:
+ +					phba->state |= BE_ADAPTER_CHECK_BOOT;
+ +					phba->get_boot = BE_GET_BOOT_RETRIES;
+ +					beiscsi_log(phba, KERN_ERR,
+ +						    BEISCSI_LOG_CONFIG |
+ +						    BEISCSI_LOG_MBOX,
+ +						    "BC_%d : Async iscsi Event, flags "
+ +						    "handled = 0x%08x\n",
+ +						    compl->flags);
+ +					break;
+ +				default:
+ +					phba->state |= BE_ADAPTER_CHECK_BOOT;
+ +					phba->get_boot = BE_GET_BOOT_RETRIES;
+ +					beiscsi_log(phba, KERN_ERR,
+ +						    BEISCSI_LOG_CONFIG |
+ +						    BEISCSI_LOG_MBOX,
+ +						    "BC_%d : Unsupported Async iscsi "
+ +						    "Event, flags = 0x%08x\n",
+ +						    compl->flags);
+ +				}
+ +			} else
+ +				beiscsi_log(phba, KERN_ERR,
+ +					    BEISCSI_LOG_CONFIG |
+ +					    BEISCSI_LOG_MBOX,
+ +					    "BC_%d : Unsupported Async Event, flags"
+ +					    " = 0x%08x\n", compl->flags);
+ +
+++=======
++ 			beiscsi_process_async_event(phba, compl);
+++>>>>>>> 53aefe2552e6 (be2iscsi: Fix to handle misconfigured optics events)
+  		} else if (compl->flags & CQE_FLAGS_COMPLETED_MASK) {
+- 				status = be_mcc_compl_process(ctrl, compl);
+- 				atomic_dec(&phba->ctrl.mcc_obj.q.used);
++ 			status = be_mcc_compl_process(ctrl, compl);
++ 			atomic_dec(&phba->ctrl.mcc_obj.q.used);
+  		}
+  		be_mcc_compl_use(compl);
+  		num++;
+* Unmerged path drivers/scsi/be2iscsi/be_cmds.c
+diff --git a/drivers/scsi/be2iscsi/be_cmds.h b/drivers/scsi/be2iscsi/be_cmds.h
+index 39004db0b47d..4ab755919a70 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@ -119,13 +119,22 @@ struct be_mcc_compl {
+ #define ASYNC_TRAILER_EVENT_CODE_MASK	0xFF
+ #define ASYNC_EVENT_CODE_LINK_STATE	0x1
+ #define ASYNC_EVENT_CODE_ISCSI		0x4
++#define ASYNC_EVENT_CODE_SLI		0x11
+ 
+ #define ASYNC_TRAILER_EVENT_TYPE_SHIFT	16	/* bits 16 - 23 */
+-#define ASYNC_TRAILER_EVENT_TYPE_MASK	0xF
++#define ASYNC_TRAILER_EVENT_TYPE_MASK	0xFF
++
++/* iSCSI events */
+ #define ASYNC_EVENT_NEW_ISCSI_TGT_DISC	0x4
+ #define ASYNC_EVENT_NEW_ISCSI_CONN	0x5
+ #define ASYNC_EVENT_NEW_TCP_CONN	0x7
+ 
++/* SLI events */
++#define ASYNC_SLI_EVENT_TYPE_MISCONFIGURED	0x9
++#define ASYNC_SLI_LINK_EFFECT_VALID(le)		(le & 0x80)
++#define ASYNC_SLI_LINK_EFFECT_SEV(le)		((le >> 1)  & 0x03)
++#define ASYNC_SLI_LINK_EFFECT_STATE(le)		(le & 0x01)
++
+ struct be_async_event_trailer {
+ 	u32 code;
+ };
+@@ -153,6 +162,16 @@ struct be_async_event_link_state {
+ 	struct be_async_event_trailer trailer;
+ } __packed;
+ 
++/**
++ * When async-trailer is SLI event, mcc_compl is interpreted as
++ */
++struct be_async_event_sli {
++	u32 event_data1;
++	u32 event_data2;
++	u32 reserved;
++	u32 trailer;
++} __packed;
++
+ struct be_mcc_mailbox {
+ 	struct be_mcc_wrb wrb;
+ 	struct be_mcc_compl compl;
+@@ -172,6 +191,7 @@ struct be_mcc_mailbox {
+ #define OPCODE_COMMON_CQ_CREATE				12
+ #define OPCODE_COMMON_EQ_CREATE				13
+ #define OPCODE_COMMON_MCC_CREATE			21
++#define OPCODE_COMMON_MCC_CREATE_EXT			90
+ #define OPCODE_COMMON_ADD_TEMPLATE_HEADER_BUFFERS	24
+ #define OPCODE_COMMON_REMOVE_TEMPLATE_HEADER_BUFFERS	25
+ #define OPCODE_COMMON_GET_CNTL_ATTRIBUTES		32
+@@ -183,6 +203,7 @@ struct be_mcc_mailbox {
+ #define OPCODE_COMMON_EQ_DESTROY			55
+ #define OPCODE_COMMON_QUERY_FIRMWARE_CONFIG		58
+ #define OPCODE_COMMON_FUNCTION_RESET			61
++#define OPCODE_COMMON_GET_PORT_NAME			77
+ 
+ /**
+  * LIST of opcodes that are common between Initiator and Target
+@@ -587,10 +608,11 @@ struct amap_mcc_context {
+ 	u8 rsvd2[32];
+ } __packed;
+ 
+-struct be_cmd_req_mcc_create {
++struct be_cmd_req_mcc_create_ext {
+ 	struct be_cmd_req_hdr hdr;
+ 	u16 num_pages;
+ 	u16 rsvd0;
++	u32 async_evt_bitmap;
+ 	u8 context[sizeof(struct amap_mcc_context) / 8];
+ 	struct phys_addr pages[8];
+ } __packed;
+@@ -748,8 +770,8 @@ struct be_mcc_wrb *wrb_from_mccq(struct beiscsi_hba *phba);
+ int be_mcc_notify_wait(struct beiscsi_hba *phba, unsigned int tag);
+ void be_mcc_notify(struct beiscsi_hba *phba, unsigned int tag);
+ unsigned int alloc_mcc_tag(struct beiscsi_hba *phba);
+-void beiscsi_async_link_state_process(struct beiscsi_hba *phba,
+-		struct be_async_event_link_state *evt);
++void beiscsi_process_async_event(struct beiscsi_hba *phba,
++				struct be_mcc_compl *compl);
+ int be_mcc_compl_process_isr(struct be_ctrl_info *ctrl,
+ 				    struct be_mcc_compl *compl);
+ 
+@@ -777,8 +799,6 @@ int be_cmd_wrbq_create(struct be_ctrl_info *ctrl, struct be_dma_mem *q_mem,
+ 		       struct hwi_wrb_context *pwrb_context,
+ 		       uint8_t ulp_num);
+ 
+-bool is_link_state_evt(u32 trailer);
+-
+ /* Configuration Functions */
+ int be_cmd_set_vlan(struct beiscsi_hba *phba, uint16_t vlan_tag);
+ 
+@@ -1137,6 +1157,21 @@ struct be_cmd_get_all_if_id_req {
+ 	u32 if_hndl_list[1];
+ } __packed;
+ 
++struct be_cmd_get_port_name {
++	union {
++		struct be_cmd_req_hdr req_hdr;
++		struct be_cmd_resp_hdr resp_hdr;
++	} h;
++	union {
++		struct {
++			u32 reserved;
++		} req;
++		struct {
++			u32 port_names;
++		} resp;
++	} p;
++} __packed;
++
+ #define ISCSI_OPCODE_SCSI_DATA_OUT		5
+ #define OPCODE_COMMON_NTWK_LINK_STATUS_QUERY 5
+ #define OPCODE_COMMON_MODIFY_EQ_DELAY		41
+diff --git a/drivers/scsi/be2iscsi/be_main.c b/drivers/scsi/be2iscsi/be_main.c
+index abdc14b473a0..d7e491692fd5 100644
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@ -2099,21 +2099,7 @@ static void  beiscsi_process_mcc_isr(struct beiscsi_hba *phba)
+ 			num_processed = 0;
+ 		}
+ 		if (mcc_compl->flags & CQE_FLAGS_ASYNC_MASK) {
+-			/* Interpret flags as an async trailer */
+-			if (is_link_state_evt(mcc_compl->flags))
+-				/* Interpret compl as a async link evt */
+-				beiscsi_async_link_state_process(phba,
+-				(struct be_async_event_link_state *) mcc_compl);
+-			else {
+-				beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_MBOX,
+-					    "BM_%d :  Unsupported Async Event, flags"
+-					    " = 0x%08x\n",
+-					    mcc_compl->flags);
+-				if (phba->state & BE_ADAPTER_LINK_UP) {
+-					phba->state |= BE_ADAPTER_CHECK_BOOT;
+-					phba->get_boot = BE_GET_BOOT_RETRIES;
+-				}
+-			}
++			beiscsi_process_async_event(phba, mcc_compl);
+ 		} else if (mcc_compl->flags & CQE_FLAGS_COMPLETED_MASK) {
+ 			be_mcc_compl_process_isr(&phba->ctrl, mcc_compl);
+ 			atomic_dec(&phba->ctrl.mcc_obj.q.used);
+@@ -3920,6 +3906,8 @@ static int hwi_init_port(struct beiscsi_hba *phba)
+ 	phwi_context->min_eqd = 0;
+ 	phwi_context->cur_eqd = 0;
+ 	be_cmd_fw_initialize(&phba->ctrl);
++	/* set optic state to unknown */
++	phba->optic_state = 0xff;
+ 
+ 	status = beiscsi_create_eqs(phba, phwi_context);
+ 	if (status != 0) {
+@@ -5749,6 +5737,7 @@ static int beiscsi_dev_probe(struct pci_dev *pcidev,
+ 			    "BM_%d : Error getting fw config\n");
+ 		goto free_port;
+ 	}
++	mgmt_get_port_name(&phba->ctrl, phba);
+ 
+ 	if (enable_msix)
+ 		find_num_cpus(phba);
+diff --git a/drivers/scsi/be2iscsi/be_main.h b/drivers/scsi/be2iscsi/be_main.h
+index 7c1871cc0ca5..0a65996840cf 100644
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@ -415,6 +415,7 @@ struct beiscsi_hba {
+ 	} fw_config;
+ 
+ 	unsigned int state;
++	u8 optic_state;
+ 	int get_boot;
+ 	bool fw_timeout;
+ 	bool ue_detected;
+@@ -422,6 +423,7 @@ struct beiscsi_hba {
+ 
+ 	bool mac_addr_set;
+ 	u8 mac_address[ETH_ALEN];
++	u8 port_name;
+ 	char fw_ver_str[BEISCSI_VER_STRLEN];
+ 	char wq_name[20];
+ 	struct workqueue_struct *wq;	/* The actuak work queue */
+@@ -1073,12 +1075,14 @@ struct hwi_context_memory {
+ #define BEISCSI_LOG_CONFIG	0x0020	/* CONFIG Code Path */
+ #define BEISCSI_LOG_ISCSI	0x0040	/* SCSI/iSCSI Protocol related Logs */
+ 
++#define __beiscsi_log(phba, level, fmt, arg...) \
++	shost_printk(level, phba->shost, fmt, __LINE__, ##arg)
++
+ #define beiscsi_log(phba, level, mask, fmt, arg...) \
+ do { \
+ 	uint32_t log_value = phba->attr_log_enable; \
+ 		if (((mask) & log_value) || (level[1] <= '3')) \
+-			shost_printk(level, phba->shost, \
+-				     fmt, __LINE__, ##arg); \
+-} while (0)
++			__beiscsi_log(phba, level, fmt, ##arg); \
++} while (0);
+ 
+ #endif
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index 229fa208398d..9fe6c042be10 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -315,6 +315,48 @@ unsigned int mgmt_get_session_info(struct beiscsi_hba *phba,
+ 	return tag;
+ }
+ 
++/**
++ * mgmt_get_port_name()- Get port name for the function
++ * @ctrl: ptr to Ctrl Info
++ * @phba: ptr to the dev priv structure
++ *
++ * Get the alphanumeric character for port
++ *
++ **/
++int mgmt_get_port_name(struct be_ctrl_info *ctrl,
++		       struct beiscsi_hba *phba)
++{
++	int ret = 0;
++	struct be_mcc_wrb *wrb;
++	struct be_cmd_get_port_name *ioctl;
++
++	mutex_lock(&ctrl->mbox_lock);
++	wrb = wrb_from_mbox(&ctrl->mbox_mem);
++	memset(wrb, 0, sizeof(*wrb));
++	ioctl = embedded_payload(wrb);
++
++	be_wrb_hdr_prepare(wrb, sizeof(*ioctl), true, 0);
++	be_cmd_hdr_prepare(&ioctl->h.req_hdr, CMD_SUBSYSTEM_COMMON,
++			   OPCODE_COMMON_GET_PORT_NAME,
++			   EMBED_MBX_MAX_PAYLOAD_SIZE);
++	ret = be_mbox_notify(ctrl);
++	phba->port_name = 0;
++	if (!ret) {
++		phba->port_name = ioctl->p.resp.port_names >>
++				  (phba->fw_config.phys_port * 8) & 0xff;
++	} else {
++		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_INIT,
++			    "BG_%d : GET_PORT_NAME ret 0x%x status 0x%x\n",
++			    ret, ioctl->h.resp_hdr.status);
++	}
++
++	if (phba->port_name == 0)
++		phba->port_name = '?';
++
++	mutex_unlock(&ctrl->mbox_lock);
++	return ret;
++}
++
+ /**
+  * mgmt_get_fw_config()- Get the FW config for the function
+  * @ctrl: ptr to Ctrl Info
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.h b/drivers/scsi/be2iscsi/be_mgmt.h
+index 7af15e152fdc..8149b8cd6c6f 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.h
++++ b/drivers/scsi/be2iscsi/be_mgmt.h
+@@ -268,6 +268,8 @@ struct beiscsi_endpoint {
+ 
+ int mgmt_get_fw_config(struct be_ctrl_info *ctrl,
+ 				 struct beiscsi_hba *phba);
++int mgmt_get_port_name(struct be_ctrl_info *ctrl,
++		       struct beiscsi_hba *phba);
+ 
+ unsigned int mgmt_invalidate_connection(struct beiscsi_hba *phba,
+ 					 struct beiscsi_endpoint *beiscsi_ep,
