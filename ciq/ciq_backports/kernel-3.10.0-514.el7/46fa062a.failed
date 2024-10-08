@@ -1,0 +1,212 @@
+ip_tunnels: convert the mode field of ip_tunnel_info to flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 46fa062ad63146dd138ec0f017e71224471e8ea5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/46fa062a.failed
+
+The mode field holds a single bit of information only (whether the
+ip_tunnel_info struct is for rx or tx). Change the mode field to bit flags.
+This allows more mode flags to be added.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 46fa062ad63146dd138ec0f017e71224471e8ea5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/dst_metadata.h
+#	include/net/ip_tunnels.h
+#	net/ipv4/ip_gre.c
+#	net/ipv4/route.c
+#	net/ipv6/route.c
+diff --cc drivers/net/vxlan.c
+index 9d79e4f0a7b6,bd1b8cdf2bf6..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2071,6 -2112,12 +2071,15 @@@ static netdev_tx_t vxlan_xmit(struct sk
+  #endif
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vxlan->flags & VXLAN_F_COLLECT_METADATA &&
++ 	    info && info->mode & IP_TUNNEL_INFO_TX) {
++ 		vxlan_xmit_one(skb, dev, NULL, false);
++ 		return NETDEV_TX_OK;
++ 	}
++ 
+++>>>>>>> 46fa062ad631 (ip_tunnels: convert the mode field of ip_tunnel_info to flags)
+  	f = vxlan_find_mac(vxlan, eth->h_dest);
+  	did_rsc = false;
+  
+diff --cc include/net/ip_tunnels.h
+index 8a38d811a07c,9bdb3948798f..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -38,6 -50,9 +38,12 @@@ struct ip_tunnel_key 
+  	__be16			tp_dst;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Flags for ip_tunnel_info mode. */
++ #define IP_TUNNEL_INFO_TX	0x01	/* represents tx tunnel parameters */
++ 
+++>>>>>>> 46fa062ad631 (ip_tunnels: convert the mode field of ip_tunnel_info to flags)
+  struct ip_tunnel_info {
+  	struct ip_tunnel_key	key;
+  	const void		*options;
+diff --cc net/ipv4/ip_gre.c
+index afc4a83f7ee7,1e813a9f9378..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -246,6 -490,81 +246,83 @@@ static void __gre_xmit(struct sk_buff *
+  	ip_tunnel_xmit(skb, dev, tnl_params, tnl_params->protocol);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *gre_handle_offloads(struct sk_buff *skb,
++ 					   bool csum)
++ {
++ 	return iptunnel_handle_offloads(skb, csum,
++ 					csum ? SKB_GSO_GRE_CSUM : SKB_GSO_GRE);
++ }
++ 
++ static void gre_fb_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct ip_tunnel_info *tun_info;
++ 	struct net *net = dev_net(dev);
++ 	const struct ip_tunnel_key *key;
++ 	struct flowi4 fl;
++ 	struct rtable *rt;
++ 	int min_headroom;
++ 	int tunnel_hlen;
++ 	__be16 df, flags;
++ 	int err;
++ 
++ 	tun_info = skb_tunnel_info(skb);
++ 	if (unlikely(!tun_info || !(tun_info->mode & IP_TUNNEL_INFO_TX)))
++ 		goto err_free_skb;
++ 
++ 	key = &tun_info->key;
++ 	memset(&fl, 0, sizeof(fl));
++ 	fl.daddr = key->u.ipv4.dst;
++ 	fl.saddr = key->u.ipv4.src;
++ 	fl.flowi4_tos = RT_TOS(key->tos);
++ 	fl.flowi4_mark = skb->mark;
++ 	fl.flowi4_proto = IPPROTO_GRE;
++ 
++ 	rt = ip_route_output_key(net, &fl);
++ 	if (IS_ERR(rt))
++ 		goto err_free_skb;
++ 
++ 	tunnel_hlen = ip_gre_calc_hlen(key->tun_flags);
++ 
++ 	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
++ 			+ tunnel_hlen + sizeof(struct iphdr);
++ 	if (skb_headroom(skb) < min_headroom || skb_header_cloned(skb)) {
++ 		int head_delta = SKB_DATA_ALIGN(min_headroom -
++ 						skb_headroom(skb) +
++ 						16);
++ 		err = pskb_expand_head(skb, max_t(int, head_delta, 0),
++ 				       0, GFP_ATOMIC);
++ 		if (unlikely(err))
++ 			goto err_free_rt;
++ 	}
++ 
++ 	/* Push Tunnel header. */
++ 	skb = gre_handle_offloads(skb, !!(tun_info->key.tun_flags & TUNNEL_CSUM));
++ 	if (IS_ERR(skb)) {
++ 		skb = NULL;
++ 		goto err_free_rt;
++ 	}
++ 
++ 	flags = tun_info->key.tun_flags & (TUNNEL_CSUM | TUNNEL_KEY);
++ 	build_header(skb, tunnel_hlen, flags, htons(ETH_P_TEB),
++ 		     tunnel_id_to_key(tun_info->key.tun_id), 0);
++ 
++ 	df = key->tun_flags & TUNNEL_DONT_FRAGMENT ?  htons(IP_DF) : 0;
++ 	err = iptunnel_xmit(skb->sk, rt, skb, fl.saddr,
++ 			    key->u.ipv4.dst, IPPROTO_GRE,
++ 			    key->tos, key->ttl, df, false);
++ 	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
++ 	return;
++ 
++ err_free_rt:
++ 	ip_rt_put(rt);
++ err_free_skb:
++ 	kfree_skb(skb);
++ 	dev->stats.tx_dropped++;
++ }
++ 
+++>>>>>>> 46fa062ad631 (ip_tunnels: convert the mode field of ip_tunnel_info to flags)
+  static netdev_tx_t ipgre_xmit(struct sk_buff *skb,
+  			      struct net_device *dev)
+  {
+diff --cc net/ipv4/route.c
+index 31700d4dc025,5f4a5565ad8b..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -1657,6 -1695,13 +1657,16 @@@ static int ip_route_input_slow(struct s
+  	   by fib_lookup.
+  	 */
+  
+++<<<<<<< HEAD
+++=======
++ 	tun_info = skb_tunnel_info(skb);
++ 	if (tun_info && !(tun_info->mode & IP_TUNNEL_INFO_TX))
++ 		fl4.flowi4_tun_key.tun_id = tun_info->key.tun_id;
++ 	else
++ 		fl4.flowi4_tun_key.tun_id = 0;
++ 	skb_dst_drop(skb);
++ 
+++>>>>>>> 46fa062ad631 (ip_tunnels: convert the mode field of ip_tunnel_info to flags)
+  	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr))
+  		goto martian_source;
+  
+diff --cc net/ipv6/route.c
+index 637dad9bab3f,308dd5f9158f..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -1024,6 -1173,9 +1024,12 @@@ void ip6_route_input(struct sk_buff *sk
+  		.flowi6_proto = iph->nexthdr,
+  	};
+  
+++<<<<<<< HEAD
+++=======
++ 	tun_info = skb_tunnel_info(skb);
++ 	if (tun_info && !(tun_info->mode & IP_TUNNEL_INFO_TX))
++ 		fl6.flowi6_tun_key.tun_id = tun_info->key.tun_id;
+++>>>>>>> 46fa062ad631 (ip_tunnels: convert the mode field of ip_tunnel_info to flags)
+  	skb_dst_drop(skb);
+  	skb_dst_set(skb, ip6_route_input_lookup(net, skb->dev, &fl6, flags));
+  }
+* Unmerged path include/net/dst_metadata.h
+diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
+index 4357bae732d7..4a39c09f144c 100644
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -623,7 +623,7 @@ static netdev_tx_t geneve_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 	if (geneve->collect_md) {
+ 		info = skb_tunnel_info(skb);
+-		if (unlikely(info && info->mode != IP_TUNNEL_INFO_TX)) {
++		if (unlikely(info && !(info->mode & IP_TUNNEL_INFO_TX))) {
+ 			netdev_dbg(dev, "no tunnel metadata\n");
+ 			goto tx_error;
+ 		}
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/dst_metadata.h
+* Unmerged path include/net/ip_tunnels.h
+* Unmerged path net/ipv4/ip_gre.c
+* Unmerged path net/ipv4/route.c
+* Unmerged path net/ipv6/route.c
