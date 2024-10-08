@@ -1402,6 +1402,9 @@ static int tty_reopen(struct tty_struct *tty)
 	    driver->subtype == PTY_TYPE_MASTER)
 		return -EIO;
 
+	if (test_bit(TTY_EXCLUSIVE, &tty->flags) && !capable(CAP_SYS_ADMIN))
+		return -EBUSY;
+
 	tty->count++;
 
 	WARN_ON(!tty->ldisc);
@@ -2048,10 +2051,6 @@ retry_open:
 	else
 		retval = -ENODEV;
 	filp->f_flags = saved_flags;
-
-	if (!retval && test_bit(TTY_EXCLUSIVE, &tty->flags) &&
-						!capable(CAP_SYS_ADMIN))
-		retval = -EBUSY;
 
 	if (retval) {
 #ifdef TTY_DEBUG_HANGUP
