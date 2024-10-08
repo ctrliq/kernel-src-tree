@@ -459,7 +459,6 @@ int beiscsi_process_mcc(struct beiscsi_hba *phba)
 	int num = 0, status = 0;
 	struct be_ctrl_info *ctrl = &phba->ctrl;
 
-	spin_lock_bh(&phba->ctrl.mcc_cq_lock);
 	while ((compl = be_mcc_compl_get(phba))) {
 		if (compl->flags & CQE_FLAGS_ASYNC_MASK) {
 			/* Interpret flags as an async trailer */
@@ -509,7 +508,6 @@ int beiscsi_process_mcc(struct beiscsi_hba *phba)
 	if (num)
 		hwi_ring_cq_db(phba, phba->ctrl.mcc_obj.cq.id, num, 1, 0);
 
-	spin_unlock_bh(&phba->ctrl.mcc_cq_lock);
 	return status;
 }
 
