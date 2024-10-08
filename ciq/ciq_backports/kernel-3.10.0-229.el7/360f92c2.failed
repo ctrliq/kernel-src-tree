@@ -1,0 +1,252 @@
+block: fix regression with block enabled tagging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [block] fix regression with block enabled tagging (Mike Snitzer) [1105204]
+Rebuild_FUZZ: 92.13%
+commit-author Jens Axboe <axboe@fb.com>
+commit 360f92c2443073143467a0088daffec96a17910b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/360f92c2.failed
+
+Martin reported that his test system would not boot with
+current git, it oopsed with this:
+
+BUG: unable to handle kernel paging request at ffff88046c6c9e80
+IP: [<ffffffff812971e0>] blk_queue_start_tag+0x90/0x150
+PGD 1ddf067 PUD 1de2067 PMD 47fc7d067 PTE 800000046c6c9060
+Oops: 0002 [#1] SMP DEBUG_PAGEALLOC
+Modules linked in: sd_mod lpfc(+) scsi_transport_fc scsi_tgt oracleasm
+rpcsec_gss_krb5 ipv6 igb dca i2c_algo_bit i2c_core hwmon
+CPU: 3 PID: 87 Comm: kworker/u17:1 Not tainted 3.14.0+ #246
+Hardware name: Supermicro X9DRX+-F/X9DRX+-F, BIOS 3.00 07/09/2013
+Workqueue: events_unbound async_run_entry_fn
+task: ffff8802743c2150 ti: ffff880273d02000 task.ti: ffff880273d02000
+RIP: 0010:[<ffffffff812971e0>]  [<ffffffff812971e0>]
+blk_queue_start_tag+0x90/0x150
+RSP: 0018:ffff880273d03a58  EFLAGS: 00010092
+RAX: ffff88046c6c9e78 RBX: ffff880077208e78 RCX: 00000000fffc8da6
+RDX: 00000000fffc186d RSI: 0000000000000009 RDI: 00000000fffc8d9d
+RBP: ffff880273d03a88 R08: 0000000000000001 R09: ffff8800021c2410
+R10: 0000000000000005 R11: 0000000000015b30 R12: ffff88046c5bb8a0
+R13: ffff88046c5c0890 R14: 000000000000001e R15: 000000000000001e
+FS:  0000000000000000(0000) GS:ffff880277b00000(0000)
+knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: ffff88046c6c9e80 CR3: 00000000018f6000 CR4: 00000000000407e0
+Stack:
+ ffff880273d03a98 ffff880474b18800 0000000000000000 ffff880474157000
+ ffff88046c5c0890 ffff880077208e78 ffff880273d03ae8 ffffffff813b9e62
+ ffff880200000010 ffff880474b18968 ffff880474b18848 ffff88046c5c0cd8
+Call Trace:
+ [<ffffffff813b9e62>] scsi_request_fn+0xf2/0x510
+ [<ffffffff81293167>] __blk_run_queue+0x37/0x50
+ [<ffffffff8129ac43>] blk_execute_rq_nowait+0xb3/0x130
+ [<ffffffff8129ad24>] blk_execute_rq+0x64/0xf0
+ [<ffffffff8108d2b0>] ? bit_waitqueue+0xd0/0xd0
+ [<ffffffff813bba35>] scsi_execute+0xe5/0x180
+ [<ffffffff813bbe4a>] scsi_execute_req_flags+0x9a/0x110
+ [<ffffffffa01b1304>] sd_spinup_disk+0x94/0x460 [sd_mod]
+ [<ffffffff81160000>] ? __unmap_hugepage_range+0x200/0x2f0
+ [<ffffffffa01b2b9a>] sd_revalidate_disk+0xaa/0x3f0 [sd_mod]
+ [<ffffffffa01b2fb8>] sd_probe_async+0xd8/0x200 [sd_mod]
+ [<ffffffff8107703f>] async_run_entry_fn+0x3f/0x140
+ [<ffffffff8106a1c5>] process_one_work+0x175/0x410
+ [<ffffffff8106b373>] worker_thread+0x123/0x400
+ [<ffffffff8106b250>] ? manage_workers+0x160/0x160
+ [<ffffffff8107104e>] kthread+0xce/0xf0
+ [<ffffffff81070f80>] ? kthread_freezable_should_stop+0x70/0x70
+ [<ffffffff815f0bac>] ret_from_fork+0x7c/0xb0
+ [<ffffffff81070f80>] ? kthread_freezable_should_stop+0x70/0x70
+Code: 48 0f ab 11 72 db 48 81 4b 40 00 00 10 00 89 83 08 01 00 00 48 89
+df 49 8b 04 24 48 89 1c d0 e8 f7 a8 ff ff 49 8b 85 28 05 00 00 <48> 89
+58 08 48 89 03 49 8d 85 28 05 00 00 48 89 43 08 49 89 9d
+RIP  [<ffffffff812971e0>] blk_queue_start_tag+0x90/0x150
+ RSP <ffff880273d03a58>
+CR2: ffff88046c6c9e80
+
+Martin bisected and found this to be the problem patch;
+
+	commit 6d113398dcf4dfcd9787a4ead738b186f7b7ff0f
+	Author: Jan Kara <jack@suse.cz>
+	Date:   Mon Feb 24 16:39:54 2014 +0100
+
+	    block: Stop abusing rq->csd.list in blk-softirq
+
+and the problem was immediately apparent. The patch states that
+it is safe to reuse queuelist at completion time, since it is
+no longer used. However, that is not true if a device is using
+block enabled tagging. If that is the case, then the queuelist
+is reused to keep track of busy tags. If a device also ended
+up using softirq completions, we'd reuse ->queuelist for the
+IPI handling while block tagging was still using it. Boom.
+
+Fix this by adding a new ipi_list list head, and share the
+memory used with the request hash table. The hash table is
+never used after the request is moved to the dispatch list,
+which happens long before any potential completion of the
+request. Add a new request bit for this, so we don't have
+cases that check rq->hash while it could potentially have
+been reused for the IPI completion.
+
+	Reported-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Tested-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 360f92c2443073143467a0088daffec96a17910b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-softirq.c
+diff --cc block/blk-softirq.c
+index ec9e60636f43,53b1737e978d..000000000000
+--- a/block/blk-softirq.c
++++ b/block/blk-softirq.c
+@@@ -30,8 -30,8 +30,13 @@@ static void blk_done_softirq(struct sof
+  	while (!list_empty(&local_list)) {
+  		struct request *rq;
+  
+++<<<<<<< HEAD
+ +		rq = list_entry(local_list.next, struct request, csd.list);
+ +		list_del_init(&rq->csd.list);
+++=======
++ 		rq = list_entry(local_list.next, struct request, ipi_list);
++ 		list_del_init(&rq->ipi_list);
+++>>>>>>> 360f92c24430 (block: fix regression with block enabled tagging)
+  		rq->q->softirq_done_fn(rq);
+  	}
+  }
+@@@ -44,10 -44,10 +49,17 @@@ static void trigger_softirq(void *data
+  	struct list_head *list;
+  
+  	local_irq_save(flags);
+++<<<<<<< HEAD
+ +	list = &__get_cpu_var(blk_cpu_done);
+ +	list_add_tail(&rq->csd.list, list);
+ +
+ +	if (list->next == &rq->csd.list)
+++=======
++ 	list = this_cpu_ptr(&blk_cpu_done);
++ 	list_add_tail(&rq->ipi_list, list);
++ 
++ 	if (list->next == &rq->ipi_list)
+++>>>>>>> 360f92c24430 (block: fix regression with block enabled tagging)
+  		raise_softirq_irqoff(BLOCK_SOFTIRQ);
+  
+  	local_irq_restore(flags);
+@@@ -135,8 -135,8 +147,13 @@@ void __blk_complete_request(struct requ
+  	if (ccpu == cpu || shared) {
+  		struct list_head *list;
+  do_local:
+++<<<<<<< HEAD
+ +		list = &__get_cpu_var(blk_cpu_done);
+ +		list_add_tail(&req->csd.list, list);
+++=======
++ 		list = this_cpu_ptr(&blk_cpu_done);
++ 		list_add_tail(&req->ipi_list, list);
+++>>>>>>> 360f92c24430 (block: fix regression with block enabled tagging)
+  
+  		/*
+  		 * if the list only contains our just added request,
+@@@ -144,7 -144,7 +161,11 @@@
+  		 * entries there, someone already raised the irq but it
+  		 * hasn't run yet.
+  		 */
+++<<<<<<< HEAD
+ +		if (list->next == &req->csd.list)
+++=======
++ 		if (list->next == &req->ipi_list)
+++>>>>>>> 360f92c24430 (block: fix regression with block enabled tagging)
+  			raise_softirq_irqoff(BLOCK_SOFTIRQ);
+  	} else if (raise_blk_irq(ccpu, req))
+  		goto do_local;
+diff --git a/block/blk-core.c b/block/blk-core.c
+index b0261becf41f..147db3dfba12 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1306,7 +1306,7 @@ void __blk_put_request(struct request_queue *q, struct request *req)
+ 		struct request_list *rl = blk_rq_rl(req);
+ 
+ 		BUG_ON(!list_empty(&req->queuelist));
+-		BUG_ON(!hlist_unhashed(&req->hash));
++		BUG_ON(ELV_ON_HASH(req));
+ 
+ 		blk_free_request(rl, req);
+ 		freed_request(rl, flags);
+* Unmerged path block/blk-softirq.c
+diff --git a/block/blk.h b/block/blk.h
+index c90e1d8f7a2b..44c2b0fb7754 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -78,7 +78,7 @@ static inline void blk_clear_rq_complete(struct request *rq)
+ /*
+  * Internal elevator interface
+  */
+-#define ELV_ON_HASH(rq) hash_hashed(&(rq)->hash)
++#define ELV_ON_HASH(rq) ((rq)->cmd_flags & REQ_HASHED)
+ 
+ void blk_insert_flush(struct request *rq);
+ void blk_abort_flushes(struct request_queue *q);
+diff --git a/block/elevator.c b/block/elevator.c
+index 27d33dc2fe7d..7a66a7a6a0b3 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -248,6 +248,7 @@ EXPORT_SYMBOL(elevator_exit);
+ static inline void __elv_rqhash_del(struct request *rq)
+ {
+ 	hash_del(&rq->hash);
++	rq->cmd_flags &= ~REQ_HASHED;
+ }
+ 
+ static void elv_rqhash_del(struct request_queue *q, struct request *rq)
+@@ -262,6 +263,7 @@ static void elv_rqhash_add(struct request_queue *q, struct request *rq)
+ 
+ 	BUG_ON(ELV_ON_HASH(rq));
+ 	hash_add(e->hash, &rq->hash, rq_hash_key(rq));
++	rq->cmd_flags |= REQ_HASHED;
+ }
+ 
+ static void elv_rqhash_reposition(struct request_queue *q, struct request *rq)
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 1ab064ef48f2..ba848c6acb94 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -186,6 +186,7 @@ enum rq_flag_bits {
+ 	__REQ_KERNEL, 		/* direct IO to kernel pages */
+ 	__REQ_PM,		/* runtime pm request */
+ 	__REQ_END,		/* last of chain of requests */
++	__REQ_HASHED,		/* on IO scheduler merge hash */
+ 	__REQ_NR_BITS,		/* stops here */
+ };
+ 
+@@ -238,5 +239,6 @@ enum rq_flag_bits {
+ #define REQ_KERNEL		(1ULL << __REQ_KERNEL)
+ #define REQ_PM			(1ULL << __REQ_PM)
+ #define REQ_END			(1ULL << __REQ_END)
++#define REQ_HASHED		(1ULL << __REQ_HASHED)
+ 
+ #endif /* __LINUX_BLK_TYPES_H */
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 548bd1f1a877..fda81b4f3c14 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -121,7 +121,18 @@ struct request {
+ 	struct bio *bio;
+ 	struct bio *biotail;
+ 
+-	struct hlist_node hash;	/* merge hash */
++	/*
++	 * The hash is used inside the scheduler, and killed once the
++	 * request reaches the dispatch list. The ipi_list is only used
++	 * to queue the request for softirq completion, which is long
++	 * after the request has been unhashed (and even removed from
++	 * the dispatch list).
++	 */
++	union {
++		struct hlist_node hash;	/* merge hash */
++		struct list_head ipi_list;
++	};
++
+ 	/*
+ 	 * The rb_node is only used inside the io scheduler, requests
+ 	 * are pruned when moved to the dispatch queue. So let the
