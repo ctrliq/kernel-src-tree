@@ -1,0 +1,198 @@
+bonding: 3ad: use curr_slave_lock instead of bond->lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit bdbc5f13036c13ba47dad5f99645556fc40381f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bdbc5f13.failed
+
+In 3ad mode the only syncing needed by bond->lock is for the wq
+and the recv handler, so change them to use curr_slave_lock.
+There're no locking dependencies here as 3ad doesn't use
+curr_slave_lock at all.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bdbc5f13036c13ba47dad5f99645556fc40381f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_3ad.c
+index 65115ee7b259,5d27a6207384..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -2109,24 -2051,30 +2109,32 @@@ void bond_3ad_state_machine_handler(str
+  {
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    ad_work.work);
+ -	struct aggregator *aggregator;
+ -	struct list_head *iter;
+ -	struct slave *slave;
+  	struct port *port;
+ -	bool should_notify_rtnl = BOND_SLAVE_NOTIFY_LATER;
+ +	struct aggregator *aggregator;
+  
+++<<<<<<< HEAD
+ +	if (!rtnl_trylock()) {
+ +		queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+ +		return;
+ +	}
+ +	//check if there are any slaves
+ +	if (bond->slave_cnt == 0)
+++=======
++ 	read_lock(&bond->curr_slave_lock);
++ 	rcu_read_lock();
++ 
++ 	/* check if there are any slaves */
++ 	if (!bond_has_slaves(bond))
+++>>>>>>> bdbc5f13036c (bonding: 3ad: use curr_slave_lock instead of bond->lock)
+  		goto re_arm;
+  
+ -	/* check if agg_select_timer timer after initialize is timed out */
+ -	if (BOND_AD_INFO(bond).agg_select_timer &&
+ -	    !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ -		slave = bond_first_slave_rcu(bond);
+ -		port = slave ? &(SLAVE_AD_INFO(slave)->port) : NULL;
+ -
+ -		/* select the active aggregator for the bond */
+ -		if (port) {
+ +	// check if agg_select_timer timer after initialize is timed out
+ +	if (BOND_AD_INFO(bond).agg_select_timer && !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ +		// select the active aggregator for the bond
+ +		if ((port = __get_first_port(bond))) {
+  			if (!port->slave) {
+ -				net_warn_ratelimited("%s: Warning: bond's first port is uninitialized\n",
+ -						     bond->dev->name);
+ +				pr_warning("%s: Warning: bond's first port is uninitialized\n",
+ +					   bond->dev->name);
+  				goto re_arm;
+  			}
+  
+@@@ -2164,7 -2113,19 +2172,23 @@@
+  	}
+  
+  re_arm:
+++<<<<<<< HEAD
+ +	rtnl_unlock();
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (slave->should_notify) {
++ 			should_notify_rtnl = BOND_SLAVE_NOTIFY_NOW;
++ 			break;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	read_unlock(&bond->curr_slave_lock);
++ 
++ 	if (should_notify_rtnl && rtnl_trylock()) {
++ 		bond_slave_state_notify(bond);
++ 		rtnl_unlock();
++ 	}
+++>>>>>>> bdbc5f13036c (bonding: 3ad: use curr_slave_lock instead of bond->lock)
+  	queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+  }
+  
+@@@ -2407,19 -2383,18 +2431,18 @@@ int __bond_3ad_get_active_agg_info(stru
+  		}
+  	}
+  
+ -	if (!aggregator)
+ -		return -1;
+ +	if (aggregator) {
+ +		ad_info->aggregator_id = aggregator->aggregator_identifier;
+ +		ad_info->ports = aggregator->num_of_ports;
+ +		ad_info->actor_key = aggregator->actor_oper_aggregator_key;
+ +		ad_info->partner_key = aggregator->partner_oper_aggregator_key;
+ +		memcpy(ad_info->partner_system, aggregator->partner_system.mac_addr_value, ETH_ALEN);
+ +		return 0;
+ +	}
+  
+ -	ad_info->aggregator_id = aggregator->aggregator_identifier;
+ -	ad_info->ports = aggregator->num_of_ports;
+ -	ad_info->actor_key = aggregator->actor_oper_aggregator_key;
+ -	ad_info->partner_key = aggregator->partner_oper_aggregator_key;
+ -	ether_addr_copy(ad_info->partner_system,
+ -			aggregator->partner_system.mac_addr_value);
+ -	return 0;
+ +	return -1;
+  }
+  
+- /* Wrapper used to hold bond->lock so no slave manipulation can occur */
+  int bond_3ad_get_active_agg_info(struct bonding *bond, struct ad_info *ad_info)
+  {
+  	int ret;
+diff --cc drivers/net/bonding/bond_main.c
+index f10f65fec93b,dcd331bd0c17..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1952,37 -1687,33 +1952,63 @@@ static int __bond_release_one(struct ne
+  	 * for this slave anymore.
+  	 */
+  	netdev_rx_handler_unregister(slave_dev);
+- 	write_lock_bh(&bond->lock);
+  
+++<<<<<<< HEAD
+ +	if (!all && !bond->params.fail_over_mac) {
+ +		if (ether_addr_equal(bond_dev->dev_addr, slave->perm_hwaddr) &&
+ +		    bond->slave_cnt > 1)
+ +			pr_warning("%s: Warning: the permanent HWaddr of %s - %pM - is still in use by %s. Set the HWaddr of %s to a different address to avoid conflicts.\n",
+ +				   bond_dev->name, slave_dev->name,
+ +				   slave->perm_hwaddr,
+ +				   bond_dev->name, slave_dev->name);
+++=======
++ 	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
++ 		/* Sync against bond_3ad_rx_indication and
++ 		 * bond_3ad_state_machine_handler
++ 		 */
++ 		write_lock_bh(&bond->curr_slave_lock);
++ 		bond_3ad_unbind_slave(slave);
++ 		write_unlock_bh(&bond->curr_slave_lock);
++ 	}
++ 
++ 	netdev_info(bond_dev, "Releasing %s interface %s\n",
++ 		    bond_is_active_slave(slave) ? "active" : "backup",
++ 		    slave_dev->name);
++ 
++ 	oldcurrent = rcu_access_pointer(bond->curr_active_slave);
++ 
++ 	RCU_INIT_POINTER(bond->current_arp_slave, NULL);
++ 
++ 	if (!all && (!bond->params.fail_over_mac ||
++ 		     BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)) {
++ 		if (ether_addr_equal_64bits(bond_dev->dev_addr, slave->perm_hwaddr) &&
++ 		    bond_has_slaves(bond))
++ 			netdev_warn(bond_dev, "the permanent HWaddr of %s - %pM - is still in use by %s - set the HWaddr of %s to a different address to avoid conflicts\n",
++ 				    slave_dev->name, slave->perm_hwaddr,
++ 				    bond_dev->name, slave_dev->name);
+++>>>>>>> bdbc5f13036c (bonding: 3ad: use curr_slave_lock instead of bond->lock)
+  	}
+  
+ +	/* Inform AD package of unbinding of slave. */
+ +	if (bond->params.mode == BOND_MODE_8023AD) {
+ +		/* must be called before the slave is
+ +		 * detached from the list
+ +		 */
+ +		bond_3ad_unbind_slave(slave);
+ +	}
+ +
+ +	pr_info("%s: releasing %s interface %s\n",
+ +		bond_dev->name,
+ +		bond_is_active_slave(slave) ? "active" : "backup",
+ +		slave_dev->name);
+ +
+ +	oldcurrent = bond->curr_active_slave;
+ +
+ +	bond->current_arp_slave = NULL;
+ +
+ +	/* release the slave from its bond */
+ +	bond_detach_slave(bond, slave);
+ +
+  	if (bond->primary_slave == slave)
+  		bond->primary_slave = NULL;
+  
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_main.c
