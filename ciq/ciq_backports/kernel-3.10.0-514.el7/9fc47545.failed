@@ -1,0 +1,153 @@
+geneve: move geneve device lookup before iptunnel_pull_header
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 9fc4754582bf46b0998a64fce74f570cea720e18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9fc47545.failed
+
+This is in preparation for iptunnel_pull_header calling skb_scrub_packet.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9fc4754582bf46b0998a64fce74f570cea720e18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+diff --cc drivers/net/geneve.c
+index 7c79843ccb40,4ceccf871b3f..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -114,33 -158,60 +114,87 @@@ static inline struct genevehdr *geneve_
+  	return (struct genevehdr *)(udp_hdr(skb) + 1);
+  }
+  
+- /* geneve receive/decap routine */
+- static void geneve_rx(struct geneve_sock *gs, struct sk_buff *skb)
++ static struct geneve_dev *geneve_lookup_skb(struct geneve_sock *gs,
++ 					    struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	struct genevehdr *gnvh = geneve_hdr(skb);
+ +	struct metadata_dst *tun_dst = NULL;
+ +	struct geneve_dev *geneve = NULL;
+ +	struct pcpu_sw_netstats *stats;
+ +	struct iphdr *iph;
+ +	u8 *vni;
+ +	__be32 addr;
+ +	int err;
+ +
+ +	iph = ip_hdr(skb); /* outer IP header... */
+ +
+ +	if (gs->collect_md) {
+ +		static u8 zero_vni[3];
+ +
+ +		vni = zero_vni;
+ +		addr = 0;
+ +	} else {
+ +		vni = gnvh->vni;
+ +		addr = iph->saddr;
+ +	}
+ +
+ +	geneve = geneve_lookup(gs, addr, vni);
+ +	if (!geneve)
+ +		goto drop;
+++=======
++ 	u8 *vni;
++ 	__be32 addr;
++ 	static u8 zero_vni[3];
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	static struct in6_addr zero_addr6;
++ #endif
++ 
++ 	if (geneve_get_sk_family(gs) == AF_INET) {
++ 		struct iphdr *iph;
++ 
++ 		iph = ip_hdr(skb); /* outer IP header... */
++ 
++ 		if (gs->collect_md) {
++ 			vni = zero_vni;
++ 			addr = 0;
++ 		} else {
++ 			vni = geneve_hdr(skb)->vni;
++ 			addr = iph->saddr;
++ 		}
++ 
++ 		return geneve_lookup(gs, addr, vni);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (geneve_get_sk_family(gs) == AF_INET6) {
++ 		struct ipv6hdr *ip6h;
++ 		struct in6_addr addr6;
++ 
++ 		ip6h = ipv6_hdr(skb); /* outer IPv6 header... */
++ 
++ 		if (gs->collect_md) {
++ 			vni = zero_vni;
++ 			addr6 = zero_addr6;
++ 		} else {
++ 			vni = geneve_hdr(skb)->vni;
++ 			addr6 = ip6h->saddr;
++ 		}
++ 
++ 		return geneve6_lookup(gs, addr6, vni);
++ #endif
++ 	}
++ 	return NULL;
++ }
++ 
++ /* geneve receive/decap routine */
++ static void geneve_rx(struct geneve_dev *geneve, struct geneve_sock *gs,
++ 		      struct sk_buff *skb)
++ {
++ 	struct genevehdr *gnvh = geneve_hdr(skb);
++ 	struct metadata_dst *tun_dst = NULL;
++ 	struct pcpu_sw_netstats *stats;
++ 	int err = 0;
++ 	void *oiph;
+++>>>>>>> 9fc4754582bf (geneve: move geneve device lookup before iptunnel_pull_header)
+  
+  	if (ip_tunnel_collect_metadata() || gs->collect_md) {
+  		__be16 flags;
+@@@ -180,14 -248,29 +234,38 @@@
+  	if (ether_addr_equal(eth_hdr(skb)->h_source, geneve->dev->dev_addr))
+  		goto drop;
+  
++ 	oiph = skb_network_header(skb);
+  	skb_reset_network_header(skb);
+  
+++<<<<<<< HEAD
+ +	err = IP_ECN_decapsulate(iph, skb);
+ +
+ +	if (unlikely(err)) {
+ +		if (log_ecn_error)
+ +			net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
+ +					     &iph->saddr, iph->tos);
+++=======
++ 	if (geneve_get_sk_family(gs) == AF_INET)
++ 		err = IP_ECN_decapsulate(oiph, skb);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else
++ 		err = IP6_ECN_decapsulate(oiph, skb);
++ #endif
++ 
++ 	if (unlikely(err)) {
++ 		if (log_ecn_error) {
++ 			if (geneve_get_sk_family(gs) == AF_INET)
++ 				net_info_ratelimited("non-ECT from %pI4 "
++ 						     "with TOS=%#x\n",
++ 						     &((struct iphdr *)oiph)->saddr,
++ 						     ((struct iphdr *)oiph)->tos);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 			else
++ 				net_info_ratelimited("non-ECT from %pI6\n",
++ 						     &((struct ipv6hdr *)oiph)->saddr);
++ #endif
++ 		}
+++>>>>>>> 9fc4754582bf (geneve: move geneve device lookup before iptunnel_pull_header)
+  		if (err > 1) {
+  			++geneve->dev->stats.rx_frame_errors;
+  			++geneve->dev->stats.rx_errors;
+* Unmerged path drivers/net/geneve.c
