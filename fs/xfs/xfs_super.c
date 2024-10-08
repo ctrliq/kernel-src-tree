@@ -1016,7 +1016,6 @@ xfs_fs_evict_inode(
 	clear_inode(inode);
 	XFS_STATS_INC(vn_rele);
 	XFS_STATS_INC(vn_remove);
-	XFS_STATS_DEC(vn_active);
 
 	xfs_inactive(ip);
 }
