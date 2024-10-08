@@ -464,7 +464,7 @@ megasas_alloc_cmds_fusion(struct megasas_instance *instance)
 
 	reply_desc = fusion->reply_frames_desc;
 	for (i = 0; i < fusion->reply_q_depth * count; i++, reply_desc++)
-		reply_desc->Words = ULLONG_MAX;
+		reply_desc->Words = cpu_to_le64(ULLONG_MAX);
 
 	io_frames_sz = fusion->io_frames_alloc_sz;
 
@@ -2026,7 +2026,8 @@ complete_cmd_fusion(struct megasas_instance *instance, u32 MSIxIndex)
 
 	num_completed = 0;
 
-	while ((d_val.u.low != UINT_MAX) && (d_val.u.high != UINT_MAX)) {
+	while (d_val.u.low != cpu_to_le32(UINT_MAX) &&
+	       d_val.u.high != cpu_to_le32(UINT_MAX)) {
 		smid = le16_to_cpu(reply_desc->SMID);
 
 		cmd_fusion = fusion->cmd_list[smid - 1];
@@ -2094,7 +2095,7 @@ complete_cmd_fusion(struct megasas_instance *instance, u32 MSIxIndex)
 		    fusion->reply_q_depth)
 			fusion->last_reply_idx[MSIxIndex] = 0;
 
-		desc->Words = ULLONG_MAX;
+		desc->Words = cpu_to_le64(ULLONG_MAX);
 		num_completed++;
 		threshold_reply_count++;
 
@@ -2536,7 +2537,7 @@ void  megasas_reset_reply_desc(struct megasas_instance *instance)
 		fusion->last_reply_idx[i] = 0;
 	reply_desc = fusion->reply_frames_desc;
 	for (i = 0 ; i < fusion->reply_q_depth * count; i++, reply_desc++)
-		reply_desc->Words = ULLONG_MAX;
+		reply_desc->Words = cpu_to_le64(ULLONG_MAX);
 }
 
 /*
