@@ -1564,6 +1564,12 @@ static inline u32 nfsd4_rename_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op
 		+ op_encode_change_info_maxsz) * sizeof(__be32);
 }
 
+static inline u32 nfsd4_sequence_rsize(struct svc_rqst *rqstp,
+				       struct nfsd4_op *op)
+{
+	return NFS4_MAX_SESSIONID_LEN + 20;
+}
+
 static inline u32 nfsd4_setattr_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
 {
 	return (op_encode_hdr_size + nfs4_fattr_bitmap_maxsz) * sizeof(__be32);
