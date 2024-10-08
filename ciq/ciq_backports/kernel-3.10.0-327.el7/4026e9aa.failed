@@ -1,0 +1,550 @@
+megaraid_sas : Use Block layer tag support for internal command indexing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: Use Block layer tag support for internal command indexing (Tomas Henzl) [1185944]
+Rebuild_FUZZ: 99.30%
+commit-author Sumit.Saxena@avagotech.com <Sumit.Saxena@avagotech.com>
+commit 4026e9aac3ff108fd1885a7f05dd4b5a374b0bf8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4026e9aa.failed
+
+megaraid_sas driver will use block layer provided tag for indexing internal
+MPT frames to get any unique MPT frame tied with tag.  Each IO request
+submitted from SCSI mid layer will get associated MPT frame from MPT framepool
+(retrieved and return back using spinlock inside megaraid_sas driver's
+submission/completion call back). Getting MPT frame from MPT Frame pool is
+very expensive operation because of associated spin lock operation (spinlock
+overhead increase on multi NUMA node). This type of locking in driver is very
+expensive call considering each IO request need - Acquire and Release of the
+same lock.
+
+With this support, in IO path driver will directly provide the unique command
+index(which is based on block layer tag) and will get the MPT frame tied to
+the tag and this way driver can get rid off lock, which synchronizes the
+access to MPT frame pool while fetching and returning MPT frame from the pool.
+
+This support in driver provides siginificant performance improvement(on multi
+NUMA node system)on latest upstream with SCSI.MQ as well as on existing linux
+distributions.
+
+Here is the data for test executed at Avago-
+- IO Tool- FIO
+- 4 Socket SMC server. (4 NUMA node server)
+- 12 SSDs in JBOD mode .
+- 4K Rand READ, QD=32
+- SCSI MQ x86_64 (Latest Upstream kernel)
+- upto 300% Performance Improvement.
+
+If IOs are running on single Node, perfromance gain is less, but as soon as
+increase number of nodes, performance improvement is significant. IOs running
+on all 4 NUMA nodes, with this patch applied IOPs observed was 1170K vs 344K
+IOPs seen without this patch.
+
+Logically, there are two parts of this patch- 1) Block layer tag support 2)
+changes in calling convention of return_cmd.  part 2 will revert the changes
+done by patch- 90dc9d9 megaraid_sas : MFI MPT linked list corruption fix
+because changes done in part 1 has fixed the problem of MFI MPT linked list
+corruption. part 2 is very much dependent on part 1, so we decided to have
+single patch for these two logical changes.
+
+[jejb: remove chatty printk pointed out by hch]
+	Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+	Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 4026e9aac3ff108fd1885a7f05dd4b5a374b0bf8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 7f3de6f82935,6f07f9119066..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@@ -188,44 -176,8 +176,40 @@@ inline struct megasas_cmd_fusion *megas
+  inline void megasas_return_cmd_fusion(struct megasas_instance *instance,
+  	struct megasas_cmd_fusion *cmd)
+  {
+- 	unsigned long flags;
+- 	struct fusion_context *fusion =
+- 		(struct fusion_context *)instance->ctrl_context;
+- 
+- 	spin_lock_irqsave(&fusion->mpt_pool_lock, flags);
+- 
+  	cmd->scmd = NULL;
+- 	cmd->sync_cmd_idx = (u32)ULONG_MAX;
+  	memset(cmd->io_request, 0, sizeof(struct MPI2_RAID_SCSI_IO_REQUEST));
+++<<<<<<< HEAD
+ +	list_add(&cmd->list, (&fusion->cmd_pool)->next);
+ +
+ +	spin_unlock_irqrestore(&fusion->mpt_pool_lock, flags);
+ +}
+ +
+ +/**
+ + * megasas_return_mfi_mpt_pthr - Return a mfi and mpt to free command pool
+ + * @instance:		Adapter soft state
+ + * @cmd_mfi:		MFI Command packet to be returned to free command pool
+ + * @cmd_mpt:		MPT Command packet to be returned to free command pool
+ + */
+ +inline void megasas_return_mfi_mpt_pthr(struct megasas_instance *instance,
+ +	struct megasas_cmd *cmd_mfi, struct megasas_cmd_fusion *cmd_fusion)
+ +{
+ +	unsigned long flags;
+ +
+ +	/* 
+ + 	 * TO DO: optimize this code and use only one lock instead of two
+ + 	 * locks being used currently- mpt_pool_lock is acquired
+ + 	 * inside mfi_pool_lock
+ + 	 */
+ +	spin_lock_irqsave(&instance->mfi_pool_lock, flags);
+ +	megasas_return_cmd_fusion(instance, cmd_fusion);
+ +	if (atomic_read(&cmd_mfi->mfi_mpt_pthr) != MFI_MPT_ATTACHED)
+ +		dev_err(&instance->pdev->dev, "Possible bug from %s %d\n",
+ +			__func__, __LINE__);
+ +	atomic_set(&cmd_mfi->mfi_mpt_pthr, MFI_MPT_DETACHED);
+ +	__megasas_return_cmd(instance, cmd_mfi);
+ +	spin_unlock_irqrestore(&instance->mfi_pool_lock, flags);
+++=======
+++>>>>>>> 4026e9aac3ff (megaraid_sas : Use Block layer tag support for internal command indexing)
+  }
+  
+  /**
+@@@ -2024,8 -1996,7 +1999,12 @@@ complete_cmd_fusion(struct megasas_inst
+  		switch (scsi_io_req->Function) {
+  		case MPI2_FUNCTION_SCSI_IO_REQUEST:  /*Fast Path IO.*/
+  			/* Update load balancing info */
+++<<<<<<< HEAD
+ +			device_id = MEGASAS_DEV_INDEX(instance,
+ +						      cmd_fusion->scmd);
+++=======
++ 			device_id = MEGASAS_DEV_INDEX(scmd_local);
+++>>>>>>> 4026e9aac3ff (megaraid_sas : Use Block layer tag support for internal command indexing)
+  			lbinfo = &fusion->load_balance_info[device_id];
+  			if (cmd_fusion->scmd->SCp.Status &
+  			    MEGASAS_LOAD_BALANCE_FLAG) {
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index e7a96c90fb8a..1e156a017a69 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -153,6 +153,9 @@
+ #define MFI_FRAME_DIR_BOTH			0x0018
+ #define MFI_FRAME_IEEE                          0x0020
+ 
++/* Driver internal */
++#define DRV_DCMD_POLLED_MODE		0x1
++
+ /*
+  * Definition for cmd_status
+  */
+@@ -1042,11 +1045,6 @@ struct megasas_ctrl_info {
+ 
+ #define VD_EXT_DEBUG 0
+ 
+-enum MR_MFI_MPT_PTHR_FLAGS {
+-	MFI_MPT_DETACHED = 0,
+-	MFI_LIST_ADDED = 1,
+-	MFI_MPT_ATTACHED = 2,
+-};
+ 
+ enum MR_SCSI_CMD_TYPE {
+ 	READ_WRITE_LDIO = 0,
+@@ -1885,10 +1883,7 @@ struct megasas_cmd {
+ 
+ 	struct list_head list;
+ 	struct scsi_cmnd *scmd;
+-
+-	void *mpt_pthr_cmd_blocked;
+-	atomic_t mfi_mpt_pthr;
+-	u8 is_wait_event;
++	u8 flags;
+ 
+ 	struct megasas_instance *instance;
+ 	union {
+diff --git a/drivers/scsi/megaraid/megaraid_sas_base.c b/drivers/scsi/megaraid/megaraid_sas_base.c
+index 50220bbe2c2e..b9bcf6344615 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -215,7 +215,6 @@ struct megasas_cmd *megasas_get_cmd(struct megasas_instance
+ 		cmd = list_entry((&instance->cmd_pool)->next,
+ 				 struct megasas_cmd, list);
+ 		list_del_init(&cmd->list);
+-		atomic_set(&cmd->mfi_mpt_pthr, MFI_MPT_DETACHED);
+ 	} else {
+ 		printk(KERN_ERR "megasas: Command pool empty!\n");
+ 	}
+@@ -225,52 +224,41 @@ struct megasas_cmd *megasas_get_cmd(struct megasas_instance
+ }
+ 
+ /**
+- * __megasas_return_cmd -	Return a cmd to free command pool
++ * megasas_return_cmd -	Return a cmd to free command pool
+  * @instance:		Adapter soft state
+  * @cmd:		Command packet to be returned to free command pool
+  */
+ inline void
+-__megasas_return_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd)
++megasas_return_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd)
+ {
+-	/*
+-	 * Don't go ahead and free the MFI frame, if corresponding
+-	 * MPT frame is not freed(valid for only fusion adapters).
+-	 * In case of MFI adapters, anyways for any allocated MFI
+-	 * frame will have cmd->mfi_mpt_mpthr set to MFI_MPT_DETACHED
++	unsigned long flags;
++	u32 blk_tags;
++	struct megasas_cmd_fusion *cmd_fusion;
++	struct fusion_context *fusion = instance->ctrl_context;
++
++	/* This flag is used only for fusion adapter.
++	 * Wait for Interrupt for Polled mode DCMD
+ 	 */
+-	if (atomic_read(&cmd->mfi_mpt_pthr) != MFI_MPT_DETACHED)
++	if (cmd->flags & DRV_DCMD_POLLED_MODE)
+ 		return;
+ 
++	spin_lock_irqsave(&instance->mfi_pool_lock, flags);
++
++	if (fusion) {
++		blk_tags = instance->max_scsi_cmds + cmd->index;
++		cmd_fusion = fusion->cmd_list[blk_tags];
++		megasas_return_cmd_fusion(instance, cmd_fusion);
++	}
+ 	cmd->scmd = NULL;
+ 	cmd->frame_count = 0;
+-	cmd->is_wait_event = 0;
+-	cmd->mpt_pthr_cmd_blocked = NULL;
+-
+-	if ((instance->pdev->device != PCI_DEVICE_ID_LSI_FUSION) &&
+-	    (instance->pdev->device != PCI_DEVICE_ID_LSI_INVADER) &&
+-	    (instance->pdev->device != PCI_DEVICE_ID_LSI_FURY) &&
+-	    (reset_devices))
++	cmd->flags = 0;
++	if (!fusion && reset_devices)
+ 		cmd->frame->hdr.cmd = MFI_CMD_INVALID;
+-
+-	atomic_set(&cmd->mfi_mpt_pthr, MFI_LIST_ADDED);
+ 	list_add(&cmd->list, (&instance->cmd_pool)->next);
+-}
+ 
+-/**
+- * megasas_return_cmd -	Return a cmd to free command pool
+- * @instance:		Adapter soft state
+- * @cmd:		Command packet to be returned to free command pool
+- */
+-inline void
+-megasas_return_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&instance->mfi_pool_lock, flags);
+-	__megasas_return_cmd(instance, cmd);
+ 	spin_unlock_irqrestore(&instance->mfi_pool_lock, flags);
+-}
+ 
++}
+ 
+ /**
+ *	The following functions are defined for xscale
+@@ -954,7 +942,6 @@ megasas_issue_blocked_cmd(struct megasas_instance *instance,
+ 	int ret = 0;
+ 	cmd->cmd_status = ENODATA;
+ 
+-	cmd->is_wait_event = 1;
+ 	instance->instancet->issue_dcmd(instance, cmd);
+ 	if (timeout) {
+ 		ret = wait_event_timeout(instance->int_cmd_wait_q,
+@@ -1976,11 +1963,7 @@ out:
+ 				    new_affiliation_111_h);
+ 	}
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	return retval;
+ }
+@@ -2147,11 +2130,7 @@ out:
+ 				    (MAX_LOGICAL_DRIVES + 1) *
+ 				    sizeof(struct MR_LD_VF_AFFILIATION),
+ 				    new_affiliation, new_affiliation_h);
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	return retval;
+ }
+@@ -2221,9 +2200,13 @@ int megasas_sriov_start_heartbeat(struct megasas_instance *instance,
+ 	printk(KERN_WARNING "megasas: SR-IOV: Starting heartbeat for scsi%d\n",
+ 	       instance->host->host_no);
+ 
+-	if (!megasas_issue_polled(instance, cmd)) {
+-		retval = 0;
+-	} else {
++	if (instance->ctrl_context && !instance->mask_interrupts)
++		retval = megasas_issue_blocked_cmd(instance, cmd,
++			MEGASAS_ROUTINE_WAIT_TIME_VF);
++	else
++		retval = megasas_issue_polled(instance, cmd);
++
++	if (retval) {
+ 		printk(KERN_WARNING "megasas: SR-IOV: MR_DCMD_CTRL_SHARED_HOST"
+ 		       "_MEM_ALLOC DCMD timed out for scsi%d\n",
+ 		       instance->host->host_no);
+@@ -2614,11 +2597,7 @@ megasas_service_aen(struct megasas_instance *instance, struct megasas_cmd *cmd)
+ 
+ 	instance->aen_cmd = NULL;
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	if ((instance->unload == 0) &&
+ 		((instance->issuepend_done == 1))) {
+@@ -2994,8 +2973,7 @@ megasas_complete_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd,
+ 					       "failed, status = 0x%x.\n",
+ 					       cmd->frame->hdr.cmd_status);
+ 				else {
+-					megasas_return_mfi_mpt_pthr(instance,
+-						cmd, cmd->mpt_pthr_cmd_blocked);
++					megasas_return_cmd(instance, cmd);
+ 					spin_unlock_irqrestore(
+ 						instance->host->host_lock,
+ 						flags);
+@@ -3003,8 +2981,7 @@ megasas_complete_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd,
+ 				}
+ 			} else
+ 				instance->map_id++;
+-			megasas_return_mfi_mpt_pthr(instance, cmd,
+-				cmd->mpt_pthr_cmd_blocked);
++			megasas_return_cmd(instance, cmd);
+ 
+ 			/*
+ 			 * Set fast path IO to ZERO.
+@@ -3782,7 +3759,6 @@ int megasas_alloc_cmds(struct megasas_instance *instance)
+ 		cmd = instance->cmd_list[i];
+ 		memset(cmd, 0, sizeof(struct megasas_cmd));
+ 		cmd->index = i;
+-		atomic_set(&cmd->mfi_mpt_pthr, MFI_LIST_ADDED);
+ 		cmd->scmd = NULL;
+ 		cmd->instance = instance;
+ 
+@@ -3890,11 +3866,7 @@ megasas_get_pd_list(struct megasas_instance *instance)
+ 				MEGASAS_MAX_PD * sizeof(struct MR_PD_LIST),
+ 				ci, ci_h);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	return ret;
+ }
+@@ -3981,11 +3953,7 @@ megasas_get_ld_list(struct megasas_instance *instance)
+ 				ci,
+ 				ci_h);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 	return ret;
+ }
+ 
+@@ -4066,11 +4034,7 @@ megasas_ld_list_query(struct megasas_instance *instance, u8 query_type)
+ 	pci_free_consistent(instance->pdev, sizeof(struct MR_LD_TARGETID_LIST),
+ 			    ci, ci_h);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	return ret;
+ }
+@@ -4196,16 +4160,17 @@ megasas_get_ctrl_info(struct megasas_instance *instance)
+ 		le32_to_cpus((u32 *)&ctrl_info->adapterOperations2);
+ 		le32_to_cpus((u32 *)&ctrl_info->adapterOperations3);
+ 		megasas_update_ext_vd_details(instance);
++		instance->is_imr = (ctrl_info->memory_size ? 0 : 1);
++		dev_info(&instance->pdev->dev,
++				"controller type\t: %s(%dMB)\n",
++				instance->is_imr ? "iMR" : "MR",
++				le16_to_cpu(ctrl_info->memory_size));
+ 	}
+ 
+ 	pci_free_consistent(instance->pdev, sizeof(struct megasas_ctrl_info),
+ 			    ci, ci_h);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 	return ret;
+ }
+ 
+@@ -4260,11 +4225,7 @@ int megasas_set_crash_dump_params(struct megasas_instance *instance,
+ 	else
+ 		ret = megasas_issue_polled(instance, cmd);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 	return ret;
+ }
+ 
+@@ -4753,17 +4714,6 @@ static int megasas_init_fw(struct megasas_instance *instance)
+ 
+ 	tmp_sectors = min_t(u32, max_sectors_1 , max_sectors_2);
+ 
+-	/*Check whether controller is iMR or MR */
+-	if (ctrl_info->memory_size) {
+-		instance->is_imr = 0;
+-		dev_info(&instance->pdev->dev, "Controller type: MR,"
+-			"Memory size is: %dMB\n",
+-			le16_to_cpu(ctrl_info->memory_size));
+-	} else {
+-		instance->is_imr = 1;
+-		dev_info(&instance->pdev->dev,
+-			"Controller type: iMR\n");
+-	}
+ 	instance->disableOnlineCtrlReset =
+ 	ctrl_info->properties.OnOffProperties.disableOnlineCtrlReset;
+ 	instance->mpio = ctrl_info->adapterOperations2.mpio;
+@@ -4968,11 +4918,7 @@ megasas_get_seq_num(struct megasas_instance *instance,
+ 	pci_free_consistent(instance->pdev, sizeof(struct megasas_evt_log_info),
+ 			    el_info, el_info_h);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	return 0;
+ }
+@@ -5137,6 +5083,7 @@ static int megasas_start_aen(struct megasas_instance *instance)
+ static int megasas_io_attach(struct megasas_instance *instance)
+ {
+ 	struct Scsi_Host *host = instance->host;
++	u32		error;
+ 
+ 	/*
+ 	 * Export parameters required by SCSI mid-layer
+@@ -5186,12 +5133,21 @@ static int megasas_io_attach(struct megasas_instance *instance)
+ 		host->hostt->eh_device_reset_handler = NULL;
+ 		host->hostt->eh_bus_reset_handler = NULL;
+ 	}
++	error = scsi_init_shared_tag_map(host, host->can_queue);
++	if (error) {
++		dev_err(&instance->pdev->dev,
++			"Failed to shared tag from %s %d\n",
++			__func__, __LINE__);
++		return -ENODEV;
++	}
+ 
+ 	/*
+ 	 * Notify the mid-layer about the new controller
+ 	 */
+ 	if (scsi_add_host(host, &instance->pdev->dev)) {
+-		printk(KERN_DEBUG "megasas: scsi_add_host failed\n");
++		dev_err(&instance->pdev->dev,
++			"Failed to add host from %s %d\n",
++			__func__, __LINE__);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -5309,8 +5265,6 @@ static int megasas_probe_one(struct pci_dev *pdev,
+ 		fusion = instance->ctrl_context;
+ 		memset(fusion, 0,
+ 			((1 << PAGE_SHIFT) << instance->ctrl_context_pages));
+-		INIT_LIST_HEAD(&fusion->cmd_pool);
+-		spin_lock_init(&fusion->mpt_pool_lock);
+ 	}
+ 	break;
+ 	default: /* For all other supported controllers */
+@@ -5556,11 +5510,7 @@ static void megasas_flush_cache(struct megasas_instance *instance)
+ 		dev_err(&instance->pdev->dev, "Command timedout"
+ 			" from %s\n", __func__);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	return;
+ }
+@@ -5607,11 +5557,7 @@ static void megasas_shutdown_controller(struct megasas_instance *instance,
+ 		dev_err(&instance->pdev->dev, "Command timedout"
+ 			"from %s\n", __func__);
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 
+ 	return;
+ }
+@@ -6217,11 +6163,7 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
+ 			kbuff_arr[i] = NULL;
+ 	}
+ 
+-	if (instance->ctrl_context && cmd->mpt_pthr_cmd_blocked)
+-		megasas_return_mfi_mpt_pthr(instance, cmd,
+-			cmd->mpt_pthr_cmd_blocked);
+-	else
+-		megasas_return_cmd(instance, cmd);
++	megasas_return_cmd(instance, cmd);
+ 	return error;
+ }
+ 
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.h b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+index 5a621d2cca90..e58f75fbd988 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.h
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+@@ -679,7 +679,6 @@ struct megasas_cmd_fusion {
+ 	 */
+ 	u32 sync_cmd_idx;
+ 	u32 index;
+-	u8 flags;
+ 	u8 pd_r1_lb;
+ };
+ 
+@@ -792,10 +791,6 @@ struct MR_FW_RAID_MAP_EXT {
+ 
+ struct fusion_context {
+ 	struct megasas_cmd_fusion **cmd_list;
+-	struct list_head cmd_pool;
+-
+-	spinlock_t mpt_pool_lock;
+-
+ 	dma_addr_t req_frames_desc_phys;
+ 	u8 *req_frames_desc;
+ 
