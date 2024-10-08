@@ -1,0 +1,161 @@
+mm/rmap.c: fix pgoff calculation to handle hugepage correctly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] rmap: fix pgoff calculation to handle hugepage correctly (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 95.73%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit a0f7a756c2f7543585657cdeeefdfcc11b567293
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a0f7a756.failed
+
+I triggered VM_BUG_ON() in vma_address() when I tried to migrate an
+anonymous hugepage with mbind() in the kernel v3.16-rc3.  This is
+because pgoff's calculation in rmap_walk_anon() fails to consider
+compound_order() only to have an incorrect value.
+
+This patch introduces page_to_pgoff(), which gets the page's offset in
+PAGE_CACHE_SIZE.
+
+Kirill pointed out that page cache tree should natively handle
+hugepages, and in order to make hugetlbfs fit it, page->index of
+hugetlbfs page should be in PAGE_CACHE_SIZE.  This is beyond this patch,
+but page_to_pgoff() contains the point to be fixed in a single function.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Hillf Danton <dhillf@gmail.com>
+	Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a0f7a756c2f7543585657cdeeefdfcc11b567293)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/rmap.c
+diff --cc mm/rmap.c
+index 8a1f7d7fc267,22a4a7699cdb..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1697,8 -1612,37 +1693,40 @@@ static int rmap_walk_anon(struct page *
+  	 */
+  	anon_vma = page_anon_vma(page);
+  	if (!anon_vma)
+++<<<<<<< HEAD
+++=======
++ 		return NULL;
++ 
++ 	anon_vma_lock_read(anon_vma);
++ 	return anon_vma;
++ }
++ 
++ /*
++  * rmap_walk_anon - do something to anonymous page using the object-based
++  * rmap method
++  * @page: the page to be handled
++  * @rwc: control variable according to each walk type
++  *
++  * Find all the mappings of a page using the mapping pointer and the vma chains
++  * contained in the anon_vma struct it points to.
++  *
++  * When called from try_to_munlock(), the mmap_sem of the mm containing the vma
++  * where the page was found will be held for write.  So, we won't recheck
++  * vm_flags for that VMA.  That should be OK, because that vma shouldn't be
++  * LOCKED.
++  */
++ static int rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc)
++ {
++ 	struct anon_vma *anon_vma;
++ 	pgoff_t pgoff = page_to_pgoff(page);
++ 	struct anon_vma_chain *avc;
++ 	int ret = SWAP_AGAIN;
++ 
++ 	anon_vma = rmap_walk_anon_lock(page, rwc);
++ 	if (!anon_vma)
+++>>>>>>> a0f7a756c2f7 (mm/rmap.c: fix pgoff calculation to handle hugepage correctly)
+  		return ret;
+ -
+ +	anon_vma_lock_read(anon_vma);
+  	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, pgoff, pgoff) {
+  		struct vm_area_struct *vma = avc->vma;
+  		unsigned long address = vma_address(page, vma);
+@@@ -1710,11 -1660,23 +1738,15 @@@
+  	return ret;
+  }
+  
+ -/*
+ - * rmap_walk_file - do something to file page using the object-based rmap method
+ - * @page: the page to be handled
+ - * @rwc: control variable according to each walk type
+ - *
+ - * Find all the mappings of a page using the mapping pointer and the vma chains
+ - * contained in the address_space struct it points to.
+ - *
+ - * When called from try_to_munlock(), the mmap_sem of the mm containing the vma
+ - * where the page was found will be held for write.  So, we won't recheck
+ - * vm_flags for that VMA.  That should be OK, because that vma shouldn't be
+ - * LOCKED.
+ - */
+ -static int rmap_walk_file(struct page *page, struct rmap_walk_control *rwc)
+ +static int rmap_walk_file(struct page *page, int (*rmap_one)(struct page *,
+ +		struct vm_area_struct *, unsigned long, void *), void *arg)
+  {
+  	struct address_space *mapping = page->mapping;
+++<<<<<<< HEAD
+ +	pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
+++=======
++ 	pgoff_t pgoff = page_to_pgoff(page);
+++>>>>>>> a0f7a756c2f7 (mm/rmap.c: fix pgoff calculation to handle hugepage correctly)
+  	struct vm_area_struct *vma;
+  	int ret = SWAP_AGAIN;
+  
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 5c0d28084fa4..49621e63cc8a 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -313,6 +313,18 @@ static inline struct page *read_mapping_page(struct address_space *mapping,
+ 	return read_cache_page(mapping, index, filler, data);
+ }
+ 
++/*
++ * Get the offset in PAGE_SIZE.
++ * (TODO: hugepage should have ->index in PAGE_SIZE)
++ */
++static inline pgoff_t page_to_pgoff(struct page *page)
++{
++	if (unlikely(PageHeadHuge(page)))
++		return page->index << compound_order(page);
++	else
++		return page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
++}
++
+ /*
+  * Return byte-offset into filesystem object for page.
+  */
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index 357bfc36dff4..dd86b7b0bf42 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -437,7 +437,7 @@ static void collect_procs_anon(struct page *page, struct list_head *to_kill,
+ 	if (av == NULL)	/* Not actually mapped anymore */
+ 		return;
+ 
+-	pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
++	pgoff = page_to_pgoff(page);
+ 	read_lock(&tasklist_lock);
+ 	for_each_process (tsk) {
+ 		struct anon_vma_chain *vmac;
+@@ -471,7 +471,7 @@ static void collect_procs_file(struct page *page, struct list_head *to_kill,
+ 	mutex_lock(&mapping->i_mmap_mutex);
+ 	read_lock(&tasklist_lock);
+ 	for_each_process(tsk) {
+-		pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
++		pgoff_t pgoff = page_to_pgoff(page);
+ 		struct task_struct *t = task_early_kill(tsk, force_early);
+ 
+ 		if (!t)
+* Unmerged path mm/rmap.c
