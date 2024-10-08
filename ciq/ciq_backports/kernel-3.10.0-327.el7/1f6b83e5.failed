@@ -1,0 +1,293 @@
+s390: avoid z13 cache aliasing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] avoid z13 cache aliasing (Hendrik Brueckner) [1204860]
+Rebuild_FUZZ: 88.89%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 1f6b83e5e4d3aed46eac1d219322fba9c7341cd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1f6b83e5.failed
+
+Avoid cache aliasing on z13 by aligning shared objects to multiples
+of 512K. The virtual addresses of a page from a shared file needs
+to have identical bits in the range 2^12 to 2^18.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 1f6b83e5e4d3aed46eac1d219322fba9c7341cd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/process.c
+diff --cc arch/s390/kernel/process.c
+index 7ed0d4e2a435,2c1eb4f3aaf5..000000000000
+--- a/arch/s390/kernel/process.c
++++ b/arch/s390/kernel/process.c
+@@@ -261,20 -238,8 +261,23 @@@ static inline unsigned long brk_rnd(voi
+  
+  unsigned long arch_randomize_brk(struct mm_struct *mm)
+  {
+ -	unsigned long ret;
+ +	unsigned long ret = PAGE_ALIGN(mm->brk + brk_rnd());
+ +
+ +	if (ret < mm->brk)
+ +		return mm->brk;
+ +	return ret;
+ +}
+++<<<<<<< HEAD
+ +
+ +unsigned long randomize_et_dyn(unsigned long base)
+ +{
+ +	unsigned long ret = PAGE_ALIGN(base + brk_rnd());
+  
+ -	ret = PAGE_ALIGN(mm->brk + brk_rnd());
+ -	return (ret > mm->brk) ? ret : mm->brk;
+ +	if (!(current->flags & PF_RANDOMIZE))
+ +		return base;
+ +	if (ret < base)
+ +		return base;
+ +	return ret;
+  }
+++=======
+++>>>>>>> 1f6b83e5e4d3 (s390: avoid z13 cache aliasing)
+diff --git a/arch/s390/include/asm/elf.h b/arch/s390/include/asm/elf.h
+index 78f4f8711d58..ebf919c0f7bd 100644
+--- a/arch/s390/include/asm/elf.h
++++ b/arch/s390/include/asm/elf.h
+@@ -162,8 +162,8 @@ extern unsigned int vdso_enabled;
+    the loader.  We need to make sure that it is out of the way of the program
+    that it will "exec", and that there is sufficient room for the brk.  */
+ 
+-extern unsigned long randomize_et_dyn(unsigned long base);
+-#define ELF_ET_DYN_BASE		(randomize_et_dyn(STACK_TOP / 3 * 2))
++extern unsigned long randomize_et_dyn(void);
++#define ELF_ET_DYN_BASE		randomize_et_dyn()
+ 
+ /* This yields a mask that user programs can use to figure out what
+    instruction set this CPU supports. */
+@@ -208,7 +208,9 @@ do {								\
+ } while (0)
+ #endif /* CONFIG_COMPAT */
+ 
+-#define STACK_RND_MASK	0x7ffUL
++extern unsigned long mmap_rnd_mask;
++
++#define STACK_RND_MASK	(mmap_rnd_mask)
+ 
+ #define ARCH_DLINFO							    \
+ do {									    \
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index d80e1657c67e..543299f8a183 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -1594,6 +1594,10 @@ extern int vmem_add_mapping(unsigned long start, unsigned long size);
+ extern int vmem_remove_mapping(unsigned long start, unsigned long size);
+ extern int s390_enable_sie(void);
+ 
++/* s390 has a private copy of get unmapped area to deal with cache synonyms */
++#define HAVE_ARCH_UNMAPPED_AREA
++#define HAVE_ARCH_UNMAPPED_AREA_TOPDOWN
++
+ /*
+  * No page table caches to initialise
+  */
+* Unmerged path arch/s390/kernel/process.c
+diff --git a/arch/s390/mm/init.c b/arch/s390/mm/init.c
+index a4dfc0bd05db..cf410b36b055 100644
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@ -71,13 +71,16 @@ static void __init setup_zero_pages(void)
+ 		break;
+ 	case 0x2827:	/* zEC12 */
+ 	case 0x2828:	/* zEC12 */
+-	default:
+ 		order = 5;
+ 		break;
++	case 0x2964:	/* z13 */
++	default:
++		order = 7;
++		break;
+ 	}
+ 	/* Limit number of empty zero pages for small memory sizes */
+-	if (order > 2 && totalram_pages <= 16384)
+-		order = 2;
++	while (order > 2 && (totalram_pages >> 10) < (1UL << order))
++		order--;
+ 
+ 	empty_zero_page = __get_free_pages(GFP_KERNEL | __GFP_ZERO, order);
+ 	if (!empty_zero_page)
+diff --git a/arch/s390/mm/mmap.c b/arch/s390/mm/mmap.c
+index 20b806b01c9d..7b4365bc83e6 100644
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@ -28,8 +28,12 @@
+ #include <linux/module.h>
+ #include <linux/random.h>
+ #include <linux/compat.h>
++#include <linux/security.h>
+ #include <asm/pgalloc.h>
+ 
++unsigned long mmap_rnd_mask;
++unsigned long mmap_align_mask;
++
+ static unsigned long stack_maxrandom_size(void)
+ {
+ 	if (!(current->flags & PF_RANDOMIZE))
+@@ -60,8 +64,10 @@ static unsigned long mmap_rnd(void)
+ {
+ 	if (!(current->flags & PF_RANDOMIZE))
+ 		return 0;
+-	/* 8MB randomization for mmap_base */
+-	return (get_random_int() & 0x7ffUL) << PAGE_SHIFT;
++	if (is_32bit_task())
++		return (get_random_int() & 0x7ff) << PAGE_SHIFT;
++	else
++		return (get_random_int() & mmap_rnd_mask) << PAGE_SHIFT;
+ }
+ 
+ static inline unsigned long mmap_base(void)
+@@ -76,6 +82,106 @@ static inline unsigned long mmap_base(void)
+ 	return STACK_TOP - stack_maxrandom_size() - mmap_rnd() - gap;
+ }
+ 
++unsigned long
++arch_get_unmapped_area(struct file *filp, unsigned long addr,
++		unsigned long len, unsigned long pgoff, unsigned long flags)
++{
++	struct mm_struct *mm = current->mm;
++	struct vm_area_struct *vma;
++	struct vm_unmapped_area_info info;
++	int do_color_align;
++
++	if (len > TASK_SIZE - mmap_min_addr)
++		return -ENOMEM;
++
++	if (flags & MAP_FIXED)
++		return addr;
++
++	if (addr) {
++		addr = PAGE_ALIGN(addr);
++		vma = find_vma(mm, addr);
++		if (TASK_SIZE - len >= addr && addr >= mmap_min_addr &&
++		    (!vma || addr + len <= vma->vm_start))
++			return addr;
++	}
++
++	do_color_align = 0;
++	if (filp || (flags & MAP_SHARED))
++		do_color_align = !is_32bit_task();
++
++	info.flags = 0;
++	info.length = len;
++	info.low_limit = mm->mmap_base;
++	info.high_limit = TASK_SIZE;
++	info.align_mask = do_color_align ? (mmap_align_mask << PAGE_SHIFT) : 0;
++	info.align_offset = pgoff << PAGE_SHIFT;
++	return vm_unmapped_area(&info);
++}
++
++unsigned long
++arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
++			  const unsigned long len, const unsigned long pgoff,
++			  const unsigned long flags)
++{
++	struct vm_area_struct *vma;
++	struct mm_struct *mm = current->mm;
++	unsigned long addr = addr0;
++	struct vm_unmapped_area_info info;
++	int do_color_align;
++
++	/* requested length too big for entire address space */
++	if (len > TASK_SIZE - mmap_min_addr)
++		return -ENOMEM;
++
++	if (flags & MAP_FIXED)
++		return addr;
++
++	/* requesting a specific address */
++	if (addr) {
++		addr = PAGE_ALIGN(addr);
++		vma = find_vma(mm, addr);
++		if (TASK_SIZE - len >= addr && addr >= mmap_min_addr &&
++				(!vma || addr + len <= vma->vm_start))
++			return addr;
++	}
++
++	do_color_align = 0;
++	if (filp || (flags & MAP_SHARED))
++		do_color_align = !is_32bit_task();
++
++	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
++	info.length = len;
++	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.high_limit = mm->mmap_base;
++	info.align_mask = do_color_align ? (mmap_align_mask << PAGE_SHIFT) : 0;
++	info.align_offset = pgoff << PAGE_SHIFT;
++	addr = vm_unmapped_area(&info);
++
++	/*
++	 * A failed mmap() very likely causes application failure,
++	 * so fall back to the bottom-up function here. This scenario
++	 * can happen with large stack limits and large mmap()
++	 * allocations.
++	 */
++	if (addr & ~PAGE_MASK) {
++		VM_BUG_ON(addr != -ENOMEM);
++		info.flags = 0;
++		info.low_limit = TASK_UNMAPPED_BASE;
++		info.high_limit = TASK_SIZE;
++		addr = vm_unmapped_area(&info);
++	}
++
++	return addr;
++}
++
++unsigned long randomize_et_dyn(void)
++{
++	unsigned long base;
++
++	base = (STACK_TOP / 3 * 2) & (~mmap_align_mask << PAGE_SHIFT);
++	return base + mmap_rnd();
++}
++
+ #ifndef CONFIG_64BIT
+ 
+ /*
+@@ -176,4 +282,36 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
+ 	}
+ }
+ 
++static int __init setup_mmap_rnd(void)
++{
++	struct cpuid cpu_id;
++
++	get_cpu_id(&cpu_id);
++	switch (cpu_id.machine) {
++	case 0x9672:
++	case 0x2064:
++	case 0x2066:
++	case 0x2084:
++	case 0x2086:
++	case 0x2094:
++	case 0x2096:
++	case 0x2097:
++	case 0x2098:
++	case 0x2817:
++	case 0x2818:
++	case 0x2827:
++	case 0x2828:
++		mmap_rnd_mask = 0x7ffUL;
++		mmap_align_mask = 0UL;
++		break;
++	case 0x2964:	/* z13 */
++	default:
++		mmap_rnd_mask = 0x3ff80UL;
++		mmap_align_mask = 0x7fUL;
++		break;
++	}
++	return 0;
++}
++early_initcall(setup_mmap_rnd);
++
+ #endif
