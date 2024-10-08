@@ -1,0 +1,196 @@
+x86/PCI/ACPI: Use common ACPI resource interfaces to simplify implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] pci/acpi: Use common ACPI resource interfaces to simplify implementation (Myron Stowe) [1344513]
+Rebuild_FUZZ: 97.30%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 593669c2ac0fe18baee04a3cd5539a148aa48574
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/593669c2.failed
+
+Use common ACPI resource discovery interfaces to simplify PCI host bridge
+resource enumeration.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 593669c2ac0fe18baee04a3cd5539a148aa48574)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/pci/acpi.c
+diff --cc arch/x86/pci/acpi.c
+index d1d7ec7f7759,6ac273832f28..000000000000
+--- a/arch/x86/pci/acpi.c
++++ b/arch/x86/pci/acpi.c
+@@@ -231,132 -215,41 +228,153 @@@ static void teardown_mcfg_map(struct pc
+  }
+  #endif
+  
+- static acpi_status resource_to_addr(struct acpi_resource *resource,
+- 				    struct acpi_resource_address64 *addr)
++ static void validate_resources(struct device *dev, struct list_head *crs_res,
++ 			       unsigned long type)
+  {
+- 	acpi_status status;
+- 	struct acpi_resource_memory24 *memory24;
+- 	struct acpi_resource_memory32 *memory32;
+- 	struct acpi_resource_fixed_memory32 *fixed_memory32;
++ 	LIST_HEAD(list);
++ 	struct resource *res1, *res2, *root = NULL;
++ 	struct resource_entry *tmp, *entry, *entry2;
+  
+++<<<<<<< HEAD
+ +	memset(addr, 0, sizeof(*addr));
+ +	switch (resource->type) {
+ +	case ACPI_RESOURCE_TYPE_MEMORY24:
+ +		memory24 = &resource->data.memory24;
+ +		addr->resource_type = ACPI_MEMORY_RANGE;
+ +		addr->minimum = memory24->minimum;
+ +		addr->address_length = memory24->address_length;
+ +		addr->maximum = addr->minimum + addr->address_length - 1;
+ +		return AE_OK;
+ +	case ACPI_RESOURCE_TYPE_MEMORY32:
+ +		memory32 = &resource->data.memory32;
+ +		addr->resource_type = ACPI_MEMORY_RANGE;
+ +		addr->minimum = memory32->minimum;
+ +		addr->address_length = memory32->address_length;
+ +		addr->maximum = addr->minimum + addr->address_length - 1;
+ +		return AE_OK;
+ +	case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
+ +		fixed_memory32 = &resource->data.fixed_memory32;
+ +		addr->resource_type = ACPI_MEMORY_RANGE;
+ +		addr->minimum = fixed_memory32->address;
+ +		addr->address_length = fixed_memory32->address_length;
+ +		addr->maximum = addr->minimum + addr->address_length - 1;
+ +		return AE_OK;
+ +	case ACPI_RESOURCE_TYPE_ADDRESS16:
+ +	case ACPI_RESOURCE_TYPE_ADDRESS32:
+ +	case ACPI_RESOURCE_TYPE_ADDRESS64:
+ +		status = acpi_resource_to_address64(resource, addr);
+ +		if (ACPI_SUCCESS(status) &&
+ +		    (addr->resource_type == ACPI_MEMORY_RANGE ||
+ +		    addr->resource_type == ACPI_IO_RANGE) &&
+ +		    addr->address_length > 0) {
+ +			return AE_OK;
+ +		}
+ +		break;
+ +	}
+ +	return AE_ERROR;
+ +}
+++=======
++ 	BUG_ON((type & (IORESOURCE_MEM | IORESOURCE_IO)) == 0);
++ 	root = (type & IORESOURCE_MEM) ? &iomem_resource : &ioport_resource;
+++>>>>>>> 593669c2ac0f (x86/PCI/ACPI: Use common ACPI resource interfaces to simplify implementation)
+  
+- static acpi_status count_resource(struct acpi_resource *acpi_res, void *data)
+- {
+- 	struct pci_root_info *info = data;
+- 	struct acpi_resource_address64 addr;
+- 	acpi_status status;
++ 	list_splice_init(crs_res, &list);
++ 	resource_list_for_each_entry_safe(entry, tmp, &list) {
++ 		bool free = false;
++ 		resource_size_t end;
+  
+++<<<<<<< HEAD
+ +	status = resource_to_addr(acpi_res, &addr);
+ +	if (ACPI_SUCCESS(status))
+ +		info->res_num++;
+ +	return AE_OK;
+ +}
+ +
+ +static acpi_status setup_resource(struct acpi_resource *acpi_res, void *data)
+ +{
+ +	struct pci_root_info *info = data;
+ +	struct resource *res;
+ +	struct acpi_resource_address64 addr;
+ +	acpi_status status;
+ +	unsigned long flags;
+ +	u64 start, orig_end, end, res_end;
+ +
+ +	status = resource_to_addr(acpi_res, &addr);
+ +	if (!ACPI_SUCCESS(status))
+ +		return AE_OK;
+ +
+ +	if (addr.resource_type == ACPI_MEMORY_RANGE) {
+ +		flags = IORESOURCE_MEM;
+ +		if (addr.info.mem.caching == ACPI_PREFETCHABLE_MEMORY)
+ +			flags |= IORESOURCE_PREFETCH;
+ +		res_end = (u64)iomem_resource.end;
+ +	} else if (addr.resource_type == ACPI_IO_RANGE) {
+ +		flags = IORESOURCE_IO;
+ +		res_end = (u64)ioport_resource.end;
+ +	} else
+ +		return AE_OK;
+ +
+ +	start = addr.minimum + addr.translation_offset;
+ +	orig_end = end = addr.maximum + addr.translation_offset;
+ +
+ +	/* Exclude non-addressable range or non-addressable portion of range */
+ +	end = min(end, res_end);
+ +	if (end <= start) {
+ +		dev_info(&info->bridge->dev,
+ +			"host bridge window [%#llx-%#llx] "
+ +			"(ignored, not CPU addressable)\n", start, orig_end);
+ +		return AE_OK;
+ +	} else if (orig_end != end) {
+ +		dev_info(&info->bridge->dev,
+ +			"host bridge window [%#llx-%#llx] "
+ +			"([%#llx-%#llx] ignored, not CPU addressable)\n", 
+ +			start, orig_end, end + 1, orig_end);
+ +	}
+ +
+ +	res = &info->res[info->res_num];
+ +	res->name = info->name;
+ +	res->flags = flags;
+ +	res->start = start;
+ +	res->end = end;
+ +	info->res_offset[info->res_num] = addr.translation_offset;
+ +	info->res_num++;
+ +
+ +	if (!pci_use_crs)
+ +		dev_printk(KERN_DEBUG, &info->bridge->dev,
+ +			   "host bridge window %pR (ignored)\n", res);
+ +
+ +	return AE_OK;
+ +}
+ +
+ +static void coalesce_windows(struct pci_root_info *info, unsigned long type)
+ +{
+ +	int i, j;
+ +	struct resource *res1, *res2;
+ +
+ +	for (i = 0; i < info->res_num; i++) {
+ +		res1 = &info->res[i];
+++=======
++ 		res1 = entry->res;
+++>>>>>>> 593669c2ac0f (x86/PCI/ACPI: Use common ACPI resource interfaces to simplify implementation)
+  		if (!(res1->flags & type))
+- 			continue;
++ 			goto next;
++ 
++ 		/* Exclude non-addressable range or non-addressable portion */
++ 		end = min(res1->end, root->end);
++ 		if (end <= res1->start) {
++ 			dev_info(dev, "host bridge window %pR (ignored, not CPU addressable)\n",
++ 				 res1);
++ 			free = true;
++ 			goto next;
++ 		} else if (res1->end != end) {
++ 			dev_info(dev, "host bridge window %pR ([%#llx-%#llx] ignored, not CPU addressable)\n",
++ 				 res1, (unsigned long long)end + 1,
++ 				 (unsigned long long)res1->end);
++ 			res1->end = end;
++ 		}
+  
+- 		for (j = i + 1; j < info->res_num; j++) {
+- 			res2 = &info->res[j];
++ 		resource_list_for_each_entry(entry2, crs_res) {
++ 			res2 = entry2->res;
+  			if (!(res2->flags & type))
+  				continue;
+  
+* Unmerged path arch/x86/pci/acpi.c
