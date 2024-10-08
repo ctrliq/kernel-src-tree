@@ -1,0 +1,403 @@
+ACPI / hotplug / PCI: Do not exectute _PS0 and _PS3 directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Do not exectute _PS0 and _PS3 directly (Myron Stowe) [1114228]
+Rebuild_FUZZ: 91.89%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit bc805a55392a7cb3e9b1251d00449c70e3967fc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/bc805a55.failed
+
+The ACPI-based PCI hotplug (acpiphp) core code need not and really
+should not execute _PS0 and _PS3 directly for devices it handles.
+
+First of all, it is not necessary to put devices into D3 after
+acpi_bus_trim() has walked through them, because
+acpi_device_unregister() invoked by it puts each device into D3cold
+before returning.  Thus after disable_device() the slot should be
+powered down already.
+
+Second, calling _PS0 directly on ACPI device objects may not be
+appropriate, because it may require power resources to be set up in
+a specific way in advance and that must be taken care of by the ACPI
+core.  Thus modify acpiphp_bus_add() to power up the device using
+the appropriate interface after it has run acpi_bus_scan() on its
+handle.
+
+After that, the functions executing _PS0 and _PS3, power_on_slot()
+and power_off_slot(), are not necessary any more, so drop them
+and update the code calling them accordingly.  Also drop the
+function flags related to device power states, since they aren't
+useful any more too.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit bc805a55392a7cb3e9b1251d00449c70e3967fc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index d210006fa4ad,b6691cc8230b..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -221,82 -285,74 +221,86 @@@ register_slot(acpi_handle handle, u32 l
+  	device = (adr >> 16) & 0xffff;
+  	function = adr & 0xffff;
+  
+ -	mutex_lock(&acpiphp_context_lock);
+ -	context = acpiphp_init_context(handle);
+ -	if (!context) {
+ -		mutex_unlock(&acpiphp_context_lock);
+ -		acpi_handle_err(handle, "No hotplug context\n");
+ -		return AE_NOT_EXIST;
+ -	}
+ -	newfunc = &context->func;
+ +	pdev = bridge->pci_dev;
+ +	if (pdev && device_is_managed_by_native_pciehp(pdev))
+ +		return AE_OK;
+ +
+ +	newfunc = kzalloc(sizeof(struct acpiphp_func), GFP_KERNEL);
+ +	if (!newfunc)
+ +		return AE_NO_MEMORY;
+ +
+ +	newfunc->handle = handle;
+  	newfunc->function = function;
+ -	newfunc->parent = bridge;
+ -	mutex_unlock(&acpiphp_context_lock);
+  
+ -	if (acpi_has_method(handle, "_EJ0"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_EJ0", &tmp)))
+  		newfunc->flags = FUNC_HAS_EJ0;
+  
+ -	if (acpi_has_method(handle, "_STA"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_STA", &tmp)))
+  		newfunc->flags |= FUNC_HAS_STA;
+  
+++<<<<<<< HEAD
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS0", &tmp)))
+ +		newfunc->flags |= FUNC_HAS_PS0;
+ +
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS3", &tmp)))
+ +		newfunc->flags |= FUNC_HAS_PS3;
+ +
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_DCK", &tmp)))
+++=======
++ 	if (acpi_has_method(handle, "_DCK"))
+++>>>>>>> bc805a55392a (ACPI / hotplug / PCI: Do not exectute _PS0 and _PS3 directly)
+  		newfunc->flags |= FUNC_HAS_DCK;
+  
+ -	/* search for objects that share the same slot */
+ -	list_for_each_entry(slot, &bridge->slots, node)
+ -		if (slot->device == device)
+ -			goto slot_found;
+ -
+ -	slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ -	if (!slot) {
+ -		status = AE_NO_MEMORY;
+ -		goto err;
+ +	status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ +	if (ACPI_FAILURE(status)) {
+ +		/*
+ +		 * use the count of the number of slots we've found
+ +		 * for the number of the slot
+ +		 */
+ +		sun = bridge->nr_slots+1;
+  	}
+  
+ -	slot->bus = bridge->pci_bus;
+ -	slot->device = device;
+ -	INIT_LIST_HEAD(&slot->funcs);
+ -	mutex_init(&slot->crit_sect);
+ +	/* search for objects that share the same slot */
+ +	list_for_each_entry(slot, &bridge->slots, node)
+ +		if (slot->device == device) {
+ +			if (slot->sun != sun)
+ +				pr_warn("sibling found, but _SUN doesn't match!\n");
+ +			found = 1;
+ +			break;
+ +		}
+  
+ -	mutex_lock(&bridge_mutex);
+ -	list_add_tail(&slot->node, &bridge->slots);
+ -	mutex_unlock(&bridge_mutex);
+ +	if (!found) {
+ +		slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ +		if (!slot) {
+ +			kfree(newfunc);
+ +			return AE_NO_MEMORY;
+ +		}
+  
+ -	/* Register slots for ejectable funtions only. */
+ -	if (acpi_pci_check_ejectable(pbus, handle)  || is_dock_device(handle)) {
+ -		unsigned long long sun;
+ -		int retval;
+ +		slot->bridge = bridge;
+ +		slot->device = device;
+ +		slot->sun = sun;
+ +		INIT_LIST_HEAD(&slot->funcs);
+ +		mutex_init(&slot->crit_sect);
+  
+ +		mutex_lock(&bridge_mutex);
+ +		list_add_tail(&slot->node, &bridge->slots);
+ +		mutex_unlock(&bridge_mutex);
+  		bridge->nr_slots++;
+ -		status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ -		if (ACPI_FAILURE(status))
+ -			sun = bridge->nr_slots;
+  
+ -		dbg("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ -		    sun, pci_domain_nr(pbus), pbus->number, device);
+ -
+ -		retval = acpiphp_register_hotplug_slot(slot, sun);
+ +		pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ +		    slot->sun, pci_domain_nr(pbus), pbus->number, device);
+ +		retval = acpiphp_register_hotplug_slot(slot);
+  		if (retval) {
+ -			bridge->nr_slots--;
+  			if (retval == -EBUSY)
+ -				warn("Slot %llu already registered by another "
+ -					"hotplug driver\n", sun);
+ +				pr_warn("Slot %llu already registered by another "
+ +					"hotplug driver\n", slot->sun);
+  			else
+ -				warn("acpiphp_register_hotplug_slot failed "
+ +				pr_warn("acpiphp_register_hotplug_slot failed "
+  					"(err code = 0x%x)\n", retval);
+ +			goto err_exit;
+  		}
+ -		/* Even if the slot registration fails, we can still use it. */
+  	}
+  
+ - slot_found:
+  	newfunc->slot = slot;
+  	mutex_lock(&bridge_mutex);
+  	list_add_tail(&newfunc->sibling, &slot->funcs);
+@@@ -493,71 -440,6 +497,74 @@@ static void cleanup_bridge(struct acpip
+  	mutex_unlock(&bridge_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +static int power_on_slot(struct acpiphp_slot *slot)
+ +{
+ +	acpi_status status;
+ +	struct acpiphp_func *func;
+ +	int retval = 0;
+ +
+ +	/* if already enabled, just skip */
+ +	if (slot->flags & SLOT_POWEREDON)
+ +		goto err_exit;
+ +
+ +	list_for_each_entry(func, &slot->funcs, sibling) {
+ +		if (func->flags & FUNC_HAS_PS0) {
+ +			pr_debug("%s: executing _PS0\n", __func__);
+ +			status = acpi_evaluate_object(func->handle, "_PS0", NULL, NULL);
+ +			if (ACPI_FAILURE(status)) {
+ +				pr_warn("%s: _PS0 failed\n", __func__);
+ +				retval = -1;
+ +				goto err_exit;
+ +			} else
+ +				break;
+ +		}
+ +	}
+ +
+ +	/* TBD: evaluate _STA to check if the slot is enabled */
+ +
+ +	slot->flags |= SLOT_POWEREDON;
+ +
+ + err_exit:
+ +	return retval;
+ +}
+ +
+ +
+ +static int power_off_slot(struct acpiphp_slot *slot)
+ +{
+ +	acpi_status status;
+ +	struct acpiphp_func *func;
+ +
+ +	int retval = 0;
+ +
+ +	/* if already disabled, just skip */
+ +	if ((slot->flags & SLOT_POWEREDON) == 0)
+ +		goto err_exit;
+ +
+ +	list_for_each_entry(func, &slot->funcs, sibling) {
+ +		if (func->flags & FUNC_HAS_PS3) {
+ +			status = acpi_evaluate_object(func->handle, "_PS3", NULL, NULL);
+ +			if (ACPI_FAILURE(status)) {
+ +				pr_warn("%s: _PS3 failed\n", __func__);
+ +				retval = -1;
+ +				goto err_exit;
+ +			} else
+ +				break;
+ +		}
+ +	}
+ +
+ +	/* TBD: evaluate _STA to check if the slot is disabled */
+ +
+ +	slot->flags &= (~SLOT_POWEREDON);
+ +
+ + err_exit:
+ +	return retval;
+ +}
+ +
+ +
+ +
+++=======
+++>>>>>>> bc805a55392a (ACPI / hotplug / PCI: Do not exectute _PS0 and _PS3 directly)
+  /**
+   * acpiphp_max_busnr - return the highest reserved bus number under the given bus.
+   * @bus: bus to start search with
+@@@ -585,52 -467,32 +592,62 @@@ static unsigned char acpiphp_max_busnr(
+  	return max;
+  }
+  
+ +
+  /**
+ - * acpiphp_bus_trim - Trim device objects in an ACPI namespace subtree.
+ - * @handle: ACPI device object handle to start from.
+ + * acpiphp_bus_add - add a new bus to acpi subsystem
+ + * @func: acpiphp_func of the bridge
+   */
+ -static void acpiphp_bus_trim(acpi_handle handle)
+ +static int acpiphp_bus_add(struct acpiphp_func *func)
+  {
+ -	struct acpi_device *adev = NULL;
+ +	struct acpi_device *device;
+ +	int ret_val;
+  
+ -	acpi_bus_get_device(handle, &adev);
+ -	if (adev)
+ -		acpi_bus_trim(adev);
+ +	if (!acpi_bus_get_device(func->handle, &device)) {
+ +		pr_debug("bus exists... trim\n");
+ +		/* this shouldn't be in here, so remove
+ +		 * the bus then re-add it...
+ +		 */
+ +		acpi_bus_trim(device);
+ +	}
+ +
+ +	ret_val = acpi_bus_scan(func->handle);
+ +	if (!ret_val)
+ +		ret_val = acpi_bus_get_device(func->handle, &device);
+ +
+ +	if (ret_val)
+ +		pr_debug("error adding bus, %x\n", -ret_val);
+ +
+ +	return ret_val;
+  }
+  
+ +
+  /**
+ - * acpiphp_bus_add - Scan ACPI namespace subtree.
+ - * @handle: ACPI object handle to start the scan from.
+ + * acpiphp_bus_trim - trim a bus from acpi subsystem
+ + * @handle: handle to acpi namespace
+   */
+ -static void acpiphp_bus_add(acpi_handle handle)
+ +static int acpiphp_bus_trim(acpi_handle handle)
+  {
+++<<<<<<< HEAD
+ +	struct acpi_device *device;
+ +	int retval;
+ +
+ +	retval = acpi_bus_get_device(handle, &device);
+ +	if (retval) {
+ +		pr_debug("acpi_device not found\n");
+ +		return retval;
+ +	}
+ +
+ +	acpi_bus_trim(device);
+ +	return 0;
+++=======
++ 	struct acpi_device *adev = NULL;
++ 
++ 	acpiphp_bus_trim(handle);
++ 	acpi_bus_scan(handle);
++ 	acpi_bus_get_device(handle, &adev);
++ 	if (adev)
++ 		acpi_device_set_power(adev, ACPI_STATE_D0);
+++>>>>>>> bc805a55392a (ACPI / hotplug / PCI: Do not exectute _PS0 and _PS3 directly)
+  }
+  
+  static void acpiphp_set_acpi_region(struct acpiphp_slot *slot)
+@@@ -1231,23 -1027,8 +1248,28 @@@ int acpiphp_enable_slot(struct acpiphp_
+  	int retval;
+  
+  	mutex_lock(&slot->crit_sect);
+++<<<<<<< HEAD
+ +
+ +	/* wake up all functions */
+ +	retval = power_on_slot(slot);
+ +	if (retval)
+ +		goto err_exit;
+ +
+ +	if (get_slot_status(slot) == ACPI_STA_ALL) {
+ +		/* configure all functions */
+ +		retval = enable_device(slot);
+ +		if (retval)
+ +			power_off_slot(slot);
+ +	} else {
+ +		pr_debug("%s: Slot status is not ACPI_STA_ALL\n", __func__);
+ +		power_off_slot(slot);
+ +	}
+ +
+ + err_exit:
+++=======
++ 	/* configure all functions */
++ 	retval = enable_device(slot);
+++>>>>>>> bc805a55392a (ACPI / hotplug / PCI: Do not exectute _PS0 and _PS3 directly)
+  	mutex_unlock(&slot->crit_sect);
+  	return retval;
+  }
+@@@ -1267,10 -1049,15 +1289,22 @@@ int acpiphp_disable_slot(struct acpiphp
+  	if (retval)
+  		goto err_exit;
+  
+++<<<<<<< HEAD
+ +	/* power off all functions */
+ +	retval = power_off_slot(slot);
+ +	if (retval)
+ +		goto err_exit;
+++=======
++ 	list_for_each_entry(func, &slot->funcs, sibling)
++ 		if (func->flags & FUNC_HAS_EJ0) {
++ 			acpi_handle handle = func_to_handle(func);
++ 
++ 			if (ACPI_FAILURE(acpi_evaluate_ej0(handle)))
++ 				acpi_handle_err(handle, "_EJ0 failed\n");
++ 
++ 			break;
++ 		}
+++>>>>>>> bc805a55392a (ACPI / hotplug / PCI: Do not exectute _PS0 and _PS3 directly)
+  
+   err_exit:
+  	mutex_unlock(&slot->crit_sect);
+diff --git a/drivers/pci/hotplug/acpiphp.h b/drivers/pci/hotplug/acpiphp.h
+index 8d99e4e1e51d..f1e24f88236c 100644
+--- a/drivers/pci/hotplug/acpiphp.h
++++ b/drivers/pci/hotplug/acpiphp.h
+@@ -143,7 +143,6 @@ struct acpiphp_attention_info
+ 
+ /* slot flags */
+ 
+-#define SLOT_POWEREDON		(0x00000001)
+ #define SLOT_ENABLED		(0x00000002)
+ #define SLOT_MULTIFUNCTION	(0x00000004)
+ 
+@@ -151,11 +150,7 @@ struct acpiphp_attention_info
+ 
+ #define FUNC_HAS_STA		(0x00000001)
+ #define FUNC_HAS_EJ0		(0x00000002)
+-#define FUNC_HAS_PS0		(0x00000010)
+-#define FUNC_HAS_PS1		(0x00000020)
+-#define FUNC_HAS_PS2		(0x00000040)
+-#define FUNC_HAS_PS3		(0x00000080)
+-#define FUNC_HAS_DCK            (0x00000100)
++#define FUNC_HAS_DCK            (0x00000004)
+ 
+ /* function prototypes */
+ 
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
