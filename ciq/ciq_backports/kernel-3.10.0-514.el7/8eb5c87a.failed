@@ -1,0 +1,649 @@
+i2c: add ACPI support for I2C mux ports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dustin Byford <dustin@cumulusnetworks.com>
+commit 8eb5c87a92c065aaca39ac3e841b07906a4959a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8eb5c87a.failed
+
+Although I2C mux devices are easily enumerated using ACPI (_HID/_CID or
+device property compatible string match), enumerating I2C client devices
+connected through an I2C mux needs a little extra work.
+
+This change implements a method for describing an I2C device hierarchy that
+includes mux devices by using an ACPI Device() for each mux channel along
+with an _ADR to set the channel number for the device.  See
+Documentation/acpi/i2c-muxes.txt for a simple example.
+
+To make this work the ismt, i801, and designware pci/platform devs now
+share an ACPI companion with their I2C adapter dev similar to how it's done
+in OF.  This is done on the assumption that power management functions will
+not be called directly on the I2C dev that is sharing the ACPI node.
+
+	Acked-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Dustin Byford <dustin@cumulusnetworks.com>
+	Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+(cherry picked from commit 8eb5c87a92c065aaca39ac3e841b07906a4959a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/i2c/busses/i2c-designware-pcidrv.c
+#	drivers/i2c/busses/i2c-designware-platdrv.c
+#	drivers/i2c/busses/i2c-i801.c
+#	drivers/i2c/i2c-core.c
+diff --cc drivers/i2c/busses/i2c-designware-pcidrv.c
+index 76bdc3369a4f,1543d35d228d..000000000000
+--- a/drivers/i2c/busses/i2c-designware-pcidrv.c
++++ b/drivers/i2c/busses/i2c-designware-pcidrv.c
+@@@ -314,7 -241,14 +315,18 @@@ static int i2c_dw_pci_probe(struct pci_
+  
+  	dev->tx_fifo_depth = controller->tx_fifo_depth;
+  	dev->rx_fifo_depth = controller->rx_fifo_depth;
+++<<<<<<< HEAD
+ +	r = i2c_dw_init(dev);
+++=======
++ 
++ 	adap = &dev->adapter;
++ 	adap->owner = THIS_MODULE;
++ 	adap->class = 0;
++ 	ACPI_COMPANION_SET(&adap->dev, ACPI_COMPANION(&pdev->dev));
++ 	adap->nr = controller->bus_num;
++ 
++ 	r = i2c_dw_probe(dev);
+++>>>>>>> 8eb5c87a92c0 (i2c: add ACPI support for I2C mux ports)
+  	if (r)
+  		return r;
+  
+diff --cc drivers/i2c/busses/i2c-designware-platdrv.c
+index 0f48d5184f50,190a0d2b94e7..000000000000
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@@ -181,7 -203,14 +181,18 @@@ static int dw_i2c_probe(struct platform
+  		dev->rx_fifo_depth = ((param1 >> 8)  & 0xff) + 1;
+  		dev->adapter.nr = pdev->id;
+  	}
+++<<<<<<< HEAD
+ +	r = i2c_dw_init(dev);
+++=======
++ 
++ 	adap = &dev->adapter;
++ 	adap->owner = THIS_MODULE;
++ 	adap->class = I2C_CLASS_DEPRECATED;
++ 	ACPI_COMPANION_SET(&adap->dev, ACPI_COMPANION(&pdev->dev));
++ 	adap->dev.of_node = pdev->dev.of_node;
++ 
++ 	r = i2c_dw_probe(dev);
+++>>>>>>> 8eb5c87a92c0 (i2c: add ACPI support for I2C mux ports)
+  	if (r)
+  		return r;
+  
+diff --cc drivers/i2c/busses/i2c-i801.c
+index 425b1bd89d6d,c306751ceadb..000000000000
+--- a/drivers/i2c/busses/i2c-i801.c
++++ b/drivers/i2c/busses/i2c-i801.c
+@@@ -1260,11 -1389,7 +1263,15 @@@ static int i801_probe(struct pci_dev *d
+  	dev_info(&dev->dev, "SMBus using %s\n",
+  		 priv->features & FEATURE_IRQ ? "PCI interrupt" : "polling");
+  
+++<<<<<<< HEAD
+ +	/* set up the sysfs linkage to our parent device */
+ +	priv->adapter.dev.parent = &dev->dev;
+ +
+ +	/* Retry up to 3 times on lost arbitration */
+ +	priv->adapter.retries = 3;
+++=======
++ 	i801_add_tco(priv);
+++>>>>>>> 8eb5c87a92c0 (i2c: add ACPI support for I2C mux ports)
+  
+  	snprintf(priv->adapter.name, sizeof(priv->adapter.name),
+  		"SMBus I801 adapter at %04lx", priv->smba);
+diff --cc drivers/i2c/i2c-core.c
+index a50407dd134d,5897fdb2480d..000000000000
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@@ -57,6 -71,421 +57,424 @@@ static DEFINE_IDR(i2c_adapter_idr)
+  static struct device_type i2c_client_type;
+  static int i2c_detect(struct i2c_adapter *adapter, struct i2c_driver *driver);
+  
+++<<<<<<< HEAD
+++=======
++ static struct static_key i2c_trace_msg = STATIC_KEY_INIT_FALSE;
++ 
++ void i2c_transfer_trace_reg(void)
++ {
++ 	static_key_slow_inc(&i2c_trace_msg);
++ }
++ 
++ void i2c_transfer_trace_unreg(void)
++ {
++ 	static_key_slow_dec(&i2c_trace_msg);
++ }
++ 
++ #if defined(CONFIG_ACPI)
++ struct acpi_i2c_handler_data {
++ 	struct acpi_connection_info info;
++ 	struct i2c_adapter *adapter;
++ };
++ 
++ struct gsb_buffer {
++ 	u8	status;
++ 	u8	len;
++ 	union {
++ 		u16	wdata;
++ 		u8	bdata;
++ 		u8	data[0];
++ 	};
++ } __packed;
++ 
++ struct acpi_i2c_lookup {
++ 	struct i2c_board_info *info;
++ 	acpi_handle adapter_handle;
++ 	acpi_handle device_handle;
++ };
++ 
++ static int acpi_i2c_find_address(struct acpi_resource *ares, void *data)
++ {
++ 	struct acpi_i2c_lookup *lookup = data;
++ 	struct i2c_board_info *info = lookup->info;
++ 	struct acpi_resource_i2c_serialbus *sb;
++ 	acpi_handle adapter_handle;
++ 	acpi_status status;
++ 
++ 	if (info->addr || ares->type != ACPI_RESOURCE_TYPE_SERIAL_BUS)
++ 		return 1;
++ 
++ 	sb = &ares->data.i2c_serial_bus;
++ 	if (sb->type != ACPI_RESOURCE_SERIAL_TYPE_I2C)
++ 		return 1;
++ 
++ 	/*
++ 	 * Extract the ResourceSource and make sure that the handle matches
++ 	 * with the I2C adapter handle.
++ 	 */
++ 	status = acpi_get_handle(lookup->device_handle,
++ 				 sb->resource_source.string_ptr,
++ 				 &adapter_handle);
++ 	if (ACPI_SUCCESS(status) && adapter_handle == lookup->adapter_handle) {
++ 		info->addr = sb->slave_address;
++ 		if (sb->access_mode == ACPI_I2C_10BIT_MODE)
++ 			info->flags |= I2C_CLIENT_TEN;
++ 	}
++ 
++ 	return 1;
++ }
++ 
++ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
++ 				       void *data, void **return_value)
++ {
++ 	struct i2c_adapter *adapter = data;
++ 	struct list_head resource_list;
++ 	struct acpi_i2c_lookup lookup;
++ 	struct resource_entry *entry;
++ 	struct i2c_board_info info;
++ 	struct acpi_device *adev;
++ 	int ret;
++ 
++ 	if (acpi_bus_get_device(handle, &adev))
++ 		return AE_OK;
++ 	if (acpi_bus_get_status(adev) || !adev->status.present)
++ 		return AE_OK;
++ 
++ 	memset(&info, 0, sizeof(info));
++ 	info.fwnode = acpi_fwnode_handle(adev);
++ 
++ 	memset(&lookup, 0, sizeof(lookup));
++ 	lookup.adapter_handle = ACPI_HANDLE(&adapter->dev);
++ 	lookup.device_handle = handle;
++ 	lookup.info = &info;
++ 
++ 	/*
++ 	 * Look up for I2cSerialBus resource with ResourceSource that
++ 	 * matches with this adapter.
++ 	 */
++ 	INIT_LIST_HEAD(&resource_list);
++ 	ret = acpi_dev_get_resources(adev, &resource_list,
++ 				     acpi_i2c_find_address, &lookup);
++ 	acpi_dev_free_resource_list(&resource_list);
++ 
++ 	if (ret < 0 || !info.addr)
++ 		return AE_OK;
++ 
++ 	/* Then fill IRQ number if any */
++ 	ret = acpi_dev_get_resources(adev, &resource_list, NULL, NULL);
++ 	if (ret < 0)
++ 		return AE_OK;
++ 
++ 	resource_list_for_each_entry(entry, &resource_list) {
++ 		if (resource_type(entry->res) == IORESOURCE_IRQ) {
++ 			info.irq = entry->res->start;
++ 			break;
++ 		}
++ 	}
++ 
++ 	acpi_dev_free_resource_list(&resource_list);
++ 
++ 	adev->power.flags.ignore_parent = true;
++ 	strlcpy(info.type, dev_name(&adev->dev), sizeof(info.type));
++ 	if (!i2c_new_device(adapter, &info)) {
++ 		adev->power.flags.ignore_parent = false;
++ 		dev_err(&adapter->dev,
++ 			"failed to add I2C device %s from ACPI\n",
++ 			dev_name(&adev->dev));
++ 	}
++ 
++ 	return AE_OK;
++ }
++ 
++ #define ACPI_I2C_MAX_SCAN_DEPTH 32
++ 
++ /**
++  * acpi_i2c_register_devices - enumerate I2C slave devices behind adapter
++  * @adap: pointer to adapter
++  *
++  * Enumerate all I2C slave devices behind this adapter by walking the ACPI
++  * namespace. When a device is found it will be added to the Linux device
++  * model and bound to the corresponding ACPI handle.
++  */
++ static void acpi_i2c_register_devices(struct i2c_adapter *adap)
++ {
++ 	acpi_status status;
++ 
++ 	if (!has_acpi_companion(&adap->dev))
++ 		return;
++ 
++ 	status = acpi_walk_namespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT,
++ 				     ACPI_I2C_MAX_SCAN_DEPTH,
++ 				     acpi_i2c_add_device, NULL,
++ 				     adap, NULL);
++ 	if (ACPI_FAILURE(status))
++ 		dev_warn(&adap->dev, "failed to enumerate I2C slaves\n");
++ }
++ 
++ #else /* CONFIG_ACPI */
++ static inline void acpi_i2c_register_devices(struct i2c_adapter *adap) { }
++ #endif /* CONFIG_ACPI */
++ 
++ #ifdef CONFIG_ACPI_I2C_OPREGION
++ static int acpi_gsb_i2c_read_bytes(struct i2c_client *client,
++ 		u8 cmd, u8 *data, u8 data_len)
++ {
++ 
++ 	struct i2c_msg msgs[2];
++ 	int ret;
++ 	u8 *buffer;
++ 
++ 	buffer = kzalloc(data_len, GFP_KERNEL);
++ 	if (!buffer)
++ 		return AE_NO_MEMORY;
++ 
++ 	msgs[0].addr = client->addr;
++ 	msgs[0].flags = client->flags;
++ 	msgs[0].len = 1;
++ 	msgs[0].buf = &cmd;
++ 
++ 	msgs[1].addr = client->addr;
++ 	msgs[1].flags = client->flags | I2C_M_RD;
++ 	msgs[1].len = data_len;
++ 	msgs[1].buf = buffer;
++ 
++ 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++ 	if (ret < 0)
++ 		dev_err(&client->adapter->dev, "i2c read failed\n");
++ 	else
++ 		memcpy(data, buffer, data_len);
++ 
++ 	kfree(buffer);
++ 	return ret;
++ }
++ 
++ static int acpi_gsb_i2c_write_bytes(struct i2c_client *client,
++ 		u8 cmd, u8 *data, u8 data_len)
++ {
++ 
++ 	struct i2c_msg msgs[1];
++ 	u8 *buffer;
++ 	int ret = AE_OK;
++ 
++ 	buffer = kzalloc(data_len + 1, GFP_KERNEL);
++ 	if (!buffer)
++ 		return AE_NO_MEMORY;
++ 
++ 	buffer[0] = cmd;
++ 	memcpy(buffer + 1, data, data_len);
++ 
++ 	msgs[0].addr = client->addr;
++ 	msgs[0].flags = client->flags;
++ 	msgs[0].len = data_len + 1;
++ 	msgs[0].buf = buffer;
++ 
++ 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++ 	if (ret < 0)
++ 		dev_err(&client->adapter->dev, "i2c write failed\n");
++ 
++ 	kfree(buffer);
++ 	return ret;
++ }
++ 
++ static acpi_status
++ acpi_i2c_space_handler(u32 function, acpi_physical_address command,
++ 			u32 bits, u64 *value64,
++ 			void *handler_context, void *region_context)
++ {
++ 	struct gsb_buffer *gsb = (struct gsb_buffer *)value64;
++ 	struct acpi_i2c_handler_data *data = handler_context;
++ 	struct acpi_connection_info *info = &data->info;
++ 	struct acpi_resource_i2c_serialbus *sb;
++ 	struct i2c_adapter *adapter = data->adapter;
++ 	struct i2c_client *client;
++ 	struct acpi_resource *ares;
++ 	u32 accessor_type = function >> 16;
++ 	u8 action = function & ACPI_IO_MASK;
++ 	acpi_status ret;
++ 	int status;
++ 
++ 	ret = acpi_buffer_to_resource(info->connection, info->length, &ares);
++ 	if (ACPI_FAILURE(ret))
++ 		return ret;
++ 
++ 	client = kzalloc(sizeof(*client), GFP_KERNEL);
++ 	if (!client) {
++ 		ret = AE_NO_MEMORY;
++ 		goto err;
++ 	}
++ 
++ 	if (!value64 || ares->type != ACPI_RESOURCE_TYPE_SERIAL_BUS) {
++ 		ret = AE_BAD_PARAMETER;
++ 		goto err;
++ 	}
++ 
++ 	sb = &ares->data.i2c_serial_bus;
++ 	if (sb->type != ACPI_RESOURCE_SERIAL_TYPE_I2C) {
++ 		ret = AE_BAD_PARAMETER;
++ 		goto err;
++ 	}
++ 
++ 	client->adapter = adapter;
++ 	client->addr = sb->slave_address;
++ 
++ 	if (sb->access_mode == ACPI_I2C_10BIT_MODE)
++ 		client->flags |= I2C_CLIENT_TEN;
++ 
++ 	switch (accessor_type) {
++ 	case ACPI_GSB_ACCESS_ATTRIB_SEND_RCV:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_byte(client);
++ 			if (status >= 0) {
++ 				gsb->bdata = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_byte(client, gsb->bdata);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_BYTE:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_byte_data(client, command);
++ 			if (status >= 0) {
++ 				gsb->bdata = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_byte_data(client, command,
++ 					gsb->bdata);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_WORD:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_word_data(client, command);
++ 			if (status >= 0) {
++ 				gsb->wdata = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_word_data(client, command,
++ 					gsb->wdata);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_BLOCK:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_block_data(client, command,
++ 					gsb->data);
++ 			if (status >= 0) {
++ 				gsb->len = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_block_data(client, command,
++ 					gsb->len, gsb->data);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_MULTIBYTE:
++ 		if (action == ACPI_READ) {
++ 			status = acpi_gsb_i2c_read_bytes(client, command,
++ 					gsb->data, info->access_length);
++ 			if (status > 0)
++ 				status = 0;
++ 		} else {
++ 			status = acpi_gsb_i2c_write_bytes(client, command,
++ 					gsb->data, info->access_length);
++ 		}
++ 		break;
++ 
++ 	default:
++ 		pr_info("protocol(0x%02x) is not supported.\n", accessor_type);
++ 		ret = AE_BAD_PARAMETER;
++ 		goto err;
++ 	}
++ 
++ 	gsb->status = status;
++ 
++  err:
++ 	kfree(client);
++ 	ACPI_FREE(ares);
++ 	return ret;
++ }
++ 
++ 
++ static int acpi_i2c_install_space_handler(struct i2c_adapter *adapter)
++ {
++ 	acpi_handle handle;
++ 	struct acpi_i2c_handler_data *data;
++ 	acpi_status status;
++ 
++ 	if (!adapter->dev.parent)
++ 		return -ENODEV;
++ 
++ 	handle = ACPI_HANDLE(adapter->dev.parent);
++ 
++ 	if (!handle)
++ 		return -ENODEV;
++ 
++ 	data = kzalloc(sizeof(struct acpi_i2c_handler_data),
++ 			    GFP_KERNEL);
++ 	if (!data)
++ 		return -ENOMEM;
++ 
++ 	data->adapter = adapter;
++ 	status = acpi_bus_attach_private_data(handle, (void *)data);
++ 	if (ACPI_FAILURE(status)) {
++ 		kfree(data);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	status = acpi_install_address_space_handler(handle,
++ 				ACPI_ADR_SPACE_GSBUS,
++ 				&acpi_i2c_space_handler,
++ 				NULL,
++ 				data);
++ 	if (ACPI_FAILURE(status)) {
++ 		dev_err(&adapter->dev, "Error installing i2c space handler\n");
++ 		acpi_bus_detach_private_data(handle);
++ 		kfree(data);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	acpi_walk_dep_device_list(handle);
++ 	return 0;
++ }
++ 
++ static void acpi_i2c_remove_space_handler(struct i2c_adapter *adapter)
++ {
++ 	acpi_handle handle;
++ 	struct acpi_i2c_handler_data *data;
++ 	acpi_status status;
++ 
++ 	if (!adapter->dev.parent)
++ 		return;
++ 
++ 	handle = ACPI_HANDLE(adapter->dev.parent);
++ 
++ 	if (!handle)
++ 		return;
++ 
++ 	acpi_remove_address_space_handler(handle,
++ 				ACPI_ADR_SPACE_GSBUS,
++ 				&acpi_i2c_space_handler);
++ 
++ 	status = acpi_bus_get_private_data(handle, (void **)&data);
++ 	if (ACPI_SUCCESS(status))
++ 		kfree(data);
++ 
++ 	acpi_bus_detach_private_data(handle);
++ }
++ #else /* CONFIG_ACPI_I2C_OPREGION */
++ static inline void acpi_i2c_remove_space_handler(struct i2c_adapter *adapter)
++ { }
++ 
++ static inline int acpi_i2c_install_space_handler(struct i2c_adapter *adapter)
++ { return 0; }
++ #endif /* CONFIG_ACPI_I2C_OPREGION */
++ 
+++>>>>>>> 8eb5c87a92c0 (i2c: add ACPI support for I2C mux ports)
+  /* ------------------------------------------------------------------------- */
+  
+  static const struct i2c_device_id *i2c_match_id(const struct i2c_device_id *id,
+diff --git a/Documentation/acpi/i2c-muxes.txt b/Documentation/acpi/i2c-muxes.txt
+new file mode 100644
+index 000000000000..9fcc4f0b885e
+--- /dev/null
++++ b/Documentation/acpi/i2c-muxes.txt
+@@ -0,0 +1,58 @@
++ACPI I2C Muxes
++--------------
++
++Describing an I2C device hierarchy that includes I2C muxes requires an ACPI
++Device () scope per mux channel.
++
++Consider this topology:
++
+++------+   +------+
++| SMB1 |-->| MUX0 |--CH00--> i2c client A (0x50)
++|      |   | 0x70 |--CH01--> i2c client B (0x50)
+++------+   +------+
++
++which corresponds to the following ASL:
++
++Device (SMB1)
++{
++    Name (_HID, ...)
++    Device (MUX0)
++    {
++        Name (_HID, ...)
++        Name (_CRS, ResourceTemplate () {
++            I2cSerialBus (0x70, ControllerInitiated, I2C_SPEED,
++                          AddressingMode7Bit, "^SMB1", 0x00,
++                          ResourceConsumer,,)
++        }
++
++        Device (CH00)
++        {
++            Name (_ADR, 0)
++
++            Device (CLIA)
++            {
++                Name (_HID, ...)
++                Name (_CRS, ResourceTemplate () {
++                    I2cSerialBus (0x50, ControllerInitiated, I2C_SPEED,
++                                  AddressingMode7Bit, "^CH00", 0x00,
++                                  ResourceConsumer,,)
++                }
++            }
++        }
++
++        Device (CH01)
++        {
++            Name (_ADR, 1)
++
++            Device (CLIB)
++            {
++                Name (_HID, ...)
++                Name (_CRS, ResourceTemplate () {
++                    I2cSerialBus (0x50, ControllerInitiated, I2C_SPEED,
++                                  AddressingMode7Bit, "^CH01", 0x00,
++                                  ResourceConsumer,,)
++                }
++            }
++        }
++    }
++}
+* Unmerged path drivers/i2c/busses/i2c-designware-pcidrv.c
+* Unmerged path drivers/i2c/busses/i2c-designware-platdrv.c
+* Unmerged path drivers/i2c/busses/i2c-i801.c
+diff --git a/drivers/i2c/busses/i2c-ismt.c b/drivers/i2c/busses/i2c-ismt.c
+index 552aef04d362..f1ab885c091d 100644
+--- a/drivers/i2c/busses/i2c-ismt.c
++++ b/drivers/i2c/busses/i2c-ismt.c
+@@ -849,17 +849,13 @@ ismt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		return -ENOMEM;
+ 
+ 	pci_set_drvdata(pdev, priv);
++
+ 	i2c_set_adapdata(&priv->adapter, priv);
+ 	priv->adapter.owner = THIS_MODULE;
+-
+ 	priv->adapter.class = I2C_CLASS_HWMON;
+-
+ 	priv->adapter.algo = &smbus_algorithm;
+-
+-	/* set up the sysfs linkage to our parent device */
+ 	priv->adapter.dev.parent = &pdev->dev;
+-
+-	/* number of retries on lost arbitration */
++	ACPI_COMPANION_SET(&priv->adapter.dev, ACPI_COMPANION(&pdev->dev));
+ 	priv->adapter.retries = ISMT_MAX_RETRIES;
+ 
+ 	priv->pci_dev = pdev;
+* Unmerged path drivers/i2c/i2c-core.c
+diff --git a/drivers/i2c/i2c-mux.c b/drivers/i2c/i2c-mux.c
+index 797e3117bef7..0fd365391fd2 100644
+--- a/drivers/i2c/i2c-mux.c
++++ b/drivers/i2c/i2c-mux.c
+@@ -25,6 +25,7 @@
+ #include <linux/i2c.h>
+ #include <linux/i2c-mux.h>
+ #include <linux/of.h>
++#include <linux/acpi.h>
+ 
+ /* multiplexer per channel data */
+ struct i2c_mux_priv {
+@@ -167,6 +168,13 @@ struct i2c_adapter *i2c_add_mux_adapter(struct i2c_adapter *parent,
+ 		}
+ 	}
+ 
++	/*
++	 * Associate the mux channel with an ACPI node.
++	 */
++	if (has_acpi_companion(mux_dev))
++		acpi_preset_companion(&priv->adap.dev, ACPI_COMPANION(mux_dev),
++				      chan_id);
++
+ 	if (force_nr) {
+ 		priv->adap.nr = force_nr;
+ 		ret = i2c_add_numbered_adapter(&priv->adap);
