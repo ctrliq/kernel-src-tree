@@ -1,0 +1,147 @@
+powerpc/powernv: Enable M64 aperatus for PHB3
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Enable M64 aperatus for PHB3 (Steve Best) [1211946]
+Rebuild_FUZZ: 90.24%
+commit-author Guo Chao <yan@linux.vnet.ibm.com>
+commit 262af557dd750e94adcee3f450782c743f9a92d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/262af557.failed
+
+This patch enables M64 aperatus for PHB3.
+
+We already had platform hook (ppc_md.pcibios_window_alignment) to affect
+the PCI resource assignment done in PCI core so that each PE's M32 resource
+was built on basis of M32 segment size. Similarly, we're using that for
+M64 assignment on basis of M64 segment size.
+
+   * We're using last M64 BAR to cover M64 aperatus, and it's shared by all
+     256 PEs.
+   * We don't support P7IOC yet. However, some function callbacks are added
+     to (struct pnv_phb) so that we can reuse them on P7IOC in future.
+   * PE, corresponding to PCI bus with large M64 BAR device attached, might
+     span multiple M64 segments. We introduce "compound" PE to cover the case.
+     The compound PE is a list of PEs and the master PE is used as before.
+     The slave PEs are just for MMIO isolation.
+
+	Signed-off-by: Guo Chao <yan@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 262af557dd750e94adcee3f450782c743f9a92d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index 37f50fc823a8,899fe4049b44..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -72,6 -73,22 +73,25 @@@ define_pe_printk_level(pe_err, KERN_ERR
+  define_pe_printk_level(pe_warn, KERN_WARNING);
+  define_pe_printk_level(pe_info, KERN_INFO);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * stdcix is only supposed to be used in hypervisor real mode as per
++  * the architecture spec
++  */
++ static inline void __raw_rm_writeq(u64 val, volatile void __iomem *paddr)
++ {
++ 	__asm__ __volatile__("stdcix %0,0,%1"
++ 		: : "r" (val), "r" (paddr) : "memory");
++ }
++ 
++ static inline bool pnv_pci_is_mem_pref_64(unsigned long flags)
++ {
++ 	return ((flags & (IORESOURCE_MEM_64 | IORESOURCE_PREFETCH)) ==
++ 		(IORESOURCE_MEM_64 | IORESOURCE_PREFETCH));
++ }
++ 
+++>>>>>>> 262af557dd75 (powerpc/powernv: Enable M64 aperatus for PHB3)
+  static int pnv_ioda_alloc_pe(struct pnv_phb *phb)
+  {
+  	unsigned long pe;
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 3fde32bb59d1..d57c814c9afa 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -342,6 +342,12 @@ enum OpalMveEnableAction {
+ 	OPAL_ENABLE_MVE = 1
+ };
+ 
++enum OpalM64EnableAction {
++	OPAL_DISABLE_M64 = 0,
++	OPAL_ENABLE_M64_SPLIT = 1,
++	OPAL_ENABLE_M64_NON_SPLIT = 2
++};
++
+ enum OpalPciResetScope {
+ 	OPAL_PHB_COMPLETE = 1, OPAL_PCI_LINK = 2, OPAL_PHB_ERROR = 3,
+ 	OPAL_PCI_HOT_RESET = 4, OPAL_PCI_FUNDAMENTAL_RESET = 5,
+@@ -770,7 +776,7 @@ int64_t opal_pci_set_phb_mem_window(uint64_t phb_id, uint16_t window_type,
+ 				    uint16_t window_num,
+ 				    uint64_t starting_real_address,
+ 				    uint64_t starting_pci_address,
+-				    uint16_t segment_size);
++				    uint64_t size);
+ int64_t opal_pci_map_pe_mmio_window(uint64_t phb_id, uint16_t pe_number,
+ 				    uint16_t window_type, uint16_t window_num,
+ 				    uint16_t segment_num);
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
+diff --git a/arch/powerpc/platforms/powernv/pci.h b/arch/powerpc/platforms/powernv/pci.h
+index b8e57c241bf0..15212d05f128 100644
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@ -21,6 +21,8 @@ enum pnv_phb_model {
+ #define PNV_IODA_PE_DEV		(1 << 0)	/* PE has single PCI device	*/
+ #define PNV_IODA_PE_BUS		(1 << 1)	/* PE has primary PCI bus	*/
+ #define PNV_IODA_PE_BUS_ALL	(1 << 2)	/* PE has subordinate buses	*/
++#define PNV_IODA_PE_MASTER	(1 << 3)	/* Master PE in compound case	*/
++#define PNV_IODA_PE_SLAVE	(1 << 4)	/* Slave PE in compound case	*/
+ 
+ /* Data associated with a PE, including IOMMU tracking etc.. */
+ struct pnv_phb;
+@@ -63,6 +65,10 @@ struct pnv_ioda_pe {
+ 	 */
+ 	int			mve_number;
+ 
++	/* PEs in compound case */
++	struct pnv_ioda_pe	*master;
++	struct list_head	slaves;
++
+ 	/* Link in list of PE#s */
+ 	struct list_head	dma_link;
+ 	struct list_head	list;
+@@ -118,6 +124,9 @@ struct pnv_phb {
+ 	void (*fixup_phb)(struct pci_controller *hose);
+ 	u32 (*bdfn_to_pe)(struct pnv_phb *phb, struct pci_bus *bus, u32 devfn);
+ 	void (*shutdown)(struct pnv_phb *phb);
++	int (*init_m64)(struct pnv_phb *phb);
++	void (*alloc_m64_pe)(struct pnv_phb *phb);
++	int (*pick_m64_pe)(struct pnv_phb *phb, struct pci_bus *bus, int all);
+ 
+ 	union {
+ 		struct {
+@@ -128,9 +137,20 @@ struct pnv_phb {
+ 			/* Global bridge info */
+ 			unsigned int		total_pe;
+ 			unsigned int		reserved_pe;
++
++			/* 32-bit MMIO window */
+ 			unsigned int		m32_size;
+ 			unsigned int		m32_segsize;
+ 			unsigned int		m32_pci_base;
++
++			/* 64-bit MMIO window */
++			unsigned int		m64_bar_idx;
++			unsigned long		m64_size;
++			unsigned long		m64_segsize;
++			unsigned long		m64_base;
++			unsigned long		m64_bar_alloc;
++
++			/* IO ports */
+ 			unsigned int		io_size;
+ 			unsigned int		io_segsize;
+ 			unsigned int		io_pci_base;
