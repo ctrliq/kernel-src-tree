@@ -220,8 +220,6 @@ extern struct kmem_cache *sctp_bucket_cachep __read_mostly;
 #define sctp_read_unlock(lock)  read_unlock(lock)
 
 /* sock lock wrappers. */
-#define sctp_lock_sock(sk)       lock_sock(sk)
-#define sctp_release_sock(sk)    release_sock(sk)
 #define sctp_bh_lock_sock(sk)    bh_lock_sock(sk)
 #define sctp_bh_unlock_sock(sk)  bh_unlock_sock(sk)
 
