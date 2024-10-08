@@ -1,0 +1,193 @@
+xfs: DIO write completion size updates race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit b9d59846f73713d77f0f3fb784c7f84249fc2b93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b9d59846.failed
+
+xfs_end_io_direct_write() can race with other IO completions when
+updating the in-core inode size. The IO completion processing is not
+serialised for direct IO - they are done either under the
+IOLOCK_SHARED for non-AIO DIO, and without any IOLOCK held at all
+during AIO DIO completion. Hence the non-atomic test-and-set update
+of the in-core inode size is racy and can result in the in-core
+inode size going backwards if the race if hit just right.
+
+If the inode size goes backwards, this can trigger the EOF zeroing
+code to run incorrectly on the next IO, which then will zero data
+that has successfully been written to disk by a previous DIO.
+
+To fix this bug, we need to serialise the test/set updates of the
+in-core inode size. This first patch introduces locking around the
+relevant updates and checks in the DIO path. Because we now have an
+ioend in xfs_end_io_direct_write(), we know exactly then we are
+doing an IO that requires an in-core EOF update, and we know that
+they are not running in interrupt context. As such, we do not need to
+use irqsave() spinlock variants to protect against interrupts while
+the lock is held.
+
+Hence we can use an existing spinlock in the inode to do this
+serialisation and so not need to grow the struct xfs_inode just to
+work around this problem.
+
+This patch does not address the test/set EOF update in
+generic_file_write_direct() for various reasons - that will be done
+as a followup with separate explanation.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit b9d59846f73713d77f0f3fb784c7f84249fc2b93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index bac558efa13a,598b259fda04..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1482,41 -1536,76 +1482,78 @@@ xfs_end_io_direct_write
+  	struct kiocb		*iocb,
+  	loff_t			offset,
+  	ssize_t			size,
+ -	void			*private)
+ +	void			*private,
+ +	int			ret,
+ +	bool			is_async)
+  {
+ -	struct inode		*inode = file_inode(iocb->ki_filp);
+ -	struct xfs_inode	*ip = XFS_I(inode);
+ -	struct xfs_mount	*mp = ip->i_mount;
+ -	struct xfs_ioend	*ioend = private;
+ -
+ -	trace_xfs_gbmap_direct_endio(ip, offset, size,
+ -				     ioend ? ioend->io_type : 0, NULL);
+ -
+ -	if (!ioend) {
+ -		ASSERT(offset + size <= i_size_read(inode));
+ -		return;
+ -	}
+ -
+ -	if (XFS_FORCED_SHUTDOWN(mp))
+ -		goto out_end_io;
+ +	struct xfs_ioend	*ioend = iocb->private;
+  
+  	/*
+ -	 * dio completion end_io functions are only called on writes if more
+ -	 * than 0 bytes was written.
+ +	 * While the generic direct I/O code updates the inode size, it does
+ +	 * so only after the end_io handler is called, which means our
+ +	 * end_io handler thinks the on-disk size is outside the in-core
+ +	 * size.  To prevent this just update it a little bit earlier here.
+  	 */
+ -	ASSERT(size > 0);
+ +	if (offset + size > i_size_read(ioend->io_inode))
+ +		i_size_write(ioend->io_inode, offset + size);
+  
+  	/*
+ -	 * The ioend only maps whole blocks, while the IO may be sector aligned.
+ -	 * Hence the ioend offset/size may not match the IO offset/size exactly.
+ -	 * Because we don't map overwrites within EOF into the ioend, the offset
+ -	 * may not match, but only if the endio spans EOF.  Either way, write
+ -	 * the IO sizes into the ioend so that completion processing does the
+ -	 * right thing.
+ +	 * blockdev_direct_IO can return an error even after the I/O
+ +	 * completion handler was called.  Thus we need to protect
+ +	 * against double-freeing.
+  	 */
+ -	ASSERT(offset + size <= ioend->io_offset + ioend->io_size);
+ -	ioend->io_size = size;
+ -	ioend->io_offset = offset;
+ +	iocb->private = NULL;
+  
+ +	ioend->io_offset = offset;
+ +	ioend->io_size = size;
+ +	ioend->io_iocb = iocb;
+ +	ioend->io_result = ret;
+ +	if (private && size > 0)
+ +		ioend->io_type = XFS_IO_UNWRITTEN;
+ +
+++<<<<<<< HEAD
+ +	if (is_async) {
+ +		ioend->io_isasync = 1;
+ +		xfs_finish_ioend(ioend);
+ +	} else {
+ +		xfs_finish_ioend_sync(ioend);
+ +	}
+++=======
++ 	/*
++ 	 * The ioend tells us whether we are doing unwritten extent conversion
++ 	 * or an append transaction that updates the on-disk file size. These
++ 	 * cases are the only cases where we should *potentially* be needing
++ 	 * to update the VFS inode size.
++ 	 *
++ 	 * We need to update the in-core inode size here so that we don't end up
++ 	 * with the on-disk inode size being outside the in-core inode size. We
++ 	 * have no other method of updating EOF for AIO, so always do it here
++ 	 * if necessary.
++ 	 *
++ 	 * We need to lock the test/set EOF update as we can be racing with
++ 	 * other IO completions here to update the EOF. Failing to serialise
++ 	 * here can result in EOF moving backwards and Bad Things Happen when
++ 	 * that occurs.
++ 	 */
++ 	spin_lock(&ip->i_flags_lock);
++ 	if (offset + size > i_size_read(inode))
++ 		i_size_write(inode, offset + size);
++ 	spin_unlock(&ip->i_flags_lock);
++ 
++ 	/*
++ 	 * If we are doing an append IO that needs to update the EOF on disk,
++ 	 * do the transaction reserve now so we can use common end io
++ 	 * processing. Stashing the error (if there is one) in the ioend will
++ 	 * result in the ioend processing passing on the error if it is
++ 	 * possible as we can't return it from here.
++ 	 */
++ 	if (ioend->io_type == XFS_IO_OVERWRITE)
++ 		ioend->io_error = xfs_setfilesize_trans_alloc(ioend);
++ 
++ out_end_io:
++ 	xfs_end_io(&ioend->io_work);
++ 	return;
+++>>>>>>> b9d59846f737 (xfs: DIO write completion size updates race)
+  }
+  
+  STATIC ssize_t
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 8ca9115caacb..afab10e3fb10 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -575,8 +575,18 @@ restart:
+ 	 * write.  If zeroing is needed and we are currently holding the
+ 	 * iolock shared, we need to update it to exclusive which implies
+ 	 * having to redo all checks before.
++	 *
++	 * We need to serialise against EOF updates that occur in IO
++	 * completions here. We want to make sure that nobody is changing the
++	 * size while we do this check until we have placed an IO barrier (i.e.
++	 * hold the XFS_IOLOCK_EXCL) that prevents new IO from being dispatched.
++	 * The spinlock effectively forms a memory barrier once we have the
++	 * XFS_IOLOCK_EXCL so we are guaranteed to see the latest EOF value
++	 * and hence be able to correctly determine if we need to run zeroing.
+ 	 */
++	spin_lock(&ip->i_flags_lock);
+ 	if (*pos > i_size_read(inode)) {
++		spin_unlock(&ip->i_flags_lock);
+ 		if (*iolock == XFS_IOLOCK_SHARED) {
+ 			xfs_rw_iunlock(ip, *iolock);
+ 			*iolock = XFS_IOLOCK_EXCL;
+@@ -586,7 +596,8 @@ restart:
+ 		error = -xfs_zero_eof(ip, *pos, i_size_read(inode));
+ 		if (error)
+ 			return error;
+-	}
++	} else
++		spin_unlock(&ip->i_flags_lock);
+ 
+ 	/*
+ 	 * Updating the timestamps will grab the ilock again from
