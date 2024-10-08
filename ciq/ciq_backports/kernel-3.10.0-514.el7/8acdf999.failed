@@ -1,0 +1,82 @@
+virtio_net: Fix napi poll list corruption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 8acdf999accfd95093db17f33a58429a38782060
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8acdf999.failed
+
+The commit d75b1ade567ffab085e8adbbdacf0092d10cd09c (net: less
+interrupt masking in NAPI) breaks virtio_net in an insidious way.
+
+It is now required that if the entire budget is consumed when poll
+returns, the napi poll_list must remain empty.  However, like some
+other drivers virtio_net tries to do a last-ditch check and if
+there is more work it will call napi_schedule and then immediately
+process some of this new work.  Should the entire budget be consumed
+while processing such new work then we will violate the new caller
+contract.
+
+This patch fixes this by not touching any work when we reschedule
+in virtio_net.
+
+The worst part of this bug is that the list corruption causes other
+napi users to be moved off-list.  In my case I was chasing a stall
+in IPsec (IPsec uses netif_rx) and I only belatedly realised that it
+was virtio_net which caused the stall even though the virtio_net
+poll was still functioning perfectly after IPsec stalled.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8acdf999accfd95093db17f33a58429a38782060)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index c58d0bcdeaef,5ca97713bfb3..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -638,15 -734,12 +638,16 @@@ static void refill_work(struct work_str
+  	}
+  }
+  
+ -static int virtnet_receive(struct receive_queue *rq, int budget)
+ +static int virtnet_poll(struct napi_struct *napi, int budget)
+  {
+ +	struct receive_queue *rq =
+ +		container_of(napi, struct receive_queue, napi);
+  	struct virtnet_info *vi = rq->vq->vdev->priv;
+ -	unsigned int len, received = 0;
+  	void *buf;
+ +	unsigned int r, len, received = 0;
+  
+++<<<<<<< HEAD
+ +again:
+  	while (received < budget &&
+  	       (buf = virtqueue_get_buf(rq->vq, &len)) != NULL) {
+  		receive_buf(vi, rq, buf, len);
+@@@ -658,6 -750,17 +659,9 @@@
+  		if (!try_fill_recv(vi, rq, GFP_ATOMIC))
+  			schedule_delayed_work(&vi->refill, 0);
+  	}
+ -
+ -	return received;
+ -}
+ -
+ -static int virtnet_poll(struct napi_struct *napi, int budget)
+ -{
+ -	struct receive_queue *rq =
+ -		container_of(napi, struct receive_queue, napi);
+ -	unsigned int r, received = 0;
+ -
+++=======
++ 	received += virtnet_receive(rq, budget - received);
+++>>>>>>> 8acdf999accf (virtio_net: Fix napi poll list corruption)
+  
+  	/* Out of packets? */
+  	if (received < budget) {
+* Unmerged path drivers/net/virtio_net.c
