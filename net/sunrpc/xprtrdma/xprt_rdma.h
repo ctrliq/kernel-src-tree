@@ -201,6 +201,8 @@ struct rpcrdma_frmr {
 	struct ib_fast_reg_page_list	*fr_pgl;
 	struct ib_mr			*fr_mr;
 	enum rpcrdma_frmr_state		fr_state;
+	struct work_struct		fr_work;
+	struct rpcrdma_xprt		*fr_xprt;
 };
 
 struct rpcrdma_mw {
@@ -424,6 +426,9 @@ void rpcrdma_free_regbuf(struct rpcrdma_ia *,
 			 struct rpcrdma_regbuf *);
 
 unsigned int rpcrdma_max_segments(struct rpcrdma_xprt *);
+
+int frwr_alloc_recovery_wq(void);
+void frwr_destroy_recovery_wq(void);
 
 /*
  * Wrappers for chunk registration, shared by read/write chunk code.
