@@ -1,0 +1,335 @@
+net: ip_fragment: remove BRIDGE_NETFILTER mtu special handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] ip_fragment: remove BRIDGE_NETFILTER mtu special handling (Paolo Abeni) [1265259]
+Rebuild_FUZZ: 95.80%
+commit-author Florian Westphal <fw@strlen.de>
+commit 33b1f31392861947fa2a2a57c3a39ab63b8c9f9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/33b1f313.failed
+
+since commit d6b915e29f4adea9
+("ip_fragment: don't forward defragmented DF packet") the largest
+fragment size is available in the IPCB.
+
+Therefore we no longer need to care about 'encapsulation'
+overhead of stripped PPPOE/VLAN headers since ip_do_fragment
+doesn't use device mtu in such cases.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 33b1f31392861947fa2a2a57c3a39ab63b8c9f9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter_bridge.h
+#	net/bridge/br_netfilter.c
+#	net/ipv4/ip_output.c
+diff --cc include/linux/netfilter_bridge.h
+index 91f08439b405,6d80fc686323..000000000000
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@@ -15,105 -15,55 +15,108 @@@ enum nf_br_hook_priorities 
+  	NF_BR_PRI_LAST = INT_MAX,
+  };
+  
+ -#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+  
+ +#define BRNF_PKT_TYPE			0x01
+  #define BRNF_BRIDGED_DNAT		0x02
+  #define BRNF_NF_BRIDGE_PREROUTING	0x08
+ +#define BRNF_8021Q			0x10
+ +#define BRNF_PPPoE			0x20
+  
+ -int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb);
+ -
+ -static inline void br_drop_fake_rtable(struct sk_buff *skb)
+ +static inline unsigned int nf_bridge_encap_header_len(const struct sk_buff *skb)
+  {
+ -	struct dst_entry *dst = skb_dst(skb);
+ -
+ -	if (dst && (dst->flags & DST_FAKE_RTABLE))
+ -		skb_dst_drop(skb);
+ +	switch (skb->protocol) {
+ +	case __cpu_to_be16(ETH_P_8021Q):
+ +		return VLAN_HLEN;
+ +	case __cpu_to_be16(ETH_P_PPP_SES):
+ +		return PPPOE_SES_HLEN;
+ +	default:
+ +		return 0;
+ +	}
+  }
+  
+ -static inline int nf_bridge_get_physinif(const struct sk_buff *skb)
+ +static inline void nf_bridge_update_protocol(struct sk_buff *skb)
+  {
+ -	struct nf_bridge_info *nf_bridge;
+ -
+ -	if (skb->nf_bridge == NULL)
+ -		return 0;
+ +	if (skb->nf_bridge->mask & BRNF_8021Q)
+ +		skb->protocol = htons(ETH_P_8021Q);
+ +	else if (skb->nf_bridge->mask & BRNF_PPPoE)
+ +		skb->protocol = htons(ETH_P_PPP_SES);
+ +}
+  
+ -	nf_bridge = skb->nf_bridge;
+ -	return nf_bridge->physindev ? nf_bridge->physindev->ifindex : 0;
+ +/* Fill in the header for fragmented IP packets handled by
+ + * the IPv4 connection tracking code.
+ + *
+ + * Only used in br_forward.c
+ + */
+ +static inline int nf_bridge_copy_header(struct sk_buff *skb)
+ +{
+ +	int err;
+ +	unsigned int header_size;
+ +
+ +	nf_bridge_update_protocol(skb);
+ +	header_size = ETH_HLEN + nf_bridge_encap_header_len(skb);
+ +	err = skb_cow_head(skb, header_size);
+ +	if (err)
+ +		return err;
+ +
+ +	skb_copy_to_linear_data_offset(skb, -header_size,
+ +				       skb->nf_bridge->data, header_size);
+ +	__skb_push(skb, nf_bridge_encap_header_len(skb));
+ +	return 0;
+  }
+  
+ -static inline int nf_bridge_get_physoutif(const struct sk_buff *skb)
+ +static inline int nf_bridge_maybe_copy_header(struct sk_buff *skb)
+  {
+ -	struct nf_bridge_info *nf_bridge;
+ +	if (skb->nf_bridge &&
+ +	    skb->nf_bridge->mask & (BRNF_BRIDGED | BRNF_BRIDGED_DNAT))
+ +		return nf_bridge_copy_header(skb);
+ +  	return 0;
+ +}
+  
+ -	if (skb->nf_bridge == NULL)
+ -		return 0;
+++<<<<<<< HEAD
+ +static inline unsigned int nf_bridge_mtu_reduction(const struct sk_buff *skb)
+ +{
+ +	if (unlikely(skb->nf_bridge->mask & BRNF_PPPoE))
+ +		return PPPOE_SES_HLEN;
+ +	return 0;
+ +}
+  
+ -	nf_bridge = skb->nf_bridge;
+ -	return nf_bridge->physoutdev ? nf_bridge->physoutdev->ifindex : 0;
+++=======
+++>>>>>>> 33b1f3139286 (net: ip_fragment: remove BRIDGE_NETFILTER mtu special handling)
+ +int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb);
+ +/* Only used in br_device.c */
+ +static inline int br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
+ +{
+ +	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+ +
+ +	skb_pull(skb, ETH_HLEN);
+ +	nf_bridge->mask ^= BRNF_BRIDGED_DNAT;
+ +	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN-ETH_ALEN),
+ +				       skb->nf_bridge->data, ETH_HLEN-ETH_ALEN);
+ +	skb->dev = nf_bridge->physindev;
+ +	return br_handle_frame_finish(NULL, skb);
+  }
+  
+ -static inline struct net_device *
+ -nf_bridge_get_physindev(const struct sk_buff *skb)
+ +/* This is called by the IP fragmenting code and it ensures there is
+ + * enough room for the encapsulating header (if there is one). */
+ +static inline unsigned int nf_bridge_pad(const struct sk_buff *skb)
+  {
+ -	return skb->nf_bridge ? skb->nf_bridge->physindev : NULL;
+ +	if (skb->nf_bridge)
+ +		return nf_bridge_encap_header_len(skb);
+ +	return 0;
+  }
+  
+ -static inline struct net_device *
+ -nf_bridge_get_physoutdev(const struct sk_buff *skb)
+ +static inline void br_drop_fake_rtable(struct sk_buff *skb)
+  {
+ -	return skb->nf_bridge ? skb->nf_bridge->physoutdev : NULL;
+ +	struct dst_entry *dst = skb_dst(skb);
+ +
+ +	if (dst && (dst->flags & DST_FAKE_RTABLE))
+ +		skb_dst_drop(skb);
+  }
+ +
+  #else
+ +#define nf_bridge_maybe_copy_header(skb)	(0)
+ +#define nf_bridge_pad(skb)			(0)
+  #define br_drop_fake_rtable(skb)	        do { } while (0)
+  #endif /* CONFIG_BRIDGE_NETFILTER */
+  
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,1e62ae5d8f4e..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -848,29 -895,120 +848,80 @@@ static unsigned int br_nf_forward_arp(c
+  	return NF_STOLEN;
+  }
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_NF_CONNTRACK_IPV4)
+++=======
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4) || IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
++ static int br_nf_push_frag_xmit(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct brnf_frag_data *data;
++ 	int err;
++ 
++ 	data = this_cpu_ptr(&brnf_frag_data_storage);
++ 	err = skb_cow_head(skb, data->size);
++ 
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return 0;
++ 	}
++ 
++ 	skb_copy_to_linear_data_offset(skb, -data->size, data->mac, data->size);
++ 	__skb_push(skb, data->encap_size);
++ 
++ 	nf_bridge_info_free(skb);
++ 	return br_dev_queue_push_xmit(sk, skb);
++ }
++ #endif
++ 
++ static int br_nf_ip_fragment(struct sock *sk, struct sk_buff *skb,
++ 			     int (*output)(struct sock *, struct sk_buff *))
++ {
++ 	unsigned int mtu = ip_skb_dst_mtu(skb);
++ 	struct iphdr *iph = ip_hdr(skb);
++ 	struct rtable *rt = skb_rtable(skb);
++ 	struct net_device *dev = rt->dst.dev;
++ 
++ 	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
++ 		     (IPCB(skb)->frag_max_size &&
++ 		      IPCB(skb)->frag_max_size > mtu))) {
++ 		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
++ 		kfree_skb(skb);
++ 		return -EMSGSIZE;
++ 	}
++ 
++ 	return ip_do_fragment(sk, skb, output);
++ }
++ 
++ static unsigned int nf_bridge_mtu_reduction(const struct sk_buff *skb)
++ {
++ 	if (skb->nf_bridge->orig_proto == BRNF_PROTO_PPPOE)
++ 		return PPPOE_SES_HLEN;
++ 	return 0;
++ }
++ 
+++>>>>>>> 33b1f3139286 (net: ip_fragment: remove BRIDGE_NETFILTER mtu special handling)
+  static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+  {
+ -	struct nf_bridge_info *nf_bridge;
+ -	unsigned int mtu_reserved;
+ -
+ -	mtu_reserved = nf_bridge_mtu_reduction(skb);
+ -
+ -	if (skb_is_gso(skb) || skb->len + mtu_reserved <= skb->dev->mtu) {
+ -		nf_bridge_info_free(skb);
+ -		return br_dev_queue_push_xmit(sk, skb);
+ -	}
+ -
+ -	nf_bridge = nf_bridge_info_get(skb);
+ -
+ -#if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
+ -	/* This is wrong! We should preserve the original fragment
+ -	 * boundaries by preserving frag_list rather than refragmenting.
+ -	 */
+ -	if (skb->protocol == htons(ETH_P_IP)) {
+ -		struct brnf_frag_data *data;
+ -
+ -		if (br_validate_ipv4(skb))
+ -			return NF_DROP;
+ -
+ -		IPCB(skb)->frag_max_size = nf_bridge->frag_max_size;
+ -
+ -		nf_bridge_update_protocol(skb);
+ -
+ -		data = this_cpu_ptr(&brnf_frag_data_storage);
+ -		data->encap_size = nf_bridge_encap_header_len(skb);
+ -		data->size = ETH_HLEN + data->encap_size;
+ -
+ -		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
+ -						 data->size);
+ -
+ -		return br_nf_ip_fragment(sk, skb, br_nf_push_frag_xmit);
+ -	}
+ -#endif
+ -#if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
+ -	if (skb->protocol == htons(ETH_P_IPV6)) {
+ -		const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
+ -		struct brnf_frag_data *data;
+ +	int ret;
+  
+ -		if (br_validate_ipv6(skb))
+ +	if (skb->nfct != NULL && skb->protocol == htons(ETH_P_IP) &&
+ +	    skb->len + nf_bridge_mtu_reduction(skb) > skb->dev->mtu &&
+ +	    !skb_is_gso(skb)) {
+ +		if (br_parse_ip_options(skb))
+ +			/* Drop invalid packet */
+  			return NF_DROP;
+ +		ret = ip_fragment(sk, skb, br_dev_queue_push_xmit);
+ +	} else
+ +		ret = br_dev_queue_push_xmit(sk, skb);
+  
+ -		IP6CB(skb)->frag_max_size = nf_bridge->frag_max_size;
+ -
+ -		nf_bridge_update_protocol(skb);
+ -
+ -		data = this_cpu_ptr(&brnf_frag_data_storage);
+ -		data->encap_size = nf_bridge_encap_header_len(skb);
+ -		data->size = ETH_HLEN + data->encap_size;
+ -
+ -		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
+ -						 data->size);
+ -
+ -		if (v6ops)
+ -			return v6ops->fragment(sk, skb, br_nf_push_frag_xmit);
+ -		else
+ -			return -EMSGSIZE;
+ -	}
+ -#endif
+ -	nf_bridge_info_free(skb);
+ -	return br_dev_queue_push_xmit(sk, skb);
+ +	return ret;
+ +}
+ +#else
+ +static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+ +{
+ +        return br_dev_queue_push_xmit(sk, skb);
+  }
+ +#endif
+  
+  /* PF_BRIDGE/POST_ROUTING ********************************************/
+  static unsigned int br_nf_post_routing(const struct nf_hook_ops *ops,
+diff --cc net/ipv4/ip_output.c
+index c0c838649a76,19d7e43b5370..000000000000
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@@ -525,10 -549,6 +525,13 @@@ int ip_fragment(struct sock *sk, struc
+  
+  	hlen = iph->ihl * 4;
+  	mtu = mtu - hlen;	/* Size of data space */
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	if (skb->nf_bridge)
+ +		mtu -= nf_bridge_mtu_reduction(skb);
+ +#endif
+++=======
+++>>>>>>> 33b1f3139286 (net: ip_fragment: remove BRIDGE_NETFILTER mtu special handling)
+  	IPCB(skb)->flags |= IPSKB_FRAG_COMPLETE;
+  
+  	/* When frag_list is given, use it. First, check its validity:
+* Unmerged path include/linux/netfilter_bridge.h
+* Unmerged path net/bridge/br_netfilter.c
+* Unmerged path net/ipv4/ip_output.c
