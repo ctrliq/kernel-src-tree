@@ -1,0 +1,149 @@
+vti: Update the ipv4 side to use it's own receive hook.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] vti4: Update the ipv4 side to use it's own receive hook (Jiri Pirko) [1091561]
+Rebuild_FUZZ: 98.18%
+commit-author Steffen Klassert <steffen.klassert@secunet.com>
+commit df3893c176e9b0bb39b28ab5ec8113fa20ad1ee0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/df3893c1.failed
+
+With this patch, vti uses the IPsec protocol multiplexer to
+register it's own receive side hooks for ESP, AH and IPCOMP.
+
+Vti now does the following on receive side:
+
+1. Do an input policy check for the IPsec packet we received.
+   This is required because this packet could be already
+   prosecces by IPsec, so an inbuond policy check is needed.
+
+2. Mark the packet with the i_key. The policy and the state
+   must match this key now. Policy and state belong to the outer
+   namespace and policy enforcement is done at the further layers.
+
+3. Call the generic xfrm layer to do decryption and decapsulation.
+
+4. Wait for a callback from the xfrm layer to properly clean the
+   skb to not leak informations on namespace and to update the
+   device statistics.
+
+On transmit side:
+
+1. Mark the packet with the o_key. The policy and the state
+   must match this key now.
+
+2. Do a xfrm_lookup on the original packet with the mark applied.
+
+3. Check if we got an IPsec route.
+
+4. Clean the skb to not leak informations on namespace
+   transitions.
+
+5. Attach the dst_enty we got from the xfrm_lookup to the skb.
+
+6. Call dst_output to do the IPsec processing.
+
+7. Do the device statistics.
+
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit df3893c176e9b0bb39b28ab5ec8113fa20ad1ee0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_vti.c
+diff --cc net/ipv4/ip_vti.c
+index be11cdadfc8b,b23f9e63b1cd..000000000000
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@@ -60,32 -60,66 +60,72 @@@ static int vti_input(struct sk_buff *sk
+  	tunnel = ip_tunnel_lookup(itn, skb->dev->ifindex, TUNNEL_NO_KEY,
+  				  iph->saddr, iph->daddr, 0);
+  	if (tunnel != NULL) {
+++<<<<<<< HEAD
+ +		struct pcpu_tstats *tstats;
+ +		u32 oldmark = skb->mark;
+ +		int ret;
+++=======
++ 		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
++ 			goto drop;
+++>>>>>>> df3893c176e9 (vti: Update the ipv4 side to use it's own receive hook.)
++ 
++ 		XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4 = tunnel;
++ 		skb->mark = be32_to_cpu(tunnel->parms.i_key);
+  
++ 		return xfrm_input(skb, nexthdr, spi, encap_type);
++ 	}
+  
+- 		/* temporarily mark the skb with the tunnel o_key, to
+- 		 * only match policies with this mark.
+- 		 */
+- 		skb->mark = be32_to_cpu(tunnel->parms.o_key);
+- 		ret = xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb);
+- 		skb->mark = oldmark;
+- 		if (!ret)
+- 			return -1;
++ 	return -EINVAL;
++ drop:
++ 	kfree_skb(skb);
++ 	return 0;
++ }
+  
+- 		tstats = this_cpu_ptr(tunnel->dev->tstats);
+- 		u64_stats_update_begin(&tstats->syncp);
+- 		tstats->rx_packets++;
+- 		tstats->rx_bytes += skb->len;
+- 		u64_stats_update_end(&tstats->syncp);
++ static int vti_rcv(struct sk_buff *skb)
++ {
++ 	XFRM_SPI_SKB_CB(skb)->family = AF_INET;
++ 	XFRM_SPI_SKB_CB(skb)->daddroff = offsetof(struct iphdr, daddr);
++ 
++ 	return vti_input(skb, ip_hdr(skb)->protocol, 0, 0);
++ }
+  
+- 		secpath_reset(skb);
+- 		skb->dev = tunnel->dev;
++ static int vti_rcv_cb(struct sk_buff *skb, int err)
++ {
++ 	unsigned short family;
++ 	struct net_device *dev;
++ 	struct pcpu_sw_netstats *tstats;
++ 	struct xfrm_state *x;
++ 	struct ip_tunnel *tunnel = XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4;
++ 
++ 	if (!tunnel)
+  		return 1;
++ 
++ 	dev = tunnel->dev;
++ 
++ 	if (err) {
++ 		dev->stats.rx_errors++;
++ 		dev->stats.rx_dropped++;
++ 
++ 		return 0;
+  	}
+  
+- 	return -1;
++ 	x = xfrm_input_state(skb);
++ 	family = x->inner_mode->afinfo->family;
++ 
++ 	if (!xfrm_policy_check(NULL, XFRM_POLICY_IN, skb, family))
++ 		return -EPERM;
++ 
++ 	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(skb->dev)));
++ 	skb->dev = dev;
++ 
++ 	tstats = this_cpu_ptr(dev->tstats);
++ 
++ 	u64_stats_update_begin(&tstats->syncp);
++ 	tstats->rx_packets++;
++ 	tstats->rx_bytes += skb->len;
++ 	u64_stats_update_end(&tstats->syncp);
++ 
++ 	return 0;
+  }
+  
+  /* This function assumes it is being called from dev_queue_xmit()
+* Unmerged path net/ipv4/ip_vti.c
