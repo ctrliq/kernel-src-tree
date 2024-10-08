@@ -1,0 +1,1016 @@
+net: openvswitch: Support masked set actions.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] openvswitch: Support masked set actions (Jiri Benc) [1156461 1211348]
+Rebuild_FUZZ: 92.86%
+commit-author Jarno Rajahalme <jrajahalme@nicira.com>
+commit 83d2b9ba1abca241df44a502b6da950a25856b5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/83d2b9ba.failed
+
+OVS userspace already probes the openvswitch kernel module for
+OVS_ACTION_ATTR_SET_MASKED support.  This patch adds the kernel module
+implementation of masked set actions.
+
+The existing set action sets many fields at once.  When only a subset
+of the IP header fields, for example, should be modified, all the IP
+fields need to be exact matched so that the other field values can be
+copied to the set action.  A masked set action allows modification of
+an arbitrary subset of the supported header bits without requiring the
+rest to be matched.
+
+Masked set action is now supported for all writeable key types, except
+for the tunnel key.  The set tunnel action is an exception as any
+input tunnel info is cleared before action processing starts, so there
+is no tunnel info to mask.
+
+The kernel module converts all (non-tunnel) set actions to masked set
+actions.  This makes action processing more uniform, and results in
+less branching and duplicating the action processing code.  When
+returning actions to userspace, the fully masked set actions are
+converted back to normal set actions.  We use a kernel internal action
+code to be able to tell the userspace provided and converted masked
+set actions apart.
+
+	Signed-off-by: Jarno Rajahalme <jrajahalme@nicira.com>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 83d2b9ba1abca241df44a502b6da950a25856b5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/openvswitch.h
+#	net/openvswitch/actions.c
+#	net/openvswitch/flow_netlink.c
+diff --cc include/uapi/linux/openvswitch.h
+index 0d7501a221c7,bbd49a0c46c7..000000000000
+--- a/include/uapi/linux/openvswitch.h
++++ b/include/uapi/linux/openvswitch.h
+@@@ -563,7 -638,21 +572,25 @@@ enum ovs_action_attr 
+  	OVS_ACTION_ATTR_SAMPLE,       /* Nested OVS_SAMPLE_ATTR_*. */
+  	OVS_ACTION_ATTR_RECIRC,       /* u32 recirc_id. */
+  	OVS_ACTION_ATTR_HASH,	      /* struct ovs_action_hash. */
+++<<<<<<< HEAD
+ +	__OVS_ACTION_ATTR_MAX
+++=======
++ 	OVS_ACTION_ATTR_PUSH_MPLS,    /* struct ovs_action_push_mpls. */
++ 	OVS_ACTION_ATTR_POP_MPLS,     /* __be16 ethertype. */
++ 	OVS_ACTION_ATTR_SET_MASKED,   /* One nested OVS_KEY_ATTR_* including
++ 				       * data immediately followed by a mask.
++ 				       * The data must be zero for the unmasked
++ 				       * bits. */
++ 
++ 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
++ 				       * from userspace. */
++ 
++ #ifdef __KERNEL__
++ 	OVS_ACTION_ATTR_SET_TO_MASKED, /* Kernel module internal masked
++ 					* set action converted from
++ 					* OVS_ACTION_ATTR_SET. */
++ #endif
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  };
+  
+  #define OVS_ACTION_ATTR_MAX (__OVS_ACTION_ATTR_MAX - 1)
+diff --cc net/openvswitch/actions.c
+index 5e332feb5508,b491c1c296fe..000000000000
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@@ -147,60 -154,108 +147,143 @@@ static int __pop_vlan_tci(struct sk_buf
+  	return 0;
+  }
+  
+ -static int pop_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ -		    const __be16 ethertype)
+ +static int pop_vlan(struct sk_buff *skb)
+  {
+ -	struct ethhdr *hdr;
+ +	__be16 tci;
+  	int err;
+  
+ -	err = skb_ensure_writable(skb, skb->mac_len + MPLS_HLEN);
+ -	if (unlikely(err))
+ -		return err;
+ +	if (likely(vlan_tx_tag_present(skb))) {
+ +		skb->vlan_tci = 0;
+ +	} else {
+ +		if (unlikely(skb->protocol != htons(ETH_P_8021Q) ||
+ +			     skb->len < VLAN_ETH_HLEN))
+ +			return 0;
+  
+++<<<<<<< HEAD
+ +		err = __pop_vlan_tci(skb, &tci);
+ +		if (err)
+ +			return err;
+++=======
++ 	skb_postpull_rcsum(skb, skb_mpls_header(skb), MPLS_HLEN);
++ 
++ 	memmove(skb_mac_header(skb) + MPLS_HLEN, skb_mac_header(skb),
++ 		skb->mac_len);
++ 
++ 	__skb_pull(skb, MPLS_HLEN);
++ 	skb_reset_mac_header(skb);
++ 
++ 	/* skb_mpls_header() is used to locate the ethertype
++ 	 * field correctly in the presence of VLAN tags.
++ 	 */
++ 	hdr = (struct ethhdr *)(skb_mpls_header(skb) - ETH_HLEN);
++ 	hdr->h_proto = ethertype;
++ 	if (eth_p_mpls(skb->protocol))
++ 		skb->protocol = ethertype;
++ 
++ 	invalidate_flow_key(key);
++ 	return 0;
++ }
++ 
++ /* 'KEY' must not have any bits set outside of the 'MASK' */
++ #define MASKED(OLD, KEY, MASK) ((KEY) | ((OLD) & ~(MASK)))
++ #define SET_MASKED(OLD, KEY, MASK) ((OLD) = MASKED(OLD, KEY, MASK))
++ 
++ static int set_mpls(struct sk_buff *skb, struct sw_flow_key *flow_key,
++ 		    const __be32 *mpls_lse, const __be32 *mask)
++ {
++ 	__be32 *stack;
++ 	__be32 lse;
++ 	int err;
++ 
++ 	err = skb_ensure_writable(skb, skb->mac_len + MPLS_HLEN);
++ 	if (unlikely(err))
++ 		return err;
++ 
++ 	stack = (__be32 *)skb_mpls_header(skb);
++ 	lse = MASKED(*stack, *mpls_lse, *mask);
++ 	if (skb->ip_summed == CHECKSUM_COMPLETE) {
++ 		__be32 diff[] = { ~(*stack), lse };
++ 
++ 		skb->csum = ~csum_partial((char *)diff, sizeof(diff),
++ 					  ~skb->csum);
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  	}
+ +	/* move next vlan tag to hw accel tag */
+ +	if (likely(skb->protocol != htons(ETH_P_8021Q) ||
+ +		   skb->len < VLAN_ETH_HLEN))
+ +		return 0;
+ +
+++<<<<<<< HEAD
+ +	err = __pop_vlan_tci(skb, &tci);
+ +	if (unlikely(err))
+ +		return err;
+  
+ +	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), ntohs(tci));
+++=======
++ 	*stack = lse;
++ 	flow_key->mpls.top_lse = lse;
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  	return 0;
+  }
+  
+ -static int pop_vlan(struct sk_buff *skb, struct sw_flow_key *key)
+ +static int push_vlan(struct sk_buff *skb, const struct ovs_action_push_vlan *vlan)
+  {
+ -	int err;
+ +	if (unlikely(vlan_tx_tag_present(skb))) {
+ +		u16 current_tag;
+  
+ -	err = skb_vlan_pop(skb);
+ -	if (skb_vlan_tag_present(skb))
+ -		invalidate_flow_key(key);
+ -	else
+ -		key->eth.tci = 0;
+ -	return err;
+ +		/* push down current VLAN tag */
+ +		current_tag = vlan_tx_tag_get(skb);
+ +
+ +		if (!__vlan_put_tag(skb, skb->vlan_proto, current_tag))
+ +			return -ENOMEM;
+ +
+ +		if (skb->ip_summed == CHECKSUM_COMPLETE)
+ +			skb->csum = csum_add(skb->csum, csum_partial(skb->data
+ +					+ (2 * ETH_ALEN), VLAN_HLEN, 0));
+ +
+ +	}
+ +	__vlan_hwaccel_put_tag(skb, vlan->vlan_tpid, ntohs(vlan->vlan_tci) & ~VLAN_TAG_PRESENT);
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_eth_addr(struct sk_buff *skb,
+ +			const struct ovs_key_ethernet *eth_key)
+ +{
+ +	int err;
+ +	err = make_writable(skb, ETH_HLEN);
+++=======
++ static int push_vlan(struct sk_buff *skb, struct sw_flow_key *key,
++ 		     const struct ovs_action_push_vlan *vlan)
++ {
++ 	if (skb_vlan_tag_present(skb))
++ 		invalidate_flow_key(key);
++ 	else
++ 		key->eth.tci = vlan->vlan_tci;
++ 	return skb_vlan_push(skb, vlan->vlan_tpid,
++ 			     ntohs(vlan->vlan_tci) & ~VLAN_TAG_PRESENT);
++ }
++ 
++ /* 'src' is already properly masked. */
++ static void ether_addr_copy_masked(u8 *dst_, const u8 *src_, const u8 *mask_)
++ {
++ 	u16 *dst = (u16 *)dst_;
++ 	const u16 *src = (const u16 *)src_;
++ 	const u16 *mask = (const u16 *)mask_;
++ 
++ 	SET_MASKED(dst[0], src[0], mask[0]);
++ 	SET_MASKED(dst[1], src[1], mask[1]);
++ 	SET_MASKED(dst[2], src[2], mask[2]);
++ }
++ 
++ static int set_eth_addr(struct sk_buff *skb, struct sw_flow_key *flow_key,
++ 			const struct ovs_key_ethernet *key,
++ 			const struct ovs_key_ethernet *mask)
++ {
++ 	int err;
++ 
++ 	err = skb_ensure_writable(skb, ETH_HLEN);
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  	if (unlikely(err))
+  		return err;
+  
+@@@ -211,6 -268,8 +296,11 @@@
+  
+  	ovs_skb_postpush_rcsum(skb, eth_hdr(skb), ETH_ALEN * 2);
+  
+++<<<<<<< HEAD
+++=======
++ 	ether_addr_copy(flow_key->eth.src, eth_hdr(skb)->h_source);
++ 	ether_addr_copy(flow_key->eth.dst, eth_hdr(skb)->h_dest);
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  	return 0;
+  }
+  
+@@@ -298,167 -364,235 +395,328 @@@ static void set_ip_ttl(struct sk_buff *
+  	nh->ttl = new_ttl;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_ipv4(struct sk_buff *skb, const struct ovs_key_ipv4 *ipv4_key)
+++=======
++ static int set_ipv4(struct sk_buff *skb, struct sw_flow_key *flow_key,
++ 		    const struct ovs_key_ipv4 *key,
++ 		    const struct ovs_key_ipv4 *mask)
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  {
+  	struct iphdr *nh;
++ 	__be32 new_addr;
+  	int err;
+  
+ -	err = skb_ensure_writable(skb, skb_network_offset(skb) +
+ -				  sizeof(struct iphdr));
+ +	err = make_writable(skb, skb_network_offset(skb) +
+ +				 sizeof(struct iphdr));
+  	if (unlikely(err))
+  		return err;
+  
+  	nh = ip_hdr(skb);
+  
+++<<<<<<< HEAD
+ +	if (ipv4_key->ipv4_src != nh->saddr)
+ +		set_ip_addr(skb, nh, &nh->saddr, ipv4_key->ipv4_src);
+ +
+ +	if (ipv4_key->ipv4_dst != nh->daddr)
+ +		set_ip_addr(skb, nh, &nh->daddr, ipv4_key->ipv4_dst);
+ +
+ +	if (ipv4_key->ipv4_tos != nh->tos)
+ +		ipv4_change_dsfield(nh, 0, ipv4_key->ipv4_tos);
+ +
+ +	if (ipv4_key->ipv4_ttl != nh->ttl)
+ +		set_ip_ttl(skb, nh, ipv4_key->ipv4_ttl);
+++=======
++ 	/* Setting an IP addresses is typically only a side effect of
++ 	 * matching on them in the current userspace implementation, so it
++ 	 * makes sense to check if the value actually changed.
++ 	 */
++ 	if (mask->ipv4_src) {
++ 		new_addr = MASKED(nh->saddr, key->ipv4_src, mask->ipv4_src);
++ 
++ 		if (unlikely(new_addr != nh->saddr)) {
++ 			set_ip_addr(skb, nh, &nh->saddr, new_addr);
++ 			flow_key->ipv4.addr.src = new_addr;
++ 		}
++ 	}
++ 	if (mask->ipv4_dst) {
++ 		new_addr = MASKED(nh->daddr, key->ipv4_dst, mask->ipv4_dst);
++ 
++ 		if (unlikely(new_addr != nh->daddr)) {
++ 			set_ip_addr(skb, nh, &nh->daddr, new_addr);
++ 			flow_key->ipv4.addr.dst = new_addr;
++ 		}
++ 	}
++ 	if (mask->ipv4_tos) {
++ 		ipv4_change_dsfield(nh, ~mask->ipv4_tos, key->ipv4_tos);
++ 		flow_key->ip.tos = nh->tos;
++ 	}
++ 	if (mask->ipv4_ttl) {
++ 		set_ip_ttl(skb, nh, key->ipv4_ttl, mask->ipv4_ttl);
++ 		flow_key->ip.ttl = nh->ttl;
++ 	}
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_ipv6(struct sk_buff *skb, const struct ovs_key_ipv6 *ipv6_key)
+++=======
++ static bool is_ipv6_mask_nonzero(const __be32 addr[4])
++ {
++ 	return !!(addr[0] | addr[1] | addr[2] | addr[3]);
++ }
++ 
++ static int set_ipv6(struct sk_buff *skb, struct sw_flow_key *flow_key,
++ 		    const struct ovs_key_ipv6 *key,
++ 		    const struct ovs_key_ipv6 *mask)
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  {
+  	struct ipv6hdr *nh;
+  	int err;
+- 	__be32 *saddr;
+- 	__be32 *daddr;
+  
+ -	err = skb_ensure_writable(skb, skb_network_offset(skb) +
+ -				  sizeof(struct ipv6hdr));
+ +	err = make_writable(skb, skb_network_offset(skb) +
+ +			    sizeof(struct ipv6hdr));
+  	if (unlikely(err))
+  		return err;
+  
+  	nh = ipv6_hdr(skb);
+- 	saddr = (__be32 *)&nh->saddr;
+- 	daddr = (__be32 *)&nh->daddr;
+  
+++<<<<<<< HEAD
+ +	if (memcmp(ipv6_key->ipv6_src, saddr, sizeof(ipv6_key->ipv6_src)))
+ +		set_ipv6_addr(skb, ipv6_key->ipv6_proto, saddr,
+ +			      ipv6_key->ipv6_src, true);
+ +
+ +	if (memcmp(ipv6_key->ipv6_dst, daddr, sizeof(ipv6_key->ipv6_dst))) {
+++=======
++ 	/* Setting an IP addresses is typically only a side effect of
++ 	 * matching on them in the current userspace implementation, so it
++ 	 * makes sense to check if the value actually changed.
++ 	 */
++ 	if (is_ipv6_mask_nonzero(mask->ipv6_src)) {
++ 		__be32 *saddr = (__be32 *)&nh->saddr;
++ 		__be32 masked[4];
++ 
++ 		mask_ipv6_addr(saddr, key->ipv6_src, mask->ipv6_src, masked);
++ 
++ 		if (unlikely(memcmp(saddr, masked, sizeof(masked)))) {
++ 			set_ipv6_addr(skb, key->ipv6_proto, saddr, masked,
++ 				      true);
++ 			memcpy(&flow_key->ipv6.addr.src, masked,
++ 			       sizeof(flow_key->ipv6.addr.src));
++ 		}
++ 	}
++ 	if (is_ipv6_mask_nonzero(mask->ipv6_dst)) {
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  		unsigned int offset = 0;
+  		int flags = IP6_FH_F_SKIP_RH;
+  		bool recalc_csum = true;
++ 		__be32 *daddr = (__be32 *)&nh->daddr;
++ 		__be32 masked[4];
+  
+- 		if (ipv6_ext_hdr(nh->nexthdr))
+- 			recalc_csum = ipv6_find_hdr(skb, &offset,
+- 						    NEXTHDR_ROUTING, NULL,
+- 						    &flags) != NEXTHDR_ROUTING;
++ 		mask_ipv6_addr(daddr, key->ipv6_dst, mask->ipv6_dst, masked);
+  
+++<<<<<<< HEAD
+ +		set_ipv6_addr(skb, ipv6_key->ipv6_proto, daddr,
+ +			      ipv6_key->ipv6_dst, recalc_csum);
+ +	}
+ +
+ +	set_ipv6_tc(nh, ipv6_key->ipv6_tclass);
+ +	set_ipv6_fl(nh, ntohl(ipv6_key->ipv6_label));
+ +	nh->hop_limit = ipv6_key->ipv6_hlimit;
+ +
+++=======
++ 		if (unlikely(memcmp(daddr, masked, sizeof(masked)))) {
++ 			if (ipv6_ext_hdr(nh->nexthdr))
++ 				recalc_csum = (ipv6_find_hdr(skb, &offset,
++ 							     NEXTHDR_ROUTING,
++ 							     NULL, &flags)
++ 					       != NEXTHDR_ROUTING);
++ 
++ 			set_ipv6_addr(skb, key->ipv6_proto, daddr, masked,
++ 				      recalc_csum);
++ 			memcpy(&flow_key->ipv6.addr.dst, masked,
++ 			       sizeof(flow_key->ipv6.addr.dst));
++ 		}
++ 	}
++ 	if (mask->ipv6_tclass) {
++ 		ipv6_change_dsfield(nh, ~mask->ipv6_tclass, key->ipv6_tclass);
++ 		flow_key->ip.tos = ipv6_get_dsfield(nh);
++ 	}
++ 	if (mask->ipv6_label) {
++ 		set_ipv6_fl(nh, ntohl(key->ipv6_label),
++ 			    ntohl(mask->ipv6_label));
++ 		flow_key->ipv6.label =
++ 		    *(__be32 *)nh & htonl(IPV6_FLOWINFO_FLOWLABEL);
++ 	}
++ 	if (mask->ipv6_hlimit) {
++ 		SET_MASKED(nh->hop_limit, key->ipv6_hlimit, mask->ipv6_hlimit);
++ 		flow_key->ip.ttl = nh->hop_limit;
++ 	}
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  	return 0;
+  }
+  
+ -/* Must follow skb_ensure_writable() since that can move the skb data. */
+ +/* Must follow make_writable() since that can move the skb data. */
+  static void set_tp_port(struct sk_buff *skb, __be16 *port,
+- 			 __be16 new_port, __sum16 *check)
++ 			__be16 new_port, __sum16 *check)
+  {
+  	inet_proto_csum_replace2(check, skb, *port, new_port, 0);
+  	*port = new_port;
+- 	skb_clear_hash(skb);
+  }
+  
+++<<<<<<< HEAD
+ +static void set_udp_port(struct sk_buff *skb, __be16 *port, __be16 new_port)
+ +{
+ +	struct udphdr *uh = udp_hdr(skb);
+ +
+ +	if (uh->check && skb->ip_summed != CHECKSUM_PARTIAL) {
+ +		set_tp_port(skb, port, new_port, &uh->check);
+ +
+ +		if (!uh->check)
+ +			uh->check = CSUM_MANGLED_0;
+ +	} else {
+ +		*port = new_port;
+ +		skb_clear_hash(skb);
+ +	}
+ +}
+ +
+ +static int set_udp(struct sk_buff *skb, const struct ovs_key_udp *udp_port_key)
+++=======
++ static int set_udp(struct sk_buff *skb, struct sw_flow_key *flow_key,
++ 		   const struct ovs_key_udp *key,
++ 		   const struct ovs_key_udp *mask)
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  {
+  	struct udphdr *uh;
++ 	__be16 src, dst;
+  	int err;
+  
+ -	err = skb_ensure_writable(skb, skb_transport_offset(skb) +
+ -				  sizeof(struct udphdr));
+ +	err = make_writable(skb, skb_transport_offset(skb) +
+ +				 sizeof(struct udphdr));
+  	if (unlikely(err))
+  		return err;
+  
+  	uh = udp_hdr(skb);
+++<<<<<<< HEAD
+ +	if (udp_port_key->udp_src != uh->source)
+ +		set_udp_port(skb, &uh->source, udp_port_key->udp_src);
+ +
+ +	if (udp_port_key->udp_dst != uh->dest)
+ +		set_udp_port(skb, &uh->dest, udp_port_key->udp_dst);
+++=======
++ 	/* Either of the masks is non-zero, so do not bother checking them. */
++ 	src = MASKED(uh->source, key->udp_src, mask->udp_src);
++ 	dst = MASKED(uh->dest, key->udp_dst, mask->udp_dst);
++ 
++ 	if (uh->check && skb->ip_summed != CHECKSUM_PARTIAL) {
++ 		if (likely(src != uh->source)) {
++ 			set_tp_port(skb, &uh->source, src, &uh->check);
++ 			flow_key->tp.src = src;
++ 		}
++ 		if (likely(dst != uh->dest)) {
++ 			set_tp_port(skb, &uh->dest, dst, &uh->check);
++ 			flow_key->tp.dst = dst;
++ 		}
++ 
++ 		if (unlikely(!uh->check))
++ 			uh->check = CSUM_MANGLED_0;
++ 	} else {
++ 		uh->source = src;
++ 		uh->dest = dst;
++ 		flow_key->tp.src = src;
++ 		flow_key->tp.dst = dst;
++ 	}
++ 
++ 	skb_clear_hash(skb);
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_tcp(struct sk_buff *skb, const struct ovs_key_tcp *tcp_port_key)
+++=======
++ static int set_tcp(struct sk_buff *skb, struct sw_flow_key *flow_key,
++ 		   const struct ovs_key_tcp *key,
++ 		   const struct ovs_key_tcp *mask)
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  {
+  	struct tcphdr *th;
++ 	__be16 src, dst;
+  	int err;
+  
+ -	err = skb_ensure_writable(skb, skb_transport_offset(skb) +
+ -				  sizeof(struct tcphdr));
+ +	err = make_writable(skb, skb_transport_offset(skb) +
+ +				 sizeof(struct tcphdr));
+  	if (unlikely(err))
+  		return err;
+  
+  	th = tcp_hdr(skb);
+++<<<<<<< HEAD
+ +	if (tcp_port_key->tcp_src != th->source)
+ +		set_tp_port(skb, &th->source, tcp_port_key->tcp_src, &th->check);
+ +
+ +	if (tcp_port_key->tcp_dst != th->dest)
+ +		set_tp_port(skb, &th->dest, tcp_port_key->tcp_dst, &th->check);
+++=======
++ 	src = MASKED(th->source, key->tcp_src, mask->tcp_src);
++ 	if (likely(src != th->source)) {
++ 		set_tp_port(skb, &th->source, src, &th->check);
++ 		flow_key->tp.src = src;
++ 	}
++ 	dst = MASKED(th->dest, key->tcp_dst, mask->tcp_dst);
++ 	if (likely(dst != th->dest)) {
++ 		set_tp_port(skb, &th->dest, dst, &th->check);
++ 		flow_key->tp.dst = dst;
++ 	}
++ 	skb_clear_hash(skb);
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_sctp(struct sk_buff *skb,
+ +		     const struct ovs_key_sctp *sctp_port_key)
+++=======
++ static int set_sctp(struct sk_buff *skb, struct sw_flow_key *flow_key,
++ 		    const struct ovs_key_sctp *key,
++ 		    const struct ovs_key_sctp *mask)
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  {
++ 	unsigned int sctphoff = skb_transport_offset(skb);
+  	struct sctphdr *sh;
++ 	__le32 old_correct_csum, new_csum, old_csum;
+  	int err;
+- 	unsigned int sctphoff = skb_transport_offset(skb);
+  
+ -	err = skb_ensure_writable(skb, sctphoff + sizeof(struct sctphdr));
+ +	err = make_writable(skb, sctphoff + sizeof(struct sctphdr));
+  	if (unlikely(err))
+  		return err;
+  
+  	sh = sctp_hdr(skb);
+- 	if (sctp_port_key->sctp_src != sh->source ||
+- 	    sctp_port_key->sctp_dst != sh->dest) {
+- 		__le32 old_correct_csum, new_csum, old_csum;
++ 	old_csum = sh->checksum;
++ 	old_correct_csum = sctp_compute_cksum(skb, sctphoff);
+  
+- 		old_csum = sh->checksum;
+- 		old_correct_csum = sctp_compute_cksum(skb, sctphoff);
++ 	sh->source = MASKED(sh->source, key->sctp_src, mask->sctp_src);
++ 	sh->dest = MASKED(sh->dest, key->sctp_dst, mask->sctp_dst);
+  
+- 		sh->source = sctp_port_key->sctp_src;
+- 		sh->dest = sctp_port_key->sctp_dst;
++ 	new_csum = sctp_compute_cksum(skb, sctphoff);
+  
+- 		new_csum = sctp_compute_cksum(skb, sctphoff);
++ 	/* Carry any checksum errors through. */
++ 	sh->checksum = old_csum ^ old_correct_csum ^ new_csum;
+  
+++<<<<<<< HEAD
+ +		/* Carry any checksum errors through. */
+ +		sh->checksum = old_csum ^ old_correct_csum ^ new_csum;
+ +
+ +		skb_clear_hash(skb);
+ +	}
+++=======
++ 	skb_clear_hash(skb);
++ 	flow_key->tp.src = sh->source;
++ 	flow_key->tp.dst = sh->dest;
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  
+  	return 0;
+  }
+@@@ -587,17 -721,36 +845,48 @@@ static void execute_hash(struct sk_buf
+  }
+  
+  static int execute_set_action(struct sk_buff *skb,
+++<<<<<<< HEAD
+ +				 const struct nlattr *nested_attr)
+++=======
++ 			      struct sw_flow_key *flow_key,
++ 			      const struct nlattr *a)
++ {
++ 	/* Only tunnel set execution is supported without a mask. */
++ 	if (nla_type(a) == OVS_KEY_ATTR_TUNNEL_INFO) {
++ 		OVS_CB(skb)->egress_tun_info = nla_data(a);
++ 		return 0;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ /* Mask is at the midpoint of the data. */
++ #define get_mask(a, type) ((const type)nla_data(a) + 1)
++ 
++ static int execute_masked_set_action(struct sk_buff *skb,
++ 				     struct sw_flow_key *flow_key,
++ 				     const struct nlattr *a)
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  {
+  	int err = 0;
+  
+- 	switch (nla_type(nested_attr)) {
++ 	switch (nla_type(a)) {
+  	case OVS_KEY_ATTR_PRIORITY:
+++<<<<<<< HEAD
+ +		skb->priority = nla_get_u32(nested_attr);
+ +		break;
+ +
+ +	case OVS_KEY_ATTR_SKB_MARK:
+ +		skb->mark = nla_get_u32(nested_attr);
+++=======
++ 		SET_MASKED(skb->priority, nla_get_u32(a), *get_mask(a, u32 *));
++ 		flow_key->phy.priority = skb->priority;
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_SKB_MARK:
++ 		SET_MASKED(skb->mark, nla_get_u32(a), *get_mask(a, u32 *));
++ 		flow_key->phy.skb_mark = skb->mark;
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  		break;
+  
+  	case OVS_KEY_ATTR_TUNNEL_INFO:
+@@@ -605,27 -759,38 +895,62 @@@
+  		break;
+  
+  	case OVS_KEY_ATTR_ETHERNET:
+++<<<<<<< HEAD
+ +		err = set_eth_addr(skb, nla_data(nested_attr));
+ +		break;
+ +
+ +	case OVS_KEY_ATTR_IPV4:
+ +		err = set_ipv4(skb, nla_data(nested_attr));
+ +		break;
+ +
+ +	case OVS_KEY_ATTR_IPV6:
+ +		err = set_ipv6(skb, nla_data(nested_attr));
+ +		break;
+ +
+ +	case OVS_KEY_ATTR_TCP:
+ +		err = set_tcp(skb, nla_data(nested_attr));
+ +		break;
+ +
+ +	case OVS_KEY_ATTR_UDP:
+ +		err = set_udp(skb, nla_data(nested_attr));
+ +		break;
+ +
+ +	case OVS_KEY_ATTR_SCTP:
+ +		err = set_sctp(skb, nla_data(nested_attr));
+++=======
++ 		err = set_eth_addr(skb, flow_key, nla_data(a),
++ 				   get_mask(a, struct ovs_key_ethernet *));
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_IPV4:
++ 		err = set_ipv4(skb, flow_key, nla_data(a),
++ 			       get_mask(a, struct ovs_key_ipv4 *));
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_IPV6:
++ 		err = set_ipv6(skb, flow_key, nla_data(a),
++ 			       get_mask(a, struct ovs_key_ipv6 *));
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_TCP:
++ 		err = set_tcp(skb, flow_key, nla_data(a),
++ 			      get_mask(a, struct ovs_key_tcp *));
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_UDP:
++ 		err = set_udp(skb, flow_key, nla_data(a),
++ 			      get_mask(a, struct ovs_key_udp *));
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_SCTP:
++ 		err = set_sctp(skb, flow_key, nla_data(a),
++ 			       get_mask(a, struct ovs_key_sctp *));
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_MPLS:
++ 		err = set_mpls(skb, flow_key, nla_data(a), get_mask(a,
++ 								    __be32 *));
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  		break;
+  	}
+  
+@@@ -731,9 -907,14 +1056,14 @@@ static int do_execute_actions(struct da
+  			break;
+  
+  		case OVS_ACTION_ATTR_SET:
+ -			err = execute_set_action(skb, key, nla_data(a));
+ +			err = execute_set_action(skb, nla_data(a));
+  			break;
+  
++ 		case OVS_ACTION_ATTR_SET_MASKED:
++ 		case OVS_ACTION_ATTR_SET_TO_MASKED:
++ 			err = execute_masked_set_action(skb, key, nla_data(a));
++ 			break;
++ 
+  		case OVS_ACTION_ATTR_SAMPLE:
+  			err = sample(dp, skb, key, a);
+  			break;
+diff --cc net/openvswitch/flow_netlink.c
+index d35e6f9713da,993281e6278d..000000000000
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@@ -1457,16 -1695,6 +1457,19 @@@ static int validate_and_copy_sample(con
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int validate_tp_port(const struct sw_flow_key *flow_key)
+ +{
+ +	if ((flow_key->eth.type == htons(ETH_P_IP) ||
+ +	     flow_key->eth.type == htons(ETH_P_IPV6)) &&
+ +	    (flow_key->tp.src || flow_key->tp.dst))
+ +		return 0;
+ +
+ +	return -EINVAL;
+ +}
+ +
+++=======
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  void ovs_match_init(struct sw_flow_match *match,
+  		    struct sw_flow_key *key,
+  		    struct sw_flow_mask *mask)
+@@@ -1555,7 -1812,7 +1572,11 @@@ static bool validate_masked(u8 *data, i
+  static int validate_set(const struct nlattr *a,
+  			const struct sw_flow_key *flow_key,
+  			struct sw_flow_actions **sfa,
+++<<<<<<< HEAD
+ +			bool *set_tun)
+++=======
++ 			bool *skip_copy, __be16 eth_type, bool masked, bool log)
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  {
+  	const struct nlattr *ovs_key = nla_data(a);
+  	int key_type = nla_type(ovs_key);
+@@@ -1564,9 -1822,16 +1586,21 @@@
+  	if (nla_total_size(nla_len(ovs_key)) != nla_len(a))
+  		return -EINVAL;
+  
++ 	key_len = nla_len(ovs_key);
++ 	if (masked)
++ 		key_len /= 2;
++ 
+  	if (key_type > OVS_KEY_ATTR_MAX ||
+++<<<<<<< HEAD
+ +	    (ovs_key_lens[key_type] != nla_len(ovs_key) &&
+ +	     ovs_key_lens[key_type] != -1))
+++=======
++ 	    (ovs_key_lens[key_type].len != key_len &&
++ 	     ovs_key_lens[key_type].len != OVS_ATTR_NESTED))
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
++ 		return -EINVAL;
++ 
++ 	if (masked && !validate_masked(nla_data(ovs_key), key_len))
+  		return -EINVAL;
+  
+  	switch (key_type) {
+@@@ -1580,64 -1845,95 +1614,112 @@@
+  		break;
+  
+  	case OVS_KEY_ATTR_TUNNEL:
+++<<<<<<< HEAD
+ +		*set_tun = true;
+ +		err = validate_and_copy_set_tun(a, sfa);
+++=======
++ 		if (eth_p_mpls(eth_type))
++ 			return -EINVAL;
++ 
++ 		if (masked)
++ 			return -EINVAL; /* Masked tunnel set not supported. */
++ 
++ 		*skip_copy = true;
++ 		err = validate_and_copy_set_tun(a, sfa, log);
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  		if (err)
+  			return err;
+  		break;
+  
+  	case OVS_KEY_ATTR_IPV4:
+ -		if (eth_type != htons(ETH_P_IP))
+ +		if (flow_key->eth.type != htons(ETH_P_IP))
+  			return -EINVAL;
+  
+- 		if (!flow_key->ip.proto)
+- 			return -EINVAL;
+- 
+  		ipv4_key = nla_data(ovs_key);
+- 		if (ipv4_key->ipv4_proto != flow_key->ip.proto)
+- 			return -EINVAL;
+  
+- 		if (ipv4_key->ipv4_frag != flow_key->ip.frag)
+- 			return -EINVAL;
++ 		if (masked) {
++ 			const struct ovs_key_ipv4 *mask = ipv4_key + 1;
+  
++ 			/* Non-writeable fields. */
++ 			if (mask->ipv4_proto || mask->ipv4_frag)
++ 				return -EINVAL;
++ 		} else {
++ 			if (ipv4_key->ipv4_proto != flow_key->ip.proto)
++ 				return -EINVAL;
++ 
++ 			if (ipv4_key->ipv4_frag != flow_key->ip.frag)
++ 				return -EINVAL;
++ 		}
+  		break;
+  
+  	case OVS_KEY_ATTR_IPV6:
+ -		if (eth_type != htons(ETH_P_IPV6))
+ +		if (flow_key->eth.type != htons(ETH_P_IPV6))
+  			return -EINVAL;
+  
+- 		if (!flow_key->ip.proto)
+- 			return -EINVAL;
+- 
+  		ipv6_key = nla_data(ovs_key);
+- 		if (ipv6_key->ipv6_proto != flow_key->ip.proto)
+- 			return -EINVAL;
+  
+- 		if (ipv6_key->ipv6_frag != flow_key->ip.frag)
+- 			return -EINVAL;
++ 		if (masked) {
++ 			const struct ovs_key_ipv6 *mask = ipv6_key + 1;
++ 
++ 			/* Non-writeable fields. */
++ 			if (mask->ipv6_proto || mask->ipv6_frag)
++ 				return -EINVAL;
+  
++ 			/* Invalid bits in the flow label mask? */
++ 			if (ntohl(mask->ipv6_label) & 0xFFF00000)
++ 				return -EINVAL;
++ 		} else {
++ 			if (ipv6_key->ipv6_proto != flow_key->ip.proto)
++ 				return -EINVAL;
++ 
++ 			if (ipv6_key->ipv6_frag != flow_key->ip.frag)
++ 				return -EINVAL;
++ 		}
+  		if (ntohl(ipv6_key->ipv6_label) & 0xFFF00000)
+  			return -EINVAL;
+  
+  		break;
+  
+  	case OVS_KEY_ATTR_TCP:
+- 		if (flow_key->ip.proto != IPPROTO_TCP)
++ 		if ((eth_type != htons(ETH_P_IP) &&
++ 		     eth_type != htons(ETH_P_IPV6)) ||
++ 		    flow_key->ip.proto != IPPROTO_TCP)
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		return validate_tp_port(flow_key);
+++=======
++ 		break;
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  
+  	case OVS_KEY_ATTR_UDP:
+- 		if (flow_key->ip.proto != IPPROTO_UDP)
++ 		if ((eth_type != htons(ETH_P_IP) &&
++ 		     eth_type != htons(ETH_P_IPV6)) ||
++ 		    flow_key->ip.proto != IPPROTO_UDP)
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		return validate_tp_port(flow_key);
+++=======
++ 		break;
++ 
++ 	case OVS_KEY_ATTR_MPLS:
++ 		if (!eth_p_mpls(eth_type))
++ 			return -EINVAL;
++ 		break;
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  
+  	case OVS_KEY_ATTR_SCTP:
+- 		if (flow_key->ip.proto != IPPROTO_SCTP)
++ 		if ((eth_type != htons(ETH_P_IP) &&
++ 		     eth_type != htons(ETH_P_IPV6)) ||
++ 		    flow_key->ip.proto != IPPROTO_SCTP)
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		return validate_tp_port(flow_key);
+++=======
++ 		break;
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  
+  	default:
+  		return -EINVAL;
+@@@ -1757,8 -2086,52 +1868,20 @@@ int ovs_nla_copy_actions(const struct n
+  		case OVS_ACTION_ATTR_RECIRC:
+  			break;
+  
+ -		case OVS_ACTION_ATTR_PUSH_MPLS: {
+ -			const struct ovs_action_push_mpls *mpls = nla_data(a);
+ -
+ -			if (!eth_p_mpls(mpls->mpls_ethertype))
+ -				return -EINVAL;
+ -			/* Prohibit push MPLS other than to a white list
+ -			 * for packets that have a known tag order.
+ -			 */
+ -			if (vlan_tci & htons(VLAN_TAG_PRESENT) ||
+ -			    (eth_type != htons(ETH_P_IP) &&
+ -			     eth_type != htons(ETH_P_IPV6) &&
+ -			     eth_type != htons(ETH_P_ARP) &&
+ -			     eth_type != htons(ETH_P_RARP) &&
+ -			     !eth_p_mpls(eth_type)))
+ -				return -EINVAL;
+ -			eth_type = mpls->mpls_ethertype;
+ -			break;
+ -		}
+ -
+ -		case OVS_ACTION_ATTR_POP_MPLS:
+ -			if (vlan_tci & htons(VLAN_TAG_PRESENT) ||
+ -			    !eth_p_mpls(eth_type))
+ -				return -EINVAL;
+ -
+ -			/* Disallow subsequent L2.5+ set and mpls_pop actions
+ -			 * as there is no check here to ensure that the new
+ -			 * eth_type is valid and thus set actions could
+ -			 * write off the end of the packet or otherwise
+ -			 * corrupt it.
+ -			 *
+ -			 * Support for these actions is planned using packet
+ -			 * recirculation.
+ -			 */
+ -			eth_type = htons(0);
+ -			break;
+ -
+  		case OVS_ACTION_ATTR_SET:
+++<<<<<<< HEAD
+ +			err = validate_set(a, key, sfa, &skip_copy);
+++=======
++ 			err = validate_set(a, key, sfa,
++ 					   &skip_copy, eth_type, false, log);
++ 			if (err)
++ 				return err;
++ 			break;
++ 
++ 		case OVS_ACTION_ATTR_SET_MASKED:
++ 			err = validate_set(a, key, sfa,
++ 					   &skip_copy, eth_type, true, log);
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  			if (err)
+  				return err;
+  			break;
+@@@ -1787,6 -2161,25 +1910,28 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* 'key' must be the masked key. */
++ int ovs_nla_copy_actions(const struct nlattr *attr,
++ 			 const struct sw_flow_key *key,
++ 			 struct sw_flow_actions **sfa, bool log)
++ {
++ 	int err;
++ 
++ 	*sfa = nla_alloc_flow_actions(nla_len(attr), log);
++ 	if (IS_ERR(*sfa))
++ 		return PTR_ERR(*sfa);
++ 
++ 	err = __ovs_nla_copy_actions(attr, key, 0, sfa, key->eth.type,
++ 				     key->eth.tci, log);
++ 	if (err)
++ 		kfree(*sfa);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 83d2b9ba1abc (net: openvswitch: Support masked set actions.)
+  static int sample_action_to_attr(const struct nlattr *attr, struct sk_buff *skb)
+  {
+  	const struct nlattr *a;
+* Unmerged path include/uapi/linux/openvswitch.h
+* Unmerged path net/openvswitch/actions.c
+* Unmerged path net/openvswitch/flow_netlink.c
