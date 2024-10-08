@@ -1,0 +1,400 @@
+drm/radeon: add locking around atombios scratch space usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] radeon: add locking around atombios scratch space usage (Rob Clark) [1173317]
+Rebuild_FUZZ: 96.49%
+commit-author Dave Airlie <airlied@redhat.com>
+commit 1c9498425453bb65ef339a57705c5ef59fe1541d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1c949842.failed
+
+While developing MST support I noticed I often got the wrong data
+back from a transaction, in a racy fashion. I noticed the scratch
+space wasn't locked against concurrent users.
+
+Based on a patch by Alex, but I've made it a bit more obvious when
+things are locked.
+
+	Signed-off-by: Dave Airlie <airlied@redhat.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 1c9498425453bb65ef339a57705c5ef59fe1541d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/radeon/atombios_dp.c
+#	drivers/gpu/drm/radeon/atombios_i2c.c
+diff --cc drivers/gpu/drm/radeon/atombios_dp.c
+index 00885417ffff,11ba9d21b89b..000000000000
+--- a/drivers/gpu/drm/radeon/atombios_dp.c
++++ b/drivers/gpu/drm/radeon/atombios_dp.c
+@@@ -98,6 -98,10 +98,12 @@@ static int radeon_process_aux_ch(struc
+  
+  	memset(&args, 0, sizeof(args));
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&chan->mutex);
++ 	mutex_lock(&rdev->mode_info.atom_context->scratch_mutex);
++ 
+++>>>>>>> 1c9498425453 (drm/radeon: add locking around atombios scratch space usage)
+  	base = (unsigned char *)(rdev->mode_info.atom_context->scratch + 1);
+  
+  	radeon_atom_copy_swap(base, send, send_bytes, true);
+@@@ -139,187 -146,90 +145,196 @@@
+  	if (recv && recv_size)
+  		radeon_atom_copy_swap(recv, base + 16, recv_bytes, false);
+  
+++<<<<<<< HEAD
+ +	return recv_bytes;
+++=======
++ 	r = recv_bytes;
++ done:
++ 	mutex_unlock(&rdev->mode_info.atom_context->scratch_mutex);
++ 	mutex_unlock(&chan->mutex);
++ 
++ 	return r;
+++>>>>>>> 1c9498425453 (drm/radeon: add locking around atombios scratch space usage)
+  }
+  
+ -#define BARE_ADDRESS_SIZE 3
+ -#define HEADER_SIZE (BARE_ADDRESS_SIZE + 1)
+ -
+ -static ssize_t
+ -radeon_dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
+ +static int radeon_dp_aux_native_write(struct radeon_connector *radeon_connector,
+ +				      u16 address, u8 *send, u8 send_bytes, u8 delay)
+  {
+ -	struct radeon_i2c_chan *chan =
+ -		container_of(aux, struct radeon_i2c_chan, aux);
+ +	struct radeon_connector_atom_dig *dig_connector = radeon_connector->con_priv;
+  	int ret;
+ -	u8 tx_buf[20];
+ -	size_t tx_size;
+ -	u8 ack, delay = 0;
+ -
+ -	if (WARN_ON(msg->size > 16))
+ -		return -E2BIG;
+ -
+ -	tx_buf[0] = msg->address & 0xff;
+ -	tx_buf[1] = msg->address >> 8;
+ -	tx_buf[2] = msg->request << 4;
+ -	tx_buf[3] = msg->size ? (msg->size - 1) : 0;
+ -
+ -	switch (msg->request & ~DP_AUX_I2C_MOT) {
+ -	case DP_AUX_NATIVE_WRITE:
+ -	case DP_AUX_I2C_WRITE:
+ -		/* tx_size needs to be 4 even for bare address packets since the atom
+ -		 * table needs the info in tx_buf[3].
+ -		 */
+ -		tx_size = HEADER_SIZE + msg->size;
+ -		if (msg->size == 0)
+ -			tx_buf[3] |= BARE_ADDRESS_SIZE << 4;
+ +	u8 msg[20];
+ +	int msg_bytes = send_bytes + 4;
+ +	u8 ack;
+ +	unsigned retry;
+ +
+ +	if (send_bytes > 16)
+ +		return -1;
+ +
+ +	msg[0] = address;
+ +	msg[1] = address >> 8;
+ +	msg[2] = AUX_NATIVE_WRITE << 4;
+ +	msg[3] = (msg_bytes << 4) | (send_bytes - 1);
+ +	memcpy(&msg[4], send, send_bytes);
+ +
+ +	for (retry = 0; retry < 4; retry++) {
+ +		ret = radeon_process_aux_ch(dig_connector->dp_i2c_bus,
+ +					    msg, msg_bytes, NULL, 0, delay, &ack);
+ +		if (ret == -EBUSY)
+ +			continue;
+ +		else if (ret < 0)
+ +			return ret;
+ +		if ((ack & AUX_NATIVE_REPLY_MASK) == AUX_NATIVE_REPLY_ACK)
+ +			return send_bytes;
+ +		else if ((ack & AUX_NATIVE_REPLY_MASK) == AUX_NATIVE_REPLY_DEFER)
+ +			udelay(400);
+  		else
+ -			tx_buf[3] |= tx_size << 4;
+ -		memcpy(tx_buf + HEADER_SIZE, msg->buffer, msg->size);
+ -		ret = radeon_process_aux_ch(chan,
+ -					    tx_buf, tx_size, NULL, 0, delay, &ack);
+ -		if (ret >= 0)
+ -			/* Return payload size. */
+ -			ret = msg->size;
+ -		break;
+ -	case DP_AUX_NATIVE_READ:
+ -	case DP_AUX_I2C_READ:
+ -		/* tx_size needs to be 4 even for bare address packets since the atom
+ -		 * table needs the info in tx_buf[3].
+ -		 */
+ -		tx_size = HEADER_SIZE;
+ -		if (msg->size == 0)
+ -			tx_buf[3] |= BARE_ADDRESS_SIZE << 4;
+ +			return -EIO;
+ +	}
+ +
+ +	return -EIO;
+ +}
+ +
+ +static int radeon_dp_aux_native_read(struct radeon_connector *radeon_connector,
+ +				     u16 address, u8 *recv, int recv_bytes, u8 delay)
+ +{
+ +	struct radeon_connector_atom_dig *dig_connector = radeon_connector->con_priv;
+ +	u8 msg[4];
+ +	int msg_bytes = 4;
+ +	u8 ack;
+ +	int ret;
+ +	unsigned retry;
+ +
+ +	msg[0] = address;
+ +	msg[1] = address >> 8;
+ +	msg[2] = AUX_NATIVE_READ << 4;
+ +	msg[3] = (msg_bytes << 4) | (recv_bytes - 1);
+ +
+ +	for (retry = 0; retry < 4; retry++) {
+ +		ret = radeon_process_aux_ch(dig_connector->dp_i2c_bus,
+ +					    msg, msg_bytes, recv, recv_bytes, delay, &ack);
+ +		if (ret == -EBUSY)
+ +			continue;
+ +		else if (ret < 0)
+ +			return ret;
+ +		if ((ack & AUX_NATIVE_REPLY_MASK) == AUX_NATIVE_REPLY_ACK)
+ +			return ret;
+ +		else if ((ack & AUX_NATIVE_REPLY_MASK) == AUX_NATIVE_REPLY_DEFER)
+ +			udelay(400);
+ +		else if (ret == 0)
+ +			return -EPROTO;
+  		else
+ -			tx_buf[3] |= tx_size << 4;
+ -		ret = radeon_process_aux_ch(chan,
+ -					    tx_buf, tx_size, msg->buffer, msg->size, delay, &ack);
+ -		break;
+ -	default:
+ -		ret = -EINVAL;
+ -		break;
+ +			return -EIO;
+  	}
+  
+ -	if (ret >= 0)
+ -		msg->reply = ack >> 4;
+ +	return -EIO;
+ +}
+ +
+ +static void radeon_write_dpcd_reg(struct radeon_connector *radeon_connector,
+ +				 u16 reg, u8 val)
+ +{
+ +	radeon_dp_aux_native_write(radeon_connector, reg, &val, 1, 0);
+ +}
+ +
+ +static u8 radeon_read_dpcd_reg(struct radeon_connector *radeon_connector,
+ +			       u16 reg)
+ +{
+ +	u8 val = 0;
+ +
+ +	radeon_dp_aux_native_read(radeon_connector, reg, &val, 1, 0);
+  
+ -	return ret;
+ +	return val;
+  }
+  
+ -void radeon_dp_aux_init(struct radeon_connector *radeon_connector)
+ +int radeon_dp_i2c_aux_ch(struct i2c_adapter *adapter, int mode,
+ +			 u8 write_byte, u8 *read_byte)
+  {
+ +	struct i2c_algo_dp_aux_data *algo_data = adapter->algo_data;
+ +	struct radeon_i2c_chan *auxch = (struct radeon_i2c_chan *)adapter;
+ +	u16 address = algo_data->address;
+ +	u8 msg[5];
+ +	u8 reply[2];
+ +	unsigned retry;
+ +	int msg_bytes;
+ +	int reply_bytes = 1;
+  	int ret;
+ +	u8 ack;
+ +
+ +	/* Set up the command byte */
+ +	if (mode & MODE_I2C_READ)
+ +		msg[2] = AUX_I2C_READ << 4;
+ +	else
+ +		msg[2] = AUX_I2C_WRITE << 4;
+ +
+ +	if (!(mode & MODE_I2C_STOP))
+ +		msg[2] |= AUX_I2C_MOT << 4;
+ +
+ +	msg[0] = address;
+ +	msg[1] = address >> 8;
+ +
+ +	switch (mode) {
+ +	case MODE_I2C_WRITE:
+ +		msg_bytes = 5;
+ +		msg[3] = msg_bytes << 4;
+ +		msg[4] = write_byte;
+ +		break;
+ +	case MODE_I2C_READ:
+ +		msg_bytes = 4;
+ +		msg[3] = msg_bytes << 4;
+ +		break;
+ +	default:
+ +		msg_bytes = 4;
+ +		msg[3] = 3 << 4;
+ +		break;
+ +	}
+  
+ -	radeon_connector->ddc_bus->rec.hpd = radeon_connector->hpd.hpd;
+ -	radeon_connector->ddc_bus->aux.dev = radeon_connector->base.kdev;
+ -	radeon_connector->ddc_bus->aux.transfer = radeon_dp_aux_transfer;
+ +	for (retry = 0; retry < 4; retry++) {
+ +		ret = radeon_process_aux_ch(auxch,
+ +					    msg, msg_bytes, reply, reply_bytes, 0, &ack);
+ +		if (ret == -EBUSY)
+ +			continue;
+ +		else if (ret < 0) {
+ +			DRM_DEBUG_KMS("aux_ch failed %d\n", ret);
+ +			return ret;
+ +		}
+  
+ -	ret = drm_dp_aux_register(&radeon_connector->ddc_bus->aux);
+ -	if (!ret)
+ -		radeon_connector->ddc_bus->has_aux = true;
+ +		switch (ack & AUX_NATIVE_REPLY_MASK) {
+ +		case AUX_NATIVE_REPLY_ACK:
+ +			/* I2C-over-AUX Reply field is only valid
+ +			 * when paired with AUX ACK.
+ +			 */
+ +			break;
+ +		case AUX_NATIVE_REPLY_NACK:
+ +			DRM_DEBUG_KMS("aux_ch native nack\n");
+ +			return -EREMOTEIO;
+ +		case AUX_NATIVE_REPLY_DEFER:
+ +			DRM_DEBUG_KMS("aux_ch native defer\n");
+ +			udelay(400);
+ +			continue;
+ +		default:
+ +			DRM_ERROR("aux_ch invalid native reply 0x%02x\n", ack);
+ +			return -EREMOTEIO;
+ +		}
+  
+ -	WARN(ret, "drm_dp_aux_register() failed with error %d\n", ret);
+ +		switch (ack & AUX_I2C_REPLY_MASK) {
+ +		case AUX_I2C_REPLY_ACK:
+ +			if (mode == MODE_I2C_READ)
+ +				*read_byte = reply[0];
+ +			return ret;
+ +		case AUX_I2C_REPLY_NACK:
+ +			DRM_DEBUG_KMS("aux_i2c nack\n");
+ +			return -EREMOTEIO;
+ +		case AUX_I2C_REPLY_DEFER:
+ +			DRM_DEBUG_KMS("aux_i2c defer\n");
+ +			udelay(400);
+ +			break;
+ +		default:
+ +			DRM_ERROR("aux_i2c invalid reply 0x%02x\n", ack);
+ +			return -EREMOTEIO;
+ +		}
+ +	}
+ +
+ +	DRM_DEBUG_KMS("aux i2c too many retries, giving up\n");
+ +	return -EREMOTEIO;
+  }
+  
+  /***** general DP utility functions *****/
+diff --cc drivers/gpu/drm/radeon/atombios_i2c.c
+index f685035dbe39,4157780585a0..000000000000
+--- a/drivers/gpu/drm/radeon/atombios_i2c.c
++++ b/drivers/gpu/drm/radeon/atombios_i2c.c
+@@@ -48,6 -46,10 +48,12 @@@ static int radeon_process_i2c_ch(struc
+  
+  	memset(&args, 0, sizeof(args));
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&chan->mutex);
++ 	mutex_lock(&rdev->mode_info.atom_context->scratch_mutex);
++ 
+++>>>>>>> 1c9498425453 (drm/radeon: add locking around atombios scratch space usage)
+  	base = (unsigned char *)rdev->mode_info.atom_context->scratch;
+  
+  	if (flags & HW_I2C_WRITE) {
+@@@ -90,7 -95,11 +96,15 @@@
+  	if (!(flags & HW_I2C_WRITE))
+  		radeon_atom_copy_swap(buf, base, num, false);
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ done:
++ 	mutex_unlock(&rdev->mode_info.atom_context->scratch_mutex);
++ 	mutex_unlock(&chan->mutex);
++ 
++ 	return r;
+++>>>>>>> 1c9498425453 (drm/radeon: add locking around atombios scratch space usage)
+  }
+  
+  int radeon_atom_hw_i2c_xfer(struct i2c_adapter *i2c_adap,
+diff --git a/drivers/gpu/drm/radeon/atom.c b/drivers/gpu/drm/radeon/atom.c
+index 15da7ef344a4..ec1593a6a561 100644
+--- a/drivers/gpu/drm/radeon/atom.c
++++ b/drivers/gpu/drm/radeon/atom.c
+@@ -1217,7 +1217,7 @@ free:
+ 	return ret;
+ }
+ 
+-int atom_execute_table(struct atom_context *ctx, int index, uint32_t * params)
++int atom_execute_table_scratch_unlocked(struct atom_context *ctx, int index, uint32_t * params)
+ {
+ 	int r;
+ 
+@@ -1238,6 +1238,15 @@ int atom_execute_table(struct atom_context *ctx, int index, uint32_t * params)
+ 	return r;
+ }
+ 
++int atom_execute_table(struct atom_context *ctx, int index, uint32_t * params)
++{
++	int r;
++	mutex_lock(&ctx->scratch_mutex);
++	r = atom_execute_table_scratch_unlocked(ctx, index, params);
++	mutex_unlock(&ctx->scratch_mutex);
++	return r;
++}
++
+ static int atom_iio_len[] = { 1, 2, 3, 3, 3, 3, 4, 4, 4, 3 };
+ 
+ static void atom_index_iio(struct atom_context *ctx, int base)
+diff --git a/drivers/gpu/drm/radeon/atom.h b/drivers/gpu/drm/radeon/atom.h
+index feba6b8d36b3..6d014ddb6b78 100644
+--- a/drivers/gpu/drm/radeon/atom.h
++++ b/drivers/gpu/drm/radeon/atom.h
+@@ -125,6 +125,7 @@ struct card_info {
+ struct atom_context {
+ 	struct card_info *card;
+ 	struct mutex mutex;
++	struct mutex scratch_mutex;
+ 	void *bios;
+ 	uint32_t cmd_table, data_table;
+ 	uint16_t *iio;
+@@ -145,6 +146,7 @@ extern int atom_debug;
+ 
+ struct atom_context *atom_parse(struct card_info *, void *);
+ int atom_execute_table(struct atom_context *, int, uint32_t *);
++int atom_execute_table_scratch_unlocked(struct atom_context *, int, uint32_t *);
+ int atom_asic_init(struct atom_context *);
+ void atom_destroy(struct atom_context *);
+ bool atom_parse_data_header(struct atom_context *ctx, int index, uint16_t *size,
+* Unmerged path drivers/gpu/drm/radeon/atombios_dp.c
+* Unmerged path drivers/gpu/drm/radeon/atombios_i2c.c
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 26d211241388..deba6c20c0bc 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -893,6 +893,7 @@ int radeon_atombios_init(struct radeon_device *rdev)
+ 	}
+ 
+ 	mutex_init(&rdev->mode_info.atom_context->mutex);
++	mutex_init(&rdev->mode_info.atom_context->scratch_mutex);
+ 	radeon_atom_initialize_bios_scratch_regs(rdev->ddev);
+ 	atom_allocate_fb_scratch(rdev->mode_info.atom_context);
+ 	return 0;
