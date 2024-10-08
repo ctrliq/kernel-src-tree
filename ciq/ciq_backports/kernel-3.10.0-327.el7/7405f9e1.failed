@@ -1,0 +1,287 @@
+nfs41: pull nfs4_ds_connect from file layout to generic pnfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit 7405f9e195aab95e147cc225f203d11fa74b65a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7405f9e1.failed
+
+It can be reused by flexfiles layout client.
+
+	Reviewed-by: Jeff Layton <jlayton@primarydata.com>
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Tom Haynes <Thomas.Haynes@primarydata.com>
+(cherry picked from commit 7405f9e195aab95e147cc225f203d11fa74b65a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/filelayout/filelayoutdev.c
+#	fs/nfs/pnfs.h
+#	fs/nfs/pnfs_nfs.c
+diff --cc fs/nfs/filelayout/filelayoutdev.c
+index b394f8c6697b,27bdd8ce177e..000000000000
+--- a/fs/nfs/filelayout/filelayoutdev.c
++++ b/fs/nfs/filelayout/filelayoutdev.c
+@@@ -42,184 -41,6 +42,187 @@@
+  static unsigned int dataserver_timeo = NFS4_DEF_DS_TIMEO;
+  static unsigned int dataserver_retrans = NFS4_DEF_DS_RETRANS;
+  
+++<<<<<<< HEAD
+ +/*
+ + * Data server cache
+ + *
+ + * Data servers can be mapped to different device ids.
+ + * nfs4_pnfs_ds reference counting
+ + *   - set to 1 on allocation
+ + *   - incremented when a device id maps a data server already in the cache.
+ + *   - decremented when deviceid is removed from the cache.
+ + */
+ +static DEFINE_SPINLOCK(nfs4_ds_cache_lock);
+ +static LIST_HEAD(nfs4_data_server_cache);
+ +
+ +/* Debug routines */
+ +void
+ +print_ds(struct nfs4_pnfs_ds *ds)
+ +{
+ +	if (ds == NULL) {
+ +		printk("%s NULL device\n", __func__);
+ +		return;
+ +	}
+ +	printk("        ds %s\n"
+ +		"        ref count %d\n"
+ +		"        client %p\n"
+ +		"        cl_exchange_flags %x\n",
+ +		ds->ds_remotestr,
+ +		atomic_read(&ds->ds_count), ds->ds_clp,
+ +		ds->ds_clp ? ds->ds_clp->cl_exchange_flags : 0);
+ +}
+ +
+ +static bool
+ +same_sockaddr(struct sockaddr *addr1, struct sockaddr *addr2)
+ +{
+ +	struct sockaddr_in *a, *b;
+ +	struct sockaddr_in6 *a6, *b6;
+ +
+ +	if (addr1->sa_family != addr2->sa_family)
+ +		return false;
+ +
+ +	switch (addr1->sa_family) {
+ +	case AF_INET:
+ +		a = (struct sockaddr_in *)addr1;
+ +		b = (struct sockaddr_in *)addr2;
+ +
+ +		if (a->sin_addr.s_addr == b->sin_addr.s_addr &&
+ +		    a->sin_port == b->sin_port)
+ +			return true;
+ +		break;
+ +
+ +	case AF_INET6:
+ +		a6 = (struct sockaddr_in6 *)addr1;
+ +		b6 = (struct sockaddr_in6 *)addr2;
+ +
+ +		/* LINKLOCAL addresses must have matching scope_id */
+ +		if (ipv6_addr_src_scope(&a6->sin6_addr) ==
+ +		    IPV6_ADDR_SCOPE_LINKLOCAL &&
+ +		    a6->sin6_scope_id != b6->sin6_scope_id)
+ +			return false;
+ +
+ +		if (ipv6_addr_equal(&a6->sin6_addr, &b6->sin6_addr) &&
+ +		    a6->sin6_port == b6->sin6_port)
+ +			return true;
+ +		break;
+ +
+ +	default:
+ +		dprintk("%s: unhandled address family: %u\n",
+ +			__func__, addr1->sa_family);
+ +		return false;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +static bool
+ +_same_data_server_addrs_locked(const struct list_head *dsaddrs1,
+ +			       const struct list_head *dsaddrs2)
+ +{
+ +	struct nfs4_pnfs_ds_addr *da1, *da2;
+ +
+ +	/* step through both lists, comparing as we go */
+ +	for (da1 = list_first_entry(dsaddrs1, typeof(*da1), da_node),
+ +	     da2 = list_first_entry(dsaddrs2, typeof(*da2), da_node);
+ +	     da1 != NULL && da2 != NULL;
+ +	     da1 = list_entry(da1->da_node.next, typeof(*da1), da_node),
+ +	     da2 = list_entry(da2->da_node.next, typeof(*da2), da_node)) {
+ +		if (!same_sockaddr((struct sockaddr *)&da1->da_addr,
+ +				   (struct sockaddr *)&da2->da_addr))
+ +			return false;
+ +	}
+ +	if (da1 == NULL && da2 == NULL)
+ +		return true;
+ +
+ +	return false;
+ +}
+ +
+ +/*
+ + * Lookup DS by addresses.  nfs4_ds_cache_lock is held
+ + */
+ +static struct nfs4_pnfs_ds *
+ +_data_server_lookup_locked(const struct list_head *dsaddrs)
+ +{
+ +	struct nfs4_pnfs_ds *ds;
+ +
+ +	list_for_each_entry(ds, &nfs4_data_server_cache, ds_node)
+ +		if (_same_data_server_addrs_locked(&ds->ds_addrs, dsaddrs))
+ +			return ds;
+ +	return NULL;
+ +}
+ +
+ +/*
+ + * Create an rpc connection to the nfs4_pnfs_ds data server
+ + * Currently only supports IPv4 and IPv6 addresses
+ + */
+ +static int
+ +nfs4_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds)
+ +{
+ +	struct nfs_client *clp = ERR_PTR(-EIO);
+ +	struct nfs4_pnfs_ds_addr *da;
+ +	int status = 0;
+ +
+ +	dprintk("--> %s DS %s au_flavor %d\n", __func__, ds->ds_remotestr,
+ +		mds_srv->nfs_client->cl_rpcclient->cl_auth->au_flavor);
+ +
+ +	list_for_each_entry(da, &ds->ds_addrs, da_node) {
+ +		dprintk("%s: DS %s: trying address %s\n",
+ +			__func__, ds->ds_remotestr, da->da_remotestr);
+ +
+ +		clp = nfs4_set_ds_client(mds_srv->nfs_client,
+ +					(struct sockaddr *)&da->da_addr,
+ +					da->da_addrlen, IPPROTO_TCP,
+ +					dataserver_timeo, dataserver_retrans);
+ +		if (!IS_ERR(clp))
+ +			break;
+ +	}
+ +
+ +	if (IS_ERR(clp)) {
+ +		status = PTR_ERR(clp);
+ +		goto out;
+ +	}
+ +
+ +	status = nfs4_init_ds_session(clp, mds_srv->nfs_client->cl_lease_time);
+ +	if (status)
+ +		goto out_put;
+ +
+ +	smp_wmb();
+ +	ds->ds_clp = clp;
+ +	dprintk("%s [new] addr: %s\n", __func__, ds->ds_remotestr);
+ +out:
+ +	return status;
+ +out_put:
+ +	nfs_put_client(clp);
+ +	goto out;
+ +}
+ +
+ +static void
+ +destroy_ds(struct nfs4_pnfs_ds *ds)
+ +{
+ +	struct nfs4_pnfs_ds_addr *da;
+ +
+ +	dprintk("--> %s\n", __func__);
+ +	ifdebug(FACILITY)
+ +		print_ds(ds);
+ +
+ +	if (ds->ds_clp)
+ +		nfs_put_client(ds->ds_clp);
+ +
+ +	while (!list_empty(&ds->ds_addrs)) {
+ +		da = list_first_entry(&ds->ds_addrs,
+ +				      struct nfs4_pnfs_ds_addr,
+ +				      da_node);
+ +		list_del_init(&da->da_node);
+ +		kfree(da->da_remotestr);
+ +		kfree(da);
+ +	}
+ +
+ +	kfree(ds->ds_remotestr);
+ +	kfree(ds);
+ +}
+ +
+++=======
+++>>>>>>> 7405f9e195aa (nfs41: pull nfs4_ds_connect from file layout to generic pnfs)
+  void
+  nfs4_fl_free_deviceid(struct nfs4_file_layout_dsaddr *dsaddr)
+  {
+@@@ -682,22 -257,7 +685,26 @@@ nfs4_fl_select_ds_fh(struct pnfs_layout
+  	return flseg->fh_array[i];
+  }
+  
+++<<<<<<< HEAD
+ +static void nfs4_wait_ds_connect(struct nfs4_pnfs_ds *ds)
+ +{
+ +	might_sleep();
+ +	wait_on_bit(&ds->ds_state, NFS4DS_CONNECTING,
+ +			nfs_wait_bit_killable, TASK_KILLABLE);
+ +}
+ +
+ +static void nfs4_clear_ds_conn_bit(struct nfs4_pnfs_ds *ds)
+ +{
+ +	smp_mb__before_clear_bit();
+ +	clear_bit(NFS4DS_CONNECTING, &ds->ds_state);
+ +	smp_mb__after_clear_bit();
+ +	wake_up_bit(&ds->ds_state, NFS4DS_CONNECTING);
+ +}
+ +
+ +
+++=======
++ /* Upon return, either ds is connected, or ds is NULL */
+++>>>>>>> 7405f9e195aa (nfs41: pull nfs4_ds_connect from file layout to generic pnfs)
+  struct nfs4_pnfs_ds *
+  nfs4_fl_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx)
+  {
+diff --cc fs/nfs/pnfs.h
+index 959dfb9c2be3,9a8937c31d97..000000000000
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@@ -277,8 -292,32 +277,37 @@@ bool nfs4_put_deviceid_node(struct nfs4
+  void nfs4_mark_deviceid_unavailable(struct nfs4_deviceid_node *node);
+  bool nfs4_test_deviceid_unavailable(struct nfs4_deviceid_node *node);
+  void nfs4_deviceid_purge_client(const struct nfs_client *);
+++<<<<<<< HEAD
+ +int nfs4_deviceid_getdevicelist(struct nfs_server *server,
+ +		const struct nfs_fh *fh);
+++=======
++ 
++ /* pnfs_nfs.c */
++ void pnfs_generic_clear_request_commit(struct nfs_page *req,
++ 				       struct nfs_commit_info *cinfo);
++ void pnfs_generic_commit_release(void *calldata);
++ void pnfs_generic_prepare_to_resend_writes(struct nfs_commit_data *data);
++ void pnfs_generic_rw_release(void *data);
++ void pnfs_generic_recover_commit_reqs(struct list_head *dst,
++ 				      struct nfs_commit_info *cinfo);
++ int pnfs_generic_commit_pagelist(struct inode *inode,
++ 				 struct list_head *mds_pages,
++ 				 int how,
++ 				 struct nfs_commit_info *cinfo,
++ 				 int (*initiate_commit)(struct nfs_commit_data *data,
++ 							int how));
++ int pnfs_generic_scan_commit_lists(struct nfs_commit_info *cinfo, int max);
++ void pnfs_generic_write_commit_done(struct rpc_task *task, void *data);
++ void nfs4_pnfs_ds_put(struct nfs4_pnfs_ds *ds);
++ struct nfs4_pnfs_ds *nfs4_pnfs_ds_add(struct list_head *dsaddrs,
++ 				      gfp_t gfp_flags);
++ void nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
++ 			  struct nfs4_deviceid_node *devid, unsigned int timeo,
++ 			  unsigned int retrans);
++ struct nfs4_pnfs_ds_addr *nfs4_decode_mp_ds_addr(struct net *net,
++ 						 struct xdr_stream *xdr,
++ 						 gfp_t gfp_flags);
+++>>>>>>> 7405f9e195aa (nfs41: pull nfs4_ds_connect from file layout to generic pnfs)
+  
+  static inline struct nfs4_deviceid_node *
+  nfs4_get_deviceid(struct nfs4_deviceid_node *d)
+* Unmerged path fs/nfs/pnfs_nfs.c
+* Unmerged path fs/nfs/filelayout/filelayoutdev.c
+* Unmerged path fs/nfs/pnfs.h
+* Unmerged path fs/nfs/pnfs_nfs.c
