@@ -1,0 +1,766 @@
+drm/i915: Fix IPS related flicker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [drm] i915: Fix IPS related flicker (Rob Clark) [1249805]
+Rebuild_FUZZ: 93.55%
+commit-author Rodrigo Vivi <rodrigo.vivi@intel.com>
+commit ac88cd738425e04dbed3706621cf613a00708834
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ac88cd73.failed
+
+We cannot let IPS enabled with no plane on the pipe:
+
+BSpec: "IPS cannot be enabled until after at least one plane has
+been enabled for at least one vertical blank." and "IPS must be
+disabled while there is still at least one plane enabled on the
+same pipe as IPS." This restriction apply to HSW and BDW.
+
+However a shortcut path on update primary plane function
+to make primary plane invisible by setting DSPCTRL to 0
+was leting IPS enabled while there was no
+other plane enabled on the pipe causing flickerings that we were
+believing that it was caused by that other restriction where
+ips cannot be used when pixel rate is greater than 95% of cdclok.
+
+v2: Don't mess with Atomic path as pointed out by Ville.
+
+Reference: https://bugs.freedesktop.org/show_bug.cgi?id=85583
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Paulo Zanoni <paulo.r.zanoni@intel.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+(cherry picked from commit ac88cd738425e04dbed3706621cf613a00708834)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+#	drivers/gpu/drm/i915/intel_drv.h
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 317cab4ce037,1b61f9810387..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -11010,6 -13091,661 +11010,664 @@@ static void intel_shared_dpll_init(stru
+  	BUG_ON(dev_priv->num_shared_dpll > I915_NUM_PLLS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * intel_wm_need_update - Check whether watermarks need updating
++  * @plane: drm plane
++  * @state: new plane state
++  *
++  * Check current plane state versus the new one to determine whether
++  * watermarks need to be recalculated.
++  *
++  * Returns true or false.
++  */
++ bool intel_wm_need_update(struct drm_plane *plane,
++ 			  struct drm_plane_state *state)
++ {
++ 	/* Update watermarks on tiling changes. */
++ 	if (!plane->state->fb || !state->fb ||
++ 	    plane->state->fb->modifier[0] != state->fb->modifier[0] ||
++ 	    plane->state->rotation != state->rotation)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /**
++  * intel_prepare_plane_fb - Prepare fb for usage on plane
++  * @plane: drm plane to prepare for
++  * @fb: framebuffer to prepare for presentation
++  *
++  * Prepares a framebuffer for usage on a display plane.  Generally this
++  * involves pinning the underlying object and updating the frontbuffer tracking
++  * bits.  Some older platforms need special physical address handling for
++  * cursor planes.
++  *
++  * Returns 0 on success, negative error code on failure.
++  */
++ int
++ intel_prepare_plane_fb(struct drm_plane *plane,
++ 		       struct drm_framebuffer *fb,
++ 		       const struct drm_plane_state *new_state)
++ {
++ 	struct drm_device *dev = plane->dev;
++ 	struct intel_plane *intel_plane = to_intel_plane(plane);
++ 	enum pipe pipe = intel_plane->pipe;
++ 	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
++ 	struct drm_i915_gem_object *old_obj = intel_fb_obj(plane->fb);
++ 	unsigned frontbuffer_bits = 0;
++ 	int ret = 0;
++ 
++ 	if (!obj)
++ 		return 0;
++ 
++ 	switch (plane->type) {
++ 	case DRM_PLANE_TYPE_PRIMARY:
++ 		frontbuffer_bits = INTEL_FRONTBUFFER_PRIMARY(pipe);
++ 		break;
++ 	case DRM_PLANE_TYPE_CURSOR:
++ 		frontbuffer_bits = INTEL_FRONTBUFFER_CURSOR(pipe);
++ 		break;
++ 	case DRM_PLANE_TYPE_OVERLAY:
++ 		frontbuffer_bits = INTEL_FRONTBUFFER_SPRITE(pipe);
++ 		break;
++ 	}
++ 
++ 	mutex_lock(&dev->struct_mutex);
++ 
++ 	if (plane->type == DRM_PLANE_TYPE_CURSOR &&
++ 	    INTEL_INFO(dev)->cursor_needs_physical) {
++ 		int align = IS_I830(dev) ? 16 * 1024 : 256;
++ 		ret = i915_gem_object_attach_phys(obj, align);
++ 		if (ret)
++ 			DRM_DEBUG_KMS("failed to attach phys object\n");
++ 	} else {
++ 		ret = intel_pin_and_fence_fb_obj(plane, fb, new_state, NULL);
++ 	}
++ 
++ 	if (ret == 0)
++ 		i915_gem_track_fb(old_obj, obj, frontbuffer_bits);
++ 
++ 	mutex_unlock(&dev->struct_mutex);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * intel_cleanup_plane_fb - Cleans up an fb after plane use
++  * @plane: drm plane to clean up for
++  * @fb: old framebuffer that was on plane
++  *
++  * Cleans up a framebuffer that has just been removed from a plane.
++  */
++ void
++ intel_cleanup_plane_fb(struct drm_plane *plane,
++ 		       struct drm_framebuffer *fb,
++ 		       const struct drm_plane_state *old_state)
++ {
++ 	struct drm_device *dev = plane->dev;
++ 	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
++ 
++ 	if (WARN_ON(!obj))
++ 		return;
++ 
++ 	if (plane->type != DRM_PLANE_TYPE_CURSOR ||
++ 	    !INTEL_INFO(dev)->cursor_needs_physical) {
++ 		mutex_lock(&dev->struct_mutex);
++ 		intel_unpin_fb_obj(fb, old_state);
++ 		mutex_unlock(&dev->struct_mutex);
++ 	}
++ }
++ 
++ int
++ skl_max_scale(struct intel_crtc *intel_crtc, struct intel_crtc_state *crtc_state)
++ {
++ 	int max_scale;
++ 	struct drm_device *dev;
++ 	struct drm_i915_private *dev_priv;
++ 	int crtc_clock, cdclk;
++ 
++ 	if (!intel_crtc || !crtc_state)
++ 		return DRM_PLANE_HELPER_NO_SCALING;
++ 
++ 	dev = intel_crtc->base.dev;
++ 	dev_priv = dev->dev_private;
++ 	crtc_clock = crtc_state->base.adjusted_mode.crtc_clock;
++ 	cdclk = dev_priv->display.get_display_clock_speed(dev);
++ 
++ 	if (!crtc_clock || !cdclk)
++ 		return DRM_PLANE_HELPER_NO_SCALING;
++ 
++ 	/*
++ 	 * skl max scale is lower of:
++ 	 *    close to 3 but not 3, -1 is for that purpose
++ 	 *            or
++ 	 *    cdclk/crtc_clock
++ 	 */
++ 	max_scale = min((1 << 16) * 3 - 1, (1 << 8) * ((cdclk << 8) / crtc_clock));
++ 
++ 	return max_scale;
++ }
++ 
++ static int
++ intel_check_primary_plane(struct drm_plane *plane,
++ 			  struct intel_plane_state *state)
++ {
++ 	struct drm_device *dev = plane->dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct drm_crtc *crtc = state->base.crtc;
++ 	struct intel_crtc *intel_crtc;
++ 	struct intel_crtc_state *crtc_state;
++ 	struct drm_framebuffer *fb = state->base.fb;
++ 	struct drm_rect *dest = &state->dst;
++ 	struct drm_rect *src = &state->src;
++ 	const struct drm_rect *clip = &state->clip;
++ 	bool can_position = false;
++ 	int max_scale = DRM_PLANE_HELPER_NO_SCALING;
++ 	int min_scale = DRM_PLANE_HELPER_NO_SCALING;
++ 	int ret;
++ 
++ 	crtc = crtc ? crtc : plane->crtc;
++ 	intel_crtc = to_intel_crtc(crtc);
++ 	crtc_state = state->base.state ?
++ 		intel_atomic_get_crtc_state(state->base.state, intel_crtc) : NULL;
++ 
++ 	if (INTEL_INFO(dev)->gen >= 9) {
++ 		/* use scaler when colorkey is not required */
++ 		if (to_intel_plane(plane)->ckey.flags == I915_SET_COLORKEY_NONE) {
++ 			min_scale = 1;
++ 			max_scale = skl_max_scale(intel_crtc, crtc_state);
++ 		}
++ 		can_position = true;
++ 	}
++ 
++ 	ret = drm_plane_helper_check_update(plane, crtc, fb,
++ 					    src, dest, clip,
++ 					    min_scale,
++ 					    max_scale,
++ 					    can_position, true,
++ 					    &state->visible);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (intel_crtc->active) {
++ 		struct intel_plane_state *old_state =
++ 			to_intel_plane_state(plane->state);
++ 
++ 		intel_crtc->atomic.wait_for_flips = true;
++ 
++ 		/*
++ 		 * FBC does not work on some platforms for rotated
++ 		 * planes, so disable it when rotation is not 0 and
++ 		 * update it when rotation is set back to 0.
++ 		 *
++ 		 * FIXME: This is redundant with the fbc update done in
++ 		 * the primary plane enable function except that that
++ 		 * one is done too late. We eventually need to unify
++ 		 * this.
++ 		 */
++ 		if (state->visible &&
++ 		    INTEL_INFO(dev)->gen <= 4 && !IS_G4X(dev) &&
++ 		    dev_priv->fbc.crtc == intel_crtc &&
++ 		    state->base.rotation != BIT(DRM_ROTATE_0)) {
++ 			intel_crtc->atomic.disable_fbc = true;
++ 		}
++ 
++ 		if (state->visible && !old_state->visible) {
++ 			/*
++ 			 * BDW signals flip done immediately if the plane
++ 			 * is disabled, even if the plane enable is already
++ 			 * armed to occur at the next vblank :(
++ 			 */
++ 			if (IS_BROADWELL(dev))
++ 				intel_crtc->atomic.wait_vblank = true;
++ 		}
++ 
++ 		/*
++ 		 * FIXME: Actually if we will still have any other plane enabled
++ 		 * on the pipe we could let IPS enabled still, but for
++ 		 * now lets consider that when we make primary invisible
++ 		 * by setting DSPCNTR to 0 on update_primary_plane function
++ 		 * IPS needs to be disable.
++ 		 */
++ 		if (!state->visible || !fb)
++ 			intel_crtc->atomic.disable_ips = true;
++ 
++ 		intel_crtc->atomic.fb_bits |=
++ 			INTEL_FRONTBUFFER_PRIMARY(intel_crtc->pipe);
++ 
++ 		intel_crtc->atomic.update_fbc = true;
++ 
++ 		if (intel_wm_need_update(plane, &state->base))
++ 			intel_crtc->atomic.update_wm = true;
++ 	}
++ 
++ 	if (INTEL_INFO(dev)->gen >= 9) {
++ 		ret = skl_update_scaler_users(intel_crtc, crtc_state,
++ 			to_intel_plane(plane), state, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void
++ intel_commit_primary_plane(struct drm_plane *plane,
++ 			   struct intel_plane_state *state)
++ {
++ 	struct drm_crtc *crtc = state->base.crtc;
++ 	struct drm_framebuffer *fb = state->base.fb;
++ 	struct drm_device *dev = plane->dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct intel_crtc *intel_crtc;
++ 	struct drm_rect *src = &state->src;
++ 
++ 	crtc = crtc ? crtc : plane->crtc;
++ 	intel_crtc = to_intel_crtc(crtc);
++ 
++ 	plane->fb = fb;
++ 	crtc->x = src->x1 >> 16;
++ 	crtc->y = src->y1 >> 16;
++ 
++ 	if (intel_crtc->active) {
++ 		if (state->visible)
++ 			/* FIXME: kill this fastboot hack */
++ 			intel_update_pipe_size(intel_crtc);
++ 
++ 		dev_priv->display.update_primary_plane(crtc, plane->fb,
++ 						       crtc->x, crtc->y);
++ 	}
++ }
++ 
++ static void
++ intel_disable_primary_plane(struct drm_plane *plane,
++ 			    struct drm_crtc *crtc,
++ 			    bool force)
++ {
++ 	struct drm_device *dev = plane->dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 
++ 	dev_priv->display.update_primary_plane(crtc, NULL, 0, 0);
++ }
++ 
++ static void intel_begin_crtc_commit(struct drm_crtc *crtc)
++ {
++ 	struct drm_device *dev = crtc->dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 	struct intel_plane *intel_plane;
++ 	struct drm_plane *p;
++ 	unsigned fb_bits = 0;
++ 
++ 	/* Track fb's for any planes being disabled */
++ 	list_for_each_entry(p, &dev->mode_config.plane_list, head) {
++ 		intel_plane = to_intel_plane(p);
++ 
++ 		if (intel_crtc->atomic.disabled_planes &
++ 		    (1 << drm_plane_index(p))) {
++ 			switch (p->type) {
++ 			case DRM_PLANE_TYPE_PRIMARY:
++ 				fb_bits = INTEL_FRONTBUFFER_PRIMARY(intel_plane->pipe);
++ 				break;
++ 			case DRM_PLANE_TYPE_CURSOR:
++ 				fb_bits = INTEL_FRONTBUFFER_CURSOR(intel_plane->pipe);
++ 				break;
++ 			case DRM_PLANE_TYPE_OVERLAY:
++ 				fb_bits = INTEL_FRONTBUFFER_SPRITE(intel_plane->pipe);
++ 				break;
++ 			}
++ 
++ 			mutex_lock(&dev->struct_mutex);
++ 			i915_gem_track_fb(intel_fb_obj(p->fb), NULL, fb_bits);
++ 			mutex_unlock(&dev->struct_mutex);
++ 		}
++ 	}
++ 
++ 	if (intel_crtc->atomic.wait_for_flips)
++ 		intel_crtc_wait_for_pending_flips(crtc);
++ 
++ 	if (intel_crtc->atomic.disable_fbc)
++ 		intel_fbc_disable(dev);
++ 
++ 	if (intel_crtc->atomic.disable_ips)
++ 		hsw_disable_ips(intel_crtc);
++ 
++ 	if (intel_crtc->atomic.pre_disable_primary)
++ 		intel_pre_disable_primary(crtc);
++ 
++ 	if (intel_crtc->atomic.update_wm)
++ 		intel_update_watermarks(crtc);
++ 
++ 	intel_runtime_pm_get(dev_priv);
++ 
++ 	/* Perform vblank evasion around commit operation */
++ 	if (intel_crtc->active)
++ 		intel_crtc->atomic.evade =
++ 			intel_pipe_update_start(intel_crtc,
++ 						&intel_crtc->atomic.start_vbl_count);
++ }
++ 
++ static void intel_finish_crtc_commit(struct drm_crtc *crtc)
++ {
++ 	struct drm_device *dev = crtc->dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 	struct drm_plane *p;
++ 
++ 	if (intel_crtc->atomic.evade)
++ 		intel_pipe_update_end(intel_crtc,
++ 				      intel_crtc->atomic.start_vbl_count);
++ 
++ 	intel_runtime_pm_put(dev_priv);
++ 
++ 	if (intel_crtc->atomic.wait_vblank)
++ 		intel_wait_for_vblank(dev, intel_crtc->pipe);
++ 
++ 	intel_frontbuffer_flip(dev, intel_crtc->atomic.fb_bits);
++ 
++ 	if (intel_crtc->atomic.update_fbc) {
++ 		mutex_lock(&dev->struct_mutex);
++ 		intel_fbc_update(dev);
++ 		mutex_unlock(&dev->struct_mutex);
++ 	}
++ 
++ 	if (intel_crtc->atomic.post_enable_primary)
++ 		intel_post_enable_primary(crtc);
++ 
++ 	drm_for_each_legacy_plane(p, &dev->mode_config.plane_list)
++ 		if (intel_crtc->atomic.update_sprite_watermarks & drm_plane_index(p))
++ 			intel_update_sprite_watermarks(p, crtc, 0, 0, 0,
++ 						       false, false);
++ 
++ 	memset(&intel_crtc->atomic, 0, sizeof(intel_crtc->atomic));
++ }
++ 
++ /**
++  * intel_plane_destroy - destroy a plane
++  * @plane: plane to destroy
++  *
++  * Common destruction function for all types of planes (primary, cursor,
++  * sprite).
++  */
++ void intel_plane_destroy(struct drm_plane *plane)
++ {
++ 	struct intel_plane *intel_plane = to_intel_plane(plane);
++ 	drm_plane_cleanup(plane);
++ 	kfree(intel_plane);
++ }
++ 
++ const struct drm_plane_funcs intel_plane_funcs = {
++ 	.update_plane = drm_atomic_helper_update_plane,
++ 	.disable_plane = drm_atomic_helper_disable_plane,
++ 	.destroy = intel_plane_destroy,
++ 	.set_property = drm_atomic_helper_plane_set_property,
++ 	.atomic_get_property = intel_plane_atomic_get_property,
++ 	.atomic_set_property = intel_plane_atomic_set_property,
++ 	.atomic_duplicate_state = intel_plane_duplicate_state,
++ 	.atomic_destroy_state = intel_plane_destroy_state,
++ 
++ };
++ 
++ static struct drm_plane *intel_primary_plane_create(struct drm_device *dev,
++ 						    int pipe)
++ {
++ 	struct intel_plane *primary;
++ 	struct intel_plane_state *state;
++ 	const uint32_t *intel_primary_formats;
++ 	int num_formats;
++ 
++ 	primary = kzalloc(sizeof(*primary), GFP_KERNEL);
++ 	if (primary == NULL)
++ 		return NULL;
++ 
++ 	state = intel_create_plane_state(&primary->base);
++ 	if (!state) {
++ 		kfree(primary);
++ 		return NULL;
++ 	}
++ 	primary->base.state = &state->base;
++ 
++ 	primary->can_scale = false;
++ 	primary->max_downscale = 1;
++ 	if (INTEL_INFO(dev)->gen >= 9) {
++ 		primary->can_scale = true;
++ 		state->scaler_id = -1;
++ 	}
++ 	primary->pipe = pipe;
++ 	primary->plane = pipe;
++ 	primary->check_plane = intel_check_primary_plane;
++ 	primary->commit_plane = intel_commit_primary_plane;
++ 	primary->disable_plane = intel_disable_primary_plane;
++ 	primary->ckey.flags = I915_SET_COLORKEY_NONE;
++ 	if (HAS_FBC(dev) && INTEL_INFO(dev)->gen < 4)
++ 		primary->plane = !pipe;
++ 
++ 	if (INTEL_INFO(dev)->gen >= 9) {
++ 		intel_primary_formats = skl_primary_formats;
++ 		num_formats = ARRAY_SIZE(skl_primary_formats);
++ 	} else if (INTEL_INFO(dev)->gen >= 4) {
++ 		intel_primary_formats = i965_primary_formats;
++ 		num_formats = ARRAY_SIZE(i965_primary_formats);
++ 	} else {
++ 		intel_primary_formats = i8xx_primary_formats;
++ 		num_formats = ARRAY_SIZE(i8xx_primary_formats);
++ 	}
++ 
++ 	drm_universal_plane_init(dev, &primary->base, 0,
++ 				 &intel_plane_funcs,
++ 				 intel_primary_formats, num_formats,
++ 				 DRM_PLANE_TYPE_PRIMARY);
++ 
++ 	if (INTEL_INFO(dev)->gen >= 4)
++ 		intel_create_rotation_property(dev, primary);
++ 
++ 	drm_plane_helper_add(&primary->base, &intel_plane_helper_funcs);
++ 
++ 	return &primary->base;
++ }
++ 
++ void intel_create_rotation_property(struct drm_device *dev, struct intel_plane *plane)
++ {
++ 	if (!dev->mode_config.rotation_property) {
++ 		unsigned long flags = BIT(DRM_ROTATE_0) |
++ 			BIT(DRM_ROTATE_180);
++ 
++ 		if (INTEL_INFO(dev)->gen >= 9)
++ 			flags |= BIT(DRM_ROTATE_90) | BIT(DRM_ROTATE_270);
++ 
++ 		dev->mode_config.rotation_property =
++ 			drm_mode_create_rotation_property(dev, flags);
++ 	}
++ 	if (dev->mode_config.rotation_property)
++ 		drm_object_attach_property(&plane->base.base,
++ 				dev->mode_config.rotation_property,
++ 				plane->base.state->rotation);
++ }
++ 
++ static int
++ intel_check_cursor_plane(struct drm_plane *plane,
++ 			 struct intel_plane_state *state)
++ {
++ 	struct drm_crtc *crtc = state->base.crtc;
++ 	struct drm_device *dev = plane->dev;
++ 	struct drm_framebuffer *fb = state->base.fb;
++ 	struct drm_rect *dest = &state->dst;
++ 	struct drm_rect *src = &state->src;
++ 	const struct drm_rect *clip = &state->clip;
++ 	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
++ 	struct intel_crtc *intel_crtc;
++ 	unsigned stride;
++ 	int ret;
++ 
++ 	crtc = crtc ? crtc : plane->crtc;
++ 	intel_crtc = to_intel_crtc(crtc);
++ 
++ 	ret = drm_plane_helper_check_update(plane, crtc, fb,
++ 					    src, dest, clip,
++ 					    DRM_PLANE_HELPER_NO_SCALING,
++ 					    DRM_PLANE_HELPER_NO_SCALING,
++ 					    true, true, &state->visible);
++ 	if (ret)
++ 		return ret;
++ 
++ 
++ 	/* if we want to turn off the cursor ignore width and height */
++ 	if (!obj)
++ 		goto finish;
++ 
++ 	/* Check for which cursor types we support */
++ 	if (!cursor_size_ok(dev, state->base.crtc_w, state->base.crtc_h)) {
++ 		DRM_DEBUG("Cursor dimension %dx%d not supported\n",
++ 			  state->base.crtc_w, state->base.crtc_h);
++ 		return -EINVAL;
++ 	}
++ 
++ 	stride = roundup_pow_of_two(state->base.crtc_w) * 4;
++ 	if (obj->base.size < stride * state->base.crtc_h) {
++ 		DRM_DEBUG_KMS("buffer is too small\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (fb->modifier[0] != DRM_FORMAT_MOD_NONE) {
++ 		DRM_DEBUG_KMS("cursor cannot be tiled\n");
++ 		ret = -EINVAL;
++ 	}
++ 
++ finish:
++ 	if (intel_crtc->active) {
++ 		if (plane->state->crtc_w != state->base.crtc_w)
++ 			intel_crtc->atomic.update_wm = true;
++ 
++ 		intel_crtc->atomic.fb_bits |=
++ 			INTEL_FRONTBUFFER_CURSOR(intel_crtc->pipe);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void
++ intel_disable_cursor_plane(struct drm_plane *plane,
++ 			   struct drm_crtc *crtc,
++ 			   bool force)
++ {
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 
++ 	if (!force) {
++ 		plane->fb = NULL;
++ 		intel_crtc->cursor_bo = NULL;
++ 		intel_crtc->cursor_addr = 0;
++ 	}
++ 
++ 	intel_crtc_update_cursor(crtc, false);
++ }
++ 
++ static void
++ intel_commit_cursor_plane(struct drm_plane *plane,
++ 			  struct intel_plane_state *state)
++ {
++ 	struct drm_crtc *crtc = state->base.crtc;
++ 	struct drm_device *dev = plane->dev;
++ 	struct intel_crtc *intel_crtc;
++ 	struct drm_i915_gem_object *obj = intel_fb_obj(state->base.fb);
++ 	uint32_t addr;
++ 
++ 	crtc = crtc ? crtc : plane->crtc;
++ 	intel_crtc = to_intel_crtc(crtc);
++ 
++ 	plane->fb = state->base.fb;
++ 	crtc->cursor_x = state->base.crtc_x;
++ 	crtc->cursor_y = state->base.crtc_y;
++ 
++ 	if (intel_crtc->cursor_bo == obj)
++ 		goto update;
++ 
++ 	if (!obj)
++ 		addr = 0;
++ 	else if (!INTEL_INFO(dev)->cursor_needs_physical)
++ 		addr = i915_gem_obj_ggtt_offset(obj);
++ 	else
++ 		addr = obj->phys_handle->busaddr;
++ 
++ 	intel_crtc->cursor_addr = addr;
++ 	intel_crtc->cursor_bo = obj;
++ update:
++ 
++ 	if (intel_crtc->active)
++ 		intel_crtc_update_cursor(crtc, state->visible);
++ }
++ 
++ static struct drm_plane *intel_cursor_plane_create(struct drm_device *dev,
++ 						   int pipe)
++ {
++ 	struct intel_plane *cursor;
++ 	struct intel_plane_state *state;
++ 
++ 	cursor = kzalloc(sizeof(*cursor), GFP_KERNEL);
++ 	if (cursor == NULL)
++ 		return NULL;
++ 
++ 	state = intel_create_plane_state(&cursor->base);
++ 	if (!state) {
++ 		kfree(cursor);
++ 		return NULL;
++ 	}
++ 	cursor->base.state = &state->base;
++ 
++ 	cursor->can_scale = false;
++ 	cursor->max_downscale = 1;
++ 	cursor->pipe = pipe;
++ 	cursor->plane = pipe;
++ 	cursor->check_plane = intel_check_cursor_plane;
++ 	cursor->commit_plane = intel_commit_cursor_plane;
++ 	cursor->disable_plane = intel_disable_cursor_plane;
++ 
++ 	drm_universal_plane_init(dev, &cursor->base, 0,
++ 				 &intel_plane_funcs,
++ 				 intel_cursor_formats,
++ 				 ARRAY_SIZE(intel_cursor_formats),
++ 				 DRM_PLANE_TYPE_CURSOR);
++ 
++ 	if (INTEL_INFO(dev)->gen >= 4) {
++ 		if (!dev->mode_config.rotation_property)
++ 			dev->mode_config.rotation_property =
++ 				drm_mode_create_rotation_property(dev,
++ 							BIT(DRM_ROTATE_0) |
++ 							BIT(DRM_ROTATE_180));
++ 		if (dev->mode_config.rotation_property)
++ 			drm_object_attach_property(&cursor->base.base,
++ 				dev->mode_config.rotation_property,
++ 				state->base.rotation);
++ 	}
++ 
++ 	if (INTEL_INFO(dev)->gen >=9)
++ 		state->scaler_id = -1;
++ 
++ 	drm_plane_helper_add(&cursor->base, &intel_plane_helper_funcs);
++ 
++ 	return &cursor->base;
++ }
++ 
++ static void skl_init_scalers(struct drm_device *dev, struct intel_crtc *intel_crtc,
++ 	struct intel_crtc_state *crtc_state)
++ {
++ 	int i;
++ 	struct intel_scaler *intel_scaler;
++ 	struct intel_crtc_scaler_state *scaler_state = &crtc_state->scaler_state;
++ 
++ 	for (i = 0; i < intel_crtc->num_scalers; i++) {
++ 		intel_scaler = &scaler_state->scalers[i];
++ 		intel_scaler->in_use = 0;
++ 		intel_scaler->id = i;
++ 
++ 		intel_scaler->mode = PS_SCALER_MODE_DYN;
++ 	}
++ 
++ 	scaler_state->scaler_id = -1;
++ }
++ 
+++>>>>>>> ac88cd738425 (drm/i915: Fix IPS related flicker)
+  static void intel_crtc_init(struct drm_device *dev, int pipe)
+  {
+  	struct drm_i915_private *dev_priv = dev->dev_private;
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 0b62c2ef3886,105928382e21..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -366,6 -458,46 +366,49 @@@ struct intel_pipe_wm 
+  	bool sprites_scaled;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct intel_mmio_flip {
++ 	struct work_struct work;
++ 	struct drm_i915_private *i915;
++ 	struct drm_i915_gem_request *req;
++ 	struct intel_crtc *crtc;
++ };
++ 
++ struct skl_pipe_wm {
++ 	struct skl_wm_level wm[8];
++ 	struct skl_wm_level trans_wm;
++ 	uint32_t linetime;
++ };
++ 
++ /*
++  * Tracking of operations that need to be performed at the beginning/end of an
++  * atomic commit, outside the atomic section where interrupts are disabled.
++  * These are generally operations that grab mutexes or might otherwise sleep
++  * and thus can't be run with interrupts disabled.
++  */
++ struct intel_crtc_atomic_commit {
++ 	/* vblank evasion */
++ 	bool evade;
++ 	unsigned start_vbl_count;
++ 
++ 	/* Sleepable operations to perform before commit */
++ 	bool wait_for_flips;
++ 	bool disable_fbc;
++ 	bool disable_ips;
++ 	bool pre_disable_primary;
++ 	bool update_wm;
++ 	unsigned disabled_planes;
++ 
++ 	/* Sleepable operations to perform after commit */
++ 	unsigned fb_bits;
++ 	bool wait_vblank;
++ 	bool update_fbc;
++ 	bool post_enable_primary;
++ 	unsigned update_sprite_watermarks;
++ };
++ 
+++>>>>>>> ac88cd738425 (drm/i915: Fix IPS related flicker)
+  struct intel_crtc {
+  	struct drm_crtc base;
+  	enum pipe pipe;
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
