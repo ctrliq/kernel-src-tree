@@ -1,0 +1,170 @@
+uprobes: Export 'struct return_instance', introduce arch_uretprobe_is_alive()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 97da89767d398c1dfa1f34e5f312eb8ebb382f7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/97da8976.failed
+
+Add the new "weak" helper, arch_uretprobe_is_alive(), used by
+the next patches. It should return true if this return_instance
+is still valid. The arch agnostic version just always returns
+true.
+
+The patch exports "struct return_instance" for the architectures
+which want to override this hook. We can also cleanup
+prepare_uretprobe() if we pass the new return_instance to
+arch_uretprobe_hijack_return_addr().
+
+	Tested-by: Pratyush Anand <panand@redhat.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Acked-by: Anton Arapov <arapov@gmail.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20150721134016.GA4762@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 97da89767d398c1dfa1f34e5f312eb8ebb382f7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/uprobes.h
+#	kernel/events/uprobes.c
+diff --cc include/linux/uprobes.h
+index 13a7f13ff0d3,50d2764d66a8..000000000000
+--- a/include/linux/uprobes.h
++++ b/include/linux/uprobes.h
+@@@ -75,30 -90,18 +75,43 @@@ struct uprobe_task 
+  
+  	struct return_instance		*return_instances;
+  	unsigned int			depth;
+ +	struct uprobe			*active_uprobe;
+ +
+ +	unsigned long			xol_vaddr;
+ +	unsigned long			vaddr;
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + * On a breakpoint hit, thread contests for a slot.  It frees the
+ + * slot after singlestep. Currently a fixed number of slots are
+ + * allocated.
+ + */
+ +struct xol_area {
+ +	wait_queue_head_t 	wq;		/* if all slots are busy */
+ +	atomic_t 		slot_count;	/* number of in-use slots */
+ +	unsigned long 		*bitmap;	/* 0 = free slot */
+ +	struct page 		*page;
+ +
+ +	/*
+ +	 * We keep the vma's vm_start rather than a pointer to the vma
+ +	 * itself.  The probed process or a naughty kernel module could make
+ +	 * the vma go away, and we must handle that reasonably gracefully.
+ +	 */
+ +	unsigned long 		vaddr;		/* Page(s) of instruction slots */
+ +};
+++=======
++ struct return_instance {
++ 	struct uprobe		*uprobe;
++ 	unsigned long		func;
++ 	unsigned long		orig_ret_vaddr; /* original return address */
++ 	bool			chained;	/* true, if instance is nested */
++ 
++ 	struct return_instance	*next;		/* keep as stack */
++ };
++ 
++ struct xol_area;
+++>>>>>>> 97da89767d39 (uprobes: Export 'struct return_instance', introduce arch_uretprobe_is_alive())
+  
+  struct uprobes_state {
+  	struct xol_area		*xol_area;
+@@@ -123,8 -128,19 +136,22 @@@ extern int uprobe_post_sstep_notifier(s
+  extern int uprobe_pre_sstep_notifier(struct pt_regs *regs);
+  extern void uprobe_notify_resume(struct pt_regs *regs);
+  extern bool uprobe_deny_signal(void);
+ -extern bool arch_uprobe_skip_sstep(struct arch_uprobe *aup, struct pt_regs *regs);
+ +extern bool __weak arch_uprobe_skip_sstep(struct arch_uprobe *aup, struct pt_regs *regs);
+  extern void uprobe_clear_state(struct mm_struct *mm);
+++<<<<<<< HEAD
+++=======
++ extern int  arch_uprobe_analyze_insn(struct arch_uprobe *aup, struct mm_struct *mm, unsigned long addr);
++ extern int  arch_uprobe_pre_xol(struct arch_uprobe *aup, struct pt_regs *regs);
++ extern int  arch_uprobe_post_xol(struct arch_uprobe *aup, struct pt_regs *regs);
++ extern bool arch_uprobe_xol_was_trapped(struct task_struct *tsk);
++ extern int  arch_uprobe_exception_notify(struct notifier_block *self, unsigned long val, void *data);
++ extern void arch_uprobe_abort_xol(struct arch_uprobe *aup, struct pt_regs *regs);
++ extern unsigned long arch_uretprobe_hijack_return_addr(unsigned long trampoline_vaddr, struct pt_regs *regs);
++ extern bool arch_uretprobe_is_alive(struct return_instance *ret, struct pt_regs *regs);
++ extern bool arch_uprobe_ignore(struct arch_uprobe *aup, struct pt_regs *regs);
++ extern void arch_uprobe_copy_ixol(struct page *page, unsigned long vaddr,
++ 					 void *src, unsigned long len);
+++>>>>>>> 97da89767d39 (uprobes: Export 'struct return_instance', introduce arch_uretprobe_is_alive())
+  #else /* !CONFIG_UPROBES */
+  struct uprobes_state {
+  };
+diff --cc kernel/events/uprobes.c
+index b0b89515dd30,1c71b6242a7e..000000000000
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@@ -74,15 -75,40 +74,6 @@@ struct uprobe 
+  	struct arch_uprobe	arch;
+  };
+  
+- struct return_instance {
+- 	struct uprobe		*uprobe;
+- 	unsigned long		func;
+- 	unsigned long		orig_ret_vaddr; /* original return address */
+- 	bool			chained;	/* true, if instance is nested */
+ -/*
+ - * Execute out of line area: anonymous executable mapping installed
+ - * by the probed task to execute the copy of the original instruction
+ - * mangled by set_swbp().
+ - *
+ - * On a breakpoint hit, thread contests for a slot.  It frees the
+ - * slot after singlestep. Currently a fixed number of slots are
+ - * allocated.
+ - */
+ -struct xol_area {
+ -	wait_queue_head_t 	wq;		/* if all slots are busy */
+ -	atomic_t 		slot_count;	/* number of in-use slots */
+ -	unsigned long 		*bitmap;	/* 0 = free slot */
+ -	struct page 		*page;
+--
+- 	struct return_instance	*next;		/* keep as stack */
+ -	/*
+ -	 * We keep the vma's vm_start rather than a pointer to the vma
+ -	 * itself.  The probed process or a naughty kernel module could make
+ -	 * the vma go away, and we must handle that reasonably gracefully.
+ -	 */
+ -	unsigned long 		vaddr;		/* Page(s) of instruction slots */
+--};
+--
+  /*
+   * valid_vma: Verify if the specified vma is an executable vma
+   * Relax restrictions while unregistering: vm_flags might have
+@@@ -1759,6 -1804,16 +1750,19 @@@ static void handle_trampoline(struct pt
+  
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool __weak arch_uprobe_ignore(struct arch_uprobe *aup, struct pt_regs *regs)
++ {
++ 	return false;
++ }
++ 
++ bool __weak arch_uretprobe_is_alive(struct return_instance *ret, struct pt_regs *regs)
++ {
++ 	return true;
++ }
++ 
+++>>>>>>> 97da89767d39 (uprobes: Export 'struct return_instance', introduce arch_uretprobe_is_alive())
+  /*
+   * Run handler and ask thread to singlestep.
+   * Ensure all non-fatal signals cannot interrupt thread while it singlesteps.
+* Unmerged path include/linux/uprobes.h
+* Unmerged path kernel/events/uprobes.c
