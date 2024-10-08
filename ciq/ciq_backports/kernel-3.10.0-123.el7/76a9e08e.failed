@@ -1,0 +1,189 @@
+be2net: cleanup wake-on-lan code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Suresh Reddy <suresh.reddy@emulex.com>
+commit 76a9e08e33ced4a87277edb63456ce108ad4e712
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/76a9e08e.failed
+
+This patch cleans-up wake-on-lan code in the following ways:
+1) Removes some driver hacks in be_cmd_get_acpi_wol_cap() that were based
+on incorrect assumptions.
+2) Uses the adapter->wol_en and wol_cap variables for checking if WoL
+is supported and enabled on an interface instead of referring to the
+exclusion list via the macro be_is_wol_supported()
+
+	Signed-off-by: Suresh Reddy <suresh.reddy@emulex.com>
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 76a9e08e33ced4a87277edb63456ce108ad4e712)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index b0663a6b2cc5,6d22d6f439e3..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -4193,53 -4279,9 +4195,56 @@@ static void be_remove(struct pci_dev *p
+  	free_netdev(adapter->netdev);
+  }
+  
+++<<<<<<< HEAD
+ +bool be_is_wol_supported(struct be_adapter *adapter)
+ +{
+ +	return ((adapter->wol_cap & BE_WOL_CAP) &&
+ +		!be_is_wol_excluded(adapter)) ? true : false;
+ +}
+ +
+ +u32 be_get_fw_log_level(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem extfat_cmd;
+ +	struct be_fat_conf_params *cfgs;
+ +	int status;
+ +	u32 level = 0;
+ +	int j;
+ +
+ +	if (lancer_chip(adapter))
+ +		return 0;
+ +
+ +	memset(&extfat_cmd, 0, sizeof(struct be_dma_mem));
+ +	extfat_cmd.size = sizeof(struct be_cmd_resp_get_ext_fat_caps);
+ +	extfat_cmd.va = pci_alloc_consistent(adapter->pdev, extfat_cmd.size,
+ +					     &extfat_cmd.dma);
+ +
+ +	if (!extfat_cmd.va) {
+ +		dev_err(&adapter->pdev->dev, "%s: Memory allocation failure\n",
+ +			__func__);
+ +		goto err;
+ +	}
+ +
+ +	status = be_cmd_get_ext_fat_capabilites(adapter, &extfat_cmd);
+ +	if (!status) {
+ +		cfgs = (struct be_fat_conf_params *)(extfat_cmd.va +
+ +						sizeof(struct be_cmd_resp_hdr));
+ +		for (j = 0; j < le32_to_cpu(cfgs->module[0].num_modes); j++) {
+ +			if (cfgs->module[0].trace_lvl[j].mode == MODE_UART)
+ +				level = cfgs->module[0].trace_lvl[j].dbg_lvl;
+ +		}
+ +	}
+ +	pci_free_consistent(adapter->pdev, extfat_cmd.size, extfat_cmd.va,
+ +			    extfat_cmd.dma);
+ +err:
+ +	return level;
+ +}
+ +
+++=======
+++>>>>>>> 76a9e08e33ce (be2net: cleanup wake-on-lan code)
+  static int be_get_initial_config(struct be_adapter *adapter)
+  {
+ -	int status, level;
+ +	int status;
+ +	u32 level;
+  
+  	status = be_cmd_get_cntl_attributes(adapter);
+  	if (status)
+diff --git a/drivers/net/ethernet/emulex/benet/be.h b/drivers/net/ethernet/emulex/benet/be.h
+index 409648810dde..ae858e7dd9df 100644
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -465,7 +465,7 @@ struct be_adapter {
+ 	u16 pvid;
+ 	struct phy_info phy;
+ 	u8 wol_cap;
+-	bool wol;
++	bool wol_en;
+ 	u32 uc_macs;		/* Count of secondary UC MAC programmed */
+ 	u16 asic_rev;
+ 	u16 qnq_vid;
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index 138b2a691be6..a22b9adc553c 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -3019,14 +3019,16 @@ int be_cmd_get_acpi_wol_cap(struct be_adapter *adapter)
+ {
+ 	struct be_mcc_wrb *wrb;
+ 	struct be_cmd_req_acpi_wol_magic_config_v1 *req;
+-	int status;
+-	int payload_len = sizeof(*req);
++	int status = 0;
+ 	struct be_dma_mem cmd;
+ 
+ 	if (!be_cmd_allowed(adapter, OPCODE_ETH_ACPI_WOL_MAGIC_CONFIG,
+ 			    CMD_SUBSYSTEM_ETH))
+ 		return -EPERM;
+ 
++	if (be_is_wol_excluded(adapter))
++		return status;
++
+ 	if (mutex_lock_interruptible(&adapter->mbox_lock))
+ 		return -1;
+ 
+@@ -3051,7 +3053,7 @@ int be_cmd_get_acpi_wol_cap(struct be_adapter *adapter)
+ 
+ 	be_wrb_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ETH,
+ 			       OPCODE_ETH_ACPI_WOL_MAGIC_CONFIG,
+-			       payload_len, wrb, &cmd);
++			       sizeof(*req), wrb, &cmd);
+ 
+ 	req->hdr.version = 1;
+ 	req->query_options = BE_GET_WOL_CAP;
+@@ -3061,13 +3063,9 @@ int be_cmd_get_acpi_wol_cap(struct be_adapter *adapter)
+ 		struct be_cmd_resp_acpi_wol_magic_config_v1 *resp;
+ 		resp = (struct be_cmd_resp_acpi_wol_magic_config_v1 *) cmd.va;
+ 
+-		/* the command could succeed misleadingly on old f/w
+-		 * which is not aware of the V1 version. fake an error. */
+-		if (resp->hdr.response_length < payload_len) {
+-			status = -1;
+-			goto err;
+-		}
+ 		adapter->wol_cap = resp->wol_settings;
++		if (adapter->wol_cap & BE_WOL_CAP)
++			adapter->wol_en = true;
+ 	}
+ err:
+ 	mutex_unlock(&adapter->mbox_lock);
+diff --git a/drivers/net/ethernet/emulex/benet/be_ethtool.c b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+index 5573355e2bb6..1fcce10f3b7f 100644
+--- a/drivers/net/ethernet/emulex/benet/be_ethtool.c
++++ b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+@@ -710,12 +710,13 @@ be_get_wol(struct net_device *netdev, struct ethtool_wolinfo *wol)
+ {
+ 	struct be_adapter *adapter = netdev_priv(netdev);
+ 
+-	if (be_is_wol_supported(adapter)) {
++	if (adapter->wol_cap & BE_WOL_CAP) {
+ 		wol->supported |= WAKE_MAGIC;
+-		if (adapter->wol)
++		if (adapter->wol_en)
+ 			wol->wolopts |= WAKE_MAGIC;
+-	} else
++	} else {
+ 		wol->wolopts = 0;
++	}
+ 	memset(&wol->sopass, 0, sizeof(wol->sopass));
+ }
+ 
+@@ -727,15 +728,15 @@ be_set_wol(struct net_device *netdev, struct ethtool_wolinfo *wol)
+ 	if (wol->wolopts & ~WAKE_MAGIC)
+ 		return -EOPNOTSUPP;
+ 
+-	if (!be_is_wol_supported(adapter)) {
++	if (!(adapter->wol_cap & BE_WOL_CAP)) {
+ 		dev_warn(&adapter->pdev->dev, "WOL not supported\n");
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+ 	if (wol->wolopts & WAKE_MAGIC)
+-		adapter->wol = true;
++		adapter->wol_en = true;
+ 	else
+-		adapter->wol = false;
++		adapter->wol_en = false;
+ 
+ 	return 0;
+ }
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
