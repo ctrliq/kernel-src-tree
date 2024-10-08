@@ -138,6 +138,11 @@ struct dso {
 		struct list_head open_entry;
 	} data;
 
+	union { /* Tool specific area */
+		void	 *priv;
+		u64	 db_id;
+	};
+
 	char		 name[0];
 };
 
