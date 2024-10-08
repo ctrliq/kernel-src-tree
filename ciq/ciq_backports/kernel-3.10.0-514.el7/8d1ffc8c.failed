@@ -1,0 +1,99 @@
+mmc: core: Keep host claimed while invoking mmc_power_off|up()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] core: Keep host claimed while invoking mmc_power_off|up() (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 95.80%
+commit-author Ulf Hansson <ulf.hansson@linaro.org>
+commit 8d1ffc8c982e4480059ef735e8f15f631e40e80c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8d1ffc8c.failed
+
+As mmc_claim_host() invokes pm_runtime_get_sync() for the mmc host device,
+it's important that the host is kept claimed for *all* accesses to it via
+the host_ops callbacks.
+
+In some code paths for SDIO, particularly related to the PM support,
+mmc_power_off|up() is invoked without keeping the host claimed. Let's fix
+these.
+
+Moreover, mmc_start|stop_host() also invokes mmc_power_off|up() without
+claiming the host, let's fix these as well.
+
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Acked-by: Kishon Vijay Abraham I <kishon@ti.com>
+(cherry picked from commit 8d1ffc8c982e4480059ef735e8f15f631e40e80c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/core.c
+diff --cc drivers/mmc/core/core.c
+index 6b8033f0b771,2092a89dcf76..000000000000
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@@ -2590,6 -2639,9 +2592,12 @@@ void mmc_start_host(struct mmc_host *ho
+  		mmc_power_off(host);
+  	else
+  		mmc_power_up(host, host->ocr_avail);
+++<<<<<<< HEAD
+++=======
++ 	mmc_release_host(host);
++ 
++ 	mmc_gpiod_request_cd_irq(host);
+++>>>>>>> 8d1ffc8c982e (mmc: core: Keep host claimed while invoking mmc_power_off|up())
+  	_mmc_detect_change(host, 0, false);
+  }
+  
+* Unmerged path drivers/mmc/core/core.c
+diff --git a/drivers/mmc/core/sdio.c b/drivers/mmc/core/sdio.c
+index d2f16e27144d..b304e3326855 100644
+--- a/drivers/mmc/core/sdio.c
++++ b/drivers/mmc/core/sdio.c
+@@ -939,15 +939,16 @@ static int mmc_sdio_pre_suspend(struct mmc_host *host)
+  */
+ static int mmc_sdio_suspend(struct mmc_host *host)
+ {
+-	if (mmc_card_keep_power(host) && mmc_card_wake_sdio_irq(host)) {
+-		mmc_claim_host(host);
++	mmc_claim_host(host);
++
++	if (mmc_card_keep_power(host) && mmc_card_wake_sdio_irq(host))
+ 		sdio_disable_wide(host->card);
+-		mmc_release_host(host);
+-	}
+ 
+ 	if (!mmc_card_keep_power(host))
+ 		mmc_power_off(host);
+ 
++	mmc_release_host(host);
++
+ 	return 0;
+ }
+ 
+@@ -1048,15 +1049,24 @@ out:
+ static int mmc_sdio_runtime_suspend(struct mmc_host *host)
+ {
+ 	/* No references to the card, cut the power to it. */
++	mmc_claim_host(host);
+ 	mmc_power_off(host);
++	mmc_release_host(host);
++
+ 	return 0;
+ }
+ 
+ static int mmc_sdio_runtime_resume(struct mmc_host *host)
+ {
++	int ret;
++
+ 	/* Restore power and re-initialize. */
++	mmc_claim_host(host);
+ 	mmc_power_up(host, host->card->ocr);
+-	return mmc_sdio_power_restore(host);
++	ret = mmc_sdio_power_restore(host);
++	mmc_release_host(host);
++
++	return ret;
+ }
+ 
+ static int mmc_sdio_reset(struct mmc_host *host)
