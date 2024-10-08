@@ -1,0 +1,131 @@
+r8152: don't enable napi before rx ready
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author hayeswang <hayeswang@realtek.com>
+commit 41cec84cf2858b59121a1cec5e9b09fc1bf1d882
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/41cec84c.failed
+
+Adjust napi_disable() and napi_enable() to avoid r8152_poll() start
+working before rx ready. Otherwise, it may have race condition for
+rx_agg.
+
+	Signed-off-by: Hayes Wang <hayeswang@realtek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 41cec84cf2858b59121a1cec5e9b09fc1bf1d882)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/r8152.c
+diff --cc drivers/net/usb/r8152.c
+index e3d600def538,144dc641c239..000000000000
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@@ -1978,6 -2071,53 +1978,56 @@@ static void rxdy_gated_en(struct r8152 
+  	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MISC_1, ocp_data);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rtl_start_rx(struct r8152 *tp)
++ {
++ 	int i, ret = 0;
++ 
++ 	INIT_LIST_HEAD(&tp->rx_done);
++ 	for (i = 0; i < RTL8152_MAX_RX; i++) {
++ 		INIT_LIST_HEAD(&tp->rx_info[i].list);
++ 		ret = r8152_submit_rx(tp, &tp->rx_info[i], GFP_KERNEL);
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	if (ret && ++i < RTL8152_MAX_RX) {
++ 		struct list_head rx_queue;
++ 		unsigned long flags;
++ 
++ 		INIT_LIST_HEAD(&rx_queue);
++ 
++ 		do {
++ 			struct rx_agg *agg = &tp->rx_info[i++];
++ 			struct urb *urb = agg->urb;
++ 
++ 			urb->actual_length = 0;
++ 			list_add_tail(&agg->list, &rx_queue);
++ 		} while (i < RTL8152_MAX_RX);
++ 
++ 		spin_lock_irqsave(&tp->rx_lock, flags);
++ 		list_splice_tail(&rx_queue, &tp->rx_done);
++ 		spin_unlock_irqrestore(&tp->rx_lock, flags);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int rtl_stop_rx(struct r8152 *tp)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < RTL8152_MAX_RX; i++)
++ 		usb_kill_urb(tp->rx_info[i].urb);
++ 
++ 	while (!skb_queue_empty(&tp->rx_queue))
++ 		dev_kfree_skb(__skb_dequeue(&tp->rx_queue));
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 41cec84cf285 (r8152: don't enable napi before rx ready)
+  static int rtl_enable(struct r8152 *tp)
+  {
+  	u32 ocp_data;
+@@@ -2817,20 -2946,22 +2867,26 @@@ static void set_carrier(struct r8152 *t
+  	speed = rtl8152_get_speed(tp);
+  
+  	if (speed & LINK_STATUS) {
+ -		if (!netif_carrier_ok(netdev)) {
+ +		if (!(tp->speed & LINK_STATUS)) {
+  			tp->rtl_ops.enable(tp);
+  			set_bit(RTL8152_SET_RX_MODE, &tp->flags);
++ 			napi_disable(&tp->napi);
+  			netif_carrier_on(netdev);
+++<<<<<<< HEAD
+++=======
++ 			rtl_start_rx(tp);
++ 			napi_enable(&tp->napi);
+++>>>>>>> 41cec84cf285 (r8152: don't enable napi before rx ready)
+  		}
+  	} else {
+ -		if (netif_carrier_ok(netdev)) {
+ +		if (tp->speed & LINK_STATUS) {
+  			netif_carrier_off(netdev);
+ -			napi_disable(&tp->napi);
+ +			tasklet_disable(&tp->tl);
+  			tp->rtl_ops.disable(tp);
+ -			napi_enable(&tp->napi);
+ +			tasklet_enable(&tp->tl);
+  		}
+  	}
+ +	tp->speed = speed;
+  }
+  
+  static void rtl_work_func_t(struct work_struct *work)
+@@@ -3216,8 -3395,11 +3272,16 @@@ static int rtl8152_resume(struct usb_in
+  		if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
+  			rtl_runtime_suspend_enable(tp, false);
+  			clear_bit(SELECTIVE_SUSPEND, &tp->flags);
+++<<<<<<< HEAD
+ +			if (tp->speed & LINK_STATUS)
+ +				tp->rtl_ops.disable(tp);
+++=======
++ 			napi_disable(&tp->napi);
++ 			set_bit(WORK_ENABLE, &tp->flags);
++ 			if (netif_carrier_ok(tp->netdev))
++ 				rtl_start_rx(tp);
++ 			napi_enable(&tp->napi);
+++>>>>>>> 41cec84cf285 (r8152: don't enable napi before rx ready)
+  		} else {
+  			tp->rtl_ops.up(tp);
+  			rtl8152_set_speed(tp, AUTONEG_ENABLE,
+* Unmerged path drivers/net/usb/r8152.c
