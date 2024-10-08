@@ -7536,6 +7536,11 @@ static void vmx_handle_external_intr(struct kvm_vcpu *vcpu)
 		local_irq_enable();
 }
 
+static bool vmx_has_high_real_mode_segbase(void)
+{
+	return enable_unrestricted_guest || emulate_invalid_guest_state;
+}
+
 static bool vmx_mpx_supported(void)
 {
 	return (vmcs_config.vmexit_ctrl & VM_EXIT_CLEAR_BNDCFGS) &&
@@ -9358,6 +9363,7 @@ static struct kvm_x86_ops vmx_x86_ops = {
 	.hardware_enable = hardware_enable,
 	.hardware_disable = hardware_disable,
 	.cpu_has_accelerated_tpr = report_flexpriority,
+	.cpu_has_high_real_mode_segbase = vmx_has_high_real_mode_segbase,
 
 	.vcpu_create = vmx_create_vcpu,
 	.vcpu_free = vmx_free_vcpu,
