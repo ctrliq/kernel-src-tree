@@ -1,0 +1,173 @@
+xfs: combine xfs_seek_hole & xfs_seek_data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Sandeen <sandeen@sandeen.net>
+commit 49c69591c80648c14ff87525e97ee6ebe3a343cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/49c69591.failed
+
+xfs_seek_hole & xfs_seek_data are remarkably similar;
+so much so that they can be combined, saving a fair
+bit of semi-complex code duplication.
+
+The following patch passes generic/285 and generic/286,
+which specifically test seek behavior.
+
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Jie Liu <jeff.liu@oracle.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 49c69591c80648c14ff87525e97ee6ebe3a343cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 91b548987ce6,1da3b7db5bf7..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1239,111 -1181,10 +1239,116 @@@ out
+  }
+  
+  STATIC loff_t
+- xfs_seek_data(
++ xfs_seek_hole_data(
+  	struct file		*file,
+++<<<<<<< HEAD
+ +	loff_t			start)
+ +{
+ +	struct inode		*inode = file->f_mapping->host;
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +	struct xfs_mount	*mp = ip->i_mount;
+ +	loff_t			uninitialized_var(offset);
+ +	xfs_fsize_t		isize;
+ +	xfs_fileoff_t		fsbno;
+ +	xfs_filblks_t		end;
+ +	uint			lock;
+ +	int			error;
+ +
+ +	lock = xfs_ilock_data_map_shared(ip);
+ +
+ +	isize = i_size_read(inode);
+ +	if (start >= isize) {
+ +		error = ENXIO;
+ +		goto out_unlock;
+ +	}
+ +
+ +	/*
+ +	 * Try to read extents from the first block indicated
+ +	 * by fsbno to the end block of the file.
+ +	 */
+ +	fsbno = XFS_B_TO_FSBT(mp, start);
+ +	end = XFS_B_TO_FSB(mp, isize);
+ +	for (;;) {
+ +		struct xfs_bmbt_irec	map[2];
+ +		int			nmap = 2;
+ +		unsigned int		i;
+ +
+ +		error = xfs_bmapi_read(ip, fsbno, end - fsbno, map, &nmap,
+ +				       XFS_BMAPI_ENTIRE);
+ +		if (error)
+ +			goto out_unlock;
+ +
+ +		/* No extents at given offset, must be beyond EOF */
+ +		if (nmap == 0) {
+ +			error = ENXIO;
+ +			goto out_unlock;
+ +		}
+ +
+ +		for (i = 0; i < nmap; i++) {
+ +			offset = max_t(loff_t, start,
+ +				       XFS_FSB_TO_B(mp, map[i].br_startoff));
+ +
+ +			/* Landed in a data extent */
+ +			if (map[i].br_startblock == DELAYSTARTBLOCK ||
+ +			    (map[i].br_state == XFS_EXT_NORM &&
+ +			     !isnullstartblock(map[i].br_startblock)))
+ +				goto out;
+ +
+ +			/*
+ +			 * Landed in an unwritten extent, try to search data
+ +			 * from page cache.
+ +			 */
+ +			if (map[i].br_state == XFS_EXT_UNWRITTEN) {
+ +				if (xfs_find_get_desired_pgoff(inode, &map[i],
+ +							DATA_OFF, &offset))
+ +					goto out;
+ +			}
+ +		}
+ +
+ +		/*
+ +		 * map[0] is hole or its an unwritten extent but
+ +		 * without data in page cache.  Probably means that
+ +		 * we are reading after EOF if nothing in map[1].
+ +		 */
+ +		if (nmap == 1) {
+ +			error = ENXIO;
+ +			goto out_unlock;
+ +		}
+ +
+ +		ASSERT(i > 1);
+ +
+ +		/*
+ +		 * Nothing was found, proceed to the next round of search
+ +		 * if reading offset not beyond or hit EOF.
+ +		 */
+ +		fsbno = map[i - 1].br_startoff + map[i - 1].br_blockcount;
+ +		start = XFS_FSB_TO_B(mp, fsbno);
+ +		if (start >= isize) {
+ +			error = ENXIO;
+ +			goto out_unlock;
+ +		}
+ +	}
+ +
+ +out:
+ +	if (offset != file->f_pos)
+ +		file->f_pos = offset;
+ +
+ +out_unlock:
+ +	xfs_iunlock(ip, lock);
+ +
+ +	if (error)
+ +		return -error;
+ +	return offset;
+ +}
+ +
+ +STATIC loff_t
+ +xfs_seek_hole(
+ +	struct file		*file,
+ +	loff_t			start)
+++=======
++ 	loff_t			start,
++ 	int			whence)
+++>>>>>>> 49c69591c806 (xfs: combine xfs_seek_hole & xfs_seek_data)
+  {
+  	struct inode		*inode = file->f_mapping->host;
+  	struct xfs_inode	*ip = XFS_I(inode);
+@@@ -1432,14 -1301,14 +1465,20 @@@
+  
+  out:
+  	/*
+- 	 * At this point, we must have found a hole.  However, the returned
++ 	 * If at this point we have found the hole we wanted, the returned
+  	 * offset may be bigger than the file size as it may be aligned to
+- 	 * page boundary for unwritten extents, we need to deal with this
++ 	 * page boundary for unwritten extents.  We need to deal with this
+  	 * situation in particular.
+  	 */
+++<<<<<<< HEAD
+ +	offset = min_t(loff_t, offset, isize);
+ +	if (offset != file->f_pos)
+ +		file->f_pos = offset;
+++=======
++ 	if (whence == SEEK_HOLE)
++ 		offset = min_t(loff_t, offset, isize);
++ 	offset = vfs_setpos(file, offset, inode->i_sb->s_maxbytes);
+++>>>>>>> 49c69591c806 (xfs: combine xfs_seek_hole & xfs_seek_data)
+  
+  out_unlock:
+  	xfs_iunlock(ip, lock);
+* Unmerged path fs/xfs/xfs_file.c
