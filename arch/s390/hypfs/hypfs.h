@@ -47,7 +47,6 @@ struct hypfs_dbfs_data {
 	void			*buf_free_ptr;
 	size_t			size;
 	struct hypfs_dbfs_file	*dbfs_file;
-	struct kref		kref;
 };
 
 struct hypfs_dbfs_file {
@@ -57,8 +56,6 @@ struct hypfs_dbfs_file {
 	void		(*data_free)(const void *buf_free_ptr);
 
 	/* Private data for hypfs_dbfs.c */
-	struct hypfs_dbfs_data	*data;
-	struct delayed_work	data_free_work;
 	struct mutex		lock;
 	struct dentry		*dentry;
 };
