@@ -1,0 +1,184 @@
+perf: Close install vs. exit race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 84c4e620d35f49f486a900af214ad12276afb386
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/84c4e620.failed
+
+Consider the following scenario:
+
+  CPU0					CPU1
+
+  ctx = find_get_ctx();
+					perf_event_exit_task_context()
+  mutex_lock(&ctx->mutex);
+  perf_install_in_context(ctx, ...);
+    /* NO-OP */
+  mutex_unlock(&ctx->mutex);
+
+  ...
+
+  perf_release()
+    WARN_ON_ONCE(event->state != STATE_EXIT);
+
+Since the event doesn't pass through perf_remove_from_context()
+because perf_install_in_context() NO-OPs because the ctx is dead, and
+perf_event_exit_task_context() will not observe the event because its
+not attached yet, the event->state will not be set.
+
+Solve this by revalidating ctx->task after we acquire ctx->mutex and
+failing the event creation as a whole.
+
+	Tested-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: dvyukov@google.com
+	Cc: eranian@google.com
+	Cc: oleg@redhat.com
+	Cc: panand@redhat.com
+	Cc: sasha.levin@oracle.com
+	Cc: vince@deater.net
+Link: http://lkml.kernel.org/r/20160224174947.626853419@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 84c4e620d35f49f486a900af214ad12276afb386)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e086d60d319b,d7b0316e3465..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -2118,8 -2147,42 +2118,47 @@@ perf_install_in_context(struct perf_eve
+  	if (event->cpu != -1)
+  		event->cpu = cpu;
+  
+++<<<<<<< HEAD
+ +	event_function_call(event, __perf_install_in_context,
+ +			    ___perf_install_in_context, event);
+++=======
++ 	/*
++ 	 * Installing events is tricky because we cannot rely on ctx->is_active
++ 	 * to be set in case this is the nr_events 0 -> 1 transition.
++ 	 *
++ 	 * So what we do is we add the event to the list here, which will allow
++ 	 * a future context switch to DTRT and then send a racy IPI. If the IPI
++ 	 * fails to hit the right task, this means a context switch must have
++ 	 * happened and that will have taken care of business.
++ 	 */
++ 	raw_spin_lock_irq(&ctx->lock);
++ 	task = ctx->task;
++ 
++ 	/*
++ 	 * If between ctx = find_get_context() and mutex_lock(&ctx->mutex) the
++ 	 * ctx gets destroyed, we must not install an event into it.
++ 	 *
++ 	 * This is normally tested for after we acquire the mutex, so this is
++ 	 * a sanity check.
++ 	 */
++ 	if (WARN_ON_ONCE(task == TASK_TOMBSTONE)) {
++ 		raw_spin_unlock_irq(&ctx->lock);
++ 		return;
++ 	}
++ 	update_context_time(ctx);
++ 	/*
++ 	 * Update cgrp time only if current cgrp matches event->cgrp.
++ 	 * Must be done before calling add_event_to_ctx().
++ 	 */
++ 	update_cgrp_time_from_event(event);
++ 	add_event_to_ctx(event, ctx);
++ 	raw_spin_unlock_irq(&ctx->lock);
++ 
++ 	if (task)
++ 		task_function_call(task, __perf_install_in_context, ctx);
++ 	else
++ 		cpu_function_call(cpu, __perf_install_in_context, ctx);
+++>>>>>>> 84c4e620d35f (perf: Close install vs. exit race)
+  }
+  
+  /*
+@@@ -7824,24 -8390,37 +7863,55 @@@ SYSCALL_DEFINE5(perf_event_open
+  
+  	if (move_group) {
+  		gctx = group_leader->ctx;
+ +
+ +		/*
+ +		 * See perf_event_ctx_lock() for comments on the details
+ +		 * of swizzling perf_event::ctx.
+ +		 */
+  		mutex_lock_double(&gctx->mutex, &ctx->mutex);
+++<<<<<<< HEAD
+ +
+ +		perf_remove_from_context(group_leader, false);
+ +
+ +		list_for_each_entry(sibling, &group_leader->sibling_list,
+ +				    group_entry) {
+ +			perf_remove_from_context(sibling, false);
+ +			put_ctx(gctx);
+++=======
++ 		if (gctx->task == TASK_TOMBSTONE) {
++ 			err = -ESRCH;
++ 			goto err_locked;
+++>>>>>>> 84c4e620d35f (perf: Close install vs. exit race)
+  		}
+  	} else {
+  		mutex_lock(&ctx->mutex);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ctx->task == TASK_TOMBSTONE) {
++ 		err = -ESRCH;
++ 		goto err_locked;
++ 	}
++ 
++ 	if (!perf_event_validate_size(event)) {
++ 		err = -E2BIG;
++ 		goto err_locked;
++ 	}
++ 
++ 	/*
++ 	 * Must be under the same ctx::mutex as perf_install_in_context(),
++ 	 * because we need to serialize with concurrent event creation.
++ 	 */
++ 	if (!exclusive_event_installable(event, ctx)) {
++ 		/* exclusive and group stuff are assumed mutually exclusive */
++ 		WARN_ON_ONCE(move_group);
++ 
++ 		err = -EBUSY;
++ 		goto err_locked;
++ 	}
++ 
+++>>>>>>> 84c4e620d35f (perf: Close install vs. exit race)
+  	WARN_ON_ONCE(ctx->parent_ctx);
+  
+  	if (move_group) {
+@@@ -7970,6 -8574,16 +8040,19 @@@ perf_event_create_kernel_counter(struc
+  
+  	WARN_ON_ONCE(ctx->parent_ctx);
+  	mutex_lock(&ctx->mutex);
+++<<<<<<< HEAD
+++=======
++ 	if (ctx->task == TASK_TOMBSTONE) {
++ 		err = -ESRCH;
++ 		goto err_unlock;
++ 	}
++ 
++ 	if (!exclusive_event_installable(event, ctx)) {
++ 		err = -EBUSY;
++ 		goto err_unlock;
++ 	}
++ 
+++>>>>>>> 84c4e620d35f (perf: Close install vs. exit race)
+  	perf_install_in_context(ctx, event, cpu);
+  	perf_unpin_context(ctx);
+  	mutex_unlock(&ctx->mutex);
+* Unmerged path kernel/events/core.c
