@@ -185,7 +185,6 @@ static inline unsigned long long rdclock(void)
 #define __user
 #define asmlinkage
 
-#define unlikely(x)	__builtin_expect(!!(x), 0)
 #define min(x, y) ({				\
 	typeof(x) _min1 = (x);			\
 	typeof(y) _min2 = (y);			\
