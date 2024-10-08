@@ -1,0 +1,136 @@
+xfs: move DIO mapping size calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 1fdca9c21198b2c2869086ac3629612492476f28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1fdca9c2.failed
+
+The mapping size calculation is done last in __xfs_get_blocks(), but
+we are going to need the actual mapping size we will use to map the
+direct IO correctly in xfs_map_direct(). Factor out the calculation
+for code clarity, and move the call to be the first operation in
+mapping the extent to the returned buffer.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 1fdca9c21198b2c2869086ac3629612492476f28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index bb6024910e57,4a29399ed549..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1260,6 -1233,63 +1260,66 @@@ xfs_vm_releasepage
+  	return try_to_free_buffers(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * do all the direct IO specific mapping buffer manipulation here.
++  */
++ static void
++ xfs_map_direct(
++ 	struct inode		*inode,
++ 	struct buffer_head	*bh_result,
++ 	struct xfs_bmbt_irec	*imap,
++ 	xfs_off_t		offset)
++ {
++ 	if (ISUNWRITTEN(imap)) {
++ 		bh_result->b_private = inode;
++ 		set_buffer_defer_completion(bh_result);
++ 	}
++ }
++ 
++ 
++ /*
++  * If this is O_DIRECT or the mpage code calling tell them how large the mapping
++  * is, so that we can avoid repeated get_blocks calls.
++  *
++  * If the mapping spans EOF, then we have to break the mapping up as the mapping
++  * for blocks beyond EOF must be marked new so that sub block regions can be
++  * correctly zeroed. We can't do this for mappings within EOF unless the mapping
++  * was just allocated or is unwritten, otherwise the callers would overwrite
++  * existing data with zeros. Hence we have to split the mapping into a range up
++  * to and including EOF, and a second mapping for beyond EOF.
++  */
++ static void
++ xfs_map_trim_size(
++ 	struct inode		*inode,
++ 	sector_t		iblock,
++ 	struct buffer_head	*bh_result,
++ 	struct xfs_bmbt_irec	*imap,
++ 	xfs_off_t		offset,
++ 	ssize_t			size)
++ {
++ 	xfs_off_t		mapping_size;
++ 
++ 	mapping_size = imap->br_startoff + imap->br_blockcount - iblock;
++ 	mapping_size <<= inode->i_blkbits;
++ 
++ 	ASSERT(mapping_size > 0);
++ 	if (mapping_size > size)
++ 		mapping_size = size;
++ 	if (offset < i_size_read(inode) &&
++ 	    offset + mapping_size >= i_size_read(inode)) {
++ 		/* limit mapping to block that spans EOF */
++ 		mapping_size = roundup_64(i_size_read(inode) - offset,
++ 					  1 << inode->i_blkbits);
++ 	}
++ 	if (mapping_size > LONG_MAX)
++ 		mapping_size = LONG_MAX;
++ 
++ 	bh_result->b_size = mapping_size;
++ }
++ 
+++>>>>>>> 1fdca9c21198 (xfs: move DIO mapping size calculation)
+  STATIC int
+  __xfs_get_blocks(
+  	struct inode		*inode,
+@@@ -1358,19 -1388,24 +1418,31 @@@
+  		goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* trim mapping down to size requested */
++ 	if (direct || size > (1 << inode->i_blkbits))
++ 		xfs_map_trim_size(inode, iblock, bh_result,
++ 				  &imap, offset, size);
++ 
++ 	/*
++ 	 * For unwritten extents do not report a disk address in the buffered
++ 	 * read case (treat as if we're reading into a hole).
++ 	 */
+++>>>>>>> 1fdca9c21198 (xfs: move DIO mapping size calculation)
+  	if (imap.br_startblock != HOLESTARTBLOCK &&
+ -	    imap.br_startblock != DELAYSTARTBLOCK &&
+ -	    (create || !ISUNWRITTEN(&imap))) {
+ -		xfs_map_buffer(inode, bh_result, &imap, offset);
+ -		if (ISUNWRITTEN(&imap))
+ +	    imap.br_startblock != DELAYSTARTBLOCK) {
+ +		/*
+ +		 * For unwritten extents do not report a disk address on
+ +		 * the read case (treat as if we're reading into a hole).
+ +		 */
+ +		if (create || !ISUNWRITTEN(&imap))
+ +			xfs_map_buffer(inode, bh_result, &imap, offset);
+ +		if (create && ISUNWRITTEN(&imap)) {
+ +			if (direct)
+ +				bh_result->b_private = inode;
+  			set_buffer_unwritten(bh_result);
+ -		/* direct IO needs special help */
+ -		if (create && direct)
+ -			xfs_map_direct(inode, bh_result, &imap, offset);
+ +		}
+  	}
+  
+  	/*
+* Unmerged path fs/xfs/xfs_aops.c
