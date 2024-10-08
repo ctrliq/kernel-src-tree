@@ -1,0 +1,204 @@
+x86, mpx: Add MPX-specific mmap interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mpx: Add MPX-specific mmap interface (Rui Wang) [1138650]
+Rebuild_FUZZ: 93.51%
+commit-author Qiaowei Ren <qiaowei.ren@intel.com>
+commit 57319d80e1d328e34cb24868a4f4405661485e30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/57319d80.failed
+
+We have chosen to perform the allocation of bounds tables in
+kernel (See the patch "on-demand kernel allocation of bounds
+tables") and to mark these VMAs with VM_MPX.
+
+However, there is currently no suitable interface to actually do
+this.  Existing interfaces, like do_mmap_pgoff(), have no way to
+set a modified ->vm_ops or ->vm_flags and don't hold mmap_sem
+long enough to let a caller do it.
+
+This patch wraps mmap_region() and hold mmap_sem long enough to
+make the modifications to the VMA which we need.
+
+Also note the 32/64-bit #ifdef in the header.  We actually need
+to do this at runtime eventually.  But, for now, we don't support
+running 32-bit binaries on 64-bit kernels.  Support for this will
+come in later patches.
+
+	Signed-off-by: Qiaowei Ren <qiaowei.ren@intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: linux-mm@kvack.org
+	Cc: linux-mips@linux-mips.org
+	Cc: Dave Hansen <dave@sr71.net>
+Link: http://lkml.kernel.org/r/20141114151827.CE440F67@viggo.jf.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 57319d80e1d328e34cb24868a4f4405661485e30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/Makefile
+diff --cc arch/x86/mm/Makefile
+index e0a96cd72162,ecfdc46a024a..000000000000
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@@ -31,4 -31,4 +31,8 @@@ obj-$(CONFIG_NUMA_EMU)		+= numa_emulati
+  
+  obj-$(CONFIG_MEMTEST)		+= memtest.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_TRACK_DIRTY_PAGES)	+= track.o
+++=======
++ obj-$(CONFIG_X86_INTEL_MPX)	+= mpx.o
+++>>>>>>> 57319d80e1d3 (x86, mpx: Add MPX-specific mmap interface)
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index eb1df2fdf979..dad0820e99b6 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -227,6 +227,10 @@ config HAVE_INTEL_TXT
+ 	def_bool y
+ 	depends on INTEL_IOMMU && ACPI
+ 
++config X86_INTEL_MPX
++	def_bool y
++	depends on CPU_SUP_INTEL
++
+ config X86_32_SMP
+ 	def_bool y
+ 	depends on X86_32 && SMP
+diff --git a/arch/x86/include/asm/mpx.h b/arch/x86/include/asm/mpx.h
+new file mode 100644
+index 000000000000..7d7c5f54cc5f
+--- /dev/null
++++ b/arch/x86/include/asm/mpx.h
+@@ -0,0 +1,36 @@
++#ifndef _ASM_X86_MPX_H
++#define _ASM_X86_MPX_H
++
++#include <linux/types.h>
++#include <asm/ptrace.h>
++
++#ifdef CONFIG_X86_64
++
++/* upper 28 bits [47:20] of the virtual address in 64-bit used to
++ * index into bounds directory (BD).
++ */
++#define MPX_BD_ENTRY_OFFSET	28
++#define MPX_BD_ENTRY_SHIFT	3
++/* bits [19:3] of the virtual address in 64-bit used to index into
++ * bounds table (BT).
++ */
++#define MPX_BT_ENTRY_OFFSET	17
++#define MPX_BT_ENTRY_SHIFT	5
++#define MPX_IGN_BITS		3
++
++#else
++
++#define MPX_BD_ENTRY_OFFSET	20
++#define MPX_BD_ENTRY_SHIFT	2
++#define MPX_BT_ENTRY_OFFSET	10
++#define MPX_BT_ENTRY_SHIFT	4
++#define MPX_IGN_BITS		2
++
++#endif
++
++#define MPX_BD_SIZE_BYTES (1UL<<(MPX_BD_ENTRY_OFFSET+MPX_BD_ENTRY_SHIFT))
++#define MPX_BT_SIZE_BYTES (1UL<<(MPX_BT_ENTRY_OFFSET+MPX_BT_ENTRY_SHIFT))
++
++#define MPX_BNDSTA_ERROR_CODE	0x3
++
++#endif /* _ASM_X86_MPX_H */
+* Unmerged path arch/x86/mm/Makefile
+diff --git a/arch/x86/mm/mpx.c b/arch/x86/mm/mpx.c
+new file mode 100644
+index 000000000000..72d13b0779a2
+--- /dev/null
++++ b/arch/x86/mm/mpx.c
+@@ -0,0 +1,86 @@
++/*
++ * mpx.c - Memory Protection eXtensions
++ *
++ * Copyright (c) 2014, Intel Corporation.
++ * Qiaowei Ren <qiaowei.ren@intel.com>
++ * Dave Hansen <dave.hansen@intel.com>
++ */
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/sched/sysctl.h>
++
++#include <asm/mman.h>
++#include <asm/mpx.h>
++
++static const char *mpx_mapping_name(struct vm_area_struct *vma)
++{
++	return "[mpx]";
++}
++
++static struct vm_operations_struct mpx_vma_ops = {
++	.name = mpx_mapping_name,
++};
++
++/*
++ * This is really a simplified "vm_mmap". it only handles MPX
++ * bounds tables (the bounds directory is user-allocated).
++ *
++ * Later on, we use the vma->vm_ops to uniquely identify these
++ * VMAs.
++ */
++static unsigned long mpx_mmap(unsigned long len)
++{
++	unsigned long ret;
++	unsigned long addr, pgoff;
++	struct mm_struct *mm = current->mm;
++	vm_flags_t vm_flags;
++	struct vm_area_struct *vma;
++
++	/* Only bounds table and bounds directory can be allocated here */
++	if (len != MPX_BD_SIZE_BYTES && len != MPX_BT_SIZE_BYTES)
++		return -EINVAL;
++
++	down_write(&mm->mmap_sem);
++
++	/* Too many mappings? */
++	if (mm->map_count > sysctl_max_map_count) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/* Obtain the address to map to. we verify (or select) it and ensure
++	 * that it represents a valid section of the address space.
++	 */
++	addr = get_unmapped_area(NULL, 0, len, 0, MAP_ANONYMOUS | MAP_PRIVATE);
++	if (addr & ~PAGE_MASK) {
++		ret = addr;
++		goto out;
++	}
++
++	vm_flags = VM_READ | VM_WRITE | VM_MPX |
++			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
++
++	/* Set pgoff according to addr for anon_vma */
++	pgoff = addr >> PAGE_SHIFT;
++
++	ret = mmap_region(NULL, addr, len, vm_flags, pgoff);
++	if (IS_ERR_VALUE(ret))
++		goto out;
++
++	vma = find_vma(mm, ret);
++	if (!vma) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	vma->vm_ops = &mpx_vma_ops;
++
++	if (vm_flags & VM_LOCKED) {
++		up_write(&mm->mmap_sem);
++		mm_populate(ret, len);
++		return ret;
++	}
++
++out:
++	up_write(&mm->mmap_sem);
++	return ret;
++}
