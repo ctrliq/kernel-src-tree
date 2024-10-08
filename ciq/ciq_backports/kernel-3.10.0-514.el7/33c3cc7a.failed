@@ -1,0 +1,182 @@
+perf/x86/mbm: Add Intel Memory B/W Monitoring enumeration and init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit 33c3cc7acfd95968d74247f1a4e1b0727a07ed43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/33c3cc7a.failed
+
+The MBM init patch enumerates the Intel MBM (Memory b/w monitoring)
+and initializes the perf events and datastructures for monitoring the
+memory b/w.
+
+Its based on original patch series by Tony Luck and Kanaka Juvva.
+
+Memory bandwidth monitoring (MBM) provides OS/VMM a way to monitor
+bandwidth from one level of cache to another. The current patches
+support L3 external bandwidth monitoring. It supports both 'local
+bandwidth' and 'total bandwidth' monitoring for the socket. Local
+bandwidth measures the amount of data sent through the memory controller
+on the socket and total b/w measures the total system bandwidth.
+
+Extending the cache quality of service monitoring (CQM) we add two
+more events to the perf infrastructure:
+
+  intel_cqm_llc/local_bytes - bytes sent through local socket memory controller
+  intel_cqm_llc/total_bytes - total L3 external bytes sent
+
+The tasks are associated with a Resouce Monitoring ID (RMID) just like
+in CQM and OS uses a MSR write to indicate the RMID of the task during
+scheduling.
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: fenghua.yu@intel.com
+	Cc: h.peter.anvin@intel.com
+	Cc: ravi.v.shankar@intel.com
+	Cc: vikas.shivappa@intel.com
+Link: http://lkml.kernel.org/r/1457652732-4499-4-git-send-email-vikas.shivappa@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 33c3cc7acfd95968d74247f1a4e1b0727a07ed43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/cpu/perf_event_intel_cqm.c
+diff --cc arch/x86/kernel/cpu/common.c
+index b7f07b3beff8,e601c1286e29..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -660,14 -647,17 +660,24 @@@ void get_cpu_cap(struct cpuinfo_x86 *c
+  
+  			/* QoS sub-leaf, EAX=0Fh, ECX=1 */
+  			cpuid_count(0x0000000F, 1, &eax, &ebx, &ecx, &edx);
+++<<<<<<< HEAD
+ +			c->x86_capability[12] = edx;
+ +			if (cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) {
+ +				rh_c->x86_cache_max_rmid = ecx;
+ +				rh_c->x86_cache_occ_scale = ebx;
+++=======
++ 			c->x86_capability[CPUID_F_1_EDX] = edx;
++ 
++ 			if ((cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) ||
++ 			      ((cpu_has(c, X86_FEATURE_CQM_MBM_TOTAL)) ||
++ 			       (cpu_has(c, X86_FEATURE_CQM_MBM_LOCAL)))) {
++ 				c->x86_cache_max_rmid = ecx;
++ 				c->x86_cache_occ_scale = ebx;
+++>>>>>>> 33c3cc7acfd9 (perf/x86/mbm: Add Intel Memory B/W Monitoring enumeration and init)
+  			}
+  		} else {
+ -			c->x86_cache_max_rmid = -1;
+ -			c->x86_cache_occ_scale = -1;
+ +			rh_c->x86_cache_max_rmid = -1;
+ +			rh_c->x86_cache_occ_scale = -1;
+  		}
+  	}
+  
+diff --cc arch/x86/kernel/cpu/perf_event_intel_cqm.c
+index 431fbecf27df,515df11e65bb..000000000000
+--- a/arch/x86/kernel/cpu/perf_event_intel_cqm.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+@@@ -15,10 -15,25 +15,11 @@@
+  
+  static u32 cqm_max_rmid = -1;
+  static unsigned int cqm_l3_scale; /* supposedly cacheline size */
++ static bool cqm_enabled, mbm_enabled;
+  
+ -/**
+ - * struct intel_pqr_state - State cache for the PQR MSR
+ - * @rmid:		The cached Resource Monitoring ID
+ - * @closid:		The cached Class Of Service ID
+ - * @rmid_usecnt:	The usage counter for rmid
+ - *
+ - * The upper 32 bits of MSR_IA32_PQR_ASSOC contain closid and the
+ - * lower 10 bits rmid. The update to MSR_IA32_PQR_ASSOC always
+ - * contains both parts, so we need to cache them.
+ - *
+ - * The cache also helps to avoid pointless updates if the value does
+ - * not change.
+ - */
+ -struct intel_pqr_state {
+ +struct intel_cqm_state {
+  	u32			rmid;
+ -	u32			closid;
+ -	int			rmid_usecnt;
+ +	int			cnt;
+  };
+  
+  /*
+@@@ -27,7 -42,25 +28,29 @@@
+   * (intel_cqm_event_start and intel_cqm_event_stop) are called with
+   * interrupts disabled, which is sufficient for the protection.
+   */
+++<<<<<<< HEAD:arch/x86/kernel/cpu/perf_event_intel_cqm.c
+ +static DEFINE_PER_CPU(struct intel_cqm_state, cqm_state);
+++=======
++ static DEFINE_PER_CPU(struct intel_pqr_state, pqr_state);
++ /**
++  * struct sample - mbm event's (local or total) data
++  * @total_bytes    #bytes since we began monitoring
++  * @prev_msr       previous value of MSR
++  */
++ struct sample {
++ 	u64	total_bytes;
++ 	u64	prev_msr;
++ };
++ 
++ /*
++  * samples profiled for total memory bandwidth type events
++  */
++ static struct sample *mbm_total;
++ /*
++  * samples profiled for local memory bandwidth type events
++  */
++ static struct sample *mbm_local;
+++>>>>>>> 33c3cc7acfd9 (perf/x86/mbm: Add Intel Memory B/W Monitoring enumeration and init):arch/x86/events/intel/cqm.c
+  
+  /*
+   * Protects cache_cgroups and cqm_rmid_free_lru and cqm_rmid_limbo_lru.
+@@@ -1323,10 -1424,17 +1424,17 @@@ static int __init intel_cqm_init(void
+  	char *str = NULL, scale[20];
+  	int i, cpu, ret;
+  
+- 	if (!x86_match_cpu(intel_cqm_match))
++ 	if (x86_match_cpu(intel_cqm_match))
++ 		cqm_enabled = true;
++ 
++ 	if (x86_match_cpu(intel_mbm_local_match) &&
++ 	     x86_match_cpu(intel_mbm_total_match))
++ 		mbm_enabled = true;
++ 
++ 	if (!cqm_enabled && !mbm_enabled)
+  		return -ENODEV;
+  
+ -	cqm_l3_scale = boot_cpu_data.x86_cache_occ_scale;
+ +	cqm_l3_scale = rh_boot_cpu_data.x86_cache_occ_scale;
+  
+  	/*
+  	 * It's possible that not all resources support the same number
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/kernel/cpu/common.c
+* Unmerged path arch/x86/kernel/cpu/perf_event_intel_cqm.c
