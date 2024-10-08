@@ -1,0 +1,89 @@
+ceph: fix ceph_dir_llseek()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Yan, Zheng <zheng.z.yan@intel.com>
+commit f0494206076703aaa0c8005eff41c413216ae26b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f0494206.failed
+
+Comparing offset with inode->i_sb->s_maxbytes doesn't make sense for
+directory. For a fragmented directory, offset (frag_t, off) can be
+larger than inode->i_sb->s_maxbytes.
+
+At the very beginning of ceph_dir_llseek(), local variable old_offset
+is initialized to parameter offset. This doesn't make sense neither.
+Old_offset should be ceph_make_fpos(fi->frag, fi->next_offset).
+
+	Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+	Reviewed-by: Alex Elder <elder@linaro.org>
+(cherry picked from commit f0494206076703aaa0c8005eff41c413216ae26b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+diff --cc fs/ceph/dir.c
+index e9a0fd2a195f,a7eaf9692aa6..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -173,29 -180,27 +173,33 @@@ more
+  	spin_unlock(&dentry->d_lock);
+  	spin_unlock(&parent->d_lock);
+  
+ -	dout(" %llu (%llu) dentry %p %.*s %p\n", di->offset, ctx->pos,
+ +	dout(" %llu (%llu) dentry %p %.*s %p\n", di->offset, filp->f_pos,
+  	     dentry, dentry->d_name.len, dentry->d_name.name, dentry->d_inode);
+ -	ctx->pos = di->offset;
+ -	if (!dir_emit(ctx, dentry->d_name.name,
+ -		      dentry->d_name.len,
+ +	filp->f_pos = di->offset;
+ +	err = filldir(dirent, dentry->d_name.name,
+ +		      dentry->d_name.len, di->offset,
+  		      ceph_translate_ino(dentry->d_sb, dentry->d_inode->i_ino),
+ -		      dentry->d_inode->i_mode >> 12)) {
+ -		if (last) {
+ +		      dentry->d_inode->i_mode >> 12);
+ +
+ +	if (last) {
+ +		if (err < 0) {
+  			/* remember our position */
+  			fi->dentry = last;
+++<<<<<<< HEAD
+ +			fi->next_offset = di->offset;
+ +		} else {
+ +			dput(last);
+++=======
++ 			fi->next_offset = fpos_off(di->offset);
+++>>>>>>> f04942060767 (ceph: fix ceph_dir_llseek())
+  		}
+ -		dput(dentry);
+ -		return 0;
+  	}
+ -
+ -	if (last)
+ -		dput(last);
+  	last = dentry;
+  
+ -	ctx->pos++;
+ +	if (err < 0)
+ +		goto out;
+ +
+ +	filp->f_pos++;
+  
+  	/* make sure a dentry wasn't dropped while we didn't have parent lock */
+  	if (!ceph_dir_is_complete(dir)) {
+* Unmerged path fs/ceph/dir.c
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index d5f3f2a712dc..99e482c98bd4 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -561,7 +561,7 @@ struct ceph_file_info {
+ 
+ 	/* readdir: position within a frag */
+ 	unsigned offset;       /* offset of last chunk, adjusted for . and .. */
+-	u64 next_offset;       /* offset of next chunk (last_name's + 1) */
++	unsigned next_offset;  /* offset of next chunk (last_name's + 1) */
+ 	char *last_name;       /* last entry in previous chunk */
+ 	struct dentry *dentry; /* next dentry (for dcache readdir) */
+ 	int dir_release_count;
