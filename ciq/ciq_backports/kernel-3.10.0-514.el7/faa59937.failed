@@ -1,0 +1,105 @@
+sched/deadline: Prevent rt_time growth to infinity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@gmail.com>
+commit faa5993736d9b44b508cab4f1f3a77d66641c6f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/faa59937.failed
+
+Kirill Tkhai noted:
+
+  Since deadline tasks share rt bandwidth, we must care about
+  bandwidth timer set. Otherwise rt_time may grow up to infinity
+  in update_curr_dl(), if there are no other available RT tasks
+  on top level bandwidth.
+
+RT task were in fact throttled right after they got enqueued,
+and never executed again (rt_time never again went below rt_runtime).
+
+Peter then proposed to accrue DL execution on rt_time only when
+rt timer is active, and proposed a patch (this patch is a slight
+modification of that) to implement that behavior. While this
+solves Kirill problem, it has a drawback.
+
+Indeed, Kirill noted again:
+
+  It looks we may get into a situation, when all CPU time is shared
+  between RT and DL tasks:
+
+  rt_runtime = n
+  rt_period  = 2n
+
+  | RT working, DL sleeping  | DL working, RT sleeping      |
+  -----------------------------------------------------------
+  | (1)     duration = n     | (2)     duration = n         | (repeat)
+  |--------------------------|------------------------------|
+  | (rt_bw timer is running) | (rt_bw timer is not running) |
+
+  No time for fair tasks at all.
+
+While this can happen during the first period, if rq is always backlogged,
+RT tasks won't have the opportunity to execute anymore: rt_time reached
+rt_runtime during (1), suppose after (2) RT is enqueued back, it gets
+throttled since rt timer didn't fire, replenishment is from now on eaten up
+by DL tasks that accrue their execution on rt_time (while rt timer is
+active - we have an RT task waiting for replenishment). FAIR tasks are
+not touched after this first period. Ok, this is not ideal, and the situation
+is even worse!
+
+What above (the nice case), practically never happens in reality, where
+your rt timer is not aligned to tasks periods, tasks are in general not
+periodic, etc.. Long story short, you always risk to overload your system.
+
+This patch is based on Peter's idea, but exploits an additional fact:
+if you don't have RT tasks enqueued, it makes little sense to continue
+incrementing rt_time once you reached the upper limit (DL tasks have their
+own mechanism for throttling).
+
+This cures both problems:
+
+ - no matter how many DL instances in the past, you'll have an rt_time
+   slightly above rt_runtime when an RT task is enqueued, and from that
+   point on (after the first replenishment), the task will normally execute;
+
+ - you can still eat up all bandwidth during the first period, but not
+   anymore after that, remember that DL execution will increment rt_time
+   till the upper limit is reached.
+
+The situation is still not perfect! But, we have a simple solution for now,
+that limits how much you can jeopardize your system, as we keep working
+towards the right answer: RT groups scheduled using deadline servers.
+
+	Reported-by: Kirill Tkhai <tkhai@yandex.ru>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+Link: http://lkml.kernel.org/r/20140225151515.617714e2f2cd6c558531ba61@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit faa5993736d9b44b508cab4f1f3a77d66641c6f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/deadline.c
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 27f9ed8f4b17..d637908062bc 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -561,6 +561,14 @@ static inline struct rt_bandwidth *sched_rt_bandwidth(struct rt_rq *rt_rq)
+ 
+ #endif /* CONFIG_RT_GROUP_SCHED */
+ 
++bool sched_rt_bandwidth_account(struct rt_rq *rt_rq)
++{
++	struct rt_bandwidth *rt_b = sched_rt_bandwidth(rt_rq);
++
++	return (hrtimer_active(&rt_b->rt_period_timer) ||
++		rt_rq->rt_time < rt_b->rt_runtime);
++}
++
+ #ifdef CONFIG_SMP
+ /*
+  * We ran out of runtime, see if we can borrow some from our neighbours.
