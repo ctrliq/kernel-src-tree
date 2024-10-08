@@ -1,0 +1,246 @@
+ahci: Store irq number in struct ahci_host_priv
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Robert Richter <rrichter@cavium.com>
+commit 21bfd1aa9527811408d6073d45e5ac8283a28b72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/21bfd1aa.failed
+
+Currently, ahci supports only msi and intx. To also support msix the
+handling of the irq number need to be changed. The irq number for msix
+devices is taken from msi_list instead of pci_dev. Thus, the irq
+number of a device needs to be stored in struct ahci_host_priv now.
+This allows the host controller to be activated in a generic way.
+
+This change is only intended for ahci drivers. For that reason the irq
+number is stored in struct ahci_host_priv used only by ahci drivers.
+Thus, the ABI changes only for ahci_host_activate(), but existing ata
+drivers (about 50) are unaffected and keep unchanged. All users of
+ahci_host_activate() have been updated.
+
+While touching drivers/ata/libahci.c, doing a small code cleanup in
+ahci_port_start().
+
+	Signed-off-by: Robert Richter <rrichter@cavium.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 21bfd1aa9527811408d6073d45e5ac8283a28b72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/ahci.h
+#	drivers/ata/libahci_platform.c
+#	drivers/ata/sata_highbank.c
+diff --cc drivers/ata/ahci.h
+index ca362482649f,5b8e8a0fab48..000000000000
+--- a/drivers/ata/ahci.h
++++ b/drivers/ata/ahci.h
+@@@ -323,7 -333,23 +323,27 @@@ struct ahci_host_priv 
+  	u32 			em_loc; /* enclosure management location */
+  	u32			em_buf_sz;	/* EM buffer size in byte */
+  	u32			em_msg_type;	/* EM message type */
+++<<<<<<< HEAD
+ +	struct clk		*clk;		/* Only for platforms supporting clk */
+++=======
++ 	bool			got_runtime_pm; /* Did we do pm_runtime_get? */
++ 	struct clk		*clks[AHCI_MAX_CLKS]; /* Optional */
++ 	struct regulator	**target_pwrs;	/* Optional */
++ 	/*
++ 	 * If platform uses PHYs. There is a 1:1 relation between the port number and
++ 	 * the PHY position in this array.
++ 	 */
++ 	struct phy		**phys;
++ 	unsigned		nports;		/* Number of ports */
++ 	void			*plat_data;	/* Other platform data */
++ 	unsigned int		irq;		/* interrupt line */
++ 	/*
++ 	 * Optional ahci_start_engine override, if not set this gets set to the
++ 	 * default ahci_start_engine during ahci_save_initial_config, this can
++ 	 * be overridden anytime before the host is activated.
++ 	 */
++ 	void			(*start_engine)(struct ata_port *ap);
+++>>>>>>> 21bfd1aa9527 (ahci: Store irq number in struct ahci_host_priv)
+  };
+  
+  extern int ahci_ignore_sss;
+@@@ -367,8 -396,8 +387,13 @@@ void ahci_set_em_messages(struct ahci_h
+  			  struct ata_port_info *pi);
+  int ahci_reset_em(struct ata_host *host);
+  void ahci_print_info(struct ata_host *host, const char *scc_s);
+++<<<<<<< HEAD
+ +int ahci_host_activate(struct ata_host *host, int irq,
+ +		       struct scsi_host_template *sht);
+++=======
++ int ahci_host_activate(struct ata_host *host, struct scsi_host_template *sht);
++ void ahci_error_handler(struct ata_port *ap);
+++>>>>>>> 21bfd1aa9527 (ahci: Store irq number in struct ahci_host_priv)
+  
+  static inline void __iomem *__ahci_port_base(struct ata_host *host,
+  					     unsigned int port_no)
+diff --cc drivers/ata/sata_highbank.c
+index dd71250942a9,8638d575b2b9..000000000000
+--- a/drivers/ata/sata_highbank.c
++++ b/drivers/ata/sata_highbank.c
+@@@ -305,7 -493,13 +305,8 @@@ static int ahci_highbank_probe(struct p
+  		dev_err(dev, "can't alloc ahci_host_priv\n");
+  		return -ENOMEM;
+  	}
+ -	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
+ -	if (!pdata) {
+ -		dev_err(dev, "can't alloc ecx_plat_data\n");
+ -		return -ENOMEM;
+ -	}
+  
++ 	hpriv->irq = irq;
+  	hpriv->flags |= (unsigned long)pi.private_data;
+  
+  	hpriv->mmio = devm_ioremap(dev, mem->start, resource_size(mem));
+@@@ -373,8 -569,7 +374,12 @@@
+  	ahci_init_controller(host);
+  	ahci_print_info(host, "platform");
+  
+++<<<<<<< HEAD
+ +	rc = ata_host_activate(host, irq, ahci_interrupt, 0,
+ +					&ahci_highbank_platform_sht);
+++=======
++ 	rc = ahci_host_activate(host, &ahci_highbank_platform_sht);
+++>>>>>>> 21bfd1aa9527 (ahci: Store irq number in struct ahci_host_priv)
+  	if (rc)
+  		goto err0;
+  
+* Unmerged path drivers/ata/libahci_platform.c
+diff --git a/drivers/ata/acard-ahci.c b/drivers/ata/acard-ahci.c
+index b9ed236f52d1..6221d9203f6f 100644
+--- a/drivers/ata/acard-ahci.c
++++ b/drivers/ata/acard-ahci.c
+@@ -433,6 +433,8 @@ static int acard_ahci_init_one(struct pci_dev *pdev, const struct pci_device_id
+ 	hpriv = devm_kzalloc(dev, sizeof(*hpriv), GFP_KERNEL);
+ 	if (!hpriv)
+ 		return -ENOMEM;
++
++	hpriv->irq = pdev->irq;
+ 	hpriv->flags |= (unsigned long)pi.private_data;
+ 
+ 	if (!(hpriv->flags & AHCI_HFLAG_NO_MSI))
+@@ -498,7 +500,7 @@ static int acard_ahci_init_one(struct pci_dev *pdev, const struct pci_device_id
+ 	acard_ahci_pci_print_info(host);
+ 
+ 	pci_set_master(pdev);
+-	return ahci_host_activate(host, pdev->irq, &acard_ahci_sht);
++	return ahci_host_activate(host, &acard_ahci_sht);
+ }
+ 
+ module_pci_driver(acard_ahci_pci_driver);
+diff --git a/drivers/ata/ahci.c b/drivers/ata/ahci.c
+index 6e323e88e7be..4789edda4bad 100644
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@ -1286,14 +1286,18 @@ static int ahci_init_msi(struct pci_dev *pdev, unsigned int n_ports,
+ 	if (nvec > 1)
+ 		hpriv->flags |= AHCI_HFLAG_MULTI_MSI;
+ 
+-	return nvec;
++	goto out;
+ 
+ single_msi:
++	nvec = 1;
++
+ 	rc = pci_enable_msi(pdev);
+ 	if (rc < 0)
+ 		return rc;
++out:
++	hpriv->irq = pdev->irq;
+ 
+-	return 1;
++	return nvec;
+ }
+ 
+ static int ahci_init_interrupts(struct pci_dev *pdev, unsigned int n_ports,
+@@ -1307,6 +1311,7 @@ static int ahci_init_interrupts(struct pci_dev *pdev, unsigned int n_ports,
+ 
+ 	/* lagacy intx interrupts */
+ 	pci_intx(pdev, 1);
++	hpriv->irq = pdev->irq;
+ 
+ 	return 0;
+ }
+@@ -1474,13 +1479,13 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	 */
+ 	n_ports = max(ahci_nr_ports(hpriv->cap), fls(hpriv->port_map));
+ 
+-	ahci_init_interrupts(pdev, n_ports, hpriv);
+-
+ 	host = ata_host_alloc_pinfo(&pdev->dev, ppi, n_ports);
+ 	if (!host)
+ 		return -ENOMEM;
+ 	host->private_data = hpriv;
+ 
++	ahci_init_interrupts(pdev, n_ports, hpriv);
++
+ 	if (!(hpriv->cap & HOST_CAP_SSS) || ahci_ignore_sss)
+ 		host->flags |= ATA_HOST_PARALLEL_SCAN;
+ 	else
+@@ -1526,7 +1531,7 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	pci_set_master(pdev);
+ 
+-	return ahci_host_activate(host, pdev->irq, &ahci_sht);
++	return ahci_host_activate(host, &ahci_sht);
+ }
+ 
+ module_pci_driver(ahci_pci_driver);
+* Unmerged path drivers/ata/ahci.h
+diff --git a/drivers/ata/libahci.c b/drivers/ata/libahci.c
+index 15889abeecd3..e6be15c636c1 100644
+--- a/drivers/ata/libahci.c
++++ b/drivers/ata/libahci.c
+@@ -2283,7 +2283,7 @@ static int ahci_port_start(struct ata_port *ap)
+ 	/*
+ 	 * Switch to per-port locking in case each port has its own MSI vector.
+ 	 */
+-	if ((hpriv->flags & AHCI_HFLAG_MULTI_MSI)) {
++	if (hpriv->flags & AHCI_HFLAG_MULTI_MSI) {
+ 		spin_lock_init(&pp->lock);
+ 		ap->lock = &pp->lock;
+ 	}
+@@ -2411,7 +2411,10 @@ static int ahci_host_activate_multi_irqs(struct ata_host *host, int irq,
+ 	rc = ata_host_start(host);
+ 	if (rc)
+ 		return rc;
+-
++	/*
++	 * Requests IRQs according to AHCI-1.1 when multiple MSIs were
++	 * allocated. That is one MSI per port, starting from @irq.
++	 */
+ 	for (i = 0; i < host->n_ports; i++) {
+ 		struct ahci_port_priv *pp = host->ports[i]->private_data;
+ 
+@@ -2450,23 +2453,18 @@ out_free_irqs:
+ /**
+  *	ahci_host_activate - start AHCI host, request IRQs and register it
+  *	@host: target ATA host
+- *	@irq: base IRQ number to request
+  *	@sht: scsi_host_template to use when registering the host
+  *
+- *	Similar to ata_host_activate, but requests IRQs according to AHCI-1.1
+- *	when multiple MSIs were allocated. That is one MSI per port, starting
+- *	from @irq.
+- *
+  *	LOCKING:
+  *	Inherited from calling layer (may sleep).
+  *
+  *	RETURNS:
+  *	0 on success, -errno otherwise.
+  */
+-int ahci_host_activate(struct ata_host *host, int irq,
+-		       struct scsi_host_template *sht)
++int ahci_host_activate(struct ata_host *host, struct scsi_host_template *sht)
+ {
+ 	struct ahci_host_priv *hpriv = host->private_data;
++	int irq = hpriv->irq;
+ 	int rc;
+ 
+ 	if (hpriv->flags & AHCI_HFLAG_MULTI_MSI)
+* Unmerged path drivers/ata/libahci_platform.c
+* Unmerged path drivers/ata/sata_highbank.c
