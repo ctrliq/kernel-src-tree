@@ -1,0 +1,206 @@
+x86, irq, ACPI: Change __acpi_register_gsi to return IRQ number instead of GSI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] irq, acpi: Change __acpi_register_gsi to return IRQ number instead of GSI (Steve Best) [1231358]
+Rebuild_FUZZ: 96.69%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 84245af7297ced9e8fe837dc0fc4782438771bd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/84245af7.failed
+
+Currently __acpi_register_gsi is defined to return GSI number and
+may be set to acpi_register_gsi_pic(), acpi_register_gsi_ioapic(),
+acpi_register_gsi_xen_hvm() and acpi_register_gsi_xen().
+
+Among which, acpi_register_gsi_ioapic() returns GSI number, but
+acpi_register_gsi_xen_hvm() and acpi_register_gsi_xen() actually
+returns IRQ number instead of GSI. And for acpi_register_gsi_pic(),
+GSI number equals to IRQ number.
+
+So change acpi_register_gsi_ioapic() to return IRQ number, it also
+simplifies the code.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Grant Likely <grant.likely@linaro.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Len Brown <len.brown@intel.com>
+	Cc: Pavel Machek <pavel@ucw.cz>
+Link: http://lkml.kernel.org/r/1402380887-32512-1-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 84245af7297ced9e8fe837dc0fc4782438771bd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/acpi/boot.c
+diff --cc arch/x86/kernel/acpi/boot.c
+index e90087442d73,0cf311c72bce..000000000000
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@@ -334,6 -320,134 +334,137 @@@ acpi_parse_lapic_nmi(struct acpi_subtab
+  #endif				/*CONFIG_X86_LOCAL_APIC */
+  
+  #ifdef CONFIG_X86_IO_APIC
+++<<<<<<< HEAD
+++=======
++ #define MP_ISA_BUS		0
++ 
++ static void __init mp_override_legacy_irq(u8 bus_irq, u8 polarity, u8 trigger,
++ 					  u32 gsi)
++ {
++ 	int ioapic;
++ 	int pin;
++ 	struct mpc_intsrc mp_irq;
++ 
++ 	/*
++ 	 * Convert 'gsi' to 'ioapic.pin'.
++ 	 */
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0)
++ 		return;
++ 	pin = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	/*
++ 	 * TBD: This check is for faulty timer entries, where the override
++ 	 *      erroneously sets the trigger to level, resulting in a HUGE
++ 	 *      increase of timer interrupts!
++ 	 */
++ 	if ((bus_irq == 0) && (trigger == 3))
++ 		trigger = 1;
++ 
++ 	mp_irq.type = MP_INTSRC;
++ 	mp_irq.irqtype = mp_INT;
++ 	mp_irq.irqflag = (trigger << 2) | polarity;
++ 	mp_irq.srcbus = MP_ISA_BUS;
++ 	mp_irq.srcbusirq = bus_irq;	/* IRQ */
++ 	mp_irq.dstapic = mpc_ioapic_id(ioapic); /* APIC ID */
++ 	mp_irq.dstirq = pin;	/* INTIN# */
++ 
++ 	mp_save_irq(&mp_irq);
++ 
++ 	/*
++ 	 * Reset default identity mapping if gsi is also an legacy IRQ,
++ 	 * otherwise there will be more than one entry with the same GSI
++ 	 * and acpi_isa_irq_to_gsi() may give wrong result.
++ 	 */
++ 	if (gsi < nr_legacy_irqs() && isa_irq_to_gsi[gsi] == gsi)
++ 		isa_irq_to_gsi[gsi] = ACPI_INVALID_GSI;
++ 	isa_irq_to_gsi[bus_irq] = gsi;
++ }
++ 
++ static int mp_config_acpi_gsi(struct device *dev, u32 gsi, int trigger,
++ 			int polarity)
++ {
++ #ifdef CONFIG_X86_MPPARSE
++ 	struct mpc_intsrc mp_irq;
++ 	struct pci_dev *pdev;
++ 	unsigned char number;
++ 	unsigned int devfn;
++ 	int ioapic;
++ 	u8 pin;
++ 
++ 	if (!acpi_ioapic)
++ 		return 0;
++ 	if (!dev || !dev_is_pci(dev))
++ 		return 0;
++ 
++ 	pdev = to_pci_dev(dev);
++ 	number = pdev->bus->number;
++ 	devfn = pdev->devfn;
++ 	pin = pdev->pin;
++ 	/* print the entry should happen on mptable identically */
++ 	mp_irq.type = MP_INTSRC;
++ 	mp_irq.irqtype = mp_INT;
++ 	mp_irq.irqflag = (trigger == ACPI_EDGE_SENSITIVE ? 4 : 0x0c) |
++ 				(polarity == ACPI_ACTIVE_HIGH ? 1 : 3);
++ 	mp_irq.srcbus = number;
++ 	mp_irq.srcbusirq = (((devfn >> 3) & 0x1f) << 2) | ((pin - 1) & 3);
++ 	ioapic = mp_find_ioapic(gsi);
++ 	mp_irq.dstapic = mpc_ioapic_id(ioapic);
++ 	mp_irq.dstirq = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	mp_save_irq(&mp_irq);
++ #endif
++ 	return 0;
++ }
++ 
++ static int mp_register_gsi(struct device *dev, u32 gsi, int trigger,
++ 			   int polarity)
++ {
++ 	int irq;
++ 	int ioapic;
++ 	int ioapic_pin;
++ 	struct io_apic_irq_attr irq_attr;
++ 	int ret;
++ 
++ 	if (acpi_irq_model != ACPI_IRQ_MODEL_IOAPIC)
++ 		return gsi;
++ 
++ 	/* Don't set up the ACPI SCI because it's already set up */
++ 	if (acpi_gbl_FADT.sci_interrupt == gsi)
++ 		return gsi;
++ 
++ 	irq = map_gsi_to_irq(gsi);
++ 	if (irq < 0)
++ 		return irq;
++ 
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0) {
++ 		printk(KERN_WARNING "No IOAPIC for GSI %u\n", gsi);
++ 		return gsi;
++ 	}
++ 
++ 	ioapic_pin = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	if (ioapic_pin > MP_MAX_IOAPIC_PIN) {
++ 		printk(KERN_ERR "Invalid reference to IOAPIC pin "
++ 		       "%d-%d\n", mpc_ioapic_id(ioapic),
++ 		       ioapic_pin);
++ 		return gsi;
++ 	}
++ 
++ 	if (enable_update_mptable)
++ 		mp_config_acpi_gsi(dev, gsi, trigger, polarity);
++ 
++ 	set_io_apic_irq_attr(&irq_attr, ioapic, ioapic_pin,
++ 			     trigger == ACPI_EDGE_SENSITIVE ? 0 : 1,
++ 			     polarity == ACPI_ACTIVE_HIGH ? 0 : 1);
++ 	ret = io_apic_set_pci_routing(dev, irq, &irq_attr);
++ 	if (ret < 0)
++ 		irq = -1;
++ 
++ 	return irq;
++ }
+++>>>>>>> 84245af7297c (x86, irq, ACPI: Change __acpi_register_gsi to return IRQ number instead of GSI)
+  
+  static int __init
+  acpi_parse_ioapic(struct acpi_subtable_header * header, const unsigned long end)
+@@@ -554,13 -675,7 +687,17 @@@ int (*acpi_suspend_lowlevel)(void)
+   */
+  int acpi_register_gsi(struct device *dev, u32 gsi, int trigger, int polarity)
+  {
+++<<<<<<< HEAD
+ +	unsigned int irq;
+ +	unsigned int plat_gsi = gsi;
+ +
+ +	plat_gsi = (*__acpi_register_gsi)(dev, gsi, trigger, polarity);
+ +	irq = gsi_to_irq(plat_gsi);
+ +
+ +	return irq;
+++=======
++ 	return __acpi_register_gsi(dev, gsi, trigger, polarity);
+++>>>>>>> 84245af7297c (x86, irq, ACPI: Change __acpi_register_gsi to return IRQ number instead of GSI)
+  }
+  EXPORT_SYMBOL_GPL(acpi_register_gsi);
+  
+* Unmerged path arch/x86/kernel/acpi/boot.c
