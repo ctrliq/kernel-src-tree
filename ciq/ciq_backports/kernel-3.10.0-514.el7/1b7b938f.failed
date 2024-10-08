@@ -1,0 +1,135 @@
+perf/x86/intel: Fix PMI handling for Intel PT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Shishkin <alexander.shishkin@linux.intel.com>
+commit 1b7b938f181742f899a2f31c280f79dabef6ddb6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1b7b938f.failed
+
+Intel PT is a separate PMU and it is not using any of the x86_pmu
+code paths, which means in particular that the active_events counter
+remains intact when new PT events are created.
+
+However, PT uses the generic x86_pmu PMI handler for its PMI handling needs.
+
+The problem here is that the latter checks active_events and in case of it
+being zero, exits without calling the actual x86_pmu.handle_nmi(), which
+results in unknown NMI errors and massive data loss for PT.
+
+The effect is not visible if there are other perf events in the system
+at the same time that keep active_events counter non-zero, for instance
+if the NMI watchdog is running, so one needs to disable it to reproduce
+the problem.
+
+At the same time, the active_events counter besides doing what the name
+suggests also implicitly serves as a PMC hardware and DS area reference
+counter.
+
+This patch adds a separate reference counter for the PMC hardware, leaving
+active_events for actually counting the events and makes sure it also
+counts PT and BTS events.
+
+	Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: acme@infradead.org
+	Cc: adrian.hunter@intel.com
+Link: http://lkml.kernel.org/r/87k2v92t0s.fsf@ashishki-desk.ger.corp.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1b7b938f181742f899a2f31c280f79dabef6ddb6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/perf_event.c
+diff --cc arch/x86/kernel/cpu/perf_event.c
+index f1131c0efdf8,6be186ccef46..000000000000
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@@ -266,11 -271,8 +267,16 @@@ msr_fail
+  
+  static void hw_perf_event_destroy(struct perf_event *event)
+  {
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_mutex_lock(&active_events, &pmc_reserve_mutex)) {
+ +		release_pmc_hardware();
+ +		release_ds_buffers();
+ +		mutex_unlock(&pmc_reserve_mutex);
+ +	}
+++=======
++ 	x86_release_hardware();
++ 	atomic_dec(&active_events);
+++>>>>>>> 1b7b938f1817 (perf/x86/intel: Fix PMI handling for Intel PT)
+  }
+  
+  void hw_perf_lbr_event_destroy(struct perf_event *event)
+@@@ -320,6 -322,35 +326,38 @@@ set_ext_hw_attr(struct hw_perf_event *h
+  	return x86_pmu_extra_regs(val, event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int x86_reserve_hardware(void)
++ {
++ 	int err = 0;
++ 
++ 	if (!atomic_inc_not_zero(&pmc_refcount)) {
++ 		mutex_lock(&pmc_reserve_mutex);
++ 		if (atomic_read(&pmc_refcount) == 0) {
++ 			if (!reserve_pmc_hardware())
++ 				err = -EBUSY;
++ 			else
++ 				reserve_ds_buffers();
++ 		}
++ 		if (!err)
++ 			atomic_inc(&pmc_refcount);
++ 		mutex_unlock(&pmc_reserve_mutex);
++ 	}
++ 
++ 	return err;
++ }
++ 
++ void x86_release_hardware(void)
++ {
++ 	if (atomic_dec_and_mutex_lock(&pmc_refcount, &pmc_reserve_mutex)) {
++ 		release_pmc_hardware();
++ 		release_ds_buffers();
++ 		mutex_unlock(&pmc_reserve_mutex);
++ 	}
++ }
++ 
+++>>>>>>> 1b7b938f1817 (perf/x86/intel: Fix PMI handling for Intel PT)
+  /*
+   * Check if we can create event of a certain type (that no conflicting events
+   * are present).
+@@@ -1398,13 -1437,17 +1449,17 @@@ void perf_events_lapic_init(void
+  	apic_write(APIC_LVTPC, APIC_DM_NMI);
+  }
+  
+ -static int
+ +static int __kprobes
+  perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+  {
+ +	int ret;
+  	u64 start_clock;
+  	u64 finish_clock;
+ -	int ret;
+  
++ 	/*
++ 	 * All PMUs/events that share this PMI handler should make sure to
++ 	 * increment active_events for their events.
++ 	 */
+  	if (!atomic_read(&active_events))
+  		return NMI_DONE;
+  
+* Unmerged path arch/x86/kernel/cpu/perf_event.c
