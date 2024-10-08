@@ -1,0 +1,111 @@
+Btrfs: split bio_readpage_error into several functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Miao Xie <miaox@cn.fujitsu.com>
+commit 2fe6303e7cd099334cdb09370cece6bc168de131
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2fe6303e.failed
+
+The data repair function of direct read will be implemented later, and some code
+in bio_readpage_error will be reused, so split bio_readpage_error into
+several functions which will be used in direct read repair later.
+
+	Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 2fe6303e7cd099334cdb09370cece6bc168de131)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent_io.c
+diff --cc fs/btrfs/extent_io.c
+index 2c202e4d5284,c191ea58750f..000000000000
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@@ -2303,22 -2278,32 +2278,41 @@@ int btrfs_check_repairable(struct inod
+  	}
+  
+  	if (failrec->this_mirror > num_copies) {
+- 		pr_debug("bio_readpage_error: (fail) num_copies=%d, next_mirror %d, failed_mirror %d\n",
++ 		pr_debug("Check Repairable: (fail) num_copies=%d, next_mirror %d, failed_mirror %d\n",
+  			 num_copies, failrec->this_mirror, failed_mirror);
+- 		free_io_failure(inode, failrec);
+- 		return -EIO;
++ 		return 0;
+  	}
+  
++ 	return 1;
++ }
++ 
++ 
++ struct bio *btrfs_create_repair_bio(struct inode *inode, struct bio *failed_bio,
++ 				    struct io_failure_record *failrec,
++ 				    struct page *page, int pg_offset, int icsum,
++ 				    bio_end_io_t *endio_func)
++ {
++ 	struct bio *bio;
++ 	struct btrfs_io_bio *btrfs_failed_bio;
++ 	struct btrfs_io_bio *btrfs_bio;
++ 
+  	bio = btrfs_io_bio_alloc(GFP_NOFS, 1);
+++<<<<<<< HEAD
+ +	if (!bio) {
+ +		free_io_failure(inode, failrec);
+ +		return -EIO;
+ +	}
+ +	bio->bi_end_io = failed_bio->bi_end_io;
+ +	bio->bi_sector = failrec->logical >> 9;
+++=======
++ 	if (!bio)
++ 		return NULL;
++ 
++ 	bio->bi_end_io = endio_func;
++ 	bio->bi_iter.bi_sector = failrec->logical >> 9;
+++>>>>>>> 2fe6303e7cd0 (Btrfs: split bio_readpage_error into several functions)
+  	bio->bi_bdev = BTRFS_I(inode)->root->fs_info->fs_devices->latest_bdev;
+ -	bio->bi_iter.bi_size = 0;
+ +	bio->bi_size = 0;
+  
+  	btrfs_failed_bio = btrfs_io_bio(failed_bio);
+  	if (btrfs_failed_bio->csum) {
+* Unmerged path fs/btrfs/extent_io.c
+diff --git a/fs/btrfs/extent_io.h b/fs/btrfs/extent_io.h
+index 844b4c5029cd..75b621b7cd9f 100644
+--- a/fs/btrfs/extent_io.h
++++ b/fs/btrfs/extent_io.h
+@@ -344,6 +344,34 @@ int repair_io_failure(struct btrfs_fs_info *fs_info, u64 start,
+ int end_extent_writepage(struct page *page, int err, u64 start, u64 end);
+ int repair_eb_io_failure(struct btrfs_root *root, struct extent_buffer *eb,
+ 			 int mirror_num);
++
++/*
++ * When IO fails, either with EIO or csum verification fails, we
++ * try other mirrors that might have a good copy of the data.  This
++ * io_failure_record is used to record state as we go through all the
++ * mirrors.  If another mirror has good data, the page is set up to date
++ * and things continue.  If a good mirror can't be found, the original
++ * bio end_io callback is called to indicate things have failed.
++ */
++struct io_failure_record {
++	struct page *page;
++	u64 start;
++	u64 len;
++	u64 logical;
++	unsigned long bio_flags;
++	int this_mirror;
++	int failed_mirror;
++	int in_validation;
++};
++
++int btrfs_get_io_failure_record(struct inode *inode, u64 start, u64 end,
++				struct io_failure_record **failrec_ret);
++int btrfs_check_repairable(struct inode *inode, struct bio *failed_bio,
++			   struct io_failure_record *failrec, int fail_mirror);
++struct bio *btrfs_create_repair_bio(struct inode *inode, struct bio *failed_bio,
++				    struct io_failure_record *failrec,
++				    struct page *page, int pg_offset, int icsum,
++				    bio_end_io_t *endio_func);
+ #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+ noinline u64 find_lock_delalloc_range(struct inode *inode,
+ 				      struct extent_io_tree *tree,
