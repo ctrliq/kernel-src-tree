@@ -219,6 +219,7 @@ struct eeh_ops {
 };
 
 extern int eeh_subsystem_flags;
+extern int eeh_max_freezes;
 extern struct eeh_ops *eeh_ops;
 extern raw_spinlock_t confirm_error_lock;
 
@@ -263,12 +264,6 @@ static inline void eeh_serialize_unlock(unsigned long flags)
 {
 	raw_spin_unlock_irqrestore(&confirm_error_lock, flags);
 }
-
-/*
- * Max number of EEH freezes allowed before we consider the device
- * to be permanently disabled.
- */
-#define EEH_MAX_ALLOWED_FREEZES 5
 
 typedef void *(*eeh_traverse_func)(void *data, void *flag);
 int eeh_phb_pe_create(struct pci_controller *phb);
