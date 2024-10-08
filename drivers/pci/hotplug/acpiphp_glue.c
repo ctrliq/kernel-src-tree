@@ -1165,9 +1165,12 @@ static void handle_hotplug_event_func(acpi_handle handle, u32 type,
 	alloc_acpi_hp_work(handle, type, context, _handle_hotplug_event_func);
 }
 
-/*
- * Create hotplug slots for the PCI bus.
- * It should always return 0 to avoid skipping following notifiers.
+/**
+ * acpiphp_enumerate_slots - Enumerate PCI slots for a given bus.
+ * @bus: PCI bus to enumerate the slots for.
+ *
+ * A "slot" is an object associated with a PCI device number.  All functions
+ * (PCI devices) with the same bus and device number belong to the same slot.
  */
 void acpiphp_enumerate_slots(struct pci_bus *bus, acpi_handle handle)
 {
@@ -1210,7 +1213,10 @@ void acpiphp_enumerate_slots(struct pci_bus *bus, acpi_handle handle)
 	init_bridge_misc(bridge);
 }
 
-/* Destroy hotplug slots associated with the PCI bus */
+/**
+ * acpiphp_remove_slots - Remove slot objects associated with a given bus.
+ * @bus: PCI bus to remove the slot objects for.
+ */
 void acpiphp_remove_slots(struct pci_bus *bus)
 {
 	struct acpiphp_bridge *bridge, *tmp;
