@@ -1,0 +1,226 @@
+blk-mq: handle NULL req return from blk_map_request in single queue mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit ff87bcec197774f938fbd1fe996068005f3dfb3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ff87bcec.failed
+
+blk_mq_map_request() can return NULL if we fail entering the queue
+(dying, or removed), in which case it has already ended IO on the
+bio. So nothing more to do, except just return.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit ff87bcec197774f938fbd1fe996068005f3dfb3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index f1f3d27fe9e1,96e6eb638f00..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -845,39 -1094,57 +845,40 @@@ void blk_mq_flush_plug_list(struct blk_
+  static void blk_mq_bio_to_request(struct request *rq, struct bio *bio)
+  {
+  	init_request_from_bio(rq, bio);
+ -
+ -	if (blk_do_io_stat(rq)) {
+ -		rq->start_time = jiffies;
+ -		blk_account_io_start(rq, 1);
+ -	}
+ +	blk_account_io_start(rq, 1);
+  }
+  
+ -static inline bool blk_mq_merge_queue_io(struct blk_mq_hw_ctx *hctx,
+ -					 struct blk_mq_ctx *ctx,
+ -					 struct request *rq, struct bio *bio)
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct request_queue *q = hctx->queue;
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_ctx *ctx;
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	int rw = bio_data_dir(bio);
+ +	struct request *rq;
+ +	unsigned int use_plug, request_count = 0;
+  
+ -	if (!(hctx->flags & BLK_MQ_F_SHOULD_MERGE)) {
+ -		blk_mq_bio_to_request(rq, bio);
+ -		spin_lock(&ctx->lock);
+ -insert_rq:
+ -		__blk_mq_insert_request(hctx, rq, false);
+ -		spin_unlock(&ctx->lock);
+ -		return false;
+ -	} else {
+ -		spin_lock(&ctx->lock);
+ -		if (!blk_mq_attempt_merge(q, ctx, bio)) {
+ -			blk_mq_bio_to_request(rq, bio);
+ -			goto insert_rq;
+ -		}
+ +	/*
+ +	 * If we have multiple hardware queues, just go directly to
+ +	 * one of those for sync IO.
+ +	 */
+ +	use_plug = !is_flush_fua && ((q->nr_hw_queues == 1) || !is_sync);
+  
+ -		spin_unlock(&ctx->lock);
+ -		__blk_mq_free_request(hctx, ctx, rq);
+ -		return true;
+ -	}
+ -}
+ +	blk_queue_bounce(q, &bio);
+  
+ -struct blk_map_ctx {
+ -	struct blk_mq_hw_ctx *hctx;
+ -	struct blk_mq_ctx *ctx;
+ -};
+ +	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ +		bio_endio(bio, -EIO);
+ +		return;
+ +	}
+  
+ -static struct request *blk_mq_map_request(struct request_queue *q,
+ -					  struct bio *bio,
+ -					  struct blk_map_ctx *data)
+ -{
+ -	struct blk_mq_hw_ctx *hctx;
+ -	struct blk_mq_ctx *ctx;
+ -	struct request *rq;
+ -	int rw = bio_data_dir(bio);
+ -	struct blk_mq_alloc_data alloc_data;
+ +	if (use_plug && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count))
+ +		return;
+  
+ -	if (unlikely(blk_mq_queue_enter(q))) {
+++<<<<<<< HEAD
+ +	if (blk_mq_queue_enter(q)) {
+  		bio_endio(bio, -EIO);
+ -		return NULL;
+ +		return;
+  	}
+  
+  	ctx = blk_mq_get_ctx(q);
+@@@ -899,6 -1167,117 +900,11 @@@
+  	}
+  
+  	hctx->queued++;
+ -	data->hctx = hctx;
+ -	data->ctx = ctx;
+ -	return rq;
+ -}
+ -
+ -/*
+ - * Multiple hardware queue variant. This will not use per-process plugs,
+ - * but will attempt to bypass the hctx queueing if we can go straight to
+ - * hardware for SYNC IO.
+ - */
+ -static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ -{
+ -	const int is_sync = rw_is_sync(bio->bi_rw);
+ -	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ -	struct blk_map_ctx data;
+ -	struct request *rq;
+ -
+ -	blk_queue_bounce(q, &bio);
+ -
+ -	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_endio(bio, -EIO);
+ -		return;
+ -	}
+ -
+ -	rq = blk_mq_map_request(q, bio, &data);
+ -	if (unlikely(!rq))
+ -		return;
+ -
+ -	if (unlikely(is_flush_fua)) {
+ -		blk_mq_bio_to_request(rq, bio);
+ -		blk_insert_flush(rq);
+ -		goto run_queue;
+ -	}
+ -
+ -	if (is_sync) {
+ -		int ret;
+ -
+ -		blk_mq_bio_to_request(rq, bio);
+ -		blk_mq_start_request(rq, true);
+ -		blk_add_timer(rq);
+ -
+ -		/*
+ -		 * For OK queue, we are done. For error, kill it. Any other
+ -		 * error (busy), just add it to our list as we previously
+ -		 * would have done
+ -		 */
+ -		ret = q->mq_ops->queue_rq(data.hctx, rq);
+ -		if (ret == BLK_MQ_RQ_QUEUE_OK)
+ -			goto done;
+ -		else {
+ -			__blk_mq_requeue_request(rq);
+ -
+ -			if (ret == BLK_MQ_RQ_QUEUE_ERROR) {
+ -				rq->errors = -EIO;
+ -				blk_mq_end_io(rq, rq->errors);
+ -				goto done;
+ -			}
+ -		}
+ -	}
+ -
+ -	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+ -		/*
+ -		 * For a SYNC request, send it to the hardware immediately. For
+ -		 * an ASYNC request, just ensure that we run it later on. The
+ -		 * latter allows for merging opportunities and more efficient
+ -		 * dispatching.
+ -		 */
+ -run_queue:
+ -		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+ -	}
+ -done:
+ -	blk_mq_put_ctx(data.ctx);
+ -}
+ -
+ -/*
+ - * Single hardware queue variant. This will attempt to use any per-process
+ - * plug for merging and IO deferral.
+ - */
+ -static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
+ -{
+ -	const int is_sync = rw_is_sync(bio->bi_rw);
+ -	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ -	unsigned int use_plug, request_count = 0;
+ -	struct blk_map_ctx data;
+ -	struct request *rq;
+ -
+ -	/*
+ -	 * If we have multiple hardware queues, just go directly to
+ -	 * one of those for sync IO.
+ -	 */
+ -	use_plug = !is_flush_fua && !is_sync;
+ -
+ -	blk_queue_bounce(q, &bio);
+ -
+ -	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_endio(bio, -EIO);
+ -		return;
+ -	}
+ -
+ -	if (use_plug && !blk_queue_nomerges(q) &&
+ -	    blk_attempt_plug_merge(q, bio, &request_count))
+ -		return;
+ -
+ -	rq = blk_mq_map_request(q, bio, &data);
+ -	if (unlikely(!rq))
+ -		return;
+++=======
+++	rq = blk_mq_map_request(q, bio, &data);
+++	if (unlikely(!rq))
+++		return;
+++>>>>>>> ff87bcec1977 (blk-mq: handle NULL req return from blk_map_request in single queue mode)
+  
+  	if (unlikely(is_flush_fua)) {
+  		blk_mq_bio_to_request(rq, bio);
+* Unmerged path block/blk-mq.c
