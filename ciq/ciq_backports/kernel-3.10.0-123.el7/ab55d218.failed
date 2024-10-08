@@ -1,0 +1,187 @@
+powerpc/eeh: Introdce flag to protect sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Introdce flag to protect sysfs (Steve Best) [1033086]
+Rebuild_FUZZ: 89.74%
+commit-author Gavin Shan <shangw@linux.vnet.ibm.com>
+commit ab55d2187da27414f78056810713c92f9a4350c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/ab55d218.failed
+
+The patch introduces flag EEH_DEV_SYSFS to keep track that the sysfs
+entries for the corresponding EEH device (then PCI device) has been
+added or removed, in order to avoid race condition.
+
+	Signed-off-by: Gavin Shan <shangw@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit ab55d2187da27414f78056810713c92f9a4350c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/eeh.c
+#	arch/powerpc/kernel/eeh_sysfs.c
+#	arch/powerpc/platforms/powernv/eeh-powernv.c
+#	arch/powerpc/platforms/pseries/eeh_pseries.c
+diff --cc arch/powerpc/kernel/eeh.c
+index 16c2bbaf5883,ea9414c8088d..000000000000
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@@ -880,7 -900,22 +880,26 @@@ static void eeh_add_device_late(struct 
+  		pr_debug("EEH: Already referenced !\n");
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	WARN_ON(edev->pdev);
+++=======
++ 
++ 	/*
++ 	 * The EEH cache might not be removed correctly because of
++ 	 * unbalanced kref to the device during unplug time, which
++ 	 * relies on pcibios_release_device(). So we have to remove
++ 	 * that here explicitly.
++ 	 */
++ 	if (edev->pdev) {
++ 		eeh_rmv_from_parent_pe(edev);
++ 		eeh_addr_cache_rmv_dev(edev->pdev);
++ 		eeh_sysfs_remove_device(edev->pdev);
++ 		edev->mode &= ~EEH_DEV_SYSFS;
++ 
++ 		edev->pdev = NULL;
++ 		dev->dev.archdata.edev = NULL;
++ 	}
+++>>>>>>> ab55d2187da2 (powerpc/eeh: Introdce flag to protect sysfs)
+  
+  	edev->pdev = dev;
+  	dev->dev.archdata.edev = edev;
+@@@ -967,37 -1001,25 +986,38 @@@ static void eeh_remove_device(struct pc
+  		pr_debug("EEH: Not referenced !\n");
+  		return;
+  	}
+ -
+ -	/*
+ -	 * During the hotplug for EEH error recovery, we need the EEH
+ -	 * device attached to the parent PE in order for BAR restore
+ -	 * a bit later. So we keep it for BAR restore and remove it
+ -	 * from the parent PE during the BAR resotre.
+ -	 */
+  	edev->pdev = NULL;
+  	dev->dev.archdata.edev = NULL;
+ -	if (!(edev->pe->state & EEH_PE_KEEP))
+ -		eeh_rmv_from_parent_pe(edev);
+ -	else
+ -		edev->mode |= EEH_DEV_DISCONNECTED;
+  
+ +	eeh_rmv_from_parent_pe(edev, purge_pe);
+  	eeh_addr_cache_rmv_dev(dev);
+  	eeh_sysfs_remove_device(dev);
++ 	edev->mode &= ~EEH_DEV_SYSFS;
+  }
+  
+ +/**
+ + * eeh_remove_bus_device - Undo EEH setup for the indicated PCI device
+ + * @dev: PCI device
+ + * @purge_pe: remove the corresponding PE or not
+ + *
+ + * This routine must be called when a device is removed from the
+ + * running system through hotplug or dlpar. The corresponding
+ + * PCI address cache will be removed.
+ + */
+ +void eeh_remove_bus_device(struct pci_dev *dev, int purge_pe)
+ +{
+ +	struct pci_bus *bus = dev->subordinate;
+ +	struct pci_dev *child, *tmp;
+ +
+ +	eeh_remove_device(dev, purge_pe);
+ +
+ +	if (bus && dev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
+ +		list_for_each_entry_safe(child, tmp, &bus->devices, bus_list)
+ +			 eeh_remove_bus_device(child, purge_pe);
+ +	}
+ +}
+ +EXPORT_SYMBOL_GPL(eeh_remove_bus_device);
+ +
+  static int proc_eeh_show(struct seq_file *m, void *v)
+  {
+  	if (0 == eeh_subsystem_enabled) {
+diff --cc arch/powerpc/kernel/eeh_sysfs.c
+index e7ae3484918c,5d753d4f2c75..000000000000
+--- a/arch/powerpc/kernel/eeh_sysfs.c
++++ b/arch/powerpc/kernel/eeh_sysfs.c
+@@@ -68,6 -74,18 +74,21 @@@ void eeh_sysfs_add_device(struct pci_de
+  
+  void eeh_sysfs_remove_device(struct pci_dev *pdev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct eeh_dev *edev = pci_dev_to_eeh_dev(pdev);
++ 
++ 	/*
++ 	 * The parent directory might have been removed. We needn't
++ 	 * continue for that case.
++ 	 */
++ 	if (!pdev->dev.kobj.sd) {
++ 		if (edev)
++ 			edev->mode &= ~EEH_DEV_SYSFS;
++ 		return;
++ 	}
++ 
+++>>>>>>> ab55d2187da2 (powerpc/eeh: Introdce flag to protect sysfs)
+  	device_remove_file(&pdev->dev, &dev_attr_eeh_mode);
+  	device_remove_file(&pdev->dev, &dev_attr_eeh_config_addr);
+  	device_remove_file(&pdev->dev, &dev_attr_eeh_pe_config_addr);
+diff --cc arch/powerpc/platforms/pseries/eeh_pseries.c
+index b456b157d33d,7fbc25b1813f..000000000000
+--- a/arch/powerpc/platforms/pseries/eeh_pseries.c
++++ b/arch/powerpc/platforms/pseries/eeh_pseries.c
+@@@ -167,9 -211,26 +167,26 @@@ static void *pseries_eeh_of_probe(struc
+  	if (dn->type && !strcmp(dn->type, "isa"))
+  		return NULL;
+  
+ -	/*
+ -	 * Update class code and mode of eeh device. We need
+ -	 * correctly reflects that current device is root port
+ -	 * or PCIe switch downstream port.
+ -	 */
+ +	/* Update class code and mode of eeh device */
+  	edev->class_code = *class_code;
+++<<<<<<< HEAD
+ +	edev->mode = 0;
+++=======
++ 	edev->pcie_cap = pseries_eeh_find_cap(dn, PCI_CAP_ID_EXP);
++ 	edev->mode &= 0xFFFFFF00;
++ 	if ((edev->class_code >> 8) == PCI_CLASS_BRIDGE_PCI) {
++ 		edev->mode |= EEH_DEV_BRIDGE;
++ 		if (edev->pcie_cap) {
++ 			rtas_read_config(pdn, edev->pcie_cap + PCI_EXP_FLAGS,
++ 					 2, &pcie_flags);
++ 			pcie_flags = (pcie_flags & PCI_EXP_FLAGS_TYPE) >> 4;
++ 			if (pcie_flags == PCI_EXP_TYPE_ROOT_PORT)
++ 				edev->mode |= EEH_DEV_ROOT_PORT;
++ 			else if (pcie_flags == PCI_EXP_TYPE_DOWNSTREAM)
++ 				edev->mode |= EEH_DEV_DS_PORT;
++ 		}
++ 	}
+++>>>>>>> ab55d2187da2 (powerpc/eeh: Introdce flag to protect sysfs)
+  
+  	/* Retrieve the device address */
+  	regs = of_get_property(dn, "reg", NULL);
+* Unmerged path arch/powerpc/platforms/powernv/eeh-powernv.c
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index f2d19467c123..af50fc774792 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -83,6 +83,8 @@ struct eeh_pe {
+  */
+ #define EEH_DEV_IRQ_DISABLED	(1<<0)	/* Interrupt disabled		*/
+ 
++#define EEH_DEV_SYSFS		(1 << 8)	/* Sysfs created        */
++
+ struct eeh_dev {
+ 	int mode;			/* EEH mode			*/
+ 	int class_code;			/* Class code of the device	*/
+* Unmerged path arch/powerpc/kernel/eeh.c
+* Unmerged path arch/powerpc/kernel/eeh_sysfs.c
+* Unmerged path arch/powerpc/platforms/powernv/eeh-powernv.c
+* Unmerged path arch/powerpc/platforms/pseries/eeh_pseries.c
