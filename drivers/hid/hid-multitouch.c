@@ -1038,6 +1038,7 @@ static void mt_release_contacts(struct hid_device *hid)
 							   MT_TOOL_FINGER,
 							   false);
 			}
+			input_mt_sync_frame(input_dev);
 			input_sync(input_dev);
 		}
 	}
