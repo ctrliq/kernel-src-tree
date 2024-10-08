@@ -1,0 +1,207 @@
+IB/hfi1: Fix memory leak in user ExpRcv and SDMA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit 0ad2d3d05b4a597d1f2e239dcc6ab537cc3eeacb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0ad2d3d0.failed
+
+The driver had two memory leaks - one in the user
+expected receive code and one in SDMA buffer cache.
+
+The leak in the expected receive code only showed up
+when the user/admin had set ulimit sufficiently low
+and the driver did not have enough room in the cache
+before hitting the limit of allowed cachable memory.
+
+When this condition occurred, the driver returned
+early signaling userland that it needed to free some
+buffers to free up room in the cache.
+
+The bug was that the driver was not cleaning up
+allocated memory prior to returning early.
+
+The leak in the SDMA buffer cache could occur (even
+though it never did), when the insertion of a buffer
+node in the interval RB tree failed. In this case, the
+driver failed to unpin the pages of the node instead
+erroneously returning success.
+
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 0ad2d3d05b4a597d1f2e239dcc6ab537cc3eeacb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/user_sdma.c
+#	drivers/staging/rdma/hfi1/user_exp_rcv.c
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 6967deb7956a,044d33777fba..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -1036,40 -1030,134 +1036,57 @@@ static inline int num_user_pages(const 
+  	return 1 + ((epage - spage) >> PAGE_SHIFT);
+  }
+  
+ -/* Caller must hold pq->evict_lock */
+ -static u32 sdma_cache_evict(struct hfi1_user_sdma_pkt_q *pq, u32 npages)
+ -{
+ -	u32 cleared = 0;
+ -	struct sdma_mmu_node *node, *ptr;
+ -
+ -	list_for_each_entry_safe_reverse(node, ptr, &pq->evict, list) {
+ -		/* Make sure that no one is still using the node. */
+ -		if (!atomic_read(&node->refcount)) {
+ -			/*
+ -			 * Need to use the page count now as the remove callback
+ -			 * will free the node.
+ -			 */
+ -			cleared += node->npages;
+ -			spin_unlock(&pq->evict_lock);
+ -			hfi1_mmu_rb_remove(&pq->sdma_rb_root, &node->rb);
+ -			spin_lock(&pq->evict_lock);
+ -			if (cleared >= npages)
+ -				break;
+ -		}
+ -	}
+ -	return cleared;
+ -}
+ -
+  static int pin_vector_pages(struct user_sdma_request *req,
+  			    struct user_sdma_iovec *iovec) {
+ -	int ret = 0, pinned, npages, cleared;
+ -	struct page **pages;
+ -	struct hfi1_user_sdma_pkt_q *pq = req->pq;
+ -	struct sdma_mmu_node *node = NULL;
+ -	struct mmu_rb_node *rb_node;
+ -
+ -	rb_node = hfi1_mmu_rb_search(&pq->sdma_rb_root,
+ -				     (unsigned long)iovec->iov.iov_base,
+ -				     iovec->iov.iov_len);
+ -	if (rb_node && !IS_ERR(rb_node))
+ -		node = container_of(rb_node, struct sdma_mmu_node, rb);
+ -	else
+ -		rb_node = NULL;
+ -
+ -	if (!node) {
+ -		node = kzalloc(sizeof(*node), GFP_KERNEL);
+ -		if (!node)
+ -			return -ENOMEM;
+ +	int pinned, npages;
+  
+ -		node->rb.addr = (unsigned long)iovec->iov.iov_base;
+ -		node->rb.len = iovec->iov.iov_len;
+ -		node->pq = pq;
+ -		atomic_set(&node->refcount, 0);
+ -		INIT_LIST_HEAD(&node->list);
+ +	npages = num_user_pages(&iovec->iov);
+ +	iovec->pages = kcalloc(npages, sizeof(*iovec->pages), GFP_KERNEL);
+ +	if (!iovec->pages) {
+ +		SDMA_DBG(req, "Failed page array alloc");
+ +		return -ENOMEM;
+  	}
+  
+ -	npages = num_user_pages(&iovec->iov);
+ -	if (node->npages < npages) {
+ -		pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
+ -		if (!pages) {
+ -			SDMA_DBG(req, "Failed page array alloc");
+ -			ret = -ENOMEM;
+ -			goto bail;
+ -		}
+ -		memcpy(pages, node->pages, node->npages * sizeof(*pages));
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +	pinned = hfi1_acquire_user_pages((unsigned long)iovec->iov.iov_base,
+ +					 npages, 0, iovec->pages);
+  
+ -		npages -= node->npages;
+ -retry:
+ -		if (!hfi1_can_pin_pages(pq->dd, pq->n_locked, npages)) {
+ -			spin_lock(&pq->evict_lock);
+ -			cleared = sdma_cache_evict(pq, npages);
+ -			spin_unlock(&pq->evict_lock);
+ -			if (cleared >= npages)
+ -				goto retry;
+ -		}
+ -		pinned = hfi1_acquire_user_pages(
+ -			((unsigned long)iovec->iov.iov_base +
+ -			 (node->npages * PAGE_SIZE)), npages, 0,
+ -			pages + node->npages);
+ -		if (pinned < 0) {
+ -			kfree(pages);
+ -			ret = pinned;
+ -			goto bail;
+ -		}
+ -		if (pinned != npages) {
+ -			unpin_vector_pages(current->mm, pages, node->npages,
+ -					   pinned);
+ -			ret = -EFAULT;
+ -			goto bail;
+ -		}
+ -		kfree(node->pages);
+ -		node->pages = pages;
+ -		node->npages += pinned;
+ -		npages = node->npages;
+ -		spin_lock(&pq->evict_lock);
+ -		if (!rb_node)
+ -			list_add(&node->list, &pq->evict);
+ -		else
+ -			list_move(&node->list, &pq->evict);
+ -		pq->n_locked += pinned;
+ -		spin_unlock(&pq->evict_lock);
+ -	}
+ -	iovec->pages = node->pages;
+ -	iovec->npages = npages;
+ +	if (pinned < 0)
+ +		return pinned;
+  
+ +	iovec->npages = pinned;
+ +	if (pinned != npages) {
+ +		SDMA_DBG(req, "Failed to pin pages (%d/%u)", pinned, npages);
+ +		unpin_vector_pages(iovec);
+ +		return -EFAULT;
+++=======
++ 	if (!rb_node) {
++ 		ret = hfi1_mmu_rb_insert(&req->pq->sdma_rb_root, &node->rb);
++ 		if (ret) {
++ 			spin_lock(&pq->evict_lock);
++ 			if (!list_empty(&node->list))
++ 				list_del(&node->list);
++ 			pq->n_locked -= node->npages;
++ 			spin_unlock(&pq->evict_lock);
++ 			unpin_vector_pages(current->mm, node->pages, 0,
++ 					   node->npages);
++ 			goto bail;
++ 		}
++ 	} else {
++ 		atomic_inc(&node->refcount);
+++>>>>>>> 0ad2d3d05b4a (IB/hfi1: Fix memory leak in user ExpRcv and SDMA):drivers/staging/rdma/hfi1/user_sdma.c
+  	}
+  	return 0;
+ -bail:
+ -	if (!rb_node)
+ -		kfree(node);
+ -	return ret;
+  }
+  
+ -static void unpin_vector_pages(struct mm_struct *mm, struct page **pages,
+ -			       unsigned start, unsigned npages)
+ +static void unpin_vector_pages(struct user_sdma_iovec *iovec)
+  {
+ -	hfi1_release_user_pages(mm, pages + start, npages, 0);
+ -	kfree(pages);
+ +	hfi1_release_user_pages(iovec->pages, iovec->npages, 0);
+ +
+ +	kfree(iovec->pages);
+ +	iovec->pages = NULL;
+ +	iovec->npages = 0;
+ +	iovec->offset = 0;
+  }
+  
+  static int check_header_template(struct user_sdma_request *req,
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
