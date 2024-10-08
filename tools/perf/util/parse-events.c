@@ -1770,7 +1770,7 @@ int parse_events_term__clone(struct parse_events_term **new,
 			term->err_term, term->err_val);
 }
 
-void parse_events__free_terms(struct list_head *terms)
+void parse_events_terms__purge(struct list_head *terms)
 {
 	struct parse_events_term *term, *h;
 
@@ -1778,6 +1778,11 @@ void parse_events__free_terms(struct list_head *terms)
 		list_del_init(&term->list);
 		free(term);
 	}
+}
+
+void parse_events__free_terms(struct list_head *terms)
+{
+	parse_events_terms__purge(terms);
 }
 
 void parse_events_evlist_error(struct parse_events_evlist *data,
