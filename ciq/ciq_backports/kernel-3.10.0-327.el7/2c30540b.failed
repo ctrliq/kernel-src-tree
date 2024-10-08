@@ -1,0 +1,208 @@
+NVMe: add ->exit_hctx() hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 2c30540b38d683d4c7f06d13a451f67d4362d7b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2c30540b.failed
+
+If we do teardown and setup of the queue and block related parts
+of the driver, then we should clear nvmeq->hctx once we kill the
+hardware queue.
+
+	Acked-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 2c30540b38d683d4c7f06d13a451f67d4362d7b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index dfa7c848f446,ba278ae00705..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -148,62 -142,79 +148,74 @@@ typedef void (*nvme_completion_fn)(stru
+  struct nvme_cmd_info {
+  	nvme_completion_fn fn;
+  	void *ctx;
+ +	unsigned long timeout;
+  	int aborted;
+ -	struct nvme_queue *nvmeq;
+  };
+  
+ -static int nvme_admin_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
+ -				unsigned int hctx_idx)
+ +static struct nvme_cmd_info *nvme_cmd_info(struct nvme_queue *nvmeq)
+  {
+ -	struct nvme_dev *dev = data;
+ -	struct nvme_queue *nvmeq = dev->queues[0];
+ -
+ -	WARN_ON(nvmeq->hctx);
+ -	nvmeq->hctx = hctx;
+ -	hctx->driver_data = nvmeq;
+ -	return 0;
+ +	return (void *)&nvmeq->cmdid_data[BITS_TO_LONGS(nvmeq->q_depth)];
+  }
+  
+ -static int nvme_admin_init_request(void *data, struct request *req,
+ -				unsigned int hctx_idx, unsigned int rq_idx,
+ -				unsigned int numa_node)
+ +static unsigned nvme_queue_extra(int depth)
+  {
+ -	struct nvme_dev *dev = data;
+ -	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
+ -	struct nvme_queue *nvmeq = dev->queues[0];
+ -
+ -	BUG_ON(!nvmeq);
+ -	cmd->nvmeq = nvmeq;
+ -	return 0;
+ +	return DIV_ROUND_UP(depth, 8) + (depth * sizeof(struct nvme_cmd_info));
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * alloc_cmdid() - Allocate a Command ID
+ + * @nvmeq: The queue that will be used for this command
+ + * @ctx: A pointer that will be passed to the handler
+ + * @handler: The function to call on completion
+ + *
+ + * Allocate a Command ID for a queue.  The data passed in will
+ + * be passed to the completion handler.  This is implemented by using
+ + * the bottom two bits of the ctx pointer to store the handler ID.
+ + * Passing in a pointer that's not 4-byte aligned will cause a BUG.
+ + * We can change this if it becomes a problem.
+ + *
+ + * May be called with local interrupts disabled and the q_lock held,
+ + * or with interrupts enabled and no locks held.
+ + */
+ +static int alloc_cmdid(struct nvme_queue *nvmeq, void *ctx,
+ +				nvme_completion_fn handler, unsigned timeout)
+++=======
++ static void nvme_exit_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
++ {
++ 	struct nvme_queue *nvmeq = hctx->driver_data;
++ 
++ 	nvmeq->hctx = NULL;
++ }
++ 
++ static int nvme_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
++ 			  unsigned int hctx_idx)
+++>>>>>>> 2c30540b38d6 (NVMe: add ->exit_hctx() hook)
+  {
+ -	struct nvme_dev *dev = data;
+ -	struct nvme_queue *nvmeq = dev->queues[
+ -					(hctx_idx % dev->queue_count) + 1];
+ -
+ -	if (!nvmeq->hctx)
+ -		nvmeq->hctx = hctx;
+ -
+ -	/* nvmeq queues are shared between namespaces. We assume here that
+ -	 * blk-mq map the tags so they match up with the nvme queue tags. */
+ -	WARN_ON(nvmeq->hctx->tags != hctx->tags);
+ -
+ -	hctx->driver_data = nvmeq;
+ -	return 0;
+ -}
+ +	int depth = nvmeq->q_depth - 1;
+ +	struct nvme_cmd_info *info = nvme_cmd_info(nvmeq);
+ +	int cmdid;
+  
+ -static int nvme_init_request(void *data, struct request *req,
+ -				unsigned int hctx_idx, unsigned int rq_idx,
+ -				unsigned int numa_node)
+ -{
+ -	struct nvme_dev *dev = data;
+ -	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
+ -	struct nvme_queue *nvmeq = dev->queues[hctx_idx + 1];
+ +	do {
+ +		cmdid = find_first_zero_bit(nvmeq->cmdid_data, depth);
+ +		if (cmdid >= depth)
+ +			return -EBUSY;
+ +	} while (test_and_set_bit(cmdid, nvmeq->cmdid_data));
+  
+ -	BUG_ON(!nvmeq);
+ -	cmd->nvmeq = nvmeq;
+ -	return 0;
+ +	info[cmdid].fn = handler;
+ +	info[cmdid].ctx = ctx;
+ +	info[cmdid].timeout = jiffies + timeout;
+ +	info[cmdid].aborted = 0;
+ +	return cmdid;
+  }
+  
+ -static void nvme_set_info(struct nvme_cmd_info *cmd, void *ctx,
+ -				nvme_completion_fn handler)
+ +static int alloc_cmdid_killable(struct nvme_queue *nvmeq, void *ctx,
+ +				nvme_completion_fn handler, unsigned timeout)
+  {
+ -	cmd->fn = handler;
+ -	cmd->ctx = ctx;
+ -	cmd->aborted = 0;
+ +	int cmdid;
+ +	wait_event_killable(nvmeq->sq_full,
+ +		(cmdid = alloc_cmdid(nvmeq, ctx, handler, timeout)) >= 0);
+ +	return (cmdid < 0) ? -EINTR : cmdid;
+  }
+  
+  /* Special values must be less than 0x1000 */
+@@@ -1561,6 -1338,54 +1573,57 @@@ static int nvme_shutdown_ctrl(struct nv
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct blk_mq_ops nvme_mq_admin_ops = {
++ 	.queue_rq	= nvme_admin_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_admin_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_admin_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static struct blk_mq_ops nvme_mq_ops = {
++ 	.queue_rq	= nvme_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static int nvme_alloc_admin_tags(struct nvme_dev *dev)
++ {
++ 	if (!dev->admin_q) {
++ 		dev->admin_tagset.ops = &nvme_mq_admin_ops;
++ 		dev->admin_tagset.nr_hw_queues = 1;
++ 		dev->admin_tagset.queue_depth = NVME_AQ_DEPTH - 1;
++ 		dev->admin_tagset.timeout = ADMIN_TIMEOUT;
++ 		dev->admin_tagset.numa_node = dev_to_node(&dev->pci_dev->dev);
++ 		dev->admin_tagset.cmd_size = sizeof(struct nvme_cmd_info);
++ 		dev->admin_tagset.driver_data = dev;
++ 
++ 		if (blk_mq_alloc_tag_set(&dev->admin_tagset))
++ 			return -ENOMEM;
++ 
++ 		dev->admin_q = blk_mq_init_queue(&dev->admin_tagset);
++ 		if (!dev->admin_q) {
++ 			blk_mq_free_tag_set(&dev->admin_tagset);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void nvme_free_admin_tags(struct nvme_dev *dev)
++ {
++ 	if (dev->admin_q)
++ 		blk_mq_free_tag_set(&dev->admin_tagset);
++ }
++ 
+++>>>>>>> 2c30540b38d6 (NVMe: add ->exit_hctx() hook)
+  static int nvme_configure_admin_queue(struct nvme_dev *dev)
+  {
+  	int result;
+* Unmerged path drivers/block/nvme-core.c
