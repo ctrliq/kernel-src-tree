@@ -1,0 +1,136 @@
+pnfs: find swapped pages on pnfs commit lists too
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit 02d1426c7053da7c5a828ae9cd7b636ea4e46bf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/02d1426c.failed
+
+nfs_page_find_head_request_locked looks through the regular nfs commit lists
+when the page is swapped out, but doesn't look through the pnfs commit lists.
+
+I'm not sure if anyone has hit any issues caused by this.
+
+	Suggested-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 02d1426c7053da7c5a828ae9cd7b636ea4e46bf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/write.c
+diff --cc fs/nfs/write.c
+index a89cdd72f163,ba417692b80d..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -46,6 -45,10 +46,13 @@@ static const struct rpc_call_ops nfs_wr
+  static const struct rpc_call_ops nfs_commit_ops;
+  static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops;
+  static const struct nfs_commit_completion_ops nfs_commit_completion_ops;
+++<<<<<<< HEAD
+++=======
++ static const struct nfs_rw_ops nfs_rw_write_ops;
++ static void nfs_clear_request_commit(struct nfs_page *req);
++ static void nfs_init_cinfo_from_inode(struct nfs_commit_info *cinfo,
++ 				      struct inode *inode);
+++>>>>>>> 02d1426c7053 (pnfs: find swapped pages on pnfs commit lists too)
+  
+  static struct kmem_cache *nfs_wdata_cachep;
+  static mempool_t *nfs_wdata_mempool;
+diff --git a/fs/nfs/filelayout/filelayout.c b/fs/nfs/filelayout/filelayout.c
+index bcea4ec949e4..fb45669aa3ad 100644
+--- a/fs/nfs/filelayout/filelayout.c
++++ b/fs/nfs/filelayout/filelayout.c
+@@ -1257,6 +1257,36 @@ restart:
+ 	spin_unlock(cinfo->lock);
+ }
+ 
++/* filelayout_search_commit_reqs - Search lists in @cinfo for the head reqest
++ *				   for @page
++ * @cinfo - commit info for current inode
++ * @page - page to search for matching head request
++ *
++ * Returns a the head request if one is found, otherwise returns NULL.
++ */
++static struct nfs_page *
++filelayout_search_commit_reqs(struct nfs_commit_info *cinfo, struct page *page)
++{
++	struct nfs_page *freq, *t;
++	struct pnfs_commit_bucket *b;
++	int i;
++
++	/* Linearly search the commit lists for each bucket until a matching
++	 * request is found */
++	for (i = 0, b = cinfo->ds->buckets; i < cinfo->ds->nbuckets; i++, b++) {
++		list_for_each_entry_safe(freq, t, &b->written, wb_list) {
++			if (freq->wb_page == page)
++				return freq->wb_head;
++		}
++		list_for_each_entry_safe(freq, t, &b->committing, wb_list) {
++			if (freq->wb_page == page)
++				return freq->wb_head;
++		}
++	}
++
++	return NULL;
++}
++
+ static void filelayout_retry_commit(struct nfs_commit_info *cinfo, int idx)
+ {
+ 	struct pnfs_ds_commit_info *fl_cinfo = cinfo->ds;
+@@ -1406,6 +1436,7 @@ static struct pnfs_layoutdriver_type filelayout_type = {
+ 	.clear_request_commit	= filelayout_clear_request_commit,
+ 	.scan_commit_lists	= filelayout_scan_commit_lists,
+ 	.recover_commit_reqs	= filelayout_recover_commit_reqs,
++	.search_commit_reqs	= filelayout_search_commit_reqs,
+ 	.commit_pagelist	= filelayout_commit_pagelist,
+ 	.read_pagelist		= filelayout_read_pagelist,
+ 	.write_pagelist		= filelayout_write_pagelist,
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index bb1f061f76db..9e0b5bc58147 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -104,6 +104,8 @@ struct pnfs_layoutdriver_type {
+ 				  int max);
+ 	void (*recover_commit_reqs) (struct list_head *list,
+ 				     struct nfs_commit_info *cinfo);
++	struct nfs_page * (*search_commit_reqs)(struct nfs_commit_info *cinfo,
++						struct page *page);
+ 	int (*commit_pagelist)(struct inode *inode,
+ 			       struct list_head *mds_pages,
+ 			       int how,
+@@ -345,6 +347,17 @@ pnfs_recover_commit_reqs(struct inode *inode, struct list_head *list,
+ 	NFS_SERVER(inode)->pnfs_curr_ld->recover_commit_reqs(list, cinfo);
+ }
+ 
++static inline struct nfs_page *
++pnfs_search_commit_reqs(struct inode *inode, struct nfs_commit_info *cinfo,
++			struct page *page)
++{
++	struct pnfs_layoutdriver_type *ld = NFS_SERVER(inode)->pnfs_curr_ld;
++
++	if (ld == NULL || ld->search_commit_reqs == NULL)
++		return NULL;
++	return ld->search_commit_reqs(cinfo, page);
++}
++
+ /* Should the pNFS client commit and return the layout upon a setattr */
+ static inline bool
+ pnfs_ld_layoutret_on_setattr(struct inode *inode)
+@@ -496,6 +509,13 @@ pnfs_recover_commit_reqs(struct inode *inode, struct list_head *list,
+ {
+ }
+ 
++static inline struct nfs_page *
++pnfs_search_commit_reqs(struct inode *inode, struct nfs_commit_info *cinfo,
++			struct page *page)
++{
++	return NULL;
++}
++
+ static inline int pnfs_layoutcommit_inode(struct inode *inode, bool sync)
+ {
+ 	return 0;
+* Unmerged path fs/nfs/write.c
