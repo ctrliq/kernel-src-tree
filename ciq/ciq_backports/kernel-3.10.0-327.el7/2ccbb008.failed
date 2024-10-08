@@ -1,0 +1,152 @@
+scsi: only maintain target_blocked if the driver has a target queue limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] only maintain target_blocked if the driver has a target queue limit (Ewan Milne) [1109348]
+Rebuild_FUZZ: 95.71%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 2ccbb00808465338b57c39f38c0b1e7ce69e2bb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2ccbb008.failed
+
+This saves us an atomic operation for each I/O submission and completion
+for the usual case where the driver doesn't set a per-target can_queue
+value.  Only a few iscsi hardware offload drivers set the per-target
+can_queue value at the moment.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Webb Scales <webbnh@hp.com>
+	Acked-by: Jens Axboe <axboe@kernel.dk>
+	Tested-by: Bart Van Assche <bvanassche@acm.org>
+	Tested-by: Robert Elliott <elliott@hp.com>
+(cherry picked from commit 2ccbb00808465338b57c39f38c0b1e7ce69e2bb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index 3970c9519e29,a643353584b5..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -293,16 -294,18 +293,23 @@@ void scsi_device_unbusy(struct scsi_dev
+  	struct scsi_target *starget = scsi_target(sdev);
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(shost->host_lock, flags);
+ +	shost->host_busy--;
+ +	atomic_dec(&starget->target_busy);
+++=======
++ 	atomic_dec(&shost->host_busy);
++ 	if (starget->can_queue > 0)
++ 		atomic_dec(&starget->target_busy);
++ 
+++>>>>>>> 2ccbb0080846 (scsi: only maintain target_blocked if the driver has a target queue limit)
+  	if (unlikely(scsi_host_in_recovery(shost) &&
+ -		     (shost->host_failed || shost->host_eh_scheduled))) {
+ -		spin_lock_irqsave(shost->host_lock, flags);
+ +		     (shost->host_failed || shost->host_eh_scheduled)))
+  		scsi_eh_wakeup(shost);
+ -		spin_unlock_irqrestore(shost->host_lock, flags);
+ -	}
+ -
+ -	atomic_dec(&sdev->device_busy);
+ +	spin_unlock(shost->host_lock);
+ +	spin_lock(sdev->request_queue->queue_lock);
+ +	sdev->device_busy--;
+ +	spin_unlock_irqrestore(sdev->request_queue->queue_lock, flags);
+  }
+  
+  /*
+@@@ -351,28 -354,36 +358,38 @@@ static void scsi_single_lun_run(struct 
+  	spin_unlock_irqrestore(shost->host_lock, flags);
+  }
+  
+ -static inline bool scsi_device_is_busy(struct scsi_device *sdev)
+ +static inline int scsi_device_is_busy(struct scsi_device *sdev)
+  {
+ -	if (atomic_read(&sdev->device_busy) >= sdev->queue_depth)
+ -		return true;
+ -	if (atomic_read(&sdev->device_blocked) > 0)
+ -		return true;
+ -	return false;
+ +	if (sdev->device_busy >= sdev->queue_depth || sdev->device_blocked)
+ +		return 1;
+ +
+ +	return 0;
+  }
+  
+ -static inline bool scsi_target_is_busy(struct scsi_target *starget)
+ +static inline int scsi_target_is_busy(struct scsi_target *starget)
+  {
+++<<<<<<< HEAD
+ +	return ((starget->can_queue > 0 &&
+ +		 atomic_read(&starget->target_busy) >= starget->can_queue) ||
+ +		 starget->target_blocked);
+++=======
++ 	if (starget->can_queue > 0) {
++ 		if (atomic_read(&starget->target_busy) >= starget->can_queue)
++ 			return true;
++ 		if (atomic_read(&starget->target_blocked) > 0)
++ 			return true;
++ 	}
++ 	return false;
+++>>>>>>> 2ccbb0080846 (scsi: only maintain target_blocked if the driver has a target queue limit)
+  }
+  
+ -static inline bool scsi_host_is_busy(struct Scsi_Host *shost)
+ +static inline int scsi_host_is_busy(struct Scsi_Host *shost)
+  {
+ -	if (shost->can_queue > 0 &&
+ -	    atomic_read(&shost->host_busy) >= shost->can_queue)
+ -		return true;
+ -	if (atomic_read(&shost->host_blocked) > 0)
+ -		return true;
+ -	if (shost->host_self_blocked)
+ -		return true;
+ -	return false;
+ +	if ((shost->can_queue > 0 && shost->host_busy >= shost->can_queue) ||
+ +	    shost->host_blocked || shost->host_self_blocked)
+ +		return 1;
+ +
+ +	return 0;
+  }
+  
+  static void scsi_starved_list_run(struct Scsi_Host *shost)
+@@@ -1301,8 -1311,11 +1318,11 @@@ static inline int scsi_target_queue_rea
+  		spin_unlock_irq(shost->host_lock);
+  	}
+  
++ 	if (starget->can_queue <= 0)
++ 		return 1;
++ 
+  	busy = atomic_inc_return(&starget->target_busy) - 1;
+ -	if (atomic_read(&starget->target_blocked) > 0) {
+ +	if (starget->target_blocked) {
+  		if (busy)
+  			goto starved;
+  
+@@@ -1437,13 -1459,10 +1458,20 @@@ static void scsi_kill_request(struct re
+  	 * bump busy counts.  To bump the counters, we need to dance
+  	 * with the locks as normal issue path does.
+  	 */
+++<<<<<<< HEAD
+ +	sdev->device_busy++;
+ +	spin_unlock(sdev->request_queue->queue_lock);
+ +	spin_lock(shost->host_lock);
+ +	shost->host_busy++;
+ +	atomic_inc(&starget->target_busy);
+ +	spin_unlock(shost->host_lock);
+ +	spin_lock(sdev->request_queue->queue_lock);
+++=======
++ 	atomic_inc(&sdev->device_busy);
++ 	atomic_inc(&shost->host_busy);
++ 	if (starget->can_queue > 0)
++ 		atomic_inc(&starget->target_busy);
+++>>>>>>> 2ccbb0080846 (scsi: only maintain target_blocked if the driver has a target queue limit)
+  
+  	blk_complete_request(req);
+  }
+* Unmerged path drivers/scsi/scsi_lib.c
