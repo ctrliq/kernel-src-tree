@@ -144,7 +144,7 @@ nvc0_ltcg_init_tag_ram(struct nouveau_fb *pfb, struct nvc0_ltcg_priv *priv)
 	if (ret) {
 		priv->num_tags = 0;
 	} else {
-		u64 tag_base = (priv->tag_ram->offset << 12) + tag_margin;
+		u64 tag_base = ((u64)priv->tag_ram->offset << 12) + tag_margin;
 
 		tag_base += tag_align - 1;
 		ret = do_div(tag_base, tag_align);
