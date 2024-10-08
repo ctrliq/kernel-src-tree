@@ -1,0 +1,263 @@
+mm: introdule compound_head_by_tail()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [mm] introdule compound_head_by_tail() (Andrea Arcangeli) [1135506]
+Rebuild_FUZZ: 94.29%
+commit-author Jianyu Zhan <nasa4836@gmail.com>
+commit d2ee40eae98d8a41ff27dcdd13b1b656c4c1ad00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d2ee40ea.failed
+
+Currently, in put_compound_page(), we have
+
+======
+if (likely(!PageTail(page))) {                  <------  (1)
+        if (put_page_testzero(page)) {
+                 /*
+                 ¦* By the time all refcounts have been released
+                 ¦* split_huge_page cannot run anymore from under us.
+                 ¦*/
+                 if (PageHead(page))
+                         __put_compound_page(page);
+                 else
+                         __put_single_page(page);
+         }
+         return;
+}
+
+/* __split_huge_page_refcount can run under us */
+page_head = compound_head(page);        <------------ (2)
+======
+
+if at (1) ,  we fail the check, this means page is *likely* a tail page.
+
+Then at (2), as compoud_head(page) is inlined, it is :
+
+======
+static inline struct page *compound_head(struct page *page)
+{
+          if (unlikely(PageTail(page))) {           <----------- (3)
+              struct page *head = page->first_page;
+
+                smp_rmb();
+                if (likely(PageTail(page)))
+                        return head;
+        }
+        return page;
+}
+======
+
+here, the (3) unlikely in the case is a negative hint, because it is
+*likely* a tail page.  So the check (3) in this case is not good, so I
+introduce a helper for this case.
+
+So this patch introduces compound_head_by_tail() which deals with a
+possible tail page(though it could be spilt by a racy thread), and make
+compound_head() a wrapper on it.
+
+This patch has no functional change, and it reduces the object
+size slightly:
+   text    data     bss     dec     hex  filename
+  11003    1328      16   12347    303b  mm/swap.o.orig
+  10971    1328      16   12315    301b  mm/swap.o.patched
+
+I've ran "perf top -e branch-miss" to observe branch-miss in this case.
+As Michael points out, it's a slow path, so only very few times this case
+happens.  But I grep'ed the code base, and found there still are some
+other call sites could be benifited from this helper.  And given that it
+only bloating up the source by only 5 lines, but with a reduced object
+size.  I still believe this helper deserves to exsit.
+
+	Signed-off-by: Jianyu Zhan <nasa4836@gmail.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Jiang Liu <liuj97@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Sasha Levin <sasha.levin@oracle.com>
+	Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d2ee40eae98d8a41ff27dcdd13b1b656c4c1ad00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+#	mm/swap.c
+diff --cc include/linux/mm.h
+index c26b898c8bfd,368600628d14..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -374,7 -425,7 +389,11 @@@ static inline struct page *compound_hea
+  static inline struct page *compound_head(struct page *page)
+  {
+  	if (unlikely(PageTail(page)))
+++<<<<<<< HEAD
+ +		return page->first_page;
+++=======
++ 		return compound_head_by_tail(page);
+++>>>>>>> d2ee40eae98d (mm: introdule compound_head_by_tail())
+  	return page;
+  }
+  
+diff --cc mm/swap.c
+index 6dab198384ff,c8d6df556ce6..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -239,135 -244,20 +239,143 @@@ static void put_compound_page(struct pa
+  		return;
+  	}
+  
+ +	/* __split_huge_page_refcount can run under us */
+ +	page_head = compound_trans_head(page);
+ +
+  	/*
+ -	 * We see the PageCompound set and PageTail set, so @page maybe:
+ -	 *  1. a tail hugetlbfs page, or
+ -	 *  2. a tail THP page, or
+ -	 *  3. a split THP page.
+ +	 * THP can not break up slab pages so avoid taking
+ +	 * compound_lock() and skip the tail page refcounting (in
+ +	 * _mapcount) too. Slab performs non-atomic bit ops on
+ +	 * page->flags for better performance. In particular
+ +	 * slab_unlock() in slub used to be a hot path. It is still
+ +	 * hot on arches that do not support
+ +	 * this_cpu_cmpxchg_double().
+  	 *
+ -	 *  Case 3 is possible, as we may race with
+ -	 *  __split_huge_page_refcount tearing down a THP page.
+ +	 * If "page" is part of a slab or hugetlbfs page it cannot be
+ +	 * splitted and the head page cannot change from under us. And
+ +	 * if "page" is part of a THP page under splitting, if the
+ +	 * head page pointed by the THP tail isn't a THP head anymore,
+ +	 * we'll find PageTail clear after smp_rmb() and we'll treat
+ +	 * it as a single page.
+  	 */
+++<<<<<<< HEAD
+ +	if (!__compound_tail_refcounted(page_head)) {
+ +		/*
+ +		 * If "page" is a THP tail, we must read the tail page
+ +		 * flags after the head page flags. The
+ +		 * split_huge_page side enforces write memory barriers
+ +		 * between clearing PageTail and before the head page
+ +		 * can be freed and reallocated.
+ +		 */
+ +		smp_rmb();
+ +		if (likely(PageTail(page))) {
+ +			/*
+ +			 * __split_huge_page_refcount cannot race
+ +			 * here.
+ +			 */
+ +			VM_BUG_ON(!PageHead(page_head));
+ +			VM_BUG_ON(page_mapcount(page) != 0);
+ +			if (put_page_testzero(page_head)) {
+ +				/*
+ +				 * If this is the tail of a slab
+ +				 * compound page, the tail pin must
+ +				 * not be the last reference held on
+ +				 * the page, because the PG_slab
+ +				 * cannot be cleared before all tail
+ +				 * pins (which skips the _mapcount
+ +				 * tail refcounting) have been
+ +				 * released. For hugetlbfs the tail
+ +				 * pin may be the last reference on
+ +				 * the page instead, because
+ +				 * PageHeadHuge will not go away until
+ +				 * the compound page enters the buddy
+ +				 * allocator.
+ +				 */
+ +				VM_BUG_ON(PageSlab(page_head));
+ +				__put_compound_page(page_head);
+ +			}
+ +			return;
+ +		} else
+ +			/*
+ +			 * __split_huge_page_refcount run before us,
+ +			 * "page" was a THP tail. The split page_head
+ +			 * has been freed and reallocated as slab or
+ +			 * hugetlbfs page of smaller order (only
+ +			 * possible if reallocated as slab on x86).
+ +			 */
+ +			goto out_put_single;
+ +	}
+ +
+ +	if (likely(page != page_head && get_page_unless_zero(page_head))) {
+ +		unsigned long flags;
+ +
+ +		/*
+ +		 * page_head wasn't a dangling pointer but it may not
+ +		 * be a head page anymore by the time we obtain the
+ +		 * lock. That is ok as long as it can't be freed from
+ +		 * under us.
+ +		 */
+ +		flags = compound_lock_irqsave(page_head);
+ +		if (unlikely(!PageTail(page))) {
+ +			/* __split_huge_page_refcount run before us */
+ +			compound_unlock_irqrestore(page_head, flags);
+ +			if (put_page_testzero(page_head)) {
+ +				/*
+ +				 * The head page may have been freed
+ +				 * and reallocated as a compound page
+ +				 * of smaller order and then freed
+ +				 * again.  All we know is that it
+ +				 * cannot have become: a THP page, a
+ +				 * compound page of higher order, a
+ +				 * tail page.  That is because we
+ +				 * still hold the refcount of the
+ +				 * split THP tail and page_head was
+ +				 * the THP head before the split.
+ +				 */
+ +				if (PageHead(page_head))
+ +					__put_compound_page(page_head);
+ +				else
+ +					__put_single_page(page_head);
+ +			}
+ +out_put_single:
+ +			if (put_page_testzero(page))
+ +				__put_single_page(page);
+ +			return;
+ +		}
+ +		VM_BUG_ON(page_head != page->first_page);
+ +		/*
+ +		 * We can release the refcount taken by
+ +		 * get_page_unless_zero() now that
+ +		 * __split_huge_page_refcount() is blocked on the
+ +		 * compound_lock.
+ +		 */
+ +		if (put_page_testzero(page_head))
+ +			VM_BUG_ON(1);
+ +		/* __split_huge_page_refcount will wait now */
+ +		VM_BUG_ON(page_mapcount(page) <= 0);
+ +		atomic_dec(&page->_mapcount);
+ +		VM_BUG_ON(atomic_read(&page_head->_count) <= 0);
+ +		VM_BUG_ON(atomic_read(&page->_count) != 0);
+ +		compound_unlock_irqrestore(page_head, flags);
+ +
+ +		if (put_page_testzero(page_head)) {
+ +			if (PageHead(page_head))
+ +				__put_compound_page(page_head);
+ +			else
+ +				__put_single_page(page_head);
+ +		}
+ +	} else {
+ +		/* page_head is a dangling pointer */
+ +		VM_BUG_ON(PageTail(page));
+ +		goto out_put_single;
+ +	}
+++=======
++ 	page_head = compound_head_by_tail(page);
++ 	if (!__compound_tail_refcounted(page_head))
++ 		put_unrefcounted_compound_page(page_head, page);
++ 	else
++ 		put_refcounted_compound_page(page_head, page);
+++>>>>>>> d2ee40eae98d (mm: introdule compound_head_by_tail())
+  }
+  
+  void put_page(struct page *page)
+* Unmerged path include/linux/mm.h
+* Unmerged path mm/swap.c
