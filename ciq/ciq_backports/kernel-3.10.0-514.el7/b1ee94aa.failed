@@ -1,0 +1,201 @@
+ceph: include the initial ACL in create/mkdir/mknod MDS requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit b1ee94aa593abd03634bc3887b8e189840e42c12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b1ee94aa.failed
+
+Current code set new file/directory's initial ACL in a non-atomic
+manner.
+Client first sends request to MDS to create new file/directory, then set
+the initial ACL after the new file/directory is successfully created.
+
+The fix is include the initial ACL in create/mkdir/mknod MDS requests.
+So MDS can handle creating file/directory and setting the initial ACL in
+one request.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+	Reviewed-by: Sage Weil <sage@redhat.com>
+(cherry picked from commit b1ee94aa593abd03634bc3887b8e189840e42c12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/acl.c
+#	fs/ceph/dir.c
+#	fs/ceph/file.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/dir.c
+index 67bdd35eda74,26be84929439..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -727,8 -714,12 +736,16 @@@ static int ceph_mknod(struct inode *dir
+  	if (!err && !req->r_reply_info.head->is_dentry)
+  		err = ceph_handle_notrace_create(dir, dentry);
+  	ceph_mdsc_put_request(req);
+++<<<<<<< HEAD
+ +	if (err)
+++=======
++ out:
++ 	if (!err)
++ 		ceph_init_inode_acls(dentry->d_inode, &acls);
++ 	else
+++>>>>>>> b1ee94aa593a (ceph: include the initial ACL in create/mkdir/mknod MDS requests)
+  		d_drop(dentry);
++ 	ceph_release_acls_info(&acls);
+  	return err;
+  }
+  
+@@@ -752,18 -743,13 +769,18 @@@ static int ceph_symlink(struct inode *d
+  	dout("symlink in dir %p dentry %p to '%s'\n", dir, dentry, dest);
+  	req = ceph_mdsc_create_request(mdsc, CEPH_MDS_OP_SYMLINK, USE_AUTH_MDS);
+  	if (IS_ERR(req)) {
+- 		d_drop(dentry);
+- 		return PTR_ERR(req);
++ 		err = PTR_ERR(req);
++ 		goto out;
+  	}
+ -	req->r_dentry = dget(dentry);
+ -	req->r_num_caps = 2;
+  	req->r_path2 = kstrdup(dest, GFP_NOFS);
+ +	if (!req->r_path2) {
+ +		err = -ENOMEM;
+ +		ceph_mdsc_put_request(req);
+ +		goto out;
+ +	}
+  	req->r_locked_dir = dir;
+ +	req->r_dentry = dget(dentry);
+ +	req->r_num_caps = 2;
+  	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+  	req->r_dentry_unless = CEPH_CAP_FILE_EXCL;
+  	err = ceph_mdsc_do_request(mdsc, dir, req);
+@@@ -807,15 -800,20 +831,26 @@@ static int ceph_mkdir(struct inode *dir
+  	req->r_args.mkdir.mode = cpu_to_le32(mode);
+  	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+  	req->r_dentry_unless = CEPH_CAP_FILE_EXCL;
++ 	if (acls.pagelist) {
++ 		req->r_pagelist = acls.pagelist;
++ 		acls.pagelist = NULL;
++ 	}
+  	err = ceph_mdsc_do_request(mdsc, dir, req);
+ -	if (!err && !req->r_reply_info.head->is_dentry)
+ +	if (!err &&
+ +	    !req->r_reply_info.head->is_target &&
+ +	    !req->r_reply_info.head->is_dentry)
+  		err = ceph_handle_notrace_create(dir, dentry);
+  	ceph_mdsc_put_request(req);
+  out:
+++<<<<<<< HEAD
+ +	if (err < 0)
+++=======
++ 	if (!err)
++ 		ceph_init_inode_acls(dentry->d_inode, &acls);
++ 	else
+++>>>>>>> b1ee94aa593a (ceph: include the initial ACL in create/mkdir/mknod MDS requests)
+  		d_drop(dentry);
++ 	ceph_release_acls_info(&acls);
+  	return err;
+  }
+  
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,d7e0da8366e6..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -245,11 -275,11 +258,11 @@@ int ceph_atomic_open(struct inode *dir
+  	err = ceph_mdsc_do_request(mdsc,
+  				   (flags & (O_CREAT|O_TRUNC)) ? dir : NULL,
+  				   req);
+ +	err = ceph_handle_snapdir(req, dentry, err);
+  	if (err)
+- 		goto out_err;
++ 		goto out_req;
+  
+ -	err = ceph_handle_snapdir(req, dentry, err);
+ -	if (err == 0 && (flags & O_CREAT) && !req->r_reply_info.head->is_dentry)
+ +	if ((flags & O_CREAT) && !req->r_reply_info.head->is_dentry)
+  		err = ceph_handle_notrace_create(dir, dentry);
+  
+  	if (d_unhashed(dentry)) {
+@@@ -269,6 -299,7 +282,10 @@@
+  	} else {
+  		dout("atomic_open finish_open on dn %p\n", dn);
+  		if (req->r_op == CEPH_MDS_OP_CREATE && req->r_reply_info.has_create_ino) {
+++<<<<<<< HEAD
+++=======
++ 			ceph_init_inode_acls(dentry->d_inode, &acls);
+++>>>>>>> b1ee94aa593a (ceph: include the initial ACL in create/mkdir/mknod MDS requests)
+  			*opened |= FILE_CREATED;
+  		}
+  		err = finish_open(file, dentry, ceph_open, opened);
+diff --cc fs/ceph/super.h
+index 1c439e8e6c74,f62a09863ff1..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -770,7 -733,57 +770,60 @@@ extern void __ceph_build_xattrs_blob(st
+  extern void __ceph_destroy_xattrs(struct ceph_inode_info *ci);
+  extern void __init ceph_xattr_init(void);
+  extern void ceph_xattr_exit(void);
++ extern const struct xattr_handler *ceph_xattr_handlers[];
++ 
+++<<<<<<< HEAD
+++=======
++ /* acl.c */
++ struct ceph_acls_info {
++ 	void *default_acl;
++ 	void *acl;
++ 	struct ceph_pagelist *pagelist;
++ };
++ 
++ #ifdef CONFIG_CEPH_FS_POSIX_ACL
++ 
++ struct posix_acl *ceph_get_acl(struct inode *, int);
++ int ceph_set_acl(struct inode *inode, struct posix_acl *acl, int type);
++ int ceph_pre_init_acls(struct inode *dir, umode_t *mode,
++ 		       struct ceph_acls_info *info);
++ void ceph_init_inode_acls(struct inode *inode, struct ceph_acls_info *info);
++ void ceph_release_acls_info(struct ceph_acls_info *info);
++ 
++ static inline void ceph_forget_all_cached_acls(struct inode *inode)
++ {
++        forget_all_cached_acls(inode);
++ }
++ 
++ #else
++ 
++ #define ceph_get_acl NULL
++ #define ceph_set_acl NULL
++ 
++ static inline int ceph_pre_init_acls(struct inode *dir, umode_t *mode,
++ 				     struct ceph_acls_info *info)
++ {
++ 	return 0;
++ }
++ static inline void ceph_init_inode_acls(struct inode *inode,
++ 					struct ceph_acls_info *info)
++ {
++ }
++ static inline void ceph_release_acls_info(struct ceph_acls_info *info)
++ {
++ }
++ static inline int ceph_acl_chmod(struct dentry *dentry, struct inode *inode)
++ {
++ 	return 0;
++ }
++ 
++ static inline void ceph_forget_all_cached_acls(struct inode *inode)
++ {
++ }
++ 
++ #endif
+  
+++>>>>>>> b1ee94aa593a (ceph: include the initial ACL in create/mkdir/mknod MDS requests)
+  /* caps.c */
+  extern const char *ceph_cap_string(int c);
+  extern void ceph_handle_caps(struct ceph_mds_session *session,
+* Unmerged path fs/ceph/acl.c
+* Unmerged path fs/ceph/acl.c
+* Unmerged path fs/ceph/dir.c
+* Unmerged path fs/ceph/file.c
+* Unmerged path fs/ceph/super.h
