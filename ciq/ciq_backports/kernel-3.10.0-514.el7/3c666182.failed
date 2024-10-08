@@ -1,0 +1,400 @@
+mei: revamp client disconnection flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 3c66618295ca5fb0fde32e60e5f26557a5fcad5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3c666182.failed
+
+Split disconnected state into two parts first reception disconnect
+response from the firmware and second actually setting of disconnected
+state.  Book keeping data are needed for processing and after firmware
+disconnected the client and are cleaned when setting the disconnected
+state in mei_cl_set_disconneted() function.
+Add mei_cl_send_disconnect to reduce code duplication.
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3c66618295ca5fb0fde32e60e5f26557a5fcad5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/hbm.c
+#	drivers/misc/mei/interrupt.c
+#	drivers/misc/mei/main.c
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,e572ecd5a68d..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -262,10 -541,12 +262,11 @@@ void mei_cl_init(struct mei_cl *cl, str
+  	init_waitqueue_head(&cl->wait);
+  	init_waitqueue_head(&cl->rx_wait);
+  	init_waitqueue_head(&cl->tx_wait);
+ -	INIT_LIST_HEAD(&cl->rd_completed);
+ -	INIT_LIST_HEAD(&cl->rd_pending);
+  	INIT_LIST_HEAD(&cl->link);
+  	INIT_LIST_HEAD(&cl->device_link);
+ +	cl->reading_state = MEI_IDLE;
+  	cl->writing_state = MEI_IDLE;
++ 	cl->state = MEI_FILE_INITIALIZING;
+  	cl->dev = dev;
+  }
+  
+@@@ -469,60 -819,54 +552,64 @@@ int mei_cl_disconnect(struct mei_cl *cl
+  
+  	cl_dbg(dev, cl, "disconnecting");
+  
+- 	if (cl->state != MEI_FILE_DISCONNECTING)
++ 	if (!mei_cl_is_connected(cl))
+  		return 0;
+  
+ -	rets = pm_runtime_get(dev->dev);
+ +	rets = pm_runtime_get(&dev->pdev->dev);
+  	if (rets < 0 && rets != -EINPROGRESS) {
+ -		pm_runtime_put_noidle(dev->dev);
+ +		pm_runtime_put_noidle(&dev->pdev->dev);
+  		cl_err(dev, cl, "rpm: get failed %d\n", rets);
+  		return rets;
+  	}
+  
+++<<<<<<< HEAD
+ +	cb = mei_io_cb_init(cl, NULL);
+ +	if (!cb) {
+ +		rets = -ENOMEM;
+ +		goto free;
+ +	}
+ +
+ +	cb->fop_type = MEI_FOP_DISCONNECT;
+++=======
++ 	cl->state = MEI_FILE_DISCONNECTING;
++ 
++ 	cb = mei_io_cb_init(cl, MEI_FOP_DISCONNECT, NULL);
++ 	rets = cb ? 0 : -ENOMEM;
++ 	if (rets)
++ 		goto out;
++ 
++ 	cl_dbg(dev, cl, "add disconnect cb to control write list\n");
++ 	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+++>>>>>>> 3c66618295ca (mei: revamp client disconnection flow)
+  
+  	if (mei_hbuf_acquire(dev)) {
+- 		if (mei_hbm_cl_disconnect_req(dev, cl)) {
+- 			rets = -ENODEV;
++ 		rets = mei_cl_send_disconnect(cl, cb);
++ 		if (rets) {
+  			cl_err(dev, cl, "failed to disconnect.\n");
+- 			goto free;
++ 			goto out;
+  		}
+- 		cl->timer_count = MEI_CONNECT_TIMEOUT;
+- 		mdelay(10); /* Wait for hardware disconnection ready */
+- 		list_add_tail(&cb->list, &dev->ctrl_rd_list.list);
+- 	} else {
+- 		cl_dbg(dev, cl, "add disconnect cb to control write list\n");
+- 		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+- 
+  	}
+- 	mutex_unlock(&dev->device_lock);
+- 
+- 	wait_event_timeout(cl->wait,
+- 			MEI_FILE_DISCONNECTED == cl->state,
+- 			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+  
++ 	mutex_unlock(&dev->device_lock);
++ 	wait_event_timeout(cl->wait, cl->state == MEI_FILE_DISCONNECT_REPLY,
++ 			   mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+  	mutex_lock(&dev->device_lock);
+  
+- 	if (MEI_FILE_DISCONNECTED == cl->state) {
+- 		rets = 0;
+- 		cl_dbg(dev, cl, "successfully disconnected from FW client.\n");
+- 	} else {
++ 	rets = cl->status;
++ 	if (cl->state != MEI_FILE_DISCONNECT_REPLY) {
+  		cl_dbg(dev, cl, "timeout on disconnect from FW client.\n");
+  		rets = -ETIME;
+  	}
+  
+- 	mei_io_list_flush(&dev->ctrl_rd_list, cl);
+- 	mei_io_list_flush(&dev->ctrl_wr_list, cl);
+- free:
++ out:
++ 	/* we disconnect also on error */
++ 	mei_cl_set_disconnected(cl);
++ 	if (!rets)
++ 		cl_dbg(dev, cl, "successfully disconnected from FW client.\n");
++ 
+  	cl_dbg(dev, cl, "rpm: autosuspend\n");
+ -	pm_runtime_mark_last_busy(dev->dev);
+ -	pm_runtime_put_autosuspend(dev->dev);
+ +	pm_runtime_mark_last_busy(&dev->pdev->dev);
+ +	pm_runtime_put_autosuspend(&dev->pdev->dev);
+  
+  	mei_io_cb_free(cb);
+  	return rets;
+@@@ -614,8 -956,7 +701,12 @@@ int mei_cl_connect(struct mei_cl *cl, s
+  			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+  	mutex_lock(&dev->device_lock);
+  
+++<<<<<<< HEAD
+ +	if (cl->state != MEI_FILE_CONNECTED) {
+ +		cl->state = MEI_FILE_DISCONNECTED;
+++=======
++ 	if (!mei_cl_is_connected(cl)) {
+++>>>>>>> 3c66618295ca (mei: revamp client disconnection flow)
+  		/* something went really wrong */
+  		if (!cl->status)
+  			cl->status = -EFAULT;
+@@@ -1002,16 -1372,24 +1092,30 @@@ void mei_cl_complete(struct mei_cl *cl
+  		cl->writing_state = MEI_WRITE_COMPLETE;
+  		if (waitqueue_active(&cl->tx_wait))
+  			wake_up_interruptible(&cl->tx_wait);
++ 		break;
+  
+++<<<<<<< HEAD
+ +	} else if (cb->fop_type == MEI_FOP_READ &&
+ +			MEI_READING == cl->reading_state) {
+ +		cl->reading_state = MEI_READ_COMPLETE;
+++=======
++ 	case MEI_FOP_READ:
++ 		list_add_tail(&cb->list, &cl->rd_completed);
+++>>>>>>> 3c66618295ca (mei: revamp client disconnection flow)
+  		if (waitqueue_active(&cl->rx_wait))
+ -			wake_up_interruptible_all(&cl->rx_wait);
+ +			wake_up_interruptible(&cl->rx_wait);
+  		else
+  			mei_cl_bus_rx_event(cl);
++ 		break;
+  
++ 	case MEI_FOP_CONNECT:
++ 	case MEI_FOP_DISCONNECT:
++ 		if (waitqueue_active(&cl->wait))
++ 			wake_up(&cl->wait);
++ 
++ 		break;
++ 	default:
++ 		BUG_ON(0);
+  	}
+  }
+  
+@@@ -1019,9 -1397,8 +1123,8 @@@
+  /**
+   * mei_cl_all_disconnect - disconnect forcefully all connected clients
+   *
+ - * @dev: mei device
+ + * @dev - mei device
+   */
+- 
+  void mei_cl_all_disconnect(struct mei_device *dev)
+  {
+  	struct mei_cl *cl;
+diff --cc drivers/misc/mei/hbm.c
+index 3cb8e1000d69,410e0297527e..000000000000
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@@ -522,11 -569,10 +522,11 @@@ static void mei_hbm_cl_disconnect_res(s
+  	struct hbm_client_connect_response *rs =
+  		(struct hbm_client_connect_response *)cmd;
+  
+ -	cl_dbg(dev, cl, "hbm: disconnect response status=%d\n", rs->status);
+ +	dev_dbg(&cl->dev->pdev->dev, "hbm: disconnect response cl:host=%02d me=%02d status=%d\n",
+ +			rs->me_addr, rs->host_addr, rs->status);
+  
+  	if (rs->status == MEI_CL_DISCONN_SUCCESS)
+- 		cl->state = MEI_FILE_DISCONNECTED;
++ 		cl->state = MEI_FILE_DISCONNECT_REPLY;
+  	cl->status = 0;
+  }
+  
+@@@ -636,23 -678,17 +636,31 @@@ static int mei_hbm_fw_disconnect_req(st
+  	struct mei_cl *cl;
+  	struct mei_cl_cb *cb;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(cl, &dev->file_list, link) {
+ +		if (mei_hbm_cl_addr_equal(cl, disconnect_req)) {
+ +			dev_dbg(&dev->pdev->dev, "disconnect request host client %d ME client %d.\n",
+ +					disconnect_req->host_addr,
+ +					disconnect_req->me_addr);
+ +			cl->state = MEI_FILE_DISCONNECTED;
+ +			cl->timer_count = 0;
+++=======
++ 	cl = mei_hbm_cl_find_by_cmd(dev, disconnect_req);
++ 	if (cl) {
++ 		cl_dbg(dev, cl, "fw disconnect request received\n");
++ 		cl->state = MEI_FILE_DISCONNECTING;
++ 		cl->timer_count = 0;
+++>>>>>>> 3c66618295ca (mei: revamp client disconnection flow)
+  
+ -		cb = mei_io_cb_init(cl, MEI_FOP_DISCONNECT_RSP, NULL);
+ -		if (!cb)
+ -			return -ENOMEM;
+ -		cl_dbg(dev, cl, "add disconnect response as first\n");
+ -		list_add(&cb->list, &dev->ctrl_wr_list.list);
+ +			cb = mei_io_cb_init(cl, NULL);
+ +			if (!cb)
+ +				return -ENOMEM;
+ +			cb->fop_type = MEI_FOP_DISCONNECT_RSP;
+ +			cl_dbg(dev, cl, "add disconnect response as first\n");
+ +			list_add(&cb->list, &dev->ctrl_wr_list.list);
+ +
+ +			break;
+ +		}
+  	}
+  	return 0;
+  }
+diff --cc drivers/misc/mei/interrupt.c
+index b8d9cfee3e87,6fd7ca9b3119..000000000000
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@@ -182,59 -180,14 +182,66 @@@ static int mei_cl_irq_disconnect_rsp(st
+  		return -EMSGSIZE;
+  
+  	ret = mei_hbm_cl_disconnect_rsp(dev, cl);
+++<<<<<<< HEAD
+ +
+ +	cl->state = MEI_FILE_DISCONNECTED;
+ +	cl->status = 0;
+ +	list_del(&cb->list);
+++=======
++ 	mei_cl_set_disconnected(cl);
+++>>>>>>> 3c66618295ca (mei: revamp client disconnection flow)
+  	mei_io_cb_free(cb);
+  
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +
+ +/**
+ + * mei_cl_irq_disconnect - processes close related operation from
+ + *	interrupt thread context - send disconnect request
+ + *
+ + * @cl: client
+ + * @cb: callback block.
+ + * @cmpl_list: complete list.
+ + *
+ + * returns 0, OK; otherwise, error.
+ + */
+ +static int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
+ +			    struct mei_cl_cb *cmpl_list)
+ +{
+ +	struct mei_device *dev = cl->dev;
+ +	u32 msg_slots;
+ +	int slots;
+ +
+ +	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
+ +	slots = mei_hbuf_empty_slots(dev);
+ +
+ +	if (slots < msg_slots)
+ +		return -EMSGSIZE;
+ +
+ +	if (mei_hbm_cl_disconnect_req(dev, cl)) {
+ +		cl->status = 0;
+ +		cb->buf_idx = 0;
+ +		list_move_tail(&cb->list, &cmpl_list->list);
+ +		return -EIO;
+ +	}
+ +
+ +	cl->state = MEI_FILE_DISCONNECTING;
+ +	cl->status = 0;
+ +	cb->buf_idx = 0;
+ +	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
+ +	cl->timer_count = MEI_CONNECT_TIMEOUT;
+ +
+ +	return 0;
+ +}
+ +
+ +
+++=======
+++>>>>>>> 3c66618295ca (mei: revamp client disconnection flow)
+  /**
+ - * mei_cl_irq_read - processes client read related operation from the
+ + * mei_cl_irq_close - processes client read related operation from the
+   *	interrupt thread context - request for flow control credits
+   *
+   * @cl: client
+diff --cc drivers/misc/mei/main.c
+index b23f9eba9e3a,3d205d10d21c..000000000000
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@@ -109,9 -93,8 +109,9 @@@ err_unlock
+  static int mei_release(struct inode *inode, struct file *file)
+  {
+  	struct mei_cl *cl = file->private_data;
+ +	struct mei_cl_cb *cb;
+  	struct mei_device *dev;
+- 	int rets = 0;
++ 	int rets;
+  
+  	if (WARN_ON(!cl || !cl->dev))
+  		return -ENODEV;
+@@@ -123,12 -106,9 +123,18 @@@
+  		rets = mei_amthif_release(dev, file);
+  		goto out;
+  	}
+++<<<<<<< HEAD
+ +	if (cl->state == MEI_FILE_CONNECTED) {
+ +		cl->state = MEI_FILE_DISCONNECTING;
+ +		cl_dbg(dev, cl, "disconnecting\n");
+ +		rets = mei_cl_disconnect(cl);
+ +	}
+ +	mei_cl_flush_queues(cl);
+++=======
++ 	rets = mei_cl_disconnect(cl);
++ 
++ 	mei_cl_flush_queues(cl, file);
+++>>>>>>> 3c66618295ca (mei: revamp client disconnection flow)
+  	cl_dbg(dev, cl, "removing\n");
+  
+  	mei_cl_unlink(cl);
+diff --git a/drivers/misc/mei/bus.c b/drivers/misc/mei/bus.c
+index ca8736c3675b..802834537750 100644
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@ -467,8 +467,6 @@ int mei_cl_disable_device(struct mei_cl_device *device)
+ 		return 0;
+ 	}
+ 
+-	cl->state = MEI_FILE_DISCONNECTING;
+-
+ 	err = mei_cl_disconnect(cl);
+ 	if (err < 0) {
+ 		mutex_unlock(&dev->device_lock);
+* Unmerged path drivers/misc/mei/client.c
+diff --git a/drivers/misc/mei/client.h b/drivers/misc/mei/client.h
+index f2a130967f1e..284c16b45b98 100644
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@ -81,6 +81,9 @@ static inline bool mei_cl_is_transitioning(struct mei_cl *cl)
+ 
+ bool mei_cl_is_other_connecting(struct mei_cl *cl);
+ int mei_cl_disconnect(struct mei_cl *cl);
++void mei_cl_set_disconnected(struct mei_cl *cl);
++int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
++			  struct mei_cl_cb *cmpl_list);
+ int mei_cl_connect(struct mei_cl *cl, struct file *file);
+ int mei_cl_read_start(struct mei_cl *cl, size_t length);
+ int mei_cl_write(struct mei_cl *cl, struct mei_cl_cb *cb, bool blocking);
+* Unmerged path drivers/misc/mei/hbm.c
+* Unmerged path drivers/misc/mei/interrupt.c
+* Unmerged path drivers/misc/mei/main.c
+diff --git a/drivers/misc/mei/mei_dev.h b/drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa..6e4688388fa3 100644
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -93,7 +93,8 @@ enum file_state {
+ 	MEI_FILE_CONNECTING,
+ 	MEI_FILE_CONNECTED,
+ 	MEI_FILE_DISCONNECTING,
+-	MEI_FILE_DISCONNECTED
++	MEI_FILE_DISCONNECT_REPLY,
++	MEI_FILE_DISCONNECTED,
+ };
+ 
+ /* MEI device states */
