@@ -1,0 +1,323 @@
+perf tools: tool->finished_round() doesn't need perf_session
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] tools: tool->finished_round() doesn't need perf_session (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 95.65%
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit d704ebdae4aaeec89180dcfd0ca74e5bba318853
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d704ebda.failed
+
+It is all about flushing the ordered queue or piping it thru, no need
+for a perf_session pointer.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Don Zickus <dzickus@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/n/tip-g47fx3ys0t9271cp0dcabjc7@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit d704ebdae4aaeec89180dcfd0ca74e5bba318853)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/session.c
+diff --cc tools/perf/util/session.c
+index 647c690afe48,703a370ae5b6..000000000000
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@@ -619,111 -531,106 +626,115 @@@ static int ordered_events__flush(struc
+   *      Flush every events below timestamp 7
+   *      etc...
+   */
+ -static int process_finished_round(struct perf_tool *tool __maybe_unused,
+ +static int process_finished_round(struct perf_tool *tool,
+  				  union perf_event *event __maybe_unused,
+- 				  struct perf_session *session)
++ 				  struct ordered_events *oe)
+  {
+++<<<<<<< HEAD
+ +	return ordered_events__flush(session, tool, OE_FLUSH__ROUND);
+++=======
++ 	return ordered_events__flush(oe, OE_FLUSH__ROUND);
+++>>>>>>> d704ebdae4aa (perf tools: tool->finished_round() doesn't need perf_session)
+  }
+  
+ -int perf_session__queue_event(struct perf_session *s, union perf_event *event,
+ -			      struct perf_sample *sample, u64 file_offset)
+ +/* The queue is ordered by time */
+ +static void __queue_event(struct ordered_event *new, struct perf_session *s)
+  {
+  	struct ordered_events *oe = &s->ordered_events;
+ +	struct ordered_event *last = oe->last;
+ +	u64 timestamp = new->timestamp;
+ +	struct list_head *p;
+  
+ -	u64 timestamp = sample->time;
+ -	struct ordered_event *new;
+ +	++oe->nr_events;
+ +	oe->last = new;
+  
+ -	if (!timestamp || timestamp == ~0ULL)
+ -		return -ETIME;
+ -
+ -	if (timestamp < oe->last_flush) {
+ -		pr_oe_time(timestamp,      "out of order event\n");
+ -		pr_oe_time(oe->last_flush, "last flush, last_flush_type %d\n",
+ -			   oe->last_flush_type);
+ -
+ -		s->evlist->stats.nr_unordered_events++;
+ +	if (!last) {
+ +		list_add(&new->list, &oe->events);
+ +		oe->max_timestamp = timestamp;
+ +		return;
+  	}
+  
+ -	new = ordered_events__new(oe, timestamp, event);
+ -	if (!new) {
+ -		ordered_events__flush(oe, OE_FLUSH__HALF);
+ -		new = ordered_events__new(oe, timestamp, event);
+ +	/*
+ +	 * last event might point to some random place in the list as it's
+ +	 * the last queued event. We expect that the new event is close to
+ +	 * this.
+ +	 */
+ +	if (last->timestamp <= timestamp) {
+ +		while (last->timestamp <= timestamp) {
+ +			p = last->list.next;
+ +			if (p == &oe->events) {
+ +				list_add_tail(&new->list, &oe->events);
+ +				oe->max_timestamp = timestamp;
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add_tail(&new->list, &last->list);
+ +	} else {
+ +		while (last->timestamp > timestamp) {
+ +			p = last->list.prev;
+ +			if (p == &oe->events) {
+ +				list_add(&new->list, &oe->events);
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add(&new->list, &last->list);
+  	}
+ -
+ -	if (!new)
+ -		return -ENOMEM;
+ -
+ -	new->file_offset = file_offset;
+ -	return 0;
+  }
+  
+ -static void callchain__lbr_callstack_printf(struct perf_sample *sample)
+ +#define MAX_SAMPLE_BUFFER	(64 * 1024 / sizeof(struct ordered_event))
+ +
+ +int perf_session_queue_event(struct perf_session *s, union perf_event *event,
+ +				    struct perf_sample *sample, u64 file_offset)
+  {
+ -	struct ip_callchain *callchain = sample->callchain;
+ -	struct branch_stack *lbr_stack = sample->branch_stack;
+ -	u64 kernel_callchain_nr = callchain->nr;
+ -	unsigned int i;
+ +	struct ordered_events *oe = &s->ordered_events;
+ +	struct list_head *cache = &oe->cache;
+ +	u64 timestamp = sample->time;
+ +	struct ordered_event *new;
+  
+ -	for (i = 0; i < kernel_callchain_nr; i++) {
+ -		if (callchain->ips[i] == PERF_CONTEXT_USER)
+ -			break;
+ +	if (!timestamp || timestamp == ~0ULL)
+ +		return -ETIME;
+ +
+ +	if (timestamp < s->ordered_events.last_flush) {
+ +		printf("Warning: Timestamp below last timeslice flush\n");
+ +		return -EINVAL;
+  	}
+  
+ -	if ((i != kernel_callchain_nr) && lbr_stack->nr) {
+ -		u64 total_nr;
+ -		/*
+ -		 * LBR callstack can only get user call chain,
+ -		 * i is kernel call chain number,
+ -		 * 1 is PERF_CONTEXT_USER.
+ -		 *
+ -		 * The user call chain is stored in LBR registers.
+ -		 * LBR are pair registers. The caller is stored
+ -		 * in "from" register, while the callee is stored
+ -		 * in "to" register.
+ -		 * For example, there is a call stack
+ -		 * "A"->"B"->"C"->"D".
+ -		 * The LBR registers will recorde like
+ -		 * "C"->"D", "B"->"C", "A"->"B".
+ -		 * So only the first "to" register and all "from"
+ -		 * registers are needed to construct the whole stack.
+ -		 */
+ -		total_nr = i + 1 + lbr_stack->nr + 1;
+ -		kernel_callchain_nr = i + 1;
+ +	if (!list_empty(cache)) {
+ +		new = list_entry(cache->next, struct ordered_event, list);
+ +		list_del(&new->list);
+ +	} else if (oe->buffer) {
+ +		new = oe->buffer + oe->buffer_idx;
+ +		if (++oe->buffer_idx == MAX_SAMPLE_BUFFER)
+ +			oe->buffer = NULL;
+ +	} else {
+ +		oe->buffer = malloc(MAX_SAMPLE_BUFFER * sizeof(*new));
+ +		if (!oe->buffer)
+ +			return -ENOMEM;
+ +		list_add(&oe->buffer->list, &oe->to_free);
+ +		oe->buffer_idx = 2;
+ +		new = oe->buffer + 1;
+ +	}
+  
+ -		printf("... LBR call chain: nr:%" PRIu64 "\n", total_nr);
+ +	new->timestamp = timestamp;
+ +	new->file_offset = file_offset;
+ +	new->event = event;
+  
+ -		for (i = 0; i < kernel_callchain_nr; i++)
+ -			printf("..... %2d: %016" PRIx64 "\n",
+ -			       i, callchain->ips[i]);
+ +	__queue_event(new, s);
+  
+ -		printf("..... %2d: %016" PRIx64 "\n",
+ -		       (int)(kernel_callchain_nr), lbr_stack->entries[0].to);
+ -		for (i = 0; i < lbr_stack->nr; i++)
+ -			printf("..... %2d: %016" PRIx64 "\n",
+ -			       (int)(i + kernel_callchain_nr + 1), lbr_stack->entries[i].from);
+ -	}
+ +	return 0;
+  }
+  
+ -static void callchain__printf(struct perf_evsel *evsel,
+ -			      struct perf_sample *sample)
+ +static void callchain__printf(struct perf_sample *sample)
+  {
+  	unsigned int i;
+ -	struct ip_callchain *callchain = sample->callchain;
+ -
+ -	if (has_branch_callstack(evsel))
+ -		callchain__lbr_callstack_printf(sample);
+  
+ -	printf("... FP chain: nr:%" PRIu64 "\n", callchain->nr);
+ +	printf("... chain: nr:%" PRIu64 "\n", sample->callchain->nr);
+  
+ -	for (i = 0; i < callchain->nr; i++)
+ +	for (i = 0; i < sample->callchain->nr; i++)
+  		printf("..... %2d: %016" PRIx64 "\n",
+ -		       i, callchain->ips[i]);
+ +		       i, sample->callchain->ips[i]);
+  }
+  
+  static void branch_stack__printf(struct perf_sample *sample)
+@@@ -1059,9 -964,10 +1070,14 @@@ static int perf_session_deliver_event(s
+  
+  static s64 perf_session__process_user_event(struct perf_session *session,
+  					    union perf_event *event,
+ +					    struct perf_tool *tool,
+  					    u64 file_offset)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct ordered_events *oe = &session->ordered_events;
++ 	struct perf_tool *tool = oe->tool;
+++>>>>>>> d704ebdae4aa (perf tools: tool->finished_round() doesn't need perf_session)
+  	int fd = perf_data_file__fd(session->file);
+  	int err;
+  
+diff --git a/tools/perf/builtin-inject.c b/tools/perf/builtin-inject.c
+index a13641e066f5..5c2c615235fa 100644
+--- a/tools/perf/builtin-inject.c
++++ b/tools/perf/builtin-inject.c
+@@ -53,6 +53,13 @@ static int perf_event__repipe_synth(struct perf_tool *tool,
+ 	return 0;
+ }
+ 
++static int perf_event__repipe_oe_synth(struct perf_tool *tool,
++				       union perf_event *event,
++				       struct ordered_events *oe __maybe_unused)
++{
++	return perf_event__repipe_synth(tool, event);
++}
++
+ static int perf_event__repipe_op2_synth(struct perf_tool *tool,
+ 					union perf_event *event,
+ 					struct perf_session *session
+@@ -408,7 +415,7 @@ int cmd_inject(int argc, const char **argv, const char *prefix __maybe_unused)
+ 			.unthrottle	= perf_event__repipe,
+ 			.attr		= perf_event__repipe_attr,
+ 			.tracing_data	= perf_event__repipe_op2_synth,
+-			.finished_round	= perf_event__repipe_op2_synth,
++			.finished_round	= perf_event__repipe_oe_synth,
+ 			.build_id	= perf_event__repipe_op2_synth,
+ 			.id_index	= perf_event__repipe_op2_synth,
+ 		},
+diff --git a/tools/perf/builtin-kvm.c b/tools/perf/builtin-kvm.c
+index eb4f3837f938..a76093cd1381 100644
+--- a/tools/perf/builtin-kvm.c
++++ b/tools/perf/builtin-kvm.c
+@@ -18,6 +18,7 @@
+ #include "util/stat.h"
+ #include "util/top.h"
+ #include "util/data.h"
++#include "util/ordered-events.h"
+ 
+ #include <sys/prctl.h>
+ #ifdef HAVE_TIMERFD_SUPPORT
+@@ -742,8 +743,10 @@ static int perf_kvm__mmap_read(struct perf_kvm_stat *kvm)
+ 
+ 	/* flush queue after each round in which we processed events */
+ 	if (ntotal) {
+-		kvm->session->ordered_events.next_flush = flush_time;
+-		err = kvm->tool.finished_round(&kvm->tool, NULL, kvm->session);
++		struct ordered_events *oe = &kvm->session->ordered_events;
++
++		oe->next_flush = flush_time;
++		err = ordered_events__flush(oe, OE_FLUSH__ROUND);
+ 		if (err) {
+ 			if (kvm->lost_events)
+ 				pr_info("\nLost events: %" PRIu64 "\n\n",
+* Unmerged path tools/perf/util/session.c
+diff --git a/tools/perf/util/tool.h b/tools/perf/util/tool.h
+index bb2708bbfaca..51d9e56c0f84 100644
+--- a/tools/perf/util/tool.h
++++ b/tools/perf/util/tool.h
+@@ -10,6 +10,7 @@ struct perf_evsel;
+ struct perf_sample;
+ struct perf_tool;
+ struct machine;
++struct ordered_events;
+ 
+ typedef int (*event_sample)(struct perf_tool *tool, union perf_event *event,
+ 			    struct perf_sample *sample,
+@@ -25,6 +26,9 @@ typedef int (*event_attr_op)(struct perf_tool *tool,
+ typedef int (*event_op2)(struct perf_tool *tool, union perf_event *event,
+ 			 struct perf_session *session);
+ 
++typedef int (*event_oe)(struct perf_tool *tool, union perf_event *event,
++			struct ordered_events *oe);
++
+ struct perf_tool {
+ 	event_sample	sample,
+ 			read;
+@@ -38,8 +42,8 @@ struct perf_tool {
+ 			unthrottle;
+ 	event_attr_op	attr;
+ 	event_op2	tracing_data;
+-	event_op2	finished_round,
+-			build_id,
++	event_oe	finished_round;
++	event_op2	build_id,
+ 			id_index;
+ 	bool		ordered_events;
+ 	bool		ordering_requires_timestamps;
