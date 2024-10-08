@@ -1,0 +1,111 @@
+nvme: do not restart the request timeout if we're resetting the controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit e1569a16180aef4311ff5fc54f54b23ae9e8a03e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e1569a16.failed
+
+Otherwise we're never going to complete a command when it is restarted just
+after we completed all other outstanding commands in nvme_clear_queue.
+
+The controller must be disabled prior to completing a presumed lost
+command, do this by directly shutting down the controller before
+queueing the reset work, and return EH_HANDLED from the timeout handler
+after we shut the controller down.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+[hch: split and rebase]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit e1569a16180aef4311ff5fc54f54b23ae9e8a03e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,6082f2775581..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -79,11 -73,15 +79,18 @@@ static struct task_struct *nvme_thread
+  static struct workqueue_struct *nvme_workq;
+  static wait_queue_head_t nvme_kthread_wait;
+  
+ -struct nvme_dev;
+ -struct nvme_queue;
+ -struct nvme_iod;
+ +static struct class *nvme_class;
+  
+ +static void nvme_reset_failed_dev(struct work_struct *ws);
+  static int nvme_reset(struct nvme_dev *dev);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static int nvme_process_cq(struct nvme_queue *nvmeq);
+++=======
++ static void nvme_process_cq(struct nvme_queue *nvmeq);
++ static void nvme_unmap_data(struct nvme_dev *dev, struct nvme_iod *iod);
++ static void nvme_dead_ctrl(struct nvme_dev *dev);
++ static void nvme_dev_shutdown(struct nvme_dev *dev);
+++>>>>>>> e1569a16180a (nvme: do not restart the request timeout if we're resetting the controller):drivers/nvme/host/pci.c
+  
+  struct async_cmd_info {
+  	struct kthread_work work;
+@@@ -1096,30 -1087,33 +1103,51 @@@ static void nvme_abort_req(struct reque
+  	struct nvme_cmd_info *abort_cmd;
+  	struct nvme_command cmd;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	if (!nvmeq->qid || cmd_rq->aborted) {
+ +		unsigned long flags;
+ +
+ +		spin_lock_irqsave(&dev_list_lock, flags);
+ +		if (work_busy(&dev->reset_work))
+ +			goto out;
+ +		list_del_init(&dev->node);
+ +		dev_warn(&dev->pci_dev->dev,
+ +			"I/O %d QID %d timeout, reset controller\n",
+ +							req->tag, nvmeq->qid);
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +		queue_work(nvme_workq, &dev->reset_work);
+ + out:
+ +		spin_unlock_irqrestore(&dev_list_lock, flags);
+ +		return;
+++=======
++ 	/*
++ 	 * Shutdown the controller immediately and schedule a reset if the
++ 	 * command was already aborted once before and still hasn't been
++ 	 * returned to the driver, or if this is the admin queue.
++ 	 */
++ 	if (!nvmeq->qid || cmd_rq->aborted) {
++ 		dev_warn(dev->dev,
++ 			 "I/O %d QID %d timeout, reset controller\n",
++ 			 req->tag, nvmeq->qid);
++ 		nvme_dev_shutdown(dev);
++ 		queue_work(nvme_workq, &dev->reset_work);
++ 
++ 		/*
++ 		 * Mark the request as handled, since the inline shutdown
++ 		 * forces all outstanding requests to complete.
++ 		 */
++ 		req->errors = NVME_SC_CANCELLED;
++ 		return BLK_EH_HANDLED;
+++>>>>>>> e1569a16180a (nvme: do not restart the request timeout if we're resetting the controller):drivers/nvme/host/pci.c
+  	}
+  
+ -	if (!dev->ctrl.abort_limit)
+ -		return BLK_EH_RESET_TIMER;
+ +	if (!dev->abort_limit)
+ +		return;
+  
+ -	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE,
+ -			BLK_MQ_REQ_NOWAIT);
+ +	abort_req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC,
+ +									false);
+  	if (IS_ERR(abort_req))
+ -		return BLK_EH_RESET_TIMER;
+ +		return;
+  
+  	abort_cmd = blk_mq_rq_to_pdu(abort_req);
+  	nvme_set_info(abort_cmd, abort_req, abort_completion);
+* Unmerged path drivers/block/nvme-core.c
