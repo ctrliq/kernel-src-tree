@@ -510,8 +510,7 @@ STATIC int
 xfs_inode_ag_walk(
 	struct xfs_mount	*mp,
 	struct xfs_perag	*pag,
-	int			(*execute)(struct xfs_inode *ip,
-					   struct xfs_perag *pag, int flags,
+	int			(*execute)(struct xfs_inode *ip, int flags,
 					   void *args),
 	int			flags,
 	void			*args,
@@ -585,7 +584,7 @@ restart:
 		for (i = 0; i < nr_found; i++) {
 			if (!batch[i])
 				continue;
-			error = execute(batch[i], pag, flags, args);
+			error = execute(batch[i], flags, args);
 			IRELE(batch[i]);
 			if (error == EAGAIN) {
 				skipped++;
@@ -639,8 +638,7 @@ xfs_eofblocks_worker(
 int
 xfs_inode_ag_iterator(
 	struct xfs_mount	*mp,
-	int			(*execute)(struct xfs_inode *ip,
-					   struct xfs_perag *pag, int flags,
+	int			(*execute)(struct xfs_inode *ip, int flags,
 					   void *args),
 	int			flags,
 	void			*args)
@@ -667,8 +665,7 @@ xfs_inode_ag_iterator(
 int
 xfs_inode_ag_iterator_tag(
 	struct xfs_mount	*mp,
-	int			(*execute)(struct xfs_inode *ip,
-					   struct xfs_perag *pag, int flags,
+	int			(*execute)(struct xfs_inode *ip, int flags,
 					   void *args),
 	int			flags,
 	void			*args,
@@ -1236,7 +1233,6 @@ xfs_inode_match_id_union(
 STATIC int
 xfs_inode_free_eofblocks(
 	struct xfs_inode	*ip,
-	struct xfs_perag	*pag,
 	int			flags,
 	void			*args)
 {
