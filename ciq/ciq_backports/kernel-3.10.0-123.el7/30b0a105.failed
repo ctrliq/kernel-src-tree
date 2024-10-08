@@ -1,0 +1,204 @@
+mm: thp: give transparent hugepage code a separate copy_page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] thp: give transparent hugepage code a separate copy_page (Rik van Riel) [1044367]
+Rebuild_FUZZ: 96.55%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 30b0a105d9f7141e4cbf72ae5511832457d89788
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/30b0a105.failed
+
+Right now, the migration code in migrate_page_copy() uses copy_huge_page()
+for hugetlbfs and thp pages:
+
+       if (PageHuge(page) || PageTransHuge(page))
+                copy_huge_page(newpage, page);
+
+So, yay for code reuse.  But:
+
+  void copy_huge_page(struct page *dst, struct page *src)
+  {
+        struct hstate *h = page_hstate(src);
+
+and a non-hugetlbfs page has no page_hstate().  This works 99% of the
+time because page_hstate() determines the hstate from the page order
+alone.  Since the page order of a THP page matches the default hugetlbfs
+page order, it works.
+
+But, if you change the default huge page size on the boot command-line
+(say default_hugepagesz=1G), then we might not even *have* a 2MB hstate
+so page_hstate() returns null and copy_huge_page() oopses pretty fast
+since copy_huge_page() dereferences the hstate:
+
+  void copy_huge_page(struct page *dst, struct page *src)
+  {
+        struct hstate *h = page_hstate(src);
+        if (unlikely(pages_per_huge_page(h) > MAX_ORDER_NR_PAGES)) {
+  ...
+
+Mel noticed that the migration code is really the only user of these
+functions.  This moves all the copy code over to migrate.c and makes
+copy_huge_page() work for THP by checking for it explicitly.
+
+I believe the bug was introduced in commit b32967ff101a ("mm: numa: Add
+THP migration for the NUMA working set scanning fault case")
+
+[akpm@linux-foundation.org: fix coding-style and comment text, per Naoya Horiguchi]
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Hillf Danton <dhillf@gmail.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Tested-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 30b0a105d9f7141e4cbf72ae5511832457d89788)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+diff --cc include/linux/hugetlb.h
+index 6b4890fa57e7,85e0c58bdfdf..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -67,7 -66,13 +67,13 @@@ int hugetlb_reserve_pages(struct inode 
+  						vm_flags_t vm_flags);
+  void hugetlb_unreserve_pages(struct inode *inode, long offset, long freed);
+  int dequeue_hwpoisoned_huge_page(struct page *page);
+++<<<<<<< HEAD
+ +void copy_huge_page(struct page *dst, struct page *src);
+++=======
++ bool isolate_huge_page(struct page *page, struct list_head *list);
++ void putback_active_hugepage(struct page *page);
++ bool is_hugepage_active(struct page *page);
+ -
+ -#ifdef CONFIG_ARCH_WANT_HUGE_PMD_SHARE
+ -pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud);
+ -#endif
+++>>>>>>> 30b0a105d9f7 (mm: thp: give transparent hugepage code a separate copy_page)
+  
+  extern unsigned long hugepages_treat_as_movable;
+  extern const unsigned long hugetlb_zero, hugetlb_infinity;
+@@@ -132,9 -136,9 +138,15 @@@ static inline int dequeue_hwpoisoned_hu
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void copy_huge_page(struct page *dst, struct page *src)
+ +{
+ +}
+++=======
++ #define isolate_huge_page(p, l) false
++ #define putback_active_hugepage(p)	do {} while (0)
++ #define is_hugepage_active(x)	false
+++>>>>>>> 30b0a105d9f7 (mm: thp: give transparent hugepage code a separate copy_page)
+  
+  static inline unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
+  		unsigned long address, unsigned long end, pgprot_t newprot)
+* Unmerged path include/linux/hugetlb.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index a2d4f4651dc3..6bb2444d9a99 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -471,40 +471,6 @@ static int vma_has_reserves(struct vm_area_struct *vma)
+ 	return 0;
+ }
+ 
+-static void copy_gigantic_page(struct page *dst, struct page *src)
+-{
+-	int i;
+-	struct hstate *h = page_hstate(src);
+-	struct page *dst_base = dst;
+-	struct page *src_base = src;
+-
+-	for (i = 0; i < pages_per_huge_page(h); ) {
+-		cond_resched();
+-		copy_highpage(dst, src);
+-
+-		i++;
+-		dst = mem_map_next(dst, dst_base, i);
+-		src = mem_map_next(src, src_base, i);
+-	}
+-}
+-
+-void copy_huge_page(struct page *dst, struct page *src)
+-{
+-	int i;
+-	struct hstate *h = page_hstate(src);
+-
+-	if (unlikely(pages_per_huge_page(h) > MAX_ORDER_NR_PAGES)) {
+-		copy_gigantic_page(dst, src);
+-		return;
+-	}
+-
+-	might_sleep();
+-	for (i = 0; i < pages_per_huge_page(h); i++) {
+-		cond_resched();
+-		copy_highpage(dst + i, src + i);
+-	}
+-}
+-
+ static void enqueue_huge_page(struct hstate *h, struct page *page)
+ {
+ 	int nid = page_to_nid(page);
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 95e799012226..253c49951862 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -434,6 +434,54 @@ int migrate_huge_page_move_mapping(struct address_space *mapping,
+ 	return MIGRATEPAGE_SUCCESS;
+ }
+ 
++/*
++ * Gigantic pages are so large that we do not guarantee that page++ pointer
++ * arithmetic will work across the entire page.  We need something more
++ * specialized.
++ */
++static void __copy_gigantic_page(struct page *dst, struct page *src,
++				int nr_pages)
++{
++	int i;
++	struct page *dst_base = dst;
++	struct page *src_base = src;
++
++	for (i = 0; i < nr_pages; ) {
++		cond_resched();
++		copy_highpage(dst, src);
++
++		i++;
++		dst = mem_map_next(dst, dst_base, i);
++		src = mem_map_next(src, src_base, i);
++	}
++}
++
++static void copy_huge_page(struct page *dst, struct page *src)
++{
++	int i;
++	int nr_pages;
++
++	if (PageHuge(src)) {
++		/* hugetlbfs page */
++		struct hstate *h = page_hstate(src);
++		nr_pages = pages_per_huge_page(h);
++
++		if (unlikely(nr_pages > MAX_ORDER_NR_PAGES)) {
++			__copy_gigantic_page(dst, src, nr_pages);
++			return;
++		}
++	} else {
++		/* thp page */
++		BUG_ON(!PageTransHuge(src));
++		nr_pages = hpage_nr_pages(src);
++	}
++
++	for (i = 0; i < nr_pages; i++) {
++		cond_resched();
++		copy_highpage(dst + i, src + i);
++	}
++}
++
+ /*
+  * Copy the page to its new location
+  */
