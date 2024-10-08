@@ -1,0 +1,159 @@
+vmstat: do not use deferrable delayed work for vmstat_update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Michal Hocko <mhocko@suse.cz>
+commit ba4877b9ca51f80b5d30f304a46762f0509e1635
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ba4877b9.failed
+
+Vinayak Menon has reported that an excessive number of tasks was throttled
+in the direct reclaim inside too_many_isolated() because NR_ISOLATED_FILE
+was relatively high compared to NR_INACTIVE_FILE.  However it turned out
+that the real number of NR_ISOLATED_FILE was 0 and the per-cpu
+vm_stat_diff wasn't transferred into the global counter.
+
+vmstat_work which is responsible for the sync is defined as deferrable
+delayed work which means that the defined timeout doesn't wake up an idle
+CPU.  A CPU might stay in an idle state for a long time and general effort
+is to keep such a CPU in this state as long as possible which might lead
+to all sorts of troubles for vmstat consumers as can be seen with the
+excessive direct reclaim throttling.
+
+This patch basically reverts 39bf6270f524 ("VM statistics: Make timer
+deferrable") but it shouldn't cause any problems for idle CPUs because
+only CPUs with an active per-cpu drift are woken up since 7cc36bbddde5
+("vmstat: on-demand vmstat workers v8") and CPUs which are idle for a
+longer time shouldn't have per-cpu drift.
+
+Fixes: 39bf6270f524 (VM statistics: Make timer deferrable)
+	Signed-off-by: Michal Hocko <mhocko@suse.cz>
+	Reported-by: Vinayak Menon <vinmenon@codeaurora.org>
+	Acked-by: Christoph Lameter <cl@linux.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ba4877b9ca51f80b5d30f304a46762f0509e1635)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmstat.c
+diff --cc mm/vmstat.c
+index 63f525670e51,470cdd5b924b..000000000000
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@@ -1185,8 -1362,104 +1185,108 @@@ int sysctl_stat_interval __read_mostly 
+  
+  static void vmstat_update(struct work_struct *w)
+  {
+++<<<<<<< HEAD
+ +	refresh_cpu_vm_stats(smp_processor_id());
+ +	schedule_delayed_work(&__get_cpu_var(vmstat_work),
+++=======
++ 	if (refresh_cpu_vm_stats())
++ 		/*
++ 		 * Counters were updated so we expect more updates
++ 		 * to occur in the future. Keep on running the
++ 		 * update worker thread.
++ 		 */
++ 		schedule_delayed_work(this_cpu_ptr(&vmstat_work),
++ 			round_jiffies_relative(sysctl_stat_interval));
++ 	else {
++ 		/*
++ 		 * We did not update any counters so the app may be in
++ 		 * a mode where it does not cause counter updates.
++ 		 * We may be uselessly running vmstat_update.
++ 		 * Defer the checking for differentials to the
++ 		 * shepherd thread on a different processor.
++ 		 */
++ 		int r;
++ 		/*
++ 		 * Shepherd work thread does not race since it never
++ 		 * changes the bit if its zero but the cpu
++ 		 * online / off line code may race if
++ 		 * worker threads are still allowed during
++ 		 * shutdown / startup.
++ 		 */
++ 		r = cpumask_test_and_set_cpu(smp_processor_id(),
++ 			cpu_stat_off);
++ 		VM_BUG_ON(r);
++ 	}
++ }
++ 
++ /*
++  * Check if the diffs for a certain cpu indicate that
++  * an update is needed.
++  */
++ static bool need_update(int cpu)
++ {
++ 	struct zone *zone;
++ 
++ 	for_each_populated_zone(zone) {
++ 		struct per_cpu_pageset *p = per_cpu_ptr(zone->pageset, cpu);
++ 
++ 		BUILD_BUG_ON(sizeof(p->vm_stat_diff[0]) != 1);
++ 		/*
++ 		 * The fast way of checking if there are any vmstat diffs.
++ 		 * This works because the diffs are byte sized items.
++ 		 */
++ 		if (memchr_inv(p->vm_stat_diff, 0, NR_VM_ZONE_STAT_ITEMS))
++ 			return true;
++ 
++ 	}
++ 	return false;
++ }
++ 
++ 
++ /*
++  * Shepherd worker thread that checks the
++  * differentials of processors that have their worker
++  * threads for vm statistics updates disabled because of
++  * inactivity.
++  */
++ static void vmstat_shepherd(struct work_struct *w);
++ 
++ static DECLARE_DELAYED_WORK(shepherd, vmstat_shepherd);
++ 
++ static void vmstat_shepherd(struct work_struct *w)
++ {
++ 	int cpu;
++ 
++ 	get_online_cpus();
++ 	/* Check processors whose vmstat worker threads have been disabled */
++ 	for_each_cpu(cpu, cpu_stat_off)
++ 		if (need_update(cpu) &&
++ 			cpumask_test_and_clear_cpu(cpu, cpu_stat_off))
++ 
++ 			schedule_delayed_work_on(cpu, &per_cpu(vmstat_work, cpu),
++ 				__round_jiffies_relative(sysctl_stat_interval, cpu));
++ 
++ 	put_online_cpus();
++ 
++ 	schedule_delayed_work(&shepherd,
++ 		round_jiffies_relative(sysctl_stat_interval));
++ 
++ }
++ 
++ static void __init start_shepherd_timer(void)
++ {
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu)
++ 		INIT_DELAYED_WORK(per_cpu_ptr(&vmstat_work, cpu),
++ 			vmstat_update);
++ 
++ 	if (!alloc_cpumask_var(&cpu_stat_off, GFP_KERNEL))
++ 		BUG();
++ 	cpumask_copy(cpu_stat_off, cpu_online_mask);
++ 
++ 	schedule_delayed_work(&shepherd,
+++>>>>>>> ba4877b9ca51 (vmstat: do not use deferrable delayed work for vmstat_update)
+  		round_jiffies_relative(sysctl_stat_interval));
+  }
+  
+* Unmerged path mm/vmstat.c
