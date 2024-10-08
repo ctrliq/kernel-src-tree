@@ -1,0 +1,330 @@
+ovl: store real inode pointer in ->i_private
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 39b681f8026c170a73972517269efc830db0d7ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/39b681f8.failed
+
+To get from overlay inode to real inode we currently use 'struct
+ovl_entry', which has lifetime connected to overlay dentry.  This is okay,
+since each overlay dentry had a new overlay inode allocated.
+
+Following patch will break that assumption, so need to leave out ovl_entry.
+This patch stores the real inode directly in i_private, with the lowest bit
+used to indicate whether the inode is upper or lower.
+
+Lifetime rules remain, using ovl_inode_real() must only be done while
+caller holds ref on overlay dentry (and hence on real dentry), or within
+RCU protected regions.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 39b681f8026c170a73972517269efc830db0d7ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/super.c
+diff --cc fs/overlayfs/inode.c
+index cec7c3f64b1e,2bdd3cae0f71..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -73,89 -117,31 +73,100 @@@ static int ovl_getattr(struct vfsmount 
+  
+  int ovl_permission(struct inode *inode, int mask)
+  {
+++<<<<<<< HEAD
+ +	struct ovl_entry *oe;
+ +	struct dentry *alias = NULL;
+ +	struct inode *realinode;
+ +	struct dentry *realdentry;
+ +	bool is_upper;
+ +	int err;
+ +
+ +	if (S_ISDIR(inode->i_mode)) {
+ +		oe = inode->i_private;
+ +	} else if (mask & MAY_NOT_BLOCK) {
+++=======
++ 	bool is_upper;
++ 	struct inode *realinode = ovl_inode_real(inode, &is_upper);
++ 	const struct cred *old_cred;
++ 	int err;
++ 
++ 	/* Careful in RCU walk mode */
++ 	if (!realinode) {
++ 		WARN_ON(!(mask & MAY_NOT_BLOCK));
+++>>>>>>> 39b681f8026c (ovl: store real inode pointer in ->i_private)
+  		return -ECHILD;
+ +	} else {
+ +		/*
+ +		 * For non-directories find an alias and get the info
+ +		 * from there.
+ +		 */
+ +		alias = d_find_any_alias(inode);
+ +		if (WARN_ON(!alias))
+ +			return -ENOENT;
+ +
+ +		oe = alias->d_fsdata;
+  	}
+  
+ -	/*
+ -	 * Check overlay inode with the creds of task and underlying inode
+ -	 * with creds of mounter
+ -	 */
+ -	err = generic_permission(inode, mask);
+ -	if (err)
+ -		return err;
+ +	realdentry = ovl_entry_real(oe, &is_upper);
+  
+ -	old_cred = ovl_override_creds(inode->i_sb);
+ -	if (!is_upper)
+ -		mask &= ~(MAY_WRITE | MAY_APPEND);
+ -	err = inode_permission(realinode, mask);
+ -	revert_creds(old_cred);
+ +	if (ovl_is_default_permissions(inode)) {
+ +		struct kstat stat;
+ +		struct path realpath = { .dentry = realdentry };
+  
+ +		if (mask & MAY_NOT_BLOCK)
+ +			return -ECHILD;
+ +
+ +		realpath.mnt = ovl_entry_mnt_real(oe, inode, is_upper);
+ +
+ +		err = vfs_getattr(&realpath, &stat);
+ +		if (err)
+ +			goto out_dput;
+ +
+ +		err = -ESTALE;
+ +		if ((stat.mode ^ inode->i_mode) & S_IFMT)
+ +			goto out_dput;
+ +
+ +		inode->i_mode = stat.mode;
+ +		inode->i_uid = stat.uid;
+ +		inode->i_gid = stat.gid;
+ +
+ +		err = generic_permission(inode, mask);
+ +		goto out_dput;
+ +	}
+ +
+ +	/* Careful in RCU walk mode */
+ +	realinode = ACCESS_ONCE(realdentry->d_inode);
+ +	if (!realinode) {
+ +		WARN_ON(!(mask & MAY_NOT_BLOCK));
+ +		err = -ENOENT;
+ +		goto out_dput;
+ +	}
+ +
+ +	if (mask & MAY_WRITE) {
+ +		umode_t mode = realinode->i_mode;
+ +
+ +		/*
+ +		 * Writes will always be redirected to upper layer, so
+ +		 * ignore lower layer being read-only.
+ +		 *
+ +		 * If the overlay itself is read-only then proceed
+ +		 * with the permission check, don't return EROFS.
+ +		 * This will only happen if this is the lower layer of
+ +		 * another overlayfs.
+ +		 *
+ +		 * If upper fs becomes read-only after the overlay was
+ +		 * constructed return EROFS to prevent modification of
+ +		 * upper layer.
+ +		 */
+ +		err = -EROFS;
+ +		if (is_upper && !IS_RDONLY(inode) && IS_RDONLY(realinode) &&
+ +		    (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
+ +			goto out_dput;
+ +	}
+ +
+ +	err = __inode_permission(realinode, mask);
+ +out_dput:
+ +	dput(alias);
+  	return err;
+  }
+  
+@@@ -345,6 -307,25 +356,28 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct posix_acl *ovl_get_acl(struct inode *inode, int type)
++ {
++ 	struct inode *realinode = ovl_inode_real(inode, NULL);
++ 	const struct cred *old_cred;
++ 	struct posix_acl *acl;
++ 
++ 	if (!IS_POSIXACL(realinode))
++ 		return NULL;
++ 
++ 	if (!realinode->i_op->get_acl)
++ 		return NULL;
++ 
++ 	old_cred = ovl_override_creds(inode->i_sb);
++ 	acl = realinode->i_op->get_acl(realinode, type);
++ 	revert_creds(old_cred);
++ 
++ 	return acl;
++ }
++ 
+++>>>>>>> 39b681f8026c (ovl: store real inode pointer in ->i_private)
+  static bool ovl_open_need_copy_up(int flags, enum ovl_path_type type,
+  				  struct dentry *realdentry)
+  {
+@@@ -413,10 -406,10 +446,9 @@@ static const struct inode_operations ov
+  	.getxattr	= ovl_getxattr,
+  	.listxattr	= ovl_listxattr,
+  	.removexattr	= ovl_removexattr,
+ -	.update_time	= ovl_update_time,
+  };
+  
+- struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+- 			    struct ovl_entry *oe)
++ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode)
+  {
+  	struct inode *inode;
+  
+@@@ -426,7 -419,7 +458,11 @@@
+  
+  	inode->i_ino = get_next_ino();
+  	inode->i_mode = mode;
+++<<<<<<< HEAD
+ +	inode->i_flags |= S_NOATIME | S_NOCMTIME;
+++=======
++ 	inode->i_flags |= S_NOCMTIME;
+++>>>>>>> 39b681f8026c (ovl: store real inode pointer in ->i_private)
+  
+  	mode &= S_IFMT;
+  	switch (mode) {
+diff --cc fs/overlayfs/overlayfs.h
+index 26a0f54fc56c,6410209ea616..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -141,7 -153,6 +153,10 @@@ int ovl_path_next(int idx, struct dentr
+  struct dentry *ovl_dentry_upper(struct dentry *dentry);
+  struct dentry *ovl_dentry_lower(struct dentry *dentry);
+  struct dentry *ovl_dentry_real(struct dentry *dentry);
+++<<<<<<< HEAD
+ +struct dentry *ovl_entry_real(struct ovl_entry *oe, bool *is_upper);
+++=======
+++>>>>>>> 39b681f8026c (ovl: store real inode pointer in ->i_private)
+  struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+  				    bool is_upper);
+  struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry);
+@@@ -172,15 -183,18 +188,14 @@@ int ovl_check_d_type_supported(struct p
+  /* inode.c */
+  int ovl_setattr(struct dentry *dentry, struct iattr *attr);
+  int ovl_permission(struct inode *inode, int mask);
+ -int ovl_setxattr(struct dentry *dentry, struct inode *inode,
+ -		 const char *name, const void *value,
+ -		 size_t size, int flags);
+ -ssize_t ovl_getxattr(struct dentry *dentry, struct inode *inode,
+ -		     const char *name, void *value, size_t size);
+ +int ovl_setxattr(struct dentry *dentry, const char *name,
+ +		 const void *value, size_t size, int flags);
+ +ssize_t ovl_getxattr(struct dentry *dentry, const char *name,
+ +		     void *value, size_t size);
+  ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size);
+  int ovl_removexattr(struct dentry *dentry, const char *name);
+ -struct posix_acl *ovl_get_acl(struct inode *inode, int type);
+ -int ovl_open_maybe_copy_up(struct dentry *dentry, unsigned int file_flags);
+ -int ovl_update_time(struct inode *inode, struct timespec *ts, int flags);
+  
+- struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+- 			    struct ovl_entry *oe);
++ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode);
+  static inline void ovl_copyattr(struct inode *from, struct inode *to)
+  {
+  	to->i_uid = from->i_uid;
+diff --cc fs/overlayfs/super.c
+index 5c0fb1f1eab2,313f773652ff..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -143,18 -145,11 +143,24 @@@ struct dentry *ovl_dentry_real(struct d
+  	return realdentry;
+  }
+  
+- struct dentry *ovl_entry_real(struct ovl_entry *oe, bool *is_upper)
++ static void ovl_inode_init(struct inode *inode, struct inode *realinode,
++ 			   bool is_upper)
+  {
+++<<<<<<< HEAD
+ +	struct dentry *realdentry;
+ +
+ +	realdentry = ovl_upperdentry_dereference(oe);
+ +	if (realdentry) {
+ +		*is_upper = true;
+ +	} else {
+ +		realdentry = __ovl_dentry_lower(oe);
+ +		*is_upper = false;
+ +	}
+ +	return realdentry;
+++=======
++ 	WRITE_ONCE(inode->i_private, (unsigned long) realinode |
++ 		   (is_upper ? OVL_ISUPPER_MASK : 0));
+++>>>>>>> 39b681f8026c (ovl: store real inode pointer in ->i_private)
+  }
+  
+  struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+@@@ -231,9 -219,8 +237,8 @@@ void ovl_dentry_update(struct dentry *d
+  {
+  	struct ovl_entry *oe = dentry->d_fsdata;
+  
+ -	WARN_ON(!inode_is_locked(upperdentry->d_parent->d_inode));
+ +	WARN_ON(!mutex_is_locked(&upperdentry->d_parent->d_inode->i_mutex));
+  	WARN_ON(oe->__upperdentry);
+- 	BUG_ON(!upperdentry->d_inode);
+  	/*
+  	 * Make sure upperdentry is consistent before making it visible to
+  	 * ovl_upperdentry_dereference().
+@@@ -929,10 -963,9 +943,11 @@@ static int ovl_fill_super(struct super_
+  	struct path upperpath = { NULL, NULL };
+  	struct path workpath = { NULL, NULL };
+  	struct dentry *root_dentry;
++ 	struct inode *realinode;
+  	struct ovl_entry *oe;
+  	struct ovl_fs *ufs;
+ +	const int *upper_stack_depth;
+ +	int *overlay_stack_depth;
+  	struct path *stack = NULL;
+  	char *lowertmp;
+  	char *lower;
+diff --git a/fs/overlayfs/copy_up.c b/fs/overlayfs/copy_up.c
+index 79058d666f6a..2cb6ee167dea 100644
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@ -294,6 +294,7 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+ 		goto out_cleanup;
+ 
+ 	ovl_dentry_update(dentry, newdentry);
++	ovl_inode_update(d_inode(dentry), d_inode(newdentry));
+ 	newdentry = NULL;
+ 
+ 	/*
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index a1caf19083f8..324da45df59d 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -164,6 +164,7 @@ static void ovl_instantiate(struct dentry *dentry, struct inode *inode,
+ {
+ 	ovl_dentry_version_inc(dentry->d_parent);
+ 	ovl_dentry_update(dentry, newdentry);
++	ovl_inode_update(inode, d_inode(newdentry));
+ 	ovl_copyattr(newdentry->d_inode, inode);
+ 	d_instantiate(dentry, inode);
+ }
+@@ -397,7 +398,7 @@ static int ovl_create_or_link(struct dentry *dentry, int mode, dev_t rdev,
+ 	};
+ 
+ 	err = -ENOMEM;
+-	inode = ovl_new_inode(dentry->d_sb, mode, dentry->d_fsdata);
++	inode = ovl_new_inode(dentry->d_sb, mode);
+ 	if (!inode)
+ 		goto out;
+ 
+* Unmerged path fs/overlayfs/inode.c
+* Unmerged path fs/overlayfs/overlayfs.h
+* Unmerged path fs/overlayfs/super.c
