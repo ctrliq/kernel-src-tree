@@ -1,0 +1,191 @@
+ext4: call dax_pfn_mkwrite() for DAX fsync/msync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit d5be7a03b002a0faec136687ec03dbee6c579930
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d5be7a03.failed
+
+To properly support the new DAX fsync/msync infrastructure filesystems
+need to call dax_pfn_mkwrite() so that DAX can track when user pages are
+dirtied.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: "J. Bruce Fields" <bfields@fieldses.org>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Jeff Layton <jlayton@poochiereds.net>
+	Cc: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d5be7a03b002a0faec136687ec03dbee6c579930)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,8c8965cc4aab..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -164,38 -188,122 +164,132 @@@ ext4_file_dio_write(struct kiocb *iocb
+  	return ret;
+  }
+  
+ -#ifdef CONFIG_FS_DAX
+ -static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ +static ssize_t
+ +ext4_file_write(struct kiocb *iocb, const struct iovec *iov,
+ +		unsigned long nr_segs, loff_t pos)
+  {
+ -	int result;
+ -	handle_t *handle = NULL;
+ -	struct inode *inode = file_inode(vma->vm_file);
+ -	struct super_block *sb = inode->i_sb;
+ -	bool write = vmf->flags & FAULT_FLAG_WRITE;
+ +	struct inode *inode = file_inode(iocb->ki_filp);
+ +	ssize_t ret;
+ +	int overwrite = 0;
+  
+ -	if (write) {
+ -		sb_start_pagefault(sb);
+ -		file_update_time(vma->vm_file);
+ -		down_read(&EXT4_I(inode)->i_mmap_sem);
+ -		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
+ -						EXT4_DATA_TRANS_BLOCKS(sb));
+ -	} else
+ -		down_read(&EXT4_I(inode)->i_mmap_sem);
+ +	/*
+ +	 * If we have encountered a bitmap-format file, the size limit
+ +	 * is smaller than s_maxbytes, which is for extent-mapped files.
+ +	 */
+  
+ -	if (IS_ERR(handle))
+ -		result = VM_FAULT_SIGBUS;
+ +	if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))) {
+ +		struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+ +		size_t length = iov_length(iov, nr_segs);
+ +
+ +		if ((pos > sbi->s_bitmap_maxbytes ||
+ +		    (pos == sbi->s_bitmap_maxbytes && length > 0)))
+ +			return -EFBIG;
+ +
+ +		if (pos + length > sbi->s_bitmap_maxbytes) {
+ +			nr_segs = iov_shorten((struct iovec *)iov, nr_segs,
+ +					      sbi->s_bitmap_maxbytes - pos);
+ +		}
+ +	}
+ +
+ +	iocb->private = &overwrite; /* RHEL7 only - prevent DIO race */
+ +	if (unlikely(iocb->ki_filp->f_flags & O_DIRECT))
+ +		ret = ext4_file_dio_write(iocb, iov, nr_segs, pos);
+  	else
+++<<<<<<< HEAD
+ +		ret = generic_file_aio_write(iocb, iov, nr_segs, pos);
+++=======
++ 		result = __dax_fault(vma, vmf, ext4_dax_mmap_get_block, NULL);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 		sb_end_pagefault(sb);
++ 	} else
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
++ 						pmd_t *pmd, unsigned int flags)
++ {
++ 	int result;
++ 	handle_t *handle = NULL;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	bool write = flags & FAULT_FLAG_WRITE;
++ 
++ 	if (write) {
++ 		sb_start_pagefault(sb);
++ 		file_update_time(vma->vm_file);
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
++ 				ext4_chunk_trans_blocks(inode,
++ 							PMD_SIZE / PAGE_SIZE));
++ 	} else
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	if (IS_ERR(handle))
++ 		result = VM_FAULT_SIGBUS;
++ 	else
++ 		result = __dax_pmd_fault(vma, addr, pmd, flags,
++ 				ext4_dax_mmap_get_block, NULL);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 		sb_end_pagefault(sb);
++ 	} else
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	int err;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 
++ 	sb_start_pagefault(inode->i_sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&EXT4_I(inode)->i_mmap_sem);
++ 	err = __dax_mkwrite(vma, vmf, ext4_dax_mmap_get_block, NULL);
++ 	up_read(&EXT4_I(inode)->i_mmap_sem);
++ 	sb_end_pagefault(inode->i_sb);
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Handle write fault for VM_MIXEDMAP mappings. Similarly to ext4_dax_mkwrite()
++  * handler we check for races agaist truncate. Note that since we cycle through
++  * i_mmap_sem, we are sure that also any hole punching that began before we
++  * were called is finished by now and so if it included part of the file we
++  * are working on, our pte will get unmapped and the check for pte_same() in
++  * wp_pfn_shared() fails. Thus fault gets retried and things work out as
++  * desired.
++  */
++ static int ext4_dax_pfn_mkwrite(struct vm_area_struct *vma,
++ 				struct vm_fault *vmf)
++ {
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	loff_t size;
++ 	int ret;
++ 
++ 	sb_start_pagefault(sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&EXT4_I(inode)->i_mmap_sem);
++ 	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	if (vmf->pgoff >= size)
++ 		ret = VM_FAULT_SIGBUS;
++ 	else
++ 		ret = dax_pfn_mkwrite(vma, vmf);
++ 	up_read(&EXT4_I(inode)->i_mmap_sem);
++ 	sb_end_pagefault(sb);
+++>>>>>>> d5be7a03b002 (ext4: call dax_pfn_mkwrite() for DAX fsync/msync)
+  
+  	return ret;
+  }
+* Unmerged path fs/ext4/file.c
