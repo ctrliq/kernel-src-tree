@@ -1,0 +1,173 @@
+perf hists: Do column alignment on the format iterator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 89fee70943232d73e3cc328634e0da253b6de9b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/89fee709.failed
+
+We were doing column alignment in the format function for each cell,
+returning a string padded with spaces so that when the next column is
+printed the cursor is at its column alignment.
+
+This ends up needlessly printing trailing spaces, do it at the format
+iterator, that is where we know if it is needed, i.e. if there is more
+columns to be printed.
+
+This eliminates the need for triming lines when doing a dump using 'P'
+in the TUI browser and also produces far saner results with things like
+piping 'perf report' to 'less'.
+
+Right now only the formatters for sym->name and the 'locked' column
+(perf mem report), that are the ones that end up at the end of lines
+in the default 'perf report', 'perf top' and 'perf mem report' tools,
+the others will be done in a subsequent patch.
+
+In the end the 'width' parameter for the formatters now mean, in
+'printf' terms, the 'precision', where before it was the field 'width'.
+
+	Reported-by: Dave Jones <davej@codemonkey.org.uk>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/n/tip-s7iwl2gj23w92l6tibnrcqzr@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 89fee70943232d73e3cc328634e0da253b6de9b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/ui/browsers/hists.c
+diff --cc tools/perf/ui/browsers/hists.c
+index 29794dff01f7,1819771243f9..000000000000
+--- a/tools/perf/ui/browsers/hists.c
++++ b/tools/perf/ui/browsers/hists.c
+@@@ -1095,8 -1089,16 +1089,21 @@@ static int hist_browser__show_entry(str
+  
+  		hist_browser__gotorc(browser, row, 0);
+  
+++<<<<<<< HEAD
+ +		perf_hpp__for_each_format(fmt) {
+ +			if (perf_hpp__should_skip(fmt) || column++ < browser->b.horiz_scroll)
+++=======
++ 		hists__for_each_format(browser->hists, fmt) {
++ 			char s[2048];
++ 			struct perf_hpp hpp = {
++ 				.buf	= s,
++ 				.size	= sizeof(s),
++ 				.ptr	= &arg,
++ 			};
++ 
++ 			if (perf_hpp__should_skip(fmt, entry->hists) ||
++ 			    column++ < browser->b.horiz_scroll)
+++>>>>>>> 89fee7094323 (perf hists: Do column alignment on the format iterator)
+  				continue;
+  
+  			if (current_entry && browser->b.navkeypressed) {
+* Unmerged path tools/perf/ui/browsers/hists.c
+diff --git a/tools/perf/ui/stdio/hist.c b/tools/perf/ui/stdio/hist.c
+index 28fcb1ee0342..375d2b4918cb 100644
+--- a/tools/perf/ui/stdio/hist.c
++++ b/tools/perf/ui/stdio/hist.c
+@@ -403,6 +403,7 @@ static int hist_entry__snprintf(struct hist_entry *he, struct perf_hpp *hpp)
+ 		else
+ 			ret = fmt->entry(fmt, hpp, he);
+ 
++		ret = hist_entry__snprintf_alignment(he, hpp, fmt, ret);
+ 		advance_hpp(hpp, ret);
+ 	}
+ 
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index d3cfa15c7e2e..1215a37c2655 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -1009,6 +1009,27 @@ void hist_entry__delete(struct hist_entry *he)
+ 	free(he);
+ }
+ 
++/*
++ * If this is not the last column, then we need to pad it according to the
++ * pre-calculated max lenght for this column, otherwise don't bother adding
++ * spaces because that would break viewing this with, for instance, 'less',
++ * that would show tons of trailing spaces when a long C++ demangled method
++ * names is sampled.
++*/
++int hist_entry__snprintf_alignment(struct hist_entry *he, struct perf_hpp *hpp,
++				   struct perf_hpp_fmt *fmt, int printed)
++{
++	if (!list_is_last(&fmt->list, &he->hists->hpp_list->fields)) {
++		const int width = fmt->width(fmt, hpp, hists_to_evsel(he->hists));
++		if (printed < width) {
++			advance_hpp(hpp, printed);
++			printed = scnprintf(hpp->buf, hpp->size, "%-*s", width - printed, " ");
++		}
++	}
++
++	return printed;
++}
++
+ /*
+  * collapse the histogram
+  */
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index 9ddf2f915eef..cfffc897a085 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -117,11 +117,16 @@ struct hist_entry *__hists__add_entry(struct hists *hists,
+ int hist_entry_iter__add(struct hist_entry_iter *iter, struct addr_location *al,
+ 			 int max_stack_depth, void *arg);
+ 
++struct perf_hpp;
++struct perf_hpp_fmt;
++
+ int64_t hist_entry__cmp(struct hist_entry *left, struct hist_entry *right);
+ int64_t hist_entry__collapse(struct hist_entry *left, struct hist_entry *right);
+ int hist_entry__transaction_len(void);
+ int hist_entry__sort_snprintf(struct hist_entry *he, char *bf, size_t size,
+ 			      struct hists *hists);
++int hist_entry__snprintf_alignment(struct hist_entry *he, struct perf_hpp *hpp,
++				   struct perf_hpp_fmt *fmt, int printed);
+ void hist_entry__delete(struct hist_entry *he);
+ 
+ void hists__output_resort(struct hists *hists, struct ui_progress *prog);
+diff --git a/tools/perf/util/sort.c b/tools/perf/util/sort.c
+index fd679d5f90f2..2ce5c3e99fb3 100644
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@ -253,10 +253,8 @@ static int _hist_entry__sym_snprintf(struct map *map, struct symbol *sym,
+ 			ret += repsep_snprintf(bf + ret, size - ret, "%s", sym->name);
+ 			ret += repsep_snprintf(bf + ret, size - ret, "+0x%llx",
+ 					ip - map->unmap_ip(map, sym->start));
+-			ret += repsep_snprintf(bf + ret, size - ret, "%-*s",
+-				       width - ret, "");
+ 		} else {
+-			ret += repsep_snprintf(bf + ret, size - ret, "%-*s",
++			ret += repsep_snprintf(bf + ret, size - ret, "%.*s",
+ 					       width - ret,
+ 					       sym->name);
+ 		}
+@@ -264,14 +262,9 @@ static int _hist_entry__sym_snprintf(struct map *map, struct symbol *sym,
+ 		size_t len = BITS_PER_LONG / 4;
+ 		ret += repsep_snprintf(bf + ret, size - ret, "%-#.*llx",
+ 				       len, ip);
+-		ret += repsep_snprintf(bf + ret, size - ret, "%-*s",
+-				       width - ret, "");
+ 	}
+ 
+-	if (ret > width)
+-		bf[width] = '\0';
+-
+-	return width;
++	return ret;
+ }
+ 
+ static int hist_entry__sym_snprintf(struct hist_entry *he, char *bf,
+@@ -732,7 +725,7 @@ static int hist_entry__locked_snprintf(struct hist_entry *he, char *bf,
+ 	else
+ 		out = "No";
+ 
+-	return repsep_snprintf(bf, size, "%-*s", width, out);
++	return repsep_snprintf(bf, size, "%.*s", width, out);
+ }
+ 
+ static int64_t
