@@ -1,0 +1,198 @@
+dm mpath: use atomic_t for counting members of 'struct multipath'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 91e968aa6015d7366281b532dad2e48855b91fe3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/91e968aa.failed
+
+The use of atomic_t for nr_valid_paths, pg_init_in_progress and
+pg_init_count will allow relaxing the use of the m->lock spinlock.
+
+	Suggested-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Tested-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 91e968aa6015d7366281b532dad2e48855b91fe3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index e077a28bdb3f,780e5d0a066f..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -82,18 -80,15 +79,21 @@@ struct multipath 
+  	struct priority_group *current_pg;
+  	struct priority_group *next_pg;	/* Switch to this PG if set */
+  
+ -	unsigned long flags;		/* Multipath state flags */
+ +	bool queue_io:1;		/* Must we queue all I/O? */
+ +	bool queue_if_no_path:1;	/* Queue I/O if last path fails? */
+ +	bool saved_queue_if_no_path:1;	/* Saved state during suspension */
+ +	bool retain_attached_hw_handler:1; /* If there's already a hw_handler present, don't change it. */
+ +	bool pg_init_disabled:1;	/* pg_init is not currently allowed */
+ +	bool pg_init_required:1;	/* pg_init needs calling? */
+ +	bool pg_init_delay_retry:1;	/* Delay pg_init retry? */
+  
+  	unsigned pg_init_retries;	/* Number of times to retry pg_init */
+- 	unsigned pg_init_count;		/* Number of times pg_init called */
+  	unsigned pg_init_delay_msecs;	/* Number of msecs before pg_init retry */
+  
++ 	atomic_t nr_valid_paths;	/* Total number of usable paths */
++ 	atomic_t pg_init_in_progress;	/* Only one pg_init allowed at once */
++ 	atomic_t pg_init_count;		/* Number of times pg_init called */
++ 
+  	struct work_struct trigger_event;
+  
+  	/*
+@@@ -191,7 -194,10 +191,14 @@@ static struct multipath *alloc_multipat
+  	if (m) {
+  		INIT_LIST_HEAD(&m->priority_groups);
+  		spin_lock_init(&m->lock);
+++<<<<<<< HEAD
+ +		m->queue_io = true;
+++=======
++ 		set_bit(MPATHF_QUEUE_IO, &m->flags);
++ 		atomic_set(&m->nr_valid_paths, 0);
++ 		atomic_set(&m->pg_init_in_progress, 0);
++ 		atomic_set(&m->pg_init_count, 0);
+++>>>>>>> 91e968aa6015 (dm mpath: use atomic_t for counting members of 'struct multipath')
+  		m->pg_init_delay_msecs = DM_PG_INIT_DELAY_DEFAULT;
+  		INIT_WORK(&m->trigger_event, trigger_event);
+  		init_waitqueue_head(&m->pg_init_wait);
+@@@ -276,11 -282,11 +283,19 @@@ static int __pg_init_all_paths(struct m
+  	struct pgpath *pgpath;
+  	unsigned long pg_init_delay = 0;
+  
+++<<<<<<< HEAD
+ +	if (m->pg_init_in_progress || m->pg_init_disabled)
+ +		return 0;
+ +
+ +	m->pg_init_count++;
+ +	m->pg_init_required = false;
+++=======
++ 	if (atomic_read(&m->pg_init_in_progress) || test_bit(MPATHF_PG_INIT_DISABLED, &m->flags))
++ 		return 0;
++ 
++ 	atomic_inc(&m->pg_init_count);
++ 	clear_bit(MPATHF_PG_INIT_REQUIRED, &m->flags);
+++>>>>>>> 91e968aa6015 (dm mpath: use atomic_t for counting members of 'struct multipath')
+  
+  	/* Check here to reset pg_init_required */
+  	if (!m->current_pg)
+@@@ -306,14 -312,14 +321,14 @@@ static void __switch_pg(struct multipat
+  
+  	/* Must we initialise the PG first, and queue I/O till it's ready? */
+  	if (m->hw_handler_name) {
+ -		set_bit(MPATHF_PG_INIT_REQUIRED, &m->flags);
+ -		set_bit(MPATHF_QUEUE_IO, &m->flags);
+ +		m->pg_init_required = true;
+ +		m->queue_io = true;
+  	} else {
+ -		clear_bit(MPATHF_PG_INIT_REQUIRED, &m->flags);
+ -		clear_bit(MPATHF_QUEUE_IO, &m->flags);
+ +		m->pg_init_required = false;
+ +		m->queue_io = false;
+  	}
+  
+- 	m->pg_init_count = 0;
++ 	atomic_set(&m->pg_init_count, 0);
+  }
+  
+  static int __choose_path_in_pg(struct multipath *m, struct priority_group *pg,
+@@@ -338,8 -344,8 +353,13 @@@ static void __choose_pgpath(struct mult
+  	struct priority_group *pg;
+  	bool bypassed = true;
+  
+++<<<<<<< HEAD
+ +	if (!m->nr_valid_paths) {
+ +		m->queue_io = false;
+++=======
++ 	if (!atomic_read(&m->nr_valid_paths)) {
++ 		clear_bit(MPATHF_QUEUE_IO, &m->flags);
+++>>>>>>> 91e968aa6015 (dm mpath: use atomic_t for counting members of 'struct multipath')
+  		goto failed;
+  	}
+  
+@@@ -1159,8 -1169,9 +1179,14 @@@ static bool pg_init_limit_reached(struc
+  
+  	spin_lock_irqsave(&m->lock, flags);
+  
+++<<<<<<< HEAD
+ +	if (m->pg_init_count <= m->pg_init_retries && !m->pg_init_disabled)
+ +		m->pg_init_required = true;
+++=======
++ 	if (atomic_read(&m->pg_init_count) <= m->pg_init_retries &&
++ 	    !test_bit(MPATHF_PG_INIT_DISABLED, &m->flags))
++ 		set_bit(MPATHF_PG_INIT_REQUIRED, &m->flags);
+++>>>>>>> 91e968aa6015 (dm mpath: use atomic_t for counting members of 'struct multipath')
+  	else
+  		limit_reached = true;
+  
+@@@ -1226,10 -1237,10 +1252,10 @@@ static void pg_init_done(void *data, in
+  			m->current_pgpath = NULL;
+  			m->current_pg = NULL;
+  		}
+ -	} else if (!test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags))
+ +	} else if (!m->pg_init_required)
+  		pg->bypassed = false;
+  
+- 	if (--m->pg_init_in_progress)
++ 	if (atomic_dec_return(&m->pg_init_in_progress) > 0)
+  		/* Activations of other paths are still on going */
+  		goto out;
+  
+@@@ -1306,8 -1321,8 +1332,13 @@@ static int do_end_io(struct multipath *
+  		fail_path(mpio->pgpath);
+  
+  	spin_lock_irqsave(&m->lock, flags);
+++<<<<<<< HEAD
+ +	if (!m->nr_valid_paths) {
+ +		if (!m->queue_if_no_path) {
+++=======
++ 	if (!atomic_read(&m->nr_valid_paths)) {
++ 		if (!test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
+++>>>>>>> 91e968aa6015 (dm mpath: use atomic_t for counting members of 'struct multipath')
+  			if (!__must_push_back(m))
+  				r = -EIO;
+  		} else {
+@@@ -1409,13 -1425,14 +1440,18 @@@ static void multipath_status(struct dm_
+  
+  	/* Features */
+  	if (type == STATUSTYPE_INFO)
+++<<<<<<< HEAD
+ +		DMEMIT("2 %u %u ", m->queue_io, m->pg_init_count);
+++=======
++ 		DMEMIT("2 %u %u ", test_bit(MPATHF_QUEUE_IO, &m->flags),
++ 		       atomic_read(&m->pg_init_count));
+++>>>>>>> 91e968aa6015 (dm mpath: use atomic_t for counting members of 'struct multipath')
+  	else {
+ -		DMEMIT("%u ", test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) +
+ +		DMEMIT("%u ", m->queue_if_no_path +
+  			      (m->pg_init_retries > 0) * 2 +
+  			      (m->pg_init_delay_msecs != DM_PG_INIT_DELAY_DEFAULT) * 2 +
+ -			      test_bit(MPATHF_RETAIN_ATTACHED_HW_HANDLER, &m->flags));
+ -		if (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))
+ +			      m->retain_attached_hw_handler);
+ +		if (m->queue_if_no_path)
+  			DMEMIT("queue_if_no_path ");
+  		if (m->pg_init_retries)
+  			DMEMIT("pg_init_retries %u ", m->pg_init_retries);
+@@@ -1666,8 -1680,8 +1702,13 @@@ static int multipath_busy(struct dm_tar
+  	spin_lock_irqsave(&m->lock, flags);
+  
+  	/* pg_init in progress or no paths available */
+++<<<<<<< HEAD
+ +	if (m->pg_init_in_progress ||
+ +	    (!m->nr_valid_paths && m->queue_if_no_path)) {
+++=======
++ 	if (atomic_read(&m->pg_init_in_progress) ||
++ 	    (!atomic_read(&m->nr_valid_paths) && test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))) {
+++>>>>>>> 91e968aa6015 (dm mpath: use atomic_t for counting members of 'struct multipath')
+  		busy = true;
+  		goto out;
+  	}
+* Unmerged path drivers/md/dm-mpath.c
