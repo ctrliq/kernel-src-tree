@@ -686,7 +686,7 @@ process_status:
  * @xprt: transport
  *
  * Initiates a graceful shutdown of the TCP socket by calling the
- * equivalent of shutdown(SHUT_WR);
+ * equivalent of shutdown(SHUT_RDWR);
  */
 static void xs_tcp_shutdown(struct rpc_xprt *xprt)
 {
@@ -694,7 +694,7 @@ static void xs_tcp_shutdown(struct rpc_xprt *xprt)
 	struct socket *sock = transport->sock;
 
 	if (sock != NULL) {
-		kernel_sock_shutdown(sock, SHUT_WR);
+		kernel_sock_shutdown(sock, SHUT_RDWR);
 		trace_rpc_socket_shutdown(xprt, sock);
 	}
 }
