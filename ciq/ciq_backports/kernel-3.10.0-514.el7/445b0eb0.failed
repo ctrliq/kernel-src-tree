@@ -1,0 +1,244 @@
+ACPI / property: Add support for data-only subnodes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 445b0eb058f5f31c844a731cb82e7441d0d9e578
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/445b0eb0.failed
+
+In some cases, the information expressed via device properties is
+hierarchical by nature.  For example, the properties of a composite
+device consisting of multiple semi-dependent components may need
+to be represented in the form of a tree of property data sets
+corresponding to specific components of the device.
+
+Unfortunately, using ACPI device objects for this purpose turns out
+to be problematic, mostly due to the assumption made by some operating
+systems (that platform firmware generally needs to work with) that
+each device object in the ACPI namespace represents a device requiring
+a separate driver.  That assumption leads to complications which
+reportedly are impractically difficult to overcome and a different
+approach is needed for the sake of interoperability.
+
+The approach implemented here is based on extending _DSD via pointers
+(links) to additional ACPI objects returning data packages formatted
+in accordance with the _DSD formatting rules defined by Section 6.2.5
+of ACPI 6.  Those additional objects are referred to as data-only
+subnodes of the device object containing the _DSD pointing to them.
+
+The links to them need to be located in a separate section of the
+_DSD data package following UUID dbb8e3e6-5886-4ba6-8795-1319f52a966b
+referred to as the Hierarchical Data Extension UUID as defined in [1].
+Each of them is represented by a package of two strings.  The first
+string in that package (the key) is regarded as the name of the
+data-only subnode pointed to by the link.  The second string in it
+(the target) is expected to hold the ACPI namespace path (possibly
+utilizing the usual ACPI namespace search rules) of an ACPI object
+evaluating to a data package extending the _DSD.
+
+The device properties initialization code follows those links,
+creates a struct acpi_data_node object for each of them to store
+the data returned by the ACPI object pointed to by it and processes
+those data recursively (which may lead to the creation of more
+struct acpi_data_node objects if the returned data package contains
+the Hierarchical Data Extension UUID section with more links in it).
+
+All of the struct acpi_data_node objects are present until the the
+ACPI device object containing the _DSD with links to them is deleted
+and they are deleted along with that object.
+
+[1]: http://www.uefi.org/sites/default/files/resources/_DSD-hierarchical-data-extension-UUID-v1.pdf
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit 445b0eb058f5f31c844a731cb82e7441d0d9e578)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/property.c
+#	include/acpi/acpi_bus.h
+#	include/linux/fwnode.h
+diff --cc drivers/acpi/property.c
+index 3d47281953cd,17c436de376b..000000000000
+--- a/drivers/acpi/property.c
++++ b/drivers/acpi/property.c
+@@@ -117,19 -242,77 +226,81 @@@ void acpi_init_properties(struct acpi_d
+  		if (!acpi_properties_format_valid(properties))
+  			break;
+  
+++<<<<<<< HEAD
+ +		adev->data.pointer = buf.pointer;
+ +		adev->data.properties = properties;
+ +		return;
+++=======
++ 		data->properties = properties;
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ void acpi_init_properties(struct acpi_device *adev)
++ {
++ 	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
++ 	struct acpi_hardware_id *hwid;
++ 	acpi_status status;
++ 	bool acpi_of = false;
++ 
++ 	INIT_LIST_HEAD(&adev->data.subnodes);
++ 
++ 	/*
++ 	 * Check if ACPI_DT_NAMESPACE_HID is present and inthat case we fill in
++ 	 * Device Tree compatible properties for this device.
++ 	 */
++ 	list_for_each_entry(hwid, &adev->pnp.ids, list) {
++ 		if (!strcmp(hwid->id, ACPI_DT_NAMESPACE_HID)) {
++ 			acpi_of = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	status = acpi_evaluate_object_typed(adev->handle, "_DSD", NULL, &buf,
++ 					    ACPI_TYPE_PACKAGE);
++ 	if (ACPI_FAILURE(status))
++ 		goto out;
++ 
++ 	if (acpi_extract_properties(buf.pointer, &adev->data)) {
++ 		adev->data.pointer = buf.pointer;
++ 		if (acpi_of)
++ 			acpi_init_of_compatible(adev);
++ 	}
++ 	if (acpi_enumerate_nondev_subnodes(adev->handle, buf.pointer, &adev->data))
++ 		adev->data.pointer = buf.pointer;
++ 
++ 	if (!adev->data.pointer) {
++ 		acpi_handle_debug(adev->handle, "Invalid _DSD data, skipping\n");
++ 		ACPI_FREE(buf.pointer);
+++>>>>>>> 445b0eb058f5 (ACPI / property: Add support for data-only subnodes)
+  	}
+  
+ - out:
+ -	if (acpi_of && !adev->flags.of_compatible_ok)
+ -		acpi_handle_info(adev->handle,
+ -			 ACPI_DT_NAMESPACE_HID " requires 'compatible' property\n");
+ + fail:
+ +	dev_warn(&adev->dev, "Returned _DSD data is not valid, skipping\n");
+ +	ACPI_FREE(buf.pointer);
+  }
+  
++ static void acpi_destroy_nondev_subnodes(struct list_head *list)
++ {
++ 	struct acpi_data_node *dn, *next;
++ 
++ 	if (list_empty(list))
++ 		return;
++ 
++ 	list_for_each_entry_safe_reverse(dn, next, list, sibling) {
++ 		acpi_destroy_nondev_subnodes(&dn->data.subnodes);
++ 		list_del(&dn->sibling);
++ 		ACPI_FREE((void *)dn->data.pointer);
++ 		kfree(dn);
++ 	}
++ }
++ 
+  void acpi_free_properties(struct acpi_device *adev)
+  {
++ 	acpi_destroy_nondev_subnodes(&adev->data.subnodes);
+  	ACPI_FREE((void *)adev->data.pointer);
+ -	adev->data.of_compatible = NULL;
+  	adev->data.pointer = NULL;
+  	adev->data.properties = NULL;
+  }
+diff --cc include/acpi/acpi_bus.h
+index 8bcd3caab412,79cfee646d6b..000000000000
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@@ -333,8 -342,12 +333,13 @@@ struct acpi_device_physical_node 
+  struct acpi_device_data {
+  	const union acpi_object *pointer;
+  	const union acpi_object *properties;
+++<<<<<<< HEAD
+++=======
++ 	const union acpi_object *of_compatible;
++ 	struct list_head subnodes;
+++>>>>>>> 445b0eb058f5 (ACPI / property: Add support for data-only subnodes)
+  };
+  
+ -struct acpi_gpio_mapping;
+ -
+  /* Device */
+  struct acpi_device {
+  	int device_type;
+@@@ -363,6 -379,63 +368,66 @@@
+  	void (*remove)(struct acpi_device *);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Non-device subnode */
++ struct acpi_data_node {
++ 	const char *name;
++ 	struct fwnode_handle fwnode;
++ 	struct acpi_device_data data;
++ 	struct list_head sibling;
++ };
++ 
++ static inline bool acpi_check_dma(struct acpi_device *adev, bool *coherent)
++ {
++ 	bool ret = false;
++ 
++ 	if (!adev)
++ 		return ret;
++ 
++ 	/**
++ 	 * Currently, we only support _CCA=1 (i.e. coherent_dma=1)
++ 	 * This should be equivalent to specifyig dma-coherent for
++ 	 * a device in OF.
++ 	 *
++ 	 * For the case when _CCA=0 (i.e. coherent_dma=0 && cca_seen=1),
++ 	 * There are two cases:
++ 	 * case 1. Do not support and disable DMA.
++ 	 * case 2. Support but rely on arch-specific cache maintenance for
++ 	 *         non-coherence DMA operations.
++ 	 * Currently, we implement case 1 above.
++ 	 *
++ 	 * For the case when _CCA is missing (i.e. cca_seen=0) and
++ 	 * platform specifies ACPI_CCA_REQUIRED, we do not support DMA,
++ 	 * and fallback to arch-specific default handling.
++ 	 *
++ 	 * See acpi_init_coherency() for more info.
++ 	 */
++ 	if (adev->flags.coherent_dma) {
++ 		ret = true;
++ 		if (coherent)
++ 			*coherent = adev->flags.coherent_dma;
++ 	}
++ 	return ret;
++ }
++ 
++ static inline bool is_acpi_node(struct fwnode_handle *fwnode)
++ {
++ 	return fwnode && fwnode->type == FWNODE_ACPI;
++ }
++ 
++ static inline struct acpi_device *to_acpi_node(struct fwnode_handle *fwnode)
++ {
++ 	return is_acpi_node(fwnode) ?
++ 		container_of(fwnode, struct acpi_device, fwnode) : NULL;
++ }
++ 
++ static inline struct fwnode_handle *acpi_fwnode_handle(struct acpi_device *adev)
++ {
++ 	return &adev->fwnode;
++ }
++ 
+++>>>>>>> 445b0eb058f5 (ACPI / property: Add support for data-only subnodes)
+  static inline void *acpi_driver_data(struct acpi_device *d)
+  {
+  	return d->driver_data;
+* Unmerged path include/linux/fwnode.h
+* Unmerged path drivers/acpi/property.c
+* Unmerged path include/acpi/acpi_bus.h
+* Unmerged path include/linux/fwnode.h
