@@ -1,0 +1,114 @@
+GFS2: Only do one directory search on create
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit 5a00f3cc978be45b9d2597851bedaa40630bc597
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/5a00f3cc.failed
+
+Creation of a new inode requires a directory search in order to ensure
+that we are not trying to create an inode with the same name as an
+existing one. This was hidden away inside the create_ok() function.
+
+In the case that there was an existing inode, and a lookup can be
+substituted for a create (which is the case with regular files
+when the O_EXCL flag is not in use) then we were doing a second
+lookup in order to return the inode.
+
+This patch merges these two lookups into one. This can be done by
+passing a flag to gfs2_dir_search() to tell it to just return -EEXIST
+in the cases where we don't actually want to look up the inode.
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+(cherry picked from commit 5a00f3cc978be45b9d2597851bedaa40630bc597)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/inode.c
+diff --cc fs/gfs2/inode.c
+index 62b484e4a9e4,ede16ae784e2..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -584,12 -573,6 +573,15 @@@ static int gfs2_create_inode(struct ino
+  		goto fail;
+  
+  	error = create_ok(dip, name, mode);
+++<<<<<<< HEAD
+ +	if ((error == -EEXIST) && S_ISREG(mode) && !excl) {
+ +		inode = gfs2_lookupi(dir, &dentry->d_name, 0);
+ +		gfs2_glock_dq_uninit(ghs);
+ +		d_instantiate(dentry, inode);
+ +		return IS_ERR(inode) ? PTR_ERR(inode) : 0;
+ +	}
+++=======
+++>>>>>>> 5a00f3cc978b (GFS2: Only do one directory search on create)
+  	if (error)
+  		goto fail_gunlock;
+  
+diff --git a/fs/gfs2/dir.c b/fs/gfs2/dir.c
+index b631c9043460..f0c70529948f 100644
+--- a/fs/gfs2/dir.c
++++ b/fs/gfs2/dir.c
+@@ -1555,9 +1555,9 @@ out:
+ 
+ /**
+  * gfs2_dir_search - Search a directory
+- * @dip: The GFS2 inode
+- * @filename:
+- * @inode:
++ * @dip: The GFS2 dir inode
++ * @name: The name we are looking up
++ * @fail_on_exist: Fail if the name exists rather than looking it up
+  *
+  * This routine searches a directory for a file or another directory.
+  * Assumes a glock is held on dip.
+@@ -1565,22 +1565,25 @@ out:
+  * Returns: errno
+  */
+ 
+-struct inode *gfs2_dir_search(struct inode *dir, const struct qstr *name)
++struct inode *gfs2_dir_search(struct inode *dir, const struct qstr *name,
++			      bool fail_on_exist)
+ {
+ 	struct buffer_head *bh;
+ 	struct gfs2_dirent *dent;
+-	struct inode *inode;
++	u64 addr, formal_ino;
++	u16 dtype;
+ 
+ 	dent = gfs2_dirent_search(dir, name, gfs2_dirent_find, &bh);
+ 	if (dent) {
+ 		if (IS_ERR(dent))
+ 			return ERR_CAST(dent);
+-		inode = gfs2_inode_lookup(dir->i_sb, 
+-				be16_to_cpu(dent->de_type),
+-				be64_to_cpu(dent->de_inum.no_addr),
+-				be64_to_cpu(dent->de_inum.no_formal_ino), 0);
++		dtype = be16_to_cpu(dent->de_type);
++		addr = be64_to_cpu(dent->de_inum.no_addr);
++		formal_ino = be64_to_cpu(dent->de_inum.no_formal_ino);
+ 		brelse(bh);
+-		return inode;
++		if (fail_on_exist)
++			return ERR_PTR(-EEXIST);
++		return gfs2_inode_lookup(dir->i_sb, dtype, addr, formal_ino, 0);
+ 	}
+ 	return ERR_PTR(-ENOENT);
+ }
+diff --git a/fs/gfs2/dir.h b/fs/gfs2/dir.h
+index 98c960beab35..d3f273870b49 100644
+--- a/fs/gfs2/dir.h
++++ b/fs/gfs2/dir.h
+@@ -18,7 +18,8 @@ struct gfs2_inode;
+ struct gfs2_inum;
+ 
+ extern struct inode *gfs2_dir_search(struct inode *dir,
+-				     const struct qstr *filename);
++				     const struct qstr *filename,
++				     bool fail_on_exist);
+ extern int gfs2_dir_check(struct inode *dir, const struct qstr *filename,
+ 			  const struct gfs2_inode *ip);
+ extern int gfs2_dir_add(struct inode *inode, const struct qstr *filename,
+* Unmerged path fs/gfs2/inode.c
