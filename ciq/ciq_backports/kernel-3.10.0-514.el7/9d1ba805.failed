@@ -1,0 +1,483 @@
+mm/balloon_compaction: remove balloon mapping and flag AS_BALLOON_MAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] balloon_compaction: remove balloon mapping and flag AS_BALLOON_MAP (Luiz Capitulino) [1263649]
+Rebuild_FUZZ: 97.78%
+commit-author Konstantin Khlebnikov <k.khlebnikov@samsung.com>
+commit 9d1ba8056474a208ed9efb7e58cd014795d9f818
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9d1ba805.failed
+
+Now ballooned pages are detected using PageBalloon().  Fake mapping is no
+longer required.  This patch links ballooned pages to balloon device using
+field page->private instead of page->mapping.  Also this patch embeds
+balloon_dev_info directly into struct virtio_balloon.
+
+	Signed-off-by: Konstantin Khlebnikov <k.khlebnikov@samsung.com>
+	Cc: Rafael Aquini <aquini@redhat.com>
+	Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 9d1ba8056474a208ed9efb7e58cd014795d9f818)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/balloon_compaction.h
+diff --cc include/linux/balloon_compaction.h
+index 089743ade734,bc3d2985cc9a..000000000000
+--- a/include/linux/balloon_compaction.h
++++ b/include/linux/balloon_compaction.h
+@@@ -63,67 -66,23 +63,60 @@@ struct balloon_dev_info 
+  
+  extern struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info);
+  extern struct page *balloon_page_dequeue(struct balloon_dev_info *b_dev_info);
+- extern struct balloon_dev_info *balloon_devinfo_alloc(
+- 						void *balloon_dev_descriptor);
+  
+- static inline void balloon_devinfo_free(struct balloon_dev_info *b_dev_info)
++ static inline void balloon_devinfo_init(struct balloon_dev_info *balloon)
+  {
+- 	kfree(b_dev_info);
++ 	balloon->isolated_pages = 0;
++ 	spin_lock_init(&balloon->pages_lock);
++ 	INIT_LIST_HEAD(&balloon->pages);
++ 	balloon->migratepage = NULL;
+  }
+  
+ +/*
+ + * balloon_page_free - release a balloon page back to the page free lists
+ + * @page: ballooned page to be set free
+ + *
+ + * This function must be used to properly set free an isolated/dequeued balloon
+ + * page at the end of a sucessful page migration, or at the balloon driver's
+ + * page release procedure.
+ + */
+ +static inline void balloon_page_free(struct page *page)
+ +{
+ +	/*
+ +	 * Balloon pages always get an extra refcount before being isolated
+ +	 * and before being dequeued to help on sorting out fortuite colisions
+ +	 * between a thread attempting to isolate and another thread attempting
+ +	 * to release the very same balloon page.
+ +	 *
+ +	 * Before we handle the page back to Buddy, lets drop its extra refcnt.
+ +	 */
+ +	put_page(page);
+ +	__free_page(page);
+ +}
+ +
+  #ifdef CONFIG_BALLOON_COMPACTION
+  extern bool balloon_page_isolate(struct page *page);
+  extern void balloon_page_putback(struct page *page);
+  extern int balloon_page_migrate(struct page *newpage,
+  				struct page *page, enum migrate_mode mode);
+- extern struct address_space
+- *balloon_mapping_alloc(struct balloon_dev_info *b_dev_info,
+- 			const struct address_space_operations *a_ops);
+- 
+- static inline void balloon_mapping_free(struct address_space *balloon_mapping)
+- {
+- 	kfree(balloon_mapping);
+- }
+  
+  /*
+ - * __is_movable_balloon_page - helper to perform @page PageBalloon tests
+ + * page_flags_cleared - helper to perform balloon @page ->flags tests.
+ + *
+ + * As balloon pages are obtained from buddy and we do not play with page->flags
+ + * at driver level (exception made when we get the page lock for compaction),
+ + * we can safely identify a ballooned page by checking if the
+ + * PAGE_FLAGS_CHECK_AT_PREP page->flags are all cleared.  This approach also
+ + * helps us skip ballooned pages that are locked for compaction or release, thus
+ + * mitigating their racy check at balloon_page_movable()
+ + */
+ +static inline bool page_flags_cleared(struct page *page)
+ +{
+ +	return !(page->flags & PAGE_FLAGS_CHECK_AT_PREP);
+ +}
+ +
+ +/*
+ + * __is_movable_balloon_page - helper to perform @page mapping->flags tests
+   */
+  static inline bool __is_movable_balloon_page(struct page *page)
+  {
+@@@ -188,12 -120,13 +180,18 @@@ static inline bool isolated_balloon_pag
+   * Caller must ensure the page is locked and the spin_lock protecting balloon
+   * pages list is held before inserting a page into the balloon device.
+   */
+- static inline void balloon_page_insert(struct page *page,
+- 				       struct address_space *mapping,
+- 				       struct list_head *head)
++ static inline void balloon_page_insert(struct balloon_dev_info *balloon,
++ 				       struct page *page)
+  {
+++<<<<<<< HEAD
+ +	page->mapping = mapping;
+ +	list_add(&page->lru, head);
+++=======
++ 	__SetPageBalloon(page);
++ 	SetPagePrivate(page);
++ 	set_page_private(page, (unsigned long)balloon);
++ 	list_add(&page->lru, &balloon->pages);
+++>>>>>>> 9d1ba8056474 (mm/balloon_compaction: remove balloon mapping and flag AS_BALLOON_MAP)
+  }
+  
+  /*
+@@@ -206,8 -139,12 +204,17 @@@
+   */
+  static inline void balloon_page_delete(struct page *page)
+  {
+++<<<<<<< HEAD
+ +	page->mapping = NULL;
+ +	list_del(&page->lru);
+++=======
++ 	__ClearPageBalloon(page);
++ 	set_page_private(page, 0);
++ 	if (PagePrivate(page)) {
++ 		ClearPagePrivate(page);
++ 		list_del(&page->lru);
++ 	}
+++>>>>>>> 9d1ba8056474 (mm/balloon_compaction: remove balloon mapping and flag AS_BALLOON_MAP)
+  }
+  
+  /*
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index f4f518c36eab..0f3b072065c9 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -58,7 +58,7 @@ struct virtio_balloon {
+ 	 * Each page on this list adds VIRTIO_BALLOON_PAGES_PER_PAGE
+ 	 * to num_pages above.
+ 	 */
+-	struct balloon_dev_info *vb_dev_info;
++	struct balloon_dev_info vb_dev_info;
+ 
+ 	/* Synchronize access/update to this struct virtio_balloon elements */
+ 	struct mutex balloon_lock;
+@@ -126,7 +126,7 @@ static void set_page_pfns(u32 pfns[], struct page *page)
+ 
+ static void fill_balloon(struct virtio_balloon *vb, size_t num)
+ {
+-	struct balloon_dev_info *vb_dev_info = vb->vb_dev_info;
++	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
+ 
+ 	/* We can only do one array worth at a time. */
+ 	num = min(num, ARRAY_SIZE(vb->pfns));
+@@ -169,7 +169,7 @@ static void release_pages_by_pfn(const u32 pfns[], unsigned int num)
+ static void leak_balloon(struct virtio_balloon *vb, size_t num)
+ {
+ 	struct page *page;
+-	struct balloon_dev_info *vb_dev_info = vb->vb_dev_info;
++	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
+ 
+ 	/* We can only do one array worth at a time. */
+ 	num = min(num, ARRAY_SIZE(vb->pfns));
+@@ -360,12 +360,11 @@ static int init_vqs(struct virtio_balloon *vb)
+ 	return 0;
+ }
+ 
+-static const struct address_space_operations virtio_balloon_aops;
+ #ifdef CONFIG_BALLOON_COMPACTION
+ /*
+  * virtballoon_migratepage - perform the balloon page migration on behalf of
+  *			     a compation thread.     (called under page lock)
+- * @mapping: the page->mapping which will be assigned to the new migrated page.
++ * @vb_dev_info: the balloon device
+  * @newpage: page that will replace the isolated page after migration finishes.
+  * @page   : the isolated (old) page that is about to be migrated to newpage.
+  * @mode   : compaction mode -- not used for balloon page migration.
+@@ -380,17 +379,13 @@ static const struct address_space_operations virtio_balloon_aops;
+  * This function preforms the balloon page migration task.
+  * Called through balloon_mapping->a_ops->migratepage
+  */
+-static int virtballoon_migratepage(struct address_space *mapping,
++static int virtballoon_migratepage(struct balloon_dev_info *vb_dev_info,
+ 		struct page *newpage, struct page *page, enum migrate_mode mode)
+ {
+-	struct balloon_dev_info *vb_dev_info = balloon_page_device(page);
+-	struct virtio_balloon *vb;
++	struct virtio_balloon *vb = container_of(vb_dev_info,
++			struct virtio_balloon, vb_dev_info);
+ 	unsigned long flags;
+ 
+-	BUG_ON(!vb_dev_info);
+-
+-	vb = vb_dev_info->balloon_device;
+-
+ 	/*
+ 	 * In order to avoid lock contention while migrating pages concurrently
+ 	 * to leak_balloon() or fill_balloon() we just give up the balloon_lock
+@@ -404,7 +399,7 @@ static int virtballoon_migratepage(struct address_space *mapping,
+ 
+ 	/* balloon's page migration 1st step  -- inflate "newpage" */
+ 	spin_lock_irqsave(&vb_dev_info->pages_lock, flags);
+-	balloon_page_insert(newpage, mapping, &vb_dev_info->pages);
++	balloon_page_insert(vb_dev_info, newpage);
+ 	vb_dev_info->isolated_pages--;
+ 	spin_unlock_irqrestore(&vb_dev_info->pages_lock, flags);
+ 	vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
+@@ -426,18 +421,11 @@ static int virtballoon_migratepage(struct address_space *mapping,
+ 
+ 	return MIGRATEPAGE_BALLOON_SUCCESS;
+ }
+-
+-/* define the balloon_mapping->a_ops callback to allow balloon page migration */
+-static const struct address_space_operations virtio_balloon_aops = {
+-			.migratepage = virtballoon_migratepage,
+-};
+ #endif /* CONFIG_BALLOON_COMPACTION */
+ 
+ static int virtballoon_probe(struct virtio_device *vdev)
+ {
+ 	struct virtio_balloon *vb;
+-	struct address_space *vb_mapping;
+-	struct balloon_dev_info *vb_devinfo;
+ 	int err;
+ 
+ 	if (!vdev->config->get) {
+@@ -459,30 +447,14 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 	vb->vdev = vdev;
+ 	vb->need_stats_update = 0;
+ 
+-	vb_devinfo = balloon_devinfo_alloc(vb);
+-	if (IS_ERR(vb_devinfo)) {
+-		err = PTR_ERR(vb_devinfo);
+-		goto out_free_vb;
+-	}
+-
+-	vb_mapping = balloon_mapping_alloc(vb_devinfo,
+-					   (balloon_compaction_check()) ?
+-					   &virtio_balloon_aops : NULL);
+-	if (IS_ERR(vb_mapping)) {
+-		/*
+-		 * IS_ERR(vb_mapping) && PTR_ERR(vb_mapping) == -EOPNOTSUPP
+-		 * This means !CONFIG_BALLOON_COMPACTION, otherwise we get off.
+-		 */
+-		err = PTR_ERR(vb_mapping);
+-		if (err != -EOPNOTSUPP)
+-			goto out_free_vb_devinfo;
+-	}
+-
+-	vb->vb_dev_info = vb_devinfo;
++	balloon_devinfo_init(&vb->vb_dev_info);
++#ifdef CONFIG_BALLOON_COMPACTION
++	vb->vb_dev_info.migratepage = virtballoon_migratepage;
++#endif
+ 
+ 	err = init_vqs(vb);
+ 	if (err)
+-		goto out_free_vb_mapping;
++		goto out_free_vb;
+ 
+ 	virtio_device_ready(vdev);
+ 
+@@ -496,10 +468,6 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 
+ out_del_vqs:
+ 	vdev->config->del_vqs(vdev);
+-out_free_vb_mapping:
+-	balloon_mapping_free(vb_mapping);
+-out_free_vb_devinfo:
+-	balloon_devinfo_free(vb_devinfo);
+ out_free_vb:
+ 	kfree(vb);
+ out:
+@@ -525,8 +493,6 @@ static void virtballoon_remove(struct virtio_device *vdev)
+ 
+ 	kthread_stop(vb->thread);
+ 	remove_common(vb);
+-	balloon_mapping_free(vb->vb_dev_info->mapping);
+-	balloon_devinfo_free(vb->vb_dev_info);
+ 	kfree(vb);
+ }
+ 
+* Unmerged path include/linux/balloon_compaction.h
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 5c0d28084fa4..8d3045116485 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -24,8 +24,7 @@ enum mapping_flags {
+ 	AS_ENOSPC	= __GFP_BITS_SHIFT + 1,	/* ENOSPC on async write */
+ 	AS_MM_ALL_LOCKS	= __GFP_BITS_SHIFT + 2,	/* under mm_take_all_locks() */
+ 	AS_UNEVICTABLE	= __GFP_BITS_SHIFT + 3,	/* e.g., ramdisk, SHM_LOCK */
+-	AS_BALLOON_MAP  = __GFP_BITS_SHIFT + 4, /* balloon page special map */
+-	AS_EXITING	= __GFP_BITS_SHIFT + 5, /* final truncate in progress */
++	AS_EXITING	= __GFP_BITS_SHIFT + 4, /* final truncate in progress */
+ };
+ 
+ static inline void mapping_set_error(struct address_space *mapping, int error)
+@@ -55,21 +54,6 @@ static inline int mapping_unevictable(struct address_space *mapping)
+ 	return !!mapping;
+ }
+ 
+-static inline void mapping_set_balloon(struct address_space *mapping)
+-{
+-	set_bit(AS_BALLOON_MAP, &mapping->flags);
+-}
+-
+-static inline void mapping_clear_balloon(struct address_space *mapping)
+-{
+-	clear_bit(AS_BALLOON_MAP, &mapping->flags);
+-}
+-
+-static inline int mapping_balloon(struct address_space *mapping)
+-{
+-	return mapping && test_bit(AS_BALLOON_MAP, &mapping->flags);
+-}
+-
+ static inline void mapping_set_exiting(struct address_space *mapping)
+ {
+ 	set_bit(AS_EXITING, &mapping->flags);
+diff --git a/mm/balloon_compaction.c b/mm/balloon_compaction.c
+index 6e45a5074bf0..5f29ca36c78f 100644
+--- a/mm/balloon_compaction.c
++++ b/mm/balloon_compaction.c
+@@ -10,32 +10,6 @@
+ #include <linux/export.h>
+ #include <linux/balloon_compaction.h>
+ 
+-/*
+- * balloon_devinfo_alloc - allocates a balloon device information descriptor.
+- * @balloon_dev_descriptor: pointer to reference the balloon device which
+- *                          this struct balloon_dev_info will be servicing.
+- *
+- * Driver must call it to properly allocate and initialize an instance of
+- * struct balloon_dev_info which will be used to reference a balloon device
+- * as well as to keep track of the balloon device page list.
+- */
+-struct balloon_dev_info *balloon_devinfo_alloc(void *balloon_dev_descriptor)
+-{
+-	struct balloon_dev_info *b_dev_info;
+-	b_dev_info = kmalloc(sizeof(*b_dev_info), GFP_KERNEL);
+-	if (!b_dev_info)
+-		return ERR_PTR(-ENOMEM);
+-
+-	b_dev_info->balloon_device = balloon_dev_descriptor;
+-	b_dev_info->mapping = NULL;
+-	b_dev_info->isolated_pages = 0;
+-	spin_lock_init(&b_dev_info->pages_lock);
+-	INIT_LIST_HEAD(&b_dev_info->pages);
+-
+-	return b_dev_info;
+-}
+-EXPORT_SYMBOL_GPL(balloon_devinfo_alloc);
+-
+ /*
+  * balloon_page_enqueue - allocates a new page and inserts it into the balloon
+  *			  page list.
+@@ -61,7 +35,7 @@ struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info)
+ 	 */
+ 	BUG_ON(!trylock_page(page));
+ 	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
+-	balloon_page_insert(page, b_dev_info->mapping, &b_dev_info->pages);
++	balloon_page_insert(b_dev_info, page);
+ 	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
+ 	unlock_page(page);
+ 	return page;
+@@ -132,60 +106,10 @@ struct page *balloon_page_dequeue(struct balloon_dev_info *b_dev_info)
+ EXPORT_SYMBOL_GPL(balloon_page_dequeue);
+ 
+ #ifdef CONFIG_BALLOON_COMPACTION
+-/*
+- * balloon_mapping_alloc - allocates a special ->mapping for ballooned pages.
+- * @b_dev_info: holds the balloon device information descriptor.
+- * @a_ops: balloon_mapping address_space_operations descriptor.
+- *
+- * Driver must call it to properly allocate and initialize an instance of
+- * struct address_space which will be used as the special page->mapping for
+- * balloon device enlisted page instances.
+- */
+-struct address_space *balloon_mapping_alloc(struct balloon_dev_info *b_dev_info,
+-				const struct address_space_operations *a_ops)
+-{
+-	struct address_space *mapping;
+-
+-	mapping = kmalloc(sizeof(*mapping), GFP_KERNEL);
+-	if (!mapping)
+-		return ERR_PTR(-ENOMEM);
+-
+-	/*
+-	 * Give a clean 'zeroed' status to all elements of this special
+-	 * balloon page->mapping struct address_space instance.
+-	 */
+-	address_space_init_once(mapping);
+-
+-	/*
+-	 * Set mapping->flags appropriately, to allow balloon pages
+-	 * ->mapping identification.
+-	 */
+-	mapping_set_balloon(mapping);
+-	mapping_set_gfp_mask(mapping, balloon_mapping_gfp_mask());
+-
+-	/* balloon's page->mapping->a_ops callback descriptor */
+-	mapping->a_ops = a_ops;
+-
+-	/*
+-	 * Establish a pointer reference back to the balloon device descriptor
+-	 * this particular page->mapping will be servicing.
+-	 * This is used by compaction / migration procedures to identify and
+-	 * access the balloon device pageset while isolating / migrating pages.
+-	 *
+-	 * As some balloon drivers can register multiple balloon devices
+-	 * for a single guest, this also helps compaction / migration to
+-	 * properly deal with multiple balloon pagesets, when required.
+-	 */
+-	mapping->private_data = b_dev_info;
+-	b_dev_info->mapping = mapping;
+-
+-	return mapping;
+-}
+-EXPORT_SYMBOL_GPL(balloon_mapping_alloc);
+ 
+ static inline void __isolate_balloon_page(struct page *page)
+ {
+-	struct balloon_dev_info *b_dev_info = page->mapping->private_data;
++	struct balloon_dev_info *b_dev_info = balloon_page_device(page);
+ 	unsigned long flags;
+ 	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
+ 	list_del(&page->lru);
+@@ -195,7 +119,7 @@ static inline void __isolate_balloon_page(struct page *page)
+ 
+ static inline void __putback_balloon_page(struct page *page)
+ {
+-	struct balloon_dev_info *b_dev_info = page->mapping->private_data;
++	struct balloon_dev_info *b_dev_info = balloon_page_device(page);
+ 	unsigned long flags;
+ 	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
+ 	list_add(&page->lru, &b_dev_info->pages);
+@@ -203,12 +127,6 @@ static inline void __putback_balloon_page(struct page *page)
+ 	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
+ }
+ 
+-static inline int __migrate_balloon_page(struct address_space *mapping,
+-		struct page *newpage, struct page *page, enum migrate_mode mode)
+-{
+-	return page->mapping->a_ops->migratepage(mapping, newpage, page, mode);
+-}
+-
+ /* __isolate_lru_page() counterpart for a ballooned page */
+ bool balloon_page_isolate(struct page *page)
+ {
+@@ -276,7 +194,7 @@ void balloon_page_putback(struct page *page)
+ int balloon_page_migrate(struct page *newpage,
+ 			 struct page *page, enum migrate_mode mode)
+ {
+-	struct address_space *mapping;
++	struct balloon_dev_info *balloon = balloon_page_device(page);
+ 	int rc = -EAGAIN;
+ 
+ 	/*
+@@ -292,9 +210,8 @@ int balloon_page_migrate(struct page *newpage,
+ 		return rc;
+ 	}
+ 
+-	mapping = page->mapping;
+-	if (mapping)
+-		rc = __migrate_balloon_page(mapping, newpage, page, mode);
++	if (balloon && balloon->migratepage)
++		rc = balloon->migratepage(balloon, newpage, page, mode);
+ 
+ 	unlock_page(newpage);
+ 	return rc;
