@@ -1,0 +1,141 @@
+tcp: fix tcp_cong_avoid_ai() credit accumulation bug with decreases in w
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Neal Cardwell <ncardwell@google.com>
+commit 9949afa42be0b76f5832db112ce51bb6b35b2abb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9949afa4.failed
+
+The recent change to tcp_cong_avoid_ai() to handle stretch ACKs
+introduced a bug where snd_cwnd_cnt could accumulate a very large
+value while w was large, and then if w was reduced snd_cwnd could be
+incremented by a large delta, leading to a large burst and high packet
+loss. This was tickled when CUBIC's bictcp_update() sets "ca->cnt =
+100 * cwnd".
+
+This bug crept in while preparing the upstream version of
+814d488c6126.
+
+Testing: This patch has been tested in datacenter netperf transfers
+and live youtube.com and google.com servers.
+
+Fixes: 814d488c6126 ("tcp: fix the timid additive increase on stretch ACKs")
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9949afa42be0b76f5832db112ce51bb6b35b2abb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_cong.c
+diff --cc net/ipv4/tcp_cong.c
+index 511547b93096,62856e185a93..000000000000
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@@ -282,68 -351,47 +282,78 @@@ int tcp_set_congestion_control(struct s
+  	return err;
+  }
+  
+ -/* Slow start is used when congestion window is no greater than the slow start
+ - * threshold. We base on RFC2581 and also handle stretch ACKs properly.
+ - * We do not implement RFC3465 Appropriate Byte Counting (ABC) per se but
+ - * something better;) a packet is only considered (s)acked in its entirety to
+ - * defend the ACK attacks described in the RFC. Slow start processes a stretch
+ - * ACK of degree N as if N acks of degree 1 are received back to back except
+ - * ABC caps N to 2. Slow start exits when cwnd grows over ssthresh and
+ - * returns the leftover acks to adjust cwnd in congestion avoidance mode.
+ +/* RFC2861 Check whether we are limited by application or congestion window
+ + * This is the inverse of cwnd check in tcp_tso_should_defer
+   */
+ -u32 tcp_slow_start(struct tcp_sock *tp, u32 acked)
+ +bool tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
+  {
+ -	u32 cwnd = tp->snd_cwnd + acked;
+ +	const struct tcp_sock *tp = tcp_sk(sk);
+ +	u32 left;
+  
+ -	if (cwnd > tp->snd_ssthresh)
+ -		cwnd = tp->snd_ssthresh + 1;
+ -	acked -= cwnd - tp->snd_cwnd;
+ -	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
+ +	if (in_flight >= tp->snd_cwnd)
+ +		return true;
+  
+ -	return acked;
+ +	left = tp->snd_cwnd - in_flight;
+ +	if (sk_can_gso(sk) &&
+ +	    left * sysctl_tcp_tso_win_divisor < tp->snd_cwnd &&
+ +	    left < tp->xmit_size_goal_segs)
+ +		return true;
+ +	return left <= tcp_max_tso_deferred_mss(tp);
+  }
+ -EXPORT_SYMBOL_GPL(tcp_slow_start);
+ +EXPORT_SYMBOL_GPL(tcp_is_cwnd_limited);
+  
+ -/* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd (or alternative w),
+ - * for every packet that was ACKed.
+ +/*
+ + * Slow start is used when congestion window is less than slow start
+ + * threshold. This version implements the basic RFC2581 version
+ + * and optionally supports:
+ + * 	RFC3742 Limited Slow Start  	  - growth limited to max_ssthresh
+ + *	RFC3465 Appropriate Byte Counting - growth limited by bytes acknowledged
+   */
+ -void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w, u32 acked)
+ +void tcp_slow_start(struct tcp_sock *tp)
+ +{
+ +	int cnt; /* increase in packets */
+ +	unsigned int delta = 0;
+ +	u32 snd_cwnd = tp->snd_cwnd;
+ +
+ +	if (unlikely(!snd_cwnd)) {
+ +		pr_err_once("snd_cwnd is nul, please report this bug.\n");
+ +		snd_cwnd = 1U;
+ +	}
+ +
+ +	if (sysctl_tcp_max_ssthresh > 0 && tp->snd_cwnd > sysctl_tcp_max_ssthresh)
+ +		cnt = sysctl_tcp_max_ssthresh >> 1;	/* limited slow start */
+ +	else
+ +		cnt = snd_cwnd;				/* exponential increase */
+ +
+ +	tp->snd_cwnd_cnt += cnt;
+ +	while (tp->snd_cwnd_cnt >= snd_cwnd) {
+ +		tp->snd_cwnd_cnt -= snd_cwnd;
+ +		delta++;
+ +	}
+ +	tp->snd_cwnd = min(snd_cwnd + delta, tp->snd_cwnd_clamp);
+ +}
+ +EXPORT_SYMBOL_GPL(tcp_slow_start);
+ +
+ +/* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd (or alternative w) */
+ +void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w)
+  {
+++<<<<<<< HEAD
+++=======
++ 	/* If credits accumulated at a higher w, apply them gently now. */
++ 	if (tp->snd_cwnd_cnt >= w) {
++ 		tp->snd_cwnd_cnt = 0;
++ 		tp->snd_cwnd++;
++ 	}
++ 
++ 	tp->snd_cwnd_cnt += acked;
+++>>>>>>> 9949afa42be0 (tcp: fix tcp_cong_avoid_ai() credit accumulation bug with decreases in w)
+  	if (tp->snd_cwnd_cnt >= w) {
+ -		u32 delta = tp->snd_cwnd_cnt / w;
+ -
+ -		tp->snd_cwnd_cnt -= delta * w;
+ -		tp->snd_cwnd += delta;
+ +		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
+ +			tp->snd_cwnd++;
+ +		tp->snd_cwnd_cnt = 0;
+ +	} else {
+ +		tp->snd_cwnd_cnt++;
+  	}
+ -	tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_cwnd_clamp);
+  }
+  EXPORT_SYMBOL_GPL(tcp_cong_avoid_ai);
+  
+* Unmerged path net/ipv4/tcp_cong.c
