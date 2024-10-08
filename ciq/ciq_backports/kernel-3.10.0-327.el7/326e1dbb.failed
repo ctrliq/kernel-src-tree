@@ -1,0 +1,438 @@
+block: remove management of bi_remaining when restoring original bi_end_io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 326e1dbb57368087a36607aaebe9795b8d5453e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/326e1dbb.failed
+
+Commit c4cf5261 ("bio: skip atomic inc/dec of ->bi_remaining for
+non-chains") regressed all existing callers that followed this pattern:
+ 1) saving a bio's original bi_end_io
+ 2) wiring up an intermediate bi_end_io
+ 3) restoring the original bi_end_io from intermediate bi_end_io
+ 4) calling bio_endio() to execute the restored original bi_end_io
+
+The regression was due to BIO_CHAIN only ever getting set if
+bio_inc_remaining() is called.  For the above pattern it isn't set until
+step 3 above (step 2 would've needed to establish BIO_CHAIN).  As such
+the first bio_endio(), in step 2 above, never decremented __bi_remaining
+before calling the intermediate bi_end_io -- leaving __bi_remaining with
+the value 1 instead of 0.  When bio_inc_remaining() occurred during step
+3 it brought it to a value of 2.  When the second bio_endio() was
+called, in step 4 above, it should've called the original bi_end_io but
+it didn't because there was an extra reference that wasn't dropped (due
+to atomic operations being optimized away since BIO_CHAIN wasn't set
+upfront).
+
+Fix this issue by removing the __bi_remaining management complexity for
+all callers that use the above pattern -- bio_chain() is the only
+interface that _needs_ to be concerned with __bi_remaining.  For the
+above pattern callers just expect the bi_end_io they set to get called!
+Remove bio_endio_nodec() and also remove all bio_inc_remaining() calls
+that aren't associated with the bio_chain() interface.
+
+Also, the bio_inc_remaining() interface has been moved local to bio.c.
+
+Fixes: c4cf5261 ("bio: skip atomic inc/dec of ->bi_remaining for non-chains")
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 326e1dbb57368087a36607aaebe9795b8d5453e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-raid1.c
+#	drivers/md/dm-thin.c
+#	drivers/md/dm-verity.c
+#	fs/bio.c
+#	fs/btrfs/disk-io.c
+#	fs/btrfs/volumes.c
+#	fs/btrfs/volumes.h
+diff --cc drivers/md/dm-raid1.c
+index a0a133994150,743fa9bbae9e..000000000000
+--- a/drivers/md/dm-raid1.c
++++ b/drivers/md/dm-raid1.c
+@@@ -1254,8 -1254,6 +1254,11 @@@ static int mirror_end_io(struct dm_targ
+  			dm_bio_restore(bd, bio);
+  			bio_record->details.bi_bdev = NULL;
+  
+++<<<<<<< HEAD
+ +			atomic_inc(&bio->bi_remaining);
+ +
+++=======
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io)
+  			queue_bio(ms, bio, rw);
+  			return DM_ENDIO_INCOMPLETE;
+  		}
+diff --cc drivers/md/dm-thin.c
+index f761dad02142,e852602c0091..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -794,6 -795,7 +794,10 @@@ static void process_prepared_mapping_fa
+  {
+  	if (m->bio)
+  		m->bio->bi_end_io = m->saved_bi_end_io;
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io)
+  	cell_error(m->tc->pool, m->cell);
+  	list_del(&m->list);
+  	mempool_free(m, m->tc->pool->mapping_pool);
+diff --cc drivers/md/dm-verity.c
+index 38d3eb60025b,bb9c6a00e4b0..000000000000
+--- a/drivers/md/dm-verity.c
++++ b/drivers/md/dm-verity.c
+@@@ -471,9 -459,6 +471,12 @@@ static void verity_finish_io(struct dm_
+  	bio->bi_end_io = io->orig_bi_end_io;
+  	bio->bi_private = io->orig_bi_private;
+  
+++<<<<<<< HEAD
+ +	if (io->io_vec != io->io_vec_inline)
+ +		mempool_free(io->io_vec, v->vec_mempool);
+ +
+++=======
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io)
+  	bio_endio(bio, error);
+  }
+  
+diff --cc fs/bio.c
+index 4329823b87b2,259197d97de1..000000000000
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@@ -298,6 -297,44 +298,47 @@@ void bio_reset(struct bio *bio
+  }
+  EXPORT_SYMBOL(bio_reset);
+  
+++<<<<<<< HEAD:fs/bio.c
+++=======
++ static void bio_chain_endio(struct bio *bio, int error)
++ {
++ 	bio_endio(bio->bi_private, error);
++ 	bio_put(bio);
++ }
++ 
++ /*
++  * Increment chain count for the bio. Make sure the CHAIN flag update
++  * is visible before the raised count.
++  */
++ static inline void bio_inc_remaining(struct bio *bio)
++ {
++ 	bio->bi_flags |= (1 << BIO_CHAIN);
++ 	smp_mb__before_atomic();
++ 	atomic_inc(&bio->__bi_remaining);
++ }
++ 
++ /**
++  * bio_chain - chain bio completions
++  * @bio: the target bio
++  * @parent: the @bio's parent bio
++  *
++  * The caller won't have a bi_end_io called when @bio completes - instead,
++  * @parent's bi_end_io won't be called until both @parent and @bio have
++  * completed; the chained bio will also be freed when it completes.
++  *
++  * The caller must not set bi_private or bi_end_io in @bio.
++  */
++ void bio_chain(struct bio *bio, struct bio *parent)
++ {
++ 	BUG_ON(bio->bi_private || bio->bi_end_io);
++ 
++ 	bio->bi_private = parent;
++ 	bio->bi_end_io	= bio_chain_endio;
++ 	bio_inc_remaining(parent);
++ }
++ EXPORT_SYMBOL(bio_chain);
++ 
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io):block/bio.c
+  static void bio_alloc_rescue(struct work_struct *work)
+  {
+  	struct bio_set *bs = container_of(work, struct bio_set, rescue_work);
+@@@ -1709,6 -1756,25 +1750,28 @@@ void bio_flush_dcache_pages(struct bio 
+  EXPORT_SYMBOL(bio_flush_dcache_pages);
+  #endif
+  
+++<<<<<<< HEAD:fs/bio.c
+++=======
++ static inline bool bio_remaining_done(struct bio *bio)
++ {
++ 	/*
++ 	 * If we're not chaining, then ->__bi_remaining is always 1 and
++ 	 * we always end io on the first invocation.
++ 	 */
++ 	if (!bio_flagged(bio, BIO_CHAIN))
++ 		return true;
++ 
++ 	BUG_ON(atomic_read(&bio->__bi_remaining) <= 0);
++ 
++ 	if (atomic_dec_and_test(&bio->__bi_remaining)) {
++ 		clear_bit(BIO_CHAIN, &bio->bi_flags);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io):block/bio.c
+  /**
+   * bio_endio - end I/O on a bio
+   * @bio:	bio
+@@@ -1725,96 -1791,69 +1788,114 @@@
+   **/
+  void bio_endio(struct bio *bio, int error)
+  {
+ -	while (bio) {
+ -		if (error)
+ -			clear_bit(BIO_UPTODATE, &bio->bi_flags);
+ -		else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
+ -			error = -EIO;
+ +	if (error)
+ +		clear_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
+ +		error = -EIO;
+  
+ -		if (unlikely(!bio_remaining_done(bio)))
+ -			break;
+ +	if (bio->bi_end_io)
+ +		bio->bi_end_io(bio, error);
+ +}
+ +EXPORT_SYMBOL(bio_endio);
+  
+ -		/*
+ -		 * Need to have a real endio function for chained bios,
+ -		 * otherwise various corner cases will break (like stacking
+ -		 * block devices that save/restore bi_end_io) - however, we want
+ -		 * to avoid unbounded recursion and blowing the stack. Tail call
+ -		 * optimization would handle this, but compiling with frame
+ -		 * pointers also disables gcc's sibling call optimization.
+ -		 */
+ -		if (bio->bi_end_io == bio_chain_endio) {
+ -			struct bio *parent = bio->bi_private;
+ -			bio_put(bio);
+ -			bio = parent;
+ -		} else {
+ -			if (bio->bi_end_io)
+ -				bio->bi_end_io(bio, error);
+ -			bio = NULL;
+ -		}
+++<<<<<<< HEAD:fs/bio.c
+ +void bio_pair_release(struct bio_pair *bp)
+ +{
+ +	if (atomic_dec_and_test(&bp->cnt)) {
+ +		struct bio *master = bp->bio1.bi_private;
+ +
+ +		bio_endio(master, bp->error);
+ +		mempool_free(bp, bp->bio2.bi_private);
+  	}
+  }
+ -EXPORT_SYMBOL(bio_endio);
+ +EXPORT_SYMBOL(bio_pair_release);
+  
+ +static void bio_pair_end_1(struct bio *bi, int err)
+++=======
++ /**
++  * bio_split - split a bio
++  * @bio:	bio to split
++  * @sectors:	number of sectors to split from the front of @bio
++  * @gfp:	gfp mask
++  * @bs:		bio set to allocate from
++  *
++  * Allocates and returns a new bio which represents @sectors from the start of
++  * @bio, and updates @bio to represent the remaining sectors.
++  *
++  * The newly allocated bio will point to @bio's bi_io_vec; it is the caller's
++  * responsibility to ensure that @bio is not freed before the split.
++  */
++ struct bio *bio_split(struct bio *bio, int sectors,
++ 		      gfp_t gfp, struct bio_set *bs)
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io):block/bio.c
+  {
+ -	struct bio *split = NULL;
+ +	struct bio_pair *bp = container_of(bi, struct bio_pair, bio1);
+  
+ -	BUG_ON(sectors <= 0);
+ -	BUG_ON(sectors >= bio_sectors(bio));
+ +	if (err)
+ +		bp->error = err;
+  
+ -	split = bio_clone_fast(bio, gfp, bs);
+ -	if (!split)
+ -		return NULL;
+ +	bio_pair_release(bp);
+ +}
+ +
+ +static void bio_pair_end_2(struct bio *bi, int err)
+ +{
+ +	struct bio_pair *bp = container_of(bi, struct bio_pair, bio2);
+ +
+ +	if (err)
+ +		bp->error = err;
+ +
+ +	bio_pair_release(bp);
+ +}
+ +
+ +/*
+ + * split a bio - only worry about a bio with a single page in its iovec
+ + */
+ +struct bio_pair *bio_split(struct bio *bi, int first_sectors)
+ +{
+ +	struct bio_pair *bp = mempool_alloc(bio_split_pool, GFP_NOIO);
+ +
+ +	if (!bp)
+ +		return bp;
+ +
+ +	trace_block_split(bdev_get_queue(bi->bi_bdev), bi,
+ +				bi->bi_sector + first_sectors);
+ +
+ +	BUG_ON(bio_segments(bi) > 1);
+ +	atomic_set(&bp->cnt, 3);
+ +	bp->error = 0;
+ +	bp->bio1 = *bi;
+ +	bp->bio2 = *bi;
+ +	bp->bio2.bi_sector += first_sectors;
+ +	bp->bio2.bi_size -= first_sectors << 9;
+ +	bp->bio1.bi_size = first_sectors << 9;
+ +
+ +	if (bi->bi_vcnt != 0) {
+ +		bp->bv1 = *bio_iovec(bi);
+ +		bp->bv2 = *bio_iovec(bi);
+  
+ -	split->bi_iter.bi_size = sectors << 9;
+ +		if (bio_is_rw(bi)) {
+ +			bp->bv2.bv_offset += first_sectors << 9;
+ +			bp->bv2.bv_len -= first_sectors << 9;
+ +			bp->bv1.bv_len = first_sectors << 9;
+ +		}
+ +
+ +		bp->bio1.bi_io_vec = &bp->bv1;
+ +		bp->bio2.bi_io_vec = &bp->bv2;
+ +
+ +		bp->bio1.bi_max_vecs = 1;
+ +		bp->bio2.bi_max_vecs = 1;
+ +	}
+ +
+ +	bp->bio1.bi_end_io = bio_pair_end_1;
+ +	bp->bio2.bi_end_io = bio_pair_end_2;
+  
+ -	if (bio_integrity(split))
+ -		bio_integrity_trim(split, 0, sectors);
+ +	bp->bio1.bi_private = bi;
+ +	bp->bio2.bi_private = bio_split_pool;
+  
+ -	bio_advance(bio, split->bi_iter.bi_size);
+ +	if (bio_integrity(bi))
+ +		bio_integrity_split(bi, bp, first_sectors);
+  
+ -	return split;
+ +	return bp;
+  }
+  EXPORT_SYMBOL(bio_split);
+  
+diff --cc fs/btrfs/disk-io.c
+index 1b38f2a3eaff,0bccf18dc1dc..000000000000
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@@ -1726,8 -1744,8 +1726,13 @@@ static void end_workqueue_fn(struct btr
+  	error = end_io_wq->error;
+  	bio->bi_private = end_io_wq->private;
+  	bio->bi_end_io = end_io_wq->end_io;
+++<<<<<<< HEAD
+ +	kfree(end_io_wq);
+ +	bio_endio_nodec(bio, error);
+++=======
++ 	kmem_cache_free(btrfs_end_io_wq_cache, end_io_wq);
++ 	bio_endio(bio, error);
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io)
+  }
+  
+  static int cleaner_kthread(void *arg)
+diff --cc fs/btrfs/volumes.c
+index c9e9926028f3,dac77d42a9ab..000000000000
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@@ -5525,6 -5583,15 +5525,18 @@@ int btrfs_rmap_block(struct btrfs_mappi
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void btrfs_end_bbio(struct btrfs_bio *bbio, struct bio *bio, int err)
++ {
++ 	bio->bi_private = bbio->private;
++ 	bio->bi_end_io = bbio->end_io;
++ 	bio_endio(bio, err);
++ 
++ 	btrfs_put_bbio(bbio);
++ }
++ 
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io)
+  static void btrfs_end_bio(struct bio *bio, int err)
+  {
+  	struct btrfs_bio *bbio = bio->bi_private;
+@@@ -5745,12 -5810,13 +5755,18 @@@ static void bbio_error(struct btrfs_bi
+  {
+  	atomic_inc(&bbio->error);
+  	if (atomic_dec_and_test(&bbio->stripes_pending)) {
+++<<<<<<< HEAD
+ +		bio->bi_private = bbio->private;
+ +		bio->bi_end_io = bbio->end_io;
+++=======
++ 		/* Shoud be the original bio. */
++ 		WARN_ON(bio != bbio->orig_bio);
++ 
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io)
+  		btrfs_io_bio(bio)->mirror_num = bbio->mirror_num;
+ -		bio->bi_iter.bi_sector = logical >> 9;
+ -
+ -		btrfs_end_bbio(bbio, bio, -EIO);
+ +		bio->bi_sector = logical >> 9;
+ +		kfree(bbio);
+ +		bio_endio(bio, -EIO);
+  	}
+  }
+  
+diff --cc fs/btrfs/volumes.h
+index 01a483f773cd,cedae0356558..000000000000
+--- a/fs/btrfs/volumes.h
++++ b/fs/btrfs/volumes.h
+@@@ -291,11 -292,11 +291,14 @@@ struct btrfs_bio_stripe 
+  struct btrfs_bio;
+  typedef void (btrfs_bio_end_io_t) (struct btrfs_bio *bio, int err);
+  
+++<<<<<<< HEAD
+ +#define BTRFS_BIO_ORIG_BIO_SUBMITTED	0x1
+ +
+++=======
+++>>>>>>> 326e1dbb5736 (block: remove management of bi_remaining when restoring original bi_end_io)
+  struct btrfs_bio {
+ -	atomic_t refs;
+  	atomic_t stripes_pending;
+  	struct btrfs_fs_info *fs_info;
+ -	u64 map_type; /* get from map_lookup->type */
+  	bio_end_io_t *end_io;
+  	struct bio *orig_bio;
+  	unsigned long flags;
+* Unmerged path drivers/md/dm-raid1.c
+* Unmerged path drivers/md/dm-thin.c
+* Unmerged path drivers/md/dm-verity.c
+diff --git a/fs/bio-integrity.c b/fs/bio-integrity.c
+index 134b06745707..8dccf73025b3 100644
+--- a/fs/bio-integrity.c
++++ b/fs/bio-integrity.c
+@@ -530,7 +530,7 @@ void bio_integrity_endio(struct bio *bio, int error)
+ 	 */
+ 	if (error) {
+ 		bio->bi_end_io = bip->bip_end_io;
+-		bio_endio_nodec(bio, error);
++		bio_endio(bio, error);
+ 
+ 		return;
+ 	}
+* Unmerged path fs/bio.c
+* Unmerged path fs/btrfs/disk-io.c
+* Unmerged path fs/btrfs/volumes.c
+* Unmerged path fs/btrfs/volumes.h
