@@ -1836,7 +1836,10 @@ static int trace__replay(struct trace *trace)
 		{ "raw_syscalls:sys_exit",   trace__sys_exit, },
 		{ "probe:vfs_getname",	     trace__vfs_getname, },
 	};
-
+	struct perf_data_file file = {
+		.path  = input_name,
+		.mode  = PERF_DATA_MODE_READ,
+	};
 	struct perf_session *session;
 	int err = -1;
 
@@ -1859,8 +1862,7 @@ static int trace__replay(struct trace *trace)
 	if (symbol__init() < 0)
 		return -1;
 
-	session = perf_session__new(input_name, O_RDONLY, 0, false,
-				    &trace->tool);
+	session = perf_session__new(&file, false, &trace->tool);
 	if (session == NULL)
 		return -ENOMEM;
 
