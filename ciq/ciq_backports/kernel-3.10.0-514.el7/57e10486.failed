@@ -1,0 +1,355 @@
+mmc: dw_mmc: add quirk for broken data transfer over scheme
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Addy Ke <addy.ke@rock-chips.com>
+commit 57e104864bc4874a36796fd222d8d084dbf90b9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/57e10486.failed
+
+This patch add a new quirk to add a s/w timer to notify the driver
+to terminate current transfer and report a data timeout to the core,
+if DTO interrupt does NOT come within the given time.
+
+dw_mmc call mmc_request_done func to finish transfer depends on
+DTO interrupt. If DTO interrupt does not come in sending data state,
+the current transfer will be blocked.
+
+We got the reply from synopsys:
+There are two counters but both use the same value of [31:8] bits.
+Data timeout counter doesn't wait for stop clock and you should get
+DRTO even when the clock is not stopped.
+Host Starvation timeout counter is triggered with stop clock condition.
+
+This means that host should get DRTO and DTO interrupt.
+
+But this case really exists, when driver reads tuning data from
+card on RK3288-pink2 board. I measured waveforms by oscilloscope
+and found that card clock was always on and data lines were always
+holded high level in sending data state.
+
+There are two possibility that data over interrupt doesn't come in
+reading data state on RK3X SoCs:
+- get command done interrupt, but doesn't get any data-related interrupt.
+- get data error interrupt, but doesn't get data over interrupt.
+
+	Signed-off-by: Addy Ke <addy.ke@rock-chips.com>
+	Signed-off-by: Heiko Stuebner <heiko@sntech.de>
+	Signed-off-by: Jaehoon Chung <jh80.chung@samsung.com>
+(cherry picked from commit 57e104864bc4874a36796fd222d8d084dbf90b9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/dw_mmc-rockchip.c
+#	drivers/mmc/host/dw_mmc.c
+#	include/linux/mmc/dw_mmc.h
+diff --cc drivers/mmc/host/dw_mmc.c
+index bc4f99ee919c,fcbf5524fd31..000000000000
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@@ -1105,14 -1526,68 +1105,28 @@@ static void dw_mci_command_complete(str
+  		/* newer ip versions need a delay between retries */
+  		if (host->quirks & DW_MCI_QUIRK_RETRY_DELAY)
+  			mdelay(20);
+ -	}
+ -
+ -	return cmd->error;
+ -}
+ -
+ -static int dw_mci_data_complete(struct dw_mci *host, struct mmc_data *data)
+ -{
+ -	u32 status = host->data_status;
+  
+ -	if (status & DW_MCI_DATA_ERROR_FLAGS) {
+ -		if (status & SDMMC_INT_DRTO) {
+ -			data->error = -ETIMEDOUT;
+ -		} else if (status & SDMMC_INT_DCRC) {
+ -			data->error = -EILSEQ;
+ -		} else if (status & SDMMC_INT_EBE) {
+ -			if (host->dir_status ==
+ -				DW_MCI_SEND_STATUS) {
+ -				/*
+ -				 * No data CRC status was returned.
+ -				 * The number of bytes transferred
+ -				 * will be exaggerated in PIO mode.
+ -				 */
+ -				data->bytes_xfered = 0;
+ -				data->error = -ETIMEDOUT;
+ -			} else if (host->dir_status ==
+ -					DW_MCI_RECV_STATUS) {
+ -				data->error = -EIO;
+ -			}
+ -		} else {
+ -			/* SDMMC_INT_SBE is included */
+ -			data->error = -EIO;
+ +		if (cmd->data) {
+ +			dw_mci_stop_dma(host);
+ +			host->data = NULL;
+  		}
+ -
+ -		dev_dbg(host->dev, "data error, status 0x%08x\n", status);
+ -
+ -		/*
+ -		 * After an error, there may be data lingering
+ -		 * in the FIFO
+ -		 */
+ -		dw_mci_reset(host);
+ -	} else {
+ -		data->bytes_xfered = data->blocks * data->blksz;
+ -		data->error = 0;
+  	}
+ -
+ -	return data->error;
+  }
+  
++ static void dw_mci_set_drto(struct dw_mci *host)
++ {
++ 	unsigned int drto_clks;
++ 	unsigned int drto_ms;
++ 
++ 	drto_clks = mci_readl(host, TMOUT) >> 8;
++ 	drto_ms = DIV_ROUND_UP(drto_clks, host->bus_hz / 1000);
++ 
++ 	/* add a bit spare time */
++ 	drto_ms += 10;
++ 
++ 	mod_timer(&host->dto_timer, jiffies + msecs_to_jiffies(drto_ms));
++ }
++ 
+  static void dw_mci_tasklet_func(unsigned long priv)
+  {
+  	struct dw_mci *host = (struct dw_mci *)priv;
+@@@ -1169,11 -1665,44 +1183,19 @@@
+  			}
+  
+  			if (!test_and_clear_bit(EVENT_XFER_COMPLETE,
+- 						&host->pending_events))
++ 						&host->pending_events)) {
++ 				/*
++ 				 * If all data-related interrupts don't come
++ 				 * within the given time in reading data state.
++ 				 */
++ 				if ((host->quirks & DW_MCI_QUIRK_BROKEN_DTO) &&
++ 				    (host->dir_status == DW_MCI_RECV_STATUS))
++ 					dw_mci_set_drto(host);
+  				break;
++ 			}
+  
+  			set_bit(EVENT_XFER_COMPLETE, &host->completed_events);
+ -
+ -			/*
+ -			 * Handle an EVENT_DATA_ERROR that might have shown up
+ -			 * before the transfer completed.  This might not have
+ -			 * been caught by the check above because the interrupt
+ -			 * could have gone off between the previous check and
+ -			 * the check for transfer complete.
+ -			 *
+ -			 * Technically this ought not be needed assuming we
+ -			 * get a DATA_COMPLETE eventually (we'll notice the
+ -			 * error and end the request), but it shouldn't hurt.
+ -			 *
+ -			 * This has the advantage of sending the stop command.
+ -			 */
+ -			if (test_and_clear_bit(EVENT_DATA_ERROR,
+ -					       &host->pending_events)) {
+ -				dw_mci_stop_dma(host);
+ -				if (data->stop ||
+ -				    !(host->data_status & (SDMMC_INT_DRTO |
+ -							   SDMMC_INT_EBE)))
+ -					send_stop_abort(host, data);
+ -				state = STATE_DATA_ERROR;
+ -				break;
+ -			}
+  			prev_state = state = STATE_DATA_BUSY;
+ -
+  			/* fall through */
+  
+  		case STATE_DATA_BUSY:
+@@@ -2181,6 -2593,113 +2215,116 @@@ static bool mci_wait_reset(struct devic
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool dw_mci_reset(struct dw_mci *host)
++ {
++ 	u32 flags = SDMMC_CTRL_RESET | SDMMC_CTRL_FIFO_RESET;
++ 	bool ret = false;
++ 
++ 	/*
++ 	 * Reseting generates a block interrupt, hence setting
++ 	 * the scatter-gather pointer to NULL.
++ 	 */
++ 	if (host->sg) {
++ 		sg_miter_stop(&host->sg_miter);
++ 		host->sg = NULL;
++ 	}
++ 
++ 	if (host->use_dma)
++ 		flags |= SDMMC_CTRL_DMA_RESET;
++ 
++ 	if (dw_mci_ctrl_reset(host, flags)) {
++ 		/*
++ 		 * In all cases we clear the RAWINTS register to clear any
++ 		 * interrupts.
++ 		 */
++ 		mci_writel(host, RINTSTS, 0xFFFFFFFF);
++ 
++ 		/* if using dma we wait for dma_req to clear */
++ 		if (host->use_dma) {
++ 			unsigned long timeout = jiffies + msecs_to_jiffies(500);
++ 			u32 status;
++ 
++ 			do {
++ 				status = mci_readl(host, STATUS);
++ 				if (!(status & SDMMC_STATUS_DMA_REQ))
++ 					break;
++ 				cpu_relax();
++ 			} while (time_before(jiffies, timeout));
++ 
++ 			if (status & SDMMC_STATUS_DMA_REQ) {
++ 				dev_err(host->dev,
++ 					"%s: Timeout waiting for dma_req to clear during reset\n",
++ 					__func__);
++ 				goto ciu_out;
++ 			}
++ 
++ 			/* when using DMA next we reset the fifo again */
++ 			if (!dw_mci_ctrl_reset(host, SDMMC_CTRL_FIFO_RESET))
++ 				goto ciu_out;
++ 		}
++ 	} else {
++ 		/* if the controller reset bit did clear, then set clock regs */
++ 		if (!(mci_readl(host, CTRL) & SDMMC_CTRL_RESET)) {
++ 			dev_err(host->dev,
++ 				"%s: fifo/dma reset bits didn't clear but ciu was reset, doing clock update\n",
++ 				__func__);
++ 			goto ciu_out;
++ 		}
++ 	}
++ 
++ #if IS_ENABLED(CONFIG_MMC_DW_IDMAC)
++ 	/* It is also recommended that we reset and reprogram idmac */
++ 	dw_mci_idmac_reset(host);
++ #endif
++ 
++ 	ret = true;
++ 
++ ciu_out:
++ 	/* After a CTRL reset we need to have CIU set clock registers  */
++ 	mci_send_cmd(host->cur_slot, SDMMC_CMD_UPD_CLK, 0);
++ 
++ 	return ret;
++ }
++ 
++ static void dw_mci_cmd11_timer(unsigned long arg)
++ {
++ 	struct dw_mci *host = (struct dw_mci *)arg;
++ 
++ 	if (host->state != STATE_SENDING_CMD11) {
++ 		dev_warn(host->dev, "Unexpected CMD11 timeout\n");
++ 		return;
++ 	}
++ 
++ 	host->cmd_status = SDMMC_INT_RTO;
++ 	set_bit(EVENT_CMD_COMPLETE, &host->pending_events);
++ 	tasklet_schedule(&host->tasklet);
++ }
++ 
++ static void dw_mci_dto_timer(unsigned long arg)
++ {
++ 	struct dw_mci *host = (struct dw_mci *)arg;
++ 
++ 	switch (host->state) {
++ 	case STATE_SENDING_DATA:
++ 	case STATE_DATA_BUSY:
++ 		/*
++ 		 * If DTO interrupt does NOT come in sending data state,
++ 		 * we should notify the driver to terminate current transfer
++ 		 * and report a data timeout to the core.
++ 		 */
++ 		host->data_status = SDMMC_INT_DRTO;
++ 		set_bit(EVENT_DATA_ERROR, &host->pending_events);
++ 		set_bit(EVENT_DATA_COMPLETE, &host->pending_events);
++ 		tasklet_schedule(&host->tasklet);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> 57e104864bc4 (mmc: dw_mmc: add quirk for broken data transfer over scheme)
+  #ifdef CONFIG_OF
+  static struct dw_mci_of_quirks {
+  	char *quirk;
+@@@ -2346,7 -2878,12 +2490,11 @@@ int dw_mci_probe(struct dw_mci *host
+  
+  	host->quirks = host->pdata->quirks;
+  
++ 	if (host->quirks & DW_MCI_QUIRK_BROKEN_DTO)
++ 		setup_timer(&host->dto_timer,
++ 			    dw_mci_dto_timer, (unsigned long)host);
++ 
+  	spin_lock_init(&host->lock);
+ -	spin_lock_init(&host->irq_lock);
+  	INIT_LIST_HEAD(&host->queue);
+  
+  	/*
+diff --cc include/linux/mmc/dw_mmc.h
+index a2d9a022a8fd,134c57422740..000000000000
+--- a/include/linux/mmc/dw_mmc.h
++++ b/include/linux/mmc/dw_mmc.h
+@@@ -93,6 -97,8 +93,11 @@@ struct mmc_data
+   * @quirks: Set of quirks that apply to specific versions of the IP.
+   * @irq_flags: The flags to be passed to request_irq.
+   * @irq: The irq value to be passed to request_irq.
+++<<<<<<< HEAD
+++=======
++  * @sdio_id0: Number of slot0 in the SDIO interrupt registers.
++  * @dto_timer: Timer for broken data transfer over scheme.
+++>>>>>>> 57e104864bc4 (mmc: dw_mmc: add quirk for broken data transfer over scheme)
+   *
+   * Locking
+   * =======
+@@@ -186,9 -194,14 +191,17 @@@ struct dw_mci 
+  	/* Workaround flags */
+  	u32			quirks;
+  
+ -	bool			vqmmc_enabled;
+ +	struct regulator	*vmmc;	/* Power regulator */
+  	unsigned long		irq_flags; /* IRQ flags */
+  	int			irq;
+++<<<<<<< HEAD
+++=======
++ 
++ 	int			sdio_id0;
++ 
++ 	struct timer_list       cmd11_timer;
++ 	struct timer_list       dto_timer;
+++>>>>>>> 57e104864bc4 (mmc: dw_mmc: add quirk for broken data transfer over scheme)
+  };
+  
+  /* DMA ops for Internal/External DMAC interface */
+@@@ -211,12 -224,8 +224,17 @@@ struct dw_mci_dma_ops 
+  #define DW_MCI_QUIRK_HIGHSPEED			BIT(2)
+  /* Unreliable card detection */
+  #define DW_MCI_QUIRK_BROKEN_CARD_DETECTION	BIT(3)
+++<<<<<<< HEAD
+ +/* No write protect */
+ +#define DW_MCI_QUIRK_NO_WRITE_PROTECT		BIT(4)
+ +
+ +/* Slot level quirks */
+ +/* This slot has no write protect */
+ +#define DW_MCI_SLOT_QUIRK_NO_WRITE_PROTECT	BIT(0)
+++=======
++ /* Timer for broken data transfer over scheme */
++ #define DW_MCI_QUIRK_BROKEN_DTO			BIT(4)
+++>>>>>>> 57e104864bc4 (mmc: dw_mmc: add quirk for broken data transfer over scheme)
+  
+  struct dma_pdata;
+  
+* Unmerged path drivers/mmc/host/dw_mmc-rockchip.c
+* Unmerged path drivers/mmc/host/dw_mmc-rockchip.c
+* Unmerged path drivers/mmc/host/dw_mmc.c
+* Unmerged path include/linux/mmc/dw_mmc.h
