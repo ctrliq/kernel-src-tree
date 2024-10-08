@@ -1,0 +1,125 @@
+PCI: pciehp: Remove assumptions about which commands cause completion events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [pci] pciehp: Remove assumptions about which commands cause completion events (Myron Stowe) [1223472]
+Rebuild_FUZZ: 96.60%
+commit-author Bjorn Helgaas <bhelgaas@google.com>
+commit 2cc56f3028091578dcf0093cd00f1fee7a21515d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2cc56f30.failed
+
+We use incorrect logic to decide whether a PCIe hotplug controller
+generates command completion events.
+
+5808639bfa98 ("pciehp: fix slow probing") assumed that the Slot Status
+"Command Completed" bit was set only for commands affecting slot power,
+indicators, or electromechanical interlock.  That assumption is false: per
+sec. 6.7.3.2 of PCIe spec r3.0, a write targeting any portion of the Slot
+Control register is a command, and (if command completed events are
+supported) software must wait for a command to complete before issuing the
+next command.
+
+5808639bfa98 was to fix boot-time timeouts (see bugzilla below) on a Lenovo
+Thinkpad R61 with an Intel hotplug controller.  The controller probably has
+the Intel CF118 erratum, which means it doesn't report Command Completed
+unless the Slot Control power, indicator, or interlock bits are changed.
+This causes a timeout because pciehp always waits for Command Complete (if
+supported), regardless of which bits are changed.
+
+Remove the incorrect logic because the timeouts have been addressed
+differently by these changes:
+
+  PCI: pciehp: Wait for hotplug command completion lazily
+  PCI: pciehp: Compute timeout from hotplug command start time
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=10751
+	Tested-by: Rajat Jain <rajatxjain@gmail.com>	(IDT 807a controller)
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Acked-by: Yinghai Lu <yinghai@kernel.org>
+(cherry picked from commit 2cc56f3028091578dcf0093cd00f1fee7a21515d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/pciehp_hpc.c
+diff --cc drivers/pci/hotplug/pciehp_hpc.c
+index f253bb808636,a3a5c65def1c..000000000000
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@@ -157,31 -189,8 +156,36 @@@ static void pcie_write_cmd(struct contr
+  
+  	mutex_lock(&ctrl->ctrl_lock);
+  
+++<<<<<<< HEAD
+ +	pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
+ +	if (slot_status & PCI_EXP_SLTSTA_CC) {
+ +		pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
+ +					   PCI_EXP_SLTSTA_CC);
+ +		if (!ctrl->no_cmd_complete) {
+ +			/*
+ +			 * After 1 sec and CMD_COMPLETED still not set, just
+ +			 * proceed forward to issue the next command according
+ +			 * to spec. Just print out the error message.
+ +			 */
+ +			ctrl_dbg(ctrl, "CMD_COMPLETED not clear after 1 sec\n");
+ +		} else if (!NO_CMD_CMPL(ctrl)) {
+ +			/*
+ +			 * This controller seems to notify of command completed
+ +			 * event even though it supports none of power
+ +			 * controller, attention led, power led and EMI.
+ +			 */
+ +			ctrl_dbg(ctrl, "Unexpected CMD_COMPLETED. Need to "
+ +				 "wait for command completed event.\n");
+ +			ctrl->no_cmd_complete = 0;
+ +		} else {
+ +			ctrl_dbg(ctrl, "Unexpected CMD_COMPLETED. Maybe "
+ +				 "the controller is broken.\n");
+ +		}
+ +	}
+++=======
++ 	/* Wait for any previous command that might still be in progress */
++ 	pcie_wait_cmd(ctrl);
+++>>>>>>> 2cc56f302809 (PCI: pciehp: Remove assumptions about which commands cause completion events)
+  
+  	pcie_capability_read_word(pdev, PCI_EXP_SLTCTL, &slot_ctrl);
+  	slot_ctrl &= ~mask;
+@@@ -777,22 -771,22 +781,28 @@@ struct controller *pcie_init(struct pci
+  	mutex_init(&ctrl->ctrl_lock);
+  	init_waitqueue_head(&ctrl->queue);
+  	dbg_ctrl(ctrl);
++ 
+  	/*
+  	 * Controller doesn't notify of command completion if the "No
+- 	 * Command Completed Support" bit is set in Slot Capability
+- 	 * register or the controller supports none of power
+- 	 * controller, attention led, power led and EMI.
++ 	 * Command Completed Support" bit is set in Slot Capabilities.
++ 	 * If set, it means the controller can accept hotplug commands
++ 	 * with no delay between them.
+  	 */
+++<<<<<<< HEAD
+ +	if (NO_CMD_CMPL(ctrl) ||
+ +	    !(POWER_CTRL(ctrl) | ATTN_LED(ctrl) | PWR_LED(ctrl) | EMI(ctrl)))
+ +	    ctrl->no_cmd_complete = 1;
+++=======
++ 	if (NO_CMD_CMPL(ctrl))
++ 		ctrl->no_cmd_complete = 1;
+++>>>>>>> 2cc56f302809 (PCI: pciehp: Remove assumptions about which commands cause completion events)
+  
+ -	/* Check if Data Link Layer Link Active Reporting is implemented */
+ -	pcie_capability_read_dword(pdev, PCI_EXP_LNKCAP, &link_cap);
+ -	if (link_cap & PCI_EXP_LNKCAP_DLLLARC) {
+ -		ctrl_dbg(ctrl, "Link Active Reporting supported\n");
+ -		ctrl->link_active_reporting = 1;
+ -	}
+ +        /* Check if Data Link Layer Link Active Reporting is implemented */
+ +        pcie_capability_read_dword(pdev, PCI_EXP_LNKCAP, &link_cap);
+ +        if (link_cap & PCI_EXP_LNKCAP_DLLLARC) {
+ +                ctrl_dbg(ctrl, "Link Active Reporting supported\n");
+ +                ctrl->link_active_reporting = 1;
+ +        }
+  
+  	/* Clear all remaining event bits in Slot Status register */
+  	pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
+* Unmerged path drivers/pci/hotplug/pciehp_hpc.c
