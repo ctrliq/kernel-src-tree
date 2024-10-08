@@ -7132,7 +7132,7 @@ static unsigned int mdstat_poll(struct file *filp, poll_table *wait)
 	int mask;
 
 	if (md_unloading)
-		return POLLIN|POLLRDNORM|POLLERR|POLLPRI;;
+		return POLLIN|POLLRDNORM|POLLERR|POLLPRI;
 	poll_wait(filp, &md_event_waiters, wait);
 
 	/* always allow read */
