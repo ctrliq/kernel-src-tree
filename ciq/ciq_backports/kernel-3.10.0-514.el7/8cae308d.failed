@@ -1,0 +1,138 @@
+netfilter: bridge: re-order br_nf_pre_routing_finish_ipv6()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bernhard Thaler <bernhard.thaler@wvnet.at>
+commit 8cae308d2bc81f95c320e7a345b92be6c238f510
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8cae308d.failed
+
+Put br_nf_pre_routing_finish_ipv6() after daddr_was_changed() and
+br_nf_pre_routing_finish_bridge() to prepare calling these functions
+from there.
+
+	Signed-off-by: Bernhard Thaler <bernhard.thaler@wvnet.at>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 8cae308d2bc81f95c320e7a345b92be6c238f510)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netfilter.c
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,6cb642c43451..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -297,35 -264,18 +297,50 @@@ drop
+  	return -1;
+  }
+  
+++<<<<<<< HEAD
+ +/* PF_BRIDGE/PRE_ROUTING *********************************************/
+ +/* Undo the changes made for ip6tables PREROUTING and continue the
+ + * bridge PRE_ROUTING hook. */
+ +static int br_nf_pre_routing_finish_ipv6(struct sock *sk, struct sk_buff *skb)
+ +{
+ +	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+ +	struct rtable *rt;
+ +
+ +	if (nf_bridge->mask & BRNF_PKT_TYPE) {
+ +		skb->pkt_type = PACKET_OTHERHOST;
+ +		nf_bridge->mask ^= BRNF_PKT_TYPE;
+ +	}
+ +	nf_bridge->mask ^= BRNF_NF_BRIDGE_PREROUTING;
+ +
+ +	rt = bridge_parent_rtable(nf_bridge->physindev);
+ +	if (!rt) {
+ +		kfree_skb(skb);
+ +		return 0;
+ +	}
+ +	skb_dst_set_noref(skb, &rt->dst);
+ +
+ +	skb->dev = nf_bridge->physindev;
+ +	nf_bridge_update_protocol(skb);
+ +	nf_bridge_push_encap_header(skb);
+ +	NF_HOOK_THRESH(NFPROTO_BRIDGE, NF_BR_PRE_ROUTING, sk, skb,
+ +		       skb->dev, NULL,
+ +		       br_handle_frame_finish, 1);
+ +
+ +	return 0;
+++=======
++ static void nf_bridge_update_protocol(struct sk_buff *skb)
++ {
++ 	switch (skb->nf_bridge->orig_proto) {
++ 	case BRNF_PROTO_8021Q:
++ 		skb->protocol = htons(ETH_P_8021Q);
++ 		break;
++ 	case BRNF_PROTO_PPPOE:
++ 		skb->protocol = htons(ETH_P_PPP_SES);
++ 		break;
++ 	case BRNF_PROTO_UNCHANGED:
++ 		break;
++ 	}
+++>>>>>>> 8cae308d2bc8 (netfilter: bridge: re-order br_nf_pre_routing_finish_ipv6())
+  }
+  
+  /* Obtain the correct destination MAC address, while preserving the original
+@@@ -372,24 -323,47 +387,56 @@@ free_skb
+  	return 0;
+  }
+  
+ -static bool daddr_was_changed(const struct sk_buff *skb,
+ -			      const struct nf_bridge_info *nf_bridge)
+ +static bool dnat_took_place(const struct sk_buff *skb)
+  {
+ -	return ip_hdr(skb)->daddr != nf_bridge->ipv4_daddr;
+ +#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ +	enum ip_conntrack_info ctinfo;
+ +	struct nf_conn *ct;
+ +
+ +	ct = nf_ct_get(skb, &ctinfo);
+ +	if (!ct || nf_ct_is_untracked(ct))
+ +		return false;
+ +
+ +	return test_bit(IPS_DST_NAT_BIT, &ct->status);
+ +#else
+ +	return false;
+ +#endif
+  }
+  
++ /* PF_BRIDGE/PRE_ROUTING *********************************************/
++ /* Undo the changes made for ip6tables PREROUTING and continue the
++  * bridge PRE_ROUTING hook.
++  */
++ static int br_nf_pre_routing_finish_ipv6(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
++ 	struct rtable *rt;
++ 
++ 	if (nf_bridge->pkt_otherhost) {
++ 		skb->pkt_type = PACKET_OTHERHOST;
++ 		nf_bridge->pkt_otherhost = false;
++ 	}
++ 	nf_bridge->mask &= ~BRNF_NF_BRIDGE_PREROUTING;
++ 
++ 	rt = bridge_parent_rtable(nf_bridge->physindev);
++ 	if (!rt) {
++ 		kfree_skb(skb);
++ 		return 0;
++ 	}
++ 	skb_dst_set_noref(skb, &rt->dst);
++ 
++ 	skb->dev = nf_bridge->physindev;
++ 	nf_bridge_update_protocol(skb);
++ 	nf_bridge_push_encap_header(skb);
++ 	NF_HOOK_THRESH(NFPROTO_BRIDGE, NF_BR_PRE_ROUTING, sk, skb,
++ 		       skb->dev, NULL,
++ 		       br_handle_frame_finish, 1);
++ 
++ 	return 0;
++ }
++ 
+  /* This requires some explaining. If DNAT has taken place,
+   * we will need to fix up the destination Ethernet address.
+ - * This is also true when SNAT takes place (for the reply direction).
+   *
+   * There are two cases to consider:
+   * 1. The packet was DNAT'ed to a device in the same bridge
+* Unmerged path net/bridge/br_netfilter.c
