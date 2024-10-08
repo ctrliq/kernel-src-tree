@@ -1,0 +1,94 @@
+bgmac: leave interrupts disabled as long as there is work to do
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Felix Fietkau <nbd@openwrt.org>
+commit eb64e2923a886441c7b322f138b36029f3fa6a36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/eb64e292.failed
+
+Always poll rx and tx during NAPI poll instead of relying on the status
+of the first interrupt. This prevents bgmac_poll from leaving unfinished
+work around until the next IRQ.
+In my tests this makes bridging/routing throughput under heavy load more
+stable and ensures that no new IRQs arrive as long as bgmac_poll uses up
+the entire budget.
+
+	Signed-off-by: Felix Fietkau <nbd@openwrt.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eb64e2923a886441c7b322f138b36029f3fa6a36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bgmac.c
+diff --cc drivers/net/ethernet/broadcom/bgmac.c
+index 1c6bc9678774,9c3b2ff33e63..000000000000
+--- a/drivers/net/ethernet/broadcom/bgmac.c
++++ b/drivers/net/ethernet/broadcom/bgmac.c
+@@@ -970,7 -1108,7 +970,11 @@@ static void bgmac_chip_reset(struct bgm
+  	bgmac_miiconfig(bgmac);
+  	bgmac_phy_init(bgmac);
+  
+++<<<<<<< HEAD
+ +	bgmac->int_status = 0;
+++=======
++ 	netdev_reset_queue(bgmac->net_dev);
+++>>>>>>> eb64e2923a88 (bgmac: leave interrupts disabled as long as there is work to do)
+  }
+  
+  static void bgmac_chip_intrs_on(struct bgmac *bgmac)
+@@@ -1104,30 -1238,22 +1107,22 @@@ static irqreturn_t bgmac_interrupt(int 
+  static int bgmac_poll(struct napi_struct *napi, int weight)
+  {
+  	struct bgmac *bgmac = container_of(napi, struct bgmac, napi);
+- 	struct bgmac_dma_ring *ring;
+  	int handled = 0;
+  
+- 	if (bgmac->int_status & BGMAC_IS_TX0) {
+- 		ring = &bgmac->tx_ring[0];
+- 		bgmac_dma_tx_free(bgmac, ring);
+- 		bgmac->int_status &= ~BGMAC_IS_TX0;
+- 	}
++ 	/* Ack */
++ 	bgmac_write(bgmac, BGMAC_INT_STATUS, ~0);
+  
+- 	if (bgmac->int_status & BGMAC_IS_RX) {
+- 		ring = &bgmac->rx_ring[0];
+- 		handled += bgmac_dma_rx_read(bgmac, ring, weight);
+- 		bgmac->int_status &= ~BGMAC_IS_RX;
+- 	}
++ 	bgmac_dma_tx_free(bgmac, &bgmac->tx_ring[0]);
++ 	handled += bgmac_dma_rx_read(bgmac, &bgmac->rx_ring[0], weight);
+  
+- 	if (bgmac->int_status) {
+- 		bgmac_err(bgmac, "Unknown IRQs: 0x%08X\n", bgmac->int_status);
+- 		bgmac->int_status = 0;
+- 	}
++ 	/* Poll again if more events arrived in the meantime */
++ 	if (bgmac_read(bgmac, BGMAC_INT_STATUS) & (BGMAC_IS_TX0 | BGMAC_IS_RX))
++ 		return handled;
+  
+ -	if (handled < weight) {
+ +	if (handled < weight)
+  		napi_complete(napi);
+ -		bgmac_chip_intrs_on(bgmac);
+ -	}
+ +
+ +	bgmac_chip_intrs_on(bgmac);
+  
+  	return handled;
+  }
+* Unmerged path drivers/net/ethernet/broadcom/bgmac.c
+diff --git a/drivers/net/ethernet/broadcom/bgmac.h b/drivers/net/ethernet/broadcom/bgmac.h
+index 12a35cf9bb81..842bb24be0d7 100644
+--- a/drivers/net/ethernet/broadcom/bgmac.h
++++ b/drivers/net/ethernet/broadcom/bgmac.h
+@@ -412,7 +412,6 @@ struct bgmac {
+ 
+ 	/* Int */
+ 	u32 int_mask;
+-	u32 int_status;
+ 
+ 	/* Speed-related */
+ 	int speed;
