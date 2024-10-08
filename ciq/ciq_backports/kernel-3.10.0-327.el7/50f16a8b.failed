@@ -1,0 +1,255 @@
+perf: Remove type specific target pointers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] Remove type specific target pointers (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 92.31%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 50f16a8bf9d7a92c437ed1867d0f7e1dc6a9aca9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/50f16a8b.failed
+
+The only reason CQM had to use a hard-coded pmu type was so it could use
+cqm_target in hw_perf_event.
+
+Do away with the {tp,bp,cqm}_target pointers and provide a non type
+specific one.
+
+This allows us to do away with that silly pmu type as well.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Vince Weaver <vince@deater.net>
+	Cc: acme@kernel.org
+	Cc: acme@redhat.com
+	Cc: hpa@zytor.com
+	Cc: jolsa@redhat.com
+	Cc: kanaka.d.juvva@intel.com
+	Cc: matt.fleming@intel.com
+	Cc: tglx@linutronix.de
+	Cc: torvalds@linux-foundation.org
+	Cc: vikas.shivappa@linux.intel.com
+Link: http://lkml.kernel.org/r/20150305211019.GU21418@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 50f16a8bf9d7a92c437ed1867d0f7e1dc6a9aca9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_uprobe.c
+diff --cc kernel/trace/trace_uprobe.c
+index 6fd72b768522,93fdc7791eaa..000000000000
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@@ -758,15 -1015,38 +758,40 @@@ __uprobe_perf_filter(struct trace_uprob
+  static inline bool
+  uprobe_filter_event(struct trace_uprobe *tu, struct perf_event *event)
+  {
+- 	return __uprobe_perf_filter(&tu->filter, event->hw.tp_target->mm);
++ 	return __uprobe_perf_filter(&tu->filter, event->hw.target->mm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int uprobe_perf_close(struct trace_uprobe *tu, struct perf_event *event)
++ {
++ 	bool done;
++ 
++ 	write_lock(&tu->filter.rwlock);
++ 	if (event->hw.target) {
++ 		list_del(&event->hw.tp_list);
++ 		done = tu->filter.nr_systemwide ||
++ 			(event->hw.target->flags & PF_EXITING) ||
++ 			uprobe_filter_event(tu, event);
++ 	} else {
++ 		tu->filter.nr_systemwide--;
++ 		done = tu->filter.nr_systemwide;
++ 	}
++ 	write_unlock(&tu->filter.rwlock);
++ 
++ 	if (!done)
++ 		return uprobe_apply(tu->inode, tu->offset, &tu->consumer, false);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 50f16a8bf9d7 (perf: Remove type specific target pointers)
+  static int uprobe_perf_open(struct trace_uprobe *tu, struct perf_event *event)
+  {
+  	bool done;
+ -	int err;
+  
+  	write_lock(&tu->filter.rwlock);
+- 	if (event->hw.tp_target) {
++ 	if (event->hw.target) {
+  		/*
+  		 * event->parent != NULL means copy_process(), we can avoid
+  		 * uprobe_apply(). current->mm must be probed and we can rely
+diff --git a/arch/arm/kernel/hw_breakpoint.c b/arch/arm/kernel/hw_breakpoint.c
+index 1fd749ee4a1b..55dcc651eaa3 100644
+--- a/arch/arm/kernel/hw_breakpoint.c
++++ b/arch/arm/kernel/hw_breakpoint.c
+@@ -647,7 +647,7 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 		 * Per-cpu breakpoints are not supported by our stepping
+ 		 * mechanism.
+ 		 */
+-		if (!bp->hw.bp_target)
++		if (!bp->hw.target)
+ 			return -EINVAL;
+ 
+ 		/*
+diff --git a/arch/arm64/kernel/hw_breakpoint.c b/arch/arm64/kernel/hw_breakpoint.c
+index 5ab825c59db9..7c7143d7890a 100644
+--- a/arch/arm64/kernel/hw_breakpoint.c
++++ b/arch/arm64/kernel/hw_breakpoint.c
+@@ -486,7 +486,7 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 	 * Disallow per-task kernel breakpoints since these would
+ 	 * complicate the stepping code.
+ 	 */
+-	if (info->ctrl.privilege == AARCH64_BREAKPOINT_EL1 && bp->hw.bp_target)
++	if (info->ctrl.privilege == AARCH64_BREAKPOINT_EL1 && bp->hw.target)
+ 		return -EINVAL;
+ 
+ 	return 0;
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_cqm.c b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+index a032cfdae031..3bf8b92fed28 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_cqm.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+@@ -121,7 +121,7 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
+ 	/*
+ 	 * Events that target same task are placed into the same cache group.
+ 	 */
+-	if (a->hw.cqm_target == b->hw.cqm_target)
++	if (a->hw.target == b->hw.target)
+ 		return true;
+ 
+ 	/*
+@@ -137,7 +137,7 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
+ static inline struct perf_cgroup *event_to_cgroup(struct perf_event *event)
+ {
+ 	if (event->attach_state & PERF_ATTACH_TASK)
+-		return perf_cgroup_from_task(event->hw.cqm_target);
++		return perf_cgroup_from_task(event->hw.target);
+ 
+ 	return event->cgrp;
+ }
+@@ -668,8 +668,7 @@ static int __init intel_cqm_init(void)
+ 
+ 	__perf_cpu_notifier(intel_cqm_cpu_notifier);
+ 
+-	ret = perf_pmu_register(&intel_cqm_pmu, "intel_cqm",
+-				PERF_TYPE_INTEL_CQM);
++	ret = perf_pmu_register(&intel_cqm_pmu, "intel_cqm", -1);
+ 	if (ret)
+ 		pr_err("Intel CQM perf registration failed: %d\n", ret);
+ 	else
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index ed6275e910ce..ead04f51980b 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -149,7 +149,6 @@ struct hw_perf_event {
+ 			struct hrtimer	hrtimer;
+ 		};
+ 		struct { /* tracepoint */
+-			struct task_struct	*tp_target;
+ 			/* for tp_event->class */
+ 			struct list_head	tp_list;
+ 		};
+@@ -159,7 +158,6 @@ struct hw_perf_event {
+ 			struct list_head	cqm_events_entry;
+ 			struct list_head	cqm_groups_entry;
+ 			struct list_head	cqm_group_entry;
+-			struct task_struct	*cqm_target;
+ 		};
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+ 		struct { /* breakpoint */
+@@ -168,12 +166,12 @@ struct hw_perf_event {
+ 			 * problem hw_breakpoint has with context
+ 			 * creation and event initalization.
+ 			 */
+-			struct task_struct		*bp_target;
+ 			struct arch_hw_breakpoint	info;
+ 			struct list_head		bp_list;
+ 		};
+ #endif
+ 	};
++	struct task_struct		*target;
+ 	int				state;
+ 	local64_t			prev_count;
+ 	u64				sample_period;
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index 8d116ea25d7d..311244f5e36d 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -32,7 +32,6 @@ enum perf_type_id {
+ 	PERF_TYPE_HW_CACHE			= 3,
+ 	PERF_TYPE_RAW				= 4,
+ 	PERF_TYPE_BREAKPOINT			= 5,
+-	PERF_TYPE_INTEL_CQM			= 6,
+ 
+ 	PERF_TYPE_MAX,				/* non-ABI */
+ };
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index c61e717d7f19..28f71e2d0752 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7198,18 +7198,12 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
+ 
+ 	if (task) {
+ 		event->attach_state = PERF_ATTACH_TASK;
+-
+-		if (attr->type == PERF_TYPE_TRACEPOINT)
+-			event->hw.tp_target = task;
+-#ifdef CONFIG_HAVE_HW_BREAKPOINT
+ 		/*
+-		 * hw_breakpoint is a bit difficult here..
++		 * XXX pmu::event_init needs to know what task to account to
++		 * and we cannot use the ctx information because we need the
++		 * pmu before we get a ctx.
+ 		 */
+-		else if (attr->type == PERF_TYPE_BREAKPOINT)
+-			event->hw.bp_target = task;
+-#endif
+-		else if (attr->type == PERF_TYPE_INTEL_CQM)
+-			event->hw.cqm_target = task;
++		event->hw.target = task;
+ 	}
+ 
+ 	if (!overflow_handler && parent_event) {
+diff --git a/kernel/events/hw_breakpoint.c b/kernel/events/hw_breakpoint.c
+index 1559fb0b9296..7255bfd7a6ff 100644
+--- a/kernel/events/hw_breakpoint.c
++++ b/kernel/events/hw_breakpoint.c
+@@ -116,12 +116,12 @@ static unsigned int max_task_bp_pinned(int cpu, enum bp_type_idx type)
+  */
+ static int task_bp_pinned(int cpu, struct perf_event *bp, enum bp_type_idx type)
+ {
+-	struct task_struct *tsk = bp->hw.bp_target;
++	struct task_struct *tsk = bp->hw.target;
+ 	struct perf_event *iter;
+ 	int count = 0;
+ 
+ 	list_for_each_entry(iter, &bp_task_head, hw.bp_list) {
+-		if (iter->hw.bp_target == tsk &&
++		if (iter->hw.target == tsk &&
+ 		    find_slot_idx(iter) == type &&
+ 		    (iter->cpu < 0 || cpu == iter->cpu))
+ 			count += hw_breakpoint_weight(iter);
+@@ -153,7 +153,7 @@ fetch_bp_busy_slots(struct bp_busy_slots *slots, struct perf_event *bp,
+ 		int nr;
+ 
+ 		nr = info->cpu_pinned;
+-		if (!bp->hw.bp_target)
++		if (!bp->hw.target)
+ 			nr += max_task_bp_pinned(cpu, type);
+ 		else
+ 			nr += task_bp_pinned(cpu, bp, type);
+@@ -210,7 +210,7 @@ toggle_bp_slot(struct perf_event *bp, bool enable, enum bp_type_idx type,
+ 		weight = -weight;
+ 
+ 	/* Pinned counter cpu profiling */
+-	if (!bp->hw.bp_target) {
++	if (!bp->hw.target) {
+ 		get_bp_info(bp->cpu, type)->cpu_pinned += weight;
+ 		return;
+ 	}
+* Unmerged path kernel/trace/trace_uprobe.c
