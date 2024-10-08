@@ -1,0 +1,283 @@
+fs/proc: use a rb tree for the directory entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] proc: use a rb tree for the directory entries (Carlos Maiolino) [1210350]
+Rebuild_FUZZ: 96.77%
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 710585d4922fd315f2cada8fbe550ae8ed23e994
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/710585d4.failed
+
+When a lot of netdevices are created, one of the bottleneck is the
+creation of proc entries.  This serie aims to accelerate this part.
+
+The current implementation for the directories in /proc is using a single
+linked list.  This is slow when handling directories with large numbers of
+entries (eg netdevice-related entries when lots of tunnels are opened).
+
+This patch replaces this linked list by a red-black tree.
+
+Here are some numbers:
+
+dummy30000.batch contains 30 000 times 'link add type dummy'.
+
+Before the patch:
+  $ time ip -b dummy30000.batch
+  real    2m31.950s
+  user    0m0.440s
+  sys     2m21.440s
+  $ time rmmod dummy
+  real    1m35.764s
+  user    0m0.000s
+  sys     1m24.088s
+
+After the patch:
+  $ time ip -b dummy30000.batch
+  real    2m0.874s
+  user    0m0.448s
+  sys     1m49.720s
+  $ time rmmod dummy
+  real    1m13.988s
+  user    0m0.000s
+  sys     1m1.008s
+
+The idea of improving this part was suggested by Thierry Herbelot.
+
+[akpm@linux-foundation.org: initialise proc_root.subdir at compile time]
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Acked-by: David S. Miller <davem@davemloft.net>
+	Cc: Thierry Herbelot <thierry.herbelot@6wind.com>.
+	Acked-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 710585d4922fd315f2cada8fbe550ae8ed23e994)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/generic.c
+diff --cc fs/proc/generic.c
+index a2596afffae6,9f8fa1e5e8aa..000000000000
+--- a/fs/proc/generic.c
++++ b/fs/proc/generic.c
+@@@ -200,19 -252,16 +269,32 @@@ struct dentry *proc_lookup_de(struct pr
+  	struct inode *inode;
+  
+  	spin_lock(&proc_subdir_lock);
+++<<<<<<< HEAD
+ +	for (de = de->subdir; de ; de = de->next) {
+ +		if (de->namelen != dentry->d_name.len)
+ +			continue;
+ +		if (!memcmp(dentry->d_name.name, de->name, de->namelen)) {
+ +			pde_get(de);
+ +			spin_unlock(&proc_subdir_lock);
+ +			inode = proc_get_inode(dir->i_sb, de);
+ +			if (!inode)
+ +				return ERR_PTR(-ENOMEM);
+ +			d_set_d_op(dentry, &proc_dentry_operations);
+ +			d_add(dentry, inode);
+ +			return NULL;
+ +		}
+++=======
++ 	de = pde_subdir_find(de, dentry->d_name.name, dentry->d_name.len);
++ 	if (de) {
++ 		pde_get(de);
++ 		spin_unlock(&proc_subdir_lock);
++ 		inode = proc_get_inode(dir->i_sb, de);
++ 		if (!inode)
++ 			return ERR_PTR(-ENOMEM);
++ 		d_set_d_op(dentry, &simple_dentry_operations);
++ 		d_add(dentry, inode);
++ 		return NULL;
+++>>>>>>> 710585d4922f (fs/proc: use a rb tree for the directory entries)
+  	}
+  	spin_unlock(&proc_subdir_lock);
+  	return ERR_PTR(-ENOENT);
+@@@ -233,76 -282,52 +315,110 @@@ struct dentry *proc_lookup(struct inod
+   * value of the readdir() call, as long as it's non-negative
+   * for success..
+   */
+ -int proc_readdir_de(struct proc_dir_entry *de, struct file *file,
+ -		    struct dir_context *ctx)
+ +int proc_readdir_de(struct proc_dir_entry *de, struct file *filp, void *dirent,
+ +		filldir_t filldir)
+  {
+ +	unsigned int ino;
+  	int i;
+ +	struct inode *inode = file_inode(filp);
+ +	int ret = 0;
+ +
+ +	ino = inode->i_ino;
+ +	i = filp->f_pos;
+ +	switch (i) {
+ +		case 0:
+ +			if (filldir(dirent, ".", 1, i, ino, DT_DIR) < 0)
+ +				goto out;
+ +			i++;
+ +			filp->f_pos++;
+ +			/* fall through */
+ +		case 1:
+ +			if (filldir(dirent, "..", 2, i,
+ +				    parent_ino(filp->f_path.dentry),
+ +				    DT_DIR) < 0)
+ +				goto out;
+ +			i++;
+ +			filp->f_pos++;
+ +			/* fall through */
+ +		default:
+ +			spin_lock(&proc_subdir_lock);
+ +			de = de->subdir;
+ +			i -= 2;
+ +			for (;;) {
+ +				if (!de) {
+ +					ret = 1;
+ +					spin_unlock(&proc_subdir_lock);
+ +					goto out;
+ +				}
+ +				if (!i)
+ +					break;
+ +				de = de->next;
+ +				i--;
+ +			}
+  
+ -	if (!dir_emit_dots(file, ctx))
+ -		return 0;
+ -
+++<<<<<<< HEAD
+ +			do {
+ +				struct proc_dir_entry *next;
+ +
+ +				/* filldir passes info to user space */
+ +				pde_get(de);
+ +				spin_unlock(&proc_subdir_lock);
+ +				if (filldir(dirent, de->name, de->namelen, filp->f_pos,
+ +					    de->low_ino, de->mode >> 12) < 0) {
+ +					pde_put(de);
+ +					goto out;
+ +				}
+ +				spin_lock(&proc_subdir_lock);
+ +				filp->f_pos++;
+ +				next = de->next;
+ +				pde_put(de);
+ +				de = next;
+ +			} while (de);
+ +			spin_unlock(&proc_subdir_lock);
+ +	}
+ +	ret = 1;
+ +out:
+ +	return ret;	
+++=======
++ 	spin_lock(&proc_subdir_lock);
++ 	de = pde_subdir_first(de);
++ 	i = ctx->pos - 2;
++ 	for (;;) {
++ 		if (!de) {
++ 			spin_unlock(&proc_subdir_lock);
++ 			return 0;
++ 		}
++ 		if (!i)
++ 			break;
++ 		de = pde_subdir_next(de);
++ 		i--;
++ 	}
++ 
++ 	do {
++ 		struct proc_dir_entry *next;
++ 		pde_get(de);
++ 		spin_unlock(&proc_subdir_lock);
++ 		if (!dir_emit(ctx, de->name, de->namelen,
++ 			    de->low_ino, de->mode >> 12)) {
++ 			pde_put(de);
++ 			return 0;
++ 		}
++ 		spin_lock(&proc_subdir_lock);
++ 		ctx->pos++;
++ 		next = pde_subdir_next(de);
++ 		pde_put(de);
++ 		de = next;
++ 	} while (de);
++ 	spin_unlock(&proc_subdir_lock);
++ 	return 1;
+++>>>>>>> 710585d4922f (fs/proc: use a rb tree for the directory entries)
+  }
+  
+ -int proc_readdir(struct file *file, struct dir_context *ctx)
+ +int proc_readdir(struct file *filp, void *dirent, filldir_t filldir)
+  {
+ -	struct inode *inode = file_inode(file);
+ +	struct inode *inode = file_inode(filp);
+  
+ -	return proc_readdir_de(PDE(inode), file, ctx);
+ +	return proc_readdir_de(PDE(inode), filp, dirent, filldir);
+  }
+  
+  /*
+@@@ -391,10 -408,11 +499,11 @@@ static struct proc_dir_entry *__proc_cr
+  	if (!ent)
+  		goto out;
+  
+ -	memcpy(ent->name, fn, qstr.len + 1);
+ -	ent->namelen = qstr.len;
+ +	memcpy(ent->name, fn, len + 1);
+ +	ent->namelen = len;
+  	ent->mode = mode;
+  	ent->nlink = nlink;
++ 	ent->subdir = RB_ROOT;
+  	atomic_set(&ent->count, 1);
+  	spin_lock_init(&ent->pde_unload_lock);
+  	INIT_LIST_HEAD(&ent->pde_openers);
+* Unmerged path fs/proc/generic.c
+diff --git a/fs/proc/internal.h b/fs/proc/internal.h
+index d600fb098b6a..ea33a1172584 100644
+--- a/fs/proc/internal.h
++++ b/fs/proc/internal.h
+@@ -24,10 +24,9 @@ struct mempolicy;
+  * tree) of these proc_dir_entries, so that we can dynamically
+  * add new files to /proc.
+  *
+- * The "next" pointer creates a linked list of one /proc directory,
+- * while parent/subdir create the directory structure (every
+- * /proc file has a parent, but "subdir" is NULL for all
+- * non-directory entries).
++ * parent/subdir are used for the directory structure (every /proc file has a
++ * parent, but "subdir" is empty for all non-directory entries).
++ * subdir_node is used to build the rb tree "subdir" of the parent.
+  */
+ struct proc_dir_entry {
+ 	unsigned int low_ino;
+@@ -38,7 +37,9 @@ struct proc_dir_entry {
+ 	loff_t size;
+ 	const struct inode_operations *proc_iops;
+ 	const struct file_operations *proc_fops;
+-	struct proc_dir_entry *next, *parent, *subdir;
++	struct proc_dir_entry *parent;
++	struct rb_root subdir;
++	struct rb_node subdir_node;
+ 	void *data;
+ 	atomic_t count;		/* use count */
+ 	atomic_t in_use;	/* number of callers into module in progress; */
+diff --git a/fs/proc/proc_net.c b/fs/proc/proc_net.c
+index 71b5fcf793a2..00f7e23c208b 100644
+--- a/fs/proc/proc_net.c
++++ b/fs/proc/proc_net.c
+@@ -193,6 +193,7 @@ static __net_init int proc_net_ns_init(struct net *net)
+ 	if (!netd)
+ 		goto out;
+ 
++	netd->subdir = RB_ROOT;
+ 	netd->data = net;
+ 	netd->nlink = 2;
+ 	netd->namelen = 3;
+diff --git a/fs/proc/root.c b/fs/proc/root.c
+index 04ec276c7bab..3a48c1b05b1a 100644
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -251,6 +251,7 @@ struct proc_dir_entry proc_root = {
+ 	.proc_iops	= &proc_root_inode_operations, 
+ 	.proc_fops	= &proc_root_operations,
+ 	.parent		= &proc_root,
++	.subdir		= RB_ROOT,
+ 	.name		= "/proc",
+ };
+ 
