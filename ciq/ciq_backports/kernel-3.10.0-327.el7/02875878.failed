@@ -1,0 +1,1109 @@
+net: better IFF_XMIT_DST_RELEASE support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] better IFF_XMIT_DST_RELEASE support (Alexander Duyck) [1129761]
+Rebuild_FUZZ: 93.33%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 0287587884b15041203b3a362d485e1ab1f24445
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/02875878.failed
+
+Testing xmit_more support with netperf and connected UDP sockets,
+I found strange dst refcount false sharing.
+
+Current handling of IFF_XMIT_DST_RELEASE is not optimal.
+
+Dropping dst in validate_xmit_skb() is certainly too late in case
+packet was queued by cpu X but dequeued by cpu Y
+
+The logical point to take care of drop/force is in __dev_queue_xmit()
+before even taking qdisc lock.
+
+As Julian Anastasov pointed out, need for skb_dst() might come from some
+packet schedulers or classifiers.
+
+This patch adds new helper to cleanly express needs of various drivers
+or qdiscs/classifiers.
+
+Drivers that need skb_dst() in their ndo_start_xmit() should call
+following helper in their setup instead of the prior :
+
+	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
+->
+	netif_keep_dst(dev);
+
+Instead of using a single bit, we use two bits, one being
+eventually rebuilt in bonding/team drivers.
+
+The other one, is permanent and blocks IFF_XMIT_DST_RELEASE being
+rebuilt in bonding/team. Eventually, we could add something
+smarter later.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0287587884b15041203b3a362d485e1ab1f24445)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/loopback.c
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/sched/cls_route.c
+#	net/sched/sch_generic.c
+diff --cc drivers/net/bonding/bond_main.c
+index 4ea3a26a679d,c9ac06cfe6b7..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1340,11 -997,18 +1340,20 @@@ static netdev_features_t bond_fix_featu
+  				 NETIF_F_FRAGLIST | NETIF_F_ALL_TSO | \
+  				 NETIF_F_HIGHDMA | NETIF_F_LRO)
+  
+ -#define BOND_ENC_FEATURES	(NETIF_F_ALL_CSUM | NETIF_F_SG | NETIF_F_RXCSUM |\
+ -				 NETIF_F_TSO | NETIF_F_GSO_UDP_TUNNEL)
+ -
+  static void bond_compute_features(struct bonding *bond)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int dst_release_flag = IFF_XMIT_DST_RELEASE |
++ 					IFF_XMIT_DST_RELEASE_PERM;
++ 	netdev_features_t vlan_features = BOND_VLAN_FEATURES;
++ 	netdev_features_t enc_features  = BOND_ENC_FEATURES;
++ 	struct net_device *bond_dev = bond->dev;
++ 	struct list_head *iter;
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+  	struct slave *slave;
+ +	struct net_device *bond_dev = bond->dev;
+ +	netdev_features_t vlan_features = BOND_VLAN_FEATURES;
+  	unsigned short max_hard_header_len = ETH_HLEN;
+  	unsigned int gso_max_size = GSO_MAX_SIZE;
+  	u16 gso_max_segs = GSO_MAX_SEGS;
+@@@ -1375,11 -1039,11 +1384,13 @@@ done
+  	bond_dev->gso_max_segs = gso_max_segs;
+  	netif_set_gso_max_size(bond_dev, gso_max_size);
+  
+- 	flags = bond_dev->priv_flags & ~IFF_XMIT_DST_RELEASE;
+- 	bond_dev->priv_flags = flags | dst_release_flag;
++ 	bond_dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++ 	if ((bond_dev->priv_flags & IFF_XMIT_DST_RELEASE_PERM) &&
++ 	    dst_release_flag == (IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM))
++ 		bond_dev->priv_flags |= IFF_XMIT_DST_RELEASE;
+  
+ +	read_unlock(&bond->lock);
+ +
+  	netdev_change_features(bond_dev);
+  }
+  
+diff --cc drivers/net/loopback.c
+index fcbf680c3e62,c76283c2f84a..000000000000
+--- a/drivers/net/loopback.c
++++ b/drivers/net/loopback.c
+@@@ -168,7 -168,8 +168,12 @@@ static void loopback_setup(struct net_d
+  	dev->tx_queue_len	= 0;
+  	dev->type		= ARPHRD_LOOPBACK;	/* 0x0001*/
+  	dev->flags		= IFF_LOOPBACK;
+++<<<<<<< HEAD
+ +	dev->priv_flags	       &= ~IFF_XMIT_DST_RELEASE;
+++=======
++ 	dev->priv_flags		|= IFF_LIVE_ADDR_CHANGE;
++ 	netif_keep_dst(dev);
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+  	dev->hw_features	= NETIF_F_ALL_TSO | NETIF_F_UFO;
+  	dev->features 		= NETIF_F_SG | NETIF_F_FRAGLIST
+  		| NETIF_F_ALL_TSO
+diff --cc include/linux/netdevice.h
+index d77c2cff9dff,3a4315b39d20..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1100,36 -1137,305 +1100,327 @@@ struct net_device_ops 
+  						      sa_family_t sa_family,
+  						      __be16 port);
+  
+ -	void*			(*ndo_dfwd_add_station)(struct net_device *pdev,
+ -							struct net_device *dev);
+ -	void			(*ndo_dfwd_del_station)(struct net_device *pdev,
+ -							void *priv);
+ -
+ -	netdev_tx_t		(*ndo_dfwd_start_xmit) (struct sk_buff *skb,
+ -							struct net_device *dev,
+ -							void *priv);
+ -	int			(*ndo_get_lock_subclass)(struct net_device *dev);
+ +	/* RHEL SPECIFIC
+ +	 *
+ +	 * The following padding has been inserted before ABI freeze to
+ +	 * allow extending the structure while preserve ABI. Feel free
+ +	 * to replace reserved slots with required structure field
+ +	 * additions of your backport.
+ +	 */
+ +	RH_KABI_RESERVE_P(1)
+ +	RH_KABI_RESERVE_P(2)
+ +	RH_KABI_RESERVE_P(3)
+ +	RH_KABI_RESERVE_P(4)
+ +	RH_KABI_RESERVE_P(5)
+ +	RH_KABI_RESERVE_P(6)
+ +	RH_KABI_RESERVE_P(7)
+ +	RH_KABI_RESERVE_P(8)
+ +	RH_KABI_RESERVE_P(9)
+ +	RH_KABI_RESERVE_P(10)
+ +	RH_KABI_RESERVE_P(11)
+ +	RH_KABI_RESERVE_P(12)
+ +	RH_KABI_RESERVE_P(13)
+ +	RH_KABI_RESERVE_P(14)
+ +	RH_KABI_RESERVE_P(15)
+ +	RH_KABI_RESERVE_P(16)
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + *	The DEVICE structure.
+ + *	Actually, this whole structure is a big mistake.  It mixes I/O
+ + *	data with strictly "high-level" data, and it has to know about
+ + *	almost every data structure used in the INET module.
+++=======
++ /**
++  * enum net_device_priv_flags - &struct net_device priv_flags
++  *
++  * These are the &struct net_device, they are only set internally
++  * by drivers and used in the kernel. These flags are invisible to
++  * userspace, this means that the order of these flags can change
++  * during any kernel release.
++  *
++  * You should have a pretty good reason to be extending these flags.
++  *
++  * @IFF_802_1Q_VLAN: 802.1Q VLAN device
++  * @IFF_EBRIDGE: Ethernet bridging device
++  * @IFF_SLAVE_INACTIVE: bonding slave not the curr. active
++  * @IFF_MASTER_8023AD: bonding master, 802.3ad
++  * @IFF_MASTER_ALB: bonding master, balance-alb
++  * @IFF_BONDING: bonding master or slave
++  * @IFF_SLAVE_NEEDARP: need ARPs for validation
++  * @IFF_ISATAP: ISATAP interface (RFC4214)
++  * @IFF_MASTER_ARPMON: bonding master, ARP mon in use
++  * @IFF_WAN_HDLC: WAN HDLC device
++  * @IFF_XMIT_DST_RELEASE: dev_hard_start_xmit() is allowed to
++  *	release skb->dst
++  * @IFF_DONT_BRIDGE: disallow bridging this ether dev
++  * @IFF_DISABLE_NETPOLL: disable netpoll at run-time
++  * @IFF_MACVLAN_PORT: device used as macvlan port
++  * @IFF_BRIDGE_PORT: device used as bridge port
++  * @IFF_OVS_DATAPATH: device used as Open vSwitch datapath port
++  * @IFF_TX_SKB_SHARING: The interface supports sharing skbs on transmit
++  * @IFF_UNICAST_FLT: Supports unicast filtering
++  * @IFF_TEAM_PORT: device used as team port
++  * @IFF_SUPP_NOFCS: device supports sending custom FCS
++  * @IFF_LIVE_ADDR_CHANGE: device supports hardware address
++  *	change when it's running
++  * @IFF_MACVLAN: Macvlan device
++  */
++ enum netdev_priv_flags {
++ 	IFF_802_1Q_VLAN			= 1<<0,
++ 	IFF_EBRIDGE			= 1<<1,
++ 	IFF_SLAVE_INACTIVE		= 1<<2,
++ 	IFF_MASTER_8023AD		= 1<<3,
++ 	IFF_MASTER_ALB			= 1<<4,
++ 	IFF_BONDING			= 1<<5,
++ 	IFF_SLAVE_NEEDARP		= 1<<6,
++ 	IFF_ISATAP			= 1<<7,
++ 	IFF_MASTER_ARPMON		= 1<<8,
++ 	IFF_WAN_HDLC			= 1<<9,
++ 	IFF_XMIT_DST_RELEASE		= 1<<10,
++ 	IFF_DONT_BRIDGE			= 1<<11,
++ 	IFF_DISABLE_NETPOLL		= 1<<12,
++ 	IFF_MACVLAN_PORT		= 1<<13,
++ 	IFF_BRIDGE_PORT			= 1<<14,
++ 	IFF_OVS_DATAPATH		= 1<<15,
++ 	IFF_TX_SKB_SHARING		= 1<<16,
++ 	IFF_UNICAST_FLT			= 1<<17,
++ 	IFF_TEAM_PORT			= 1<<18,
++ 	IFF_SUPP_NOFCS			= 1<<19,
++ 	IFF_LIVE_ADDR_CHANGE		= 1<<20,
++ 	IFF_MACVLAN			= 1<<21,
++ 	IFF_XMIT_DST_RELEASE_PERM	= 1<<22,
++ };
++ 
++ #define IFF_802_1Q_VLAN			IFF_802_1Q_VLAN
++ #define IFF_EBRIDGE			IFF_EBRIDGE
++ #define IFF_SLAVE_INACTIVE		IFF_SLAVE_INACTIVE
++ #define IFF_MASTER_8023AD		IFF_MASTER_8023AD
++ #define IFF_MASTER_ALB			IFF_MASTER_ALB
++ #define IFF_BONDING			IFF_BONDING
++ #define IFF_SLAVE_NEEDARP		IFF_SLAVE_NEEDARP
++ #define IFF_ISATAP			IFF_ISATAP
++ #define IFF_MASTER_ARPMON		IFF_MASTER_ARPMON
++ #define IFF_WAN_HDLC			IFF_WAN_HDLC
++ #define IFF_XMIT_DST_RELEASE		IFF_XMIT_DST_RELEASE
++ #define IFF_DONT_BRIDGE			IFF_DONT_BRIDGE
++ #define IFF_DISABLE_NETPOLL		IFF_DISABLE_NETPOLL
++ #define IFF_MACVLAN_PORT		IFF_MACVLAN_PORT
++ #define IFF_BRIDGE_PORT			IFF_BRIDGE_PORT
++ #define IFF_OVS_DATAPATH		IFF_OVS_DATAPATH
++ #define IFF_TX_SKB_SHARING		IFF_TX_SKB_SHARING
++ #define IFF_UNICAST_FLT			IFF_UNICAST_FLT
++ #define IFF_TEAM_PORT			IFF_TEAM_PORT
++ #define IFF_SUPP_NOFCS			IFF_SUPP_NOFCS
++ #define IFF_LIVE_ADDR_CHANGE		IFF_LIVE_ADDR_CHANGE
++ #define IFF_MACVLAN			IFF_MACVLAN
++ #define IFF_XMIT_DST_RELEASE_PERM	IFF_XMIT_DST_RELEASE_PERM
++ 
++ /**
++  *	struct net_device - The DEVICE structure.
++  *		Actually, this whole structure is a big mistake.  It mixes I/O
++  *		data with strictly "high-level" data, and it has to know about
++  *		almost every data structure used in the INET module.
++  *
++  *	@name:	This is the first field of the "visible" part of this structure
++  *		(i.e. as seen by users in the "Space.c" file).  It is the name
++  *	 	of the interface.
++  *
++  *	@name_hlist: 	Device name hash chain, please keep it close to name[]
++  *	@ifalias:	SNMP alias
++  *	@mem_end:	Shared memory end
++  *	@mem_start:	Shared memory start
++  *	@base_addr:	Device I/O address
++  *	@irq:		Device IRQ number
++  *
++  *	@state:		Generic network queuing layer state, see netdev_state_t
++  *	@dev_list:	The global list of network devices
++  *	@napi_list:	List entry, that is used for polling napi devices
++  *	@unreg_list:	List entry, that is used, when we are unregistering the
++  *			device, see the function unregister_netdev
++  *	@close_list:	List entry, that is used, when we are closing the device
++  *
++  *	@adj_list:	Directly linked devices, like slaves for bonding
++  *	@all_adj_list:	All linked devices, *including* neighbours
++  *	@features:	Currently active device features
++  *	@hw_features:	User-changeable features
++  *
++  *	@wanted_features:	User-requested features
++  *	@vlan_features:		Mask of features inheritable by VLAN devices
++  *
++  *	@hw_enc_features:	Mask of features inherited by encapsulating devices
++  *				This field indicates what encapsulation
++  *				offloads the hardware is capable of doing,
++  *				and drivers will need to set them appropriately.
++  *
++  *	@mpls_features:	Mask of features inheritable by MPLS
++  *
++  *	@ifindex:	interface index
++  *	@iflink:	unique device identifier
++  *
++  *	@stats:		Statistics struct, which was left as a legacy, use
++  *			rtnl_link_stats64 instead
++  *
++  *	@rx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *	@tx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *
++  *	@carrier_changes:	Stats to monitor carrier on<->off transitions
++  *
++  *	@wireless_handlers:	List of functions to handle Wireless Extensions,
++  *				instead of ioctl,
++  *				see <net/iw_handler.h> for details.
++  *	@wireless_data:	Instance data managed by the core of wireless extensions
++  *
++  *	@netdev_ops:	Includes several pointers to callbacks,
++  *			if one wants to override the ndo_*() functions
++  *	@ethtool_ops:	Management operations
++  *	@fwd_ops:	Management operations
++  *	@header_ops:	Includes callbacks for creating,parsing,rebuilding,etc
++  *			of Layer 2 headers.
++  *
++  *	@flags:		Interface flags (a la BSD)
++  *	@priv_flags:	Like 'flags' but invisible to userspace,
++  *			see if.h for the definitions
++  *	@gflags:	Global flags ( kept as legacy )
++  *	@padded:	How much padding added by alloc_netdev()
++  *	@operstate:	RFC2863 operstate
++  *	@link_mode:	Mapping policy to operstate
++  *	@if_port:	Selectable AUI, TP, ...
++  *	@dma:		DMA channel
++  *	@mtu:		Interface MTU value
++  *	@type:		Interface hardware type
++  *	@hard_header_len: Hardware header length
++  *
++  *	@needed_headroom: Extra headroom the hardware may need, but not in all
++  *			  cases can this be guaranteed
++  *	@needed_tailroom: Extra tailroom the hardware may need, but not in all
++  *			  cases can this be guaranteed. Some cases also use
++  *			  LL_MAX_HEADER instead to allocate the skb
++  *
++  *	interface address info:
++  *
++  * 	@perm_addr:		Permanent hw address
++  * 	@addr_assign_type:	Hw address assignment type
++  * 	@addr_len:		Hardware address length
++  * 	@neigh_priv_len;	Used in neigh_alloc(),
++  * 				initialized only in atm/clip.c
++  * 	@dev_id:		Used to differentiate devices that share
++  * 				the same link layer address
++  * 	@dev_port:		Used to differentiate devices that share
++  * 				the same function
++  *	@addr_list_lock:	XXX: need comments on this one
++  *	@uc:			unicast mac addresses
++  *	@mc:			multicast mac addresses
++  *	@dev_addrs:		list of device hw addresses
++  *	@queues_kset:		Group of all Kobjects in the Tx and RX queues
++  *	@uc_promisc:		Counter, that indicates, that promiscuous mode
++  *				has been enabled due to the need to listen to
++  *				additional unicast addresses in a device that
++  *				does not implement ndo_set_rx_mode()
++  *	@promiscuity:		Number of times, the NIC is told to work in
++  *				Promiscuous mode, if it becomes 0 the NIC will
++  *				exit from working in Promiscuous mode
++  *	@allmulti:		Counter, enables or disables allmulticast mode
++  *
++  *	@vlan_info:	VLAN info
++  *	@dsa_ptr:	dsa specific data
++  *	@tipc_ptr:	TIPC specific data
++  *	@atalk_ptr:	AppleTalk link
++  *	@ip_ptr:	IPv4 specific data
++  *	@dn_ptr:	DECnet specific data
++  *	@ip6_ptr:	IPv6 specific data
++  *	@ax25_ptr:	AX.25 specific data
++  *	@ieee80211_ptr:	IEEE 802.11 specific data, assign before registering
++  *
++  *	@last_rx:	Time of last Rx
++  *	@dev_addr:	Hw address (before bcast,
++  *			because most packets are unicast)
++  *
++  *	@_rx:			Array of RX queues
++  *	@num_rx_queues:		Number of RX queues
++  *				allocated at register_netdev() time
++  *	@real_num_rx_queues: 	Number of RX queues currently active in device
++  *
++  *	@rx_handler:		handler for received packets
++  *	@rx_handler_data: 	XXX: need comments on this one
++  *	@ingress_queue:		XXX: need comments on this one
++  *	@broadcast:		hw bcast address
++  *
++  *	@_tx:			Array of TX queues
++  *	@num_tx_queues:		Number of TX queues allocated at alloc_netdev_mq() time
++  *	@real_num_tx_queues: 	Number of TX queues currently active in device
++  *	@qdisc:			Root qdisc from userspace point of view
++  *	@tx_queue_len:		Max frames per queue allowed
++  *	@tx_global_lock: 	XXX: need comments on this one
++  *
++  *	@xps_maps:	XXX: need comments on this one
++  *
++  *	@rx_cpu_rmap:	CPU reverse-mapping for RX completion interrupts,
++  *			indexed by RX queue number. Assigned by driver.
++  *			This must only be set if the ndo_rx_flow_steer
++  *			operation is defined
++  *
++  *	@trans_start:		Time (in jiffies) of last Tx
++  *	@watchdog_timeo:	Represents the timeout that is used by
++  *				the watchdog ( see dev_watchdog() )
++  *	@watchdog_timer:	List of timers
++  *
++  *	@pcpu_refcnt:		Number of references to this device
++  *	@todo_list:		Delayed register/unregister
++  *	@index_hlist:		Device index hash chain
++  *	@link_watch_list:	XXX: need comments on this one
++  *
++  *	@reg_state:		Register/unregister state machine
++  *	@dismantle:		Device is going to be freed
++  *	@rtnl_link_state:	This enum represents the phases of creating
++  *				a new link
++  *
++  *	@destructor:		Called from unregister,
++  *				can be used to call free_netdev
++  *	@npinfo:		XXX: need comments on this one
++  * 	@nd_net:		Network namespace this network device is inside
++  *
++  * 	@ml_priv:	Mid-layer private
++  * 	@lstats:	Loopback statistics
++  * 	@tstats:	Tunnel statistics
++  * 	@dstats:	Dummy statistics
++  * 	@vstats:	Virtual ethernet statistics
++  *
++  *	@garp_port:	GARP
++  *	@mrp_port:	MRP
++  *
++  *	@dev:		Class/net/name entry
++  *	@sysfs_groups:	Space for optional device, statistics and wireless
++  *			sysfs groups
++  *
++  *	@sysfs_rx_queue_group:	Space for optional per-rx queue attributes
++  *	@rtnl_link_ops:	Rtnl_link_ops
++  *
++  *	@gso_max_size:	Maximum size of generic segmentation offload
++  *	@gso_max_segs:	Maximum number of segments that can be passed to the
++  *			NIC for GSO
++  *	@gso_min_segs:	Minimum number of segments that can be passed to the
++  *			NIC for GSO
++  *
++  *	@dcbnl_ops:	Data Center Bridging netlink ops
++  *	@num_tc:	Number of traffic classes in the net device
++  *	@tc_to_txq:	XXX: need comments on this one
++  *	@prio_tc_map	XXX: need comments on this one
++  *
++  *	@fcoe_ddp_xid:	Max exchange id for FCoE LRO by ddp
++  *
++  *	@priomap:	XXX: need comments on this one
++  *	@phydev:	Physical device may attach itself
++  *			for hardware timestamping
++  *
++  *	@qdisc_tx_busylock:	XXX: need comments on this one
++  *
++  *	@group:		The group, that the device belongs to
++  *	@pm_qos_req:	Power Management QoS object
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+   *
+   *	FIXME: cleanup struct net_device such that network protocol info
+   *	moves out.
+diff --cc net/core/dev.c
+index 9a2bea4eeeee,3c5bdaa44486..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2494,115 -2600,148 +2494,187 @@@ netdev_features_t netif_skb_features(st
+  }
+  EXPORT_SYMBOL(netif_skb_features);
+  
+ -static int xmit_one(struct sk_buff *skb, struct net_device *dev,
+ -		    struct netdev_queue *txq, bool more)
+ +int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ +			struct netdev_queue *txq)
+  {
+ -	unsigned int len;
+ -	int rc;
+ -
+ -	if (!list_empty(&ptype_all))
+ -		dev_queue_xmit_nit(skb, dev);
+ -
+ -	len = skb->len;
+ -	trace_net_dev_start_xmit(skb, dev);
+ -	rc = netdev_start_xmit(skb, dev, txq, more);
+ -	trace_net_dev_xmit(skb, rc, dev, len);
+ -
+ -	return rc;
+ -}
+ -
+ -struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *dev,
+ -				    struct netdev_queue *txq, int *ret)
+ -{
+ -	struct sk_buff *skb = first;
+ +	const struct net_device_ops *ops = dev->netdev_ops;
+  	int rc = NETDEV_TX_OK;
+ +	unsigned int skb_len;
+  
+ -	while (skb) {
+ -		struct sk_buff *next = skb->next;
+ +	if (likely(!skb->next)) {
+ +		netdev_features_t features;
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * If device doesn't need skb->dst, release it right now while
+ +		 * its hot in this cpu cache
+++=======
++ 		skb->next = NULL;
++ 		rc = xmit_one(skb, dev, txq, next != NULL);
++ 		if (unlikely(!dev_xmit_complete(rc))) {
++ 			skb->next = next;
++ 			goto out;
++ 		}
++ 
++ 		skb = next;
++ 		if (netif_xmit_stopped(txq) && skb) {
++ 			rc = NETDEV_TX_BUSY;
++ 			break;
++ 		}
++ 	}
++ 
++ out:
++ 	*ret = rc;
++ 	return skb;
++ }
++ 
++ static struct sk_buff *validate_xmit_vlan(struct sk_buff *skb,
++ 					  netdev_features_t features)
++ {
++ 	if (vlan_tx_tag_present(skb) &&
++ 	    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
++ 		skb = __vlan_put_tag(skb, skb->vlan_proto,
++ 				     vlan_tx_tag_get(skb));
++ 		if (skb)
++ 			skb->vlan_tci = 0;
++ 	}
++ 	return skb;
++ }
++ 
++ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	netdev_features_t features;
++ 
++ 	if (skb->next)
++ 		return skb;
++ 
++ 	features = netif_skb_features(skb);
++ 	skb = validate_xmit_vlan(skb, features);
++ 	if (unlikely(!skb))
++ 		goto out_null;
++ 
++ 	/* If encapsulation offload request, verify we are testing
++ 	 * hardware encapsulation features instead of standard
++ 	 * features for the netdev
++ 	 */
++ 	if (skb->encapsulation)
++ 		features &= dev->hw_enc_features;
++ 
++ 	if (netif_needs_gso(skb, features)) {
++ 		struct sk_buff *segs;
++ 
++ 		segs = skb_gso_segment(skb, features);
++ 		if (IS_ERR(segs)) {
++ 			segs = NULL;
++ 		} else if (segs) {
++ 			consume_skb(skb);
++ 			skb = segs;
++ 		}
++ 	} else {
++ 		if (skb_needs_linearize(skb, features) &&
++ 		    __skb_linearize(skb))
++ 			goto out_kfree_skb;
++ 
++ 		/* If packet is not checksummed and device does not
++ 		 * support checksumming for this protocol, complete
++ 		 * checksumming here.
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+  		 */
+ -		if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ -			if (skb->encapsulation)
+ -				skb_set_inner_transport_header(skb,
+ -							       skb_checksum_start_offset(skb));
+ -			else
+ -				skb_set_transport_header(skb,
+ -							 skb_checksum_start_offset(skb));
+ -			if (!(features & NETIF_F_ALL_CSUM) &&
+ -			    skb_checksum_help(skb))
+ -				goto out_kfree_skb;
+ +		if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
+ +			skb_dst_drop(skb);
+ +
+ +		features = netif_skb_features(skb);
+ +
+ +		if (vlan_tx_tag_present(skb) &&
+ +		    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
+ +			skb = __vlan_put_tag(skb, skb->vlan_proto,
+ +					     vlan_tx_tag_get(skb));
+ +			if (unlikely(!skb))
+ +				goto out;
+ +
+ +			skb->vlan_tci = 0;
+  		}
+ -	}
+  
+ -	return skb;
+ +		/* If encapsulation offload request, verify we are testing
+ +		 * hardware encapsulation features instead of standard
+ +		 * features for the netdev
+ +		 */
+ +		if (skb->encapsulation)
+ +			features &= dev->hw_enc_features;
+  
+ -out_kfree_skb:
+ -	kfree_skb(skb);
+ -out_null:
+ -	return NULL;
+ -}
+ +		if (netif_needs_gso(skb, features)) {
+ +			if (unlikely(dev_gso_segment(skb, features)))
+ +				goto out_kfree_skb;
+ +			if (skb->next)
+ +				goto gso;
+ +		} else {
+ +			if (skb_needs_linearize(skb, features) &&
+ +			    __skb_linearize(skb))
+ +				goto out_kfree_skb;
+  
+ -struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev)
+ -{
+ -	struct sk_buff *next, *head = NULL, *tail;
+ +			/* If packet is not checksummed and device does not
+ +			 * support checksumming for this protocol, complete
+ +			 * checksumming here.
+ +			 */
+ +			if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ +				if (skb->encapsulation)
+ +					skb_set_inner_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				else
+ +					skb_set_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				if (!(features & NETIF_F_ALL_CSUM) &&
+ +				     skb_checksum_help(skb))
+ +					goto out_kfree_skb;
+ +			}
+ +		}
+  
+ -	for (; skb != NULL; skb = next) {
+ -		next = skb->next;
+ -		skb->next = NULL;
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(skb, dev);
+  
+ -		/* in case skb wont be segmented, point to itself */
+ -		skb->prev = skb;
+ +		skb_len = skb->len;
+ +		rc = ops->ndo_start_xmit(skb, dev);
+ +		trace_net_dev_xmit(skb, rc, dev, skb_len);
+ +		if (rc == NETDEV_TX_OK)
+ +			txq_trans_update(txq);
+ +		return rc;
+ +	}
+  
+ -		skb = validate_xmit_skb(skb, dev);
+ -		if (!skb)
+ -			continue;
+ +gso:
+ +	do {
+ +		struct sk_buff *nskb = skb->next;
+  
+ -		if (!head)
+ -			head = skb;
+ -		else
+ -			tail->next = skb;
+ -		/* If skb was segmented, skb->prev points to
+ -		 * the last segment. If not, it still contains skb.
+ -		 */
+ -		tail = skb->prev;
+ +		skb->next = nskb->next;
+ +		nskb->next = NULL;
+ +
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(nskb, dev);
+ +
+ +		skb_len = nskb->len;
+ +		rc = ops->ndo_start_xmit(nskb, dev);
+ +		trace_net_dev_xmit(nskb, rc, dev, skb_len);
+ +		if (unlikely(rc != NETDEV_TX_OK)) {
+ +			if (rc & ~NETDEV_TX_MASK)
+ +				goto out_kfree_gso_skb;
+ +			nskb->next = skb->next;
+ +			skb->next = nskb;
+ +			return rc;
+ +		}
+ +		txq_trans_update(txq);
+ +		if (unlikely(netif_xmit_stopped(txq) && skb->next))
+ +			return NETDEV_TX_BUSY;
+ +	} while (skb->next);
+ +
+ +out_kfree_gso_skb:
+ +	if (likely(skb->next == NULL)) {
+ +		skb->destructor = DEV_GSO_CB(skb)->destructor;
+ +		consume_skb(skb);
+ +		return rc;
+  	}
+ -	return head;
+ +out_kfree_skb:
+ +	kfree_skb(skb);
+ +out:
+ +	return rc;
+  }
+  
+  static void qdisc_pkt_len_init(struct sk_buff *skb)
+@@@ -2775,7 -2915,15 +2844,19 @@@ int dev_queue_xmit(struct sk_buff *skb
+  
+  	skb_update_prio(skb);
+  
+++<<<<<<< HEAD
+ +	txq = netdev_pick_tx(dev, skb);
+++=======
++ 	/* If device/qdisc don't need skb->dst, release it right now while
++ 	 * its hot in this cpu cache.
++ 	 */
++ 	if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
++ 		skb_dst_drop(skb);
++ 	else
++ 		skb_dst_force(skb);
++ 
++ 	txq = netdev_pick_tx(dev, skb, accel_priv);
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+  	q = rcu_dereference_bh(txq->qdisc);
+  
+  #ifdef CONFIG_NET_CLS_ACT
+@@@ -5858,9 -6666,14 +5939,17 @@@ struct net_device *alloc_netdev_mqs(in
+  
+  	INIT_LIST_HEAD(&dev->napi_list);
+  	INIT_LIST_HEAD(&dev->unreg_list);
+ -	INIT_LIST_HEAD(&dev->close_list);
+  	INIT_LIST_HEAD(&dev->link_watch_list);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&dev->upper_dev_list);
+ +	dev->priv_flags = IFF_XMIT_DST_RELEASE;
+++=======
++ 	INIT_LIST_HEAD(&dev->adj_list.upper);
++ 	INIT_LIST_HEAD(&dev->adj_list.lower);
++ 	INIT_LIST_HEAD(&dev->all_adj_list.upper);
++ 	INIT_LIST_HEAD(&dev->all_adj_list.lower);
++ 	dev->priv_flags = IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM;
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+  	setup(dev);
+  
+  	dev->num_tx_queues = txqs;
+diff --cc net/sched/cls_route.c
+index 37da567d833e,109a329b7198..000000000000
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@@ -492,17 -524,19 +492,23 @@@ reinsert
+  		if (f->handle < f1->handle)
+  			break;
+  
+++<<<<<<< HEAD
+ +	f->next = f1;
+ +	tcf_tree_lock(tp);
+ +	*fp = f;
+++=======
++ 	netif_keep_dst(qdisc_dev(tp->q));
++ 	rcu_assign_pointer(f->next, f1);
++ 	rcu_assign_pointer(*fp, f);
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+  
+ -	if (fold && fold->handle && f->handle != fold->handle) {
+ -		th = to_hash(fold->handle);
+ -		h = from_hash(fold->handle >> 16);
+ -		b = rtnl_dereference(head->table[th]);
+ +	if (old_handle && f->handle != old_handle) {
+ +		th = to_hash(old_handle);
+ +		h = from_hash(old_handle >> 16);
+ +		b = head->table[th];
+  		if (b) {
+ -			fp = &b->ht[h];
+ -			for (pfp = rtnl_dereference(*fp); pfp;
+ -			     fp = &pfp->next, pfp = rtnl_dereference(*fp)) {
+ -				if (pfp == f) {
+ +			for (fp = &b->ht[h]; *fp; fp = &(*fp)->next) {
+ +				if (*fp == f) {
+  					*fp = f->next;
+  					break;
+  				}
+diff --cc net/sched/sch_generic.c
+index bba00963a92a,38d58e6cef07..000000000000
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@@ -177,17 -210,18 +176,21 @@@ static inline int qdisc_restart(struct 
+  	struct net_device *dev;
+  	spinlock_t *root_lock;
+  	struct sk_buff *skb;
+ -	bool validate;
+  
+  	/* Dequeue packet */
+ -	skb = dequeue_skb(q, &validate);
+ +	skb = dequeue_skb(q);
+  	if (unlikely(!skb))
+  		return 0;
+++<<<<<<< HEAD
+ +	WARN_ON_ONCE(skb_dst_is_noref(skb));
+++=======
++ 
+++>>>>>>> 0287587884b1 (net: better IFF_XMIT_DST_RELEASE support)
+  	root_lock = qdisc_lock(q);
+  	dev = qdisc_dev(q);
+ -	txq = skb_get_tx_queue(dev, skb);
+ +	txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
+  
+ -	return sch_direct_xmit(skb, q, dev, txq, root_lock, validate);
+ +	return sch_direct_xmit(skb, q, dev, txq, root_lock);
+  }
+  
+  void __qdisc_run(struct Qdisc *q)
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 4989c7d0e907..a81ae934ff4f 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -1364,7 +1364,7 @@ void ipoib_setup(struct net_device *dev)
+ 	dev->tx_queue_len	 = ipoib_sendq_size * 2;
+ 	dev->features		 = (NETIF_F_VLAN_CHALLENGED	|
+ 				    NETIF_F_HIGHDMA);
+-	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 
+ 	memcpy(dev->broadcast, ipv4_bcast_addr, INFINIBAND_ALEN);
+ 
+diff --git a/drivers/net/appletalk/ipddp.c b/drivers/net/appletalk/ipddp.c
+index 10d0dba572c2..e90c6a7333d7 100644
+--- a/drivers/net/appletalk/ipddp.c
++++ b/drivers/net/appletalk/ipddp.c
+@@ -74,7 +74,7 @@ static struct net_device * __init ipddp_init(void)
+ 	if (!dev)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 	strcpy(dev->name, "ipddp%d");
+ 
+ 	if (version_printed++ == 0)
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/eql.c b/drivers/net/eql.c
+index f219d38acf58..e2f89dfc57f5 100644
+--- a/drivers/net/eql.c
++++ b/drivers/net/eql.c
+@@ -199,7 +199,7 @@ static void __init eql_setup(struct net_device *dev)
+ 
+ 	dev->type       	= ARPHRD_SLIP;
+ 	dev->tx_queue_len 	= 5;		/* Hands them off fast */
+-	dev->priv_flags	       &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ }
+ 
+ static int eql_open(struct net_device *dev)
+diff --git a/drivers/net/ifb.c b/drivers/net/ifb.c
+index a3bed28197d2..79527c48fce0 100644
+--- a/drivers/net/ifb.c
++++ b/drivers/net/ifb.c
+@@ -184,7 +184,8 @@ static void ifb_setup(struct net_device *dev)
+ 
+ 	dev->flags |= IFF_NOARP;
+ 	dev->flags &= ~IFF_MULTICAST;
+-	dev->priv_flags &= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
++	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
++	netif_keep_dst(dev);
+ 	eth_hw_addr_random(dev);
+ }
+ 
+* Unmerged path drivers/net/loopback.c
+diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
+index 6af48508e014..1e25cfa2ccd8 100644
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@ -693,7 +693,8 @@ void macvlan_common_setup(struct net_device *dev)
+ {
+ 	ether_setup(dev);
+ 
+-	dev->priv_flags	       &= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
++	dev->priv_flags	       &= ~IFF_TX_SKB_SHARING;
++	netif_keep_dst(dev);
+ 	dev->priv_flags	       |= IFF_UNICAST_FLT;
+ 	dev->netdev_ops		= &macvlan_netdev_ops;
+ 	dev->destructor		= free_netdev;
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+index 72ff14b811c6..8b962d74ffd6 100644
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -1082,7 +1082,7 @@ static void ppp_setup(struct net_device *dev)
+ 	dev->type = ARPHRD_PPP;
+ 	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
+ 	dev->features |= NETIF_F_NETNS_LOCAL;
+-	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ }
+ 
+ /*
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 2ba75d8ed769..ab1690a8050b 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -980,7 +980,8 @@ static void __team_compute_features(struct team *team)
+ 	struct team_port *port;
+ 	u32 vlan_features = TEAM_VLAN_FEATURES;
+ 	unsigned short max_hard_header_len = ETH_HLEN;
+-	unsigned int flags, dst_release_flag = IFF_XMIT_DST_RELEASE;
++	unsigned int dst_release_flag = IFF_XMIT_DST_RELEASE |
++					IFF_XMIT_DST_RELEASE_PERM;
+ 
+ 	list_for_each_entry(port, &team->port_list, list) {
+ 		vlan_features = netdev_increment_features(vlan_features,
+@@ -995,8 +996,9 @@ static void __team_compute_features(struct team *team)
+ 	team->dev->vlan_features = vlan_features;
+ 	team->dev->hard_header_len = max_hard_header_len;
+ 
+-	flags = team->dev->priv_flags & ~IFF_XMIT_DST_RELEASE;
+-	team->dev->priv_flags = flags | dst_release_flag;
++	team->dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	if (dst_release_flag == (IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM))
++		team->dev->priv_flags |= IFF_XMIT_DST_RELEASE;
+ 
+ 	netdev_change_features(team->dev);
+ }
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 1f7710467383..2153bd67bb69 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -2202,7 +2202,7 @@ static void vxlan_setup(struct net_device *dev)
+ 	dev->hw_features |= NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_RXCSUM;
+ 	dev->hw_features |= NETIF_F_GSO_SOFTWARE;
+ 	dev->hw_features |= NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_STAG_TX;
+-	dev->priv_flags	&= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+ 
+ 	INIT_LIST_HEAD(&vxlan->next);
+diff --git a/drivers/net/wan/hdlc_fr.c b/drivers/net/wan/hdlc_fr.c
+index 7c6cb4f31798..c7aeb9eaaf73 100644
+--- a/drivers/net/wan/hdlc_fr.c
++++ b/drivers/net/wan/hdlc_fr.c
+@@ -1046,7 +1046,7 @@ static void pvc_setup(struct net_device *dev)
+ 	dev->flags = IFF_POINTOPOINT;
+ 	dev->hard_header_len = 10;
+ 	dev->addr_len = 2;
+-	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ }
+ 
+ static const struct net_device_ops pvc_ops = {
+diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
+index c8cbc6835e31..ab8656ee5547 100644
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -3302,7 +3302,7 @@ static int qeth_l3_setup_netdev(struct qeth_card *card)
+ 	card->dev->features |=	NETIF_F_HW_VLAN_CTAG_TX |
+ 				NETIF_F_HW_VLAN_CTAG_RX |
+ 				NETIF_F_HW_VLAN_CTAG_FILTER;
+-	card->dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(card->dev);
+ 	card->dev->gso_max_size = 15 * PAGE_SIZE;
+ 
+ 	SET_NETDEV_DEV(card->dev, &card->gdev->dev);
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/8021q/vlan_dev.c b/net/8021q/vlan_dev.c
+index 0acdbe2b227c..f305a8ef823b 100644
+--- a/net/8021q/vlan_dev.c
++++ b/net/8021q/vlan_dev.c
+@@ -784,7 +784,8 @@ void vlan_setup(struct net_device *dev)
+ 	ether_setup(dev);
+ 
+ 	dev->priv_flags		|= IFF_802_1Q_VLAN;
+-	dev->priv_flags		&= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
++	dev->priv_flags		&= ~IFF_TX_SKB_SHARING;
++	netif_keep_dst(dev);
+ 	dev->tx_queue_len	= 0;
+ 
+ 	dev->netdev_ops		= &vlan_netdev_ops;
+diff --git a/net/atm/clip.c b/net/atm/clip.c
+index 8ae3a7879335..d1d8f524179f 100644
+--- a/net/atm/clip.c
++++ b/net/atm/clip.c
+@@ -501,7 +501,7 @@ static void clip_setup(struct net_device *dev)
+ 	/* without any more elaborate queuing. 100 is a reasonable */
+ 	/* compromise between decent burst-tolerance and protection */
+ 	/* against memory hogs. */
+-	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ }
+ 
+ static int clip_create(int number)
+* Unmerged path net/core/dev.c
+diff --git a/net/ipv4/ip_gre.c b/net/ipv4/ip_gre.c
+index d066319d6040..a019a63009df 100644
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@ -505,7 +505,7 @@ static int ipgre_tunnel_init(struct net_device *dev)
+ 	memcpy(dev->broadcast, &iph->daddr, 4);
+ 
+ 	dev->flags		= IFF_NOARP;
+-	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 	dev->addr_len		= 4;
+ 
+ 	if (iph->daddr) {
+diff --git a/net/ipv4/ip_vti.c b/net/ipv4/ip_vti.c
+index b9997c5dcf18..bc2b99ef0934 100644
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@ -363,7 +363,7 @@ static int vti_tunnel_init(struct net_device *dev)
+ 	dev->iflink		= 0;
+ 	dev->addr_len		= 4;
+ 	dev->features		|= NETIF_F_LLTX;
+-	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 
+ 	return ip_tunnel_init(dev);
+ }
+diff --git a/net/ipv4/ipip.c b/net/ipv4/ipip.c
+index ca79260ee627..ad4e157d7de6 100644
+--- a/net/ipv4/ipip.c
++++ b/net/ipv4/ipip.c
+@@ -289,7 +289,7 @@ static void ipip_tunnel_setup(struct net_device *dev)
+ 	dev->iflink		= 0;
+ 	dev->addr_len		= 4;
+ 	dev->features		|= NETIF_F_LLTX;
+-	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 
+ 	dev->features		|= IPIP_FEATURES;
+ 	dev->hw_features	|= IPIP_FEATURES;
+diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
+index 06aadf812d65..d1fd11ee907b 100644
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -1244,7 +1244,7 @@ static void ip6gre_tunnel_setup(struct net_device *dev)
+ 	dev->flags |= IFF_NOARP;
+ 	dev->iflink = 0;
+ 	dev->addr_len = sizeof(struct in6_addr);
+-	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ }
+ 
+ static int ip6gre_tunnel_init(struct net_device *dev)
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index 3e2a790fd5f7..430685b5c7c4 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -1555,7 +1555,7 @@ static void ip6_tnl_dev_setup(struct net_device *dev)
+ 		dev->mtu-=8;
+ 	dev->flags |= IFF_NOARP;
+ 	dev->addr_len = sizeof(struct in6_addr);
+-	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 	/* This perm addr will be used as interface identifier by IPv6 */
+ 	dev->addr_assign_type = NET_ADDR_RANDOM;
+ 	eth_random_addr(dev->perm_addr);
+diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
+index eb6301424fd2..fe6cf71948aa 100644
+--- a/net/ipv6/ip6_vti.c
++++ b/net/ipv6/ip6_vti.c
+@@ -708,7 +708,7 @@ static void vti6_dev_setup(struct net_device *dev)
+ 	dev->mtu = ETH_DATA_LEN;
+ 	dev->flags |= IFF_NOARP;
+ 	dev->addr_len = sizeof(struct in6_addr);
+-	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ }
+ 
+ /**
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+index 0bf8881a52b0..28650267da5d 100644
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -1268,7 +1268,7 @@ static void ipip6_tunnel_setup(struct net_device *dev)
+ 	dev->hard_header_len 	= LL_MAX_HEADER + sizeof(struct iphdr);
+ 	dev->mtu		= ETH_DATA_LEN - sizeof(struct iphdr);
+ 	dev->flags		= IFF_NOARP;
+-	dev->priv_flags	       &= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ 	dev->iflink		= 0;
+ 	dev->addr_len		= 4;
+ 	dev->features		|= NETIF_F_LLTX;
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index 83a6322b7751..f6ceec6354c1 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -467,6 +467,8 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 
+ 	tcf_tree_lock(tp);
+ 
++	netif_keep_dst(qdisc_dev(tp->q));
++
+ 	if (tb[TCA_FLOW_KEYS]) {
+ 		f->keymask = keymask;
+ 		f->nkeys   = nkeys;
+* Unmerged path net/sched/cls_route.c
+* Unmerged path net/sched/sch_generic.c
+diff --git a/net/sched/sch_teql.c b/net/sched/sch_teql.c
+index 474167162947..82e091798dce 100644
+--- a/net/sched/sch_teql.c
++++ b/net/sched/sch_teql.c
+@@ -468,7 +468,7 @@ static __init void teql_master_setup(struct net_device *dev)
+ 	dev->tx_queue_len	= 100;
+ 	dev->flags		= IFF_NOARP;
+ 	dev->hard_header_len	= LL_MAX_HEADER;
+-	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
++	netif_keep_dst(dev);
+ }
+ 
+ static LIST_HEAD(master_dev_list);
