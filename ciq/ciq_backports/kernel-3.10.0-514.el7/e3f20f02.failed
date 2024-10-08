@@ -1,0 +1,142 @@
+IB/core: Integrate IB address resolution module into core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit e3f20f02864f6da1509c523bfa1e928619e59095
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e3f20f02.failed
+
+IB address resolution is declared as a module (ib_addr.ko) which loads
+itself before IB core module (ib_core.ko).
+
+It causes to the scenario where IB netlink which is initialized by IB
+core can't be used by ib_addr.ko.
+
+In order to solve it, we are converting ib_addr.ko to be part of
+IB core module.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e3f20f02864f6da1509c523bfa1e928619e59095)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/Makefile
+diff --cc drivers/infiniband/core/Makefile
+index ae48d874012f,209838d2114d..000000000000
+--- a/drivers/infiniband/core/Makefile
++++ b/drivers/infiniband/core/Makefile
+@@@ -8,9 -8,9 +8,13 @@@ obj-$(CONFIG_INFINIBAND_USER_MAD) +=	ib
+  obj-$(CONFIG_INFINIBAND_USER_ACCESS) +=	ib_uverbs.o ib_ucm.o \
+  					$(user_access-y)
+  
+ -ib_core-y :=			packer.o ud_header.o verbs.o cq.o rw.o sysfs.o \
+ +ib_core-y :=			packer.o ud_header.o verbs.o cq.o sysfs.o \
+  				device.o fmr_pool.o cache.o netlink.o \
+++<<<<<<< HEAD
+ +				roce_gid_mgmt.o
+++=======
++ 				roce_gid_mgmt.o mr_pool.o addr.o
+++>>>>>>> e3f20f02864f (IB/core: Integrate IB address resolution module into core)
+  ib_core-$(CONFIG_INFINIBAND_USER_MEM) += umem.o
+  ib_core-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += umem_odp.o umem_rbtree.o
+  
+@@@ -24,10 -24,10 +28,8 @@@ iw_cm-y :=			iwcm.o iwpm_util.o iwpm_ms
+  
+  rdma_cm-y :=			cma.o
+  
+ -rdma_cm-$(CONFIG_INFINIBAND_ADDR_TRANS_CONFIGFS) += cma_configfs.o
+ -
+  rdma_ucm-y :=			ucma.o
+  
+- ib_addr-y :=			addr.o
+- 
+  ib_umad-y :=			user_mad.o
+  
+  ib_ucm-y :=			ucm.o
+* Unmerged path drivers/infiniband/core/Makefile
+diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
+index 746cdf56bc76..68e9581fbf31 100644
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -47,10 +47,6 @@
+ #include <rdma/ib_addr.h>
+ #include <rdma/ib.h>
+ 
+-MODULE_AUTHOR("Sean Hefty");
+-MODULE_DESCRIPTION("IB Address Translation");
+-MODULE_LICENSE("Dual BSD/GPL");
+-
+ struct addr_req {
+ 	struct list_head list;
+ 	struct sockaddr_storage src_addr;
+@@ -536,7 +532,7 @@ static struct notifier_block nb = {
+ 	.notifier_call = netevent_callback
+ };
+ 
+-static int __init addr_init(void)
++int addr_init(void)
+ {
+ 	addr_wq = create_singlethread_workqueue("ib_addr");
+ 	if (!addr_wq)
+@@ -547,12 +543,9 @@ static int __init addr_init(void)
+ 	return 0;
+ }
+ 
+-static void __exit addr_cleanup(void)
++void addr_cleanup(void)
+ {
+ 	rdma_addr_unregister_client(&self);
+ 	unregister_netevent_notifier(&nb);
+ 	destroy_workqueue(addr_wq);
+ }
+-
+-module_init(addr_init);
+-module_exit(addr_cleanup);
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 0d01fb95d944..ea5ca9c9ab16 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -114,4 +114,7 @@ static inline bool rdma_is_upper_dev_rcu(struct net_device *dev,
+ 	return _upper == upper;
+ }
+ 
++int addr_init(void);
++void addr_cleanup(void);
++
+ #endif /* _CORE_PRIV_H */
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index 84b0c0c4193b..bcd333e7e581 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -974,10 +974,18 @@ static int __init ib_core_init(void)
+ 		goto err_sysfs;
+ 	}
+ 
++	ret = addr_init();
++	if (ret) {
++		pr_warn("Could't init IB address resolution\n");
++		goto err_ibnl;
++	}
++
+ 	ib_cache_setup();
+ 
+ 	return 0;
+ 
++err_ibnl:
++	ibnl_cleanup();
+ err_sysfs:
+ 	class_unregister(&ib_class);
+ err_comp:
+@@ -990,6 +998,7 @@ err:
+ static void __exit ib_core_cleanup(void)
+ {
+ 	ib_cache_cleanup();
++	addr_cleanup();
+ 	ibnl_cleanup();
+ 	class_unregister(&ib_class);
+ 	destroy_workqueue(ib_comp_wq);
