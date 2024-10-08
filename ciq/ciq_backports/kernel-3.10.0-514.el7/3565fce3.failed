@@ -1,0 +1,637 @@
+mm, x86: get_user_pages() for dax mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] x86: get_user_pages() for dax mappings (Jeff Moyer) [1346083 1346084 1346445 1346449 1346472 1347091 1359806]
+Rebuild_FUZZ: 95.00%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 3565fce3a6597e91b8dee3e8e36ebf70f8b7ef9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3565fce3.failed
+
+A dax mapping establishes a pte with _PAGE_DEVMAP set when the driver
+has established a devm_memremap_pages() mapping, i.e.  when the pfn_t
+return from ->direct_access() has PFN_DEV and PFN_MAP set.  Later, when
+encountering _PAGE_DEVMAP during a page table walk we lookup and pin a
+struct dev_pagemap instance to keep the result of pfn_to_page() valid
+until put_page().
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Tested-by: Logan Gunthorpe <logang@deltatee.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3565fce3a6597e91b8dee3e8e36ebf70f8b7ef9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/gup.c
+#	include/linux/huge_mm.h
+#	include/linux/mm.h
+#	kernel/memremap.c
+#	mm/gup.c
+diff --cc arch/x86/mm/gup.c
+index 2ab183bfc9f4,6d5eb5900372..000000000000
+--- a/arch/x86/mm/gup.c
++++ b/arch/x86/mm/gup.c
+@@@ -125,14 -171,18 +172,23 @@@ static noinline int gup_huge_pmd(pmd_t 
+  	mask = _PAGE_PRESENT|_PAGE_USER;
+  	if (write)
+  		mask |= _PAGE_RW;
+ -	if ((pmd_flags(pmd) & mask) != mask)
+ +	if ((pte_flags(pte) & mask) != mask)
+  		return 0;
++ 
++ 	VM_BUG_ON(!pfn_valid(pmd_pfn(pmd)));
++ 	if (pmd_devmap(pmd))
++ 		return __gup_device_huge_pmd(pmd, addr, end, pages, nr);
++ 
+  	/* hugepages are never "special" */
+++<<<<<<< HEAD
+ +	VM_BUG_ON(pte_flags(pte) & _PAGE_SPECIAL);
+ +	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
+++=======
++ 	VM_BUG_ON(pmd_flags(pmd) & _PAGE_SPECIAL);
+++>>>>>>> 3565fce3a659 (mm, x86: get_user_pages() for dax mappings)
+  
+  	refs = 0;
+ -	head = pmd_page(pmd);
+ +	head = pte_page(pte);
+  	page = head + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
+  	do {
+  		VM_BUG_ON_PAGE(compound_head(page) != head, page);
+diff --cc include/linux/huge_mm.h
+index bc76ace62045,cfe81e10bd54..000000000000
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@@ -34,8 -37,7 +34,12 @@@ extern int change_huge_pmd(struct vm_ar
+  			unsigned long addr, pgprot_t newprot,
+  			int prot_numa);
+  int vmf_insert_pfn_pmd(struct vm_area_struct *, unsigned long addr, pmd_t *,
+++<<<<<<< HEAD
+ +			unsigned long pfn, bool write);
+ +
+++=======
++ 			pfn_t pfn, bool write);
+++>>>>>>> 3565fce3a659 (mm, x86: get_user_pages() for dax mappings)
+  enum transparent_hugepage_flag {
+  	TRANSPARENT_HUGEPAGE_FLAG,
+  	TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG,
+@@@ -203,6 -202,17 +210,20 @@@ static inline int do_huge_pmd_numa_page
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool is_huge_zero_page(struct page *page)
++ {
++ 	return false;
++ }
++ 
++ 
++ static inline struct page *follow_devmap_pmd(struct vm_area_struct *vma,
++ 		unsigned long addr, pmd_t *pmd, int flags)
++ {
++ 	return NULL;
++ }
+++>>>>>>> 3565fce3a659 (mm, x86: get_user_pages() for dax mappings)
+  #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+  
+  #endif /* _LINUX_HUGE_MM_H */
+diff --cc include/linux/mm.h
+index 449f02cd1f7b,792f2469c142..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -433,71 -441,31 +434,74 @@@ static inline void page_mapcount_reset(
+  	atomic_set(&(page)->_mapcount, -1);
+  }
+  
+ -int __page_mapcount(struct page *page);
+ -
+  static inline int page_mapcount(struct page *page)
+  {
+ -	VM_BUG_ON_PAGE(PageSlab(page), page);
+ +	return atomic_read(&(page)->_mapcount) + 1;
+ +}
+  
+ -	if (unlikely(PageCompound(page)))
+ -		return __page_mapcount(page);
+ -	return atomic_read(&page->_mapcount) + 1;
+ +static inline int page_count(struct page *page)
+ +{
+ +	return atomic_read(&compound_head(page)->_count);
+  }
+  
+ -#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ -int total_mapcount(struct page *page);
+ -#else
+ -static inline int total_mapcount(struct page *page)
+++<<<<<<< HEAD
+ +#ifdef CONFIG_HUGETLB_PAGE
+ +extern int PageHeadHuge(struct page *page_head);
+ +#else /* CONFIG_HUGETLB_PAGE */
+ +static inline int PageHeadHuge(struct page *page_head)
+  {
+ -	return page_mapcount(page);
+ +	return 0;
+  }
+ -#endif
+ +#endif /* CONFIG_HUGETLB_PAGE */
+  
+ -static inline int page_count(struct page *page)
+ +static inline bool __compound_tail_refcounted(struct page *page)
+  {
+ -	return atomic_read(&compound_head(page)->_count);
+ +	return !PageSlab(page) && !PageHeadHuge(page);
+ +}
+ +
+ +/*
+ + * This takes a head page as parameter and tells if the
+ + * tail page reference counting can be skipped.
+ + *
+ + * For this to be safe, PageSlab and PageHeadHuge must remain true on
+ + * any given page where they return true here, until all tail pins
+ + * have been released.
+ + */
+ +static inline bool compound_tail_refcounted(struct page *page)
+ +{
+ +	VM_BUG_ON_PAGE(!PageHead(page), page);
+ +	return __compound_tail_refcounted(page);
+ +}
+ +
+ +static inline void get_huge_page_tail(struct page *page)
+ +{
+ +	/*
+ +	 * __split_huge_page_refcount() cannot run from under us.
+ +	 */
+ +	VM_BUG_ON_PAGE(!PageTail(page), page);
+ +	VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
+ +	VM_BUG_ON_PAGE(atomic_read(&page->_count) != 0, page);
+ +	if (compound_tail_refcounted(page->first_page))
+ +		atomic_inc(&page->_mapcount);
+ +}
+ +
+ +extern bool __get_page_tail(struct page *page);
+ +
+ +static inline void get_page(struct page *page)
+ +{
+ +	if (unlikely(PageTail(page)))
+ +		if (likely(__get_page_tail(page)))
+ +			return;
+ +	/*
+ +	 * Getting a normal page or the head of a compound page
+ +	 * requires to already have an elevated page->_count.
+ +	 */
+ +	VM_BUG_ON_PAGE(atomic_read(&page->_count) <= 0, page);
+ +	atomic_inc(&page->_count);
+  }
+  
+++=======
+++>>>>>>> 3565fce3a659 (mm, x86: get_user_pages() for dax mappings)
+  static inline struct page *virt_to_head_page(const void *x)
+  {
+  	struct page *page = virt_to_page(x);
+@@@ -513,35 -482,8 +517,38 @@@ static inline void init_page_count(stru
+  	atomic_set(&page->_count, 1);
+  }
+  
+ -void __put_page(struct page *page);
+ +/*
+ + * PageBuddy() indicate that the page is free and in the buddy system
+ + * (see mm/page_alloc.c).
+ + *
+ + * PAGE_BUDDY_MAPCOUNT_VALUE must be <= -2 but better not too close to
+ + * -2 so that an underflow of the page_mapcount() won't be mistaken
+ + * for a genuine PAGE_BUDDY_MAPCOUNT_VALUE. -128 can be created very
+ + * efficiently by most CPU architectures.
+ + */
+ +#define PAGE_BUDDY_MAPCOUNT_VALUE (-128)
+ +
+++<<<<<<< HEAD
+ +static inline int PageBuddy(struct page *page)
+ +{
+ +	return atomic_read(&page->_mapcount) == PAGE_BUDDY_MAPCOUNT_VALUE;
+ +}
+  
+ +static inline void __SetPageBuddy(struct page *page)
+ +{
+ +	VM_BUG_ON_PAGE(atomic_read(&page->_mapcount) != -1, page);
+ +	atomic_set(&page->_mapcount, PAGE_BUDDY_MAPCOUNT_VALUE);
+ +}
+ +
+ +static inline void __ClearPageBuddy(struct page *page)
+ +{
+ +	VM_BUG_ON_PAGE(!PageBuddy(page), page);
+ +	atomic_set(&page->_mapcount, -1);
+ +}
+ +
+ +void put_page(struct page *page);
+++=======
+++>>>>>>> 3565fce3a659 (mm, x86: get_user_pages() for dax mappings)
+  void put_pages_list(struct list_head *pages);
+  
+  void split_page(struct page *page, unsigned int order);
+diff --cc kernel/memremap.c
+index 26717809cbd2,e517a16cb426..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -144,3 -149,253 +144,256 @@@ void devm_memunmap(struct device *dev, 
+  				devm_memremap_match, addr));
+  }
+  EXPORT_SYMBOL(devm_memunmap);
+++<<<<<<< HEAD
+++=======
++ 
++ pfn_t phys_to_pfn_t(dma_addr_t addr, unsigned long flags)
++ {
++ 	return __pfn_to_pfn_t(addr >> PAGE_SHIFT, flags);
++ }
++ EXPORT_SYMBOL(phys_to_pfn_t);
++ 
++ #ifdef CONFIG_ZONE_DEVICE
++ static DEFINE_MUTEX(pgmap_lock);
++ static RADIX_TREE(pgmap_radix, GFP_KERNEL);
++ #define SECTION_MASK ~((1UL << PA_SECTION_SHIFT) - 1)
++ #define SECTION_SIZE (1UL << PA_SECTION_SHIFT)
++ 
++ struct page_map {
++ 	struct resource res;
++ 	struct percpu_ref *ref;
++ 	struct dev_pagemap pgmap;
++ 	struct vmem_altmap altmap;
++ };
++ 
++ void get_zone_device_page(struct page *page)
++ {
++ 	percpu_ref_get(page->pgmap->ref);
++ }
++ EXPORT_SYMBOL(get_zone_device_page);
++ 
++ void put_zone_device_page(struct page *page)
++ {
++ 	put_dev_pagemap(page->pgmap);
++ }
++ EXPORT_SYMBOL(put_zone_device_page);
++ 
++ static void pgmap_radix_release(struct resource *res)
++ {
++ 	resource_size_t key;
++ 
++ 	mutex_lock(&pgmap_lock);
++ 	for (key = res->start; key <= res->end; key += SECTION_SIZE)
++ 		radix_tree_delete(&pgmap_radix, key >> PA_SECTION_SHIFT);
++ 	mutex_unlock(&pgmap_lock);
++ }
++ 
++ static unsigned long pfn_first(struct page_map *page_map)
++ {
++ 	struct dev_pagemap *pgmap = &page_map->pgmap;
++ 	const struct resource *res = &page_map->res;
++ 	struct vmem_altmap *altmap = pgmap->altmap;
++ 	unsigned long pfn;
++ 
++ 	pfn = res->start >> PAGE_SHIFT;
++ 	if (altmap)
++ 		pfn += vmem_altmap_offset(altmap);
++ 	return pfn;
++ }
++ 
++ static unsigned long pfn_end(struct page_map *page_map)
++ {
++ 	const struct resource *res = &page_map->res;
++ 
++ 	return (res->start + resource_size(res)) >> PAGE_SHIFT;
++ }
++ 
++ #define for_each_device_pfn(pfn, map) \
++ 	for (pfn = pfn_first(map); pfn < pfn_end(map); pfn++)
++ 
++ static void devm_memremap_pages_release(struct device *dev, void *data)
++ {
++ 	struct page_map *page_map = data;
++ 	struct resource *res = &page_map->res;
++ 	resource_size_t align_start, align_size;
++ 	struct dev_pagemap *pgmap = &page_map->pgmap;
++ 
++ 	if (percpu_ref_tryget_live(pgmap->ref)) {
++ 		dev_WARN(dev, "%s: page mapping is still live!\n", __func__);
++ 		percpu_ref_put(pgmap->ref);
++ 	}
++ 
++ 	pgmap_radix_release(res);
++ 
++ 	/* pages are dead and unused, undo the arch mapping */
++ 	align_start = res->start & ~(SECTION_SIZE - 1);
++ 	align_size = ALIGN(resource_size(res), SECTION_SIZE);
++ 	arch_remove_memory(align_start, align_size);
++ 	dev_WARN_ONCE(dev, pgmap->altmap && pgmap->altmap->alloc,
++ 			"%s: failed to free all reserved pages\n", __func__);
++ }
++ 
++ /* assumes rcu_read_lock() held at entry */
++ struct dev_pagemap *find_dev_pagemap(resource_size_t phys)
++ {
++ 	struct page_map *page_map;
++ 
++ 	WARN_ON_ONCE(!rcu_read_lock_held());
++ 
++ 	page_map = radix_tree_lookup(&pgmap_radix, phys >> PA_SECTION_SHIFT);
++ 	return page_map ? &page_map->pgmap : NULL;
++ }
++ 
++ /**
++  * devm_memremap_pages - remap and provide memmap backing for the given resource
++  * @dev: hosting device for @res
++  * @res: "host memory" address range
++  * @ref: a live per-cpu reference count
++  * @altmap: optional descriptor for allocating the memmap from @res
++  *
++  * Notes:
++  * 1/ @ref must be 'live' on entry and 'dead' before devm_memunmap_pages() time
++  *    (or devm release event).
++  *
++  * 2/ @res is expected to be a host memory range that could feasibly be
++  *    treated as a "System RAM" range, i.e. not a device mmio range, but
++  *    this is not enforced.
++  */
++ void *devm_memremap_pages(struct device *dev, struct resource *res,
++ 		struct percpu_ref *ref, struct vmem_altmap *altmap)
++ {
++ 	int is_ram = region_intersects(res->start, resource_size(res),
++ 			"System RAM");
++ 	resource_size_t key, align_start, align_size;
++ 	struct dev_pagemap *pgmap;
++ 	struct page_map *page_map;
++ 	unsigned long pfn;
++ 	int error, nid;
++ 
++ 	if (is_ram == REGION_MIXED) {
++ 		WARN_ONCE(1, "%s attempted on mixed region %pr\n",
++ 				__func__, res);
++ 		return ERR_PTR(-ENXIO);
++ 	}
++ 
++ 	if (is_ram == REGION_INTERSECTS)
++ 		return __va(res->start);
++ 
++ 	if (altmap && !IS_ENABLED(CONFIG_SPARSEMEM_VMEMMAP)) {
++ 		dev_err(dev, "%s: altmap requires CONFIG_SPARSEMEM_VMEMMAP=y\n",
++ 				__func__);
++ 		return ERR_PTR(-ENXIO);
++ 	}
++ 
++ 	if (!ref)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	page_map = devres_alloc_node(devm_memremap_pages_release,
++ 			sizeof(*page_map), GFP_KERNEL, dev_to_node(dev));
++ 	if (!page_map)
++ 		return ERR_PTR(-ENOMEM);
++ 	pgmap = &page_map->pgmap;
++ 
++ 	memcpy(&page_map->res, res, sizeof(*res));
++ 
++ 	pgmap->dev = dev;
++ 	if (altmap) {
++ 		memcpy(&page_map->altmap, altmap, sizeof(*altmap));
++ 		pgmap->altmap = &page_map->altmap;
++ 	}
++ 	pgmap->ref = ref;
++ 	pgmap->res = &page_map->res;
++ 
++ 	mutex_lock(&pgmap_lock);
++ 	error = 0;
++ 	for (key = res->start; key <= res->end; key += SECTION_SIZE) {
++ 		struct dev_pagemap *dup;
++ 
++ 		rcu_read_lock();
++ 		dup = find_dev_pagemap(key);
++ 		rcu_read_unlock();
++ 		if (dup) {
++ 			dev_err(dev, "%s: %pr collides with mapping for %s\n",
++ 					__func__, res, dev_name(dup->dev));
++ 			error = -EBUSY;
++ 			break;
++ 		}
++ 		error = radix_tree_insert(&pgmap_radix, key >> PA_SECTION_SHIFT,
++ 				page_map);
++ 		if (error) {
++ 			dev_err(dev, "%s: failed: %d\n", __func__, error);
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&pgmap_lock);
++ 	if (error)
++ 		goto err_radix;
++ 
++ 	nid = dev_to_node(dev);
++ 	if (nid < 0)
++ 		nid = numa_mem_id();
++ 
++ 	align_start = res->start & ~(SECTION_SIZE - 1);
++ 	align_size = ALIGN(resource_size(res), SECTION_SIZE);
++ 	error = arch_add_memory(nid, align_start, align_size, true);
++ 	if (error)
++ 		goto err_add_memory;
++ 
++ 	for_each_device_pfn(pfn, page_map) {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		/* ZONE_DEVICE pages must never appear on a slab lru */
++ 		list_force_poison(&page->lru);
++ 		page->pgmap = pgmap;
++ 	}
++ 	devres_add(dev, page_map);
++ 	return __va(res->start);
++ 
++  err_add_memory:
++  err_radix:
++ 	pgmap_radix_release(res);
++ 	devres_free(page_map);
++ 	return ERR_PTR(error);
++ }
++ EXPORT_SYMBOL(devm_memremap_pages);
++ 
++ unsigned long vmem_altmap_offset(struct vmem_altmap *altmap)
++ {
++ 	/* number of pfns from base where pfn_to_page() is valid */
++ 	return altmap->reserve + altmap->free;
++ }
++ 
++ void vmem_altmap_free(struct vmem_altmap *altmap, unsigned long nr_pfns)
++ {
++ 	altmap->alloc -= nr_pfns;
++ }
++ 
++ #ifdef CONFIG_SPARSEMEM_VMEMMAP
++ struct vmem_altmap *to_vmem_altmap(unsigned long memmap_start)
++ {
++ 	/*
++ 	 * 'memmap_start' is the virtual address for the first "struct
++ 	 * page" in this range of the vmemmap array.  In the case of
++ 	 * CONFIG_SPARSE_VMEMMAP a page_to_pfn conversion is simple
++ 	 * pointer arithmetic, so we can perform this to_vmem_altmap()
++ 	 * conversion without concern for the initialization state of
++ 	 * the struct page fields.
++ 	 */
++ 	struct page *page = (struct page *) memmap_start;
++ 	struct dev_pagemap *pgmap;
++ 
++ 	/*
++ 	 * Uncoditionally retrieve a dev_pagemap associated with the
++ 	 * given physical address, this is only for use in the
++ 	 * arch_{add|remove}_memory() for setting up and tearing down
++ 	 * the memmap.
++ 	 */
++ 	rcu_read_lock();
++ 	pgmap = find_dev_pagemap(__pfn_to_phys(page_to_pfn(page)));
++ 	rcu_read_unlock();
++ 
++ 	return pgmap ? pgmap->altmap : NULL;
++ }
++ #endif /* CONFIG_SPARSEMEM_VMEMMAP */
++ #endif /* CONFIG_ZONE_DEVICE */
+++>>>>>>> 3565fce3a659 (mm, x86: get_user_pages() for dax mappings)
+* Unmerged path mm/gup.c
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index baa6c1dd0ecb..28e50465185e 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -415,6 +415,13 @@ static inline int pte_present(pte_t a)
+ 			       _PAGE_NUMA);
+ }
+ 
++#ifdef __HAVE_ARCH_PTE_DEVMAP
++static inline int pte_devmap(pte_t a)
++{
++	return (pte_flags(a) & _PAGE_DEVMAP) == _PAGE_DEVMAP;
++}
++#endif
++
+ #define pte_accessible pte_accessible
+ static inline bool pte_accessible(struct mm_struct *mm, pte_t a)
+ {
+* Unmerged path arch/x86/mm/gup.c
+* Unmerged path include/linux/huge_mm.h
+* Unmerged path include/linux/mm.h
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/gup.c
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index d2d7f5e6a9e8..b07f437a16b4 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -18,6 +18,7 @@
+ #include <linux/khugepaged.h>
+ #include <linux/freezer.h>
+ #include <linux/mman.h>
++#include <linux/memremap.h>
+ #include <linux/pagemap.h>
+ #include <linux/migrate.h>
+ #include <linux/hashtable.h>
+@@ -910,6 +911,63 @@ int vmf_insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
+ 	return VM_FAULT_NOPAGE;
+ }
+ 
++static void touch_pmd(struct vm_area_struct *vma, unsigned long addr,
++		pmd_t *pmd)
++{
++	pmd_t _pmd;
++
++	/*
++	 * We should set the dirty bit only for FOLL_WRITE but for now
++	 * the dirty bit in the pmd is meaningless.  And if the dirty
++	 * bit will become meaningful and we'll only set it with
++	 * FOLL_WRITE, an atomic set_bit will be required on the pmd to
++	 * set the young bit, instead of the current set_pmd_at.
++	 */
++	_pmd = pmd_mkyoung(pmd_mkdirty(*pmd));
++	if (pmdp_set_access_flags(vma, addr & HPAGE_PMD_MASK,
++				pmd, _pmd,  1))
++		update_mmu_cache_pmd(vma, addr, pmd);
++}
++
++struct page *follow_devmap_pmd(struct vm_area_struct *vma, unsigned long addr,
++		pmd_t *pmd, int flags)
++{
++	unsigned long pfn = pmd_pfn(*pmd);
++	struct mm_struct *mm = vma->vm_mm;
++	struct dev_pagemap *pgmap;
++	struct page *page;
++
++	assert_spin_locked(pmd_lockptr(mm, pmd));
++
++	if (flags & FOLL_WRITE && !pmd_write(*pmd))
++		return NULL;
++
++	if (pmd_present(*pmd) && pmd_devmap(*pmd))
++		/* pass */;
++	else
++		return NULL;
++
++	if (flags & FOLL_TOUCH)
++		touch_pmd(vma, addr, pmd);
++
++	/*
++	 * device mapped pages can only be returned if the
++	 * caller will manage the page reference count.
++	 */
++	if (!(flags & FOLL_GET))
++		return ERR_PTR(-EEXIST);
++
++	pfn += (addr & ~PMD_MASK) >> PAGE_SHIFT;
++	pgmap = get_dev_pagemap(pfn, NULL);
++	if (!pgmap)
++		return ERR_PTR(-EFAULT);
++	page = pfn_to_page(pfn);
++	get_page(page);
++	put_dev_pagemap(pgmap);
++
++	return page;
++}
++
+ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 		  pmd_t *dst_pmd, pmd_t *src_pmd, unsigned long addr,
+ 		  struct vm_area_struct *vma)
+@@ -1323,21 +1381,8 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
+ 
+ 	page = pmd_page(*pmd);
+ 	VM_BUG_ON_PAGE(!PageHead(page), page);
+-	if (flags & FOLL_TOUCH) {
+-		pmd_t _pmd;
+-		/*
+-		 * We should set the dirty bit only for FOLL_WRITE but
+-		 * for now the dirty bit in the pmd is meaningless.
+-		 * And if the dirty bit will become meaningful and
+-		 * we'll only set it with FOLL_WRITE, an atomic
+-		 * set_bit will be required on the pmd to set the
+-		 * young bit, instead of the current set_pmd_at.
+-		 */
+-		_pmd = pmd_mkyoung(pmd_mkdirty(*pmd));
+-		if (pmdp_set_access_flags(vma, addr & HPAGE_PMD_MASK,
+-					  pmd, _pmd,  1))
+-			update_mmu_cache_pmd(vma, addr, pmd);
+-	}
++	if (flags & FOLL_TOUCH)
++		touch_pmd(vma, addr, pmd);
+ 	if ((flags & FOLL_MLOCK) && (vma->vm_flags & VM_LOCKED)) {
+ 		if (page->mapping && trylock_page(page)) {
+ 			lru_add_drain();
+diff --git a/mm/swap.c b/mm/swap.c
+index b4d20d204074..29f4ecc62b00 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -24,6 +24,7 @@
+ #include <linux/export.h>
+ #include <linux/mm_inline.h>
+ #include <linux/percpu_counter.h>
++#include <linux/memremap.h>
+ #include <linux/percpu.h>
+ #include <linux/cpu.h>
+ #include <linux/notifier.h>
