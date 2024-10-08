@@ -433,6 +433,7 @@ struct ehci_iso_packet {
 struct ehci_iso_sched {
 	struct list_head	td_list;
 	unsigned		span;
+	unsigned		first_packet;
 	struct ehci_iso_packet	packet [0];
 };
 
