@@ -1,0 +1,176 @@
+ahci: per-port msix support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williamps@intel.com>
+commit d684a90d38e24dcaf95fdb32c83efe05f80d152a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d684a90d.failed
+
+Some AHCI controllers support per-port MSI-X vectors.  At the same time
+the Linux AHCI driver needs to support one-off architectures that
+implement a single MSI-X vector for all ports.  The heuristic for
+enabling AHCI ports becomes, in order of preference:
+
+1/ per-port multi-MSI-X
+
+2/ per-port multi-MSI
+
+3/ single MSI
+
+4/ single MSI-X
+
+5/ legacy INTX
+
+This all depends on AHCI implementations with potentially broken MSI-X
+requesting less vectors than the number of ports.  If this assumption is
+violated we will need to start explicitly white-listing AHCI-MSIX
+implementations.
+
+	Reported-by: Ricardo Neri <ricardo.neri@intel.com>
+[ricardo: fix struct msix_entry handling]
+	Reported-by: kernel test robot <ying.huang@linux.intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit d684a90d38e24dcaf95fdb32c83efe05f80d152a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/ahci.c
+#	drivers/ata/ahci.h
+#	drivers/ata/libahci.c
+diff --cc drivers/ata/ahci.c
+index 690e32b6811a,594fcabd22cd..000000000000
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@@ -1360,8 -1436,9 +1380,8 @@@ static int ahci_init_interrupts(struct 
+  	if (nvec >= 0)
+  		return nvec;
+  
+- 	/* lagacy intx interrupts */
++ 	/* legacy intx interrupts */
+  	pci_intx(pdev, 1);
+ -	hpriv->irq = pdev->irq;
+  
+  	return 0;
+  }
+@@@ -1535,6 -1598,11 +1555,14 @@@ static int ahci_init_one(struct pci_de
+  	if (!host)
+  		return -ENOMEM;
+  	host->private_data = hpriv;
+++<<<<<<< HEAD
+++=======
++ 	hpriv->msix = devm_kzalloc(&pdev->dev,
++ 			sizeof(struct msix_entry) * n_ports, GFP_KERNEL);
++ 	if (!hpriv->msix)
++ 		return -ENOMEM;
++ 	ahci_init_interrupts(pdev, n_ports, hpriv);
+++>>>>>>> d684a90d38e2 (ahci: per-port msix support)
+  
+  	if (!(hpriv->cap & HOST_CAP_SSS) || ahci_ignore_sss)
+  		host->flags |= ATA_HOST_PARALLEL_SCAN;
+diff --cc drivers/ata/ahci.h
+index 99f0e9fe4522,9e60c50b2103..000000000000
+--- a/drivers/ata/ahci.h
++++ b/drivers/ata/ahci.h
+@@@ -235,7 -238,11 +235,15 @@@ enum 
+  						        port start (wait until
+  						        error-handling stage) */
+  	AHCI_HFLAG_MULTI_MSI		= (1 << 16), /* multiple PCI MSIs */
+++<<<<<<< HEAD
+ +	AHCI_HFLAG_NO_FBS		= (1 << 17), /* no FBS */
+++=======
++ 	AHCI_HFLAG_NO_DEVSLP		= (1 << 17), /* no device sleep */
++ 	AHCI_HFLAG_NO_FBS		= (1 << 18), /* no FBS */
++ 	AHCI_HFLAG_EDGE_IRQ		= (1 << 19), /* HOST_IRQ_STAT behaves as
++ 							Edge Triggered */
++ 	AHCI_HFLAG_MULTI_MSIX		= (1 << 20), /* per-port MSI-X */
+++>>>>>>> d684a90d38e2 (ahci: per-port msix support)
+  
+  	/* ap->flags bits */
+  
+@@@ -325,7 -336,24 +333,28 @@@ struct ahci_host_priv 
+  	u32 			em_loc; /* enclosure management location */
+  	u32			em_buf_sz;	/* EM buffer size in byte */
+  	u32			em_msg_type;	/* EM message type */
+++<<<<<<< HEAD
+ +	struct clk		*clk;		/* Only for platforms supporting clk */
+++=======
++ 	bool			got_runtime_pm; /* Did we do pm_runtime_get? */
++ 	struct clk		*clks[AHCI_MAX_CLKS]; /* Optional */
++ 	struct regulator	**target_pwrs;	/* Optional */
++ 	/*
++ 	 * If platform uses PHYs. There is a 1:1 relation between the port number and
++ 	 * the PHY position in this array.
++ 	 */
++ 	struct phy		**phys;
++ 	struct msix_entry	*msix;		/* Optional MSI-X support */
++ 	unsigned		nports;		/* Number of ports */
++ 	void			*plat_data;	/* Other platform data */
++ 	unsigned int		irq;		/* interrupt line */
++ 	/*
++ 	 * Optional ahci_start_engine override, if not set this gets set to the
++ 	 * default ahci_start_engine during ahci_save_initial_config, this can
++ 	 * be overridden anytime before the host is activated.
++ 	 */
++ 	void			(*start_engine)(struct ata_port *ap);
+++>>>>>>> d684a90d38e2 (ahci: per-port msix support)
+  };
+  
+  extern int ahci_ignore_sss;
+diff --cc drivers/ata/libahci.c
+index 245e3eaedd22,0a5645fb02f8..000000000000
+--- a/drivers/ata/libahci.c
++++ b/drivers/ata/libahci.c
+@@@ -2418,9 -2480,18 +2420,15 @@@ static int ahci_host_activate_multi_irq
+  	rc = ata_host_start(host);
+  	if (rc)
+  		return rc;
+ -	/*
+ -	 * Requests IRQs according to AHCI-1.1 when multiple MSIs were
+ -	 * allocated. That is one MSI per port, starting from @irq.
+ -	 */
+ +
+  	for (i = 0; i < host->n_ports; i++) {
+  		struct ahci_port_priv *pp = host->ports[i]->private_data;
++ 		int irq;
++ 
++ 		if (hpriv->flags & AHCI_HFLAG_MULTI_MSIX)
++ 			irq = hpriv->msix[i].vector;
++ 		else
++ 			irq = hpriv->irq + i;
+  
+  		/* Do not receive interrupts sent by dummy ports */
+  		if (!pp) {
+@@@ -2455,16 -2522,19 +2464,24 @@@
+   *	RETURNS:
+   *	0 on success, -errno otherwise.
+   */
+ -int ahci_host_activate(struct ata_host *host, struct scsi_host_template *sht)
+ +int ahci_host_activate(struct ata_host *host, int irq,
+ +		       struct scsi_host_template *sht)
+  {
+  	struct ahci_host_priv *hpriv = host->private_data;
+ -	int irq = hpriv->irq;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (hpriv->flags & AHCI_HFLAG_MULTI_MSI)
+ +		rc = ahci_host_activate_multi_irqs(host, irq, sht);
+++=======
++ 	if (hpriv->flags & (AHCI_HFLAG_MULTI_MSI | AHCI_HFLAG_MULTI_MSIX))
++ 		rc = ahci_host_activate_multi_irqs(host, sht);
++ 	else if (hpriv->flags & AHCI_HFLAG_EDGE_IRQ)
++ 		rc = ata_host_activate(host, irq, ahci_single_edge_irq_intr,
++ 				       IRQF_SHARED, sht);
+++>>>>>>> d684a90d38e2 (ahci: per-port msix support)
+  	else
+ -		rc = ata_host_activate(host, irq, ahci_single_level_irq_intr,
+ +		rc = ata_host_activate(host, irq, ahci_single_irq_intr,
+  				       IRQF_SHARED, sht);
+  	return rc;
+  }
+* Unmerged path drivers/ata/ahci.c
+* Unmerged path drivers/ata/ahci.h
+* Unmerged path drivers/ata/libahci.c
