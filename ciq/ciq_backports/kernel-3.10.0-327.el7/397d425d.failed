@@ -1,0 +1,299 @@
+vfs: Test for and handle paths that are unreachable from their mnt_root
+
+jira LE-1907
+cve CVE-2015-2925
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 397d425dc26da728396e66d392d5dcb8dac30c37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/397d425d.failed
+
+In rare cases a directory can be renamed out from under a bind mount.
+In those cases without special handling it becomes possible to walk up
+the directory tree to the root dentry of the filesystem and down
+from the root dentry to every other file or directory on the filesystem.
+
+Like division by zero .. from an unconnected path can not be given
+a useful semantic as there is no predicting at which path component
+the code will realize it is unconnected.  We certainly can not match
+the current behavior as the current behavior is a security hole.
+
+Therefore when encounting .. when following an unconnected path
+return -ENOENT.
+
+- Add a function path_connected to verify path->dentry is reachable
+  from path->mnt.mnt_root.  AKA to validate that rename did not do
+  something nasty to the bind mount.
+
+  To avoid races path_connected must be called after following a path
+  component to it's next path component.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 397d425dc26da728396e66d392d5dcb8dac30c37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+diff --cc fs/namei.c
+index f812b27e37bc,29b927938b8c..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -472,6 -492,167 +472,170 @@@ void path_put(const struct path *path
+  }
+  EXPORT_SYMBOL(path_put);
+  
+++<<<<<<< HEAD
+++=======
++ #define EMBEDDED_LEVELS 2
++ struct nameidata {
++ 	struct path	path;
++ 	struct qstr	last;
++ 	struct path	root;
++ 	struct inode	*inode; /* path.dentry.d_inode */
++ 	unsigned int	flags;
++ 	unsigned	seq, m_seq;
++ 	int		last_type;
++ 	unsigned	depth;
++ 	int		total_link_count;
++ 	struct saved {
++ 		struct path link;
++ 		void *cookie;
++ 		const char *name;
++ 		struct inode *inode;
++ 		unsigned seq;
++ 	} *stack, internal[EMBEDDED_LEVELS];
++ 	struct filename	*name;
++ 	struct nameidata *saved;
++ 	unsigned	root_seq;
++ 	int		dfd;
++ };
++ 
++ static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
++ {
++ 	struct nameidata *old = current->nameidata;
++ 	p->stack = p->internal;
++ 	p->dfd = dfd;
++ 	p->name = name;
++ 	p->total_link_count = old ? old->total_link_count : 0;
++ 	p->saved = old;
++ 	current->nameidata = p;
++ }
++ 
++ static void restore_nameidata(void)
++ {
++ 	struct nameidata *now = current->nameidata, *old = now->saved;
++ 
++ 	current->nameidata = old;
++ 	if (old)
++ 		old->total_link_count = now->total_link_count;
++ 	if (now->stack != now->internal) {
++ 		kfree(now->stack);
++ 		now->stack = now->internal;
++ 	}
++ }
++ 
++ static int __nd_alloc_stack(struct nameidata *nd)
++ {
++ 	struct saved *p;
++ 
++ 	if (nd->flags & LOOKUP_RCU) {
++ 		p= kmalloc(MAXSYMLINKS * sizeof(struct saved),
++ 				  GFP_ATOMIC);
++ 		if (unlikely(!p))
++ 			return -ECHILD;
++ 	} else {
++ 		p= kmalloc(MAXSYMLINKS * sizeof(struct saved),
++ 				  GFP_KERNEL);
++ 		if (unlikely(!p))
++ 			return -ENOMEM;
++ 	}
++ 	memcpy(p, nd->internal, sizeof(nd->internal));
++ 	nd->stack = p;
++ 	return 0;
++ }
++ 
++ /**
++  * path_connected - Verify that a path->dentry is below path->mnt.mnt_root
++  * @path: nameidate to verify
++  *
++  * Rename can sometimes move a file or directory outside of a bind
++  * mount, path_connected allows those cases to be detected.
++  */
++ static bool path_connected(const struct path *path)
++ {
++ 	struct vfsmount *mnt = path->mnt;
++ 
++ 	/* Only bind mounts can have disconnected paths */
++ 	if (mnt->mnt_root == mnt->mnt_sb->s_root)
++ 		return true;
++ 
++ 	return is_subdir(path->dentry, mnt->mnt_root);
++ }
++ 
++ static inline int nd_alloc_stack(struct nameidata *nd)
++ {
++ 	if (likely(nd->depth != EMBEDDED_LEVELS))
++ 		return 0;
++ 	if (likely(nd->stack != nd->internal))
++ 		return 0;
++ 	return __nd_alloc_stack(nd);
++ }
++ 
++ static void drop_links(struct nameidata *nd)
++ {
++ 	int i = nd->depth;
++ 	while (i--) {
++ 		struct saved *last = nd->stack + i;
++ 		struct inode *inode = last->inode;
++ 		if (last->cookie && inode->i_op->put_link) {
++ 			inode->i_op->put_link(inode, last->cookie);
++ 			last->cookie = NULL;
++ 		}
++ 	}
++ }
++ 
++ static void terminate_walk(struct nameidata *nd)
++ {
++ 	drop_links(nd);
++ 	if (!(nd->flags & LOOKUP_RCU)) {
++ 		int i;
++ 		path_put(&nd->path);
++ 		for (i = 0; i < nd->depth; i++)
++ 			path_put(&nd->stack[i].link);
++ 		if (nd->root.mnt && !(nd->flags & LOOKUP_ROOT)) {
++ 			path_put(&nd->root);
++ 			nd->root.mnt = NULL;
++ 		}
++ 	} else {
++ 		nd->flags &= ~LOOKUP_RCU;
++ 		if (!(nd->flags & LOOKUP_ROOT))
++ 			nd->root.mnt = NULL;
++ 		rcu_read_unlock();
++ 	}
++ 	nd->depth = 0;
++ }
++ 
++ /* path_put is needed afterwards regardless of success or failure */
++ static bool legitimize_path(struct nameidata *nd,
++ 			    struct path *path, unsigned seq)
++ {
++ 	int res = __legitimize_mnt(path->mnt, nd->m_seq);
++ 	if (unlikely(res)) {
++ 		if (res > 0)
++ 			path->mnt = NULL;
++ 		path->dentry = NULL;
++ 		return false;
++ 	}
++ 	if (unlikely(!lockref_get_not_dead(&path->dentry->d_lockref))) {
++ 		path->dentry = NULL;
++ 		return false;
++ 	}
++ 	return !read_seqcount_retry(&path->dentry->d_seq, seq);
++ }
++ 
++ static bool legitimize_links(struct nameidata *nd)
++ {
++ 	int i;
++ 	for (i = 0; i < nd->depth; i++) {
++ 		struct saved *last = nd->stack + i;
++ 		if (unlikely(!legitimize_path(nd, &last->link, last->seq))) {
++ 			drop_links(nd);
++ 			nd->depth = i + 1;
++ 			return false;
++ 		}
++ 	}
++ 	return true;
++ }
++ 
+++>>>>>>> 397d425dc26d (vfs: Test for and handle paths that are unreachable from their mnt_root)
+  /*
+   * Path walking has 2 modes, rcu-walk and ref-walk (see
+   * Documentation/filesystems/path-lookup.txt).  In situations when we can't
+@@@ -1166,27 -1308,46 +1330,29 @@@ static int follow_dotdot_rcu(struct nam
+  			struct dentry *parent = old->d_parent;
+  			unsigned seq;
+  
+ -			inode = parent->d_inode;
+  			seq = read_seqcount_begin(&parent->d_seq);
+ -			if (unlikely(read_seqcount_retry(&old->d_seq, nd->seq)))
+ -				return -ECHILD;
+ +			if (read_seqcount_retry(&old->d_seq, nd->seq))
+ +				goto failed;
+  			nd->path.dentry = parent;
+  			nd->seq = seq;
++ 			if (unlikely(!path_connected(&nd->path)))
++ 				return -ENOENT;
+  			break;
+ -		} else {
+ -			struct mount *mnt = real_mount(nd->path.mnt);
+ -			struct mount *mparent = mnt->mnt_parent;
+ -			struct dentry *mountpoint = mnt->mnt_mountpoint;
+ -			struct inode *inode2 = mountpoint->d_inode;
+ -			unsigned seq = read_seqcount_begin(&mountpoint->d_seq);
+ -			if (unlikely(read_seqretry(&mount_lock, nd->m_seq)))
+ -				return -ECHILD;
+ -			if (&mparent->mnt == nd->path.mnt)
+ -				break;
+ -			/* we know that mountpoint was pinned */
+ -			nd->path.dentry = mountpoint;
+ -			nd->path.mnt = &mparent->mnt;
+ -			inode = inode2;
+ -			nd->seq = seq;
+  		}
+ -	}
+ -	while (unlikely(d_mountpoint(nd->path.dentry))) {
+ -		struct mount *mounted;
+ -		mounted = __lookup_mnt(nd->path.mnt, nd->path.dentry);
+ -		if (unlikely(read_seqretry(&mount_lock, nd->m_seq)))
+ -			return -ECHILD;
+ -		if (!mounted)
+ +		if (!follow_up_rcu(&nd->path))
+  			break;
+ -		nd->path.mnt = &mounted->mnt;
+ -		nd->path.dentry = mounted->mnt.mnt_root;
+ -		inode = nd->path.dentry->d_inode;
+  		nd->seq = read_seqcount_begin(&nd->path.dentry->d_seq);
+  	}
+ -	nd->inode = inode;
+ +	follow_mount_rcu(nd);
+ +	nd->inode = nd->path.dentry->d_inode;
+  	return 0;
+ +
+ +failed:
+ +	nd->flags &= ~LOOKUP_RCU;
+ +	if (!(nd->flags & LOOKUP_ROOT))
+ +		nd->root.mnt = NULL;
+ +	unlock_rcu_walk();
+ +	return -ECHILD;
+  }
+  
+  /*
+@@@ -1254,9 -1416,10 +1420,9 @@@ static void follow_mount(struct path *p
+  	}
+  }
+  
+- static void follow_dotdot(struct nameidata *nd)
++ static int follow_dotdot(struct nameidata *nd)
+  {
+ -	if (!nd->root.mnt)
+ -		set_root(nd);
+ +	set_root(nd);
+  
+  	while(1) {
+  		struct dentry *old = nd->path.dentry;
+@@@ -1496,10 -1655,9 +1665,10 @@@ static inline int handle_dots(struct na
+  {
+  	if (type == LAST_DOTDOT) {
+  		if (nd->flags & LOOKUP_RCU) {
+ -			return follow_dotdot_rcu(nd);
+ +			if (follow_dotdot_rcu(nd))
+ +				return -ECHILD;
+  		} else
+- 			follow_dotdot(nd);
++ 			return follow_dotdot(nd);
+  	}
+  	return 0;
+  }
+* Unmerged path fs/namei.c
