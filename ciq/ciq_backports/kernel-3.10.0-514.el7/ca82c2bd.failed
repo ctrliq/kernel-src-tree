@@ -1,0 +1,132 @@
+iscsi-target: Fix rx_login_comp hang after login failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit ca82c2bded29b38d36140bfa1e76a7bbfcade390
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ca82c2bd.failed
+
+This patch addresses a case where iscsi_target_do_tx_login_io()
+fails sending the last login response PDU, after the RX/TX
+threads have already been started.
+
+The case centers around iscsi_target_rx_thread() not invoking
+allow_signal(SIGINT) before the send_sig(SIGINT, ...) occurs
+from the failure path, resulting in RX thread hanging
+indefinately on iscsi_conn->rx_login_comp.
+
+Note this bug is a regression introduced by:
+
+  commit e54198657b65625085834847ab6271087323ffea
+  Author: Nicholas Bellinger <nab@linux-iscsi.org>
+  Date:   Wed Jul 22 23:14:19 2015 -0700
+
+      iscsi-target: Fix iscsit_start_kthreads failure OOPs
+
+To address this bug, complete ->rx_login_complete for good
+measure in the failure path, and immediately return from
+RX thread context if connection state did not actually reach
+full feature phase (TARG_CONN_STATE_LOGGED_IN).
+
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: <stable@vger.kernel.org> # v3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit ca82c2bded29b38d36140bfa1e76a7bbfcade390)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target.c
+#	drivers/target/iscsi/iscsi_target_nego.c
+diff --cc drivers/target/iscsi/iscsi_target.c
+index c4fef98585d3,72204fbf2bb1..000000000000
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@@ -4075,9 -4074,20 +4075,20 @@@ reject
+  	return iscsit_add_reject(conn, ISCSI_REASON_BOOKMARK_NO_RESOURCES, buf);
+  }
+  
++ static bool iscsi_target_check_conn_state(struct iscsi_conn *conn)
++ {
++ 	bool ret;
++ 
++ 	spin_lock_bh(&conn->state_lock);
++ 	ret = (conn->conn_state != TARG_CONN_STATE_LOGGED_IN);
++ 	spin_unlock_bh(&conn->state_lock);
++ 
++ 	return ret;
++ }
++ 
+  int iscsi_target_rx_thread(void *arg)
+  {
+ -	int ret, rc;
+ +	int ret;
+  	u8 buffer[ISCSI_HDR_LEN], opcode;
+  	u32 checksum = 0, digest = 0;
+  	struct iscsi_conn *conn = arg;
+@@@ -4087,6 -4097,13 +4098,16 @@@
+  	 * connection recovery / failure event can be triggered externally.
+  	 */
+  	allow_signal(SIGINT);
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Wait for iscsi_post_login_handler() to complete before allowing
++ 	 * incoming iscsi/tcp socket I/O, and/or failing the connection.
++ 	 */
++ 	rc = wait_for_completion_interruptible(&conn->rx_login_comp);
++ 	if (rc < 0 || iscsi_target_check_conn_state(conn))
++ 		return 0;
+++>>>>>>> ca82c2bded29 (iscsi-target: Fix rx_login_comp hang after login failure)
+  
+  	if (conn->conn_transport->transport_type == ISCSI_INFINIBAND) {
+  		struct completion comp;
+diff --cc drivers/target/iscsi/iscsi_target_nego.c
+index 52409a817501,9fc9117d0f22..000000000000
+--- a/drivers/target/iscsi/iscsi_target_nego.c
++++ b/drivers/target/iscsi/iscsi_target_nego.c
+@@@ -364,18 -364,46 +364,39 @@@ static int iscsi_target_do_tx_login_io(
+  
+  	if (conn->conn_transport->iscsit_put_login_tx(conn, login,
+  					login->rsp_length + padding) < 0)
+ -		goto err;
+ +		return -1;
+  
+  	login->rsp_length		= 0;
+ +	mutex_lock(&sess->cmdsn_mutex);
+ +	login_rsp->exp_cmdsn		= cpu_to_be32(sess->exp_cmd_sn);
+ +	login_rsp->max_cmdsn		= cpu_to_be32(sess->max_cmd_sn);
+ +	mutex_unlock(&sess->cmdsn_mutex);
+  
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ err:
++ 	if (login->login_complete) {
++ 		if (conn->rx_thread && conn->rx_thread_active) {
++ 			send_sig(SIGINT, conn->rx_thread, 1);
++ 			complete(&conn->rx_login_comp);
++ 			kthread_stop(conn->rx_thread);
++ 		}
++ 		if (conn->tx_thread && conn->tx_thread_active) {
++ 			send_sig(SIGINT, conn->tx_thread, 1);
++ 			kthread_stop(conn->tx_thread);
++ 		}
++ 		spin_lock(&iscsit_global->ts_bitmap_lock);
++ 		bitmap_release_region(iscsit_global->ts_bitmap, conn->bitmap_id,
++ 				      get_order(1));
++ 		spin_unlock(&iscsit_global->ts_bitmap_lock);
++ 	}
++ 	return -1;
+++>>>>>>> ca82c2bded29 (iscsi-target: Fix rx_login_comp hang after login failure)
+  }
+  
+ -static void iscsi_target_sk_data_ready(struct sock *sk)
+ +static void iscsi_target_sk_data_ready(struct sock *sk, int bytes)
+  {
+  	struct iscsi_conn *conn = sk->sk_user_data;
+  	bool rc;
+* Unmerged path drivers/target/iscsi/iscsi_target.c
+* Unmerged path drivers/target/iscsi/iscsi_target_nego.c
