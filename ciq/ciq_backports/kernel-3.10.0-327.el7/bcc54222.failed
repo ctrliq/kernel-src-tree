@@ -1,0 +1,157 @@
+mm: hugetlb: introduce page_huge_active
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [mm] hugetlb: introduce page_huge_active (Tomoaki Nishimura) [1226196]
+Rebuild_FUZZ: 94.59%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit bcc54222309c70ebcb6c69c156fba4a13dee0a3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bcc54222.failed
+
+We are not safe from calling isolate_huge_page() on a hugepage
+concurrently, which can make the victim hugepage in invalid state and
+results in BUG_ON().
+
+The root problem of this is that we don't have any information on struct
+page (so easily accessible) about hugepages' activeness.  Note that
+hugepages' activeness means just being linked to
+hstate->hugepage_activelist, which is not the same as normal pages'
+activeness represented by PageActive flag.
+
+Normal pages are isolated by isolate_lru_page() which prechecks PageLRU
+before isolation, so let's do similarly for hugetlb with a new
+paeg_huge_active().
+
+set/clear_page_huge_active() should be called within hugetlb_lock.  But
+hugetlb_cow() and hugetlb_no_page() don't do this, being justified because
+in these functions set_page_huge_active() is called right after the
+hugepage is allocated and no other thread tries to isolate it.
+
+[akpm@linux-foundation.org: s/PageHugeActive/page_huge_active/, make it return bool]
+[fengguang.wu@intel.com: set_page_huge_active() can be static]
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Reviewed-by: Michal Hocko <mhocko@suse.cz>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Signed-off-by: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit bcc54222309c70ebcb6c69c156fba4a13dee0a3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+#	mm/memory-failure.c
+diff --cc mm/hugetlb.c
+index 567a4225dad3,05407831016b..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -830,7 -968,16 +855,8 @@@ void free_huge_page(struct page *page
+  	restore_reserve = PagePrivate(page);
+  	ClearPagePrivate(page);
+  
+ -	/*
+ -	 * A return code of zero implies that the subpool will be under its
+ -	 * minimum size if the reservation is not restored after page is free.
+ -	 * Therefore, force restore_reserve operation.
+ -	 */
+ -	if (hugepage_subpool_put_pages(spool, 1) == 0)
+ -		restore_reserve = true;
+ -
+  	spin_lock(&hugetlb_lock);
++ 	clear_page_huge_active(page);
+  	hugetlb_cgroup_uncharge_page(hstate_index(h),
+  				     pages_per_huge_page(h), page);
+  	if (restore_reserve)
+@@@ -3467,3 -3938,52 +3495,55 @@@ int dequeue_hwpoisoned_huge_page(struc
+  	return ret;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ bool isolate_huge_page(struct page *page, struct list_head *list)
++ {
++ 	bool ret = true;
++ 
++ 	VM_BUG_ON_PAGE(!PageHead(page), page);
++ 	spin_lock(&hugetlb_lock);
++ 	if (!page_huge_active(page) || !get_page_unless_zero(page)) {
++ 		ret = false;
++ 		goto unlock;
++ 	}
++ 	clear_page_huge_active(page);
++ 	list_move_tail(&page->lru, list);
++ unlock:
++ 	spin_unlock(&hugetlb_lock);
++ 	return ret;
++ }
++ 
++ void putback_active_hugepage(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(!PageHead(page), page);
++ 	spin_lock(&hugetlb_lock);
++ 	set_page_huge_active(page);
++ 	list_move_tail(&page->lru, &(page_hstate(page))->hugepage_activelist);
++ 	spin_unlock(&hugetlb_lock);
++ 	put_page(page);
++ }
++ 
++ bool is_hugepage_active(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(!PageHuge(page), page);
++ 	/*
++ 	 * This function can be called for a tail page because the caller,
++ 	 * scan_movable_pages, scans through a given pfn-range which typically
++ 	 * covers one memory block. In systems using gigantic hugepage (1GB
++ 	 * for x86_64,) a hugepage is larger than a memory block, and we don't
++ 	 * support migrating such large hugepages for now, so return false
++ 	 * when called for tail pages.
++ 	 */
++ 	if (PageTail(page))
++ 		return false;
++ 	/*
++ 	 * Refcount of a hwpoisoned hugepages is 1, but they are not active,
++ 	 * so we should return false for them.
++ 	 */
++ 	if (unlikely(PageHWPoison(page)))
++ 		return false;
++ 	return page_count(page) > 0;
++ }
+++>>>>>>> bcc54222309c (mm: hugetlb: introduce page_huge_active)
+diff --cc mm/memory-failure.c
+index 96911c114194,d9359b770cd9..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -1555,9 -1586,19 +1555,25 @@@ static int soft_offline_huge_page(struc
+  	}
+  	unlock_page(hpage);
+  
+++<<<<<<< HEAD
+ +	/* Keep page count to indicate a given hugepage is isolated. */
+ +	list_move(&hpage->lru, &pagelist);
+ +	ret = migrate_pages(&pagelist, new_page, MPOL_MF_MOVE_ALL,
+++=======
++ 	ret = isolate_huge_page(hpage, &pagelist);
++ 	if (ret) {
++ 		/*
++ 		 * get_any_page() and isolate_huge_page() takes a refcount each,
++ 		 * so need to drop one here.
++ 		 */
++ 		put_page(hpage);
++ 	} else {
++ 		pr_info("soft offline: %#lx hugepage failed to isolate\n", pfn);
++ 		return -EBUSY;
++ 	}
++ 
++ 	ret = migrate_pages(&pagelist, new_page, NULL, MPOL_MF_MOVE_ALL,
+++>>>>>>> bcc54222309c (mm: hugetlb: introduce page_huge_active)
+  				MIGRATE_SYNC, MR_MEMORY_FAILURE);
+  	if (ret) {
+  		pr_info("soft offline: %#lx: migration failed %d, type %lx\n",
+* Unmerged path mm/hugetlb.c
+* Unmerged path mm/memory-failure.c
