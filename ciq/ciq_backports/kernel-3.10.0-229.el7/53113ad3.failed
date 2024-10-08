@@ -1,0 +1,160 @@
+pnfs: clean up *_resend_to_mds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit 53113ad35e4b9ce82d949c7c67c7b666fad5d907
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/53113ad3.failed
+
+Clean up pnfs_read_done_resend_to_mds and pnfs_write_done_resend_to_mds:
+ - instead of passing all arguments from a nfs_pgio_header, just pass the header
+ - share the common code
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 53113ad35e4b9ce82d949c7c67c7b666fad5d907)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/pnfs.c
+index eed474e3fcc7,83ff8a05485a..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1512,10 -1490,7 +1491,14 @@@ static void pnfs_ld_handle_write_error(
+  		pnfs_return_layout(hdr->inode);
+  	}
+  	if (!test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags))
+++<<<<<<< HEAD
+ +		data->task.tk_status = pnfs_write_done_resend_to_mds(hdr->inode,
+ +							&hdr->pages,
+ +							hdr->completion_ops,
+ +							hdr->dreq);
+++=======
++ 		hdr->task.tk_status = pnfs_write_done_resend_to_mds(hdr);
+++>>>>>>> 53113ad35e4b (pnfs: clean up *_resend_to_mds)
+  }
+  
+  /*
+@@@ -1667,10 -1606,7 +1632,14 @@@ static void pnfs_ld_handle_read_error(s
+  		pnfs_return_layout(hdr->inode);
+  	}
+  	if (!test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags))
+++<<<<<<< HEAD
+ +		data->task.tk_status = pnfs_read_done_resend_to_mds(hdr->inode,
+ +							&hdr->pages,
+ +							hdr->completion_ops,
+ +							hdr->dreq);
+++=======
++ 		hdr->task.tk_status = pnfs_read_done_resend_to_mds(hdr);
+++>>>>>>> 53113ad35e4b (pnfs: clean up *_resend_to_mds)
+  }
+  
+  /*
+diff --git a/fs/nfs/filelayout/filelayout.c b/fs/nfs/filelayout/filelayout.c
+index b06557ac57c5..330631db4a8b 100644
+--- a/fs/nfs/filelayout/filelayout.c
++++ b/fs/nfs/filelayout/filelayout.c
+@@ -98,10 +98,7 @@ static void filelayout_reset_write(struct nfs_write_data *data)
+ 			data->args.count,
+ 			(unsigned long long)data->args.offset);
+ 
+-		task->tk_status = pnfs_write_done_resend_to_mds(hdr->inode,
+-							&hdr->pages,
+-							hdr->completion_ops,
+-							hdr->dreq);
++		task->tk_status = pnfs_write_done_resend_to_mds(hdr);
+ 	}
+ }
+ 
+@@ -119,10 +116,7 @@ static void filelayout_reset_read(struct nfs_read_data *data)
+ 			data->args.count,
+ 			(unsigned long long)data->args.offset);
+ 
+-		task->tk_status = pnfs_read_done_resend_to_mds(hdr->inode,
+-							&hdr->pages,
+-							hdr->completion_ops,
+-							hdr->dreq);
++		task->tk_status = pnfs_read_done_resend_to_mds(hdr);
+ 	}
+ }
+ 
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 00f3d2d2a504..7a2fdd78793b 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -496,6 +496,38 @@ int nfs_pageio_add_request(struct nfs_pageio_descriptor *desc,
+ }
+ EXPORT_SYMBOL_GPL(nfs_pageio_add_request);
+ 
++/*
++ * nfs_pageio_resend - Transfer requests to new descriptor and resend
++ * @hdr - the pgio header to move request from
++ * @desc - the pageio descriptor to add requests to
++ *
++ * Try to move each request (nfs_page) from @hdr to @desc then attempt
++ * to send them.
++ *
++ * Returns 0 on success and < 0 on error.
++ */
++int nfs_pageio_resend(struct nfs_pageio_descriptor *desc,
++		      struct nfs_pgio_header *hdr)
++{
++	LIST_HEAD(failed);
++
++	desc->pg_dreq = hdr->dreq;
++	while (!list_empty(&hdr->pages)) {
++		struct nfs_page *req = nfs_list_entry(hdr->pages.next);
++
++		nfs_list_remove_request(req);
++		if (!nfs_pageio_add_request(desc, req))
++			nfs_list_add_request(req, &failed);
++	}
++	nfs_pageio_complete(desc);
++	if (!list_empty(&failed)) {
++		list_move(&failed, &hdr->pages);
++		return -EIO;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nfs_pageio_resend);
++
+ /**
+  * nfs_pageio_complete - Complete I/O on an nfs_pageio_descriptor
+  * @desc: pointer to io descriptor
+* Unmerged path fs/nfs/pnfs.c
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index bb1f061f76db..60731297c922 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -228,12 +228,8 @@ struct pnfs_layout_segment *pnfs_update_layout(struct inode *ino,
+ 					       gfp_t gfp_flags);
+ 
+ void nfs4_deviceid_mark_client_invalid(struct nfs_client *clp);
+-int pnfs_read_done_resend_to_mds(struct inode *inode, struct list_head *head,
+-			const struct nfs_pgio_completion_ops *compl_ops,
+-			struct nfs_direct_req *dreq);
+-int pnfs_write_done_resend_to_mds(struct inode *inode, struct list_head *head,
+-			const struct nfs_pgio_completion_ops *compl_ops,
+-			struct nfs_direct_req *dreq);
++int pnfs_read_done_resend_to_mds(struct nfs_pgio_header *);
++int pnfs_write_done_resend_to_mds(struct nfs_pgio_header *);
+ struct nfs4_threshold *pnfs_mdsthreshold_alloc(void);
+ 
+ /* nfs4_deviceid_flags */
+diff --git a/include/linux/nfs_page.h b/include/linux/nfs_page.h
+index 214e09851870..e7f991297c56 100644
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@ -88,6 +88,8 @@ extern	void nfs_pageio_init(struct nfs_pageio_descriptor *desc,
+ 			     int how);
+ extern	int nfs_pageio_add_request(struct nfs_pageio_descriptor *,
+ 				   struct nfs_page *);
++extern  int nfs_pageio_resend(struct nfs_pageio_descriptor *,
++			      struct nfs_pgio_header *);
+ extern	void nfs_pageio_complete(struct nfs_pageio_descriptor *desc);
+ extern	void nfs_pageio_cond_complete(struct nfs_pageio_descriptor *, pgoff_t);
+ extern size_t nfs_generic_pg_test(struct nfs_pageio_descriptor *desc,
