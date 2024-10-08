@@ -1,0 +1,113 @@
+xprtrdma: Fix XDR tail buffer marshalling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 677eb17e94edfbbea3b7e628d8aa046930f102c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/677eb17e.failed
+
+Currently xprtrdma appends an extra chunk element to the RPC/RDMA
+read chunk list of each NFSv4 WRITE compound. The extra element
+contains the final GETATTR operation in the compound.
+
+The result is an extra RDMA READ operation to transfer a very short
+piece of each NFS WRITE compound (typically 16 bytes). This is
+inefficient.
+
+It is also incorrect.
+
+The client is sending the trailing GETATTR at the same Position as
+the preceding WRITE data payload. Whether or not RFC 5667 allows
+the GETATTR to appear in a read chunk, RFC 5666 requires that these
+two separate RPC arguments appear at two distinct Positions.
+
+It can also be argued that the GETATTR operation is not bulk data,
+and therefore RFC 5667 forbids its appearance in a read chunk at
+all.
+
+Although RFC 5667 is not precise about when using a read list with
+NFSv4 COMPOUND is allowed, the intent is that only data arguments
+not touched by NFS (ie, read and write payloads) are to be sent
+using RDMA READ or WRITE.
+
+The NFS client constructs GETATTR arguments itself, and therefore is
+required to send the trailing GETATTR operation as additional inline
+content, not as a data payload.
+
+NB: This change is not backwards compatible. Some older servers do
+not accept inline content following the read list. The Linux NFS
+server should handle this content correctly as of commit
+a97c331f9aa9 ("svcrdma: Handle additional inline content").
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 677eb17e94edfbbea3b7e628d8aa046930f102c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 7cfb717728c2,1dd48f269986..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -482,45 -509,15 +522,55 @@@ rpcrdma_marshal_req(struct rpc_rqst *rq
+  	 */
+  	if (rtype == rpcrdma_noch) {
+  
+ -		rpcrdma_inline_pullup(rqst);
+ +		padlen = rpcrdma_inline_pullup(rqst,
+ +						RPCRDMA_INLINE_PAD_VALUE(rqst));
+ +
+++<<<<<<< HEAD
+ +		if (padlen) {
+ +			headerp->rm_type = rdma_msgp;
+ +			headerp->rm_body.rm_padded.rm_align =
+ +				cpu_to_be32(RPCRDMA_INLINE_PAD_VALUE(rqst));
+ +			headerp->rm_body.rm_padded.rm_thresh =
+ +				cpu_to_be32(RPCRDMA_INLINE_PAD_THRESH);
+ +			headerp->rm_body.rm_padded.rm_pempty[0] = xdr_zero;
+ +			headerp->rm_body.rm_padded.rm_pempty[1] = xdr_zero;
+ +			headerp->rm_body.rm_padded.rm_pempty[2] = xdr_zero;
+ +			hdrlen += 2 * sizeof(u32); /* extra words in padhdr */
+ +			if (wtype != rpcrdma_noch) {
+ +				dprintk("RPC:       %s: invalid chunk list\n",
+ +					__func__);
+ +				return -EIO;
+ +			}
+ +		} else {
+ +			headerp->rm_body.rm_nochunks.rm_empty[0] = xdr_zero;
+ +			headerp->rm_body.rm_nochunks.rm_empty[1] = xdr_zero;
+ +			headerp->rm_body.rm_nochunks.rm_empty[2] = xdr_zero;
+ +			/* new length after pullup */
+ +			rpclen = rqst->rq_svec[0].iov_len;
+ +			/*
+ +			 * Currently we try to not actually use read inline.
+ +			 * Reply chunks have the desirable property that
+ +			 * they land, packed, directly in the target buffers
+ +			 * without headers, so they require no fixup. The
+ +			 * additional RDMA Write op sends the same amount
+ +			 * of data, streams on-the-wire and adds no overhead
+ +			 * on receive. Therefore, we request a reply chunk
+ +			 * for non-writes wherever feasible and efficient.
+ +			 */
+ +			if (wtype == rpcrdma_noch)
+ +				wtype = rpcrdma_replych;
+ +		}
+ +	}
+  
+++=======
++ 		headerp->rm_body.rm_nochunks.rm_empty[0] = xdr_zero;
++ 		headerp->rm_body.rm_nochunks.rm_empty[1] = xdr_zero;
++ 		headerp->rm_body.rm_nochunks.rm_empty[2] = xdr_zero;
++ 		/* new length after pullup */
++ 		rpclen = rqst->rq_svec[0].iov_len;
++ 	} else if (rtype == rpcrdma_readch)
++ 		rpclen += rpcrdma_tail_pullup(&rqst->rq_snd_buf);
+++>>>>>>> 677eb17e94ed (xprtrdma: Fix XDR tail buffer marshalling)
+  	if (rtype != rpcrdma_noch) {
+  		hdrlen = rpcrdma_create_chunks(rqst, &rqst->rq_snd_buf,
+  					       headerp, rtype);
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
