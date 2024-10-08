@@ -1,0 +1,123 @@
+inet: split syncookie keys for ipv4 and ipv6 and initialize with net_get_random_once
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit b23a002fc6f0c19846ee0382f019429af54a27e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b23a002f.failed
+
+This patch splits the secret key for syncookies for ipv4 and ipv6 and
+initializes them with net_get_random_once. This change was the reason I
+did this series. I think the initialization of the syncookie_secret is
+way to early.
+
+	Cc: Florian Westphal <fw@strlen.de>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b23a002fc6f0c19846ee0382f019429af54a27e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+diff --cc include/net/tcp.h
+index aff4173509ce,f30326f1c92b..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -473,14 -475,14 +473,21 @@@ int tcp_send_rcvq(struct sock *sk, stru
+  void inet_sk_rx_dst_set(struct sock *sk, const struct sk_buff *skb);
+  
+  /* From syncookies.c */
+++<<<<<<< HEAD
+ +extern __u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
+ +extern int __cookie_v4_check(const struct iphdr *iph, const struct tcphdr *th,
+ +			     u32 cookie);
+ +extern struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb, 
+ +				    struct ip_options *opt);
+++=======
++ int __cookie_v4_check(const struct iphdr *iph, const struct tcphdr *th,
++ 		      u32 cookie);
++ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
++ 			     struct ip_options *opt);
+++>>>>>>> b23a002fc6f0 (inet: split syncookie keys for ipv4 and ipv6 and initialize with net_get_random_once)
+  #ifdef CONFIG_SYN_COOKIES
+  #include <linux/ktime.h>
+ -
+ -/* Syncookies use a monotonic timer which increments every 64 seconds.
+ +/* Syncookies use a monotonic timer which increments every 60 seconds.
+   * This counter is used both as a hash input and partially encoded into
+   * the cookie value.  A cookie is only validated further if the delta
+   * between the current counter value and the encoded one is less than this,
+* Unmerged path include/net/tcp.h
+diff --git a/net/ipv4/syncookies.c b/net/ipv4/syncookies.c
+index 84b29ed816a8..eb48d5627600 100644
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@ -21,15 +21,7 @@
+ 
+ extern int sysctl_tcp_syncookies;
+ 
+-__u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
+-EXPORT_SYMBOL(syncookie_secret);
+-
+-static __init int init_syncookies(void)
+-{
+-	get_random_bytes(syncookie_secret, sizeof(syncookie_secret));
+-	return 0;
+-}
+-__initcall(init_syncookies);
++static u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
+ 
+ #define COOKIEBITS 24	/* Upper bits store count */
+ #define COOKIEMASK (((__u32)1 << COOKIEBITS) - 1)
+@@ -64,8 +56,11 @@ static DEFINE_PER_CPU(__u32 [16 + 5 + SHA_WORKSPACE_WORDS],
+ static u32 cookie_hash(__be32 saddr, __be32 daddr, __be16 sport, __be16 dport,
+ 		       u32 count, int c)
+ {
+-	__u32 *tmp = __get_cpu_var(ipv4_cookie_scratch);
++	__u32 *tmp;
++
++	net_get_random_once(syncookie_secret, sizeof(syncookie_secret));
+ 
++	tmp  = __get_cpu_var(ipv4_cookie_scratch);
+ 	memcpy(tmp + 4, syncookie_secret[c], sizeof(syncookie_secret[c]));
+ 	tmp[0] = (__force u32)saddr;
+ 	tmp[1] = (__force u32)daddr;
+diff --git a/net/ipv6/syncookies.c b/net/ipv6/syncookies.c
+index d04d3f1dd9b7..535a3ad262f1 100644
+--- a/net/ipv6/syncookies.c
++++ b/net/ipv6/syncookies.c
+@@ -24,6 +24,8 @@
+ #define COOKIEBITS 24	/* Upper bits store count */
+ #define COOKIEMASK (((__u32)1 << COOKIEBITS) - 1)
+ 
++static u32 syncookie6_secret[2][16-4+SHA_DIGEST_WORDS];
++
+ /* RFC 2460, Section 8.3:
+  * [ipv6 tcp] MSS must be computed as the maximum packet size minus 60 [..]
+  *
+@@ -61,14 +63,18 @@ static DEFINE_PER_CPU(__u32 [16 + 5 + SHA_WORKSPACE_WORDS],
+ static u32 cookie_hash(const struct in6_addr *saddr, const struct in6_addr *daddr,
+ 		       __be16 sport, __be16 dport, u32 count, int c)
+ {
+-	__u32 *tmp = __get_cpu_var(ipv6_cookie_scratch);
++	__u32 *tmp;
++
++	net_get_random_once(syncookie6_secret, sizeof(syncookie6_secret));
++
++	tmp  = __get_cpu_var(ipv6_cookie_scratch);
+ 
+ 	/*
+ 	 * we have 320 bits of information to hash, copy in the remaining
+-	 * 192 bits required for sha_transform, from the syncookie_secret
++	 * 192 bits required for sha_transform, from the syncookie6_secret
+ 	 * and overwrite the digest with the secret
+ 	 */
+-	memcpy(tmp + 10, syncookie_secret[c], 44);
++	memcpy(tmp + 10, syncookie6_secret[c], 44);
+ 	memcpy(tmp, saddr, 16);
+ 	memcpy(tmp + 4, daddr, 16);
+ 	tmp[8] = ((__force u32)sport << 16) + (__force u32)dport;
