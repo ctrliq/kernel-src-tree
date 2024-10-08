@@ -1,0 +1,495 @@
+IB/ulps: Avoid calling ib_query_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit 4a061b287b1eb58676875cc45929679911d1ca38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4a061b28.failed
+
+Instead, use the cached copy of the attributes present on the device.
+
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 4a061b287b1eb58676875cc45929679911d1ca38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 862a581a4df5,84b7b07170c7..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -757,6 -741,31 +751,34 @@@ static void iser_connect_error(struct r
+  	iser_conn->state = ISER_CONN_TERMINATING;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ iser_calc_scsi_params(struct iser_conn *iser_conn,
++ 		      unsigned int max_sectors)
++ {
++ 	struct iser_device *device = iser_conn->ib_conn.device;
++ 	unsigned short sg_tablesize, sup_sg_tablesize;
++ 
++ 	sg_tablesize = DIV_ROUND_UP(max_sectors * 512, SIZE_4K);
++ 	sup_sg_tablesize = min_t(unsigned, ISCSI_ISER_MAX_SG_TABLESIZE,
++ 				 device->ib_device->attrs.max_fast_reg_page_list_len);
++ 
++ 	if (sg_tablesize > sup_sg_tablesize) {
++ 		sg_tablesize = sup_sg_tablesize;
++ 		iser_conn->scsi_max_sectors = sg_tablesize * SIZE_4K / 512;
++ 	} else {
++ 		iser_conn->scsi_max_sectors = max_sectors;
++ 	}
++ 
++ 	iser_conn->scsi_sg_tablesize = sg_tablesize;
++ 
++ 	iser_dbg("iser_conn %p, sg_tablesize %u, max_sectors %u\n",
++ 		 iser_conn, iser_conn->scsi_sg_tablesize,
++ 		 iser_conn->scsi_max_sectors);
++ }
++ 
+++>>>>>>> 4a061b287b1e (IB/ulps: Avoid calling ib_query_device)
+  /**
+   * Called with state mutex held
+   **/
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_cm.c b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+index 50b289cc0773..46eaaeac41a8 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -1522,8 +1522,7 @@ static void ipoib_cm_create_srq(struct net_device *dev, int max_sge)
+ int ipoib_cm_dev_init(struct net_device *dev)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+-	int i, ret;
+-	struct ib_device_attr attr;
++	int max_srq_sge, i;
+ 
+ 	INIT_LIST_HEAD(&priv->cm.passive_ids);
+ 	INIT_LIST_HEAD(&priv->cm.reap_list);
+@@ -1540,19 +1539,13 @@ int ipoib_cm_dev_init(struct net_device *dev)
+ 
+ 	skb_queue_head_init(&priv->cm.skb_queue);
+ 
+-	ret = ib_query_device(priv->ca, &attr);
+-	if (ret) {
+-		printk(KERN_WARNING "ib_query_device() failed with %d\n", ret);
+-		return ret;
+-	}
+-
+-	ipoib_dbg(priv, "max_srq_sge=%d\n", attr.max_srq_sge);
++	ipoib_dbg(priv, "max_srq_sge=%d\n", priv->ca->attrs.max_srq_sge);
+ 
+-	attr.max_srq_sge = min_t(int, IPOIB_CM_RX_SG, attr.max_srq_sge);
+-	ipoib_cm_create_srq(dev, attr.max_srq_sge);
++	max_srq_sge = min_t(int, IPOIB_CM_RX_SG, priv->ca->attrs.max_srq_sge);
++	ipoib_cm_create_srq(dev, max_srq_sge);
+ 	if (ipoib_cm_has_srq(dev)) {
+-		priv->cm.max_cm_mtu = attr.max_srq_sge * PAGE_SIZE - 0x10;
+-		priv->cm.num_frags  = attr.max_srq_sge;
++		priv->cm.max_cm_mtu = max_srq_sge * PAGE_SIZE - 0x10;
++		priv->cm.num_frags  = max_srq_sge;
+ 		ipoib_dbg(priv, "max_cm_mtu = 0x%x, num_frags=%d\n",
+ 			  priv->cm.max_cm_mtu, priv->cm.num_frags);
+ 	} else {
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c b/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c
+index c4b3940845e6..2a1ff9f64afb 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c
+@@ -40,15 +40,11 @@ static void ipoib_get_drvinfo(struct net_device *netdev,
+ 			      struct ethtool_drvinfo *drvinfo)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(netdev);
+-	struct ib_device_attr *attr;
+-
+-	attr = kmalloc(sizeof(*attr), GFP_KERNEL);
+-	if (attr && !ib_query_device(priv->ca, attr))
+-		snprintf(drvinfo->fw_version, sizeof(drvinfo->fw_version),
+-			 "%d.%d.%d", (int)(attr->fw_ver >> 32),
+-			 (int)(attr->fw_ver >> 16) & 0xffff,
+-			 (int)attr->fw_ver & 0xffff);
+-	kfree(attr);
++
++	snprintf(drvinfo->fw_version, sizeof(drvinfo->fw_version),
++		 "%d.%d.%d", (int)(priv->ca->attrs.fw_ver >> 32),
++		 (int)(priv->ca->attrs.fw_ver >> 16) & 0xffff,
++		 (int)priv->ca->attrs.fw_ver & 0xffff);
+ 
+ 	strlcpy(drvinfo->bus_info, dev_name(priv->ca->dma_device),
+ 		sizeof(drvinfo->bus_info));
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 99e6cd24bcd7..9ec9d2c0f44d 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -1777,26 +1777,7 @@ int ipoib_add_pkey_attr(struct net_device *dev)
+ 
+ int ipoib_set_dev_features(struct ipoib_dev_priv *priv, struct ib_device *hca)
+ {
+-	struct ib_device_attr *device_attr;
+-	int result = -ENOMEM;
+-
+-	device_attr = kmalloc(sizeof *device_attr, GFP_KERNEL);
+-	if (!device_attr) {
+-		printk(KERN_WARNING "%s: allocation of %zu bytes failed\n",
+-		       hca->name, sizeof *device_attr);
+-		return result;
+-	}
+-
+-	result = ib_query_device(hca, device_attr);
+-	if (result) {
+-		printk(KERN_WARNING "%s: ib_query_device failed (ret = %d)\n",
+-		       hca->name, result);
+-		kfree(device_attr);
+-		return result;
+-	}
+-	priv->hca_caps = device_attr->device_cap_flags;
+-
+-	kfree(device_attr);
++	priv->hca_caps = hca->attrs.device_cap_flags;
+ 
+ 	if (priv->hca_caps & IB_DEVICE_UD_IP_CSUM) {
+ 		priv->dev->hw_features = NETIF_F_SG |
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.c b/drivers/infiniband/ulp/iser/iscsi_iser.c
+index 7276679eedca..5c1b178a7907 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -632,7 +632,7 @@ iscsi_iser_session_create(struct iscsi_endpoint *ep,
+ 
+ 		ib_conn = &iser_conn->ib_conn;
+ 		if (ib_conn->pi_support) {
+-			u32 sig_caps = ib_conn->device->dev_attr.sig_prot_cap;
++			u32 sig_caps = ib_conn->device->ib_device->attrs.sig_prot_cap;
+ 
+ 			scsi_host_set_prot(shost, iser_dif_prot_caps(sig_caps));
+ 			if (iser_pi_guard)
+@@ -646,7 +646,7 @@ iscsi_iser_session_create(struct iscsi_endpoint *ep,
+ 		 * max fastreg page list length.
+ 		 */
+ 		shost->sg_tablesize = min_t(unsigned short, shost->sg_tablesize,
+-			ib_conn->device->dev_attr.max_fast_reg_page_list_len);
++			ib_conn->device->ib_device->attrs.max_fast_reg_page_list_len);
+ 		shost->max_sectors = min_t(unsigned int,
+ 			1024, (shost->sg_tablesize * PAGE_SIZE) >> 9);
+ 
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.h b/drivers/infiniband/ulp/iser/iscsi_iser.h
+index 144a3278337e..947e6e8b156c 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@ -374,7 +374,6 @@ struct iser_reg_ops {
+  *
+  * @ib_device:     RDMA device
+  * @pd:            Protection Domain for this device
+- * @dev_attr:      Device attributes container
+  * @mr:            Global DMA memory region
+  * @event_handler: IB events handle routine
+  * @ig_list:	   entry in devices list
+@@ -387,7 +386,6 @@ struct iser_reg_ops {
+ struct iser_device {
+ 	struct ib_device             *ib_device;
+ 	struct ib_pd	             *pd;
+-	struct ib_device_attr	     dev_attr;
+ 	struct ib_mr	             *mr;
+ 	struct ib_event_handler      event_handler;
+ 	struct list_head             ig_list;
+diff --git a/drivers/infiniband/ulp/iser/iser_memory.c b/drivers/infiniband/ulp/iser/iser_memory.c
+index b04a5e59e448..f42b68dd5643 100644
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@ -59,15 +59,14 @@ static struct iser_reg_ops fmr_ops = {
+ 
+ int iser_assign_reg_ops(struct iser_device *device)
+ {
+-	struct ib_device_attr *dev_attr = &device->dev_attr;
++	struct ib_device *ib_dev = device->ib_device;
+ 
+ 	/* Assign function handles  - based on FMR support */
+-	if (device->ib_device->alloc_fmr && device->ib_device->dealloc_fmr &&
+-	    device->ib_device->map_phys_fmr && device->ib_device->unmap_fmr) {
++	if (ib_dev->alloc_fmr && ib_dev->dealloc_fmr &&
++	    ib_dev->map_phys_fmr && ib_dev->unmap_fmr) {
+ 		iser_info("FMR supported, using FMR for registration\n");
+ 		device->reg_ops = &fmr_ops;
+-	} else
+-	if (dev_attr->device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS) {
++	} else if (ib_dev->attrs.device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS) {
+ 		iser_info("FastReg supported, using FastReg for registration\n");
+ 		device->reg_ops = &fastreg_ops;
+ 	} else {
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index 2f51693e7c05..e0c176780761 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -95,22 +95,6 @@ isert_qp_event_callback(struct ib_event *e, void *context)
+ 	}
+ }
+ 
+-static int
+-isert_query_device(struct ib_device *ib_dev, struct ib_device_attr *devattr)
+-{
+-	int ret;
+-
+-	ret = ib_query_device(ib_dev, devattr);
+-	if (ret) {
+-		isert_err("ib_query_device() failed: %d\n", ret);
+-		return ret;
+-	}
+-	isert_dbg("devattr->max_sge: %d\n", devattr->max_sge);
+-	isert_dbg("devattr->max_sge_rd: %d\n", devattr->max_sge_rd);
+-
+-	return 0;
+-}
+-
+ static struct isert_comp *
+ isert_comp_get(struct isert_conn *isert_conn)
+ {
+@@ -157,9 +141,9 @@ isert_create_qp(struct isert_conn *isert_conn,
+ 	attr.recv_cq = comp->cq;
+ 	attr.cap.max_send_wr = ISERT_QP_MAX_REQ_DTOS;
+ 	attr.cap.max_recv_wr = ISERT_QP_MAX_RECV_DTOS + 1;
+-	attr.cap.max_send_sge = device->dev_attr.max_sge;
+-	isert_conn->max_sge = min(device->dev_attr.max_sge,
+-				  device->dev_attr.max_sge_rd);
++	attr.cap.max_send_sge = device->ib_device->attrs.max_sge;
++	isert_conn->max_sge = min(device->ib_device->attrs.max_sge,
++				  device->ib_device->attrs.max_sge_rd);
+ 	attr.cap.max_recv_sge = 1;
+ 	attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+ 	attr.qp_type = IB_QPT_RC;
+@@ -287,8 +271,7 @@ isert_free_comps(struct isert_device *device)
+ }
+ 
+ static int
+-isert_alloc_comps(struct isert_device *device,
+-		  struct ib_device_attr *attr)
++isert_alloc_comps(struct isert_device *device)
+ {
+ 	int i, max_cqe, ret = 0;
+ 
+@@ -308,7 +291,7 @@ isert_alloc_comps(struct isert_device *device,
+ 		return -ENOMEM;
+ 	}
+ 
+-	max_cqe = min(ISER_MAX_CQ_LEN, attr->max_cqe);
++	max_cqe = min(ISER_MAX_CQ_LEN, device->ib_device->attrs.max_cqe);
+ 
+ 	for (i = 0; i < device->comps_used; i++) {
+ 		struct ib_cq_init_attr cq_attr = {};
+@@ -344,17 +327,15 @@ out_cq:
+ static int
+ isert_create_device_ib_res(struct isert_device *device)
+ {
+-	struct ib_device_attr *dev_attr;
++	struct ib_device *ib_dev = device->ib_device;
+ 	int ret;
+ 
+-	dev_attr = &device->dev_attr;
+-	ret = isert_query_device(device->ib_device, dev_attr);
+-	if (ret)
+-		return ret;
++	isert_dbg("devattr->max_sge: %d\n", ib_dev->attrs.max_sge);
++	isert_dbg("devattr->max_sge_rd: %d\n", ib_dev->attrs.max_sge_rd);
+ 
+ 	/* asign function handlers */
+-	if (dev_attr->device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS &&
+-	    dev_attr->device_cap_flags & IB_DEVICE_SIGNATURE_HANDOVER) {
++	if (ib_dev->attrs.device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS &&
++	    ib_dev->attrs.device_cap_flags & IB_DEVICE_SIGNATURE_HANDOVER) {
+ 		device->use_fastreg = 1;
+ 		device->reg_rdma_mem = isert_reg_rdma;
+ 		device->unreg_rdma_mem = isert_unreg_rdma;
+@@ -364,11 +345,11 @@ isert_create_device_ib_res(struct isert_device *device)
+ 		device->unreg_rdma_mem = isert_unmap_cmd;
+ 	}
+ 
+-	ret = isert_alloc_comps(device, dev_attr);
++	ret = isert_alloc_comps(device);
+ 	if (ret)
+ 		return ret;
+ 
+-	device->pd = ib_alloc_pd(device->ib_device);
++	device->pd = ib_alloc_pd(ib_dev);
+ 	if (IS_ERR(device->pd)) {
+ 		ret = PTR_ERR(device->pd);
+ 		isert_err("failed to allocate pd, device %p, ret=%d\n",
+@@ -377,7 +358,7 @@ isert_create_device_ib_res(struct isert_device *device)
+ 	}
+ 
+ 	/* Check signature cap */
+-	device->pi_capable = dev_attr->device_cap_flags &
++	device->pi_capable = ib_dev->attrs.device_cap_flags &
+ 			     IB_DEVICE_SIGNATURE_HANDOVER ? true : false;
+ 
+ 	return 0;
+@@ -743,7 +724,7 @@ isert_connect_request(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+ 	/* Set max inflight RDMA READ requests */
+ 	isert_conn->initiator_depth = min_t(u8,
+ 				event->param.conn.initiator_depth,
+-				device->dev_attr.max_qp_init_rd_atom);
++				device->ib_device->attrs.max_qp_init_rd_atom);
+ 	isert_dbg("Using initiator_depth: %u\n", isert_conn->initiator_depth);
+ 
+ 	ret = isert_conn_setup_qp(isert_conn, cma_id);
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.h b/drivers/infiniband/ulp/isert/ib_isert.h
+index 6f7db3ebfd35..864038f48170 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.h
++++ b/drivers/infiniband/ulp/isert/ib_isert.h
+@@ -209,7 +209,6 @@ struct isert_device {
+ 	struct isert_comp	*comps;
+ 	int                     comps_used;
+ 	struct list_head	dev_node;
+-	struct ib_device_attr	dev_attr;
+ 	int			(*reg_rdma_mem)(struct iscsi_conn *conn,
+ 						    struct iscsi_cmd *cmd,
+ 						    struct isert_rdma_wr *wr);
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index 207f50dbdbb8..4be35f062ca8 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -3435,27 +3435,17 @@ free_host:
+ static void srp_add_one(struct ib_device *device)
+ {
+ 	struct srp_device *srp_dev;
+-	struct ib_device_attr *dev_attr;
+ 	struct srp_host *host;
+ 	int mr_page_shift, p;
+ 	u64 max_pages_per_mr;
+ 
+-	dev_attr = kmalloc(sizeof *dev_attr, GFP_KERNEL);
+-	if (!dev_attr)
+-		return;
+-
+-	if (ib_query_device(device, dev_attr)) {
+-		pr_warn("Query device failed for %s\n", device->name);
+-		goto free_attr;
+-	}
+-
+ 	srp_dev = kmalloc(sizeof *srp_dev, GFP_KERNEL);
+ 	if (!srp_dev)
+-		goto free_attr;
++		return;
+ 
+ 	srp_dev->has_fmr = (device->alloc_fmr && device->dealloc_fmr &&
+ 			    device->map_phys_fmr && device->unmap_fmr);
+-	srp_dev->has_fr = (dev_attr->device_cap_flags &
++	srp_dev->has_fr = (device->attrs.device_cap_flags &
+ 			   IB_DEVICE_MEM_MGT_EXTENSIONS);
+ 	if (!srp_dev->has_fmr && !srp_dev->has_fr)
+ 		dev_warn(&device->dev, "neither FMR nor FR is supported\n");
+@@ -3469,23 +3459,23 @@ static void srp_add_one(struct ib_device *device)
+ 	 * minimum of 4096 bytes. We're unlikely to build large sglists
+ 	 * out of smaller entries.
+ 	 */
+-	mr_page_shift		= max(12, ffs(dev_attr->page_size_cap) - 1);
++	mr_page_shift		= max(12, ffs(device->attrs.page_size_cap) - 1);
+ 	srp_dev->mr_page_size	= 1 << mr_page_shift;
+ 	srp_dev->mr_page_mask	= ~((u64) srp_dev->mr_page_size - 1);
+-	max_pages_per_mr	= dev_attr->max_mr_size;
++	max_pages_per_mr	= device->attrs.max_mr_size;
+ 	do_div(max_pages_per_mr, srp_dev->mr_page_size);
+ 	srp_dev->max_pages_per_mr = min_t(u64, SRP_MAX_PAGES_PER_MR,
+ 					  max_pages_per_mr);
+ 	if (srp_dev->use_fast_reg) {
+ 		srp_dev->max_pages_per_mr =
+ 			min_t(u32, srp_dev->max_pages_per_mr,
+-			      dev_attr->max_fast_reg_page_list_len);
++			      device->attrs.max_fast_reg_page_list_len);
+ 	}
+ 	srp_dev->mr_max_size	= srp_dev->mr_page_size *
+ 				   srp_dev->max_pages_per_mr;
+-	pr_debug("%s: mr_page_shift = %d, dev_attr->max_mr_size = %#llx, dev_attr->max_fast_reg_page_list_len = %u, max_pages_per_mr = %d, mr_max_size = %#x\n",
+-		 device->name, mr_page_shift, dev_attr->max_mr_size,
+-		 dev_attr->max_fast_reg_page_list_len,
++	pr_debug("%s: mr_page_shift = %d, device->max_mr_size = %#llx, device->max_fast_reg_page_list_len = %u, max_pages_per_mr = %d, mr_max_size = %#x\n",
++		 device->name, mr_page_shift, device->attrs.max_mr_size,
++		 device->attrs.max_fast_reg_page_list_len,
+ 		 srp_dev->max_pages_per_mr, srp_dev->mr_max_size);
+ 
+ 	INIT_LIST_HEAD(&srp_dev->dev_list);
+@@ -3513,17 +3503,13 @@ static void srp_add_one(struct ib_device *device)
+ 	}
+ 
+ 	ib_set_client_data(device, &srp_client, srp_dev);
+-
+-	goto free_attr;
++	return;
+ 
+ err_pd:
+ 	ib_dealloc_pd(srp_dev->pd);
+ 
+ free_dev:
+ 	kfree(srp_dev);
+-
+-free_attr:
+-	kfree(dev_attr);
+ }
+ 
+ static void srp_remove_one(struct ib_device *device, void *client_data)
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 6df2d90f10ad..5c8ee2ee48eb 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -344,10 +344,10 @@ static void srpt_get_ioc(struct srpt_port *sport, u32 slot,
+ 	memset(iocp, 0, sizeof *iocp);
+ 	strcpy(iocp->id_string, SRPT_ID_STRING);
+ 	iocp->guid = cpu_to_be64(srpt_service_guid);
+-	iocp->vendor_id = cpu_to_be32(sdev->dev_attr.vendor_id);
+-	iocp->device_id = cpu_to_be32(sdev->dev_attr.vendor_part_id);
+-	iocp->device_version = cpu_to_be16(sdev->dev_attr.hw_ver);
+-	iocp->subsys_vendor_id = cpu_to_be32(sdev->dev_attr.vendor_id);
++	iocp->vendor_id = cpu_to_be32(sdev->device->attrs.vendor_id);
++	iocp->device_id = cpu_to_be32(sdev->device->attrs.vendor_part_id);
++	iocp->device_version = cpu_to_be16(sdev->device->attrs.hw_ver);
++	iocp->subsys_vendor_id = cpu_to_be32(sdev->device->attrs.vendor_id);
+ 	iocp->subsys_device_id = 0x0;
+ 	iocp->io_class = cpu_to_be16(SRP_REV16A_IB_IO_CLASS);
+ 	iocp->io_subclass = cpu_to_be16(SRP_IO_SUBCLASS);
+@@ -3205,14 +3205,11 @@ static void srpt_add_one(struct ib_device *device)
+ 	init_waitqueue_head(&sdev->ch_releaseQ);
+ 	spin_lock_init(&sdev->spinlock);
+ 
+-	if (ib_query_device(device, &sdev->dev_attr))
+-		goto free_dev;
+-
+ 	sdev->pd = ib_alloc_pd(device);
+ 	if (IS_ERR(sdev->pd))
+ 		goto free_dev;
+ 
+-	sdev->srq_size = min(srpt_srq_size, sdev->dev_attr.max_srq_wr);
++	sdev->srq_size = min(srpt_srq_size, sdev->device->attrs.max_srq_wr);
+ 
+ 	srq_attr.event_handler = srpt_srq_event;
+ 	srq_attr.srq_context = (void *)sdev;
+@@ -3226,7 +3223,7 @@ static void srpt_add_one(struct ib_device *device)
+ 		goto err_pd;
+ 
+ 	pr_debug("%s: create SRQ #wr= %d max_allow=%d dev= %s\n",
+-		 __func__, sdev->srq_size, sdev->dev_attr.max_srq_wr,
++		 __func__, sdev->srq_size, sdev->device->attrs.max_srq_wr,
+ 		 device->name);
+ 
+ 	if (!srpt_service_guid)
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.h b/drivers/infiniband/ulp/srpt/ib_srpt.h
+index e030242461ac..678c61636674 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.h
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.h
+@@ -380,8 +380,6 @@ struct srpt_port {
+  * @mr:            L_Key (local key) with write access to all local memory.
+  * @srq:           Per-HCA SRQ (shared receive queue).
+  * @cm_id:         Connection identifier.
+- * @dev_attr:      Attributes of the InfiniBand device as obtained during the
+- *                 ib_client.add() callback.
+  * @srq_size:      SRQ size.
+  * @ioctx_ring:    Per-HCA SRQ.
+  * @rch_list:      Per-device channel list -- see also srpt_rdma_ch.list.
+@@ -396,7 +394,6 @@ struct srpt_device {
+ 	struct ib_pd		*pd;
+ 	struct ib_srq		*srq;
+ 	struct ib_cm_id		*cm_id;
+-	struct ib_device_attr	dev_attr;
+ 	int			srq_size;
+ 	struct srpt_recv_ioctx	**ioctx_ring;
+ 	struct list_head	rch_list;
