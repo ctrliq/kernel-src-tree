@@ -1,0 +1,111 @@
+KEYS: Allow special keys (eg. DNS results) to be invalidated by CAP_SYS_ADMIN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 0c7774abb41bd00d5836d9ba098825a40fa94133
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/0c7774ab.failed
+
+Special kernel keys, such as those used to hold DNS results for AFS, CIFS and
+NFS and those used to hold idmapper results for NFS, used to be
+'invalidateable' with key_revoke().  However, since the default permissions for
+keys were reduced:
+
+	Commit: 96b5c8fea6c0861621051290d705ec2e971963f1
+	KEYS: Reduce initial permissions on keys
+
+it has become impossible to do this.
+
+Add a key flag (KEY_FLAG_ROOT_CAN_INVAL) that will permit a key to be
+invalidated by root.  This should not be used for system keyrings as the
+garbage collector will try and remove any invalidate key.  For system keyrings,
+KEY_FLAG_ROOT_CAN_CLEAR can be used instead.
+
+After this, from userspace, keyctl_invalidate() and "keyctl invalidate" can be
+used by any possessor of CAP_SYS_ADMIN (typically root) to invalidate DNS and
+idmapper keys.  Invalidated keys are immediately garbage collected and will be
+immediately rerequested if needed again.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Tested-by: Steve Dickson <steved@redhat.com>
+(cherry picked from commit 0c7774abb41bd00d5836d9ba098825a40fa94133)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/key.h
+diff --cc include/linux/key.h
+index ef596c7af585,e37a4d807185..000000000000
+--- a/include/linux/key.h
++++ b/include/linux/key.h
+@@@ -167,6 -168,9 +167,12 @@@ struct key 
+  #define KEY_FLAG_NEGATIVE	5	/* set if key is negative */
+  #define KEY_FLAG_ROOT_CAN_CLEAR	6	/* set if key can be cleared by root without permission */
+  #define KEY_FLAG_INVALIDATED	7	/* set if key has been invalidated */
+++<<<<<<< HEAD
+++=======
++ #define KEY_FLAG_TRUSTED	8	/* set if key is trusted */
++ #define KEY_FLAG_TRUSTED_ONLY	9	/* set if keyring only accepts links to trusted keys */
++ #define KEY_FLAG_ROOT_CAN_INVAL	11	/* set if key can be invalidated by root without permission */
+++>>>>>>> 0c7774abb41b (KEYS: Allow special keys (eg. DNS results) to be invalidated by CAP_SYS_ADMIN)
+  
+  	/* the key type and key description string
+  	 * - the desc is used to match a key against search criteria
+diff --git a/fs/nfs/idmap.c b/fs/nfs/idmap.c
+index 34f3e9ac7685..cf1d4ebfe76b 100644
+--- a/fs/nfs/idmap.c
++++ b/fs/nfs/idmap.c
+@@ -281,6 +281,8 @@ static struct key *nfs_idmap_request_key(const char *name, size_t namelen,
+ 						desc, "", 0, idmap);
+ 		mutex_unlock(&idmap->idmap_mutex);
+ 	}
++	if (!IS_ERR(rkey))
++		set_bit(KEY_FLAG_ROOT_CAN_INVAL, &rkey->flags);
+ 
+ 	kfree(desc);
+ 	return rkey;
+* Unmerged path include/linux/key.h
+diff --git a/net/dns_resolver/dns_query.c b/net/dns_resolver/dns_query.c
+index c32be292c7e3..90967b2836c6 100644
+--- a/net/dns_resolver/dns_query.c
++++ b/net/dns_resolver/dns_query.c
+@@ -130,6 +130,7 @@ int dns_query(const char *type, const char *name, size_t namelen,
+ 	}
+ 
+ 	down_read(&rkey->sem);
++	set_bit(KEY_FLAG_ROOT_CAN_INVAL, &rkey->flags);
+ 	rkey->perm |= KEY_USR_VIEW;
+ 
+ 	ret = key_validate(rkey);
+diff --git a/security/keys/keyctl.c b/security/keys/keyctl.c
+index 33cfd27b4de2..4e939c3dc1bd 100644
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@ -404,12 +404,25 @@ long keyctl_invalidate_key(key_serial_t id)
+ 	key_ref = lookup_user_key(id, 0, KEY_SEARCH);
+ 	if (IS_ERR(key_ref)) {
+ 		ret = PTR_ERR(key_ref);
++
++		/* Root is permitted to invalidate certain special keys */
++		if (capable(CAP_SYS_ADMIN)) {
++			key_ref = lookup_user_key(id, 0, 0);
++			if (IS_ERR(key_ref))
++				goto error;
++			if (test_bit(KEY_FLAG_ROOT_CAN_INVAL,
++				     &key_ref_to_ptr(key_ref)->flags))
++				goto invalidate;
++			goto error_put;
++		}
++
+ 		goto error;
+ 	}
+ 
++invalidate:
+ 	key_invalidate(key_ref_to_ptr(key_ref));
+ 	ret = 0;
+-
++error_put:
+ 	key_ref_put(key_ref);
+ error:
+ 	kleave(" = %ld", ret);
