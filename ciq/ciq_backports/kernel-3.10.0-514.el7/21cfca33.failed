@@ -1,0 +1,167 @@
+IB/qib: Destroy SMI AH before de-allocating the protection domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Harish Chegondi <harish.chegondi@intel.com>
+commit 21cfca33587d45ccdc5aaaedf97a909ccc4a0a27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/21cfca33.failed
+
+If SMI AH is not destroyed before de-allocating the PD, it would result in
+non-zero PD use count when de-allocating the PD, triggering a WARN_ON() at
+drivers/infiniband/core/verbs.c:284 ib_dealloc_pd+0x69/0xb0 [ib_core]()
+when unloading the qib driver on systems with dual-port card.
+
+This problem has always been there in qib and was detected only after the
+commit 7dd78647a2c2 ("IB/core: Make ib_dealloc_pd return void") introduced
+a WARN_ON in ib_dealloc_pd() that triggers if a PD's use count is non-zero
+before de-allocating the PD.
+
+Below is the call trace from the dmesg log.
+
+[ 7264.966129] Call Trace:
+[ 7264.969652]  [<ffffffff81338470>] dump_stack+0x44/0x64
+[ 7264.976181]  [<ffffffff81086bb6>] warn_slowpath_common+0x86/0xc0
+[ 7264.983656]  [<ffffffff81086cfa>] warn_slowpath_null+0x1a/0x20
+[ 7264.990961]  [<ffffffffa025c2d9>] ib_dealloc_pd+0x69/0xb0 [ib_core]
+[ 7264.998717]  [<ffffffffa0044de8>] ib_mad_port_close+0xb8/0x120 [ib_mad]
+[ 7265.006866]  [<ffffffffa0044ebf>] ib_mad_remove_device+0x6f/0xc0 [ib_mad]
+[ 7265.015224]  [<ffffffffa025fc87>] ib_unregister_device+0xa7/0x140 [ib_core]
+[ 7265.023738]  [<ffffffffa04b5b79>] rvt_unregister_device+0x29/0x80 [rdmavt]
+[ 7265.032181]  [<ffffffffa088d2a2>] qib_unregister_ib_device+0x22/0x210 [ib_qib]
+[ 7265.040993]  [<ffffffffa085f73f>] qib_remove_one+0x1f/0x250 [ib_qib]
+[ 7265.048823]  [<ffffffff8137a319>] pci_device_remove+0x39/0xc0
+[ 7265.055984]  [<ffffffff81466a1a>] __device_release_driver+0x9a/0x140
+[ 7265.063821]  [<ffffffff81466bc8>] driver_detach+0xb8/0xc0
+[ 7265.070579]  [<ffffffff81465a15>] bus_remove_driver+0x55/0xd0
+[ 7265.077717]  [<ffffffff8146732c>] driver_unregister+0x2c/0x50
+[ 7265.084849]  [<ffffffff813789ba>] pci_unregister_driver+0x2a/0x80
+[ 7265.092366]  [<ffffffffa08921bd>] qib_ib_cleanup+0x37/0x65 [ib_qib]
+[ 7265.100068]  [<ffffffff811096d0>] SyS_delete_module+0x190/0x220
+[ 7265.107379]  [<ffffffff816a7bae>] entry_SYSCALL_64_fastpath+0x12/0x71
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 21cfca33587d45ccdc5aaaedf97a909ccc4a0a27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qib/qib_mad.c
+diff --cc drivers/infiniband/hw/qib/qib_mad.c
+index c65d3aac236c,0bd18375d7df..000000000000
+--- a/drivers/infiniband/hw/qib/qib_mad.c
++++ b/drivers/infiniband/hw/qib/qib_mad.c
+@@@ -2473,71 -2472,31 +2473,79 @@@ done
+  	mod_timer(&ppd->cong_stats.timer, jiffies + HZ);
+  }
+  
+ -void qib_notify_create_mad_agent(struct rvt_dev_info *rdi, int port_idx)
+ +int qib_create_agents(struct qib_ibdev *dev)
+  {
+ -	struct qib_ibdev *ibdev = container_of(rdi, struct qib_ibdev, rdi);
+ -	struct qib_devdata *dd = container_of(ibdev,
+ -					      struct qib_devdata, verbs_dev);
+ +	struct qib_devdata *dd = dd_from_dev(dev);
+ +	struct ib_mad_agent *agent;
+ +	struct qib_ibport *ibp;
+ +	int p;
+ +	int ret;
+ +
+ +	for (p = 0; p < dd->num_pports; p++) {
+ +		ibp = &dd->pport[p].ibport_data;
+ +		agent = ib_register_mad_agent(&dev->rdi.ibdev, p + 1,
+ +					      IB_QPT_SMI,
+ +					      NULL, 0, send_handler,
+ +					      NULL, NULL, 0);
+ +		if (IS_ERR(agent)) {
+ +			ret = PTR_ERR(agent);
+ +			goto err;
+ +		}
+ +
+ +		/* Initialize xmit_wait structure */
+ +		dd->pport[p].cong_stats.counter = 0;
+ +		init_timer(&dd->pport[p].cong_stats.timer);
+ +		dd->pport[p].cong_stats.timer.function = xmit_wait_timer_func;
+ +		dd->pport[p].cong_stats.timer.data =
+ +			(unsigned long)(&dd->pport[p]);
+ +		dd->pport[p].cong_stats.timer.expires = 0;
+ +		add_timer(&dd->pport[p].cong_stats.timer);
+ +
+ +		ibp->send_agent = agent;
+ +	}
+  
+ -	/* Initialize xmit_wait structure */
+ -	dd->pport[port_idx].cong_stats.counter = 0;
+ -	init_timer(&dd->pport[port_idx].cong_stats.timer);
+ -	dd->pport[port_idx].cong_stats.timer.function = xmit_wait_timer_func;
+ -	dd->pport[port_idx].cong_stats.timer.data =
+ -		(unsigned long)(&dd->pport[port_idx]);
+ -	dd->pport[port_idx].cong_stats.timer.expires = 0;
+ -	add_timer(&dd->pport[port_idx].cong_stats.timer);
+ +	return 0;
+ +
+ +err:
+ +	for (p = 0; p < dd->num_pports; p++) {
+ +		ibp = &dd->pport[p].ibport_data;
+ +		if (ibp->send_agent) {
+ +			agent = ibp->send_agent;
+ +			ibp->send_agent = NULL;
+ +			ib_unregister_mad_agent(agent);
+ +		}
+ +	}
+ +
+ +	return ret;
+  }
+  
+ -void qib_notify_free_mad_agent(struct rvt_dev_info *rdi, int port_idx)
+ +void qib_free_agents(struct qib_ibdev *dev)
+  {
+ -	struct qib_ibdev *ibdev = container_of(rdi, struct qib_ibdev, rdi);
+ -	struct qib_devdata *dd = container_of(ibdev,
+ -					      struct qib_devdata, verbs_dev);
+ -
+ +	struct qib_devdata *dd = dd_from_dev(dev);
+ +	struct ib_mad_agent *agent;
+ +	struct qib_ibport *ibp;
+ +	int p;
+ +
+++<<<<<<< HEAD
+ +	for (p = 0; p < dd->num_pports; p++) {
+ +		ibp = &dd->pport[p].ibport_data;
+ +		if (ibp->send_agent) {
+ +			agent = ibp->send_agent;
+ +			ibp->send_agent = NULL;
+ +			ib_unregister_mad_agent(agent);
+ +		}
+ +		if (ibp->sm_ah) {
+ +			ib_destroy_ah(&ibp->sm_ah->ibah);
+ +			ibp->sm_ah = NULL;
+ +		}
+ +		if (dd->pport[p].cong_stats.timer.data)
+ +			del_timer_sync(&dd->pport[p].cong_stats.timer);
+ +	}
+++=======
++ 	if (dd->pport[port_idx].cong_stats.timer.data)
++ 		del_timer_sync(&dd->pport[port_idx].cong_stats.timer);
++ 
++ 	if (dd->pport[port_idx].ibport_data.smi_ah)
++ 		ib_destroy_ah(&dd->pport[port_idx].ibport_data.smi_ah->ibah);
+++>>>>>>> 21cfca33587d (IB/qib: Destroy SMI AH before de-allocating the protection domain)
+  }
+diff --git a/drivers/infiniband/hw/qib/qib_iba7322.c b/drivers/infiniband/hw/qib/qib_iba7322.c
+index 181e226c8045..532bf8f351d0 100644
+--- a/drivers/infiniband/hw/qib/qib_iba7322.c
++++ b/drivers/infiniband/hw/qib/qib_iba7322.c
+@@ -2910,8 +2910,6 @@ static void qib_setup_7322_cleanup(struct qib_devdata *dd)
+ 			spin_unlock_irqrestore(&dd->cspec->gpio_lock, flags);
+ 			qib_qsfp_deinit(&dd->pport[i].cpspec->qsfp_data);
+ 		}
+-		if (dd->pport[i].ibport_data.smi_ah)
+-			ib_destroy_ah(&dd->pport[i].ibport_data.smi_ah->ibah);
+ 	}
+ }
+ 
+* Unmerged path drivers/infiniband/hw/qib/qib_mad.c
