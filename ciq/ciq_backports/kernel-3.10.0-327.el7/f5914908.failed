@@ -1,0 +1,454 @@
+ALSA: pcm: Replace PCM hwptr tracking with tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] pcm: Replace PCM hwptr tracking with tracepoints (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 94.12%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit f5914908a5b7b2338f210e56827a1ef35585dc6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f5914908.failed
+
+ALSA PCM core has a mechanism tracking the PCM hwptr updates for
+analyzing XRUNs.  But its log is limited (up to 10) and its log output
+is a kernel message, which is hard to handle.
+
+In this patch, the hwptr logging is moved to the tracing
+infrastructure instead of its own.  Not only the hwptr updates but
+also XRUN and hwptr errors are recorded on the trace log, so that user
+can see such events at the exact timing.
+
+The new "snd_pcm" entry will appear in the tracing events:
+  # ls -F /sys/kernel/debug/tracing/events/snd_pcm
+  enable  filter  hw_ptr_error/  hwptr/  xrun/
+
+The hwptr is for the regular hwptr update events.  An event trace
+looks like:
+
+  aplay-26187 [004] d..3  4012.834761: hwptr: pcmC0D0p/sub0: POS: pos=488, old=0, base=0, period=1024, buf=16384
+
+"POS" shows the hwptr update by the explicit position update call and
+"IRQ" means the hwptr update by the interrupt,
+i.e. snd_pcm_period_elapsed() call.  The "pos" is the passed
+ring-buffer offset by the caller, "old" is the previous hwptr, "base"
+is the hwptr base position, "period" and "buf" are period- and
+buffer-size of the target PCM substream.
+(Note that the hwptr position displayed here isn't the ring-buffer
+ offset.  It increments up to the PCM position boundary.)
+
+The XRUN event appears similarly, but without "pos" field.
+The hwptr error events appear with the PCM identifier and its reason
+string, such as "Lost interrupt?".
+
+The XRUN and hwptr error reports on kernel message are still left, can
+be turned on/off via xrun_debug proc like before.  But the bit 3, 4, 5
+and 6 bits of xrun_debug proc are dropped by this patch.  Also, along
+with the change, the message strings have been reformatted to be a bit
+more consistent.
+
+Last but not least, the hwptr reporting is enabled only when
+CONFIG_SND_PCM_XRUN_DEBUG is set.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit f5914908a5b7b2338f210e56827a1ef35585dc6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/core/Makefile
+diff --cc sound/core/Makefile
+index 57f5e2587068,4daf2f58261c..000000000000
+--- a/sound/core/Makefile
++++ b/sound/core/Makefile
+@@@ -14,6 -14,11 +14,14 @@@ snd-pcm-y := pcm.o pcm_native.o pcm_lib
+  		pcm_memory.o memalloc.o
+  snd-pcm-$(CONFIG_SND_DMA_SGBUF) += sgbuf.o
+  
+++<<<<<<< HEAD
+++=======
++ # for trace-points
++ CFLAGS_pcm_lib.o := -I$(src)
++ 
++ snd-pcm-dmaengine-objs := pcm_dmaengine.o
++ 
+++>>>>>>> f5914908a5b7 (ALSA: pcm: Replace PCM hwptr tracking with tracepoints)
+  snd-rawmidi-objs  := rawmidi.o
+  snd-timer-objs    := timer.o
+  snd-hrtimer-objs  := hrtimer.o
+diff --git a/Documentation/sound/alsa/Procfile.txt b/Documentation/sound/alsa/Procfile.txt
+index 7fcd1ad96fcc..cfc49567b9dc 100644
+--- a/Documentation/sound/alsa/Procfile.txt
++++ b/Documentation/sound/alsa/Procfile.txt
+@@ -101,10 +101,6 @@ card*/pcm*/xrun_debug
+ 	  bit 0 = Enable XRUN/jiffies debug messages
+ 	  bit 1 = Show stack trace at XRUN / jiffies check
+ 	  bit 2 = Enable additional jiffies check
+-	  bit 3 = Log hwptr update at each period interrupt
+-	  bit 4 = Log hwptr update at each snd_pcm_update_hw_ptr()
+-	  bit 5 = Show last 10 positions on error
+-	  bit 6 = Do above only once
+ 
+ 	When the bit 0 is set, the driver will show the messages to
+ 	kernel log when an xrun is detected.  The debug message is
+@@ -121,15 +117,6 @@ card*/pcm*/xrun_debug
+ 	buggy) hardware that doesn't give smooth pointer updates.
+ 	This feature is enabled via the bit 2.
+ 
+-	Bits 3 and 4 are for logging the hwptr records.  Note that
+-	these will give flood of kernel messages.
+-
+-	When bit 5 is set, the driver logs the last 10 xrun errors and
+-	the proc file shows each jiffies, position, period_size,
+-	buffer_size, old_hw_ptr, and hw_ptr_base values.
+-
+-	When bit 6 is set, the full xrun log is shown only once.
+-
+ card*/pcm*/sub*/info
+ 	The general information of this PCM sub-stream.
+ 
+* Unmerged path sound/core/Makefile
+diff --git a/sound/core/pcm_lib.c b/sound/core/pcm_lib.c
+index 7b9e2fb35a86..ec9e7866177f 100644
+--- a/sound/core/pcm_lib.c
++++ b/sound/core/pcm_lib.c
+@@ -32,6 +32,15 @@
+ #include <sound/pcm_params.h>
+ #include <sound/timer.h>
+ 
++#ifdef CONFIG_SND_PCM_XRUN_DEBUG
++#define CREATE_TRACE_POINTS
++#include "pcm_trace.h"
++#else
++#define trace_hwptr(substream, pos, in_interrupt)
++#define trace_xrun(substream)
++#define trace_hw_ptr_error(substream, reason)
++#endif
++
+ /*
+  * fill ring buffer with silence
+  * runtime->silence_start: starting pointer to silence area
+@@ -146,10 +155,6 @@ EXPORT_SYMBOL(snd_pcm_debug_name);
+ #define XRUN_DEBUG_BASIC	(1<<0)
+ #define XRUN_DEBUG_STACK	(1<<1)	/* dump also stack */
+ #define XRUN_DEBUG_JIFFIESCHECK	(1<<2)	/* do jiffies check */
+-#define XRUN_DEBUG_PERIODUPDATE	(1<<3)	/* full period update info */
+-#define XRUN_DEBUG_HWPTRUPDATE	(1<<4)	/* full hwptr update info */
+-#define XRUN_DEBUG_LOG		(1<<5)	/* show last 10 positions on err */
+-#define XRUN_DEBUG_LOGONCE	(1<<6)	/* do above only once */
+ 
+ #ifdef CONFIG_SND_PCM_XRUN_DEBUG
+ 
+@@ -168,6 +173,7 @@ static void xrun(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 
++	trace_xrun(substream);
+ 	if (runtime->tstamp_mode == SNDRV_PCM_TSTAMP_ENABLE)
+ 		snd_pcm_gettime(runtime, (struct timespec *)&runtime->status->tstamp);
+ 	snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
+@@ -180,97 +186,19 @@ static void xrun(struct snd_pcm_substream *substream)
+ }
+ 
+ #ifdef CONFIG_SND_PCM_XRUN_DEBUG
+-#define hw_ptr_error(substream, fmt, args...)				\
++#define hw_ptr_error(substream, in_interrupt, reason, fmt, args...)	\
+ 	do {								\
++		trace_hw_ptr_error(substream, reason);	\
+ 		if (xrun_debug(substream, XRUN_DEBUG_BASIC)) {		\
+-			xrun_log_show(substream);			\
+-			pr_err_ratelimited("ALSA: PCM: " fmt, ##args);	\
++			pr_err_ratelimited("ALSA: PCM: [%c] " reason ": " fmt, \
++					   (in_interrupt) ? 'Q' : 'P', ##args);	\
+ 			dump_stack_on_xrun(substream);			\
+ 		}							\
+ 	} while (0)
+ 
+-#define XRUN_LOG_CNT	10
+-
+-struct hwptr_log_entry {
+-	unsigned int in_interrupt;
+-	unsigned long jiffies;
+-	snd_pcm_uframes_t pos;
+-	snd_pcm_uframes_t period_size;
+-	snd_pcm_uframes_t buffer_size;
+-	snd_pcm_uframes_t old_hw_ptr;
+-	snd_pcm_uframes_t hw_ptr_base;
+-};
+-
+-struct snd_pcm_hwptr_log {
+-	unsigned int idx;
+-	unsigned int hit: 1;
+-	struct hwptr_log_entry entries[XRUN_LOG_CNT];
+-};
+-
+-static void xrun_log(struct snd_pcm_substream *substream,
+-		     snd_pcm_uframes_t pos, int in_interrupt)
+-{
+-	struct snd_pcm_runtime *runtime = substream->runtime;
+-	struct snd_pcm_hwptr_log *log = runtime->hwptr_log;
+-	struct hwptr_log_entry *entry;
+-
+-	if (log == NULL) {
+-		log = kzalloc(sizeof(*log), GFP_ATOMIC);
+-		if (log == NULL)
+-			return;
+-		runtime->hwptr_log = log;
+-	} else {
+-		if (xrun_debug(substream, XRUN_DEBUG_LOGONCE) && log->hit)
+-			return;
+-	}
+-	entry = &log->entries[log->idx];
+-	entry->in_interrupt = in_interrupt;
+-	entry->jiffies = jiffies;
+-	entry->pos = pos;
+-	entry->period_size = runtime->period_size;
+-	entry->buffer_size = runtime->buffer_size;
+-	entry->old_hw_ptr = runtime->status->hw_ptr;
+-	entry->hw_ptr_base = runtime->hw_ptr_base;
+-	log->idx = (log->idx + 1) % XRUN_LOG_CNT;
+-}
+-
+-static void xrun_log_show(struct snd_pcm_substream *substream)
+-{
+-	struct snd_pcm_hwptr_log *log = substream->runtime->hwptr_log;
+-	struct hwptr_log_entry *entry;
+-	char name[16];
+-	unsigned int idx;
+-	int cnt;
+-
+-	if (log == NULL)
+-		return;
+-	if (xrun_debug(substream, XRUN_DEBUG_LOGONCE) && log->hit)
+-		return;
+-	snd_pcm_debug_name(substream, name, sizeof(name));
+-	for (cnt = 0, idx = log->idx; cnt < XRUN_LOG_CNT; cnt++) {
+-		entry = &log->entries[idx];
+-		if (entry->period_size == 0)
+-			break;
+-		pr_info("hwptr log: %s: %sj=%lu, pos=%ld/%ld/%ld, "
+-			   "hwptr=%ld/%ld\n",
+-			   name, entry->in_interrupt ? "[Q] " : "",
+-			   entry->jiffies,
+-			   (unsigned long)entry->pos,
+-			   (unsigned long)entry->period_size,
+-			   (unsigned long)entry->buffer_size,
+-			   (unsigned long)entry->old_hw_ptr,
+-			   (unsigned long)entry->hw_ptr_base);
+-		idx++;
+-		idx %= XRUN_LOG_CNT;
+-	}
+-	log->hit = 1;
+-}
+-
+ #else /* ! CONFIG_SND_PCM_XRUN_DEBUG */
+ 
+ #define hw_ptr_error(substream, fmt, args...) do { } while (0)
+-#define xrun_log(substream, pos, in_interrupt)	do { } while (0)
+-#define xrun_log_show(substream)	do { } while (0)
+ 
+ #endif
+ 
+@@ -343,7 +271,6 @@ static int snd_pcm_update_hw_ptr0(struct snd_pcm_substream *substream,
+ 		if (printk_ratelimit()) {
+ 			char name[16];
+ 			snd_pcm_debug_name(substream, name, sizeof(name));
+-			xrun_log_show(substream);
+ 			pcm_err(substream->pcm,
+ 				"BUG: %s, pos = %ld, buffer size = %ld, period size = %ld\n",
+ 				name, pos, runtime->buffer_size,
+@@ -352,8 +279,7 @@ static int snd_pcm_update_hw_ptr0(struct snd_pcm_substream *substream,
+ 		pos = 0;
+ 	}
+ 	pos -= pos % runtime->min_align;
+-	if (xrun_debug(substream, XRUN_DEBUG_LOG))
+-		xrun_log(substream, pos, in_interrupt);
++	trace_hwptr(substream, pos, in_interrupt);
+ 	hw_base = runtime->hw_ptr_base;
+ 	new_hw_ptr = hw_base + pos;
+ 	if (in_interrupt) {
+@@ -388,22 +314,6 @@ static int snd_pcm_update_hw_ptr0(struct snd_pcm_substream *substream,
+ 	delta = new_hw_ptr - old_hw_ptr;
+ 	if (delta < 0)
+ 		delta += runtime->boundary;
+-	if (xrun_debug(substream, in_interrupt ?
+-			XRUN_DEBUG_PERIODUPDATE : XRUN_DEBUG_HWPTRUPDATE)) {
+-		char name[16];
+-		snd_pcm_debug_name(substream, name, sizeof(name));
+-		pcm_dbg(substream->pcm,
+-			"%s_update: %s: pos=%u/%u/%u, hwptr=%ld/%ld/%ld/%ld\n",
+-			   in_interrupt ? "period" : "hwptr",
+-			   name,
+-			   (unsigned int)pos,
+-			   (unsigned int)runtime->period_size,
+-			   (unsigned int)runtime->buffer_size,
+-			   (unsigned long)delta,
+-			   (unsigned long)old_hw_ptr,
+-			   (unsigned long)new_hw_ptr,
+-			   (unsigned long)runtime->hw_ptr_base);
+-	}
+ 
+ 	if (runtime->no_period_wakeup) {
+ 		snd_pcm_sframes_t xrun_threshold;
+@@ -431,13 +341,10 @@ static int snd_pcm_update_hw_ptr0(struct snd_pcm_substream *substream,
+ 
+ 	/* something must be really wrong */
+ 	if (delta >= runtime->buffer_size + runtime->period_size) {
+-		hw_ptr_error(substream,
+-			       "Unexpected hw_pointer value %s"
+-			       "(stream=%i, pos=%ld, new_hw_ptr=%ld, "
+-			       "old_hw_ptr=%ld)\n",
+-				     in_interrupt ? "[Q] " : "[P]",
+-				     substream->stream, (long)pos,
+-				     (long)new_hw_ptr, (long)old_hw_ptr);
++		hw_ptr_error(substream, in_interrupt, "Unexpected hw_ptr",
++			     "(stream=%i, pos=%ld, new_hw_ptr=%ld, old_hw_ptr=%ld)\n",
++			     substream->stream, (long)pos,
++			     (long)new_hw_ptr, (long)old_hw_ptr);
+ 		return 0;
+ 	}
+ 
+@@ -474,11 +381,8 @@ static int snd_pcm_update_hw_ptr0(struct snd_pcm_substream *substream,
+ 			delta--;
+ 		}
+ 		/* align hw_base to buffer_size */
+-		hw_ptr_error(substream,
+-			     "hw_ptr skipping! %s"
+-			     "(pos=%ld, delta=%ld, period=%ld, "
+-			     "jdelta=%lu/%lu/%lu, hw_ptr=%ld/%ld)\n",
+-			     in_interrupt ? "[Q] " : "",
++		hw_ptr_error(substream, in_interrupt, "hw_ptr skipping",
++			     "(pos=%ld, delta=%ld, period=%ld, jdelta=%lu/%lu/%lu, hw_ptr=%ld/%ld)\n",
+ 			     (long)pos, (long)hdelta,
+ 			     (long)runtime->period_size, jdelta,
+ 			     ((hdelta * HZ) / runtime->rate), hw_base,
+@@ -490,11 +394,9 @@ static int snd_pcm_update_hw_ptr0(struct snd_pcm_substream *substream,
+ 	}
+  no_jiffies_check:
+ 	if (delta > runtime->period_size + runtime->period_size / 2) {
+-		hw_ptr_error(substream,
+-			     "Lost interrupts? %s"
+-			     "(stream=%i, delta=%ld, new_hw_ptr=%ld, "
+-			     "old_hw_ptr=%ld)\n",
+-			     in_interrupt ? "[Q] " : "",
++		hw_ptr_error(substream, in_interrupt,
++			     "Lost interrupts?",
++			     "(stream=%i, delta=%ld, new_hw_ptr=%ld, old_hw_ptr=%ld)\n",
+ 			     substream->stream, (long)delta,
+ 			     (long)new_hw_ptr,
+ 			     (long)old_hw_ptr);
+diff --git a/sound/core/pcm_trace.h b/sound/core/pcm_trace.h
+new file mode 100644
+index 000000000000..b63b654da5ff
+--- /dev/null
++++ b/sound/core/pcm_trace.h
+@@ -0,0 +1,110 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM snd_pcm
++#define TRACE_INCLUDE_FILE pcm_trace
++
++#if !defined(_PCM_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _PCM_TRACE_H
++
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(hwptr,
++	TP_PROTO(struct snd_pcm_substream *substream, snd_pcm_uframes_t pos, bool irq),
++	TP_ARGS(substream, pos, irq),
++	TP_STRUCT__entry(
++		__field( bool, in_interrupt )
++		__field( unsigned int, card )
++		__field( unsigned int, device )
++		__field( unsigned int, number )
++		__field( unsigned int, stream )
++		__field( snd_pcm_uframes_t, pos )
++		__field( snd_pcm_uframes_t, period_size )
++		__field( snd_pcm_uframes_t, buffer_size )
++		__field( snd_pcm_uframes_t, old_hw_ptr )
++		__field( snd_pcm_uframes_t, hw_ptr_base )
++	),
++	TP_fast_assign(
++		__entry->in_interrupt = (irq);
++		__entry->card = (substream)->pcm->card->number;
++		__entry->device = (substream)->pcm->device;
++		__entry->number = (substream)->number;
++		__entry->stream = (substream)->stream;
++		__entry->pos = (pos);
++		__entry->period_size = (substream)->runtime->period_size;
++		__entry->buffer_size = (substream)->runtime->buffer_size;
++		__entry->old_hw_ptr = (substream)->runtime->status->hw_ptr;
++		__entry->hw_ptr_base = (substream)->runtime->hw_ptr_base;
++	),
++	TP_printk("pcmC%dD%d%c/sub%d: %s: pos=%lu, old=%lu, base=%lu, period=%lu, buf=%lu",
++		  __entry->card, __entry->device,
++		  __entry->stream == SNDRV_PCM_STREAM_PLAYBACK ? 'p' : 'c',
++		  __entry->number,
++		  __entry->in_interrupt ? "IRQ" : "POS",
++		  (unsigned long)__entry->pos,
++		  (unsigned long)__entry->old_hw_ptr,
++		  (unsigned long)__entry->hw_ptr_base,
++		  (unsigned long)__entry->period_size,
++		  (unsigned long)__entry->buffer_size)
++);
++
++TRACE_EVENT(xrun,
++	TP_PROTO(struct snd_pcm_substream *substream),
++	TP_ARGS(substream),
++	TP_STRUCT__entry(
++		__field( unsigned int, card )
++		__field( unsigned int, device )
++		__field( unsigned int, number )
++		__field( unsigned int, stream )
++		__field( snd_pcm_uframes_t, period_size )
++		__field( snd_pcm_uframes_t, buffer_size )
++		__field( snd_pcm_uframes_t, old_hw_ptr )
++		__field( snd_pcm_uframes_t, hw_ptr_base )
++	),
++	TP_fast_assign(
++		__entry->card = (substream)->pcm->card->number;
++		__entry->device = (substream)->pcm->device;
++		__entry->number = (substream)->number;
++		__entry->stream = (substream)->stream;
++		__entry->period_size = (substream)->runtime->period_size;
++		__entry->buffer_size = (substream)->runtime->buffer_size;
++		__entry->old_hw_ptr = (substream)->runtime->status->hw_ptr;
++		__entry->hw_ptr_base = (substream)->runtime->hw_ptr_base;
++	),
++	TP_printk("pcmC%dD%d%c/sub%d: XRUN: old=%lu, base=%lu, period=%lu, buf=%lu",
++		  __entry->card, __entry->device,
++		  __entry->stream == SNDRV_PCM_STREAM_PLAYBACK ? 'p' : 'c',
++		  __entry->number,
++		  (unsigned long)__entry->old_hw_ptr,
++		  (unsigned long)__entry->hw_ptr_base,
++		  (unsigned long)__entry->period_size,
++		  (unsigned long)__entry->buffer_size)
++);
++
++TRACE_EVENT(hw_ptr_error,
++	TP_PROTO(struct snd_pcm_substream *substream, const char *why),
++	TP_ARGS(substream, why),
++	TP_STRUCT__entry(
++		__field( unsigned int, card )
++		__field( unsigned int, device )
++		__field( unsigned int, number )
++		__field( unsigned int, stream )
++		__field( const char *, reason )
++	),
++	TP_fast_assign(
++		__entry->card = (substream)->pcm->card->number;
++		__entry->device = (substream)->pcm->device;
++		__entry->number = (substream)->number;
++		__entry->stream = (substream)->stream;
++		__entry->reason = (why);
++	),
++	TP_printk("pcmC%dD%d%c/sub%d: ERROR: %s",
++		  __entry->card, __entry->device,
++		  __entry->stream == SNDRV_PCM_STREAM_PLAYBACK ? 'p' : 'c',
++		  __entry->number, __entry->reason)
++);
++
++#endif /* _PCM_TRACE_H */
++
++/* This part must be outside protection */
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH .
++#include <trace/define_trace.h>
