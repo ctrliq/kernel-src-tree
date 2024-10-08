@@ -260,6 +260,8 @@ int rhashtable_expand(struct rhashtable *ht)
 		}
 	} while (!complete);
 
+	synchronize_rcu();
+
 	bucket_table_free(old_tbl);
 	return 0;
 }
