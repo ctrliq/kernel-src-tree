@@ -1,0 +1,190 @@
+ses: Add power_status to SES device slot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Song Liu <songliubraving@fb.com>
+commit 08024885a2a3ed432716e9d50046a620a5b2df05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/08024885.failed
+
+Add power_status to SES device slot, so we can power on/off the
+HDDs behind the enclosure.
+
+Check firmware status in ses_set_* before sending control pages to
+firmware.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Acked-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Jens Axboe <axboe@fb.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 08024885a2a3ed432716e9d50046a620a5b2df05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/ses.c
+#	include/linux/enclosure.h
+diff --cc drivers/scsi/ses.c
+index 0915d3039926,dcb0d76d7312..000000000000
+--- a/drivers/scsi/ses.c
++++ b/drivers/scsi/ses.c
+@@@ -275,13 -295,63 +313,65 @@@ static int ses_set_active(struct enclos
+  	return ses_set_page2_descriptor(edev, ecomp, desc);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ses_show_id(struct enclosure_device *edev, char *buf)
++ {
++ 	struct ses_device *ses_dev = edev->scratch;
++ 	unsigned long long id = get_unaligned_be64(ses_dev->page1+8+4);
++ 
++ 	return sprintf(buf, "%#llx\n", id);
++ }
++ 
++ static void ses_get_power_status(struct enclosure_device *edev,
++ 				 struct enclosure_component *ecomp)
++ {
++ 	unsigned char *desc;
++ 
++ 	desc = ses_get_page2_descriptor(edev, ecomp);
++ 	if (desc)
++ 		ecomp->power_status = (desc[3] & 0x10) ? 0 : 1;
++ }
++ 
++ static int ses_set_power_status(struct enclosure_device *edev,
++ 				struct enclosure_component *ecomp,
++ 				int val)
++ {
++ 	unsigned char desc[4];
++ 	unsigned char *desc_ptr;
++ 
++ 	desc_ptr = ses_get_page2_descriptor(edev, ecomp);
++ 
++ 	if (!desc_ptr)
++ 		return -EIO;
++ 
++ 	init_device_slot_control(desc, ecomp, desc_ptr);
++ 
++ 	switch (val) {
++ 	/* power = 1 is device_off = 0 and vice versa */
++ 	case 0:
++ 		desc[3] |= 0x10;
++ 		break;
++ 	case 1:
++ 		desc[3] &= 0xef;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 	ecomp->power_status = val;
++ 	return ses_set_page2_descriptor(edev, ecomp, desc);
++ }
++ 
+++>>>>>>> 08024885a2a3 (ses: Add power_status to SES device slot)
+  static struct enclosure_component_callbacks ses_enclosure_callbacks = {
+  	.get_fault		= ses_get_fault,
+  	.set_fault		= ses_set_fault,
+  	.get_status		= ses_get_status,
+  	.get_locate		= ses_get_locate,
+  	.set_locate		= ses_set_locate,
++ 	.get_power_status	= ses_get_power_status,
++ 	.set_power_status	= ses_set_power_status,
+  	.set_active		= ses_set_active,
+ -	.show_id		= ses_show_id,
+  };
+  
+  struct ses_host_edev {
+diff --cc include/linux/enclosure.h
+index 04f1e8844364,7be22da321f3..000000000000
+--- a/include/linux/enclosure.h
++++ b/include/linux/enclosure.h
+@@@ -79,6 -79,12 +79,15 @@@ struct enclosure_component_callbacks 
+  	int (*set_locate)(struct enclosure_device *,
+  			  struct enclosure_component *,
+  			  enum enclosure_component_setting);
+++<<<<<<< HEAD
+++=======
++ 	void (*get_power_status)(struct enclosure_device *,
++ 				 struct enclosure_component *);
++ 	int (*set_power_status)(struct enclosure_device *,
++ 				struct enclosure_component *,
++ 				int);
++ 	int (*show_id)(struct enclosure_device *, char *buf);
+++>>>>>>> 08024885a2a3 (ses: Add power_status to SES device slot)
+  };
+  
+  
+diff --git a/drivers/misc/enclosure.c b/drivers/misc/enclosure.c
+index 35f9f4f1ffb0..1c3e3ee50835 100644
+--- a/drivers/misc/enclosure.c
++++ b/drivers/misc/enclosure.c
+@@ -148,6 +148,7 @@ enclosure_register(struct device *dev, const char *name, int components,
+ 	for (i = 0; i < components; i++) {
+ 		edev->component[i].number = -1;
+ 		edev->component[i].slot = -1;
++		edev->component[i].power_status = 1;
+ 	}
+ 
+ 	mutex_lock(&container_list_lock);
+@@ -570,6 +571,40 @@ static ssize_t set_component_locate(struct device *cdev,
+ 	return count;
+ }
+ 
++static ssize_t get_component_power_status(struct device *cdev,
++					  struct device_attribute *attr,
++					  char *buf)
++{
++	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
++	struct enclosure_component *ecomp = to_enclosure_component(cdev);
++
++	if (edev->cb->get_power_status)
++		edev->cb->get_power_status(edev, ecomp);
++	return snprintf(buf, 40, "%s\n", ecomp->power_status ? "on" : "off");
++}
++
++static ssize_t set_component_power_status(struct device *cdev,
++					  struct device_attribute *attr,
++					  const char *buf, size_t count)
++{
++	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
++	struct enclosure_component *ecomp = to_enclosure_component(cdev);
++	int val;
++
++	if (strncmp(buf, "on", 2) == 0 &&
++	    (buf[2] == '\n' || buf[2] == '\0'))
++		val = 1;
++	else if (strncmp(buf, "off", 3) == 0 &&
++	    (buf[3] == '\n' || buf[3] == '\0'))
++		val = 0;
++	else
++		return -EINVAL;
++
++	if (edev->cb->set_power_status)
++		edev->cb->set_power_status(edev, ecomp, val);
++	return count;
++}
++
+ static ssize_t get_component_type(struct device *cdev,
+ 				  struct device_attribute *attr, char *buf)
+ {
+@@ -601,6 +636,8 @@ static DEVICE_ATTR(active, S_IRUGO | S_IWUSR, get_component_active,
+ 		   set_component_active);
+ static DEVICE_ATTR(locate, S_IRUGO | S_IWUSR, get_component_locate,
+ 		   set_component_locate);
++static DEVICE_ATTR(power_status, S_IRUGO | S_IWUSR, get_component_power_status,
++		   set_component_power_status);
+ static DEVICE_ATTR(type, S_IRUGO, get_component_type, NULL);
+ static DEVICE_ATTR(slot, S_IRUGO, get_component_slot, NULL);
+ 
+@@ -609,6 +646,7 @@ static struct attribute *enclosure_component_attrs[] = {
+ 	&dev_attr_status.attr,
+ 	&dev_attr_active.attr,
+ 	&dev_attr_locate.attr,
++	&dev_attr_power_status.attr,
+ 	&dev_attr_type.attr,
+ 	&dev_attr_slot.attr,
+ 	NULL
+* Unmerged path drivers/scsi/ses.c
+* Unmerged path include/linux/enclosure.h
