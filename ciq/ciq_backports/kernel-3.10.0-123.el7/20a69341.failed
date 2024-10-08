@@ -1,0 +1,592 @@
+netfilter: nf_tables: add netlink set API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 20a69341f2d00cd042e81c82289fba8a13c05a25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/20a69341.failed
+
+This patch adds the new netlink API for maintaining nf_tables sets
+independently of the ruleset. The API supports the following operations:
+
+- creation of sets
+- deletion of sets
+- querying of specific sets
+- dumping of all sets
+
+- addition of set elements
+- removal of set elements
+- dumping of all set elements
+
+Sets are identified by name, each table defines an individual namespace.
+The name of a set may be allocated automatically, this is mostly useful
+in combination with the NFT_SET_ANONYMOUS flag, which destroys a set
+automatically once the last reference has been released.
+
+Sets can be marked constant, meaning they're not allowed to change while
+linked to a rule. This allows to perform lockless operation for set
+types that would otherwise require locking.
+
+Additionally, if the implementation supports it, sets can (as before) be
+used as maps, associating a data value with each key (or range), by
+specifying the NFT_SET_MAP flag and can be used for interval queries by
+specifying the NFT_SET_INTERVAL flag.
+
+Set elements are added and removed incrementally. All element operations
+support batching, reducing netlink message and set lookup overhead.
+
+The old "set" and "hash" expressions are replaced by a generic "lookup"
+expression, which binds to the specified set. Userspace is not aware
+of the actual set implementation used by the kernel anymore, all
+configuration options are generic.
+
+Currently the implementation selection logic is largely missing and the
+kernel will simply use the first registered implementation supporting the
+requested operation. Eventually, the plan is to have userspace supply a
+description of the data characteristics and select the implementation
+based on expected performance and memory use.
+
+This patch includes the new 'lookup' expression to look up for element
+matching in the set.
+
+This patch includes kernel-doc descriptions for this set API and it
+also includes the following fixes.
+
+From Patrick McHardy:
+* netfilter: nf_tables: fix set element data type in dumps
+* netfilter: nf_tables: fix indentation of struct nft_set_elem comments
+* netfilter: nf_tables: fix oops in nft_validate_data_load()
+* netfilter: nf_tables: fix oops while listing sets of built-in tables
+* netfilter: nf_tables: destroy anonymous sets immediately if binding fails
+* netfilter: nf_tables: propagate context to set iter callback
+* netfilter: nf_tables: add loop detection
+
+From Pablo Neira Ayuso:
+* netfilter: nf_tables: allow to dump all existing sets
+* netfilter: nf_tables: fix wrong type for flags variable in newelem
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 20a69341f2d00cd042e81c82289fba8a13c05a25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	include/uapi/linux/netfilter/nf_tables.h
+#	net/netfilter/Kconfig
+#	net/netfilter/Makefile
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nf_tables_core.c
+#	net/netfilter/nft_hash.c
+#	net/netfilter/nft_immediate.c
+diff --cc net/netfilter/Kconfig
+index d9954c1c7613,aa184a46bbf3..000000000000
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@@ -408,21 -408,47 +408,56 @@@ config NF_NAT_TFT
+  	depends on NF_CONNTRACK && NF_NAT
+  	default NF_NAT && NF_CONNTRACK_TFTP
+  
+ -config NETFILTER_SYNPROXY
+ -	tristate
+ -
+  endif # NF_CONNTRACK
+  
+ -config NF_TABLES
+ -	depends on NETFILTER_NETLINK
+ -	tristate "Netfilter nf_tables support"
+ +# transparent proxy support
+ +config NETFILTER_TPROXY
+ +	tristate "Transparent proxying support"
+ +	depends on IP_NF_MANGLE
+ +	depends on NETFILTER_ADVANCED
+ +	help
+ +	  This option enables transparent proxying support, that is,
+ +	  support for handling non-locally bound IPv4 TCP and UDP sockets.
+ +	  For it to work you will have to configure certain iptables rules
+ +	  and use policy routing. For more information on how to set it up
+ +	  see Documentation/networking/tproxy.txt.
+  
+++<<<<<<< HEAD
+ +	  To compile it as a module, choose M here.  If unsure, say N.
+++=======
++ config NFT_EXTHDR
++ 	depends on NF_TABLES
++ 	tristate "Netfilter nf_tables IPv6 exthdr module"
++ 
++ config NFT_META
++ 	depends on NF_TABLES
++ 	tristate "Netfilter nf_tables meta module"
++ 
++ config NFT_CT
++ 	depends on NF_TABLES
++ 	depends on NF_CONNTRACK
++ 	tristate "Netfilter nf_tables conntrack module"
++ 
++ config NFT_RBTREE
++ 	depends on NF_TABLES
++ 	tristate "Netfilter nf_tables rbtree set module"
++ 
++ config NFT_HASH
++ 	depends on NF_TABLES
++ 	tristate "Netfilter nf_tables hash set module"
++ 
++ config NFT_COUNTER
++ 	depends on NF_TABLES
++ 	tristate "Netfilter nf_tables counter module"
++ 
++ config NFT_LOG
++ 	depends on NF_TABLES
++ 	tristate "Netfilter nf_tables log module"
++ 
++ config NFT_LIMIT
++ 	depends on NF_TABLES
++ 	tristate "Netfilter nf_tables limit module"
+++>>>>>>> 20a69341f2d0 (netfilter: nf_tables: add netlink set API)
+  
+  config NETFILTER_XTABLES
+  	tristate "Netfilter Xtables support (required for ip_tables)"
+diff --cc net/netfilter/Makefile
+index a1abf87d43bf,b6b78754e4cc..000000000000
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@@ -61,8 -61,24 +61,29 @@@ obj-$(CONFIG_NF_NAT_IRC) += nf_nat_irc.
+  obj-$(CONFIG_NF_NAT_SIP) += nf_nat_sip.o
+  obj-$(CONFIG_NF_NAT_TFTP) += nf_nat_tftp.o
+  
+++<<<<<<< HEAD
+ +# transparent proxy support
+ +obj-$(CONFIG_NETFILTER_TPROXY) += nf_tproxy_core.o
+++=======
++ # SYNPROXY
++ obj-$(CONFIG_NETFILTER_SYNPROXY) += nf_synproxy_core.o
++ 
++ # nf_tables
++ nf_tables-objs += nf_tables_core.o nf_tables_api.o
++ nf_tables-objs += nft_immediate.o nft_cmp.o nft_lookup.o
++ nf_tables-objs += nft_bitwise.o nft_byteorder.o nft_payload.o
++ 
++ obj-$(CONFIG_NF_TABLES)		+= nf_tables.o
++ obj-$(CONFIG_NFT_EXTHDR)	+= nft_exthdr.o
++ obj-$(CONFIG_NFT_META)		+= nft_meta.o
++ obj-$(CONFIG_NFT_CT)		+= nft_ct.o
++ obj-$(CONFIG_NFT_LIMIT)		+= nft_limit.o
++ #nf_tables-objs			+= nft_meta_target.o
++ obj-$(CONFIG_NFT_RBTREE)	+= nft_rbtree.o
++ obj-$(CONFIG_NFT_HASH)		+= nft_hash.o
++ obj-$(CONFIG_NFT_COUNTER)	+= nft_counter.o
++ obj-$(CONFIG_NFT_LOG)		+= nft_log.o
+++>>>>>>> 20a69341f2d0 (netfilter: nf_tables: add netlink set API)
+  
+  # generic X tables 
+  obj-$(CONFIG_NETFILTER_XTABLES) += x_tables.o xt_tcpudp.o
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path include/uapi/linux/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nf_tables_core.c
+* Unmerged path net/netfilter/nft_hash.c
+* Unmerged path net/netfilter/nft_immediate.c
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path include/uapi/linux/netfilter/nf_tables.h
+* Unmerged path net/netfilter/Kconfig
+* Unmerged path net/netfilter/Makefile
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nf_tables_core.c
+* Unmerged path net/netfilter/nft_hash.c
+* Unmerged path net/netfilter/nft_immediate.c
+diff --git a/net/netfilter/nft_lookup.c b/net/netfilter/nft_lookup.c
+new file mode 100644
+index 000000000000..4962d2173678
+--- /dev/null
++++ b/net/netfilter/nft_lookup.c
+@@ -0,0 +1,135 @@
++/*
++ * Copyright (c) 2009 Patrick McHardy <kaber@trash.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Development of this code funded by Astaro AG (http://www.astaro.com/)
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/rbtree.h>
++#include <linux/netlink.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter/nf_tables.h>
++#include <net/netfilter/nf_tables.h>
++
++struct nft_lookup {
++	struct nft_set			*set;
++	enum nft_registers		sreg:8;
++	enum nft_registers		dreg:8;
++	struct nft_set_binding		binding;
++};
++
++static void nft_lookup_eval(const struct nft_expr *expr,
++			    struct nft_data data[NFT_REG_MAX + 1],
++			    const struct nft_pktinfo *pkt)
++{
++	const struct nft_lookup *priv = nft_expr_priv(expr);
++	const struct nft_set *set = priv->set;
++
++	if (set->ops->lookup(set, &data[priv->sreg], &data[priv->dreg]))
++		return;
++	data[NFT_REG_VERDICT].verdict = NFT_BREAK;
++}
++
++static const struct nla_policy nft_lookup_policy[NFTA_LOOKUP_MAX + 1] = {
++	[NFTA_LOOKUP_SET]	= { .type = NLA_STRING },
++	[NFTA_LOOKUP_SREG]	= { .type = NLA_U32 },
++	[NFTA_LOOKUP_DREG]	= { .type = NLA_U32 },
++};
++
++static int nft_lookup_init(const struct nft_ctx *ctx,
++			   const struct nft_expr *expr,
++			   const struct nlattr * const tb[])
++{
++	struct nft_lookup *priv = nft_expr_priv(expr);
++	struct nft_set *set;
++	int err;
++
++	if (tb[NFTA_LOOKUP_SET] == NULL ||
++	    tb[NFTA_LOOKUP_SREG] == NULL)
++		return -EINVAL;
++
++	set = nf_tables_set_lookup(ctx->table, tb[NFTA_LOOKUP_SET]);
++	if (IS_ERR(set))
++		return PTR_ERR(set);
++
++	priv->sreg = ntohl(nla_get_be32(tb[NFTA_LOOKUP_SREG]));
++	err = nft_validate_input_register(priv->sreg);
++	if (err < 0)
++		return err;
++
++	if (tb[NFTA_LOOKUP_DREG] != NULL) {
++		if (!(set->flags & NFT_SET_MAP))
++			return -EINVAL;
++
++		priv->dreg = ntohl(nla_get_be32(tb[NFTA_LOOKUP_DREG]));
++		err = nft_validate_output_register(priv->dreg);
++		if (err < 0)
++			return err;
++
++		if (priv->dreg == NFT_REG_VERDICT) {
++			if (set->dtype != NFT_DATA_VERDICT)
++				return -EINVAL;
++		} else if (set->dtype == NFT_DATA_VERDICT)
++			return -EINVAL;
++	} else if (set->flags & NFT_SET_MAP)
++		return -EINVAL;
++
++	err = nf_tables_bind_set(ctx, set, &priv->binding);
++	if (err < 0)
++		return err;
++
++	priv->set = set;
++	return 0;
++}
++
++static void nft_lookup_destroy(const struct nft_expr *expr)
++{
++	struct nft_lookup *priv = nft_expr_priv(expr);
++
++	nf_tables_unbind_set(NULL, priv->set, &priv->binding);
++}
++
++static int nft_lookup_dump(struct sk_buff *skb, const struct nft_expr *expr)
++{
++	const struct nft_lookup *priv = nft_expr_priv(expr);
++
++	if (nla_put_string(skb, NFTA_LOOKUP_SET, priv->set->name))
++		goto nla_put_failure;
++	if (nla_put_be32(skb, NFTA_LOOKUP_SREG, htonl(priv->sreg)))
++		goto nla_put_failure;
++	if (priv->set->flags & NFT_SET_MAP)
++		if (nla_put_be32(skb, NFTA_LOOKUP_DREG, htonl(priv->dreg)))
++			goto nla_put_failure;
++	return 0;
++
++nla_put_failure:
++	return -1;
++}
++
++static struct nft_expr_ops nft_lookup_ops __read_mostly = {
++	.name		= "lookup",
++	.size		= NFT_EXPR_SIZE(sizeof(struct nft_lookup)),
++	.owner		= THIS_MODULE,
++	.eval		= nft_lookup_eval,
++	.init		= nft_lookup_init,
++	.destroy	= nft_lookup_destroy,
++	.dump		= nft_lookup_dump,
++	.policy		= nft_lookup_policy,
++	.maxattr	= NFTA_LOOKUP_MAX,
++};
++
++int __init nft_lookup_module_init(void)
++{
++	return nft_register_expr(&nft_lookup_ops);
++}
++
++void nft_lookup_module_exit(void)
++{
++	nft_unregister_expr(&nft_lookup_ops);
++}
+diff --git a/net/netfilter/nft_rbtree.c b/net/netfilter/nft_rbtree.c
+new file mode 100644
+index 000000000000..ca0c1b231bfe
+--- /dev/null
++++ b/net/netfilter/nft_rbtree.c
+@@ -0,0 +1,247 @@
++/*
++ * Copyright (c) 2008-2009 Patrick McHardy <kaber@trash.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Development of this code funded by Astaro AG (http://www.astaro.com/)
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/list.h>
++#include <linux/rbtree.h>
++#include <linux/netlink.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter/nf_tables.h>
++#include <net/netfilter/nf_tables.h>
++
++struct nft_rbtree {
++	struct rb_root		root;
++};
++
++struct nft_rbtree_elem {
++	struct rb_node		node;
++	u16			flags;
++	struct nft_data		key;
++	struct nft_data		data[];
++};
++
++static bool nft_rbtree_lookup(const struct nft_set *set,
++			      const struct nft_data *key,
++			      struct nft_data *data)
++{
++	const struct nft_rbtree *priv = nft_set_priv(set);
++	const struct nft_rbtree_elem *rbe, *interval = NULL;
++	const struct rb_node *parent = priv->root.rb_node;
++	int d;
++
++	while (parent != NULL) {
++		rbe = rb_entry(parent, struct nft_rbtree_elem, node);
++
++		d = nft_data_cmp(&rbe->key, key, set->klen);
++		if (d < 0) {
++			parent = parent->rb_left;
++			interval = rbe;
++		} else if (d > 0)
++			parent = parent->rb_right;
++		else {
++found:
++			if (rbe->flags & NFT_SET_ELEM_INTERVAL_END)
++				goto out;
++			if (set->flags & NFT_SET_MAP)
++				nft_data_copy(data, rbe->data);
++			return true;
++		}
++	}
++
++	if (set->flags & NFT_SET_INTERVAL && interval != NULL) {
++		rbe = interval;
++		goto found;
++	}
++out:
++	return false;
++}
++
++static void nft_rbtree_elem_destroy(const struct nft_set *set,
++				    struct nft_rbtree_elem *rbe)
++{
++	nft_data_uninit(&rbe->key, NFT_DATA_VALUE);
++	if (set->flags & NFT_SET_MAP)
++		nft_data_uninit(rbe->data, set->dtype);
++	kfree(rbe);
++}
++
++static int __nft_rbtree_insert(const struct nft_set *set,
++			       struct nft_rbtree_elem *new)
++{
++	struct nft_rbtree *priv = nft_set_priv(set);
++	struct nft_rbtree_elem *rbe;
++	struct rb_node *parent, **p;
++	int d;
++
++	parent = NULL;
++	p = &priv->root.rb_node;
++	while (*p != NULL) {
++		parent = *p;
++		rbe = rb_entry(parent, struct nft_rbtree_elem, node);
++		d = nft_data_cmp(&rbe->key, &new->key, set->klen);
++		if (d < 0)
++			p = &parent->rb_left;
++		else if (d > 0)
++			p = &parent->rb_right;
++		else
++			return -EEXIST;
++	}
++	rb_link_node(&new->node, parent, p);
++	rb_insert_color(&new->node, &priv->root);
++	return 0;
++}
++
++static int nft_rbtree_insert(const struct nft_set *set,
++			     const struct nft_set_elem *elem)
++{
++	struct nft_rbtree_elem *rbe;
++	unsigned int size;
++	int err;
++
++	size = sizeof(*rbe);
++	if (set->flags & NFT_SET_MAP)
++		size += sizeof(rbe->data[0]);
++
++	rbe = kzalloc(size, GFP_KERNEL);
++	if (rbe == NULL)
++		return -ENOMEM;
++
++	rbe->flags = elem->flags;
++	nft_data_copy(&rbe->key, &elem->key);
++	if (set->flags & NFT_SET_MAP)
++		nft_data_copy(rbe->data, &elem->data);
++
++	err = __nft_rbtree_insert(set, rbe);
++	if (err < 0)
++		kfree(rbe);
++	return err;
++}
++
++static void nft_rbtree_remove(const struct nft_set *set,
++			      const struct nft_set_elem *elem)
++{
++	struct nft_rbtree *priv = nft_set_priv(set);
++	struct nft_rbtree_elem *rbe = elem->cookie;
++
++	rb_erase(&rbe->node, &priv->root);
++	kfree(rbe);
++}
++
++static int nft_rbtree_get(const struct nft_set *set, struct nft_set_elem *elem)
++{
++	const struct nft_rbtree *priv = nft_set_priv(set);
++	const struct rb_node *parent = priv->root.rb_node;
++	struct nft_rbtree_elem *rbe;
++	int d;
++
++	while (parent != NULL) {
++		rbe = rb_entry(parent, struct nft_rbtree_elem, node);
++
++		d = nft_data_cmp(&rbe->key, &elem->key, set->klen);
++		if (d < 0)
++			parent = parent->rb_left;
++		else if (d > 0)
++			parent = parent->rb_right;
++		else {
++			elem->cookie = rbe;
++			if (set->flags & NFT_SET_MAP)
++				nft_data_copy(&elem->data, rbe->data);
++			elem->flags = rbe->flags;
++			return 0;
++		}
++	}
++	return -ENOENT;
++}
++
++static void nft_rbtree_walk(const struct nft_ctx *ctx,
++			    const struct nft_set *set,
++			    struct nft_set_iter *iter)
++{
++	const struct nft_rbtree *priv = nft_set_priv(set);
++	const struct nft_rbtree_elem *rbe;
++	struct nft_set_elem elem;
++	struct rb_node *node;
++
++	for (node = rb_first(&priv->root); node != NULL; node = rb_next(node)) {
++		if (iter->count < iter->skip)
++			goto cont;
++
++		rbe = rb_entry(node, struct nft_rbtree_elem, node);
++		nft_data_copy(&elem.key, &rbe->key);
++		if (set->flags & NFT_SET_MAP)
++			nft_data_copy(&elem.data, rbe->data);
++		elem.flags = rbe->flags;
++
++		iter->err = iter->fn(ctx, set, iter, &elem);
++		if (iter->err < 0)
++			return;
++cont:
++		iter->count++;
++	}
++}
++
++static unsigned int nft_rbtree_privsize(const struct nlattr * const nla[])
++{
++	return sizeof(struct nft_rbtree);
++}
++
++static int nft_rbtree_init(const struct nft_set *set,
++			   const struct nlattr * const nla[])
++{
++	struct nft_rbtree *priv = nft_set_priv(set);
++
++	priv->root = RB_ROOT;
++	return 0;
++}
++
++static void nft_rbtree_destroy(const struct nft_set *set)
++{
++	struct nft_rbtree *priv = nft_set_priv(set);
++	struct nft_rbtree_elem *rbe;
++	struct rb_node *node;
++
++	while ((node = priv->root.rb_node) != NULL) {
++		rb_erase(node, &priv->root);
++		rbe = rb_entry(node, struct nft_rbtree_elem, node);
++		nft_rbtree_elem_destroy(set, rbe);
++	}
++}
++
++static struct nft_set_ops nft_rbtree_ops __read_mostly = {
++	.privsize	= nft_rbtree_privsize,
++	.init		= nft_rbtree_init,
++	.destroy	= nft_rbtree_destroy,
++	.insert		= nft_rbtree_insert,
++	.remove		= nft_rbtree_remove,
++	.get		= nft_rbtree_get,
++	.lookup		= nft_rbtree_lookup,
++	.walk		= nft_rbtree_walk,
++	.features	= NFT_SET_INTERVAL | NFT_SET_MAP,
++	.owner		= THIS_MODULE,
++};
++
++static int __init nft_rbtree_module_init(void)
++{
++	return nft_register_set(&nft_rbtree_ops);
++}
++
++static void __exit nft_rbtree_module_exit(void)
++{
++	nft_unregister_set(&nft_rbtree_ops);
++}
++
++module_init(nft_rbtree_module_init);
++module_exit(nft_rbtree_module_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Patrick McHardy <kaber@trash.net>");
++MODULE_ALIAS_NFT_SET();
