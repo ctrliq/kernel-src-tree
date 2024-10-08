@@ -2465,6 +2465,7 @@ static u64 mlx4_enable_sriov(struct mlx4_dev *dev, struct pci_dev *pdev,
 disable_sriov:
 	dev->num_vfs = 0;
 	kfree(dev->dev_vfs);
+        dev->dev_vfs = NULL;
 	return dev_flags & ~MLX4_FLAG_MASTER;
 }
 
