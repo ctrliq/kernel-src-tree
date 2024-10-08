@@ -1,0 +1,211 @@
+KVM: Add SMAP support when setting CR4
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Feng Wu <feng.wu@intel.com>
+commit 97ec8c067d322d32effdc1701760d3babbc5595f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/97ec8c06.failed
+
+This patch adds SMAP handling logic when setting CR4 for guests
+
+Thanks a lot to Paolo Bonzini for his suggestion to use the branchless
+way to detect SMAP violation.
+
+	Signed-off-by: Feng Wu <feng.wu@intel.com>
+	Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+(cherry picked from commit 97ec8c067d322d32effdc1701760d3babbc5595f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/mmu.h
+diff --cc arch/x86/kvm/mmu.c
+index 9fd6b6d2b555,084caf3efaf5..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3586,7 -3569,40 +3586,44 @@@ static void reset_rsvds_bits_mask(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void update_permission_bitmask(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu)
+++=======
++ static void reset_rsvds_bits_mask_ept(struct kvm_vcpu *vcpu,
++ 		struct kvm_mmu *context, bool execonly)
++ {
++ 	int maxphyaddr = cpuid_maxphyaddr(vcpu);
++ 	int pte;
++ 
++ 	context->rsvd_bits_mask[0][3] =
++ 		rsvd_bits(maxphyaddr, 51) | rsvd_bits(3, 7);
++ 	context->rsvd_bits_mask[0][2] =
++ 		rsvd_bits(maxphyaddr, 51) | rsvd_bits(3, 6);
++ 	context->rsvd_bits_mask[0][1] =
++ 		rsvd_bits(maxphyaddr, 51) | rsvd_bits(3, 6);
++ 	context->rsvd_bits_mask[0][0] = rsvd_bits(maxphyaddr, 51);
++ 
++ 	/* large page */
++ 	context->rsvd_bits_mask[1][3] = context->rsvd_bits_mask[0][3];
++ 	context->rsvd_bits_mask[1][2] =
++ 		rsvd_bits(maxphyaddr, 51) | rsvd_bits(12, 29);
++ 	context->rsvd_bits_mask[1][1] =
++ 		rsvd_bits(maxphyaddr, 51) | rsvd_bits(12, 20);
++ 	context->rsvd_bits_mask[1][0] = context->rsvd_bits_mask[0][0];
++ 
++ 	for (pte = 0; pte < 64; pte++) {
++ 		int rwx_bits = pte & 7;
++ 		int mt = pte >> 3;
++ 		if (mt == 0x2 || mt == 0x3 || mt == 0x7 ||
++ 				rwx_bits == 0x2 || rwx_bits == 0x6 ||
++ 				(rwx_bits == 0x4 && !execonly))
++ 			context->bad_mt_xwr |= (1ull << pte);
++ 	}
++ }
++ 
++ void update_permission_bitmask(struct kvm_vcpu *vcpu,
++ 		struct kvm_mmu *mmu, bool ept)
+++>>>>>>> 97ec8c067d32 (KVM: Add SMAP support when setting CR4)
+  {
+  	unsigned bit, byte, pfec;
+  	u8 map;
+@@@ -3604,14 -3627,39 +3648,48 @@@
+  			w = bit & ACC_WRITE_MASK;
+  			u = bit & ACC_USER_MASK;
+  
+++<<<<<<< HEAD
+ +			/* Not really needed: !nx will cause pte.nx to fault */
+ +			x |= !mmu->nx;
+ +			/* Allow supervisor writes if !cr0.wp */
+ +			w |= !is_write_protection(vcpu) && !uf;
+ +			/* Disallow supervisor fetches of user code if cr4.smep */
+ +			x &= !(smep && u && !uf);
+- 
+- 			fault = (ff && !x) || (uf && !u) || (wf && !w);
+++=======
++ 			if (!ept) {
++ 				/* Not really needed: !nx will cause pte.nx to fault */
++ 				x |= !mmu->nx;
++ 				/* Allow supervisor writes if !cr0.wp */
++ 				w |= !is_write_protection(vcpu) && !uf;
++ 				/* Disallow supervisor fetches of user code if cr4.smep */
++ 				x &= !(smep && u && !uf);
++ 
++ 				/*
++ 				 * SMAP:kernel-mode data accesses from user-mode
++ 				 * mappings should fault. A fault is considered
++ 				 * as a SMAP violation if all of the following
++ 				 * conditions are ture:
++ 				 *   - X86_CR4_SMAP is set in CR4
++ 				 *   - An user page is accessed
++ 				 *   - Page fault in kernel mode
++ 				 *   - if CPL = 3 or X86_EFLAGS_AC is clear
++ 				 *
++ 				 *   Here, we cover the first three conditions.
++ 				 *   The fourth is computed dynamically in
++ 				 *   permission_fault() and is in smapf.
++ 				 *
++ 				 *   Also, SMAP does not affect instruction
++ 				 *   fetches, add the !ff check here to make it
++ 				 *   clearer.
++ 				 */
++ 				smap = cr4_smap && u && !uf && !ff;
++ 			} else
++ 				/* Not really needed: no U/S accesses on ept  */
++ 				u = 1;
+++>>>>>>> 97ec8c067d32 (KVM: Add SMAP support when setting CR4)
++ 
++ 			fault = (ff && !x) || (uf && !u) || (wf && !w) ||
++ 				(smapf && smap);
+  			map |= fault << bit;
+  		}
+  		mmu->permissions[byte] = map;
+diff --cc arch/x86/kvm/mmu.h
+index 5b59c573aba7,3842e70bdb7c..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -70,7 -76,11 +76,15 @@@ enum 
+  };
+  
+  int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct);
+++<<<<<<< HEAD
+ +int kvm_init_shadow_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context);
+++=======
++ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context);
++ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
++ 		bool execonly);
++ void update_permission_bitmask(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
++ 		bool ept);
+++>>>>>>> 97ec8c067d32 (KVM: Add SMAP support when setting CR4)
+  
+  static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+  {
+diff --git a/arch/x86/kvm/cpuid.h b/arch/x86/kvm/cpuid.h
+index bf21636b80ee..8dc3e319c91f 100644
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -47,6 +47,14 @@ static inline bool guest_cpuid_has_smep(struct kvm_vcpu *vcpu)
+ 	return best && (best->ebx & bit(X86_FEATURE_SMEP));
+ }
+ 
++static inline bool guest_cpuid_has_smap(struct kvm_vcpu *vcpu)
++{
++	struct kvm_cpuid_entry2 *best;
++
++	best = kvm_find_cpuid_entry(vcpu, 7, 0);
++	return best && (best->ebx & bit(X86_FEATURE_SMAP));
++}
++
+ static inline bool guest_cpuid_has_fsgsbase(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpuid_entry2 *best;
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/mmu.h
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index 86bb4c2dd8ad..7b15c7f3c4f5 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -353,7 +353,7 @@ retry_walk:
+ 		walker->ptes[walker->level - 1] = pte;
+ 	} while (!is_last_gpte(mmu, walker->level, pte));
+ 
+-	if (unlikely(permission_fault(mmu, pte_access, access))) {
++	if (unlikely(permission_fault(vcpu, mmu, pte_access, access))) {
+ 		errcode |= PFERR_PRESENT_MASK;
+ 		goto error;
+ 	}
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index efd58736a1bf..09b8a46bf9ba 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -654,6 +654,9 @@ int kvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+ 	if (!guest_cpuid_has_smep(vcpu) && (cr4 & X86_CR4_SMEP))
+ 		return 1;
+ 
++	if (!guest_cpuid_has_smap(vcpu) && (cr4 & X86_CR4_SMAP))
++		return 1;
++
+ 	if (!guest_cpuid_has_fsgsbase(vcpu) && (cr4 & X86_CR4_FSGSBASE))
+ 		return 1;
+ 
+@@ -682,6 +685,9 @@ int kvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+ 	    (!(cr4 & X86_CR4_PCIDE) && (old_cr4 & X86_CR4_PCIDE)))
+ 		kvm_mmu_reset_context(vcpu);
+ 
++	if ((cr4 ^ old_cr4) & X86_CR4_SMAP)
++		update_permission_bitmask(vcpu, vcpu->arch.walk_mmu, false);
++
+ 	if ((cr4 ^ old_cr4) & X86_CR4_OSXSAVE)
+ 		kvm_update_cpuid(vcpu);
+ 
+@@ -4164,7 +4170,8 @@ static int vcpu_mmio_gva_to_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
+ 		| (write ? PFERR_WRITE_MASK : 0);
+ 
+ 	if (vcpu_match_mmio_gva(vcpu, gva)
+-	    && !permission_fault(vcpu->arch.walk_mmu, vcpu->arch.access, access)) {
++	    && !permission_fault(vcpu, vcpu->arch.walk_mmu,
++				 vcpu->arch.access, access)) {
+ 		*gpa = vcpu->arch.mmio_gfn << PAGE_SHIFT |
+ 					(gva & (PAGE_SIZE - 1));
+ 		trace_vcpu_match_mmio(gva, *gpa, write, false);
