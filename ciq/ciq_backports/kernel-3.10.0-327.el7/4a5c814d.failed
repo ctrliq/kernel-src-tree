@@ -1,0 +1,184 @@
+megaraid_sas : Add separate functions for building sysPD IOs and non RW LDIOs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: Add separate functions for building sysPD IOs and non RW LDIOs (Tomas Henzl) [1185944]
+Rebuild_FUZZ: 99.35%
+commit-author Sumit.Saxena@avagotech.com <Sumit.Saxena@avagotech.com>
+commit 4a5c814d933911bcbeb33e238e1e427baf0802b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4a5c814d.failed
+
+	Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+	Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 4a5c814d933911bcbeb33e238e1e427baf0802b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_fusion.c
+index b476617ddd80,d38f85e6f26e..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@@ -1784,18 -1732,87 +1731,92 @@@ static void megasas_build_ld_nonrw_fusi
+  		/* build the raidScsiIO structure */
+  		io_request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
+  		io_request->DevHandle = devHandle;
++ 	}
++ }
+  
+- 		return;
++ /**
++  * megasas_build_syspd_fusion - prepares rw/non-rw ios for syspd
++  * @instance:		Adapter soft state
++  * @scp:		SCSI command
++  * @cmd:		Command to be prepared
++  * @fp_possible:	parameter to detect fast path or firmware path io.
++  *
++  * Prepares the io_request frame for rw/non-rw io cmds for syspds
++  */
++ static void
++ megasas_build_syspd_fusion(struct megasas_instance *instance,
++ 	struct scsi_cmnd *scmd, struct megasas_cmd_fusion *cmd, u8 fp_possible)
++ {
++ 	u32 device_id;
++ 	struct MPI2_RAID_SCSI_IO_REQUEST *io_request;
++ 	u16 pd_index = 0;
++ 	u16 os_timeout_value;
++ 	u16 timeout_limit;
++ 	struct MR_DRV_RAID_MAP_ALL *local_map_ptr;
++ 	struct RAID_CONTEXT	*pRAID_Context;
++ 	struct fusion_context *fusion = instance->ctrl_context;
++ 
++ 	device_id = MEGASAS_DEV_INDEX(scmd);
++ 	pd_index = MEGASAS_PD_INDEX(scmd);
++ 	os_timeout_value = scmd->request->timeout / HZ;
+  
+- NonFastPath:
++ 	io_request = cmd->io_request;
++ 	/* get RAID_Context pointer */
++ 	pRAID_Context = &io_request->RaidContext;
++ 	io_request->DataLength = cpu_to_le32(scsi_bufflen(scmd));
++ 	io_request->LUN[1] = scmd->device->lun;
++ 	pRAID_Context->RAIDFlags = MR_RAID_FLAGS_IO_SUB_TYPE_SYSTEM_PD
++ 		<< MR_RAID_CTX_RAID_FLAGS_IO_SUB_TYPE_SHIFT;
++ 
++ 	pRAID_Context->VirtualDiskTgtId = cpu_to_le16(device_id);
++ 	pRAID_Context->configSeqNum = 0;
++ 	local_map_ptr = fusion->ld_drv_map[(instance->map_id & 1)];
++ 	io_request->DevHandle =
++ 		local_map_ptr->raidMap.devHndlInfo[device_id].curDevHdl;
++ 
++ 	cmd->request_desc->SCSIIO.DevHandle = io_request->DevHandle;
++ 	cmd->request_desc->SCSIIO.MSIxIndex =
++ 		instance->msix_vectors ?
++ 		(raw_smp_processor_id() % instance->msix_vectors) : 0;
++ 
++ 
++ 	if (!fp_possible) {
++ 		/* system pd firmware path */
+  		io_request->Function  = MEGASAS_MPI2_FUNCTION_LD_IO_REQUEST;
+- 		io_request->DevHandle = cpu_to_le16(device_id);
+  		cmd->request_desc->SCSIIO.RequestFlags =
+  			(MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO <<
+- 			 MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
++ 				MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
++ 		pRAID_Context->timeoutValue = cpu_to_le16(os_timeout_value);
++ 	} else {
++ 		/* system pd Fast Path */
++ 		io_request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
++ 		pRAID_Context->regLockFlags = 0;
++ 		pRAID_Context->regLockRowLBA = 0;
++ 		pRAID_Context->regLockLength = 0;
++ 		timeout_limit = (scmd->device->type == TYPE_DISK) ?
++ 				255 : 0xFFFF;
++ 		pRAID_Context->timeoutValue =
++ 			cpu_to_le16((os_timeout_value > timeout_limit) ?
++ 			timeout_limit : os_timeout_value);
++ 		if ((instance->pdev->device == PCI_DEVICE_ID_LSI_INVADER) ||
++ 			(instance->pdev->device == PCI_DEVICE_ID_LSI_FURY)) {
++ 			cmd->request_desc->SCSIIO.RequestFlags |=
++ 				(MEGASAS_REQ_DESCRIPT_FLAGS_NO_LOCK <<
++ 				MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
++ 			pRAID_Context->Type = MPI2_TYPE_CUDA;
++ 			pRAID_Context->nseg = 0x1;
++ 			io_request->IoFlags |=
++ 				cpu_to_le16(MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH);
++ 		}
++ 		cmd->request_desc->SCSIIO.RequestFlags =
++ 			(MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY <<
++ 				MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
+  	}
+++<<<<<<< HEAD
+ +	io_request->RaidContext.VirtualDiskTgtId = cpu_to_le16(device_id);
+ +	io_request->LUN[1] = scmd->device->lun;
+++=======
+++>>>>>>> 4a5c814d9339 (megaraid_sas : Add separate functions for building sysPD IOs and non RW LDIOs)
+  }
+  
+  /**
+@@@ -1812,13 -1829,12 +1833,12 @@@ megasas_build_io_fusion(struct megasas_
+  			struct scsi_cmnd *scp,
+  			struct megasas_cmd_fusion *cmd)
+  {
+- 	u32 device_id, sge_count;
++ 	u32 sge_count;
++ 	u8  cmd_type;
+  	struct MPI2_RAID_SCSI_IO_REQUEST *io_request = cmd->io_request;
+  
+- 	device_id = MEGASAS_DEV_INDEX(instance, scp);
+- 
+  	/* Zero out some fields so they don't get reused */
+ -	memset(io_request->LUN, 0x0, 8);
+ +	io_request->LUN[1] = 0;
+  	io_request->CDB.EEDP32.PrimaryReferenceTag = 0;
+  	io_request->CDB.EEDP32.PrimaryApplicationTagMask = 0;
+  	io_request->EEDPFlags = 0;
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index 14e5c7cea929..bdcf2b69778d 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -1864,9 +1864,13 @@ struct megasas_instance_template {
+ #define MEGASAS_IS_LOGICAL(scp)						\
+ 	(scp->device->channel < MEGASAS_MAX_PD_CHANNELS) ? 0 : 1
+ 
+-#define MEGASAS_DEV_INDEX(inst, scp)					\
+-	((scp->device->channel % 2) * MEGASAS_MAX_DEV_PER_CHANNEL) + 	\
+-	scp->device->id
++#define MEGASAS_DEV_INDEX(scp)						\
++	(((scp->device->channel % 2) * MEGASAS_MAX_DEV_PER_CHANNEL) +	\
++	scp->device->id)
++
++#define MEGASAS_PD_INDEX(scp)						\
++	((scp->device->channel * MEGASAS_MAX_DEV_PER_CHANNEL) +		\
++	scp->device->id)
+ 
+ struct megasas_cmd {
+ 
+diff --git a/drivers/scsi/megaraid/megaraid_sas_base.c b/drivers/scsi/megaraid/megaraid_sas_base.c
+index 771e35965e6a..b3ad712acb4e 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -1196,7 +1196,7 @@ megasas_build_dcdb(struct megasas_instance *instance, struct scsi_cmnd *scp,
+ 	struct megasas_pthru_frame *pthru;
+ 
+ 	is_logical = MEGASAS_IS_LOGICAL(scp);
+-	device_id = MEGASAS_DEV_INDEX(instance, scp);
++	device_id = MEGASAS_DEV_INDEX(scp);
+ 	pthru = (struct megasas_pthru_frame *)cmd->frame;
+ 
+ 	if (scp->sc_data_direction == PCI_DMA_TODEVICE)
+@@ -1294,7 +1294,7 @@ megasas_build_ldio(struct megasas_instance *instance, struct scsi_cmnd *scp,
+ 	u16 flags = 0;
+ 	struct megasas_io_frame *ldio;
+ 
+-	device_id = MEGASAS_DEV_INDEX(instance, scp);
++	device_id = MEGASAS_DEV_INDEX(scp);
+ 	ldio = (struct megasas_io_frame *)cmd->frame;
+ 
+ 	if (scp->sc_data_direction == PCI_DMA_TODEVICE)
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fusion.c
