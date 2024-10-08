@@ -1,0 +1,127 @@
+xfrm: Remove ancient sleeping when the SA is in acquire state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Steffen Klassert <steffen.klassert@secunet.com>
+commit 5b8ef3415a21f173ab115e90ec92c071a03f22d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5b8ef341.failed
+
+We now queue packets to the policy if the states are not yet resolved,
+this replaces the ancient sleeping code. Also the sleeping can cause
+indefinite task hangs if the needed state does not get resolved.
+
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 5b8ef3415a21f173ab115e90ec92c071a03f22d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_state.c
+diff --cc net/xfrm/xfrm_state.c
+index 19b6e2fadae2,e845066547c4..000000000000
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@@ -638,8 -627,7 +631,12 @@@ restart
+  		err = 0;
+  
+  out:
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&xfrm_state_lock);
+ +	wake_up(&net->xfrm.km_waitq);
+++=======
++ 	spin_unlock_bh(&net->xfrm.xfrm_state_lock);
+++>>>>>>> 5b8ef3415a21 (xfrm: Remove ancient sleeping when the SA is in acquire state)
+  	return err;
+  }
+  EXPORT_SYMBOL(xfrm_state_flush);
+@@@ -2027,7 -2010,7 +2014,11 @@@ int __net_init xfrm_state_init(struct n
+  	INIT_WORK(&net->xfrm.state_hash_work, xfrm_hash_resize);
+  	INIT_HLIST_HEAD(&net->xfrm.state_gc_list);
+  	INIT_WORK(&net->xfrm.state_gc_work, xfrm_state_gc_task);
+++<<<<<<< HEAD
+ +	init_waitqueue_head(&net->xfrm.km_waitq);
+++=======
++ 	spin_lock_init(&net->xfrm.xfrm_state_lock);
+++>>>>>>> 5b8ef3415a21 (xfrm: Remove ancient sleeping when the SA is in acquire state)
+  	return 0;
+  
+  out_byspi:
+diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
+index 5299e69a32af..bda80396ec3b 100644
+--- a/include/net/netns/xfrm.h
++++ b/include/net/netns/xfrm.h
+@@ -33,8 +33,6 @@ struct netns_xfrm {
+ 	struct hlist_head	state_gc_list;
+ 	struct work_struct	state_gc_work;
+ 
+-	wait_queue_head_t	km_waitq;
+-
+ 	struct list_head	policy_all;
+ 	struct hlist_head	*policy_byidx;
+ 	unsigned int		policy_idx_hmask;
+diff --git a/net/key/af_key.c b/net/key/af_key.c
+index 4f7982631637..49e8ffcc0cca 100644
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@ -1383,10 +1383,9 @@ static int pfkey_acquire(struct sock *sk, struct sk_buff *skb, const struct sadb
+ 		return 0;
+ 
+ 	spin_lock_bh(&x->lock);
+-	if (x->km.state == XFRM_STATE_ACQ) {
++	if (x->km.state == XFRM_STATE_ACQ)
+ 		x->km.state = XFRM_STATE_ERROR;
+-		wake_up(&net->xfrm.km_waitq);
+-	}
++
+ 	spin_unlock_bh(&x->lock);
+ 	xfrm_state_put(x);
+ 	return 0;
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index 8da957011964..6812a895a4ce 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -1889,8 +1889,7 @@ static struct xfrm_dst *xfrm_create_dummy_bundle(struct net *net,
+ 	if (IS_ERR(xdst))
+ 		return xdst;
+ 
+-	if (net->xfrm.sysctl_larval_drop || num_xfrms <= 0 ||
+-	    (fl->flowi_flags & FLOWI_FLAG_CAN_SLEEP))
++	if (net->xfrm.sysctl_larval_drop || num_xfrms <= 0)
+ 		return xdst;
+ 
+ 	dst1 = &xdst->u.dst;
+@@ -2065,7 +2064,6 @@ struct dst_entry *xfrm_lookup(struct net *net, struct dst_entry *dst_orig,
+ 	u8 dir = policy_to_flow_dir(XFRM_POLICY_OUT);
+ 	int i, err, num_pols, num_xfrms = 0, drop_pols = 0;
+ 
+-restart:
+ 	dst = NULL;
+ 	xdst = NULL;
+ 	route = NULL;
+@@ -2147,23 +2145,8 @@ restart:
+ 
+ 			return ERR_PTR(-EREMOTE);
+ 		}
+-		if (fl->flowi_flags & FLOWI_FLAG_CAN_SLEEP) {
+-			DECLARE_WAITQUEUE(wait, current);
+ 
+-			add_wait_queue(&net->xfrm.km_waitq, &wait);
+-			set_current_state(TASK_INTERRUPTIBLE);
+-			schedule();
+-			set_current_state(TASK_RUNNING);
+-			remove_wait_queue(&net->xfrm.km_waitq, &wait);
+-
+-			if (!signal_pending(current)) {
+-				dst_release(dst);
+-				goto restart;
+-			}
+-
+-			err = -ERESTART;
+-		} else
+-			err = -EAGAIN;
++		err = -EAGAIN;
+ 
+ 		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTNOSTATES);
+ 		goto error;
+* Unmerged path net/xfrm/xfrm_state.c
