@@ -1,0 +1,229 @@
+percpu: store offsets instead of lengths in ->map[]
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 723ad1d90b5663ab623bb3bfba3e4ee7101795d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/723ad1d9.failed
+
+Current code keeps +-length for each area in chunk->map[].  It has
+several unpleasant consequences:
+	* even if we know that first 50 areas are all in use, allocation
+still needs to go through all those areas just to sum their sizes, just
+to get the offset of free one.
+	* freeing needs to find the array entry refering to the area
+in question; again, the need to sum the sizes until we reach the offset
+we are interested in.  Note that offsets are monotonous, so simple
+binary search would do here.
+
+	New data representation: array of <offset,in-use flag> pairs.
+Each pair is represented by one int - we use offset|1 for <offset, in use>
+and offset for <offset, free> (we make sure that all offsets are even).
+In the end we put a sentry entry - <total size, in use>.  The first
+entry is <0, flag>; it would be possible to store together the flag
+for Nth area and offset for N+1st, but that leads to much hairier code.
+
+In other words, where the old variant would have
+	4, -8, -4, 4, -12, 100
+(4 bytes free, 8 in use, 4 in use, 4 free, 12 in use, 100 free) we store
+	<0,0>, <4,1>, <12,1>, <16,0>, <20,1>, <32,0>, <132,1>
+i.e.
+	0, 5, 13, 16, 21, 32, 133
+
+This commit switches to new data representation and takes care of a couple
+of low-hanging fruits in free_pcpu_area() - one is the switch to binary
+search, another is not doing two memmove() when one would do.  Speeding
+the alloc side up (by keeping track of how many areas in the beginning are
+known to be all in use) also becomes possible - that'll be done in the next
+commit.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 723ad1d90b5663ab623bb3bfba3e4ee7101795d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/percpu.c
+diff --cc mm/percpu.c
+index 89e586173340,49dfccf9169c..000000000000
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@@ -483,26 -441,21 +483,41 @@@ static int pcpu_alloc_area(struct pcpu_
+  	int oslot = pcpu_chunk_slot(chunk);
+  	int max_contig = 0;
+  	int i, off;
+++<<<<<<< HEAD
+ +	bool seen_free = false;
+ +
+ +	for (i = 0; i < chunk->map_used; i++) {
+ +		bool is_last = i + 1 == chunk->map_used;
+ +		int head, tail;
+ +		int this_size;
+ +
+ +		off = chunk->map[i];
+++=======
++ 	int *p;
++ 
++ 	for (i = 0, p = chunk->map; i < chunk->map_used; i++, p++) {
++ 		int head, tail;
++ 		int this_size;
++ 
++ 		off = *p;
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  		if (off & 1)
+  			continue;
+  
+  		/* extra for alignment requirement */
+  		head = ALIGN(off, align) - off;
+  
+++<<<<<<< HEAD
+ +		this_size = (chunk->map[i + 1] & ~1) - off;
+ +		if (this_size < head + size) {
+ +			if (!seen_free) {
+ +				chunk->first_free = i;
+ +				seen_free = true;
+ +			}
+++=======
++ 		this_size = (p[1] & ~1) - off;
++ 		if (this_size < head + size) {
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  			max_contig = max(this_size, max_contig);
+  			continue;
+  		}
+@@@ -513,10 -466,10 +528,17 @@@
+  		 * than sizeof(int), which is very small but isn't too
+  		 * uncommon for percpu allocations.
+  		 */
+++<<<<<<< HEAD
+ +		if (head && (head < sizeof(int) || !(chunk->map[i - 1] & 1))) {
+ +			if (chunk->map[i - 1] & 1)
+ +				chunk->free_size -= head;
+ +			chunk->map[i] = off += head;
+++=======
++ 		if (head && (head < sizeof(int) || !(p[-1] & 1))) {
++ 			if (p[-1] & 1)
++ 				chunk->free_size -= head;
++ 			*p = off += head;
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  			this_size -= head;
+  			head = 0;
+  		}
+@@@ -530,32 -483,33 +552,53 @@@
+  
+  		/* split if warranted */
+  		if (head || tail) {
+++<<<<<<< HEAD
+ +			pcpu_split_block(chunk, i, head, size, tail);
+ +			if (head) {
+ +				if (!seen_free) {
+ +					chunk->first_free = i;
+ +					seen_free = true;
+ +				}
+ +				i++;
+ +				off += head;
+ +				max_contig = max(head, max_contig);
+ +			}
+ +			if (tail)
+++=======
++ 			int nr_extra = !!head + !!tail;
++ 
++ 			/* insert new subblocks */
++ 			memmove(p + nr_extra + 1, p + 1,
++ 				sizeof(chunk->map[0]) * (chunk->map_used - i));
++ 			chunk->map_used += nr_extra;
++ 
++ 			if (head) {
++ 				*++p = off += head;
++ 				++i;
++ 				max_contig = max(head, max_contig);
++ 			}
++ 			if (tail) {
++ 				p[1] = off + size;
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  				max_contig = max(tail, max_contig);
+ -			}
+  		}
+  
+ +		if (!seen_free)
+ +			chunk->first_free = i + 1;
+ +
+  		/* update hint and mark allocated */
+- 		if (is_last)
++ 		if (i + 1 == chunk->map_used)
+  			chunk->contig_hint = max_contig; /* fully scanned */
+  		else
+  			chunk->contig_hint = max(chunk->contig_hint,
+  						 max_contig);
+  
+  		chunk->free_size -= size;
+++<<<<<<< HEAD
+ +		chunk->map[i] |= 1;
+++=======
++ 		*p |= 1;
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  
+  		pcpu_chunk_relocate(chunk, oslot);
+  		return off;
+@@@ -588,7 -542,7 +631,11 @@@ static void pcpu_free_area(struct pcpu_
+  	int to_free = 0;
+  	int *p;
+  
+++<<<<<<< HEAD
+ +	freeme |= 1;
+++=======
++ 	freeme |= 1;	/* we are searching for <given offset, in use> pair */
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  
+  	i = 0;
+  	j = chunk->map_used;
+@@@ -604,9 -558,6 +651,12 @@@
+  	}
+  	BUG_ON(off != freeme);
+  
+++<<<<<<< HEAD
+ +	if (i < chunk->first_free)
+ +		chunk->first_free = i;
+ +
+++=======
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  	p = chunk->map + i;
+  	*p = off &= ~1;
+  	chunk->free_size += (p[1] & ~1) - off;
+@@@ -622,7 -573,7 +672,11 @@@
+  	}
+  	if (to_free) {
+  		chunk->map_used -= to_free;
+++<<<<<<< HEAD
+ +		memmove(p + 1, p + 1 + to_free, 
+++=======
++ 		memmove(p + 1, p + 1 + to_free,
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  			(chunk->map_used - i) * sizeof(chunk->map[0]));
+  	}
+  
+@@@ -744,12 -695,13 +798,22 @@@ static void __percpu *pcpu_alloc(size_
+  	unsigned long flags;
+  	void __percpu *ptr;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(align < 2))
+ +		align = 2;
+ +
+ +	if (unlikely(size & 1))
+ +		size++;
+ +
+++=======
++ 	/*
++ 	 * We want the lowest bit of offset available for in-use/free
++ 	 * indicator.
++ 	 */
++ 	if (unlikely(align < 2))
++ 		align = 2;
++ 
+++>>>>>>> 723ad1d90b56 (percpu: store offsets instead of lengths in ->map[])
+  	if (unlikely(!size || size > PCPU_MIN_UNIT_SIZE || align > PAGE_SIZE)) {
+  		WARN(true, "illegal size (%zu) or align (%zu) for "
+  		     "percpu allocation\n", size, align);
+* Unmerged path mm/percpu.c
