@@ -1,0 +1,183 @@
+aacraid: IOCTL fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mahesh Rajashekhara <Mahesh.Rajashekhara@pmcs.com>
+commit f9c4259678cbde854a4e94398d66ef379178fd7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f9c42596.failed
+
+After getting the platform shutdown command "VM_CloseAll" response from the
+firmware, driver was getting configuration IOCTL request from the upper layers
+and it sends down to firmware. This causes firmware assert issue.
+
+This patch fixes the firmware assert issue. During the shutdown, if driver
+gets commands from the upper layer, driver sends error code to the upper
+layers.
+
+	Signed-off-by: Mahesh Rajashekhara <Mahesh.Rajashekhara@pmcs.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Murthy Bhat <Murthy.Bhat@pmcs.com>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit f9c4259678cbde854a4e94398d66ef379178fd7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/aacraid/aacraid.h
+#	drivers/scsi/aacraid/comminit.c
+diff --cc drivers/scsi/aacraid/aacraid.h
+index 0b48b47d8620,43d80763bb7d..000000000000
+--- a/drivers/scsi/aacraid/aacraid.h
++++ b/drivers/scsi/aacraid/aacraid.h
+@@@ -1156,6 -1216,13 +1156,16 @@@ struct aac_de
+  	int			sync_mode;
+  	struct fib		*sync_fib;
+  	struct list_head	sync_fib_list;
+++<<<<<<< HEAD
+++=======
++ 	u32			doorbell_mask;
++ 	u32			max_msix;	/* max. MSI-X vectors */
++ 	u32			vector_cap;	/* MSI-X vector capab.*/
++ 	int			msi_enabled;	/* MSI/MSI-X enabled */
++ 	struct msix_entry	msixentry[AAC_MAX_MSIX];
++ 	struct aac_msix_ctx	aac_msix[AAC_MAX_MSIX]; /* context */
++ 	u8			adapter_shutdown;
+++>>>>>>> f9c4259678cb (aacraid: IOCTL fix)
+  };
+  
+  #define aac_adapter_interrupt(dev) \
+diff --cc drivers/scsi/aacraid/comminit.c
+index 177b094c7792,27432b9ea235..000000000000
+--- a/drivers/scsi/aacraid/comminit.c
++++ b/drivers/scsi/aacraid/comminit.c
+@@@ -228,6 -231,12 +228,15 @@@ int aac_send_shutdown(struct aac_dev * 
+  	/* FIB should be freed only after getting the response from the F/W */
+  	if (status != -ERESTARTSYS)
+  		aac_fib_free(fibctx);
+++<<<<<<< HEAD
+++=======
++ 	dev->adapter_shutdown = 1;
++ 	if ((dev->pdev->device == PMC_DEVICE_S7 ||
++ 	     dev->pdev->device == PMC_DEVICE_S8 ||
++ 	     dev->pdev->device == PMC_DEVICE_S9) &&
++ 	     dev->msi_enabled)
++ 		aac_src_access_devreg(dev, AAC_ENABLE_INTX);
+++>>>>>>> f9c4259678cb (aacraid: IOCTL fix)
+  	return status;
+  }
+  
+@@@ -388,6 -399,9 +397,12 @@@ struct aac_dev *aac_init_adapter(struc
+  			}
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 	dev->max_msix = 0;
++ 	dev->msi_enabled = 0;
++ 	dev->adapter_shutdown = 0;
+++>>>>>>> f9c4259678cb (aacraid: IOCTL fix)
+  	if ((!aac_adapter_sync_cmd(dev, GET_COMM_PREFERRED_SETTINGS,
+  	  0, 0, 0, 0, 0, 0,
+  	  status+0, status+1, status+2, status+3, status+4))
+@@@ -489,4 -508,79 +504,83 @@@
+  	return dev;
+  }
+  
+++<<<<<<< HEAD
+ +    
+++=======
++ static void aac_define_int_mode(struct aac_dev *dev)
++ {
++ 
++ 	int i, msi_count;
++ 
++ 	msi_count = i = 0;
++ 	/* max. vectors from GET_COMM_PREFERRED_SETTINGS */
++ 	if (dev->max_msix == 0 ||
++ 	    dev->pdev->device == PMC_DEVICE_S6 ||
++ 	    dev->sync_mode) {
++ 		dev->max_msix = 1;
++ 		dev->vector_cap =
++ 			dev->scsi_host_ptr->can_queue +
++ 			AAC_NUM_MGT_FIB;
++ 		return;
++ 	}
++ 
++ 	msi_count = min(dev->max_msix,
++ 		(unsigned int)num_online_cpus());
++ 
++ 	dev->max_msix = msi_count;
++ 
++ 	if (msi_count > AAC_MAX_MSIX)
++ 		msi_count = AAC_MAX_MSIX;
++ 
++ 	for (i = 0; i < msi_count; i++)
++ 		dev->msixentry[i].entry = i;
++ 
++ 	if (msi_count > 1 &&
++ 	    pci_find_capability(dev->pdev, PCI_CAP_ID_MSIX)) {
++ 		i = pci_enable_msix(dev->pdev,
++ 				    dev->msixentry,
++ 				    msi_count);
++ 		 /* Check how many MSIX vectors are allocated */
++ 		if (i >= 0) {
++ 			dev->msi_enabled = 1;
++ 			if (i) {
++ 				msi_count = i;
++ 				if (pci_enable_msix(dev->pdev,
++ 				    dev->msixentry,
++ 				    msi_count)) {
++ 					dev->msi_enabled = 0;
++ 					printk(KERN_ERR "%s%d: MSIX not supported!! Will try MSI 0x%x.\n",
++ 							dev->name, dev->id, i);
++ 				}
++ 			}
++ 		} else {
++ 			dev->msi_enabled = 0;
++ 			printk(KERN_ERR "%s%d: MSIX not supported!! Will try MSI 0x%x.\n",
++ 					dev->name, dev->id, i);
++ 		}
++ 	}
++ 
++ 	if (!dev->msi_enabled) {
++ 		msi_count = 1;
++ 		i = pci_enable_msi(dev->pdev);
++ 
++ 		if (!i) {
++ 			dev->msi_enabled = 1;
++ 			dev->msi = 1;
++ 		} else {
++ 			printk(KERN_ERR "%s%d: MSI not supported!! Will try INTx 0x%x.\n",
++ 					dev->name, dev->id, i);
++ 		}
++ 	}
++ 
++ 	if (!dev->msi_enabled)
++ 		dev->max_msix = msi_count = 1;
++ 	else {
++ 		if (dev->max_msix > msi_count)
++ 			dev->max_msix = msi_count;
++ 	}
++ 	dev->vector_cap =
++ 		(dev->scsi_host_ptr->can_queue + AAC_NUM_MGT_FIB) /
++ 		msi_count;
++ }
+++>>>>>>> f9c4259678cb (aacraid: IOCTL fix)
+* Unmerged path drivers/scsi/aacraid/aacraid.h
+* Unmerged path drivers/scsi/aacraid/comminit.c
+diff --git a/drivers/scsi/aacraid/linit.c b/drivers/scsi/aacraid/linit.c
+index 74c546b830f7..9939634a6b85 100644
+--- a/drivers/scsi/aacraid/linit.c
++++ b/drivers/scsi/aacraid/linit.c
+@@ -785,7 +785,9 @@ static long aac_cfg_ioctl(struct file *file,
+ 		unsigned int cmd, unsigned long arg)
+ {
+ 	int ret;
+-	if (!capable(CAP_SYS_RAWIO))
++	struct aac_dev *aac;
++	aac = (struct aac_dev *)file->private_data;
++	if (!capable(CAP_SYS_RAWIO) || aac->adapter_shutdown)
+ 		return -EPERM;
+ 	mutex_lock(&aac_mutex);
+ 	ret = aac_do_ioctl(file->private_data, cmd, (void __user *)arg);
