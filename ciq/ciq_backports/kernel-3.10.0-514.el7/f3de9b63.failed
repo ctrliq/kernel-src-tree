@@ -1,0 +1,326 @@
+mei: use mei_cl_is_connected consistently
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit f3de9b635d93a3d268adda428e1df94091506a42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f3de9b63.failed
+
+Replace open coded check for cl->state !=/== MEI_FILE_CONNECTED
+with mei_cl_is_connected function.
+
+Note that cl->state != MEI_FILE_CONNECTED is not the same
+as cl->state == MEI_FILE_DISCONNECTED
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit f3de9b635d93a3d268adda428e1df94091506a42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/bus.c
+#	drivers/misc/mei/interrupt.c
+#	drivers/misc/mei/main.c
+#	drivers/misc/mei/wd.c
+diff --cc drivers/misc/mei/bus.c
+index ca8736c3675b,b724a67696fc..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -238,30 -237,31 +238,38 @@@ static int ___mei_cl_send(struct mei_c
+  
+  	dev = cl->dev;
+  
+++<<<<<<< HEAD
+ +	if (cl->state != MEI_FILE_CONNECTED)
+ +		return -ENODEV;
+++=======
++ 	mutex_lock(&dev->device_lock);
++ 	if (!mei_cl_is_connected(cl)) {
++ 		rets = -ENODEV;
++ 		goto out;
++ 	}
+++>>>>>>> f3de9b635d93 (mei: use mei_cl_is_connected consistently)
+  
+  	/* Check if we have an ME client device */
+ -	me_cl = mei_me_cl_by_uuid_id(dev, &cl->cl_uuid, cl->me_client_id);
+ -	if (!me_cl) {
+ -		rets = -ENOTTY;
+ -		goto out;
+ -	}
+ +	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (id < 0)
+ +		return id;
+  
+ -	if (length > me_cl->props.max_msg_length) {
+ -		rets = -EFBIG;
+ -		goto out;
+ -	}
+ +	if (length > dev->me_clients[id].props.max_msg_length)
+ +		return -EINVAL;
+  
+ -	cb = mei_cl_alloc_cb(cl, length, MEI_FOP_WRITE, NULL);
+ -	if (!cb) {
+ -		rets = -ENOMEM;
+ -		goto out;
+ +	cb = mei_io_cb_init(cl, NULL);
+ +	if (!cb)
+ +		return -ENOMEM;
+ +
+ +	rets = mei_io_cb_alloc_req_buf(cb, length);
+ +	if (rets < 0) {
+ +		mei_io_cb_free(cb);
+ +		return rets;
+  	}
+  
+ -	memcpy(cb->buf.data, buf, length);
+ +	memcpy(cb->request_buffer.data, buf, length);
+ +
+ +	mutex_lock(&dev->device_lock);
+  
+  	rets = mei_cl_write(cl, cb, blocking);
+  
+@@@ -458,13 -467,17 +466,20 @@@ int mei_cl_disable_device(struct mei_cl
+  
+  	dev = cl->dev;
+  
+ -	if (device->ops && device->ops->disable)
+ -		device->ops->disable(device);
+ -
+ -	device->event_cb = NULL;
+ -
+  	mutex_lock(&dev->device_lock);
+  
+++<<<<<<< HEAD
+ +	if (cl->state != MEI_FILE_CONNECTED) {
+ +		mutex_unlock(&dev->device_lock);
+ +		dev_err(&dev->pdev->dev, "Already disconnected");
+ +
+ +		return 0;
+++=======
++ 	if (!mei_cl_is_connected(cl)) {
++ 		dev_err(dev->dev, "Already disconnected");
++ 		err = 0;
++ 		goto out;
+++>>>>>>> f3de9b635d93 (mei: use mei_cl_is_connected consistently)
+  	}
+  
+  	cl->state = MEI_FILE_DISCONNECTING;
+diff --cc drivers/misc/mei/interrupt.c
+index b8d9cfee3e87,3f84d2edcde4..000000000000
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@@ -87,73 -88,70 +87,81 @@@ static bool mei_cl_is_reading(struct me
+  }
+  
+  /**
+ - * mei_cl_irq_read_msg - process client message
+ + * mei_irq_read_client_message - process client message
+   *
+ - * @cl: reading client
+ + * @dev: the device structure
+   * @mei_hdr: header of mei client message
+ - * @complete_list: completion list
+ + * @complete_list: An instance of our list structure
+   *
+ - * Return: always 0
+ + * returns 0 on success, <0 on failure.
+   */
+ -int mei_cl_irq_read_msg(struct mei_cl *cl,
+ -		       struct mei_msg_hdr *mei_hdr,
+ -		       struct mei_cl_cb *complete_list)
+ +static int mei_cl_irq_read_msg(struct mei_device *dev,
+ +			       struct mei_msg_hdr *mei_hdr,
+ +			       struct mei_cl_cb *complete_list)
+  {
+ -	struct mei_device *dev = cl->dev;
+ -	struct mei_cl_cb *cb;
+ +	struct mei_cl *cl;
+ +	struct mei_cl_cb *cb, *next;
+  	unsigned char *buffer = NULL;
+  
+ -	cb = list_first_entry_or_null(&cl->rd_pending, struct mei_cl_cb, list);
+ -	if (!cb) {
+ -		cl_err(dev, cl, "pending read cb not found\n");
+ -		goto out;
+ -	}
+ +	list_for_each_entry_safe(cb, next, &dev->read_list.list, list) {
+ +		cl = cb->cl;
+ +		if (!cl || !mei_cl_is_reading(cl, mei_hdr))
+ +			continue;
+  
+++<<<<<<< HEAD
+ +		cl->reading_state = MEI_READING;
+++=======
++ 	if (!mei_cl_is_connected(cl)) {
++ 		cl_dbg(dev, cl, "not connected\n");
++ 		cb->status = -ENODEV;
++ 		goto out;
++ 	}
+++>>>>>>> f3de9b635d93 (mei: use mei_cl_is_connected consistently)
+  
+ -	if (cb->buf.size == 0 || cb->buf.data == NULL) {
+ -		cl_err(dev, cl, "response buffer is not allocated.\n");
+ -		list_move_tail(&cb->list, &complete_list->list);
+ -		cb->status = -ENOMEM;
+ -		goto out;
+ -	}
+ -
+ -	if (cb->buf.size < mei_hdr->length + cb->buf_idx) {
+ -		cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
+ -			cb->buf.size, mei_hdr->length, cb->buf_idx);
+ -		buffer = krealloc(cb->buf.data, mei_hdr->length + cb->buf_idx,
+ -				  GFP_KERNEL);
+ -
+ -		if (!buffer) {
+ -			cb->status = -ENOMEM;
+ -			list_move_tail(&cb->list, &complete_list->list);
+ -			goto out;
+ +		if (cb->response_buffer.size == 0 ||
+ +		    cb->response_buffer.data == NULL) {
+ +			cl_err(dev, cl, "response buffer is not allocated.\n");
+ +			list_del(&cb->list);
+ +			return -ENOMEM;
+  		}
+ -		cb->buf.data = buffer;
+ -		cb->buf.size = mei_hdr->length + cb->buf_idx;
+ -	}
+  
+ -	buffer = cb->buf.data + cb->buf_idx;
+ -	mei_read_slots(dev, buffer, mei_hdr->length);
+ +		if (cb->response_buffer.size < mei_hdr->length + cb->buf_idx) {
+ +			cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
+ +				cb->response_buffer.size,
+ +				mei_hdr->length, cb->buf_idx);
+ +			buffer = krealloc(cb->response_buffer.data,
+ +					  mei_hdr->length + cb->buf_idx,
+ +					  GFP_KERNEL);
+ +
+ +			if (!buffer) {
+ +				list_del(&cb->list);
+ +				return -ENOMEM;
+ +			}
+ +			cb->response_buffer.data = buffer;
+ +			cb->response_buffer.size =
+ +				mei_hdr->length + cb->buf_idx;
+ +		}
+  
+ -	cb->buf_idx += mei_hdr->length;
+ +		buffer = cb->response_buffer.data + cb->buf_idx;
+ +		mei_read_slots(dev, buffer, mei_hdr->length);
+  
+ -	if (mei_hdr->msg_complete) {
+ -		cb->read_time = jiffies;
+ -		cl_dbg(dev, cl, "completed read length = %lu\n", cb->buf_idx);
+ -		list_move_tail(&cb->list, &complete_list->list);
+ +		cb->buf_idx += mei_hdr->length;
+ +		if (mei_hdr->msg_complete) {
+ +			cl->status = 0;
+ +			list_del(&cb->list);
+ +			cl_dbg(dev, cl, "completed read length = %lu\n",
+ +				cb->buf_idx);
+ +			list_add_tail(&cb->list, &complete_list->list);
+ +		}
+ +		break;
+  	}
+  
+ -out:
+ -	if (!buffer)
+ -		mei_irq_discard_msg(dev, mei_hdr);
+ +	dev_dbg(&dev->pdev->dev, "message read\n");
+ +	if (!buffer) {
+ +		mei_read_slots(dev, dev->rd_msg_buf, mei_hdr->length);
+ +		dev_dbg(&dev->pdev->dev, "discarding message " MEI_HDR_FMT "\n",
+ +				MEI_HDR_PRM(mei_hdr));
+ +	}
+  
+  	return 0;
+  }
+diff --cc drivers/misc/mei/main.c
+index b23f9eba9e3a,29fa88b6fa17..000000000000
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@@ -360,9 -309,8 +360,14 @@@ static ssize_t mei_write(struct file *f
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (cl->state != MEI_FILE_CONNECTED) {
+ +		dev_err(&dev->pdev->dev, "host client = %d,  is not connected to ME client = %d",
+ +			cl->host_client_id, cl->me_client_id);
+++=======
++ 	if (!mei_cl_is_connected(cl)) {
++ 		cl_err(dev, cl, "is not connected");
+++>>>>>>> f3de9b635d93 (mei: use mei_cl_is_connected consistently)
+  		rets = -ENODEV;
+  		goto out;
+  	}
+@@@ -500,8 -416,8 +505,13 @@@ static int mei_ioctl_connect_client(str
+  	 * existing connection
+  	 */
+  	if (uuid_le_cmp(data->in_client_uuid, mei_amthif_guid) == 0) {
+++<<<<<<< HEAD
+ +		dev_dbg(&dev->pdev->dev, "FW Client is amthi\n");
+ +		if (dev->iamthif_cl.state != MEI_FILE_CONNECTED) {
+++=======
++ 		dev_dbg(dev->dev, "FW Client is amthi\n");
++ 		if (!mei_cl_is_connected(&dev->iamthif_cl)) {
+++>>>>>>> f3de9b635d93 (mei: use mei_cl_is_connected consistently)
+  			rets = -ENODEV;
+  			goto end;
+  		}
+diff --cc drivers/misc/mei/wd.c
+index f22efbbc16aa,2725f865c3d6..000000000000
+--- a/drivers/misc/mei/wd.c
++++ b/drivers/misc/mei/wd.c
+@@@ -234,9 -230,8 +238,14 @@@ static int mei_wd_ops_start(struct watc
+  		goto end_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (dev->wd_cl.state != MEI_FILE_CONNECTED)	{
+ +		dev_dbg(&dev->pdev->dev,
+ +			"MEI Driver is not connected to Watchdog Client\n");
+++=======
++ 	if (!mei_cl_is_connected(cl)) {
++ 		cl_dbg(dev, cl, "MEI Driver is not connected to Watchdog Client\n");
+++>>>>>>> f3de9b635d93 (mei: use mei_cl_is_connected consistently)
+  		goto end_unlock;
+  	}
+  
+@@@ -286,10 -282,12 +295,15 @@@ static int mei_wd_ops_ping(struct watch
+  	if (!dev)
+  		return -ENODEV;
+  
+ -	cl = &dev->wd_cl;
+ -
+  	mutex_lock(&dev->device_lock);
+  
+++<<<<<<< HEAD
+ +	if (dev->wd_cl.state != MEI_FILE_CONNECTED) {
+ +		dev_err(&dev->pdev->dev, "wd: not connected.\n");
+++=======
++ 	if (!mei_cl_is_connected(cl)) {
++ 		cl_err(dev, cl, "wd: not connected.\n");
+++>>>>>>> f3de9b635d93 (mei: use mei_cl_is_connected consistently)
+  		ret = -ENODEV;
+  		goto end;
+  	}
+* Unmerged path drivers/misc/mei/bus.c
+diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
+index 3c539de435ba..e5cca7029b5e 100644
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -614,7 +614,7 @@ int mei_cl_connect(struct mei_cl *cl, struct file *file)
+ 			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+ 	mutex_lock(&dev->device_lock);
+ 
+-	if (cl->state != MEI_FILE_CONNECTED) {
++	if (!mei_cl_is_connected(cl)) {
+ 		cl->state = MEI_FILE_DISCONNECTED;
+ 		/* something went really wrong */
+ 		if (!cl->status)
+* Unmerged path drivers/misc/mei/interrupt.c
+* Unmerged path drivers/misc/mei/main.c
+* Unmerged path drivers/misc/mei/wd.c
