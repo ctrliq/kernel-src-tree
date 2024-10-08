@@ -1,0 +1,503 @@
+net: move vlan pop/push functions into common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] vlan: move vlan pop/push functions into common code (Jiri Benc) [1156461 1211348]
+Rebuild_FUZZ: 95.05%
+commit-author Jiri Pirko <jiri@resnulli.us>
+commit 93515d53b133d66f01aec7b231fa3e40e3d2fd9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/93515d53.failed
+
+So it can be used from out of openvswitch code.
+Did couple of cosmetic changes on the way, namely variable naming and
+adding support for 8021AD proto.
+
+	Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 93515d53b133d66f01aec7b231fa3e40e3d2fd9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/skbuff.c
+#	net/openvswitch/actions.c
+diff --cc include/linux/skbuff.h
+index 7d61df58cfdc,78c299f40bac..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -2656,15 -2672,15 +2656,23 @@@ extern void	       skb_copy_and_csum_de
+  unsigned int skb_zerocopy_headlen(const struct sk_buff *from);
+  int skb_zerocopy(struct sk_buff *to, struct sk_buff *from,
+  		 int len, int hlen);
+ -void skb_split(struct sk_buff *skb, struct sk_buff *skb1, const u32 len);
+ -int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen);
+ -void skb_scrub_packet(struct sk_buff *skb, bool xnet);
+ +
+ +extern void	       skb_split(struct sk_buff *skb,
+ +				 struct sk_buff *skb1, const u32 len);
+ +extern int	       skb_shift(struct sk_buff *tgt, struct sk_buff *skb,
+ +				 int shiftlen);
+ +extern void	       skb_scrub_packet(struct sk_buff *skb, bool xnet);
+  unsigned int skb_gso_transport_seglen(const struct sk_buff *skb);
+++<<<<<<< HEAD
+ +extern struct sk_buff *skb_segment(struct sk_buff *skb,
+ +				   netdev_features_t features);
+++=======
++ struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features);
++ struct sk_buff *skb_vlan_untag(struct sk_buff *skb);
++ int skb_ensure_writable(struct sk_buff *skb, int write_len);
++ int skb_vlan_pop(struct sk_buff *skb);
++ int skb_vlan_push(struct sk_buff *skb, __be16 vlan_proto, u16 vlan_tci);
+++>>>>>>> 93515d53b133 (net: move vlan pop/push functions into common code)
+  
+  struct skb_checksum_ops {
+  	__wsum (*update)(const void *mem, int len, __wsum wsum);
+diff --cc net/core/skbuff.c
+index 13e8ed896c2a,c906c5f4bf69..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -3718,3 -4098,240 +3718,243 @@@ unsigned int skb_gso_transport_seglen(c
+  	return thlen + shinfo->gso_size;
+  }
+  EXPORT_SYMBOL_GPL(skb_gso_transport_seglen);
+++<<<<<<< HEAD
+++=======
++ 
++ static struct sk_buff *skb_reorder_vlan_header(struct sk_buff *skb)
++ {
++ 	if (skb_cow(skb, skb_headroom(skb)) < 0) {
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	}
++ 
++ 	memmove(skb->data - ETH_HLEN, skb->data - VLAN_ETH_HLEN, 2 * ETH_ALEN);
++ 	skb->mac_header += VLAN_HLEN;
++ 	return skb;
++ }
++ 
++ struct sk_buff *skb_vlan_untag(struct sk_buff *skb)
++ {
++ 	struct vlan_hdr *vhdr;
++ 	u16 vlan_tci;
++ 
++ 	if (unlikely(vlan_tx_tag_present(skb))) {
++ 		/* vlan_tci is already set-up so leave this for another time */
++ 		return skb;
++ 	}
++ 
++ 	skb = skb_share_check(skb, GFP_ATOMIC);
++ 	if (unlikely(!skb))
++ 		goto err_free;
++ 
++ 	if (unlikely(!pskb_may_pull(skb, VLAN_HLEN)))
++ 		goto err_free;
++ 
++ 	vhdr = (struct vlan_hdr *)skb->data;
++ 	vlan_tci = ntohs(vhdr->h_vlan_TCI);
++ 	__vlan_hwaccel_put_tag(skb, skb->protocol, vlan_tci);
++ 
++ 	skb_pull_rcsum(skb, VLAN_HLEN);
++ 	vlan_set_encap_proto(skb, vhdr);
++ 
++ 	skb = skb_reorder_vlan_header(skb);
++ 	if (unlikely(!skb))
++ 		goto err_free;
++ 
++ 	skb_reset_network_header(skb);
++ 	skb_reset_transport_header(skb);
++ 	skb_reset_mac_len(skb);
++ 
++ 	return skb;
++ 
++ err_free:
++ 	kfree_skb(skb);
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(skb_vlan_untag);
++ 
++ int skb_ensure_writable(struct sk_buff *skb, int write_len)
++ {
++ 	if (!pskb_may_pull(skb, write_len))
++ 		return -ENOMEM;
++ 
++ 	if (!skb_cloned(skb) || skb_clone_writable(skb, write_len))
++ 		return 0;
++ 
++ 	return pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
++ }
++ EXPORT_SYMBOL(skb_ensure_writable);
++ 
++ /* remove VLAN header from packet and update csum accordingly. */
++ static int __skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci)
++ {
++ 	struct vlan_hdr *vhdr;
++ 	unsigned int offset = skb->data - skb_mac_header(skb);
++ 	int err;
++ 
++ 	__skb_push(skb, offset);
++ 	err = skb_ensure_writable(skb, VLAN_ETH_HLEN);
++ 	if (unlikely(err))
++ 		goto pull;
++ 
++ 	skb_postpull_rcsum(skb, skb->data + (2 * ETH_ALEN), VLAN_HLEN);
++ 
++ 	vhdr = (struct vlan_hdr *)(skb->data + ETH_HLEN);
++ 	*vlan_tci = ntohs(vhdr->h_vlan_TCI);
++ 
++ 	memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
++ 	__skb_pull(skb, VLAN_HLEN);
++ 
++ 	vlan_set_encap_proto(skb, vhdr);
++ 	skb->mac_header += VLAN_HLEN;
++ 
++ 	if (skb_network_offset(skb) < ETH_HLEN)
++ 		skb_set_network_header(skb, ETH_HLEN);
++ 
++ 	skb_reset_mac_len(skb);
++ pull:
++ 	__skb_pull(skb, offset);
++ 
++ 	return err;
++ }
++ 
++ int skb_vlan_pop(struct sk_buff *skb)
++ {
++ 	u16 vlan_tci;
++ 	__be16 vlan_proto;
++ 	int err;
++ 
++ 	if (likely(vlan_tx_tag_present(skb))) {
++ 		skb->vlan_tci = 0;
++ 	} else {
++ 		if (unlikely((skb->protocol != htons(ETH_P_8021Q) &&
++ 			      skb->protocol != htons(ETH_P_8021AD)) ||
++ 			     skb->len < VLAN_ETH_HLEN))
++ 			return 0;
++ 
++ 		err = __skb_vlan_pop(skb, &vlan_tci);
++ 		if (err)
++ 			return err;
++ 	}
++ 	/* move next vlan tag to hw accel tag */
++ 	if (likely((skb->protocol != htons(ETH_P_8021Q) &&
++ 		    skb->protocol != htons(ETH_P_8021AD)) ||
++ 		   skb->len < VLAN_ETH_HLEN))
++ 		return 0;
++ 
++ 	vlan_proto = skb->protocol;
++ 	err = __skb_vlan_pop(skb, &vlan_tci);
++ 	if (unlikely(err))
++ 		return err;
++ 
++ 	__vlan_hwaccel_put_tag(skb, vlan_proto, vlan_tci);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(skb_vlan_pop);
++ 
++ int skb_vlan_push(struct sk_buff *skb, __be16 vlan_proto, u16 vlan_tci)
++ {
++ 	if (vlan_tx_tag_present(skb)) {
++ 		unsigned int offset = skb->data - skb_mac_header(skb);
++ 		int err;
++ 
++ 		/* __vlan_insert_tag expect skb->data pointing to mac header.
++ 		 * So change skb->data before calling it and change back to
++ 		 * original position later
++ 		 */
++ 		__skb_push(skb, offset);
++ 		err = __vlan_insert_tag(skb, skb->vlan_proto,
++ 					vlan_tx_tag_get(skb));
++ 		if (err)
++ 			return err;
++ 		skb->protocol = skb->vlan_proto;
++ 		skb->mac_len += VLAN_HLEN;
++ 		__skb_pull(skb, offset);
++ 
++ 		if (skb->ip_summed == CHECKSUM_COMPLETE)
++ 			skb->csum = csum_add(skb->csum, csum_partial(skb->data
++ 					+ (2 * ETH_ALEN), VLAN_HLEN, 0));
++ 	}
++ 	__vlan_hwaccel_put_tag(skb, vlan_proto, vlan_tci);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(skb_vlan_push);
++ 
++ /**
++  * alloc_skb_with_frags - allocate skb with page frags
++  *
++  * @header_len: size of linear part
++  * @data_len: needed length in frags
++  * @max_page_order: max page order desired.
++  * @errcode: pointer to error code if any
++  * @gfp_mask: allocation mask
++  *
++  * This can be used to allocate a paged skb, given a maximal order for frags.
++  */
++ struct sk_buff *alloc_skb_with_frags(unsigned long header_len,
++ 				     unsigned long data_len,
++ 				     int max_page_order,
++ 				     int *errcode,
++ 				     gfp_t gfp_mask)
++ {
++ 	int npages = (data_len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++ 	unsigned long chunk;
++ 	struct sk_buff *skb;
++ 	struct page *page;
++ 	gfp_t gfp_head;
++ 	int i;
++ 
++ 	*errcode = -EMSGSIZE;
++ 	/* Note this test could be relaxed, if we succeed to allocate
++ 	 * high order pages...
++ 	 */
++ 	if (npages > MAX_SKB_FRAGS)
++ 		return NULL;
++ 
++ 	gfp_head = gfp_mask;
++ 	if (gfp_head & __GFP_WAIT)
++ 		gfp_head |= __GFP_REPEAT;
++ 
++ 	*errcode = -ENOBUFS;
++ 	skb = alloc_skb(header_len, gfp_head);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	skb->truesize += npages << PAGE_SHIFT;
++ 
++ 	for (i = 0; npages > 0; i++) {
++ 		int order = max_page_order;
++ 
++ 		while (order) {
++ 			if (npages >= 1 << order) {
++ 				page = alloc_pages(gfp_mask |
++ 						   __GFP_COMP |
++ 						   __GFP_NOWARN |
++ 						   __GFP_NORETRY,
++ 						   order);
++ 				if (page)
++ 					goto fill_page;
++ 				/* Do not retry other high order allocations */
++ 				order = 1;
++ 				max_page_order = 0;
++ 			}
++ 			order--;
++ 		}
++ 		page = alloc_page(gfp_mask);
++ 		if (!page)
++ 			goto failure;
++ fill_page:
++ 		chunk = min_t(unsigned long, data_len,
++ 			      PAGE_SIZE << order);
++ 		skb_fill_page_desc(skb, i, page, 0, chunk);
++ 		data_len -= chunk;
++ 		npages -= 1 << order;
++ 	}
++ 	return skb;
++ 
++ failure:
++ 	kfree_skb(skb);
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(alloc_skb_with_frags);
+++>>>>>>> 93515d53b133 (net: move vlan pop/push functions into common code)
+diff --cc net/openvswitch/actions.c
+index 5e332feb5508,4e05ea1c2d11..000000000000
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@@ -107,24 -109,58 +107,25 @@@ static struct deferred_action *add_defe
+  	return da;
+  }
+  
+ -static void invalidate_flow_key(struct sw_flow_key *key)
+ +static int make_writable(struct sk_buff *skb, int write_len)
+  {
+ -	key->eth.type = htons(0);
+ -}
+ -
+ -static bool is_flow_key_valid(const struct sw_flow_key *key)
+ -{
+ -	return !!key->eth.type;
+ -}
+ -
+ -static int push_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ -		     const struct ovs_action_push_mpls *mpls)
+ -{
+ -	__be32 *new_mpls_lse;
+ -	struct ethhdr *hdr;
+ -
+ -	/* Networking stack do not allow simultaneous Tunnel and MPLS GSO. */
+ -	if (skb->encapsulation)
+ -		return -ENOTSUPP;
+ -
+ -	if (skb_cow_head(skb, MPLS_HLEN) < 0)
+ +	if (!pskb_may_pull(skb, write_len))
+  		return -ENOMEM;
+  
+ -	skb_push(skb, MPLS_HLEN);
+ -	memmove(skb_mac_header(skb) - MPLS_HLEN, skb_mac_header(skb),
+ -		skb->mac_len);
+ -	skb_reset_mac_header(skb);
+ -
+ -	new_mpls_lse = (__be32 *)skb_mpls_header(skb);
+ -	*new_mpls_lse = mpls->mpls_lse;
+ -
+ -	if (skb->ip_summed == CHECKSUM_COMPLETE)
+ -		skb->csum = csum_add(skb->csum, csum_partial(new_mpls_lse,
+ -							     MPLS_HLEN, 0));
+ -
+ -	hdr = eth_hdr(skb);
+ -	hdr->h_proto = mpls->mpls_ethertype;
+ -
+ -	skb_set_inner_protocol(skb, skb->protocol);
+ -	skb->protocol = mpls->mpls_ethertype;
+ +	if (!skb_cloned(skb) || skb_clone_writable(skb, write_len))
+ +		return 0;
+  
+ -	invalidate_flow_key(key);
+ -	return 0;
+ +	return pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+  }
+  
+ -static int pop_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ -		    const __be16 ethertype)
+++<<<<<<< HEAD
+ +/* remove VLAN header from packet and update csum accordingly. */
+ +static int __pop_vlan_tci(struct sk_buff *skb, __be16 *current_tci)
+  {
+ -	struct ethhdr *hdr;
+ +	struct vlan_hdr *vhdr;
+  	int err;
+  
+ -	err = skb_ensure_writable(skb, skb->mac_len + MPLS_HLEN);
+ +	err = make_writable(skb, VLAN_ETH_HLEN);
+  	if (unlikely(err))
+  		return err;
+  
+@@@ -147,56 -183,53 +148,76 @@@
+  	return 0;
+  }
+  
+ -static int set_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ -		    const __be32 *mpls_lse)
+ +static int pop_vlan(struct sk_buff *skb)
+++=======
+++static int pop_vlan(struct sk_buff *skb, struct sw_flow_key *key)
+++>>>>>>> 93515d53b133 (net: move vlan pop/push functions into common code)
+  {
+- 	__be16 tci;
+ -	__be32 *stack;
+  	int err;
+  
+ -	err = skb_ensure_writable(skb, skb->mac_len + MPLS_HLEN);
+ -	if (unlikely(err))
+ -		return err;
+++<<<<<<< HEAD
+ +	if (likely(vlan_tx_tag_present(skb))) {
+ +		skb->vlan_tci = 0;
+ +	} else {
+ +		if (unlikely(skb->protocol != htons(ETH_P_8021Q) ||
+ +			     skb->len < VLAN_ETH_HLEN))
+ +			return 0;
+  
+ -	stack = (__be32 *)skb_mpls_header(skb);
+ -	if (skb->ip_summed == CHECKSUM_COMPLETE) {
+ -		__be32 diff[] = { ~(*stack), *mpls_lse };
+ -		skb->csum = ~csum_partial((char *)diff, sizeof(diff),
+ -					  ~skb->csum);
+ +		err = __pop_vlan_tci(skb, &tci);
+ +		if (err)
+ +			return err;
+  	}
+ +	/* move next vlan tag to hw accel tag */
+ +	if (likely(skb->protocol != htons(ETH_P_8021Q) ||
+ +		   skb->len < VLAN_ETH_HLEN))
+ +		return 0;
+  
+ -	*stack = *mpls_lse;
+ -	key->mpls.top_lse = *mpls_lse;
+ -	return 0;
+ -}
+ -
+ -static int pop_vlan(struct sk_buff *skb, struct sw_flow_key *key)
+ -{
+ -	int err;
+ +	err = __pop_vlan_tci(skb, &tci);
+ +	if (unlikely(err))
+ +		return err;
+  
+ +	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), ntohs(tci));
+ +	return 0;
+++=======
++ 	err = skb_vlan_pop(skb);
++ 	if (vlan_tx_tag_present(skb))
++ 		invalidate_flow_key(key);
++ 	else
++ 		key->eth.tci = 0;
++ 	return err;
+++>>>>>>> 93515d53b133 (net: move vlan pop/push functions into common code)
+  }
+  
+ -static int push_vlan(struct sk_buff *skb, struct sw_flow_key *key,
+ -		     const struct ovs_action_push_vlan *vlan)
+ +static int push_vlan(struct sk_buff *skb, const struct ovs_action_push_vlan *vlan)
+  {
+++<<<<<<< HEAD
+ +	if (unlikely(vlan_tx_tag_present(skb))) {
+ +		u16 current_tag;
+ +
+ +		/* push down current VLAN tag */
+ +		current_tag = vlan_tx_tag_get(skb);
+ +
+ +		if (!__vlan_put_tag(skb, skb->vlan_proto, current_tag))
+ +			return -ENOMEM;
+ +
+ +		if (skb->ip_summed == CHECKSUM_COMPLETE)
+ +			skb->csum = csum_add(skb->csum, csum_partial(skb->data
+ +					+ (2 * ETH_ALEN), VLAN_HLEN, 0));
+ +
+ +	}
+ +	__vlan_hwaccel_put_tag(skb, vlan->vlan_tpid, ntohs(vlan->vlan_tci) & ~VLAN_TAG_PRESENT);
+ +	return 0;
+++=======
++ 	if (vlan_tx_tag_present(skb))
++ 		invalidate_flow_key(key);
++ 	else
++ 		key->eth.tci = vlan->vlan_tci;
++ 	return skb_vlan_push(skb, vlan->vlan_tpid,
++ 			     ntohs(vlan->vlan_tci) & ~VLAN_TAG_PRESENT);
+++>>>>>>> 93515d53b133 (net: move vlan pop/push functions into common code)
+  }
+  
+ -static int set_eth_addr(struct sk_buff *skb, struct sw_flow_key *key,
+ +static int set_eth_addr(struct sk_buff *skb,
+  			const struct ovs_key_ethernet *eth_key)
+  {
+  	int err;
+@@@ -709,10 -782,16 +730,14 @@@ static int do_execute_actions(struct da
+  			execute_hash(skb, key, a);
+  			break;
+  
+ -		case OVS_ACTION_ATTR_PUSH_MPLS:
+ -			err = push_mpls(skb, key, nla_data(a));
+ -			break;
+ -
+ -		case OVS_ACTION_ATTR_POP_MPLS:
+ -			err = pop_mpls(skb, key, nla_get_be16(a));
+ -			break;
+ -
+  		case OVS_ACTION_ATTR_PUSH_VLAN:
+++<<<<<<< HEAD
+ +			err = push_vlan(skb, nla_data(a));
+ +			if (unlikely(err)) /* skb already freed. */
+ +				return err;
+++=======
++ 			err = push_vlan(skb, key, nla_data(a));
+++>>>>>>> 93515d53b133 (net: move vlan pop/push functions into common code)
+  			break;
+  
+  		case OVS_ACTION_ATTR_POP_VLAN:
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/skbuff.c
+* Unmerged path net/openvswitch/actions.c
