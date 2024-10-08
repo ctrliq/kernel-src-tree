@@ -1,0 +1,1010 @@
+netfilter: nf_conntrack: make sequence number adjustments usuable without NAT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 41d73ec053d2424599c4ed8452b889374d523ade
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/41d73ec0.failed
+
+Split out sequence number adjustments from NAT and move them to the conntrack
+core to make them usable for SYN proxying. The sequence number adjustment
+information is moved to a seperate extend. The extend is added to new
+conntracks when a NAT mapping is set up for a connection using a helper.
+
+As a side effect, this saves 24 bytes per connection with NAT in the common
+case that a connection does not have a helper assigned.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Tested-by: Martin Topholm <mph@one.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 41d73ec053d2424599c4ed8452b889374d523ade)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter.h
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc include/linux/netfilter.h
+index cf6abef9e725,708fe72ab913..000000000000
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@@ -325,14 -326,12 +326,15 @@@ struct nfq_ct_hook 
+  	size_t (*build_size)(const struct nf_conn *ct);
+  	int (*build)(struct sk_buff *skb, struct nf_conn *ct);
+  	int (*parse)(const struct nlattr *attr, struct nf_conn *ct);
+- };
+- extern struct nfq_ct_hook __rcu *nfq_ct_hook;
+- 
+- struct nfq_ct_nat_hook {
+++<<<<<<< HEAD
+++=======
++ 	int (*attach_expect)(const struct nlattr *attr, struct nf_conn *ct,
++ 			     u32 portid, u32 report);
+  	void (*seq_adjust)(struct sk_buff *skb, struct nf_conn *ct,
+- 			   u32 ctinfo, s32 off);
++ 			   enum ip_conntrack_info ctinfo, s32 off);
+++>>>>>>> 41d73ec053d2 (netfilter: nf_conntrack: make sequence number adjustments usuable without NAT)
+  };
+- extern struct nfq_ct_nat_hook __rcu *nfq_ct_nat_hook;
++ extern struct nfq_ct_hook __rcu *nfq_ct_hook;
+  #else
+  static inline void nf_ct_attach(struct sk_buff *new, struct sk_buff *skb) {}
+  #endif
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 9aaa68bbbcdb,7c55745ececf..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -2131,6 -2202,8 +2123,11 @@@ static struct nfq_ct_hook ctnetlink_nfq
+  	.build_size	= ctnetlink_nfqueue_build_size,
+  	.build		= ctnetlink_nfqueue_build,
+  	.parse		= ctnetlink_nfqueue_parse,
+++<<<<<<< HEAD
+++=======
++ 	.attach_expect	= ctnetlink_nfqueue_attach_expect,
++ 	.seq_adjust	= nf_ct_tcp_seqadj_set,
+++>>>>>>> 41d73ec053d2 (netfilter: nf_conntrack: make sequence number adjustments usuable without NAT)
+  };
+  #endif /* CONFIG_NETFILTER_NETLINK_QUEUE_CT */
+  
+* Unmerged path include/linux/netfilter.h
+diff --git a/include/net/netfilter/nf_conntrack_extend.h b/include/net/netfilter/nf_conntrack_extend.h
+index 977bc8a46444..2a22bcbfe6e4 100644
+--- a/include/net/netfilter/nf_conntrack_extend.h
++++ b/include/net/netfilter/nf_conntrack_extend.h
+@@ -9,6 +9,7 @@ enum nf_ct_ext_id {
+ 	NF_CT_EXT_HELPER,
+ #if defined(CONFIG_NF_NAT) || defined(CONFIG_NF_NAT_MODULE)
+ 	NF_CT_EXT_NAT,
++	NF_CT_EXT_SEQADJ,
+ #endif
+ 	NF_CT_EXT_ACCT,
+ #ifdef CONFIG_NF_CONNTRACK_EVENTS
+@@ -31,6 +32,7 @@ enum nf_ct_ext_id {
+ 
+ #define NF_CT_EXT_HELPER_TYPE struct nf_conn_help
+ #define NF_CT_EXT_NAT_TYPE struct nf_conn_nat
++#define NF_CT_EXT_SEQADJ_TYPE struct nf_conn_seqadj
+ #define NF_CT_EXT_ACCT_TYPE struct nf_conn_counter
+ #define NF_CT_EXT_ECACHE_TYPE struct nf_conntrack_ecache
+ #define NF_CT_EXT_ZONE_TYPE struct nf_conntrack_zone
+diff --git a/include/net/netfilter/nf_conntrack_seqadj.h b/include/net/netfilter/nf_conntrack_seqadj.h
+new file mode 100644
+index 000000000000..30bfbbed9f47
+--- /dev/null
++++ b/include/net/netfilter/nf_conntrack_seqadj.h
+@@ -0,0 +1,49 @@
++#ifndef _NF_CONNTRACK_SEQADJ_H
++#define _NF_CONNTRACK_SEQADJ_H
++
++#include <net/netfilter/nf_conntrack_extend.h>
++
++/**
++ * struct nf_ct_seqadj - sequence number adjustment information
++ *
++ * @correction_pos: position of the last TCP sequence number modification
++ * @offset_before: sequence number offset before last modification
++ * @offset_after: sequence number offset after last modification
++ */
++struct nf_ct_seqadj {
++	u32		correction_pos;
++	s32		offset_before;
++	s32		offset_after;
++};
++
++struct nf_conn_seqadj {
++	struct nf_ct_seqadj	seq[IP_CT_DIR_MAX];
++};
++
++static inline struct nf_conn_seqadj *nfct_seqadj(const struct nf_conn *ct)
++{
++	return nf_ct_ext_find(ct, NF_CT_EXT_SEQADJ);
++}
++
++static inline struct nf_conn_seqadj *nfct_seqadj_ext_add(struct nf_conn *ct)
++{
++	return nf_ct_ext_add(ct, NF_CT_EXT_SEQADJ, GFP_ATOMIC);
++}
++
++extern int nf_ct_seqadj_set(struct nf_conn *ct, enum ip_conntrack_info ctinfo,
++			    __be32 seq, s32 off);
++extern void nf_ct_tcp_seqadj_set(struct sk_buff *skb,
++				 struct nf_conn *ct,
++				 enum ip_conntrack_info ctinfo,
++				 s32 off);
++
++extern int nf_ct_seq_adjust(struct sk_buff *skb,
++			    struct nf_conn *ct, enum ip_conntrack_info ctinfo,
++			    unsigned int protoff);
++extern s32 nf_ct_seq_offset(const struct nf_conn *ct, enum ip_conntrack_dir,
++			    u32 seq);
++
++extern int nf_conntrack_seqadj_init(void);
++extern void nf_conntrack_seqadj_fini(void);
++
++#endif /* _NF_CONNTRACK_SEQADJ_H */
+diff --git a/include/net/netfilter/nf_nat.h b/include/net/netfilter/nf_nat.h
+index e2441413675c..59a192420053 100644
+--- a/include/net/netfilter/nf_nat.h
++++ b/include/net/netfilter/nf_nat.h
+@@ -13,15 +13,6 @@ enum nf_nat_manip_type {
+ #define HOOK2MANIP(hooknum) ((hooknum) != NF_INET_POST_ROUTING && \
+ 			     (hooknum) != NF_INET_LOCAL_IN)
+ 
+-/* NAT sequence number modifications */
+-struct nf_nat_seq {
+-	/* position of the last TCP sequence number modification (if any) */
+-	u_int32_t correction_pos;
+-
+-	/* sequence number offset before and after last modification */
+-	int32_t offset_before, offset_after;
+-};
+-
+ #include <linux/list.h>
+ #include <linux/netfilter/nf_conntrack_pptp.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+@@ -39,7 +30,6 @@ struct nf_conn;
+ /* The structure embedded in the conntrack structure. */
+ struct nf_conn_nat {
+ 	struct hlist_node bysource;
+-	struct nf_nat_seq seq[IP_CT_DIR_MAX];
+ 	struct nf_conn *ct;
+ 	union nf_conntrack_nat_help help;
+ #if defined(CONFIG_IP_NF_TARGET_MASQUERADE) || \
+diff --git a/include/net/netfilter/nf_nat_helper.h b/include/net/netfilter/nf_nat_helper.h
+index 194c34794923..404324d1d0c4 100644
+--- a/include/net/netfilter/nf_nat_helper.h
++++ b/include/net/netfilter/nf_nat_helper.h
+@@ -39,28 +39,9 @@ extern int nf_nat_mangle_udp_packet(struct sk_buff *skb,
+ 				    const char *rep_buffer,
+ 				    unsigned int rep_len);
+ 
+-extern void nf_nat_set_seq_adjust(struct nf_conn *ct,
+-				  enum ip_conntrack_info ctinfo,
+-				  __be32 seq, s32 off);
+-extern int nf_nat_seq_adjust(struct sk_buff *skb,
+-			     struct nf_conn *ct,
+-			     enum ip_conntrack_info ctinfo,
+-			     unsigned int protoff);
+-extern int (*nf_nat_seq_adjust_hook)(struct sk_buff *skb,
+-				     struct nf_conn *ct,
+-				     enum ip_conntrack_info ctinfo,
+-				     unsigned int protoff);
+-
+ /* Setup NAT on this expected conntrack so it follows master, but goes
+  * to port ct->master->saved_proto. */
+ extern void nf_nat_follow_master(struct nf_conn *ct,
+ 				 struct nf_conntrack_expect *this);
+ 
+-extern s32 nf_nat_get_offset(const struct nf_conn *ct,
+-			     enum ip_conntrack_dir dir,
+-			     u32 seq);
+-
+-extern void nf_nat_tcp_seq_adjust(struct sk_buff *skb, struct nf_conn *ct,
+-				  u32 dir, s32 off);
+-
+ #endif
+diff --git a/include/uapi/linux/netfilter/nf_conntrack_common.h b/include/uapi/linux/netfilter/nf_conntrack_common.h
+index d69483fb3825..8dd803818ebe 100644
+--- a/include/uapi/linux/netfilter/nf_conntrack_common.h
++++ b/include/uapi/linux/netfilter/nf_conntrack_common.h
+@@ -99,7 +99,8 @@ enum ip_conntrack_events {
+ 	IPCT_PROTOINFO,		/* protocol information has changed */
+ 	IPCT_HELPER,		/* new helper has been set */
+ 	IPCT_MARK,		/* new mark has been set */
+-	IPCT_NATSEQADJ,		/* NAT is doing sequence adjustment */
++	IPCT_SEQADJ,		/* sequence adjustment has changed */
++	IPCT_NATSEQADJ = IPCT_SEQADJ,
+ 	IPCT_SECMARK,		/* new security mark has been set */
+ 	IPCT_LABEL,		/* new connlabel has been set */
+ };
+diff --git a/include/uapi/linux/netfilter/nfnetlink_conntrack.h b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
+index 08fabc6c93f3..acad6c52a652 100644
+--- a/include/uapi/linux/netfilter/nfnetlink_conntrack.h
++++ b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
+@@ -42,8 +42,10 @@ enum ctattr_type {
+ 	CTA_ID,
+ 	CTA_NAT_DST,
+ 	CTA_TUPLE_MASTER,
+-	CTA_NAT_SEQ_ADJ_ORIG,
+-	CTA_NAT_SEQ_ADJ_REPLY,
++	CTA_SEQ_ADJ_ORIG,
++	CTA_NAT_SEQ_ADJ_ORIG	= CTA_SEQ_ADJ_ORIG,
++	CTA_SEQ_ADJ_REPLY,
++	CTA_NAT_SEQ_ADJ_REPLY	= CTA_SEQ_ADJ_REPLY,
+ 	CTA_SECMARK,		/* obsolete */
+ 	CTA_ZONE,
+ 	CTA_SECCTX,
+@@ -165,6 +167,15 @@ enum ctattr_protonat {
+ };
+ #define CTA_PROTONAT_MAX (__CTA_PROTONAT_MAX - 1)
+ 
++enum ctattr_seqadj {
++	CTA_SEQADJ_UNSPEC,
++	CTA_SEQADJ_CORRECTION_POS,
++	CTA_SEQADJ_OFFSET_BEFORE,
++	CTA_SEQADJ_OFFSET_AFTER,
++	__CTA_SEQADJ_MAX
++};
++#define CTA_SEQADJ_MAX (__CTA_SEQADJ_MAX - 1)
++
+ enum ctattr_natseq {
+ 	CTA_NAT_SEQ_UNSPEC,
+ 	CTA_NAT_SEQ_CORRECTION_POS,
+diff --git a/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c b/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+index 567d84168bd2..fa6f99d6721f 100644
+--- a/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
++++ b/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+@@ -25,6 +25,7 @@
+ #include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <net/netfilter/nf_conntrack_core.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
+ #include <net/netfilter/ipv4/nf_conntrack_ipv4.h>
+ #include <net/netfilter/nf_nat_helper.h>
+ #include <net/netfilter/ipv4/nf_defrag_ipv4.h>
+@@ -136,11 +137,7 @@ static unsigned int ipv4_confirm(unsigned int hooknum,
+ 	/* adjust seqs for loopback traffic only in outgoing direction */
+ 	if (test_bit(IPS_SEQ_ADJUST_BIT, &ct->status) &&
+ 	    !nf_is_loopback_packet(skb)) {
+-		typeof(nf_nat_seq_adjust_hook) seq_adjust;
+-
+-		seq_adjust = rcu_dereference(nf_nat_seq_adjust_hook);
+-		if (!seq_adjust ||
+-		    !seq_adjust(skb, ct, ctinfo, ip_hdrlen(skb))) {
++		if (!nf_ct_seq_adjust(skb, ct, ctinfo, ip_hdrlen(skb))) {
+ 			NF_CT_STAT_INC_ATOMIC(nf_ct_net(ct), drop);
+ 			return NF_DROP;
+ 		}
+diff --git a/net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c b/net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+index c9b6a6e6a1e8..d6e4dd8b58df 100644
+--- a/net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
++++ b/net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+@@ -28,6 +28,7 @@
+ #include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
+ #include <net/netfilter/ipv6/nf_conntrack_ipv6.h>
+ #include <net/netfilter/nf_nat_helper.h>
+ #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
+@@ -158,11 +159,7 @@ static unsigned int ipv6_confirm(unsigned int hooknum,
+ 	/* adjust seqs for loopback traffic only in outgoing direction */
+ 	if (test_bit(IPS_SEQ_ADJUST_BIT, &ct->status) &&
+ 	    !nf_is_loopback_packet(skb)) {
+-		typeof(nf_nat_seq_adjust_hook) seq_adjust;
+-
+-		seq_adjust = rcu_dereference(nf_nat_seq_adjust_hook);
+-		if (!seq_adjust ||
+-		    !seq_adjust(skb, ct, ctinfo, protoff)) {
++		if (!nf_ct_seq_adjust(skb, ct, ctinfo, protoff)) {
+ 			NF_CT_STAT_INC_ATOMIC(nf_ct_net(ct), drop);
+ 			return NF_DROP;
+ 		}
+diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
+index a1abf87d43bf..baf12709b83a 100644
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -1,6 +1,6 @@
+ netfilter-objs := core.o nf_log.o nf_queue.o nf_sockopt.o
+ 
+-nf_conntrack-y	:= nf_conntrack_core.o nf_conntrack_standalone.o nf_conntrack_expect.o nf_conntrack_helper.o nf_conntrack_proto.o nf_conntrack_l3proto_generic.o nf_conntrack_proto_generic.o nf_conntrack_proto_tcp.o nf_conntrack_proto_udp.o nf_conntrack_extend.o nf_conntrack_acct.o
++nf_conntrack-y	:= nf_conntrack_core.o nf_conntrack_standalone.o nf_conntrack_expect.o nf_conntrack_helper.o nf_conntrack_proto.o nf_conntrack_l3proto_generic.o nf_conntrack_proto_generic.o nf_conntrack_proto_tcp.o nf_conntrack_proto_udp.o nf_conntrack_extend.o nf_conntrack_acct.o nf_conntrack_seqadj.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMEOUT) += nf_conntrack_timeout.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMESTAMP) += nf_conntrack_timestamp.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_EVENTS) += nf_conntrack_ecache.o
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index da6f1787a102..00a7a94d4132 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -39,6 +39,7 @@
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_expect.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
+@@ -1326,6 +1327,7 @@ void nf_conntrack_cleanup_end(void)
+ 	nf_ct_extend_unregister(&nf_ct_zone_extend);
+ #endif
+ 	nf_conntrack_proto_fini();
++	nf_conntrack_seqadj_fini();
+ 	nf_conntrack_labels_fini();
+ 	nf_conntrack_helper_fini();
+ 	nf_conntrack_timeout_fini();
+@@ -1531,6 +1533,10 @@ int nf_conntrack_init_start(void)
+ 	if (ret < 0)
+ 		goto err_labels;
+ 
++	ret = nf_conntrack_seqadj_init();
++	if (ret < 0)
++		goto err_seqadj;
++
+ #ifdef CONFIG_NF_CONNTRACK_ZONES
+ 	ret = nf_ct_extend_register(&nf_ct_zone_extend);
+ 	if (ret < 0)
+@@ -1555,6 +1561,8 @@ err_proto:
+ 	nf_ct_extend_unregister(&nf_ct_zone_extend);
+ err_extend:
+ #endif
++	nf_conntrack_seqadj_fini();
++err_seqadj:
+ 	nf_conntrack_labels_fini();
+ err_labels:
+ 	nf_conntrack_helper_fini();
+@@ -1577,9 +1585,6 @@ void nf_conntrack_init_end(void)
+ 	/* For use by REJECT target */
+ 	RCU_INIT_POINTER(ip_ct_attach, nf_conntrack_attach);
+ 	RCU_INIT_POINTER(nf_ct_destroy, destroy_conntrack);
+-
+-	/* Howto get NAT offsets */
+-	RCU_INIT_POINTER(nf_ct_nat_offset, NULL);
+ }
+ 
+ /*
+@@ -1666,8 +1671,3 @@ err_slabname:
+ err_stat:
+ 	return ret;
+ }
+-
+-s32 (*nf_ct_nat_offset)(const struct nf_conn *ct,
+-			enum ip_conntrack_dir dir,
+-			u32 seq);
+-EXPORT_SYMBOL_GPL(nf_ct_nat_offset);
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
+diff --git a/net/netfilter/nf_conntrack_proto_tcp.c b/net/netfilter/nf_conntrack_proto_tcp.c
+index 8f308d896324..3c3401e5a930 100644
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@ -27,6 +27,7 @@
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_ecache.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
+ #include <net/netfilter/nf_log.h>
+ #include <net/netfilter/ipv4/nf_conntrack_ipv4.h>
+ #include <net/netfilter/ipv6/nf_conntrack_ipv6.h>
+@@ -495,21 +496,6 @@ static void tcp_sack(const struct sk_buff *skb, unsigned int dataoff,
+ 	}
+ }
+ 
+-#ifdef CONFIG_NF_NAT_NEEDED
+-static inline s32 nat_offset(const struct nf_conn *ct,
+-			     enum ip_conntrack_dir dir,
+-			     u32 seq)
+-{
+-	typeof(nf_ct_nat_offset) get_offset = rcu_dereference(nf_ct_nat_offset);
+-
+-	return get_offset != NULL ? get_offset(ct, dir, seq) : 0;
+-}
+-#define NAT_OFFSET(ct, dir, seq) \
+-	(nat_offset(ct, dir, seq))
+-#else
+-#define NAT_OFFSET(ct, dir, seq)	0
+-#endif
+-
+ static bool tcp_in_window(const struct nf_conn *ct,
+ 			  struct ip_ct_tcp *state,
+ 			  enum ip_conntrack_dir dir,
+@@ -540,7 +526,7 @@ static bool tcp_in_window(const struct nf_conn *ct,
+ 		tcp_sack(skb, dataoff, tcph, &sack);
+ 
+ 	/* Take into account NAT sequence number mangling */
+-	receiver_offset = NAT_OFFSET(ct, !dir, ack - 1);
++	receiver_offset = nf_ct_seq_offset(ct, !dir, ack - 1);
+ 	ack -= receiver_offset;
+ 	sack -= receiver_offset;
+ 
+diff --git a/net/netfilter/nf_conntrack_seqadj.c b/net/netfilter/nf_conntrack_seqadj.c
+new file mode 100644
+index 000000000000..483eb9ce3216
+--- /dev/null
++++ b/net/netfilter/nf_conntrack_seqadj.c
+@@ -0,0 +1,218 @@
++#include <linux/types.h>
++#include <linux/netfilter.h>
++#include <net/tcp.h>
++
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_extend.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
++
++int nf_ct_seqadj_set(struct nf_conn *ct, enum ip_conntrack_info ctinfo,
++		     __be32 seq, s32 off)
++{
++	struct nf_conn_seqadj *seqadj = nfct_seqadj(ct);
++	enum ip_conntrack_dir dir = CTINFO2DIR(ctinfo);
++	struct nf_ct_seqadj *this_way;
++
++	if (off == 0)
++		return 0;
++
++	set_bit(IPS_SEQ_ADJUST_BIT, &ct->status);
++
++	spin_lock_bh(&ct->lock);
++	this_way = &seqadj->seq[dir];
++	if (this_way->offset_before == this_way->offset_after ||
++	    before(this_way->correction_pos, seq)) {
++		this_way->correction_pos = seq;
++		this_way->offset_before	 = this_way->offset_after;
++		this_way->offset_after	+= off;
++	}
++	spin_unlock_bh(&ct->lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nf_ct_seqadj_set);
++
++void nf_ct_tcp_seqadj_set(struct sk_buff *skb,
++			  struct nf_conn *ct, enum ip_conntrack_info ctinfo,
++			  s32 off)
++{
++	const struct tcphdr *th;
++
++	if (nf_ct_protonum(ct) != IPPROTO_TCP)
++		return;
++
++	th = (struct tcphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
++	nf_ct_seqadj_set(ct, ctinfo, th->seq, off);
++}
++EXPORT_SYMBOL_GPL(nf_ct_tcp_seqadj_set);
++
++/* Adjust one found SACK option including checksum correction */
++static void nf_ct_sack_block_adjust(struct sk_buff *skb,
++				    struct tcphdr *tcph,
++				    unsigned int sackoff,
++				    unsigned int sackend,
++				    struct nf_ct_seqadj *seq)
++{
++	while (sackoff < sackend) {
++		struct tcp_sack_block_wire *sack;
++		__be32 new_start_seq, new_end_seq;
++
++		sack = (void *)skb->data + sackoff;
++		if (after(ntohl(sack->start_seq) - seq->offset_before,
++			  seq->correction_pos))
++			new_start_seq = htonl(ntohl(sack->start_seq) -
++					seq->offset_after);
++		else
++			new_start_seq = htonl(ntohl(sack->start_seq) -
++					seq->offset_before);
++
++		if (after(ntohl(sack->end_seq) - seq->offset_before,
++			  seq->correction_pos))
++			new_end_seq = htonl(ntohl(sack->end_seq) -
++				      seq->offset_after);
++		else
++			new_end_seq = htonl(ntohl(sack->end_seq) -
++				      seq->offset_before);
++
++		pr_debug("sack_adjust: start_seq: %d->%d, end_seq: %d->%d\n",
++			 ntohl(sack->start_seq), new_start_seq,
++			 ntohl(sack->end_seq), new_end_seq);
++
++		inet_proto_csum_replace4(&tcph->check, skb,
++					 sack->start_seq, new_start_seq, 0);
++		inet_proto_csum_replace4(&tcph->check, skb,
++					 sack->end_seq, new_end_seq, 0);
++		sack->start_seq = new_start_seq;
++		sack->end_seq = new_end_seq;
++		sackoff += sizeof(*sack);
++	}
++}
++
++/* TCP SACK sequence number adjustment */
++static unsigned int nf_ct_sack_adjust(struct sk_buff *skb,
++				      unsigned int protoff,
++				      struct tcphdr *tcph,
++				      struct nf_conn *ct,
++				      enum ip_conntrack_info ctinfo)
++{
++	unsigned int dir, optoff, optend;
++	struct nf_conn_seqadj *seqadj = nfct_seqadj(ct);
++
++	optoff = protoff + sizeof(struct tcphdr);
++	optend = protoff + tcph->doff * 4;
++
++	if (!skb_make_writable(skb, optend))
++		return 0;
++
++	dir = CTINFO2DIR(ctinfo);
++
++	while (optoff < optend) {
++		/* Usually: option, length. */
++		unsigned char *op = skb->data + optoff;
++
++		switch (op[0]) {
++		case TCPOPT_EOL:
++			return 1;
++		case TCPOPT_NOP:
++			optoff++;
++			continue;
++		default:
++			/* no partial options */
++			if (optoff + 1 == optend ||
++			    optoff + op[1] > optend ||
++			    op[1] < 2)
++				return 0;
++			if (op[0] == TCPOPT_SACK &&
++			    op[1] >= 2+TCPOLEN_SACK_PERBLOCK &&
++			    ((op[1] - 2) % TCPOLEN_SACK_PERBLOCK) == 0)
++				nf_ct_sack_block_adjust(skb, tcph, optoff + 2,
++							optoff+op[1],
++							&seqadj->seq[!dir]);
++			optoff += op[1];
++		}
++	}
++	return 1;
++}
++
++/* TCP sequence number adjustment.  Returns 1 on success, 0 on failure */
++int nf_ct_seq_adjust(struct sk_buff *skb,
++		     struct nf_conn *ct, enum ip_conntrack_info ctinfo,
++		     unsigned int protoff)
++{
++	enum ip_conntrack_dir dir = CTINFO2DIR(ctinfo);
++	struct tcphdr *tcph;
++	__be32 newseq, newack;
++	s32 seqoff, ackoff;
++	struct nf_conn_seqadj *seqadj = nfct_seqadj(ct);
++	struct nf_ct_seqadj *this_way, *other_way;
++	int res;
++
++	this_way  = &seqadj->seq[dir];
++	other_way = &seqadj->seq[!dir];
++
++	if (!skb_make_writable(skb, protoff + sizeof(*tcph)))
++		return 0;
++
++	tcph = (void *)skb->data + protoff;
++	spin_lock_bh(&ct->lock);
++	if (after(ntohl(tcph->seq), this_way->correction_pos))
++		seqoff = this_way->offset_after;
++	else
++		seqoff = this_way->offset_before;
++
++	if (after(ntohl(tcph->ack_seq) - other_way->offset_before,
++		  other_way->correction_pos))
++		ackoff = other_way->offset_after;
++	else
++		ackoff = other_way->offset_before;
++
++	newseq = htonl(ntohl(tcph->seq) + seqoff);
++	newack = htonl(ntohl(tcph->ack_seq) - ackoff);
++
++	inet_proto_csum_replace4(&tcph->check, skb, tcph->seq, newseq, 0);
++	inet_proto_csum_replace4(&tcph->check, skb, tcph->ack_seq, newack, 0);
++
++	pr_debug("Adjusting sequence number from %u->%u, ack from %u->%u\n",
++		 ntohl(tcph->seq), ntohl(newseq), ntohl(tcph->ack_seq),
++		 ntohl(newack));
++
++	tcph->seq = newseq;
++	tcph->ack_seq = newack;
++
++	res = nf_ct_sack_adjust(skb, protoff, tcph, ct, ctinfo);
++	spin_unlock_bh(&ct->lock);
++
++	return res;
++}
++EXPORT_SYMBOL_GPL(nf_ct_seq_adjust);
++
++s32 nf_ct_seq_offset(const struct nf_conn *ct,
++		     enum ip_conntrack_dir dir,
++		     u32 seq)
++{
++	struct nf_conn_seqadj *seqadj = nfct_seqadj(ct);
++	struct nf_ct_seqadj *this_way;
++
++	if (!seqadj)
++		return 0;
++
++	this_way = &seqadj->seq[dir];
++	return after(seq, this_way->correction_pos) ?
++		 this_way->offset_after : this_way->offset_before;
++}
++EXPORT_SYMBOL_GPL(nf_ct_seq_offset);
++
++static struct nf_ct_ext_type nf_ct_seqadj_extend __read_mostly = {
++	.len	= sizeof(struct nf_conn_seqadj),
++	.align	= __alignof__(struct nf_conn_seqadj),
++	.id	= NF_CT_EXT_SEQADJ,
++};
++
++int nf_conntrack_seqadj_init(void)
++{
++	return nf_ct_extend_register(&nf_ct_seqadj_extend);
++}
++
++void nf_conntrack_seqadj_fini(void)
++{
++	nf_ct_extend_unregister(&nf_ct_seqadj_extend);
++}
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index 6ff808375b5e..6f0f4f7f68a5 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -25,6 +25,7 @@
+ #include <net/netfilter/nf_nat_core.h>
+ #include <net/netfilter/nf_nat_helper.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
+ #include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <linux/netfilter/nf_nat.h>
+@@ -402,6 +403,9 @@ nf_nat_setup_info(struct nf_conn *ct,
+ 			ct->status |= IPS_SRC_NAT;
+ 		else
+ 			ct->status |= IPS_DST_NAT;
++
++		if (nfct_help(ct))
++			nfct_seqadj_ext_add(ct);
+ 	}
+ 
+ 	if (maniptype == NF_NAT_MANIP_SRC) {
+@@ -764,10 +768,6 @@ static struct nf_ct_helper_expectfn follow_master_nat = {
+ 	.expectfn	= nf_nat_follow_master,
+ };
+ 
+-static struct nfq_ct_nat_hook nfq_ct_nat = {
+-	.seq_adjust	= nf_nat_tcp_seq_adjust,
+-};
+-
+ static int __init nf_nat_init(void)
+ {
+ 	int ret;
+@@ -787,14 +787,9 @@ static int __init nf_nat_init(void)
+ 	/* Initialize fake conntrack so that NAT will skip it */
+ 	nf_ct_untracked_status_or(IPS_NAT_DONE_MASK);
+ 
+-	BUG_ON(nf_nat_seq_adjust_hook != NULL);
+-	RCU_INIT_POINTER(nf_nat_seq_adjust_hook, nf_nat_seq_adjust);
+ 	BUG_ON(nfnetlink_parse_nat_setup_hook != NULL);
+ 	RCU_INIT_POINTER(nfnetlink_parse_nat_setup_hook,
+ 			   nfnetlink_parse_nat_setup);
+-	BUG_ON(nf_ct_nat_offset != NULL);
+-	RCU_INIT_POINTER(nf_ct_nat_offset, nf_nat_get_offset);
+-	RCU_INIT_POINTER(nfq_ct_nat_hook, &nfq_ct_nat);
+ #ifdef CONFIG_XFRM
+ 	BUG_ON(nf_nat_decode_session_hook != NULL);
+ 	RCU_INIT_POINTER(nf_nat_decode_session_hook, __nf_nat_decode_session);
+@@ -813,10 +808,7 @@ static void __exit nf_nat_cleanup(void)
+ 	unregister_pernet_subsys(&nf_nat_net_ops);
+ 	nf_ct_extend_unregister(&nat_extend);
+ 	nf_ct_helper_expectfn_unregister(&follow_master_nat);
+-	RCU_INIT_POINTER(nf_nat_seq_adjust_hook, NULL);
+ 	RCU_INIT_POINTER(nfnetlink_parse_nat_setup_hook, NULL);
+-	RCU_INIT_POINTER(nf_ct_nat_offset, NULL);
+-	RCU_INIT_POINTER(nfq_ct_nat_hook, NULL);
+ #ifdef CONFIG_XFRM
+ 	RCU_INIT_POINTER(nf_nat_decode_session_hook, NULL);
+ #endif
+diff --git a/net/netfilter/nf_nat_helper.c b/net/netfilter/nf_nat_helper.c
+index 46b9baa845a6..2840abb5bb99 100644
+--- a/net/netfilter/nf_nat_helper.c
++++ b/net/netfilter/nf_nat_helper.c
+@@ -20,67 +20,13 @@
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_ecache.h>
+ #include <net/netfilter/nf_conntrack_expect.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
+ #include <net/netfilter/nf_nat.h>
+ #include <net/netfilter/nf_nat_l3proto.h>
+ #include <net/netfilter/nf_nat_l4proto.h>
+ #include <net/netfilter/nf_nat_core.h>
+ #include <net/netfilter/nf_nat_helper.h>
+ 
+-#define DUMP_OFFSET(x) \
+-	pr_debug("offset_before=%d, offset_after=%d, correction_pos=%u\n", \
+-		 x->offset_before, x->offset_after, x->correction_pos);
+-
+-/* Setup TCP sequence correction given this change at this sequence */
+-static inline void
+-adjust_tcp_sequence(u32 seq,
+-		    int sizediff,
+-		    struct nf_conn *ct,
+-		    enum ip_conntrack_info ctinfo)
+-{
+-	enum ip_conntrack_dir dir = CTINFO2DIR(ctinfo);
+-	struct nf_conn_nat *nat = nfct_nat(ct);
+-	struct nf_nat_seq *this_way = &nat->seq[dir];
+-
+-	pr_debug("adjust_tcp_sequence: seq = %u, sizediff = %d\n",
+-		 seq, sizediff);
+-
+-	pr_debug("adjust_tcp_sequence: Seq_offset before: ");
+-	DUMP_OFFSET(this_way);
+-
+-	spin_lock_bh(&ct->lock);
+-
+-	/* SYN adjust. If it's uninitialized, or this is after last
+-	 * correction, record it: we don't handle more than one
+-	 * adjustment in the window, but do deal with common case of a
+-	 * retransmit */
+-	if (this_way->offset_before == this_way->offset_after ||
+-	    before(this_way->correction_pos, seq)) {
+-		this_way->correction_pos = seq;
+-		this_way->offset_before = this_way->offset_after;
+-		this_way->offset_after += sizediff;
+-	}
+-	spin_unlock_bh(&ct->lock);
+-
+-	pr_debug("adjust_tcp_sequence: Seq_offset after: ");
+-	DUMP_OFFSET(this_way);
+-}
+-
+-/* Get the offset value, for conntrack. Caller must have the conntrack locked */
+-s32 nf_nat_get_offset(const struct nf_conn *ct,
+-		      enum ip_conntrack_dir dir,
+-		      u32 seq)
+-{
+-	struct nf_conn_nat *nat = nfct_nat(ct);
+-	struct nf_nat_seq *this_way;
+-
+-	if (!nat)
+-		return 0;
+-
+-	this_way = &nat->seq[dir];
+-	return after(seq, this_way->correction_pos)
+-		 ? this_way->offset_after : this_way->offset_before;
+-}
+-
+ /* Frobs data inside this packet, which is linear. */
+ static void mangle_contents(struct sk_buff *skb,
+ 			    unsigned int dataoff,
+@@ -135,30 +81,6 @@ static int enlarge_skb(struct sk_buff *skb, unsigned int extra)
+ 	return 1;
+ }
+ 
+-void nf_nat_set_seq_adjust(struct nf_conn *ct, enum ip_conntrack_info ctinfo,
+-			   __be32 seq, s32 off)
+-{
+-	if (!off)
+-		return;
+-	set_bit(IPS_SEQ_ADJUST_BIT, &ct->status);
+-	adjust_tcp_sequence(ntohl(seq), off, ct, ctinfo);
+-	nf_conntrack_event_cache(IPCT_NATSEQADJ, ct);
+-}
+-EXPORT_SYMBOL_GPL(nf_nat_set_seq_adjust);
+-
+-void nf_nat_tcp_seq_adjust(struct sk_buff *skb, struct nf_conn *ct,
+-			   u32 ctinfo, int off)
+-{
+-	const struct tcphdr *th;
+-
+-	if (nf_ct_protonum(ct) != IPPROTO_TCP)
+-		return;
+-
+-	th = (struct tcphdr *)(skb_network_header(skb)+ ip_hdrlen(skb));
+-	nf_nat_set_seq_adjust(ct, ctinfo, th->seq, off);
+-}
+-EXPORT_SYMBOL_GPL(nf_nat_tcp_seq_adjust);
+-
+ /* Generic function for mangling variable-length address changes inside
+  * NATed TCP connections (like the PORT XXX,XXX,XXX,XXX,XXX,XXX
+  * command in FTP).
+@@ -203,8 +125,8 @@ int __nf_nat_mangle_tcp_packet(struct sk_buff *skb,
+ 			     datalen, oldlen);
+ 
+ 	if (adjust && rep_len != match_len)
+-		nf_nat_set_seq_adjust(ct, ctinfo, tcph->seq,
+-				      (int)rep_len - (int)match_len);
++		nf_ct_seqadj_set(ct, ctinfo, tcph->seq,
++				 (int)rep_len - (int)match_len);
+ 
+ 	return 1;
+ }
+@@ -264,150 +186,6 @@ nf_nat_mangle_udp_packet(struct sk_buff *skb,
+ }
+ EXPORT_SYMBOL(nf_nat_mangle_udp_packet);
+ 
+-/* Adjust one found SACK option including checksum correction */
+-static void
+-sack_adjust(struct sk_buff *skb,
+-	    struct tcphdr *tcph,
+-	    unsigned int sackoff,
+-	    unsigned int sackend,
+-	    struct nf_nat_seq *natseq)
+-{
+-	while (sackoff < sackend) {
+-		struct tcp_sack_block_wire *sack;
+-		__be32 new_start_seq, new_end_seq;
+-
+-		sack = (void *)skb->data + sackoff;
+-		if (after(ntohl(sack->start_seq) - natseq->offset_before,
+-			  natseq->correction_pos))
+-			new_start_seq = htonl(ntohl(sack->start_seq)
+-					- natseq->offset_after);
+-		else
+-			new_start_seq = htonl(ntohl(sack->start_seq)
+-					- natseq->offset_before);
+-
+-		if (after(ntohl(sack->end_seq) - natseq->offset_before,
+-			  natseq->correction_pos))
+-			new_end_seq = htonl(ntohl(sack->end_seq)
+-				      - natseq->offset_after);
+-		else
+-			new_end_seq = htonl(ntohl(sack->end_seq)
+-				      - natseq->offset_before);
+-
+-		pr_debug("sack_adjust: start_seq: %d->%d, end_seq: %d->%d\n",
+-			 ntohl(sack->start_seq), new_start_seq,
+-			 ntohl(sack->end_seq), new_end_seq);
+-
+-		inet_proto_csum_replace4(&tcph->check, skb,
+-					 sack->start_seq, new_start_seq, 0);
+-		inet_proto_csum_replace4(&tcph->check, skb,
+-					 sack->end_seq, new_end_seq, 0);
+-		sack->start_seq = new_start_seq;
+-		sack->end_seq = new_end_seq;
+-		sackoff += sizeof(*sack);
+-	}
+-}
+-
+-/* TCP SACK sequence number adjustment */
+-static inline unsigned int
+-nf_nat_sack_adjust(struct sk_buff *skb,
+-		   unsigned int protoff,
+-		   struct tcphdr *tcph,
+-		   struct nf_conn *ct,
+-		   enum ip_conntrack_info ctinfo)
+-{
+-	unsigned int dir, optoff, optend;
+-	struct nf_conn_nat *nat = nfct_nat(ct);
+-
+-	optoff = protoff + sizeof(struct tcphdr);
+-	optend = protoff + tcph->doff * 4;
+-
+-	if (!skb_make_writable(skb, optend))
+-		return 0;
+-
+-	dir = CTINFO2DIR(ctinfo);
+-
+-	while (optoff < optend) {
+-		/* Usually: option, length. */
+-		unsigned char *op = skb->data + optoff;
+-
+-		switch (op[0]) {
+-		case TCPOPT_EOL:
+-			return 1;
+-		case TCPOPT_NOP:
+-			optoff++;
+-			continue;
+-		default:
+-			/* no partial options */
+-			if (optoff + 1 == optend ||
+-			    optoff + op[1] > optend ||
+-			    op[1] < 2)
+-				return 0;
+-			if (op[0] == TCPOPT_SACK &&
+-			    op[1] >= 2+TCPOLEN_SACK_PERBLOCK &&
+-			    ((op[1] - 2) % TCPOLEN_SACK_PERBLOCK) == 0)
+-				sack_adjust(skb, tcph, optoff+2,
+-					    optoff+op[1], &nat->seq[!dir]);
+-			optoff += op[1];
+-		}
+-	}
+-	return 1;
+-}
+-
+-/* TCP sequence number adjustment.  Returns 1 on success, 0 on failure */
+-int
+-nf_nat_seq_adjust(struct sk_buff *skb,
+-		  struct nf_conn *ct,
+-		  enum ip_conntrack_info ctinfo,
+-		  unsigned int protoff)
+-{
+-	struct tcphdr *tcph;
+-	int dir;
+-	__be32 newseq, newack;
+-	s32 seqoff, ackoff;
+-	struct nf_conn_nat *nat = nfct_nat(ct);
+-	struct nf_nat_seq *this_way, *other_way;
+-	int res;
+-
+-	dir = CTINFO2DIR(ctinfo);
+-
+-	this_way = &nat->seq[dir];
+-	other_way = &nat->seq[!dir];
+-
+-	if (!skb_make_writable(skb, protoff + sizeof(*tcph)))
+-		return 0;
+-
+-	tcph = (void *)skb->data + protoff;
+-	spin_lock_bh(&ct->lock);
+-	if (after(ntohl(tcph->seq), this_way->correction_pos))
+-		seqoff = this_way->offset_after;
+-	else
+-		seqoff = this_way->offset_before;
+-
+-	if (after(ntohl(tcph->ack_seq) - other_way->offset_before,
+-		  other_way->correction_pos))
+-		ackoff = other_way->offset_after;
+-	else
+-		ackoff = other_way->offset_before;
+-
+-	newseq = htonl(ntohl(tcph->seq) + seqoff);
+-	newack = htonl(ntohl(tcph->ack_seq) - ackoff);
+-
+-	inet_proto_csum_replace4(&tcph->check, skb, tcph->seq, newseq, 0);
+-	inet_proto_csum_replace4(&tcph->check, skb, tcph->ack_seq, newack, 0);
+-
+-	pr_debug("Adjusting sequence number from %u->%u, ack from %u->%u\n",
+-		 ntohl(tcph->seq), ntohl(newseq), ntohl(tcph->ack_seq),
+-		 ntohl(newack));
+-
+-	tcph->seq = newseq;
+-	tcph->ack_seq = newack;
+-
+-	res = nf_nat_sack_adjust(skb, protoff, tcph, ct, ctinfo);
+-	spin_unlock_bh(&ct->lock);
+-
+-	return res;
+-}
+-
+ /* Setup NAT on this expected conntrack so it follows master. */
+ /* If we fail to get a free NAT slot, we'll get dropped on confirm */
+ void nf_nat_follow_master(struct nf_conn *ct,
+diff --git a/net/netfilter/nf_nat_sip.c b/net/netfilter/nf_nat_sip.c
+index dac11f73868e..f9790405b7ff 100644
+--- a/net/netfilter/nf_nat_sip.c
++++ b/net/netfilter/nf_nat_sip.c
+@@ -20,6 +20,7 @@
+ #include <net/netfilter/nf_nat_helper.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_expect.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
+ #include <linux/netfilter/nf_conntrack_sip.h>
+ 
+ MODULE_LICENSE("GPL");
+@@ -308,7 +309,7 @@ static void nf_nat_sip_seq_adjust(struct sk_buff *skb, unsigned int protoff,
+ 		return;
+ 
+ 	th = (struct tcphdr *)(skb->data + protoff);
+-	nf_nat_set_seq_adjust(ct, ctinfo, th->seq, off);
++	nf_ct_seqadj_set(ct, ctinfo, th->seq, off);
+ }
+ 
+ /* Handles expected signalling connections and media streams */
+diff --git a/net/netfilter/nfnetlink_queue_ct.c b/net/netfilter/nfnetlink_queue_ct.c
+index ab61d66bc0b9..2cb9a280b538 100644
+--- a/net/netfilter/nfnetlink_queue_ct.c
++++ b/net/netfilter/nfnetlink_queue_ct.c
+@@ -87,12 +87,12 @@ nla_put_failure:
+ void nfqnl_ct_seq_adjust(struct sk_buff *skb, struct nf_conn *ct,
+ 			 enum ip_conntrack_info ctinfo, int diff)
+ {
+-	struct nfq_ct_nat_hook *nfq_nat_ct;
++	struct nfq_ct_hook *nfq_ct;
+ 
+-	nfq_nat_ct = rcu_dereference(nfq_ct_nat_hook);
+-	if (nfq_nat_ct == NULL)
++	nfq_ct = rcu_dereference(nfq_ct_hook);
++	if (nfq_ct == NULL)
+ 		return;
+ 
+ 	if ((ct->status & IPS_NAT_MASK) && diff)
+-		nfq_nat_ct->seq_adjust(skb, ct, ctinfo, diff);
++		nfq_ct->seq_adjust(skb, ct, ctinfo, diff);
+ }
