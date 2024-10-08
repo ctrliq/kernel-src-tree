@@ -1,0 +1,739 @@
+mei: bus: use mei_cl_bus_ prefix consistently
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit ae48d74dfcb55d508404135ce2807d59e93bd46f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ae48d74d.failed
+
+Use mei_cl_bus_ for internal bus function consistently.
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ae48d74dfcb55d508404135ce2807d59e93bd46f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/bus-fixup.c
+#	drivers/misc/mei/bus.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/bus-fixup.c
+index 2b65e8021f0d,020de5919c21..000000000000
+--- a/drivers/misc/mei/bus-fixup.c
++++ b/drivers/misc/mei/bus-fixup.c
+@@@ -309,249 -167,140 +309,258 @@@ err
+  	return ret;
+  }
+  
+ -/**
+ - * mei_nfc_radio_name - derive nfc radio name from the interface version
+ - *
+ - * @ver: NFC radio version
+ - *
+ - * Return: radio name string
+ - */
+ -static const char *mei_nfc_radio_name(struct mei_nfc_if_version *ver)
+ +static int mei_nfc_enable(struct mei_cl_device *cldev)
+  {
+ +	struct mei_device *dev;
+ +	struct mei_nfc_dev *ndev = &nfc_dev;
+ +	int ret;
+  
+ -	if (ver->vendor_id == MEI_NFC_VENDOR_INSIDE) {
+ -		if (ver->radio_type == MEI_NFC_VENDOR_INSIDE_UREAD)
+ -			return "microread";
+ -	}
+ +	dev = ndev->cl->dev;
+  
+ -	if (ver->vendor_id == MEI_NFC_VENDOR_NXP) {
+ -		if (ver->radio_type == MEI_NFC_VENDOR_NXP_PN544)
+ -			return "pn544";
+ +	ret = mei_nfc_connect(ndev);
+ +	if (ret < 0) {
+ +		dev_err(&dev->pdev->dev, "Could not connect to NFC");
+ +		return ret;
+  	}
+  
+ -	return NULL;
+ +	return 0;
+  }
+  
+ -/**
+ - * mei_nfc - The nfc fixup function. The function retrieves nfc radio
+ - *    name and set is as device attribute so we can load
+ - *    the proper device driver for it
+ - *
+ - * @cldev: me client device (nfc)
+ - */
+ -static void mei_nfc(struct mei_cl_device *cldev)
+ +static int mei_nfc_disable(struct mei_cl_device *cldev)
+  {
+ -	struct mei_device *bus;
+ -	struct mei_cl *cl;
+ -	struct mei_me_client *me_cl = NULL;
+ -	struct mei_nfc_if_version ver;
+ -	const char *radio_name = NULL;
+ -	int ret;
+ -
+ -	bus = cldev->bus;
+ +	return 0;
+ +}
+  
+ -	dev_dbg(bus->dev, "running hook %s: %pUl match=%d\n",
+ -		__func__, mei_me_cl_uuid(cldev->me_cl), cldev->do_match);
+ +static int mei_nfc_send(struct mei_cl_device *cldev, u8 *buf, size_t length)
+ +{
+ +	struct mei_device *dev;
+ +	struct mei_nfc_dev *ndev;
+ +	struct mei_nfc_hci_hdr *hdr;
+ +	u8 *mei_buf;
+ +	int err;
+  
+ -	mutex_lock(&bus->device_lock);
+ -	/* we need to connect to INFO GUID */
+ -	cl = mei_cl_alloc_linked(bus, MEI_HOST_CLIENT_ID_ANY);
+ -	if (IS_ERR(cl)) {
+ -		ret = PTR_ERR(cl);
+ -		cl = NULL;
+ -		dev_err(bus->dev, "nfc hook alloc failed %d\n", ret);
+ -		goto out;
+ -	}
+ +	ndev = (struct mei_nfc_dev *) cldev->priv_data;
+ +	dev = ndev->cl->dev;
+  
+ -	me_cl = mei_me_cl_by_uuid(bus, &mei_nfc_info_guid);
+ -	if (!me_cl) {
+ -		ret = -ENOTTY;
+ -		dev_err(bus->dev, "Cannot find nfc info %d\n", ret);
+ -		goto out;
+ -	}
+ +	mei_buf = kzalloc(length + MEI_NFC_HEADER_SIZE, GFP_KERNEL);
+ +	if (!mei_buf)
+ +		return -ENOMEM;
+  
+ -	ret = mei_cl_connect(cl, me_cl, NULL);
+ -	if (ret < 0) {
+ -		dev_err(&cldev->dev, "Can't connect to the NFC INFO ME ret = %d\n",
+ -			ret);
+ -		goto out;
+ -	}
+ +	hdr = (struct mei_nfc_hci_hdr *) mei_buf;
+ +	hdr->cmd = MEI_NFC_CMD_HCI_SEND;
+ +	hdr->status = 0;
+ +	hdr->req_id = ndev->req_id;
+ +	hdr->reserved = 0;
+ +	hdr->data_size = length;
+  
+ -	mutex_unlock(&bus->device_lock);
+ +	memcpy(mei_buf + MEI_NFC_HEADER_SIZE, buf, length);
+  
+ -	ret = mei_nfc_if_version(cl, &ver);
+ -	if (ret)
+ -		goto disconnect;
+ +	err = __mei_cl_send(ndev->cl, mei_buf, length + MEI_NFC_HEADER_SIZE);
+ +	if (err < 0)
+ +		return err;
+  
+ -	radio_name = mei_nfc_radio_name(&ver);
+ +	kfree(mei_buf);
+  
+ -	if (!radio_name) {
+ -		ret = -ENOENT;
+ -		dev_err(&cldev->dev, "Can't get the NFC interface version ret = %d\n",
+ -			ret);
+ -		goto disconnect;
+ +	if (!wait_event_interruptible_timeout(ndev->send_wq,
+ +				ndev->recv_req_id == ndev->req_id, HZ)) {
+ +		dev_err(&dev->pdev->dev, "NFC MEI command timeout\n");
+ +		err = -ETIME;
+ +	} else {
+ +		ndev->req_id++;
+  	}
+  
+ -	dev_dbg(bus->dev, "nfc radio %s\n", radio_name);
+ -	strlcpy(cldev->name, radio_name, sizeof(cldev->name));
+ +	return err;
+ +}
+  
+ -disconnect:
+ -	mutex_lock(&bus->device_lock);
+ -	if (mei_cl_disconnect(cl) < 0)
+ -		dev_err(bus->dev, "Can't disconnect the NFC INFO ME\n");
+ +static int mei_nfc_recv(struct mei_cl_device *cldev, u8 *buf, size_t length)
+ +{
+ +	struct mei_nfc_dev *ndev;
+ +	struct mei_nfc_hci_hdr *hci_hdr;
+ +	int received_length;
+  
+ -	mei_cl_flush_queues(cl, NULL);
+ +	ndev = (struct mei_nfc_dev *)cldev->priv_data;
+  
+ -out:
+ -	mei_cl_unlink(cl);
+ -	mutex_unlock(&bus->device_lock);
+ -	mei_me_cl_put(me_cl);
+ -	kfree(cl);
+ +	received_length = __mei_cl_recv(ndev->cl, buf, length);
+ +	if (received_length < 0)
+ +		return received_length;
+  
+ -	if (ret)
+ -		cldev->do_match = 0;
+ +	hci_hdr = (struct mei_nfc_hci_hdr *) buf;
+  
+ -	dev_dbg(bus->dev, "end of fixup match = %d\n", cldev->do_match);
+ -}
+ +	if (hci_hdr->cmd == MEI_NFC_CMD_HCI_SEND) {
+ +		ndev->recv_req_id = hci_hdr->req_id;
+ +		wake_up(&ndev->send_wq);
+  
+ -#define MEI_FIXUP(_uuid, _hook) { _uuid, _hook }
+ +		return 0;
+ +	}
+  
+ -static struct mei_fixup {
+ +	return received_length;
+ +}
+  
+ -	const uuid_le uuid;
+ -	void (*hook)(struct mei_cl_device *cldev);
+ -} mei_fixups[] = {
+ -	MEI_FIXUP(MEI_UUID_ANY, number_of_connections),
+ -	MEI_FIXUP(MEI_UUID_NFC_INFO, blacklist),
+ -	MEI_FIXUP(MEI_UUID_NFC_HCI, mei_nfc),
+ +static struct mei_cl_ops nfc_ops = {
+ +	.enable = mei_nfc_enable,
+ +	.disable = mei_nfc_disable,
+ +	.send = mei_nfc_send,
+ +	.recv = mei_nfc_recv,
+  };
+  
+++<<<<<<< HEAD
+ +static void mei_nfc_init(struct work_struct *work)
+++=======
++ /**
++  * mei_cldev_fixup - run fixup handlers
++  *
++  * @cldev: me client device
++  */
++ void mei_cl_bus_dev_fixup(struct mei_cl_device *cldev)
+++>>>>>>> ae48d74dfcb5 (mei: bus: use mei_cl_bus_ prefix consistently)
+ +{
+ +	struct mei_device *dev;
+ +	struct mei_cl_device *cldev;
+ +	struct mei_nfc_dev *ndev;
+ +	struct mei_cl *cl_info;
+ +
+ +	ndev = container_of(work, struct mei_nfc_dev, init_work);
+ +
+ +	cl_info = ndev->cl_info;
+ +	dev = cl_info->dev;
+ +
+ +	mutex_lock(&dev->device_lock);
+ +
+ +	if (mei_cl_connect(cl_info, NULL) < 0) {
+ +		mutex_unlock(&dev->device_lock);
+ +		dev_err(&dev->pdev->dev,
+ +			"Could not connect to the NFC INFO ME client");
+ +
+ +		goto err;
+ +	}
+ +
+ +	mutex_unlock(&dev->device_lock);
+ +
+ +	if (mei_nfc_if_version(ndev) < 0) {
+ +		dev_err(&dev->pdev->dev, "Could not get the NFC interface version");
+ +
+ +		goto err;
+ +	}
+ +
+ +	dev_info(&dev->pdev->dev,
+ +		"NFC MEI VERSION: IVN 0x%x Vendor ID 0x%x Type 0x%x\n",
+ +		ndev->fw_ivn, ndev->vendor_id, ndev->radio_type);
+ +
+ +	mutex_lock(&dev->device_lock);
+ +
+ +	if (mei_cl_disconnect(cl_info) < 0) {
+ +		mutex_unlock(&dev->device_lock);
+ +		dev_err(&dev->pdev->dev,
+ +			"Could not disconnect the NFC INFO ME client");
+ +
+ +		goto err;
+ +	}
+ +
+ +	mutex_unlock(&dev->device_lock);
+ +
+ +	if (mei_nfc_build_bus_name(ndev) < 0) {
+ +		dev_err(&dev->pdev->dev,
+ +			"Could not build the bus ID name\n");
+ +		return;
+ +	}
+ +
+ +	cldev = mei_cl_add_device(dev, mei_nfc_guid, ndev->bus_name, &nfc_ops);
+ +	if (!cldev) {
+ +		dev_err(&dev->pdev->dev,
+ +			"Could not add the NFC device to the MEI bus\n");
+ +
+ +		goto err;
+ +	}
+ +
+ +	cldev->priv_data = ndev;
+ +
+ +
+ +	return;
+ +
+ +err:
+ +	mutex_lock(&dev->device_lock);
+ +	mei_nfc_free(ndev);
+ +	mutex_unlock(&dev->device_lock);
+ +
+ +}
+ +
+ +
+ +int mei_nfc_host_init(struct mei_device *dev)
+  {
+ -	struct mei_fixup *f;
+ -	const uuid_le *uuid = mei_me_cl_uuid(cldev->me_cl);
+ -	int i;
+ +	struct mei_nfc_dev *ndev = &nfc_dev;
+ +	struct mei_cl *cl_info, *cl = NULL;
+ +	int i, ret;
+ +
+ +	/* already initialized */
+ +	if (ndev->cl_info)
+ +		return 0;
+  
+ -	for (i = 0; i < ARRAY_SIZE(mei_fixups); i++) {
+ +	ndev->cl_info = mei_cl_allocate(dev);
+ +	ndev->cl = mei_cl_allocate(dev);
+  
+ -		f = &mei_fixups[i];
+ -		if (uuid_le_cmp(f->uuid, MEI_UUID_ANY) == 0 ||
+ -		    uuid_le_cmp(f->uuid, *uuid) == 0)
+ -			f->hook(cldev);
+ +	cl = ndev->cl;
+ +	cl_info = ndev->cl_info;
+ +
+ +	if (!cl || !cl_info) {
+ +		ret = -ENOMEM;
+ +		goto err;
+  	}
+ +
+ +	/* check for valid client id */
+ +	i = mei_me_cl_by_uuid(dev, &mei_nfc_info_guid);
+ +	if (i < 0) {
+ +		dev_info(&dev->pdev->dev, "nfc: failed to find the client\n");
+ +		ret = -ENOTTY;
+ +		goto err;
+ +	}
+ +
+ +	cl_info->me_client_id = dev->me_clients[i].client_id;
+ +
+ +	ret = mei_cl_link(cl_info, MEI_HOST_CLIENT_ID_ANY);
+ +	if (ret)
+ +		goto err;
+ +
+ +	cl_info->device_uuid = mei_nfc_info_guid;
+ +
+ +	list_add_tail(&cl_info->device_link, &dev->device_list);
+ +
+ +	/* check for valid client id */
+ +	i = mei_me_cl_by_uuid(dev, &mei_nfc_guid);
+ +	if (i < 0) {
+ +		dev_info(&dev->pdev->dev, "nfc: failed to find the client\n");
+ +		ret = -ENOTTY;
+ +		goto err;
+ +	}
+ +
+ +	cl->me_client_id = dev->me_clients[i].client_id;
+ +
+ +	ret = mei_cl_link(cl, MEI_HOST_CLIENT_ID_ANY);
+ +	if (ret)
+ +		goto err;
+ +
+ +	cl->device_uuid = mei_nfc_guid;
+ +
+ +
+ +	list_add_tail(&cl->device_link, &dev->device_list);
+ +
+ +	ndev->req_id = 1;
+ +
+ +	INIT_WORK(&ndev->init_work, mei_nfc_init);
+ +	init_waitqueue_head(&ndev->send_wq);
+ +	schedule_work(&ndev->init_work);
+ +
+ +	return 0;
+ +
+ +err:
+ +	mei_nfc_free(ndev);
+ +
+ +	return ret;
+ +}
+ +
+ +void mei_nfc_host_exit(struct mei_device *dev)
+ +{
+ +	struct mei_nfc_dev *ndev = &nfc_dev;
+ +	cancel_work_sync(&ndev->init_work);
+  }
+  
+ +
+diff --cc drivers/misc/mei/bus.c
+index 3365981198e7,832085207a7f..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -140,74 -711,235 +140,266 @@@ static struct bus_type mei_cl_bus_type 
+  	.uevent		= mei_cl_device_uevent,
+  };
+  
+++<<<<<<< HEAD
+ +static void mei_cl_dev_release(struct device *dev)
+++=======
++ static struct mei_device *mei_dev_bus_get(struct mei_device *bus)
++ {
++ 	if (bus)
++ 		get_device(bus->dev);
++ 
++ 	return bus;
++ }
++ 
++ static void mei_dev_bus_put(struct mei_device *bus)
++ {
++ 	if (bus)
++ 		put_device(bus->dev);
++ }
++ 
++ static void mei_cl_bus_dev_release(struct device *dev)
+++>>>>>>> ae48d74dfcb5 (mei: bus: use mei_cl_bus_ prefix consistently)
+  {
+ -	struct mei_cl_device *cldev = to_mei_cl_device(dev);
+ -
+ -	if (!cldev)
+ -		return;
+ -
+ -	mei_me_cl_put(cldev->me_cl);
+ -	mei_dev_bus_put(cldev->bus);
+ -	kfree(cldev);
+ +	kfree(to_mei_cl_device(dev));
+  }
+  
+  static struct device_type mei_cl_device_type = {
+- 	.release	= mei_cl_dev_release,
++ 	.release	= mei_cl_bus_dev_release,
+  };
+  
+++<<<<<<< HEAD
+ +static struct mei_cl *mei_bus_find_mei_cl_by_uuid(struct mei_device *dev,
+ +						uuid_le uuid)
+++=======
++ /**
++  * mei_cl_bus_dev_alloc - initialize and allocate mei client device
++  *
++  * @bus: mei device
++  * @me_cl: me client
++  *
++  * Return: allocated device structur or NULL on allocation failure
++  */
++ static struct mei_cl_device *mei_cl_bus_dev_alloc(struct mei_device *bus,
++ 						  struct mei_me_client *me_cl)
+++>>>>>>> ae48d74dfcb5 (mei: bus: use mei_cl_bus_ prefix consistently)
+  {
+ -	struct mei_cl_device *cldev;
+ +	struct mei_cl *cl;
+  
+ -	cldev = kzalloc(sizeof(struct mei_cl_device), GFP_KERNEL);
+ -	if (!cldev)
+ +	list_for_each_entry(cl, &dev->device_list, device_link) {
+ +		if (!uuid_le_cmp(uuid, cl->device_uuid))
+ +			return cl;
+ +	}
+ +
+ +	return NULL;
+ +}
+ +struct mei_cl_device *mei_cl_add_device(struct mei_device *dev,
+ +					uuid_le uuid, char *name,
+ +					struct mei_cl_ops *ops)
+ +{
+ +	struct mei_cl_device *device;
+ +	struct mei_cl *cl;
+ +	int status;
+ +
+ +	cl = mei_bus_find_mei_cl_by_uuid(dev, uuid);
+ +	if (cl == NULL)
+  		return NULL;
+  
+ -	device_initialize(&cldev->dev);
+ -	cldev->dev.parent = bus->dev;
+ -	cldev->dev.bus    = &mei_cl_bus_type;
+ -	cldev->dev.type   = &mei_cl_device_type;
+ -	cldev->bus        = mei_dev_bus_get(bus);
+ -	cldev->me_cl      = mei_me_cl_get(me_cl);
+ -	cldev->is_added   = 0;
+ -	INIT_LIST_HEAD(&cldev->bus_list);
+ +	device = kzalloc(sizeof(struct mei_cl_device), GFP_KERNEL);
+ +	if (!device)
+ +		return NULL;
+  
+ -	return cldev;
+ -}
+ +	device->cl = cl;
+ +	device->ops = ops;
+  
+++<<<<<<< HEAD
+ +	device->dev.parent = &dev->pdev->dev;
+ +	device->dev.bus = &mei_cl_bus_type;
+ +	device->dev.type = &mei_cl_device_type;
+++=======
++ /**
++  * mei_cl_dev_setup - setup me client device
++  *    run fix up routines and set the device name
++  *
++  * @bus: mei device
++  * @cldev: me client device
++  *
++  * Return: true if the device is eligible for enumeration
++  */
++ static bool mei_cl_bus_dev_setup(struct mei_device *bus,
++ 				 struct mei_cl_device *cldev)
++ {
++ 	cldev->do_match = 1;
++ 	mei_cl_bus_dev_fixup(cldev);
+++>>>>>>> ae48d74dfcb5 (mei: bus: use mei_cl_bus_ prefix consistently)
+  
+ -	if (cldev->do_match)
+ -		dev_set_name(&cldev->dev, "mei:%s:%pUl:%02X",
+ -			     cldev->name,
+ -			     mei_me_cl_uuid(cldev->me_cl),
+ -			     mei_me_cl_ver(cldev->me_cl));
+ +	dev_set_name(&device->dev, "%s", name);
+  
+++<<<<<<< HEAD
+ +	status = device_register(&device->dev);
+ +	if (status) {
+ +		dev_err(&dev->pdev->dev, "Failed to register MEI device\n");
+ +		kfree(device);
+ +		return NULL;
+++=======
++ 	return cldev->do_match == 1;
++ }
++ 
++ /**
++  * mei_cl_bus_dev_add - add me client devices
++  *
++  * @cldev: me client device
++  *
++  * Return: 0 on success; < 0 on failre
++  */
++ static int mei_cl_bus_dev_add(struct mei_cl_device *cldev)
++ {
++ 	int ret;
++ 
++ 	dev_dbg(cldev->bus->dev, "adding %pUL:%02X\n",
++ 		mei_me_cl_uuid(cldev->me_cl),
++ 		mei_me_cl_ver(cldev->me_cl));
++ 	ret = device_add(&cldev->dev);
++ 	if (!ret)
++ 		cldev->is_added = 1;
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * mei_cl_bus_dev_stop - stop the driver
++  *
++  * @cldev: me client device
++  */
++ static void mei_cl_bus_dev_stop(struct mei_cl_device *cldev)
++ {
++ 	if (cldev->is_added)
++ 		device_release_driver(&cldev->dev);
++ }
++ 
++ /**
++  * mei_cl_bus_dev_destroy - destroy me client devices object
++  *
++  * @cldev: me client device
++  */
++ static void mei_cl_bus_dev_destroy(struct mei_cl_device *cldev)
++ {
++ 	if (!cldev->is_added)
++ 		return;
++ 
++ 	device_del(&cldev->dev);
++ 
++ 	mutex_lock(&cldev->bus->cl_bus_lock);
++ 	list_del_init(&cldev->bus_list);
++ 	mutex_unlock(&cldev->bus->cl_bus_lock);
++ 
++ 	cldev->is_added = 0;
++ 	put_device(&cldev->dev);
++ }
++ 
++ /**
++  * mei_cl_bus_remove_device - remove a devices form the bus
++  *
++  * @cldev: me client device
++  */
++ static void mei_cl_bus_remove_device(struct mei_cl_device *cldev)
++ {
++ 	mei_cl_bus_dev_stop(cldev);
++ 	mei_cl_bus_dev_destroy(cldev);
++ }
++ 
++ /**
++  * mei_cl_bus_remove_devices - remove all devices form the bus
++  *
++  * @bus: mei device
++  */
++ void mei_cl_bus_remove_devices(struct mei_device *bus)
++ {
++ 	struct mei_cl_device *cldev, *next;
++ 
++ 	list_for_each_entry_safe(cldev, next, &bus->device_list, bus_list)
++ 		mei_cl_bus_remove_device(cldev);
++ }
++ 
++ 
++ /**
++  * mei_cl_bus_dev_init - allocate and initializes an mei client devices
++  *     based on me client
++  *
++  * @bus: mei device
++  * @me_cl: me client
++  */
++ static void mei_cl_bus_dev_init(struct mei_device *bus,
++ 				struct mei_me_client *me_cl)
++ {
++ 	struct mei_cl_device *cldev;
++ 
++ 	dev_dbg(bus->dev, "initializing %pUl", mei_me_cl_uuid(me_cl));
++ 
++ 	if (me_cl->bus_added)
++ 		return;
++ 
++ 	cldev = mei_cl_bus_dev_alloc(bus, me_cl);
++ 	if (!cldev)
++ 		return;
++ 
++ 	mutex_lock(&cldev->bus->cl_bus_lock);
++ 	me_cl->bus_added = true;
++ 	list_add_tail(&cldev->bus_list, &bus->device_list);
++ 	mutex_unlock(&cldev->bus->cl_bus_lock);
++ 
++ }
++ 
++ /**
++  * mei_cl_bus_rescan - scan me clients list and add create
++  *    devices for eligible clients
++  *
++  * @bus: mei device
++  */
++ void mei_cl_bus_rescan(struct mei_device *bus)
++ {
++ 	struct mei_cl_device *cldev, *n;
++ 	struct mei_me_client *me_cl;
++ 
++ 	down_read(&bus->me_clients_rwsem);
++ 	list_for_each_entry(me_cl, &bus->me_clients, list)
++ 		mei_cl_bus_dev_init(bus, me_cl);
++ 	up_read(&bus->me_clients_rwsem);
++ 
++ 	mutex_lock(&bus->cl_bus_lock);
++ 	list_for_each_entry_safe(cldev, n, &bus->device_list, bus_list) {
++ 
++ 		if (!mei_me_cl_is_active(cldev->me_cl)) {
++ 			mei_cl_bus_remove_device(cldev);
++ 			continue;
++ 		}
++ 
++ 		if (cldev->is_added)
++ 			continue;
++ 
++ 		if (mei_cl_bus_dev_setup(bus, cldev))
++ 			mei_cl_bus_dev_add(cldev);
++ 		else {
++ 			list_del_init(&cldev->bus_list);
++ 			put_device(&cldev->dev);
++ 		}
+++>>>>>>> ae48d74dfcb5 (mei: bus: use mei_cl_bus_ prefix consistently)
+  	}
+ -	mutex_unlock(&bus->cl_bus_lock);
+  
+ -	dev_dbg(bus->dev, "rescan end");
+ +	cl->device = device;
+ +
+ +	dev_dbg(&device->dev, "client %s registered\n", name);
+ +
+ +	return device;
+ +}
+ +EXPORT_SYMBOL_GPL(mei_cl_add_device);
+ +
+ +void mei_cl_remove_device(struct mei_cl_device *device)
+ +{
+ +	device_unregister(&device->dev);
+  }
+ +EXPORT_SYMBOL_GPL(mei_cl_remove_device);
+  
+ -int __mei_cldev_driver_register(struct mei_cl_driver *cldrv,
+ -				struct module *owner)
+ +int __mei_cl_driver_register(struct mei_cl_driver *driver, struct module *owner)
+  {
+  	int err;
+  
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,0f87dffa6be1..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -288,38 -339,14 +288,46 @@@ struct mei_hw_ops 
+  };
+  
+  /* MEI bus API*/
+++<<<<<<< HEAD
+ +
+ +/**
+ + * struct mei_cl_ops - MEI CL device ops
+ + * This structure allows ME host clients to implement technology
+ + * specific operations.
+ + *
+ + * @enable: Enable an MEI CL device. Some devices require specific
+ + *	HECI commands to initialize completely.
+ + * @disable: Disable an MEI CL device.
+ + * @send: Tx hook for the device. This allows ME host clients to trap
+ + *	the device driver buffers before actually physically
+ + *	pushing it to the ME.
+ + * @recv: Rx hook for the device. This allows ME host clients to trap the
+ + *	ME buffers before forwarding them to the device driver.
+ + */
+ +struct mei_cl_ops {
+ +	int (*enable)(struct mei_cl_device *device);
+ +	int (*disable)(struct mei_cl_device *device);
+ +	int (*send)(struct mei_cl_device *device, u8 *buf, size_t length);
+ +	int (*recv)(struct mei_cl_device *device, u8 *buf, size_t length);
+ +};
+ +
+ +struct mei_cl_device *mei_cl_add_device(struct mei_device *dev,
+ +					uuid_le uuid, char *name,
+ +					struct mei_cl_ops *ops);
+ +void mei_cl_remove_device(struct mei_cl_device *device);
+ +
+ +int __mei_cl_async_send(struct mei_cl *cl, u8 *buf, size_t length);
+ +int __mei_cl_send(struct mei_cl *cl, u8 *buf, size_t length);
+ +int __mei_cl_recv(struct mei_cl *cl, u8 *buf, size_t length);
+++=======
++ void mei_cl_bus_rescan(struct mei_device *bus);
++ void mei_cl_bus_dev_fixup(struct mei_cl_device *dev);
++ ssize_t __mei_cl_send(struct mei_cl *cl, u8 *buf, size_t length,
++ 			bool blocking);
++ ssize_t __mei_cl_recv(struct mei_cl *cl, u8 *buf, size_t length);
+++>>>>>>> ae48d74dfcb5 (mei: bus: use mei_cl_bus_ prefix consistently)
+  void mei_cl_bus_rx_event(struct mei_cl *cl);
+ -void mei_cl_bus_notify_event(struct mei_cl *cl);
+ -void mei_cl_bus_remove_devices(struct mei_device *bus);
+ +void mei_cl_bus_remove_devices(struct mei_device *dev);
+  int mei_cl_bus_init(void);
+  void mei_cl_bus_exit(void);
+  
+* Unmerged path drivers/misc/mei/bus-fixup.c
+* Unmerged path drivers/misc/mei/bus.c
+* Unmerged path drivers/misc/mei/mei_dev.h
