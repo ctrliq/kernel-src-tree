@@ -1,0 +1,150 @@
+dm thin: unroll issue_discard() to create longer discard bio chains
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Joe Thornber <ejt@redhat.com>
+commit 202bae52934d4eb79ffaebf49f49b1cc64d8e40b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/202bae52.failed
+
+There is little benefit to doing this but it does structure DM thinp's
+code to more cleanly use the __blkdev_issue_discard() interface --
+particularly in passdown_double_checking_shared_status().
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 202bae52934d4eb79ffaebf49f49b1cc64d8e40b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin.c
+diff --cc drivers/md/dm-thin.c
+index 6c9ed579302c,fc803d50f9f0..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -442,14 -334,55 +442,63 @@@ static sector_t block_to_sectors(struc
+  		(b * pool->sectors_per_block);
+  }
+  
+- static int issue_discard(struct thin_c *tc, dm_block_t data_b, dm_block_t data_e,
+- 			 struct bio *parent_bio)
++ /*----------------------------------------------------------------*/
++ 
++ struct discard_op {
++ 	struct thin_c *tc;
++ 	struct blk_plug plug;
++ 	struct bio *parent_bio;
++ 	struct bio *bio;
++ };
++ 
++ static void begin_discard(struct discard_op *op, struct thin_c *tc, struct bio *parent)
+  {
+++<<<<<<< HEAD
+ +	sector_t s = block_to_sectors(tc->pool, data_b);
+ +	sector_t len = block_to_sectors(tc->pool, data_e - data_b);
+ +
+ +	return __blkdev_issue_discard_async(tc->pool_dev->bdev, s, len,
+ +					    GFP_NOWAIT, 0, parent_bio);
+++=======
++ 	BUG_ON(!parent);
++ 
++ 	op->tc = tc;
++ 	blk_start_plug(&op->plug);
++ 	op->parent_bio = parent;
++ 	op->bio = NULL;
++ }
++ 
++ static int issue_discard(struct discard_op *op, dm_block_t data_b, dm_block_t data_e)
++ {
++ 	struct thin_c *tc = op->tc;
++ 	sector_t s = block_to_sectors(tc->pool, data_b);
++ 	sector_t len = block_to_sectors(tc->pool, data_e - data_b);
++ 
++ 	return __blkdev_issue_discard(tc->pool_dev->bdev, s, len,
++ 				      GFP_NOWAIT, REQ_WRITE | REQ_DISCARD, &op->bio);
++ }
++ 
++ static void end_discard(struct discard_op *op, int r)
++ {
++ 	if (op->bio) {
++ 		/*
++ 		 * Even if one of the calls to issue_discard failed, we
++ 		 * need to wait for the chain to complete.
++ 		 */
++ 		bio_chain(op->bio, op->parent_bio);
++ 		submit_bio(REQ_WRITE | REQ_DISCARD, op->bio);
++ 	}
++ 
++ 	blk_finish_plug(&op->plug);
++ 
++ 	/*
++ 	 * Even if r is set, there could be sub discards in flight that we
++ 	 * need to wait for.
++ 	 */
++ 	if (r && !op->parent_bio->bi_error)
++ 		op->parent_bio->bi_error = r;
++ 	bio_endio(op->parent_bio);
+++>>>>>>> 202bae52934d (dm thin: unroll issue_discard() to create longer discard bio chains)
+  }
+  
+  /*----------------------------------------------------------------*/
+@@@ -1114,19 -1054,21 +1167,29 @@@ static void process_prepared_discard_pa
+  	struct pool *pool = tc->pool;
+  
+  	r = dm_thin_remove_range(tc->td, m->virt_begin, m->virt_end);
+- 	if (r)
++ 	if (r) {
+  		metadata_operation_failed(pool, "dm_thin_remove_range", r);
++ 		bio_io_error(m->bio);
+  
+- 	else if (m->maybe_shared)
+- 		r = passdown_double_checking_shared_status(m);
+- 	else
+- 		r = issue_discard(tc, m->data_block, m->data_block + (m->virt_end - m->virt_begin), m->bio);
++ 	} else if (m->maybe_shared) {
++ 		passdown_double_checking_shared_status(m);
++ 
++ 	} else {
++ 		struct discard_op op;
++ 		begin_discard(&op, tc, m->bio);
++ 		r = issue_discard(&op, m->data_block,
++ 				  m->data_block + (m->virt_end - m->virt_begin));
++ 		end_discard(&op, r);
++ 	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Even if r is set, there could be sub discards in flight that we
+ +	 * need to wait for.
+ +	 */
+ +	bio_endio(m->bio, r);
+++=======
+++>>>>>>> 202bae52934d (dm thin: unroll issue_discard() to create longer discard bio chains)
+  	cell_defer_no_holder(tc, m->cell);
+  	mempool_free(m, pool->mapping_pool);
+  }
+@@@ -1607,13 -1539,13 +1670,21 @@@ static void break_up_discard_bio(struc
+  
+  		/*
+  		 * The parent bio must not complete before sub discard bios are
+++<<<<<<< HEAD
+ +		 * chained to it (see __blkdev_issue_discard_async's bio_chain)!
+ +		 *
+ +		 * This per-mapping bi_remaining increment is paired with
+ +		 * the implicit decrement that occurs via bio_endio() in
+ +		 * process_prepared_discard_{passdown,no_passdown}.
+++=======
++ 		 * chained to it (see end_discard's bio_chain)!
++ 		 *
++ 		 * This per-mapping bi_remaining increment is paired with
++ 		 * the implicit decrement that occurs via bio_endio() in
++ 		 * end_discard().
+++>>>>>>> 202bae52934d (dm thin: unroll issue_discard() to create longer discard bio chains)
+  		 */
+ -		bio_inc_remaining(bio);
+ +		__bio_inc_remaining(bio);
+  		if (!dm_deferred_set_add_work(pool->all_io_ds, &m->list))
+  			pool->process_prepared_discard(m);
+  
+* Unmerged path drivers/md/dm-thin.c
