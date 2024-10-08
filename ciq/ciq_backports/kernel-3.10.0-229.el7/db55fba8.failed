@@ -1,0 +1,352 @@
+lpfc: Fix SLI4 s abort loop to process all FCP rings and under ring_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [scsi] lpfc 10.2.8000.0: Fix SLI4 s abort loop to process all FCP rings and under ring_lock (Rob Evers) [1088574]
+Rebuild_FUZZ: 92.31%
+commit-author James Smart <james.smart@emulex.com>
+commit db55fba8dc26535d34c00a3b3256da0b48608071
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/db55fba8.failed
+
+Fix SLI4 s abort loop to process all FCP rings and under ring_lock
+
+	Signed-off-by: James Smart <james.smart@emulex.com>
+Reviewed-By: Dick Kennedy <dick.kennedy@emulex.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit db55fba8dc26535d34c00a3b3256da0b48608071)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index 6fc46fa5b770,02d8731eb365..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -820,7 -820,93 +820,95 @@@ lpfc_hba_down_prep(struct lpfc_hba *phb
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_hba_free_post_buf - Perform lpfc uninitialization after HBA reset
++  * @phba: pointer to lpfc HBA data structure.
++  *
++  * This routine will cleanup posted ELS buffers after the HBA is reset
++  * when bringing down the SLI Layer.
++  *
++  *
++  * Return codes
++  *   void.
++  **/
++ static void
++ lpfc_hba_free_post_buf(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_sli *psli = &phba->sli;
++ 	struct lpfc_sli_ring *pring;
++ 	struct lpfc_dmabuf *mp, *next_mp;
++ 	LIST_HEAD(buflist);
++ 	int count;
++ 
++ 	if (phba->sli3_options & LPFC_SLI3_HBQ_ENABLED)
++ 		lpfc_sli_hbqbuf_free_all(phba);
++ 	else {
++ 		/* Cleanup preposted buffers on the ELS ring */
++ 		pring = &psli->ring[LPFC_ELS_RING];
++ 		spin_lock_irq(&phba->hbalock);
++ 		list_splice_init(&pring->postbufq, &buflist);
++ 		spin_unlock_irq(&phba->hbalock);
++ 
++ 		count = 0;
++ 		list_for_each_entry_safe(mp, next_mp, &buflist, list) {
++ 			list_del(&mp->list);
++ 			count++;
++ 			lpfc_mbuf_free(phba, mp->virt, mp->phys);
++ 			kfree(mp);
++ 		}
++ 
++ 		spin_lock_irq(&phba->hbalock);
++ 		pring->postbufq_cnt -= count;
++ 		spin_unlock_irq(&phba->hbalock);
++ 	}
++ }
++ 
++ /**
++  * lpfc_hba_clean_txcmplq - Perform lpfc uninitialization after HBA reset
++  * @phba: pointer to lpfc HBA data structure.
++  *
++  * This routine will cleanup the txcmplq after the HBA is reset when bringing
++  * down the SLI Layer.
++  *
++  * Return codes
++  *   void
++  **/
++ static void
++ lpfc_hba_clean_txcmplq(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_sli *psli = &phba->sli;
++ 	struct lpfc_sli_ring *pring;
++ 	LIST_HEAD(completions);
++ 	int i;
++ 
++ 	for (i = 0; i < psli->num_rings; i++) {
++ 		pring = &psli->ring[i];
++ 		if (phba->sli_rev >= LPFC_SLI_REV4)
++ 			spin_lock_irq(&pring->ring_lock);
++ 		else
++ 			spin_lock_irq(&phba->hbalock);
++ 		/* At this point in time the HBA is either reset or DOA. Either
++ 		 * way, nothing should be on txcmplq as it will NEVER complete.
++ 		 */
++ 		list_splice_init(&pring->txcmplq, &completions);
++ 		pring->txcmplq_cnt = 0;
++ 
++ 		if (phba->sli_rev >= LPFC_SLI_REV4)
++ 			spin_unlock_irq(&pring->ring_lock);
++ 		else
++ 			spin_unlock_irq(&phba->hbalock);
++ 
++ 		/* Cancel all the IOCBs from the completions list */
++ 		lpfc_sli_cancel_iocbs(phba, &completions, IOSTAT_LOCAL_REJECT,
++ 				      IOERR_SLI_ABORTED);
++ 		lpfc_sli_abort_iocb_ring(phba, pring);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> db55fba8dc26 (lpfc: Fix SLI4 s abort loop to process all FCP rings and under ring_lock)
+   * lpfc_hba_down_post_s3 - Perform lpfc uninitialization after HBA reset
+ -	int i;
+   * @phba: pointer to lpfc HBA data structure.
+   *
+   * This routine will do uninitialization after the HBA is reset when bring
+diff --git a/drivers/scsi/lpfc/lpfc_crtn.h b/drivers/scsi/lpfc/lpfc_crtn.h
+index adda0bf7a244..429116a9cb7d 100644
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -289,6 +289,7 @@ int lpfc_sli_issue_iocb(struct lpfc_hba *, uint32_t,
+ void lpfc_sli_pcimem_bcopy(void *, void *, uint32_t);
+ void lpfc_sli_bemem_bcopy(void *, void *, uint32_t);
+ void lpfc_sli_abort_iocb_ring(struct lpfc_hba *, struct lpfc_sli_ring *);
++void lpfc_sli_abort_fcp_rings(struct lpfc_hba *phba);
+ void lpfc_sli_hba_iocb_abort(struct lpfc_hba *);
+ void lpfc_sli_flush_fcp_rings(struct lpfc_hba *);
+ int lpfc_sli_ringpostbuf_put(struct lpfc_hba *, struct lpfc_sli_ring *,
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index db2100db259f..e0b12562df0b 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -3511,20 +3511,63 @@ lpfc_sli_abort_iocb_ring(struct lpfc_hba *phba, struct lpfc_sli_ring *pring)
+ 	/* Error everything on txq and txcmplq
+ 	 * First do the txq.
+ 	 */
+-	spin_lock_irq(&phba->hbalock);
+-	list_splice_init(&pring->txq, &completions);
++	if (phba->sli_rev >= LPFC_SLI_REV4) {
++		spin_lock_irq(&pring->ring_lock);
++		list_splice_init(&pring->txq, &completions);
++		pring->txq_cnt = 0;
++		spin_unlock_irq(&pring->ring_lock);
+ 
+-	/* Next issue ABTS for everything on the txcmplq */
+-	list_for_each_entry_safe(iocb, next_iocb, &pring->txcmplq, list)
+-		lpfc_sli_issue_abort_iotag(phba, pring, iocb);
++		spin_lock_irq(&phba->hbalock);
++		/* Next issue ABTS for everything on the txcmplq */
++		list_for_each_entry_safe(iocb, next_iocb, &pring->txcmplq, list)
++			lpfc_sli_issue_abort_iotag(phba, pring, iocb);
++		spin_unlock_irq(&phba->hbalock);
++	} else {
++		spin_lock_irq(&phba->hbalock);
++		list_splice_init(&pring->txq, &completions);
++		pring->txq_cnt = 0;
+ 
+-	spin_unlock_irq(&phba->hbalock);
++		/* Next issue ABTS for everything on the txcmplq */
++		list_for_each_entry_safe(iocb, next_iocb, &pring->txcmplq, list)
++			lpfc_sli_issue_abort_iotag(phba, pring, iocb);
++		spin_unlock_irq(&phba->hbalock);
++	}
+ 
+ 	/* Cancel all the IOCBs from the completions list */
+ 	lpfc_sli_cancel_iocbs(phba, &completions, IOSTAT_LOCAL_REJECT,
+ 			      IOERR_SLI_ABORTED);
+ }
+ 
++/**
++ * lpfc_sli_abort_fcp_rings - Abort all iocbs in all FCP rings
++ * @phba: Pointer to HBA context object.
++ * @pring: Pointer to driver SLI ring object.
++ *
++ * This function aborts all iocbs in FCP rings and frees all the iocb
++ * objects in txq. This function issues an abort iocb for all the iocb commands
++ * in txcmplq. The iocbs in the txcmplq is not guaranteed to complete before
++ * the return of this function. The caller is not required to hold any locks.
++ **/
++void
++lpfc_sli_abort_fcp_rings(struct lpfc_hba *phba)
++{
++	struct lpfc_sli *psli = &phba->sli;
++	struct lpfc_sli_ring  *pring;
++	uint32_t i;
++
++	/* Look on all the FCP Rings for the iotag */
++	if (phba->sli_rev >= LPFC_SLI_REV4) {
++		for (i = 0; i < phba->cfg_fcp_io_channel; i++) {
++			pring = &psli->ring[i + MAX_SLI3_CONFIGURED_RINGS];
++			lpfc_sli_abort_iocb_ring(phba, pring);
++		}
++	} else {
++		pring = &psli->ring[psli->fcp_ring];
++		lpfc_sli_abort_iocb_ring(phba, pring);
++	}
++}
++
++
+ /**
+  * lpfc_sli_flush_fcp_rings - flush all iocbs in the fcp ring
+  * @phba: Pointer to HBA context object.
+@@ -3542,28 +3585,55 @@ lpfc_sli_flush_fcp_rings(struct lpfc_hba *phba)
+ 	LIST_HEAD(txcmplq);
+ 	struct lpfc_sli *psli = &phba->sli;
+ 	struct lpfc_sli_ring  *pring;
+-
+-	/* Currently, only one fcp ring */
+-	pring = &psli->ring[psli->fcp_ring];
++	uint32_t i;
+ 
+ 	spin_lock_irq(&phba->hbalock);
+-	/* Retrieve everything on txq */
+-	list_splice_init(&pring->txq, &txq);
+-
+-	/* Retrieve everything on the txcmplq */
+-	list_splice_init(&pring->txcmplq, &txcmplq);
+-
+ 	/* Indicate the I/O queues are flushed */
+ 	phba->hba_flag |= HBA_FCP_IOQ_FLUSH;
+ 	spin_unlock_irq(&phba->hbalock);
+ 
+-	/* Flush the txq */
+-	lpfc_sli_cancel_iocbs(phba, &txq, IOSTAT_LOCAL_REJECT,
+-			      IOERR_SLI_DOWN);
++	/* Look on all the FCP Rings for the iotag */
++	if (phba->sli_rev >= LPFC_SLI_REV4) {
++		for (i = 0; i < phba->cfg_fcp_io_channel; i++) {
++			pring = &psli->ring[i + MAX_SLI3_CONFIGURED_RINGS];
++
++			spin_lock_irq(&pring->ring_lock);
++			/* Retrieve everything on txq */
++			list_splice_init(&pring->txq, &txq);
++			/* Retrieve everything on the txcmplq */
++			list_splice_init(&pring->txcmplq, &txcmplq);
++			pring->txq_cnt = 0;
++			pring->txcmplq_cnt = 0;
++			spin_unlock_irq(&pring->ring_lock);
++
++			/* Flush the txq */
++			lpfc_sli_cancel_iocbs(phba, &txq,
++					      IOSTAT_LOCAL_REJECT,
++					      IOERR_SLI_DOWN);
++			/* Flush the txcmpq */
++			lpfc_sli_cancel_iocbs(phba, &txcmplq,
++					      IOSTAT_LOCAL_REJECT,
++					      IOERR_SLI_DOWN);
++		}
++	} else {
++		pring = &psli->ring[psli->fcp_ring];
+ 
+-	/* Flush the txcmpq */
+-	lpfc_sli_cancel_iocbs(phba, &txcmplq, IOSTAT_LOCAL_REJECT,
+-			      IOERR_SLI_DOWN);
++		spin_lock_irq(&phba->hbalock);
++		/* Retrieve everything on txq */
++		list_splice_init(&pring->txq, &txq);
++		/* Retrieve everything on the txcmplq */
++		list_splice_init(&pring->txcmplq, &txcmplq);
++		pring->txq_cnt = 0;
++		pring->txcmplq_cnt = 0;
++		spin_unlock_irq(&phba->hbalock);
++
++		/* Flush the txq */
++		lpfc_sli_cancel_iocbs(phba, &txq, IOSTAT_LOCAL_REJECT,
++				      IOERR_SLI_DOWN);
++		/* Flush the txcmpq */
++		lpfc_sli_cancel_iocbs(phba, &txcmplq, IOSTAT_LOCAL_REJECT,
++				      IOERR_SLI_DOWN);
++	}
+ }
+ 
+ /**
+@@ -6701,7 +6771,6 @@ lpfc_mbox_timeout_handler(struct lpfc_hba *phba)
+ 	LPFC_MBOXQ_t *pmbox = phba->sli.mbox_active;
+ 	MAILBOX_t *mb = &pmbox->u.mb;
+ 	struct lpfc_sli *psli = &phba->sli;
+-	struct lpfc_sli_ring *pring;
+ 
+ 	/* If the mailbox completed, process the completion and return */
+ 	if (lpfc_sli4_process_missed_mbox_completions(phba))
+@@ -6743,8 +6812,7 @@ lpfc_mbox_timeout_handler(struct lpfc_hba *phba)
+ 	psli->sli_flag &= ~LPFC_SLI_ACTIVE;
+ 	spin_unlock_irq(&phba->hbalock);
+ 
+-	pring = &psli->ring[psli->fcp_ring];
+-	lpfc_sli_abort_iocb_ring(phba, pring);
++	lpfc_sli_abort_fcp_rings(phba);
+ 
+ 	lpfc_printf_log(phba, KERN_ERR, LOG_MBOX | LOG_SLI,
+ 			"0345 Resetting board due to mailbox timeout\n");
+@@ -9783,43 +9851,6 @@ abort_iotag_exit:
+ 	return retval;
+ }
+ 
+-/**
+- * lpfc_sli_iocb_ring_abort - Unconditionally abort all iocbs on an iocb ring
+- * @phba: Pointer to HBA context object.
+- * @pring: Pointer to driver SLI ring object.
+- *
+- * This function aborts all iocbs in the given ring and frees all the iocb
+- * objects in txq. This function issues abort iocbs unconditionally for all
+- * the iocb commands in txcmplq. The iocbs in the txcmplq is not guaranteed
+- * to complete before the return of this function. The caller is not required
+- * to hold any locks.
+- **/
+-static void
+-lpfc_sli_iocb_ring_abort(struct lpfc_hba *phba, struct lpfc_sli_ring *pring)
+-{
+-	LIST_HEAD(completions);
+-	struct lpfc_iocbq *iocb, *next_iocb;
+-
+-	if (pring->ringno == LPFC_ELS_RING)
+-		lpfc_fabric_abort_hba(phba);
+-
+-	spin_lock_irq(&phba->hbalock);
+-
+-	/* Take off all the iocbs on txq for cancelling */
+-	list_splice_init(&pring->txq, &completions);
+-	pring->txq_cnt = 0;
+-
+-	/* Next issue ABTS for everything on the txcmplq */
+-	list_for_each_entry_safe(iocb, next_iocb, &pring->txcmplq, list)
+-		lpfc_sli_abort_iotag_issue(phba, pring, iocb);
+-
+-	spin_unlock_irq(&phba->hbalock);
+-
+-	/* Cancel all the IOCBs from the completions list */
+-	lpfc_sli_cancel_iocbs(phba, &completions, IOSTAT_LOCAL_REJECT,
+-			      IOERR_SLI_ABORTED);
+-}
+-
+ /**
+  * lpfc_sli_hba_iocb_abort - Abort all iocbs to an hba.
+  * @phba: pointer to lpfc HBA data structure.
+@@ -9835,7 +9866,7 @@ lpfc_sli_hba_iocb_abort(struct lpfc_hba *phba)
+ 
+ 	for (i = 0; i < psli->num_rings; i++) {
+ 		pring = &psli->ring[i];
+-		lpfc_sli_iocb_ring_abort(phba, pring);
++		lpfc_sli_abort_iocb_ring(phba, pring);
+ 	}
+ }
+ 
