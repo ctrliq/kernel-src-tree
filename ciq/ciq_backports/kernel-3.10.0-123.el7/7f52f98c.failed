@@ -1,0 +1,230 @@
+blk-throttle: implement dispatch looping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 7f52f98c2a83339b89a27d01296354e5dbb90ad0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/7f52f98c.failed
+
+throtl_select_dispatch() only dispatches throtl_quantum bios on each
+invocation.  blk_throtl_dispatch_work_fn() in turn depends on
+throtl_schedule_next_dispatch() scheduling the next dispatch window
+immediately so that undue delays aren't incurred.  This effectively
+chains multiple dispatch work item executions back-to-back when there
+are more than throtl_quantum bios to dispatch on a given tick.
+
+There is no reason to finish the current work item just to repeat it
+immediately.  This patch makes throtl_schedule_next_dispatch() return
+%false without doing anything if the current dispatch window is still
+open and updates blk_throtl_dispatch_work_fn() repeat dispatching
+after cpu_relax() on %false return.
+
+This change will help implementing hierarchy support as dispatching
+will be done from pending_timer and immediate reschedule of timer
+function isn't supported and doesn't make much sense.
+
+While this patch changes how dispatch behaves when there are more than
+throtl_quantum bios to dispatch on a single tick, the behavior change
+is immaterial.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Vivek Goyal <vgoyal@redhat.com>
+(cherry picked from commit 7f52f98c2a83339b89a27d01296354e5dbb90ad0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-throttle.c
+diff --cc block/blk-throttle.c
+index e65e45a33372,8ee8e4e0a2ba..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -397,29 -459,49 +397,64 @@@ static void throtl_dequeue_tg(struct th
+  }
+  
+  /* Call with queue lock held */
+ -static void throtl_schedule_pending_timer(struct throtl_service_queue *sq,
+ -					  unsigned long expires)
+ +static void throtl_schedule_delayed_work(struct throtl_data *td,
+ +					 unsigned long delay)
+  {
+ -	mod_timer(&sq->pending_timer, expires);
+ -	throtl_log(sq, "schedule timer. delay=%lu jiffies=%lu",
+ -		   expires - jiffies, jiffies);
+ +	struct delayed_work *dwork = &td->dispatch_work;
+ +
+ +	mod_delayed_work(kthrotld_workqueue, dwork, delay);
+ +	throtl_log(td, "schedule work. delay=%lu jiffies=%lu", delay, jiffies);
+  }
+  
+++<<<<<<< HEAD
+ +static void throtl_schedule_next_dispatch(struct throtl_data *td)
+ +{
+ +	struct throtl_service_queue *sq = &td->service_queue;
+ +
+++=======
++ /**
++  * throtl_schedule_next_dispatch - schedule the next dispatch cycle
++  * @sq: the service_queue to schedule dispatch for
++  * @force: force scheduling
++  *
++  * Arm @sq->pending_timer so that the next dispatch cycle starts on the
++  * dispatch time of the first pending child.  Returns %true if either timer
++  * is armed or there's no pending child left.  %false if the current
++  * dispatch window is still open and the caller should continue
++  * dispatching.
++  *
++  * If @force is %true, the dispatch timer is always scheduled and this
++  * function is guaranteed to return %true.  This is to be used when the
++  * caller can't dispatch itself and needs to invoke pending_timer
++  * unconditionally.  Note that forced scheduling is likely to induce short
++  * delay before dispatch starts even if @sq->first_pending_disptime is not
++  * in the future and thus shouldn't be used in hot paths.
++  */
++ static bool throtl_schedule_next_dispatch(struct throtl_service_queue *sq,
++ 					  bool force)
++ {
+++>>>>>>> 7f52f98c2a83 (blk-throttle: implement dispatch looping)
+  	/* any pending children left? */
+  	if (!sq->nr_pending)
+- 		return;
++ 		return true;
+  
+  	update_min_dispatch_time(sq);
+  
+++<<<<<<< HEAD
+ +	if (time_before_eq(sq->first_pending_disptime, jiffies))
+ +		throtl_schedule_delayed_work(td, 0);
+ +	else
+ +		throtl_schedule_delayed_work(td, sq->first_pending_disptime - jiffies);
+++=======
++ 	/* is the next dispatch time in the future? */
++ 	if (force || time_after(sq->first_pending_disptime, jiffies)) {
++ 		throtl_schedule_pending_timer(sq, sq->first_pending_disptime);
++ 		return true;
++ 	}
++ 
++ 	/* tell the caller to continue dispatching */
++ 	return false;
+++>>>>>>> 7f52f98c2a83 (blk-throttle: implement dispatch looping)
+  }
+  
+  static inline void throtl_start_new_slice(struct throtl_grp *tg, bool rw)
+@@@ -841,28 -935,51 +876,58 @@@ static int throtl_select_dispatch(struc
+  /* work function to dispatch throttled bios */
+  void blk_throtl_dispatch_work_fn(struct work_struct *work)
+  {
+ -	struct throtl_data *td = container_of(work, struct throtl_data,
+ -					      dispatch_work);
+ -	struct throtl_service_queue *sq = &td->service_queue;
+ +	struct throtl_data *td = container_of(to_delayed_work(work),
+ +					      struct throtl_data, dispatch_work);
+  	struct request_queue *q = td->queue;
+- 	unsigned int nr_disp = 0;
+  	struct bio_list bio_list_on_stack;
+  	struct bio *bio;
+  	struct blk_plug plug;
+++<<<<<<< HEAD
+++=======
++ 	bool dispatched = false;
++ 	int rw, ret;
+++>>>>>>> 7f52f98c2a83 (blk-throttle: implement dispatch looping)
+  
+  	spin_lock_irq(q->queue_lock);
+  
+  	bio_list_init(&bio_list_on_stack);
+  
+++<<<<<<< HEAD
+ +	throtl_log(td, "dispatch nr_queued=%u read=%u write=%u",
+ +		   td->nr_queued[READ] + td->nr_queued[WRITE],
+ +		   td->nr_queued[READ], td->nr_queued[WRITE]);
+ +
+ +	nr_disp = throtl_select_dispatch(&td->service_queue, &bio_list_on_stack);
+ +
+ +	if (nr_disp)
+ +		throtl_log(td, "bios disp=%u", nr_disp);
+ +
+ +	throtl_schedule_next_dispatch(td);
+++=======
++ 	while (true) {
++ 		throtl_log(sq, "dispatch nr_queued=%u read=%u write=%u",
++ 			   td->nr_queued[READ] + td->nr_queued[WRITE],
++ 			   td->nr_queued[READ], td->nr_queued[WRITE]);
++ 
++ 		ret = throtl_select_dispatch(sq);
++ 		if (ret) {
++ 			for (rw = READ; rw <= WRITE; rw++) {
++ 				bio_list_merge(&bio_list_on_stack, &sq->bio_lists[rw]);
++ 				bio_list_init(&sq->bio_lists[rw]);
++ 			}
++ 			throtl_log(sq, "bios disp=%u", ret);
++ 			dispatched = true;
++ 		}
++ 
++ 		if (throtl_schedule_next_dispatch(sq, false))
++ 			break;
++ 
++ 		/* this dispatch windows is still open, relax and repeat */
++ 		spin_unlock_irq(q->queue_lock);
++ 		cpu_relax();
++ 		spin_lock_irq(q->queue_lock);
++ 	}
+++>>>>>>> 7f52f98c2a83 (blk-throttle: implement dispatch looping)
+  
+  	spin_unlock_irq(q->queue_lock);
+  
+@@@ -984,8 -1102,8 +1049,13 @@@ static int tg_set_conf(struct cgroup *c
+  	throtl_start_new_slice(tg, 1);
+  
+  	if (tg->flags & THROTL_TG_PENDING) {
+++<<<<<<< HEAD
+ +		tg_update_disptime(tg, &td->service_queue);
+ +		throtl_schedule_next_dispatch(td);
+++=======
++ 		tg_update_disptime(tg);
++ 		throtl_schedule_next_dispatch(sq->parent_sq, true);
+++>>>>>>> 7f52f98c2a83 (blk-throttle: implement dispatch looping)
+  	}
+  
+  	blkg_conf_finish(&ctx);
+@@@ -1127,21 -1244,25 +1197,31 @@@ bool blk_throtl_bio(struct request_queu
+  	}
+  
+  queue_bio:
+ -	throtl_log(sq, "[%c] bio. bdisp=%llu sz=%u bps=%llu iodisp=%u iops=%u queued=%d/%d",
+ -		   rw == READ ? 'R' : 'W',
+ -		   tg->bytes_disp[rw], bio->bi_size, tg->bps[rw],
+ -		   tg->io_disp[rw], tg->iops[rw],
+ -		   sq->nr_queued[READ], sq->nr_queued[WRITE]);
+ +	throtl_log_tg(tg, "[%c] bio. bdisp=%llu sz=%u bps=%llu"
+ +			" iodisp=%u iops=%u queued=%d/%d",
+ +			rw == READ ? 'R' : 'W',
+ +			tg->bytes_disp[rw], bio->bi_size, tg->bps[rw],
+ +			tg->io_disp[rw], tg->iops[rw],
+ +			sq->nr_queued[READ], sq->nr_queued[WRITE]);
+  
+  	bio_associate_current(bio);
+ -	throtl_add_bio_tg(bio, tg);
+ +	throtl_add_bio_tg(bio, tg, &q->td->service_queue);
+  	throttled = true;
+  
+- 	/* update @tg's dispatch time if @tg was empty before @bio */
++ 	/*
++ 	 * Update @tg's dispatch time and force schedule dispatch if @tg
++ 	 * was empty before @bio.  The forced scheduling isn't likely to
++ 	 * cause undue delay as @bio is likely to be dispatched directly if
++ 	 * its @tg's disptime is not in the future.
++ 	 */
+  	if (tg->flags & THROTL_TG_WAS_EMPTY) {
+++<<<<<<< HEAD
+ +		tg_update_disptime(tg, &td->service_queue);
+ +		throtl_schedule_next_dispatch(td);
+++=======
++ 		tg_update_disptime(tg);
++ 		throtl_schedule_next_dispatch(tg->service_queue.parent_sq, true);
+++>>>>>>> 7f52f98c2a83 (blk-throttle: implement dispatch looping)
+  	}
+  
+  out_unlock:
+* Unmerged path block/blk-throttle.c
