@@ -1,0 +1,280 @@
+locks: plumb a "priv" pointer into the setlease routines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jeff Layton <jlayton@primarydata.com>
+commit e6f5c78930e409f3a6b37f5484313a416359ac7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e6f5c789.failed
+
+In later patches, we're going to add a new lock_manager_operation to
+finish setting up the lease while still holding the i_lock.  To do
+this, we'll need to pass a little bit of info in the fcntl setlease
+case (primarily an fasync structure). Plumb the extra pointer into
+there in advance of that.
+
+We declare this pointer as a void ** to make it clear that this is
+private info, and that the caller isn't required to set this unless
+the lm_setup specifically requires it.
+
+	Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit e6f5c78930e409f3a6b37f5484313a416359ac7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/libfs.c
+#	fs/locks.c
+#	fs/nfsd/nfs4state.c
+#	include/linux/fs.h
+diff --cc fs/libfs.c
+index 0431513baf08,171d2846f2a3..000000000000
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@@ -1065,3 -1075,21 +1065,24 @@@ struct inode *alloc_anon_inode(struct s
+  	return inode;
+  }
+  EXPORT_SYMBOL(alloc_anon_inode);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * simple_nosetlease - generic helper for prohibiting leases
++  * @filp: file pointer
++  * @arg: type of lease to obtain
++  * @flp: new lease supplied for insertion
++  * @priv: private data for lm_setup operation
++  *
++  * Generic helper for filesystems that do not wish to allow leases to be set.
++  * All arguments are ignored and it just returns -EINVAL.
++  */
++ int
++ simple_nosetlease(struct file *filp, long arg, struct file_lock **flp,
++ 		  void **priv)
++ {
++ 	return -EINVAL;
++ }
++ EXPORT_SYMBOL(simple_nosetlease);
+++>>>>>>> e6f5c78930e4 (locks: plumb a "priv" pointer into the setlease routines)
+diff --cc fs/locks.c
+index 539c15f0037d,4fa269b0bdef..000000000000
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@@ -1606,7 -1630,7 +1606,11 @@@ generic_add_lease(struct file *filp, lo
+  	smp_mb();
+  	error = check_conflicting_open(dentry, arg);
+  	if (error)
+++<<<<<<< HEAD
+ +		locks_unlink_lock(flp);
+++=======
++ 		goto out_unlink;
+++>>>>>>> e6f5c78930e4 (locks: plumb a "priv" pointer into the setlease routines)
+  out:
+  	if (is_deleg)
+  		mutex_unlock(&inode->i_mutex);
+@@@ -1675,42 -1704,31 +1684,57 @@@ int generic_setlease(struct file *filp
+  }
+  EXPORT_SYMBOL(generic_setlease);
+  
+- static int __vfs_setlease(struct file *filp, long arg, struct file_lock **lease)
++ static int
++ __vfs_setlease(struct file *filp, long arg, struct file_lock **lease, void **priv)
+  {
+++<<<<<<< HEAD
+ +	if (filp->f_op && filp->f_op->setlease)
+ +		return filp->f_op->setlease(filp, arg, lease);
+++=======
++ 	if (filp->f_op->setlease)
++ 		return filp->f_op->setlease(filp, arg, lease, priv);
+++>>>>>>> e6f5c78930e4 (locks: plumb a "priv" pointer into the setlease routines)
+  	else
+- 		return generic_setlease(filp, arg, lease);
++ 		return generic_setlease(filp, arg, lease, priv);
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + *	vfs_setlease        -       sets a lease on an open file
+ + *	@filp: file pointer
+ + *	@arg: type of lease to obtain
+ + *	@lease: file_lock to use
+++=======
++  * vfs_setlease        -       sets a lease on an open file
++  * @filp: file pointer
++  * @arg: type of lease to obtain
++  * @lease: file_lock to use when adding a lease
++  * @priv: private info for lm_setup when adding a lease
+ - *
+ - * Call this to establish a lease on the file. The "lease" argument is not
+ - * used for F_UNLCK requests and may be NULL. For commands that set or alter
+ - * an existing lease, the (*lease)->fl_lmops->lm_break operation must be set;
+ - * if not, this function will return -ENOLCK (and generate a scary-looking
+ - * stack trace).
+++>>>>>>> e6f5c78930e4 (locks: plumb a "priv" pointer into the setlease routines)
+ + *
+ + *	Call this to establish a lease on the file.
+ + *	The (*lease)->fl_lmops->lm_break operation must be set; if not,
+ + *	break_lease will oops!
+ + *
+ + *	This will call the filesystem's setlease file method, if
+ + *	defined.  Note that there is no getlease method; instead, the
+ + *	filesystem setlease method should call back to setlease() to
+ + *	add a lease to the inode's lease list, where fcntl_getlease() can
+ + *	find it.  Since fcntl_getlease() only reports whether the current
+ + *	task holds a lease, a cluster filesystem need only do this for
+ + *	leases held by processes on this node.
+ + *
+ + *	There is also no break_lease method; filesystems that
+ + *	handle their own leases should break leases themselves from the
+ + *	filesystem's open, create, and (on truncate) setattr methods.
+ + *
+ + *	Warning: the only current setlease methods exist only to disable
+ + *	leases in certain cases.  More vfs changes may be required to
+ + *	allow a full filesystem lease implementation.
+   */
+  
+- int vfs_setlease(struct file *filp, long arg, struct file_lock **lease)
++ int
++ vfs_setlease(struct file *filp, long arg, struct file_lock **lease, void **priv)
+  {
+  	struct inode *inode = file_inode(filp);
+  	int error;
+@@@ -1741,14 -1759,11 +1765,22 @@@ static int do_fcntl_add_lease(unsigned 
+  	}
+  	ret = fl;
+  	spin_lock(&inode->i_lock);
+++<<<<<<< HEAD
+ +	error = __vfs_setlease(filp, arg, &ret);
+ +	if (error) {
+ +		spin_unlock(&inode->i_lock);
+ +		locks_free_lock(fl);
+ +		goto out_free_fasync;
+ +	}
+ +	if (ret != fl)
+ +		locks_free_lock(fl);
+++=======
++ 	error = __vfs_setlease(filp, arg, &ret, NULL);
++ 	if (error)
++ 		goto out_unlock;
++ 	if (ret == fl)
++ 		fl = NULL;
+++>>>>>>> e6f5c78930e4 (locks: plumb a "priv" pointer into the setlease routines)
+  
+  	/*
+  	 * fasync_insert_entry() returns the old entry if any.
+diff --cc fs/nfsd/nfs4state.c
+index 3e7464bc7f87,7c803db2a027..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -3837,7 -3791,8 +3837,12 @@@ static int nfs4_setlease(struct nfs4_de
+  		return -EBADF;
+  	}
+  	fl->fl_file = filp;
+++<<<<<<< HEAD
+ +	status = vfs_setlease(filp, fl->fl_type, &fl);
+++=======
++ 	ret = fl;
++ 	status = vfs_setlease(filp, fl->fl_type, &fl, NULL);
+++>>>>>>> e6f5c78930e4 (locks: plumb a "priv" pointer into the setlease routines)
+  	if (status) {
+  		locks_free_lock(fl);
+  		goto out_fput;
+diff --cc include/linux/fs.h
+index aca276e78a8a,f1870eb67b02..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1055,13 -982,12 +1055,13 @@@ extern int vfs_cancel_lock(struct file 
+  extern int flock_lock_file_wait(struct file *filp, struct file_lock *fl);
+  extern int __break_lease(struct inode *inode, unsigned int flags, unsigned int type);
+  extern void lease_get_mtime(struct inode *, struct timespec *time);
+- extern int generic_setlease(struct file *, long, struct file_lock **);
+- extern int vfs_setlease(struct file *, long, struct file_lock **);
++ extern int generic_setlease(struct file *, long, struct file_lock **, void **priv);
++ extern int vfs_setlease(struct file *, long, struct file_lock **, void **);
+  extern int lease_modify(struct file_lock **, int);
+ +extern int lock_may_read(struct inode *, loff_t start, unsigned long count);
+ +extern int lock_may_write(struct inode *, loff_t start, unsigned long count);
+  #else /* !CONFIG_FILE_LOCKING */
+ -static inline int fcntl_getlk(struct file *file, unsigned int cmd,
+ -			      struct flock __user *user)
+ +static inline int fcntl_getlk(struct file *file, struct flock __user *user)
+  {
+  	return -EINVAL;
+  }
+@@@ -2746,7 -2597,10 +2746,12 @@@ extern int simple_write_begin(struct fi
+  extern int simple_write_end(struct file *file, struct address_space *mapping,
+  			loff_t pos, unsigned len, unsigned copied,
+  			struct page *page, void *fsdata);
+ -extern int always_delete_dentry(const struct dentry *);
+  extern struct inode *alloc_anon_inode(struct super_block *);
+++<<<<<<< HEAD
+++=======
++ extern int simple_nosetlease(struct file *, long, struct file_lock **, void **);
++ extern const struct dentry_operations simple_dentry_operations;
+++>>>>>>> e6f5c78930e4 (locks: plumb a "priv" pointer into the setlease routines)
+  
+  extern struct dentry *simple_lookup(struct inode *, struct dentry *, unsigned int flags);
+  extern ssize_t generic_read_dir(struct file *, char __user *, size_t, loff_t *);
+diff --git a/Documentation/filesystems/Locking b/Documentation/filesystems/Locking
+index 4282d5731b47..af63b7f9e0d8 100644
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -459,7 +459,7 @@ prototypes:
+ 			size_t, unsigned int);
+ 	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *,
+ 			size_t, unsigned int);
+-	int (*setlease)(struct file *, long, struct file_lock **);
++	int (*setlease)(struct file *, long, struct file_lock **, void **);
+ 	long (*fallocate)(struct file *, int, loff_t, loff_t);
+ };
+ 
+diff --git a/Documentation/filesystems/vfs.txt b/Documentation/filesystems/vfs.txt
+index ef86aceb8ccc..49cef1203c04 100644
+--- a/Documentation/filesystems/vfs.txt
++++ b/Documentation/filesystems/vfs.txt
+@@ -822,7 +822,7 @@ struct file_operations {
+ 	int (*flock) (struct file *, int, struct file_lock *);
+ 	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, size_t, unsigned int);
+ 	ssize_t (*splice_read)(struct file *, struct pipe_inode_info *, size_t, unsigned int);
+-	int (*setlease)(struct file *, long arg, struct file_lock **);
++	int (*setlease)(struct file *, long arg, struct file_lock **, void **);
+ 	long (*fallocate)(struct file *, int mode, loff_t offset, loff_t len);
+ };
+ 
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index a2406baee1ae..ed9371c9e0f4 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -787,7 +787,8 @@ static loff_t cifs_llseek(struct file *file, loff_t offset, int whence)
+ 	return generic_file_llseek(file, offset, whence);
+ }
+ 
+-static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
++static int
++cifs_setlease(struct file *file, long arg, struct file_lock **lease, void **priv)
+ {
+ 	/*
+ 	 * Note that this is called by vfs setlease with i_lock held to
+@@ -803,7 +804,7 @@ static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
+ 	if (arg == F_UNLCK ||
+ 	    ((arg == F_RDLCK) && CIFS_CACHE_READ(CIFS_I(inode))) ||
+ 	    ((arg == F_WRLCK) && CIFS_CACHE_WRITE(CIFS_I(inode))))
+-		return generic_setlease(file, arg, lease);
++		return generic_setlease(file, arg, lease, priv);
+ 	else if (tlink_tcon(cfile->tlink)->local_lease &&
+ 		 !CIFS_CACHE_READ(CIFS_I(inode)))
+ 		/*
+@@ -814,7 +815,7 @@ static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
+ 		 * knows that the file won't be changed on the server by anyone
+ 		 * else.
+ 		 */
+-		return generic_setlease(file, arg, lease);
++		return generic_setlease(file, arg, lease, priv);
+ 	else
+ 		return -EAGAIN;
+ }
+* Unmerged path fs/libfs.c
+* Unmerged path fs/locks.c
+* Unmerged path fs/nfsd/nfs4state.c
+* Unmerged path include/linux/fs.h
