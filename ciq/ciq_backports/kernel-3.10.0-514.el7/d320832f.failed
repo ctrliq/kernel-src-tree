@@ -1,0 +1,484 @@
+mei: me_client lookup function to return me_client object
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit d320832f64666089a06778782e42fac29abd7bf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d320832f.failed
+
+For support of dynamic addition and removal of me clients
+it is more convenient to use a list instead of static array
+as is use now.
+As the first step of the transition to the new data structure
+we change the lookup function so it returns me client address
+instead of an index.
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d320832f64666089a06778782e42fac29abd7bf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/bus.c
+diff --cc drivers/misc/mei/bus.c
+index bac5d49667ff,c829676c4716..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -242,12 -242,12 +242,17 @@@ static int ___mei_cl_send(struct mei_c
+  		return -ENODEV;
+  
+  	/* Check if we have an ME client device */
+- 	id = mei_me_cl_by_id(dev, cl->me_client_id);
+- 	if (id < 0)
+- 		return id;
++ 	me_cl = mei_me_cl_by_id(dev, cl->me_client_id);
++ 	if (!me_cl)
++ 		return -ENOTTY;
+  
+++<<<<<<< HEAD
+ +	if (length > dev->me_clients[id].props.max_msg_length)
+ +		return -EINVAL;
+++=======
++ 	if (length > me_cl->props.max_msg_length)
++ 		return -EFBIG;
+++>>>>>>> d320832f6466 (mei: me_client lookup function to return me_client object)
+  
+  	cb = mei_io_cb_init(cl, NULL);
+  	if (!cb)
+diff --git a/drivers/misc/mei/amthif.c b/drivers/misc/mei/amthif.c
+index 48cf2935c66b..9b08ea652168 100644
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@ -69,27 +69,26 @@ void mei_amthif_reset_params(struct mei_device *dev)
+ int mei_amthif_host_init(struct mei_device *dev)
+ {
+ 	struct mei_cl *cl = &dev->iamthif_cl;
++	struct mei_me_client *me_cl;
+ 	unsigned char *msg_buf;
+-	int ret, i;
++	int ret;
+ 
+ 	dev->iamthif_state = MEI_IAMTHIF_IDLE;
+ 
+ 	mei_cl_init(cl, dev);
+ 
+-	i = mei_me_cl_by_uuid(dev, &mei_amthif_guid);
+-	if (i < 0) {
+-		dev_info(&dev->pdev->dev,
+-			"amthif: failed to find the client %d\n", i);
++	me_cl = mei_me_cl_by_uuid(dev, &mei_amthif_guid);
++	if (!me_cl) {
++		dev_info(&dev->pdev->dev, "amthif: failed to find the client");
+ 		return -ENOTTY;
+ 	}
+ 
+-	cl->me_client_id = dev->me_clients[i].client_id;
++	cl->me_client_id = me_cl->client_id;
+ 
+ 	/* Assign iamthif_mtu to the value received from ME  */
+ 
+-	dev->iamthif_mtu = dev->me_clients[i].props.max_msg_length;
+-	dev_dbg(&dev->pdev->dev, "IAMTHIF_MTU = %d\n",
+-			dev->me_clients[i].props.max_msg_length);
++	dev->iamthif_mtu = me_cl->props.max_msg_length;
++	dev_dbg(&dev->pdev->dev, "IAMTHIF_MTU = %d\n", dev->iamthif_mtu);
+ 
+ 	kfree(dev->iamthif_msg_buf);
+ 	dev->iamthif_msg_buf = NULL;
+@@ -158,12 +157,11 @@ struct mei_cl_cb *mei_amthif_find_read_list_entry(struct mei_device *dev,
+ int mei_amthif_read(struct mei_device *dev, struct file *file,
+ 	       char __user *ubuf, size_t length, loff_t *offset)
+ {
+-	int rets;
+-	int wait_ret;
+-	struct mei_cl_cb *cb = NULL;
+ 	struct mei_cl *cl = file->private_data;
++	struct mei_cl_cb *cb;
+ 	unsigned long timeout;
+-	int i;
++	int rets;
++	int wait_ret;
+ 
+ 	/* Only possible if we are in timeout */
+ 	if (!cl) {
+@@ -171,11 +169,6 @@ int mei_amthif_read(struct mei_device *dev, struct file *file,
+ 		return -ETIME;
+ 	}
+ 
+-	i = mei_me_cl_by_id(dev, dev->iamthif_cl.me_client_id);
+-	if (i < 0) {
+-		dev_dbg(&dev->pdev->dev, "amthif client not found.\n");
+-		return -ENOTTY;
+-	}
+ 	dev_dbg(&dev->pdev->dev, "checking amthif data\n");
+ 	cb = mei_amthif_find_read_list_entry(dev, file);
+ 
+* Unmerged path drivers/misc/mei/bus.c
+diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
+index 3be58ecdef41..3af32fb2a168 100644
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -33,18 +33,19 @@
+  *
+  * Locking: called under "dev->device_lock" lock
+  *
+- * returns me client index or -ENOENT if not found
++ * returns me client or NULL if not found
+  */
+-int mei_me_cl_by_uuid(const struct mei_device *dev, const uuid_le *uuid)
++struct mei_me_client *mei_me_cl_by_uuid(const struct mei_device *dev,
++					const uuid_le *uuid)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < dev->me_clients_num; ++i)
+ 		if (uuid_le_cmp(*uuid,
+ 				dev->me_clients[i].props.protocol_name) == 0)
+-			return i;
++			return &dev->me_clients[i];
+ 
+-	return -ENOENT;
++	return NULL;
+ }
+ 
+ 
+@@ -56,18 +57,18 @@ int mei_me_cl_by_uuid(const struct mei_device *dev, const uuid_le *uuid)
+  *
+  * Locking: called under "dev->device_lock" lock
+  *
+- * returns index on success, -ENOENT on failure.
++ * returns me client or NULL if not found
+  */
+ 
+-int mei_me_cl_by_id(struct mei_device *dev, u8 client_id)
++struct mei_me_client *mei_me_cl_by_id(struct mei_device *dev, u8 client_id)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < dev->me_clients_num; i++)
+ 		if (dev->me_clients[i].client_id == client_id)
+-			return i;
++			return &dev->me_clients[i];
+ 
+-	return -ENOENT;
++	return NULL;
+ }
+ 
+ 
+@@ -646,7 +647,6 @@ int mei_cl_flow_ctrl_creds(struct mei_cl *cl)
+ {
+ 	struct mei_device *dev;
+ 	struct mei_me_client *me_cl;
+-	int id;
+ 
+ 	if (WARN_ON(!cl || !cl->dev))
+ 		return -EINVAL;
+@@ -659,13 +659,12 @@ int mei_cl_flow_ctrl_creds(struct mei_cl *cl)
+ 	if (cl->mei_flow_ctrl_creds > 0)
+ 		return 1;
+ 
+-	id = mei_me_cl_by_id(dev, cl->me_client_id);
+-	if (id < 0) {
++	me_cl = mei_me_cl_by_id(dev, cl->me_client_id);
++	if (!me_cl) {
+ 		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+-		return id;
++		return -ENOENT;
+ 	}
+ 
+-	me_cl = &dev->me_clients[id];
+ 	if (me_cl->mei_flow_ctrl_creds) {
+ 		if (WARN_ON(me_cl->props.single_recv_buf == 0))
+ 			return -EINVAL;
+@@ -688,21 +687,19 @@ int mei_cl_flow_ctrl_reduce(struct mei_cl *cl)
+ {
+ 	struct mei_device *dev;
+ 	struct mei_me_client *me_cl;
+-	int id;
+ 
+ 	if (WARN_ON(!cl || !cl->dev))
+ 		return -EINVAL;
+ 
+ 	dev = cl->dev;
+ 
+-	id = mei_me_cl_by_id(dev, cl->me_client_id);
+-	if (id < 0) {
++	me_cl = mei_me_cl_by_id(dev, cl->me_client_id);
++	if (!me_cl) {
+ 		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+-		return id;
++		return -ENOENT;
+ 	}
+ 
+-	me_cl = &dev->me_clients[id];
+-	if (me_cl->props.single_recv_buf != 0) {
++	if (me_cl->props.single_recv_buf) {
+ 		if (WARN_ON(me_cl->mei_flow_ctrl_creds <= 0))
+ 			return -EINVAL;
+ 		me_cl->mei_flow_ctrl_creds--;
+@@ -725,8 +722,8 @@ int mei_cl_read_start(struct mei_cl *cl, size_t length)
+ {
+ 	struct mei_device *dev;
+ 	struct mei_cl_cb *cb;
++	struct mei_me_client *me_cl;
+ 	int rets;
+-	int i;
+ 
+ 	if (WARN_ON(!cl || !cl->dev))
+ 		return -ENODEV;
+@@ -740,8 +737,8 @@ int mei_cl_read_start(struct mei_cl *cl, size_t length)
+ 		cl_dbg(dev, cl, "read is pending.\n");
+ 		return -EBUSY;
+ 	}
+-	i = mei_me_cl_by_id(dev, cl->me_client_id);
+-	if (i < 0) {
++	me_cl = mei_me_cl_by_id(dev, cl->me_client_id);
++	if (!me_cl) {
+ 		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+ 		return  -ENOTTY;
+ 	}
+@@ -760,7 +757,7 @@ int mei_cl_read_start(struct mei_cl *cl, size_t length)
+ 	}
+ 
+ 	/* always allocate at least client max message */
+-	length = max_t(size_t, length, dev->me_clients[i].props.max_msg_length);
++	length = max_t(size_t, length, me_cl->props.max_msg_length);
+ 	rets = mei_io_cb_alloc_resp_buf(cb, length);
+ 	if (rets)
+ 		goto out;
+diff --git a/drivers/misc/mei/client.h b/drivers/misc/mei/client.h
+index bf2b0b1b493d..ddb95b2ee2ac 100644
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@ -24,8 +24,9 @@
+ 
+ #include "mei_dev.h"
+ 
+-int mei_me_cl_by_uuid(const struct mei_device *dev, const uuid_le *cuuid);
+-int mei_me_cl_by_id(struct mei_device *dev, u8 client_id);
++struct mei_me_client *mei_me_cl_by_uuid(const struct mei_device *dev,
++					const uuid_le *cuuid);
++struct mei_me_client *mei_me_cl_by_id(struct mei_device *dev, u8 client_id);
+ 
+ /*
+  * MEI IO Functions
+diff --git a/drivers/misc/mei/hbm.c b/drivers/misc/mei/hbm.c
+index b76b57c71bfa..9fec9cf96504 100644
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -401,25 +401,20 @@ static int mei_hbm_add_single_flow_creds(struct mei_device *dev,
+ 				  struct hbm_flow_control *flow)
+ {
+ 	struct mei_me_client *me_cl;
+-	int id;
+ 
+-	id = mei_me_cl_by_id(dev, flow->me_addr);
+-	if (id < 0) {
++	me_cl = mei_me_cl_by_id(dev, flow->me_addr);
++	if (!me_cl) {
+ 		dev_err(&dev->pdev->dev, "no such me client %d\n",
+ 			flow->me_addr);
+-		return id;
++		return -ENOENT;
+ 	}
+ 
+-	me_cl = &dev->me_clients[id];
+-	if (me_cl->props.single_recv_buf) {
+-		me_cl->mei_flow_ctrl_creds++;
+-		dev_dbg(&dev->pdev->dev, "recv flow ctrl msg ME %d (single).\n",
+-		    flow->me_addr);
+-		dev_dbg(&dev->pdev->dev, "flow control credentials =%d.\n",
+-		    me_cl->mei_flow_ctrl_creds);
+-	} else {
+-		BUG();	/* error in flow control */
+-	}
++	if (WARN_ON(me_cl->props.single_recv_buf == 0))
++		return -EINVAL;
++
++	me_cl->mei_flow_ctrl_creds++;
++	dev_dbg(&dev->pdev->dev, "recv flow ctrl msg ME %d (single) creds = %d.\n",
++	    flow->me_addr, me_cl->mei_flow_ctrl_creds);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/misc/mei/main.c b/drivers/misc/mei/main.c
+index a248b970782a..1d60da2007d0 100644
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@ -326,11 +326,11 @@ static ssize_t mei_write(struct file *file, const char __user *ubuf,
+ 			 size_t length, loff_t *offset)
+ {
+ 	struct mei_cl *cl = file->private_data;
++	struct mei_me_client *me_cl;
+ 	struct mei_cl_cb *write_cb = NULL;
+ 	struct mei_device *dev;
+ 	unsigned long timeout = 0;
+ 	int rets;
+-	int id;
+ 
+ 	if (WARN_ON(!cl || !cl->dev))
+ 		return -ENODEV;
+@@ -344,8 +344,8 @@ static ssize_t mei_write(struct file *file, const char __user *ubuf,
+ 		goto out;
+ 	}
+ 
+-	id = mei_me_cl_by_id(dev, cl->me_client_id);
+-	if (id < 0) {
++	me_cl = mei_me_cl_by_id(dev, cl->me_client_id);
++	if (!me_cl) {
+ 		rets = -ENOTTY;
+ 		goto out;
+ 	}
+@@ -355,7 +355,7 @@ static ssize_t mei_write(struct file *file, const char __user *ubuf,
+ 		goto out;
+ 	}
+ 
+-	if (length > dev->me_clients[id].props.max_msg_length) {
++	if (length > me_cl->props.max_msg_length) {
+ 		rets = -EFBIG;
+ 		goto out;
+ 	}
+@@ -461,8 +461,8 @@ static int mei_ioctl_connect_client(struct file *file,
+ {
+ 	struct mei_device *dev;
+ 	struct mei_client *client;
++	struct mei_me_client *me_cl;
+ 	struct mei_cl *cl;
+-	int i;
+ 	int rets;
+ 
+ 	cl = file->private_data;
+@@ -483,22 +483,22 @@ static int mei_ioctl_connect_client(struct file *file,
+ 	}
+ 
+ 	/* find ME client we're trying to connect to */
+-	i = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
+-	if (i < 0 || dev->me_clients[i].props.fixed_address) {
++	me_cl = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
++	if (!me_cl || me_cl->props.fixed_address) {
+ 		dev_dbg(&dev->pdev->dev, "Cannot connect to FW Client UUID = %pUl\n",
+ 				&data->in_client_uuid);
+ 		rets = -ENOTTY;
+ 		goto end;
+ 	}
+ 
+-	cl->me_client_id = dev->me_clients[i].client_id;
++	cl->me_client_id = me_cl->client_id;
+ 
+ 	dev_dbg(&dev->pdev->dev, "Connect to FW Client ID = %d\n",
+ 			cl->me_client_id);
+ 	dev_dbg(&dev->pdev->dev, "FW Client - Protocol Version = %d\n",
+-			dev->me_clients[i].props.protocol_version);
++			me_cl->props.protocol_version);
+ 	dev_dbg(&dev->pdev->dev, "FW Client - Max Msg Len = %d\n",
+-			dev->me_clients[i].props.max_msg_length);
++			me_cl->props.max_msg_length);
+ 
+ 	/* if we're connecting to amthif client then we will use the
+ 	 * existing connection
+@@ -517,10 +517,8 @@ static int mei_ioctl_connect_client(struct file *file,
+ 		file->private_data = &dev->iamthif_cl;
+ 
+ 		client = &data->out_client_properties;
+-		client->max_msg_length =
+-			dev->me_clients[i].props.max_msg_length;
+-		client->protocol_version =
+-			dev->me_clients[i].props.protocol_version;
++		client->max_msg_length = me_cl->props.max_msg_length;
++		client->protocol_version = me_cl->props.protocol_version;
+ 		rets = dev->iamthif_cl.status;
+ 
+ 		goto end;
+@@ -529,8 +527,8 @@ static int mei_ioctl_connect_client(struct file *file,
+ 
+ 	/* prepare the output buffer */
+ 	client = &data->out_client_properties;
+-	client->max_msg_length = dev->me_clients[i].props.max_msg_length;
+-	client->protocol_version = dev->me_clients[i].props.protocol_version;
++	client->max_msg_length = me_cl->props.max_msg_length;
++	client->protocol_version = me_cl->props.protocol_version;
+ 	dev_dbg(&dev->pdev->dev, "Can connect?\n");
+ 
+ 
+diff --git a/drivers/misc/mei/nfc.c b/drivers/misc/mei/nfc.c
+index 3095fc514a65..9d393b0503f1 100644
+--- a/drivers/misc/mei/nfc.c
++++ b/drivers/misc/mei/nfc.c
+@@ -481,7 +481,8 @@ int mei_nfc_host_init(struct mei_device *dev)
+ {
+ 	struct mei_nfc_dev *ndev = &nfc_dev;
+ 	struct mei_cl *cl_info, *cl = NULL;
+-	int i, ret;
++	struct mei_me_client *me_cl;
++	int ret;
+ 
+ 	/* already initialized */
+ 	if (ndev->cl_info)
+@@ -499,14 +500,14 @@ int mei_nfc_host_init(struct mei_device *dev)
+ 	}
+ 
+ 	/* check for valid client id */
+-	i = mei_me_cl_by_uuid(dev, &mei_nfc_info_guid);
+-	if (i < 0) {
++	me_cl = mei_me_cl_by_uuid(dev, &mei_nfc_info_guid);
++	if (!me_cl) {
+ 		dev_info(&dev->pdev->dev, "nfc: failed to find the client\n");
+ 		ret = -ENOTTY;
+ 		goto err;
+ 	}
+ 
+-	cl_info->me_client_id = dev->me_clients[i].client_id;
++	cl_info->me_client_id = me_cl->client_id;
+ 
+ 	ret = mei_cl_link(cl_info, MEI_HOST_CLIENT_ID_ANY);
+ 	if (ret)
+@@ -517,14 +518,14 @@ int mei_nfc_host_init(struct mei_device *dev)
+ 	list_add_tail(&cl_info->device_link, &dev->device_list);
+ 
+ 	/* check for valid client id */
+-	i = mei_me_cl_by_uuid(dev, &mei_nfc_guid);
+-	if (i < 0) {
++	me_cl = mei_me_cl_by_uuid(dev, &mei_nfc_guid);
++	if (!me_cl) {
+ 		dev_info(&dev->pdev->dev, "nfc: failed to find the client\n");
+ 		ret = -ENOTTY;
+ 		goto err;
+ 	}
+ 
+-	cl->me_client_id = dev->me_clients[i].client_id;
++	cl->me_client_id = me_cl->client_id;
+ 
+ 	ret = mei_cl_link(cl, MEI_HOST_CLIENT_ID_ANY);
+ 	if (ret)
+diff --git a/drivers/misc/mei/wd.c b/drivers/misc/mei/wd.c
+index 1e4f4283f10e..c02440b19f29 100644
+--- a/drivers/misc/mei/wd.c
++++ b/drivers/misc/mei/wd.c
+@@ -65,7 +65,7 @@ static void mei_wd_set_start_timeout(struct mei_device *dev, u16 timeout)
+ int mei_wd_host_init(struct mei_device *dev)
+ {
+ 	struct mei_cl *cl = &dev->wd_cl;
+-	int id;
++	struct mei_me_client *me_cl;
+ 	int ret;
+ 
+ 	mei_cl_init(cl, dev);
+@@ -75,13 +75,13 @@ int mei_wd_host_init(struct mei_device *dev)
+ 
+ 
+ 	/* check for valid client id */
+-	id = mei_me_cl_by_uuid(dev, &mei_wd_guid);
+-	if (id < 0) {
++	me_cl = mei_me_cl_by_uuid(dev, &mei_wd_guid);
++	if (!me_cl) {
+ 		dev_info(&dev->pdev->dev, "wd: failed to find the client\n");
+ 		return -ENOTTY;
+ 	}
+ 
+-	cl->me_client_id = dev->me_clients[id].client_id;
++	cl->me_client_id = me_cl->client_id;
+ 
+ 	ret = mei_cl_link(cl, MEI_WD_HOST_CLIENT_ID);
+ 
