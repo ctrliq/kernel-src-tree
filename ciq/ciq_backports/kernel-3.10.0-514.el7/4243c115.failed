@@ -1,0 +1,476 @@
+qla2xxx: Add support for online flash update for ISP27XX.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add support for online flash update for ISP27XX (Chad Dupuis) [1273080]
+Rebuild_FUZZ: 99.12%
+commit-author Sawan Chandak <sawan.chandak@qlogic.com>
+commit 4243c115f47757761b85e1ca7f2cfe71bb9d2c4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4243c115.failed
+
+	Signed-off-by: Sawan Chandak <sawan.chandak@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 4243c115f47757761b85e1ca7f2cfe71bb9d2c4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index a623e74ec209,493a3ea81e79..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -11,11 -11,11 +11,15 @@@
+   * ----------------------------------------------------------------------
+   * |             Level            |   Last Value Used  |     Holes	|
+   * ----------------------------------------------------------------------
+++<<<<<<< HEAD
+ + * | Module Init and Probe        |       0x017f       | 0x0146,	|
+++=======
++  * | Module Init and Probe        |       0x018f       | 0x0146         |
+++>>>>>>> 4243c115f477 (qla2xxx: Add support for online flash update for ISP27XX.)
+   * |                              |                    | 0x015b-0x0160	|
+ - * |                              |                    | 0x016e-0x0170  |
+ - * | Mailbox commands             |       0x1192       |		|
+ - * |                              |                    |		|
+ + * |                              |                    | 0x016e-0x0170	|
+ + * | Mailbox commands             |       0x118d       | 0x1115-0x1116	|
+ + * |                              |                    | 0x111a-0x111b  |
+   * | Device Discovery             |       0x2016       | 0x2020-0x2022, |
+   * |                              |                    | 0x2011-0x2012, |
+   * |                              |                    | 0x2099-0x20a4  |
+diff --git a/drivers/scsi/qla2xxx/qla_attr.c b/drivers/scsi/qla2xxx/qla_attr.c
+index 8a17e5ab672d..7f59e1303b85 100644
+--- a/drivers/scsi/qla2xxx/qla_attr.c
++++ b/drivers/scsi/qla2xxx/qla_attr.c
+@@ -562,6 +562,7 @@ qla2x00_sysfs_read_vpd(struct file *filp, struct kobject *kobj,
+ 	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
+ 	    struct device, kobj)));
+ 	struct qla_hw_data *ha = vha->hw;
++	uint32_t faddr;
+ 
+ 	if (unlikely(pci_channel_offline(ha->pdev)))
+ 		return -EAGAIN;
+@@ -569,9 +570,16 @@ qla2x00_sysfs_read_vpd(struct file *filp, struct kobject *kobj,
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EINVAL;
+ 
+-	if (IS_NOCACHE_VPD_TYPE(ha))
+-		ha->isp_ops->read_optrom(vha, ha->vpd, ha->flt_region_vpd << 2,
++	if (IS_NOCACHE_VPD_TYPE(ha)) {
++		faddr = ha->flt_region_vpd << 2;
++
++		if (IS_QLA27XX(ha) &&
++		    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
++			faddr = ha->flt_region_vpd_sec << 2;
++
++		ha->isp_ops->read_optrom(vha, ha->vpd, faddr,
+ 		    ha->vpd_size);
++	}
+ 	return memory_read_from_buffer(buf, count, &off, ha->vpd, ha->vpd_size);
+ }
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.c b/drivers/scsi/qla2xxx/qla_bsg.c
+index e1c2a57a882f..70fe3c7372c1 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.c
++++ b/drivers/scsi/qla2xxx/qla_bsg.c
+@@ -2109,6 +2109,80 @@ qla8044_serdes_op(struct fc_bsg_job *bsg_job)
+ 	return 0;
+ }
+ 
++static int
++qla27xx_get_flash_upd_cap(struct fc_bsg_job *bsg_job)
++{
++	struct Scsi_Host *host = bsg_job->shost;
++	scsi_qla_host_t *vha = shost_priv(host);
++	struct qla_hw_data *ha = vha->hw;
++	struct qla_flash_update_caps cap;
++
++	if (!(IS_QLA27XX(ha)))
++		return -EPERM;
++
++	memset(&cap, 0, sizeof(cap));
++	cap.capabilities = (uint64_t)ha->fw_attributes_ext[1] << 48 |
++			   (uint64_t)ha->fw_attributes_ext[0] << 32 |
++			   (uint64_t)ha->fw_attributes_h << 16 |
++			   (uint64_t)ha->fw_attributes;
++
++	sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
++	    bsg_job->reply_payload.sg_cnt, &cap, sizeof(cap));
++	bsg_job->reply->reply_payload_rcv_len = sizeof(cap);
++
++	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
++	    EXT_STATUS_OK;
++
++	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
++	bsg_job->reply->result = DID_OK << 16;
++	bsg_job->job_done(bsg_job);
++	return 0;
++}
++
++static int
++qla27xx_set_flash_upd_cap(struct fc_bsg_job *bsg_job)
++{
++	struct Scsi_Host *host = bsg_job->shost;
++	scsi_qla_host_t *vha = shost_priv(host);
++	struct qla_hw_data *ha = vha->hw;
++	uint64_t online_fw_attr = 0;
++	struct qla_flash_update_caps cap;
++
++	if (!(IS_QLA27XX(ha)))
++		return -EPERM;
++
++	memset(&cap, 0, sizeof(cap));
++	sg_copy_to_buffer(bsg_job->request_payload.sg_list,
++	    bsg_job->request_payload.sg_cnt, &cap, sizeof(cap));
++
++	online_fw_attr = (uint64_t)ha->fw_attributes_ext[1] << 48 |
++			 (uint64_t)ha->fw_attributes_ext[0] << 32 |
++			 (uint64_t)ha->fw_attributes_h << 16 |
++			 (uint64_t)ha->fw_attributes;
++
++	if (online_fw_attr != cap.capabilities) {
++		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
++		    EXT_STATUS_INVALID_PARAM;
++		return -EINVAL;
++	}
++
++	if (cap.outage_duration < MAX_LOOP_TIMEOUT)  {
++		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
++		    EXT_STATUS_INVALID_PARAM;
++		return -EINVAL;
++	}
++
++	bsg_job->reply->reply_payload_rcv_len = 0;
++
++	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
++	    EXT_STATUS_OK;
++
++	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
++	bsg_job->reply->result = DID_OK << 16;
++	bsg_job->job_done(bsg_job);
++	return 0;
++}
++
+ static int
+ qla2x00_process_vendor_specific(struct fc_bsg_job *bsg_job)
+ {
+@@ -2164,6 +2238,12 @@ qla2x00_process_vendor_specific(struct fc_bsg_job *bsg_job)
+ 	case QL_VND_SERDES_OP_EX:
+ 		return qla8044_serdes_op(bsg_job);
+ 
++	case QL_VND_GET_FLASH_UPDATE_CAPS:
++		return qla27xx_get_flash_upd_cap(bsg_job);
++
++	case QL_VND_SET_FLASH_UPDATE_CAPS:
++		return qla27xx_set_flash_upd_cap(bsg_job);
++
+ 	default:
+ 		return -ENOSYS;
+ 	}
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.h b/drivers/scsi/qla2xxx/qla_bsg.h
+index d38f9efa56fa..6c45bf4c9981 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.h
++++ b/drivers/scsi/qla2xxx/qla_bsg.h
+@@ -25,6 +25,8 @@
+ #define QL_VND_FX00_MGMT_CMD	0x12
+ #define QL_VND_SERDES_OP	0x13
+ #define	QL_VND_SERDES_OP_EX	0x14
++#define QL_VND_GET_FLASH_UPDATE_CAPS    0x15
++#define QL_VND_SET_FLASH_UPDATE_CAPS    0x16
+ 
+ /* BSG Vendor specific subcode returns */
+ #define EXT_STATUS_OK			0
+@@ -232,4 +234,9 @@ struct qla_serdes_reg_ex {
+ 	uint32_t val;
+ } __packed;
+ 
++struct qla_flash_update_caps {
++	uint64_t  capabilities;
++	uint32_t  outage_duration;
++	uint8_t   reserved[20];
++} __packed;
+ #endif
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 03748dc366c8..677dbdd15a30 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -1038,6 +1038,12 @@ struct mbx_cmd_32 {
+ #define FSTATE_FATAL_ERROR         4
+ #define FSTATE_LOOP_BACK_CONN      5
+ 
++#define QLA27XX_IMG_STATUS_VER_MAJOR   0x01
++#define QLA27XX_IMG_STATUS_VER_MINOR    0x00
++#define QLA27XX_IMG_STATUS_SIGN   0xFACEFADE
++#define QLA27XX_PRIMARY_IMAGE  1
++#define QLA27XX_SECONDARY_IMAGE    2
++
+ /*
+  * Port Database structure definition
+  * Little endian except where noted.
+@@ -3346,14 +3352,20 @@ struct qla_hw_data {
+ 	uint32_t        flt_region_flt;
+ 	uint32_t        flt_region_fdt;
+ 	uint32_t        flt_region_boot;
++	uint32_t        flt_region_boot_sec;
+ 	uint32_t        flt_region_fw;
++	uint32_t        flt_region_fw_sec;
+ 	uint32_t        flt_region_vpd_nvram;
+ 	uint32_t        flt_region_vpd;
++	uint32_t        flt_region_vpd_sec;
+ 	uint32_t        flt_region_nvram;
+ 	uint32_t        flt_region_npiv_conf;
+ 	uint32_t	flt_region_gold_fw;
+ 	uint32_t	flt_region_fcp_prio;
+ 	uint32_t	flt_region_bootload;
++	uint32_t	flt_region_img_status_pri;
++	uint32_t	flt_region_img_status_sec;
++	uint8_t         active_image;
+ 
+ 	/* Needed for BEACON */
+ 	uint16_t        beacon_blink_led;
+@@ -3583,6 +3595,16 @@ typedef struct scsi_qla_host {
+ 	struct qla8044_reset_template reset_tmplt;
+ } scsi_qla_host_t;
+ 
++struct qla27xx_image_status {
++	uint8_t image_status_mask;
++	uint16_t generation_number;
++	uint8_t reserved[3];
++	uint8_t ver_minor;
++	uint8_t ver_major;
++	uint32_t checksum;
++	uint32_t signature;
++} __packed;
++
+ #define SET_VP_IDX	1
+ #define SET_AL_PA	2
+ #define RESET_VP_IDX	3
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index 42bb357bf56b..7f095e30bd1d 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -1393,6 +1393,16 @@ struct qla_flt_header {
+ #define FLT_REG_FCOE_NVRAM_0	0xAA
+ #define FLT_REG_FCOE_NVRAM_1	0xAC
+ 
++/* 27xx */
++#define FLT_REG_IMG_PRI_27XX	0x95
++#define FLT_REG_IMG_SEC_27XX	0x96
++#define FLT_REG_FW_SEC_27XX	0x02
++#define FLT_REG_BOOTLOAD_SEC_27XX	0x9
++#define FLT_REG_VPD_SEC_27XX_0	0x50
++#define FLT_REG_VPD_SEC_27XX_1	0x52
++#define FLT_REG_VPD_SEC_27XX_2	0xD8
++#define FLT_REG_VPD_SEC_27XX_3	0xDA
++
+ struct qla_flt_region {
+ 	uint32_t code;
+ 	uint32_t size;
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index 4a34762f8a9c..88cac0e519d2 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -87,6 +87,7 @@ extern int qla2xxx_mctp_dump(scsi_qla_host_t *);
+ extern int
+ qla2x00_alloc_outstanding_cmds(struct qla_hw_data *, struct req_que *);
+ extern int qla2x00_init_rings(scsi_qla_host_t *);
++extern uint8_t qla27xx_find_valid_image(struct scsi_qla_host *);
+ 
+ /*
+  * Global Data in qla_os.c source file.
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index db58db867d9e..b51d14998fcd 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -5217,6 +5217,93 @@ qla24xx_nvram_config(scsi_qla_host_t *vha)
+ 	return (rval);
+ }
+ 
++uint8_t qla27xx_find_valid_image(struct scsi_qla_host *vha)
++{
++	struct qla27xx_image_status pri_image_status, sec_image_status;
++	uint8_t valid_pri_image, valid_sec_image;
++	uint32_t *wptr;
++	uint32_t cnt, chksum, size;
++	struct qla_hw_data *ha = vha->hw;
++
++	valid_pri_image = valid_sec_image = 1;
++	ha->active_image = 0;
++	size = sizeof(struct qla27xx_image_status) / sizeof(uint32_t);
++
++	if (!ha->flt_region_img_status_pri) {
++		valid_pri_image = 0;
++		goto check_sec_image;
++	}
++
++	qla24xx_read_flash_data(vha, (uint32_t *)(&pri_image_status),
++	    ha->flt_region_img_status_pri, size);
++
++	if (pri_image_status.signature != QLA27XX_IMG_STATUS_SIGN) {
++		ql_dbg(ql_dbg_init, vha, 0x018b,
++		    "Primary image signature (0x%x) not valid\n",
++		    pri_image_status.signature);
++		valid_pri_image = 0;
++		goto check_sec_image;
++	}
++
++	wptr = (uint32_t *)(&pri_image_status);
++	cnt = size;
++
++	for (chksum = 0; cnt; cnt--)
++		chksum += le32_to_cpu(*wptr++);
++	if (chksum) {
++		ql_dbg(ql_dbg_init, vha, 0x018c,
++		    "Checksum validation failed for primary image (0x%x)\n",
++		    chksum);
++		valid_pri_image = 0;
++	}
++
++check_sec_image:
++	if (!ha->flt_region_img_status_sec) {
++		valid_sec_image = 0;
++		goto check_valid_image;
++	}
++
++	qla24xx_read_flash_data(vha, (uint32_t *)(&sec_image_status),
++	    ha->flt_region_img_status_sec, size);
++
++	if (sec_image_status.signature != QLA27XX_IMG_STATUS_SIGN) {
++		ql_dbg(ql_dbg_init, vha, 0x018d,
++		    "Secondary image signature(0x%x) not valid\n",
++		    sec_image_status.signature);
++		valid_sec_image = 0;
++		goto check_valid_image;
++	}
++
++	wptr = (uint32_t *)(&sec_image_status);
++	cnt = size;
++	for (chksum = 0; cnt; cnt--)
++		chksum += le32_to_cpu(*wptr++);
++	if (chksum) {
++		ql_dbg(ql_dbg_init, vha, 0x018e,
++		    "Checksum validation failed for secondary image (0x%x)\n",
++		    chksum);
++		valid_sec_image = 0;
++	}
++
++check_valid_image:
++	if (valid_pri_image && (pri_image_status.image_status_mask & 0x1))
++		ha->active_image = QLA27XX_PRIMARY_IMAGE;
++	if (valid_sec_image && (sec_image_status.image_status_mask & 0x1)) {
++		if (!ha->active_image ||
++		    pri_image_status.generation_number <
++		    sec_image_status.generation_number)
++			ha->active_image = QLA27XX_SECONDARY_IMAGE;
++	}
++
++	ql_dbg(ql_dbg_init, vha, 0x018f, "%s image\n",
++	    ha->active_image == 0 ? "default bootld and fw" :
++	    ha->active_image == 1 ? "primary" :
++	    ha->active_image == 2 ? "secondary" :
++	    "Invalid");
++
++	return ha->active_image;
++}
++
+ static int
+ qla24xx_load_risc_flash(scsi_qla_host_t *vha, uint32_t *srisc_addr,
+     uint32_t faddr)
+@@ -5239,6 +5326,10 @@ qla24xx_load_risc_flash(scsi_qla_host_t *vha, uint32_t *srisc_addr,
+ 	dcode = (uint32_t *)req->ring;
+ 	*srisc_addr = 0;
+ 
++	if (IS_QLA27XX(ha) &&
++	    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
++		faddr = ha->flt_region_fw_sec;
++
+ 	/* Validate firmware image by checking version. */
+ 	qla24xx_read_flash_data(vha, dcode, faddr + 4, 4);
+ 	for (i = 0; i < 4; i++)
+diff --git a/drivers/scsi/qla2xxx/qla_sup.c b/drivers/scsi/qla2xxx/qla_sup.c
+index 028e8c8a7de9..f66c9a5b4e7b 100644
+--- a/drivers/scsi/qla2xxx/qla_sup.c
++++ b/drivers/scsi/qla2xxx/qla_sup.c
+@@ -846,6 +846,38 @@ qla2xxx_get_flt_info(scsi_qla_host_t *vha, uint32_t flt_addr)
+ 			if (ha->port_no == 1)
+ 				ha->flt_region_nvram = start;
+ 			break;
++		case FLT_REG_IMG_PRI_27XX:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_img_status_pri = start;
++			break;
++		case FLT_REG_IMG_SEC_27XX:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_img_status_sec = start;
++			break;
++		case FLT_REG_FW_SEC_27XX:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_fw_sec = start;
++			break;
++		case FLT_REG_BOOTLOAD_SEC_27XX:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_boot_sec = start;
++			break;
++		case FLT_REG_VPD_SEC_27XX_0:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_vpd_sec = start;
++			break;
++		case FLT_REG_VPD_SEC_27XX_1:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_vpd_sec = start;
++			break;
++		case FLT_REG_VPD_SEC_27XX_2:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_vpd_sec = start;
++			break;
++		case FLT_REG_VPD_SEC_27XX_3:
++			if (IS_QLA27XX(ha))
++				ha->flt_region_vpd_sec = start;
++			break;
+ 		}
+ 	}
+ 	goto done;
+@@ -2989,6 +3021,9 @@ qla24xx_get_flash_version(scsi_qla_host_t *vha, void *mbuf)
+ 	uint8_t code_type, last_image;
+ 	int i;
+ 	struct qla_hw_data *ha = vha->hw;
++	uint32_t faddr = 0;
++
++	pcihdr = pcids = 0;
+ 
+ 	if (IS_P3P_TYPE(ha))
+ 		return ret;
+@@ -3002,9 +3037,11 @@ qla24xx_get_flash_version(scsi_qla_host_t *vha, void *mbuf)
+ 	memset(ha->fw_revision, 0, sizeof(ha->fw_revision));
+ 
+ 	dcode = mbuf;
+-
+-	/* Begin with first PCI expansion ROM header. */
+ 	pcihdr = ha->flt_region_boot << 2;
++	if (IS_QLA27XX(ha) &&
++	    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
++		pcihdr = ha->flt_region_boot_sec << 2;
++
+ 	last_image = 1;
+ 	do {
+ 		/* Verify PCI expansion ROM header. */
+@@ -3077,8 +3114,12 @@ qla24xx_get_flash_version(scsi_qla_host_t *vha, void *mbuf)
+ 	/* Read firmware image information. */
+ 	memset(ha->fw_revision, 0, sizeof(ha->fw_revision));
+ 	dcode = mbuf;
++	faddr = ha->flt_region_fw;
++	if (IS_QLA27XX(ha) &&
++	    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
++		faddr = ha->flt_region_fw_sec;
+ 
+-	qla24xx_read_flash_data(vha, dcode, ha->flt_region_fw + 4, 4);
++	qla24xx_read_flash_data(vha, dcode, faddr + 4, 4);
+ 	for (i = 0; i < 4; i++)
+ 		dcode[i] = be32_to_cpu(dcode[i]);
+ 
