@@ -1,0 +1,650 @@
+net: add adj_list to save only neighbours
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] add adj_list to save only neighbours (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 93.51%
+commit-author Veaceslav Falico <vfalico@redhat.com>
+commit 2f268f129c2d1a05d297fe3ee34d393f862d2b22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2f268f12.failed
+
+Currently, we distinguish neighbours (first-level linked devices) from
+non-neighbours by the neighbour bool in the netdev_adjacent. This could be
+quite time-consuming in case we would like to traverse *only* through
+neighbours - cause we'd have to traverse through all devices and check for
+this flag, and in a (quite common) scenario where we have lots of vlans on
+top of bridge, which is on top of a bond - the bonding would have to go
+through all those vlans to get its upper neighbour linked devices.
+
+This situation is really unpleasant, cause there are already a lot of cases
+when a device with slaves needs to go through them in hot path.
+
+To fix this, introduce a new upper/lower device lists structure -
+adj_list, which contains only the neighbours. It works always in
+pair with the all_adj_list structure (renamed from upper/lower_dev_list),
+i.e. both of them contain the same links, only that all_adj_list contains
+also non-neighbour device links. It's really a small change visible,
+currently, only for __netdev_adjacent_dev_insert/remove(), and doesn't
+change the main linked logic at all.
+
+Also, add some comments a fix a name collision in
+netdev_for_each_upper_dev_rcu() and rework the naming by the following
+rules:
+
+netdev_(all_)(upper|lower)_*
+
+If "all_" is present, then we work with the whole list of upper/lower
+devices, otherwise - only with direct neighbours. Uninline functions - to
+get better stack traces.
+
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Eric Dumazet <edumazet@google.com>
+CC: Jiri Pirko <jiri@resnulli.us>
+CC: Alexander Duyck <alexander.h.duyck@intel.com>
+CC: Cong Wang <amwang@redhat.com>
+	Signed-off-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2f268f129c2d1a05d297fe3ee34d393f862d2b22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bond_main.c
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc drivers/net/bonding/bond_alb.c
+index ad06dd955bf7,8524e33e6754..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -963,11 -1019,10 +963,16 @@@ static void alb_send_learning_packets(s
+  
+  	/* loop through vlans and send one packet for each */
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	list_for_each_entry_rcu(upper, &bond->dev->upper_dev_list, list) {
+ +		if (upper->dev->priv_flags & IFF_802_1Q_VLAN)
+++=======
++ 	netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
++ 		if (upper->priv_flags & IFF_802_1Q_VLAN)
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  			alb_send_lp_vid(slave, mac_addr,
+ -					vlan_dev_vlan_id(upper));
+ +					vlan_dev_vlan_proto(upper->dev),
+ +					vlan_dev_vlan_id(upper->dev));
+  	}
+  	rcu_read_unlock();
+  }
+diff --cc drivers/net/bonding/bond_main.c
+index dd9219794eca,91c4ab8913b1..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2201,8 -2267,8 +2201,13 @@@ static bool bond_has_this_ip(struct bon
+  		return true;
+  
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	list_for_each_entry_rcu(upper, &bond->dev->upper_dev_list, list) {
+ +		if (ip == bond_confirm_addr(upper->dev, 0, ip)) {
+++=======
++ 	netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
++ 		if (ip == bond_confirm_addr(upper, 0, ip)) {
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  			ret = true;
+  			break;
+  		}
+@@@ -2293,30 -2339,17 +2298,41 @@@ static void bond_arp_send_all(struct bo
+  		 * found we verify its upper dev list, searching for the
+  		 * rt->dst.dev. If found we save the tag of the vlan and
+  		 * proceed to send the packet.
+ -		 *
+ -		 * TODO: QinQ?
+  		 */
+++<<<<<<< HEAD
+ +		list_for_each_entry_rcu(vlan_upper, &bond->dev->upper_dev_list, list) {
+ +			if (!is_vlan_dev(vlan_upper->dev))
+ +				continue;
+ +
+ +			if (vlan_upper->dev == rt->dst.dev) {
+ +				outer.vlan_proto = vlan_dev_vlan_proto(vlan_upper->dev);
+ +				outer.vlan_id = vlan_dev_vlan_id(vlan_upper->dev);
+ +				rcu_read_unlock();
+ +				goto found;
+ +			}
+ +			list_for_each_entry_rcu(upper,
+ +						&vlan_upper->dev->upper_dev_list,
+ +						list) {
+ +				if (upper->dev == rt->dst.dev) {
+ +					/* If the upper dev is a vlan dev too,
+ +					 *  set the vlan tag to inner tag.
+ +					 */
+ +					if (is_vlan_dev(upper->dev)) {
+ +						inner.vlan_proto = vlan_dev_vlan_proto(upper->dev);
+ +						inner.vlan_id = vlan_dev_vlan_id(upper->dev);
+ +					}
+ +					outer.vlan_proto = vlan_dev_vlan_proto(vlan_upper->dev);
+ +					outer.vlan_id = vlan_dev_vlan_id(vlan_upper->dev);
+++=======
++ 		netdev_for_each_all_upper_dev_rcu(bond->dev, vlan_upper,
++ 						  vlan_iter) {
++ 			if (!is_vlan_dev(vlan_upper))
++ 				continue;
++ 			netdev_for_each_all_upper_dev_rcu(vlan_upper, upper,
++ 							  iter) {
++ 				if (upper == rt->dst.dev) {
++ 					vlan_id = vlan_dev_vlan_id(vlan_upper);
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  					rcu_read_unlock();
+  					goto found;
+  				}
+@@@ -2327,8 -2360,12 +2343,17 @@@
+  		 * our upper vlans, then just search for any dev that
+  		 * matches, and in case it's a vlan - save the id
+  		 */
+++<<<<<<< HEAD
+ +		list_for_each_entry_rcu(upper, &bond->dev->upper_dev_list, list) {
+ +			if (upper->dev == rt->dst.dev) {
+++=======
++ 		netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
++ 			if (upper == rt->dst.dev) {
++ 				/* if it's a vlan - get its VID */
++ 				if (is_vlan_dev(upper))
++ 					vlan_id = vlan_dev_vlan_id(upper);
++ 
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  				rcu_read_unlock();
+  				goto found;
+  			}
+diff --cc include/linux/netdevice.h
+index 7b10147de03d,514045c704a8..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1317,7 -1143,18 +1317,22 @@@ struct net_device 
+  	struct list_head	dev_list;
+  	struct list_head	napi_list;
+  	struct list_head	unreg_list;
+++<<<<<<< HEAD
+ +	struct list_head	upper_dev_list; /* List of upper devices */
+++=======
++ 
++ 	/* directly linked devices, like slaves for bonding */
++ 	struct {
++ 		struct list_head upper;
++ 		struct list_head lower;
++ 	} adj_list;
++ 
++ 	/* all linked devices, *including* neighbours */
++ 	struct {
++ 		struct list_head upper;
++ 		struct list_head lower;
++ 	} all_adj_list;
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  
+  
+  	/* currently active device features */
+@@@ -3273,30 -2820,32 +3288,43 @@@ extern int		netdev_tstamp_prequeue
+  extern int		weight_p;
+  extern int		bpf_jit_enable;
+  
+ -extern bool netdev_has_upper_dev(struct net_device *dev,
+ +bool netdev_has_upper_dev(struct net_device *dev, struct net_device *upper_dev);
+ +bool netdev_has_any_upper_dev(struct net_device *dev);
+ +struct net_device *netdev_master_upper_dev_get(struct net_device *dev);
+ +struct net_device *netdev_master_upper_dev_get_rcu(struct net_device *dev);
+ +int netdev_upper_dev_link(struct net_device *dev, struct net_device *upper_dev);
+ +int netdev_master_upper_dev_link(struct net_device *dev,
+  				 struct net_device *upper_dev);
+++<<<<<<< HEAD
+ +void netdev_upper_dev_unlink(struct net_device *dev,
+ +			     struct net_device *upper_dev);
+ +void *netdev_lower_dev_get_private_rcu(struct net_device *dev,
+ +				       struct net_device *lower_dev);
+ +void *netdev_lower_dev_get_private(struct net_device *dev,
+ +				   struct net_device *lower_dev);
+ +
+ +/* RSS keys are 40 or 52 bytes long */
+ +#define NETDEV_RSS_KEY_LEN 52
+ +extern u8 netdev_rss_key[NETDEV_RSS_KEY_LEN];
+ +void netdev_rss_key_fill(void *buffer, size_t len);
+++=======
++ extern bool netdev_has_any_upper_dev(struct net_device *dev);
++ extern struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
++ 							    struct list_head **iter);
++ 
++ /* iterate through upper list, must be called under RCU read lock */
++ #define netdev_for_each_all_upper_dev_rcu(dev, updev, iter) \
++ 	for (iter = &(dev)->all_adj_list.upper, \
++ 	     updev = netdev_all_upper_get_next_dev_rcu(dev, &(iter)); \
++ 	     updev; \
++ 	     updev = netdev_all_upper_get_next_dev_rcu(dev, &(iter)))
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  
+ -extern struct net_device *netdev_master_upper_dev_get(struct net_device *dev);
+ -extern struct net_device *netdev_master_upper_dev_get_rcu(struct net_device *dev);
+ -extern int netdev_upper_dev_link(struct net_device *dev,
+ -				 struct net_device *upper_dev);
+ -extern int netdev_master_upper_dev_link(struct net_device *dev,
+ -					struct net_device *upper_dev);
+ -extern void netdev_upper_dev_unlink(struct net_device *dev,
+ -				    struct net_device *upper_dev);
+ -extern int skb_checksum_help(struct sk_buff *skb);
+ -extern struct sk_buff *__skb_gso_segment(struct sk_buff *skb,
+ -	netdev_features_t features, bool tx_path);
+ -extern struct sk_buff *skb_mac_gso_segment(struct sk_buff *skb,
+ -					  netdev_features_t features);
+ +int skb_checksum_help(struct sk_buff *skb);
+ +struct sk_buff *__skb_gso_segment(struct sk_buff *skb,
+ +				  netdev_features_t features, bool tx_path);
+ +struct sk_buff *skb_mac_gso_segment(struct sk_buff *skb,
+ +				    netdev_features_t features);
+  
+  static inline
+  struct sk_buff *skb_gso_segment(struct sk_buff *skb, netdev_features_t features)
+diff --cc net/core/dev.c
+index 004e3f31d664,9a395e03da74..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4498,53 -4369,26 +4498,72 @@@ softnet_break
+  
+  struct netdev_adjacent {
+  	struct net_device *dev;
+ -
+ -	/* upper master flag, there can only be one master device per list */
+  	bool master;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* counter for the number of times this device was added to us */
++ 	u16 ref_nr;
++ 
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  	struct list_head list;
+  	struct rcu_head rcu;
+ +	struct list_head search_list;
+  };
+  
+++<<<<<<< HEAD
+ +static void __append_search_uppers(struct list_head *search_list,
+ +				   struct net_device *dev)
+++=======
++ static struct netdev_adjacent *__netdev_find_adj(struct net_device *dev,
++ 						 struct net_device *adj_dev,
++ 						 struct list_head *adj_list)
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  {
+ -	struct netdev_adjacent *adj;
+ +	struct netdev_adjacent *upper;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(upper, &dev->upper_dev_list, list) {
+ +		/* check if this upper is not already in search list */
+ +		if (list_empty(&upper->search_list))
+ +			list_add_tail(&upper->search_list, search_list);
+ +	}
+ +}
+ +
+ +static bool __netdev_search_upper_dev(struct net_device *dev,
+ +				      struct net_device *upper_dev)
+ +{
+ +	LIST_HEAD(search_list);
+ +	struct netdev_adjacent *upper;
+ +	struct netdev_adjacent *tmp;
+ +	bool ret = false;
+ +
+ +	__append_search_uppers(&search_list, dev);
+ +	list_for_each_entry(upper, &search_list, search_list) {
+ +		if (upper->dev == upper_dev) {
+ +			ret = true;
+ +			break;
+ +		}
+ +		__append_search_uppers(&search_list, upper->dev);
+ +	}
+ +	list_for_each_entry_safe(upper, tmp, &search_list, search_list)
+ +		INIT_LIST_HEAD(&upper->search_list);
+ +	return ret;
+ +}
+ +
+ +static struct netdev_adjacent *__netdev_find_upper(struct net_device *dev,
+ +						struct net_device *upper_dev)
+ +{
+ +	struct netdev_adjacent *upper;
+ +
+ +	list_for_each_entry(upper, &dev->upper_dev_list, list) {
+ +		if (upper->dev == upper_dev)
+ +			return upper;
+++=======
++ 	list_for_each_entry(adj, adj_list, list) {
++ 		if (adj->dev == adj_dev)
++ 			return adj;
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  	}
+  	return NULL;
+  }
+@@@ -4650,6 -4494,146 +4669,149 @@@ struct net_device *netdev_master_upper_
+  }
+  EXPORT_SYMBOL(netdev_master_upper_dev_get_rcu);
+  
+++<<<<<<< HEAD
+++=======
++ static int __netdev_adjacent_dev_insert(struct net_device *dev,
++ 					struct net_device *adj_dev,
++ 					struct list_head *dev_list,
++ 					bool master)
++ {
++ 	struct netdev_adjacent *adj;
++ 
++ 	adj = __netdev_find_adj(dev, adj_dev, dev_list);
++ 
++ 	if (adj) {
++ 		adj->ref_nr++;
++ 		return 0;
++ 	}
++ 
++ 	adj = kmalloc(sizeof(*adj), GFP_KERNEL);
++ 	if (!adj)
++ 		return -ENOMEM;
++ 
++ 	adj->dev = adj_dev;
++ 	adj->master = master;
++ 	adj->ref_nr = 1;
++ 	dev_hold(adj_dev);
++ 
++ 	pr_debug("dev_hold for %s, because of link added from %s to %s\n",
++ 		 adj_dev->name, dev->name, adj_dev->name);
++ 
++ 	/* Ensure that master link is always the first item in list. */
++ 	if (master)
++ 		list_add_rcu(&adj->list, dev_list);
++ 	else
++ 		list_add_tail_rcu(&adj->list, dev_list);
++ 
++ 	return 0;
++ }
++ 
++ void __netdev_adjacent_dev_remove(struct net_device *dev,
++ 				  struct net_device *adj_dev,
++ 				  struct list_head *dev_list)
++ {
++ 	struct netdev_adjacent *adj;
++ 
++ 	adj = __netdev_find_adj(dev, adj_dev, dev_list);
++ 
++ 	if (!adj) {
++ 		pr_err("tried to remove device %s from %s\n",
++ 		       dev->name, adj_dev->name);
++ 		BUG();
++ 	}
++ 
++ 	if (adj->ref_nr > 1) {
++ 		pr_debug("%s to %s ref_nr-- = %d\n", dev->name, adj_dev->name,
++ 			 adj->ref_nr-1);
++ 		adj->ref_nr--;
++ 		return;
++ 	}
++ 
++ 	list_del_rcu(&adj->list);
++ 	pr_debug("dev_put for %s, because link removed from %s to %s\n",
++ 		 adj_dev->name, dev->name, adj_dev->name);
++ 	dev_put(adj_dev);
++ 	kfree_rcu(adj, rcu);
++ }
++ 
++ int __netdev_adjacent_dev_link_lists(struct net_device *dev,
++ 				     struct net_device *upper_dev,
++ 				     struct list_head *up_list,
++ 				     struct list_head *down_list,
++ 				     bool master)
++ {
++ 	int ret;
++ 
++ 	ret = __netdev_adjacent_dev_insert(dev, upper_dev, up_list, master);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = __netdev_adjacent_dev_insert(upper_dev, dev, down_list, false);
++ 	if (ret) {
++ 		__netdev_adjacent_dev_remove(dev, upper_dev, up_list);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int __netdev_adjacent_dev_link(struct net_device *dev,
++ 			       struct net_device *upper_dev)
++ {
++ 	return __netdev_adjacent_dev_link_lists(dev, upper_dev,
++ 						&dev->all_adj_list.upper,
++ 						&upper_dev->all_adj_list.lower,
++ 						false);
++ }
++ 
++ void __netdev_adjacent_dev_unlink_lists(struct net_device *dev,
++ 					struct net_device *upper_dev,
++ 					struct list_head *up_list,
++ 					struct list_head *down_list)
++ {
++ 	__netdev_adjacent_dev_remove(dev, upper_dev, up_list);
++ 	__netdev_adjacent_dev_remove(upper_dev, dev, down_list);
++ }
++ 
++ void __netdev_adjacent_dev_unlink(struct net_device *dev,
++ 				  struct net_device *upper_dev)
++ {
++ 	__netdev_adjacent_dev_unlink_lists(dev, upper_dev,
++ 					   &dev->all_adj_list.upper,
++ 					   &upper_dev->all_adj_list.lower);
++ }
++ 
++ int __netdev_adjacent_dev_link_neighbour(struct net_device *dev,
++ 					 struct net_device *upper_dev,
++ 					 bool master)
++ {
++ 	int ret = __netdev_adjacent_dev_link(dev, upper_dev);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = __netdev_adjacent_dev_link_lists(dev, upper_dev,
++ 					       &dev->adj_list.upper,
++ 					       &upper_dev->adj_list.lower,
++ 					       master);
++ 	if (ret) {
++ 		__netdev_adjacent_dev_unlink(dev, upper_dev);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void __netdev_adjacent_dev_unlink_neighbour(struct net_device *dev,
++ 					    struct net_device *upper_dev)
++ {
++ 	__netdev_adjacent_dev_unlink(dev, upper_dev);
++ 	__netdev_adjacent_dev_unlink_lists(dev, upper_dev,
++ 					   &dev->adj_list.upper,
++ 					   &upper_dev->adj_list.lower);
++ }
++ 
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  static int __netdev_upper_dev_link(struct net_device *dev,
+  				   struct net_device *upper_dev, bool master)
+  {
+@@@ -4661,31 -4646,91 +4823,110 @@@
+  		return -EBUSY;
+  
+  	/* To prevent loops, check if dev is not upper device to upper_dev. */
+++<<<<<<< HEAD
+ +	if (__netdev_search_upper_dev(upper_dev, dev))
+++=======
++ 	if (__netdev_find_adj(upper_dev, dev, &upper_dev->all_adj_list.upper))
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  		return -EBUSY;
+  
+- 	if (__netdev_find_upper(dev, upper_dev))
++ 	if (__netdev_find_adj(dev, upper_dev, &dev->all_adj_list.upper))
+  		return -EEXIST;
+  
+  	if (master && netdev_master_upper_dev_get(dev))
+  		return -EBUSY;
+  
+ -	ret = __netdev_adjacent_dev_link_neighbour(dev, upper_dev, master);
+ -	if (ret)
+ -		return ret;
+ +	upper = kmalloc(sizeof(*upper), GFP_KERNEL);
+ +	if (!upper)
+ +		return -ENOMEM;
+ +
+++<<<<<<< HEAD
+ +	upper->dev = upper_dev;
+ +	upper->master = master;
+ +	INIT_LIST_HEAD(&upper->search_list);
+  
+ +	/* Ensure that master upper link is always the first item in list. */
+ +	if (master)
+ +		list_add_rcu(&upper->list, &dev->upper_dev_list);
+ +	else
+ +		list_add_tail_rcu(&upper->list, &dev->upper_dev_list);
+ +	dev_hold(upper_dev);
+ +
+ +	return 0;
+++=======
++ 	/* Now that we linked these devs, make all the upper_dev's
++ 	 * all_adj_list.upper visible to every dev's all_adj_list.lower an
++ 	 * versa, and don't forget the devices itself. All of these
++ 	 * links are non-neighbours.
++ 	 */
++ 	list_for_each_entry(i, &dev->all_adj_list.lower, list) {
++ 		list_for_each_entry(j, &upper_dev->all_adj_list.upper, list) {
++ 			pr_debug("Interlinking %s with %s, non-neighbour\n",
++ 				 i->dev->name, j->dev->name);
++ 			ret = __netdev_adjacent_dev_link(i->dev, j->dev);
++ 			if (ret)
++ 				goto rollback_mesh;
++ 		}
++ 	}
++ 
++ 	/* add dev to every upper_dev's upper device */
++ 	list_for_each_entry(i, &upper_dev->all_adj_list.upper, list) {
++ 		pr_debug("linking %s's upper device %s with %s\n",
++ 			 upper_dev->name, i->dev->name, dev->name);
++ 		ret = __netdev_adjacent_dev_link(dev, i->dev);
++ 		if (ret)
++ 			goto rollback_upper_mesh;
++ 	}
++ 
++ 	/* add upper_dev to every dev's lower device */
++ 	list_for_each_entry(i, &dev->all_adj_list.lower, list) {
++ 		pr_debug("linking %s's lower device %s with %s\n", dev->name,
++ 			 i->dev->name, upper_dev->name);
++ 		ret = __netdev_adjacent_dev_link(i->dev, upper_dev);
++ 		if (ret)
++ 			goto rollback_lower_mesh;
++ 	}
++ 
++ 	call_netdevice_notifiers(NETDEV_CHANGEUPPER, dev);
++ 	return 0;
++ 
++ rollback_lower_mesh:
++ 	to_i = i;
++ 	list_for_each_entry(i, &dev->all_adj_list.lower, list) {
++ 		if (i == to_i)
++ 			break;
++ 		__netdev_adjacent_dev_unlink(i->dev, upper_dev);
++ 	}
++ 
++ 	i = NULL;
++ 
++ rollback_upper_mesh:
++ 	to_i = i;
++ 	list_for_each_entry(i, &upper_dev->all_adj_list.upper, list) {
++ 		if (i == to_i)
++ 			break;
++ 		__netdev_adjacent_dev_unlink(dev, i->dev);
++ 	}
++ 
++ 	i = j = NULL;
++ 
++ rollback_mesh:
++ 	to_i = i;
++ 	to_j = j;
++ 	list_for_each_entry(i, &dev->all_adj_list.lower, list) {
++ 		list_for_each_entry(j, &upper_dev->all_adj_list.upper, list) {
++ 			if (i == to_i && j == to_j)
++ 				break;
++ 			__netdev_adjacent_dev_unlink(i->dev, j->dev);
++ 		}
++ 		if (i == to_i)
++ 			break;
++ 	}
++ 
++ 	__netdev_adjacent_dev_unlink_neighbour(dev, upper_dev);
++ 
++ 	return ret;
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  }
+  
+  /**
+@@@ -4734,16 -4779,29 +4975,39 @@@ EXPORT_SYMBOL(netdev_master_upper_dev_l
+  void netdev_upper_dev_unlink(struct net_device *dev,
+  			     struct net_device *upper_dev)
+  {
+ -	struct netdev_adjacent *i, *j;
+ +	struct netdev_adjacent *upper;
+ +
+  	ASSERT_RTNL();
+  
+++<<<<<<< HEAD
+ +	upper = __netdev_find_upper(dev, upper_dev);
+ +	if (!upper)
+ +		return;
+ +	list_del_rcu(&upper->list);
+ +	dev_put(upper_dev);
+ +	kfree_rcu(upper, rcu);
+++=======
++ 	__netdev_adjacent_dev_unlink_neighbour(dev, upper_dev);
++ 
++ 	/* Here is the tricky part. We must remove all dev's lower
++ 	 * devices from all upper_dev's upper devices and vice
++ 	 * versa, to maintain the graph relationship.
++ 	 */
++ 	list_for_each_entry(i, &dev->all_adj_list.lower, list)
++ 		list_for_each_entry(j, &upper_dev->all_adj_list.upper, list)
++ 			__netdev_adjacent_dev_unlink(i->dev, j->dev);
++ 
++ 	/* remove also the devices itself from lower/upper device
++ 	 * list
++ 	 */
++ 	list_for_each_entry(i, &dev->all_adj_list.lower, list)
++ 		__netdev_adjacent_dev_unlink(i->dev, upper_dev);
++ 
++ 	list_for_each_entry(i, &upper_dev->all_adj_list.upper, list)
++ 		__netdev_adjacent_dev_unlink(dev, i->dev);
++ 
++ 	call_netdevice_notifiers(NETDEV_CHANGEUPPER, dev);
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  }
+  EXPORT_SYMBOL(netdev_upper_dev_unlink);
+  
+@@@ -6065,8 -6060,11 +6329,16 @@@ struct net_device *alloc_netdev_mqs(in
+  	INIT_LIST_HEAD(&dev->napi_list);
+  	INIT_LIST_HEAD(&dev->unreg_list);
+  	INIT_LIST_HEAD(&dev->link_watch_list);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&dev->upper_dev_list);
+ +	dev->priv_flags = IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM;
+++=======
++ 	INIT_LIST_HEAD(&dev->adj_list.upper);
++ 	INIT_LIST_HEAD(&dev->adj_list.lower);
++ 	INIT_LIST_HEAD(&dev->all_adj_list.upper);
++ 	INIT_LIST_HEAD(&dev->all_adj_list.lower);
++ 	dev->priv_flags = IFF_XMIT_DST_RELEASE;
+++>>>>>>> 2f268f129c2d (net: add adj_list to save only neighbours)
+  	setup(dev);
+  
+  	dev->num_tx_queues = txqs;
+* Unmerged path drivers/net/bonding/bond_alb.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
