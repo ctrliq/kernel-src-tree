@@ -1,0 +1,854 @@
+xfs: consolidate superblock logging functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 61e63ecb577f9b56bfb3182f1215b64e37a12c38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/61e63ecb.failed
+
+We now have several superblock loggin functions that are identical
+except for the transaction reservation and whether it shoul dbe a
+synchronous transaction or not. Consolidate these all into a single
+function, a single reserveration and a sync flag and call it
+xfs_sync_sb().
+
+Also, xfs_mod_sb() is not really a modification function - it's the
+operation of logging the superblock buffer. hence change the name of
+it to reflect this.
+
+Note that we have to change the mp->m_update_flags that are passed
+around at mount time to a boolean simply to indicate a superblock
+update is needed.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 61e63ecb577f9b56bfb3182f1215b64e37a12c38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr_leaf.c
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_sb.c
+#	fs/xfs/libxfs/xfs_sb.h
+#	fs/xfs/xfs_fsops.c
+#	fs/xfs/xfs_mount.c
+#	fs/xfs/xfs_qm.c
+#	fs/xfs/xfs_qm.h
+#	fs/xfs/xfs_qm_syscalls.c
+#	fs/xfs/xfs_super.c
+diff --cc fs/xfs/libxfs/xfs_attr_leaf.c
+index e210c280e72a,15105dbc9e28..000000000000
+--- a/fs/xfs/libxfs/xfs_attr_leaf.c
++++ b/fs/xfs/libxfs/xfs_attr_leaf.c
+@@@ -404,7 -403,7 +404,11 @@@ xfs_sbversion_add_attr2(xfs_mount_t *mp
+  		if (!xfs_sb_version_hasattr2(&mp->m_sb)) {
+  			xfs_sb_version_addattr2(&mp->m_sb);
+  			spin_unlock(&mp->m_sb_lock);
+++<<<<<<< HEAD
+ +			xfs_mod_sb(tp, XFS_SB_VERSIONNUM | XFS_SB_FEATURES2);
+++=======
++ 			xfs_log_sb(tp);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  		} else
+  			spin_unlock(&mp->m_sb_lock);
+  	}
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index b6f15ccf3239,63a5bb9113ee..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -1223,22 -1221,20 +1223,38 @@@ xfs_bmap_add_attrfork
+  		goto bmap_cancel;
+  	if (!xfs_sb_version_hasattr(&mp->m_sb) ||
+  	   (!xfs_sb_version_hasattr2(&mp->m_sb) && version == 2)) {
+++<<<<<<< HEAD
+ +		__int64_t sbfields = 0;
+++=======
++ 		bool log_sb = false;
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  
+  		spin_lock(&mp->m_sb_lock);
+  		if (!xfs_sb_version_hasattr(&mp->m_sb)) {
+  			xfs_sb_version_addattr(&mp->m_sb);
+++<<<<<<< HEAD
+ +			sbfields |= XFS_SB_VERSIONNUM;
+ +		}
+ +		if (!xfs_sb_version_hasattr2(&mp->m_sb) && version == 2) {
+ +			xfs_sb_version_addattr2(&mp->m_sb);
+ +			sbfields |= (XFS_SB_VERSIONNUM | XFS_SB_FEATURES2);
+ +		}
+ +		if (sbfields) {
+ +			spin_unlock(&mp->m_sb_lock);
+ +			xfs_mod_sb(tp, sbfields);
+ +		} else
+ +			spin_unlock(&mp->m_sb_lock);
+++=======
++ 			log_sb = true;
++ 		}
++ 		if (!xfs_sb_version_hasattr2(&mp->m_sb) && version == 2) {
++ 			xfs_sb_version_addattr2(&mp->m_sb);
++ 			log_sb = true;
++ 		}
++ 		spin_unlock(&mp->m_sb_lock);
++ 		if (log_sb)
++ 			xfs_log_sb(tp);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  	}
+  
+  	error = xfs_bmap_finish(&tp, &flist, &committed);
+diff --cc fs/xfs/libxfs/xfs_sb.c
+index 07f47e5690d3,63f814872dfb..000000000000
+--- a/fs/xfs/libxfs/xfs_sb.c
++++ b/fs/xfs/libxfs/xfs_sb.c
+@@@ -826,42 -753,51 +826,78 @@@ xfs_initialize_perag_data
+  }
+  
+  /*
+-  * xfs_mod_sb() can be used to copy arbitrary changes to the
+-  * in-core superblock into the superblock buffer to be logged.
+-  * It does not provide the higher level of locking that is
+-  * needed to protect the in-core superblock from concurrent
+-  * access.
++  * xfs_log_sb() can be used to copy arbitrary changes to the in-core superblock
++  * into the superblock buffer to be logged.  It does not provide the higher
++  * level of locking that is needed to protect the in-core superblock from
++  * concurrent access.
+   */
+  void
+++<<<<<<< HEAD
+ +xfs_mod_sb(xfs_trans_t *tp, __int64_t fields)
+++=======
++ xfs_log_sb(
++ 	struct xfs_trans	*tp)
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  {
+ -	struct xfs_mount	*mp = tp->t_mountp;
+ -	struct xfs_buf		*bp = xfs_trans_getsb(tp, mp, 0);
+ +	xfs_buf_t	*bp;
+ +	int		first;
+ +	int		last;
+ +	xfs_mount_t	*mp;
+ +	xfs_sb_field_t	f;
+ +
+ +	ASSERT(fields);
+ +	if (!fields)
+ +		return;
+ +	mp = tp->t_mountp;
+ +	bp = xfs_trans_getsb(tp, mp, 0);
+ +	first = sizeof(xfs_sb_t);
+ +	last = 0;
+ +
+ +	/* translate/copy */
+ +
+ +	xfs_sb_to_disk(XFS_BUF_TO_SBP(bp), &mp->m_sb, fields);
+ +
+ +	/* find modified range */
+ +	f = (xfs_sb_field_t)xfs_highbit64((__uint64_t)fields);
+ +	ASSERT((1LL << f) & XFS_SB_MOD_BITS);
+ +	last = xfs_sb_info[f + 1].offset - 1;
+ +
+ +	f = (xfs_sb_field_t)xfs_lowbit64((__uint64_t)fields);
+ +	ASSERT((1LL << f) & XFS_SB_MOD_BITS);
+ +	first = xfs_sb_info[f].offset;
+  
+ -	xfs_sb_to_disk(XFS_BUF_TO_SBP(bp), &mp->m_sb);
+  	xfs_trans_buf_set_type(tp, bp, XFS_BLFT_SB_BUF);
+ -	xfs_trans_log_buf(tp, bp, 0, sizeof(struct xfs_dsb));
+ +	xfs_trans_log_buf(tp, bp, first, last);
+  }
++ 
++ /*
++  * xfs_sync_sb
++  *
++  * Sync the superblock to disk.
++  *
++  * Note that the caller is responsible for checking the frozen state of the
++  * filesystem. This procedure uses the non-blocking transaction allocator and
++  * thus will allow modifications to a frozen fs. This is required because this
++  * code can be called during the process of freezing where use of the high-level
++  * allocator would deadlock.
++  */
++ int
++ xfs_sync_sb(
++ 	struct xfs_mount	*mp,
++ 	bool			wait)
++ {
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 
++ 	tp = _xfs_trans_alloc(mp, XFS_TRANS_SB_CHANGE, KM_SLEEP);
++ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
++ 	if (error) {
++ 		xfs_trans_cancel(tp, 0);
++ 		return error;
++ 	}
++ 
++ 	xfs_log_sb(tp);
++ 	if (wait)
++ 		xfs_trans_set_sync(tp);
++ 	return xfs_trans_commit(tp, 0);
++ }
+diff --cc fs/xfs/libxfs/xfs_sb.h
+index 9e6a3d51a942,b25bb9a343f3..000000000000
+--- a/fs/xfs/libxfs/xfs_sb.h
++++ b/fs/xfs/libxfs/xfs_sb.h
+@@@ -636,11 -27,12 +636,20 @@@ extern struct xfs_perag *xfs_perag_get_
+  extern void	xfs_perag_put(struct xfs_perag *pag);
+  extern int	xfs_initialize_perag_data(struct xfs_mount *, xfs_agnumber_t);
+  
+++<<<<<<< HEAD
+ +extern void	xfs_sb_calc_crc(struct xfs_buf	*);
+ +extern void	xfs_mod_sb(struct xfs_trans *, __int64_t);
+ +extern void	xfs_sb_mount_common(struct xfs_mount *, struct xfs_sb *);
+ +extern void	xfs_sb_from_disk(struct xfs_sb *, struct xfs_dsb *);
+ +extern void	xfs_sb_to_disk(struct xfs_dsb *, struct xfs_sb *, __int64_t);
+++=======
++ extern void	xfs_sb_calc_crc(struct xfs_buf *bp);
++ extern void	xfs_log_sb(struct xfs_trans *tp);
++ extern int	xfs_sync_sb(struct xfs_mount *mp, bool wait);
++ extern void	xfs_sb_mount_common(struct xfs_mount *mp, struct xfs_sb *sbp);
++ extern void	xfs_sb_from_disk(struct xfs_sb *to, struct xfs_dsb *from);
++ extern void	xfs_sb_to_disk(struct xfs_dsb *to, struct xfs_sb *from);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  extern void	xfs_sb_quota_from_disk(struct xfs_sb *sbp);
+  
+  #endif	/* __XFS_SB_H__ */
+diff --cc fs/xfs/xfs_fsops.c
+index 3445ead7c1fc,f7114527cd2f..000000000000
+--- a/fs/xfs/xfs_fsops.c
++++ b/fs/xfs/xfs_fsops.c
+@@@ -766,37 -756,6 +766,40 @@@ out
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Dump a transaction into the log that contains no real change. This is needed
+ + * to be able to make the log dirty or stamp the current tail LSN into the log
+ + * during the covering operation.
+ + *
+ + * We cannot use an inode here for this - that will push dirty state back up
+ + * into the VFS and then periodic inode flushing will prevent log covering from
+ + * making progress. Hence we log a field in the superblock instead and use a
+ + * synchronous transaction to ensure the superblock is immediately unpinned
+ + * and can be written back.
+ + */
+ +int
+ +xfs_fs_log_dummy(
+ +	xfs_mount_t	*mp)
+ +{
+ +	xfs_trans_t	*tp;
+ +	int		error;
+ +
+ +	tp = _xfs_trans_alloc(mp, XFS_TRANS_DUMMY1, KM_SLEEP);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		return error;
+ +	}
+ +
+ +	/* log the UUID because it is an unchanging field */
+ +	xfs_mod_sb(tp, XFS_SB_UUID);
+ +	xfs_trans_set_sync(tp);
+ +	return xfs_trans_commit(tp, 0);
+ +}
+ +
+++=======
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  int
+  xfs_fs_goingdown(
+  	xfs_mount_t	*mp,
+diff --cc fs/xfs/xfs_mount.c
+index 1f0460bd27b8,5ef9aa2bfa19..000000000000
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@@ -608,23 -592,10 +602,23 @@@ xfs_mount_reset_sbqflags
+  	mp->m_sb.sb_qflags = 0;
+  	spin_unlock(&mp->m_sb_lock);
+  
+- 	/*
+- 	 * If the fs is readonly, let the incore superblock run
+- 	 * with quotas off but don't flush the update out to disk
+- 	 */
+- 	if (mp->m_flags & XFS_MOUNT_RDONLY)
++ 	if (!xfs_fs_writable(mp, SB_FREEZE_WRITE))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	tp = xfs_trans_alloc(mp, XFS_TRANS_QM_SBCHANGE);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_sbchange, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		xfs_alert(mp, "%s: Superblock update failed!", __func__);
+ +		return error;
+ +	}
+ +
+ +	xfs_mod_sb(tp, XFS_SB_QFLAGS);
+ +	return xfs_trans_commit(tp, 0);
+++=======
++ 	return xfs_sync_sb(mp, false);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  }
+  
+  __uint64_t
+@@@ -706,9 -677,15 +700,18 @@@ xfs_mountfs
+  
+  		/* update sb_versionnum for the clearing of the morebits */
+  		if (!sbp->sb_features2)
+- 			mp->m_update_flags |= XFS_SB_VERSIONNUM;
++ 			mp->m_update_sb = true;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* always use v2 inodes by default now */
++ 	if (!(mp->m_sb.sb_versionnum & XFS_SB_VERSION_NLINKBIT)) {
++ 		mp->m_sb.sb_versionnum |= XFS_SB_VERSION_NLINKBIT;
++ 		mp->m_update_sb = true;
++ 	}
++ 
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  	/*
+  	 * Check if sb_agblocks is aligned at stripe boundary
+  	 * If sb_agblocks is NOT aligned turn off m_dalign since
+@@@ -899,8 -876,8 +902,13 @@@
+  	 * the next remount into writeable mode.  Otherwise we would never
+  	 * perform the update e.g. for the root filesystem.
+  	 */
+++<<<<<<< HEAD
+ +	if (mp->m_update_flags && !(mp->m_flags & XFS_MOUNT_RDONLY)) {
+ +		error = xfs_mount_log_sb(mp, mp->m_update_flags);
+++=======
++ 	if (mp->m_update_sb && !(mp->m_flags & XFS_MOUNT_RDONLY)) {
++ 		error = xfs_sync_sb(mp, false);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  		if (error) {
+  			xfs_warn(mp, "failed to write sb changes");
+  			goto out_rtunmount;
+@@@ -1123,17 -1097,7 +1128,21 @@@ xfs_log_sbcount(xfs_mount_t *mp
+  	if (!xfs_sb_version_haslazysbcount(&mp->m_sb))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	tp = _xfs_trans_alloc(mp, XFS_TRANS_SB_COUNT, KM_SLEEP);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		return error;
+ +	}
+ +
+ +	xfs_mod_sb(tp, XFS_SB_IFREE | XFS_SB_ICOUNT | XFS_SB_FDBLOCKS);
+ +	xfs_trans_set_sync(tp);
+ +	error = xfs_trans_commit(tp, 0);
+ +	return error;
+++=======
++ 	return xfs_sync_sb(mp, true);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  }
+  
+  /*
+@@@ -1427,34 -1391,6 +1436,37 @@@ xfs_freesb
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Used to log changes to the superblock unit and width fields which could
+ + * be altered by the mount options, as well as any potential sb_features2
+ + * fixup. Only the first superblock is updated.
+ + */
+ +int
+ +xfs_mount_log_sb(
+ +	xfs_mount_t	*mp,
+ +	__int64_t	fields)
+ +{
+ +	xfs_trans_t	*tp;
+ +	int		error;
+ +
+ +	ASSERT(fields & (XFS_SB_UNIT | XFS_SB_WIDTH | XFS_SB_UUID |
+ +			 XFS_SB_FEATURES2 | XFS_SB_BAD_FEATURES2 |
+ +			 XFS_SB_VERSIONNUM));
+ +
+ +	tp = xfs_trans_alloc(mp, XFS_TRANS_SB_UNIT);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		return error;
+ +	}
+ +	xfs_mod_sb(tp, fields);
+ +	error = xfs_trans_commit(tp, 0);
+ +	return error;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+   * If the underlying (data/log/rt) device is readonly, there are some
+   * operations that cannot proceed.
+   */
+diff --cc fs/xfs/xfs_qm.c
+index cf4f87e96c1f,3e8186279541..000000000000
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@@ -828,7 -792,7 +828,11 @@@ xfs_qm_qino_alloc
+  	else
+  		mp->m_sb.sb_pquotino = (*ip)->i_ino;
+  	spin_unlock(&mp->m_sb_lock);
+++<<<<<<< HEAD
+ +	xfs_mod_sb(tp, sbfields);
+++=======
++ 	xfs_log_sb(tp);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  
+  	if ((error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES))) {
+  		xfs_alert(mp, "%s failed (error %d)!", __func__, error);
+@@@ -1481,7 -1445,7 +1485,11 @@@ xfs_qm_mount_quotas
+  	spin_unlock(&mp->m_sb_lock);
+  
+  	if (sbf != (mp->m_qflags & XFS_MOUNT_QUOTA_ALL)) {
+++<<<<<<< HEAD
+ +		if (xfs_qm_write_sb_changes(mp, XFS_SB_QFLAGS)) {
+++=======
++ 		if (xfs_sync_sb(mp, false)) {
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  			/*
+  			 * We could only have been turning quotas off.
+  			 * We aren't in very good shape actually because
+@@@ -1617,158 -1574,6 +1625,161 @@@ xfs_qm_dqfree_one
+  	xfs_qm_dqdestroy(dqp);
+  }
+  
+++<<<<<<< HEAD
+ +STATIC void
+ +xfs_qm_dqreclaim_one(
+ +	struct xfs_dquot	*dqp,
+ +	struct list_head	*buffer_list,
+ +	struct list_head	*dispose_list)
+ +{
+ +	struct xfs_mount	*mp = dqp->q_mount;
+ +	struct xfs_quotainfo	*qi = mp->m_quotainfo;
+ +	int			error;
+ +
+ +	if (!xfs_dqlock_nowait(dqp))
+ +		goto out_move_tail;
+ +
+ +	/*
+ +	 * This dquot has acquired a reference in the meantime remove it from
+ +	 * the freelist and try again.
+ +	 */
+ +	if (dqp->q_nrefs) {
+ +		xfs_dqunlock(dqp);
+ +
+ +		trace_xfs_dqreclaim_want(dqp);
+ +		XFS_STATS_INC(xs_qm_dqwants);
+ +
+ +		list_del_init(&dqp->q_lru);
+ +		qi->qi_lru_count--;
+ +		XFS_STATS_DEC(xs_qm_dquot_unused);
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * Try to grab the flush lock. If this dquot is in the process of
+ +	 * getting flushed to disk, we don't want to reclaim it.
+ +	 */
+ +	if (!xfs_dqflock_nowait(dqp))
+ +		goto out_unlock_move_tail;
+ +
+ +	if (XFS_DQ_IS_DIRTY(dqp)) {
+ +		struct xfs_buf	*bp = NULL;
+ +
+ +		trace_xfs_dqreclaim_dirty(dqp);
+ +
+ +		error = xfs_qm_dqflush(dqp, &bp);
+ +		if (error) {
+ +			xfs_warn(mp, "%s: dquot %p flush failed",
+ +				 __func__, dqp);
+ +			goto out_unlock_move_tail;
+ +		}
+ +
+ +		xfs_buf_delwri_queue(bp, buffer_list);
+ +		xfs_buf_relse(bp);
+ +		/*
+ +		 * Give the dquot another try on the freelist, as the
+ +		 * flushing will take some time.
+ +		 */
+ +		goto out_unlock_move_tail;
+ +	}
+ +	xfs_dqfunlock(dqp);
+ +
+ +	/*
+ +	 * Prevent lookups now that we are past the point of no return.
+ +	 */
+ +	dqp->dq_flags |= XFS_DQ_FREEING;
+ +	xfs_dqunlock(dqp);
+ +
+ +	ASSERT(dqp->q_nrefs == 0);
+ +	list_move_tail(&dqp->q_lru, dispose_list);
+ +	qi->qi_lru_count--;
+ +	XFS_STATS_DEC(xs_qm_dquot_unused);
+ +
+ +	trace_xfs_dqreclaim_done(dqp);
+ +	XFS_STATS_INC(xs_qm_dqreclaims);
+ +	return;
+ +
+ +	/*
+ +	 * Move the dquot to the tail of the list so that we don't spin on it.
+ +	 */
+ +out_unlock_move_tail:
+ +	xfs_dqunlock(dqp);
+ +out_move_tail:
+ +	list_move_tail(&dqp->q_lru, &qi->qi_lru_list);
+ +	trace_xfs_dqreclaim_busy(dqp);
+ +	XFS_STATS_INC(xs_qm_dqreclaim_misses);
+ +}
+ +
+ +STATIC int
+ +xfs_qm_shake(
+ +	struct shrinker		*shrink,
+ +	struct shrink_control	*sc)
+ +{
+ +	struct xfs_quotainfo	*qi =
+ +		container_of(shrink, struct xfs_quotainfo, qi_shrinker);
+ +	int			nr_to_scan = sc->nr_to_scan;
+ +	LIST_HEAD		(buffer_list);
+ +	LIST_HEAD		(dispose_list);
+ +	struct xfs_dquot	*dqp;
+ +	int			error;
+ +
+ +	if ((sc->gfp_mask & (__GFP_FS|__GFP_WAIT)) != (__GFP_FS|__GFP_WAIT))
+ +		return 0;
+ +	if (!nr_to_scan)
+ +		goto out;
+ +
+ +	mutex_lock(&qi->qi_lru_lock);
+ +	while (!list_empty(&qi->qi_lru_list)) {
+ +		if (nr_to_scan-- <= 0)
+ +			break;
+ +		dqp = list_first_entry(&qi->qi_lru_list, struct xfs_dquot,
+ +				       q_lru);
+ +		xfs_qm_dqreclaim_one(dqp, &buffer_list, &dispose_list);
+ +	}
+ +	mutex_unlock(&qi->qi_lru_lock);
+ +
+ +	error = xfs_buf_delwri_submit(&buffer_list);
+ +	if (error)
+ +		xfs_warn(NULL, "%s: dquot reclaim failed", __func__);
+ +
+ +	while (!list_empty(&dispose_list)) {
+ +		dqp = list_first_entry(&dispose_list, struct xfs_dquot, q_lru);
+ +		list_del_init(&dqp->q_lru);
+ +		xfs_qm_dqfree_one(dqp);
+ +	}
+ +
+ +out:
+ +	return (qi->qi_lru_count / 100) * sysctl_vfs_cache_pressure;
+ +}
+ +
+ +/*
+ + * Start a transaction and write the incore superblock changes to
+ + * disk. flags parameter indicates which fields have changed.
+ + */
+ +int
+ +xfs_qm_write_sb_changes(
+ +	xfs_mount_t	*mp,
+ +	__int64_t	flags)
+ +{
+ +	xfs_trans_t	*tp;
+ +	int		error;
+ +
+ +	tp = xfs_trans_alloc(mp, XFS_TRANS_QM_SBCHANGE);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_sbchange, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		return error;
+ +	}
+ +
+ +	xfs_mod_sb(tp, flags);
+ +	error = xfs_trans_commit(tp, 0);
+ +
+ +	return error;
+ +}
+ +
+ +
+++=======
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  /* --------------- utility functions for vnodeops ---------------- */
+  
+  
+diff --cc fs/xfs/xfs_qm.h
+index ff0e59c318f7,d6e4d88094ab..000000000000
+--- a/fs/xfs/xfs_qm.h
++++ b/fs/xfs/xfs_qm.h
+@@@ -159,7 -157,6 +159,10 @@@ struct xfs_dquot_acct 
+  #define XFS_QM_RTBWARNLIMIT	5
+  
+  extern void		xfs_qm_destroy_quotainfo(struct xfs_mount *);
+++<<<<<<< HEAD
+ +extern int		xfs_qm_write_sb_changes(struct xfs_mount *, __int64_t);
+++=======
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  
+  /* dquot stuff */
+  extern void		xfs_qm_dqpurge_all(struct xfs_mount *, uint);
+diff --cc fs/xfs/xfs_qm_syscalls.c
+index 98609d59d912,b8a565edb4ae..000000000000
+--- a/fs/xfs/xfs_qm_syscalls.c
++++ b/fs/xfs/xfs_qm_syscalls.c
+@@@ -93,8 -92,7 +93,12 @@@ xfs_qm_scall_quotaoff
+  		mutex_unlock(&q->qi_quotaofflock);
+  
+  		/* XXX what to do if error ? Revert back to old vals incore ? */
+++<<<<<<< HEAD
+ +		error = xfs_qm_write_sb_changes(mp, XFS_SB_QFLAGS);
+ +		return error;
+++=======
++ 		return xfs_sync_sb(mp, false);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  	}
+  
+  	dqtype = 0;
+@@@ -365,11 -366,11 +369,16 @@@ xfs_qm_scall_quotaon
+  	/*
+  	 * There's nothing to change if it's the same.
+  	 */
+ -	if ((qf & flags) == flags)
+ -		return -EEXIST;
+ +	if ((qf & flags) == flags && sbflags == 0)
+ +		return XFS_ERROR(EEXIST);
+ +	sbflags |= XFS_SB_QFLAGS;
+  
+++<<<<<<< HEAD
+ +	if ((error = xfs_qm_write_sb_changes(mp, sbflags)))
+++=======
++ 	error = xfs_sync_sb(mp, false);
++ 	if (error)
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  		return error;
+  	/*
+  	 * If we aren't trying to switch on quota enforcement, we are done.
+@@@ -776,7 -797,7 +785,11 @@@ xfs_qm_log_quotaoff
+  	mp->m_sb.sb_qflags = (mp->m_qflags & ~(flags)) & XFS_MOUNT_QUOTA_ALL;
+  	spin_unlock(&mp->m_sb_lock);
+  
+++<<<<<<< HEAD
+ +	xfs_mod_sb(tp, XFS_SB_QFLAGS);
+++=======
++ 	xfs_log_sb(tp);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  
+  	/*
+  	 * We have to make sure that the transaction is secure on disk before we
+diff --cc fs/xfs/xfs_super.c
+index 43f644fc7e7d,a3b791b85336..000000000000
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@@ -1274,8 -1257,8 +1274,13 @@@ xfs_fs_remount
+  		 * If this is the first remount to writeable state we
+  		 * might have some superblock changes to update.
+  		 */
+++<<<<<<< HEAD
+ +		if (mp->m_update_flags) {
+ +			error = xfs_mount_log_sb(mp, mp->m_update_flags);
+++=======
++ 		if (mp->m_update_sb) {
++ 			error = xfs_sync_sb(mp, false);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  			if (error) {
+  				xfs_warn(mp, "failed to write sb changes");
+  				return error;
+@@@ -1321,7 -1305,7 +1327,11 @@@ xfs_fs_freeze
+  
+  	xfs_save_resvblks(mp);
+  	xfs_quiesce_attr(mp);
+++<<<<<<< HEAD
+ +	return -xfs_fs_log_dummy(mp);
+++=======
++ 	return xfs_sync_sb(mp, true);
+++>>>>>>> 61e63ecb577f (xfs: consolidate superblock logging functions)
+  }
+  
+  STATIC int
+* Unmerged path fs/xfs/libxfs/xfs_attr_leaf.c
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/libxfs/xfs_sb.c
+* Unmerged path fs/xfs/libxfs/xfs_sb.h
+diff --git a/fs/xfs/libxfs/xfs_shared.h b/fs/xfs/libxfs/xfs_shared.h
+index 82404da2ca67..8dda4b321343 100644
+--- a/fs/xfs/libxfs/xfs_shared.h
++++ b/fs/xfs/libxfs/xfs_shared.h
+@@ -82,7 +82,7 @@ extern const struct xfs_buf_ops xfs_symlink_buf_ops;
+ #define	XFS_TRANS_ATTR_RM		23
+ #define	XFS_TRANS_ATTR_FLAG		24
+ #define	XFS_TRANS_CLEAR_AGI_BUCKET	25
+-#define XFS_TRANS_QM_SBCHANGE		26
++#define XFS_TRANS_SB_CHANGE		26
+ /*
+  * Dummy entries since we use the transaction type to index into the
+  * trans_type[] in xlog_recover_print_trans_head()
+@@ -95,17 +95,15 @@ extern const struct xfs_buf_ops xfs_symlink_buf_ops;
+ #define XFS_TRANS_QM_DQCLUSTER		32
+ #define XFS_TRANS_QM_QINOCREATE		33
+ #define XFS_TRANS_QM_QUOTAOFF_END	34
+-#define XFS_TRANS_SB_UNIT		35
+-#define XFS_TRANS_FSYNC_TS		36
+-#define	XFS_TRANS_GROWFSRT_ALLOC	37
+-#define	XFS_TRANS_GROWFSRT_ZERO		38
+-#define	XFS_TRANS_GROWFSRT_FREE		39
+-#define	XFS_TRANS_SWAPEXT		40
+-#define	XFS_TRANS_SB_COUNT		41
+-#define	XFS_TRANS_CHECKPOINT		42
+-#define	XFS_TRANS_ICREATE		43
+-#define	XFS_TRANS_CREATE_TMPFILE	44
+-#define	XFS_TRANS_TYPE_MAX		44
++#define XFS_TRANS_FSYNC_TS		35
++#define	XFS_TRANS_GROWFSRT_ALLOC	36
++#define	XFS_TRANS_GROWFSRT_ZERO		37
++#define	XFS_TRANS_GROWFSRT_FREE		38
++#define	XFS_TRANS_SWAPEXT		39
++#define	XFS_TRANS_CHECKPOINT		40
++#define	XFS_TRANS_ICREATE		41
++#define	XFS_TRANS_CREATE_TMPFILE	42
++#define	XFS_TRANS_TYPE_MAX		43
+ /* new transaction types need to be reflected in xfs_logprint(8) */
+ 
+ #define XFS_TRANS_TYPES \
+@@ -113,7 +111,6 @@ extern const struct xfs_buf_ops xfs_symlink_buf_ops;
+ 	{ XFS_TRANS_SETATTR_SIZE,	"SETATTR_SIZE" }, \
+ 	{ XFS_TRANS_INACTIVE,		"INACTIVE" }, \
+ 	{ XFS_TRANS_CREATE,		"CREATE" }, \
+-	{ XFS_TRANS_CREATE_TMPFILE,	"CREATE_TMPFILE" }, \
+ 	{ XFS_TRANS_CREATE_TRUNC,	"CREATE_TRUNC" }, \
+ 	{ XFS_TRANS_TRUNCATE_FILE,	"TRUNCATE_FILE" }, \
+ 	{ XFS_TRANS_REMOVE,		"REMOVE" }, \
+@@ -134,23 +131,23 @@ extern const struct xfs_buf_ops xfs_symlink_buf_ops;
+ 	{ XFS_TRANS_ATTR_RM,		"ATTR_RM" }, \
+ 	{ XFS_TRANS_ATTR_FLAG,		"ATTR_FLAG" }, \
+ 	{ XFS_TRANS_CLEAR_AGI_BUCKET,	"CLEAR_AGI_BUCKET" }, \
+-	{ XFS_TRANS_QM_SBCHANGE,	"QM_SBCHANGE" }, \
++	{ XFS_TRANS_SB_CHANGE,		"SBCHANGE" }, \
++	{ XFS_TRANS_DUMMY1,		"DUMMY1" }, \
++	{ XFS_TRANS_DUMMY2,		"DUMMY2" }, \
+ 	{ XFS_TRANS_QM_QUOTAOFF,	"QM_QUOTAOFF" }, \
+ 	{ XFS_TRANS_QM_DQALLOC,		"QM_DQALLOC" }, \
+ 	{ XFS_TRANS_QM_SETQLIM,		"QM_SETQLIM" }, \
+ 	{ XFS_TRANS_QM_DQCLUSTER,	"QM_DQCLUSTER" }, \
+ 	{ XFS_TRANS_QM_QINOCREATE,	"QM_QINOCREATE" }, \
+ 	{ XFS_TRANS_QM_QUOTAOFF_END,	"QM_QOFF_END" }, \
+-	{ XFS_TRANS_SB_UNIT,		"SB_UNIT" }, \
+ 	{ XFS_TRANS_FSYNC_TS,		"FSYNC_TS" }, \
+ 	{ XFS_TRANS_GROWFSRT_ALLOC,	"GROWFSRT_ALLOC" }, \
+ 	{ XFS_TRANS_GROWFSRT_ZERO,	"GROWFSRT_ZERO" }, \
+ 	{ XFS_TRANS_GROWFSRT_FREE,	"GROWFSRT_FREE" }, \
+ 	{ XFS_TRANS_SWAPEXT,		"SWAPEXT" }, \
+-	{ XFS_TRANS_SB_COUNT,		"SB_COUNT" }, \
+ 	{ XFS_TRANS_CHECKPOINT,		"CHECKPOINT" }, \
+-	{ XFS_TRANS_DUMMY1,		"DUMMY1" }, \
+-	{ XFS_TRANS_DUMMY2,		"DUMMY2" }, \
++	{ XFS_TRANS_ICREATE,		"ICREATE" }, \
++	{ XFS_TRANS_CREATE_TMPFILE,	"CREATE_TMPFILE" }, \
+ 	{ XLOG_UNMOUNT_REC_TYPE,	"UNMOUNT" }
+ 
+ /*
+diff --git a/fs/xfs/libxfs/xfs_trans_resv.c b/fs/xfs/libxfs/xfs_trans_resv.c
+index 8d6ab48deb5a..07a28ebb9397 100644
+--- a/fs/xfs/libxfs/xfs_trans_resv.c
++++ b/fs/xfs/libxfs/xfs_trans_resv.c
+@@ -702,17 +702,6 @@ xfs_calc_clear_agi_bucket_reservation(
+ 	return xfs_calc_buf_res(1, mp->m_sb.sb_sectsize);
+ }
+ 
+-/*
+- * Clearing the quotaflags in the superblock.
+- *	the super block for changing quota flags: sector size
+- */
+-STATIC uint
+-xfs_calc_qm_sbchange_reservation(
+-	struct xfs_mount	*mp)
+-{
+-	return xfs_calc_buf_res(1, mp->m_sb.sb_sectsize);
+-}
+-
+ /*
+  * Adjusting quota limits.
+  *    the xfs_disk_dquot_t: sizeof(struct xfs_disk_dquot)
+@@ -851,9 +840,6 @@ xfs_trans_resv_calc(
+ 	 * The following transactions are logged in logical format with
+ 	 * a default log count.
+ 	 */
+-	resp->tr_qm_sbchange.tr_logres = xfs_calc_qm_sbchange_reservation(mp);
+-	resp->tr_qm_sbchange.tr_logcount = XFS_DEFAULT_LOG_COUNT;
+-
+ 	resp->tr_qm_setqlim.tr_logres = xfs_calc_qm_setqlim_reservation(mp);
+ 	resp->tr_qm_setqlim.tr_logcount = XFS_DEFAULT_LOG_COUNT;
+ 
+diff --git a/fs/xfs/libxfs/xfs_trans_resv.h b/fs/xfs/libxfs/xfs_trans_resv.h
+index 1097d14cd583..2d5bdfce6d8f 100644
+--- a/fs/xfs/libxfs/xfs_trans_resv.h
++++ b/fs/xfs/libxfs/xfs_trans_resv.h
+@@ -56,7 +56,6 @@ struct xfs_trans_resv {
+ 	struct xfs_trans_res	tr_growrtalloc;	/* grow realtime allocations */
+ 	struct xfs_trans_res	tr_growrtzero;	/* grow realtime zeroing */
+ 	struct xfs_trans_res	tr_growrtfree;	/* grow realtime freeing */
+-	struct xfs_trans_res	tr_qm_sbchange;	/* change quota flags */
+ 	struct xfs_trans_res	tr_qm_setqlim;	/* adjust quota limits */
+ 	struct xfs_trans_res	tr_qm_dqalloc;	/* allocate quota on disk */
+ 	struct xfs_trans_res	tr_qm_quotaoff;	/* turn quota off */
+* Unmerged path fs/xfs/xfs_fsops.c
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 84ac30e4a69c..13f6b53dd2bf 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -35,6 +35,7 @@
+ #include "xfs_fsops.h"
+ #include "xfs_cksum.h"
+ #include "xfs_sysfs.h"
++#include "xfs_sb.h"
+ 
+ kmem_zone_t	*xfs_log_ticket_zone;
+ 
+@@ -1292,9 +1293,20 @@ xfs_log_worker(
+ 	struct xfs_mount	*mp = log->l_mp;
+ 
+ 	/* dgc: errors ignored - not fatal and nowhere to report them */
+-	if (xfs_log_need_covered(mp))
+-		xfs_fs_log_dummy(mp);
+-	else
++	if (xfs_log_need_covered(mp)) {
++		/*
++		 * Dump a transaction into the log that contains no real change.
++		 * This is needed to stamp the current tail LSN into the log
++		 * during the covering operation.
++		 *
++		 * We cannot use an inode here for this - that will push dirty
++		 * state back up into the VFS and then periodic inode flushing
++		 * will prevent log covering from making progress. Hence we
++		 * synchronously log the superblock instead to ensure the
++		 * superblock is immediately unpinned and can be written back.
++		 */
++		xfs_sync_sb(mp, true);
++	} else
+ 		xfs_log_force(mp, 0);
+ 
+ 	/* start pushing all the metadata that is currently dirty */
+* Unmerged path fs/xfs/xfs_mount.c
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index 388fb64ed369..50ffa30c2f95 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -169,8 +169,7 @@ typedef struct xfs_mount {
+ 	struct delayed_work	m_reclaim_work;	/* background inode reclaim */
+ 	struct delayed_work	m_eofblocks_work; /* background eof blocks
+ 						     trimming */
+-	__int64_t		m_update_flags;	/* sb flags we need to update
+-						   on the next remount,rw */
++	bool			m_update_sb;	/* sb needs update in mount */
+ 	int64_t			m_low_space[XFS_LOWSP_MAX];
+ 						/* low free space thresholds */
+ 	struct xfs_kobj		m_kobj;
+* Unmerged path fs/xfs/xfs_qm.c
+* Unmerged path fs/xfs/xfs_qm.h
+* Unmerged path fs/xfs/xfs_qm_syscalls.c
+* Unmerged path fs/xfs/xfs_super.c
