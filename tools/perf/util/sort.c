@@ -26,7 +26,15 @@ int		sort__has_sym = 0;
 int		sort__has_dso = 0;
 enum sort_mode	sort__mode = SORT_MODE__NORMAL;
 
-
+/*
+ * Replaces all occurrences of a char used with the:
+ *
+ * -t, --field-separator
+ *
+ * option, that uses a special separator character and don't pad with spaces,
+ * replacing all occurances of this separator in symbol names (and other
+ * output) with a '.' character, that thus it's the only non valid separator.
+*/
 static int repsep_snprintf(char *bf, size_t size, const char *fmt, ...)
 {
 	int n;
