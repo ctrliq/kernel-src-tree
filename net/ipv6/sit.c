@@ -1621,6 +1621,7 @@ static int __net_init sit_init_net(struct net *net)
 		goto err_alloc_dev;
 	}
 	dev_net_set(sitn->fb_tunnel_dev, net);
+	sitn->fb_tunnel_dev->rtnl_link_ops = &sit_link_ops;
 	/* FB netdevice is special: we have one, and only one per netns.
 	 * Allowing to move it to another netns is clearly unsafe.
 	 */
@@ -1655,7 +1656,6 @@ static void __net_exit sit_exit_net(struct net *net)
 
 	rtnl_lock();
 	sit_destroy_tunnels(sitn, &list);
-	unregister_netdevice_queue(sitn->fb_tunnel_dev, &list);
 	unregister_netdevice_many(&list);
 	rtnl_unlock();
 }
