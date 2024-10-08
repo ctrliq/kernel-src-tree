@@ -1,0 +1,138 @@
+lpfc: fix discovery timeout during nameserver login
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [scsi] lpfc: 10.4.8000.0: Fix discovery timeout during nameserver login (Rob Evers) [1149846]
+Rebuild_FUZZ: 88.70%
+commit-author James Smart <james.smart@emulex.com>
+commit dafe8ceaa89577062c2364139997f04a32f77502
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/dafe8cea.failed
+
+Fix discovery timeout during nameserver login
+
+	Signed-off-by: James Smart <james.smart@emulex.com>
+	Signed-off-by: Dick Kennedy <dick.kennedy@emulex.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit dafe8ceaa89577062c2364139997f04a32f77502)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index e937d89f4675,7f54916c4f62..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -890,13 -986,15 +890,22 @@@ lpfc_hba_down_post_s4(struct lpfc_hba *
+  {
+  	struct lpfc_scsi_buf *psb, *psb_next;
+  	LIST_HEAD(aborts);
+ +	int ret;
+  	unsigned long iflag = 0;
+  	struct lpfc_sglq *sglq_entry = NULL;
++ 	struct lpfc_sli *psli = &phba->sli;
++ 	struct lpfc_sli_ring *pring;
+  
+++<<<<<<< HEAD
+ +	ret = lpfc_hba_down_post_s3(phba);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	lpfc_hba_free_post_buf(phba);
++ 	lpfc_hba_clean_txcmplq(phba);
++ 	pring = &psli->ring[LPFC_ELS_RING];
++ 
+++>>>>>>> dafe8ceaa895 (lpfc: fix discovery timeout during nameserver login)
+  	/* At this point in time the HBA is either reset or DOA. Either
+  	 * way, nothing should be on lpfc_abts_els_sgl_list, it needs to be
+  	 * on the lpfc_sgl_list so that it can either be freed if the
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index 624fe0b3cc0b..e15f176ee71e 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -8187,9 +8187,11 @@ lpfc_sli4_els_xri_aborted(struct lpfc_hba *phba,
+ 			list_del(&sglq_entry->list);
+ 			ndlp = sglq_entry->ndlp;
+ 			sglq_entry->ndlp = NULL;
++			spin_lock(&pring->ring_lock);
+ 			list_add_tail(&sglq_entry->list,
+ 				&phba->sli4_hba.lpfc_sgl_list);
+ 			sglq_entry->state = SGL_FREED;
++			spin_unlock(&pring->ring_lock);
+ 			spin_unlock(&phba->sli4_hba.abts_sgl_list_lock);
+ 			spin_unlock_irqrestore(&phba->hbalock, iflag);
+ 			lpfc_set_rrq_active(phba, ndlp,
+@@ -8208,12 +8210,15 @@ lpfc_sli4_els_xri_aborted(struct lpfc_hba *phba,
+ 		spin_unlock_irqrestore(&phba->hbalock, iflag);
+ 		return;
+ 	}
++	spin_lock(&pring->ring_lock);
+ 	sglq_entry = __lpfc_get_active_sglq(phba, lxri);
+ 	if (!sglq_entry || (sglq_entry->sli4_xritag != xri)) {
++		spin_unlock(&pring->ring_lock);
+ 		spin_unlock_irqrestore(&phba->hbalock, iflag);
+ 		return;
+ 	}
+ 	sglq_entry->state = SGL_XRI_ABORTED;
++	spin_unlock(&pring->ring_lock);
+ 	spin_unlock_irqrestore(&phba->hbalock, iflag);
+ 	return;
+ }
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 546352fa1999..c40c8ebb8152 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -937,7 +937,7 @@ out:
+  * @phba: Pointer to HBA context object.
+  * @piocb: Pointer to the iocbq.
+  *
+- * This function is called with hbalock held. This function
++ * This function is called with the ring lock held. This function
+  * gets a new driver sglq object from the sglq list. If the
+  * list is not empty then it is successful, it returns pointer to the newly
+  * allocated sglq object else it returns NULL.
+@@ -1053,10 +1053,12 @@ __lpfc_sli_release_iocbq_s4(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq)
+ 			spin_unlock_irqrestore(
+ 				&phba->sli4_hba.abts_sgl_list_lock, iflag);
+ 		} else {
++			spin_lock_irqsave(&pring->ring_lock, iflag);
+ 			sglq->state = SGL_FREED;
+ 			sglq->ndlp = NULL;
+ 			list_add_tail(&sglq->list,
+ 				&phba->sli4_hba.lpfc_sgl_list);
++			spin_unlock_irqrestore(&pring->ring_lock, iflag);
+ 
+ 			/* Check if TXQ queue needs to be serviced */
+ 			if (!list_empty(&pring->txq))
+@@ -6024,14 +6026,18 @@ lpfc_sli4_repost_els_sgl_list(struct lpfc_hba *phba)
+ 	struct lpfc_sglq *sglq_entry_first = NULL;
+ 	int status, total_cnt, post_cnt = 0, num_posted = 0, block_cnt = 0;
+ 	int last_xritag = NO_XRI;
++	struct lpfc_sli_ring *pring;
+ 	LIST_HEAD(prep_sgl_list);
+ 	LIST_HEAD(blck_sgl_list);
+ 	LIST_HEAD(allc_sgl_list);
+ 	LIST_HEAD(post_sgl_list);
+ 	LIST_HEAD(free_sgl_list);
+ 
++	pring = &phba->sli.ring[LPFC_ELS_RING];
+ 	spin_lock_irq(&phba->hbalock);
++	spin_lock(&pring->ring_lock);
+ 	list_splice_init(&phba->sli4_hba.lpfc_sgl_list, &allc_sgl_list);
++	spin_unlock(&pring->ring_lock);
+ 	spin_unlock_irq(&phba->hbalock);
+ 
+ 	total_cnt = phba->sli4_hba.els_xri_cnt;
+@@ -6133,8 +6139,10 @@ lpfc_sli4_repost_els_sgl_list(struct lpfc_hba *phba)
+ 	/* push els sgls posted to the availble list */
+ 	if (!list_empty(&post_sgl_list)) {
+ 		spin_lock_irq(&phba->hbalock);
++		spin_lock(&pring->ring_lock);
+ 		list_splice_init(&post_sgl_list,
+ 				 &phba->sli4_hba.lpfc_sgl_list);
++		spin_unlock(&pring->ring_lock);
+ 		spin_unlock_irq(&phba->hbalock);
+ 	} else {
+ 		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
