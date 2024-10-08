@@ -1,0 +1,256 @@
+blk-mq: add helper to insert requests from irq context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6fca6a611c27f1f0d90fbe1cc3c229dbf8c09e48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/6fca6a61.failed
+
+Both the cache flush state machine and the SCSI midlayer want to submit
+requests from irq context, and the current per-request requeue_work
+unfortunately causes corruption due to sharing with the csd field for
+flushes.  Replace them with a per-request_queue list of requests to
+be requeued.
+
+Based on an earlier test by Ming Lei.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reported-by: Ming Lei <tom.leiming@gmail.com>
+	Tested-by: Ming Lei <tom.leiming@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 6fca6a611c27f1f0d90fbe1cc3c229dbf8c09e48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 2ab20aca2fd8,67066ecc79c0..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -406,6 -510,80 +406,83 @@@ static void blk_mq_requeue_request(stru
+  		rq->nr_phys_segments--;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void blk_mq_requeue_request(struct request *rq)
++ {
++ 	__blk_mq_requeue_request(rq);
++ 	blk_clear_rq_complete(rq);
++ 
++ 	BUG_ON(blk_queued_rq(rq));
++ 	blk_mq_add_to_requeue_list(rq, true);
++ }
++ EXPORT_SYMBOL(blk_mq_requeue_request);
++ 
++ static void blk_mq_requeue_work(struct work_struct *work)
++ {
++ 	struct request_queue *q =
++ 		container_of(work, struct request_queue, requeue_work);
++ 	LIST_HEAD(rq_list);
++ 	struct request *rq, *next;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	list_splice_init(&q->requeue_list, &rq_list);
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ 
++ 	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
++ 		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
++ 			continue;
++ 
++ 		rq->cmd_flags &= ~REQ_SOFTBARRIER;
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, true, false, false);
++ 	}
++ 
++ 	while (!list_empty(&rq_list)) {
++ 		rq = list_entry(rq_list.next, struct request, queuelist);
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, false, false, false);
++ 	}
++ 
++ 	blk_mq_run_queues(q, false);
++ }
++ 
++ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
++ {
++ 	struct request_queue *q = rq->q;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * We abuse this flag that is otherwise used by the I/O scheduler to
++ 	 * request head insertation from the workqueue.
++ 	 */
++ 	BUG_ON(rq->cmd_flags & REQ_SOFTBARRIER);
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	if (at_head) {
++ 		rq->cmd_flags |= REQ_SOFTBARRIER;
++ 		list_add(&rq->queuelist, &q->requeue_list);
++ 	} else {
++ 		list_add_tail(&rq->queuelist, &q->requeue_list);
++ 	}
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ }
++ EXPORT_SYMBOL(blk_mq_add_to_requeue_list);
++ 
++ void blk_mq_kick_requeue_list(struct request_queue *q)
++ {
++ 	kblockd_schedule_work(&q->requeue_work);
++ }
++ EXPORT_SYMBOL(blk_mq_kick_requeue_list);
++ 
++ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
++ {
++ 	return tags->rqs[tag];
++ }
++ EXPORT_SYMBOL(blk_mq_tag_to_rq);
++ 
+++>>>>>>> 6fca6a611c27 (blk-mq: add helper to insert requests from irq context)
+  struct blk_mq_timeout_data {
+  	struct blk_mq_hw_ctx *hctx;
+  	unsigned long *next;
+@@@ -1364,19 -1870,33 +1441,30 @@@ struct request_queue *blk_mq_init_queue
+  
+  	q->sg_reserved_size = INT_MAX;
+  
+++<<<<<<< HEAD
+ +	blk_queue_make_request(q, blk_mq_make_request);
+ +	blk_queue_rq_timed_out(q, reg->ops->timeout);
+ +	if (reg->timeout)
+ +		blk_queue_rq_timeout(q, reg->timeout);
+++=======
++ 	INIT_WORK(&q->requeue_work, blk_mq_requeue_work);
++ 	INIT_LIST_HEAD(&q->requeue_list);
++ 	spin_lock_init(&q->requeue_lock);
++ 
++ 	if (q->nr_hw_queues > 1)
++ 		blk_queue_make_request(q, blk_mq_make_request);
++ 	else
++ 		blk_queue_make_request(q, blk_sq_make_request);
+++>>>>>>> 6fca6a611c27 (blk-mq: add helper to insert requests from irq context)
+  
+ -	blk_queue_rq_timed_out(q, blk_mq_rq_timed_out);
+ -	if (set->timeout)
+ -		blk_queue_rq_timeout(q, set->timeout);
+ -
+ -	/*
+ -	 * Do this after blk_queue_make_request() overrides it...
+ -	 */
+ -	q->nr_requests = set->queue_depth;
+ -
+ -	if (set->ops->complete)
+ -		blk_queue_softirq_done(q, set->ops->complete);
+ +	if (reg->ops->complete)
+ +		blk_queue_softirq_done(q, reg->ops->complete);
+  
+  	blk_mq_init_flush(q);
+ -	blk_mq_init_cpu_queues(q, set->nr_hw_queues);
+ +	blk_mq_init_cpu_queues(q, reg->nr_hw_queues);
+  
+ -	q->flush_rq = kzalloc(round_up(sizeof(struct request) +
+ -				set->cmd_size, cache_line_size()),
+ -				GFP_KERNEL);
+ +	q->flush_rq = kzalloc(round_up(sizeof(struct request) + reg->cmd_size,
+ +				cache_line_size()), GFP_KERNEL);
+  	if (!q->flush_rq)
+  		goto err_hw;
+  
+diff --cc include/linux/blk-mq.h
+index 0f2259d5e784,b9a74a386dbc..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -127,24 -162,18 +127,30 @@@ void blk_mq_free_request(struct reques
+  bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+  struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp);
+  struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw, gfp_t gfp);
+ -struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+ +struct request *blk_mq_rq_from_tag(struct request_queue *q, unsigned int tag);
+  
+  struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ -struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *, unsigned int);
+  void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+  
+ -void blk_mq_end_io(struct request *rq, int error);
+ -void __blk_mq_end_io(struct request *rq, int error);
+ +bool blk_mq_end_io_partial(struct request *rq, int error,
+ +		unsigned int nr_bytes);
+ +static inline void blk_mq_end_io(struct request *rq, int error)
+ +{
+ +	bool done = !blk_mq_end_io_partial(rq, error, blk_rq_bytes(rq));
+ +	BUG_ON(!done);
+ +}
+  
+++<<<<<<< HEAD
+ +/*
+ + * Complete request through potential IPI for right placement. Driver must
+ + * have defined a mq_ops->complete() hook for this.
+ + */
+++=======
++ void blk_mq_requeue_request(struct request *rq);
++ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head);
++ void blk_mq_kick_requeue_list(struct request_queue *q);
+++>>>>>>> 6fca6a611c27 (blk-mq: add helper to insert requests from irq context)
+  void blk_mq_complete_request(struct request *rq);
+  
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 1c9013bca5a0..9cc3254136a7 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -130,21 +130,13 @@ static void blk_flush_restore_request(struct request *rq)
+ 	blk_clear_rq_complete(rq);
+ }
+ 
+-static void mq_flush_run(struct work_struct *work)
+-{
+-	struct request *rq;
+-
+-	rq = container_of(work, struct request, requeue_work);
+-
+-	memset(&rq->csd, 0, sizeof(rq->csd));
+-	blk_mq_insert_request(rq, false, true, false);
+-}
+-
+ static bool blk_flush_queue_rq(struct request *rq, bool add_front)
+ {
+ 	if (rq->q->mq_ops) {
+-		INIT_WORK(&rq->requeue_work, mq_flush_run);
+-		kblockd_schedule_work(&rq->requeue_work);
++		struct request_queue *q = rq->q;
++
++		blk_mq_add_to_requeue_list(rq, add_front);
++		blk_mq_kick_requeue_list(q);
+ 		return false;
+ 	} else {
+ 		if (add_front)
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 7073d451e562..2b049e8ca98d 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -101,7 +101,6 @@ struct request {
+ 	};
+ 	union {
+ 		struct call_single_data csd;
+-		struct work_struct requeue_work;
+ 		unsigned long fifo_time;
+ 	};
+ 
+@@ -463,6 +462,10 @@ struct request_queue {
+ 	struct request		*flush_rq;
+ 	spinlock_t		mq_flush_lock;
+ 
++	struct list_head	requeue_list;
++	spinlock_t		requeue_lock;
++	struct work_struct	requeue_work;
++
+ 	struct mutex		sysfs_lock;
+ 
+ 	int			bypass_depth;
