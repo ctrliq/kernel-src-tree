@@ -1,0 +1,439 @@
+net: Kill hold_net release_net
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Kill hold_net release_net (Jiri Benc) [1210260]
+Rebuild_FUZZ: 90.91%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit efd7ef1c1929d7a0329d4349252863c04d6f1729
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/efd7ef1c.failed
+
+hold_net and release_net were an idea that turned out to be useless.
+The code has been disabled since 2008.  Kill the code it is long past due.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit efd7ef1c1929d7a0329d4349252863c04d6f1729)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/ipv4/inet_timewait_sock.c
+diff --cc net/core/dev.c
+index 1924c9647d47,39fe369b46ad..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5901,11 -6841,9 +5901,17 @@@ void free_netdev(struct net_device *dev
+  {
+  	struct napi_struct *p, *n;
+  
+++<<<<<<< HEAD
+ +	release_net(dev_net(dev));
+ +
+ +	kfree(dev->_tx);
+ +#ifdef CONFIG_RPS
+ +	kfree(dev->_rx);
+++=======
++ 	netif_free_tx_queues(dev);
++ #ifdef CONFIG_SYSFS
++ 	kvfree(dev->_rx);
+++>>>>>>> efd7ef1c1929 (net: Kill hold_net release_net)
+  #endif
+  
+  	kfree(rcu_dereference_protected(dev->ingress_queue, 1));
+diff --cc net/ipv4/inet_timewait_sock.c
+index 6d592f8555fb,86ebf020925b..000000000000
+--- a/net/ipv4/inet_timewait_sock.c
++++ b/net/ipv4/inet_timewait_sock.c
+@@@ -195,7 -194,8 +194,12 @@@ struct inet_timewait_sock *inet_twsk_al
+  		tw->tw_ipv6only	    = 0;
+  		tw->tw_transparent  = inet->transparent;
+  		tw->tw_prot	    = sk->sk_prot_creator;
+++<<<<<<< HEAD
+ +		twsk_net_set(tw, hold_net(sock_net(sk)));
+++=======
++ 		atomic64_set(&tw->tw_cookie, atomic64_read(&sk->sk_cookie));
++ 		twsk_net_set(tw, sock_net(sk));
+++>>>>>>> efd7ef1c1929 (net: Kill hold_net release_net)
+  		/*
+  		 * Because we use RCU lookups, we should not set tw_refcnt
+  		 * to a non null value before everything is setup for this
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 80813de117ba..08b140328910 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1549,8 +1549,7 @@ static inline
+ void dev_net_set(struct net_device *dev, struct net *net)
+ {
+ #ifdef CONFIG_NET_NS
+-	release_net(dev->nd_net);
+-	dev->nd_net = hold_net(net);
++	dev->nd_net = net;
+ #endif
+ }
+ 
+diff --git a/include/net/fib_rules.h b/include/net/fib_rules.h
+index e361f4882426..5b0bbc779862 100644
+--- a/include/net/fib_rules.h
++++ b/include/net/fib_rules.h
+@@ -87,17 +87,10 @@ static inline void fib_rule_get(struct fib_rule *rule)
+ 	atomic_inc(&rule->refcnt);
+ }
+ 
+-static inline void fib_rule_put_rcu(struct rcu_head *head)
+-{
+-	struct fib_rule *rule = container_of(head, struct fib_rule, rcu);
+-	release_net(rule->fr_net);
+-	kfree(rule);
+-}
+-
+ static inline void fib_rule_put(struct fib_rule *rule)
+ {
+ 	if (atomic_dec_and_test(&rule->refcnt))
+-		call_rcu(&rule->rcu, fib_rule_put_rcu);
++		kfree_rcu(rule, rcu);
+ }
+ 
+ static inline u32 frh_get_table(struct fib_rule_hdr *frh, struct nlattr **nla)
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index 385ac027c602..c5e16474b9e3 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -47,11 +47,6 @@ struct net {
+ 	atomic_t		count;		/* To decided when the network
+ 						 *  namespace should be shut down.
+ 						 */
+-#ifdef NETNS_REFCNT_DEBUG
+-	atomic_t		use_count;	/* To track references we
+-						 * destroy on demand
+-						 */
+-#endif
+ 	spinlock_t		rules_mod_lock;
+ 
+ 	struct list_head	list;		/* list of network namespaces */
+@@ -227,30 +222,6 @@ int net_eq(const struct net *net1, const struct net *net2)
+ #endif
+ 
+ 
+-#ifdef NETNS_REFCNT_DEBUG
+-static inline struct net *hold_net(struct net *net)
+-{
+-	if (net)
+-		atomic_inc(&net->use_count);
+-	return net;
+-}
+-
+-static inline void release_net(struct net *net)
+-{
+-	if (net)
+-		atomic_dec(&net->use_count);
+-}
+-#else
+-static inline struct net *hold_net(struct net *net)
+-{
+-	return net;
+-}
+-
+-static inline void release_net(struct net *net)
+-{
+-}
+-#endif
+-
+ #ifdef CONFIG_NET_NS
+ 
+ static inline void write_pnet(struct net **pnet, struct net *net)
+diff --git a/include/net/sock.h b/include/net/sock.h
+index cda784f68c5d..6766115e09ba 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -2276,7 +2276,7 @@ static inline void sk_change_net(struct sock *sk, struct net *net)
+ 
+ 	if (!net_eq(current_net, net)) {
+ 		put_net(current_net);
+-		sock_net_set(sk, hold_net(net));
++		sock_net_set(sk, net);
+ 	}
+ }
+ 
+* Unmerged path net/core/dev.c
+diff --git a/net/core/fib_rules.c b/net/core/fib_rules.c
+index 0e9131195eb0..2771bcd5bded 100644
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@ -31,7 +31,7 @@ int fib_default_rule_add(struct fib_rules_ops *ops,
+ 	r->pref = pref;
+ 	r->table = table;
+ 	r->flags = flags;
+-	r->fr_net = hold_net(ops->fro_net);
++	r->fr_net = ops->fro_net;
+ 
+ 	/* The lock is not required here, the list in unreacheable
+ 	 * at the moment this function is called */
+@@ -113,7 +113,6 @@ static int __fib_rules_register(struct fib_rules_ops *ops)
+ 		if (ops->family == o->family)
+ 			goto errout;
+ 
+-	hold_net(net);
+ 	list_add_tail_rcu(&ops->list, &net->rules_ops);
+ 	err = 0;
+ errout:
+@@ -157,15 +156,6 @@ static void fib_rules_cleanup_ops(struct fib_rules_ops *ops)
+ 	}
+ }
+ 
+-static void fib_rules_put_rcu(struct rcu_head *head)
+-{
+-	struct fib_rules_ops *ops = container_of(head, struct fib_rules_ops, rcu);
+-	struct net *net = ops->fro_net;
+-
+-	release_net(net);
+-	kfree(ops);
+-}
+-
+ void fib_rules_unregister(struct fib_rules_ops *ops)
+ {
+ 	struct net *net = ops->fro_net;
+@@ -175,7 +165,7 @@ void fib_rules_unregister(struct fib_rules_ops *ops)
+ 	fib_rules_cleanup_ops(ops);
+ 	spin_unlock(&net->rules_mod_lock);
+ 
+-	call_rcu(&ops->rcu, fib_rules_put_rcu);
++	kfree_rcu(ops, rcu);
+ }
+ EXPORT_SYMBOL_GPL(fib_rules_unregister);
+ 
+@@ -297,7 +287,7 @@ static int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr* nlh)
+ 		err = -ENOMEM;
+ 		goto errout;
+ 	}
+-	rule->fr_net = hold_net(net);
++	rule->fr_net = net;
+ 
+ 	if (tb[FRA_PRIORITY])
+ 		rule->pref = nla_get_u32(tb[FRA_PRIORITY]);
+@@ -408,7 +398,6 @@ static int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr* nlh)
+ 	return 0;
+ 
+ errout_free:
+-	release_net(rule->fr_net);
+ 	kfree(rule);
+ errout:
+ 	rules_ops_put(ops);
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+index 71092bad43dc..edb434d186c9 100644
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -607,7 +607,7 @@ struct pneigh_entry * pneigh_lookup(struct neigh_table *tbl,
+ 	if (!n)
+ 		goto out;
+ 
+-	write_pnet(&n->net, hold_net(net));
++	write_pnet(&n->net, net);
+ 	memcpy(n->key, pkey, key_len);
+ 	n->dev = dev;
+ 	if (dev)
+@@ -616,7 +616,6 @@ struct pneigh_entry * pneigh_lookup(struct neigh_table *tbl,
+ 	if (tbl->pconstructor && tbl->pconstructor(n)) {
+ 		if (dev)
+ 			dev_put(dev);
+-		release_net(net);
+ 		kfree(n);
+ 		n = NULL;
+ 		goto out;
+@@ -650,7 +649,6 @@ int pneigh_delete(struct neigh_table *tbl, struct net *net, const void *pkey,
+ 				tbl->pdestructor(n);
+ 			if (n->dev)
+ 				dev_put(n->dev);
+-			release_net(pneigh_net(n));
+ 			kfree(n);
+ 			return 0;
+ 		}
+@@ -673,7 +671,6 @@ static int pneigh_ifdown(struct neigh_table *tbl, struct net_device *dev)
+ 					tbl->pdestructor(n);
+ 				if (n->dev)
+ 					dev_put(n->dev);
+-				release_net(pneigh_net(n));
+ 				kfree(n);
+ 				continue;
+ 			}
+@@ -1472,11 +1469,10 @@ struct neigh_parms *neigh_parms_alloc(struct net_device *dev,
+ 				neigh_rand_reach_time(NEIGH_VAR(p, BASE_REACHABLE_TIME));
+ 		dev_hold(dev);
+ 		p->dev = dev;
+-		write_pnet(&p->net, hold_net(net));
++		write_pnet(&p->net, net);
+ 		p->sysctl_table = NULL;
+ 
+ 		if (ops->ndo_neigh_setup && ops->ndo_neigh_setup(dev, p)) {
+-			release_net(net);
+ 			dev_put(dev);
+ 			kfree(p);
+ 			return NULL;
+@@ -1526,7 +1522,6 @@ EXPORT_SYMBOL(neigh_parms_release);
+ 
+ static void neigh_parms_destroy(struct neigh_parms *parms)
+ {
+-	release_net(neigh_parms_net(parms));
+ 	kfree(parms);
+ }
+ 
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index 4cf6699528f0..cc7361a9c5e9 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -159,10 +159,6 @@ static __net_init int setup_net(struct net *net, struct user_namespace *user_ns)
+ 	net->dev_base_seq = 1;
+ 	net->user_ns = user_ns;
+ 
+-#ifdef NETNS_REFCNT_DEBUG
+-	atomic_set(&net->use_count, 0);
+-#endif
+-
+ 	list_for_each_entry(ops, &pernet_list, list) {
+ 		error = ops_init(ops, net);
+ 		if (error < 0)
+@@ -217,13 +213,6 @@ out_free:
+ 
+ static void net_free(struct net *net)
+ {
+-#ifdef NETNS_REFCNT_DEBUG
+-	if (unlikely(atomic_read(&net->use_count) != 0)) {
+-		pr_emerg("network namespace not free! Usage: %d\n",
+-			 atomic_read(&net->use_count));
+-		return;
+-	}
+-#endif
+ 	kfree(rcu_access_pointer(net->gen));
+ 	kmem_cache_free(net_cachep, net);
+ }
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 5a083b2d2957..0a32613862d7 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1414,7 +1414,6 @@ void sk_release_kernel(struct sock *sk)
+ 
+ 	sock_hold(sk);
+ 	sock_release(sk->sk_socket);
+-	release_net(sock_net(sk));
+ 	sock_net_set(sk, get_net(&init_net));
+ 	sock_put(sk);
+ }
+diff --git a/net/ipv4/fib_semantics.c b/net/ipv4/fib_semantics.c
+index b6c8c98fb7b5..403b409dc687 100644
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -212,7 +212,6 @@ static void free_fib_info_rcu(struct rcu_head *head)
+ 		rt_fibinfo_free(&nexthop_nh->nh_rth_input);
+ 	} endfor_nexthops(fi);
+ 
+-	release_net(fi->fib_net);
+ 	if (fi->fib_metrics != (u32 *) dst_default_metrics)
+ 		kfree(fi->fib_metrics);
+ 	kfree(fi);
+@@ -828,7 +827,7 @@ struct fib_info *fib_create_info(struct fib_config *cfg)
+ 		fi->fib_metrics = (u32 *) dst_default_metrics;
+ 	fib_info_cnt++;
+ 
+-	fi->fib_net = hold_net(net);
++	fi->fib_net = net;
+ 	fi->fib_protocol = cfg->fc_protocol;
+ 	fi->fib_scope = cfg->fc_scope;
+ 	fi->fib_flags = cfg->fc_flags;
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index fba2f42a1b6c..673cf014e2f3 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -36,7 +36,7 @@ struct inet_bind_bucket *inet_bind_bucket_create(struct kmem_cache *cachep,
+ 	struct inet_bind_bucket *tb = kmem_cache_alloc(cachep, GFP_ATOMIC);
+ 
+ 	if (tb != NULL) {
+-		write_pnet(&tb->ib_net, hold_net(net));
++		write_pnet(&tb->ib_net, net);
+ 		tb->port      = snum;
+ 		tb->fastreuse = 0;
+ 		tb->fastreuseport = 0;
+@@ -54,7 +54,6 @@ void inet_bind_bucket_destroy(struct kmem_cache *cachep, struct inet_bind_bucket
+ {
+ 	if (hlist_empty(&tb->owners)) {
+ 		__hlist_del(&tb->node);
+-		release_net(ib_net(tb));
+ 		kmem_cache_free(cachep, tb);
+ 	}
+ }
+* Unmerged path net/ipv4/inet_timewait_sock.c
+diff --git a/net/ipv6/addrlabel.c b/net/ipv6/addrlabel.c
+index b30ad3741b46..5ffb3f803c81 100644
+--- a/net/ipv6/addrlabel.c
++++ b/net/ipv6/addrlabel.c
+@@ -130,9 +130,6 @@ static const __net_initconst struct ip6addrlbl_init_table
+ /* Object management */
+ static inline void ip6addrlbl_free(struct ip6addrlbl_entry *p)
+ {
+-#ifdef CONFIG_NET_NS
+-	release_net(p->lbl_net);
+-#endif
+ 	kfree(p);
+ }
+ 
+@@ -242,7 +239,7 @@ static struct ip6addrlbl_entry *ip6addrlbl_alloc(struct net *net,
+ 	newp->label = label;
+ 	INIT_HLIST_NODE(&newp->list);
+ #ifdef CONFIG_NET_NS
+-	newp->lbl_net = hold_net(net);
++	newp->lbl_net = net;
+ #endif
+ 	atomic_set(&newp->refcnt, 1);
+ 	return newp;
+diff --git a/net/ipv6/ip6_flowlabel.c b/net/ipv6/ip6_flowlabel.c
+index 76fb26cd1d8c..3d1e7f06f75b 100644
+--- a/net/ipv6/ip6_flowlabel.c
++++ b/net/ipv6/ip6_flowlabel.c
+@@ -107,7 +107,6 @@ static void fl_free(struct ip6_flowlabel *fl)
+ 	if (fl) {
+ 		if (fl->share == IPV6_FL_S_PROCESS)
+ 			put_pid(fl->owner.pid);
+-		release_net(fl->fl_net);
+ 		kfree(fl->opt);
+ 		kfree_rcu(fl, rcu);
+ 	}
+@@ -407,7 +406,7 @@ fl_create(struct net *net, struct sock *sk, struct in6_flowlabel_req *freq,
+ 		}
+ 	}
+ 
+-	fl->fl_net = hold_net(net);
++	fl->fl_net = net;
+ 	fl->expires = jiffies;
+ 	err = fl6_renew(fl, freq->flr_linger, freq->flr_expires);
+ 	if (err)
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 054e47f4601f..a2a9c1df7077 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -186,7 +186,6 @@ static void destroy_dp_rcu(struct rcu_head *rcu)
+ 	struct datapath *dp = container_of(rcu, struct datapath, rcu);
+ 
+ 	free_percpu(dp->stats_percpu);
+-	release_net(ovs_dp_get_net(dp));
+ 	kfree(dp->ports);
+ 	kfree(dp);
+ }
+@@ -1350,7 +1349,7 @@ static int ovs_dp_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 	if (dp == NULL)
+ 		goto err_free_reply;
+ 
+-	ovs_dp_set_net(dp, hold_net(sock_net(skb->sk)));
++	ovs_dp_set_net(dp, sock_net(skb->sk));
+ 
+ 	/* Allocate table. */
+ 	err = ovs_flow_tbl_init(&dp->table);
+@@ -1424,7 +1423,6 @@ err_destroy_percpu:
+ err_destroy_table:
+ 	ovs_flow_tbl_destroy(&dp->table, false);
+ err_free_dp:
+-	release_net(ovs_dp_get_net(dp));
+ 	kfree(dp);
+ err_free_reply:
+ 	kfree_skb(reply);
