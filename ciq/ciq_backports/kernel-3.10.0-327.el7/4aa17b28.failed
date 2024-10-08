@@ -1,0 +1,149 @@
+mlx5: Enable mutual support for IB and Ethernet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Haggai Abramonvsky <hagaya@mellanox.com>
+commit 4aa17b2879f66e478aa9b81cc3bbade6416126aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4aa17b28.failed
+
+Ethernet functionality is only available when working in ISSI > 0 mode.
+
+Previously, the IB driver wasn't ready to work on that mode, and hence
+building both the IB driver and the Ethernet functionality in the core
+driver were disallowed by Kconfigs.
+
+Now, once we have all the pre-steps in place, we can remove this limitation.
+
+The last steps in the IB driver for getting that setup to work are:
+create dummy SRQ for the driver's use (until now we could use XRC_SRQ
+as SRQ and XRC_SRQ, after moving to ISSI > 0, we separate XRC SRQs from
+basic SRQs) and adapt the create QP function to be compatible with ISSI > 0.
+
+	Signed-off-by: Haggai Abramovsky <hagaya@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4aa17b2879f66e478aa9b81cc3bbade6416126aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+index 8ff57e8e3e91,158c88c69ef9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Kconfig
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+@@@ -3,6 -3,18 +3,21 @@@
+  #
+  
+  config MLX5_CORE
+ -	tristate "Mellanox Technologies ConnectX-4 and Connect-IB core driver"
+ +	tristate
+  	depends on PCI
+  	default n
+++<<<<<<< HEAD
+++=======
++ 	---help---
++ 	  Core driver for low level functionality of the ConnectX-4 and
++ 	  Connect-IB cards by Mellanox Technologies.
++ 
++ config MLX5_CORE_EN
++ 	bool "Mellanox Technologies ConnectX-4 Ethernet support"
++ 	depends on NETDEVICES && ETHERNET && PCI && MLX5_CORE
++ 	default n
++ 	---help---
++ 	  Ethernet support in Mellanox Technologies ConnectX-4 NIC.
++ 	  Ethernet and Infiniband support in ConnectX-4 are currently mutually
++ 	  exclusive.
+++>>>>>>> 4aa17b2879f6 (mlx5: Enable mutual support for IB and Ethernet)
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 86005fa8c936..134f8c1366d2 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1159,8 +1159,29 @@ static int create_dev_resources(struct mlx5_ib_resources *devr)
+ 	atomic_inc(&devr->p0->usecnt);
+ 	atomic_set(&devr->s0->usecnt, 0);
+ 
++	memset(&attr, 0, sizeof(attr));
++	attr.attr.max_sge = 1;
++	attr.attr.max_wr = 1;
++	attr.srq_type = IB_SRQT_BASIC;
++	devr->s1 = mlx5_ib_create_srq(devr->p0, &attr, NULL);
++	if (IS_ERR(devr->s1)) {
++		ret = PTR_ERR(devr->s1);
++		goto error5;
++	}
++	devr->s1->device	= &dev->ib_dev;
++	devr->s1->pd		= devr->p0;
++	devr->s1->uobject       = NULL;
++	devr->s1->event_handler = NULL;
++	devr->s1->srq_context   = NULL;
++	devr->s1->srq_type      = IB_SRQT_BASIC;
++	devr->s1->ext.xrc.cq	= devr->c0;
++	atomic_inc(&devr->p0->usecnt);
++	atomic_set(&devr->s0->usecnt, 0);
++
+ 	return 0;
+ 
++error5:
++	mlx5_ib_destroy_srq(devr->s0);
+ error4:
+ 	mlx5_ib_dealloc_xrcd(devr->x1);
+ error3:
+@@ -1175,6 +1196,7 @@ error0:
+ 
+ static void destroy_dev_resources(struct mlx5_ib_resources *devr)
+ {
++	mlx5_ib_destroy_srq(devr->s1);
+ 	mlx5_ib_destroy_srq(devr->s0);
+ 	mlx5_ib_dealloc_xrcd(devr->x0);
+ 	mlx5_ib_dealloc_xrcd(devr->x1);
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 1013944d3180..a2eecaaffaf1 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -415,6 +415,7 @@ struct mlx5_ib_resources {
+ 	struct ib_xrcd	*x1;
+ 	struct ib_pd	*p0;
+ 	struct ib_srq	*s0;
++	struct ib_srq	*s1;
+ };
+ 
+ struct mlx5_ib_dev {
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 082db0ec729c..838c1375effe 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -1014,7 +1014,8 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 			in->ctx.rq_type_srqn |= cpu_to_be32(to_msrq(init_attr->srq)->msrq.srqn);
+ 		} else {
+ 			in->ctx.xrcd = cpu_to_be32(to_mxrcd(devr->x1)->xrcdn);
+-			in->ctx.rq_type_srqn |= cpu_to_be32(to_msrq(devr->s0)->msrq.srqn);
++			in->ctx.rq_type_srqn |=
++				cpu_to_be32(to_msrq(devr->s1)->msrq.srqn);
+ 		}
+ 	}
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/qp.c b/drivers/net/ethernet/mellanox/mlx5/core/qp.c
+index dc7dbf7e9d98..8b494b562263 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/qp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/qp.c
+@@ -187,10 +187,17 @@ int mlx5_core_create_qp(struct mlx5_core_dev *dev,
+ 	struct mlx5_destroy_qp_mbox_in din;
+ 	struct mlx5_destroy_qp_mbox_out dout;
+ 	int err;
++	void *qpc;
+ 
+ 	memset(&out, 0, sizeof(out));
+ 	in->hdr.opcode = cpu_to_be16(MLX5_CMD_OP_CREATE_QP);
+ 
++	if (dev->issi) {
++		qpc = MLX5_ADDR_OF(create_qp_in, in, qpc);
++		/* 0xffffff means we ask to work with cqe version 0 */
++		MLX5_SET(qpc, qpc, user_index, 0xffffff);
++	}
++
+ 	err = mlx5_cmd_exec(dev, in, inlen, &out, sizeof(out));
+ 	if (err) {
+ 		mlx5_core_warn(dev, "ret %d\n", err);
