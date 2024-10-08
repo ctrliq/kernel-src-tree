@@ -1,0 +1,158 @@
+kvm: vfio: fix unregister kvm_device_ops of vfio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] vfio: fix unregister kvm_device_ops of vfio (Bandan Das) [1209995]
+Rebuild_FUZZ: 94.51%
+commit-author Wanpeng Li <wanpeng.li@linux.intel.com>
+commit 571ee1b6859869a09ed718d390aac2b9414646a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/571ee1b6.failed
+
+After commit 80ce163 (KVM: VFIO: register kvm_device_ops dynamically),
+kvm_device_ops of vfio can be registered dynamically. Commit 3c3c29fd
+(kvm-vfio: do not use module_init) move the dynamic register invoked by
+kvm_init in order to fix broke unloading of the kvm module. However,
+kvm_device_ops of vfio is unregistered after rmmod kvm-intel module
+which lead to device type collision detection warning after kvm-intel
+module reinsmod.
+
+    WARNING: CPU: 1 PID: 10358 at /root/cathy/kvm/arch/x86/kvm/../../../virt/kvm/kvm_main.c:3289 kvm_init+0x234/0x282 [kvm]()
+    Modules linked in: kvm_intel(O+) kvm(O) nfsv3 nfs_acl auth_rpcgss oid_registry nfsv4 dns_resolver nfs fscache lockd sunrpc pci_stub bridge stp llc autofs4 8021q cpufreq_ondemand ipv6 joydev microcode pcspkr igb i2c_algo_bit ehci_pci ehci_hcd e1000e i2c_i801 ixgbe ptp pps_core hwmon mdio tpm_tis tpm ipmi_si ipmi_msghandler acpi_cpufreq isci libsas scsi_transport_sas button dm_mirror dm_region_hash dm_log dm_mod [last unloaded: kvm_intel]
+    CPU: 1 PID: 10358 Comm: insmod Tainted: G        W  O   3.17.0-rc1 #2
+    Hardware name: Intel Corporation S2600CP/S2600CP, BIOS RMLSDP.86I.00.29.D696.1311111329 11/11/2013
+     0000000000000cd9 ffff880ff08cfd18 ffffffff814a61d9 0000000000000cd9
+     0000000000000000 ffff880ff08cfd58 ffffffff810417b7 ffff880ff08cfd48
+     ffffffffa045bcac ffffffffa049c420 0000000000000040 00000000000000ff
+    Call Trace:
+     [<ffffffff814a61d9>] dump_stack+0x49/0x60
+     [<ffffffff810417b7>] warn_slowpath_common+0x7c/0x96
+     [<ffffffffa045bcac>] ? kvm_init+0x234/0x282 [kvm]
+     [<ffffffff810417e6>] warn_slowpath_null+0x15/0x17
+     [<ffffffffa045bcac>] kvm_init+0x234/0x282 [kvm]
+     [<ffffffffa016e995>] vmx_init+0x1bf/0x42a [kvm_intel]
+     [<ffffffffa016e7d6>] ? vmx_check_processor_compat+0x64/0x64 [kvm_intel]
+     [<ffffffff810002ab>] do_one_initcall+0xe3/0x170
+     [<ffffffff811168a9>] ? __vunmap+0xad/0xb8
+     [<ffffffff8109c58f>] do_init_module+0x2b/0x174
+     [<ffffffff8109d414>] load_module+0x43e/0x569
+     [<ffffffff8109c6d8>] ? do_init_module+0x174/0x174
+     [<ffffffff8109c75a>] ? copy_module_from_user+0x39/0x82
+     [<ffffffff8109b7dd>] ? module_sect_show+0x20/0x20
+     [<ffffffff8109d65f>] SyS_init_module+0x54/0x81
+     [<ffffffff814a9a12>] system_call_fastpath+0x16/0x1b
+    ---[ end trace 0626f4a3ddea56f3 ]---
+
+The bug can be reproduced by:
+
+    rmmod kvm_intel.ko
+    insmod kvm_intel.ko
+
+without rmmod/insmod kvm.ko
+This patch fixes the bug by unregistering kvm_device_ops of vfio when the
+kvm-intel module is removed.
+
+	Reported-by: Liu Rongrong <rongrongx.liu@intel.com>
+Fixes: 3c3c29fd0d7cddc32862c350d0700ce69953e3bd
+	Signed-off-by: Wanpeng Li <wanpeng.li@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 571ee1b6859869a09ed718d390aac2b9414646a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kvm_host.h
+#	virt/kvm/kvm_main.c
+#	virt/kvm/vfio.c
+#	virt/kvm/vfio.h
+diff --cc include/linux/kvm_host.h
+index e1e1c9fa034a,ea53b04993f2..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -1052,6 -1079,8 +1052,11 @@@ struct kvm_device_ops 
+  void kvm_device_get(struct kvm_device *dev);
+  void kvm_device_put(struct kvm_device *dev);
+  struct kvm_device *kvm_device_from_filp(struct file *filp);
+++<<<<<<< HEAD
+++=======
++ int kvm_register_device_ops(struct kvm_device_ops *ops, u32 type);
++ void kvm_unregister_device_ops(u32 type);
+++>>>>>>> 571ee1b68598 (kvm: vfio: fix unregister kvm_device_ops of vfio)
+  
+  extern struct kvm_device_ops kvm_mpic_ops;
+  extern struct kvm_device_ops kvm_xics_ops;
+diff --cc virt/kvm/kvm_main.c
+index 577696e35d5e,25ffac9e947d..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -2288,6 -2331,35 +2288,38 @@@ struct kvm_device *kvm_device_from_filp
+  	return filp->private_data;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct kvm_device_ops *kvm_device_ops_table[KVM_DEV_TYPE_MAX] = {
++ #ifdef CONFIG_KVM_MPIC
++ 	[KVM_DEV_TYPE_FSL_MPIC_20]	= &kvm_mpic_ops,
++ 	[KVM_DEV_TYPE_FSL_MPIC_42]	= &kvm_mpic_ops,
++ #endif
++ 
++ #ifdef CONFIG_KVM_XICS
++ 	[KVM_DEV_TYPE_XICS]		= &kvm_xics_ops,
++ #endif
++ };
++ 
++ int kvm_register_device_ops(struct kvm_device_ops *ops, u32 type)
++ {
++ 	if (type >= ARRAY_SIZE(kvm_device_ops_table))
++ 		return -ENOSPC;
++ 
++ 	if (kvm_device_ops_table[type] != NULL)
++ 		return -EEXIST;
++ 
++ 	kvm_device_ops_table[type] = ops;
++ 	return 0;
++ }
++ 
++ void kvm_unregister_device_ops(u32 type)
++ {
++ 	if (kvm_device_ops_table[type] != NULL)
++ 		kvm_device_ops_table[type] = NULL;
++ }
++ 
+++>>>>>>> 571ee1b68598 (kvm: vfio: fix unregister kvm_device_ops of vfio)
+  static int kvm_ioctl_create_device(struct kvm *kvm,
+  				   struct kvm_create_device *cd)
+  {
+diff --cc virt/kvm/vfio.c
+index ba1a93f935c7,620e37f741b8..000000000000
+--- a/virt/kvm/vfio.c
++++ b/virt/kvm/vfio.c
+@@@ -268,10 -279,12 +268,22 @@@ static int kvm_vfio_create(struct kvm_d
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +struct kvm_device_ops kvm_vfio_ops = {
+ +	.name = "kvm-vfio",
+ +	.create = kvm_vfio_create,
+ +	.destroy = kvm_vfio_destroy,
+ +	.set_attr = kvm_vfio_set_attr,
+ +	.has_attr = kvm_vfio_has_attr,
+ +};
+++=======
++ int kvm_vfio_ops_init(void)
++ {
++ 	return kvm_register_device_ops(&kvm_vfio_ops, KVM_DEV_TYPE_VFIO);
++ }
++ 
++ void kvm_vfio_ops_exit(void)
++ {
++ 	kvm_unregister_device_ops(KVM_DEV_TYPE_VFIO);
++ }
+++>>>>>>> 571ee1b68598 (kvm: vfio: fix unregister kvm_device_ops of vfio)
+* Unmerged path virt/kvm/vfio.h
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path virt/kvm/kvm_main.c
+* Unmerged path virt/kvm/vfio.c
+* Unmerged path virt/kvm/vfio.h
