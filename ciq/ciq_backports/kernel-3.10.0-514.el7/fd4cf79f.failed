@@ -1,0 +1,242 @@
+x86/mce: Remove the MCE ring for Action Optional errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mce: Remove the MCE ring for Action Optional errors (Prarit Bhargava) [1301710]
+Rebuild_FUZZ: 96.23%
+commit-author Chen, Gong <gong.chen@linux.intel.com>
+commit fd4cf79fcc4b5130ced8fd8c40378d3cec2e5fa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fd4cf79f.failed
+
+Use unified genpool to save Action Optional error events and put
+Action Optional error handling in the same notification chain as
+MCE error decoding.
+
+	Signed-off-by: Chen, Gong <gong.chen@linux.intel.com>
+[ Fold in subsequent patch from Boris for early boot logging. ]
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+[ Correct a lot. ]
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1439396985-12812-5-git-send-email-bp@alien8.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit fd4cf79fcc4b5130ced8fd8c40378d3cec2e5fa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mcheck/mce.c
+diff --cc arch/x86/kernel/cpu/mcheck/mce.c
+index 53f7039f68c9,82603690b65c..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@@ -108,9 -110,11 +108,10 @@@ DEFINE_PER_CPU(mce_banks_t, mce_poll_ba
+   */
+  mce_banks_t mce_banks_ce_disabled;
+  
+ -static struct work_struct mce_work;
+ -static struct irq_work mce_irq_work;
+ +static DEFINE_PER_CPU(struct work_struct, mce_work);
+  
+  static void (*quirk_no_way_out)(int bank, struct mce *m, struct pt_regs *regs);
++ static int mce_usable_address(struct mce *m);
+  
+  /*
+   * CPU/chipset specific EDAC code can register a notifier call here to print
+@@@ -459,61 -470,6 +467,64 @@@ static inline void mce_gather_info(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Simple lockless ring to communicate PFNs from the exception handler with the
+ + * process context work function. This is vastly simplified because there's
+ + * only a single reader and a single writer.
+ + */
+ +#define MCE_RING_SIZE 16	/* we use one entry less */
+ +
+ +struct mce_ring {
+ +	unsigned short start;
+ +	unsigned short end;
+ +	unsigned long ring[MCE_RING_SIZE];
+ +};
+ +static DEFINE_PER_CPU(struct mce_ring, mce_ring);
+ +
+ +/* Runs with CPU affinity in workqueue */
+ +static int mce_ring_empty(void)
+ +{
+ +	struct mce_ring *r = &__get_cpu_var(mce_ring);
+ +
+ +	return r->start == r->end;
+ +}
+ +
+ +static int mce_ring_get(unsigned long *pfn)
+ +{
+ +	struct mce_ring *r;
+ +	int ret = 0;
+ +
+ +	*pfn = 0;
+ +	get_cpu();
+ +	r = &__get_cpu_var(mce_ring);
+ +	if (r->start == r->end)
+ +		goto out;
+ +	*pfn = r->ring[r->start];
+ +	r->start = (r->start + 1) % MCE_RING_SIZE;
+ +	ret = 1;
+ +out:
+ +	put_cpu();
+ +	return ret;
+ +}
+ +
+ +/* Always runs in MCE context with preempt off */
+ +static int mce_ring_add(unsigned long pfn)
+ +{
+ +	struct mce_ring *r = &__get_cpu_var(mce_ring);
+ +	unsigned next;
+ +
+ +	next = (r->end + 1) % MCE_RING_SIZE;
+ +	if (next == r->start)
+ +		return -1;
+ +	r->ring[r->end] = pfn;
+ +	wmb();
+ +	r->end = next;
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> fd4cf79fcc4b (x86/mce: Remove the MCE ring for Action Optional errors)
+  int mce_available(struct cpuinfo_x86 *c)
+  {
+  	if (mca_cfg.disabled)
+@@@ -523,12 -479,10 +534,17 @@@
+  
+  static void mce_schedule_work(void)
+  {
+++<<<<<<< HEAD
+ +	if (!mce_ring_empty())
+ +		schedule_work(&__get_cpu_var(mce_work));
+++=======
++ 	if (!mce_gen_pool_empty() && keventd_up())
++ 		schedule_work(&mce_work);
+++>>>>>>> fd4cf79fcc4b (x86/mce: Remove the MCE ring for Action Optional errors)
+  }
+  
+ +static DEFINE_PER_CPU(struct irq_work, mce_irq_work);
+ +
+  static void mce_irq_work_cb(struct irq_work *entry)
+  {
+  	mce_notify_irq();
+@@@ -549,9 -503,30 +565,30 @@@ static void mce_report_event(struct pt_
+  		return;
+  	}
+  
+ -	irq_work_queue(&mce_irq_work);
+ +	irq_work_queue(&__get_cpu_var(mce_irq_work));
+  }
+  
++ static int srao_decode_notifier(struct notifier_block *nb, unsigned long val,
++ 				void *data)
++ {
++ 	struct mce *mce = (struct mce *)data;
++ 	unsigned long pfn;
++ 
++ 	if (!mce)
++ 		return NOTIFY_DONE;
++ 
++ 	if (mce->usable_addr && (mce->severity == MCE_AO_SEVERITY)) {
++ 		pfn = mce->addr >> PAGE_SHIFT;
++ 		memory_failure(pfn, MCE_VECTOR, 0);
++ 	}
++ 
++ 	return NOTIFY_OK;
++ }
++ static struct notifier_block mce_srao_nb = {
++ 	.notifier_call	= srao_decode_notifier,
++ 	.priority = INT_MAX,
++ };
++ 
+  /*
+   * Read ADDR and MISC registers.
+   */
+@@@ -2053,8 -2028,12 +2085,9 @@@ __setup("mce", mcheck_enable)
+  int __init mcheck_init(void)
+  {
+  	mcheck_intel_therm_init();
++ 	mce_register_decode_chain(&mce_srao_nb, false);
+  	mcheck_vendor_init_severity();
+  
+ -	INIT_WORK(&mce_work, mce_process_work);
+ -	init_irq_work(&mce_irq_work, mce_irq_work_cb);
+ -
+  	return 0;
+  }
+  
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index 21ba156340f0..a78045e9e749 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -140,7 +140,7 @@ struct mce_vendor_flags {
+ extern struct mce_vendor_flags mce_flags;
+ 
+ extern struct mca_config mca_cfg;
+-extern void mce_register_decode_chain(struct notifier_block *nb);
++extern void mce_register_decode_chain(struct notifier_block *nb, bool drain);
+ extern void mce_unregister_decode_chain(struct notifier_block *nb);
+ 
+ #include <linux/percpu.h>
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce.c
+diff --git a/drivers/acpi/acpi_extlog.c b/drivers/acpi/acpi_extlog.c
+index 9b388b1508cb..c907df3fc4b7 100644
+--- a/drivers/acpi/acpi_extlog.c
++++ b/drivers/acpi/acpi_extlog.c
+@@ -323,7 +323,7 @@ static int __init extlog_init(void)
+ 	 */
+ 	old_edac_report_status = get_edac_report_status();
+ 	set_edac_report_status(EDAC_REPORTING_DISABLED);
+-	mce_register_decode_chain(&extlog_mce_dec);
++	mce_register_decode_chain(&extlog_mce_dec, true);
+ 	/* enable OS to be involved to take over management from BIOS */
+ 	((struct extlog_l1_head *)extlog_l1_addr)->flags |= FLAG_OS_OPTIN;
+ 
+diff --git a/drivers/edac/i7core_edac.c b/drivers/edac/i7core_edac.c
+index f0c227105749..b9da47309882 100644
+--- a/drivers/edac/i7core_edac.c
++++ b/drivers/edac/i7core_edac.c
+@@ -2431,7 +2431,7 @@ static int __init i7core_init(void)
+ 	pci_rc = pci_register_driver(&i7core_driver);
+ 
+ 	if (pci_rc >= 0) {
+-		mce_register_decode_chain(&i7_mce_dec);
++		mce_register_decode_chain(&i7_mce_dec, true);
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/edac/mce_amd.c b/drivers/edac/mce_amd.c
+index 62329bc3bdc4..10133dbbedd0 100644
+--- a/drivers/edac/mce_amd.c
++++ b/drivers/edac/mce_amd.c
+@@ -915,7 +915,7 @@ static int __init mce_amd_init(void)
+ 
+ 	pr_info("MCE: In-kernel MCE decoding enabled.\n");
+ 
+-	mce_register_decode_chain(&amd_mce_dec_nb);
++	mce_register_decode_chain(&amd_mce_dec_nb, true);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/edac/sb_edac.c b/drivers/edac/sb_edac.c
+index 07f2fea8d5eb..81a9e510e92b 100644
+--- a/drivers/edac/sb_edac.c
++++ b/drivers/edac/sb_edac.c
+@@ -2639,7 +2639,7 @@ static int __init sbridge_init(void)
+ 
+ 	pci_rc = pci_register_driver(&sbridge_driver);
+ 	if (pci_rc >= 0) {
+-		mce_register_decode_chain(&sbridge_mce_dec);
++		mce_register_decode_chain(&sbridge_mce_dec, true);
+ 		if (get_edac_report_status() == EDAC_REPORTING_DISABLED)
+ 			sbridge_printk(KERN_WARNING, "Loading driver, error reporting disabled.\n");
+ 		return 0;
