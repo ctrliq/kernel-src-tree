@@ -1,0 +1,204 @@
+xfs: call dax_pfn_mkwrite() for DAX fsync/msync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 5eb88dca9ce4546bdfca6e5defcd50fbe8ea8411
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5eb88dca.failed
+
+To properly support the new DAX fsync/msync infrastructure filesystems
+need to call dax_pfn_mkwrite() so that DAX can track when user pages are
+dirtied.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: "J. Bruce Fields" <bfields@fieldses.org>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Jeff Layton <jlayton@poochiereds.net>
+	Cc: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5eb88dca9ce4546bdfca6e5defcd50fbe8ea8411)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index ff72b4ea0a57,55e16e2402a7..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1562,21 -1516,150 +1562,137 @@@ xfs_filemap_page_mkwrite
+  	struct vm_area_struct	*vma,
+  	struct vm_fault		*vmf)
+  {
+ -	struct inode		*inode = file_inode(vma->vm_file);
+ +	struct xfs_inode	*ip = XFS_I(vma->vm_file->f_mapping->host);
+  	int			ret;
+  
+ -	trace_xfs_filemap_page_mkwrite(XFS_I(inode));
+ +	trace_xfs_filemap_page_mkwrite(ip);
+  
+ -	sb_start_pagefault(inode->i_sb);
+ +	sb_start_pagefault(VFS_I(ip)->i_sb);
+  	file_update_time(vma->vm_file);
+++<<<<<<< HEAD
+ +	xfs_ilock(ip, XFS_MMAPLOCK_SHARED);
+ +
+ +	ret = __block_page_mkwrite(vma, vmf, xfs_get_blocks);
+ +
+++=======
++ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 
++ 	if (IS_DAX(inode)) {
++ 		ret = __dax_mkwrite(vma, vmf, xfs_get_blocks_dax_fault, NULL);
++ 	} else {
++ 		ret = block_page_mkwrite(vma, vmf, xfs_get_blocks);
++ 		ret = block_page_mkwrite_return(ret);
++ 	}
++ 
++ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	sb_end_pagefault(inode->i_sb);
++ 
++ 	return ret;
++ }
++ 
++ STATIC int
++ xfs_filemap_fault(
++ 	struct vm_area_struct	*vma,
++ 	struct vm_fault		*vmf)
++ {
++ 	struct inode		*inode = file_inode(vma->vm_file);
++ 	int			ret;
++ 
++ 	trace_xfs_filemap_fault(XFS_I(inode));
++ 
++ 	/* DAX can shortcut the normal fault path on write faults! */
++ 	if ((vmf->flags & FAULT_FLAG_WRITE) && IS_DAX(inode))
++ 		return xfs_filemap_page_mkwrite(vma, vmf);
++ 
++ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	if (IS_DAX(inode)) {
++ 		/*
++ 		 * we do not want to trigger unwritten extent conversion on read
++ 		 * faults - that is unnecessary overhead and would also require
++ 		 * changes to xfs_get_blocks_direct() to map unwritten extent
++ 		 * ioend for conversion on read-only mappings.
++ 		 */
++ 		ret = __dax_fault(vma, vmf, xfs_get_blocks_dax_fault, NULL);
++ 	} else
++ 		ret = filemap_fault(vma, vmf);
++ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Similar to xfs_filemap_fault(), the DAX fault path can call into here on
++  * both read and write faults. Hence we need to handle both cases. There is no
++  * ->pmd_mkwrite callout for huge pages, so we have a single function here to
++  * handle both cases here. @flags carries the information on the type of fault
++  * occuring.
++  */
++ STATIC int
++ xfs_filemap_pmd_fault(
++ 	struct vm_area_struct	*vma,
++ 	unsigned long		addr,
++ 	pmd_t			*pmd,
++ 	unsigned int		flags)
++ {
++ 	struct inode		*inode = file_inode(vma->vm_file);
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	int			ret;
++ 
++ 	if (!IS_DAX(inode))
++ 		return VM_FAULT_FALLBACK;
++ 
++ 	trace_xfs_filemap_pmd_fault(ip);
++ 
++ 	if (flags & FAULT_FLAG_WRITE) {
++ 		sb_start_pagefault(inode->i_sb);
++ 		file_update_time(vma->vm_file);
++ 	}
++ 
++ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	ret = __dax_pmd_fault(vma, addr, pmd, flags, xfs_get_blocks_dax_fault,
++ 			      NULL);
++ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 
++ 	if (flags & FAULT_FLAG_WRITE)
++ 		sb_end_pagefault(inode->i_sb);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * pfn_mkwrite was originally inteneded to ensure we capture time stamp
++  * updates on write faults. In reality, it's need to serialise against
++  * truncate similar to page_mkwrite. Hence we cycle the XFS_MMAPLOCK_SHARED
++  * to ensure we serialise the fault barrier in place.
++  */
++ static int
++ xfs_filemap_pfn_mkwrite(
++ 	struct vm_area_struct	*vma,
++ 	struct vm_fault		*vmf)
++ {
++ 
++ 	struct inode		*inode = file_inode(vma->vm_file);
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	int			ret = VM_FAULT_NOPAGE;
++ 	loff_t			size;
++ 
++ 	trace_xfs_filemap_pfn_mkwrite(ip);
++ 
++ 	sb_start_pagefault(inode->i_sb);
++ 	file_update_time(vma->vm_file);
++ 
++ 	/* check if the faulting page hasn't raced with truncate */
++ 	xfs_ilock(ip, XFS_MMAPLOCK_SHARED);
++ 	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	if (vmf->pgoff >= size)
++ 		ret = VM_FAULT_SIGBUS;
++ 	else if (IS_DAX(inode))
++ 		ret = dax_pfn_mkwrite(vma, vmf);
+++>>>>>>> 5eb88dca9ce4 (xfs: call dax_pfn_mkwrite() for DAX fsync/msync)
+  	xfs_iunlock(ip, XFS_MMAPLOCK_SHARED);
+ -	sb_end_pagefault(inode->i_sb);
+ -	return ret;
+ -
+ -}
+ +	sb_end_pagefault(VFS_I(ip)->i_sb);
+  
+ -static const struct vm_operations_struct xfs_file_vm_ops = {
+ -	.fault		= xfs_filemap_fault,
+ -	.pmd_fault	= xfs_filemap_pmd_fault,
+ -	.map_pages	= filemap_map_pages,
+ -	.page_mkwrite	= xfs_filemap_page_mkwrite,
+ -	.pfn_mkwrite	= xfs_filemap_pfn_mkwrite,
+ -};
+ -
+ -STATIC int
+ -xfs_file_mmap(
+ -	struct file	*filp,
+ -	struct vm_area_struct *vma)
+ -{
+ -	file_accessed(filp);
+ -	vma->vm_ops = &xfs_file_vm_ops;
+ -	if (IS_DAX(file_inode(filp)))
+ -		vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+ -	return 0;
+ +	return block_page_mkwrite_return(ret);
+  }
+  
+  const struct file_operations xfs_file_operations = {
+* Unmerged path fs/xfs/xfs_file.c
