@@ -1,0 +1,420 @@
+s390/mm: fix asce_bits handling with dynamic pagetable levels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [s390] mm: fix asce_bits handling with dynamic pagetable levels (Hendrik Brueckner) [1337933]
+Rebuild_FUZZ: 95.73%
+commit-author Gerald Schaefer <gerald.schaefer@de.ibm.com>
+commit 723cacbd9dc79582e562c123a0bacf8bfc69e72a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/723cacbd.failed
+
+There is a race with multi-threaded applications between context switch and
+pagetable upgrade. In switch_mm() a new user_asce is built from mm->pgd and
+mm->context.asce_bits, w/o holding any locks. A concurrent mmap with a
+pagetable upgrade on another thread in crst_table_upgrade() could already
+have set new asce_bits, but not yet the new mm->pgd. This would result in a
+corrupt user_asce in switch_mm(), and eventually in a kernel panic from a
+translation exception.
+
+Fix this by storing the complete asce instead of just the asce_bits, which
+can then be read atomically from switch_mm(), so that it either sees the
+old value or the new value, but no mixture. Both cases are OK. Having the
+old value would result in a page fault on access to the higher level memory,
+but the fault handler would see the new mm->pgd, if it was a valid access
+after the mmap on the other thread has completed. So as worst-case scenario
+we would have a page fault loop for the racing thread until the next time
+slice.
+
+Also remove dead code and simplify the upgrade/downgrade path, there are no
+upgrades from 2 levels, and only downgrades from 3 levels for compat tasks.
+There are also no concurrent upgrades, because the mmap_sem is held with
+down_write() in do_mmap, so the flush and table checks during upgrade can
+be removed.
+
+	Reported-by: Michael Munday <munday@ca.ibm.com>
+	Reviewed-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Signed-off-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 723cacbd9dc79582e562c123a0bacf8bfc69e72a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/mmu_context.h
+#	arch/s390/include/asm/tlbflush.h
+#	arch/s390/mm/init.c
+#	arch/s390/mm/mmap.c
+#	arch/s390/mm/pgalloc.c
+diff --cc arch/s390/include/asm/mmu_context.h
+index f9585ce71106,c837b79b455d..000000000000
+--- a/arch/s390/include/asm/mmu_context.h
++++ b/arch/s390/include/asm/mmu_context.h
+@@@ -15,21 -15,64 +15,68 @@@
+  static inline int init_new_context(struct task_struct *tsk,
+  				   struct mm_struct *mm)
+  {
+ -	spin_lock_init(&mm->context.list_lock);
+ -	INIT_LIST_HEAD(&mm->context.pgtable_list);
+ -	INIT_LIST_HEAD(&mm->context.gmap_list);
+ -	cpumask_clear(&mm->context.cpu_attach_mask);
+  	atomic_set(&mm->context.attach_count, 0);
+  	mm->context.flush_mm = 0;
+ -#ifdef CONFIG_PGSTE
+ -	mm->context.alloc_pgste = page_table_allocate_pgste;
+ -	mm->context.has_pgste = 0;
+ -	mm->context.use_skey = 0;
+ +	mm->context.asce_bits = _ASCE_TABLE_LENGTH | _ASCE_USER_BITS;
+ +#ifdef CONFIG_64BIT
+ +	mm->context.asce_bits |= _ASCE_TYPE_REGION3;
+  #endif
+++<<<<<<< HEAD
+ +	mm->context.has_pgste = 0;
+ +	mm->context.asce_limit = STACK_TOP_MAX;
+++=======
++ 	switch (mm->context.asce_limit) {
++ 	case 1UL << 42:
++ 		/*
++ 		 * forked 3-level task, fall through to set new asce with new
++ 		 * mm->pgd
++ 		 */
++ 	case 0:
++ 		/* context created by exec, set asce limit to 4TB */
++ 		mm->context.asce_limit = STACK_TOP_MAX;
++ 		mm->context.asce = __pa(mm->pgd) | _ASCE_TABLE_LENGTH |
++ 				   _ASCE_USER_BITS | _ASCE_TYPE_REGION3;
++ 		break;
++ 	case 1UL << 53:
++ 		/* forked 4-level task, set new asce with new mm->pgd */
++ 		mm->context.asce = __pa(mm->pgd) | _ASCE_TABLE_LENGTH |
++ 				   _ASCE_USER_BITS | _ASCE_TYPE_REGION2;
++ 		break;
++ 	case 1UL << 31:
++ 		/* forked 2-level compat task, set new asce with new mm->pgd */
++ 		mm->context.asce = __pa(mm->pgd) | _ASCE_TABLE_LENGTH |
++ 				   _ASCE_USER_BITS | _ASCE_TYPE_SEGMENT;
++ 		/* pgd_alloc() did not increase mm->nr_pmds */
++ 		mm_inc_nr_pmds(mm);
++ 	}
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  	crst_table_init((unsigned long *) mm->pgd, pgd_entry_type(mm));
+  	return 0;
+  }
+  
+  #define destroy_context(mm)             do { } while (0)
+  
+++<<<<<<< HEAD
+ +static inline void update_primary_asce(struct task_struct *tsk)
+++=======
++ static inline void set_user_asce(struct mm_struct *mm)
++ {
++ 	S390_lowcore.user_asce = mm->context.asce;
++ 	if (current->thread.mm_segment.ar4)
++ 		__ctl_load(S390_lowcore.user_asce, 7, 7);
++ 	set_cpu_flag(CIF_ASCE);
++ }
++ 
++ static inline void clear_user_asce(void)
++ {
++ 	S390_lowcore.user_asce = S390_lowcore.kernel_asce;
++ 
++ 	__ctl_load(S390_lowcore.user_asce, 1, 1);
++ 	__ctl_load(S390_lowcore.user_asce, 7, 7);
++ }
++ 
++ static inline void load_kernel_asce(void)
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  {
+  	unsigned long asce;
+  
+@@@ -51,14 -85,40 +98,28 @@@ static inline void update_mm(struct mm_
+  static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+  			     struct task_struct *tsk)
+  {
+++<<<<<<< HEAD
+ +	cpumask_set_cpu(smp_processor_id(), mm_cpumask(next));
+ +	update_mm(next, tsk);
+++=======
++ 	int cpu = smp_processor_id();
++ 
++ 	S390_lowcore.user_asce = next->context.asce;
++ 	if (prev == next)
++ 		return;
++ 	if (MACHINE_HAS_TLB_LC)
++ 		cpumask_set_cpu(cpu, &next->context.cpu_attach_mask);
++ 	/* Clear old ASCE by loading the kernel ASCE. */
++ 	__ctl_load(S390_lowcore.kernel_asce, 1, 1);
++ 	__ctl_load(S390_lowcore.kernel_asce, 7, 7);
++ 	atomic_inc(&next->context.attach_count);
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  	atomic_dec(&prev->context.attach_count);
+ -	if (MACHINE_HAS_TLB_LC)
+ -		cpumask_clear_cpu(cpu, &prev->context.cpu_attach_mask);
+ -}
+ -
+ -#define finish_arch_post_lock_switch finish_arch_post_lock_switch
+ -static inline void finish_arch_post_lock_switch(void)
+ -{
+ -	struct task_struct *tsk = current;
+ -	struct mm_struct *mm = tsk->mm;
+ -
+ -	load_kernel_asce();
+ -	if (mm) {
+ -		preempt_disable();
+ -		while (atomic_read(&mm->context.attach_count) >> 16)
+ -			cpu_relax();
+ -
+ -		cpumask_set_cpu(smp_processor_id(), mm_cpumask(mm));
+ -		if (mm->context.flush_mm)
+ -			__tlb_flush_mm(mm);
+ -		preempt_enable();
+ -	}
+ -	set_fs(current->thread.mm_segment);
+ +	WARN_ON(atomic_read(&prev->context.attach_count) < 0);
+ +	atomic_inc(&next->context.attach_count);
+ +	/* Check for TLBs not flushed yet */
+ +	if (next->context.flush_mm)
+ +		__tlb_flush_mm(next);
+  }
+  
+  #define enter_lazy_tlb(mm,tsk)	do { } while (0)
+diff --cc arch/s390/include/asm/tlbflush.h
+index 6b32af30878c,a2e6ef32e054..000000000000
+--- a/arch/s390/include/asm/tlbflush.h
++++ b/arch/s390/include/asm/tlbflush.h
+@@@ -42,36 -57,87 +42,94 @@@ static inline void __tlb_flush_global(v
+  		: : "d" (reg2), "d" (reg3), "d" (reg4), "m" (dummy) : "cc" );
+  }
+  
+ -/*
+ - * Flush TLB entries for a specific mm on all CPUs (in case gmap is used
+ - * this implicates multiple ASCEs!).
+ - */
+  static inline void __tlb_flush_full(struct mm_struct *mm)
+  {
+ +	cpumask_t local_cpumask;
+ +
+  	preempt_disable();
+ -	atomic_add(0x10000, &mm->context.attach_count);
+ -	if (cpumask_equal(mm_cpumask(mm), cpumask_of(smp_processor_id()))) {
+ -		/* Local TLB flush */
+ +	/*
+ +	 * If the process only ran on the local cpu, do a local flush.
+ +	 */
+ +	cpumask_copy(&local_cpumask, cpumask_of(smp_processor_id()));
+ +	if (cpumask_equal(mm_cpumask(mm), &local_cpumask))
+  		__tlb_flush_local();
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		/* Global TLB flush */
++ 		__tlb_flush_global();
++ 		/* Reset TLB flush mask */
++ 		if (MACHINE_HAS_TLB_LC)
++ 			cpumask_copy(mm_cpumask(mm),
++ 				     &mm->context.cpu_attach_mask);
++ 	}
++ 	atomic_sub(0x10000, &mm->context.attach_count);
++ 	preempt_enable();
++ }
++ 
++ /*
++  * Flush TLB entries for a specific ASCE on all CPUs.
++  */
++ static inline void __tlb_flush_asce(struct mm_struct *mm, unsigned long asce)
++ {
++ 	int active, count;
++ 
++ 	preempt_disable();
++ 	active = (mm == current->active_mm) ? 1 : 0;
++ 	count = atomic_add_return(0x10000, &mm->context.attach_count);
++ 	if (MACHINE_HAS_TLB_LC && (count & 0xffff) <= active &&
++ 	    cpumask_equal(mm_cpumask(mm), cpumask_of(smp_processor_id()))) {
++ 		__tlb_flush_idte_local(asce);
++ 	} else {
++ 		if (MACHINE_HAS_IDTE)
++ 			__tlb_flush_idte(asce);
++ 		else
++ 			__tlb_flush_global();
++ 		/* Reset TLB flush mask */
++ 		if (MACHINE_HAS_TLB_LC)
++ 			cpumask_copy(mm_cpumask(mm),
++ 				     &mm->context.cpu_attach_mask);
++ 	}
++ 	atomic_sub(0x10000, &mm->context.attach_count);
++ 	preempt_enable();
++ }
++ 
++ static inline void __tlb_flush_kernel(void)
++ {
++ 	if (MACHINE_HAS_IDTE)
++ 		__tlb_flush_idte(init_mm.context.asce);
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  	else
+  		__tlb_flush_global();
+ +	preempt_enable();
+  }
+  #else
+ -#define __tlb_flush_global()	__tlb_flush_local()
+  #define __tlb_flush_full(mm)	__tlb_flush_local()
+ +#define __tlb_flush_global()	__tlb_flush_local()
+ +#endif
+  
+  /*
+ - * Flush TLB entries for a specific ASCE on all CPUs.
+ + * Flush all tlb entries of a page table on all cpus.
+   */
+ -static inline void __tlb_flush_asce(struct mm_struct *mm, unsigned long asce)
+ +static inline void __tlb_flush_idte(unsigned long asce)
+  {
+ -	if (MACHINE_HAS_TLB_LC)
+ -		__tlb_flush_idte_local(asce);
+ -	else
+ -		__tlb_flush_local();
+ +	asm volatile(
+ +		"	.insn	rrf,0xb98e0000,0,%0,%1,0"
+ +		: : "a" (2048), "a" (asce) : "cc" );
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void __tlb_flush_kernel(void)
++ {
++ 	if (MACHINE_HAS_TLB_LC)
++ 		__tlb_flush_idte_local(init_mm.context.asce);
++ 	else
++ 		__tlb_flush_local();
++ }
++ #endif
++ 
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  static inline void __tlb_flush_mm(struct mm_struct * mm)
+  {
+  	/*
+@@@ -80,8 -146,7 +138,12 @@@
+  	 * only ran on the local cpu.
+  	 */
+  	if (MACHINE_HAS_IDTE && list_empty(&mm->context.gmap_list))
+++<<<<<<< HEAD
+ +		__tlb_flush_idte((unsigned long) mm->pgd |
+ +				 mm->context.asce_bits);
+++=======
++ 		__tlb_flush_asce(mm, mm->context.asce);
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  	else
+  		__tlb_flush_full(mm);
+  }
+diff --cc arch/s390/mm/init.c
+index cf410b36b055,2489b2e917c8..000000000000
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@@ -113,11 -89,8 +113,16 @@@ void __init paging_init(void
+  		asce_bits = _ASCE_TYPE_REGION3 | _ASCE_TABLE_LENGTH;
+  		pgd_type = _REGION3_ENTRY_EMPTY;
+  	}
+++<<<<<<< HEAD
+ +#else
+ +	asce_bits = _ASCE_TABLE_LENGTH;
+ +	pgd_type = _SEGMENT_ENTRY_EMPTY;
+ +#endif
+ +	S390_lowcore.kernel_asce = (__pa(init_mm.pgd) & PAGE_MASK) | asce_bits;
+++=======
++ 	init_mm.context.asce = (__pa(init_mm.pgd) & PAGE_MASK) | asce_bits;
++ 	S390_lowcore.kernel_asce = init_mm.context.asce;
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  	clear_table((unsigned long *) init_mm.pgd, pgd_type,
+  		    sizeof(unsigned long)*2048);
+  	vmem_map_init();
+diff --cc arch/s390/mm/mmap.c
+index f09eff2a649d,89cf09e5f168..000000000000
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@@ -217,7 -174,7 +217,11 @@@ int s390_mmap_check(unsigned long addr
+  	if (!(flags & MAP_FIXED))
+  		addr = 0;
+  	if ((addr + len) >= TASK_SIZE)
+++<<<<<<< HEAD
+ +		return crst_table_upgrade(current->mm, 1UL << 53);
+++=======
++ 		return crst_table_upgrade(current->mm);
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  	return 0;
+  }
+  
+@@@ -232,9 -189,9 +236,13 @@@ s390_get_unmapped_area(struct file *fil
+  	area = arch_get_unmapped_area(filp, addr, len, pgoff, flags);
+  	if (!(area & ~PAGE_MASK))
+  		return area;
+ -	if (area == -ENOMEM && !is_compat_task() && TASK_SIZE < TASK_MAX_SIZE) {
+ +	if (area == -ENOMEM && !is_compat_task() && TASK_SIZE < (1UL << 53)) {
+  		/* Upgrade the page table to 4 levels and retry. */
+++<<<<<<< HEAD
+ +		rc = crst_table_upgrade(mm, 1UL << 53);
+++=======
++ 		rc = crst_table_upgrade(mm);
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  		if (rc)
+  			return (unsigned long) rc;
+  		area = arch_get_unmapped_area(filp, addr, len, pgoff, flags);
+@@@ -254,9 -211,9 +262,13 @@@ s390_get_unmapped_area_topdown(struct f
+  	area = arch_get_unmapped_area_topdown(filp, addr, len, pgoff, flags);
+  	if (!(area & ~PAGE_MASK))
+  		return area;
+ -	if (area == -ENOMEM && !is_compat_task() && TASK_SIZE < TASK_MAX_SIZE) {
+ +	if (area == -ENOMEM && !is_compat_task() && TASK_SIZE < (1UL << 53)) {
+  		/* Upgrade the page table to 4 levels and retry. */
+++<<<<<<< HEAD
+ +		rc = crst_table_upgrade(mm, 1UL << 53);
+++=======
++ 		rc = crst_table_upgrade(mm);
+++>>>>>>> 723cacbd9dc7 (s390/mm: fix asce_bits handling with dynamic pagetable levels)
+  		if (rc)
+  			return (unsigned long) rc;
+  		area = arch_get_unmapped_area_topdown(filp, addr, len,
+* Unmerged path arch/s390/mm/pgalloc.c
+diff --git a/arch/s390/include/asm/mmu.h b/arch/s390/include/asm/mmu.h
+index ff132ac64ddd..9805a84946ea 100644
+--- a/arch/s390/include/asm/mmu.h
++++ b/arch/s390/include/asm/mmu.h
+@@ -9,7 +9,7 @@ typedef struct {
+ 	spinlock_t list_lock;
+ 	struct list_head pgtable_list;
+ 	struct list_head gmap_list;
+-	unsigned long asce_bits;
++	unsigned long asce;
+ 	unsigned long asce_limit;
+ 	unsigned long vdso_base;
+ 	/* The mmu context has extended page tables. */
+* Unmerged path arch/s390/include/asm/mmu_context.h
+diff --git a/arch/s390/include/asm/pgalloc.h b/arch/s390/include/asm/pgalloc.h
+index e1408ddb94f8..9eb1f209d7ee 100644
+--- a/arch/s390/include/asm/pgalloc.h
++++ b/arch/s390/include/asm/pgalloc.h
+@@ -76,8 +76,8 @@ static inline unsigned long pgd_entry_type(struct mm_struct *mm)
+ 	return _REGION2_ENTRY_EMPTY;
+ }
+ 
+-int crst_table_upgrade(struct mm_struct *, unsigned long limit);
+-void crst_table_downgrade(struct mm_struct *, unsigned long limit);
++int crst_table_upgrade(struct mm_struct *);
++void crst_table_downgrade(struct mm_struct *);
+ 
+ static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long address)
+ {
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index 8e007ad500bf..ee29f2d6af2b 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -146,7 +146,7 @@ struct stack_frame {
+ 	regs->psw.mask	= PSW_USER_BITS | PSW_MASK_BA;			\
+ 	regs->psw.addr	= new_psw | PSW_ADDR_AMODE;			\
+ 	regs->gprs[15]	= new_stackp;					\
+-	crst_table_downgrade(current->mm, 1UL << 31);			\
++	crst_table_downgrade(current->mm);				\
+ 	execve_tail();							\
+ } while (0)
+ 
+* Unmerged path arch/s390/include/asm/tlbflush.h
+* Unmerged path arch/s390/mm/init.c
+* Unmerged path arch/s390/mm/mmap.c
+* Unmerged path arch/s390/mm/pgalloc.c
