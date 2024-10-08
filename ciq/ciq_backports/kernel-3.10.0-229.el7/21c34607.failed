@@ -1,0 +1,141 @@
+drm/i915: Rename gtt_bus_addr to gtt_phys_addr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] i915: Rename gtt_bus_addr to gtt_phys_addr (Myron Stowe) [1110895]
+Rebuild_FUZZ: 95.45%
+commit-author Bjorn Helgaas <bhelgaas@google.com>
+commit 21c346075c0694581303ff04ff2be021587e4b40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/21c34607.failed
+
+We're dealing with CPU physical addresses here, which may be different from
+bus addresses, so rename gtt_bus_addr to gtt_phys_addr to avoid confusion.
+
+No functional change.
+
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 21c346075c0694581303ff04ff2be021587e4b40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_gtt.c
+diff --cc drivers/gpu/drm/i915/i915_gem_gtt.c
+index 1f7b4caefb6e,15604b3dda3e..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@@ -874,6 -1249,108 +874,111 @@@ static inline size_t gen6_get_stolen_si
+  	return snb_gmch_ctl << 25; /* 32 MB units */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline size_t gen8_get_stolen_size(u16 bdw_gmch_ctl)
++ {
++ 	bdw_gmch_ctl >>= BDW_GMCH_GMS_SHIFT;
++ 	bdw_gmch_ctl &= BDW_GMCH_GMS_MASK;
++ 	return bdw_gmch_ctl << 25; /* 32 MB units */
++ }
++ 
++ static int ggtt_probe_common(struct drm_device *dev,
++ 			     size_t gtt_size)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	phys_addr_t gtt_phys_addr;
++ 	int ret;
++ 
++ 	/* For Modern GENs the PTEs and register space are split in the BAR */
++ 	gtt_phys_addr = pci_resource_start(dev->pdev, 0) +
++ 		(pci_resource_len(dev->pdev, 0) / 2);
++ 
++ 	dev_priv->gtt.gsm = ioremap_wc(gtt_phys_addr, gtt_size);
++ 	if (!dev_priv->gtt.gsm) {
++ 		DRM_ERROR("Failed to map the gtt page table\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	ret = setup_scratch_page(dev);
++ 	if (ret) {
++ 		DRM_ERROR("Scratch setup failed\n");
++ 		/* iounmap will also get called at remove, but meh */
++ 		iounmap(dev_priv->gtt.gsm);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ /* The GGTT and PPGTT need a private PPAT setup in order to handle cacheability
++  * bits. When using advanced contexts each context stores its own PAT, but
++  * writing this data shouldn't be harmful even in those cases. */
++ static void gen8_setup_private_ppat(struct drm_i915_private *dev_priv)
++ {
++ #define GEN8_PPAT_UC		(0<<0)
++ #define GEN8_PPAT_WC		(1<<0)
++ #define GEN8_PPAT_WT		(2<<0)
++ #define GEN8_PPAT_WB		(3<<0)
++ #define GEN8_PPAT_ELLC_OVERRIDE	(0<<2)
++ /* FIXME(BDW): Bspec is completely confused about cache control bits. */
++ #define GEN8_PPAT_LLC		(1<<2)
++ #define GEN8_PPAT_LLCELLC	(2<<2)
++ #define GEN8_PPAT_LLCeLLC	(3<<2)
++ #define GEN8_PPAT_AGE(x)	(x<<4)
++ #define GEN8_PPAT(i, x) ((uint64_t) (x) << ((i) * 8))
++ 	uint64_t pat;
++ 
++ 	pat = GEN8_PPAT(0, GEN8_PPAT_WB | GEN8_PPAT_LLC)     | /* for normal objects, no eLLC */
++ 	      GEN8_PPAT(1, GEN8_PPAT_WC | GEN8_PPAT_LLCELLC) | /* for something pointing to ptes? */
++ 	      GEN8_PPAT(2, GEN8_PPAT_WT | GEN8_PPAT_LLCELLC) | /* for scanout with eLLC */
++ 	      GEN8_PPAT(3, GEN8_PPAT_UC)                     | /* Uncached objects, mostly for scanout */
++ 	      GEN8_PPAT(4, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(0)) |
++ 	      GEN8_PPAT(5, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(1)) |
++ 	      GEN8_PPAT(6, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(2)) |
++ 	      GEN8_PPAT(7, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(3));
++ 
++ 	/* XXX: spec defines this as 2 distinct registers. It's unclear if a 64b
++ 	 * write would work. */
++ 	I915_WRITE(GEN8_PRIVATE_PAT, pat);
++ 	I915_WRITE(GEN8_PRIVATE_PAT + 4, pat >> 32);
++ }
++ 
++ static int gen8_gmch_probe(struct drm_device *dev,
++ 			   size_t *gtt_total,
++ 			   size_t *stolen,
++ 			   phys_addr_t *mappable_base,
++ 			   unsigned long *mappable_end)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	unsigned int gtt_size;
++ 	u16 snb_gmch_ctl;
++ 	int ret;
++ 
++ 	/* TODO: We're not aware of mappable constraints on gen8 yet */
++ 	*mappable_base = pci_resource_start(dev->pdev, 2);
++ 	*mappable_end = pci_resource_len(dev->pdev, 2);
++ 
++ 	if (!pci_set_dma_mask(dev->pdev, DMA_BIT_MASK(39)))
++ 		pci_set_consistent_dma_mask(dev->pdev, DMA_BIT_MASK(39));
++ 
++ 	pci_read_config_word(dev->pdev, SNB_GMCH_CTRL, &snb_gmch_ctl);
++ 
++ 	*stolen = gen8_get_stolen_size(snb_gmch_ctl);
++ 
++ 	gtt_size = gen8_get_total_gtt_size(snb_gmch_ctl);
++ 	*gtt_total = (gtt_size / sizeof(gen8_gtt_pte_t)) << PAGE_SHIFT;
++ 
++ 	gen8_setup_private_ppat(dev_priv);
++ 
++ 	ret = ggtt_probe_common(dev, gtt_size);
++ 
++ 	dev_priv->gtt.base.clear_range = gen8_ggtt_clear_range;
++ 	dev_priv->gtt.base.insert_entries = gen8_ggtt_insert_entries;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 21c346075c06 (drm/i915: Rename gtt_bus_addr to gtt_phys_addr)
+  static int gen6_gmch_probe(struct drm_device *dev,
+  			   size_t *gtt_total,
+  			   size_t *stolen,
+* Unmerged path drivers/gpu/drm/i915/i915_gem_gtt.c
