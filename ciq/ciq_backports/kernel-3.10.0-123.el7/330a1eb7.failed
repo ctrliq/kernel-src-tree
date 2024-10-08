@@ -1,0 +1,573 @@
+powerpc/perf: Core EBB support for 64-bit book3s
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [powerpc] perf: Core EBB support for 64-bit book3s (Steve Best) [969176]
+Rebuild_FUZZ: 90.91%
+commit-author Michael Ellerman <michael@ellerman.id.au>
+commit 330a1eb7775ba876dbd46b9885556e57f705e3d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/330a1eb7.failed
+
+Add support for EBB (Event Based Branches) on 64-bit book3s. See the
+included documentation for more details.
+
+EBBs are a feature which allows the hardware to branch directly to a
+specified user space address when a PMU event overflows. This can be
+used by programs for self-monitoring with no kernel involvement in the
+inner loop.
+
+Most of the logic is in the generic book3s code, primarily to avoid a
+proliferation of PMU callbacks.
+
+	Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 330a1eb7775ba876dbd46b9885556e57f705e3d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/processor.h
+diff --cc arch/powerpc/include/asm/processor.h
+index 14a658363698,47a35b08b963..000000000000
+--- a/arch/powerpc/include/asm/processor.h
++++ b/arch/powerpc/include/asm/processor.h
+@@@ -287,9 -287,9 +287,13 @@@ struct thread_struct 
+  	unsigned long	siar;
+  	unsigned long	sdar;
+  	unsigned long	sier;
+- 	unsigned long	mmcr0;
+  	unsigned long	mmcr2;
+++<<<<<<< HEAD
+ +	unsigned long	mmcra;
+++=======
++ 	unsigned 	mmcr0;
++ 	unsigned 	used_ebb;
+++>>>>>>> 330a1eb7775b (powerpc/perf: Core EBB support for 64-bit book3s)
+  #endif
+  };
+  
+diff --git a/Documentation/powerpc/00-INDEX b/Documentation/powerpc/00-INDEX
+index dd9e92802ec0..05026ce1875e 100644
+--- a/Documentation/powerpc/00-INDEX
++++ b/Documentation/powerpc/00-INDEX
+@@ -14,6 +14,8 @@ hvcs.txt
+ 	- IBM "Hypervisor Virtual Console Server" Installation Guide
+ mpc52xx.txt
+ 	- Linux 2.6.x on MPC52xx family
++pmu-ebb.txt
++	- Description of the API for using the PMU with Event Based Branches.
+ qe_firmware.txt
+ 	- describes the layout of firmware binaries for the Freescale QUICC
+ 	  Engine and the code that parses and uploads the microcode therein.
+diff --git a/Documentation/powerpc/pmu-ebb.txt b/Documentation/powerpc/pmu-ebb.txt
+new file mode 100644
+index 000000000000..73cd163dbfb8
+--- /dev/null
++++ b/Documentation/powerpc/pmu-ebb.txt
+@@ -0,0 +1,137 @@
++PMU Event Based Branches
++========================
++
++Event Based Branches (EBBs) are a feature which allows the hardware to
++branch directly to a specified user space address when certain events occur.
++
++The full specification is available in Power ISA v2.07:
++
++  https://www.power.org/documentation/power-isa-version-2-07/
++
++One type of event for which EBBs can be configured is PMU exceptions. This
++document describes the API for configuring the Power PMU to generate EBBs,
++using the Linux perf_events API.
++
++
++Terminology
++-----------
++
++Throughout this document we will refer to an "EBB event" or "EBB events". This
++just refers to a struct perf_event which has set the "EBB" flag in its
++attr.config. All events which can be configured on the hardware PMU are
++possible "EBB events".
++
++
++Background
++----------
++
++When a PMU EBB occurs it is delivered to the currently running process. As such
++EBBs can only sensibly be used by programs for self-monitoring.
++
++It is a feature of the perf_events API that events can be created on other
++processes, subject to standard permission checks. This is also true of EBB
++events, however unless the target process enables EBBs (via mtspr(BESCR)) no
++EBBs will ever be delivered.
++
++This makes it possible for a process to enable EBBs for itself, but not
++actually configure any events. At a later time another process can come along
++and attach an EBB event to the process, which will then cause EBBs to be
++delivered to the first process. It's not clear if this is actually useful.
++
++
++When the PMU is configured for EBBs, all PMU interrupts are delivered to the
++user process. This means once an EBB event is scheduled on the PMU, no non-EBB
++events can be configured. This means that EBB events can not be run
++concurrently with regular 'perf' commands, or any other perf events.
++
++It is however safe to run 'perf' commands on a process which is using EBBs. The
++kernel will in general schedule the EBB event, and perf will be notified that
++its events could not run.
++
++The exclusion between EBB events and regular events is implemented using the
++existing "pinned" and "exclusive" attributes of perf_events. This means EBB
++events will be given priority over other events, unless they are also pinned.
++If an EBB event and a regular event are both pinned, then whichever is enabled
++first will be scheduled and the other will be put in error state. See the
++section below titled "Enabling an EBB event" for more information.
++
++
++Creating an EBB event
++---------------------
++
++To request that an event is counted using EBB, the event code should have bit
++63 set.
++
++EBB events must be created with a particular, and restrictive, set of
++attributes - this is so that they interoperate correctly with the rest of the
++perf_events subsystem.
++
++An EBB event must be created with the "pinned" and "exclusive" attributes set.
++Note that if you are creating a group of EBB events, only the leader can have
++these attributes set.
++
++An EBB event must NOT set any of the "inherit", "sample_period", "freq" or
++"enable_on_exec" attributes.
++
++An EBB event must be attached to a task. This is specified to perf_event_open()
++by passing a pid value, typically 0 indicating the current task.
++
++All events in a group must agree on whether they want EBB. That is all events
++must request EBB, or none may request EBB.
++
++EBB events must specify the PMC they are to be counted on. This ensures
++userspace is able to reliably determine which PMC the event is scheduled on.
++
++
++Enabling an EBB event
++---------------------
++
++Once an EBB event has been successfully opened, it must be enabled with the
++perf_events API. This can be achieved either via the ioctl() interface, or the
++prctl() interface.
++
++However, due to the design of the perf_events API, enabling an event does not
++guarantee that it has been scheduled on the PMU. To ensure that the EBB event
++has been scheduled on the PMU, you must perform a read() on the event. If the
++read() returns EOF, then the event has not been scheduled and EBBs are not
++enabled.
++
++This behaviour occurs because the EBB event is pinned and exclusive. When the
++EBB event is enabled it will force all other non-pinned events off the PMU. In
++this case the enable will be successful. However if there is already an event
++pinned on the PMU then the enable will not be successful.
++
++
++Reading an EBB event
++--------------------
++
++It is possible to read() from an EBB event. However the results are
++meaningless. Because interrupts are being delivered to the user process the
++kernel is not able to count the event, and so will return a junk value.
++
++
++Closing an EBB event
++--------------------
++
++When an EBB event is finished with, you can close it using close() as for any
++regular event. If this is the last EBB event the PMU will be deconfigured and
++no further PMU EBBs will be delivered.
++
++
++EBB Handler
++-----------
++
++The EBB handler is just regular userspace code, however it must be written in
++the style of an interrupt handler. When the handler is entered all registers
++are live (possibly) and so must be saved somehow before the handler can invoke
++other code.
++
++It's up to the program how to handle this. For C programs a relatively simple
++option is to create an interrupt frame on the stack and save registers there.
++
++Fork
++----
++
++EBB events are not inherited across fork. If the child process wishes to use
++EBBs it should open a new event for itself. Similarly the EBB state in
++BESCR/EBBHR/EBBRR is cleared across fork().
+diff --git a/arch/powerpc/include/asm/perf_event_server.h b/arch/powerpc/include/asm/perf_event_server.h
+index f265049dd7d6..2dd7bfc459be 100644
+--- a/arch/powerpc/include/asm/perf_event_server.h
++++ b/arch/powerpc/include/asm/perf_event_server.h
+@@ -60,6 +60,7 @@ struct power_pmu {
+ #define PPMU_HAS_SSLOT		0x00000020 /* Has sampled slot in MMCRA */
+ #define PPMU_HAS_SIER		0x00000040 /* Has SIER */
+ #define PPMU_BHRB		0x00000080 /* has BHRB feature enabled */
++#define PPMU_EBB		0x00000100 /* supports event based branch */
+ 
+ /*
+  * Values for flags to get_alternatives()
+@@ -68,6 +69,11 @@ struct power_pmu {
+ #define PPMU_LIMITED_PMC_REQD	2	/* have to put this on a limited PMC */
+ #define PPMU_ONLY_COUNT_RUN	4	/* only counting in run state */
+ 
++/*
++ * We use the event config bit 63 as a flag to request EBB.
++ */
++#define EVENT_CONFIG_EBB_SHIFT	63
++
+ extern int register_power_pmu(struct power_pmu *);
+ 
+ struct pt_regs;
+* Unmerged path arch/powerpc/include/asm/processor.h
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index 362142b69d5b..5d7d9c2a5473 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -621,6 +621,9 @@
+ #define   MMCR0_PMXE	0x04000000UL /* performance monitor exception enable */
+ #define   MMCR0_FCECE	0x02000000UL /* freeze ctrs on enabled cond or event */
+ #define   MMCR0_TBEE	0x00400000UL /* time base exception enable */
++#define   MMCR0_EBE	0x00100000UL /* Event based branch enable */
++#define   MMCR0_PMCC	0x000c0000UL /* PMC control */
++#define   MMCR0_PMCC_U6	0x00080000UL /* PMC1-6 are R/W by user (PR) */
+ #define   MMCR0_PMC1CE	0x00008000UL /* PMC1 count enable*/
+ #define   MMCR0_PMCjCE	0x00004000UL /* PMCj count enable*/
+ #define   MMCR0_TRIGGER	0x00002000UL /* TRIGGER enable */
+@@ -674,6 +677,11 @@
+ #define   SIER_SIAR_VALID	0x0400000	/* SIAR contents valid */
+ #define   SIER_SDAR_VALID	0x0200000	/* SDAR contents valid */
+ 
++/* When EBB is enabled, some of MMCR0/MMCR2/SIER are user accessible */
++#define MMCR0_USER_MASK	(MMCR0_FC | MMCR0_PMXE | MMCR0_PMAO)
++#define MMCR2_USER_MASK	0x4020100804020000UL /* (FC1P|FC2P|FC3P|FC4P|FC5P|FC6P) */
++#define SIER_USER_MASK	0x7fffffUL
++
+ #define SPRN_PA6T_MMCR0 795
+ #define   PA6T_MMCR0_EN0	0x0000000000000001UL
+ #define   PA6T_MMCR0_EN1	0x0000000000000002UL
+diff --git a/arch/powerpc/include/asm/switch_to.h b/arch/powerpc/include/asm/switch_to.h
+index 200d763a0a67..49a13e0ef234 100644
+--- a/arch/powerpc/include/asm/switch_to.h
++++ b/arch/powerpc/include/asm/switch_to.h
+@@ -67,4 +67,18 @@ static inline void flush_spe_to_thread(struct task_struct *t)
+ }
+ #endif
+ 
++static inline void clear_task_ebb(struct task_struct *t)
++{
++#ifdef CONFIG_PPC_BOOK3S_64
++    /* EBB perf events are not inherited, so clear all EBB state. */
++    t->thread.bescr = 0;
++    t->thread.mmcr2 = 0;
++    t->thread.mmcr0 = 0;
++    t->thread.siar = 0;
++    t->thread.sdar = 0;
++    t->thread.sier = 0;
++    t->thread.used_ebb = 0;
++#endif
++}
++
+ #endif /* _ASM_POWERPC_SWITCH_TO_H */
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index 076d1242507a..c517dbe705fd 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -916,7 +916,11 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+ 	flush_altivec_to_thread(src);
+ 	flush_vsx_to_thread(src);
+ 	flush_spe_to_thread(src);
++
+ 	*dst = *src;
++
++	clear_task_ebb(dst);
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/powerpc/perf/core-book3s.c b/arch/powerpc/perf/core-book3s.c
+index d3ee2e50a3a6..c6bbbf945f08 100644
+--- a/arch/powerpc/perf/core-book3s.c
++++ b/arch/powerpc/perf/core-book3s.c
+@@ -77,6 +77,9 @@ static unsigned int freeze_events_kernel = MMCR0_FCS;
+ #define MMCR0_PMCjCE		MMCR0_PMCnCE
+ #define MMCR0_FC56		0
+ #define MMCR0_PMAO		0
++#define MMCR0_EBE		0
++#define MMCR0_PMCC		0
++#define MMCR0_PMCC_U6		0
+ 
+ #define SPRN_MMCRA		SPRN_MMCR2
+ #define MMCRA_SAMPLE_ENABLE	0
+@@ -104,6 +107,15 @@ static inline int siar_valid(struct pt_regs *regs)
+ 	return 1;
+ }
+ 
++static bool is_ebb_event(struct perf_event *event) { return false; }
++static int ebb_event_check(struct perf_event *event) { return 0; }
++static void ebb_event_add(struct perf_event *event) { }
++static void ebb_switch_out(unsigned long mmcr0) { }
++static unsigned long ebb_switch_in(bool ebb, unsigned long mmcr0)
++{
++	return mmcr0;
++}
++
+ static inline void power_pmu_bhrb_enable(struct perf_event *event) {}
+ static inline void power_pmu_bhrb_disable(struct perf_event *event) {}
+ void power_pmu_flush_branch_stack(void) {}
+@@ -464,6 +476,89 @@ void power_pmu_bhrb_read(struct cpu_hw_events *cpuhw)
+ 	return;
+ }
+ 
++static bool is_ebb_event(struct perf_event *event)
++{
++	/*
++	 * This could be a per-PMU callback, but we'd rather avoid the cost. We
++	 * check that the PMU supports EBB, meaning those that don't can still
++	 * use bit 63 of the event code for something else if they wish.
++	 */
++	return (ppmu->flags & PPMU_EBB) &&
++	       ((event->attr.config >> EVENT_CONFIG_EBB_SHIFT) & 1);
++}
++
++static int ebb_event_check(struct perf_event *event)
++{
++	struct perf_event *leader = event->group_leader;
++
++	/* Event and group leader must agree on EBB */
++	if (is_ebb_event(leader) != is_ebb_event(event))
++		return -EINVAL;
++
++	if (is_ebb_event(event)) {
++		if (!(event->attach_state & PERF_ATTACH_TASK))
++			return -EINVAL;
++
++		if (!leader->attr.pinned || !leader->attr.exclusive)
++			return -EINVAL;
++
++		if (event->attr.inherit || event->attr.sample_period ||
++		    event->attr.enable_on_exec || event->attr.freq)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void ebb_event_add(struct perf_event *event)
++{
++	if (!is_ebb_event(event) || current->thread.used_ebb)
++		return;
++
++	/*
++	 * IFF this is the first time we've added an EBB event, set
++	 * PMXE in the user MMCR0 so we can detect when it's cleared by
++	 * userspace. We need this so that we can context switch while
++	 * userspace is in the EBB handler (where PMXE is 0).
++	 */
++	current->thread.used_ebb = 1;
++	current->thread.mmcr0 |= MMCR0_PMXE;
++}
++
++static void ebb_switch_out(unsigned long mmcr0)
++{
++	if (!(mmcr0 & MMCR0_EBE))
++		return;
++
++	current->thread.siar  = mfspr(SPRN_SIAR);
++	current->thread.sier  = mfspr(SPRN_SIER);
++	current->thread.sdar  = mfspr(SPRN_SDAR);
++	current->thread.mmcr0 = mmcr0 & MMCR0_USER_MASK;
++	current->thread.mmcr2 = mfspr(SPRN_MMCR2) & MMCR2_USER_MASK;
++}
++
++static unsigned long ebb_switch_in(bool ebb, unsigned long mmcr0)
++{
++	if (!ebb)
++		goto out;
++
++	/* Enable EBB and read/write to all 6 PMCs for userspace */
++	mmcr0 |= MMCR0_EBE | MMCR0_PMCC_U6;
++
++	/* Add any bits from the user reg, FC or PMAO */
++	mmcr0 |= current->thread.mmcr0;
++
++	/* Be careful not to set PMXE if userspace had it cleared */
++	if (!(current->thread.mmcr0 & MMCR0_PMXE))
++		mmcr0 &= ~MMCR0_PMXE;
++
++	mtspr(SPRN_SIAR, current->thread.siar);
++	mtspr(SPRN_SIER, current->thread.sier);
++	mtspr(SPRN_SDAR, current->thread.sdar);
++	mtspr(SPRN_MMCR2, current->thread.mmcr2);
++out:
++	return mmcr0;
++}
+ #endif /* CONFIG_PPC64 */
+ 
+ static void perf_event_interrupt(struct pt_regs *regs);
+@@ -734,6 +829,13 @@ static void power_pmu_read(struct perf_event *event)
+ 
+ 	if (!event->hw.idx)
+ 		return;
++
++	if (is_ebb_event(event)) {
++		val = read_pmc(event->hw.idx);
++		local64_set(&event->hw.prev_count, val);
++		return;
++	}
++
+ 	/*
+ 	 * Performance monitor interrupts come even when interrupts
+ 	 * are soft-disabled, as long as interrupts are hard-enabled.
+@@ -854,7 +956,7 @@ static void write_mmcr0(struct cpu_hw_events *cpuhw, unsigned long mmcr0)
+ static void power_pmu_disable(struct pmu *pmu)
+ {
+ 	struct cpu_hw_events *cpuhw;
+-	unsigned long flags, val;
++	unsigned long flags, mmcr0, val;
+ 
+ 	if (!ppmu)
+ 		return;
+@@ -871,11 +973,11 @@ static void power_pmu_disable(struct pmu *pmu)
+ 		}
+ 
+ 		/*
+-		 * Set the 'freeze counters' bit, clear PMAO/FC56.
++		 * Set the 'freeze counters' bit, clear EBE/PMCC/PMAO/FC56.
+ 		 */
+-		val  = mfspr(SPRN_MMCR0);
++		val  = mmcr0 = mfspr(SPRN_MMCR0);
+ 		val |= MMCR0_FC;
+-		val &= ~(MMCR0_PMAO | MMCR0_FC56);
++		val &= ~(MMCR0_EBE | MMCR0_PMCC | MMCR0_PMAO | MMCR0_FC56);
+ 
+ 		/*
+ 		 * The barrier is to make sure the mtspr has been
+@@ -896,7 +998,10 @@ static void power_pmu_disable(struct pmu *pmu)
+ 
+ 		cpuhw->disabled = 1;
+ 		cpuhw->n_added = 0;
++
++		ebb_switch_out(mmcr0);
+ 	}
++
+ 	local_irq_restore(flags);
+ }
+ 
+@@ -911,15 +1016,15 @@ static void power_pmu_enable(struct pmu *pmu)
+ 	struct cpu_hw_events *cpuhw;
+ 	unsigned long flags;
+ 	long i;
+-	unsigned long val;
++	unsigned long val, mmcr0;
+ 	s64 left;
+ 	unsigned int hwc_index[MAX_HWEVENTS];
+ 	int n_lim;
+ 	int idx;
++	bool ebb;
+ 
+ 	if (!ppmu)
+ 		return;
+-
+ 	local_irq_save(flags);
+ 
+ 	cpuhw = &__get_cpu_var(cpu_hw_events);
+@@ -933,6 +1038,13 @@ static void power_pmu_enable(struct pmu *pmu)
+ 
+ 	cpuhw->disabled = 0;
+ 
++	/*
++	 * EBB requires an exclusive group and all events must have the EBB
++	 * flag set, or not set, so we can just check a single event. Also we
++	 * know we have at least one event.
++	 */
++	ebb = is_ebb_event(cpuhw->event[0]);
++
+ 	/*
+ 	 * If we didn't change anything, or only removed events,
+ 	 * no need to recalculate MMCR* settings and reset the PMCs.
+@@ -1008,25 +1120,34 @@ static void power_pmu_enable(struct pmu *pmu)
+ 			++n_lim;
+ 			continue;
+ 		}
+-		val = 0;
+-		if (event->hw.sample_period) {
+-			left = local64_read(&event->hw.period_left);
+-			if (left < 0x80000000L)
+-				val = 0x80000000L - left;
++
++		if (ebb)
++			val = local64_read(&event->hw.prev_count);
++		else {
++			val = 0;
++			if (event->hw.sample_period) {
++				left = local64_read(&event->hw.period_left);
++				if (left < 0x80000000L)
++					val = 0x80000000L - left;
++			}
++			local64_set(&event->hw.prev_count, val);
+ 		}
+-		local64_set(&event->hw.prev_count, val);
++
+ 		event->hw.idx = idx;
+ 		if (event->hw.state & PERF_HES_STOPPED)
+ 			val = 0;
+ 		write_pmc(idx, val);
++
+ 		perf_event_update_userpage(event);
+ 	}
+ 	cpuhw->n_limited = n_lim;
+ 	cpuhw->mmcr[0] |= MMCR0_PMXE | MMCR0_FCECE;
+ 
+  out_enable:
++	mmcr0 = ebb_switch_in(ebb, cpuhw->mmcr[0]);
++
+ 	mb();
+-	write_mmcr0(cpuhw, cpuhw->mmcr[0]);
++	write_mmcr0(cpuhw, mmcr0);
+ 
+ 	/*
+ 	 * Enable instruction sampling if necessary
+@@ -1124,6 +1245,8 @@ static int power_pmu_add(struct perf_event *event, int ef_flags)
+ 	event->hw.config = cpuhw->events[n0];
+ 
+ nocheck:
++	ebb_event_add(event);
++
+ 	++cpuhw->n_events;
+ 	++cpuhw->n_added;
+ 
+@@ -1484,6 +1607,11 @@ static int power_pmu_event_init(struct perf_event *event)
+ 		}
+ 	}
+ 
++	/* Extra checks for EBB */
++	err = ebb_event_check(event);
++	if (err)
++		return err;
++
+ 	/*
+ 	 * If this is in a group, check if it can go on with all the
+ 	 * other hardware events in the group.  We assume the event
+@@ -1522,6 +1650,13 @@ static int power_pmu_event_init(struct perf_event *event)
+ 	event->hw.last_period = event->hw.sample_period;
+ 	local64_set(&event->hw.period_left, event->hw.last_period);
+ 
++	/*
++	 * For EBB events we just context switch the PMC value, we don't do any
++	 * of the sample_period logic. We use hw.prev_count for this.
++	 */
++	if (is_ebb_event(event))
++		local64_set(&event->hw.prev_count, 0);
++
+ 	/*
+ 	 * See if we need to reserve the PMU.
+ 	 * If no events are currently in use, then we have to take a
