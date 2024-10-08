@@ -6115,8 +6115,7 @@ enum btrfs_loop_type {
  * ins->offset == number of blocks
  * Any available blocks before search_start are skipped.
  */
-static noinline int find_free_extent(struct btrfs_trans_handle *trans,
-				     struct btrfs_root *orig_root,
+static noinline int find_free_extent(struct btrfs_root *orig_root,
 				     u64 num_bytes, u64 empty_size,
 				     u64 hint_byte, struct btrfs_key *ins,
 				     u64 flags)
@@ -6339,10 +6338,10 @@ refill_cluster:
 					      block_group->full_stripe_len);
 
 			/* allocate a cluster in this block group */
-			ret = btrfs_find_space_cluster(trans, root,
-					       block_group, last_ptr,
-					       search_start, num_bytes,
-					       aligned_cluster);
+			ret = btrfs_find_space_cluster(root, block_group,
+						       last_ptr, search_start,
+						       num_bytes,
+						       aligned_cluster);
 			if (ret == 0) {
 				/*
 				 * now pull our allocation out of this
@@ -6473,17 +6472,28 @@ loop:
 		index = 0;
 		loop++;
 		if (loop == LOOP_ALLOC_CHUNK) {
+			struct btrfs_trans_handle *trans;
+
+			trans = btrfs_join_transaction(root);
+			if (IS_ERR(trans)) {
+				ret = PTR_ERR(trans);
+				goto out;
+			}
+
 			ret = do_chunk_alloc(trans, root, flags,
 					     CHUNK_ALLOC_FORCE);
 			/*
 			 * Do not bail out on ENOSPC since we
 			 * can do more things.
 			 */
-			if (ret < 0 && ret != -ENOSPC) {
+			if (ret < 0 && ret != -ENOSPC)
 				btrfs_abort_transaction(trans,
 							root, ret);
+			else
+				ret = 0;
+			btrfs_end_transaction(trans, root);
+			if (ret)
 				goto out;
-			}
 		}
 
 		if (loop == LOOP_NO_EMPTY_SIZE) {
@@ -6547,8 +6557,7 @@ again:
 	up_read(&info->groups_sem);
 }
 
-int btrfs_reserve_extent(struct btrfs_trans_handle *trans,
-			 struct btrfs_root *root,
+int btrfs_reserve_extent(struct btrfs_root *root,
 			 u64 num_bytes, u64 min_alloc_size,
 			 u64 empty_size, u64 hint_byte,
 			 struct btrfs_key *ins, int is_data)
@@ -6560,8 +6569,8 @@ int btrfs_reserve_extent(struct btrfs_trans_handle *trans,
 	flags = btrfs_get_alloc_profile(root, is_data);
 again:
 	WARN_ON(num_bytes < root->sectorsize);
-	ret = find_free_extent(trans, root, num_bytes, empty_size,
-			       hint_byte, ins, flags);
+	ret = find_free_extent(root, num_bytes, empty_size, hint_byte, ins,
+			       flags);
 
 	if (ret == -ENOSPC) {
 		if (!final_tried) {
@@ -6949,7 +6958,7 @@ struct extent_buffer *btrfs_alloc_free_block(struct btrfs_trans_handle *trans,
 	if (IS_ERR(block_rsv))
 		return ERR_CAST(block_rsv);
 
-	ret = btrfs_reserve_extent(trans, root, blocksize, blocksize,
+	ret = btrfs_reserve_extent(root, blocksize, blocksize,
 				   empty_size, hint, &ins, 0);
 	if (ret) {
 		unuse_block_rsv(root->fs_info, block_rsv, blocksize);
