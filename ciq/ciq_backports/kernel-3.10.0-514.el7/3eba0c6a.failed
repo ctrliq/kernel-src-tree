@@ -1,0 +1,422 @@
+mm/zpool: add name argument to create zpool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] zpool: add name argument to create zpool (Seth Jennings) [1244276]
+Rebuild_FUZZ: 96.39%
+commit-author Ganesh Mahendran <opensource.ganesh@gmail.com>
+commit 3eba0c6a56c04f2b017b43641a821f1ebfb7fb4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3eba0c6a.failed
+
+Currently the underlay of zpool: zsmalloc/zbud, do not know who creates
+them.  There is not a method to let zsmalloc/zbud find which caller they
+belong to.
+
+Now we want to add statistics collection in zsmalloc.  We need to name the
+debugfs dir for each pool created.  The way suggested by Minchan Kim is to
+use a name passed by caller(such as zram) to create the zsmalloc pool.
+
+    /sys/kernel/debug/zsmalloc/zram0
+
+This patch adds an argument `name' to zs_create_pool() and other related
+functions.
+
+	Signed-off-by: Ganesh Mahendran <opensource.ganesh@gmail.com>
+	Acked-by: Minchan Kim <minchan@kernel.org>
+	Cc: Seth Jennings <sjennings@variantweb.net>
+	Cc: Nitin Gupta <ngupta@vflare.org>
+	Cc: Dan Streetman <ddstreet@ieee.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3eba0c6a56c04f2b017b43641a821f1ebfb7fb4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/zsmalloc.c
+diff --cc mm/zsmalloc.c
+index 363858e3a119,2359e61b02bf..000000000000
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@@ -1178,11 -1038,238 +1178,234 @@@ void zs_unmap_object(struct zs_pool *po
+  }
+  EXPORT_SYMBOL_GPL(zs_unmap_object);
+  
+ -/**
+ - * zs_malloc - Allocate block of given size from pool.
+ - * @pool: pool to allocate from
+ - * @size: size of block to allocate
+ - *
+ - * On success, handle to the allocated object is returned,
+ - * otherwise 0.
+ - * Allocation requests with size > ZS_MAX_ALLOC_SIZE will fail.
+ - */
+ -unsigned long zs_malloc(struct zs_pool *pool, size_t size)
+ +unsigned long zs_get_total_pages(struct zs_pool *pool)
+  {
+++<<<<<<< HEAD
+ +	return atomic_long_read(&pool->pages_allocated);
+++=======
++ 	unsigned long obj;
++ 	struct link_free *link;
++ 	struct size_class *class;
++ 	void *vaddr;
++ 
++ 	struct page *first_page, *m_page;
++ 	unsigned long m_objidx, m_offset;
++ 
++ 	if (unlikely(!size || size > ZS_MAX_ALLOC_SIZE))
++ 		return 0;
++ 
++ 	class = pool->size_class[get_size_class_index(size)];
++ 
++ 	spin_lock(&class->lock);
++ 	first_page = find_get_zspage(class);
++ 
++ 	if (!first_page) {
++ 		spin_unlock(&class->lock);
++ 		first_page = alloc_zspage(class, pool->flags);
++ 		if (unlikely(!first_page))
++ 			return 0;
++ 
++ 		set_zspage_mapping(first_page, class->index, ZS_EMPTY);
++ 		atomic_long_add(class->pages_per_zspage,
++ 					&pool->pages_allocated);
++ 		spin_lock(&class->lock);
++ 	}
++ 
++ 	obj = (unsigned long)first_page->freelist;
++ 	obj_handle_to_location(obj, &m_page, &m_objidx);
++ 	m_offset = obj_idx_to_offset(m_page, m_objidx, class->size);
++ 
++ 	vaddr = kmap_atomic(m_page);
++ 	link = (struct link_free *)vaddr + m_offset / sizeof(*link);
++ 	first_page->freelist = link->next;
++ 	memset(link, POISON_INUSE, sizeof(*link));
++ 	kunmap_atomic(vaddr);
++ 
++ 	first_page->inuse++;
++ 	/* Now move the zspage to another fullness group, if required */
++ 	fix_fullness_group(pool, first_page);
++ 	spin_unlock(&class->lock);
++ 
++ 	return obj;
++ }
++ EXPORT_SYMBOL_GPL(zs_malloc);
++ 
++ void zs_free(struct zs_pool *pool, unsigned long obj)
++ {
++ 	struct link_free *link;
++ 	struct page *first_page, *f_page;
++ 	unsigned long f_objidx, f_offset;
++ 	void *vaddr;
++ 
++ 	int class_idx;
++ 	struct size_class *class;
++ 	enum fullness_group fullness;
++ 
++ 	if (unlikely(!obj))
++ 		return;
++ 
++ 	obj_handle_to_location(obj, &f_page, &f_objidx);
++ 	first_page = get_first_page(f_page);
++ 
++ 	get_zspage_mapping(first_page, &class_idx, &fullness);
++ 	class = pool->size_class[class_idx];
++ 	f_offset = obj_idx_to_offset(f_page, f_objidx, class->size);
++ 
++ 	spin_lock(&class->lock);
++ 
++ 	/* Insert this object in containing zspage's freelist */
++ 	vaddr = kmap_atomic(f_page);
++ 	link = (struct link_free *)(vaddr + f_offset);
++ 	link->next = first_page->freelist;
++ 	kunmap_atomic(vaddr);
++ 	first_page->freelist = (void *)obj;
++ 
++ 	first_page->inuse--;
++ 	fullness = fix_fullness_group(pool, first_page);
++ 	spin_unlock(&class->lock);
++ 
++ 	if (fullness == ZS_EMPTY) {
++ 		atomic_long_sub(class->pages_per_zspage,
++ 				&pool->pages_allocated);
++ 		free_zspage(first_page);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(zs_free);
++ 
++ /**
++  * zs_create_pool - Creates an allocation pool to work from.
++  * @flags: allocation flags used to allocate pool metadata
++  *
++  * This function must be called before anything when using
++  * the zsmalloc allocator.
++  *
++  * On success, a pointer to the newly created pool is returned,
++  * otherwise NULL.
++  */
++ struct zs_pool *zs_create_pool(char *name, gfp_t flags)
++ {
++ 	int i;
++ 	struct zs_pool *pool;
++ 	struct size_class *prev_class = NULL;
++ 
++ 	pool = kzalloc(sizeof(*pool), GFP_KERNEL);
++ 	if (!pool)
++ 		return NULL;
++ 
++ 	pool->size_class = kcalloc(zs_size_classes, sizeof(struct size_class *),
++ 			GFP_KERNEL);
++ 	if (!pool->size_class) {
++ 		kfree(pool);
++ 		return NULL;
++ 	}
++ 
++ 	/*
++ 	 * Iterate reversly, because, size of size_class that we want to use
++ 	 * for merging should be larger or equal to current size.
++ 	 */
++ 	for (i = zs_size_classes - 1; i >= 0; i--) {
++ 		int size;
++ 		int pages_per_zspage;
++ 		struct size_class *class;
++ 
++ 		size = ZS_MIN_ALLOC_SIZE + i * ZS_SIZE_CLASS_DELTA;
++ 		if (size > ZS_MAX_ALLOC_SIZE)
++ 			size = ZS_MAX_ALLOC_SIZE;
++ 		pages_per_zspage = get_pages_per_zspage(size);
++ 
++ 		/*
++ 		 * size_class is used for normal zsmalloc operation such
++ 		 * as alloc/free for that size. Although it is natural that we
++ 		 * have one size_class for each size, there is a chance that we
++ 		 * can get more memory utilization if we use one size_class for
++ 		 * many different sizes whose size_class have same
++ 		 * characteristics. So, we makes size_class point to
++ 		 * previous size_class if possible.
++ 		 */
++ 		if (prev_class) {
++ 			if (can_merge(prev_class, size, pages_per_zspage)) {
++ 				pool->size_class[i] = prev_class;
++ 				continue;
++ 			}
++ 		}
++ 
++ 		class = kzalloc(sizeof(struct size_class), GFP_KERNEL);
++ 		if (!class)
++ 			goto err;
++ 
++ 		class->size = size;
++ 		class->index = i;
++ 		class->pages_per_zspage = pages_per_zspage;
++ 		spin_lock_init(&class->lock);
++ 		pool->size_class[i] = class;
++ 
++ 		prev_class = class;
++ 	}
++ 
++ 	pool->flags = flags;
++ 
++ 	return pool;
++ 
++ err:
++ 	zs_destroy_pool(pool);
++ 	return NULL;
++ }
++ EXPORT_SYMBOL_GPL(zs_create_pool);
++ 
++ void zs_destroy_pool(struct zs_pool *pool)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < zs_size_classes; i++) {
++ 		int fg;
++ 		struct size_class *class = pool->size_class[i];
++ 
++ 		if (!class)
++ 			continue;
++ 
++ 		if (class->index != i)
++ 			continue;
++ 
++ 		for (fg = 0; fg < _ZS_NR_FULLNESS_GROUPS; fg++) {
++ 			if (class->fullness_list[fg]) {
++ 				pr_info("Freeing non-empty class with size %db, fullness group %d\n",
++ 					class->size, fg);
++ 			}
++ 		}
++ 		kfree(class);
++ 	}
++ 
++ 	kfree(pool->size_class);
++ 	kfree(pool);
++ }
++ EXPORT_SYMBOL_GPL(zs_destroy_pool);
++ 
++ static int __init zs_init(void)
++ {
++ 	int ret = zs_register_cpu_notifier();
++ 
++ 	if (ret) {
++ 		zs_unregister_cpu_notifier();
++ 		return ret;
++ 	}
++ 
++ 	init_zs_size_classes();
++ 
++ #ifdef CONFIG_ZPOOL
++ 	zpool_register_driver(&zs_zpool_driver);
++ #endif
++ 	return 0;
++ }
++ 
++ static void __exit zs_exit(void)
++ {
++ #ifdef CONFIG_ZPOOL
++ 	zpool_unregister_driver(&zs_zpool_driver);
++ #endif
++ 	zs_unregister_cpu_notifier();
+++>>>>>>> 3eba0c6a56c0 (mm/zpool: add name argument to create zpool)
+  }
+ +EXPORT_SYMBOL_GPL(zs_get_total_pages);
+  
+  module_init(zs_init);
+  module_exit(zs_exit);
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 55d1b1aee8ba..4e10caabddcc 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -314,9 +314,10 @@ static void zram_meta_free(struct zram_meta *meta, u64 disksize)
+ 	kfree(meta);
+ }
+ 
+-static struct zram_meta *zram_meta_alloc(u64 disksize)
++static struct zram_meta *zram_meta_alloc(int device_id, u64 disksize)
+ {
+ 	size_t num_pages;
++	char pool_name[8];
+ 	struct zram_meta *meta = kmalloc(sizeof(*meta), GFP_KERNEL);
+ 
+ 	if (!meta)
+@@ -329,7 +330,8 @@ static struct zram_meta *zram_meta_alloc(u64 disksize)
+ 		goto out_error;
+ 	}
+ 
+-	meta->mem_pool = zs_create_pool(GFP_NOIO | __GFP_HIGHMEM);
++	snprintf(pool_name, sizeof(pool_name), "zram%d", device_id);
++	meta->mem_pool = zs_create_pool(pool_name, GFP_NOIO | __GFP_HIGHMEM);
+ 	if (!meta->mem_pool) {
+ 		pr_err("Error creating memory pool\n");
+ 		goto out_error;
+@@ -702,7 +704,7 @@ static ssize_t disksize_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	disksize = PAGE_ALIGN(disksize);
+-	meta = zram_meta_alloc(disksize);
++	meta = zram_meta_alloc(zram->disk->first_minor, disksize);
+ 	if (!meta)
+ 		return -ENOMEM;
+ 
+diff --git a/include/linux/zpool.h b/include/linux/zpool.h
+index f14bd75f08b3..56529b34dc63 100644
+--- a/include/linux/zpool.h
++++ b/include/linux/zpool.h
+@@ -36,7 +36,8 @@ enum zpool_mapmode {
+ 	ZPOOL_MM_DEFAULT = ZPOOL_MM_RW
+ };
+ 
+-struct zpool *zpool_create_pool(char *type, gfp_t gfp, struct zpool_ops *ops);
++struct zpool *zpool_create_pool(char *type, char *name,
++			gfp_t gfp, struct zpool_ops *ops);
+ 
+ char *zpool_get_type(struct zpool *pool);
+ 
+@@ -80,7 +81,7 @@ struct zpool_driver {
+ 	atomic_t refcount;
+ 	struct list_head list;
+ 
+-	void *(*create)(gfp_t gfp, struct zpool_ops *ops);
++	void *(*create)(char *name, gfp_t gfp, struct zpool_ops *ops);
+ 	void (*destroy)(void *pool);
+ 
+ 	int (*malloc)(void *pool, size_t size, gfp_t gfp,
+diff --git a/include/linux/zsmalloc.h b/include/linux/zsmalloc.h
+index 05c214760977..3283c6a55425 100644
+--- a/include/linux/zsmalloc.h
++++ b/include/linux/zsmalloc.h
+@@ -36,7 +36,7 @@ enum zs_mapmode {
+ 
+ struct zs_pool;
+ 
+-struct zs_pool *zs_create_pool(gfp_t flags);
++struct zs_pool *zs_create_pool(char *name, gfp_t flags);
+ void zs_destroy_pool(struct zs_pool *pool);
+ 
+ unsigned long zs_malloc(struct zs_pool *pool, size_t size);
+diff --git a/mm/zbud.c b/mm/zbud.c
+index ecf1dbef6983..2010b6ecf5ce 100644
+--- a/mm/zbud.c
++++ b/mm/zbud.c
+@@ -130,7 +130,8 @@ static struct zbud_ops zbud_zpool_ops = {
+ 	.evict =	zbud_zpool_evict
+ };
+ 
+-static void *zbud_zpool_create(gfp_t gfp, struct zpool_ops *zpool_ops)
++static void *zbud_zpool_create(char *name, gfp_t gfp,
++			struct zpool_ops *zpool_ops)
+ {
+ 	return zbud_create_pool(gfp, &zbud_zpool_ops);
+ }
+diff --git a/mm/zpool.c b/mm/zpool.c
+index 739cdf0d183a..bacdab6e47de 100644
+--- a/mm/zpool.c
++++ b/mm/zpool.c
+@@ -129,6 +129,7 @@ static void zpool_put_driver(struct zpool_driver *driver)
+ /**
+  * zpool_create_pool() - Create a new zpool
+  * @type	The type of the zpool to create (e.g. zbud, zsmalloc)
++ * @name	The name of the zpool (e.g. zram0, zswap)
+  * @gfp		The GFP flags to use when allocating the pool.
+  * @ops		The optional ops callback.
+  *
+@@ -140,7 +141,8 @@ static void zpool_put_driver(struct zpool_driver *driver)
+  *
+  * Returns: New zpool on success, NULL on failure.
+  */
+-struct zpool *zpool_create_pool(char *type, gfp_t gfp, struct zpool_ops *ops)
++struct zpool *zpool_create_pool(char *type, char *name, gfp_t gfp,
++		struct zpool_ops *ops)
+ {
+ 	struct zpool_driver *driver;
+ 	struct zpool *zpool;
+@@ -168,7 +170,7 @@ struct zpool *zpool_create_pool(char *type, gfp_t gfp, struct zpool_ops *ops)
+ 
+ 	zpool->type = driver->type;
+ 	zpool->driver = driver;
+-	zpool->pool = driver->create(gfp, ops);
++	zpool->pool = driver->create(name, gfp, ops);
+ 	zpool->ops = ops;
+ 
+ 	if (!zpool->pool) {
+* Unmerged path mm/zsmalloc.c
+diff --git a/mm/zswap.c b/mm/zswap.c
+index 15804a44395a..4eb661cab809 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -907,11 +907,12 @@ static int __init init_zswap(void)
+ 
+ 	pr_info("loading zswap\n");
+ 
+-	zswap_pool = zpool_create_pool(zswap_zpool_type, gfp, &zswap_zpool_ops);
++	zswap_pool = zpool_create_pool(zswap_zpool_type, "zswap", gfp,
++					&zswap_zpool_ops);
+ 	if (!zswap_pool && strcmp(zswap_zpool_type, ZSWAP_ZPOOL_DEFAULT)) {
+ 		pr_info("%s zpool not available\n", zswap_zpool_type);
+ 		zswap_zpool_type = ZSWAP_ZPOOL_DEFAULT;
+-		zswap_pool = zpool_create_pool(zswap_zpool_type, gfp,
++		zswap_pool = zpool_create_pool(zswap_zpool_type, "zswap", gfp,
+ 					&zswap_zpool_ops);
+ 	}
+ 	if (!zswap_pool) {
