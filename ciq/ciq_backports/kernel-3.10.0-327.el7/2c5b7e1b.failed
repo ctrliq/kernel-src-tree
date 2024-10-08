@@ -1,0 +1,142 @@
+userfaultfd: avoid missing wakeups during refile in userfaultfd_read
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 2c5b7e1be74ff0175dedbbd325abe9f0dbbb09ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2c5b7e1b.failed
+
+During the refile in userfaultfd_read both waitqueues could look empty to
+the lockless wake_userfault().  Use a seqcount to prevent this false
+negative that could leave an userfault blocked.
+
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2c5b7e1be74ff0175dedbbd325abe9f0dbbb09ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/userfaultfd.c
+diff --cc fs/userfaultfd.c
+index 6a34033d3189,634e676072cb..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -39,6 -45,10 +39,13 @@@ struct userfaultfd_ctx 
+  	wait_queue_head_t fault_wqh;
+  	/* waitqueue head for the pseudo fd to wakeup poll/read */
+  	wait_queue_head_t fd_wqh;
+++<<<<<<< HEAD
+++=======
++ 	/* a refile sequence protected by fault_pending_wqh lock */
++ 	struct seqcount refile_seq;
++ 	/* pseudo fd refcounting */
++ 	atomic_t refcount;
+++>>>>>>> 2c5b7e1be74f (userfaultfd: avoid missing wakeups during refile in userfaultfd_read)
+  	/* userfaultfd syscall flags */
+  	unsigned int flags;
+  	/* state machine */
+@@@ -484,16 -545,47 +491,56 @@@ static ssize_t userfaultfd_ctx_read(str
+  	__add_wait_queue(&ctx->fd_wqh, &wait);
+  	for (;;) {
+  		set_current_state(TASK_INTERRUPTIBLE);
+ -		spin_lock(&ctx->fault_pending_wqh.lock);
+ -		uwq = find_userfault(ctx);
+ -		if (uwq) {
+ +		spin_lock(&ctx->fault_wqh.lock);
+ +		if (find_userfault(ctx, &uwq)) {
+  			/*
+++<<<<<<< HEAD
+ +			 * The fault_wqh.lock prevents the uwq to
+ +			 * disappear from under us.
+ +			 */
+ +			uwq->pending = false;
+ +			/* careful to always initialize addr if ret == 0 */
+ +			*addr = uwq->address;
+ +			spin_unlock(&ctx->fault_wqh.lock);
+++=======
++ 			 * Use a seqcount to repeat the lockless check
++ 			 * in wake_userfault() to avoid missing
++ 			 * wakeups because during the refile both
++ 			 * waitqueue could become empty if this is the
++ 			 * only userfault.
++ 			 */
++ 			write_seqcount_begin(&ctx->refile_seq);
++ 
++ 			/*
++ 			 * The fault_pending_wqh.lock prevents the uwq
++ 			 * to disappear from under us.
++ 			 *
++ 			 * Refile this userfault from
++ 			 * fault_pending_wqh to fault_wqh, it's not
++ 			 * pending anymore after we read it.
++ 			 *
++ 			 * Use list_del() by hand (as
++ 			 * userfaultfd_wake_function also uses
++ 			 * list_del_init() by hand) to be sure nobody
++ 			 * changes __remove_wait_queue() to use
++ 			 * list_del_init() in turn breaking the
++ 			 * !list_empty_careful() check in
++ 			 * handle_userfault(). The uwq->wq.task_list
++ 			 * must never be empty at any time during the
++ 			 * refile, or the waitqueue could disappear
++ 			 * from under us. The "wait_queue_head_t"
++ 			 * parameter of __remove_wait_queue() is unused
++ 			 * anyway.
++ 			 */
++ 			list_del(&uwq->wq.task_list);
++ 			__add_wait_queue(&ctx->fault_wqh, &uwq->wq);
++ 
++ 			write_seqcount_end(&ctx->refile_seq);
++ 
++ 			/* careful to always initialize msg if ret == 0 */
++ 			*msg = uwq->msg;
++ 			spin_unlock(&ctx->fault_pending_wqh.lock);
+++>>>>>>> 2c5b7e1be74f (userfaultfd: avoid missing wakeups during refile in userfaultfd_read)
+  			ret = 0;
+  			break;
+  		}
+@@@ -580,7 -678,13 +630,17 @@@ static __always_inline void wake_userfa
+  	 * userfaults yet. So we take the spinlock only when we're
+  	 * sure we've userfaults to wake.
+  	 */
+++<<<<<<< HEAD
+ +	if (waitqueue_active(&ctx->fault_wqh))
+++=======
++ 	do {
++ 		seq = read_seqcount_begin(&ctx->refile_seq);
++ 		need_wakeup = waitqueue_active(&ctx->fault_pending_wqh) ||
++ 			waitqueue_active(&ctx->fault_wqh);
++ 		cond_resched();
++ 	} while (read_seqcount_retry(&ctx->refile_seq, seq));
++ 	if (need_wakeup)
+++>>>>>>> 2c5b7e1be74f (userfaultfd: avoid missing wakeups during refile in userfaultfd_read)
+  		__wake_userfault(ctx, range);
+  }
+  
+@@@ -1128,6 -1233,16 +1188,19 @@@ static const struct file_operations use
+  	.llseek		= noop_llseek,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void init_once_userfaultfd_ctx(void *mem)
++ {
++ 	struct userfaultfd_ctx *ctx = (struct userfaultfd_ctx *) mem;
++ 
++ 	init_waitqueue_head(&ctx->fault_pending_wqh);
++ 	init_waitqueue_head(&ctx->fault_wqh);
++ 	init_waitqueue_head(&ctx->fd_wqh);
++ 	seqcount_init(&ctx->refile_seq);
++ }
++ 
+++>>>>>>> 2c5b7e1be74f (userfaultfd: avoid missing wakeups during refile in userfaultfd_read)
+  /**
+   * userfaultfd_file_create - Creates an userfaultfd file pointer.
+   * @flags: Flags for the userfaultfd file.
+* Unmerged path fs/userfaultfd.c
