@@ -1,0 +1,660 @@
+ext4: fix races between page faults and hole punching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.com>
+commit ea3d7209ca01da209cda6f0dea8be9cc4b7a933b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ea3d7209.failed
+
+Currently, page faults and hole punching are completely unsynchronized.
+This can result in page fault faulting in a page into a range that we
+are punching after truncate_pagecache_range() has been called and thus
+we can end up with a page mapped to disk blocks that will be shortly
+freed. Filesystem corruption will shortly follow. Note that the same
+race is avoided for truncate by checking page fault offset against
+i_size but there isn't similar mechanism available for punching holes.
+
+Fix the problem by creating new rw semaphore i_mmap_sem in inode and
+grab it for writing over truncate, hole punching, and other functions
+removing blocks from extent tree and for read over page faults. We
+cannot easily use i_data_sem for this since that ranks below transaction
+start and we need something ranking above it so that it can be held over
+the whole truncate / hole punching operation. Also remove various
+workarounds we had in the code to reduce race window when page fault
+could have created pages with stale mapping information.
+
+	Signed-off-by: Jan Kara <jack@suse.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit ea3d7209ca01da209cda6f0dea8be9cc4b7a933b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/extents.c
+#	fs/ext4/file.c
+#	fs/ext4/inode.c
+diff --cc fs/ext4/extents.c
+index d936da6a075b,5be9ca5a8a7a..000000000000
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@@ -5504,3 -5579,373 +5504,376 @@@ out_mutex
+  	mutex_unlock(&inode->i_mutex);
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * ext4_insert_range:
++  * This function implements the FALLOC_FL_INSERT_RANGE flag of fallocate.
++  * The data blocks starting from @offset to the EOF are shifted by @len
++  * towards right to create a hole in the @inode. Inode size is increased
++  * by len bytes.
++  * Returns 0 on success, error otherwise.
++  */
++ int ext4_insert_range(struct inode *inode, loff_t offset, loff_t len)
++ {
++ 	struct super_block *sb = inode->i_sb;
++ 	handle_t *handle;
++ 	struct ext4_ext_path *path;
++ 	struct ext4_extent *extent;
++ 	ext4_lblk_t offset_lblk, len_lblk, ee_start_lblk = 0;
++ 	unsigned int credits, ee_len;
++ 	int ret = 0, depth, split_flag = 0;
++ 	loff_t ioffset;
++ 
++ 	/*
++ 	 * We need to test this early because xfstests assumes that an
++ 	 * insert range of (0, 1) will return EOPNOTSUPP if the file
++ 	 * system does not support insert range.
++ 	 */
++ 	if (!ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Insert range works only on fs block size aligned offsets. */
++ 	if (offset & (EXT4_CLUSTER_SIZE(sb) - 1) ||
++ 			len & (EXT4_CLUSTER_SIZE(sb) - 1))
++ 		return -EINVAL;
++ 
++ 	if (!S_ISREG(inode->i_mode))
++ 		return -EOPNOTSUPP;
++ 
++ 	trace_ext4_insert_range(inode, offset, len);
++ 
++ 	offset_lblk = offset >> EXT4_BLOCK_SIZE_BITS(sb);
++ 	len_lblk = len >> EXT4_BLOCK_SIZE_BITS(sb);
++ 
++ 	/* Call ext4_force_commit to flush all data in case of data=journal */
++ 	if (ext4_should_journal_data(inode)) {
++ 		ret = ext4_force_commit(inode->i_sb);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/*
++ 	 * Need to round down to align start offset to page size boundary
++ 	 * for page size > block size.
++ 	 */
++ 	ioffset = round_down(offset, PAGE_SIZE);
++ 
++ 	/* Write out all dirty pages */
++ 	ret = filemap_write_and_wait_range(inode->i_mapping, ioffset,
++ 			LLONG_MAX);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Take mutex lock */
++ 	mutex_lock(&inode->i_mutex);
++ 
++ 	/* Currently just for extent based files */
++ 	if (!ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)) {
++ 		ret = -EOPNOTSUPP;
++ 		goto out_mutex;
++ 	}
++ 
++ 	/* Check for wrap through zero */
++ 	if (inode->i_size + len > inode->i_sb->s_maxbytes) {
++ 		ret = -EFBIG;
++ 		goto out_mutex;
++ 	}
++ 
++ 	/* Offset should be less than i_size */
++ 	if (offset >= i_size_read(inode)) {
++ 		ret = -EINVAL;
++ 		goto out_mutex;
++ 	}
++ 
++ 	/* Wait for existing dio to complete */
++ 	ext4_inode_block_unlocked_dio(inode);
++ 	inode_dio_wait(inode);
++ 
++ 	/*
++ 	 * Prevent page faults from reinstantiating pages we have released from
++ 	 * page cache.
++ 	 */
++ 	down_write(&EXT4_I(inode)->i_mmap_sem);
++ 	truncate_pagecache(inode, ioffset);
++ 
++ 	credits = ext4_writepage_trans_blocks(inode);
++ 	handle = ext4_journal_start(inode, EXT4_HT_TRUNCATE, credits);
++ 	if (IS_ERR(handle)) {
++ 		ret = PTR_ERR(handle);
++ 		goto out_mmap;
++ 	}
++ 
++ 	/* Expand file to avoid data loss if there is error while shifting */
++ 	inode->i_size += len;
++ 	EXT4_I(inode)->i_disksize += len;
++ 	inode->i_mtime = inode->i_ctime = ext4_current_time(inode);
++ 	ret = ext4_mark_inode_dirty(handle, inode);
++ 	if (ret)
++ 		goto out_stop;
++ 
++ 	down_write(&EXT4_I(inode)->i_data_sem);
++ 	ext4_discard_preallocations(inode);
++ 
++ 	path = ext4_find_extent(inode, offset_lblk, NULL, 0);
++ 	if (IS_ERR(path)) {
++ 		up_write(&EXT4_I(inode)->i_data_sem);
++ 		goto out_stop;
++ 	}
++ 
++ 	depth = ext_depth(inode);
++ 	extent = path[depth].p_ext;
++ 	if (extent) {
++ 		ee_start_lblk = le32_to_cpu(extent->ee_block);
++ 		ee_len = ext4_ext_get_actual_len(extent);
++ 
++ 		/*
++ 		 * If offset_lblk is not the starting block of extent, split
++ 		 * the extent @offset_lblk
++ 		 */
++ 		if ((offset_lblk > ee_start_lblk) &&
++ 				(offset_lblk < (ee_start_lblk + ee_len))) {
++ 			if (ext4_ext_is_unwritten(extent))
++ 				split_flag = EXT4_EXT_MARK_UNWRIT1 |
++ 					EXT4_EXT_MARK_UNWRIT2;
++ 			ret = ext4_split_extent_at(handle, inode, &path,
++ 					offset_lblk, split_flag,
++ 					EXT4_EX_NOCACHE |
++ 					EXT4_GET_BLOCKS_PRE_IO |
++ 					EXT4_GET_BLOCKS_METADATA_NOFAIL);
++ 		}
++ 
++ 		ext4_ext_drop_refs(path);
++ 		kfree(path);
++ 		if (ret < 0) {
++ 			up_write(&EXT4_I(inode)->i_data_sem);
++ 			goto out_stop;
++ 		}
++ 	}
++ 
++ 	ret = ext4_es_remove_extent(inode, offset_lblk,
++ 			EXT_MAX_BLOCKS - offset_lblk);
++ 	if (ret) {
++ 		up_write(&EXT4_I(inode)->i_data_sem);
++ 		goto out_stop;
++ 	}
++ 
++ 	/*
++ 	 * if offset_lblk lies in a hole which is at start of file, use
++ 	 * ee_start_lblk to shift extents
++ 	 */
++ 	ret = ext4_ext_shift_extents(inode, handle,
++ 		ee_start_lblk > offset_lblk ? ee_start_lblk : offset_lblk,
++ 		len_lblk, SHIFT_RIGHT);
++ 
++ 	up_write(&EXT4_I(inode)->i_data_sem);
++ 	if (IS_SYNC(inode))
++ 		ext4_handle_sync(handle);
++ 
++ out_stop:
++ 	ext4_journal_stop(handle);
++ out_mmap:
++ 	up_write(&EXT4_I(inode)->i_mmap_sem);
++ 	ext4_inode_resume_unlocked_dio(inode);
++ out_mutex:
++ 	mutex_unlock(&inode->i_mutex);
++ 	return ret;
++ }
++ 
++ /**
++  * ext4_swap_extents - Swap extents between two inodes
++  *
++  * @inode1:	First inode
++  * @inode2:	Second inode
++  * @lblk1:	Start block for first inode
++  * @lblk2:	Start block for second inode
++  * @count:	Number of blocks to swap
++  * @mark_unwritten: Mark second inode's extents as unwritten after swap
++  * @erp:	Pointer to save error value
++  *
++  * This helper routine does exactly what is promise "swap extents". All other
++  * stuff such as page-cache locking consistency, bh mapping consistency or
++  * extent's data copying must be performed by caller.
++  * Locking:
++  * 		i_mutex is held for both inodes
++  * 		i_data_sem is locked for write for both inodes
++  * Assumptions:
++  *		All pages from requested range are locked for both inodes
++  */
++ int
++ ext4_swap_extents(handle_t *handle, struct inode *inode1,
++ 		     struct inode *inode2, ext4_lblk_t lblk1, ext4_lblk_t lblk2,
++ 		  ext4_lblk_t count, int unwritten, int *erp)
++ {
++ 	struct ext4_ext_path *path1 = NULL;
++ 	struct ext4_ext_path *path2 = NULL;
++ 	int replaced_count = 0;
++ 
++ 	BUG_ON(!rwsem_is_locked(&EXT4_I(inode1)->i_data_sem));
++ 	BUG_ON(!rwsem_is_locked(&EXT4_I(inode2)->i_data_sem));
++ 	BUG_ON(!mutex_is_locked(&inode1->i_mutex));
++ 	BUG_ON(!mutex_is_locked(&inode2->i_mutex));
++ 
++ 	*erp = ext4_es_remove_extent(inode1, lblk1, count);
++ 	if (unlikely(*erp))
++ 		return 0;
++ 	*erp = ext4_es_remove_extent(inode2, lblk2, count);
++ 	if (unlikely(*erp))
++ 		return 0;
++ 
++ 	while (count) {
++ 		struct ext4_extent *ex1, *ex2, tmp_ex;
++ 		ext4_lblk_t e1_blk, e2_blk;
++ 		int e1_len, e2_len, len;
++ 		int split = 0;
++ 
++ 		path1 = ext4_find_extent(inode1, lblk1, NULL, EXT4_EX_NOCACHE);
++ 		if (IS_ERR(path1)) {
++ 			*erp = PTR_ERR(path1);
++ 			path1 = NULL;
++ 		finish:
++ 			count = 0;
++ 			goto repeat;
++ 		}
++ 		path2 = ext4_find_extent(inode2, lblk2, NULL, EXT4_EX_NOCACHE);
++ 		if (IS_ERR(path2)) {
++ 			*erp = PTR_ERR(path2);
++ 			path2 = NULL;
++ 			goto finish;
++ 		}
++ 		ex1 = path1[path1->p_depth].p_ext;
++ 		ex2 = path2[path2->p_depth].p_ext;
++ 		/* Do we have somthing to swap ? */
++ 		if (unlikely(!ex2 || !ex1))
++ 			goto finish;
++ 
++ 		e1_blk = le32_to_cpu(ex1->ee_block);
++ 		e2_blk = le32_to_cpu(ex2->ee_block);
++ 		e1_len = ext4_ext_get_actual_len(ex1);
++ 		e2_len = ext4_ext_get_actual_len(ex2);
++ 
++ 		/* Hole handling */
++ 		if (!in_range(lblk1, e1_blk, e1_len) ||
++ 		    !in_range(lblk2, e2_blk, e2_len)) {
++ 			ext4_lblk_t next1, next2;
++ 
++ 			/* if hole after extent, then go to next extent */
++ 			next1 = ext4_ext_next_allocated_block(path1);
++ 			next2 = ext4_ext_next_allocated_block(path2);
++ 			/* If hole before extent, then shift to that extent */
++ 			if (e1_blk > lblk1)
++ 				next1 = e1_blk;
++ 			if (e2_blk > lblk2)
++ 				next2 = e1_blk;
++ 			/* Do we have something to swap */
++ 			if (next1 == EXT_MAX_BLOCKS || next2 == EXT_MAX_BLOCKS)
++ 				goto finish;
++ 			/* Move to the rightest boundary */
++ 			len = next1 - lblk1;
++ 			if (len < next2 - lblk2)
++ 				len = next2 - lblk2;
++ 			if (len > count)
++ 				len = count;
++ 			lblk1 += len;
++ 			lblk2 += len;
++ 			count -= len;
++ 			goto repeat;
++ 		}
++ 
++ 		/* Prepare left boundary */
++ 		if (e1_blk < lblk1) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode1,
++ 						&path1, lblk1, 0);
++ 			if (unlikely(*erp))
++ 				goto finish;
++ 		}
++ 		if (e2_blk < lblk2) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode2,
++ 						&path2,  lblk2, 0);
++ 			if (unlikely(*erp))
++ 				goto finish;
++ 		}
++ 		/* ext4_split_extent_at() may result in leaf extent split,
++ 		 * path must to be revalidated. */
++ 		if (split)
++ 			goto repeat;
++ 
++ 		/* Prepare right boundary */
++ 		len = count;
++ 		if (len > e1_blk + e1_len - lblk1)
++ 			len = e1_blk + e1_len - lblk1;
++ 		if (len > e2_blk + e2_len - lblk2)
++ 			len = e2_blk + e2_len - lblk2;
++ 
++ 		if (len != e1_len) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode1,
++ 						&path1, lblk1 + len, 0);
++ 			if (unlikely(*erp))
++ 				goto finish;
++ 		}
++ 		if (len != e2_len) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode2,
++ 						&path2, lblk2 + len, 0);
++ 			if (*erp)
++ 				goto finish;
++ 		}
++ 		/* ext4_split_extent_at() may result in leaf extent split,
++ 		 * path must to be revalidated. */
++ 		if (split)
++ 			goto repeat;
++ 
++ 		BUG_ON(e2_len != e1_len);
++ 		*erp = ext4_ext_get_access(handle, inode1, path1 + path1->p_depth);
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 		*erp = ext4_ext_get_access(handle, inode2, path2 + path2->p_depth);
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 
++ 		/* Both extents are fully inside boundaries. Swap it now */
++ 		tmp_ex = *ex1;
++ 		ext4_ext_store_pblock(ex1, ext4_ext_pblock(ex2));
++ 		ext4_ext_store_pblock(ex2, ext4_ext_pblock(&tmp_ex));
++ 		ex1->ee_len = cpu_to_le16(e2_len);
++ 		ex2->ee_len = cpu_to_le16(e1_len);
++ 		if (unwritten)
++ 			ext4_ext_mark_unwritten(ex2);
++ 		if (ext4_ext_is_unwritten(&tmp_ex))
++ 			ext4_ext_mark_unwritten(ex1);
++ 
++ 		ext4_ext_try_to_merge(handle, inode2, path2, ex2);
++ 		ext4_ext_try_to_merge(handle, inode1, path1, ex1);
++ 		*erp = ext4_ext_dirty(handle, inode2, path2 +
++ 				      path2->p_depth);
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 		*erp = ext4_ext_dirty(handle, inode1, path1 +
++ 				      path1->p_depth);
++ 		/*
++ 		 * Looks scarry ah..? second inode already points to new blocks,
++ 		 * and it was successfully dirtied. But luckily error may happen
++ 		 * only due to journal error, so full transaction will be
++ 		 * aborted anyway.
++ 		 */
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 		lblk1 += len;
++ 		lblk2 += len;
++ 		replaced_count += len;
++ 		count -= len;
++ 
++ 	repeat:
++ 		ext4_ext_drop_refs(path1);
++ 		kfree(path1);
++ 		ext4_ext_drop_refs(path2);
++ 		kfree(path2);
++ 		path1 = path2 = NULL;
++ 	}
++ 	return replaced_count;
++ }
+++>>>>>>> ea3d7209ca01 (ext4: fix races between page faults and hole punching)
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,0d24ebcd7c9e..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -200,10 -188,152 +200,154 @@@ ext4_file_write(struct kiocb *iocb, con
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct vm_operations_struct ext4_file_vm_ops = {
+ +	.fault		= filemap_fault,
+++=======
++ #ifdef CONFIG_FS_DAX
++ static void ext4_end_io_unwritten(struct buffer_head *bh, int uptodate)
++ {
++ 	struct inode *inode = bh->b_assoc_map->host;
++ 	/* XXX: breaks on 32-bit > 16TB. Is that even supported? */
++ 	loff_t offset = (loff_t)(uintptr_t)bh->b_private << inode->i_blkbits;
++ 	int err;
++ 	if (!uptodate)
++ 		return;
++ 	WARN_ON(!buffer_unwritten(bh));
++ 	err = ext4_convert_unwritten_extents(NULL, inode, offset, bh->b_size);
++ }
++ 
++ static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	int result;
++ 	handle_t *handle = NULL;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	bool write = vmf->flags & FAULT_FLAG_WRITE;
++ 
++ 	if (write) {
++ 		sb_start_pagefault(sb);
++ 		file_update_time(vma->vm_file);
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
++ 						EXT4_DATA_TRANS_BLOCKS(sb));
++ 	} else
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	if (IS_ERR(handle))
++ 		result = VM_FAULT_SIGBUS;
++ 	else
++ 		result = __dax_fault(vma, vmf, ext4_get_block_dax,
++ 						ext4_end_io_unwritten);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 		sb_end_pagefault(sb);
++ 	} else
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
++ 						pmd_t *pmd, unsigned int flags)
++ {
++ 	int result;
++ 	handle_t *handle = NULL;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	bool write = flags & FAULT_FLAG_WRITE;
++ 
++ 	if (write) {
++ 		sb_start_pagefault(sb);
++ 		file_update_time(vma->vm_file);
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
++ 				ext4_chunk_trans_blocks(inode,
++ 							PMD_SIZE / PAGE_SIZE));
++ 	} else
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	if (IS_ERR(handle))
++ 		result = VM_FAULT_SIGBUS;
++ 	else
++ 		result = __dax_pmd_fault(vma, addr, pmd, flags,
++ 				ext4_get_block_dax, ext4_end_io_unwritten);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 		sb_end_pagefault(sb);
++ 	} else
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	int err;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 
++ 	sb_start_pagefault(inode->i_sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&EXT4_I(inode)->i_mmap_sem);
++ 	err = __dax_mkwrite(vma, vmf, ext4_get_block_dax,
++ 			    ext4_end_io_unwritten);
++ 	up_read(&EXT4_I(inode)->i_mmap_sem);
++ 	sb_end_pagefault(inode->i_sb);
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Handle write fault for VM_MIXEDMAP mappings. Similarly to ext4_dax_mkwrite()
++  * handler we check for races agaist truncate. Note that since we cycle through
++  * i_mmap_sem, we are sure that also any hole punching that began before we
++  * were called is finished by now and so if it included part of the file we
++  * are working on, our pte will get unmapped and the check for pte_same() in
++  * wp_pfn_shared() fails. Thus fault gets retried and things work out as
++  * desired.
++  */
++ static int ext4_dax_pfn_mkwrite(struct vm_area_struct *vma,
++ 				struct vm_fault *vmf)
++ {
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	int ret = VM_FAULT_NOPAGE;
++ 	loff_t size;
++ 
++ 	sb_start_pagefault(sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&EXT4_I(inode)->i_mmap_sem);
++ 	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	if (vmf->pgoff >= size)
++ 		ret = VM_FAULT_SIGBUS;
++ 	up_read(&EXT4_I(inode)->i_mmap_sem);
++ 	sb_end_pagefault(sb);
++ 
++ 	return ret;
++ }
++ 
++ static const struct vm_operations_struct ext4_dax_vm_ops = {
++ 	.fault		= ext4_dax_fault,
++ 	.pmd_fault	= ext4_dax_pmd_fault,
++ 	.page_mkwrite	= ext4_dax_mkwrite,
++ 	.pfn_mkwrite	= ext4_dax_pfn_mkwrite,
++ };
++ #else
++ #define ext4_dax_vm_ops	ext4_file_vm_ops
++ #endif
++ 
++ static const struct vm_operations_struct ext4_file_vm_ops = {
++ 	.fault		= ext4_filemap_fault,
++ 	.map_pages	= filemap_map_pages,
+++>>>>>>> ea3d7209ca01 (ext4: fix races between page faults and hole punching)
+  	.page_mkwrite   = ext4_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+  };
+  
+  static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+diff --cc fs/ext4/inode.c
+index 235a73f02c8d,d1207d03c961..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -4607,14 -4829,11 +4609,21 @@@ int ext4_setattr(struct dentry *dentry
+  		 * Truncate pagecache after we've waited for commit
+  		 * in data=journal mode to make pages freeable.
+  		 */
+++<<<<<<< HEAD
+ +			truncate_pagecache(inode, inode->i_size);
+++=======
++ 		truncate_pagecache(inode, inode->i_size);
++ 		if (shrink)
++ 			ext4_truncate(inode);
++ 		up_write(&EXT4_I(inode)->i_mmap_sem);
+++>>>>>>> ea3d7209ca01 (ext4: fix races between page faults and hole punching)
+  	}
+ +	/*
+ +	 * We want to call ext4_truncate() even if attr->ia_size ==
+ +	 * inode->i_size for cases like truncation of fallocated space
+ +	 */
+ +	if (attr->ia_valid & ATTR_SIZE)
+ +		ext4_truncate(inode);
+  
+  	if (!rc) {
+  		setattr_copy(inode, attr);
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 5dda1d21c88f..42c6ba080f2c 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -863,6 +863,15 @@ struct ext4_inode_info {
+ 	 * by other means, so we have i_data_sem.
+ 	 */
+ 	struct rw_semaphore i_data_sem;
++	/*
++	 * i_mmap_sem is for serializing page faults with truncate / punch hole
++	 * operations. We have to make sure that new page cannot be faulted in
++	 * a section of the inode that is being punched. We cannot easily use
++	 * i_data_sem for this since we need protection for the whole punch
++	 * operation and i_data_sem ranks below transaction start so we have
++	 * to occasionally drop it.
++	 */
++	struct rw_semaphore i_mmap_sem;
+ 	struct inode vfs_inode;
+ 	struct jbd2_inode *jinode;
+ 
+@@ -2132,6 +2141,7 @@ extern int ext4_chunk_trans_blocks(struct inode *, int nrblocks);
+ extern int ext4_zero_partial_blocks(handle_t *handle, struct inode *inode,
+ 			     loff_t lstart, loff_t lend);
+ extern int ext4_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf);
++extern int ext4_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+ extern qsize_t *ext4_get_reserved_space(struct inode *inode);
+ extern void ext4_da_update_reserve_space(struct inode *inode,
+ 					int used, int quota_claim);
+* Unmerged path fs/ext4/extents.c
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/ext4/inode.c
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 31618f12ab5f..40d25cb8b831 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -940,6 +940,7 @@ static void init_once(void *foo)
+ 	INIT_LIST_HEAD(&ei->i_orphan);
+ 	init_rwsem(&ei->xattr_sem);
+ 	init_rwsem(&ei->i_data_sem);
++	init_rwsem(&ei->i_mmap_sem);
+ 	inode_init_once(&ei->vfs_inode);
+ }
+ 
+diff --git a/fs/ext4/truncate.h b/fs/ext4/truncate.h
+index 011ba6670d99..c70d06a383e2 100644
+--- a/fs/ext4/truncate.h
++++ b/fs/ext4/truncate.h
+@@ -10,8 +10,10 @@
+  */
+ static inline void ext4_truncate_failed_write(struct inode *inode)
+ {
++	down_write(&EXT4_I(inode)->i_mmap_sem);
+ 	truncate_inode_pages(inode->i_mapping, inode->i_size);
+ 	ext4_truncate(inode);
++	up_write(&EXT4_I(inode)->i_mmap_sem);
+ }
+ 
+ /*
