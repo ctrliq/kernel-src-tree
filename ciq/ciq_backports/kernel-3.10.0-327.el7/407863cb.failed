@@ -1,0 +1,131 @@
+hpsa: check for ctlr lockup after command allocation in main io path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Stephen Cameron <stephenmcameron@gmail.com>
+commit 407863cb9daddd99000c70cffb7013f47f67b29c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/407863cb.failed
+
+Command allocation is the thing that takes the longest in the main i/o
+path, so check for controller lockup immediately after this to prevent
+submitting commands to locked up controller as much as possible.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 407863cb9daddd99000c70cffb7013f47f67b29c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 324be725ca32,834ac78c51a3..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -3933,6 -4043,100 +3933,103 @@@ static int hpsa_scsi_queue_command(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hpsa_command_resubmit_worker(struct work_struct *work)
++ {
++ 	struct scsi_cmnd *cmd;
++ 	struct hpsa_scsi_dev_t *dev;
++ 	struct CommandList *c =
++ 			container_of(work, struct CommandList, work);
++ 
++ 	cmd = c->scsi_cmd;
++ 	dev = cmd->device->hostdata;
++ 	if (!dev) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd->scsi_done(cmd);
++ 		return;
++ 	}
++ 	if (hpsa_ciss_submit(c->h, c, cmd, dev->scsi3addr)) {
++ 		/*
++ 		 * If we get here, it means dma mapping failed. Try
++ 		 * again via scsi mid layer, which will then get
++ 		 * SCSI_MLQUEUE_HOST_BUSY.
++ 		 */
++ 		cmd->result = DID_IMM_RETRY << 16;
++ 		cmd->scsi_done(cmd);
++ 	}
++ }
++ 
++ /* Running in struct Scsi_Host->host_lock less mode */
++ static int hpsa_scsi_queue_command(struct Scsi_Host *sh, struct scsi_cmnd *cmd)
++ {
++ 	struct ctlr_info *h;
++ 	struct hpsa_scsi_dev_t *dev;
++ 	unsigned char scsi3addr[8];
++ 	struct CommandList *c;
++ 	int rc = 0;
++ 
++ 	/* Get the ptr to our adapter structure out of cmd->host. */
++ 	h = sdev_to_hba(cmd->device);
++ 	dev = cmd->device->hostdata;
++ 	if (!dev) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 	memcpy(scsi3addr, dev->scsi3addr, sizeof(scsi3addr));
++ 
++ 	if (unlikely(lockup_detected(h))) {
++ 		cmd->result = DID_ERROR << 16;
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 	c = cmd_alloc(h);
++ 	if (c == NULL) {			/* trouble... */
++ 		dev_err(&h->pdev->dev, "cmd_alloc returned NULL!\n");
++ 		return SCSI_MLQUEUE_HOST_BUSY;
++ 	}
++ 	if (unlikely(lockup_detected(h))) {
++ 		cmd->result = DID_ERROR << 16;
++ 		cmd_free(h, c);
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Call alternate submit routine for I/O accelerated commands.
++ 	 * Retries always go down the normal I/O path.
++ 	 */
++ 	if (likely(cmd->retries == 0 &&
++ 		cmd->request->cmd_type == REQ_TYPE_FS &&
++ 		h->acciopath_status)) {
++ 
++ 		cmd->host_scribble = (unsigned char *) c;
++ 		c->cmd_type = CMD_SCSI;
++ 		c->scsi_cmd = cmd;
++ 
++ 		if (dev->offload_enabled) {
++ 			rc = hpsa_scsi_ioaccel_raid_map(h, c);
++ 			if (rc == 0)
++ 				return 0; /* Sent on ioaccel path */
++ 			if (rc < 0) {   /* scsi_dma_map failed. */
++ 				cmd_free(h, c);
++ 				return SCSI_MLQUEUE_HOST_BUSY;
++ 			}
++ 		} else if (dev->ioaccel_handle) {
++ 			rc = hpsa_scsi_ioaccel_direct_map(h, c);
++ 			if (rc == 0)
++ 				return 0; /* Sent on direct map path */
++ 			if (rc < 0) {   /* scsi_dma_map failed. */
++ 				cmd_free(h, c);
++ 				return SCSI_MLQUEUE_HOST_BUSY;
++ 			}
++ 		}
++ 	}
++ 	return hpsa_ciss_submit(h, c, cmd, scsi3addr);
++ }
++ 
+++>>>>>>> 407863cb9dad (hpsa: check for ctlr lockup after command allocation in main io path)
+  static int do_not_scan_if_controller_locked_up(struct ctlr_info *h)
+  {
+  	unsigned long flags;
+* Unmerged path drivers/scsi/hpsa.c
