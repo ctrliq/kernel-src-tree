@@ -39,6 +39,7 @@
 #include <asm/firmware.h>
 #include <asm/cell-regs.h>
 
+#include "cell.h"
 #include "interrupt.h"
 
 /* Define CELL_IOMMU_REAL_UNMAP to actually unmap non-used pages
@@ -862,7 +863,7 @@ static int __init cell_iommu_init_disabled(void)
 	cell_dma_direct_offset += base;
 
 	if (cell_dma_direct_offset != 0)
-		ppc_md.pci_dma_dev_setup = cell_pci_dma_dev_setup;
+		cell_pci_controller_ops.dma_dev_setup = cell_pci_dma_dev_setup;
 
 	printk("iommu: disabled, direct DMA offset is 0x%lx\n",
 	       cell_dma_direct_offset);
@@ -1202,8 +1203,8 @@ static int __init cell_iommu_init(void)
 		if (cell_iommu_init_disabled() == 0)
 			goto bail;
 
-	/* Setup various ppc_md. callbacks */
-	ppc_md.pci_dma_dev_setup = cell_pci_dma_dev_setup;
+	/* Setup various callbacks */
+	cell_pci_controller_ops.dma_dev_setup = cell_pci_dma_dev_setup;
 	ppc_md.dma_get_required_mask = cell_dma_get_required_mask;
 
 	if (!iommu_fixed_disabled && cell_iommu_fixed_mapping_init() == 0)
