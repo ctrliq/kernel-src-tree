@@ -1,0 +1,325 @@
+iommu/vt-d: Use RCU to protect global resources in interrupt context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Use RCU to protect global resources in interrupt context (Myron Stowe) [1129880 1087643]
+Rebuild_FUZZ: 95.38%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 0e242612d9cdb46e878ed1f126c78fe68492af00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0e242612.failed
+
+Global DMA and interrupt remapping resources may be accessed in
+interrupt context, so use RCU instead of rwsem to protect them
+in such cases.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <joro@8bytes.org>
+(cherry picked from commit 0e242612d9cdb46e878ed1f126c78fe68492af00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+#	include/linux/dmar.h
+diff --cc drivers/iommu/intel-iommu.c
+index 1e823b20bbdc,e1679a6fe468..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -675,11 -657,12 +678,16 @@@ static void domain_update_iommu_cap(str
+  static struct intel_iommu *device_to_iommu(int segment, u8 bus, u8 devfn)
+  {
+  	struct dmar_drhd_unit *drhd = NULL;
+ -	struct intel_iommu *iommu;
+ -	struct pci_dev *dev;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	for_each_drhd_unit(drhd) {
+ +		if (drhd->ignored)
+ +			continue;
+++=======
++ 	rcu_read_lock();
++ 	for_each_active_iommu(iommu, drhd) {
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  		if (segment != drhd->segment)
+  			continue;
+  
+@@@ -696,10 -677,13 +704,16 @@@
+  		}
+  
+  		if (drhd->include_all)
+ -			goto out;
+ +			return drhd->iommu;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	iommu = NULL;
++ out:
++ 	rcu_read_unlock();
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  
+ -	return iommu;
+ +	return NULL;
+  }
+  
+  static void domain_flush_cache(struct dmar_domain *domain,
+@@@ -1577,9 -1539,13 +1591,15 @@@ static void domain_exit(struct dmar_dom
+  	/* free page tables */
+  	dma_pte_free_pagetable(domain, 0, DOMAIN_MAX_PFN(domain->gaw));
+  
+++<<<<<<< HEAD
+++=======
++ 	/* clear attached or cached domains */
++ 	rcu_read_lock();
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  	for_each_active_iommu(iommu, drhd)
+ -		if (domain->flags & DOMAIN_FLAG_VIRTUAL_MACHINE ||
+ -		    test_bit(iommu->seq_id, domain->iommu_bmp))
+ +		if (test_bit(iommu->seq_id, domain->iommu_bmp))
+  			iommu_detach_domain(domain, iommu);
++ 	rcu_read_unlock();
+  
+  	free_domain_mem(domain);
+  }
+@@@ -2361,18 -2342,23 +2381,31 @@@ static int domain_add_dev_info(struct d
+  static bool device_has_rmrr(struct pci_dev *dev)
+  {
+  	struct dmar_rmrr_unit *rmrr;
+ -	struct pci_dev *tmp;
+  	int i;
+  
++ 	rcu_read_lock();
+  	for_each_rmrr_units(rmrr) {
+++<<<<<<< HEAD
+ +		for (i = 0; i < rmrr->devices_cnt; i++) {
+ +			/*
+ +			 * Return TRUE if this RMRR contains the device that
+ +			 * is passed in.
+ +			 */
+ +			if (rmrr->devices[i] == dev)
+++=======
++ 		/*
++ 		 * Return TRUE if this RMRR contains the device that
++ 		 * is passed in.
++ 		 */
++ 		for_each_active_dev_scope(rmrr->devices,
++ 					  rmrr->devices_cnt, i, tmp)
++ 			if (tmp == dev) {
++ 				rcu_read_unlock();
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  				return true;
+ -			}
+ +		}
+  	}
++ 	rcu_read_unlock();
+  	return false;
+  }
+  
+@@@ -3616,15 -3590,18 +3650,21 @@@ int dmar_find_matched_atsr_unit(struct 
+  		if (atsr->segment != pci_domain_nr(dev->bus))
+  			continue;
+  
+ -		for_each_dev_scope(atsru->devices, atsru->devices_cnt, i, tmp)
+ -			if (tmp == bridge)
+ -				goto out;
+ +		for (i = 0; i < atsru->devices_cnt; i++)
+ +			if (atsru->devices[i] == bridge)
+ +				return 1;
+  
+  		if (atsru->include_all)
+ -			goto out;
+ +			return 1;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	ret = 0;
++ out:
++ 	rcu_read_unlock();
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  
+ -	return ret;
+ +	return 0;
+  }
+  
+  int __init dmar_parse_rmrr_atsr_dev(void)
+@@@ -3639,7 -3616,7 +3679,11 @@@
+  			return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(atsr, atsr_n, &dmar_atsr_units, list) {
+++=======
++ 	list_for_each_entry_rcu(atsr, &dmar_atsr_units, list) {
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  		ret = atsr_parse_dev(atsr);
+  		if (ret)
+  			return ret;
+diff --cc include/linux/dmar.h
+index b6fb978dad27,bedebab934b4..000000000000
+--- a/include/linux/dmar.h
++++ b/include/linux/dmar.h
+@@@ -25,6 -25,8 +25,11 @@@
+  #include <linux/types.h>
+  #include <linux/msi.h>
+  #include <linux/irqreturn.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/rwsem.h>
++ #include <linux/rcupdate.h>
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  
+  struct acpi_dmar_header;
+  
+@@@ -51,16 -53,36 +56,41 @@@ struct dmar_drhd_unit 
+  extern struct list_head dmar_drhd_units;
+  
+  #define for_each_drhd_unit(drhd) \
+- 	list_for_each_entry(drhd, &dmar_drhd_units, list)
++ 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list)
+  
+++<<<<<<< HEAD
+++=======
++ #define for_each_active_drhd_unit(drhd)					\
++ 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list)		\
++ 		if (drhd->ignored) {} else
++ 
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  #define for_each_active_iommu(i, drhd)					\
+- 	list_for_each_entry(drhd, &dmar_drhd_units, list)		\
++ 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list)		\
+  		if (i=drhd->iommu, drhd->ignored) {} else
+  
+  #define for_each_iommu(i, drhd)						\
+- 	list_for_each_entry(drhd, &dmar_drhd_units, list)		\
++ 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list)		\
+  		if (i=drhd->iommu, 0) {} else 
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool dmar_rcu_check(void)
++ {
++ 	return rwsem_is_locked(&dmar_global_lock) ||
++ 	       system_state == SYSTEM_BOOTING;
++ }
++ 
++ #define	dmar_rcu_dereference(p)	rcu_dereference_check((p), dmar_rcu_check())
++ 
++ #define	for_each_dev_scope(a, c, p, d)	\
++ 	for ((p) = 0; ((d) = (p) < (c) ? dmar_rcu_dereference((a)[(p)]) : \
++ 			NULL, (p) < (c)); (p)++)
++ 
++ #define	for_each_active_dev_scope(a, c, p, d)	\
++ 	for_each_dev_scope((a), (c), (p), (d))	if (!(d)) { continue; } else
++ 
+++>>>>>>> 0e242612d9cd (iommu/vt-d: Use RCU to protect global resources in interrupt context)
+  extern int dmar_table_init(void);
+  extern int dmar_dev_scope_init(void);
+  extern int dmar_parse_dev_scope(void *start, void *end, int *cnt,
+diff --git a/drivers/iommu/dmar.c b/drivers/iommu/dmar.c
+index 54da61577318..e1d3e651d189 100644
+--- a/drivers/iommu/dmar.c
++++ b/drivers/iommu/dmar.c
+@@ -61,13 +61,13 @@ static void __init dmar_register_drhd_unit(struct dmar_drhd_unit *drhd)
+ 	 * the very end.
+ 	 */
+ 	if (drhd->include_all)
+-		list_add_tail(&drhd->list, &dmar_drhd_units);
++		list_add_tail_rcu(&drhd->list, &dmar_drhd_units);
+ 	else
+-		list_add(&drhd->list, &dmar_drhd_units);
++		list_add_rcu(&drhd->list, &dmar_drhd_units);
+ }
+ 
+ static int __init dmar_parse_one_dev_scope(struct acpi_dmar_device_scope *scope,
+-					   struct pci_dev **dev, u16 segment)
++					   struct pci_dev __rcu **dev, u16 segment)
+ {
+ 	struct pci_bus *bus;
+ 	struct pci_dev *pdev = NULL;
+@@ -112,7 +112,9 @@ static int __init dmar_parse_one_dev_scope(struct acpi_dmar_device_scope *scope,
+ 			pci_name(pdev));
+ 		return -EINVAL;
+ 	}
+-	*dev = pdev;
++
++	rcu_assign_pointer(*dev, pdev);
++
+ 	return 0;
+ }
+ 
+@@ -139,7 +141,7 @@ void *dmar_alloc_dev_scope(void *start, void *end, int *cnt)
+ }
+ 
+ int __init dmar_parse_dev_scope(void *start, void *end, int *cnt,
+-				struct pci_dev ***devices, u16 segment)
++				struct pci_dev __rcu ***devices, u16 segment)
+ {
+ 	struct acpi_dmar_device_scope *scope;
+ 	int index, ret;
+@@ -167,15 +169,16 @@ int __init dmar_parse_dev_scope(void *start, void *end, int *cnt,
+ 	return 0;
+ }
+ 
+-void dmar_free_dev_scope(struct pci_dev ***devices, int *cnt)
++void dmar_free_dev_scope(struct pci_dev __rcu ***devices, int *cnt)
+ {
+ 	if (*devices && *cnt) {
+ 		while (--*cnt >= 0)
+ 			pci_dev_put((*devices)[*cnt]);
+ 		kfree(*devices);
+-		*devices = NULL;
+-		*cnt = 0;
+ 	}
++
++	*devices = NULL;
++	*cnt = 0;
+ }
+ 
+ /**
+@@ -394,7 +397,7 @@ parse_dmar_table(void)
+ 	return ret;
+ }
+ 
+-static int dmar_pci_device_match(struct pci_dev *devices[], int cnt,
++static int dmar_pci_device_match(struct pci_dev __rcu *devices[], int cnt,
+ 			  struct pci_dev *dev)
+ {
+ 	int index;
+@@ -414,11 +417,12 @@ static int dmar_pci_device_match(struct pci_dev *devices[], int cnt,
+ struct dmar_drhd_unit *
+ dmar_find_matched_drhd_unit(struct pci_dev *dev)
+ {
+-	struct dmar_drhd_unit *dmaru = NULL;
++	struct dmar_drhd_unit *dmaru;
+ 	struct acpi_dmar_hardware_unit *drhd;
+ 
+ 	dev = pci_physfn(dev);
+ 
++	rcu_read_lock();
+ 	for_each_drhd_unit(dmaru) {
+ 		drhd = container_of(dmaru->hdr,
+ 				    struct acpi_dmar_hardware_unit,
+@@ -426,14 +430,17 @@ dmar_find_matched_drhd_unit(struct pci_dev *dev)
+ 
+ 		if (dmaru->include_all &&
+ 		    drhd->segment == pci_domain_nr(dev->bus))
+-			return dmaru;
++			goto out;
+ 
+ 		if (dmar_pci_device_match(dmaru->devices,
+ 					  dmaru->devices_cnt, dev))
+-			return dmaru;
++			goto out;
+ 	}
++	dmaru = NULL;
++out:
++	rcu_read_unlock();
+ 
+-	return NULL;
++	return dmaru;
+ }
+ 
+ int __init dmar_dev_scope_init(void)
+* Unmerged path drivers/iommu/intel-iommu.c
+* Unmerged path include/linux/dmar.h
