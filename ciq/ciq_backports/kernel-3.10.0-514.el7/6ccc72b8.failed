@@ -1,0 +1,190 @@
+lib: Add a generic cmdline parse function parse_option_str
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [lib] Add a generic cmdline parse function parse_option_str (Yasuaki Ishimatsu) [1270209]
+Rebuild_FUZZ: 95.50%
+commit-author Dave Young <dyoung@redhat.com>
+commit 6ccc72b87b83ece31c2a75bbe07f440b0378f7a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6ccc72b8.failed
+
+There should be a generic function to parse params like a=b,c
+Adding parse_option_str in lib/cmdline.c which will return true
+if there's specified option set in the params.
+
+Also updated efi=old_map parsing code to use the new function
+
+	Signed-off-by: Dave Young <dyoung@redhat.com>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 6ccc72b87b83ece31c2a75bbe07f440b0378f7a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi.c
+#	lib/cmdline.c
+diff --cc arch/x86/platform/efi/efi.c
+index 574b2a778872,c73a7df5d37f..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -1231,95 -930,10 +1231,100 @@@ u64 efi_mem_attributes(unsigned long ph
+  	return 0;
+  }
+  
+ +/*
+ + * Some firmware has serious problems when using more than 50% of the EFI
+ + * variable store, i.e. it triggers bugs that can brick machines. Ensure that
+ + * we never use more than this safe limit.
+ + *
+ + * Return EFI_SUCCESS if it is safe to write 'size' bytes to the variable
+ + * store.
+ + */
+ +efi_status_t efi_query_variable_store(u32 attributes, unsigned long size)
+ +{
+ +	efi_status_t status;
+ +	u64 storage_size, remaining_size, max_size;
+ +
+ +	if (!(attributes & EFI_VARIABLE_NON_VOLATILE))
+ +		return 0;
+ +
+ +	status = efi.query_variable_info(attributes, &storage_size,
+ +					 &remaining_size, &max_size);
+ +	if (status != EFI_SUCCESS)
+ +		return status;
+ +
+ +	/*
+ +	 * Some firmware implementations refuse to boot if there's insufficient
+ +	 * space in the variable store. We account for that by refusing the
+ +	 * write if permitting it would reduce the available space to under
+ +	 * 5KB. This figure was provided by Samsung, so should be safe.
+ +	 */
+ +	if ((remaining_size - size < EFI_MIN_RESERVE) &&
+ +		!efi_no_storage_paranoia) {
+ +
+ +		/*
+ +		 * Triggering garbage collection may require that the firmware
+ +		 * generate a real EFI_OUT_OF_RESOURCES error. We can force
+ +		 * that by attempting to use more space than is available.
+ +		 */
+ +		unsigned long dummy_size = remaining_size + 1024;
+ +		void *dummy = kzalloc(dummy_size, GFP_ATOMIC);
+ +
+ +		if (!dummy)
+ +			return EFI_OUT_OF_RESOURCES;
+ +
+ +		status = efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
+ +					  EFI_VARIABLE_NON_VOLATILE |
+ +					  EFI_VARIABLE_BOOTSERVICE_ACCESS |
+ +					  EFI_VARIABLE_RUNTIME_ACCESS,
+ +					  dummy_size, dummy);
+ +
+ +		if (status == EFI_SUCCESS) {
+ +			/*
+ +			 * This should have failed, so if it didn't make sure
+ +			 * that we delete it...
+ +			 */
+ +			efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
+ +					 EFI_VARIABLE_NON_VOLATILE |
+ +					 EFI_VARIABLE_BOOTSERVICE_ACCESS |
+ +					 EFI_VARIABLE_RUNTIME_ACCESS,
+ +					 0, dummy);
+ +		}
+ +
+ +		kfree(dummy);
+ +
+ +		/*
+ +		 * The runtime code may now have triggered a garbage collection
+ +		 * run, so check the variable info again
+ +		 */
+ +		status = efi.query_variable_info(attributes, &storage_size,
+ +						 &remaining_size, &max_size);
+ +
+ +		if (status != EFI_SUCCESS)
+ +			return status;
+ +
+ +		/*
+ +		 * There still isn't enough room, so return an error
+ +		 */
+ +		if (remaining_size - size < EFI_MIN_RESERVE)
+ +			return EFI_OUT_OF_RESOURCES;
+ +	}
+ +
+ +	return EFI_SUCCESS;
+ +}
+ +EXPORT_SYMBOL_GPL(efi_query_variable_store);
+ +
+  static int __init parse_efi_cmdline(char *str)
+  {
+++<<<<<<< HEAD
+ +	if (*str == '=')
+ +		str++;
+ +
+ +	if (!strncmp(str, "old_map", 7))
+ +		set_bit(EFI_OLD_MEMMAP, &x86_efi_facility);
+++=======
++ 	if (parse_option_str(str, "old_map"))
++ 		set_bit(EFI_OLD_MEMMAP, &efi.flags);
+++>>>>>>> 6ccc72b87b83 (lib: Add a generic cmdline parse function parse_option_str)
+  
+  	return 0;
+  }
+diff --cc lib/cmdline.c
+index 16768f290556,8f13cf73c2ec..000000000000
+--- a/lib/cmdline.c
++++ b/lib/cmdline.c
+@@@ -157,8 -159,33 +157,40 @@@ unsigned long long memparse(const char 
+  
+  	return ret;
+  }
+ +
+ +
+  EXPORT_SYMBOL(memparse);
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(get_option);
+ +EXPORT_SYMBOL(get_options);
+++=======
++ 
++ /**
++  *	parse_option_str - Parse a string and check an option is set or not
++  *	@str: String to be parsed
++  *	@option: option name
++  *
++  *	This function parses a string containing a comma-separated list of
++  *	strings like a=b,c.
++  *
++  *	Return true if there's such option in the string, or return false.
++  */
++ bool parse_option_str(const char *str, const char *option)
++ {
++ 	while (*str) {
++ 		if (!strncmp(str, option, strlen(option))) {
++ 			str += strlen(option);
++ 			if (!*str || *str == ',')
++ 				return true;
++ 		}
++ 
++ 		while (*str && *str != ',')
++ 			str++;
++ 
++ 		if (*str == ',')
++ 			str++;
++ 	}
++ 
++ 	return false;
++ }
+++>>>>>>> 6ccc72b87b83 (lib: Add a generic cmdline parse function parse_option_str)
+* Unmerged path arch/x86/platform/efi/efi.c
+diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+index affdfe63bfe4..7e531739d4d3 100644
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -418,6 +418,7 @@ int vsscanf(const char *, const char *, va_list);
+ extern int get_option(char **str, int *pint);
+ extern char *get_options(const char *str, int nints, int *ints);
+ extern unsigned long long memparse(const char *ptr, char **retptr);
++extern bool parse_option_str(const char *str, const char *option);
+ 
+ extern int core_kernel_text(unsigned long addr);
+ extern int core_kernel_data(unsigned long addr);
+* Unmerged path lib/cmdline.c
