@@ -1,0 +1,178 @@
+ACPI / hotplug / PCI: Eliminate acpiphp_dev_to_bridge()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Eliminate acpiphp_dev_to_bridge() (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 91.09%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 86f5f3ca49e3d20c1a5e83917b2c8b98a7c95506
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/86f5f3ca.failed
+
+Since acpiphp_dev_to_bridge() is only called by
+acpiphp_check_host_bridge(), move the code from it to that function
+directly which reduces the call chain depth and makes the code
+slightly easier to follow.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 86f5f3ca49e3d20c1a5e83917b2c8b98a7c95506)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index 0f3f960473bc,08043f9c1dd5..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -351,102 -369,6 +351,105 @@@ register_slot(acpi_handle handle, u32 l
+  	return AE_OK;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +/* see if it's worth looking at this bridge */
+ +static int detect_ejectable_slots(acpi_handle handle)
+ +{
+ +	int found = acpi_pci_detect_ejectable(handle);
+ +	if (!found) {
+ +		acpi_walk_namespace(ACPI_TYPE_DEVICE, handle, (u32)1,
+ +				    is_pci_dock_device, NULL, (void *)&found, NULL);
+ +	}
+ +	return found;
+ +}
+ +
+ +/* initialize miscellaneous stuff for both root and PCI-to-PCI bridge */
+ +static void init_bridge_misc(struct acpiphp_bridge *bridge)
+ +{
+ +	acpi_status status;
+ +
+ +	/* must be added to the list prior to calling register_slot */
+ +	mutex_lock(&bridge_mutex);
+ +	list_add(&bridge->list, &bridge_list);
+ +	mutex_unlock(&bridge_mutex);
+ +
+ +	/* register all slot objects under this bridge */
+ +	status = acpi_walk_namespace(ACPI_TYPE_DEVICE, bridge->handle, (u32)1,
+ +				     register_slot, NULL, bridge, NULL);
+ +	if (ACPI_FAILURE(status)) {
+ +		mutex_lock(&bridge_mutex);
+ +		list_del(&bridge->list);
+ +		mutex_unlock(&bridge_mutex);
+ +		return;
+ +	}
+ +
+ +	/* install notify handler for P2P bridges */
+ +	if (!pci_is_root_bus(bridge->pci_bus)) {
+ +		if ((bridge->flags & BRIDGE_HAS_EJ0) && bridge->func) {
+ +			status = acpi_remove_notify_handler(bridge->func->handle,
+ +						ACPI_SYSTEM_NOTIFY,
+ +						handle_hotplug_event_func);
+ +			if (ACPI_FAILURE(status))
+ +				pr_err("failed to remove notify handler\n");
+ +		}
+ +		status = acpi_install_notify_handler(bridge->handle,
+ +					     ACPI_SYSTEM_NOTIFY,
+ +					     handle_hotplug_event_bridge,
+ +					     bridge);
+ +
+ +		if (ACPI_FAILURE(status)) {
+ +			pr_err("failed to register interrupt notify handler\n");
+ +		}
+ +	}
+ +}
+ +
+ +
+ +/* find acpiphp_func from acpiphp_bridge */
+ +static struct acpiphp_func *acpiphp_bridge_handle_to_function(acpi_handle handle)
+ +{
+ +	struct acpiphp_bridge *bridge;
+ +	struct acpiphp_slot *slot;
+ +	struct acpiphp_func *func = NULL;
+ +
+ +	mutex_lock(&bridge_mutex);
+ +	list_for_each_entry(bridge, &bridge_list, list) {
+ +		list_for_each_entry(slot, &bridge->slots, node) {
+ +			list_for_each_entry(func, &slot->funcs, sibling) {
+ +				if (func->handle == handle) {
+ +					get_bridge(func->slot->bridge);
+ +					mutex_unlock(&bridge_mutex);
+ +					return func;
+ +				}
+ +			}
+ +		}
+ +	}
+ +	mutex_unlock(&bridge_mutex);
+ +
+ +	return NULL;
+ +}
+ +
+ +
+ +static struct acpiphp_bridge *acpiphp_handle_to_bridge(acpi_handle handle)
+ +{
+ +	struct acpiphp_context *context;
+ +	struct acpiphp_bridge *bridge = NULL;
+ +
+ +	mutex_lock(&acpiphp_context_lock);
+ +	context = acpiphp_get_context(handle);
+ +	if (context) {
+ +		bridge = context->bridge;
+ +		if (bridge)
+ +			get_bridge(bridge);
+ +
+ +		acpiphp_put_context(context);
+ +	}
+ +	mutex_unlock(&acpiphp_context_lock);
+ +	return bridge;
+ +}
+ +
+++=======
+++>>>>>>> 86f5f3ca49e3 (ACPI / hotplug / PCI: Eliminate acpiphp_dev_to_bridge())
+  static void cleanup_bridge(struct acpiphp_bridge *bridge)
+  {
+  	struct acpiphp_slot *slot;
+@@@ -945,30 -737,17 +948,40 @@@ static void acpiphp_sanitize_bus(struc
+   * ACPI event handlers
+   */
+  
+ -void acpiphp_check_host_bridge(struct acpi_device *adev)
+ +static acpi_status
+ +check_sub_bridges(acpi_handle handle, u32 lvl, void *context, void **rv)
+ +{
+ +	struct acpiphp_bridge *bridge;
+ +	char objname[64];
+ +	struct acpi_buffer buffer = { .length = sizeof(objname),
+ +				      .pointer = objname };
+ +
+ +	bridge = acpiphp_handle_to_bridge(handle);
+ +	if (bridge) {
+ +		acpi_get_name(handle, ACPI_FULL_PATHNAME, &buffer);
+ +		pr_debug("%s: re-enumerating slots under %s\n",
+ +			__func__, objname);
+ +		acpiphp_check_bridge(bridge);
+ +		put_bridge(bridge);
+ +	}
+ +	return AE_OK ;
+ +}
+ +
+ +void acpiphp_check_host_bridge(acpi_handle handle)
+  {
+- 	struct acpiphp_bridge *bridge;
++ 	struct acpiphp_bridge *bridge = NULL;
+  
+++<<<<<<< HEAD
+ +	bridge = acpiphp_handle_to_bridge(handle);
+++=======
++ 	acpi_lock_hp_context();
++ 	if (adev->hp) {
++ 		bridge = to_acpiphp_root_context(adev->hp)->root_bridge;
++ 		if (bridge)
++ 			get_bridge(bridge);
++ 	}
++ 	acpi_unlock_hp_context();
+++>>>>>>> 86f5f3ca49e3 (ACPI / hotplug / PCI: Eliminate acpiphp_dev_to_bridge())
+  	if (bridge) {
+  		pci_lock_rescan_remove();
+  
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
