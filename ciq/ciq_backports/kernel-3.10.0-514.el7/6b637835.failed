@@ -1,0 +1,199 @@
+x86, mm: support huge KVA mappings on x86
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Toshi Kani <toshi.kani@hp.com>
+commit 6b6378355b925050eb6fa966742d8c2d65ff0d83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6b637835.failed
+
+Implement huge KVA mapping interfaces on x86.
+
+On x86, MTRRs can override PAT memory types with a 4KB granularity.  When
+using a huge page, MTRRs can override the memory type of the huge page,
+which may lead a performance penalty.  The processor can also behave in an
+undefined manner if a huge page is mapped to a memory range that MTRRs
+have mapped with multiple different memory types.  Therefore, the mapping
+code falls back to use a smaller page size toward 4KB when a mapping range
+is covered by non-WB type of MTRRs.  The WB type of MTRRs has no affect on
+the PAT memory types.
+
+pud_set_huge() and pmd_set_huge() call mtrr_type_lookup() to see if a
+given range is covered by MTRRs.  MTRR_TYPE_WRBACK indicates that the
+range is either covered by WB or not covered and the MTRR default value is
+set to WB.  0xFF indicates that MTRRs are disabled.
+
+HAVE_ARCH_HUGE_VMAP is selected when X86_64 or X86_32 with X86_PAE is set.
+ X86_32 without X86_PAE is not supported since such config can unlikey be
+benefited from this feature, and there was an issue found in testing.
+
+[fengguang.wu@intel.com: ioremap_pud_capable can be static]
+	Signed-off-by: Toshi Kani <toshi.kani@hp.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Robert Elliott <Elliott@hp.com>
+	Signed-off-by: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6b6378355b925050eb6fa966742d8c2d65ff0d83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	lib/ioremap.c
+diff --cc arch/x86/Kconfig
+index 499727234a8b,0f948cefaeb1..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -91,9 -97,10 +91,14 @@@ config X8
+  	select GENERIC_IRQ_SHOW
+  	select GENERIC_CLOCKEVENTS_MIN_ADJUST
+  	select IRQ_FORCED_THREADING
+ +	select USE_GENERIC_SMP_HELPERS if SMP
+  	select HAVE_BPF_JIT if X86_64
+  	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
+++<<<<<<< HEAD
+++=======
++ 	select HAVE_ARCH_HUGE_VMAP if X86_64 || (X86_32 && X86_PAE)
++ 	select ARCH_HAS_SG_CHAIN
+++>>>>>>> 6b6378355b92 (x86, mm: support huge KVA mappings on x86)
+  	select CLKEVT_I8253
+  	select ARCH_HAVE_NMI_SAFE_CMPXCHG
+  	select GENERIC_IOMAP
+diff --cc lib/ioremap.c
+index 9490b8affe31,86c8911b0e3a..000000000000
+--- a/lib/ioremap.c
++++ b/lib/ioremap.c
+@@@ -13,6 -13,43 +13,46 @@@
+  #include <asm/cacheflush.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
++ static int __read_mostly ioremap_pud_capable;
++ static int __read_mostly ioremap_pmd_capable;
++ static int __read_mostly ioremap_huge_disabled;
++ 
++ static int __init set_nohugeiomap(char *str)
++ {
++ 	ioremap_huge_disabled = 1;
++ 	return 0;
++ }
++ early_param("nohugeiomap", set_nohugeiomap);
++ 
++ void __init ioremap_huge_init(void)
++ {
++ 	if (!ioremap_huge_disabled) {
++ 		if (arch_ioremap_pud_supported())
++ 			ioremap_pud_capable = 1;
++ 		if (arch_ioremap_pmd_supported())
++ 			ioremap_pmd_capable = 1;
++ 	}
++ }
++ 
++ static inline int ioremap_pud_enabled(void)
++ {
++ 	return ioremap_pud_capable;
++ }
++ 
++ static inline int ioremap_pmd_enabled(void)
++ {
++ 	return ioremap_pmd_capable;
++ }
++ 
++ #else	/* !CONFIG_HAVE_ARCH_HUGE_VMAP */
++ static inline int ioremap_pud_enabled(void) { return 0; }
++ static inline int ioremap_pmd_enabled(void) { return 0; }
++ #endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */
++ 
+++>>>>>>> 6b6378355b92 (x86, mm: support huge KVA mappings on x86)
+  static int ioremap_pte_range(pmd_t *pmd, unsigned long addr,
+  		unsigned long end, phys_addr_t phys_addr, pgprot_t prot)
+  {
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/mm/pgtable.c b/arch/x86/mm/pgtable.c
+index d5aa594e6332..d700b125e608 100644
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -4,6 +4,7 @@
+ #include <asm/pgtable.h>
+ #include <asm/tlb.h>
+ #include <asm/fixmap.h>
++#include <asm/mtrr.h>
+ 
+ #define PGALLOC_GFP GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO
+ 
+@@ -476,3 +477,67 @@ void native_set_fixmap(enum fixed_addresses idx, phys_addr_t phys,
+ {
+ 	__native_set_fixmap(idx, pfn_pte(phys >> PAGE_SHIFT, flags));
+ }
++
++#ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
++int pud_set_huge(pud_t *pud, phys_addr_t addr, pgprot_t prot)
++{
++	u8 mtrr;
++
++	/*
++	 * Do not use a huge page when the range is covered by non-WB type
++	 * of MTRRs.
++	 */
++	mtrr = mtrr_type_lookup(addr, addr + PUD_SIZE);
++	if ((mtrr != MTRR_TYPE_WRBACK) && (mtrr != 0xFF))
++		return 0;
++
++	prot = pgprot_4k_2_large(prot);
++
++	set_pte((pte_t *)pud, pfn_pte(
++		(u64)addr >> PAGE_SHIFT,
++		__pgprot(pgprot_val(prot) | _PAGE_PSE)));
++
++	return 1;
++}
++
++int pmd_set_huge(pmd_t *pmd, phys_addr_t addr, pgprot_t prot)
++{
++	u8 mtrr;
++
++	/*
++	 * Do not use a huge page when the range is covered by non-WB type
++	 * of MTRRs.
++	 */
++	mtrr = mtrr_type_lookup(addr, addr + PMD_SIZE);
++	if ((mtrr != MTRR_TYPE_WRBACK) && (mtrr != 0xFF))
++		return 0;
++
++	prot = pgprot_4k_2_large(prot);
++
++	set_pte((pte_t *)pmd, pfn_pte(
++		(u64)addr >> PAGE_SHIFT,
++		__pgprot(pgprot_val(prot) | _PAGE_PSE)));
++
++	return 1;
++}
++
++int pud_clear_huge(pud_t *pud)
++{
++	if (pud_large(*pud)) {
++		pud_clear(pud);
++		return 1;
++	}
++
++	return 0;
++}
++
++int pmd_clear_huge(pmd_t *pmd)
++{
++	if (pmd_large(*pmd)) {
++		pmd_clear(pmd);
++		return 1;
++	}
++
++	return 0;
++}
++#endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */
+* Unmerged path lib/ioremap.c
