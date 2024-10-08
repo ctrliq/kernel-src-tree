@@ -188,7 +188,6 @@ static int mei_me_hw_reset(struct mei_device *dev, bool intr_enable)
 	if (intr_enable == false)
 		mei_me_hw_reset_release(dev);
 
-	dev_dbg(&dev->pdev->dev, "current HCSR = 0x%08x.\n", mei_hcsr_read(hw));
 	return 0;
 }
 
