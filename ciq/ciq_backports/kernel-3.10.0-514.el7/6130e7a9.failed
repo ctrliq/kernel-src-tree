@@ -1,0 +1,303 @@
+mmc: dw_mmc: Remove old card detect infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Doug Anderson <dianders@chromium.org>
+commit 6130e7a9c34d01afbd4e7e215846d1f2d70333bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6130e7a9.failed
+
+The dw_mmc driver had a bunch of code that ran whenever a card was
+ejected and inserted.  However, this code was old and crufty and
+should be removed.  Some evidence that it's really not needed:
+
+1. Is is supposed to be legal to use 'cd-gpio' on dw_mmc instead of
+   using the built-in card detect mechanism.  The 'cd-gpio' code
+   doesn't run any of the crufty old code but yet still works.
+
+2. While looking at this, I realized that my old change (369ac86 mmc:
+   dw_mmc: don't queue up a card detect at slot startup) actually
+   castrated the old code a little bit already and nobody noticed.
+   Specifically "last_detect_state" was left as 0 at bootup.  That
+   means that on the first card removal none of the crufty code ran.
+
+3. I can run "while true; do dd if=/dev/mmcblk1 of=/dev/null; done"
+   while ejecting and inserting an SD Card and the world doesn't
+   explode.
+
+If some of the crufty old code is actually needed, we should justify
+it and also put it in some place where it will be run even with
+"cd-gpio".
+
+Note that in my case I'm using the "cd-gpio" mechanism but for various
+reasons the hardware triggers a dw_mmc "card detect" at bootup.  That
+was actually causing a real bug.  The card detect workqueue was
+running while the system was trying to enumerate the card.  The
+"present != slot->last_detect_state" triggered and we were doing all
+kinds of crazy stuff and messing up enumeration.  The new mechanism of
+just asking the core to check the card is much safer and then the
+bogus interrupt doesn't hurt.
+
+	Signed-off-by: Doug Anderson <dianders@chromium.org>
+	Tested-by: Jaehoon Chung <jh80.chung@samsung.com>
+	Acked-by: Jaehoon Chung <jh80.chung@samsung.com>
+	Tested-by: alim.akhtar <alim.akhtar@samsung.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 6130e7a9c34d01afbd4e7e215846d1f2d70333bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/dw_mmc.c
+#	drivers/mmc/host/dw_mmc.h
+diff --cc drivers/mmc/host/dw_mmc.c
+index 1add727a3cc5,bb46b1b8d16b..000000000000
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@@ -32,9 -32,11 +32,8 @@@
+  #include <linux/mmc/dw_mmc.h>
+  #include <linux/bitops.h>
+  #include <linux/regulator/consumer.h>
+- #include <linux/workqueue.h>
+  #include <linux/of.h>
+  #include <linux/of_gpio.h>
+ -#include <linux/mmc/slot-gpio.h>
+  
+  #include "dw_mmc.h"
+  
+@@@ -1781,113 -2077,6 +1797,116 @@@ static irqreturn_t dw_mci_interrupt(in
+  	return IRQ_HANDLED;
+  }
+  
+++<<<<<<< HEAD
+ +static void dw_mci_work_routine_card(struct work_struct *work)
+ +{
+ +	struct dw_mci *host = container_of(work, struct dw_mci, card_work);
+ +	int i;
+ +
+ +	for (i = 0; i < host->num_slots; i++) {
+ +		struct dw_mci_slot *slot = host->slot[i];
+ +		struct mmc_host *mmc = slot->mmc;
+ +		struct mmc_request *mrq;
+ +		int present;
+ +		u32 ctrl;
+ +
+ +		present = dw_mci_get_cd(mmc);
+ +		while (present != slot->last_detect_state) {
+ +			dev_dbg(&slot->mmc->class_dev, "card %s\n",
+ +				present ? "inserted" : "removed");
+ +
+ +			spin_lock_bh(&host->lock);
+ +
+ +			/* Card change detected */
+ +			slot->last_detect_state = present;
+ +
+ +			/* Mark card as present if applicable */
+ +			if (present != 0)
+ +				set_bit(DW_MMC_CARD_PRESENT, &slot->flags);
+ +
+ +			/* Clean up queue if present */
+ +			mrq = slot->mrq;
+ +			if (mrq) {
+ +				if (mrq == host->mrq) {
+ +					host->data = NULL;
+ +					host->cmd = NULL;
+ +
+ +					switch (host->state) {
+ +					case STATE_IDLE:
+ +						break;
+ +					case STATE_SENDING_CMD:
+ +						mrq->cmd->error = -ENOMEDIUM;
+ +						if (!mrq->data)
+ +							break;
+ +						/* fall through */
+ +					case STATE_SENDING_DATA:
+ +						mrq->data->error = -ENOMEDIUM;
+ +						dw_mci_stop_dma(host);
+ +						break;
+ +					case STATE_DATA_BUSY:
+ +					case STATE_DATA_ERROR:
+ +						if (mrq->data->error == -EINPROGRESS)
+ +							mrq->data->error = -ENOMEDIUM;
+ +						if (!mrq->stop)
+ +							break;
+ +						/* fall through */
+ +					case STATE_SENDING_STOP:
+ +						mrq->stop->error = -ENOMEDIUM;
+ +						break;
+ +					}
+ +
+ +					dw_mci_request_end(host, mrq);
+ +				} else {
+ +					list_del(&slot->queue_node);
+ +					mrq->cmd->error = -ENOMEDIUM;
+ +					if (mrq->data)
+ +						mrq->data->error = -ENOMEDIUM;
+ +					if (mrq->stop)
+ +						mrq->stop->error = -ENOMEDIUM;
+ +
+ +					spin_unlock(&host->lock);
+ +					mmc_request_done(slot->mmc, mrq);
+ +					spin_lock(&host->lock);
+ +				}
+ +			}
+ +
+ +			/* Power down slot */
+ +			if (present == 0) {
+ +				clear_bit(DW_MMC_CARD_PRESENT, &slot->flags);
+ +
+ +				/*
+ +				 * Clear down the FIFO - doing so generates a
+ +				 * block interrupt, hence setting the
+ +				 * scatter-gather pointer to NULL.
+ +				 */
+ +				sg_miter_stop(&host->sg_miter);
+ +				host->sg = NULL;
+ +
+ +				ctrl = mci_readl(host, CTRL);
+ +				ctrl |= SDMMC_CTRL_FIFO_RESET;
+ +				mci_writel(host, CTRL, ctrl);
+ +
+ +#ifdef CONFIG_MMC_DW_IDMAC
+ +				ctrl = mci_readl(host, BMOD);
+ +				/* Software reset of DMA */
+ +				ctrl |= SDMMC_IDMAC_SWRESET;
+ +				mci_writel(host, BMOD, ctrl);
+ +#endif
+ +
+ +			}
+ +
+ +			spin_unlock_bh(&host->lock);
+ +
+ +			present = dw_mci_get_cd(mmc);
+ +		}
+ +
+ +		mmc_detect_change(slot->mmc,
+ +			msecs_to_jiffies(host->pdata->detect_delay_ms));
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 6130e7a9c34d (mmc: dw_mmc: Remove old card detect infrastructure)
+  #ifdef CONFIG_OF
+  /* given a slot id, find out the device node representing that slot */
+  static struct device_node *dw_mci_of_find_slot_node(struct device *dev, u8 slot)
+@@@ -2102,20 -2228,11 +2121,23 @@@ static int dw_mci_init_slot(struct dw_m
+  	dw_mci_init_debugfs(slot);
+  #endif
+  
+++<<<<<<< HEAD
+ +	/* Card initially undetected */
+ +	slot->last_detect_state = 0;
+ +
+ +	/*
+ +	 * Card may have been plugged in prior to boot so we
+ +	 * need to run the detect tasklet
+ +	 */
+ +	queue_work(host->card_workqueue, &host->card_work);
+ +
+++=======
+++>>>>>>> 6130e7a9c34d (mmc: dw_mmc: Remove old card detect infrastructure)
+  	return 0;
+  
+ -err_host_allocated:
+ +err_setup_bus:
+  	mmc_free_host(mmc);
+ -	return ret;
+ +	return -EINVAL;
+  }
+  
+  static void dw_mci_cleanup_slot(struct dw_mci_slot *slot, unsigned int id)
+@@@ -2438,11 -2608,6 +2460,14 @@@ int dw_mci_probe(struct dw_mci *host
+  		host->data_offset = DATA_240A_OFFSET;
+  
+  	tasklet_init(&host->tasklet, dw_mci_tasklet_func, (unsigned long)host);
+++<<<<<<< HEAD
+ +	host->card_workqueue = alloc_workqueue("dw-mci-card",
+ +			WQ_MEM_RECLAIM | WQ_NON_REENTRANT, 1);
+ +	if (!host->card_workqueue)
+ +		goto err_dmaunmap;
+ +	INIT_WORK(&host->card_work, dw_mci_work_routine_card);
+++=======
+++>>>>>>> 6130e7a9c34d (mmc: dw_mmc: Remove old card detect infrastructure)
+  	ret = devm_request_irq(host->dev, host->irq, dw_mci_interrupt,
+  			       host->irq_flags, "dw-mci", host);
+  	if (ret)
+diff --cc drivers/mmc/host/dw_mmc.h
+index f894414bb248,71d499557edc..000000000000
+--- a/drivers/mmc/host/dw_mmc.h
++++ b/drivers/mmc/host/dw_mmc.h
+@@@ -191,6 -199,48 +191,51 @@@ extern int dw_mci_resume(struct dw_mci 
+  #endif
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * struct dw_mci_slot - MMC slot state
++  * @mmc: The mmc_host representing this slot.
++  * @host: The MMC controller this slot is using.
++  * @quirks: Slot-level quirks (DW_MCI_SLOT_QUIRK_XXX)
++  * @ctype: Card type for this slot.
++  * @mrq: mmc_request currently being processed or waiting to be
++  *	processed, or NULL when the slot is idle.
++  * @queue_node: List node for placing this node in the @queue list of
++  *	&struct dw_mci.
++  * @clock: Clock rate configured by set_ios(). Protected by host->lock.
++  * @__clk_old: The last updated clock with reflecting clock divider.
++  *	Keeping track of this helps us to avoid spamming the console
++  *	with CONFIG_MMC_CLKGATE.
++  * @flags: Random state bits associated with the slot.
++  * @id: Number of this slot.
++  */
++ struct dw_mci_slot {
++ 	struct mmc_host		*mmc;
++ 	struct dw_mci		*host;
++ 
++ 	int			quirks;
++ 
++ 	u32			ctype;
++ 
++ 	struct mmc_request	*mrq;
++ 	struct list_head	queue_node;
++ 
++ 	unsigned int		clock;
++ 	unsigned int		__clk_old;
++ 
++ 	unsigned long		flags;
++ #define DW_MMC_CARD_PRESENT	0
++ #define DW_MMC_CARD_NEED_INIT	1
++ 	int			id;
++ };
++ 
++ struct dw_mci_tuning_data {
++ 	const u8 *blk_pattern;
++ 	unsigned int blksz;
++ };
++ 
++ /**
+++>>>>>>> 6130e7a9c34d (mmc: dw_mmc: Remove old card detect infrastructure)
+   * dw_mci driver data - dw-mshc implementation specific driver data.
+   * @caps: mmc subsystem specified capabilities of the controller(s).
+   * @init: early implementation specific initialization.
+* Unmerged path drivers/mmc/host/dw_mmc.c
+* Unmerged path drivers/mmc/host/dw_mmc.h
+diff --git a/include/linux/mmc/dw_mmc.h b/include/linux/mmc/dw_mmc.h
+index a578603b514c..447cd43b0606 100644
+--- a/include/linux/mmc/dw_mmc.h
++++ b/include/linux/mmc/dw_mmc.h
+@@ -131,7 +131,6 @@ struct dw_mci {
+ 	struct mmc_data		*data;
+ 	unsigned int		prev_blksz;
+ 	unsigned char		timing;
+-	struct workqueue_struct	*card_workqueue;
+ 
+ 	/* DMA interface members*/
+ 	int			use_dma;
+@@ -150,7 +149,6 @@ struct dw_mci {
+ 	u32			stop_cmdr;
+ 	u32			dir_status;
+ 	struct tasklet_struct	tasklet;
+-	struct work_struct	card_work;
+ 	unsigned long		pending_events;
+ 	unsigned long		completed_events;
+ 	enum dw_mci_state	state;
