@@ -1,0 +1,125 @@
+bridge: vlan: fix usage of vlan 0 and 4095 again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 462e1ead9296a8452499fb10cf3b51903ffe24ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/462e1ead.failed
+
+Vlan ids 0 and 4095 were disallowed by commit:
+8adff41c3d25 ("bridge: Don't use VID 0 and 4095 in vlan filtering")
+but then the check was removed when vlan ranges were introduced by:
+bdced7ef7838 ("bridge: support for multiple vlans and vlan ranges in setlink and dellink requests")
+So reintroduce the vlan range check.
+Before patch:
+[root@testvm ~]# bridge vlan add vid 0 dev eth0 master
+(succeeds)
+After Patch:
+[root@testvm ~]# bridge vlan add vid 0 dev eth0 master
+RTNETLINK answers: Invalid argument
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+Fixes: bdced7ef7838 ("bridge: support for multiple vlans and vlan ranges in setlink and dellink requests")
+	Acked-by: Toshiaki Makita <toshiaki.makita1@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 462e1ead9296a8452499fb10cf3b51903ffe24ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netlink.c
+diff --cc net/bridge/br_netlink.c
+index f813332a82b3,364bdc98bd9b..000000000000
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@@ -231,48 -445,52 +231,60 @@@ static int br_afspec(struct net_bridge 
+  		     struct nlattr *af_spec,
+  		     int cmd)
+  {
+ -	struct bridge_vlan_info *vinfo_start = NULL;
+ -	struct bridge_vlan_info *vinfo = NULL;
+ -	struct nlattr *attr;
+ +	struct nlattr *tb[IFLA_BRIDGE_MAX+1];
+  	int err = 0;
+ -	int rem;
+  
+ -	nla_for_each_nested(attr, af_spec, rem) {
+ -		if (nla_type(attr) != IFLA_BRIDGE_VLAN_INFO)
+ -			continue;
+ -		if (nla_len(attr) != sizeof(struct bridge_vlan_info))
+ +	err = nla_parse_nested(tb, IFLA_BRIDGE_MAX, af_spec, ifla_br_policy);
+ +	if (err)
+ +		return err;
+ +
+ +	if (tb[IFLA_BRIDGE_VLAN_INFO]) {
+ +		struct bridge_vlan_info *vinfo;
+ +
+ +		vinfo = nla_data(tb[IFLA_BRIDGE_VLAN_INFO]);
+ +
+ +		if (!vinfo->vid || vinfo->vid >= VLAN_VID_MASK)
+  			return -EINVAL;
+++<<<<<<< HEAD
+++=======
++ 		vinfo = nla_data(attr);
++ 		if (!vinfo->vid || vinfo->vid >= VLAN_VID_MASK)
++ 			return -EINVAL;
++ 		if (vinfo->flags & BRIDGE_VLAN_INFO_RANGE_BEGIN) {
++ 			if (vinfo_start)
++ 				return -EINVAL;
++ 			vinfo_start = vinfo;
++ 			continue;
++ 		}
+++>>>>>>> 462e1ead9296 (bridge: vlan: fix usage of vlan 0 and 4095 again)
+  
+ -		if (vinfo_start) {
+ -			struct bridge_vlan_info tmp_vinfo;
+ -			int v;
+ +		switch (cmd) {
+ +		case RTM_SETLINK:
+ +			if (p) {
+ +				err = nbp_vlan_add(p, vinfo->vid, vinfo->flags);
+ +				if (err)
+ +					break;
+  
+ -			if (!(vinfo->flags & BRIDGE_VLAN_INFO_RANGE_END))
+ -				return -EINVAL;
+ +				if (vinfo->flags & BRIDGE_VLAN_INFO_MASTER)
+ +					err = br_vlan_add(p->br, vinfo->vid,
+ +							  vinfo->flags);
+ +			} else
+ +				err = br_vlan_add(br, vinfo->vid, vinfo->flags);
+  
+ -			if (vinfo->vid <= vinfo_start->vid)
+ -				return -EINVAL;
+ +			if (err)
+ +				break;
+  
+ -			memcpy(&tmp_vinfo, vinfo_start,
+ -			       sizeof(struct bridge_vlan_info));
+ +			break;
+  
+ -			for (v = vinfo_start->vid; v <= vinfo->vid; v++) {
+ -				tmp_vinfo.vid = v;
+ -				err = br_vlan_info(br, p, cmd, &tmp_vinfo);
+ -				if (err)
+ -					break;
+ -			}
+ -			vinfo_start = NULL;
+ -		} else {
+ -			err = br_vlan_info(br, p, cmd, vinfo);
+ -		}
+ -		if (err)
+ +		case RTM_DELLINK:
+ +			if (p) {
+ +				nbp_vlan_delete(p, vinfo->vid);
+ +				if (vinfo->flags & BRIDGE_VLAN_INFO_MASTER)
+ +					br_vlan_delete(p->br, vinfo->vid);
+ +			} else
+ +				br_vlan_delete(br, vinfo->vid);
+  			break;
+ +		}
+  	}
+  
+  	return err;
+* Unmerged path net/bridge/br_netlink.c
