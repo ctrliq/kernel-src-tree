@@ -1,0 +1,871 @@
+pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5c83746a0cf2831d4b59f5cf99ef5fbf138564e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5c83746a.failed
+
+This patches moves parsing of the GETDEVICEINFO XDR to kernel space, as well
+as the management of complex devices.  The reason for that is we might have
+multiple outstanding complex devices after a NOTIFY_DEVICEID4_CHANGE, which
+device mapper or md can't handle as they claim devices exclusively.
+
+But as is turns out simple striping / concatenation is fairly trivial to
+implement anyway, so we make our life simpler by reducing the reliance
+on blkmapd.  For now we still use blkmapd by feeding it synthetic SIMPLE
+device XDR to translate device signatures to device numbers, but in the
+long runs I have plans to eliminate it entirely.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 5c83746a0cf2831d4b59f5cf99ef5fbf138564e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/blocklayout/Makefile
+#	fs/nfs/blocklayout/blocklayout.c
+#	fs/nfs/blocklayout/blocklayout.h
+#	fs/nfs/blocklayout/rpc_pipefs.c
+diff --cc fs/nfs/blocklayout/Makefile
+index d5815505c020,3ca14c36d08b..000000000000
+--- a/fs/nfs/blocklayout/Makefile
++++ b/fs/nfs/blocklayout/Makefile
+@@@ -2,4 -2,5 +2,9 @@@
+  # Makefile for the pNFS block layout driver kernel module
+  #
+  obj-$(CONFIG_PNFS_BLOCK) += blocklayoutdriver.o
+++<<<<<<< HEAD
+ +blocklayoutdriver-objs := blocklayout.o extents.o blocklayoutdev.o blocklayoutdm.o
+++=======
++ 
++ blocklayoutdriver-y += blocklayout.o dev.o extent_tree.o rpc_pipefs.o
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+diff --cc fs/nfs/blocklayout/blocklayout.c
+index 5b7b41d3b0f9,c41a718854e3..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.c
++++ b/fs/nfs/blocklayout/blocklayout.c
+@@@ -156,8 -128,8 +155,13 @@@ bl_alloc_init_bio(int npg, struct block
+  	}
+  
+  	if (bio) {
+++<<<<<<< HEAD
+ +		bio->bi_sector = isect - be->be_f_offset + be->be_v_offset;
+ +		bio->bi_bdev = be->be_mdev;
+++=======
++ 		bio->bi_iter.bi_sector = disk_sector;
++ 		bio->bi_bdev = bdev;
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  		bio->bi_end_io = end_io;
+  		bio->bi_private = par;
+  	}
+@@@ -244,31 -220,31 +272,36 @@@ bl_end_par_io_read(void *data, int unus
+  }
+  
+  static enum pnfs_try_status
+ -bl_read_pagelist(struct nfs_pgio_header *header)
+ +bl_read_pagelist(struct nfs_pgio_header *hdr)
+  {
+++<<<<<<< HEAD
+ +	struct nfs_pgio_header *header = hdr;
+ +	int i, hole;
+++=======
++ 	struct pnfs_block_layout *bl = BLK_LSEG2EXT(header->lseg);
++ 	struct pnfs_block_dev_map map = { .start = NFS4_MAX_UINT64 };
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  	struct bio *bio = NULL;
+ -	struct pnfs_block_extent be;
+ +	struct pnfs_block_extent *be = NULL, *cow_read = NULL;
+  	sector_t isect, extent_length = 0;
+  	struct parallel_io *par;
+ -	loff_t f_offset = header->args.offset;
+ -	size_t bytes_left = header->args.count;
+ +	loff_t f_offset = hdr->args.offset;
+ +	size_t bytes_left = hdr->args.count;
+  	unsigned int pg_offset, pg_len;
+ -	struct page **pages = header->args.pages;
+ -	int pg_index = header->args.pgbase >> PAGE_CACHE_SHIFT;
+ +	struct page **pages = hdr->args.pages;
+ +	int pg_index = hdr->args.pgbase >> PAGE_CACHE_SHIFT;
+  	const bool is_dio = (header->dreq != NULL);
+  	struct blk_plug plug;
+ -	int i;
+  
+  	dprintk("%s enter nr_pages %u offset %lld count %u\n", __func__,
+ -		header->page_array.npages, f_offset,
+ -		(unsigned int)header->args.count);
+ +		hdr->page_array.npages, f_offset,
+ +		(unsigned int)hdr->args.count);
+  
+ -	par = alloc_parallel(header);
+ +	par = alloc_parallel(hdr);
+  	if (!par)
+ -		return PNFS_NOT_ATTEMPTED;
+ +		goto use_mds;
+  	par->pnfs_callback = bl_end_par_io_read;
+ +	/* At this point, we can no longer jump to use_mds */
+  
+  	blk_start_plug(&plug);
+  
+@@@ -302,34 -269,29 +335,46 @@@
+  				pg_len = PAGE_CACHE_SIZE - pg_offset;
+  			else
+  				pg_len = bytes_left;
+- 
+- 			f_offset += pg_len;
+- 			bytes_left -= pg_len;
+- 			isect += (pg_offset >> SECTOR_SHIFT);
+- 			extent_length -= (pg_offset >> SECTOR_SHIFT);
+  		} else {
+ -			BUG_ON(pg_offset != 0);
+ +			pg_offset = 0;
+  			pg_len = PAGE_CACHE_SIZE;
+  		}
+  
+++<<<<<<< HEAD
+ +		hole = is_hole(be, isect);
+ +		if (hole && !cow_read) {
+++=======
++ 		isect += (pg_offset >> SECTOR_SHIFT);
++ 		extent_length -= (pg_offset >> SECTOR_SHIFT);
++ 
++ 		if (is_hole(&be)) {
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  			bio = bl_submit_bio(READ, bio);
+  			/* Fill hole w/ zeroes w/o accessing device */
+  			dprintk("%s Zeroing page for hole\n", __func__);
+  			zero_user_segment(pages[i], pg_offset, pg_len);
+++<<<<<<< HEAD
+ +			print_page(pages[i]);
+ +			SetPageUptodate(pages[i]);
+++=======
++ 
++ 			/* invalidate map */
++ 			map.start = NFS4_MAX_UINT64;
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  		} else {
+ +			struct pnfs_block_extent *be_read;
+ +
+ +			be_read = (hole && cow_read) ? cow_read : be;
+  			bio = do_add_page_to_bio(bio,
+ -						 header->page_array.npages - i,
+ +						 hdr->page_array.npages - i,
+  						 READ,
+++<<<<<<< HEAD
+ +						 isect, pages[i], be_read,
+++=======
++ 						 isect, pages[i], &map, &be,
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  						 bl_end_io_read, par,
+- 						 pg_offset, pg_len);
++ 						 pg_offset, &pg_len);
+  			if (IS_ERR(bio)) {
+  				header->pnfs_error = PTR_ERR(bio);
+  				bio = NULL;
+@@@ -338,16 -300,16 +383,18 @@@
+  		}
+  		isect += (pg_len >> SECTOR_SHIFT);
+  		extent_length -= (pg_len >> SECTOR_SHIFT);
++ 		f_offset += pg_len;
++ 		bytes_left -= pg_len;
+  	}
+  	if ((isect << SECTOR_SHIFT) >= header->inode->i_size) {
+ -		header->res.eof = 1;
+ -		header->res.count = header->inode->i_size - header->args.offset;
+ +		hdr->res.eof = 1;
+ +		hdr->res.count = header->inode->i_size - hdr->args.offset;
+  	} else {
+ -		header->res.count = (isect << SECTOR_SHIFT) - header->args.offset;
+ +		hdr->res.count = (isect << SECTOR_SHIFT) - hdr->args.offset;
+  	}
+  out:
+ +	bl_put_extent(be);
+ +	bl_put_extent(cow_read);
+  	bl_submit_bio(READ, bio);
+  	blk_finish_plug(&plug);
+  	put_parallel(par);
+@@@ -686,21 -369,19 +733,31 @@@ check_page
+  static enum pnfs_try_status
+  bl_write_pagelist(struct nfs_pgio_header *header, int sync)
+  {
+++<<<<<<< HEAD
+ +	int i, ret, npg_zero, pg_index, last = 0;
+++=======
++ 	struct pnfs_block_layout *bl = BLK_LSEG2EXT(header->lseg);
++ 	struct pnfs_block_dev_map map = { .start = NFS4_MAX_UINT64 };
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  	struct bio *bio = NULL;
+ -	struct pnfs_block_extent be;
+ -	sector_t isect, extent_length = 0;
+ +	struct pnfs_block_extent *be = NULL, *cow_read = NULL;
+ +	sector_t isect, last_isect = 0, extent_length = 0;
+  	struct parallel_io *par = NULL;
+  	loff_t offset = header->args.offset;
+  	size_t count = header->args.count;
+ +	unsigned int pg_offset, pg_len, saved_len;
+  	struct page **pages = header->args.pages;
+++<<<<<<< HEAD
+ +	struct page *page;
+ +	pgoff_t index;
+ +	u64 temp;
+ +	int npg_per_block =
+ +	    NFS_SERVER(header->inode)->pnfs_blksize >> PAGE_CACHE_SHIFT;
+++=======
++ 	int pg_index = pg_index = header->args.pgbase >> PAGE_CACHE_SHIFT;
++ 	unsigned int pg_len;
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  	struct blk_plug plug;
+ -	int i;
+  
+  	dprintk("%s enter, %Zu@%lld\n", __func__, count, offset);
+  
+@@@ -817,97 -409,29 +874,113 @@@ next_page
+  				header->pnfs_error = -EINVAL;
+  				goto out;
+  			}
+ +			if (be->be_state == PNFS_BLOCK_INVALID_DATA) {
+ +				if (likely(!bl_push_one_short_extent(
+ +								be->be_inval)))
+ +					par->bse_count++;
+ +				else {
+ +					header->pnfs_error = -ENOMEM;
+ +					goto out;
+ +				}
+ +			}
+ +			extent_length = be->be_length -
+ +			    (isect - be->be_f_offset);
+ +		}
+ +
+++<<<<<<< HEAD
+ +		dprintk("%s offset %lld count %Zu\n", __func__, offset, count);
+ +		pg_offset = offset & ~PAGE_CACHE_MASK;
+ +		if (pg_offset + count > PAGE_CACHE_SIZE)
+ +			pg_len = PAGE_CACHE_SIZE - pg_offset;
+ +		else
+ +			pg_len = count;
+ +
+ +		saved_len = pg_len;
+ +		if (be->be_state == PNFS_BLOCK_INVALID_DATA &&
+ +		    !bl_is_sector_init(be->be_inval, isect)) {
+ +			ret = bl_read_partial_page_sync(pages[i], cow_read,
+ +							pg_offset, pg_len, true);
+ +			if (ret) {
+ +				dprintk("%s bl_read_partial_page_sync fail %d\n",
+ +					__func__, ret);
+ +				header->pnfs_error = ret;
+ +				goto out;
+ +			}
+ +
+ +			ret = bl_mark_sectors_init(be->be_inval, isect,
+ +						       PAGE_CACHE_SECTORS);
+ +			if (unlikely(ret)) {
+ +				dprintk("%s bl_mark_sectors_init fail %d\n",
+ +					__func__, ret);
+ +				header->pnfs_error = ret;
+ +				goto out;
+ +			}
+  
+ -			extent_length = be.be_length - (isect - be.be_f_offset);
+ +			/* Expand to full page write */
+ +			pg_offset = 0;
+ +			pg_len = PAGE_CACHE_SIZE;
+ +		} else if  ((pg_offset & (SECTOR_SIZE - 1)) ||
+ +			    (pg_len & (SECTOR_SIZE - 1))){
+ +			/* ahh, nasty case. We have to do sync full sector
+ +			 * read-modify-write cycles.
+ +			 */
+ +			unsigned int saved_offset = pg_offset;
+ +			ret = bl_read_partial_page_sync(pages[i], be, pg_offset,
+ +							pg_len, false);
+ +			pg_offset = round_down(pg_offset, SECTOR_SIZE);
+ +			pg_len = round_up(saved_offset + pg_len, SECTOR_SIZE)
+ +				 - pg_offset;
+  		}
+  
+ +
+ +		bio = do_add_page_to_bio(bio, header->page_array.npages - i,
+ +					 WRITE,
+ +					 isect, pages[i], be,
+ +					 bl_end_io_write, par,
+ +					 pg_offset, pg_len);
+++=======
++ 		pg_len = PAGE_CACHE_SIZE;
++ 		bio = do_add_page_to_bio(bio, header->page_array.npages - i,
++ 					 WRITE, isect, pages[i], &map, &be,
++ 					 bl_end_io_write, par,
++ 					 0, &pg_len);
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  		if (IS_ERR(bio)) {
+  			header->pnfs_error = PTR_ERR(bio);
+  			bio = NULL;
+  			goto out;
+  		}
+++<<<<<<< HEAD
+ +		offset += saved_len;
+ +		count -= saved_len;
+ +		isect += PAGE_CACHE_SECTORS;
+ +		last_isect = isect;
+ +		extent_length -= PAGE_CACHE_SECTORS;
+++=======
++ 
++ 		offset += pg_len;
++ 		count -= pg_len;
++ 		isect += (pg_len >> SECTOR_SHIFT);
++ 		extent_length -= (pg_len >> SECTOR_SHIFT);
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+ +	}
+ +
+ +	/* Last page inside INVALID extent */
+ +	if (be->be_state == PNFS_BLOCK_INVALID_DATA) {
+ +		bio = bl_submit_bio(WRITE, bio);
+ +		temp = last_isect >> PAGE_CACHE_SECTOR_SHIFT;
+ +		npg_zero = npg_per_block - do_div(temp, npg_per_block);
+ +		if (npg_zero < npg_per_block) {
+ +			last = 1;
+ +			goto fill_invalid_ext;
+ +		}
+  	}
+  
+ +write_done:
+  	header->res.count = header->args.count;
+  out:
+ +	bl_put_extent(be);
+ +	bl_put_extent(cow_read);
+  	bl_submit_bio(WRITE, bio);
+  	blk_finish_plug(&plug);
+  	put_parallel(par);
+diff --cc fs/nfs/blocklayout/blocklayout.h
+index 9838fb020473,92dca9e90d8d..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.h
++++ b/fs/nfs/blocklayout/blocklayout.h
+@@@ -44,16 -44,77 +44,90 @@@
+  #define PAGE_CACHE_SECTOR_SHIFT (PAGE_CACHE_SHIFT - SECTOR_SHIFT)
+  #define SECTOR_SIZE (1 << SECTOR_SHIFT)
+  
+++<<<<<<< HEAD
+ +struct block_mount_id {
+ +	spinlock_t			bm_lock;    /* protects list */
+ +	struct list_head		bm_devlist; /* holds pnfs_block_dev */
+ +};
+ +
+ +struct pnfs_block_dev {
+ +	struct list_head		bm_node;
+ +	struct nfs4_deviceid		bm_mdevid;    /* associated devid */
+ +	struct block_device		*bm_mdev;     /* meta device itself */
+ +	struct net			*net;
+++=======
++ struct pnfs_block_dev;
++ 
++ enum pnfs_block_volume_type {
++ 	PNFS_BLOCK_VOLUME_SIMPLE	= 0,
++ 	PNFS_BLOCK_VOLUME_SLICE		= 1,
++ 	PNFS_BLOCK_VOLUME_CONCAT	= 2,
++ 	PNFS_BLOCK_VOLUME_STRIPE	= 3,
++ };
++ 
++ #define PNFS_BLOCK_MAX_UUIDS	4
++ #define PNFS_BLOCK_MAX_DEVICES	64
++ 
++ /*
++  * Random upper cap for the uuid length to avoid unbounded allocation.
++  * Not actually limited by the protocol.
++  */
++ #define PNFS_BLOCK_UUID_LEN	128
++ 
++ 
++ struct pnfs_block_volume {
++ 	enum pnfs_block_volume_type	type;
++ 	union {
++ 		struct {
++ 			int		len;
++ 			int		nr_sigs;
++ 			struct {
++ 				u64		offset;
++ 				u32		sig_len;
++ 				u8		sig[PNFS_BLOCK_UUID_LEN];
++ 			} sigs[PNFS_BLOCK_MAX_UUIDS];
++ 		} simple;
++ 		struct {
++ 			u64		start;
++ 			u64		len;
++ 			u32		volume;
++ 		} slice;
++ 		struct {
++ 			u32		volumes_count;
++ 			u32		volumes[PNFS_BLOCK_MAX_DEVICES];
++ 		} concat;
++ 		struct {
++ 			u64		chunk_size;
++ 			u32		volumes_count;
++ 			u32		volumes[PNFS_BLOCK_MAX_DEVICES];
++ 		} stripe;
++ 	};
++ };
++ 
++ struct pnfs_block_dev_map {
++ 	sector_t			start;
++ 	sector_t			len;
++ 
++ 	sector_t			disk_offset;
++ 	struct block_device		*bdev;
++ };
++ 
++ struct pnfs_block_dev {
++ 	struct nfs4_deviceid_node	node;
++ 
++ 	u64				start;
++ 	u64				len;
++ 
++ 	u32				nr_children;
++ 	struct pnfs_block_dev		*children;
++ 	u64				chunk_size;
++ 
++ 	struct block_device		*bdev;
++ 	u64				disk_offset;
++ 
++ 	bool (*map)(struct pnfs_block_dev *dev, u64 offset,
++ 			struct pnfs_block_dev_map *map);
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  };
+  
+  enum exstate4 {
+@@@ -171,41 -178,27 +245,66 @@@ struct bl_msg_hdr 
+  #define BL_DEVICE_REQUEST_PROC         0x1 /* User level process succeeds */
+  #define BL_DEVICE_REQUEST_ERR          0x2 /* User level process fails */
+  
+++<<<<<<< HEAD
+ +/* blocklayoutdev.c */
+ +ssize_t bl_pipe_downcall(struct file *, const char __user *, size_t);
+ +void bl_pipe_destroy_msg(struct rpc_pipe_msg *);
+ +void nfs4_blkdev_put(struct block_device *bdev);
+ +struct pnfs_block_dev *nfs4_blk_decode_device(struct nfs_server *server,
+ +						struct pnfs_device *dev);
+ +int nfs4_blk_process_layoutget(struct pnfs_layout_hdr *lo,
+ +				struct nfs4_layoutget_res *lgr, gfp_t gfp_flags);
+ +
+ +/* blocklayoutdm.c */
+ +void bl_free_block_dev(struct pnfs_block_dev *bdev);
+ +
+ +/* extents.c */
+ +struct pnfs_block_extent *
+ +bl_find_get_extent(struct pnfs_block_layout *bl, sector_t isect,
+ +		struct pnfs_block_extent **cow_read);
+ +int bl_mark_sectors_init(struct pnfs_inval_markings *marks,
+ +			     sector_t offset, sector_t length);
+ +void bl_put_extent(struct pnfs_block_extent *be);
+ +struct pnfs_block_extent *bl_alloc_extent(void);
+ +int bl_is_sector_init(struct pnfs_inval_markings *marks, sector_t isect);
+ +int encode_pnfs_block_layoutupdate(struct pnfs_block_layout *bl,
+ +				   struct xdr_stream *xdr,
+ +				   const struct nfs4_layoutcommit_args *arg);
+ +void clean_pnfs_block_layoutupdate(struct pnfs_block_layout *bl,
+ +				   const struct nfs4_layoutcommit_args *arg,
+ +				   int status);
+ +int bl_add_merge_extent(struct pnfs_block_layout *bl,
+ +			 struct pnfs_block_extent *new);
+ +int bl_mark_for_commit(struct pnfs_block_extent *be,
+ +			sector_t offset, sector_t length,
+ +			struct pnfs_block_short_extent *new);
+ +int bl_push_one_short_extent(struct pnfs_inval_markings *marks);
+ +struct pnfs_block_short_extent *
+ +bl_pop_one_short_extent(struct pnfs_inval_markings *marks);
+ +void bl_free_short_extents(struct pnfs_inval_markings *marks, int num_to_free);
+++=======
++ /* dev.c */
++ struct nfs4_deviceid_node *bl_alloc_deviceid_node(struct nfs_server *server,
++ 		struct pnfs_device *pdev, gfp_t gfp_mask);
++ void bl_free_deviceid_node(struct nfs4_deviceid_node *d);
++ 
++ /* extent_tree.c */
++ int ext_tree_insert(struct pnfs_block_layout *bl,
++ 		struct pnfs_block_extent *new);
++ int ext_tree_remove(struct pnfs_block_layout *bl, bool rw, sector_t start,
++ 		sector_t end);
++ int ext_tree_mark_written(struct pnfs_block_layout *bl, sector_t start,
++ 		sector_t len);
++ bool ext_tree_lookup(struct pnfs_block_layout *bl, sector_t isect,
++ 		struct pnfs_block_extent *ret, bool rw);
++ int ext_tree_prepare_commit(struct nfs4_layoutcommit_args *arg);
++ void ext_tree_mark_committed(struct nfs4_layoutcommit_args *arg, int status);
++ 
++ /* rpc_pipefs.c */
++ dev_t bl_resolve_deviceid(struct nfs_server *server,
++ 		struct pnfs_block_volume *b, gfp_t gfp_mask);
++ int __init bl_init_pipefs(void);
++ void __exit bl_cleanup_pipefs(void);
+++>>>>>>> 5c83746a0cf2 (pnfs/blocklayout: in-kernel GETDEVICEINFO XDR parsing)
+  
+  #endif /* FS_NFS_NFS4BLOCKLAYOUT_H */
+* Unmerged path fs/nfs/blocklayout/rpc_pipefs.c
+* Unmerged path fs/nfs/blocklayout/Makefile
+* Unmerged path fs/nfs/blocklayout/blocklayout.c
+* Unmerged path fs/nfs/blocklayout/blocklayout.h
+diff --git a/fs/nfs/blocklayout/dev.c b/fs/nfs/blocklayout/dev.c
+new file mode 100644
+index 000000000000..00f159da06ee
+--- /dev/null
++++ b/fs/nfs/blocklayout/dev.c
+@@ -0,0 +1,360 @@
++/*
++ * Copyright (c) 2014 Christoph Hellwig.
++ */
++#include <linux/sunrpc/svc.h>
++#include <linux/blkdev.h>
++#include <linux/nfs4.h>
++#include <linux/nfs_fs.h>
++#include <linux/nfs_xdr.h>
++
++#include "blocklayout.h"
++
++#define NFSDBG_FACILITY		NFSDBG_PNFS_LD
++
++static void
++bl_free_device(struct pnfs_block_dev *dev)
++{
++	if (dev->nr_children) {
++		int i;
++
++		for (i = 0; i < dev->nr_children; i++)
++			bl_free_device(&dev->children[i]);
++		kfree(dev->children);
++	} else {
++		if (dev->bdev)
++			blkdev_put(dev->bdev, FMODE_READ);
++	}
++}
++
++void
++bl_free_deviceid_node(struct nfs4_deviceid_node *d)
++{
++	struct pnfs_block_dev *dev =
++		container_of(d, struct pnfs_block_dev, node);
++
++	bl_free_device(dev);
++	kfree(dev);
++}
++
++static int
++nfs4_block_decode_volume(struct xdr_stream *xdr, struct pnfs_block_volume *b)
++{
++	__be32 *p;
++	int i;
++
++	p = xdr_inline_decode(xdr, 4);
++	if (!p)
++		return -EIO;
++	b->type = be32_to_cpup(p++);
++
++	switch (b->type) {
++	case PNFS_BLOCK_VOLUME_SIMPLE:
++		p = xdr_inline_decode(xdr, 4);
++		if (!p)
++			return -EIO;
++		b->simple.nr_sigs = be32_to_cpup(p++);
++		if (!b->simple.nr_sigs) {
++			dprintk("no signature\n");
++			return -EIO;
++		}
++
++		b->simple.len = 4 + 4;
++		for (i = 0; i < b->simple.nr_sigs; i++) {
++			p = xdr_inline_decode(xdr, 8 + 4);
++			if (!p)
++				return -EIO;
++			p = xdr_decode_hyper(p, &b->simple.sigs[i].offset);
++			b->simple.sigs[i].sig_len = be32_to_cpup(p++);
++
++			p = xdr_inline_decode(xdr, b->simple.sigs[i].sig_len);
++			if (!p)
++				return -EIO;
++			memcpy(&b->simple.sigs[i].sig, p,
++				b->simple.sigs[i].sig_len);
++
++			b->simple.len += 8 + 4 + b->simple.sigs[i].sig_len;
++		}
++		break;
++	case PNFS_BLOCK_VOLUME_SLICE:
++		p = xdr_inline_decode(xdr, 8 + 8 + 4);
++		if (!p)
++			return -EIO;
++		p = xdr_decode_hyper(p, &b->slice.start);
++		p = xdr_decode_hyper(p, &b->slice.len);
++		b->slice.volume = be32_to_cpup(p++);
++		break;
++	case PNFS_BLOCK_VOLUME_CONCAT:
++		p = xdr_inline_decode(xdr, 4);
++		if (!p)
++			return -EIO;
++		b->concat.volumes_count = be32_to_cpup(p++);
++
++		p = xdr_inline_decode(xdr, b->concat.volumes_count * 4);
++		if (!p)
++			return -EIO;
++		for (i = 0; i < b->concat.volumes_count; i++)
++			b->concat.volumes[i] = be32_to_cpup(p++);
++		break;
++	case PNFS_BLOCK_VOLUME_STRIPE:
++		p = xdr_inline_decode(xdr, 8 + 4);
++		if (!p)
++			return -EIO;
++		p = xdr_decode_hyper(p, &b->stripe.chunk_size);
++		b->stripe.volumes_count = be32_to_cpup(p++);
++
++		p = xdr_inline_decode(xdr, b->stripe.volumes_count * 4);
++		if (!p)
++			return -EIO;
++		for (i = 0; i < b->stripe.volumes_count; i++)
++			b->stripe.volumes[i] = be32_to_cpup(p++);
++		break;
++	default:
++		dprintk("unknown volume type!\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static bool bl_map_simple(struct pnfs_block_dev *dev, u64 offset,
++		struct pnfs_block_dev_map *map)
++{
++	map->start = dev->start;
++	map->len = dev->len;
++	map->disk_offset = dev->disk_offset;
++	map->bdev = dev->bdev;
++	return true;
++}
++
++static bool bl_map_concat(struct pnfs_block_dev *dev, u64 offset,
++		struct pnfs_block_dev_map *map)
++{
++	int i;
++
++	for (i = 0; i < dev->nr_children; i++) {
++		struct pnfs_block_dev *child = &dev->children[i];
++
++		if (child->start > offset ||
++		    child->start + child->len <= offset)
++			continue;
++
++		child->map(child, offset - child->start, map);
++		return true;
++	}
++
++	dprintk("%s: ran off loop!\n", __func__);
++	return false;
++}
++
++static bool bl_map_stripe(struct pnfs_block_dev *dev, u64 offset,
++		struct pnfs_block_dev_map *map)
++{
++	struct pnfs_block_dev *child;
++	u64 chunk = (offset / dev->chunk_size);
++	int chunk_idx = chunk % dev->nr_children;
++	u64 disk_offset;
++
++	if (chunk_idx > dev->nr_children) {
++		dprintk("%s: invalid chunk idx %d (%lld/%lld)\n",
++			__func__, chunk_idx, offset, dev->chunk_size);
++		/* error, should not happen */
++		return false;
++	}
++
++	/* truncate offset to the beginning of the stripe */
++	offset = chunk * dev->chunk_size;
++
++	/* disk offset of the stripe */
++	disk_offset = offset / dev->nr_children;
++
++	child = &dev->children[chunk_idx];
++	child->map(child, disk_offset, map);
++
++	map->start += offset;
++	map->disk_offset += disk_offset;
++	map->len = dev->chunk_size;
++	return true;
++}
++
++static int
++bl_parse_deviceid(struct nfs_server *server, struct pnfs_block_dev *d,
++		struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask);
++
++
++static int
++bl_parse_simple(struct nfs_server *server, struct pnfs_block_dev *d,
++		struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask)
++{
++	struct pnfs_block_volume *v = &volumes[idx];
++	dev_t dev;
++
++	dev = bl_resolve_deviceid(server, v, gfp_mask);
++	if (!dev)
++		return -EIO;
++
++	d->bdev = blkdev_get_by_dev(dev, FMODE_READ, NULL);
++	if (IS_ERR(d->bdev)) {
++		printk(KERN_WARNING "pNFS: failed to open device %d:%d (%ld)\n",
++			MAJOR(dev), MINOR(dev), PTR_ERR(d->bdev));
++		return PTR_ERR(d->bdev);
++	}
++
++
++	d->len = i_size_read(d->bdev->bd_inode);
++	d->map = bl_map_simple;
++
++	printk(KERN_INFO "pNFS: using block device %s\n",
++		d->bdev->bd_disk->disk_name);
++	return 0;
++}
++
++static int
++bl_parse_slice(struct nfs_server *server, struct pnfs_block_dev *d,
++		struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask)
++{
++	struct pnfs_block_volume *v = &volumes[idx];
++	int ret;
++
++	ret = bl_parse_deviceid(server, d, volumes, v->slice.volume, gfp_mask);
++	if (ret)
++		return ret;
++
++	d->disk_offset = v->slice.start;
++	d->len = v->slice.len;
++	return 0;
++}
++
++static int
++bl_parse_concat(struct nfs_server *server, struct pnfs_block_dev *d,
++		struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask)
++{
++	struct pnfs_block_volume *v = &volumes[idx];
++	u64 len = 0;
++	int ret, i;
++
++	d->children = kcalloc(v->concat.volumes_count,
++			sizeof(struct pnfs_block_dev), GFP_KERNEL);
++	if (!d->children)
++		return -ENOMEM;
++
++	for (i = 0; i < v->concat.volumes_count; i++) {
++		ret = bl_parse_deviceid(server, &d->children[i],
++				volumes, v->concat.volumes[i], gfp_mask);
++		if (ret)
++			return ret;
++
++		d->nr_children++;
++		d->children[i].start += len;
++		len += d->children[i].len;
++	}
++
++	d->len = len;
++	d->map = bl_map_concat;
++	return 0;
++}
++
++static int
++bl_parse_stripe(struct nfs_server *server, struct pnfs_block_dev *d,
++		struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask)
++{
++	struct pnfs_block_volume *v = &volumes[idx];
++	u64 len = 0;
++	int ret, i;
++
++	d->children = kcalloc(v->stripe.volumes_count,
++			sizeof(struct pnfs_block_dev), GFP_KERNEL);
++	if (!d->children)
++		return -ENOMEM;
++
++	for (i = 0; i < v->stripe.volumes_count; i++) {
++		ret = bl_parse_deviceid(server, &d->children[i],
++				volumes, v->stripe.volumes[i], gfp_mask);
++		if (ret)
++			return ret;
++
++		d->nr_children++;
++		len += d->children[i].len;
++	}
++
++	d->len = len;
++	d->chunk_size = v->stripe.chunk_size;
++	d->map = bl_map_stripe;
++	return 0;
++}
++
++static int
++bl_parse_deviceid(struct nfs_server *server, struct pnfs_block_dev *d,
++		struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask)
++{
++	switch (volumes[idx].type) {
++	case PNFS_BLOCK_VOLUME_SIMPLE:
++		return bl_parse_simple(server, d, volumes, idx, gfp_mask);
++	case PNFS_BLOCK_VOLUME_SLICE:
++		return bl_parse_slice(server, d, volumes, idx, gfp_mask);
++	case PNFS_BLOCK_VOLUME_CONCAT:
++		return bl_parse_concat(server, d, volumes, idx, gfp_mask);
++	case PNFS_BLOCK_VOLUME_STRIPE:
++		return bl_parse_stripe(server, d, volumes, idx, gfp_mask);
++	default:
++		dprintk("unsupported volume type: %d\n", volumes[idx].type);
++		return -EIO;
++	}
++}
++
++struct nfs4_deviceid_node *
++bl_alloc_deviceid_node(struct nfs_server *server, struct pnfs_device *pdev,
++		gfp_t gfp_mask)
++{
++	struct nfs4_deviceid_node *node = NULL;
++	struct pnfs_block_volume *volumes;
++	struct pnfs_block_dev *top;
++	struct xdr_stream xdr;
++	struct xdr_buf buf;
++	struct page *scratch;
++	int nr_volumes, ret, i;
++	__be32 *p;
++
++	scratch = alloc_page(gfp_mask);
++	if (!scratch)
++		goto out;
++
++	xdr_init_decode_pages(&xdr, &buf, pdev->pages, pdev->pglen);
++	xdr_set_scratch_buffer(&xdr, page_address(scratch), PAGE_SIZE);
++
++	p = xdr_inline_decode(&xdr, sizeof(__be32));
++	if (!p)
++		goto out_free_scratch;
++	nr_volumes = be32_to_cpup(p++);
++
++	volumes = kcalloc(nr_volumes, sizeof(struct pnfs_block_volume),
++			  gfp_mask);
++	if (!volumes)
++		goto out_free_scratch;
++
++	for (i = 0; i < nr_volumes; i++) {
++		ret = nfs4_block_decode_volume(&xdr, &volumes[i]);
++		if (ret < 0)
++			goto out_free_volumes;
++	}
++
++	top = kzalloc(sizeof(*top), gfp_mask);
++	if (!top)
++		goto out_free_volumes;
++
++	ret = bl_parse_deviceid(server, top, volumes, nr_volumes - 1, gfp_mask);
++	if (ret) {
++		bl_free_device(top);
++		kfree(top);
++		goto out_free_volumes;
++	}
++
++	node = &top->node;
++	nfs4_init_deviceid_node(node, server, &pdev->dev_id);
++
++out_free_volumes:
++	kfree(volumes);
++out_free_scratch:
++	__free_page(scratch);
++out:
++	return node;
++}
+* Unmerged path fs/nfs/blocklayout/rpc_pipefs.c
