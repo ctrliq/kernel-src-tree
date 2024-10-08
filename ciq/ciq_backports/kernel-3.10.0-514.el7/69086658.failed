@@ -1,0 +1,136 @@
+netfilter: nf_tables: add GC synchronization helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 6908665826d56ddd024f3e131a9ee36f0d140943
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/69086658.failed
+
+GC is expected to happen asynchrously to the netlink interface. In the
+netlink path, both insertion and removal of elements consist of two
+steps, insertion followed by activation or deactivation followed by
+removal, during which the element must not be freed by GC.
+
+The synchronization helpers use an unused bit in the genmask field to
+atomically mark an element as "busy", meaning it is either currently
+being handled through the netlink API or by GC.
+
+Elements being processed by GC will never survive, netlink will simply
+ignore them. Elements being currently processed through netlink will be
+skipped by GC and reprocessed during the next run.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 6908665826d56ddd024f3e131a9ee36f0d140943)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+diff --cc include/net/netfilter/nf_tables.h
+index e78033d80cd2,1ea13fcd388e..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -802,6 -836,57 +802,60 @@@ static inline u8 nft_genmask_cur(const 
+  	return 1 << ACCESS_ONCE(net->nft.gencursor);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Set element transaction helpers
++  */
++ 
++ static inline bool nft_set_elem_active(const struct nft_set_ext *ext,
++ 				       u8 genmask)
++ {
++ 	return !(ext->genmask & genmask);
++ }
++ 
++ static inline void nft_set_elem_change_active(const struct nft_set *set,
++ 					      struct nft_set_ext *ext)
++ {
++ 	ext->genmask ^= nft_genmask_next(read_pnet(&set->pnet));
++ }
++ 
++ /*
++  * We use a free bit in the genmask field to indicate the element
++  * is busy, meaning it is currently being processed either by
++  * the netlink API or GC.
++  *
++  * Even though the genmask is only a single byte wide, this works
++  * because the extension structure if fully constant once initialized,
++  * so there are no non-atomic write accesses unless it is already
++  * marked busy.
++  */
++ #define NFT_SET_ELEM_BUSY_MASK	(1 << 2)
++ 
++ #if defined(__LITTLE_ENDIAN_BITFIELD)
++ #define NFT_SET_ELEM_BUSY_BIT	2
++ #elif defined(__BIG_ENDIAN_BITFIELD)
++ #define NFT_SET_ELEM_BUSY_BIT	(BITS_PER_LONG - BITS_PER_BYTE + 2)
++ #else
++ #error
++ #endif
++ 
++ static inline int nft_set_elem_mark_busy(struct nft_set_ext *ext)
++ {
++ 	unsigned long *word = (unsigned long *)ext;
++ 
++ 	BUILD_BUG_ON(offsetof(struct nft_set_ext, genmask) != 0);
++ 	return test_and_set_bit(NFT_SET_ELEM_BUSY_BIT, word);
++ }
++ 
++ static inline void nft_set_elem_clear_busy(struct nft_set_ext *ext)
++ {
++ 	unsigned long *word = (unsigned long *)ext;
++ 
++ 	clear_bit(NFT_SET_ELEM_BUSY_BIT, word);
++ }
++ 
+++>>>>>>> 6908665826d5 (netfilter: nf_tables: add GC synchronization helpers)
+  /**
+   *	struct nft_trans - nf_tables object update in transaction
+   *
+diff --cc net/netfilter/nf_tables_api.c
+index 2c37d65b92ed,3aa92b3f85fd..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3223,15 -3320,28 +3223,19 @@@ static int nft_add_set_elem(struct nft_
+  			if (err < 0)
+  				goto err3;
+  		}
+ -
+ -		nft_set_ext_add(&tmpl, NFT_SET_EXT_DATA);
+  	}
+  
+ -	err = -ENOMEM;
+ -	elem.priv = nft_set_elem_init(set, &tmpl, &elem.key, &data,
+ -				      timeout, GFP_KERNEL);
+ -	if (elem.priv == NULL)
+ -		goto err3;
+ -
+ -	ext = nft_set_elem_ext(set, elem.priv);
+ -	if (flags)
+ -		*nft_set_ext_flags(ext) = flags;
+ -
+  	trans = nft_trans_elem_alloc(ctx, NFT_MSG_NEWSETELEM, set);
+  	if (trans == NULL)
+ -		goto err4;
+ +		goto err3;
+  
+++<<<<<<< HEAD
+++=======
++ 	ext->genmask = nft_genmask_cur(ctx->net) | NFT_SET_ELEM_BUSY_MASK;
+++>>>>>>> 6908665826d5 (netfilter: nf_tables: add GC synchronization helpers)
+  	err = set->ops->insert(set, &elem);
+  	if (err < 0)
+ -		goto err5;
+ +		goto err4;
+  
+  	nft_trans_elem(trans) = elem;
+  	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
