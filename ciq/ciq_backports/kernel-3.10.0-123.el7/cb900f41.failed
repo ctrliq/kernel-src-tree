@@ -1,0 +1,496 @@
+mm, hugetlb: convert hugetlbfs to use split pmd lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] hugetlb: convert hugetlbfs to use split pmd lock (Rik van Riel) [1058896]
+Rebuild_FUZZ: 96.00%
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit cb900f41215447433cbc456d1c4294e858a84d7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/cb900f41.failed
+
+Hugetlb supports multiple page sizes. We use split lock only for PMD
+level, but not for PUD.
+
+[akpm@linux-foundation.org: coding-style fixes]
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Tested-by: Alex Thorlton <athorlton@sgi.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: "Eric W . Biederman" <ebiederm@xmission.com>
+	Cc: "Paul E . McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Dave Jones <davej@redhat.com>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Robin Holt <robinmholt@gmail.com>
+	Cc: Sedat Dilek <sedat.dilek@gmail.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cb900f41215447433cbc456d1c4294e858a84d7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+#	mm/hugetlb.c
+#	mm/mempolicy.c
+diff --cc include/linux/hugetlb.h
+index 6b4890fa57e7,acd2010328f3..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -358,6 -368,39 +358,42 @@@ static inline int hstate_index(struct h
+  	return h - hstates;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ pgoff_t __basepage_index(struct page *page);
++ 
++ /* Return page->index in PAGE_SIZE units */
++ static inline pgoff_t basepage_index(struct page *page)
++ {
++ 	if (!PageCompound(page))
++ 		return page->index;
++ 
++ 	return __basepage_index(page);
++ }
++ 
++ extern void dissolve_free_huge_pages(unsigned long start_pfn,
++ 				     unsigned long end_pfn);
++ int pmd_huge_support(void);
++ /*
++  * Currently hugepage migration is enabled only for pmd-based hugepage.
++  * This function will be updated when hugepage migration is more widely
++  * supported.
++  */
++ static inline int hugepage_migration_support(struct hstate *h)
++ {
++ 	return pmd_huge_support() && (huge_page_shift(h) == PMD_SHIFT);
++ }
++ 
++ static inline spinlock_t *huge_pte_lockptr(struct hstate *h,
++ 					   struct mm_struct *mm, pte_t *pte)
++ {
++ 	if (huge_page_size(h) == PMD_SIZE)
++ 		return pmd_lockptr(mm, (pmd_t *) pte);
++ 	VM_BUG_ON(huge_page_size(h) == PAGE_SIZE);
++ 	return &mm->page_table_lock;
++ }
++ 
+++>>>>>>> cb900f412154 (mm, hugetlb: convert hugetlbfs to use split pmd lock)
+  #else	/* CONFIG_HUGETLB_PAGE */
+  struct hstate {};
+  #define alloc_huge_page_node(h, nid) NULL
+@@@ -378,6 -423,30 +415,33 @@@ static inline unsigned int pages_per_hu
+  }
+  #define hstate_index_to_shift(index) 0
+  #define hstate_index(h) 0
+++<<<<<<< HEAD
+++=======
++ 
++ static inline pgoff_t basepage_index(struct page *page)
++ {
++ 	return page->index;
++ }
++ #define dissolve_free_huge_pages(s, e)	do {} while (0)
++ #define pmd_huge_support()	0
++ #define hugepage_migration_support(h)	0
++ 
++ static inline spinlock_t *huge_pte_lockptr(struct hstate *h,
++ 					   struct mm_struct *mm, pte_t *pte)
++ {
++ 	return &mm->page_table_lock;
++ }
+++>>>>>>> cb900f412154 (mm, hugetlb: convert hugetlbfs to use split pmd lock)
+  #endif	/* CONFIG_HUGETLB_PAGE */
+  
++ static inline spinlock_t *huge_pte_lock(struct hstate *h,
++ 					struct mm_struct *mm, pte_t *pte)
++ {
++ 	spinlock_t *ptl;
++ 
++ 	ptl = huge_pte_lockptr(h, mm, pte);
++ 	spin_lock(ptl);
++ 	return ptl;
++ }
++ 
+  #endif /* _LINUX_HUGETLB_H */
+diff --cc mm/hugetlb.c
+index 94b15bb6f96b,7d57af21f49e..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -2634,12 -2715,14 +2642,12 @@@ retry_avoidcopy
+  	mmun_end = mmun_start + huge_page_size(h);
+  	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+  	/*
+- 	 * Retake the page_table_lock to check for racing updates
++ 	 * Retake the page table lock to check for racing updates
+  	 * before the page tables are altered
+  	 */
+- 	spin_lock(&mm->page_table_lock);
++ 	spin_lock(ptl);
+  	ptep = huge_pte_offset(mm, address & huge_page_mask(h));
+  	if (likely(pte_same(huge_ptep_get(ptep), pte))) {
+ -		ClearPagePrivate(new_page);
+ -
+  		/* Break COW */
+  		huge_ptep_clear_flush(vma, address, ptep);
+  		set_huge_pte_at(mm, address, ptep,
+@@@ -3170,6 -3259,218 +3190,221 @@@ void hugetlb_unreserve_pages(struct ino
+  	hugetlb_acct_memory(h, -(chg - freed));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ARCH_WANT_HUGE_PMD_SHARE
++ static unsigned long page_table_shareable(struct vm_area_struct *svma,
++ 				struct vm_area_struct *vma,
++ 				unsigned long addr, pgoff_t idx)
++ {
++ 	unsigned long saddr = ((idx - svma->vm_pgoff) << PAGE_SHIFT) +
++ 				svma->vm_start;
++ 	unsigned long sbase = saddr & PUD_MASK;
++ 	unsigned long s_end = sbase + PUD_SIZE;
++ 
++ 	/* Allow segments to share if only one is marked locked */
++ 	unsigned long vm_flags = vma->vm_flags & ~VM_LOCKED;
++ 	unsigned long svm_flags = svma->vm_flags & ~VM_LOCKED;
++ 
++ 	/*
++ 	 * match the virtual addresses, permission and the alignment of the
++ 	 * page table page.
++ 	 */
++ 	if (pmd_index(addr) != pmd_index(saddr) ||
++ 	    vm_flags != svm_flags ||
++ 	    sbase < svma->vm_start || svma->vm_end < s_end)
++ 		return 0;
++ 
++ 	return saddr;
++ }
++ 
++ static int vma_shareable(struct vm_area_struct *vma, unsigned long addr)
++ {
++ 	unsigned long base = addr & PUD_MASK;
++ 	unsigned long end = base + PUD_SIZE;
++ 
++ 	/*
++ 	 * check on proper vm_flags and page table alignment
++ 	 */
++ 	if (vma->vm_flags & VM_MAYSHARE &&
++ 	    vma->vm_start <= base && end <= vma->vm_end)
++ 		return 1;
++ 	return 0;
++ }
++ 
++ /*
++  * Search for a shareable pmd page for hugetlb. In any case calls pmd_alloc()
++  * and returns the corresponding pte. While this is not necessary for the
++  * !shared pmd case because we can allocate the pmd later as well, it makes the
++  * code much cleaner. pmd allocation is essential for the shared case because
++  * pud has to be populated inside the same i_mmap_mutex section - otherwise
++  * racing tasks could either miss the sharing (see huge_pte_offset) or select a
++  * bad pmd for sharing.
++  */
++ pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
++ {
++ 	struct vm_area_struct *vma = find_vma(mm, addr);
++ 	struct address_space *mapping = vma->vm_file->f_mapping;
++ 	pgoff_t idx = ((addr - vma->vm_start) >> PAGE_SHIFT) +
++ 			vma->vm_pgoff;
++ 	struct vm_area_struct *svma;
++ 	unsigned long saddr;
++ 	pte_t *spte = NULL;
++ 	pte_t *pte;
++ 	spinlock_t *ptl;
++ 
++ 	if (!vma_shareable(vma, addr))
++ 		return (pte_t *)pmd_alloc(mm, pud, addr);
++ 
++ 	mutex_lock(&mapping->i_mmap_mutex);
++ 	vma_interval_tree_foreach(svma, &mapping->i_mmap, idx, idx) {
++ 		if (svma == vma)
++ 			continue;
++ 
++ 		saddr = page_table_shareable(svma, vma, addr, idx);
++ 		if (saddr) {
++ 			spte = huge_pte_offset(svma->vm_mm, saddr);
++ 			if (spte) {
++ 				get_page(virt_to_page(spte));
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (!spte)
++ 		goto out;
++ 
++ 	ptl = huge_pte_lockptr(hstate_vma(vma), mm, spte);
++ 	spin_lock(ptl);
++ 	if (pud_none(*pud))
++ 		pud_populate(mm, pud,
++ 				(pmd_t *)((unsigned long)spte & PAGE_MASK));
++ 	else
++ 		put_page(virt_to_page(spte));
++ 	spin_unlock(ptl);
++ out:
++ 	pte = (pte_t *)pmd_alloc(mm, pud, addr);
++ 	mutex_unlock(&mapping->i_mmap_mutex);
++ 	return pte;
++ }
++ 
++ /*
++  * unmap huge page backed by shared pte.
++  *
++  * Hugetlb pte page is ref counted at the time of mapping.  If pte is shared
++  * indicated by page_count > 1, unmap is achieved by clearing pud and
++  * decrementing the ref count. If count == 1, the pte page is not shared.
++  *
++  * called with page table lock held.
++  *
++  * returns: 1 successfully unmapped a shared pte page
++  *	    0 the underlying pte page is not shared, or it is the last user
++  */
++ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
++ {
++ 	pgd_t *pgd = pgd_offset(mm, *addr);
++ 	pud_t *pud = pud_offset(pgd, *addr);
++ 
++ 	BUG_ON(page_count(virt_to_page(ptep)) == 0);
++ 	if (page_count(virt_to_page(ptep)) == 1)
++ 		return 0;
++ 
++ 	pud_clear(pud);
++ 	put_page(virt_to_page(ptep));
++ 	*addr = ALIGN(*addr, HPAGE_SIZE * PTRS_PER_PTE) - HPAGE_SIZE;
++ 	return 1;
++ }
++ #define want_pmd_share()	(1)
++ #else /* !CONFIG_ARCH_WANT_HUGE_PMD_SHARE */
++ pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
++ {
++ 	return NULL;
++ }
++ #define want_pmd_share()	(0)
++ #endif /* CONFIG_ARCH_WANT_HUGE_PMD_SHARE */
++ 
++ #ifdef CONFIG_ARCH_WANT_GENERAL_HUGETLB
++ pte_t *huge_pte_alloc(struct mm_struct *mm,
++ 			unsigned long addr, unsigned long sz)
++ {
++ 	pgd_t *pgd;
++ 	pud_t *pud;
++ 	pte_t *pte = NULL;
++ 
++ 	pgd = pgd_offset(mm, addr);
++ 	pud = pud_alloc(mm, pgd, addr);
++ 	if (pud) {
++ 		if (sz == PUD_SIZE) {
++ 			pte = (pte_t *)pud;
++ 		} else {
++ 			BUG_ON(sz != PMD_SIZE);
++ 			if (want_pmd_share() && pud_none(*pud))
++ 				pte = huge_pmd_share(mm, addr, pud);
++ 			else
++ 				pte = (pte_t *)pmd_alloc(mm, pud, addr);
++ 		}
++ 	}
++ 	BUG_ON(pte && !pte_none(*pte) && !pte_huge(*pte));
++ 
++ 	return pte;
++ }
++ 
++ pte_t *huge_pte_offset(struct mm_struct *mm, unsigned long addr)
++ {
++ 	pgd_t *pgd;
++ 	pud_t *pud;
++ 	pmd_t *pmd = NULL;
++ 
++ 	pgd = pgd_offset(mm, addr);
++ 	if (pgd_present(*pgd)) {
++ 		pud = pud_offset(pgd, addr);
++ 		if (pud_present(*pud)) {
++ 			if (pud_huge(*pud))
++ 				return (pte_t *)pud;
++ 			pmd = pmd_offset(pud, addr);
++ 		}
++ 	}
++ 	return (pte_t *) pmd;
++ }
++ 
++ struct page *
++ follow_huge_pmd(struct mm_struct *mm, unsigned long address,
++ 		pmd_t *pmd, int write)
++ {
++ 	struct page *page;
++ 
++ 	page = pte_page(*(pte_t *)pmd);
++ 	if (page)
++ 		page += ((address & ~PMD_MASK) >> PAGE_SHIFT);
++ 	return page;
++ }
++ 
++ struct page *
++ follow_huge_pud(struct mm_struct *mm, unsigned long address,
++ 		pud_t *pud, int write)
++ {
++ 	struct page *page;
++ 
++ 	page = pte_page(*(pte_t *)pud);
++ 	if (page)
++ 		page += ((address & ~PUD_MASK) >> PAGE_SHIFT);
++ 	return page;
++ }
++ 
++ #else /* !CONFIG_ARCH_WANT_GENERAL_HUGETLB */
++ 
++ /* Can be overriden by architectures */
++ __attribute__((weak)) struct page *
++ follow_huge_pud(struct mm_struct *mm, unsigned long address,
++ 	       pud_t *pud, int write)
++ {
++ 	BUG();
++ 	return NULL;
++ }
++ 
++ #endif /* CONFIG_ARCH_WANT_GENERAL_HUGETLB */
++ 
+++>>>>>>> cb900f412154 (mm, hugetlb: convert hugetlbfs to use split pmd lock)
+  #ifdef CONFIG_MEMORY_FAILURE
+  
+  /* Should be called in hugetlb_lock */
+diff --cc mm/mempolicy.c
+index f05aa4c2c73c,c4403cdf3433..000000000000
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@@ -512,7 -518,32 +512,36 @@@ static int check_pte_range(struct vm_ar
+  	return addr != end;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int check_pmd_range(struct vm_area_struct *vma, pud_t *pud,
+++=======
++ static void queue_pages_hugetlb_pmd_range(struct vm_area_struct *vma,
++ 		pmd_t *pmd, const nodemask_t *nodes, unsigned long flags,
++ 				    void *private)
++ {
++ #ifdef CONFIG_HUGETLB_PAGE
++ 	int nid;
++ 	struct page *page;
++ 	spinlock_t *ptl;
++ 
++ 	ptl = huge_pte_lock(hstate_vma(vma), vma->vm_mm, (pte_t *)pmd);
++ 	page = pte_page(huge_ptep_get((pte_t *)pmd));
++ 	nid = page_to_nid(page);
++ 	if (node_isset(nid, *nodes) == !!(flags & MPOL_MF_INVERT))
++ 		goto unlock;
++ 	/* With MPOL_MF_MOVE, we migrate only unshared hugepage. */
++ 	if (flags & (MPOL_MF_MOVE_ALL) ||
++ 	    (flags & MPOL_MF_MOVE && page_mapcount(page) == 1))
++ 		isolate_huge_page(page, private);
++ unlock:
++ 	spin_unlock(ptl);
++ #else
++ 	BUG();
++ #endif
++ }
++ 
++ static inline int queue_pages_pmd_range(struct vm_area_struct *vma, pud_t *pud,
+++>>>>>>> cb900f412154 (mm, hugetlb: convert hugetlbfs to use split pmd lock)
+  		unsigned long addr, unsigned long end,
+  		const nodemask_t *nodes, unsigned long flags,
+  		void *private)
+diff --git a/fs/proc/meminfo.c b/fs/proc/meminfo.c
+index 5aa847a603c0..911437b7ddad 100644
+--- a/fs/proc/meminfo.c
++++ b/fs/proc/meminfo.c
+@@ -1,8 +1,8 @@
+ #include <linux/fs.h>
+-#include <linux/hugetlb.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
++#include <linux/hugetlb.h>
+ #include <linux/mman.h>
+ #include <linux/mmzone.h>
+ #include <linux/proc_fs.h>
+* Unmerged path include/linux/hugetlb.h
+diff --git a/include/linux/swapops.h b/include/linux/swapops.h
+index c5fd30d2a415..dff14c873903 100644
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@ -137,7 +137,8 @@ static inline void make_migration_entry_read(swp_entry_t *entry)
+ 
+ extern void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 					unsigned long address);
+-extern void migration_entry_wait_huge(struct mm_struct *mm, pte_t *pte);
++extern void migration_entry_wait_huge(struct vm_area_struct *vma,
++		struct mm_struct *mm, pte_t *pte);
+ #else
+ 
+ #define make_migration_entry(page, write) swp_entry(0, 0)
+@@ -149,8 +150,8 @@ static inline int is_migration_entry(swp_entry_t swp)
+ static inline void make_migration_entry_read(swp_entry_t *entryp) { }
+ static inline void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 					 unsigned long address) { }
+-static inline void migration_entry_wait_huge(struct mm_struct *mm,
+-					pte_t *pte) { }
++static inline void migration_entry_wait_huge(struct vm_area_struct *vma,
++		struct mm_struct *mm, pte_t *pte) { }
+ static inline int is_write_migration_entry(swp_entry_t entry)
+ {
+ 	return 0;
+* Unmerged path mm/hugetlb.c
+* Unmerged path mm/mempolicy.c
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 40c5b97e9161..7a63a64970b0 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -126,7 +126,7 @@ static int remove_migration_pte(struct page *new, struct vm_area_struct *vma,
+ 		ptep = huge_pte_offset(mm, addr);
+ 		if (!ptep)
+ 			goto out;
+-		ptl = &mm->page_table_lock;
++		ptl = huge_pte_lockptr(hstate_vma(vma), mm, ptep);
+ 	} else {
+ 		pmd = mm_find_pmd(mm, addr);
+ 		if (!pmd)
+@@ -243,9 +243,10 @@ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 	__migration_entry_wait(mm, ptep, ptl);
+ }
+ 
+-void migration_entry_wait_huge(struct mm_struct *mm, pte_t *pte)
++void migration_entry_wait_huge(struct vm_area_struct *vma,
++		struct mm_struct *mm, pte_t *pte)
+ {
+-	spinlock_t *ptl = &(mm)->page_table_lock;
++	spinlock_t *ptl = huge_pte_lockptr(hstate_vma(vma), mm, pte);
+ 	__migration_entry_wait(mm, pte, ptl);
+ }
+ 
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 0b69b98f9380..009a408797f9 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -601,7 +601,7 @@ pte_t *__page_check_address(struct page *page, struct mm_struct *mm,
+ 
+ 	if (unlikely(PageHuge(page))) {
+ 		pte = huge_pte_offset(mm, address);
+-		ptl = &mm->page_table_lock;
++		ptl = huge_pte_lockptr(page_hstate(page), mm, pte);
+ 		goto check;
+ 	}
+ 
