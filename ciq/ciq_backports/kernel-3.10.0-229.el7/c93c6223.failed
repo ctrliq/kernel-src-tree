@@ -1,0 +1,94 @@
+xprtrdma: Disconnect on registration failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] sunrpc/xprtrdma: Disconnect on registration failure (Steve Dickson) [1113248]
+Rebuild_FUZZ: 92.63%
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit c93c62231cf55df4a26bd08937efeea97e6fc5e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c93c6223.failed
+
+If rpcrdma_register_external() fails during request marshaling, the
+current RPC request is killed. Instead, this RPC should be retried
+after reconnecting the transport instance.
+
+The most likely reason for registration failure with FRMR is a
+failed post_send, which would be due to a remote transport
+disconnect or memory exhaustion. These issues can be recovered
+by a retry.
+
+Problems encountered in the marshaling logic itself will not be
+corrected by trying again, so these should still kill a request.
+
+Now that we've added a clean exit for marshaling errors, take the
+opportunity to defang some BUG_ON's.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit c93c62231cf55df4a26bd08937efeea97e6fc5e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index d8cf393c8eb6,693966d3f33b..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -201,12 -206,11 +206,16 @@@ rpcrdma_create_chunks(struct rpc_rqst *
+  		pos = target->head[0].iov_len;
+  
+  	nsegs = rpcrdma_convert_iovs(target, pos, type, seg, RPCRDMA_MAX_SEGS);
+- 	if (nsegs == 0)
+- 		return 0;
++ 	if (nsegs < 0)
++ 		return nsegs;
+  
+  	do {
+++<<<<<<< HEAD
+ +		/* bind/register the memory, then build chunk from result. */
+ +		int n = rpcrdma_register_external(seg, nsegs,
+++=======
++ 		n = rpcrdma_register_external(seg, nsegs,
+++>>>>>>> c93c62231cf5 (xprtrdma: Disconnect on registration failure)
+  						cur_wchunk != NULL, r_xprt);
+  		if (n <= 0)
+  			goto out;
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index ceedc17fa5c8..86855cf8a925 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -619,13 +619,12 @@ xprt_rdma_send_request(struct rpc_task *task)
+ 	struct rpc_xprt *xprt = rqst->rq_xprt;
+ 	struct rpcrdma_req *req = rpcr_to_rdmar(rqst);
+ 	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
++	int rc;
+ 
+-	/* marshal the send itself */
+-	if (req->rl_niovs == 0 && rpcrdma_marshal_req(rqst) != 0) {
+-		r_xprt->rx_stats.failed_marshal_count++;
+-		dprintk("RPC:       %s: rpcrdma_marshal_req failed\n",
+-			__func__);
+-		return -EIO;
++	if (req->rl_niovs == 0) {
++		rc = rpcrdma_marshal_req(rqst);
++		if (rc < 0)
++			goto failed_marshal;
+ 	}
+ 
+ 	if (req->rl_reply == NULL) 		/* e.g. reconnection */
+@@ -649,6 +648,12 @@ xprt_rdma_send_request(struct rpc_task *task)
+ 	rqst->rq_bytes_sent = 0;
+ 	return 0;
+ 
++failed_marshal:
++	r_xprt->rx_stats.failed_marshal_count++;
++	dprintk("RPC:       %s: rpcrdma_marshal_req failed, status %i\n",
++		__func__, rc);
++	if (rc == -EIO)
++		return -EIO;
+ drop_connection:
+ 	xprt_disconnect_done(xprt);
+ 	return -ENOTCONN;	/* implies disconnect */
