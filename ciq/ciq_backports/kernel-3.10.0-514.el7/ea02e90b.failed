@@ -1,0 +1,132 @@
+i40e: propagate properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mitch Williams <mitch.a.williams@intel.com>
+commit ea02e90b4b49782462d06a425e05c776909fbae4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ea02e90b.failed
+
+i40e_sync_vsi_filters() is the surly teenager of this driver. It says
+it's going to report errors, but it doesn't actually do that most of the
+time. And when it does, it leaves a mess.
+
+Change this function to have a common exit point so it will properly
+release the busy lock on the VSI. Propagate errors to the callers.
+Finally, adjust a few callers to check for and deal with errors from
+this function.
+
+Change-ID: Ic6af4956491e72402ebb3c538a3c31a0ad7f8667
+	Signed-off-by: Mitch Williams <mitch.a.williams@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit ea02e90b4b49782462d06a425e05c776909fbae4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 5c357c885661,c5a24fe98dbf..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1542,10 -1552,9 +1542,14 @@@ static int i40e_set_mac(struct net_devi
+  		spin_unlock_bh(&vsi->mac_filter_list_lock);
+  	}
+  
+ +	i40e_sync_vsi_filters(vsi, false);
+  	ether_addr_copy(netdev->dev_addr, addr->sa_data);
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	return i40e_sync_vsi_filters(vsi);
+++>>>>>>> ea02e90b4b49 (i40e: propagate properly)
+  }
+  
+  /**
+@@@ -2089,17 -2101,21 +2105,20 @@@ int i40e_sync_vsi_filters(struct i40e_v
+  	/* check for changes in promiscuous modes */
+  	if (changed_flags & IFF_ALLMULTI) {
+  		bool cur_multipromisc;
+ -
+  		cur_multipromisc = !!(vsi->current_netdev_flags & IFF_ALLMULTI);
+- 		ret = i40e_aq_set_vsi_multicast_promiscuous(&vsi->back->hw,
+- 							    vsi->seid,
+- 							    cur_multipromisc,
+- 							    NULL);
+- 		if (ret)
++ 		aq_ret = i40e_aq_set_vsi_multicast_promiscuous(&vsi->back->hw,
++ 							       vsi->seid,
++ 							       cur_multipromisc,
++ 							       NULL);
++ 		if (aq_ret) {
++ 			retval = i40e_aq_rc_to_posix(aq_ret,
++ 						     pf->hw.aq.asq_last_status);
+  			dev_info(&pf->pdev->dev,
+  				 "set multi promisc failed, err %s aq_err %s\n",
+- 				 i40e_stat_str(&pf->hw, ret),
++ 				 i40e_stat_str(&pf->hw, aq_ret),
+  				 i40e_aq_str(&pf->hw,
+  					     pf->hw.aq.asq_last_status));
++ 		}
+  	}
+  	if ((changed_flags & IFF_PROMISC) || promisc_forced_on) {
+  		bool cur_promisc;
+@@@ -2114,15 -2131,10 +2133,15 @@@
+  			 */
+  			if (pf->cur_promisc != cur_promisc) {
+  				pf->cur_promisc = cur_promisc;
+ -				set_bit(__I40E_PF_RESET_REQUESTED, &pf->state);
+ +				if (grab_rtnl)
+ +					i40e_do_reset_safe(pf,
+ +						BIT(__I40E_PF_RESET_REQUESTED));
+ +				else
+ +					i40e_do_reset(pf,
+ +						BIT(__I40E_PF_RESET_REQUESTED));
+  			}
+  		} else {
+- 			ret = i40e_aq_set_vsi_unicast_promiscuous(
++ 			aq_ret = i40e_aq_set_vsi_unicast_promiscuous(
+  							  &vsi->back->hw,
+  							  vsi->seid,
+  							  cur_promisc, NULL);
+diff --cc drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index c6da5ab76114,30a1d300c060..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@@ -1619,8 -1633,10 +1619,15 @@@ static int i40e_vc_add_mac_addr_msg(str
+  	spin_unlock_bh(&vsi->mac_filter_list_lock);
+  
+  	/* program the updated filter list */
+++<<<<<<< HEAD
+ +	if (i40e_sync_vsi_filters(vsi, false))
+ +		dev_err(&pf->pdev->dev, "Unable to program VF MAC filters\n");
+++=======
++ 	ret = i40e_sync_vsi_filters(vsi);
++ 	if (ret)
++ 		dev_err(&pf->pdev->dev, "Unable to program VF %d MAC filters, error %d\n",
++ 			vf->vf_id, ret);
+++>>>>>>> ea02e90b4b49 (i40e: propagate properly)
+  
+  error_param:
+  	/* send the response to the VF */
+@@@ -1672,8 -1688,10 +1679,15 @@@ static int i40e_vc_del_mac_addr_msg(str
+  	spin_unlock_bh(&vsi->mac_filter_list_lock);
+  
+  	/* program the updated filter list */
+++<<<<<<< HEAD
+ +	if (i40e_sync_vsi_filters(vsi, false))
+ +		dev_err(&pf->pdev->dev, "Unable to program VF MAC filters\n");
+++=======
++ 	ret = i40e_sync_vsi_filters(vsi);
++ 	if (ret)
++ 		dev_err(&pf->pdev->dev, "Unable to program VF %d MAC filters, error %d\n",
++ 			vf->vf_id, ret);
+++>>>>>>> ea02e90b4b49 (i40e: propagate properly)
+  
+  error_param:
+  	/* send the response to the VF */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
