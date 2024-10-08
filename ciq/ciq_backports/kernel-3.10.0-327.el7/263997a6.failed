@@ -1,0 +1,301 @@
+xfs: turn NLINK feature on by default
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 263997a6842b27a49f42bd795c5dd12242917b22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/263997a6.failed
+
+mkfs has turned on the XFS_SB_VERSION_NLINKBIT feature bit by
+default since November 2007. It's about time we simply made the
+kernel code turn it on by default and so always convert v1 inodes to
+v2 inodes when reading them in from disk or allocating them. This
+This removes needless version checks and modification when bumping
+link counts on inodes, and will take code out of a few common code
+paths.
+
+   text    data     bss     dec     hex filename
+ 783251  100867     616  884734   d7ffe fs/xfs/xfs.o.orig
+ 782664  100867     616  884147   d7db3 fs/xfs/xfs.o.patched
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 263997a6842b27a49f42bd795c5dd12242917b22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/xfs_inode.c
+index 4a2cda2c661c,9731977be528..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -1114,22 -1069,10 +1067,14 @@@ xfs_bumplink
+  {
+  	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
+  
+++<<<<<<< HEAD
+ +	ASSERT(ip->i_d.di_nlink > 0);
+++=======
++ 	ASSERT(ip->i_d.di_version > 1);
++ 	ASSERT(ip->i_d.di_nlink > 0 || (VFS_I(ip)->i_state & I_LINKABLE));
+++>>>>>>> 263997a6842b (xfs: turn NLINK feature on by default)
+  	ip->i_d.di_nlink++;
+  	inc_nlink(VFS_I(ip));
+- 	if ((ip->i_d.di_version == 1) &&
+- 	    (ip->i_d.di_nlink > XFS_MAXLINK_1)) {
+- 		/*
+- 		 * The inode has increased its number of links beyond
+- 		 * what can fit in an old format inode.  It now needs
+- 		 * to be converted to a version 2 inode with a 32 bit
+- 		 * link count.  If this is the first inode in the file
+- 		 * system to do this, then we need to bump the superblock
+- 		 * version number as well.
+- 		 */
+- 		xfs_bump_ino_vers2(tp, ip);
+- 	}
+- 
+  	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+  	return 0;
+  }
+@@@ -3250,40 -3283,9 +3196,44 @@@ xfs_iflush_int
+  	if (ip->i_d.di_flushiter == DI_MAX_FLUSH)
+  		ip->i_d.di_flushiter = 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If this is really an old format inode and the superblock version
+ +	 * has not been updated to support only new format inodes, then
+ +	 * convert back to the old inode format.  If the superblock version
+ +	 * has been updated, then make the conversion permanent.
+ +	 */
+ +	ASSERT(ip->i_d.di_version == 1 || xfs_sb_version_hasnlink(&mp->m_sb));
+ +	if (ip->i_d.di_version == 1) {
+ +		if (!xfs_sb_version_hasnlink(&mp->m_sb)) {
+ +			/*
+ +			 * Convert it back.
+ +			 */
+ +			ASSERT(ip->i_d.di_nlink <= XFS_MAXLINK_1);
+ +			dip->di_onlink = cpu_to_be16(ip->i_d.di_nlink);
+ +		} else {
+ +			/*
+ +			 * The superblock version has already been bumped,
+ +			 * so just make the conversion to the new inode
+ +			 * format permanent.
+ +			 */
+ +			ip->i_d.di_version = 2;
+ +			dip->di_version = 2;
+ +			ip->i_d.di_onlink = 0;
+ +			dip->di_onlink = 0;
+ +			memset(&(ip->i_d.di_pad[0]), 0, sizeof(ip->i_d.di_pad));
+ +			memset(&(dip->di_pad[0]), 0,
+ +			      sizeof(dip->di_pad));
+ +			ASSERT(xfs_get_projid(ip) == 0);
+ +		}
+ +	}
+ +
+ +	xfs_iflush_fork(ip, dip, iip, XFS_DATA_FORK);
+++=======
++ 	xfs_iflush_fork(ip, dip, iip, XFS_DATA_FORK, bp);
+++>>>>>>> 263997a6842b (xfs: turn NLINK feature on by default)
+  	if (XFS_IFORK_Q(ip))
+ -		xfs_iflush_fork(ip, dip, iip, XFS_ATTR_FORK, bp);
+ +		xfs_iflush_fork(ip, dip, iip, XFS_ATTR_FORK);
+  	xfs_inobp_check(mp, bp);
+  
+  	/*
+diff --git a/fs/xfs/xfs_fsops.c b/fs/xfs/xfs_fsops.c
+index 3445ead7c1fc..2a03f2d48e81 100644
+--- a/fs/xfs/xfs_fsops.c
++++ b/fs/xfs/xfs_fsops.c
+@@ -74,11 +74,9 @@ xfs_fs_geometry(
+ 	}
+ 	if (new_version >= 3) {
+ 		geo->version = XFS_FSOP_GEOM_VERSION;
+-		geo->flags =
++		geo->flags = XFS_FSOP_GEOM_FLAGS_NLINK |
+ 			(xfs_sb_version_hasattr(&mp->m_sb) ?
+ 				XFS_FSOP_GEOM_FLAGS_ATTR : 0) |
+-			(xfs_sb_version_hasnlink(&mp->m_sb) ?
+-				XFS_FSOP_GEOM_FLAGS_NLINK : 0) |
+ 			(xfs_sb_version_hasquota(&mp->m_sb) ?
+ 				XFS_FSOP_GEOM_FLAGS_QUOTA : 0) |
+ 			(xfs_sb_version_hasalign(&mp->m_sb) ?
+diff --git a/fs/xfs/xfs_ialloc.c b/fs/xfs/xfs_ialloc.c
+index fedaf58e322a..98b7daf33c9a 100644
+--- a/fs/xfs/xfs_ialloc.c
++++ b/fs/xfs/xfs_ialloc.c
+@@ -280,10 +280,8 @@ xfs_ialloc_inode_init(
+ 		if (tp)
+ 			xfs_icreate_log(tp, agno, agbno, mp->m_ialloc_inos,
+ 					mp->m_sb.sb_inodesize, length, gen);
+-	} else if (xfs_sb_version_hasnlink(&mp->m_sb))
++	} else
+ 		version = 2;
+-	else
+-		version = 1;
+ 
+ 	for (j = 0; j < nbufs; j++) {
+ 		/*
+* Unmerged path fs/xfs/xfs_inode.c
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 5a7f81a958cd..a0b94aa7d9b1 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -377,7 +377,6 @@ int		xfs_dir_ialloc(struct xfs_trans **, struct xfs_inode *, umode_t,
+ 			       struct xfs_inode **, int *);
+ int		xfs_droplink(struct xfs_trans *, struct xfs_inode *);
+ int		xfs_bumplink(struct xfs_trans *, struct xfs_inode *);
+-void		xfs_bump_ino_vers2(struct xfs_trans *, struct xfs_inode *);
+ 
+ /* from xfs_file.c */
+ int		xfs_zero_eof(struct xfs_inode *, xfs_off_t, xfs_fsize_t);
+diff --git a/fs/xfs/xfs_inode_buf.c b/fs/xfs/xfs_inode_buf.c
+index 24e993996bdc..cb35ae41d4a1 100644
+--- a/fs/xfs/xfs_inode_buf.c
++++ b/fs/xfs/xfs_inode_buf.c
+@@ -437,17 +437,16 @@ xfs_iread(
+ 	}
+ 
+ 	/*
+-	 * The inode format changed when we moved the link count and
+-	 * made it 32 bits long.  If this is an old format inode,
+-	 * convert it in memory to look like a new one.  If it gets
+-	 * flushed to disk we will convert back before flushing or
+-	 * logging it.  We zero out the new projid field and the old link
+-	 * count field.  We'll handle clearing the pad field (the remains
+-	 * of the old uuid field) when we actually convert the inode to
+-	 * the new format. We don't change the version number so that we
+-	 * can distinguish this from a real new format inode.
++	 * Automatically convert version 1 inode formats in memory to version 2
++	 * inode format. If the inode is modified, it will get logged and
++	 * rewritten as a version 2 inode. We can do this because we set the
++	 * superblock feature bit for v2 inodes unconditionally during mount
++	 * and it means the reast of the code can assume the inode version is 2
++	 * or higher.
+ 	 */
+ 	if (ip->i_d.di_version == 1) {
++		ip->i_d.di_version = 2;
++		memset(&(ip->i_d.di_pad[0]), 0, sizeof(ip->i_d.di_pad));
+ 		ip->i_d.di_nlink = ip->i_d.di_onlink;
+ 		ip->i_d.di_onlink = 0;
+ 		xfs_set_projid(ip, 0);
+diff --git a/fs/xfs/xfs_inode_item.c b/fs/xfs/xfs_inode_item.c
+index 686889b4a1e5..a640137b3573 100644
+--- a/fs/xfs/xfs_inode_item.c
++++ b/fs/xfs/xfs_inode_item.c
+@@ -145,34 +145,6 @@ xfs_inode_item_size(
+ 		xfs_inode_item_attr_fork_size(iip, nvecs, nbytes);
+ }
+ 
+-/*
+- * If this is a v1 format inode, then we need to log it as such.  This means
+- * that we have to copy the link count from the new field to the old.  We
+- * don't have to worry about the new fields, because nothing trusts them as
+- * long as the old inode version number is there.
+- */
+-STATIC void
+-xfs_inode_item_format_v1_inode(
+-	struct xfs_inode	*ip)
+-{
+-	if (!xfs_sb_version_hasnlink(&ip->i_mount->m_sb)) {
+-		/*
+-		 * Convert it back.
+-		 */
+-		ASSERT(ip->i_d.di_nlink <= XFS_MAXLINK_1);
+-		ip->i_d.di_onlink = ip->i_d.di_nlink;
+-	} else {
+-		/*
+-		 * The superblock version has already been bumped,
+-		 * so just make the conversion to the new inode
+-		 * format permanent.
+-		 */
+-		ip->i_d.di_version = 2;
+-		ip->i_d.di_onlink = 0;
+-		memset(&(ip->i_d.di_pad[0]), 0, sizeof(ip->i_d.di_pad));
+-	}
+-}
+-
+ STATIC void
+ xfs_inode_item_format_data_fork(
+ 	struct xfs_inode_log_item *iip,
+@@ -370,6 +342,8 @@ xfs_inode_item_format(
+ 	struct xfs_inode_log_format *ilf;
+ 	struct xfs_log_iovec	*vecp = NULL;
+ 
++	ASSERT(ip->i_d.di_version > 1);
++
+ 	ilf = xlog_prepare_iovec(lv, &vecp, XLOG_REG_TYPE_IFORMAT);
+ 	ilf->ilf_type = XFS_LI_INODE;
+ 	ilf->ilf_ino = ip->i_ino;
+@@ -380,8 +354,6 @@ xfs_inode_item_format(
+ 	ilf->ilf_size = 2; /* format + core */
+ 	xlog_finish_iovec(lv, vecp, sizeof(struct xfs_inode_log_format));
+ 
+-	if (ip->i_d.di_version == 1)
+-		xfs_inode_item_format_v1_inode(ip);
+ 	xlog_copy_iovec(lv, &vecp, XLOG_REG_TYPE_ICORE,
+ 			&ip->i_d,
+ 			xfs_icdinode_size(ip->i_d.di_version));
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index c01d09b8b9c4..35504ad77a2f 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -1254,15 +1254,8 @@ xfs_ioctl_setattr(
+ 				olddquot = xfs_qm_vop_chown(tp, ip,
+ 							&ip->i_pdquot, pdqp);
+ 			}
++			ASSERT(ip->i_d.di_version > 1);
+ 			xfs_set_projid(ip, fa->fsx_projid);
+-
+-			/*
+-			 * We may have to rev the inode as well as
+-			 * the superblock version number since projids didn't
+-			 * exist before DINODE_VERSION_2 and SB_VERSION_NLINK.
+-			 */
+-			if (ip->i_d.di_version == 1)
+-				xfs_bump_ino_vers2(tp, ip);
+ 		}
+ 
+ 	}
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index fa9703bc06c7..89c5276c8cb4 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -707,6 +707,12 @@ xfs_mountfs(
+ 			mp->m_update_flags |= XFS_SB_VERSIONNUM;
+ 	}
+ 
++	/* always use v2 inodes by default now */
++	if (!(mp->m_sb.sb_versionnum & XFS_SB_VERSION_NLINKBIT)) {
++		mp->m_sb.sb_versionnum |= XFS_SB_VERSION_NLINKBIT;
++		mp->m_update_flags |= XFS_SB_VERSIONNUM;
++	}
++
+ 	/*
+ 	 * Check if sb_agblocks is aligned at stripe boundary
+ 	 * If sb_agblocks is NOT aligned turn off m_dalign since
+diff --git a/fs/xfs/xfs_sb.h b/fs/xfs/xfs_sb.h
+index 9e6a3d51a942..b5e7d0a24009 100644
+--- a/fs/xfs/xfs_sb.h
++++ b/fs/xfs/xfs_sb.h
+@@ -376,16 +376,6 @@ static inline void xfs_sb_version_addattr(struct xfs_sb *sbp)
+ 	sbp->sb_versionnum |= XFS_SB_VERSION_ATTRBIT;
+ }
+ 
+-static inline bool xfs_sb_version_hasnlink(struct xfs_sb *sbp)
+-{
+-	return (sbp->sb_versionnum & XFS_SB_VERSION_NLINKBIT);
+-}
+-
+-static inline void xfs_sb_version_addnlink(struct xfs_sb *sbp)
+-{
+-	sbp->sb_versionnum |= XFS_SB_VERSION_NLINKBIT;
+-}
+-
+ static inline bool xfs_sb_version_hasquota(struct xfs_sb *sbp)
+ {
+ 	return (sbp->sb_versionnum & XFS_SB_VERSION_QUOTABIT);
