@@ -1243,7 +1243,10 @@ static __initconst const u64 slm_hw_cache_event_ids
  },
 };
 
-static void intel_pmu_disable_all(void)
+/*
+ * Use from PMIs where the LBRs are already disabled.
+ */
+static void __intel_pmu_disable_all(void)
 {
 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
 
@@ -1253,15 +1256,20 @@ static void intel_pmu_disable_all(void)
 		intel_pmu_disable_bts();
 
 	intel_pmu_pebs_disable_all();
+}
+
+static void intel_pmu_disable_all(void)
+{
+	__intel_pmu_disable_all();
 	intel_pmu_lbr_disable_all();
 }
 
-static void intel_pmu_enable_all(int added)
+static void __intel_pmu_enable_all(int added, bool pmi)
 {
 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
 
 	intel_pmu_pebs_enable_all();
-	intel_pmu_lbr_enable_all();
+	intel_pmu_lbr_enable_all(pmi);
 	wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL,
 			x86_pmu.intel_ctrl & ~cpuc->intel_ctrl_guest_mask);
 
@@ -1274,6 +1282,11 @@ static void intel_pmu_enable_all(int added)
 
 		intel_pmu_enable_bts(event->hw.config);
 	}
+}
+
+static void intel_pmu_enable_all(int added)
+{
+	__intel_pmu_enable_all(added, false);
 }
 
 /*
@@ -1569,7 +1582,7 @@ static int intel_pmu_handle_irq(struct pt_regs *regs)
 	 */
 	if (!x86_pmu.late_ack)
 		apic_write(APIC_LVTPC, APIC_DM_NMI);
-	intel_pmu_disable_all();
+	__intel_pmu_disable_all();
 	handled = intel_pmu_drain_bts_buffer();
 	status = intel_pmu_get_status();
 	if (!status)
@@ -1642,7 +1655,7 @@ again:
 		goto again;
 
 done:
-	intel_pmu_enable_all(0);
+	__intel_pmu_enable_all(0, true);
 	/*
 	 * Only unmask the NMI after the overflow counters
 	 * have been reset. This avoids spurious NMIs on
