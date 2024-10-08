@@ -885,19 +885,15 @@ static void vhost_scsi_handle_vq(struct vhost_scsi *vs,
 	int head, ret;
 	u8 target;
 
+	mutex_lock(&vq->mutex);
 	/*
 	 * We can handle the vq only after the endpoint is setup by calling the
 	 * VHOST_SCSI_SET_ENDPOINT ioctl.
-	 *
-	 * TODO: Check that we are running from vhost_worker which acts
-	 * as read-side critical section for vhost kind of RCU.
-	 * See the comments in struct vhost_virtqueue in drivers/vhost/vhost.h
 	 */
-	vs_tpg = rcu_dereference_check(vq->private_data, 1);
+	vs_tpg = vq->private_data;
 	if (!vs_tpg)
-		return;
+		goto out;
 
-	mutex_lock(&vq->mutex);
 	vhost_disable_notify(&vs->dev, vq);
 
 	for (;;) {
@@ -1047,6 +1043,7 @@ err_free:
 	vhost_scsi_free_cmd(tv_cmd);
 err_cmd:
 	vhost_scsi_send_bad_target(vs, vq, head, out);
+out:
 	mutex_unlock(&vq->mutex);
 }
 
