@@ -1,0 +1,182 @@
+perf tools: Apply percent-limit to cumulative percentage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf: Apply percent-limit to cumulative percentage (Jiri Olsa) [1134356]
+Rebuild_FUZZ: 94.34%
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 14135663f1d770bb057f8bf345e5436c985eb29c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/14135663.failed
+
+If -g cumulative option is given, it needs to show entries which don't
+have self overhead.  So apply percent-limit to accumulated overhead
+percentage in this case.
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Tested-by: Arun Sharma <asharma@fb.com>
+	Tested-by: Rodrigo Campos <rodrigo@sdfg.com.ar>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Link: http://lkml.kernel.org/r/1401335910-16832-14-git-send-email-namhyung@kernel.org
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+(cherry picked from commit 14135663f1d770bb057f8bf345e5436c985eb29c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/ui/browsers/hists.c
+diff --cc tools/perf/ui/browsers/hists.c
+index 9c27e35401c5,5905acde5f1d..000000000000
+--- a/tools/perf/ui/browsers/hists.c
++++ b/tools/perf/ui/browsers/hists.c
+@@@ -35,6 -36,26 +35,29 @@@ static int hists__browser_title(struct 
+  				const char *ev_name);
+  static void hist_browser__update_nr_entries(struct hist_browser *hb);
+  
+++<<<<<<< HEAD
+++=======
++ static struct rb_node *hists__filter_entries(struct rb_node *nd,
++ 					     float min_pcnt);
++ 
++ static bool hist_browser__has_filter(struct hist_browser *hb)
++ {
++ 	return hists__has_filter(hb->hists) || hb->min_pcnt;
++ }
++ 
++ static u32 hist_browser__nr_entries(struct hist_browser *hb)
++ {
++ 	u32 nr_entries;
++ 
++ 	if (hist_browser__has_filter(hb))
++ 		nr_entries = hb->nr_non_filtered_entries;
++ 	else
++ 		nr_entries = hb->hists->nr_entries;
++ 
++ 	return nr_entries + hb->nr_callchain_rows;
++ }
++ 
+++>>>>>>> 14135663f1d7 (perf tools: Apply percent-limit to cumulative percentage)
+  static void hist_browser__refresh_dimensions(struct hist_browser *browser)
+  {
+  	/* 3 == +/- toggle symbol before actual hist_entry rendering */
+@@@ -281,16 -311,18 +304,22 @@@ static void hist_entry__set_folding(str
+  		he->nr_rows = 0;
+  }
+  
+ -static void
+ -__hist_browser__set_folding(struct hist_browser *browser, bool unfold)
+ +static void hists__set_folding(struct hists *hists, bool unfold)
+  {
+  	struct rb_node *nd;
+ -	struct hists *hists = browser->hists;
+  
+++<<<<<<< HEAD
+ +	hists->nr_entries = 0;
+ +
+ +	for (nd = rb_first(&hists->entries); nd; nd = rb_next(nd)) {
+++=======
++ 	for (nd = rb_first(&hists->entries);
++ 	     (nd = hists__filter_entries(nd, browser->min_pcnt)) != NULL;
++ 	     nd = rb_next(nd)) {
+++>>>>>>> 14135663f1d7 (perf tools: Apply percent-limit to cumulative percentage)
+  		struct hist_entry *he = rb_entry(nd, struct hist_entry, rb_node);
+  		hist_entry__set_folding(he, unfold);
+ -		browser->nr_callchain_rows += he->nr_rows;
+ +		hists->nr_entries += 1 + he->nr_rows;
+  	}
+  }
+  
+@@@ -1358,8 -1375,12 +1371,17 @@@ static void hist_browser__update_nr_ent
+  	u64 nr_entries = 0;
+  	struct rb_node *nd = rb_first(&hb->hists->entries);
+  
+++<<<<<<< HEAD
+ +	while ((nd = hists__filter_entries(nd, hb->hists,
+ +					   hb->min_pcnt)) != NULL) {
+++=======
++ 	if (hb->min_pcnt == 0) {
++ 		hb->nr_non_filtered_entries = hb->hists->nr_non_filtered_entries;
++ 		return;
++ 	}
++ 
++ 	while ((nd = hists__filter_entries(nd, hb->min_pcnt)) != NULL) {
+++>>>>>>> 14135663f1d7 (perf tools: Apply percent-limit to cumulative percentage)
+  		nr_entries++;
+  		nd = rb_next(nd);
+  	}
+* Unmerged path tools/perf/ui/browsers/hists.c
+diff --git a/tools/perf/ui/gtk/hists.c b/tools/perf/ui/gtk/hists.c
+index ca5ff608c814..e1faf3cbd135 100644
+--- a/tools/perf/ui/gtk/hists.c
++++ b/tools/perf/ui/gtk/hists.c
+@@ -223,14 +223,12 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
+ 		struct hist_entry *h = rb_entry(nd, struct hist_entry, rb_node);
+ 		GtkTreeIter iter;
+ 		u64 total = hists__total_period(h->hists);
+-		float percent = 0.0;
++		float percent;
+ 
+ 		if (h->filtered)
+ 			continue;
+ 
+-		if (total)
+-			percent = h->stat.period * 100.0 / total;
+-
++		percent = hist_entry__get_percent_limit(h);
+ 		if (percent < min_pcnt)
+ 			continue;
+ 
+diff --git a/tools/perf/ui/stdio/hist.c b/tools/perf/ui/stdio/hist.c
+index f3a923a35b97..0a2869676df3 100644
+--- a/tools/perf/ui/stdio/hist.c
++++ b/tools/perf/ui/stdio/hist.c
+@@ -461,12 +461,12 @@ print_entries:
+ 
+ 	for (nd = rb_first(&hists->entries); nd; nd = rb_next(nd)) {
+ 		struct hist_entry *h = rb_entry(nd, struct hist_entry, rb_node);
+-		float percent = h->stat.period * 100.0 /
+-					hists->stats.total_period;
++		float percent;
+ 
+ 		if (h->filtered)
+ 			continue;
+ 
++		percent = hist_entry__get_percent_limit(h);
+ 		if (percent < min_pcnt)
+ 			continue;
+ 
+diff --git a/tools/perf/util/sort.h b/tools/perf/util/sort.h
+index d43ebef70364..1e92e034e020 100644
+--- a/tools/perf/util/sort.h
++++ b/tools/perf/util/sort.h
+@@ -20,7 +20,7 @@
+ 
+ #include "parse-options.h"
+ #include "parse-events.h"
+-
++#include "hist.h"
+ #include "thread.h"
+ 
+ extern regex_t parent_regex;
+@@ -129,6 +129,21 @@ static inline void hist_entry__add_pair(struct hist_entry *pair,
+ 	list_add_tail(&pair->pairs.node, &he->pairs.head);
+ }
+ 
++static inline float hist_entry__get_percent_limit(struct hist_entry *he)
++{
++	u64 period = he->stat.period;
++	u64 total_period = hists__total_period(he->hists);
++
++	if (unlikely(total_period == 0))
++		return 0;
++
++	if (symbol_conf.cumulate_callchain)
++		period = he->stat_acc->period;
++
++	return period * 100.0 / total_period;
++}
++
++
+ enum sort_mode {
+ 	SORT_MODE__NORMAL,
+ 	SORT_MODE__BRANCH,
