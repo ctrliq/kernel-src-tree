@@ -1,0 +1,207 @@
+x86/efi: Delete superfluous global variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [x86] efi: Delete superfluous global variables (Dave Young) [1080109]
+Rebuild_FUZZ: 95.24%
+commit-author Matt Fleming <matt.fleming@intel.com>
+commit 518548abd61808ea1e31614ccbdae34d3c32dfa4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/518548ab.failed
+
+There's no need to save the runtime map details in global variables, the
+values are only required to pass to efi_runtime_map_setup().
+
+And because 'nr_efi_runtime_map' isn't needed, get_nr_runtime_map() can
+be deleted along with 'efi_data_len'.
+
+	Cc: Dave Young <dyoung@redhat.com>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 518548abd61808ea1e31614ccbdae34d3c32dfa4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi.c
+#	arch/x86/platform/efi/efi_64.c
+diff --cc arch/x86/platform/efi/efi.c
+index 4ba4bd5dfe10,7ed3ecfde98a..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -74,6 -76,8 +74,11 @@@ static __initdata efi_config_table_type
+  	{NULL_GUID, NULL, NULL},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ u64 efi_setup;		/* efi setup_data physical address */
++ 
+++>>>>>>> 518548abd618 (x86/efi: Delete superfluous global variables)
+  /*
+   * Returns 1 if 'facility' is enabled, 0 otherwise.
+   */
+@@@ -626,6 -643,62 +631,65 @@@ static int __init efi_memmap_init(void
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * A number of config table entries get remapped to virtual addresses
++  * after entering EFI virtual mode. However, the kexec kernel requires
++  * their physical addresses therefore we pass them via setup_data and
++  * correct those entries to their respective physical addresses here.
++  *
++  * Currently only handles smbios which is necessary for some firmware
++  * implementation.
++  */
++ static int __init efi_reuse_config(u64 tables, int nr_tables)
++ {
++ 	int i, sz, ret = 0;
++ 	void *p, *tablep;
++ 	struct efi_setup_data *data;
++ 
++ 	if (!efi_setup)
++ 		return 0;
++ 
++ 	if (!efi_enabled(EFI_64BIT))
++ 		return 0;
++ 
++ 	data = early_memremap(efi_setup, sizeof(*data));
++ 	if (!data) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	if (!data->smbios)
++ 		goto out_memremap;
++ 
++ 	sz = sizeof(efi_config_table_64_t);
++ 
++ 	p = tablep = early_memremap(tables, nr_tables * sz);
++ 	if (!p) {
++ 		pr_err("Could not map Configuration table!\n");
++ 		ret = -ENOMEM;
++ 		goto out_memremap;
++ 	}
++ 
++ 	for (i = 0; i < efi.systab->nr_tables; i++) {
++ 		efi_guid_t guid;
++ 
++ 		guid = ((efi_config_table_64_t *)p)->guid;
++ 
++ 		if (!efi_guidcmp(guid, SMBIOS_TABLE_GUID))
++ 			((efi_config_table_64_t *)p)->table = data->smbios;
++ 		p += sz;
++ 	}
++ 	early_iounmap(tablep, nr_tables * sz);
++ 
++ out_memremap:
++ 	early_iounmap(data, sizeof(*data));
++ out:
++ 	return ret;
++ }
++ 
+++>>>>>>> 518548abd618 (x86/efi: Delete superfluous global variables)
+  void __init efi_init(void)
+  {
+  	efi_char16_t *c16;
+@@@ -804,6 -882,77 +868,80 @@@ void __init efi_enter_virtual_mode(void
+  		}
+  		prev_md = md;
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static void __init get_systab_virt_addr(efi_memory_desc_t *md)
++ {
++ 	unsigned long size;
++ 	u64 end, systab;
++ 
++ 	size = md->num_pages << EFI_PAGE_SHIFT;
++ 	end = md->phys_addr + size;
++ 	systab = (u64)(unsigned long)efi_phys.systab;
++ 	if (md->phys_addr <= systab && systab < end) {
++ 		systab += md->virt_addr - md->phys_addr;
++ 		efi.systab = (efi_system_table_t *)(unsigned long)systab;
++ 	}
++ }
++ 
++ static int __init save_runtime_map(void)
++ {
++ 	efi_memory_desc_t *md;
++ 	void *tmp, *p, *q = NULL;
++ 	int count = 0;
++ 
++ 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
++ 		md = p;
++ 
++ 		if (!(md->attribute & EFI_MEMORY_RUNTIME) ||
++ 		    (md->type == EFI_BOOT_SERVICES_CODE) ||
++ 		    (md->type == EFI_BOOT_SERVICES_DATA))
++ 			continue;
++ 		tmp = krealloc(q, (count + 1) * memmap.desc_size, GFP_KERNEL);
++ 		if (!tmp)
++ 			goto out;
++ 		q = tmp;
++ 
++ 		memcpy(q + count * memmap.desc_size, md, memmap.desc_size);
++ 		count++;
++ 	}
++ 
++ 	efi_runtime_map_setup(q, count, memmap.desc_size);
++ 
++ 	return 0;
++ out:
++ 	kfree(q);
++ 	return -ENOMEM;
++ }
++ 
++ /*
++  * Map efi regions which were passed via setup_data. The virt_addr is a fixed
++  * addr which was used in first kernel of a kexec boot.
++  */
++ static void __init efi_map_regions_fixed(void)
++ {
++ 	void *p;
++ 	efi_memory_desc_t *md;
++ 
++ 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
++ 		md = p;
++ 		efi_map_region_fixed(md); /* FIXME: add error handling */
++ 		get_systab_virt_addr(md);
++ 	}
++ 
++ }
++ 
++ /*
++  * Map efi memory ranges for runtime serivce and update new_memmap with virtual
++  * addresses.
++  */
++ static void * __init efi_map_regions(int *count)
++ {
++ 	efi_memory_desc_t *md;
++ 	void *p, *tmp, *new_memmap = NULL;
+++>>>>>>> 518548abd618 (x86/efi: Delete superfluous global variables)
+  
+  	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
+  		md = p;
+diff --cc arch/x86/platform/efi/efi_64.c
+index 39a0e7f1f0a3,6284f158a47d..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -113,3 -228,8 +113,11 @@@ void __iomem *__init efi_ioremap(unsign
+  
+  	return (void __iomem *)__va(phys_addr);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void __init parse_efi_setup(u64 phys_addr, u32 data_len)
++ {
++ 	efi_setup = phys_addr + sizeof(struct setup_data);
++ }
+++>>>>>>> 518548abd618 (x86/efi: Delete superfluous global variables)
+* Unmerged path arch/x86/platform/efi/efi.c
+* Unmerged path arch/x86/platform/efi/efi_64.c
