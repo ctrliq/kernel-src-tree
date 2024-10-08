@@ -57,10 +57,10 @@ int ovs_vport_send(struct vport *, struct sk_buff *);
 /* The following definitions are for implementers of vport devices: */
 
 struct vport_err_stats {
-	u64 rx_dropped;
-	u64 rx_errors;
-	u64 tx_dropped;
-	u64 tx_errors;
+	atomic_long_t rx_dropped;
+	atomic_long_t rx_errors;
+	atomic_long_t tx_dropped;
+	atomic_long_t tx_errors;
 };
 
 /**
@@ -74,7 +74,6 @@ struct vport_err_stats {
  * @dp_hash_node: Element in @datapath->ports hash table in datapath.c.
  * @ops: Class structure.
  * @percpu_stats: Points to per-CPU statistics used and maintained by vport
- * @stats_lock: Protects @err_stats;
  * @err_stats: Points to error statistics used and maintained by vport
  */
 struct vport {
@@ -89,7 +88,6 @@ struct vport {
 
 	struct pcpu_tstats __percpu *percpu_stats;
 
-	spinlock_t stats_lock;
 	struct vport_err_stats err_stats;
 };
 
