@@ -1,0 +1,612 @@
+genetlink: make all genl_ops users const
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 4534de8305b3f1460a527a0cda0e3dc2224c6f0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4534de83.failed
+
+Now that genl_ops are no longer modified in place when
+registering, they can be made const. This patch was done
+mostly with spatch:
+
+@@
+identifier ops;
+@@
++const
+ struct genl_ops ops[] = {
+ ...
+ };
+
+(except the struct thing in net/openvswitch/datapath.c)
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4534de8305b3f1460a527a0cda0e3dc2224c6f0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/hsr/hsr_netlink.c
+#	net/nfc/netlink.c
+#	net/wimax/stack.c
+diff --cc net/nfc/netlink.c
+index f0c4d61f37c0,f5585611c098..000000000000
+--- a/net/nfc/netlink.c
++++ b/net/nfc/netlink.c
+@@@ -1025,7 -1090,281 +1025,285 @@@ exit
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static struct genl_ops nfc_genl_ops[] = {
+++=======
++ static int nfc_genl_fw_download(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	int rc;
++ 	u32 idx;
++ 	char firmware_name[NFC_FIRMWARE_NAME_MAXSIZE + 1];
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX])
++ 		return -EINVAL;
++ 
++ 	idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 
++ 	dev = nfc_get_device(idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	nla_strlcpy(firmware_name, info->attrs[NFC_ATTR_FIRMWARE_NAME],
++ 		    sizeof(firmware_name));
++ 
++ 	rc = nfc_fw_download(dev, firmware_name);
++ 
++ 	nfc_put_device(dev);
++ 	return rc;
++ }
++ 
++ int nfc_genl_fw_download_done(struct nfc_dev *dev, const char *firmware_name,
++ 			      u32 result)
++ {
++ 	struct sk_buff *msg;
++ 	void *hdr;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 
++ 	hdr = genlmsg_put(msg, 0, 0, &nfc_genl_family, 0,
++ 			  NFC_CMD_FW_DOWNLOAD);
++ 	if (!hdr)
++ 		goto free_msg;
++ 
++ 	if (nla_put_string(msg, NFC_ATTR_FIRMWARE_NAME, firmware_name) ||
++ 	    nla_put_u32(msg, NFC_ATTR_FIRMWARE_DOWNLOAD_STATUS, result) ||
++ 	    nla_put_u32(msg, NFC_ATTR_DEVICE_INDEX, dev->idx))
++ 		goto nla_put_failure;
++ 
++ 	genlmsg_end(msg, hdr);
++ 
++ 	genlmsg_multicast(msg, 0, nfc_genl_event_mcgrp.id, GFP_KERNEL);
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ free_msg:
++ 	nlmsg_free(msg);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int nfc_genl_enable_se(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	int rc;
++ 	u32 idx, se_idx;
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_INDEX])
++ 		return -EINVAL;
++ 
++ 	idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 	se_idx = nla_get_u32(info->attrs[NFC_ATTR_SE_INDEX]);
++ 
++ 	dev = nfc_get_device(idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	rc = nfc_enable_se(dev, se_idx);
++ 
++ 	nfc_put_device(dev);
++ 	return rc;
++ }
++ 
++ static int nfc_genl_disable_se(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	int rc;
++ 	u32 idx, se_idx;
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_INDEX])
++ 		return -EINVAL;
++ 
++ 	idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 	se_idx = nla_get_u32(info->attrs[NFC_ATTR_SE_INDEX]);
++ 
++ 	dev = nfc_get_device(idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	rc = nfc_disable_se(dev, se_idx);
++ 
++ 	nfc_put_device(dev);
++ 	return rc;
++ }
++ 
++ static int nfc_genl_send_se(struct sk_buff *msg, struct nfc_dev *dev,
++ 				u32 portid, u32 seq,
++ 				struct netlink_callback *cb,
++ 				int flags)
++ {
++ 	void *hdr;
++ 	struct nfc_se *se, *n;
++ 
++ 	list_for_each_entry_safe(se, n, &dev->secure_elements, list) {
++ 		hdr = genlmsg_put(msg, portid, seq, &nfc_genl_family, flags,
++ 				  NFC_CMD_GET_SE);
++ 		if (!hdr)
++ 			goto nla_put_failure;
++ 
++ 		if (cb)
++ 			genl_dump_check_consistent(cb, hdr, &nfc_genl_family);
++ 
++ 		if (nla_put_u32(msg, NFC_ATTR_DEVICE_INDEX, dev->idx) ||
++ 		    nla_put_u32(msg, NFC_ATTR_SE_INDEX, se->idx) ||
++ 		    nla_put_u8(msg, NFC_ATTR_SE_TYPE, se->type))
++ 			goto nla_put_failure;
++ 
++ 		if (genlmsg_end(msg, hdr) < 0)
++ 			goto nla_put_failure;
++ 	}
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int nfc_genl_dump_ses(struct sk_buff *skb,
++ 				 struct netlink_callback *cb)
++ {
++ 	struct class_dev_iter *iter = (struct class_dev_iter *) cb->args[0];
++ 	struct nfc_dev *dev = (struct nfc_dev *) cb->args[1];
++ 	bool first_call = false;
++ 
++ 	if (!iter) {
++ 		first_call = true;
++ 		iter = kmalloc(sizeof(struct class_dev_iter), GFP_KERNEL);
++ 		if (!iter)
++ 			return -ENOMEM;
++ 		cb->args[0] = (long) iter;
++ 	}
++ 
++ 	mutex_lock(&nfc_devlist_mutex);
++ 
++ 	cb->seq = nfc_devlist_generation;
++ 
++ 	if (first_call) {
++ 		nfc_device_iter_init(iter);
++ 		dev = nfc_device_iter_next(iter);
++ 	}
++ 
++ 	while (dev) {
++ 		int rc;
++ 
++ 		rc = nfc_genl_send_se(skb, dev, NETLINK_CB(cb->skb).portid,
++ 					  cb->nlh->nlmsg_seq, cb, NLM_F_MULTI);
++ 		if (rc < 0)
++ 			break;
++ 
++ 		dev = nfc_device_iter_next(iter);
++ 	}
++ 
++ 	mutex_unlock(&nfc_devlist_mutex);
++ 
++ 	cb->args[1] = (long) dev;
++ 
++ 	return skb->len;
++ }
++ 
++ static int nfc_genl_dump_ses_done(struct netlink_callback *cb)
++ {
++ 	struct class_dev_iter *iter = (struct class_dev_iter *) cb->args[0];
++ 
++ 	nfc_device_iter_exit(iter);
++ 	kfree(iter);
++ 
++ 	return 0;
++ }
++ 
++ struct se_io_ctx {
++ 	u32 dev_idx;
++ 	u32 se_idx;
++ };
++ 
++ static void se_io_cb(void *context, u8 *apdu, size_t apdu_len, int err)
++ {
++ 	struct se_io_ctx *ctx = context;
++ 	struct sk_buff *msg;
++ 	void *hdr;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg) {
++ 		kfree(ctx);
++ 		return;
++ 	}
++ 
++ 	hdr = genlmsg_put(msg, 0, 0, &nfc_genl_family, 0,
++ 			  NFC_CMD_SE_IO);
++ 	if (!hdr)
++ 		goto free_msg;
++ 
++ 	if (nla_put_u32(msg, NFC_ATTR_DEVICE_INDEX, ctx->dev_idx) ||
++ 	    nla_put_u32(msg, NFC_ATTR_SE_INDEX, ctx->se_idx) ||
++ 	    nla_put(msg, NFC_ATTR_SE_APDU, apdu_len, apdu))
++ 		goto nla_put_failure;
++ 
++ 	genlmsg_end(msg, hdr);
++ 
++ 	genlmsg_multicast(msg, 0, nfc_genl_event_mcgrp.id, GFP_KERNEL);
++ 
++ 	kfree(ctx);
++ 
++ 	return;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ free_msg:
++ 	nlmsg_free(msg);
++ 	kfree(ctx);
++ 
++ 	return;
++ }
++ 
++ static int nfc_genl_se_io(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	struct se_io_ctx *ctx;
++ 	u32 dev_idx, se_idx;
++ 	u8 *apdu;
++ 	size_t apdu_len;
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_APDU])
++ 		return -EINVAL;
++ 
++ 	dev_idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 	se_idx = nla_get_u32(info->attrs[NFC_ATTR_SE_INDEX]);
++ 
++ 	dev = nfc_get_device(dev_idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	if (!dev->ops || !dev->ops->se_io)
++ 		return -ENOTSUPP;
++ 
++ 	apdu_len = nla_len(info->attrs[NFC_ATTR_SE_APDU]);
++ 	if (apdu_len == 0)
++ 		return -EINVAL;
++ 
++ 	apdu = nla_data(info->attrs[NFC_ATTR_SE_APDU]);
++ 	if (!apdu)
++ 		return -EINVAL;
++ 
++ 	ctx = kzalloc(sizeof(struct se_io_ctx), GFP_KERNEL);
++ 	if (!ctx)
++ 		return -ENOMEM;
++ 
++ 	ctx->dev_idx = dev_idx;
++ 	ctx->se_idx = se_idx;
++ 
++ 	return dev->ops->se_io(dev, se_idx, apdu, apdu_len, se_io_cb, ctx);
++ }
++ 
++ static const struct genl_ops nfc_genl_ops[] = {
+++>>>>>>> 4534de8305b3 (genetlink: make all genl_ops users const)
+  	{
+  		.cmd = NFC_CMD_GET_DEVICE,
+  		.doit = nfc_genl_get_device,
+diff --cc net/wimax/stack.c
+index a6470ac39498,47170c9495f1..000000000000
+--- a/net/wimax/stack.c
++++ b/net/wimax/stack.c
+@@@ -402,22 -402,44 +402,50 @@@ void wimax_dev_init(struct wimax_dev *w
+  }
+  EXPORT_SYMBOL_GPL(wimax_dev_init);
+  
+ -static const struct nla_policy wimax_gnl_policy[WIMAX_GNL_ATTR_MAX + 1] = {
+ -	[WIMAX_GNL_RESET_IFIDX] = { .type = NLA_U32, },
+ -	[WIMAX_GNL_RFKILL_IFIDX] = { .type = NLA_U32, },
+ -	[WIMAX_GNL_RFKILL_STATE] = {
+ -		.type = NLA_U32		/* enum wimax_rf_state */
+ -	},
+ -	[WIMAX_GNL_STGET_IFIDX] = { .type = NLA_U32, },
+ -	[WIMAX_GNL_MSG_IFIDX] = { .type = NLA_U32, },
+ -	[WIMAX_GNL_MSG_DATA] = {
+ -		.type = NLA_UNSPEC,	/* libnl doesn't grok BINARY yet */
+ -	},
+ -};
+ +/*
+ + * This extern is declared here because it's easier to keep track --
+ + * both declarations are a list of the same
+ + */
+ +extern struct genl_ops
+ +	wimax_gnl_msg_from_user,
+ +	wimax_gnl_reset,
+ +	wimax_gnl_rfkill,
+ +	wimax_gnl_state_get;
+  
+++<<<<<<< HEAD
+ +static
+ +struct genl_ops *wimax_gnl_ops[] = {
+ +	&wimax_gnl_msg_from_user,
+ +	&wimax_gnl_reset,
+ +	&wimax_gnl_rfkill,
+ +	&wimax_gnl_state_get,
+++=======
++ static const struct genl_ops wimax_gnl_ops[] = {
++ 	{
++ 		.cmd = WIMAX_GNL_OP_MSG_FROM_USER,
++ 		.flags = GENL_ADMIN_PERM,
++ 		.policy = wimax_gnl_policy,
++ 		.doit = wimax_gnl_doit_msg_from_user,
++ 	},
++ 	{
++ 		.cmd = WIMAX_GNL_OP_RESET,
++ 		.flags = GENL_ADMIN_PERM,
++ 		.policy = wimax_gnl_policy,
++ 		.doit = wimax_gnl_doit_reset,
++ 	},
++ 	{
++ 		.cmd = WIMAX_GNL_OP_RFKILL,
++ 		.flags = GENL_ADMIN_PERM,
++ 		.policy = wimax_gnl_policy,
++ 		.doit = wimax_gnl_doit_rfkill,
++ 	},
++ 	{
++ 		.cmd = WIMAX_GNL_OP_STATE_GET,
++ 		.flags = GENL_ADMIN_PERM,
++ 		.policy = wimax_gnl_policy,
++ 		.doit = wimax_gnl_doit_state_get,
++ 	},
+++>>>>>>> 4534de8305b3 (genetlink: make all genl_ops users const)
+  };
+  
+  
+* Unmerged path net/hsr/hsr_netlink.c
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index b69a91a1b3d0..ad7669eb3bd3 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -2680,7 +2680,7 @@ static int team_nl_cmd_port_list_get(struct sk_buff *skb,
+ 	return err;
+ }
+ 
+-static struct genl_ops team_nl_ops[] = {
++static const struct genl_ops team_nl_ops[] = {
+ 	{
+ 		.cmd = TEAM_CMD_NOOP,
+ 		.doit = team_nl_cmd_noop,
+diff --git a/drivers/net/wireless/mac80211_hwsim.c b/drivers/net/wireless/mac80211_hwsim.c
+index cb34c7895f2a..5734540d609b 100644
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@ -2075,7 +2075,7 @@ out:
+ }
+ 
+ /* Generic Netlink operations array */
+-static struct genl_ops hwsim_ops[] = {
++static const struct genl_ops hwsim_ops[] = {
+ 	{
+ 		.cmd = HWSIM_CMD_REGISTER,
+ 		.policy = hwsim_genl_policy,
+diff --git a/kernel/taskstats.c b/kernel/taskstats.c
+index 778bb99abb37..b08c6a422224 100644
+--- a/kernel/taskstats.c
++++ b/kernel/taskstats.c
+@@ -667,7 +667,7 @@ err:
+ 	nlmsg_free(rep_skb);
+ }
+ 
+-static struct genl_ops taskstats_ops[] = {
++static const struct genl_ops taskstats_ops[] = {
+ 	{
+ 		.cmd		= TASKSTATS_CMD_GET,
+ 		.doit		= taskstats_user_cmd,
+diff --git a/net/core/drop_monitor.c b/net/core/drop_monitor.c
+index d23b6682f4e9..24346da03725 100644
+--- a/net/core/drop_monitor.c
++++ b/net/core/drop_monitor.c
+@@ -333,7 +333,7 @@ out:
+ 	return NOTIFY_DONE;
+ }
+ 
+-static struct genl_ops dropmon_ops[] = {
++static const struct genl_ops dropmon_ops[] = {
+ 	{
+ 		.cmd = NET_DM_CMD_CONFIG,
+ 		.doit = net_dm_cmd_config,
+* Unmerged path net/hsr/hsr_netlink.c
+diff --git a/net/ieee802154/netlink.c b/net/ieee802154/netlink.c
+index eb9faef6782a..3ffcdbb56aab 100644
+--- a/net/ieee802154/netlink.c
++++ b/net/ieee802154/netlink.c
+@@ -109,7 +109,7 @@ out:
+ 	return -ENOBUFS;
+ }
+ 
+-static struct genl_ops ieee8021154_ops[] = {
++static const struct genl_ops ieee8021154_ops[] = {
+ 	/* see nl-phy.c */
+ 	IEEE802154_DUMP(IEEE802154_LIST_PHY, ieee802154_list_phy,
+ 			ieee802154_dump_phy),
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index 37136f100f20..9b593492afd5 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -996,7 +996,7 @@ static int tcp_metrics_nl_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	return 0;
+ }
+ 
+-static struct genl_ops tcp_metrics_nl_ops[] = {
++static const struct genl_ops tcp_metrics_nl_ops[] = {
+ 	{
+ 		.cmd = TCP_METRICS_CMD_GET,
+ 		.doit = tcp_metrics_nl_cmd_get,
+diff --git a/net/irda/irnetlink.c b/net/irda/irnetlink.c
+index c32971269280..bf5d7d476dae 100644
+--- a/net/irda/irnetlink.c
++++ b/net/irda/irnetlink.c
+@@ -131,7 +131,7 @@ static const struct nla_policy irda_nl_policy[IRDA_NL_ATTR_MAX + 1] = {
+ 	[IRDA_NL_ATTR_MODE] = { .type = NLA_U32 },
+ };
+ 
+-static struct genl_ops irda_nl_ops[] = {
++static const struct genl_ops irda_nl_ops[] = {
+ 	{
+ 		.cmd = IRDA_NL_CMD_SET_MODE,
+ 		.doit = irda_nl_set_mode,
+diff --git a/net/l2tp/l2tp_netlink.c b/net/l2tp/l2tp_netlink.c
+index f34d17bc0e4f..bafa8d9362c9 100644
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -800,7 +800,7 @@ static struct nla_policy l2tp_nl_policy[L2TP_ATTR_MAX + 1] = {
+ 	},
+ };
+ 
+-static struct genl_ops l2tp_nl_ops[] = {
++static const struct genl_ops l2tp_nl_ops[] = {
+ 	{
+ 		.cmd = L2TP_CMD_NOOP,
+ 		.doit = l2tp_nl_cmd_noop,
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index 3c31d7a8046c..bde2fe4b8eb5 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -3565,7 +3565,7 @@ out:
+ }
+ 
+ 
+-static struct genl_ops ip_vs_genl_ops[] __read_mostly = {
++static const struct genl_ops ip_vs_genl_ops[] __read_mostly = {
+ 	{
+ 		.cmd	= IPVS_CMD_NEW_SERVICE,
+ 		.flags	= GENL_ADMIN_PERM,
+diff --git a/net/netlabel/netlabel_cipso_v4.c b/net/netlabel/netlabel_cipso_v4.c
+index a1100640495d..706691739b99 100644
+--- a/net/netlabel/netlabel_cipso_v4.c
++++ b/net/netlabel/netlabel_cipso_v4.c
+@@ -737,7 +737,7 @@ static int netlbl_cipsov4_remove(struct sk_buff *skb, struct genl_info *info)
+  * NetLabel Generic NETLINK Command Definitions
+  */
+ 
+-static struct genl_ops netlbl_cipsov4_ops[] = {
++static const struct genl_ops netlbl_cipsov4_ops[] = {
+ 	{
+ 	.cmd = NLBL_CIPSOV4_C_ADD,
+ 	.flags = GENL_ADMIN_PERM,
+diff --git a/net/netlabel/netlabel_mgmt.c b/net/netlabel/netlabel_mgmt.c
+index dd1c37d7acbc..7de6f660b80a 100644
+--- a/net/netlabel/netlabel_mgmt.c
++++ b/net/netlabel/netlabel_mgmt.c
+@@ -705,7 +705,7 @@ version_failure:
+  * NetLabel Generic NETLINK Command Definitions
+  */
+ 
+-static struct genl_ops netlbl_mgmt_genl_ops[] = {
++static const struct genl_ops netlbl_mgmt_genl_ops[] = {
+ 	{
+ 	.cmd = NLBL_MGMT_C_ADD,
+ 	.flags = GENL_ADMIN_PERM,
+diff --git a/net/netlabel/netlabel_unlabeled.c b/net/netlabel/netlabel_unlabeled.c
+index 8162e073b573..2a4909b35fc2 100644
+--- a/net/netlabel/netlabel_unlabeled.c
++++ b/net/netlabel/netlabel_unlabeled.c
+@@ -1324,7 +1324,7 @@ unlabel_staticlistdef_return:
+  * NetLabel Generic NETLINK Command Definitions
+  */
+ 
+-static struct genl_ops netlbl_unlabel_genl_ops[] = {
++static const struct genl_ops netlbl_unlabel_genl_ops[] = {
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICADD,
+ 	.flags = GENL_ADMIN_PERM,
+* Unmerged path net/nfc/netlink.c
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 68fd03cc34f5..16c025586e5c 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -578,7 +578,7 @@ static const struct nla_policy packet_policy[OVS_PACKET_ATTR_MAX + 1] = {
+ 	[OVS_PACKET_ATTR_ACTIONS] = { .type = NLA_NESTED },
+ };
+ 
+-static struct genl_ops dp_packet_genl_ops[] = {
++static const struct genl_ops dp_packet_genl_ops[] = {
+ 	{ .cmd = OVS_PACKET_CMD_EXECUTE,
+ 	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+ 	  .policy = packet_policy,
+@@ -1033,7 +1033,7 @@ static int ovs_flow_cmd_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	return skb->len;
+ }
+ 
+-static struct genl_ops dp_flow_genl_ops[] = {
++static const struct genl_ops dp_flow_genl_ops[] = {
+ 	{ .cmd = OVS_FLOW_CMD_NEW,
+ 	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+ 	  .policy = flow_policy,
+@@ -1426,7 +1426,7 @@ static int ovs_dp_cmd_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	return skb->len;
+ }
+ 
+-static struct genl_ops dp_datapath_genl_ops[] = {
++static const struct genl_ops dp_datapath_genl_ops[] = {
+ 	{ .cmd = OVS_DP_CMD_NEW,
+ 	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+ 	  .policy = datapath_policy,
+@@ -1787,7 +1787,7 @@ out:
+ 	return skb->len;
+ }
+ 
+-static struct genl_ops dp_vport_genl_ops[] = {
++static const struct genl_ops dp_vport_genl_ops[] = {
+ 	{ .cmd = OVS_VPORT_CMD_NEW,
+ 	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+ 	  .policy = vport_policy,
+@@ -1813,7 +1813,7 @@ static struct genl_ops dp_vport_genl_ops[] = {
+ 
+ struct genl_family_and_ops {
+ 	struct genl_family *family;
+-	struct genl_ops *ops;
++	const struct genl_ops *ops;
+ 	int n_ops;
+ 	struct genl_multicast_group *group;
+ };
+* Unmerged path net/wimax/stack.c
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index ac2cb32ea023..dcd047972aa2 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -8397,7 +8397,7 @@ static void nl80211_post_doit(const struct genl_ops *ops, struct sk_buff *skb,
+ 		rtnl_unlock();
+ }
+ 
+-static struct genl_ops nl80211_ops[] = {
++static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_GET_WIPHY,
+ 		.doit = nl80211_get_wiphy,
