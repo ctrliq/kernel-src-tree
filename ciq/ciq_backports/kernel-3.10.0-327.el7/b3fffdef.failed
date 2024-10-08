@@ -1,0 +1,240 @@
+NVMe: Register management handle under nvme class
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit b3fffdefabab266ae5176a136d93b6670b07bb30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b3fffdef.failed
+
+This creates a new class type for nvme devices to register their
+management character devices with. This is so we do not rely on miscdev
+to provide enough minors for as many nvme devices some people plan to
+use. The previous limit was approximately 60 NVMe controllers, depending
+on the platform and kernel. Now the limit is 1M, which ought to be enough
+for anybody.
+
+Since we have a new device class, it makes sense to attach the block
+devices under this as well, so part of this patch moves the management
+handle initialization prior to the namespaces discovery.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+(cherry picked from commit b3fffdefabab266ae5176a136d93b6670b07bb30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	include/linux/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 4365f3348321,bb2b861cfed9..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -42,9 -42,9 +42,13 @@@
+  #include <scsi/sg.h>
+  #include <asm-generic/io-64-nonatomic-lo-hi.h>
+  
+++<<<<<<< HEAD
+ +#include <trace/events/block.h>
+ +
+++=======
++ #define NVME_MINORS		(1U << MINORBITS)
+++>>>>>>> b3fffdefabab (NVMe: Register management handle under nvme class)
+  #define NVME_Q_DEPTH		1024
+ -#define NVME_AQ_DEPTH		64
+  #define SQ_SIZE(depth)		(depth * sizeof(struct nvme_command))
+  #define CQ_SIZE(depth)		(depth * sizeof(struct nvme_completion))
+  #define ADMIN_TIMEOUT		(admin_timeout * HZ)
+@@@ -80,7 -83,10 +87,9 @@@ static struct workqueue_struct *nvme_wo
+  static wait_queue_head_t nvme_kthread_wait;
+  static struct notifier_block nvme_nb;
+  
++ static struct class *nvme_class;
++ 
+  static void nvme_reset_failed_dev(struct work_struct *ws);
+ -static int nvme_process_cq(struct nvme_queue *nvmeq);
+  
+  struct async_cmd_info {
+  	struct kthread_work work;
+@@@ -2123,16 -2195,22 +2132,16 @@@ static struct nvme_ns *nvme_alloc_ns(st
+  	disk->fops = &nvme_fops;
+  	disk->private_data = ns;
+  	disk->queue = ns->queue;
+- 	disk->driverfs_dev = &dev->pci_dev->dev;
++ 	disk->driverfs_dev = dev->device;
+  	disk->flags = GENHD_FL_EXT_DEVT;
+  	sprintf(disk->disk_name, "nvme%dn%d", dev->instance, nsid);
+ +	set_capacity(disk, le64_to_cpup(&id->nsze) << (ns->lba_shift - 9));
+ +
+ +	if (dev->oncs & NVME_CTRL_ONCS_DSM)
+ +		nvme_config_discard(ns);
+ +
+ +	return ns;
+  
+ -	/*
+ -	 * Initialize capacity to 0 until we establish the namespace format and
+ -	 * setup integrity extentions if necessary. The revalidate_disk after
+ -	 * add_disk allows the driver to register with integrity if the format
+ -	 * requires it.
+ -	 */
+ -	set_capacity(disk, 0);
+ -	nvme_revalidate_disk(ns->disk);
+ -	add_disk(ns->disk);
+ -	if (ns->ms)
+ -		revalidate_disk(ns->disk);
+ -	return;
+   out_free_queue:
+  	blk_cleanup_queue(ns->queue);
+   out_free_ns:
+@@@ -2810,8 -2781,11 +2819,9 @@@ static void nvme_free_dev(struct kref *
+  	struct nvme_dev *dev = container_of(kref, struct nvme_dev, kref);
+  
+  	pci_dev_put(dev->pci_dev);
++ 	put_device(dev->device);
+  	nvme_free_namespaces(dev);
+ -	nvme_release_instance(dev);
+ -	blk_mq_free_tag_set(&dev->tagset);
+ -	blk_put_queue(dev->admin_q);
+ +	free_percpu(dev->io_queue);
+  	kfree(dev->queues);
+  	kfree(dev->entry);
+  	kfree(dev);
+@@@ -2996,26 -3021,26 +3018,35 @@@ static int nvme_probe(struct pci_dev *p
+  	if (result)
+  		goto release_pools;
+  
+- 	if (dev->online_queues > 1)
+- 		result = nvme_dev_add(dev);
+- 	if (result)
++ 	dev->device = device_create(nvme_class, &pdev->dev,
++ 				MKDEV(nvme_char_major, dev->instance),
++ 				dev, "nvme%d", dev->instance);
++ 	if (IS_ERR(dev->device)) {
++ 		result = PTR_ERR(dev->device);
+  		goto shutdown;
++ 	}
++ 	get_device(dev->device);
+  
+- 	scnprintf(dev->name, sizeof(dev->name), "nvme%d", dev->instance);
+- 	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+- 	dev->miscdev.parent = &pdev->dev;
+- 	dev->miscdev.name = dev->name;
+- 	dev->miscdev.fops = &nvme_dev_fops;
+- 	result = misc_register(&dev->miscdev);
++ 	if (dev->online_queues > 1)
++ 		result = nvme_dev_add(dev);
+  	if (result)
+- 		goto remove;
++ 		goto device_del;
+  
+++<<<<<<< HEAD
+ +	dev->initialized = 1;
+ +	return 0;
+ +
+ + remove:
+ +	nvme_dev_remove(dev);
+ +	nvme_free_namespaces(dev);
+++=======
++ 	nvme_set_irq_hints(dev);
++ 	dev->initialized = 1;
++ 	return 0;
++ 
++  device_del:
++ 	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+++>>>>>>> b3fffdefabab (NVMe: Register management handle under nvme class)
+   shutdown:
+  	nvme_dev_shutdown(dev);
+   release_pools:
+@@@ -3059,12 -3083,11 +3090,19 @@@ static void nvme_remove(struct pci_dev 
+  
+  	pci_set_drvdata(pdev, NULL);
+  	flush_work(&dev->reset_work);
+++<<<<<<< HEAD
+ +	flush_work(&dev->cpu_work);
+ +	misc_deregister(&dev->miscdev);
+ +	nvme_dev_shutdown(dev);
+++=======
++ 	nvme_dev_shutdown(dev);
++ 	nvme_dev_remove(dev);
++ 	nvme_dev_remove_admin(dev);
++ 	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+++>>>>>>> b3fffdefabab (NVMe: Register management handle under nvme class)
+  	nvme_free_queues(dev, 0);
+ +	nvme_dev_remove(dev);
+ +	nvme_release_instance(dev);
+  	nvme_release_prp_pools(dev);
+  	kref_put(&dev->kref, nvme_free_dev);
+  }
+@@@ -3145,18 -3170,26 +3183,41 @@@ static int __init nvme_init(void
+  	else if (result > 0)
+  		nvme_major = result;
+  
+++<<<<<<< HEAD
+ +	nvme_nb.notifier_call = &nvme_cpu_notify;
+ +	result = register_hotcpu_notifier(&nvme_nb);
+ +	if (result)
+ +		goto unregister_blkdev;
+ +
+ +	result = pci_register_driver(&nvme_driver);
+ +	if (result)
+ +		goto unregister_hotcpu;
+ +	return 0;
+ +
+ + unregister_hotcpu:
+ +	unregister_hotcpu_notifier(&nvme_nb);
+++=======
++ 	result = __register_chrdev(nvme_char_major, 0, NVME_MINORS, "nvme",
++ 							&nvme_dev_fops);
++ 	if (result < 0)
++ 		goto unregister_blkdev;
++ 	else if (result > 0)
++ 		nvme_char_major = result;
++ 
++ 	nvme_class = class_create(THIS_MODULE, "nvme");
++ 	if (!nvme_class)
++ 		goto unregister_chrdev;
++ 
++ 	result = pci_register_driver(&nvme_driver);
++ 	if (result)
++ 		goto destroy_class;
++ 	return 0;
++ 
++  destroy_class:
++ 	class_destroy(nvme_class);
++  unregister_chrdev:
++ 	__unregister_chrdev(nvme_char_major, 0, NVME_MINORS, "nvme");
+++>>>>>>> b3fffdefabab (NVMe: Register management handle under nvme class)
+   unregister_blkdev:
+  	unregister_blkdev(nvme_major, "nvme");
+   kill_workq:
+diff --cc include/linux/nvme.h
+index 0ee15565532d,383d495c5e4c..000000000000
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@@ -17,8 -17,8 +17,7 @@@
+  
+  #include <uapi/linux/nvme.h>
+  #include <linux/pci.h>
+- #include <linux/miscdevice.h>
+  #include <linux/kref.h>
+ -#include <linux/blk-mq.h>
+  
+  struct nvme_bar {
+  	__u64			cap;	/* Controller Capabilities */
+@@@ -85,9 -88,9 +84,14 @@@ struct nvme_dev 
+  	struct nvme_bar __iomem *bar;
+  	struct list_head namespaces;
+  	struct kref kref;
+++<<<<<<< HEAD
+ +	struct miscdevice miscdev;
+++=======
++ 	struct device *device;
++ 	work_func_t reset_workfn;
+++>>>>>>> b3fffdefabab (NVMe: Register management handle under nvme class)
+  	struct work_struct reset_work;
+ +	struct work_struct cpu_work;
+  	char name[12];
+  	char serial[20];
+  	char model[40];
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path include/linux/nvme.h
