@@ -1,0 +1,511 @@
+s390/kdump: add support for vector extension
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] kdump: add support for vector extension (Hendrik Brueckner) [1102206]
+Rebuild_FUZZ: 93.98%
+commit-author Michael Holzheu <holzheu@linux.vnet.ibm.com>
+commit a62bc0739253939d6fce40d51d92412252a9bb55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a62bc073.failed
+
+With this patch for kdump the s390 vector registers are stored into the
+prepared save areas in the old kernel and into the REGSET_VX_LOW and
+REGSET_VX_HIGH ELF notes for /proc/vmcore in the new kernel.
+
+The NT_S390_VXRS_LOW note contains the lower halves of the first 16 vector
+registers 0-15. The higher halves are stored in the floating point register
+ELF note.  The NT_S390_VXRS_HIGH contains the full vector registers 16-31.
+
+The kernel provides a save area for storing vector register in case of
+machine checks. A pointer to this save are is stored in the CPU lowcore
+at offset 0x11b0. This save area is also used to save the registers for
+kdump. In case of a dumped crashed kdump those areas are used to extract
+the registers of the production system.
+
+The vector registers for remote CPUs are stored using the "store additional
+status at address" SIGP. For the dump CPU the vector registers are stored
+with the VSTM instruction.
+
+With this patch also zfcpdump stores the vector registers.
+
+	Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit a62bc0739253939d6fce40d51d92412252a9bb55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/sigp.h
+#	arch/s390/include/asm/switch_to.h
+#	arch/s390/kernel/smp.c
+diff --cc arch/s390/include/asm/sigp.h
+index 5a87d16d3e7c,49576115dbb7..000000000000
+--- a/arch/s390/include/asm/sigp.h
++++ b/arch/s390/include/asm/sigp.h
+@@@ -12,7 -13,9 +12,8 @@@
+  #define SIGP_SET_PREFIX		     13
+  #define SIGP_STORE_STATUS_AT_ADDRESS 14
+  #define SIGP_SET_ARCHITECTURE	     18
+ -#define SIGP_COND_EMERGENCY_SIGNAL   19
+  #define SIGP_SENSE_RUNNING	     21
++ #define SIGP_STORE_ADDITIONAL_STATUS 23
+  
+  /* SIGP condition codes */
+  #define SIGP_CC_ORDER_CODE_ACCEPTED 0
+@@@ -29,4 -32,24 +30,27 @@@
+  #define SIGP_STATUS_INCORRECT_STATE	0x00000200UL
+  #define SIGP_STATUS_NOT_RUNNING		0x00000400UL
+  
+++<<<<<<< HEAD
+++=======
++ #ifndef __ASSEMBLY__
++ 
++ static inline int __pcpu_sigp(u16 addr, u8 order, unsigned long parm,
++ 			      u32 *status)
++ {
++ 	register unsigned long reg1 asm ("1") = parm;
++ 	int cc;
++ 
++ 	asm volatile(
++ 		"	sigp	%1,%2,0(%3)\n"
++ 		"	ipm	%0\n"
++ 		"	srl	%0,28\n"
++ 		: "=d" (cc), "+d" (reg1) : "d" (addr), "a" (order) : "cc");
++ 	if (status && cc == 1)
++ 		*status = reg1;
++ 	return cc;
++ }
++ 
++ #endif /* __ASSEMBLY__ */
++ 
+++>>>>>>> a62bc0739253 (s390/kdump: add support for vector extension)
+  #endif /* __S390_ASM_SIGP_H */
+diff --cc arch/s390/include/asm/switch_to.h
+index b6d9247bf9b3,2542a7e4c8b4..000000000000
+--- a/arch/s390/include/asm/switch_to.h
++++ b/arch/s390/include/asm/switch_to.h
+@@@ -102,9 -103,66 +102,67 @@@ static inline void restore_fp_regs(freg
+  	asm volatile("ld 15,%0" : : "Q" (fprs[15]));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void save_vx_regs(__vector128 *vxrs)
++ {
++ 	typedef struct { __vector128 _[__NUM_VXRS]; } addrtype;
++ 
++ 	asm volatile(
++ 		"	la	1,%0\n"
++ 		"	.word	0xe70f,0x1000,0x003e\n"	/* vstm 0,15,0(1) */
++ 		"	.word	0xe70f,0x1100,0x0c3e\n"	/* vstm 16,31,256(1) */
++ 		: "=Q" (*(addrtype *) vxrs) : : "1");
++ }
++ 
++ static inline void save_vx_regs_safe(__vector128 *vxrs)
++ {
++ 	unsigned long cr0, flags;
++ 
++ 	flags = arch_local_irq_save();
++ 	__ctl_store(cr0, 0, 0);
++ 	__ctl_set_bit(0, 17);
++ 	__ctl_set_bit(0, 18);
++ 	save_vx_regs(vxrs);
++ 	__ctl_load(cr0, 0, 0);
++ 	arch_local_irq_restore(flags);
++ }
++ 
++ static inline void restore_vx_regs(__vector128 *vxrs)
++ {
++ 	typedef struct { __vector128 _[__NUM_VXRS]; } addrtype;
++ 
++ 	asm volatile(
++ 		"	la	1,%0\n"
++ 		"	.word	0xe70f,0x1000,0x0036\n"	/* vlm 0,15,0(1) */
++ 		"	.word	0xe70f,0x1100,0x0c36\n"	/* vlm 16,31,256(1) */
++ 		: : "Q" (*(addrtype *) vxrs) : "1");
++ }
++ 
++ static inline void save_fp_vx_regs(struct task_struct *task)
++ {
++ #ifdef CONFIG_64BIT
++ 	if (task->thread.vxrs)
++ 		save_vx_regs(task->thread.vxrs);
++ 	else
++ #endif
++ 	save_fp_regs(task->thread.fp_regs.fprs);
++ }
++ 
++ static inline void restore_fp_vx_regs(struct task_struct *task)
++ {
++ #ifdef CONFIG_64BIT
++ 	if (task->thread.vxrs)
++ 		restore_vx_regs(task->thread.vxrs);
++ 	else
++ #endif
++ 	restore_fp_regs(task->thread.fp_regs.fprs);
++ }
++ 
+++>>>>>>> a62bc0739253 (s390/kdump: add support for vector extension)
+  static inline void save_access_regs(unsigned int *acrs)
+  {
+ -	typedef struct { int _[NUM_ACRS]; } acrstype;
+ -
+ -	asm volatile("stam 0,15,%0" : "=Q" (*(acrstype *)acrs));
+ +	asm volatile("stam 0,15,%0" : "=Q" (*acrs));
+  }
+  
+  static inline void restore_access_regs(unsigned int *acrs)
+diff --cc arch/s390/kernel/smp.c
+index 6055d9cfb3ce,6fd9e60101f1..000000000000
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@@ -83,22 -83,8 +83,27 @@@ DEFINE_MUTEX(smp_cpu_state_mutex)
+  /*
+   * Signal processor helper functions.
+   */
+++<<<<<<< HEAD
+ +static inline int __pcpu_sigp(u16 addr, u8 order, u32 parm, u32 *status)
+ +{
+ +	register unsigned int reg1 asm ("1") = parm;
+ +	int cc;
+ +
+ +	asm volatile(
+ +		"	sigp	%1,%2,0(%3)\n"
+ +		"	ipm	%0\n"
+ +		"	srl	%0,28\n"
+ +		: "=d" (cc), "+d" (reg1) : "d" (addr), "a" (order) : "cc");
+ +	if (status && cc == 1)
+ +		*status = reg1;
+ +	return cc;
+ +}
+ +
+ +static inline int __pcpu_sigp_relax(u16 addr, u8 order, u32 parm, u32 *status)
+++=======
++ static inline int __pcpu_sigp_relax(u16 addr, u8 order, unsigned long parm,
++ 				    u32 *status)
+++>>>>>>> a62bc0739253 (s390/kdump: add support for vector extension)
+  {
+  	int cc;
+  
+@@@ -546,20 -524,29 +552,31 @@@ static void __init smp_get_save_area(in
+  	if (!OLDMEM_BASE && (address == boot_cpu_address ||
+  			     ipl_info.type != IPL_TYPE_FCP_DUMP))
+  		return;
+- 	save_area = dump_save_area_create(cpu);
+- 	if (!save_area)
++ 	sa_ext = dump_save_area_create(cpu);
++ 	if (!sa_ext)
+  		panic("could not allocate memory for save area\n");
+ +#ifdef CONFIG_CRASH_DUMP
+  	if (address == boot_cpu_address) {
+  		/* Copy the registers of the boot cpu. */
+- 		copy_oldmem_page(1, (void *) save_area, sizeof(*save_area),
++ 		copy_oldmem_page(1, (void *) &sa_ext->sa, sizeof(sa_ext->sa),
+  				 SAVE_AREA_BASE - PAGE_SIZE, 0);
++ 		if (MACHINE_HAS_VX)
++ 			save_vx_regs_safe(sa_ext->vx_regs);
+  		return;
+  	}
+ +#endif
+  	/* Get the registers of a non-boot cpu. */
+  	__pcpu_sigp_relax(address, SIGP_STOP_AND_STORE_STATUS, 0, NULL);
+- 	memcpy_real(save_area, lc + SAVE_AREA_BASE, sizeof(*save_area));
++ 	memcpy_real(&sa_ext->sa, lc + SAVE_AREA_BASE, sizeof(sa_ext->sa));
++ 	if (!MACHINE_HAS_VX)
++ 		return;
++ 	/* Get the VX registers */
++ 	vx_sa = __get_free_page(GFP_KERNEL);
++ 	if (!vx_sa)
++ 		panic("could not allocate memory for VX save area\n");
++ 	__pcpu_sigp_relax(address, SIGP_STORE_ADDITIONAL_STATUS, vx_sa, NULL);
++ 	memcpy(sa_ext->vx_regs, (void *) vx_sa, sizeof(sa_ext->vx_regs));
++ 	free_page(vx_sa);
+  }
+  
+  int smp_store_status(int cpu)
+diff --git a/arch/s390/include/asm/elf.h b/arch/s390/include/asm/elf.h
+index 78f4f8711d58..2f8df42c8ccd 100644
+--- a/arch/s390/include/asm/elf.h
++++ b/arch/s390/include/asm/elf.h
+@@ -225,6 +225,6 @@ int arch_setup_additional_pages(struct linux_binprm *, int);
+ extern unsigned long arch_randomize_brk(struct mm_struct *mm);
+ #define arch_randomize_brk arch_randomize_brk
+ 
+-void *fill_cpu_elf_notes(void *ptr, struct save_area *sa);
++void *fill_cpu_elf_notes(void *ptr, struct save_area *sa, __vector128 *vxrs);
+ 
+ #endif
+diff --git a/arch/s390/include/asm/ipl.h b/arch/s390/include/asm/ipl.h
+index ea7d9d6ab06e..5d96a80d822c 100644
+--- a/arch/s390/include/asm/ipl.h
++++ b/arch/s390/include/asm/ipl.h
+@@ -90,12 +90,12 @@ extern u32 dump_prefix_page;
+ extern unsigned int zfcpdump_prefix_array[];
+ 
+ struct dump_save_areas {
+-	struct save_area **areas;
++	struct save_area_ext **areas;
+ 	int count;
+ };
+ 
+ extern struct dump_save_areas dump_save_areas;
+-struct save_area *dump_save_area_create(int cpu);
++struct save_area_ext *dump_save_area_create(int cpu);
+ 
+ extern void do_reipl(void);
+ extern void do_halt(void);
+diff --git a/arch/s390/include/asm/lowcore.h b/arch/s390/include/asm/lowcore.h
+index bbf8141408cd..d7194a6fb210 100644
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -11,6 +11,7 @@
+ #include <linux/types.h>
+ #include <asm/ptrace.h>
+ #include <asm/cpu.h>
++#include <asm/types.h>
+ 
+ #ifdef CONFIG_32BIT
+ 
+@@ -31,6 +32,11 @@ struct save_area {
+ 	u32	ctrl_regs[16];
+ } __packed;
+ 
++struct save_area_ext {
++	struct save_area	sa;
++	__vector128		vx_regs[32];
++};
++
+ struct _lowcore {
+ 	psw_t	restart_psw;			/* 0x0000 */
+ 	psw_t	restart_old_psw;		/* 0x0008 */
+@@ -183,6 +189,11 @@ struct save_area {
+ 	u64	ctrl_regs[16];
+ } __packed;
+ 
++struct save_area_ext {
++	struct save_area	sa;
++	__vector128		vx_regs[32];
++};
++
+ struct _lowcore {
+ 	__u8	pad_0x0000[0x0014-0x0000];	/* 0x0000 */
+ 	__u32	ipl_parmblock_ptr;		/* 0x0014 */
+* Unmerged path arch/s390/include/asm/sigp.h
+* Unmerged path arch/s390/include/asm/switch_to.h
+diff --git a/arch/s390/kernel/crash_dump.c b/arch/s390/kernel/crash_dump.c
+index 826f57dff94f..494dda59c407 100644
+--- a/arch/s390/kernel/crash_dump.c
++++ b/arch/s390/kernel/crash_dump.c
+@@ -27,9 +27,9 @@ struct dump_save_areas dump_save_areas;
+ /*
+  * Allocate and add a save area for a CPU
+  */
+-struct save_area *dump_save_area_create(int cpu)
++struct save_area_ext *dump_save_area_create(int cpu)
+ {
+-	struct save_area **save_areas, *save_area;
++	struct save_area_ext **save_areas, *save_area;
+ 
+ 	save_area = kmalloc(sizeof(*save_area), GFP_KERNEL);
+ 	if (!save_area)
+@@ -382,10 +382,46 @@ static void *nt_s390_prefix(void *ptr, struct save_area *sa)
+ 			 sizeof(sa->pref_reg), KEXEC_CORE_NOTE_NAME);
+ }
+ 
++/*
++ * Initialize vxrs high note (full 128 bit VX registers 16-31)
++ */
++static void *nt_s390_vx_high(void *ptr, __vector128 *vx_regs)
++{
++	return nt_init(ptr, NT_S390_VXRS_HIGH, &vx_regs[16],
++		       16 * sizeof(__vector128), KEXEC_CORE_NOTE_NAME);
++}
++
++/*
++ * Initialize vxrs low note (lower halves of VX registers 0-15)
++ */
++static void *nt_s390_vx_low(void *ptr, __vector128 *vx_regs)
++{
++	Elf64_Nhdr *note;
++	u64 len;
++	int i;
++
++	note = (Elf64_Nhdr *)ptr;
++	note->n_namesz = strlen(KEXEC_CORE_NOTE_NAME) + 1;
++	note->n_descsz = 16 * 8;
++	note->n_type = NT_S390_VXRS_LOW;
++	len = sizeof(Elf64_Nhdr);
++
++	memcpy(ptr + len, KEXEC_CORE_NOTE_NAME, note->n_namesz);
++	len = roundup(len + note->n_namesz, 4);
++
++	ptr += len;
++	/* Copy lower halves of SIMD registers 0-15 */
++	for (i = 0; i < 16; i++) {
++		memcpy(ptr, &vx_regs[i], 8);
++		ptr += 8;
++	}
++	return ptr;
++}
++
+ /*
+  * Fill ELF notes for one CPU with save area registers
+  */
+-void *fill_cpu_elf_notes(void *ptr, struct save_area *sa)
++void *fill_cpu_elf_notes(void *ptr, struct save_area *sa, __vector128 *vx_regs)
+ {
+ 	ptr = nt_prstatus(ptr, sa);
+ 	ptr = nt_fpregset(ptr, sa);
+@@ -394,6 +430,10 @@ void *fill_cpu_elf_notes(void *ptr, struct save_area *sa)
+ 	ptr = nt_s390_tod_preg(ptr, sa);
+ 	ptr = nt_s390_ctrs(ptr, sa);
+ 	ptr = nt_s390_prefix(ptr, sa);
++	if (MACHINE_HAS_VX && vx_regs) {
++		ptr = nt_s390_vx_low(ptr, vx_regs);
++		ptr = nt_s390_vx_high(ptr, vx_regs);
++	}
+ 	return ptr;
+ }
+ 
+@@ -481,7 +521,7 @@ static int get_cpu_cnt(void)
+ 	int i, cpus = 0;
+ 
+ 	for (i = 0; i < dump_save_areas.count; i++) {
+-		if (dump_save_areas.areas[i]->pref_reg == 0)
++		if (dump_save_areas.areas[i]->sa.pref_reg == 0)
+ 			continue;
+ 		cpus++;
+ 	}
+@@ -546,17 +586,17 @@ static int loads_init(Elf64_Phdr *phdr, u64 loads_offset)
+  */
+ static void *notes_init(Elf64_Phdr *phdr, void *ptr, u64 notes_offset)
+ {
+-	struct save_area *sa;
++	struct save_area_ext *sa_ext;
+ 	void *ptr_start = ptr;
+ 	int i;
+ 
+ 	ptr = nt_prpsinfo(ptr);
+ 
+ 	for (i = 0; i < dump_save_areas.count; i++) {
+-		sa = dump_save_areas.areas[i];
+-		if (sa->pref_reg == 0)
++		sa_ext = dump_save_areas.areas[i];
++		if (sa_ext->sa.pref_reg == 0)
+ 			continue;
+-		ptr = fill_cpu_elf_notes(ptr, sa);
++		ptr = fill_cpu_elf_notes(ptr, &sa_ext->sa, sa_ext->vx_regs);
+ 	}
+ 	ptr = nt_vmcoreinfo(ptr);
+ 	memset(phdr, 0, sizeof(*phdr));
+@@ -589,7 +629,7 @@ int elfcorehdr_alloc(unsigned long long *addr, unsigned long long *size)
+ 		return -ENODEV;
+ 	mem_chunk_cnt = get_mem_chunk_cnt();
+ 
+-	alloc_size = 0x1000 + get_cpu_cnt() * 0x300 +
++	alloc_size = 0x1000 + get_cpu_cnt() * 0x4a0 +
+ 		mem_chunk_cnt * sizeof(Elf64_Phdr);
+ 	hdr = kzalloc_panic(alloc_size);
+ 	/* Init elf header */
+diff --git a/arch/s390/kernel/machine_kexec.c b/arch/s390/kernel/machine_kexec.c
+index ac2178161ec3..da84ae055515 100644
+--- a/arch/s390/kernel/machine_kexec.c
++++ b/arch/s390/kernel/machine_kexec.c
+@@ -25,6 +25,7 @@
+ #include <asm/elf.h>
+ #include <asm/asm-offsets.h>
+ #include <asm/os_info.h>
++#include <asm/switch_to.h>
+ 
+ typedef void (*relocate_kernel_t)(kimage_entry_t *, unsigned long);
+ 
+@@ -43,7 +44,7 @@ static void add_elf_notes(int cpu)
+ 
+ 	memcpy((void *) (4608UL + sa->pref_reg), sa, sizeof(*sa));
+ 	ptr = (u64 *) per_cpu_ptr(crash_notes, cpu);
+-	ptr = fill_cpu_elf_notes(ptr, sa);
++	ptr = fill_cpu_elf_notes(ptr, sa, NULL);
+ 	memset(ptr, 0, sizeof(struct elf_note));
+ }
+ 
+@@ -53,8 +54,11 @@ static void add_elf_notes(int cpu)
+ void setup_regs(void)
+ {
+ 	unsigned long sa = S390_lowcore.prefixreg_save_area + SAVE_AREA_BASE;
++	struct _lowcore *lc;
+ 	int cpu, this_cpu;
+ 
++	/* Get lowcore pointer from store status of this CPU (absolute zero) */
++	lc = (struct _lowcore *)(unsigned long)S390_lowcore.prefixreg_save_area;
+ 	this_cpu = smp_find_processor_id(stap());
+ 	add_elf_notes(this_cpu);
+ 	for_each_online_cpu(cpu) {
+@@ -64,6 +68,8 @@ void setup_regs(void)
+ 			continue;
+ 		add_elf_notes(cpu);
+ 	}
++	if (MACHINE_HAS_VX)
++		save_vx_regs_safe((void *) lc->vector_save_area_addr);
+ 	/* Copy dump CPU store status info to absolute zero */
+ 	memcpy((void *) SAVE_AREA_BASE, (void *) sa, sizeof(struct save_area));
+ }
+* Unmerged path arch/s390/kernel/smp.c
+diff --git a/drivers/s390/char/zcore.c b/drivers/s390/char/zcore.c
+index 3d8e4d63f514..f96a1ff2e2da 100644
+--- a/drivers/s390/char/zcore.c
++++ b/drivers/s390/char/zcore.c
+@@ -26,6 +26,7 @@
+ #include <asm/processor.h>
+ #include <asm/irqflags.h>
+ #include <asm/checksum.h>
++#include <asm/switch_to.h>
+ #include "sclp.h"
+ 
+ #define TRACE(x...) debug_sprintf_event(zcore_dbf, 1, x)
+@@ -147,18 +148,21 @@ static int memcpy_hsa_kernel(void *dest, unsigned long src, size_t count)
+ 
+ static int __init init_cpu_info(enum arch_id arch)
+ {
+-	struct save_area *sa;
++	struct save_area_ext *sa_ext;
+ 
+ 	/* get info for boot cpu from lowcore, stored in the HSA */
+ 
+-	sa = dump_save_area_create(0);
+-	if (!sa)
++	sa_ext = dump_save_area_create(0);
++	if (!sa_ext)
+ 		return -ENOMEM;
+-	if (memcpy_hsa_kernel(sa, sys_info.sa_base, sys_info.sa_size) < 0) {
++	if (memcpy_hsa_kernel(&sa_ext->sa, sys_info.sa_base,
++			      sys_info.sa_size) < 0) {
+ 		TRACE("could not copy from HSA\n");
+-		kfree(sa);
++		kfree(sa_ext);
+ 		return -EIO;
+ 	}
++	if (MACHINE_HAS_VX)
++		save_vx_regs_safe(sa_ext->vx_regs);
+ 	return 0;
+ }
+ 
+@@ -256,7 +260,7 @@ static int zcore_add_lc(char __user *buf, unsigned long start, size_t count)
+ 		unsigned long sa_start, sa_end; /* save area range */
+ 		unsigned long prefix;
+ 		unsigned long sa_off, len, buf_off;
+-		struct save_area *save_area = dump_save_areas.areas[i];
++		struct save_area *save_area = &dump_save_areas.areas[i]->sa;
+ 
+ 		prefix = save_area->pref_reg;
+ 		sa_start = prefix + sys_info.sa_base;
+@@ -628,7 +632,7 @@ static void __init zcore_header_init(int arch, struct zcore_header *hdr,
+ 	hdr->tod = get_tod_clock();
+ 	get_cpu_id(&hdr->cpu_id);
+ 	for (i = 0; i < dump_save_areas.count; i++) {
+-		prefix = dump_save_areas.areas[i]->pref_reg;
++		prefix = dump_save_areas.areas[i]->sa.pref_reg;
+ 		hdr->real_cpu_cnt++;
+ 		if (!prefix)
+ 			continue;
