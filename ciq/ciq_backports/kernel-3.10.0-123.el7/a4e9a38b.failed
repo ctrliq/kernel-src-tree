@@ -1,0 +1,252 @@
+ALSA: hda - Move mutex from hda_eld to per_pin in HDMI codec driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [alsa] hda: Move mutex from hda_eld to per_pin in HDMI codec driver (Jaroslav Kysela) [1044022]
+Rebuild_FUZZ: 92.91%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit a4e9a38b40a0e2f7dad1a0b355896d23fbdd16e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/a4e9a38b.failed
+
+Since the lock is used primarily in patch_hdmi.c, it's better to move
+it in the local struct instead of exporting in hda_eld.  The only
+functions requiring the lock in hda_eld.c are proc accessors.  So in
+this patch, the proc entry and its creation/deletion/accessors are
+moved into patch_hdmi.c, together with the mutex lock to pin_spec
+struct.
+
+The former proc info functions are exported so that they can be called
+from patch_hdmi.c.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit a4e9a38b40a0e2f7dad1a0b355896d23fbdd16e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/patch_hdmi.c
+diff --cc sound/pci/hda/patch_hdmi.c
+index cc259696a8da,804adb872e63..000000000000
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@@ -1310,6 -1412,7 +1380,10 @@@ static void hdmi_present_sense(struct h
+  	bool update_eld = false;
+  	bool eld_changed = false;
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&per_pin->lock);
+++>>>>>>> a4e9a38b40a0 (ALSA: hda - Move mutex from hda_eld to per_pin in HDMI codec driver)
+  	pin_eld->monitor_present = !!(present & AC_PINSENSE_PRESENCE);
+  	if (pin_eld->monitor_present)
+  		eld->eld_valid  = !!(present & AC_PINSENSE_ELDV);
+@@@ -1365,6 -1475,8 +1439,11 @@@
+  		snd_ctl_notify(codec->bus->card,
+  			       SNDRV_CTL_EVENT_MASK_VALUE | SNDRV_CTL_EVENT_MASK_INFO,
+  			       &per_pin->eld_ctl->id);
+++<<<<<<< HEAD
+++=======
++  unlock:
++ 	mutex_unlock(&per_pin->lock);
+++>>>>>>> a4e9a38b40a0 (ALSA: hda - Move mutex from hda_eld to per_pin in HDMI codec driver)
+  }
+  
+  static void hdmi_repoll_eld(struct work_struct *work)
+@@@ -1534,10 -1647,12 +1613,19 @@@ static int generic_hdmi_playback_pcm_pr
+  	bool non_pcm;
+  
+  	non_pcm = check_non_pcm_per_cvt(codec, cvt_nid);
+++<<<<<<< HEAD
+ +
+ +	hdmi_set_channel_count(codec, cvt_nid, substream->runtime->channels);
+ +
+ +	hdmi_setup_audio_infoframe(codec, pin_idx, non_pcm, substream);
+++=======
++ 	mutex_lock(&per_pin->lock);
++ 	per_pin->channels = substream->runtime->channels;
++ 	per_pin->setup = true;
++ 
++ 	hdmi_setup_audio_infoframe(codec, per_pin, non_pcm);
++ 	mutex_unlock(&per_pin->lock);
+++>>>>>>> a4e9a38b40a0 (ALSA: hda - Move mutex from hda_eld to per_pin in HDMI codec driver)
+  
+  	return hdmi_setup_stream(codec, cvt_nid, pin_nid, stream_tag, format);
+  }
+@@@ -1575,8 -1690,14 +1663,19 @@@ static int hdmi_pcm_close(struct hda_pc
+  		per_pin = get_pin(spec, pin_idx);
+  
+  		snd_hda_spdif_ctls_unassign(codec, pin_idx);
+++<<<<<<< HEAD
+ +		per_pin->chmap_set = false;
+ +		memset(per_pin->chmap, 0, sizeof(per_pin->chmap));
+++=======
++ 
++ 		mutex_lock(&per_pin->lock);
++ 		per_pin->chmap_set = false;
++ 		memset(per_pin->chmap, 0, sizeof(per_pin->chmap));
++ 
++ 		per_pin->setup = false;
++ 		per_pin->channels = 0;
++ 		mutex_unlock(&per_pin->lock);
+++>>>>>>> a4e9a38b40a0 (ALSA: hda - Move mutex from hda_eld to per_pin in HDMI codec driver)
+  	}
+  
+  	return 0;
+@@@ -1705,11 -1826,12 +1804,20 @@@ static int hdmi_chmap_ctl_put(struct sn
+  	ca = hdmi_manual_channel_allocation(ARRAY_SIZE(chmap), chmap);
+  	if (ca < 0)
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	per_pin->chmap_set = true;
+ +	memcpy(per_pin->chmap, chmap, sizeof(chmap));
+ +	if (prepared)
+ +		hdmi_setup_audio_infoframe(codec, pin_idx, per_pin->non_pcm,
+ +					   substream);
+++=======
++ 	mutex_lock(&per_pin->lock);
++ 	per_pin->chmap_set = true;
++ 	memcpy(per_pin->chmap, chmap, sizeof(chmap));
++ 	if (prepared)
++ 		hdmi_setup_audio_infoframe(codec, per_pin, per_pin->non_pcm);
++ 	mutex_unlock(&per_pin->lock);
+++>>>>>>> a4e9a38b40a0 (ALSA: hda - Move mutex from hda_eld to per_pin in HDMI codec driver)
+  
+  	return 0;
+  }
+diff --git a/sound/pci/hda/hda_eld.c b/sound/pci/hda/hda_eld.c
+index d0d7ac1e99d2..f62356c2f54c 100644
+--- a/sound/pci/hda/hda_eld.c
++++ b/sound/pci/hda/hda_eld.c
+@@ -478,10 +478,9 @@ static void hdmi_print_sad_info(int i, struct cea_sad *a,
+ 		snd_iprintf(buffer, "sad%d_profile\t\t%d\n", i, a->profile);
+ }
+ 
+-static void hdmi_print_eld_info(struct snd_info_entry *entry,
+-				struct snd_info_buffer *buffer)
++void snd_hdmi_print_eld_info(struct hdmi_eld *eld,
++			     struct snd_info_buffer *buffer)
+ {
+-	struct hdmi_eld *eld = entry->private_data;
+ 	struct parsed_hdmi_eld *e = &eld->info;
+ 	char buf[SND_PRINT_CHANNEL_ALLOCATION_ADVISED_BUFSIZE];
+ 	int i;
+@@ -500,13 +499,10 @@ static void hdmi_print_eld_info(struct snd_info_entry *entry,
+ 		[4 ... 7] = "reserved"
+ 	};
+ 
+-	mutex_lock(&eld->lock);
+ 	snd_iprintf(buffer, "monitor_present\t\t%d\n", eld->monitor_present);
+ 	snd_iprintf(buffer, "eld_valid\t\t%d\n", eld->eld_valid);
+-	if (!eld->eld_valid) {
+-		mutex_unlock(&eld->lock);
++	if (!eld->eld_valid)
+ 		return;
+-	}
+ 	snd_iprintf(buffer, "monitor_name\t\t%s\n", e->monitor_name);
+ 	snd_iprintf(buffer, "connection_type\t\t%s\n",
+ 				eld_connection_type_names[e->conn_type]);
+@@ -528,13 +524,11 @@ static void hdmi_print_eld_info(struct snd_info_entry *entry,
+ 
+ 	for (i = 0; i < e->sad_count; i++)
+ 		hdmi_print_sad_info(i, e->sad + i, buffer);
+-	mutex_unlock(&eld->lock);
+ }
+ 
+-static void hdmi_write_eld_info(struct snd_info_entry *entry,
+-				struct snd_info_buffer *buffer)
++void snd_hdmi_write_eld_info(struct hdmi_eld *eld,
++			     struct snd_info_buffer *buffer)
+ {
+-	struct hdmi_eld *eld = entry->private_data;
+ 	struct parsed_hdmi_eld *e = &eld->info;
+ 	char line[64];
+ 	char name[64];
+@@ -542,7 +536,6 @@ static void hdmi_write_eld_info(struct snd_info_entry *entry,
+ 	long long val;
+ 	unsigned int n;
+ 
+-	mutex_lock(&eld->lock);
+ 	while (!snd_info_get_line(buffer, line, sizeof(line))) {
+ 		if (sscanf(line, "%s %llx", name, &val) != 2)
+ 			continue;
+@@ -594,38 +587,7 @@ static void hdmi_write_eld_info(struct snd_info_entry *entry,
+ 				e->sad_count = n + 1;
+ 		}
+ 	}
+-	mutex_unlock(&eld->lock);
+-}
+-
+-
+-int snd_hda_eld_proc_new(struct hda_codec *codec, struct hdmi_eld *eld,
+-			 int index)
+-{
+-	char name[32];
+-	struct snd_info_entry *entry;
+-	int err;
+-
+-	snprintf(name, sizeof(name), "eld#%d.%d", codec->addr, index);
+-	err = snd_card_proc_new(codec->bus->card, name, &entry);
+-	if (err < 0)
+-		return err;
+-
+-	snd_info_set_text_ops(entry, eld, hdmi_print_eld_info);
+-	entry->c.text.write = hdmi_write_eld_info;
+-	entry->mode |= S_IWUSR;
+-	eld->proc_entry = entry;
+-
+-	return 0;
+-}
+-
+-void snd_hda_eld_proc_free(struct hda_codec *codec, struct hdmi_eld *eld)
+-{
+-	if (!codec->bus->shutdown && eld->proc_entry) {
+-		snd_device_free(codec->bus->card, eld->proc_entry);
+-		eld->proc_entry = NULL;
+-	}
+ }
+-
+ #endif /* CONFIG_PROC_FS */
+ 
+ /* update PCM info based on ELD */
+diff --git a/sound/pci/hda/hda_local.h b/sound/pci/hda/hda_local.h
+index 974963e5c11a..5bad3bb92f55 100644
+--- a/sound/pci/hda/hda_local.h
++++ b/sound/pci/hda/hda_local.h
+@@ -744,10 +744,6 @@ struct hdmi_eld {
+ 	int	eld_size;
+ 	char    eld_buffer[ELD_MAX_SIZE];
+ 	struct parsed_hdmi_eld info;
+-	struct mutex lock;
+-#ifdef CONFIG_PROC_FS
+-	struct snd_info_entry *proc_entry;
+-#endif
+ };
+ 
+ int snd_hdmi_get_eld_size(struct hda_codec *codec, hda_nid_t nid);
+@@ -760,20 +756,10 @@ void snd_hdmi_eld_update_pcm_info(struct parsed_hdmi_eld *e,
+ 			      struct hda_pcm_stream *hinfo);
+ 
+ #ifdef CONFIG_PROC_FS
+-int snd_hda_eld_proc_new(struct hda_codec *codec, struct hdmi_eld *eld,
+-			 int index);
+-void snd_hda_eld_proc_free(struct hda_codec *codec, struct hdmi_eld *eld);
+-#else
+-static inline int snd_hda_eld_proc_new(struct hda_codec *codec,
+-				       struct hdmi_eld *eld,
+-				       int index)
+-{
+-	return 0;
+-}
+-static inline void snd_hda_eld_proc_free(struct hda_codec *codec,
+-					 struct hdmi_eld *eld)
+-{
+-}
++void snd_hdmi_print_eld_info(struct hdmi_eld *eld,
++			     struct snd_info_buffer *buffer);
++void snd_hdmi_write_eld_info(struct hdmi_eld *eld,
++			     struct snd_info_buffer *buffer);
+ #endif
+ 
+ #define SND_PRINT_CHANNEL_ALLOCATION_ADVISED_BUFSIZE 80
+* Unmerged path sound/pci/hda/patch_hdmi.c
