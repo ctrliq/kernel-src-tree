@@ -1,0 +1,172 @@
+CIFS: Use multicredits for SMB 2.1/3 reads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Pavel Shilovsky <pshilovsky@samba.org>
+commit bed9da0213f2174719b68012bd60735a11cfe244
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bed9da02.failed
+
+If we negotiate SMB 2.1 and higher version of the protocol and
+a server supports large read buffer size, we need to consume 1
+credit per 65536 bytes. So, we need to know how many credits
+we have and obtain the required number of them before constructing
+a readdata structure in readpages and user read.
+
+	Reviewed-by: Shirish Pargaonkar <spargaonkar@suse.com>
+	Signed-off-by: Pavel Shilovsky <pshilovsky@samba.org>
+	Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit bed9da0213f2174719b68012bd60735a11cfe244)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/file.c
+diff --cc fs/cifs/file.c
+index 8387da6cfd58,ebdeb56f8d30..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -2855,21 -2912,14 +2855,28 @@@ cifs_uncached_read_into_pages(struct TC
+  	return total_read > 0 && result != -EAGAIN ? total_read : result;
+  }
+  
+ -static int
+ -cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
+ -		     struct cifs_sb_info *cifs_sb, struct list_head *rdata_list)
+ +ssize_t cifs_user_readv(struct kiocb *iocb, const struct iovec *iov,
+ +			       unsigned long nr_segs, loff_t pos)
+  {
+++<<<<<<< HEAD
+ +	struct file *file = iocb->ki_filp;
+ +	ssize_t rc;
+ +	size_t len, cur_len;
+ +	ssize_t total_read = 0;
+ +	loff_t offset = pos;
+ +	unsigned int npages;
+ +	struct cifs_sb_info *cifs_sb;
+ +	struct cifs_tcon *tcon;
+ +	struct cifsFileInfo *open_file;
+ +	struct cifs_readdata *rdata, *tmp;
+ +	struct list_head rdata_list;
+ +	struct iov_iter to;
+++=======
++ 	struct cifs_readdata *rdata;
++ 	unsigned int npages, rsize, credits;
++ 	size_t cur_len;
++ 	int rc;
+++>>>>>>> bed9da0213f2 (CIFS: Use multicredits for SMB 2.1/3 reads)
+  	pid_t pid;
+  	struct TCP_Server_Info *server;
+  
+@@@ -2897,11 -2930,13 +2904,20 @@@
+  	else
+  		pid = current->tgid;
+  
+ +	if ((file->f_flags & O_ACCMODE) == O_WRONLY)
+ +		cifs_dbg(FYI, "attempting read on write only file instance\n");
+ +
+  	do {
+++<<<<<<< HEAD
+ +		cur_len = min_t(const size_t, len - total_read, cifs_sb->rsize);
+++=======
++ 		rc = server->ops->wait_mtu_credits(server, cifs_sb->rsize,
++ 						   &rsize, &credits);
++ 		if (rc)
++ 			break;
++ 
++ 		cur_len = min_t(const size_t, len, rsize);
+++>>>>>>> bed9da0213f2 (CIFS: Use multicredits for SMB 2.1/3 reads)
+  		npages = DIV_ROUND_UP(cur_len, PAGE_SIZE);
+  
+  		/* allocate a readdata struct */
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 16664c015d95..1ba71d4b30f9 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -1055,6 +1055,7 @@ struct cifs_readdata {
+ 	struct kvec			iov;
+ 	unsigned int			pagesz;
+ 	unsigned int			tailsz;
++	unsigned int			credits;
+ 	unsigned int			nr_pages;
+ 	struct page			*pages[];
+ };
+* Unmerged path fs/cifs/file.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 9605585a8689..18521efb6202 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -198,8 +198,9 @@ smb2_negotiate_rsize(struct cifs_tcon *tcon, struct smb_vol *volume_info)
+ 	/* start with specified rsize, or default */
+ 	rsize = volume_info->rsize ? volume_info->rsize : CIFS_DEFAULT_IOSIZE;
+ 	rsize = min_t(unsigned int, rsize, server->max_read);
+-	/* set it to the maximum buffer size value we can send with 1 credit */
+-	rsize = min_t(unsigned int, rsize, SMB2_MAX_BUFFER_SIZE);
++
++	if (!(server->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU))
++		rsize = min_t(unsigned int, rsize, SMB2_MAX_BUFFER_SIZE);
+ 
+ 	return rsize;
+ }
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index ba60063879ce..1243833b6ff5 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -1753,11 +1753,12 @@ smb2_readv_callback(struct mid_q_entry *mid)
+ int
+ smb2_async_readv(struct cifs_readdata *rdata)
+ {
+-	int rc;
++	int rc, flags = 0;
+ 	struct smb2_hdr *buf;
+ 	struct cifs_io_parms io_parms;
+ 	struct smb_rqst rqst = { .rq_iov = &rdata->iov,
+ 				 .rq_nvec = 1 };
++	struct TCP_Server_Info *server;
+ 
+ 	cifs_dbg(FYI, "%s: offset=%llu bytes=%u\n",
+ 		 __func__, rdata->offset, rdata->bytes);
+@@ -1768,18 +1769,41 @@ smb2_async_readv(struct cifs_readdata *rdata)
+ 	io_parms.persistent_fid = rdata->cfile->fid.persistent_fid;
+ 	io_parms.volatile_fid = rdata->cfile->fid.volatile_fid;
+ 	io_parms.pid = rdata->pid;
++
++	server = io_parms.tcon->ses->server;
++
+ 	rc = smb2_new_read_req(&rdata->iov, &io_parms, 0, 0);
+-	if (rc)
++	if (rc) {
++		if (rc == -EAGAIN && rdata->credits) {
++			/* credits was reset by reconnect */
++			rdata->credits = 0;
++			/* reduce in_flight value since we won't send the req */
++			spin_lock(&server->req_lock);
++			server->in_flight--;
++			spin_unlock(&server->req_lock);
++		}
+ 		return rc;
++	}
+ 
+ 	buf = (struct smb2_hdr *)rdata->iov.iov_base;
+ 	/* 4 for rfc1002 length field */
+ 	rdata->iov.iov_len = get_rfc1002_length(rdata->iov.iov_base) + 4;
+ 
++	if (rdata->credits) {
++		buf->CreditCharge = cpu_to_le16(DIV_ROUND_UP(rdata->bytes,
++						SMB2_MAX_BUFFER_SIZE));
++		spin_lock(&server->req_lock);
++		server->credits += rdata->credits -
++						le16_to_cpu(buf->CreditCharge);
++		spin_unlock(&server->req_lock);
++		wake_up(&server->request_q);
++		flags = CIFS_HAS_CREDITS;
++	}
++
+ 	kref_get(&rdata->refcount);
+ 	rc = cifs_call_async(io_parms.tcon->ses->server, &rqst,
+ 			     cifs_readv_receive, smb2_readv_callback,
+-			     rdata, 0);
++			     rdata, flags);
+ 	if (rc) {
+ 		kref_put(&rdata->refcount, cifs_readdata_release);
+ 		cifs_stats_fail_inc(io_parms.tcon, SMB2_READ_HE);
