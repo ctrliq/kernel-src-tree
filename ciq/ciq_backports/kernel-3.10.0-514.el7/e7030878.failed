@@ -1,0 +1,317 @@
+fib: Add fib rule match on tunnel id
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit e7030878fc8448492b6e5cecd574043f63271298
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e7030878.failed
+
+This add the ability to select a routing table based on the tunnel
+id which allows to maintain separate routing tables for each virtual
+tunnel network.
+
+ip rule add from all tunnel-id 100 lookup 100
+ip rule add from all tunnel-id 200 lookup 200
+
+A new static key controls the collection of metadata at tunnel level
+upon demand.
+
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e7030878fc8448492b6e5cecd574043f63271298)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/ip_tunnels.h
+#	include/uapi/linux/fib_rules.h
+#	net/core/fib_rules.c
+#	net/ipv4/ip_tunnel_core.c
+diff --cc drivers/net/vxlan.c
+index e2461103c0f3,2587ac84f71a..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -140,6 -141,12 +140,15 @@@ struct vxlan_dev 
+  static u32 vxlan_salt __read_mostly;
+  static struct workqueue_struct *vxlan_wq;
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool vxlan_collect_metadata(struct vxlan_sock *vs)
++ {
++ 	return vs->flags & VXLAN_F_COLLECT_METADATA ||
++ 	       ip_tunnel_collect_metadata();
++ }
++ 
+++>>>>>>> e7030878fc84 (fib: Add fib rule match on tunnel id)
+  #if IS_ENABLED(CONFIG_IPV6)
+  static inline
+  bool vxlan_addr_equal(const union vxlan_addr *a, const union vxlan_addr *b)
+diff --cc include/net/ip_tunnels.h
+index 1466fdbddeda,0a5a7763eec2..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -296,6 -293,27 +296,30 @@@ static inline void iptunnel_xmit_stats(
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void *ip_tunnel_info_opts(struct ip_tunnel_info *info, size_t n)
++ {
++ 	return info + 1;
++ }
++ 
++ static inline struct ip_tunnel_info *lwt_tun_info(struct lwtunnel_state *lwtstate)
++ {
++ 	return (struct ip_tunnel_info *)lwtstate->data;
++ }
++ 
++ extern struct static_key ip_tunnel_metadata_cnt;
++ 
++ /* Returns > 0 if metadata should be collected */
++ static inline int ip_tunnel_collect_metadata(void)
++ {
++ 	return static_key_false(&ip_tunnel_metadata_cnt);
++ }
++ 
++ void ip_tunnel_need_metadata(void);
++ void ip_tunnel_unneed_metadata(void);
++ 
+++>>>>>>> e7030878fc84 (fib: Add fib rule match on tunnel id)
+  #endif /* CONFIG_INET */
+  
+  #endif /* __NET_IP_TUNNELS_H */
+diff --cc include/uapi/linux/fib_rules.h
+index 51da65b68b85,96161b8202b5..000000000000
+--- a/include/uapi/linux/fib_rules.h
++++ b/include/uapi/linux/fib_rules.h
+@@@ -43,9 -43,9 +43,15 @@@ enum 
+  	FRA_UNUSED5,
+  	FRA_FWMARK,	/* mark */
+  	FRA_FLOW,	/* flow/class id */
+++<<<<<<< HEAD
+ +	FRA_UNUSED6,
+ +	FRA_UNUSED7,
+ +	FRA_UNUSED8,
+++=======
++ 	FRA_TUN_ID,
++ 	FRA_SUPPRESS_IFGROUP,
++ 	FRA_SUPPRESS_PREFIXLEN,
+++>>>>>>> e7030878fc84 (fib: Add fib rule match on tunnel id)
+  	FRA_TABLE,	/* Extended table id */
+  	FRA_FWMASK,	/* mask for netfilter mark */
+  	FRA_OIFNAME,
+diff --cc net/core/fib_rules.c
+index 2771bcd5bded,ae8306e7c56f..000000000000
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@@ -466,6 -495,15 +480,18 @@@ static int fib_nl_delrule(struct sk_buf
+  			goto errout;
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		if (ops->delete) {
++ 			err = ops->delete(rule);
++ 			if (err)
++ 				goto errout;
++ 		}
++ 
++ 		if (rule->tun_id)
++ 			ip_tunnel_unneed_metadata();
++ 
+++>>>>>>> e7030878fc84 (fib: Add fib rule match on tunnel id)
+  		list_del_rcu(&rule->list);
+  
+  		if (rule->action == FR_ACT_GOTO) {
+@@@ -513,8 -549,11 +539,9 @@@ static inline size_t fib_rule_nlmsg_siz
+  			 + nla_total_size(IFNAMSIZ) /* FRA_OIFNAME */
+  			 + nla_total_size(4) /* FRA_PRIORITY */
+  			 + nla_total_size(4) /* FRA_TABLE */
+ -			 + nla_total_size(4) /* FRA_SUPPRESS_PREFIXLEN */
+ -			 + nla_total_size(4) /* FRA_SUPPRESS_IFGROUP */
+  			 + nla_total_size(4) /* FRA_FWMARK */
+- 			 + nla_total_size(4); /* FRA_FWMASK */
++ 			 + nla_total_size(4) /* FRA_FWMASK */
++ 			 + nla_total_size(8); /* FRA_TUN_ID */
+  
+  	if (ops->nlmsg_payload)
+  		payload += ops->nlmsg_payload(rule);
+@@@ -568,8 -609,16 +595,10 @@@ static int fib_nl_fill_rule(struct sk_b
+  	    ((rule->mark_mask || rule->mark) &&
+  	     nla_put_u32(skb, FRA_FWMASK, rule->mark_mask)) ||
+  	    (rule->target &&
+- 	     nla_put_u32(skb, FRA_GOTO, rule->target)))
++ 	     nla_put_u32(skb, FRA_GOTO, rule->target)) ||
++ 	    (rule->tun_id &&
++ 	     nla_put_be64(skb, FRA_TUN_ID, rule->tun_id)))
+  		goto nla_put_failure;
+ -
+ -	if (rule->suppress_ifgroup != -1) {
+ -		if (nla_put_u32(skb, FRA_SUPPRESS_IFGROUP, rule->suppress_ifgroup))
+ -			goto nla_put_failure;
+ -	}
+ -
+  	if (ops->fill(rule, skb, frh) < 0)
+  		goto nla_put_failure;
+  
+diff --cc net/ipv4/ip_tunnel_core.c
+index 010b54caceed,630e6d5712e8..000000000000
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@@ -188,3 -191,132 +189,135 @@@ struct rtnl_link_stats64 *ip_tunnel_get
+  	return tot;
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
+++<<<<<<< HEAD
+++=======
++ 
++ static const struct nla_policy ip_tun_policy[IP_TUN_MAX + 1] = {
++ 	[IP_TUN_ID]		= { .type = NLA_U64 },
++ 	[IP_TUN_DST]		= { .type = NLA_U32 },
++ 	[IP_TUN_SRC]		= { .type = NLA_U32 },
++ 	[IP_TUN_TTL]		= { .type = NLA_U8 },
++ 	[IP_TUN_TOS]		= { .type = NLA_U8 },
++ 	[IP_TUN_SPORT]		= { .type = NLA_U16 },
++ 	[IP_TUN_DPORT]		= { .type = NLA_U16 },
++ 	[IP_TUN_FLAGS]		= { .type = NLA_U16 },
++ };
++ 
++ static int ip_tun_build_state(struct net_device *dev, struct nlattr *attr,
++ 			      struct lwtunnel_state **ts)
++ {
++ 	struct ip_tunnel_info *tun_info;
++ 	struct lwtunnel_state *new_state;
++ 	struct nlattr *tb[IP_TUN_MAX + 1];
++ 	int err;
++ 
++ 	err = nla_parse_nested(tb, IP_TUN_MAX, attr, ip_tun_policy);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	new_state = lwtunnel_state_alloc(sizeof(*tun_info));
++ 	if (!new_state)
++ 		return -ENOMEM;
++ 
++ 	new_state->type = LWTUNNEL_ENCAP_IP;
++ 
++ 	tun_info = lwt_tun_info(new_state);
++ 
++ 	if (tb[IP_TUN_ID])
++ 		tun_info->key.tun_id = nla_get_u64(tb[IP_TUN_ID]);
++ 
++ 	if (tb[IP_TUN_DST])
++ 		tun_info->key.ipv4_dst = nla_get_be32(tb[IP_TUN_DST]);
++ 
++ 	if (tb[IP_TUN_SRC])
++ 		tun_info->key.ipv4_src = nla_get_be32(tb[IP_TUN_SRC]);
++ 
++ 	if (tb[IP_TUN_TTL])
++ 		tun_info->key.ipv4_ttl = nla_get_u8(tb[IP_TUN_TTL]);
++ 
++ 	if (tb[IP_TUN_TOS])
++ 		tun_info->key.ipv4_tos = nla_get_u8(tb[IP_TUN_TOS]);
++ 
++ 	if (tb[IP_TUN_SPORT])
++ 		tun_info->key.tp_src = nla_get_be16(tb[IP_TUN_SPORT]);
++ 
++ 	if (tb[IP_TUN_DPORT])
++ 		tun_info->key.tp_dst = nla_get_be16(tb[IP_TUN_DPORT]);
++ 
++ 	if (tb[IP_TUN_FLAGS])
++ 		tun_info->key.tun_flags = nla_get_u16(tb[IP_TUN_FLAGS]);
++ 
++ 	tun_info->mode = IP_TUNNEL_INFO_TX;
++ 	tun_info->options = NULL;
++ 	tun_info->options_len = 0;
++ 
++ 	*ts = new_state;
++ 
++ 	return 0;
++ }
++ 
++ static int ip_tun_fill_encap_info(struct sk_buff *skb,
++ 				  struct lwtunnel_state *lwtstate)
++ {
++ 	struct ip_tunnel_info *tun_info = lwt_tun_info(lwtstate);
++ 
++ 	if (nla_put_u64(skb, IP_TUN_ID, tun_info->key.tun_id) ||
++ 	    nla_put_be32(skb, IP_TUN_DST, tun_info->key.ipv4_dst) ||
++ 	    nla_put_be32(skb, IP_TUN_SRC, tun_info->key.ipv4_src) ||
++ 	    nla_put_u8(skb, IP_TUN_TOS, tun_info->key.ipv4_tos) ||
++ 	    nla_put_u8(skb, IP_TUN_TTL, tun_info->key.ipv4_ttl) ||
++ 	    nla_put_u16(skb, IP_TUN_SPORT, tun_info->key.tp_src) ||
++ 	    nla_put_u16(skb, IP_TUN_DPORT, tun_info->key.tp_dst) ||
++ 	    nla_put_u16(skb, IP_TUN_FLAGS, tun_info->key.tun_flags))
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
++ static int ip_tun_encap_nlsize(struct lwtunnel_state *lwtstate)
++ {
++ 	return nla_total_size(8)	/* IP_TUN_ID */
++ 		+ nla_total_size(4)	/* IP_TUN_DST */
++ 		+ nla_total_size(4)	/* IP_TUN_SRC */
++ 		+ nla_total_size(1)	/* IP_TUN_TOS */
++ 		+ nla_total_size(1)	/* IP_TUN_TTL */
++ 		+ nla_total_size(2)	/* IP_TUN_SPORT */
++ 		+ nla_total_size(2)	/* IP_TUN_DPORT */
++ 		+ nla_total_size(2);	/* IP_TUN_FLAGS */
++ }
++ 
++ static const struct lwtunnel_encap_ops ip_tun_lwt_ops = {
++ 	.build_state = ip_tun_build_state,
++ 	.fill_encap = ip_tun_fill_encap_info,
++ 	.get_encap_size = ip_tun_encap_nlsize,
++ };
++ 
++ static int __init ip_tunnel_core_init(void)
++ {
++ 	lwtunnel_encap_add_ops(&ip_tun_lwt_ops, LWTUNNEL_ENCAP_IP);
++ 
++ 	return 0;
++ }
++ module_init(ip_tunnel_core_init);
++ 
++ static void __exit ip_tunnel_core_exit(void)
++ {
++ 	lwtunnel_encap_del_ops(&ip_tun_lwt_ops, LWTUNNEL_ENCAP_IP);
++ }
++ module_exit(ip_tunnel_core_exit);
++ 
++ struct static_key ip_tunnel_metadata_cnt = STATIC_KEY_INIT_FALSE;
++ EXPORT_SYMBOL(ip_tunnel_metadata_cnt);
++ 
++ void ip_tunnel_need_metadata(void)
++ {
++ 	static_key_slow_inc(&ip_tunnel_metadata_cnt);
++ }
++ EXPORT_SYMBOL_GPL(ip_tunnel_need_metadata);
++ 
++ void ip_tunnel_unneed_metadata(void)
++ {
++ 	static_key_slow_dec(&ip_tunnel_metadata_cnt);
++ }
++ EXPORT_SYMBOL_GPL(ip_tunnel_unneed_metadata);
+++>>>>>>> e7030878fc84 (fib: Add fib rule match on tunnel id)
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/fib_rules.h b/include/net/fib_rules.h
+index 5b0bbc779862..b0c72e5ee459 100644
+--- a/include/net/fib_rules.h
++++ b/include/net/fib_rules.h
+@@ -20,6 +20,7 @@ struct fib_rule {
+ 	u32			table;
+ 	u8			action;
+ 	u32			target;
++	__be64			tun_id;
+ 	struct fib_rule __rcu	*ctarget;
+ 	char			iifname[IFNAMSIZ];
+ 	char			oifname[IFNAMSIZ];
+* Unmerged path include/net/ip_tunnels.h
+* Unmerged path include/uapi/linux/fib_rules.h
+* Unmerged path net/core/fib_rules.c
+* Unmerged path net/ipv4/ip_tunnel_core.c
