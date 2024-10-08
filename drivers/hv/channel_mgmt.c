@@ -405,7 +405,7 @@ static void init_vp_index(struct vmbus_channel *channel, uuid_le *type_guid)
 		 * channel, bind it to cpu 0.
 		 */
 		channel->target_cpu = 0;
-		channel->target_vp = 0;
+		channel->target_vp = hv_context.vp_index[0];
 		return;
 	}
 	cur_cpu = (++next_vp % max_cpus);
