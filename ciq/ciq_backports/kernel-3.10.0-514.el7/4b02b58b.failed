@@ -1,0 +1,160 @@
+hv_netvsc: change member name of struct netvsc_stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author sixiao@microsoft.com <sixiao@microsoft.com>
+commit 4b02b58b52fab385e120c4b4f0d90f5f3076352d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4b02b58b.failed
+
+Currently the struct netvsc_stats has a member s_sync
+of type u64_stats_sync.
+This definition will break kernel build as the macro
+netdev_alloc_pcpu_stats requires this member name to be syncp.
+(see netdev_alloc_pcpu_stats definition in ./include/linux/netdevice.h)
+
+This patch changes netvsc_stats's member name from s_sync to syncp to fix
+the build break.
+
+	Signed-off-by: Simon Xiao <sixiao@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4b02b58b52fab385e120c4b4f0d90f5f3076352d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 3362765215d6,ddcc7f8d22b4..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -595,7 -602,34 +595,38 @@@ struct nvsp_message 
+  
+  #define VRSS_SEND_TAB_SIZE 16
+  
+++<<<<<<< HEAD
+ +/* Per netvsc channel-specific */
+++=======
++ #define RNDIS_MAX_PKT_DEFAULT 8
++ #define RNDIS_PKT_ALIGN_DEFAULT 8
++ 
++ struct multi_send_data {
++ 	spinlock_t lock; /* protect struct multi_send_data */
++ 	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++ 	u32 count; /* counter of batched packets */
++ };
++ 
++ struct netvsc_stats {
++ 	u64 packets;
++ 	u64 bytes;
++ 	struct u64_stats_sync syncp;
++ };
++ 
++ /* The context of the netvsc device  */
++ struct net_device_context {
++ 	/* point back to our device context */
++ 	struct hv_device *device_ctx;
++ 	struct delayed_work dwork;
++ 	struct work_struct work;
++ 	u32 msg_enable; /* debug level */
++ 
++ 	struct netvsc_stats __percpu *tx_stats;
++ 	struct netvsc_stats __percpu *rx_stats;
++ };
++ 
++ /* Per netvsc device */
+++>>>>>>> 4b02b58b52fa (hv_netvsc: change member name of struct netvsc_stats)
+  struct netvsc_device {
+  	struct hv_device *dev;
+  
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index f6bc78f79972,d9c88bc09f45..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -560,10 -580,11 +560,17 @@@ do_send
+  
+  drop:
+  	if (ret == 0) {
+++<<<<<<< HEAD
+ +		net->stats.tx_bytes += skb_length;
+ +		net->stats.tx_packets++;
+++=======
++ 		u64_stats_update_begin(&tx_stats->syncp);
++ 		tx_stats->packets++;
++ 		tx_stats->bytes += skb_length;
++ 		u64_stats_update_end(&tx_stats->syncp);
+++>>>>>>> 4b02b58b52fa (hv_netvsc: change member name of struct netvsc_stats)
+  	} else {
+ +		kfree(packet);
+  		if (ret != -EAGAIN) {
+  			dev_kfree_skb_any(skb);
+  			net->stats.tx_dropped++;
+@@@ -654,8 -692,10 +661,15 @@@ int netvsc_recv_callback(struct hv_devi
+  	skb_record_rx_queue(skb, packet->channel->
+  			    offermsg.offer.sub_channel_index);
+  
+++<<<<<<< HEAD
+ +	net->stats.rx_packets++;
+ +	net->stats.rx_bytes += packet->total_data_buflen;
+++=======
++ 	u64_stats_update_begin(&rx_stats->syncp);
++ 	rx_stats->packets++;
++ 	rx_stats->bytes += packet->total_data_buflen;
++ 	u64_stats_update_end(&rx_stats->syncp);
+++>>>>>>> 4b02b58b52fa (hv_netvsc: change member name of struct netvsc_stats)
+  
+  	/*
+  	 * Pass the skb back up. Network stack will deallocate the skb when it
+@@@ -721,6 -761,46 +735,49 @@@ static int netvsc_change_mtu(struct net
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rtnl_link_stats64 *netvsc_get_stats64(struct net_device *net,
++ 						    struct rtnl_link_stats64 *t)
++ {
++ 	struct net_device_context *ndev_ctx = netdev_priv(net);
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct netvsc_stats *tx_stats = per_cpu_ptr(ndev_ctx->tx_stats,
++ 							    cpu);
++ 		struct netvsc_stats *rx_stats = per_cpu_ptr(ndev_ctx->rx_stats,
++ 							    cpu);
++ 		u64 tx_packets, tx_bytes, rx_packets, rx_bytes;
++ 		unsigned int start;
++ 
++ 		do {
++ 			start = u64_stats_fetch_begin_irq(&tx_stats->syncp);
++ 			tx_packets = tx_stats->packets;
++ 			tx_bytes = tx_stats->bytes;
++ 		} while (u64_stats_fetch_retry_irq(&tx_stats->syncp, start));
++ 
++ 		do {
++ 			start = u64_stats_fetch_begin_irq(&rx_stats->syncp);
++ 			rx_packets = rx_stats->packets;
++ 			rx_bytes = rx_stats->bytes;
++ 		} while (u64_stats_fetch_retry_irq(&rx_stats->syncp, start));
++ 
++ 		t->tx_bytes	+= tx_bytes;
++ 		t->tx_packets	+= tx_packets;
++ 		t->rx_bytes	+= rx_bytes;
++ 		t->rx_packets	+= rx_packets;
++ 	}
++ 
++ 	t->tx_dropped	= net->stats.tx_dropped;
++ 	t->tx_errors	= net->stats.tx_dropped;
++ 
++ 	t->rx_dropped	= net->stats.rx_dropped;
++ 	t->rx_errors	= net->stats.rx_errors;
++ 
++ 	return t;
++ }
+++>>>>>>> 4b02b58b52fa (hv_netvsc: change member name of struct netvsc_stats)
+  
+  static int netvsc_set_mac_addr(struct net_device *ndev, void *p)
+  {
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
