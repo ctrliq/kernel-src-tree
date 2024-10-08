@@ -1,0 +1,255 @@
+cpufreq: Use rwsem for protecting critical sections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [cpufreq] Use rwsem for protecting critical sections (Prarit Bhargava) [1031793]
+Rebuild_FUZZ: 90.32%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 6eed9404ab3c4baea54ce4c7e862e69df1d39f38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6eed9404.failed
+
+Critical sections of the cpufreq core are protected with the help of
+the driver module owner's refcount, which isn't the correct approach,
+because it causes rmmod to return an error when some routine has
+updated that refcount.
+
+Let's use rwsem for this purpose instead.  Only
+cpufreq_unregister_driver() will use write sem
+and everybody else will use read sem.
+
+[rjw: Subject & changelog]
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 6eed9404ab3c4baea54ce4c7e862e69df1d39f38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 92c36d09d291,c9bbfeef92e3..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -182,79 -184,46 +188,111 @@@ u64 get_cpu_idle_time(unsigned int cpu
+  }
+  EXPORT_SYMBOL_GPL(get_cpu_idle_time);
+  
+- static struct cpufreq_policy *__cpufreq_cpu_get(unsigned int cpu, bool sysfs)
++ struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	struct cpufreq_policy *data;
+++=======
++ 	struct cpufreq_policy *policy = NULL;
+++>>>>>>> 6eed9404ab3c (cpufreq: Use rwsem for protecting critical sections)
+  	unsigned long flags;
+  
+- 	if (cpu >= nr_cpu_ids)
+- 		goto err_out;
++ 	if (cpufreq_disabled() || (cpu >= nr_cpu_ids))
++ 		return NULL;
++ 
++ 	if (!down_read_trylock(&cpufreq_rwsem))
++ 		return NULL;
+  
+  	/* get the cpufreq driver */
+  	read_lock_irqsave(&cpufreq_driver_lock, flags);
+  
+- 	if (!cpufreq_driver)
+- 		goto err_out_unlock;
++ 	if (cpufreq_driver) {
++ 		/* get the CPU */
++ 		policy = per_cpu(cpufreq_cpu_data, cpu);
++ 		if (policy)
++ 			kobject_get(&policy->kobj);
++ 	}
+  
+++<<<<<<< HEAD
+ +	if (!try_module_get(cpufreq_driver->owner))
+ +		goto err_out_unlock;
+ +
+ +
+ +	/* get the CPU */
+ +	data = per_cpu(cpufreq_cpu_data, cpu);
+ +
+ +	if (!data)
+ +		goto err_out_put_module;
+ +
+ +	if (!sysfs && !kobject_get(&data->kobj))
+ +		goto err_out_put_module;
+ +
+ +	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +	return data;
+ +
+ +err_out_put_module:
+ +	module_put(cpufreq_driver->owner);
+ +err_out_unlock:
+ +	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +err_out:
+ +	return NULL;
+ +}
+ +
+ +struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu)
+ +{
+ +	if (cpufreq_disabled())
+ +		return NULL;
+ +
+ +	return __cpufreq_cpu_get(cpu, false);
+ +}
+ +EXPORT_SYMBOL_GPL(cpufreq_cpu_get);
+ +
+ +static struct cpufreq_policy *cpufreq_cpu_get_sysfs(unsigned int cpu)
+ +{
+ +	return __cpufreq_cpu_get(cpu, true);
+ +}
+ +
+ +static void __cpufreq_cpu_put(struct cpufreq_policy *data, bool sysfs)
+ +{
+ +	if (!sysfs)
+ +		kobject_put(&data->kobj);
+ +	module_put(cpufreq_driver->owner);
+ +}
+ +
+ +void cpufreq_cpu_put(struct cpufreq_policy *data)
+++=======
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy)
++ 		up_read(&cpufreq_rwsem);
++ 
++ 	return policy;
++ }
++ EXPORT_SYMBOL_GPL(cpufreq_cpu_get);
++ 
++ void cpufreq_cpu_put(struct cpufreq_policy *policy)
+++>>>>>>> 6eed9404ab3c (cpufreq: Use rwsem for protecting critical sections)
+  {
+  	if (cpufreq_disabled())
+  		return;
+  
+++<<<<<<< HEAD
+ +	__cpufreq_cpu_put(data, false);
+ +}
+ +EXPORT_SYMBOL_GPL(cpufreq_cpu_put);
+ +
+ +static void cpufreq_cpu_put_sysfs(struct cpufreq_policy *data)
+ +{
+ +	__cpufreq_cpu_put(data, true);
+ +}
+ +
+++=======
++ 	kobject_put(&policy->kobj);
++ 	up_read(&cpufreq_rwsem);
++ }
++ EXPORT_SYMBOL_GPL(cpufreq_cpu_put);
++ 
+++>>>>>>> 6eed9404ab3c (cpufreq: Use rwsem for protecting critical sections)
+  /*********************************************************************
+   *            EXTERNALLY AFFECTING FREQUENCY CHANGES                 *
+   *********************************************************************/
+@@@ -970,23 -985,24 +1013,38 @@@ static int cpufreq_add_dev(struct devic
+  #ifdef CONFIG_HOTPLUG_CPU
+  	/* Check if this cpu was hot-unplugged earlier and has siblings */
+  	read_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	list_for_each_entry(tpolicy, &cpufreq_policy_list, policy_list) {
+ -		if (cpumask_test_cpu(cpu, tpolicy->related_cpus)) {
+ +	for_each_online_cpu(sibling) {
+ +		struct cpufreq_policy *cp = per_cpu(cpufreq_cpu_data, sibling);
+ +		if (cp && cpumask_test_cpu(cpu, cp->related_cpus)) {
+  			read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+++<<<<<<< HEAD
+ +			return cpufreq_add_policy_cpu(cpu, sibling, dev);
+++=======
++ 			ret = cpufreq_add_policy_cpu(tpolicy, cpu, dev, frozen);
++ 			up_read(&cpufreq_rwsem);
++ 			return ret;
+++>>>>>>> 6eed9404ab3c (cpufreq: Use rwsem for protecting critical sections)
+  		}
+  	}
+  	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  #endif
+  #endif
+  
+++<<<<<<< HEAD
+ +	if (!try_module_get(cpufreq_driver->owner)) {
+ +		ret = -EINVAL;
+ +		goto module_out;
+ +	}
+ +
+ +	policy = kzalloc(sizeof(struct cpufreq_policy), GFP_KERNEL);
+++=======
++ 	if (frozen)
++ 		/* Restore the saved policy when doing light-weight init */
++ 		policy = cpufreq_policy_restore(cpu);
++ 	else
++ 		policy = cpufreq_policy_alloc();
++ 
+++>>>>>>> 6eed9404ab3c (cpufreq: Use rwsem for protecting critical sections)
+  	if (!policy)
+  		goto nomem_out;
+  
+@@@ -1039,35 -1049,47 +1097,36 @@@
+  	}
+  #endif
+  
+ -	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	for_each_cpu(j, policy->cpus) {
+ -		per_cpu(cpufreq_cpu_data, j) = policy;
+ -		per_cpu(cpufreq_policy_cpu, j) = policy->cpu;
+ -	}
+ -	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ -
+ -	if (!frozen) {
+ -		ret = cpufreq_add_dev_interface(policy, dev);
+ -		if (ret)
+ -			goto err_out_unregister;
+ -
+ -		write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -		list_add(&policy->policy_list, &cpufreq_policy_list);
+ -		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ -	}
+ -
+ -	cpufreq_init_policy(policy);
+ +	ret = cpufreq_add_dev_interface(cpu, policy, dev);
+ +	if (ret)
+ +		goto err_out_unregister;
+  
+  	kobject_uevent(&policy->kobj, KOBJ_ADD);
+- 	module_put(cpufreq_driver->owner);
++ 	up_read(&cpufreq_rwsem);
++ 
+  	pr_debug("initialization complete\n");
+  
+  	return 0;
+  
+  err_out_unregister:
+  	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	for_each_cpu(j, policy->cpus) {
+ +	for_each_cpu(j, policy->cpus)
+  		per_cpu(cpufreq_cpu_data, j) = NULL;
+ -		if (j != cpu)
+ -			per_cpu(cpufreq_policy_cpu, j) = -1;
+ -	}
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+ +	kobject_put(&policy->kobj);
+ +	wait_for_completion(&policy->kobj_unregister);
+ +
+  err_set_policy_cpu:
+  	per_cpu(cpufreq_policy_cpu, cpu) = -1;
+ -	cpufreq_policy_free(policy);
+ +	free_cpumask_var(policy->related_cpus);
+ +err_free_cpumask:
+ +	free_cpumask_var(policy->cpus);
+ +err_free_policy:
+ +	kfree(policy);
+  nomem_out:
+- 	module_put(cpufreq_driver->owner);
+- module_out:
++ 	up_read(&cpufreq_rwsem);
++ 
+  	return ret;
+  }
+  
+* Unmerged path drivers/cpufreq/cpufreq.c
