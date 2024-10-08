@@ -1,0 +1,119 @@
+powerpc/eeh: Selectively enable IO for error log
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Selectively enable IO for error log (Steve Best) [1211945]
+Rebuild_FUZZ: 90.91%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit dc561fb9e7e13ad77000ccec5d45dc71596f98a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dc561fb9.failed
+
+According to the experiment I did, PCI config access is blocked
+on P7IOC frozen PE by hardware, but PHB3 doesn't do that. That
+means we always get 0xFF's while dumping PCI config space of the
+frozen PE on P7IOC. We don't have the problem on PHB3. So we have
+to enable I/O prioir to collecting error log. Otherwise, meaningless
+0xFF's are always returned.
+
+The patch fixes it by EEH flag (EEH_ENABLE_IO_FOR_LOG), which is
+selectively set to indicate the case for: P7IOC on PowerNV platform,
+pSeries platform.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit dc561fb9e7e13ad77000ccec5d45dc71596f98a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/eeh.c
+#	arch/powerpc/platforms/pseries/eeh_pseries.c
+diff --cc arch/powerpc/kernel/eeh.c
+index aafd43037fdc,aa33656e9a22..000000000000
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@@ -251,7 -252,7 +251,11 @@@ void eeh_slot_error_detail(struct eeh_p
+  	 * 0xFF's is always returned from PCI config space.
+  	 */
+  	if (!(pe->type & EEH_PE_PHB)) {
+++<<<<<<< HEAD
+ +		if (eeh_probe_mode_devtree())
+++=======
++ 		if (eeh_has_flag(EEH_ENABLE_IO_FOR_LOG))
+++>>>>>>> dc561fb9e7e1 (powerpc/eeh: Selectively enable IO for error log)
+  			eeh_pci_enable(pe, EEH_OPT_THAW_MMIO);
+  		eeh_ops->configure_bridge(pe);
+  		eeh_pe_restore_bars(pe);
+diff --cc arch/powerpc/platforms/pseries/eeh_pseries.c
+index a919da0f7fca,dd1874ca56d9..000000000000
+--- a/arch/powerpc/platforms/pseries/eeh_pseries.c
++++ b/arch/powerpc/platforms/pseries/eeh_pseries.c
+@@@ -113,7 -128,7 +113,11 @@@ static int pseries_eeh_init(void
+  	}
+  
+  	/* Set EEH probe mode */
+++<<<<<<< HEAD
+ +	eeh_probe_mode_set(EEH_PROBE_MODE_DEVTREE);
+++=======
++ 	eeh_add_flag(EEH_PROBE_MODE_DEVTREE | EEH_ENABLE_IO_FOR_LOG);
+++>>>>>>> dc561fb9e7e1 (powerpc/eeh: Selectively enable IO for error log)
+  
+  	return 0;
+  }
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 0a55d415c449..6f542e3ea3d9 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -36,10 +36,11 @@ struct device_node;
+ #ifdef CONFIG_EEH
+ 
+ /* EEH subsystem flags */
+-#define EEH_ENABLED		0x1	/* EEH enabled		*/
+-#define EEH_FORCE_DISABLED	0x2	/* EEH disabled		*/
+-#define EEH_PROBE_MODE_DEV	0x4	/* From PCI device	*/
+-#define EEH_PROBE_MODE_DEVTREE	0x8	/* From device tree	*/
++#define EEH_ENABLED		0x01	/* EEH enabled		*/
++#define EEH_FORCE_DISABLED	0x02	/* EEH disabled		*/
++#define EEH_PROBE_MODE_DEV	0x04	/* From PCI device	*/
++#define EEH_PROBE_MODE_DEVTREE	0x08	/* From device tree	*/
++#define EEH_ENABLE_IO_FOR_LOG	0x10	/* Enable IO for log	*/
+ 
+ /*
+  * Delay for PE reset, all in ms
+* Unmerged path arch/powerpc/kernel/eeh.c
+diff --git a/arch/powerpc/platforms/powernv/eeh-powernv.c b/arch/powerpc/platforms/powernv/eeh-powernv.c
+index 998bcc18a491..6ea9e5208b2f 100644
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@ -45,6 +45,9 @@
+  */
+ static int powernv_eeh_init(void)
+ {
++	struct pci_controller *hose;
++	struct pnv_phb *phb;
++
+ 	/* We require OPALv3 */
+ 	if (!firmware_has_feature(FW_FEATURE_OPALv3)) {
+ 		pr_warning("%s: OPALv3 is required !\n", __func__);
+@@ -54,6 +57,19 @@ static int powernv_eeh_init(void)
+ 	/* Set EEH probe mode */
+ 	eeh_probe_mode_set(EEH_PROBE_MODE_DEV);
+ 
++	/*
++	 * P7IOC blocks PCI config access to frozen PE, but PHB3
++	 * doesn't do that. So we have to selectively enable I/O
++	 * prior to collecting error log.
++	 */
++	list_for_each_entry(hose, &hose_list, list_node) {
++		phb = hose->private_data;
++
++		if (phb->model == PNV_PHB_MODEL_P7IOC)
++			eeh_add_flag(EEH_ENABLE_IO_FOR_LOG);
++		break;
++	}
++
+ 	return 0;
+ }
+ 
+* Unmerged path arch/powerpc/platforms/pseries/eeh_pseries.c
