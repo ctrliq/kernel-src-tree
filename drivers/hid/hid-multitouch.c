@@ -364,6 +364,11 @@ static void mt_feature_mapping(struct hid_device *hdev,
 			*quirks &= ~MT_QUIRK_VALID_IS_CONFIDENCE;
 		}
 		break;
+	case 0xff0000c5:
+		/* Retrieve the Win8 blob once to enable some devices */
+		if (usage->usage_index == 0)
+			mt_get_feature(hdev, field->report);
+		break;
 	}
 }
 
