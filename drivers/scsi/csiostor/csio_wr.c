@@ -1354,8 +1354,8 @@ csio_wr_fixup_host_params(struct csio_hw *hw)
 	csio_set_reg_field(hw, SGE_CONTROL, PKTSHIFT_MASK,
 			   PKTSHIFT(CSIO_SGE_RX_DMA_OFFSET));
 
-	csio_hw_tp_wr_bits_indirect(hw, TP_INGRESS_CONFIG,
-				    CSUM_HAS_PSEUDO_HDR, 0);
+	csio_hw_tp_wr_bits_indirect(hw, TP_INGRESS_CONFIG_A,
+				    CSUM_HAS_PSEUDO_HDR_F, 0);
 }
 
 static void
