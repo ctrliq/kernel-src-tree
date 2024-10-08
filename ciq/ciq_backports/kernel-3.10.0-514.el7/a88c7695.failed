@@ -1,0 +1,141 @@
+mm: hugetlb: fix hugepage memory leak caused by wrong reserve count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] hugetlb: fix hugepage memory leak caused by wrong reserve count (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 96.92%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit a88c769548047b21f76fd71e04b6a3300ff17160
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a88c7695.failed
+
+When dequeue_huge_page_vma() in alloc_huge_page() fails, we fall back on
+alloc_buddy_huge_page() to directly create a hugepage from the buddy
+allocator.
+
+In that case, however, if alloc_buddy_huge_page() succeeds we don't
+decrement h->resv_huge_pages, which means that successful
+hugetlb_fault() returns without releasing the reserve count.  As a
+result, subsequent hugetlb_fault() might fail despite that there are
+still free hugepages.
+
+This patch simply adds decrementing code on that code path.
+
+I reproduced this problem when testing v4.3 kernel in the following situation:
+ - the test machine/VM is a NUMA system,
+ - hugepage overcommiting is enabled,
+ - most of hugepages are allocated and there's only one free hugepage
+   which is on node 0 (for example),
+ - another program, which calls set_mempolicy(MPOL_BIND) to bind itself to
+   node 1, tries to allocate a hugepage,
+ - the allocation should fail but the reserve count is still hold.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: <stable@vger.kernel.org> [3.16+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a88c769548047b21f76fd71e04b6a3300ff17160)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index af04714f89b5,4fe4340ed9b7..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1354,39 -1835,60 +1354,48 @@@ static struct page *alloc_huge_page(str
+  	struct hugetlb_cgroup *h_cg;
+  
+  	idx = hstate_index(h);
+ -	/*
+ -	 * Examine the region/reserve map to determine if the process
+ -	 * has a reservation for the page to be allocated.  A return
+ -	 * code of zero indicates a reservation exists (no change).
+ -	 */
+ -	map_chg = gbl_chg = vma_needs_reservation(h, vma, addr);
+ -	if (map_chg < 0)
+ -		return ERR_PTR(-ENOMEM);
+ -
+  	/*
+  	 * Processes that did not create the mapping will have no
+ -	 * reserves as indicated by the region/reserve map. Check
+ -	 * that the allocation will not exceed the subpool limit.
+ -	 * Allocations for MAP_NORESERVE mappings also need to be
+ -	 * checked against any subpool limit.
+ +	 * reserves and will not have accounted against subpool
+ +	 * limit. Check that the subpool limit can be made before
+ +	 * satisfying the allocation MAP_NORESERVE mappings may also
+ +	 * need pages and subpool limit allocated allocated if no reserve
+ +	 * mapping overlaps.
+  	 */
+ -	if (map_chg || avoid_reserve) {
+ -		gbl_chg = hugepage_subpool_get_pages(spool, 1);
+ -		if (gbl_chg < 0) {
+ -			vma_end_reservation(h, vma, addr);
+ +	chg = vma_needs_reservation(h, vma, addr);
+ +	if (chg < 0)
+ +		return ERR_PTR(-ENOMEM);
+ +	if (chg || avoid_reserve)
+ +		if (hugepage_subpool_get_pages(spool, 1))
+  			return ERR_PTR(-ENOSPC);
+ -		}
+ -
+ -		/*
+ -		 * Even though there was no reservation in the region/reserve
+ -		 * map, there could be reservations associated with the
+ -		 * subpool that can be used.  This would be indicated if the
+ -		 * return value of hugepage_subpool_get_pages() is zero.
+ -		 * However, if avoid_reserve is specified we still avoid even
+ -		 * the subpool reservations.
+ -		 */
+ -		if (avoid_reserve)
+ -			gbl_chg = 1;
+ -	}
+  
+  	ret = hugetlb_cgroup_charge_cgroup(idx, pages_per_huge_page(h), &h_cg);
+ -	if (ret)
+ -		goto out_subpool_put;
+ -
+ +	if (ret) {
+ +		if (chg || avoid_reserve)
+ +			hugepage_subpool_put_pages(spool, 1);
+ +		return ERR_PTR(-ENOSPC);
+ +	}
+  	spin_lock(&hugetlb_lock);
+ -	/*
+ -	 * glb_chg is passed to indicate whether or not a page must be taken
+ -	 * from the global free pool (global change).  gbl_chg == 0 indicates
+ -	 * a reservation exists for the allocation.
+ -	 */
+ -	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, gbl_chg);
+ +	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, chg);
+  	if (!page) {
+  		spin_unlock(&hugetlb_lock);
+++<<<<<<< HEAD
+ +		page = alloc_buddy_huge_page(h, NUMA_NO_NODE);
+ +		if (!page) {
+ +			hugetlb_cgroup_uncharge_cgroup(idx,
+ +						       pages_per_huge_page(h),
+ +						       h_cg);
+ +			if (chg || avoid_reserve)
+ +				hugepage_subpool_put_pages(spool, 1);
+ +			return ERR_PTR(-ENOSPC);
+++=======
++ 		page = __alloc_buddy_huge_page_with_mpol(h, vma, addr);
++ 		if (!page)
++ 			goto out_uncharge_cgroup;
++ 		if (!avoid_reserve && vma_has_reserves(vma, gbl_chg)) {
++ 			SetPagePrivate(page);
++ 			h->resv_huge_pages--;
+++>>>>>>> a88c76954804 (mm: hugetlb: fix hugepage memory leak caused by wrong reserve count)
+  		}
+  		spin_lock(&hugetlb_lock);
+  		list_move(&page->lru, &h->hugepage_activelist);
+* Unmerged path mm/hugetlb.c
