@@ -1,0 +1,237 @@
+perf test: Add entry to test cpu topology
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit c84974ed9fb672930929e0d20ea3c366635a54aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c84974ed.failed
+
+This patch test cpu core_id and socket_id which are stored in perf_env.
+
+Commiter note:
+
+  # perf test topo
+  40: Test topology in session: Ok
+
+  # perf test -v topo
+  40: Test topology in session:
+  --- start ---
+  test child forked, pid 31767
+  templ file: /tmp/perf-test-VTZ1PL
+  CPU 0, core 0, socket 0
+  CPU 1, core 1, socket 0
+  CPU 2, core 0, socket 0
+  CPU 3, core 1, socket 0
+  test child finished with 0
+  ---- end ----
+  Test topology in session: Ok
+  #
+
+Based-on-a-patch-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+Link: http://lkml.kernel.org/r/1441357111-64522-1-git-send-email-kan.liang@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit c84974ed9fb672930929e0d20ea3c366635a54aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/tests/Build
+#	tools/perf/tests/builtin-test.c
+#	tools/perf/tests/tests.h
+diff --cc tools/perf/tests/Build
+index d20d6e6ab65b,c6f198ae65fb..000000000000
+--- a/tools/perf/tests/Build
++++ b/tools/perf/tests/Build
+@@@ -32,8 -32,13 +32,13 @@@ perf-y += sample-parsing.
+  perf-y += parse-no-sample-id-all.o
+  perf-y += kmod-path.o
+  perf-y += thread-map.o
+++<<<<<<< HEAD
+++=======
++ perf-y += llvm.o
++ perf-y += topology.o
+++>>>>>>> c84974ed9fb6 (perf test: Add entry to test cpu topology)
+  
+  perf-$(CONFIG_X86) += perf-time-to-tsc.o
+ -ifdef CONFIG_AUXTRACE
+ -perf-$(CONFIG_X86) += insn-x86.o
+ -endif
+  
+  ifeq ($(ARCH),$(filter $(ARCH),x86 arm arm64))
+  perf-$(CONFIG_DWARF_UNWIND) += dwarf-unwind.o
+diff --cc tools/perf/tests/builtin-test.c
+index c1dde733c3a6,98b0b2486100..000000000000
+--- a/tools/perf/tests/builtin-test.c
++++ b/tools/perf/tests/builtin-test.c
+@@@ -175,6 -175,22 +175,25 @@@ static struct test 
+  		.func = test__thread_map,
+  	},
+  	{
+++<<<<<<< HEAD
+++=======
++ 		.desc = "Test LLVM searching and compiling",
++ 		.func = test__llvm,
++ 	},
++ #ifdef HAVE_AUXTRACE_SUPPORT
++ #if defined(__x86_64__) || defined(__i386__)
++ 	{
++ 		.desc = "Test x86 instruction decoder - new instructions",
++ 		.func = test__insn_x86,
++ 	},
++ #endif
++ #endif
++ 	{
++ 		.desc = "Test topology in session",
++ 		.func = test_session_topology,
++ 	},
++ 	{
+++>>>>>>> c84974ed9fb6 (perf test: Add entry to test cpu topology)
+  		.func = NULL,
+  	},
+  };
+diff --cc tools/perf/tests/tests.h
+index ebb47d96bc0b,0b3549672c16..000000000000
+--- a/tools/perf/tests/tests.h
++++ b/tools/perf/tests/tests.h
+@@@ -62,6 -62,9 +62,12 @@@ int test__fdarray__filter(void)
+  int test__fdarray__add(void);
+  int test__kmod_path__parse(void);
+  int test__thread_map(void);
+++<<<<<<< HEAD
+++=======
++ int test__llvm(void);
++ int test__insn_x86(void);
++ int test_session_topology(void);
+++>>>>>>> c84974ed9fb6 (perf test: Add entry to test cpu topology)
+  
+  #if defined(__x86_64__) || defined(__i386__) || defined(__arm__) || defined(__aarch64__)
+  #ifdef HAVE_DWARF_UNWIND_SUPPORT
+* Unmerged path tools/perf/tests/Build
+* Unmerged path tools/perf/tests/builtin-test.c
+* Unmerged path tools/perf/tests/tests.h
+diff --git a/tools/perf/tests/topology.c b/tools/perf/tests/topology.c
+new file mode 100644
+index 000000000000..c3aff53a976a
+--- /dev/null
++++ b/tools/perf/tests/topology.c
+@@ -0,0 +1,115 @@
++#include <string.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include "tests.h"
++#include "util.h"
++#include "session.h"
++#include "evlist.h"
++#include "debug.h"
++
++#define TEMPL "/tmp/perf-test-XXXXXX"
++#define DATA_SIZE	10
++
++static int get_temp(char *path)
++{
++	int fd;
++
++	strcpy(path, TEMPL);
++
++	fd = mkstemp(path);
++	if (fd < 0) {
++		perror("mkstemp failed");
++		return -1;
++	}
++
++	close(fd);
++	return 0;
++}
++
++static int session_write_header(char *path)
++{
++	struct perf_session *session;
++	struct perf_data_file file = {
++		.path = path,
++		.mode = PERF_DATA_MODE_WRITE,
++	};
++
++	session = perf_session__new(&file, false, NULL);
++	TEST_ASSERT_VAL("can't get session", session);
++
++	session->evlist = perf_evlist__new_default();
++	TEST_ASSERT_VAL("can't get evlist", session->evlist);
++
++	perf_header__set_feat(&session->header, HEADER_CPU_TOPOLOGY);
++	perf_header__set_feat(&session->header, HEADER_NRCPUS);
++
++	session->header.data_size += DATA_SIZE;
++
++	TEST_ASSERT_VAL("failed to write header",
++			!perf_session__write_header(session, session->evlist, file.fd, true));
++
++	perf_session__delete(session);
++
++	return 0;
++}
++
++static int check_cpu_topology(char *path, struct cpu_map *map)
++{
++	struct perf_session *session;
++	struct perf_data_file file = {
++		.path = path,
++		.mode = PERF_DATA_MODE_READ,
++	};
++	int i;
++
++	session = perf_session__new(&file, false, NULL);
++	TEST_ASSERT_VAL("can't get session", session);
++
++	for (i = 0; i < session->header.env.nr_cpus_online; i++) {
++		pr_debug("CPU %d, core %d, socket %d\n", i,
++			 session->header.env.cpu[i].core_id,
++			 session->header.env.cpu[i].socket_id);
++	}
++
++	for (i = 0; i < map->nr; i++) {
++		TEST_ASSERT_VAL("Core ID doesn't match",
++			(session->header.env.cpu[map->map[i]].core_id == (cpu_map__get_core(map, i) & 0xffff)));
++
++		TEST_ASSERT_VAL("Socket ID doesn't match",
++			(session->header.env.cpu[map->map[i]].socket_id == cpu_map__get_socket(map, i)));
++	}
++
++	perf_session__delete(session);
++
++	return 0;
++}
++
++int test_session_topology(void)
++{
++	char path[PATH_MAX];
++	struct cpu_map *map;
++	int ret = -1;
++
++	TEST_ASSERT_VAL("can't get templ file", !get_temp(path));
++
++	pr_debug("templ file: %s\n", path);
++
++	if (session_write_header(path))
++		goto free_path;
++
++	map = cpu_map__new(NULL);
++	if (map == NULL) {
++		pr_debug("failed to get system cpumap\n");
++		goto free_path;
++	}
++
++	if (check_cpu_topology(path, map))
++		goto free_map;
++	ret = 0;
++
++free_map:
++	cpu_map__put(map);
++free_path:
++	unlink(path);
++	return ret;
++}
