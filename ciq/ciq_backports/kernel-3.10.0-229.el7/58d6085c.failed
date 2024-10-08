@@ -1,0 +1,157 @@
+l2tp: Remove UDP checksum verification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Tom Herbert <therbert@google.com>
+commit 58d6085c14f5db61c092c90b59813397bc771417
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/58d6085c.failed
+
+Validating the UDP checksum is now done in UDP before handing
+packets to the encapsulation layer. Note that this also eliminates
+the "feature" where L2TP can ignore a non-zero UDP checksum (doing
+this was contrary to RFC 1122).
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 58d6085c14f5db61c092c90b59813397bc771417)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/l2tp/l2tp_core.c
+diff --cc net/l2tp/l2tp_core.c
+index bc5c8150a746,aa1a9d44c107..000000000000
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@@ -501,50 -495,82 +501,129 @@@ out
+  	spin_unlock_bh(&session->reorder_q.lock);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int l2tp_verify_udp_checksum(struct sock *sk,
+ +					   struct sk_buff *skb)
+ +{
+ +	struct udphdr *uh = udp_hdr(skb);
+ +	u16 ulen = ntohs(uh->len);
+ +	__wsum psum;
+ +
+ +	if (sk->sk_no_check || skb_csum_unnecessary(skb))
+ +		return 0;
+ +
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	if (sk->sk_family == PF_INET6 && !l2tp_tunnel(sk)->v4mapped) {
+ +		if (!uh->check) {
+ +			LIMIT_NETDEBUG(KERN_INFO "L2TP: IPv6: checksum is 0\n");
+ +			return 1;
+ +		}
+ +		if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
+ +		    !csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
+ +				     &ipv6_hdr(skb)->daddr, ulen,
+ +				     IPPROTO_UDP, skb->csum)) {
+ +			skb->ip_summed = CHECKSUM_UNNECESSARY;
+ +			return 0;
+ +		}
+ +		skb->csum = ~csum_unfold(csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
+ +							 &ipv6_hdr(skb)->daddr,
+ +							 skb->len, IPPROTO_UDP,
+ +							 0));
+ +	} else
+ +#endif
+ +	{
+ +		struct inet_sock *inet;
+ +		if (!uh->check)
+ +			return 0;
+ +		inet = inet_sk(sk);
+ +		psum = csum_tcpudp_nofold(inet->inet_saddr, inet->inet_daddr,
+ +					  ulen, IPPROTO_UDP, 0);
+ +
+ +		if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
+ +		    !csum_fold(csum_add(psum, skb->csum)))
+ +			return 0;
+ +		skb->csum = psum;
+ +	}
+ +
+ +	return __skb_checksum_complete(skb);
+++=======
++ static int l2tp_seq_check_rx_window(struct l2tp_session *session, u32 nr)
++ {
++ 	u32 nws;
++ 
++ 	if (nr >= session->nr)
++ 		nws = nr - session->nr;
++ 	else
++ 		nws = (session->nr_max + 1) - (session->nr - nr);
++ 
++ 	return nws < session->nr_window_size;
++ }
++ 
++ /* If packet has sequence numbers, queue it if acceptable. Returns 0 if
++  * acceptable, else non-zero.
++  */
++ static int l2tp_recv_data_seq(struct l2tp_session *session, struct sk_buff *skb)
++ {
++ 	if (!l2tp_seq_check_rx_window(session, L2TP_SKB_CB(skb)->ns)) {
++ 		/* Packet sequence number is outside allowed window.
++ 		 * Discard it.
++ 		 */
++ 		l2tp_dbg(session, L2TP_MSG_SEQ,
++ 			 "%s: pkt %u len %d discarded, outside window, nr=%u\n",
++ 			 session->name, L2TP_SKB_CB(skb)->ns,
++ 			 L2TP_SKB_CB(skb)->length, session->nr);
++ 		goto discard;
++ 	}
++ 
++ 	if (session->reorder_timeout != 0) {
++ 		/* Packet reordering enabled. Add skb to session's
++ 		 * reorder queue, in order of ns.
++ 		 */
++ 		l2tp_recv_queue_skb(session, skb);
++ 		goto out;
++ 	}
++ 
++ 	/* Packet reordering disabled. Discard out-of-sequence packets, while
++ 	 * tracking the number if in-sequence packets after the first OOS packet
++ 	 * is seen. After nr_oos_count_max in-sequence packets, reset the
++ 	 * sequence number to re-enable packet reception.
++ 	 */
++ 	if (L2TP_SKB_CB(skb)->ns == session->nr) {
++ 		skb_queue_tail(&session->reorder_q, skb);
++ 	} else {
++ 		u32 nr_oos = L2TP_SKB_CB(skb)->ns;
++ 		u32 nr_next = (session->nr_oos + 1) & session->nr_max;
++ 
++ 		if (nr_oos == nr_next)
++ 			session->nr_oos_count++;
++ 		else
++ 			session->nr_oos_count = 0;
++ 
++ 		session->nr_oos = nr_oos;
++ 		if (session->nr_oos_count > session->nr_oos_count_max) {
++ 			session->reorder_skip = 1;
++ 			l2tp_dbg(session, L2TP_MSG_SEQ,
++ 				 "%s: %d oos packets received. Resetting sequence numbers\n",
++ 				 session->name, session->nr_oos_count);
++ 		}
++ 		if (!session->reorder_skip) {
++ 			atomic_long_inc(&session->stats.rx_seq_discards);
++ 			l2tp_dbg(session, L2TP_MSG_SEQ,
++ 				 "%s: oos pkt %u len %d discarded, waiting for %u, reorder_q_len=%d\n",
++ 				 session->name, L2TP_SKB_CB(skb)->ns,
++ 				 L2TP_SKB_CB(skb)->length, session->nr,
++ 				 skb_queue_len(&session->reorder_q));
++ 			goto discard;
++ 		}
++ 		skb_queue_tail(&session->reorder_q, skb);
++ 	}
++ 
++ out:
++ 	return 0;
++ 
++ discard:
++ 	return 1;
+++>>>>>>> 58d6085c14f5 (l2tp: Remove UDP checksum verification)
+  }
+  
+  /* Do receive processing of L2TP data frames. We handle both L2TPv2
+* Unmerged path net/l2tp/l2tp_core.c
