@@ -1,0 +1,127 @@
+ovl: get rid of the dead code left from broken (and disabled) optimizations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 0f7ff2dabbc95ed7a8019d142274f0c7e083577d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0f7ff2da.failed
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 0f7ff2dabbc95ed7a8019d142274f0c7e083577d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+diff --cc fs/overlayfs/inode.c
+index 5c77b4f87340,4060ffde8722..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -369,13 -344,13 +366,18 @@@ static int ovl_dentry_open(struct dentr
+  		return d_backing_inode(dentry);
+  
+  	type = ovl_path_real(dentry, &realpath);
+ -	if (ovl_open_need_copy_up(file_flags, type, realpath.dentry)) {
+ +	if (ovl_open_need_copy_up(file->f_flags, type, realpath.dentry)) {
+  		err = ovl_want_write(dentry);
+  		if (err)
+ -			return ERR_PTR(err);
+ +			return err;
+  
+++<<<<<<< HEAD
+ +		if (file->f_flags & O_TRUNC)
+ +			err = ovl_copy_up_last(dentry, NULL, true);
+++=======
++ 		if (file_flags & O_TRUNC)
++ 			err = ovl_copy_up_truncate(dentry);
+++>>>>>>> 0f7ff2dabbc9 (ovl: get rid of the dead code left from broken (and disabled) optimizations)
+  		else
+  			err = ovl_copy_up(dentry);
+  		ovl_drop_write(dentry);
+diff --git a/fs/overlayfs/copy_up.c b/fs/overlayfs/copy_up.c
+index e9f01288b75b..e32dca2be445 100644
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@ -238,8 +238,7 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
+ 
+ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+ 			      struct dentry *dentry, struct path *lowerpath,
+-			      struct kstat *stat, struct iattr *attr,
+-			      const char *link)
++			      struct kstat *stat, const char *link)
+ {
+ 	struct inode *wdir = workdir->d_inode;
+ 	struct inode *udir = upperdir->d_inode;
+@@ -283,8 +282,6 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+ 
+ 	mutex_lock(&newdentry->d_inode->i_mutex);
+ 	err = ovl_set_attr(newdentry, stat);
+-	if (!err && attr)
+-		err = notify_change(newdentry, attr, NULL);
+ 	mutex_unlock(&newdentry->d_inode->i_mutex);
+ 	if (err)
+ 		goto out_cleanup;
+@@ -329,8 +326,7 @@ out_cleanup:
+  * that point the file will have already been copied up anyway.
+  */
+ int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
+-		    struct path *lowerpath, struct kstat *stat,
+-		    struct iattr *attr)
++		    struct path *lowerpath, struct kstat *stat)
+ {
+ 	struct dentry *workdir = ovl_workdir(dentry);
+ 	int err;
+@@ -390,26 +386,19 @@ int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
+ 	}
+ 	upperdentry = ovl_dentry_upper(dentry);
+ 	if (upperdentry) {
+-		unlock_rename(workdir, upperdir);
++		/* Raced with another copy-up?  Nothing to do, then... */
+ 		err = 0;
+-		/* Raced with another copy-up?  Do the setattr here */
+-		if (attr) {
+-			mutex_lock(&upperdentry->d_inode->i_mutex);
+-			err = notify_change(upperdentry, attr, NULL);
+-			mutex_unlock(&upperdentry->d_inode->i_mutex);
+-		}
+-		goto out_put_cred;
++		goto out_unlock;
+ 	}
+ 
+ 	err = ovl_copy_up_locked(workdir, upperdir, dentry, lowerpath,
+-				 stat, attr, link);
++				 stat, link);
+ 	if (!err) {
+ 		/* Restore timestamps on parent (best effort) */
+ 		ovl_set_timestamps(upperdir, &pstat);
+ 	}
+ out_unlock:
+ 	unlock_rename(workdir, upperdir);
+-out_put_cred:
+ 	revert_creds(old_cred);
+ 	put_cred(override_cred);
+ 
+@@ -451,7 +440,7 @@ int ovl_copy_up(struct dentry *dentry)
+ 		ovl_path_lower(next, &lowerpath);
+ 		err = vfs_getattr(&lowerpath, &stat);
+ 		if (!err)
+-			err = ovl_copy_up_one(parent, next, &lowerpath, &stat, NULL);
++			err = ovl_copy_up_one(parent, next, &lowerpath, &stat);
+ 
+ 		dput(parent);
+ 		dput(next);
+* Unmerged path fs/overlayfs/inode.c
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 719aeaf34076..f195f5bb4cf8 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -196,7 +196,6 @@ void ovl_cleanup(struct inode *dir, struct dentry *dentry);
+ /* copy_up.c */
+ int ovl_copy_up(struct dentry *dentry);
+ int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
+-		    struct path *lowerpath, struct kstat *stat,
+-		    struct iattr *attr);
++		    struct path *lowerpath, struct kstat *stat);
+ int ovl_copy_xattr(struct dentry *old, struct dentry *new);
+ int ovl_set_attr(struct dentry *upper, struct kstat *stat);
