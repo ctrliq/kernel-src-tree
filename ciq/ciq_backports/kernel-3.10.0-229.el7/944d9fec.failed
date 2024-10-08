@@ -1,0 +1,193 @@
+hugetlb: add support for gigantic page allocation at runtime
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Luiz Capitulino <lcapitulino@redhat.com>
+commit 944d9fec8d7aee3f2e16573e9b6a16634b33f403
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/944d9fec.failed
+
+HugeTLB is limited to allocating hugepages whose size are less than
+MAX_ORDER order.  This is so because HugeTLB allocates hugepages via the
+buddy allocator.  Gigantic pages (that is, pages whose size is greater
+than MAX_ORDER order) have to be allocated at boottime.
+
+However, boottime allocation has at least two serious problems.  First,
+it doesn't support NUMA and second, gigantic pages allocated at boottime
+can't be freed.
+
+This commit solves both issues by adding support for allocating gigantic
+pages during runtime.  It works just like regular sized hugepages,
+meaning that the interface in sysfs is the same, it supports NUMA, and
+gigantic pages can be freed.
+
+For example, on x86_64 gigantic pages are 1GB big. To allocate two 1G
+gigantic pages on node 1, one can do:
+
+ # echo 2 > \
+   /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/nr_hugepages
+
+And to free them all:
+
+ # echo 0 > \
+   /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/nr_hugepages
+
+The one problem with gigantic page allocation at runtime is that it
+can't be serviced by the buddy allocator.  To overcome that problem,
+this commit scans all zones from a node looking for a large enough
+contiguous region.  When one is found, it's allocated by using CMA, that
+is, we call alloc_contig_range() to do the actual allocation.  For
+example, on x86_64 we scan all zones looking for a 1GB contiguous
+region.  When one is found, it's allocated by alloc_contig_range().
+
+One expected issue with that approach is that such gigantic contiguous
+regions tend to vanish as runtime goes by.  The best way to avoid this
+for now is to make gigantic page allocations very early during system
+boot, say from a init script.  Other possible optimization include using
+compaction, which is supported by CMA but is not explicitly used by this
+commit.
+
+It's also important to note the following:
+
+ 1. Gigantic pages allocated at boottime by the hugepages= command-line
+    option can be freed at runtime just fine
+
+ 2. This commit adds support for gigantic pages only to x86_64. The
+    reason is that I don't have access to nor experience with other archs.
+    The code is arch indepedent though, so it should be simple to add
+    support to different archs
+
+ 3. I didn't add support for hugepage overcommit, that is allocating
+    a gigantic page on demand when
+   /proc/sys/vm/nr_overcommit_hugepages > 0. The reason is that I don't
+   think it's reasonable to do the hard and long work required for
+   allocating a gigantic page at fault time. But it should be simple
+   to add this if wanted
+
+[akpm@linux-foundation.org: coding-style fixes]
+	Signed-off-by: Luiz Capitulino <lcapitulino@redhat.com>
+	Reviewed-by: Davidlohr Bueso <davidlohr@hp.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Reviewed-by: Zhang Yanfei <zhangyanfei@cn.fujitsu.com>
+	Reviewed-by: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 944d9fec8d7aee3f2e16573e9b6a16634b33f403)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index e9ed3cb4a5b2,98f0bc105dfe..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -631,7 -822,8 +769,12 @@@ static void update_and_free_page(struc
+  {
+  	int i;
+  
+++<<<<<<< HEAD
+ +	VM_BUG_ON(h->order >= MAX_ORDER);
+++=======
++ 	if (hstate_is_gigantic(h) && !gigantic_page_supported())
++ 		return;
+++>>>>>>> 944d9fec8d7a (hugetlb: add support for gigantic page allocation at runtime)
+  
+  	h->nr_huge_pages--;
+  	h->nr_huge_pages_node[page_to_nid(page)]--;
+@@@ -641,11 -833,16 +784,16 @@@
+  				1 << PG_active | 1 << PG_private |
+  				1 << PG_writeback);
+  	}
+ -	VM_BUG_ON_PAGE(hugetlb_cgroup_from_page(page), page);
+ +	VM_BUG_ON(hugetlb_cgroup_from_page(page));
+  	set_compound_page_dtor(page, NULL);
+  	set_page_refcounted(page);
+- 	arch_release_hugepage(page);
+- 	__free_pages(page, huge_page_order(h));
++ 	if (hstate_is_gigantic(h)) {
++ 		destroy_compound_gigantic_page(page, huge_page_order(h));
++ 		free_gigantic_page(page, huge_page_order(h));
++ 	} else {
++ 		arch_release_hugepage(page);
++ 		__free_pages(page, huge_page_order(h));
++ 	}
+  }
+  
+  struct hstate *size_to_hstate(unsigned long size)
+@@@ -684,7 -881,7 +832,11 @@@ static void free_huge_page(struct page 
+  	if (restore_reserve)
+  		h->resv_huge_pages++;
+  
+++<<<<<<< HEAD
+ +	if (h->surplus_huge_pages_node[nid] && huge_page_order(h) < MAX_ORDER) {
+++=======
++ 	if (h->surplus_huge_pages_node[nid]) {
+++>>>>>>> 944d9fec8d7a (hugetlb: add support for gigantic page allocation at runtime)
+  		/* remove the page from active list */
+  		list_del(&page->lru);
+  		update_and_free_page(h, page);
+@@@ -766,11 -985,8 +918,14 @@@ static struct page *alloc_fresh_huge_pa
+  {
+  	struct page *page;
+  
+++<<<<<<< HEAD
+ +	if (h->order >= MAX_ORDER)
+ +		return NULL;
+ +
+++=======
+++>>>>>>> 944d9fec8d7a (hugetlb: add support for gigantic page allocation at runtime)
+  	page = alloc_pages_exact_node(nid,
+ -		htlb_alloc_mask(h)|__GFP_COMP|__GFP_THISNODE|
+ +		htlb_alloc_mask|__GFP_COMP|__GFP_THISNODE|
+  						__GFP_REPEAT|__GFP_NOWARN,
+  		huge_page_order(h));
+  	if (page) {
+@@@ -1364,7 -1619,7 +1519,11 @@@ static unsigned long set_max_huge_pages
+  {
+  	unsigned long min_count, ret;
+  
+++<<<<<<< HEAD
+ +	if (h->order >= MAX_ORDER)
+++=======
++ 	if (hstate_is_gigantic(h) && !gigantic_page_supported())
+++>>>>>>> 944d9fec8d7a (hugetlb: add support for gigantic page allocation at runtime)
+  		return h->max_huge_pages;
+  
+  	/*
+@@@ -1490,7 -1749,7 +1652,11 @@@ static ssize_t nr_hugepages_store_commo
+  		goto out;
+  
+  	h = kobj_to_hstate(kobj, &nid);
+++<<<<<<< HEAD
+ +	if (h->order >= MAX_ORDER) {
+++=======
++ 	if (hstate_is_gigantic(h) && !gigantic_page_supported()) {
+++>>>>>>> 944d9fec8d7a (hugetlb: add support for gigantic page allocation at runtime)
+  		err = -EINVAL;
+  		goto out;
+  	}
+@@@ -1982,9 -2251,12 +2148,13 @@@ static int hugetlb_sysctl_handler_commo
+  	unsigned long tmp;
+  	int ret;
+  
+ -	if (!hugepages_supported())
+ -		return -ENOTSUPP;
+ -
+  	tmp = h->max_huge_pages;
+  
+++<<<<<<< HEAD
+ +	if (write && h->order >= MAX_ORDER)
+++=======
++ 	if (write && hstate_is_gigantic(h) && !gigantic_page_supported())
+++>>>>>>> 944d9fec8d7a (hugetlb: add support for gigantic page allocation at runtime)
+  		return -EINVAL;
+  
+  	table->data = &tmp;
+* Unmerged path mm/hugetlb.c
