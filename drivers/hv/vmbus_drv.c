@@ -834,6 +834,10 @@ static void __exit vmbus_exit(void)
 {
 	hv_remove_vmbus_irq();
 	vmbus_free_channels();
+	if (ms_hyperv.features & HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE) {
+		atomic_notifier_chain_unregister(&panic_notifier_list,
+						 &hyperv_panic_block);
+	}
 	bus_unregister(&hv_bus);
 	hv_cleanup();
 	acpi_bus_unregister_driver(&vmbus_acpi_driver);
