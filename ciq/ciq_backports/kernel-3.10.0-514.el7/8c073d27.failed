@@ -1,0 +1,215 @@
+watchdog: introduce watchdog_suspend() and watchdog_resume()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ulrich Obergfell <uobergfe@redhat.com>
+commit 8c073d27d7ad293bf734cc8475689413afadab81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8c073d27.failed
+
+This interface can be utilized to deactivate the hard and soft lockup
+detector temporarily.  Callers are expected to minimize the duration of
+deactivation.  Multiple deactivations are allowed to occur in parallel but
+should be rare in practice.
+
+[akpm@linux-foundation.org: remove unneeded static initialization]
+	Signed-off-by: Ulrich Obergfell <uobergfe@redhat.com>
+	Reviewed-by: Aaron Tomlin <atomlin@redhat.com>
+	Cc: Guenter Roeck <linux@roeck-us.net>
+	Cc: Don Zickus <dzickus@redhat.com>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Chris Metcalf <cmetcalf@ezchip.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8c073d27d7ad293bf734cc8475689413afadab81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/nmi.h
+#	kernel/watchdog.c
+diff --cc include/linux/nmi.h
+index 6fe7c9ae7224,e9f213c337bb..000000000000
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@@ -82,8 -80,14 +82,19 @@@ extern int proc_soft_watchdog(struct ct
+  			      void __user *, size_t *, loff_t *);
+  extern int proc_watchdog_thresh(struct ctl_table *, int ,
+  				void __user *, size_t *, loff_t *);
+++<<<<<<< HEAD
+ +extern int proc_dowatchdog(struct ctl_table *, int ,
+ +			   void __user *, size_t *, loff_t *);
+++=======
++ extern int proc_watchdog_cpumask(struct ctl_table *, int,
++ 				 void __user *, size_t *, loff_t *);
++ extern int watchdog_suspend(void);
++ extern void watchdog_resume(void);
++ #endif
++ 
++ #ifdef CONFIG_HAVE_ACPI_APEI_NMI
++ #include <asm/nmi.h>
+++>>>>>>> 8c073d27d7ad (watchdog: introduce watchdog_suspend() and watchdog_resume())
+  #endif
+  
+  #endif
+diff --cc kernel/watchdog.c
+index 22977eb33006,e6eb5b697212..000000000000
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@@ -59,7 -60,14 +59,8 @@@ int __read_mostly sysctl_softlockup_all
+  #else
+  #define sysctl_softlockup_all_cpu_backtrace 0
+  #endif
+ -static struct cpumask watchdog_cpumask __read_mostly;
+ -unsigned long *watchdog_cpumask_bits = cpumask_bits(&watchdog_cpumask);
+ -
+ -/* Helper for online, unparked cpus. */
+ -#define for_each_watchdog_cpu(cpu) \
+ -	for_each_cpu_and((cpu), cpu_online_mask, &watchdog_cpumask)
+  
++ static int __read_mostly watchdog_suspended;
+  static int __read_mostly watchdog_running;
+  static u64 __read_mostly sample_period;
+  
+@@@ -710,9 -701,53 +711,53 @@@ static void watchdog_unpark_threads(voi
+  	put_online_cpus();
+  }
+  
++ /*
++  * Suspend the hard and soft lockup detector by parking the watchdog threads.
++  */
++ int watchdog_suspend(void)
++ {
++ 	int ret = 0;
++ 
++ 	mutex_lock(&watchdog_proc_mutex);
++ 	/*
++ 	 * Multiple suspend requests can be active in parallel (counted by
++ 	 * the 'watchdog_suspended' variable). If the watchdog threads are
++ 	 * running, the first caller takes care that they will be parked.
++ 	 * The state of 'watchdog_running' cannot change while a suspend
++ 	 * request is active (see related changes in 'proc' handlers).
++ 	 */
++ 	if (watchdog_running && !watchdog_suspended)
++ 		ret = watchdog_park_threads();
++ 
++ 	if (ret == 0)
++ 		watchdog_suspended++;
++ 
++ 	mutex_unlock(&watchdog_proc_mutex);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Resume the hard and soft lockup detector by unparking the watchdog threads.
++  */
++ void watchdog_resume(void)
++ {
++ 	mutex_lock(&watchdog_proc_mutex);
++ 
++ 	watchdog_suspended--;
++ 	/*
++ 	 * The watchdog threads are unparked if they were previously running
++ 	 * and if there is no more active suspend request.
++ 	 */
++ 	if (watchdog_running && !watchdog_suspended)
++ 		watchdog_unpark_threads();
++ 
++ 	mutex_unlock(&watchdog_proc_mutex);
++ }
++ 
+  static void restart_watchdog_hrtimer(void *info)
+  {
+ -	struct hrtimer *hrtimer = raw_cpu_ptr(&watchdog_hrtimer);
+ +	struct hrtimer *hrtimer = &__raw_get_cpu_var(watchdog_hrtimer);
+  	int ret;
+  
+  	/*
+@@@ -928,46 -980,40 +985,61 @@@ out
+  }
+  
+  /*
+ - * The cpumask is the mask of possible cpus that the watchdog can run
+ - * on, not the mask of cpus it is actually running on.  This allows the
+ - * user to specify a mask that will include cpus that have not yet
+ - * been brought online, if desired.
+ + * proc handler for /proc/sys/kernel/nmi_watchdog,watchdog_thresh
+   */
+ -int proc_watchdog_cpumask(struct ctl_table *table, int write,
+ -			  void __user *buffer, size_t *lenp, loff_t *ppos)
+ +
+ +int proc_dowatchdog(struct ctl_table *table, int write,
+ +		    void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+ -	int err;
+ +	int err, old_thresh, old_enabled;
+ +	bool old_hardlockup;
+  
+  	mutex_lock(&watchdog_proc_mutex);
+++<<<<<<< HEAD
+ +	old_thresh = ACCESS_ONCE(watchdog_thresh);
+ +	old_enabled = ACCESS_ONCE(watchdog_user_enabled);
+ +	old_hardlockup = watchdog_hardlockup_detector_is_enabled();
+++=======
++ 
++ 	if (watchdog_suspended) {
++ 		/* no parameter changes allowed while watchdog is suspended */
++ 		err = -EAGAIN;
++ 		goto out;
++ 	}
++ 
++ 	err = proc_do_large_bitmap(table, write, buffer, lenp, ppos);
++ 	if (!err && write) {
++ 		/* Remove impossible cpus to keep sysctl output cleaner. */
++ 		cpumask_and(&watchdog_cpumask, &watchdog_cpumask,
++ 			    cpu_possible_mask);
+++>>>>>>> 8c073d27d7ad (watchdog: introduce watchdog_suspend() and watchdog_resume())
+  
+ -		if (watchdog_running) {
+ -			/*
+ -			 * Failure would be due to being unable to allocate
+ -			 * a temporary cpumask, so we are likely not in a
+ -			 * position to do much else to make things better.
+ -			 */
+ -			if (smpboot_update_cpumask_percpu_thread(
+ -				    &watchdog_threads, &watchdog_cpumask) != 0)
+ -				pr_err("cpumask update failed\n");
+ -		}
+ +	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+ +	if (err || !write)
+ +		goto out;
+ +
+ +	set_sample_period();
+ +	/*
+ +	 * Watchdog threads shouldn't be enabled if they are
+ +	 * disabled. The 'watchdog_running' variable check in
+ +	 * watchdog_*_all_cpus() function takes care of this.
+ +	 */
+ +	if (watchdog_user_enabled && watchdog_thresh) {
+ +		/*
+ +		 * Prevent a change in watchdog_thresh accidentally overriding
+ +		 * the enablement of the hardlockup detector.
+ +		 */
+ +		if (watchdog_user_enabled != old_enabled)
+ +			watchdog_enable_hardlockup_detector(true);
+ +		err = watchdog_enable_all_cpus(old_thresh != watchdog_thresh);
+ +	} else
+ +		watchdog_disable_all_cpus();
+ +
+ +	/* Restore old values on failure */
+ +	if (err) {
+ +		watchdog_thresh = old_thresh;
+ +		watchdog_user_enabled = old_enabled;
+ +		watchdog_enable_hardlockup_detector(old_hardlockup);
+  	}
+  out:
+  	mutex_unlock(&watchdog_proc_mutex);
+* Unmerged path include/linux/nmi.h
+* Unmerged path kernel/watchdog.c
