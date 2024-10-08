@@ -1,0 +1,223 @@
+KVM: x86: add SMM to the MMU role, support SMRAM address space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] x86: add SMM to the MMU role, support SMRAM address space (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 95.80%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 699023e239658e62da6f42f47d31b54788521ec1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/699023e2.failed
+
+This is now very simple to do.  The only interesting part is a simple
+trick to find the right memslot in gfn_to_rmap, retrieving the address
+space from the spte role word.  The same trick is used in the auditing
+code.
+
+The comment on top of union kvm_mmu_page_role has been stale forever,
+so remove it.  Speaking of stale code, remove pad_for_nice_hex_output
+too: it was splitting the "access" bitfield across two bytes and thus
+had effectively turned into pad_for_ugly_hex_output.
+
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 699023e239658e62da6f42f47d31b54788521ec1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/mmu.c
+index 20252f84c3ac,c88f0e443669..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -812,9 -813,9 +813,15 @@@ static void account_shadowed(struct kv
+  	int i;
+  
+  	gfn = sp->gfn;
+++<<<<<<< HEAD
+ +	slot = gfn_to_memslot(kvm, gfn);
+ +	for (i = PT_DIRECTORY_LEVEL;
+ +	     i < PT_PAGE_TABLE_LEVEL + KVM_NR_PAGE_SIZES; ++i) {
+++=======
++ 	slots = kvm_memslots_for_spte_role(kvm, sp->role);
++ 	slot = __gfn_to_memslot(slots, gfn);
++ 	for (i = PT_DIRECTORY_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
+++>>>>>>> 699023e23965 (KVM: x86: add SMM to the MMU role, support SMRAM address space)
+  		linfo = lpage_info_slot(gfn, slot, i);
+  		linfo->write_count += 1;
+  	}
+@@@ -829,9 -831,9 +837,15 @@@ static void unaccount_shadowed(struct k
+  	int i;
+  
+  	gfn = sp->gfn;
+++<<<<<<< HEAD
+ +	slot = gfn_to_memslot(kvm, gfn);
+ +	for (i = PT_DIRECTORY_LEVEL;
+ +	     i < PT_PAGE_TABLE_LEVEL + KVM_NR_PAGE_SIZES; ++i) {
+++=======
++ 	slots = kvm_memslots_for_spte_role(kvm, sp->role);
++ 	slot = __gfn_to_memslot(slots, gfn);
++ 	for (i = PT_DIRECTORY_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
+++>>>>>>> 699023e23965 (KVM: x86: add SMM to the MMU role, support SMRAM address space)
+  		linfo = lpage_info_slot(gfn, slot, i);
+  		linfo->write_count -= 1;
+  		WARN_ON(linfo->write_count < 0);
+diff --cc arch/x86/kvm/x86.c
+index 44ac86d26f9f,7489871b63df..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -5180,9 -5476,32 +5180,32 @@@ static bool retry_instruction(struct x8
+  static int complete_emulated_mmio(struct kvm_vcpu *vcpu);
+  static int complete_emulated_pio(struct kvm_vcpu *vcpu);
+  
+ -static void kvm_smm_changed(struct kvm_vcpu *vcpu)
+ +void kvm_set_hflags(struct kvm_vcpu *vcpu, unsigned emul_flags)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (!(vcpu->arch.hflags & HF_SMM_MASK)) {
++ 		/* This is a good place to trace that we are exiting SMM.  */
++ 		trace_kvm_enter_smm(vcpu->vcpu_id, vcpu->arch.smbase, false);
++ 
++ 		if (unlikely(vcpu->arch.smi_pending)) {
++ 			kvm_make_request(KVM_REQ_SMI, vcpu);
++ 			vcpu->arch.smi_pending = 0;
++ 		} else {
++ 			/* Process a latched INIT, if any.  */
++ 			kvm_make_request(KVM_REQ_EVENT, vcpu);
++ 		}
++ 	}
++ 
++ 	kvm_mmu_reset_context(vcpu);
++ }
++ 
++ static void kvm_set_hflags(struct kvm_vcpu *vcpu, unsigned emul_flags)
++ {
++ 	unsigned changed = vcpu->arch.hflags ^ emul_flags;
++ 
+++>>>>>>> 699023e23965 (KVM: x86: add SMM to the MMU role, support SMRAM address space)
+  	vcpu->arch.hflags = emul_flags;
+ -
+ -	if (changed & HF_SMM_MASK)
+ -		kvm_smm_changed(vcpu);
+  }
+  
+  static int kvm_vcpu_check_hw_bp(unsigned long addr, u32 type, u32 dr7,
+diff --git a/Documentation/virtual/kvm/mmu.txt b/Documentation/virtual/kvm/mmu.txt
+index c59bd9bc41ef..3a4d681c3e98 100644
+--- a/Documentation/virtual/kvm/mmu.txt
++++ b/Documentation/virtual/kvm/mmu.txt
+@@ -173,6 +173,12 @@ Shadow pages contain the following information:
+     Contains the value of cr4.smap && !cr0.wp for which the page is valid
+     (pages for which this is true are different from other pages; see the
+     treatment of cr0.wp=0 below).
++  role.smm:
++    Is 1 if the page is valid in system management mode.  This field
++    determines which of the kvm_memslots array was used to build this
++    shadow page; it is also used to go back from a struct kvm_mmu_page
++    to a memslot, through the kvm_memslots_for_spte_role macro and
++    __gfn_to_memslot.
+   gfn:
+     Either the guest page table containing the translations shadowed by this
+     page, or the base page frame for linear translations.  See role.direct.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 1442e6fbe132..232c8db640ca 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -183,23 +183,12 @@ struct kvm_mmu_memory_cache {
+ 	void *objects[KVM_NR_MEM_OBJS];
+ };
+ 
+-/*
+- * kvm_mmu_page_role, below, is defined as:
+- *
+- *   bits 0:3 - total guest paging levels (2-4, or zero for real mode)
+- *   bits 4:7 - page table level for this shadow (1-4)
+- *   bits 8:9 - page table quadrant for 2-level guests
+- *   bit   16 - direct mapping of virtual to physical mapping at gfn
+- *              used for real mode and two-dimensional paging
+- *   bits 17:19 - common access permissions for all ptes in this shadow page
+- */
+ union kvm_mmu_page_role {
+ 	unsigned word;
+ 	struct {
+ 		unsigned level:4;
+ 		unsigned cr4_pae:1;
+ 		unsigned quadrant:2;
+-		unsigned pad_for_nice_hex_output:6;
+ 		unsigned direct:1;
+ 		unsigned access:3;
+ 		unsigned invalid:1;
+@@ -207,6 +196,15 @@ union kvm_mmu_page_role {
+ 		unsigned cr0_wp:1;
+ 		unsigned smep_andnot_wp:1;
+ 		unsigned smap_andnot_wp:1;
++		unsigned :8;
++
++		/*
++		 * This is left at the top of the word so that
++		 * kvm_memslots_for_spte_role can extract it with a
++		 * simple shift.  While there is room, give it a whole
++		 * byte so it is also faster to load it from memory.
++		 */
++		unsigned smm:8;
+ 	};
+ };
+ 
+@@ -1060,6 +1058,12 @@ enum {
+ #define HF_IRET_MASK		(1 << 4)
+ #define HF_GUEST_MASK		(1 << 5) /* VCPU is in guest-mode */
+ 
++#define __KVM_VCPU_MULTIPLE_ADDRESS_SPACE
++#define KVM_ADDRESS_SPACE_NUM 2
++
++#define kvm_arch_vcpu_memslots_id(vcpu) ((vcpu)->arch.hflags & HF_SMM_MASK ? 1 : 0)
++#define kvm_memslots_for_spte_role(kvm, role) __kvm_memslots(kvm, (role).smm)
++
+ /*
+  * Hardware virtualization extension instructions may fault if a
+  * reboot turns off virtualization while processes are running.
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmu_audit.c b/arch/x86/kvm/mmu_audit.c
+index 19c22a49550a..40676082c54d 100644
+--- a/arch/x86/kvm/mmu_audit.c
++++ b/arch/x86/kvm/mmu_audit.c
+@@ -131,12 +131,16 @@ static void inspect_spte_has_rmap(struct kvm *kvm, u64 *sptep)
+ 	static DEFINE_RATELIMIT_STATE(ratelimit_state, 5 * HZ, 10);
+ 	unsigned long *rmapp;
+ 	struct kvm_mmu_page *rev_sp;
++	struct kvm_memslots *slots;
++	struct kvm_memory_slot *slot;
+ 	gfn_t gfn;
+ 
+ 	rev_sp = page_header(__pa(sptep));
+ 	gfn = kvm_mmu_page_get_gfn(rev_sp, sptep - rev_sp->spt);
+ 
+-	if (!gfn_to_memslot(kvm, gfn)) {
++	slots = kvm_memslots_for_spte_role(kvm, rev_sp->role);
++	slot = __gfn_to_memslot(slots, gfn);
++	if (!slot) {
+ 		if (!__ratelimit(&ratelimit_state))
+ 			return;
+ 		audit_printk(kvm, "no memslot for gfn %llx\n", gfn);
+@@ -146,7 +150,7 @@ static void inspect_spte_has_rmap(struct kvm *kvm, u64 *sptep)
+ 		return;
+ 	}
+ 
+-	rmapp = gfn_to_rmap(kvm, gfn, rev_sp);
++	rmapp = __gfn_to_rmap(gfn, rev_sp->role.level, slot);
+ 	if (!*rmapp) {
+ 		if (!__ratelimit(&ratelimit_state))
+ 			return;
+@@ -197,7 +201,7 @@ static void audit_write_protection(struct kvm *kvm, struct kvm_mmu_page *sp)
+ 	if (sp->role.direct || sp->unsync || sp->role.invalid)
+ 		return;
+ 
+-	slots = kvm_memslots(kvm);
++	slots = kvm_memslots_for_spte_role(kvm, sp->role);
+ 	slot = __gfn_to_memslot(slots, sp->gfn);
+ 	rmapp = __gfn_to_rmap(sp->gfn, PT_PAGE_TABLE_LEVEL, slot);
+ 
+* Unmerged path arch/x86/kvm/x86.c
