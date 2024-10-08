@@ -557,6 +557,7 @@ retry:
 		goto retry;
 	insert_hash(conf, sh);
 	sh->cpu = smp_processor_id();
+	set_bit(STRIPE_BATCH_READY, &sh->state);
 }
 
 static struct stripe_head *__find_stripe(struct r5conf *conf, sector_t sector,
@@ -2651,7 +2652,8 @@ schedule_reconstruction(struct stripe_head *sh, struct stripe_head_state *s,
  * toread/towrite point to the first in a chain.
  * The bi_next chain must be in order.
  */
-static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx, int forwrite)
+static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx,
+			  int forwrite, int previous)
 {
 	struct bio **bip;
 	struct r5conf *conf = sh->raid_conf;
@@ -2683,6 +2685,9 @@ static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx, in
 	}
 	if (*bip && (*bip)->bi_sector < bio_end_sector(bi))
 		goto overlap;
+
+	if (!forwrite || previous)
+		clear_bit(STRIPE_BATCH_READY, &sh->state);
 
 	BUG_ON(*bip && bi->bi_next && (*bip) != bi->bi_next);
 	if (*bip)
@@ -3755,6 +3760,7 @@ static void handle_stripe(struct stripe_head *sh)
 		return;
 	}
 
+	clear_bit(STRIPE_BATCH_READY, &sh->state);
 	if (test_bit(STRIPE_SYNC_REQUESTED, &sh->state)) {
 		spin_lock(&sh->stripe_lock);
 		/* Cannot process 'sync' concurrently with 'discard' */
@@ -4729,7 +4735,7 @@ static void make_request(struct mddev *mddev, struct bio * bi)
 			}
 
 			if (test_bit(STRIPE_EXPANDING, &sh->state) ||
-			    !add_stripe_bio(sh, bi, dd_idx, rw)) {
+			    !add_stripe_bio(sh, bi, dd_idx, rw, previous)) {
 				/* Stripe is busy expanding or
 				 * add failed due to overlap.  Flush everything
 				 * and wait a while
@@ -5141,7 +5147,7 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio)
 			return handled;
 		}
 
-		if (!add_stripe_bio(sh, raid_bio, dd_idx, 0)) {
+		if (!add_stripe_bio(sh, raid_bio, dd_idx, 0, 0)) {
 			release_stripe(sh);
 			raid5_set_bi_processed_stripes(raid_bio, scnt);
 			conf->retry_read_aligned = raid_bio;
