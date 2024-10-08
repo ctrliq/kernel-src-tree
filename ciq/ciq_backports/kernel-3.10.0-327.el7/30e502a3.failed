@@ -1,0 +1,353 @@
+net: tcp: add flag for ca to indicate that ECN is required
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] tcp: add flag for ca to indicate that ECN is required (Florian Westphal) [970613]
+Rebuild_FUZZ: 95.50%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit 30e502a34b8b21fae2c789da102bd9f6e99fef83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/30e502a3.failed
+
+This patch adds a flag to TCP congestion algorithms that allows
+for requesting to mark IPv4/IPv6 sockets with transport as ECN
+capable, that is, ECT(0), when required by a congestion algorithm.
+
+It is currently used and needed in DataCenter TCP (DCTCP), as it
+requires both peers to assert ECT on all IP packets sent - it
+uses ECN feedback (i.e. CE, Congestion Encountered information)
+from switches inside the data center to derive feedback to the
+end hosts.
+
+Therefore, simply add a new flag to icsk_ca_ops. Note that DCTCP's
+algorithm/behaviour slightly diverges from RFC3168, therefore this
+is only (!) enabled iff the assigned congestion control ops module
+has requested this. By that, we can tightly couple this logic really
+only to the provided congestion control ops.
+
+Joint work with Florian Westphal and Glenn Judd.
+
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Glenn Judd <glenn.judd@morganstanley.com>
+	Acked-by: Stephen Hemminger <stephen@networkplumber.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 30e502a34b8b21fae2c789da102bd9f6e99fef83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp_input.c
+diff --cc include/net/tcp.h
+index 81f472949625,a12f145cfbc3..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -784,8 -774,10 +767,14 @@@ enum tcp_ca_event 
+  #define TCP_CA_MAX	128
+  #define TCP_CA_BUF_MAX	(TCP_CA_NAME_MAX*TCP_CA_MAX)
+  
++ /* Algorithm can be set on socket without CAP_NET_ADMIN privileges */
+  #define TCP_CONG_NON_RESTRICTED 0x1
+++<<<<<<< HEAD
+ +#define TCP_CONG_RTT_STAMP	0x2
+++=======
++ /* Requires ECN/ECT set on all packets */
++ #define TCP_CONG_NEEDS_ECN	0x2
+++>>>>>>> 30e502a34b8b (net: tcp: add flag for ca to indicate that ECN is required)
+  
+  struct tcp_congestion_ops {
+  	struct list_head	list;
+@@@ -817,26 -807,32 +806,33 @@@
+  	struct module 	*owner;
+  };
+  
+ -int tcp_register_congestion_control(struct tcp_congestion_ops *type);
+ -void tcp_unregister_congestion_control(struct tcp_congestion_ops *type);
+ -
+ -void tcp_assign_congestion_control(struct sock *sk);
+ -void tcp_init_congestion_control(struct sock *sk);
+ -void tcp_cleanup_congestion_control(struct sock *sk);
+ -int tcp_set_default_congestion_control(const char *name);
+ -void tcp_get_default_congestion_control(char *name);
+ -void tcp_get_available_congestion_control(char *buf, size_t len);
+ -void tcp_get_allowed_congestion_control(char *buf, size_t len);
+ -int tcp_set_allowed_congestion_control(char *allowed);
+ -int tcp_set_congestion_control(struct sock *sk, const char *name);
+ -int tcp_slow_start(struct tcp_sock *tp, u32 acked);
+ -void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w);
+ -
+ -u32 tcp_reno_ssthresh(struct sock *sk);
+ -void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 acked);
+ +extern int tcp_register_congestion_control(struct tcp_congestion_ops *type);
+ +extern void tcp_unregister_congestion_control(struct tcp_congestion_ops *type);
+ +
+ +extern void tcp_init_congestion_control(struct sock *sk);
+ +extern void tcp_cleanup_congestion_control(struct sock *sk);
+ +extern int tcp_set_default_congestion_control(const char *name);
+ +extern void tcp_get_default_congestion_control(char *name);
+ +extern void tcp_get_available_congestion_control(char *buf, size_t len);
+ +extern void tcp_get_allowed_congestion_control(char *buf, size_t len);
+ +extern int tcp_set_allowed_congestion_control(char *allowed);
+ +extern int tcp_set_congestion_control(struct sock *sk, const char *name);
+ +extern void tcp_slow_start(struct tcp_sock *tp);
+ +extern void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w);
+ +
+ +extern struct tcp_congestion_ops tcp_init_congestion_ops;
+ +extern u32 tcp_reno_ssthresh(struct sock *sk);
+ +extern void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight);
+ +extern u32 tcp_reno_min_cwnd(const struct sock *sk);
+  extern struct tcp_congestion_ops tcp_reno;
+  
++ static inline bool tcp_ca_needs_ecn(const struct sock *sk)
++ {
++ 	const struct inet_connection_sock *icsk = inet_csk(sk);
++ 
++ 	return icsk->icsk_ca_ops->flags & TCP_CONG_NEEDS_ECN;
++ }
++ 
+  static inline void tcp_set_ca_state(struct sock *sk, const u8 ca_state)
+  {
+  	struct inet_connection_sock *icsk = inet_csk(sk);
+diff --cc net/ipv4/tcp_input.c
+index b7e10e9c0e98,fb0fe97e1c54..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -5796,3 -5869,156 +5796,159 @@@ discard
+  	return 0;
+  }
+  EXPORT_SYMBOL(tcp_rcv_state_process);
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void pr_drop_req(struct request_sock *req, __u16 port, int family)
++ {
++ 	struct inet_request_sock *ireq = inet_rsk(req);
++ 
++ 	if (family == AF_INET)
++ 		LIMIT_NETDEBUG(KERN_DEBUG pr_fmt("drop open request from %pI4/%u\n"),
++ 			       &ireq->ir_rmt_addr, port);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else if (family == AF_INET6)
++ 		LIMIT_NETDEBUG(KERN_DEBUG pr_fmt("drop open request from %pI6/%u\n"),
++ 			       &ireq->ir_v6_rmt_addr, port);
++ #endif
++ }
++ 
++ int tcp_conn_request(struct request_sock_ops *rsk_ops,
++ 		     const struct tcp_request_sock_ops *af_ops,
++ 		     struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct tcp_options_received tmp_opt;
++ 	struct request_sock *req;
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 	struct dst_entry *dst = NULL;
++ 	__u32 isn = TCP_SKB_CB(skb)->tcp_tw_isn;
++ 	bool want_cookie = false, fastopen;
++ 	struct flowi fl;
++ 	struct tcp_fastopen_cookie foc = { .len = -1 };
++ 	int err;
++ 
++ 
++ 	/* TW buckets are converted to open requests without
++ 	 * limitations, they conserve resources and peer is
++ 	 * evidently real one.
++ 	 */
++ 	if ((sysctl_tcp_syncookies == 2 ||
++ 	     inet_csk_reqsk_queue_is_full(sk)) && !isn) {
++ 		want_cookie = tcp_syn_flood_action(sk, skb, rsk_ops->slab_name);
++ 		if (!want_cookie)
++ 			goto drop;
++ 	}
++ 
++ 
++ 	/* Accept backlog is full. If we have already queued enough
++ 	 * of warm entries in syn queue, drop request. It is better than
++ 	 * clogging syn queue with openreqs with exponentially increasing
++ 	 * timeout.
++ 	 */
++ 	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
++ 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
++ 		goto drop;
++ 	}
++ 
++ 	req = inet_reqsk_alloc(rsk_ops);
++ 	if (!req)
++ 		goto drop;
++ 
++ 	tcp_rsk(req)->af_specific = af_ops;
++ 
++ 	tcp_clear_options(&tmp_opt);
++ 	tmp_opt.mss_clamp = af_ops->mss_clamp;
++ 	tmp_opt.user_mss  = tp->rx_opt.user_mss;
++ 	tcp_parse_options(skb, &tmp_opt, 0, want_cookie ? NULL : &foc);
++ 
++ 	if (want_cookie && !tmp_opt.saw_tstamp)
++ 		tcp_clear_options(&tmp_opt);
++ 
++ 	tmp_opt.tstamp_ok = tmp_opt.saw_tstamp;
++ 	tcp_openreq_init(req, &tmp_opt, skb, sk);
++ 
++ 	af_ops->init_req(req, sk, skb);
++ 
++ 	if (security_inet_conn_request(sk, skb, req))
++ 		goto drop_and_free;
++ 
++ 	if (!want_cookie || tmp_opt.tstamp_ok)
++ 		TCP_ECN_create_request(req, skb, sk);
++ 
++ 	if (want_cookie) {
++ 		isn = cookie_init_sequence(af_ops, sk, skb, &req->mss);
++ 		req->cookie_ts = tmp_opt.tstamp_ok;
++ 	} else if (!isn) {
++ 		/* VJ's idea. We save last timestamp seen
++ 		 * from the destination in peer table, when entering
++ 		 * state TIME-WAIT, and check against it before
++ 		 * accepting new connection request.
++ 		 *
++ 		 * If "isn" is not zero, this request hit alive
++ 		 * timewait bucket, so that all the necessary checks
++ 		 * are made in the function processing timewait state.
++ 		 */
++ 		if (tcp_death_row.sysctl_tw_recycle) {
++ 			bool strict;
++ 
++ 			dst = af_ops->route_req(sk, &fl, req, &strict);
++ 
++ 			if (dst && strict &&
++ 			    !tcp_peer_is_proven(req, dst, true,
++ 						tmp_opt.saw_tstamp)) {
++ 				NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSPASSIVEREJECTED);
++ 				goto drop_and_release;
++ 			}
++ 		}
++ 		/* Kill the following clause, if you dislike this way. */
++ 		else if (!sysctl_tcp_syncookies &&
++ 			 (sysctl_max_syn_backlog - inet_csk_reqsk_queue_len(sk) <
++ 			  (sysctl_max_syn_backlog >> 2)) &&
++ 			 !tcp_peer_is_proven(req, dst, false,
++ 					     tmp_opt.saw_tstamp)) {
++ 			/* Without syncookies last quarter of
++ 			 * backlog is filled with destinations,
++ 			 * proven to be alive.
++ 			 * It means that we continue to communicate
++ 			 * to destinations, already remembered
++ 			 * to the moment of synflood.
++ 			 */
++ 			pr_drop_req(req, ntohs(tcp_hdr(skb)->source),
++ 				    rsk_ops->family);
++ 			goto drop_and_release;
++ 		}
++ 
++ 		isn = af_ops->init_seq(skb);
++ 	}
++ 	if (!dst) {
++ 		dst = af_ops->route_req(sk, &fl, req, NULL);
++ 		if (!dst)
++ 			goto drop_and_free;
++ 	}
++ 
++ 	tcp_rsk(req)->snt_isn = isn;
++ 	tcp_openreq_init_rwin(req, sk, dst);
++ 	fastopen = !want_cookie &&
++ 		   tcp_try_fastopen(sk, skb, req, &foc, dst);
++ 	err = af_ops->send_synack(sk, dst, &fl, req,
++ 				  skb_get_queue_mapping(skb), &foc);
++ 	if (!fastopen) {
++ 		if (err || want_cookie)
++ 			goto drop_and_free;
++ 
++ 		tcp_rsk(req)->listener = NULL;
++ 		af_ops->queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
++ 	}
++ 
++ 	return 0;
++ 
++ drop_and_release:
++ 	dst_release(dst);
++ drop_and_free:
++ 	reqsk_free(req);
++ drop:
++ 	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tcp_conn_request);
+++>>>>>>> 30e502a34b8b (net: tcp: add flag for ca to indicate that ECN is required)
+* Unmerged path include/net/tcp.h
+* Unmerged path net/ipv4/tcp_input.c
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index c50742a4dcce..e4b3b54f8df8 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -315,11 +315,15 @@ static u16 tcp_select_window(struct sock *sk)
+ }
+ 
+ /* Packet ECN state for a SYN-ACK */
+-static inline void TCP_ECN_send_synack(const struct tcp_sock *tp, struct sk_buff *skb)
++static inline void TCP_ECN_send_synack(struct sock *sk, struct sk_buff *skb)
+ {
++	const struct tcp_sock *tp = tcp_sk(sk);
++
+ 	TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_CWR;
+ 	if (!(tp->ecn_flags & TCP_ECN_OK))
+ 		TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_ECE;
++	else if (tcp_ca_needs_ecn(sk))
++		INET_ECN_xmit(sk);
+ }
+ 
+ /* Packet ECN state for a SYN.  */
+@@ -328,17 +332,24 @@ static inline void TCP_ECN_send_syn(struct sock *sk, struct sk_buff *skb)
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 
+ 	tp->ecn_flags = 0;
+-	if (sock_net(sk)->ipv4.sysctl_tcp_ecn == 1) {
++	if (sock_net(sk)->ipv4.sysctl_tcp_ecn == 1 ||
++	    tcp_ca_needs_ecn(sk)) {
+ 		TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_ECE | TCPHDR_CWR;
+ 		tp->ecn_flags = TCP_ECN_OK;
++		if (tcp_ca_needs_ecn(sk))
++			INET_ECN_xmit(sk);
+ 	}
+ }
+ 
+ static __inline__ void
+-TCP_ECN_make_synack(const struct request_sock *req, struct tcphdr *th)
++TCP_ECN_make_synack(const struct request_sock *req, struct tcphdr *th,
++		    struct sock *sk)
+ {
+-	if (inet_rsk(req)->ecn_ok)
++	if (inet_rsk(req)->ecn_ok) {
+ 		th->ece = 1;
++		if (tcp_ca_needs_ecn(sk))
++			INET_ECN_xmit(sk);
++	}
+ }
+ 
+ /* Set up ECN state for a packet on a ESTABLISHED socket that is about to
+@@ -359,7 +370,7 @@ static inline void TCP_ECN_send(struct sock *sk, struct sk_buff *skb,
+ 				tcp_hdr(skb)->cwr = 1;
+ 				skb_shinfo(skb)->gso_type |= SKB_GSO_TCP_ECN;
+ 			}
+-		} else {
++		} else if (!tcp_ca_needs_ecn(sk)) {
+ 			/* ACK or retransmitted segment: clear ECT|CE */
+ 			INET_ECN_dontxmit(sk);
+ 		}
+@@ -2719,7 +2730,7 @@ int tcp_send_synack(struct sock *sk)
+ 		}
+ 
+ 		TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_ACK;
+-		TCP_ECN_send_synack(tcp_sk(sk), skb);
++		TCP_ECN_send_synack(sk, skb);
+ 	}
+ 	TCP_SKB_CB(skb)->when = tcp_time_stamp;
+ 	return tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);
+@@ -2800,7 +2811,7 @@ struct sk_buff *tcp_make_synack(struct sock *sk, struct dst_entry *dst,
+ 	memset(th, 0, sizeof(struct tcphdr));
+ 	th->syn = 1;
+ 	th->ack = 1;
+-	TCP_ECN_make_synack(req, th);
++	TCP_ECN_make_synack(req, th, sk);
+ 	th->source = htons(ireq->ir_num);
+ 	th->dest = ireq->ir_rmt_port;
+ 	/* Setting of flags are superfluous here for callers (and ECE is
