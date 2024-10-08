@@ -1,0 +1,830 @@
+vxlan: keep flags and vni in network byte order
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 54bfd872bf16d40b61bd0cd9b769b2fef67dd272
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/54bfd872.failed
+
+Prevent repeated conversions from and to network order in the fast path.
+
+To achieve this, define all flag constants in big endian order and store VNI
+as __be32. To prevent confusion between the actual VNI value and the VNI
+field from the header (which contains additional reserved byte), strictly
+distinguish between "vni" and "vni_field".
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 54bfd872bf16d40b61bd0cd9b769b2fef67dd272)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+diff --cc drivers/net/vxlan.c
+index a2751f4f523c,4e3d3dfe2a0e..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1154,98 -1160,9 +1156,103 @@@ static struct vxlanhdr *vxlan_remcsum(s
+  	return vh;
+  }
+  
+ +/* Callback from net/ipv4/udp.c to receive packets */
+ +static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+ +{
+ +	struct vxlan_sock *vs;
+ +	struct vxlanhdr *vxh;
+ +	u32 flags, vni;
+ +	struct vxlan_metadata md = {0};
+ +
+ +	/* Need Vxlan and inner Ethernet header to be present */
+ +	if (!pskb_may_pull(skb, VXLAN_HLEN))
+ +		goto error;
+ +
+ +	vxh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
+ +	flags = ntohl(vxh->vx_flags);
+ +	vni = ntohl(vxh->vx_vni);
+ +
+ +	if (flags & VXLAN_HF_VNI) {
+ +		flags &= ~VXLAN_HF_VNI;
+ +	} else {
+ +		/* VNI flag always required to be set */
+ +		goto bad_flags;
+ +	}
+ +
+ +	if (iptunnel_pull_header(skb, VXLAN_HLEN, htons(ETH_P_TEB)))
+ +		goto drop;
+ +	vxh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
+ +
+ +	vs = rcu_dereference_sk_user_data(sk);
+ +	if (!vs)
+ +		goto drop;
+ +
+ +	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
+ +		vxh = vxlan_remcsum(skb, vxh, sizeof(struct vxlanhdr), vni,
+ +				    !!(vs->flags & VXLAN_F_REMCSUM_NOPARTIAL));
+ +		if (!vxh)
+ +			goto drop;
+ +
+ +		flags &= ~VXLAN_HF_RCO;
+ +		vni &= VXLAN_VNI_MASK;
+ +	}
+ +
+ +	/* For backwards compatibility, only allow reserved fields to be
+ +	 * used by VXLAN extensions if explicitly requested.
+ +	 */
+ +	if ((flags & VXLAN_HF_GBP) && (vs->flags & VXLAN_F_GBP)) {
+ +		struct vxlanhdr_gbp *gbp;
+ +
+ +		gbp = (struct vxlanhdr_gbp *)vxh;
+ +		md.gbp = ntohs(gbp->policy_id);
+ +
+ +		if (gbp->dont_learn)
+ +			md.gbp |= VXLAN_GBP_DONT_LEARN;
+ +
+ +		if (gbp->policy_applied)
+ +			md.gbp |= VXLAN_GBP_POLICY_APPLIED;
+ +
+ +		flags &= ~VXLAN_GBP_USED_BITS;
+ +	}
+ +
+ +	if (flags || vni & ~VXLAN_VNI_MASK) {
+ +		/* If there are any unprocessed flags remaining treat
+ +		 * this as a malformed packet. This behavior diverges from
+ +		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
+ +		 * in reserved fields are to be ignored. The approach here
+ +		 * maintains compatibility with previous stack code, and also
+ +		 * is more robust and provides a little more security in
+ +		 * adding extensions to VXLAN.
+ +		 */
+ +
+ +		goto bad_flags;
+ +	}
+ +
+ +	md.vni = vxh->vx_vni;
+ +	vs->rcv(vs, skb, &md);
+ +	return 0;
+ +
+ +drop:
+ +	/* Consume bad packet */
+ +	kfree_skb(skb);
+ +	return 0;
+ +
+ +bad_flags:
+ +	netdev_dbg(skb->dev, "invalid vxlan flags=%#x vni=%#x\n",
+ +		   ntohl(vxh->vx_flags), ntohl(vxh->vx_vni));
+ +
+ +error:
+ +	/* Return non vxlan pkt */
+ +	return 1;
+ +}
+ +
+  static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+++<<<<<<< HEAD
+ +		      struct vxlan_metadata *md)
+++=======
++ 		      struct vxlan_metadata *md, __be32 vni,
++ 		      struct metadata_dst *tun_dst)
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  {
+  	struct iphdr *oip = NULL;
+  	struct ipv6hdr *oip6 = NULL;
+@@@ -1327,6 -1254,113 +1334,116 @@@ drop
+  	kfree_skb(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Callback from net/ipv4/udp.c to receive packets */
++ static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct metadata_dst *tun_dst = NULL;
++ 	struct vxlan_sock *vs;
++ 	__be32 flags, vni_field;
++ 	struct vxlan_metadata _md;
++ 	struct vxlan_metadata *md = &_md;
++ 
++ 	/* Need Vxlan and inner Ethernet header to be present */
++ 	if (!pskb_may_pull(skb, VXLAN_HLEN))
++ 		goto error;
++ 
++ 	flags = vxlan_hdr(skb)->vx_flags;
++ 	vni_field = vxlan_hdr(skb)->vx_vni;
++ 
++ 	if (flags & VXLAN_HF_VNI) {
++ 		flags &= ~VXLAN_HF_VNI;
++ 	} else {
++ 		/* VNI flag always required to be set */
++ 		goto bad_flags;
++ 	}
++ 
++ 	if (iptunnel_pull_header(skb, VXLAN_HLEN, htons(ETH_P_TEB)))
++ 		goto drop;
++ 
++ 	vs = rcu_dereference_sk_user_data(sk);
++ 	if (!vs)
++ 		goto drop;
++ 
++ 	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
++ 		if (!vxlan_remcsum(skb, vxlan_hdr(skb), sizeof(struct vxlanhdr),
++ 				   vni_field,
++ 				   !!(vs->flags & VXLAN_F_REMCSUM_NOPARTIAL)))
++ 			goto drop;
++ 
++ 		flags &= ~VXLAN_HF_RCO;
++ 		vni_field &= VXLAN_VNI_MASK;
++ 	}
++ 
++ 	if (vxlan_collect_metadata(vs)) {
++ 		tun_dst = udp_tun_rx_dst(skb, vxlan_get_sk_family(vs), TUNNEL_KEY,
++ 					 vxlan_vni(vni_field), sizeof(*md));
++ 
++ 		if (!tun_dst)
++ 			goto drop;
++ 
++ 		md = ip_tunnel_info_opts(&tun_dst->u.tun_info);
++ 	} else {
++ 		memset(md, 0, sizeof(*md));
++ 	}
++ 
++ 	/* For backwards compatibility, only allow reserved fields to be
++ 	 * used by VXLAN extensions if explicitly requested.
++ 	 */
++ 	if ((flags & VXLAN_HF_GBP) && (vs->flags & VXLAN_F_GBP)) {
++ 		struct vxlanhdr_gbp *gbp;
++ 
++ 		gbp = (struct vxlanhdr_gbp *)vxlan_hdr(skb);
++ 		md->gbp = ntohs(gbp->policy_id);
++ 
++ 		if (tun_dst)
++ 			tun_dst->u.tun_info.key.tun_flags |= TUNNEL_VXLAN_OPT;
++ 
++ 		if (gbp->dont_learn)
++ 			md->gbp |= VXLAN_GBP_DONT_LEARN;
++ 
++ 		if (gbp->policy_applied)
++ 			md->gbp |= VXLAN_GBP_POLICY_APPLIED;
++ 
++ 		flags &= ~VXLAN_GBP_USED_BITS;
++ 	}
++ 
++ 	if (flags || vni_field & ~VXLAN_VNI_MASK) {
++ 		/* If there are any unprocessed flags remaining treat
++ 		 * this as a malformed packet. This behavior diverges from
++ 		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
++ 		 * in reserved fields are to be ignored. The approach here
++ 		 * maintains compatibility with previous stack code, and also
++ 		 * is more robust and provides a little more security in
++ 		 * adding extensions to VXLAN.
++ 		 */
++ 
++ 		goto bad_flags;
++ 	}
++ 
++ 	vxlan_rcv(vs, skb, md, vxlan_vni(vni_field), tun_dst);
++ 	return 0;
++ 
++ drop:
++ 	/* Consume bad packet */
++ 	kfree_skb(skb);
++ 	return 0;
++ 
++ bad_flags:
++ 	netdev_dbg(skb->dev, "invalid vxlan flags=%#x vni=%#x\n",
++ 		   ntohl(vxlan_hdr(skb)->vx_flags),
++ 		   ntohl(vxlan_hdr(skb)->vx_vni));
++ 
++ error:
++ 	if (tun_dst)
++ 		dst_release((struct dst_entry *)tun_dst);
++ 
++ 	/* Return non vxlan pkt */
++ 	return 1;
++ }
++ 
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  static int arp_reduce(struct net_device *dev, struct sk_buff *skb)
+  {
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+@@@ -1671,9 -1702,7 +1788,8 @@@ static int vxlan6_xmit_skb(struct dst_e
+  	struct vxlanhdr *vxh;
+  	int min_headroom;
+  	int err;
+ +	bool udp_sum = !(vxflags & VXLAN_F_UDP_ZERO_CSUM6_TX);
+  	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+- 	u16 hdrlen = sizeof(struct vxlanhdr);
+  
+  	if ((vxflags & VXLAN_F_REMCSUM_TX) &&
+  	    skb->ip_summed == CHECKSUM_PARTIAL) {
+@@@ -1702,30 -1727,23 +1818,32 @@@
+  	}
+  
+  	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb))
+ -		return -ENOMEM;
+ +	if (WARN_ON(!skb)) {
+ +		err = -ENOMEM;
+ +		goto err;
+ +	}
+  
+ -	skb = iptunnel_handle_offloads(skb, type);
+ -	if (IS_ERR(skb))
+ -		return PTR_ERR(skb);
+ +	skb = iptunnel_handle_offloads(skb, udp_sum, type);
+ +	if (IS_ERR(skb)) {
+ +		err = -EINVAL;
+ +		goto err;
+ +	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+++<<<<<<< HEAD
+ +	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+ +	vxh->vx_vni = md->vni;
+++=======
++ 	vxh->vx_flags = VXLAN_HF_VNI;
++ 	vxh->vx_vni = vxlan_vni_field(vni);
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  
+  	if (type & SKB_GSO_TUNNEL_REMCSUM) {
+- 		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
+- 			   VXLAN_RCO_SHIFT;
+- 
+- 		if (skb->csum_offset == offsetof(struct udphdr, check))
+- 			data |= VXLAN_RCO_UDP;
++ 		unsigned int start;
+  
+- 		vxh->vx_vni |= htonl(data);
+- 		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
++ 		start = skb_checksum_start_offset(skb) - sizeof(struct vxlanhdr);
++ 		vxh->vx_vni |= vxlan_compute_rco(start, skb->csum_offset);
++ 		vxh->vx_flags |= VXLAN_HF_RCO;
+  
+  		if (!skb_is_gso(skb)) {
+  			skb->ip_summed = CHECKSUM_NONE;
+@@@ -1871,22 -1880,48 +1989,48 @@@ static void vxlan_encap_bypass(struct s
+  static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+  			   struct vxlan_rdst *rdst, bool did_rsc)
+  {
+ -	struct dst_cache *dst_cache;
+ -	struct ip_tunnel_info *info;
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	struct sock *sk;
+ +	struct sock *sk = vxlan->vn_sock->sock->sk;
+  	struct rtable *rt = NULL;
+  	const struct iphdr *old_iph;
+ +	struct flowi4 fl4;
+  	union vxlan_addr *dst;
+ -	union vxlan_addr remote_ip;
+ -	struct vxlan_metadata _md;
+ -	struct vxlan_metadata *md = &_md;
+ +	struct vxlan_metadata md;
+  	__be16 src_port = 0, dst_port;
+- 	u32 vni;
++ 	__be32 vni;
+  	__be16 df = 0;
+  	__u8 tos, ttl;
+  	int err;
+ -	u32 flags = vxlan->flags;
+ -	bool udp_sum = false;
+ -	bool xnet = !net_eq(vxlan->net, dev_net(vxlan->dev));
+  
+++<<<<<<< HEAD
+ +	dst_port = rdst->remote_port ? rdst->remote_port : vxlan->dst_port;
+ +	vni = rdst->remote_vni;
+ +	dst = &rdst->remote_ip;
+++=======
++ 	info = skb_tunnel_info(skb);
++ 
++ 	if (rdst) {
++ 		dst_port = rdst->remote_port ? rdst->remote_port : vxlan->cfg.dst_port;
++ 		vni = rdst->remote_vni;
++ 		dst = &rdst->remote_ip;
++ 		dst_cache = &rdst->dst_cache;
++ 	} else {
++ 		if (!info) {
++ 			WARN_ONCE(1, "%s: Missing encapsulation instructions\n",
++ 				  dev->name);
++ 			goto drop;
++ 		}
++ 		dst_port = info->key.tp_dst ? : vxlan->cfg.dst_port;
++ 		vni = vxlan_tun_id_to_vni(info->key.tun_id);
++ 		remote_ip.sa.sa_family = ip_tunnel_info_af(info);
++ 		if (remote_ip.sa.sa_family == AF_INET)
++ 			remote_ip.sin.sin_addr.s_addr = info->key.u.ipv4.dst;
++ 		else
++ 			remote_ip.sin6.sin6_addr = info->key.u.ipv6.dst;
++ 		dst = &remote_ip;
++ 		dst_cache = &info->dst_cache;
++ 	}
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  
+  	if (vxlan_addr_any(dst)) {
+  		if (did_rsc) {
+@@@ -1951,21 -2005,14 +2095,28 @@@
+  
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+++<<<<<<< HEAD
+ +		md.vni = htonl(vni << 8);
+ +		md.gbp = skb->mark;
+++=======
++ 		err = vxlan_build_skb(skb, &rt->dst, sizeof(struct iphdr),
++ 				      vni, md, flags, udp_sum);
++ 		if (err < 0)
++ 			goto xmit_tx_error;
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  
+ -		udp_tunnel_xmit_skb(rt, sk, skb, saddr,
+ -				    dst->sin.sin_addr.s_addr, tos, ttl, df,
+ -				    src_port, dst_port, xnet, !udp_sum);
+ +		err = vxlan_xmit_skb(rt, sk, skb, fl4.saddr,
+ +				     dst->sin.sin_addr.s_addr, tos, ttl, df,
+ +				     src_port, dst_port, &md,
+ +				     !net_eq(vxlan->net, dev_net(vxlan->dev)),
+ +				     vxlan->flags);
+ +		if (err < 0) {
+ +			/* skb is already freed. */
+ +			skb = NULL;
+ +			goto rt_tx_error;
+ +		}
+ +
+ +		iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+  		struct dst_entry *ndst;
+@@@ -2010,14 -2058,20 +2161,27 @@@
+  			return;
+  		}
+  
+ -		if (!info)
+ -			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM6_TX);
+ -
+  		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+++<<<<<<< HEAD
+ +		md.vni = htonl(vni << 8);
+ +		md.gbp = skb->mark;
+ +
+ +		err = vxlan6_xmit_skb(ndst, sk, skb, dev, &fl6.saddr, &fl6.daddr,
+ +				      0, ttl, src_port, dst_port, &md,
+ +				      !net_eq(vxlan->net, dev_net(vxlan->dev)),
+ +				      vxlan->flags);
+++=======
++ 		skb_scrub_packet(skb, xnet);
++ 		err = vxlan_build_skb(skb, ndst, sizeof(struct ipv6hdr),
++ 				      vni, md, flags, udp_sum);
++ 		if (err < 0) {
++ 			dst_release(ndst);
++ 			return;
++ 		}
++ 		udp_tunnel6_xmit_skb(ndst, sk, skb, dev,
++ 				     &saddr, &dst->sin6.sin6_addr,
++ 				     0, ttl, src_port, dst_port, !udp_sum);
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  #endif
+  	}
+  
+@@@ -2155,9 -2221,8 +2319,9 @@@ static void vxlan_cleanup(unsigned lon
+  static void vxlan_vs_add_dev(struct vxlan_sock *vs, struct vxlan_dev *vxlan)
+  {
+  	struct vxlan_net *vn = net_generic(vxlan->net, vxlan_net_id);
+- 	__u32 vni = vxlan->default_dst.remote_vni;
++ 	__be32 vni = vxlan->default_dst.remote_vni;
+  
+ +	vxlan->vn_sock = vs;
+  	spin_lock(&vn->sock_lock);
+  	hlist_add_head_rcu(&vxlan->hlist, vni_head(vs, vni));
+  	spin_unlock(&vn->sock_lock);
+@@@ -2757,6 -2803,150 +2921,153 @@@ static int vxlan_newlink(struct net *sr
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct net_device *vxlan_dev_create(struct net *net, const char *name,
++ 				    u8 name_assign_type, struct vxlan_config *conf)
++ {
++ 	struct nlattr *tb[IFLA_MAX+1];
++ 	struct net_device *dev;
++ 	int err;
++ 
++ 	memset(&tb, 0, sizeof(tb));
++ 
++ 	dev = rtnl_create_link(net, name, name_assign_type,
++ 			       &vxlan_link_ops, tb);
++ 	if (IS_ERR(dev))
++ 		return dev;
++ 
++ 	err = vxlan_dev_configure(net, dev, conf);
++ 	if (err < 0) {
++ 		free_netdev(dev);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	return dev;
++ }
++ EXPORT_SYMBOL_GPL(vxlan_dev_create);
++ 
++ static int vxlan_newlink(struct net *src_net, struct net_device *dev,
++ 			 struct nlattr *tb[], struct nlattr *data[])
++ {
++ 	struct vxlan_config conf;
++ 	int err;
++ 
++ 	memset(&conf, 0, sizeof(conf));
++ 
++ 	if (data[IFLA_VXLAN_ID])
++ 		conf.vni = cpu_to_be32(nla_get_u32(data[IFLA_VXLAN_ID]));
++ 
++ 	if (data[IFLA_VXLAN_GROUP]) {
++ 		conf.remote_ip.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_GROUP]);
++ 	} else if (data[IFLA_VXLAN_GROUP6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		conf.remote_ip.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_GROUP6]);
++ 		conf.remote_ip.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LOCAL]) {
++ 		conf.saddr.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_LOCAL]);
++ 		conf.saddr.sa.sa_family = AF_INET;
++ 	} else if (data[IFLA_VXLAN_LOCAL6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		/* TODO: respect scope id */
++ 		conf.saddr.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_LOCAL6]);
++ 		conf.saddr.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LINK])
++ 		conf.remote_ifindex = nla_get_u32(data[IFLA_VXLAN_LINK]);
++ 
++ 	if (data[IFLA_VXLAN_TOS])
++ 		conf.tos  = nla_get_u8(data[IFLA_VXLAN_TOS]);
++ 
++ 	if (data[IFLA_VXLAN_TTL])
++ 		conf.ttl = nla_get_u8(data[IFLA_VXLAN_TTL]);
++ 
++ 	if (!data[IFLA_VXLAN_LEARNING] || nla_get_u8(data[IFLA_VXLAN_LEARNING]))
++ 		conf.flags |= VXLAN_F_LEARN;
++ 
++ 	if (data[IFLA_VXLAN_AGEING])
++ 		conf.age_interval = nla_get_u32(data[IFLA_VXLAN_AGEING]);
++ 
++ 	if (data[IFLA_VXLAN_PROXY] && nla_get_u8(data[IFLA_VXLAN_PROXY]))
++ 		conf.flags |= VXLAN_F_PROXY;
++ 
++ 	if (data[IFLA_VXLAN_RSC] && nla_get_u8(data[IFLA_VXLAN_RSC]))
++ 		conf.flags |= VXLAN_F_RSC;
++ 
++ 	if (data[IFLA_VXLAN_L2MISS] && nla_get_u8(data[IFLA_VXLAN_L2MISS]))
++ 		conf.flags |= VXLAN_F_L2MISS;
++ 
++ 	if (data[IFLA_VXLAN_L3MISS] && nla_get_u8(data[IFLA_VXLAN_L3MISS]))
++ 		conf.flags |= VXLAN_F_L3MISS;
++ 
++ 	if (data[IFLA_VXLAN_LIMIT])
++ 		conf.addrmax = nla_get_u32(data[IFLA_VXLAN_LIMIT]);
++ 
++ 	if (data[IFLA_VXLAN_COLLECT_METADATA] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_COLLECT_METADATA]))
++ 		conf.flags |= VXLAN_F_COLLECT_METADATA;
++ 
++ 	if (data[IFLA_VXLAN_PORT_RANGE]) {
++ 		const struct ifla_vxlan_port_range *p
++ 			= nla_data(data[IFLA_VXLAN_PORT_RANGE]);
++ 		conf.port_min = ntohs(p->low);
++ 		conf.port_max = ntohs(p->high);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PORT])
++ 		conf.dst_port = nla_get_be16(data[IFLA_VXLAN_PORT]);
++ 
++ 	if (data[IFLA_VXLAN_UDP_CSUM] && nla_get_u8(data[IFLA_VXLAN_UDP_CSUM]))
++ 		conf.flags |= VXLAN_F_UDP_CSUM;
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]))
++ 		conf.flags |= VXLAN_F_UDP_ZERO_CSUM6_TX;
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
++ 		conf.flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_TX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_TX]))
++ 		conf.flags |= VXLAN_F_REMCSUM_TX;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_RX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_RX]))
++ 		conf.flags |= VXLAN_F_REMCSUM_RX;
++ 
++ 	if (data[IFLA_VXLAN_GBP])
++ 		conf.flags |= VXLAN_F_GBP;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_NOPARTIAL])
++ 		conf.flags |= VXLAN_F_REMCSUM_NOPARTIAL;
++ 
++ 	err = vxlan_dev_configure(src_net, dev, &conf);
++ 	switch (err) {
++ 	case -ENODEV:
++ 		pr_info("ifindex %d does not exist\n", conf.remote_ifindex);
++ 		break;
++ 
++ 	case -EPERM:
++ 		pr_info("IPv6 is disabled via sysctl\n");
++ 		break;
++ 
++ 	case -EEXIST:
++ 		pr_info("duplicate VNI %u\n", be32_to_cpu(conf.vni));
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  static void vxlan_dellink(struct net_device *dev, struct list_head *head)
+  {
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+@@@ -2802,11 -2994,11 +3113,11 @@@ static int vxlan_fill_info(struct sk_bu
+  	const struct vxlan_dev *vxlan = netdev_priv(dev);
+  	const struct vxlan_rdst *dst = &vxlan->default_dst;
+  	struct ifla_vxlan_port_range ports = {
+ -		.low =  htons(vxlan->cfg.port_min),
+ -		.high = htons(vxlan->cfg.port_max),
+ +		.low =  htons(vxlan->port_min),
+ +		.high = htons(vxlan->port_max),
+  	};
+  
+- 	if (nla_put_u32(skb, IFLA_VXLAN_ID, dst->remote_vni))
++ 	if (nla_put_u32(skb, IFLA_VXLAN_ID, be32_to_cpu(dst->remote_vni)))
+  		goto nla_put_failure;
+  
+  	if (!vxlan_addr_any(&dst->remote_ip)) {
+diff --cc include/net/vxlan.h
+index b3828bd87f8a,1b85a3b40c5a..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -7,11 -7,67 +7,70 @@@
+  #include <linux/skbuff.h>
+  #include <linux/netdevice.h>
+  #include <linux/udp.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/dst_metadata.h>
++ 
++ /* VXLAN protocol (RFC 7348) header:
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |R|R|R|R|I|R|R|R|               Reserved                        |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |                VXLAN Network Identifier (VNI) |   Reserved    |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * I = VXLAN Network Identifier (VNI) present.
++  */
++ struct vxlanhdr {
++ 	__be32 vx_flags;
++ 	__be32 vx_vni;
++ };
++ 
++ /* VXLAN header flags. */
++ #define VXLAN_HF_VNI	cpu_to_be32(BIT(27))
++ 
++ #define VXLAN_N_VID     (1u << 24)
++ #define VXLAN_VID_MASK  (VXLAN_N_VID - 1)
++ #define VXLAN_VNI_MASK	cpu_to_be32(VXLAN_VID_MASK << 8)
++ #define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
++ 
++ #define VNI_HASH_BITS	10
++ #define VNI_HASH_SIZE	(1<<VNI_HASH_BITS)
++ #define FDB_HASH_BITS	8
++ #define FDB_HASH_SIZE	(1<<FDB_HASH_BITS)
++ 
++ /* Remote checksum offload for VXLAN (VXLAN_F_REMCSUM_[RT]X):
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |R|R|R|R|I|R|R|R|R|R|C|              Reserved                   |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |           VXLAN Network Identifier (VNI)      |O| Csum start  |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * C = Remote checksum offload bit. When set indicates that the
++  *     remote checksum offload data is present.
++  *
++  * O = Offset bit. Indicates the checksum offset relative to
++  *     checksum start.
++  *
++  * Csum start = Checksum start divided by two.
++  *
++  * http://tools.ietf.org/html/draft-herbert-vxlan-rco
++  */
++ 
++ /* VXLAN-RCO header flags. */
++ #define VXLAN_HF_RCO	cpu_to_be32(BIT(21))
++ 
++ /* Remote checksum offload header option */
++ #define VXLAN_RCO_MASK	cpu_to_be32(0x7f)  /* Last byte of vni field */
++ #define VXLAN_RCO_UDP	cpu_to_be32(0x80)  /* Indicate UDP RCO (TCP when not set *) */
++ #define VXLAN_RCO_SHIFT	1		   /* Left shift of start */
++ #define VXLAN_RCO_SHIFT_MASK ((1 << VXLAN_RCO_SHIFT) - 1)
++ #define VXLAN_MAX_REMCSUM_START (0x7f << VXLAN_RCO_SHIFT)
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  
+  /*
+ - * VXLAN Group Based Policy Extension (VXLAN_F_GBP):
+ + * VXLAN Group Based Policy Extension:
+   * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ - * |G|R|R|R|I|R|R|R|R|D|R|R|A|R|R|R|        Group Policy ID        |
+ + * |1|-|-|-|1|-|-|-|R|D|R|R|A|R|R|R|        Group Policy ID        |
+   * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   * |                VXLAN Network Identifier (VNI) |   Reserved    |
+   * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+@@@ -46,7 -104,10 +105,14 @@@ struct vxlanhdr_gbp 
+  	__be32	vx_vni;
+  };
+  
+++<<<<<<< HEAD
+ +#define VXLAN_GBP_USED_BITS (VXLAN_HF_GBP | 0xFFFFFF)
+++=======
++ /* VXLAN-GBP header flags. */
++ #define VXLAN_HF_GBP	cpu_to_be32(BIT(31))
++ 
++ #define VXLAN_GBP_USED_BITS (VXLAN_HF_GBP | cpu_to_be32(0xFFFFFF))
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  
+  /* skb->mark mapping
+   *
+@@@ -114,6 -135,62 +180,65 @@@ struct vxlan_sock 
+  	u32		  flags;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ union vxlan_addr {
++ 	struct sockaddr_in sin;
++ 	struct sockaddr_in6 sin6;
++ 	struct sockaddr sa;
++ };
++ 
++ struct vxlan_rdst {
++ 	union vxlan_addr	 remote_ip;
++ 	__be16			 remote_port;
++ 	__be32			 remote_vni;
++ 	u32			 remote_ifindex;
++ 	struct list_head	 list;
++ 	struct rcu_head		 rcu;
++ 	struct dst_cache	 dst_cache;
++ };
++ 
++ struct vxlan_config {
++ 	union vxlan_addr	remote_ip;
++ 	union vxlan_addr	saddr;
++ 	__be32			vni;
++ 	int			remote_ifindex;
++ 	int			mtu;
++ 	__be16			dst_port;
++ 	u16			port_min;
++ 	u16			port_max;
++ 	u8			tos;
++ 	u8			ttl;
++ 	u32			flags;
++ 	unsigned long		age_interval;
++ 	unsigned int		addrmax;
++ 	bool			no_share;
++ };
++ 
++ /* Pseudo network device */
++ struct vxlan_dev {
++ 	struct hlist_node hlist;	/* vni hash table */
++ 	struct list_head  next;		/* vxlan's per namespace list */
++ 	struct vxlan_sock *vn4_sock;	/* listening socket for IPv4 */
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	struct vxlan_sock *vn6_sock;	/* listening socket for IPv6 */
++ #endif
++ 	struct net_device *dev;
++ 	struct net	  *net;		/* netns for packet i/o */
++ 	struct vxlan_rdst default_dst;	/* default destination */
++ 	u32		  flags;	/* VXLAN_F_* in vxlan.h */
++ 
++ 	struct timer_list age_timer;
++ 	spinlock_t	  hash_lock;
++ 	unsigned int	  addrcnt;
++ 	struct gro_cells  gro_cells;
++ 
++ 	struct vxlan_config	cfg;
++ 
++ 	struct hlist_head fdb_head[FDB_HASH_SIZE];
++ };
++ 
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  #define VXLAN_F_LEARN			0x01
+  #define VXLAN_F_PROXY			0x02
+  #define VXLAN_F_RSC			0x04
+@@@ -181,6 -262,59 +306,62 @@@ static inline netdev_features_t vxlan_f
+  /* IPv6 header + UDP + VXLAN + Ethernet header */
+  #define VXLAN6_HEADROOM (40 + 8 + 8 + 14)
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct vxlanhdr *vxlan_hdr(struct sk_buff *skb)
++ {
++ 	return (struct vxlanhdr *)(udp_hdr(skb) + 1);
++ }
++ 
++ static inline __be32 vxlan_vni(__be32 vni_field)
++ {
++ #if defined(__BIG_ENDIAN)
++ 	return vni_field >> 8;
++ #else
++ 	return (vni_field & VXLAN_VNI_MASK) << 8;
++ #endif
++ }
++ 
++ static inline __be32 vxlan_vni_field(__be32 vni)
++ {
++ #if defined(__BIG_ENDIAN)
++ 	return vni << 8;
++ #else
++ 	return vni >> 8;
++ #endif
++ }
++ 
++ static inline __be32 vxlan_tun_id_to_vni(__be64 tun_id)
++ {
++ #if defined(__BIG_ENDIAN)
++ 	return tun_id;
++ #else
++ 	return tun_id >> 32;
++ #endif
++ }
++ 
++ static inline size_t vxlan_rco_start(__be32 vni_field)
++ {
++ 	return be32_to_cpu(vni_field & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
++ }
++ 
++ static inline size_t vxlan_rco_offset(__be32 vni_field)
++ {
++ 	return (vni_field & VXLAN_RCO_UDP) ?
++ 		offsetof(struct udphdr, check) :
++ 		offsetof(struct tcphdr, check);
++ }
++ 
++ static inline __be32 vxlan_compute_rco(unsigned int start, unsigned int offset)
++ {
++ 	__be32 vni_field = cpu_to_be32(start >> VXLAN_RCO_SHIFT);
++ 
++ 	if (offset == offsetof(struct udphdr, check))
++ 		vni_field |= VXLAN_RCO_UDP;
++ 	return vni_field;
++ }
++ 
+++>>>>>>> 54bfd872bf16 (vxlan: keep flags and vni in network byte order)
+  #if IS_ENABLED(CONFIG_VXLAN)
+  void vxlan_get_rx_port(struct net_device *netdev);
+  #else
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
