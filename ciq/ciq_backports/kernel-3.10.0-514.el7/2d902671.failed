@@ -1,0 +1,516 @@
+vfs: merge .d_select_inode() into .d_real()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 2d902671ce1cd98cdc88d78c481889a1b2996101
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2d902671.failed
+
+The two methods essentially do the same: find the real dentry/inode
+belonging to an overlay dentry.  The difference is in the usage:
+
+vfs_open() uses ->d_select_inode() and expects the function to perform
+copy-up if necessary based on the open flags argument.
+
+file_dentry() uses ->d_real() passing in the overlay dentry as well as the
+underlying inode.
+
+vfs_rename() uses ->d_select_inode() but passes zero flags.  ->d_real()
+with a zero inode would have worked just as well here.
+
+This patch merges the functionality of ->d_select_inode() into ->d_real()
+by adding an 'open_flags' argument to the latter.
+
+[Al Viro] Make the signature of d_real() match that of ->d_real() again.
+And constify the inode argument, while we are at it.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 2d902671ce1cd98cdc88d78c481889a1b2996101)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	fs/open.c
+#	fs/overlayfs/inode.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/super.c
+#	include/linux/dcache.h
+#	include/linux/fs.h
+diff --cc fs/dcache.c
+index 94451775d8ad,5405b89fe8ec..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1472,7 -1728,8 +1472,12 @@@ void d_set_d_op(struct dentry *dentry, 
+  				DCACHE_OP_COMPARE	|
+  				DCACHE_OP_REVALIDATE	|
+  				DCACHE_OP_WEAK_REVALIDATE	|
+++<<<<<<< HEAD
+ +				DCACHE_OP_DELETE ));
+++=======
++ 				DCACHE_OP_DELETE	|
++ 				DCACHE_OP_REAL));
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  	dentry->d_op = op;
+  	if (!op)
+  		return;
+@@@ -1488,6 -1745,8 +1493,11 @@@
+  		dentry->d_flags |= DCACHE_OP_DELETE;
+  	if (op->d_prune)
+  		dentry->d_flags |= DCACHE_OP_PRUNE;
+++<<<<<<< HEAD
+++=======
++ 	if (op->d_real)
++ 		dentry->d_flags |= DCACHE_OP_REAL;
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  
+  }
+  EXPORT_SYMBOL(d_set_d_op);
+diff --cc fs/open.c
+index eeadbd924dc1,bf66cf1a9f5c..000000000000
+--- a/fs/open.c
++++ b/fs/open.c
+@@@ -840,6 -825,30 +840,33 @@@ int finish_no_open(struct file *file, s
+  }
+  EXPORT_SYMBOL(finish_no_open);
+  
+++<<<<<<< HEAD
+++=======
++ char *file_path(struct file *filp, char *buf, int buflen)
++ {
++ 	return d_path(&filp->f_path, buf, buflen);
++ }
++ EXPORT_SYMBOL(file_path);
++ 
++ /**
++  * vfs_open - open the file at the given path
++  * @path: path to open
++  * @file: newly allocated file with f_flag initialized
++  * @cred: credentials to use
++  */
++ int vfs_open(const struct path *path, struct file *file,
++ 	     const struct cred *cred)
++ {
++ 	struct dentry *dentry = d_real(path->dentry, NULL, file->f_flags);
++ 
++ 	if (IS_ERR(dentry))
++ 		return PTR_ERR(dentry);
++ 
++ 	file->f_path = *path;
++ 	return do_dentry_open(file, d_backing_inode(dentry), NULL, cred);
++ }
++ 
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  struct file *dentry_open(const struct path *path, int flags,
+  			 const struct cred *cred)
+  {
+diff --cc fs/overlayfs/inode.c
+index cec7c3f64b1e,e08cd94d7b26..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -360,38 -325,28 +360,52 @@@ static bool ovl_open_need_copy_up(int f
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int ovl_dentry_open(struct dentry *dentry, struct file *file,
+ +		    const struct cred *cred)
+++=======
++ int ovl_open_maybe_copy_up(struct dentry *dentry, unsigned int file_flags)
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  {
+- 	int err;
++ 	int err = 0;
+  	struct path realpath;
+  	enum ovl_path_type type;
+  
+- 	if (d_is_dir(dentry))
+- 		return d_backing_inode(dentry);
+- 
+  	type = ovl_path_real(dentry, &realpath);
+ -	if (ovl_open_need_copy_up(file_flags, type, realpath.dentry)) {
+ +	if (ovl_open_need_copy_up(file->f_flags, type, realpath.dentry)) {
+  		err = ovl_want_write(dentry);
+++<<<<<<< HEAD
+ +		if (err)
+ +			return err;
+ +
+ +		if (file->f_flags & O_TRUNC)
+ +			err = ovl_copy_up_last(dentry, NULL, true);
+ +		else
+ +			err = ovl_copy_up(dentry);
+ +		ovl_drop_write(dentry);
+ +		if (err)
+ +			return err;
+ +
+ +		ovl_path_upper(dentry, &realpath);
+ +	}
+ +
+ +	return vfs_open(&realpath, file, cred);
+++=======
++ 		if (!err) {
++ 			if (file_flags & O_TRUNC)
++ 				err = ovl_copy_up_truncate(dentry);
++ 			else
++ 				err = ovl_copy_up(dentry);
++ 			ovl_drop_write(dentry);
++ 		}
++ 	}
++ 
++ 	return err;
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  }
+  
+ -static const struct inode_operations ovl_file_inode_operations = {
+ +static const struct inode_operations_wrapper ovl_file_inode_operations = {
+ +	.ops = {
+  	.setattr	= ovl_setattr,
+  	.permission	= ovl_permission,
+  	.getattr	= ovl_getattr,
+diff --cc fs/overlayfs/overlayfs.h
+index 26a0f54fc56c,6b9fd25c5ad4..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -172,12 -172,14 +172,16 @@@ int ovl_check_d_type_supported(struct p
+  /* inode.c */
+  int ovl_setattr(struct dentry *dentry, struct iattr *attr);
+  int ovl_permission(struct inode *inode, int mask);
+ -int ovl_setxattr(struct dentry *dentry, struct inode *inode,
+ -		 const char *name, const void *value,
+ -		 size_t size, int flags);
+ -ssize_t ovl_getxattr(struct dentry *dentry, struct inode *inode,
+ -		     const char *name, void *value, size_t size);
+ +int ovl_setxattr(struct dentry *dentry, const char *name,
+ +		 const void *value, size_t size, int flags);
+ +ssize_t ovl_getxattr(struct dentry *dentry, const char *name,
+ +		     void *value, size_t size);
+  ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size);
+  int ovl_removexattr(struct dentry *dentry, const char *name);
+++<<<<<<< HEAD
+++=======
++ int ovl_open_maybe_copy_up(struct dentry *dentry, unsigned int file_flags);
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  
+  struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+  			    struct ovl_entry *oe);
+diff --cc fs/overlayfs/super.c
+index 5c0fb1f1eab2,035c176edf00..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -302,6 -304,47 +302,50 @@@ static void ovl_dentry_release(struct d
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct dentry *ovl_d_real(struct dentry *dentry,
++ 				 const struct inode *inode,
++ 				 unsigned int open_flags)
++ {
++ 	struct dentry *real;
++ 
++ 	if (d_is_dir(dentry)) {
++ 		if (!inode || inode == d_inode(dentry))
++ 			return dentry;
++ 		goto bug;
++ 	}
++ 
++ 	if (d_is_negative(dentry))
++ 		return dentry;
++ 
++ 	if (open_flags) {
++ 		int err = ovl_open_maybe_copy_up(dentry, open_flags);
++ 
++ 		if (err)
++ 			return ERR_PTR(err);
++ 	}
++ 
++ 	real = ovl_dentry_upper(dentry);
++ 	if (real && (!inode || inode == d_inode(real)))
++ 		return real;
++ 
++ 	real = ovl_dentry_lower(dentry);
++ 	if (!real)
++ 		goto bug;
++ 
++ 	if (!inode || inode == d_inode(real))
++ 		return real;
++ 
++ 	/* Handle recursion */
++ 	return d_real(real, inode, open_flags);
++ bug:
++ 	WARN(1, "ovl_d_real(%pd4, %s:%lu\n): real dentry not found\n", dentry,
++ 	     inode ? inode->i_sb->s_id : "NULL", inode ? inode->i_ino : 0);
++ 	return dentry;
++ }
++ 
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  static int ovl_dentry_revalidate(struct dentry *dentry, unsigned int flags)
+  {
+  	struct ovl_entry *oe = dentry->d_fsdata;
+@@@ -345,11 -388,12 +389,19 @@@ static int ovl_dentry_weak_revalidate(s
+  
+  static const struct dentry_operations ovl_dentry_operations = {
+  	.d_release = ovl_dentry_release,
+++<<<<<<< HEAD
+++=======
++ 	.d_real = ovl_d_real,
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  };
+  
+  static const struct dentry_operations ovl_reval_dentry_operations = {
+  	.d_release = ovl_dentry_release,
+++<<<<<<< HEAD
+ +	.d_select_inode = ovl_d_select_inode,
+++=======
++ 	.d_real = ovl_d_real,
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  	.d_revalidate = ovl_dentry_revalidate,
+  	.d_weak_revalidate = ovl_dentry_weak_revalidate,
+  };
+diff --cc include/linux/dcache.h
+index 5888528c0fa0,45b22de15ede..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -158,6 -139,7 +158,10 @@@ struct dentry_operations 
+  	char *(*d_dname)(struct dentry *, char *, int);
+  	struct vfsmount *(*d_automount)(struct path *);
+  	int (*d_manage)(struct dentry *, bool);
+++<<<<<<< HEAD
+++=======
++ 	struct dentry *(*d_real)(struct dentry *, const struct inode *, unsigned int);
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  } ____cacheline_aligned;
+  
+  /*
+@@@ -208,15 -192,24 +212,34 @@@
+  #define DCACHE_MANAGED_DENTRY \
+  	(DCACHE_MOUNTED|DCACHE_NEED_AUTOMOUNT|DCACHE_MANAGE_TRANSIT)
+  
+ -#define DCACHE_LRU_LIST			0x00080000
+ -
+ +#define DCACHE_LRU_LIST		0x80000
+ +#define DCACHE_DENTRY_KILLED	0x100000
+ +
+++<<<<<<< HEAD
+ +#define DCACHE_ENTRY_TYPE		0x07000000
+ +#define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry */
+ +#define DCACHE_DIRECTORY_TYPE		0x01000000 /* Normal directory */
+ +#define DCACHE_AUTODIR_TYPE		0x02000000 /* Lookupless directory (presumed automount) */
+ +#define DCACHE_SYMLINK_TYPE		0x03000000 /* Symlink */
+ +#define DCACHE_FILE_TYPE		0x04000000 /* Other file type */
+++=======
++ #define DCACHE_ENTRY_TYPE		0x00700000
++ #define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry (maybe fallthru to nowhere) */
++ #define DCACHE_WHITEOUT_TYPE		0x00100000 /* Whiteout dentry (stop pathwalk) */
++ #define DCACHE_DIRECTORY_TYPE		0x00200000 /* Normal directory */
++ #define DCACHE_AUTODIR_TYPE		0x00300000 /* Lookupless directory (presumed automount) */
++ #define DCACHE_REGULAR_TYPE		0x00400000 /* Regular file type (or fallthru to such) */
++ #define DCACHE_SPECIAL_TYPE		0x00500000 /* Other file type (or fallthru to such) */
++ #define DCACHE_SYMLINK_TYPE		0x00600000 /* Symlink (or fallthru to such) */
++ 
++ #define DCACHE_MAY_FREE			0x00800000
++ #define DCACHE_FALLTHRU			0x01000000 /* Fall through to lower layer */
++ #define DCACHE_ENCRYPTED_WITH_KEY	0x02000000 /* dir is encrypted with a valid key */
++ #define DCACHE_OP_REAL			0x04000000
++ 
++ #define DCACHE_PAR_LOOKUP		0x10000000 /* being looked up (with parent locked shared) */
++ #define DCACHE_DENTRY_CURSOR		0x20000000
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  
+  extern seqlock_t rename_lock;
+  
+@@@ -459,6 -440,141 +482,93 @@@ static inline bool d_is_positive(const 
+  	return !d_is_negative(dentry);
+  }
+  
+ -/**
+ - * d_really_is_negative - Determine if a dentry is really negative (ignoring fallthroughs)
+ - * @dentry: The dentry in question
+ - *
+ - * Returns true if the dentry represents either an absent name or a name that
+ - * doesn't map to an inode (ie. ->d_inode is NULL).  The dentry could represent
+ - * a true miss, a whiteout that isn't represented by a 0,0 chardev or a
+ - * fallthrough marker in an opaque directory.
+ - *
+ - * Note!  (1) This should be used *only* by a filesystem to examine its own
+ - * dentries.  It should not be used to look at some other filesystem's
+ - * dentries.  (2) It should also be used in combination with d_inode() to get
+ - * the inode.  (3) The dentry may have something attached to ->d_lower and the
+ - * type field of the flags may be set to something other than miss or whiteout.
+ - */
+ -static inline bool d_really_is_negative(const struct dentry *dentry)
+ -{
+ -	return dentry->d_inode == NULL;
+ -}
+ -
+ -/**
+ - * d_really_is_positive - Determine if a dentry is really positive (ignoring fallthroughs)
+ - * @dentry: The dentry in question
+ - *
+ - * Returns true if the dentry represents a name that maps to an inode
+ - * (ie. ->d_inode is not NULL).  The dentry might still represent a whiteout if
+ - * that is represented on medium as a 0,0 chardev.
+ - *
+ - * Note!  (1) This should be used *only* by a filesystem to examine its own
+ - * dentries.  It should not be used to look at some other filesystem's
+ - * dentries.  (2) It should also be used in combination with d_inode() to get
+ - * the inode.
+ - */
+ -static inline bool d_really_is_positive(const struct dentry *dentry)
+ -{
+ -	return dentry->d_inode != NULL;
+ -}
+ -
+ -static inline int simple_positive(struct dentry *dentry)
+ -{
+ -	return d_really_is_positive(dentry) && !d_unhashed(dentry);
+ -}
+ -
+ -extern void d_set_fallthru(struct dentry *dentry);
+ -
+ -static inline bool d_is_fallthru(const struct dentry *dentry)
+ -{
+ -	return dentry->d_flags & DCACHE_FALLTHRU;
+ -}
+ -
+ -
+  extern int sysctl_vfs_cache_pressure;
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned long vfs_pressure_ratio(unsigned long val)
++ {
++ 	return mult_frac(val, sysctl_vfs_cache_pressure, 100);
++ }
++ 
++ /**
++  * d_inode - Get the actual inode of this dentry
++  * @dentry: The dentry to query
++  *
++  * This is the helper normal filesystems should use to get at their own inodes
++  * in their own dentries and ignore the layering superimposed upon them.
++  */
++ static inline struct inode *d_inode(const struct dentry *dentry)
++ {
++ 	return dentry->d_inode;
++ }
++ 
++ /**
++  * d_inode_rcu - Get the actual inode of this dentry with ACCESS_ONCE()
++  * @dentry: The dentry to query
++  *
++  * This is the helper normal filesystems should use to get at their own inodes
++  * in their own dentries and ignore the layering superimposed upon them.
++  */
++ static inline struct inode *d_inode_rcu(const struct dentry *dentry)
++ {
++ 	return ACCESS_ONCE(dentry->d_inode);
++ }
++ 
++ /**
++  * d_backing_inode - Get upper or lower inode we should be using
++  * @upper: The upper layer
++  *
++  * This is the helper that should be used to get at the inode that will be used
++  * if this dentry were to be opened as a file.  The inode may be on the upper
++  * dentry or it may be on a lower dentry pinned by the upper.
++  *
++  * Normal filesystems should not use this to access their own inodes.
++  */
++ static inline struct inode *d_backing_inode(const struct dentry *upper)
++ {
++ 	struct inode *inode = upper->d_inode;
++ 
++ 	return inode;
++ }
++ 
++ /**
++  * d_backing_dentry - Get upper or lower dentry we should be using
++  * @upper: The upper layer
++  *
++  * This is the helper that should be used to get the dentry of the inode that
++  * will be used if this dentry were opened as a file.  It may be the upper
++  * dentry or it may be a lower dentry pinned by the upper.
++  *
++  * Normal filesystems should not use this to access their own dentries.
++  */
++ static inline struct dentry *d_backing_dentry(struct dentry *upper)
++ {
++ 	return upper;
++ }
++ 
++ static inline struct dentry *d_real(struct dentry *dentry,
++ 				    const struct inode *inode,
++ 				    unsigned int flags)
++ {
++ 	if (unlikely(dentry->d_flags & DCACHE_OP_REAL))
++ 		return dentry->d_op->d_real(dentry, inode, flags);
++ 	else
++ 		return dentry;
++ }
++ 
++ /**
++  * d_real_inode - Return the real inode
++  * @dentry: The dentry to query
++  *
++  * If dentry is on an union/overlay, then return the underlying, real inode.
++  * Otherwise return d_inode().
++  */
++ static inline struct inode *d_real_inode(struct dentry *dentry)
++ {
++ 	return d_backing_inode(d_real(dentry, NULL, 0));
++ }
++ 
++ 
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  #endif	/* __LINUX_DCACHE_H */
+diff --cc include/linux/fs.h
+index 37d4ac39152e,bacc0733663c..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1258,6 -1265,20 +1258,23 @@@ static inline void show_fd_locks(struc
+  			struct file *filp, struct files_struct *files) {}
+  #endif /* !CONFIG_FILE_LOCKING */
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct inode *file_inode(const struct file *f)
++ {
++ 	return f->f_inode;
++ }
++ 
++ static inline struct dentry *file_dentry(const struct file *file)
++ {
++ 	return d_real(file->f_path.dentry, file_inode(file), 0);
++ }
++ 
++ static inline int locks_lock_file_wait(struct file *filp, struct file_lock *fl)
++ {
++ 	return locks_lock_inode_wait(file_inode(filp), fl);
++ }
+++>>>>>>> 2d902671ce1c (vfs: merge .d_select_inode() into .d_real())
+  
+  struct fasync_struct {
+  	spinlock_t		fa_lock;
+* Unmerged path fs/dcache.c
+diff --git a/fs/namei.c b/fs/namei.c
+index c10882eb7ad0..2ab53f66943a 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -4099,7 +4099,7 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 	 * Check source == target.
+ 	 * On overlayfs need to look at underlying inodes.
+ 	 */
+-	if (vfs_select_inode(old_dentry, 0) == vfs_select_inode(new_dentry, 0))
++	if (d_real_inode(old_dentry) == d_real_inode(new_dentry))
+ 		return 0;
+ 
+ 	error = may_delete(old_dir, old_dentry, is_dir);
+* Unmerged path fs/open.c
+* Unmerged path fs/overlayfs/inode.c
+* Unmerged path fs/overlayfs/overlayfs.h
+* Unmerged path fs/overlayfs/super.c
+* Unmerged path include/linux/dcache.h
+* Unmerged path include/linux/fs.h
