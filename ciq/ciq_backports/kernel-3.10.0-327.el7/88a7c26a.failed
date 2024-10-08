@@ -1,0 +1,210 @@
+perf: Move task_pt_regs sampling into arch code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] Move task_pt_regs sampling into arch code (Jiri Olsa) [1209607]
+Rebuild_FUZZ: 93.18%
+commit-author Andy Lutomirski <luto@amacapital.net>
+commit 88a7c26af8dab2f2d69f5a6067eb670694ec38c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/88a7c26a.failed
+
+On x86_64, at least, task_pt_regs may be only partially initialized
+in many contexts, so x86_64 should not use it without extra care
+from interrupt context, let alone NMI context.
+
+This will allow x86_64 to override the logic and will supply some
+scratch space to use to make a cleaner copy of user regs.
+
+	Tested-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: chenggang.qcg@taobao.com
+	Cc: Wu Fengguang <fengguang.wu@intel.com>
+	Cc: Namhyung Kim <namhyung@gmail.com>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Arjan van de Ven <arjan@linux.intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Jean Pihet <jean.pihet@linaro.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mark Salter <msalter@redhat.com>
+	Cc: Russell King <linux@arm.linux.org.uk>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: linux-arm-kernel@lists.infradead.org
+Link: http://lkml.kernel.org/r/e431cd4c18c2e1c44c774f10758527fb2d1025c4.1420396372.git.luto@amacapital.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 88a7c26af8dab2f2d69f5a6067eb670694ec38c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/kernel/perf_regs.c
+#	arch/arm64/kernel/perf_regs.c
+#	include/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index 7d06dfb6891c,4f7a61ca4b39..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -613,21 -604,18 +608,31 @@@ struct perf_sample_data 
+  		u32	cpu;
+  		u32	reserved;
+  	}				cpu_entry;
+ +	u64				period;
+ +	union  perf_mem_data_src	data_src;
+  	struct perf_callchain_entry	*callchain;
+++<<<<<<< HEAD
+ +	struct perf_raw_record		*raw;
+ +	struct perf_branch_stack	*br_stack;
+++=======
++ 
++ 	/*
++ 	 * regs_user may point to task_pt_regs or to regs_user_copy, depending
++ 	 * on arch details.
++ 	 */
+++>>>>>>> 88a7c26af8da (perf: Move task_pt_regs sampling into arch code)
+  	struct perf_regs		regs_user;
++ 	struct pt_regs			regs_user_copy;
++ 
+  	struct perf_regs		regs_intr;
+  	u64				stack_user_size;
+ -} ____cacheline_aligned;
+ +	u64				weight;
+ +
+ +	/*
+ +	 * Transaction flags for abort events:
+ +	 */
+ +	RH_KABI_EXTEND(u64				txn)
+ +};
+  
+  /* default value for data source */
+  #define PERF_MEM_NA (PERF_MEM_S(OP, NA)   |\
+diff --cc kernel/events/core.c
+index 30b7d0bf3ac7,882f835a0d85..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -4470,18 -4461,17 +4470,30 @@@ perf_output_sample_regs(struct perf_out
+  }
+  
+  static void perf_sample_regs_user(struct perf_regs *regs_user,
+- 				  struct pt_regs *regs)
++ 				  struct pt_regs *regs,
++ 				  struct pt_regs *regs_user_copy)
+  {
+++<<<<<<< HEAD
+ +	if (!user_mode(regs)) {
+ +		if (current->mm)
+ +			regs = task_pt_regs(current);
+ +		else
+ +			regs = NULL;
+ +	}
+ +
+ +	if (regs) {
+ +		regs_user->regs = regs;
+ +		regs_user->abi  = perf_reg_abi(current);
+++=======
++ 	if (user_mode(regs)) {
++ 		regs_user->abi = perf_reg_abi(current);
++ 		regs_user->regs = regs;
++ 	} else if (current->mm) {
++ 		perf_get_regs_user(regs_user, regs, regs_user_copy);
++ 	} else {
++ 		regs_user->abi = PERF_SAMPLE_REGS_ABI_NONE;
++ 		regs_user->regs = NULL;
+++>>>>>>> 88a7c26af8da (perf: Move task_pt_regs sampling into arch code)
+  	}
+  }
+  
+@@@ -4956,6 -4946,10 +4968,13 @@@ void perf_prepare_sample(struct perf_ev
+  		header->size += size;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (sample_type & (PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER))
++ 		perf_sample_regs_user(&data->regs_user, regs,
++ 				      &data->regs_user_copy);
++ 
+++>>>>>>> 88a7c26af8da (perf: Move task_pt_regs sampling into arch code)
+  	if (sample_type & PERF_SAMPLE_REGS_USER) {
+  		/* regs dump ABI info */
+  		int size = sizeof(u64);
+* Unmerged path arch/arm/kernel/perf_regs.c
+* Unmerged path arch/arm64/kernel/perf_regs.c
+* Unmerged path arch/arm/kernel/perf_regs.c
+* Unmerged path arch/arm64/kernel/perf_regs.c
+diff --git a/arch/x86/kernel/perf_regs.c b/arch/x86/kernel/perf_regs.c
+index e309cc5c276e..3bbbb1a4fb52 100644
+--- a/arch/x86/kernel/perf_regs.c
++++ b/arch/x86/kernel/perf_regs.c
+@@ -78,6 +78,14 @@ u64 perf_reg_abi(struct task_struct *task)
+ {
+ 	return PERF_SAMPLE_REGS_ABI_32;
+ }
++
++void perf_get_regs_user(struct perf_regs *regs_user,
++			struct pt_regs *regs,
++			struct pt_regs *regs_user_copy)
++{
++	regs_user->regs = task_pt_regs(current);
++	regs_user->abi = perf_reg_abi(current);
++}
+ #else /* CONFIG_X86_64 */
+ #define REG_NOSUPPORT ((1ULL << PERF_REG_X86_DS) | \
+ 		       (1ULL << PERF_REG_X86_ES) | \
+@@ -102,4 +110,12 @@ u64 perf_reg_abi(struct task_struct *task)
+ 	else
+ 		return PERF_SAMPLE_REGS_ABI_64;
+ }
++
++void perf_get_regs_user(struct perf_regs *regs_user,
++			struct pt_regs *regs,
++			struct pt_regs *regs_user_copy)
++{
++	regs_user->regs = task_pt_regs(current);
++	regs_user->abi = perf_reg_abi(current);
++}
+ #endif /* CONFIG_X86_32 */
+* Unmerged path include/linux/perf_event.h
+diff --git a/include/linux/perf_regs.h b/include/linux/perf_regs.h
+index 3c73d5fe18be..a5f98d53d732 100644
+--- a/include/linux/perf_regs.h
++++ b/include/linux/perf_regs.h
+@@ -1,11 +1,19 @@
+ #ifndef _LINUX_PERF_REGS_H
+ #define _LINUX_PERF_REGS_H
+ 
++struct perf_regs {
++	__u64		abi;
++	struct pt_regs	*regs;
++};
++
+ #ifdef CONFIG_HAVE_PERF_REGS
+ #include <asm/perf_regs.h>
+ u64 perf_reg_value(struct pt_regs *regs, int idx);
+ int perf_reg_validate(u64 mask);
+ u64 perf_reg_abi(struct task_struct *task);
++void perf_get_regs_user(struct perf_regs *regs_user,
++			struct pt_regs *regs,
++			struct pt_regs *regs_user_copy);
+ #else
+ static inline u64 perf_reg_value(struct pt_regs *regs, int idx)
+ {
+@@ -21,5 +29,13 @@ static inline u64 perf_reg_abi(struct task_struct *task)
+ {
+ 	return PERF_SAMPLE_REGS_ABI_NONE;
+ }
++
++static inline void perf_get_regs_user(struct perf_regs *regs_user,
++				      struct pt_regs *regs,
++				      struct pt_regs *regs_user_copy)
++{
++	regs_user->regs = task_pt_regs(current);
++	regs_user->abi = perf_reg_abi(current);
++}
+ #endif /* CONFIG_HAVE_PERF_REGS */
+ #endif /* _LINUX_PERF_REGS_H */
+* Unmerged path kernel/events/core.c
