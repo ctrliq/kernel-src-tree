@@ -1,0 +1,163 @@
+udp: fix a typo in __udp4_lib_mcast_demux_lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit f69b923a758f598fd6bb69e57564b59506f4f1fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f69b923a.failed
+
+At this point sk might contain garbage.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f69b923a758f598fd6bb69e57564b59506f4f1fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp.c
+diff --cc net/ipv4/udp.c
+index 556580e2c4f8,9f27bb800607..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1809,6 -1808,135 +1809,138 @@@ drop
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* We can only early demux multicast if there is a single matching socket.
++  * If more than one socket found returns NULL
++  */
++ static struct sock *__udp4_lib_mcast_demux_lookup(struct net *net,
++ 						  __be16 loc_port, __be32 loc_addr,
++ 						  __be16 rmt_port, __be32 rmt_addr,
++ 						  int dif)
++ {
++ 	struct sock *sk, *result;
++ 	struct hlist_nulls_node *node;
++ 	unsigned short hnum = ntohs(loc_port);
++ 	unsigned int count, slot = udp_hashfn(net, hnum, udp_table.mask);
++ 	struct udp_hslot *hslot = &udp_table.hash[slot];
++ 
++ 	rcu_read_lock();
++ begin:
++ 	count = 0;
++ 	result = NULL;
++ 	sk_nulls_for_each_rcu(sk, node, &hslot->head) {
++ 		if (__udp_is_mcast_sock(net, sk,
++ 					loc_port, loc_addr,
++ 					rmt_port, rmt_addr,
++ 					dif, hnum)) {
++ 			result = sk;
++ 			++count;
++ 		}
++ 	}
++ 	/*
++ 	 * if the nulls value we got at the end of this lookup is
++ 	 * not the expected one, we must restart lookup.
++ 	 * We probably met an item that was moved to another chain.
++ 	 */
++ 	if (get_nulls_value(node) != slot)
++ 		goto begin;
++ 
++ 	if (result) {
++ 		if (count != 1 ||
++ 		    unlikely(!atomic_inc_not_zero_hint(&result->sk_refcnt, 2)))
++ 			result = NULL;
++ 		else if (unlikely(!__udp_is_mcast_sock(net, result,
++ 						       loc_port, loc_addr,
++ 						       rmt_port, rmt_addr,
++ 						       dif, hnum))) {
++ 			sock_put(result);
++ 			result = NULL;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	return result;
++ }
++ 
++ /* For unicast we should only early demux connected sockets or we can
++  * break forwarding setups.  The chains here can be long so only check
++  * if the first socket is an exact match and if not move on.
++  */
++ static struct sock *__udp4_lib_demux_lookup(struct net *net,
++ 					    __be16 loc_port, __be32 loc_addr,
++ 					    __be16 rmt_port, __be32 rmt_addr,
++ 					    int dif)
++ {
++ 	struct sock *sk, *result;
++ 	struct hlist_nulls_node *node;
++ 	unsigned short hnum = ntohs(loc_port);
++ 	unsigned int hash2 = udp4_portaddr_hash(net, loc_addr, hnum);
++ 	unsigned int slot2 = hash2 & udp_table.mask;
++ 	struct udp_hslot *hslot2 = &udp_table.hash2[slot2];
++ 	INET_ADDR_COOKIE(acookie, rmt_addr, loc_addr)
++ 	const __portpair ports = INET_COMBINED_PORTS(rmt_port, hnum);
++ 
++ 	rcu_read_lock();
++ 	result = NULL;
++ 	udp_portaddr_for_each_entry_rcu(sk, node, &hslot2->head) {
++ 		if (INET_MATCH(sk, net, acookie,
++ 			       rmt_addr, loc_addr, ports, dif))
++ 			result = sk;
++ 		/* Only check first socket in chain */
++ 		break;
++ 	}
++ 
++ 	if (result) {
++ 		if (unlikely(!atomic_inc_not_zero_hint(&result->sk_refcnt, 2)))
++ 			result = NULL;
++ 		else if (unlikely(!INET_MATCH(sk, net, acookie,
++ 					      rmt_addr, loc_addr,
++ 					      ports, dif))) {
++ 			sock_put(result);
++ 			result = NULL;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	return result;
++ }
++ 
++ void udp_v4_early_demux(struct sk_buff *skb)
++ {
++ 	const struct iphdr *iph = ip_hdr(skb);
++ 	const struct udphdr *uh = udp_hdr(skb);
++ 	struct sock *sk;
++ 	struct dst_entry *dst;
++ 	struct net *net = dev_net(skb->dev);
++ 	int dif = skb->dev->ifindex;
++ 
++ 	/* validate the packet */
++ 	if (!pskb_may_pull(skb, skb_transport_offset(skb) + sizeof(struct udphdr)))
++ 		return;
++ 
++ 	if (skb->pkt_type == PACKET_BROADCAST ||
++ 	    skb->pkt_type == PACKET_MULTICAST)
++ 		sk = __udp4_lib_mcast_demux_lookup(net, uh->dest, iph->daddr,
++ 						   uh->source, iph->saddr, dif);
++ 	else if (skb->pkt_type == PACKET_HOST)
++ 		sk = __udp4_lib_demux_lookup(net, uh->dest, iph->daddr,
++ 					     uh->source, iph->saddr, dif);
++ 	else
++ 		return;
++ 
++ 	if (!sk)
++ 		return;
++ 
++ 	skb->sk = sk;
++ 	skb->destructor = sock_edemux;
++ 	dst = sk->sk_rx_dst;
++ 
++ 	if (dst)
++ 		dst = dst_check(dst, 0);
++ 	if (dst)
++ 		skb_dst_set_noref(skb, dst);
++ }
++ 
+++>>>>>>> f69b923a758f (udp: fix a typo in __udp4_lib_mcast_demux_lookup)
+  int udp_rcv(struct sk_buff *skb)
+  {
+  	return __udp4_lib_rcv(skb, &udp_table, IPPROTO_UDP);
+* Unmerged path net/ipv4/udp.c
