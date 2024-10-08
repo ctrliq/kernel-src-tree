@@ -1,0 +1,189 @@
+KVM: x86: Support for disabling quirks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] x86: Support for disabling quirks (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 92.96%
+commit-author Nadav Amit <namit@cs.technion.ac.il>
+commit 90de4a1875180f8347c075319af2cce586c96ab6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/90de4a18.failed
+
+Introducing KVM_CAP_DISABLE_QUIRKS for disabling x86 quirks that were previous
+created in order to overcome QEMU issues. Those issue were mostly result of
+invalid VM BIOS.  Currently there are two quirks that can be disabled:
+
+1. KVM_QUIRK_LINT0_REENABLED - LINT0 was enabled after boot
+2. KVM_QUIRK_CD_NW_CLEARED - CD and NW are cleared after boot
+
+These two issues are already resolved in recent releases of QEMU, and would
+therefore be disabled by QEMU.
+
+	Signed-off-by: Nadav Amit <namit@cs.technion.ac.il>
+Message-Id: <1428879221-29996-1-git-send-email-namit@cs.technion.ac.il>
+[Report capability from KVM_CHECK_EXTENSION too. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 90de4a1875180f8347c075319af2cce586c96ab6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index 7d851dae2791,75bd9f7fd846..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -665,9 -797,24 +665,24 @@@ struct kvm_ppc_smmu_info 
+  #define KVM_CAP_HYPERV_TIME 96
+  #define KVM_CAP_IOAPIC_POLARITY_IGNORED 97
+  #define KVM_CAP_ENABLE_CAP_VM 98
+ -#define KVM_CAP_S390_IRQCHIP 99
+  #define KVM_CAP_IOEVENTFD_NO_LENGTH 100
+ -#define KVM_CAP_VM_ATTRIBUTES 101
+ -#define KVM_CAP_ARM_PSCI_0_2 102
+  #define KVM_CAP_PPC_FIXUP_HCALL 103
+  #define KVM_CAP_PPC_ENABLE_HCALL 104
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_CHECK_EXTENSION_VM 105
++ #define KVM_CAP_S390_USER_SIGP 106
++ #define KVM_CAP_S390_VECTOR_REGISTERS 107
++ #define KVM_CAP_S390_MEM_OP 108
++ #define KVM_CAP_S390_USER_STSI 109
++ #define KVM_CAP_S390_SKEYS 110
++ #define KVM_CAP_MIPS_FPU 111
++ #define KVM_CAP_MIPS_MSA 112
++ #define KVM_CAP_S390_INJECT_IRQ 113
++ #define KVM_CAP_S390_IRQ_STATE 114
++ #define KVM_CAP_PPC_HWRNG 115
++ #define KVM_CAP_DISABLE_QUIRKS 116
+++>>>>>>> 90de4a187518 (KVM: x86: Support for disabling quirks)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 63d448f87c08..1c0efaeaf53e 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -935,7 +935,8 @@ documentation when it pops into existence).
+ 4.37 KVM_ENABLE_CAP
+ 
+ Capability: KVM_CAP_ENABLE_CAP, KVM_CAP_ENABLE_CAP_VM
+-Architectures: ppc, s390
++Architectures: x86 (only KVM_CAP_ENABLE_CAP_VM),
++	       mips (only KVM_CAP_ENABLE_CAP), ppc, s390
+ Type: vcpu ioctl, vm ioctl (with KVM_CAP_ENABLE_CAP_VM)
+ Parameters: struct kvm_enable_cap (in)
+ Returns: 0 on success; -1 on error
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 1442e6fbe132..1904d349fd6f 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -622,6 +622,8 @@ struct kvm_arch {
+ 	#endif
+ 
+ 	bool boot_vcpu_runs_old_kvmclock;
++
++	u64 disabled_quirks;
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index d3a87780c70b..de289615143a 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -342,4 +342,7 @@ struct kvm_xcrs {
+ struct kvm_sync_regs {
+ };
+ 
++#define KVM_QUIRK_LINT0_REENABLED	(1 << 0)
++#define KVM_QUIRK_CD_NW_CLEARED		(1 << 1)
++
+ #endif /* _ASM_X86_KVM_H */
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index beb5d6bc99fa..2445d8ec7643 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1510,8 +1510,9 @@ void kvm_lapic_reset(struct kvm_vcpu *vcpu)
+ 	for (i = 0; i < APIC_LVT_NUM; i++)
+ 		apic_set_reg(apic, APIC_LVTT + 0x10 * i, APIC_LVT_MASKED);
+ 	apic->lapic_timer.timer_mode = 0;
+-	apic_set_reg(apic, APIC_LVT0,
+-		     SET_APIC_DELIVERY_MODE(0, APIC_MODE_EXTINT));
++	if (!(vcpu->kvm->arch.disabled_quirks & KVM_QUIRK_LINT0_REENABLED))
++		apic_set_reg(apic, APIC_LVT0,
++			     SET_APIC_DELIVERY_MODE(0, APIC_MODE_EXTINT));
+ 
+ 	apic_set_reg(apic, APIC_DFR, 0xffffffffU);
+ 	apic_set_spiv(apic, 0xff);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index e21cbdc1b064..344996ded5b0 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -1575,7 +1575,8 @@ static void svm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
+ 	 * does not do it - this results in some delay at
+ 	 * reboot
+ 	 */
+-	cr0 &= ~(X86_CR0_CD | X86_CR0_NW);
++	if (!(vcpu->kvm->arch.disabled_quirks & KVM_QUIRK_CD_NW_CLEARED))
++		cr0 &= ~(X86_CR0_CD | X86_CR0_NW);
+ 	svm->vmcb->save.cr0 = cr0;
+ 	mark_dirty(svm->vmcb, VMCB_CR);
+ 	update_cr0_intercept(svm);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c09978a6a4ee..152ad0c27d00 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2783,6 +2783,8 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_HYPERV_TIME:
+ 	case KVM_CAP_IOAPIC_POLARITY_IGNORED:
+ 	case KVM_CAP_TSC_DEADLINE_TIMER:
++	case KVM_CAP_ENABLE_CAP_VM:
++	case KVM_CAP_DISABLE_QUIRKS:
+ #ifdef CONFIG_KVM_DEVICE_ASSIGNMENT
+ 	case KVM_CAP_ASSIGN_DEV_IRQ:
+ 	case KVM_CAP_PCI_2_3:
+@@ -3750,6 +3752,26 @@ int kvm_vm_ioctl_irq_line(struct kvm *kvm, struct kvm_irq_level *irq_event,
+ 	return 0;
+ }
+ 
++static int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
++				   struct kvm_enable_cap *cap)
++{
++	int r;
++
++	if (cap->flags)
++		return -EINVAL;
++
++	switch (cap->cap) {
++	case KVM_CAP_DISABLE_QUIRKS:
++		kvm->arch.disabled_quirks = cap->args[0];
++		r = 0;
++		break;
++	default:
++		r = -EINVAL;
++		break;
++	}
++	return r;
++}
++
+ long kvm_arch_vm_ioctl(struct file *filp,
+ 		       unsigned int ioctl, unsigned long arg)
+ {
+@@ -4002,7 +4024,15 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		r = 0;
+ 		break;
+ 	}
++	case KVM_ENABLE_CAP: {
++		struct kvm_enable_cap cap;
+ 
++		r = -EFAULT;
++		if (copy_from_user(&cap, argp, sizeof(cap)))
++			goto out;
++		r = kvm_vm_ioctl_enable_cap(kvm, &cap);
++		break;
++	}
+ 	default:
+ 		r = kvm_vm_ioctl_assigned_device(kvm, ioctl, arg);
+ 	}
+* Unmerged path include/uapi/linux/kvm.h
