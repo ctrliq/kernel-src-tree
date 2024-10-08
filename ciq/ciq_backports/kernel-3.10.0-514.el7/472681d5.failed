@@ -1,0 +1,190 @@
+net: ndo_fdb_dump should report -EMSGSIZE to rtnl_fdb_dump.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] ndo_fdb_dump should report -EMSGSIZE to rtnl_fdb_dump (Jiri Benc) [1297504]
+Rebuild_FUZZ: 94.64%
+commit-author MINOURA Makoto / 箕浦 真 <minoura@valinux.co.jp>
+commit 472681d57a5dde7c6d16b05469be57f1c4ed9d99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/472681d5.failed
+
+When the send skbuff reaches the end, nlmsg_put and friends returns
+-EMSGSIZE but it is silently thrown away in ndo_fdb_dump. It is called
+within a for_each_netdev loop and the first fdb entry of a following
+netdev could fit in the remaining skbuff.  This breaks the mechanism
+of cb->args[0] and idx to keep track of the entries that are already
+dumped, which results missing entries in bridge fdb show command.
+
+	Signed-off-by: Minoura Makoto <minoura@valinux.co.jp>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 472681d57a5dde7c6d16b05469be57f1c4ed9d99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_fdb.c
+#	net/core/rtnetlink.c
+#	net/switchdev/switchdev.c
+diff --cc net/bridge/br_fdb.c
+index 1e923efdd041,dcea4f4c62b3..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -692,12 -728,30 +694,38 @@@ int br_fdb_dump(struct sk_buff *skb
+  			if (idx < cb->args[0])
+  				goto skip;
+  
+++<<<<<<< HEAD
+ +			if (fdb_fill_info(skb, br, f,
+ +					  NETLINK_CB(cb->skb).portid,
+ +					  cb->nlh->nlmsg_seq,
+ +					  RTM_NEWNEIGH,
+ +					  NLM_F_MULTI) < 0)
+++=======
++ 			if (filter_dev &&
++ 			    (!f->dst || f->dst->dev != filter_dev)) {
++ 				if (filter_dev != dev)
++ 					goto skip;
++ 				/* !f->dst is a special case for bridge
++ 				 * It means the MAC belongs to the bridge
++ 				 * Therefore need a little more filtering
++ 				 * we only want to dump the !f->dst case
++ 				 */
++ 				if (f->dst)
++ 					goto skip;
++ 			}
++ 			if (!filter_dev && f->dst)
++ 				goto skip;
++ 
++ 			err = fdb_fill_info(skb, br, f,
++ 					    NETLINK_CB(cb->skb).portid,
++ 					    cb->nlh->nlmsg_seq,
++ 					    RTM_NEWNEIGH,
++ 					    NLM_F_MULTI);
++ 			if (err < 0) {
++ 				cb->args[1] = err;
+++>>>>>>> 472681d57a5d (net: ndo_fdb_dump should report -EMSGSIZE to rtnl_fdb_dump.)
+  				break;
++ 			}
+  skip:
+  			++idx;
+  		}
+diff --cc net/core/rtnetlink.c
+index bca0c57300c0,8261d95dd846..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -2696,28 -2918,74 +2697,80 @@@ EXPORT_SYMBOL(ndo_dflt_fdb_dump)
+  
+  static int rtnl_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb)
+  {
+ -	struct net_device *dev;
+ -	struct nlattr *tb[IFLA_MAX+1];
+ -	struct net_device *br_dev = NULL;
+ -	const struct net_device_ops *ops = NULL;
+ -	const struct net_device_ops *cops = NULL;
+ -	struct ifinfomsg *ifm = nlmsg_data(cb->nlh);
+ -	struct net *net = sock_net(skb->sk);
+ -	int brport_idx = 0;
+ -	int br_idx = 0;
+  	int idx = 0;
+ +	struct net *net = sock_net(skb->sk);
+ +	struct net_device *dev;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	for_each_netdev_rcu(net, dev) {
+++=======
++ 	if (nlmsg_parse(cb->nlh, sizeof(struct ifinfomsg), tb, IFLA_MAX,
++ 			ifla_policy) == 0) {
++ 		if (tb[IFLA_MASTER])
++ 			br_idx = nla_get_u32(tb[IFLA_MASTER]);
++ 	}
++ 
++ 	brport_idx = ifm->ifi_index;
++ 
++ 	if (br_idx) {
++ 		br_dev = __dev_get_by_index(net, br_idx);
++ 		if (!br_dev)
++ 			return -ENODEV;
++ 
++ 		ops = br_dev->netdev_ops;
++ 	}
++ 
++ 	cb->args[1] = 0;
++ 	for_each_netdev(net, dev) {
++ 		if (brport_idx && (dev->ifindex != brport_idx))
++ 			continue;
++ 
++ 		if (!br_idx) { /* user did not specify a specific bridge */
++ 			if (dev->priv_flags & IFF_BRIDGE_PORT) {
++ 				br_dev = netdev_master_upper_dev_get(dev);
++ 				cops = br_dev->netdev_ops;
++ 			}
++ 
++ 		} else {
++ 			if (dev != br_dev &&
++ 			    !(dev->priv_flags & IFF_BRIDGE_PORT))
++ 				continue;
++ 
++ 			if (br_dev != netdev_master_upper_dev_get(dev) &&
++ 			    !(dev->priv_flags & IFF_EBRIDGE))
++ 				continue;
++ 
++ 			cops = ops;
++ 		}
++ 
+++>>>>>>> 472681d57a5d (net: ndo_fdb_dump should report -EMSGSIZE to rtnl_fdb_dump.)
+  		if (dev->priv_flags & IFF_BRIDGE_PORT) {
+ -			if (cops && cops->ndo_fdb_dump)
+ -				idx = cops->ndo_fdb_dump(skb, cb, br_dev, dev,
+ -							 idx);
+ +			struct net_device *br_dev;
+ +			const struct net_device_ops *ops;
+ +
+ +			br_dev = netdev_master_upper_dev_get(dev);
+ +			ops = br_dev->netdev_ops;
+ +			if (ops->ndo_fdb_dump)
+ +				idx = ops->ndo_fdb_dump(skb, cb, dev, idx);
+  		}
++ 		if (cb->args[1] == -EMSGSIZE)
++ 			break;
+  
+  		if (dev->netdev_ops->ndo_fdb_dump)
+ -			idx = dev->netdev_ops->ndo_fdb_dump(skb, cb, dev, NULL,
+ -							    idx);
+ +			idx = dev->netdev_ops->ndo_fdb_dump(skb, cb, dev, idx);
+  		else
+++<<<<<<< HEAD
+ +			idx = ndo_dflt_fdb_dump(skb, cb, dev, idx);
+++=======
++ 			idx = ndo_dflt_fdb_dump(skb, cb, dev, NULL, idx);
++ 		if (cb->args[1] == -EMSGSIZE)
++ 			break;
++ 
++ 		cops = NULL;
+++>>>>>>> 472681d57a5d (net: ndo_fdb_dump should report -EMSGSIZE to rtnl_fdb_dump.)
+  	}
+ +	rcu_read_unlock();
+  
+  	cb->args[0] = idx;
+  	return skb->len;
+* Unmerged path net/switchdev/switchdev.c
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 000e4c57a81e..1b93ac7881b2 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -962,8 +962,10 @@ static int vxlan_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ 						     cb->nlh->nlmsg_seq,
+ 						     RTM_NEWNEIGH,
+ 						     NLM_F_MULTI, rd);
+-				if (err < 0)
++				if (err < 0) {
++					cb->args[1] = err;
+ 					goto out;
++				}
+ skip:
+ 				++idx;
+ 			}
+* Unmerged path net/bridge/br_fdb.c
+* Unmerged path net/core/rtnetlink.c
+* Unmerged path net/switchdev/switchdev.c
