@@ -1,0 +1,273 @@
+sched/numa: Introduce migrate_swap()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit ac66f5477239ebd3c4e2cbf2f591ef387aa09884
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/ac66f547.failed
+
+Use the new stop_two_cpus() to implement migrate_swap(), a function that
+flips two tasks between their respective cpus.
+
+I'm fairly sure there's a less crude way than employing the stop_two_cpus()
+method, but everything I tried either got horribly fragile and/or complex. So
+keep it simple for now.
+
+The notable detail is how we 'migrate' tasks that aren't runnable
+anymore. We'll make it appear like we migrated them before they went to
+sleep. The sole difference is the previous cpu in the wakeup path, so we
+override this.
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+Link: http://lkml.kernel.org/r/1381141781-10992-39-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ac66f5477239ebd3c4e2cbf2f591ef387aa09884)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/sched.h
+diff --cc kernel/sched/sched.h
+index 5abdf358588f,4dc92d016aef..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -552,6 -557,8 +552,11 @@@ static inline u64 rq_clock_task(struct 
+  }
+  
+  #ifdef CONFIG_NUMA_BALANCING
+++<<<<<<< HEAD
+++=======
++ extern int migrate_task_to(struct task_struct *p, int cpu);
++ extern int migrate_swap(struct task_struct *, struct task_struct *);
+++>>>>>>> ac66f5477239 (sched/numa: Introduce migrate_swap())
+  static inline void task_numa_free(struct task_struct *p)
+  {
+  	kfree(p->numa_faults);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index dcb716d68b2f..4178cc57360b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1044,6 +1044,8 @@ struct task_struct {
+ 	struct task_struct *last_wakee;
+ 	unsigned long wakee_flips;
+ 	unsigned long wakee_flip_decay_ts;
++
++	int wake_cpu;
+ #endif
+ 	int on_rq;
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index e7a70e97bb75..a1c34a7d1c8b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1030,6 +1030,102 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+ 	__set_task_cpu(p, new_cpu);
+ }
+ 
++static void __migrate_swap_task(struct task_struct *p, int cpu)
++{
++	if (p->on_rq) {
++		struct rq *src_rq, *dst_rq;
++
++		src_rq = task_rq(p);
++		dst_rq = cpu_rq(cpu);
++
++		deactivate_task(src_rq, p, 0);
++		set_task_cpu(p, cpu);
++		activate_task(dst_rq, p, 0);
++		check_preempt_curr(dst_rq, p, 0);
++	} else {
++		/*
++		 * Task isn't running anymore; make it appear like we migrated
++		 * it before it went to sleep. This means on wakeup we make the
++		 * previous cpu our targer instead of where it really is.
++		 */
++		p->wake_cpu = cpu;
++	}
++}
++
++struct migration_swap_arg {
++	struct task_struct *src_task, *dst_task;
++	int src_cpu, dst_cpu;
++};
++
++static int migrate_swap_stop(void *data)
++{
++	struct migration_swap_arg *arg = data;
++	struct rq *src_rq, *dst_rq;
++	int ret = -EAGAIN;
++
++	src_rq = cpu_rq(arg->src_cpu);
++	dst_rq = cpu_rq(arg->dst_cpu);
++
++	double_rq_lock(src_rq, dst_rq);
++	if (task_cpu(arg->dst_task) != arg->dst_cpu)
++		goto unlock;
++
++	if (task_cpu(arg->src_task) != arg->src_cpu)
++		goto unlock;
++
++	if (!cpumask_test_cpu(arg->dst_cpu, tsk_cpus_allowed(arg->src_task)))
++		goto unlock;
++
++	if (!cpumask_test_cpu(arg->src_cpu, tsk_cpus_allowed(arg->dst_task)))
++		goto unlock;
++
++	__migrate_swap_task(arg->src_task, arg->dst_cpu);
++	__migrate_swap_task(arg->dst_task, arg->src_cpu);
++
++	ret = 0;
++
++unlock:
++	double_rq_unlock(src_rq, dst_rq);
++
++	return ret;
++}
++
++/*
++ * Cross migrate two tasks
++ */
++int migrate_swap(struct task_struct *cur, struct task_struct *p)
++{
++	struct migration_swap_arg arg;
++	int ret = -EINVAL;
++
++	get_online_cpus();
++
++	arg = (struct migration_swap_arg){
++		.src_task = cur,
++		.src_cpu = task_cpu(cur),
++		.dst_task = p,
++		.dst_cpu = task_cpu(p),
++	};
++
++	if (arg.src_cpu == arg.dst_cpu)
++		goto out;
++
++	if (!cpu_active(arg.src_cpu) || !cpu_active(arg.dst_cpu))
++		goto out;
++
++	if (!cpumask_test_cpu(arg.dst_cpu, tsk_cpus_allowed(arg.src_task)))
++		goto out;
++
++	if (!cpumask_test_cpu(arg.src_cpu, tsk_cpus_allowed(arg.dst_task)))
++		goto out;
++
++	ret = stop_two_cpus(arg.dst_cpu, arg.src_cpu, migrate_swap_stop, &arg);
++
++out:
++	put_online_cpus();
++	return ret;
++}
++
+ struct migration_arg {
+ 	struct task_struct *task;
+ 	int dest_cpu;
+@@ -1249,9 +1345,9 @@ out:
+  * The caller (fork, wakeup) owns p->pi_lock, ->cpus_allowed is stable.
+  */
+ static inline
+-int select_task_rq(struct task_struct *p, int sd_flags, int wake_flags)
++int select_task_rq(struct task_struct *p, int cpu, int sd_flags, int wake_flags)
+ {
+-	int cpu = p->sched_class->select_task_rq(p, sd_flags, wake_flags);
++	cpu = p->sched_class->select_task_rq(p, cpu, sd_flags, wake_flags);
+ 
+ 	/*
+ 	 * In order not to call set_task_cpu() on a blocking task we need
+@@ -1518,7 +1614,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 	if (p->sched_class->task_waking)
+ 		p->sched_class->task_waking(p);
+ 
+-	cpu = select_task_rq(p, SD_BALANCE_WAKE, wake_flags);
++	cpu = select_task_rq(p, p->wake_cpu, SD_BALANCE_WAKE, wake_flags);
+ 	if (task_cpu(p) != cpu) {
+ 		wake_flags |= WF_MIGRATED;
+ 		set_task_cpu(p, cpu);
+@@ -1764,7 +1860,7 @@ void wake_up_new_task(struct task_struct *p)
+ 	 *  - cpus_allowed can change in the fork path
+ 	 *  - any previously selected cpu might disappear through hotplug
+ 	 */
+-	set_task_cpu(p, select_task_rq(p, SD_BALANCE_FORK, 0));
++	set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
+ #endif
+ 
+ 	rq = __task_rq_lock(p);
+@@ -2659,7 +2755,7 @@ void sched_exec(void)
+ 	int dest_cpu;
+ 
+ 	raw_spin_lock_irqsave(&p->pi_lock, flags);
+-	dest_cpu = p->sched_class->select_task_rq(p, SD_BALANCE_EXEC, 0);
++	dest_cpu = p->sched_class->select_task_rq(p, task_cpu(p), SD_BALANCE_EXEC, 0);
+ 	if (dest_cpu == smp_processor_id())
+ 		goto unlock;
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 98cee68da024..a66eb007c81a 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3493,11 +3493,10 @@ done:
+  * preempt must be disabled.
+  */
+ static int
+-select_task_rq_fair(struct task_struct *p, int sd_flag, int wake_flags)
++select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
+ {
+ 	struct sched_domain *tmp, *affine_sd = NULL, *sd = NULL;
+ 	int cpu = smp_processor_id();
+-	int prev_cpu = task_cpu(p);
+ 	int new_cpu = cpu;
+ 	int want_affine = 0;
+ 	int sync = wake_flags & WF_SYNC;
+diff --git a/kernel/sched/idle_task.c b/kernel/sched/idle_task.c
+index d8da01008d39..516c3d9ceea1 100644
+--- a/kernel/sched/idle_task.c
++++ b/kernel/sched/idle_task.c
+@@ -9,7 +9,7 @@
+ 
+ #ifdef CONFIG_SMP
+ static int
+-select_task_rq_idle(struct task_struct *p, int sd_flag, int flags)
++select_task_rq_idle(struct task_struct *p, int cpu, int sd_flag, int flags)
+ {
+ 	return task_cpu(p); /* IDLE tasks as never migrated */
+ }
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 3dfffc403432..a874414cd201 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1239,13 +1239,10 @@ static void yield_task_rt(struct rq *rq)
+ static int find_lowest_rq(struct task_struct *task);
+ 
+ static int
+-select_task_rq_rt(struct task_struct *p, int sd_flag, int flags)
++select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
+ {
+ 	struct task_struct *curr;
+ 	struct rq *rq;
+-	int cpu;
+-
+-	cpu = task_cpu(p);
+ 
+ 	if (p->nr_cpus_allowed == 1)
+ 		goto out;
+* Unmerged path kernel/sched/sched.h
+diff --git a/kernel/sched/stop_task.c b/kernel/sched/stop_task.c
+index e08fbeeb54b9..47197de8abd9 100644
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@ -11,7 +11,7 @@
+ 
+ #ifdef CONFIG_SMP
+ static int
+-select_task_rq_stop(struct task_struct *p, int sd_flag, int flags)
++select_task_rq_stop(struct task_struct *p, int cpu, int sd_flag, int flags)
+ {
+ 	return task_cpu(p); /* stop tasks as never migrate */
+ }
