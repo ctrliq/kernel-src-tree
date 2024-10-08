@@ -1,0 +1,311 @@
+blk-mq: do not initialize req->special
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 9d74e25737d73e93ccddeb5a61bcd56b7b8eb57b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9d74e257.failed
+
+Drivers can reach their private data easily using the blk_mq_rq_to_pdu
+helper and don't need req->special.  By not initializing it code can
+be simplified nicely, and we also shave off a few more instructions from
+the I/O path.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 9d74e25737d73e93ccddeb5a61bcd56b7b8eb57b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/virtio_blk.c
+diff --cc drivers/block/virtio_blk.c
+index 64723953e1c9,c7d02bc9d945..000000000000
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@@ -143,84 -110,9 +143,88 @@@ static int __virtblk_add_req(struct vir
+  	return virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
+  }
+  
+ -static inline void virtblk_request_done(struct request *req)
+ +static void virtblk_add_req(struct virtblk_req *vbr, bool have_data)
+ +{
+++<<<<<<< HEAD
+ +	struct virtio_blk *vblk = vbr->vblk;
+ +	DEFINE_WAIT(wait);
+ +	int ret;
+ +
+ +	spin_lock_irq(vblk->disk->queue->queue_lock);
+ +	while (unlikely((ret = __virtblk_add_req(vblk->vq, vbr, vbr->sg,
+ +						 have_data)) < 0)) {
+ +		prepare_to_wait_exclusive(&vblk->queue_wait, &wait,
+ +					  TASK_UNINTERRUPTIBLE);
+ +
+ +		spin_unlock_irq(vblk->disk->queue->queue_lock);
+ +		io_schedule();
+ +		spin_lock_irq(vblk->disk->queue->queue_lock);
+ +
+ +		finish_wait(&vblk->queue_wait, &wait);
+ +	}
+ +
+ +	virtqueue_kick(vblk->vq);
+ +	spin_unlock_irq(vblk->disk->queue->queue_lock);
+ +}
+ +
+ +static void virtblk_bio_send_flush(struct virtblk_req *vbr)
+ +{
+ +	vbr->flags |= VBLK_IS_FLUSH;
+ +	vbr->out_hdr.type = VIRTIO_BLK_T_FLUSH;
+ +	vbr->out_hdr.sector = 0;
+ +	vbr->out_hdr.ioprio = 0;
+ +
+ +	virtblk_add_req(vbr, false);
+ +}
+ +
+ +static void virtblk_bio_send_data(struct virtblk_req *vbr)
+  {
+ +	struct virtio_blk *vblk = vbr->vblk;
+ +	struct bio *bio = vbr->bio;
+ +	bool have_data;
+ +
+ +	vbr->flags &= ~VBLK_IS_FLUSH;
+ +	vbr->out_hdr.type = 0;
+ +	vbr->out_hdr.sector = bio->bi_sector;
+ +	vbr->out_hdr.ioprio = bio_prio(bio);
+ +
+ +	if (blk_bio_map_sg(vblk->disk->queue, bio, vbr->sg)) {
+ +		have_data = true;
+ +		if (bio->bi_rw & REQ_WRITE)
+ +			vbr->out_hdr.type |= VIRTIO_BLK_T_OUT;
+ +		else
+ +			vbr->out_hdr.type |= VIRTIO_BLK_T_IN;
+ +	} else
+ +		have_data = false;
+ +
+ +	virtblk_add_req(vbr, have_data);
+ +}
+ +
+ +static void virtblk_bio_send_data_work(struct work_struct *work)
+ +{
+ +	struct virtblk_req *vbr;
+ +
+ +	vbr = container_of(work, struct virtblk_req, work);
+ +
+ +	virtblk_bio_send_data(vbr);
+ +}
+ +
+ +static void virtblk_bio_send_flush_work(struct work_struct *work)
+ +{
+ +	struct virtblk_req *vbr;
+ +
+ +	vbr = container_of(work, struct virtblk_req, work);
+ +
+ +	virtblk_bio_send_flush(vbr);
+ +}
+ +
+ +static inline void virtblk_request_done(struct virtblk_req *vbr)
+ +{
+ +	struct virtio_blk *vblk = vbr->vblk;
+ +	struct request *req = vbr->req;
+++=======
++ 	struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
+++>>>>>>> 9d74e25737d7 (blk-mq: do not initialize req->special)
+  	int error = virtblk_result(vbr);
+  
+  	if (req->cmd_type == REQ_TYPE_BLOCK_PC) {
+@@@ -284,37 -138,31 +288,43 @@@ static void virtblk_done(struct virtque
+  	do {
+  		virtqueue_disable_cb(vq);
+  		while ((vbr = virtqueue_get_buf(vblk->vq, &len)) != NULL) {
+ -			blk_mq_complete_request(vbr->req);
+ -			req_done = true;
+ +			if (vbr->bio) {
+ +				virtblk_bio_done(vbr);
+ +				bio_done = true;
+ +			} else {
+ +				virtblk_request_done(vbr);
+ +				req_done = true;
+ +			}
+  		}
+ -		if (unlikely(virtqueue_is_broken(vq)))
+ -			break;
+  	} while (!virtqueue_enable_cb(vq));
+ -	spin_unlock_irqrestore(&vblk->vq_lock, flags);
+ -
+  	/* In case queue is stopped waiting for more buffers. */
+  	if (req_done)
+ -		blk_mq_start_stopped_hw_queues(vblk->disk->queue);
+ +		blk_start_queue(vblk->disk->queue);
+ +	spin_unlock_irqrestore(vblk->disk->queue->queue_lock, flags);
+ +
+ +	if (bio_done)
+ +		wake_up(&vblk->queue_wait);
+  }
+  
+ -static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+ +static bool do_req(struct request_queue *q, struct virtio_blk *vblk,
+ +		   struct request *req)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct virtio_blk *vblk = hctx->queue->queuedata;
++ 	struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
++ 	unsigned long flags;
+++>>>>>>> 9d74e25737d7 (blk-mq: do not initialize req->special)
+  	unsigned int num;
+ -	const bool last = (req->cmd_flags & REQ_END) != 0;
+ -	int err;
+ +	struct virtblk_req *vbr;
+  
+ -	BUG_ON(req->nr_phys_segments + 2 > vblk->sg_elems);
+ +	vbr = virtblk_alloc_req(vblk, GFP_ATOMIC);
+ +	if (!vbr)
+ +		/* When another request finishes we'll try again. */
+ +		return false;
+  
+  	vbr->req = req;
+ +	vbr->bio = NULL;
+  	if (req->cmd_flags & REQ_FLUSH) {
+  		vbr->out_hdr.type = VIRTIO_BLK_T_FLUSH;
+  		vbr->out_hdr.sector = 0;
+@@@ -680,6 -480,33 +690,36 @@@ static const struct device_attribute de
+  	__ATTR(cache_type, S_IRUGO|S_IWUSR,
+  	       virtblk_cache_type_show, virtblk_cache_type_store);
+  
+++<<<<<<< HEAD
+++=======
++ static struct blk_mq_ops virtio_mq_ops = {
++ 	.queue_rq	= virtio_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.alloc_hctx	= blk_mq_alloc_single_hw_queue,
++ 	.free_hctx	= blk_mq_free_single_hw_queue,
++ 	.complete	= virtblk_request_done,
++ };
++ 
++ static struct blk_mq_reg virtio_mq_reg = {
++ 	.ops		= &virtio_mq_ops,
++ 	.nr_hw_queues	= 1,
++ 	.queue_depth	= 0, /* Set in virtblk_probe */
++ 	.numa_node	= NUMA_NO_NODE,
++ 	.flags		= BLK_MQ_F_SHOULD_MERGE,
++ };
++ module_param_named(queue_depth, virtio_mq_reg.queue_depth, uint, 0444);
++ 
++ static int virtblk_init_vbr(void *data, struct blk_mq_hw_ctx *hctx,
++ 			     struct request *rq, unsigned int nr)
++ {
++ 	struct virtio_blk *vblk = data;
++ 	struct virtblk_req *vbr = blk_mq_rq_to_pdu(rq);
++ 
++ 	sg_init_table(vbr->sg, vblk->sg_elems);
++ 	return 0;
++ }
++ 
+++>>>>>>> 9d74e25737d7 (blk-mq: do not initialize req->special)
+  static int virtblk_probe(struct virtio_device *vdev)
+  {
+  	struct virtio_blk *vblk;
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 8e8098693aac..e4b9d5425767 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -306,22 +306,16 @@ static bool blk_kick_flush(struct request_queue *q)
+ 	 */
+ 	q->flush_pending_idx ^= 1;
+ 
++	blk_rq_init(q, q->flush_rq);
+ 	if (q->mq_ops) {
+-		struct blk_mq_ctx *ctx = first_rq->mq_ctx;
+-		struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q, ctx->cpu);
+-
+-		blk_mq_rq_init(hctx, q->flush_rq);
+-		q->flush_rq->mq_ctx = ctx;
+-
+ 		/*
+ 		 * Reuse the tag value from the fist waiting request,
+ 		 * with blk-mq the tag is generated during request
+ 		 * allocation and drivers can rely on it being inside
+ 		 * the range they asked for.
+ 		 */
++		q->flush_rq->mq_ctx = first_rq->mq_ctx;
+ 		q->flush_rq->tag = first_rq->tag;
+-	} else {
+-		blk_rq_init(q, q->flush_rq);
+ 	}
+ 
+ 	q->flush_rq->cmd_type = REQ_TYPE_FS;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index aa3684343138..4c503b878d59 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -251,24 +251,13 @@ struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw,
+ }
+ EXPORT_SYMBOL(blk_mq_alloc_reserved_request);
+ 
+-/*
+- * Re-init and set pdu, if we have it
+- */
+-void blk_mq_rq_init(struct blk_mq_hw_ctx *hctx, struct request *rq)
+-{
+-	blk_rq_init(hctx->queue, rq);
+-
+-	if (hctx->cmd_size)
+-		rq->special = blk_mq_rq_to_pdu(rq);
+-}
+-
+ static void __blk_mq_free_request(struct blk_mq_hw_ctx *hctx,
+ 				  struct blk_mq_ctx *ctx, struct request *rq)
+ {
+ 	const int tag = rq->tag;
+ 	struct request_queue *q = rq->q;
+ 
+-	blk_mq_rq_init(hctx, rq);
++	blk_rq_init(hctx->queue, rq);
+ 	blk_mq_put_tag(hctx->tags, tag);
+ 
+ 	blk_mq_queue_exit(q);
+@@ -1127,7 +1116,7 @@ static int blk_mq_init_rq_map(struct blk_mq_hw_ctx *hctx,
+ 		left -= to_do * rq_size;
+ 		for (j = 0; j < to_do; j++) {
+ 			hctx->rqs[i] = p;
+-			blk_mq_rq_init(hctx, hctx->rqs[i]);
++			blk_rq_init(hctx->queue, hctx->rqs[i]);
+ 			p += rq_size;
+ 			i++;
+ 		}
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index ebbe6bac9d61..238379a612e4 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -27,7 +27,6 @@ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
+ void blk_mq_init_flush(struct request_queue *q);
+ void blk_mq_drain_queue(struct request_queue *q);
+ void blk_mq_free_queue(struct request_queue *q);
+-void blk_mq_rq_init(struct blk_mq_hw_ctx *hctx, struct request *rq);
+ 
+ /*
+  * CPU hotplug helpers
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index d64c266700ce..c1b8c5c7c46a 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -226,7 +226,7 @@ static void null_cmd_end_timer(struct nullb_cmd *cmd)
+ 
+ static void null_softirq_done_fn(struct request *rq)
+ {
+-	end_cmd(rq->special);
++	end_cmd(blk_mq_rq_to_pdu(rq));
+ }
+ 
+ static inline void null_handle_cmd(struct nullb_cmd *cmd)
+@@ -311,7 +311,7 @@ static void null_request_fn(struct request_queue *q)
+ 
+ static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ {
+-	struct nullb_cmd *cmd = rq->special;
++	struct nullb_cmd *cmd = blk_mq_rq_to_pdu(rq);
+ 
+ 	cmd->rq = rq;
+ 	cmd->nq = hctx->driver_data;
+* Unmerged path drivers/block/virtio_blk.c
