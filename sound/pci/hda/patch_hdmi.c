@@ -2233,6 +2233,7 @@ static void intel_pin_eld_notify(void *audio_ptr, int port, int port_mst_index)
 	if (atomic_read(&(codec)->core.in_pm))
 		return;
 
+	snd_hdac_i915_set_bclk(&codec->bus->core);
 	check_presence_and_report(codec, pin_nid);
 }
 
