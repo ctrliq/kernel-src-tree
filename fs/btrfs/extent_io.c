@@ -4390,19 +4390,16 @@ int extent_buffer_under_io(struct extent_buffer *eb)
 /*
  * Helper for releasing extent buffer page.
  */
-static void btrfs_release_extent_buffer_page(struct extent_buffer *eb,
-						unsigned long start_idx)
+static void btrfs_release_extent_buffer_page(struct extent_buffer *eb)
 {
 	unsigned long index;
-	unsigned long num_pages;
 	struct page *page;
 	int mapped = !test_bit(EXTENT_BUFFER_DUMMY, &eb->bflags);
 
 	BUG_ON(extent_buffer_under_io(eb));
 
-	num_pages = num_extent_pages(eb->start, eb->len);
-	index = start_idx + num_pages;
-	if (start_idx >= index)
+	index = num_extent_pages(eb->start, eb->len);
+	if (index == 0)
 		return;
 
 	do {
@@ -4438,7 +4435,7 @@ static void btrfs_release_extent_buffer_page(struct extent_buffer *eb,
 			/* One for when we alloced the page */
 			page_cache_release(page);
 		}
-	} while (index != start_idx);
+	} while (index != 0);
 }
 
 /*
@@ -4446,7 +4443,7 @@ static void btrfs_release_extent_buffer_page(struct extent_buffer *eb,
  */
 static inline void btrfs_release_extent_buffer(struct extent_buffer *eb)
 {
-	btrfs_release_extent_buffer_page(eb, 0);
+	btrfs_release_extent_buffer_page(eb);
 	__free_extent_buffer(eb);
 }
 
@@ -4802,7 +4799,7 @@ static int release_extent_buffer(struct extent_buffer *eb)
 		}
 
 		/* Should be safe to release our pages at this point */
-		btrfs_release_extent_buffer_page(eb, 0);
+		btrfs_release_extent_buffer_page(eb);
 		call_rcu(&eb->rcu_head, btrfs_release_extent_buffer_rcu);
 		return 1;
 	}
