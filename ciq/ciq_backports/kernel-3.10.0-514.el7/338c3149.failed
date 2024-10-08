@@ -1,0 +1,194 @@
+PCI: Add support for multiple DMA aliases
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [pci] Add support for multiple DMA aliases (Jerry Snitselaar) [1299853]
+Rebuild_FUZZ: 93.51%
+commit-author Jacek Lawrynowicz <jacek.lawrynowicz@intel.com>
+commit 338c3149a221527e202ee26b1e35f76c965bb6c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/338c3149.failed
+
+Solve IOMMU support issues with PCIe non-transparent bridges that use
+Requester ID look-up tables (RID-LUT), e.g., the PEX8733.
+
+The NTB connects devices in two independent PCI domains.  Devices separated
+by the NTB are not able to discover each other.  A PCI packet being
+forwared from one domain to another has to have its RID modified so it
+appears on correct bus and completions are forwarded back to the original
+domain through the NTB.  The RID is translated using a preprogrammed table
+(LUT) and the PCI packet propagates upstream away from the NTB.  If the
+destination system has IOMMU enabled, the packet will be discarded because
+the new RID is unknown to the IOMMU.  Adding a DMA alias for the new RID
+allows IOMMU to properly recognize the packet.
+
+Each device behind the NTB has a unique RID assigned in the RID-LUT.  The
+current DMA alias implementation supports only a single alias, so it's not
+possible to support mutiple devices behind the NTB when IOMMU is enabled.
+
+Enable all possible aliases on a given bus (256) that are stored in a
+bitset.  Alias devfn is directly translated to a bit number.  The bitset is
+not allocated for devices that have no need for DMA aliases.
+
+More details can be found in the following article:
+http://www.plxtech.com/files/pdf/technical/expresslane/RTC_Enabling%20MulitHostSystemDesigns.pdf
+
+	Signed-off-by: Jacek Lawrynowicz <jacek.lawrynowicz@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Alex Williamson <alex.williamson@redhat.com>
+	Acked-by: David Woodhouse <David.Woodhouse@intel.com>
+	Acked-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 338c3149a221527e202ee26b1e35f76c965bb6c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommu.c
+#	drivers/pci/pci.c
+#	drivers/pci/probe.c
+#	drivers/pci/search.c
+#	include/linux/pci.h
+diff --cc drivers/iommu/iommu.c
+index 70b9321d6ca7,1b49e940a318..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -655,11 -686,7 +655,15 @@@ static struct iommu_group *get_pci_alia
+  			continue;
+  
+  		/* We alias them or they alias us */
+++<<<<<<< HEAD
+ +		if (((pdev->dev_flags & PCI_DEV_FLAGS_DMA_ALIAS_DEVFN) &&
+ +		     pdev->pci_dev_rh->dma_alias_devfn == tmp->devfn) ||
+ +		    ((tmp->dev_flags & PCI_DEV_FLAGS_DMA_ALIAS_DEVFN) &&
+ +		     tmp->pci_dev_rh->dma_alias_devfn == pdev->devfn)) {
+ +
+++=======
++ 		if (pci_devs_are_dma_aliases(pdev, tmp)) {
+++>>>>>>> 338c3149a221 (PCI: Add support for multiple DMA aliases)
+  			group = get_pci_alias_group(tmp, devfns);
+  			if (group) {
+  				pci_dev_put(tmp);
+diff --cc drivers/pci/pci.c
+index 1126474d9c49,0b90c2186f1c..000000000000
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@@ -4268,6 -4578,37 +4268,40 @@@ int pci_set_vga_state(struct pci_dev *d
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * pci_add_dma_alias - Add a DMA devfn alias for a device
++  * @dev: the PCI device for which alias is added
++  * @devfn: alias slot and function
++  *
++  * This helper encodes 8-bit devfn as bit number in dma_alias_mask.
++  * It should be called early, preferably as PCI fixup header quirk.
++  */
++ void pci_add_dma_alias(struct pci_dev *dev, u8 devfn)
++ {
++ 	if (!dev->dma_alias_mask)
++ 		dev->dma_alias_mask = kcalloc(BITS_TO_LONGS(U8_MAX),
++ 					      sizeof(long), GFP_KERNEL);
++ 	if (!dev->dma_alias_mask) {
++ 		dev_warn(&dev->dev, "Unable to allocate DMA alias mask\n");
++ 		return;
++ 	}
++ 
++ 	set_bit(devfn, dev->dma_alias_mask);
++ 	dev_info(&dev->dev, "Enabling fixed DMA alias to %02x.%d\n",
++ 		 PCI_SLOT(devfn), PCI_FUNC(devfn));
++ }
++ 
++ bool pci_devs_are_dma_aliases(struct pci_dev *dev1, struct pci_dev *dev2)
++ {
++ 	return (dev1->dma_alias_mask &&
++ 		test_bit(dev2->devfn, dev1->dma_alias_mask)) ||
++ 	       (dev2->dma_alias_mask &&
++ 		test_bit(dev1->devfn, dev2->dma_alias_mask));
++ }
++ 
+++>>>>>>> 338c3149a221 (PCI: Add support for multiple DMA aliases)
+  bool pci_device_is_present(struct pci_dev *pdev)
+  {
+  	u32 v;
+diff --cc drivers/pci/probe.c
+index 24615182a299,ae7daeb83e21..000000000000
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@@ -1455,8 -1536,8 +1455,13 @@@ static void pci_release_dev(struct devi
+  	pci_release_of_node(pci_dev);
+  	pcibios_release_device(pci_dev);
+  	pci_bus_put(pci_dev->bus);
+++<<<<<<< HEAD
+ +	kfree(pci_dev->pci_dev_rh->driver_override);
+ +	kfree(pci_dev->pci_dev_rh);
+++=======
++ 	kfree(pci_dev->driver_override);
++ 	kfree(pci_dev->dma_alias_mask);
+++>>>>>>> 338c3149a221 (PCI: Add support for multiple DMA aliases)
+  	kfree(pci_dev);
+  }
+  
+diff --cc drivers/pci/search.c
+index 9f0453ad3cd8,33e0f033a48e..000000000000
+--- a/drivers/pci/search.c
++++ b/drivers/pci/search.c
+@@@ -40,12 -40,15 +40,24 @@@ int pci_for_each_dma_alias(struct pci_d
+  	 * If the device is broken and uses an alias requester ID for
+  	 * DMA, iterate over that too.
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(pdev->dev_flags & PCI_DEV_FLAGS_DMA_ALIAS_DEVFN)) {
+ +		ret = fn(pdev, PCI_DEVID(pdev->bus->number,
+ +					 pdev->pci_dev_rh->dma_alias_devfn),
+ +					 data);
+ +		if (ret)
+ +			return ret;
+++=======
++ 	if (unlikely(pdev->dma_alias_mask)) {
++ 		u8 devfn;
++ 
++ 		for_each_set_bit(devfn, pdev->dma_alias_mask, U8_MAX) {
++ 			ret = fn(pdev, PCI_DEVID(pdev->bus->number, devfn),
++ 				 data);
++ 			if (ret)
++ 				return ret;
++ 		}
+++>>>>>>> 338c3149a221 (PCI: Add support for multiple DMA aliases)
+  	}
+  
+  	for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
+diff --cc include/linux/pci.h
+index 101751adcb61,5581d05f7833..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -283,6 -271,7 +281,10 @@@ struct pci_dev 
+  	u8		rom_base_reg;	/* which config register controls the ROM */
+  	u8		pin;		/* which interrupt pin this device uses */
+  	u16		pcie_flags_reg;	/* cached PCIe Capabilities Register */
+++<<<<<<< HEAD
+++=======
++ 	unsigned long	*dma_alias_mask;/* mask of enabled devfn aliases */
+++>>>>>>> 338c3149a221 (PCI: Add support for multiple DMA aliases)
+  
+  	struct pci_driver *driver;	/* which driver has allocated this device */
+  	u64		dma_mask;	/* Mask of the bits of bus address this
+@@@ -1907,6 -1986,8 +1909,11 @@@ static inline struct eeh_dev *pci_dev_t
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ void pci_add_dma_alias(struct pci_dev *dev, u8 devfn);
++ bool pci_devs_are_dma_aliases(struct pci_dev *dev1, struct pci_dev *dev2);
+++>>>>>>> 338c3149a221 (PCI: Add support for multiple DMA aliases)
+  int pci_for_each_dma_alias(struct pci_dev *pdev,
+  			   int (*fn)(struct pci_dev *pdev,
+  				     u16 alias, void *data), void *data);
+* Unmerged path drivers/iommu/iommu.c
+* Unmerged path drivers/pci/pci.c
+* Unmerged path drivers/pci/probe.c
+* Unmerged path drivers/pci/search.c
+* Unmerged path include/linux/pci.h
