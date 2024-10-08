@@ -1,0 +1,114 @@
+kvm: svm: Only propagate next_rip when guest supports it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Joerg Roedel <joro@8bytes.org>
+commit 6092d3d3e6db983048469d424a8f2221915a8dd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6092d3d3.failed
+
+Currently we always write the next_rip of the shadow vmcb to
+the guests vmcb when we emulate a vmexit. This could confuse
+the guest when its cpuid indicated no support for the
+next_rip feature.
+
+Fix this by only propagating next_rip if the guest actually
+supports it.
+
+	Cc: Bandan Das <bsd@redhat.com>
+	Cc: Dirk Mueller <dmueller@suse.com>
+Tested-By: Dirk Mueller <dmueller@suse.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 6092d3d3e6db983048469d424a8f2221915a8dd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.h
+diff --cc arch/x86/kvm/cpuid.h
+index c346c610bd63,06332cb7e7d1..000000000000
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@@ -127,4 -133,41 +127,44 @@@ static inline bool guest_cpuid_has_mpx(
+  	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+  	return best && (best->ebx & bit(X86_FEATURE_MPX));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline bool guest_cpuid_has_pcommit(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_cpuid_entry2 *best;
++ 
++ 	best = kvm_find_cpuid_entry(vcpu, 7, 0);
++ 	return best && (best->ebx & bit(X86_FEATURE_PCOMMIT));
++ }
++ 
++ static inline bool guest_cpuid_has_rdtscp(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_cpuid_entry2 *best;
++ 
++ 	best = kvm_find_cpuid_entry(vcpu, 0x80000001, 0);
++ 	return best && (best->edx & bit(X86_FEATURE_RDTSCP));
++ }
++ 
++ /*
++  * NRIPS is provided through cpuidfn 0x8000000a.edx bit 3
++  */
++ #define BIT_NRIPS	3
++ 
++ static inline bool guest_cpuid_has_nrips(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_cpuid_entry2 *best;
++ 
++ 	best = kvm_find_cpuid_entry(vcpu, 0x8000000a, 0);
++ 
++ 	/*
++ 	 * NRIPS is a scattered cpuid feature, so we can't use
++ 	 * X86_FEATURE_NRIPS here (X86_FEATURE_NRIPS would be bit
++ 	 * position 8, not 3).
++ 	 */
++ 	return best && (best->edx & bit(BIT_NRIPS));
++ }
++ #undef BIT_NRIPS
++ 
+++>>>>>>> 6092d3d3e6db (kvm: svm: Only propagate next_rip when guest supports it)
+  #endif
+* Unmerged path arch/x86/kvm/cpuid.h
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 1ecabdc7bbac..3b7c77cafd73 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -159,6 +159,9 @@ struct vcpu_svm {
+ 	u32 apf_reason;
+ 
+ 	u64  tsc_ratio;
++
++	/* cached guest cpuid flags for faster access */
++	bool nrips_enabled	: 1;
+ };
+ 
+ static DEFINE_PER_CPU(u64, current_tsc_ratio);
+@@ -2363,7 +2366,9 @@ static int nested_svm_vmexit(struct vcpu_svm *svm)
+ 	nested_vmcb->control.exit_info_2       = vmcb->control.exit_info_2;
+ 	nested_vmcb->control.exit_int_info     = vmcb->control.exit_int_info;
+ 	nested_vmcb->control.exit_int_info_err = vmcb->control.exit_int_info_err;
+-	nested_vmcb->control.next_rip          = vmcb->control.next_rip;
++
++	if (svm->nrips_enabled)
++		nested_vmcb->control.next_rip  = vmcb->control.next_rip;
+ 
+ 	/*
+ 	 * If we emulate a VMRUN/#VMEXIT in the same host #vmexit cycle we have
+@@ -4086,6 +4091,10 @@ static u64 svm_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
+ 
+ static void svm_cpuid_update(struct kvm_vcpu *vcpu)
+ {
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++	/* Update nrips enabled cache */
++	svm->nrips_enabled = !!guest_cpuid_has_nrips(&svm->vcpu);
+ }
+ 
+ static void svm_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry)
