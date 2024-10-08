@@ -1,0 +1,153 @@
+hv_netvsc: introduce netif-msg into netvsc module
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Simon Xiao <sixiao@microsoft.com>
+commit 3f300ff41d89fe9674b8dbab950ba2572639ee8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3f300ff4.failed
+
+1. Introduce netif-msg to netvsc to control debug logging output
+and keep msg_enable in netvsc_device_context so that it is
+kept persistently.
+2. Only call dump_rndis_message() when NETIF_MSG_RX_ERR or above
+is specified in netvsc module debug param.
+In non-debug mode, in current code, dump_rndis_message() will not
+dump anything but it still initialize some local variables and
+process the switch logic which is unnecessary, especially in
+high network throughput situation.
+
+	Signed-off-by: Simon Xiao <sixiao@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3f300ff41d89fe9674b8dbab950ba2572639ee8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 3362765215d6,e55c8f4f55ef..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -595,7 -603,25 +595,29 @@@ struct nvsp_message 
+  
+  #define VRSS_SEND_TAB_SIZE 16
+  
+++<<<<<<< HEAD
+ +/* Per netvsc channel-specific */
+++=======
++ #define RNDIS_MAX_PKT_DEFAULT 8
++ #define RNDIS_PKT_ALIGN_DEFAULT 8
++ 
++ struct multi_send_data {
++ 	spinlock_t lock; /* protect struct multi_send_data */
++ 	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++ 	u32 count; /* counter of batched packets */
++ };
++ 
++ /* The context of the netvsc device  */
++ struct net_device_context {
++ 	/* point back to our device context */
++ 	struct hv_device *device_ctx;
++ 	struct delayed_work dwork;
++ 	struct work_struct work;
++ 	u32 msg_enable; /* debug level */
++ };
++ 
++ /* Per netvsc device */
+++>>>>>>> 3f300ff41d89 (hv_netvsc: introduce netif-msg into netvsc module)
+  struct netvsc_device {
+  	struct hv_device *dev;
+  
+@@@ -646,6 -672,13 +668,16 @@@
+  	unsigned char *cb_buffer;
+  	/* The sub channel callback buffer */
+  	unsigned char *sub_cb_buf;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct multi_send_data msd[NR_CPUS];
++ 	u32 max_pkt; /* max number of pkt in one send, e.g. 8 */
++ 	u32 pkt_align; /* alignment bytes, e.g. 8 */
++ 
++ 	/* The net device context */
++ 	struct net_device_context *nd_ctx;
+++>>>>>>> 3f300ff41d89 (hv_netvsc: introduce netif-msg into netvsc module)
+  };
+  
+  /* NdisInitialize message */
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index f6702b01e754..aaae1460d222 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -1078,6 +1078,9 @@ int netvsc_device_add(struct hv_device *device, void *additional_info)
+ 	 */
+ 	ndev = net_device->ndev;
+ 
++	/* Add netvsc_device context to netvsc_device */
++	net_device->nd_ctx = netdev_priv(ndev);
++
+ 	/* Initialize the NetVSC channel extension */
+ 	init_completion(&net_device->channel_init_wait);
+ 
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index f6bc78f79972..67d7d8e2d5de 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -41,18 +41,21 @@
+ 
+ #include "hyperv_net.h"
+ 
+-struct net_device_context {
+-	/* point back to our device context */
+-	struct hv_device *device_ctx;
+-	struct delayed_work dwork;
+-	struct work_struct work;
+-};
+ 
+ #define RING_SIZE_MIN 64
+ static int ring_size = 128;
+ module_param(ring_size, int, S_IRUGO);
+ MODULE_PARM_DESC(ring_size, "Ring buffer size (# of pages)");
+ 
++static const u32 default_msg = NETIF_MSG_DRV | NETIF_MSG_PROBE |
++				NETIF_MSG_LINK | NETIF_MSG_IFUP |
++				NETIF_MSG_IFDOWN | NETIF_MSG_RX_ERR |
++				NETIF_MSG_TX_ERR;
++
++static int debug = -1;
++module_param(debug, int, S_IRUGO);
++MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
++
+ static void do_set_multicast(struct work_struct *w)
+ {
+ 	struct net_device_context *ndevctx =
+@@ -833,6 +836,11 @@ static int netvsc_probe(struct hv_device *dev,
+ 
+ 	net_device_ctx = netdev_priv(net);
+ 	net_device_ctx->device_ctx = dev;
++	net_device_ctx->msg_enable = netif_msg_init(debug, default_msg);
++	if (netif_msg_probe(net_device_ctx))
++		netdev_dbg(net, "netvsc msg_enable: %d\n",
++			   net_device_ctx->msg_enable);
++
+ 	hv_set_drvdata(dev, net);
+ 	INIT_DELAYED_WORK(&net_device_ctx->dwork, netvsc_link_change);
+ 	INIT_WORK(&net_device_ctx->work, do_set_multicast);
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index 5d06e00ce98f..acd96ea15160 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -446,7 +446,8 @@ int rndis_filter_receive(struct hv_device *dev,
+ 
+ 	rndis_msg = pkt->data;
+ 
+-	dump_rndis_message(dev, rndis_msg);
++	if (netif_msg_rx_err(net_dev->nd_ctx))
++		dump_rndis_message(dev, rndis_msg);
+ 
+ 	switch (rndis_msg->ndis_msg_type) {
+ 	case RNDIS_MSG_PACKET:
