@@ -1,0 +1,105 @@
+r8152: fix lockup when runtime PM is enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Wu <peter@lekensteyn.nl>
+commit 90186af404ada5a47b875bf3c16d0b02bb023ea0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/90186af4.failed
+
+When an interface is brought up which was previously suspended (via
+runtime PM), it would hang. This happens because napi_disable is called
+before napi_enable.
+
+Solve this by avoiding napi_enable in the resume during open function
+(netif_running is true when open is called, IFF_UP is set after a
+successful open; netif_running is false when close is called, but IFF_UP
+is then still set).
+
+While at it, remove WORK_ENABLE check from rtl8152_open (introduced with
+the original change) because it cannot happen:
+
+ - After this patch, runtime resume will not set it during rtl8152_open.
+ - When link is up, rtl8152_open is not called.
+ - When link is down during system/auto suspend/resume, it is not set.
+
+Fixes: 41cec84cf285 ("r8152: don't enable napi before rx ready")
+Link: https://lkml.kernel.org/r/20151205105912.GA1766@al
+	Signed-off-by: Peter Wu <peter@lekensteyn.nl>
+	Acked-by: Hayes Wang <hayeswang@realtek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 90186af404ada5a47b875bf3c16d0b02bb023ea0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/r8152.c
+diff --cc drivers/net/usb/r8152.c
+index a5864fc9686d,2e32c41536ae..000000000000
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@@ -2884,16 -3065,7 +2884,20 @@@ static int rtl8152_open(struct net_devi
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* The WORK_ENABLE may be set when autoresume occurs */
+ +	if (test_bit(WORK_ENABLE, &tp->flags)) {
+ +		clear_bit(WORK_ENABLE, &tp->flags);
+ +		usb_kill_urb(tp->intr_urb);
+ +		cancel_delayed_work_sync(&tp->schedule);
+ +
+ +		/* disable the tx/rx, if the workqueue has enabled them. */
+ +		if (tp->speed & LINK_STATUS)
+ +			tp->rtl_ops.disable(tp);
+ +	}
+++=======
++ 	mutex_lock(&tp->control);
+++>>>>>>> 90186af404ad (r8152: fix lockup when runtime PM is enabled)
+  
+  	tp->rtl_ops.up(tp);
+  
+@@@ -2933,16 -3109,14 +2937,21 @@@ static int rtl8152_close(struct net_dev
+  	res = usb_autopm_get_interface(tp->intf);
+  	if (res < 0 || test_bit(RTL8152_UNPLUG, &tp->flags)) {
+  		rtl_drop_queued_tx(tp);
+ -		rtl_stop_rx(tp);
+  	} else {
+++<<<<<<< HEAD
+ +		/* The autosuspend may have been enabled and wouldn't
+ +		 * be disable when autoresume occurs, because the
+ +		 * netif_running() would be false.
+ +		 */
+ +		rtl_runtime_suspend_enable(tp, false);
+ +
+ +		tasklet_disable(&tp->tl);
+++=======
++ 		mutex_lock(&tp->control);
++ 
+++>>>>>>> 90186af404ad (r8152: fix lockup when runtime PM is enabled)
+  		tp->rtl_ops.down(tp);
+ -
+ -		mutex_unlock(&tp->control);
+ -
+ +		tasklet_enable(&tp->tl);
+  		usb_autopm_put_interface(tp->intf);
+  	}
+  
+@@@ -3277,12 -3510,13 +3286,14 @@@ static int rtl8152_resume(struct usb_in
+  					  tp->mii.supports_gmii ?
+  					  SPEED_1000 : SPEED_100,
+  					  DUPLEX_FULL);
+ -			netif_carrier_off(tp->netdev);
+ -			set_bit(WORK_ENABLE, &tp->flags);
+  		}
+ +		tp->speed = 0;
+ +		netif_carrier_off(tp->netdev);
+ +		set_bit(WORK_ENABLE, &tp->flags);
+  		usb_submit_urb(tp->intr_urb, GFP_KERNEL);
+  	} else if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
++ 		if (tp->netdev->flags & IFF_UP)
++ 			rtl_runtime_suspend_enable(tp, false);
+  		clear_bit(SELECTIVE_SUSPEND, &tp->flags);
+  	}
+  
+* Unmerged path drivers/net/usb/r8152.c
