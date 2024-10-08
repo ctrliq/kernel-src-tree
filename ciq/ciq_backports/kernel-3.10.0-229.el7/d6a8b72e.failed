@@ -1,0 +1,221 @@
+drm/i915: Disable caches for Global GTT.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] i915: Disable caches for Global GTT (Rob Clark) [1173317]
+Rebuild_FUZZ: 93.33%
+commit-author Rodrigo Vivi <rodrigo.vivi@intel.com>
+commit d6a8b72edc92471283925ceb4ba12799b67c3ff8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d6a8b72e.failed
+
+Global GTT doesn't have pat_sel[2:0] so it always point to pat_sel = 000;
+So the only way to avoid screen corruptions is setting PAT 0 to Uncached.
+
+MOCS can still be used though. But if userspace is trusting PTE for
+cache selection the safest thing to do is to let caches disabled.
+
+BSpec: "For GGTT, there is NO pat_sel[2:0] from the entry,
+so RTL will always use the value corresponding to pat_sel = 000"
+
+- System agent ggtt writes (i.e. cpu gtt mmaps) already work before
+this patch, i.e. the same uncached + snooping access like on gen6/7
+seems to be in effect.
+- So this just fixes blitter/render access. Again it looks like it's
+not just uncached access, but uncached + snooping. So we can still
+hold onto all our assumptions wrt cpu clflushing on LLC machines.
+
+v2: Cleaner patch as suggested by Chris.
+v3: Add Daniel's comment
+
+Reference: https://bugs.freedesktop.org/show_bug.cgi?id=85576
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: James Ausmus <james.ausmus@intel.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Jani Nikula <jani.nikula@intel.com>
+	Cc: Stable@vger.kernel.org
+	Tested-by: James Ausmus <james.ausmus@intel.com>
+	Reviewed-by: James Ausmus <james.ausmus@intel.com>
+	Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+(cherry picked from commit d6a8b72edc92471283925ceb4ba12799b67c3ff8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_gtt.c
+diff --cc drivers/gpu/drm/i915/i915_gem_gtt.c
+index 1f7b4caefb6e,728938f02341..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@@ -874,6 -1834,166 +874,169 @@@ static inline size_t gen6_get_stolen_si
+  	return snb_gmch_ctl << 25; /* 32 MB units */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline size_t gen8_get_stolen_size(u16 bdw_gmch_ctl)
++ {
++ 	bdw_gmch_ctl >>= BDW_GMCH_GMS_SHIFT;
++ 	bdw_gmch_ctl &= BDW_GMCH_GMS_MASK;
++ 	return bdw_gmch_ctl << 25; /* 32 MB units */
++ }
++ 
++ static size_t chv_get_stolen_size(u16 gmch_ctrl)
++ {
++ 	gmch_ctrl >>= SNB_GMCH_GMS_SHIFT;
++ 	gmch_ctrl &= SNB_GMCH_GMS_MASK;
++ 
++ 	/*
++ 	 * 0x0  to 0x10: 32MB increments starting at 0MB
++ 	 * 0x11 to 0x16: 4MB increments starting at 8MB
++ 	 * 0x17 to 0x1d: 4MB increments start at 36MB
++ 	 */
++ 	if (gmch_ctrl < 0x11)
++ 		return gmch_ctrl << 25;
++ 	else if (gmch_ctrl < 0x17)
++ 		return (gmch_ctrl - 0x11 + 2) << 22;
++ 	else
++ 		return (gmch_ctrl - 0x17 + 9) << 22;
++ }
++ 
++ static int ggtt_probe_common(struct drm_device *dev,
++ 			     size_t gtt_size)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	phys_addr_t gtt_phys_addr;
++ 	int ret;
++ 
++ 	/* For Modern GENs the PTEs and register space are split in the BAR */
++ 	gtt_phys_addr = pci_resource_start(dev->pdev, 0) +
++ 		(pci_resource_len(dev->pdev, 0) / 2);
++ 
++ 	dev_priv->gtt.gsm = ioremap_wc(gtt_phys_addr, gtt_size);
++ 	if (!dev_priv->gtt.gsm) {
++ 		DRM_ERROR("Failed to map the gtt page table\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	ret = setup_scratch_page(dev);
++ 	if (ret) {
++ 		DRM_ERROR("Scratch setup failed\n");
++ 		/* iounmap will also get called at remove, but meh */
++ 		iounmap(dev_priv->gtt.gsm);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ /* The GGTT and PPGTT need a private PPAT setup in order to handle cacheability
++  * bits. When using advanced contexts each context stores its own PAT, but
++  * writing this data shouldn't be harmful even in those cases. */
++ static void bdw_setup_private_ppat(struct drm_i915_private *dev_priv)
++ {
++ 	uint64_t pat;
++ 
++ 	pat = GEN8_PPAT(0, GEN8_PPAT_WB | GEN8_PPAT_LLC)     | /* for normal objects, no eLLC */
++ 	      GEN8_PPAT(1, GEN8_PPAT_WC | GEN8_PPAT_LLCELLC) | /* for something pointing to ptes? */
++ 	      GEN8_PPAT(2, GEN8_PPAT_WT | GEN8_PPAT_LLCELLC) | /* for scanout with eLLC */
++ 	      GEN8_PPAT(3, GEN8_PPAT_UC)                     | /* Uncached objects, mostly for scanout */
++ 	      GEN8_PPAT(4, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(0)) |
++ 	      GEN8_PPAT(5, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(1)) |
++ 	      GEN8_PPAT(6, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(2)) |
++ 	      GEN8_PPAT(7, GEN8_PPAT_WB | GEN8_PPAT_LLCELLC | GEN8_PPAT_AGE(3));
++ 
++ 	if (!USES_PPGTT(dev_priv->dev))
++ 		/* Spec: "For GGTT, there is NO pat_sel[2:0] from the entry,
++ 		 * so RTL will always use the value corresponding to
++ 		 * pat_sel = 000".
++ 		 * So let's disable cache for GGTT to avoid screen corruptions.
++ 		 * MOCS still can be used though.
++ 		 * - System agent ggtt writes (i.e. cpu gtt mmaps) already work
++ 		 * before this patch, i.e. the same uncached + snooping access
++ 		 * like on gen6/7 seems to be in effect.
++ 		 * - So this just fixes blitter/render access. Again it looks
++ 		 * like it's not just uncached access, but uncached + snooping.
++ 		 * So we can still hold onto all our assumptions wrt cpu
++ 		 * clflushing on LLC machines.
++ 		 */
++ 		pat = GEN8_PPAT(0, GEN8_PPAT_UC);
++ 
++ 	/* XXX: spec defines this as 2 distinct registers. It's unclear if a 64b
++ 	 * write would work. */
++ 	I915_WRITE(GEN8_PRIVATE_PAT, pat);
++ 	I915_WRITE(GEN8_PRIVATE_PAT + 4, pat >> 32);
++ }
++ 
++ static void chv_setup_private_ppat(struct drm_i915_private *dev_priv)
++ {
++ 	uint64_t pat;
++ 
++ 	/*
++ 	 * Map WB on BDW to snooped on CHV.
++ 	 *
++ 	 * Only the snoop bit has meaning for CHV, the rest is
++ 	 * ignored.
++ 	 *
++ 	 * Note that the harware enforces snooping for all page
++ 	 * table accesses. The snoop bit is actually ignored for
++ 	 * PDEs.
++ 	 */
++ 	pat = GEN8_PPAT(0, CHV_PPAT_SNOOP) |
++ 	      GEN8_PPAT(1, 0) |
++ 	      GEN8_PPAT(2, 0) |
++ 	      GEN8_PPAT(3, 0) |
++ 	      GEN8_PPAT(4, CHV_PPAT_SNOOP) |
++ 	      GEN8_PPAT(5, CHV_PPAT_SNOOP) |
++ 	      GEN8_PPAT(6, CHV_PPAT_SNOOP) |
++ 	      GEN8_PPAT(7, CHV_PPAT_SNOOP);
++ 
++ 	I915_WRITE(GEN8_PRIVATE_PAT, pat);
++ 	I915_WRITE(GEN8_PRIVATE_PAT + 4, pat >> 32);
++ }
++ 
++ static int gen8_gmch_probe(struct drm_device *dev,
++ 			   size_t *gtt_total,
++ 			   size_t *stolen,
++ 			   phys_addr_t *mappable_base,
++ 			   unsigned long *mappable_end)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	unsigned int gtt_size;
++ 	u16 snb_gmch_ctl;
++ 	int ret;
++ 
++ 	/* TODO: We're not aware of mappable constraints on gen8 yet */
++ 	*mappable_base = pci_resource_start(dev->pdev, 2);
++ 	*mappable_end = pci_resource_len(dev->pdev, 2);
++ 
++ 	if (!pci_set_dma_mask(dev->pdev, DMA_BIT_MASK(39)))
++ 		pci_set_consistent_dma_mask(dev->pdev, DMA_BIT_MASK(39));
++ 
++ 	pci_read_config_word(dev->pdev, SNB_GMCH_CTRL, &snb_gmch_ctl);
++ 
++ 	if (IS_CHERRYVIEW(dev)) {
++ 		*stolen = chv_get_stolen_size(snb_gmch_ctl);
++ 		gtt_size = chv_get_total_gtt_size(snb_gmch_ctl);
++ 	} else {
++ 		*stolen = gen8_get_stolen_size(snb_gmch_ctl);
++ 		gtt_size = gen8_get_total_gtt_size(snb_gmch_ctl);
++ 	}
++ 
++ 	*gtt_total = (gtt_size / sizeof(gen8_gtt_pte_t)) << PAGE_SHIFT;
++ 
++ 	if (IS_CHERRYVIEW(dev))
++ 		chv_setup_private_ppat(dev_priv);
++ 	else
++ 		bdw_setup_private_ppat(dev_priv);
++ 
++ 	ret = ggtt_probe_common(dev, gtt_size);
++ 
++ 	dev_priv->gtt.base.clear_range = gen8_ggtt_clear_range;
++ 	dev_priv->gtt.base.insert_entries = gen8_ggtt_insert_entries;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> d6a8b72edc92 (drm/i915: Disable caches for Global GTT.)
+  static int gen6_gmch_probe(struct drm_device *dev,
+  			   size_t *gtt_total,
+  			   size_t *stolen,
+* Unmerged path drivers/gpu/drm/i915/i915_gem_gtt.c
