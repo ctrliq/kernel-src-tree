@@ -1,0 +1,123 @@
+sctp: the temp asoc's transports should not be hashed/unhashed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit dd7445ad6be3809565272b0e724f2f00c2de1989
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dd7445ad.failed
+
+Re-establish the previous behavior and avoid hashing temporary asocs by
+checking t->asoc->temp in sctp_(un)hash_transport. Also, remove the
+check of t->asoc->temp in __sctp_lookup_association, since they are
+never hashed now.
+
+Fixes: 4f0087812648 ("sctp: apply rhashtable api to send/recv path")
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Reported-by: Vlad Yasevich <vyasevich@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dd7445ad6be3809565272b0e724f2f00c2de1989)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/endpointola.c
+#	net/sctp/input.c
+diff --cc net/sctp/endpointola.c
+index e09f906514db,2522a6175291..000000000000
+--- a/net/sctp/endpointola.c
++++ b/net/sctp/endpointola.c
+@@@ -339,26 -332,12 +339,32 @@@ static struct sctp_association *__sctp_
+  	 */
+  	if (!ep->base.bind_addr.port)
+  		goto out;
+++<<<<<<< HEAD
+++=======
++ 	t = sctp_epaddr_lookup_transport(ep, paddr);
++ 	if (!t)
++ 		goto out;
+++>>>>>>> dd7445ad6be3 (sctp: the temp asoc's transports should not be hashed/unhashed)
+ +
+ +	rport = ntohs(paddr->v4.sin_port);
+ +
+ +	hash = sctp_assoc_hashfn(sock_net(ep->base.sk), ep->base.bind_addr.port,
+ +				 rport);
+ +	head = &sctp_assoc_hashtable[hash];
+ +	read_lock(&head->lock);
+ +	sctp_for_each_hentry(epb, &head->chain) {
+ +		tmp = sctp_assoc(epb);
+ +		if (tmp->ep != ep || rport != tmp->peer.port)
+ +			continue;
+  
+ -	*transport = t;
+ -	asoc = t->asoc;
+ +		t = sctp_assoc_lookup_paddr(tmp, paddr);
+ +		if (t) {
+ +			asoc = tmp;
+ +			*transport = t;
+ +			break;
+ +		}
+ +	}
+ +	read_unlock(&head->lock);
+  out:
+  	return asoc;
+  }
+diff --cc net/sctp/input.c
+index 336fe69bc6d8,bf61dfb8e09e..000000000000
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@@ -1005,39 -934,20 +1011,45 @@@ static struct sctp_association *__sctp_
+  					const union sctp_addr *peer,
+  					struct sctp_transport **pt)
+  {
+ -	struct sctp_transport *t;
+ +	struct sctp_hashbucket *head;
+ +	struct sctp_ep_common *epb;
+ +	struct sctp_association *asoc;
+ +	struct sctp_transport *transport;
+ +	int hash;
+  
+++<<<<<<< HEAD
+ +	/* Optimize here for direct hit, only listening connections can
+ +	 * have wildcards anyways.
+ +	 */
+ +	hash = sctp_assoc_hashfn(net, ntohs(local->v4.sin_port),
+ +				 ntohs(peer->v4.sin_port));
+ +	head = &sctp_assoc_hashtable[hash];
+ +	read_lock(&head->lock);
+ +	sctp_for_each_hentry(epb, &head->chain) {
+ +		asoc = sctp_assoc(epb);
+ +		transport = sctp_assoc_is_match(asoc, net, local, peer);
+ +		if (transport)
+ +			goto hit;
+ +	}
+++=======
++ 	t = sctp_addrs_lookup_transport(net, local, peer);
++ 	if (!t || t->dead)
++ 		return NULL;
+++>>>>>>> dd7445ad6be3 (sctp: the temp asoc's transports should not be hashed/unhashed)
+  
+ -	sctp_association_hold(t->asoc);
+ -	*pt = t;
+ +	read_unlock(&head->lock);
+ +
+ +	return NULL;
+  
+ -	return t->asoc;
+ +hit:
+ +	*pt = transport;
+ +	sctp_association_hold(asoc);
+ +	read_unlock(&head->lock);
+ +	return asoc;
+  }
+  
+ -/* Look up an association. protected by RCU read lock */
+ -static
+ +/* Look up an association. BH-safe. */
+ +SCTP_STATIC
+  struct sctp_association *sctp_lookup_association(struct net *net,
+  						 const union sctp_addr *laddr,
+  						 const union sctp_addr *paddr,
+* Unmerged path net/sctp/endpointola.c
+* Unmerged path net/sctp/input.c
