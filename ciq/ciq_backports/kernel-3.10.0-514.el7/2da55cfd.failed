@@ -1,0 +1,342 @@
+mei: bus: use correct lock ordering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 2da55cfd603d1c08dd1a396f943d6205eca47227
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2da55cfd.failed
+
+The correct lock order is
+  cl_bus_lock
+    device_lock
+      me_clients_rwsem
+
+This order was violated in bus rescan and remove routines
+when me_client_rwsem was locked before cl_bus_lock.
+
+Chain exists of:
+[    4.321653]   &dev->device_lock --> &dev->me_clients_rwsem -->
+&dev->cl_bus_lock
+[    4.321653]
+[    4.321679]  Possible unsafe locking scenario:
+[    4.321679]
+[    4.321693]        CPU0                    CPU1
+[    4.321701]        ----                    ----
+[    4.321709]   lock(&dev->cl_bus_lock);
+[    4.321720]
+lock(&dev->me_clients_rwsem);
+[    4.321733]                                lock(&dev->cl_bus_lock);
+[    4.321745]   lock(&dev->device_lock);
+[    4.321755]
+[    4.321755]  *** DEADLOCK ***
+[    4.321755]
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 2da55cfd603d1c08dd1a396f943d6205eca47227)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/bus.c
+diff --cc drivers/misc/mei/bus.c
+index 3365981198e7,46403e48be4f..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -140,74 -711,243 +140,226 @@@ static struct bus_type mei_cl_bus_type 
+  	.uevent		= mei_cl_device_uevent,
+  };
+  
+ -static struct mei_device *mei_dev_bus_get(struct mei_device *bus)
+ +static void mei_cl_dev_release(struct device *dev)
+  {
+ -	if (bus)
+ -		get_device(bus->dev);
+ -
+ -	return bus;
+ +	kfree(to_mei_cl_device(dev));
+  }
+  
+ -static void mei_dev_bus_put(struct mei_device *bus)
+ -{
+ -	if (bus)
+ -		put_device(bus->dev);
+ -}
+ +static struct device_type mei_cl_device_type = {
+ +	.release	= mei_cl_dev_release,
+ +};
+  
+ -static void mei_cl_bus_dev_release(struct device *dev)
+ +static struct mei_cl *mei_bus_find_mei_cl_by_uuid(struct mei_device *dev,
+ +						uuid_le uuid)
+  {
+ -	struct mei_cl_device *cldev = to_mei_cl_device(dev);
+ +	struct mei_cl *cl;
+  
+ -	if (!cldev)
+ -		return;
+ +	list_for_each_entry(cl, &dev->device_list, device_link) {
+ +		if (!uuid_le_cmp(uuid, cl->device_uuid))
+ +			return cl;
+ +	}
+  
+ -	mei_me_cl_put(cldev->me_cl);
+ -	mei_dev_bus_put(cldev->bus);
+ -	kfree(cldev);
+ +	return NULL;
+  }
+ -
+ -static struct device_type mei_cl_device_type = {
+ -	.release	= mei_cl_bus_dev_release,
+ -};
+ -
+ -/**
+ - * mei_cl_bus_dev_alloc - initialize and allocate mei client device
+ - *
+ - * @bus: mei device
+ - * @me_cl: me client
+ - *
+ - * Return: allocated device structur or NULL on allocation failure
+ - */
+ -static struct mei_cl_device *mei_cl_bus_dev_alloc(struct mei_device *bus,
+ -						  struct mei_me_client *me_cl)
+ +struct mei_cl_device *mei_cl_add_device(struct mei_device *dev,
+ +					uuid_le uuid, char *name,
+ +					struct mei_cl_ops *ops)
+  {
+ -	struct mei_cl_device *cldev;
+ +	struct mei_cl_device *device;
+ +	struct mei_cl *cl;
+ +	int status;
+  
+ -	cldev = kzalloc(sizeof(struct mei_cl_device), GFP_KERNEL);
+ -	if (!cldev)
+ +	cl = mei_bus_find_mei_cl_by_uuid(dev, uuid);
+ +	if (cl == NULL)
+  		return NULL;
+  
+ -	device_initialize(&cldev->dev);
+ -	cldev->dev.parent = bus->dev;
+ -	cldev->dev.bus    = &mei_cl_bus_type;
+ -	cldev->dev.type   = &mei_cl_device_type;
+ -	cldev->bus        = mei_dev_bus_get(bus);
+ -	cldev->me_cl      = mei_me_cl_get(me_cl);
+ -	cldev->is_added   = 0;
+ -	INIT_LIST_HEAD(&cldev->bus_list);
+ +	device = kzalloc(sizeof(struct mei_cl_device), GFP_KERNEL);
+ +	if (!device)
+ +		return NULL;
+  
+ -	return cldev;
+ -}
+ +	device->cl = cl;
+ +	device->ops = ops;
+  
+ -/**
+ - * mei_cl_dev_setup - setup me client device
+ - *    run fix up routines and set the device name
+ - *
+ - * @bus: mei device
+ - * @cldev: me client device
+ - *
+ - * Return: true if the device is eligible for enumeration
+ - */
+ -static bool mei_cl_bus_dev_setup(struct mei_device *bus,
+ -				 struct mei_cl_device *cldev)
+ -{
+ -	cldev->do_match = 1;
+ -	mei_cl_bus_dev_fixup(cldev);
+ +	device->dev.parent = &dev->pdev->dev;
+ +	device->dev.bus = &mei_cl_bus_type;
+ +	device->dev.type = &mei_cl_device_type;
+  
+ -	if (cldev->do_match)
+ -		dev_set_name(&cldev->dev, "mei:%s:%pUl:%02X",
+ -			     cldev->name,
+ -			     mei_me_cl_uuid(cldev->me_cl),
+ -			     mei_me_cl_ver(cldev->me_cl));
+ +	dev_set_name(&device->dev, "%s", name);
+  
+++<<<<<<< HEAD
+ +	status = device_register(&device->dev);
+ +	if (status) {
+ +		dev_err(&dev->pdev->dev, "Failed to register MEI device\n");
+ +		kfree(device);
+ +		return NULL;
+++=======
++ 	return cldev->do_match == 1;
++ }
++ 
++ /**
++  * mei_cl_bus_dev_add - add me client devices
++  *
++  * @cldev: me client device
++  *
++  * Return: 0 on success; < 0 on failre
++  */
++ static int mei_cl_bus_dev_add(struct mei_cl_device *cldev)
++ {
++ 	int ret;
++ 
++ 	dev_dbg(cldev->bus->dev, "adding %pUL:%02X\n",
++ 		mei_me_cl_uuid(cldev->me_cl),
++ 		mei_me_cl_ver(cldev->me_cl));
++ 	ret = device_add(&cldev->dev);
++ 	if (!ret)
++ 		cldev->is_added = 1;
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * mei_cl_bus_dev_stop - stop the driver
++  *
++  * @cldev: me client device
++  */
++ static void mei_cl_bus_dev_stop(struct mei_cl_device *cldev)
++ {
++ 	if (cldev->is_added)
++ 		device_release_driver(&cldev->dev);
++ }
++ 
++ /**
++  * mei_cl_bus_dev_destroy - destroy me client devices object
++  *
++  * @cldev: me client device
++  *
++  * Locking: called under "dev->cl_bus_lock" lock
++  */
++ static void mei_cl_bus_dev_destroy(struct mei_cl_device *cldev)
++ {
++ 
++ 	WARN_ON(!mutex_is_locked(&cldev->bus->cl_bus_lock));
++ 
++ 	if (!cldev->is_added)
++ 		return;
++ 
++ 	device_del(&cldev->dev);
++ 
++ 	list_del_init(&cldev->bus_list);
++ 
++ 	cldev->is_added = 0;
++ 	put_device(&cldev->dev);
++ }
++ 
++ /**
++  * mei_cl_bus_remove_device - remove a devices form the bus
++  *
++  * @cldev: me client device
++  */
++ static void mei_cl_bus_remove_device(struct mei_cl_device *cldev)
++ {
++ 	mei_cl_bus_dev_stop(cldev);
++ 	mei_cl_bus_dev_destroy(cldev);
++ }
++ 
++ /**
++  * mei_cl_bus_remove_devices - remove all devices form the bus
++  *
++  * @bus: mei device
++  */
++ void mei_cl_bus_remove_devices(struct mei_device *bus)
++ {
++ 	struct mei_cl_device *cldev, *next;
++ 
++ 	mutex_lock(&bus->cl_bus_lock);
++ 	list_for_each_entry_safe(cldev, next, &bus->device_list, bus_list)
++ 		mei_cl_bus_remove_device(cldev);
++ 	mutex_unlock(&bus->cl_bus_lock);
++ }
++ 
++ 
++ /**
++  * mei_cl_bus_dev_init - allocate and initializes an mei client devices
++  *     based on me client
++  *
++  * @bus: mei device
++  * @me_cl: me client
++  *
++  * Locking: called under "dev->cl_bus_lock" lock
++  */
++ static void mei_cl_bus_dev_init(struct mei_device *bus,
++ 				struct mei_me_client *me_cl)
++ {
++ 	struct mei_cl_device *cldev;
++ 
++ 	WARN_ON(!mutex_is_locked(&bus->cl_bus_lock));
++ 
++ 	dev_dbg(bus->dev, "initializing %pUl", mei_me_cl_uuid(me_cl));
++ 
++ 	if (me_cl->bus_added)
++ 		return;
++ 
++ 	cldev = mei_cl_bus_dev_alloc(bus, me_cl);
++ 	if (!cldev)
++ 		return;
++ 
++ 	me_cl->bus_added = true;
++ 	list_add_tail(&cldev->bus_list, &bus->device_list);
++ 
++ }
++ 
++ /**
++  * mei_cl_bus_rescan - scan me clients list and add create
++  *    devices for eligible clients
++  *
++  * @bus: mei device
++  */
++ void mei_cl_bus_rescan(struct mei_device *bus)
++ {
++ 	struct mei_cl_device *cldev, *n;
++ 	struct mei_me_client *me_cl;
++ 
++ 	mutex_lock(&bus->cl_bus_lock);
++ 
++ 	down_read(&bus->me_clients_rwsem);
++ 	list_for_each_entry(me_cl, &bus->me_clients, list)
++ 		mei_cl_bus_dev_init(bus, me_cl);
++ 	up_read(&bus->me_clients_rwsem);
++ 
++ 	list_for_each_entry_safe(cldev, n, &bus->device_list, bus_list) {
++ 
++ 		if (!mei_me_cl_is_active(cldev->me_cl)) {
++ 			mei_cl_bus_remove_device(cldev);
++ 			continue;
++ 		}
++ 
++ 		if (cldev->is_added)
++ 			continue;
++ 
++ 		if (mei_cl_bus_dev_setup(bus, cldev))
++ 			mei_cl_bus_dev_add(cldev);
++ 		else {
++ 			list_del_init(&cldev->bus_list);
++ 			put_device(&cldev->dev);
++ 		}
+++>>>>>>> 2da55cfd603d (mei: bus: use correct lock ordering)
+  	}
+ -	mutex_unlock(&bus->cl_bus_lock);
+  
+ -	dev_dbg(bus->dev, "rescan end");
+ +	cl->device = device;
+ +
+ +	dev_dbg(&device->dev, "client %s registered\n", name);
+ +
+ +	return device;
+  }
+ +EXPORT_SYMBOL_GPL(mei_cl_add_device);
+  
+ -int __mei_cldev_driver_register(struct mei_cl_driver *cldrv,
+ -				struct module *owner)
+ +void mei_cl_remove_device(struct mei_cl_device *device)
+ +{
+ +	device_unregister(&device->dev);
+ +}
+ +EXPORT_SYMBOL_GPL(mei_cl_remove_device);
+ +
+ +int __mei_cl_driver_register(struct mei_cl_driver *driver, struct module *owner)
+  {
+  	int err;
+  
+* Unmerged path drivers/misc/mei/bus.c
