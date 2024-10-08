@@ -1,0 +1,459 @@
+ext4: Introduce FALLOC_FL_ZERO_RANGE flag for fallocate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Lukas Czerner <lczerner@redhat.com>
+commit b8a8684502a0fc852afa0056c6bb2a9273f6fcc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b8a86845.failed
+
+Introduce new FALLOC_FL_ZERO_RANGE flag for fallocate. This has the same
+functionality as xfs ioctl XFS_IOC_ZERO_RANGE.
+
+It can be used to convert a range of file to zeros preferably without
+issuing data IO. Blocks should be preallocated for the regions that span
+holes in the file, and the entire range is preferable converted to
+unwritten extents
+
+This can be also used to preallocate blocks past EOF in the same way as
+with fallocate. Flag FALLOC_FL_KEEP_SIZE which should cause the inode
+size to remain the same.
+
+Also add appropriate tracepoints.
+
+	Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+(cherry picked from commit b8a8684502a0fc852afa0056c6bb2a9273f6fcc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/extents.c
+diff --cc fs/ext4/extents.c
+index b0f11d183059,464e95da716e..000000000000
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@@ -4657,6 -4705,218 +4761,221 @@@ retry
+  		goto retry;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return ret > 0 ? ret2 : ret;
++ }
++ 
++ static long ext4_zero_range(struct file *file, loff_t offset,
++ 			    loff_t len, int mode)
++ {
++ 	struct inode *inode = file_inode(file);
++ 	handle_t *handle = NULL;
++ 	unsigned int max_blocks;
++ 	loff_t new_size = 0;
++ 	int ret = 0;
++ 	int flags;
++ 	int partial;
++ 	loff_t start, end;
++ 	ext4_lblk_t lblk;
++ 	struct address_space *mapping = inode->i_mapping;
++ 	unsigned int blkbits = inode->i_blkbits;
++ 
++ 	trace_ext4_zero_range(inode, offset, len, mode);
++ 
++ 	/*
++ 	 * Write out all dirty pages to avoid race conditions
++ 	 * Then release them.
++ 	 */
++ 	if (mapping->nrpages && mapping_tagged(mapping, PAGECACHE_TAG_DIRTY)) {
++ 		ret = filemap_write_and_wait_range(mapping, offset,
++ 						   offset + len - 1);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/*
++ 	 * Round up offset. This is not fallocate, we neet to zero out
++ 	 * blocks, so convert interior block aligned part of the range to
++ 	 * unwritten and possibly manually zero out unaligned parts of the
++ 	 * range.
++ 	 */
++ 	start = round_up(offset, 1 << blkbits);
++ 	end = round_down((offset + len), 1 << blkbits);
++ 
++ 	if (start < offset || end > offset + len)
++ 		return -EINVAL;
++ 	partial = (offset + len) & ((1 << blkbits) - 1);
++ 
++ 	lblk = start >> blkbits;
++ 	max_blocks = (end >> blkbits);
++ 	if (max_blocks < lblk)
++ 		max_blocks = 0;
++ 	else
++ 		max_blocks -= lblk;
++ 
++ 	flags = EXT4_GET_BLOCKS_CREATE_UNINIT_EXT |
++ 		EXT4_GET_BLOCKS_CONVERT_UNWRITTEN;
++ 	if (mode & FALLOC_FL_KEEP_SIZE)
++ 		flags |= EXT4_GET_BLOCKS_KEEP_SIZE;
++ 
++ 	mutex_lock(&inode->i_mutex);
++ 
++ 	/*
++ 	 * Indirect files do not support unwritten extnets
++ 	 */
++ 	if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))) {
++ 		ret = -EOPNOTSUPP;
++ 		goto out_mutex;
++ 	}
++ 
++ 	if (!(mode & FALLOC_FL_KEEP_SIZE) &&
++ 	     offset + len > i_size_read(inode)) {
++ 		new_size = offset + len;
++ 		ret = inode_newsize_ok(inode, new_size);
++ 		if (ret)
++ 			goto out_mutex;
++ 		/*
++ 		 * If we have a partial block after EOF we have to allocate
++ 		 * the entire block.
++ 		 */
++ 		if (partial)
++ 			max_blocks += 1;
++ 	}
++ 
++ 	if (max_blocks > 0) {
++ 
++ 		/* Now release the pages and zero block aligned part of pages*/
++ 		truncate_pagecache_range(inode, start, end - 1);
++ 
++ 		/* Wait all existing dio workers, newcomers will block on i_mutex */
++ 		ext4_inode_block_unlocked_dio(inode);
++ 		inode_dio_wait(inode);
++ 
++ 		/*
++ 		 * Remove entire range from the extent status tree.
++ 		 */
++ 		ret = ext4_es_remove_extent(inode, lblk, max_blocks);
++ 		if (ret)
++ 			goto out_dio;
++ 
++ 		ret = ext4_alloc_file_blocks(file, lblk, max_blocks, flags,
++ 					     mode);
++ 		if (ret)
++ 			goto out_dio;
++ 	}
++ 
++ 	handle = ext4_journal_start(inode, EXT4_HT_MISC, 4);
++ 	if (IS_ERR(handle)) {
++ 		ret = PTR_ERR(handle);
++ 		ext4_std_error(inode->i_sb, ret);
++ 		goto out_dio;
++ 	}
++ 
++ 	inode->i_mtime = inode->i_ctime = ext4_current_time(inode);
++ 
++ 	if (!ret && new_size) {
++ 		if (new_size > i_size_read(inode))
++ 			i_size_write(inode, new_size);
++ 		if (new_size > EXT4_I(inode)->i_disksize)
++ 			ext4_update_i_disksize(inode, new_size);
++ 	} else if (!ret && !new_size) {
++ 		/*
++ 		* Mark that we allocate beyond EOF so the subsequent truncate
++ 		* can proceed even if the new size is the same as i_size.
++ 		*/
++ 		if ((offset + len) > i_size_read(inode))
++ 			ext4_set_inode_flag(inode, EXT4_INODE_EOFBLOCKS);
++ 	}
++ 
++ 	ext4_mark_inode_dirty(handle, inode);
++ 
++ 	/* Zero out partial block at the edges of the range */
++ 	ret = ext4_zero_partial_blocks(handle, inode, offset, len);
++ 
++ 	if (file->f_flags & O_SYNC)
++ 		ext4_handle_sync(handle);
++ 
++ 	ext4_journal_stop(handle);
++ out_dio:
++ 	ext4_inode_resume_unlocked_dio(inode);
++ out_mutex:
++ 	mutex_unlock(&inode->i_mutex);
++ 	return ret;
++ }
++ 
++ /*
++  * preallocate space for a file. This implements ext4's fallocate file
++  * operation, which gets called from sys_fallocate system call.
++  * For block-mapped files, posix_fallocate should fall back to the method
++  * of writing zeroes to the required new blocks (the same behavior which is
++  * expected for file systems which do not support fallocate() system call).
++  */
++ long ext4_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
++ {
++ 	struct inode *inode = file_inode(file);
++ 	handle_t *handle;
++ 	loff_t new_size = 0;
++ 	unsigned int max_blocks;
++ 	int ret = 0;
++ 	int flags;
++ 	ext4_lblk_t lblk;
++ 	struct timespec tv;
++ 	unsigned int blkbits = inode->i_blkbits;
++ 
++ 	/* Return error if mode is not supported */
++ 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
++ 		     FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (mode & FALLOC_FL_PUNCH_HOLE)
++ 		return ext4_punch_hole(inode, offset, len);
++ 
++ 	if (mode & FALLOC_FL_COLLAPSE_RANGE)
++ 		return ext4_collapse_range(inode, offset, len);
++ 
++ 	ret = ext4_convert_inline_data(inode);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * currently supporting (pre)allocate mode for extent-based
++ 	 * files _only_
++ 	 */
++ 	if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (mode & FALLOC_FL_ZERO_RANGE)
++ 		return ext4_zero_range(file, offset, len, mode);
++ 
++ 	trace_ext4_fallocate_enter(inode, offset, len, mode);
++ 	lblk = offset >> blkbits;
++ 	/*
++ 	 * We can't just convert len to max_blocks because
++ 	 * If blocksize = 4096 offset = 3072 and len = 2048
++ 	 */
++ 	max_blocks = (EXT4_BLOCK_ALIGN(len + offset, blkbits) >> blkbits)
++ 		- lblk;
++ 
++ 	flags = EXT4_GET_BLOCKS_CREATE_UNINIT_EXT;
++ 	if (mode & FALLOC_FL_KEEP_SIZE)
++ 		flags |= EXT4_GET_BLOCKS_KEEP_SIZE;
++ 
++ 	mutex_lock(&inode->i_mutex);
++ 
++ 	if (!(mode & FALLOC_FL_KEEP_SIZE) &&
++ 	     offset + len > i_size_read(inode)) {
++ 		new_size = offset + len;
++ 		ret = inode_newsize_ok(inode, new_size);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	ret = ext4_alloc_file_blocks(file, lblk, max_blocks, flags, mode);
++ 	if (ret)
++ 		goto out;
++ 
+++>>>>>>> b8a8684502a0 (ext4: Introduce FALLOC_FL_ZERO_RANGE flag for fallocate)
+  	handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
+  	if (IS_ERR(handle))
+  		goto out;
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 55b17b213a87..a5a804ed34e7 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -582,6 +582,8 @@ enum {
+ #define EXT4_GET_BLOCKS_NO_LOCK			0x0100
+ 	/* Do not put hole in extent cache */
+ #define EXT4_GET_BLOCKS_NO_PUT_HOLE		0x0200
++	/* Convert written extents to unwritten */
++#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0400
+ 
+ /*
+  * The bit position of these flags must not overlap with any of the
+* Unmerged path fs/ext4/extents.c
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 125dc8b5be9a..c24816221fbb 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -501,6 +501,7 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
+ {
+ 	struct extent_status es;
+ 	int retval;
++	int ret = 0;
+ #ifdef ES_AGGRESSIVE_TEST
+ 	struct ext4_map_blocks orig_map;
+ 
+@@ -560,7 +561,6 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
+ 					     EXT4_GET_BLOCKS_KEEP_SIZE);
+ 	}
+ 	if (retval > 0) {
+-		int ret;
+ 		unsigned int status;
+ 
+ 		if (unlikely(retval != map->m_len)) {
+@@ -587,7 +587,7 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
+ 
+ found:
+ 	if (retval > 0 && map->m_flags & EXT4_MAP_MAPPED) {
+-		int ret = check_block_validity(inode, map);
++		ret = check_block_validity(inode, map);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+@@ -604,7 +604,13 @@ found:
+ 	 * with buffer head unmapped.
+ 	 */
+ 	if (retval > 0 && map->m_flags & EXT4_MAP_MAPPED)
+-		return retval;
++		/*
++		 * If we need to convert extent to unwritten
++		 * we continue and do the actual work in
++		 * ext4_ext_map_blocks()
++		 */
++		if (!(flags & EXT4_GET_BLOCKS_CONVERT_UNWRITTEN))
++			return retval;
+ 
+ 	/*
+ 	 * Here we clear m_flags because after allocating an new extent,
+@@ -660,7 +666,6 @@ found:
+ 		ext4_clear_inode_state(inode, EXT4_STATE_DELALLOC_RESERVED);
+ 
+ 	if (retval > 0) {
+-		int ret;
+ 		unsigned int status;
+ 
+ 		if (unlikely(retval != map->m_len)) {
+@@ -695,7 +700,7 @@ found:
+ has_zeroout:
+ 	up_write((&EXT4_I(inode)->i_data_sem));
+ 	if (retval > 0 && map->m_flags & EXT4_MAP_MAPPED) {
+-		int ret = check_block_validity(inode, map);
++		ret = check_block_validity(inode, map);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+@@ -3474,7 +3479,7 @@ int ext4_punch_hole(struct inode *inode, loff_t offset, loff_t length)
+ 	if (!S_ISREG(inode->i_mode))
+ 		return -EOPNOTSUPP;
+ 
+-	trace_ext4_punch_hole(inode, offset, length);
++	trace_ext4_punch_hole(inode, offset, length, 0);
+ 
+ 	/*
+ 	 * Write out all dirty pages to avoid race conditions
+diff --git a/include/trace/events/ext4.h b/include/trace/events/ext4.h
+index 459eed33acf1..1929811eea34 100644
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@ -21,6 +21,10 @@ struct extent_status;
+ #define FALLOC_FL_COLLAPSE_RANGE	0x08
+ #endif
+ 
++#ifndef FALLOC_FL_ZERO_RANGE
++#define FALLOC_FL_ZERO_RANGE           0x10
++#endif
++
+ #define EXT4_I(inode) (container_of(inode, struct ext4_inode_info, vfs_inode))
+ 
+ #define show_mballoc_flags(flags) __print_flags(flags, "|",	\
+@@ -77,7 +81,8 @@ struct extent_status;
+ 	{ FALLOC_FL_KEEP_SIZE,		"KEEP_SIZE"},		\
+ 	{ FALLOC_FL_PUNCH_HOLE,		"PUNCH_HOLE"},		\
+ 	{ FALLOC_FL_NO_HIDE_STALE,	"NO_HIDE_STALE"},	\
+-	{ FALLOC_FL_COLLAPSE_RANGE,	"COLLAPSE_RANGE"})
++	{ FALLOC_FL_COLLAPSE_RANGE,	"COLLAPSE_RANGE"},	\
++	{ FALLOC_FL_ZERO_RANGE,		"ZERO_RANGE"})
+ 
+ 
+ TRACE_EVENT(ext4_free_inode,
+@@ -1321,7 +1326,7 @@ TRACE_EVENT(ext4_direct_IO_exit,
+ 		  __entry->rw, __entry->ret)
+ );
+ 
+-TRACE_EVENT(ext4_fallocate_enter,
++DECLARE_EVENT_CLASS(ext4__fallocate_mode,
+ 	TP_PROTO(struct inode *inode, loff_t offset, loff_t len, int mode),
+ 
+ 	TP_ARGS(inode, offset, len, mode),
+@@ -1329,23 +1334,45 @@ TRACE_EVENT(ext4_fallocate_enter,
+ 	TP_STRUCT__entry(
+ 		__field(	dev_t,	dev			)
+ 		__field(	ino_t,	ino			)
+-		__field(	loff_t,	pos			)
+-		__field(	loff_t,	len			)
++		__field(	loff_t,	offset			)
++		__field(	loff_t, len			)
+ 		__field(	int,	mode			)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		__entry->dev	= inode->i_sb->s_dev;
+ 		__entry->ino	= inode->i_ino;
+-		__entry->pos	= offset;
++		__entry->offset	= offset;
+ 		__entry->len	= len;
+ 		__entry->mode	= mode;
+ 	),
+ 
+-	TP_printk("dev %d,%d ino %lu pos %lld len %lld mode %s",
++	TP_printk("dev %d,%d ino %lu offset %lld len %lld mode %s",
+ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
+-		  (unsigned long) __entry->ino, __entry->pos,
+-		  __entry->len, show_falloc_mode(__entry->mode))
++		  (unsigned long) __entry->ino,
++		  __entry->offset, __entry->len,
++		  show_falloc_mode(__entry->mode))
++);
++
++DEFINE_EVENT(ext4__fallocate_mode, ext4_fallocate_enter,
++
++	TP_PROTO(struct inode *inode, loff_t offset, loff_t len, int mode),
++
++	TP_ARGS(inode, offset, len, mode)
++);
++
++DEFINE_EVENT(ext4__fallocate_mode, ext4_punch_hole,
++
++	TP_PROTO(struct inode *inode, loff_t offset, loff_t len, int mode),
++
++	TP_ARGS(inode, offset, len, mode)
++);
++
++DEFINE_EVENT(ext4__fallocate_mode, ext4_zero_range,
++
++	TP_PROTO(struct inode *inode, loff_t offset, loff_t len, int mode),
++
++	TP_ARGS(inode, offset, len, mode)
+ );
+ 
+ TRACE_EVENT(ext4_fallocate_exit,
+@@ -1377,31 +1404,6 @@ TRACE_EVENT(ext4_fallocate_exit,
+ 		  __entry->ret)
+ );
+ 
+-TRACE_EVENT(ext4_punch_hole,
+-	TP_PROTO(struct inode *inode, loff_t offset, loff_t len),
+-
+-	TP_ARGS(inode, offset, len),
+-
+-	TP_STRUCT__entry(
+-		__field(	dev_t,	dev			)
+-		__field(	ino_t,	ino			)
+-		__field(	loff_t,	offset			)
+-		__field(	loff_t, len			)
+-	),
+-
+-	TP_fast_assign(
+-		__entry->dev	= inode->i_sb->s_dev;
+-		__entry->ino	= inode->i_ino;
+-		__entry->offset	= offset;
+-		__entry->len	= len;
+-	),
+-
+-	TP_printk("dev %d,%d ino %lu offset %lld len %lld",
+-		  MAJOR(__entry->dev), MINOR(__entry->dev),
+-		  (unsigned long) __entry->ino,
+-		  __entry->offset, __entry->len)
+-);
+-
+ TRACE_EVENT(ext4_unlink_enter,
+ 	TP_PROTO(struct inode *parent, struct dentry *dentry),
+ 
