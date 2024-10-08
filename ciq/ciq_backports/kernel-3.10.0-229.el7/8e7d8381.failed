@@ -1,0 +1,719 @@
+kexec: verify the signature of signed PE bzImage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 8e7d838103feac320baf9e68d73f954840ac1eea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/8e7d8381.failed
+
+This is the final piece of the puzzle of verifying kernel image signature
+during kexec_file_load() syscall.
+
+This patch calls into PE file routines to verify signature of bzImage.  If
+signature are valid, kexec_file_load() succeeds otherwise it fails.
+
+Two new config options have been introduced.  First one is
+CONFIG_KEXEC_VERIFY_SIG.  This option enforces that kernel has to be
+validly signed otherwise kernel load will fail.  If this option is not
+set, no signature verification will be done.  Only exception will be when
+secureboot is enabled.  In that case signature verification should be
+automatically enforced when secureboot is enabled.  But that will happen
+when secureboot patches are merged.
+
+Second config option is CONFIG_KEXEC_BZIMAGE_VERIFY_SIG.  This option
+enables signature verification support on bzImage.  If this option is not
+set and previous one is set, kernel image loading will fail because kernel
+does not have support to verify signature of bzImage.
+
+I tested these patches with both "pesign" and "sbsign" signed bzImages.
+
+I used signing_key.priv key and signing_key.x509 cert for signing as
+generated during kernel build process (if module signing is enabled).
+
+Used following method to sign bzImage.
+
+pesign
+======
+- Convert DER format cert to PEM format cert
+openssl x509 -in signing_key.x509 -inform DER -out signing_key.x509.PEM -outform
+PEM
+
+- Generate a .p12 file from existing cert and private key file
+openssl pkcs12 -export -out kernel-key.p12 -inkey signing_key.priv -in
+signing_key.x509.PEM
+
+- Import .p12 file into pesign db
+pk12util -i /tmp/kernel-key.p12 -d /etc/pki/pesign
+
+- Sign bzImage
+pesign -i /boot/vmlinuz-3.16.0-rc3+ -o /boot/vmlinuz-3.16.0-rc3+.signed.pesign
+-c "Glacier signing key - Magrathea" -s
+
+sbsign
+======
+sbsign --key signing_key.priv --cert signing_key.x509.PEM --output
+/boot/vmlinuz-3.16.0-rc3+.signed.sbsign /boot/vmlinuz-3.16.0-rc3+
+
+Patch details:
+
+Well all the hard work is done in previous patches.  Now bzImage loader
+has just call into that code and verify whether bzImage signature are
+valid or not.
+
+Also create two config options.  First one is CONFIG_KEXEC_VERIFY_SIG.
+This option enforces that kernel has to be validly signed otherwise kernel
+load will fail.  If this option is not set, no signature verification will
+be done.  Only exception will be when secureboot is enabled.  In that case
+signature verification should be automatically enforced when secureboot is
+enabled.  But that will happen when secureboot patches are merged.
+
+Second config option is CONFIG_KEXEC_BZIMAGE_VERIFY_SIG.  This option
+enables signature verification support on bzImage.  If this option is not
+set and previous one is set, kernel image loading will fail because kernel
+does not have support to verify signature of bzImage.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Eric Biederman <ebiederm@xmission.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Matthew Garrett <mjg59@srcf.ucam.org>
+	Cc: Greg Kroah-Hartman <greg@kroah.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: WANG Chao <chaowang@redhat.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Matt Fleming <matt@console-pimps.org>
+	Cc: David Howells <dhowells@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8e7d838103feac320baf9e68d73f954840ac1eea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kexec-bzimage64.c
+#	arch/x86/kernel/machine_kexec_64.c
+#	include/linux/kexec.h
+#	kernel/kexec.c
+diff --cc arch/x86/kernel/machine_kexec_64.c
+index 4eabc160696f,8b04018e5d1f..000000000000
+--- a/arch/x86/kernel/machine_kexec_64.c
++++ b/arch/x86/kernel/machine_kexec_64.c
+@@@ -279,5 -323,202 +279,203 @@@ void arch_crash_save_vmcoreinfo(void
+  	VMCOREINFO_SYMBOL(node_data);
+  	VMCOREINFO_LENGTH(node_data, MAX_NUMNODES);
+  #endif
+ -	vmcoreinfo_append_str("KERNELOFFSET=%lx\n",
+ -			      (unsigned long)&_text - __START_KERNEL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* arch-dependent functionality related to kexec file-based syscall */
++ 
++ int arch_kexec_kernel_image_probe(struct kimage *image, void *buf,
++ 				  unsigned long buf_len)
++ {
++ 	int i, ret = -ENOEXEC;
++ 	struct kexec_file_ops *fops;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(kexec_file_loaders); i++) {
++ 		fops = kexec_file_loaders[i];
++ 		if (!fops || !fops->probe)
++ 			continue;
++ 
++ 		ret = fops->probe(buf, buf_len);
++ 		if (!ret) {
++ 			image->fops = fops;
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ void *arch_kexec_kernel_image_load(struct kimage *image)
++ {
++ 	vfree(image->arch.elf_headers);
++ 	image->arch.elf_headers = NULL;
++ 
++ 	if (!image->fops || !image->fops->load)
++ 		return ERR_PTR(-ENOEXEC);
++ 
++ 	return image->fops->load(image, image->kernel_buf,
++ 				 image->kernel_buf_len, image->initrd_buf,
++ 				 image->initrd_buf_len, image->cmdline_buf,
++ 				 image->cmdline_buf_len);
++ }
++ 
++ int arch_kimage_file_post_load_cleanup(struct kimage *image)
++ {
++ 	if (!image->fops || !image->fops->cleanup)
++ 		return 0;
++ 
++ 	return image->fops->cleanup(image->image_loader_data);
++ }
++ 
++ int arch_kexec_kernel_verify_sig(struct kimage *image, void *kernel,
++ 				 unsigned long kernel_len)
++ {
++ 	if (!image->fops || !image->fops->verify_sig) {
++ 		pr_debug("kernel loader does not support signature verification.");
++ 		return -EKEYREJECTED;
++ 	}
++ 
++ 	return image->fops->verify_sig(kernel, kernel_len);
++ }
++ 
++ /*
++  * Apply purgatory relocations.
++  *
++  * ehdr: Pointer to elf headers
++  * sechdrs: Pointer to section headers.
++  * relsec: section index of SHT_RELA section.
++  *
++  * TODO: Some of the code belongs to generic code. Move that in kexec.c.
++  */
++ int arch_kexec_apply_relocations_add(const Elf64_Ehdr *ehdr,
++ 				     Elf64_Shdr *sechdrs, unsigned int relsec)
++ {
++ 	unsigned int i;
++ 	Elf64_Rela *rel;
++ 	Elf64_Sym *sym;
++ 	void *location;
++ 	Elf64_Shdr *section, *symtabsec;
++ 	unsigned long address, sec_base, value;
++ 	const char *strtab, *name, *shstrtab;
++ 
++ 	/*
++ 	 * ->sh_offset has been modified to keep the pointer to section
++ 	 * contents in memory
++ 	 */
++ 	rel = (void *)sechdrs[relsec].sh_offset;
++ 
++ 	/* Section to which relocations apply */
++ 	section = &sechdrs[sechdrs[relsec].sh_info];
++ 
++ 	pr_debug("Applying relocate section %u to %u\n", relsec,
++ 		 sechdrs[relsec].sh_info);
++ 
++ 	/* Associated symbol table */
++ 	symtabsec = &sechdrs[sechdrs[relsec].sh_link];
++ 
++ 	/* String table */
++ 	if (symtabsec->sh_link >= ehdr->e_shnum) {
++ 		/* Invalid strtab section number */
++ 		pr_err("Invalid string table section index %d\n",
++ 		       symtabsec->sh_link);
++ 		return -ENOEXEC;
++ 	}
++ 
++ 	strtab = (char *)sechdrs[symtabsec->sh_link].sh_offset;
++ 
++ 	/* section header string table */
++ 	shstrtab = (char *)sechdrs[ehdr->e_shstrndx].sh_offset;
++ 
++ 	for (i = 0; i < sechdrs[relsec].sh_size / sizeof(*rel); i++) {
++ 
++ 		/*
++ 		 * rel[i].r_offset contains byte offset from beginning
++ 		 * of section to the storage unit affected.
++ 		 *
++ 		 * This is location to update (->sh_offset). This is temporary
++ 		 * buffer where section is currently loaded. This will finally
++ 		 * be loaded to a different address later, pointed to by
++ 		 * ->sh_addr. kexec takes care of moving it
++ 		 *  (kexec_load_segment()).
++ 		 */
++ 		location = (void *)(section->sh_offset + rel[i].r_offset);
++ 
++ 		/* Final address of the location */
++ 		address = section->sh_addr + rel[i].r_offset;
++ 
++ 		/*
++ 		 * rel[i].r_info contains information about symbol table index
++ 		 * w.r.t which relocation must be made and type of relocation
++ 		 * to apply. ELF64_R_SYM() and ELF64_R_TYPE() macros get
++ 		 * these respectively.
++ 		 */
++ 		sym = (Elf64_Sym *)symtabsec->sh_offset +
++ 				ELF64_R_SYM(rel[i].r_info);
++ 
++ 		if (sym->st_name)
++ 			name = strtab + sym->st_name;
++ 		else
++ 			name = shstrtab + sechdrs[sym->st_shndx].sh_name;
++ 
++ 		pr_debug("Symbol: %s info: %02x shndx: %02x value=%llx size: %llx\n",
++ 			 name, sym->st_info, sym->st_shndx, sym->st_value,
++ 			 sym->st_size);
++ 
++ 		if (sym->st_shndx == SHN_UNDEF) {
++ 			pr_err("Undefined symbol: %s\n", name);
++ 			return -ENOEXEC;
++ 		}
++ 
++ 		if (sym->st_shndx == SHN_COMMON) {
++ 			pr_err("symbol '%s' in common section\n", name);
++ 			return -ENOEXEC;
++ 		}
++ 
++ 		if (sym->st_shndx == SHN_ABS)
++ 			sec_base = 0;
++ 		else if (sym->st_shndx >= ehdr->e_shnum) {
++ 			pr_err("Invalid section %d for symbol %s\n",
++ 			       sym->st_shndx, name);
++ 			return -ENOEXEC;
++ 		} else
++ 			sec_base = sechdrs[sym->st_shndx].sh_addr;
++ 
++ 		value = sym->st_value;
++ 		value += sec_base;
++ 		value += rel[i].r_addend;
++ 
++ 		switch (ELF64_R_TYPE(rel[i].r_info)) {
++ 		case R_X86_64_NONE:
++ 			break;
++ 		case R_X86_64_64:
++ 			*(u64 *)location = value;
++ 			break;
++ 		case R_X86_64_32:
++ 			*(u32 *)location = value;
++ 			if (value != *(u32 *)location)
++ 				goto overflow;
++ 			break;
++ 		case R_X86_64_32S:
++ 			*(s32 *)location = value;
++ 			if ((s64)value != *(s32 *)location)
++ 				goto overflow;
++ 			break;
++ 		case R_X86_64_PC32:
++ 			value -= (u64)address;
++ 			*(u32 *)location = value;
++ 			break;
++ 		default:
++ 			pr_err("Unknown rela relocation: %llu\n",
++ 			       ELF64_R_TYPE(rel[i].r_info));
++ 			return -ENOEXEC;
++ 		}
++ 	}
++ 	return 0;
++ 
++ overflow:
++ 	pr_err("Overflow in relocation type %d value 0x%lx\n",
++ 	       (int)ELF64_R_TYPE(rel[i].r_info), value);
++ 	return -ENOEXEC;
++ }
+++>>>>>>> 8e7d838103fe (kexec: verify the signature of signed PE bzImage)
+diff --cc include/linux/kexec.h
+index 66d56ac0f64c,4b2a0e11cc5b..000000000000
+--- a/include/linux/kexec.h
++++ b/include/linux/kexec.h
+@@@ -125,9 -149,57 +125,27 @@@ struct kimage 
+  #ifdef ARCH_HAS_KIMAGE_ARCH
+  	struct kimage_arch arch;
+  #endif
+ -
+ -	/* Additional fields for file based kexec syscall */
+ -	void *kernel_buf;
+ -	unsigned long kernel_buf_len;
+ -
+ -	void *initrd_buf;
+ -	unsigned long initrd_buf_len;
+ -
+ -	char *cmdline_buf;
+ -	unsigned long cmdline_buf_len;
+ -
+ -	/* File operations provided by image loader */
+ -	struct kexec_file_ops *fops;
+ -
+ -	/* Image loader handling the kernel can store a pointer here */
+ -	void *image_loader_data;
+ -
+ -	/* Information for loading purgatory */
+ -	struct purgatory_info purgatory_info;
+  };
+  
+ -/*
+ - * Keeps track of buffer parameters as provided by caller for requesting
+ - * memory placement of buffer.
+ - */
+ -struct kexec_buf {
+ -	struct kimage *image;
+ -	char *buffer;
+ -	unsigned long bufsz;
+ -	unsigned long memsz;
+ -	unsigned long buf_align;
+ -	unsigned long buf_min;
+ -	unsigned long buf_max;
+ -	bool top_down;		/* allocate from top of memory hole */
+ -};
+  
+++<<<<<<< HEAD
+++=======
++ typedef int (kexec_probe_t)(const char *kernel_buf, unsigned long kernel_size);
++ typedef void *(kexec_load_t)(struct kimage *image, char *kernel_buf,
++ 			     unsigned long kernel_len, char *initrd,
++ 			     unsigned long initrd_len, char *cmdline,
++ 			     unsigned long cmdline_len);
++ typedef int (kexec_cleanup_t)(void *loader_data);
++ typedef int (kexec_verify_sig_t)(const char *kernel_buf,
++ 				 unsigned long kernel_len);
++ 
++ struct kexec_file_ops {
++ 	kexec_probe_t *probe;
++ 	kexec_load_t *load;
++ 	kexec_cleanup_t *cleanup;
++ 	kexec_verify_sig_t *verify_sig;
++ };
+++>>>>>>> 8e7d838103fe (kexec: verify the signature of signed PE bzImage)
+  
+  /* kexec interface functions */
+  extern void machine_kexec(struct kimage *image);
+diff --cc kernel/kexec.c
+index 4b1d9ca3907c,0b49a0a58102..000000000000
+--- a/kernel/kexec.c
++++ b/kernel/kexec.c
+@@@ -293,57 -361,256 +293,275 @@@ static int kimage_crash_alloc(struct ki
+  		goto out;
+  	}
+  
+ -	/* Don't hand 0 to vmalloc, it whines. */
+ -	if (stat.size == 0) {
+ -		ret = -EINVAL;
+ +	/* Allocate and initialize a controlling structure */
+ +	result = do_kimage_alloc(&image, entry, nr_segments, segments);
+ +	if (result)
+  		goto out;
+ -	}
+  
+ -	*buf = vmalloc(stat.size);
+ -	if (!*buf) {
+ -		ret = -ENOMEM;
+ -		goto out;
+ -	}
+ +	/* Enable the special crash kernel control page
+ +	 * allocation policy.
+ +	 */
+ +	image->control_page = crashk_res.start;
+ +	image->type = KEXEC_TYPE_CRASH;
+  
+ -	pos = 0;
+ -	while (pos < stat.size) {
+ -		bytes = kernel_read(f.file, pos, (char *)(*buf) + pos,
+ -				    stat.size - pos);
+ -		if (bytes < 0) {
+ -			vfree(*buf);
+ -			ret = bytes;
+ -			goto out;
+ -		}
+ +	/*
+ +	 * Verify we have good destination addresses.  Normally
+ +	 * the caller is responsible for making certain we don't
+ +	 * attempt to load the new image into invalid or reserved
+ +	 * areas of RAM.  But crash kernels are preloaded into a
+ +	 * reserved area of ram.  We must ensure the addresses
+ +	 * are in the reserved area otherwise preloading the
+ +	 * kernel could corrupt things.
+ +	 */
+ +	result = -EADDRNOTAVAIL;
+ +	for (i = 0; i < nr_segments; i++) {
+ +		unsigned long mstart, mend;
+  
+ -		if (bytes == 0)
+ -			break;
+ -		pos += bytes;
+ +		mstart = image->segment[i].mem;
+ +		mend = mstart + image->segment[i].memsz - 1;
+ +		/* Ensure we are within the crash kernel limits */
+ +		if ((mstart < crashk_res.start) || (mend > crashk_res.end))
+ +			goto out_free;
+  	}
+  
+ -	if (pos != stat.size) {
+ -		ret = -EBADF;
+ -		vfree(*buf);
+ -		goto out;
+ +	/*
+ +	 * Find a location for the control code buffer, and add
+ +	 * the vector of segments so that it's pages will also be
+ +	 * counted as destination pages.
+ +	 */
+ +	result = -ENOMEM;
+ +	image->control_code_page = kimage_alloc_control_pages(image,
+ +					   get_order(KEXEC_CONTROL_PAGE_SIZE));
+ +	if (!image->control_code_page) {
+ +		printk(KERN_ERR "Could not allocate control_code_buffer\n");
+ +		goto out_free;
+  	}
+  
+ -	*buf_len = pos;
+ +	*rimage = image;
+ +	return 0;
+ +
+ +out_free:
+ +	kfree(image);
+  out:
+++<<<<<<< HEAD
+ +	return result;
+++=======
++ 	fdput(f);
++ 	return ret;
++ }
++ 
++ /* Architectures can provide this probe function */
++ int __weak arch_kexec_kernel_image_probe(struct kimage *image, void *buf,
++ 					 unsigned long buf_len)
++ {
++ 	return -ENOEXEC;
++ }
++ 
++ void * __weak arch_kexec_kernel_image_load(struct kimage *image)
++ {
++ 	return ERR_PTR(-ENOEXEC);
++ }
++ 
++ void __weak arch_kimage_file_post_load_cleanup(struct kimage *image)
++ {
++ }
++ 
++ int __weak arch_kexec_kernel_verify_sig(struct kimage *image, void *buf,
++ 					unsigned long buf_len)
++ {
++ 	return -EKEYREJECTED;
++ }
++ 
++ /* Apply relocations of type RELA */
++ int __weak
++ arch_kexec_apply_relocations_add(const Elf_Ehdr *ehdr, Elf_Shdr *sechdrs,
++ 				 unsigned int relsec)
++ {
++ 	pr_err("RELA relocation unsupported.\n");
++ 	return -ENOEXEC;
++ }
++ 
++ /* Apply relocations of type REL */
++ int __weak
++ arch_kexec_apply_relocations(const Elf_Ehdr *ehdr, Elf_Shdr *sechdrs,
++ 			     unsigned int relsec)
++ {
++ 	pr_err("REL relocation unsupported.\n");
++ 	return -ENOEXEC;
++ }
++ 
++ /*
++  * Free up memory used by kernel, initrd, and comand line. This is temporary
++  * memory allocation which is not needed any more after these buffers have
++  * been loaded into separate segments and have been copied elsewhere.
++  */
++ static void kimage_file_post_load_cleanup(struct kimage *image)
++ {
++ 	struct purgatory_info *pi = &image->purgatory_info;
++ 
++ 	vfree(image->kernel_buf);
++ 	image->kernel_buf = NULL;
++ 
++ 	vfree(image->initrd_buf);
++ 	image->initrd_buf = NULL;
++ 
++ 	kfree(image->cmdline_buf);
++ 	image->cmdline_buf = NULL;
++ 
++ 	vfree(pi->purgatory_buf);
++ 	pi->purgatory_buf = NULL;
++ 
++ 	vfree(pi->sechdrs);
++ 	pi->sechdrs = NULL;
++ 
++ 	/* See if architecture has anything to cleanup post load */
++ 	arch_kimage_file_post_load_cleanup(image);
++ 
++ 	/*
++ 	 * Above call should have called into bootloader to free up
++ 	 * any data stored in kimage->image_loader_data. It should
++ 	 * be ok now to free it up.
++ 	 */
++ 	kfree(image->image_loader_data);
++ 	image->image_loader_data = NULL;
++ }
++ 
++ /*
++  * In file mode list of segments is prepared by kernel. Copy relevant
++  * data from user space, do error checking, prepare segment list
++  */
++ static int
++ kimage_file_prepare_segments(struct kimage *image, int kernel_fd, int initrd_fd,
++ 			     const char __user *cmdline_ptr,
++ 			     unsigned long cmdline_len, unsigned flags)
++ {
++ 	int ret = 0;
++ 	void *ldata;
++ 
++ 	ret = copy_file_from_fd(kernel_fd, &image->kernel_buf,
++ 				&image->kernel_buf_len);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Call arch image probe handlers */
++ 	ret = arch_kexec_kernel_image_probe(image, image->kernel_buf,
++ 					    image->kernel_buf_len);
++ 
++ 	if (ret)
++ 		goto out;
++ 
++ #ifdef CONFIG_KEXEC_VERIFY_SIG
++ 	ret = arch_kexec_kernel_verify_sig(image, image->kernel_buf,
++ 					   image->kernel_buf_len);
++ 	if (ret) {
++ 		pr_debug("kernel signature verification failed.\n");
++ 		goto out;
++ 	}
++ 	pr_debug("kernel signature verification successful.\n");
++ #endif
++ 	/* It is possible that there no initramfs is being loaded */
++ 	if (!(flags & KEXEC_FILE_NO_INITRAMFS)) {
++ 		ret = copy_file_from_fd(initrd_fd, &image->initrd_buf,
++ 					&image->initrd_buf_len);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	if (cmdline_len) {
++ 		image->cmdline_buf = kzalloc(cmdline_len, GFP_KERNEL);
++ 		if (!image->cmdline_buf) {
++ 			ret = -ENOMEM;
++ 			goto out;
++ 		}
++ 
++ 		ret = copy_from_user(image->cmdline_buf, cmdline_ptr,
++ 				     cmdline_len);
++ 		if (ret) {
++ 			ret = -EFAULT;
++ 			goto out;
++ 		}
++ 
++ 		image->cmdline_buf_len = cmdline_len;
++ 
++ 		/* command line should be a string with last byte null */
++ 		if (image->cmdline_buf[cmdline_len - 1] != '\0') {
++ 			ret = -EINVAL;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	/* Call arch image load handlers */
++ 	ldata = arch_kexec_kernel_image_load(image);
++ 
++ 	if (IS_ERR(ldata)) {
++ 		ret = PTR_ERR(ldata);
++ 		goto out;
++ 	}
++ 
++ 	image->image_loader_data = ldata;
++ out:
++ 	/* In case of error, free up all allocated memory in this function */
++ 	if (ret)
++ 		kimage_file_post_load_cleanup(image);
++ 	return ret;
++ }
++ 
++ static int
++ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
++ 		       int initrd_fd, const char __user *cmdline_ptr,
++ 		       unsigned long cmdline_len, unsigned long flags)
++ {
++ 	int ret;
++ 	struct kimage *image;
++ 	bool kexec_on_panic = flags & KEXEC_FILE_ON_CRASH;
++ 
++ 	image = do_kimage_alloc_init();
++ 	if (!image)
++ 		return -ENOMEM;
++ 
++ 	image->file_mode = 1;
++ 
++ 	if (kexec_on_panic) {
++ 		/* Enable special crash kernel control page alloc policy. */
++ 		image->control_page = crashk_res.start;
++ 		image->type = KEXEC_TYPE_CRASH;
++ 	}
++ 
++ 	ret = kimage_file_prepare_segments(image, kernel_fd, initrd_fd,
++ 					   cmdline_ptr, cmdline_len, flags);
++ 	if (ret)
++ 		goto out_free_image;
++ 
++ 	ret = sanity_check_segment_list(image);
++ 	if (ret)
++ 		goto out_free_post_load_bufs;
++ 
++ 	ret = -ENOMEM;
++ 	image->control_code_page = kimage_alloc_control_pages(image,
++ 					   get_order(KEXEC_CONTROL_PAGE_SIZE));
++ 	if (!image->control_code_page) {
++ 		pr_err("Could not allocate control_code_buffer\n");
++ 		goto out_free_post_load_bufs;
++ 	}
++ 
++ 	if (!kexec_on_panic) {
++ 		image->swap_page = kimage_alloc_control_pages(image, 0);
++ 		if (!image->swap_page) {
++ 			pr_err(KERN_ERR "Could not allocate swap buffer\n");
++ 			goto out_free_control_pages;
++ 		}
++ 	}
++ 
++ 	*rimage = image;
++ 	return 0;
++ out_free_control_pages:
++ 	kimage_free_page_list(&image->control_pages);
++ out_free_post_load_bufs:
++ 	kimage_file_post_load_cleanup(image);
++ out_free_image:
++ 	kfree(image);
++ 	return ret;
+++>>>>>>> 8e7d838103fe (kexec: verify the signature of signed PE bzImage)
+  }
+  
+  static int kimage_is_destination_range(struct kimage *image,
+* Unmerged path arch/x86/kernel/kexec-bzimage64.c
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index a9a20295a8de..877b0ab7a9ff 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1650,6 +1650,28 @@ config KEXEC_AUTO_RESERVE
+ 	 On x86_32, 128M is reserved, on x86_64 1/32 of your memory is
+ 	 reserved, but it will not exceed 4G.
+ 
++config KEXEC_VERIFY_SIG
++	bool "Verify kernel signature during kexec_file_load() syscall"
++	depends on KEXEC
++	---help---
++	  This option makes kernel signature verification mandatory for
++	  kexec_file_load() syscall. If kernel is signature can not be
++	  verified, kexec_file_load() will fail.
++
++	  This option enforces signature verification at generic level.
++	  One needs to enable signature verification for type of kernel
++	  image being loaded to make sure it works. For example, enable
++	  bzImage signature verification option to be able to load and
++	  verify signatures of bzImage. Otherwise kernel loading will fail.
++
++config KEXEC_BZIMAGE_VERIFY_SIG
++	bool "Enable bzImage signature verification support"
++	depends on KEXEC_VERIFY_SIG
++	depends on SIGNED_PE_FILE_VERIFICATION
++	select SYSTEM_TRUSTED_KEYRING
++	---help---
++	  Enable bzImage signature verification support.
++
+ config CRASH_DUMP
+ 	bool "kernel crash dumps"
+ 	depends on X86_64 || (X86_32 && HIGHMEM)
+* Unmerged path arch/x86/kernel/kexec-bzimage64.c
+* Unmerged path arch/x86/kernel/machine_kexec_64.c
+* Unmerged path include/linux/kexec.h
+* Unmerged path kernel/kexec.c
