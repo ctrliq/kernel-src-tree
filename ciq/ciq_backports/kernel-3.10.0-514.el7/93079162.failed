@@ -1,0 +1,148 @@
+scsi_transport_srp: Fix a race condition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit 93079162bf0ed2934c7b0c3ee93ba894df8fb3cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/93079162.failed
+
+The rport timers must be stopped before the SRP initiator destroys the
+resources associated with the SCSI host. This is necessary because
+otherwise the callback functions invoked from the SRP transport layer
+could trigger a use-after-free. Stopping the rport timers before
+invoking scsi_remove_host() can trigger long delays in the SCSI error
+handler if a transport layer failure occurs while scsi_remove_host()
+is in progress. Hence move the code for stopping the rport timers from
+srp_rport_release() into a new function and invoke that function after
+scsi_remove_host() has finished. This patch fixes the following
+sporadic kernel crash:
+
+     kernel BUG at include/asm-generic/dma-mapping-common.h:64!
+     invalid opcode: 0000 [#1] SMP
+     RIP: 0010:[<ffffffffa03b20b1>]  [<ffffffffa03b20b1>] srp_unmap_data+0x121/0x130 [ib_srp]
+     Call Trace:
+     [<ffffffffa03b20fc>] srp_free_req+0x3c/0x80 [ib_srp]
+     [<ffffffffa03b2188>] srp_finish_req+0x48/0x70 [ib_srp]
+     [<ffffffffa03b21fb>] srp_terminate_io+0x4b/0x60 [ib_srp]
+     [<ffffffffa03a6fb5>] __rport_fail_io_fast+0x75/0x80 [scsi_transport_srp]
+     [<ffffffffa03a7438>] rport_fast_io_fail_timedout+0x88/0xc0 [scsi_transport_srp]
+     [<ffffffff8108b370>] worker_thread+0x170/0x2a0
+     [<ffffffff81090876>] kthread+0x96/0xa0
+     [<ffffffff8100c0ca>] child_rip+0xa/0x20
+
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 93079162bf0ed2934c7b0c3ee93ba894df8fb3cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_transport_srp.c
+diff --cc drivers/scsi/scsi_transport_srp.c
+index 2700a5a09bd4,a349d44c4c36..000000000000
+--- a/drivers/scsi/scsi_transport_srp.c
++++ b/drivers/scsi/scsi_transport_srp.c
+@@@ -452,37 -456,29 +452,53 @@@ static void __srp_start_tl_fail_timers(
+  
+  	lockdep_assert_held(&rport->mutex);
+  
+- 	if (!rport->deleted) {
+- 		delay = rport->reconnect_delay;
+- 		fast_io_fail_tmo = rport->fast_io_fail_tmo;
+- 		dev_loss_tmo = rport->dev_loss_tmo;
+- 		pr_debug("%s current state: %d\n",
+- 			 dev_name(&shost->shost_gendev), rport->state);
++ 	delay = rport->reconnect_delay;
++ 	fast_io_fail_tmo = rport->fast_io_fail_tmo;
++ 	dev_loss_tmo = rport->dev_loss_tmo;
++ 	pr_debug("%s current state: %d\n", dev_name(&shost->shost_gendev),
++ 		 rport->state);
+  
+- 		if (delay > 0)
++ 	if (rport->state == SRP_RPORT_LOST)
++ 		return;
++ 	if (delay > 0)
++ 		queue_delayed_work(system_long_wq, &rport->reconnect_work,
++ 				   1UL * delay * HZ);
++ 	if (srp_rport_set_state(rport, SRP_RPORT_BLOCKED) == 0) {
++ 		pr_debug("%s new state: %d\n", dev_name(&shost->shost_gendev),
++ 			 rport->state);
++ 		scsi_target_block(&shost->shost_gendev);
++ 		if (fast_io_fail_tmo >= 0)
+  			queue_delayed_work(system_long_wq,
+++<<<<<<< HEAD
+ +					   &rport->reconnect_work,
+ +					   1UL * delay * HZ);
+ +		if (fast_io_fail_tmo >= 0 &&
+ +		    srp_rport_set_state(rport, SRP_RPORT_BLOCKED) == 0) {
+ +			pr_debug("%s new state: %d\n",
+ +				 dev_name(&shost->shost_gendev),
+ +				 rport->state);
+ +			scsi_target_block(&shost->shost_gendev);
+ +			queue_delayed_work(system_long_wq,
+ +					   &rport->fast_io_fail_work,
+ +					   1UL * fast_io_fail_tmo * HZ);
+ +		}
+++=======
++ 					   &rport->fast_io_fail_work,
++ 					   1UL * fast_io_fail_tmo * HZ);
+++>>>>>>> 93079162bf0e (scsi_transport_srp: Fix a race condition)
+  		if (dev_loss_tmo >= 0)
+  			queue_delayed_work(system_long_wq,
+  					   &rport->dev_loss_work,
+  					   1UL * dev_loss_tmo * HZ);
+++<<<<<<< HEAD
+ +	} else {
+ +		pr_debug("%s has already been deleted\n",
+ +			 dev_name(&shost->shost_gendev));
+ +		srp_rport_set_state(rport, SRP_RPORT_FAIL_FAST);
+ +		scsi_target_unblock(&shost->shost_gendev,
+ +				    SDEV_TRANSPORT_OFFLINE);
+++=======
+++>>>>>>> 93079162bf0e (scsi_transport_srp: Fix a race condition)
+  	}
+  }
+  
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index 7b6298b022a8..4a7359a0d238 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -929,6 +929,7 @@ static void srp_remove_target(struct srp_target_port *target)
+ 	srp_rport_get(target->rport);
+ 	srp_remove_host(target->scsi_host);
+ 	scsi_remove_host(target->scsi_host);
++	srp_stop_rport_timers(target->rport);
+ 	srp_disconnect_target(target);
+ 	srp_free_ch_ib(target, ch);
+ 	cancel_work_sync(&target->tl_err_work);
+* Unmerged path drivers/scsi/scsi_transport_srp.c
+diff --git a/include/scsi/scsi_transport_srp.h b/include/scsi/scsi_transport_srp.h
+index 4ebf6913b7b2..f24e763fa430 100644
+--- a/include/scsi/scsi_transport_srp.h
++++ b/include/scsi/scsi_transport_srp.h
+@@ -19,7 +19,7 @@ struct srp_rport_identifiers {
+  * @SRP_RPORT_BLOCKED:   Transport layer not operational; fast I/O fail timer
+  *                       is running and I/O has been blocked.
+  * @SRP_RPORT_FAIL_FAST: Fast I/O fail timer has expired; fail I/O fast.
+- * @SRP_RPORT_LOST:      Device loss timer has expired; port is being removed.
++ * @SRP_RPORT_LOST:      Port is being removed.
+  */
+ enum srp_rport_state {
+ 	SRP_RPORT_RUNNING,
+@@ -48,7 +48,6 @@ struct srp_rport {
+ 
+ 	struct mutex		mutex;
+ 	enum srp_rport_state	state;
+-	bool			deleted;
+ 	int			reconnect_delay;
+ 	int			failed_reconnects;
+ 	struct delayed_work	reconnect_work;
+@@ -101,6 +100,7 @@ extern int srp_tmo_valid(int reconnect_delay, int fast_io_fail_tmo,
+ extern int srp_reconnect_rport(struct srp_rport *rport);
+ extern void srp_start_tl_fail_timers(struct srp_rport *rport);
+ extern void srp_remove_host(struct Scsi_Host *);
++extern void srp_stop_rport_timers(struct srp_rport *rport);
+ 
+ /**
+  * srp_chkready() - evaluate the transport layer state before I/O
