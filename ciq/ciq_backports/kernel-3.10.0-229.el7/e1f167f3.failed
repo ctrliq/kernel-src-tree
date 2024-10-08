@@ -1,0 +1,147 @@
+iommu/vt-d: Make domain_context_mapp{ed,ing}() take struct device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Make domain_context_mapp{ed, ing}() take struct device (Myron Stowe) [1129880 1087643]
+Rebuild_FUZZ: 94.40%
+commit-author David Woodhouse <David.Woodhouse@intel.com>
+commit e1f167f3fd69d794b570fc4d3159191568ff9b70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e1f167f3.failed
+
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit e1f167f3fd69d794b570fc4d3159191568ff9b70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 144c54a1b81e,949aa29dba8b..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -1733,16 -1840,21 +1733,28 @@@ static int domain_context_mapping_one(s
+  }
+  
+  static int
+- domain_context_mapping(struct dmar_domain *domain, struct pci_dev *pdev,
+- 			int translation)
++ domain_context_mapping(struct dmar_domain *domain, struct device *dev,
++ 		       int translation)
+  {
+  	int ret;
+++<<<<<<< HEAD
+ +	struct pci_dev *tmp, *parent;
+ +
+ +	ret = domain_context_mapping_one(domain, pci_domain_nr(pdev->bus),
+ +					 pdev->bus->number, pdev->devfn,
+++=======
++ 	struct pci_dev *pdev, *tmp, *parent;
++ 	struct intel_iommu *iommu;
++ 	u8 bus, devfn;
++ 
++ 	iommu = device_to_iommu(dev, &bus, &devfn);
++ 	if (!iommu)
++ 		return -ENODEV;
++ 
++ 	ret = domain_context_mapping_one(domain, iommu, bus, devfn,
+++>>>>>>> e1f167f3fd69 (iommu/vt-d: Make domain_context_mapp{ed,ing}() take struct device)
+  					 translation);
+- 	if (ret)
++ 	if (ret || !dev_is_pci(dev))
+  		return ret;
+  
+  	/* dependent device mapping */
+@@@ -1773,21 -1883,23 +1786,32 @@@
+  						  translation);
+  }
+  
+- static int domain_context_mapped(struct pci_dev *pdev)
++ static int domain_context_mapped(struct device *dev)
+  {
+  	int ret;
+- 	struct pci_dev *tmp, *parent;
++ 	struct pci_dev *pdev, *tmp, *parent;
+  	struct intel_iommu *iommu;
+ -	u8 bus, devfn;
+  
+++<<<<<<< HEAD
+ +	iommu = device_to_iommu(pci_domain_nr(pdev->bus), pdev->bus->number,
+ +				pdev->devfn);
+ +	if (!iommu)
+ +		return -ENODEV;
+ +
+ +	ret = device_context_mapped(iommu, pdev->bus->number, pdev->devfn);
+ +	if (!ret)
+++=======
++ 	iommu = device_to_iommu(dev, &bus, &devfn);
++ 	if (!iommu)
++ 		return -ENODEV;
++ 
++ 	ret = device_context_mapped(iommu, bus, devfn);
++ 	if (!ret || !dev_is_pci(dev))
+++>>>>>>> e1f167f3fd69 (iommu/vt-d: Make domain_context_mapp{ed,ing}() take struct device)
+  		return ret;
++ 
+  	/* dependent device mapping */
++ 	pdev = to_pci_dev(dev);
+  	tmp = pci_find_upstream_pcie_bridge(pdev);
+  	if (!tmp)
+  		return ret;
+@@@ -2343,32 -2475,22 +2367,32 @@@ static int domain_add_dev_info(struct d
+  			       struct pci_dev *pdev,
+  			       int translation)
+  {
+ -	struct dmar_domain *ndomain;
+ -	struct intel_iommu *iommu;
+ -	u8 bus, devfn;
+ +	struct device_domain_info *info;
+ +	unsigned long flags;
+  	int ret;
+  
+ -	iommu = device_to_iommu(&pdev->dev, &bus, &devfn);
+ -	if (!iommu)
+ -		return -ENODEV;
+ +	info = alloc_devinfo_mem();
+ +	if (!info)
+ +		return -ENOMEM;
+ +
+ +	info->segment = pci_domain_nr(pdev->bus);
+ +	info->bus = pdev->bus->number;
+ +	info->devfn = pdev->devfn;
+ +	info->dev = pdev;
+ +	info->domain = domain;
+  
+ -	ndomain = dmar_insert_dev_info(iommu, bus, devfn, &pdev->dev, domain);
+ -	if (ndomain != domain)
+ -		return -EBUSY;
+ +	spin_lock_irqsave(&device_domain_lock, flags);
+ +	list_add(&info->link, &domain->devices);
+ +	list_add(&info->global, &device_domain_list);
+ +	pdev->dev.archdata.iommu = info;
+ +	spin_unlock_irqrestore(&device_domain_lock, flags);
+  
+- 	ret = domain_context_mapping(domain, pdev, translation);
++ 	ret = domain_context_mapping(domain, &pdev->dev, translation);
+  	if (ret) {
+ -		domain_remove_one_dev_info(domain, pdev);
+ +		spin_lock_irqsave(&device_domain_lock, flags);
+ +		unlink_domain_info(info);
+ +		spin_unlock_irqrestore(&device_domain_lock, flags);
+ +		free_devinfo_mem(info);
+  		return ret;
+  	}
+  
+@@@ -4117,9 -4159,10 +4141,9 @@@ static int intel_iommu_attach_device(st
+  	struct pci_dev *pdev = to_pci_dev(dev);
+  	struct intel_iommu *iommu;
+  	int addr_width;
+ -	u8 bus, devfn;
+  
+  	/* normally pdev is not mapped */
+- 	if (unlikely(domain_context_mapped(pdev))) {
++ 	if (unlikely(domain_context_mapped(&pdev->dev))) {
+  		struct dmar_domain *old_domain;
+  
+  		old_domain = find_domain(dev);
+* Unmerged path drivers/iommu/intel-iommu.c
