@@ -1,0 +1,294 @@
+selinux: look for IPsec labels on both inbound and outbound packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Paul Moore <pmoore@redhat.com>
+commit 5b67c493248059909d7e0ff646d8475306669b27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/5b67c493.failed
+
+Previously selinux_skb_peerlbl_sid() would only check for labeled
+IPsec security labels on inbound packets, this patch enables it to
+check both inbound and outbound traffic for labeled IPsec security
+labels.
+
+	Reported-by: Janak Desai <Janak.Desai@gtri.gatech.edu>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paul Moore <pmoore@redhat.com>
+(cherry picked from commit 5b67c493248059909d7e0ff646d8475306669b27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/hooks.c
+#	security/selinux/include/xfrm.h
+#	security/selinux/xfrm.c
+diff --cc security/selinux/hooks.c
+index 3d8c70f699f3,95cb1345257d..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -3782,8 -3829,12 +3782,17 @@@ static int selinux_skb_peerlbl_sid(stru
+  	u32 nlbl_sid;
+  	u32 nlbl_type;
+  
+++<<<<<<< HEAD
+ +	selinux_skb_xfrm_sid(skb, &xfrm_sid);
+ +	selinux_netlbl_skbuff_getsid(skb, family, &nlbl_type, &nlbl_sid);
+++=======
++ 	err = selinux_xfrm_skb_sid(skb, &xfrm_sid);
++ 	if (unlikely(err))
++ 		return -EACCES;
++ 	err = selinux_netlbl_skbuff_getsid(skb, family, &nlbl_type, &nlbl_sid);
++ 	if (unlikely(err))
++ 		return -EACCES;
+++>>>>>>> 5b67c4932480 (selinux: look for IPsec labels on both inbound and outbound packets)
+  
+  	err = security_net_peersid_resolve(nlbl_sid, nlbl_type, xfrm_sid, sid);
+  	if (unlikely(err)) {
+diff --cc security/selinux/include/xfrm.h
+index 65f67cb0aefb,48c3cc94c168..000000000000
+--- a/security/selinux/include/xfrm.h
++++ b/security/selinux/include/xfrm.h
+@@@ -42,11 -34,12 +42,12 @@@ static inline int selinux_xfrm_enabled(
+  	return (atomic_read(&selinux_xfrm_refcount) > 0);
+  }
+  
+ -int selinux_xfrm_sock_rcv_skb(u32 sk_sid, struct sk_buff *skb,
+ -			      struct common_audit_data *ad);
+ -int selinux_xfrm_postroute_last(u32 sk_sid, struct sk_buff *skb,
+ -				struct common_audit_data *ad, u8 proto);
+ +int selinux_xfrm_sock_rcv_skb(u32 sid, struct sk_buff *skb,
+ +			struct common_audit_data *ad);
+ +int selinux_xfrm_postroute_last(u32 isec_sid, struct sk_buff *skb,
+ +			struct common_audit_data *ad, u8 proto);
+  int selinux_xfrm_decode_session(struct sk_buff *skb, u32 *sid, int ckall);
++ int selinux_xfrm_skb_sid(struct sk_buff *skb, u32 *sid);
+  
+  static inline void selinux_xfrm_notify_policyload(void)
+  {
+@@@ -80,12 -80,12 +81,21 @@@ static inline int selinux_xfrm_decode_s
+  static inline void selinux_xfrm_notify_policyload(void)
+  {
+  }
++ 
++ static inline int selinux_xfrm_skb_sid(struct sk_buff *skb, u32 *sid)
++ {
++ 	*sid = SECSID_NULL;
++ 	return 0;
++ }
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline void selinux_skb_xfrm_sid(struct sk_buff *skb, u32 *sid)
+ +{
+ +	int err = selinux_xfrm_decode_session(skb, sid, 0);
+ +	BUG_ON(err);
+ +}
+ +
+++=======
+++>>>>>>> 5b67c4932480 (selinux: look for IPsec labels on both inbound and outbound packets)
+  #endif /* _SELINUX_XFRM_H_ */
+diff --cc security/selinux/xfrm.c
+index d03081886214,0462cb3ff0a7..000000000000
+--- a/security/selinux/xfrm.c
++++ b/security/selinux/xfrm.c
+@@@ -138,39 -201,38 +138,62 @@@ int selinux_xfrm_state_pol_flow_match(s
+  	if (fl->flowi_secid != state_sid)
+  		return 0;
+  
+ -	/* We don't need a separate SA Vs. policy polmatch check since the SA
+ -	 * is now of the same label as the flow and a flow Vs. policy polmatch
+ -	 * check had already happened in selinux_xfrm_policy_lookup() above. */
+ -	return (avc_has_perm(fl->flowi_secid, state_sid,
+ -			    SECCLASS_ASSOCIATION, ASSOCIATION__SENDTO,
+ -			    NULL) ? 0 : 1);
+ +	rc = avc_has_perm(fl->flowi_secid, state_sid, SECCLASS_ASSOCIATION,
+ +			  ASSOCIATION__SENDTO,
+ +			  NULL)? 0:1;
+ +
+ +	/*
+ +	 * We don't need a separate SA Vs. policy polmatch check
+ +	 * since the SA is now of the same label as the flow and
+ +	 * a flow Vs. policy polmatch check had already happened
+ +	 * in selinux_xfrm_policy_lookup() above.
+ +	 */
+ +
+ +	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * LSM hook implementation that checks and/or returns the xfrm sid for the
+ + * incoming packet.
+ + */
+ +
+ +int selinux_xfrm_decode_session(struct sk_buff *skb, u32 *sid, int ckall)
+ +{
+ +	struct sec_path *sp;
+ +
+ +	*sid = SECSID_NULL;
+ +
+ +	if (skb == NULL)
+ +		return 0;
+ +
+ +	sp = skb->sp;
+++=======
++ static u32 selinux_xfrm_skb_sid_egress(struct sk_buff *skb)
++ {
++ 	struct dst_entry *dst = skb_dst(skb);
++ 	struct xfrm_state *x;
++ 
++ 	if (dst == NULL)
++ 		return SECSID_NULL;
++ 	x = dst->xfrm;
++ 	if (x == NULL || !selinux_authorizable_xfrm(x))
++ 		return SECSID_NULL;
++ 
++ 	return x->security->ctx_sid;
++ }
++ 
++ static int selinux_xfrm_skb_sid_ingress(struct sk_buff *skb,
++ 					u32 *sid, int ckall)
++ {
++ 	u32 sid_session = SECSID_NULL;
++ 	struct sec_path *sp = skb->sp;
++ 
+++>>>>>>> 5b67c4932480 (selinux: look for IPsec labels on both inbound and outbound packets)
+  	if (sp) {
+ -		int i;
+ +		int i, sid_set = 0;
+  
+ -		for (i = sp->len - 1; i >= 0; i--) {
+ +		for (i = sp->len-1; i >= 0; i--) {
+  			struct xfrm_state *x = sp->xvec[i];
+  			if (selinux_authorizable_xfrm(x)) {
+  				struct xfrm_sec_ctx *ctx = x->security;
+@@@ -191,98 -255,31 +214,125 @@@
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Security blob allocation for xfrm_policy and xfrm_state
+ + * CTX does not have a meaningful value on input
+ + */
+ +static int selinux_xfrm_sec_ctx_alloc(struct xfrm_sec_ctx **ctxp,
+ +	struct xfrm_user_sec_ctx *uctx, u32 sid)
+ +{
+ +	int rc = 0;
+ +	const struct task_security_struct *tsec = current_security();
+ +	struct xfrm_sec_ctx *ctx = NULL;
+ +	char *ctx_str = NULL;
+ +	u32 str_len;
+ +
+ +	BUG_ON(uctx && sid);
+ +
+ +	if (!uctx)
+ +		goto not_from_user;
+ +
+ +	if (uctx->ctx_alg != XFRM_SC_ALG_SELINUX)
+ +		return -EINVAL;
+ +
+ +	str_len = uctx->ctx_len;
+ +	if (str_len >= PAGE_SIZE)
+ +		return -ENOMEM;
+ +
+ +	*ctxp = ctx = kmalloc(sizeof(*ctx) +
+ +			      str_len + 1,
+ +			      GFP_KERNEL);
+ +
+ +	if (!ctx)
+ +		return -ENOMEM;
+ +
+ +	ctx->ctx_doi = uctx->ctx_doi;
+ +	ctx->ctx_len = str_len;
+ +	ctx->ctx_alg = uctx->ctx_alg;
+ +
+ +	memcpy(ctx->ctx_str,
+ +	       uctx+1,
+ +	       str_len);
+ +	ctx->ctx_str[str_len] = 0;
+ +	rc = security_context_to_sid(ctx->ctx_str,
+ +				     str_len,
+ +				     &ctx->ctx_sid);
+ +
+ +	if (rc)
+ +		goto out;
+ +
+ +	/*
+ +	 * Does the subject have permission to set security context?
+ +	 */
+ +	rc = avc_has_perm(tsec->sid, ctx->ctx_sid,
+ +			  SECCLASS_ASSOCIATION,
+ +			  ASSOCIATION__SETCONTEXT, NULL);
+ +	if (rc)
+ +		goto out;
+ +
+ +	return rc;
+ +
+ +not_from_user:
+ +	rc = security_sid_to_context(sid, &ctx_str, &str_len);
+ +	if (rc)
+ +		goto out;
+ +
+ +	*ctxp = ctx = kmalloc(sizeof(*ctx) +
+ +			      str_len,
+ +			      GFP_ATOMIC);
+ +
+ +	if (!ctx) {
+ +		rc = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	ctx->ctx_doi = XFRM_SC_DOI_LSM;
+ +	ctx->ctx_alg = XFRM_SC_ALG_SELINUX;
+ +	ctx->ctx_sid = sid;
+ +	ctx->ctx_len = str_len;
+ +	memcpy(ctx->ctx_str,
+ +	       ctx_str,
+ +	       str_len);
+ +
+ +	goto out2;
+ +
+ +out:
+ +	*ctxp = NULL;
+ +	kfree(ctx);
+ +out2:
+ +	kfree(ctx_str);
+++=======
++  * LSM hook implementation that checks and/or returns the xfrm sid for the
++  * incoming packet.
++  */
++ int selinux_xfrm_decode_session(struct sk_buff *skb, u32 *sid, int ckall)
++ {
++ 	if (skb == NULL) {
++ 		*sid = SECSID_NULL;
++ 		return 0;
++ 	}
++ 	return selinux_xfrm_skb_sid_ingress(skb, sid, ckall);
++ }
++ 
++ int selinux_xfrm_skb_sid(struct sk_buff *skb, u32 *sid)
++ {
++ 	int rc;
++ 
++ 	rc = selinux_xfrm_skb_sid_ingress(skb, sid, 0);
++ 	if (rc == 0 && *sid == SECSID_NULL)
++ 		*sid = selinux_xfrm_skb_sid_egress(skb);
++ 
+++>>>>>>> 5b67c4932480 (selinux: look for IPsec labels on both inbound and outbound packets)
+  	return rc;
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * LSM hook implementation that allocs and transfers uctx spec to
+ + * xfrm_policy.
+++=======
++  * LSM hook implementation that allocs and transfers uctx spec to xfrm_policy.
+++>>>>>>> 5b67c4932480 (selinux: look for IPsec labels on both inbound and outbound packets)
+   */
+  int selinux_xfrm_policy_alloc(struct xfrm_sec_ctx **ctxp,
+  			      struct xfrm_user_sec_ctx *uctx)
+* Unmerged path security/selinux/hooks.c
+* Unmerged path security/selinux/include/xfrm.h
+* Unmerged path security/selinux/xfrm.c
