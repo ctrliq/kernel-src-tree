@@ -1,0 +1,199 @@
+xprtrdma: Use ib_device pointer safely
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 89e0d11258e9a69d550fd4bfb4609e955bdd84ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/89e0d112.failed
+
+The connect worker can replace ri_id, but prevents ri_id->device
+from changing during the lifetime of a transport instance. The old
+ID is kept around until a new ID is created and the ->device is
+confirmed to be the same.
+
+Cache a copy of ri_id->device in rpcrdma_ia and in rpcrdma_rep.
+The cached copy can be used safely in code that does not serialize
+with the connect worker.
+
+Other code can use it to save an extra address generation (one
+pointer dereference instead of two).
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Reviewed-by: Doug Ledford <dledford@redhat.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 89e0d11258e9a69d550fd4bfb4609e955bdd84ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 3feab2b05f1e,ddd5b362da35..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -768,9 -766,9 +767,15 @@@ rpcrdma_ep_create(struct rpcrdma_ep *ep
+  	init_waitqueue_head(&ep->rep_connect_wait);
+  	INIT_DELAYED_WORK(&ep->rep_connect_worker, rpcrdma_connect_worker);
+  
+++<<<<<<< HEAD
+ +	cq_attr.cqe = ep->rep_attr.cap.max_send_wr + 1;
+ +	sendcq = ib_create_cq(ia->ri_id->device, rpcrdma_sendcq_upcall,
+ +				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
+++=======
++ 	sendcq = ib_create_cq(ia->ri_device, rpcrdma_sendcq_upcall,
++ 			      rpcrdma_cq_async_error_upcall, ep,
++ 			      ep->rep_attr.cap.max_send_wr + 1, 0);
+++>>>>>>> 89e0d11258e9 (xprtrdma: Use ib_device pointer safely)
+  	if (IS_ERR(sendcq)) {
+  		rc = PTR_ERR(sendcq);
+  		dprintk("RPC:       %s: failed to create send CQ: %i\n",
+@@@ -785,9 -783,9 +790,15 @@@
+  		goto out2;
+  	}
+  
+++<<<<<<< HEAD
+ +	cq_attr.cqe = ep->rep_attr.cap.max_recv_wr + 1;
+ +	recvcq = ib_create_cq(ia->ri_id->device, rpcrdma_recvcq_upcall,
+ +				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
+++=======
++ 	recvcq = ib_create_cq(ia->ri_device, rpcrdma_recvcq_upcall,
++ 			      rpcrdma_cq_async_error_upcall, ep,
++ 			      ep->rep_attr.cap.max_recv_wr + 1, 0);
+++>>>>>>> 89e0d11258e9 (xprtrdma: Use ib_device pointer safely)
+  	if (IS_ERR(recvcq)) {
+  		rc = PTR_ERR(recvcq);
+  		dprintk("RPC:       %s: failed to create recv CQ: %i\n",
+diff --git a/net/sunrpc/xprtrdma/fmr_ops.c b/net/sunrpc/xprtrdma/fmr_ops.c
+index a91ba2c8ef1e..383f11dc727a 100644
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@ -85,7 +85,7 @@ fmr_op_map(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg,
+ 	   int nsegs, bool writing)
+ {
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+-	struct ib_device *device = ia->ri_id->device;
++	struct ib_device *device = ia->ri_device;
+ 	enum dma_data_direction direction = rpcrdma_data_dir(writing);
+ 	struct rpcrdma_mr_seg *seg1 = seg;
+ 	struct rpcrdma_mw *mw = seg1->rl_mw;
+@@ -137,17 +137,13 @@ fmr_op_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg)
+ {
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ 	struct rpcrdma_mr_seg *seg1 = seg;
+-	struct ib_device *device;
+ 	int rc, nsegs = seg->mr_nsegs;
+ 	LIST_HEAD(l);
+ 
+ 	list_add(&seg1->rl_mw->r.fmr->list, &l);
+ 	rc = ib_unmap_fmr(&l);
+-	read_lock(&ia->ri_qplock);
+-	device = ia->ri_id->device;
+ 	while (seg1->mr_nsegs--)
+-		rpcrdma_unmap_one(device, seg++);
+-	read_unlock(&ia->ri_qplock);
++		rpcrdma_unmap_one(ia->ri_device, seg++);
+ 	if (rc)
+ 		goto out_err;
+ 	return nsegs;
+diff --git a/net/sunrpc/xprtrdma/frwr_ops.c b/net/sunrpc/xprtrdma/frwr_ops.c
+index 0a7b9df70133..51d09c82c8e3 100644
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -137,7 +137,7 @@ static int
+ frwr_op_init(struct rpcrdma_xprt *r_xprt)
+ {
+ 	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+-	struct ib_device *device = r_xprt->rx_ia.ri_id->device;
++	struct ib_device *device = r_xprt->rx_ia.ri_device;
+ 	unsigned int depth = r_xprt->rx_ia.ri_max_frmr_depth;
+ 	struct ib_pd *pd = r_xprt->rx_ia.ri_pd;
+ 	int i;
+@@ -178,7 +178,7 @@ frwr_op_map(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg,
+ 	    int nsegs, bool writing)
+ {
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+-	struct ib_device *device = ia->ri_id->device;
++	struct ib_device *device = ia->ri_device;
+ 	enum dma_data_direction direction = rpcrdma_data_dir(writing);
+ 	struct rpcrdma_mr_seg *seg1 = seg;
+ 	struct rpcrdma_mw *mw = seg1->rl_mw;
+@@ -263,7 +263,6 @@ frwr_op_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg)
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ 	struct ib_send_wr invalidate_wr, *bad_wr;
+ 	int rc, nsegs = seg->mr_nsegs;
+-	struct ib_device *device;
+ 
+ 	seg1->rl_mw->r.frmr.fr_state = FRMR_IS_INVALID;
+ 
+@@ -273,10 +272,9 @@ frwr_op_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg)
+ 	invalidate_wr.ex.invalidate_rkey = seg1->rl_mw->r.frmr.fr_mr->rkey;
+ 	DECR_CQCOUNT(&r_xprt->rx_ep);
+ 
+-	read_lock(&ia->ri_qplock);
+-	device = ia->ri_id->device;
+ 	while (seg1->mr_nsegs--)
+-		rpcrdma_unmap_one(device, seg++);
++		rpcrdma_unmap_one(ia->ri_device, seg++);
++	read_lock(&ia->ri_qplock);
+ 	rc = ib_post_send(ia->ri_id->qp, &invalidate_wr, &bad_wr);
+ 	read_unlock(&ia->ri_qplock);
+ 	if (rc)
+@@ -304,7 +302,7 @@ static void
+ frwr_op_reset(struct rpcrdma_xprt *r_xprt)
+ {
+ 	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+-	struct ib_device *device = r_xprt->rx_ia.ri_id->device;
++	struct ib_device *device = r_xprt->rx_ia.ri_device;
+ 	unsigned int depth = r_xprt->rx_ia.ri_max_frmr_depth;
+ 	struct ib_pd *pd = r_xprt->rx_ia.ri_pd;
+ 	struct rpcrdma_mw *r;
+diff --git a/net/sunrpc/xprtrdma/physical_ops.c b/net/sunrpc/xprtrdma/physical_ops.c
+index ba518af16787..da149e892858 100644
+--- a/net/sunrpc/xprtrdma/physical_ops.c
++++ b/net/sunrpc/xprtrdma/physical_ops.c
+@@ -50,8 +50,7 @@ physical_op_map(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg,
+ {
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ 
+-	rpcrdma_map_one(ia->ri_id->device, seg,
+-			rpcrdma_data_dir(writing));
++	rpcrdma_map_one(ia->ri_device, seg, rpcrdma_data_dir(writing));
+ 	seg->mr_rkey = ia->ri_bind_mem->rkey;
+ 	seg->mr_base = seg->mr_dma;
+ 	seg->mr_nsegs = 1;
+@@ -65,10 +64,7 @@ physical_op_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg)
+ {
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ 
+-	read_lock(&ia->ri_qplock);
+-	rpcrdma_unmap_one(ia->ri_id->device, seg);
+-	read_unlock(&ia->ri_qplock);
+-
++	rpcrdma_unmap_one(ia->ri_device, seg);
+ 	return 1;
+ }
+ 
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 230e7fe5e31a..300423dea19c 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -62,6 +62,7 @@
+ struct rpcrdma_ia {
+ 	const struct rpcrdma_memreg_ops	*ri_ops;
+ 	rwlock_t		ri_qplock;
++	struct ib_device	*ri_device;
+ 	struct rdma_cm_id 	*ri_id;
+ 	struct ib_pd		*ri_pd;
+ 	struct ib_mr		*ri_bind_mem;
+@@ -173,6 +174,7 @@ struct rpcrdma_buffer;
+ 
+ struct rpcrdma_rep {
+ 	unsigned int		rr_len;
++	struct ib_device	*rr_device;
+ 	struct rpcrdma_xprt	*rr_rxprt;
+ 	struct list_head	rr_list;
+ 	struct rpcrdma_regbuf	*rr_rdmabuf;
