@@ -1,0 +1,341 @@
+net-gre-gro: Add GRE support to the GRO stack
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [net] gre: gro: Add GRE support to the GRO stack (Thomas Graf) [1051111]
+Rebuild_FUZZ: 91.95%
+commit-author Jerry Chu <hkchu@google.com>
+commit bf5a755f5e9186406bbf50f4087100af5bd68e40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/bf5a755f.failed
+
+This patch built on top of Commit 299603e8370a93dd5d8e8d800f0dff1ce2c53d36
+("net-gro: Prepare GRO stack for the upcoming tunneling support") to add
+the support of the standard GRE (RFC1701/RFC2784/RFC2890) to the GRO
+stack. It also serves as an example for supporting other encapsulation
+protocols in the GRO stack in the future.
+
+The patch supports version 0 and all the flags (key, csum, seq#) but
+will flush any pkt with the S (seq#) flag. This is because the S flag
+is not support by GSO, and a GRO pkt may end up in the forwarding path,
+thus requiring GSO support to break it up correctly.
+
+Currently the "packet_offload" structure only contains L3 (ETH_P_IP/
+ETH_P_IPV6) GRO offload support so the encapped pkts are limited to
+IP pkts (i.e., w/o L2 hdr). But support for other protocol type can
+be easily added, so is the support for GRE variations like NVGRE.
+
+The patch also support csum offload. Specifically if the csum flag is on
+and the h/w is capable of checksumming the payload (CHECKSUM_COMPLETE),
+the code will take advantage of the csum computed by the h/w when
+validating the GRE csum.
+
+Note that commit 60769a5dcd8755715c7143b4571d5c44f01796f1 "ipv4: gre:
+add GRO capability" already introduces GRO capability to IPv4 GRE
+tunnels, using the gro_cells infrastructure. But GRO is done after
+GRE hdr has been removed (i.e., decapped). The following patch applies
+GRO when pkts first come in (before hitting the GRE tunnel code). There
+is some performance advantage for applying GRO as early as possible.
+Also this approach is transparent to other subsystem like Open vSwitch
+where GRE decap is handled outside of the IP stack hence making it
+harder for the gro_cells stuff to apply. On the other hand, some NICs
+are still not capable of hashing on the inner hdr of a GRE pkt (RSS).
+In that case the GRO processing of pkts from the same remote host will
+all happen on the same CPU and the performance may be suboptimal.
+
+I'm including some rough preliminary performance numbers below. Note
+that the performance will be highly dependent on traffic load, mix as
+usual. Moreover it also depends on NIC offload features hence the
+following is by no means a comprehesive study. Local testing and tuning
+will be needed to decide the best setting.
+
+All tests spawned 50 copies of netperf TCP_STREAM and ran for 30 secs.
+(super_netperf 50 -H 192.168.1.18 -l 30)
+
+An IP GRE tunnel with only the key flag on (e.g., ip tunnel add gre1
+mode gre local 10.246.17.18 remote 10.246.17.17 ttl 255 key 123)
+is configured.
+
+The GRO support for pkts AFTER decap are controlled through the device
+feature of the GRE device (e.g., ethtool -K gre1 gro on/off).
+
+1.1 ethtool -K gre1 gro off; ethtool -K eth0 gro off
+thruput: 9.16Gbps
+CPU utilization: 19%
+
+1.2 ethtool -K gre1 gro on; ethtool -K eth0 gro off
+thruput: 5.9Gbps
+CPU utilization: 15%
+
+1.3 ethtool -K gre1 gro off; ethtool -K eth0 gro on
+thruput: 9.26Gbps
+CPU utilization: 12-13%
+
+1.4 ethtool -K gre1 gro on; ethtool -K eth0 gro on
+thruput: 9.26Gbps
+CPU utilization: 10%
+
+The following tests were performed on a different NIC that is capable of
+csum offload. I.e., the h/w is capable of computing IP payload csum
+(CHECKSUM_COMPLETE).
+
+2.1 ethtool -K gre1 gro on (hence will use gro_cells)
+
+2.1.1 ethtool -K eth0 gro off; csum offload disabled
+thruput: 8.53Gbps
+CPU utilization: 9%
+
+2.1.2 ethtool -K eth0 gro off; csum offload enabled
+thruput: 8.97Gbps
+CPU utilization: 7-8%
+
+2.1.3 ethtool -K eth0 gro on; csum offload disabled
+thruput: 8.83Gbps
+CPU utilization: 5-6%
+
+2.1.4 ethtool -K eth0 gro on; csum offload enabled
+thruput: 8.98Gbps
+CPU utilization: 5%
+
+2.2 ethtool -K gre1 gro off
+
+2.2.1 ethtool -K eth0 gro off; csum offload disabled
+thruput: 5.93Gbps
+CPU utilization: 9%
+
+2.2.2 ethtool -K eth0 gro off; csum offload enabled
+thruput: 5.62Gbps
+CPU utilization: 8%
+
+2.2.3 ethtool -K eth0 gro on; csum offload disabled
+thruput: 7.69Gbps
+CPU utilization: 8%
+
+2.2.4 ethtool -K eth0 gro on; csum offload enabled
+thruput: 8.96Gbps
+CPU utilization: 5-6%
+
+	Signed-off-by: H.K. Jerry Chu <hkchu@google.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bf5a755f5e9186406bbf50f4087100af5bd68e40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/ipv4/af_inet.c
+#	net/ipv4/gre_offload.c
+diff --cc include/linux/netdevice.h
+index e5656da10867,a2a70cc70e7b..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -2246,28 -2398,64 +2260,50 @@@ static inline int netif_copy_real_num_q
+  }
+  
+  #define DEFAULT_MAX_NUM_RSS_QUEUES	(8)
+ -int netif_get_num_default_rss_queues(void);
+ -
+ -enum skb_free_reason {
+ -	SKB_REASON_CONSUMED,
+ -	SKB_REASON_DROPPED,
+ -};
+ -
+ -void __dev_kfree_skb_irq(struct sk_buff *skb, enum skb_free_reason reason);
+ -void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason);
+ -
+ -/*
+ - * It is not allowed to call kfree_skb() or consume_skb() from hardware
+ - * interrupt context or with hardware interrupts being disabled.
+ - * (in_irq() || irqs_disabled())
+ - *
+ - * We provide four helpers that can be used in following contexts :
+ - *
+ - * dev_kfree_skb_irq(skb) when caller drops a packet from irq context,
+ - *  replacing kfree_skb(skb)
+ - *
+ - * dev_consume_skb_irq(skb) when caller consumes a packet from irq context.
+ - *  Typically used in place of consume_skb(skb) in TX completion path
+ - *
+ - * dev_kfree_skb_any(skb) when caller doesn't know its current irq context,
+ - *  replacing kfree_skb(skb)
+ - *
+ - * dev_consume_skb_any(skb) when caller doesn't know its current irq context,
+ - *  and consumed a packet. Used in place of consume_skb(skb)
+ - */
+ -static inline void dev_kfree_skb_irq(struct sk_buff *skb)
+ -{
+ -	__dev_kfree_skb_irq(skb, SKB_REASON_DROPPED);
+ -}
+ -
+ -static inline void dev_consume_skb_irq(struct sk_buff *skb)
+ -{
+ -	__dev_kfree_skb_irq(skb, SKB_REASON_CONSUMED);
+ -}
+ -
+ +extern int netif_get_num_default_rss_queues(void);
+ +
+ +/* Use this variant when it is known for sure that it
+ + * is executing from hardware interrupt context or with hardware interrupts
+ + * disabled.
+ + */
+ +extern void dev_kfree_skb_irq(struct sk_buff *skb);
+ +
+ +/* Use this variant in places where it could be invoked
+ + * from either hardware interrupt or other context, with hardware interrupts
+ + * either disabled or enabled.
+ + */
+ +extern void dev_kfree_skb_any(struct sk_buff *skb);
+ +
+++<<<<<<< HEAD
+ +extern int		netif_rx(struct sk_buff *skb);
+ +extern int		netif_rx_ni(struct sk_buff *skb);
+ +extern int		netif_receive_skb(struct sk_buff *skb);
+ +extern gro_result_t	napi_gro_receive(struct napi_struct *napi,
+ +					 struct sk_buff *skb);
+ +extern void		napi_gro_flush(struct napi_struct *napi, bool flush_old);
+ +extern struct sk_buff *	napi_get_frags(struct napi_struct *napi);
+ +extern gro_result_t	napi_gro_frags(struct napi_struct *napi);
+++=======
++ static inline void dev_kfree_skb_any(struct sk_buff *skb)
++ {
++ 	__dev_kfree_skb_any(skb, SKB_REASON_DROPPED);
++ }
++ 
++ static inline void dev_consume_skb_any(struct sk_buff *skb)
++ {
++ 	__dev_kfree_skb_any(skb, SKB_REASON_CONSUMED);
++ }
++ 
++ int netif_rx(struct sk_buff *skb);
++ int netif_rx_ni(struct sk_buff *skb);
++ int netif_receive_skb(struct sk_buff *skb);
++ gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
++ void napi_gro_flush(struct napi_struct *napi, bool flush_old);
++ struct sk_buff *napi_get_frags(struct napi_struct *napi);
++ gro_result_t napi_gro_frags(struct napi_struct *napi);
++ struct packet_offload *gro_find_receive_by_type(__be16 type);
++ struct packet_offload *gro_find_complete_by_type(__be16 type);
+++>>>>>>> bf5a755f5e91 (net-gre-gro: Add GRE support to the GRO stack)
+  
+  static inline void napi_free_frags(struct napi_struct *napi)
+  {
+diff --cc net/ipv4/af_inet.c
+index 81c94229c055,6268a4751e64..000000000000
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@@ -1421,9 -1391,15 +1421,20 @@@ static struct sk_buff **inet_gro_receiv
+  		NAPI_GRO_CB(p)->flush |=
+  			(iph->ttl ^ iph2->ttl) |
+  			(iph->tos ^ iph2->tos) |
+++<<<<<<< HEAD
+ +			((iph->frag_off ^ iph2->frag_off) & htons(IP_DF)) |
+ +			((u16)(ntohs(iph2->id) + NAPI_GRO_CB(p)->count) ^ id);
+- 
+++=======
++ 			((iph->frag_off ^ iph2->frag_off) & htons(IP_DF));
+++>>>>>>> bf5a755f5e91 (net-gre-gro: Add GRE support to the GRO stack)
++ 
++ 		/* Save the IP ID check to be included later when we get to
++ 		 * the transport layer so only the inner most IP ID is checked.
++ 		 * This is because some GSO/TSO implementations do not
++ 		 * correctly increment the IP ID for the outer hdrs.
++ 		 */
++ 		NAPI_GRO_CB(p)->flush_id =
++ 			    ((u16)(ntohs(iph2->id) + NAPI_GRO_CB(p)->count) ^ id);
+  		NAPI_GRO_CB(p)->flush |= flush;
+  	}
+  
+* Unmerged path net/ipv4/gre_offload.c
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 98222195b36f..f0de40ae277a 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3766,6 +3766,7 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 
+ 	skb_gro_reset_offset(skb);
+ 	gro_list_prepare(napi, skb);
++	NAPI_GRO_CB(skb)->csum = skb->csum; /* Needed for CHECKSUM_COMPLETE */
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(ptype, head, list) {
+@@ -3842,6 +3843,31 @@ normal:
+ 	goto pull;
+ }
+ 
++struct packet_offload *gro_find_receive_by_type(__be16 type)
++{
++	struct list_head *offload_head = &offload_base;
++	struct packet_offload *ptype;
++
++	list_for_each_entry_rcu(ptype, offload_head, list) {
++		if (ptype->type != type || !ptype->callbacks.gro_receive)
++			continue;
++		return ptype;
++	}
++	return NULL;
++}
++
++struct packet_offload *gro_find_complete_by_type(__be16 type)
++{
++	struct list_head *offload_head = &offload_base;
++	struct packet_offload *ptype;
++
++	list_for_each_entry_rcu(ptype, offload_head, list) {
++		if (ptype->type != type || !ptype->callbacks.gro_complete)
++			continue;
++		return ptype;
++	}
++	return NULL;
++}
+ 
+ static gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
+ {
+* Unmerged path net/ipv4/af_inet.c
+* Unmerged path net/ipv4/gre_offload.c
+diff --git a/net/ipv4/tcp_offload.c b/net/ipv4/tcp_offload.c
+index c4a6e4bcbb29..9f894c9d2d76 100644
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -195,7 +195,8 @@ struct sk_buff **tcp_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+ 	goto out_check_final;
+ 
+ found:
+-	flush = NAPI_GRO_CB(p)->flush;
++	/* Include the IP ID check below from the inner most IP hdr */
++	flush = NAPI_GRO_CB(p)->flush | NAPI_GRO_CB(p)->flush_id;
+ 	flush |= (__force int)(flags & TCP_FLAG_CWR);
+ 	flush |= (__force int)((flags ^ tcp_flag_word(th2)) &
+ 		  ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
+@@ -228,7 +229,7 @@ out_check_final:
+ 		pp = head;
+ 
+ out:
+-	NAPI_GRO_CB(skb)->flush |= flush;
++	NAPI_GRO_CB(skb)->flush |= (flush != 0);
+ 
+ 	return pp;
+ }
+@@ -278,7 +279,7 @@ static struct sk_buff **tcp4_gro_receive(struct sk_buff **head, struct sk_buff *
+ 	if (NAPI_GRO_CB(skb)->flush)
+ 		goto skip_csum;
+ 
+-	wsum = skb->csum;
++	wsum = NAPI_GRO_CB(skb)->csum;
+ 
+ 	switch (skb->ip_summed) {
+ 	case CHECKSUM_NONE:
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+index 1302b42c4fed..d6068e007823 100644
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -191,7 +191,7 @@ static struct sk_buff **ipv6_gro_receive(struct sk_buff **head,
+ 	unsigned int nlen;
+ 	unsigned int hlen;
+ 	unsigned int off;
+-	int flush = 1;
++	u16 flush = 1;
+ 	int proto;
+ 	__wsum csum;
+ 
