@@ -1,0 +1,359 @@
+bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit 5e5b066535f0ee58e5de3a2db5fb56fa3cd7e3b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5e5b0665.failed
+
+The problem was introduced by the commit 1d3ee88ae0d
+(bonding: add netlink attributes to slave link dev).
+The bond_set_active_slave() and bond_set_backup_slave()
+will use rtmsg_ifinfo to send slave's states, so these
+two functions should be called in RTNL.
+
+In 802.3ad mode, acquiring RTNL for the __enable_port and
+__disable_port cases is difficult, as those calls generally
+already hold the state machine lock, and cannot unconditionally
+call rtnl_lock because either they already hold RTNL (for calls
+via bond_3ad_unbind_slave) or due to the potential for deadlock
+with bond_3ad_adapter_speed_changed, bond_3ad_adapter_duplex_changed,
+bond_3ad_link_change, or bond_3ad_update_lacp_rate.  All four of
+those are called with RTNL held, and acquire the state machine lock
+second.  The calling contexts for __enable_port and __disable_port
+already hold the state machine lock, and may or may not need RTNL.
+
+According to the Jay's opinion, I don't think it is a problem that
+the slave don't send notify message synchronously when the status
+changed, normally the state machine is running every 100 ms, send
+the notify message at the end of the state machine if the slave's
+state changed should be better.
+
+I fix the problem through these steps:
+
+1). add a new function bond_set_slave_state() which could change
+    the slave's state and call rtmsg_ifinfo() according to the input
+    parameters called notify.
+
+2). Add a new slave parameter which called should_notify, if the slave's state
+    changed and don't notify yet, the parameter will be set to 1, and then if
+    the slave's state changed again, the param will be set to 0, it indicate that
+    the slave's state has been restored, no need to notify any one.
+
+3). the __enable_port and __disable_port should not call rtmsg_ifinfo
+    in the state machine lock, any change in the state of slave could
+    set a flag in the slave, it will indicated that an rtmsg_ifinfo
+    should be called at the end of the state machine.
+
+	Cc: Jay Vosburgh <fubar@us.ibm.com>
+	Cc: Veaceslav Falico <vfalico@redhat.com>
+	Cc: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5e5b066535f0ee58e5de3a2db5fb56fa3cd7e3b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_3ad.c
+index dc508c87249d,6826e4f61060..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -2111,24 -2058,30 +2111,28 @@@ void bond_3ad_state_machine_handler(str
+  {
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    ad_work.work);
+ -	struct aggregator *aggregator;
+ -	struct list_head *iter;
+ -	struct slave *slave;
+  	struct port *port;
+++<<<<<<< HEAD
+ +	struct aggregator *aggregator;
+++=======
++ 	bool should_notify_rtnl = BOND_SLAVE_NOTIFY_LATER;
+++>>>>>>> 5e5b066535f0 (bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode)
+  
+ -	read_lock(&bond->lock);
+ -	rcu_read_lock();
+ -
+ -	/* check if there are any slaves */
+ -	if (!bond_has_slaves(bond))
+ +	if (!rtnl_trylock()) {
+ +		queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+ +		return;
+ +	}
+ +	//check if there are any slaves
+ +	if (bond->slave_cnt == 0)
+  		goto re_arm;
+  
+ -	/* check if agg_select_timer timer after initialize is timed out */
+ -	if (BOND_AD_INFO(bond).agg_select_timer &&
+ -	    !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ -		slave = bond_first_slave_rcu(bond);
+ -		port = slave ? &(SLAVE_AD_INFO(slave).port) : NULL;
+ -
+ -		/* select the active aggregator for the bond */
+ -		if (port) {
+ +	// check if agg_select_timer timer after initialize is timed out
+ +	if (BOND_AD_INFO(bond).agg_select_timer && !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ +		// select the active aggregator for the bond
+ +		if ((port = __get_first_port(bond))) {
+  			if (!port->slave) {
+ -				pr_warn("%s: Warning: bond's first port is uninitialized\n",
+ -					bond->dev->name);
+ +				pr_warning("%s: Warning: bond's first port is uninitialized\n",
+ +					   bond->dev->name);
+  				goto re_arm;
+  			}
+  
+@@@ -2166,7 -2120,25 +2170,29 @@@
+  	}
+  
+  re_arm:
+++<<<<<<< HEAD
+ +	rtnl_unlock();
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (slave->should_notify) {
++ 			should_notify_rtnl = BOND_SLAVE_NOTIFY_NOW;
++ 			break;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	read_unlock(&bond->lock);
++ 
++ 	if (should_notify_rtnl && rtnl_trylock()) {
++ 		bond_for_each_slave(bond, slave, iter) {
++ 			if (slave->should_notify) {
++ 				rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0,
++ 					     GFP_KERNEL);
++ 				slave->should_notify = 0;
++ 			}
++ 		}
++ 		rtnl_unlock();
++ 	}
+++>>>>>>> 5e5b066535f0 (bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode)
+  	queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+  }
+  
+diff --cc drivers/net/bonding/bond_main.c
+index a013179836f0,e02029bbf5cc..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1067,11 -829,13 +1067,13 @@@ void bond_change_active_slave(struct bo
+  	if (bond_is_lb(bond)) {
+  		bond_alb_handle_active_change(bond, new_active);
+  		if (old_active)
+- 			bond_set_slave_inactive_flags(old_active);
++ 			bond_set_slave_inactive_flags(old_active,
++ 						      BOND_SLAVE_NOTIFY_NOW);
+  		if (new_active)
+- 			bond_set_slave_active_flags(new_active);
++ 			bond_set_slave_active_flags(new_active,
++ 						    BOND_SLAVE_NOTIFY_NOW);
+  	} else {
+ -		rcu_assign_pointer(bond->curr_active_slave, new_active);
+ +		bond->curr_active_slave = new_active;
+  	}
+  
+  	if (bond->params.mode == BOND_MODE_ACTIVEBACKUP) {
+@@@ -1742,21 -1465,19 +1746,26 @@@ int bond_enslave(struct net_device *bon
+  		}
+  	}
+  
+ +	write_lock_bh(&bond->curr_slave_lock);
+ +
+  	switch (bond->params.mode) {
+  	case BOND_MODE_ACTIVEBACKUP:
+++<<<<<<< HEAD
+ +		bond_set_slave_inactive_flags(new_slave);
+ +		bond_select_active_slave(bond);
+++=======
++ 		bond_set_slave_inactive_flags(new_slave,
++ 					      BOND_SLAVE_NOTIFY_NOW);
+++>>>>>>> 5e5b066535f0 (bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode)
+  		break;
+  	case BOND_MODE_8023AD:
+  		/* in 802.3ad mode, the internal mechanism
+  		 * will activate the slaves in the selected
+  		 * aggregator
+  		 */
+- 		bond_set_slave_inactive_flags(new_slave);
++ 		bond_set_slave_inactive_flags(new_slave, BOND_SLAVE_NOTIFY_NOW);
+  		/* if this is the first slave */
+ -		if (!prev_slave) {
+ +		if (bond->slave_cnt == 1) {
+  			SLAVE_AD_INFO(new_slave).id = 1;
+  			/* Initialize AD with the number of times that the AD timer is called in 1 second
+  			 * can be called only after the mac address of the bond is set
+@@@ -1772,8 -1493,7 +1781,12 @@@
+  	case BOND_MODE_TLB:
+  	case BOND_MODE_ALB:
+  		bond_set_active_slave(new_slave);
+++<<<<<<< HEAD
+ +		bond_set_slave_inactive_flags(new_slave);
+ +		bond_select_active_slave(bond);
+++=======
++ 		bond_set_slave_inactive_flags(new_slave, BOND_SLAVE_NOTIFY_NOW);
+++>>>>>>> 5e5b066535f0 (bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode)
+  		break;
+  	default:
+  		pr_debug("This slave is always active in trunk mode\n");
+@@@ -2944,25 -2652,27 +2960,29 @@@ static void bond_ab_arp_probe(struct bo
+  	 * for becoming the curr_active_slave
+  	 */
+  
+ -	if (!rtnl_trylock())
+ -		return false;
+ -	/* curr_arp_slave might have gone away */
+ -	curr_arp_slave = ACCESS_ONCE(bond->current_arp_slave);
+ -
+ -	if (!curr_arp_slave) {
+ -		curr_arp_slave = bond_first_slave(bond);
+ -		if (!curr_arp_slave) {
+ -			rtnl_unlock();
+ -			return true;
+ -		}
+ +	if (!bond->current_arp_slave) {
+ +		bond->current_arp_slave = bond->first_slave;
+ +		if (!bond->current_arp_slave)
+ +			return;
+  	}
+  
+++<<<<<<< HEAD
+ +	bond_set_slave_inactive_flags(bond->current_arp_slave);
+++=======
++ 	bond_set_slave_inactive_flags(curr_arp_slave, BOND_SLAVE_NOTIFY_NOW);
+++>>>>>>> 5e5b066535f0 (bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode)
+  
+ -	bond_for_each_slave(bond, slave, iter) {
+ -		if (!found && !before && IS_UP(slave->dev))
+ -			before = slave;
+ +	/* search for next candidate */
+ +	bond_for_each_slave_from(bond, slave, i, bond->current_arp_slave->next) {
+ +		if (IS_UP(slave->dev)) {
+ +			slave->link = BOND_LINK_BACK;
+ +			bond_set_slave_active_flags(slave);
+ +			bond_arp_send_all(bond, slave);
+ +			slave->jiffies = jiffies;
+ +			bond->current_arp_slave = slave;
+ +			break;
+ +		}
+  
+ -		if (found && !new_slave && IS_UP(slave->dev))
+ -			new_slave = slave;
+  		/* if the link state is up at this point, we
+  		 * mark it down - this can happen if we have
+  		 * simultaneous link failures and
+@@@ -2980,10 -2691,29 +3001,30 @@@
+  			pr_info("%s: backup interface %s is now down.\n",
+  				bond->dev->name, slave->dev->name);
+  		}
+ -		if (slave == curr_arp_slave)
+ -			found = true;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (!new_slave && before)
++ 		new_slave = before;
++ 
++ 	if (!new_slave) {
++ 		rtnl_unlock();
++ 		return true;
++ 	}
++ 
++ 	new_slave->link = BOND_LINK_BACK;
++ 	bond_set_slave_active_flags(new_slave, BOND_SLAVE_NOTIFY_NOW);
++ 	bond_arp_send_all(bond, new_slave);
++ 	new_slave->jiffies = jiffies;
++ 	rcu_assign_pointer(bond->current_arp_slave, new_slave);
++ 	rtnl_unlock();
++ 
++ 	return true;
+++>>>>>>> 5e5b066535f0 (bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode)
+  }
+  
+ -static void bond_activebackup_arp_mon(struct work_struct *work)
+ +void bond_activebackup_arp_mon(struct work_struct *work)
+  {
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    arp_work.work);
+@@@ -3336,14 -3050,16 +3377,16 @@@ static int bond_open(struct net_device 
+  
+  	/* reset slave->backup and slave->inactive */
+  	read_lock(&bond->lock);
+ -	if (bond_has_slaves(bond)) {
+ +	if (bond->slave_cnt > 0) {
+  		read_lock(&bond->curr_slave_lock);
+ -		bond_for_each_slave(bond, slave, iter) {
+ +		bond_for_each_slave(bond, slave, i) {
+  			if ((bond->params.mode == BOND_MODE_ACTIVEBACKUP)
+  				&& (slave != bond->curr_active_slave)) {
+- 				bond_set_slave_inactive_flags(slave);
++ 				bond_set_slave_inactive_flags(slave,
++ 							      BOND_SLAVE_NOTIFY_NOW);
+  			} else {
+- 				bond_set_slave_active_flags(slave);
++ 				bond_set_slave_active_flags(slave,
++ 							    BOND_SLAVE_NOTIFY_NOW);
+  			}
+  		}
+  		read_unlock(&bond->curr_slave_lock);
+diff --cc drivers/net/bonding/bonding.h
+index e1ca02f0b074,9b280ac8c454..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -298,7 -298,41 +299,45 @@@ static inline void bond_set_active_slav
+  
+  static inline void bond_set_backup_slave(struct slave *slave)
+  {
+++<<<<<<< HEAD
+ +	slave->backup = 1;
+++=======
++ 	if (!slave->backup) {
++ 		slave->backup = 1;
++ 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_KERNEL);
++ 	}
++ }
++ 
++ static inline void bond_set_slave_state(struct slave *slave,
++ 					int slave_state, bool notify)
++ {
++ 	if (slave->backup == slave_state)
++ 		return;
++ 
++ 	slave->backup = slave_state;
++ 	if (notify) {
++ 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_KERNEL);
++ 		slave->should_notify = 0;
++ 	} else {
++ 		if (slave->should_notify)
++ 			slave->should_notify = 0;
++ 		else
++ 			slave->should_notify = 1;
++ 	}
++ }
++ 
++ static inline void bond_slave_state_change(struct bonding *bond)
++ {
++ 	struct list_head *iter;
++ 	struct slave *tmp;
++ 
++ 	bond_for_each_slave(bond, tmp, iter) {
++ 		if (tmp->link == BOND_LINK_UP)
++ 			bond_set_active_slave(tmp);
++ 		else if (tmp->link == BOND_LINK_DOWN)
++ 			bond_set_backup_slave(tmp);
++ 	}
+++>>>>>>> 5e5b066535f0 (bonding: Fix RTNL: assertion failed at net/core/rtnetlink.c for 802.3ad mode)
+  }
+  
+  static inline int bond_slave_state(struct slave *slave)
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bonding.h
