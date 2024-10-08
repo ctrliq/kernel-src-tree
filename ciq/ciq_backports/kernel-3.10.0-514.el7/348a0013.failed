@@ -1,0 +1,176 @@
+Btrfs: fix unprotected list move from unused_bgs to deleted_bgs list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Filipe Manana <fdmanana@suse.com>
+commit 348a0013d54acec35c22958480af054b97b5e4fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/348a0013.failed
+
+As of my previous change titled "Btrfs: fix scrub preventing unused block
+groups from being deleted", the following warning at
+extent-tree.c:btrfs_delete_unused_bgs() can be hit when we mount the a
+filesysten with "-o discard":
+
+ 10263  void btrfs_delete_unused_bgs(struct btrfs_fs_info *fs_info)
+ 10264  {
+ (...)
+ 10405                  if (trimming) {
+ 10406                          WARN_ON(!list_empty(&block_group->bg_list));
+ 10407                          spin_lock(&trans->transaction->deleted_bgs_lock);
+ 10408                          list_move(&block_group->bg_list,
+ 10409                                    &trans->transaction->deleted_bgs);
+ 10410                          spin_unlock(&trans->transaction->deleted_bgs_lock);
+ 10411                          btrfs_get_block_group(block_group);
+ 10412                  }
+ (...)
+
+This happens because scrub can now add back the block group to the list of
+unused block groups (fs_info->unused_bgs). This is dangerous because we
+are moving the block group from the unused block groups list to the list
+of deleted block groups without holding the lock that protects the source
+list (fs_info->unused_bgs_lock).
+
+The following diagram illustrates how this happens:
+
+            CPU 1                                     CPU 2
+
+ cleaner_kthread()
+   btrfs_delete_unused_bgs()
+
+     sees bg X in list
+      fs_info->unused_bgs
+
+     deletes bg X from list
+      fs_info->unused_bgs
+
+                                            scrub_enumerate_chunks()
+
+                                              searches device tree using
+                                              its commit root
+
+                                              finds device extent for
+                                              block group X
+
+                                              gets block group X from the tree
+                                              fs_info->block_group_cache_tree
+                                              (via btrfs_lookup_block_group())
+
+                                              sets bg X to RO (again)
+
+                                              scrub_chunk(bg X)
+
+                                              sets bg X back to RW mode
+
+                                              adds bg X to the list
+                                              fs_info->unused_bgs again,
+                                              since it's still unused and
+                                              currently not in that list
+
+     sets bg X to RO mode
+
+     btrfs_remove_chunk(bg X)
+
+     --> discard is enabled and bg X
+         is in the fs_info->unused_bgs
+         list again so the warning is
+         triggered
+     --> we move it from that list into
+         the transaction's delete_bgs
+         list, but we can have another
+         task currently manipulating
+         the first list (fs_info->unused_bgs)
+
+Fix this by using the same lock (fs_info->unused_bgs_lock) to protect both
+the list of unused block groups and the list of deleted block groups. This
+makes it safe and there's not much worry for more lock contention, as this
+lock is seldom used and only the cleaner kthread adds elements to the list
+of deleted block groups. The warning goes away too, as this was previously
+an impossible case (and would have been better a BUG_ON/ASSERT) but it's
+not impossible anymore.
+Reproduced with fstest btrfs/073 (using MOUNT_OPTIONS="-o discard").
+
+	Signed-off-by: Filipe Manana <fdmanana@suse.com>
+(cherry picked from commit 348a0013d54acec35c22958480af054b97b5e4fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/transaction.c
+#	fs/btrfs/transaction.h
+diff --cc fs/btrfs/transaction.c
+index 8b4f4403906f,be8eae80ff65..000000000000
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@@ -256,9 -268,13 +256,13 @@@ loop
+  	INIT_LIST_HEAD(&cur_trans->pending_chunks);
+  	INIT_LIST_HEAD(&cur_trans->switch_commits);
+  	INIT_LIST_HEAD(&cur_trans->dirty_bgs);
+ -	INIT_LIST_HEAD(&cur_trans->io_bgs);
+ -	INIT_LIST_HEAD(&cur_trans->dropped_roots);
+ -	mutex_init(&cur_trans->cache_write_mutex);
+ -	cur_trans->num_dirty_bgs = 0;
+  	spin_lock_init(&cur_trans->dirty_bgs_lock);
+  	INIT_LIST_HEAD(&cur_trans->deleted_bgs);
+++<<<<<<< HEAD
+ +	spin_lock_init(&cur_trans->deleted_bgs_lock);
+++=======
++ 	spin_lock_init(&cur_trans->dropped_roots_lock);
+++>>>>>>> 348a0013d54a (Btrfs: fix unprotected list move from unused_bgs to deleted_bgs list)
+  	list_add_tail(&cur_trans->list, &fs_info->trans_list);
+  	extent_io_tree_init(&cur_trans->dirty_pages,
+  			     fs_info->btree_inode->i_mapping);
+diff --cc fs/btrfs/transaction.h
+index 12a9e4bff46e,64c8221b6165..000000000000
+--- a/fs/btrfs/transaction.h
++++ b/fs/btrfs/transaction.h
+@@@ -65,9 -66,20 +65,14 @@@ struct btrfs_transaction 
+  	struct list_head pending_chunks;
+  	struct list_head switch_commits;
+  	struct list_head dirty_bgs;
+ -	struct list_head io_bgs;
+ -	struct list_head dropped_roots;
+ -	u64 num_dirty_bgs;
+ -
+ -	/*
+ -	 * we need to make sure block group deletion doesn't race with
+ -	 * free space cache writeout.  This mutex keeps them from stomping
+ -	 * on each other
+ -	 */
+ -	struct mutex cache_write_mutex;
+  	spinlock_t dirty_bgs_lock;
++ 	/* Protected by spin lock fs_info->unused_bgs_lock. */
+  	struct list_head deleted_bgs;
+++<<<<<<< HEAD
+ +	spinlock_t deleted_bgs_lock;
+++=======
++ 	spinlock_t dropped_roots_lock;
+++>>>>>>> 348a0013d54a (Btrfs: fix unprotected list move from unused_bgs to deleted_bgs list)
+  	struct btrfs_delayed_ref_root delayed_refs;
+  	int aborted;
+  };
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 8bdf879f6872..31511cbc3dcb 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -10205,11 +10205,15 @@ void btrfs_delete_unused_bgs(struct btrfs_fs_info *fs_info)
+ 		 * until transaction commit to do the actual discard.
+ 		 */
+ 		if (trimming) {
+-			WARN_ON(!list_empty(&block_group->bg_list));
+-			spin_lock(&trans->transaction->deleted_bgs_lock);
++			spin_lock(&fs_info->unused_bgs_lock);
++			/*
++			 * A concurrent scrub might have added us to the list
++			 * fs_info->unused_bgs, so use a list_move operation
++			 * to add the block group to the deleted_bgs list.
++			 */
+ 			list_move(&block_group->bg_list,
+ 				  &trans->transaction->deleted_bgs);
+-			spin_unlock(&trans->transaction->deleted_bgs_lock);
++			spin_unlock(&fs_info->unused_bgs_lock);
+ 			btrfs_get_block_group(block_group);
+ 		}
+ end_trans:
+* Unmerged path fs/btrfs/transaction.c
+* Unmerged path fs/btrfs/transaction.h
