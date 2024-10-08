@@ -1,0 +1,79 @@
+epoll: optimize EPOLL_CTL_DEL using rcu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jason Baron <jbaron@akamai.com>
+commit ae10b2b4eb01bedc91d29d5c5bb9e416fd806c40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/ae10b2b4.failed
+
+Nathan Zimmer found that once we get over 10+ cpus, the scalability of
+SPECjbb falls over due to the contention on the global 'epmutex', which is
+taken in on EPOLL_CTL_ADD and EPOLL_CTL_DEL operations.
+
+Patch #1 removes the 'epmutex' lock completely from the EPOLL_CTL_DEL path
+by using rcu to guard against any concurrent traversals.
+
+Patch #2 remove the 'epmutex' lock from EPOLL_CTL_ADD operations for
+simple topologies.  IE when adding a link from an epoll file descriptor to
+a wakeup source, where the epoll file descriptor is not nested.
+
+This patch (of 2):
+
+Optimize EPOLL_CTL_DEL such that it does not require the 'epmutex' by
+converting the file->f_ep_links list into an rcu one.  In this way, we can
+traverse the epoll network on the add path in parallel with deletes.
+Since deletes can't create loops or worse wakeup paths, this is safe.
+
+This patch in combination with the patch "epoll: Do not take global 'epmutex'
+for simple topologies", shows a dramatic performance improvement in
+scalability for SPECjbb.
+
+	Signed-off-by: Jason Baron <jbaron@akamai.com>
+	Tested-by: Nathan Zimmer <nzimmer@sgi.com>
+	Cc: Eric Wong <normalperson@yhbt.net>
+	Cc: Nelson Elhage <nelhage@nelhage.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Davide Libenzi <davidel@xmailserver.org>
+	Cc: "Paul E. McKenney" <paulmck@us.ibm.com>
+CC: Wu Fengguang <fengguang.wu@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ae10b2b4eb01bedc91d29d5c5bb9e416fd806c40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/eventpoll.c
+diff --cc fs/eventpoll.c
+index 4ff595d6eb53,584249454822..000000000000
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@@ -1847,18 -1855,15 +1858,21 @@@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, i
+  	 * and hang them on the tfile_check_list, so we can check that we
+  	 * haven't created too many possible wakeup paths.
+  	 *
+- 	 * We need to hold the epmutex across both ep_insert and ep_remove
+- 	 * b/c we want to make sure we are looking at a coherent view of
+- 	 * epoll network.
++ 	 * We need to hold the epmutex across ep_insert to prevent
++ 	 * multple adds from creating loops in parallel.
+  	 */
+- 	if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL) {
++ 	if (op == EPOLL_CTL_ADD) {
+  		mutex_lock(&epmutex);
+  		did_lock_epmutex = 1;
+++<<<<<<< HEAD
+ +	}
+ +	if (op == EPOLL_CTL_ADD) {
+ +		if (is_file_epoll(tfile)) {
+++=======
++ 		if (is_file_epoll(tf.file)) {
+++>>>>>>> ae10b2b4eb01 (epoll: optimize EPOLL_CTL_DEL using rcu)
+  			error = -ELOOP;
+ -			if (ep_loop_check(ep, tf.file) != 0) {
+ +			if (ep_loop_check(ep, tfile) != 0) {
+  				clear_tfile_check_list();
+  				goto error_tgt_fput;
+  			}
+* Unmerged path fs/eventpoll.c
