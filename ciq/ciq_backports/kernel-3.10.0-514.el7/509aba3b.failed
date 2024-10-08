@@ -1,0 +1,148 @@
+IPv6: add the option to use anycast addresses as source addresses in echo reply
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author FX Le Bail <fx.lebail@yahoo.com>
+commit 509aba3b0d366b7f16a9a2eebac1156b25f5f622
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/509aba3b.failed
+
+This change allows to follow a recommandation of RFC4942.
+
+- Add "anycast_src_echo_reply" sysctl to control the use of anycast addresses
+  as source addresses for ICMPv6 echo reply. This sysctl is false by default
+  to preserve existing behavior.
+- Add inline check ipv6_anycast_destination().
+- Use them in icmpv6_echo_reply().
+
+Reference:
+RFC4942 - IPv6 Transition/Coexistence Security Considerations
+   (http://tools.ietf.org/html/rfc4942#section-2.1.6)
+
+2.1.6. Anycast Traffic Identification and Security
+
+   [...]
+   To avoid exposing knowledge about the internal structure of the
+   network, it is recommended that anycast servers now take advantage of
+   the ability to return responses with the anycast address as the
+   source address if possible.
+
+	Signed-off-by: Francois-Xavier Le Bail <fx.lebail@yahoo.com>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 509aba3b0d366b7f16a9a2eebac1156b25f5f622)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ip-sysctl.txt
+#	include/net/ip6_route.h
+#	include/net/netns/ipv6.h
+diff --cc Documentation/networking/ip-sysctl.txt
+index e8d824aef227,7373115407e4..000000000000
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@@ -1119,10 -1094,12 +1119,19 @@@ bindv6only - BOOLEA
+  
+  	Default: FALSE (as specified in RFC3493)
+  
+++<<<<<<< HEAD
+ +mld_qrv - INTEGER
+ +	Controls the MLD query robustness variable (see RFC3810 9.1).
+ +	Default: 2 (as specified by RFC3810 9.1)
+ +	Minimum: 1 (as specified by RFC6636 4.5)
+++=======
++ anycast_src_echo_reply - BOOLEAN
++ 	Controls the use of anycast addresses as source addresses for ICMPv6
++ 	echo reply
++ 	TRUE:  enabled
++ 	FALSE: disabled
++ 	Default: FALSE
+++>>>>>>> 509aba3b0d36 (IPv6: add the option to use anycast addresses as source addresses in echo reply)
+  
+  IPv6 Fragmentation:
+  
+diff --cc include/net/ip6_route.h
+index e5c627bfe2e7,017badb1aec7..000000000000
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@@ -179,8 -152,14 +179,19 @@@ static inline bool ipv6_unicast_destina
+  	return rt->rt6i_flags & RTF_LOCAL;
+  }
+  
+++<<<<<<< HEAD
+ +int ip6_fragment(struct sock *sk, struct sk_buff *skb,
+ +		 int (*output)(struct sock *, struct sk_buff *));
+++=======
++ static inline bool ipv6_anycast_destination(const struct sk_buff *skb)
++ {
++ 	struct rt6_info *rt = (struct rt6_info *) skb_dst(skb);
++ 
++ 	return rt->rt6i_flags & RTF_ANYCAST;
++ }
++ 
++ int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *));
+++>>>>>>> 509aba3b0d36 (IPv6: add the option to use anycast addresses as source addresses in echo reply)
+  
+  static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+  {
+diff --cc include/net/netns/ipv6.h
+index 005e2c2e39a9,76fc7d1dbfd3..000000000000
+--- a/include/net/netns/ipv6.h
++++ b/include/net/netns/ipv6.h
+@@@ -72,6 -72,8 +72,11 @@@ struct netns_ipv6 
+  #endif
+  #endif
+  	atomic_t		dev_addr_genid;
+++<<<<<<< HEAD
+++=======
++ 	atomic_t		rt_genid;
++ 	int			anycast_src_echo_reply;
+++>>>>>>> 509aba3b0d36 (IPv6: add the option to use anycast addresses as source addresses in echo reply)
+  };
+  
+  #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
+* Unmerged path Documentation/networking/ip-sysctl.txt
+* Unmerged path include/net/ip6_route.h
+* Unmerged path include/net/netns/ipv6.h
+diff --git a/net/ipv6/icmp.c b/net/ipv6/icmp.c
+index 8a66e2366f49..4376a64b63b9 100644
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@ -546,7 +546,9 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
+ 
+ 	saddr = &ipv6_hdr(skb)->daddr;
+ 
+-	if (!ipv6_unicast_destination(skb))
++	if (!ipv6_unicast_destination(skb) &&
++	    !(net->ipv6.anycast_src_echo_reply &&
++	      ipv6_anycast_destination(skb)))
+ 		saddr = NULL;
+ 
+ 	memcpy(&tmp_hdr, icmph, sizeof(tmp_hdr));
+diff --git a/net/ipv6/sysctl_net_ipv6.c b/net/ipv6/sysctl_net_ipv6.c
+index 2d528c931397..62d2de89f536 100644
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@ -26,6 +26,13 @@ static struct ctl_table ipv6_table_template[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec
+ 	},
++	{
++		.procname	= "anycast_src_echo_reply",
++		.data		= &init_net.ipv6.anycast_src_echo_reply,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec
++	},
+ 	{ }
+ };
+ 
+@@ -61,6 +68,7 @@ static int __net_init ipv6_sysctl_net_init(struct net *net)
+ 	if (!ipv6_table)
+ 		goto out;
+ 	ipv6_table[0].data = &net->ipv6.sysctl.bindv6only;
++	ipv6_table[1].data = &net->ipv6.anycast_src_echo_reply;
+ 
+ 	ipv6_route_table = ipv6_route_sysctl_init(net);
+ 	if (!ipv6_route_table)
