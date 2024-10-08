@@ -1,0 +1,221 @@
+ovs: propagate per dp max headroom to all vports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] openvswitch: propagate per dp max headroom to all vports (Jakub Sitnicki) [1322337]
+Rebuild_FUZZ: 92.31%
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 3a927bc7cf9d0fbe8f4a8189dd5f8440228f64e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3a927bc7.failed
+
+This patch implements bookkeeping support to compute the maximum
+headroom for all the devices in each datapath. When said value
+changes, the underlying devs are notified via the
+ndo_set_rx_headroom method.
+
+This also increases the internal vports xmit performance.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3a927bc7cf9d0fbe8f4a8189dd5f8440228f64e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/vport-internal_dev.c
+diff --cc net/openvswitch/vport-internal_dev.c
+index d6aef25cd7bb,83a5534abd31..000000000000
+--- a/net/openvswitch/vport-internal_dev.c
++++ b/net/openvswitch/vport-internal_dev.c
+@@@ -115,13 -106,51 +115,58 @@@ static void internal_dev_destructor(str
+  	free_netdev(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rtnl_link_stats64 *
++ internal_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
++ {
++ 	int i;
++ 
++ 	memset(stats, 0, sizeof(*stats));
++ 	stats->rx_errors  = dev->stats.rx_errors;
++ 	stats->tx_errors  = dev->stats.tx_errors;
++ 	stats->tx_dropped = dev->stats.tx_dropped;
++ 	stats->rx_dropped = dev->stats.rx_dropped;
++ 
++ 	for_each_possible_cpu(i) {
++ 		const struct pcpu_sw_netstats *percpu_stats;
++ 		struct pcpu_sw_netstats local_stats;
++ 		unsigned int start;
++ 
++ 		percpu_stats = per_cpu_ptr(dev->tstats, i);
++ 
++ 		do {
++ 			start = u64_stats_fetch_begin_irq(&percpu_stats->syncp);
++ 			local_stats = *percpu_stats;
++ 		} while (u64_stats_fetch_retry_irq(&percpu_stats->syncp, start));
++ 
++ 		stats->rx_bytes         += local_stats.rx_bytes;
++ 		stats->rx_packets       += local_stats.rx_packets;
++ 		stats->tx_bytes         += local_stats.tx_bytes;
++ 		stats->tx_packets       += local_stats.tx_packets;
++ 	}
++ 
++ 	return stats;
++ }
++ 
++ void internal_set_rx_headroom(struct net_device *dev, int new_hr)
++ {
++ 	dev->needed_headroom = new_hr;
++ }
++ 
+++>>>>>>> 3a927bc7cf9d (ovs: propagate per dp max headroom to all vports)
+  static const struct net_device_ops internal_dev_netdev_ops = {
+  	.ndo_open = internal_dev_open,
+  	.ndo_stop = internal_dev_stop,
+  	.ndo_start_xmit = internal_dev_xmit,
+  	.ndo_set_mac_address = eth_mac_addr,
+  	.ndo_change_mtu = internal_dev_change_mtu,
+++<<<<<<< HEAD
+ +	.ndo_get_stats64 = internal_dev_get_stats,
+++=======
++ 	.ndo_get_stats64 = internal_get_stats,
++ 	.ndo_set_rx_headroom = internal_set_rx_headroom,
+++>>>>>>> 3a927bc7cf9d (ovs: propagate per dp max headroom to all vports)
+  };
+  
+  static struct rtnl_link_ops internal_dev_link_ops __read_mostly = {
+@@@ -135,7 -164,8 +180,12 @@@ static void do_setup(struct net_device 
+  	netdev->netdev_ops = &internal_dev_netdev_ops;
+  
+  	netdev->priv_flags &= ~IFF_TX_SKB_SHARING;
+++<<<<<<< HEAD
+ +	netdev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+++=======
++ 	netdev->priv_flags |= IFF_LIVE_ADDR_CHANGE | IFF_OPENVSWITCH |
++ 			      IFF_PHONY_HEADROOM;
+++>>>>>>> 3a927bc7cf9d (ovs: propagate per dp max headroom to all vports)
+  	netdev->destructor = internal_dev_destructor;
+  	netdev->ethtool_ops = &internal_dev_ethtool_ops;
+  	netdev->rtnl_link_ops = &internal_dev_link_ops;
+@@@ -175,9 -201,15 +225,18 @@@ static struct vport *internal_dev_creat
+  		err = -ENOMEM;
+  		goto error_free_vport;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	vport->dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
++ 	if (!vport->dev->tstats) {
++ 		err = -ENOMEM;
++ 		goto error_free_netdev;
++ 	}
++ 	vport->dev->needed_headroom = vport->dp->max_headroom;
+++>>>>>>> 3a927bc7cf9d (ovs: propagate per dp max headroom to all vports)
+  
+ -	dev_net_set(vport->dev, ovs_dp_get_net(vport->dp));
+ -	internal_dev = internal_dev_priv(vport->dev);
+ +	dev_net_set(netdev_vport->dev, ovs_dp_get_net(vport->dp));
+ +	internal_dev = internal_dev_priv(netdev_vport->dev);
+  	internal_dev->vport = vport;
+  
+  	/* Restrict bridge port to current netns. */
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index b447e1242e90..517f432116d0 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -1878,6 +1878,29 @@ static struct vport *lookup_vport(struct net *net,
+ 		return ERR_PTR(-EINVAL);
+ }
+ 
++/* Called with ovs_mutex */
++static void update_headroom(struct datapath *dp)
++{
++	unsigned dev_headroom, max_headroom = 0;
++	struct net_device *dev;
++	struct vport *vport;
++	int i;
++
++	for (i = 0; i < DP_VPORT_HASH_BUCKETS; i++) {
++		hlist_for_each_entry_rcu(vport, &dp->ports[i], dp_hash_node) {
++			dev = vport->dev;
++			dev_headroom = netdev_get_fwd_headroom(dev);
++			if (dev_headroom > max_headroom)
++				max_headroom = dev_headroom;
++		}
++	}
++
++	dp->max_headroom = max_headroom;
++	for (i = 0; i < DP_VPORT_HASH_BUCKETS; i++)
++		hlist_for_each_entry_rcu(vport, &dp->ports[i], dp_hash_node)
++			netdev_set_rx_headroom(vport->dev, max_headroom);
++}
++
+ static int ovs_vport_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct nlattr **a = info->attrs;
+@@ -1943,6 +1966,12 @@ restart:
+ 
+ 	err = ovs_vport_cmd_fill_info(vport, reply, info->snd_portid,
+ 				      info->snd_seq, 0, OVS_VPORT_CMD_NEW);
++
++	if (netdev_get_fwd_headroom(vport->dev) > dp->max_headroom)
++		update_headroom(dp);
++	else
++		netdev_set_rx_headroom(vport->dev, dp->max_headroom);
++
+ 	BUG_ON(err < 0);
+ 	ovs_unlock();
+ 
+@@ -2009,8 +2038,10 @@ exit_unlock_free:
+ 
+ static int ovs_vport_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ {
++	bool must_update_headroom = false;
+ 	struct nlattr **a = info->attrs;
+ 	struct sk_buff *reply;
++	struct datapath *dp;
+ 	struct vport *vport;
+ 	int err;
+ 
+@@ -2032,7 +2063,16 @@ static int ovs_vport_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	err = ovs_vport_cmd_fill_info(vport, reply, info->snd_portid,
+ 				      info->snd_seq, 0, OVS_VPORT_CMD_DEL);
+ 	BUG_ON(err < 0);
++
++	/* the vport deletion may trigger dp headroom update */
++	dp = vport->dp;
++	if (netdev_get_fwd_headroom(vport->dev) == dp->max_headroom)
++		must_update_headroom = true;
++	netdev_reset_rx_headroom(vport->dev);
+ 	ovs_dp_detach_port(vport);
++
++	if (must_update_headroom)
++		update_headroom(dp);
+ 	ovs_unlock();
+ 
+ 	ovs_notify(&dp_vport_genl_family, reply, info);
+diff --git a/net/openvswitch/datapath.h b/net/openvswitch/datapath.h
+index 487a85f7d967..a577980867db 100644
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -68,6 +68,8 @@ struct dp_stats_percpu {
+  * ovs_mutex and RCU.
+  * @stats_percpu: Per-CPU datapath statistics.
+  * @net: Reference to net namespace.
++ * @max_headroom: the maximum headroom of all vports in this datapath; it will
++ * be used by all the internal vports in this dp.
+  *
+  * Context: See the comment on locking at the top of datapath.c for additional
+  * locking information.
+@@ -89,6 +91,8 @@ struct datapath {
+ 	possible_net_t net;
+ 
+ 	u32 user_features;
++
++	u32 max_headroom;
+ };
+ 
+ /**
+* Unmerged path net/openvswitch/vport-internal_dev.c
