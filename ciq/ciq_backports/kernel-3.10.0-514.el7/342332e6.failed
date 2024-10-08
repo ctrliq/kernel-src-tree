@@ -1,0 +1,162 @@
+mm/page_alloc.c: introduce kernelcore=mirror option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] page_alloc.c: introduce kernelcore=mirror option (Yasuaki Ishimatsu) [1270209]
+Rebuild_FUZZ: 96.97%
+commit-author Taku Izumi <izumi.taku@jp.fujitsu.com>
+commit 342332e6a925e9ed015e5465062c38d2b86ec8f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/342332e6.failed
+
+This patch extends existing "kernelcore" option and introduces
+kernelcore=mirror option.  By specifying "mirror" instead of specifying
+the amount of memory, non-mirrored (non-reliable) region will be
+arranged into ZONE_MOVABLE.
+
+[akpm@linux-foundation.org: fix build with CONFIG_HAVE_MEMBLOCK_NODE_MAP=n]
+	Signed-off-by: Taku Izumi <izumi.taku@jp.fujitsu.com>
+	Tested-by: Sudeep Holla <sudeep.holla@arm.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Xishi Qiu <qiuxishi@huawei.com>
+	Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+	Cc: Mel Gorman <mel@csn.ul.ie>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Steve Capper <steve.capper@linaro.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 342332e6a925e9ed015e5465062c38d2b86ec8f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index f60ded95bce9,b8160b9d5e72..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -4006,10 -4487,14 +4007,17 @@@ static void setup_zone_migrate_reserve(
+  void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+  		unsigned long start_pfn, enum memmap_context context)
+  {
+ -	struct vmem_altmap *altmap = to_vmem_altmap(__pfn_to_phys(start_pfn));
+ +	struct page *page;
+  	unsigned long end_pfn = start_pfn + size;
+ -	pg_data_t *pgdat = NODE_DATA(nid);
+  	unsigned long pfn;
+++<<<<<<< HEAD
+ +	struct zone *z;
+++=======
++ 	unsigned long nr_initialised = 0;
++ #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
++ 	struct memblock_region *r = NULL, *tmp;
++ #endif
+++>>>>>>> 342332e6a925 (mm/page_alloc.c: introduce kernelcore=mirror option)
+  
+  	if (highest_memmap_pfn < end_pfn - 1)
+  		highest_memmap_pfn = end_pfn - 1;
+@@@ -4026,14 -4517,45 +4034,54 @@@
+  				continue;
+  			if (!early_pfn_in_nid(pfn, nid))
+  				continue;
+++<<<<<<< HEAD
+++=======
++ 			if (!update_defer_init(pgdat, pfn, end_pfn,
++ 						&nr_initialised))
++ 				break;
++ 
++ #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
++ 			/*
++ 			 * if not mirrored_kernelcore and ZONE_MOVABLE exists,
++ 			 * range from zone_movable_pfn[nid] to end of each node
++ 			 * should be ZONE_MOVABLE not ZONE_NORMAL. skip it.
++ 			 */
++ 			if (!mirrored_kernelcore && zone_movable_pfn[nid])
++ 				if (zone == ZONE_NORMAL &&
++ 				    pfn >= zone_movable_pfn[nid])
++ 					continue;
++ 
++ 			/*
++ 			 * check given memblock attribute by firmware which
++ 			 * can affect kernel memory layout.
++ 			 * if zone==ZONE_MOVABLE but memory is mirrored,
++ 			 * it's an overlapped memmap init. skip it.
++ 			 */
++ 			if (mirrored_kernelcore && zone == ZONE_MOVABLE) {
++ 				if (!r ||
++ 				    pfn >= memblock_region_memory_end_pfn(r)) {
++ 					for_each_memblock(memory, tmp)
++ 						if (pfn < memblock_region_memory_end_pfn(tmp))
++ 							break;
++ 					r = tmp;
++ 				}
++ 				if (pfn >= memblock_region_memory_base_pfn(r) &&
++ 				    memblock_is_mirror(r)) {
++ 					/* already initialized as NORMAL */
++ 					pfn = memblock_region_memory_end_pfn(r);
++ 					continue;
++ 				}
++ 			}
++ #endif
+++>>>>>>> 342332e6a925 (mm/page_alloc.c: introduce kernelcore=mirror option)
+  		}
+ -
+ +		page = pfn_to_page(pfn);
+ +		set_page_links(page, zone, nid, pfn);
+ +		mminit_verify_page_links(page, zone, nid, pfn);
+ +		init_page_count(page);
+ +		page_mapcount_reset(page);
+ +		page_cpupid_reset_last(page);
+ +		SetPageReserved(page);
+  		/*
+  		 * Mark the block movable so that blocks are reserved for
+  		 * movable at startup. This will force kernel allocations
+@@@ -4527,10 -5055,13 +4570,11 @@@ static unsigned long __meminit zone_abs
+  {
+  	unsigned long zone_low = arch_zone_lowest_possible_pfn[zone_type];
+  	unsigned long zone_high = arch_zone_highest_possible_pfn[zone_type];
+ +	unsigned long node_start_pfn, node_end_pfn;
+  	unsigned long zone_start_pfn, zone_end_pfn;
++ 	unsigned long nr_absent;
+  
+ -	/* When hotadd a new node from cpu_up(), the node should be empty */
+ -	if (!node_start_pfn && !node_end_pfn)
+ -		return 0;
+ -
+ +	get_pfn_range_for_nid(nid, &node_start_pfn, &node_end_pfn);
+  	zone_start_pfn = clamp(node_start_pfn, zone_low, zone_high);
+  	zone_end_pfn = clamp(node_end_pfn, zone_low, zone_high);
+  
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index c4a4c989b635..04ab2eb7df6a 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1366,7 +1366,9 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 
+ 	keepinitrd	[HW,ARM]
+ 
+-	kernelcore=nn[KMG]	[KNL,X86,IA-64,PPC] This parameter
++	kernelcore=	[KNL,X86,IA-64,PPC]
++			Format: nn[KMGTPE] | "mirror"
++			This parameter
+ 			specifies the amount of memory usable by the kernel
+ 			for non-movable allocations.  The requested amount is
+ 			spread evenly throughout all nodes in the system. The
+@@ -1382,6 +1384,14 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			use the HighMem zone if it exists, and the Normal
+ 			zone if it does not.
+ 
++			Instead of specifying the amount of memory (nn[KMGTPE]),
++			you can specify "mirror" option. In case "mirror"
++			option is specified, mirrored (reliable) memory is used
++			for non-movable allocations and remaining memory is used
++			for Movable pages. nn[KMGTPE] and "mirror" are exclusive,
++			so you can NOT specify nn[KMGTPE] and "mirror" at the same
++			time.
++
+ 	kgdbdbgp=	[KGDB,HW] kgdb over EHCI usb debug port.
+ 			Format: <Controller#>[,poll interval]
+ 			The controller # is the number of the ehci usb debug
+* Unmerged path mm/page_alloc.c
