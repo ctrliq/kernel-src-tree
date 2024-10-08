@@ -1,0 +1,132 @@
+dax,ext2: replace ext2_clear_xip_target with dax_clear_blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] dax, ext2: replace ext2_clear_xip_target with dax_clear_blocks (Eric Sandeen) [1274459]
+Rebuild_FUZZ: 99.19%
+commit-author Matthew Wilcox <matthew.r.wilcox@intel.com>
+commit 289c6aedac981533331428bc933fff21ae332c9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/289c6aed.failed
+
+This is practically generic code; other filesystems will want to call it
+from other places, but there's nothing ext2-specific about it.
+
+Make it a little more generic by allowing it to take a count of the number
+of bytes to zero rather than fixing it to a single page.  Thanks to Dave
+Hansen for suggesting that I need to call cond_resched() if zeroing more
+than one page.
+
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Andreas Dilger <andreas.dilger@intel.com>
+	Cc: Boaz Harrosh <boaz@plexistor.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 289c6aedac981533331428bc933fff21ae332c9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/linux/fs.h
+diff --cc include/linux/fs.h
+index 37d4ac39152e,8084934a5676..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2706,12 -2587,12 +2706,19 @@@ extern loff_t fixed_size_llseek(struct 
+  extern int generic_file_open(struct inode * inode, struct file * filp);
+  extern int nonseekable_open(struct inode * inode, struct file * filp);
+  
+++<<<<<<< HEAD
+++=======
++ ssize_t dax_do_io(int rw, struct kiocb *, struct inode *, struct iov_iter *,
++ 		loff_t, get_block_t, dio_iodone_t, int flags);
++ int dax_clear_blocks(struct inode *, sector_t block, long size);
++ 
+++>>>>>>> 289c6aedac98 (dax,ext2: replace ext2_clear_xip_target with dax_clear_blocks)
+  #ifdef CONFIG_FS_XIP
+ +extern ssize_t xip_file_read(struct file *filp, char __user *buf, size_t len,
+ +			     loff_t *ppos);
+  extern int xip_file_mmap(struct file * file, struct vm_area_struct * vma);
+ +extern ssize_t xip_file_write(struct file *filp, const char __user *buf,
+ +			      size_t len, loff_t *ppos);
+  extern int xip_truncate_page(struct address_space *mapping, loff_t from);
+  #else
+  static inline int xip_truncate_page(struct address_space *mapping, loff_t from)
+* Unmerged path fs/dax.c
+* Unmerged path fs/dax.c
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index 115fa58bb9ae..e23ec6a0bce7 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -731,10 +731,12 @@ static int ext2_get_blocks(struct inode *inode,
+ 
+ 	if (ext2_use_xip(inode->i_sb)) {
+ 		/*
+-		 * we need to clear the block
++		 * block must be initialised before we put it in the tree
++		 * so that it's not found by another thread before it's
++		 * initialised
+ 		 */
+-		err = ext2_clear_xip_target (inode,
+-			le32_to_cpu(chain[depth-1].key));
++		err = dax_clear_blocks(inode, le32_to_cpu(chain[depth-1].key),
++						1 << inode->i_blkbits);
+ 		if (err) {
+ 			mutex_unlock(&ei->truncate_mutex);
+ 			goto cleanup;
+diff --git a/fs/ext2/xip.c b/fs/ext2/xip.c
+index c79eaf871406..93258347fb12 100644
+--- a/fs/ext2/xip.c
++++ b/fs/ext2/xip.c
+@@ -41,20 +41,6 @@ __ext2_get_block(struct inode *inode, pgoff_t pgoff, int create,
+ 	return rc;
+ }
+ 
+-int
+-ext2_clear_xip_target(struct inode *inode, sector_t block)
+-{
+-	void *kaddr;
+-	unsigned long pfn;
+-	long size;
+-
+-	size = __inode_direct_access(inode, block, &kaddr, &pfn, PAGE_SIZE);
+-	if (size < 0)
+-		return size;
+-	clear_page(kaddr);
+-	return 0;
+-}
+-
+ void ext2_xip_verify_sb(struct super_block *sb)
+ {
+ 	struct ext2_sb_info *sbi = EXT2_SB(sb);
+diff --git a/fs/ext2/xip.h b/fs/ext2/xip.h
+index 18b34d2f31b3..daaee20ed44f 100644
+--- a/fs/ext2/xip.h
++++ b/fs/ext2/xip.h
+@@ -7,8 +7,6 @@
+ 
+ #ifdef CONFIG_EXT2_FS_XIP
+ extern void ext2_xip_verify_sb (struct super_block *);
+-extern int ext2_clear_xip_target (struct inode *, sector_t);
+-
+ static inline int ext2_use_xip (struct super_block *sb)
+ {
+ 	struct ext2_sb_info *sbi = EXT2_SB(sb);
+@@ -21,6 +19,5 @@ int ext2_get_xip_mem(struct address_space *, pgoff_t, int,
+ #define mapping_is_xip(map)			0
+ #define ext2_xip_verify_sb(sb)			do { } while (0)
+ #define ext2_use_xip(sb)			0
+-#define ext2_clear_xip_target(inode, chain)	0
+ #define ext2_get_xip_mem			NULL
+ #endif
+* Unmerged path include/linux/fs.h
