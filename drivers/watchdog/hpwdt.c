@@ -354,10 +354,10 @@ static int detect_cru_service(void)
 
 asm(".text                      \n\t"
     ".align 4                   \n\t"
-    ".globl asminline_call	\n"
+    ".globl asminline_call	\n\t"
+    ".type asminline_call, @function \n\t"
     "asminline_call:            \n\t"
-    "pushq      %rbp            \n\t"
-    "movq       %rsp, %rbp      \n\t"
+    FRAME_BEGIN
     "pushq      %rax            \n\t"
     "pushq      %rbx            \n\t"
     "pushq      %rdx            \n\t"
@@ -387,7 +387,7 @@ asm(".text                      \n\t"
     "popq       %rdx            \n\t"
     "popq       %rbx            \n\t"
     "popq       %rax            \n\t"
-    "leave                      \n\t"
+    FRAME_END
     "ret                        \n\t"
     ".previous");
 
