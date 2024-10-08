@@ -1065,12 +1065,7 @@ static void blk_mq_free_rq_map(struct blk_mq_hw_ctx *hctx)
 
 static size_t order_to_size(unsigned int order)
 {
-	size_t ret = PAGE_SIZE;
-
-	while (order--)
-		ret *= 2;
-
-	return ret;
+	return (size_t)PAGE_SIZE << order;
 }
 
 static int blk_mq_init_rq_map(struct blk_mq_hw_ctx *hctx,
