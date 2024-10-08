@@ -1,0 +1,106 @@
+KVM: PPC: Book3S HV: Fix endianness of instruction obtained from HEIR register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s hv: Fix endianness of instruction obtained from HEIR register (Thomas Huth) [1226884 1227323]
+Rebuild_FUZZ: 96.69%
+commit-author Paul Mackerras <paulus@samba.org>
+commit 4a157d61b48c7cdb8d751001442a14ebac80229f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4a157d61.failed
+
+There are two ways in which a guest instruction can be obtained from
+the guest in the guest exit code in book3s_hv_rmhandlers.S.  If the
+exit was caused by a Hypervisor Emulation interrupt (i.e. an illegal
+instruction), the offending instruction is in the HEIR register
+(Hypervisor Emulation Instruction Register).  If the exit was caused
+by a load or store to an emulated MMIO device, we load the instruction
+from the guest by turning data relocation on and loading the instruction
+with an lwz instruction.
+
+Unfortunately, in the case where the guest has opposite endianness to
+the host, these two methods give results of different endianness, but
+both get put into vcpu->arch.last_inst.  The HEIR value has been loaded
+using guest endianness, whereas the lwz will load the instruction using
+host endianness.  The rest of the code that uses vcpu->arch.last_inst
+assumes it was loaded using host endianness.
+
+To fix this, we define a new vcpu field to store the HEIR value.  Then,
+in kvmppc_handle_exit_hv(), we transfer the value from this new field to
+vcpu->arch.last_inst, doing a byte-swap if the guest and host endianness
+differ.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 4a157d61b48c7cdb8d751001442a14ebac80229f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index a2df577911e2,26a5b8d4dd3c..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -1119,15 -983,13 +1119,19 @@@ END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR
+  
+  	stw	r12,VCPU_TRAP(r9)
+  
+- 	/* Save HEIR (HV emulation assist reg) in last_inst
++ 	/* Save HEIR (HV emulation assist reg) in emul_inst
+  	   if this is an HEI (HV emulation interrupt, e40) */
+  	li	r3,KVM_INST_FETCH_FAILED
+ +BEGIN_FTR_SECTION
+  	cmpwi	r12,BOOK3S_INTERRUPT_H_EMUL_ASSIST
+  	bne	11f
+  	mfspr	r3,SPRN_HEIR
+++<<<<<<< HEAD
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ +11:	stw	r3,VCPU_LAST_INST(r9)
+++=======
++ 11:	stw	r3,VCPU_HEIR(r9)
+++>>>>>>> 4a157d61b48c (KVM: PPC: Book3S HV: Fix endianness of instruction obtained from HEIR register)
+  
+  	/* these are volatile across C function calls */
+  	mfctr	r3
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 09895973b6c7..e49a5bb60984 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -684,6 +684,8 @@ struct kvm_vcpu_arch {
+ 	spinlock_t tbacct_lock;
+ 	u64 busy_stolen;
+ 	u64 busy_preempt;
++
++	u32 emul_inst;
+ #endif
+ };
+ 
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 3b59d088fb8a..2fc49cc1a91c 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -492,6 +492,7 @@ int main(void)
+ 	DEFINE(VCPU_DAR, offsetof(struct kvm_vcpu, arch.shregs.dar));
+ 	DEFINE(VCPU_VPA, offsetof(struct kvm_vcpu, arch.vpa.pinned_addr));
+ 	DEFINE(VCPU_VPA_DIRTY, offsetof(struct kvm_vcpu, arch.vpa.dirty));
++	DEFINE(VCPU_HEIR, offsetof(struct kvm_vcpu, arch.emul_inst));
+ #endif
+ #ifdef CONFIG_PPC_BOOK3S
+ 	DEFINE(VCPU_VCPUID, offsetof(struct kvm_vcpu, vcpu_id));
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index c9d09cd7cd1e..ddcac64c53ee 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -837,6 +837,10 @@ static int kvmppc_handle_exit_hv(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	 * Accordingly return to Guest or Host.
+ 	 */
+ 	case BOOK3S_INTERRUPT_H_EMUL_ASSIST:
++		if (vcpu->arch.emul_inst != KVM_INST_FETCH_FAILED)
++			vcpu->arch.last_inst = kvmppc_need_byteswap(vcpu) ?
++				swab32(vcpu->arch.emul_inst) :
++				vcpu->arch.emul_inst;
+ 		if (vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP) {
+ 			r = kvmppc_emulate_debug_inst(run, vcpu);
+ 		} else {
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
