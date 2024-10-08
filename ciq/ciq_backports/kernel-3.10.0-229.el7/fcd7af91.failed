@@ -1,0 +1,380 @@
+cpufreq: stats: handle cpufreq_unregister_driver() and suspend/resume properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] stats: handle cpufreq_unregister_driver() and suspend/resume properly (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 93.88%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit fcd7af917abba798cd954419030142e95139359f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/fcd7af91.failed
+
+There are several problems with cpufreq stats in the way it handles
+cpufreq_unregister_driver() and suspend/resume..
+
+ - We must not lose data collected so far when suspend/resume happens
+   and so stats directories must not be removed/allocated during these
+   operations, which is done currently.
+
+ - cpufreq_stat has registered notifiers with both cpufreq and hotplug.
+   It adds sysfs stats directory with a cpufreq notifier: CPUFREQ_NOTIFY
+   and removes this directory with a notifier from hotplug core.
+
+   In case cpufreq_unregister_driver() is called (on rmmod cpufreq driver),
+   stats directories per cpu aren't removed as CPUs are still online. The
+   only call cpufreq_stats gets is cpufreq_stats_update_policy_cpu() for
+   all CPUs except the last of each policy. And pointer to stat information
+   is stored in the entry for last CPU in the per-cpu cpufreq_stats_table.
+   But policy structure would be freed inside cpufreq core and so that will
+   result in memory leak inside cpufreq stats (as we are never freeing
+   memory for stats).
+
+   Now if we again insert the module cpufreq_register_driver() will be
+   called and we will again allocate stats data and put it on for first
+   CPU of every policy.  In case we only have a single CPU per policy, we
+   will return with a error from cpufreq_stats_create_table() due to this
+   code:
+
+	if (per_cpu(cpufreq_stats_table, cpu))
+		return -EBUSY;
+
+   And so probably cpufreq stats directory would not show up anymore (as
+   it was added inside last policies->kobj which doesn't exist anymore).
+   I haven't tested it, though. Also the values in stats files wouldn't
+   be refreshed as we are using the earlier stats structure.
+
+ - CPUFREQ_NOTIFY is called from cpufreq_set_policy() which is called for
+   scenarios where we don't really want cpufreq_stat_notifier_policy() to get
+   called. For example whenever we are changing anything related to a policy:
+   min/max/current freq, etc. cpufreq_set_policy() is called and so cpufreq
+   stats is notified. Where we don't do any useful stuff other than simply
+   returning with -EBUSY from cpufreq_stats_create_table(). And so this
+   isn't the right notifier that cpufreq stats..
+
+ Due to all above reasons this patch does following changes:
+ - Add new notifiers CPUFREQ_CREATE_POLICY and CPUFREQ_REMOVE_POLICY,
+   which are only called when policy is created/destroyed. They aren't
+   called for suspend/resume paths..
+ - Use these notifiers in cpufreq_stat_notifier_policy() to create/destory
+   stats sysfs entries. And so cpufreq_unregister_driver() or suspend/resume
+   shouldn't be a problem for cpufreq_stats.
+ - Return early from cpufreq_stat_cpu_callback() for suspend/resume sequence,
+   so that we don't free stats structure.
+
+	Acked-by: Nicolas Pitre <nico@linaro.org>
+	Tested-by: Nicolas Pitre <nico@linaro.org>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit fcd7af917abba798cd954419030142e95139359f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+#	include/linux/cpufreq.h
+diff --cc drivers/cpufreq/cpufreq.c
+index c8bc717e8458,1afbe52d6782..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -911,16 -897,97 +911,110 @@@ static int cpufreq_add_policy_cpu(unsig
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	INIT_LIST_HEAD(&policy->policy_list);
++ 	init_rwsem(&policy->rwsem);
++ 
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_put_kobj(struct cpufreq_policy *policy)
++ {
++ 	struct kobject *kobj;
++ 	struct completion *cmp;
++ 
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_REMOVE_POLICY, policy);
++ 
++ 	down_read(&policy->rwsem);
++ 	kobj = &policy->kobj;
++ 	cmp = &policy->kobj_unregister;
++ 	up_read(&policy->rwsem);
++ 	kobject_put(kobj);
++ 
++ 	/*
++ 	 * We need to make sure that the underlying kobj is
++ 	 * actually not referenced anymore by anybody before we
++ 	 * proceed with unloading.
++ 	 */
++ 	pr_debug("waiting for dropping of refcount\n");
++ 	wait_for_completion(cmp);
++ 	pr_debug("wait complete\n");
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
++ {
++ 	if (WARN_ON(cpu == policy->cpu))
++ 		return;
++ 
++ 	down_write(&policy->rwsem);
++ 
++ 	policy->last_cpu = policy->cpu;
++ 	policy->cpu = cpu;
++ 
++ 	up_write(&policy->rwsem);
++ 
++ 	cpufreq_frequency_table_update_policy_cpu(policy);
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_UPDATE_POLICY_CPU, policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
++ 			     bool frozen)
+++>>>>>>> fcd7af917abb (cpufreq: stats: handle cpufreq_unregister_driver() and suspend/resume properly)
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+@@@ -1066,17 -1143,28 +1160,28 @@@
+  #endif
+  
+  	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	for_each_cpu(j, policy->cpus)
+ +	for_each_cpu(j, policy->cpus) {
+  		per_cpu(cpufreq_cpu_data, j) = policy;
+++<<<<<<< HEAD
+ +		per_cpu(cpufreq_policy_cpu, j) = policy->cpu;
+++=======
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!frozen) {
++ 		ret = cpufreq_add_dev_interface(policy, dev);
++ 		if (ret)
++ 			goto err_out_unregister;
++ 		blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 				CPUFREQ_CREATE_POLICY, policy);
+++>>>>>>> fcd7af917abb (cpufreq: stats: handle cpufreq_unregister_driver() and suspend/resume properly)
+  	}
+ -
+ -	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	list_add(&policy->policy_list, &cpufreq_policy_list);
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+ -	cpufreq_init_policy(policy);
+ +	ret = cpufreq_add_dev_interface(cpu, policy, dev);
+ +	if (ret)
+ +		goto err_out_unregister;
+  
+ -	if (!frozen) {
+ -		policy->user_policy.policy = policy->policy;
+ -		policy->user_policy.governor = policy->governor;
+ -	}
+ +	cpufreq_init_policy(policy);
+  
+  	kobject_uevent(&policy->kobj, KOBJ_ADD);
+  	up_read(&cpufreq_rwsem);
+diff --cc include/linux/cpufreq.h
+index 4d87da0ff71a,bb727eb98ed5..000000000000
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@@ -296,61 -289,40 +296,82 @@@ cpufreq_verify_within_cpu_limits(struc
+  			policy->cpuinfo.max_freq);
+  }
+  
+ +
+ +struct freq_attr {
+ +	struct attribute attr;
+ +	ssize_t (*show)(struct cpufreq_policy *, char *);
+ +	ssize_t (*store)(struct cpufreq_policy *, const char *, size_t count);
+ +};
+ +
+ +#define cpufreq_freq_attr_ro(_name)		\
+ +static struct freq_attr _name =			\
+ +__ATTR(_name, 0444, show_##_name, NULL)
+ +
+ +#define cpufreq_freq_attr_ro_perm(_name, _perm)	\
+ +static struct freq_attr _name =			\
+ +__ATTR(_name, _perm, show_##_name, NULL)
+ +
+ +#define cpufreq_freq_attr_rw(_name)		\
+ +static struct freq_attr _name =			\
+ +__ATTR(_name, 0644, show_##_name, store_##_name)
+ +
+ +struct global_attr {
+ +	struct attribute attr;
+ +	ssize_t (*show)(struct kobject *kobj,
+ +			struct attribute *attr, char *buf);
+ +	ssize_t (*store)(struct kobject *a, struct attribute *b,
+ +			 const char *c, size_t count);
+ +};
+ +
+ +#define define_one_global_ro(_name)		\
+ +static struct global_attr _name =		\
+ +__ATTR(_name, 0444, show_##_name, NULL)
+ +
+ +#define define_one_global_rw(_name)		\
+ +static struct global_attr _name =		\
+ +__ATTR(_name, 0644, show_##_name, store_##_name)
+ +
+ +struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu);
+ +void cpufreq_cpu_put(struct cpufreq_policy *data);
+ +const char *cpufreq_get_current_driver(void);
+ +
+  /*********************************************************************
+ - *                     CPUFREQ NOTIFIER INTERFACE                    *
+ + *                        CPUFREQ 2.6. INTERFACE                     *
+   *********************************************************************/
+++<<<<<<< HEAD
+ +u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy);
+ +int cpufreq_get_policy(struct cpufreq_policy *policy, unsigned int cpu);
+ +int cpufreq_update_policy(unsigned int cpu);
+ +bool have_governor_per_policy(void);
+ +struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy);
+++=======
++ 
++ #define CPUFREQ_TRANSITION_NOTIFIER	(0)
++ #define CPUFREQ_POLICY_NOTIFIER		(1)
++ 
++ /* Transition notifiers */
++ #define CPUFREQ_PRECHANGE		(0)
++ #define CPUFREQ_POSTCHANGE		(1)
++ #define CPUFREQ_RESUMECHANGE		(8)
++ #define CPUFREQ_SUSPENDCHANGE		(9)
++ 
++ /* Policy Notifiers  */
++ #define CPUFREQ_ADJUST			(0)
++ #define CPUFREQ_INCOMPATIBLE		(1)
++ #define CPUFREQ_NOTIFY			(2)
++ #define CPUFREQ_START			(3)
++ #define CPUFREQ_UPDATE_POLICY_CPU	(4)
++ #define CPUFREQ_CREATE_POLICY		(5)
++ #define CPUFREQ_REMOVE_POLICY		(6)
+++>>>>>>> fcd7af917abb (cpufreq: stats: handle cpufreq_unregister_driver() and suspend/resume properly)
+  
+  #ifdef CONFIG_CPU_FREQ
+ -int cpufreq_register_notifier(struct notifier_block *nb, unsigned int list);
+ -int cpufreq_unregister_notifier(struct notifier_block *nb, unsigned int list);
+ -
+ -void cpufreq_notify_transition(struct cpufreq_policy *policy,
+ -		struct cpufreq_freqs *freqs, unsigned int state);
+ -void cpufreq_notify_post_transition(struct cpufreq_policy *policy,
+ -		struct cpufreq_freqs *freqs, int transition_failed);
+ -
+ -#else /* CONFIG_CPU_FREQ */
+ -static inline int cpufreq_register_notifier(struct notifier_block *nb,
+ -						unsigned int list)
+ +/*
+ + * query the current CPU frequency (in kHz). If zero, cpufreq couldn't detect it
+ + */
+ +unsigned int cpufreq_get(unsigned int cpu);
+ +#else
+ +static inline unsigned int cpufreq_get(unsigned int cpu)
+  {
+  	return 0;
+  }
+* Unmerged path drivers/cpufreq/cpufreq.c
+diff --git a/drivers/cpufreq/cpufreq_stats.c b/drivers/cpufreq/cpufreq_stats.c
+index ee6a6db3cbe4..f7e47644054e 100644
+--- a/drivers/cpufreq/cpufreq_stats.c
++++ b/drivers/cpufreq/cpufreq_stats.c
+@@ -277,7 +277,7 @@ static void cpufreq_stats_update_policy_cpu(struct cpufreq_policy *policy)
+ static int cpufreq_stat_notifier_policy(struct notifier_block *nb,
+ 		unsigned long val, void *data)
+ {
+-	int ret;
++	int ret = 0;
+ 	struct cpufreq_policy *policy = data;
+ 	struct cpufreq_frequency_table *table;
+ 	unsigned int cpu = policy->cpu;
+@@ -287,15 +287,21 @@ static int cpufreq_stat_notifier_policy(struct notifier_block *nb,
+ 		return 0;
+ 	}
+ 
+-	if (val != CPUFREQ_NOTIFY)
+-		return 0;
+ 	table = cpufreq_frequency_get_table(cpu);
+ 	if (!table)
+ 		return 0;
+-	ret = cpufreq_stats_create_table(policy, table);
+-	if (ret)
+-		return ret;
+-	return 0;
++
++	if (val == CPUFREQ_CREATE_POLICY)
++		ret = cpufreq_stats_create_table(policy, table);
++	else if (val == CPUFREQ_REMOVE_POLICY) {
++		/* This might already be freed by cpu hotplug notifier */
++		if (per_cpu(cpufreq_stats_table, cpu)) {
++			cpufreq_stats_free_sysfs(cpu);
++			cpufreq_stats_free_table(cpu);
++		}
++	}
++
++	return ret;
+ }
+ 
+ static int cpufreq_stat_notifier_trans(struct notifier_block *nb,
+@@ -340,6 +346,10 @@ static int cpufreq_stat_cpu_callback(struct notifier_block *nfb,
+ {
+ 	unsigned int cpu = (unsigned long)hcpu;
+ 
++	/* Don't free/allocate stats during suspend/resume */
++	if (action & CPU_TASKS_FROZEN)
++		return 0;
++
+ 	switch (action) {
+ 	case CPU_DOWN_PREPARE:
+ 	case CPU_DOWN_PREPARE_FROZEN:
+* Unmerged path include/linux/cpufreq.h
