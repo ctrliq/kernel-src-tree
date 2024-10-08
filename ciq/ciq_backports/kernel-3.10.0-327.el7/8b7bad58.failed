@@ -1,0 +1,444 @@
+perf callchain: Support handling complete branch stacks as histograms
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] callchain: Support handling complete branch stacks as histograms (Jiri Olsa) [1209607]
+Rebuild_FUZZ: 96.24%
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 8b7bad58efb7e3aaff60f7c1fa4361fb8c23181d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8b7bad58.failed
+
+Currently branch stacks can be only shown as edge histograms for
+individual branches. I never found this display particularly useful.
+
+This implements an alternative mode that creates histograms over
+complete branch traces, instead of individual branches, similar to how
+normal callgraphs are handled. This is done by putting it in front of
+the normal callgraph and then using the normal callgraph histogram
+infrastructure to unify them.
+
+This way in complex functions we can understand the control flow that
+lead to a particular sample, and may even see some control flow in the
+caller for short functions.
+
+Example (simplified, of course for such simple code this is usually not
+needed), please run this after the whole patchkit is in, as at this
+point in the patch order there is no --branch-history, that will be
+added in a patch after this one:
+
+tcall.c:
+
+volatile a = 10000, b = 100000, c;
+
+__attribute__((noinline)) f2()
+{
+	c = a / b;
+}
+
+__attribute__((noinline)) f1()
+{
+	f2();
+	f2();
+}
+main()
+{
+	int i;
+	for (i = 0; i < 1000000; i++)
+		f1();
+}
+
+% perf record -b -g ./tsrc/tcall
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.044 MB perf.data (~1923 samples) ]
+% perf report --no-children --branch-history
+...
+    54.91%  tcall.c:6  [.] f2                      tcall
+            |
+            |--65.53%-- f2 tcall.c:5
+            |          |
+            |          |--70.83%-- f1 tcall.c:11
+            |          |          f1 tcall.c:10
+            |          |          main tcall.c:18
+            |          |          main tcall.c:18
+            |          |          main tcall.c:17
+            |          |          main tcall.c:17
+            |          |          f1 tcall.c:13
+            |          |          f1 tcall.c:13
+            |          |          f2 tcall.c:7
+            |          |          f2 tcall.c:5
+            |          |          f1 tcall.c:12
+            |          |          f1 tcall.c:12
+            |          |          f2 tcall.c:7
+            |          |          f2 tcall.c:5
+            |          |          f1 tcall.c:11
+            |          |
+            |           --29.17%-- f1 tcall.c:12
+            |                     f1 tcall.c:12
+            |                     f2 tcall.c:7
+            |                     f2 tcall.c:5
+            |                     f1 tcall.c:11
+            |                     f1 tcall.c:10
+            |                     main tcall.c:18
+            |                     main tcall.c:18
+            |                     main tcall.c:17
+            |                     main tcall.c:17
+            |                     f1 tcall.c:13
+            |                     f1 tcall.c:13
+            |                     f2 tcall.c:7
+            |                     f2 tcall.c:5
+            |                     f1 tcall.c:12
+
+The default output is unchanged.
+
+This is only implemented in perf report, no change to record or anywhere
+else.
+
+This adds the basic code to report:
+
+- add a new "branch" option to the -g option parser to enable this mode
+- when the flag is set include the LBR into the callstack in machine.c.
+
+The rest of the history code is unchanged and doesn't know the
+difference between LBR entry and normal call entry.
+
+- detect overlaps with the callchain
+- remove small loop duplicates in the LBR
+
+Current limitations:
+
+- The LBR flags (mispredict etc.) are not shown in the history
+and LBR entries have no special marker.
+- It would be nice if annotate marked the LBR entries somehow
+(e.g. with arrows)
+
+v2: Various fixes.
+v3: Merge further patches into this one. Fix white space.
+v4: Improve manpage. Address review feedback.
+v5: Rename functions. Better error message without -g. Fix crash without
+    -b.
+v6: Rebase
+v7: Rebase. Use NO_ENTRY in memset.
+v8: Port to latest tip. Move add_callchain_ip to separate
+    patch. Skip initial entries in callchain. Minor cleanups.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/1415844328-4884-3-git-send-email-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 8b7bad58efb7e3aaff60f7c1fa4361fb8c23181d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/callchain.c
+#	tools/perf/util/symbol.h
+diff --cc tools/perf/util/callchain.c
+index 9ded02758124,cf524a35cc84..000000000000
+--- a/tools/perf/util/callchain.c
++++ b/tools/perf/util/callchain.c
+@@@ -109,6 -109,53 +109,56 @@@ int parse_callchain_record_opt(const ch
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int parse_callchain_mode(const char *value)
++ {
++ 	if (!strncmp(value, "graph", strlen(value))) {
++ 		callchain_param.mode = CHAIN_GRAPH_ABS;
++ 		return 0;
++ 	}
++ 	if (!strncmp(value, "flat", strlen(value))) {
++ 		callchain_param.mode = CHAIN_FLAT;
++ 		return 0;
++ 	}
++ 	if (!strncmp(value, "fractal", strlen(value))) {
++ 		callchain_param.mode = CHAIN_GRAPH_REL;
++ 		return 0;
++ 	}
++ 	return -1;
++ }
++ 
++ static int parse_callchain_order(const char *value)
++ {
++ 	if (!strncmp(value, "caller", strlen(value))) {
++ 		callchain_param.order = ORDER_CALLER;
++ 		return 0;
++ 	}
++ 	if (!strncmp(value, "callee", strlen(value))) {
++ 		callchain_param.order = ORDER_CALLEE;
++ 		return 0;
++ 	}
++ 	return -1;
++ }
++ 
++ static int parse_callchain_sort_key(const char *value)
++ {
++ 	if (!strncmp(value, "function", strlen(value))) {
++ 		callchain_param.key = CCKEY_FUNCTION;
++ 		return 0;
++ 	}
++ 	if (!strncmp(value, "address", strlen(value))) {
++ 		callchain_param.key = CCKEY_ADDRESS;
++ 		return 0;
++ 	}
++ 	if (!strncmp(value, "branch", strlen(value))) {
++ 		callchain_param.branch_callstack = 1;
++ 		return 0;
++ 	}
++ 	return -1;
++ }
++ 
+++>>>>>>> 8b7bad58efb7 (perf callchain: Support handling complete branch stacks as histograms)
+  int
+  parse_callchain_report_opt(const char *arg)
+  {
+diff --cc tools/perf/util/symbol.h
+index 3a3e893ba651,9d602e9c6f59..000000000000
+--- a/tools/perf/util/symbol.h
++++ b/tools/perf/util/symbol.h
+@@@ -101,7 -101,9 +101,13 @@@ struct symbol_conf 
+  			event_group,
+  			demangle,
+  			demangle_kernel,
+++<<<<<<< HEAD
+ +			filter_relative;
+++=======
++ 			filter_relative,
++ 			show_hist_headers,
++ 			branch_callstack;
+++>>>>>>> 8b7bad58efb7 (perf callchain: Support handling complete branch stacks as histograms)
+  	const char	*vmlinux_name,
+  			*kallsyms_name,
+  			*source_prefix,
+diff --git a/tools/perf/Documentation/perf-report.txt b/tools/perf/Documentation/perf-report.txt
+index 0927bf4e6c2a..22706beffabc 100644
+--- a/tools/perf/Documentation/perf-report.txt
++++ b/tools/perf/Documentation/perf-report.txt
+@@ -159,7 +159,7 @@ OPTIONS
+ --dump-raw-trace::
+         Dump raw trace in ASCII.
+ 
+--g [type,min[,limit],order[,key]]::
++-g [type,min[,limit],order[,key][,branch]]::
+ --call-graph::
+         Display call chains using type, min percent threshold, optional print
+ 	limit and order.
+@@ -177,6 +177,11 @@ OPTIONS
+ 	- function: compare on functions
+ 	- address: compare on individual code addresses
+ 
++	branch can be:
++	- branch: include last branch information in callgraph
++	when available. Usually more convenient to use --branch-history
++	for this.
++
+ 	Default: fractal,0.5,callee,function.
+ 
+ --children::
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 771672d9cdf8..2d162b517b83 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -631,8 +631,8 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+ 		   "regex filter to identify parent, see: '--sort parent'"),
+ 	OPT_BOOLEAN('x', "exclude-other", &symbol_conf.exclude_other,
+ 		    "Only display entries with parent-match"),
+-	OPT_CALLBACK_DEFAULT('g', "call-graph", &report, "output_type,min_percent[,print_limit],call_order",
+-		     "Display callchains using output_type (graph, flat, fractal, or none) , min percent threshold, optional print limit, callchain order, key (function or address). "
++	OPT_CALLBACK_DEFAULT('g', "call-graph", &report, "output_type,min_percent[,print_limit],call_order[,branch]",
++		     "Display callchains using output_type (graph, flat, fractal, or none) , min percent threshold, optional print limit, callchain order, key (function or address), add branches. "
+ 		     "Default: fractal,0.5,callee,function", &report_parse_callchain_opt, callchain_default_opt),
+ 	OPT_BOOLEAN(0, "children", &symbol_conf.cumulate_callchain,
+ 		    "Accumulate callchains of children and show total overhead as well"),
+* Unmerged path tools/perf/util/callchain.c
+diff --git a/tools/perf/util/callchain.h b/tools/perf/util/callchain.h
+index 9e601f2db698..46f4dce9d540 100644
+--- a/tools/perf/util/callchain.h
++++ b/tools/perf/util/callchain.h
+@@ -63,6 +63,7 @@ struct callchain_param {
+ 	sort_chain_func_t	sort;
+ 	enum chain_order	order;
+ 	enum chain_key		key;
++	bool			branch_callstack;
+ };
+ 
+ extern struct callchain_param callchain_param;
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index b75b487574c7..15dd0a9691ce 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -12,6 +12,7 @@
+ #include <stdbool.h>
+ #include <symbol/kallsyms.h>
+ #include "unwind.h"
++#include "linux/hash.h"
+ 
+ static void dsos__init(struct dsos *dsos)
+ {
+@@ -1391,7 +1392,11 @@ static int add_callchain_ip(struct thread *thread,
+ 
+ 	al.filtered = 0;
+ 	al.sym = NULL;
+-	thread__find_addr_location(thread, cpumode, MAP__FUNCTION,
++	if (cpumode == -1)
++		thread__find_cpumode_addr_location(thread, MAP__FUNCTION,
++						   ip, &al);
++	else
++		thread__find_addr_location(thread, cpumode, MAP__FUNCTION,
+ 				   ip, &al);
+ 	if (al.sym != NULL) {
+ 		if (sort__has_parent && !*parent &&
+@@ -1427,8 +1432,50 @@ struct branch_info *sample__resolve_bstack(struct perf_sample *sample,
+ 	return bi;
+ }
+ 
++#define CHASHSZ 127
++#define CHASHBITS 7
++#define NO_ENTRY 0xff
++
++#define PERF_MAX_BRANCH_DEPTH 127
++
++/* Remove loops. */
++static int remove_loops(struct branch_entry *l, int nr)
++{
++	int i, j, off;
++	unsigned char chash[CHASHSZ];
++
++	memset(chash, NO_ENTRY, sizeof(chash));
++
++	BUG_ON(PERF_MAX_BRANCH_DEPTH > 255);
++
++	for (i = 0; i < nr; i++) {
++		int h = hash_64(l[i].from, CHASHBITS) % CHASHSZ;
++
++		/* no collision handling for now */
++		if (chash[h] == NO_ENTRY) {
++			chash[h] = i;
++		} else if (l[chash[h]].from == l[i].from) {
++			bool is_loop = true;
++			/* check if it is a real loop */
++			off = 0;
++			for (j = chash[h]; j < i && i + off < nr; j++, off++)
++				if (l[j].from != l[i + off].from) {
++					is_loop = false;
++					break;
++				}
++			if (is_loop) {
++				memmove(l + i, l + i + off,
++					(nr - (i + off)) * sizeof(*l));
++				nr -= off;
++			}
++		}
++	}
++	return nr;
++}
++
+ static int thread__resolve_callchain_sample(struct thread *thread,
+ 					     struct ip_callchain *chain,
++					     struct branch_stack *branch,
+ 					     struct symbol **parent,
+ 					     struct addr_location *root_al,
+ 					     int max_stack)
+@@ -1438,22 +1485,82 @@ static int thread__resolve_callchain_sample(struct thread *thread,
+ 	int i;
+ 	int j;
+ 	int err;
+-	int skip_idx __maybe_unused;
++	int skip_idx = -1;
++	int first_call = 0;
++
++	/*
++	 * Based on DWARF debug information, some architectures skip
++	 * a callchain entry saved by the kernel.
++	 */
++	if (chain->nr < PERF_MAX_STACK_DEPTH)
++		skip_idx = arch_skip_callchain_idx(thread, chain);
+ 
+ 	callchain_cursor_reset(&callchain_cursor);
+ 
++	/*
++	 * Add branches to call stack for easier browsing. This gives
++	 * more context for a sample than just the callers.
++	 *
++	 * This uses individual histograms of paths compared to the
++	 * aggregated histograms the normal LBR mode uses.
++	 *
++	 * Limitations for now:
++	 * - No extra filters
++	 * - No annotations (should annotate somehow)
++	 */
++
++	if (branch && callchain_param.branch_callstack) {
++		int nr = min(max_stack, (int)branch->nr);
++		struct branch_entry be[nr];
++
++		if (branch->nr > PERF_MAX_BRANCH_DEPTH) {
++			pr_warning("corrupted branch chain. skipping...\n");
++			goto check_calls;
++		}
++
++		for (i = 0; i < nr; i++) {
++			if (callchain_param.order == ORDER_CALLEE) {
++				be[i] = branch->entries[i];
++				/*
++				 * Check for overlap into the callchain.
++				 * The return address is one off compared to
++				 * the branch entry. To adjust for this
++				 * assume the calling instruction is not longer
++				 * than 8 bytes.
++				 */
++				if (i == skip_idx ||
++				    chain->ips[first_call] >= PERF_CONTEXT_MAX)
++					first_call++;
++				else if (be[i].from < chain->ips[first_call] &&
++				    be[i].from >= chain->ips[first_call] - 8)
++					first_call++;
++			} else
++				be[i] = branch->entries[branch->nr - i - 1];
++		}
++
++		nr = remove_loops(be, nr);
++
++		for (i = 0; i < nr; i++) {
++			err = add_callchain_ip(thread, parent, root_al,
++					       -1, be[i].to);
++			if (!err)
++				err = add_callchain_ip(thread, parent, root_al,
++						       -1, be[i].from);
++			if (err == -EINVAL)
++				break;
++			if (err)
++				return err;
++		}
++		chain_nr -= nr;
++	}
++
++check_calls:
+ 	if (chain->nr > PERF_MAX_STACK_DEPTH) {
+ 		pr_warning("corrupted callchain. skipping...\n");
+ 		return 0;
+ 	}
+ 
+-	/*
+-	 * Based on DWARF debug information, some architectures skip
+-	 * a callchain entry saved by the kernel.
+-	 */
+-	skip_idx = arch_skip_callchain_idx(thread, chain);
+-
+-	for (i = 0; i < chain_nr; i++) {
++	for (i = first_call; i < chain_nr; i++) {
+ 		u64 ip;
+ 
+ 		if (callchain_param.order == ORDER_CALLEE)
+@@ -1517,6 +1624,7 @@ int thread__resolve_callchain(struct thread *thread,
+ 			      int max_stack)
+ {
+ 	int ret = thread__resolve_callchain_sample(thread, sample->callchain,
++						   sample->branch_stack,
+ 						   parent, root_al, max_stack);
+ 	if (ret)
+ 		return ret;
+* Unmerged path tools/perf/util/symbol.h
