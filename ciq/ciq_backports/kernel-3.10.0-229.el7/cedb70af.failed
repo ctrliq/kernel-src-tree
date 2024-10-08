@@ -1,0 +1,212 @@
+cpufreq: Split __cpufreq_remove_dev() into two parts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Split __cpufreq_remove_dev() into two parts (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 90.53%
+commit-author Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+commit cedb70afd077b00bff7379042fdbf7eef32606c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/cedb70af.failed
+
+During CPU offline, the cpufreq core invokes __cpufreq_remove_dev()
+to perform work such as stopping the cpufreq governor, clearing the
+CPU from the policy structure etc, and finally cleaning up the
+kobject.
+
+There are certain subtle issues related to the kobject cleanup, and
+it would be much easier to deal with them if we separate that part
+from the rest of the cleanup-work in the CPU offline phase. So split
+the __cpufreq_remove_dev() function into 2 parts: one that handles
+the kobject cleanup, and the other that handles the rest of the work.
+
+	Reported-by: Stephen Boyd <sboyd@codeaurora.org>
+	Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit cedb70afd077b00bff7379042fdbf7eef32606c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index f53ea50877e5,a33174e324d1..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1099,22 -1141,14 +1099,32 @@@ static int cpufreq_nominate_new_policy_
+  	return cpu_dev->id;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * __cpufreq_remove_dev - remove a CPU device
+ + *
+ + * Removes the cpufreq interface for a CPU device.
+ + * Caller should already have policy_rwsem in write mode for this CPU.
+ + * This routine frees the rwsem before returning.
+ + */
+ +static int __cpufreq_remove_dev(struct device *dev,
+ +		struct subsys_interface *sif)
+++=======
++ static int __cpufreq_remove_dev_prepare(struct device *dev,
++ 					struct subsys_interface *sif,
++ 					bool frozen)
+++>>>>>>> cedb70afd077 (cpufreq: Split __cpufreq_remove_dev() into two parts)
+  {
+  	unsigned int cpu = dev->id, cpus;
+ -	int new_cpu, ret;
+ +	int new_cpu;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	struct cpufreq_policy *data;
+ +	struct kobject *kobj;
+ +	struct completion *cmp;
+++=======
++ 	struct cpufreq_policy *policy;
+++>>>>>>> cedb70afd077 (cpufreq: Split __cpufreq_remove_dev() into two parts)
+  
+  	pr_debug("%s: unregistering CPU %u\n", __func__, cpu);
+  
+@@@ -1160,35 -1205,85 +1170,62 @@@
+  		}
+  	}
+  
++ 	return 0;
++ }
++ 
++ static int __cpufreq_remove_dev_finish(struct device *dev,
++ 				       struct subsys_interface *sif,
++ 				       bool frozen)
++ {
++ 	unsigned int cpu = dev->id, cpus;
++ 	int ret;
++ 	unsigned long flags;
++ 	struct cpufreq_policy *policy;
++ 	struct kobject *kobj;
++ 	struct completion *cmp;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy) {
++ 		pr_debug("%s: No cpu_data found\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	lock_policy_rwsem_read(cpu);
++ 	cpus = cpumask_weight(policy->cpus);
++ 	unlock_policy_rwsem_read(cpu);
++ 
+  	/* If cpu is last user of policy, free policy */
+  	if (cpus == 1) {
+ -		if (cpufreq_driver->target) {
+ -			ret = __cpufreq_governor(policy,
+ -					CPUFREQ_GOV_POLICY_EXIT);
+ -			if (ret) {
+ -				pr_err("%s: Failed to exit governor\n",
+ -						__func__);
+ -				return ret;
+ -			}
+ -		}
+ -
+ -		if (!frozen) {
+ -			lock_policy_rwsem_read(cpu);
+ -			kobj = &policy->kobj;
+ -			cmp = &policy->kobj_unregister;
+ -			unlock_policy_rwsem_read(cpu);
+ -			kobject_put(kobj);
+ -
+ -			/*
+ -			 * We need to make sure that the underlying kobj is
+ -			 * actually not referenced anymore by anybody before we
+ -			 * proceed with unloading.
+ -			 */
+ -			pr_debug("waiting for dropping of refcount\n");
+ -			wait_for_completion(cmp);
+ -			pr_debug("wait complete\n");
+ -		}
+ -
+ -		/*
+ -		 * Perform the ->exit() even during light-weight tear-down,
+ -		 * since this is a core component, and is essential for the
+ -		 * subsequent light-weight ->init() to succeed.
+ +		if (cpufreq_driver->target)
+ +			__cpufreq_governor(data, CPUFREQ_GOV_POLICY_EXIT);
+ +
+ +		lock_policy_rwsem_read(cpu);
+ +		kobj = &data->kobj;
+ +		cmp = &data->kobj_unregister;
+ +		unlock_policy_rwsem_read(cpu);
+ +		kobject_put(kobj);
+ +
+ +		/* we need to make sure that the underlying kobj is actually
+ +		 * not referenced anymore by anybody before we proceed with
+ +		 * unloading.
+  		 */
+ -		if (cpufreq_driver->exit)
+ -			cpufreq_driver->exit(policy);
+ +		pr_debug("waiting for dropping of refcount\n");
+ +		wait_for_completion(cmp);
+ +		pr_debug("wait complete\n");
+  
+ -		/* Remove policy from list of active policies */
+ -		write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -		list_del(&policy->policy_list);
+ -		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +		if (cpufreq_driver->exit)
+ +			cpufreq_driver->exit(data);
+  
+ -		if (!frozen)
+ -			cpufreq_policy_free(policy);
+ +		free_cpumask_var(data->related_cpus);
+ +		free_cpumask_var(data->cpus);
+ +		kfree(data);
+  	} else {
+  		if (cpufreq_driver->target) {
+ -			if ((ret = __cpufreq_governor(policy, CPUFREQ_GOV_START)) ||
+ -					(ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))) {
+ -				pr_err("%s: Failed to start governor\n",
+ -						__func__);
+ -				return ret;
+ -			}
+ +			__cpufreq_governor(data, CPUFREQ_GOV_START);
+ +			__cpufreq_governor(data, CPUFREQ_GOV_LIMITS);
+  		}
+  	}
+  
+@@@ -1916,19 -2028,24 +1974,24 @@@ static int cpufreq_cpu_callback(struct 
+  
+  	dev = get_cpu_device(cpu);
+  	if (dev) {
+ -
+ -		if (action & CPU_TASKS_FROZEN)
+ -			frozen = true;
+ -
+ -		switch (action & ~CPU_TASKS_FROZEN) {
+ +		switch (action) {
+  		case CPU_ONLINE:
+ -			__cpufreq_add_dev(dev, NULL, frozen);
+ +		case CPU_ONLINE_FROZEN:
+ +			cpufreq_add_dev(dev, NULL);
+  			cpufreq_update_policy(cpu);
+  			break;
+ -
+  		case CPU_DOWN_PREPARE:
+++<<<<<<< HEAD
+ +		case CPU_DOWN_PREPARE_FROZEN:
+ +			__cpufreq_remove_dev(dev, NULL);
+++=======
++ 			__cpufreq_remove_dev_prepare(dev, NULL, frozen);
++ 			__cpufreq_remove_dev_finish(dev, NULL, frozen);
+++>>>>>>> cedb70afd077 (cpufreq: Split __cpufreq_remove_dev() into two parts)
+  			break;
+ -
+  		case CPU_DOWN_FAILED:
+ -			__cpufreq_add_dev(dev, NULL, frozen);
+ +		case CPU_DOWN_FAILED_FROZEN:
+ +			cpufreq_add_dev(dev, NULL);
+  			break;
+  		}
+  	}
+* Unmerged path drivers/cpufreq/cpufreq.c
