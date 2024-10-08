@@ -1,0 +1,216 @@
+vxlan: GRO support at tunnel layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tom Herbert <tom@herbertland.com>
+commit 58ce31cca1ffe057f4744c3f671e3e84606d3d4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/58ce31cc.failed
+
+Add calls to gro_cells infrastructure to do GRO when receiving on a tunnel.
+
+Testing:
+
+Ran 200 netperf TCP_STREAM instance
+
+  - With fix (GRO enabled on VXLAN interface)
+
+    Verify GRO is happening.
+
+    9084 MBps tput
+    3.44% CPU utilization
+
+  - Without fix (GRO disabled on VXLAN interface)
+
+    Verified no GRO is happening.
+
+    9084 MBps tput
+    5.54% CPU utilization
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 58ce31cca1ffe057f4744c3f671e3e84606d3d4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+diff --cc drivers/net/vxlan.c
+index 9d79e4f0a7b6,61b457b9ec00..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1154,6 -1123,102 +1154,105 @@@ static struct vxlanhdr *vxlan_remcsum(s
+  	return vh;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
++ 		      struct vxlan_metadata *md, u32 vni,
++ 		      struct metadata_dst *tun_dst)
++ {
++ 	struct iphdr *oip = NULL;
++ 	struct ipv6hdr *oip6 = NULL;
++ 	struct vxlan_dev *vxlan;
++ 	struct pcpu_sw_netstats *stats;
++ 	union vxlan_addr saddr;
++ 	int err = 0;
++ 	union vxlan_addr *remote_ip;
++ 
++ 	/* For flow based devices, map all packets to VNI 0 */
++ 	if (vs->flags & VXLAN_F_COLLECT_METADATA)
++ 		vni = 0;
++ 
++ 	/* Is this VNI defined? */
++ 	vxlan = vxlan_vs_find_vni(vs, vni);
++ 	if (!vxlan)
++ 		goto drop;
++ 
++ 	remote_ip = &vxlan->default_dst.remote_ip;
++ 	skb_reset_mac_header(skb);
++ 	skb_scrub_packet(skb, !net_eq(vxlan->net, dev_net(vxlan->dev)));
++ 	skb->protocol = eth_type_trans(skb, vxlan->dev);
++ 	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
++ 
++ 	/* Ignore packet loops (and multicast echo) */
++ 	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
++ 		goto drop;
++ 
++ 	/* Re-examine inner Ethernet packet */
++ 	if (remote_ip->sa.sa_family == AF_INET) {
++ 		oip = ip_hdr(skb);
++ 		saddr.sin.sin_addr.s_addr = oip->saddr;
++ 		saddr.sa.sa_family = AF_INET;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else {
++ 		oip6 = ipv6_hdr(skb);
++ 		saddr.sin6.sin6_addr = oip6->saddr;
++ 		saddr.sa.sa_family = AF_INET6;
++ #endif
++ 	}
++ 
++ 	if (tun_dst) {
++ 		skb_dst_set(skb, (struct dst_entry *)tun_dst);
++ 		tun_dst = NULL;
++ 	}
++ 
++ 	if ((vxlan->flags & VXLAN_F_LEARN) &&
++ 	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
++ 		goto drop;
++ 
++ 	skb_reset_network_header(skb);
++ 	/* In flow-based mode, GBP is carried in dst_metadata */
++ 	if (!(vs->flags & VXLAN_F_COLLECT_METADATA))
++ 		skb->mark = md->gbp;
++ 
++ 	if (oip6)
++ 		err = IP6_ECN_decapsulate(oip6, skb);
++ 	if (oip)
++ 		err = IP_ECN_decapsulate(oip, skb);
++ 
++ 	if (unlikely(err)) {
++ 		if (log_ecn_error) {
++ 			if (oip6)
++ 				net_info_ratelimited("non-ECT from %pI6\n",
++ 						     &oip6->saddr);
++ 			if (oip)
++ 				net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
++ 						     &oip->saddr, oip->tos);
++ 		}
++ 		if (err > 1) {
++ 			++vxlan->dev->stats.rx_frame_errors;
++ 			++vxlan->dev->stats.rx_errors;
++ 			goto drop;
++ 		}
++ 	}
++ 
++ 	stats = this_cpu_ptr(vxlan->dev->tstats);
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->rx_packets++;
++ 	stats->rx_bytes += skb->len;
++ 	u64_stats_update_end(&stats->syncp);
++ 
++ 	gro_cells_receive(&vxlan->gro_cells, skb);
++ 
++ 	return;
++ drop:
++ 	if (tun_dst)
++ 		dst_release((struct dst_entry *)tun_dst);
++ 
++ 	/* Consume bad packet */
++ 	kfree_skb(skb);
++ }
++ 
+++>>>>>>> 58ce31cca1ff (vxlan: GRO support at tunnel layer)
+  /* Callback from net/ipv4/udp.c to receive packets */
+  static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+  {
+diff --cc include/net/vxlan.h
+index 756ff02ae639,6b3234599a2c..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -117,6 -116,58 +117,61 @@@ struct vxlan_sock 
+  	u32		  flags;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ union vxlan_addr {
++ 	struct sockaddr_in sin;
++ 	struct sockaddr_in6 sin6;
++ 	struct sockaddr sa;
++ };
++ 
++ struct vxlan_rdst {
++ 	union vxlan_addr	 remote_ip;
++ 	__be16			 remote_port;
++ 	u32			 remote_vni;
++ 	u32			 remote_ifindex;
++ 	struct list_head	 list;
++ 	struct rcu_head		 rcu;
++ };
++ 
++ struct vxlan_config {
++ 	union vxlan_addr	remote_ip;
++ 	union vxlan_addr	saddr;
++ 	u32			vni;
++ 	int			remote_ifindex;
++ 	int			mtu;
++ 	__be16			dst_port;
++ 	__u16			port_min;
++ 	__u16			port_max;
++ 	__u8			tos;
++ 	__u8			ttl;
++ 	u32			flags;
++ 	unsigned long		age_interval;
++ 	unsigned int		addrmax;
++ 	bool			no_share;
++ };
++ 
++ /* Pseudo network device */
++ struct vxlan_dev {
++ 	struct hlist_node hlist;	/* vni hash table */
++ 	struct list_head  next;		/* vxlan's per namespace list */
++ 	struct vxlan_sock *vn_sock;	/* listening socket */
++ 	struct net_device *dev;
++ 	struct net	  *net;		/* netns for packet i/o */
++ 	struct vxlan_rdst default_dst;	/* default destination */
++ 	u32		  flags;	/* VXLAN_F_* in vxlan.h */
++ 
++ 	struct timer_list age_timer;
++ 	spinlock_t	  hash_lock;
++ 	unsigned int	  addrcnt;
++ 	struct gro_cells  gro_cells;
++ 
++ 	struct vxlan_config	cfg;
++ 
++ 	struct hlist_head fdb_head[FDB_HASH_SIZE];
++ };
++ 
+++>>>>>>> 58ce31cca1ff (vxlan: GRO support at tunnel layer)
+  #define VXLAN_F_LEARN			0x01
+  #define VXLAN_F_PROXY			0x02
+  #define VXLAN_F_RSC			0x04
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
