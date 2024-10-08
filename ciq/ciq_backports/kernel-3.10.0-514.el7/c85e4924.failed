@@ -1,0 +1,231 @@
+hv_netvsc: Fix book keeping of skb during batching process
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit c85e4924452ae8225c8829f3fa8a2f7baa34bc5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c85e4924.failed
+
+Since eliminating send_completion_tid from struct hv_netvsc_packet, we
+haven't add proper book keeping for the skb of the batched packet. This
+patch fixes this issue and allows the previous skb is properly freed.
+Otherwise, a panic may happen.
+Thanks to Simon Xiao <sixiao@microsoft.com> for bisecting and analysis.
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c85e4924452ae8225c8829f3fa8a2f7baa34bc5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index cf498664d989,fcb92c0d0eb9..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -596,7 -620,47 +596,51 @@@ struct nvsp_message 
+  
+  #define VRSS_SEND_TAB_SIZE 16
+  
+++<<<<<<< HEAD
+ +/* Per netvsc channel-specific */
+++=======
++ #define RNDIS_MAX_PKT_DEFAULT 8
++ #define RNDIS_PKT_ALIGN_DEFAULT 8
++ 
++ struct multi_send_data {
++ 	struct sk_buff *skb; /* skb containing the pkt */
++ 	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++ 	u32 count; /* counter of batched packets */
++ };
++ 
++ struct netvsc_stats {
++ 	u64 packets;
++ 	u64 bytes;
++ 	struct u64_stats_sync syncp;
++ };
++ 
++ struct netvsc_reconfig {
++ 	struct list_head list;
++ 	u32 event;
++ };
++ 
++ /* The context of the netvsc device  */
++ struct net_device_context {
++ 	/* point back to our device context */
++ 	struct hv_device *device_ctx;
++ 	/* reconfigure work */
++ 	struct delayed_work dwork;
++ 	/* last reconfig time */
++ 	unsigned long last_reconfig;
++ 	/* reconfig events */
++ 	struct list_head reconfig_events;
++ 	/* list protection */
++ 	spinlock_t lock;
++ 
++ 	struct work_struct work;
++ 	u32 msg_enable; /* debug level */
++ 
++ 	struct netvsc_stats __percpu *tx_stats;
++ 	struct netvsc_stats __percpu *rx_stats;
++ };
++ 
++ /* Per netvsc device */
+++>>>>>>> c85e4924452a (hv_netvsc: Fix book keeping of skb during batching process)
+  struct netvsc_device {
+  	struct hv_device *dev;
+  
+diff --cc drivers/net/hyperv/netvsc.c
+index 74ee1b57e623,ec313fc08d82..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -817,13 -838,133 +817,143 @@@ int netvsc_send(struct hv_device *devic
+  			   packet, ret);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ret != 0) {
+ +		if (section_index != NETVSC_INVALID_INDEX)
+ +			netvsc_free_send_slot(net_device, section_index);
+ +	} else if (skb) {
+ +		dev_kfree_skb_any(skb);
+ +	}
+ +
+++=======
++ 	return ret;
++ }
++ 
++ /* Move packet out of multi send data (msd), and clear msd */
++ static inline void move_pkt_msd(struct hv_netvsc_packet **msd_send,
++ 				struct sk_buff **msd_skb,
++ 				struct multi_send_data *msdp)
++ {
++ 	*msd_skb = msdp->skb;
++ 	*msd_send = msdp->pkt;
++ 	msdp->skb = NULL;
++ 	msdp->pkt = NULL;
++ 	msdp->count = 0;
++ }
++ 
++ int netvsc_send(struct hv_device *device,
++ 		struct hv_netvsc_packet *packet,
++ 		struct rndis_message *rndis_msg,
++ 		struct hv_page_buffer **pb,
++ 		struct sk_buff *skb)
++ {
++ 	struct netvsc_device *net_device;
++ 	int ret = 0, m_ret = 0;
++ 	struct vmbus_channel *out_channel;
++ 	u16 q_idx = packet->q_idx;
++ 	u32 pktlen = packet->total_data_buflen, msd_len = 0;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	struct multi_send_data *msdp;
++ 	struct hv_netvsc_packet *msd_send = NULL, *cur_send = NULL;
++ 	struct sk_buff *msd_skb = NULL;
++ 	bool try_batch;
++ 	bool xmit_more = (skb != NULL) ? skb->xmit_more : false;
++ 
++ 	net_device = get_outbound_net_device(device);
++ 	if (!net_device)
++ 		return -ENODEV;
++ 
++ 	out_channel = net_device->chn_table[q_idx];
++ 
++ 	packet->send_buf_index = NETVSC_INVALID_INDEX;
++ 	packet->cp_partial = false;
++ 
++ 	/* Send control message directly without accessing msd (Multi-Send
++ 	 * Data) field which may be changed during data packet processing.
++ 	 */
++ 	if (!skb) {
++ 		cur_send = packet;
++ 		goto send_now;
++ 	}
++ 
++ 	msdp = &net_device->msd[q_idx];
++ 
++ 	/* batch packets in send buffer if possible */
++ 	if (msdp->pkt)
++ 		msd_len = msdp->pkt->total_data_buflen;
++ 
++ 	try_batch = (skb != NULL) && msd_len > 0 && msdp->count <
++ 		    net_device->max_pkt;
++ 
++ 	if (try_batch && msd_len + pktlen + net_device->pkt_align <
++ 	    net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 
++ 	} else if (try_batch && msd_len + packet->rmsg_size <
++ 		   net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 		packet->cp_partial = true;
++ 
++ 	} else if ((skb != NULL) && pktlen + net_device->pkt_align <
++ 		   net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 			move_pkt_msd(&msd_send, &msd_skb, msdp);
++ 			msd_len = 0;
++ 		}
++ 	}
++ 
++ 	if (section_index != NETVSC_INVALID_INDEX) {
++ 		netvsc_copy_to_send_buf(net_device,
++ 					section_index, msd_len,
++ 					packet, rndis_msg, pb, skb);
++ 
++ 		packet->send_buf_index = section_index;
++ 
++ 		if (packet->cp_partial) {
++ 			packet->page_buf_cnt -= packet->rmsg_pgcnt;
++ 			packet->total_data_buflen = msd_len + packet->rmsg_size;
++ 		} else {
++ 			packet->page_buf_cnt = 0;
++ 			packet->total_data_buflen += msd_len;
++ 		}
++ 
++ 		if (msdp->skb)
++ 			dev_kfree_skb_any(msdp->skb);
++ 
++ 		if (xmit_more && !packet->cp_partial) {
++ 			msdp->skb = skb;
++ 			msdp->pkt = packet;
++ 			msdp->count++;
++ 		} else {
++ 			cur_send = packet;
++ 			msdp->skb = NULL;
++ 			msdp->pkt = NULL;
++ 			msdp->count = 0;
++ 		}
++ 	} else {
++ 		move_pkt_msd(&msd_send, &msd_skb, msdp);
++ 		cur_send = packet;
++ 	}
++ 
++ 	if (msd_send) {
++ 		m_ret = netvsc_send_pkt(msd_send, net_device, NULL, msd_skb);
++ 
++ 		if (m_ret != 0) {
++ 			netvsc_free_send_slot(net_device,
++ 					      msd_send->send_buf_index);
++ 			dev_kfree_skb_any(msd_skb);
++ 		}
++ 	}
++ 
++ send_now:
++ 	if (cur_send)
++ 		ret = netvsc_send_pkt(cur_send, net_device, pb, skb);
++ 
++ 	if (ret != 0 && section_index != NETVSC_INVALID_INDEX)
++ 		netvsc_free_send_slot(net_device, section_index);
++ 
+++>>>>>>> c85e4924452a (hv_netvsc: Fix book keeping of skb during batching process)
+  	return ret;
+  }
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
