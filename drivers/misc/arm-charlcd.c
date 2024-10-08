@@ -372,7 +372,6 @@ static const struct dev_pm_ops charlcd_pm_ops = {
 static struct platform_driver charlcd_driver = {
 	.driver = {
 		.name = DRIVERNAME,
-		.owner = THIS_MODULE,
 		.pm = &charlcd_pm_ops,
 	},
 	.remove = __exit_p(charlcd_remove),
