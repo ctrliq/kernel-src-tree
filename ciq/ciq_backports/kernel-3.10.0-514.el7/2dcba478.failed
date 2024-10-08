@@ -1,0 +1,227 @@
+ext4: get rid of EXT4_GET_BLOCKS_NO_LOCK flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.com>
+commit 2dcba4781fa3842e28f47ab23056d58cd283fca6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2dcba478.failed
+
+When dioread_nolock mode is enabled, we grab i_data_sem in
+ext4_ext_direct_IO() and therefore we need to instruct _ext4_get_block()
+not to grab i_data_sem again using EXT4_GET_BLOCKS_NO_LOCK. However
+holding i_data_sem over overwrite direct IO isn't needed these days. We
+have exclusion against truncate / hole punching because we increase
+i_dio_count under i_mutex in ext4_ext_direct_IO() so once
+ext4_file_write_iter() verifies blocks are allocated & written, they are
+guaranteed to stay so during the whole direct IO even after we drop
+i_mutex.
+
+So we can just remove this locking abuse and the no longer necessary
+EXT4_GET_BLOCKS_NO_LOCK flag.
+
+	Signed-off-by: Jan Kara <jack@suse.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 2dcba4781fa3842e28f47ab23056d58cd283fca6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+diff --cc fs/ext4/inode.c
+index 235a73f02c8d,f100c1780e03..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -884,8 -875,94 +880,99 @@@ int do_journal_get_write_access(handle_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int ext4_get_block_write_nolock(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create);
+++=======
++ #ifdef CONFIG_EXT4_FS_ENCRYPTION
++ static int ext4_block_write_begin(struct page *page, loff_t pos, unsigned len,
++ 				  get_block_t *get_block)
++ {
++ 	unsigned from = pos & (PAGE_CACHE_SIZE - 1);
++ 	unsigned to = from + len;
++ 	struct inode *inode = page->mapping->host;
++ 	unsigned block_start, block_end;
++ 	sector_t block;
++ 	int err = 0;
++ 	unsigned blocksize = inode->i_sb->s_blocksize;
++ 	unsigned bbits;
++ 	struct buffer_head *bh, *head, *wait[2], **wait_bh = wait;
++ 	bool decrypt = false;
++ 
++ 	BUG_ON(!PageLocked(page));
++ 	BUG_ON(from > PAGE_CACHE_SIZE);
++ 	BUG_ON(to > PAGE_CACHE_SIZE);
++ 	BUG_ON(from > to);
++ 
++ 	if (!page_has_buffers(page))
++ 		create_empty_buffers(page, blocksize, 0);
++ 	head = page_buffers(page);
++ 	bbits = ilog2(blocksize);
++ 	block = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
++ 
++ 	for (bh = head, block_start = 0; bh != head || !block_start;
++ 	    block++, block_start = block_end, bh = bh->b_this_page) {
++ 		block_end = block_start + blocksize;
++ 		if (block_end <= from || block_start >= to) {
++ 			if (PageUptodate(page)) {
++ 				if (!buffer_uptodate(bh))
++ 					set_buffer_uptodate(bh);
++ 			}
++ 			continue;
++ 		}
++ 		if (buffer_new(bh))
++ 			clear_buffer_new(bh);
++ 		if (!buffer_mapped(bh)) {
++ 			WARN_ON(bh->b_size != blocksize);
++ 			err = get_block(inode, block, bh, 1);
++ 			if (err)
++ 				break;
++ 			if (buffer_new(bh)) {
++ 				unmap_underlying_metadata(bh->b_bdev,
++ 							  bh->b_blocknr);
++ 				if (PageUptodate(page)) {
++ 					clear_buffer_new(bh);
++ 					set_buffer_uptodate(bh);
++ 					mark_buffer_dirty(bh);
++ 					continue;
++ 				}
++ 				if (block_end > to || block_start < from)
++ 					zero_user_segments(page, to, block_end,
++ 							   block_start, from);
++ 				continue;
++ 			}
++ 		}
++ 		if (PageUptodate(page)) {
++ 			if (!buffer_uptodate(bh))
++ 				set_buffer_uptodate(bh);
++ 			continue;
++ 		}
++ 		if (!buffer_uptodate(bh) && !buffer_delay(bh) &&
++ 		    !buffer_unwritten(bh) &&
++ 		    (block_start < from || block_end > to)) {
++ 			ll_rw_block(READ, 1, &bh);
++ 			*wait_bh++ = bh;
++ 			decrypt = ext4_encrypted_inode(inode) &&
++ 				S_ISREG(inode->i_mode);
++ 		}
++ 	}
++ 	/*
++ 	 * If we issued read requests, let them complete.
++ 	 */
++ 	while (wait_bh > wait) {
++ 		wait_on_buffer(*--wait_bh);
++ 		if (!buffer_uptodate(*wait_bh))
++ 			err = -EIO;
++ 	}
++ 	if (unlikely(err))
++ 		page_zero_new_buffers(page, from, to);
++ 	else if (decrypt)
++ 		err = ext4_decrypt(page);
++ 	return err;
++ }
++ #endif
++ 
+++>>>>>>> 2dcba4781fa3 (ext4: get rid of EXT4_GET_BLOCKS_NO_LOCK flag)
+  static int ext4_write_begin(struct file *file, struct address_space *mapping,
+  			    loff_t pos, unsigned len, unsigned flags,
+  			    struct page **pagep, void **fsdata)
+@@@ -2924,20 -3047,37 +3011,28 @@@ int ext4_get_block_write(struct inode *
+  			       EXT4_GET_BLOCKS_IO_CREATE_EXT);
+  }
+  
+- static int ext4_get_block_write_nolock(struct inode *inode, sector_t iblock,
++ static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
+  		   struct buffer_head *bh_result, int create)
+  {
+- 	ext4_debug("ext4_get_block_write_nolock: inode %lu, create flag %d\n",
++ 	int ret;
++ 
++ 	ext4_debug("ext4_get_block_overwrite: inode %lu, create flag %d\n",
+  		   inode->i_ino, create);
+- 	return _ext4_get_block(inode, iblock, bh_result,
+- 			       EXT4_GET_BLOCKS_NO_LOCK);
++ 	ret = _ext4_get_block(inode, iblock, bh_result, 0);
++ 	/*
++ 	 * Blocks should have been preallocated! ext4_file_write_iter() checks
++ 	 * that.
++ 	 */
++ 	WARN_ON_ONCE(!buffer_mapped(bh_result));
++ 
++ 	return ret;
+  }
+  
+ -int ext4_get_block_dax(struct inode *inode, sector_t iblock,
+ -		   struct buffer_head *bh_result, int create)
+ -{
+ -	int flags = EXT4_GET_BLOCKS_PRE_IO | EXT4_GET_BLOCKS_UNWRIT_EXT;
+ -	if (create)
+ -		flags |= EXT4_GET_BLOCKS_CREATE;
+ -	ext4_debug("ext4_get_block_dax: inode %lu, create flag %d\n",
+ -		   inode->i_ino, create);
+ -	return _ext4_get_block(inode, iblock, bh_result, flags);
+ -}
+ -
+  static void ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
+ -			    ssize_t size, void *private)
+ +			    ssize_t size, void *private, int ret,
+ +			    bool is_async)
+  {
+ +	struct inode *inode = file_inode(iocb->ki_filp);
+          ext4_io_end_t *io_end = iocb->private;
+  
+  	/* if not async direct IO just return */
+@@@ -3116,13 -3241,11 +3209,11 @@@ static ssize_t ext4_ext_direct_IO(int r
+  	}
+  
+  retake_lock:
+ -	if (iov_iter_rw(iter) == WRITE)
+ -		inode_dio_end(inode);
+ +	if (rw == WRITE)
+ +		inode_dio_done(inode);
+  	/* take i_mutex locking again if we do a ovewrite dio */
+- 	if (overwrite) {
+- 		up_read(&EXT4_I(inode)->i_data_sem);
++ 	if (overwrite)
+  		mutex_lock(&inode->i_mutex);
+- 	}
+  
+  	return ret;
+  }
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 5dda1d21c88f..f8ab4f94325a 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -557,10 +557,8 @@ enum {
+ #define EXT4_GET_BLOCKS_NO_NORMALIZE		0x0040
+ 	/* Request will not result in inode size update (user for fallocate) */
+ #define EXT4_GET_BLOCKS_KEEP_SIZE		0x0080
+-	/* Do not take i_data_sem locking in ext4_map_blocks */
+-#define EXT4_GET_BLOCKS_NO_LOCK			0x0100
+ 	/* Convert written extents to unwritten */
+-#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0200
++#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0100
+ 
+ /*
+  * The bit position of these flags must not overlap with any of the
+* Unmerged path fs/ext4/inode.c
+diff --git a/include/trace/events/ext4.h b/include/trace/events/ext4.h
+index 12cd04b9714f..62e6d9d9604a 100644
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@ -51,8 +51,7 @@ struct extent_status;
+ 	{ EXT4_GET_BLOCKS_CONVERT,		"CONVERT" },		\
+ 	{ EXT4_GET_BLOCKS_METADATA_NOFAIL,	"METADATA_NOFAIL" },	\
+ 	{ EXT4_GET_BLOCKS_NO_NORMALIZE,		"NO_NORMALIZE" },	\
+-	{ EXT4_GET_BLOCKS_KEEP_SIZE,		"KEEP_SIZE" },		\
+-	{ EXT4_GET_BLOCKS_NO_LOCK,		"NO_LOCK" })
++	{ EXT4_GET_BLOCKS_KEEP_SIZE,		"KEEP_SIZE" })
+ 
+ #define show_mflags(flags) __print_flags(flags, "",	\
+ 	{ EXT4_MAP_NEW,		"N" },			\
