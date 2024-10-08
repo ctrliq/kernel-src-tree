@@ -1,0 +1,340 @@
+block: fix blk_abort_request on blk-mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [block] fix blk_abort_request on blk-mq (Jeff Moyer) [1146660]
+Rebuild_FUZZ: 89.86%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 90415837659fec54f33584b423dab250eb1e8432
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/90415837.failed
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+Moved blk_mq_rq_timed_out() definition to the private blk-mq.h header.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 90415837659fec54f33584b423dab250eb1e8432)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-mq.c
+index 6fcf1deefe8d,a3a80884ed95..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -355,94 -422,195 +355,98 @@@ static void blk_mq_start_request(struc
+  		 */
+  		rq->nr_phys_segments++;
+  	}
+ -}
+ -EXPORT_SYMBOL(blk_mq_start_request);
+ -
+ -static void __blk_mq_requeue_request(struct request *rq)
+ -{
+ -	struct request_queue *q = rq->q;
+ -
+ -	trace_block_rq_requeue(q, rq);
+ -
+ -	if (test_and_clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags)) {
+ -		if (q->dma_drain_size && blk_rq_bytes(rq))
+ -			rq->nr_phys_segments--;
+ -	}
+ -}
+ -
+ -void blk_mq_requeue_request(struct request *rq)
+ -{
+ -	__blk_mq_requeue_request(rq);
+ -
+ -	BUG_ON(blk_queued_rq(rq));
+ -	blk_mq_add_to_requeue_list(rq, true);
+ -}
+ -EXPORT_SYMBOL(blk_mq_requeue_request);
+ -
+ -static void blk_mq_requeue_work(struct work_struct *work)
+ -{
+ -	struct request_queue *q =
+ -		container_of(work, struct request_queue, requeue_work);
+ -	LIST_HEAD(rq_list);
+ -	struct request *rq, *next;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&q->requeue_lock, flags);
+ -	list_splice_init(&q->requeue_list, &rq_list);
+ -	spin_unlock_irqrestore(&q->requeue_lock, flags);
+ -
+ -	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
+ -		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
+ -			continue;
+ -
+ -		rq->cmd_flags &= ~REQ_SOFTBARRIER;
+ -		list_del_init(&rq->queuelist);
+ -		blk_mq_insert_request(rq, true, false, false);
+ -	}
+ -
+ -	while (!list_empty(&rq_list)) {
+ -		rq = list_entry(rq_list.next, struct request, queuelist);
+ -		list_del_init(&rq->queuelist);
+ -		blk_mq_insert_request(rq, false, false, false);
+ -	}
+  
+  	/*
+ -	 * Use the start variant of queue running here, so that running
+ -	 * the requeue work will kick stopped queues.
+ +	 * Flag the last request in the series so that drivers know when IO
+ +	 * should be kicked off, if they don't do it on a per-request basis.
+ +	 *
+ +	 * Note: the flag isn't the only condition drivers should do kick off.
+ +	 * If drive is busy, the last request might not have the bit set.
+  	 */
+ -	blk_mq_start_hw_queues(q);
+ +	if (last)
+ +		rq->cmd_flags |= REQ_END;
+  }
+  
+ -void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
+ +static void blk_mq_requeue_request(struct request *rq)
+  {
+  	struct request_queue *q = rq->q;
+ -	unsigned long flags;
+ -
+ -	/*
+ -	 * We abuse this flag that is otherwise used by the I/O scheduler to
+ -	 * request head insertation from the workqueue.
+ -	 */
+ -	BUG_ON(rq->cmd_flags & REQ_SOFTBARRIER);
+ -
+ -	spin_lock_irqsave(&q->requeue_lock, flags);
+ -	if (at_head) {
+ -		rq->cmd_flags |= REQ_SOFTBARRIER;
+ -		list_add(&rq->queuelist, &q->requeue_list);
+ -	} else {
+ -		list_add_tail(&rq->queuelist, &q->requeue_list);
+ -	}
+ -	spin_unlock_irqrestore(&q->requeue_lock, flags);
+ -}
+ -EXPORT_SYMBOL(blk_mq_add_to_requeue_list);
+ -
+ -void blk_mq_kick_requeue_list(struct request_queue *q)
+ -{
+ -	kblockd_schedule_work(&q->requeue_work);
+ -}
+ -EXPORT_SYMBOL(blk_mq_kick_requeue_list);
+ -
+ -static inline bool is_flush_request(struct request *rq, unsigned int tag)
+ -{
+ -	return ((rq->cmd_flags & REQ_FLUSH_SEQ) &&
+ -			rq->q->flush_rq->tag == tag);
+ -}
+  
+ -struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
+ -{
+ -	struct request *rq = tags->rqs[tag];
+ +	trace_block_rq_requeue(q, rq);
+ +	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+  
+ -	if (!is_flush_request(rq, tag))
+ -		return rq;
+ +	rq->cmd_flags &= ~REQ_END;
+  
+ -	return rq->q->flush_rq;
+ +	if (q->dma_drain_size && blk_rq_bytes(rq))
+ +		rq->nr_phys_segments--;
+  }
+ -EXPORT_SYMBOL(blk_mq_tag_to_rq);
+  
+  struct blk_mq_timeout_data {
+ -	unsigned long next;
+ -	unsigned int next_set;
+ +	struct blk_mq_hw_ctx *hctx;
+ +	unsigned long *next;
+ +	unsigned int *next_set;
+  };
+  
+++<<<<<<< HEAD
+ +static void blk_mq_timeout_check(void *__data, unsigned long *free_tags)
+++=======
++ void blk_mq_rq_timed_out(struct request *req, bool reserved)
+++>>>>>>> 90415837659f (block: fix blk_abort_request on blk-mq)
+  {
+ -	struct blk_mq_ops *ops = req->q->mq_ops;
+ -	enum blk_eh_timer_return ret = BLK_EH_RESET_TIMER;
+ +	struct blk_mq_timeout_data *data = __data;
+ +	struct blk_mq_hw_ctx *hctx = data->hctx;
+ +	unsigned int tag;
+  
+ -	/*
+ -	 * We know that complete is set at this point. If STARTED isn't set
+ -	 * anymore, then the request isn't active and the "timeout" should
+ -	 * just be ignored. This can happen due to the bitflag ordering.
+ -	 * Timeout first checks if STARTED is set, and if it is, assumes
+ -	 * the request is active. But if we race with completion, then
+ -	 * we both flags will get cleared. So check here again, and ignore
+ -	 * a timeout event with a request that isn't active.
+ +	 /* It may not be in flight yet (this is where
+ +	 * the REQ_ATOMIC_STARTED flag comes in). The requests are
+ +	 * statically allocated, so we know it's always safe to access the
+ +	 * memory associated with a bit offset into ->rqs[].
+  	 */
+ -	if (!test_bit(REQ_ATOM_STARTED, &req->atomic_flags))
+ -		return;
+ +	tag = 0;
+ +	do {
+ +		struct request *rq;
+  
+ -	if (ops->timeout)
+ -		ret = ops->timeout(req, reserved);
+ -
+ -	switch (ret) {
+ -	case BLK_EH_HANDLED:
+ -		__blk_mq_complete_request(req);
+ -		break;
+ -	case BLK_EH_RESET_TIMER:
+ -		blk_add_timer(req);
+ -		blk_clear_rq_complete(req);
+ -		break;
+ -	case BLK_EH_NOT_HANDLED:
+ -		break;
+ -	default:
+ -		printk(KERN_ERR "block: bad eh return: %d\n", ret);
+ -		break;
+ -	}
+ -}
+ -		
+ -static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
+ -		struct request *rq, void *priv, bool reserved)
+ -{
+ -	struct blk_mq_timeout_data *data = priv;
+ +		tag = find_next_zero_bit(free_tags, hctx->queue_depth, tag);
+ +		if (tag >= hctx->queue_depth)
+ +			break;
+  
+ -	if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
+ -		return;
+ +		rq = hctx->rqs[tag++];
+  
+ -	if (time_after_eq(jiffies, rq->deadline)) {
+ -		if (!blk_mark_rq_complete(rq))
+ -			blk_mq_rq_timed_out(rq, reserved);
+ -	} else if (!data->next_set || time_after(data->next, rq->deadline)) {
+ -		data->next = rq->deadline;
+ -		data->next_set = 1;
+ -	}
+ +		if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
+ +			continue;
+ +
+ +		blk_rq_check_expired(rq, data->next, data->next_set);
+ +	} while (1);
+  }
+  
+ -static void blk_mq_rq_timer(unsigned long priv)
+ +static void blk_mq_hw_ctx_check_timeout(struct blk_mq_hw_ctx *hctx,
+ +					unsigned long *next,
+ +					unsigned int *next_set)
+  {
+ -	struct request_queue *q = (struct request_queue *)priv;
+  	struct blk_mq_timeout_data data = {
+ -		.next		= 0,
+ -		.next_set	= 0,
+ +		.hctx		= hctx,
+ +		.next		= next,
+ +		.next_set	= next_set,
+  	};
+ -	struct blk_mq_hw_ctx *hctx;
+ -	int i;
+  
+ -	queue_for_each_hw_ctx(q, hctx, i) {
+ -		/*
+ -		 * If not software queues are currently mapped to this
+ -		 * hardware queue, there's nothing to check
+ -		 */
+ -		if (!hctx->nr_ctx || !hctx->tags)
+ -			continue;
+ +	/*
+ +	 * Ask the tagging code to iterate busy requests, so we can
+ +	 * check them for timeout.
+ +	 */
+ +	blk_mq_tag_busy_iter(hctx->tags, blk_mq_timeout_check, &data);
+ +}
+  
+ -		blk_mq_tag_busy_iter(hctx, blk_mq_check_expired, &data);
+ -	}
+ +static void blk_mq_rq_timer(unsigned long data)
+ +{
+ +	struct request_queue *q = (struct request_queue *) data;
+ +	struct blk_mq_hw_ctx *hctx;
+ +	unsigned long next = 0;
+ +	int i, next_set = 0;
+  
+ -	if (data.next_set) {
+ -		data.next = blk_rq_timeout(round_jiffies_up(data.next));
+ -		mod_timer(&q->timeout, data.next);
+ -	} else {
+ -		queue_for_each_hw_ctx(q, hctx, i)
+ -			blk_mq_tag_idle(hctx);
+ -	}
+ +	queue_for_each_hw_ctx(q, hctx, i)
+ +		blk_mq_hw_ctx_check_timeout(hctx, &next, &next_set);
+ +
+ +	if (next_set)
+ +		mod_timer(&q->timeout, round_jiffies_up(next));
+  }
+  
+  /*
+diff --cc block/blk-mq.h
+index 0f992dc928d0,a3c613a9df2d..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -44,11 -50,26 +44,30 @@@ void blk_mq_disable_hotplug(void)
+  /*
+   * CPU -> queue mappings
+   */
+ -extern unsigned int *blk_mq_make_queue_map(struct blk_mq_tag_set *set);
+ +struct blk_mq_reg;
+ +extern unsigned int *blk_mq_make_queue_map(struct blk_mq_reg *reg);
+  extern int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues);
+ -extern int blk_mq_hw_queue_to_node(unsigned int *map, unsigned int);
+  
+++<<<<<<< HEAD
+ +void blk_mq_add_timer(struct request *rq);
+++=======
++ /*
++  * sysfs helpers
++  */
++ extern int blk_mq_sysfs_register(struct request_queue *q);
++ extern void blk_mq_sysfs_unregister(struct request_queue *q);
++ 
++ extern void blk_mq_rq_timed_out(struct request *req, bool reserved);
++ 
++ /*
++  * Basic implementation of sparser bitmap, allowing the user to spread
++  * the bits over more cachelines.
++  */
++ struct blk_align_bitmap {
++ 	unsigned long word;
++ 	unsigned long depth;
++ } ____cacheline_aligned_in_smp;
+++>>>>>>> 90415837659f (block: fix blk_abort_request on blk-mq)
+  
+  static inline struct blk_mq_ctx *__blk_mq_get_ctx(struct request_queue *q,
+  					   unsigned int cpu)
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index b3a0bd944004..7bfbaf9d9a04 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -165,7 +165,10 @@ void blk_abort_request(struct request *req)
+ 	if (blk_mark_rq_complete(req))
+ 		return;
+ 	blk_delete_timer(req);
+-	blk_rq_timed_out(req);
++	if (req->q->mq_ops)
++		blk_mq_rq_timed_out(req, false);
++	else
++		blk_rq_timed_out(req);
+ }
+ EXPORT_SYMBOL_GPL(blk_abort_request);
+ 
