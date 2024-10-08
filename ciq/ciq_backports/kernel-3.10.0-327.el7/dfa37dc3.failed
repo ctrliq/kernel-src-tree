@@ -1,0 +1,146 @@
+userfaultfd: allow signals to interrupt a userfault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit dfa37dc3fc1f6f81a6900d0e561c02362f4817f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dfa37dc3.failed
+
+This is only simple to achieve if the userfault is going to return to
+userland (not to the kernel) because we can avoid returning VM_FAULT_RETRY
+despite we temporarily released the mmap_sem.  The fault would just be
+retried by userland then.  This is safe at least on x86 and powerpc (the
+two archs with the syscall implemented so far).
+
+Hint to verify for which archs this is safe: after handle_mm_fault
+returns, no access to data structures protected by the mmap_sem must be
+done by the fault code in arch/*/mm/fault.c until up_read(&mm->mmap_sem)
+is called.
+
+This has two main benefits: signals can run with lower latency in
+production (signals aren't blocked by userfaults and userfaults are
+immediately repeated after signal processing) and gdb can then trivially
+debug the threads blocked in this kind of userfaults coming directly from
+userland.
+
+On a side note: while gdb has a need to get signal processed, coredumps
+always worked perfectly with userfaults, no matter if the userfault is
+triggered by GUP a kernel copy_user or directly from userland.
+
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit dfa37dc3fc1f6f81a6900d0e561c02362f4817f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/userfaultfd.c
+diff --cc fs/userfaultfd.c
+index 6a34033d3189,a14d63e945f4..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -305,18 -324,26 +305,37 @@@ int handle_userfault(struct vm_area_str
+  
+  	init_waitqueue_func_entry(&uwq.wq, userfaultfd_wake_function);
+  	uwq.wq.private = current;
+ -	uwq.msg = userfault_msg(address, flags, reason);
+ +	uwq.address = userfault_address(address, flags, reason);
+ +	uwq.pending = true;
+  	uwq.ctx = ctx;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&ctx->fault_wqh.lock);
+++=======
++ 	return_to_userland = (flags & (FAULT_FLAG_USER|FAULT_FLAG_KILLABLE)) ==
++ 		(FAULT_FLAG_USER|FAULT_FLAG_KILLABLE);
++ 
++ 	spin_lock(&ctx->fault_pending_wqh.lock);
+++>>>>>>> dfa37dc3fc1f (userfaultfd: allow signals to interrupt a userfault)
+  	/*
+  	 * After the __add_wait_queue the uwq is visible to userland
+  	 * through poll/read().
+  	 */
+++<<<<<<< HEAD
+ +	__add_wait_queue(&ctx->fault_wqh, &uwq.wq);
+ +	set_current_state(TASK_KILLABLE);
+ +	spin_unlock(&ctx->fault_wqh.lock);
+++=======
++ 	__add_wait_queue(&ctx->fault_pending_wqh, &uwq.wq);
++ 	/*
++ 	 * The smp_mb() after __set_current_state prevents the reads
++ 	 * following the spin_unlock to happen before the list_add in
++ 	 * __add_wait_queue.
++ 	 */
++ 	set_current_state(return_to_userland ? TASK_INTERRUPTIBLE :
++ 			  TASK_KILLABLE);
++ 	spin_unlock(&ctx->fault_pending_wqh.lock);
+++>>>>>>> dfa37dc3fc1f (userfaultfd: allow signals to interrupt a userfault)
+  
+  	must_wait = userfaultfd_must_wait(ctx, address, flags, reason);
+  	up_read(&mm->mmap_sem);
+@@@ -329,11 -357,52 +349,52 @@@
+  	}
+  
+  	__set_current_state(TASK_RUNNING);
+++<<<<<<< HEAD
+ +	/* see finish_wait() comment for why list_empty_careful() */
+++=======
++ 
++ 	if (return_to_userland) {
++ 		if (signal_pending(current) &&
++ 		    !fatal_signal_pending(current)) {
++ 			/*
++ 			 * If we got a SIGSTOP or SIGCONT and this is
++ 			 * a normal userland page fault, just let
++ 			 * userland return so the signal will be
++ 			 * handled and gdb debugging works.  The page
++ 			 * fault code immediately after we return from
++ 			 * this function is going to release the
++ 			 * mmap_sem and it's not depending on it
++ 			 * (unlike gup would if we were not to return
++ 			 * VM_FAULT_RETRY).
++ 			 *
++ 			 * If a fatal signal is pending we still take
++ 			 * the streamlined VM_FAULT_RETRY failure path
++ 			 * and there's no need to retake the mmap_sem
++ 			 * in such case.
++ 			 */
++ 			down_read(&mm->mmap_sem);
++ 			ret = 0;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Here we race with the list_del; list_add in
++ 	 * userfaultfd_ctx_read(), however because we don't ever run
++ 	 * list_del_init() to refile across the two lists, the prev
++ 	 * and next pointers will never point to self. list_add also
++ 	 * would never let any of the two pointers to point to
++ 	 * self. So list_empty_careful won't risk to see both pointers
++ 	 * pointing to self at any time during the list refile. The
++ 	 * only case where list_del_init() is called is the full
++ 	 * removal in the wake function and there we don't re-list_add
++ 	 * and it's fine not to block on the spinlock. The uwq on this
++ 	 * kernel stack can be released after the list_del_init.
++ 	 */
+++>>>>>>> dfa37dc3fc1f (userfaultfd: allow signals to interrupt a userfault)
+  	if (!list_empty_careful(&uwq.wq.task_list)) {
+ -		spin_lock(&ctx->fault_pending_wqh.lock);
+ -		/*
+ -		 * No need of list_del_init(), the uwq on the stack
+ -		 * will be freed shortly anyway.
+ -		 */
+ -		list_del(&uwq.wq.task_list);
+ -		spin_unlock(&ctx->fault_pending_wqh.lock);
+ +		spin_lock(&ctx->fault_wqh.lock);
+ +		list_del_init(&uwq.wq.task_list);
+ +		spin_unlock(&ctx->fault_wqh.lock);
+  	}
+  
+  	/*
+* Unmerged path fs/userfaultfd.c
