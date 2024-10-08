@@ -1,0 +1,105 @@
+staging/rdma/hfi1: Fix reporting of LED status in Get(LedInfo) and Get(PortInfo)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Fix reporting of LED status in Get(LedInfo) and Get(PortInfo) (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 94.74%
+commit-author Easwar Hariharan <easwar.hariharan@intel.com>
+commit 409b146225cdefcc76d9956e323e84e510208884
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/409b1462.failed
+
+The LedInfo SMA attribute is redefined to control the LED beaconing
+state machine instead of the LED directly. In accordance, we now
+return the state of LED beaconing, represented by whether the beaconing
+timer is active, instead of the state of the LED itself for SMA queries
+Get(LedInfo) and Get(PortInfo). While we are at it, we fix the beaconing
+timer control code so that the state of the timer is accurately updated.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Easwar Hariharan <easwar.hariharan@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 409b146225cdefcc76d9956e323e84e510208884)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/mad.c
+diff --cc drivers/staging/hfi1/mad.c
+index 4900f79eb54a,5925798db4d1..000000000000
+--- a/drivers/staging/hfi1/mad.c
++++ b/drivers/staging/hfi1/mad.c
+@@@ -3545,19 -3587,24 +3554,35 @@@ static int __subn_get_opa_led_info(stru
+  				   u32 *resp_len)
+  {
+  	struct hfi1_devdata *dd = dd_from_ibdev(ibdev);
+++<<<<<<< HEAD:drivers/staging/hfi1/mad.c
+ +	struct opa_led_info *p = (struct opa_led_info *) data;
+++=======
++ 	struct hfi1_pportdata *ppd = dd->pport;
++ 	struct opa_led_info *p = (struct opa_led_info *)data;
+++>>>>>>> 409b146225cd (staging/rdma/hfi1: Fix reporting of LED status in Get(LedInfo) and Get(PortInfo)):drivers/staging/rdma/hfi1/mad.c
+  	u32 nport = OPA_AM_NPORT(am);
+- 	u64 reg;
++ 	u32 is_beaconing_active;
+  
+  	if (nport != 1) {
+  		smp->status |= IB_SMP_INVALID_FIELD;
+  		return reply((struct ib_mad_hdr *)smp);
+  	}
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/mad.c
+ +	reg = read_csr(dd, DCC_CFG_LED_CNTRL);
+ +	if ((reg & DCC_CFG_LED_CNTRL_LED_CNTRL_SMASK) &&
+ +		((reg & DCC_CFG_LED_CNTRL_LED_SW_BLINK_RATE_SMASK) == 0xf))
+ +			p->rsvd_led_mask = cpu_to_be32(OPA_LED_MASK);
+++=======
++ 	/*
++ 	 * This pairs with the memory barrier implied by the atomic_dec in
++ 	 * hfi1_set_led_override to ensure that we read the correct state of
++ 	 * LED beaconing represented by led_override_timer_active
++ 	 */
++ 	smp_mb();
++ 	is_beaconing_active = !!atomic_read(&ppd->led_override_timer_active);
++ 	p->rsvd_led_mask = cpu_to_be32(is_beaconing_active << OPA_LED_SHIFT);
+++>>>>>>> 409b146225cd (staging/rdma/hfi1: Fix reporting of LED status in Get(LedInfo) and Get(PortInfo)):drivers/staging/rdma/hfi1/mad.c
+  
+  	if (resp_len)
+  		*resp_len += sizeof(struct opa_led_info);
+diff --git a/drivers/staging/hfi1/driver.c b/drivers/staging/hfi1/driver.c
+index 31605ee909b6..76feb5e4b66a 100644
+--- a/drivers/staging/hfi1/driver.c
++++ b/drivers/staging/hfi1/driver.c
+@@ -1158,6 +1158,12 @@ void shutdown_led_override(struct hfi1_pportdata *ppd)
+ {
+ 	struct hfi1_devdata *dd = ppd->dd;
+ 
++	/*
++	 * This pairs with the memory barrier implied by the atomic_dec in
++	 * hfi1_set_led_override to ensure that we read the correct state of
++	 * LED beaconing represented by led_override_timer_active
++	 */
++	smp_mb();
+ 	if (atomic_read(&ppd->led_override_timer_active)) {
+ 		del_timer_sync(&ppd->led_override_timer);
+ 		atomic_set(&ppd->led_override_timer_active, 0);
+@@ -1188,11 +1194,14 @@ static void run_led_override(unsigned long opaque)
+ 	 * don't re-fire the timer if user asked for it to be off; we let
+ 	 * it fire one more time after they turn it off to simplify
+ 	 */
+-	if (ppd->led_override_vals[0] || ppd->led_override_vals[1])
++	if (ppd->led_override_vals[0] || ppd->led_override_vals[1]) {
+ 		mod_timer(&ppd->led_override_timer, jiffies + timeout);
+-	else
++	} else {
+ 		/* Hand control of the LED to the DC for normal operation */
+ 		write_csr(dd, DCC_CFG_LED_CNTRL, 0);
++		/* Record that we did not re-fire the timer */
++		atomic_dec(&ppd->led_override_timer_active);
++	}
+ }
+ 
+ /*
+* Unmerged path drivers/staging/hfi1/mad.c
