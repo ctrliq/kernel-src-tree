@@ -1,0 +1,253 @@
+mm: defer flush of writable TLB entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] defer flush of writable TLB entries (George Beshers) [727269]
+Rebuild_FUZZ: 94.59%
+commit-author Mel Gorman <mgorman@suse.de>
+commit d950c9477d51f0cefc2ed3cf76e695d46af0d9c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d950c947.failed
+
+If a PTE is unmapped and it's dirty then it was writable recently.  Due to
+deferred TLB flushing, it's best to assume a writable TLB cache entry
+exists.  With that assumption, the TLB must be flushed before any IO can
+start or the page is freed to avoid lost writes or data corruption.  This
+patch defers flushing of potentially writable TLBs as long as possible.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d950c9477d51f0cefc2ed3cf76e695d46af0d9c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	mm/internal.h
+#	mm/rmap.c
+diff --cc include/linux/sched.h
+index e57aba91f593,a4ab9daa387c..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1114,6 -1344,25 +1114,28 @@@ enum perf_event_task_context 
+  	perf_nr_task_contexts,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Track pages that require TLB flushes */
++ struct tlbflush_unmap_batch {
++ 	/*
++ 	 * Each bit set is a CPU that potentially has a TLB entry for one of
++ 	 * the PFNs being flushed. See set_tlb_ubc_flush_pending().
++ 	 */
++ 	struct cpumask cpumask;
++ 
++ 	/* True if any bit in cpumask is set */
++ 	bool flush_required;
++ 
++ 	/*
++ 	 * If true then the PTE was dirty when unmapped. The entry must be
++ 	 * flushed before IO is initiated or a stale TLB entry potentially
++ 	 * allows an update without redirtying the page.
++ 	 */
++ 	bool writable;
++ };
++ 
+++>>>>>>> d950c9477d51 (mm: defer flush of writable TLB entries)
+  struct task_struct {
+  	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+  	void *stack;
+diff --cc mm/internal.h
+index d07fa9595ecf,1195dd2d6a2b..000000000000
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@@ -373,4 -426,19 +373,22 @@@ unsigned long reclaim_clean_pages_from_
+  #define ALLOC_CMA		0x80 /* allow allocations from CMA areas */
+  #define ALLOC_FAIR		0x100 /* fair zone allocation */
+  
+++<<<<<<< HEAD
+++=======
++ enum ttu_flags;
++ struct tlbflush_unmap_batch;
++ 
++ #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
++ void try_to_unmap_flush(void);
++ void try_to_unmap_flush_dirty(void);
++ #else
++ static inline void try_to_unmap_flush(void)
++ {
++ }
++ static inline void try_to_unmap_flush_dirty(void)
++ {
++ }
++ 
++ #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
+++>>>>>>> d950c9477d51 (mm: defer flush of writable TLB entries)
+  #endif	/* __MM_INTERNAL_H */
+diff --cc mm/rmap.c
+index 4c545e1f57dc,0db38e7d0a72..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -534,6 -585,107 +534,110 @@@ vma_address(struct page *page, struct v
+  	return address;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
++ static void percpu_flush_tlb_batch_pages(void *data)
++ {
++ 	/*
++ 	 * All TLB entries are flushed on the assumption that it is
++ 	 * cheaper to flush all TLBs and let them be refilled than
++ 	 * flushing individual PFNs. Note that we do not track mm's
++ 	 * to flush as that might simply be multiple full TLB flushes
++ 	 * for no gain.
++ 	 */
++ 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
++ 	flush_tlb_local();
++ }
++ 
++ /*
++  * Flush TLB entries for recently unmapped pages from remote CPUs. It is
++  * important if a PTE was dirty when it was unmapped that it's flushed
++  * before any IO is initiated on the page to prevent lost writes. Similarly,
++  * it must be flushed before freeing to prevent data leakage.
++  */
++ void try_to_unmap_flush(void)
++ {
++ 	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
++ 	int cpu;
++ 
++ 	if (!tlb_ubc->flush_required)
++ 		return;
++ 
++ 	cpu = get_cpu();
++ 
++ 	trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, -1UL);
++ 
++ 	if (cpumask_test_cpu(cpu, &tlb_ubc->cpumask))
++ 		percpu_flush_tlb_batch_pages(&tlb_ubc->cpumask);
++ 
++ 	if (cpumask_any_but(&tlb_ubc->cpumask, cpu) < nr_cpu_ids) {
++ 		smp_call_function_many(&tlb_ubc->cpumask,
++ 			percpu_flush_tlb_batch_pages, (void *)tlb_ubc, true);
++ 	}
++ 	cpumask_clear(&tlb_ubc->cpumask);
++ 	tlb_ubc->flush_required = false;
++ 	tlb_ubc->writable = false;
++ 	put_cpu();
++ }
++ 
++ /* Flush iff there are potentially writable TLB entries that can race with IO */
++ void try_to_unmap_flush_dirty(void)
++ {
++ 	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
++ 
++ 	if (tlb_ubc->writable)
++ 		try_to_unmap_flush();
++ }
++ 
++ static void set_tlb_ubc_flush_pending(struct mm_struct *mm,
++ 		struct page *page, bool writable)
++ {
++ 	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
++ 
++ 	cpumask_or(&tlb_ubc->cpumask, &tlb_ubc->cpumask, mm_cpumask(mm));
++ 	tlb_ubc->flush_required = true;
++ 
++ 	/*
++ 	 * If the PTE was dirty then it's best to assume it's writable. The
++ 	 * caller must use try_to_unmap_flush_dirty() or try_to_unmap_flush()
++ 	 * before the page is queued for IO.
++ 	 */
++ 	if (writable)
++ 		tlb_ubc->writable = true;
++ }
++ 
++ /*
++  * Returns true if the TLB flush should be deferred to the end of a batch of
++  * unmap operations to reduce IPIs.
++  */
++ static bool should_defer_flush(struct mm_struct *mm, enum ttu_flags flags)
++ {
++ 	bool should_defer = false;
++ 
++ 	if (!(flags & TTU_BATCH_FLUSH))
++ 		return false;
++ 
++ 	/* If remote CPUs need to be flushed then defer batch the flush */
++ 	if (cpumask_any_but(mm_cpumask(mm), get_cpu()) < nr_cpu_ids)
++ 		should_defer = true;
++ 	put_cpu();
++ 
++ 	return should_defer;
++ }
++ #else
++ static void set_tlb_ubc_flush_pending(struct mm_struct *mm,
++ 		struct page *page, bool writable)
++ {
++ }
++ 
++ static bool should_defer_flush(struct mm_struct *mm, enum ttu_flags flags)
++ {
++ 	return false;
++ }
++ #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
++ 
+++>>>>>>> d950c9477d51 (mm: defer flush of writable TLB entries)
+  /*
+   * At what user virtual address is page expected in vma?
+   * Caller should check the page is actually part of the vma.
+@@@ -1218,7 -1323,20 +1322,24 @@@ int try_to_unmap_one(struct page *page
+  
+  	/* Nuke the page table entry. */
+  	flush_cache_page(vma, address, page_to_pfn(page));
+++<<<<<<< HEAD
+ +	pteval = ptep_clear_flush(vma, address, pte);
+++=======
++ 	if (should_defer_flush(mm, flags)) {
++ 		/*
++ 		 * We clear the PTE but do not flush so potentially a remote
++ 		 * CPU could still be writing to the page. If the entry was
++ 		 * previously clean then the architecture must guarantee that
++ 		 * a clear->dirty transition on a cached TLB entry is written
++ 		 * through and traps if the PTE is unmapped.
++ 		 */
++ 		pteval = ptep_get_and_clear(mm, address, pte);
++ 
++ 		set_tlb_ubc_flush_pending(mm, page, pte_dirty(pteval));
++ 	} else {
++ 		pteval = ptep_clear_flush(vma, address, pte);
++ 	}
+++>>>>>>> d950c9477d51 (mm: defer flush of writable TLB entries)
+  
+  	/* Move the dirty bit to the physical page now the pte is gone. */
+  	if (pte_dirty(pteval))
+* Unmerged path include/linux/sched.h
+* Unmerged path mm/internal.h
+* Unmerged path mm/rmap.c
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 7592127381db..51ad0c855e40 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -958,7 +958,12 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 			if (!sc->may_writepage)
+ 				goto keep_locked;
+ 
+-			/* Page is dirty, try to write it out here */
++			/*
++			 * Page is dirty. Flush the TLB if a writable entry
++			 * potentially exists to avoid CPU writes after IO
++			 * starts and then write it out here.
++			 */
++			try_to_unmap_flush_dirty();
+ 			switch (pageout(page, mapping, sc)) {
+ 			case PAGE_KEEP:
+ 				goto keep_locked;
