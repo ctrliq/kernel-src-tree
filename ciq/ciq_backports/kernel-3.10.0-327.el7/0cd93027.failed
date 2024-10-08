@@ -1,0 +1,338 @@
+net/mlx4_core: Reset flow activation upon SRIOV fatal command cases
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_core: Reset flow activation upon SRIOV fatal command cases (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 96.92%
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 0cd9302734111abc0b5912b695336f2ee63cb22b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0cd93027.failed
+
+When SRIOV commands are executed over the comm-channel and get
+a fatal error (e.g. timeout, closing command failure) the VF enters
+into error state and reset flow is activated.
+
+To be able to recognize whether the failure was on a closing command, the
+operational code for the given VHCR command is used. Once the device entered
+into an error state we prevent redundant error messages from being printed.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0cd9302734111abc0b5912b695336f2ee63cb22b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/main.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/main.c
+index e21046536e8b,9c7ef0bffb52..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@@ -1541,9 -1641,15 +1542,9 @@@ static int mlx4_init_slave(struct mlx4_
+  
+  	mutex_lock(&priv->cmd.slave_cmd_mutex);
+  	priv->cmd.max_cmds = 1;
+ -	if (mlx4_comm_check_offline(dev)) {
+ -		mlx4_err(dev, "PF is not responsive, skipping initialization\n");
+ -		goto err_offline;
+ -	}
+ -
+ -	mlx4_reset_vf_support(dev);
+  	mlx4_warn(dev, "Sending reset\n");
+  	ret_from_reset = mlx4_comm_cmd(dev, MLX4_COMM_CMD_RESET, 0,
+- 				       MLX4_COMM_TIME);
++ 				       MLX4_COMM_CMD_NA_OP, MLX4_COMM_TIME);
+  	/* if we are in the middle of flr the slave will try
+  	 * NUM_OF_RESET_RETRIES times before leaving.*/
+  	if (ret_from_reset) {
+@@@ -1583,7 -1690,8 +1585,12 @@@
+  	return 0;
+  
+  err:
+++<<<<<<< HEAD
+ +	mlx4_comm_cmd(dev, MLX4_COMM_CMD_RESET, 0, 0);
+++=======
++ 	mlx4_comm_cmd(dev, MLX4_COMM_CMD_RESET, 0, MLX4_COMM_CMD_NA_OP, 0);
++ err_offline:
+++>>>>>>> 0cd930273411 (net/mlx4_core: Reset flow activation upon SRIOV fatal command cases)
+  	mutex_unlock(&priv->cmd.slave_cmd_mutex);
+  	return -EIO;
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4.h
+index cebd1180702b,096a81c16a9b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@@ -120,6 -122,10 +120,13 @@@ enum mlx4_mpt_state 
+  };
+  
+  #define MLX4_COMM_TIME		10000
+++<<<<<<< HEAD
+++=======
++ #define MLX4_COMM_OFFLINE_TIME_OUT 30000
++ #define MLX4_COMM_CMD_NA_OP    0x0
++ 
++ 
+++>>>>>>> 0cd930273411 (net/mlx4_core: Reset flow activation upon SRIOV fatal command cases)
+  enum {
+  	MLX4_COMM_CMD_RESET,
+  	MLX4_COMM_CMD_VHCR0,
+diff --git a/drivers/net/ethernet/mellanox/mlx4/cmd.c b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+index b07100e60e38..ec4a77ae8196 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -190,16 +190,30 @@ static int comm_pending(struct mlx4_dev *dev)
+ 	return (swab32(status) >> 31) != priv->cmd.comm_toggle;
+ }
+ 
+-static void mlx4_comm_cmd_post(struct mlx4_dev *dev, u8 cmd, u16 param)
++static int mlx4_comm_cmd_post(struct mlx4_dev *dev, u8 cmd, u16 param)
+ {
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+ 	u32 val;
+ 
++	/* To avoid writing to unknown addresses after the device state was
++	 * changed to internal error and the function was rest,
++	 * check the INTERNAL_ERROR flag which is updated under
++	 * device_state_mutex lock.
++	 */
++	mutex_lock(&dev->persist->device_state_mutex);
++
++	if (dev->persist->state & MLX4_DEVICE_STATE_INTERNAL_ERROR) {
++		mutex_unlock(&dev->persist->device_state_mutex);
++		return -EIO;
++	}
++
+ 	priv->cmd.comm_toggle ^= 1;
+ 	val = param | (cmd << 16) | (priv->cmd.comm_toggle << 31);
+ 	__raw_writel((__force u32) cpu_to_be32(val),
+ 		     &priv->mfunc.comm->slave_write);
+ 	mmiowb();
++	mutex_unlock(&dev->persist->device_state_mutex);
++	return 0;
+ }
+ 
+ static int mlx4_comm_cmd_poll(struct mlx4_dev *dev, u8 cmd, u16 param,
+@@ -219,7 +233,13 @@ static int mlx4_comm_cmd_poll(struct mlx4_dev *dev, u8 cmd, u16 param,
+ 
+ 	/* Write command */
+ 	down(&priv->cmd.poll_sem);
+-	mlx4_comm_cmd_post(dev, cmd, param);
++	if (mlx4_comm_cmd_post(dev, cmd, param)) {
++		/* Only in case the device state is INTERNAL_ERROR,
++		 * mlx4_comm_cmd_post returns with an error
++		 */
++		err = mlx4_status_to_errno(CMD_STAT_INTERNAL_ERR);
++		goto out;
++	}
+ 
+ 	end = msecs_to_jiffies(timeout) + jiffies;
+ 	while (comm_pending(dev) && time_before(jiffies, end))
+@@ -231,18 +251,23 @@ static int mlx4_comm_cmd_poll(struct mlx4_dev *dev, u8 cmd, u16 param,
+ 		 * is MLX4_DELAY_RESET_SLAVE*/
+ 		if ((MLX4_COMM_CMD_RESET == cmd)) {
+ 			err = MLX4_DELAY_RESET_SLAVE;
++			goto out;
+ 		} else {
+-			mlx4_warn(dev, "Communication channel timed out\n");
+-			err = -ETIMEDOUT;
++			mlx4_warn(dev, "Communication channel command 0x%x timed out\n",
++				  cmd);
++			err = mlx4_status_to_errno(CMD_STAT_INTERNAL_ERR);
+ 		}
+ 	}
+ 
++	if (err)
++		mlx4_enter_error_state(dev->persist);
++out:
+ 	up(&priv->cmd.poll_sem);
+ 	return err;
+ }
+ 
+-static int mlx4_comm_cmd_wait(struct mlx4_dev *dev, u8 op,
+-			      u16 param, unsigned long timeout)
++static int mlx4_comm_cmd_wait(struct mlx4_dev *dev, u8 vhcr_cmd,
++			      u16 param, u16 op, unsigned long timeout)
+ {
+ 	struct mlx4_cmd *cmd = &mlx4_priv(dev)->cmd;
+ 	struct mlx4_cmd_context *context;
+@@ -260,32 +285,47 @@ static int mlx4_comm_cmd_wait(struct mlx4_dev *dev, u8 op,
+ 
+ 	init_completion(&context->done);
+ 
+-	mlx4_comm_cmd_post(dev, op, param);
++	if (mlx4_comm_cmd_post(dev, vhcr_cmd, param)) {
++		/* Only in case the device state is INTERNAL_ERROR,
++		 * mlx4_comm_cmd_post returns with an error
++		 */
++		err = mlx4_status_to_errno(CMD_STAT_INTERNAL_ERR);
++		goto out;
++	}
+ 
+ 	if (!wait_for_completion_timeout(&context->done,
+ 					 msecs_to_jiffies(timeout))) {
+-		mlx4_warn(dev, "communication channel command 0x%x timed out\n",
+-			  op);
+-		err = -EBUSY;
+-		goto out;
++		mlx4_warn(dev, "communication channel command 0x%x (op=0x%x) timed out\n",
++			  vhcr_cmd, op);
++		goto out_reset;
+ 	}
+ 
+ 	err = context->result;
+ 	if (err && context->fw_status != CMD_STAT_MULTI_FUNC_REQ) {
+ 		mlx4_err(dev, "command 0x%x failed: fw status = 0x%x\n",
+-			 op, context->fw_status);
+-		goto out;
++			 vhcr_cmd, context->fw_status);
++		if (mlx4_closing_cmd_fatal_error(op, context->fw_status))
++			goto out_reset;
+ 	}
+ 
+-out:
+ 	/* wait for comm channel ready
+ 	 * this is necessary for prevention the race
+ 	 * when switching between event to polling mode
++	 * Skipping this section in case the device is in FATAL_ERROR state,
++	 * In this state, no commands are sent via the comm channel until
++	 * the device has returned from reset.
+ 	 */
+-	end = msecs_to_jiffies(timeout) + jiffies;
+-	while (comm_pending(dev) && time_before(jiffies, end))
+-		cond_resched();
++	if (!(dev->persist->state & MLX4_DEVICE_STATE_INTERNAL_ERROR)) {
++		end = msecs_to_jiffies(timeout) + jiffies;
++		while (comm_pending(dev) && time_before(jiffies, end))
++			cond_resched();
++	}
++	goto out;
+ 
++out_reset:
++	err = mlx4_status_to_errno(CMD_STAT_INTERNAL_ERR);
++	mlx4_enter_error_state(dev->persist);
++out:
+ 	spin_lock(&cmd->context_lock);
+ 	context->next = cmd->free_head;
+ 	cmd->free_head = context - cmd->context;
+@@ -296,10 +336,13 @@ out:
+ }
+ 
+ int mlx4_comm_cmd(struct mlx4_dev *dev, u8 cmd, u16 param,
+-		  unsigned long timeout)
++		  u16 op, unsigned long timeout)
+ {
++	if (dev->persist->state & MLX4_DEVICE_STATE_INTERNAL_ERROR)
++		return mlx4_status_to_errno(CMD_STAT_INTERNAL_ERR);
++
+ 	if (mlx4_priv(dev)->cmd.use_events)
+-		return mlx4_comm_cmd_wait(dev, cmd, param, timeout);
++		return mlx4_comm_cmd_wait(dev, cmd, param, op, timeout);
+ 	return mlx4_comm_cmd_poll(dev, cmd, param, timeout);
+ }
+ 
+@@ -428,8 +471,11 @@ static int mlx4_slave_cmd(struct mlx4_dev *dev, u64 in_param, u64 *out_param,
+ 			}
+ 			ret = mlx4_status_to_errno(vhcr->status);
+ 		}
++		if (ret &&
++		    dev->persist->state & MLX4_DEVICE_STATE_INTERNAL_ERROR)
++			ret = mlx4_internal_err_ret_value(dev, op, op_modifier);
+ 	} else {
+-		ret = mlx4_comm_cmd(dev, MLX4_COMM_CMD_VHCR_POST, 0,
++		ret = mlx4_comm_cmd(dev, MLX4_COMM_CMD_VHCR_POST, 0, op,
+ 				    MLX4_COMM_TIME + timeout);
+ 		if (!ret) {
+ 			if (out_is_imm) {
+@@ -443,9 +489,14 @@ static int mlx4_slave_cmd(struct mlx4_dev *dev, u64 in_param, u64 *out_param,
+ 				}
+ 			}
+ 			ret = mlx4_status_to_errno(vhcr->status);
+-		} else
+-			mlx4_err(dev, "failed execution of VHCR_POST command opcode 0x%x\n",
+-				 op);
++		} else {
++			if (dev->persist->state &
++			    MLX4_DEVICE_STATE_INTERNAL_ERROR)
++				ret = mlx4_internal_err_ret_value(dev, op,
++								  op_modifier);
++			else
++				mlx4_err(dev, "failed execution of VHCR_POST command opcode 0x%x\n", op);
++		}
+ 	}
+ 
+ 	mutex_unlock(&priv->cmd.slave_cmd_mutex);
+@@ -1460,8 +1511,10 @@ static int mlx4_master_process_vhcr(struct mlx4_dev *dev, int slave,
+ 				      ALIGN(sizeof(struct mlx4_vhcr_cmd),
+ 					    MLX4_ACCESS_MEM_ALIGN), 1);
+ 		if (ret) {
+-			mlx4_err(dev, "%s: Failed reading vhcr ret: 0x%x\n",
+-				 __func__, ret);
++			if (!(dev->persist->state &
++			    MLX4_DEVICE_STATE_INTERNAL_ERROR))
++				mlx4_err(dev, "%s: Failed reading vhcr ret: 0x%x\n",
++					 __func__, ret);
+ 			kfree(vhcr);
+ 			return ret;
+ 		}
+@@ -1500,11 +1553,14 @@ static int mlx4_master_process_vhcr(struct mlx4_dev *dev, int slave,
+ 			goto out_status;
+ 		}
+ 
+-		if (mlx4_ACCESS_MEM(dev, inbox->dma, slave,
+-				    vhcr->in_param,
+-				    MLX4_MAILBOX_SIZE, 1)) {
+-			mlx4_err(dev, "%s: Failed reading inbox (cmd:0x%x)\n",
+-				 __func__, cmd->opcode);
++		ret = mlx4_ACCESS_MEM(dev, inbox->dma, slave,
++				      vhcr->in_param,
++				      MLX4_MAILBOX_SIZE, 1);
++		if (ret) {
++			if (!(dev->persist->state &
++			    MLX4_DEVICE_STATE_INTERNAL_ERROR))
++				mlx4_err(dev, "%s: Failed reading inbox (cmd:0x%x)\n",
++					 __func__, cmd->opcode);
+ 			vhcr_cmd->status = CMD_STAT_INTERNAL_ERR;
+ 			goto out_status;
+ 		}
+@@ -1552,8 +1608,9 @@ static int mlx4_master_process_vhcr(struct mlx4_dev *dev, int slave,
+ 	}
+ 
+ 	if (err) {
+-		mlx4_warn(dev, "vhcr command:0x%x slave:%d failed with error:%d, status %d\n",
+-			  vhcr->op, slave, vhcr->errno, err);
++		if (!(dev->persist->state & MLX4_DEVICE_STATE_INTERNAL_ERROR))
++			mlx4_warn(dev, "vhcr command:0x%x slave:%d failed with error:%d, status %d\n",
++				  vhcr->op, slave, vhcr->errno, err);
+ 		vhcr_cmd->status = mlx4_errno_to_status(err);
+ 		goto out_status;
+ 	}
+@@ -1568,7 +1625,9 @@ static int mlx4_master_process_vhcr(struct mlx4_dev *dev, int slave,
+ 			/* If we failed to write back the outbox after the
+ 			 *command was successfully executed, we must fail this
+ 			 * slave, as it is now in undefined state */
+-			mlx4_err(dev, "%s:Failed writing outbox\n", __func__);
++			if (!(dev->persist->state &
++			    MLX4_DEVICE_STATE_INTERNAL_ERROR))
++				mlx4_err(dev, "%s:Failed writing outbox\n", __func__);
+ 			goto out;
+ 		}
+ 	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mcg.c b/drivers/net/ethernet/mellanox/mlx4/mcg.c
+index a3867e7ef885..1def7f9935d3 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mcg.c
++++ b/drivers/net/ethernet/mellanox/mlx4/mcg.c
+@@ -1347,6 +1347,9 @@ static int mlx4_QP_ATTACH(struct mlx4_dev *dev, struct mlx4_qp *qp,
+ 		       MLX4_CMD_WRAPPED);
+ 
+ 	mlx4_free_cmd_mailbox(dev, mailbox);
++	if (err && !attach &&
++	    dev->persist->state & MLX4_DEVICE_STATE_INTERNAL_ERROR)
++		err = 0;
+ 	return err;
+ }
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4.h
