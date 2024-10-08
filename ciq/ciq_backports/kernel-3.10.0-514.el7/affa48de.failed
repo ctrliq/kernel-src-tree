@@ -1,0 +1,250 @@
+staging/rdma/hfi1: Add support for enabling/disabling PCIe ASPM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Add support for enabling/disabling PCIe ASPM (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 93.22%
+commit-author Ashutosh Dixit <ashutosh.dixit@intel.com>
+commit affa48de8417ccdde467b075577f6e5154ff9943
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/affa48de.failed
+
+hfi1 HW has a high PCIe ASPM L1 exit latency and also advertises an
+acceptable latency less than actual ASPM latencies. Additional
+mechanisms than those provided by BIOS/OS are therefore required to
+enable/disable ASPM for hfi1 to provide acceptable power/performance
+trade offs. This patch adds this support.
+
+By means of a module parameter ASPM can be either (a) always enabled
+(power save mode) (b) always disabled (performance mode) (c)
+enabled/disabled dynamically. The dynamic mode implements two
+heuristics to alleviate possible problems with high ASPM L1 exit
+latency. ASPM is normally enabled but is disabled if (a) there are any
+active user space PSM contexts, or (b) for verbs, ASPM is disabled as
+interrupt activity for a context starts to increase.
+
+A few more points about the verbs implementation. In order to reduce
+lock/cache contention between multiple verbs contexts, some processing
+is done at the context layer before contending for device layer
+locks. ASPM is disabled when two interrupts for a context happen
+within 1 millisec. A timer is scheduled which will re-enable ASPM
+after 1 second should the interrupt activity cease. Normally, every
+interrupt, or interrupt-pair should push the timer out
+further. However, since this might increase the processing load per
+interrupt, pushing the timer out is postponed for half a second. If
+after half a second we get two interrupts within 1 millisec the timer
+is pushed out by another second.
+
+Finally, the kernel ASPM API is not used in this patch. This is
+because this patch does several non-standard things as SW workarounds
+for HW issues. As mentioned above, it enables ASPM even when advertised
+actual latencies are greater than acceptable latencies. Also, whereas
+the kernel API only allows drivers to disable ASPM from driver probe,
+this patch enables/disables ASPM directly from interrupt context. Due
+to these reasons the kernel ASPM API was not used.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit affa48de8417ccdde467b075577f6e5154ff9943)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/aspm.h
+#	drivers/staging/hfi1/chip.c
+diff --cc drivers/staging/hfi1/chip.c
+index 10123147fb89,3577042423b2..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -63,6 -63,9 +63,12 @@@
+  #include "pio.h"
+  #include "sdma.h"
+  #include "eprom.h"
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+++=======
++ #include "efivar.h"
++ #include "platform.h"
++ #include "aspm.h"
+++>>>>>>> affa48de8417 (staging/rdma/hfi1: Add support for enabling/disabling PCIe ASPM):drivers/staging/rdma/hfi1/chip.c
+  
+  #define NUM_IB_PORTS 1
+  
+* Unmerged path drivers/staging/hfi1/aspm.h
+* Unmerged path drivers/staging/hfi1/aspm.h
+* Unmerged path drivers/staging/hfi1/chip.c
+diff --git a/drivers/staging/hfi1/chip_registers.h b/drivers/staging/hfi1/chip_registers.h
+index 3cd3352af2ce..23898ebbad24 100644
+--- a/drivers/staging/hfi1/chip_registers.h
++++ b/drivers/staging/hfi1/chip_registers.h
+@@ -1281,6 +1281,9 @@
+ #define SEND_STATIC_RATE_CONTROL_CSR_SRC_RELOAD_SHIFT 0
+ #define SEND_STATIC_RATE_CONTROL_CSR_SRC_RELOAD_SMASK 0xFFFFull
+ #define PCIE_CFG_REG_PL2 (PCIE + 0x000000000708)
++#define PCIE_CFG_REG_PL3 (PCIE + 0x00000000070C)
++#define PCIE_CFG_REG_PL3_L1_ENT_LATENCY_SHIFT 27
++#define PCIE_CFG_REG_PL3_L1_ENT_LATENCY_SMASK 0x38000000
+ #define PCIE_CFG_REG_PL102 (PCIE + 0x000000000898)
+ #define PCIE_CFG_REG_PL102_GEN3_EQ_POST_CURSOR_PSET_SHIFT 12
+ #define PCIE_CFG_REG_PL102_GEN3_EQ_CURSOR_PSET_SHIFT 6
+diff --git a/drivers/staging/hfi1/file_ops.c b/drivers/staging/hfi1/file_ops.c
+index 1f753f5a4830..82dfdab10abe 100644
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@ -70,6 +70,7 @@
+ #include "trace.h"
+ #include "user_sdma.h"
+ #include "eprom.h"
++#include "aspm.h"
+ 
+ #undef pr_fmt
+ #define pr_fmt(fmt) DRIVER_NAME ": " fmt
+@@ -810,7 +811,8 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
+ 		unlock_exp_tids(uctxt);
+ 
+ 	hfi1_stats.sps_ctxts--;
+-	dd->freectxts++;
++	if (++dd->freectxts == dd->num_user_contexts)
++		aspm_enable_all(dd);
+ 	mutex_unlock(&hfi1_mutex);
+ 	hfi1_free_ctxtdata(dd, uctxt);
+ done:
+@@ -1052,7 +1054,12 @@ static int allocate_ctxt(struct file *fp, struct hfi1_devdata *dd,
+ 	INIT_LIST_HEAD(&uctxt->sdma_queues);
+ 	spin_lock_init(&uctxt->sdma_qlock);
+ 	hfi1_stats.sps_ctxts++;
+-	dd->freectxts--;
++	/*
++	 * Disable ASPM when there are open user/PSM contexts to avoid
++	 * issues with ASPM L1 exit latency
++	 */
++	if (dd->freectxts-- == dd->num_user_contexts)
++		aspm_disable_all(dd);
+ 	fd->uctxt = uctxt;
+ 
+ 	return 0;
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index 8c6839cc9104..1209f3022bf5 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -325,6 +325,21 @@ struct hfi1_ctxtdata {
+ 	struct list_head sdma_queues;
+ 	spinlock_t sdma_qlock;
+ 
++	/* Is ASPM interrupt supported for this context */
++	bool aspm_intr_supported;
++	/* ASPM state (enabled/disabled) for this context */
++	bool aspm_enabled;
++	/* Timer for re-enabling ASPM if interrupt activity quietens down */
++	struct timer_list aspm_timer;
++	/* Lock to serialize between intr, timer intr and user threads */
++	spinlock_t aspm_lock;
++	/* Is ASPM processing enabled for this context (in intr context) */
++	bool aspm_intr_enable;
++	/* Last interrupt timestamp */
++	ktime_t aspm_ts_last_intr;
++	/* Last timestamp at which we scheduled a timer for this context */
++	ktime_t aspm_ts_timer_sched;
++
+ 	/*
+ 	 * The interrupt handler for a particular receive context can vary
+ 	 * throughout it's lifetime. This is not a lock protected data member so
+@@ -901,6 +916,8 @@ struct hfi1_devdata {
+ 	 * number of ctxts available for PSM open
+ 	 */
+ 	u32 freectxts;
++	/* total number of available user/PSM contexts */
++	u32 num_user_contexts;
+ 	/* base receive interrupt timeout, in CSR units */
+ 	u32 rcv_intr_timeout_csr;
+ 
+@@ -1131,6 +1148,13 @@ struct hfi1_devdata {
+ 	/* receive context tail dummy address */
+ 	__le64 *rcvhdrtail_dummy_kvaddr;
+ 	dma_addr_t rcvhdrtail_dummy_physaddr;
++
++	bool aspm_supported;	/* Does HW support ASPM */
++	bool aspm_enabled;	/* ASPM state: enabled/disabled */
++	/* Serialize ASPM enable/disable between multiple verbs contexts */
++	spinlock_t aspm_lock;
++	/* Number of verbs contexts which have disabled ASPM */
++	atomic_t aspm_disabled_cnt;
+ };
+ 
+ /* 8051 firmware version helper */
+diff --git a/drivers/staging/hfi1/init.c b/drivers/staging/hfi1/init.c
+index e968fb2788e4..c16c202c22c1 100644
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@ -65,6 +65,7 @@
+ #include "sdma.h"
+ #include "debugfs.h"
+ #include "verbs.h"
++#include "aspm.h"
+ 
+ #undef pr_fmt
+ #define pr_fmt(fmt) DRIVER_NAME ": " fmt
+@@ -189,6 +190,12 @@ int hfi1_create_ctxts(struct hfi1_devdata *dd)
+ 		}
+ 	}
+ 
++	/*
++	 * Initialize aspm, to be done after gen3 transition and setting up
++	 * contexts and before enabling interrupts
++	 */
++	aspm_init(dd);
++
+ 	return 0;
+ nomem:
+ 	ret = -ENOMEM;
+diff --git a/drivers/staging/hfi1/pcie.c b/drivers/staging/hfi1/pcie.c
+index 098b66c6995e..5a24bc55c9ed 100644
+--- a/drivers/staging/hfi1/pcie.c
++++ b/drivers/staging/hfi1/pcie.c
+@@ -57,6 +57,7 @@
+ 
+ #include "hfi.h"
+ #include "chip_registers.h"
++#include "aspm.h"
+ 
+ /* link speed vector for Gen3 speed - not in Linux headers */
+ #define GEN1_SPEED_VECTOR 0x1
+@@ -463,6 +464,10 @@ static int hfi1_pcie_caps;
+ module_param_named(pcie_caps, hfi1_pcie_caps, int, S_IRUGO);
+ MODULE_PARM_DESC(pcie_caps, "Max PCIe tuning: Payload (0..3), ReadReq (4..7)");
+ 
++uint aspm_mode = ASPM_MODE_DISABLED;
++module_param_named(aspm, aspm_mode, uint, S_IRUGO);
++MODULE_PARM_DESC(aspm, "PCIe ASPM: 0: disable, 1: enable, 2: dynamic");
++
+ static void tune_pcie_caps(struct hfi1_devdata *dd)
+ {
+ 	struct pci_dev *parent;
+@@ -957,7 +962,7 @@ int do_pcie_gen3_transition(struct hfi1_devdata *dd)
+ 	int do_retry, retry_count = 0;
+ 	uint default_pset;
+ 	u16 target_vector, target_speed;
+-	u16 lnkctl, lnkctl2, vendor;
++	u16 lnkctl2, vendor;
+ 	u8 nsbr = 1;
+ 	u8 div;
+ 	const u8 (*eq)[3];
+@@ -1147,11 +1152,12 @@ retry:
+ 	 */
+ 	write_xmt_margin(dd, __func__);
+ 
+-	/* step 5e: disable active state power management (ASPM) */
++	/*
++	 * step 5e: disable active state power management (ASPM). It
++	 * will be enabled if required later
++	 */
+ 	dd_dev_info(dd, "%s: clearing ASPM\n", __func__);
+-	pcie_capability_read_word(dd->pcidev, PCI_EXP_LNKCTL, &lnkctl);
+-	lnkctl &= ~PCI_EXP_LNKCTL_ASPMC;
+-	pcie_capability_write_word(dd->pcidev, PCI_EXP_LNKCTL, lnkctl);
++	aspm_hw_disable_l1(dd);
+ 
+ 	/*
+ 	 * step 5f: clear DirectSpeedChange
