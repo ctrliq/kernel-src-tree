@@ -1,0 +1,311 @@
+KVM: PPC: Implement kvmppc_xlate for all targets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: Implement kvmppc_xlate for all targets (Thomas Huth) [1226884 1227323]
+Rebuild_FUZZ: 94.51%
+commit-author Alexander Graf <agraf@suse.de>
+commit 7d15c06f1abfe4b893c6c2c8a306b02210a6a6db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7d15c06f.failed
+
+We have a nice API to find the translated GPAs of a GVA including protection
+flags. So far we only use it on Book3S, but there's no reason the same shouldn't
+be used on BookE as well.
+
+Implement a kvmppc_xlate() version for BookE and clean it up to make it more
+readable in general.
+
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 7d15c06f1abfe4b893c6c2c8a306b02210a6a6db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/booke.c
+diff --cc arch/powerpc/kvm/booke.c
+index 858f0d771408,2f697b49073b..000000000000
+--- a/arch/powerpc/kvm/booke.c
++++ b/arch/powerpc/kvm/booke.c
+@@@ -1653,6 -1707,208 +1653,211 @@@ void kvmppc_decrementer_func(unsigned l
+  	kvmppc_set_tsr_bits(vcpu, TSR_DIS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int kvmppc_booke_add_breakpoint(struct debug_reg *dbg_reg,
++ 				       uint64_t addr, int index)
++ {
++ 	switch (index) {
++ 	case 0:
++ 		dbg_reg->dbcr0 |= DBCR0_IAC1;
++ 		dbg_reg->iac1 = addr;
++ 		break;
++ 	case 1:
++ 		dbg_reg->dbcr0 |= DBCR0_IAC2;
++ 		dbg_reg->iac2 = addr;
++ 		break;
++ #if CONFIG_PPC_ADV_DEBUG_IACS > 2
++ 	case 2:
++ 		dbg_reg->dbcr0 |= DBCR0_IAC3;
++ 		dbg_reg->iac3 = addr;
++ 		break;
++ 	case 3:
++ 		dbg_reg->dbcr0 |= DBCR0_IAC4;
++ 		dbg_reg->iac4 = addr;
++ 		break;
++ #endif
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	dbg_reg->dbcr0 |= DBCR0_IDM;
++ 	return 0;
++ }
++ 
++ static int kvmppc_booke_add_watchpoint(struct debug_reg *dbg_reg, uint64_t addr,
++ 				       int type, int index)
++ {
++ 	switch (index) {
++ 	case 0:
++ 		if (type & KVMPPC_DEBUG_WATCH_READ)
++ 			dbg_reg->dbcr0 |= DBCR0_DAC1R;
++ 		if (type & KVMPPC_DEBUG_WATCH_WRITE)
++ 			dbg_reg->dbcr0 |= DBCR0_DAC1W;
++ 		dbg_reg->dac1 = addr;
++ 		break;
++ 	case 1:
++ 		if (type & KVMPPC_DEBUG_WATCH_READ)
++ 			dbg_reg->dbcr0 |= DBCR0_DAC2R;
++ 		if (type & KVMPPC_DEBUG_WATCH_WRITE)
++ 			dbg_reg->dbcr0 |= DBCR0_DAC2W;
++ 		dbg_reg->dac2 = addr;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	dbg_reg->dbcr0 |= DBCR0_IDM;
++ 	return 0;
++ }
++ void kvm_guest_protect_msr(struct kvm_vcpu *vcpu, ulong prot_bitmap, bool set)
++ {
++ 	/* XXX: Add similar MSR protection for BookE-PR */
++ #ifdef CONFIG_KVM_BOOKE_HV
++ 	BUG_ON(prot_bitmap & ~(MSRP_UCLEP | MSRP_DEP | MSRP_PMMP));
++ 	if (set) {
++ 		if (prot_bitmap & MSR_UCLE)
++ 			vcpu->arch.shadow_msrp |= MSRP_UCLEP;
++ 		if (prot_bitmap & MSR_DE)
++ 			vcpu->arch.shadow_msrp |= MSRP_DEP;
++ 		if (prot_bitmap & MSR_PMM)
++ 			vcpu->arch.shadow_msrp |= MSRP_PMMP;
++ 	} else {
++ 		if (prot_bitmap & MSR_UCLE)
++ 			vcpu->arch.shadow_msrp &= ~MSRP_UCLEP;
++ 		if (prot_bitmap & MSR_DE)
++ 			vcpu->arch.shadow_msrp &= ~MSRP_DEP;
++ 		if (prot_bitmap & MSR_PMM)
++ 			vcpu->arch.shadow_msrp &= ~MSRP_PMMP;
++ 	}
++ #endif
++ }
++ 
++ int kvmppc_xlate(struct kvm_vcpu *vcpu, ulong eaddr, enum xlate_instdata xlid,
++ 		 enum xlate_readwrite xlrw, struct kvmppc_pte *pte)
++ {
++ 	int gtlb_index;
++ 	gpa_t gpaddr;
++ 
++ #ifdef CONFIG_KVM_E500V2
++ 	if (!(vcpu->arch.shared->msr & MSR_PR) &&
++ 	    (eaddr & PAGE_MASK) == vcpu->arch.magic_page_ea) {
++ 		pte->eaddr = eaddr;
++ 		pte->raddr = (vcpu->arch.magic_page_pa & PAGE_MASK) |
++ 			     (eaddr & ~PAGE_MASK);
++ 		pte->vpage = eaddr >> PAGE_SHIFT;
++ 		pte->may_read = true;
++ 		pte->may_write = true;
++ 		pte->may_execute = true;
++ 
++ 		return 0;
++ 	}
++ #endif
++ 
++ 	/* Check the guest TLB. */
++ 	switch (xlid) {
++ 	case XLATE_INST:
++ 		gtlb_index = kvmppc_mmu_itlb_index(vcpu, eaddr);
++ 		break;
++ 	case XLATE_DATA:
++ 		gtlb_index = kvmppc_mmu_dtlb_index(vcpu, eaddr);
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	/* Do we have a TLB entry at all? */
++ 	if (gtlb_index < 0)
++ 		return -ENOENT;
++ 
++ 	gpaddr = kvmppc_mmu_xlate(vcpu, gtlb_index, eaddr);
++ 
++ 	pte->eaddr = eaddr;
++ 	pte->raddr = (gpaddr & PAGE_MASK) | (eaddr & ~PAGE_MASK);
++ 	pte->vpage = eaddr >> PAGE_SHIFT;
++ 
++ 	/* XXX read permissions from the guest TLB */
++ 	pte->may_read = true;
++ 	pte->may_write = true;
++ 	pte->may_execute = true;
++ 
++ 	return 0;
++ }
++ 
++ int kvm_arch_vcpu_ioctl_set_guest_debug(struct kvm_vcpu *vcpu,
++ 					 struct kvm_guest_debug *dbg)
++ {
++ 	struct debug_reg *dbg_reg;
++ 	int n, b = 0, w = 0;
++ 
++ 	if (!(dbg->control & KVM_GUESTDBG_ENABLE)) {
++ 		vcpu->arch.shadow_dbg_reg.dbcr0 = 0;
++ 		vcpu->guest_debug = 0;
++ 		kvm_guest_protect_msr(vcpu, MSR_DE, false);
++ 		return 0;
++ 	}
++ 
++ 	kvm_guest_protect_msr(vcpu, MSR_DE, true);
++ 	vcpu->guest_debug = dbg->control;
++ 	vcpu->arch.shadow_dbg_reg.dbcr0 = 0;
++ 	/* Set DBCR0_EDM in guest visible DBCR0 register. */
++ 	vcpu->arch.dbg_reg.dbcr0 = DBCR0_EDM;
++ 
++ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
++ 		vcpu->arch.shadow_dbg_reg.dbcr0 |= DBCR0_IDM | DBCR0_IC;
++ 
++ 	/* Code below handles only HW breakpoints */
++ 	dbg_reg = &(vcpu->arch.shadow_dbg_reg);
++ 
++ #ifdef CONFIG_KVM_BOOKE_HV
++ 	/*
++ 	 * On BookE-HV (e500mc) the guest is always executed with MSR.GS=1
++ 	 * DBCR1 and DBCR2 are set to trigger debug events when MSR.PR is 0
++ 	 */
++ 	dbg_reg->dbcr1 = 0;
++ 	dbg_reg->dbcr2 = 0;
++ #else
++ 	/*
++ 	 * On BookE-PR (e500v2) the guest is always executed with MSR.PR=1
++ 	 * We set DBCR1 and DBCR2 to only trigger debug events when MSR.PR
++ 	 * is set.
++ 	 */
++ 	dbg_reg->dbcr1 = DBCR1_IAC1US | DBCR1_IAC2US | DBCR1_IAC3US |
++ 			  DBCR1_IAC4US;
++ 	dbg_reg->dbcr2 = DBCR2_DAC1US | DBCR2_DAC2US;
++ #endif
++ 
++ 	if (!(vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP))
++ 		return 0;
++ 
++ 	for (n = 0; n < (KVMPPC_BOOKE_IAC_NUM + KVMPPC_BOOKE_DAC_NUM); n++) {
++ 		uint64_t addr = dbg->arch.bp[n].addr;
++ 		uint32_t type = dbg->arch.bp[n].type;
++ 
++ 		if (type == KVMPPC_DEBUG_NONE)
++ 			continue;
++ 
++ 		if (type & !(KVMPPC_DEBUG_WATCH_READ |
++ 			     KVMPPC_DEBUG_WATCH_WRITE |
++ 			     KVMPPC_DEBUG_BREAKPOINT))
++ 			return -EINVAL;
++ 
++ 		if (type & KVMPPC_DEBUG_BREAKPOINT) {
++ 			/* Setting H/W breakpoint */
++ 			if (kvmppc_booke_add_breakpoint(dbg_reg, addr, b++))
++ 				return -EINVAL;
++ 		} else {
++ 			/* Setting H/W watchpoint */
++ 			if (kvmppc_booke_add_watchpoint(dbg_reg, addr,
++ 							type, w++))
++ 				return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 7d15c06f1abf (KVM: PPC: Implement kvmppc_xlate for all targets)
+  void kvmppc_booke_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  {
+  	vcpu->cpu = smp_processor_id();
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 2da5f547d872..fbac6be25158 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -52,6 +52,16 @@ enum instruction_type {
+ 	INST_SC,		/* system call */
+ };
+ 
++enum xlate_instdata {
++	XLATE_INST,		/* translate instruction address */
++	XLATE_DATA		/* translate data address */
++};
++
++enum xlate_readwrite {
++	XLATE_READ,		/* check for read permissions */
++	XLATE_WRITE		/* check for write permissions */
++};
++
+ extern int kvmppc_vcpu_run(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu);
+ extern int __kvmppc_vcpu_run(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu);
+ extern void kvmppc_handler_highmem(void);
+@@ -94,6 +104,9 @@ extern gpa_t kvmppc_mmu_xlate(struct kvm_vcpu *vcpu, unsigned int gtlb_index,
+                               gva_t eaddr);
+ extern void kvmppc_mmu_dtlb_miss(struct kvm_vcpu *vcpu);
+ extern void kvmppc_mmu_itlb_miss(struct kvm_vcpu *vcpu);
++extern int kvmppc_xlate(struct kvm_vcpu *vcpu, ulong eaddr,
++			enum xlate_instdata xlid, enum xlate_readwrite xlrw,
++			struct kvmppc_pte *pte);
+ 
+ extern struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm,
+                                                 unsigned int id);
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index a3cbada114bc..0b6c84e0352d 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -380,9 +380,11 @@ pfn_t kvmppc_gpa_to_pfn(struct kvm_vcpu *vcpu, gpa_t gpa, bool writing,
+ }
+ EXPORT_SYMBOL_GPL(kvmppc_gpa_to_pfn);
+ 
+-static int kvmppc_xlate(struct kvm_vcpu *vcpu, ulong eaddr, bool data,
+-			bool iswrite, struct kvmppc_pte *pte)
++int kvmppc_xlate(struct kvm_vcpu *vcpu, ulong eaddr, enum xlate_instdata xlid,
++		 enum xlate_readwrite xlrw, struct kvmppc_pte *pte)
+ {
++	bool data = (xlid == XLATE_DATA);
++	bool iswrite = (xlrw == XLATE_WRITE);
+ 	int relocated = (kvmppc_get_msr(vcpu) & (data ? MSR_DR : MSR_IR));
+ 	int r;
+ 
+@@ -434,7 +436,8 @@ int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+ 
+ 	vcpu->stat.st++;
+ 
+-	r = kvmppc_xlate(vcpu, *eaddr, data, true, &pte);
++	r = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
++			 XLATE_WRITE, &pte);
+ 	if (r < 0)
+ 		return r;
+ 
+@@ -459,7 +462,8 @@ int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+ 
+ 	vcpu->stat.ld++;
+ 
+-	rc = kvmppc_xlate(vcpu, *eaddr, data, false, &pte);
++	rc = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
++			  XLATE_READ, &pte);
+ 	if (rc)
+ 		return rc;
+ 
+* Unmerged path arch/powerpc/kvm/booke.c
