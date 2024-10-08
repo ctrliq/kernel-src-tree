@@ -1,0 +1,1042 @@
+perf evlist: Introduce evlist__for_each() & friends
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf/evlist: Introduce evlist__for_each() & friends (Jiri Olsa) [1133083]
+Rebuild_FUZZ: 98.04%
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 0050f7aa182e3e8ed34dd6cc4318e52b3df6347a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0050f7aa.failed
+
+For the common evsel list traversal, so that it becomes more compact.
+
+Use the opportunity to start ditching the 'perf_' from 'perf_evlist__',
+as discussed, as the whole conversion touches a lot of places, lets do
+it piecemeal when we have the chance due to other work, like in this
+case.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/n/tip-qnkx7dzm2h6m6uptkfk03ni6@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 0050f7aa182e3e8ed34dd6cc4318e52b3df6347a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-report.c
+#	tools/perf/tests/hists_link.c
+diff --cc tools/perf/builtin-report.c
+index e3b253d3e27e,46864dd7eb83..000000000000
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@@ -442,9 -441,97 +442,100 @@@ static void report__warn_kptr_restrict(
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int report__gtk_browse_hists(struct report *rep, const char *help)
++ {
++ 	int (*hist_browser)(struct perf_evlist *evlist, const char *help,
++ 			    struct hist_browser_timer *timer, float min_pcnt);
++ 
++ 	hist_browser = dlsym(perf_gtk_handle, "perf_evlist__gtk_browse_hists");
++ 
++ 	if (hist_browser == NULL) {
++ 		ui__error("GTK browser not found!\n");
++ 		return -1;
++ 	}
++ 
++ 	return hist_browser(rep->session->evlist, help, NULL, rep->min_percent);
++ }
++ 
++ static int report__browse_hists(struct report *rep)
++ {
++ 	int ret;
++ 	struct perf_session *session = rep->session;
++ 	struct perf_evlist *evlist = session->evlist;
++ 	const char *help = "For a higher level overview, try: perf report --sort comm,dso";
++ 
++ 	switch (use_browser) {
++ 	case 1:
++ 		ret = perf_evlist__tui_browse_hists(evlist, help, NULL,
++ 						    rep->min_percent,
++ 						    &session->header.env);
++ 		/*
++ 		 * Usually "ret" is the last pressed key, and we only
++ 		 * care if the key notifies us to switch data file.
++ 		 */
++ 		if (ret != K_SWITCH_INPUT_DATA)
++ 			ret = 0;
++ 		break;
++ 	case 2:
++ 		ret = report__gtk_browse_hists(rep, help);
++ 		break;
++ 	default:
++ 		ret = perf_evlist__tty_browse_hists(evlist, rep, help);
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static u64 report__collapse_hists(struct report *rep)
++ {
++ 	struct ui_progress prog;
++ 	struct perf_evsel *pos;
++ 	u64 nr_samples = 0;
++ 	/*
++  	 * Count number of histogram entries to use when showing progress,
++  	 * reusing nr_samples variable.
++  	 */
++ 	evlist__for_each(rep->session->evlist, pos)
++ 		nr_samples += pos->hists.nr_entries;
++ 
++ 	ui_progress__init(&prog, nr_samples, "Merging related events...");
++ 	/*
++ 	 * Count total number of samples, will be used to check if this
++  	 * session had any.
++  	 */
++ 	nr_samples = 0;
++ 
++ 	evlist__for_each(rep->session->evlist, pos) {
++ 		struct hists *hists = &pos->hists;
++ 
++ 		if (pos->idx == 0)
++ 			hists->symbol_filter_str = rep->symbol_filter_str;
++ 
++ 		hists__collapse_resort(hists, &prog);
++ 		nr_samples += hists->stats.nr_events[PERF_RECORD_SAMPLE];
++ 
++ 		/* Non-group events are considered as leader */
++ 		if (symbol_conf.event_group &&
++ 		    !perf_evsel__is_group_leader(pos)) {
++ 			struct hists *leader_hists = &pos->leader->hists;
++ 
++ 			hists__match(leader_hists, hists);
++ 			hists__link(leader_hists, hists);
++ 		}
++ 	}
++ 
++ 	ui_progress__finish();
++ 
++ 	return nr_samples;
++ }
++ 
+++>>>>>>> 0050f7aa182e (perf evlist: Introduce evlist__for_each() & friends)
+  static int __cmd_report(struct report *rep)
+  {
+ -	int ret;
+ +	int ret = -EINVAL;
+  	u64 nr_samples;
+  	struct perf_session *session = rep->session;
+  	struct perf_evsel *pos;
+@@@ -514,30 -582,10 +605,30 @@@
+  		return 0;
+  	}
+  
+- 	list_for_each_entry(pos, &session->evlist->entries, node)
++ 	evlist__for_each(session->evlist, pos)
+  		hists__output_resort(&pos->hists);
+  
+ -	return report__browse_hists(rep);
+ +	if (use_browser > 0) {
+ +		if (use_browser == 1) {
+ +			ret = perf_evlist__tui_browse_hists(session->evlist,
+ +							help, NULL,
+ +							rep->min_percent,
+ +							&session->header.env);
+ +			/*
+ +			 * Usually "ret" is the last pressed key, and we only
+ +			 * care if the key notifies us to switch data file.
+ +			 */
+ +			if (ret != K_SWITCH_INPUT_DATA)
+ +				ret = 0;
+ +
+ +		} else if (use_browser == 2) {
+ +			perf_evlist__gtk_browse_hists(session->evlist, help,
+ +						      NULL, rep->min_percent);
+ +		}
+ +	} else
+ +		perf_evlist__tty_browse_hists(session->evlist, rep, help);
+ +
+ +	return ret;
+  }
+  
+  static int
+diff --cc tools/perf/tests/hists_link.c
+index fe6f7bec89fd,2b6519e0e36f..000000000000
+--- a/tools/perf/tests/hists_link.c
++++ b/tools/perf/tests/hists_link.c
+@@@ -466,8 -466,8 +466,13 @@@ int test__hists_link(void
+  	if (err < 0)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(evsel, &evlist->entries, node) {
+ +		hists__collapse_resort(&evsel->hists);
+++=======
++ 	evlist__for_each(evlist, evsel) {
++ 		hists__collapse_resort(&evsel->hists, NULL);
+++>>>>>>> 0050f7aa182e (perf evlist: Introduce evlist__for_each() & friends)
+  
+  		if (verbose > 2)
+  			print_hists(&evsel->hists);
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index 36e3a284497c..d445b365f4e5 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -222,7 +222,7 @@ static int __cmd_annotate(struct perf_annotate *ann)
+ 		perf_session__fprintf_dsos(session, stdout);
+ 
+ 	total_nr_samples = 0;
+-	list_for_each_entry(pos, &session->evlist->entries, node) {
++	evlist__for_each(session->evlist, pos) {
+ 		struct hists *hists = &pos->hists;
+ 		u32 nr_samples = hists->stats.nr_events[PERF_RECORD_SAMPLE];
+ 
+diff --git a/tools/perf/builtin-diff.c b/tools/perf/builtin-diff.c
+index 650b53bd1d81..5265d75a3e0e 100644
+--- a/tools/perf/builtin-diff.c
++++ b/tools/perf/builtin-diff.c
+@@ -356,9 +356,10 @@ static struct perf_evsel *evsel_match(struct perf_evsel *evsel,
+ {
+ 	struct perf_evsel *e;
+ 
+-	list_for_each_entry(e, &evlist->entries, node)
++	evlist__for_each(evlist, e) {
+ 		if (perf_evsel__match2(evsel, e))
+ 			return e;
++	}
+ 
+ 	return NULL;
+ }
+@@ -367,7 +368,7 @@ static void perf_evlist__collapse_resort(struct perf_evlist *evlist)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		struct hists *hists = &evsel->hists;
+ 
+ 		hists__collapse_resort(hists);
+@@ -614,7 +615,7 @@ static void data_process(void)
+ 	struct perf_evsel *evsel_base;
+ 	bool first = true;
+ 
+-	list_for_each_entry(evsel_base, &evlist_base->entries, node) {
++	evlist__for_each(evlist_base, evsel_base) {
+ 		struct data__file *d;
+ 		int i;
+ 
+diff --git a/tools/perf/builtin-evlist.c b/tools/perf/builtin-evlist.c
+index 20b0f12763b0..c99e0de7e54a 100644
+--- a/tools/perf/builtin-evlist.c
++++ b/tools/perf/builtin-evlist.c
+@@ -29,7 +29,7 @@ static int __cmd_evlist(const char *file_name, struct perf_attr_details *details
+ 	if (session == NULL)
+ 		return -ENOMEM;
+ 
+-	list_for_each_entry(pos, &session->evlist->entries, node)
++	evlist__for_each(session->evlist, pos)
+ 		perf_evsel__fprintf(pos, details, stdout);
+ 
+ 	perf_session__delete(session);
+diff --git a/tools/perf/builtin-inject.c b/tools/perf/builtin-inject.c
+index d1bf0a1d94f2..44c4b03e52e1 100644
+--- a/tools/perf/builtin-inject.c
++++ b/tools/perf/builtin-inject.c
+@@ -369,7 +369,7 @@ static int __cmd_inject(struct perf_inject *inject)
+ 
+ 		inject->tool.ordered_samples = true;
+ 
+-		list_for_each_entry(evsel, &session->evlist->entries, node) {
++		evlist__for_each(session->evlist, evsel) {
+ 			const char *name = perf_evsel__name(evsel);
+ 
+ 			if (!strcmp(name, "sched:sched_switch")) {
+diff --git a/tools/perf/builtin-kvm.c b/tools/perf/builtin-kvm.c
+index ce5e8a715422..900d5d5e2043 100644
+--- a/tools/perf/builtin-kvm.c
++++ b/tools/perf/builtin-kvm.c
+@@ -1167,7 +1167,7 @@ static int kvm_live_open_events(struct perf_kvm_stat *kvm)
+ 	 * Note: exclude_{guest,host} do not apply here.
+ 	 *       This command processes KVM tracepoints from host only
+ 	 */
+-	list_for_each_entry(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ 		struct perf_event_attr *attr = &pos->attr;
+ 
+ 		/* make sure these *are* set */
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 6d4fdfe43d2e..528166aeccce 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -183,7 +183,7 @@ static int record__open(struct record *rec)
+ 
+ 	perf_evlist__config(evlist, opts);
+ 
+-	list_for_each_entry(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ try_again:
+ 		if (perf_evsel__open(pos, evlist->cpus, evlist->threads) < 0) {
+ 			if (perf_evsel__fallback(pos, errno, msg, sizeof(msg))) {
+* Unmerged path tools/perf/builtin-report.c
+diff --git a/tools/perf/builtin-script.c b/tools/perf/builtin-script.c
+index f8ab125aac48..80a9b37c80cd 100644
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@ -605,7 +605,7 @@ static int process_attr(struct perf_tool *tool, union perf_event *event,
+ 	if (evsel->attr.type >= PERF_TYPE_MAX)
+ 		return 0;
+ 
+-	list_for_each_entry(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ 		if (pos->attr.type == evsel->attr.type && pos != evsel)
+ 			return 0;
+ 	}
+@@ -1311,8 +1311,7 @@ static int check_ev_match(char *dir_name, char *scriptname,
+ 			snprintf(evname, len + 1, "%s", p);
+ 
+ 			match = 0;
+-			list_for_each_entry(pos,
+-					&session->evlist->entries, node) {
++			evlist__for_each(session->evlist, pos) {
+ 				if (!strcmp(perf_evsel__name(pos), evname)) {
+ 					match = 1;
+ 					break;
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index bcb835404944..6478624af7c6 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -216,7 +216,7 @@ static void perf_evlist__free_stats(struct perf_evlist *evlist)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		perf_evsel__free_stat_priv(evsel);
+ 		perf_evsel__free_counts(evsel);
+ 		perf_evsel__free_prev_raw_counts(evsel);
+@@ -227,7 +227,7 @@ static int perf_evlist__alloc_stats(struct perf_evlist *evlist, bool alloc_raw)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if (perf_evsel__alloc_stat_priv(evsel) < 0 ||
+ 		    perf_evsel__alloc_counts(evsel, perf_evsel__nr_cpus(evsel)) < 0 ||
+ 		    (alloc_raw && perf_evsel__alloc_prev_raw_counts(evsel) < 0))
+@@ -261,7 +261,7 @@ static void perf_stat__reset_stats(struct perf_evlist *evlist)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		perf_evsel__reset_stat_priv(evsel);
+ 		perf_evsel__reset_counts(evsel, perf_evsel__nr_cpus(evsel));
+ 	}
+@@ -328,13 +328,13 @@ static struct perf_evsel *nth_evsel(int n)
+ 
+ 	/* Assumes this only called when evsel_list does not change anymore. */
+ 	if (!array) {
+-		list_for_each_entry(ev, &evsel_list->entries, node)
++		evlist__for_each(evsel_list, ev)
+ 			array_len++;
+ 		array = malloc(array_len * sizeof(void *));
+ 		if (!array)
+ 			exit(ENOMEM);
+ 		j = 0;
+-		list_for_each_entry(ev, &evsel_list->entries, node)
++		evlist__for_each(evsel_list, ev)
+ 			array[j++] = ev;
+ 	}
+ 	if (n < array_len)
+@@ -442,13 +442,13 @@ static void print_interval(void)
+ 	char prefix[64];
+ 
+ 	if (aggr_mode == AGGR_GLOBAL) {
+-		list_for_each_entry(counter, &evsel_list->entries, node) {
++		evlist__for_each(evsel_list, counter) {
+ 			ps = counter->priv;
+ 			memset(ps->res_stats, 0, sizeof(ps->res_stats));
+ 			read_counter_aggr(counter);
+ 		}
+ 	} else	{
+-		list_for_each_entry(counter, &evsel_list->entries, node) {
++		evlist__for_each(evsel_list, counter) {
+ 			ps = counter->priv;
+ 			memset(ps->res_stats, 0, sizeof(ps->res_stats));
+ 			read_counter(counter);
+@@ -485,12 +485,12 @@ static void print_interval(void)
+ 		print_aggr(prefix);
+ 		break;
+ 	case AGGR_NONE:
+-		list_for_each_entry(counter, &evsel_list->entries, node)
++		evlist__for_each(evsel_list, counter)
+ 			print_counter(counter, prefix);
+ 		break;
+ 	case AGGR_GLOBAL:
+ 	default:
+-		list_for_each_entry(counter, &evsel_list->entries, node)
++		evlist__for_each(evsel_list, counter)
+ 			print_counter_aggr(counter, prefix);
+ 	}
+ 
+@@ -506,7 +506,7 @@ static void handle_initial_delay(void)
+ 			nthreads = thread_map__nr(evsel_list->threads);
+ 
+ 		usleep(initial_delay * 1000);
+-		list_for_each_entry(counter, &evsel_list->entries, node)
++		evlist__for_each(evsel_list, counter)
+ 			perf_evsel__enable(counter, ncpus, nthreads);
+ 	}
+ }
+@@ -554,7 +554,7 @@ static int __run_perf_stat(int argc, const char **argv)
+ 	if (group)
+ 		perf_evlist__set_leader(evsel_list);
+ 
+-	list_for_each_entry(counter, &evsel_list->entries, node) {
++	evlist__for_each(evsel_list, counter) {
+ 		if (create_perf_stat_counter(counter) < 0) {
+ 			/*
+ 			 * PPC returns ENXIO for HW counters until 2.6.37
+@@ -632,13 +632,13 @@ static int __run_perf_stat(int argc, const char **argv)
+ 	update_stats(&walltime_nsecs_stats, t1 - t0);
+ 
+ 	if (aggr_mode == AGGR_GLOBAL) {
+-		list_for_each_entry(counter, &evsel_list->entries, node) {
++		evlist__for_each(evsel_list, counter) {
+ 			read_counter_aggr(counter);
+ 			perf_evsel__close_fd(counter, perf_evsel__nr_cpus(counter),
+ 					     thread_map__nr(evsel_list->threads));
+ 		}
+ 	} else {
+-		list_for_each_entry(counter, &evsel_list->entries, node) {
++		evlist__for_each(evsel_list, counter) {
+ 			read_counter(counter);
+ 			perf_evsel__close_fd(counter, perf_evsel__nr_cpus(counter), 1);
+ 		}
+@@ -1119,7 +1119,7 @@ static void print_aggr(char *prefix)
+ 
+ 	for (s = 0; s < aggr_map->nr; s++) {
+ 		id = aggr_map->map[s];
+-		list_for_each_entry(counter, &evsel_list->entries, node) {
++		evlist__for_each(evsel_list, counter) {
+ 			val = ena = run = 0;
+ 			nr = 0;
+ 			for (cpu = 0; cpu < perf_evsel__nr_cpus(counter); cpu++) {
+@@ -1330,11 +1330,11 @@ static void print_stat(int argc, const char **argv)
+ 		print_aggr(NULL);
+ 		break;
+ 	case AGGR_GLOBAL:
+-		list_for_each_entry(counter, &evsel_list->entries, node)
++		evlist__for_each(evsel_list, counter)
+ 			print_counter_aggr(counter, NULL);
+ 		break;
+ 	case AGGR_NONE:
+-		list_for_each_entry(counter, &evsel_list->entries, node)
++		evlist__for_each(evsel_list, counter)
+ 			print_counter(counter, NULL);
+ 		break;
+ 	default:
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index c1b5d3b13b56..b5bc28d8a013 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -482,7 +482,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
+ 
+ 				fprintf(stderr, "\nAvailable events:");
+ 
+-				list_for_each_entry(top->sym_evsel, &top->evlist->entries, node)
++				evlist__for_each(top->evlist, top->sym_evsel)
+ 					fprintf(stderr, "\n\t%d %s", top->sym_evsel->idx, perf_evsel__name(top->sym_evsel));
+ 
+ 				prompt_integer(&counter, "Enter details event counter");
+@@ -493,7 +493,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
+ 					sleep(1);
+ 					break;
+ 				}
+-				list_for_each_entry(top->sym_evsel, &top->evlist->entries, node)
++				evlist__for_each(top->evlist, top->sym_evsel)
+ 					if (top->sym_evsel->idx == counter)
+ 						break;
+ 			} else
+@@ -575,7 +575,7 @@ static void *display_thread_tui(void *arg)
+ 	 * Zooming in/out UIDs. For now juse use whatever the user passed
+ 	 * via --uid.
+ 	 */
+-	list_for_each_entry(pos, &top->evlist->entries, node)
++	evlist__for_each(top->evlist, pos)
+ 		pos->hists.uid_filter_str = top->record_opts.target.uid_str;
+ 
+ 	perf_evlist__tui_browse_hists(top->evlist, help, &hbt, top->min_percent,
+@@ -858,7 +858,7 @@ static int perf_top__start_counters(struct perf_top *top)
+ 
+ 	perf_evlist__config(evlist, opts);
+ 
+-	list_for_each_entry(counter, &evlist->entries, node) {
++	evlist__for_each(evlist, counter) {
+ try_again:
+ 		if (perf_evsel__open(counter, top->evlist->cpus,
+ 				     top->evlist->threads) < 0) {
+diff --git a/tools/perf/tests/evsel-roundtrip-name.c b/tools/perf/tests/evsel-roundtrip-name.c
+index 0197bda9c461..465cdbc345cf 100644
+--- a/tools/perf/tests/evsel-roundtrip-name.c
++++ b/tools/perf/tests/evsel-roundtrip-name.c
+@@ -79,7 +79,7 @@ static int __perf_evsel__name_array_test(const char *names[], int nr_names)
+ 	}
+ 
+ 	err = 0;
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if (strcmp(perf_evsel__name(evsel), names[evsel->idx])) {
+ 			--err;
+ 			pr_debug("%s != %s\n", perf_evsel__name(evsel), names[evsel->idx]);
+* Unmerged path tools/perf/tests/hists_link.c
+diff --git a/tools/perf/tests/mmap-basic.c b/tools/perf/tests/mmap-basic.c
+index aef25f0ff9cc..142263492f6f 100644
+--- a/tools/perf/tests/mmap-basic.c
++++ b/tools/perf/tests/mmap-basic.c
+@@ -126,7 +126,7 @@ int test__basic_mmap(void)
+ 	}
+ 
+ 	err = 0;
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if (nr_events[evsel->idx] != expected_nr_events[evsel->idx]) {
+ 			pr_debug("expected %d %s events, got %d\n",
+ 				 expected_nr_events[evsel->idx],
+diff --git a/tools/perf/tests/parse-events.c b/tools/perf/tests/parse-events.c
+index 7b7a19e78efa..eb9b4b91d674 100644
+--- a/tools/perf/tests/parse-events.c
++++ b/tools/perf/tests/parse-events.c
+@@ -30,7 +30,7 @@ static int test__checkevent_tracepoint_multi(struct perf_evlist *evlist)
+ 	TEST_ASSERT_VAL("wrong number of entries", evlist->nr_entries > 1);
+ 	TEST_ASSERT_VAL("wrong number of groups", 0 == evlist->nr_groups);
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		TEST_ASSERT_VAL("wrong type",
+ 			PERF_TYPE_TRACEPOINT == evsel->attr.type);
+ 		TEST_ASSERT_VAL("wrong sample_type",
+@@ -201,7 +201,7 @@ test__checkevent_tracepoint_multi_modifier(struct perf_evlist *evlist)
+ 
+ 	TEST_ASSERT_VAL("wrong number of entries", evlist->nr_entries > 1);
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		TEST_ASSERT_VAL("wrong exclude_user",
+ 				!evsel->attr.exclude_user);
+ 		TEST_ASSERT_VAL("wrong exclude_kernel",
+diff --git a/tools/perf/ui/browsers/hists.c b/tools/perf/ui/browsers/hists.c
+index ebf95db9a69f..a117d0aff330 100644
+--- a/tools/perf/ui/browsers/hists.c
++++ b/tools/perf/ui/browsers/hists.c
+@@ -1940,7 +1940,7 @@ static int __perf_evlist__tui_browse_hists(struct perf_evlist *evlist,
+ 
+ 	ui_helpline__push("Press ESC to exit");
+ 
+-	list_for_each_entry(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ 		const char *ev_name = perf_evsel__name(pos);
+ 		size_t line_len = strlen(ev_name) + 7;
+ 
+@@ -1972,9 +1972,10 @@ single_entry:
+ 		struct perf_evsel *pos;
+ 
+ 		nr_entries = 0;
+-		list_for_each_entry(pos, &evlist->entries, node)
++		evlist__for_each(evlist, pos) {
+ 			if (perf_evsel__is_group_leader(pos))
+ 				nr_entries++;
++		}
+ 
+ 		if (nr_entries == 1)
+ 			goto single_entry;
+diff --git a/tools/perf/ui/gtk/hists.c b/tools/perf/ui/gtk/hists.c
+index 2ca66cc1160f..5b95c44f3435 100644
+--- a/tools/perf/ui/gtk/hists.c
++++ b/tools/perf/ui/gtk/hists.c
+@@ -375,7 +375,7 @@ int perf_evlist__gtk_browse_hists(struct perf_evlist *evlist,
+ 
+ 	gtk_container_add(GTK_CONTAINER(window), vbox);
+ 
+-	list_for_each_entry(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ 		struct hists *hists = &pos->hists;
+ 		const char *evname = perf_evsel__name(pos);
+ 		GtkWidget *scrolled_window;
+diff --git a/tools/perf/util/cgroup.c b/tools/perf/util/cgroup.c
+index 96bbda1ddb83..87e927f8eeea 100644
+--- a/tools/perf/util/cgroup.c
++++ b/tools/perf/util/cgroup.c
+@@ -81,7 +81,7 @@ static int add_cgroup(struct perf_evlist *evlist, char *str)
+ 	/*
+ 	 * check if cgrp is already defined, if so we reuse it
+ 	 */
+-	list_for_each_entry(counter, &evlist->entries, node) {
++	evlist__for_each(evlist, counter) {
+ 		cgrp = counter->cgrp;
+ 		if (!cgrp)
+ 			continue;
+@@ -110,7 +110,7 @@ static int add_cgroup(struct perf_evlist *evlist, char *str)
+ 	 * if add cgroup N, then need to find event N
+ 	 */
+ 	n = 0;
+-	list_for_each_entry(counter, &evlist->entries, node) {
++	evlist__for_each(evlist, counter) {
+ 		if (n == nr_cgroups)
+ 			goto found;
+ 		n++;
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 885c0d67effb..d3468ffb8039 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -81,7 +81,7 @@ static void perf_evlist__update_id_pos(struct perf_evlist *evlist)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node)
++	evlist__for_each(evlist, evsel)
+ 		perf_evsel__calc_id_pos(evsel);
+ 
+ 	perf_evlist__set_id_pos(evlist);
+@@ -91,7 +91,7 @@ static void perf_evlist__purge(struct perf_evlist *evlist)
+ {
+ 	struct perf_evsel *pos, *n;
+ 
+-	list_for_each_entry_safe(pos, n, &evlist->entries, node) {
++	evlist__for_each_safe(evlist, n, pos) {
+ 		list_del_init(&pos->node);
+ 		perf_evsel__delete(pos);
+ 	}
+@@ -150,7 +150,7 @@ void __perf_evlist__set_leader(struct list_head *list)
+ 
+ 	leader->nr_members = evsel->idx - leader->idx + 1;
+ 
+-	list_for_each_entry(evsel, list, node) {
++	__evlist__for_each(list, evsel) {
+ 		evsel->leader = leader;
+ 	}
+ }
+@@ -209,7 +209,7 @@ static int perf_evlist__add_attrs(struct perf_evlist *evlist,
+ 	return 0;
+ 
+ out_delete_partial_list:
+-	list_for_each_entry_safe(evsel, n, &head, node)
++	__evlist__for_each_safe(&head, n, evsel)
+ 		perf_evsel__delete(evsel);
+ 	return -1;
+ }
+@@ -230,7 +230,7 @@ perf_evlist__find_tracepoint_by_id(struct perf_evlist *evlist, int id)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if (evsel->attr.type   == PERF_TYPE_TRACEPOINT &&
+ 		    (int)evsel->attr.config == id)
+ 			return evsel;
+@@ -245,7 +245,7 @@ perf_evlist__find_tracepoint_by_name(struct perf_evlist *evlist,
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if ((evsel->attr.type == PERF_TYPE_TRACEPOINT) &&
+ 		    (strcmp(evsel->name, name) == 0))
+ 			return evsel;
+@@ -275,7 +275,7 @@ void perf_evlist__disable(struct perf_evlist *evlist)
+ 	int nr_threads = thread_map__nr(evlist->threads);
+ 
+ 	for (cpu = 0; cpu < nr_cpus; cpu++) {
+-		list_for_each_entry(pos, &evlist->entries, node) {
++		evlist__for_each(evlist, pos) {
+ 			if (!perf_evsel__is_group_leader(pos) || !pos->fd)
+ 				continue;
+ 			for (thread = 0; thread < nr_threads; thread++)
+@@ -293,7 +293,7 @@ void perf_evlist__enable(struct perf_evlist *evlist)
+ 	int nr_threads = thread_map__nr(evlist->threads);
+ 
+ 	for (cpu = 0; cpu < nr_cpus; cpu++) {
+-		list_for_each_entry(pos, &evlist->entries, node) {
++		evlist__for_each(evlist, pos) {
+ 			if (!perf_evsel__is_group_leader(pos) || !pos->fd)
+ 				continue;
+ 			for (thread = 0; thread < nr_threads; thread++)
+@@ -633,7 +633,7 @@ static int perf_evlist__mmap_per_evsel(struct perf_evlist *evlist, int idx,
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		int fd = FD(evsel, cpu, thread);
+ 
+ 		if (*output == -1) {
+@@ -809,7 +809,7 @@ int perf_evlist__mmap(struct perf_evlist *evlist, unsigned int pages,
+ 	pr_debug("mmap size %zuB\n", evlist->mmap_len);
+ 	mask = evlist->mmap_len - page_size - 1;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if ((evsel->attr.read_format & PERF_FORMAT_ID) &&
+ 		    evsel->sample_id == NULL &&
+ 		    perf_evsel__alloc_id(evsel, cpu_map__nr(cpus), threads->nr) < 0)
+@@ -852,7 +852,7 @@ int perf_evlist__apply_filters(struct perf_evlist *evlist)
+ 	const int ncpus = cpu_map__nr(evlist->cpus),
+ 		  nthreads = thread_map__nr(evlist->threads);
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if (evsel->filter == NULL)
+ 			continue;
+ 
+@@ -871,7 +871,7 @@ int perf_evlist__set_filter(struct perf_evlist *evlist, const char *filter)
+ 	const int ncpus = cpu_map__nr(evlist->cpus),
+ 		  nthreads = thread_map__nr(evlist->threads);
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		err = perf_evsel__set_filter(evsel, ncpus, nthreads, filter);
+ 		if (err)
+ 			break;
+@@ -890,7 +890,7 @@ bool perf_evlist__valid_sample_type(struct perf_evlist *evlist)
+ 	if (evlist->id_pos < 0 || evlist->is_pos < 0)
+ 		return false;
+ 
+-	list_for_each_entry(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ 		if (pos->id_pos != evlist->id_pos ||
+ 		    pos->is_pos != evlist->is_pos)
+ 			return false;
+@@ -906,7 +906,7 @@ u64 __perf_evlist__combined_sample_type(struct perf_evlist *evlist)
+ 	if (evlist->combined_sample_type)
+ 		return evlist->combined_sample_type;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node)
++	evlist__for_each(evlist, evsel)
+ 		evlist->combined_sample_type |= evsel->attr.sample_type;
+ 
+ 	return evlist->combined_sample_type;
+@@ -924,7 +924,7 @@ bool perf_evlist__valid_read_format(struct perf_evlist *evlist)
+ 	u64 read_format = first->attr.read_format;
+ 	u64 sample_type = first->attr.sample_type;
+ 
+-	list_for_each_entry_continue(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ 		if (read_format != pos->attr.read_format)
+ 			return false;
+ 	}
+@@ -981,7 +981,7 @@ bool perf_evlist__valid_sample_id_all(struct perf_evlist *evlist)
+ {
+ 	struct perf_evsel *first = perf_evlist__first(evlist), *pos = first;
+ 
+-	list_for_each_entry_continue(pos, &evlist->entries, node) {
++	evlist__for_each_continue(evlist, pos) {
+ 		if (first->attr.sample_id_all != pos->attr.sample_id_all)
+ 			return false;
+ 	}
+@@ -1007,7 +1007,7 @@ void perf_evlist__close(struct perf_evlist *evlist)
+ 	int ncpus = cpu_map__nr(evlist->cpus);
+ 	int nthreads = thread_map__nr(evlist->threads);
+ 
+-	list_for_each_entry_reverse(evsel, &evlist->entries, node)
++	evlist__for_each_reverse(evlist, evsel)
+ 		perf_evsel__close(evsel, ncpus, nthreads);
+ }
+ 
+@@ -1018,7 +1018,7 @@ int perf_evlist__open(struct perf_evlist *evlist)
+ 
+ 	perf_evlist__update_id_pos(evlist);
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		err = perf_evsel__open(evsel, evlist->cpus, evlist->threads);
+ 		if (err < 0)
+ 			goto out_err;
+@@ -1157,7 +1157,7 @@ size_t perf_evlist__fprintf(struct perf_evlist *evlist, FILE *fp)
+ 	struct perf_evsel *evsel;
+ 	size_t printed = 0;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		printed += fprintf(fp, "%s%s", evsel->idx ? ", " : "",
+ 				   perf_evsel__name(evsel));
+ 	}
+@@ -1236,7 +1236,7 @@ void perf_evlist__to_front(struct perf_evlist *evlist,
+ 	if (move_evsel == perf_evlist__first(evlist))
+ 		return;
+ 
+-	list_for_each_entry_safe(evsel, n, &evlist->entries, node) {
++	evlist__for_each_safe(evlist, n, evsel) {
+ 		if (evsel->leader == move_evsel->leader)
+ 			list_move_tail(&evsel->node, &move);
+ 	}
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index 7efa93afeec3..dfd4c1eff8ff 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -196,5 +196,70 @@ bool perf_evlist__can_select_event(struct perf_evlist *evlist, const char *str);
+ void perf_evlist__to_front(struct perf_evlist *evlist,
+ 			   struct perf_evsel *move_evsel);
+ 
++/**
++ * __evlist__for_each - iterate thru all the evsels
++ * @list: list_head instance to iterate
++ * @evsel: struct evsel iterator
++ */
++#define __evlist__for_each(list, evsel) \
++        list_for_each_entry(evsel, list, node)
++
++/**
++ * evlist__for_each - iterate thru all the evsels
++ * @evlist: evlist instance to iterate
++ * @evsel: struct evsel iterator
++ */
++#define evlist__for_each(evlist, evsel) \
++	__evlist__for_each(&(evlist)->entries, evsel)
++
++/**
++ * __evlist__for_each_continue - continue iteration thru all the evsels
++ * @list: list_head instance to iterate
++ * @evsel: struct evsel iterator
++ */
++#define __evlist__for_each_continue(list, evsel) \
++        list_for_each_entry_continue(evsel, list, node)
++
++/**
++ * evlist__for_each_continue - continue iteration thru all the evsels
++ * @evlist: evlist instance to iterate
++ * @evsel: struct evsel iterator
++ */
++#define evlist__for_each_continue(evlist, evsel) \
++	__evlist__for_each_continue(&(evlist)->entries, evsel)
++
++/**
++ * __evlist__for_each_reverse - iterate thru all the evsels in reverse order
++ * @list: list_head instance to iterate
++ * @evsel: struct evsel iterator
++ */
++#define __evlist__for_each_reverse(list, evsel) \
++        list_for_each_entry_reverse(evsel, list, node)
++
++/**
++ * evlist__for_each_reverse - iterate thru all the evsels in reverse order
++ * @evlist: evlist instance to iterate
++ * @evsel: struct evsel iterator
++ */
++#define evlist__for_each_reverse(evlist, evsel) \
++	__evlist__for_each_reverse(&(evlist)->entries, evsel)
++
++/**
++ * __evlist__for_each_safe - safely iterate thru all the evsels
++ * @list: list_head instance to iterate
++ * @tmp: struct evsel temp iterator
++ * @evsel: struct evsel iterator
++ */
++#define __evlist__for_each_safe(list, tmp, evsel) \
++        list_for_each_entry_safe(evsel, tmp, list, node)
++
++/**
++ * evlist__for_each_safe - safely iterate thru all the evsels
++ * @evlist: evlist instance to iterate
++ * @evsel: struct evsel iterator
++ * @tmp: struct evsel temp iterator
++ */
++#define evlist__for_each_safe(evlist, tmp, evsel) \
++	__evlist__for_each_safe(&(evlist)->entries, tmp, evsel)
+ 
+ #endif /* __PERF_EVLIST_H */
+diff --git a/tools/perf/util/header.c b/tools/perf/util/header.c
+index 10730b0af804..ec12a00a16d5 100644
+--- a/tools/perf/util/header.c
++++ b/tools/perf/util/header.c
+@@ -643,8 +643,7 @@ static int write_event_desc(int fd, struct perf_header *h __maybe_unused,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
+-
++	evlist__for_each(evlist, evsel) {
+ 		ret = do_write(fd, &evsel->attr, sz);
+ 		if (ret < 0)
+ 			return ret;
+@@ -1092,7 +1091,7 @@ static int write_group_desc(int fd, struct perf_header *h __maybe_unused,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if (perf_evsel__is_group_leader(evsel) &&
+ 		    evsel->nr_members > 1) {
+ 			const char *name = evsel->group_name ?: "{anon_group}";
+@@ -1488,7 +1487,7 @@ static void print_group_desc(struct perf_header *ph, int fd __maybe_unused,
+ 
+ 	session = container_of(ph, struct perf_session, header);
+ 
+-	list_for_each_entry(evsel, &session->evlist->entries, node) {
++	evlist__for_each(session->evlist, evsel) {
+ 		if (perf_evsel__is_group_leader(evsel) &&
+ 		    evsel->nr_members > 1) {
+ 			fprintf(fp, "# group: %s{%s", evsel->group_name ?: "",
+@@ -1769,7 +1768,7 @@ perf_evlist__find_by_index(struct perf_evlist *evlist, int idx)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		if (evsel->idx == idx)
+ 			return evsel;
+ 	}
+@@ -2072,7 +2071,7 @@ static int process_group_desc(struct perf_file_section *section __maybe_unused,
+ 	session->evlist->nr_groups = nr_groups;
+ 
+ 	i = nr = 0;
+-	list_for_each_entry(evsel, &session->evlist->entries, node) {
++	evlist__for_each(session->evlist, evsel) {
+ 		if (evsel->idx == (int) desc[i].leader_idx) {
+ 			evsel->leader = evsel;
+ 			/* {anon_group} is a dummy name */
+@@ -2299,7 +2298,7 @@ int perf_session__write_header(struct perf_session *session,
+ 
+ 	lseek(fd, sizeof(f_header), SEEK_SET);
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(session->evlist, evsel) {
+ 		evsel->id_offset = lseek(fd, 0, SEEK_CUR);
+ 		err = do_write(fd, evsel->id, evsel->ids * sizeof(u64));
+ 		if (err < 0) {
+@@ -2310,7 +2309,7 @@ int perf_session__write_header(struct perf_session *session,
+ 
+ 	attr_offset = lseek(fd, 0, SEEK_CUR);
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node) {
++	evlist__for_each(evlist, evsel) {
+ 		f_attr = (struct perf_file_attr){
+ 			.attr = evsel->attr,
+ 			.ids  = {
+@@ -2743,7 +2742,7 @@ static int perf_evlist__prepare_tracepoint_events(struct perf_evlist *evlist,
+ {
+ 	struct perf_evsel *pos;
+ 
+-	list_for_each_entry(pos, &evlist->entries, node) {
++	evlist__for_each(evlist, pos) {
+ 		if (pos->attr.type == PERF_TYPE_TRACEPOINT &&
+ 		    perf_evsel__prepare_tracepoint_event(pos, pevent))
+ 			return -1;
+@@ -2891,7 +2890,7 @@ int perf_event__synthesize_attrs(struct perf_tool *tool,
+ 	struct perf_evsel *evsel;
+ 	int err = 0;
+ 
+-	list_for_each_entry(evsel, &session->evlist->entries, node) {
++	evlist__for_each(session->evlist, evsel) {
+ 		err = perf_event__synthesize_attr(tool, &evsel->attr, evsel->ids,
+ 						  evsel->id, process);
+ 		if (err) {
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 969cb8f0d88d..18070c95cdc0 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -820,8 +820,7 @@ int parse_events__modifier_event(struct list_head *list, char *str, bool add)
+ 	if (!add && get_event_modifier(&mod, str, NULL))
+ 		return -EINVAL;
+ 
+-	list_for_each_entry(evsel, list, node) {
+-
++	__evlist__for_each(list, evsel) {
+ 		if (add && get_event_modifier(&mod, str, evsel))
+ 			return -EINVAL;
+ 
+@@ -845,7 +844,7 @@ int parse_events_name(struct list_head *list, char *name)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, list, node) {
++	__evlist__for_each(list, evsel) {
+ 		if (!evsel->name)
+ 			evsel->name = strdup(name);
+ 	}
+diff --git a/tools/perf/util/python.c b/tools/perf/util/python.c
+index 4bf8ace7f511..122669c18ff4 100644
+--- a/tools/perf/util/python.c
++++ b/tools/perf/util/python.c
+@@ -908,9 +908,10 @@ static PyObject *pyrf_evlist__item(PyObject *obj, Py_ssize_t i)
+ 	if (i >= pevlist->evlist.nr_entries)
+ 		return NULL;
+ 
+-	list_for_each_entry(pos, &pevlist->evlist.entries, node)
++	evlist__for_each(&pevlist->evlist, pos) {
+ 		if (i-- == 0)
+ 			break;
++	}
+ 
+ 	return Py_BuildValue("O", container_of(pos, struct pyrf_evsel, evsel));
+ }
+diff --git a/tools/perf/util/record.c b/tools/perf/util/record.c
+index 104a47563d39..373762501dad 100644
+--- a/tools/perf/util/record.c
++++ b/tools/perf/util/record.c
+@@ -89,19 +89,19 @@ void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts)
+ 	if (evlist->cpus->map[0] < 0)
+ 		opts->no_inherit = true;
+ 
+-	list_for_each_entry(evsel, &evlist->entries, node)
++	evlist__for_each(evlist, evsel)
+ 		perf_evsel__config(evsel, opts);
+ 
+ 	if (evlist->nr_entries > 1) {
+ 		struct perf_evsel *first = perf_evlist__first(evlist);
+ 
+-		list_for_each_entry(evsel, &evlist->entries, node) {
++		evlist__for_each(evlist, evsel) {
+ 			if (evsel->attr.sample_type == first->attr.sample_type)
+ 				continue;
+ 			use_sample_identifier = perf_can_sample_identifier();
+ 			break;
+ 		}
+-		list_for_each_entry(evsel, &evlist->entries, node)
++		evlist__for_each(evlist, evsel)
+ 			perf_evsel__set_sample_id(evsel, use_sample_identifier);
+ 	}
+ 
+diff --git a/tools/perf/util/session.c b/tools/perf/util/session.c
+index b08bb0fdcecb..8f67e0ff9935 100644
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@ -1385,7 +1385,7 @@ bool perf_session__has_traces(struct perf_session *session, const char *msg)
+ {
+ 	struct perf_evsel *evsel;
+ 
+-	list_for_each_entry(evsel, &session->evlist->entries, node) {
++	evlist__for_each(session->evlist, evsel) {
+ 		if (evsel->attr.type == PERF_TYPE_TRACEPOINT)
+ 			return true;
+ 	}
+@@ -1443,7 +1443,7 @@ size_t perf_session__fprintf_nr_events(struct perf_session *session, FILE *fp)
+ 
+ 	ret += events_stats__fprintf(&session->stats, fp);
+ 
+-	list_for_each_entry(pos, &session->evlist->entries, node) {
++	evlist__for_each(session->evlist, pos) {
+ 		ret += fprintf(fp, "%s stats:\n", perf_evsel__name(pos));
+ 		ret += events_stats__fprintf(&pos->hists.stats, fp);
+ 	}
+@@ -1465,7 +1465,7 @@ struct perf_evsel *perf_session__find_first_evtype(struct perf_session *session,
+ {
+ 	struct perf_evsel *pos;
+ 
+-	list_for_each_entry(pos, &session->evlist->entries, node) {
++	evlist__for_each(session->evlist, pos) {
+ 		if (pos->attr.type == type)
+ 			return pos;
+ 	}
