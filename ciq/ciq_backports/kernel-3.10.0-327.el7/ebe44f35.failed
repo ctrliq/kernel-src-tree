@@ -1,0 +1,182 @@
+ip_tunnel: Move ip_tunnel_get_stats64 into ip_tunnel_core.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author David S. Miller <davem@davemloft.net>
+commit ebe44f350e15d6142d4d74cbaec0dad976c36753
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ebe44f35.failed
+
+net/built-in.o:(.rodata+0x1707c): undefined reference to `ip_tunnel_get_stats64'
+
+	Reported-by: Randy Dunlap <rdunlap@infradead.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ebe44f350e15d6142d4d74cbaec0dad976c36753)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/ip_tunnel.c
+index 97e997263ac1,08f8cf99b3a2..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -68,50 -68,56 +68,103 @@@ static unsigned int ip_tunnel_hash(stru
+  			 IP_TNL_HASH_BITS);
+  }
+  
+++<<<<<<< HEAD
+ +/* Often modified stats are per cpu, other are shared (netdev->stats) */
+ +struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+ +						struct rtnl_link_stats64 *tot)
+ +{
+ +	int i;
+ +
+ +	for_each_possible_cpu(i) {
+ +		const struct pcpu_tstats *tstats = per_cpu_ptr(dev->tstats, i);
+ +		u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
+ +		unsigned int start;
+ +
+ +		do {
+ +			start = u64_stats_fetch_begin_bh(&tstats->syncp);
+ +			rx_packets = tstats->rx_packets;
+ +			tx_packets = tstats->tx_packets;
+ +			rx_bytes = tstats->rx_bytes;
+ +			tx_bytes = tstats->tx_bytes;
+ +		} while (u64_stats_fetch_retry_bh(&tstats->syncp, start));
+ +
+ +		tot->rx_packets += rx_packets;
+ +		tot->tx_packets += tx_packets;
+ +		tot->rx_bytes   += rx_bytes;
+ +		tot->tx_bytes   += tx_bytes;
+ +	}
+ +
+ +	tot->multicast = dev->stats.multicast;
+ +
+ +	tot->rx_crc_errors = dev->stats.rx_crc_errors;
+ +	tot->rx_fifo_errors = dev->stats.rx_fifo_errors;
+ +	tot->rx_length_errors = dev->stats.rx_length_errors;
+ +	tot->rx_frame_errors = dev->stats.rx_frame_errors;
+ +	tot->rx_errors = dev->stats.rx_errors;
+ +
+ +	tot->tx_fifo_errors = dev->stats.tx_fifo_errors;
+ +	tot->tx_carrier_errors = dev->stats.tx_carrier_errors;
+ +	tot->tx_dropped = dev->stats.tx_dropped;
+ +	tot->tx_aborted_errors = dev->stats.tx_aborted_errors;
+ +	tot->tx_errors = dev->stats.tx_errors;
+ +
+ +	tot->collisions  = dev->stats.collisions;
+ +
+ +	return tot;
+ +}
+ +EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
+++=======
++ static void __tunnel_dst_set(struct ip_tunnel_dst *idst,
++ 			     struct dst_entry *dst)
++ {
++ 	struct dst_entry *old_dst;
++ 
++ 	if (dst) {
++ 		if (dst->flags & DST_NOCACHE)
++ 			dst = NULL;
++ 		else
++ 			dst_clone(dst);
++ 	}
++ 	old_dst = xchg((__force struct dst_entry **)&idst->dst, dst);
++ 	dst_release(old_dst);
++ }
++ 
++ static void tunnel_dst_set(struct ip_tunnel *t, struct dst_entry *dst)
++ {
++ 	__tunnel_dst_set(this_cpu_ptr(t->dst_cache), dst);
++ }
++ 
++ static void tunnel_dst_reset(struct ip_tunnel *t)
++ {
++ 	tunnel_dst_set(t, NULL);
++ }
++ 
++ static void tunnel_dst_reset_all(struct ip_tunnel *t)
++ {
++ 	int i;
++ 
++ 	for_each_possible_cpu(i)
++ 		__tunnel_dst_set(per_cpu_ptr(t->dst_cache, i), NULL);
++ }
++ 
++ static struct rtable *tunnel_rtable_get(struct ip_tunnel *t, u32 cookie)
++ {
++ 	struct dst_entry *dst;
++ 
++ 	rcu_read_lock();
++ 	dst = rcu_dereference(this_cpu_ptr(t->dst_cache)->dst);
++ 	if (dst) {
++ 		if (dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
++ 			rcu_read_unlock();
++ 			tunnel_dst_reset(t);
++ 			return NULL;
++ 		}
++ 		dst_hold(dst);
++ 	}
++ 	rcu_read_unlock();
++ 	return (struct rtable *)dst;
++ }
+++>>>>>>> ebe44f350e15 (ip_tunnel: Move ip_tunnel_get_stats64 into ip_tunnel_core.c)
+  
+  static bool ip_tunnel_key_match(const struct ip_tunnel_parm *p,
+  				__be16 flags, __be32 key)
+* Unmerged path net/ipv4/ip_tunnel.c
+diff --git a/net/ipv4/ip_tunnel_core.c b/net/ipv4/ip_tunnel_core.c
+index 0782eb93380a..ffe3fbd69b3d 100644
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -159,3 +159,49 @@ error:
+ 	return ERR_PTR(err);
+ }
+ EXPORT_SYMBOL_GPL(iptunnel_handle_offloads);
++
++/* Often modified stats are per cpu, other are shared (netdev->stats) */
++struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
++						struct rtnl_link_stats64 *tot)
++{
++	int i;
++
++	for_each_possible_cpu(i) {
++		const struct pcpu_sw_netstats *tstats =
++						   per_cpu_ptr(dev->tstats, i);
++		u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
++		unsigned int start;
++
++		do {
++			start = u64_stats_fetch_begin_bh(&tstats->syncp);
++			rx_packets = tstats->rx_packets;
++			tx_packets = tstats->tx_packets;
++			rx_bytes = tstats->rx_bytes;
++			tx_bytes = tstats->tx_bytes;
++		} while (u64_stats_fetch_retry_bh(&tstats->syncp, start));
++
++		tot->rx_packets += rx_packets;
++		tot->tx_packets += tx_packets;
++		tot->rx_bytes   += rx_bytes;
++		tot->tx_bytes   += tx_bytes;
++	}
++
++	tot->multicast = dev->stats.multicast;
++
++	tot->rx_crc_errors = dev->stats.rx_crc_errors;
++	tot->rx_fifo_errors = dev->stats.rx_fifo_errors;
++	tot->rx_length_errors = dev->stats.rx_length_errors;
++	tot->rx_frame_errors = dev->stats.rx_frame_errors;
++	tot->rx_errors = dev->stats.rx_errors;
++
++	tot->tx_fifo_errors = dev->stats.tx_fifo_errors;
++	tot->tx_carrier_errors = dev->stats.tx_carrier_errors;
++	tot->tx_dropped = dev->stats.tx_dropped;
++	tot->tx_aborted_errors = dev->stats.tx_aborted_errors;
++	tot->tx_errors = dev->stats.tx_errors;
++
++	tot->collisions  = dev->stats.collisions;
++
++	return tot;
++}
++EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
