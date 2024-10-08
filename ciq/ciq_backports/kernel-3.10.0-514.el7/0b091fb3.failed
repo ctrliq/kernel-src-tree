@@ -1,0 +1,696 @@
+staging/hfi1: Enable TID caching feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] hfi1: Enable TID caching feature (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 88.89%
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit 0b091fb32c5ae4737bf606a313e6625dad34bbc6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0b091fb3.failed
+
+This commit "flips the switch" on the TID caching feature
+implemented in this patch series.
+
+As well as enabling the new feature by tying the new function
+with the PSM API, it also cleans up the old unneeded code,
+data structure members, and variables.
+
+Due to difference in operation and information, the tracing
+functions related to expected receives had to be changed. This
+patch include these changes.
+
+The tracing function changes could not be split into a separate
+commit without including both tracing variants at the same time.
+This would have caused other complications and ugliness.
+
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 0b091fb32c5ae4737bf606a313e6625dad34bbc6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/file_ops.c
+#	drivers/staging/rdma/hfi1/user_exp_rcv.c
+diff --cc drivers/staging/hfi1/file_ops.c
+index 34efcc6606e4,d36588934f99..000000000000
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@@ -1529,367 -1484,6 +1510,370 @@@ static int user_event_ack(struct hfi1_c
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +#define num_user_pages(vaddr, len)					\
+ +	(1 + (((((unsigned long)(vaddr) +				\
+ +		 (unsigned long)(len) - 1) & PAGE_MASK) -		\
+ +	       ((unsigned long)vaddr & PAGE_MASK)) >> PAGE_SHIFT))
+ +
+ +/**
+ + * tzcnt - count the number of trailing zeros in a 64bit value
+ + * @value: the value to be examined
+ + *
+ + * Returns the number of trailing least significant zeros in the
+ + * the input value. If the value is zero, return the number of
+ + * bits of the value.
+ + */
+ +static inline u8 tzcnt(u64 value)
+ +{
+ +	return value ? __builtin_ctzl(value) : sizeof(value) * 8;
+ +}
+ +
+ +static inline unsigned num_free_groups(unsigned long map, u16 *start)
+ +{
+ +	unsigned free;
+ +	u16 bitidx = *start;
+ +
+ +	if (bitidx >= BITS_PER_LONG)
+ +		return 0;
+ +	/* "Turn off" any bits set before our bit index */
+ +	map &= ~((1ULL << bitidx) - 1);
+ +	free = tzcnt(map) - bitidx;
+ +	while (!free && bitidx < BITS_PER_LONG) {
+ +		/* Zero out the last set bit so we look at the rest */
+ +		map &= ~(1ULL << bitidx);
+ +		/*
+ +		 * Account for the previously checked bits and advance
+ +		 * the bit index. We don't have to check for bitidx
+ +		 * getting bigger than BITS_PER_LONG here as it would
+ +		 * mean extra instructions that we don't need. If it
+ +		 * did happen, it would push free to a negative value
+ +		 * which will break the loop.
+ +		 */
+ +		free = tzcnt(map) - ++bitidx;
+ +	}
+ +	*start = bitidx;
+ +	return free;
+ +}
+ +
+ +static int exp_tid_setup(struct file *fp, struct hfi1_tid_info *tinfo)
+ +{
+ +	int ret = 0;
+ +	struct hfi1_filedata *fd = fp->private_data;
+ +	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+ +	struct hfi1_devdata *dd = uctxt->dd;
+ +	unsigned tid, mapped = 0, npages, ngroups, exp_groups,
+ +		tidpairs = uctxt->expected_count / 2;
+ +	struct page **pages;
+ +	unsigned long vaddr, tidmap[uctxt->tidmapcnt];
+ +	dma_addr_t *phys;
+ +	u32 tidlist[tidpairs], pairidx = 0, tidcursor;
+ +	u16 useidx, idx, bitidx, tidcnt = 0;
+ +
+ +	vaddr = tinfo->vaddr;
+ +
+ +	if (offset_in_page(vaddr)) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +
+ +	npages = num_user_pages(vaddr, tinfo->length);
+ +	if (!npages) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +	if (!access_ok(VERIFY_WRITE, (void __user *)vaddr,
+ +		       npages * PAGE_SIZE)) {
+ +		dd_dev_err(dd, "Fail vaddr %p, %u pages, !access_ok\n",
+ +			   (void *)vaddr, npages);
+ +		ret = -EFAULT;
+ +		goto bail;
+ +	}
+ +
+ +	memset(tidmap, 0, sizeof(tidmap[0]) * uctxt->tidmapcnt);
+ +	memset(tidlist, 0, sizeof(tidlist[0]) * tidpairs);
+ +
+ +	exp_groups = uctxt->expected_count / dd->rcv_entries.group_size;
+ +	/* which group set do we look at first? */
+ +	tidcursor = atomic_read(&uctxt->tidcursor);
+ +	useidx = (tidcursor >> 16) & 0xffff;
+ +	bitidx = tidcursor & 0xffff;
+ +
+ +	/*
+ +	 * Keep going until we've mapped all pages or we've exhausted all
+ +	 * RcvArray entries.
+ +	 * This iterates over the number of tidmaps + 1
+ +	 * (idx <= uctxt->tidmapcnt) so we check the bitmap which we
+ +	 * started from one more time for any free bits before the
+ +	 * starting point bit.
+ +	 */
+ +	for (mapped = 0, idx = 0;
+ +	     mapped < npages && idx <= uctxt->tidmapcnt;) {
+ +		u64 i, offset = 0;
+ +		unsigned free, pinned, pmapped = 0, bits_used;
+ +		u16 grp;
+ +
+ +		/*
+ +		 * "Reserve" the needed group bits under lock so other
+ +		 * processes can't step in the middle of it. Once
+ +		 * reserved, we don't need the lock anymore since we
+ +		 * are guaranteed the groups.
+ +		 */
+ +		spin_lock(&uctxt->exp_lock);
+ +		if (uctxt->tidusemap[useidx] == -1ULL ||
+ +		    bitidx >= BITS_PER_LONG) {
+ +			/* no free groups in the set, use the next */
+ +			useidx = (useidx + 1) % uctxt->tidmapcnt;
+ +			idx++;
+ +			bitidx = 0;
+ +			spin_unlock(&uctxt->exp_lock);
+ +			continue;
+ +		}
+ +		ngroups = ((npages - mapped) / dd->rcv_entries.group_size) +
+ +			!!((npages - mapped) % dd->rcv_entries.group_size);
+ +
+ +		/*
+ +		 * If we've gotten here, the current set of groups does have
+ +		 * one or more free groups.
+ +		 */
+ +		free = num_free_groups(uctxt->tidusemap[useidx], &bitidx);
+ +		if (!free) {
+ +			/*
+ +			 * Despite the check above, free could still come back
+ +			 * as 0 because we don't check the entire bitmap but
+ +			 * we start from bitidx.
+ +			 */
+ +			spin_unlock(&uctxt->exp_lock);
+ +			continue;
+ +		}
+ +		bits_used = min(free, ngroups);
+ +		tidmap[useidx] |= ((1ULL << bits_used) - 1) << bitidx;
+ +		uctxt->tidusemap[useidx] |= tidmap[useidx];
+ +		spin_unlock(&uctxt->exp_lock);
+ +
+ +		/*
+ +		 * At this point, we know where in the map we have free bits.
+ +		 * properly offset into the various "shadow" arrays and compute
+ +		 * the RcvArray entry index.
+ +		 */
+ +		offset = ((useidx * BITS_PER_LONG) + bitidx) *
+ +			dd->rcv_entries.group_size;
+ +		pages = uctxt->tid_pg_list + offset;
+ +		phys = uctxt->physshadow + offset;
+ +		tid = uctxt->expected_base + offset;
+ +
+ +		/* Calculate how many pages we can pin based on free bits */
+ +		pinned = min((bits_used * dd->rcv_entries.group_size),
+ +			     (npages - mapped));
+ +		/*
+ +		 * Now that we know how many free RcvArray entries we have,
+ +		 * we can pin that many user pages.
+ +		 */
+ +		ret = hfi1_acquire_user_pages(vaddr + (mapped * PAGE_SIZE),
+ +					      pinned, true, pages);
+ +		if (ret) {
+ +			/*
+ +			 * We can't continue because the pages array won't be
+ +			 * initialized. This should never happen,
+ +			 * unless perhaps the user has mpin'ed the pages
+ +			 * themselves.
+ +			 */
+ +			dd_dev_info(dd,
+ +				    "Failed to lock addr %p, %u pages: errno %d\n",
+ +				    (void *) vaddr, pinned, -ret);
+ +			/*
+ +			 * Let go of the bits that we reserved since we are not
+ +			 * going to use them.
+ +			 */
+ +			spin_lock(&uctxt->exp_lock);
+ +			uctxt->tidusemap[useidx] &=
+ +				~(((1ULL << bits_used) - 1) << bitidx);
+ +			spin_unlock(&uctxt->exp_lock);
+ +			goto done;
+ +		}
+ +		/*
+ +		 * How many groups do we need based on how many pages we have
+ +		 * pinned?
+ +		 */
+ +		ngroups = (pinned / dd->rcv_entries.group_size) +
+ +			!!(pinned % dd->rcv_entries.group_size);
+ +		/*
+ +		 * Keep programming RcvArray entries for all the <ngroups> free
+ +		 * groups.
+ +		 */
+ +		for (i = 0, grp = 0; grp < ngroups; i++, grp++) {
+ +			unsigned j;
+ +			u32 pair_size = 0, tidsize;
+ +			/*
+ +			 * This inner loop will program an entire group or the
+ +			 * array of pinned pages (which ever limit is hit
+ +			 * first).
+ +			 */
+ +			for (j = 0; j < dd->rcv_entries.group_size &&
+ +				     pmapped < pinned; j++, pmapped++, tid++) {
+ +				tidsize = PAGE_SIZE;
+ +				phys[pmapped] = hfi1_map_page(dd->pcidev,
+ +						   pages[pmapped], 0,
+ +						   tidsize, PCI_DMA_FROMDEVICE);
+ +				trace_hfi1_exp_rcv_set(uctxt->ctxt,
+ +						       fd->subctxt,
+ +						       tid, vaddr,
+ +						       phys[pmapped],
+ +						       pages[pmapped]);
+ +				/*
+ +				 * Each RcvArray entry is programmed with one
+ +				 * page * worth of memory. This will handle
+ +				 * the 8K MTU as well as anything smaller
+ +				 * due to the fact that both entries in the
+ +				 * RcvTidPair are programmed with a page.
+ +				 * PSM currently does not handle anything
+ +				 * bigger than 8K MTU, so should we even worry
+ +				 * about 10K here?
+ +				 */
+ +				hfi1_put_tid(dd, tid, PT_EXPECTED,
+ +					     phys[pmapped],
+ +					     ilog2(tidsize >> PAGE_SHIFT) + 1);
+ +				pair_size += tidsize >> PAGE_SHIFT;
+ +				EXP_TID_RESET(tidlist[pairidx], LEN, pair_size);
+ +				if (!(tid % 2)) {
+ +					tidlist[pairidx] |=
+ +					   EXP_TID_SET(IDX,
+ +						(tid - uctxt->expected_base)
+ +						       / 2);
+ +					tidlist[pairidx] |=
+ +						EXP_TID_SET(CTRL, 1);
+ +					tidcnt++;
+ +				} else {
+ +					tidlist[pairidx] |=
+ +						EXP_TID_SET(CTRL, 2);
+ +					pair_size = 0;
+ +					pairidx++;
+ +				}
+ +			}
+ +			/*
+ +			 * We've programmed the entire group (or as much of the
+ +			 * group as we'll use. Now, it's time to push it out...
+ +			 */
+ +			flush_wc();
+ +		}
+ +		mapped += pinned;
+ +		atomic_set(&uctxt->tidcursor,
+ +			   (((useidx & 0xffffff) << 16) |
+ +			    ((bitidx + bits_used) & 0xffffff)));
+ +	}
+ +	trace_hfi1_exp_tid_map(uctxt->ctxt, fd->subctxt, 0, uctxt->tidusemap,
+ +			       uctxt->tidmapcnt);
+ +
+ +done:
+ +	/* If we've mapped anything, copy relevant info to user */
+ +	if (mapped) {
+ +		if (copy_to_user((void __user *)(unsigned long)tinfo->tidlist,
+ +				 tidlist, sizeof(tidlist[0]) * tidcnt)) {
+ +			ret = -EFAULT;
+ +			goto done;
+ +		}
+ +		/* copy TID info to user */
+ +		if (copy_to_user((void __user *)(unsigned long)tinfo->tidmap,
+ +				 tidmap, sizeof(tidmap[0]) * uctxt->tidmapcnt))
+ +			ret = -EFAULT;
+ +	}
+ +bail:
+ +	/*
+ +	 * Calculate mapped length. New Exp TID protocol does not "unwind" and
+ +	 * report an error if it can't map the entire buffer. It just reports
+ +	 * the length that was mapped.
+ +	 */
+ +	tinfo->length = mapped * PAGE_SIZE;
+ +	tinfo->tidcnt = tidcnt;
+ +	return ret;
+ +}
+ +
+ +static int exp_tid_free(struct file *fp, struct hfi1_tid_info *tinfo)
+ +{
+ +	struct hfi1_filedata *fd = fp->private_data;
+ +	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+ +	struct hfi1_devdata *dd = uctxt->dd;
+ +	unsigned long tidmap[uctxt->tidmapcnt];
+ +	struct page **pages;
+ +	dma_addr_t *phys;
+ +	u16 idx, bitidx, tid;
+ +	int ret = 0;
+ +
+ +	if (copy_from_user(&tidmap, (void __user *)(unsigned long)
+ +			   tinfo->tidmap,
+ +			   sizeof(tidmap[0]) * uctxt->tidmapcnt)) {
+ +		ret = -EFAULT;
+ +		goto done;
+ +	}
+ +	for (idx = 0; idx < uctxt->tidmapcnt; idx++) {
+ +		unsigned long map;
+ +
+ +		bitidx = 0;
+ +		if (!tidmap[idx])
+ +			continue;
+ +		map = tidmap[idx];
+ +		while ((bitidx = tzcnt(map)) < BITS_PER_LONG) {
+ +			int i, pcount = 0;
+ +			struct page *pshadow[dd->rcv_entries.group_size];
+ +			unsigned offset = ((idx * BITS_PER_LONG) + bitidx) *
+ +				dd->rcv_entries.group_size;
+ +
+ +			pages = uctxt->tid_pg_list + offset;
+ +			phys = uctxt->physshadow + offset;
+ +			tid = uctxt->expected_base + offset;
+ +			for (i = 0; i < dd->rcv_entries.group_size;
+ +			     i++, tid++) {
+ +				if (pages[i]) {
+ +					hfi1_put_tid(dd, tid, PT_INVALID,
+ +						      0, 0);
+ +					trace_hfi1_exp_rcv_free(uctxt->ctxt,
+ +								fd->subctxt,
+ +								tid, phys[i],
+ +								pages[i]);
+ +					pci_unmap_page(dd->pcidev, phys[i],
+ +					      PAGE_SIZE, PCI_DMA_FROMDEVICE);
+ +					pshadow[pcount] = pages[i];
+ +					pages[i] = NULL;
+ +					pcount++;
+ +					phys[i] = 0;
+ +				}
+ +			}
+ +			flush_wc();
+ +			hfi1_release_user_pages(pshadow, pcount, true);
+ +			clear_bit(bitidx, &uctxt->tidusemap[idx]);
+ +			map &= ~(1ULL<<bitidx);
+ +		}
+ +	}
+ +	trace_hfi1_exp_tid_map(uctxt->ctxt, fd->subctxt, 1, uctxt->tidusemap,
+ +			       uctxt->tidmapcnt);
+ +done:
+ +	return ret;
+ +}
+ +
+ +static void unlock_exp_tids(struct hfi1_ctxtdata *uctxt)
+ +{
+ +	struct hfi1_devdata *dd = uctxt->dd;
+ +	unsigned tid;
+ +
+ +	dd_dev_info(dd, "ctxt %u unlocking any locked expTID pages\n",
+ +		    uctxt->ctxt);
+ +	for (tid = 0; tid < uctxt->expected_count; tid++) {
+ +		struct page *p = uctxt->tid_pg_list[tid];
+ +		dma_addr_t phys;
+ +
+ +		if (!p)
+ +			continue;
+ +
+ +		phys = uctxt->physshadow[tid];
+ +		uctxt->physshadow[tid] = 0;
+ +		uctxt->tid_pg_list[tid] = NULL;
+ +		pci_unmap_page(dd->pcidev, phys, PAGE_SIZE, PCI_DMA_FROMDEVICE);
+ +		hfi1_release_user_pages(&p, 1, true);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 0b091fb32c5a (staging/hfi1: Enable TID caching feature):drivers/staging/rdma/hfi1/file_ops.c
+  static int set_ctxt_pkey(struct hfi1_ctxtdata *uctxt, unsigned subctxt,
+  			 u16 pkey)
+  {
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
+* Unmerged path drivers/staging/hfi1/file_ops.c
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index d9319fb2b434..c08e308c12a2 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -238,18 +238,6 @@ struct hfi1_ctxtdata {
+ 	u32 expected_count;
+ 	/* index of first expected TID entry. */
+ 	u32 expected_base;
+-	/* cursor into the exp group sets */
+-	atomic_t tidcursor;
+-	/* number of exp TID groups assigned to the ctxt */
+-	u16 numtidgroups;
+-	/* size of exp TID group fields in tidusemap */
+-	u16 tidmapcnt;
+-	/* exp TID group usage bitfield array */
+-	unsigned long *tidusemap;
+-	/* pinned pages for exp sends, allocated at open */
+-	struct page **tid_pg_list;
+-	/* dma handles for exp tid pages */
+-	dma_addr_t *physshadow;
+ 
+ 	struct exp_tid_set tid_group_list;
+ 	struct exp_tid_set tid_used_list;
+@@ -1656,8 +1644,6 @@ int get_platform_config_field(struct hfi1_devdata *dd,
+ 			enum platform_config_table_type_encoding table_type,
+ 			int table_index, int field_index, u32 *data, u32 len);
+ 
+-dma_addr_t hfi1_map_page(struct pci_dev *, struct page *, unsigned long,
+-			 size_t, int);
+ const char *get_unit_name(int unit);
+ 
+ /*
+diff --git a/drivers/staging/hfi1/init.c b/drivers/staging/hfi1/init.c
+index 71f4d21145d3..3da264e25783 100644
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@ -962,13 +962,10 @@ void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
+ 	kfree(rcd->egrbufs.buffers);
+ 
+ 	sc_free(rcd->sc);
+-	vfree(rcd->physshadow);
+-	vfree(rcd->tid_pg_list);
+ 	vfree(rcd->user_event_mask);
+ 	vfree(rcd->subctxt_uregbase);
+ 	vfree(rcd->subctxt_rcvegrbuf);
+ 	vfree(rcd->subctxt_rcvhdr_base);
+-	kfree(rcd->tidusemap);
+ 	kfree(rcd->opstats);
+ 	kfree(rcd);
+ }
+diff --git a/drivers/staging/hfi1/trace.h b/drivers/staging/hfi1/trace.h
+index 86c12ebfd4f0..1e435675335f 100644
+--- a/drivers/staging/hfi1/trace.h
++++ b/drivers/staging/hfi1/trace.h
+@@ -153,92 +153,130 @@ TRACE_EVENT(hfi1_receive_interrupt,
+ 	)
+ );
+ 
+-const char *print_u64_array(struct trace_seq *, u64 *, int);
++TRACE_EVENT(hfi1_exp_tid_reg,
++	    TP_PROTO(unsigned ctxt, u16 subctxt, u32 rarr,
++		     u32 npages, unsigned long va, unsigned long pa,
++		     dma_addr_t dma),
++	    TP_ARGS(ctxt, subctxt, rarr, npages, va, pa, dma),
++	    TP_STRUCT__entry(
++		    __field(unsigned, ctxt)
++		    __field(u16, subctxt)
++		    __field(u32, rarr)
++		    __field(u32, npages)
++		    __field(unsigned long, va)
++		    __field(unsigned long, pa)
++		    __field(dma_addr_t, dma)
++		    ),
++	    TP_fast_assign(
++		    __entry->ctxt = ctxt;
++		    __entry->subctxt = subctxt;
++		    __entry->rarr = rarr;
++		    __entry->npages = npages;
++		    __entry->va = va;
++		    __entry->pa = pa;
++		    __entry->dma = dma;
++		    ),
++	    TP_printk("[%u:%u] entry:%u, %u pages @ 0x%lx, va:0x%lx dma:0x%llx",
++		      __entry->ctxt,
++		      __entry->subctxt,
++		      __entry->rarr,
++		      __entry->npages,
++		      __entry->pa,
++		      __entry->va,
++		      __entry->dma
++		    )
++	);
+ 
+-TRACE_EVENT(hfi1_exp_tid_map,
+-	    TP_PROTO(unsigned ctxt, u16 subctxt, int dir,
+-		     unsigned long *maps, u16 count),
+-	    TP_ARGS(ctxt, subctxt, dir, maps, count),
++TRACE_EVENT(hfi1_exp_tid_unreg,
++	    TP_PROTO(unsigned ctxt, u16 subctxt, u32 rarr, u32 npages,
++		     unsigned long va, unsigned long pa, dma_addr_t dma),
++	    TP_ARGS(ctxt, subctxt, rarr, npages, va, pa, dma),
+ 	    TP_STRUCT__entry(
+ 		    __field(unsigned, ctxt)
+ 		    __field(u16, subctxt)
+-		    __field(int, dir)
+-		    __field(u16, count)
+-		    __dynamic_array(unsigned long, maps, sizeof(*maps) * count)
++		    __field(u32, rarr)
++		    __field(u32, npages)
++		    __field(unsigned long, va)
++		    __field(unsigned long, pa)
++		    __field(dma_addr_t, dma)
+ 		    ),
+ 	    TP_fast_assign(
+ 		    __entry->ctxt = ctxt;
+ 		    __entry->subctxt = subctxt;
+-		    __entry->dir = dir;
+-		    __entry->count = count;
+-		    memcpy(__get_dynamic_array(maps), maps,
+-			   sizeof(*maps) * count);
++		    __entry->rarr = rarr;
++		    __entry->npages = npages;
++		    __entry->va = va;
++		    __entry->pa = pa;
++		    __entry->dma = dma;
+ 		    ),
+-	    TP_printk("[%3u:%02u] %s tidmaps %s",
++	    TP_printk("[%u:%u] entry:%u, %u pages @ 0x%lx, va:0x%lx dma:0x%llx",
+ 		      __entry->ctxt,
+ 		      __entry->subctxt,
+-		      (__entry->dir ? ">" : "<"),
+-		      print_u64_array(p, __get_dynamic_array(maps),
+-				      __entry->count)
++		      __entry->rarr,
++		      __entry->npages,
++		      __entry->pa,
++		      __entry->va,
++		      __entry->dma
+ 		    )
+ 	);
+ 
+-TRACE_EVENT(hfi1_exp_rcv_set,
+-	    TP_PROTO(unsigned ctxt, u16 subctxt, u32 tid,
+-		     unsigned long vaddr, u64 phys_addr, void *page),
+-	    TP_ARGS(ctxt, subctxt, tid, vaddr, phys_addr, page),
++TRACE_EVENT(hfi1_exp_tid_inval,
++	    TP_PROTO(unsigned ctxt, u16 subctxt, unsigned long va, u32 rarr,
++		     u32 npages, dma_addr_t dma),
++	    TP_ARGS(ctxt, subctxt, va, rarr, npages, dma),
+ 	    TP_STRUCT__entry(
+ 		    __field(unsigned, ctxt)
+ 		    __field(u16, subctxt)
+-		    __field(u32, tid)
+-		    __field(unsigned long, vaddr)
+-		    __field(u64, phys_addr)
+-		    __field(void *, page)
++		    __field(unsigned long, va)
++		    __field(u32, rarr)
++		    __field(u32, npages)
++		    __field(dma_addr_t, dma)
+ 		    ),
+ 	    TP_fast_assign(
+ 		    __entry->ctxt = ctxt;
+ 		    __entry->subctxt = subctxt;
+-		    __entry->tid = tid;
+-		    __entry->vaddr = vaddr;
+-		    __entry->phys_addr = phys_addr;
+-		    __entry->page = page;
++		    __entry->va = va;
++		    __entry->rarr = rarr;
++		    __entry->npages = npages;
++		    __entry->dma = dma;
+ 		    ),
+-	    TP_printk("[%u:%u] TID %u, vaddrs 0x%lx, physaddr 0x%llx, pgp %p",
++	    TP_printk("[%u:%u] entry:%u, %u pages @ 0x%lx dma: 0x%llx",
+ 		      __entry->ctxt,
+ 		      __entry->subctxt,
+-		      __entry->tid,
+-		      __entry->vaddr,
+-		      __entry->phys_addr,
+-		      __entry->page
++		      __entry->rarr,
++		      __entry->npages,
++		      __entry->va,
++		      __entry->dma
+ 		    )
+ 	);
+ 
+-TRACE_EVENT(hfi1_exp_rcv_free,
+-	    TP_PROTO(unsigned ctxt, u16 subctxt, u32 tid,
+-		     unsigned long phys, void *page),
+-	    TP_ARGS(ctxt, subctxt, tid, phys, page),
++TRACE_EVENT(hfi1_mmu_invalidate,
++	    TP_PROTO(unsigned ctxt, u16 subctxt, const char *type,
++		     unsigned long start, unsigned long end),
++	    TP_ARGS(ctxt, subctxt, type, start, end),
+ 	    TP_STRUCT__entry(
+ 		    __field(unsigned, ctxt)
+ 		    __field(u16, subctxt)
+-		    __field(u32, tid)
+-		    __field(unsigned long, phys)
+-		    __field(void *, page)
++		    __string(type, type)
++		    __field(unsigned long, start)
++		    __field(unsigned long, end)
+ 		    ),
+ 	    TP_fast_assign(
+ 		    __entry->ctxt = ctxt;
+ 		    __entry->subctxt = subctxt;
+-		    __entry->tid = tid;
+-		    __entry->phys = phys;
+-		    __entry->page = page;
++		    __assign_str(type, type);
++		    __entry->start = start;
++		    __entry->end = end;
+ 		    ),
+-	    TP_printk("[%u:%u] freeing TID %u, 0x%lx, pgp %p",
++	    TP_printk("[%3u:%02u] MMU Invalidate (%s) 0x%lx - 0x%lx",
+ 		      __entry->ctxt,
+ 		      __entry->subctxt,
+-		      __entry->tid,
+-		      __entry->phys,
+-		      __entry->page
++		      __get_str(type),
++		      __entry->start,
++		      __entry->end
+ 		    )
+ 	);
++
+ #undef TRACE_SYSTEM
+ #define TRACE_SYSTEM hfi1_tx
+ 
+diff --git a/drivers/staging/hfi1/user_pages.c b/drivers/staging/hfi1/user_pages.c
+index 692de658f0dc..1854c0c7ce7e 100644
+--- a/drivers/staging/hfi1/user_pages.c
++++ b/drivers/staging/hfi1/user_pages.c
+@@ -54,20 +54,6 @@
+ 
+ #include "hfi.h"
+ 
+-/**
+- * hfi1_map_page - a safety wrapper around pci_map_page()
+- *
+- */
+-dma_addr_t hfi1_map_page(struct pci_dev *hwdev, struct page *page,
+-			 unsigned long offset, size_t size, int direction)
+-{
+-	dma_addr_t phys;
+-
+-	phys = pci_map_page(hwdev, page, offset, size, direction);
+-
+-	return phys;
+-}
+-
+ int hfi1_acquire_user_pages(unsigned long vaddr, size_t npages, bool writable,
+ 			    struct page **pages)
+ {
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
+diff --git a/include/uapi/rdma/hfi/hfi1_user.h b/include/uapi/rdma/hfi/hfi1_user.h
+index 7bb3830de469..11e0547c9138 100644
+--- a/include/uapi/rdma/hfi/hfi1_user.h
++++ b/include/uapi/rdma/hfi/hfi1_user.h
+@@ -66,7 +66,7 @@
+  * The major version changes when data structures change in an incompatible
+  * way. The driver must be the same for initialization to succeed.
+  */
+-#define HFI1_USER_SWMAJOR 4
++#define HFI1_USER_SWMAJOR 5
+ 
+ /*
+  * Minor version differences are always compatible
+@@ -241,11 +241,6 @@ struct hfi1_tid_info {
+ 	__u32 tidcnt;
+ 	/* length of transfer buffer programmed by this request */
+ 	__u32 length;
+-	/*
+-	 * pointer to bitmap of TIDs used for this call;
+-	 * checked for being large enough at open
+-	 */
+-	__u64 tidmap;
+ };
+ 
+ struct hfi1_cmd {
