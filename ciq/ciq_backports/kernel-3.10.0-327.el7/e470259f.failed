@@ -1,0 +1,360 @@
+bonding: 3ad: convert to bond->mode_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit e470259fa1bd7ce5a375b16c5ec97cc0e83b058d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e470259f.failed
+
+Now that we have bond->mode_lock, we can remove the state_machine_lock
+and use it in its place. There're no fast paths requiring the per-port
+spinlocks so it should be okay to consolidate them into mode_lock.
+Also move it inside the unbinding function as we don't want to expose
+mode_lock outside of the specific modes.
+
+	Suggested-by: Jay Vosburgh <jay.vosburgh@canonical.com>
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e470259fa1bd7ce5a375b16c5ec97cc0e83b058d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_3ad.c
+index 65115ee7b259,2bb360f32a64..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -280,26 -234,6 +280,29 @@@ static inline int __check_agg_selection
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * __get_state_machine_lock - lock the port's state machines
+ + * @port: the port we're looking at
+ + *
+ + */
+ +static inline void __get_state_machine_lock(struct port *port)
+ +{
+ +	spin_lock_bh(&(SLAVE_AD_INFO(port->slave).state_machine_lock));
+ +}
+ +
+ +/**
+ + * __release_state_machine_lock - unlock the port's state machines
+ + * @port: the port we're looking at
+ + *
+ + */
+ +static inline void __release_state_machine_lock(struct port *port)
+ +{
+ +	spin_unlock_bh(&(SLAVE_AD_INFO(port->slave).state_machine_lock));
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+   * __get_link_speed - get a port's speed
+   * @port: the port we're looking at
+   *
+@@@ -386,18 -323,7 +389,22 @@@ static u8 __get_duplex(struct port *por
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * __initialize_port_locks - initialize a port's STATE machine spinlock
+ + * @port: the slave of the port we're looking at
+ + *
+ + */
+ +static inline void __initialize_port_locks(struct slave *slave)
+ +{
+ +	// make sure it isn't called twice
+ +	spin_lock_init(&(SLAVE_AD_INFO(slave).state_machine_lock));
+ +}
+ +
+ +//conversions
+++=======
++ /* Conversions */
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+  
+  /**
+   * __ad_timer_to_ticks - convert a given timer type to AD module ticks
+@@@ -1908,17 -1815,12 +1915,16 @@@ void bond_3ad_bind_slave(struct slave *
+  
+  		ad_initialize_port(port, bond->params.lacp_fast);
+  
+- 		__initialize_port_locks(slave);
+  		port->slave = slave;
+ -		port->actor_port_number = SLAVE_AD_INFO(slave)->id;
+ +		port->actor_port_number = SLAVE_AD_INFO(slave).id;
+  		/* key is determined according to the link speed, duplex and user key(which
+  		 * is yet not supported)
+ +		 *              ------------------------------------------------------------
+ +		 * Port key :   | User key                       |      Speed       |Duplex|
+ +		 *              ------------------------------------------------------------
+ +		 *              16                               6               1 0
+  		 */
+ -		port->actor_admin_port_key = 0;
+ +		port->actor_admin_port_key = 0;	/* initialize this parameter */
+  		port->actor_admin_port_key |= __get_duplex(port);
+  		port->actor_admin_port_key |= (__get_link_speed(port) << 1);
+  		port->actor_oper_port_key = port->actor_admin_port_key;
+@@@ -1964,21 -1870,20 +1970,34 @@@ void bond_3ad_unbind_slave(struct slav
+  	struct slave *slave_iter;
+  	struct list_head *iter;
+  
+++<<<<<<< HEAD
+ +	// find the aggregator related to this slave
+ +	aggregator = &(SLAVE_AD_INFO(slave).aggregator);
+++=======
++ 	/* Sync against bond_3ad_state_machine_handler() */
++ 	spin_lock_bh(&bond->mode_lock);
++ 	aggregator = &(SLAVE_AD_INFO(slave)->aggregator);
++ 	port = &(SLAVE_AD_INFO(slave)->port);
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+  
+ -	/* if slave is null, the whole port is not initialized */
+ +	// find the port related to this slave
+ +	port = &(SLAVE_AD_INFO(slave).port);
+ +
+ +	// if slave is null, the whole port is not initialized
+  	if (!port->slave) {
+++<<<<<<< HEAD
+ +		pr_warning("Warning: %s: Trying to unbind an uninitialized port on %s\n",
+ +			   slave->bond->dev->name, slave->dev->name);
+ +		return;
+++=======
++ 		netdev_warn(bond->dev, "Trying to unbind an uninitialized port on %s\n",
++ 			    slave->dev->name);
++ 		goto out;
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+  	}
+  
+ -	netdev_dbg(bond->dev, "Unbinding Link Aggregation Group %d\n",
+ -		   aggregator->aggregator_identifier);
+ +	pr_debug("Unbinding Link Aggregation Group %d\n",
+ +		 aggregator->aggregator_identifier);
+  
+  	/* Tell the partner that this port is not suitable for aggregation */
+  	port->actor_oper_port_state &= ~AD_STATE_AGGREGATION;
+@@@ -2109,24 -2027,34 +2131,36 @@@ void bond_3ad_state_machine_handler(str
+  {
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    ad_work.work);
+ -	struct aggregator *aggregator;
+ -	struct list_head *iter;
+ -	struct slave *slave;
+  	struct port *port;
+ -	bool should_notify_rtnl = BOND_SLAVE_NOTIFY_LATER;
+ +	struct aggregator *aggregator;
+  
+++<<<<<<< HEAD
+ +	if (!rtnl_trylock()) {
+ +		queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+ +		return;
+ +	}
+ +	//check if there are any slaves
+ +	if (bond->slave_cnt == 0)
+++=======
++ 	/* Lock to protect data accessed by all (e.g., port->sm_vars) and
++ 	 * against running with bond_3ad_unbind_slave. ad_rx_machine may run
++ 	 * concurrently due to incoming LACPDU as well.
++ 	 */
++ 	spin_lock_bh(&bond->mode_lock);
++ 	rcu_read_lock();
++ 
++ 	/* check if there are any slaves */
++ 	if (!bond_has_slaves(bond))
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+  		goto re_arm;
+  
+ -	/* check if agg_select_timer timer after initialize is timed out */
+ -	if (BOND_AD_INFO(bond).agg_select_timer &&
+ -	    !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ -		slave = bond_first_slave_rcu(bond);
+ -		port = slave ? &(SLAVE_AD_INFO(slave)->port) : NULL;
+ -
+ -		/* select the active aggregator for the bond */
+ -		if (port) {
+ +	// check if agg_select_timer timer after initialize is timed out
+ +	if (BOND_AD_INFO(bond).agg_select_timer && !(--BOND_AD_INFO(bond).agg_select_timer)) {
+ +		// select the active aggregator for the bond
+ +		if ((port = __get_first_port(bond))) {
+  			if (!port->slave) {
+ -				net_warn_ratelimited("%s: Warning: bond's first port is uninitialized\n",
+ -						     bond->dev->name);
+ +				pr_warning("%s: Warning: bond's first port is uninitialized\n",
+ +					   bond->dev->name);
+  				goto re_arm;
+  			}
+  
+@@@ -2156,11 -2079,9 +2184,9 @@@
+  		ad_mux_machine(port);
+  		ad_tx_machine(port);
+  
+ -		/* turn off the BEGIN bit, since we already handled it */
+ +		// turn off the BEGIN bit, since we already handled it
+  		if (port->sm_vars & AD_PORT_BEGIN)
+  			port->sm_vars &= ~AD_PORT_BEGIN;
+- 
+- 		__release_state_machine_lock(port);
+  	}
+  
+  re_arm:
+@@@ -2196,12 -2130,12 +2222,12 @@@ static int bond_3ad_rx_indication(struc
+  		switch (lacpdu->subtype) {
+  		case AD_TYPE_LACPDU:
+  			ret = RX_HANDLER_CONSUMED;
+ -			netdev_dbg(slave->bond->dev, "Received LACPDU on port %d\n",
+ -				   port->actor_port_number);
+ +			pr_debug("Received LACPDU on port %d\n",
+ +				 port->actor_port_number);
+  			/* Protect against concurrent state machines */
+- 			__get_state_machine_lock(port);
++ 			spin_lock(&slave->bond->mode_lock);
+  			ad_rx_machine(lacpdu, port);
+- 			__release_state_machine_lock(port);
++ 			spin_unlock(&slave->bond->mode_lock);
+  			break;
+  
+  		case AD_TYPE_MARKER:
+@@@ -2347,13 -2283,16 +2373,13 @@@ void bond_3ad_handle_link_change(struc
+  	 */
+  	port->sm_vars |= AD_PORT_BEGIN;
+  
+- 	__release_state_machine_lock(port);
++ 	spin_unlock_bh(&slave->bond->mode_lock);
+  }
+  
+ -/**
+ - * bond_3ad_set_carrier - set link state for bonding master
+ - * @bond - bonding structure
+ - *
+ - * if we have an active aggregator, we're up, if not, we're down.
+ - * Presumes that we cannot have an active aggregator if there are
+ - * no slaves with link up.
+ +/*
+ + * set link state for bonding master: if we have an active
+ + * aggregator, we're up, if not, we're down.  Presumes that we cannot
+ + * have an active aggregator if there are no slaves with link up.
+   *
+   * This behavior complies with IEEE 802.3 section 43.3.9.
+   *
+@@@ -2528,25 -2473,19 +2554,34 @@@ int bond_3ad_lacpdu_recv(const struct s
+   */
+  void bond_3ad_update_lacp_rate(struct bonding *bond)
+  {
+ -	struct port *port = NULL;
+ -	struct list_head *iter;
+ +	int i;
+  	struct slave *slave;
+ +	struct port *port = NULL;
+  	int lacp_fast;
+  
+ +	write_lock_bh(&bond->lock);
+  	lacp_fast = bond->params.lacp_fast;
+++<<<<<<< HEAD
+ +
+ +	bond_for_each_slave(bond, slave, i) {
+ +		port = &(SLAVE_AD_INFO(slave).port);
+ +		if (port->slave == NULL)
+ +			continue;
+ +		__get_state_machine_lock(port);
+++=======
++ 	spin_lock_bh(&bond->mode_lock);
++ 	bond_for_each_slave(bond, slave, iter) {
++ 		port = &(SLAVE_AD_INFO(slave)->port);
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+  		if (lacp_fast)
+  			port->actor_oper_port_state |= AD_STATE_LACP_TIMEOUT;
+  		else
+  			port->actor_oper_port_state &= ~AD_STATE_LACP_TIMEOUT;
+- 		__release_state_machine_lock(port);
+  	}
+++<<<<<<< HEAD
+ +
+ +	write_unlock_bh(&bond->lock);
+++=======
++ 	spin_unlock_bh(&bond->mode_lock);
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+  }
+diff --cc drivers/net/bonding/bond_main.c
+index b4cb8784d691,116cf6965bc5..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1952,39 -1674,29 +1952,44 @@@ static int __bond_release_one(struct ne
+  	 * for this slave anymore.
+  	 */
+  	netdev_rx_handler_unregister(slave_dev);
+ -
+ +	write_lock_bh(&bond->lock);
+ +
+++<<<<<<< HEAD
+ +	if (!all && !bond->params.fail_over_mac) {
+ +		if (ether_addr_equal(bond_dev->dev_addr, slave->perm_hwaddr) &&
+ +		    bond->slave_cnt > 1)
+ +			pr_warning("%s: Warning: the permanent HWaddr of %s - %pM - is still in use by %s. Set the HWaddr of %s to a different address to avoid conflicts.\n",
+ +				   bond_dev->name, slave_dev->name,
+ +				   slave->perm_hwaddr,
+ +				   bond_dev->name, slave_dev->name);
+ +	}
+ +
+ +	/* Inform AD package of unbinding of slave. */
+ +	if (bond->params.mode == BOND_MODE_8023AD) {
+ +		/* must be called before the slave is
+ +		 * detached from the list
+ +		 */
+ +		bond_3ad_unbind_slave(slave);
+ +	}
+++=======
++ 	if (BOND_MODE(bond) == BOND_MODE_8023AD)
++ 		bond_3ad_unbind_slave(slave);
+++>>>>>>> e470259fa1bd (bonding: 3ad: convert to bond->mode_lock)
+  
+ -	netdev_info(bond_dev, "Releasing %s interface %s\n",
+ -		    bond_is_active_slave(slave) ? "active" : "backup",
+ -		    slave_dev->name);
+ +	pr_info("%s: releasing %s interface %s\n",
+ +		bond_dev->name,
+ +		bond_is_active_slave(slave) ? "active" : "backup",
+ +		slave_dev->name);
+  
+ -	oldcurrent = rcu_access_pointer(bond->curr_active_slave);
+ +	oldcurrent = bond->curr_active_slave;
+  
+ -	RCU_INIT_POINTER(bond->current_arp_slave, NULL);
+ +	bond->current_arp_slave = NULL;
+  
+ -	if (!all && (!bond->params.fail_over_mac ||
+ -		     BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)) {
+ -		if (ether_addr_equal_64bits(bond_dev->dev_addr, slave->perm_hwaddr) &&
+ -		    bond_has_slaves(bond))
+ -			netdev_warn(bond_dev, "the permanent HWaddr of %s - %pM - is still in use by %s - set the HWaddr of %s to a different address to avoid conflicts\n",
+ -				    slave_dev->name, slave->perm_hwaddr,
+ -				    bond_dev->name, slave_dev->name);
+ -	}
+ +	/* release the slave from its bond */
+ +	bond_detach_slave(bond, slave);
+  
+ -	if (rtnl_dereference(bond->primary_slave) == slave)
+ -		RCU_INIT_POINTER(bond->primary_slave, NULL);
+ +	if (bond->primary_slave == slave)
+ +		bond->primary_slave = NULL;
+  
+  	if (oldcurrent == slave)
+  		bond_change_active_slave(bond, NULL);
+* Unmerged path drivers/net/bonding/bond_3ad.c
+diff --git a/drivers/net/bonding/bond_3ad.h b/drivers/net/bonding/bond_3ad.h
+index 3b97fe487dca..73991e925002 100644
+--- a/drivers/net/bonding/bond_3ad.h
++++ b/drivers/net/bonding/bond_3ad.h
+@@ -258,7 +258,6 @@ struct ad_bond_info {
+ struct ad_slave_info {
+ 	struct aggregator aggregator;	/* 802.3ad aggregator structure */
+ 	struct port port;		/* 802.3ad port structure */
+-	spinlock_t state_machine_lock;	/* mutex state machines vs. incoming LACPDU */
+ 	u16 id;
+ };
+ 
+* Unmerged path drivers/net/bonding/bond_main.c
