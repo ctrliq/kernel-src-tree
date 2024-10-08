@@ -1,0 +1,387 @@
+ALSA: hda - rename hda_intel_trace.h to hda_controller_trace.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] hda - rename hda_intel_trace.h to hda_controller_trace.h (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 94.92%
+commit-author Libin Yang <libin.yang@intel.com>
+commit 184865085b88789fc8a355cc16ceff25f82f63ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/18486508.failed
+
+This patch does:
+
+1. Rename the hda_intel_trace.h to hda_controller_trace.h as
+this trace is used in hda_controller.c
+
+2. Add some trace function for pcm flow.
+
+	Signed-off-by: Libin Yang <libin.yang@intel.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 184865085b88789fc8a355cc16ceff25f82f63ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_controller.c
+#	sound/pci/hda/hda_intel_trace.h
+diff --cc sound/pci/hda/hda_controller.c
+index 0d7233e1e418,944455997fdc..000000000000
+--- a/sound/pci/hda/hda_controller.c
++++ b/sound/pci/hda/hda_controller.c
+@@@ -34,138 -32,12 +34,138 @@@
+  #include "hda_controller.h"
+  
+  #define CREATE_TRACE_POINTS
+- #include "hda_intel_trace.h"
++ #include "hda_controller_trace.h"
+  
+  /* DSP lock helpers */
+ -#define dsp_lock(dev)		snd_hdac_dsp_lock(azx_stream(dev))
+ -#define dsp_unlock(dev)		snd_hdac_dsp_unlock(azx_stream(dev))
+ -#define dsp_is_locked(dev)	snd_hdac_stream_is_locked(azx_stream(dev))
+ +#ifdef CONFIG_SND_HDA_DSP_LOADER
+ +#define dsp_lock_init(dev)	mutex_init(&(dev)->dsp_mutex)
+ +#define dsp_lock(dev)		mutex_lock(&(dev)->dsp_mutex)
+ +#define dsp_unlock(dev)		mutex_unlock(&(dev)->dsp_mutex)
+ +#define dsp_is_locked(dev)	((dev)->locked)
+ +#else
+ +#define dsp_lock_init(dev)	do {} while (0)
+ +#define dsp_lock(dev)		do {} while (0)
+ +#define dsp_unlock(dev)		do {} while (0)
+ +#define dsp_is_locked(dev)	0
+ +#endif
+ +
+ +/*
+ + * AZX stream operations.
+ + */
+ +
+ +/* start a stream */
+ +static void azx_stream_start(struct azx *chip, struct azx_dev *azx_dev)
+ +{
+ +	/*
+ +	 * Before stream start, initialize parameter
+ +	 */
+ +	azx_dev->insufficient = 1;
+ +
+ +	/* enable SIE */
+ +	azx_writel(chip, INTCTL,
+ +		   azx_readl(chip, INTCTL) | (1 << azx_dev->index));
+ +	/* set DMA start and interrupt mask */
+ +	azx_sd_writeb(chip, azx_dev, SD_CTL,
+ +		      azx_sd_readb(chip, azx_dev, SD_CTL) |
+ +		      SD_CTL_DMA_START | SD_INT_MASK);
+ +}
+ +
+ +/* stop DMA */
+ +static void azx_stream_clear(struct azx *chip, struct azx_dev *azx_dev)
+ +{
+ +	azx_sd_writeb(chip, azx_dev, SD_CTL,
+ +		      azx_sd_readb(chip, azx_dev, SD_CTL) &
+ +		      ~(SD_CTL_DMA_START | SD_INT_MASK));
+ +	azx_sd_writeb(chip, azx_dev, SD_STS, SD_INT_MASK); /* to be sure */
+ +}
+ +
+ +/* stop a stream */
+ +void azx_stream_stop(struct azx *chip, struct azx_dev *azx_dev)
+ +{
+ +	azx_stream_clear(chip, azx_dev);
+ +	/* disable SIE */
+ +	azx_writel(chip, INTCTL,
+ +		   azx_readl(chip, INTCTL) & ~(1 << azx_dev->index));
+ +}
+ +EXPORT_SYMBOL_GPL(azx_stream_stop);
+ +
+ +/* reset stream */
+ +static void azx_stream_reset(struct azx *chip, struct azx_dev *azx_dev)
+ +{
+ +	unsigned char val;
+ +	int timeout;
+ +
+ +	azx_stream_clear(chip, azx_dev);
+ +
+ +	azx_sd_writeb(chip, azx_dev, SD_CTL,
+ +		      azx_sd_readb(chip, azx_dev, SD_CTL) |
+ +		      SD_CTL_STREAM_RESET);
+ +	udelay(3);
+ +	timeout = 300;
+ +	while (!((val = azx_sd_readb(chip, azx_dev, SD_CTL)) &
+ +		 SD_CTL_STREAM_RESET) && --timeout)
+ +		;
+ +	val &= ~SD_CTL_STREAM_RESET;
+ +	azx_sd_writeb(chip, azx_dev, SD_CTL, val);
+ +	udelay(3);
+ +
+ +	timeout = 300;
+ +	/* waiting for hardware to report that the stream is out of reset */
+ +	while (((val = azx_sd_readb(chip, azx_dev, SD_CTL)) &
+ +		SD_CTL_STREAM_RESET) && --timeout)
+ +		;
+ +
+ +	/* reset first position - may not be synced with hw at this time */
+ +	*azx_dev->posbuf = 0;
+ +}
+ +
+ +/*
+ + * set up the SD for streaming
+ + */
+ +static int azx_setup_controller(struct azx *chip, struct azx_dev *azx_dev)
+ +{
+ +	unsigned int val;
+ +	/* make sure the run bit is zero for SD */
+ +	azx_stream_clear(chip, azx_dev);
+ +	/* program the stream_tag */
+ +	val = azx_sd_readl(chip, azx_dev, SD_CTL);
+ +	val = (val & ~SD_CTL_STREAM_TAG_MASK) |
+ +		(azx_dev->stream_tag << SD_CTL_STREAM_TAG_SHIFT);
+ +	if (!azx_snoop(chip))
+ +		val |= SD_CTL_TRAFFIC_PRIO;
+ +	azx_sd_writel(chip, azx_dev, SD_CTL, val);
+ +
+ +	/* program the length of samples in cyclic buffer */
+ +	azx_sd_writel(chip, azx_dev, SD_CBL, azx_dev->bufsize);
+ +
+ +	/* program the stream format */
+ +	/* this value needs to be the same as the one programmed */
+ +	azx_sd_writew(chip, azx_dev, SD_FORMAT, azx_dev->format_val);
+ +
+ +	/* program the stream LVI (last valid index) of the BDL */
+ +	azx_sd_writew(chip, azx_dev, SD_LVI, azx_dev->frags - 1);
+ +
+ +	/* program the BDL address */
+ +	/* lower BDL address */
+ +	azx_sd_writel(chip, azx_dev, SD_BDLPL, (u32)azx_dev->bdl.addr);
+ +	/* upper BDL address */
+ +	azx_sd_writel(chip, azx_dev, SD_BDLPU,
+ +		      upper_32_bits(azx_dev->bdl.addr));
+ +
+ +	/* enable the position buffer */
+ +	if (chip->get_position[0] != azx_get_pos_lpib ||
+ +	    chip->get_position[1] != azx_get_pos_lpib) {
+ +		if (!(azx_readl(chip, DPLBASE) & AZX_DPLBASE_ENABLE))
+ +			azx_writel(chip, DPLBASE,
+ +				(u32)chip->posbuf.addr | AZX_DPLBASE_ENABLE);
+ +	}
+ +
+ +	/* set the interrupt enable bits in the descriptor control register */
+ +	azx_sd_writel(chip, azx_dev, SD_CTL,
+ +		      azx_sd_readl(chip, azx_dev, SD_CTL) | SD_INT_MASK);
+ +
+ +	return 0;
+ +}
+  
+  /* assign a stream for the PCM */
+  static inline struct azx_dev *
+@@@ -399,16 -91,12 +399,17 @@@ static int azx_setup_periods(struct az
+  static int azx_pcm_close(struct snd_pcm_substream *substream)
+  {
+  	struct azx_pcm *apcm = snd_pcm_substream_chip(substream);
+ -	struct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);
+ +	struct hda_pcm_stream *hinfo = apcm->hinfo[substream->stream];
+  	struct azx *chip = apcm->chip;
+  	struct azx_dev *azx_dev = get_azx_dev(substream);
+ +	unsigned long flags;
+  
++ 	trace_azx_pcm_close(chip, azx_dev);
+  	mutex_lock(&chip->open_mutex);
+ +	spin_lock_irqsave(&chip->reg_lock, flags);
+ +	azx_dev->substream = NULL;
+ +	azx_dev->running = 0;
+ +	spin_unlock_irqrestore(&chip->reg_lock, flags);
+  	azx_release_device(azx_dev);
+  	if (hinfo->ops.close)
+  		hinfo->ops.close(hinfo, apcm->codec, substream);
+@@@ -423,10 -111,12 +424,16 @@@ static int azx_pcm_hw_params(struct snd
+  {
+  	struct azx_pcm *apcm = snd_pcm_substream_chip(substream);
+  	struct azx *chip = apcm->chip;
+ -	struct azx_dev *azx_dev = get_azx_dev(substream);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	dsp_lock(get_azx_dev(substream));
+ +	if (dsp_is_locked(get_azx_dev(substream))) {
+++=======
++ 	trace_azx_pcm_hw_params(chip, azx_dev);
++ 	dsp_lock(azx_dev);
++ 	if (dsp_is_locked(azx_dev)) {
+++>>>>>>> 184865085b88 (ALSA: hda - rename hda_intel_trace.h to hda_controller_trace.h)
+  		ret = -EBUSY;
+  		goto unlock;
+  	}
+diff --cc sound/pci/hda/hda_intel_trace.h
+index 7b5e4c2cf9d5,e69de29bb2d1..000000000000
+--- a/sound/pci/hda/hda_intel_trace.h
++++ b/sound/pci/hda/hda_intel_trace.h
+@@@ -1,62 -1,0 +1,65 @@@
+++<<<<<<< HEAD
+ +#undef TRACE_SYSTEM
+ +#define TRACE_SYSTEM hda_intel
+ +#define TRACE_INCLUDE_FILE hda_intel_trace
+ +
+ +#if !defined(_TRACE_HDA_INTEL_H) || defined(TRACE_HEADER_MULTI_READ)
+ +#define _TRACE_HDA_INTEL_H
+ +
+ +#include <linux/tracepoint.h>
+ +
+ +struct azx;
+ +struct azx_dev;
+ +
+ +TRACE_EVENT(azx_pcm_trigger,
+ +
+ +	TP_PROTO(struct azx *chip, struct azx_dev *dev, int cmd),
+ +
+ +	TP_ARGS(chip, dev, cmd),
+ +
+ +	TP_STRUCT__entry(
+ +		__field( int, card )
+ +		__field( int, idx )
+ +		__field( int, cmd )
+ +	),
+ +
+ +	TP_fast_assign(
+ +		__entry->card = (chip)->card->number;
+ +		__entry->idx = (dev)->index;
+ +		__entry->cmd = cmd;
+ +	),
+ +
+ +	TP_printk("[%d:%d] cmd=%d", __entry->card, __entry->idx, __entry->cmd)
+ +);
+ +
+ +TRACE_EVENT(azx_get_position,
+ +
+ +    TP_PROTO(struct azx *chip, struct azx_dev *dev, unsigned int pos, unsigned int delay),
+ +
+ +	    TP_ARGS(chip, dev, pos, delay),
+ +
+ +	TP_STRUCT__entry(
+ +		__field( int, card )
+ +		__field( int, idx )
+ +		__field( unsigned int, pos )
+ +		__field( unsigned int, delay )
+ +	),
+ +
+ +	TP_fast_assign(
+ +		__entry->card = (chip)->card->number;
+ +		__entry->idx = (dev)->index;
+ +		__entry->pos = pos;
+ +		__entry->delay = delay;
+ +	),
+ +
+ +	TP_printk("[%d:%d] pos=%u, delay=%u", __entry->card, __entry->idx, __entry->pos, __entry->delay)
+ +);
+ +
+ +#endif /* _TRACE_HDA_INTEL_H */
+ +
+ +/* This part must be outside protection */
+ +#undef TRACE_INCLUDE_PATH
+ +#define TRACE_INCLUDE_PATH .
+ +#include <trace/define_trace.h>
+++=======
+++>>>>>>> 184865085b88 (ALSA: hda - rename hda_intel_trace.h to hda_controller_trace.h)
+* Unmerged path sound/pci/hda/hda_controller.c
+diff --git a/sound/pci/hda/hda_controller_trace.h b/sound/pci/hda/hda_controller_trace.h
+new file mode 100644
+index 000000000000..3e18d99bfb70
+--- /dev/null
++++ b/sound/pci/hda/hda_controller_trace.h
+@@ -0,0 +1,98 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM hda_controller
++#define TRACE_INCLUDE_FILE hda_controller_trace
++
++#if !defined(_TRACE_HDA_CONTROLLER_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_HDA_CONTROLLER_H
++
++#include <linux/tracepoint.h>
++
++struct azx;
++struct azx_dev;
++
++TRACE_EVENT(azx_pcm_trigger,
++
++	TP_PROTO(struct azx *chip, struct azx_dev *dev, int cmd),
++
++	TP_ARGS(chip, dev, cmd),
++
++	TP_STRUCT__entry(
++		__field( int, card )
++		__field( int, idx )
++		__field( int, cmd )
++	),
++
++	TP_fast_assign(
++		__entry->card = (chip)->card->number;
++		__entry->idx = (dev)->core.index;
++		__entry->cmd = cmd;
++	),
++
++	TP_printk("[%d:%d] cmd=%d", __entry->card, __entry->idx, __entry->cmd)
++);
++
++TRACE_EVENT(azx_get_position,
++
++    TP_PROTO(struct azx *chip, struct azx_dev *dev, unsigned int pos, unsigned int delay),
++
++	    TP_ARGS(chip, dev, pos, delay),
++
++	TP_STRUCT__entry(
++		__field( int, card )
++		__field( int, idx )
++		__field( unsigned int, pos )
++		__field( unsigned int, delay )
++	),
++
++	TP_fast_assign(
++		__entry->card = (chip)->card->number;
++		__entry->idx = (dev)->core.index;
++		__entry->pos = pos;
++		__entry->delay = delay;
++	),
++
++	TP_printk("[%d:%d] pos=%u, delay=%u", __entry->card, __entry->idx, __entry->pos, __entry->delay)
++);
++
++DECLARE_EVENT_CLASS(azx_pcm,
++	TP_PROTO(struct azx *chip, struct azx_dev *azx_dev),
++
++	TP_ARGS(chip, azx_dev),
++
++	TP_STRUCT__entry(
++		__field( unsigned char, stream_tag )
++	),
++
++	TP_fast_assign(
++		__entry->stream_tag = (azx_dev)->core.stream_tag;
++	),
++
++	TP_printk("stream_tag: %d", __entry->stream_tag)
++);
++
++DEFINE_EVENT(azx_pcm, azx_pcm_open,
++	TP_PROTO(struct azx *chip, struct azx_dev *azx_dev),
++	TP_ARGS(chip, azx_dev)
++);
++
++DEFINE_EVENT(azx_pcm, azx_pcm_close,
++	TP_PROTO(struct azx *chip, struct azx_dev *azx_dev),
++	TP_ARGS(chip, azx_dev)
++);
++
++DEFINE_EVENT(azx_pcm, azx_pcm_hw_params,
++	TP_PROTO(struct azx *chip, struct azx_dev *azx_dev),
++	TP_ARGS(chip, azx_dev)
++);
++
++DEFINE_EVENT(azx_pcm, azx_pcm_prepare,
++	TP_PROTO(struct azx *chip, struct azx_dev *azx_dev),
++	TP_ARGS(chip, azx_dev)
++);
++
++#endif /* _TRACE_HDA_CONTROLLER_H */
++
++/* This part must be outside protection */
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH .
++#include <trace/define_trace.h>
+* Unmerged path sound/pci/hda/hda_intel_trace.h
