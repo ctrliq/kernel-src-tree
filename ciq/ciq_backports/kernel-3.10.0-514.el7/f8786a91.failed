@@ -1,0 +1,127 @@
+drivers: usb: fsl: Workaround for USB erratum-A005275
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] usb: fsl: Workaround for USB erratum-A005275 (Torez Smith) [1303955]
+Rebuild_FUZZ: 90.72%
+commit-author Nikhil Badola <nikhil.badola@freescale.com>
+commit f8786a91548df6930643a052e40e5c0b7a8403a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f8786a91.failed
+
+Incoming packets in high speed are randomly corrupted by h/w
+resulting in multiple errors. This workaround makes FS as
+default mode in all affected socs by disabling HS chirp
+signalling.This errata does not affect FS and LS mode.
+
+Forces all HS devices to connect in FS mode for all socs
+affected by this erratum:
+P3041 and P2041 rev 1.0 and 1.1
+P5020 and P5010 rev 1.0 and 2.0
+P5040, P1010 and T4240 rev 1.0
+
+	Signed-off-by: Ramneek Mehresh <ramneek.mehresh@freescale.com>
+	Signed-off-by: Nikhil Badola <nikhil.badola@freescale.com>
+	Cc: stable <stable@vger.kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit f8786a91548df6930643a052e40e5c0b7a8403a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fsl_devices.h
+diff --cc include/linux/fsl_devices.h
+index 457232accf1a,f2912914141a..000000000000
+--- a/include/linux/fsl_devices.h
++++ b/include/linux/fsl_devices.h
+@@@ -94,6 -99,8 +94,11 @@@ struct fsl_usb2_platform_data 
+  	unsigned	suspended:1;
+  	unsigned	already_suspended:1;
+  	unsigned        has_fsl_erratum_a007792:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned        has_fsl_erratum_a005275:1;
++ 	unsigned        check_phy_clk_valid:1;
+++>>>>>>> f8786a91548d (drivers: usb: fsl: Workaround for USB erratum-A005275)
+  
+  	/* register save area for suspend/resume */
+  	u32		pm_command;
+diff --git a/drivers/usb/host/ehci-fsl.c b/drivers/usb/host/ehci-fsl.c
+index 753ba1dfbea8..932bd5e8b948 100644
+--- a/drivers/usb/host/ehci-fsl.c
++++ b/drivers/usb/host/ehci-fsl.c
+@@ -311,6 +311,10 @@ static int ehci_fsl_usb_setup(struct ehci_hcd *ehci)
+ 		out_be32(non_ehci + FSL_SOC_USB_SNOOP2, 0x80000000 | SNOOP_SIZE_2GB);
+ 	}
+ 
++	/* Deal with USB erratum A-005275 */
++	if (pdata->has_fsl_erratum_a005275 == 1)
++		ehci->has_fsl_hs_errata = 1;
++
+ 	if ((pdata->operating_mode == FSL_USB2_DR_HOST) ||
+ 			(pdata->operating_mode == FSL_USB2_DR_OTG))
+ 		if (ehci_fsl_setup_phy(hcd, pdata->phy_mode, 0))
+diff --git a/drivers/usb/host/ehci-hub.c b/drivers/usb/host/ehci-hub.c
+index 9290f686ce10..276fe5bcc117 100644
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -1229,6 +1229,13 @@ static int ehci_hub_control (
+ 				 */
+ 				ehci->reset_done [wIndex] = jiffies
+ 						+ msecs_to_jiffies (50);
++
++				/*
++				 * Force full-speed connect for FSL high-speed
++				 * erratum; disable HS Chirp by setting PFSC bit
++				 */
++				if (ehci_has_fsl_hs_errata(ehci))
++					temp |= (1 << PORTSC_FSL_PFSC);
+ 			}
+ 			ehci_writel(ehci, temp, status_reg);
+ 			break;
+diff --git a/drivers/usb/host/ehci.h b/drivers/usb/host/ehci.h
+index 03cb384c961c..284a4ce56f4b 100644
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -215,6 +215,7 @@ struct ehci_hcd {			/* one per controller */
+ 	/* SILICON QUIRKS */
+ 	unsigned		no_selective_suspend:1;
+ 	unsigned		has_fsl_port_bug:1; /* FreeScale */
++	unsigned		has_fsl_hs_errata:1;	/* Freescale HS quirk */
+ 	unsigned		big_endian_mmio:1;
+ 	unsigned		big_endian_desc:1;
+ 	unsigned		big_endian_capbase:1;
+@@ -685,6 +686,17 @@ ehci_port_speed(struct ehci_hcd *ehci, unsigned int portsc)
+ #define	ehci_has_fsl_portno_bug(e)		(0)
+ #endif
+ 
++#define PORTSC_FSL_PFSC	24	/* Port Force Full-Speed Connect */
++
++#if defined(CONFIG_PPC_85xx)
++/* Some Freescale processors have an erratum (USB A-005275) in which
++ * incoming packets get corrupted in HS mode
++ */
++#define ehci_has_fsl_hs_errata(e)	((e)->has_fsl_hs_errata)
++#else
++#define ehci_has_fsl_hs_errata(e)	(0)
++#endif
++
+ /*
+  * While most USB host controllers implement their registers in
+  * little-endian format, a minority (celleb companion chip) implement
+diff --git a/drivers/usb/host/fsl-mph-dr-of.c b/drivers/usb/host/fsl-mph-dr-of.c
+index 467bf6d6460d..29ffc3864e8a 100644
+--- a/drivers/usb/host/fsl-mph-dr-of.c
++++ b/drivers/usb/host/fsl-mph-dr-of.c
+@@ -213,6 +213,10 @@ static int fsl_usb2_mph_dr_of_probe(struct platform_device *ofdev)
+ 		pdata->has_fsl_erratum_a007792 = 1;
+ 	else
+ 		pdata->has_fsl_erratum_a007792 = 0;
++	if (of_get_property(np, "fsl,usb-erratum-a005275", NULL))
++		pdata->has_fsl_erratum_a005275 = 1;
++	else
++		pdata->has_fsl_erratum_a005275 = 0;
+ 
+ 	if (pdata->have_sysif_regs) {
+ 		if (pdata->controller_ver < 0) {
+* Unmerged path include/linux/fsl_devices.h
