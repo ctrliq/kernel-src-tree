@@ -1,0 +1,134 @@
+staging/rdma/hfi1: use mod_timer when appropriate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: use mod_timer when appropriate (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 91.11%
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 633d27399514e7726633c9029e3947f0526d2565
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/633d2739.failed
+
+Use new timer API to optimize maintenance of
+timers during ACK processing.
+
+When we are still expecting ACKs, mod the timer
+to avoid a heavyweight delete/add. Otherwise, insure
+do_rc_ack() maintains the timer as it had.
+
+	Reviewed-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 633d27399514e7726633c9029e3947f0526d2565)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/rc.c
+diff --cc drivers/staging/hfi1/rc.c
+index dd57d65aa9b2,700d84942afe..000000000000
+--- a/drivers/staging/hfi1/rc.c
++++ b/drivers/staging/hfi1/rc.c
+@@@ -1167,13 -1264,8 +1167,16 @@@ static int do_rc_ack(struct hfi1_qp *qp
+  	int ret = 0;
+  	u32 ack_psn;
+  	int diff;
+ -	unsigned long to;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +	/* Remove QP from retry timer */
+ +	if (qp->s_flags & (HFI1_S_TIMER | HFI1_S_WAIT_RNR)) {
+ +		qp->s_flags &= ~(HFI1_S_TIMER | HFI1_S_WAIT_RNR);
+ +		del_timer(&qp->s_timer);
+ +	}
+ +
+++=======
+++>>>>>>> 633d27399514 (staging/rdma/hfi1: use mod_timer when appropriate):drivers/staging/rdma/hfi1/rc.c
+  	/*
+  	 * Note that NAKs implicitly ACK outstanding SEND and RDMA write
+  	 * requests and implicitly NAK RDMA read and atomic requests issued
+@@@ -1267,36 -1359,39 +1270,49 @@@
+  		if (qp->s_acked != qp->s_tail) {
+  			/*
+  			 * We are expecting more ACKs so
+- 			 * reset the re-transmit timer.
++ 			 * mod the retry timer.
+  			 */
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +			start_timer(qp);
+++=======
++ 			hfi1_mod_retry_timer(qp);
+++>>>>>>> 633d27399514 (staging/rdma/hfi1: use mod_timer when appropriate):drivers/staging/rdma/hfi1/rc.c
+  			/*
+  			 * We can stop re-sending the earlier packets and
+  			 * continue with the next packet the receiver wants.
+  			 */
+  			if (cmp_psn(qp->s_psn, psn) <= 0)
+  				reset_psn(qp, psn + 1);
+- 		} else if (cmp_psn(qp->s_psn, psn) <= 0) {
+- 			qp->s_state = OP(SEND_LAST);
+- 			qp->s_psn = psn + 1;
++ 		} else {
++ 			/* No more acks - kill all timers */
++ 			hfi1_stop_rc_timers(qp);
++ 			if (cmp_psn(qp->s_psn, psn) <= 0) {
++ 				qp->s_state = OP(SEND_LAST);
++ 				qp->s_psn = psn + 1;
++ 			}
+  		}
+ -		if (qp->s_flags & RVT_S_WAIT_ACK) {
+ -			qp->s_flags &= ~RVT_S_WAIT_ACK;
+ +		if (qp->s_flags & HFI1_S_WAIT_ACK) {
+ +			qp->s_flags &= ~HFI1_S_WAIT_ACK;
+  			hfi1_schedule_send(qp);
+  		}
+  		hfi1_get_credit(qp, aeth);
+  		qp->s_rnr_retry = qp->s_rnr_retry_cnt;
+  		qp->s_retry = qp->s_retry_cnt;
+  		update_last_psn(qp, psn);
+- 		ret = 1;
+- 		goto bail;
++ 		return 1;
+  
+  	case 1:         /* RNR NAK */
+ -		ibp->rvp.n_rnr_naks++;
+ +		ibp->n_rnr_naks++;
+  		if (qp->s_acked == qp->s_tail)
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +			goto bail;
+ +		if (qp->s_flags & HFI1_S_WAIT_RNR)
+ +			goto bail;
+++=======
++ 			goto bail_stop;
++ 		if (qp->s_flags & RVT_S_WAIT_RNR)
++ 			goto bail_stop;
+++>>>>>>> 633d27399514 (staging/rdma/hfi1: use mod_timer when appropriate):drivers/staging/rdma/hfi1/rc.c
+  		if (qp->s_rnr_retry == 0) {
+  			status = IB_WC_RNR_RETRY_EXC_ERR;
+  			goto class_b;
+@@@ -1311,14 -1406,13 +1327,24 @@@
+  
+  		reset_psn(qp, psn);
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +		qp->s_flags &= ~(HFI1_S_WAIT_SSN_CREDIT | HFI1_S_WAIT_ACK);
+ +		qp->s_flags |= HFI1_S_WAIT_RNR;
+ +		qp->s_timer.function = hfi1_rc_rnr_retry;
+ +		qp->s_timer.expires = jiffies + usecs_to_jiffies(
+ +			ib_hfi1_rnr_table[(aeth >> HFI1_AETH_CREDIT_SHIFT) &
+ +					   HFI1_AETH_CREDIT_MASK]);
+ +		add_timer(&qp->s_timer);
+ +		goto bail;
+++=======
++ 		qp->s_flags &= ~(RVT_S_WAIT_SSN_CREDIT | RVT_S_WAIT_ACK);
++ 		hfi1_stop_rc_timers(qp);
++ 		to =
++ 			ib_hfi1_rnr_table[(aeth >> HFI1_AETH_CREDIT_SHIFT) &
++ 					   HFI1_AETH_CREDIT_MASK];
++ 		hfi1_add_rnr_timer(qp, to);
++ 		return 0;
+++>>>>>>> 633d27399514 (staging/rdma/hfi1: use mod_timer when appropriate):drivers/staging/rdma/hfi1/rc.c
+  
+  	case 3:         /* NAK */
+  		if (qp->s_acked == qp->s_tail)
+* Unmerged path drivers/staging/hfi1/rc.c
