@@ -1,0 +1,128 @@
+sctp: fix ASCONF list handling
+
+jira LE-1907
+cve CVE-2015-3212
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+commit 2d45a02d0166caf2627fe91897c6ffc3b19514c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2d45a02d.failed
+
+->auto_asconf_splist is per namespace and mangled by functions like
+sctp_setsockopt_auto_asconf() which doesn't guarantee any serialization.
+
+Also, the call to inet_sk_copy_descendant() was backuping
+->auto_asconf_list through the copy but was not honoring
+->do_auto_asconf, which could lead to list corruption if it was
+different between both sockets.
+
+This commit thus fixes the list handling by using ->addr_wq_lock
+spinlock to protect the list. A special handling is done upon socket
+creation and destruction for that. Error handlig on sctp_init_sock()
+will never return an error after having initialized asconf, so
+sctp_destroy_sock() can be called without addrq_wq_lock. The lock now
+will be take on sctp_close_sock(), before locking the socket, so we
+don't do it in inverse order compared to sctp_addr_wq_timeout_handler().
+
+Instead of taking the lock on sctp_sock_migrate() for copying and
+restoring the list values, it's preferred to avoid rewritting it by
+implementing sctp_copy_descendant().
+
+Issue was found with a test application that kept flipping sysctl
+default_auto_asconf on and off, but one could trigger it by issuing
+simultaneous setsockopt() calls on multiple sockets or by
+creating/destroying sockets fast enough. This is only triggerable
+locally.
+
+Fixes: 9f7d653b67ae ("sctp: Add Auto-ASCONF support (core).")
+	Reported-by: Ji Jianwen <jiji@redhat.com>
+	Suggested-by: Neil Horman <nhorman@tuxdriver.com>
+	Suggested-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2d45a02d0166caf2627fe91897c6ffc3b19514c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/socket.c
+diff --cc net/sctp/socket.c
+index 3f52f2a398da,5f6c4e61325b..000000000000
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@@ -1548,9 -1528,11 +1548,16 @@@ SCTP_STATIC void sctp_close(struct soc
+  
+  	/* Supposedly, no process has access to the socket, but
+  	 * the net layers still may.
++ 	 * Also, sctp_destroy_sock() needs to be called with addr_wq_lock
++ 	 * held and that should be grabbed before socket lock.
+  	 */
+++<<<<<<< HEAD
+ +	sctp_local_bh_disable();
+ +	sctp_bh_lock_sock(sk);
+++=======
++ 	spin_lock_bh(&net->sctp.addr_wq_lock);
++ 	bh_lock_sock(sk);
+++>>>>>>> 2d45a02d0166 (sctp: fix ASCONF list handling)
+  
+  	/* Hold the sock, since sk_common_release() will put sock_put()
+  	 * and we have just a little more cleanup.
+@@@ -1558,8 -1540,8 +1565,13 @@@
+  	sock_hold(sk);
+  	sk_common_release(sk);
+  
+++<<<<<<< HEAD
+ +	sctp_bh_unlock_sock(sk);
+ +	sctp_local_bh_enable();
+++=======
++ 	bh_unlock_sock(sk);
++ 	spin_unlock_bh(&net->sctp.addr_wq_lock);
+++>>>>>>> 2d45a02d0166 (sctp: fix ASCONF list handling)
+  
+  	sock_put(sk);
+  
+@@@ -4018,8 -4144,10 +4040,15 @@@ SCTP_STATIC int sctp_init_sock(struct s
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/* Cleanup any SCTP per socket resources.  */
+ +SCTP_STATIC void sctp_destroy_sock(struct sock *sk)
+++=======
++ /* Cleanup any SCTP per socket resources. Must be called with
++  * sock_net(sk)->sctp.addr_wq_lock held if sp->do_auto_asconf is true
++  */
++ static void sctp_destroy_sock(struct sock *sk)
+++>>>>>>> 2d45a02d0166 (sctp: fix ASCONF list handling)
+  {
+  	struct sctp_sock *sp;
+  
+diff --git a/include/net/netns/sctp.h b/include/net/netns/sctp.h
+index 3573a81815ad..8ba379f9e467 100644
+--- a/include/net/netns/sctp.h
++++ b/include/net/netns/sctp.h
+@@ -31,6 +31,7 @@ struct netns_sctp {
+ 	struct list_head addr_waitq;
+ 	struct timer_list addr_wq_timer;
+ 	struct list_head auto_asconf_splist;
++	/* Lock that protects both addr_waitq and auto_asconf_splist */
+ 	spinlock_t addr_wq_lock;
+ 
+ 	/* Lock that protects the local_addr_list writers */
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index da6b9a01ff75..b30c1d95be2c 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -228,6 +228,10 @@ struct sctp_sock {
+ 	atomic_t pd_mode;
+ 	/* Receive to here while partial delivery is in effect. */
+ 	struct sk_buff_head pd_lobby;
++
++	/* These must be the last fields, as they will skipped on copies,
++	 * like on accept and peeloff operations
++	 */
+ 	struct list_head auto_asconf_list;
+ 	int do_auto_asconf;
+ };
+* Unmerged path net/sctp/socket.c
