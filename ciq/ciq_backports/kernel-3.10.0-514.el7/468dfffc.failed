@@ -1,0 +1,206 @@
+geneve: add dst caching support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 468dfffcd762cbb2777ec5a76bc21e3748ebf47e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/468dfffc.failed
+
+use generic dst implementation for both plain geneve devices and
+lwtunnels.
+
+In case of UDP traffic with datagram length below MTU this give
+about 2% performance increase for plain geneve tunnel over ipv4,
+about 65% performance increase for ipv6 tunnel.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Suggested-and-Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 468dfffcd762cbb2777ec5a76bc21e3748ebf47e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+diff --cc drivers/net/geneve.c
+index d82906728571,6f208132a574..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -60,8 -71,15 +60,13 @@@ struct geneve_dev 
+  	__be16		   dst_port;
+  	bool		   collect_md;
+  	struct gro_cells   gro_cells;
+++<<<<<<< HEAD
+++=======
++ 	u32		   flags;
++ 	struct dst_cache   dst_cache;
+++>>>>>>> 468dfffcd762 (geneve: add dst caching support)
+  };
+  
+ -/* Geneve device flags */
+ -#define GENEVE_F_UDP_CSUM		BIT(0)
+ -#define GENEVE_F_UDP_ZERO_CSUM6_TX	BIT(1)
+ -#define GENEVE_F_UDP_ZERO_CSUM6_RX	BIT(2)
+ -
+  struct geneve_sock {
+  	bool			collect_md;
+  	struct list_head	list;
+@@@ -565,13 -718,53 +578,15 @@@ free_rt
+  	return err;
+  }
+  
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -static int geneve6_build_skb(struct dst_entry *dst, struct sk_buff *skb,
+ -			     __be16 tun_flags, u8 vni[3], u8 opt_len, u8 *opt,
+ -			     u32 flags, bool xnet)
+ -{
+ -	struct genevehdr *gnvh;
+ -	int min_headroom;
+ -	int err;
+ -	bool udp_sum = !(flags & GENEVE_F_UDP_ZERO_CSUM6_TX);
+ -
+ -	skb_scrub_packet(skb, xnet);
+ -
+ -	min_headroom = LL_RESERVED_SPACE(dst->dev) + dst->header_len
+ -			+ GENEVE_BASE_HLEN + opt_len + sizeof(struct ipv6hdr);
+ -	err = skb_cow_head(skb, min_headroom);
+ -	if (unlikely(err)) {
+ -		kfree_skb(skb);
+ -		goto free_dst;
+ -	}
+ -
+ -	skb = udp_tunnel_handle_offloads(skb, udp_sum);
+ -	if (IS_ERR(skb)) {
+ -		err = PTR_ERR(skb);
+ -		goto free_dst;
+ -	}
+ -
+ -	gnvh = (struct genevehdr *)__skb_push(skb, sizeof(*gnvh) + opt_len);
+ -	geneve_build_header(gnvh, tun_flags, vni, opt_len, opt);
+ -
+ -	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ -	return 0;
+ -
+ -free_dst:
+ -	dst_release(dst);
+ -	return err;
+ -}
+ -#endif
+ -
+ -static struct rtable *geneve_get_v4_rt(struct sk_buff *skb,
+ -				       struct net_device *dev,
+ -				       struct flowi4 *fl4,
+ -				       struct ip_tunnel_info *info)
+ +static struct rtable *geneve_get_rt(struct sk_buff *skb,
+ +				    struct net_device *dev,
+ +				    struct flowi4 *fl4,
+ +				    struct ip_tunnel_info *info)
+  {
+  	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct dst_cache *dst_cache;
+  	struct rtable *rt = NULL;
++ 	bool use_cache = true;
+  	__u8 tos;
+  
+  	memset(fl4, 0, sizeof(*fl4));
+@@@ -591,7 -786,15 +608,19 @@@
+  		}
+  
+  		fl4->flowi4_tos = RT_TOS(tos);
+++<<<<<<< HEAD
+ +		fl4->daddr = geneve->remote.sin_addr.s_addr;
+++=======
++ 		fl4->daddr = geneve->remote.sin.sin_addr.s_addr;
++ 		dst_cache = &geneve->dst_cache;
++ 	}
++ 
++ 	use_cache = use_cache && !skb->mark;
++ 	if (use_cache) {
++ 		rt = dst_cache_get_ip4(dst_cache, &fl4->saddr);
++ 		if (rt)
++ 			return rt;
+++>>>>>>> 468dfffcd762 (geneve: add dst caching support)
+  	}
+  
+  	rt = ip_route_output_key(geneve->net, fl4);
+@@@ -602,13 -804,73 +631,77 @@@
+  	}
+  	if (rt->dst.dev == dev) { /* is this necessary? */
+  		netdev_dbg(dev, "circular route to %pI4\n", &fl4->daddr);
+ +		dev->stats.collisions++;
+  		ip_rt_put(rt);
+ -		return ERR_PTR(-ELOOP);
+ +		return ERR_PTR(-EINVAL);
+  	}
++ 	if (use_cache)
++ 		dst_cache_set_ip4(dst_cache, &rt->dst, fl4->saddr);
+  	return rt;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_IPV6)
++ static struct dst_entry *geneve_get_v6_dst(struct sk_buff *skb,
++ 					   struct net_device *dev,
++ 					   struct flowi6 *fl6,
++ 					   struct ip_tunnel_info *info)
++ {
++ 	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct geneve_sock *gs6 = geneve->sock6;
++ 	struct dst_entry *dst = NULL;
++ 	struct dst_cache *dst_cache;
++ 	bool use_cache = true;
++ 	__u8 prio;
++ 
++ 	memset(fl6, 0, sizeof(*fl6));
++ 	fl6->flowi6_mark = skb->mark;
++ 	fl6->flowi6_proto = IPPROTO_UDP;
++ 
++ 	if (info) {
++ 		fl6->daddr = info->key.u.ipv6.dst;
++ 		fl6->saddr = info->key.u.ipv6.src;
++ 		fl6->flowi6_tos = RT_TOS(info->key.tos);
++ 		dst_cache = &info->dst_cache;
++ 	} else {
++ 		prio = geneve->tos;
++ 		if (prio == 1) {
++ 			const struct iphdr *iip = ip_hdr(skb);
++ 
++ 			prio = ip_tunnel_get_dsfield(iip, skb);
++ 			use_cache = false;
++ 		}
++ 
++ 		fl6->flowi6_tos = RT_TOS(prio);
++ 		fl6->daddr = geneve->remote.sin6.sin6_addr;
++ 		dst_cache = &geneve->dst_cache;
++ 	}
++ 
++ 	use_cache = use_cache && !skb->mark;
++ 	if (use_cache) {
++ 		dst = dst_cache_get_ip6(dst_cache, &fl6->saddr);
++ 		if (dst)
++ 			return dst;
++ 	}
++ 
++ 	if (ipv6_stub->ipv6_dst_lookup(geneve->net, gs6->sock->sk, &dst, fl6)) {
++ 		netdev_dbg(dev, "no route to %pI6\n", &fl6->daddr);
++ 		return ERR_PTR(-ENETUNREACH);
++ 	}
++ 	if (dst->dev == dev) { /* is this necessary? */
++ 		netdev_dbg(dev, "circular route to %pI6\n", &fl6->daddr);
++ 		dst_release(dst);
++ 		return ERR_PTR(-ELOOP);
++ 	}
++ 
++ 	if (use_cache)
++ 		dst_cache_set_ip6(dst_cache, dst, &fl6->saddr);
++ 	return dst;
++ }
++ #endif
++ 
+++>>>>>>> 468dfffcd762 (geneve: add dst caching support)
+  /* Convert 64 bit tunnel ID to 24 bit VNI. */
+  static void tunnel_id_to_vni(__be64 tun_id, __u8 *vni)
+  {
+* Unmerged path drivers/net/geneve.c
