@@ -390,6 +390,7 @@ static void munge_mode_uid_gid(const struct gfs2_inode *dip,
 static int alloc_dinode(struct gfs2_inode *ip, u32 flags)
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+	struct gfs2_alloc_parms ap = { .target = RES_DINODE, .aflags = flags, };
 	int error;
 	int dblocks = 1;
 
@@ -397,7 +398,7 @@ static int alloc_dinode(struct gfs2_inode *ip, u32 flags)
 	if (error)
 		goto out;
 
-	error = gfs2_inplace_reserve(ip, RES_DINODE, flags);
+	error = gfs2_inplace_reserve(ip, &ap);
 	if (error)
 		goto out_quota;
 
@@ -483,6 +484,7 @@ static int link_dinode(struct gfs2_inode *dip, const struct qstr *name,
 		       struct gfs2_inode *ip, int arq)
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
+	struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
 	int error;
 
 	if (arq) {
@@ -490,7 +492,7 @@ static int link_dinode(struct gfs2_inode *dip, const struct qstr *name,
 		if (error)
 			goto fail_quota_locks;
 
-		error = gfs2_inplace_reserve(dip, sdp->sd_max_dirres, 0);
+		error = gfs2_inplace_reserve(dip, &ap);
 		if (error)
 			goto fail_quota_locks;
 
@@ -843,11 +845,12 @@ static int gfs2_link(struct dentry *old_dentry, struct inode *dir,
 	error = 0;
 
 	if (alloc_required) {
+		struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
 		error = gfs2_quota_lock_check(dip);
 		if (error)
 			goto out_gunlock;
 
-		error = gfs2_inplace_reserve(dip, sdp->sd_max_dirres, 0);
+		error = gfs2_inplace_reserve(dip, &ap);
 		if (error)
 			goto out_gunlock_q;
 
@@ -1318,11 +1321,12 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 		goto out_gunlock;
 
 	if (alloc_required) {
+		struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
 		error = gfs2_quota_lock_check(ndip);
 		if (error)
 			goto out_gunlock;
 
-		error = gfs2_inplace_reserve(ndip, sdp->sd_max_dirres, 0);
+		error = gfs2_inplace_reserve(ndip, &ap);
 		if (error)
 			goto out_gunlock_q;
 
