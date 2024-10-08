@@ -1,0 +1,143 @@
+ACPI, APEI, EINJ: Changes to the ACPI/APEI/EINJ debugfs interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [acpi] apei, einj: Changes to the ACPI/APEI/EINJ debugfs interface (Jeff Moyer) [1342696]
+Rebuild_FUZZ: 95.16%
+commit-author Tony Luck <tony.luck@intel.com>
+commit 3482fb5e0c1c20ce0dbcfc5ca3b6558a8c455b10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3482fb5e.failed
+
+When I added support for ACPI5 I made the assumption that
+injected processor errors would just need to know the APICID,
+memory errors just the address and mask, and PCIe errors just the
+segment/bus/device/function. So I had the code check the type of injection
+and multiplex the "param1" value appropriately.
+
+This was not a good assumption :-(
+
+There are injection scenarios where we need to specify more than one of
+these items. E.g. injecting a cache error we need to specify an APICID
+of the cpu that owns the cache, and also an address (so that we can trip
+the error by accessing the address).
+
+Add a "flags" file to give the user direct access to specify which items
+are valid in the ACPI SET_ERROR_TYPE_WITH_ADDRESS structure. Also add
+new files param3 and param4 to hold all these values.
+
+For backwards compatability with old injection scripts we maintain the
+old behaviour if flags remains set at zero (or is reset to 0).
+
+	Acked-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+(cherry picked from commit 3482fb5e0c1c20ce0dbcfc5ca3b6558a8c455b10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/acpi/apei/einj.txt
+#	drivers/acpi/apei/einj.c
+diff --cc Documentation/acpi/apei/einj.txt
+index e20b6daaced4,f51861bcb07b..000000000000
+--- a/Documentation/acpi/apei/einj.txt
++++ b/Documentation/acpi/apei/einj.txt
+@@@ -45,14 -45,36 +45,37 @@@ directory apei/einj. The following file
+    injection. Before this, please specify all necessary error
+    parameters.
+  
++ - flags
++   Present for kernel version 3.13 and above. Used to specify which
++   of param{1..4} are valid and should be used by BIOS during injection.
++   Value is a bitmask as specified in ACPI5.0 spec for the
++   SET_ERROR_TYPE_WITH_ADDRESS data structure:
++ 	Bit 0 - Processor APIC field valid (see param3 below)
++ 	Bit 1 - Memory address and mask valid (param1 and param2)
++ 	Bit 2 - PCIe (seg,bus,dev,fn) valid (param4 below)
++   If set to zero, legacy behaviour is used where the type of injection
++   specifies just one bit set, and param1 is multiplexed.
++ 
+  - param1
+    This file is used to set the first error parameter value. Effect of
+++<<<<<<< HEAD
+ +  parameter depends on error_type specified.
+++=======
++   parameter depends on error_type specified. For example, if error
++   type is memory related type, the param1 should be a valid physical
++   memory address. [Unless "flag" is set - see above]
+++>>>>>>> 3482fb5e0c1c (ACPI, APEI, EINJ: Changes to the ACPI/APEI/EINJ debugfs interface)
+  
+  - param2
+    This file is used to set the second error parameter value. Effect of
+ -  parameter depends on error_type specified. For example, if error
+ -  type is memory related type, the param2 should be a physical memory
+ -  address mask. Linux requires page or narrower granularity, say,
+ -  0xfffffffffffff000.
+ +  parameter depends on error_type specified.
+  
++ - param3
++   Used when the 0x1 bit is set in "flag" to specify the APIC id
++ 
++ - param4
++   Used when the 0x4 bit is set in "flag" to specify target PCIe device
++ 
+  - notrigger
+    The EINJ mechanism is a two step process. First inject the error, then
+    perform some actions to trigger it. Setting "notrigger" to 1 skips the
+diff --cc drivers/acpi/apei/einj.c
+index 2cc8e034a3c0,c76674e2a01f..000000000000
+--- a/drivers/acpi/apei/einj.c
++++ b/drivers/acpi/apei/einj.c
+@@@ -509,12 -521,45 +516,47 @@@ static int __einj_error_inject(u32 type
+  }
+  
+  /* Inject the specified hardware error */
+- static int einj_error_inject(u32 type, u64 param1, u64 param2)
++ static int einj_error_inject(u32 type, u32 flags, u64 param1, u64 param2,
++ 			     u64 param3, u64 param4)
+  {
+  	int rc;
+ -	unsigned long pfn;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* If user manually set "flags", make sure it is legal */
++ 	if (flags && (flags &
++ 		~(SETWA_FLAGS_APICID|SETWA_FLAGS_MEM|SETWA_FLAGS_PCIE_SBDF)))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * We need extra sanity checks for memory errors.
++ 	 * Other types leap directly to injection.
++ 	 */
++ 
++ 	/* ensure param1/param2 existed */
++ 	if (!(param_extension || acpi5))
++ 		goto inject;
++ 
++ 	/* ensure injection is memory related */
++ 	if (type & ACPI5_VENDOR_BIT) {
++ 		if (vendor_flags != SETWA_FLAGS_MEM)
++ 			goto inject;
++ 	} else if (!(type & MEM_ERROR_MASK) && !(flags & SETWA_FLAGS_MEM))
++ 		goto inject;
++ 
++ 	/*
++ 	 * Disallow crazy address masks that give BIOS leeway to pick
++ 	 * injection address almost anywhere. Insist on page or
++ 	 * better granularity and that target address is normal RAM.
++ 	 */
++ 	pfn = PFN_DOWN(param1 & param2);
++ 	if (!page_is_ram(pfn) || ((param2 & PAGE_MASK) != PAGE_MASK))
++ 		return -EINVAL;
++ 
++ inject:
+++>>>>>>> 3482fb5e0c1c (ACPI, APEI, EINJ: Changes to the ACPI/APEI/EINJ debugfs interface)
+  	mutex_lock(&einj_mutex);
+- 	rc = __einj_error_inject(type, param1, param2);
++ 	rc = __einj_error_inject(type, flags, param1, param2, param3, param4);
+  	mutex_unlock(&einj_mutex);
+  
+  	return rc;
+* Unmerged path Documentation/acpi/apei/einj.txt
+* Unmerged path drivers/acpi/apei/einj.c
