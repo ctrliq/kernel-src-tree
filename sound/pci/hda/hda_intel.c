@@ -493,6 +493,17 @@ static void azx_init_pci(struct azx *chip)
         }
 }
 
+static void hda_intel_init_chip(struct azx *chip, bool full_reset)
+{
+	struct hda_intel *hda = container_of(chip, struct hda_intel, chip);
+
+	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL)
+		hda_set_codec_wakeup(hda, true);
+	azx_init_chip(chip, full_reset);
+	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL)
+		hda_set_codec_wakeup(hda, false);
+}
+
 /* calculate runtime delay from LPIB */
 static int azx_get_delay_from_lpib(struct azx *chip, struct azx_dev *azx_dev,
 				   unsigned int pos)
@@ -831,7 +842,7 @@ static int azx_resume(struct device *dev)
 		return -EIO;
 	azx_init_pci(chip);
 
-	azx_init_chip(chip, true);
+	hda_intel_init_chip(chip, true);
 
 	snd_power_change_state(card, SNDRV_CTL_POWER_D0);
 	return 0;
@@ -892,13 +903,16 @@ static int azx_runtime_resume(struct device *dev)
 	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL) {
 		hda_display_power(hda, true);
 		haswell_set_bclk(hda);
+		/* toggle codec wakeup bit for STATESTS read */
+		hda_set_codec_wakeup(hda, true);
+		hda_set_codec_wakeup(hda, false);
 	}
 
 	/* Read STATESTS before controller reset */
 	status = azx_readw(chip, STATESTS);
 
 	azx_init_pci(chip);
-	azx_init_chip(chip, true);
+	hda_intel_init_chip(chip, true);
 
 	bus = chip->bus;
 	if (status && bus) {
@@ -1599,7 +1613,7 @@ static int azx_first_init(struct azx *chip)
 		haswell_set_bclk(hda);
 	}
 
-	azx_init_chip(chip, (probe_only[dev] & 2) == 0);
+	hda_intel_init_chip(chip, (probe_only[dev] & 2) == 0);
 
 	/* codec detection */
 	if (!chip->codec_mask) {
