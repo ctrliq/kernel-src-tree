@@ -1,0 +1,190 @@
+aio: block io_destroy() until all context requests are completed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Anatol Pomozov <anatol.pomozov@gmail.com>
+commit e02ba72aabfade4c9cd6e3263e9b57bf890ad25c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e02ba72a.failed
+
+deletes aio context and all resources related to. It makes sense that
+no IO operations connected to the context should be running after the context
+is destroyed. As we removed io_context we have no chance to
+get requests status or call io_getevents().
+
+man page for io_destroy says that this function may block until
+all context's requests are completed. Before kernel 3.11 io_destroy()
+blocked indeed, but since aio refactoring in 3.11 it is not true anymore.
+
+Here is a pseudo-code that shows a testcase for a race condition discovered
+in 3.11:
+
+  initialize io_context
+  io_submit(read to buffer)
+  io_destroy()
+
+  // context is destroyed so we can free the resources
+  free(buffers);
+
+  // if the buffer is allocated by some other user he'll be surprised
+  // to learn that the buffer still filled by an outstanding operation
+  // from the destroyed io_context
+
+The fix is straight-forward - add a completion struct and wait on it
+in io_destroy, complete() should be called when number of in-fligh requests
+reaches zero.
+
+If two or more io_destroy() called for the same context simultaneously then
+only the first one waits for IO completion, other calls behaviour is undefined.
+
+Tested: ran http://pastebin.com/LrPsQ4RL testcase for several hours and
+  do not see the race condition anymore.
+
+	Signed-off-by: Anatol Pomozov <anatol.pomozov@gmail.com>
+	Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+(cherry picked from commit e02ba72aabfade4c9cd6e3263e9b57bf890ad25c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/aio.c
+diff --cc fs/aio.c
+index e90f40ffd1ab,2adbb0398ab9..000000000000
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@@ -88,11 -110,23 +88,16 @@@ struct kioctx 
+  	struct page		**ring_pages;
+  	long			nr_pages;
+  
+ -	struct work_struct	free_work;
+ +	struct rcu_head		rcu_head;
+ +	struct work_struct	rcu_work;
+  
++ 	/*
++ 	 * signals when all in-flight requests are done
++ 	 */
++ 	struct completion *requests_done;
++ 
+  	struct {
+ -		/*
+ -		 * This counts the number of available slots in the ringbuffer,
+ -		 * so we avoid overflowing it: it's decremented (if positive)
+ -		 * when allocating a kiocb and incremented when the resulting
+ -		 * io_event is pulled off the ringbuffer.
+ -		 *
+ -		 * We batch accesses to it with a percpu version.
+ -		 */
+ -		atomic_t	reqs_available;
+ +		atomic_t	reqs_active;
+  	} ____cacheline_aligned_in_smp;
+  
+  	struct {
+@@@ -487,6 -509,18 +492,21 @@@ static void free_ioctx_rcu(struct rcu_h
+  	kmem_cache_free(kioctx_cachep, ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void free_ioctx_reqs(struct percpu_ref *ref)
++ {
++ 	struct kioctx *ctx = container_of(ref, struct kioctx, reqs);
++ 
++ 	/* At this point we know that there are no any in-flight requests */
++ 	if (ctx->requests_done)
++ 		complete(ctx->requests_done);
++ 
++ 	INIT_WORK(&ctx->free_work, free_ioctx);
++ 	schedule_work(&ctx->free_work);
++ }
++ 
+++>>>>>>> e02ba72aabfa (aio: block io_destroy() until all context requests are completed)
+  /*
+   * When this function runs, the kioctx has been removed from the "hash table"
+   * and ctx->users has dropped to 0, so we know no more kiocbs can be submitted -
+@@@ -636,13 -727,24 +656,14 @@@ static void kill_ioctx_rcu(struct rcu_h
+   *	when the processes owning a context have all exited to encourage
+   *	the rapid destruction of the kioctx.
+   */
+- static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx)
++ static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
++ 		struct completion *requests_done)
+  {
+  	if (!atomic_xchg(&ctx->dead, 1)) {
+ -		struct kioctx_table *table;
+ -
+  		spin_lock(&mm->ioctx_lock);
+ -		rcu_read_lock();
+ -		table = rcu_dereference(mm->ioctx_table);
+ -
+ -		WARN_ON(ctx != table->table[ctx->id]);
+ -		table->table[ctx->id] = NULL;
+ -		rcu_read_unlock();
+ +		hlist_del_rcu(&ctx->list);
+  		spin_unlock(&mm->ioctx_lock);
+  
+ -		/* percpu_ref_kill() will do the necessary call_rcu() */
+ -		wake_up_all(&ctx->wait);
+ -
+  		/*
+  		 * It'd be more correct to do this in free_ioctx(), after all
+  		 * the outstanding kiocbs have finished - but by then io_destroy
+@@@ -658,8 -757,11 +679,16 @@@
+  		if (ctx->mmap_size)
+  			vm_munmap(ctx->mmap_base, ctx->mmap_size);
+  
+++<<<<<<< HEAD
+ +		/* Between hlist_del_rcu() and dropping the initial ref */
+ +		call_rcu(&ctx->rcu_head, kill_ioctx_rcu);
+++=======
++ 		ctx->requests_done = requests_done;
++ 		percpu_ref_kill(&ctx->users);
++ 	} else {
++ 		if (requests_done)
++ 			complete(requests_done);
+++>>>>>>> e02ba72aabfa (aio: block io_destroy() until all context requests are completed)
+  	}
+  }
+  
+@@@ -1078,8 -1199,8 +1107,13 @@@ SYSCALL_DEFINE2(io_setup, unsigned, nr_
+  	if (!IS_ERR(ioctx)) {
+  		ret = put_user(ioctx->user_id, ctxp);
+  		if (ret)
+++<<<<<<< HEAD
+ +			kill_ioctx(current->mm, ioctx);
+ +		put_ioctx(ioctx);
+++=======
++ 			kill_ioctx(current->mm, ioctx, NULL);
++ 		percpu_ref_put(&ioctx->users);
+++>>>>>>> e02ba72aabfa (aio: block io_destroy() until all context requests are completed)
+  	}
+  
+  out:
+@@@ -1096,8 -1217,22 +1130,27 @@@ SYSCALL_DEFINE1(io_destroy, aio_context
+  {
+  	struct kioctx *ioctx = lookup_ioctx(ctx);
+  	if (likely(NULL != ioctx)) {
+++<<<<<<< HEAD
+ +		kill_ioctx(current->mm, ioctx);
+ +		put_ioctx(ioctx);
+++=======
++ 		struct completion requests_done =
++ 			COMPLETION_INITIALIZER_ONSTACK(requests_done);
++ 
++ 		/* Pass requests_done to kill_ioctx() where it can be set
++ 		 * in a thread-safe way. If we try to set it here then we have
++ 		 * a race condition if two io_destroy() called simultaneously.
++ 		 */
++ 		kill_ioctx(current->mm, ioctx, &requests_done);
++ 		percpu_ref_put(&ioctx->users);
++ 
++ 		/* Wait until all IO for the context are done. Otherwise kernel
++ 		 * keep using user-space buffers even if user thinks the context
++ 		 * is destroyed.
++ 		 */
++ 		wait_for_completion(&requests_done);
++ 
+++>>>>>>> e02ba72aabfa (aio: block io_destroy() until all context requests are completed)
+  		return 0;
+  	}
+  	pr_debug("EINVAL: io_destroy: invalid context id\n");
+* Unmerged path fs/aio.c
