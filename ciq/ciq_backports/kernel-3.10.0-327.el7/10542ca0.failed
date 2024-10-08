@@ -1,0 +1,175 @@
+cxl: Add base builtin support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Ian Munsie <imunsie@au1.ibm.com>
+commit 10542ca0156f60571ef41799d44d40dd4cb0a473
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/10542ca0.failed
+
+This adds the base cxl support that cannot be built as a module. Specifically
+it adds the cxl callbacks that are called from the core powerpc mm code which
+must always exist irrespective of if the cxl module is loaded or not. This is
+similar to how cell works with CONFIG_SPU_BASE.
+
+This adds a cxl_slbia() call (similar to spu_flush_all_slbs()) which checks if
+the cxl module is loaded and in use, returning immediately if it is not. If it
+is in use it calls into the cxl SLB invalidation code.
+
+	Signed-off-by: Ian Munsie <imunsie@au1.ibm.com>
+	Signed-off-by: Michael Neuling <mikey@neuling.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 10542ca0156f60571ef41799d44d40dd4cb0a473)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/Kconfig
+#	drivers/misc/Makefile
+diff --cc drivers/misc/Kconfig
+index d514b094c53e,bbeb4516facf..000000000000
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@@ -536,5 -524,8 +536,10 @@@ source "drivers/misc/carma/Kconfig
+  source "drivers/misc/altera-stapl/Kconfig"
+  source "drivers/misc/mei/Kconfig"
+  source "drivers/misc/vmw_vmci/Kconfig"
+ -source "drivers/misc/mic/Kconfig"
+  source "drivers/misc/genwqe/Kconfig"
+++<<<<<<< HEAD
+++=======
++ source "drivers/misc/echo/Kconfig"
++ source "drivers/misc/cxl/Kconfig"
+++>>>>>>> 10542ca0156f (cxl: Add base builtin support)
+  endmenu
+diff --cc drivers/misc/Makefile
+index 62a3dfba967c,7d5c4cd118c4..000000000000
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@@ -53,4 -51,8 +53,10 @@@ obj-$(CONFIG_INTEL_MEI)		+= mei
+  obj-$(CONFIG_VMWARE_VMCI)	+= vmw_vmci/
+  obj-$(CONFIG_LATTICE_ECP3_CONFIG)	+= lattice-ecp3-config.o
+  obj-$(CONFIG_SRAM)		+= sram.o
+ -obj-y				+= mic/
+  obj-$(CONFIG_GENWQE)		+= genwqe/
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_ECHO)		+= echo/
++ obj-$(CONFIG_VEXPRESS_SYSCFG)	+= vexpress-syscfg.o
++ obj-$(CONFIG_CXL_BASE)		+= cxl/
+++>>>>>>> 10542ca0156f (cxl: Add base builtin support)
+* Unmerged path drivers/misc/Kconfig
+* Unmerged path drivers/misc/Makefile
+diff --git a/drivers/misc/cxl/Kconfig b/drivers/misc/cxl/Kconfig
+new file mode 100644
+index 000000000000..5cdd3199f97d
+--- /dev/null
++++ b/drivers/misc/cxl/Kconfig
+@@ -0,0 +1,8 @@
++#
++# IBM Coherent Accelerator (CXL) compatible devices
++#
++
++config CXL_BASE
++	bool
++	default n
++	select PPC_COPRO_BASE
+diff --git a/drivers/misc/cxl/Makefile b/drivers/misc/cxl/Makefile
+new file mode 100644
+index 000000000000..e30ad0ab0cf5
+--- /dev/null
++++ b/drivers/misc/cxl/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_CXL_BASE)		+= base.o
+diff --git a/drivers/misc/cxl/base.c b/drivers/misc/cxl/base.c
+new file mode 100644
+index 000000000000..0654ad83675e
+--- /dev/null
++++ b/drivers/misc/cxl/base.c
+@@ -0,0 +1,86 @@
++/*
++ * Copyright 2014 IBM Corp.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/module.h>
++#include <linux/rcupdate.h>
++#include <asm/errno.h>
++#include <misc/cxl.h>
++#include "cxl.h"
++
++/* protected by rcu */
++static struct cxl_calls *cxl_calls;
++
++atomic_t cxl_use_count = ATOMIC_INIT(0);
++EXPORT_SYMBOL(cxl_use_count);
++
++#ifdef CONFIG_CXL_MODULE
++
++static inline struct cxl_calls *cxl_calls_get(void)
++{
++	struct cxl_calls *calls = NULL;
++
++	rcu_read_lock();
++	calls = rcu_dereference(cxl_calls);
++	if (calls && !try_module_get(calls->owner))
++		calls = NULL;
++	rcu_read_unlock();
++
++	return calls;
++}
++
++static inline void cxl_calls_put(struct cxl_calls *calls)
++{
++	BUG_ON(calls != cxl_calls);
++
++	/* we don't need to rcu this, as we hold a reference to the module */
++	module_put(cxl_calls->owner);
++}
++
++#else /* !defined CONFIG_CXL_MODULE */
++
++static inline struct cxl_calls *cxl_calls_get(void)
++{
++	return cxl_calls;
++}
++
++static inline void cxl_calls_put(struct cxl_calls *calls) { }
++
++#endif /* CONFIG_CXL_MODULE */
++
++void cxl_slbia(struct mm_struct *mm)
++{
++	struct cxl_calls *calls;
++
++	calls = cxl_calls_get();
++	if (!calls)
++		return;
++
++	if (cxl_ctx_in_use())
++	    calls->cxl_slbia(mm);
++
++	cxl_calls_put(calls);
++}
++
++int register_cxl_calls(struct cxl_calls *calls)
++{
++	if (cxl_calls)
++		return -EBUSY;
++
++	rcu_assign_pointer(cxl_calls, calls);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(register_cxl_calls);
++
++void unregister_cxl_calls(struct cxl_calls *calls)
++{
++	BUG_ON(cxl_calls->owner != calls->owner);
++	RCU_INIT_POINTER(cxl_calls, NULL);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL_GPL(unregister_cxl_calls);
