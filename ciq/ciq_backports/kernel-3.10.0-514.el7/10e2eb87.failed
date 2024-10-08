@@ -1,0 +1,204 @@
+udp: fix dst races with multicast early demux
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 10e2eb878f3ca07ac2f05fa5ca5e6c4c9174a27a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/10e2eb87.failed
+
+Multicast dst are not cached. They carry DST_NOCACHE.
+
+As mentioned in commit f8864972126899 ("ipv4: fix dst race in
+sk_dst_get()"), these dst need special care before caching them
+into a socket.
+
+Caching them is allowed only if their refcnt was not 0, ie we
+must use atomic_inc_not_zero()
+
+Also, we must use READ_ONCE() to fetch sk->sk_rx_dst, as mentioned
+in commit d0c294c53a771 ("tcp: prevent fetching dst twice in early demux
+code")
+
+Fixes: 421b3885bf6d ("udp: ipv4: Add udp early demux")
+	Tested-by: Gregory Hoggarth <Gregory.Hoggarth@alliedtelesis.co.nz>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Gregory Hoggarth <Gregory.Hoggarth@alliedtelesis.co.nz>
+	Reported-by: Alex Gartrell <agartrell@fb.com>
+	Cc: Michal Kubeček <mkubecek@suse.cz>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 10e2eb878f3ca07ac2f05fa5ca5e6c4c9174a27a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp.c
+diff --cc net/ipv4/udp.c
+index 556580e2c4f8,1b8c5ba7d5f7..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1809,6 -1856,160 +1809,163 @@@ drop
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* We can only early demux multicast if there is a single matching socket.
++  * If more than one socket found returns NULL
++  */
++ static struct sock *__udp4_lib_mcast_demux_lookup(struct net *net,
++ 						  __be16 loc_port, __be32 loc_addr,
++ 						  __be16 rmt_port, __be32 rmt_addr,
++ 						  int dif)
++ {
++ 	struct sock *sk, *result;
++ 	struct hlist_nulls_node *node;
++ 	unsigned short hnum = ntohs(loc_port);
++ 	unsigned int count, slot = udp_hashfn(net, hnum, udp_table.mask);
++ 	struct udp_hslot *hslot = &udp_table.hash[slot];
++ 
++ 	/* Do not bother scanning a too big list */
++ 	if (hslot->count > 10)
++ 		return NULL;
++ 
++ 	rcu_read_lock();
++ begin:
++ 	count = 0;
++ 	result = NULL;
++ 	sk_nulls_for_each_rcu(sk, node, &hslot->head) {
++ 		if (__udp_is_mcast_sock(net, sk,
++ 					loc_port, loc_addr,
++ 					rmt_port, rmt_addr,
++ 					dif, hnum)) {
++ 			result = sk;
++ 			++count;
++ 		}
++ 	}
++ 	/*
++ 	 * if the nulls value we got at the end of this lookup is
++ 	 * not the expected one, we must restart lookup.
++ 	 * We probably met an item that was moved to another chain.
++ 	 */
++ 	if (get_nulls_value(node) != slot)
++ 		goto begin;
++ 
++ 	if (result) {
++ 		if (count != 1 ||
++ 		    unlikely(!atomic_inc_not_zero_hint(&result->sk_refcnt, 2)))
++ 			result = NULL;
++ 		else if (unlikely(!__udp_is_mcast_sock(net, result,
++ 						       loc_port, loc_addr,
++ 						       rmt_port, rmt_addr,
++ 						       dif, hnum))) {
++ 			sock_put(result);
++ 			result = NULL;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	return result;
++ }
++ 
++ /* For unicast we should only early demux connected sockets or we can
++  * break forwarding setups.  The chains here can be long so only check
++  * if the first socket is an exact match and if not move on.
++  */
++ static struct sock *__udp4_lib_demux_lookup(struct net *net,
++ 					    __be16 loc_port, __be32 loc_addr,
++ 					    __be16 rmt_port, __be32 rmt_addr,
++ 					    int dif)
++ {
++ 	struct sock *sk, *result;
++ 	struct hlist_nulls_node *node;
++ 	unsigned short hnum = ntohs(loc_port);
++ 	unsigned int hash2 = udp4_portaddr_hash(net, loc_addr, hnum);
++ 	unsigned int slot2 = hash2 & udp_table.mask;
++ 	struct udp_hslot *hslot2 = &udp_table.hash2[slot2];
++ 	INET_ADDR_COOKIE(acookie, rmt_addr, loc_addr);
++ 	const __portpair ports = INET_COMBINED_PORTS(rmt_port, hnum);
++ 
++ 	rcu_read_lock();
++ 	result = NULL;
++ 	udp_portaddr_for_each_entry_rcu(sk, node, &hslot2->head) {
++ 		if (INET_MATCH(sk, net, acookie,
++ 			       rmt_addr, loc_addr, ports, dif))
++ 			result = sk;
++ 		/* Only check first socket in chain */
++ 		break;
++ 	}
++ 
++ 	if (result) {
++ 		if (unlikely(!atomic_inc_not_zero_hint(&result->sk_refcnt, 2)))
++ 			result = NULL;
++ 		else if (unlikely(!INET_MATCH(sk, net, acookie,
++ 					      rmt_addr, loc_addr,
++ 					      ports, dif))) {
++ 			sock_put(result);
++ 			result = NULL;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	return result;
++ }
++ 
++ void udp_v4_early_demux(struct sk_buff *skb)
++ {
++ 	struct net *net = dev_net(skb->dev);
++ 	const struct iphdr *iph;
++ 	const struct udphdr *uh;
++ 	struct sock *sk;
++ 	struct dst_entry *dst;
++ 	int dif = skb->dev->ifindex;
++ 	int ours;
++ 
++ 	/* validate the packet */
++ 	if (!pskb_may_pull(skb, skb_transport_offset(skb) + sizeof(struct udphdr)))
++ 		return;
++ 
++ 	iph = ip_hdr(skb);
++ 	uh = udp_hdr(skb);
++ 
++ 	if (skb->pkt_type == PACKET_BROADCAST ||
++ 	    skb->pkt_type == PACKET_MULTICAST) {
++ 		struct in_device *in_dev = __in_dev_get_rcu(skb->dev);
++ 
++ 		if (!in_dev)
++ 			return;
++ 
++ 		ours = ip_check_mc_rcu(in_dev, iph->daddr, iph->saddr,
++ 				       iph->protocol);
++ 		if (!ours)
++ 			return;
++ 		sk = __udp4_lib_mcast_demux_lookup(net, uh->dest, iph->daddr,
++ 						   uh->source, iph->saddr, dif);
++ 	} else if (skb->pkt_type == PACKET_HOST) {
++ 		sk = __udp4_lib_demux_lookup(net, uh->dest, iph->daddr,
++ 					     uh->source, iph->saddr, dif);
++ 	} else {
++ 		return;
++ 	}
++ 
++ 	if (!sk)
++ 		return;
++ 
++ 	skb->sk = sk;
++ 	skb->destructor = sock_efree;
++ 	dst = READ_ONCE(sk->sk_rx_dst);
++ 
++ 	if (dst)
++ 		dst = dst_check(dst, 0);
++ 	if (dst) {
++ 		/* DST_NOCACHE can not be used without taking a reference */
++ 		if (dst->flags & DST_NOCACHE) {
++ 			if (likely(atomic_inc_not_zero(&dst->__refcnt)))
++ 				skb_dst_set(skb, dst);
++ 		} else {
++ 			skb_dst_set_noref(skb, dst);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 10e2eb878f3c (udp: fix dst races with multicast early demux)
+  int udp_rcv(struct sk_buff *skb)
+  {
+  	return __udp4_lib_rcv(skb, &udp_table, IPPROTO_UDP);
+* Unmerged path net/ipv4/udp.c
