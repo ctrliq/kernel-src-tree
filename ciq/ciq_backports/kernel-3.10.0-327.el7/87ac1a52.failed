@@ -1,0 +1,345 @@
+be2net: refactor adapter resource cleanup sequence into be_cleanup()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Kalesh AP <kalesh.purayil@emulex.com>
+commit 87ac1a5296291d557080fb544f445be3bce6c51f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/87ac1a52.failed
+
+Most of the resource cleanup sequences performed in be_suspend(),
+be_eeh_err_detected() and be_err_detection_task() are same. Moved the
+common code to a new routine be_cleanup() to avoid code duplication.
+
+	Signed-off-by: Kalesh AP <kalesh.purayil@emulex.com>
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 87ac1a5296291d557080fb544f445be3bce6c51f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index b2184bdb8a43,7aa1a4dd2df9..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -4650,201 -4932,53 +4650,218 @@@ static int be_roce_map_pci_bars(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int be_map_pci_bars(struct be_adapter *adapter)
+++=======
++ static void be_cleanup(struct be_adapter *adapter)
++ {
++ 	struct net_device *netdev = adapter->netdev;
++ 
++ 	rtnl_lock();
++ 	netif_device_detach(netdev);
++ 	if (netif_running(netdev))
++ 		be_close(netdev);
++ 	rtnl_unlock();
++ 
++ 	be_clear(adapter);
++ }
++ 
++ static int be_resume(struct be_adapter *adapter)
+++>>>>>>> 87ac1a529629 (be2net: refactor adapter resource cleanup sequence into be_cleanup())
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -	int status;
+ +	struct pci_dev *pdev = adapter->pdev;
+ +	u8 __iomem *addr;
+  
+ -	status = be_func_init(adapter);
+ -	if (status)
+ -		return status;
+ +	if (BEx_chip(adapter) && be_physfn(adapter)) {
+ +		adapter->csr = pci_iomap(pdev, 2, 0);
+ +		if (!adapter->csr)
+ +			return -ENOMEM;
+ +	}
+  
+ -	status = be_setup(adapter);
+ -	if (status)
+ -		return status;
+ +	addr = pci_iomap(pdev, db_bar(adapter), 0);
+ +	if (!addr)
+ +		goto pci_map_err;
+ +	adapter->db = addr;
+  
+ -	if (netif_running(netdev)) {
+ -		status = be_open(netdev);
+ -		if (status)
+ -			return status;
+ +	if (skyhawk_chip(adapter) || BEx_chip(adapter)) {
+ +		if (be_physfn(adapter)) {
+ +			/* PCICFG is the 2nd BAR in BE2 */
+ +			addr = pci_iomap(pdev, BE2_chip(adapter) ? 1 : 0, 0);
+ +			if (!addr)
+ +				goto pci_map_err;
+ +			adapter->pcicfg = addr;
+ +		} else {
+ +			adapter->pcicfg = adapter->db + SRIOV_VF_PCICFG_OFFSET;
+ +		}
+  	}
+  
+ -	netif_device_attach(netdev);
+ +	be_roce_map_pci_bars(adapter);
+ +	return 0;
+ +
+ +pci_map_err:
+ +	dev_err(&pdev->dev, "Error in mapping PCI BARs\n");
+ +	be_unmap_pci_bars(adapter);
+ +	return -ENOMEM;
+ +}
+ +
+ +static void be_ctrl_cleanup(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem *mem = &adapter->mbox_mem_alloced;
+ +
+ +	be_unmap_pci_bars(adapter);
+ +
+ +	if (mem->va)
+ +		dma_free_coherent(&adapter->pdev->dev, mem->size, mem->va,
+ +				  mem->dma);
+ +
+ +	mem = &adapter->rx_filter;
+ +	if (mem->va)
+ +		dma_free_coherent(&adapter->pdev->dev, mem->size, mem->va,
+ +				  mem->dma);
+ +}
+ +
+ +static int be_ctrl_init(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem *mbox_mem_alloc = &adapter->mbox_mem_alloced;
+ +	struct be_dma_mem *mbox_mem_align = &adapter->mbox_mem;
+ +	struct be_dma_mem *rx_filter = &adapter->rx_filter;
+ +	u32 sli_intf;
+ +	int status;
+ +
+ +	pci_read_config_dword(adapter->pdev, SLI_INTF_REG_OFFSET, &sli_intf);
+ +	adapter->sli_family = (sli_intf & SLI_INTF_FAMILY_MASK) >>
+ +				 SLI_INTF_FAMILY_SHIFT;
+ +	adapter->virtfn = (sli_intf & SLI_INTF_FT_MASK) ? 1 : 0;
+ +
+ +	status = be_map_pci_bars(adapter);
+ +	if (status)
+ +		goto done;
+ +
+ +	mbox_mem_alloc->size = sizeof(struct be_mcc_mailbox) + 16;
+ +	mbox_mem_alloc->va = dma_alloc_coherent(&adapter->pdev->dev,
+ +						mbox_mem_alloc->size,
+ +						&mbox_mem_alloc->dma,
+ +						GFP_KERNEL);
+ +	if (!mbox_mem_alloc->va) {
+ +		status = -ENOMEM;
+ +		goto unmap_pci_bars;
+ +	}
+ +	mbox_mem_align->size = sizeof(struct be_mcc_mailbox);
+ +	mbox_mem_align->va = PTR_ALIGN(mbox_mem_alloc->va, 16);
+ +	mbox_mem_align->dma = PTR_ALIGN(mbox_mem_alloc->dma, 16);
+ +	memset(mbox_mem_align->va, 0, sizeof(struct be_mcc_mailbox));
+ +
+ +	rx_filter->size = sizeof(struct be_cmd_req_rx_filter);
+ +	rx_filter->va = dma_zalloc_coherent(&adapter->pdev->dev,
+ +					    rx_filter->size, &rx_filter->dma,
+ +					    GFP_KERNEL);
+ +	if (!rx_filter->va) {
+ +		status = -ENOMEM;
+ +		goto free_mbox;
+ +	}
+ +
+ +	mutex_init(&adapter->mbox_lock);
+ +	spin_lock_init(&adapter->mcc_lock);
+ +	spin_lock_init(&adapter->mcc_cq_lock);
+  
+ +	init_completion(&adapter->et_cmd_compl);
+ +	pci_save_state(adapter->pdev);
+  	return 0;
+ +
+ +free_mbox:
+ +	dma_free_coherent(&adapter->pdev->dev, mbox_mem_alloc->size,
+ +			  mbox_mem_alloc->va, mbox_mem_alloc->dma);
+ +
+ +unmap_pci_bars:
+ +	be_unmap_pci_bars(adapter);
+ +
+ +done:
+ +	return status;
+  }
+  
+ -static int be_err_recover(struct be_adapter *adapter)
+ +static void be_stats_cleanup(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem *cmd = &adapter->stats_cmd;
+ +
+ +	if (cmd->va)
+ +		dma_free_coherent(&adapter->pdev->dev, cmd->size,
+ +				  cmd->va, cmd->dma);
+ +}
+ +
+ +static int be_stats_init(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem *cmd = &adapter->stats_cmd;
+ +
+ +	if (lancer_chip(adapter))
+ +		cmd->size = sizeof(struct lancer_cmd_req_pport_stats);
+ +	else if (BE2_chip(adapter))
+ +		cmd->size = sizeof(struct be_cmd_req_get_stats_v0);
+ +	else if (BE3_chip(adapter))
+ +		cmd->size = sizeof(struct be_cmd_req_get_stats_v1);
+ +	else
+ +		/* ALL non-BE ASICs */
+ +		cmd->size = sizeof(struct be_cmd_req_get_stats_v2);
+ +
+ +	cmd->va = dma_zalloc_coherent(&adapter->pdev->dev, cmd->size, &cmd->dma,
+ +				      GFP_KERNEL);
+ +	if (!cmd->va)
+ +		return -ENOMEM;
+ +	return 0;
+ +}
+ +
+ +static void be_remove(struct pci_dev *pdev)
+ +{
+ +	struct be_adapter *adapter = pci_get_drvdata(pdev);
+ +
+ +	if (!adapter)
+ +		return;
+ +
+ +	be_roce_dev_remove(adapter);
+ +	be_intr_set(adapter, false);
+ +
+ +	cancel_delayed_work_sync(&adapter->func_recovery_work);
+ +
+ +	unregister_netdev(adapter->netdev);
+ +
+ +	be_clear(adapter);
+ +
+ +	/* tell fw we're done with firing cmds */
+ +	be_cmd_fw_clean(adapter);
+ +
+ +	be_stats_cleanup(adapter);
+ +
+ +	be_ctrl_cleanup(adapter);
+ +
+ +	pci_disable_pcie_error_reporting(pdev);
+ +
+ +	pci_release_regions(pdev);
+ +	pci_disable_device(pdev);
+ +
+ +	free_netdev(adapter->netdev);
+ +}
+ +
+ +static int be_get_initial_config(struct be_adapter *adapter)
+ +{
+ +	int status, level;
+ +
+ +	status = be_cmd_get_cntl_attributes(adapter);
+ +	if (status)
+ +		return status;
+ +
+ +	/* Must be a power of 2 or else MODULO will BUG_ON */
+ +	adapter->be_get_temp_freq = 64;
+ +
+ +	if (BEx_chip(adapter)) {
+ +		level = be_cmd_get_fw_log_level(adapter);
+ +		adapter->msg_enable =
+ +			level <= FW_LOG_LEVEL_DEFAULT ? NETIF_MSG_HW : 0;
+ +	}
+ +
+ +	adapter->cfg_num_qs = netif_get_num_default_rss_queues();
+ +	return 0;
+ +}
+ +
+ +static int lancer_recover_func(struct be_adapter *adapter)
+  {
+  	struct device *dev = &adapter->pdev->dev;
+  	int status;
+@@@ -4881,30 -4998,26 +4898,44 @@@ err
+  	return status;
+  }
+  
+ -static void be_err_detection_task(struct work_struct *work)
+ +static void be_func_recovery_task(struct work_struct *work)
+  {
+  	struct be_adapter *adapter =
+++<<<<<<< HEAD
+ +		container_of(work, struct be_adapter,  func_recovery_work.work);
+++=======
++ 				container_of(work, struct be_adapter,
++ 					     be_err_detection_work.work);
+++>>>>>>> 87ac1a529629 (be2net: refactor adapter resource cleanup sequence into be_cleanup())
+  	int status = 0;
+  
+  	be_detect_error(adapter);
+  
+++<<<<<<< HEAD
+ +	if (adapter->hw_error && lancer_chip(adapter)) {
+ +		rtnl_lock();
+ +		netif_device_detach(adapter->netdev);
+ +		rtnl_unlock();
+ +
+ +		status = lancer_recover_func(adapter);
+ +		if (!status)
+ +			netif_device_attach(adapter->netdev);
+++=======
++ 	if (adapter->hw_error) {
++ 		be_cleanup(adapter);
++ 
++ 		/* As of now error recovery support is in Lancer only */
++ 		if (lancer_chip(adapter))
++ 			status = be_err_recover(adapter);
+++>>>>>>> 87ac1a529629 (be2net: refactor adapter resource cleanup sequence into be_cleanup())
+  	}
+  
+ -	/* Always attempt recovery on VFs */
+ -	if (!status || be_virtfn(adapter))
+ -		be_schedule_err_detection(adapter);
+ +	/* In Lancer, for all errors other than provisioning error (-EAGAIN),
+ +	 * no need to attempt further recovery.
+ +	 */
+ +	if (!status || status == -EAGAIN)
+ +		schedule_delayed_work(&adapter->func_recovery_work,
+ +				      msecs_to_jiffies(1000));
+  }
+  
+  static void be_log_sfp_info(struct be_adapter *adapter)
+@@@ -5137,15 -5412,9 +5167,9 @@@ static int be_suspend(struct pci_dev *p
+  		be_setup_wol(adapter, true);
+  
+  	be_intr_set(adapter, false);
+ -	be_cancel_err_detection(adapter);
+ +	cancel_delayed_work_sync(&adapter->func_recovery_work);
+  
+- 	netif_device_detach(netdev);
+- 	if (netif_running(netdev)) {
+- 		rtnl_lock();
+- 		be_close(netdev);
+- 		rtnl_unlock();
+- 	}
+- 	be_clear(adapter);
++ 	be_cleanup(adapter);
+  
+  	pci_save_state(pdev);
+  	pci_disable_device(pdev);
+@@@ -5231,15 -5477,9 +5254,9 @@@ static pci_ers_result_t be_eeh_err_dete
+  	if (!adapter->eeh_error) {
+  		adapter->eeh_error = true;
+  
+ -		be_cancel_err_detection(adapter);
+ +		cancel_delayed_work_sync(&adapter->func_recovery_work);
+  
+- 		rtnl_lock();
+- 		netif_device_detach(netdev);
+- 		if (netif_running(netdev))
+- 			be_close(netdev);
+- 		rtnl_unlock();
+- 
+- 		be_clear(adapter);
++ 		be_cleanup(adapter);
+  	}
+  
+  	if (state == pci_channel_io_perm_failure)
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
