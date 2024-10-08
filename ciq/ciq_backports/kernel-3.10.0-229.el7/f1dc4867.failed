@@ -1,0 +1,206 @@
+audit: anchor all pid references in the initial pid namespace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit f1dc4867ff41b7bcca57fa19449d1fe7ad517ac1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f1dc4867.failed
+
+Store and log all PIDs with reference to the initial PID namespace and
+use the access functions task_pid_nr() and task_tgid_nr() for task->pid
+and task->tgid.
+
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+(informed by ebiederman's c776b5d2)
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+(cherry picked from commit f1dc4867ff41b7bcca57fa19449d1fe7ad517ac1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/auditsc.c
+diff --cc kernel/auditsc.c
+index 59ed7262959f,6381f25ac3d4..000000000000
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@@ -1990,10 -2050,12 +1992,19 @@@ static void audit_log_set_loginuid(kuid
+  	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_LOGIN);
+  	if (!ab)
+  		return;
+++<<<<<<< HEAD
+ +	audit_log_format(ab, "pid=%d uid=%u", current->pid, uid);
+ +	audit_log_task_context(ab);
+ +	audit_log_format(ab, " old-auid=%u auid=%u old-ses=%u ses=%u res=%d",
+ +			 oldloginuid, loginuid, oldsessionid, sessionid, !rc);
+++=======
++ 	audit_log_format(ab, "pid=%d uid=%u"
++ 			 " old-auid=%u new-auid=%u old-ses=%u new-ses=%u"
++ 			 " res=%d",
++ 			 task_pid_nr(current), uid,
++ 			 oldloginuid, loginuid, oldsessionid, sessionid,
++ 			 !rc);
+++>>>>>>> f1dc4867ff41 (audit: anchor all pid references in the initial pid namespace)
+  	audit_log_end(ab);
+  }
+  
+@@@ -2376,17 -2437,17 +2387,17 @@@ static void audit_log_task(struct audit
+  			 from_kgid(&init_user_ns, gid),
+  			 sessionid);
+  	audit_log_task_context(ab);
+- 	audit_log_format(ab, " pid=%d comm=", current->pid);
++ 	audit_log_format(ab, " pid=%d comm=", task_pid_nr(current));
+  	audit_log_untrustedstring(ab, current->comm);
+ -	if (mm) {
+ -		down_read(&mm->mmap_sem);
+ -		if (mm->exe_file)
+ -			audit_log_d_path(ab, " exe=", &mm->exe_file->f_path);
+ -		up_read(&mm->mmap_sem);
+ -	} else
+ -		audit_log_format(ab, " exe=(null)");
+  }
+  
+ +static void audit_log_abend(struct audit_buffer *ab, char *reason, long signr)
+ +{
+ +	audit_log_task(ab);
+ +	audit_log_format(ab, " reason=");
+ +	audit_log_string(ab, reason);
+ +	audit_log_format(ab, " sig=%ld", signr);
+ +}
+  /**
+   * audit_core_dumps - record information about processes that end abnormally
+   * @signr: signal value
+diff --git a/drivers/tty/tty_audit.c b/drivers/tty/tty_audit.c
+index a4fdce74f883..a8a2a91ca03b 100644
+--- a/drivers/tty/tty_audit.c
++++ b/drivers/tty/tty_audit.c
+@@ -65,6 +65,7 @@ static void tty_audit_log(const char *description, int major, int minor,
+ {
+ 	struct audit_buffer *ab;
+ 	struct task_struct *tsk = current;
++	pid_t pid = task_pid_nr(tsk);
+ 	uid_t uid = from_kuid(&init_user_ns, task_uid(tsk));
+ 	uid_t loginuid = from_kuid(&init_user_ns, audit_get_loginuid(tsk));
+ 	u32 sessionid = audit_get_sessionid(tsk);
+@@ -74,7 +75,7 @@ static void tty_audit_log(const char *description, int major, int minor,
+ 		char name[sizeof(tsk->comm)];
+ 
+ 		audit_log_format(ab, "%s pid=%u uid=%u auid=%u ses=%u major=%d"
+-				 " minor=%d comm=", description, tsk->pid, uid,
++				 " minor=%d comm=", description, pid, uid,
+ 				 loginuid, sessionid, major, minor);
+ 		get_task_comm(name, tsk);
+ 		audit_log_untrustedstring(ab, name);
+diff --git a/kernel/audit.c b/kernel/audit.c
+index 4ead2589f157..e2fdae79b518 100644
+--- a/kernel/audit.c
++++ b/kernel/audit.c
+@@ -635,6 +635,7 @@ static int audit_log_common_recv_msg(struct audit_buffer **ab, u16 msg_type)
+ {
+ 	int rc = 0;
+ 	uid_t uid = from_kuid(&init_user_ns, current_uid());
++	pid_t pid = task_tgid_nr(current);
+ 
+ 	if (!audit_enabled && msg_type != AUDIT_USER_AVC) {
+ 		*ab = NULL;
+@@ -644,7 +645,7 @@ static int audit_log_common_recv_msg(struct audit_buffer **ab, u16 msg_type)
+ 	*ab = audit_log_start(NULL, GFP_KERNEL, msg_type);
+ 	if (unlikely(!*ab))
+ 		return rc;
+-	audit_log_format(*ab, "pid=%d uid=%u", task_tgid_vnr(current), uid);
++	audit_log_format(*ab, "pid=%d uid=%u", pid, uid);
+ 	audit_log_session_info(*ab);
+ 	audit_log_task_context(*ab);
+ 
+@@ -1743,7 +1744,7 @@ void audit_log_task_info(struct audit_buffer *ab, struct task_struct *tsk)
+ 			 " euid=%u suid=%u fsuid=%u"
+ 			 " egid=%u sgid=%u fsgid=%u tty=%s ses=%u",
+ 			 task_ppid_nr(tsk),
+-			 tsk->pid,
++			 task_pid_nr(tsk),
+ 			 from_kuid(&init_user_ns, audit_get_loginuid(tsk)),
+ 			 from_kuid(&init_user_ns, cred->uid),
+ 			 from_kgid(&init_user_ns, cred->gid),
+diff --git a/kernel/auditfilter.c b/kernel/auditfilter.c
+index 900b86759654..095e61f4757c 100644
+--- a/kernel/auditfilter.c
++++ b/kernel/auditfilter.c
+@@ -429,6 +429,19 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
+ 			f->val = 0;
+ 		}
+ 
++		if ((f->type == AUDIT_PID) || (f->type == AUDIT_PPID)) {
++			struct pid *pid;
++			rcu_read_lock();
++			pid = find_vpid(f->val);
++			if (!pid) {
++				rcu_read_unlock();
++				err = -ESRCH;
++				goto exit_free;
++			}
++			f->val = pid_nr(pid);
++			rcu_read_unlock();
++		}
++
+ 		err = audit_field_valid(entry, f);
+ 		if (err)
+ 			goto exit_free;
+@@ -1216,12 +1229,14 @@ static int audit_filter_user_rules(struct audit_krule *rule, int type,
+ 
+ 	for (i = 0; i < rule->field_count; i++) {
+ 		struct audit_field *f = &rule->fields[i];
++		pid_t pid;
+ 		int result = 0;
+ 		u32 sid;
+ 
+ 		switch (f->type) {
+ 		case AUDIT_PID:
+-			result = audit_comparator(task_pid_vnr(current), f->op, f->val);
++			pid = task_pid_nr(current);
++			result = audit_comparator(pid, f->op, f->val);
+ 			break;
+ 		case AUDIT_UID:
+ 			result = audit_uid_comparator(current_uid(), f->op, f->uid);
+* Unmerged path kernel/auditsc.c
+diff --git a/security/integrity/ima/ima_audit.c b/security/integrity/ima/ima_audit.c
+index c586faae8fd6..8ced0aa2f64b 100644
+--- a/security/integrity/ima/ima_audit.c
++++ b/security/integrity/ima/ima_audit.c
+@@ -39,7 +39,7 @@ void integrity_audit_msg(int audit_msgno, struct inode *inode,
+ 
+ 	ab = audit_log_start(current->audit_context, GFP_KERNEL, audit_msgno);
+ 	audit_log_format(ab, "pid=%d uid=%u auid=%u ses=%u",
+-			 current->pid,
++			 task_pid_nr(current),
+ 			 from_kuid(&init_user_ns, current_cred()->uid),
+ 			 from_kuid(&init_user_ns, audit_get_loginuid(current)),
+ 			 audit_get_sessionid(current));
+diff --git a/security/lsm_audit.c b/security/lsm_audit.c
+index 9a62045e6282..69fdf3bc765b 100644
+--- a/security/lsm_audit.c
++++ b/security/lsm_audit.c
+@@ -220,7 +220,7 @@ static void dump_common_audit_data(struct audit_buffer *ab,
+ 	 */
+ 	BUILD_BUG_ON(sizeof(a->u) > sizeof(void *)*2);
+ 
+-	audit_log_format(ab, " pid=%d comm=", tsk->pid);
++	audit_log_format(ab, " pid=%d comm=", task_pid_nr(tsk));
+ 	audit_log_untrustedstring(ab, tsk->comm);
+ 
+ 	switch (a->type) {
+@@ -278,9 +278,12 @@ static void dump_common_audit_data(struct audit_buffer *ab,
+ 	}
+ 	case LSM_AUDIT_DATA_TASK:
+ 		tsk = a->u.tsk;
+-		if (tsk && tsk->pid) {
+-			audit_log_format(ab, " pid=%d comm=", tsk->pid);
+-			audit_log_untrustedstring(ab, tsk->comm);
++		if (tsk) {
++			pid_t pid = task_pid_nr(tsk);
++			if (pid) {
++				audit_log_format(ab, " pid=%d comm=", pid);
++				audit_log_untrustedstring(ab, tsk->comm);
++			}
+ 		}
+ 		break;
+ 	case LSM_AUDIT_DATA_NET:
