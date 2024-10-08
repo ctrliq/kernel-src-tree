@@ -1,0 +1,256 @@
+drm/i915: Fix erroneous dereference of batch_obj inside reset_status
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [drm] i915: Fix erroneous dereference of batch_obj inside reset_status (Rob Clark) [1054409]
+Rebuild_FUZZ: 96.97%
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit 4db080f9e93411c3c41ec402244da28e2bbde835
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/4db080f9.failed
+
+As the rings may be processed and their requests deallocated in a
+different order to the natural retirement during a reset,
+
+/* Whilst this request exists, batch_obj will be on the
+ * active_list, and so will hold the active reference. Only when this
+ * request is retired will the the batch_obj be moved onto the
+ * inactive_list and lose its active reference. Hence we do not need
+ * to explicitly hold another reference here.
+ */
+
+is violated, and the batch_obj may be dereferenced after it had been
+freed on another ring. This can be simply avoided by processing the
+status update prior to deallocating any requests.
+
+Fixes regression (a possible OOPS following a GPU hang) from
+commit aa60c664e6df502578454621c3a9b1f087ff8d25
+Author: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date:   Wed Jun 12 15:13:20 2013 +0300
+
+    drm/i915: find guilty batch buffer on ring resets
+
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+[danvet: Add the code comment Chris supplied.]
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 4db080f9e93411c3c41ec402244da28e2bbde835)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem.c
+diff --cc drivers/gpu/drm/i915/i915_gem.c
+index 9e35dafc5807,76d3d1ab73c6..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@@ -2100,9 -2210,157 +2100,163 @@@ i915_gem_request_remove_from_client(str
+  	spin_unlock(&file_priv->mm.lock);
+  }
+  
+++<<<<<<< HEAD
+ +static void i915_gem_reset_ring_lists(struct drm_i915_private *dev_priv,
+ +				      struct intel_ring_buffer *ring)
+ +{
+++=======
++ static bool i915_head_inside_object(u32 acthd, struct drm_i915_gem_object *obj,
++ 				    struct i915_address_space *vm)
++ {
++ 	if (acthd >= i915_gem_obj_offset(obj, vm) &&
++ 	    acthd < i915_gem_obj_offset(obj, vm) + obj->base.size)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static bool i915_head_inside_request(const u32 acthd_unmasked,
++ 				     const u32 request_start,
++ 				     const u32 request_end)
++ {
++ 	const u32 acthd = acthd_unmasked & HEAD_ADDR;
++ 
++ 	if (request_start < request_end) {
++ 		if (acthd >= request_start && acthd < request_end)
++ 			return true;
++ 	} else if (request_start > request_end) {
++ 		if (acthd >= request_start || acthd < request_end)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static struct i915_address_space *
++ request_to_vm(struct drm_i915_gem_request *request)
++ {
++ 	struct drm_i915_private *dev_priv = request->ring->dev->dev_private;
++ 	struct i915_address_space *vm;
++ 
++ 	vm = &dev_priv->gtt.base;
++ 
++ 	return vm;
++ }
++ 
++ static bool i915_request_guilty(struct drm_i915_gem_request *request,
++ 				const u32 acthd, bool *inside)
++ {
++ 	/* There is a possibility that unmasked head address
++ 	 * pointing inside the ring, matches the batch_obj address range.
++ 	 * However this is extremely unlikely.
++ 	 */
++ 	if (request->batch_obj) {
++ 		if (i915_head_inside_object(acthd, request->batch_obj,
++ 					    request_to_vm(request))) {
++ 			*inside = true;
++ 			return true;
++ 		}
++ 	}
++ 
++ 	if (i915_head_inside_request(acthd, request->head, request->tail)) {
++ 		*inside = false;
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool i915_context_is_banned(const struct i915_ctx_hang_stats *hs)
++ {
++ 	const unsigned long elapsed = get_seconds() - hs->guilty_ts;
++ 
++ 	if (hs->banned)
++ 		return true;
++ 
++ 	if (elapsed <= DRM_I915_CTX_BAN_PERIOD) {
++ 		DRM_ERROR("context hanging too fast, declaring banned!\n");
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void i915_set_reset_status(struct intel_ring_buffer *ring,
++ 				  struct drm_i915_gem_request *request,
++ 				  u32 acthd)
++ {
++ 	struct i915_ctx_hang_stats *hs = NULL;
++ 	bool inside, guilty;
++ 	unsigned long offset = 0;
++ 
++ 	/* Innocent until proven guilty */
++ 	guilty = false;
++ 
++ 	if (request->batch_obj)
++ 		offset = i915_gem_obj_offset(request->batch_obj,
++ 					     request_to_vm(request));
++ 
++ 	if (ring->hangcheck.action != HANGCHECK_WAIT &&
++ 	    i915_request_guilty(request, acthd, &inside)) {
++ 		DRM_ERROR("%s hung %s bo (0x%lx ctx %d) at 0x%x\n",
++ 			  ring->name,
++ 			  inside ? "inside" : "flushing",
++ 			  offset,
++ 			  request->ctx ? request->ctx->id : 0,
++ 			  acthd);
++ 
++ 		guilty = true;
++ 	}
++ 
++ 	/* If contexts are disabled or this is the default context, use
++ 	 * file_priv->reset_state
++ 	 */
++ 	if (request->ctx && request->ctx->id != DEFAULT_CONTEXT_ID)
++ 		hs = &request->ctx->hang_stats;
++ 	else if (request->file_priv)
++ 		hs = &request->file_priv->hang_stats;
++ 
++ 	if (hs) {
++ 		if (guilty) {
++ 			hs->banned = i915_context_is_banned(hs);
++ 			hs->batch_active++;
++ 			hs->guilty_ts = get_seconds();
++ 		} else {
++ 			hs->batch_pending++;
++ 		}
++ 	}
++ }
++ 
++ static void i915_gem_free_request(struct drm_i915_gem_request *request)
++ {
++ 	list_del(&request->list);
++ 	i915_gem_request_remove_from_client(request);
++ 
++ 	if (request->ctx)
++ 		i915_gem_context_unreference(request->ctx);
++ 
++ 	kfree(request);
++ }
++ 
++ static void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
++ 				       struct intel_ring_buffer *ring)
++ {
++ 	u32 completed_seqno = ring->get_seqno(ring, false);
++ 	u32 acthd = intel_ring_get_active_head(ring);
++ 	struct drm_i915_gem_request *request;
++ 
++ 	list_for_each_entry(request, &ring->request_list, list) {
++ 		if (i915_seqno_passed(completed_seqno, request->seqno))
++ 			continue;
++ 
++ 		i915_set_reset_status(ring, request, acthd);
++ 	}
++ }
++ 
++ static void i915_gem_reset_ring_cleanup(struct drm_i915_private *dev_priv,
++ 					struct intel_ring_buffer *ring)
++ {
+++>>>>>>> 4db080f9e934 (drm/i915: Fix erroneous dereference of batch_obj inside reset_status)
+  	while (!list_empty(&ring->request_list)) {
+  		struct drm_i915_gem_request *request;
+  
+@@@ -2110,9 -2368,7 +2264,13 @@@
+  					   struct drm_i915_gem_request,
+  					   list);
+  
+++<<<<<<< HEAD
+ +		list_del(&request->list);
+ +		i915_gem_request_remove_from_client(request);
+ +		kfree(request);
+++=======
++ 		i915_gem_free_request(request);
+++>>>>>>> 4db080f9e934 (drm/i915: Fix erroneous dereference of batch_obj inside reset_status)
+  	}
+  
+  	while (!list_empty(&ring->active_list)) {
+@@@ -2144,18 -2409,18 +2302,26 @@@ void i915_gem_reset(struct drm_device *
+  	struct intel_ring_buffer *ring;
+  	int i;
+  
++ 	/*
++ 	 * Before we free the objects from the requests, we need to inspect
++ 	 * them for finding the guilty party. As the requests only borrow
++ 	 * their reference to the objects, the inspection must be done first.
++ 	 */
++ 	for_each_ring(ring, dev_priv, i)
++ 		i915_gem_reset_ring_status(dev_priv, ring);
++ 
+  	for_each_ring(ring, dev_priv, i)
+- 		i915_gem_reset_ring_lists(dev_priv, ring);
++ 		i915_gem_reset_ring_cleanup(dev_priv, ring);
+  
+ -	i915_gem_cleanup_ringbuffer(dev);
+ +	/* Move everything out of the GPU domains to ensure we do any
+ +	 * necessary invalidation upon reuse.
+ +	 */
+ +	list_for_each_entry(obj,
+ +			    &dev_priv->mm.inactive_list,
+ +			    mm_list)
+ +	{
+ +		obj->base.read_domains &= ~I915_GEM_GPU_DOMAINS;
+ +	}
+  
+  	i915_gem_restore_fences(dev);
+  }
+* Unmerged path drivers/gpu/drm/i915/i915_gem.c
