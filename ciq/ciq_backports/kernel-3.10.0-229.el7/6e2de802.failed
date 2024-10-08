@@ -1,0 +1,211 @@
+vti4: Check the tunnel endpoints of the xfrm state and the vti interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Steffen Klassert <steffen.klassert@secunet.com>
+commit 6e2de802af32704d9bc4af0c437da7045960112b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/6e2de802.failed
+
+The tunnel endpoints of the xfrm_state we got from the xfrm_lookup
+must match the tunnel endpoints of the vti interface. This patch
+ensures this matching.
+
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 6e2de802af32704d9bc4af0c437da7045960112b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_vti.c
+diff --cc net/ipv4/ip_vti.c
+index be11cdadfc8b,9471893df47c..000000000000
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@@ -60,79 -61,120 +60,126 @@@ static int vti_rcv(struct sk_buff *skb
+  	tunnel = ip_tunnel_lookup(itn, skb->dev->ifindex, TUNNEL_NO_KEY,
+  				  iph->saddr, iph->daddr, 0);
+  	if (tunnel != NULL) {
+ -		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
+ -			goto drop;
+ -
+ -		XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4 = tunnel;
+ -		skb->mark = be32_to_cpu(tunnel->parms.i_key);
+ -
+ -		return xfrm_input(skb, nexthdr, spi, encap_type);
+ +		struct pcpu_tstats *tstats;
+ +		u32 oldmark = skb->mark;
+ +		int ret;
+ +
+ +
+ +		/* temporarily mark the skb with the tunnel o_key, to
+ +		 * only match policies with this mark.
+ +		 */
+ +		skb->mark = be32_to_cpu(tunnel->parms.o_key);
+ +		ret = xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb);
+ +		skb->mark = oldmark;
+ +		if (!ret)
+ +			return -1;
+ +
+ +		tstats = this_cpu_ptr(tunnel->dev->tstats);
+ +		u64_stats_update_begin(&tstats->syncp);
+ +		tstats->rx_packets++;
+ +		tstats->rx_bytes += skb->len;
+ +		u64_stats_update_end(&tstats->syncp);
+ +
+ +		secpath_reset(skb);
+ +		skb->dev = tunnel->dev;
+ +		return 1;
+  	}
+  
+ -	return -EINVAL;
+ -drop:
+ -	kfree_skb(skb);
+ -	return 0;
+ +	return -1;
+  }
+  
+ -static int vti_rcv(struct sk_buff *skb)
+ -{
+ -	XFRM_SPI_SKB_CB(skb)->family = AF_INET;
+ -	XFRM_SPI_SKB_CB(skb)->daddroff = offsetof(struct iphdr, daddr);
+ -
+ -	return vti_input(skb, ip_hdr(skb)->protocol, 0, 0);
+ -}
+++<<<<<<< HEAD
+ +/* This function assumes it is being called from dev_queue_xmit()
+ + * and that skb is filled properly by that function.
+ + */
+  
+ -static int vti_rcv_cb(struct sk_buff *skb, int err)
+ +static netdev_tx_t vti_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
+ -	unsigned short family;
+ -	struct net_device *dev;
+ -	struct pcpu_sw_netstats *tstats;
+ -	struct xfrm_state *x;
+ -	struct ip_tunnel *tunnel = XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4;
+ -
+ -	if (!tunnel)
+ -		return 1;
+ -
+ -	dev = tunnel->dev;
+ -
+ -	if (err) {
+ -		dev->stats.rx_errors++;
+ -		dev->stats.rx_dropped++;
+ -
+ -		return 0;
+ -	}
+ -
+ -	x = xfrm_input_state(skb);
+ -	family = x->inner_mode->afinfo->family;
+ -
+ -	if (!xfrm_policy_check(NULL, XFRM_POLICY_IN, skb, family))
+ -		return -EPERM;
+ -
+ -	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(skb->dev)));
+ -	skb->dev = dev;
+ -
+ -	tstats = this_cpu_ptr(dev->tstats);
+ -
+ -	u64_stats_update_begin(&tstats->syncp);
+ -	tstats->rx_packets++;
+ -	tstats->rx_bytes += skb->len;
+ -	u64_stats_update_end(&tstats->syncp);
+ -
+ -	return 0;
+ -}
+ -
+ +	struct ip_tunnel *tunnel = netdev_priv(dev);
+ +	struct iphdr  *tiph = &tunnel->parms.iph;
+ +	u8     tos;
+ +	struct rtable *rt;		/* Route to the other host */
+++=======
++ static bool vti_state_check(const struct xfrm_state *x, __be32 dst, __be32 src)
++ {
++ 	xfrm_address_t *daddr = (xfrm_address_t *)&dst;
++ 	xfrm_address_t *saddr = (xfrm_address_t *)&src;
++ 
++ 	/* if there is no transform then this tunnel is not functional.
++ 	 * Or if the xfrm is not mode tunnel.
++ 	 */
++ 	if (!x || x->props.mode != XFRM_MODE_TUNNEL ||
++ 	    x->props.family != AF_INET)
++ 		return false;
++ 
++ 	if (!dst)
++ 		return xfrm_addr_equal(saddr, &x->props.saddr, AF_INET);
++ 
++ 	if (!xfrm_state_addr_check(x, daddr, saddr, AF_INET))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
++ 			    struct flowi *fl)
++ {
++ 	struct ip_tunnel *tunnel = netdev_priv(dev);
++ 	struct ip_tunnel_parm *parms = &tunnel->parms;
++ 	struct dst_entry *dst = skb_dst(skb);
+++>>>>>>> 6e2de802af32 (vti4: Check the tunnel endpoints of the xfrm state and the vti interface)
+  	struct net_device *tdev;	/* Device to other host */
+ +	struct iphdr  *old_iph = ip_hdr(skb);
+ +	__be32 dst = tiph->daddr;
+ +	struct flowi4 fl4;
+  	int err;
+  
+ -	if (!dst) {
+ +	if (skb->protocol != htons(ETH_P_IP))
+ +		goto tx_error;
+ +
+ +	tos = old_iph->tos;
+ +
+ +	memset(&fl4, 0, sizeof(fl4));
+ +	flowi4_init_output(&fl4, tunnel->parms.link,
+ +			   be32_to_cpu(tunnel->parms.o_key), RT_TOS(tos),
+ +			   RT_SCOPE_UNIVERSE,
+ +			   IPPROTO_IPIP, 0,
+ +			   dst, tiph->saddr, 0, 0);
+ +	rt = ip_route_output_key(dev_net(dev), &fl4);
+ +	if (IS_ERR(rt)) {
+  		dev->stats.tx_carrier_errors++;
+  		goto tx_error_icmp;
+  	}
+++<<<<<<< HEAD
+ +	/* if there is no transform then this tunnel is not functional.
+ +	 * Or if the xfrm is not mode tunnel.
+ +	 */
+ +	if (!rt->dst.xfrm ||
+ +	    rt->dst.xfrm->props.mode != XFRM_MODE_TUNNEL) {
+++=======
++ 
++ 	dst_hold(dst);
++ 	dst = xfrm_lookup(tunnel->net, dst, fl, NULL, 0);
++ 	if (IS_ERR(dst)) {
++ 		dev->stats.tx_carrier_errors++;
++ 		goto tx_error_icmp;
++ 	}
++ 
++ 	if (!vti_state_check(dst->xfrm, parms->iph.daddr, parms->iph.saddr)) {
+++>>>>>>> 6e2de802af32 (vti4: Check the tunnel endpoints of the xfrm state and the vti interface)
+  		dev->stats.tx_carrier_errors++;
+ -		dst_release(dst);
+ +		ip_rt_put(rt);
+  		goto tx_error_icmp;
+  	}
+++<<<<<<< HEAD
+ +	tdev = rt->dst.dev;
+++=======
++ 
++ 	tdev = dst->dev;
+++>>>>>>> 6e2de802af32 (vti4: Check the tunnel endpoints of the xfrm state and the vti interface)
+  
+  	if (tdev == dev) {
+ -		dst_release(dst);
+ +		ip_rt_put(rt);
+  		dev->stats.collisions++;
+  		goto tx_error;
+  	}
+* Unmerged path net/ipv4/ip_vti.c
