@@ -1,0 +1,94 @@
+net: correct error path in rtnl_newlink()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] rtnetlink: correct error path in rtnl_newlink() (Sabrina Dubroca) [1354232]
+Rebuild_FUZZ: 93.18%
+commit-author Cong Wang <cwang@twopensource.com>
+commit 0e0eee2465df77bcec2e8ff75432b8e57897b143
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0e0eee24.failed
+
+I saw the following BUG when ->newlink() fails in rtnl_newlink():
+
+[   40.240058] kernel BUG at net/core/dev.c:6438!
+
+this is due to free_netdev() is not supposed to be called before
+netdev is completely unregistered, therefore it is not correct
+to call free_netdev() here, at least for ops->newlink!=NULL case,
+many drivers call it in ->destructor so that rtnl_unlock() will
+take care of it, we probably don't need to do anything here.
+
+	Cc: David S. Miller <davem@davemloft.net>
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: Cong Wang <cwang@twopensource.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0e0eee2465df77bcec2e8ff75432b8e57897b143)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/rtnetlink.c
+diff --cc net/core/rtnetlink.c
+index bf4ac7729817,1a0dac2ef9ad..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -2210,39 -1963,27 +2210,50 @@@ replay
+  
+  		dev->ifindex = ifm->ifi_index;
+  
+++<<<<<<< HEAD
+ +		if (ops->newlink)
+ +			err = ops->newlink(link_net ? : net, dev, tb, data);
+ +		else
+++=======
++ 		if (ops->newlink) {
++ 			err = ops->newlink(net, dev, tb, data);
++ 			/* Drivers should call free_netdev() in ->destructor
++ 			 * and unregister it on failure so that device could be
++ 			 * finally freed in rtnl_unlock.
++ 			 */
++ 			if (err < 0)
++ 				goto out;
++ 		} else {
+++>>>>>>> 0e0eee2465df (net: correct error path in rtnl_newlink())
+  			err = register_netdevice(dev);
+- 
+- 		if (err < 0) {
+- 			free_netdev(dev);
+- 			goto out;
++ 			if (err < 0) {
++ 				free_netdev(dev);
++ 				goto out;
++ 			}
+  		}
+- 
+  		err = rtnl_configure_link(dev, ifm);
+  		if (err < 0)
+ -			unregister_netdevice(dev);
+ +			goto out_unregister;
+ +		if (link_net) {
+ +			err = dev_change_net_namespace(dev, dest_net, ifname);
+ +			if (err < 0)
+ +				goto out_unregister;
+ +		}
+  out:
+ +		if (link_net)
+ +			put_net(link_net);
+  		put_net(dest_net);
+  		return err;
+ +out_unregister:
+ +		if (ops->newlink) {
+ +			LIST_HEAD(list_kill);
+ +
+ +			ops->dellink(dev, &list_kill);
+ +			unregister_netdevice_many(&list_kill);
+ +		} else {
+ +			unregister_netdevice(dev);
+ +		}
+ +		goto out;
+  	}
+  }
+  
+* Unmerged path net/core/rtnetlink.c
