@@ -1,0 +1,159 @@
+blk-throttle: dispatch from throtl_pending_timer_fn()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 6e1a5704cbbd244a8db2d7d59215cf9a4c9a0d31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6e1a5704.failed
+
+Currently, blk_throtl_dispatch_work_fn() is responsible for both
+dispatching bio's from throtl_grp's according to their limits and then
+issuing the dispatched bios.
+
+This patch moves the dispatch part to throtl_pending_timer_fn() so
+that the work item is kicked iff there are bio's to issue.  This is to
+avoid work item execution at each step when hierarchy support is
+enabled.  bio's will be dispatched towards the top-level service_queue
+from the timers at each layer and the work item will only be used to
+issue the bio's which reached the top-level service_queue.
+
+While fetching bio's to issue from bio_lists[],
+blk_throtl_dispatch_work_fn() fetches all READs before WRITEs.  While
+the original code also dispatched READs first, if multiple throtl_grps
+are dispatched on the same run, WRITEs from throtl_grp which is
+dispatched first would precede READs from throtl_grps which are
+dispatched later.  While this is a behavior change, given that the
+previous code already prioritized READs and block layer generally
+prioritizes and segregates READs from WRITEs, this isn't likely to
+make any noticeable differences.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Vivek Goyal <vgoyal@redhat.com>
+(cherry picked from commit 6e1a5704cbbd244a8db2d7d59215cf9a4c9a0d31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-throttle.c
+diff --cc block/blk-throttle.c
+index e65e45a33372,918d22240856..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -838,39 -932,81 +838,108 @@@ static int throtl_select_dispatch(struc
+  	return nr_disp;
+  }
+  
+++<<<<<<< HEAD
+ +/* work function to dispatch throttled bios */
+ +void blk_throtl_dispatch_work_fn(struct work_struct *work)
+ +{
+ +	struct throtl_data *td = container_of(to_delayed_work(work),
+ +					      struct throtl_data, dispatch_work);
+ +	struct request_queue *q = td->queue;
+ +	unsigned int nr_disp = 0;
+ +	struct bio_list bio_list_on_stack;
+ +	struct bio *bio;
+ +	struct blk_plug plug;
+ +
+ +	spin_lock_irq(q->queue_lock);
+ +
+ +	bio_list_init(&bio_list_on_stack);
+ +
+ +	throtl_log(td, "dispatch nr_queued=%u read=%u write=%u",
+ +		   td->nr_queued[READ] + td->nr_queued[WRITE],
+ +		   td->nr_queued[READ], td->nr_queued[WRITE]);
+ +
+ +	nr_disp = throtl_select_dispatch(&td->service_queue, &bio_list_on_stack);
+++=======
++ /**
++  * throtl_pending_timer_fn - timer function for service_queue->pending_timer
++  * @arg: the throtl_service_queue being serviced
++  *
++  * This timer is armed when a child throtl_grp with active bio's become
++  * pending and queued on the service_queue's pending_tree and expires when
++  * the first child throtl_grp should be dispatched.  This function
++  * dispatches bio's from the children throtl_grps and kicks
++  * throtl_data->dispatch_work if there are bio's ready to be issued.
++  */
++ static void throtl_pending_timer_fn(unsigned long arg)
++ {
++ 	struct throtl_service_queue *sq = (void *)arg;
++ 	struct throtl_data *td = sq_to_td(sq);
++ 	struct request_queue *q = td->queue;
++ 	bool dispatched = false;
++ 	int ret;
++ 
++ 	spin_lock_irq(q->queue_lock);
++ 
++ 	while (true) {
++ 		throtl_log(sq, "dispatch nr_queued=%u read=%u write=%u",
++ 			   td->nr_queued[READ] + td->nr_queued[WRITE],
++ 			   td->nr_queued[READ], td->nr_queued[WRITE]);
++ 
++ 		ret = throtl_select_dispatch(sq);
++ 		if (ret) {
++ 			throtl_log(sq, "bios disp=%u", ret);
++ 			dispatched = true;
++ 		}
+++>>>>>>> 6e1a5704cbbd (blk-throttle: dispatch from throtl_pending_timer_fn())
+  
+ -		if (throtl_schedule_next_dispatch(sq, false))
+ -			break;
+ +	if (nr_disp)
+ +		throtl_log(td, "bios disp=%u", nr_disp);
+  
+ -		/* this dispatch windows is still open, relax and repeat */
+ -		spin_unlock_irq(q->queue_lock);
+ -		cpu_relax();
+ -		spin_lock_irq(q->queue_lock);
+ -	}
+ +	throtl_schedule_next_dispatch(td);
+  
++ 	if (dispatched)
++ 		queue_work(kthrotld_workqueue, &td->dispatch_work);
++ 
++ 	spin_unlock_irq(q->queue_lock);
++ }
++ 
++ /**
++  * blk_throtl_dispatch_work_fn - work function for throtl_data->dispatch_work
++  * @work: work item being executed
++  *
++  * This function is queued for execution when bio's reach the bio_lists[]
++  * of throtl_data->service_queue.  Those bio's are ready and issued by this
++  * function.
++  */
++ void blk_throtl_dispatch_work_fn(struct work_struct *work)
++ {
++ 	struct throtl_data *td = container_of(work, struct throtl_data,
++ 					      dispatch_work);
++ 	struct throtl_service_queue *td_sq = &td->service_queue;
++ 	struct request_queue *q = td->queue;
++ 	struct bio_list bio_list_on_stack;
++ 	struct bio *bio;
++ 	struct blk_plug plug;
++ 	int rw;
++ 
++ 	bio_list_init(&bio_list_on_stack);
++ 
++ 	spin_lock_irq(q->queue_lock);
++ 	for (rw = READ; rw <= WRITE; rw++) {
++ 		bio_list_merge(&bio_list_on_stack, &td_sq->bio_lists[rw]);
++ 		bio_list_init(&td_sq->bio_lists[rw]);
++ 	}
+  	spin_unlock_irq(q->queue_lock);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If we dispatched some requests, unplug the queue to make sure
+ +	 * immediate dispatch
+ +	 */
+ +	if (nr_disp) {
+++=======
++ 	if (!bio_list_empty(&bio_list_on_stack)) {
+++>>>>>>> 6e1a5704cbbd (blk-throttle: dispatch from throtl_pending_timer_fn())
+  		blk_start_plug(&plug);
+  		while((bio = bio_list_pop(&bio_list_on_stack)))
+  			generic_make_request(bio);
+* Unmerged path block/blk-throttle.c
