@@ -1,0 +1,122 @@
+sched/cputime: Convert vtime_seqlock to seqcount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit b7ce2277f087fd052e7e1bbf432f7fecbee82bb6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b7ce2277.failed
+
+The cputime can only be updated by the current task itself, even in
+vtime case. So we can safely use seqcount instead of seqlock as there
+is no writer concurrency involved.
+
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Chris Metcalf <cmetcalf@ezchip.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Hiroshi Shimamoto <h-shimamoto@ct.jp.nec.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Luiz Capitulino <lcapitulino@redhat.com>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Paul E . McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1447948054-28668-8-git-send-email-fweisbec@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b7ce2277f087fd052e7e1bbf432f7fecbee82bb6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/cputime.c
+diff --cc kernel/sched/cputime.c
+index 4dff8ccec506,d5ff5c6bf829..000000000000
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@@ -733,14 -763,14 +733,20 @@@ void vtime_account_idle(struct task_str
+  
+  void arch_vtime_task_switch(struct task_struct *prev)
+  {
+++<<<<<<< HEAD
+ +	write_seqlock(&prev->vtime_seqlock);
+ +	prev->vtime_snap_whence = VTIME_SLEEPING;
+ +	write_sequnlock(&prev->vtime_seqlock);
+++=======
++ 	write_seqcount_begin(&prev->vtime_seqcount);
++ 	prev->vtime_snap_whence = VTIME_INACTIVE;
++ 	write_seqcount_end(&prev->vtime_seqcount);
+++>>>>>>> b7ce2277f087 (sched/cputime: Convert vtime_seqlock to seqcount)
+  
+- 	write_seqlock(&current->vtime_seqlock);
++ 	write_seqcount_begin(&current->vtime_seqcount);
+  	current->vtime_snap_whence = VTIME_SYS;
+  	current->vtime_snap = sched_clock_cpu(smp_processor_id());
+- 	write_sequnlock(&current->vtime_seqlock);
++ 	write_seqcount_end(&current->vtime_seqcount);
+  }
+  
+  void vtime_init_idle(struct task_struct *t, int cpu)
+@@@ -758,14 -790,17 +766,14 @@@ cputime_t task_gtime(struct task_struc
+  	unsigned int seq;
+  	cputime_t gtime;
+  
+ -	if (!vtime_accounting_enabled())
+ -		return t->gtime;
+ -
+  	do {
+- 		seq = read_seqbegin(&t->vtime_seqlock);
++ 		seq = read_seqcount_begin(&t->vtime_seqcount);
+  
+  		gtime = t->gtime;
+ -		if (t->vtime_snap_whence == VTIME_SYS && t->flags & PF_VCPU)
+ +		if (t->flags & PF_VCPU)
+  			gtime += vtime_delta(t);
+  
+- 	} while (read_seqretry(&t->vtime_seqlock, seq));
++ 	} while (read_seqcount_retry(&t->vtime_seqcount, seq));
+  
+  	return gtime;
+  }
+diff --git a/include/linux/init_task.h b/include/linux/init_task.h
+index 998f4dfedecf..1babfd717357 100644
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@ -146,7 +146,7 @@ extern struct task_group root_task_group;
+ 
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+ # define INIT_VTIME(tsk)						\
+-	.vtime_seqlock = __SEQLOCK_UNLOCKED(tsk.vtime_seqlock),	\
++	.vtime_seqcount = SEQCNT_ZERO(tsk.vtime_seqcount),	\
+ 	.vtime_snap = 0,				\
+ 	.vtime_snap_whence = VTIME_SYS,
+ #else
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ee7a889a65c0..1c06596eb30e 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1254,7 +1254,7 @@ struct task_struct {
+ 	struct cputime prev_cputime;
+ #endif
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-	seqlock_t vtime_seqlock;
++	seqcount_t vtime_seqcount;
+ 	unsigned long long vtime_snap;
+ 	enum {
+ 		VTIME_SLEEPING = 0,
+diff --git a/kernel/fork.c b/kernel/fork.c
+index a14b2bbebc6a..13ee548c96dc 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1258,7 +1258,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 	p->prev_cputime.utime = p->prev_cputime.stime = 0;
+ #endif
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-	seqlock_init(&p->vtime_seqlock);
++	seqcount_init(&p->vtime_seqcount);
+ 	p->vtime_snap = 0;
+ 	p->vtime_snap_whence = VTIME_SLEEPING;
+ #endif
+* Unmerged path kernel/sched/cputime.c
