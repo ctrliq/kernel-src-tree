@@ -1,0 +1,175 @@
+svc_rdma: use local_dma_lkey
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit 5fe1043da84887369d32459514f2c7d98ff37936
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5fe1043d.failed
+
+We now alwasy have a per-PD local_dma_lkey available.  Make use of that
+fact in svc_rdma and stop registering our own MR.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Reviewed-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+	Reviewed-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Acked-by: J. Bruce Fields <bfields@redhat.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 5fe1043da84887369d32459514f2c7d98ff37936)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+#	net/sunrpc/xprtrdma/svc_rdma_transport.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_transport.c
+index 9e33fdc56b4e,5763825d09bf..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@@ -1028,11 -1013,9 +1028,17 @@@ static struct svc_xprt *svc_rdma_accept
+  	struct rdma_conn_param conn_param;
+  	struct ib_cq_init_attr cq_attr = {};
+  	struct ib_qp_init_attr qp_attr;
+++<<<<<<< HEAD
+ +	struct ib_device_attr devattr;
+ +	int uninitialized_var(dma_mr_acc);
+ +	int need_dma_mr = 0;
+ +	int ret;
+ +	int i;
+++=======
++ 	struct ib_device *dev;
++ 	unsigned int i;
++ 	int ret = 0;
+++>>>>>>> 5fe1043da848 (svc_rdma: use local_dma_lkey)
+  
+  	listen_rdma = container_of(xprt, struct svcxprt_rdma, sc_xprt);
+  	clear_bit(XPT_CONN, &xprt->xpt_flags);
+@@@ -1171,43 -1154,15 +1177,49 @@@
+  	/*
+  	 * Determine if a DMA MR is required and if so, what privs are required
+  	 */
+ -	if (!rdma_protocol_iwarp(dev, newxprt->sc_cm_id->port_num) &&
+ -	    !rdma_ib_or_roce(dev, newxprt->sc_cm_id->port_num))
+ +	if (!rdma_protocol_iwarp(newxprt->sc_cm_id->device,
+ +				 newxprt->sc_cm_id->port_num) &&
+ +	    !rdma_ib_or_roce(newxprt->sc_cm_id->device,
+ +			     newxprt->sc_cm_id->port_num))
+  		goto errout;
+  
+++<<<<<<< HEAD
+ +	if (!(newxprt->sc_dev_caps & SVCRDMA_DEVCAP_FAST_REG) ||
+ +	    !(devattr.device_cap_flags & IB_DEVICE_LOCAL_DMA_LKEY)) {
+ +		need_dma_mr = 1;
+ +		dma_mr_acc = IB_ACCESS_LOCAL_WRITE;
+ +		if (rdma_protocol_iwarp(newxprt->sc_cm_id->device,
+ +					newxprt->sc_cm_id->port_num) &&
+ +		    !(newxprt->sc_dev_caps & SVCRDMA_DEVCAP_FAST_REG))
+ +			dma_mr_acc |= IB_ACCESS_REMOTE_WRITE;
+ +	}
+ +
+ +	if (rdma_protocol_iwarp(newxprt->sc_cm_id->device,
+ +				newxprt->sc_cm_id->port_num))
+ +		newxprt->sc_dev_caps |= SVCRDMA_DEVCAP_READ_W_INV;
+ +
+ +	/* Create the DMA MR if needed, otherwise, use the DMA LKEY */
+ +	if (need_dma_mr) {
+ +		/* Register all of physical memory */
+ +		newxprt->sc_phys_mr =
+ +			ib_get_dma_mr(newxprt->sc_pd, dma_mr_acc);
+ +		if (IS_ERR(newxprt->sc_phys_mr)) {
+ +			dprintk("svcrdma: Failed to create DMA MR ret=%d\n",
+ +				ret);
+ +			goto errout;
+ +		}
+ +		newxprt->sc_dma_lkey = newxprt->sc_phys_mr->lkey;
+ +	} else
+ +		newxprt->sc_dma_lkey =
+ +			newxprt->sc_cm_id->device->local_dma_lkey;
+ +
+++=======
++ 	if (rdma_protocol_iwarp(dev, newxprt->sc_cm_id->port_num))
++ 		newxprt->sc_dev_caps |= SVCRDMA_DEVCAP_READ_W_INV;
++ 
+++>>>>>>> 5fe1043da848 (svc_rdma: use local_dma_lkey)
+  	/* Post receive buffers */
+ -	for (i = 0; i < newxprt->sc_rq_depth; i++) {
+ +	for (i = 0; i < newxprt->sc_max_requests; i++) {
+  		ret = svc_rdma_post_recv(newxprt, GFP_KERNEL);
+  		if (ret) {
+  			dprintk("svcrdma: failure posting receive buffers\n");
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+diff --git a/include/linux/sunrpc/svc_rdma.h b/include/linux/sunrpc/svc_rdma.h
+index aa20d5f0dab3..4afe9809827a 100644
+--- a/include/linux/sunrpc/svc_rdma.h
++++ b/include/linux/sunrpc/svc_rdma.h
+@@ -156,13 +156,11 @@ struct svcxprt_rdma {
+ 	struct ib_qp         *sc_qp;
+ 	struct ib_cq         *sc_rq_cq;
+ 	struct ib_cq         *sc_sq_cq;
+-	struct ib_mr         *sc_phys_mr;	/* MR for server memory */
+ 	int		     (*sc_reader)(struct svcxprt_rdma *,
+ 					  struct svc_rqst *,
+ 					  struct svc_rdma_op_ctxt *,
+ 					  int *, u32 *, u32, u32, u64, bool);
+ 	u32		     sc_dev_caps;	/* distilled device caps */
+-	u32		     sc_dma_lkey;	/* local dma key */
+ 	unsigned int	     sc_frmr_pg_list_len;
+ 	struct list_head     sc_frmr_q;
+ 	spinlock_t	     sc_frmr_q_lock;
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+index f0c3ff67ca98..5ab6d1cab6e1 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+@@ -144,6 +144,7 @@ int rdma_read_chunk_lcl(struct svcxprt_rdma *xprt,
+ 
+ 		head->arg.pages[pg_no] = rqstp->rq_arg.pages[pg_no];
+ 		head->arg.page_len += len;
++
+ 		head->arg.len += len;
+ 		if (!pg_off)
+ 			head->count++;
+@@ -160,8 +161,7 @@ int rdma_read_chunk_lcl(struct svcxprt_rdma *xprt,
+ 			goto err;
+ 		atomic_inc(&xprt->sc_dma_used);
+ 
+-		/* The lkey here is either a local dma lkey or a dma_mr lkey */
+-		ctxt->sge[pno].lkey = xprt->sc_dma_lkey;
++		ctxt->sge[pno].lkey = xprt->sc_pd->local_dma_lkey;
+ 		ctxt->sge[pno].length = len;
+ 		ctxt->count++;
+ 
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_sendto.c b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index 442d94f83017..9338e00de1f0 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@ -265,7 +265,7 @@ static int send_write(struct svcxprt_rdma *xprt, struct svc_rqst *rqstp,
+ 					 sge[sge_no].addr))
+ 			goto err;
+ 		atomic_inc(&xprt->sc_dma_used);
+-		sge[sge_no].lkey = xprt->sc_dma_lkey;
++		sge[sge_no].lkey = xprt->sc_pd->local_dma_lkey;
+ 		ctxt->count++;
+ 		sge_off = 0;
+ 		sge_no++;
+@@ -480,7 +480,7 @@ static int send_reply(struct svcxprt_rdma *rdma,
+ 	ctxt->count = 1;
+ 
+ 	/* Prepare the SGE for the RPCRDMA Header */
+-	ctxt->sge[0].lkey = rdma->sc_dma_lkey;
++	ctxt->sge[0].lkey = rdma->sc_pd->local_dma_lkey;
+ 	ctxt->sge[0].length = svc_rdma_xdr_get_reply_hdr_len(rdma_resp);
+ 	ctxt->sge[0].addr =
+ 	    ib_dma_map_page(rdma->sc_cm_id->device, page, 0,
+@@ -504,7 +504,7 @@ static int send_reply(struct svcxprt_rdma *rdma,
+ 					 ctxt->sge[sge_no].addr))
+ 			goto err;
+ 		atomic_inc(&rdma->sc_dma_used);
+-		ctxt->sge[sge_no].lkey = rdma->sc_dma_lkey;
++		ctxt->sge[sge_no].lkey = rdma->sc_pd->local_dma_lkey;
+ 		ctxt->sge[sge_no].length = sge_bytes;
+ 	}
+ 	if (byte_count != 0) {
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_transport.c
