@@ -1,0 +1,431 @@
+percpu-refcount: add @gfp to percpu_ref_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit a34375ef9e65340a138fc0be287de5c940d260fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a34375ef.failed
+
+Percpu allocator now supports allocation mask.  Add @gfp to
+percpu_ref_init() so that !GFP_KERNEL allocation masks can be used
+with percpu_refs too.
+
+This patch doesn't make any functional difference.
+
+v2: blk-mq conversion was missing.  Updated.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Cc: Kent Overstreet <koverstreet@google.com>
+	Cc: Benjamin LaHaise <bcrl@kvack.org>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: Nicholas A. Bellinger <nab@linux-iscsi.org>
+	Cc: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a34375ef9e65340a138fc0be287de5c940d260fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_tpg.c
+#	fs/aio.c
+#	include/linux/percpu-refcount.h
+#	kernel/cgroup.c
+#	lib/percpu-refcount.c
+diff --cc drivers/target/target_core_tpg.c
+index aac9d2727e3c,4ab6da338585..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -815,7 -819,8 +815,12 @@@ int core_tpg_post_addlun
+  {
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = core_dev_export(lun_ptr, tpg, lun);
+++=======
++ 	ret = percpu_ref_init(&lun->lun_ref, core_tpg_lun_ref_release,
++ 			      GFP_KERNEL);
+++>>>>>>> a34375ef9e65 (percpu-refcount: add @gfp to percpu_ref_init())
+  	if (ret < 0)
+  		return ret;
+  
+diff --cc fs/aio.c
+index 74aa9906fcde,93fbcc0f5696..000000000000
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@@ -600,8 -666,15 +600,20 @@@ static struct kioctx *ioctx_alloc(unsig
+  
+  	INIT_LIST_HEAD(&ctx->active_reqs);
+  
+++<<<<<<< HEAD
+ +	atomic_set(&ctx->users, 2);
+ +	atomic_set(&ctx->dead, 0);
+++=======
++ 	if (percpu_ref_init(&ctx->users, free_ioctx_users, GFP_KERNEL))
++ 		goto err;
++ 
++ 	if (percpu_ref_init(&ctx->reqs, free_ioctx_reqs, GFP_KERNEL))
++ 		goto err;
++ 
++ 	ctx->cpu = alloc_percpu(struct kioctx_cpu);
++ 	if (!ctx->cpu)
++ 		goto err;
+++>>>>>>> a34375ef9e65 (percpu-refcount: add @gfp to percpu_ref_init())
+  
+  	err = aio_setup_ring(ctx);
+  	if (err < 0)
+diff --cc kernel/cgroup.c
+index c773b1f779f5,589b4d89a0a5..000000000000
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@@ -1504,72 -1610,98 +1504,76 @@@ static struct cgroupfs_root *cgroup_roo
+  	if (opts->name)
+  		strcpy(root->name, opts->name);
+  	if (opts->cpuset_clone_children)
+ -		set_bit(CGRP_CPUSET_CLONE_CHILDREN, &root->cgrp.flags);
+ +		set_bit(CGRP_CPUSET_CLONE_CHILDREN, &root->top_cgroup.flags);
+ +	return root;
+  }
+  
+ -static int cgroup_setup_root(struct cgroup_root *root, unsigned int ss_mask)
+ +static void cgroup_drop_root(struct cgroupfs_root *root)
+  {
+ -	LIST_HEAD(tmp_links);
+ -	struct cgroup *root_cgrp = &root->cgrp;
+ -	struct cftype *base_files;
+ -	struct css_set *cset;
+ -	int i, ret;
+ +	if (!root)
+ +		return;
+  
+ -	lockdep_assert_held(&cgroup_mutex);
+ +	BUG_ON(!root->hierarchy_id);
+ +	spin_lock(&hierarchy_id_lock);
+ +	ida_remove(&hierarchy_ida, root->hierarchy_id);
+ +	spin_unlock(&hierarchy_id_lock);
+ +	ida_destroy(&root->cgroup_ida);
+ +	kfree(root);
+ +}
+  
+ -	ret = cgroup_idr_alloc(&root->cgroup_idr, root_cgrp, 1, 2, GFP_NOWAIT);
+ -	if (ret < 0)
+ -		goto out;
+ -	root_cgrp->id = ret;
+ +static int cgroup_set_super(struct super_block *sb, void *data)
+ +{
+ +	int ret;
+ +	struct cgroup_sb_opts *opts = data;
+  
+ -	ret = percpu_ref_init(&root_cgrp->self.refcnt, css_release, GFP_KERNEL);
+ -	if (ret)
+ -		goto out;
+++<<<<<<< HEAD
+ +	/* If we don't have a new root, we can't set up a new sb */
+ +	if (!opts->new_root)
+ +		return -EINVAL;
+  
+ -	/*
+ -	 * We're accessing css_set_count without locking css_set_rwsem here,
+ -	 * but that's OK - it can only be increased by someone holding
+ -	 * cgroup_lock, and that's us. The worst that can happen is that we
+ -	 * have some link structures left over
+ -	 */
+ -	ret = allocate_cgrp_cset_links(css_set_count, &tmp_links);
+ -	if (ret)
+ -		goto cancel_ref;
+ +	BUG_ON(!opts->subsys_mask && !opts->none);
+  
+ -	ret = cgroup_init_root_id(root);
+ +	ret = set_anon_super(sb, NULL);
+++=======
+++	ret = percpu_ref_init(&root_cgrp->self.refcnt, css_release, GFP_KERNEL);
+++>>>>>>> a34375ef9e65 (percpu-refcount: add @gfp to percpu_ref_init())
+  	if (ret)
+ -		goto cancel_ref;
+ -
+ -	root->kf_root = kernfs_create_root(&cgroup_kf_syscall_ops,
+ -					   KERNFS_ROOT_CREATE_DEACTIVATED,
+ -					   root_cgrp);
+ -	if (IS_ERR(root->kf_root)) {
+ -		ret = PTR_ERR(root->kf_root);
+ -		goto exit_root_id;
+ -	}
+ -	root_cgrp->kn = root->kf_root->kn;
+ +		return ret;
+  
+ -	if (root == &cgrp_dfl_root)
+ -		base_files = cgroup_dfl_base_files;
+ -	else
+ -		base_files = cgroup_legacy_base_files;
+ +	sb->s_fs_info = opts->new_root;
+ +	opts->new_root->sb = sb;
+  
+ -	ret = cgroup_addrm_files(root_cgrp, base_files, true);
+ -	if (ret)
+ -		goto destroy_root;
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ +	sb->s_magic = CGROUP_SUPER_MAGIC;
+ +	sb->s_op = &cgroup_ops;
+  
+ -	ret = rebind_subsystems(root, ss_mask);
+ -	if (ret)
+ -		goto destroy_root;
+ +	return 0;
+ +}
+  
+ -	/*
+ -	 * There must be no failure case after here, since rebinding takes
+ -	 * care of subsystems' refcounts, which are explicitly dropped in
+ -	 * the failure exit path.
+ -	 */
+ -	list_add(&root->root_list, &cgroup_roots);
+ -	cgroup_root_count++;
+ +static int cgroup_get_rootdir(struct super_block *sb)
+ +{
+ +	static const struct dentry_operations cgroup_dops = {
+ +		.d_iput = cgroup_diput,
+ +		.d_delete = cgroup_delete,
+ +	};
+  
+ -	/*
+ -	 * Link the root cgroup in this hierarchy into all the css_set
+ -	 * objects.
+ -	 */
+ -	down_write(&css_set_rwsem);
+ -	hash_for_each(css_set_table, i, cset, hlist)
+ -		link_css_set(&tmp_links, cset, root_cgrp);
+ -	up_write(&css_set_rwsem);
+ +	struct inode *inode =
+ +		cgroup_new_inode(S_IFDIR | S_IRUGO | S_IXUGO | S_IWUSR, sb);
+  
+ -	BUG_ON(!list_empty(&root_cgrp->self.children));
+ -	BUG_ON(atomic_read(&root->nr_cgrps) != 1);
+ +	if (!inode)
+ +		return -ENOMEM;
+  
+ -	kernfs_activate(root_cgrp->kn);
+ -	ret = 0;
+ -	goto out;
+ -
+ -destroy_root:
+ -	kernfs_destroy_root(root->kf_root);
+ -	root->kf_root = NULL;
+ -exit_root_id:
+ -	cgroup_exit_root_id(root);
+ -cancel_ref:
+ -	percpu_ref_exit(&root_cgrp->self.refcnt);
+ -out:
+ -	free_cgrp_cset_links(&tmp_links);
+ -	return ret;
+ +	inode->i_fop = &simple_dir_operations;
+ +	inode->i_op = &cgroup_dir_inode_operations;
+ +	/* directories start off with i_nlink == 2 (for "." entry) */
+ +	inc_nlink(inode);
+ +	sb->s_root = d_make_root(inode);
+ +	if (!sb->s_root)
+ +		return -ENOMEM;
+ +	/* for everything else we want ->d_op set */
+ +	sb->s_d_op = &cgroup_dops;
+ +	return 0;
+  }
+  
+  static struct dentry *cgroup_mount(struct file_system_type *fs_type,
+@@@ -4120,69 -4453,126 +4124,142 @@@ static void offline_css(struct cgroup_s
+  		return;
+  
+  	if (ss->css_offline)
+ -		ss->css_offline(css);
+ +		ss->css_offline(cgrp);
+  
+ -	css->flags &= ~CSS_ONLINE;
+ -	RCU_INIT_POINTER(css->cgroup->subsys[ss->id], NULL);
+ -
+ -	wake_up_all(&css->cgroup->offline_waitq);
+ +	cgrp->subsys[ss->subsys_id]->flags &= ~CSS_ONLINE;
+  }
+  
+ -/**
+ - * create_css - create a cgroup_subsys_state
+ - * @cgrp: the cgroup new css will be associated with
+ - * @ss: the subsys of new css
+ - * @visible: whether to create control knobs for the new css or not
+ +/*
+ + * cgroup_create - create a cgroup
+ + * @parent: cgroup that will be parent of the new cgroup
+ + * @dentry: dentry of the new cgroup
+ + * @mode: mode to set on new inode
+   *
+ - * Create a new css associated with @cgrp - @ss pair.  On success, the new
+ - * css is online and installed in @cgrp with all interface files created if
+ - * @visible.  Returns 0 on success, -errno on failure.
+ + * Must be called with the mutex on the parent inode held
+   */
+ -static int create_css(struct cgroup *cgrp, struct cgroup_subsys *ss,
+ -		      bool visible)
+ +static long cgroup_create(struct cgroup *parent, struct dentry *dentry,
+ +			     umode_t mode)
+  {
+++<<<<<<< HEAD
+ +	struct cgroup *cgrp;
+ +	struct cgroup_name *name;
+ +	struct cgroupfs_root *root = parent->root;
+ +	int err = 0;
+++=======
++ 	struct cgroup *parent = cgroup_parent(cgrp);
++ 	struct cgroup_subsys_state *parent_css = cgroup_css(parent, ss);
++ 	struct cgroup_subsys_state *css;
++ 	int err;
++ 
++ 	lockdep_assert_held(&cgroup_mutex);
++ 
++ 	css = ss->css_alloc(parent_css);
++ 	if (IS_ERR(css))
++ 		return PTR_ERR(css);
++ 
++ 	init_and_link_css(css, ss, cgrp);
++ 
++ 	err = percpu_ref_init(&css->refcnt, css_release, GFP_KERNEL);
++ 	if (err)
++ 		goto err_free_css;
++ 
++ 	err = cgroup_idr_alloc(&ss->css_idr, NULL, 2, 0, GFP_NOWAIT);
++ 	if (err < 0)
++ 		goto err_free_percpu_ref;
++ 	css->id = err;
++ 
++ 	if (visible) {
++ 		err = cgroup_populate_dir(cgrp, 1 << ss->id);
++ 		if (err)
++ 			goto err_free_id;
++ 	}
++ 
++ 	/* @css is ready to be brought online now, make it visible */
++ 	list_add_tail_rcu(&css->sibling, &parent_css->children);
++ 	cgroup_idr_replace(&ss->css_idr, css, css->id);
++ 
++ 	err = online_css(css);
++ 	if (err)
++ 		goto err_list_del;
++ 
++ 	if (ss->broken_hierarchy && !ss->warned_broken_hierarchy &&
++ 	    cgroup_parent(parent)) {
++ 		pr_warn("%s (%d) created nested cgroup for controller \"%s\" which has incomplete hierarchy support. Nested cgroups may change behavior in the future.\n",
++ 			current->comm, current->pid, ss->name);
++ 		if (!strcmp(ss->name, "memory"))
++ 			pr_warn("\"memory\" requires setting use_hierarchy to 1 on the root\n");
++ 		ss->warned_broken_hierarchy = true;
++ 	}
++ 
++ 	return 0;
++ 
++ err_list_del:
++ 	list_del_rcu(&css->sibling);
++ 	cgroup_clear_dir(css->cgroup, 1 << css->ss->id);
++ err_free_id:
++ 	cgroup_idr_remove(&ss->css_idr, css->id);
++ err_free_percpu_ref:
++ 	percpu_ref_exit(&css->refcnt);
++ err_free_css:
++ 	call_rcu(&css->rcu_head, css_free_rcu_fn);
++ 	return err;
++ }
++ 
++ static int cgroup_mkdir(struct kernfs_node *parent_kn, const char *name,
++ 			umode_t mode)
++ {
++ 	struct cgroup *parent, *cgrp;
++ 	struct cgroup_root *root;
+++>>>>>>> a34375ef9e65 (percpu-refcount: add @gfp to percpu_ref_init())
+  	struct cgroup_subsys *ss;
+ -	struct kernfs_node *kn;
+ -	struct cftype *base_files;
+ -	int ssid, ret;
+ -
+ -	parent = cgroup_kn_lock_live(parent_kn);
+ -	if (!parent)
+ -		return -ENODEV;
+ -	root = parent->root;
+ +	struct super_block *sb = root->sb;
+  
+  	/* allocate the cgroup and its ID, 0 is reserved for the root */
+  	cgrp = kzalloc(sizeof(*cgrp), GFP_KERNEL);
+ -	if (!cgrp) {
+ -		ret = -ENOMEM;
+ -		goto out_unlock;
+ -	}
+ +	if (!cgrp)
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	name = cgroup_alloc_name(dentry);
+ +	if (!name)
+ +		goto err_free_cgrp;
+ +	rcu_assign_pointer(cgrp->name, name);
+ +
+ +	cgrp->id = ida_simple_get(&root->cgroup_ida, 1, 0, GFP_KERNEL);
+ +	if (cgrp->id < 0)
+ +		goto err_free_name;
+++=======
++ 	ret = percpu_ref_init(&cgrp->self.refcnt, css_release, GFP_KERNEL);
++ 	if (ret)
++ 		goto out_free_cgrp;
+++>>>>>>> a34375ef9e65 (percpu-refcount: add @gfp to percpu_ref_init())
+  
+  	/*
+ -	 * Temporarily set the pointer to NULL, so idr_find() won't return
+ -	 * a half-baked cgroup.
+ +	 * Only live parents can have children.  Note that the liveliness
+ +	 * check isn't strictly necessary because cgroup_mkdir() and
+ +	 * cgroup_rmdir() are fully synchronized by i_mutex; however, do it
+ +	 * anyway so that locking is contained inside cgroup proper and we
+ +	 * don't get nasty surprises if we ever grow another caller.
+  	 */
+ -	cgrp->id = cgroup_idr_alloc(&root->cgroup_idr, NULL, 2, 0, GFP_NOWAIT);
+ -	if (cgrp->id < 0) {
+ -		ret = -ENOMEM;
+ -		goto out_cancel_ref;
+ +	if (!cgroup_lock_live_group(parent)) {
+ +		err = -ENODEV;
+ +		goto err_free_id;
+  	}
+  
+ +	/* Grab a reference on the superblock so the hierarchy doesn't
+ +	 * get deleted on unmount if there are child cgroups.  This
+ +	 * can be done outside cgroup_mutex, since the sb can't
+ +	 * disappear while someone has an open control file on the
+ +	 * fs */
+ +	atomic_inc(&sb->s_active);
+ +
+  	init_cgroup_housekeeping(cgrp);
+  
+ -	cgrp->self.parent = &parent->self;
+ -	cgrp->root = root;
+ +	dentry->d_fsdata = cgrp;
+ +	cgrp->dentry = dentry;
+ +
+ +	cgrp->parent = parent;
+ +	cgrp->root = parent->root;
+  
+  	if (notify_on_release(parent))
+  		set_bit(CGRP_NOTIFY_ON_RELEASE, &cgrp->flags);
+* Unmerged path include/linux/percpu-refcount.h
+* Unmerged path lib/percpu-refcount.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 808b7025cdcf..7e4e63ddcc07 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1773,7 +1773,8 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ 	if (!q)
+ 		goto err_hctxs;
+ 
+-	if (percpu_ref_init(&q->mq_usage_counter, blk_mq_usage_counter_release))
++	if (percpu_ref_init(&q->mq_usage_counter, blk_mq_usage_counter_release,
++			    GFP_KERNEL))
+ 		goto err_map;
+ 
+ 	setup_timer(&q->timeout, blk_mq_rq_timer, (unsigned long) q);
+* Unmerged path drivers/target/target_core_tpg.c
+* Unmerged path fs/aio.c
+* Unmerged path include/linux/percpu-refcount.h
+* Unmerged path kernel/cgroup.c
+* Unmerged path lib/percpu-refcount.c
