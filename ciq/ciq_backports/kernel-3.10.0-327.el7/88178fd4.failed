@@ -1,0 +1,164 @@
+KVM: x86: Add new dirty logging kvm_x86_ops for PML
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] x86: Add new dirty logging kvm_x86_ops for PML (Bandan Das) [1209995]
+Rebuild_FUZZ: 94.85%
+commit-author Kai Huang <kai.huang@linux.intel.com>
+commit 88178fd4f7187bbe290c5d373fd44aabec891934
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/88178fd4.failed
+
+This patch adds new kvm_x86_ops dirty logging hooks to enable/disable dirty
+logging for particular memory slot, and to flush potentially logged dirty GPAs
+before reporting slot->dirty_bitmap to userspace.
+
+kvm x86 common code calls these hooks when they are available so PML logic can
+be hidden to VMX specific. SVM won't be impacted as these hooks remain NULL
+there.
+
+	Signed-off-by: Kai Huang <kai.huang@linux.intel.com>
+	Reviewed-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 88178fd4f7187bbe290c5d373fd44aabec891934)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/mmu.c
+index 486947d144c0,cee759299a35..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -1241,6 -1295,53 +1241,56 @@@ void kvm_arch_mmu_write_protect_pt_mask
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * kvm_mmu_clear_dirty_pt_masked - clear MMU D-bit for PT level pages
++  * @kvm: kvm instance
++  * @slot: slot to clear D-bit
++  * @gfn_offset: start of the BITS_PER_LONG pages we care about
++  * @mask: indicates which pages we should clear D-bit
++  *
++  * Used for PML to re-log the dirty GPAs after userspace querying dirty_bitmap.
++  */
++ void kvm_mmu_clear_dirty_pt_masked(struct kvm *kvm,
++ 				     struct kvm_memory_slot *slot,
++ 				     gfn_t gfn_offset, unsigned long mask)
++ {
++ 	unsigned long *rmapp;
++ 
++ 	while (mask) {
++ 		rmapp = __gfn_to_rmap(slot->base_gfn + gfn_offset + __ffs(mask),
++ 				      PT_PAGE_TABLE_LEVEL, slot);
++ 		__rmap_clear_dirty(kvm, rmapp);
++ 
++ 		/* clear the first set bit */
++ 		mask &= mask - 1;
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_clear_dirty_pt_masked);
++ 
++ /**
++  * kvm_arch_mmu_enable_log_dirty_pt_masked - enable dirty logging for selected
++  * PT level pages.
++  *
++  * It calls kvm_mmu_write_protect_pt_masked to write protect selected pages to
++  * enable dirty logging for them.
++  *
++  * Used when we do not need to care about huge page mappings: e.g. during dirty
++  * logging we do not have any such mappings.
++  */
++ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
++ 				struct kvm_memory_slot *slot,
++ 				gfn_t gfn_offset, unsigned long mask)
++ {
++ 	if (kvm_x86_ops->enable_log_dirty_pt_masked)
++ 		kvm_x86_ops->enable_log_dirty_pt_masked(kvm, slot, gfn_offset,
++ 				mask);
++ 	else
++ 		kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
++ }
++ 
+++>>>>>>> 88178fd4f718 (KVM: x86: Add new dirty logging kvm_x86_ops for PML)
+  static bool rmap_write_protect(struct kvm *kvm, u64 gfn)
+  {
+  	struct kvm_memory_slot *slot;
+diff --cc arch/x86/kvm/x86.c
+index 7b812805de5a,442ee7d90946..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -7457,17 -7613,20 +7513,21 @@@ void kvm_arch_commit_memory_region(stru
+  
+  	if (nr_mmu_pages)
+  		kvm_mmu_change_mmu_pages(kvm, nr_mmu_pages);
+ -
+ -	/* It's OK to get 'new' slot here as it has already been installed */
+ -	new = id_to_memslot(kvm->memslots, mem->slot);
+ -
+  	/*
+- 	 * Write protect all pages for dirty logging.
+- 	 *
+- 	 * All the sptes including the large sptes which point to this
+- 	 * slot are set to readonly. We can not create any new large
+- 	 * spte on this slot until the end of the logging.
++ 	 * Set up write protection and/or dirty logging for the new slot.
+  	 *
+- 	 * See the comments in fast_page_fault().
++ 	 * For KVM_MR_DELETE and KVM_MR_MOVE, the shadow pages of old slot have
++ 	 * been zapped so no dirty logging staff is needed for old slot. For
++ 	 * KVM_MR_FLAGS_ONLY, the old slot is essentially the same one as the
++ 	 * new and it's also covered when dealing with the new slot.
+  	 */
+++<<<<<<< HEAD
+ +	if ((change != KVM_MR_DELETE) && (mem->flags & KVM_MEM_LOG_DIRTY_PAGES))
+ +		kvm_mmu_slot_remove_write_access(kvm, mem->slot);
+++=======
++ 	if (change != KVM_MR_DELETE)
++ 		kvm_mmu_slot_apply_flags(kvm, new);
+++>>>>>>> 88178fd4f718 (KVM: x86: Add new dirty logging kvm_x86_ops for PML)
+  }
+  
+  void kvm_arch_flush_shadow_all(struct kvm *kvm)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 85892f251941..9a7d8fba2d07 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -792,6 +792,31 @@ struct kvm_x86_ops {
+ 	int (*check_nested_events)(struct kvm_vcpu *vcpu, bool external_intr);
+ 
+ 	void (*sched_in)(struct kvm_vcpu *kvm, int cpu);
++
++	/*
++	 * Arch-specific dirty logging hooks. These hooks are only supposed to
++	 * be valid if the specific arch has hardware-accelerated dirty logging
++	 * mechanism. Currently only for PML on VMX.
++	 *
++	 *  - slot_enable_log_dirty:
++	 *	called when enabling log dirty mode for the slot.
++	 *  - slot_disable_log_dirty:
++	 *	called when disabling log dirty mode for the slot.
++	 *	also called when slot is created with log dirty disabled.
++	 *  - flush_log_dirty:
++	 *	called before reporting dirty_bitmap to userspace.
++	 *  - enable_log_dirty_pt_masked:
++	 *	called when reenabling log dirty for the GFNs in the mask after
++	 *	corresponding bits are cleared in slot->dirty_bitmap.
++	 */
++	void (*slot_enable_log_dirty)(struct kvm *kvm,
++				      struct kvm_memory_slot *slot);
++	void (*slot_disable_log_dirty)(struct kvm *kvm,
++				       struct kvm_memory_slot *slot);
++	void (*flush_log_dirty)(struct kvm *kvm);
++	void (*enable_log_dirty_pt_masked)(struct kvm *kvm,
++					   struct kvm_memory_slot *slot,
++					   gfn_t offset, unsigned long mask);
+ };
+ 
+ struct kvm_arch_async_pf {
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/x86.c
