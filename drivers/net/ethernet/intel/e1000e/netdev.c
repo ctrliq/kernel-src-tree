@@ -6046,7 +6046,7 @@ static int e1000_mii_ioctl(struct net_device *netdev, struct ifreq *ifr,
  * specified. Matching the kind of event packet is not supported, with the
  * exception of "all V2 events regardless of level 2 or 4".
  **/
-static int e1000e_hwtstamp_ioctl(struct net_device *netdev, struct ifreq *ifr)
+static int e1000e_hwtstamp_set(struct net_device *netdev, struct ifreq *ifr)
 {
 	struct e1000_adapter *adapter = netdev_priv(netdev);
 	struct hwtstamp_config config;
@@ -6081,6 +6081,14 @@ static int e1000e_hwtstamp_ioctl(struct net_device *netdev, struct ifreq *ifr)
 			    sizeof(config)) ? -EFAULT : 0;
 }
 
+static int e1000e_hwtstamp_get(struct net_device *netdev, struct ifreq *ifr)
+{
+	struct e1000_adapter *adapter = netdev_priv(netdev);
+
+	return copy_to_user(ifr->ifr_data, &adapter->hwtstamp_config,
+			    sizeof(adapter->hwtstamp_config)) ? -EFAULT : 0;
+}
+
 static int e1000_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 {
 	switch (cmd) {
@@ -6089,7 +6097,9 @@ static int e1000_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 	case SIOCSMIIREG:
 		return e1000_mii_ioctl(netdev, ifr, cmd);
 	case SIOCSHWTSTAMP:
-		return e1000e_hwtstamp_ioctl(netdev, ifr);
+		return e1000e_hwtstamp_set(netdev, ifr);
+	case SIOCGHWTSTAMP:
+		return e1000e_hwtstamp_get(netdev, ifr);
 	default:
 		return -EOPNOTSUPP;
 	}
