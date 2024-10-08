@@ -1,0 +1,167 @@
+NVMe: fix retry/error logic in nvme_queue_rq()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit fe54303ee2be293c1c5c7a53a152453789cabc2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fe54303e.failed
+
+The logic around retrying and erroring IO in nvme_queue_rq() is broken
+in a few ways:
+
+- If we fail allocating dma memory for a discard, we return retry. We
+  have the 'iod' stored in ->special, but we free the 'iod'.
+
+- For a normal request, if we fail dma mapping of setting up prps, we
+  have the same iod situation. Additionally, we haven't set the callback
+  for the request yet, so we also potentially leak IOMMU resources.
+
+Get rid of the ->special 'iod' store. The retry is uncommon enough that
+it's not worth optimizing for or holding on to resources to attempt to
+speed it up. Additionally, it's usually best practice to free any
+request related resources when doing retries.
+
+	Acked-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit fe54303ee2be293c1c5c7a53a152453789cabc2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 48e1152870d9,e92bdf4c68fc..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -835,25 -612,26 +835,40 @@@ static int nvme_split_flush_data(struc
+  	return 0;
+  }
+  
+ -static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ -			 const struct blk_mq_queue_data *bd)
+ +/*
+ + * Called with local interrupts disabled and the q_lock held.  May not sleep.
+ + */
+ +static int nvme_submit_bio_queue(struct nvme_queue *nvmeq, struct nvme_ns *ns,
+ +								struct bio *bio)
+  {
+ -	struct nvme_ns *ns = hctx->queue->queuedata;
+ -	struct nvme_queue *nvmeq = hctx->driver_data;
+ -	struct request *req = bd->rq;
+ -	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
+  	struct nvme_iod *iod;
+++<<<<<<< HEAD
+ +	int psegs = bio_phys_segments(ns->queue, bio);
+ +	int result;
+ +
+ +	if ((bio->bi_rw & REQ_FLUSH) && psegs)
+ +		return nvme_split_flush_data(nvmeq, bio);
+ +
+ +	iod = nvme_alloc_iod(psegs, bio->bi_size, GFP_ATOMIC);
+ +	if (!iod)
+ +		return -ENOMEM;
+ +
+ +	iod->private = bio;
+ +	if (bio->bi_rw & REQ_DISCARD) {
+++=======
++ 	int psegs = req->nr_phys_segments;
++ 	enum dma_data_direction dma_dir;
++ 	unsigned size = !(req->cmd_flags & REQ_DISCARD) ? blk_rq_bytes(req) :
++ 						sizeof(struct nvme_dsm_range);
++ 
++ 	iod = nvme_alloc_iod(psegs, size, ns->dev, GFP_ATOMIC);
++ 	if (!iod)
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 
++ 	iod->private = req;
++ 
++ 	if (req->cmd_flags & REQ_DISCARD) {
+++>>>>>>> fe54303ee2be (NVMe: fix retry/error logic in nvme_queue_rq())
+  		void *range;
+  		/*
+  		 * We reuse the small pool to allocate the 16-byte range here
+@@@ -863,35 -641,50 +878,81 @@@
+  		range = dma_pool_alloc(nvmeq->dev->prp_small_pool,
+  						GFP_ATOMIC,
+  						&iod->first_dma);
+++<<<<<<< HEAD
+ +		if (!range) {
+ +			result = -ENOMEM;
+ +			goto free_iod;
+ +		}
+ +		iod_list(iod)[0] = (__le64 *)range;
+ +		iod->npages = 0;
+ +	} else if (psegs) {
+ +		result = nvme_map_bio(nvmeq, iod, bio,
+ +			bio_data_dir(bio) ? DMA_TO_DEVICE : DMA_FROM_DEVICE,
+ +			psegs);
+ +		if (result <= 0)
+ +			goto free_iod;
+ +		if (nvme_setup_prps(nvmeq->dev, iod, result, GFP_ATOMIC) !=
+ +								result) {
+ +			result = -ENOMEM;
+ +			goto free_iod;
+ +		}
+ +		nvme_start_io_acct(bio);
+++=======
++ 		if (!range)
++ 			goto retry_cmd;
++ 		iod_list(iod)[0] = (__le64 *)range;
++ 		iod->npages = 0;
++ 	} else if (psegs) {
++ 		dma_dir = rq_data_dir(req) ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
++ 
++ 		sg_init_table(iod->sg, psegs);
++ 		iod->nents = blk_rq_map_sg(req->q, req, iod->sg);
++ 		if (!iod->nents)
++ 			goto error_cmd;
++ 
++ 		if (!dma_map_sg(nvmeq->q_dmadev, iod->sg, iod->nents, dma_dir))
++ 			goto retry_cmd;
++ 
++ 		if (blk_rq_bytes(req) !=
++                     nvme_setup_prps(nvmeq->dev, iod, blk_rq_bytes(req), GFP_ATOMIC)) {
++ 			dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->sg,
++ 					iod->nents, dma_dir);
++ 			goto retry_cmd;
++ 		}
+++>>>>>>> fe54303ee2be (NVMe: fix retry/error logic in nvme_queue_rq())
+  	}
+ +	if (unlikely(nvme_submit_iod(nvmeq, iod))) {
+ +		if (!waitqueue_active(&nvmeq->sq_full))
+ +			add_wait_queue(&nvmeq->sq_full, &nvmeq->sq_cong_wait);
+ +		list_add_tail(&iod->node, &nvmeq->iod_bio);
+ +	}
+ +	return 0;
+  
+++<<<<<<< HEAD
+ + free_iod:
+++=======
++ 	blk_mq_start_request(req);
++ 
++ 	nvme_set_info(cmd, iod, req_completion);
++ 	spin_lock_irq(&nvmeq->q_lock);
++ 	if (req->cmd_flags & REQ_DISCARD)
++ 		nvme_submit_discard(nvmeq, ns, req, iod);
++ 	else if (req->cmd_flags & REQ_FLUSH)
++ 		nvme_submit_flush(nvmeq, ns, req->tag);
++ 	else
++ 		nvme_submit_iod(nvmeq, iod, ns);
++ 
++ 	nvme_process_cq(nvmeq);
++ 	spin_unlock_irq(&nvmeq->q_lock);
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ 
++  error_cmd:
+++>>>>>>> fe54303ee2be (NVMe: fix retry/error logic in nvme_queue_rq())
++ 	nvme_free_iod(nvmeq->dev, iod);
++ 	return BLK_MQ_RQ_QUEUE_ERROR;
++  retry_cmd:
+  	nvme_free_iod(nvmeq->dev, iod);
+- 	return result;
++ 	return BLK_MQ_RQ_QUEUE_BUSY;
+  }
+  
+  static int nvme_process_cq(struct nvme_queue *nvmeq)
+* Unmerged path drivers/block/nvme-core.c
