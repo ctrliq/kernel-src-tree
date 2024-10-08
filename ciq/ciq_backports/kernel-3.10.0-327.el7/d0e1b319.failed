@@ -1,0 +1,409 @@
+be2net: refactor error detect/recovery function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Kalesh AP <kalesh.purayil@emulex.com>
+commit d0e1b319bbf345e8b8cc8bd7702cc6c33db074d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d0e1b319.failed
+
+Currently when an error is detected, the queue resources are being cleaned up
+in the recovery routine. The resources are better cleaned up in the error
+detection routine itself (similar to EEH code.)
+So, this patch re-factors error processing logic to follow the following sequence:
+	- check if there is an error in adapter
+	- if error,
+		- cleanup resources
+		- attempt recovery
+
+The patch renames lancer_recover_func() to be_err_recover() as this
+routine will be used in the future for error recovery on Skyhawk too.
+
+	Signed-off-by: Kalesh AP <kalesh.purayil@emulex.com>
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d0e1b319bbf345e8b8cc8bd7702cc6c33db074d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index b2184bdb8a43,034ce7031ce2..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -4622,41 -4903,173 +4622,42 @@@ static void be_netdev_init(struct net_d
+  	netdev->ethtool_ops = &be_ethtool_ops;
+  }
+  
+ -static int be_err_recover(struct be_adapter *adapter)
+++<<<<<<< HEAD
+ +static void be_unmap_pci_bars(struct be_adapter *adapter)
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -	struct device *dev = &adapter->pdev->dev;
+ -	int status;
+ -
+ -	status = lancer_test_and_set_rdy_state(adapter);
+ -	if (status)
+ -		goto err;
+ -
+ -	be_clear_all_error(adapter);
+ +	if (adapter->csr)
+ +		pci_iounmap(adapter->pdev, adapter->csr);
+ +	if (adapter->db)
+ +		pci_iounmap(adapter->pdev, adapter->db);
+ +}
+  
+ -	status = be_setup(adapter);
+ -	if (status)
+ -		goto err;
+ +static int db_bar(struct be_adapter *adapter)
+ +{
+ +	if (lancer_chip(adapter) || !be_physfn(adapter))
+ +		return 0;
+ +	else
+ +		return 4;
+ +}
+  
+ -	if (netif_running(netdev)) {
+ -		status = be_open(netdev);
+ -		if (status)
+ -			goto err;
+ +static int be_roce_map_pci_bars(struct be_adapter *adapter)
+ +{
+ +	if (skyhawk_chip(adapter)) {
+ +		adapter->roce_db.size = 4096;
+ +		adapter->roce_db.io_addr = pci_resource_start(adapter->pdev,
+ +							      db_bar(adapter));
+ +		adapter->roce_db.total_size = pci_resource_len(adapter->pdev,
+ +							       db_bar(adapter));
+  	}
+ -
+ -	netif_device_attach(netdev);
+ -
+ -	dev_err(dev, "Adapter recovery successful\n");
+  	return 0;
+ -err:
+ -	if (status == -EAGAIN)
+ -		dev_err(dev, "Waiting for resource provisioning\n");
+ -	else
+ -		dev_err(dev, "Adapter recovery failed\n");
+ -
+ -	return status;
+  }
+  
+ -static void be_err_detection_task(struct work_struct *work)
+ +static int be_map_pci_bars(struct be_adapter *adapter)
+  {
+ -	struct be_adapter *adapter =
+ -				container_of(work, struct be_adapter,
+ -					     be_err_detection_work.work);
+ -	struct net_device *netdev = adapter->netdev;
+ -	int status = 0;
+ -
+ -	be_detect_error(adapter);
+ -
+ -	if (adapter->hw_error) {
+ -		rtnl_lock();
+ -		netif_device_detach(netdev);
+ -		if (netif_running(netdev))
+ -			be_close(netdev);
+ -		rtnl_unlock();
+ -
+ -		be_clear(adapter);
+ -
+ -		/* As of now error recovery support is in Lancer only */
+ -		if (lancer_chip(adapter))
+ -			status = be_err_recover(adapter);
+ -	}
+ -
+ -	/* In Lancer, for all errors other than provisioning error (-EAGAIN),
+ -	 * no need to attempt further recovery.
+ -	 */
+ -	if (!status || status == -EAGAIN)
+ -		be_schedule_err_detection(adapter);
+ -}
+ -
+ -static void be_log_sfp_info(struct be_adapter *adapter)
+ -{
+ -	int status;
+ -
+ -	status = be_cmd_query_sfp_info(adapter);
+ -	if (!status) {
+ -		dev_err(&adapter->pdev->dev,
+ -			"Unqualified SFP+ detected on %c from %s part no: %s",
+ -			adapter->port_name, adapter->phy.vendor_name,
+ -			adapter->phy.vendor_pn);
+ -	}
+ -	adapter->flags &= ~BE_FLAGS_EVT_INCOMPATIBLE_SFP;
+ -}
+ -
+ -static void be_worker(struct work_struct *work)
+ -{
+ -	struct be_adapter *adapter =
+ -		container_of(work, struct be_adapter, work.work);
+ -	struct be_rx_obj *rxo;
+ -	int i;
+ -
+ -	/* when interrupts are not yet enabled, just reap any pending
+ -	 * mcc completions
+ -	 */
+ -	if (!netif_running(adapter->netdev)) {
+ -		local_bh_disable();
+ -		be_process_mcc(adapter);
+ -		local_bh_enable();
+ -		goto reschedule;
+ -	}
+ -
+ -	if (!adapter->stats_cmd_sent) {
+ -		if (lancer_chip(adapter))
+ -			lancer_cmd_get_pport_stats(adapter,
+ -						   &adapter->stats_cmd);
+ -		else
+ -			be_cmd_get_stats(adapter, &adapter->stats_cmd);
+ -	}
+ -
+ -	if (be_physfn(adapter) &&
+ -	    MODULO(adapter->work_counter, adapter->be_get_temp_freq) == 0)
+ -		be_cmd_get_die_temperature(adapter);
+ -
+ -	for_all_rx_queues(adapter, rxo, i) {
+ -		/* Replenish RX-queues starved due to memory
+ -		 * allocation failures.
+ -		 */
+ -		if (rxo->rx_post_starved)
+ -			be_post_rx_frags(rxo, GFP_KERNEL, MAX_RX_POST);
+ -	}
+ -
+ -	be_eqd_update(adapter);
+ -
+ -	if (adapter->flags & BE_FLAGS_EVT_INCOMPATIBLE_SFP)
+ -		be_log_sfp_info(adapter);
+ -
+ -reschedule:
+ -	adapter->work_counter++;
+ -	schedule_delayed_work(&adapter->work, msecs_to_jiffies(1000));
+ -}
+ -
+ -static void be_unmap_pci_bars(struct be_adapter *adapter)
+ -{
+ -	if (adapter->csr)
+ -		pci_iounmap(adapter->pdev, adapter->csr);
+ -	if (adapter->db)
+ -		pci_iounmap(adapter->pdev, adapter->db);
+ -}
+ -
+ -static int db_bar(struct be_adapter *adapter)
+ -{
+ -	if (lancer_chip(adapter) || !be_physfn(adapter))
+ -		return 0;
+ -	else
+ -		return 4;
+ -}
+ -
+ -static int be_roce_map_pci_bars(struct be_adapter *adapter)
+ -{
+ -	if (skyhawk_chip(adapter)) {
+ -		adapter->roce_db.size = 4096;
+ -		adapter->roce_db.io_addr = pci_resource_start(adapter->pdev,
+ -							      db_bar(adapter));
+ -		adapter->roce_db.total_size = pci_resource_len(adapter->pdev,
+ -							       db_bar(adapter));
+ -	}
+ -	return 0;
+ -}
+ -
+ -static int be_map_pci_bars(struct be_adapter *adapter)
+ -{
+ -	u8 __iomem *addr;
+ -	u32 sli_intf;
+ -
+ -	pci_read_config_dword(adapter->pdev, SLI_INTF_REG_OFFSET, &sli_intf);
+ -	adapter->sli_family = (sli_intf & SLI_INTF_FAMILY_MASK) >>
+ -				SLI_INTF_FAMILY_SHIFT;
+ -	adapter->virtfn = (sli_intf & SLI_INTF_FT_MASK) ? 1 : 0;
+ +	struct pci_dev *pdev = adapter->pdev;
+ +	u8 __iomem *addr;
+  
+  	if (BEx_chip(adapter) && be_physfn(adapter)) {
+ -		adapter->csr = pci_iomap(adapter->pdev, 2, 0);
+ +		adapter->csr = pci_iomap(pdev, 2, 0);
+  		if (!adapter->csr)
+  			return -ENOMEM;
+  	}
+@@@ -4823,150 -5208,6 +4824,161 @@@ static void be_remove(struct pci_dev *p
+  	free_netdev(adapter->netdev);
+  }
+  
+ +static int be_get_initial_config(struct be_adapter *adapter)
+ +{
+ +	int status, level;
+ +
+ +	status = be_cmd_get_cntl_attributes(adapter);
+ +	if (status)
+ +		return status;
+ +
+ +	/* Must be a power of 2 or else MODULO will BUG_ON */
+ +	adapter->be_get_temp_freq = 64;
+ +
+ +	if (BEx_chip(adapter)) {
+ +		level = be_cmd_get_fw_log_level(adapter);
+ +		adapter->msg_enable =
+ +			level <= FW_LOG_LEVEL_DEFAULT ? NETIF_MSG_HW : 0;
+ +	}
+ +
+ +	adapter->cfg_num_qs = netif_get_num_default_rss_queues();
+ +	return 0;
+ +}
+ +
+ +static int lancer_recover_func(struct be_adapter *adapter)
+++=======
+++static int be_err_recover(struct be_adapter *adapter)
+++>>>>>>> d0e1b319bbf3 (be2net: refactor error detect/recovery function)
+ +{
+++	struct net_device *netdev = adapter->netdev;
+ +	struct device *dev = &adapter->pdev->dev;
+ +	int status;
+ +
+ +	status = lancer_test_and_set_rdy_state(adapter);
+ +	if (status)
+ +		goto err;
+ +
+- 	if (netif_running(adapter->netdev))
+- 		be_close(adapter->netdev);
+- 
+- 	be_clear(adapter);
+- 
+ +	be_clear_all_error(adapter);
+ +
+ +	status = be_setup(adapter);
+ +	if (status)
+ +		goto err;
+ +
+- 	if (netif_running(adapter->netdev)) {
+- 		status = be_open(adapter->netdev);
+++	if (netif_running(netdev)) {
+++		status = be_open(netdev);
+ +		if (status)
+ +			goto err;
+ +	}
+ +
+++	netif_device_attach(netdev);
+++
+ +	dev_err(dev, "Adapter recovery successful\n");
+ +	return 0;
+ +err:
+ +	if (status == -EAGAIN)
+ +		dev_err(dev, "Waiting for resource provisioning\n");
+ +	else
+ +		dev_err(dev, "Adapter recovery failed\n");
+ +
+ +	return status;
+ +}
+ +
+ +static void be_func_recovery_task(struct work_struct *work)
+ +{
+ +	struct be_adapter *adapter =
+++<<<<<<< HEAD
+ +		container_of(work, struct be_adapter,  func_recovery_work.work);
+++=======
+++				container_of(work, struct be_adapter,
+++					     be_err_detection_work.work);
+++	struct net_device *netdev = adapter->netdev;
+++>>>>>>> d0e1b319bbf3 (be2net: refactor error detect/recovery function)
+ +	int status = 0;
+ +
+ +	be_detect_error(adapter);
+ +
+- 	if (adapter->hw_error && lancer_chip(adapter)) {
+++	if (adapter->hw_error) {
+ +		rtnl_lock();
+- 		netif_device_detach(adapter->netdev);
+++		netif_device_detach(netdev);
+++		if (netif_running(netdev))
+++			be_close(netdev);
+ +		rtnl_unlock();
+ +
+- 		status = lancer_recover_func(adapter);
+- 		if (!status)
+- 			netif_device_attach(adapter->netdev);
+++		be_clear(adapter);
+++
+++		/* As of now error recovery support is in Lancer only */
+++		if (lancer_chip(adapter))
+++			status = be_err_recover(adapter);
+ +	}
+ +
+ +	/* In Lancer, for all errors other than provisioning error (-EAGAIN),
+ +	 * no need to attempt further recovery.
+ +	 */
+ +	if (!status || status == -EAGAIN)
+ +		schedule_delayed_work(&adapter->func_recovery_work,
+ +				      msecs_to_jiffies(1000));
+ +}
+ +
+ +static void be_log_sfp_info(struct be_adapter *adapter)
+ +{
+ +	int status;
+ +
+ +	status = be_cmd_query_sfp_info(adapter);
+ +	if (!status) {
+ +		dev_err(&adapter->pdev->dev,
+ +			"Unqualified SFP+ detected on %c from %s part no: %s",
+ +			adapter->port_name, adapter->phy.vendor_name,
+ +			adapter->phy.vendor_pn);
+ +	}
+ +	adapter->flags &= ~BE_FLAGS_EVT_INCOMPATIBLE_SFP;
+ +}
+ +
+ +static void be_worker(struct work_struct *work)
+ +{
+ +	struct be_adapter *adapter =
+ +		container_of(work, struct be_adapter, work.work);
+ +	struct be_rx_obj *rxo;
+ +	int i;
+ +
+ +	/* when interrupts are not yet enabled, just reap any pending
+ +	* mcc completions */
+ +	if (!netif_running(adapter->netdev)) {
+ +		local_bh_disable();
+ +		be_process_mcc(adapter);
+ +		local_bh_enable();
+ +		goto reschedule;
+ +	}
+ +
+ +	if (!adapter->stats_cmd_sent) {
+ +		if (lancer_chip(adapter))
+ +			lancer_cmd_get_pport_stats(adapter,
+ +						   &adapter->stats_cmd);
+ +		else
+ +			be_cmd_get_stats(adapter, &adapter->stats_cmd);
+ +	}
+ +
+ +	if (be_physfn(adapter) &&
+ +	    MODULO(adapter->work_counter, adapter->be_get_temp_freq) == 0)
+ +		be_cmd_get_die_temperature(adapter);
+ +
+ +	for_all_rx_queues(adapter, rxo, i) {
+ +		/* Replenish RX-queues starved due to memory
+ +		 * allocation failures.
+ +		 */
+ +		if (rxo->rx_post_starved)
+ +			be_post_rx_frags(rxo, GFP_KERNEL, MAX_RX_POST);
+ +	}
+ +
+ +	be_eqd_update(adapter);
+ +
+ +	if (adapter->flags & BE_FLAGS_EVT_INCOMPATIBLE_SFP)
+ +		be_log_sfp_info(adapter);
+ +
+ +reschedule:
+ +	adapter->work_counter++;
+ +	schedule_delayed_work(&adapter->work, msecs_to_jiffies(1000));
+ +}
+ +
+  /* If any VFs are already enabled don't FLR the PF */
+  static bool be_reset_required(struct be_adapter *adapter)
+  {
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
