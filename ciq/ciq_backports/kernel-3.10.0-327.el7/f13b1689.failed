@@ -1,0 +1,99 @@
+vxlan: do not exit on error in vxlan_stop()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit f13b1689d753f333459878ac27cb12d414502a09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f13b1689.failed
+
+We need to clean up vxlan despite vxlan_igmp_leave() fails.
+
+This fixes the following kernel warning:
+
+ WARNING: CPU: 0 PID: 6 at lib/debugobjects.c:263 debug_print_object+0x7c/0x8d()
+ ODEBUG: free active (active state 0) object type: timer_list hint: vxlan_cleanup+0x0/0xd0
+ CPU: 0 PID: 6 Comm: kworker/u8:0 Not tainted 4.0.0-rc7+ #953
+ Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+ Workqueue: netns cleanup_net
+  0000000000000009 ffff88011955f948 ffffffff81a25f5a 00000000253f253e
+  ffff88011955f998 ffff88011955f988 ffffffff8107608e 0000000000000000
+  ffffffff814deba2 ffff8800d4e94000 ffffffff82254c30 ffffffff81fbe455
+ Call Trace:
+  [<ffffffff81a25f5a>] dump_stack+0x4c/0x65
+  [<ffffffff8107608e>] warn_slowpath_common+0x9c/0xb6
+  [<ffffffff814deba2>] ? debug_print_object+0x7c/0x8d
+  [<ffffffff81076116>] warn_slowpath_fmt+0x46/0x48
+  [<ffffffff814deba2>] debug_print_object+0x7c/0x8d
+  [<ffffffff81666bf1>] ? vxlan_fdb_destroy+0x5b/0x5b
+  [<ffffffff814dee02>] __debug_check_no_obj_freed+0xc3/0x15f
+  [<ffffffff814df728>] debug_check_no_obj_freed+0x12/0x16
+  [<ffffffff8117ae4e>] slab_free_hook+0x64/0x6c
+  [<ffffffff8114deaa>] ? kvfree+0x31/0x33
+  [<ffffffff8117dc66>] kfree+0x101/0x1ac
+  [<ffffffff8114deaa>] kvfree+0x31/0x33
+  [<ffffffff817d4137>] netdev_freemem+0x18/0x1a
+  [<ffffffff817e8b52>] netdev_release+0x2e/0x32
+  [<ffffffff815b4163>] device_release+0x5a/0x92
+  [<ffffffff814bd4dd>] kobject_cleanup+0x49/0x5e
+  [<ffffffff814bd3ff>] kobject_put+0x45/0x49
+  [<ffffffff817d3fc1>] netdev_run_todo+0x26f/0x283
+  [<ffffffff817d4873>] ? rollback_registered_many+0x20f/0x23b
+  [<ffffffff817e0c80>] rtnl_unlock+0xe/0x10
+  [<ffffffff817d4af0>] default_device_exit_batch+0x12a/0x139
+  [<ffffffff810aadfa>] ? wait_woken+0x8f/0x8f
+  [<ffffffff817c8e14>] ops_exit_list+0x2b/0x57
+  [<ffffffff817c9b21>] cleanup_net+0x154/0x1e7
+  [<ffffffff8108b05d>] process_one_work+0x255/0x4ad
+  [<ffffffff8108af69>] ? process_one_work+0x161/0x4ad
+  [<ffffffff8108b4b1>] worker_thread+0x1cd/0x2ab
+  [<ffffffff8108b2e4>] ? process_scheduled_works+0x2f/0x2f
+  [<ffffffff81090686>] kthread+0xd4/0xdc
+  [<ffffffff8109eca3>] ? local_clock+0x19/0x22
+  [<ffffffff810905b2>] ? __kthread_parkme+0x83/0x83
+  [<ffffffff81a31c48>] ret_from_fork+0x58/0x90
+  [<ffffffff810905b2>] ? __kthread_parkme+0x83/0x83
+
+For the long-term, we should handle NETDEV_{UP,DOWN} event
+from the lower device of a tunnel device.
+
+Fixes: 56ef9c909b40 ("vxlan: Move socket initialization to within rtnl scope")
+	Cc: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f13b1689d753f333459878ac27cb12d414502a09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index ae2759a0f1e4,577c9b071ad9..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2079,16 -2250,14 +2079,21 @@@ static void vxlan_flush(struct vxlan_de
+  /* Cleanup timer and forwarding table on shutdown */
+  static int vxlan_stop(struct net_device *dev)
+  {
+ +	struct vxlan_net *vn = net_generic(dev_net(dev), vxlan_net_id);
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	struct vxlan_net *vn = net_generic(vxlan->net, vxlan_net_id);
+  	struct vxlan_sock *vs = vxlan->vn_sock;
+ -	int ret = 0;
+  
+  	if (vxlan_addr_multicast(&vxlan->default_dst.remote_ip) &&
+++<<<<<<< HEAD
+ +	    !vxlan_group_used(vn, vxlan)) {
+ +		vxlan_sock_hold(vs);
+ +		dev_hold(dev);
+ +		queue_work(vxlan_wq, &vxlan->igmp_leave);
+ +	}
+++=======
++ 	    !vxlan_group_used(vn, vxlan))
++ 		ret = vxlan_igmp_leave(vxlan);
+++>>>>>>> f13b1689d753 (vxlan: do not exit on error in vxlan_stop())
+  
+  	del_timer_sync(&vxlan->age_timer);
+  
+* Unmerged path drivers/net/vxlan.c
