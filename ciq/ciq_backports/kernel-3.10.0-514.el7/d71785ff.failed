@@ -1,0 +1,430 @@
+net: add dst_cache to ovs vxlan lwtunnel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] add dst_cache to ovs vxlan lwtunnel (Jiri Benc) [1323141]
+Rebuild_FUZZ: 93.33%
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit d71785ffc7e7cae3fbdc4ea8a9d05b7a1c59f7b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d71785ff.failed
+
+In case of UDP traffic with datagram length
+below MTU this give about 2% performance increase
+when tunneling over ipv4 and about 60% when tunneling
+over ipv6
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Suggested-and-acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d71785ffc7e7cae3fbdc4ea8a9d05b7a1c59f7b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/dst_metadata.h
+#	include/net/ip_tunnels.h
+#	net/core/dst.c
+diff --cc drivers/net/vxlan.c
+index 000e4c57a81e,ee1206d9f8df..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1737,14 -1759,80 +1737,90 @@@ static int vxlan6_xmit_skb(struct dst_e
+  		vxlan_build_gbp_hdr(vxh, vxflags, md);
+  
+  	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ +
+ +	udp_tunnel6_xmit_skb(dst, sk, skb, dev, saddr, daddr, prio,
+ +			     ttl, src_port, dst_port,
+ +			     !!(vxflags & VXLAN_F_UDP_ZERO_CSUM6_TX));
+  	return 0;
+++<<<<<<< HEAD
+ +err:
+ +	dst_release(dst);
+ +	return err;
+++=======
++ }
++ 
++ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
++ 				      struct sk_buff *skb, int oif, u8 tos,
++ 				      __be32 daddr, __be32 *saddr,
++ 				      struct dst_cache *dst_cache,
++ 				      struct ip_tunnel_info *info)
++ {
++ 	struct rtable *rt = NULL;
++ 	bool use_cache = false;
++ 	struct flowi4 fl4;
++ 
++ 	/* when the ip_tunnel_info is availble, the tos used for lookup is
++ 	 * packet independent, so we can use the cache
++ 	 */
++ 	if (!skb->mark && (!tos || info)) {
++ 		use_cache = true;
++ 		rt = dst_cache_get_ip4(dst_cache, saddr);
++ 		if (rt)
++ 			return rt;
++ 	}
++ 
++ 	memset(&fl4, 0, sizeof(fl4));
++ 	fl4.flowi4_oif = oif;
++ 	fl4.flowi4_tos = RT_TOS(tos);
++ 	fl4.flowi4_mark = skb->mark;
++ 	fl4.flowi4_proto = IPPROTO_UDP;
++ 	fl4.daddr = daddr;
++ 	fl4.saddr = vxlan->cfg.saddr.sin.sin_addr.s_addr;
++ 
++ 	rt = ip_route_output_key(vxlan->net, &fl4);
++ 	if (!IS_ERR(rt)) {
++ 		*saddr = fl4.saddr;
++ 		if (use_cache)
++ 			dst_cache_set_ip4(dst_cache, &rt->dst, fl4.saddr);
++ 	}
++ 	return rt;
++ }
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
++ 					  struct sk_buff *skb, int oif,
++ 					  const struct in6_addr *daddr,
++ 					  struct in6_addr *saddr,
++ 					  struct dst_cache *dst_cache)
++ {
++ 	struct dst_entry *ndst;
++ 	struct flowi6 fl6;
++ 	int err;
++ 
++ 	if (!skb->mark) {
++ 		ndst = dst_cache_get_ip6(dst_cache, saddr);
++ 		if (ndst)
++ 			return ndst;
++ 	}
++ 
++ 	memset(&fl6, 0, sizeof(fl6));
++ 	fl6.flowi6_oif = oif;
++ 	fl6.daddr = *daddr;
++ 	fl6.saddr = vxlan->cfg.saddr.sin6.sin6_addr;
++ 	fl6.flowi6_mark = skb->mark;
++ 	fl6.flowi6_proto = IPPROTO_UDP;
++ 
++ 	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
++ 					 vxlan->vn6_sock->sock->sk,
++ 					 &ndst, &fl6);
++ 	if (err < 0)
++ 		return ERR_PTR(err);
++ 
++ 	*saddr = fl6.saddr;
++ 	if (!skb->mark)
++ 		dst_cache_set_ip6(dst_cache, ndst, saddr);
++ 	return ndst;
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  }
+  #endif
+  
+@@@ -1871,22 -1884,48 +1947,53 @@@ static void vxlan_encap_bypass(struct s
+  static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+  			   struct vxlan_rdst *rdst, bool did_rsc)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct dst_cache *dst_cache;
++ 	struct ip_tunnel_info *info;
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	struct sock *sk;
+ +	struct sock *sk = vxlan->vn_sock->sock->sk;
+  	struct rtable *rt = NULL;
+  	const struct iphdr *old_iph;
+ +	struct flowi4 fl4;
+  	union vxlan_addr *dst;
+ -	union vxlan_addr remote_ip;
+ -	struct vxlan_metadata _md;
+ -	struct vxlan_metadata *md = &_md;
+ +	struct vxlan_metadata md;
+  	__be16 src_port = 0, dst_port;
+  	u32 vni;
+  	__be16 df = 0;
+  	__u8 tos, ttl;
+  	int err;
+ -	u32 flags = vxlan->flags;
+ -	bool udp_sum = false;
+ -	bool xnet = !net_eq(vxlan->net, dev_net(vxlan->dev));
+  
+++<<<<<<< HEAD
+ +	dst_port = rdst->remote_port ? rdst->remote_port : vxlan->dst_port;
+ +	vni = rdst->remote_vni;
+ +	dst = &rdst->remote_ip;
+++=======
++ 	info = skb_tunnel_info(skb);
++ 
++ 	if (rdst) {
++ 		dst_port = rdst->remote_port ? rdst->remote_port : vxlan->cfg.dst_port;
++ 		vni = rdst->remote_vni;
++ 		dst = &rdst->remote_ip;
++ 		dst_cache = &rdst->dst_cache;
++ 	} else {
++ 		if (!info) {
++ 			WARN_ONCE(1, "%s: Missing encapsulation instructions\n",
++ 				  dev->name);
++ 			goto drop;
++ 		}
++ 		dst_port = info->key.tp_dst ? : vxlan->cfg.dst_port;
++ 		vni = be64_to_cpu(info->key.tun_id);
++ 		remote_ip.sa.sa_family = ip_tunnel_info_af(info);
++ 		if (remote_ip.sa.sa_family == AF_INET)
++ 			remote_ip.sin.sin_addr.s_addr = info->key.u.ipv4.dst;
++ 		else
++ 			remote_ip.sin6.sin6_addr = info->key.u.ipv6.dst;
++ 		dst = &remote_ip;
++ 		dst_cache = &info->dst_cache;
++ 	}
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  
+  	if (vxlan_addr_any(dst)) {
+  		if (did_rsc) {
+@@@ -1907,19 -1946,38 +2014,37 @@@
+  	if (tos == 1)
+  		tos = ip_tunnel_get_dsfield(old_iph, skb);
+  
+ -	src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->cfg.port_min,
+ -				     vxlan->cfg.port_max, true);
+ -
+ -	if (info) {
+ -		ttl = info->key.ttl;
+ -		tos = info->key.tos;
+ -		udp_sum = !!(info->key.tun_flags & TUNNEL_CSUM);
+ -
+ -		if (info->options_len)
+ -			md = ip_tunnel_info_opts(info);
+ -	} else {
+ -		md->gbp = skb->mark;
+ -	}
+ +	src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->port_min,
+ +				     vxlan->port_max, true);
+  
+  	if (dst->sa.sa_family == AF_INET) {
+ -		__be32 saddr;
+ -
+ +		memset(&fl4, 0, sizeof(fl4));
+ +		fl4.flowi4_oif = rdst->remote_ifindex;
+ +		fl4.flowi4_tos = RT_TOS(tos);
+ +		fl4.flowi4_mark = skb->mark;
+ +		fl4.flowi4_proto = IPPROTO_UDP;
+ +		fl4.daddr = dst->sin.sin_addr.s_addr;
+ +		fl4.saddr = vxlan->saddr.sin.sin_addr.s_addr;
+ +
+++<<<<<<< HEAD
+ +		rt = ip_route_output_key(vxlan->net, &fl4);
+++=======
++ 		if (!vxlan->vn4_sock)
++ 			goto drop;
++ 		sk = vxlan->vn4_sock->sock->sk;
++ 
++ 		if (info) {
++ 			if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT)
++ 				df = htons(IP_DF);
++ 		} else {
++ 			udp_sum = !!(flags & VXLAN_F_UDP_CSUM);
++ 		}
++ 
++ 		rt = vxlan_get_route(vxlan, skb,
++ 				     rdst ? rdst->remote_ifindex : 0, tos,
++ 				     dst->sin.sin_addr.s_addr, &saddr,
++ 				     dst_cache, info);
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  		if (IS_ERR(rt)) {
+  			netdev_dbg(dev, "no route to %pI4\n",
+  				   &dst->sin.sin_addr.s_addr);
+@@@ -1969,17 -2020,18 +2094,25 @@@
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+  		struct dst_entry *ndst;
+ -		struct in6_addr saddr;
+ +		struct flowi6 fl6;
+  		u32 rt6i_flags;
+  
+ -		if (!vxlan->vn6_sock)
+ -			goto drop;
+ -		sk = vxlan->vn6_sock->sock->sk;
+ +		memset(&fl6, 0, sizeof(fl6));
+ +		fl6.flowi6_oif = rdst->remote_ifindex;
+ +		fl6.daddr = dst->sin6.sin6_addr;
+ +		fl6.saddr = vxlan->saddr.sin6.sin6_addr;
+ +		fl6.flowi6_mark = skb->mark;
+ +		fl6.flowi6_proto = IPPROTO_UDP;
+  
+++<<<<<<< HEAD
+ +		if (ipv6_stub->ipv6_dst_lookup(sk, &ndst, &fl6)) {
+++=======
++ 		ndst = vxlan6_get_route(vxlan, skb,
++ 					rdst ? rdst->remote_ifindex : 0,
++ 					&dst->sin6.sin6_addr, &saddr,
++ 					dst_cache);
++ 		if (IS_ERR(ndst)) {
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  			netdev_dbg(dev, "no route to %pI6\n",
+  				   &dst->sin6.sin6_addr);
+  			dev->stats.tx_carrier_errors++;
+diff --cc include/net/ip_tunnels.h
+index 3a5ac80169cf,87408ab80856..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -38,10 -52,17 +38,16 @@@ struct ip_tunnel_key 
+  	__be16			tp_dst;
+  };
+  
+ -/* Flags for ip_tunnel_info mode. */
+ -#define IP_TUNNEL_INFO_TX	0x01	/* represents tx tunnel parameters */
+ -#define IP_TUNNEL_INFO_IPV6	0x02	/* key contains IPv6 addresses */
+ -
+  struct ip_tunnel_info {
+  	struct ip_tunnel_key	key;
+++<<<<<<< HEAD
+ +	const void		*options;
+++=======
++ #ifdef CONFIG_DST_CACHE
++ 	struct dst_cache	dst_cache;
++ #endif
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  	u8			options_len;
+ -	u8			mode;
+  };
+  
+  /* 6rd prefix/relay information */
+diff --cc net/core/dst.c
+index 65dccfb58d44,b5cbbe07f786..000000000000
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@@ -248,7 -261,13 +248,17 @@@ again
+  		dst->ops->destroy(dst);
+  	if (dst->dev)
+  		dev_put(dst->dev);
+++<<<<<<< HEAD
+ +	kmem_cache_free(dst->ops->kmem_cachep, dst);
+++=======
++ 
++ 	lwtstate_put(dst->lwtstate);
++ 
++ 	if (dst->flags & DST_METADATA)
++ 		metadata_dst_free((struct metadata_dst *)dst);
++ 	else
++ 		kmem_cache_free(dst->ops->kmem_cachep, dst);
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  
+  	dst = child;
+  	if (dst) {
+@@@ -330,6 -349,77 +340,80 @@@ void __dst_destroy_metrics_generic(stru
+  }
+  EXPORT_SYMBOL(__dst_destroy_metrics_generic);
+  
+++<<<<<<< HEAD
+++=======
++ static struct dst_ops md_dst_ops = {
++ 	.family =		AF_UNSPEC,
++ };
++ 
++ static int dst_md_discard_out(struct net *net, struct sock *sk, struct sk_buff *skb)
++ {
++ 	WARN_ONCE(1, "Attempting to call output on metadata dst\n");
++ 	kfree_skb(skb);
++ 	return 0;
++ }
++ 
++ static int dst_md_discard(struct sk_buff *skb)
++ {
++ 	WARN_ONCE(1, "Attempting to call input on metadata dst\n");
++ 	kfree_skb(skb);
++ 	return 0;
++ }
++ 
++ static void __metadata_dst_init(struct metadata_dst *md_dst, u8 optslen)
++ {
++ 	struct dst_entry *dst;
++ 
++ 	dst = &md_dst->dst;
++ 	dst_init(dst, &md_dst_ops, NULL, 1, DST_OBSOLETE_NONE,
++ 		 DST_METADATA | DST_NOCACHE | DST_NOCOUNT);
++ 
++ 	dst->input = dst_md_discard;
++ 	dst->output = dst_md_discard_out;
++ 
++ 	memset(dst + 1, 0, sizeof(*md_dst) + optslen - sizeof(*dst));
++ }
++ 
++ struct metadata_dst *metadata_dst_alloc(u8 optslen, gfp_t flags)
++ {
++ 	struct metadata_dst *md_dst;
++ 
++ 	md_dst = kmalloc(sizeof(*md_dst) + optslen, flags);
++ 	if (!md_dst)
++ 		return NULL;
++ 
++ 	__metadata_dst_init(md_dst, optslen);
++ 
++ 	return md_dst;
++ }
++ EXPORT_SYMBOL_GPL(metadata_dst_alloc);
++ 
++ void metadata_dst_free(struct metadata_dst *md_dst)
++ {
++ #ifdef CONFIG_DST_CACHE
++ 	dst_cache_destroy(&md_dst->u.tun_info.dst_cache);
++ #endif
++ 	kfree(md_dst);
++ }
++ 
++ struct metadata_dst __percpu *metadata_dst_alloc_percpu(u8 optslen, gfp_t flags)
++ {
++ 	int cpu;
++ 	struct metadata_dst __percpu *md_dst;
++ 
++ 	md_dst = __alloc_percpu_gfp(sizeof(struct metadata_dst) + optslen,
++ 				    __alignof__(struct metadata_dst), flags);
++ 	if (!md_dst)
++ 		return NULL;
++ 
++ 	for_each_possible_cpu(cpu)
++ 		__metadata_dst_init(per_cpu_ptr(md_dst, cpu), optslen);
++ 
++ 	return md_dst;
++ }
++ EXPORT_SYMBOL_GPL(metadata_dst_alloc_percpu);
++ 
+++>>>>>>> d71785ffc7e7 (net: add dst_cache to ovs vxlan lwtunnel)
+  /* Dirty hack. We did it in 2.2 (in __dst_free),
+   * we have _very_ good reasons not to repeat
+   * this mistake in 2.3, but we have no choice
+* Unmerged path include/net/dst_metadata.h
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/dst_metadata.h
+* Unmerged path include/net/ip_tunnels.h
+* Unmerged path net/core/dst.c
+diff --git a/net/openvswitch/Kconfig b/net/openvswitch/Kconfig
+index aa5eac5326eb..018620c615ad 100644
+--- a/net/openvswitch/Kconfig
++++ b/net/openvswitch/Kconfig
+@@ -9,6 +9,7 @@ config OPENVSWITCH
+ 	select LIBCRC32C
+ 	select MPLS
+ 	select NET_MPLS_GSO
++	select DST_CACHE
+ 	---help---
+ 	  Open vSwitch is a multilayer Ethernet switch targeted at virtualized
+ 	  environments.  In addition to supporting a variety of features
+diff --git a/net/openvswitch/flow_netlink.c b/net/openvswitch/flow_netlink.c
+index 7f4707e70b38..49d4c1cbd9de 100644
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@ -1815,6 +1815,12 @@ static int validate_and_copy_set_tun(const struct nlattr *attr,
+ 	if (!tun_dst)
+ 		return -ENOMEM;
+ 
++	err = dst_cache_init(&tun_dst->u.tun_info.dst_cache, GFP_KERNEL);
++	if (err) {
++		dst_release((struct dst_entry *)tun_dst);
++		return err;
++	}
++
+ 	a = __add_action(sfa, OVS_KEY_ATTR_TUNNEL_INFO, NULL,
+ 			 sizeof(*ovs_tun), log);
+ 	if (IS_ERR(a)) {
