@@ -1,0 +1,133 @@
+KVM: VMX: fix nested vpid for old KVM guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit ef697a712a6165aea7779c295604b099e8bfae2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ef697a71.failed
+
+Old KVM guests invoke single-context invvpid without actually checking
+whether it is supported.  This was fixed by commit 518c8ae ("KVM: VMX:
+Make sure single type invvpid is supported before issuing invvpid
+instruction", 2010-08-01) and the patch after, but pre-2.6.36
+kernels lack it including RHEL 6.
+
+	Reported-by: jmontleo@redhat.com
+	Tested-by: jmontleo@redhat.com
+	Cc: stable@vger.kernel.org
+Fixes: 99b83ac893b84ed1a62ad6d1f2b6cc32026b9e85
+	Reviewed-by: David Matlack <dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ef697a712a6165aea7779c295604b099e8bfae2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index a7d76dce5145,161230016dfa..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -2465,12 -2708,25 +2465,29 @@@ static __init void nested_vmx_setup_ctl
+  		 * for single context invalidation. Hence, only advertise
+  		 * support for global context invalidation.
+  		 */
+ -		vmx->nested.nested_vmx_ept_caps |= VMX_EPT_EXTENT_GLOBAL_BIT;
+ +		nested_vmx_ept_caps |= VMX_EPT_EXTENT_GLOBAL_BIT;
+  	} else
+++<<<<<<< HEAD
+ +		nested_vmx_ept_caps = 0;
+++=======
++ 		vmx->nested.nested_vmx_ept_caps = 0;
++ 
++ 	/*
++ 	 * Old versions of KVM use the single-context version without
++ 	 * checking for support, so declare that it is supported even
++ 	 * though it is treated as global context.  The alternative is
++ 	 * not failing the single-context invvpid, and it is worse.
++ 	 */
++ 	if (enable_vpid)
++ 		vmx->nested.nested_vmx_vpid_caps = VMX_VPID_INVVPID_BIT |
++ 				VMX_VPID_EXTENT_SINGLE_CONTEXT_BIT |
++ 				VMX_VPID_EXTENT_GLOBAL_CONTEXT_BIT;
++ 	else
++ 		vmx->nested.nested_vmx_vpid_caps = 0;
+++>>>>>>> ef697a712a61 (KVM: VMX: fix nested vpid for old KVM guests)
+  
+  	if (enable_unrestricted_guest)
+ -		vmx->nested.nested_vmx_secondary_ctls_high |=
+ +		nested_vmx_secondary_ctls_high |=
+  			SECONDARY_EXEC_UNRESTRICTED_GUEST;
+  
+  	/* miscellaneous data */
+@@@ -6982,7 -7440,64 +6999,68 @@@ static int handle_invept(struct kvm_vcp
+  
+  static int handle_invvpid(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	kvm_queue_exception(vcpu, UD_VECTOR);
+++=======
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	u32 vmx_instruction_info;
++ 	unsigned long type, types;
++ 	gva_t gva;
++ 	struct x86_exception e;
++ 	int vpid;
++ 
++ 	if (!(vmx->nested.nested_vmx_secondary_ctls_high &
++ 	      SECONDARY_EXEC_ENABLE_VPID) ||
++ 			!(vmx->nested.nested_vmx_vpid_caps & VMX_VPID_INVVPID_BIT)) {
++ 		kvm_queue_exception(vcpu, UD_VECTOR);
++ 		return 1;
++ 	}
++ 
++ 	if (!nested_vmx_check_permission(vcpu))
++ 		return 1;
++ 
++ 	vmx_instruction_info = vmcs_read32(VMX_INSTRUCTION_INFO);
++ 	type = kvm_register_readl(vcpu, (vmx_instruction_info >> 28) & 0xf);
++ 
++ 	types = (vmx->nested.nested_vmx_vpid_caps >> 8) & 0x7;
++ 
++ 	if (!(types & (1UL << type))) {
++ 		nested_vmx_failValid(vcpu,
++ 			VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
++ 		skip_emulated_instruction(vcpu);
++ 		return 1;
++ 	}
++ 
++ 	/* according to the intel vmx instruction reference, the memory
++ 	 * operand is read even if it isn't needed (e.g., for type==global)
++ 	 */
++ 	if (get_vmx_mem_address(vcpu, vmcs_readl(EXIT_QUALIFICATION),
++ 			vmx_instruction_info, false, &gva))
++ 		return 1;
++ 	if (kvm_read_guest_virt(&vcpu->arch.emulate_ctxt, gva, &vpid,
++ 				sizeof(u32), &e)) {
++ 		kvm_inject_page_fault(vcpu, &e);
++ 		return 1;
++ 	}
++ 
++ 	switch (type) {
++ 	case VMX_VPID_EXTENT_SINGLE_CONTEXT:
++ 		/*
++ 		 * Old versions of KVM use the single-context version so we
++ 		 * have to support it; just treat it the same as all-context.
++ 		 */
++ 	case VMX_VPID_EXTENT_ALL_CONTEXT:
++ 		__vmx_flush_tlb(vcpu, to_vmx(vcpu)->nested.vpid02);
++ 		nested_vmx_succeed(vcpu);
++ 		break;
++ 	default:
++ 		/* Trap individual address invalidation invvpid calls */
++ 		BUG_ON(1);
++ 		break;
++ 	}
++ 
++ 	skip_emulated_instruction(vcpu);
+++>>>>>>> ef697a712a61 (KVM: VMX: fix nested vpid for old KVM guests)
+  	return 1;
+  }
+  
+* Unmerged path arch/x86/kvm/vmx.c
