@@ -1,0 +1,171 @@
+mmc: core: refactor the hw_reset routines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] core: refactor the hw_reset routines (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 93.51%
+commit-author Johan Rudholm <johan.rudholm@axis.com>
+commit f855a3717eaff1179837060c4796f1cd706331e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f855a371.failed
+
+Move the (e)MMC specific hw_reset code from core.c into mmc.c. Call the
+code from the new bus_ops member "reset". This also allows for adding
+a SD card specific reset procedure.
+
+	Signed-off-by: Johan Rudholm <johanru@axis.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit f855a3717eaff1179837060c4796f1cd706331e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/core.c
+diff --cc drivers/mmc/core/core.c
+index 354690df1570,2cdb06e0643e..000000000000
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@@ -2267,59 -2273,25 +2267,39 @@@ static void mmc_hw_reset_for_init(struc
+  	mmc_host_clk_release(host);
+  }
+  
+- int mmc_can_reset(struct mmc_card *card)
+- {
+- 	u8 rst_n_function;
+- 
+- 	if (!mmc_card_mmc(card))
+- 		return 0;
+- 	rst_n_function = card->ext_csd.rst_n_function;
+- 	if ((rst_n_function & EXT_CSD_RST_N_EN_MASK) != EXT_CSD_RST_N_ENABLED)
+- 		return 0;
+- 	return 1;
+- }
+- EXPORT_SYMBOL(mmc_can_reset);
+- 
+  int mmc_hw_reset(struct mmc_host *host)
+  {
+- 	struct mmc_card *card = host->card;
+- 	u32 status;
+- 
+- 	if (!(host->caps & MMC_CAP_HW_RESET) || !host->ops->hw_reset)
+- 		return -EOPNOTSUPP;
++ 	int ret;
+  
+- 	if (!card)
++ 	if (!host->card)
+  		return -EINVAL;
+  
+- 	if (!mmc_can_reset(card))
++ 	mmc_bus_get(host);
++ 	if (!host->bus_ops || host->bus_dead || !host->bus_ops->reset) {
++ 		mmc_bus_put(host);
+  		return -EOPNOTSUPP;
+- 
+- 	mmc_host_clk_hold(host);
+- 	mmc_set_clock(host, host->f_init);
+- 
+- 	host->ops->hw_reset(host);
+- 
+- 	/* If the reset has happened, then a status command will fail */
+- 	if (!mmc_send_status(card, &status)) {
+- 		mmc_host_clk_release(host);
+- 		return -ENOSYS;
+  	}
+  
+++<<<<<<< HEAD
+ +	host->card->state &= ~(MMC_STATE_HIGHSPEED | MMC_STATE_HIGHSPEED_DDR);
+ +	if (mmc_host_is_spi(host)) {
+ +		host->ios.chip_select = MMC_CS_HIGH;
+ +		host->ios.bus_mode = MMC_BUSMODE_PUSHPULL;
+ +	} else {
+ +		host->ios.chip_select = MMC_CS_DONTCARE;
+ +		host->ios.bus_mode = MMC_BUSMODE_OPENDRAIN;
+ +	}
+ +	host->ios.bus_width = MMC_BUS_WIDTH_1;
+ +	host->ios.timing = MMC_TIMING_LEGACY;
+ +	mmc_set_ios(host);
+++=======
++ 	ret = host->bus_ops->reset(host);
++ 	mmc_bus_put(host);
+++>>>>>>> f855a3717eaf (mmc: core: refactor the hw_reset routines)
+  
+- 	mmc_host_clk_release(host);
++ 	pr_warn("%s: tried to reset card\n", mmc_hostname(host));
+  
+- 	return host->bus_ops->power_restore(host);
++ 	return ret;
+  }
+  EXPORT_SYMBOL(mmc_hw_reset);
+  
+* Unmerged path drivers/mmc/core/core.c
+diff --git a/drivers/mmc/core/core.h b/drivers/mmc/core/core.h
+index f712f6e0bc34..b82370b3e824 100644
+--- a/drivers/mmc/core/core.h
++++ b/drivers/mmc/core/core.h
+@@ -27,6 +27,7 @@ struct mmc_bus_ops {
+ 	int (*power_restore)(struct mmc_host *);
+ 	int (*alive)(struct mmc_host *);
+ 	int (*shutdown)(struct mmc_host *);
++	int (*reset)(struct mmc_host *);
+ };
+ 
+ void mmc_attach_bus(struct mmc_host *host, const struct mmc_bus_ops *ops);
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index 51a18b7ab66f..0ea215cd7a72 100644
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -1677,6 +1677,46 @@ static int mmc_power_restore(struct mmc_host *host)
+ 	return ret;
+ }
+ 
++int mmc_can_reset(struct mmc_card *card)
++{
++	u8 rst_n_function;
++
++	rst_n_function = card->ext_csd.rst_n_function;
++	if ((rst_n_function & EXT_CSD_RST_N_EN_MASK) != EXT_CSD_RST_N_ENABLED)
++		return 0;
++	return 1;
++}
++EXPORT_SYMBOL(mmc_can_reset);
++
++static int mmc_reset(struct mmc_host *host)
++{
++	struct mmc_card *card = host->card;
++	u32 status;
++
++	if (!(host->caps & MMC_CAP_HW_RESET) || !host->ops->hw_reset)
++		return -EOPNOTSUPP;
++
++	if (!mmc_can_reset(card))
++		return -EOPNOTSUPP;
++
++	mmc_host_clk_hold(host);
++	mmc_set_clock(host, host->f_init);
++
++	host->ops->hw_reset(host);
++
++	/* If the reset has happened, then a status command will fail */
++	if (!mmc_send_status(card, &status)) {
++		mmc_host_clk_release(host);
++		return -ENOSYS;
++	}
++
++	/* Set initial state and call mmc_set_ios */
++	mmc_set_initial_state(host);
++	mmc_host_clk_release(host);
++
++	return mmc_power_restore(host);
++}
++
+ static const struct mmc_bus_ops mmc_ops = {
+ 	.remove = mmc_remove,
+ 	.detect = mmc_detect,
+@@ -1687,6 +1727,7 @@ static const struct mmc_bus_ops mmc_ops = {
+ 	.power_restore = mmc_power_restore,
+ 	.alive = mmc_alive,
+ 	.shutdown = mmc_shutdown,
++	.reset = mmc_reset,
+ };
+ 
+ /*
