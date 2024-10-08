@@ -1,0 +1,189 @@
+mmc: sdhci-sirf: fake version and capbility registers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] sdhci-sirf: fake version and capbility registers (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 95.05%
+commit-author Weijun Yang <Weijun.Yang@csr.com>
+commit a1b0b977d2b2b9248ae26df0c7987d1696028309
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a1b0b977.failed
+
+chips have some issues for version and capbility registers, here we fake
+them.
+
+	Signed-off-by: Weijun Yang <Weijun.Yang@csr.com>
+	Signed-off-by: Barry Song <Baohua.Song@csr.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit a1b0b977d2b2b9248ae26df0c7987d1696028309)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/sdhci-sirf.c
+diff --cc drivers/mmc/host/sdhci-sirf.c
+index 09805af0526d,0110bae25b7e..000000000000
+--- a/drivers/mmc/host/sdhci-sirf.c
++++ b/drivers/mmc/host/sdhci-sirf.c
+@@@ -21,15 -23,137 +21,147 @@@ struct sdhci_sirf_priv 
+  	int gpio_cd;
+  };
+  
+ -static void sdhci_sirf_set_bus_width(struct sdhci_host *host, int width)
+ +static unsigned int sdhci_sirf_get_max_clk(struct sdhci_host *host)
+  {
+++<<<<<<< HEAD
+ +	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+ +	struct sdhci_sirf_priv *priv = pltfm_host->priv;
+ +	return clk_get_rate(priv->clk);
+ +}
+ +
+ +static struct sdhci_ops sdhci_sirf_ops = {
+ +	.get_max_clock	= sdhci_sirf_get_max_clk,
+++=======
++ 	u8 ctrl;
++ 
++ 	ctrl = sdhci_readb(host, SDHCI_HOST_CONTROL);
++ 	ctrl &= ~(SDHCI_CTRL_4BITBUS | SDHCI_SIRF_8BITBUS);
++ 
++ 	/*
++ 	 * CSR atlas7 and prima2 SD host version is not 3.0
++ 	 * 8bit-width enable bit of CSR SD hosts is 3,
++ 	 * while stardard hosts use bit 5
++ 	 */
++ 	if (width == MMC_BUS_WIDTH_8)
++ 		ctrl |= SDHCI_SIRF_8BITBUS;
++ 	else if (width == MMC_BUS_WIDTH_4)
++ 		ctrl |= SDHCI_CTRL_4BITBUS;
++ 
++ 	sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
++ }
++ 
++ static u32 sdhci_sirf_readl_le(struct sdhci_host *host, int reg)
++ {
++ 	u32 val = readl(host->ioaddr + reg);
++ 
++ 	if (unlikely((reg == SDHCI_CAPABILITIES_1) &&
++ 			(host->mmc->caps & MMC_CAP_UHS_SDR50))) {
++ 		/* fake CAP_1 register */
++ 		val = SDHCI_SUPPORT_SDR50 | SDHCI_USE_SDR50_TUNING;
++ 	}
++ 
++ 	if (unlikely(reg == SDHCI_SLOT_INT_STATUS)) {
++ 		u32 prss = val;
++ 		/* fake chips as V3.0 host conreoller */
++ 		prss &= ~(0xFF << 16);
++ 		val = prss | (SDHCI_SPEC_300 << 16);
++ 	}
++ 	return val;
++ }
++ 
++ static u16 sdhci_sirf_readw_le(struct sdhci_host *host, int reg)
++ {
++ 	u16 ret = 0;
++ 
++ 	ret = readw(host->ioaddr + reg);
++ 
++ 	if (unlikely(reg == SDHCI_HOST_VERSION)) {
++ 		ret = readw(host->ioaddr + SDHCI_HOST_VERSION);
++ 		ret |= SDHCI_SPEC_300;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int sdhci_sirf_execute_tuning(struct sdhci_host *host, u32 opcode)
++ {
++ 	int tuning_seq_cnt = 3;
++ 	int phase;
++ 	u8 tuned_phase_cnt = 0;
++ 	int rc = 0, longest_range = 0;
++ 	int start = -1, end = 0, tuning_value = -1, range = 0;
++ 	u16 clock_setting;
++ 	struct mmc_host *mmc = host->mmc;
++ 
++ 	clock_setting = sdhci_readw(host, SDHCI_CLK_DELAY_SETTING);
++ 	clock_setting &= ~0x3fff;
++ 
++ retry:
++ 	phase = 0;
++ 	tuned_phase_cnt = 0;
++ 	do {
++ 		sdhci_writel(host,
++ 			clock_setting | phase,
++ 			SDHCI_CLK_DELAY_SETTING);
++ 
++ 		if (!mmc_send_tuning(mmc)) {
++ 			/* Tuning is successful at this tuning point */
++ 			tuned_phase_cnt++;
++ 			dev_dbg(mmc_dev(mmc), "%s: Found good phase = %d\n",
++ 				 mmc_hostname(mmc), phase);
++ 			if (start == -1)
++ 				start = phase;
++ 			end = phase;
++ 			range++;
++ 			if (phase == (SIRF_TUNING_COUNT - 1)
++ 				&& range > longest_range)
++ 				tuning_value = (start + end) / 2;
++ 		} else {
++ 			dev_dbg(mmc_dev(mmc), "%s: Found bad phase = %d\n",
++ 				 mmc_hostname(mmc), phase);
++ 			if (range > longest_range) {
++ 				tuning_value = (start + end) / 2;
++ 				longest_range = range;
++ 			}
++ 			start = -1;
++ 			end = range = 0;
++ 		}
++ 	} while (++phase < SIRF_TUNING_COUNT);
++ 
++ 	if (tuned_phase_cnt && tuning_value > 0) {
++ 		/*
++ 		 * Finally set the selected phase in delay
++ 		 * line hw block.
++ 		 */
++ 		phase = tuning_value;
++ 		sdhci_writel(host,
++ 			clock_setting | phase,
++ 			SDHCI_CLK_DELAY_SETTING);
++ 
++ 		dev_dbg(mmc_dev(mmc), "%s: Setting the tuning phase to %d\n",
++ 			 mmc_hostname(mmc), phase);
++ 	} else {
++ 		if (--tuning_seq_cnt)
++ 			goto retry;
++ 		/* Tuning failed */
++ 		dev_dbg(mmc_dev(mmc), "%s: No tuning point found\n",
++ 		       mmc_hostname(mmc));
++ 		rc = -EIO;
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ static struct sdhci_ops sdhci_sirf_ops = {
++ 	.read_l = sdhci_sirf_readl_le,
++ 	.read_w = sdhci_sirf_readw_le,
++ 	.platform_execute_tuning = sdhci_sirf_execute_tuning,
++ 	.set_clock = sdhci_set_clock,
++ 	.get_max_clock	= sdhci_pltfm_clk_get_max_clock,
++ 	.set_bus_width = sdhci_sirf_set_bus_width,
++ 	.reset = sdhci_reset,
++ 	.set_uhs_signaling = sdhci_set_uhs_signaling,
+++>>>>>>> a1b0b977d2b2 (mmc: sdhci-sirf: fake version and capbility registers)
+  };
+  
+  static struct sdhci_pltfm_data sdhci_sirf_pdata = {
+diff --git a/drivers/mmc/host/Kconfig b/drivers/mmc/host/Kconfig
+index 17adfe67817a..186d40f771d4 100644
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -196,6 +196,7 @@ config MMC_SDHCI_SIRF
+ 	tristate "SDHCI support on CSR SiRFprimaII and SiRFmarco SoCs"
+ 	depends on ARCH_SIRF
+ 	depends on MMC_SDHCI_PLTFM
++	select MMC_SDHCI_IO_ACCESSORS
+ 	help
+ 	  This selects the SDHCI support for SiRF System-on-Chip devices.
+ 
+* Unmerged path drivers/mmc/host/sdhci-sirf.c
