@@ -1,0 +1,565 @@
+mei: bus: fix c&p issue in the kdoc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit df7f5447d7b56c08684c7d285621e15e5c3c06b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/df7f5447.failed
+
+s/send/receive/
+The buffer in the receive function is
+not used for sending
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit df7f5447d7b56c08684c7d285621e15e5c3c06b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/bus.c
+diff --cc drivers/misc/mei/bus.c
+index 3365981198e7,160e084ae800..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -31,26 -30,523 +31,488 @@@
+  #define to_mei_cl_driver(d) container_of(d, struct mei_cl_driver, driver)
+  #define to_mei_cl_device(d) container_of(d, struct mei_cl_device, dev)
+  
+++<<<<<<< HEAD
+ +static int mei_cl_device_match(struct device *dev, struct device_driver *drv)
+++=======
++ /**
++  * __mei_cl_send - internal client send (write)
++  *
++  * @cl: host client
++  * @buf: buffer to send
++  * @length: buffer length
++  * @blocking: wait for write completion
++  *
++  * Return: written size bytes or < 0 on error
++  */
++ ssize_t __mei_cl_send(struct mei_cl *cl, u8 *buf, size_t length,
++ 			bool blocking)
++ {
++ 	struct mei_device *bus;
++ 	struct mei_cl_cb *cb = NULL;
++ 	ssize_t rets;
++ 
++ 	if (WARN_ON(!cl || !cl->dev))
++ 		return -ENODEV;
++ 
++ 	bus = cl->dev;
++ 
++ 	mutex_lock(&bus->device_lock);
++ 	if (!mei_cl_is_connected(cl)) {
++ 		rets = -ENODEV;
++ 		goto out;
++ 	}
++ 
++ 	/* Check if we have an ME client device */
++ 	if (!mei_me_cl_is_active(cl->me_cl)) {
++ 		rets = -ENOTTY;
++ 		goto out;
++ 	}
++ 
++ 	if (length > mei_cl_mtu(cl)) {
++ 		rets = -EFBIG;
++ 		goto out;
++ 	}
++ 
++ 	cb = mei_cl_alloc_cb(cl, length, MEI_FOP_WRITE, NULL);
++ 	if (!cb) {
++ 		rets = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	memcpy(cb->buf.data, buf, length);
++ 
++ 	rets = mei_cl_write(cl, cb, blocking);
++ 
++ out:
++ 	mutex_unlock(&bus->device_lock);
++ 	if (rets < 0)
++ 		mei_io_cb_free(cb);
++ 
++ 	return rets;
++ }
++ 
++ /**
++  * __mei_cl_recv - internal client receive (read)
++  *
++  * @cl: host client
++  * @buf: buffer to receive
++  * @length: buffer length
++  *
++  * Return: read size in bytes of < 0 on error
++  */
++ ssize_t __mei_cl_recv(struct mei_cl *cl, u8 *buf, size_t length)
++ {
++ 	struct mei_device *bus;
++ 	struct mei_cl_cb *cb;
++ 	size_t r_length;
++ 	ssize_t rets;
++ 
++ 	if (WARN_ON(!cl || !cl->dev))
++ 		return -ENODEV;
++ 
++ 	bus = cl->dev;
++ 
++ 	mutex_lock(&bus->device_lock);
++ 
++ 	cb = mei_cl_read_cb(cl, NULL);
++ 	if (cb)
++ 		goto copy;
++ 
++ 	rets = mei_cl_read_start(cl, length, NULL);
++ 	if (rets && rets != -EBUSY)
++ 		goto out;
++ 
++ 	/* wait on event only if there is no other waiter */
++ 	if (list_empty(&cl->rd_completed) && !waitqueue_active(&cl->rx_wait)) {
++ 
++ 		mutex_unlock(&bus->device_lock);
++ 
++ 		if (wait_event_interruptible(cl->rx_wait,
++ 				(!list_empty(&cl->rd_completed)) ||
++ 				(!mei_cl_is_connected(cl)))) {
++ 
++ 			if (signal_pending(current))
++ 				return -EINTR;
++ 			return -ERESTARTSYS;
++ 		}
++ 
++ 		mutex_lock(&bus->device_lock);
++ 
++ 		if (!mei_cl_is_connected(cl)) {
++ 			rets = -EBUSY;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	cb = mei_cl_read_cb(cl, NULL);
++ 	if (!cb) {
++ 		rets = 0;
++ 		goto out;
++ 	}
++ 
++ copy:
++ 	if (cb->status) {
++ 		rets = cb->status;
++ 		goto free;
++ 	}
++ 
++ 	r_length = min_t(size_t, length, cb->buf_idx);
++ 	memcpy(buf, cb->buf.data, r_length);
++ 	rets = r_length;
++ 
++ free:
++ 	mei_io_cb_free(cb);
++ out:
++ 	mutex_unlock(&bus->device_lock);
++ 
++ 	return rets;
++ }
++ 
++ /**
++  * mei_cldev_send - me device send  (write)
++  *
++  * @cldev: me client device
++  * @buf: buffer to send
++  * @length: buffer length
++  *
++  * Return: written size in bytes or < 0 on error
++  */
++ ssize_t mei_cldev_send(struct mei_cl_device *cldev, u8 *buf, size_t length)
++ {
++ 	struct mei_cl *cl = cldev->cl;
++ 
++ 	if (cl == NULL)
++ 		return -ENODEV;
++ 
++ 	return __mei_cl_send(cl, buf, length, 1);
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_send);
++ 
++ /**
++  * mei_cldev_recv - client receive (read)
++  *
++  * @cldev: me client device
++  * @buf: buffer to receive
++  * @length: buffer length
++  *
++  * Return: read size in bytes of < 0 on error
++  */
++ ssize_t mei_cldev_recv(struct mei_cl_device *cldev, u8 *buf, size_t length)
++ {
++ 	struct mei_cl *cl = cldev->cl;
++ 
++ 	if (cl == NULL)
++ 		return -ENODEV;
++ 
++ 	return __mei_cl_recv(cl, buf, length);
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_recv);
++ 
++ /**
++  * mei_cl_bus_event_work  - dispatch rx event for a bus device
++  *    and schedule new work
++  *
++  * @work: work
++  */
++ static void mei_cl_bus_event_work(struct work_struct *work)
++ {
++ 	struct mei_cl_device *cldev;
++ 
++ 	cldev = container_of(work, struct mei_cl_device, event_work);
++ 
++ 	if (cldev->event_cb)
++ 		cldev->event_cb(cldev, cldev->events, cldev->event_context);
++ 
++ 	cldev->events = 0;
++ 
++ 	/* Prepare for the next read */
++ 	if (cldev->events_mask & BIT(MEI_CL_EVENT_RX))
++ 		mei_cl_read_start(cldev->cl, 0, NULL);
++ }
++ 
++ /**
++  * mei_cl_bus_notify_event - schedule notify cb on bus client
++  *
++  * @cl: host client
++  */
++ void mei_cl_bus_notify_event(struct mei_cl *cl)
++ {
++ 	struct mei_cl_device *cldev = cl->cldev;
++ 
++ 	if (!cldev || !cldev->event_cb)
++ 		return;
++ 
++ 	if (!(cldev->events_mask & BIT(MEI_CL_EVENT_NOTIF)))
++ 		return;
++ 
++ 	if (!cl->notify_ev)
++ 		return;
++ 
++ 	set_bit(MEI_CL_EVENT_NOTIF, &cldev->events);
++ 
++ 	schedule_work(&cldev->event_work);
++ 
++ 	cl->notify_ev = false;
++ }
++ 
++ /**
++  * mei_cl_bus_rx_event  - schedule rx evenet
++  *
++  * @cl: host client
++  */
++ void mei_cl_bus_rx_event(struct mei_cl *cl)
++ {
++ 	struct mei_cl_device *cldev = cl->cldev;
++ 
++ 	if (!cldev || !cldev->event_cb)
++ 		return;
++ 
++ 	if (!(cldev->events_mask & BIT(MEI_CL_EVENT_RX)))
++ 		return;
++ 
++ 	set_bit(MEI_CL_EVENT_RX, &cldev->events);
++ 
++ 	schedule_work(&cldev->event_work);
++ }
++ 
++ /**
++  * mei_cldev_register_event_cb - register event callback
++  *
++  * @cldev: me client devices
++  * @event_cb: callback function
++  * @events_mask: requested events bitmask
++  * @context: driver context data
++  *
++  * Return: 0 on success
++  *         -EALREADY if an callback is already registered
++  *         <0 on other errors
++  */
++ int mei_cldev_register_event_cb(struct mei_cl_device *cldev,
++ 				unsigned long events_mask,
++ 				mei_cldev_event_cb_t event_cb, void *context)
++ {
++ 	int ret;
++ 
++ 	if (cldev->event_cb)
++ 		return -EALREADY;
++ 
++ 	cldev->events = 0;
++ 	cldev->events_mask = events_mask;
++ 	cldev->event_cb = event_cb;
++ 	cldev->event_context = context;
++ 	INIT_WORK(&cldev->event_work, mei_cl_bus_event_work);
++ 
++ 	if (cldev->events_mask & BIT(MEI_CL_EVENT_RX)) {
++ 		ret = mei_cl_read_start(cldev->cl, 0, NULL);
++ 		if (ret && ret != -EBUSY)
++ 			return ret;
++ 	}
++ 
++ 	if (cldev->events_mask & BIT(MEI_CL_EVENT_NOTIF)) {
++ 		mutex_lock(&cldev->cl->dev->device_lock);
++ 		ret = mei_cl_notify_request(cldev->cl, NULL, event_cb ? 1 : 0);
++ 		mutex_unlock(&cldev->cl->dev->device_lock);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_register_event_cb);
++ 
++ /**
++  * mei_cldev_get_drvdata - driver data getter
++  *
++  * @cldev: mei client device
++  *
++  * Return: driver private data
++  */
++ void *mei_cldev_get_drvdata(const struct mei_cl_device *cldev)
++ {
++ 	return dev_get_drvdata(&cldev->dev);
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_get_drvdata);
++ 
++ /**
++  * mei_cldev_set_drvdata - driver data setter
++  *
++  * @cldev: mei client device
++  * @data: data to store
++  */
++ void mei_cldev_set_drvdata(struct mei_cl_device *cldev, void *data)
++ {
++ 	dev_set_drvdata(&cldev->dev, data);
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_set_drvdata);
++ 
++ /**
++  * mei_cldev_uuid - return uuid of the underlying me client
++  *
++  * @cldev: mei client device
++  *
++  * Return: me client uuid
++  */
++ const uuid_le *mei_cldev_uuid(const struct mei_cl_device *cldev)
++ {
++ 	return mei_me_cl_uuid(cldev->me_cl);
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_uuid);
++ 
++ /**
++  * mei_cldev_ver - return protocol version of the underlying me client
++  *
++  * @cldev: mei client device
++  *
++  * Return: me client protocol version
++  */
++ u8 mei_cldev_ver(const struct mei_cl_device *cldev)
++ {
++ 	return mei_me_cl_ver(cldev->me_cl);
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_ver);
++ 
++ /**
++  * mei_cldev_enabled - check whether the device is enabled
++  *
++  * @cldev: mei client device
++  *
++  * Return: true if me client is initialized and connected
++  */
++ bool mei_cldev_enabled(struct mei_cl_device *cldev)
++ {
++ 	return cldev->cl && mei_cl_is_connected(cldev->cl);
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_enabled);
++ 
++ /**
++  * mei_cldev_enable_device - enable me client device
++  *     create connection with me client
++  *
++  * @cldev: me client device
++  *
++  * Return: 0 on success and < 0 on error
++  */
++ int mei_cldev_enable(struct mei_cl_device *cldev)
++ {
++ 	struct mei_device *bus = cldev->bus;
++ 	struct mei_cl *cl;
++ 	int ret;
++ 
++ 	cl = cldev->cl;
++ 
++ 	if (!cl) {
++ 		mutex_lock(&bus->device_lock);
++ 		cl = mei_cl_alloc_linked(bus, MEI_HOST_CLIENT_ID_ANY);
++ 		mutex_unlock(&bus->device_lock);
++ 		if (IS_ERR(cl))
++ 			return PTR_ERR(cl);
++ 		/* update pointers */
++ 		cldev->cl = cl;
++ 		cl->cldev = cldev;
++ 	}
++ 
++ 	mutex_lock(&bus->device_lock);
++ 	if (mei_cl_is_connected(cl)) {
++ 		ret = 0;
++ 		goto out;
++ 	}
++ 
++ 	if (!mei_me_cl_is_active(cldev->me_cl)) {
++ 		dev_err(&cldev->dev, "me client is not active\n");
++ 		ret = -ENOTTY;
++ 		goto out;
++ 	}
++ 
++ 	ret = mei_cl_connect(cl, cldev->me_cl, NULL);
++ 	if (ret < 0)
++ 		dev_err(&cldev->dev, "cannot connect\n");
++ 
++ out:
++ 	mutex_unlock(&bus->device_lock);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_enable);
++ 
++ /**
++  * mei_cldev_disable - disable me client device
++  *     disconnect form the me client
++  *
++  * @cldev: me client device
++  *
++  * Return: 0 on success and < 0 on error
++  */
++ int mei_cldev_disable(struct mei_cl_device *cldev)
++ {
++ 	struct mei_device *bus;
++ 	struct mei_cl *cl;
++ 	int err;
++ 
++ 	if (!cldev || !cldev->cl)
++ 		return -ENODEV;
++ 
++ 	cl = cldev->cl;
++ 
++ 	bus = cldev->bus;
++ 
++ 	cldev->event_cb = NULL;
++ 
++ 	mutex_lock(&bus->device_lock);
++ 
++ 	if (!mei_cl_is_connected(cl)) {
++ 		dev_err(bus->dev, "Already disconnected");
++ 		err = 0;
++ 		goto out;
++ 	}
++ 
++ 	err = mei_cl_disconnect(cl);
++ 	if (err < 0)
++ 		dev_err(bus->dev, "Could not disconnect from the ME client");
++ 
++ out:
++ 	/* Flush queues and remove any pending read */
++ 	mei_cl_flush_queues(cl, NULL);
++ 	mei_cl_unlink(cl);
++ 
++ 	kfree(cl);
++ 	cldev->cl = NULL;
++ 
++ 	mutex_unlock(&bus->device_lock);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(mei_cldev_disable);
++ 
++ /**
++  * mei_cl_device_find - find matching entry in the driver id table
++  *
++  * @cldev: me client device
++  * @cldrv: me client driver
++  *
++  * Return: id on success; NULL if no id is matching
++  */
++ static const
++ struct mei_cl_device_id *mei_cl_device_find(struct mei_cl_device *cldev,
++ 					    struct mei_cl_driver *cldrv)
+++>>>>>>> df7f5447d7b5 (mei: bus: fix c&p issue in the kdoc)
+  {
+ +	struct mei_cl_device *device = to_mei_cl_device(dev);
+ +	struct mei_cl_driver *driver = to_mei_cl_driver(drv);
+  	const struct mei_cl_device_id *id;
+ -	const uuid_le *uuid;
+ -	u8 version;
+ -	bool match;
+ -
+ -	uuid = mei_me_cl_uuid(cldev->me_cl);
+ -	version = mei_me_cl_ver(cldev->me_cl);
+ -
+ -	id = cldrv->id_table;
+ -	while (uuid_le_cmp(NULL_UUID_LE, id->uuid)) {
+ -		if (!uuid_le_cmp(*uuid, id->uuid)) {
+ -			match = true;
+ -
+ -			if (cldev->name[0])
+ -				if (strncmp(cldev->name, id->name,
+ -					    sizeof(id->name)))
+ -					match = false;
+ -
+ -			if (id->version != MEI_CL_VERSION_ANY)
+ -				if (id->version != version)
+ -					match = false;
+ -			if (match)
+ -				return id;
+ -		}
+ -
+ -		id++;
+ -	}
+  
+ -	return NULL;
+ -}
+ -
+ -/**
+ - * mei_cl_device_match  - device match function
+ - *
+ - * @dev: device
+ - * @drv: driver
+ - *
+ - * Return:  1 if matching device was found 0 otherwise
+ - */
+ -static int mei_cl_device_match(struct device *dev, struct device_driver *drv)
+ -{
+ -	struct mei_cl_device *cldev = to_mei_cl_device(dev);
+ -	struct mei_cl_driver *cldrv = to_mei_cl_driver(drv);
+ -	const struct mei_cl_device_id *found_id;
+ -
+ -	if (!cldev)
+ +	if (!device)
+  		return 0;
+  
+ -	if (!cldev->do_match)
+ +	if (!driver || !driver->id_table)
+  		return 0;
+  
+ -	if (!cldrv || !cldrv->id_table)
+ -		return 0;
+ +	id = driver->id_table;
+  
+ -	found_id = mei_cl_device_find(cldev, cldrv);
+ -	if (found_id)
+ -		return 1;
+ +	while (id->name[0]) {
+ +		if (!strncmp(dev_name(dev), id->name, sizeof(id->name)))
+ +			return 1;
+ +
+ +		id++;
+ +	}
+  
+  	return 0;
+  }
+* Unmerged path drivers/misc/mei/bus.c
