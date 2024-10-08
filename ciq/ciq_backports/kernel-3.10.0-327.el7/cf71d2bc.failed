@@ -1,0 +1,220 @@
+sit: fix panic with route cache in ip tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit cf71d2bc0b8a473209d5c770ce560853bd720d14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cf71d2bc.failed
+
+Bug introduced by commit 7d442fab0a67 ("ipv4: Cache dst in tunnels").
+
+Because sit code does not call ip_tunnel_init(), the dst_cache was not
+initialized.
+
+CC: Tom Herbert <therbert@google.com>
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cf71d2bc0b8a473209d5c770ce560853bd720d14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+#	net/ipv6/sit.c
+diff --cc net/ipv4/ip_tunnel.c
+index 97e997263ac1,78a89e61925d..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -68,50 -68,57 +68,86 @@@ static unsigned int ip_tunnel_hash(stru
+  			 IP_TNL_HASH_BITS);
+  }
+  
+++<<<<<<< HEAD
+ +/* Often modified stats are per cpu, other are shared (netdev->stats) */
+ +struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+ +						struct rtnl_link_stats64 *tot)
+ +{
+ +	int i;
+ +
+ +	for_each_possible_cpu(i) {
+ +		const struct pcpu_tstats *tstats = per_cpu_ptr(dev->tstats, i);
+ +		u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
+ +		unsigned int start;
+++=======
++ static void __tunnel_dst_set(struct ip_tunnel_dst *idst,
++ 			     struct dst_entry *dst)
++ {
++ 	struct dst_entry *old_dst;
++ 
++ 	if (dst) {
++ 		if (dst->flags & DST_NOCACHE)
++ 			dst = NULL;
++ 		else
++ 			dst_clone(dst);
++ 	}
++ 	old_dst = xchg((__force struct dst_entry **)&idst->dst, dst);
++ 	dst_release(old_dst);
++ }
++ 
++ static void tunnel_dst_set(struct ip_tunnel *t, struct dst_entry *dst)
++ {
++ 	__tunnel_dst_set(this_cpu_ptr(t->dst_cache), dst);
++ }
++ 
++ static void tunnel_dst_reset(struct ip_tunnel *t)
++ {
++ 	tunnel_dst_set(t, NULL);
++ }
++ 
++ void ip_tunnel_dst_reset_all(struct ip_tunnel *t)
++ {
++ 	int i;
++ 
++ 	for_each_possible_cpu(i)
++ 		__tunnel_dst_set(per_cpu_ptr(t->dst_cache, i), NULL);
++ }
++ EXPORT_SYMBOL(ip_tunnel_dst_reset_all);
+++>>>>>>> cf71d2bc0b8a (sit: fix panic with route cache in ip tunnels)
+ +
+ +		do {
+ +			start = u64_stats_fetch_begin_bh(&tstats->syncp);
+ +			rx_packets = tstats->rx_packets;
+ +			tx_packets = tstats->tx_packets;
+ +			rx_bytes = tstats->rx_bytes;
+ +			tx_bytes = tstats->tx_bytes;
+ +		} while (u64_stats_fetch_retry_bh(&tstats->syncp, start));
+ +
+ +		tot->rx_packets += rx_packets;
+ +		tot->tx_packets += tx_packets;
+ +		tot->rx_bytes   += rx_bytes;
+ +		tot->tx_bytes   += tx_bytes;
+ +	}
+  
+ -static struct rtable *tunnel_rtable_get(struct ip_tunnel *t, u32 cookie)
+ -{
+ -	struct dst_entry *dst;
+ +	tot->multicast = dev->stats.multicast;
+  
+ -	rcu_read_lock();
+ -	dst = rcu_dereference(this_cpu_ptr(t->dst_cache)->dst);
+ -	if (dst) {
+ -		if (dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
+ -			rcu_read_unlock();
+ -			tunnel_dst_reset(t);
+ -			return NULL;
+ -		}
+ -		dst_hold(dst);
+ -	}
+ -	rcu_read_unlock();
+ -	return (struct rtable *)dst;
+ +	tot->rx_crc_errors = dev->stats.rx_crc_errors;
+ +	tot->rx_fifo_errors = dev->stats.rx_fifo_errors;
+ +	tot->rx_length_errors = dev->stats.rx_length_errors;
+ +	tot->rx_frame_errors = dev->stats.rx_frame_errors;
+ +	tot->rx_errors = dev->stats.rx_errors;
+ +
+ +	tot->tx_fifo_errors = dev->stats.tx_fifo_errors;
+ +	tot->tx_carrier_errors = dev->stats.tx_carrier_errors;
+ +	tot->tx_dropped = dev->stats.tx_dropped;
+ +	tot->tx_aborted_errors = dev->stats.tx_aborted_errors;
+ +	tot->tx_errors = dev->stats.tx_errors;
+ +
+ +	tot->collisions  = dev->stats.collisions;
+ +
+ +	return tot;
+  }
+ +EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
+  
+  static bool ip_tunnel_key_match(const struct ip_tunnel_parm *p,
+  				__be16 flags, __be32 key)
+@@@ -703,6 -714,7 +739,10 @@@ static void ip_tunnel_update(struct ip_
+  		if (set_mtu)
+  			dev->mtu = mtu;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	ip_tunnel_dst_reset_all(t);
+++>>>>>>> cf71d2bc0b8a (sit: fix panic with route cache in ip tunnels)
+  	netdev_state_change(dev);
+  }
+  
+@@@ -1027,6 -1042,8 +1067,11 @@@ void ip_tunnel_uninit(struct net_devic
+  	/* fb_tunnel_dev will be unregisted in net-exit call. */
+  	if (itn->fb_tunnel_dev != dev)
+  		ip_tunnel_del(netdev_priv(dev));
+++<<<<<<< HEAD
+++=======
++ 
++ 	ip_tunnel_dst_reset_all(tunnel);
+++>>>>>>> cf71d2bc0b8a (sit: fix panic with route cache in ip tunnels)
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_uninit);
+  
+diff --cc net/ipv6/sit.c
+index 04b859234833,b4d74c86586c..000000000000
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@@ -1287,6 -1376,18 +1294,21 @@@ static int ipip6_tunnel_init(struct net
+  	if (!dev->tstats)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	for_each_possible_cpu(i) {
++ 		struct pcpu_sw_netstats *ipip6_tunnel_stats;
++ 		ipip6_tunnel_stats = per_cpu_ptr(dev->tstats, i);
++ 		u64_stats_init(&ipip6_tunnel_stats->syncp);
++ 	}
++ 
++ 	tunnel->dst_cache = alloc_percpu(struct ip_tunnel_dst);
++ 	if (!tunnel->dst_cache) {
++ 		free_percpu(dev->tstats);
++ 		return -ENOMEM;
++ 	}
++ 
+++>>>>>>> cf71d2bc0b8a (sit: fix panic with route cache in ip tunnels)
+  	return 0;
+  }
+  
+@@@ -1306,9 -1408,22 +1328,25 @@@ static int __net_init ipip6_fb_tunnel_i
+  	iph->ihl		= 5;
+  	iph->ttl		= 64;
+  
+ -	dev->tstats = alloc_percpu(struct pcpu_sw_netstats);
+ +	dev->tstats = alloc_percpu(struct pcpu_tstats);
+  	if (!dev->tstats)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+++=======
++ 
++ 	for_each_possible_cpu(i) {
++ 		struct pcpu_sw_netstats *ipip6_fb_stats;
++ 		ipip6_fb_stats = per_cpu_ptr(dev->tstats, i);
++ 		u64_stats_init(&ipip6_fb_stats->syncp);
++ 	}
++ 
++ 	tunnel->dst_cache = alloc_percpu(struct ip_tunnel_dst);
++ 	if (!tunnel->dst_cache) {
++ 		free_percpu(dev->tstats);
++ 		return -ENOMEM;
++ 	}
++ 
+++>>>>>>> cf71d2bc0b8a (sit: fix panic with route cache in ip tunnels)
+  	dev_hold(dev);
+  	rcu_assign_pointer(sitn->tunnels_wc[0], tunnel);
+  	return 0;
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 8d95b01ba42b..6d4d648114db 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -135,6 +135,7 @@ int ip_tunnel_changelink(struct net_device *dev, struct nlattr *tb[],
+ int ip_tunnel_newlink(struct net_device *dev, struct nlattr *tb[],
+ 		      struct ip_tunnel_parm *p);
+ void ip_tunnel_setup(struct net_device *dev, int net_id);
++void ip_tunnel_dst_reset_all(struct ip_tunnel *t);
+ 
+ /* Extract dsfield from inner protocol */
+ static inline u8 ip_tunnel_get_dsfield(const struct iphdr *iph,
+* Unmerged path net/ipv4/ip_tunnel.c
+* Unmerged path net/ipv6/sit.c
