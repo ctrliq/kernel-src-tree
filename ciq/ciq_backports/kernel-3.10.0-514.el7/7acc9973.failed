@@ -1,0 +1,300 @@
+usb: phy: generic: add vbus support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Robert Jarzmik <robert.jarzmik@free.fr>
+commit 7acc9973e3c42de9926b28eec8ae3434dfdde3be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7acc9973.failed
+
+Add support for vbus detection and power supply. This code is more or
+less stolen from phy-gpio-vbus-usb.c, and aims at providing a detection
+mechanism for VBus (ie. usb cable plug) based on a GPIO line, and a
+power supply activation which draws current from the VBus.
+
+[ balbi@ti.com : fix build break ]
+
+	Signed-off-by: Robert Jarzmik <robert.jarzmik@free.fr>
+	Signed-off-by: Felipe Balbi <balbi@ti.com>
+(cherry picked from commit 7acc9973e3c42de9926b28eec8ae3434dfdde3be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/phy/phy-generic.h
+#	drivers/usb/phy/phy-nop.c
+diff --cc drivers/usb/phy/phy-nop.c
+index 638cc5dade35,dd05254241fb..000000000000
+--- a/drivers/usb/phy/phy-nop.c
++++ b/drivers/usb/phy/phy-nop.c
+@@@ -29,50 -27,119 +29,138 @@@
+  #include <linux/module.h>
+  #include <linux/platform_device.h>
+  #include <linux/dma-mapping.h>
++ #include <linux/usb/gadget.h>
+  #include <linux/usb/otg.h>
+ -#include <linux/usb/usb_phy_generic.h>
+ +#include <linux/usb/nop-usb-xceiv.h>
+  #include <linux/slab.h>
+  #include <linux/clk.h>
+  #include <linux/regulator/consumer.h>
+  #include <linux/of.h>
+ -#include <linux/of_gpio.h>
+ -#include <linux/gpio.h>
+ -#include <linux/delay.h>
+  
+ -#include "phy-generic.h"
+ +struct nop_usb_xceiv {
+ +	struct usb_phy phy;
+ +	struct device *dev;
+ +	struct clk *clk;
+ +	struct regulator *vcc;
+ +	struct regulator *reset;
+ +};
+ +
+++<<<<<<< HEAD:drivers/usb/phy/phy-nop.c
+ +static struct platform_device *pd;
+  
+ +void usb_nop_xceiv_register(void)
+++=======
++ #define VBUS_IRQ_FLAGS \
++ 	(IRQF_SHARED | IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING)
++ 
++ struct platform_device *usb_phy_generic_register(void)
+++>>>>>>> 7acc9973e3c4 (usb: phy: generic: add vbus support):drivers/usb/phy/phy-generic.c
+  {
+ -	return platform_device_register_simple("usb_phy_generic",
+ -			PLATFORM_DEVID_AUTO, NULL, 0);
+ +	if (pd)
+ +		return;
+ +	pd = platform_device_register_simple("nop_usb_xceiv", -1, NULL, 0);
+ +	if (!pd) {
+ +		printk(KERN_ERR "Unable to register usb nop transceiver\n");
+ +		return;
+ +	}
+  }
+ -EXPORT_SYMBOL_GPL(usb_phy_generic_register);
+ +EXPORT_SYMBOL(usb_nop_xceiv_register);
+  
+ -void usb_phy_generic_unregister(struct platform_device *pdev)
+ +void usb_nop_xceiv_unregister(void)
+  {
+ -	platform_device_unregister(pdev);
+ +	platform_device_unregister(pd);
+ +	pd = NULL;
+  }
+ -EXPORT_SYMBOL_GPL(usb_phy_generic_unregister);
+ +EXPORT_SYMBOL(usb_nop_xceiv_unregister);
+  
+  static int nop_set_suspend(struct usb_phy *x, int suspend)
+  {
+  	return 0;
+  }
+  
+ -static void nop_reset_set(struct usb_phy_generic *nop, int asserted)
+ +static int nop_init(struct usb_phy *phy)
+  {
+++<<<<<<< HEAD:drivers/usb/phy/phy-nop.c
+ +	struct nop_usb_xceiv *nop = dev_get_drvdata(phy->dev);
+++=======
++ 	if (nop->gpiod_reset)
++ 		gpiod_set_value(nop->gpiod_reset, asserted);
++ 
++ 	if (!asserted)
++ 		usleep_range(10000, 20000);
++ }
++ 
++ /* interface to regulator framework */
++ static void nop_set_vbus_draw(struct usb_phy_generic *nop, unsigned mA)
++ {
++ 	struct regulator *vbus_draw = nop->vbus_draw;
++ 	int enabled;
++ 	int ret;
++ 
++ 	if (!vbus_draw)
++ 		return;
++ 
++ 	enabled = nop->vbus_draw_enabled;
++ 	if (mA) {
++ 		regulator_set_current_limit(vbus_draw, 0, 1000 * mA);
++ 		if (!enabled) {
++ 			ret = regulator_enable(vbus_draw);
++ 			if (ret < 0)
++ 				return;
++ 			nop->vbus_draw_enabled = 1;
++ 		}
++ 	} else {
++ 		if (enabled) {
++ 			ret = regulator_disable(vbus_draw);
++ 			if (ret < 0)
++ 				return;
++ 			nop->vbus_draw_enabled = 0;
++ 		}
++ 	}
++ 	nop->mA = mA;
++ }
++ 
++ 
++ static irqreturn_t nop_gpio_vbus_thread(int irq, void *data)
++ {
++ 	struct usb_phy_generic *nop = data;
++ 	struct usb_otg *otg = nop->phy.otg;
++ 	int vbus, status;
++ 
++ 	vbus = gpiod_get_value(nop->gpiod_vbus);
++ 	if ((vbus ^ nop->vbus) == 0)
++ 		return IRQ_HANDLED;
++ 	nop->vbus = vbus;
++ 
++ 	if (vbus) {
++ 		status = USB_EVENT_VBUS;
++ 		otg->state = OTG_STATE_B_PERIPHERAL;
++ 		nop->phy.last_event = status;
++ 		usb_gadget_vbus_connect(otg->gadget);
++ 
++ 		/* drawing a "unit load" is *always* OK, except for OTG */
++ 		nop_set_vbus_draw(nop, 100);
++ 
++ 		atomic_notifier_call_chain(&nop->phy.notifier, status,
++ 					   otg->gadget);
++ 	} else {
++ 		nop_set_vbus_draw(nop, 0);
++ 
++ 		usb_gadget_vbus_disconnect(otg->gadget);
++ 		status = USB_EVENT_NONE;
++ 		otg->state = OTG_STATE_B_IDLE;
++ 		nop->phy.last_event = status;
++ 
++ 		atomic_notifier_call_chain(&nop->phy.notifier, status,
++ 					   otg->gadget);
++ 	}
++ 	return IRQ_HANDLED;
++ }
++ 
++ int usb_gen_phy_init(struct usb_phy *phy)
++ {
++ 	struct usb_phy_generic *nop = dev_get_drvdata(phy->dev);
+++>>>>>>> 7acc9973e3c4 (usb: phy: generic: add vbus support):drivers/usb/phy/phy-generic.c
+  
+  	if (!IS_ERR(nop->vcc)) {
+  		if (regulator_enable(nop->vcc))
+@@@ -166,18 -218,42 +254,39 @@@ static int nop_usb_xceiv_probe(struct p
+  			clk_rate = 0;
+  
+  		needs_vcc = of_property_read_bool(node, "vcc-supply");
+++<<<<<<< HEAD:drivers/usb/phy/phy-nop.c
+ +		needs_reset = of_property_read_bool(node, "reset-supply");
+ +
+++=======
++ 		nop->gpiod_reset = devm_gpiod_get(dev, "reset-gpios");
++ 		err = PTR_ERR(nop->gpiod_reset);
++ 		if (!err) {
++ 			nop->gpiod_vbus = devm_gpiod_get(dev,
++ 							 "vbus-detect-gpio");
++ 			err = PTR_ERR(nop->gpiod_vbus);
++ 		}
+++>>>>>>> 7acc9973e3c4 (usb: phy: generic: add vbus support):drivers/usb/phy/phy-generic.c
+  	} else if (pdata) {
+  		type = pdata->type;
+  		clk_rate = pdata->clk_rate;
+  		needs_vcc = pdata->needs_vcc;
+++<<<<<<< HEAD:drivers/usb/phy/phy-nop.c
+ +		needs_reset = pdata->needs_reset;
+++=======
++ 		if (gpio_is_valid(pdata->gpio_reset)) {
++ 			err = devm_gpio_request_one(dev, pdata->gpio_reset, 0,
++ 						    dev_name(dev));
++ 			if (!err)
++ 				nop->gpiod_reset =
++ 					gpio_to_desc(pdata->gpio_reset);
++ 		}
++ 		nop->gpiod_vbus = pdata->gpiod_vbus;
+++>>>>>>> 7acc9973e3c4 (usb: phy: generic: add vbus support):drivers/usb/phy/phy-generic.c
+  	}
+  
+ -	if (err == -EPROBE_DEFER)
+ -		return -EPROBE_DEFER;
+ -	if (err) {
+ -		dev_err(dev, "Error requesting RESET GPIO\n");
+ -		return err;
+ -	}
+ -
+ -	nop->phy.otg = devm_kzalloc(dev, sizeof(*nop->phy.otg),
+ -			GFP_KERNEL);
+ -	if (!nop->phy.otg)
+ -		return -ENOMEM;
+ -
+ -	nop->clk = devm_clk_get(dev, "main_clk");
+ +	nop->clk = devm_clk_get(&pdev->dev, "main_clk");
+  	if (IS_ERR(nop->clk)) {
+ -		dev_dbg(dev, "Can't get phy clock: %ld\n",
+ +		dev_dbg(&pdev->dev, "Can't get phy clock: %ld\n",
+  					PTR_ERR(nop->clk));
+  	}
+  
+@@@ -226,6 -284,39 +335,42 @@@
+  	nop->phy.otg->set_host		= nop_set_host;
+  	nop->phy.otg->set_peripheral	= nop_set_peripheral;
+  
+++<<<<<<< HEAD:drivers/usb/phy/phy-nop.c
+++=======
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(usb_phy_gen_create_phy);
++ 
++ static int usb_phy_generic_probe(struct platform_device *pdev)
++ {
++ 	struct device *dev = &pdev->dev;
++ 	struct usb_phy_generic	*nop;
++ 	int err;
++ 
++ 	nop = devm_kzalloc(dev, sizeof(*nop), GFP_KERNEL);
++ 	if (!nop)
++ 		return -ENOMEM;
++ 
++ 	err = usb_phy_gen_create_phy(dev, nop, dev_get_platdata(&pdev->dev));
++ 	if (err)
++ 		return err;
++ 	if (nop->gpiod_vbus) {
++ 		err = devm_request_threaded_irq(&pdev->dev,
++ 						gpiod_to_irq(nop->gpiod_vbus),
++ 						NULL, nop_gpio_vbus_thread,
++ 						VBUS_IRQ_FLAGS, "vbus_detect",
++ 						nop);
++ 		if (err) {
++ 			dev_err(&pdev->dev, "can't request irq %i, err: %d\n",
++ 				gpiod_to_irq(nop->gpiod_vbus), err);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	nop->phy.init		= usb_gen_phy_init;
++ 	nop->phy.shutdown	= usb_gen_phy_shutdown;
++ 
+++>>>>>>> 7acc9973e3c4 (usb: phy: generic: add vbus support):drivers/usb/phy/phy-generic.c
+  	err = usb_add_phy_dev(&nop->phy);
+  	if (err) {
+  		dev_err(&pdev->dev, "can't register transceiver, err: %d\n",
+* Unmerged path drivers/usb/phy/phy-generic.h
+* Unmerged path drivers/usb/phy/phy-generic.h
+* Unmerged path drivers/usb/phy/phy-nop.c
+diff --git a/include/linux/usb/nop-usb-xceiv.h b/include/linux/usb/nop-usb-xceiv.h
+index 200df93c4837..28fe49dbcbfc 100644
+--- a/include/linux/usb/nop-usb-xceiv.h
++++ b/include/linux/usb/nop-usb-xceiv.h
+@@ -2,6 +2,7 @@
+ #define __LINUX_USB_NOP_XCEIV_H
+ 
+ #include <linux/usb/otg.h>
++#include <linux/gpio/consumer.h>
+ 
+ struct nop_usb_xceiv_platform_data {
+ 	enum usb_phy_type type;
+@@ -11,6 +12,7 @@ struct nop_usb_xceiv_platform_data {
+ 	unsigned int needs_vcc:1;
+ 	unsigned int needs_reset:1;	/* deprecated */
+ 	int gpio_reset;
++	struct gpio_desc *gpiod_vbus;
+ };
+ 
+ #if IS_ENABLED(CONFIG_NOP_USB_XCEIV)
