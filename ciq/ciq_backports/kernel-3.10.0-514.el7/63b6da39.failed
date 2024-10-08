@@ -1,0 +1,427 @@
+perf: Fix perf_event_exit_task() race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 63b6da39bb38e8f1a1ef3180d32a39d6baf9da84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/63b6da39.failed
+
+There is a race against perf_event_exit_task() vs
+event_function_call(),find_get_context(),perf_install_in_context()
+(iow, everyone).
+
+Since there is no permanent marker on a context that its dead, it is
+quite possible that we access (and even modify) a context after its
+passed through perf_event_exit_task().
+
+For instance, find_get_context() might find the context still
+installed, but by the time we get to perf_install_in_context() it
+might already have passed through perf_event_exit_task() and be
+considered dead, we will however still add the event to it.
+
+Solve this by marking a ctx dead by setting its ctx->task value to -1,
+it must be !0 so we still know its a (former) task context.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 63b6da39bb38e8f1a1ef3180d32a39d6baf9da84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 9892cf39a4f2,9de4d352ba8c..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -124,13 -126,143 +124,153 @@@ static int cpu_function_call(int cpu, r
+  	return data.ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void event_function_call(struct perf_event *event,
+ +				int (*active)(void *),
+ +				void (*inactive)(void *),
+ +				void *data)
+ +{
+ +	struct perf_event_context *ctx = event->ctx;
+ +	struct task_struct *task = ctx->task;
+++=======
++ static inline struct perf_cpu_context *
++ __get_cpu_context(struct perf_event_context *ctx)
++ {
++ 	return this_cpu_ptr(ctx->pmu->pmu_cpu_context);
++ }
++ 
++ static void perf_ctx_lock(struct perf_cpu_context *cpuctx,
++ 			  struct perf_event_context *ctx)
++ {
++ 	raw_spin_lock(&cpuctx->ctx.lock);
++ 	if (ctx)
++ 		raw_spin_lock(&ctx->lock);
++ }
++ 
++ static void perf_ctx_unlock(struct perf_cpu_context *cpuctx,
++ 			    struct perf_event_context *ctx)
++ {
++ 	if (ctx)
++ 		raw_spin_unlock(&ctx->lock);
++ 	raw_spin_unlock(&cpuctx->ctx.lock);
++ }
++ 
++ #define TASK_TOMBSTONE ((void *)-1L)
++ 
++ static bool is_kernel_event(struct perf_event *event)
++ {
++ 	return event->owner == TASK_TOMBSTONE;
++ }
++ 
++ /*
++  * On task ctx scheduling...
++  *
++  * When !ctx->nr_events a task context will not be scheduled. This means
++  * we can disable the scheduler hooks (for performance) without leaving
++  * pending task ctx state.
++  *
++  * This however results in two special cases:
++  *
++  *  - removing the last event from a task ctx; this is relatively straight
++  *    forward and is done in __perf_remove_from_context.
++  *
++  *  - adding the first event to a task ctx; this is tricky because we cannot
++  *    rely on ctx->is_active and therefore cannot use event_function_call().
++  *    See perf_install_in_context().
++  *
++  * This is because we need a ctx->lock serialized variable (ctx->is_active)
++  * to reliably determine if a particular task/context is scheduled in. The
++  * task_curr() use in task_function_call() is racy in that a remote context
++  * switch is not a single atomic operation.
++  *
++  * As is, the situation is 'safe' because we set rq->curr before we do the
++  * actual context switch. This means that task_curr() will fail early, but
++  * we'll continue spinning on ctx->is_active until we've passed
++  * perf_event_task_sched_out().
++  *
++  * Without this ctx->lock serialized variable we could have race where we find
++  * the task (and hence the context) would not be active while in fact they are.
++  *
++  * If ctx->nr_events, then ctx->is_active and cpuctx->task_ctx are set.
++  */
++ 
++ typedef void (*event_f)(struct perf_event *, struct perf_cpu_context *,
++ 			struct perf_event_context *, void *);
++ 
++ struct event_function_struct {
++ 	struct perf_event *event;
++ 	event_f func;
++ 	void *data;
++ };
++ 
++ static int event_function(void *info)
++ {
++ 	struct event_function_struct *efs = info;
++ 	struct perf_event *event = efs->event;
++ 	struct perf_event_context *ctx = event->ctx;
++ 	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
++ 	struct perf_event_context *task_ctx = cpuctx->task_ctx;
++ 	int ret = 0;
++ 
++ 	WARN_ON_ONCE(!irqs_disabled());
++ 
++ 	perf_ctx_lock(cpuctx, task_ctx);
++ 	/*
++ 	 * Since we do the IPI call without holding ctx->lock things can have
++ 	 * changed, double check we hit the task we set out to hit.
++ 	 */
++ 	if (ctx->task) {
++ 		if (ctx->task != current) {
++ 			ret = -EAGAIN;
++ 			goto unlock;
++ 		}
++ 
++ 		/*
++ 		 * We only use event_function_call() on established contexts,
++ 		 * and event_function() is only ever called when active (or
++ 		 * rather, we'll have bailed in task_function_call() or the
++ 		 * above ctx->task != current test), therefore we must have
++ 		 * ctx->is_active here.
++ 		 */
++ 		WARN_ON_ONCE(!ctx->is_active);
++ 		/*
++ 		 * And since we have ctx->is_active, cpuctx->task_ctx must
++ 		 * match.
++ 		 */
++ 		WARN_ON_ONCE(task_ctx != ctx);
++ 	} else {
++ 		WARN_ON_ONCE(&cpuctx->ctx != ctx);
++ 	}
++ 
++ 	efs->func(event, cpuctx, ctx, efs->data);
++ unlock:
++ 	perf_ctx_unlock(cpuctx, task_ctx);
++ 
++ 	return ret;
++ }
++ 
++ static void event_function_local(struct perf_event *event, event_f func, void *data)
++ {
++ 	struct event_function_struct efs = {
++ 		.event = event,
++ 		.func = func,
++ 		.data = data,
++ 	};
++ 
++ 	int ret = event_function(&efs);
++ 	WARN_ON_ONCE(ret);
++ }
++ 
++ static void event_function_call(struct perf_event *event, event_f func, void *data)
++ {
++ 	struct perf_event_context *ctx = event->ctx;
++ 	struct task_struct *task = READ_ONCE(ctx->task); /* verified in event_function */
++ 	struct event_function_struct efs = {
++ 		.event = event,
++ 		.func = func,
++ 		.data = data,
++ 	};
+++>>>>>>> 63b6da39bb38 (perf: Fix perf_event_exit_task() race)
+  
+  	if (!event->parent) {
+  		/*
+@@@ -147,20 -279,25 +287,33 @@@
+  	}
+  
+  again:
+++<<<<<<< HEAD
+ +	if (!task_function_call(task, active, data))
+++=======
++ 	if (task == TASK_TOMBSTONE)
++ 		return;
++ 
++ 	if (!task_function_call(task, event_function, &efs))
+++>>>>>>> 63b6da39bb38 (perf: Fix perf_event_exit_task() race)
+  		return;
+  
+  	raw_spin_lock_irq(&ctx->lock);
+- 	if (ctx->is_active) {
+- 		/*
+- 		 * Reload the task pointer, it might have been changed by
+- 		 * a concurrent perf_event_context_sched_out().
+- 		 */
+- 		task = ctx->task;
+- 		raw_spin_unlock_irq(&ctx->lock);
+- 		goto again;
++ 	/*
++ 	 * Reload the task pointer, it might have been changed by
++ 	 * a concurrent perf_event_context_sched_out().
++ 	 */
++ 	task = ctx->task;
++ 	if (task != TASK_TOMBSTONE) {
++ 		if (ctx->is_active) {
++ 			raw_spin_unlock_irq(&ctx->lock);
++ 			goto again;
++ 		}
++ 		func(event, NULL, ctx, data);
+  	}
+++<<<<<<< HEAD
+ +	inactive(data);
+++=======
+++>>>>>>> 63b6da39bb38 (perf: Fix perf_event_exit_task() race)
+  	raw_spin_unlock_irq(&ctx->lock);
+  }
+  
+@@@ -2048,55 -2139,31 +2198,79 @@@ static void ___perf_install_in_context(
+   */
+  static int  __perf_install_in_context(void *info)
+  {
+ -	struct perf_event_context *ctx = info;
+ +	struct perf_event *event = info;
+ +	struct perf_event_context *ctx = event->ctx;
+  	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
+  	struct perf_event_context *task_ctx = cpuctx->task_ctx;
+ +	struct task_struct *task = current;
+ +
+++<<<<<<< HEAD
+ +	perf_ctx_lock(cpuctx, task_ctx);
+ +	perf_pmu_disable(cpuctx->ctx.pmu);
+ +
+ +	/*
+ +	 * If there was an active task_ctx schedule it out.
+ +	 */
+ +	if (task_ctx)
+ +		task_ctx_sched_out(task_ctx);
+ +
+ +	/*
+ +	 * If the context we're installing events in is not the
+ +	 * active task_ctx, flip them.
+ +	 */
+ +	if (ctx->task && task_ctx != ctx) {
+ +		if (task_ctx)
+ +			raw_spin_unlock(&task_ctx->lock);
+ +		raw_spin_lock(&ctx->lock);
+ +		task_ctx = ctx;
+ +	}
+ +
+ +	if (task_ctx) {
+ +		cpuctx->task_ctx = task_ctx;
+ +		task = task_ctx->task;
+ +	}
+ +
+ +	cpu_ctx_sched_out(cpuctx, EVENT_ALL);
+ +
+ +	update_context_time(ctx);
+ +	/*
+ +	 * update cgrp time only if current cgrp
+ +	 * matches event->cgrp. Must be done before
+ +	 * calling add_event_to_ctx()
+ +	 */
+ +	update_cgrp_time_from_event(event);
+ +
+ +	add_event_to_ctx(event, ctx);
+ +
+ +	/*
+ +	 * Schedule everything back in
+ +	 */
+ +	perf_event_sched_in(cpuctx, task_ctx, task);
+  
+ +	perf_pmu_enable(cpuctx->ctx.pmu);
+++=======
++ 	raw_spin_lock(&cpuctx->ctx.lock);
++ 	if (ctx->task) {
++ 		raw_spin_lock(&ctx->lock);
++ 		/*
++ 		 * If we hit the 'wrong' task, we've since scheduled and
++ 		 * everything should be sorted, nothing to do!
++ 		 */
++ 		task_ctx = ctx;
++ 		if (ctx->task != current)
++ 			goto unlock;
++ 
++ 		/*
++ 		 * If task_ctx is set, it had better be to us.
++ 		 */
++ 		WARN_ON_ONCE(cpuctx->task_ctx != ctx && cpuctx->task_ctx);
++ 	} else if (task_ctx) {
++ 		raw_spin_lock(&task_ctx->lock);
++ 	}
++ 
++ 	ctx_resched(cpuctx, task_ctx);
++ unlock:
+++>>>>>>> 63b6da39bb38 (perf: Fix perf_event_exit_task() race)
+  	perf_ctx_unlock(cpuctx, task_ctx);
+  
+  	return 0;
+@@@ -2116,8 -2185,40 +2290,45 @@@ perf_install_in_context(struct perf_eve
+  	if (event->cpu != -1)
+  		event->cpu = cpu;
+  
+++<<<<<<< HEAD
+ +	event_function_call(event, __perf_install_in_context,
+ +			    ___perf_install_in_context, event);
+++=======
++ 	/*
++ 	 * Installing events is tricky because we cannot rely on ctx->is_active
++ 	 * to be set in case this is the nr_events 0 -> 1 transition.
++ 	 *
++ 	 * So what we do is we add the event to the list here, which will allow
++ 	 * a future context switch to DTRT and then send a racy IPI. If the IPI
++ 	 * fails to hit the right task, this means a context switch must have
++ 	 * happened and that will have taken care of business.
++ 	 */
++ 	raw_spin_lock_irq(&ctx->lock);
++ 	task = ctx->task;
++ 	/*
++ 	 * Worse, we cannot even rely on the ctx actually existing anymore. If
++ 	 * between find_get_context() and perf_install_in_context() the task
++ 	 * went through perf_event_exit_task() its dead and we should not be
++ 	 * adding new events.
++ 	 */
++ 	if (task == TASK_TOMBSTONE) {
++ 		raw_spin_unlock_irq(&ctx->lock);
++ 		return;
++ 	}
++ 	update_context_time(ctx);
++ 	/*
++ 	 * Update cgrp time only if current cgrp matches event->cgrp.
++ 	 * Must be done before calling add_event_to_ctx().
++ 	 */
++ 	update_cgrp_time_from_event(event);
++ 	add_event_to_ctx(event, ctx);
++ 	raw_spin_unlock_irq(&ctx->lock);
++ 
++ 	if (task)
++ 		task_function_call(task, __perf_install_in_context, ctx);
++ 	else
++ 		cpu_function_call(cpu, __perf_install_in_context, ctx);
+++>>>>>>> 63b6da39bb38 (perf: Fix perf_event_exit_task() race)
+  }
+  
+  /*
+@@@ -7958,8 -8566,10 +8173,8 @@@ perf_event_create_kernel_counter(struc
+  	}
+  
+  	/* Mark owner so we could distinguish it from user events. */
+- 	event->owner = EVENT_OWNER_KERNEL;
++ 	event->owner = TASK_TOMBSTONE;
+  
+ -	account_event(event);
+ -
+  	ctx = find_get_context(event->pmu, task, event);
+  	if (IS_ERR(ctx)) {
+  		err = PTR_ERR(ctx);
+@@@ -8128,28 -8746,26 +8343,32 @@@ __perf_event_exit_task(struct perf_even
+  
+  static void perf_event_exit_task_context(struct task_struct *child, int ctxn)
+  {
+- 	struct perf_event *child_event, *next;
+  	struct perf_event_context *child_ctx, *clone_ctx = NULL;
++ 	struct perf_event *child_event, *next;
++ 	unsigned long flags;
++ 
++ 	WARN_ON_ONCE(child != current);
+  
+- 	if (likely(!child->perf_event_ctxp[ctxn]))
++ 	child_ctx = perf_lock_task_context(child, ctxn, &flags);
++ 	if (!child_ctx)
+  		return;
+  
+- 	local_irq_disable();
+- 	WARN_ON_ONCE(child != current);
+- 	/*
+- 	 * We can't reschedule here because interrupts are disabled,
+- 	 * and child must be current.
+- 	 */
+- 	child_ctx = rcu_dereference_raw(child->perf_event_ctxp[ctxn]);
++ 	task_ctx_sched_out(__get_cpu_context(child_ctx), child_ctx);
+  
+  	/*
+- 	 * Take the context lock here so that if find_get_context is
+- 	 * reading child->perf_event_ctxp, we wait until it has
+- 	 * incremented the context's refcount before we do put_ctx below.
++ 	 * Now that the context is inactive, destroy the task <-> ctx relation
++ 	 * and mark the context dead.
+  	 */
+++<<<<<<< HEAD
+ +	raw_spin_lock(&child_ctx->lock);
+ +	task_ctx_sched_out(child_ctx);
+ +	child->perf_event_ctxp[ctxn] = NULL;
+++=======
++ 	RCU_INIT_POINTER(child->perf_event_ctxp[ctxn], NULL);
++ 	put_ctx(child_ctx); /* cannot be last */
++ 	WRITE_ONCE(child_ctx->task, TASK_TOMBSTONE);
++ 	put_task_struct(current); /* cannot be last */
+++>>>>>>> 63b6da39bb38 (perf: Fix perf_event_exit_task() race)
+  
+  	/*
+  	 * If this context is a clone; unclone it so it can't get
+* Unmerged path kernel/events/core.c
