@@ -1,0 +1,72 @@
+NVMe: fix race condition in nvme_submit_sync_cmd()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 849c6e7746e4f6317ace6aa7d2fcdcd844e99ddb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/849c6e77.failed
+
+If we have a race between the schedule timing out and the command
+completing, we could have the task issuing the command exit
+nvme_submit_sync_cmd() while the irq is running sync_completion().
+If that happens, we could be corrupting memory, since the stack
+that held 'cmdinfo' is no longer valid.
+
+Fix this by always calling nvme_abort_cmd_info(). Once that call
+completes, we know that we have either run sync_completion() if
+the completion came in, or that we will never run it since we now
+have special_completion() as the command callback handler.
+
+	Acked-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 849c6e7746e4f6317ace6aa7d2fcdcd844e99ddb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 48e1152870d9,b1d5d8797315..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1031,22 -801,22 +1031,36 @@@ static int nvme_submit_sync_cmd(struct 
+  	set_current_state(TASK_KILLABLE);
+  	ret = nvme_submit_cmd(nvmeq, cmd);
+  	if (ret) {
+ -		nvme_finish_cmd(nvmeq, req->tag, NULL);
+ +		free_cmdid(nvmeq, cmdid, NULL);
+ +		unlock_nvmeq(nvmeq);
+  		set_current_state(TASK_RUNNING);
+ +		return ret;
+  	}
+++<<<<<<< HEAD
+ +	unlock_nvmeq(nvmeq);
+ +	schedule_timeout(timeout);
+ +
+ +	if (cmdinfo.status == -EINTR) {
+ +		nvmeq = lock_nvmeq(dev, q_idx);
+ +		if (nvmeq) {
+ +			nvme_abort_command(nvmeq, cmdid);
+ +			unlock_nvmeq(nvmeq);
+ +		}
+++=======
++ 	ret = schedule_timeout(timeout);
++ 
++ 	/*
++ 	 * Ensure that sync_completion has either run, or that it will
++ 	 * never run.
++ 	 */
++ 	nvme_abort_cmd_info(nvmeq, blk_mq_rq_to_pdu(req));
++ 
++ 	/*
++ 	 * We never got the completion
++ 	 */
++ 	if (cmdinfo.status == -EINTR)
+++>>>>>>> 849c6e7746e4 (NVMe: fix race condition in nvme_submit_sync_cmd())
+  		return -EINTR;
+- 	}
+  
+  	if (result)
+  		*result = cmdinfo.result;
+* Unmerged path drivers/block/nvme-core.c
