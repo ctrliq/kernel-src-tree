@@ -1,0 +1,174 @@
+AHCI: Move ahci_host_activate() function to libahci.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Gordeev <agordeev@redhat.com>
+commit 1c62854f5f7321b3ee8c08d34d7c1e615608566d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1c62854f.failed
+
+This update is a prerequisite for consolidation of
+AHCI host activation code within ahci_host_activate()
+function.
+
+	Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Cc: linux-ide@vger.kernel.org
+(cherry picked from commit 1c62854f5f7321b3ee8c08d34d7c1e615608566d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/ahci.c
+diff --cc drivers/ata/ahci.c
+index 2fc38f7d1744,0b2160457046..000000000000
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@@ -1162,71 -1226,6 +1162,74 @@@ intx
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + *	ahci_host_activate - start AHCI host, request IRQs and register it
+ + *	@host: target ATA host
+ + *	@irq: base IRQ number to request
+ + *	@n_msis: number of MSIs allocated for this host
+ + *	@irq_handler: irq_handler used when requesting IRQs
+ + *	@irq_flags: irq_flags used when requesting IRQs
+ + *
+ + *	Similar to ata_host_activate, but requests IRQs according to AHCI-1.1
+ + *	when multiple MSIs were allocated. That is one MSI per port, starting
+ + *	from @irq.
+ + *
+ + *	LOCKING:
+ + *	Inherited from calling layer (may sleep).
+ + *
+ + *	RETURNS:
+ + *	0 on success, -errno otherwise.
+ + */
+ +int ahci_host_activate(struct ata_host *host, int irq, unsigned int n_msis)
+ +{
+ +	int i, rc;
+ +
+ +	/* Sharing Last Message among several ports is not supported */
+ +	if (n_msis < host->n_ports)
+ +		return -EINVAL;
+ +
+ +	rc = ata_host_start(host);
+ +	if (rc)
+ +		return rc;
+ +
+ +	for (i = 0; i < host->n_ports; i++) {
+ +		struct ahci_port_priv *pp = host->ports[i]->private_data;
+ +
+ +		/* Do not receive interrupts sent by dummy ports */
+ +		if (!pp) {
+ +			disable_irq(irq + i);
+ +			continue;
+ +		}
+ +
+ +		rc = devm_request_threaded_irq(host->dev, irq + i,
+ +					       ahci_hw_interrupt,
+ +					       ahci_thread_fn, IRQF_SHARED,
+ +					       pp->irq_desc, host->ports[i]);
+ +		if (rc)
+ +			goto out_free_irqs;
+ +	}
+ +
+ +	for (i = 0; i < host->n_ports; i++)
+ +		ata_port_desc(host->ports[i], "irq %d", irq + i);
+ +
+ +	rc = ata_host_register(host, &ahci_sht);
+ +	if (rc)
+ +		goto out_free_all_irqs;
+ +
+ +	return 0;
+ +
+ +out_free_all_irqs:
+ +	i = host->n_ports;
+ +out_free_irqs:
+ +	for (i--; i >= 0; i--)
+ +		devm_free_irq(host->dev, irq + i, host->ports[i]);
+ +
+ +	return rc;
+ +}
+ +
+++=======
+++>>>>>>> 1c62854f5f73 (AHCI: Move ahci_host_activate() function to libahci.c)
+  static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+  {
+  	unsigned int board_id = ent->driver_data;
+* Unmerged path drivers/ata/ahci.c
+diff --git a/drivers/ata/libahci.c b/drivers/ata/libahci.c
+index 198a9d07a8bc..117816acbada 100644
+--- a/drivers/ata/libahci.c
++++ b/drivers/ata/libahci.c
+@@ -2458,6 +2458,67 @@ void ahci_set_em_messages(struct ahci_host_priv *hpriv,
+ }
+ EXPORT_SYMBOL_GPL(ahci_set_em_messages);
+ 
++/**
++ *	ahci_host_activate - start AHCI host, request IRQs and register it
++ *	@host: target ATA host
++ *	@irq: base IRQ number to request
++ *	@sht: scsi_host_template to use when registering the host
++ *
++ *	Similar to ata_host_activate, but requests IRQs according to AHCI-1.1
++ *	when multiple MSIs were allocated. That is one MSI per port, starting
++ *	from @irq.
++ *
++ *	LOCKING:
++ *	Inherited from calling layer (may sleep).
++ *
++ *	RETURNS:
++ *	0 on success, -errno otherwise.
++ */
++int ahci_host_activate(struct ata_host *host, int irq,
++		       struct scsi_host_template *sht)
++{
++	int i, rc;
++
++	rc = ata_host_start(host);
++	if (rc)
++		return rc;
++
++	for (i = 0; i < host->n_ports; i++) {
++		struct ahci_port_priv *pp = host->ports[i]->private_data;
++
++		/* Do not receive interrupts sent by dummy ports */
++		if (!pp) {
++			disable_irq(irq + i);
++			continue;
++		}
++
++		rc = devm_request_threaded_irq(host->dev, irq + i,
++					       ahci_hw_interrupt,
++					       ahci_thread_fn, IRQF_SHARED,
++					       pp->irq_desc, host->ports[i]);
++		if (rc)
++			goto out_free_irqs;
++	}
++
++	for (i = 0; i < host->n_ports; i++)
++		ata_port_desc(host->ports[i], "irq %d", irq + i);
++
++	rc = ata_host_register(host, sht);
++	if (rc)
++		goto out_free_all_irqs;
++
++	return 0;
++
++out_free_all_irqs:
++	i = host->n_ports;
++out_free_irqs:
++	for (i--; i >= 0; i--)
++		devm_free_irq(host->dev, irq + i, host->ports[i]);
++
++	return rc;
++}
++EXPORT_SYMBOL_GPL(ahci_host_activate);
++
+ MODULE_AUTHOR("Jeff Garzik");
+ MODULE_DESCRIPTION("Common AHCI SATA low-level routines");
+ MODULE_LICENSE("GPL");
