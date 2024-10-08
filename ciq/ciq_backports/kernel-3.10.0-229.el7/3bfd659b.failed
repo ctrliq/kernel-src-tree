@@ -1,0 +1,397 @@
+usb: find internal hub tier mismatch via acpi
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [usb] find internal hub tier mismatch via acpi (Don Zickus) [1110939]
+Rebuild_FUZZ: 94.12%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 3bfd659baec822f54e4acb0734669e671d853a35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3bfd659b.failed
+
+ACPI identifies peer ports by setting their 'group_token' and
+'group_position' _PLD data to the same value.  If a platform has tier
+mismatch [1] , ACPI can override the default (USB3 defined) peer port
+association for internal hubs.  External hubs follow the default peer
+association scheme.
+
+Location data is cached as an opaque cookie in usb_port_location data.
+
+Note that we only consider the group_token and group_position attributes
+from the _PLD data as ACPI specifies that group_token is a unique
+identifier.
+
+When we find port location data for a port then we assume that the
+firmware will also describe its peer port.  This allows the
+implementation to only ever set the peer once.  This leads to a question
+about what happens when a pm runtime event occurs while the peer
+associations are still resolving.  Since we only ever set the peer
+information once, a USB3 port needs to be prevented from suspending
+while its ->peer pointer is NULL (implemented in a subsequent patch).
+
+There is always the possibility that firmware mis-identifies the ports,
+but there is not much the kernel can do in that case.
+
+[1]: xhci 1.1 appendix D figure 131
+[2]: acpi 5 section 6.1.8
+
+[alan]: don't do default peering when acpi data present
+	Suggested-by: Alan Stern <stern@rowland.harvard.edu>
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3bfd659baec822f54e4acb0734669e671d853a35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/port.c
+#	drivers/usb/core/usb-acpi.c
+diff --cc drivers/usb/core/port.c
+index 168fa6ee3348,aea54e8dfe47..000000000000
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@@ -152,9 -152,135 +152,138 @@@ struct device_type usb_port_device_typ
+  	.pm =		&usb_port_pm_ops,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct device_driver usb_port_driver = {
++ 	.name = "usb",
++ 	.owner = THIS_MODULE,
++ };
++ 
++ static void link_peers(struct usb_port *left, struct usb_port *right)
++ {
++ 	if (left->peer == right && right->peer == left)
++ 		return;
++ 
++ 	if (left->peer || right->peer) {
++ 		struct usb_port *lpeer = left->peer;
++ 		struct usb_port *rpeer = right->peer;
++ 
++ 		WARN(1, "failed to peer %s and %s (%s -> %p) (%s -> %p)\n",
++ 			dev_name(&left->dev), dev_name(&right->dev),
++ 			dev_name(&left->dev), lpeer,
++ 			dev_name(&right->dev), rpeer);
++ 		return;
++ 	}
++ 
++ 	left->peer = right;
++ 	right->peer = left;
++ }
++ 
++ static void unlink_peers(struct usb_port *left, struct usb_port *right)
++ {
++ 	WARN(right->peer != left || left->peer != right,
++ 			"%s and %s are not peers?\n",
++ 			dev_name(&left->dev), dev_name(&right->dev));
++ 
++ 	right->peer = NULL;
++ 	left->peer = NULL;
++ }
++ 
++ /*
++  * For each usb hub device in the system check to see if it is in the
++  * peer domain of the given port_dev, and if it is check to see if it
++  * has a port that matches the given port by location
++  */
++ static int match_location(struct usb_device *peer_hdev, void *p)
++ {
++ 	int port1;
++ 	struct usb_hcd *hcd, *peer_hcd;
++ 	struct usb_port *port_dev = p, *peer;
++ 	struct usb_hub *peer_hub = usb_hub_to_struct_hub(peer_hdev);
++ 	struct usb_device *hdev = to_usb_device(port_dev->dev.parent->parent);
++ 
++ 	if (!peer_hub)
++ 		return 0;
++ 
++ 	hcd = bus_to_hcd(hdev->bus);
++ 	peer_hcd = bus_to_hcd(peer_hdev->bus);
++ 	/* peer_hcd is provisional until we verify it against the known peer */
++ 	if (peer_hcd != hcd->shared_hcd)
++ 		return 0;
++ 
++ 	for (port1 = 1; port1 <= peer_hdev->maxchild; port1++) {
++ 		peer = peer_hub->ports[port1 - 1];
++ 		if (peer && peer->location == port_dev->location) {
++ 			link_peers(port_dev, peer);
++ 			return 1; /* done */
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Find the peer port either via explicit platform firmware "location"
++  * data, the peer hcd for root hubs, or the upstream peer relationship
++  * for all other hubs.
++  */
++ static void find_and_link_peer(struct usb_hub *hub, int port1)
++ {
++ 	struct usb_port *port_dev = hub->ports[port1 - 1], *peer;
++ 	struct usb_device *hdev = hub->hdev;
++ 	struct usb_device *peer_hdev;
++ 	struct usb_hub *peer_hub;
++ 
++ 	/*
++ 	 * If location data is available then we can only peer this port
++ 	 * by a location match, not the default peer (lest we create a
++ 	 * situation where we need to go back and undo a default peering
++ 	 * when the port is later peered by location data)
++ 	 */
++ 	if (port_dev->location) {
++ 		/* we link the peer in match_location() if found */
++ 		usb_for_each_dev(port_dev, match_location);
++ 		return;
++ 	} else if (!hdev->parent) {
++ 		struct usb_hcd *hcd = bus_to_hcd(hdev->bus);
++ 		struct usb_hcd *peer_hcd = hcd->shared_hcd;
++ 
++ 		if (!peer_hcd)
++ 			return;
++ 
++ 		peer_hdev = peer_hcd->self.root_hub;
++ 	} else {
++ 		struct usb_port *upstream;
++ 		struct usb_device *parent = hdev->parent;
++ 		struct usb_hub *parent_hub = usb_hub_to_struct_hub(parent);
++ 
++ 		if (!parent_hub)
++ 			return;
++ 
++ 		upstream = parent_hub->ports[hdev->portnum - 1];
++ 		if (!upstream || !upstream->peer)
++ 			return;
++ 
++ 		peer_hdev = upstream->peer->child;
++ 	}
++ 
++ 	peer_hub = usb_hub_to_struct_hub(peer_hdev);
++ 	if (!peer_hub || port1 > peer_hdev->maxchild)
++ 		return;
++ 
++ 	/*
++ 	 * we found a valid default peer, last check is to make sure it
++ 	 * does not have location data
++ 	 */
++ 	peer = peer_hub->ports[port1 - 1];
++ 	if (peer && peer->location == 0)
++ 		link_peers(port_dev, peer);
++ }
++ 
+++>>>>>>> 3bfd659baec8 (usb: find internal hub tier mismatch via acpi)
+  int usb_hub_create_port_device(struct usb_hub *hub, int port1)
+  {
+ -	struct usb_port *port_dev;
+ +	struct usb_port *port_dev = NULL;
+  	int retval;
+  
+  	port_dev = kzalloc(sizeof(*port_dev), GFP_KERNEL);
+diff --cc drivers/usb/core/usb-acpi.c
+index ca63c1ef7144,2776cfe64c09..000000000000
+--- a/drivers/usb/core/usb-acpi.c
++++ b/drivers/usb/core/usb-acpi.c
+@@@ -82,14 -85,13 +82,21 @@@ int usb_acpi_set_power_state(struct usb
+  }
+  EXPORT_SYMBOL_GPL(usb_acpi_set_power_state);
+  
+- static int usb_acpi_check_port_connect_type(struct usb_device *hdev,
+- 	acpi_handle handle, int port1)
++ static enum usb_port_connect_type usb_acpi_get_connect_type(acpi_handle handle,
++ 		struct acpi_pld_info *pld)
+  {
+++<<<<<<< HEAD
+ +	acpi_status status;
+ +	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+ +	union acpi_object *upc;
+ +	struct acpi_pld_info *pld;
+ +	int ret = 0;
+++=======
++ 	enum usb_port_connect_type connect_type = USB_PORT_CONNECT_TYPE_UNKNOWN;
++ 	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++ 	union acpi_object *upc;
++ 	acpi_status status;
+++>>>>>>> 3bfd659baec8 (usb: find internal hub tier mismatch via acpi)
+  
+  	/*
+  	 * According to ACPI Spec 9.13. PLD indicates whether usb port is
+@@@ -113,25 -110,28 +115,39 @@@
+  
+  	if (upc->package.elements[0].integer.value)
+  		if (pld->user_visible)
+ -			connect_type = USB_PORT_CONNECT_TYPE_HOT_PLUG;
+ +			usb_set_hub_port_connect_type(hdev, port1,
+ +				USB_PORT_CONNECT_TYPE_HOT_PLUG);
+  		else
+ -			connect_type = USB_PORT_CONNECT_TYPE_HARD_WIRED;
+ +			usb_set_hub_port_connect_type(hdev, port1,
+ +				USB_PORT_CONNECT_TYPE_HARD_WIRED);
+  	else if (!pld->user_visible)
+++<<<<<<< HEAD
+ +		usb_set_hub_port_connect_type(hdev, port1, USB_PORT_NOT_USED);
+ +
+++=======
++ 		connect_type = USB_PORT_NOT_USED;
+++>>>>>>> 3bfd659baec8 (usb: find internal hub tier mismatch via acpi)
+  out:
+- 	ACPI_FREE(pld);
+  	kfree(upc);
+- 	return ret;
++ 	return connect_type;
+  }
+  
+++<<<<<<< HEAD
+ +static int usb_acpi_find_device(struct device *dev, acpi_handle *handle)
+++=======
++ 
++ /*
++  * Private to usb-acpi, all the core needs to know is that
++  * port_dev->location is non-zero when it has been set by the firmware.
++  */
++ #define USB_ACPI_LOCATION_VALID (1 << 31)
++ 
++ static struct acpi_device *usb_acpi_find_companion(struct device *dev)
+++>>>>>>> 3bfd659baec8 (usb: find internal hub tier mismatch via acpi)
+  {
+  	struct usb_device *udev;
+ -	struct acpi_device *adev;
+  	acpi_handle *parent_handle;
+ +	int port_num;
+  
+  	/*
+  	 * In the ACPI DSDT table, only usb root hub and usb ports are
+@@@ -148,38 -148,19 +164,47 @@@
+  	 */
+  	if (is_usb_device(dev)) {
+  		udev = to_usb_device(dev);
+ -		if (udev->parent)
+ -			return NULL;
+ +		if (udev->parent) {
+ +			enum usb_port_connect_type type;
+ +
+ +			/*
+ +			 * According usb port's connect type to set usb device's
+ +			 * removability.
+ +			 */
+ +			type = usb_get_hub_port_connect_type(udev->parent,
+ +				udev->portnum);
+ +			switch (type) {
+ +			case USB_PORT_CONNECT_TYPE_HOT_PLUG:
+ +				udev->removable = USB_DEVICE_REMOVABLE;
+ +				break;
+ +			case USB_PORT_CONNECT_TYPE_HARD_WIRED:
+ +				udev->removable = USB_DEVICE_FIXED;
+ +				break;
+ +			default:
+ +				udev->removable = USB_DEVICE_REMOVABLE_UNKNOWN;
+ +				break;
+ +			}
+  
+ -		/* root hub is only child (_ADR=0) under its parent, the HC */
+ -		adev = ACPI_COMPANION(dev->parent);
+ -		return acpi_find_child_device(adev, 0, false);
+ +			return -ENODEV;
+ +		}
+ +
+ +		/* root hub's parent is the usb hcd. */
+ +		parent_handle = DEVICE_ACPI_HANDLE(dev->parent);
+ +		*handle = acpi_get_child(parent_handle, udev->portnum);
+ +		if (!*handle)
+ +			return -ENODEV;
+ +		return 0;
+  	} else if (is_usb_port(dev)) {
+++<<<<<<< HEAD
+ +		sscanf(dev_name(dev), "port%d", &port_num);
+++=======
++ 		struct usb_port *port_dev = to_usb_port(dev);
++ 		int port1 = port_dev->portnum;
++ 		struct acpi_pld_info *pld;
++ 		acpi_handle *handle;
++ 		acpi_status status;
++ 
+++>>>>>>> 3bfd659baec8 (usb: find internal hub tier mismatch via acpi)
+  		/* Get the struct usb_device point of port's hub */
+  		udev = to_usb_device(dev->parent->parent);
+  
+@@@ -203,17 -183,27 +228,32 @@@
+  				usb_get_hub_port_acpi_handle(udev->parent,
+  				udev->portnum);
+  			if (!parent_handle)
+ -				return NULL;
+ +				return -ENODEV;
+  
+ -			acpi_bus_get_device(parent_handle, &adev);
+ -			adev = acpi_find_child_device(adev, port1, false);
+ -			if (!adev)
+ -				return NULL;
+ +			*handle = acpi_get_child(parent_handle,	port_num);
+ +			if (!*handle)
+ +				return -ENODEV;
+  		}
+++<<<<<<< HEAD
+ +		usb_acpi_check_port_connect_type(udev, *handle, port_num);
+ +	} else
+ +		return -ENODEV;
+++=======
++ 		handle = adev->handle;
++ 		status = acpi_get_physical_device_location(handle, &pld);
++ 		if (ACPI_FAILURE(status) || !pld)
++ 			return adev;
++ 
++ 		port_dev->location = USB_ACPI_LOCATION_VALID
++ 			| pld->group_token << 8 | pld->group_position;
++ 		port_dev->connect_type = usb_acpi_get_connect_type(handle, pld);
++ 		ACPI_FREE(pld);
++ 
++ 		return adev;
++ 	}
+++>>>>>>> 3bfd659baec8 (usb: find internal hub tier mismatch via acpi)
+  
+ -	return NULL;
+ +	return 0;
+  }
+  
+  static bool usb_acpi_bus_match(struct device *dev)
+diff --git a/drivers/usb/core/hub.h b/drivers/usb/core/hub.h
+index 048812399485..b52c69db886f 100644
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@ -83,6 +83,7 @@ struct usb_hub {
+  * @dev: generic device interface
+  * @port_owner: port's owner
+  * @connect_type: port's connect type
++ * @location: opaque representation of platform connector location
+  * @portnum: port index num based one
+  * @power_is_on: port's power state
+  * @did_runtime_put: port has done pm_runtime_put().
+@@ -92,6 +93,7 @@ struct usb_port {
+ 	struct device dev;
+ 	struct dev_state *port_owner;
+ 	enum usb_port_connect_type connect_type;
++	usb_port_location_t location;
+ 	u8 portnum;
+ 	unsigned power_is_on:1;
+ 	unsigned did_runtime_put:1;
+* Unmerged path drivers/usb/core/port.c
+* Unmerged path drivers/usb/core/usb-acpi.c
+diff --git a/drivers/usb/core/usb.h b/drivers/usb/core/usb.h
+index 0923add72b59..1c9860176379 100644
+--- a/drivers/usb/core/usb.h
++++ b/drivers/usb/core/usb.h
+@@ -174,6 +174,12 @@ extern void usbfs_conn_disc_event(void);
+ extern int usb_devio_init(void);
+ extern void usb_devio_cleanup(void);
+ 
++/*
++ * Firmware specific cookie identifying a port's location. '0' == no location
++ * data available
++ */
++typedef u32 usb_port_location_t;
++
+ /* internal notify stuff */
+ extern void usb_notify_add_device(struct usb_device *udev);
+ extern void usb_notify_remove_device(struct usb_device *udev);
