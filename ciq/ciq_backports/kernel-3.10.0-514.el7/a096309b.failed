@@ -1,0 +1,245 @@
+perf: Fix scaling vs. perf_install_in_context()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a096309bc4677f60caa8e93fcc613a55073c51d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a096309b.failed
+
+Completely reworks perf_install_in_context() (again!) in order to
+ensure that there will be no ctx time hole between add_event_to_ctx()
+and any potential ctx_sched_in().
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: dvyukov@google.com
+	Cc: eranian@google.com
+	Cc: oleg@redhat.com
+	Cc: panand@redhat.com
+	Cc: sasha.levin@oracle.com
+	Cc: vince@deater.net
+Link: http://lkml.kernel.org/r/20160224174948.279399438@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a096309bc4677f60caa8e93fcc613a55073c51d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 4091a178da37,25edabd207de..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -146,21 -276,28 +146,46 @@@ static void event_function_call(struct 
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +again:
+ +	if (!task_function_call(task, active, data))
+ +		return;
+ +
+ +	raw_spin_lock_irq(&ctx->lock);
+ +	if (ctx->is_active) {
+ +		/*
+ +		 * Reload the task pointer, it might have been changed by
+ +		 * a concurrent perf_event_context_sched_out().
+ +		 */
+ +		task = ctx->task;
+ +		raw_spin_unlock_irq(&ctx->lock);
+ +		goto again;
+ +	}
+ +	inactive(data);
+++=======
++ 	if (task == TASK_TOMBSTONE)
++ 		return;
++ 
++ again:
++ 	if (!task_function_call(task, event_function, &efs))
++ 		return;
++ 
++ 	raw_spin_lock_irq(&ctx->lock);
++ 	/*
++ 	 * Reload the task pointer, it might have been changed by
++ 	 * a concurrent perf_event_context_sched_out().
++ 	 */
++ 	task = ctx->task;
++ 	if (task == TASK_TOMBSTONE) {
++ 		raw_spin_unlock_irq(&ctx->lock);
++ 		return;
++ 	}
++ 	if (ctx->is_active) {
++ 		raw_spin_unlock_irq(&ctx->lock);
++ 		goto again;
++ 	}
++ 	func(event, NULL, ctx, data);
+++>>>>>>> a096309bc467 (perf: Fix scaling vs. perf_install_in_context())
+  	raw_spin_unlock_irq(&ctx->lock);
+  }
+  
+@@@ -2054,54 -2127,46 +2080,92 @@@ static int  __perf_install_in_context(v
+  	struct perf_event_context *ctx = event->ctx;
+  	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
+  	struct perf_event_context *task_ctx = cpuctx->task_ctx;
+++<<<<<<< HEAD
+ +	struct task_struct *task = current;
+++=======
++ 	bool activate = true;
++ 	int ret = 0;
+++>>>>>>> a096309bc467 (perf: Fix scaling vs. perf_install_in_context())
+  
+ -	raw_spin_lock(&cpuctx->ctx.lock);
+ -	if (ctx->task) {
+ +	perf_ctx_lock(cpuctx, task_ctx);
+ +	perf_pmu_disable(cpuctx->ctx.pmu);
+ +
+ +	/*
+ +	 * If there was an active task_ctx schedule it out.
+ +	 */
+ +	if (task_ctx)
+ +		task_ctx_sched_out(task_ctx);
+ +
+ +	/*
+ +	 * If the context we're installing events in is not the
+ +	 * active task_ctx, flip them.
+ +	 */
+ +	if (ctx->task && task_ctx != ctx) {
+ +		if (task_ctx)
+ +			raw_spin_unlock(&task_ctx->lock);
+  		raw_spin_lock(&ctx->lock);
+  		task_ctx = ctx;
+++<<<<<<< HEAD
+ +	}
+ +
+ +	if (task_ctx) {
+ +		cpuctx->task_ctx = task_ctx;
+ +		task = task_ctx->task;
+ +	}
+ +
+ +	cpu_ctx_sched_out(cpuctx, EVENT_ALL);
+ +
+ +	update_context_time(ctx);
+ +	/*
+ +	 * update cgrp time only if current cgrp
+ +	 * matches event->cgrp. Must be done before
+ +	 * calling add_event_to_ctx()
+ +	 */
+ +	update_cgrp_time_from_event(event);
+ +
+ +	add_event_to_ctx(event, ctx);
+ +
+ +	/*
+ +	 * Schedule everything back in
+ +	 */
+ +	perf_event_sched_in(cpuctx, task_ctx, task);
+ +
+ +	perf_pmu_enable(cpuctx->ctx.pmu);
+++=======
++ 
++ 		/* If we're on the wrong CPU, try again */
++ 		if (task_cpu(ctx->task) != smp_processor_id()) {
++ 			ret = -ESRCH;
++ 			goto unlock;
++ 		}
++ 
++ 		/*
++ 		 * If we're on the right CPU, see if the task we target is
++ 		 * current, if not we don't have to activate the ctx, a future
++ 		 * context switch will do that for us.
++ 		 */
++ 		if (ctx->task != current)
++ 			activate = false;
++ 		else
++ 			WARN_ON_ONCE(cpuctx->task_ctx && cpuctx->task_ctx != ctx);
++ 
++ 	} else if (task_ctx) {
++ 		raw_spin_lock(&task_ctx->lock);
++ 	}
++ 
++ 	if (activate) {
++ 		ctx_sched_out(ctx, cpuctx, EVENT_TIME);
++ 		add_event_to_ctx(event, ctx);
++ 		ctx_resched(cpuctx, task_ctx);
++ 	} else {
++ 		add_event_to_ctx(event, ctx);
++ 	}
++ 
++ unlock:
+++>>>>>>> a096309bc467 (perf: Fix scaling vs. perf_install_in_context())
+  	perf_ctx_unlock(cpuctx, task_ctx);
+  
+- 	return 0;
++ 	return ret;
+  }
+  
+  /*
+@@@ -2112,14 -2179,54 +2178,62 @@@ perf_install_in_context(struct perf_eve
+  			struct perf_event *event,
+  			int cpu)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct task_struct *task = READ_ONCE(ctx->task);
++ 
+++>>>>>>> a096309bc467 (perf: Fix scaling vs. perf_install_in_context())
+  	lockdep_assert_held(&ctx->mutex);
+  
+  	event->ctx = ctx;
+  	if (event->cpu != -1)
+  		event->cpu = cpu;
+  
+++<<<<<<< HEAD
+ +	event_function_call(event, __perf_install_in_context,
+ +			    ___perf_install_in_context, event);
+++=======
++ 	if (!task) {
++ 		cpu_function_call(cpu, __perf_install_in_context, event);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Should not happen, we validate the ctx is still alive before calling.
++ 	 */
++ 	if (WARN_ON_ONCE(task == TASK_TOMBSTONE))
++ 		return;
++ 
++ 	/*
++ 	 * Installing events is tricky because we cannot rely on ctx->is_active
++ 	 * to be set in case this is the nr_events 0 -> 1 transition.
++ 	 */
++ again:
++ 	/*
++ 	 * Cannot use task_function_call() because we need to run on the task's
++ 	 * CPU regardless of whether its current or not.
++ 	 */
++ 	if (!cpu_function_call(task_cpu(task), __perf_install_in_context, event))
++ 		return;
++ 
++ 	raw_spin_lock_irq(&ctx->lock);
++ 	task = ctx->task;
++ 	if (WARN_ON_ONCE(task == TASK_TOMBSTONE)) {
++ 		/*
++ 		 * Cannot happen because we already checked above (which also
++ 		 * cannot happen), and we hold ctx->mutex, which serializes us
++ 		 * against perf_event_exit_task_context().
++ 		 */
++ 		raw_spin_unlock_irq(&ctx->lock);
++ 		return;
++ 	}
++ 	raw_spin_unlock_irq(&ctx->lock);
++ 	/*
++ 	 * Since !ctx->is_active doesn't mean anything, we must IPI
++ 	 * unconditionally.
++ 	 */
++ 	goto again;
+++>>>>>>> a096309bc467 (perf: Fix scaling vs. perf_install_in_context())
+  }
+  
+  /*
+* Unmerged path kernel/events/core.c
