@@ -1,0 +1,454 @@
+vxlan: Remote checksum offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit dfd8645ea1bd91277f841e74c33e1f4dbbede808
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dfd8645e.failed
+
+Add support for remote checksum offload in VXLAN. This uses a
+reserved bit to indicate that RCO is being done, and uses the low order
+reserved eight bits of the VNI to hold the start and offset values in a
+compressed manner.
+
+Start is encoded in the low order seven bits of VNI. This is start >> 1
+so that the checksum start offset is 0-254 using even values only.
+Checksum offset (transport checksum field) is indicated in the high
+order bit in the low order byte of the VNI. If the bit is set, the
+checksum field is for UDP (so offset = start + 6), else checksum
+field is for TCP (so offset = start + 16). Only TCP and UDP are
+supported in this implementation.
+
+Remote checksum offload for VXLAN is described in:
+
+https://tools.ietf.org/html/draft-herbert-vxlan-rco-00
+
+Tested by running 200 TCP_STREAM connections with VXLAN (over IPv4).
+
+With UDP checksums and Remote Checksum Offload
+  IPv4
+      Client
+        11.84% CPU utilization
+      Server
+        12.96% CPU utilization
+      9197 Mbps
+  IPv6
+      Client
+        12.46% CPU utilization
+      Server
+        14.48% CPU utilization
+      8963 Mbps
+
+With UDP checksums, no remote checksum offload
+  IPv4
+      Client
+        15.67% CPU utilization
+      Server
+        14.83% CPU utilization
+      9094 Mbps
+  IPv6
+      Client
+        16.21% CPU utilization
+      Server
+        14.32% CPU utilization
+      9058 Mbps
+
+No UDP checksums
+  IPv4
+      Client
+        15.03% CPU utilization
+      Server
+        23.09% CPU utilization
+      9089 Mbps
+  IPv6
+      Client
+        16.18% CPU utilization
+      Server
+        26.57% CPU utilization
+       8954 Mbps
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dfd8645ea1bd91277f841e74c33e1f4dbbede808)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+diff --cc drivers/net/vxlan.c
+index 3440d933b3ec,99df0d76157c..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -549,7 -539,49 +549,53 @@@ static int vxlan_fdb_append(struct vxla
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +static struct sk_buff **vxlan_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ static struct vxlanhdr *vxlan_gro_remcsum(struct sk_buff *skb,
++ 					  unsigned int off,
++ 					  struct vxlanhdr *vh, size_t hdrlen,
++ 					  u32 data)
++ {
++ 	size_t start, offset, plen;
++ 	__wsum delta;
++ 
++ 	if (skb->remcsum_offload)
++ 		return vh;
++ 
++ 	if (!NAPI_GRO_CB(skb)->csum_valid)
++ 		return NULL;
++ 
++ 	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
++ 	offset = start + ((data & VXLAN_RCO_UDP) ?
++ 			  offsetof(struct udphdr, check) :
++ 			  offsetof(struct tcphdr, check));
++ 
++ 	plen = hdrlen + offset + sizeof(u16);
++ 
++ 	/* Pull checksum that will be written */
++ 	if (skb_gro_header_hard(skb, off + plen)) {
++ 		vh = skb_gro_header_slow(skb, off + plen, off);
++ 		if (!vh)
++ 			return NULL;
++ 	}
++ 
++ 	delta = remcsum_adjust((void *)vh + hdrlen,
++ 			       NAPI_GRO_CB(skb)->csum, start, offset);
++ 
++ 	/* Adjust skb->csum since we changed the packet */
++ 	skb->csum = csum_add(skb->csum, delta);
++ 	NAPI_GRO_CB(skb)->csum = csum_add(NAPI_GRO_CB(skb)->csum, delta);
++ 
++ 	skb->remcsum_offload = 1;
++ 
++ 	return vh;
++ }
++ 
++ static struct sk_buff **vxlan_gro_receive(struct sk_buff **head,
++ 					  struct sk_buff *skb,
++ 					  struct udp_offload *uoff)
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+  {
+  	struct sk_buff *p, **pp = NULL;
+  	struct vxlanhdr *vh, *vh2;
+@@@ -1120,6 -1207,28 +1217,31 @@@ static int vxlan_udp_encap_recv(struct 
+  	if (!vs)
+  		goto drop;
+  
+++<<<<<<< HEAD
+++=======
++ 	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
++ 		vxh = vxlan_remcsum(skb, vxh, sizeof(struct vxlanhdr), vni);
++ 		if (!vxh)
++ 			goto drop;
++ 
++ 		flags &= ~VXLAN_HF_RCO;
++ 		vni &= VXLAN_VID_MASK;
++ 	}
++ 
++ 	if (flags || (vni & ~VXLAN_VID_MASK)) {
++ 		/* If there are any unprocessed flags remaining treat
++ 		 * this as a malformed packet. This behavior diverges from
++ 		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
++ 		 * in reserved fields are to be ignored. The approach here
++ 		 * maintains compatbility with previous stack code, and also
++ 		 * is more robust and provides a little more security in
++ 		 * adding extensions to VXLAN.
++ 		 */
++ 
++ 		goto bad_flags;
++ 	}
++ 
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+  	vs->rcv(vs, skb, vxh->vx_vni);
+  	return 0;
+  
+@@@ -1541,17 -1646,36 +1663,44 @@@ static int vxlan6_xmit_skb(struct net *
+  			   struct dst_entry *dst, struct sk_buff *skb,
+  			   struct net_device *dev, struct in6_addr *saddr,
+  			   struct in6_addr *daddr, __u8 prio, __u8 ttl,
+ -			   __be16 src_port, __be16 dst_port, __be32 vni,
+ -			   bool xnet)
+ +			   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+ +	struct ipv6hdr *ip6h;
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+++<<<<<<< HEAD
+ +
+ +	skb = vxlan_handle_offloads(skb, !udp_get_no_check6_tx(vs->sock->sk));
+ +	if (IS_ERR(skb))
+ +		return -EINVAL;
+++=======
++ 	bool udp_sum = !udp_get_no_check6_tx(vs->sock->sk);
++ 	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	u16 hdrlen = sizeof(struct vxlanhdr);
++ 
++ 	if ((vs->flags & VXLAN_F_REMCSUM_TX) &&
++ 	    skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		int csum_start = skb_checksum_start_offset(skb);
++ 
++ 		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
++ 		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
++ 		    (skb->csum_offset == offsetof(struct udphdr, check) ||
++ 		     skb->csum_offset == offsetof(struct tcphdr, check))) {
++ 			udp_sum = false;
++ 			type |= SKB_GSO_TUNNEL_REMCSUM;
++ 		}
++ 	}
++ 
++ 	skb = iptunnel_handle_offloads(skb, udp_sum, type);
++ 	if (IS_ERR(skb)) {
++ 		err = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	skb_scrub_packet(skb, xnet);
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+  
+  	min_headroom = LL_RESERVED_SPACE(dst->dev) + dst->header_len
+  			+ VXLAN_HLEN + sizeof(struct ipv6hdr)
+@@@ -1572,59 -1695,64 +1721,100 @@@
+  	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+ -	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+  	vxh->vx_vni = vni;
+  
+++<<<<<<< HEAD
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+++=======
++ 	if (type & SKB_GSO_TUNNEL_REMCSUM) {
++ 		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
++ 			   VXLAN_RCO_SHIFT;
++ 
++ 		if (skb->csum_offset == offsetof(struct udphdr, check))
++ 			data |= VXLAN_RCO_UDP;
++ 
++ 		vxh->vx_vni |= htonl(data);
++ 		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
++ 
++ 		if (!skb_is_gso(skb)) {
++ 			skb->ip_summed = CHECKSUM_NONE;
++ 			skb->encapsulation = 0;
++ 		}
++ 	}
++ 
++ 	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+ +
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+ +
+ +	uh->len = htons(skb->len);
+  
+ -	udp_tunnel6_xmit_skb(vs->sock, dst, skb, dev, saddr, daddr, prio,
+ -			     ttl, src_port, dst_port);
+ +	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ +	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ +			      IPSKB_REROUTED);
+ +	skb_dst_drop(skb);
+ +	skb_dst_set(skb, dst);
+ +
+ +	udp6_set_csum(udp_get_no_check6_tx(vs->sock->sk), skb,
+ +		      saddr, daddr, skb->len);
+ +
+ +	__skb_push(skb, sizeof(*ip6h));
+ +	skb_reset_network_header(skb);
+ +	ip6h		  = ipv6_hdr(skb);
+ +	ip6h->version	  = 6;
+ +	ip6h->priority	  = prio;
+ +	ip6h->flow_lbl[0] = 0;
+ +	ip6h->flow_lbl[1] = 0;
+ +	ip6h->flow_lbl[2] = 0;
+ +	ip6h->payload_len = htons(skb->len);
+ +	ip6h->nexthdr     = IPPROTO_UDP;
+ +	ip6h->hop_limit   = ttl;
+ +	ip6h->daddr	  = *daddr;
+ +	ip6h->saddr	  = *saddr;
+ +
+ +	ip6tunnel_xmit(skb, dev);
+  	return 0;
+ -err:
+ -	dst_release(dst);
+ -	return err;
+  }
+  #endif
+  
+ -int vxlan_xmit_skb(struct vxlan_sock *vs,
+ +int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+  		   struct rtable *rt, struct sk_buff *skb,
+  		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+ -		   __be16 src_port, __be16 dst_port, __be32 vni, bool xnet)
+ +		   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+++<<<<<<< HEAD
+ +
+ +	skb = vxlan_handle_offloads(skb, !vs->sock->sk->sk_no_check_tx);
+++=======
++ 	bool udp_sum = !vs->sock->sk->sk_no_check_tx;
++ 	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	u16 hdrlen = sizeof(struct vxlanhdr);
++ 
++ 	if ((vs->flags & VXLAN_F_REMCSUM_TX) &&
++ 	    skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		int csum_start = skb_checksum_start_offset(skb);
++ 
++ 		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
++ 		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
++ 		    (skb->csum_offset == offsetof(struct udphdr, check) ||
++ 		     skb->csum_offset == offsetof(struct tcphdr, check))) {
++ 			udp_sum = false;
++ 			type |= SKB_GSO_TUNNEL_REMCSUM;
++ 		}
++ 	}
++ 
++ 	skb = iptunnel_handle_offloads(skb, udp_sum, type);
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+  	if (IS_ERR(skb))
+ -		return PTR_ERR(skb);
+ +		return -EINVAL;
+  
+  	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+  			+ VXLAN_HLEN + sizeof(struct iphdr)
+@@@ -1632,36 -1760,39 +1822,56 @@@
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+ -	if (unlikely(err)) {
+ -		kfree_skb(skb);
+ +	if (unlikely(err))
+  		return err;
+ -	}
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb))
+ -		return -ENOMEM;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+ -	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+  	vxh->vx_vni = vni;
+  
+++<<<<<<< HEAD
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+++=======
++ 	if (type & SKB_GSO_TUNNEL_REMCSUM) {
++ 		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
++ 			   VXLAN_RCO_SHIFT;
++ 
++ 		if (skb->csum_offset == offsetof(struct udphdr, check))
++ 			data |= VXLAN_RCO_UDP;
++ 
++ 		vxh->vx_vni |= htonl(data);
++ 		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
++ 
++ 		if (!skb_is_gso(skb)) {
++ 			skb->ip_summed = CHECKSUM_NONE;
++ 			skb->encapsulation = 0;
++ 		}
++ 	}
++ 
++ 	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+  
+ -	return udp_tunnel_xmit_skb(vs->sock, rt, skb, src, dst, tos,
+ -				   ttl, df, src_port, dst_port, xnet);
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+ +
+ +	uh->len = htons(skb->len);
+ +
+ +	udp_set_csum(vs->sock->sk->sk_no_check_tx, skb,
+ +		     src, dst, skb->len);
+ +
+ +	return iptunnel_xmit(vs->sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+ +			     tos, ttl, df);
+  }
+  EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+  
+@@@ -2371,7 -2503,7 +2583,11 @@@ static struct vxlan_sock *vxlan_socket_
+  	atomic_set(&vs->refcnt, 1);
+  	vs->rcv = rcv;
+  	vs->data = data;
+++<<<<<<< HEAD
+ +	rcu_assign_sk_user_data(vs->sock->sk, vs);
+++=======
++ 	vs->flags = flags;
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+  
+  	/* Initialize the vxlan udp offloads structure */
+  	vs->udp_offloads.port = port;
+diff --cc include/net/vxlan.h
+index 1ddc74769f81,0a7443b49133..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -8,6 -11,27 +8,30 @@@
+  #define VNI_HASH_BITS	10
+  #define VNI_HASH_SIZE	(1<<VNI_HASH_BITS)
+  
+++<<<<<<< HEAD
+++=======
++ /* VXLAN protocol header */
++ struct vxlanhdr {
++ 	__be32 vx_flags;
++ 	__be32 vx_vni;
++ };
++ 
++ /* VXLAN header flags. */
++ #define VXLAN_HF_VNI 0x08000000
++ #define VXLAN_HF_RCO 0x00200000
++ 
++ /* Remote checksum offload header option */
++ #define VXLAN_RCO_MASK  0x7f    /* Last byte of vni field */
++ #define VXLAN_RCO_UDP   0x80    /* Indicate UDP RCO (TCP when not set *) */
++ #define VXLAN_RCO_SHIFT 1       /* Left shift of start */
++ #define VXLAN_RCO_SHIFT_MASK ((1 << VXLAN_RCO_SHIFT) - 1)
++ #define VXLAN_MAX_REMCSUM_START (VXLAN_RCO_MASK << VXLAN_RCO_SHIFT)
++ 
++ #define VXLAN_N_VID     (1u << 24)
++ #define VXLAN_VID_MASK  (VXLAN_N_VID - 1)
++ #define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
++ 
+++>>>>>>> dfd8645ea1bd (vxlan: Remote checksum offload)
+  struct vxlan_sock;
+  typedef void (vxlan_rcv_t)(struct vxlan_sock *vh, struct sk_buff *skb, __be32 key);
+  
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 4efe6bcb6e67..be93fdb92e0e 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -325,6 +325,8 @@ enum {
+ 	IFLA_VXLAN_UDP_CSUM,
+ 	IFLA_VXLAN_UDP_ZERO_CSUM6_TX,
+ 	IFLA_VXLAN_UDP_ZERO_CSUM6_RX,
++	IFLA_VXLAN_REMCSUM_TX,
++	IFLA_VXLAN_REMCSUM_RX,
+ 	__IFLA_VXLAN_MAX
+ };
+ #define IFLA_VXLAN_MAX	(__IFLA_VXLAN_MAX - 1)
