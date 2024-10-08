@@ -1,0 +1,282 @@
+gfs2: Extended attribute readahead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit c8d577038449a718ad0027d1790b6ef4441715d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c8d57703.failed
+
+When gfs2 allocates an inode and its extended attribute block next to
+each other at inode create time, the inode's directory entry indicates
+that in de_rahead.  In that case, we can readahead the extended
+attribute block when we read in the inode.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit c8d577038449a718ad0027d1790b6ef4441715d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/meta_io.h
+diff --cc fs/gfs2/meta_io.h
+index 0d4c843b6f8e,c5086c8af5ed..000000000000
+--- a/fs/gfs2/meta_io.h
++++ b/fs/gfs2/meta_io.h
+@@@ -48,21 -51,17 +48,35 @@@ static inline struct gfs2_sbd *gfs2_map
+  		return inode->i_sb->s_fs_info;
+  }
+  
+++<<<<<<< HEAD
+ +void gfs2_meta_sync(struct gfs2_glock *gl);
+ +
+ +struct buffer_head *gfs2_meta_new(struct gfs2_glock *gl, u64 blkno);
+ +int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno,
+ +		   int flags, struct buffer_head **bhp);
+ +int gfs2_meta_wait(struct gfs2_sbd *sdp, struct buffer_head *bh);
+ +struct buffer_head *gfs2_getbuf(struct gfs2_glock *gl, u64 blkno, int create);
+ +
+ +void gfs2_remove_from_journal(struct buffer_head *bh, struct gfs2_trans *tr,
+ +			      int meta);
+ +
+ +void gfs2_meta_wipe(struct gfs2_inode *ip, u64 bstart, u32 blen);
+ +
+ +int gfs2_meta_indirect_buffer(struct gfs2_inode *ip, int height, u64 num,
+ +			      struct buffer_head **bhp);
+++=======
++ extern struct buffer_head *gfs2_meta_new(struct gfs2_glock *gl, u64 blkno);
++ extern int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
++ 			  int rahead, struct buffer_head **bhp);
++ extern int gfs2_meta_wait(struct gfs2_sbd *sdp, struct buffer_head *bh);
++ extern struct buffer_head *gfs2_getbuf(struct gfs2_glock *gl, u64 blkno,
++ 				       int create);
++ extern void gfs2_remove_from_journal(struct buffer_head *bh,
++ 				     struct gfs2_trans *tr, int meta);
++ extern void gfs2_meta_wipe(struct gfs2_inode *ip, u64 bstart, u32 blen);
++ extern int gfs2_meta_indirect_buffer(struct gfs2_inode *ip, int height, u64 num,
++ 				     struct buffer_head **bhp);
+++>>>>>>> c8d577038449 (gfs2: Extended attribute readahead)
+  
+  static inline int gfs2_meta_inode_buffer(struct gfs2_inode *ip,
+  					 struct buffer_head **bhp)
+diff --git a/fs/gfs2/dir.c b/fs/gfs2/dir.c
+index fd0ea44f8554..561137178a5e 100644
+--- a/fs/gfs2/dir.c
++++ b/fs/gfs2/dir.c
+@@ -106,7 +106,7 @@ static int gfs2_dir_get_existing_buffer(struct gfs2_inode *ip, u64 block,
+ 	struct buffer_head *bh;
+ 	int error;
+ 
+-	error = gfs2_meta_read(ip->i_gl, block, DIO_WAIT, &bh);
++	error = gfs2_meta_read(ip->i_gl, block, DIO_WAIT, 0, &bh);
+ 	if (error)
+ 		return error;
+ 	if (gfs2_metatype_check(GFS2_SB(&ip->i_inode), bh, GFS2_METATYPE_JD)) {
+@@ -303,7 +303,7 @@ static int gfs2_dir_read_data(struct gfs2_inode *ip, __be64 *buf,
+ 			BUG_ON(extlen < 1);
+ 			bh = gfs2_meta_ra(ip->i_gl, dblock, extlen);
+ 		} else {
+-			error = gfs2_meta_read(ip->i_gl, dblock, DIO_WAIT, &bh);
++			error = gfs2_meta_read(ip->i_gl, dblock, DIO_WAIT, 0, &bh);
+ 			if (error)
+ 				goto fail;
+ 		}
+@@ -762,7 +762,7 @@ static int get_leaf(struct gfs2_inode *dip, u64 leaf_no,
+ {
+ 	int error;
+ 
+-	error = gfs2_meta_read(dip->i_gl, leaf_no, DIO_WAIT, bhp);
++	error = gfs2_meta_read(dip->i_gl, leaf_no, DIO_WAIT, 0, bhp);
+ 	if (!error && gfs2_metatype_check(GFS2_SB(&dip->i_inode), *bhp, GFS2_METATYPE_LF)) {
+ 		/* printk(KERN_INFO "block num=%llu\n", leaf_no); */
+ 		error = -EIO;
+@@ -1618,15 +1618,22 @@ struct inode *gfs2_dir_search(struct inode *dir, const struct qstr *name,
+ 
+ 	dent = gfs2_dirent_search(dir, name, gfs2_dirent_find, &bh);
+ 	if (dent) {
++		struct inode *inode;
++		u16 rahead;
++
+ 		if (IS_ERR(dent))
+ 			return ERR_CAST(dent);
+ 		dtype = be16_to_cpu(dent->de_type);
++		rahead = be16_to_cpu(dent->de_rahead);
+ 		addr = be64_to_cpu(dent->de_inum.no_addr);
+ 		formal_ino = be64_to_cpu(dent->de_inum.no_formal_ino);
+ 		brelse(bh);
+ 		if (fail_on_exist)
+ 			return ERR_PTR(-EEXIST);
+-		return gfs2_inode_lookup(dir->i_sb, dtype, addr, formal_ino, 0);
++		inode = gfs2_inode_lookup(dir->i_sb, dtype, addr, formal_ino, 0);
++		if (!IS_ERR(inode))
++			GFS2_I(inode)->i_rahead = rahead;
++		return inode;
+ 	}
+ 	return ERR_PTR(-ENOENT);
+ }
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 2caf75dc0244..1e29acb5cafb 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -384,6 +384,7 @@ struct gfs2_inode {
+ 	u32 i_diskflags;
+ 	u8 i_height;
+ 	u8 i_depth;
++	u16 i_rahead;
+ };
+ 
+ /*
+diff --git a/fs/gfs2/meta_io.c b/fs/gfs2/meta_io.c
+index 1a80ffddabcd..5f70a767d42d 100644
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@ -197,6 +197,21 @@ struct buffer_head *gfs2_meta_new(struct gfs2_glock *gl, u64 blkno)
+ 	return bh;
+ }
+ 
++static void gfs2_meta_readahead(struct gfs2_glock *gl, u64 blkno)
++{
++	struct buffer_head *bh;
++
++	bh = gfs2_getbuf(gl, blkno, 1);
++	lock_buffer(bh);
++	if (buffer_uptodate(bh)) {
++		unlock_buffer(bh);
++		brelse(bh);
++		return;
++	}
++	bh->b_end_io = end_buffer_read_sync;
++	submit_bh(READA | REQ_META | REQ_PRIO, bh);
++}
++
+ /**
+  * gfs2_meta_read - Read a block from disk
+  * @gl: The glock covering the block
+@@ -208,7 +223,7 @@ struct buffer_head *gfs2_meta_new(struct gfs2_glock *gl, u64 blkno)
+  */
+ 
+ int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
+-		   struct buffer_head **bhp)
++		   int rahead, struct buffer_head **bhp)
+ {
+ 	struct gfs2_sbd *sdp = gl->gl_sbd;
+ 	struct buffer_head *bh;
+@@ -223,11 +238,15 @@ int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
+ 	lock_buffer(bh);
+ 	if (buffer_uptodate(bh)) {
+ 		unlock_buffer(bh);
++		if (rahead)
++			gfs2_meta_readahead(gl, blkno + 1);
+ 		return 0;
+ 	}
+ 	bh->b_end_io = end_buffer_read_sync;
+ 	get_bh(bh);
+ 	submit_bh(READ_SYNC | REQ_META | REQ_PRIO, bh);
++	if (rahead)
++		gfs2_meta_readahead(gl, blkno + 1);
+ 	if (!(flags & DIO_WAIT))
+ 		return 0;
+ 
+@@ -360,8 +379,12 @@ int gfs2_meta_indirect_buffer(struct gfs2_inode *ip, int height, u64 num,
+ 	struct buffer_head *bh;
+ 	int ret = 0;
+ 	u32 mtype = height ? GFS2_METATYPE_IN : GFS2_METATYPE_DI;
++	int rahead = 0;
++
++	if (num == ip->i_no_addr)
++		rahead = ip->i_rahead;
+ 
+-	ret = gfs2_meta_read(gl, num, DIO_WAIT, &bh);
++	ret = gfs2_meta_read(gl, num, DIO_WAIT, rahead, &bh);
+ 	if (ret == 0 && gfs2_metatype_check(sdp, bh, mtype)) {
+ 		brelse(bh);
+ 		ret = -EIO;
+* Unmerged path fs/gfs2/meta_io.h
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index 481208bbcaf7..6bef6f22eea7 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -376,7 +376,7 @@ static int bh_get(struct gfs2_quota_data *qd)
+ 	error = gfs2_block_map(&ip->i_inode, block, &bh_map, 0);
+ 	if (error)
+ 		goto fail;
+-	error = gfs2_meta_read(ip->i_gl, bh_map.b_blocknr, DIO_WAIT, &bh);
++	error = gfs2_meta_read(ip->i_gl, bh_map.b_blocknr, DIO_WAIT, 0, &bh);
+ 	if (error)
+ 		goto fail;
+ 	error = -EIO;
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index a8aed1b6a8b1..d8c541151366 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -1123,7 +1123,7 @@ int gfs2_rgrp_bh_get(struct gfs2_rgrpd *rgd)
+ 
+ 	for (x = 0; x < length; x++) {
+ 		bi = rgd->rd_bits + x;
+-		error = gfs2_meta_read(gl, rgd->rd_addr + x, 0, &bi->bi_bh);
++		error = gfs2_meta_read(gl, rgd->rd_addr + x, 0, 0, &bi->bi_bh);
+ 		if (error)
+ 			goto fail;
+ 	}
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index 5c8a97adb7fd..2cbddb7d1b32 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1597,6 +1597,7 @@ static struct inode *gfs2_alloc_inode(struct super_block *sb)
+ 		ip->i_gl = NULL;
+ 		ip->i_rgd = NULL;
+ 		ip->i_res = NULL;
++		ip->i_rahead = 0;
+ 	}
+ 	return &ip->i_inode;
+ }
+diff --git a/fs/gfs2/xattr.c b/fs/gfs2/xattr.c
+index 80196e27eebe..6780ed3f4094 100644
+--- a/fs/gfs2/xattr.c
++++ b/fs/gfs2/xattr.c
+@@ -118,7 +118,7 @@ static int ea_foreach(struct gfs2_inode *ip, ea_call_t ea_call, void *data)
+ 	__be64 *eablk, *end;
+ 	int error;
+ 
+-	error = gfs2_meta_read(ip->i_gl, ip->i_eattr, DIO_WAIT, &bh);
++	error = gfs2_meta_read(ip->i_gl, ip->i_eattr, DIO_WAIT, 0, &bh);
+ 	if (error)
+ 		return error;
+ 
+@@ -142,7 +142,7 @@ static int ea_foreach(struct gfs2_inode *ip, ea_call_t ea_call, void *data)
+ 			break;
+ 		bn = be64_to_cpu(*eablk);
+ 
+-		error = gfs2_meta_read(ip->i_gl, bn, DIO_WAIT, &eabh);
++		error = gfs2_meta_read(ip->i_gl, bn, DIO_WAIT, 0, &eabh);
+ 		if (error)
+ 			break;
+ 		error = ea_foreach_i(ip, eabh, ea_call, data);
+@@ -476,7 +476,7 @@ static int gfs2_iter_unstuffed(struct gfs2_inode *ip, struct gfs2_ea_header *ea,
+ 		return -ENOMEM;
+ 
+ 	for (x = 0; x < nptrs; x++) {
+-		error = gfs2_meta_read(ip->i_gl, be64_to_cpu(*dataptrs), 0,
++		error = gfs2_meta_read(ip->i_gl, be64_to_cpu(*dataptrs), 0, 0,
+ 				       bh + x);
+ 		if (error) {
+ 			while (x--)
+@@ -976,7 +976,7 @@ static int ea_set_block(struct gfs2_inode *ip, struct gfs2_ea_request *er,
+ 	if (ip->i_diskflags & GFS2_DIF_EA_INDIRECT) {
+ 		__be64 *end;
+ 
+-		error = gfs2_meta_read(ip->i_gl, ip->i_eattr, DIO_WAIT,
++		error = gfs2_meta_read(ip->i_gl, ip->i_eattr, DIO_WAIT, 0,
+ 				       &indbh);
+ 		if (error)
+ 			return error;
+@@ -1302,7 +1302,7 @@ static int ea_dealloc_indirect(struct gfs2_inode *ip)
+ 
+ 	memset(&rlist, 0, sizeof(struct gfs2_rgrp_list));
+ 
+-	error = gfs2_meta_read(ip->i_gl, ip->i_eattr, DIO_WAIT, &indbh);
++	error = gfs2_meta_read(ip->i_gl, ip->i_eattr, DIO_WAIT, 0, &indbh);
+ 	if (error)
+ 		return error;
+ 
