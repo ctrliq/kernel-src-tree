@@ -1,0 +1,1402 @@
+xfs: remove the flags argument to xfs_trans_cancel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 4906e21545814e4129595118287a2f1415483c0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4906e215.failed
+
+xfs_trans_cancel takes two flags arguments: XFS_TRANS_RELEASE_LOG_RES and
+XFS_TRANS_ABORT.  Both of them are a direct product of the transaction
+state, and can be deducted:
+
+ - any dirty transaction needs XFS_TRANS_ABORT to be properly canceled,
+   and XFS_TRANS_ABORT is a noop for a transaction that is not dirty.
+ - any transaction with a permanent log reservation needs
+   XFS_TRANS_RELEASE_LOG_RES to be properly canceled, and passing
+   XFS_TRANS_RELEASE_LOG_RES for a transaction without a permanent
+   log reservation is invalid.
+
+So just remove the flags argument and do the right thing.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 4906e21545814e4129595118287a2f1415483c0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_attr_inactive.c
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 7500d26379cf,a07055aaf433..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5677,3 -5747,189 +5674,192 @@@ del_cursor
+  
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Splits an extent into two extents at split_fsb block such that it is
++  * the first block of the current_ext. @current_ext is a target extent
++  * to be split. @split_fsb is a block where the extents is split.
++  * If split_fsb lies in a hole or the first block of extents, just return 0.
++  */
++ STATIC int
++ xfs_bmap_split_extent_at(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		split_fsb,
++ 	xfs_fsblock_t		*firstfsb,
++ 	struct xfs_bmap_free	*free_list)
++ {
++ 	int				whichfork = XFS_DATA_FORK;
++ 	struct xfs_btree_cur		*cur = NULL;
++ 	struct xfs_bmbt_rec_host	*gotp;
++ 	struct xfs_bmbt_irec		got;
++ 	struct xfs_bmbt_irec		new; /* split extent */
++ 	struct xfs_mount		*mp = ip->i_mount;
++ 	struct xfs_ifork		*ifp;
++ 	xfs_fsblock_t			gotblkcnt; /* new block count for got */
++ 	xfs_extnum_t			current_ext;
++ 	int				error = 0;
++ 	int				logflags = 0;
++ 	int				i = 0;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT, XFS_RANDOM_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT("xfs_bmap_split_extent_at",
++ 				 XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		/* Read in all the extents */
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * gotp can be null in 2 cases: 1) if there are no extents
++ 	 * or 2) split_fsb lies in a hole beyond which there are
++ 	 * no extents. Either way, we are done.
++ 	 */
++ 	gotp = xfs_iext_bno_to_ext(ifp, split_fsb, &current_ext);
++ 	if (!gotp)
++ 		return 0;
++ 
++ 	xfs_bmbt_get_all(gotp, &got);
++ 
++ 	/*
++ 	 * Check split_fsb lies in a hole or the start boundary offset
++ 	 * of the extent.
++ 	 */
++ 	if (got.br_startoff >= split_fsb)
++ 		return 0;
++ 
++ 	gotblkcnt = split_fsb - got.br_startoff;
++ 	new.br_startoff = split_fsb;
++ 	new.br_startblock = got.br_startblock + gotblkcnt;
++ 	new.br_blockcount = got.br_blockcount - gotblkcnt;
++ 	new.br_state = got.br_state;
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstfsb;
++ 		cur->bc_private.b.flist = free_list;
++ 		cur->bc_private.b.flags = 0;
++ 		error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	xfs_bmbt_set_blockcount(gotp, gotblkcnt);
++ 	got.br_blockcount = gotblkcnt;
++ 
++ 	logflags = XFS_ILOG_CORE;
++ 	if (cur) {
++ 		error = xfs_bmbt_update(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				got.br_state);
++ 		if (error)
++ 			goto del_cursor;
++ 	} else
++ 		logflags |= XFS_ILOG_DEXT;
++ 
++ 	/* Add new extent */
++ 	current_ext++;
++ 	xfs_iext_insert(ip, current_ext, 1, &new, 0);
++ 	XFS_IFORK_NEXT_SET(ip, whichfork,
++ 			   XFS_IFORK_NEXTENTS(ip, whichfork) + 1);
++ 
++ 	if (cur) {
++ 		error = xfs_bmbt_lookup_eq(cur, new.br_startoff,
++ 				new.br_startblock, new.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 0, del_cursor);
++ 		cur->bc_rec.b.br_state = new.br_state;
++ 
++ 		error = xfs_btree_insert(cur, &i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	/*
++ 	 * Convert to a btree if necessary.
++ 	 */
++ 	if (xfs_bmap_needs_btree(ip, whichfork)) {
++ 		int tmp_logflags; /* partial log flag return val */
++ 
++ 		ASSERT(cur == NULL);
++ 		error = xfs_bmap_extents_to_btree(tp, ip, firstfsb, free_list,
++ 				&cur, 0, &tmp_logflags, whichfork);
++ 		logflags |= tmp_logflags;
++ 	}
++ 
++ del_cursor:
++ 	if (cur) {
++ 		cur->bc_private.b.allocated = 0;
++ 		xfs_btree_del_cursor(cur,
++ 				error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 	}
++ 
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 	return error;
++ }
++ 
++ int
++ xfs_bmap_split_extent(
++ 	struct xfs_inode        *ip,
++ 	xfs_fileoff_t           split_fsb)
++ {
++ 	struct xfs_mount        *mp = ip->i_mount;
++ 	struct xfs_trans        *tp;
++ 	struct xfs_bmap_free    free_list;
++ 	xfs_fsblock_t           firstfsb;
++ 	int                     committed;
++ 	int                     error;
++ 
++ 	tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
++ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
++ 			XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
++ 	if (error) {
++ 		xfs_trans_cancel(tp);
++ 		return error;
++ 	}
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 	xfs_bmap_init(&free_list, &firstfsb);
++ 
++ 	error = xfs_bmap_split_extent_at(tp, ip, split_fsb,
++ 			&firstfsb, &free_list);
++ 	if (error)
++ 		goto out;
++ 
++ 	error = xfs_bmap_finish(&tp, &free_list, &committed);
++ 	if (error)
++ 		goto out;
++ 
++ 	return xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++ 
++ 
++ out:
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
+++>>>>>>> 4906e2154581 (xfs: remove the flags argument to xfs_trans_cancel)
+diff --cc fs/xfs/xfs_aops.c
+index bb6024910e57,3890a38a0f26..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -143,6 -134,32 +143,35 @@@ xfs_setfilesize_trans_alloc
+   */
+  STATIC int
+  xfs_setfilesize(
+++<<<<<<< HEAD
+++=======
++ 	struct xfs_inode	*ip,
++ 	struct xfs_trans	*tp,
++ 	xfs_off_t		offset,
++ 	size_t			size)
++ {
++ 	xfs_fsize_t		isize;
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	isize = xfs_new_eof(ip, offset + size);
++ 	if (!isize) {
++ 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
++ 		xfs_trans_cancel(tp);
++ 		return 0;
++ 	}
++ 
++ 	trace_xfs_setfilesize(ip, offset, size);
++ 
++ 	ip->i_d.di_size = isize;
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++ 
++ 	return xfs_trans_commit(tp, 0);
++ }
++ 
++ STATIC int
++ xfs_setfilesize_ioend(
+++>>>>>>> 4906e2154581 (xfs: remove the flags argument to xfs_trans_cancel)
+  	struct xfs_ioend	*ioend)
+  {
+  	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+diff --cc fs/xfs/xfs_attr_inactive.c
+index 73e75a87af50,af7fce33ae52..000000000000
+--- a/fs/xfs/xfs_attr_inactive.c
++++ b/fs/xfs/xfs_attr_inactive.c
+@@@ -416,18 -408,13 +416,26 @@@ xfs_attr_inactive
+  	 * the inode in every transaction to let it float upward through
+  	 * the log.
+  	 */
+ +	lock_mode = 0;
+  	trans = xfs_trans_alloc(mp, XFS_TRANS_ATTRINVAL);
+  	error = xfs_trans_reserve(trans, &M_RES(mp)->tr_attrinval, 0, 0);
+++<<<<<<< HEAD
+ +	if (error)
+ +		goto out_cancel;
+ +
+ +	lock_mode = XFS_ILOCK_EXCL;
+ +	cancel_flags = XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT;
+ +	xfs_ilock(dp, lock_mode);
+ +
+ +	if (!XFS_IFORK_Q(dp))
+ +		goto out_cancel;
+++=======
++ 	if (error) {
++ 		xfs_trans_cancel(trans);
++ 		return error;
++ 	}
++ 	xfs_ilock(dp, XFS_ILOCK_EXCL);
+++>>>>>>> 4906e2154581 (xfs: remove the flags argument to xfs_trans_cancel)
+  
+  	/*
+  	 * No need to make quota reservations here. We expect to release some
+@@@ -436,36 -423,28 +444,42 @@@
+  	xfs_trans_ijoin(trans, dp, 0);
+  
+  	/*
+ -	 * Decide on what work routines to call based on the inode size.
+ +	 * Invalidate and truncate the attribute fork extents. Make sure the
+ +	 * fork actually has attributes as otherwise the invalidation has no
+ +	 * blocks to read and returns an error. In this case, just do the fork
+ +	 * removal below.
+  	 */
+ -	if (!xfs_inode_hasattr(dp) ||
+ -	    dp->i_d.di_aformat == XFS_DINODE_FMT_LOCAL) {
+ -		error = 0;
+ -		goto out;
+ +	if (xfs_inode_hasattr(dp) &&
+ +	    dp->i_d.di_aformat != XFS_DINODE_FMT_LOCAL) {
+ +		error = xfs_attr3_root_inactive(&trans, dp);
+ +		if (error)
+ +			goto out_cancel;
+ +
+ +		error = xfs_itruncate_extents(&trans, dp, XFS_ATTR_FORK, 0);
+ +		if (error)
+ +			goto out_cancel;
+  	}
+ -	error = xfs_attr3_root_inactive(&trans, dp);
+ -	if (error)
+ -		goto out;
+  
+ -	error = xfs_itruncate_extents(&trans, dp, XFS_ATTR_FORK, 0);
+ -	if (error)
+ -		goto out;
+ +	/* Reset the attribute fork - this also destroys the in-core fork */
+ +	xfs_attr_fork_remove(dp, trans);
+  
+  	error = xfs_trans_commit(trans, XFS_TRANS_RELEASE_LOG_RES);
+ -	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ -
+ +	xfs_iunlock(dp, lock_mode);
+  	return error;
+  
+++<<<<<<< HEAD
+ +out_cancel:
+ +	xfs_trans_cancel(trans, cancel_flags);
+ +out_destroy_fork:
+ +	/* kill the in-core attr fork before we drop the inode lock */
+ +	if (dp->i_afp)
+ +		xfs_idestroy_fork(dp, XFS_ATTR_FORK);
+ +	if (lock_mode)
+ +		xfs_iunlock(dp, lock_mode);
+++=======
++ out:
++ 	xfs_trans_cancel(trans);
++ 	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+++>>>>>>> 4906e2154581 (xfs: remove the flags argument to xfs_trans_cancel)
+  	return error;
+  }
+diff --cc fs/xfs/xfs_bmap_util.c
+index d31faf0a2920,7e795cf60bd0..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1489,8 -1479,7 +1487,12 @@@ xfs_collapse_file_space
+  	return error;
+  
+  out:
+++<<<<<<< HEAD
+ +	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
+ +	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+++=======
++ 	xfs_trans_cancel(tp);
+++>>>>>>> 4906e2154581 (xfs: remove the flags argument to xfs_trans_cancel)
+  	return error;
+  }
+  
+diff --git a/fs/xfs/libxfs/xfs_attr.c b/fs/xfs/libxfs/xfs_attr.c
+index 0a472fbe06d4..126da7fc5ded 100644
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@ -266,7 +266,7 @@ xfs_attr_set(
+ 	tres.tr_logflags = XFS_TRANS_PERM_LOG_RES;
+ 	error = xfs_trans_reserve(args.trans, &tres, args.total, 0);
+ 	if (error) {
+-		xfs_trans_cancel(args.trans, 0);
++		xfs_trans_cancel(args.trans);
+ 		return error;
+ 	}
+ 	xfs_ilock(dp, XFS_ILOCK_EXCL);
+@@ -276,7 +276,7 @@ xfs_attr_set(
+ 				       XFS_QMOPT_RES_REGBLKS);
+ 	if (error) {
+ 		xfs_iunlock(dp, XFS_ILOCK_EXCL);
+-		xfs_trans_cancel(args.trans, XFS_TRANS_RELEASE_LOG_RES);
++		xfs_trans_cancel(args.trans);
+ 		return error;
+ 	}
+ 
+@@ -389,10 +389,8 @@ xfs_attr_set(
+ 	return error;
+ 
+ out:
+-	if (args.trans) {
+-		xfs_trans_cancel(args.trans,
+-			XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
+-	}
++	if (args.trans)
++		xfs_trans_cancel(args.trans);
+ 	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ 	return error;
+ }
+@@ -462,7 +460,7 @@ xfs_attr_remove(
+ 	error = xfs_trans_reserve(args.trans, &M_RES(mp)->tr_attrrm,
+ 				  XFS_ATTRRM_SPACE_RES(mp), 0);
+ 	if (error) {
+-		xfs_trans_cancel(args.trans, 0);
++		xfs_trans_cancel(args.trans);
+ 		return error;
+ 	}
+ 
+@@ -507,10 +505,8 @@ xfs_attr_remove(
+ 	return error;
+ 
+ out:
+-	if (args.trans) {
+-		xfs_trans_cancel(args.trans,
+-			XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
+-	}
++	if (args.trans)
++		xfs_trans_cancel(args.trans);
+ 	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ 	return error;
+ }
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/libxfs/xfs_sb.c b/fs/xfs/libxfs/xfs_sb.c
+index 019dc324a146..e1b32862bfa8 100644
+--- a/fs/xfs/libxfs/xfs_sb.c
++++ b/fs/xfs/libxfs/xfs_sb.c
+@@ -818,7 +818,7 @@ xfs_sync_sb(
+ 	tp = _xfs_trans_alloc(mp, XFS_TRANS_SB_CHANGE, KM_SLEEP);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+diff --git a/fs/xfs/libxfs/xfs_shared.h b/fs/xfs/libxfs/xfs_shared.h
+index 8dda4b321343..930cc7d295ec 100644
+--- a/fs/xfs/libxfs/xfs_shared.h
++++ b/fs/xfs/libxfs/xfs_shared.h
+@@ -185,7 +185,6 @@ int	xfs_log_calc_minimum_size(struct xfs_mount *);
+  * Values for call flags parameter.
+  */
+ #define	XFS_TRANS_RELEASE_LOG_RES	0x4
+-#define	XFS_TRANS_ABORT			0x8
+ 
+ /*
+  * Field values for xfs_trans_mod_sb.
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_attr_inactive.c
+* Unmerged path fs/xfs/xfs_bmap_util.c
+diff --git a/fs/xfs/xfs_dquot.c b/fs/xfs/xfs_dquot.c
+index a0f4af03c7d8..c0925de3b935 100644
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@ -568,8 +568,6 @@ xfs_qm_dqread(
+ 	struct xfs_buf		*bp;
+ 	struct xfs_trans	*tp = NULL;
+ 	int			error;
+-	int			cancelflags = 0;
+-
+ 
+ 	dqp = kmem_zone_zalloc(xfs_qm_dqzone, KM_SLEEP);
+ 
+@@ -617,7 +615,6 @@ xfs_qm_dqread(
+ 					  XFS_QM_DQALLOC_SPACE_RES(mp), 0);
+ 		if (error)
+ 			goto error1;
+-		cancelflags = XFS_TRANS_RELEASE_LOG_RES;
+ 	}
+ 
+ 	/*
+@@ -632,7 +629,6 @@ xfs_qm_dqread(
+ 		 * allocate (ENOENT).
+ 		 */
+ 		trace_xfs_dqread_fail(dqp);
+-		cancelflags |= XFS_TRANS_ABORT;
+ 		goto error1;
+ 	}
+ 
+@@ -680,7 +676,7 @@ xfs_qm_dqread(
+ 
+ error1:
+ 	if (tp)
+-		xfs_trans_cancel(tp, cancelflags);
++		xfs_trans_cancel(tp);
+ error0:
+ 	xfs_qm_dqdestroy(dqp);
+ 	*O_dqpp = NULL;
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index a43abe74112c..e01fee4e8fc6 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -139,7 +139,7 @@ xfs_update_prealloc_flags(
+ 	tp = xfs_trans_alloc(ip->i_mount, XFS_TRANS_WRITEID);
+ 	error = xfs_trans_reserve(tp, &M_RES(ip->i_mount)->tr_writeid, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_fsops.c b/fs/xfs/xfs_fsops.c
+index 4bd6463cd931..e988f0fe4fff 100644
+--- a/fs/xfs/xfs_fsops.c
++++ b/fs/xfs/xfs_fsops.c
+@@ -203,7 +203,7 @@ xfs_growfs_data_private(
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_growdata,
+ 				  XFS_GROWFS_SPACE_RES(mp), 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -559,7 +559,7 @@ xfs_growfs_data_private(
+ 	return saved_error ? saved_error : error;
+ 
+  error0:
+-	xfs_trans_cancel(tp, XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ 	return error;
+ }
+ 
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index d9c271cb1792..0212446ef162 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1092,7 +1092,6 @@ xfs_create(
+ 	xfs_bmap_free_t		free_list;
+ 	xfs_fsblock_t		first_block;
+ 	bool                    unlock_dp_on_error = false;
+-	uint			cancel_flags;
+ 	int			committed;
+ 	prid_t			prid;
+ 	struct xfs_dquot	*udqp = NULL;
+@@ -1130,8 +1129,6 @@ xfs_create(
+ 		tp = xfs_trans_alloc(mp, XFS_TRANS_CREATE);
+ 	}
+ 
+-	cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
+-
+ 	/*
+ 	 * Initially assume that the file does not exist and
+ 	 * reserve the resources for that case.  If that is not
+@@ -1149,10 +1146,9 @@ xfs_create(
+ 		resblks = 0;
+ 		error = xfs_trans_reserve(tp, tres, 0, 0);
+ 	}
+-	if (error) {
+-		cancel_flags = 0;
++	if (error)
+ 		goto out_trans_cancel;
+-	}
++
+ 
+ 	xfs_ilock(dp, XFS_ILOCK_EXCL | XFS_ILOCK_PARENT);
+ 	unlock_dp_on_error = true;
+@@ -1183,7 +1179,7 @@ xfs_create(
+ 	if (error) {
+ 		if (error == -ENOSPC)
+ 			goto out_trans_cancel;
+-		goto out_trans_abort;
++		goto out_trans_cancel;
+ 	}
+ 
+ 	/*
+@@ -1201,7 +1197,7 @@ xfs_create(
+ 					resblks - XFS_IALLOC_SPACE_RES(mp) : 0);
+ 	if (error) {
+ 		ASSERT(error != -ENOSPC);
+-		goto out_trans_abort;
++		goto out_trans_cancel;
+ 	}
+ 	xfs_trans_ichgtime(tp, dp, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+ 	xfs_trans_log_inode(tp, dp, XFS_ILOG_CORE);
+@@ -1248,10 +1244,8 @@ xfs_create(
+ 
+  out_bmap_cancel:
+ 	xfs_bmap_cancel(&free_list);
+- out_trans_abort:
+-	cancel_flags |= XFS_TRANS_ABORT;
+  out_trans_cancel:
+-	xfs_trans_cancel(tp, cancel_flags);
++	xfs_trans_cancel(tp);
+  out_release_inode:
+ 	/*
+ 	 * Wait until after the current transaction is aborted to finish the
+@@ -1283,7 +1277,6 @@ xfs_create_tmpfile(
+ 	struct xfs_inode	*ip = NULL;
+ 	struct xfs_trans	*tp = NULL;
+ 	int			error;
+-	uint			cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 	prid_t                  prid;
+ 	struct xfs_dquot	*udqp = NULL;
+ 	struct xfs_dquot	*gdqp = NULL;
+@@ -1316,10 +1309,8 @@ xfs_create_tmpfile(
+ 		resblks = 0;
+ 		error = xfs_trans_reserve(tp, tres, 0, 0);
+ 	}
+-	if (error) {
+-		cancel_flags = 0;
++	if (error)
+ 		goto out_trans_cancel;
+-	}
+ 
+ 	error = xfs_trans_reserve_quota(tp, mp, udqp, gdqp,
+ 						pdqp, resblks, 1, 0);
+@@ -1331,7 +1322,7 @@ xfs_create_tmpfile(
+ 	if (error) {
+ 		if (error == -ENOSPC)
+ 			goto out_trans_cancel;
+-		goto out_trans_abort;
++		goto out_trans_cancel;
+ 	}
+ 
+ 	if (mp->m_flags & XFS_MOUNT_WSYNC)
+@@ -1347,7 +1338,7 @@ xfs_create_tmpfile(
+ 	ip->i_d.di_nlink--;
+ 	error = xfs_iunlink(tp, ip);
+ 	if (error)
+-		goto out_trans_abort;
++		goto out_trans_cancel;
+ 
+ 	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+ 	if (error)
+@@ -1360,10 +1351,8 @@ xfs_create_tmpfile(
+ 	*ipp = ip;
+ 	return 0;
+ 
+- out_trans_abort:
+-	cancel_flags |= XFS_TRANS_ABORT;
+  out_trans_cancel:
+-	xfs_trans_cancel(tp, cancel_flags);
++	xfs_trans_cancel(tp);
+  out_release_inode:
+ 	/*
+ 	 * Wait until after the current transaction is aborted to finish the
+@@ -1393,7 +1382,6 @@ xfs_link(
+ 	int			error;
+ 	xfs_bmap_free_t         free_list;
+ 	xfs_fsblock_t           first_block;
+-	int			cancel_flags;
+ 	int			committed;
+ 	int			resblks;
+ 
+@@ -1413,17 +1401,14 @@ xfs_link(
+ 		goto std_return;
+ 
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_LINK);
+-	cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 	resblks = XFS_LINK_SPACE_RES(mp, target_name->len);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_link, resblks, 0);
+ 	if (error == -ENOSPC) {
+ 		resblks = 0;
+ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_link, 0, 0);
+ 	}
+-	if (error) {
+-		cancel_flags = 0;
++	if (error)
+ 		goto error_return;
+-	}
+ 
+ 	xfs_lock_two_inodes(sip, tdp, XFS_ILOCK_EXCL);
+ 
+@@ -1452,19 +1437,19 @@ xfs_link(
+ 	if (sip->i_d.di_nlink == 0) {
+ 		error = xfs_iunlink_remove(tp, sip);
+ 		if (error)
+-			goto abort_return;
++			goto error_return;
+ 	}
+ 
+ 	error = xfs_dir_createname(tp, tdp, target_name, sip->i_ino,
+ 					&first_block, &free_list, resblks);
+ 	if (error)
+-		goto abort_return;
++		goto error_return;
+ 	xfs_trans_ichgtime(tp, tdp, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+ 	xfs_trans_log_inode(tp, tdp, XFS_ILOG_CORE);
+ 
+ 	error = xfs_bumplink(tp, sip);
+ 	if (error)
+-		goto abort_return;
++		goto error_return;
+ 
+ 	/*
+ 	 * If this is a synchronous mount, make sure that the
+@@ -1478,15 +1463,13 @@ xfs_link(
+ 	error = xfs_bmap_finish (&tp, &free_list, &committed);
+ 	if (error) {
+ 		xfs_bmap_cancel(&free_list);
+-		goto abort_return;
++		goto error_return;
+ 	}
+ 
+ 	return xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+ 
+- abort_return:
+-	cancel_flags |= XFS_TRANS_ABORT;
+  error_return:
+-	xfs_trans_cancel(tp, cancel_flags);
++	xfs_trans_cancel(tp);
+  std_return:
+ 	return error;
+ }
+@@ -1699,7 +1682,7 @@ xfs_inactive_truncate(
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_itruncate, 0, 0);
+ 	if (error) {
+ 		ASSERT(XFS_FORCED_SHUTDOWN(mp));
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -1728,7 +1711,7 @@ xfs_inactive_truncate(
+ 	return 0;
+ 
+ error_trans_cancel:
+-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ error_unlock:
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	return error;
+@@ -1778,7 +1761,7 @@ xfs_inactive_ifree(
+ 		} else {
+ 			ASSERT(XFS_FORCED_SHUTDOWN(mp));
+ 		}
+-		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -1798,7 +1781,7 @@ xfs_inactive_ifree(
+ 				__func__, error);
+ 			xfs_force_shutdown(mp, SHUTDOWN_META_IO_ERROR);
+ 		}
+-		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
++		xfs_trans_cancel(tp);
+ 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 		return error;
+ 	}
+@@ -2492,7 +2475,6 @@ xfs_remove(
+ 	int                     error = 0;
+ 	xfs_bmap_free_t         free_list;
+ 	xfs_fsblock_t           first_block;
+-	int			cancel_flags;
+ 	int			committed;
+ 	uint			resblks;
+ 
+@@ -2513,7 +2495,6 @@ xfs_remove(
+ 		tp = xfs_trans_alloc(mp, XFS_TRANS_RMDIR);
+ 	else
+ 		tp = xfs_trans_alloc(mp, XFS_TRANS_REMOVE);
+-	cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 
+ 	/*
+ 	 * We try to get the real space reservation first,
+@@ -2532,7 +2513,6 @@ xfs_remove(
+ 	}
+ 	if (error) {
+ 		ASSERT(error != -ENOSPC);
+-		cancel_flags = 0;
+ 		goto out_trans_cancel;
+ 	}
+ 
+@@ -2544,7 +2524,6 @@ xfs_remove(
+ 	/*
+ 	 * If we're removing a directory perform some additional validation.
+ 	 */
+-	cancel_flags |= XFS_TRANS_ABORT;
+ 	if (is_dir) {
+ 		ASSERT(ip->i_d.di_nlink >= 2);
+ 		if (ip->i_d.di_nlink != 2) {
+@@ -2612,7 +2591,7 @@ xfs_remove(
+  out_bmap_cancel:
+ 	xfs_bmap_cancel(&free_list);
+  out_trans_cancel:
+-	xfs_trans_cancel(tp, cancel_flags);
++	xfs_trans_cancel(tp);
+  std_return:
+ 	return error;
+ }
+@@ -2686,7 +2665,7 @@ xfs_finish_rename(
+ 	error = xfs_bmap_finish(&tp, free_list, &committed);
+ 	if (error) {
+ 		xfs_bmap_cancel(free_list);
+-		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -2811,7 +2790,7 @@ xfs_cross_rename(
+ 
+ out_trans_abort:
+ 	xfs_bmap_cancel(free_list);
+-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ 	return error;
+ }
+ 
+@@ -2871,7 +2850,6 @@ xfs_rename(
+ 	int			num_inodes = __XFS_SORT_INODES;
+ 	bool			new_parent = (src_dp != target_dp);
+ 	bool			src_is_directory = S_ISDIR(src_ip->i_d.di_mode);
+-	int			cancel_flags = 0;
+ 	int			spaceres;
+ 	int			error;
+ 
+@@ -2907,7 +2885,6 @@ xfs_rename(
+ 	}
+ 	if (error)
+ 		goto out_trans_cancel;
+-	cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 
+ 	/*
+ 	 * Attach the dquots to the inodes
+@@ -2978,10 +2955,8 @@ xfs_rename(
+ 		error = xfs_dir_createname(tp, target_dp, target_name,
+ 						src_ip->i_ino, &first_block,
+ 						&free_list, spaceres);
+-		if (error == -ENOSPC)
+-			goto out_bmap_cancel;
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_bmap_cancel;
+ 
+ 		xfs_trans_ichgtime(tp, target_dp,
+ 					XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+@@ -2989,7 +2964,7 @@ xfs_rename(
+ 		if (new_parent && src_is_directory) {
+ 			error = xfs_bumplink(tp, target_dp);
+ 			if (error)
+-				goto out_trans_abort;
++				goto out_bmap_cancel;
+ 		}
+ 	} else { /* target_ip != NULL */
+ 		/*
+@@ -3021,7 +2996,7 @@ xfs_rename(
+ 					src_ip->i_ino,
+ 					&first_block, &free_list, spaceres);
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_bmap_cancel;
+ 
+ 		xfs_trans_ichgtime(tp, target_dp,
+ 					XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+@@ -3032,7 +3007,7 @@ xfs_rename(
+ 		 */
+ 		error = xfs_droplink(tp, target_ip);
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_bmap_cancel;
+ 
+ 		if (src_is_directory) {
+ 			/*
+@@ -3040,7 +3015,7 @@ xfs_rename(
+ 			 */
+ 			error = xfs_droplink(tp, target_ip);
+ 			if (error)
+-				goto out_trans_abort;
++				goto out_bmap_cancel;
+ 		}
+ 	} /* target_ip != NULL */
+ 
+@@ -3057,7 +3032,7 @@ xfs_rename(
+ 					&first_block, &free_list, spaceres);
+ 		ASSERT(error != -EEXIST);
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_bmap_cancel;
+ 	}
+ 
+ 	/*
+@@ -3083,7 +3058,7 @@ xfs_rename(
+ 		 */
+ 		error = xfs_droplink(tp, src_dp);
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_bmap_cancel;
+ 	}
+ 
+ 	/*
+@@ -3098,7 +3073,7 @@ xfs_rename(
+ 		error = xfs_dir_removename(tp, src_dp, src_name, src_ip->i_ino,
+ 					   &first_block, &free_list, spaceres);
+ 	if (error)
+-		goto out_trans_abort;
++		goto out_bmap_cancel;
+ 
+ 	/*
+ 	 * For whiteouts, we need to bump the link count on the whiteout inode.
+@@ -3112,10 +3087,10 @@ xfs_rename(
+ 		ASSERT(VFS_I(wip)->i_nlink == 0 && wip->i_d.di_nlink == 0);
+ 		error = xfs_bumplink(tp, wip);
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_bmap_cancel;
+ 		error = xfs_iunlink_remove(tp, wip);
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_bmap_cancel;
+ 		xfs_trans_log_inode(tp, wip, XFS_ILOG_CORE);
+ 
+ 		/*
+@@ -3136,12 +3111,10 @@ xfs_rename(
+ 		IRELE(wip);
+ 	return error;
+ 
+-out_trans_abort:
+-	cancel_flags |= XFS_TRANS_ABORT;
+ out_bmap_cancel:
+ 	xfs_bmap_cancel(&free_list);
+ out_trans_cancel:
+-	xfs_trans_cancel(tp, cancel_flags);
++	xfs_trans_cancel(tp);
+ 	if (wip)
+ 		IRELE(wip);
+ 	return error;
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 6326af4aa381..03fc8d0a6d24 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -362,7 +362,7 @@ xfs_set_dmattrs(
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_SET_DMATTRS);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
+@@ -1102,7 +1102,7 @@ xfs_ioctl_setattr_get_trans(
+ 	return tp;
+ 
+ out_cancel:
+-	xfs_trans_cancel(tp, 0);
++	xfs_trans_cancel(tp);
+ 	return ERR_PTR(error);
+ }
+ 
+@@ -1291,7 +1291,7 @@ xfs_ioctl_setattr(
+ 	return code;
+ 
+ error_trans_cancel:
+-	xfs_trans_cancel(tp, 0);
++	xfs_trans_cancel(tp);
+ error_free_dquots:
+ 	xfs_qm_dqrele(udqp);
+ 	xfs_qm_dqrele(pdqp);
+@@ -1364,7 +1364,7 @@ xfs_ioc_setxflags(
+ 
+ 	error = xfs_ioctl_setattr_xflags(tp, ip, &fa);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		goto out_drop_write;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 38e633bad8c2..6ca842abae10 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -183,7 +183,7 @@ xfs_iomap_write_direct(
+ 	 * Check for running out of space, note: need lock to return
+ 	 */
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -236,7 +236,7 @@ out_bmap_cancel:
+ 	xfs_bmap_cancel(&free_list);
+ 	xfs_trans_unreserve_quota_nblks(tp, ip, (long)qblocks, 0, quota_flag);
+ out_trans_cancel:
+-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ 	goto out_unlock;
+ }
+ 
+@@ -690,7 +690,7 @@ xfs_iomap_write_allocate(
+ 			error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
+ 						  nres, 0);
+ 			if (error) {
+-				xfs_trans_cancel(tp, 0);
++				xfs_trans_cancel(tp);
+ 				return error;
+ 			}
+ 			xfs_ilock(ip, XFS_ILOCK_EXCL);
+@@ -791,7 +791,7 @@ xfs_iomap_write_allocate(
+ 
+ trans_cancel:
+ 	xfs_bmap_cancel(&free_list);
+-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ error0:
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	return error;
+@@ -853,7 +853,7 @@ xfs_iomap_write_unwritten(
+ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
+ 					  resblks, 0);
+ 		if (error) {
+-			xfs_trans_cancel(tp, 0);
++			xfs_trans_cancel(tp);
+ 			return error;
+ 		}
+ 
+@@ -914,7 +914,7 @@ xfs_iomap_write_unwritten(
+ 
+ error_on_bmapi_transaction:
+ 	xfs_bmap_cancel(&free_list);
+-	xfs_trans_cancel(tp, (XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT));
++	xfs_trans_cancel(tp);
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	return error;
+ }
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index 5e33f3364b73..cc8544cd04f0 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -730,7 +730,7 @@ xfs_setattr_nonsize(
+ 	return 0;
+ 
+ out_trans_cancel:
+-	xfs_trans_cancel(tp, 0);
++	xfs_trans_cancel(tp);
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ out_dqrele:
+ 	xfs_qm_dqrele(udqp);
+@@ -752,7 +752,6 @@ xfs_setattr_size(
+ 	struct xfs_trans	*tp;
+ 	int			error;
+ 	uint			lock_flags = 0;
+-	uint			commit_flags = 0;
+ 	bool			did_zeroing = false;
+ 
+ 	trace_xfs_setattr(ip);
+@@ -858,7 +857,6 @@ xfs_setattr_size(
+ 	if (error)
+ 		goto out_trans_cancel;
+ 
+-	commit_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 	lock_flags |= XFS_ILOCK_EXCL;
+ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 	xfs_trans_ijoin(tp, ip, 0);
+@@ -898,7 +896,7 @@ xfs_setattr_size(
+ 	if (newsize <= oldsize) {
+ 		error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, newsize);
+ 		if (error)
+-			goto out_trans_abort;
++			goto out_trans_cancel;
+ 
+ 		/*
+ 		 * Truncated "down", so we're removing references to old data
+@@ -931,10 +929,8 @@ out_unlock:
+ 		xfs_iunlock(ip, lock_flags);
+ 	return error;
+ 
+-out_trans_abort:
+-	commit_flags |= XFS_TRANS_ABORT;
+ out_trans_cancel:
+-	xfs_trans_cancel(tp, commit_flags);
++	xfs_trans_cancel(tp);
+ 	goto out_unlock;
+ }
+ 
+@@ -981,7 +977,7 @@ xfs_vn_update_time(
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_FSYNC_TS);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_fsyncts, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 29e2fbb305f9..435526c6008c 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -3787,7 +3787,7 @@ xlog_recover_process_efi(
+ 	return error;
+ 
+ abort_error:
+-	xfs_trans_cancel(tp, XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ 	return error;
+ }
+ 
+@@ -3895,7 +3895,7 @@ xlog_recover_clear_agi_bucket(
+ 	return;
+ 
+ out_abort:
+-	xfs_trans_cancel(tp, XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ out_error:
+ 	xfs_warn(mp, "%s: failed to clear agi %d. Continuing.", __func__, agno);
+ 	return;
+diff --git a/fs/xfs/xfs_pnfs.c b/fs/xfs/xfs_pnfs.c
+index 981a657eca39..3bb6097c7dd3 100644
+--- a/fs/xfs/xfs_pnfs.c
++++ b/fs/xfs/xfs_pnfs.c
+@@ -306,7 +306,7 @@ xfs_fs_commit_blocks(
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_SETATTR_NOT_SIZE);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		goto out_drop_iolock;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index c93b497fa09e..bb4c19993c2b 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -612,7 +612,7 @@ xfs_qm_qino_alloc(
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_create,
+ 				  XFS_QM_QINOCREATE_SPACE_RES(mp), 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -620,8 +620,7 @@ xfs_qm_qino_alloc(
+ 		error = xfs_dir_ialloc(&tp, NULL, S_IFREG, 1, 0, 0, 1, ip,
+ 								&committed);
+ 		if (error) {
+-			xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES |
+-					 XFS_TRANS_ABORT);
++			xfs_trans_cancel(tp);
+ 			return error;
+ 		}
+ 	}
+diff --git a/fs/xfs/xfs_qm_syscalls.c b/fs/xfs/xfs_qm_syscalls.c
+index 784c41b3ad84..80365f4308f5 100644
+--- a/fs/xfs/xfs_qm_syscalls.c
++++ b/fs/xfs/xfs_qm_syscalls.c
+@@ -241,7 +241,7 @@ xfs_qm_scall_trunc_qfile(
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_TRUNCATE_FILE);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_itruncate, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+ 		goto out_put;
+ 	}
+@@ -254,8 +254,7 @@ xfs_qm_scall_trunc_qfile(
+ 
+ 	error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES |
+-				     XFS_TRANS_ABORT);
++		xfs_trans_cancel(tp);
+ 		goto out_unlock;
+ 	}
+ 
+@@ -592,7 +591,7 @@ xfs_qm_scall_setqlim(
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_QM_SETQLIM);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_setqlim, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		goto out_rele;
+ 	}
+ 
+@@ -726,7 +725,7 @@ xfs_qm_log_quotaoff_end(
+ 
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_equotaoff, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -760,7 +759,7 @@ xfs_qm_log_quotaoff(
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_QM_QUOTAOFF);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_quotaoff, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		goto out;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_rtalloc.c b/fs/xfs/xfs_rtalloc.c
+index f2079b6911cc..ff5af6693650 100644
+--- a/fs/xfs/xfs_rtalloc.c
++++ b/fs/xfs/xfs_rtalloc.c
+@@ -780,7 +780,6 @@ xfs_growfs_rt_alloc(
+ 	 * Allocate space to the file, as necessary.
+ 	 */
+ 	while (oblocks < nblocks) {
+-		int		cancelflags = 0;
+ 		xfs_trans_t	*tp;
+ 
+ 		tp = xfs_trans_alloc(mp, XFS_TRANS_GROWFSRT_ALLOC);
+@@ -792,7 +791,6 @@ xfs_growfs_rt_alloc(
+ 					  resblks, 0);
+ 		if (error)
+ 			goto error_cancel;
+-		cancelflags = XFS_TRANS_RELEASE_LOG_RES;
+ 		/*
+ 		 * Lock the inode.
+ 		 */
+@@ -804,7 +802,6 @@ xfs_growfs_rt_alloc(
+ 		 * Allocate blocks to the bitmap file.
+ 		 */
+ 		nmap = 1;
+-		cancelflags |= XFS_TRANS_ABORT;
+ 		error = xfs_bmapi_write(tp, ip, oblocks, nblocks - oblocks,
+ 					XFS_BMAPI_METADATA, &firstblock,
+ 					resblks, &map, &nmap, &flist);
+@@ -825,7 +822,6 @@ xfs_growfs_rt_alloc(
+ 		 * Now we need to clear the allocated blocks.
+ 		 * Do this one block per transaction, to keep it simple.
+ 		 */
+-		cancelflags = 0;
+ 		for (bno = map.br_startoff, fsbno = map.br_startblock;
+ 		     bno < map.br_startoff + map.br_blockcount;
+ 		     bno++, fsbno++) {
+@@ -851,7 +847,7 @@ xfs_growfs_rt_alloc(
+ 			if (bp == NULL) {
+ 				error = -EIO;
+ error_cancel:
+-				xfs_trans_cancel(tp, cancelflags);
++				xfs_trans_cancel(tp);
+ 				goto error;
+ 			}
+ 			memset(bp->b_addr, 0, mp->m_sb.sb_blocksize);
+@@ -973,7 +969,6 @@ xfs_growfs_rt(
+ 	     bmbno < nrbmblocks;
+ 	     bmbno++) {
+ 		xfs_trans_t	*tp;
+-		int		cancelflags = 0;
+ 
+ 		*nmp = *mp;
+ 		nsbp = &nmp->m_sb;
+@@ -1015,7 +1010,6 @@ xfs_growfs_rt(
+ 		mp->m_rbmip->i_d.di_size =
+ 			nsbp->sb_rbmblocks * nsbp->sb_blocksize;
+ 		xfs_trans_log_inode(tp, mp->m_rbmip, XFS_ILOG_CORE);
+-		cancelflags |= XFS_TRANS_ABORT;
+ 		/*
+ 		 * Get the summary inode into the transaction.
+ 		 */
+@@ -1062,7 +1056,7 @@ xfs_growfs_rt(
+ 			nsbp->sb_rextents - sbp->sb_rextents, &bp, &sumbno);
+ 		if (error) {
+ error_cancel:
+-			xfs_trans_cancel(tp, cancelflags);
++			xfs_trans_cancel(tp);
+ 			break;
+ 		}
+ 		/*
+diff --git a/fs/xfs/xfs_symlink.c b/fs/xfs/xfs_symlink.c
+index 3df411eadb86..b5573bf45ca1 100644
+--- a/fs/xfs/xfs_symlink.c
++++ b/fs/xfs/xfs_symlink.c
+@@ -178,7 +178,6 @@ xfs_symlink(
+ 	struct xfs_bmap_free	free_list;
+ 	xfs_fsblock_t		first_block;
+ 	bool                    unlock_dp_on_error = false;
+-	uint			cancel_flags;
+ 	int			committed;
+ 	xfs_fileoff_t		first_fsb;
+ 	xfs_filblks_t		fs_blocks;
+@@ -224,7 +223,6 @@ xfs_symlink(
+ 		return error;
+ 
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_SYMLINK);
+-	cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 	/*
+ 	 * The symlink will fit into the inode data fork?
+ 	 * There can't be any attributes so we get the whole variable part.
+@@ -239,10 +237,8 @@ xfs_symlink(
+ 		resblks = 0;
+ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_symlink, 0, 0);
+ 	}
+-	if (error) {
+-		cancel_flags = 0;
++	if (error)
+ 		goto out_trans_cancel;
+-	}
+ 
+ 	xfs_ilock(dp, XFS_ILOCK_EXCL | XFS_ILOCK_PARENT);
+ 	unlock_dp_on_error = true;
+@@ -407,9 +403,8 @@ xfs_symlink(
+ 
+ out_bmap_cancel:
+ 	xfs_bmap_cancel(&free_list);
+-	cancel_flags |= XFS_TRANS_ABORT;
+ out_trans_cancel:
+-	xfs_trans_cancel(tp, cancel_flags);
++	xfs_trans_cancel(tp);
+ out_release_inode:
+ 	/*
+ 	 * Wait until after the current transaction is aborted to finish the
+@@ -464,7 +459,7 @@ xfs_inactive_symlink_rmt(
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_INACTIVE);
+ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_itruncate, 0, 0);
+ 	if (error) {
+-		xfs_trans_cancel(tp, 0);
++		xfs_trans_cancel(tp);
+ 		return error;
+ 	}
+ 
+@@ -552,7 +547,7 @@ xfs_inactive_symlink_rmt(
+ error_bmap_cancel:
+ 	xfs_bmap_cancel(&free_list);
+ error_trans_cancel:
+-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
++	xfs_trans_cancel(tp);
+ error_unlock:
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	return error;
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 42a1adf81dad..6cca99640d1a 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -986,29 +986,22 @@ out_unreserve:
+  */
+ void
+ xfs_trans_cancel(
+-	xfs_trans_t		*tp,
+-	int			flags)
++	struct xfs_trans	*tp)
+ {
+-	int			log_flags;
+-	xfs_mount_t		*mp = tp->t_mountp;
++	struct xfs_mount	*mp = tp->t_mountp;
++	bool			dirty = (tp->t_flags & XFS_TRANS_DIRTY);
+ 
+-	/*
+-	 * See if the caller is being too lazy to figure out if
+-	 * the transaction really needs an abort.
+-	 */
+-	if ((flags & XFS_TRANS_ABORT) && !(tp->t_flags & XFS_TRANS_DIRTY))
+-		flags &= ~XFS_TRANS_ABORT;
+ 	/*
+ 	 * See if the caller is relying on us to shut down the
+ 	 * filesystem.  This happens in paths where we detect
+ 	 * corruption and decide to give up.
+ 	 */
+-	if ((tp->t_flags & XFS_TRANS_DIRTY) && !XFS_FORCED_SHUTDOWN(mp)) {
++	if (dirty && !XFS_FORCED_SHUTDOWN(mp)) {
+ 		XFS_ERROR_REPORT("xfs_trans_cancel", XFS_ERRLEVEL_LOW, mp);
+ 		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+ 	}
+ #ifdef DEBUG
+-	if (!(flags & XFS_TRANS_ABORT) && !XFS_FORCED_SHUTDOWN(mp)) {
++	if (!dirty && !XFS_FORCED_SHUTDOWN(mp)) {
+ 		struct xfs_log_item_desc *lidp;
+ 
+ 		list_for_each_entry(lidp, &tp->t_items, lid_trans)
+@@ -1019,19 +1012,17 @@ xfs_trans_cancel(
+ 	xfs_trans_unreserve_and_mod_dquots(tp);
+ 
+ 	if (tp->t_ticket) {
+-		if (flags & XFS_TRANS_RELEASE_LOG_RES) {
+-			ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
++		uint		log_flags = 0;
++
++		if (tp->t_flags & XFS_TRANS_PERM_LOG_RES)
+ 			log_flags = XFS_LOG_REL_PERM_RESERV;
+-		} else {
+-			log_flags = 0;
+-		}
+ 		xfs_log_done(mp, tp->t_ticket, NULL, log_flags);
+ 	}
+ 
+ 	/* mark this thread as no longer being in a transaction */
+ 	current_restore_flags_nested(&tp->t_pflags, PF_FSTRANS);
+ 
+-	xfs_trans_free_items(tp, NULLCOMMITLSN, flags & XFS_TRANS_ABORT);
++	xfs_trans_free_items(tp, NULLCOMMITLSN, dirty);
+ 	xfs_trans_free(tp);
+ }
+ 
+diff --git a/fs/xfs/xfs_trans.h b/fs/xfs/xfs_trans.h
+index 3bfb4176e19b..ca95b92a40a5 100644
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -227,7 +227,7 @@ void		xfs_trans_log_efd_extent(xfs_trans_t *,
+ 					 xfs_extlen_t);
+ int		xfs_trans_commit(xfs_trans_t *, uint flags);
+ int		xfs_trans_roll(struct xfs_trans **, struct xfs_inode *);
+-void		xfs_trans_cancel(xfs_trans_t *, int);
++void		xfs_trans_cancel(xfs_trans_t *);
+ int		xfs_trans_ail_init(struct xfs_mount *);
+ void		xfs_trans_ail_destroy(struct xfs_mount *);
+ 
