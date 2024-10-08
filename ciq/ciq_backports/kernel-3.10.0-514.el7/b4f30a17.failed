@@ -1,0 +1,156 @@
+mmc: core: Allow card drive strength to be different to host
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit b4f30a174e1fda8118eda038b5d8d5260db36ad5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b4f30a17.failed
+
+Initialization of UHS-I modes for SD and SDIO cards
+employs a callback to allow the host driver to
+choose a drive strength value. Currently that
+assumes the card drive strength and host driver
+type must be the same value. Change to let the
+callback make that decision and return both the
+card drive strength and host driver type.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit b4f30a174e1fda8118eda038b5d8d5260db36ad5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/sd.c
+#	include/linux/mmc/host.h
+diff --cc drivers/mmc/core/sd.c
+index da5e61e128a5,5edd7d8b033e..000000000000
+--- a/drivers/mmc/core/sd.c
++++ b/drivers/mmc/core/sd.c
+@@@ -432,20 -421,22 +423,33 @@@ static int sd_select_driver_type(struc
+  	mmc_host_clk_hold(card->host);
+  	drive_strength = card->host->ops->select_drive_strength(
+  		card->sw_caps.uhs_max_dtr,
+- 		host_drv_type, card_drv_type);
++ 		host_drv_type, card_drv_type, &drv_type);
+  	mmc_host_clk_release(card->host);
+  
+++<<<<<<< HEAD
+ +	err = mmc_sd_switch(card, 1, 2, drive_strength, status);
+ +	if (err)
+ +		return err;
+ +
+ +	if ((status[15] & 0xF) != drive_strength) {
+ +		pr_warning("%s: Problem setting drive strength!\n",
+ +			mmc_hostname(card->host));
+ +		return 0;
+++=======
++ 	if (drive_strength) {
++ 		err = mmc_sd_switch(card, 1, 2, drive_strength, status);
++ 		if (err)
++ 			return err;
++ 		if ((status[15] & 0xF) != drive_strength) {
++ 			pr_warn("%s: Problem setting drive strength!\n",
++ 				mmc_hostname(card->host));
++ 			return 0;
++ 		}
+++>>>>>>> b4f30a174e1f (mmc: core: Allow card drive strength to be different to host)
+  	}
+  
+- 	mmc_set_driver_type(card->host, drive_strength);
++ 	if (drv_type)
++ 		mmc_set_driver_type(card->host, drv_type);
+  
+  	return 0;
+  }
+diff --cc include/linux/mmc/host.h
+index 4d8d14da1237,da33d18c66c8..000000000000
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@@ -132,7 -129,11 +132,15 @@@ struct mmc_host_ops 
+  
+  	/* The tuning command opcode value is different for SD and eMMC cards */
+  	int	(*execute_tuning)(struct mmc_host *host, u32 opcode);
+++<<<<<<< HEAD
+ +	int	(*select_drive_strength)(unsigned int max_dtr, int host_drv, int card_drv);
+++=======
++ 
++ 	/* Prepare HS400 target operating frequency depending host driver */
++ 	int	(*prepare_hs400_tuning)(struct mmc_host *host, struct mmc_ios *ios);
++ 	int	(*select_drive_strength)(unsigned int max_dtr, int host_drv,
++ 					 int card_drv, int *drv_type);
+++>>>>>>> b4f30a174e1f (mmc: core: Allow card drive strength to be different to host)
+  	void	(*hw_reset)(struct mmc_host *host);
+  	void	(*card_event)(struct mmc_host *host);
+  
+* Unmerged path drivers/mmc/core/sd.c
+diff --git a/drivers/mmc/core/sdio.c b/drivers/mmc/core/sdio.c
+index d2f16e27144d..f3e57bf35388 100644
+--- a/drivers/mmc/core/sdio.c
++++ b/drivers/mmc/core/sdio.c
+@@ -404,21 +404,10 @@ static void sdio_select_driver_type(struct mmc_card *card)
+ {
+ 	int host_drv_type = SD_DRIVER_TYPE_B;
+ 	int card_drv_type = SD_DRIVER_TYPE_B;
+-	int drive_strength;
++	int drive_strength, drv_type;
+ 	unsigned char card_strength;
+ 	int err;
+ 
+-	/*
+-	 * If the host doesn't support any of the Driver Types A,C or D,
+-	 * or there is no board specific handler then default Driver
+-	 * Type B is used.
+-	 */
+-	if (!(card->host->caps &
+-		(MMC_CAP_DRIVER_TYPE_A |
+-		 MMC_CAP_DRIVER_TYPE_C |
+-		 MMC_CAP_DRIVER_TYPE_D)))
+-		return;
+-
+ 	if (!card->host->ops->select_drive_strength)
+ 		return;
+ 
+@@ -448,23 +437,27 @@ static void sdio_select_driver_type(struct mmc_card *card)
+ 	 */
+ 	drive_strength = card->host->ops->select_drive_strength(
+ 		card->sw_caps.uhs_max_dtr,
+-		host_drv_type, card_drv_type);
++		host_drv_type, card_drv_type, &drv_type);
+ 
+-	/* if error just use default for drive strength B */
+-	err = mmc_io_rw_direct(card, 0, 0, SDIO_CCCR_DRIVE_STRENGTH, 0,
+-		&card_strength);
+-	if (err)
+-		return;
++	if (drive_strength) {
++		/* if error just use default for drive strength B */
++		err = mmc_io_rw_direct(card, 0, 0, SDIO_CCCR_DRIVE_STRENGTH, 0,
++				       &card_strength);
++		if (err)
++			return;
+ 
+-	card_strength &= ~(SDIO_DRIVE_DTSx_MASK<<SDIO_DRIVE_DTSx_SHIFT);
+-	card_strength |= host_drive_to_sdio_drive(drive_strength);
++		card_strength &= ~(SDIO_DRIVE_DTSx_MASK<<SDIO_DRIVE_DTSx_SHIFT);
++		card_strength |= host_drive_to_sdio_drive(drive_strength);
+ 
+-	err = mmc_io_rw_direct(card, 1, 0, SDIO_CCCR_DRIVE_STRENGTH,
+-		card_strength, NULL);
++		/* if error default to drive strength B */
++		err = mmc_io_rw_direct(card, 1, 0, SDIO_CCCR_DRIVE_STRENGTH,
++				       card_strength, NULL);
++		if (err)
++			return;
++	}
+ 
+-	/* if error default to drive strength B */
+-	if (!err)
+-		mmc_set_driver_type(card->host, drive_strength);
++	if (drv_type)
++		mmc_set_driver_type(card->host, drv_type);
+ }
+ 
+ 
+* Unmerged path include/linux/mmc/host.h
