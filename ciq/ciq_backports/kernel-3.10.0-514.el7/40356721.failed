@@ -1,0 +1,170 @@
+perf symbols: Do not read symbols/data from device files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 403567217d3fa5d4801f820317ada52e5c5f0e53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/40356721.failed
+
+With mem sampling we could get data source within mapped device file.
+Processing such sample would block during report phase on trying to read
+the device file.
+
+Chacking for device files and skip the processing if it's detected.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/1453290995-18485-2-git-send-email-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 403567217d3fa5d4801f820317ada52e5c5f0e53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/util.c
+#	tools/perf/util/util.h
+diff --cc tools/perf/util/util.c
+index 8228f4f63f42,7a2da7ef556e..000000000000
+--- a/tools/perf/util/util.c
++++ b/tools/perf/util/util.c
+@@@ -633,3 -635,69 +633,72 @@@ bool find_process(const char *name
+  	closedir(dir);
+  	return ret ? false : true;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int
++ fetch_kernel_version(unsigned int *puint, char *str,
++ 		     size_t str_size)
++ {
++ 	struct utsname utsname;
++ 	int version, patchlevel, sublevel, err;
++ 
++ 	if (uname(&utsname))
++ 		return -1;
++ 
++ 	if (str && str_size) {
++ 		strncpy(str, utsname.release, str_size);
++ 		str[str_size - 1] = '\0';
++ 	}
++ 
++ 	err = sscanf(utsname.release, "%d.%d.%d",
++ 		     &version, &patchlevel, &sublevel);
++ 
++ 	if (err != 3) {
++ 		pr_debug("Unablt to get kernel version from uname '%s'\n",
++ 			 utsname.release);
++ 		return -1;
++ 	}
++ 
++ 	if (puint)
++ 		*puint = (version << 16) + (patchlevel << 8) + sublevel;
++ 	return 0;
++ }
++ 
++ const char *perf_tip(const char *dirpath)
++ {
++ 	struct strlist *tips;
++ 	struct str_node *node;
++ 	char *tip = NULL;
++ 	struct strlist_config conf = {
++ 		.dirname = dirpath,
++ 		.file_only = true,
++ 	};
++ 
++ 	tips = strlist__new("tips.txt", &conf);
++ 	if (tips == NULL)
++ 		return errno == ENOENT ? NULL : "Tip: get more memory! ;-p";
++ 
++ 	if (strlist__nr_entries(tips) == 0)
++ 		goto out;
++ 
++ 	node = strlist__entry(tips, random() % strlist__nr_entries(tips));
++ 	if (asprintf(&tip, "Tip: %s", node->s) < 0)
++ 		tip = (char *)"Tip: get more memory! ;-)";
++ 
++ out:
++ 	strlist__delete(tips);
++ 
++ 	return tip;
++ }
++ 
++ bool is_regular_file(const char *file)
++ {
++ 	struct stat st;
++ 
++ 	if (stat(file, &st))
++ 		return false;
++ 
++ 	return S_ISREG(st.st_mode);
++ }
+++>>>>>>> 403567217d3f (perf symbols: Do not read symbols/data from device files)
+diff --cc tools/perf/util/util.h
+index 4e5c6ce20b5a,61650f05e5c1..000000000000
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@@ -348,4 -334,15 +348,18 @@@ static inline char *asprintf_expr_not_i
+  
+  int get_stack_size(const char *str, unsigned long *_size);
+  
+++<<<<<<< HEAD
+++=======
++ int fetch_kernel_version(unsigned int *puint,
++ 			 char *str, size_t str_sz);
++ #define KVER_VERSION(x)		(((x) >> 16) & 0xff)
++ #define KVER_PATCHLEVEL(x)	(((x) >> 8) & 0xff)
++ #define KVER_SUBLEVEL(x)	((x) & 0xff)
++ #define KVER_FMT	"%d.%d.%d"
++ #define KVER_PARAM(x)	KVER_VERSION(x), KVER_PATCHLEVEL(x), KVER_SUBLEVEL(x)
++ 
++ const char *perf_tip(const char *dirpath);
++ bool is_regular_file(const char *file);
++ 
+++>>>>>>> 403567217d3f (perf symbols: Do not read symbols/data from device files)
+  #endif /* GIT_COMPAT_UTIL_H */
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index e8e9a9dbf5e3..8e6395439ca0 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -52,6 +52,11 @@ int dso__read_binary_type_filename(const struct dso *dso,
+ 			debuglink--;
+ 		if (*debuglink == '/')
+ 			debuglink++;
++
++		ret = -1;
++		if (!is_regular_file(filename))
++			break;
++
+ 		ret = filename__read_debuglink(filename, debuglink,
+ 					       size - (debuglink - filename));
+ 		}
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index ab02209a7cf3..90cedfa30e43 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -1466,7 +1466,8 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
+ 	 * Read the build id if possible. This is required for
+ 	 * DSO_BINARY_TYPE__BUILDID_DEBUGINFO to work
+ 	 */
+-	if (filename__read_build_id(dso->long_name, build_id, BUILD_ID_SIZE) > 0)
++	if (is_regular_file(name) &&
++	    filename__read_build_id(dso->long_name, build_id, BUILD_ID_SIZE) > 0)
+ 		dso__set_build_id(dso, build_id);
+ 
+ 	/*
+@@ -1487,6 +1488,9 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
+ 						   root_dir, name, PATH_MAX))
+ 			continue;
+ 
++		if (!is_regular_file(name))
++			continue;
++
+ 		/* Name is now the name of the next image to try */
+ 		if (symsrc__init(ss, dso, name, symtab_type) < 0)
+ 			continue;
+* Unmerged path tools/perf/util/util.c
+* Unmerged path tools/perf/util/util.h
