@@ -1,0 +1,581 @@
+KVM: use kvm_memslots whenever possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] use kvm_memslots whenever possible (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 93.15%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 9f6b8029787bb37170d4535e9fc09158f634282c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9f6b8029.failed
+
+kvm_memslots provides lockdep checking.  Use it consistently instead of
+explicit dereferencing of kvm->memslots.
+
+	Reviewed-by: Radim Krcmar <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9f6b8029787bb37170d4535e9fc09158f634282c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/kvm/mmu.c
+#	arch/mips/kvm/kvm_mips.c
+#	arch/s390/kvm/kvm-s390.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/arm/kvm/mmu.c
+index 84ba67b982c0,6f0f8f3ac7df..000000000000
+--- a/arch/arm/kvm/mmu.c
++++ b/arch/arm/kvm/mmu.c
+@@@ -517,18 -988,244 +517,241 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool transparent_hugepage_adjust(pfn_t *pfnp, phys_addr_t *ipap)
++ {
++ 	pfn_t pfn = *pfnp;
++ 	gfn_t gfn = *ipap >> PAGE_SHIFT;
++ 
++ 	if (PageTransCompound(pfn_to_page(pfn))) {
++ 		unsigned long mask;
++ 		/*
++ 		 * The address we faulted on is backed by a transparent huge
++ 		 * page.  However, because we map the compound huge page and
++ 		 * not the individual tail page, we need to transfer the
++ 		 * refcount to the head page.  We have to be careful that the
++ 		 * THP doesn't start to split while we are adjusting the
++ 		 * refcounts.
++ 		 *
++ 		 * We are sure this doesn't happen, because mmu_notifier_retry
++ 		 * was successful and we are holding the mmu_lock, so if this
++ 		 * THP is trying to split, it will be blocked in the mmu
++ 		 * notifier before touching any of the pages, specifically
++ 		 * before being able to call __split_huge_page_refcount().
++ 		 *
++ 		 * We can therefore safely transfer the refcount from PG_tail
++ 		 * to PG_head and switch the pfn from a tail page to the head
++ 		 * page accordingly.
++ 		 */
++ 		mask = PTRS_PER_PMD - 1;
++ 		VM_BUG_ON((gfn & mask) != (pfn & mask));
++ 		if (pfn & mask) {
++ 			*ipap &= PMD_MASK;
++ 			kvm_release_pfn_clean(pfn);
++ 			pfn &= ~mask;
++ 			kvm_get_pfn(pfn);
++ 			*pfnp = pfn;
++ 		}
++ 
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool kvm_is_write_fault(struct kvm_vcpu *vcpu)
++ {
++ 	if (kvm_vcpu_trap_is_iabt(vcpu))
++ 		return false;
++ 
++ 	return kvm_vcpu_dabt_iswrite(vcpu);
++ }
++ 
++ static bool kvm_is_device_pfn(unsigned long pfn)
++ {
++ 	return !pfn_valid(pfn);
++ }
++ 
++ /**
++  * stage2_wp_ptes - write protect PMD range
++  * @pmd:	pointer to pmd entry
++  * @addr:	range start address
++  * @end:	range end address
++  */
++ static void stage2_wp_ptes(pmd_t *pmd, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pte_t *pte;
++ 
++ 	pte = pte_offset_kernel(pmd, addr);
++ 	do {
++ 		if (!pte_none(*pte)) {
++ 			if (!kvm_s2pte_readonly(pte))
++ 				kvm_set_s2pte_readonly(pte);
++ 		}
++ 	} while (pte++, addr += PAGE_SIZE, addr != end);
++ }
++ 
++ /**
++  * stage2_wp_pmds - write protect PUD range
++  * @pud:	pointer to pud entry
++  * @addr:	range start address
++  * @end:	range end address
++  */
++ static void stage2_wp_pmds(pud_t *pud, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pmd_t *pmd;
++ 	phys_addr_t next;
++ 
++ 	pmd = pmd_offset(pud, addr);
++ 
++ 	do {
++ 		next = kvm_pmd_addr_end(addr, end);
++ 		if (!pmd_none(*pmd)) {
++ 			if (kvm_pmd_huge(*pmd)) {
++ 				if (!kvm_s2pmd_readonly(pmd))
++ 					kvm_set_s2pmd_readonly(pmd);
++ 			} else {
++ 				stage2_wp_ptes(pmd, addr, next);
++ 			}
++ 		}
++ 	} while (pmd++, addr = next, addr != end);
++ }
++ 
++ /**
++   * stage2_wp_puds - write protect PGD range
++   * @pgd:	pointer to pgd entry
++   * @addr:	range start address
++   * @end:	range end address
++   *
++   * Process PUD entries, for a huge PUD we cause a panic.
++   */
++ static void  stage2_wp_puds(pgd_t *pgd, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pud_t *pud;
++ 	phys_addr_t next;
++ 
++ 	pud = pud_offset(pgd, addr);
++ 	do {
++ 		next = kvm_pud_addr_end(addr, end);
++ 		if (!pud_none(*pud)) {
++ 			/* TODO:PUD not supported, revisit later if supported */
++ 			BUG_ON(kvm_pud_huge(*pud));
++ 			stage2_wp_pmds(pud, addr, next);
++ 		}
++ 	} while (pud++, addr = next, addr != end);
++ }
++ 
++ /**
++  * stage2_wp_range() - write protect stage2 memory region range
++  * @kvm:	The KVM pointer
++  * @addr:	Start address of range
++  * @end:	End address of range
++  */
++ static void stage2_wp_range(struct kvm *kvm, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pgd_t *pgd;
++ 	phys_addr_t next;
++ 
++ 	pgd = kvm->arch.pgd + kvm_pgd_index(addr);
++ 	do {
++ 		/*
++ 		 * Release kvm_mmu_lock periodically if the memory region is
++ 		 * large. Otherwise, we may see kernel panics with
++ 		 * CONFIG_DETECT_HUNG_TASK, CONFIG_LOCKUP_DETECTOR,
++ 		 * CONFIG_LOCKDEP. Additionally, holding the lock too long
++ 		 * will also starve other vCPUs.
++ 		 */
++ 		if (need_resched() || spin_needbreak(&kvm->mmu_lock))
++ 			cond_resched_lock(&kvm->mmu_lock);
++ 
++ 		next = kvm_pgd_addr_end(addr, end);
++ 		if (pgd_present(*pgd))
++ 			stage2_wp_puds(pgd, addr, next);
++ 	} while (pgd++, addr = next, addr != end);
++ }
++ 
++ /**
++  * kvm_mmu_wp_memory_region() - write protect stage 2 entries for memory slot
++  * @kvm:	The KVM pointer
++  * @slot:	The memory slot to write protect
++  *
++  * Called to start logging dirty pages after memory region
++  * KVM_MEM_LOG_DIRTY_PAGES operation is called. After this function returns
++  * all present PMD and PTEs are write protected in the memory region.
++  * Afterwards read of dirty page log can be called.
++  *
++  * Acquires kvm_mmu_lock. Called with kvm->slots_lock mutex acquired,
++  * serializing operations for VM memory regions.
++  */
++ void kvm_mmu_wp_memory_region(struct kvm *kvm, int slot)
++ {
++ 	struct kvm_memslots *slots = kvm_memslots(kvm);
++ 	struct kvm_memory_slot *memslot = id_to_memslot(slots, slot);
++ 	phys_addr_t start = memslot->base_gfn << PAGE_SHIFT;
++ 	phys_addr_t end = (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	stage2_wp_range(kvm, start, end);
++ 	spin_unlock(&kvm->mmu_lock);
++ 	kvm_flush_remote_tlbs(kvm);
++ }
++ 
++ /**
++  * kvm_mmu_write_protect_pt_masked() - write protect dirty pages
++  * @kvm:	The KVM pointer
++  * @slot:	The memory slot associated with mask
++  * @gfn_offset:	The gfn offset in memory slot
++  * @mask:	The mask of dirty pages at offset 'gfn_offset' in this memory
++  *		slot to be write protected
++  *
++  * Walks bits set in mask write protects the associated pte's. Caller must
++  * acquire kvm_mmu_lock.
++  */
++ static void kvm_mmu_write_protect_pt_masked(struct kvm *kvm,
++ 		struct kvm_memory_slot *slot,
++ 		gfn_t gfn_offset, unsigned long mask)
++ {
++ 	phys_addr_t base_gfn = slot->base_gfn + gfn_offset;
++ 	phys_addr_t start = (base_gfn +  __ffs(mask)) << PAGE_SHIFT;
++ 	phys_addr_t end = (base_gfn + __fls(mask) + 1) << PAGE_SHIFT;
++ 
++ 	stage2_wp_range(kvm, start, end);
++ }
++ 
++ /*
++  * kvm_arch_mmu_enable_log_dirty_pt_masked - enable dirty logging for selected
++  * dirty pages.
++  *
++  * It calls kvm_mmu_write_protect_pt_masked to write protect selected pages to
++  * enable dirty logging for them.
++  */
++ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
++ 		struct kvm_memory_slot *slot,
++ 		gfn_t gfn_offset, unsigned long mask)
++ {
++ 	kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
++ }
++ 
++ static void coherent_cache_guest_page(struct kvm_vcpu *vcpu, pfn_t pfn,
++ 				      unsigned long size, bool uncached)
++ {
++ 	__coherent_cache_guest_page(vcpu, pfn, size, uncached);
++ }
++ 
+++>>>>>>> 9f6b8029787b (KVM: use kvm_memslots whenever possible)
+  static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ -			  struct kvm_memory_slot *memslot, unsigned long hva,
+ +			  gfn_t gfn, struct kvm_memory_slot *memslot,
+  			  unsigned long fault_status)
+  {
+ +	pte_t new_pte;
+ +	pfn_t pfn;
+  	int ret;
+ -	bool write_fault, writable, hugetlb = false, force_pte = false;
+ +	bool write_fault, writable;
+  	unsigned long mmu_seq;
+ -	gfn_t gfn = fault_ipa >> PAGE_SHIFT;
+ -	struct kvm *kvm = vcpu->kvm;
+  	struct kvm_mmu_memory_cache *memcache = &vcpu->arch.mmu_page_cache;
+ -	struct vm_area_struct *vma;
+ -	pfn_t pfn;
+ -	pgprot_t mem_type = PAGE_S2;
+ -	bool fault_ipa_uncached;
+ -	bool logging_active = memslot_is_logging(memslot);
+ -	unsigned long flags = 0;
+  
+ -	write_fault = kvm_is_write_fault(vcpu);
+ +	write_fault = kvm_is_write_fault(kvm_vcpu_get_hsr(vcpu));
+  	if (fault_status == FSC_PERM && !write_fault) {
+  		kvm_err("Unexpected L2 read permission error\n");
+  		return -EFAULT;
+diff --cc arch/mips/kvm/kvm_mips.c
+index 8d16253c5c0f,bc5ddd973b44..000000000000
+--- a/arch/mips/kvm/kvm_mips.c
++++ b/arch/mips/kvm/kvm_mips.c
+@@@ -787,11 -965,10 +787,12 @@@ out
+  	return r;
+  }
+  
+ -/* Get (and clear) the dirty memory log for a memory slot. */
+ +/*
+ + * Get (and clear) the dirty memory log for a memory slot.
+ + */
+  int kvm_vm_ioctl_get_dirty_log(struct kvm *kvm, struct kvm_dirty_log *log)
+  {
++ 	struct kvm_memslots *slots;
+  	struct kvm_memory_slot *memslot;
+  	unsigned long ga, ga_end;
+  	int is_dirty = 0;
+@@@ -806,7 -983,8 +807,12 @@@
+  
+  	/* If nothing is dirty, don't bother messing with page tables. */
+  	if (is_dirty) {
+++<<<<<<< HEAD:arch/mips/kvm/kvm_mips.c
+ +		memslot = &kvm->memslots->memslots[log->slot];
+++=======
++ 		slots = kvm_memslots(kvm);
++ 		memslot = id_to_memslot(slots, log->slot);
+++>>>>>>> 9f6b8029787b (KVM: use kvm_memslots whenever possible):arch/mips/kvm/mips.c
+  
+  		ga = memslot->base_gfn << PAGE_SHIFT;
+  		ga_end = ga + (memslot->npages << PAGE_SHIFT);
+diff --cc arch/s390/kvm/kvm-s390.c
+index 47964050ad30,a05107e9b2bf..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -183,7 -234,38 +183,42 @@@ int kvm_vm_ioctl_check_extension(struc
+  int kvm_vm_ioctl_get_dirty_log(struct kvm *kvm,
+  			       struct kvm_dirty_log *log)
+  {
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	int r;
++ 	unsigned long n;
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memory_slot *memslot;
++ 	int is_dirty = 0;
++ 
++ 	mutex_lock(&kvm->slots_lock);
++ 
++ 	r = -EINVAL;
++ 	if (log->slot >= KVM_USER_MEM_SLOTS)
++ 		goto out;
++ 
++ 	slots = kvm_memslots(kvm);
++ 	memslot = id_to_memslot(slots, log->slot);
++ 	r = -ENOENT;
++ 	if (!memslot->dirty_bitmap)
++ 		goto out;
++ 
++ 	kvm_s390_sync_dirty_log(kvm, memslot);
++ 	r = kvm_get_dirty_log(kvm, log, &is_dirty);
++ 	if (r)
++ 		goto out;
++ 
++ 	/* Clear the dirty log */
++ 	if (is_dirty) {
++ 		n = kvm_dirty_bitmap_bytes(memslot);
++ 		memset(memslot->dirty_bitmap, 0, n);
++ 	}
++ 	r = 0;
++ out:
++ 	mutex_unlock(&kvm->slots_lock);
++ 	return r;
+++>>>>>>> 9f6b8029787b (KVM: use kvm_memslots whenever possible)
+  }
+  
+  static int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
+diff --cc arch/x86/kvm/x86.c
+index d9fe72002acd,8918e23e0e8e..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -7487,7 -7782,8 +7487,12 @@@ void kvm_arch_commit_memory_region(stru
+  				const struct kvm_memory_slot *old,
+  				enum kvm_mr_change change)
+  {
+++<<<<<<< HEAD
+ +
+++=======
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memory_slot *new;
+++>>>>>>> 9f6b8029787b (KVM: use kvm_memslots whenever possible)
+  	int nr_mmu_pages = 0;
+  
+  	if ((mem->slot >= KVM_USER_MEM_SLOTS) && (change == KVM_MR_DELETE)) {
+@@@ -7506,17 -7802,38 +7511,25 @@@
+  
+  	if (nr_mmu_pages)
+  		kvm_mmu_change_mmu_pages(kvm, nr_mmu_pages);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* It's OK to get 'new' slot here as it has already been installed */
++ 	slots = kvm_memslots(kvm);
++ 	new = id_to_memslot(slots, mem->slot);
++ 
+++>>>>>>> 9f6b8029787b (KVM: use kvm_memslots whenever possible)
+  	/*
+ -	 * Dirty logging tracks sptes in 4k granularity, meaning that large
+ -	 * sptes have to be split.  If live migration is successful, the guest
+ -	 * in the source machine will be destroyed and large sptes will be
+ -	 * created in the destination. However, if the guest continues to run
+ -	 * in the source machine (for example if live migration fails), small
+ -	 * sptes will remain around and cause bad performance.
+ +	 * Write protect all pages for dirty logging.
+  	 *
+ -	 * Scan sptes if dirty logging has been stopped, dropping those
+ -	 * which can be collapsed into a single large-page spte.  Later
+ -	 * page faults will create the large-page sptes.
+ -	 */
+ -	if ((change != KVM_MR_DELETE) &&
+ -		(old->flags & KVM_MEM_LOG_DIRTY_PAGES) &&
+ -		!(new->flags & KVM_MEM_LOG_DIRTY_PAGES))
+ -		kvm_mmu_zap_collapsible_sptes(kvm, new);
+ -
+ -	/*
+ -	 * Set up write protection and/or dirty logging for the new slot.
+ +	 * All the sptes including the large sptes which point to this
+ +	 * slot are set to readonly. We can not create any new large
+ +	 * spte on this slot until the end of the logging.
+  	 *
+ -	 * For KVM_MR_DELETE and KVM_MR_MOVE, the shadow pages of old slot have
+ -	 * been zapped so no dirty logging staff is needed for old slot. For
+ -	 * KVM_MR_FLAGS_ONLY, the old slot is essentially the same one as the
+ -	 * new and it's also covered when dealing with the new slot.
+ +	 * See the comments in fast_page_fault().
+  	 */
+ -	if (change != KVM_MR_DELETE)
+ -		kvm_mmu_slot_apply_flags(kvm, new);
+ +	if ((change != KVM_MR_DELETE) && (mem->flags & KVM_MEM_LOG_DIRTY_PAGES))
+ +		kvm_mmu_slot_remove_write_access(kvm, mem->slot);
+  }
+  
+  void kvm_arch_flush_shadow_all(struct kvm *kvm)
+* Unmerged path arch/arm/kvm/mmu.c
+* Unmerged path arch/mips/kvm/kvm_mips.c
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index f682ff67a26c..518d2f16f08a 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -789,7 +789,7 @@ static void kvmppc_rmap_reset(struct kvm *kvm)
+ 	int srcu_idx;
+ 
+ 	srcu_idx = srcu_read_lock(&kvm->srcu);
+-	slots = kvm->memslots;
++	slots = kvm_memslots(kvm);
+ 	kvm_for_each_memslot(memslot, slots) {
+ 		/*
+ 		 * This assumes it is acceptable to lose reference and
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 68c809978734..e2adb4eeb683 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -2157,6 +2157,7 @@ static int kvm_vm_ioctl_get_smmu_info_hv(struct kvm *kvm,
+ static int kvm_vm_ioctl_get_dirty_log_hv(struct kvm *kvm,
+ 					 struct kvm_dirty_log *log)
+ {
++	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+ 	int r;
+ 	unsigned long n;
+@@ -2167,7 +2168,8 @@ static int kvm_vm_ioctl_get_dirty_log_hv(struct kvm *kvm,
+ 	if (log->slot >= KVM_USER_MEM_SLOTS)
+ 		goto out;
+ 
+-	memslot = id_to_memslot(kvm->memslots, log->slot);
++	slots = kvm_memslots(kvm);
++	memslot = id_to_memslot(slots, log->slot);
+ 	r = -ENOENT;
+ 	if (!memslot->dirty_bitmap)
+ 		goto out;
+@@ -2257,6 +2259,7 @@ static void kvmppc_core_commit_memory_region_hv(struct kvm *kvm,
+ 				const struct kvm_memory_slot *old)
+ {
+ 	unsigned long npages = mem->memory_size >> PAGE_SHIFT;
++	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+ 
+ 	if (npages && old->npages) {
+@@ -2266,7 +2269,8 @@ static void kvmppc_core_commit_memory_region_hv(struct kvm *kvm,
+ 		 * since the rmap array starts out as all zeroes,
+ 		 * i.e. no pages are dirty.
+ 		 */
+-		memslot = id_to_memslot(kvm->memslots, mem->slot);
++		slots = kvm_memslots(kvm);
++		memslot = id_to_memslot(slots, mem->slot);
+ 		kvmppc_hv_get_dirty_log(kvm, memslot, NULL);
+ 	}
+ }
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index c3d6bbd6f89a..d9b1ad89e88f 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -1529,6 +1529,7 @@ out:
+ static int kvm_vm_ioctl_get_dirty_log_pr(struct kvm *kvm,
+ 					 struct kvm_dirty_log *log)
+ {
++	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+ 	struct kvm_vcpu *vcpu;
+ 	ulong ga, ga_end;
+@@ -1544,7 +1545,8 @@ static int kvm_vm_ioctl_get_dirty_log_pr(struct kvm *kvm,
+ 
+ 	/* If nothing is dirty, don't bother messing with page tables. */
+ 	if (is_dirty) {
+-		memslot = id_to_memslot(kvm->memslots, log->slot);
++		slots = kvm_memslots(kvm);
++		memslot = id_to_memslot(slots, log->slot);
+ 
+ 		ga = memslot->base_gfn << PAGE_SHIFT;
+ 		ga_end = ga + (memslot->npages << PAGE_SHIFT);
+* Unmerged path arch/s390/kvm/kvm-s390.c
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 1aa6c9846964..695241f025e5 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -730,7 +730,7 @@ static int check_memory_region_flags(struct kvm_userspace_memory_region *mem)
+ static struct kvm_memslots *install_new_memslots(struct kvm *kvm,
+ 		struct kvm_memslots *slots)
+ {
+-	struct kvm_memslots *old_memslots = kvm->memslots;
++	struct kvm_memslots *old_memslots = kvm_memslots(kvm);
+ 
+ 	/*
+ 	 * Set the low bit in the generation, which disables SPTE caching
+@@ -795,7 +795,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
+ 		goto out;
+ 
+-	slot = id_to_memslot(kvm->memslots, mem->slot);
++	slot = id_to_memslot(kvm_memslots(kvm), mem->slot);
+ 	base_gfn = mem->guest_phys_addr >> PAGE_SHIFT;
+ 	npages = mem->memory_size >> PAGE_SHIFT;
+ 
+@@ -838,7 +838,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 	if ((change == KVM_MR_CREATE) || (change == KVM_MR_MOVE)) {
+ 		/* Check for overlaps */
+ 		r = -EEXIST;
+-		kvm_for_each_memslot(slot, kvm->memslots) {
++		kvm_for_each_memslot(slot, kvm_memslots(kvm)) {
+ 			if ((slot->id >= KVM_USER_MEM_SLOTS) ||
+ 			    (slot->id == mem->slot))
+ 				continue;
+@@ -869,7 +869,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 	slots = kvm_kvzalloc(sizeof(struct kvm_memslots));
+ 	if (!slots)
+ 		goto out_free;
+-	memcpy(slots, kvm->memslots, sizeof(struct kvm_memslots));
++	memcpy(slots, kvm_memslots(kvm), sizeof(struct kvm_memslots));
+ 
+ 	if ((change == KVM_MR_DELETE) || (change == KVM_MR_MOVE)) {
+ 		slot = id_to_memslot(slots, mem->slot);
+@@ -962,6 +962,7 @@ static int kvm_vm_ioctl_set_memory_region(struct kvm *kvm,
+ int kvm_get_dirty_log(struct kvm *kvm,
+ 			struct kvm_dirty_log *log, int *is_dirty)
+ {
++	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+ 	int r, i;
+ 	unsigned long n;
+@@ -971,7 +972,8 @@ int kvm_get_dirty_log(struct kvm *kvm,
+ 	if (log->slot >= KVM_USER_MEM_SLOTS)
+ 		goto out;
+ 
+-	memslot = id_to_memslot(kvm->memslots, log->slot);
++	slots = kvm_memslots(kvm);
++	memslot = id_to_memslot(slots, log->slot);
+ 	r = -ENOENT;
+ 	if (!memslot->dirty_bitmap)
+ 		goto out;
+@@ -1020,6 +1022,7 @@ EXPORT_SYMBOL_GPL(kvm_get_dirty_log);
+ int kvm_get_dirty_log_protect(struct kvm *kvm,
+ 			struct kvm_dirty_log *log, bool *is_dirty)
+ {
++	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+ 	int r, i;
+ 	unsigned long n;
+@@ -1030,7 +1033,8 @@ int kvm_get_dirty_log_protect(struct kvm *kvm,
+ 	if (log->slot >= KVM_USER_MEM_SLOTS)
+ 		goto out;
+ 
+-	memslot = id_to_memslot(kvm->memslots, log->slot);
++	slots = kvm_memslots(kvm);
++	memslot = id_to_memslot(slots, log->slot);
+ 
+ 	dirty_bitmap = memslot->dirty_bitmap;
+ 	r = -ENOENT;
