@@ -1,0 +1,347 @@
+IB/hfi1: Fix buffer cache races which may cause corruption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit e88c9271d9f8db79d8104f7f7bd14cb8d88cc187
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e88c9271.failed
+
+There are two possible causes for node/memory corruption both
+of which are related to the cache eviction algorithm. One way
+to cause corruption is due to the asynchronous nature of the
+MMU invalidation and the locking used when invalidating node.
+
+The MMU invalidation routine would temporarily release the
+RB tree lock to avoid a deadlock. However, this would allow
+the eviction function to take the lock resulting in the removal
+of cache nodes.
+
+If the node being removed by the eviction code is the same as
+the node being invalidated, the result is use after free.
+
+The same is true in the other direction due to the temporary
+release of the eviction list lock in the eviction loop.
+
+Another corner case exists when dealing with the SDMA buffer
+cache that could cause memory corruption of kernel memory.
+The most common way, in which this corruption exhibits itself
+is a linked list node corruption. In that case, the kernel will
+complain that a node with poisoned pointers is being removed.
+The fact that the pointers are already poisoned means that the
+node has already been removed from the list.
+
+To root cause of this corruption was a mishandling of the
+eviction list maintained by the driver. In order for this
+to happen four conditions need to be satisfied:
+
+   1. A node describing a user buffer already exists in the
+      interval RB tree,
+   2. The beginning of the current user buffer matches that
+      node but is bigger. This will cause the node to be
+      extended.
+   3. The amount of cached buffers is close or at the limit
+      of the buffer cache size.
+   4. The node has dropped close to the end of the eviction
+      list. This will cause the node to be considered for
+      eviction.
+
+If all of the above conditions have been satisfied, it is
+possible for the eviction algorithm to evict the current node,
+which will free the node without the driver knowing.
+
+To solve both issues described above:
+   - the locking around the MMU invalidation loop and cache
+     eviction loop has been improved so locks are not released in
+     the loop body,
+   - a new RB function is introduced which will "atomically" find
+     and remove the matching node from the RB tree, preventing the
+     MMU invalidation loop from touching it, and
+   - the node being extended by the pin_vector_pages() function is
+     removed from the eviction list prior to calling the eviction
+     function.
+
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e88c9271d9f8db79d8104f7f7bd14cb8d88cc187)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/user_sdma.c
+#	drivers/staging/rdma/hfi1/mmu_rb.c
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 6967deb7956a,635ddf8b406d..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -184,6 -180,18 +184,21 @@@ struct user_sdma_iovec 
+  	u64 offset;
+  };
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ #define SDMA_CACHE_NODE_EVICT BIT(0)
++ 
++ struct sdma_mmu_node {
++ 	struct mmu_rb_node rb;
++ 	struct list_head list;
++ 	struct hfi1_user_sdma_pkt_q *pq;
++ 	atomic_t refcount;
++ 	struct page **pages;
++ 	unsigned npages;
++ 	unsigned long flags;
++ };
++ 
+++>>>>>>> e88c9271d9f8 (IB/hfi1: Fix buffer cache races which may cause corruption):drivers/staging/rdma/hfi1/user_sdma.c
+  struct user_sdma_request {
+  	struct sdma_req_info info;
+  	struct hfi1_user_sdma_pkt_q *pq;
+@@@ -1036,40 -1033,142 +1051,128 @@@ static inline int num_user_pages(const 
+  	return 1 + ((epage - spage) >> PAGE_SHIFT);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ static u32 sdma_cache_evict(struct hfi1_user_sdma_pkt_q *pq, u32 npages)
++ {
++ 	u32 cleared = 0;
++ 	struct sdma_mmu_node *node, *ptr;
++ 	struct list_head to_evict = LIST_HEAD_INIT(to_evict);
++ 
++ 	spin_lock(&pq->evict_lock);
++ 	list_for_each_entry_safe_reverse(node, ptr, &pq->evict, list) {
++ 		/* Make sure that no one is still using the node. */
++ 		if (!atomic_read(&node->refcount)) {
++ 			set_bit(SDMA_CACHE_NODE_EVICT, &node->flags);
++ 			list_del_init(&node->list);
++ 			list_add(&node->list, &to_evict);
++ 			cleared += node->npages;
++ 			if (cleared >= npages)
++ 				break;
++ 		}
++ 	}
++ 	spin_unlock(&pq->evict_lock);
++ 
++ 	list_for_each_entry_safe(node, ptr, &to_evict, list)
++ 		hfi1_mmu_rb_remove(&pq->sdma_rb_root, &node->rb);
++ 
++ 	return cleared;
++ }
++ 
+++>>>>>>> e88c9271d9f8 (IB/hfi1: Fix buffer cache races which may cause corruption):drivers/staging/rdma/hfi1/user_sdma.c
+  static int pin_vector_pages(struct user_sdma_request *req,
+  			    struct user_sdma_iovec *iovec) {
+ -	int ret = 0, pinned, npages, cleared;
+ -	struct page **pages;
+ -	struct hfi1_user_sdma_pkt_q *pq = req->pq;
+ -	struct sdma_mmu_node *node = NULL;
+ -	struct mmu_rb_node *rb_node;
+ -
+ -	rb_node = hfi1_mmu_rb_extract(&pq->sdma_rb_root,
+ -				      (unsigned long)iovec->iov.iov_base,
+ -				      iovec->iov.iov_len);
+ -	if (rb_node && !IS_ERR(rb_node))
+ -		node = container_of(rb_node, struct sdma_mmu_node, rb);
+ -	else
+ -		rb_node = NULL;
+ -
+ -	if (!node) {
+ -		node = kzalloc(sizeof(*node), GFP_KERNEL);
+ -		if (!node)
+ -			return -ENOMEM;
+ -
+ -		node->rb.addr = (unsigned long)iovec->iov.iov_base;
+ -		node->pq = pq;
+ -		atomic_set(&node->refcount, 0);
+ -		INIT_LIST_HEAD(&node->list);
+ -	}
+ +	int pinned, npages;
+  
+  	npages = num_user_pages(&iovec->iov);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +	iovec->pages = kcalloc(npages, sizeof(*iovec->pages), GFP_KERNEL);
+ +	if (!iovec->pages) {
+ +		SDMA_DBG(req, "Failed page array alloc");
+ +		return -ENOMEM;
+++=======
++ 	if (node->npages < npages) {
++ 		pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
++ 		if (!pages) {
++ 			SDMA_DBG(req, "Failed page array alloc");
++ 			ret = -ENOMEM;
++ 			goto bail;
++ 		}
++ 		memcpy(pages, node->pages, node->npages * sizeof(*pages));
++ 
++ 		npages -= node->npages;
++ 
++ 		/*
++ 		 * If rb_node is NULL, it means that this is brand new node
++ 		 * and, therefore not on the eviction list.
++ 		 * If, however, the rb_node is non-NULL, it means that the
++ 		 * node is already in RB tree and, therefore on the eviction
++ 		 * list (nodes are unconditionally inserted in the eviction
++ 		 * list). In that case, we have to remove the node prior to
++ 		 * calling the eviction function in order to prevent it from
++ 		 * freeing this node.
++ 		 */
++ 		if (rb_node) {
++ 			spin_lock(&pq->evict_lock);
++ 			list_del_init(&node->list);
++ 			spin_unlock(&pq->evict_lock);
++ 		}
++ retry:
++ 		if (!hfi1_can_pin_pages(pq->dd, pq->n_locked, npages)) {
++ 			cleared = sdma_cache_evict(pq, npages);
++ 			if (cleared >= npages)
++ 				goto retry;
++ 		}
++ 		pinned = hfi1_acquire_user_pages(
++ 			((unsigned long)iovec->iov.iov_base +
++ 			 (node->npages * PAGE_SIZE)), npages, 0,
++ 			pages + node->npages);
++ 		if (pinned < 0) {
++ 			kfree(pages);
++ 			ret = pinned;
++ 			goto bail;
++ 		}
++ 		if (pinned != npages) {
++ 			unpin_vector_pages(current->mm, pages, node->npages,
++ 					   pinned);
++ 			ret = -EFAULT;
++ 			goto bail;
++ 		}
++ 		kfree(node->pages);
++ 		node->rb.len = iovec->iov.iov_len;
++ 		node->pages = pages;
++ 		node->npages += pinned;
++ 		npages = node->npages;
++ 		spin_lock(&pq->evict_lock);
++ 		list_add(&node->list, &pq->evict);
++ 		pq->n_locked += pinned;
++ 		spin_unlock(&pq->evict_lock);
+++>>>>>>> e88c9271d9f8 (IB/hfi1: Fix buffer cache races which may cause corruption):drivers/staging/rdma/hfi1/user_sdma.c
+  	}
+ -	iovec->pages = node->pages;
+ -	iovec->npages = npages;
+  
+ -	ret = hfi1_mmu_rb_insert(&req->pq->sdma_rb_root, &node->rb);
+ -	if (ret) {
+ -		spin_lock(&pq->evict_lock);
+ -		if (!list_empty(&node->list))
+ -			list_del(&node->list);
+ -		pq->n_locked -= node->npages;
+ -		spin_unlock(&pq->evict_lock);
+ -		goto bail;
+ +	pinned = hfi1_acquire_user_pages((unsigned long)iovec->iov.iov_base,
+ +					 npages, 0, iovec->pages);
+ +
+ +	if (pinned < 0)
+ +		return pinned;
+ +
+ +	iovec->npages = pinned;
+ +	if (pinned != npages) {
+ +		SDMA_DBG(req, "Failed to pin pages (%d/%u)", pinned, npages);
+ +		unpin_vector_pages(iovec);
+ +		return -EFAULT;
+  	}
+  	return 0;
+ -bail:
+ -	if (rb_node)
+ -		unpin_vector_pages(current->mm, node->pages, 0, node->npages);
+ -	kfree(node);
+ -	return ret;
+  }
+  
+ -static void unpin_vector_pages(struct mm_struct *mm, struct page **pages,
+ -			       unsigned start, unsigned npages)
+ +static void unpin_vector_pages(struct user_sdma_iovec *iovec)
+  {
+ -	hfi1_release_user_pages(mm, pages + start, npages, 0);
+ -	kfree(pages);
+ +	hfi1_release_user_pages(iovec->pages, iovec->npages, 0);
+ +
+ +	kfree(iovec->pages);
+ +	iovec->pages = NULL;
+ +	iovec->npages = 0;
+ +	iovec->offset = 0;
+  }
+  
+  static int check_header_template(struct user_sdma_request *req,
+@@@ -1451,3 -1548,69 +1554,72 @@@ static inline void set_comp_state(struc
+  	trace_hfi1_sdma_user_completion(pq->dd, pq->ctxt, pq->subctxt,
+  					idx, state, ret);
+  }
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 
++ static bool sdma_rb_filter(struct mmu_rb_node *node, unsigned long addr,
++ 			   unsigned long len)
++ {
++ 	return (bool)(node->addr == addr);
++ }
++ 
++ static int sdma_rb_insert(struct rb_root *root, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	atomic_inc(&node->refcount);
++ 	return 0;
++ }
++ 
++ static void sdma_rb_remove(struct rb_root *root, struct mmu_rb_node *mnode,
++ 			   struct mm_struct *mm)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	spin_lock(&node->pq->evict_lock);
++ 	/*
++ 	 * We've been called by the MMU notifier but this node has been
++ 	 * scheduled for eviction. The eviction function will take care
++ 	 * of freeing this node.
++ 	 * We have to take the above lock first because we are racing
++ 	 * against the setting of the bit in the eviction function.
++ 	 */
++ 	if (mm && test_bit(SDMA_CACHE_NODE_EVICT, &node->flags)) {
++ 		spin_unlock(&node->pq->evict_lock);
++ 		return;
++ 	}
++ 
++ 	if (!list_empty(&node->list))
++ 		list_del(&node->list);
++ 	node->pq->n_locked -= node->npages;
++ 	spin_unlock(&node->pq->evict_lock);
++ 
++ 	/*
++ 	 * If mm is set, we are being called by the MMU notifier and we
++ 	 * should not pass a mm_struct to unpin_vector_page(). This is to
++ 	 * prevent a deadlock when hfi1_release_user_pages() attempts to
++ 	 * take the mmap_sem, which the MMU notifier has already taken.
++ 	 */
++ 	unpin_vector_pages(mm ? NULL : current->mm, node->pages, 0,
++ 			   node->npages);
++ 	/*
++ 	 * If called by the MMU notifier, we have to adjust the pinned
++ 	 * page count ourselves.
++ 	 */
++ 	if (mm)
++ 		mm->pinned_vm -= node->npages;
++ 	kfree(node);
++ }
++ 
++ static int sdma_rb_invalidate(struct rb_root *root, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	if (!atomic_read(&node->refcount))
++ 		return 1;
++ 	return 0;
++ }
+++>>>>>>> e88c9271d9f8 (IB/hfi1: Fix buffer cache races which may cause corruption):drivers/staging/rdma/hfi1/user_sdma.c
+* Unmerged path drivers/staging/rdma/hfi1/mmu_rb.c
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+* Unmerged path drivers/staging/rdma/hfi1/mmu_rb.c
