@@ -1,0 +1,246 @@
+drm/i915/fbc: Disable on HSW by default for now
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [gpu] i915/fbc: Disable on HSW by default for now (Rob Clark) [1021582 1171268 1171270 1238635 1243336 1243398 1255760 1269009 1273363 1287757 1293302 1300583 1310232 1328491 1336544 1344498 1344510]
+Rebuild_FUZZ: 95.56%
+commit-author Lyude <cpaul@redhat.com>
+commit c7f7e2feffb0294302041507dfd5fc15f01afccc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c7f7e2fe.failed
+
+>From https://bugs.freedesktop.org/show_bug.cgi?id=96461 :
+
+This was kind of a difficult bug to track down. If you're using a
+Haswell system running GNOME and you have fbc completely enabled and
+working, playing videos can result in video artifacts. Steps to
+reproduce:
+
+- Run GNOME
+- Ensure FBC is enabled and active
+- Download a movie, I used the ogg version of Big Buck Bunny for this
+- Run `gst-launch-1.0 filesrc location='some_movie.ogg' ! decodebin !
+  glimagesink` in a terminal
+- Watch for about over a minute, you'll see small horizontal lines go
+  down the screen.
+
+For the time being, disable FBC for Haswell by default.
+
+Stefan Richter reported kernel freezes (no video artifacts) when fbc
+is on.  (E3-1245 v3 with HD P4600; openbox and some KDE and LXDE
+applications, thread begins at https://lkml.org/lkml/2016/4/26/813).
+We also got reports from Steven Honeyman on openbox+roxterm.
+
+v2 (From Paulo):
+  - Add extra information to the commit message
+  - Add Fixes tag
+  - Rebase
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=96461
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=96464
+Fixes: a98ee79317b4 ("drm/i915/fbc: enable FBC by default on HSW and BDW")
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+	Signed-off-by: Lyude <cpaul@redhat.com>
+	Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1465487895-7401-1-git-send-email-cpaul@redhat.com
+(cherry picked from commit c7f7e2feffb0294302041507dfd5fc15f01afccc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_fbc.c
+diff --cc drivers/gpu/drm/i915/intel_fbc.c
+index 4165ce0644f7,a19944b6dc25..000000000000
+--- a/drivers/gpu/drm/i915/intel_fbc.c
++++ b/drivers/gpu/drm/i915/intel_fbc.c
+@@@ -579,30 -767,166 +579,177 @@@ void intel_fbc_update(struct drm_devic
+  	/* The use of a CPU fence is mandatory in order to detect writes
+  	 * by the CPU to the scanout and trigger updates to the FBC.
+  	 */
+ -	if (cache->fb.tiling_mode != I915_TILING_X ||
+ -	    cache->fb.fence_reg == I915_FENCE_REG_NONE) {
+ -		fbc->no_fbc_reason = "framebuffer not tiled or fenced";
+ -		return false;
+ +	if (obj->tiling_mode != I915_TILING_X ||
+ +	    obj->fence_reg == I915_FENCE_REG_NONE) {
+ +		if (set_no_fbc_reason(dev_priv, FBC_NOT_TILED))
+ +			DRM_DEBUG_KMS("framebuffer not tiled or fenced, disabling compression\n");
+ +		goto out_disable;
+  	}
+ -	if (INTEL_INFO(dev_priv)->gen <= 4 && !IS_G4X(dev_priv) &&
+ -	    cache->plane.rotation != BIT(DRM_ROTATE_0)) {
+ -		fbc->no_fbc_reason = "rotation unsupported";
+ -		return false;
+ +	if (INTEL_INFO(dev)->gen <= 4 && !IS_G4X(dev) &&
+ +	    crtc->primary->state->rotation != BIT(DRM_ROTATE_0)) {
+ +		if (set_no_fbc_reason(dev_priv, FBC_UNSUPPORTED_MODE))
+ +			DRM_DEBUG_KMS("Rotation unsupported, disabling\n");
+ +		goto out_disable;
+  	}
+  
+ -	if (!stride_is_valid(dev_priv, cache->fb.stride)) {
+ -		fbc->no_fbc_reason = "framebuffer stride not supported";
+ -		return false;
+ +	/* If the kernel debugger is active, always disable compression */
+ +	if (in_dbg_master())
+ +		goto out_disable;
+ +
+ +	if (i915_gem_stolen_setup_compression(dev, obj->base.size,
+ +					      drm_format_plane_cpp(fb->pixel_format, 0))) {
+ +		if (set_no_fbc_reason(dev_priv, FBC_STOLEN_TOO_SMALL))
+ +			DRM_DEBUG_KMS("framebuffer too large, disabling compression\n");
+ +		goto out_disable;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!pixel_format_is_valid(dev_priv, cache->fb.pixel_format)) {
++ 		fbc->no_fbc_reason = "pixel format is invalid";
++ 		return false;
++ 	}
++ 
++ 	/* WaFbcExceedCdClockThreshold:hsw,bdw */
++ 	if ((IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv)) &&
++ 	    cache->crtc.hsw_bdw_pixel_rate >= dev_priv->cdclk_freq * 95 / 100) {
++ 		fbc->no_fbc_reason = "pixel rate is too big";
++ 		return false;
++ 	}
++ 
++ 	/* It is possible for the required CFB size change without a
++ 	 * crtc->disable + crtc->enable since it is possible to change the
++ 	 * stride without triggering a full modeset. Since we try to
++ 	 * over-allocate the CFB, there's a chance we may keep FBC enabled even
++ 	 * if this happens, but if we exceed the current CFB size we'll have to
++ 	 * disable FBC. Notice that it would be possible to disable FBC, wait
++ 	 * for a frame, free the stolen node, then try to reenable FBC in case
++ 	 * we didn't get any invalidate/deactivate calls, but this would require
++ 	 * a lot of tracking just for a specific case. If we conclude it's an
++ 	 * important case, we can implement it later. */
++ 	if (intel_fbc_calculate_cfb_size(dev_priv, &fbc->state_cache) >
++ 	    fbc->compressed_fb.size * fbc->threshold) {
++ 		fbc->no_fbc_reason = "CFB requirements changed";
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static bool intel_fbc_can_choose(struct intel_crtc *crtc)
++ {
++ 	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
++ 	struct intel_fbc *fbc = &dev_priv->fbc;
++ 	bool enable_by_default = IS_BROADWELL(dev_priv);
++ 
++ 	if (intel_vgpu_active(dev_priv)) {
++ 		fbc->no_fbc_reason = "VGPU is active";
++ 		return false;
++ 	}
++ 
++ 	if (i915.enable_fbc < 0 && !enable_by_default) {
++ 		fbc->no_fbc_reason = "disabled per chip default";
++ 		return false;
++ 	}
++ 
++ 	if (!i915.enable_fbc) {
++ 		fbc->no_fbc_reason = "disabled per module param";
++ 		return false;
++ 	}
++ 
++ 	if (fbc_on_pipe_a_only(dev_priv) && crtc->pipe != PIPE_A) {
++ 		fbc->no_fbc_reason = "no enabled pipes can have FBC";
++ 		return false;
++ 	}
++ 
++ 	if (fbc_on_plane_a_only(dev_priv) && crtc->plane != PLANE_A) {
++ 		fbc->no_fbc_reason = "no enabled planes can have FBC";
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static void intel_fbc_get_reg_params(struct intel_crtc *crtc,
++ 				     struct intel_fbc_reg_params *params)
++ {
++ 	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
++ 	struct intel_fbc *fbc = &dev_priv->fbc;
++ 	struct intel_fbc_state_cache *cache = &fbc->state_cache;
++ 
++ 	/* Since all our fields are integer types, use memset here so the
++ 	 * comparison function can rely on memcmp because the padding will be
++ 	 * zero. */
++ 	memset(params, 0, sizeof(*params));
++ 
++ 	params->crtc.pipe = crtc->pipe;
++ 	params->crtc.plane = crtc->plane;
++ 	params->crtc.fence_y_offset = get_crtc_fence_y_offset(crtc);
++ 
++ 	params->fb.pixel_format = cache->fb.pixel_format;
++ 	params->fb.stride = cache->fb.stride;
++ 	params->fb.fence_reg = cache->fb.fence_reg;
++ 
++ 	params->cfb_size = intel_fbc_calculate_cfb_size(dev_priv, cache);
++ 
++ 	params->fb.ggtt_offset = cache->fb.ilk_ggtt_offset;
++ }
++ 
++ static bool intel_fbc_reg_params_equal(struct intel_fbc_reg_params *params1,
++ 				       struct intel_fbc_reg_params *params2)
++ {
++ 	/* We can use this since intel_fbc_get_reg_params() does a memset. */
++ 	return memcmp(params1, params2, sizeof(*params1)) == 0;
++ }
++ 
++ void intel_fbc_pre_update(struct intel_crtc *crtc,
++ 			  struct intel_crtc_state *crtc_state,
++ 			  struct intel_plane_state *plane_state)
++ {
++ 	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
++ 	struct intel_fbc *fbc = &dev_priv->fbc;
++ 
++ 	if (!fbc_supported(dev_priv))
++ 		return;
++ 
++ 	mutex_lock(&fbc->lock);
++ 
++ 	if (!multiple_pipes_ok(crtc, plane_state)) {
++ 		fbc->no_fbc_reason = "more than one pipe active";
++ 		goto deactivate;
++ 	}
++ 
++ 	if (!fbc->enabled || fbc->crtc != crtc)
++ 		goto unlock;
++ 
++ 	intel_fbc_update_state_cache(crtc, crtc_state, plane_state);
++ 
++ deactivate:
++ 	intel_fbc_deactivate(dev_priv);
++ unlock:
++ 	mutex_unlock(&fbc->lock);
++ }
++ 
++ static void __intel_fbc_post_update(struct intel_crtc *crtc)
++ {
++ 	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
++ 	struct intel_fbc *fbc = &dev_priv->fbc;
++ 	struct intel_fbc_reg_params old_params;
++ 
++ 	WARN_ON(!mutex_is_locked(&fbc->lock));
++ 
++ 	if (!fbc->enabled || fbc->crtc != crtc)
++ 		return;
++ 
++ 	if (!intel_fbc_can_activate(crtc)) {
++ 		WARN_ON(fbc->active);
++ 		return;
++ 	}
++ 
++ 	old_params = fbc->params;
++ 	intel_fbc_get_reg_params(crtc, &fbc->params);
++ 
+++>>>>>>> c7f7e2feffb0 (drm/i915/fbc: Disable on HSW by default for now)
+  	/* If the scanout has not changed, don't modify the FBC settings.
+  	 * Note that we make the fundamental assumption that the fb->obj
+  	 * cannot be unpinned (and have its GTT offset and fence revoked)
+* Unmerged path drivers/gpu/drm/i915/intel_fbc.c
