@@ -2866,7 +2866,7 @@ bnad_txq_wi_prepare(struct bnad *bnad, struct bna_tcb *tcb,
 		txqent->hdr.wi.opcode =	__constant_htons(BNA_TXQ_WI_SEND);
 		txqent->hdr.wi.lso_mss = 0;
 
-		if (unlikely(skb->len > (bnad->netdev->mtu + ETH_HLEN))) {
+		if (unlikely(skb->len > (bnad->netdev->mtu + VLAN_ETH_HLEN))) {
 			BNAD_UPDATE_CTR(bnad, tx_skb_non_tso_too_long);
 			return -EINVAL;
 		}
