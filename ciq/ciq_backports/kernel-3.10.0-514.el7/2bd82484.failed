@@ -1,0 +1,324 @@
+xps: fix xps for stacked devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 2bd82484bb4c5db1d5dc983ac7c409b2782e0154
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2bd82484.failed
+
+A typical qdisc setup is the following :
+
+bond0 : bonding device, using HTB hierarchy
+eth1/eth2 : slaves, multiqueue NIC, using MQ + FQ qdisc
+
+XPS allows to spread packets on specific tx queues, based on the cpu
+doing the send.
+
+Problem is that dequeues from bond0 qdisc can happen on random cpus,
+due to the fact that qdisc_run() can dequeue a batch of packets.
+
+CPUA -> queue packet P1 on bond0 qdisc, P1->ooo_okay=1
+CPUA -> queue packet P2 on bond0 qdisc, P2->ooo_okay=0
+
+CPUB -> dequeue packet P1 from bond0
+        enqueue packet on eth1/eth2
+CPUC -> dequeue packet P2 from bond0
+        enqueue packet on eth1/eth2 using sk cache (ooo_okay is 0)
+
+get_xps_queue() then might select wrong queue for P1, since current cpu
+might be different than CPUA.
+
+P2 might be sent on the old queue (stored in sk->sk_tx_queue_mapping),
+if CPUC runs a bit faster (or CPUB spins a bit on qdisc lock)
+
+Effect of this bug is TCP reorders, and more generally not optimal
+TX queue placement. (A victim bulk flow can be migrated to the wrong TX
+queue for a while)
+
+To fix this, we have to record sender cpu number the first time
+dev_queue_xmit() is called for one tx skb.
+
+We can union napi_id (used on receive path) and sender_cpu,
+granted we clear sender_cpu in skb_scrub_packet() (credit to Willem for
+this union idea)
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Willem de Bruijn <willemb@google.com>
+	Cc: Nandita Dukkipati <nanditad@google.com>
+	Cc: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2bd82484bb4c5db1d5dc983ac7c409b2782e0154)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/skbuff.c
+diff --cc include/linux/skbuff.h
+index 3247ee7f6870,2748ff639144..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -544,43 -546,66 +544,44 @@@ struct sk_buff 
+  				data_len;
+  	__u16			mac_len,
+  				hdr_len;
+ -
+ -	/* Following fields are _not_ copied in __copy_skb_header()
+ -	 * Note that queue_mapping is here mostly to fill a hole.
+ -	 */
+ +	union {
+ +		__wsum		csum;
+ +		struct {
+ +			__u16	csum_start;
+ +			__u16	csum_offset;
+ +		};
+ +	};
+ +	__u32			priority;
+  	kmemcheck_bitfield_begin(flags1);
+ -	__u16			queue_mapping;
+ -	__u8			cloned:1,
+ +	__u8			RH_KABI_RENAME(local_df, ignore_df):1,
+ +				cloned:1,
+ +				ip_summed:2,
+  				nohdr:1,
+ +				nfctinfo:3;
+ +	__u8			pkt_type:3,
+  				fclone:2,
+ +				ipvs_property:1,
+  				peeked:1,
+ -				head_frag:1,
+ -				xmit_more:1;
+ -	/* one bit hole */
+ +				nf_trace:1;
+  	kmemcheck_bitfield_end(flags1);
+ +	__be16			protocol;
+  
+ -	/* fields enclosed in headers_start/headers_end are copied
+ -	 * using a single memcpy() in __copy_skb_header()
+ -	 */
+ -	/* private: */
+ -	__u32			headers_start[0];
+ -	/* public: */
+ -
+ -/* if you move pkt_type around you also must adapt those constants */
+ -#ifdef __BIG_ENDIAN_BITFIELD
+ -#define PKT_TYPE_MAX	(7 << 5)
+ -#else
+ -#define PKT_TYPE_MAX	7
+ +	void			(*destructor)(struct sk_buff *skb);
+ +#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ +	struct nf_conntrack	*nfct;
+ +#endif
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	struct nf_bridge_info	*nf_bridge;
+  #endif
+ -#define PKT_TYPE_OFFSET()	offsetof(struct sk_buff, __pkt_type_offset)
+ -
+ -	__u8			__pkt_type_offset[0];
+ -	__u8			pkt_type:3;
+ -	__u8			pfmemalloc:1;
+ -	__u8			ignore_df:1;
+ -	__u8			nfctinfo:3;
+  
+ -	__u8			nf_trace:1;
+ -	__u8			ip_summed:2;
+ -	__u8			ooo_okay:1;
+ -	__u8			l4_hash:1;
+ -	__u8			sw_hash:1;
+ -	__u8			wifi_acked_valid:1;
+ -	__u8			wifi_acked:1;
+ +	int			skb_iif;
+  
+ -	__u8			no_fcs:1;
+ -	/* Indicates the inner headers are valid in the skbuff. */
+ -	__u8			encapsulation:1;
+ -	__u8			encap_hdr_csum:1;
+ -	__u8			csum_valid:1;
+ -	__u8			csum_complete_sw:1;
+ -	__u8			csum_level:2;
+ -	__u8			csum_bad:1;
+ +	RH_KABI_REPLACE(__u32	rxhash,
+ +			__u32	hash)
+  
+ -#ifdef CONFIG_IPV6_NDISC_NODETYPE
+ -	__u8			ndisc_nodetype:2;
+ -#endif
+ -	__u8			ipvs_property:1;
+ -	__u8			inner_protocol_type:1;
+ -	__u8			remcsum_offload:1;
+ -	/* 3 or 5 bit hole */
+ +	__be16			vlan_proto;
+ +	__u16			vlan_tci;
+++<<<<<<< HEAD
+  
+  #ifdef CONFIG_NET_SCHED
+  	__u16			tc_index;	/* traffic control index */
+@@@ -589,33 -614,22 +590,39 @@@
+  #endif
+  #endif
+  
+ +	__u16			queue_mapping;
+ +	kmemcheck_bitfield_begin(flags2);
+ +#ifdef CONFIG_IPV6_NDISC_NODETYPE
+ +	__u8			ndisc_nodetype:2;
+ +#endif
+ +	__u8			pfmemalloc:1;
+ +	__u8			ooo_okay:1;
+ +	__u8			RH_KABI_RENAME(l4_rxhash, l4_hash):1;
+ +	__u8			wifi_acked_valid:1;
+ +	__u8			wifi_acked:1;
+ +	__u8			no_fcs:1;
+ +	__u8			head_frag:1;
+ +	/* Indicates the inner headers are valid in the skbuff. */
+ +	__u8			encapsulation:1;
+ +	RH_KABI_EXTEND(__u8			encap_hdr_csum:1)
+ +	RH_KABI_EXTEND(__u8			csum_valid:1)
+ +	RH_KABI_EXTEND(__u8			csum_complete_sw:1)
+ +	RH_KABI_EXTEND(__u8			xmit_more:1)
+ +	RH_KABI_EXTEND(__u8			inner_protocol_type:1)
+ +	RH_KABI_EXTEND(__u8			remcsum_offload:1)
+ +	/* 0/2 bit hole (depending on ndisc_nodetype presence) */
+ +	kmemcheck_bitfield_end(flags2);
+ +
+ +#if defined CONFIG_NET_DMA_RH_KABI || defined CONFIG_NET_RX_BUSY_POLL
+  	union {
+ -		__wsum		csum;
+ -		struct {
+ -			__u16	csum_start;
+ -			__u16	csum_offset;
+ -		};
+ -	};
+ -	__u32			priority;
+ -	int			skb_iif;
+ -	__u32			hash;
+ -	__be16			vlan_proto;
+ -	__u16			vlan_tci;
+ +		unsigned int	napi_id;
+ +		RH_KABI_DEPRECATE(dma_cookie_t,	dma_cookie)
+++=======
++ #if defined(CONFIG_NET_RX_BUSY_POLL) || defined(CONFIG_XPS)
++ 	union {
++ 		unsigned int	napi_id;
++ 		unsigned int	sender_cpu;
+++>>>>>>> 2bd82484bb4c (xps: fix xps for stacked devices)
+  	};
+  #endif
+  #ifdef CONFIG_NETWORK_SECMARK
+diff --cc net/core/skbuff.c
+index d9282bd8c9a4,88c613eab142..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -820,38 -794,47 +820,41 @@@ static void __copy_skb_header(struct sk
+  #ifdef CONFIG_XFRM
+  	new->sp			= secpath_get(old->sp);
+  #endif
+ -	__nf_copy(new, old, false);
+ -
+ -	/* Note : this field could be in headers_start/headers_end section
+ -	 * It is not yet because we do not want to have a 16 bit hole
+ -	 */
+ -	new->queue_mapping = old->queue_mapping;
+ -
+ -	memcpy(&new->headers_start, &old->headers_start,
+ -	       offsetof(struct sk_buff, headers_end) -
+ -	       offsetof(struct sk_buff, headers_start));
+ -	CHECK_SKB_FIELD(protocol);
+ -	CHECK_SKB_FIELD(csum);
+ -	CHECK_SKB_FIELD(hash);
+ -	CHECK_SKB_FIELD(priority);
+ -	CHECK_SKB_FIELD(skb_iif);
+ -	CHECK_SKB_FIELD(vlan_proto);
+ -	CHECK_SKB_FIELD(vlan_tci);
+ -	CHECK_SKB_FIELD(transport_header);
+ -	CHECK_SKB_FIELD(network_header);
+ -	CHECK_SKB_FIELD(mac_header);
+ -	CHECK_SKB_FIELD(inner_protocol);
+ -	CHECK_SKB_FIELD(inner_transport_header);
+ -	CHECK_SKB_FIELD(inner_network_header);
+ -	CHECK_SKB_FIELD(inner_mac_header);
+ -	CHECK_SKB_FIELD(mark);
+ -#ifdef CONFIG_NETWORK_SECMARK
+ -	CHECK_SKB_FIELD(secmark);
+ +	memcpy(new->cb, old->cb, sizeof(old->cb));
+ +	new->csum		= old->csum;
+ +	new->ignore_df		= old->ignore_df;
+ +	new->pkt_type		= old->pkt_type;
+ +	new->ip_summed		= old->ip_summed;
+ +	skb_copy_queue_mapping(new, old);
+ +	new->priority		= old->priority;
+ +#if IS_ENABLED(CONFIG_IP_VS)
+ +	new->ipvs_property	= old->ipvs_property;
+  #endif
+ -#ifdef CONFIG_NET_RX_BUSY_POLL
+ -	CHECK_SKB_FIELD(napi_id);
+ +	new->pfmemalloc		= old->pfmemalloc;
+ +	new->protocol		= old->protocol;
+ +	new->mark		= old->mark;
+ +	new->skb_iif		= old->skb_iif;
+ +	__nf_copy(new, old);
+ +#if IS_ENABLED(CONFIG_NETFILTER_XT_TARGET_TRACE)
+ +	new->nf_trace		= old->nf_trace;
+  #endif
++ #ifdef CONFIG_XPS
++ 	CHECK_SKB_FIELD(sender_cpu);
++ #endif
+  #ifdef CONFIG_NET_SCHED
+ -	CHECK_SKB_FIELD(tc_index);
+ +	new->tc_index		= old->tc_index;
+  #ifdef CONFIG_NET_CLS_ACT
+ -	CHECK_SKB_FIELD(tc_verd);
+ +	new->tc_verd		= old->tc_verd;
+  #endif
+  #endif
+ +	new->vlan_proto		= old->vlan_proto;
+ +	new->vlan_tci		= old->vlan_tci;
+  
+ +	skb_copy_secmark(new, old);
+ +
+ +#ifdef CONFIG_NET_RX_BUSY_POLL
+ +	new->napi_id	= old->napi_id;
+ +#endif
+  }
+  
+  /*
+@@@ -3847,6 -4171,9 +3850,12 @@@ void skb_scrub_packet(struct sk_buff *s
+  	skb->skb_iif = 0;
+  	skb->ignore_df = 0;
+  	skb_dst_drop(skb);
+++<<<<<<< HEAD
+++=======
++ 	skb->mark = 0;
++ 	skb->sender_cpu = 0;
++ 	skb_init_secmark(skb);
+++>>>>>>> 2bd82484bb4c (xps: fix xps for stacked devices)
+  	secpath_reset(skb);
+  	nf_reset(skb);
+  	nf_reset_trace(skb);
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/core/flow_dissector.c b/net/core/flow_dissector.c
+index 243f397103e5..fc23117626e4 100644
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -384,7 +384,7 @@ static inline int get_xps_queue(struct net_device *dev, struct sk_buff *skb)
+ 	dev_maps = rcu_dereference(dev->xps_maps);
+ 	if (dev_maps) {
+ 		map = rcu_dereference(
+-		    dev_maps->cpu_map[raw_smp_processor_id()]);
++		    dev_maps->cpu_map[skb->sender_cpu - 1]);
+ 		if (map) {
+ 			if (map->len == 1)
+ 				queue_index = map->queues[0];
+@@ -431,6 +431,11 @@ struct netdev_queue *netdev_pick_tx(struct net_device *dev,
+ {
+ 	int queue_index = 0;
+ 
++#ifdef CONFIG_XPS
++	if (skb->sender_cpu == 0)
++		skb->sender_cpu = raw_smp_processor_id() + 1;
++#endif
++
+ 	if (dev->real_num_tx_queues != 1) {
+ 		const struct net_device_ops *ops = dev->netdev_ops;
+ 		if (ops->ndo_select_queue)
+* Unmerged path net/core/skbuff.c
