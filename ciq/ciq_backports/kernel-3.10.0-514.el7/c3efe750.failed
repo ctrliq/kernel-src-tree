@@ -1,0 +1,409 @@
+IB/core: Use hop-limit from IP stack for RoCE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matan Barak <matanb@mellanox.com>
+commit c3efe7500add077f79d37b18e9c66df6621409b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c3efe750.failed
+
+Previously, IPV6_DEFAULT_HOPLIMIT was used as the hop limit value for
+RoCE. Fixing that by taking ip4_dst_hoplimit and ip6_dst_hoplimit as
+hop limit values.
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit c3efe7500add077f79d37b18e9c66df6621409b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/addr.c
+#	drivers/infiniband/core/cm.c
+#	drivers/infiniband/core/cma.c
+#	drivers/infiniband/core/verbs.c
+#	drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+#	include/rdma/ib_addr.h
+diff --cc drivers/infiniband/core/addr.c
+index 746cdf56bc76,337353d86cfa..000000000000
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@@ -244,22 -246,16 +244,29 @@@ static int addr4_resolve(struct sockadd
+  	src_in->sin_family = AF_INET;
+  	src_in->sin_addr.s_addr = fl4.saddr;
+  
+ -	/* If there's a gateway, we're definitely in RoCE v2 (as RoCE v1 isn't
+ -	 * routable) and we could set the network type accordingly.
+ -	 */
+ -	if (rt->rt_uses_gateway)
+ -		addr->network = RDMA_NETWORK_IPV4;
+ +	if (rt->dst.dev->flags & IFF_LOOPBACK) {
+ +		ret = rdma_translate_ip((struct sockaddr *)dst_in, addr, NULL);
+ +		if (!ret)
+ +			memcpy(addr->dst_dev_addr, addr->src_dev_addr, MAX_ADDR_LEN);
+ +		goto put;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/* If the device does ARP internally, return 'done' */
+ +	if (rt->dst.dev->flags & IFF_NOARP) {
+ +		ret = rdma_copy_addr(addr, rt->dst.dev, NULL);
+ +		goto put;
+ +	}
+  
+ +	ret = dst_fetch_ha(&rt->dst, addr, &fl4.daddr);
+ +put:
+ +	ip_rt_put(rt);
+++=======
++ 	addr->hoplimit = ip4_dst_hoplimit(&rt->dst);
++ 
++ 	*prt = rt;
++ 	return 0;
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  out:
+  	return ret;
+  }
+@@@ -292,20 -291,16 +299,27 @@@ static int addr6_resolve(struct sockadd
+  		src_in->sin6_addr = fl6.saddr;
+  	}
+  
+ -	/* If there's a gateway, we're definitely in RoCE v2 (as RoCE v1 isn't
+ -	 * routable) and we could set the network type accordingly.
+ -	 */
+ -	if (rt->rt6i_flags & RTF_GATEWAY)
+ -		addr->network = RDMA_NETWORK_IPV6;
+ +	if (dst->dev->flags & IFF_LOOPBACK) {
+ +		ret = rdma_translate_ip((struct sockaddr *)dst_in, addr, NULL);
+ +		if (!ret)
+ +			memcpy(addr->dst_dev_addr, addr->src_dev_addr, MAX_ADDR_LEN);
+ +		goto put;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/* If the device does ARP internally, return 'done' */
+ +	if (dst->dev->flags & IFF_NOARP) {
+ +		ret = rdma_copy_addr(addr, dst->dev, NULL);
+ +		goto put;
+ +	}
+  
+ +	ret = dst_fetch_ha(dst, addr, &fl6.daddr);
+++=======
++ 	addr->hoplimit = ip6_dst_hoplimit(dst);
++ 
++ 	*pdst = dst;
++ 	return 0;
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  put:
+  	dst_release(dst);
+  	return ret;
+@@@ -457,8 -545,10 +471,15 @@@ static void resolve_cb(int status, stru
+  	complete(&((struct resolve_cb_context *)context)->comp);
+  }
+  
+++<<<<<<< HEAD
+ +int rdma_addr_find_dmac_by_grh(const union ib_gid *sgid, const union ib_gid *dgid,
+ +			       u8 *dmac, u16 *vlan_id)
+++=======
++ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
++ 				 const union ib_gid *dgid,
++ 				 u8 *dmac, u16 *vlan_id, int *if_index,
++ 				 int *hoplimit)
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  {
+  	int ret = 0;
+  	struct rdma_dev_addr dev_addr;
+@@@ -490,8 -583,12 +511,10 @@@
+  	dev = dev_get_by_index(&init_net, dev_addr.bound_dev_if);
+  	if (!dev)
+  		return -ENODEV;
+ -	if (if_index)
+ -		*if_index = dev_addr.bound_dev_if;
+  	if (vlan_id)
+  		*vlan_id = rdma_vlan_dev_vlan_id(dev);
++ 	if (hoplimit)
++ 		*hoplimit = dev_addr.hoplimit;
+  	dev_put(dev);
+  	return ret;
+  }
+diff --cc drivers/infiniband/core/cm.c
+index d7362172d351,1d92e091e22e..000000000000
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@@ -1636,10 -1641,31 +1636,27 @@@ static int cm_req_handler(struct cm_wor
+  	cm_format_paths_from_req(req_msg, &work->path[0], &work->path[1]);
+  
+  	memcpy(work->path[0].dmac, cm_id_priv->av.ah_attr.dmac, ETH_ALEN);
+++<<<<<<< HEAD
+ +	ret = cm_init_av_by_path(&work->path[0], &cm_id_priv->av);
+++=======
++ 	work->path[0].hop_limit = cm_id_priv->av.ah_attr.grh.hop_limit;
++ 	ret = ib_get_cached_gid(work->port->cm_dev->ib_device,
++ 				work->port->port_num,
++ 				cm_id_priv->av.ah_attr.grh.sgid_index,
++ 				&gid, &gid_attr);
++ 	if (!ret) {
++ 		if (gid_attr.ndev) {
++ 			work->path[0].ifindex = gid_attr.ndev->ifindex;
++ 			work->path[0].net = dev_net(gid_attr.ndev);
++ 			dev_put(gid_attr.ndev);
++ 		}
++ 		work->path[0].gid_type = gid_attr.gid_type;
++ 		ret = cm_init_av_by_path(&work->path[0], &cm_id_priv->av);
++ 	}
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  	if (ret) {
+ -		int err = ib_get_cached_gid(work->port->cm_dev->ib_device,
+ -					    work->port->port_num, 0,
+ -					    &work->path[0].sgid,
+ -					    &gid_attr);
+ -		if (!err && gid_attr.ndev) {
+ -			work->path[0].ifindex = gid_attr.ndev->ifindex;
+ -			work->path[0].net = dev_net(gid_attr.ndev);
+ -			dev_put(gid_attr.ndev);
+ -		}
+ -		work->path[0].gid_type = gid_attr.gid_type;
+ +		ib_get_cached_gid(work->port->cm_dev->ib_device,
+ +				  work->port->port_num, 0, &work->path[0].sgid);
+  		ib_send_cm_rej(cm_id, IB_CM_REJ_INVALID_GID,
+  			       &work->path[0].sgid, sizeof work->path[0].sgid,
+  			       NULL, 0);
+diff --cc drivers/infiniband/core/cma.c
+index 0523e8efcdf1,bbcfa76c2b62..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -2317,7 -2476,14 +2317,18 @@@ static int cma_resolve_iboe_route(struc
+  	rdma_ip2gid((struct sockaddr *)&id_priv->id.route.addr.dst_addr,
+  		    &route->path_rec->dgid);
+  
+++<<<<<<< HEAD
+ +	route->path_rec->hop_limit = 1;
+++=======
++ 	/* Use the hint from IP Stack to select GID Type */
++ 	if (route->path_rec->gid_type < ib_network_to_gid_type(addr->dev_addr.network))
++ 		route->path_rec->gid_type = ib_network_to_gid_type(addr->dev_addr.network);
++ 	if (((struct sockaddr *)&id_priv->id.route.addr.dst_addr)->sa_family != AF_IB)
++ 		/* TODO: get the hoplimit from the inet/inet6 device */
++ 		route->path_rec->hop_limit = addr->dev_addr.hoplimit;
++ 	else
++ 		route->path_rec->hop_limit = 1;
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  	route->path_rec->reversible = 1;
+  	route->path_rec->pkey = cpu_to_be16(0xffff);
+  	route->path_rec->mtu_selector = IB_SA_EQ;
+diff --cc drivers/infiniband/core/verbs.c
+index 6ff33ede8c15,5af6d024e053..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -309,24 -432,72 +309,50 @@@ int ib_init_ah_from_wc(struct ib_devic
+  	u32 flow_class;
+  	u16 gid_index;
+  	int ret;
+++<<<<<<< HEAD
+++=======
++ 	enum rdma_network_type net_type = RDMA_NETWORK_IB;
++ 	enum ib_gid_type gid_type = IB_GID_TYPE_IB;
++ 	int hoplimit = 0xff;
++ 	union ib_gid dgid;
++ 	union ib_gid sgid;
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  
+  	memset(ah_attr, 0, sizeof *ah_attr);
+  	if (rdma_cap_eth_ah(device, port_num)) {
+  		if (!(wc->wc_flags & IB_WC_GRH))
+  			return -EPROTOTYPE;
+  
+++<<<<<<< HEAD
+ +		if (wc->wc_flags & IB_WC_WITH_SMAC &&
+ +		    wc->wc_flags & IB_WC_WITH_VLAN) {
+ +			memcpy(ah_attr->dmac, wc->smac, ETH_ALEN);
+ +			ah_attr->vlan_id = wc->vlan_id;
+ +		} else {
+ +			ret = rdma_addr_find_dmac_by_grh(&grh->dgid, &grh->sgid,
+ +					ah_attr->dmac, &ah_attr->vlan_id);
+ +			if (ret)
+ +				return ret;
+++=======
++ 		if (!device->get_netdev)
++ 			return -EOPNOTSUPP;
++ 
++ 		idev = device->get_netdev(device, port_num);
++ 		if (!idev)
++ 			return -ENODEV;
++ 
++ 		ret = rdma_addr_find_l2_eth_by_grh(&dgid, &sgid,
++ 						   ah_attr->dmac,
++ 						   wc->wc_flags & IB_WC_WITH_VLAN ?
++ 						   NULL : &vlan_id,
++ 						   &if_index, &hoplimit);
++ 		if (ret) {
++ 			dev_put(idev);
++ 			return ret;
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  		}
+ -
+ -		resolved_dev = dev_get_by_index(&init_net, if_index);
+ -		if (resolved_dev->flags & IFF_LOOPBACK) {
+ -			dev_put(resolved_dev);
+ -			resolved_dev = idev;
+ -			dev_hold(resolved_dev);
+ -		}
+ -		rcu_read_lock();
+ -		if (resolved_dev != idev && !rdma_is_upper_dev_rcu(idev,
+ -								   resolved_dev))
+ -			ret = -EHOSTUNREACH;
+ -		rcu_read_unlock();
+ -		dev_put(idev);
+ -		dev_put(resolved_dev);
+ -		if (ret)
+ -			return ret;
+ -
+ -		ret = get_sgid_index_from_eth(device, port_num, vlan_id,
+ -					      &dgid, gid_type, &gid_index);
+ -		if (ret)
+ -			return ret;
+ +	} else {
+ +		ah_attr->vlan_id = 0xffff;
+  	}
+  
+  	ah_attr->dlid = wc->slid;
+@@@ -973,35 -1119,50 +999,64 @@@ int ib_modify_qp_is_ok(enum ib_qp_stat
+  }
+  EXPORT_SYMBOL(ib_modify_qp_is_ok);
+  
+ -int ib_resolve_eth_dmac(struct ib_qp *qp,
+ -			struct ib_qp_attr *qp_attr, int *qp_attr_mask)
+ +int ib_resolve_eth_l2_attrs(struct ib_qp *qp,
+ +			    struct ib_qp_attr *qp_attr, int *qp_attr_mask)
+  {
+  	int           ret = 0;
+ +	union ib_gid  sgid;
+  
+ -	if (*qp_attr_mask & IB_QP_AV) {
+ -		if (qp_attr->ah_attr.port_num < rdma_start_port(qp->device) ||
+ -		    qp_attr->ah_attr.port_num > rdma_end_port(qp->device))
+ -			return -EINVAL;
+ -
+ -		if (!rdma_cap_eth_ah(qp->device, qp_attr->ah_attr.port_num))
+ -			return 0;
+ -
+ +	if ((*qp_attr_mask & IB_QP_AV)  &&
+ +	    (rdma_cap_eth_ah(qp->device, qp_attr->ah_attr.port_num))) {
+ +		ret = ib_query_gid(qp->device, qp_attr->ah_attr.port_num,
+ +				   qp_attr->ah_attr.grh.sgid_index, &sgid);
+ +		if (ret)
+ +			goto out;
+  		if (rdma_link_local_addr((struct in6_addr *)qp_attr->ah_attr.grh.dgid.raw)) {
+ -			rdma_get_ll_mac((struct in6_addr *)qp_attr->ah_attr.grh.dgid.raw,
+ -					qp_attr->ah_attr.dmac);
+ +			rdma_get_ll_mac((struct in6_addr *)qp_attr->ah_attr.grh.dgid.raw, qp_attr->ah_attr.dmac);
+ +			rdma_get_ll_mac((struct in6_addr *)sgid.raw, qp_attr->smac);
+ +			if (!(*qp_attr_mask & IB_QP_VID))
+ +				qp_attr->vlan_id = rdma_get_vlan_id(&sgid);
+  		} else {
+++<<<<<<< HEAD
+ +			ret = rdma_addr_find_dmac_by_grh(&sgid, &qp_attr->ah_attr.grh.dgid,
+ +					qp_attr->ah_attr.dmac, &qp_attr->vlan_id);
+ +			if (ret)
+ +				goto out;
+ +			ret = rdma_addr_find_smac_by_sgid(&sgid, qp_attr->smac, NULL);
+ +			if (ret)
+ +				goto out;
+++=======
++ 			union ib_gid		sgid;
++ 			struct ib_gid_attr	sgid_attr;
++ 			int			ifindex;
++ 			int			hop_limit;
++ 
++ 			ret = ib_query_gid(qp->device,
++ 					   qp_attr->ah_attr.port_num,
++ 					   qp_attr->ah_attr.grh.sgid_index,
++ 					   &sgid, &sgid_attr);
++ 
++ 			if (ret || !sgid_attr.ndev) {
++ 				if (!ret)
++ 					ret = -ENXIO;
++ 				goto out;
++ 			}
++ 
++ 			ifindex = sgid_attr.ndev->ifindex;
++ 
++ 			ret = rdma_addr_find_l2_eth_by_grh(&sgid,
++ 							   &qp_attr->ah_attr.grh.dgid,
++ 							   qp_attr->ah_attr.dmac,
++ 							   NULL, &ifindex, &hop_limit);
++ 
++ 			dev_put(sgid_attr.ndev);
++ 
++ 			qp_attr->ah_attr.grh.hop_limit = hop_limit;
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  		}
+ +		*qp_attr_mask |= IB_QP_SMAC;
+ +		if (qp_attr->vlan_id < 0xFFFF)
+ +			*qp_attr_mask |= IB_QP_VID;
+  	}
+  out:
+  	return ret;
+diff --cc drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+index 6836aea6a876,3790771f2baa..000000000000
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+@@@ -145,11 -152,13 +145,18 @@@ struct ib_ah *ocrdma_create_ah(struct i
+  	if ((pd->uctx) &&
+  	    (!rdma_is_multicast_addr((struct in6_addr *)attr->grh.dgid.raw)) &&
+  	    (!rdma_link_local_addr((struct in6_addr *)attr->grh.dgid.raw))) {
+++<<<<<<< HEAD
+ +		status = rdma_addr_find_dmac_by_grh(&sgid, &attr->grh.dgid,
+ +						    attr->dmac, &attr->vlan_id);
+++=======
++ 		status = rdma_addr_find_l2_eth_by_grh(&sgid, &attr->grh.dgid,
++ 						      attr->dmac, &vlan_tag,
++ 						      &sgid_attr.ndev->ifindex,
++ 						      NULL);
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  		if (status) {
+ -			pr_err("%s(): Failed to resolve dmac from gid." 
+ -				"status = %d\n", __func__, status);
+ +			pr_err("%s(): Failed to resolve dmac from gid. status = %d\n",
+ +			       __func__, status);
+  			goto av_conf_err;
+  		}
+  	}
+diff --cc include/rdma/ib_addr.h
+index fde33ac6b58a,c34c9002460c..000000000000
+--- a/include/rdma/ib_addr.h
++++ b/include/rdma/ib_addr.h
+@@@ -71,6 -82,9 +71,12 @@@ struct rdma_dev_addr 
+  	unsigned short dev_type;
+  	int bound_dev_if;
+  	enum rdma_transport_type transport;
+++<<<<<<< HEAD
+++=======
++ 	struct net *net;
++ 	enum rdma_network_type network;
++ 	int hoplimit;
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  };
+  
+  /**
+@@@ -111,8 -131,10 +117,15 @@@ int rdma_copy_addr(struct rdma_dev_add
+  int rdma_addr_size(struct sockaddr *addr);
+  
+  int rdma_addr_find_smac_by_sgid(union ib_gid *sgid, u8 *smac, u16 *vlan_id);
+++<<<<<<< HEAD
+ +int rdma_addr_find_dmac_by_grh(const union ib_gid *sgid, const union ib_gid *dgid,
+ +			       u8 *smac, u16 *vlan_id);
+++=======
++ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
++ 				 const union ib_gid *dgid,
++ 				 u8 *smac, u16 *vlan_id, int *if_index,
++ 				 int *hoplimit);
+++>>>>>>> c3efe7500add (IB/core: Use hop-limit from IP stack for RoCE)
+  
+  static inline u16 ib_addr_get_pkey(struct rdma_dev_addr *dev_addr)
+  {
+* Unmerged path drivers/infiniband/core/addr.c
+* Unmerged path drivers/infiniband/core/cm.c
+* Unmerged path drivers/infiniband/core/cma.c
+* Unmerged path drivers/infiniband/core/verbs.c
+* Unmerged path drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+* Unmerged path include/rdma/ib_addr.h
