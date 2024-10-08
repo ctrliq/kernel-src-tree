@@ -1,0 +1,1030 @@
+Bluetooth: Add support for limited privacy mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Johan Hedberg <johan.hedberg@intel.com>
+commit 82a37adeedd38880940e2772ec1ae27a09353e5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/82a37ade.failed
+
+Introduce a limited privacy mode indicated by value 0x02 to the mgmt
+Set Privacy command.
+
+With value 0x02 the kernel will use privacy mode with a resolvable
+private address. In case the controller is bondable and discoverable
+the identity address will be used.
+
+	Signed-off-by: Johan Hedberg <johan.hedberg@intel.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 82a37adeedd38880940e2772ec1ae27a09353e5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/bluetooth/hci.h
+#	net/bluetooth/hci_conn.c
+#	net/bluetooth/hci_request.c
+#	net/bluetooth/hci_request.h
+#	net/bluetooth/mgmt.c
+diff --cc include/net/bluetooth/hci.h
+index 0ef00066dae8,5d38d980b89d..000000000000
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@@ -106,19 -218,31 +106,28 @@@ enum 
+  	HCI_AUTO_OFF,
+  	HCI_RFKILLED,
+  	HCI_MGMT,
+ -	HCI_BONDABLE,
+ +	HCI_PAIRABLE,
+  	HCI_SERVICE_CACHE,
+ -	HCI_KEEP_DEBUG_KEYS,
+ -	HCI_USE_DEBUG_KEYS,
+ +	HCI_LINK_KEYS,
+ +	HCI_DEBUG_KEYS,
+  	HCI_UNREGISTER,
+ -	HCI_UNCONFIGURED,
+ -	HCI_USER_CHANNEL,
+ -	HCI_EXT_CONFIGURED,
+ -	HCI_LE_ADV,
+ +
+  	HCI_LE_SCAN,
+  	HCI_SSP_ENABLED,
+++<<<<<<< HEAD
+++=======
++ 	HCI_SC_ENABLED,
++ 	HCI_SC_ONLY,
++ 	HCI_PRIVACY,
++ 	HCI_LIMITED_PRIVACY,
++ 	HCI_RPA_EXPIRED,
++ 	HCI_RPA_RESOLVING,
+++>>>>>>> 82a37adeedd3 (Bluetooth: Add support for limited privacy mode)
+  	HCI_HS_ENABLED,
+  	HCI_LE_ENABLED,
+ -	HCI_ADVERTISING,
+ -	HCI_ADVERTISING_CONNECTABLE,
+ +	HCI_LE_PERIPHERAL,
+  	HCI_CONNECTABLE,
+  	HCI_DISCOVERABLE,
+ -	HCI_LIMITED_DISCOVERABLE,
+  	HCI_LINK_SECURITY,
+  	HCI_PERIODIC_INQ,
+  	HCI_FAST_CONNECTABLE,
+diff --cc net/bluetooth/hci_conn.c
+index 6c7f36379722,bf9f8a801a2e..000000000000
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@@ -506,38 -652,392 +506,262 @@@ struct hci_dev *hci_get_route(bdaddr_t 
+  }
+  EXPORT_SYMBOL(hci_get_route);
+  
+ -/* This function requires the caller holds hdev->lock */
+ -void hci_le_conn_failed(struct hci_conn *conn, u8 status)
+ +static struct hci_conn *hci_connect_le(struct hci_dev *hdev, bdaddr_t *dst,
+ +				    u8 dst_type, u8 sec_level, u8 auth_type)
+  {
+ -	struct hci_dev *hdev = conn->hdev;
+ -	struct hci_conn_params *params;
+ +	struct hci_conn *le;
+  
+ -	params = hci_pend_le_action_lookup(&hdev->pend_le_conns, &conn->dst,
+ -					   conn->dst_type);
+ -	if (params && params->conn) {
+ -		hci_conn_drop(params->conn);
+ -		hci_conn_put(params->conn);
+ -		params->conn = NULL;
+ -	}
+ +	if (test_bit(HCI_LE_PERIPHERAL, &hdev->flags))
+ +		return ERR_PTR(-ENOTSUPP);
+  
+++<<<<<<< HEAD
+ +	le = hci_conn_hash_lookup_ba(hdev, LE_LINK, dst);
+ +	if (!le) {
+ +		le = hci_conn_hash_lookup_state(hdev, LE_LINK, BT_CONNECT);
+ +		if (le)
+++=======
++ 	conn->state = BT_CLOSED;
++ 
++ 	/* If the status indicates successful cancellation of
++ 	 * the attempt (i.e. Unkown Connection Id) there's no point of
++ 	 * notifying failure since we'll go back to keep trying to
++ 	 * connect. The only exception is explicit connect requests
++ 	 * where a timeout + cancel does indicate an actual failure.
++ 	 */
++ 	if (status != HCI_ERROR_UNKNOWN_CONN_ID ||
++ 	    (params && params->explicit_connect))
++ 		mgmt_connect_failed(hdev, &conn->dst, conn->type,
++ 				    conn->dst_type, status);
++ 
++ 	hci_connect_cfm(conn, status);
++ 
++ 	hci_conn_del(conn);
++ 
++ 	/* Since we may have temporarily stopped the background scanning in
++ 	 * favor of connection establishment, we should restart it.
++ 	 */
++ 	hci_update_background_scan(hdev);
++ 
++ 	/* Re-enable advertising in case this was a failed connection
++ 	 * attempt as a peripheral.
++ 	 */
++ 	hci_req_reenable_advertising(hdev);
++ }
++ 
++ static void create_le_conn_complete(struct hci_dev *hdev, u8 status, u16 opcode)
++ {
++ 	struct hci_conn *conn;
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	conn = hci_lookup_le_connect(hdev);
++ 
++ 	if (!status) {
++ 		hci_connect_le_scan_cleanup(conn);
++ 		goto done;
++ 	}
++ 
++ 	BT_ERR("HCI request failed to create LE connection: status 0x%2.2x",
++ 	       status);
++ 
++ 	if (!conn)
++ 		goto done;
++ 
++ 	hci_le_conn_failed(conn, status);
++ 
++ done:
++ 	hci_dev_unlock(hdev);
++ }
++ 
++ static bool conn_use_rpa(struct hci_conn *conn)
++ {
++ 	struct hci_dev *hdev = conn->hdev;
++ 
++ 	return hci_dev_test_flag(hdev, HCI_PRIVACY);
++ }
++ 
++ static void hci_req_add_le_create_conn(struct hci_request *req,
++ 				       struct hci_conn *conn)
++ {
++ 	struct hci_cp_le_create_conn cp;
++ 	struct hci_dev *hdev = conn->hdev;
++ 	u8 own_addr_type;
++ 
++ 	/* Update random address, but set require_privacy to false so
++ 	 * that we never connect with an non-resolvable address.
++ 	 */
++ 	if (hci_update_random_address(req, false, conn_use_rpa(conn),
++ 				      &own_addr_type))
++ 		return;
++ 
++ 	memset(&cp, 0, sizeof(cp));
++ 
++ 	/* Set window to be the same value as the interval to enable
++ 	 * continuous scanning.
++ 	 */
++ 	cp.scan_interval = cpu_to_le16(hdev->le_scan_interval);
++ 	cp.scan_window = cp.scan_interval;
++ 
++ 	bacpy(&cp.peer_addr, &conn->dst);
++ 	cp.peer_addr_type = conn->dst_type;
++ 	cp.own_address_type = own_addr_type;
++ 	cp.conn_interval_min = cpu_to_le16(conn->le_conn_min_interval);
++ 	cp.conn_interval_max = cpu_to_le16(conn->le_conn_max_interval);
++ 	cp.conn_latency = cpu_to_le16(conn->le_conn_latency);
++ 	cp.supervision_timeout = cpu_to_le16(conn->le_supv_timeout);
++ 	cp.min_ce_len = cpu_to_le16(0x0000);
++ 	cp.max_ce_len = cpu_to_le16(0x0000);
++ 
++ 	hci_req_add(req, HCI_OP_LE_CREATE_CONN, sizeof(cp), &cp);
++ 
++ 	conn->state = BT_CONNECT;
++ 	clear_bit(HCI_CONN_SCANNING, &conn->flags);
++ }
++ 
++ static void hci_req_directed_advertising(struct hci_request *req,
++ 					 struct hci_conn *conn)
++ {
++ 	struct hci_dev *hdev = req->hdev;
++ 	struct hci_cp_le_set_adv_param cp;
++ 	u8 own_addr_type;
++ 	u8 enable;
++ 
++ 	/* Clear the HCI_LE_ADV bit temporarily so that the
++ 	 * hci_update_random_address knows that it's safe to go ahead
++ 	 * and write a new random address. The flag will be set back on
++ 	 * as soon as the SET_ADV_ENABLE HCI command completes.
++ 	 */
++ 	hci_dev_clear_flag(hdev, HCI_LE_ADV);
++ 
++ 	/* Set require_privacy to false so that the remote device has a
++ 	 * chance of identifying us.
++ 	 */
++ 	if (hci_update_random_address(req, false, conn_use_rpa(conn),
++ 				      &own_addr_type) < 0)
++ 		return;
++ 
++ 	memset(&cp, 0, sizeof(cp));
++ 	cp.type = LE_ADV_DIRECT_IND;
++ 	cp.own_address_type = own_addr_type;
++ 	cp.direct_addr_type = conn->dst_type;
++ 	bacpy(&cp.direct_addr, &conn->dst);
++ 	cp.channel_map = hdev->le_adv_channel_map;
++ 
++ 	hci_req_add(req, HCI_OP_LE_SET_ADV_PARAM, sizeof(cp), &cp);
++ 
++ 	enable = 0x01;
++ 	hci_req_add(req, HCI_OP_LE_SET_ADV_ENABLE, sizeof(enable), &enable);
++ 
++ 	conn->state = BT_CONNECT;
++ }
++ 
++ struct hci_conn *hci_connect_le(struct hci_dev *hdev, bdaddr_t *dst,
++ 				u8 dst_type, u8 sec_level, u16 conn_timeout,
++ 				u8 role)
++ {
++ 	struct hci_conn_params *params;
++ 	struct hci_conn *conn;
++ 	struct smp_irk *irk;
++ 	struct hci_request req;
++ 	int err;
++ 
++ 	/* Let's make sure that le is enabled.*/
++ 	if (!hci_dev_test_flag(hdev, HCI_LE_ENABLED)) {
++ 		if (lmp_le_capable(hdev))
++ 			return ERR_PTR(-ECONNREFUSED);
++ 
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	}
++ 
++ 	/* Since the controller supports only one LE connection attempt at a
++ 	 * time, we return -EBUSY if there is any connection attempt running.
++ 	 */
++ 	if (hci_lookup_le_connect(hdev))
++ 		return ERR_PTR(-EBUSY);
++ 
++ 	/* If there's already a connection object but it's not in
++ 	 * scanning state it means it must already be established, in
++ 	 * which case we can't do anything else except report a failure
++ 	 * to connect.
++ 	 */
++ 	conn = hci_conn_hash_lookup_le(hdev, dst, dst_type);
++ 	if (conn && !test_bit(HCI_CONN_SCANNING, &conn->flags)) {
++ 		return ERR_PTR(-EBUSY);
++ 	}
++ 
++ 	/* When given an identity address with existing identity
++ 	 * resolving key, the connection needs to be established
++ 	 * to a resolvable random address.
++ 	 *
++ 	 * Storing the resolvable random address is required here
++ 	 * to handle connection failures. The address will later
++ 	 * be resolved back into the original identity address
++ 	 * from the connect request.
++ 	 */
++ 	irk = hci_find_irk_by_addr(hdev, dst, dst_type);
++ 	if (irk && bacmp(&irk->rpa, BDADDR_ANY)) {
++ 		dst = &irk->rpa;
++ 		dst_type = ADDR_LE_DEV_RANDOM;
++ 	}
++ 
++ 	if (conn) {
++ 		bacpy(&conn->dst, dst);
++ 	} else {
++ 		conn = hci_conn_add(hdev, LE_LINK, dst, role);
++ 		if (!conn)
++ 			return ERR_PTR(-ENOMEM);
++ 		hci_conn_hold(conn);
++ 		conn->pending_sec_level = sec_level;
++ 	}
++ 
++ 	conn->dst_type = dst_type;
++ 	conn->sec_level = BT_SECURITY_LOW;
++ 	conn->conn_timeout = conn_timeout;
++ 
++ 	hci_req_init(&req, hdev);
++ 
++ 	/* Disable advertising if we're active. For master role
++ 	 * connections most controllers will refuse to connect if
++ 	 * advertising is enabled, and for slave role connections we
++ 	 * anyway have to disable it in order to start directed
++ 	 * advertising.
++ 	 */
++ 	if (hci_dev_test_flag(hdev, HCI_LE_ADV)) {
++ 		u8 enable = 0x00;
++ 		hci_req_add(&req, HCI_OP_LE_SET_ADV_ENABLE, sizeof(enable),
++ 			    &enable);
++ 	}
++ 
++ 	/* If requested to connect as slave use directed advertising */
++ 	if (conn->role == HCI_ROLE_SLAVE) {
++ 		/* If we're active scanning most controllers are unable
++ 		 * to initiate advertising. Simply reject the attempt.
++ 		 */
++ 		if (hci_dev_test_flag(hdev, HCI_LE_SCAN) &&
++ 		    hdev->le_scan_type == LE_SCAN_ACTIVE) {
++ 			skb_queue_purge(&req.cmd_q);
++ 			hci_conn_del(conn);
+++>>>>>>> 82a37adeedd3 (Bluetooth: Add support for limited privacy mode)
+  			return ERR_PTR(-EBUSY);
+ -		}
+ -
+ -		hci_req_directed_advertising(&req, conn);
+ -		goto create_conn;
+ -	}
+ -
+ -	params = hci_conn_params_lookup(hdev, &conn->dst, conn->dst_type);
+ -	if (params) {
+ -		conn->le_conn_min_interval = params->conn_min_interval;
+ -		conn->le_conn_max_interval = params->conn_max_interval;
+ -		conn->le_conn_latency = params->conn_latency;
+ -		conn->le_supv_timeout = params->supervision_timeout;
+ -	} else {
+ -		conn->le_conn_min_interval = hdev->le_conn_min_interval;
+ -		conn->le_conn_max_interval = hdev->le_conn_max_interval;
+ -		conn->le_conn_latency = hdev->le_conn_latency;
+ -		conn->le_supv_timeout = hdev->le_supv_timeout;
+ -	}
+ -
+ -	/* If controller is scanning, we stop it since some controllers are
+ -	 * not able to scan and connect at the same time. Also set the
+ -	 * HCI_LE_SCAN_INTERRUPTED flag so that the command complete
+ -	 * handler for scan disabling knows to set the correct discovery
+ -	 * state.
+ -	 */
+ -	if (hci_dev_test_flag(hdev, HCI_LE_SCAN)) {
+ -		hci_req_add_le_scan_disable(&req);
+ -		hci_dev_set_flag(hdev, HCI_LE_SCAN_INTERRUPTED);
+ -	}
+ -
+ -	hci_req_add_le_create_conn(&req, conn);
+  
+ -create_conn:
+ -	err = hci_req_run(&req, create_le_conn_complete);
+ -	if (err) {
+ -		hci_conn_del(conn);
+ -		return ERR_PTR(err);
+ -	}
+ -
+ -	return conn;
+ -}
+ -
+ -static bool is_connected(struct hci_dev *hdev, bdaddr_t *addr, u8 type)
+ -{
+ -	struct hci_conn *conn;
+ -
+ -	conn = hci_conn_hash_lookup_le(hdev, addr, type);
+ -	if (!conn)
+ -		return false;
+ -
+ -	if (conn->state != BT_CONNECTED)
+ -		return false;
+ -
+ -	return true;
+ -}
+ -
+ -/* This function requires the caller holds hdev->lock */
+ -static int hci_explicit_conn_params_set(struct hci_dev *hdev,
+ -					bdaddr_t *addr, u8 addr_type)
+ -{
+ -	struct hci_conn_params *params;
+ -
+ -	if (is_connected(hdev, addr, addr_type))
+ -		return -EISCONN;
+ -
+ -	params = hci_conn_params_lookup(hdev, addr, addr_type);
+ -	if (!params) {
+ -		params = hci_conn_params_add(hdev, addr, addr_type);
+ -		if (!params)
+ -			return -ENOMEM;
+ -
+ -		/* If we created new params, mark them to be deleted in
+ -		 * hci_connect_le_scan_cleanup. It's different case than
+ -		 * existing disabled params, those will stay after cleanup.
+ -		 */
+ -		params->auto_connect = HCI_AUTO_CONN_EXPLICIT;
+ -	}
+ +		le = hci_conn_add(hdev, LE_LINK, dst);
+ +		if (!le)
+ +			return ERR_PTR(-ENOMEM);
+  
+ -	/* We're trying to connect, so make sure params are at pend_le_conns */
+ -	if (params->auto_connect == HCI_AUTO_CONN_DISABLED ||
+ -	    params->auto_connect == HCI_AUTO_CONN_REPORT ||
+ -	    params->auto_connect == HCI_AUTO_CONN_EXPLICIT) {
+ -		list_del_init(&params->action);
+ -		list_add(&params->action, &hdev->pend_le_conns);
+ +		le->dst_type = bdaddr_to_le(dst_type);
+ +		hci_le_create_connection(le);
+  	}
+  
+ -	params->explicit_connect = true;
+ +	le->pending_sec_level = sec_level;
+ +	le->auth_type = auth_type;
+  
+ -	BT_DBG("addr %pMR (type %u) auto_connect %u", addr, addr_type,
+ -	       params->auto_connect);
+ +	hci_conn_hold(le);
+  
+ -	return 0;
+ +	return le;
+  }
+  
+ -/* This function requires the caller holds hdev->lock */
+ -struct hci_conn *hci_connect_le_scan(struct hci_dev *hdev, bdaddr_t *dst,
+ -				     u8 dst_type, u8 sec_level,
+ -				     u16 conn_timeout)
+ -{
+ -	struct hci_conn *conn;
+ -
+ -	/* Let's make sure that le is enabled.*/
+ -	if (!hci_dev_test_flag(hdev, HCI_LE_ENABLED)) {
+ -		if (lmp_le_capable(hdev))
+ -			return ERR_PTR(-ECONNREFUSED);
+ -
+ -		return ERR_PTR(-EOPNOTSUPP);
+ -	}
+ -
+ -	/* Some devices send ATT messages as soon as the physical link is
+ -	 * established. To be able to handle these ATT messages, the user-
+ -	 * space first establishes the connection and then starts the pairing
+ -	 * process.
+ -	 *
+ -	 * So if a hci_conn object already exists for the following connection
+ -	 * attempt, we simply update pending_sec_level and auth_type fields
+ -	 * and return the object found.
+ -	 */
+ -	conn = hci_conn_hash_lookup_le(hdev, dst, dst_type);
+ -	if (conn) {
+ -		if (conn->pending_sec_level < sec_level)
+ -			conn->pending_sec_level = sec_level;
+ -		goto done;
+ -	}
+ -
+ -	BT_DBG("requesting refresh of dst_addr");
+ -
+ -	conn = hci_conn_add(hdev, LE_LINK, dst, HCI_ROLE_MASTER);
+ -	if (!conn)
+ -		return ERR_PTR(-ENOMEM);
+ -
+ -	if (hci_explicit_conn_params_set(hdev, dst, dst_type) < 0)
+ -		return ERR_PTR(-EBUSY);
+ -
+ -	conn->state = BT_CONNECT;
+ -	set_bit(HCI_CONN_SCANNING, &conn->flags);
+ -	conn->dst_type = dst_type;
+ -	conn->sec_level = BT_SECURITY_LOW;
+ -	conn->pending_sec_level = sec_level;
+ -	conn->conn_timeout = conn_timeout;
+ -
+ -	hci_update_background_scan(hdev);
+ -
+ -done:
+ -	hci_conn_hold(conn);
+ -	return conn;
+ -}
+ -
+ -struct hci_conn *hci_connect_acl(struct hci_dev *hdev, bdaddr_t *dst,
+ -				 u8 sec_level, u8 auth_type)
+ +static struct hci_conn *hci_connect_acl(struct hci_dev *hdev, bdaddr_t *dst,
+ +						u8 sec_level, u8 auth_type)
+  {
+  	struct hci_conn *acl;
+  
+diff --cc net/bluetooth/mgmt.c
+index f8ecbc70293d,2ca355519d79..000000000000
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@@ -1160,17 -1374,29 +1160,33 @@@ static int set_pairable(struct sock *sk
+  	hci_dev_lock(hdev);
+  
+  	if (cp->val)
+ -		changed = !hci_dev_test_and_set_flag(hdev, HCI_BONDABLE);
+ +		set_bit(HCI_PAIRABLE, &hdev->dev_flags);
+  	else
+ -		changed = hci_dev_test_and_clear_flag(hdev, HCI_BONDABLE);
+ +		clear_bit(HCI_PAIRABLE, &hdev->dev_flags);
+  
+ -	err = send_settings_rsp(sk, MGMT_OP_SET_BONDABLE, hdev);
+ +	err = send_settings_rsp(sk, MGMT_OP_SET_PAIRABLE, hdev);
+  	if (err < 0)
+ -		goto unlock;
+ +		goto failed;
+  
+++<<<<<<< HEAD
+ +	err = new_settings(hdev, sk);
+++=======
++ 	if (changed) {
++ 		/* In limited privacy mode the change of bondable mode
++ 		 * may affect the local advertising address.
++ 		 */
++ 		if (hdev_is_powered(hdev) &&
++ 		    hci_dev_test_flag(hdev, HCI_ADVERTISING) &&
++ 		    hci_dev_test_flag(hdev, HCI_DISCOVERABLE) &&
++ 		    hci_dev_test_flag(hdev, HCI_LIMITED_PRIVACY))
++ 			queue_work(hdev->req_workqueue,
++ 				   &hdev->discoverable_update);
++ 
++ 		err = new_settings(hdev, sk);
++ 	}
+++>>>>>>> 82a37adeedd3 (Bluetooth: Add support for limited privacy mode)
+  
+ -unlock:
+ +failed:
+  	hci_dev_unlock(hdev);
+  	return err;
+  }
+@@@ -3047,15 -4097,480 +3063,475 @@@ unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void set_bredr_complete(struct hci_dev *hdev, u8 status, u16 opcode)
++ {
++ 	struct mgmt_pending_cmd *cmd;
++ 
++ 	BT_DBG("status 0x%02x", status);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	cmd = pending_find(MGMT_OP_SET_BREDR, hdev);
++ 	if (!cmd)
++ 		goto unlock;
++ 
++ 	if (status) {
++ 		u8 mgmt_err = mgmt_status(status);
++ 
++ 		/* We need to restore the flag if related HCI commands
++ 		 * failed.
++ 		 */
++ 		hci_dev_clear_flag(hdev, HCI_BREDR_ENABLED);
++ 
++ 		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode, mgmt_err);
++ 	} else {
++ 		send_settings_rsp(cmd->sk, MGMT_OP_SET_BREDR, hdev);
++ 		new_settings(hdev, cmd->sk);
++ 	}
++ 
++ 	mgmt_pending_remove(cmd);
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ }
++ 
++ static int set_bredr(struct sock *sk, struct hci_dev *hdev, void *data, u16 len)
++ {
++ 	struct mgmt_mode *cp = data;
++ 	struct mgmt_pending_cmd *cmd;
++ 	struct hci_request req;
++ 	int err;
++ 
++ 	BT_DBG("request for %s", hdev->name);
++ 
++ 	if (!lmp_bredr_capable(hdev) || !lmp_le_capable(hdev))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BREDR,
++ 				       MGMT_STATUS_NOT_SUPPORTED);
++ 
++ 	if (!hci_dev_test_flag(hdev, HCI_LE_ENABLED))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BREDR,
++ 				       MGMT_STATUS_REJECTED);
++ 
++ 	if (cp->val != 0x00 && cp->val != 0x01)
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BREDR,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	if (cp->val == hci_dev_test_flag(hdev, HCI_BREDR_ENABLED)) {
++ 		err = send_settings_rsp(sk, MGMT_OP_SET_BREDR, hdev);
++ 		goto unlock;
++ 	}
++ 
++ 	if (!hdev_is_powered(hdev)) {
++ 		if (!cp->val) {
++ 			hci_dev_clear_flag(hdev, HCI_DISCOVERABLE);
++ 			hci_dev_clear_flag(hdev, HCI_SSP_ENABLED);
++ 			hci_dev_clear_flag(hdev, HCI_LINK_SECURITY);
++ 			hci_dev_clear_flag(hdev, HCI_FAST_CONNECTABLE);
++ 			hci_dev_clear_flag(hdev, HCI_HS_ENABLED);
++ 		}
++ 
++ 		hci_dev_change_flag(hdev, HCI_BREDR_ENABLED);
++ 
++ 		err = send_settings_rsp(sk, MGMT_OP_SET_BREDR, hdev);
++ 		if (err < 0)
++ 			goto unlock;
++ 
++ 		err = new_settings(hdev, sk);
++ 		goto unlock;
++ 	}
++ 
++ 	/* Reject disabling when powered on */
++ 	if (!cp->val) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BREDR,
++ 				      MGMT_STATUS_REJECTED);
++ 		goto unlock;
++ 	} else {
++ 		/* When configuring a dual-mode controller to operate
++ 		 * with LE only and using a static address, then switching
++ 		 * BR/EDR back on is not allowed.
++ 		 *
++ 		 * Dual-mode controllers shall operate with the public
++ 		 * address as its identity address for BR/EDR and LE. So
++ 		 * reject the attempt to create an invalid configuration.
++ 		 *
++ 		 * The same restrictions applies when secure connections
++ 		 * has been enabled. For BR/EDR this is a controller feature
++ 		 * while for LE it is a host stack feature. This means that
++ 		 * switching BR/EDR back on when secure connections has been
++ 		 * enabled is not a supported transaction.
++ 		 */
++ 		if (!hci_dev_test_flag(hdev, HCI_BREDR_ENABLED) &&
++ 		    (bacmp(&hdev->static_addr, BDADDR_ANY) ||
++ 		     hci_dev_test_flag(hdev, HCI_SC_ENABLED))) {
++ 			err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BREDR,
++ 					      MGMT_STATUS_REJECTED);
++ 			goto unlock;
++ 		}
++ 	}
++ 
++ 	if (pending_find(MGMT_OP_SET_BREDR, hdev)) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BREDR,
++ 				      MGMT_STATUS_BUSY);
++ 		goto unlock;
++ 	}
++ 
++ 	cmd = mgmt_pending_add(sk, MGMT_OP_SET_BREDR, hdev, data, len);
++ 	if (!cmd) {
++ 		err = -ENOMEM;
++ 		goto unlock;
++ 	}
++ 
++ 	/* We need to flip the bit already here so that
++ 	 * hci_req_update_adv_data generates the correct flags.
++ 	 */
++ 	hci_dev_set_flag(hdev, HCI_BREDR_ENABLED);
++ 
++ 	hci_req_init(&req, hdev);
++ 
++ 	__hci_req_write_fast_connectable(&req, false);
++ 	__hci_req_update_scan(&req);
++ 
++ 	/* Since only the advertising data flags will change, there
++ 	 * is no need to update the scan response data.
++ 	 */
++ 	__hci_req_update_adv_data(&req, hdev->cur_adv_instance);
++ 
++ 	err = hci_req_run(&req, set_bredr_complete);
++ 	if (err < 0)
++ 		mgmt_pending_remove(cmd);
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ 	return err;
++ }
++ 
++ static void sc_enable_complete(struct hci_dev *hdev, u8 status, u16 opcode)
++ {
++ 	struct mgmt_pending_cmd *cmd;
++ 	struct mgmt_mode *cp;
++ 
++ 	BT_DBG("%s status %u", hdev->name, status);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	cmd = pending_find(MGMT_OP_SET_SECURE_CONN, hdev);
++ 	if (!cmd)
++ 		goto unlock;
++ 
++ 	if (status) {
++ 		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode,
++ 			        mgmt_status(status));
++ 		goto remove;
++ 	}
++ 
++ 	cp = cmd->param;
++ 
++ 	switch (cp->val) {
++ 	case 0x00:
++ 		hci_dev_clear_flag(hdev, HCI_SC_ENABLED);
++ 		hci_dev_clear_flag(hdev, HCI_SC_ONLY);
++ 		break;
++ 	case 0x01:
++ 		hci_dev_set_flag(hdev, HCI_SC_ENABLED);
++ 		hci_dev_clear_flag(hdev, HCI_SC_ONLY);
++ 		break;
++ 	case 0x02:
++ 		hci_dev_set_flag(hdev, HCI_SC_ENABLED);
++ 		hci_dev_set_flag(hdev, HCI_SC_ONLY);
++ 		break;
++ 	}
++ 
++ 	send_settings_rsp(cmd->sk, MGMT_OP_SET_SECURE_CONN, hdev);
++ 	new_settings(hdev, cmd->sk);
++ 
++ remove:
++ 	mgmt_pending_remove(cmd);
++ unlock:
++ 	hci_dev_unlock(hdev);
++ }
++ 
++ static int set_secure_conn(struct sock *sk, struct hci_dev *hdev,
++ 			   void *data, u16 len)
++ {
++ 	struct mgmt_mode *cp = data;
++ 	struct mgmt_pending_cmd *cmd;
++ 	struct hci_request req;
++ 	u8 val;
++ 	int err;
++ 
++ 	BT_DBG("request for %s", hdev->name);
++ 
++ 	if (!lmp_sc_capable(hdev) &&
++ 	    !hci_dev_test_flag(hdev, HCI_LE_ENABLED))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_SECURE_CONN,
++ 				       MGMT_STATUS_NOT_SUPPORTED);
++ 
++ 	if (hci_dev_test_flag(hdev, HCI_BREDR_ENABLED) &&
++ 	    lmp_sc_capable(hdev) &&
++ 	    !hci_dev_test_flag(hdev, HCI_SSP_ENABLED))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_SECURE_CONN,
++ 				       MGMT_STATUS_REJECTED);
++ 
++ 	if (cp->val != 0x00 && cp->val != 0x01 && cp->val != 0x02)
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_SECURE_CONN,
++ 				  MGMT_STATUS_INVALID_PARAMS);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	if (!hdev_is_powered(hdev) || !lmp_sc_capable(hdev) ||
++ 	    !hci_dev_test_flag(hdev, HCI_BREDR_ENABLED)) {
++ 		bool changed;
++ 
++ 		if (cp->val) {
++ 			changed = !hci_dev_test_and_set_flag(hdev,
++ 							     HCI_SC_ENABLED);
++ 			if (cp->val == 0x02)
++ 				hci_dev_set_flag(hdev, HCI_SC_ONLY);
++ 			else
++ 				hci_dev_clear_flag(hdev, HCI_SC_ONLY);
++ 		} else {
++ 			changed = hci_dev_test_and_clear_flag(hdev,
++ 							      HCI_SC_ENABLED);
++ 			hci_dev_clear_flag(hdev, HCI_SC_ONLY);
++ 		}
++ 
++ 		err = send_settings_rsp(sk, MGMT_OP_SET_SECURE_CONN, hdev);
++ 		if (err < 0)
++ 			goto failed;
++ 
++ 		if (changed)
++ 			err = new_settings(hdev, sk);
++ 
++ 		goto failed;
++ 	}
++ 
++ 	if (pending_find(MGMT_OP_SET_SECURE_CONN, hdev)) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_SECURE_CONN,
++ 				      MGMT_STATUS_BUSY);
++ 		goto failed;
++ 	}
++ 
++ 	val = !!cp->val;
++ 
++ 	if (val == hci_dev_test_flag(hdev, HCI_SC_ENABLED) &&
++ 	    (cp->val == 0x02) == hci_dev_test_flag(hdev, HCI_SC_ONLY)) {
++ 		err = send_settings_rsp(sk, MGMT_OP_SET_SECURE_CONN, hdev);
++ 		goto failed;
++ 	}
++ 
++ 	cmd = mgmt_pending_add(sk, MGMT_OP_SET_SECURE_CONN, hdev, data, len);
++ 	if (!cmd) {
++ 		err = -ENOMEM;
++ 		goto failed;
++ 	}
++ 
++ 	hci_req_init(&req, hdev);
++ 	hci_req_add(&req, HCI_OP_WRITE_SC_SUPPORT, 1, &val);
++ 	err = hci_req_run(&req, sc_enable_complete);
++ 	if (err < 0) {
++ 		mgmt_pending_remove(cmd);
++ 		goto failed;
++ 	}
++ 
++ failed:
++ 	hci_dev_unlock(hdev);
++ 	return err;
++ }
++ 
++ static int set_debug_keys(struct sock *sk, struct hci_dev *hdev,
++ 			  void *data, u16 len)
++ {
++ 	struct mgmt_mode *cp = data;
++ 	bool changed, use_changed;
++ 	int err;
++ 
++ 	BT_DBG("request for %s", hdev->name);
++ 
++ 	if (cp->val != 0x00 && cp->val != 0x01 && cp->val != 0x02)
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_DEBUG_KEYS,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	if (cp->val)
++ 		changed = !hci_dev_test_and_set_flag(hdev, HCI_KEEP_DEBUG_KEYS);
++ 	else
++ 		changed = hci_dev_test_and_clear_flag(hdev,
++ 						      HCI_KEEP_DEBUG_KEYS);
++ 
++ 	if (cp->val == 0x02)
++ 		use_changed = !hci_dev_test_and_set_flag(hdev,
++ 							 HCI_USE_DEBUG_KEYS);
++ 	else
++ 		use_changed = hci_dev_test_and_clear_flag(hdev,
++ 							  HCI_USE_DEBUG_KEYS);
++ 
++ 	if (hdev_is_powered(hdev) && use_changed &&
++ 	    hci_dev_test_flag(hdev, HCI_SSP_ENABLED)) {
++ 		u8 mode = (cp->val == 0x02) ? 0x01 : 0x00;
++ 		hci_send_cmd(hdev, HCI_OP_WRITE_SSP_DEBUG_MODE,
++ 			     sizeof(mode), &mode);
++ 	}
++ 
++ 	err = send_settings_rsp(sk, MGMT_OP_SET_DEBUG_KEYS, hdev);
++ 	if (err < 0)
++ 		goto unlock;
++ 
++ 	if (changed)
++ 		err = new_settings(hdev, sk);
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ 	return err;
++ }
++ 
++ static int set_privacy(struct sock *sk, struct hci_dev *hdev, void *cp_data,
++ 		       u16 len)
++ {
++ 	struct mgmt_cp_set_privacy *cp = cp_data;
++ 	bool changed;
++ 	int err;
++ 
++ 	BT_DBG("request for %s", hdev->name);
++ 
++ 	if (!lmp_le_capable(hdev))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_PRIVACY,
++ 				       MGMT_STATUS_NOT_SUPPORTED);
++ 
++ 	if (cp->privacy != 0x00 && cp->privacy != 0x01 && cp->privacy != 0x02)
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_PRIVACY,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 	if (hdev_is_powered(hdev))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_PRIVACY,
++ 				       MGMT_STATUS_REJECTED);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	/* If user space supports this command it is also expected to
++ 	 * handle IRKs. Therefore, set the HCI_RPA_RESOLVING flag.
++ 	 */
++ 	hci_dev_set_flag(hdev, HCI_RPA_RESOLVING);
++ 
++ 	if (cp->privacy) {
++ 		changed = !hci_dev_test_and_set_flag(hdev, HCI_PRIVACY);
++ 		memcpy(hdev->irk, cp->irk, sizeof(hdev->irk));
++ 		hci_dev_set_flag(hdev, HCI_RPA_EXPIRED);
++ 		if (cp->privacy == 0x02)
++ 			hci_dev_set_flag(hdev, HCI_LIMITED_PRIVACY);
++ 		else
++ 			hci_dev_clear_flag(hdev, HCI_LIMITED_PRIVACY);
++ 	} else {
++ 		changed = hci_dev_test_and_clear_flag(hdev, HCI_PRIVACY);
++ 		memset(hdev->irk, 0, sizeof(hdev->irk));
++ 		hci_dev_clear_flag(hdev, HCI_RPA_EXPIRED);
++ 		hci_dev_clear_flag(hdev, HCI_LIMITED_PRIVACY);
++ 	}
++ 
++ 	err = send_settings_rsp(sk, MGMT_OP_SET_PRIVACY, hdev);
++ 	if (err < 0)
++ 		goto unlock;
++ 
++ 	if (changed)
++ 		err = new_settings(hdev, sk);
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ 	return err;
++ }
++ 
++ static bool irk_is_valid(struct mgmt_irk_info *irk)
++ {
++ 	switch (irk->addr.type) {
++ 	case BDADDR_LE_PUBLIC:
++ 		return true;
++ 
++ 	case BDADDR_LE_RANDOM:
++ 		/* Two most significant bits shall be set */
++ 		if ((irk->addr.bdaddr.b[5] & 0xc0) != 0xc0)
++ 			return false;
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static int load_irks(struct sock *sk, struct hci_dev *hdev, void *cp_data,
++ 		     u16 len)
++ {
++ 	struct mgmt_cp_load_irks *cp = cp_data;
++ 	const u16 max_irk_count = ((U16_MAX - sizeof(*cp)) /
++ 				   sizeof(struct mgmt_irk_info));
++ 	u16 irk_count, expected_len;
++ 	int i, err;
++ 
++ 	BT_DBG("request for %s", hdev->name);
++ 
++ 	if (!lmp_le_capable(hdev))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_LOAD_IRKS,
++ 				       MGMT_STATUS_NOT_SUPPORTED);
++ 
++ 	irk_count = __le16_to_cpu(cp->irk_count);
++ 	if (irk_count > max_irk_count) {
++ 		BT_ERR("load_irks: too big irk_count value %u", irk_count);
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_LOAD_IRKS,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 	}
++ 
++ 	expected_len = sizeof(*cp) + irk_count * sizeof(struct mgmt_irk_info);
++ 	if (expected_len != len) {
++ 		BT_ERR("load_irks: expected %u bytes, got %u bytes",
++ 		       expected_len, len);
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_LOAD_IRKS,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 	}
++ 
++ 	BT_DBG("%s irk_count %u", hdev->name, irk_count);
++ 
++ 	for (i = 0; i < irk_count; i++) {
++ 		struct mgmt_irk_info *key = &cp->irks[i];
++ 
++ 		if (!irk_is_valid(key))
++ 			return mgmt_cmd_status(sk, hdev->id,
++ 					       MGMT_OP_LOAD_IRKS,
++ 					       MGMT_STATUS_INVALID_PARAMS);
++ 	}
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	hci_smp_irks_clear(hdev);
++ 
++ 	for (i = 0; i < irk_count; i++) {
++ 		struct mgmt_irk_info *irk = &cp->irks[i];
++ 
++ 		hci_add_irk(hdev, &irk->addr.bdaddr,
++ 			    le_addr_type(irk->addr.type), irk->val,
++ 			    BDADDR_ANY);
++ 	}
++ 
++ 	hci_dev_set_flag(hdev, HCI_RPA_RESOLVING);
++ 
++ 	err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_LOAD_IRKS, 0, NULL, 0);
++ 
++ 	hci_dev_unlock(hdev);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 82a37adeedd3 (Bluetooth: Add support for limited privacy mode)
+  static bool ltk_is_valid(struct mgmt_ltk_info *key)
+  {
+ +	if (key->authenticated != 0x00 && key->authenticated != 0x01)
+ +		return false;
+  	if (key->master != 0x00 && key->master != 0x01)
+  		return false;
+ -
+ -	switch (key->addr.type) {
+ -	case BDADDR_LE_PUBLIC:
+ -		return true;
+ -
+ -	case BDADDR_LE_RANDOM:
+ -		/* Two most significant bits shall be set */
+ -		if ((key->addr.bdaddr.b[5] & 0xc0) != 0xc0)
+ -			return false;
+ -		return true;
+ -	}
+ -
+ -	return false;
+ +	if (!bdaddr_type_is_le(key->addr.type))
+ +		return false;
+ +	return true;
+  }
+  
+  static int load_long_term_keys(struct sock *sk, struct hci_dev *hdev,
+* Unmerged path net/bluetooth/hci_request.c
+* Unmerged path net/bluetooth/hci_request.h
+* Unmerged path include/net/bluetooth/hci.h
+* Unmerged path net/bluetooth/hci_conn.c
+* Unmerged path net/bluetooth/hci_request.c
+* Unmerged path net/bluetooth/hci_request.h
+* Unmerged path net/bluetooth/mgmt.c
