@@ -1,0 +1,150 @@
+cxl: Allow initialization on timebase sync failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Frederic Barrat <fbarrat@linux.vnet.ibm.com>
+commit e009a7e858fed215cb4eed5174a31cadd42d8797
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e009a7e8.failed
+
+Failure to synchronize the PSL timebase currently prevents the
+initialization of the cxl card, thus rendering the card useless. This
+is too extreme for a feature which is rarely used, if at all. No
+hardware AFUs or software is currently using PSL timebase.
+
+This patch still tries to synchronize the PSL timebase when the card
+is initialized, but ignores the error if it can't. Instead, it reports
+a status via /sys.
+
+	Signed-off-by: Frederic Barrat <fbarrat@linux.vnet.ibm.com>
+	Acked-by: Ian Munsie <imunsie@au1.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit e009a7e858fed215cb4eed5174a31cadd42d8797)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/cxl/guest.c
+* Unmerged path drivers/misc/cxl/guest.c
+diff --git a/Documentation/ABI/testing/sysfs-class-cxl b/Documentation/ABI/testing/sysfs-class-cxl
+index b07e86d4597f..8875e9bc7867 100644
+--- a/Documentation/ABI/testing/sysfs-class-cxl
++++ b/Documentation/ABI/testing/sysfs-class-cxl
+@@ -233,3 +233,11 @@ Description:	read/write
+ 		0 = don't trust, the image may be different (default)
+ 		1 = trust that the image will not change.
+ Users:		https://github.com/ibm-capi/libcxl
++
++What:           /sys/class/cxl/<card>/psl_timebase_synced
++Date:           March 2016
++Contact:        linuxppc-dev@lists.ozlabs.org
++Description:    read only
++                Returns 1 if the psl timebase register is synchronized
++                with the core timebase register, 0 otherwise.
++Users:          https://github.com/ibm-capi/libcxl
+diff --git a/drivers/misc/cxl/cxl.h b/drivers/misc/cxl/cxl.h
+index ea4888bb5ce4..b84fafddb4ce 100644
+--- a/drivers/misc/cxl/cxl.h
++++ b/drivers/misc/cxl/cxl.h
+@@ -517,6 +517,7 @@ struct cxl {
+ 	bool perst_loads_image;
+ 	bool perst_select_user;
+ 	bool perst_same_image;
++	bool psl_timebase_synced;
+ };
+ 
+ int cxl_alloc_one_irq(struct cxl *adapter);
+* Unmerged path drivers/misc/cxl/guest.c
+diff --git a/drivers/misc/cxl/pci.c b/drivers/misc/cxl/pci.c
+index c7dc27fa6ee0..d86c2112e054 100644
+--- a/drivers/misc/cxl/pci.c
++++ b/drivers/misc/cxl/pci.c
+@@ -397,22 +397,24 @@ static int init_implementation_adapter_regs(struct cxl *adapter, struct pci_dev
+ #define TBSYNC_CNT(n) (((u64)n & 0x7) << (63-6))
+ #define _2048_250MHZ_CYCLES 1
+ 
+-static int cxl_setup_psl_timebase(struct cxl *adapter, struct pci_dev *dev)
++static void cxl_setup_psl_timebase(struct cxl *adapter, struct pci_dev *dev)
+ {
+ 	u64 psl_tb;
+ 	int delta;
+ 	unsigned int retry = 0;
+ 	struct device_node *np;
+ 
++	adapter->psl_timebase_synced = false;
++
+ 	if (!(np = pnv_pci_get_phb_node(dev)))
+-		return -ENODEV;
++		return;
+ 
+ 	/* Do not fail when CAPP timebase sync is not supported by OPAL */
+ 	of_node_get(np);
+ 	if (! of_get_property(np, "ibm,capp-timebase-sync", NULL)) {
+ 		of_node_put(np);
+-		pr_err("PSL: Timebase sync: OPAL support missing\n");
+-		return 0;
++		dev_info(&dev->dev, "PSL timebase inactive: OPAL support missing\n");
++		return;
+ 	}
+ 	of_node_put(np);
+ 
+@@ -431,8 +433,8 @@ static int cxl_setup_psl_timebase(struct cxl *adapter, struct pci_dev *dev)
+ 	do {
+ 		msleep(1);
+ 		if (retry++ > 5) {
+-			pr_err("PSL: Timebase sync: giving up!\n");
+-			return -EIO;
++			dev_info(&dev->dev, "PSL timebase can't synchronize\n");
++			return;
+ 		}
+ 		psl_tb = cxl_p1_read(adapter, CXL_PSL_Timebase);
+ 		delta = mftb() - psl_tb;
+@@ -440,7 +442,8 @@ static int cxl_setup_psl_timebase(struct cxl *adapter, struct pci_dev *dev)
+ 			delta = -delta;
+ 	} while (tb_to_ns(delta) > 16000);
+ 
+-	return 0;
++	adapter->psl_timebase_synced = true;
++	return;
+ }
+ 
+ static int init_implementation_afu_regs(struct cxl_afu *afu)
+@@ -1166,8 +1169,8 @@ static int cxl_configure_adapter(struct cxl *adapter, struct pci_dev *dev)
+ 	if ((rc = pnv_phb_to_cxl_mode(dev, OPAL_PHB_CAPI_MODE_SNOOP_ON)))
+ 		goto err;
+ 
+-	if ((rc = cxl_setup_psl_timebase(adapter, dev)))
+-		goto err;
++	/* Ignore error, adapter init is not dependant on timebase sync */
++	cxl_setup_psl_timebase(adapter, dev);
+ 
+ 	if ((rc = cxl_register_psl_err_irq(adapter)))
+ 		goto err;
+diff --git a/drivers/misc/cxl/sysfs.c b/drivers/misc/cxl/sysfs.c
+index 038af5d45145..1ea062db8439 100644
+--- a/drivers/misc/cxl/sysfs.c
++++ b/drivers/misc/cxl/sysfs.c
+@@ -57,6 +57,15 @@ static ssize_t image_loaded_show(struct device *device,
+ 	return scnprintf(buf, PAGE_SIZE, "factory\n");
+ }
+ 
++static ssize_t psl_timebase_synced_show(struct device *device,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct cxl *adapter = to_cxl_adapter(device);
++
++	return scnprintf(buf, PAGE_SIZE, "%i\n", adapter->psl_timebase_synced);
++}
++
+ static ssize_t reset_adapter_store(struct device *device,
+ 				   struct device_attribute *attr,
+ 				   const char *buf, size_t count)
+@@ -142,6 +151,7 @@ static struct device_attribute adapter_attrs[] = {
+ 	__ATTR_RO(psl_revision),
+ 	__ATTR_RO(base_image),
+ 	__ATTR_RO(image_loaded),
++	__ATTR_RO(psl_timebase_synced),
+ 	__ATTR_RW(load_image_on_perst),
+ 	__ATTR_RW(perst_reloads_same_image),
+ 	__ATTR(reset, S_IWUSR, NULL, reset_adapter_store),
