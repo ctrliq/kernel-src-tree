@@ -1,0 +1,236 @@
+NVMe: Fix blk-mq hot cpu notification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 1efccc9ddb98fd533169669160201b027562af7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1efccc9d.failed
+
+The driver may issue commands to a device that may never return, so its
+request_queue could always have active requests while the controller is
+running. Waiting for the queue to freeze could block forever, which is
+what blk-mq's hot cpu notification handler was doing when nvme drives
+were in use.
+
+This has the nvme driver make the asynchronous event command's tag
+reserved and does not keep the request active. We can't have more than
+one since the request is released back to the request_queue before the
+command is completed. Having only one avoids potential tag collisions,
+and reserving the tag for this purpose prevents other admin tasks from
+reusing the tag.
+
+I also couldn't think of a scenario where issuing AEN requests single
+depth is worse than issuing them in batches, so I don't think we lose
+anything with this change.
+
+As an added bonus, doing it this way removes "Cancelling I/O" warnings
+observed when unbinding the nvme driver from a device.
+
+	Reported-by: Yigal Korman <yigal@plexistor.com>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 1efccc9ddb98fd533169669160201b027562af7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 6783fae878e4,c12c95cf2e55..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -243,6 -287,45 +243,48 @@@ static void special_completion(struct n
+  	dev_warn(nvmeq->q_dmadev, "Unknown special completion %p\n", ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *cancel_cmd_info(struct nvme_cmd_info *cmd, nvme_completion_fn *fn)
++ {
++ 	void *ctx;
++ 
++ 	if (fn)
++ 		*fn = cmd->fn;
++ 	ctx = cmd->ctx;
++ 	cmd->fn = special_completion;
++ 	cmd->ctx = CMD_CTX_CANCELLED;
++ 	return ctx;
++ }
++ 
++ static void async_req_completion(struct nvme_queue *nvmeq, void *ctx,
++ 						struct nvme_completion *cqe)
++ {
++ 	u32 result = le32_to_cpup(&cqe->result);
++ 	u16 status = le16_to_cpup(&cqe->status) >> 1;
++ 
++ 	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ)
++ 		++nvmeq->dev->event_limit;
++ 	if (status == NVME_SC_SUCCESS)
++ 		dev_warn(nvmeq->q_dmadev,
++ 			"async event result %08x\n", result);
++ }
++ 
++ static void abort_completion(struct nvme_queue *nvmeq, void *ctx,
++ 						struct nvme_completion *cqe)
++ {
++ 	struct request *req = ctx;
++ 
++ 	u16 status = le16_to_cpup(&cqe->status) >> 1;
++ 	u32 result = le32_to_cpup(&cqe->result);
++ 
++ 	blk_mq_free_hctx_request(nvmeq->hctx, req);
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Abort status:%x result:%x", status, result);
++ 	++nvmeq->dev->abort_limit;
++ }
++ 
+++>>>>>>> 1efccc9ddb98 (NVMe: Fix blk-mq hot cpu notification)
+  static void async_completion(struct nvme_queue *nvmeq, void *ctx,
+  						struct nvme_completion *cqe)
+  {
+@@@ -1047,17 -1016,49 +1089,52 @@@ static int nvme_submit_sync_cmd(struct 
+  	return cmdinfo.status;
+  }
+  
+ -static int nvme_submit_async_admin_req(struct nvme_dev *dev)
+ +int nvme_submit_async_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ +						struct async_cmd_info *cmdinfo,
+ +						unsigned timeout)
+  {
+ -	struct nvme_queue *nvmeq = dev->queues[0];
+ -	struct nvme_command c;
+ -	struct nvme_cmd_info *cmd_info;
+ -	struct request *req;
+ +	int cmdid;
+  
+++<<<<<<< HEAD
+ +	cmdid = alloc_cmdid_killable(nvmeq, cmdinfo, async_completion, timeout);
+ +	if (cmdid < 0)
+ +		return cmdid;
+++=======
++ 	req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC, true);
++ 	if (IS_ERR(req))
++ 		return PTR_ERR(req);
++ 
++ 	req->cmd_flags |= REQ_NO_TIMEOUT;
++ 	cmd_info = blk_mq_rq_to_pdu(req);
++ 	nvme_set_info(cmd_info, NULL, async_req_completion);
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.common.opcode = nvme_admin_async_event;
++ 	c.common.command_id = req->tag;
++ 
++ 	blk_mq_free_hctx_request(nvmeq->hctx, req);
++ 	return __nvme_submit_cmd(nvmeq, &c);
++ }
++ 
++ static int nvme_submit_admin_async_cmd(struct nvme_dev *dev,
++ 			struct nvme_command *cmd,
++ 			struct async_cmd_info *cmdinfo, unsigned timeout)
++ {
++ 	struct nvme_queue *nvmeq = dev->queues[0];
++ 	struct request *req;
++ 	struct nvme_cmd_info *cmd_rq;
++ 
++ 	req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_KERNEL, false);
++ 	if (IS_ERR(req))
++ 		return PTR_ERR(req);
++ 
++ 	req->timeout = timeout;
++ 	cmd_rq = blk_mq_rq_to_pdu(req);
++ 	cmdinfo->req = req;
++ 	nvme_set_info(cmd_rq, cmdinfo, async_completion);
+++>>>>>>> 1efccc9ddb98 (NVMe: Fix blk-mq hot cpu notification)
+  	cmdinfo->status = -EINTR;
+ -
+ -	cmd->common.command_id = req->tag;
+ -
+ +	cmd->common.command_id = cmdid;
+  	return nvme_submit_cmd(nvmeq, cmd);
+  }
+  
+@@@ -1554,6 -1548,62 +1631,65 @@@ static int nvme_shutdown_ctrl(struct nv
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct blk_mq_ops nvme_mq_admin_ops = {
++ 	.queue_rq	= nvme_admin_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_admin_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_admin_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static struct blk_mq_ops nvme_mq_ops = {
++ 	.queue_rq	= nvme_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_init_hctx,
++ 	.exit_hctx	= nvme_exit_hctx,
++ 	.init_request	= nvme_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static void nvme_dev_remove_admin(struct nvme_dev *dev)
++ {
++ 	if (dev->admin_q && !blk_queue_dying(dev->admin_q)) {
++ 		blk_cleanup_queue(dev->admin_q);
++ 		blk_mq_free_tag_set(&dev->admin_tagset);
++ 	}
++ }
++ 
++ static int nvme_alloc_admin_tags(struct nvme_dev *dev)
++ {
++ 	if (!dev->admin_q) {
++ 		dev->admin_tagset.ops = &nvme_mq_admin_ops;
++ 		dev->admin_tagset.nr_hw_queues = 1;
++ 		dev->admin_tagset.queue_depth = NVME_AQ_DEPTH - 1;
++ 		dev->admin_tagset.reserved_tags = 1;
++ 		dev->admin_tagset.timeout = ADMIN_TIMEOUT;
++ 		dev->admin_tagset.numa_node = dev_to_node(&dev->pci_dev->dev);
++ 		dev->admin_tagset.cmd_size = nvme_cmd_size(dev);
++ 		dev->admin_tagset.driver_data = dev;
++ 
++ 		if (blk_mq_alloc_tag_set(&dev->admin_tagset))
++ 			return -ENOMEM;
++ 
++ 		dev->admin_q = blk_mq_init_queue(&dev->admin_tagset);
++ 		if (IS_ERR(dev->admin_q)) {
++ 			blk_mq_free_tag_set(&dev->admin_tagset);
++ 			return -ENOMEM;
++ 		}
++ 		if (!blk_get_queue(dev->admin_q)) {
++ 			nvme_dev_remove_admin(dev);
++ 			return -ENODEV;
++ 		}
++ 	} else
++ 		blk_mq_unfreeze_queue(dev->admin_q);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 1efccc9ddb98 (NVMe: Fix blk-mq hot cpu notification)
+  static int nvme_configure_admin_queue(struct nvme_dev *dev)
+  {
+  	int result;
+@@@ -2882,10 -2874,15 +3017,11 @@@ static int nvme_dev_start(struct nvme_d
+  
+  	result = nvme_setup_io_queues(dev);
+  	if (result)
+ -		goto free_tags;
+ -
+ -	nvme_set_irq_hints(dev);
+ +		goto disable;
+  
++ 	dev->event_limit = 1;
+  	return result;
+  
+ - free_tags:
+ -	nvme_dev_remove_admin(dev);
+   disable:
+  	nvme_disable_queue(dev, 0);
+  	nvme_dev_list_remove(dev);
+* Unmerged path drivers/block/nvme-core.c
