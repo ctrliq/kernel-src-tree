@@ -1,0 +1,238 @@
+perf hists: Basic support of hierarchical report view
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit aef810ec4e6b638facb6c81803c019906f34f014
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/aef810ec.failed
+
+In the hierarchical view, entries will be grouped and sorted on the
+first key, and then on the second key, and so on.  Add the
+he->hroot_{in,out} fields to keep the lower level entries. Actually this
+can share space, in a union, with callchain's 'sorted_root' since the
+hroots are only used by non-leaf entries and callchain is only used by
+leaf entries.
+
+It also adds the 'parent_he' and 'depth' fields which can be used by browsers.
+
+This patch only implements collapsing part which creates internal
+entries for each sort key.  These need to be sorted by output_sort stage
+and to be displayed properly in the later patch(es).
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Acked-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1456326830-30456-3-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit aef810ec4e6b638facb6c81803c019906f34f014)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/symbol.h
+diff --cc tools/perf/util/symbol.h
+index 3877753f29ce,a937053a0ae0..000000000000
+--- a/tools/perf/util/symbol.h
++++ b/tools/perf/util/symbol.h
+@@@ -107,7 -107,11 +107,15 @@@ struct symbol_conf 
+  			filter_relative,
+  			show_hist_headers,
+  			branch_callstack,
+++<<<<<<< HEAD
+ +			has_filter;
+++=======
++ 			has_filter,
++ 			show_ref_callgraph,
++ 			hide_unresolved,
++ 			raw_trace,
++ 			report_hierarchy;
+++>>>>>>> aef810ec4e6b (perf hists: Basic support of hierarchical report view)
+  	const char	*vmlinux_name,
+  			*kallsyms_name,
+  			*source_prefix,
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 17f64502833e..d558950b42ce 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -390,6 +390,9 @@ static struct hist_entry *hist_entry__new(struct hist_entry *template,
+ 		}
+ 		INIT_LIST_HEAD(&he->pairs.node);
+ 		thread__get(he->thread);
++
++		if (!symbol_conf.report_hierarchy)
++			he->leaf = true;
+ 	}
+ 
+ 	return he;
+@@ -1013,6 +1016,114 @@ void hist_entry__delete(struct hist_entry *he)
+  * collapse the histogram
+  */
+ 
++static void hists__apply_filters(struct hists *hists, struct hist_entry *he);
++
++static struct hist_entry *hierarchy_insert_entry(struct hists *hists,
++						 struct rb_root *root,
++						 struct hist_entry *he,
++						 struct perf_hpp_fmt *fmt)
++{
++	struct rb_node **p = &root->rb_node;
++	struct rb_node *parent = NULL;
++	struct hist_entry *iter, *new;
++	int64_t cmp;
++
++	while (*p != NULL) {
++		parent = *p;
++		iter = rb_entry(parent, struct hist_entry, rb_node_in);
++
++		cmp = fmt->collapse(fmt, iter, he);
++		if (!cmp) {
++			he_stat__add_stat(&iter->stat, &he->stat);
++			return iter;
++		}
++
++		if (cmp < 0)
++			p = &parent->rb_left;
++		else
++			p = &parent->rb_right;
++	}
++
++	new = hist_entry__new(he, true);
++	if (new == NULL)
++		return NULL;
++
++	hists__apply_filters(hists, new);
++	hists->nr_entries++;
++
++	/* save related format for output */
++	new->fmt = fmt;
++
++	/* some fields are now passed to 'new' */
++	if (perf_hpp__is_trace_entry(fmt))
++		he->trace_output = NULL;
++	else
++		new->trace_output = NULL;
++
++	if (perf_hpp__is_srcline_entry(fmt))
++		he->srcline = NULL;
++	else
++		new->srcline = NULL;
++
++	if (perf_hpp__is_srcfile_entry(fmt))
++		he->srcfile = NULL;
++	else
++		new->srcfile = NULL;
++
++	rb_link_node(&new->rb_node_in, parent, p);
++	rb_insert_color(&new->rb_node_in, root);
++	return new;
++}
++
++static int hists__hierarchy_insert_entry(struct hists *hists,
++					 struct rb_root *root,
++					 struct hist_entry *he)
++{
++	struct perf_hpp_fmt *fmt;
++	struct hist_entry *new_he = NULL;
++	struct hist_entry *parent = NULL;
++	int depth = 0;
++	int ret = 0;
++
++	hists__for_each_sort_list(hists, fmt) {
++		if (!perf_hpp__is_sort_entry(fmt) &&
++		    !perf_hpp__is_dynamic_entry(fmt))
++			continue;
++		if (perf_hpp__should_skip(fmt, hists))
++			continue;
++
++		/* insert copy of 'he' for each fmt into the hierarchy */
++		new_he = hierarchy_insert_entry(hists, root, he, fmt);
++		if (new_he == NULL) {
++			ret = -1;
++			break;
++		}
++
++		root = &new_he->hroot_in;
++		new_he->parent_he = parent;
++		new_he->depth = depth++;
++		parent = new_he;
++	}
++
++	if (new_he) {
++		new_he->leaf = true;
++
++		if (symbol_conf.use_callchain) {
++			callchain_cursor_reset(&callchain_cursor);
++			if (callchain_merge(&callchain_cursor,
++					    new_he->callchain,
++					    he->callchain) < 0)
++				ret = -1;
++		}
++	}
++
++	/* 'he' is no longer used */
++	hist_entry__delete(he);
++
++	/* return 0 (or -1) since it already applied filters */
++	return ret;
++}
++
+ int hists__collapse_insert_entry(struct hists *hists, struct rb_root *root,
+ 				 struct hist_entry *he)
+ {
+@@ -1021,6 +1132,9 @@ int hists__collapse_insert_entry(struct hists *hists, struct rb_root *root,
+ 	struct hist_entry *iter;
+ 	int64_t cmp;
+ 
++	if (symbol_conf.report_hierarchy)
++		return hists__hierarchy_insert_entry(hists, root, he);
++
+ 	while (*p != NULL) {
+ 		parent = *p;
+ 		iter = rb_entry(parent, struct hist_entry, rb_node_in);
+diff --git a/tools/perf/util/sort.h b/tools/perf/util/sort.h
+index cb167fb3da85..5746bea748ed 100644
+--- a/tools/perf/util/sort.h
++++ b/tools/perf/util/sort.h
+@@ -93,9 +93,11 @@ struct hist_entry {
+ 	s32			socket;
+ 	s32			cpu;
+ 	u8			cpumode;
++	u8			depth;
+ 
+ 	/* We are added by hists__add_dummy_entry. */
+ 	bool			dummy;
++	bool			leaf;
+ 
+ 	char			level;
+ 	u8			filtered;
+@@ -117,13 +119,22 @@ struct hist_entry {
+ 	char			*srcline;
+ 	char			*srcfile;
+ 	struct symbol		*parent;
+-	struct rb_root		sorted_chain;
+ 	struct branch_info	*branch_info;
+ 	struct hists		*hists;
+ 	struct mem_info		*mem_info;
+ 	void			*raw_data;
+ 	u32			raw_size;
+ 	void			*trace_output;
++	struct perf_hpp_fmt	*fmt;
++	struct hist_entry	*parent_he;
++	union {
++		/* this is for hierarchical entry structure */
++		struct {
++			struct rb_root	hroot_in;
++			struct rb_root  hroot_out;
++		};				/* non-leaf entries */
++		struct rb_root	sorted_chain;	/* leaf entry has callchains */
++	};
+ 	struct callchain_root	callchain[0]; /* must be last member */
+ };
+ 
+* Unmerged path tools/perf/util/symbol.h
