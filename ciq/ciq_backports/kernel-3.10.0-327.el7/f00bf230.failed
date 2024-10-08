@@ -1,0 +1,151 @@
+sfc: don't update stats on VF when called in atomic context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Daniel Pieczko <dpieczko@solarflare.com>
+commit f00bf2305cabc2313c70575384aee60e8f2a684d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f00bf230.failed
+
+The ifenslave command to set up a bond runs in an atomic
+context, and it queries the stats on the devices that are
+being enslaved. A VF needs to make an MCDI call to update
+its stats, which is not allowed in atomic context.
+
+The releasing of the stats_lock is moved to the beginning of
+the VF stats update function so that in_interrupt() can be
+used; it must be taken again before returning from this
+function.
+
+	Signed-off-by: Shradha Shah <sshah@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f00bf2305cabc2313c70575384aee60e8f2a684d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index 95f33d51af2f,6b8d8f254515..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -1051,37 -1291,88 +1051,92 @@@ static size_t efx_ef10_update_stats(str
+  		udelay(100);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (full_stats) {
+ +		for_each_set_bit(index, mask, EF10_STAT_COUNT) {
+ +			if (efx_ef10_stat_desc[index].name) {
+ +				*full_stats++ = stats[index];
+ +				++stats_count;
+ +			}
+ +		}
+++=======
++ 	return efx_ef10_update_stats_common(efx, full_stats, core_stats);
++ }
++ 
++ static int efx_ef10_try_update_nic_stats_vf(struct efx_nic *efx)
++ {
++ 	MCDI_DECLARE_BUF(inbuf, MC_CMD_MAC_STATS_IN_LEN);
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 	DECLARE_BITMAP(mask, EF10_STAT_COUNT);
++ 	__le64 generation_start, generation_end;
++ 	u64 *stats = nic_data->stats;
++ 	u32 dma_len = MC_CMD_MAC_NSTATS * sizeof(u64);
++ 	struct efx_buffer stats_buf;
++ 	__le64 *dma_stats;
++ 	int rc;
++ 
++ 	spin_unlock_bh(&efx->stats_lock);
++ 
++ 	if (in_interrupt()) {
++ 		/* If in atomic context, cannot update stats.  Just update the
++ 		 * software stats and return so the caller can continue.
++ 		 */
++ 		spin_lock_bh(&efx->stats_lock);
++ 		efx_update_sw_stats(efx, stats);
++ 		return 0;
++ 	}
++ 
++ 	efx_ef10_get_stat_mask(efx, mask);
++ 
++ 	rc = efx_nic_alloc_buffer(efx, &stats_buf, dma_len, GFP_ATOMIC);
++ 	if (rc) {
++ 		spin_lock_bh(&efx->stats_lock);
++ 		return rc;
++ 	}
++ 
++ 	dma_stats = stats_buf.addr;
++ 	dma_stats[MC_CMD_MAC_GENERATION_END] = EFX_MC_STATS_GENERATION_INVALID;
++ 
++ 	MCDI_SET_QWORD(inbuf, MAC_STATS_IN_DMA_ADDR, stats_buf.dma_addr);
++ 	MCDI_POPULATE_DWORD_1(inbuf, MAC_STATS_IN_CMD,
++ 			      MAC_STATS_IN_DMA, 1);
++ 	MCDI_SET_DWORD(inbuf, MAC_STATS_IN_DMA_LEN, dma_len);
++ 	MCDI_SET_DWORD(inbuf, MAC_STATS_IN_PORT_ID, EVB_PORT_ID_ASSIGNED);
++ 
++ 	rc = efx_mcdi_rpc_quiet(efx, MC_CMD_MAC_STATS, inbuf, sizeof(inbuf),
++ 				NULL, 0, NULL);
++ 	spin_lock_bh(&efx->stats_lock);
++ 	if (rc) {
++ 		/* Expect ENOENT if DMA queues have not been set up */
++ 		if (rc != -ENOENT || atomic_read(&efx->active_queues))
++ 			efx_mcdi_display_error(efx, MC_CMD_MAC_STATS,
++ 					       sizeof(inbuf), NULL, 0, rc);
++ 		goto out;
+++>>>>>>> f00bf2305cab (sfc: don't update stats on VF when called in atomic context)
+  	}
+  
+ -	generation_end = dma_stats[MC_CMD_MAC_GENERATION_END];
+ -	if (generation_end == EFX_MC_STATS_GENERATION_INVALID) {
+ -		WARN_ON_ONCE(1);
+ -		goto out;
+ -	}
+ -	rmb();
+ -	efx_nic_update_stats(efx_ef10_stat_desc, EF10_STAT_COUNT, mask,
+ -			     stats, stats_buf.addr, false);
+ -	rmb();
+ -	generation_start = dma_stats[MC_CMD_MAC_GENERATION_START];
+ -	if (generation_end != generation_start) {
+ -		rc = -EAGAIN;
+ -		goto out;
+ +	if (core_stats) {
+ +		core_stats->rx_packets = stats[EF10_STAT_port_rx_packets];
+ +		core_stats->tx_packets = stats[EF10_STAT_port_tx_packets];
+ +		core_stats->rx_bytes = stats[EF10_STAT_port_rx_bytes];
+ +		core_stats->tx_bytes = stats[EF10_STAT_port_tx_bytes];
+ +		core_stats->rx_dropped = stats[EF10_STAT_port_rx_nodesc_drops] +
+ +					 stats[GENERIC_STAT_rx_nodesc_trunc] +
+ +					 stats[GENERIC_STAT_rx_noskb_drops];
+ +		core_stats->multicast = stats[EF10_STAT_port_rx_multicast];
+ +		core_stats->rx_length_errors =
+ +			stats[EF10_STAT_port_rx_gtjumbo] +
+ +			stats[EF10_STAT_port_rx_length_error];
+ +		core_stats->rx_crc_errors = stats[EF10_STAT_port_rx_bad];
+ +		core_stats->rx_frame_errors =
+ +			stats[EF10_STAT_port_rx_align_error];
+ +		core_stats->rx_fifo_errors = stats[EF10_STAT_port_rx_overflow];
+ +		core_stats->rx_errors = (core_stats->rx_length_errors +
+ +					 core_stats->rx_crc_errors +
+ +					 core_stats->rx_frame_errors);
+  	}
+  
+ -	efx_update_sw_stats(efx, stats);
+ -out:
+ -	efx_nic_free_buffer(efx, &stats_buf);
+ -	return rc;
+ -}
+ -
+ -static size_t efx_ef10_update_stats_vf(struct efx_nic *efx, u64 *full_stats,
+ -				       struct rtnl_link_stats64 *core_stats)
+ -{
+ -	if (efx_ef10_try_update_nic_stats_vf(efx))
+ -		return 0;
+ -
+ -	return efx_ef10_update_stats_common(efx, full_stats, core_stats);
+ +	return stats_count;
+  }
+  
+  static void efx_ef10_push_irq_moderation(struct efx_channel *channel)
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
