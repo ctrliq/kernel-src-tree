@@ -2058,6 +2058,10 @@ void mlx4_en_destroy_netdev(struct net_device *dev)
 	mdev->pndev[priv->port] = NULL;
 	mutex_unlock(&mdev->state_lock);
 
+#ifdef CONFIG_RFS_ACCEL
+	mlx4_en_cleanup_filters(priv);
+#endif
+
 	mlx4_en_free_resources(priv);
 
 	kfree(priv->tx_ring);
