@@ -1,0 +1,191 @@
+powerpc/powernv: Enable Offline CPUs to enter deep idle states
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Enable Offline CPUs to enter deep idle states (Gustavo Duarte) [1123121]
+Rebuild_FUZZ: 93.10%
+commit-author Shreyas B. Prabhu <shreyas@linux.vnet.ibm.com>
+commit 8eb8ac89a364305d05ad16be983b7890eb462cc3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8eb8ac89.failed
+
+The secondary threads should enter deep idle states so as to gain maximum
+powersavings when the entire core is offline. To do so the offline path
+must be made aware of the available deepest idle state. Hence probe the
+device tree for the possible idle states in powernv core code and
+expose the deepest idle state through flags.
+
+Since the  device tree is probed by the cpuidle driver as well, move
+the parameters required to discover the idle states into an appropriate
+common place to both the driver and the powernv core code.
+
+Another point is that fastsleep idle state may require workarounds in
+the kernel to function properly. This workaround is introduced in the
+subsequent patches. However neither the cpuidle driver or the hotplug
+path need be bothered about this workaround.
+
+They will be taken care of by the core powernv code.
+
+Originally-by: Srivatsa S. Bhat <srivatsa@mit.edu>
+	Signed-off-by: Preeti U. Murthy <preeti@linux.vnet.ibm.com>
+	Signed-off-by: Shreyas B. Prabhu <shreyas@linux.vnet.ibm.com>
+	Reviewed-by: Paul Mackerras <paulus@samba.org>
+
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: linux-pm@vger.kernel.org
+	Cc: linuxppc-dev@lists.ozlabs.org
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8eb8ac89a364305d05ad16be983b7890eb462cc3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpuidle/cpuidle-powernv.c
+diff --cc drivers/cpuidle/cpuidle-powernv.c
+index a64be578dab2,0a7d827897e4..000000000000
+--- a/drivers/cpuidle/cpuidle-powernv.c
++++ b/drivers/cpuidle/cpuidle-powernv.c
+@@@ -185,7 -190,12 +182,16 @@@ static int powernv_add_idle_states(void
+  	for (i = 0; i < dt_idle_states; i++) {
+  
+  		flags = be32_to_cpu(idle_state_flags[i]);
+++<<<<<<< HEAD
+ +		if (flags & IDLE_USE_INST_NAP) {
+++=======
++ 
++ 		/* Cpuidle accepts exit_latency in us and we estimate
++ 		 * target residency to be 10x exit_latency
++ 		 */
++ 		latency_ns = be32_to_cpu(idle_state_latency[i]);
++ 		if (flags & OPAL_PM_NAP_ENABLED) {
+++>>>>>>> 8eb8ac89a364 (powerpc/powernv: Enable Offline CPUs to enter deep idle states)
+  			/* Add NAP state */
+  			strcpy(powernv_states[nr_idle_states].name, "Nap");
+  			strcpy(powernv_states[nr_idle_states].desc, "Nap");
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index e795ae10954f..c4aa3ceac886 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -150,6 +150,14 @@ struct opal_sg_list {
+ #define OPAL_REGISTER_DUMP_REGION		101
+ #define OPAL_UNREGISTER_DUMP_REGION		102
+ 
++/* Device tree flags */
++
++/* Flags set in power-mgmt nodes in device tree if
++ * respective idle states are supported in the platform.
++ */
++#define OPAL_PM_NAP_ENABLED	0x00010000
++#define OPAL_PM_SLEEP_ENABLED	0x00020000
++
+ #ifndef __ASSEMBLY__
+ 
+ #include <linux/notifier.h>
+diff --git a/arch/powerpc/platforms/powernv/powernv.h b/arch/powerpc/platforms/powernv/powernv.h
+index 75501bfede7f..4bf06abfea31 100644
+--- a/arch/powerpc/platforms/powernv/powernv.h
++++ b/arch/powerpc/platforms/powernv/powernv.h
+@@ -23,6 +23,8 @@ static inline int pnv_pci_dma_set_mask(struct pci_dev *pdev, u64 dma_mask)
+ }
+ #endif
+ 
++extern u32 pnv_get_supported_cpuidle_states(void);
++
+ extern void pnv_lpc_init(void);
+ 
+ bool cpu_core_split_required(void);
+diff --git a/arch/powerpc/platforms/powernv/setup.c b/arch/powerpc/platforms/powernv/setup.c
+index d9b88fa7c5a3..8392fcdfbae1 100644
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -280,6 +280,55 @@ static void __init pnv_setup_machdep_rtas(void)
+ }
+ #endif /* CONFIG_PPC_POWERNV_RTAS */
+ 
++static u32 supported_cpuidle_states;
++
++u32 pnv_get_supported_cpuidle_states(void)
++{
++	return supported_cpuidle_states;
++}
++
++static int __init pnv_init_idle_states(void)
++{
++	struct device_node *power_mgt;
++	int dt_idle_states;
++	const __be32 *idle_state_flags;
++	u32 len_flags, flags;
++	int i;
++
++	supported_cpuidle_states = 0;
++
++	if (cpuidle_disable != IDLE_NO_OVERRIDE)
++		return 0;
++
++	if (!firmware_has_feature(FW_FEATURE_OPALv3))
++		return 0;
++
++	power_mgt = of_find_node_by_path("/ibm,opal/power-mgt");
++	if (!power_mgt) {
++		pr_warn("opal: PowerMgmt Node not found\n");
++		return 0;
++	}
++
++	idle_state_flags = of_get_property(power_mgt,
++			"ibm,cpu-idle-state-flags", &len_flags);
++	if (!idle_state_flags) {
++		pr_warn("DT-PowerMgmt: missing ibm,cpu-idle-state-flags\n");
++		return 0;
++	}
++
++	dt_idle_states = len_flags / sizeof(u32);
++
++	for (i = 0; i < dt_idle_states; i++) {
++		flags = be32_to_cpu(idle_state_flags[i]);
++		supported_cpuidle_states |= flags;
++	}
++
++	return 0;
++}
++
++subsys_initcall(pnv_init_idle_states);
++
++
+ static int __init pnv_probe(void)
+ {
+ 	unsigned long root = of_get_flat_dt_root();
+diff --git a/arch/powerpc/platforms/powernv/smp.c b/arch/powerpc/platforms/powernv/smp.c
+index 1c14ba216c76..4c067c76fe97 100644
+--- a/arch/powerpc/platforms/powernv/smp.c
++++ b/arch/powerpc/platforms/powernv/smp.c
+@@ -150,6 +150,7 @@ static void pnv_smp_cpu_kill_self(void)
+ {
+ 	unsigned int cpu;
+ 	unsigned long srr1;
++	u32 idle_states;
+ 
+ 	/* Standard hot unplug procedure */
+ 	local_irq_disable();
+@@ -160,13 +161,17 @@ static void pnv_smp_cpu_kill_self(void)
+ 	generic_set_cpu_dead(cpu);
+ 	smp_wmb();
+ 
++	idle_states = pnv_get_supported_cpuidle_states();
+ 	/* We don't want to take decrementer interrupts while we are offline,
+ 	 * so clear LPCR:PECE1. We keep PECE2 enabled.
+ 	 */
+ 	mtspr(SPRN_LPCR, mfspr(SPRN_LPCR) & ~(u64)LPCR_PECE1);
+ 	while (!generic_check_cpu_restart(cpu)) {
+ 		ppc64_runlatch_off();
+-		srr1 = power7_nap(1);
++		if (idle_states & OPAL_PM_SLEEP_ENABLED)
++			srr1 = power7_sleep();
++		else
++			srr1 = power7_nap(1);
+ 		ppc64_runlatch_on();
+ 
+ 		/*
+* Unmerged path drivers/cpuidle/cpuidle-powernv.c
