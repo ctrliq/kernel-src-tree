@@ -1,0 +1,252 @@
+execve: use 'struct filename *' for executable name passing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit c4ad8f98bef77c7356aa6a9ad9188a6acc6b849d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c4ad8f98.failed
+
+This changes 'do_execve()' to get the executable name as a 'struct
+filename', and to free it when it is done.  This is what the normal
+users want, and it simplifies and streamlines their error handling.
+
+The controlled lifetime of the executable name also fixes a
+use-after-free problem with the trace_sched_process_exec tracepoint: the
+lifetime of the passed-in string for kernel users was not at all
+obvious, and the user-mode helper code used UMH_WAIT_EXEC to serialize
+the pathname allocation lifetime with the execve() having finished,
+which in turn meant that the trace point that happened after
+mm_release() of the old process VM ended up using already free'd memory.
+
+To solve the kernel string lifetime issue, this simply introduces
+"getname_kernel()" that works like the normal user-space getname()
+function, except with the source coming from kernel memory.
+
+As Oleg points out, this also means that we could drop the tcomm[] array
+from 'struct linux_binprm', since the pathname lifetime now covers
+setup_new_exec().  That would be a separate cleanup.
+
+	Reported-by: Igor Zhbanov <i.zhbanov@samsung.com>
+	Tested-by: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c4ad8f98bef77c7356aa6a9ad9188a6acc6b849d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+diff --cc fs/exec.c
+index d5973c813868,3d78fccdd723..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -755,11 -755,11 +755,14 @@@ static struct file *do_open_exec(struc
+  	static const struct open_flags open_exec_flags = {
+  		.open_flag = O_LARGEFILE | O_RDONLY | __FMODE_EXEC,
+  		.acc_mode = MAY_EXEC | MAY_OPEN,
+ -		.intent = LOOKUP_OPEN,
+ -		.lookup_flags = LOOKUP_FOLLOW,
+ +		.intent = LOOKUP_OPEN
+  	};
+  
+++<<<<<<< HEAD
+ +	file = do_filp_open(AT_FDCWD, &tmp, &open_exec_flags, LOOKUP_FOLLOW);
+++=======
++ 	file = do_filp_open(AT_FDCWD, name, &open_exec_flags);
+++>>>>>>> c4ad8f98bef7 (execve: use 'struct filename *' for executable name passing)
+  	if (IS_ERR(file))
+  		goto out;
+  
+@@@ -1458,10 -1444,11 +1467,13 @@@ static int do_execve_common(struct file
+  	struct linux_binprm *bprm;
+  	struct file *file;
+  	struct files_struct *displaced;
+ +	bool clear_in_exec;
+  	int retval;
+ +	const struct cred *cred = current_cred();
+  
++ 	if (IS_ERR(filename))
++ 		return PTR_ERR(filename);
++ 
+  	/*
+  	 * We move the actual failure in case of RLIMIT_NPROC excess from
+  	 * set*uid() to execve() because too many poorly written programs
+@@@ -1491,13 -1478,10 +1503,13 @@@
+  	if (retval)
+  		goto out_free;
+  
+ -	check_unsafe_exec(bprm);
+ +	retval = check_unsafe_exec(bprm);
+ +	if (retval < 0)
+ +		goto out_free;
+ +	clear_in_exec = retval;
+  	current->in_execve = 1;
+  
+- 	file = open_exec(filename);
++ 	file = do_open_exec(filename);
+  	retval = PTR_ERR(file);
+  	if (IS_ERR(file))
+  		goto out_unmark;
+diff --git a/arch/parisc/hpux/fs.c b/arch/parisc/hpux/fs.c
+index 838b479a42c4..47f0103bdb96 100644
+--- a/arch/parisc/hpux/fs.c
++++ b/arch/parisc/hpux/fs.c
+@@ -33,22 +33,9 @@
+ 
+ int hpux_execve(struct pt_regs *regs)
+ {
+-	int error;
+-	struct filename *filename;
+-
+-	filename = getname((const char __user *) regs->gr[26]);
+-	error = PTR_ERR(filename);
+-	if (IS_ERR(filename))
+-		goto out;
+-
+-	error = do_execve(filename->name,
++	return  do_execve(getname((const char __user *) regs->gr[26]),
+ 			  (const char __user *const __user *) regs->gr[25],
+ 			  (const char __user *const __user *) regs->gr[24]);
+-
+-	putname(filename);
+-
+-out:
+-	return error;
+ }
+ 
+ struct hpux_dirent {
+* Unmerged path fs/exec.c
+diff --git a/fs/namei.c b/fs/namei.c
+index cb238b752718..779fb3f8f98d 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -196,6 +196,7 @@ recopy:
+ 		goto error;
+ 
+ 	result->uptr = filename;
++	result->aname = NULL;
+ 	audit_getname(result);
+ 	return result;
+ 
+@@ -210,6 +211,35 @@ getname(const char __user * filename)
+ 	return getname_flags(filename, 0, NULL);
+ }
+ 
++/*
++ * The "getname_kernel()" interface doesn't do pathnames longer
++ * than EMBEDDED_NAME_MAX. Deal with it - you're a kernel user.
++ */
++struct filename *
++getname_kernel(const char * filename)
++{
++	struct filename *result;
++	char *kname;
++	int len;
++
++	len = strlen(filename);
++	if (len >= EMBEDDED_NAME_MAX)
++		return ERR_PTR(-ENAMETOOLONG);
++
++	result = __getname();
++	if (unlikely(!result))
++		return ERR_PTR(-ENOMEM);
++
++	kname = (char *)result + sizeof(*result);
++	result->name = kname;
++	result->uptr = NULL;
++	result->aname = NULL;
++	result->separate = false;
++
++	strlcpy(kname, filename, EMBEDDED_NAME_MAX);
++	return result;
++}
++
+ #ifdef CONFIG_AUDITSYSCALL
+ void putname(struct filename *name)
+ {
+diff --git a/include/linux/binfmts.h b/include/linux/binfmts.h
+index df97ca4aae52..7986b173d912 100644
+--- a/include/linux/binfmts.h
++++ b/include/linux/binfmts.h
+@@ -114,7 +114,6 @@ extern int copy_strings_kernel(int argc, const char *const *argv,
+ extern int prepare_bprm_creds(struct linux_binprm *bprm);
+ extern void install_exec_creds(struct linux_binprm *bprm);
+ extern void set_binfmt(struct linux_binfmt *new);
+-extern void free_bprm(struct linux_binprm *);
+ extern ssize_t read_code(struct file *, unsigned long, loff_t, size_t);
+ 
+ #endif /* _LINUX_BINFMTS_H */
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 664b4d164818..7ae29ed8f93a 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2187,6 +2187,7 @@ extern struct file * dentry_open(const struct path *, int, const struct cred *);
+ extern int filp_close(struct file *, fl_owner_t id);
+ 
+ extern struct filename *getname(const char __user *);
++extern struct filename *getname_kernel(const char *);
+ 
+ enum {
+ 	FILE_CREATED = 1,
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index c322878af9e6..b919fcff758d 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -62,6 +62,7 @@ struct bio_list;
+ struct fs_struct;
+ struct perf_event_context;
+ struct blk_plug;
++struct filename;
+ 
+ /*
+  * List of flags we want to share for kernel threads,
+@@ -2329,7 +2330,7 @@ extern void do_group_exit(int);
+ extern int allow_signal(int);
+ extern int disallow_signal(int);
+ 
+-extern int do_execve(const char *,
++extern int do_execve(struct filename *,
+ 		     const char __user * const __user *,
+ 		     const char __user * const __user *);
+ extern long do_fork(unsigned long, unsigned long, unsigned long, int __user *, int __user *);
+diff --git a/init/main.c b/init/main.c
+index e74b65f43296..8678d709aacc 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -873,7 +873,7 @@ void __init load_default_modules(void)
+ static int run_init_process(const char *init_filename)
+ {
+ 	argv_init[0] = init_filename;
+-	return do_execve(init_filename,
++	return do_execve(getname_kernel(init_filename),
+ 		(const char __user *const __user *)argv_init,
+ 		(const char __user *const __user *)envp_init);
+ }
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index 01f5de1b9bd4..5cc31e2a929e 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -1729,7 +1729,7 @@ void audit_putname(struct filename *name)
+ 	struct audit_context *context = current->audit_context;
+ 
+ 	BUG_ON(!context);
+-	if (!context->in_syscall) {
++	if (!name->aname || !context->in_syscall) {
+ #if AUDIT_DEBUG == 2
+ 		printk(KERN_ERR "%s:%d(:%d): final_putname(%p)\n",
+ 		       __FILE__, __LINE__, context->serial, name);
+diff --git a/kernel/kmod.c b/kernel/kmod.c
+index 8241906c4b61..7adfa06fbb63 100644
+--- a/kernel/kmod.c
++++ b/kernel/kmod.c
+@@ -236,7 +236,7 @@ static int ____call_usermodehelper(void *data)
+ 
+ 	commit_creds(new);
+ 
+-	retval = do_execve(sub_info->path,
++	retval = do_execve(getname_kernel(sub_info->path),
+ 			   (const char __user *const __user *)sub_info->argv,
+ 			   (const char __user *const __user *)sub_info->envp);
+ 	if (!retval)
