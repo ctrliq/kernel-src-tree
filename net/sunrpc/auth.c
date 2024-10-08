@@ -596,6 +596,7 @@ rpcauth_lookupcred(struct rpc_auth *auth, int flags)
 	ret = auth->au_ops->lookup_cred(auth, &acred, flags);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(rpcauth_lookupcred);
 
 void
 rpcauth_init_cred(struct rpc_cred *cred, const struct auth_cred *acred,
