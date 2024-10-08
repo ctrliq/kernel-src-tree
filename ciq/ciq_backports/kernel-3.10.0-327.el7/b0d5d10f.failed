@@ -1,0 +1,195 @@
+Btrfs: use insert_inode_locked4 for inode creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Chris Mason <clm@fb.com>
+commit b0d5d10f41a0f1cd839408dd94427f2db3553bca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b0d5d10f.failed
+
+Btrfs was inserting inodes into the hash table before we had fully
+set the inode up on disk.  This leaves us open to rare races that allow
+two different inodes in memory for the same [root, inode] pair.
+
+This patch fixes things by using insert_inode_locked4 to insert an I_NEW
+inode and unlock_new_inode when we're ready for the rest of the kernel
+to use the inode.
+
+It also makes sure to init the operations pointers on the inode before
+going into the error handling paths.
+
+	Signed-off-by: Chris Mason <clm@fb.com>
+	Reported-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit b0d5d10f41a0f1cd839408dd94427f2db3553bca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/inode.c
+index 77f5cc06d8e2,214b936bdd3d..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -5714,23 -5721,35 +5725,32 @@@ static struct inode *btrfs_new_inode(st
+  	btrfs_set_key_type(&key[0], BTRFS_INODE_ITEM_KEY);
+  	key[0].offset = 0;
+  
+ -	sizes[0] = sizeof(struct btrfs_inode_item);
+ -
+ -	if (name) {
+ -		/*
+ -		 * Start new inodes with an inode_ref. This is slightly more
+ -		 * efficient for small numbers of hard links since they will
+ -		 * be packed into one item. Extended refs will kick in if we
+ -		 * add more hard links than can fit in the ref item.
+ -		 */
+ -		key[1].objectid = objectid;
+ -		btrfs_set_key_type(&key[1], BTRFS_INODE_REF_KEY);
+ -		key[1].offset = ref_objectid;
+ +	/*
+ +	 * Start new inodes with an inode_ref. This is slightly more
+ +	 * efficient for small numbers of hard links since they will
+ +	 * be packed into one item. Extended refs will kick in if we
+ +	 * add more hard links than can fit in the ref item.
+ +	 */
+ +	key[1].objectid = objectid;
+ +	btrfs_set_key_type(&key[1], BTRFS_INODE_REF_KEY);
+ +	key[1].offset = ref_objectid;
+  
+ -		sizes[1] = name_len + sizeof(*ref);
+ -	}
+ +	sizes[0] = sizeof(struct btrfs_inode_item);
+ +	sizes[1] = name_len + sizeof(*ref);
+  
++ 	location = &BTRFS_I(inode)->location;
++ 	location->objectid = objectid;
++ 	location->offset = 0;
++ 	btrfs_set_key_type(location, BTRFS_INODE_ITEM_KEY);
++ 
++ 	ret = btrfs_insert_inode_locked(inode);
++ 	if (ret < 0)
++ 		goto fail;
++ 
+  	path->leave_spinning = 1;
+ -	ret = btrfs_insert_empty_items(trans, root, path, key, sizes, nitems);
+ +	ret = btrfs_insert_empty_items(trans, root, path, key, sizes, 2);
+  	if (ret != 0)
+- 		goto fail;
++ 		goto fail_unlock;
+  
+  	inode_init_owner(inode, dir, mode);
+  	inode_set_bytes(inode, 0);
+@@@ -5781,8 -5796,11 +5795,11 @@@
+  			  btrfs_ino(inode), root->root_key.objectid, ret);
+  
+  	return inode;
++ 
++ fail_unlock:
++ 	unlock_new_inode(inode);
+  fail:
+ -	if (dir && name)
+ +	if (dir)
+  		BTRFS_I(dir)->index_cnt--;
+  	btrfs_free_path(path);
+  	iput(inode);
+@@@ -6117,10 -6158,7 +6148,14 @@@ static int btrfs_mkdir(struct inode *di
+  
+  	err = btrfs_init_inode_security(trans, inode, dir, &dentry->d_name);
+  	if (err)
+++<<<<<<< HEAD
+ +		goto out_fail;
+ +
+ +	inode->i_op = &btrfs_dir_inode_operations.ops;
+ +	inode->i_fop = &btrfs_dir_file_operations;
+++=======
++ 		goto out_fail_inode;
+++>>>>>>> b0d5d10f41a0 (Btrfs: use insert_inode_locked4 for inode creation)
+  
+  	btrfs_i_size_write(inode, 0);
+  	err = btrfs_update_inode(trans, root, inode);
+@@@ -9001,8 -9028,79 +9046,84 @@@ static int btrfs_permission(struct inod
+  	return generic_permission(inode, mask);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct inode_operations_wrapper btrfs_dir_inode_operations = {
+ +	.ops = {
+++=======
++ static int btrfs_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
++ {
++ 	struct btrfs_trans_handle *trans;
++ 	struct btrfs_root *root = BTRFS_I(dir)->root;
++ 	struct inode *inode = NULL;
++ 	u64 objectid;
++ 	u64 index;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * 5 units required for adding orphan entry
++ 	 */
++ 	trans = btrfs_start_transaction(root, 5);
++ 	if (IS_ERR(trans))
++ 		return PTR_ERR(trans);
++ 
++ 	ret = btrfs_find_free_ino(root, &objectid);
++ 	if (ret)
++ 		goto out;
++ 
++ 	inode = btrfs_new_inode(trans, root, dir, NULL, 0,
++ 				btrfs_ino(dir), objectid, mode, &index);
++ 	if (IS_ERR(inode)) {
++ 		ret = PTR_ERR(inode);
++ 		inode = NULL;
++ 		goto out;
++ 	}
++ 
++ 	inode->i_fop = &btrfs_file_operations;
++ 	inode->i_op = &btrfs_file_inode_operations;
++ 
++ 	inode->i_mapping->a_ops = &btrfs_aops;
++ 	inode->i_mapping->backing_dev_info = &root->fs_info->bdi;
++ 	BTRFS_I(inode)->io_tree.ops = &btrfs_extent_io_ops;
++ 
++ 	ret = btrfs_init_inode_security(trans, inode, dir, NULL);
++ 	if (ret)
++ 		goto out_inode;
++ 
++ 	ret = btrfs_update_inode(trans, root, inode);
++ 	if (ret)
++ 		goto out_inode;
++ 	ret = btrfs_orphan_add(trans, inode);
++ 	if (ret)
++ 		goto out_inode;
++ 
++ 	/*
++ 	 * We set number of links to 0 in btrfs_new_inode(), and here we set
++ 	 * it to 1 because d_tmpfile() will issue a warning if the count is 0,
++ 	 * through:
++ 	 *
++ 	 *    d_tmpfile() -> inode_dec_link_count() -> drop_nlink()
++ 	 */
++ 	set_nlink(inode, 1);
++ 	unlock_new_inode(inode);
++ 	d_tmpfile(dentry, inode);
++ 	mark_inode_dirty(inode);
++ 
++ out:
++ 	btrfs_end_transaction(trans, root);
++ 	if (ret)
++ 		iput(inode);
++ 	btrfs_balance_delayed_items(root);
++ 	btrfs_btree_balance_dirty(root);
++ 	return ret;
++ 
++ out_inode:
++ 	unlock_new_inode(inode);
++ 	goto out;
++ 
++ }
++ 
++ static const struct inode_operations btrfs_dir_inode_operations = {
+++>>>>>>> b0d5d10f41a0 (Btrfs: use insert_inode_locked4 for inode creation)
+  	.getattr	= btrfs_getattr,
+  	.lookup		= btrfs_lookup,
+  	.create		= btrfs_create,
+* Unmerged path fs/btrfs/inode.c
