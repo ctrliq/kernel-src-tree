@@ -1,0 +1,124 @@
+context_tracking: Ground setup for static key use
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit 65f382fd0c8fa483713c0971de9f1dfb4cf1ad9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/65f382fd.failed
+
+Prepare for using a static key in the context tracking subsystem.
+This will help optimizing the off case on its many users:
+
+* user_enter, user_exit, exception_enter, exception_exit, guest_enter,
+  guest_exit, vtime_*()
+
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Li Zhong <zhong@linux.vnet.ibm.com>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Kevin Hilman <khilman@linaro.org>
+(cherry picked from commit 65f382fd0c8fa483713c0971de9f1dfb4cf1ad9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	init/main.c
+diff --cc init/main.c
+index ec549581d732,af310afbef28..000000000000
+--- a/init/main.c
++++ b/init/main.c
+@@@ -74,6 -74,8 +74,11 @@@
+  #include <linux/ptrace.h>
+  #include <linux/blkdev.h>
+  #include <linux/elevator.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/sched_clock.h>
++ #include <linux/context_tracking.h>
+++>>>>>>> 65f382fd0c8f (context_tracking: Ground setup for static key use)
+  
+  #include <asm/io.h>
+  #include <asm/bugs.h>
+diff --git a/include/linux/context_tracking.h b/include/linux/context_tracking.h
+index 1ae37c708c63..c138c24bad1a 100644
+--- a/include/linux/context_tracking.h
++++ b/include/linux/context_tracking.h
+@@ -4,6 +4,7 @@
+ #include <linux/sched.h>
+ #include <linux/percpu.h>
+ #include <linux/vtime.h>
++#include <linux/static_key.h>
+ #include <asm/ptrace.h>
+ 
+ struct context_tracking {
+@@ -22,6 +23,7 @@ struct context_tracking {
+ 
+ 
+ #ifdef CONFIG_CONTEXT_TRACKING
++extern struct static_key context_tracking_enabled;
+ DECLARE_PER_CPU(struct context_tracking, context_tracking);
+ 
+ static inline bool context_tracking_in_user(void)
+@@ -67,6 +69,14 @@ static inline void context_tracking_task_switch(struct task_struct *prev,
+ 						struct task_struct *next) { }
+ #endif /* !CONFIG_CONTEXT_TRACKING */
+ 
++
++#ifdef CONFIG_CONTEXT_TRACKING_FORCE
++extern void context_tracking_init(void);
++#else
++static inline void context_tracking_init(void) { }
++#endif /* CONFIG_CONTEXT_TRACKING_FORCE */
++
++
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+ extern void guest_enter(void);
+ extern void guest_exit(void);
+* Unmerged path init/main.c
+diff --git a/kernel/context_tracking.c b/kernel/context_tracking.c
+index 72bcb2570d3e..839d377d0da5 100644
+--- a/kernel/context_tracking.c
++++ b/kernel/context_tracking.c
+@@ -20,15 +20,16 @@
+ #include <linux/hardirq.h>
+ #include <linux/export.h>
+ 
+-DEFINE_PER_CPU(struct context_tracking, context_tracking) = {
+-#ifdef CONFIG_CONTEXT_TRACKING_FORCE
+-	.active = true,
+-#endif
+-};
++struct static_key context_tracking_enabled = STATIC_KEY_INIT_FALSE;
++
++DEFINE_PER_CPU(struct context_tracking, context_tracking);
+ 
+ void context_tracking_cpu_set(int cpu)
+ {
+-	per_cpu(context_tracking.active, cpu) = true;
++	if (!per_cpu(context_tracking.active, cpu)) {
++		per_cpu(context_tracking.active, cpu) = true;
++		static_key_slow_inc(&context_tracking_enabled);
++	}
+ }
+ 
+ /**
+@@ -202,3 +203,13 @@ void context_tracking_task_switch(struct task_struct *prev,
+ 	clear_tsk_thread_flag(prev, TIF_NOHZ);
+ 	set_tsk_thread_flag(next, TIF_NOHZ);
+ }
++
++#ifdef CONFIG_CONTEXT_TRACKING_FORCE
++void __init context_tracking_init(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		context_tracking_cpu_set(cpu);
++}
++#endif
