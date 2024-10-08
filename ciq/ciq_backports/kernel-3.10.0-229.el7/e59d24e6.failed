@@ -1,0 +1,149 @@
+KVM: PPC: Book3S HV: Fix incorrect userspace exit on ioeventfd write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: book3s/hv - Fix incorrect userspace exit on ioeventfd write (David Gibson) [1123145 1123133 1123367]
+Rebuild_FUZZ: 94.12%
+commit-author Greg Kurz <gkurz@linux.vnet.ibm.com>
+commit e59d24e61269de34d79d2f39d3d581c219ac7a94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e59d24e6.failed
+
+When the guest does an MMIO write which is handled successfully by an
+ioeventfd, ioeventfd_write() returns 0 (success) and
+kvmppc_handle_store() returns EMULATE_DONE.  Then
+kvmppc_emulate_mmio() converts EMULATE_DONE to RESUME_GUEST_NV and
+this causes an exit from the loop in kvmppc_vcpu_run_hv(), causing an
+exit back to userspace with a bogus exit reason code, typically
+causing userspace (e.g. qemu) to crash with a message about an unknown
+exit code.
+
+This adds handling of RESUME_GUEST_NV in kvmppc_vcpu_run_hv() in order
+to fix that.  For generality, we define a helper to check for either
+of the return-to-guest codes we use, RESUME_GUEST and RESUME_GUEST_NV,
+to make it easy to check for either and provide one place to update if
+any other return-to-guest code gets defined in future.
+
+Since it only affects Book3S HV for now, the helper is added to
+the kvm_book3s.h header file.
+
+We use the helper in two places in kvmppc_run_core() as well for
+future-proofing, though we don't see RESUME_GUEST_NV in either place
+at present.
+
+[paulus@samba.org - combined 4 patches into one, rewrote description]
+
+	Suggested-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Signed-off-by: Greg Kurz <gkurz@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+(cherry picked from commit e59d24e61269de34d79d2f39d3d581c219ac7a94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s.h
+diff --cc arch/powerpc/include/asm/kvm_book3s.h
+index 621f2858583f,bb1e38a23ac7..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@@ -298,59 -304,11 +298,67 @@@ static inline ulong kvmppc_get_fault_da
+  	return vcpu->arch.fault_dar;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_KVM_BOOK3S_PR_POSSIBLE
+ +
+ +static inline unsigned long kvmppc_interrupt_offset(struct kvm_vcpu *vcpu)
+ +{
+ +	return to_book3s(vcpu)->hior;
+ +}
+ +
+ +static inline void kvmppc_update_int_pending(struct kvm_vcpu *vcpu,
+ +			unsigned long pending_now, unsigned long old_pending)
+ +{
+ +	if (pending_now)
+ +		vcpu->arch.shared->int_pending = 1;
+ +	else if (old_pending)
+ +		vcpu->arch.shared->int_pending = 0;
+ +}
+ +
+ +static inline bool kvmppc_critical_section(struct kvm_vcpu *vcpu)
+ +{
+ +	ulong crit_raw = vcpu->arch.shared->critical;
+ +	ulong crit_r1 = kvmppc_get_gpr(vcpu, 1);
+ +	bool crit;
+ +
+ +	/* Truncate crit indicators in 32 bit mode */
+ +	if (!(vcpu->arch.shared->msr & MSR_SF)) {
+ +		crit_raw &= 0xffffffff;
+ +		crit_r1 &= 0xffffffff;
+ +	}
+ +
+ +	/* Critical section when crit == r1 */
+ +	crit = (crit_raw == crit_r1);
+ +	/* ... and we're in supervisor mode */
+ +	crit = crit && !(vcpu->arch.shared->msr & MSR_PR);
+ +
+ +	return crit;
+ +}
+ +#else /* CONFIG_KVM_BOOK3S_PR_POSSIBLE */
+ +
+ +static inline unsigned long kvmppc_interrupt_offset(struct kvm_vcpu *vcpu)
+ +{
+ +	return 0;
+ +}
+ +
+ +static inline void kvmppc_update_int_pending(struct kvm_vcpu *vcpu,
+ +			unsigned long pending_now, unsigned long old_pending)
+ +{
+ +}
+ +
+ +static inline bool kvmppc_critical_section(struct kvm_vcpu *vcpu)
+ +{
+ +	return false;
+ +}
+ +#endif
+ +
+++=======
++ static inline bool is_kvmppc_resume_guest(int r)
++ {
++ 	return (r == RESUME_GUEST || r == RESUME_GUEST_NV);
++ }
++ 
+++>>>>>>> e59d24e61269 (KVM: PPC: Book3S HV: Fix incorrect userspace exit on ioeventfd write)
+  /* Magic register values loaded into r3 and r4 before the 'sc' assembly
+   * instruction for the OSI hypercalls */
+  #define OSI_SC_MAGIC_R3			0x113724FA
+* Unmerged path arch/powerpc/include/asm/kvm_book3s.h
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 14588bcd5db5..1080a81007b7 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -1351,7 +1351,7 @@ static void kvmppc_run_core(struct kvmppc_vcore *vc)
+ 		vcpu->arch.trap = 0;
+ 
+ 		if (vcpu->arch.ceded) {
+-			if (ret != RESUME_GUEST)
++			if (!is_kvmppc_resume_guest(ret))
+ 				kvmppc_end_cede(vcpu);
+ 			else
+ 				kvmppc_set_timer(vcpu);
+@@ -1362,7 +1362,7 @@ static void kvmppc_run_core(struct kvmppc_vcore *vc)
+ 	vc->vcore_state = VCORE_INACTIVE;
+ 	list_for_each_entry_safe(vcpu, vnext, &vc->runnable_threads,
+ 				 arch.run_list) {
+-		if (vcpu->arch.ret != RESUME_GUEST) {
++		if (!is_kvmppc_resume_guest(vcpu->arch.ret)) {
+ 			kvmppc_remove_runnable(vc, vcpu);
+ 			wake_up(&vcpu->arch.cpu_run);
+ 		}
+@@ -1553,7 +1553,7 @@ int kvmppc_vcpu_run(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 				vcpu->arch.fault_dar, vcpu->arch.fault_dsisr);
+ 			srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
+ 		}
+-	} while (r == RESUME_GUEST);
++	} while (is_kvmppc_resume_guest(r));
+ 
+  out:
+ 	vcpu->arch.state = KVMPPC_VCPU_NOTREADY;
