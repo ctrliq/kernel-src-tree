@@ -3291,9 +3291,8 @@ static int smack_audit_rule_match(u32 secid, u32 field, u32 op, void *vrule,
 	char *smack;
 	char *rule = vrule;
 
-	if (!rule) {
-		audit_log(actx, GFP_ATOMIC, AUDIT_SELINUX_ERR,
-			  "Smack: missing rule\n");
+	if (unlikely(!rule)) {
+		WARN_ONCE(1, "Smack: missing rule\n");
 		return -ENOENT;
 	}
 
