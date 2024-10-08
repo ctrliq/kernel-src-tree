@@ -1,0 +1,228 @@
+mm, meminit: ensure node is online before checking whether pages are uninitialised
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] meminit: ensure node is online before checking whether pages are uninitialised (Koki Sanagi) [1359649]
+Rebuild_FUZZ: 97.50%
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit ef70b6f41cda6270165a6f27b2548ed31cfa3cb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ef70b6f4.failed
+
+early_page_uninitialised looks up an arbitrary PFN.  While a machine
+without node 0 will boot with "mm, page_alloc: Always return a valid
+node from early_pfn_to_nid", it works because it assumes that nodes are
+always in PFN order.  This is not guaranteed so this patch adds
+robustness by always checking if the node being checked is online.
+
+Link: http://lkml.kernel.org/r/1468008031-3848-4-git-send-email-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Cc: <stable@vger.kernel.org>	[4.2+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ef70b6f41cda6270165a6f27b2548ed31cfa3cb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index 20d353397e7d,8b3e1341b754..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -229,10 -277,188 +229,191 @@@ EXPORT_SYMBOL(nr_online_nodes)
+  
+  int page_group_by_mobility_disabled __read_mostly;
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
++ static inline void reset_deferred_meminit(pg_data_t *pgdat)
++ {
++ 	pgdat->first_deferred_pfn = ULONG_MAX;
++ }
++ 
++ /* Returns true if the struct page for the pfn is uninitialised */
++ static inline bool __meminit early_page_uninitialised(unsigned long pfn)
++ {
++ 	int nid = early_pfn_to_nid(pfn);
++ 
++ 	if (node_online(nid) && pfn >= NODE_DATA(nid)->first_deferred_pfn)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static inline bool early_page_nid_uninitialised(unsigned long pfn, int nid)
++ {
++ 	if (pfn >= NODE_DATA(nid)->first_deferred_pfn)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Returns false when the remaining initialisation should be deferred until
++  * later in the boot cycle when it can be parallelised.
++  */
++ static inline bool update_defer_init(pg_data_t *pgdat,
++ 				unsigned long pfn, unsigned long zone_end,
++ 				unsigned long *nr_initialised)
++ {
++ 	unsigned long max_initialise;
++ 
++ 	/* Always populate low zones for address-contrained allocations */
++ 	if (zone_end < pgdat_end_pfn(pgdat))
++ 		return true;
++ 	/*
++ 	 * Initialise at least 2G of a node but also take into account that
++ 	 * two large system hashes that can take up 1GB for 0.25TB/node.
++ 	 */
++ 	max_initialise = max(2UL << (30 - PAGE_SHIFT),
++ 		(pgdat->node_spanned_pages >> 8));
++ 
++ 	(*nr_initialised)++;
++ 	if ((*nr_initialised > max_initialise) &&
++ 	    (pfn & (PAGES_PER_SECTION - 1)) == 0) {
++ 		pgdat->first_deferred_pfn = pfn;
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ #else
++ static inline void reset_deferred_meminit(pg_data_t *pgdat)
++ {
++ }
++ 
++ static inline bool early_page_uninitialised(unsigned long pfn)
++ {
++ 	return false;
++ }
++ 
++ static inline bool early_page_nid_uninitialised(unsigned long pfn, int nid)
++ {
++ 	return false;
++ }
++ 
++ static inline bool update_defer_init(pg_data_t *pgdat,
++ 				unsigned long pfn, unsigned long zone_end,
++ 				unsigned long *nr_initialised)
++ {
++ 	return true;
++ }
++ #endif
++ 
++ /* Return a pointer to the bitmap storing bits affecting a block of pages */
++ static inline unsigned long *get_pageblock_bitmap(struct page *page,
++ 							unsigned long pfn)
++ {
++ #ifdef CONFIG_SPARSEMEM
++ 	return __pfn_to_section(pfn)->pageblock_flags;
++ #else
++ 	return page_zone(page)->pageblock_flags;
++ #endif /* CONFIG_SPARSEMEM */
++ }
++ 
++ static inline int pfn_to_bitidx(struct page *page, unsigned long pfn)
++ {
++ #ifdef CONFIG_SPARSEMEM
++ 	pfn &= (PAGES_PER_SECTION-1);
++ 	return (pfn >> pageblock_order) * NR_PAGEBLOCK_BITS;
++ #else
++ 	pfn = pfn - round_down(page_zone(page)->zone_start_pfn, pageblock_nr_pages);
++ 	return (pfn >> pageblock_order) * NR_PAGEBLOCK_BITS;
++ #endif /* CONFIG_SPARSEMEM */
++ }
++ 
++ /**
++  * get_pfnblock_flags_mask - Return the requested group of flags for the pageblock_nr_pages block of pages
++  * @page: The page within the block of interest
++  * @pfn: The target page frame number
++  * @end_bitidx: The last bit of interest to retrieve
++  * @mask: mask of bits that the caller is interested in
++  *
++  * Return: pageblock_bits flags
++  */
++ static __always_inline unsigned long __get_pfnblock_flags_mask(struct page *page,
++ 					unsigned long pfn,
++ 					unsigned long end_bitidx,
++ 					unsigned long mask)
++ {
++ 	unsigned long *bitmap;
++ 	unsigned long bitidx, word_bitidx;
++ 	unsigned long word;
++ 
++ 	bitmap = get_pageblock_bitmap(page, pfn);
++ 	bitidx = pfn_to_bitidx(page, pfn);
++ 	word_bitidx = bitidx / BITS_PER_LONG;
++ 	bitidx &= (BITS_PER_LONG-1);
++ 
++ 	word = bitmap[word_bitidx];
++ 	bitidx += end_bitidx;
++ 	return (word >> (BITS_PER_LONG - bitidx - 1)) & mask;
++ }
++ 
++ unsigned long get_pfnblock_flags_mask(struct page *page, unsigned long pfn,
++ 					unsigned long end_bitidx,
++ 					unsigned long mask)
++ {
++ 	return __get_pfnblock_flags_mask(page, pfn, end_bitidx, mask);
++ }
++ 
++ static __always_inline int get_pfnblock_migratetype(struct page *page, unsigned long pfn)
++ {
++ 	return __get_pfnblock_flags_mask(page, pfn, PB_migrate_end, MIGRATETYPE_MASK);
++ }
++ 
++ /**
++  * set_pfnblock_flags_mask - Set the requested group of flags for a pageblock_nr_pages block of pages
++  * @page: The page within the block of interest
++  * @flags: The flags to set
++  * @pfn: The target page frame number
++  * @end_bitidx: The last bit of interest
++  * @mask: mask of bits that the caller is interested in
++  */
++ void set_pfnblock_flags_mask(struct page *page, unsigned long flags,
++ 					unsigned long pfn,
++ 					unsigned long end_bitidx,
++ 					unsigned long mask)
++ {
++ 	unsigned long *bitmap;
++ 	unsigned long bitidx, word_bitidx;
++ 	unsigned long old_word, word;
++ 
++ 	BUILD_BUG_ON(NR_PAGEBLOCK_BITS != 4);
++ 
++ 	bitmap = get_pageblock_bitmap(page, pfn);
++ 	bitidx = pfn_to_bitidx(page, pfn);
++ 	word_bitidx = bitidx / BITS_PER_LONG;
++ 	bitidx &= (BITS_PER_LONG-1);
++ 
++ 	VM_BUG_ON_PAGE(!zone_spans_pfn(page_zone(page), pfn), page);
++ 
++ 	bitidx += end_bitidx;
++ 	mask <<= (BITS_PER_LONG - bitidx - 1);
++ 	flags <<= (BITS_PER_LONG - bitidx - 1);
++ 
++ 	word = READ_ONCE(bitmap[word_bitidx]);
++ 	for (;;) {
++ 		old_word = cmpxchg(&bitmap[word_bitidx], word, (word & ~mask) | flags);
++ 		if (word == old_word)
++ 			break;
++ 		word = old_word;
++ 	}
++ }
++ 
+++>>>>>>> ef70b6f41cda (mm, meminit: ensure node is online before checking whether pages are uninitialised)
+  void set_pageblock_migratetype(struct page *page, int migratetype)
+  {
+ -	if (unlikely(page_group_by_mobility_disabled &&
+ -		     migratetype < MIGRATE_PCPTYPES))
+ +
+ +	if (unlikely(page_group_by_mobility_disabled))
+  		migratetype = MIGRATE_UNMOVABLE;
+  
+  	set_pageblock_flags_group(page, (unsigned long)migratetype,
+* Unmerged path mm/page_alloc.c
