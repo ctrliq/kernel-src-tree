@@ -1,0 +1,400 @@
+IB/qib: Remove qpn, qp tables and related variables from qib
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Harish Chegondi <harish.chegondi@intel.com>
+commit 898fa52b4ac3bb3ba306e1aa94bc7fbc79bfd2bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/898fa52b.failed
+
+This patch removes the private queue pair structure and the table which
+holds the queue pair numbers in favor of using what is provided by rdmavt.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 898fa52b4ac3bb3ba306e1aa94bc7fbc79bfd2bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qib/qib_qp.c
+#	drivers/infiniband/hw/qib/qib_verbs.c
+#	drivers/infiniband/hw/qib/qib_verbs.h
+diff --cc drivers/infiniband/hw/qib/qib_qp.c
+index cf1dd6e9d434,f18ee76ae870..000000000000
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@@ -228,18 -234,18 +234,18 @@@ static void insert_qp(struct qib_ibdev 
+  	unsigned n = qpn_hash(dev, qp->ibqp.qp_num);
+  
+  	atomic_inc(&qp->refcount);
+- 	spin_lock_irqsave(&dev->qpt_lock, flags);
++ 	spin_lock_irqsave(&dev->rdi.qp_dev->qpt_lock, flags);
+  
+  	if (qp->ibqp.qp_num == 0)
+ -		rcu_assign_pointer(ibp->rvp.qp[0], qp);
+ +		rcu_assign_pointer(ibp->qp0, qp);
+  	else if (qp->ibqp.qp_num == 1)
+ -		rcu_assign_pointer(ibp->rvp.qp[1], qp);
+ +		rcu_assign_pointer(ibp->qp1, qp);
+  	else {
+- 		qp->next = dev->qp_table[n];
+- 		rcu_assign_pointer(dev->qp_table[n], qp);
++ 		qp->next = dev->rdi.qp_dev->qp_table[n];
++ 		rcu_assign_pointer(dev->rdi.qp_dev->qp_table[n], qp);
+  	}
+  
+- 	spin_unlock_irqrestore(&dev->qpt_lock, flags);
++ 	spin_unlock_irqrestore(&dev->rdi.qp_dev->qpt_lock, flags);
+  }
+  
+  /*
+@@@ -252,28 -258,30 +258,39 @@@ static void remove_qp(struct qib_ibdev 
+  	unsigned n = qpn_hash(dev, qp->ibqp.qp_num);
+  	unsigned long flags;
+  	int removed = 1;
++ 	spinlock_t *qpt_lock_ptr; /* Pointer to make checkpatch happy */
+  
+- 	spin_lock_irqsave(&dev->qpt_lock, flags);
++ 	spin_lock_irqsave(&dev->rdi.qp_dev->qpt_lock, flags);
+  
+++<<<<<<< HEAD
+ +	if (rcu_dereference_protected(ibp->qp0,
+ +			lockdep_is_held(&dev->qpt_lock)) == qp) {
+ +		rcu_assign_pointer(ibp->qp0, NULL);
+ +	} else if (rcu_dereference_protected(ibp->qp1,
+ +			lockdep_is_held(&dev->qpt_lock)) == qp) {
+ +		rcu_assign_pointer(ibp->qp1, NULL);
+++=======
++ 	qpt_lock_ptr = &dev->rdi.qp_dev->qpt_lock;
++ 	if (rcu_dereference_protected(ibp->rvp.qp[0],
++ 				      lockdep_is_held(qpt_lock_ptr)) == qp) {
++ 		RCU_INIT_POINTER(ibp->rvp.qp[0], NULL);
++ 	} else if (rcu_dereference_protected(ibp->rvp.qp[1],
++ 			lockdep_is_held(&dev->rdi.qp_dev->qpt_lock)) == qp) {
++ 		RCU_INIT_POINTER(ibp->rvp.qp[1], NULL);
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  	} else {
+ -		struct rvt_qp *q;
+ -		struct rvt_qp __rcu **qpp;
+ +		struct qib_qp *q;
+ +		struct qib_qp __rcu **qpp;
+  
+  		removed = 0;
+- 		qpp = &dev->qp_table[n];
++ 		qpp = &dev->rdi.qp_dev->qp_table[n];
+  		for (; (q = rcu_dereference_protected(*qpp,
+- 				lockdep_is_held(&dev->qpt_lock))) != NULL;
++ 				lockdep_is_held(qpt_lock_ptr))) != NULL;
+  				qpp = &q->next)
+  			if (q == qp) {
+ -				RCU_INIT_POINTER(*qpp,
+ +				rcu_assign_pointer(*qpp,
+  					rcu_dereference_protected(qp->next,
+- 					 lockdep_is_held(&dev->qpt_lock)));
++ 					 lockdep_is_held(qpt_lock_ptr)));
+  				removed = 1;
+  				break;
+  			}
+@@@ -297,8 -305,9 +314,9 @@@ unsigned qib_free_all_qps(struct qib_de
+  {
+  	struct qib_ibdev *dev = &dd->verbs_dev;
+  	unsigned long flags;
+ -	struct rvt_qp *qp;
+ +	struct qib_qp *qp;
+  	unsigned n, qp_inuse = 0;
++ 	spinlock_t *qpt_lock_ptr; /* Pointer to make checkpatch happy */
+  
+  	for (n = 0; n < dd->num_pports; n++) {
+  		struct qib_ibport *ibp = &dd->pport[n].ibport_data;
+@@@ -313,17 -322,18 +331,26 @@@
+  		rcu_read_unlock();
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&dev->qpt_lock, flags);
+ +	for (n = 0; n < dev->qp_table_size; n++) {
+ +		qp = rcu_dereference_protected(dev->qp_table[n],
+ +			lockdep_is_held(&dev->qpt_lock));
+ +		rcu_assign_pointer(dev->qp_table[n], NULL);
+++=======
++ 	spin_lock_irqsave(&dev->rdi.qp_dev->qpt_lock, flags);
++ 	qpt_lock_ptr = &dev->rdi.qp_dev->qpt_lock;
++ 	for (n = 0; n < dev->rdi.qp_dev->qp_table_size; n++) {
++ 		qp = rcu_dereference_protected(dev->rdi.qp_dev->qp_table[n],
++ 					       lockdep_is_held(qpt_lock_ptr));
++ 		RCU_INIT_POINTER(dev->rdi.qp_dev->qp_table[n], NULL);
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  
+  		for (; qp; qp = rcu_dereference_protected(qp->next,
+- 					lockdep_is_held(&dev->qpt_lock)))
++ 					lockdep_is_held(qpt_lock_ptr)))
+  			qp_inuse++;
+  	}
+- 	spin_unlock_irqrestore(&dev->qpt_lock, flags);
++ 	spin_unlock_irqrestore(&dev->rdi.qp_dev->qpt_lock, flags);
+  	synchronize_rcu();
+  
+  	return qp_inuse;
+@@@ -1194,10 -1206,10 +1221,10 @@@ struct ib_qp *qib_create_qp(struct ib_p
+  
+  bail_ip:
+  	if (qp->ip)
+ -		kref_put(&qp->ip->ref, rvt_release_mmap_info);
+ +		kref_put(&qp->ip->ref, qib_release_mmap_info);
+  	else
+  		vfree(qp->r_rq.wq);
+- 	free_qpn(&dev->qpn_table, qp->ibqp.qp_num);
++ 	free_qpn(&dev->rdi.qp_dev->qpn_table, qp->ibqp.qp_num);
+  bail_qp:
+  	kfree(priv->s_hdr);
+  	kfree(priv);
+@@@ -1356,10 -1368,10 +1383,10 @@@ int qib_qp_iter_next(struct qib_qp_ite
+  	struct qib_ibdev *dev = iter->dev;
+  	int n = iter->n;
+  	int ret = 1;
+ -	struct rvt_qp *pqp = iter->qp;
+ -	struct rvt_qp *qp;
+ +	struct qib_qp *pqp = iter->qp;
+ +	struct qib_qp *qp;
+  
+- 	for (; n < dev->qp_table_size; n++) {
++ 	for (; n < dev->rdi.qp_dev->qp_table_size; n++) {
+  		if (pqp)
+  			qp = rcu_dereference(pqp->next);
+  		else
+diff --cc drivers/infiniband/hw/qib/qib_verbs.c
+index c4417a1f33be,2daca8f31ca2..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@@ -2089,16 -1943,21 +2089,21 @@@ int qib_register_ib_device(struct qib_d
+  	struct qib_ibdev *dev = &dd->verbs_dev;
+  	struct ib_device *ibdev = &dev->rdi.ibdev;
+  	struct qib_pportdata *ppd = dd->pport;
+ -	unsigned i, ctxt;
+ +	unsigned i, lk_tab_size;
+  	int ret;
+  
+- 	dev->qp_table_size = ib_qib_qp_table_size;
++ 	/* allocate parent object */
++ 	dev->rdi.qp_dev = kzalloc(sizeof(*dev->rdi.qp_dev), GFP_KERNEL);
++ 	if (!dev->rdi.qp_dev)
++ 		return -ENOMEM;
++ 	dev->rdi.qp_dev->qp_table_size = ib_qib_qp_table_size;
++ 	dev->rdi.qp_dev->qp_table_bits = ilog2(ib_qib_qp_table_size);
+  	get_random_bytes(&dev->qp_rnd, sizeof(dev->qp_rnd));
+- 	dev->qp_table = kmalloc_array(
+- 				dev->qp_table_size,
+- 				sizeof(*dev->qp_table),
++ 	dev->rdi.qp_dev->qp_table = kmalloc_array(
++ 				dev->rdi.qp_dev->qp_table_size,
++ 				sizeof(*dev->rdi.qp_dev->qp_table),
+  				GFP_KERNEL);
+- 	if (!dev->qp_table) {
++ 	if (!dev->rdi.qp_dev->qp_table) {
+  		ret = -ENOMEM;
+  		goto err_qpt;
+  	}
+@@@ -2109,9 -1968,7 +2114,13 @@@
+  		init_ibport(ppd + i);
+  
+  	/* Only need to initialize non-zero fields. */
+++<<<<<<< HEAD
+ +	spin_lock_init(&dev->qpt_lock);
+ +	spin_lock_init(&dev->n_pds_lock);
+ +	spin_lock_init(&dev->n_ahs_lock);
+++=======
++ 	spin_lock_init(&dev->rdi.qp_dev->qpt_lock);
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  	spin_lock_init(&dev->n_cqs_lock);
+  	spin_lock_init(&dev->n_qps_lock);
+  	spin_lock_init(&dev->n_srqs_lock);
+@@@ -2120,35 -1977,8 +2129,35 @@@
+  	dev->mem_timer.function = mem_timer;
+  	dev->mem_timer.data = (unsigned long) dev;
+  
+- 	qib_init_qpn_table(dd, &dev->qpn_table);
++ 	qib_init_qpn_table(dd, &dev->rdi.qp_dev->qpn_table);
+  
+ +	/*
+ +	 * The top ib_qib_lkey_table_size bits are used to index the
+ +	 * table.  The lower 8 bits can be owned by the user (copied from
+ +	 * the LKEY).  The remaining bits act as a generation number or tag.
+ +	 */
+ +	spin_lock_init(&dev->lk_table.lock);
+ +	/* insure generation is at least 4 bits see keys.c */
+ +	if (ib_qib_lkey_table_size > MAX_LKEY_TABLE_BITS) {
+ +		qib_dev_warn(dd, "lkey bits %u too large, reduced to %u\n",
+ +			ib_qib_lkey_table_size, MAX_LKEY_TABLE_BITS);
+ +		ib_qib_lkey_table_size = MAX_LKEY_TABLE_BITS;
+ +	}
+ +	dev->lk_table.max = 1 << ib_qib_lkey_table_size;
+ +	lk_tab_size = dev->lk_table.max * sizeof(*dev->lk_table.table);
+ +	dev->lk_table.table = (struct qib_mregion __rcu **)
+ +		vmalloc(lk_tab_size);
+ +	if (dev->lk_table.table == NULL) {
+ +		ret = -ENOMEM;
+ +		goto err_lk;
+ +	}
+ +	RCU_INIT_POINTER(dev->dma_mr, NULL);
+ +	for (i = 0; i < dev->lk_table.max; i++)
+ +		RCU_INIT_POINTER(dev->lk_table.table[i], NULL);
+ +	INIT_LIST_HEAD(&dev->pending_mmaps);
+ +	spin_lock_init(&dev->pending_lock);
+ +	dev->mmap_offset = PAGE_SIZE;
+ +	spin_lock_init(&dev->mmap_offset_lock);
+  	INIT_LIST_HEAD(&dev->piowait);
+  	INIT_LIST_HEAD(&dev->dmawait);
+  	INIT_LIST_HEAD(&dev->txwait);
+@@@ -2323,9 -2164,7 +2332,13 @@@ err_tx
+  					sizeof(struct qib_pio_header),
+  				  dev->pio_hdrs, dev->pio_hdrs_phys);
+  err_hdrs:
+++<<<<<<< HEAD
+ +	vfree(dev->lk_table.table);
+ +err_lk:
+ +	kfree(dev->qp_table);
+++=======
++ 	kfree(dev->rdi.qp_dev->qp_table);
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  err_qpt:
+  	qib_dev_err(dd, "cannot register verbs: %d!\n", -ret);
+  bail:
+@@@ -2375,9 -2211,7 +2388,13 @@@ void qib_unregister_ib_device(struct qi
+  				  dd->pport->sdma_descq_cnt *
+  					sizeof(struct qib_pio_header),
+  				  dev->pio_hdrs, dev->pio_hdrs_phys);
+++<<<<<<< HEAD
+ +	lk_tab_size = dev->lk_table.max * sizeof(*dev->lk_table.table);
+ +	vfree(dev->lk_table.table);
+ +	kfree(dev->qp_table);
+++=======
++ 	kfree(dev->rdi.qp_dev->qp_table);
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  }
+  
+  /*
+diff --cc drivers/infiniband/hw/qib/qib_verbs.h
+index ca366073af4f,e10ab80db3b1..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@@ -638,36 -361,6 +635,39 @@@ static inline struct qib_rwqe *get_rwqe
+  		  rq->max_sge * sizeof(struct ib_sge)) * n);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * QPN-map pages start out as NULL, they get allocated upon
+ + * first use and are never deallocated. This way,
+ + * large bitmaps are not allocated unless large numbers of QPs are used.
+ + */
+ +struct qpn_map {
+ +	void *page;
+ +};
+ +
+ +struct qib_qpn_table {
+ +	spinlock_t lock; /* protect changes in this struct */
+ +	unsigned flags;         /* flags for QP0/1 allocated for each port */
+ +	u32 last;               /* last QP number allocated */
+ +	u32 nmaps;              /* size of the map table */
+ +	u16 limit;
+ +	u16 mask;
+ +	/* bit map of free QP numbers other than 0/1 */
+ +	struct qpn_map map[QPNMAP_ENTRIES];
+ +};
+ +
+ +#define MAX_LKEY_TABLE_BITS 23
+ +
+ +struct qib_lkey_table {
+ +	spinlock_t lock; /* protect changes in this struct */
+ +	u32 next;               /* next unused index (speeds search) */
+ +	u32 gen;                /* generation count */
+ +	u32 max;                /* size of the table */
+ +	struct qib_mregion __rcu **table;
+ +};
+ +
+++=======
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  struct qib_opcode_stats {
+  	u64 n_packets;          /* number of packets */
+  	u64 n_bytes;            /* total number of bytes */
+@@@ -718,66 -400,21 +718,73 @@@ struct qib_ibport 
+  	u32 z_local_link_integrity_errors;      /* starting count for PMA */
+  	u32 z_excessive_buffer_overrun_errors;  /* starting count for PMA */
+  	u32 z_vl15_dropped;                     /* starting count for PMA */
+ +	u32 n_rc_resends;
+ +	u32 n_rc_acks;
+ +	u32 n_rc_qacks;
+ +	u32 n_rc_delayed_comp;
+ +	u32 n_seq_naks;
+ +	u32 n_rdma_seq;
+ +	u32 n_rnr_naks;
+ +	u32 n_other_naks;
+ +	u32 n_loop_pkts;
+ +	u32 n_pkt_drops;
+ +	u32 n_vl15_dropped;
+ +	u32 n_rc_timeouts;
+ +	u32 n_dmawait;
+ +	u32 n_unaligned;
+ +	u32 n_rc_dupreq;
+ +	u32 n_rc_seqnak;
+ +	u32 port_cap_flags;
+ +	u32 pma_sample_start;
+ +	u32 pma_sample_interval;
+ +	__be16 pma_counter_select[5];
+ +	u16 pma_tag;
+ +	u16 pkey_violations;
+ +	u16 qkey_violations;
+ +	u16 mkey_violations;
+ +	u16 mkey_lease_period;
+ +	u16 sm_lid;
+ +	u16 repress_traps;
+ +	u8 sm_sl;
+ +	u8 mkeyprot;
+ +	u8 subnet_timeout;
+ +	u8 vl_high_limit;
+  	u8 sl_to_vl[16];
+ +
+  };
+  
+ +
+  struct qib_ibdev {
+  	struct rvt_dev_info rdi;
+ -
+ +	struct list_head pending_mmaps;
+ +	spinlock_t mmap_offset_lock; /* protect mmap_offset */
+ +	u32 mmap_offset;
+ +	struct qib_mregion __rcu *dma_mr;
+ +
+++<<<<<<< HEAD
+ +	/* QP numbers are shared by all IB ports */
+ +	struct qib_qpn_table qpn_table;
+ +	struct qib_lkey_table lk_table;
+++=======
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  	struct list_head piowait;       /* list for wait PIO buf */
+  	struct list_head dmawait;	/* list for wait DMA */
+  	struct list_head txwait;        /* list for wait qib_verbs_txreq */
+  	struct list_head memwait;       /* list for wait kernel memory */
+  	struct list_head txreq_free;
+  	struct timer_list mem_timer;
+++<<<<<<< HEAD
+ +	struct qib_qp __rcu **qp_table;
+  	struct qib_pio_header *pio_hdrs;
+  	dma_addr_t pio_hdrs_phys;
+ +	/* list of QPs waiting for RNR timer */
+ +	spinlock_t pending_lock; /* protect wait lists, PMA counters, etc. */
+ +	u32 qp_table_size; /* size of the hash table */
+++=======
+++	struct qib_pio_header *pio_hdrs;
+++	dma_addr_t pio_hdrs_phys;
+++>>>>>>> 898fa52b4ac3 (IB/qib: Remove qpn, qp tables and related variables from qib)
+  	u32 qp_rnd; /* random bytes for hash */
+- 	spinlock_t qpt_lock;
+  
+  	u32 n_piowait;
+  	u32 n_txwait;
+* Unmerged path drivers/infiniband/hw/qib/qib_qp.c
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.c
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.h
