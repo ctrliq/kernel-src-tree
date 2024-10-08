@@ -1,0 +1,169 @@
+perf: Fix scaling vs. perf_event_enable()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit bd2afa49d194c6412c333e9fdd48bc5d06bb465d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bd2afa49.failed
+
+Similar to the perf_enable_on_exec(), ensure that event timings are
+consistent across perf_event_enable().
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: dvyukov@google.com
+	Cc: eranian@google.com
+	Cc: oleg@redhat.com
+	Cc: panand@redhat.com
+	Cc: sasha.levin@oracle.com
+	Cc: vince@deater.net
+Link: http://lkml.kernel.org/r/20160224174948.218288698@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit bd2afa49d194c6412c333e9fdd48bc5d06bb465d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 4091a178da37,57c25faecfa5..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -2012,7 -2069,9 +2012,13 @@@ static void add_event_to_ctx(struct per
+  	event->tstamp_stopped = tstamp;
+  }
+  
+++<<<<<<< HEAD
+ +static void task_ctx_sched_out(struct perf_event_context *ctx);
+++=======
++ static void ctx_sched_out(struct perf_event_context *ctx,
++ 			  struct perf_cpu_context *cpuctx,
++ 			  enum event_type_t event_type);
+++>>>>>>> bd2afa49d194 (perf: Fix scaling vs. perf_event_enable())
+  static void
+  ctx_sched_in(struct perf_event_context *ctx,
+  	     struct perf_cpu_context *cpuctx,
+@@@ -2146,64 -2228,47 +2164,85 @@@ static void __perf_event_mark_enabled(s
+  /*
+   * Cross CPU call to enable a performance event
+   */
+ -static void __perf_event_enable(struct perf_event *event,
+ -				struct perf_cpu_context *cpuctx,
+ -				struct perf_event_context *ctx,
+ -				void *info)
+ +static int __perf_event_enable(void *info)
+  {
+ +	struct perf_event *event = info;
+ +	struct perf_event_context *ctx = event->ctx;
+  	struct perf_event *leader = event->group_leader;
+ -	struct perf_event_context *task_ctx;
+ +	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
+ +	struct perf_event_context *task_ctx = cpuctx->task_ctx;
+  
+ -	if (event->state >= PERF_EVENT_STATE_INACTIVE ||
+ -	    event->state <= PERF_EVENT_STATE_ERROR)
+ -		return;
+ +	/*
+ +	 * There's a time window between 'ctx->is_active' check
+ +	 * in perf_event_enable function and this place having:
+ +	 *   - IRQs on
+ +	 *   - ctx->lock unlocked
+ +	 *
+ +	 * where the task could be killed and 'ctx' deactivated
+ +	 * by perf_event_exit_task.
+ +	 */
+ +	if (!ctx->is_active)
+ +		return -EINVAL;
+ +
+++<<<<<<< HEAD
+ +	perf_ctx_lock(cpuctx, task_ctx);
+ +	WARN_ON_ONCE(&cpuctx->ctx != ctx && task_ctx != ctx);
+ +	update_context_time(ctx);
+  
+ +	if (event->state >= PERF_EVENT_STATE_INACTIVE)
+ +		goto unlock;
+ +
+ +	/*
+ +	 * set current task's cgroup time reference point
+ +	 */
+ +	perf_cgroup_set_timestamp(current, ctx);
+++=======
++ 	if (ctx->is_active)
++ 		ctx_sched_out(ctx, cpuctx, EVENT_TIME);
+++>>>>>>> bd2afa49d194 (perf: Fix scaling vs. perf_event_enable())
+  
+  	__perf_event_mark_enabled(event);
+  
+  	if (!event_filter_match(event)) {
+  		if (is_cgroup_event(event))
+  			perf_cgroup_defer_enabled(event);
+++<<<<<<< HEAD
+ +		goto unlock;
+++=======
++ 		ctx_sched_in(ctx, cpuctx, EVENT_TIME, current);
++ 		return;
+++>>>>>>> bd2afa49d194 (perf: Fix scaling vs. perf_event_enable())
+  	}
+  
+  	/*
+  	 * If the event is in a group and isn't the group leader,
+  	 * then don't put it on unless the group is on.
+  	 */
+++<<<<<<< HEAD
+ +	if (leader != event && leader->state != PERF_EVENT_STATE_ACTIVE)
+ +		goto unlock;
+++=======
++ 	if (leader != event && leader->state != PERF_EVENT_STATE_ACTIVE) {
++ 		ctx_sched_in(ctx, cpuctx, EVENT_TIME, current);
++ 		return;
++ 	}
++ 
++ 	task_ctx = cpuctx->task_ctx;
++ 	if (ctx->task)
++ 		WARN_ON_ONCE(task_ctx != ctx);
+++>>>>>>> bd2afa49d194 (perf: Fix scaling vs. perf_event_enable())
+  
+  	ctx_resched(cpuctx, task_ctx);
+ +
+ +unlock:
+ +	perf_ctx_unlock(cpuctx, task_ctx);
+ +
+ +	return 0;
+ +}
+ +
+ +void ___perf_event_enable(void *info)
+ +{
+ +	__perf_event_mark_enabled((struct perf_event *)info);
+  }
+  
+  /*
+@@@ -2583,19 -2674,6 +2622,22 @@@ void __perf_event_task_sched_out(struc
+  		perf_cgroup_sched_out(task, next);
+  }
+  
+++<<<<<<< HEAD
+ +static void task_ctx_sched_out(struct perf_event_context *ctx)
+ +{
+ +	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
+ +
+ +	if (!cpuctx->task_ctx)
+ +		return;
+ +
+ +	if (WARN_ON_ONCE(ctx != cpuctx->task_ctx))
+ +		return;
+ +
+ +	ctx_sched_out(ctx, cpuctx, EVENT_ALL);
+ +}
+ +
+++=======
+++>>>>>>> bd2afa49d194 (perf: Fix scaling vs. perf_event_enable())
+  /*
+   * Called with IRQs disabled
+   */
+* Unmerged path kernel/events/core.c
