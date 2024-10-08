@@ -1045,7 +1045,7 @@ retry:
 		}
 		/* signal not to enter either branch of the if () below */
 		timeleft = 0;
-		rtn = NEEDS_RETRY;
+		rtn = FAILED;
 	} else {
 		timeleft = wait_for_completion_timeout(&done, timeout);
 		rtn = SUCCESS;
@@ -1085,7 +1085,7 @@ retry:
 			rtn = FAILED;
 			break;
 		}
-	} else if (!rtn) {
+	} else if (rtn != FAILED) {
 		scsi_abort_eh_cmnd(scmd);
 		rtn = FAILED;
 	}
