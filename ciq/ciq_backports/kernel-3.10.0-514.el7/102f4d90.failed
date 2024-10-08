@@ -1,0 +1,142 @@
+FS-Cache: Handle a write to the page immediately beyond the EOF marker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 102f4d900c9c8f5ed89ae4746d493fe3ebd7ba64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/102f4d90.failed
+
+Handle a write being requested to the page immediately beyond the EOF
+marker on a cache object.  Currently this gets an assertion failure in
+CacheFiles because the EOF marker is used there to encode information about
+a partial page at the EOF - which could lead to an unknown blank spot in
+the file if we extend the file over it.
+
+The problem is actually in fscache where we check the index of the page
+being written against store_limit.  store_limit is set to the number of
+pages that we're allowed to store by fscache_set_store_limit() - which
+means it's one more than the index of the last page we're allowed to store.
+The problem is that we permit writing to a page with an index _equal_ to
+the store limit - when we should reject that case.
+
+Whilst we're at it, change the triggered assertion in CacheFiles to just
+return -ENOBUFS instead.
+
+The assertion failure looks something like this:
+
+CacheFiles: Assertion failed
+1000 < 7b1 is false
+------------[ cut here ]------------
+kernel BUG at fs/cachefiles/rdwr.c:962!
+...
+RIP: 0010:[<ffffffffa02c9e83>]  [<ffffffffa02c9e83>] cachefiles_write_page+0x273/0x2d0 [cachefiles]
+
+	Cc: stable@vger.kernel.org # v2.6.31+; earlier - that + backport of a17754f (at least)
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 102f4d900c9c8f5ed89ae4746d493fe3ebd7ba64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cachefiles/rdwr.c
+diff --cc fs/cachefiles/rdwr.c
+index de7136fb10ab,7a6b02f72787..000000000000
+--- a/fs/cachefiles/rdwr.c
++++ b/fs/cachefiles/rdwr.c
+@@@ -906,49 -915,38 +915,73 @@@ int cachefiles_write_page(struct fscach
+  	file = dentry_open(&path, O_RDWR | O_LARGEFILE, cache->cache_cred);
+  	if (IS_ERR(file)) {
+  		ret = PTR_ERR(file);
+++<<<<<<< HEAD
+ +	} else {
+ +		ret = -EIO;
+ +		if (file->f_op->write) {
+ +			pos = (loff_t) page->index << PAGE_SHIFT;
+ +
+ +			/* we mustn't write more data than we have, so we have
+ +			 * to beware of a partial page at EOF */
+ +			eof = object->fscache.store_limit_l;
+ +			len = PAGE_SIZE;
+ +			if (eof & ~PAGE_MASK) {
+ +				ASSERTCMP(pos, <, eof);
+ +				if (eof - pos < PAGE_SIZE) {
+ +					_debug("cut short %llx to %llx",
+ +					       pos, eof);
+ +					len = eof - pos;
+ +					ASSERTCMP(pos + len, ==, eof);
+ +				}
+ +			}
+ +
+ +			data = kmap(page);
+ +			file_start_write(file);
+ +			old_fs = get_fs();
+ +			set_fs(KERNEL_DS);
+ +			ret = file->f_op->write(
+ +				file, (const void __user *) data, len, &pos);
+ +			set_fs(old_fs);
+ +			kunmap(page);
+ +			file_end_write(file);
+ +			if (ret != len)
+ +				ret = -EIO;
+ +		}
+ +		fput(file);
+++=======
++ 		goto error_2;
+  	}
+  
+- 	if (ret < 0) {
+- 		if (ret == -EIO)
+- 			cachefiles_io_error_obj(
+- 				object, "Write page to backing file failed");
+- 		ret = -ENOBUFS;
++ 	len = PAGE_SIZE;
++ 	if (eof & ~PAGE_MASK) {
++ 		if (eof - pos < PAGE_SIZE) {
++ 			_debug("cut short %llx to %llx",
++ 			       pos, eof);
++ 			len = eof - pos;
++ 			ASSERTCMP(pos + len, ==, eof);
++ 		}
+++>>>>>>> 102f4d900c9c (FS-Cache: Handle a write to the page immediately beyond the EOF marker)
+  	}
+  
+- 	_leave(" = %d", ret);
+- 	return ret;
++ 	data = kmap(page);
++ 	ret = __kernel_write(file, data, len, &pos);
++ 	kunmap(page);
++ 	fput(file);
++ 	if (ret != len)
++ 		goto error_eio;
++ 
++ 	_leave(" = 0");
++ 	return 0;
++ 
++ error_eio:
++ 	ret = -EIO;
++ error_2:
++ 	if (ret == -EIO)
++ 		cachefiles_io_error_obj(object,
++ 					"Write page to backing file failed");
++ error:
++ 	_leave(" = -ENOBUFS [%d]", ret);
++ 	return -ENOBUFS;
+  }
+  
+  /*
+* Unmerged path fs/cachefiles/rdwr.c
+diff --git a/fs/fscache/page.c b/fs/fscache/page.c
+index e1500bda3bfc..1fa0882f7416 100644
+--- a/fs/fscache/page.c
++++ b/fs/fscache/page.c
+@@ -818,7 +818,7 @@ static void fscache_write_op(struct fscache_operation *_op)
+ 		goto superseded;
+ 	page = results[0];
+ 	_debug("gang %d [%lx]", n, page->index);
+-	if (page->index > op->store_limit) {
++	if (page->index >= op->store_limit) {
+ 		fscache_stat(&fscache_n_store_pages_over_limit);
+ 		goto superseded;
+ 	}
