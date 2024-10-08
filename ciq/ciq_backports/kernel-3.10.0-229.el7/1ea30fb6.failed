@@ -1,0 +1,545 @@
+uprobes/x86: Fix scratch register selection for rip-relative fixups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Fix scratch register selection for rip-relative fixups (Oleg Nesterov) [1073627]
+Rebuild_FUZZ: 96.92%
+commit-author Denys Vlasenko <dvlasenk@redhat.com>
+commit 1ea30fb64598bd3a6ba43d874bb53c55878eaef5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1ea30fb6.failed
+
+Before this patch, instructions such as div, mul, shifts with count
+in CL, cmpxchg are mishandled.
+
+This patch adds vex prefix handling. In particular, it avoids colliding
+with register operand encoded in vex.vvvv field.
+
+Since we need to avoid two possible register operands, the selection of
+scratch register needs to be from at least three registers.
+
+After looking through a lot of CPU docs, it looks like the safest choice
+is SI,DI,BX. Selecting BX needs care to not collide with implicit use of
+BX by cmpxchg8b.
+
+Test-case:
+
+	#include <stdio.h>
+
+	static const char *const pass[] = { "FAIL", "pass" };
+
+	long two = 2;
+	void test1(void)
+	{
+		long ax = 0, dx = 0;
+		asm volatile("\n"
+	"			xor	%%edx,%%edx\n"
+	"			lea	2(%%edx),%%eax\n"
+	// We divide 2 by 2. Result (in eax) should be 1:
+	"	probe1:		.globl	probe1\n"
+	"			divl	two(%%rip)\n"
+	// If we have a bug (eax mangled on entry) the result will be 2,
+	// because eax gets restored by probe machinery.
+		: "=a" (ax), "=d" (dx) /*out*/
+		: "0" (ax), "1" (dx) /*in*/
+		: "memory" /*clobber*/
+		);
+		dprintf(2, "%s: %s\n", __func__,
+			pass[ax == 1]
+		);
+	}
+
+	long val2 = 0;
+	void test2(void)
+	{
+		long old_val = val2;
+		long ax = 0, dx = 0;
+		asm volatile("\n"
+	"			mov	val2,%%eax\n"     // eax := val2
+	"			lea	1(%%eax),%%edx\n" // edx := eax+1
+	// eax is equal to val2. cmpxchg should store edx to val2:
+	"	probe2:		.globl  probe2\n"
+	"			cmpxchg %%edx,val2(%%rip)\n"
+	// If we have a bug (eax mangled on entry), val2 will stay unchanged
+		: "=a" (ax), "=d" (dx) /*out*/
+		: "0" (ax), "1" (dx) /*in*/
+		: "memory" /*clobber*/
+		);
+		dprintf(2, "%s: %s\n", __func__,
+			pass[val2 == old_val + 1]
+		);
+	}
+
+	long val3[2] = {0,0};
+	void test3(void)
+	{
+		long old_val = val3[0];
+		long ax = 0, dx = 0;
+		asm volatile("\n"
+	"			mov	val3,%%eax\n"  // edx:eax := val3
+	"			mov	val3+4,%%edx\n"
+	"			mov	%%eax,%%ebx\n" // ecx:ebx := edx:eax + 1
+	"			mov	%%edx,%%ecx\n"
+	"			add	$1,%%ebx\n"
+	"			adc	$0,%%ecx\n"
+	// edx:eax is equal to val3. cmpxchg8b should store ecx:ebx to val3:
+	"	probe3:		.globl  probe3\n"
+	"			cmpxchg8b val3(%%rip)\n"
+	// If we have a bug (edx:eax mangled on entry), val3 will stay unchanged.
+	// If ecx:edx in mangled, val3 will get wrong value.
+		: "=a" (ax), "=d" (dx) /*out*/
+		: "0" (ax), "1" (dx) /*in*/
+		: "cx", "bx", "memory" /*clobber*/
+		);
+		dprintf(2, "%s: %s\n", __func__,
+			pass[val3[0] == old_val + 1 && val3[1] == 0]
+		);
+	}
+
+	int main(int argc, char **argv)
+	{
+		test1();
+		test2();
+		test3();
+		return 0;
+	}
+
+Before this change all tests fail if probe{1,2,3} are probed.
+
+	Signed-off-by: Denys Vlasenko <dvlasenk@redhat.com>
+	Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+(cherry picked from commit 1ea30fb64598bd3a6ba43d874bb53c55878eaef5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/uprobes.c
+diff --cc arch/x86/kernel/uprobes.c
+index 99569dc5b83d,159ca520ef5b..000000000000
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@@ -33,16 -33,19 +33,24 @@@
+  /* Post-execution fixups. */
+  
+  /* Adjust IP back to vicinity of actual insn */
+ -#define UPROBE_FIX_IP		0x01
+ +#define UPROBE_FIX_IP		0x1
+  
+  /* Adjust the return address of a call insn */
+ -#define UPROBE_FIX_CALL		0x02
+ +#define UPROBE_FIX_CALL	0x2
+  
+  /* Instruction will modify TF, don't change it */
+ -#define UPROBE_FIX_SETF		0x04
+ +#define UPROBE_FIX_SETF	0x4
+  
+++<<<<<<< HEAD
+ +#define UPROBE_FIX_RIP_AX	0x8000
+ +#define UPROBE_FIX_RIP_CX	0x4000
+++=======
++ #define UPROBE_FIX_RIP_SI	0x08
++ #define UPROBE_FIX_RIP_DI	0x10
++ #define UPROBE_FIX_RIP_BX	0x20
++ #define UPROBE_FIX_RIP_MASK	\
++ 	(UPROBE_FIX_RIP_SI | UPROBE_FIX_RIP_DI | UPROBE_FIX_RIP_BX)
+++>>>>>>> 1ea30fb64598 (uprobes/x86: Fix scratch register selection for rip-relative fixups)
+  
+  #define	UPROBE_TRAP_NR		UINT_MAX
+  
+@@@ -291,81 -387,46 +388,114 @@@ handle_riprel_insn(struct arch_uprobe *
+  	 * is the immediate operand.
+  	 */
+  	cursor = auprobe->insn + insn_offset_modrm(insn);
+ +	insn_get_length(insn);
+ +
+  	/*
+++<<<<<<< HEAD
+ +	 * Convert from rip-relative addressing to indirect addressing
+ +	 * via a scratch register.  Change the r/m field from 0x5 (%rip)
+ +	 * to 0x0 (%rax) or 0x1 (%rcx), and squeeze out the offset field.
+ +	 */
+ +	reg = MODRM_REG(insn);
+ +	if (reg == 0) {
+ +		/*
+ +		 * The register operand (if any) is either the A register
+ +		 * (%rax, %eax, etc.) or (if the 0x4 bit is set in the
+ +		 * REX prefix) %r8.  In any case, we know the C register
+ +		 * is NOT the register operand, so we use %rcx (register
+ +		 * #1) for the scratch register.
+ +		 */
+ +		auprobe->fixups = UPROBE_FIX_RIP_CX;
+ +		/* Change modrm from 00 000 101 to 00 000 001. */
+ +		*cursor = 0x1;
+ +	} else {
+ +		/* Use %rax (register #0) for the scratch register. */
+ +		auprobe->fixups = UPROBE_FIX_RIP_AX;
+ +		/* Change modrm from 00 xxx 101 to 00 xxx 000 */
+ +		*cursor = (reg << 3);
+ +	}
+ +
+ +	/* Target address = address of next instruction + (signed) offset */
+ +	auprobe->rip_rela_target_address = (long)insn->length + insn->displacement.value;
+ +
+ +	/* Displacement field is gone; slide immediate field (if any) over. */
+ +	if (insn->immediate.nbytes) {
+ +		cursor++;
+ +		memmove(cursor, cursor + insn->displacement.nbytes, insn->immediate.nbytes);
+ +	}
+++=======
++ 	 * Change modrm from "00 reg 101" to "10 reg reg2". Example:
++ 	 * 89 05 disp32  mov %eax,disp32(%rip) becomes
++ 	 * 89 86 disp32  mov %eax,disp32(%rsi)
++ 	 */
++ 	*cursor = 0x80 | (reg << 3) | reg2;
++ }
++ 
++ static inline unsigned long *
++ scratch_reg(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	if (auprobe->def.fixups & UPROBE_FIX_RIP_SI)
++ 		return &regs->si;
++ 	if (auprobe->def.fixups & UPROBE_FIX_RIP_DI)
++ 		return &regs->di;
++ 	return &regs->bx;
+++>>>>>>> 1ea30fb64598 (uprobes/x86: Fix scratch register selection for rip-relative fixups)
+  }
+  
+  /*
+   * If we're emulating a rip-relative instruction, save the contents
+   * of the scratch register and store the target address in that register.
+   */
+ -static void riprel_pre_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ +static void
+ +pre_xol_rip_insn(struct arch_uprobe *auprobe, struct pt_regs *regs,
+ +				struct arch_uprobe_task *autask)
+  {
+++<<<<<<< HEAD
+ +	if (auprobe->fixups & UPROBE_FIX_RIP_AX) {
+ +		autask->saved_scratch_register = regs->ax;
+ +		regs->ax = current->utask->vaddr;
+ +		regs->ax += auprobe->rip_rela_target_address;
+ +	} else if (auprobe->fixups & UPROBE_FIX_RIP_CX) {
+ +		autask->saved_scratch_register = regs->cx;
+ +		regs->cx = current->utask->vaddr;
+ +		regs->cx += auprobe->rip_rela_target_address;
+++=======
++ 	if (auprobe->def.fixups & UPROBE_FIX_RIP_MASK) {
++ 		struct uprobe_task *utask = current->utask;
++ 		unsigned long *sr = scratch_reg(auprobe, regs);
++ 
++ 		utask->autask.saved_scratch_register = *sr;
++ 		*sr = utask->vaddr + auprobe->def.ilen;
+++>>>>>>> 1ea30fb64598 (uprobes/x86: Fix scratch register selection for rip-relative fixups)
+  	}
+  }
+  
+ -static void riprel_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ +static void
+ +handle_riprel_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs, long *correction)
+  {
+++<<<<<<< HEAD
+ +	if (auprobe->fixups & (UPROBE_FIX_RIP_AX | UPROBE_FIX_RIP_CX)) {
+ +		struct arch_uprobe_task *autask;
+++=======
++ 	if (auprobe->def.fixups & UPROBE_FIX_RIP_MASK) {
++ 		struct uprobe_task *utask = current->utask;
++ 		unsigned long *sr = scratch_reg(auprobe, regs);
+++>>>>>>> 1ea30fb64598 (uprobes/x86: Fix scratch register selection for rip-relative fixups)
+  
+ -		*sr = utask->autask.saved_scratch_register;
+ +		autask = &current->utask->autask;
+ +		if (auprobe->fixups & UPROBE_FIX_RIP_AX)
+ +			regs->ax = autask->saved_scratch_register;
+ +		else
+ +			regs->cx = autask->saved_scratch_register;
+ +
+ +		/*
+ +		 * The original instruction includes a displacement, and so
+ +		 * is 4 bytes longer than what we've just single-stepped.
+ +		 * Caller may need to apply other fixups to handle stuff
+ +		 * like "jmpq *...(%rip)" and "callq *...(%rip)".
+ +		 */
+ +		if (correction)
+ +			*correction += 4;
+  	}
+  }
+  #else /* 32-bit: */
+@@@ -389,6 -448,246 +519,249 @@@ static void handle_riprel_post_xol(stru
+  }
+  #endif /* CONFIG_X86_64 */
+  
+++<<<<<<< HEAD
+++=======
++ struct uprobe_xol_ops {
++ 	bool	(*emulate)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*pre_xol)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*post_xol)(struct arch_uprobe *, struct pt_regs *);
++ 	void	(*abort)(struct arch_uprobe *, struct pt_regs *);
++ };
++ 
++ static inline int sizeof_long(void)
++ {
++ 	return is_ia32_task() ? 4 : 8;
++ }
++ 
++ static int default_pre_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	riprel_pre_xol(auprobe, regs);
++ 	return 0;
++ }
++ 
++ static int push_ret_address(struct pt_regs *regs, unsigned long ip)
++ {
++ 	unsigned long new_sp = regs->sp - sizeof_long();
++ 
++ 	if (copy_to_user((void __user *)new_sp, &ip, sizeof_long()))
++ 		return -EFAULT;
++ 
++ 	regs->sp = new_sp;
++ 	return 0;
++ }
++ 
++ /*
++  * We have to fix things up as follows:
++  *
++  * Typically, the new ip is relative to the copied instruction.  We need
++  * to make it relative to the original instruction (FIX_IP).  Exceptions
++  * are return instructions and absolute or indirect jump or call instructions.
++  *
++  * If the single-stepped instruction was a call, the return address that
++  * is atop the stack is the address following the copied instruction.  We
++  * need to make it the address following the original instruction (FIX_CALL).
++  *
++  * If the original instruction was a rip-relative instruction such as
++  * "movl %edx,0xnnnn(%rip)", we have instead executed an equivalent
++  * instruction using a scratch register -- e.g., "movl %edx,0xnnnn(%rsi)".
++  * We need to restore the contents of the scratch register
++  * (FIX_RIP_reg).
++  */
++ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	struct uprobe_task *utask = current->utask;
++ 
++ 	riprel_post_xol(auprobe, regs);
++ 	if (auprobe->def.fixups & UPROBE_FIX_IP) {
++ 		long correction = utask->vaddr - utask->xol_vaddr;
++ 		regs->ip += correction;
++ 	} else if (auprobe->def.fixups & UPROBE_FIX_CALL) {
++ 		regs->sp += sizeof_long();
++ 		if (push_ret_address(regs, utask->vaddr + auprobe->def.ilen))
++ 			return -ERESTART;
++ 	}
++ 	/* popf; tell the caller to not touch TF */
++ 	if (auprobe->def.fixups & UPROBE_FIX_SETF)
++ 		utask->autask.saved_tf = true;
++ 
++ 	return 0;
++ }
++ 
++ static void default_abort_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	riprel_post_xol(auprobe, regs);
++ }
++ 
++ static struct uprobe_xol_ops default_xol_ops = {
++ 	.pre_xol  = default_pre_xol_op,
++ 	.post_xol = default_post_xol_op,
++ 	.abort	  = default_abort_op,
++ };
++ 
++ static bool branch_is_call(struct arch_uprobe *auprobe)
++ {
++ 	return auprobe->branch.opc1 == 0xe8;
++ }
++ 
++ #define CASE_COND					\
++ 	COND(70, 71, XF(OF))				\
++ 	COND(72, 73, XF(CF))				\
++ 	COND(74, 75, XF(ZF))				\
++ 	COND(78, 79, XF(SF))				\
++ 	COND(7a, 7b, XF(PF))				\
++ 	COND(76, 77, XF(CF) || XF(ZF))			\
++ 	COND(7c, 7d, XF(SF) != XF(OF))			\
++ 	COND(7e, 7f, XF(ZF) || XF(SF) != XF(OF))
++ 
++ #define COND(op_y, op_n, expr)				\
++ 	case 0x ## op_y: DO((expr) != 0)		\
++ 	case 0x ## op_n: DO((expr) == 0)
++ 
++ #define XF(xf)	(!!(flags & X86_EFLAGS_ ## xf))
++ 
++ static bool is_cond_jmp_opcode(u8 opcode)
++ {
++ 	switch (opcode) {
++ 	#define DO(expr)	\
++ 		return true;
++ 	CASE_COND
++ 	#undef	DO
++ 
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static bool check_jmp_cond(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	unsigned long flags = regs->flags;
++ 
++ 	switch (auprobe->branch.opc1) {
++ 	#define DO(expr)	\
++ 		return expr;
++ 	CASE_COND
++ 	#undef	DO
++ 
++ 	default:	/* not a conditional jmp */
++ 		return true;
++ 	}
++ }
++ 
++ #undef	XF
++ #undef	COND
++ #undef	CASE_COND
++ 
++ static bool branch_emulate_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	unsigned long new_ip = regs->ip += auprobe->branch.ilen;
++ 	unsigned long offs = (long)auprobe->branch.offs;
++ 
++ 	if (branch_is_call(auprobe)) {
++ 		/*
++ 		 * If it fails we execute this (mangled, see the comment in
++ 		 * branch_clear_offset) insn out-of-line. In the likely case
++ 		 * this should trigger the trap, and the probed application
++ 		 * should die or restart the same insn after it handles the
++ 		 * signal, arch_uprobe_post_xol() won't be even called.
++ 		 *
++ 		 * But there is corner case, see the comment in ->post_xol().
++ 		 */
++ 		if (push_ret_address(regs, new_ip))
++ 			return false;
++ 	} else if (!check_jmp_cond(auprobe, regs)) {
++ 		offs = 0;
++ 	}
++ 
++ 	regs->ip = new_ip + offs;
++ 	return true;
++ }
++ 
++ static int branch_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	BUG_ON(!branch_is_call(auprobe));
++ 	/*
++ 	 * We can only get here if branch_emulate_op() failed to push the ret
++ 	 * address _and_ another thread expanded our stack before the (mangled)
++ 	 * "call" insn was executed out-of-line. Just restore ->sp and restart.
++ 	 * We could also restore ->ip and try to call branch_emulate_op() again.
++ 	 */
++ 	regs->sp += sizeof_long();
++ 	return -ERESTART;
++ }
++ 
++ static void branch_clear_offset(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 	/*
++ 	 * Turn this insn into "call 1f; 1:", this is what we will execute
++ 	 * out-of-line if ->emulate() fails. We only need this to generate
++ 	 * a trap, so that the probed task receives the correct signal with
++ 	 * the properly filled siginfo.
++ 	 *
++ 	 * But see the comment in ->post_xol(), in the unlikely case it can
++ 	 * succeed. So we need to ensure that the new ->ip can not fall into
++ 	 * the non-canonical area and trigger #GP.
++ 	 *
++ 	 * We could turn it into (say) "pushf", but then we would need to
++ 	 * divorce ->insn[] and ->ixol[]. We need to preserve the 1st byte
++ 	 * of ->insn[] for set_orig_insn().
++ 	 */
++ 	memset(auprobe->insn + insn_offset_immediate(insn),
++ 		0, insn->immediate.nbytes);
++ }
++ 
++ static struct uprobe_xol_ops branch_xol_ops = {
++ 	.emulate  = branch_emulate_op,
++ 	.post_xol = branch_post_xol_op,
++ };
++ 
++ /* Returns -ENOSYS if branch_xol_ops doesn't handle this insn */
++ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 	u8 opc1 = OPCODE1(insn);
++ 	int i;
++ 
++ 	switch (opc1) {
++ 	case 0xeb:	/* jmp 8 */
++ 	case 0xe9:	/* jmp 32 */
++ 	case 0x90:	/* prefix* + nop; same as jmp with .offs = 0 */
++ 		break;
++ 
++ 	case 0xe8:	/* call relative */
++ 		branch_clear_offset(auprobe, insn);
++ 		break;
++ 
++ 	case 0x0f:
++ 		if (insn->opcode.nbytes != 2)
++ 			return -ENOSYS;
++ 		/*
++ 		 * If it is a "near" conditional jmp, OPCODE2() - 0x10 matches
++ 		 * OPCODE1() of the "short" jmp which checks the same condition.
++ 		 */
++ 		opc1 = OPCODE2(insn) - 0x10;
++ 	default:
++ 		if (!is_cond_jmp_opcode(opc1))
++ 			return -ENOSYS;
++ 	}
++ 
++ 	/*
++ 	 * 16-bit overrides such as CALLW (66 e8 nn nn) are not supported.
++ 	 * Intel and AMD behavior differ in 64-bit mode: Intel ignores 66 prefix.
++ 	 * No one uses these insns, reject any branch insns with such prefix.
++ 	 */
++ 	for (i = 0; i < insn->prefixes.nbytes; i++) {
++ 		if (insn->prefixes.bytes[i] == 0x66)
++ 			return -ENOTSUPP;
++ 	}
++ 
++ 	auprobe->branch.opc1 = opc1;
++ 	auprobe->branch.ilen = insn->length;
++ 	auprobe->branch.offs = insn->immediate.value;
++ 
++ 	auprobe->ops = &branch_xol_ops;
++ 	return 0;
++ }
++ 
+++>>>>>>> 1ea30fb64598 (uprobes/x86: Fix scratch register selection for rip-relative fixups)
+  /**
+   * arch_uprobe_analyze_insn - instruction analysis including validity and fixups.
+   * @mm: the probed address space.
+@@@ -524,23 -800,6 +897,26 @@@ bool arch_uprobe_xol_was_trapped(struc
+   * single-step, we single-stepped a copy of the instruction.
+   *
+   * This function prepares to resume execution after the single-step.
+++<<<<<<< HEAD
+ + * We have to fix things up as follows:
+ + *
+ + * Typically, the new ip is relative to the copied instruction.  We need
+ + * to make it relative to the original instruction (FIX_IP).  Exceptions
+ + * are return instructions and absolute or indirect jump or call instructions.
+ + *
+ + * If the single-stepped instruction was a call, the return address that
+ + * is atop the stack is the address following the copied instruction.  We
+ + * need to make it the address following the original instruction (FIX_CALL).
+ + *
+ + * If the original instruction was a rip-relative instruction such as
+ + * "movl %edx,0xnnnn(%rip)", we have instead executed an equivalent
+ + * instruction using a scratch register -- e.g., "movl %edx,(%rax)".
+ + * We need to restore the contents of the scratch register and adjust
+ + * the ip, keeping in mind that the instruction we executed is 4 bytes
+ + * shorter than the original instruction (since we squeezed out the offset
+ + * field).  (FIX_RIP_AX or FIX_RIP_CX)
+++=======
+++>>>>>>> 1ea30fb64598 (uprobes/x86: Fix scratch register selection for rip-relative fixups)
+   */
+  int arch_uprobe_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+  {
+* Unmerged path arch/x86/kernel/uprobes.c
