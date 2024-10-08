@@ -1,0 +1,358 @@
+IB/iser: Remove struct iscsi_iser_conn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [infiniband] iser: Remove struct iscsi_iser_conn (Amir Vadai) [1107622]
+Rebuild_FUZZ: 95.89%
+commit-author Ariel Nahum <arieln@mellanox.com>
+commit 4667f5dfb0c36a86339652aca694736ebc590871
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4667f5df.failed
+
+The iscsi stack has existing mechanisms to link back and forth between
+the iscsi connection and the iscsi transport (e.g iser/tcp) connection.
+
+This is done through a dd_data pointer field in struct iscsi_conn
+which can be set to point to the transport connection, etc.
+
+The iscsi_iser_conn structure was used to get this linking done in
+another way, which is uneeded and adds extra complication to the iser
+code, so we just remove it.
+
+	Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 4667f5dfb0c36a86339652aca694736ebc590871)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_initiator.c
+diff --cc drivers/infiniband/ulp/iser/iser_initiator.c
+index 84ac6d0915c4,401909006aec..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_initiator.c
++++ b/drivers/infiniband/ulp/iser/iser_initiator.c
+@@@ -370,11 -370,10 +370,14 @@@ static int iser_post_rx_bufs(struct isc
+  		return 0;
+  	} else
+  		iser_info("Normal session, posting batch of RX %d buffers\n",
+++<<<<<<< HEAD
+ +			  ISER_MIN_POSTED_RX);
+++=======
++ 			  ib_conn->min_posted_rx);
+++>>>>>>> 4667f5dfb0c3 (IB/iser: Remove struct iscsi_iser_conn)
+  
+  	/* Initial post receive buffers */
+- 	if (iser_post_recvm(iser_conn->ib_conn,
+- 			    iser_conn->ib_conn->min_posted_rx))
++ 	if (iser_post_recvm(ib_conn, ib_conn->min_posted_rx))
+  		return -ENOMEM;
+  
+  	return 0;
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.c b/drivers/infiniband/ulp/iser/iscsi_iser.c
+index a0ec2d012f95..bfbbb2d1aff7 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -146,8 +146,8 @@ static int iscsi_iser_pdu_alloc(struct iscsi_task *task, uint8_t opcode)
+ int iser_initialize_task_headers(struct iscsi_task *task,
+ 						struct iser_tx_desc *tx_desc)
+ {
+-	struct iscsi_iser_conn *iser_conn = task->conn->dd_data;
+-	struct iser_device     *device    = iser_conn->ib_conn->device;
++	struct iser_conn       *ib_conn   = task->conn->dd_data;
++	struct iser_device     *device    = ib_conn->device;
+ 	struct iscsi_iser_task *iser_task = task->dd_data;
+ 	u64 dma_addr;
+ 
+@@ -161,7 +161,7 @@ int iser_initialize_task_headers(struct iscsi_task *task,
+ 	tx_desc->tx_sg[0].length = ISER_HEADERS_LEN;
+ 	tx_desc->tx_sg[0].lkey   = device->mr->lkey;
+ 
+-	iser_task->iser_conn		= iser_conn;
++	iser_task->ib_conn = ib_conn;
+ 	return 0;
+ }
+ /**
+@@ -288,10 +288,9 @@ iscsi_iser_task_xmit(struct iscsi_task *task)
+ static void iscsi_iser_cleanup_task(struct iscsi_task *task)
+ {
+ 	struct iscsi_iser_task *iser_task = task->dd_data;
+-	struct iser_tx_desc	*tx_desc = &iser_task->desc;
+-
+-	struct iscsi_iser_conn *iser_conn = task->conn->dd_data;
+-	struct iser_device     *device    = iser_conn->ib_conn->device;
++	struct iser_tx_desc    *tx_desc   = &iser_task->desc;
++	struct iser_conn       *ib_conn	  = task->conn->dd_data;
++	struct iser_device     *device	  = ib_conn->device;
+ 
+ 	ib_dma_unmap_single(device->ib_device,
+ 		tx_desc->dma_addr, ISER_HEADERS_LEN, DMA_TO_DEVICE);
+@@ -323,9 +322,8 @@ iscsi_iser_conn_create(struct iscsi_cls_session *cls_session, uint32_t conn_idx)
+ {
+ 	struct iscsi_conn *conn;
+ 	struct iscsi_cls_conn *cls_conn;
+-	struct iscsi_iser_conn *iser_conn;
+ 
+-	cls_conn = iscsi_conn_setup(cls_session, sizeof(*iser_conn), conn_idx);
++	cls_conn = iscsi_conn_setup(cls_session, 0, conn_idx);
+ 	if (!cls_conn)
+ 		return NULL;
+ 	conn = cls_conn->dd_data;
+@@ -336,10 +334,6 @@ iscsi_iser_conn_create(struct iscsi_cls_session *cls_session, uint32_t conn_idx)
+ 	 */
+ 	conn->max_recv_dlength = ISER_RECV_DATA_SEG_LEN;
+ 
+-	iser_conn = conn->dd_data;
+-	conn->dd_data = iser_conn;
+-	iser_conn->iscsi_conn = conn;
+-
+ 	return cls_conn;
+ }
+ 
+@@ -347,8 +341,7 @@ static void
+ iscsi_iser_conn_destroy(struct iscsi_cls_conn *cls_conn)
+ {
+ 	struct iscsi_conn *conn = cls_conn->dd_data;
+-	struct iscsi_iser_conn *iser_conn = conn->dd_data;
+-	struct iser_conn *ib_conn = iser_conn->ib_conn;
++	struct iser_conn *ib_conn = conn->dd_data;
+ 
+ 	iscsi_conn_teardown(cls_conn);
+ 	/*
+@@ -357,7 +350,7 @@ iscsi_iser_conn_destroy(struct iscsi_cls_conn *cls_conn)
+ 	 * we free it here.
+ 	 */
+ 	if (ib_conn) {
+-		ib_conn->iser_conn = NULL;
++		ib_conn->iscsi_conn = NULL;
+ 		iser_conn_put(ib_conn, 1); /* deref iscsi/ib conn unbinding */
+ 	}
+ }
+@@ -368,7 +361,6 @@ iscsi_iser_conn_bind(struct iscsi_cls_session *cls_session,
+ 		     int is_leading)
+ {
+ 	struct iscsi_conn *conn = cls_conn->dd_data;
+-	struct iscsi_iser_conn *iser_conn;
+ 	struct iscsi_session *session;
+ 	struct iser_conn *ib_conn;
+ 	struct iscsi_endpoint *ep;
+@@ -395,11 +387,11 @@ iscsi_iser_conn_bind(struct iscsi_cls_session *cls_session,
+ 	/* binds the iSER connection retrieved from the previously
+ 	 * connected ep_handle to the iSCSI layer connection. exchanges
+ 	 * connection pointers */
+-	iser_info("binding iscsi/iser conn %p %p to ib_conn %p\n",
+-		  conn, conn->dd_data, ib_conn);
+-	iser_conn = conn->dd_data;
+-	ib_conn->iser_conn = iser_conn;
+-	iser_conn->ib_conn  = ib_conn;
++	iser_info("binding iscsi conn %p to ib_conn %p\n", conn, ib_conn);
++
++	conn->dd_data = ib_conn;
++	ib_conn->iscsi_conn = conn;
++
+ 	iser_conn_get(ib_conn); /* ref iscsi/ib conn binding */
+ 	return 0;
+ }
+@@ -408,8 +400,7 @@ static void
+ iscsi_iser_conn_stop(struct iscsi_cls_conn *cls_conn, int flag)
+ {
+ 	struct iscsi_conn *conn = cls_conn->dd_data;
+-	struct iscsi_iser_conn *iser_conn = conn->dd_data;
+-	struct iser_conn *ib_conn = iser_conn->ib_conn;
++	struct iser_conn *ib_conn = conn->dd_data;
+ 
+ 	/*
+ 	 * Userspace may have goofed up and not bound the connection or
+@@ -423,7 +414,7 @@ iscsi_iser_conn_stop(struct iscsi_cls_conn *cls_conn, int flag)
+ 		 */
+ 		iser_conn_put(ib_conn, 1); /* deref iscsi/ib conn unbinding */
+ 	}
+-	iser_conn->ib_conn = NULL;
++	conn->dd_data = NULL;
+ }
+ 
+ static void iscsi_iser_session_destroy(struct iscsi_cls_session *cls_session)
+@@ -661,7 +652,7 @@ iscsi_iser_ep_disconnect(struct iscsi_endpoint *ep)
+ 	struct iser_conn *ib_conn;
+ 
+ 	ib_conn = ep->dd_data;
+-	if (ib_conn->iser_conn)
++	if (ib_conn->iscsi_conn)
+ 		/*
+ 		 * Must suspend xmit path if the ep is bound to the
+ 		 * iscsi_conn, so we know we are not accessing the ib_conn
+@@ -669,7 +660,7 @@ iscsi_iser_ep_disconnect(struct iscsi_endpoint *ep)
+ 		 *
+ 		 * This may not be bound if the ep poll failed.
+ 		 */
+-		iscsi_suspend_tx(ib_conn->iser_conn->iscsi_conn);
++		iscsi_suspend_tx(ib_conn->iscsi_conn);
+ 
+ 
+ 	iser_info("ib conn %p state %d\n", ib_conn, ib_conn->state);
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.h b/drivers/infiniband/ulp/iser/iscsi_iser.h
+index 95f291fca178..41fa5e9c1bcc 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@ -214,7 +214,6 @@ struct iser_data_buf {
+ /* fwd declarations */
+ struct iser_device;
+ struct iser_cq_desc;
+-struct iscsi_iser_conn;
+ struct iscsi_iser_task;
+ struct iscsi_endpoint;
+ 
+@@ -319,7 +318,7 @@ struct fast_reg_descriptor {
+ };
+ 
+ struct iser_conn {
+-	struct iscsi_iser_conn       *iser_conn; /* iser conn for upcalls  */
++	struct iscsi_conn	     *iscsi_conn;
+ 	struct iscsi_endpoint	     *ep;
+ 	enum iser_ib_conn_state	     state;	    /* rdma connection state   */
+ 	atomic_t		     refcount;
+@@ -358,14 +357,9 @@ struct iser_conn {
+ 	};
+ };
+ 
+-struct iscsi_iser_conn {
+-	struct iscsi_conn            *iscsi_conn;/* ptr to iscsi conn */
+-	struct iser_conn             *ib_conn;   /* iSER IB conn      */
+-};
+-
+ struct iscsi_iser_task {
+ 	struct iser_tx_desc          desc;
+-	struct iscsi_iser_conn	     *iser_conn;
++	struct iser_conn	     *ib_conn;
+ 	enum iser_task_status 	     status;
+ 	struct scsi_cmnd	     *sc;
+ 	int                          command_sent;  /* set if command  sent  */
+* Unmerged path drivers/infiniband/ulp/iser/iser_initiator.c
+diff --git a/drivers/infiniband/ulp/iser/iser_memory.c b/drivers/infiniband/ulp/iser/iser_memory.c
+index 0995565f5dda..bc3f70e44c95 100644
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@ -49,7 +49,7 @@ static int iser_start_rdma_unaligned_sg(struct iscsi_iser_task *iser_task,
+ 					struct iser_data_buf *data_copy,
+ 					enum iser_data_dir cmd_dir)
+ {
+-	struct ib_device *dev = iser_task->iser_conn->ib_conn->device->ib_device;
++	struct ib_device *dev = iser_task->ib_conn->device->ib_device;
+ 	struct scatterlist *sgl = (struct scatterlist *)data->buf;
+ 	struct scatterlist *sg;
+ 	char *mem = NULL;
+@@ -116,7 +116,7 @@ void iser_finalize_rdma_unaligned_sg(struct iscsi_iser_task *iser_task,
+ 	struct ib_device *dev;
+ 	unsigned long  cmd_data_len;
+ 
+-	dev = iser_task->iser_conn->ib_conn->device->ib_device;
++	dev = iser_task->ib_conn->device->ib_device;
+ 
+ 	ib_dma_unmap_sg(dev, &data_copy->sg_single, 1,
+ 			(cmd_dir == ISER_DIR_OUT) ?
+@@ -322,7 +322,7 @@ int iser_dma_map_task_data(struct iscsi_iser_task *iser_task,
+ 	struct ib_device *dev;
+ 
+ 	iser_task->dir[iser_dir] = 1;
+-	dev = iser_task->iser_conn->ib_conn->device->ib_device;
++	dev = iser_task->ib_conn->device->ib_device;
+ 
+ 	data->dma_nents = ib_dma_map_sg(dev, data->buf, data->size, dma_dir);
+ 	if (data->dma_nents == 0) {
+@@ -337,7 +337,7 @@ void iser_dma_unmap_task_data(struct iscsi_iser_task *iser_task,
+ {
+ 	struct ib_device *dev;
+ 
+-	dev = iser_task->iser_conn->ib_conn->device->ib_device;
++	dev = iser_task->ib_conn->device->ib_device;
+ 	ib_dma_unmap_sg(dev, data->buf, data->size, DMA_FROM_DEVICE);
+ }
+ 
+@@ -348,7 +348,7 @@ static int fall_to_bounce_buf(struct iscsi_iser_task *iser_task,
+ 			      enum iser_data_dir cmd_dir,
+ 			      int aligned_len)
+ {
+-	struct iscsi_conn    *iscsi_conn = iser_task->iser_conn->iscsi_conn;
++	struct iscsi_conn    *iscsi_conn = iser_task->ib_conn->iscsi_conn;
+ 
+ 	iscsi_conn->fmr_unalign_cnt++;
+ 	iser_warn("rdma alignment violation (%d/%d aligned) or FMR not supported\n",
+@@ -377,7 +377,7 @@ static int fall_to_bounce_buf(struct iscsi_iser_task *iser_task,
+ int iser_reg_rdma_mem_fmr(struct iscsi_iser_task *iser_task,
+ 			  enum iser_data_dir cmd_dir)
+ {
+-	struct iser_conn     *ib_conn = iser_task->iser_conn->ib_conn;
++	struct iser_conn     *ib_conn = iser_task->ib_conn;
+ 	struct iser_device   *device = ib_conn->device;
+ 	struct ib_device     *ibdev = device->ib_device;
+ 	struct iser_data_buf *mem = &iser_task->data[cmd_dir];
+@@ -533,7 +533,7 @@ iser_reg_sig_mr(struct iscsi_iser_task *iser_task,
+ 		struct fast_reg_descriptor *desc, struct ib_sge *data_sge,
+ 		struct ib_sge *prot_sge, struct ib_sge *sig_sge)
+ {
+-	struct iser_conn *iser_conn = iser_task->iser_conn->ib_conn;
++	struct iser_conn *ib_conn = iser_task->ib_conn;
+ 	struct iser_pi_context *pi_ctx = desc->pi_ctx;
+ 	struct ib_send_wr sig_wr, inv_wr;
+ 	struct ib_send_wr *bad_wr, *wr = NULL;
+@@ -579,7 +579,7 @@ iser_reg_sig_mr(struct iscsi_iser_task *iser_task,
+ 	else
+ 		wr->next = &sig_wr;
+ 
+-	ret = ib_post_send(iser_conn->qp, wr, &bad_wr);
++	ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+ 	if (ret) {
+ 		iser_err("reg_sig_mr failed, ret:%d\n", ret);
+ 		goto err;
+@@ -609,7 +609,7 @@ static int iser_fast_reg_mr(struct iscsi_iser_task *iser_task,
+ 			    struct ib_sge *sge)
+ {
+ 	struct fast_reg_descriptor *desc = regd_buf->reg.mem_h;
+-	struct iser_conn *ib_conn = iser_task->iser_conn->ib_conn;
++	struct iser_conn *ib_conn = iser_task->ib_conn;
+ 	struct iser_device *device = ib_conn->device;
+ 	struct ib_device *ibdev = device->ib_device;
+ 	struct ib_mr *mr;
+@@ -700,7 +700,7 @@ static int iser_fast_reg_mr(struct iscsi_iser_task *iser_task,
+ int iser_reg_rdma_mem_fastreg(struct iscsi_iser_task *iser_task,
+ 			      enum iser_data_dir cmd_dir)
+ {
+-	struct iser_conn *ib_conn = iser_task->iser_conn->ib_conn;
++	struct iser_conn *ib_conn = iser_task->ib_conn;
+ 	struct iser_device *device = ib_conn->device;
+ 	struct ib_device *ibdev = device->ib_device;
+ 	struct iser_data_buf *mem = &iser_task->data[cmd_dir];
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index 89fadd85a776..b3668a59ca8d 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -745,9 +745,8 @@ static int iser_disconnected_handler(struct rdma_cm_id *cma_id)
+ 	 * terminated asynchronously from the iSCSI layer's perspective.  */
+ 	if (iser_conn_state_comp_exch(ib_conn, ISER_CONN_UP,
+ 					ISER_CONN_TERMINATING)){
+-		if (ib_conn->iser_conn)
+-			iscsi_conn_failure(ib_conn->iser_conn->iscsi_conn,
+-					   ISCSI_ERR_CONN_FAILED);
++		if (ib_conn->iscsi_conn)
++			iscsi_conn_failure(ib_conn->iscsi_conn, ISCSI_ERR_CONN_FAILED);
+ 		else
+ 			iser_err("iscsi_iser connection isn't bound\n");
+ 	}
+@@ -951,7 +950,7 @@ void iser_unreg_mem_fastreg(struct iscsi_iser_task *iser_task,
+ 			    enum iser_data_dir cmd_dir)
+ {
+ 	struct iser_mem_reg *reg = &iser_task->rdma_regd[cmd_dir].reg;
+-	struct iser_conn *ib_conn = iser_task->iser_conn->ib_conn;
++	struct iser_conn *ib_conn = iser_task->ib_conn;
+ 	struct fast_reg_descriptor *desc = reg->mem_h;
+ 
+ 	if (!reg->is_mr)
+@@ -1061,7 +1060,7 @@ static void iser_handle_comp_error(struct iser_tx_desc *desc,
+ 		 * perspective.                                             */
+ 		if (iser_conn_state_comp_exch(ib_conn, ISER_CONN_UP,
+ 		    ISER_CONN_TERMINATING))
+-			iscsi_conn_failure(ib_conn->iser_conn->iscsi_conn,
++			iscsi_conn_failure(ib_conn->iscsi_conn,
+ 					   ISCSI_ERR_CONN_FAILED);
+ 
+ 		/* no more non completed posts to the QP, complete the
