@@ -1,0 +1,1144 @@
+s390/uaccess: rework uaccess code - fix locking issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [s390] uaccess: rework uaccess code - fix locking issues (Hendrik Brueckner) [1099147]
+Rebuild_FUZZ: 95.15%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit 457f2180951cdcbfb4657ddcc83b486e93497f56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/457f2180.failed
+
+The current uaccess code uses a page table walk in some circumstances,
+e.g. in case of the in atomic futex operations or if running on old
+hardware which doesn't support the mvcos instruction.
+
+However it turned out that the page table walk code does not correctly
+lock page tables when accessing page table entries.
+In other words: a different cpu may invalidate a page table entry while
+the current cpu inspects the pte. This may lead to random data corruption.
+
+Adding correct locking however isn't trivial for all uaccess operations.
+Especially copy_in_user() is problematic since that requires to hold at
+least two locks, but must be protected against ABBA deadlock when a
+different cpu also performs a copy_in_user() operation.
+
+So the solution is a different approach where we change address spaces:
+
+User space runs in primary address mode, or access register mode within
+vdso code, like it currently already does.
+
+The kernel usually also runs in home space mode, however when accessing
+user space the kernel switches to primary or secondary address mode if
+the mvcos instruction is not available or if a compare-and-swap (futex)
+instruction on a user space address is performed.
+KVM however is special, since that requires the kernel to run in home
+address space while implicitly accessing user space with the sie
+instruction.
+
+So we end up with:
+
+User space:
+- runs in primary or access register mode
+- cr1 contains the user asce
+- cr7 contains the user asce
+- cr13 contains the kernel asce
+
+Kernel space:
+- runs in home space mode
+- cr1 contains the user or kernel asce
+  -> the kernel asce is loaded when a uaccess requires primary or
+     secondary address mode
+- cr7 contains the user or kernel asce, (changed with set_fs())
+- cr13 contains the kernel asce
+
+In case of uaccess the kernel changes to:
+- primary space mode in case of a uaccess (copy_to_user) and uses
+  e.g. the mvcp instruction to access user space. However the kernel
+  will stay in home space mode if the mvcos instruction is available
+- secondary space mode in case of futex atomic operations, so that the
+  instructions come from primary address space and data from secondary
+  space
+
+In case of kvm the kernel runs in home space mode, but cr1 gets switched
+to contain the gmap asce before the sie instruction gets executed. When
+the sie instruction is finished cr1 will be switched back to contain the
+user asce.
+
+A context switch between two processes will always load the kernel asce
+for the next process in cr1. So the first exit to user space is a bit
+more expensive (one extra load control register instruction) than before,
+however keeps the code rather simple.
+
+In sum this means there is no need to perform any error prone page table
+walks anymore when accessing user space.
+
+The patch seems to be rather large, however it mainly removes the
+the page table walk code and restores the previously deleted "standard"
+uaccess code, with a couple of changes.
+
+The uaccess without mvcos mode can be enforced with the "uaccess_primary"
+kernel parameter.
+
+	Reported-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 457f2180951cdcbfb4657ddcc83b486e93497f56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/futex.h
+#	arch/s390/include/asm/mmu_context.h
+#	arch/s390/include/asm/thread_info.h
+#	arch/s390/include/asm/uaccess.h
+#	arch/s390/lib/Makefile
+#	arch/s390/lib/uaccess.h
+#	arch/s390/lib/uaccess_mvcos.c
+#	arch/s390/lib/uaccess_pt.c
+#	arch/s390/mm/fault.c
+#	arch/s390/mm/pgtable.c
+diff --cc arch/s390/include/asm/futex.h
+index 51bcaa0fdeef,69cf5b5eddc9..000000000000
+--- a/arch/s390/include/asm/futex.h
++++ b/arch/s390/include/asm/futex.h
+@@@ -1,11 -1,27 +1,31 @@@
+  #ifndef _ASM_S390_FUTEX_H
+  #define _ASM_S390_FUTEX_H
+  
+- #include <linux/futex.h>
+  #include <linux/uaccess.h>
++ #include <linux/futex.h>
++ #include <asm/mmu_context.h>
+  #include <asm/errno.h>
+  
+++<<<<<<< HEAD
+ +static inline int futex_atomic_op_inuser (int encoded_op, u32 __user *uaddr)
+++=======
++ #define __futex_atomic_op(insn, ret, oldval, newval, uaddr, oparg)	\
++ 	asm volatile(							\
++ 		"   sacf  256\n"					\
++ 		"0: l     %1,0(%6)\n"					\
++ 		"1:"insn						\
++ 		"2: cs    %1,%2,0(%6)\n"				\
++ 		"3: jl    1b\n"						\
++ 		"   lhi   %0,0\n"					\
++ 		"4: sacf  768\n"					\
++ 		EX_TABLE(0b,4b) EX_TABLE(2b,4b) EX_TABLE(3b,4b)		\
++ 		: "=d" (ret), "=&d" (oldval), "=&d" (newval),		\
++ 		  "=m" (*uaddr)						\
++ 		: "0" (-EFAULT), "d" (oparg), "a" (uaddr),		\
++ 		  "m" (*uaddr) : "cc");
++ 
++ static inline int futex_atomic_op_inuser(int encoded_op, u32 __user *uaddr)
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  {
+  	int op = (encoded_op >> 28) & 7;
+  	int cmp = (encoded_op >> 24) & 15;
+@@@ -17,7 -34,30 +38,34 @@@
+  		oparg = 1 << oparg;
+  
+  	pagefault_disable();
+++<<<<<<< HEAD
+ +	ret = uaccess.futex_atomic_op(op, uaddr, oparg, &oldval);
+++=======
++ 	switch (op) {
++ 	case FUTEX_OP_SET:
++ 		__futex_atomic_op("lr %2,%5\n",
++ 				  ret, oldval, newval, uaddr, oparg);
++ 		break;
++ 	case FUTEX_OP_ADD:
++ 		__futex_atomic_op("lr %2,%1\nar %2,%5\n",
++ 				  ret, oldval, newval, uaddr, oparg);
++ 		break;
++ 	case FUTEX_OP_OR:
++ 		__futex_atomic_op("lr %2,%1\nor %2,%5\n",
++ 				  ret, oldval, newval, uaddr, oparg);
++ 		break;
++ 	case FUTEX_OP_ANDN:
++ 		__futex_atomic_op("lr %2,%1\nnr %2,%5\n",
++ 				  ret, oldval, newval, uaddr, oparg);
++ 		break;
++ 	case FUTEX_OP_XOR:
++ 		__futex_atomic_op("lr %2,%1\nxr %2,%5\n",
++ 				  ret, oldval, newval, uaddr, oparg);
++ 		break;
++ 	default:
++ 		ret = -ENOSYS;
++ 	}
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  	pagefault_enable();
+  
+  	if (!ret) {
+@@@ -37,7 -77,20 +85,24 @@@
+  static inline int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
+  						u32 oldval, u32 newval)
+  {
+++<<<<<<< HEAD
+ +	return uaccess.futex_atomic_cmpxchg(uval, uaddr, oldval, newval);
+++=======
++ 	int ret;
++ 
++ 	update_primary_asce(current);
++ 	asm volatile(
++ 		"   sacf 256\n"
++ 		"0: cs   %1,%4,0(%5)\n"
++ 		"1: la   %0,0\n"
++ 		"2: sacf 768\n"
++ 		EX_TABLE(0b,2b) EX_TABLE(1b,2b)
++ 		: "=d" (ret), "+d" (oldval), "=m" (*uaddr)
++ 		: "0" (-EFAULT), "d" (newval), "a" (uaddr), "m" (*uaddr)
++ 		: "cc", "memory");
++ 	*uval = oldval;
++ 	return ret;
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  }
+  
+  #endif /* _ASM_S390_FUTEX_H */
+diff --cc arch/s390/include/asm/mmu_context.h
+index 4fb67a0e4ddf,71be346d0e3c..000000000000
+--- a/arch/s390/include/asm/mmu_context.h
++++ b/arch/s390/include/asm/mmu_context.h
+@@@ -29,39 -30,81 +29,116 @@@ static inline int init_new_context(stru
+  
+  #define destroy_context(mm)             do { } while (0)
+  
+++<<<<<<< HEAD
+ +#ifndef CONFIG_64BIT
+ +#define LCTL_OPCODE "lctl"
+ +#else
+ +#define LCTL_OPCODE "lctlg"
+ +#endif
+ +
+ +static inline void update_mm(struct mm_struct *mm, struct task_struct *tsk)
+++=======
++ static inline void update_user_asce(struct mm_struct *mm, int load_primary)
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  {
+  	pgd_t *pgd = mm->pgd;
+  
+  	S390_lowcore.user_asce = mm->context.asce_bits | __pa(pgd);
+++<<<<<<< HEAD
+ +	if (s390_user_mode != HOME_SPACE_MODE) {
+ +		/* Load primary space page table origin. */
+ +		asm volatile(LCTL_OPCODE" 1,1,%0\n"
+ +			     : : "m" (S390_lowcore.user_asce) );
+ +	} else
+ +		/* Load home space page table origin. */
+ +		asm volatile(LCTL_OPCODE" 13,13,%0"
+ +			     : : "m" (S390_lowcore.user_asce) );
+ +	set_fs(current->thread.mm_segment);
+ +}
+ +
+ +static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ +			     struct task_struct *tsk)
+ +{
+ +	cpumask_set_cpu(smp_processor_id(), mm_cpumask(next));
+ +	update_mm(next, tsk);
+ +	atomic_dec(&prev->context.attach_count);
+ +	WARN_ON(atomic_read(&prev->context.attach_count) < 0);
+ +	atomic_inc(&next->context.attach_count);
+ +	/* Check for TLBs not flushed yet */
+ +	if (next->context.flush_mm)
+ +		__tlb_flush_mm(next);
+++=======
++ 	if (load_primary)
++ 		__ctl_load(S390_lowcore.user_asce, 1, 1);
++ 	set_fs(current->thread.mm_segment);
++ }
++ 
++ static inline void clear_user_asce(struct mm_struct *mm, int load_primary)
++ {
++ 	S390_lowcore.user_asce = S390_lowcore.kernel_asce;
++ 
++ 	if (load_primary)
++ 		__ctl_load(S390_lowcore.user_asce, 1, 1);
++ 	__ctl_load(S390_lowcore.user_asce, 7, 7);
++ }
++ 
++ static inline void update_primary_asce(struct task_struct *tsk)
++ {
++ 	unsigned long asce;
++ 
++ 	__ctl_store(asce, 1, 1);
++ 	if (asce != S390_lowcore.kernel_asce)
++ 		__ctl_load(S390_lowcore.kernel_asce, 1, 1);
++ 	set_tsk_thread_flag(tsk, TIF_ASCE);
++ }
++ 
++ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
++ 			     struct task_struct *tsk)
++ {
++ 	int cpu = smp_processor_id();
++ 
++ 	update_primary_asce(tsk);
++ 	if (prev == next)
++ 		return;
++ 	if (MACHINE_HAS_TLB_LC)
++ 		cpumask_set_cpu(cpu, &next->context.cpu_attach_mask);
++ 	if (atomic_inc_return(&next->context.attach_count) >> 16) {
++ 		/* Delay update_user_asce until all TLB flushes are done. */
++ 		set_tsk_thread_flag(tsk, TIF_TLB_WAIT);
++ 		/* Clear old ASCE by loading the kernel ASCE. */
++ 		clear_user_asce(next, 0);
++ 	} else {
++ 		cpumask_set_cpu(cpu, mm_cpumask(next));
++ 		update_user_asce(next, 0);
++ 		if (next->context.flush_mm)
++ 			/* Flush pending TLBs */
++ 			__tlb_flush_mm(next);
++ 	}
++ 	atomic_dec(&prev->context.attach_count);
++ 	WARN_ON(atomic_read(&prev->context.attach_count) < 0);
++ 	if (MACHINE_HAS_TLB_LC)
++ 		cpumask_clear_cpu(cpu, &prev->context.cpu_attach_mask);
++ }
++ 
++ #define finish_arch_post_lock_switch finish_arch_post_lock_switch
++ static inline void finish_arch_post_lock_switch(void)
++ {
++ 	struct task_struct *tsk = current;
++ 	struct mm_struct *mm = tsk->mm;
++ 
++ 	if (!test_tsk_thread_flag(tsk, TIF_TLB_WAIT))
++ 		return;
++ 	preempt_disable();
++ 	clear_tsk_thread_flag(tsk, TIF_TLB_WAIT);
++ 	while (atomic_read(&mm->context.attach_count) >> 16)
++ 		cpu_relax();
++ 
++ 	cpumask_set_cpu(smp_processor_id(), mm_cpumask(mm));
++ 	update_user_asce(mm, 0);
++ 	if (mm->context.flush_mm)
++ 		__tlb_flush_mm(mm);
++ 	preempt_enable();
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  }
+  
+  #define enter_lazy_tlb(mm,tsk)	do { } while (0)
+diff --cc arch/s390/include/asm/thread_info.h
+index eb5f64d26d06,50630e6a35de..000000000000
+--- a/arch/s390/include/asm/thread_info.h
++++ b/arch/s390/include/asm/thread_info.h
+@@@ -81,6 -81,8 +81,11 @@@ static inline struct thread_info *curre
+  #define TIF_NOTIFY_RESUME	1	/* callback before returning to user */
+  #define TIF_SIGPENDING		2	/* signal pending */
+  #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+++<<<<<<< HEAD
+++=======
++ #define TIF_TLB_WAIT		4	/* wait for TLB flush completion */
++ #define TIF_ASCE		5	/* primary asce needs fixup / uaccess */
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  #define TIF_PER_TRAP		6	/* deliver sigtrap on return to user */
+  #define TIF_MCCK_PENDING	7	/* machine check handling is pending */
+  #define TIF_SYSCALL_TRACE	8	/* syscall trace active */
+@@@ -96,6 -99,8 +101,11 @@@
+  #define _TIF_NOTIFY_RESUME	(1<<TIF_NOTIFY_RESUME)
+  #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+  #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
+++<<<<<<< HEAD
+++=======
++ #define _TIF_TLB_WAIT		(1<<TIF_TLB_WAIT)
++ #define _TIF_ASCE		(1<<TIF_ASCE)
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  #define _TIF_PER_TRAP		(1<<TIF_PER_TRAP)
+  #define _TIF_MCCK_PENDING	(1<<TIF_MCCK_PENDING)
+  #define _TIF_SYSCALL_TRACE	(1<<TIF_SYSCALL_TRACE)
+diff --cc arch/s390/include/asm/uaccess.h
+index 9c33ed4e666f,1be64a1506d0..000000000000
+--- a/arch/s390/include/asm/uaccess.h
++++ b/arch/s390/include/asm/uaccess.h
+@@@ -92,37 -92,56 +92,59 @@@ static inline unsigned long extable_fix
+  #define ARCH_HAS_SORT_EXTABLE
+  #define ARCH_HAS_SEARCH_EXTABLE
+  
+++<<<<<<< HEAD
+ +struct uaccess_ops {
+ +	size_t (*copy_from_user)(size_t, const void __user *, void *);
+ +	size_t (*copy_from_user_small)(size_t, const void __user *, void *);
+ +	size_t (*copy_to_user)(size_t, void __user *, const void *);
+ +	size_t (*copy_to_user_small)(size_t, void __user *, const void *);
+ +	size_t (*copy_in_user)(size_t, void __user *, const void __user *);
+ +	size_t (*clear_user)(size_t, void __user *);
+ +	size_t (*strnlen_user)(size_t, const char __user *);
+ +	size_t (*strncpy_from_user)(size_t, const char __user *, char *);
+ +	int (*futex_atomic_op)(int op, u32 __user *, int oparg, int *old);
+ +	int (*futex_atomic_cmpxchg)(u32 *, u32 __user *, u32 old, u32 new);
+ +};
+ +
+ +extern struct uaccess_ops uaccess;
+ +extern struct uaccess_ops uaccess_std;
+ +extern struct uaccess_ops uaccess_mvcos;
+ +extern struct uaccess_ops uaccess_mvcos_switch;
+ +extern struct uaccess_ops uaccess_pt;
+++=======
++ /**
++  * __copy_from_user: - Copy a block of data from user space, with less checking.
++  * @to:   Destination address, in kernel space.
++  * @from: Source address, in user space.
++  * @n:	  Number of bytes to copy.
++  *
++  * Context: User context only.	This function may sleep.
++  *
++  * Copy data from user space to kernel space.  Caller must check
++  * the specified block with access_ok() before calling this function.
++  *
++  * Returns number of bytes that could not be copied.
++  * On success, this will be zero.
++  *
++  * If some data could not be copied, this function will pad the copied
++  * data to the requested size using zero bytes.
++  */
++ unsigned long __must_check __copy_from_user(void *to, const void __user *from,
++ 					    unsigned long n);
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  
+ -/**
+ - * __copy_to_user: - Copy a block of data into user space, with less checking.
+ - * @to:   Destination address, in user space.
+ - * @from: Source address, in kernel space.
+ - * @n:	  Number of bytes to copy.
+ - *
+ - * Context: User context only.	This function may sleep.
+ - *
+ - * Copy data from kernel space to user space.  Caller must check
+ - * the specified block with access_ok() before calling this function.
+ - *
+ - * Returns number of bytes that could not be copied.
+ - * On success, this will be zero.
+ - */
+ -unsigned long __must_check __copy_to_user(void __user *to, const void *from,
+ -					  unsigned long n);
+ -
+ -#define __copy_to_user_inatomic __copy_to_user
+ -#define __copy_from_user_inatomic __copy_from_user
+ +extern int __handle_fault(unsigned long, unsigned long, int);
+  
+ -static inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
+ +static inline int __put_user_fn(size_t size, void __user *ptr, void *x)
+  {
+ -	size = __copy_to_user(ptr, x, size);
+ -	return size ? -EFAULT : 0;
+ +	size = uaccess.copy_to_user_small(size, ptr, x);
+ +	return size ? -EFAULT : size;
+  }
+  
+ -static inline int __get_user_fn(void *x, const void __user *ptr, unsigned long size)
+ +static inline int __get_user_fn(size_t size, const void __user *ptr, void *x)
+  {
+ -	size = __copy_from_user(x, ptr, size);
+ -	return size ? -EFAULT : 0;
+ +	size = uaccess.copy_from_user_small(size, ptr, x);
+ +	return size ? -EFAULT : size;
+  }
+  
+  /*
+diff --cc arch/s390/lib/Makefile
+index 20b0e97a7df2,c6d752e8bf28..000000000000
+--- a/arch/s390/lib/Makefile
++++ b/arch/s390/lib/Makefile
+@@@ -2,8 -2,7 +2,12 @@@
+  # Makefile for s390-specific library files..
+  #
+  
+++<<<<<<< HEAD
+ +lib-y += delay.o string.o uaccess_std.o uaccess_pt.o
+++=======
++ lib-y += delay.o string.o uaccess.o find.o
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  obj-$(CONFIG_32BIT) += div64.o qrnnd.o ucmpdi2.o mem32.o
+  obj-$(CONFIG_64BIT) += mem64.o
+ +lib-$(CONFIG_64BIT) += uaccess_mvcos.o
+  lib-$(CONFIG_SMP) += spinlock.o
+diff --cc arch/s390/mm/fault.c
+index de0adedcdf2d,f93e6c2d4ba5..000000000000
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@@ -111,20 -113,16 +113,29 @@@ static inline int user_space_fault(stru
+  	 * The lowest two bits of the translation exception
+  	 * identification indicate which paging table was used.
+  	 */
+- 	trans_exc_code &= 3;
+- 	if (trans_exc_code == 2)
+- 		/* Access via secondary space, set_fs setting decides */
++ 	trans_exc_code = regs->int_parm_long & 3;
++ 	if (trans_exc_code == 3) /* home space -> kernel */
++ 		return 0;
++ 	if (user_mode(regs))
++ 		return 1;
++ 	if (trans_exc_code == 2) /* secondary space -> set_fs */
+  		return current->thread.mm_segment.ar4;
+++<<<<<<< HEAD
+ +	if (s390_user_mode == HOME_SPACE_MODE)
+ +		/* User space if the access has been done via home space. */
+ +		return trans_exc_code == 3;
+ +	/*
+ +	 * If the user space is not the home space the kernel runs in home
+ +	 * space. Access via secondary space has already been covered,
+ +	 * access via primary space or access register is from user space
+ +	 * and access via home space is from the kernel.
+ +	 */
+ +	return trans_exc_code != 3;
+++=======
++ 	if (current->flags & PF_VCPU)
++ 		return 1;
++ 	return 0;
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  }
+  
+  static inline void report_user_fault(struct pt_regs *regs, long signr)
+@@@ -426,30 -426,6 +437,33 @@@ void __kprobes do_dat_exception(struct 
+  		do_fault_error(regs, fault);
+  }
+  
+++<<<<<<< HEAD
+ +int __handle_fault(unsigned long uaddr, unsigned long pgm_int_code, int write)
+ +{
+ +	struct pt_regs regs;
+ +	int access, fault;
+ +
+ +	/* Emulate a uaccess fault from kernel mode. */
+ +	regs.psw.mask = psw_kernel_bits | PSW_MASK_DAT | PSW_MASK_MCHECK;
+ +	if (!irqs_disabled())
+ +		regs.psw.mask |= PSW_MASK_IO | PSW_MASK_EXT;
+ +	regs.psw.addr = (unsigned long) __builtin_return_address(0);
+ +	regs.psw.addr |= PSW_ADDR_AMODE;
+ +	regs.int_code = pgm_int_code;
+ +	regs.int_parm_long = (uaddr & PAGE_MASK) | 2;
+ +	access = write ? VM_WRITE : VM_READ;
+ +	fault = do_exception(&regs, access);
+ +	/*
+ +	 * Since the fault happened in kernel mode while performing a uaccess
+ +	 * all we need to do now is emulating a fixup in case "fault" is not
+ +	 * zero.
+ +	 * For the calling uaccess functions this results always in -EFAULT.
+ +	 */
+ +	return fault ? -EFAULT : 0;
+ +}
+ +
+++=======
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  #ifdef CONFIG_PFAULT 
+  /*
+   * 'pfault' pseudo page faults routines.
+diff --cc arch/s390/mm/pgtable.c
+index a5d23aa7eac7,b5745dc9c6b5..000000000000
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@@ -53,7 -54,7 +53,11 @@@ static void __crst_table_upgrade(void *
+  	struct mm_struct *mm = arg;
+  
+  	if (current->active_mm == mm)
+++<<<<<<< HEAD
+ +		update_mm(mm, current);
+++=======
++ 		update_user_asce(mm, 1);
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  	__tlb_flush_local();
+  }
+  
+@@@ -106,8 -107,10 +110,13 @@@ void crst_table_downgrade(struct mm_str
+  {
+  	pgd_t *pgd;
+  
+++<<<<<<< HEAD
+ +	if (current->active_mm == mm)
+++=======
++ 	if (current->active_mm == mm) {
++ 		clear_user_asce(mm, 1);
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  		__tlb_flush_mm(mm);
+ -	}
+  	while (mm->context.asce_limit > limit) {
+  		pgd = mm->pgd;
+  		switch (pgd_val(*pgd) & _REGION_ENTRY_TYPE_MASK) {
+@@@ -131,7 -134,7 +140,11 @@@
+  		crst_table_free(mm, (unsigned long *) pgd);
+  	}
+  	if (current->active_mm == mm)
+++<<<<<<< HEAD
+ +		update_mm(mm, current);
+++=======
++ 		update_user_asce(mm, 1);
+++>>>>>>> 457f2180951c (s390/uaccess: rework uaccess code - fix locking issues)
+  }
+  #endif
+  
+* Unmerged path arch/s390/lib/uaccess.h
+* Unmerged path arch/s390/lib/uaccess_mvcos.c
+* Unmerged path arch/s390/lib/uaccess_pt.c
+* Unmerged path arch/s390/include/asm/futex.h
+* Unmerged path arch/s390/include/asm/mmu_context.h
+diff --git a/arch/s390/include/asm/switch_to.h b/arch/s390/include/asm/switch_to.h
+index e954d6305272..b6d9247bf9b3 100644
+--- a/arch/s390/include/asm/switch_to.h
++++ b/arch/s390/include/asm/switch_to.h
+@@ -127,6 +127,7 @@ static inline void restore_access_regs(unsigned int *acrs)
+ 		update_per_regs(next);					\
+ 	}								\
+ 	prev = __switch_to(prev,next);					\
++	update_primary_asce(current);					\
+ } while (0)
+ 
+ #define finish_arch_switch(prev) do {					     \
+* Unmerged path arch/s390/include/asm/thread_info.h
+* Unmerged path arch/s390/include/asm/uaccess.h
+diff --git a/arch/s390/kernel/asm-offsets.c b/arch/s390/kernel/asm-offsets.c
+index 6dba9929b54e..809fed72a8da 100644
+--- a/arch/s390/kernel/asm-offsets.c
++++ b/arch/s390/kernel/asm-offsets.c
+@@ -135,6 +135,7 @@ int main(void)
+ 	DEFINE(__LC_RESTART_FN, offsetof(struct _lowcore, restart_fn));
+ 	DEFINE(__LC_RESTART_DATA, offsetof(struct _lowcore, restart_data));
+ 	DEFINE(__LC_RESTART_SOURCE, offsetof(struct _lowcore, restart_source));
++	DEFINE(__LC_KERNEL_ASCE, offsetof(struct _lowcore, kernel_asce));
+ 	DEFINE(__LC_USER_ASCE, offsetof(struct _lowcore, user_asce));
+ 	DEFINE(__LC_INT_CLOCK, offsetof(struct _lowcore, int_clock));
+ 	DEFINE(__LC_MCCK_CLOCK, offsetof(struct _lowcore, mcck_clock));
+diff --git a/arch/s390/kernel/entry.S b/arch/s390/kernel/entry.S
+index cf3ffada0592..9fd2c1f12630 100644
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@ -37,9 +37,9 @@ __PT_R14     =	__PT_GPRS + 56
+ __PT_R15     =	__PT_GPRS + 60
+ 
+ _TIF_WORK_SVC = (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED | \
+-		 _TIF_MCCK_PENDING | _TIF_PER_TRAP )
++		 _TIF_MCCK_PENDING | _TIF_PER_TRAP | _TIF_ASCE)
+ _TIF_WORK_INT = (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED | \
+-		 _TIF_MCCK_PENDING)
++		 _TIF_MCCK_PENDING | _TIF_ASCE)
+ _TIF_TRACE    = (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | _TIF_SECCOMP | \
+ 		 _TIF_SYSCALL_TRACEPOINT)
+ 
+@@ -237,6 +237,8 @@ sysc_work:
+ 	jo	sysc_sigpending
+ 	tm	__TI_flags+3(%r12),_TIF_NOTIFY_RESUME
+ 	jo	sysc_notify_resume
++	tm	__TI_flags+3(%r12),_TIF_ASCE
++	jo	sysc_uaccess
+ 	j	sysc_return		# beware of critical section cleanup
+ 
+ #
+@@ -255,6 +257,14 @@ sysc_mcck_pending:
+ 	la	%r14,BASED(sysc_return)
+ 	br	%r1			# TIF bit will be cleared by handler
+ 
++#
++# _TIF_ASCE is set, load user space asce
++#
++sysc_uaccess:
++	ni	__TI_flags+3(%r12),255-_TIF_ASCE
++	lctl	%c1,%c1,__LC_USER_ASCE	# load primary asce
++	j	sysc_return
++
+ #
+ # _TIF_SIGPENDING is set, call do_signal
+ #
+@@ -505,6 +515,8 @@ io_work_tif:
+ 	jo	io_sigpending
+ 	tm	__TI_flags+3(%r12),_TIF_NOTIFY_RESUME
+ 	jo	io_notify_resume
++	tm	__TI_flags+3(%r12),_TIF_ASCE
++	jo	io_uaccess
+ 	j	io_return		# beware of critical section cleanup
+ 
+ #
+@@ -517,6 +529,14 @@ io_mcck_pending:
+ 	TRACE_IRQS_OFF
+ 	j	io_return
+ 
++#
++# _TIF_ASCE is set, load user space asce
++#
++io_uaccess:
++	ni	__TI_flags+3(%r12),255-_TIF_ASCE
++	lctl	%c1,%c1,__LC_USER_ASCE	# load primary asce
++	j	io_return
++
+ #
+ # _TIF_NEED_RESCHED is set, call schedule
+ #
+diff --git a/arch/s390/kernel/entry64.S b/arch/s390/kernel/entry64.S
+index 07761cf6a0c3..121622ef2f09 100644
+--- a/arch/s390/kernel/entry64.S
++++ b/arch/s390/kernel/entry64.S
+@@ -42,9 +42,9 @@ STACK_SIZE  = 1 << STACK_SHIFT
+ STACK_INIT = STACK_SIZE - STACK_FRAME_OVERHEAD - __PT_SIZE
+ 
+ _TIF_WORK_SVC = (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED | \
+-		 _TIF_MCCK_PENDING | _TIF_PER_TRAP )
++		 _TIF_MCCK_PENDING | _TIF_PER_TRAP | _TIF_ASCE)
+ _TIF_WORK_INT = (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED | \
+-		 _TIF_MCCK_PENDING)
++		 _TIF_MCCK_PENDING | _TIF_ASCE)
+ _TIF_TRACE    = (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | _TIF_SECCOMP | \
+ 		 _TIF_SYSCALL_TRACEPOINT)
+ 
+@@ -271,6 +271,8 @@ sysc_work:
+ 	jo	sysc_sigpending
+ 	tm	__TI_flags+7(%r12),_TIF_NOTIFY_RESUME
+ 	jo	sysc_notify_resume
++	tm	__TI_flags+7(%r12),_TIF_ASCE
++	jo	sysc_uaccess
+ 	j	sysc_return		# beware of critical section cleanup
+ 
+ #
+@@ -287,6 +289,14 @@ sysc_mcck_pending:
+ 	larl	%r14,sysc_return
+ 	jg	s390_handle_mcck	# TIF bit will be cleared by handler
+ 
++#
++# _TIF_ASCE is set, load user space asce
++#
++sysc_uaccess:
++	ni	__TI_flags+7(%r12),255-_TIF_ASCE
++	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
++	j	sysc_return
++
+ #
+ # _TIF_SIGPENDING is set, call do_signal
+ #
+@@ -542,6 +552,8 @@ io_work_tif:
+ 	jo	io_sigpending
+ 	tm	__TI_flags+7(%r12),_TIF_NOTIFY_RESUME
+ 	jo	io_notify_resume
++	tm	__TI_flags+7(%r12),_TIF_ASCE
++	jo	io_uaccess
+ 	j	io_return		# beware of critical section cleanup
+ 
+ #
+@@ -553,6 +565,14 @@ io_mcck_pending:
+ 	TRACE_IRQS_OFF
+ 	j	io_return
+ 
++#
++# _TIF_ASCE is set, load user space asce
++#
++io_uaccess:
++	ni	__TI_flags+7(%r12),255-_TIF_ASCE
++	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
++	j	io_return
++
+ #
+ # _TIF_NEED_RESCHED is set, call schedule
+ #
+* Unmerged path arch/s390/lib/Makefile
+diff --git a/arch/s390/lib/uaccess.c b/arch/s390/lib/uaccess.c
+new file mode 100644
+index 000000000000..23f866b4c7f1
+--- /dev/null
++++ b/arch/s390/lib/uaccess.c
+@@ -0,0 +1,407 @@
++/*
++ *  Standard user space access functions based on mvcp/mvcs and doing
++ *  interesting things in the secondary space mode.
++ *
++ *    Copyright IBM Corp. 2006,2014
++ *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
++ *		 Gerald Schaefer (gerald.schaefer@de.ibm.com)
++ */
++
++#include <linux/jump_label.h>
++#include <linux/uaccess.h>
++#include <linux/export.h>
++#include <linux/errno.h>
++#include <linux/mm.h>
++#include <asm/mmu_context.h>
++#include <asm/facility.h>
++
++#ifndef CONFIG_64BIT
++#define AHI	"ahi"
++#define ALR	"alr"
++#define CLR	"clr"
++#define LHI	"lhi"
++#define SLR	"slr"
++#else
++#define AHI	"aghi"
++#define ALR	"algr"
++#define CLR	"clgr"
++#define LHI	"lghi"
++#define SLR	"slgr"
++#endif
++
++static struct static_key have_mvcos = STATIC_KEY_INIT_FALSE;
++
++static inline unsigned long copy_from_user_mvcos(void *x, const void __user *ptr,
++						 unsigned long size)
++{
++	register unsigned long reg0 asm("0") = 0x81UL;
++	unsigned long tmp1, tmp2;
++
++	tmp1 = -4096UL;
++	asm volatile(
++		"0: .insn ss,0xc80000000000,0(%0,%2),0(%1),0\n"
++		"9: jz    7f\n"
++		"1:"ALR"  %0,%3\n"
++		"  "SLR"  %1,%3\n"
++		"  "SLR"  %2,%3\n"
++		"   j     0b\n"
++		"2: la    %4,4095(%1)\n"/* %4 = ptr + 4095 */
++		"   nr    %4,%3\n"	/* %4 = (ptr + 4095) & -4096 */
++		"  "SLR"  %4,%1\n"
++		"  "CLR"  %0,%4\n"	/* copy crosses next page boundary? */
++		"   jnh   4f\n"
++		"3: .insn ss,0xc80000000000,0(%4,%2),0(%1),0\n"
++		"10:"SLR"  %0,%4\n"
++		"  "ALR"  %2,%4\n"
++		"4:"LHI"  %4,-1\n"
++		"  "ALR"  %4,%0\n"	/* copy remaining size, subtract 1 */
++		"   bras  %3,6f\n"	/* memset loop */
++		"   xc    0(1,%2),0(%2)\n"
++		"5: xc    0(256,%2),0(%2)\n"
++		"   la    %2,256(%2)\n"
++		"6:"AHI"  %4,-256\n"
++		"   jnm   5b\n"
++		"   ex    %4,0(%3)\n"
++		"   j     8f\n"
++		"7:"SLR"  %0,%0\n"
++		"8:\n"
++		EX_TABLE(0b,2b) EX_TABLE(3b,4b) EX_TABLE(9b,2b) EX_TABLE(10b,4b)
++		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
++		: "d" (reg0) : "cc", "memory");
++	return size;
++}
++
++static inline unsigned long copy_from_user_mvcp(void *x, const void __user *ptr,
++						unsigned long size)
++{
++	unsigned long tmp1, tmp2;
++
++	update_primary_asce(current);
++	tmp1 = -256UL;
++	asm volatile(
++		"   sacf  0\n"
++		"0: mvcp  0(%0,%2),0(%1),%3\n"
++		"10:jz    8f\n"
++		"1:"ALR"  %0,%3\n"
++		"   la    %1,256(%1)\n"
++		"   la    %2,256(%2)\n"
++		"2: mvcp  0(%0,%2),0(%1),%3\n"
++		"11:jnz   1b\n"
++		"   j     8f\n"
++		"3: la    %4,255(%1)\n"	/* %4 = ptr + 255 */
++		"  "LHI"  %3,-4096\n"
++		"   nr    %4,%3\n"	/* %4 = (ptr + 255) & -4096 */
++		"  "SLR"  %4,%1\n"
++		"  "CLR"  %0,%4\n"	/* copy crosses next page boundary? */
++		"   jnh   5f\n"
++		"4: mvcp  0(%4,%2),0(%1),%3\n"
++		"12:"SLR"  %0,%4\n"
++		"  "ALR"  %2,%4\n"
++		"5:"LHI"  %4,-1\n"
++		"  "ALR"  %4,%0\n"	/* copy remaining size, subtract 1 */
++		"   bras  %3,7f\n"	/* memset loop */
++		"   xc    0(1,%2),0(%2)\n"
++		"6: xc    0(256,%2),0(%2)\n"
++		"   la    %2,256(%2)\n"
++		"7:"AHI"  %4,-256\n"
++		"   jnm   6b\n"
++		"   ex    %4,0(%3)\n"
++		"   j     9f\n"
++		"8:"SLR"  %0,%0\n"
++		"9: sacf  768\n"
++		EX_TABLE(0b,3b) EX_TABLE(2b,3b) EX_TABLE(4b,5b)
++		EX_TABLE(10b,3b) EX_TABLE(11b,3b) EX_TABLE(12b,5b)
++		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
++		: : "cc", "memory");
++	return size;
++}
++
++unsigned long __copy_from_user(void *to, const void __user *from, unsigned long n)
++{
++	if (static_key_false(&have_mvcos))
++		return copy_from_user_mvcos(to, from, n);
++	return copy_from_user_mvcp(to, from, n);
++}
++EXPORT_SYMBOL(__copy_from_user);
++
++static inline unsigned long copy_to_user_mvcos(void __user *ptr, const void *x,
++					       unsigned long size)
++{
++	register unsigned long reg0 asm("0") = 0x810000UL;
++	unsigned long tmp1, tmp2;
++
++	tmp1 = -4096UL;
++	asm volatile(
++		"0: .insn ss,0xc80000000000,0(%0,%1),0(%2),0\n"
++		"6: jz    4f\n"
++		"1:"ALR"  %0,%3\n"
++		"  "SLR"  %1,%3\n"
++		"  "SLR"  %2,%3\n"
++		"   j     0b\n"
++		"2: la    %4,4095(%1)\n"/* %4 = ptr + 4095 */
++		"   nr    %4,%3\n"	/* %4 = (ptr + 4095) & -4096 */
++		"  "SLR"  %4,%1\n"
++		"  "CLR"  %0,%4\n"	/* copy crosses next page boundary? */
++		"   jnh   5f\n"
++		"3: .insn ss,0xc80000000000,0(%4,%1),0(%2),0\n"
++		"7:"SLR"  %0,%4\n"
++		"   j     5f\n"
++		"4:"SLR"  %0,%0\n"
++		"5:\n"
++		EX_TABLE(0b,2b) EX_TABLE(3b,5b) EX_TABLE(6b,2b) EX_TABLE(7b,5b)
++		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
++		: "d" (reg0) : "cc", "memory");
++	return size;
++}
++
++static inline unsigned long copy_to_user_mvcs(void __user *ptr, const void *x,
++					      unsigned long size)
++{
++	unsigned long tmp1, tmp2;
++
++	update_primary_asce(current);
++	tmp1 = -256UL;
++	asm volatile(
++		"   sacf  0\n"
++		"0: mvcs  0(%0,%1),0(%2),%3\n"
++		"7: jz    5f\n"
++		"1:"ALR"  %0,%3\n"
++		"   la    %1,256(%1)\n"
++		"   la    %2,256(%2)\n"
++		"2: mvcs  0(%0,%1),0(%2),%3\n"
++		"8: jnz   1b\n"
++		"   j     5f\n"
++		"3: la    %4,255(%1)\n" /* %4 = ptr + 255 */
++		"  "LHI"  %3,-4096\n"
++		"   nr    %4,%3\n"	/* %4 = (ptr + 255) & -4096 */
++		"  "SLR"  %4,%1\n"
++		"  "CLR"  %0,%4\n"	/* copy crosses next page boundary? */
++		"   jnh   6f\n"
++		"4: mvcs  0(%4,%1),0(%2),%3\n"
++		"9:"SLR"  %0,%4\n"
++		"   j     6f\n"
++		"5:"SLR"  %0,%0\n"
++		"6: sacf  768\n"
++		EX_TABLE(0b,3b) EX_TABLE(2b,3b) EX_TABLE(4b,6b)
++		EX_TABLE(7b,3b) EX_TABLE(8b,3b) EX_TABLE(9b,6b)
++		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
++		: : "cc", "memory");
++	return size;
++}
++
++unsigned long __copy_to_user(void __user *to, const void *from, unsigned long n)
++{
++	if (static_key_false(&have_mvcos))
++		return copy_to_user_mvcos(to, from, n);
++	return copy_to_user_mvcs(to, from, n);
++}
++EXPORT_SYMBOL(__copy_to_user);
++
++static inline unsigned long copy_in_user_mvcos(void __user *to, const void __user *from,
++					       unsigned long size)
++{
++	register unsigned long reg0 asm("0") = 0x810081UL;
++	unsigned long tmp1, tmp2;
++
++	tmp1 = -4096UL;
++	/* FIXME: copy with reduced length. */
++	asm volatile(
++		"0: .insn ss,0xc80000000000,0(%0,%1),0(%2),0\n"
++		"   jz	  2f\n"
++		"1:"ALR"  %0,%3\n"
++		"  "SLR"  %1,%3\n"
++		"  "SLR"  %2,%3\n"
++		"   j	  0b\n"
++		"2:"SLR"  %0,%0\n"
++		"3: \n"
++		EX_TABLE(0b,3b)
++		: "+a" (size), "+a" (to), "+a" (from), "+a" (tmp1), "=a" (tmp2)
++		: "d" (reg0) : "cc", "memory");
++	return size;
++}
++
++static inline unsigned long copy_in_user_mvc(void __user *to, const void __user *from,
++					     unsigned long size)
++{
++	unsigned long tmp1;
++
++	update_primary_asce(current);
++	asm volatile(
++		"   sacf  256\n"
++		"  "AHI"  %0,-1\n"
++		"   jo	  5f\n"
++		"   bras  %3,3f\n"
++		"0:"AHI"  %0,257\n"
++		"1: mvc	  0(1,%1),0(%2)\n"
++		"   la	  %1,1(%1)\n"
++		"   la	  %2,1(%2)\n"
++		"  "AHI"  %0,-1\n"
++		"   jnz	  1b\n"
++		"   j	  5f\n"
++		"2: mvc	  0(256,%1),0(%2)\n"
++		"   la	  %1,256(%1)\n"
++		"   la	  %2,256(%2)\n"
++		"3:"AHI"  %0,-256\n"
++		"   jnm	  2b\n"
++		"4: ex	  %0,1b-0b(%3)\n"
++		"5: "SLR"  %0,%0\n"
++		"6: sacf  768\n"
++		EX_TABLE(1b,6b) EX_TABLE(2b,0b) EX_TABLE(4b,0b)
++		: "+a" (size), "+a" (to), "+a" (from), "=a" (tmp1)
++		: : "cc", "memory");
++	return size;
++}
++
++unsigned long __copy_in_user(void __user *to, const void __user *from, unsigned long n)
++{
++	if (static_key_false(&have_mvcos))
++		return copy_in_user_mvcos(to, from, n);
++	return copy_in_user_mvc(to, from, n);
++}
++EXPORT_SYMBOL(__copy_in_user);
++
++static inline unsigned long clear_user_mvcos(void __user *to, unsigned long size)
++{
++	register unsigned long reg0 asm("0") = 0x810000UL;
++	unsigned long tmp1, tmp2;
++
++	tmp1 = -4096UL;
++	asm volatile(
++		"0: .insn ss,0xc80000000000,0(%0,%1),0(%4),0\n"
++		"   jz	  4f\n"
++		"1:"ALR"  %0,%2\n"
++		"  "SLR"  %1,%2\n"
++		"   j	  0b\n"
++		"2: la	  %3,4095(%1)\n"/* %4 = to + 4095 */
++		"   nr	  %3,%2\n"	/* %4 = (to + 4095) & -4096 */
++		"  "SLR"  %3,%1\n"
++		"  "CLR"  %0,%3\n"	/* copy crosses next page boundary? */
++		"   jnh	  5f\n"
++		"3: .insn ss,0xc80000000000,0(%3,%1),0(%4),0\n"
++		"  "SLR"  %0,%3\n"
++		"   j	  5f\n"
++		"4:"SLR"  %0,%0\n"
++		"5:\n"
++		EX_TABLE(0b,2b) EX_TABLE(3b,5b)
++		: "+a" (size), "+a" (to), "+a" (tmp1), "=a" (tmp2)
++		: "a" (empty_zero_page), "d" (reg0) : "cc", "memory");
++	return size;
++}
++
++static inline unsigned long clear_user_xc(void __user *to, unsigned long size)
++{
++	unsigned long tmp1, tmp2;
++
++	update_primary_asce(current);
++	asm volatile(
++		"   sacf  256\n"
++		"  "AHI"  %0,-1\n"
++		"   jo    5f\n"
++		"   bras  %3,3f\n"
++		"   xc    0(1,%1),0(%1)\n"
++		"0:"AHI"  %0,257\n"
++		"   la    %2,255(%1)\n" /* %2 = ptr + 255 */
++		"   srl   %2,12\n"
++		"   sll   %2,12\n"	/* %2 = (ptr + 255) & -4096 */
++		"  "SLR"  %2,%1\n"
++		"  "CLR"  %0,%2\n"	/* clear crosses next page boundary? */
++		"   jnh   5f\n"
++		"  "AHI"  %2,-1\n"
++		"1: ex    %2,0(%3)\n"
++		"  "AHI"  %2,1\n"
++		"  "SLR"  %0,%2\n"
++		"   j     5f\n"
++		"2: xc    0(256,%1),0(%1)\n"
++		"   la    %1,256(%1)\n"
++		"3:"AHI"  %0,-256\n"
++		"   jnm   2b\n"
++		"4: ex    %0,0(%3)\n"
++		"5: "SLR"  %0,%0\n"
++		"6: sacf  768\n"
++		EX_TABLE(1b,6b) EX_TABLE(2b,0b) EX_TABLE(4b,0b)
++		: "+a" (size), "+a" (to), "=a" (tmp1), "=a" (tmp2)
++		: : "cc", "memory");
++	return size;
++}
++
++unsigned long __clear_user(void __user *to, unsigned long size)
++{
++	if (static_key_false(&have_mvcos))
++			return clear_user_mvcos(to, size);
++	return clear_user_xc(to, size);
++}
++EXPORT_SYMBOL(__clear_user);
++
++static inline unsigned long strnlen_user_srst(const char __user *src,
++					      unsigned long size)
++{
++	register unsigned long reg0 asm("0") = 0;
++	unsigned long tmp1, tmp2;
++
++	if (unlikely(!size))
++		return 0;
++	update_primary_asce(current);
++	asm volatile(
++		"   la    %2,0(%1)\n"
++		"   la    %3,0(%0,%1)\n"
++		"  "SLR"  %0,%0\n"
++		"   sacf  256\n"
++		"0: srst  %3,%2\n"
++		"   jo    0b\n"
++		"   la    %0,1(%3)\n"	/* strnlen_user results includes \0 */
++		"  "SLR"  %0,%1\n"
++		"1: sacf  768\n"
++		EX_TABLE(0b,1b)
++		: "+a" (size), "+a" (src), "=a" (tmp1), "=a" (tmp2)
++		: "d" (reg0) : "cc", "memory");
++	return size;
++}
++
++unsigned long __strnlen_user(const char __user *src, unsigned long size)
++{
++	update_primary_asce(current);
++	return strnlen_user_srst(src, size);
++}
++EXPORT_SYMBOL(__strnlen_user);
++
++long __strncpy_from_user(char *dst, const char __user *src, long size)
++{
++	size_t done, len, offset, len_str;
++
++	if (unlikely(size <= 0))
++		return 0;
++	done = 0;
++	do {
++		offset = (size_t)src & ~PAGE_MASK;
++		len = min(size - done, PAGE_SIZE - offset);
++		if (copy_from_user(dst, src, len))
++			return -EFAULT;
++		len_str = strnlen(dst, len);
++		done += len_str;
++		src += len_str;
++		dst += len_str;
++	} while ((len_str == len) && (done < size));
++	return done;
++}
++EXPORT_SYMBOL(__strncpy_from_user);
++
++/*
++ * The "old" uaccess variant without mvcos can be enforced with the
++ * uaccess_primary kernel parameter. This is mainly for debugging purposes.
++ */
++static int uaccess_primary __initdata;
++
++static int __init parse_uaccess_pt(char *__unused)
++{
++	uaccess_primary = 1;
++	return 0;
++}
++early_param("uaccess_primary", parse_uaccess_pt);
++
++static int __init uaccess_init(void)
++{
++	if (IS_ENABLED(CONFIG_64BIT) && !uaccess_primary && test_facility(27))
++		static_key_slow_inc(&have_mvcos);
++	return 0;
++}
++early_initcall(uaccess_init);
+* Unmerged path arch/s390/lib/uaccess.h
+* Unmerged path arch/s390/lib/uaccess_mvcos.c
+* Unmerged path arch/s390/lib/uaccess_pt.c
+* Unmerged path arch/s390/mm/fault.c
+* Unmerged path arch/s390/mm/pgtable.c
