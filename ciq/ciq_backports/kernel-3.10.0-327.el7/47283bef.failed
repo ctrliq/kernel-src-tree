@@ -1,0 +1,199 @@
+vhost: move memory pointer to VQs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [vhost] move memory pointer to VQs (Igor Mammedov) [1152962]
+Rebuild_FUZZ: 88.14%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 47283bef7ed356629467d1fac61687756e48f254
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/47283bef.failed
+
+commit 2ae76693b8bcabf370b981cd00c36cd41d33fabc
+    vhost: replace rcu with mutex
+replaced rcu sync for memory accesses with VQ mutex locl/unlock.
+This is correct since all accesses are under VQ mutex, but incomplete:
+we still do useless rcu lock/unlock operations, someone might copy this
+code into some other context where this won't be right.
+This use of RCU is also non standard and hard to understand.
+Let's copy the pointer to each VQ structure, this way
+the access rules become straight-forward, and there's
+no need for RCU anymore.
+
+	Reported-by: Eric Dumazet <eric.dumazet@gmail.com>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 47283bef7ed356629467d1fac61687756e48f254)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vhost.c
+diff --cc drivers/vhost/vhost.c
+index 0c277fb230c6,c90f4374442a..000000000000
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@@ -405,8 -422,14 +407,13 @@@ void vhost_dev_reset_owner(struct vhost
+  
+  	/* Restore memory to default empty mapping. */
+  	memory->nregions = 0;
+- 	RCU_INIT_POINTER(dev->memory, memory);
++ 	dev->memory = memory;
++ 	/* We don't need VQ locks below since vhost_dev_cleanup makes sure
++ 	 * VQs aren't running.
++ 	 */
++ 	for (i = 0; i < dev->nvqs; ++i)
++ 		dev->vqs[i]->memory = memory;
+  }
+ -EXPORT_SYMBOL_GPL(vhost_dev_reset_owner);
+  
+  void vhost_dev_stop(struct vhost_dev *dev)
+  {
+@@@ -540,12 -563,9 +545,8 @@@ static int vq_access_ok(struct vhost_vi
+  /* Caller should have device mutex but not vq mutex */
+  int vhost_log_access_ok(struct vhost_dev *dev)
+  {
+- 	struct vhost_memory *mp;
+- 
+- 	mp = rcu_dereference_protected(dev->memory,
+- 				       lockdep_is_held(&dev->mutex));
+- 	return memory_access_ok(dev, mp, 1);
++ 	return memory_access_ok(dev, dev->memory, 1);
+  }
+ -EXPORT_SYMBOL_GPL(vhost_log_access_ok);
+  
+  /* Verify access for write logging. */
+  /* Caller should have vq mutex and device mutex */
+@@@ -598,10 -617,15 +596,22 @@@ static long vhost_set_memory(struct vho
+  		kfree(newmem);
+  		return -EFAULT;
+  	}
+++<<<<<<< HEAD
+ +	oldmem = rcu_dereference_protected(d->memory,
+ +					   lockdep_is_held(&d->mutex));
+ +	rcu_assign_pointer(d->memory, newmem);
+ +	synchronize_rcu();
+++=======
++ 	oldmem = d->memory;
++ 	d->memory = newmem;
++ 
++ 	/* All memory accesses are done under some VQ mutex. */
++ 	for (i = 0; i < d->nvqs; ++i) {
++ 		mutex_lock(&d->vqs[i]->mutex);
++ 		d->vqs[i]->memory = newmem;
++ 		mutex_unlock(&d->vqs[i]->mutex);
++ 	}
+++>>>>>>> 47283bef7ed3 (vhost: move memory pointer to VQs)
+  	kfree(oldmem);
+  	return 0;
+  }
+@@@ -1024,16 -1046,11 +1034,16 @@@ int vhost_init_used(struct vhost_virtqu
+  	if (r)
+  		return r;
+  	vq->signalled_used_valid = false;
+ -	return get_user(vq->last_used_idx, &vq->used->idx);
+ +	if (!access_ok(VERIFY_READ, &vq->used->idx, sizeof vq->used->idx))
+ +		return -EFAULT;
+ +	r = __get_user(last_used_idx, &vq->used->idx);
+ +	if (r)
+ +		return r;
+ +	vq->last_used_idx = last_used_idx;
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(vhost_init_used);
+  
+- static int translate_desc(struct vhost_dev *dev, u64 addr, u32 len,
++ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+  			  struct iovec iov[], int iov_size)
+  {
+  	const struct vhost_memory_region *reg;
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index b17d93a81379..b6e8b6a7a800 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -372,7 +372,7 @@ static void handle_tx(struct vhost_net *net)
+ 			      % UIO_MAXIOV == nvq->done_idx))
+ 			break;
+ 
+-		head = vhost_get_vq_desc(&net->dev, vq, vq->iov,
++		head = vhost_get_vq_desc(vq, vq->iov,
+ 					 ARRAY_SIZE(vq->iov),
+ 					 &out, &in,
+ 					 NULL, NULL);
+@@ -511,7 +511,7 @@ static int get_rx_bufs(struct vhost_virtqueue *vq,
+ 			r = -ENOBUFS;
+ 			goto err;
+ 		}
+-		r = vhost_get_vq_desc(vq->dev, vq, vq->iov + seg,
++		r = vhost_get_vq_desc(vq, vq->iov + seg,
+ 				      ARRAY_SIZE(vq->iov) - seg, &out,
+ 				      &in, log, log_num);
+ 		if (unlikely(r < 0))
+diff --git a/drivers/vhost/scsi.c b/drivers/vhost/scsi.c
+index 7a98782794be..8923da854e2b 100644
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@ -588,7 +588,7 @@ static void tcm_vhost_do_evt_work(struct vhost_scsi *vs,
+ 
+ again:
+ 	vhost_disable_notify(&vs->dev, vq);
+-	head = vhost_get_vq_desc(&vs->dev, vq, vq->iov,
++	head = vhost_get_vq_desc(vq, vq->iov,
+ 			ARRAY_SIZE(vq->iov), &out, &in,
+ 			NULL, NULL);
+ 	if (head < 0) {
+@@ -897,7 +897,7 @@ static void vhost_scsi_handle_vq(struct vhost_scsi *vs,
+ 	vhost_disable_notify(&vs->dev, vq);
+ 
+ 	for (;;) {
+-		head = vhost_get_vq_desc(&vs->dev, vq, vq->iov,
++		head = vhost_get_vq_desc(vq, vq->iov,
+ 					ARRAY_SIZE(vq->iov), &out, &in,
+ 					NULL, NULL);
+ 		pr_debug("vhost_get_vq_desc: head: %d, out: %u in: %u\n",
+diff --git a/drivers/vhost/test.c b/drivers/vhost/test.c
+index c725bfb24df3..1f353f2fe5bb 100644
+--- a/drivers/vhost/test.c
++++ b/drivers/vhost/test.c
+@@ -51,7 +51,7 @@ static void handle_vq(struct vhost_test *n)
+ 	vhost_disable_notify(&n->dev, vq);
+ 
+ 	for (;;) {
+-		head = vhost_get_vq_desc(&n->dev, vq, vq->iov,
++		head = vhost_get_vq_desc(vq, vq->iov,
+ 					 ARRAY_SIZE(vq->iov),
+ 					 &out, &in,
+ 					 NULL, NULL);
+* Unmerged path drivers/vhost/vhost.c
+diff --git a/drivers/vhost/vhost.h b/drivers/vhost/vhost.h
+index 6bcd276e296b..758458c9ab55 100644
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -102,6 +102,7 @@ struct vhost_virtqueue {
+ 	struct iovec *indirect;
+ 	struct vring_used_elem *heads;
+ 	/* Protected by virtqueue mutex. */
++	struct vhost_memory *memory;
+ 	void *private_data;
+ 	unsigned acked_features;
+ 	/* Log write descriptors */
+@@ -110,10 +111,7 @@ struct vhost_virtqueue {
+ };
+ 
+ struct vhost_dev {
+-	/* Readers use RCU to access memory table pointer
+-	 * log base pointer and features.
+-	 * Writers use mutex below.*/
+-	struct vhost_memory __rcu *memory;
++	struct vhost_memory *memory;
+ 	struct mm_struct *mm;
+ 	struct mutex mutex;
+ 	struct vhost_virtqueue **vqs;
+@@ -138,7 +136,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, int ioctl, void __user *argp);
+ int vhost_vq_access_ok(struct vhost_virtqueue *vq);
+ int vhost_log_access_ok(struct vhost_dev *);
+ 
+-int vhost_get_vq_desc(struct vhost_dev *, struct vhost_virtqueue *,
++int vhost_get_vq_desc(struct vhost_virtqueue *,
+ 		      struct iovec iov[], unsigned int iov_count,
+ 		      unsigned int *out_num, unsigned int *in_num,
+ 		      struct vhost_log *log, unsigned int *log_num);
