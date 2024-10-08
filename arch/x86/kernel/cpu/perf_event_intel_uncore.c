@@ -771,10 +771,12 @@ static void __init uncore_type_exit(struct intel_uncore_type *type)
 {
 	int i;
 
-	for (i = 0; i < type->num_boxes; i++)
-		free_percpu(type->pmus[i].box);
-	kfree(type->pmus);
-	type->pmus = NULL;
+	if (type->pmus) {
+		for (i = 0; i < type->num_boxes; i++)
+			free_percpu(type->pmus[i].box);
+		kfree(type->pmus);
+		type->pmus = NULL;
+	}
 	kfree(type->events_group);
 	type->events_group = NULL;
 }
@@ -782,6 +784,7 @@ static void __init uncore_type_exit(struct intel_uncore_type *type)
 static void __init uncore_types_exit(struct intel_uncore_type **types)
 {
 	int i;
+
 	for (i = 0; types[i]; i++)
 		uncore_type_exit(types[i]);
 }
@@ -810,7 +813,7 @@ static int __init uncore_type_init(struct intel_uncore_type *type)
 		INIT_LIST_HEAD(&pmus[i].box_list);
 		pmus[i].box = alloc_percpu(struct intel_uncore_box *);
 		if (!pmus[i].box)
-			goto fail;
+			return -ENOMEM;
 	}
 
 	if (type->event_descs) {
@@ -821,7 +824,7 @@ static int __init uncore_type_init(struct intel_uncore_type *type)
 		attr_group = kzalloc(sizeof(struct attribute *) * (i + 1) +
 					sizeof(*attr_group), GFP_KERNEL);
 		if (!attr_group)
-			goto fail;
+			return -ENOMEM;
 
 		attrs = (struct attribute **)(attr_group + 1);
 		attr_group->name = "events";
@@ -835,9 +838,6 @@ static int __init uncore_type_init(struct intel_uncore_type *type)
 
 	type->pmu_group = &uncore_pmu_attr_group;
 	return 0;
-fail:
-	uncore_type_exit(type);
-	return -ENOMEM;
 }
 
 static int __init uncore_types_init(struct intel_uncore_type **types)
@@ -847,13 +847,9 @@ static int __init uncore_types_init(struct intel_uncore_type **types)
 	for (i = 0; types[i]; i++) {
 		ret = uncore_type_init(types[i]);
 		if (ret)
-			goto fail;
+			return ret;
 	}
 	return 0;
-fail:
-	while (--i >= 0)
-		uncore_type_exit(types[i]);
-	return ret;
 }
 
 /*
@@ -1011,17 +1007,21 @@ static int __init uncore_pci_init(void)
 
 	ret = uncore_types_init(uncore_pci_uncores);
 	if (ret)
-		return ret;
+		goto err;
 
 	uncore_pci_driver->probe = uncore_pci_probe;
 	uncore_pci_driver->remove = uncore_pci_remove;
 
 	ret = pci_register_driver(uncore_pci_driver);
-	if (ret == 0)
-		pcidrv_registered = true;
-	else
-		uncore_types_exit(uncore_pci_uncores);
+	if (ret)
+		goto err;
 
+	pcidrv_registered = true;
+	return 0;
+
+err:
+	uncore_types_exit(uncore_pci_uncores);
+	uncore_pci_uncores = empty_uncore;
 	return ret;
 }
 
@@ -1320,9 +1320,12 @@ static int __init uncore_cpu_init(void)
 
 	ret = uncore_types_init(uncore_msr_uncores);
 	if (ret)
-		return ret;
-
+		goto err;
 	return 0;
+err:
+	uncore_types_exit(uncore_msr_uncores);
+	uncore_msr_uncores = empty_uncore;
+	return ret;
 }
 
 static int __init uncore_pmus_register(void)
