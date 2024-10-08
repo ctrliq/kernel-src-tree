@@ -1,0 +1,296 @@
+ACPI / ATA: Add hotplug contexts to ACPI companions of SATA devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [ata] libata-acpi: Add hotplug contexts to ACPI companions of SATA devices (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 90.37%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 5d5132059a1f652de9dc2d62a8ff15561e648d11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5d513205.failed
+
+Modify the SATA subsystem to add hotplug contexts to ACPI companions
+of SATA devices and ports instead of registering special ACPI dock
+operations using register_hotplug_dock_device().
+
+That change will allow the entire code handling those special ACPI
+dock operations to be dropped in the next commit.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Aaron Lu <aaron.lu@intel.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 5d5132059a1f652de9dc2d62a8ff15561e648d11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/scan.c
+#	drivers/ata/libata-acpi.c
+#	include/acpi/acpi_bus.h
+diff --cc drivers/acpi/scan.c
+index b30a50799f84,f6bcc24f73dc..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -59,6 -61,27 +59,30 @@@ void acpi_scan_lock_release(void
+  }
+  EXPORT_SYMBOL_GPL(acpi_scan_lock_release);
+  
+++<<<<<<< HEAD
+++=======
++ void acpi_lock_hp_context(void)
++ {
++ 	mutex_lock(&acpi_hp_context_lock);
++ }
++ 
++ void acpi_unlock_hp_context(void)
++ {
++ 	mutex_unlock(&acpi_hp_context_lock);
++ }
++ 
++ void acpi_initialize_hp_context(struct acpi_device *adev,
++ 				struct acpi_hotplug_context *hp,
++ 				int (*notify)(struct acpi_device *, u32),
++ 				void (*uevent)(struct acpi_device *, u32))
++ {
++ 	acpi_lock_hp_context();
++ 	acpi_set_hp_context(adev, hp, notify, uevent, NULL);
++ 	acpi_unlock_hp_context();
++ }
++ EXPORT_SYMBOL_GPL(acpi_initialize_hp_context);
++ 
+++>>>>>>> 5d5132059a1f (ACPI / ATA: Add hotplug contexts to ACPI companions of SATA devices)
+  int acpi_scan_add_handler(struct acpi_scan_handler *handler)
+  {
+  	if (!handler || !handler->attach)
+diff --cc drivers/ata/libata-acpi.c
+index da8170dfc90f,acb95dffdb6a..000000000000
+--- a/drivers/ata/libata-acpi.c
++++ b/drivers/ata/libata-acpi.c
+@@@ -48,26 -38,19 +48,36 @@@ static void ata_acpi_clear_gtf(struct a
+  	dev->gtf_cache = NULL;
+  }
+  
++ struct ata_acpi_hotplug_context {
++ 	struct acpi_hotplug_context hp;
++ 	union {
++ 		struct ata_port *ap;
++ 		struct ata_device *dev;
++ 	} data;
++ };
++ 
++ #define ata_hotplug_data(context) (container_of((context), struct ata_acpi_hotplug_context, hp)->data)
++ 
+ +/**
+ + * ata_ap_acpi_handle - provide the acpi_handle for an ata_port
+ + * @ap: the acpi_handle returned will correspond to this port
+ + *
+ + * Returns the acpi_handle for the ACPI namespace object corresponding to
+ + * the ata_port passed into the function, or NULL if no such object exists
+ + */
+ +acpi_handle ata_ap_acpi_handle(struct ata_port *ap)
+ +{
+ +	if (ap->flags & ATA_FLAG_ACPI_SATA)
+ +		return NULL;
+ +
+ +	return ap->scsi_host ?
+ +		DEVICE_ACPI_HANDLE(&ap->scsi_host->shost_gendev) : NULL;
+ +}
+ +EXPORT_SYMBOL(ata_ap_acpi_handle);
+ +
+  /**
+   * ata_dev_acpi_handle - provide the acpi_handle for an ata_device
+ - * @dev: the acpi_handle returned will correspond to this device
+ + * @dev: the acpi_device returned will correspond to this port
+   *
+   * Returns the acpi_handle for the ACPI namespace object corresponding to
+   * the ata_device passed into the function, or NULL if no such object exists
+@@@ -156,24 -127,21 +166,23 @@@ static void ata_acpi_handle_hotplug(str
+  
+  	spin_unlock_irqrestore(ap->lock, flags);
+  
+ -	if (wait)
+ +	if (wait) {
+  		ata_port_wait_eh(ap);
+ +		flush_work(&ap->hotplug_task.work);
+ +	}
+  }
+  
+- static void ata_acpi_dev_notify_dock(acpi_handle handle, u32 event, void *data)
++ static int ata_acpi_dev_notify_dock(struct acpi_device *adev, u32 event)
+  {
+- 	struct ata_device *dev = data;
+- 
++ 	struct ata_device *dev = ata_hotplug_data(adev->hp).dev;
+  	ata_acpi_handle_hotplug(dev->link->ap, dev, event);
++ 	return 0;
+  }
+  
+- static void ata_acpi_ap_notify_dock(acpi_handle handle, u32 event, void *data)
++ static int ata_acpi_ap_notify_dock(struct acpi_device *adev, u32 event)
+  {
+- 	struct ata_port *ap = data;
+- 
+- 	ata_acpi_handle_hotplug(ap, NULL, event);
++ 	ata_acpi_handle_hotplug(ata_hotplug_data(adev->hp).ap, NULL, event);
++ 	return 0;
+  }
+  
+  static void ata_acpi_uevent(struct ata_port *ap, struct ata_device *dev,
+@@@ -206,47 -174,74 +215,112 @@@ static void ata_acpi_dev_uevent(struct 
+  	ata_acpi_uevent(dev->link->ap, dev, event);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct acpi_dock_ops ata_acpi_dev_dock_ops = {
+ +	.handler = ata_acpi_dev_notify_dock,
+ +	.uevent = ata_acpi_dev_uevent,
+ +};
+ +
+ +static const struct acpi_dock_ops ata_acpi_ap_dock_ops = {
+ +	.handler = ata_acpi_ap_notify_dock,
+ +	.uevent = ata_acpi_ap_uevent,
+ +};
+ +
+ +void ata_acpi_hotplug_init(struct ata_host *host)
+ +{
+ +	int i;
+++=======
++ /* bind acpi handle to pata port */
++ void ata_acpi_bind_port(struct ata_port *ap)
++ {
++ 	struct acpi_device *host_companion = ACPI_COMPANION(ap->host->dev);
++ 	struct acpi_device *adev;
++ 	struct ata_acpi_hotplug_context *context;
+++>>>>>>> 5d5132059a1f (ACPI / ATA: Add hotplug contexts to ACPI companions of SATA devices)
+  
+ -	if (libata_noacpi || ap->flags & ATA_FLAG_ACPI_SATA || !host_companion)
+ -		return;
+ +	for (i = 0; i < host->n_ports; i++) {
+ +		struct ata_port *ap = host->ports[i];
+ +		acpi_handle handle;
+ +		struct ata_device *dev;
+  
+ -	acpi_preset_companion(&ap->tdev, host_companion, ap->port_no);
+ +		if (!ap)
+ +			continue;
+  
+ -	if (ata_acpi_gtm(ap, &ap->__acpi_init_gtm) == 0)
+ -		ap->pflags |= ATA_PFLAG_INIT_GTM_VALID;
+ +		handle = ata_ap_acpi_handle(ap);
+ +		if (handle) {
+ +			/* we might be on a docking station */
+ +			register_hotplug_dock_device(handle,
+ +						     &ata_acpi_ap_dock_ops, ap,
+ +						     NULL, NULL);
+ +		}
+  
+++<<<<<<< HEAD
+ +		ata_for_each_dev(dev, &ap->link, ALL) {
+ +			handle = ata_dev_acpi_handle(dev);
+ +			if (!handle)
+ +				continue;
+ +
+ +			/* we might be on a docking station */
+ +			register_hotplug_dock_device(handle,
+ +						     &ata_acpi_dev_dock_ops,
+ +						     dev, NULL, NULL);
+ +		}
+ +	}
+++=======
++ 	adev = ACPI_COMPANION(&ap->tdev);
++ 	if (!adev || adev->hp)
++ 		return;
++ 
++ 	context = kzalloc(sizeof(*context), GFP_KERNEL);
++ 	if (!context)
++ 		return;
++ 
++ 	context->data.ap = ap;
++ 	acpi_initialize_hp_context(adev, &context->hp, ata_acpi_ap_notify_dock,
++ 				   ata_acpi_ap_uevent);
++ }
++ 
++ void ata_acpi_bind_dev(struct ata_device *dev)
++ {
++ 	struct ata_port *ap = dev->link->ap;
++ 	struct acpi_device *port_companion = ACPI_COMPANION(&ap->tdev);
++ 	struct acpi_device *host_companion = ACPI_COMPANION(ap->host->dev);
++ 	struct acpi_device *parent, *adev;
++ 	struct ata_acpi_hotplug_context *context;
++ 	u64 adr;
++ 
++ 	/*
++ 	 * For both sata/pata devices, host companion device is required.
++ 	 * For pata device, port companion device is also required.
++ 	 */
++ 	if (libata_noacpi || !host_companion ||
++ 			(!(ap->flags & ATA_FLAG_ACPI_SATA) && !port_companion))
++ 		return;
++ 
++ 	if (ap->flags & ATA_FLAG_ACPI_SATA) {
++ 		if (!sata_pmp_attached(ap))
++ 			adr = SATA_ADR(ap->port_no, NO_PORT_MULT);
++ 		else
++ 			adr = SATA_ADR(ap->port_no, dev->link->pmp);
++ 		parent = host_companion;
++ 	} else {
++ 		adr = dev->devno;
++ 		parent = port_companion;
++ 	}
++ 
++ 	acpi_preset_companion(&dev->tdev, parent, adr);
++ 	adev = ACPI_COMPANION(&dev->tdev);
++ 	if (!adev || adev->hp)
++ 		return;
++ 
++ 	context = kzalloc(sizeof(*context), GFP_KERNEL);
++ 	if (!context)
++ 		return;
++ 
++ 	context->data.dev = dev;
++ 	acpi_initialize_hp_context(adev, &context->hp, ata_acpi_dev_notify_dock,
++ 				   ata_acpi_dev_uevent);
+++>>>>>>> 5d5132059a1f (ACPI / ATA: Add hotplug contexts to ACPI companions of SATA devices)
+  }
+  
+  /**
+diff --cc include/acpi/acpi_bus.h
+index 717f4adcfbd4,fb23a7b6c919..000000000000
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@@ -327,6 -361,29 +327,32 @@@ static inline void *acpi_driver_data(st
+  #define to_acpi_device(d)	container_of(d, struct acpi_device, dev)
+  #define to_acpi_driver(d)	container_of(d, struct acpi_driver, drv)
+  
+++<<<<<<< HEAD
+++=======
++ static inline void acpi_set_device_status(struct acpi_device *adev, u32 sta)
++ {
++ 	*((u32 *)&adev->status) = sta;
++ }
++ 
++ static inline void acpi_set_hp_context(struct acpi_device *adev,
++ 				       struct acpi_hotplug_context *hp,
++ 				       int (*notify)(struct acpi_device *, u32),
++ 				       void (*uevent)(struct acpi_device *, u32),
++ 				       void (*fixup)(struct acpi_device *))
++ {
++ 	hp->self = adev;
++ 	hp->notify = notify;
++ 	hp->uevent = uevent;
++ 	hp->fixup = fixup;
++ 	adev->hp = hp;
++ }
++ 
++ void acpi_initialize_hp_context(struct acpi_device *adev,
++ 				struct acpi_hotplug_context *hp,
++ 				int (*notify)(struct acpi_device *, u32),
++ 				void (*uevent)(struct acpi_device *, u32));
++ 
+++>>>>>>> 5d5132059a1f (ACPI / ATA: Add hotplug contexts to ACPI companions of SATA devices)
+  /* acpi_device.dev.bus == &acpi_bus_type */
+  extern struct bus_type acpi_bus_type;
+  
+* Unmerged path drivers/acpi/scan.c
+* Unmerged path drivers/ata/libata-acpi.c
+* Unmerged path include/acpi/acpi_bus.h
