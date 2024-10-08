@@ -1,0 +1,199 @@
+RDMA/ocrdma: Support RoCE-v2 in the UD path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Devesh Sharma <devesh.sharma@avagotech.com>
+commit 6b0626679d81626eac47cba7940f1435ec480b2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6b062667.failed
+
+This patch adds following changes to support RoCE-v2
+in the UD path.
+
+ * During AH creation GID-type is resolved for a given gid-index.
+ * Based on GID-type protocol header is built.
+ * Work completion reports network header type and set
+   IB_WC_WITH_NETWORK_HDR_TYPE flag in wc->wc_flags to indicate
+   that the network header type is valid.
+
+	Signed-off-by: Somnath Kotur <somnath.kotur@avagotech.com>
+	Signed-off-by: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 6b0626679d81626eac47cba7940f1435ec480b2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --cc drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+index 6836aea6a876,4aed1dbb0b97..000000000000
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+@@@ -54,12 -55,26 +54,27 @@@
+  
+  #define OCRDMA_VID_PCP_SHIFT	0xD
+  
++ static u16 ocrdma_hdr_type_to_proto_num(int devid, u8 hdr_type)
++ {
++ 	switch (hdr_type) {
++ 	case OCRDMA_L3_TYPE_IB_GRH:
++ 		return (u16)0x8915;
++ 	case OCRDMA_L3_TYPE_IPV4:
++ 		return (u16)0x0800;
++ 	case OCRDMA_L3_TYPE_IPV6:
++ 		return (u16)0x86dd;
++ 	default:
++ 		pr_err("ocrdma%d: Invalid network header\n", devid);
++ 		return 0;
++ 	}
++ }
++ 
+  static inline int set_av_attr(struct ocrdma_dev *dev, struct ocrdma_ah *ah,
+  			struct ib_ah_attr *attr, union ib_gid *sgid,
+ -			int pdid, bool *isvlan, u16 vlan_tag)
+ +			int pdid, bool *isvlan)
+  {
+  	int status = 0;
+ +	u16 vlan_tag;
+  	struct ocrdma_eth_vlan eth;
+  	struct ocrdma_grh grh;
+  	int eth_sz;
+@@@ -67,8 -90,12 +90,13 @@@
+  	memset(&eth, 0, sizeof(eth));
+  	memset(&grh, 0, sizeof(grh));
+  
++ 	/* Protocol Number */
++ 	proto_num = ocrdma_hdr_type_to_proto_num(dev->id, ah->hdr_type);
++ 	if (!proto_num)
++ 		return -EINVAL;
++ 	nxthdr = (proto_num == 0x8915) ? 0x1b : 0x11;
+  	/* VLAN */
+ +	vlan_tag = attr->vlan_id;
+  	if (!vlan_tag || (vlan_tag > 0xFFF))
+  		vlan_tag = dev->pvid;
+  	if (vlan_tag || dev->pfc_state) {
+@@@ -135,12 -180,20 +179,22 @@@ struct ib_ah *ocrdma_create_ah(struct i
+  	if (status)
+  		goto av_err;
+  
+ -	status = ib_get_cached_gid(&dev->ibdev, 1, attr->grh.sgid_index, &sgid,
+ -				   &sgid_attr);
+ +	status = ocrdma_query_gid(&dev->ibdev, 1, attr->grh.sgid_index, &sgid);
+  	if (status) {
+  		pr_err("%s(): Failed to query sgid, status = %d\n",
+ -		      __func__, status);
+ +		       __func__, status);
+  		goto av_conf_err;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (sgid_attr.ndev) {
++ 		if (is_vlan_dev(sgid_attr.ndev))
++ 			vlan_tag = vlan_dev_vlan_id(sgid_attr.ndev);
++ 		dev_put(sgid_attr.ndev);
++ 	}
++ 	/* Get network header type for this GID */
++ 	ah->hdr_type = ib_gid_to_network_type(sgid_attr.gid_type, &sgid);
+++>>>>>>> 6b0626679d81 (RDMA/ocrdma: Support RoCE-v2 in the UD path)
+  
+  	if ((pd->uctx) &&
+  	    (!rdma_is_multicast_addr((struct in6_addr *)attr->grh.dgid.raw)) &&
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma.h b/drivers/infiniband/hw/ocrdma/ocrdma.h
+index b58833d9b909..45bdfa0e3b2b 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma.h
+@@ -357,6 +357,7 @@ struct ocrdma_ah {
+ 	struct ocrdma_av *av;
+ 	u16 sgid_index;
+ 	u32 id;
++	u8 hdr_type;
+ };
+ 
+ struct ocrdma_qp_hwq_info {
+* Unmerged path drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_sli.h b/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
+index ce7bf51455c6..327277ac9a11 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
+@@ -1744,8 +1744,11 @@ enum {
+ 
+ 	/* w1 */
+ 	OCRDMA_CQE_UD_XFER_LEN_SHIFT	= 16,
++	OCRDMA_CQE_UD_XFER_LEN_MASK     = 0x1FFF,
+ 	OCRDMA_CQE_PKEY_SHIFT		= 0,
+ 	OCRDMA_CQE_PKEY_MASK		= 0xFFFF,
++	OCRDMA_CQE_UD_L3TYPE_SHIFT      = 29,
++	OCRDMA_CQE_UD_L3TYPE_MASK       = 0x07,
+ 
+ 	/* w2 */
+ 	OCRDMA_CQE_QPN_SHIFT		= 0,
+@@ -1870,7 +1873,7 @@ struct ocrdma_ewqe_ud_hdr {
+ 	u32 rsvd_dest_qpn;
+ 	u32 qkey;
+ 	u32 rsvd_ahid;
+-	u32 rsvd;
++	u32 hdr_type;
+ };
+ 
+ /* extended wqe followed by hdr_wqe for Fast Memory register */
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index b35a7f32440e..8987a49ddaf4 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -2005,6 +2005,7 @@ static void ocrdma_build_ud_hdr(struct ocrdma_qp *qp,
+ 	else
+ 		ud_hdr->qkey = wr->wr.ud.remote_qkey;
+ 	ud_hdr->rsvd_ahid = ah->id;
++	ud_hdr->hdr_type = ah->hdr_type;
+ 	if (ah->av->valid & OCRDMA_AV_VLAN_VALID)
+ 		hdr->cw |= (OCRDMA_FLAG_AH_VLAN_PR << OCRDMA_WQE_FLAGS_SHIFT);
+ }
+@@ -2798,9 +2799,11 @@ static bool ocrdma_poll_scqe(struct ocrdma_qp *qp, struct ocrdma_cqe *cqe,
+ 	return expand;
+ }
+ 
+-static int ocrdma_update_ud_rcqe(struct ib_wc *ibwc, struct ocrdma_cqe *cqe)
++static int ocrdma_update_ud_rcqe(struct ocrdma_dev *dev, struct ib_wc *ibwc,
++				 struct ocrdma_cqe *cqe)
+ {
+ 	int status;
++	u16 hdr_type = 0;
+ 
+ 	status = (le32_to_cpu(cqe->flags_status_srcqpn) &
+ 		OCRDMA_CQE_UD_STATUS_MASK) >> OCRDMA_CQE_UD_STATUS_SHIFT;
+@@ -2809,7 +2812,17 @@ static int ocrdma_update_ud_rcqe(struct ib_wc *ibwc, struct ocrdma_cqe *cqe)
+ 	ibwc->pkey_index = 0;
+ 	ibwc->wc_flags = IB_WC_GRH;
+ 	ibwc->byte_len = (le32_to_cpu(cqe->ud.rxlen_pkey) >>
+-					OCRDMA_CQE_UD_XFER_LEN_SHIFT);
++			  OCRDMA_CQE_UD_XFER_LEN_SHIFT) &
++			  OCRDMA_CQE_UD_XFER_LEN_MASK;
++
++	if (ocrdma_is_udp_encap_supported(dev)) {
++		hdr_type = (le32_to_cpu(cqe->ud.rxlen_pkey) >>
++			    OCRDMA_CQE_UD_L3TYPE_SHIFT) &
++			    OCRDMA_CQE_UD_L3TYPE_MASK;
++		ibwc->wc_flags |= IB_WC_WITH_NETWORK_HDR_TYPE;
++		ibwc->network_hdr_type = hdr_type;
++	}
++
+ 	return status;
+ }
+ 
+@@ -2872,12 +2885,15 @@ static bool ocrdma_poll_err_rcqe(struct ocrdma_qp *qp, struct ocrdma_cqe *cqe,
+ static void ocrdma_poll_success_rcqe(struct ocrdma_qp *qp,
+ 				     struct ocrdma_cqe *cqe, struct ib_wc *ibwc)
+ {
++	struct ocrdma_dev *dev;
++
++	dev = get_ocrdma_dev(qp->ibqp.device);
+ 	ibwc->opcode = IB_WC_RECV;
+ 	ibwc->qp = &qp->ibqp;
+ 	ibwc->status = IB_WC_SUCCESS;
+ 
+ 	if (qp->qp_type == IB_QPT_UD || qp->qp_type == IB_QPT_GSI)
+-		ocrdma_update_ud_rcqe(ibwc, cqe);
++		ocrdma_update_ud_rcqe(dev, ibwc, cqe);
+ 	else
+ 		ibwc->byte_len = le32_to_cpu(cqe->rq.rxlen);
+ 
