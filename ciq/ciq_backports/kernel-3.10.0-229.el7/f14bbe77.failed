@@ -1,0 +1,372 @@
+blk-mq: pass in suggested NUMA node to ->alloc_hctx()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit f14bbe77a96bb979dc539d8308ee18a9363a544f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f14bbe77.failed
+
+Drivers currently have to figure this out on their own, and they
+are missing information to do it properly. The ones that did
+attempt to do it, do it wrong.
+
+So just pass in the suggested node directly to the alloc
+function.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f14bbe77a96bb979dc539d8308ee18a9363a544f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	drivers/block/null_blk.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index a6fc109357ae,30bad930e661..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -969,11 -1296,11 +969,19 @@@ struct blk_mq_hw_ctx *blk_mq_map_queue(
+  }
+  EXPORT_SYMBOL(blk_mq_map_queue);
+  
+++<<<<<<< HEAD
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *reg,
+ +						   unsigned int hctx_index)
+ +{
+ +	return kmalloc_node(sizeof(struct blk_mq_hw_ctx),
+ +				GFP_KERNEL | __GFP_ZERO, reg->numa_node);
+++=======
++ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *set,
++ 						   unsigned int hctx_index,
++ 						   int node)
++ {
++ 	return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, node);
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  }
+  EXPORT_SYMBOL(blk_mq_alloc_single_hw_queue);
+  
+@@@ -1289,30 -1672,88 +1297,31 @@@ static void blk_mq_map_swqueue(struct r
+  		ctx->index_hw = hctx->nr_ctx;
+  		hctx->ctxs[hctx->nr_ctx++] = ctx;
+  	}
+ -
+ -	queue_for_each_hw_ctx(q, hctx, i) {
+ -		/*
+ -		 * If not software queues are mapped to this hardware queue,
+ -		 * disable it and free the request entries
+ -		 */
+ -		if (!hctx->nr_ctx) {
+ -			struct blk_mq_tag_set *set = q->tag_set;
+ -
+ -			if (set->tags[i]) {
+ -				blk_mq_free_rq_map(set, set->tags[i], i);
+ -				set->tags[i] = NULL;
+ -				hctx->tags = NULL;
+ -			}
+ -			continue;
+ -		}
+ -
+ -		/*
+ -		 * Initialize batch roundrobin counts
+ -		 */
+ -		hctx->next_cpu = cpumask_first(hctx->cpumask);
+ -		hctx->next_cpu_batch = BLK_MQ_CPU_WORK_BATCH;
+ -	}
+  }
+  
+ -static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set)
+ +struct request_queue *blk_mq_init_queue(struct blk_mq_reg *reg,
+ +					void *driver_data)
+  {
+ -	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_hw_ctx **hctxs;
+ +	struct blk_mq_ctx *ctx;
+  	struct request_queue *q;
+ -	bool shared;
+++	unsigned int *map;
+  	int i;
+  
+ -	if (set->tag_list.next == set->tag_list.prev)
+ -		shared = false;
+ -	else
+ -		shared = true;
+ -
+ -	list_for_each_entry(q, &set->tag_list, tag_set_list) {
+ -		blk_mq_freeze_queue(q);
+ +	if (!reg->nr_hw_queues ||
+ +	    !reg->ops->queue_rq || !reg->ops->map_queue ||
+ +	    !reg->ops->alloc_hctx || !reg->ops->free_hctx)
+ +		return ERR_PTR(-EINVAL);
+  
+ -		queue_for_each_hw_ctx(q, hctx, i) {
+ -			if (shared)
+ -				hctx->flags |= BLK_MQ_F_TAG_SHARED;
+ -			else
+ -				hctx->flags &= ~BLK_MQ_F_TAG_SHARED;
+ -		}
+ -		blk_mq_unfreeze_queue(q);
+ +	if (!reg->queue_depth)
+ +		reg->queue_depth = BLK_MQ_MAX_DEPTH;
+ +	else if (reg->queue_depth > BLK_MQ_MAX_DEPTH) {
+ +		pr_err("blk-mq: queuedepth too large (%u)\n", reg->queue_depth);
+ +		reg->queue_depth = BLK_MQ_MAX_DEPTH;
+  	}
+ -}
+ -
+ -static void blk_mq_del_queue_tag_set(struct request_queue *q)
+ -{
+ -	struct blk_mq_tag_set *set = q->tag_set;
+ -
+ -	blk_mq_freeze_queue(q);
+  
+ -	mutex_lock(&set->tag_list_lock);
+ -	list_del_init(&q->tag_set_list);
+ -	blk_mq_update_tag_set_depth(set);
+ -	mutex_unlock(&set->tag_list_lock);
+ -
+ -	blk_mq_unfreeze_queue(q);
+ -}
+ -
+ -static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+ -				     struct request_queue *q)
+ -{
+ -	q->tag_set = set;
+ -
+ -	mutex_lock(&set->tag_list_lock);
+ -	list_add_tail(&q->tag_set_list, &set->tag_list);
+ -	blk_mq_update_tag_set_depth(set);
+ -	mutex_unlock(&set->tag_list_lock);
+ -}
+ -
+ -struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ -{
+ -	struct blk_mq_hw_ctx **hctxs;
+ -	struct blk_mq_ctx *ctx;
+ -	struct request_queue *q;
+ -	unsigned int *map;
+ -	int i;
+ +	if (reg->queue_depth < (reg->reserved_tags + BLK_MQ_TAG_MIN))
+ +		return ERR_PTR(-EINVAL);
+  
+  	ctx = alloc_percpu(struct blk_mq_ctx);
+  	if (!ctx)
+@@@ -1324,15 -1765,22 +1333,31 @@@
+  	if (!hctxs)
+  		goto err_percpu;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < reg->nr_hw_queues; i++) {
+ +		hctxs[i] = reg->ops->alloc_hctx(reg, i);
+++=======
++ 	map = blk_mq_make_queue_map(set);
++ 	if (!map)
++ 		goto err_map;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		int node = blk_mq_hw_queue_to_node(map, i);
++ 
++ 		hctxs[i] = set->ops->alloc_hctx(set, i, node);
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  		if (!hctxs[i])
+  			goto err_hctxs;
+  
+  		if (!zalloc_cpumask_var(&hctxs[i]->cpumask, GFP_KERNEL))
+  			goto err_hctxs;
+  
+++<<<<<<< HEAD
+ +		hctxs[i]->numa_node = NUMA_NO_NODE;
+++=======
++ 		atomic_set(&hctxs[i]->nr_active, 0);
++ 		hctxs[i]->numa_node = node;
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  		hctxs[i]->queue_num = i;
+  	}
+  
+@@@ -1340,15 -1788,15 +1365,24 @@@
+  	if (!q)
+  		goto err_hctxs;
+  
+++<<<<<<< HEAD
+ +	q->mq_map = blk_mq_make_queue_map(reg);
+ +	if (!q->mq_map)
+++=======
++ 	if (percpu_counter_init(&q->mq_usage_counter, 0))
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  		goto err_map;
+  
+  	setup_timer(&q->timeout, blk_mq_rq_timer, (unsigned long) q);
+  	blk_queue_rq_timeout(q, 30000);
+  
+  	q->nr_queues = nr_cpu_ids;
+++<<<<<<< HEAD
+ +	q->nr_hw_queues = reg->nr_hw_queues;
+++=======
++ 	q->nr_hw_queues = set->nr_hw_queues;
++ 	q->mq_map = map;
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  
+  	q->queue_ctx = ctx;
+  	q->queue_hw_ctx = hctxs;
+@@@ -1388,16 -1848,16 +1422,20 @@@
+  err_flush_rq:
+  	kfree(q->flush_rq);
+  err_hw:
+- 	kfree(q->mq_map);
+- err_map:
+  	blk_cleanup_queue(q);
+  err_hctxs:
+++<<<<<<< HEAD
+ +	for (i = 0; i < reg->nr_hw_queues; i++) {
+++=======
++ 	kfree(map);
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  		if (!hctxs[i])
+  			break;
+  		free_cpumask_var(hctxs[i]->cpumask);
+ -		set->ops->free_hctx(hctxs[i], i);
+ +		reg->ops->free_hctx(hctxs[i], i);
+  	}
++ err_map:
+  	kfree(hctxs);
+  err_percpu:
+  	free_percpu(ctx);
+diff --cc drivers/block/null_blk.c
+index 753846838587,4d33c8c25fbf..000000000000
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@@ -320,39 -321,11 +320,47 @@@ static int null_queue_rq(struct blk_mq_
+  	return BLK_MQ_RQ_QUEUE_OK;
+  }
+  
+++<<<<<<< HEAD
+ +static struct blk_mq_hw_ctx *null_alloc_hctx(struct blk_mq_reg *reg, unsigned int hctx_index)
+ +{
+ +	int b_size = DIV_ROUND_UP(reg->nr_hw_queues, nr_online_nodes);
+ +	int tip = (reg->nr_hw_queues % nr_online_nodes);
+ +	int node = 0, i, n;
+ +
+ +	/*
+ +	 * Split submit queues evenly wrt to the number of nodes. If uneven,
+ +	 * fill the first buckets with one extra, until the rest is filled with
+ +	 * no extra.
+ +	 */
+ +	for (i = 0, n = 1; i < hctx_index; i++, n++) {
+ +		if (n % b_size == 0) {
+ +			n = 0;
+ +			node++;
+ +
+ +			tip--;
+ +			if (!tip)
+ +				b_size = reg->nr_hw_queues / nr_online_nodes;
+ +		}
+ +	}
+ +
+ +	/*
+ +	 * A node might not be online, therefore map the relative node id to the
+ +	 * real node id.
+ +	 */
+ +	for_each_online_node(n) {
+ +		if (!node)
+ +			break;
+ +		node--;
+ +	}
+ +
+ +	return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, n);
+++=======
++ static struct blk_mq_hw_ctx *null_alloc_hctx(struct blk_mq_tag_set *set,
++ 					     unsigned int hctx_index,
++ 					     int node)
++ {
++ 	return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, node);
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  }
+  
+  static void null_free_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_index)
+diff --cc include/linux/blk-mq.h
+index 7b4bdadee022,afeb93496907..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -63,7 -79,8 +63,12 @@@ struct blk_mq_reg 
+  
+  typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+  typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+++<<<<<<< HEAD
+ +typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+++=======
++ typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_tag_set *,
++ 		unsigned int, int);
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+  typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+  typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+@@@ -127,19 -162,16 +132,23 @@@ void blk_mq_free_request(struct reques
+  bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+  struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp);
+  struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw, gfp_t gfp);
+ -struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+ +struct request *blk_mq_rq_from_tag(struct request_queue *q, unsigned int tag);
+  
+  struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+++<<<<<<< HEAD
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *, unsigned int);
+++=======
++ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+++>>>>>>> f14bbe77a96b (blk-mq: pass in suggested NUMA node to ->alloc_hctx())
+  void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+  
+ -void blk_mq_end_io(struct request *rq, int error);
+ -void __blk_mq_end_io(struct request *rq, int error);
+ -
+ -void blk_mq_requeue_request(struct request *rq);
+ +bool blk_mq_end_io_partial(struct request *rq, int error,
+ +		unsigned int nr_bytes);
+ +static inline void blk_mq_end_io(struct request *rq, int error)
+ +{
+ +	bool done = !blk_mq_end_io_partial(rq, error, blk_rq_bytes(rq));
+ +	BUG_ON(!done);
+ +}
+  
+  void blk_mq_complete_request(struct request *rq);
+  
+diff --git a/block/blk-mq-cpumap.c b/block/blk-mq-cpumap.c
+index 097921329619..35db81febadf 100644
+--- a/block/blk-mq-cpumap.c
++++ b/block/blk-mq-cpumap.c
+@@ -96,3 +96,19 @@ unsigned int *blk_mq_make_queue_map(struct blk_mq_reg *reg)
+ 	kfree(map);
+ 	return NULL;
+ }
++
++/*
++ * We have no quick way of doing reverse lookups. This is only used at
++ * queue init time, so runtime isn't important.
++ */
++int blk_mq_hw_queue_to_node(unsigned int *mq_map, unsigned int index)
++{
++	int i;
++
++	for_each_possible_cpu(i) {
++		if (index == mq_map[i])
++			return cpu_to_node(i);
++	}
++
++	return NUMA_NO_NODE;
++}
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 98ea89df2873..45b6bc01a83c 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -47,6 +47,7 @@ void blk_mq_disable_hotplug(void);
+ struct blk_mq_reg;
+ extern unsigned int *blk_mq_make_queue_map(struct blk_mq_reg *reg);
+ extern int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues);
++extern int blk_mq_hw_queue_to_node(unsigned int *map, unsigned int);
+ 
+ void blk_mq_add_timer(struct request *rq);
+ 
+* Unmerged path drivers/block/null_blk.c
+* Unmerged path include/linux/blk-mq.h
