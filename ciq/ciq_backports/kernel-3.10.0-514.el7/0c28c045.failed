@@ -1,0 +1,351 @@
+RDS: IB: split send completion handling and do batch ack
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Santosh Shilimkar <santosh.shilimkar@oracle.com>
+commit 0c28c04500cf956c82d542c199f5bddabd590af3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0c28c045.failed
+
+Similar to what we did with receive CQ completion handling, we split
+the transmit completion handler so that it lets us implement batched
+work completion handling.
+
+We re-use the cq_poll routine and makes use of RDS_IB_SEND_OP to
+identify the send vs receive completion event handler invocation.
+
+	Signed-off-by: Santosh Shilimkar <ssantosh@kernel.org>
+	Signed-off-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+(cherry picked from commit 0c28c04500cf956c82d542c199f5bddabd590af3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/ib.h
+#	net/rds/ib_cm.c
+#	net/rds/ib_send.c
+#	net/rds/ib_stats.c
+diff --cc net/rds/ib.h
+index dc0bccb5509c,3a8cd31d4048..000000000000
+--- a/net/rds/ib.h
++++ b/net/rds/ib.h
+@@@ -24,6 -24,9 +24,12 @@@
+  
+  #define RDS_IB_RECYCLE_BATCH_COUNT	32
+  
+++<<<<<<< HEAD
+++=======
++ #define RDS_IB_WC_MAX			32
++ #define RDS_IB_SEND_OP			BIT_ULL(63)
++ 
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  extern struct rw_semaphore rds_ib_devices_lock;
+  extern struct list_head rds_ib_devices;
+  
+@@@ -102,6 -119,12 +108,15 @@@ struct rds_ib_connection 
+  	struct ib_pd		*i_pd;
+  	struct ib_cq		*i_send_cq;
+  	struct ib_cq		*i_recv_cq;
+++<<<<<<< HEAD
+++=======
++ 	struct ib_wc		i_send_wc[RDS_IB_WC_MAX];
++ 	struct ib_wc		i_recv_wc[RDS_IB_WC_MAX];
++ 
++ 	/* interrupt handling */
++ 	struct tasklet_struct	i_send_tasklet;
++ 	struct tasklet_struct	i_recv_tasklet;
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  
+  	/* tx */
+  	struct rds_ib_work_ring	i_send_ring;
+@@@ -198,7 -220,8 +213,12 @@@ struct rds_ib_device 
+  struct rds_ib_statistics {
+  	uint64_t	s_ib_connect_raced;
+  	uint64_t	s_ib_listen_closed_stale;
+++<<<<<<< HEAD
+ +	uint64_t	s_ib_tx_cq_call;
+++=======
++ 	uint64_t	s_ib_evt_handler_call;
++ 	uint64_t	s_ib_tasklet_call;
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  	uint64_t	s_ib_tx_cq_event;
+  	uint64_t	s_ib_tx_ring_full;
+  	uint64_t	s_ib_tx_throttle;
+diff --cc net/rds/ib_cm.c
+index c129638ff6f1,8f51d0d26578..000000000000
+--- a/net/rds/ib_cm.c
++++ b/net/rds/ib_cm.c
+@@@ -207,6 -216,95 +207,98 @@@ static void rds_ib_cq_event_handler(str
+  		 event->event, ib_event_msg(event->event), data);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Plucking the oldest entry from the ring can be done concurrently with
++  * the thread refilling the ring.  Each ring operation is protected by
++  * spinlocks and the transient state of refilling doesn't change the
++  * recording of which entry is oldest.
++  *
++  * This relies on IB only calling one cq comp_handler for each cq so that
++  * there will only be one caller of rds_recv_incoming() per RDS connection.
++  */
++ static void rds_ib_cq_comp_handler_recv(struct ib_cq *cq, void *context)
++ {
++ 	struct rds_connection *conn = context;
++ 	struct rds_ib_connection *ic = conn->c_transport_data;
++ 
++ 	rdsdebug("conn %p cq %p\n", conn, cq);
++ 
++ 	rds_ib_stats_inc(s_ib_evt_handler_call);
++ 
++ 	tasklet_schedule(&ic->i_recv_tasklet);
++ }
++ 
++ static void poll_cq(struct rds_ib_connection *ic, struct ib_cq *cq,
++ 		    struct ib_wc *wcs,
++ 		    struct rds_ib_ack_state *ack_state)
++ {
++ 	int nr;
++ 	int i;
++ 	struct ib_wc *wc;
++ 
++ 	while ((nr = ib_poll_cq(cq, RDS_IB_WC_MAX, wcs)) > 0) {
++ 		for (i = 0; i < nr; i++) {
++ 			wc = wcs + i;
++ 			rdsdebug("wc wr_id 0x%llx status %u byte_len %u imm_data %u\n",
++ 				 (unsigned long long)wc->wr_id, wc->status,
++ 				 wc->byte_len, be32_to_cpu(wc->ex.imm_data));
++ 
++ 			if (wc->wr_id & RDS_IB_SEND_OP)
++ 				rds_ib_send_cqe_handler(ic, wc);
++ 			else
++ 				rds_ib_recv_cqe_handler(ic, wc, ack_state);
++ 		}
++ 	}
++ }
++ 
++ static void rds_ib_tasklet_fn_send(unsigned long data)
++ {
++ 	struct rds_ib_connection *ic = (struct rds_ib_connection *)data;
++ 	struct rds_connection *conn = ic->conn;
++ 	struct rds_ib_ack_state state;
++ 
++ 	rds_ib_stats_inc(s_ib_tasklet_call);
++ 
++ 	memset(&state, 0, sizeof(state));
++ 	poll_cq(ic, ic->i_send_cq, ic->i_send_wc, &state);
++ 	ib_req_notify_cq(ic->i_send_cq, IB_CQ_NEXT_COMP);
++ 	poll_cq(ic, ic->i_send_cq, ic->i_send_wc, &state);
++ 
++ 	if (rds_conn_up(conn) &&
++ 	    (!test_bit(RDS_LL_SEND_FULL, &conn->c_flags) ||
++ 	    test_bit(0, &conn->c_map_queued)))
++ 		rds_send_xmit(ic->conn);
++ }
++ 
++ static void rds_ib_tasklet_fn_recv(unsigned long data)
++ {
++ 	struct rds_ib_connection *ic = (struct rds_ib_connection *)data;
++ 	struct rds_connection *conn = ic->conn;
++ 	struct rds_ib_device *rds_ibdev = ic->rds_ibdev;
++ 	struct rds_ib_ack_state state;
++ 
++ 	BUG_ON(!rds_ibdev);
++ 
++ 	rds_ib_stats_inc(s_ib_tasklet_call);
++ 
++ 	memset(&state, 0, sizeof(state));
++ 	poll_cq(ic, ic->i_recv_cq, ic->i_recv_wc, &state);
++ 	ib_req_notify_cq(ic->i_recv_cq, IB_CQ_SOLICITED);
++ 	poll_cq(ic, ic->i_recv_cq, ic->i_recv_wc, &state);
++ 
++ 	if (state.ack_next_valid)
++ 		rds_ib_set_ack(ic, state.ack_next, state.ack_required);
++ 	if (state.ack_recv_valid && state.ack_recv > ic->i_ack_recv) {
++ 		rds_send_drop_acked(conn, state.ack_recv, NULL);
++ 		ic->i_ack_recv = state.ack_recv;
++ 	}
++ 
++ 	if (rds_conn_up(conn))
++ 		rds_ib_attempt_ack(ic);
++ }
++ 
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  static void rds_ib_qp_event_handler(struct ib_event *event, void *data)
+  {
+  	struct rds_connection *conn = data;
+@@@ -734,8 -846,10 +840,15 @@@ int rds_ib_conn_alloc(struct rds_connec
+  	}
+  
+  	INIT_LIST_HEAD(&ic->ib_node);
+++<<<<<<< HEAD
+ +	tasklet_init(&ic->i_recv_tasklet, rds_ib_recv_tasklet_fn,
+ +		     (unsigned long) ic);
+++=======
++ 	tasklet_init(&ic->i_send_tasklet, rds_ib_tasklet_fn_send,
++ 		     (unsigned long)ic);
++ 	tasklet_init(&ic->i_recv_tasklet, rds_ib_tasklet_fn_recv,
++ 		     (unsigned long)ic);
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  	mutex_init(&ic->i_recv_mutex);
+  #ifndef KERNEL_HAS_ATOMIC64
+  	spin_lock_init(&ic->i_ack_lock);
+diff --cc net/rds/ib_send.c
+index a7bb8b3ffd9d,670882c752e9..000000000000
+--- a/net/rds/ib_send.c
++++ b/net/rds/ib_send.c
+@@@ -247,71 -245,65 +245,79 @@@ void rds_ib_send_cqe_handler(struct rds
+  	u32 completed;
+  	u32 oldest;
+  	u32 i = 0;
+- 	int ret;
+  	int nr_sig = 0;
+  
+- 	rdsdebug("cq %p conn %p\n", cq, conn);
+- 	rds_ib_stats_inc(s_ib_tx_cq_call);
+- 	ret = ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+- 	if (ret)
+- 		rdsdebug("ib_req_notify_cq send failed: %d\n", ret);
+  
+- 	while (ib_poll_cq(cq, 1, &wc) > 0) {
+- 		rdsdebug("wc wr_id 0x%llx status %u (%s) byte_len %u imm_data %u\n",
+- 			 (unsigned long long)wc.wr_id, wc.status,
+- 			 ib_wc_status_msg(wc.status), wc.byte_len,
+- 			 be32_to_cpu(wc.ex.imm_data));
+- 		rds_ib_stats_inc(s_ib_tx_cq_event);
++ 	rdsdebug("wc wr_id 0x%llx status %u (%s) byte_len %u imm_data %u\n",
++ 		 (unsigned long long)wc->wr_id, wc->status,
++ 		 ib_wc_status_msg(wc->status), wc->byte_len,
++ 		 be32_to_cpu(wc->ex.imm_data));
++ 	rds_ib_stats_inc(s_ib_tx_cq_event);
+  
+++<<<<<<< HEAD
+ +		if (wc.wr_id == RDS_IB_ACK_WR_ID) {
+ +			if (ic->i_ack_queued + HZ/2 < jiffies)
+ +				rds_ib_stats_inc(s_ib_tx_stalled);
+ +			rds_ib_ack_send_complete(ic);
+ +			continue;
+ +		}
+++=======
++ 	if (wc->wr_id == RDS_IB_ACK_WR_ID) {
++ 		if (time_after(jiffies, ic->i_ack_queued + HZ / 2))
++ 			rds_ib_stats_inc(s_ib_tx_stalled);
++ 		rds_ib_ack_send_complete(ic);
++ 		return;
++ 	}
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  
+- 		oldest = rds_ib_ring_oldest(&ic->i_send_ring);
++ 	oldest = rds_ib_ring_oldest(&ic->i_send_ring);
+  
+- 		completed = rds_ib_ring_completed(&ic->i_send_ring, wc.wr_id, oldest);
++ 	completed = rds_ib_ring_completed(&ic->i_send_ring,
++ 					  (wc->wr_id & ~RDS_IB_SEND_OP),
++ 					  oldest);
+  
+- 		for (i = 0; i < completed; i++) {
+- 			send = &ic->i_sends[oldest];
+- 			if (send->s_wr.send_flags & IB_SEND_SIGNALED)
+- 				nr_sig++;
++ 	for (i = 0; i < completed; i++) {
++ 		send = &ic->i_sends[oldest];
++ 		if (send->s_wr.send_flags & IB_SEND_SIGNALED)
++ 			nr_sig++;
+  
+- 			rm = rds_ib_send_unmap_op(ic, send, wc.status);
++ 		rm = rds_ib_send_unmap_op(ic, send, wc->status);
+  
+++<<<<<<< HEAD
+ +			if (send->s_queued + HZ/2 < jiffies)
+ +				rds_ib_stats_inc(s_ib_tx_stalled);
+++=======
++ 		if (time_after(jiffies, send->s_queued + HZ / 2))
++ 			rds_ib_stats_inc(s_ib_tx_stalled);
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  
+- 			if (send->s_op) {
+- 				if (send->s_op == rm->m_final_op) {
+- 					/* If anyone waited for this message to get flushed out, wake
+- 					 * them up now */
+- 					rds_message_unmapped(rm);
+- 				}
+- 				rds_message_put(rm);
+- 				send->s_op = NULL;
++ 		if (send->s_op) {
++ 			if (send->s_op == rm->m_final_op) {
++ 				/* If anyone waited for this message to get
++ 				 * flushed out, wake them up now
++ 				 */
++ 				rds_message_unmapped(rm);
+  			}
+- 
+- 			oldest = (oldest + 1) % ic->i_send_ring.w_nr;
++ 			rds_message_put(rm);
++ 			send->s_op = NULL;
+  		}
+  
+- 		rds_ib_ring_free(&ic->i_send_ring, completed);
+- 		rds_ib_sub_signaled(ic, nr_sig);
+- 		nr_sig = 0;
++ 		oldest = (oldest + 1) % ic->i_send_ring.w_nr;
++ 	}
+  
+- 		if (test_and_clear_bit(RDS_LL_SEND_FULL, &conn->c_flags) ||
+- 		    test_bit(0, &conn->c_map_queued))
+- 			queue_delayed_work(rds_wq, &conn->c_send_w, 0);
++ 	rds_ib_ring_free(&ic->i_send_ring, completed);
++ 	rds_ib_sub_signaled(ic, nr_sig);
++ 	nr_sig = 0;
+  
+- 		/* We expect errors as the qp is drained during shutdown */
+- 		if (wc.status != IB_WC_SUCCESS && rds_conn_up(conn)) {
+- 			rds_ib_conn_error(conn, "send completion on %pI4 had status "
+- 					  "%u (%s), disconnecting and reconnecting\n",
+- 					  &conn->c_faddr, wc.status,
+- 					  ib_wc_status_msg(wc.status));
+- 		}
++ 	if (test_and_clear_bit(RDS_LL_SEND_FULL, &conn->c_flags) ||
++ 	    test_bit(0, &conn->c_map_queued))
++ 		queue_delayed_work(rds_wq, &conn->c_send_w, 0);
++ 
++ 	/* We expect errors as the qp is drained during shutdown */
++ 	if (wc->status != IB_WC_SUCCESS && rds_conn_up(conn)) {
++ 		rds_ib_conn_error(conn, "send completion on %pI4 had status %u (%s), disconnecting and reconnecting\n",
++ 				  &conn->c_faddr, wc->status,
++ 				  ib_wc_status_msg(wc->status));
+  	}
+  }
+  
+diff --cc net/rds/ib_stats.c
+index 2d5965d6e97c,8c8b84f7bfbb..000000000000
+--- a/net/rds/ib_stats.c
++++ b/net/rds/ib_stats.c
+@@@ -42,7 -42,8 +42,12 @@@ DEFINE_PER_CPU_SHARED_ALIGNED(struct rd
+  static const char *const rds_ib_stat_names[] = {
+  	"ib_connect_raced",
+  	"ib_listen_closed_stale",
+++<<<<<<< HEAD
+ +	"ib_tx_cq_call",
+++=======
++ 	"s_ib_evt_handler_call",
++ 	"ib_tasklet_call",
+++>>>>>>> 0c28c04500cf (RDS: IB: split send completion handling and do batch ack)
+  	"ib_tx_cq_event",
+  	"ib_tx_ring_full",
+  	"ib_tx_throttle",
+* Unmerged path net/rds/ib.h
+* Unmerged path net/rds/ib_cm.c
+* Unmerged path net/rds/ib_send.c
+* Unmerged path net/rds/ib_stats.c
+diff --git a/net/rds/send.c b/net/rds/send.c
+index 54d3553e44f8..b666a5af15b1 100644
+--- a/net/rds/send.c
++++ b/net/rds/send.c
+@@ -432,6 +432,7 @@ over_batch:
+ out:
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(rds_send_xmit);
+ 
+ static void rds_send_sndbuf_remove(struct rds_sock *rs, struct rds_message *rm)
+ {
