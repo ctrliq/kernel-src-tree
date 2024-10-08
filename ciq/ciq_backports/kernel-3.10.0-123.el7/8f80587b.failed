@@ -1,0 +1,117 @@
+xfs: increase inode cluster size for v5 filesystems
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 8f80587bacb6eb893df0ee4e35fefa0dfcfdf9f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/8f80587b.failed
+
+v5 filesystems use 512 byte inodes as a minimum, so read inodes in
+clusters that are effectively half the size of a v4 filesystem with
+256 byte inodes. For v5 fielsystems, scale the inode cluster size
+with the size of the inode so that we keep a constant 32 inodes per
+cluster ratio for all inode IO.
+
+This only works if mkfs.xfs sets the inode alignment appropriately
+for larger inode clusters, so this functionality is made conditional
+on mkfs doing the right thing. xfs_repair needs to know about
+the inode alignment changes, too.
+
+Wall time:
+	create	bulkstat	find+stat	ls -R	unlink
+v4	237s	161s		173s		201s	299s
+v5	235s	163s		205s		 31s	356s
+patched	234s	160s		182s		 29s	317s
+
+System time:
+	create	bulkstat	find+stat	ls -R	unlink
+v4	2601s	2490s		1653s		1656s	2960s
+v5	2637s	2497s		1681s		  20s	3216s
+patched	2613s	2451s		1658s		  20s	3007s
+
+So, wall time same or down across the board, system time same or
+down across the board, and cache hit rates all improve except for
+the ls -R case which is a pure cold cache directory read workload
+on v5 filesystems...
+
+So, this patch removes most of the performance and CPU usage
+differential between v4 and v5 filesystems on traversal related
+workloads.
+
+Note: while this patch is currently for v5 filesystems only, there
+is no reason it can't be ported back to v4 filesystems.  This hasn't
+been done here because bringing the code back to v4 requires
+forwards and backwards kernel compatibility testing.  i.e. to
+deterine if older kernels(*) do the right thing with larger inode
+alignments but still only using 8k inode cluster sizes. None of this
+testing and validation on v4 filesystems has been done, so for the
+moment larger inode clusters is limited to v5 superblocks.
+
+(*) a current default config v4 filesystem should mount just fine on
+2.6.23 (when lazy-count support was introduced), and so if we change
+the alignment emitted by mkfs without a feature bit then we have to
+make sure it works properly on all kernels since 2.6.23. And if we
+allow it to be changed when the lazy-count bit is not set, then it's
+all kernels since v2 logs were introduced that need to be tested for
+compatibility...
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Signed-off-by: Ben Myers <bpm@sgi.com>
+
+(cherry picked from commit 8f80587bacb6eb893df0ee4e35fefa0dfcfdf9f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_mount.c
+diff --cc fs/xfs/xfs_mount.c
+index 9d69bf0d2d6d,02df7b408a26..000000000000
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@@ -41,11 -36,12 +41,15 @@@
+  #include "xfs_error.h"
+  #include "xfs_quota.h"
+  #include "xfs_fsops.h"
+ +#include "xfs_utils.h"
+  #include "xfs_trace.h"
+  #include "xfs_icache.h"
+++<<<<<<< HEAD
+ +#include "xfs_cksum.h"
+ +#include "xfs_buf_item.h"
+++=======
++ #include "xfs_dinode.h"
+++>>>>>>> 8f80587bacb6 (xfs: increase inode cluster size for v5 filesystems)
+  
+  
+  #ifdef HAVE_PERCPU_SB
+* Unmerged path fs/xfs/xfs_mount.c
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index 53dc3341b959..63b7b948fed4 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -111,7 +111,7 @@ typedef struct xfs_mount {
+ 	__uint8_t		m_blkbb_log;	/* blocklog - BBSHIFT */
+ 	__uint8_t		m_agno_log;	/* log #ag's */
+ 	__uint8_t		m_agino_log;	/* #bits for agino in inum */
+-	__uint16_t		m_inode_cluster_size;/* min inode buf size */
++	uint			m_inode_cluster_size;/* min inode buf size */
+ 	uint			m_blockmask;	/* sb_blocksize-1 */
+ 	uint			m_blockwsize;	/* sb_blocksize in words */
+ 	uint			m_blockwmask;	/* blockwsize-1 */
+diff --git a/fs/xfs/xfs_trans_resv.c b/fs/xfs/xfs_trans_resv.c
+index a90fe66930d0..256f5cdfb3c7 100644
+--- a/fs/xfs/xfs_trans_resv.c
++++ b/fs/xfs/xfs_trans_resv.c
+@@ -361,8 +361,7 @@ xfs_calc_ifree_reservation(
+ 		xfs_calc_buf_res(1, mp->m_sb.sb_inodesize) +
+ 		xfs_calc_buf_res(2, mp->m_sb.sb_sectsize) +
+ 		xfs_calc_buf_res(1, XFS_FSB_TO_B(mp, 1)) +
+-		MAX((__uint16_t)XFS_FSB_TO_B(mp, 1),
+-		    XFS_INODE_CLUSTER_SIZE(mp)) +
++		max_t(uint, XFS_FSB_TO_B(mp, 1), XFS_INODE_CLUSTER_SIZE(mp)) +
+ 		xfs_calc_buf_res(1, 0) +
+ 		xfs_calc_buf_res(2 + XFS_IALLOC_BLOCKS(mp) +
+ 				 mp->m_in_maxlevels, 0) +
