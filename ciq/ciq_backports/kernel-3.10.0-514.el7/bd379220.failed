@@ -1,0 +1,196 @@
+iser-target: Fix pending connections handling in target stack shutdown sequnce
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jenny Derzhavetz <jennyf@mellanox.com>
+commit bd3792205aaeb79b994338af2e5499fa503d79c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bd379220.failed
+
+Instead of handing a connection to the iscsi stack
+for processing right after accepting (rdma_accept) we only hand
+the connection to the iscsi core after we reached to a connected
+state (ESTABLISHED CM event). This will prevent two error scenrios:
+
+1. race between rdma connection teardown and iscsi login sequence
+   reported by Nic in: (ce9a9fc20a78a "iser-target: Fix REJECT CM event
+   use-after-free OOPs")
+
+2. target stack shutdown sequence race with constant login attempts by
+   multiple initiators.
+
+We address this by maintaining two queues at the isert_np level:
+- accepted: connections that were accepted but have not reached
+  connected state (might get rejected, unreachable or error).
+- pending: connections in connected state, but have yet to handed
+  to the iscsi core for login processing. iser connections are promoted
+  to the pending queue only from the accepted queue.
+
+This way the iscsi core now will only handle functional iser connections
+and once we shutdown the target stack, we look for any stales that
+got left behind so we can safely release them.
+
+	Signed-off-by: Jenny Derzhavetz <jennyf@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Cc: <stable@vger.kernel.org> # v3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit bd3792205aaeb79b994338af2e5499fa503d79c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+#	drivers/infiniband/ulp/isert/ib_isert.h
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 61674c2da748,f3f498f6ecc5..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -778,12 -767,10 +767,19 @@@ isert_connect_request(struct rdma_cm_i
+  	if (ret)
+  		goto out_conn_dev;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&isert_np->np_accept_mutex);
+ +	list_add_tail(&isert_conn->accept_node, &isert_np->np_accept_list);
+ +	mutex_unlock(&isert_np->np_accept_mutex);
+ +
+ +	isert_info("np %p: Allow accept_np to continue\n", np);
+ +	up(&isert_np->np_sem);
+++=======
++ 	mutex_lock(&isert_np->mutex);
++ 	list_add_tail(&isert_conn->node, &isert_np->accepted);
++ 	mutex_unlock(&isert_np->mutex);
++ 
+++>>>>>>> bd3792205aae (iser-target: Fix pending connections handling in target stack shutdown sequnce)
+  	return 0;
+  
+  out_conn_dev:
+@@@ -945,13 -940,13 +949,23 @@@ isert_disconnected_handler(struct rdma_
+  	if (terminating)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&isert_np->np_accept_mutex);
+ +        if (!list_empty(&isert_conn->accept_node)) {
+ +                list_del_init(&isert_conn->accept_node);
+ +                isert_put_conn(isert_conn);
+ +                queue_work(isert_release_wq, &isert_conn->release_work);
+ +        }
+ +        mutex_unlock(&isert_np->np_accept_mutex);
+++=======
++ 	mutex_lock(&isert_np->mutex);
++ 	if (!list_empty(&isert_conn->node)) {
++ 		list_del_init(&isert_conn->node);
++ 		isert_put_conn(isert_conn);
++ 		queue_work(isert_release_wq, &isert_conn->release_work);
++ 	}
++ 	mutex_unlock(&isert_np->mutex);
+++>>>>>>> bd3792205aae (iser-target: Fix pending connections handling in target stack shutdown sequnce)
+  
+  out:
+  	return 0;
+@@@ -3113,9 -3109,10 +3128,16 @@@ isert_setup_np(struct iscsi_np *np
+  		isert_err("Unable to allocate struct isert_np\n");
+  		return -ENOMEM;
+  	}
+++<<<<<<< HEAD
+ +	sema_init(&isert_np->np_sem, 0);
+ +	mutex_init(&isert_np->np_accept_mutex);
+ +	INIT_LIST_HEAD(&isert_np->np_accept_list);
+++=======
++ 	sema_init(&isert_np->sem, 0);
++ 	mutex_init(&isert_np->mutex);
++ 	INIT_LIST_HEAD(&isert_np->accepted);
++ 	INIT_LIST_HEAD(&isert_np->pending);
+++>>>>>>> bd3792205aae (iser-target: Fix pending connections handling in target stack shutdown sequnce)
+  	isert_np->np = np;
+  
+  	/*
+@@@ -3254,15 -3234,15 +3276,27 @@@ accept_wait
+  	}
+  	spin_unlock_bh(&np->np_thread_lock);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&isert_np->np_accept_mutex);
+ +	if (list_empty(&isert_np->np_accept_list)) {
+ +		mutex_unlock(&isert_np->np_accept_mutex);
+ +		goto accept_wait;
+ +	}
+ +	isert_conn = list_first_entry(&isert_np->np_accept_list,
+ +			struct isert_conn, accept_node);
+ +	list_del_init(&isert_conn->accept_node);
+ +	mutex_unlock(&isert_np->np_accept_mutex);
+++=======
++ 	mutex_lock(&isert_np->mutex);
++ 	if (list_empty(&isert_np->pending)) {
++ 		mutex_unlock(&isert_np->mutex);
++ 		goto accept_wait;
++ 	}
++ 	isert_conn = list_first_entry(&isert_np->pending,
++ 			struct isert_conn, node);
++ 	list_del_init(&isert_conn->node);
++ 	mutex_unlock(&isert_np->mutex);
+++>>>>>>> bd3792205aae (iser-target: Fix pending connections handling in target stack shutdown sequnce)
+  
+  	conn->context = isert_conn;
+  	isert_conn->conn = conn;
+@@@ -3288,14 -3268,25 +3322,36 @@@ isert_free_np(struct iscsi_np *np
+  	 * that at this point we don't have hanging connections that
+  	 * completed RDMA establishment but didn't start iscsi login
+  	 * process. So work-around this by cleaning up what ever piled
+++<<<<<<< HEAD
+ +	 * up in np_accept_list.
+ +	 */
+ +	mutex_lock(&isert_np->np_accept_mutex);
+ +	if (!list_empty(&isert_np->np_accept_list)) {
+ +		isert_info("Still have isert connections, cleaning up...\n");
+ +		list_for_each_entry_safe(isert_conn, n,
+ +					 &isert_np->np_accept_list,
+ +					 accept_node) {
+++=======
++ 	 * up in accepted and pending lists.
++ 	 */
++ 	mutex_lock(&isert_np->mutex);
++ 	if (!list_empty(&isert_np->pending)) {
++ 		isert_info("Still have isert pending connections\n");
++ 		list_for_each_entry_safe(isert_conn, n,
++ 					 &isert_np->pending,
++ 					 node) {
++ 			isert_info("cleaning isert_conn %p state (%d)\n",
++ 				   isert_conn, isert_conn->state);
++ 			isert_connect_release(isert_conn);
++ 		}
++ 	}
++ 
++ 	if (!list_empty(&isert_np->accepted)) {
++ 		isert_info("Still have isert accepted connections\n");
++ 		list_for_each_entry_safe(isert_conn, n,
++ 					 &isert_np->accepted,
++ 					 node) {
+++>>>>>>> bd3792205aae (iser-target: Fix pending connections handling in target stack shutdown sequnce)
+  			isert_info("cleaning isert_conn %p state (%d)\n",
+  				   isert_conn, isert_conn->state);
+  			isert_connect_release(isert_conn);
+diff --cc drivers/infiniband/ulp/isert/ib_isert.h
+index 0480ab89ea40,b81dfe07ce62..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.h
++++ b/drivers/infiniband/ulp/isert/ib_isert.h
+@@@ -218,8 -218,9 +218,16 @@@ struct isert_device 
+  
+  struct isert_np {
+  	struct iscsi_np         *np;
+++<<<<<<< HEAD
+ +	struct semaphore	np_sem;
+ +	struct rdma_cm_id	*np_cm_id;
+ +	struct mutex		np_accept_mutex;
+ +	struct list_head	np_accept_list;
+++=======
++ 	struct semaphore	sem;
++ 	struct rdma_cm_id	*cm_id;
++ 	struct mutex		mutex;
++ 	struct list_head	accepted;
++ 	struct list_head	pending;
+++>>>>>>> bd3792205aae (iser-target: Fix pending connections handling in target stack shutdown sequnce)
+  };
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.h
