@@ -1,0 +1,348 @@
+qlcnic: Collect firmware dump using DMA on 82xx adapters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Shahed Shaikh <shahed.shaikh@qlogic.com>
+commit 8d37ba023f0ccab342df9ba216650e23aa147109
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/8d37ba02.failed
+
+o Add support to collect RDMEM section of firmware dump
+  using PEX DMA method.
+o This patch uses most of the code used for PEX DMA support
+  on 83xx series adapters and some refactoring.
+
+	Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d37ba023f0ccab342df9ba216650e23aa147109)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+index bf20c3aeeeb2,97784d09933f..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+@@@ -631,9 -617,7 +631,8 @@@ void qlcnic_83xx_idc_request_reset(stru
+  int qlcnic_83xx_lock_driver(struct qlcnic_adapter *);
+  void qlcnic_83xx_unlock_driver(struct qlcnic_adapter *);
+  int qlcnic_83xx_set_default_offload_settings(struct qlcnic_adapter *);
+- int qlcnic_83xx_ms_mem_write128(struct qlcnic_adapter *, u64, u32 *, u32);
+  int qlcnic_83xx_idc_vnic_pf_entry(struct qlcnic_adapter *);
+ +int qlcnic_83xx_enable_vnic_mode(struct qlcnic_adapter *, int);
+  int qlcnic_83xx_disable_vnic_mode(struct qlcnic_adapter *, int);
+  int qlcnic_83xx_config_vnic_opmode(struct qlcnic_adapter *);
+  int qlcnic_83xx_get_vnic_vport_info(struct qlcnic_adapter *,
+@@@ -671,9 -652,11 +670,19 @@@ int qlcnic_83xx_check_vnic_state(struc
+  void qlcnic_83xx_aer_stop_poll_work(struct qlcnic_adapter *);
+  int qlcnic_83xx_aer_reset(struct qlcnic_adapter *);
+  void qlcnic_83xx_aer_start_poll_work(struct qlcnic_adapter *);
+++<<<<<<< HEAD
+ +pci_ers_result_t qlcnic_83xx_io_error_detected(struct pci_dev *,
+ +					       pci_channel_state_t);
+ +pci_ers_result_t qlcnic_83xx_io_slot_reset(struct pci_dev *);
+ +void qlcnic_83xx_io_resume(struct pci_dev *);
+ +void qlcnic_83xx_stop_hw(struct qlcnic_adapter *);
+++=======
++ u32 qlcnic_83xx_get_saved_state(void *, u32);
++ void qlcnic_83xx_set_saved_state(void *, u32, u32);
++ void qlcnic_83xx_cache_tmpl_hdr_values(struct qlcnic_fw_dump *);
++ u32 qlcnic_83xx_get_cap_size(void *, int);
++ void qlcnic_83xx_set_sys_info(void *, int, u32);
++ void qlcnic_83xx_store_cap_mask(void *, u32);
++ int qlcnic_ms_mem_write128(struct qlcnic_adapter *, u64, u32 *, u32);
+++>>>>>>> 8d37ba023f0c (qlcnic: Collect firmware dump using DMA on 82xx adapters)
+  #endif
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
+index 7763962e2ec4,f7694da8ed5d..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
+@@@ -211,6 -211,114 +211,117 @@@ enum qlcnic_minidump_opcode 
+  	QLCNIC_DUMP_RDEND	= 255
+  };
+  
+++<<<<<<< HEAD
+++=======
++ inline u32 qlcnic_82xx_get_saved_state(void *t_hdr, u32 index)
++ {
++ 	struct qlcnic_82xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	return hdr->saved_state[index];
++ }
++ 
++ inline void qlcnic_82xx_set_saved_state(void *t_hdr, u32 index,
++ 					u32 value)
++ {
++ 	struct qlcnic_82xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	hdr->saved_state[index] = value;
++ }
++ 
++ void qlcnic_82xx_cache_tmpl_hdr_values(struct qlcnic_fw_dump *fw_dump)
++ {
++ 	struct qlcnic_82xx_dump_template_hdr *hdr;
++ 
++ 	hdr = fw_dump->tmpl_hdr;
++ 	fw_dump->tmpl_hdr_size = hdr->size;
++ 	fw_dump->version = hdr->version;
++ 	fw_dump->num_entries = hdr->num_entries;
++ 	fw_dump->offset = hdr->offset;
++ 
++ 	hdr->drv_cap_mask = hdr->cap_mask;
++ 	fw_dump->cap_mask = hdr->cap_mask;
++ 
++ 	fw_dump->use_pex_dma = (hdr->capabilities & BIT_0) ? true : false;
++ }
++ 
++ inline u32 qlcnic_82xx_get_cap_size(void *t_hdr, int index)
++ {
++ 	struct qlcnic_82xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	return hdr->cap_sizes[index];
++ }
++ 
++ void qlcnic_82xx_set_sys_info(void *t_hdr, int idx, u32 value)
++ {
++ 	struct qlcnic_82xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	hdr->sys_info[idx] = value;
++ }
++ 
++ void qlcnic_82xx_store_cap_mask(void *tmpl_hdr, u32 mask)
++ {
++ 	struct qlcnic_82xx_dump_template_hdr *hdr = tmpl_hdr;
++ 
++ 	hdr->drv_cap_mask = mask;
++ }
++ 
++ inline u32 qlcnic_83xx_get_saved_state(void *t_hdr, u32 index)
++ {
++ 	struct qlcnic_83xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	return hdr->saved_state[index];
++ }
++ 
++ inline void qlcnic_83xx_set_saved_state(void *t_hdr, u32 index,
++ 					u32 value)
++ {
++ 	struct qlcnic_83xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	hdr->saved_state[index] = value;
++ }
++ 
++ #define QLCNIC_TEMPLATE_VERSION (0x20001)
++ 
++ void qlcnic_83xx_cache_tmpl_hdr_values(struct qlcnic_fw_dump *fw_dump)
++ {
++ 	struct qlcnic_83xx_dump_template_hdr *hdr;
++ 
++ 	hdr = fw_dump->tmpl_hdr;
++ 	fw_dump->tmpl_hdr_size = hdr->size;
++ 	fw_dump->version = hdr->version;
++ 	fw_dump->num_entries = hdr->num_entries;
++ 	fw_dump->offset = hdr->offset;
++ 
++ 	hdr->drv_cap_mask = hdr->cap_mask;
++ 	fw_dump->cap_mask = hdr->cap_mask;
++ 
++ 	fw_dump->use_pex_dma = (fw_dump->version & 0xfffff) >=
++ 			       QLCNIC_TEMPLATE_VERSION;
++ }
++ 
++ inline u32 qlcnic_83xx_get_cap_size(void *t_hdr, int index)
++ {
++ 	struct qlcnic_83xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	return hdr->cap_sizes[index];
++ }
++ 
++ void qlcnic_83xx_set_sys_info(void *t_hdr, int idx, u32 value)
++ {
++ 	struct qlcnic_83xx_dump_template_hdr *hdr = t_hdr;
++ 
++ 	hdr->sys_info[idx] = value;
++ }
++ 
++ void qlcnic_83xx_store_cap_mask(void *tmpl_hdr, u32 mask)
++ {
++ 	struct qlcnic_83xx_dump_template_hdr *hdr;
++ 
++ 	hdr = tmpl_hdr;
++ 	hdr->drv_cap_mask = mask;
++ }
++ 
+++>>>>>>> 8d37ba023f0c (qlcnic: Collect firmware dump using DMA on 82xx adapters)
+  struct qlcnic_dump_operations {
+  	enum qlcnic_minidump_opcode opcode;
+  	u32 (*handler)(struct qlcnic_adapter *, struct qlcnic_dump_entry *,
+@@@ -544,7 -665,6 +655,10 @@@ out
+  static int qlcnic_start_pex_dma(struct qlcnic_adapter *adapter,
+  				struct __mem *mem)
+  {
+++<<<<<<< HEAD
+ +	struct qlcnic_dump_template_hdr *tmpl_hdr;
+++=======
+++>>>>>>> 8d37ba023f0c (qlcnic: Collect firmware dump using DMA on 82xx adapters)
+  	struct device *dev = &adapter->pdev->dev;
+  	u32 dma_no, dma_base_addr, temp_addr;
+  	int i, ret, dma_sts;
+@@@ -596,7 -716,6 +710,10 @@@ static u32 qlcnic_read_memory_pexdma(st
+  	struct qlcnic_fw_dump *fw_dump = &adapter->ahw->fw_dump;
+  	u32 temp, dma_base_addr, size = 0, read_size = 0;
+  	struct qlcnic_pex_dma_descriptor *dma_descr;
+++<<<<<<< HEAD
+ +	struct qlcnic_dump_template_hdr *tmpl_hdr;
+++=======
+++>>>>>>> 8d37ba023f0c (qlcnic: Collect firmware dump using DMA on 82xx adapters)
+  	struct device *dev = &adapter->pdev->dev;
+  	dma_addr_t dma_phys_addr;
+  	void *dma_buffer;
+@@@ -1081,17 -1202,12 +1200,20 @@@ flash_temp
+  		return -EIO;
+  	}
+  
+ -	qlcnic_cache_tmpl_hdr_values(adapter, fw_dump);
+ -
+ +	tmpl_hdr = ahw->fw_dump.tmpl_hdr;
+ +	tmpl_hdr->drv_cap_mask = tmpl_hdr->cap_mask;
+  	dev_info(&adapter->pdev->dev,
+  		 "Default minidump capture mask 0x%x\n",
+ -		 fw_dump->cap_mask);
+ +		 tmpl_hdr->cap_mask);
+ +
+++<<<<<<< HEAD
+ +	if ((tmpl_hdr->version & 0xfffff) >= 0x20001)
+ +		ahw->fw_dump.use_pex_dma = true;
+ +	else
+ +		ahw->fw_dump.use_pex_dma = false;
+  
+++=======
+++>>>>>>> 8d37ba023f0c (qlcnic: Collect firmware dump using DMA on 82xx adapters)
+  	qlcnic_enable_fw_dump_state(adapter);
+  
+  	return 0;
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+index f09be3298853..05ae656895d1 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+@@ -2895,19 +2895,18 @@ void qlcnic_83xx_unlock_driver(struct qlcnic_adapter *adapter)
+ 	QLCRDX(adapter->ahw, QLC_83XX_DRV_UNLOCK);
+ }
+ 
+-int qlcnic_83xx_ms_mem_write128(struct qlcnic_adapter *adapter, u64 addr,
++int qlcnic_ms_mem_write128(struct qlcnic_adapter *adapter, u64 addr,
+ 				u32 *data, u32 count)
+ {
+ 	int i, j, ret = 0;
+ 	u32 temp;
+-	int err = 0;
+ 
+ 	/* Check alignment */
+ 	if (addr & 0xF)
+ 		return -EIO;
+ 
+ 	mutex_lock(&adapter->ahw->mem_lock);
+-	qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_ADDR_HI, 0);
++	qlcnic_ind_wr(adapter, QLCNIC_MS_ADDR_HI, 0);
+ 
+ 	for (i = 0; i < count; i++, addr += 16) {
+ 		if (!((ADDR_IN_RANGE(addr, QLCNIC_ADDR_QDR_NET,
+@@ -2918,26 +2917,16 @@ int qlcnic_83xx_ms_mem_write128(struct qlcnic_adapter *adapter, u64 addr,
+ 			return -EIO;
+ 		}
+ 
+-		qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_ADDR_LO, addr);
+-		qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_WRTDATA_LO,
+-					     *data++);
+-		qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_WRTDATA_HI,
+-					     *data++);
+-		qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_WRTDATA_ULO,
+-					     *data++);
+-		qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_WRTDATA_UHI,
+-					     *data++);
+-		qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_CTRL,
+-					     QLCNIC_TA_WRITE_ENABLE);
+-		qlcnic_83xx_wrt_reg_indirect(adapter, QLCNIC_MS_CTRL,
+-					     QLCNIC_TA_WRITE_START);
++		qlcnic_ind_wr(adapter, QLCNIC_MS_ADDR_LO, addr);
++		qlcnic_ind_wr(adapter, QLCNIC_MS_WRTDATA_LO, *data++);
++		qlcnic_ind_wr(adapter, QLCNIC_MS_WRTDATA_HI, *data++);
++		qlcnic_ind_wr(adapter, QLCNIC_MS_WRTDATA_ULO, *data++);
++		qlcnic_ind_wr(adapter, QLCNIC_MS_WRTDATA_UHI, *data++);
++		qlcnic_ind_wr(adapter, QLCNIC_MS_CTRL, QLCNIC_TA_WRITE_ENABLE);
++		qlcnic_ind_wr(adapter, QLCNIC_MS_CTRL, QLCNIC_TA_WRITE_START);
+ 
+ 		for (j = 0; j < MAX_CTL_CHECK; j++) {
+-			temp = QLCRD32(adapter, QLCNIC_MS_CTRL, &err);
+-			if (err == -EIO) {
+-				mutex_unlock(&adapter->ahw->mem_lock);
+-				return err;
+-			}
++			temp = qlcnic_ind_rd(adapter, QLCNIC_MS_CTRL);
+ 
+ 			if ((temp & TA_CTL_BUSY) == 0)
+ 				break;
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+index 33a8917fec40..8bb7ee8a2670 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+@@ -1271,8 +1271,8 @@ static int qlcnic_83xx_copy_bootloader(struct qlcnic_adapter *adapter)
+ 		return ret;
+ 	}
+ 	/* 16 byte write to MS memory */
+-	ret = qlcnic_83xx_ms_mem_write128(adapter, dest, (u32 *)p_cache,
+-					  size / 16);
++	ret = qlcnic_ms_mem_write128(adapter, dest, (u32 *)p_cache,
++				     size / 16);
+ 	if (ret) {
+ 		vfree(p_cache);
+ 		return ret;
+@@ -1297,8 +1297,8 @@ static int qlcnic_83xx_copy_fw_file(struct qlcnic_adapter *adapter)
+ 	p_cache = (u32 *)fw->data;
+ 	addr = (u64)dest;
+ 
+-	ret = qlcnic_83xx_ms_mem_write128(adapter, addr,
+-					  p_cache, size / 16);
++	ret = qlcnic_ms_mem_write128(adapter, addr,
++				     p_cache, size / 16);
+ 	if (ret) {
+ 		dev_err(&adapter->pdev->dev, "MS memory write failed\n");
+ 		release_firmware(fw);
+@@ -1313,8 +1313,8 @@ static int qlcnic_83xx_copy_fw_file(struct qlcnic_adapter *adapter)
+ 			data[i] = fw->data[size + i];
+ 		for (; i < 16; i++)
+ 			data[i] = 0;
+-		ret = qlcnic_83xx_ms_mem_write128(adapter, addr,
+-						  (u32 *)data, 1);
++		ret = qlcnic_ms_mem_write128(adapter, addr,
++					     (u32 *)data, 1);
+ 		if (ret) {
+ 			dev_err(&adapter->pdev->dev,
+ 				"MS memory write failed\n");
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+index e6947af977a9..e523bd4e1d64 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+@@ -373,12 +373,16 @@ int qlcnic_ind_rd(struct qlcnic_adapter *adapter, u32 addr)
+ 	return data;
+ }
+ 
+-void qlcnic_ind_wr(struct qlcnic_adapter *adapter, u32 addr, u32 data)
++int qlcnic_ind_wr(struct qlcnic_adapter *adapter, u32 addr, u32 data)
+ {
++	int ret = 0;
++
+ 	if (qlcnic_82xx_check(adapter))
+ 		qlcnic_write_window_reg(addr, adapter->ahw->pci_base0, data);
+ 	else
+-		qlcnic_83xx_wrt_reg_indirect(adapter, addr, data);
++		ret = qlcnic_83xx_wrt_reg_indirect(adapter, addr, data);
++
++	return ret;
+ }
+ 
+ static int
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
