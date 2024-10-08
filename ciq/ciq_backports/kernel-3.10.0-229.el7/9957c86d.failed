@@ -1,0 +1,227 @@
+KVM: Move all accesses to kvm::irq_routing into irqchip.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Paul Mackerras <paulus@samba.org>
+commit 9957c86d659a4d5a2bed25ccbd3bfc9c3f25e658
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9957c86d.failed
+
+Now that struct _irqfd does not keep a reference to storage pointed
+to by the irq_routing field of struct kvm, we can move the statement
+that updates it out from under the irqfds.lock and put it in
+kvm_set_irq_routing() instead.  That means we then have to take a
+srcu_read_lock on kvm->irq_srcu around the irqfd_update call in
+kvm_irqfd_assign(), since holding the kvm->irqfds.lock no longer
+ensures that that the routing can't change.
+
+Combined with changing kvm_irq_map_gsi() and kvm_irq_map_chip_pin()
+to take a struct kvm * argument instead of the pointer to the routing
+table, this allows us to to move all references to kvm->irq_routing
+into irqchip.c.  That in turn allows us to move the definition of the
+kvm_irq_routing_table struct into irqchip.c as well.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Tested-by: Eric Auger <eric.auger@linaro.org>
+	Tested-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9957c86d659a4d5a2bed25ccbd3bfc9c3f25e658)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kvm_host.h
+#	virt/kvm/eventfd.c
+#	virt/kvm/irq_comm.c
+#	virt/kvm/irqchip.c
+diff --cc include/linux/kvm_host.h
+index bfb5f6dbf6ea,ddd33e1aeee1..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -740,6 -734,10 +722,13 @@@ void kvm_unregister_irq_mask_notifier(s
+  void kvm_fire_mask_notifiers(struct kvm *kvm, unsigned irqchip, unsigned pin,
+  			     bool mask);
+  
+++<<<<<<< HEAD
+++=======
++ int kvm_irq_map_gsi(struct kvm *kvm,
++ 		    struct kvm_kernel_irq_routing_entry *entries, int gsi);
++ int kvm_irq_map_chip_pin(struct kvm *kvm, unsigned irqchip, unsigned pin);
++ 
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  int kvm_set_irq(struct kvm *kvm, int irq_source_id, u32 irq, int level,
+  		bool line_status);
+  int kvm_set_irq_inatomic(struct kvm *kvm, int irq_source_id, u32 irq, int level);
+diff --cc virt/kvm/eventfd.c
+index 69e2c5d400cf,f0075ffb0c35..000000000000
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@@ -278,10 -278,13 +278,16 @@@ irqfd_ptable_queue_proc(struct file *fi
+  }
+  
+  /* Must be called under irqfds.lock */
+- static void irqfd_update(struct kvm *kvm, struct _irqfd *irqfd,
+- 			 struct kvm_irq_routing_table *irq_rt)
++ static void irqfd_update(struct kvm *kvm, struct _irqfd *irqfd)
+  {
+  	struct kvm_kernel_irq_routing_entry *e;
+++<<<<<<< HEAD
+++=======
++ 	struct kvm_kernel_irq_routing_entry entries[KVM_NR_IRQCHIPS];
++ 	int i, n_entries;
++ 
++ 	n_entries = kvm_irq_map_gsi(kvm, entries, irqfd->gsi);
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  
+  	write_seqcount_begin(&irqfd->irq_entry_sc);
+  
+diff --cc virt/kvm/irq_comm.c
+index ced4a542a031,963b8995a9e8..000000000000
+--- a/virt/kvm/irq_comm.c
++++ b/virt/kvm/irq_comm.c
+@@@ -160,9 -160,9 +160,8 @@@ static int kvm_set_msi_inatomic(struct 
+   */
+  int kvm_set_irq_inatomic(struct kvm *kvm, int irq_source_id, u32 irq, int level)
+  {
+ -	struct kvm_kernel_irq_routing_entry entries[KVM_NR_IRQCHIPS];
+  	struct kvm_kernel_irq_routing_entry *e;
+  	int ret = -EINVAL;
+- 	struct kvm_irq_routing_table *irq_rt;
+  	int idx;
+  
+  	trace_kvm_set_irq(irq, level, irq_source_id);
+@@@ -176,15 -176,13 +175,25 @@@
+  	 * which is limited to 1:1 GSI mapping.
+  	 */
+  	idx = srcu_read_lock(&kvm->irq_srcu);
+++<<<<<<< HEAD
+ +	irq_rt = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu);
+ +	if (irq < irq_rt->nr_rt_entries)
+ +		hlist_for_each_entry(e, &irq_rt->map[irq], link) {
+ +			if (likely(e->type == KVM_IRQ_ROUTING_MSI))
+ +				ret = kvm_set_msi_inatomic(e, kvm);
+ +			else
+ +				ret = -EWOULDBLOCK;
+ +			break;
+ +		}
+++=======
++ 	if (kvm_irq_map_gsi(kvm, entries, irq) > 0) {
++ 		e = &entries[0];
++ 		if (likely(e->type == KVM_IRQ_ROUTING_MSI))
++ 			ret = kvm_set_msi_inatomic(e, kvm);
++ 		else
++ 			ret = -EWOULDBLOCK;
++ 	}
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  	srcu_read_unlock(&kvm->irq_srcu, idx);
+  	return ret;
+  }
+diff --cc virt/kvm/irqchip.c
+index b43c275775cd,04faac50cef5..000000000000
+--- a/virt/kvm/irqchip.c
++++ b/virt/kvm/irqchip.c
+@@@ -31,13 -31,51 +31,58 @@@
+  #include <trace/events/kvm.h>
+  #include "irq.h"
+  
+++<<<<<<< HEAD
+++=======
++ struct kvm_irq_routing_table {
++ 	int chip[KVM_NR_IRQCHIPS][KVM_IRQCHIP_NUM_PINS];
++ 	struct kvm_kernel_irq_routing_entry *rt_entries;
++ 	u32 nr_rt_entries;
++ 	/*
++ 	 * Array indexed by gsi. Each entry contains list of irq chips
++ 	 * the gsi is connected to.
++ 	 */
++ 	struct hlist_head map[0];
++ };
++ 
++ int kvm_irq_map_gsi(struct kvm *kvm,
++ 		    struct kvm_kernel_irq_routing_entry *entries, int gsi)
++ {
++ 	struct kvm_irq_routing_table *irq_rt;
++ 	struct kvm_kernel_irq_routing_entry *e;
++ 	int n = 0;
++ 
++ 	irq_rt = srcu_dereference_check(kvm->irq_routing, &kvm->irq_srcu,
++ 					lockdep_is_held(&kvm->irq_lock));
++ 	if (gsi < irq_rt->nr_rt_entries) {
++ 		hlist_for_each_entry(e, &irq_rt->map[gsi], link) {
++ 			entries[n] = *e;
++ 			++n;
++ 		}
++ 	}
++ 
++ 	return n;
++ }
++ 
++ int kvm_irq_map_chip_pin(struct kvm *kvm, unsigned irqchip, unsigned pin)
++ {
++ 	struct kvm_irq_routing_table *irq_rt;
++ 
++ 	irq_rt = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu);
++ 	return irq_rt->chip[irqchip][pin];
++ }
++ 
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  bool kvm_irq_has_notifier(struct kvm *kvm, unsigned irqchip, unsigned pin)
+  {
+  	struct kvm_irq_ack_notifier *kian;
+  	int gsi, idx;
+  
+  	idx = srcu_read_lock(&kvm->irq_srcu);
+++<<<<<<< HEAD
+ +	gsi = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu)->chip[irqchip][pin];
+++=======
++ 	gsi = kvm_irq_map_chip_pin(kvm, irqchip, pin);
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  	if (gsi != -1)
+  		hlist_for_each_entry_rcu(kian, &kvm->irq_ack_notifier_list,
+  					 link)
+@@@ -60,7 -98,7 +105,11 @@@ void kvm_notify_acked_irq(struct kvm *k
+  	trace_kvm_ack_irq(irqchip, pin);
+  
+  	idx = srcu_read_lock(&kvm->irq_srcu);
+++<<<<<<< HEAD
+ +	gsi = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu)->chip[irqchip][pin];
+++=======
++ 	gsi = kvm_irq_map_chip_pin(kvm, irqchip, pin);
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  	if (gsi != -1)
+  		hlist_for_each_entry_rcu(kian, &kvm->irq_ack_notifier_list,
+  					 link)
+@@@ -115,9 -153,8 +164,14 @@@ int kvm_send_userspace_msi(struct kvm *
+  int kvm_set_irq(struct kvm *kvm, int irq_source_id, u32 irq, int level,
+  		bool line_status)
+  {
+++<<<<<<< HEAD
+ +	struct kvm_kernel_irq_routing_entry *e, irq_set[KVM_NR_IRQCHIPS];
+ +	int ret = -1, i = 0, idx;
+ +	struct kvm_irq_routing_table *irq_rt;
+++=======
++ 	struct kvm_kernel_irq_routing_entry irq_set[KVM_NR_IRQCHIPS];
++ 	int ret = -1, i, idx;
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  
+  	trace_kvm_set_irq(irq, level, irq_source_id);
+  
+@@@ -126,10 -163,7 +180,14 @@@
+  	 * writes to the unused one.
+  	 */
+  	idx = srcu_read_lock(&kvm->irq_srcu);
+++<<<<<<< HEAD
+ +	irq_rt = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu);
+ +	if (irq < irq_rt->nr_rt_entries)
+ +		hlist_for_each_entry(e, &irq_rt->map[irq], link)
+ +			irq_set[i++] = *e;
+++=======
++ 	i = kvm_irq_map_gsi(kvm, irq_set, irq);
+++>>>>>>> 9957c86d659a (KVM: Move all accesses to kvm::irq_routing into irqchip.c)
+  	srcu_read_unlock(&kvm->irq_srcu, idx);
+  
+  	while(i--) {
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path virt/kvm/eventfd.c
+* Unmerged path virt/kvm/irq_comm.c
+* Unmerged path virt/kvm/irqchip.c
