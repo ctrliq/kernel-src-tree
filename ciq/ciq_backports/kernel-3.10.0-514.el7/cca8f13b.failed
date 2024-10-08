@@ -1,0 +1,441 @@
+hpsa: Add box and bay information for enclosure devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Don Brace <don.brace@pmcs.com>
+commit cca8f13b4fdaf3583e103ae7f96fda948839b265
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cca8f13b.failed
+
+Adding a new method to display enclosure device information.
+
+	Reviewed-by: Justin Lindley <justin.lindley@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit cca8f13b4fdaf3583e103ae7f96fda948839b265)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+#	drivers/scsi/hpsa_cmd.h
+diff --cc drivers/scsi/hpsa.c
+index 68754355feaa,17a39761b05d..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -733,6 -749,91 +733,94 @@@ static ssize_t host_show_hp_ssd_smart_p
+  	return snprintf(buf, 20, "%d\n", offload_enabled);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define MAX_PATHS 8
++ static ssize_t path_info_show(struct device *dev,
++ 	     struct device_attribute *attr, char *buf)
++ {
++ 	struct ctlr_info *h;
++ 	struct scsi_device *sdev;
++ 	struct hpsa_scsi_dev_t *hdev;
++ 	unsigned long flags;
++ 	int i;
++ 	int output_len = 0;
++ 	u8 box;
++ 	u8 bay;
++ 	u8 path_map_index = 0;
++ 	char *active;
++ 	unsigned char phys_connector[2];
++ 
++ 	sdev = to_scsi_device(dev);
++ 	h = sdev_to_hba(sdev);
++ 	spin_lock_irqsave(&h->devlock, flags);
++ 	hdev = sdev->hostdata;
++ 	if (!hdev) {
++ 		spin_unlock_irqrestore(&h->devlock, flags);
++ 		return -ENODEV;
++ 	}
++ 
++ 	bay = hdev->bay;
++ 	for (i = 0; i < MAX_PATHS; i++) {
++ 		path_map_index = 1<<i;
++ 		if (i == hdev->active_path_index)
++ 			active = "Active";
++ 		else if (hdev->path_map & path_map_index)
++ 			active = "Inactive";
++ 		else
++ 			continue;
++ 
++ 		output_len += scnprintf(buf + output_len,
++ 				PAGE_SIZE - output_len,
++ 				"[%d:%d:%d:%d] %20.20s ",
++ 				h->scsi_host->host_no,
++ 				hdev->bus, hdev->target, hdev->lun,
++ 				scsi_device_type(hdev->devtype));
++ 
++ 		if (hdev->devtype == TYPE_RAID || is_logical_device(hdev)) {
++ 			output_len += scnprintf(buf + output_len,
++ 						PAGE_SIZE - output_len,
++ 						"%s\n", active);
++ 			continue;
++ 		}
++ 
++ 		box = hdev->box[i];
++ 		memcpy(&phys_connector, &hdev->phys_connector[i],
++ 			sizeof(phys_connector));
++ 		if (phys_connector[0] < '0')
++ 			phys_connector[0] = '0';
++ 		if (phys_connector[1] < '0')
++ 			phys_connector[1] = '0';
++ 		output_len += scnprintf(buf + output_len,
++ 				PAGE_SIZE - output_len,
++ 				"PORT: %.2s ",
++ 				phys_connector);
++ 		if (hdev->devtype == TYPE_DISK && hdev->expose_device) {
++ 			if (box == 0 || box == 0xFF) {
++ 				output_len += scnprintf(buf + output_len,
++ 					PAGE_SIZE - output_len,
++ 					"BAY: %hhu %s\n",
++ 					bay, active);
++ 			} else {
++ 				output_len += scnprintf(buf + output_len,
++ 					PAGE_SIZE - output_len,
++ 					"BOX: %hhu BAY: %hhu %s\n",
++ 					box, bay, active);
++ 			}
++ 		} else if (box != 0 && box != 0xFF) {
++ 			output_len += scnprintf(buf + output_len,
++ 				PAGE_SIZE - output_len, "BOX: %hhu %s\n",
++ 				box, active);
++ 		} else
++ 			output_len += scnprintf(buf + output_len,
++ 				PAGE_SIZE - output_len, "%s\n", active);
++ 	}
++ 
++ 	spin_unlock_irqrestore(&h->devlock, flags);
++ 	return output_len;
++ }
++ 
+++>>>>>>> cca8f13b4fda (hpsa: Add box and bay information for enclosure devices)
+  static DEVICE_ATTR(raid_level, S_IRUGO, raid_level_show, NULL);
+  static DEVICE_ATTR(lunid, S_IRUGO, lunid_show, NULL);
+  static DEVICE_ATTR(unique_id, S_IRUGO, unique_id_show, NULL);
+@@@ -3021,6 -3186,149 +3109,151 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * get enclosure information
++  * struct ReportExtendedLUNdata *rlep - Used for BMIC drive number
++  * struct hpsa_scsi_dev_t *encl_dev - device entry for enclosure
++  * Uses id_physical_device to determine the box_index.
++  */
++ static void hpsa_get_enclosure_info(struct ctlr_info *h,
++ 			unsigned char *scsi3addr,
++ 			struct ReportExtendedLUNdata *rlep, int rle_index,
++ 			struct hpsa_scsi_dev_t *encl_dev)
++ {
++ 	int rc = -1;
++ 	struct CommandList *c = NULL;
++ 	struct ErrorInfo *ei = NULL;
++ 	struct bmic_sense_storage_box_params *bssbp = NULL;
++ 	struct bmic_identify_physical_device *id_phys = NULL;
++ 	struct ext_report_lun_entry *rle = &rlep->LUN[rle_index];
++ 	u16 bmic_device_index = 0;
++ 
++ 	bmic_device_index = GET_BMIC_DRIVE_NUMBER(&rle->lunid[0]);
++ 
++ 	if (bmic_device_index == 0xFF00)
++ 		goto out;
++ 
++ 	bssbp = kzalloc(sizeof(*bssbp), GFP_KERNEL);
++ 	if (!bssbp)
++ 		goto out;
++ 
++ 	id_phys = kzalloc(sizeof(*id_phys), GFP_KERNEL);
++ 	if (!id_phys)
++ 		goto out;
++ 
++ 	rc = hpsa_bmic_id_physical_device(h, scsi3addr, bmic_device_index,
++ 						id_phys, sizeof(*id_phys));
++ 	if (rc) {
++ 		dev_warn(&h->pdev->dev, "%s: id_phys failed %d bdi[0x%x]\n",
++ 			__func__, encl_dev->external, bmic_device_index);
++ 		goto out;
++ 	}
++ 
++ 	c = cmd_alloc(h);
++ 
++ 	rc = fill_cmd(c, BMIC_SENSE_STORAGE_BOX_PARAMS, h, bssbp,
++ 			sizeof(*bssbp), 0, RAID_CTLR_LUNID, TYPE_CMD);
++ 
++ 	if (rc)
++ 		goto out;
++ 
++ 	if (id_phys->phys_connector[1] == 'E')
++ 		c->Request.CDB[5] = id_phys->box_index;
++ 	else
++ 		c->Request.CDB[5] = 0;
++ 
++ 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c, PCI_DMA_FROMDEVICE,
++ 						NO_TIMEOUT);
++ 	if (rc)
++ 		goto out;
++ 
++ 	ei = c->err_info;
++ 	if (ei->CommandStatus != 0 && ei->CommandStatus != CMD_DATA_UNDERRUN) {
++ 		rc = -1;
++ 		goto out;
++ 	}
++ 
++ 	encl_dev->box[id_phys->active_path_number] = bssbp->phys_box_on_port;
++ 	memcpy(&encl_dev->phys_connector[id_phys->active_path_number],
++ 		bssbp->phys_connector, sizeof(bssbp->phys_connector));
++ 
++ 	rc = IO_OK;
++ out:
++ 	kfree(bssbp);
++ 	kfree(id_phys);
++ 
++ 	if (c)
++ 		cmd_free(h, c);
++ 
++ 	if (rc != IO_OK)
++ 		hpsa_show_dev_msg(KERN_INFO, h, encl_dev,
++ 			"Error, could not get enclosure information\n");
++ }
++ 
++ static u64 hpsa_get_sas_address_from_report_physical(struct ctlr_info *h,
++ 						unsigned char *scsi3addr)
++ {
++ 	struct ReportExtendedLUNdata *physdev;
++ 	u32 nphysicals;
++ 	u64 sa = 0;
++ 	int i;
++ 
++ 	physdev = kzalloc(sizeof(*physdev), GFP_KERNEL);
++ 	if (!physdev)
++ 		return 0;
++ 
++ 	if (hpsa_scsi_do_report_phys_luns(h, physdev, sizeof(*physdev))) {
++ 		dev_err(&h->pdev->dev, "report physical LUNs failed.\n");
++ 		kfree(physdev);
++ 		return 0;
++ 	}
++ 	nphysicals = get_unaligned_be32(physdev->LUNListLength) / 24;
++ 
++ 	for (i = 0; i < nphysicals; i++)
++ 		if (!memcmp(&physdev->LUN[i].lunid[0], scsi3addr, 8)) {
++ 			sa = get_unaligned_be64(&physdev->LUN[i].wwid[0]);
++ 			break;
++ 		}
++ 
++ 	kfree(physdev);
++ 
++ 	return sa;
++ }
++ 
++ static void hpsa_get_sas_address(struct ctlr_info *h, unsigned char *scsi3addr,
++ 					struct hpsa_scsi_dev_t *dev)
++ {
++ 	int rc;
++ 	u64 sa = 0;
++ 
++ 	if (is_hba_lunid(scsi3addr)) {
++ 		struct bmic_sense_subsystem_info *ssi;
++ 
++ 		ssi = kzalloc(sizeof(*ssi), GFP_KERNEL);
++ 		if (ssi == NULL) {
++ 			dev_warn(&h->pdev->dev,
++ 				"%s: out of memory\n", __func__);
++ 			return;
++ 		}
++ 
++ 		rc = hpsa_bmic_sense_subsystem_information(h,
++ 					scsi3addr, 0, ssi, sizeof(*ssi));
++ 		if (rc == 0) {
++ 			sa = get_unaligned_be64(ssi->primary_world_wide_id);
++ 			h->sas_address = sa;
++ 		}
++ 
++ 		kfree(ssi);
++ 	} else
++ 		sa = hpsa_get_sas_address_from_report_physical(h, scsi3addr);
++ 
++ 	dev->sas_address = sa;
++ }
++ 
++ /* Get a device id from inquiry page 0x83 */
+++>>>>>>> cca8f13b4fda (hpsa: Add box and bay information for enclosure devices)
+  static int hpsa_vpd_page_supported(struct ctlr_info *h,
+  	unsigned char scsi3addr[], u8 page)
+  {
+@@@ -3814,15 -4108,31 +4047,22 @@@ static void hpsa_update_scsi_devices(st
+  			i, nphysicals, nlogicals, physdev_list, logdev_list);
+  
+  		/* skip masked non-disk devices */
+++<<<<<<< HEAD
+ +		if (MASKED_DEVICE(lunaddrbytes))
+ +			if (i < nphysicals + (raid_ctlr_position == 0) &&
+ +				NON_DISK_PHYS_DEV(lunaddrbytes))
+ +				continue;
+++=======
++ 		if (MASKED_DEVICE(lunaddrbytes) && physical_device &&
++ 		   (physdev_list->LUN[phys_dev_index].device_type != 0x06) &&
++ 		   (physdev_list->LUN[phys_dev_index].device_flags & 0x01))
++ 			continue;
+++>>>>>>> cca8f13b4fda (hpsa: Add box and bay information for enclosure devices)
+  
+  		/* Get device type, vendor, model, device id */
+ -		rc = hpsa_update_device_info(h, lunaddrbytes, tmpdevice,
+ -							&is_OBDR);
+ -		if (rc == -ENOMEM) {
+ -			dev_warn(&h->pdev->dev,
+ -				"Out of memory, rescan deferred.\n");
+ -			h->drv_req_rescan = 1;
+ -			goto out;
+ -		}
+ -		if (rc) {
+ -			dev_warn(&h->pdev->dev,
+ -				"Inquiry failed, skipping device.\n");
+ -			continue;
+ -		}
+ -
+ -		/* Determine if this is a lun from an external target array */
+ -		tmpdevice->external =
+ -			figure_external_status(h, raid_ctlr_position, i,
+ -						nphysicals, nlocal_logicals);
+ -
+ +		if (hpsa_update_device_info(h, lunaddrbytes, tmpdevice,
+ +							&is_OBDR))
+ +			continue; /* skip it if we can't talk to it. */
+  		figure_bus_target_lun(h, lunaddrbytes, tmpdevice);
+  		hpsa_update_device_supports_aborts(h, tmpdevice, lunaddrbytes);
+  		this_device = currentsd[ncurrent];
+@@@ -3886,12 -4194,14 +4126,21 @@@
+  			break;
+  		case TYPE_TAPE:
+  		case TYPE_MEDIUM_CHANGER:
+++<<<<<<< HEAD
+++=======
++ 			ncurrent++;
++ 			break;
++ 		case TYPE_ENCLOSURE:
++ 			hpsa_get_enclosure_info(h, lunaddrbytes,
++ 						physdev_list, phys_dev_index,
++ 						this_device);
+++>>>>>>> cca8f13b4fda (hpsa: Add box and bay information for enclosure devices)
+  			ncurrent++;
+  			break;
+ +		case TYPE_ENCLOSURE:
+ +			if (h->hba_mode_enabled)
+ +				ncurrent++;
+ +			break;
+  		case TYPE_RAID:
+  			/* Only present the Smartarray HBA as a RAID controller.
+  			 * If it's a RAID controller other than the HBA itself
+@@@ -6384,6 -6702,42 +6633,45 @@@ static int fill_cmd(struct CommandList 
+  			c->Request.CDB[7] = (size >> 16) & 0xFF;
+  			c->Request.CDB[8] = (size >> 8) & 0XFF;
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case BMIC_SENSE_SUBSYSTEM_INFORMATION:
++ 			c->Request.CDBLen = 10;
++ 			c->Request.type_attr_dir =
++ 				TYPE_ATTR_DIR(cmd_type, ATTR_SIMPLE, XFER_READ);
++ 			c->Request.Timeout = 0;
++ 			c->Request.CDB[0] = BMIC_READ;
++ 			c->Request.CDB[6] = BMIC_SENSE_SUBSYSTEM_INFORMATION;
++ 			c->Request.CDB[7] = (size >> 16) & 0xFF;
++ 			c->Request.CDB[8] = (size >> 8) & 0XFF;
++ 			break;
++ 		case BMIC_SENSE_STORAGE_BOX_PARAMS:
++ 			c->Request.CDBLen = 10;
++ 			c->Request.type_attr_dir =
++ 				TYPE_ATTR_DIR(cmd_type, ATTR_SIMPLE, XFER_READ);
++ 			c->Request.Timeout = 0;
++ 			c->Request.CDB[0] = BMIC_READ;
++ 			c->Request.CDB[6] = BMIC_SENSE_STORAGE_BOX_PARAMS;
++ 			c->Request.CDB[7] = (size >> 16) & 0xFF;
++ 			c->Request.CDB[8] = (size >> 8) & 0XFF;
++ 			break;
++ 		case BMIC_IDENTIFY_CONTROLLER:
++ 			c->Request.CDBLen = 10;
++ 			c->Request.type_attr_dir =
++ 				TYPE_ATTR_DIR(cmd_type, ATTR_SIMPLE, XFER_READ);
++ 			c->Request.Timeout = 0;
++ 			c->Request.CDB[0] = BMIC_READ;
++ 			c->Request.CDB[1] = 0;
++ 			c->Request.CDB[2] = 0;
++ 			c->Request.CDB[3] = 0;
++ 			c->Request.CDB[4] = 0;
++ 			c->Request.CDB[5] = 0;
++ 			c->Request.CDB[6] = BMIC_IDENTIFY_CONTROLLER;
++ 			c->Request.CDB[7] = (size >> 16) & 0xFF;
++ 			c->Request.CDB[8] = (size >> 8) & 0XFF;
++ 			c->Request.CDB[9] = 0;
++ 			break;
+++>>>>>>> cca8f13b4fda (hpsa: Add box and bay information for enclosure devices)
+  		default:
+  			dev_warn(&h->pdev->dev, "unknown command 0x%c\n", cmd);
+  			BUG();
+diff --cc drivers/scsi/hpsa_cmd.h
+index 47c756ba8dce,6a919ada96b3..000000000000
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@@ -288,6 -286,12 +288,15 @@@ struct SenseSubsystem_info 
+  #define BMIC_FLASH_FIRMWARE 0xF7
+  #define BMIC_SENSE_CONTROLLER_PARAMETERS 0x64
+  #define BMIC_IDENTIFY_PHYSICAL_DEVICE 0x15
+++<<<<<<< HEAD
+++=======
++ #define BMIC_IDENTIFY_CONTROLLER 0x11
++ #define BMIC_SET_DIAG_OPTIONS 0xF4
++ #define BMIC_SENSE_DIAG_OPTIONS 0xF5
++ #define HPSA_DIAG_OPTS_DISABLE_RLD_CACHING 0x40000000
++ #define BMIC_SENSE_SUBSYSTEM_INFORMATION 0x66
++ #define BMIC_SENSE_STORAGE_BOX_PARAMS 0x65
+++>>>>>>> cca8f13b4fda (hpsa: Add box and bay information for enclosure devices)
+  
+  /* Command List Structure */
+  union SCSI3Addr {
+@@@ -816,5 -830,30 +825,33 @@@ struct bmic_identify_physical_device 
+  	u8     padding[112];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bmic_sense_subsystem_info {
++ 	u8	primary_slot_number;
++ 	u8	reserved[3];
++ 	u8	chasis_serial_number[32];
++ 	u8	primary_world_wide_id[8];
++ 	u8	primary_array_serial_number[32]; /* NULL terminated */
++ 	u8	primary_cache_serial_number[32]; /* NULL terminated */
++ 	u8	reserved_2[8];
++ 	u8	secondary_array_serial_number[32];
++ 	u8	secondary_cache_serial_number[32];
++ 	u8	pad[332];
++ };
++ 
++ struct bmic_sense_storage_box_params {
++ 	u8	reserved[36];
++ 	u8	inquiry_valid;
++ 	u8	reserved_1[68];
++ 	u8	phys_box_on_port;
++ 	u8	reserved_2[22];
++ 	u16	connection_info;
++ 	u8	reserver_3[84];
++ 	u8	phys_connector[2];
++ 	u8	reserved_4[296];
++ };
++ 
+++>>>>>>> cca8f13b4fda (hpsa: Add box and bay information for enclosure devices)
+  #pragma pack()
+  #endif /* HPSA_CMD_H */
+* Unmerged path drivers/scsi/hpsa.c
+* Unmerged path drivers/scsi/hpsa_cmd.h
