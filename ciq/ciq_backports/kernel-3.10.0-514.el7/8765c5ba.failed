@@ -1,0 +1,232 @@
+ACPI / scan: Rework modalias creation when "compatible" is present
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 8765c5ba19490c9167fe0c4e05c2dfdcc39873a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8765c5ba.failed
+
+Currently, the ACPI modalias creation covers two mutually exclusive
+cases: If the PRP0001 device ID is present in the device's list of
+ACPI/PNP IDs and the "compatible" property is present in _DSD, the
+created modalias will follow the OF rules of modalias creation.
+Otherwise, ACPI rules are used.
+
+However, that is not really desirable, because the presence of PRP0001
+in the list of device IDs generally does not preclude using other
+ACPI/PNP IDs with that device and those other IDs may be of higher
+priority.  In those cases, the other IDs should take preference over
+PRP0001 and therefore they also should be present in the modalias.
+
+For this reason, rework the modalias creation for ACPI so that it
+shows both the ACPI-style and OF-style modalias strings if the
+device has a non-empty list of ACPI/PNP IDs (other than PRP0001)
+and a valid "compatible" property at the same time.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit 8765c5ba19490c9167fe0c4e05c2dfdcc39873a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/scan.c
+diff --cc drivers/acpi/scan.c
+index b64d638cf134,d2e3c3e3f9c9..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -127,14 -147,22 +141,33 @@@ static int create_pnp_modalias(struct a
+  		return 0;
+  
+  	len = snprintf(modalias, size, "acpi:");
+++<<<<<<< HEAD
+ +	size -= len;
+ +
+ +	list_for_each_entry(id, &acpi_dev->pnp.ids, list) {
+ +		count = snprintf(&modalias[len], size, "%s:", id->id);
+ +		if (count < 0)
+ +			return EINVAL;
+ +		if (count >= size)
+ +			return -ENOMEM;
+++=======
++ 	if (len <= 0)
++ 		return len;
++ 
++ 	size -= len;
++ 
++ 	list_for_each_entry(id, &acpi_dev->pnp.ids, list) {
++ 		if (!strcmp(id->id, "PRP0001"))
++ 			continue;
++ 
++ 		count = snprintf(&modalias[len], size, "%s:", id->id);
++ 		if (count < 0)
++ 			return -EINVAL;
++ 
++ 		if (count >= size)
++ 			return -ENOMEM;
++ 
+++>>>>>>> 8765c5ba1949 (ACPI / scan: Rework modalias creation when "compatible" is present)
+  		len += count;
+  		size -= count;
+  	}
+@@@ -143,17 -223,149 +228,152 @@@ static int create_of_modalias(struct ac
+  	return len;
+  }
+  
+- static ssize_t
+- acpi_device_modalias_show(struct device *dev, struct device_attribute *attr, char *buf) {
+- 	struct acpi_device *acpi_dev = to_acpi_device(dev);
+++<<<<<<< HEAD
+++=======
++ /*
++  * acpi_companion_match() - Can we match via ACPI companion device
++  * @dev: Device in question
++  *
++  * Check if the given device has an ACPI companion and if that companion has
++  * a valid list of PNP IDs, and if the device is the first (primary) physical
++  * device associated with it.  Return the companion pointer if that's the case
++  * or NULL otherwise.
++  *
++  * If multiple physical devices are attached to a single ACPI companion, we need
++  * to be careful.  The usage scenario for this kind of relationship is that all
++  * of the physical devices in question use resources provided by the ACPI
++  * companion.  A typical case is an MFD device where all the sub-devices share
++  * the parent's ACPI companion.  In such cases we can only allow the primary
++  * (first) physical device to be matched with the help of the companion's PNP
++  * IDs.
++  *
++  * Additional physical devices sharing the ACPI companion can still use
++  * resources available from it but they will be matched normally using functions
++  * provided by their bus types (and analogously for their modalias).
++  */
++ static struct acpi_device *acpi_companion_match(const struct device *dev)
++ {
++ 	struct acpi_device *adev;
++ 
++ 	adev = ACPI_COMPANION(dev);
++ 	if (!adev)
++ 		return NULL;
++ 
++ 	if (list_empty(&adev->pnp.ids))
++ 		return NULL;
++ 
++ 	mutex_lock(&adev->physical_node_lock);
++ 	if (list_empty(&adev->physical_node_list)) {
++ 		adev = NULL;
++ 	} else {
++ 		const struct acpi_device_physical_node *node;
++ 
++ 		node = list_first_entry(&adev->physical_node_list,
++ 					struct acpi_device_physical_node, node);
++ 		if (node->dev != dev)
++ 			adev = NULL;
++ 	}
++ 	mutex_unlock(&adev->physical_node_lock);
++ 
++ 	return adev;
++ }
++ 
++ static int __acpi_device_uevent_modalias(struct acpi_device *adev,
++ 					 struct kobj_uevent_env *env)
++ {
+  	int len;
+  
+- 	len = create_modalias(acpi_dev, buf, 1024);
+- 	if (len <= 0)
++ 	if (!adev)
++ 		return -ENODEV;
++ 
++ 	if (list_empty(&adev->pnp.ids))
++ 		return 0;
++ 
++ 	if (add_uevent_var(env, "MODALIAS="))
++ 		return -ENOMEM;
++ 
++ 	len = create_pnp_modalias(adev, &env->buf[env->buflen - 1],
++ 				  sizeof(env->buf) - env->buflen);
++ 	if (len < 0)
++ 		return len;
++ 
++ 	env->buflen += len;
++ 	if (!adev->data.of_compatible)
++ 		return 0;
++ 
++ 	if (len > 0 && add_uevent_var(env, "MODALIAS="))
++ 		return -ENOMEM;
++ 
++ 	len = create_of_modalias(adev, &env->buf[env->buflen - 1],
++ 				 sizeof(env->buf) - env->buflen);
++ 	if (len < 0)
+  		return len;
+- 	buf[len++] = '\n';
++ 
++ 	env->buflen += len;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Creates uevent modalias field for ACPI enumerated devices.
++  * Because the other buses does not support ACPI HIDs & CIDs.
++  * e.g. for a device with hid:IBM0001 and cid:ACPI0001 you get:
++  * "acpi:IBM0001:ACPI0001"
++  */
++ int acpi_device_uevent_modalias(struct device *dev, struct kobj_uevent_env *env)
++ {
++ 	return __acpi_device_uevent_modalias(acpi_companion_match(dev), env);
++ }
++ EXPORT_SYMBOL_GPL(acpi_device_uevent_modalias);
++ 
++ static int __acpi_device_modalias(struct acpi_device *adev, char *buf, int size)
++ {
++ 	int len, count;
++ 
++ 	if (!adev)
++ 		return -ENODEV;
++ 
++ 	if (list_empty(&adev->pnp.ids))
++ 		return 0;
++ 
++ 	len = create_pnp_modalias(adev, buf, size - 1);
++ 	if (len < 0) {
++ 		return len;
++ 	} else if (len > 0) {
++ 		buf[len++] = '\n';
++ 		size -= len;
++ 	}
++ 	if (!adev->data.of_compatible)
++ 		return len;
++ 
++ 	count = create_of_modalias(adev, buf + len, size - 1);
++ 	if (count < 0) {
++ 		return count;
++ 	} else if (count > 0) {
++ 		len += count;
++ 		buf[len++] = '\n';
++ 	}
++ 
+  	return len;
+  }
++ 
++ /*
++  * Creates modalias sysfs attribute for ACPI enumerated devices.
++  * Because the other buses does not support ACPI HIDs & CIDs.
++  * e.g. for a device with hid:IBM0001 and cid:ACPI0001 you get:
++  * "acpi:IBM0001:ACPI0001"
++  */
++ int acpi_device_modalias(struct device *dev, char *buf, int size)
++ {
++ 	return __acpi_device_modalias(acpi_companion_match(dev), buf, size);
++ }
++ EXPORT_SYMBOL_GPL(acpi_device_modalias);
++ 
+++>>>>>>> 8765c5ba1949 (ACPI / scan: Rework modalias creation when "compatible" is present)
++ static ssize_t
++ acpi_device_modalias_show(struct device *dev, struct device_attribute *attr, char *buf) {
++ 	return __acpi_device_modalias(to_acpi_device(dev), buf, 1024);
++ }
+  static DEVICE_ATTR(modalias, 0444, acpi_device_modalias_show, NULL);
+  
+  bool acpi_scan_is_offline(struct acpi_device *adev, bool uevent)
+* Unmerged path drivers/acpi/scan.c
