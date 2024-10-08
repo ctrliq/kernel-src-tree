@@ -136,9 +136,9 @@ feature_print = $(eval $(feature_print_code))
 #
 define feature_print_code
   ifeq ($(feature-$(1)), 1)
-    MSG := $(shell printf '...%30s: [ \033[32mon\033[m  ]' $(1))
+    MSG = $(shell printf '...%30s: [ \033[32mon\033[m  ]' $(1))
   else
-    MSG := $(shell printf '...%30s: [ \033[31mOFF\033[m ]' $(1))
+    MSG = $(shell printf '...%30s: [ \033[31mOFF\033[m ]' $(1))
   endif
   $(info $(MSG))
 endef
