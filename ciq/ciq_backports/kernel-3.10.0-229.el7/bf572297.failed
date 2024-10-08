@@ -1,0 +1,647 @@
+blk-mq: remove REQ_END
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit bf57229745f849e500ba69ff91e35bc8160a7373
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/bf572297.failed
+
+Pass an explicit parameter for the last request in a batch to ->queue_rq
+instead of using a request flag.  Besides being a cleaner and non-stateful
+interface this is also required for the next patch, which fixes the blk-mq
+I/O submission code to not start a time too early.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit bf57229745f849e500ba69ff91e35bc8160a7373)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	drivers/block/mtip32xx/mtip32xx.c
+#	drivers/block/virtio_blk.c
+#	drivers/scsi/scsi_lib.c
+#	include/linux/blk_types.h
+diff --cc block/blk-mq.c
+index 6fcf1deefe8d,32b4797f4186..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -355,19 -421,9 +355,9 @@@ static void blk_mq_start_request(struc
+  		 */
+  		rq->nr_phys_segments++;
+  	}
+- 
+- 	/*
+- 	 * Flag the last request in the series so that drivers know when IO
+- 	 * should be kicked off, if they don't do it on a per-request basis.
+- 	 *
+- 	 * Note: the flag isn't the only condition drivers should do kick off.
+- 	 * If drive is busy, the last request might not have the bit set.
+- 	 */
+- 	if (last)
+- 		rq->cmd_flags |= REQ_END;
+  }
+  
+ -static void __blk_mq_requeue_request(struct request *rq)
+ +static void blk_mq_requeue_request(struct request *rq)
+  {
+  	struct request_queue *q = rq->q;
+  
+@@@ -831,11 -1114,124 +819,79 @@@ static void blk_mq_make_request(struct 
+  {
+  	struct blk_mq_hw_ctx *hctx;
+  	struct blk_mq_ctx *ctx;
+ -	struct request *rq;
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+  	int rw = bio_data_dir(bio);
+ -	struct blk_mq_alloc_data alloc_data;
+ -
+ -	if (unlikely(blk_mq_queue_enter(q))) {
+ -		bio_endio(bio, -EIO);
+ -		return NULL;
+ -	}
+ -
+ -	ctx = blk_mq_get_ctx(q);
+ -	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ -
+ -	if (rw_is_sync(bio->bi_rw))
+ -		rw |= REQ_SYNC;
+ -
+ -	trace_block_getrq(q, bio, rw);
+ -	blk_mq_set_alloc_data(&alloc_data, q, GFP_ATOMIC, false, ctx,
+ -			hctx);
+ -	rq = __blk_mq_alloc_request(&alloc_data, rw);
+ -	if (unlikely(!rq)) {
+ -		__blk_mq_run_hw_queue(hctx);
+ -		blk_mq_put_ctx(ctx);
+ -		trace_block_sleeprq(q, bio, rw);
+ -
+ -		ctx = blk_mq_get_ctx(q);
+ -		hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ -		blk_mq_set_alloc_data(&alloc_data, q,
+ -				__GFP_WAIT|GFP_ATOMIC, false, ctx, hctx);
+ -		rq = __blk_mq_alloc_request(&alloc_data, rw);
+ -		ctx = alloc_data.ctx;
+ -		hctx = alloc_data.hctx;
+ -	}
+ -
+ -	hctx->queued++;
+ -	data->hctx = hctx;
+ -	data->ctx = ctx;
+ -	return rq;
+ -}
+ -
+ -/*
+ - * Multiple hardware queue variant. This will not use per-process plugs,
+ - * but will attempt to bypass the hctx queueing if we can go straight to
+ - * hardware for SYNC IO.
+ - */
+ -static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ -{
+ -	const int is_sync = rw_is_sync(bio->bi_rw);
+ -	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ -	struct blk_map_ctx data;
+ -	struct request *rq;
+ +	struct request *rq;
+++<<<<<<< HEAD
+++=======
++ 
++ 	blk_queue_bounce(q, &bio);
++ 
++ 	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
++ 		bio_endio(bio, -EIO);
++ 		return;
++ 	}
++ 
++ 	rq = blk_mq_map_request(q, bio, &data);
++ 	if (unlikely(!rq))
++ 		return;
++ 
++ 	if (unlikely(is_flush_fua)) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_insert_flush(rq);
++ 		goto run_queue;
++ 	}
++ 
++ 	if (is_sync) {
++ 		int ret;
++ 
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_start_request(rq);
++ 
++ 		/*
++ 		 * For OK queue, we are done. For error, kill it. Any other
++ 		 * error (busy), just add it to our list as we previously
++ 		 * would have done
++ 		 */
++ 		ret = q->mq_ops->queue_rq(data.hctx, rq, true);
++ 		if (ret == BLK_MQ_RQ_QUEUE_OK)
++ 			goto done;
++ 		else {
++ 			__blk_mq_requeue_request(rq);
++ 
++ 			if (ret == BLK_MQ_RQ_QUEUE_ERROR) {
++ 				rq->errors = -EIO;
++ 				blk_mq_end_io(rq, rq->errors);
++ 				goto done;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
++ 		/*
++ 		 * For a SYNC request, send it to the hardware immediately. For
++ 		 * an ASYNC request, just ensure that we run it later on. The
++ 		 * latter allows for merging opportunities and more efficient
++ 		 * dispatching.
++ 		 */
++ run_queue:
++ 		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
++ 	}
++ done:
++ 	blk_mq_put_ctx(data.ctx);
++ }
++ 
++ /*
++  * Single hardware queue variant. This will attempt to use any per-process
++  * plug for merging and IO deferral.
++  */
++ static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
++ {
++ 	const int is_sync = rw_is_sync(bio->bi_rw);
++ 	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+++>>>>>>> bf57229745f8 (blk-mq: remove REQ_END)
+  	unsigned int use_plug, request_count = 0;
+ -	struct blk_map_ctx data;
+ -	struct request *rq;
+  
+  	/*
+  	 * If we have multiple hardware queues, just go directly to
+diff --cc drivers/block/mtip32xx/mtip32xx.c
+index 9912f3d7777e,0e2084f37c67..000000000000
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@@ -4054,75 -3726,120 +4054,141 @@@ static void mtip_make_request(struct re
+  		}
+  		if (unlikely(test_bit(MTIP_DDF_WRITE_PROTECT_BIT,
+  							&dd->dd_flag) &&
+ -				rq_data_dir(rq))) {
+ -			return -ENODATA;
+ +				bio_data_dir(bio))) {
+ +			bio_endio(bio, -ENODATA);
+ +			return;
+ +		}
+ +		if (unlikely(test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag))) {
+ +			bio_endio(bio, -ENODATA);
+ +			return;
+ +		}
+ +		if (test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag)) {
+ +			bio_endio(bio, -ENXIO);
+ +			return;
+  		}
+ -		if (unlikely(test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag)))
+ -			return -ENODATA;
+ -		if (test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag))
+ -			return -ENXIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_rw & REQ_DISCARD)) {
+ +		bio_endio(bio, mtip_send_trim(dd, bio->bi_sector,
+ +						bio_sectors(bio)));
+++=======
++ 	if (rq->cmd_flags & REQ_DISCARD) {
++ 		int err;
++ 
++ 		err = mtip_send_trim(dd, blk_rq_pos(rq), blk_rq_sectors(rq));
++ 		blk_mq_end_io(rq, err);
++ 		return 0;
++ 	}
++ 
++ 	/* Create the scatter list for this request. */
++ 	nents = blk_rq_map_sg(hctx->queue, rq, cmd->sg);
++ 
++ 	/* Issue the read/write. */
++ 	mtip_hw_submit_io(dd, rq, cmd, nents, hctx);
++ 	return 0;
++ }
++ 
++ static bool mtip_check_unal_depth(struct blk_mq_hw_ctx *hctx,
++ 				  struct request *rq)
++ {
++ 	struct driver_data *dd = hctx->queue->queuedata;
++ 	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	if (rq_data_dir(rq) == READ || !dd->unal_qdepth)
++ 		return false;
++ 
++ 	/*
++ 	 * If unaligned depth must be limited on this controller, mark it
++ 	 * as unaligned if the IO isn't on a 4k boundary (start of length).
++ 	 */
++ 	if (blk_rq_sectors(rq) <= 64) {
++ 		if ((blk_rq_pos(rq) & 7) || (blk_rq_sectors(rq) & 7))
++ 			cmd->unaligned = 1;
++ 	}
++ 
++ 	if (cmd->unaligned && down_trylock(&dd->port->cmd_slot_unal))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq,
++ 		bool last)
++ {
++ 	int ret;
++ 
++ 	if (unlikely(mtip_check_unal_depth(hctx, rq)))
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 
++ 	ret = mtip_submit_request(hctx, rq);
++ 	if (likely(!ret))
++ 		return BLK_MQ_RQ_QUEUE_OK;
++ 
++ 	rq->errors = ret;
++ 	return BLK_MQ_RQ_QUEUE_ERROR;
++ }
++ 
++ static void mtip_free_cmd(void *data, struct request *rq,
++ 			  unsigned int hctx_idx, unsigned int request_idx)
++ {
++ 	struct driver_data *dd = data;
++ 	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	if (!cmd->command)
+++>>>>>>> bf57229745f8 (blk-mq: remove REQ_END)
+  		return;
+ +	}
+  
+ -	dmam_free_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
+ -				cmd->command, cmd->command_dma);
+ -}
+ -
+ -static int mtip_init_cmd(void *data, struct request *rq, unsigned int hctx_idx,
+ -			 unsigned int request_idx, unsigned int numa_node)
+ -{
+ -	struct driver_data *dd = data;
+ -	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+ -	u32 host_cap_64 = readl(dd->mmio + HOST_CAP) & HOST_CAP_64;
+ -
+ -	cmd->command = dmam_alloc_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
+ -			&cmd->command_dma, GFP_KERNEL);
+ -	if (!cmd->command)
+ -		return -ENOMEM;
+ +	if (unlikely(!bio_has_data(bio))) {
+ +		blk_queue_flush(queue, 0);
+ +		bio_endio(bio, 0);
+ +		return;
+ +	}
+  
+ -	memset(cmd->command, 0, CMD_DMA_ALLOC_SZ);
+ +	if (bio_data_dir(bio) == WRITE && bio_sectors(bio) <= 64 &&
+ +							dd->unal_qdepth) {
+ +		if (bio->bi_sector % 8 != 0) /* Unaligned on 4k boundaries */
+ +			unaligned = 1;
+ +		else if (bio_sectors(bio) % 8 != 0) /* Aligned but not 4k/8k */
+ +			unaligned = 1;
+ +	}
+  
+ -	/* Point the command headers at the command tables. */
+ -	cmd->command_header = dd->port->command_list +
+ -				(sizeof(struct mtip_cmd_hdr) * request_idx);
+ -	cmd->command_header_dma = dd->port->command_list_dma +
+ -				(sizeof(struct mtip_cmd_hdr) * request_idx);
+ +	sg = mtip_hw_get_scatterlist(dd, &tag, unaligned);
+ +	if (likely(sg != NULL)) {
+ +		blk_queue_bounce(queue, &bio);
+  
+ -	if (host_cap_64)
+ -		cmd->command_header->ctbau = __force_bit2int cpu_to_le32((cmd->command_dma >> 16) >> 16);
+ +		if (unlikely((bio)->bi_vcnt > MTIP_MAX_SG)) {
+ +			dev_warn(&dd->pdev->dev,
+ +				"Maximum number of SGL entries exceeded\n");
+ +			bio_io_error(bio);
+ +			mtip_hw_release_scatterlist(dd, tag, unaligned);
+ +			return;
+ +		}
+  
+ -	cmd->command_header->ctba = __force_bit2int cpu_to_le32(cmd->command_dma & 0xFFFFFFFF);
+ +		/* Create the scatter list for this bio. */
+ +		bio_for_each_segment(bvec, bio, i) {
+ +			sg_set_page(&sg[nents],
+ +					bvec->bv_page,
+ +					bvec->bv_len,
+ +					bvec->bv_offset);
+ +			nents++;
+ +		}
+  
+ -	sg_init_table(cmd->sg, MTIP_MAX_SG);
+ -	return 0;
+ +		/* Issue the read/write. */
+ +		mtip_hw_submit_io(dd,
+ +				bio->bi_sector,
+ +				bio_sectors(bio),
+ +				nents,
+ +				tag,
+ +				bio_endio,
+ +				bio,
+ +				bio_data_dir(bio),
+ +				unaligned);
+ +	} else
+ +		bio_io_error(bio);
+  }
+  
+ -static struct blk_mq_ops mtip_mq_ops = {
+ -	.queue_rq	= mtip_queue_rq,
+ -	.map_queue	= blk_mq_map_queue,
+ -	.init_request	= mtip_init_cmd,
+ -	.exit_request	= mtip_free_cmd,
+ -};
+ -
+  /*
+   * Block layer initialization function.
+   *
+diff --cc drivers/block/virtio_blk.c
+index 94062c5cfd56,13756e016797..000000000000
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@@ -148,16 -161,17 +148,21 @@@ static void virtblk_done(struct virtque
+  	/* In case queue is stopped waiting for more buffers. */
+  	if (req_done)
+  		blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
+ -	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+ +	spin_unlock_irqrestore(&vblk->vq_lock, flags);
+  }
+  
+- static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
++ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req,
++ 		bool last)
+  {
+  	struct virtio_blk *vblk = hctx->queue->queuedata;
+ -	struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
+ +	struct virtblk_req *vbr = req->special;
+  	unsigned long flags;
+  	unsigned int num;
+++<<<<<<< HEAD
+ +	const bool last = (req->cmd_flags & REQ_END) != 0;
+++=======
++ 	int qid = hctx->queue_num;
+++>>>>>>> bf57229745f8 (blk-mq: remove REQ_END)
+  	int err;
+  	bool notify = false;
+  
+diff --cc drivers/scsi/scsi_lib.c
+index 224fcb585fa9,f1df41168391..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1624,7 -1778,181 +1624,185 @@@ out_delay
+  		blk_delay_queue(q, SCSI_QUEUE_DELAY);
+  }
+  
+++<<<<<<< HEAD
+ +u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++=======
++ static inline int prep_to_mq(int ret)
++ {
++ 	switch (ret) {
++ 	case BLKPREP_OK:
++ 		return 0;
++ 	case BLKPREP_DEFER:
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 	default:
++ 		return BLK_MQ_RQ_QUEUE_ERROR;
++ 	}
++ }
++ 
++ static int scsi_mq_prep_fn(struct request *req)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	struct scsi_device *sdev = req->q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	unsigned char *sense_buf = cmd->sense_buffer;
++ 	struct scatterlist *sg;
++ 
++ 	memset(cmd, 0, sizeof(struct scsi_cmnd));
++ 
++ 	req->special = cmd;
++ 
++ 	cmd->request = req;
++ 	cmd->device = sdev;
++ 	cmd->sense_buffer = sense_buf;
++ 
++ 	cmd->tag = req->tag;
++ 
++ 	cmd->cmnd = req->cmd;
++ 	cmd->prot_op = SCSI_PROT_NORMAL;
++ 
++ 	INIT_LIST_HEAD(&cmd->list);
++ 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
++ 	cmd->jiffies_at_alloc = jiffies;
++ 
++ 	/*
++ 	 * XXX: cmd_list lookups are only used by two drivers, try to get
++ 	 * rid of this list in common code.
++ 	 */
++ 	spin_lock_irq(&sdev->list_lock);
++ 	list_add_tail(&cmd->list, &sdev->cmd_list);
++ 	spin_unlock_irq(&sdev->list_lock);
++ 
++ 	sg = (void *)cmd + sizeof(struct scsi_cmnd) + shost->hostt->cmd_size;
++ 	cmd->sdb.table.sgl = sg;
++ 
++ 	if (scsi_host_get_prot(shost)) {
++ 		cmd->prot_sdb = (void *)sg +
++ 			shost->sg_tablesize * sizeof(struct scatterlist);
++ 		memset(cmd->prot_sdb, 0, sizeof(struct scsi_data_buffer));
++ 
++ 		cmd->prot_sdb->table.sgl =
++ 			(struct scatterlist *)(cmd->prot_sdb + 1);
++ 	}
++ 
++ 	if (blk_bidi_rq(req)) {
++ 		struct request *next_rq = req->next_rq;
++ 		struct scsi_data_buffer *bidi_sdb = blk_mq_rq_to_pdu(next_rq);
++ 
++ 		memset(bidi_sdb, 0, sizeof(struct scsi_data_buffer));
++ 		bidi_sdb->table.sgl =
++ 			(struct scatterlist *)(bidi_sdb + 1);
++ 
++ 		next_rq->special = bidi_sdb;
++ 	}
++ 
++ 	return scsi_setup_cmnd(sdev, req);
++ }
++ 
++ static void scsi_mq_done(struct scsi_cmnd *cmd)
++ {
++ 	trace_scsi_dispatch_cmd_done(cmd);
++ 	blk_mq_complete_request(cmd->request);
++ }
++ 
++ static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req,
++ 		bool last)
++ {
++ 	struct request_queue *q = req->q;
++ 	struct scsi_device *sdev = q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	int ret;
++ 	int reason;
++ 
++ 	ret = prep_to_mq(scsi_prep_state_check(sdev, req));
++ 	if (ret)
++ 		goto out;
++ 
++ 	ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 	if (!get_device(&sdev->sdev_gendev))
++ 		goto out;
++ 
++ 	if (!scsi_dev_queue_ready(q, sdev))
++ 		goto out_put_device;
++ 	if (!scsi_target_queue_ready(shost, sdev))
++ 		goto out_dec_device_busy;
++ 	if (!scsi_host_queue_ready(q, shost, sdev))
++ 		goto out_dec_target_busy;
++ 
++ 	if (!(req->cmd_flags & REQ_DONTPREP)) {
++ 		ret = prep_to_mq(scsi_mq_prep_fn(req));
++ 		if (ret)
++ 			goto out_dec_host_busy;
++ 		req->cmd_flags |= REQ_DONTPREP;
++ 	}
++ 
++ 	scsi_init_cmd_errh(cmd);
++ 	cmd->scsi_done = scsi_mq_done;
++ 
++ 	reason = scsi_dispatch_cmd(cmd);
++ 	if (reason) {
++ 		scsi_set_blocked(cmd, reason);
++ 		ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 		goto out_dec_host_busy;
++ 	}
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ 
++ out_dec_host_busy:
++ 	atomic_dec(&shost->host_busy);
++ out_dec_target_busy:
++ 	if (scsi_target(sdev)->can_queue > 0)
++ 		atomic_dec(&scsi_target(sdev)->target_busy);
++ out_dec_device_busy:
++ 	atomic_dec(&sdev->device_busy);
++ out_put_device:
++ 	put_device(&sdev->sdev_gendev);
++ out:
++ 	switch (ret) {
++ 	case BLK_MQ_RQ_QUEUE_BUSY:
++ 		blk_mq_stop_hw_queue(hctx);
++ 		if (atomic_read(&sdev->device_busy) == 0 &&
++ 		    !scsi_device_blocked(sdev))
++ 			blk_mq_delay_queue(hctx, SCSI_QUEUE_DELAY);
++ 		break;
++ 	case BLK_MQ_RQ_QUEUE_ERROR:
++ 		/*
++ 		 * Make sure to release all allocated ressources when
++ 		 * we hit an error, as we will never see this command
++ 		 * again.
++ 		 */
++ 		if (req->cmd_flags & REQ_DONTPREP)
++ 			scsi_mq_uninit_cmd(cmd);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int scsi_init_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx,
++ 		unsigned int numa_node)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	cmd->sense_buffer = kzalloc_node(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL,
++ 			numa_node);
++ 	if (!cmd->sense_buffer)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static void scsi_exit_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	kfree(cmd->sense_buffer);
++ }
++ 
++ static u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++>>>>>>> bf57229745f8 (blk-mq: remove REQ_END)
+  {
+  	struct device *host_dev;
+  	u64 bounce_limit = 0xffffffff;
+diff --cc include/linux/blk_types.h
+index 1ab064ef48f2,bb7d66460e7a..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -185,7 -188,8 +185,12 @@@ enum rq_flag_bits 
+  	__REQ_MIXED_MERGE,	/* merge of different types, fail separately */
+  	__REQ_KERNEL, 		/* direct IO to kernel pages */
+  	__REQ_PM,		/* runtime pm request */
+++<<<<<<< HEAD
+ +	__REQ_END,		/* last of chain of requests */
+++=======
++ 	__REQ_HASHED,		/* on IO scheduler merge hash */
++ 	__REQ_MQ_INFLIGHT,	/* track inflight for MQ */
+++>>>>>>> bf57229745f8 (blk-mq: remove REQ_END)
+  	__REQ_NR_BITS,		/* stops here */
+  };
+  
+@@@ -237,6 -241,7 +242,11 @@@
+  #define REQ_SECURE		(1ULL << __REQ_SECURE)
+  #define REQ_KERNEL		(1ULL << __REQ_KERNEL)
+  #define REQ_PM			(1ULL << __REQ_PM)
+++<<<<<<< HEAD
+ +#define REQ_END			(1ULL << __REQ_END)
+++=======
++ #define REQ_HASHED		(1ULL << __REQ_HASHED)
++ #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
+++>>>>>>> bf57229745f8 (blk-mq: remove REQ_END)
+  
+  #endif /* __LINUX_BLK_TYPES_H */
+* Unmerged path block/blk-mq.c
+* Unmerged path drivers/block/mtip32xx/mtip32xx.c
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index 3ae5f19b54ef..47a637f8d5fd 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -309,7 +309,8 @@ static void null_request_fn(struct request_queue *q)
+ 	}
+ }
+ 
+-static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
++static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq,
++		bool last)
+ {
+ 	struct nullb_cmd *cmd = rq->special;
+ 
+* Unmerged path drivers/block/virtio_blk.c
+* Unmerged path drivers/scsi/scsi_lib.c
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 712a6b843fbe..e254b829e244 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -61,7 +61,7 @@ struct blk_mq_reg {
+ 	unsigned int		flags;		/* BLK_MQ_F_* */
+ };
+ 
+-typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
++typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *, bool);
+ typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+ typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+ typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+* Unmerged path include/linux/blk_types.h
