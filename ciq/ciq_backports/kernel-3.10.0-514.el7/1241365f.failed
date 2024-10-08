@@ -1,0 +1,139 @@
+openvswitch: Allocate memory for ovs internal device stats.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author James Morse <james.morse@arm.com>
+commit 1241365f1aeb24ef0ffe82970f7c558022ddc85f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1241365f.failed
+
+"openvswitch: Remove vport stats" removed the per-vport statistics, in
+order to use the netdev's statistics fields.
+"openvswitch: Fix ovs_vport_get_stats()" fixed the export of these stats
+to user-space, by using the provided netdev_ops to collate them - but ovs
+internal devices still use an unallocated dev->tstats field to count
+packets, which are no longer exported by this api.
+
+Allocate the dev->tstats field for ovs internal devices, and wire up
+ndo_get_stats64 with the original implementation of
+ovs_vport_get_stats().
+
+On its own, "openvswitch: Fix ovs_vport_get_stats()" fixes the OOPs,
+unmasking a full-on panic on arm64:
+
+=============%<==============
+[<ffffffbffc00ce4c>] internal_dev_recv+0xa8/0x170 [openvswitch]
+[<ffffffbffc0008b4>] do_output.isra.31+0x60/0x19c [openvswitch]
+[<ffffffbffc000bf8>] do_execute_actions+0x208/0x11c0 [openvswitch]
+[<ffffffbffc001c78>] ovs_execute_actions+0xc8/0x238 [openvswitch]
+[<ffffffbffc003dfc>] ovs_packet_cmd_execute+0x21c/0x288 [openvswitch]
+[<ffffffc0005e8c5c>] genl_family_rcv_msg+0x1b0/0x310
+[<ffffffc0005e8e60>] genl_rcv_msg+0xa4/0xe4
+[<ffffffc0005e7ddc>] netlink_rcv_skb+0xb0/0xdc
+[<ffffffc0005e8a94>] genl_rcv+0x38/0x50
+[<ffffffc0005e76c0>] netlink_unicast+0x164/0x210
+[<ffffffc0005e7b70>] netlink_sendmsg+0x304/0x368
+[<ffffffc0005a21c0>] sock_sendmsg+0x30/0x4c
+[SNIP]
+Kernel panic - not syncing: Fatal exception in interrupt
+=============%<==============
+
+Fixes: 8c876639c985 ("openvswitch: Remove vport stats.")
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1241365f1aeb24ef0ffe82970f7c558022ddc85f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/vport-internal_dev.c
+diff --cc net/openvswitch/vport-internal_dev.c
+index d6aef25cd7bb,b3934126daa8..000000000000
+--- a/net/openvswitch/vport-internal_dev.c
++++ b/net/openvswitch/vport-internal_dev.c
+@@@ -121,7 -144,7 +153,11 @@@ static const struct net_device_ops inte
+  	.ndo_start_xmit = internal_dev_xmit,
+  	.ndo_set_mac_address = eth_mac_addr,
+  	.ndo_change_mtu = internal_dev_change_mtu,
+++<<<<<<< HEAD
+ +	.ndo_get_stats64 = internal_dev_get_stats,
+++=======
++ 	.ndo_get_stats64 = internal_get_stats,
+++>>>>>>> 1241365f1aeb (openvswitch: Allocate memory for ovs internal device stats.)
+  };
+  
+  static struct rtnl_link_ops internal_dev_link_ops __read_mostly = {
+@@@ -175,29 -194,36 +211,40 @@@ static struct vport *internal_dev_creat
+  		err = -ENOMEM;
+  		goto error_free_vport;
+  	}
++ 	vport->dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
++ 	if (!vport->dev->tstats) {
++ 		err = -ENOMEM;
++ 		goto error_free_netdev;
++ 	}
+  
+ -	dev_net_set(vport->dev, ovs_dp_get_net(vport->dp));
+ -	internal_dev = internal_dev_priv(vport->dev);
+ +	dev_net_set(netdev_vport->dev, ovs_dp_get_net(vport->dp));
+ +	internal_dev = internal_dev_priv(netdev_vport->dev);
+  	internal_dev->vport = vport;
+  
+  	/* Restrict bridge port to current netns. */
+  	if (vport->port_no == OVSP_LOCAL)
+ -		vport->dev->features |= NETIF_F_NETNS_LOCAL;
+ +		netdev_vport->dev->features |= NETIF_F_NETNS_LOCAL;
+  
+  	rtnl_lock();
+ -	err = register_netdevice(vport->dev);
+ +	err = register_netdevice(netdev_vport->dev);
+  	if (err)
+- 		goto error_free_netdev;
++ 		goto error_unlock;
+  
+ -	dev_set_promiscuity(vport->dev, 1);
+ +	dev_set_promiscuity(netdev_vport->dev, 1);
+  	rtnl_unlock();
+ -	netif_start_queue(vport->dev);
+ +	netif_start_queue(netdev_vport->dev);
+  
+  	return vport;
+  
+- error_free_netdev:
++ error_unlock:
+  	rtnl_unlock();
+++<<<<<<< HEAD
+ +	free_netdev(netdev_vport->dev);
+++=======
++ 	free_percpu(vport->dev->tstats);
++ error_free_netdev:
++ 	free_netdev(vport->dev);
+++>>>>>>> 1241365f1aeb (openvswitch: Allocate memory for ovs internal device stats.)
+  error_free_vport:
+  	ovs_vport_free(vport);
+  error:
+@@@ -206,15 -232,13 +253,20 @@@
+  
+  static void internal_dev_destroy(struct vport *vport)
+  {
+ -	netif_stop_queue(vport->dev);
+ +	struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
+ +
+ +	netif_stop_queue(netdev_vport->dev);
+  	rtnl_lock();
+ -	dev_set_promiscuity(vport->dev, -1);
+ +	dev_set_promiscuity(netdev_vport->dev, -1);
+  
+  	/* unregister_netdevice() waits for an RCU grace period. */
+++<<<<<<< HEAD
+ +	unregister_netdevice(netdev_vport->dev);
+ +
+++=======
++ 	unregister_netdevice(vport->dev);
++ 	free_percpu(vport->dev->tstats);
+++>>>>>>> 1241365f1aeb (openvswitch: Allocate memory for ovs internal device stats.)
+  	rtnl_unlock();
+  }
+  
+* Unmerged path net/openvswitch/vport-internal_dev.c
