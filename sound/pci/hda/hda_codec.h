@@ -68,9 +68,6 @@ struct hda_codec;
 struct hda_pcm;
 struct hda_pcm_stream;
 
-/* NID type */
-typedef u16 hda_nid_t;
-
 /* bus operators */
 struct hda_bus_ops {
 	/* send a single command */
