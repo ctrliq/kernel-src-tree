@@ -1,0 +1,1999 @@
+net: pass info struct via netdevice notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] pass info struct via netdevice notifier (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 93.98%
+commit-author Jiri Pirko <jiri@resnulli.us>
+commit 351638e7deeed2ec8ce451b53d33921b3da68f83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/351638e7.failed
+
+So far, only net_device * could be passed along with netdevice notifier
+event. This patch provides a possibility to pass custom structure
+able to provide info that event listener needs to know.
+
+	Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+
+v2->v3: fix typo on simeth
+	shortened dev_getter
+	shortened notifier_info struct name
+v1->v2: fix notifier_call parameter in call_netdevice_notifier()
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+
+(cherry picked from commit 351638e7deeed2ec8ce451b53d33921b3da68f83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx4/main.c
+#	include/linux/netdevice.h
+#	net/ipv4/netfilter/ipt_MASQUERADE.c
+#	net/ipv6/netfilter/ip6t_MASQUERADE.c
+#	net/mac80211/iface.c
+#	net/wireless/core.c
+diff --cc drivers/infiniband/hw/mlx4/main.c
+index 3ffacf32e84b,a188d3178559..000000000000
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@@ -1676,393 -1108,92 +1676,397 @@@ static int update_gid_table(struct mlx4
+  			}
+  		}
+  	}
+ -	rcu_read_unlock();
+  
+ -	for (i = 0; i < 128; ++i)
+ -		if (!hits[i]) {
+ -			if (memcmp(&dev->iboe.gid_table[port - 1][i], &zgid, sizeof zgid))
+ -				++need_update;
+ -			dev->iboe.gid_table[port - 1][i] = zgid;
+ -		}
+ +	if (found == -1 && !clear && free >= 0) {
+ +		dev->iboe.gid_table[port - 1][free] = *gid;
+ +		need_update = 1;
+ +	}
+  
+ -	if (need_update) {
+ -		memcpy(work->gids, dev->iboe.gid_table[port - 1], sizeof work->gids);
+ -		INIT_WORK(&work->work, update_gids_task);
+ -		work->port = port;
+ -		work->dev = dev;
+ -		queue_work(wq, &work->work);
+ -	} else
+ -		kfree(work);
+ +	if (!need_update)
+ +		return 0;
+ +
+ +	work = kzalloc(sizeof(*work), GFP_ATOMIC);
+ +	if (!work)
+ +		return -ENOMEM;
+ +
+ +	memcpy(work->gids, dev->iboe.gid_table[port - 1], sizeof(work->gids));
+ +	INIT_WORK(&work->work, update_gids_task);
+ +	work->port = port;
+ +	work->dev = dev;
+ +	queue_work(wq, &work->work);
+  
+ -	kfree(hits);
+  	return 0;
+ +}
+  
+ -out:
+ -	kfree(work);
+ -	return ret;
+ +static void mlx4_make_default_gid(struct  net_device *dev, union ib_gid *gid)
+ +{
+ +	gid->global.subnet_prefix = cpu_to_be64(0xfe80000000000000LL);
+ +	mlx4_addrconf_ifid_eui48(&gid->raw[8], 0xffff, dev);
+  }
+  
+ -static void handle_en_event(struct mlx4_ib_dev *dev, int port, unsigned long event)
+ +
+ +static int reset_gid_table(struct mlx4_ib_dev *dev, u8 port)
+  {
+ -	switch (event) {
+ -	case NETDEV_UP:
+ -	case NETDEV_CHANGEADDR:
+ -		update_ipv6_gids(dev, port, 0);
+ -		break;
+ +	struct update_gid_work *work;
+  
+ -	case NETDEV_DOWN:
+ -		update_ipv6_gids(dev, port, 1);
+ -		dev->iboe.netdevs[port - 1] = NULL;
+ -	}
+ +	work = kzalloc(sizeof(*work), GFP_ATOMIC);
+ +	if (!work)
+ +		return -ENOMEM;
+ +
+ +	memset(dev->iboe.gid_table[port - 1], 0, sizeof(work->gids));
+ +	memset(work->gids, 0, sizeof(work->gids));
+ +	INIT_WORK(&work->work, reset_gids_task);
+ +	work->dev = dev;
+ +	work->port = port;
+ +	queue_work(wq, &work->work);
+ +	return 0;
+  }
+  
+ -static void netdev_added(struct mlx4_ib_dev *dev, int port)
+ +static int mlx4_ib_addr_event(int event, struct net_device *event_netdev,
+ +			      struct mlx4_ib_dev *ibdev, union ib_gid *gid)
+  {
+ -	update_ipv6_gids(dev, port, 0);
+ +	struct mlx4_ib_iboe *iboe;
+ +	int port = 0;
+ +	struct net_device *real_dev = rdma_vlan_dev_real_dev(event_netdev) ?
+ +				rdma_vlan_dev_real_dev(event_netdev) :
+ +				event_netdev;
+ +	union ib_gid default_gid;
+ +
+ +	mlx4_make_default_gid(real_dev, &default_gid);
+ +
+ +	if (!memcmp(gid, &default_gid, sizeof(*gid)))
+ +		return 0;
+ +
+ +	if (event != NETDEV_DOWN && event != NETDEV_UP)
+ +		return 0;
+ +
+ +	if ((real_dev != event_netdev) &&
+ +	    (event == NETDEV_DOWN) &&
+ +	    rdma_link_local_addr((struct in6_addr *)gid))
+ +		return 0;
+ +
+ +	iboe = &ibdev->iboe;
+ +	spin_lock_bh(&iboe->lock);
+ +
+ +	for (port = 1; port <= ibdev->dev->caps.num_ports; ++port)
+ +		if ((netif_is_bond_master(real_dev) &&
+ +		     (real_dev == iboe->masters[port - 1])) ||
+ +		     (!netif_is_bond_master(real_dev) &&
+ +		     (real_dev == iboe->netdevs[port - 1])))
+ +			update_gid_table(ibdev, port, gid,
+ +					 event == NETDEV_DOWN, 0);
+ +
+ +	spin_unlock_bh(&iboe->lock);
+ +	return 0;
+ +
+  }
+  
+ -static void netdev_removed(struct mlx4_ib_dev *dev, int port)
+ +static u8 mlx4_ib_get_dev_port(struct net_device *dev,
+ +			       struct mlx4_ib_dev *ibdev)
+  {
+ -	update_ipv6_gids(dev, port, 1);
+ +	u8 port = 0;
+ +	struct mlx4_ib_iboe *iboe;
+ +	struct net_device *real_dev = rdma_vlan_dev_real_dev(dev) ?
+ +				rdma_vlan_dev_real_dev(dev) : dev;
+ +
+ +	iboe = &ibdev->iboe;
+ +
+ +	for (port = 1; port <= ibdev->dev->caps.num_ports; ++port)
+ +		if ((netif_is_bond_master(real_dev) &&
+ +		     (real_dev == iboe->masters[port - 1])) ||
+ +		     (!netif_is_bond_master(real_dev) &&
+ +		     (real_dev == iboe->netdevs[port - 1])))
+ +			break;
+ +
+ +	if ((port == 0) || (port > ibdev->dev->caps.num_ports))
+ +		return 0;
+ +	else
+ +		return port;
+  }
+  
+ -static int mlx4_ib_netdev_event(struct notifier_block *this, unsigned long event,
+ +static int mlx4_ib_inet_event(struct notifier_block *this, unsigned long event,
+ +				void *ptr)
+ +{
+++<<<<<<< HEAD
+ +	struct mlx4_ib_dev *ibdev;
+ +	struct in_ifaddr *ifa = ptr;
+ +	union ib_gid gid;
+ +	struct net_device *event_netdev = ifa->ifa_dev->dev;
+ +
+ +	ipv6_addr_set_v4mapped(ifa->ifa_address, (struct in6_addr *)&gid);
+ +
+ +	ibdev = container_of(this, struct mlx4_ib_dev, iboe.nb_inet);
+ +
+ +	mlx4_ib_addr_event(event, event_netdev, ibdev, &gid);
+ +	return NOTIFY_DONE;
+ +}
+ +
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +static int mlx4_ib_inet6_event(struct notifier_block *this, unsigned long event,
+  				void *ptr)
+  {
+ -	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+  	struct mlx4_ib_dev *ibdev;
+ -	struct net_device *oldnd;
+ +	struct inet6_ifaddr *ifa = ptr;
+ +	union  ib_gid *gid = (union ib_gid *)&ifa->addr;
+ +	struct net_device *event_netdev = ifa->idev->dev;
+ +
+ +	ibdev = container_of(this, struct mlx4_ib_dev, iboe.nb_inet6);
+ +
+ +	mlx4_ib_addr_event(event, event_netdev, ibdev, gid);
+ +	return NOTIFY_DONE;
+ +}
+ +#endif
+ +
+ +#define MLX4_IB_INVALID_MAC	((u64)-1)
+ +static void mlx4_ib_update_qps(struct mlx4_ib_dev *ibdev,
+ +			       struct net_device *dev,
+ +			       int port)
+ +{
+ +	u64 new_smac = 0;
+ +	u64 release_mac = MLX4_IB_INVALID_MAC;
+ +	struct mlx4_ib_qp *qp;
+ +
+ +	read_lock(&dev_base_lock);
+ +	new_smac = mlx4_mac_to_u64(dev->dev_addr);
+ +	read_unlock(&dev_base_lock);
+ +
+ +	atomic64_set(&ibdev->iboe.mac[port - 1], new_smac);
+ +
+ +	/* no need for update QP1 and mac registration in non-SRIOV */
+ +	if (!mlx4_is_mfunc(ibdev->dev))
+ +		return;
+ +
+ +	mutex_lock(&ibdev->qp1_proxy_lock[port - 1]);
+ +	qp = ibdev->qp1_proxy[port - 1];
+ +	if (qp) {
+ +		int new_smac_index;
+ +		u64 old_smac;
+ +		struct mlx4_update_qp_params update_params;
+ +
+ +		mutex_lock(&qp->mutex);
+ +		old_smac = qp->pri.smac;
+ +		if (new_smac == old_smac)
+ +			goto unlock;
+ +
+ +		new_smac_index = mlx4_register_mac(ibdev->dev, port, new_smac);
+ +
+ +		if (new_smac_index < 0)
+ +			goto unlock;
+ +
+ +		update_params.smac_index = new_smac_index;
+ +		if (mlx4_update_qp(ibdev->dev, qp->mqp.qpn, MLX4_UPDATE_QP_SMAC,
+ +				   &update_params)) {
+ +			release_mac = new_smac;
+ +			goto unlock;
+ +		}
+ +		/* if old port was zero, no mac was yet registered for this QP */
+ +		if (qp->pri.smac_port)
+ +			release_mac = old_smac;
+ +		qp->pri.smac = new_smac;
+ +		qp->pri.smac_port = port;
+ +		qp->pri.smac_index = new_smac_index;
+ +	}
+ +
+ +unlock:
+ +	if (release_mac != MLX4_IB_INVALID_MAC)
+ +		mlx4_unregister_mac(ibdev->dev, port, release_mac);
+ +	if (qp)
+ +		mutex_unlock(&qp->mutex);
+ +	mutex_unlock(&ibdev->qp1_proxy_lock[port - 1]);
+ +}
+ +
+ +static void mlx4_ib_get_dev_addr(struct net_device *dev,
+ +				 struct mlx4_ib_dev *ibdev, u8 port)
+ +{
+ +	struct in_device *in_dev;
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	struct inet6_dev *in6_dev;
+ +	union ib_gid  *pgid;
+ +	struct inet6_ifaddr *ifp;
+ +	union ib_gid default_gid;
+ +#endif
+ +	union ib_gid gid;
+ +
+ +
+ +	if ((port == 0) || (port > ibdev->dev->caps.num_ports))
+ +		return;
+ +
+ +	/* IPv4 gids */
+ +	in_dev = in_dev_get(dev);
+ +	if (in_dev) {
+ +		for_ifa(in_dev) {
+ +			/*ifa->ifa_address;*/
+ +			ipv6_addr_set_v4mapped(ifa->ifa_address,
+ +					       (struct in6_addr *)&gid);
+ +			update_gid_table(ibdev, port, &gid, 0, 0);
+ +		}
+ +		endfor_ifa(in_dev);
+ +		in_dev_put(in_dev);
+ +	}
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	mlx4_make_default_gid(dev, &default_gid);
+ +	/* IPv6 gids */
+ +	in6_dev = in6_dev_get(dev);
+ +	if (in6_dev) {
+ +		read_lock_bh(&in6_dev->lock);
+ +		list_for_each_entry(ifp, &in6_dev->addr_list, if_list) {
+ +			pgid = (union ib_gid *)&ifp->addr;
+ +			if (!memcmp(pgid, &default_gid, sizeof(*pgid)))
+ +				continue;
+ +			update_gid_table(ibdev, port, pgid, 0, 0);
+ +		}
+ +		read_unlock_bh(&in6_dev->lock);
+ +		in6_dev_put(in6_dev);
+ +	}
+ +#endif
+ +}
+ +
+ +static void mlx4_ib_set_default_gid(struct mlx4_ib_dev *ibdev,
+ +				 struct  net_device *dev, u8 port)
+ +{
+ +	union ib_gid gid;
+ +	mlx4_make_default_gid(dev, &gid);
+ +	update_gid_table(ibdev, port, &gid, 0, 1);
+ +}
+ +
+ +static int mlx4_ib_init_gid_table(struct mlx4_ib_dev *ibdev)
+ +{
+ +	struct	net_device *dev;
+ +	struct mlx4_ib_iboe *iboe = &ibdev->iboe;
+ +	int i;
+ +	int err = 0;
+ +
+ +	for (i = 1; i <= ibdev->num_ports; ++i) {
+ +		if (rdma_port_get_link_layer(&ibdev->ib_dev, i) ==
+ +		    IB_LINK_LAYER_ETHERNET) {
+ +			err = reset_gid_table(ibdev, i);
+ +			if (err)
+ +				goto out;
+ +		}
+ +	}
+ +
+ +	read_lock(&dev_base_lock);
+ +	spin_lock_bh(&iboe->lock);
+ +
+ +	for_each_netdev(&init_net, dev) {
+ +		u8 port = mlx4_ib_get_dev_port(dev, ibdev);
+ +		/* port will be non-zero only for ETH ports */
+ +		if (port) {
+ +			mlx4_ib_set_default_gid(ibdev, dev, port);
+ +			mlx4_ib_get_dev_addr(dev, ibdev, port);
+ +		}
+ +	}
+ +
+ +	spin_unlock_bh(&iboe->lock);
+ +	read_unlock(&dev_base_lock);
+ +out:
+ +	return err;
+ +}
+ +
+ +static void mlx4_ib_scan_netdevs(struct mlx4_ib_dev *ibdev,
+ +				 struct net_device *dev,
+ +				 unsigned long event)
+ +
+ +{
+  	struct mlx4_ib_iboe *iboe;
+ +	int update_qps_port = -1;
+  	int port;
+  
+ -	if (!net_eq(dev_net(dev), &init_net))
+ -		return NOTIFY_DONE;
+ -
+ -	ibdev = container_of(this, struct mlx4_ib_dev, iboe.nb);
+  	iboe = &ibdev->iboe;
+  
+ -	spin_lock(&iboe->lock);
+ +	spin_lock_bh(&iboe->lock);
+  	mlx4_foreach_ib_transport_port(port, ibdev->dev) {
+ -		oldnd = iboe->netdevs[port - 1];
+ +		enum ib_port_state	port_state = IB_PORT_NOP;
+ +		struct net_device *old_master = iboe->masters[port - 1];
+ +		struct net_device *curr_netdev;
+ +		struct net_device *curr_master;
+ +
+  		iboe->netdevs[port - 1] =
+  			mlx4_get_protocol_dev(ibdev->dev, MLX4_PROT_ETH, port);
+ -		if (oldnd != iboe->netdevs[port - 1]) {
+ -			if (iboe->netdevs[port - 1])
+ -				netdev_added(ibdev, port);
+ -			else
+ -				netdev_removed(ibdev, port);
+ +		if (iboe->netdevs[port - 1])
+ +			mlx4_ib_set_default_gid(ibdev,
+ +						iboe->netdevs[port - 1], port);
+ +		curr_netdev = iboe->netdevs[port - 1];
+ +
+ +		if (iboe->netdevs[port - 1] &&
+ +		    netif_is_bond_slave(iboe->netdevs[port - 1])) {
+ +			iboe->masters[port - 1] = netdev_master_upper_dev_get(
+ +				iboe->netdevs[port - 1]);
+ +		} else {
+ +			iboe->masters[port - 1] = NULL;
+ +		}
+ +		curr_master = iboe->masters[port - 1];
+ +
+ +		if (dev == iboe->netdevs[port - 1] &&
+ +		    (event == NETDEV_CHANGEADDR || event == NETDEV_REGISTER ||
+ +		     event == NETDEV_UP || event == NETDEV_CHANGE))
+ +			update_qps_port = port;
+ +
+ +		if (curr_netdev) {
+ +			port_state = (netif_running(curr_netdev) && netif_carrier_ok(curr_netdev)) ?
+ +						IB_PORT_ACTIVE : IB_PORT_DOWN;
+ +			mlx4_ib_set_default_gid(ibdev, curr_netdev, port);
+ +			if (curr_master) {
+ +				/* if using bonding/team and a slave port is down, we
+ +				 * don't want the bond IP based gids in the table since
+ +				 * flows that select port by gid may get the down port.
+ +				*/
+ +				if (port_state == IB_PORT_DOWN &&
+ +				    !mlx4_is_bonded(ibdev->dev)) {
+ +					reset_gid_table(ibdev, port);
+ +					mlx4_ib_set_default_gid(ibdev,
+ +								curr_netdev,
+ +								port);
+ +				} else {
+ +					/* gids from the upper dev (bond/team)
+ +					 * should appear in port's gid table
+ +					*/
+ +					mlx4_ib_get_dev_addr(curr_master,
+ +							     ibdev, port);
+ +				}
+ +			}
+ +			/* if bonding is used it is possible that we add it to
+ +			 * masters only after IP address is assigned to the
+ +			 * net bonding interface.
+ +			*/
+ +			if (curr_master && (old_master != curr_master)) {
+ +				reset_gid_table(ibdev, port);
+ +				mlx4_ib_set_default_gid(ibdev,
+ +							curr_netdev, port);
+ +				mlx4_ib_get_dev_addr(curr_master, ibdev, port);
+ +			}
+ +
+ +			if (!curr_master && (old_master != curr_master)) {
+ +				reset_gid_table(ibdev, port);
+ +				mlx4_ib_set_default_gid(ibdev,
+ +							curr_netdev, port);
+ +				mlx4_ib_get_dev_addr(curr_netdev, ibdev, port);
+ +			}
+ +		} else {
+ +			reset_gid_table(ibdev, port);
+  		}
+  	}
+  
+ -	if (dev == iboe->netdevs[0] ||
+ -	    (iboe->netdevs[0] && rdma_vlan_dev_real_dev(dev) == iboe->netdevs[0]))
+ -		handle_en_event(ibdev, 1, event);
+ -	else if (dev == iboe->netdevs[1]
+ -		 || (iboe->netdevs[1] && rdma_vlan_dev_real_dev(dev) == iboe->netdevs[1]))
+ -		handle_en_event(ibdev, 2, event);
+ +	spin_unlock_bh(&iboe->lock);
+  
+ -	spin_unlock(&iboe->lock);
+ +	if (update_qps_port > 0)
+ +		mlx4_ib_update_qps(ibdev, dev, update_qps_port);
+ +}
+ +
+ +static int mlx4_ib_netdev_event(struct notifier_block *this,
+ +				unsigned long event, void *ptr)
+ +{
+ +	struct net_device *dev = ptr;
+++=======
+++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+++>>>>>>> 351638e7deee (net: pass info struct via netdevice notifier)
+ +	struct mlx4_ib_dev *ibdev;
+ +
+ +	if (!net_eq(dev_net(dev), &init_net))
+ +		return NOTIFY_DONE;
+ +
+ +	ibdev = container_of(this, struct mlx4_ib_dev, iboe.nb);
+ +	mlx4_ib_scan_netdevs(ibdev, dev, event);
+  
+  	return NOTIFY_DONE;
+  }
+diff --cc include/linux/netdevice.h
+index eb7e9fa3e472,13a34848b5e1..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1936,12 -1595,24 +1936,31 @@@ struct pcpu_sw_netstats 
+  #define NETDEV_RELEASE		0x0012
+  #define NETDEV_NOTIFY_PEERS	0x0013
+  #define NETDEV_JOIN		0x0014
+ -#define NETDEV_CHANGEUPPER	0x0015
+ -
+ +#define NETDEV_RESEND_IGMP	0x0016
+ +#define NETDEV_CHANGEINFODATA	0x0018
+ +
+++<<<<<<< HEAD
+ +int register_netdevice_notifier(struct notifier_block *nb);
+ +int unregister_netdevice_notifier(struct notifier_block *nb);
+ +int call_netdevice_notifiers(unsigned long val, struct net_device *dev);
+++=======
++ extern int register_netdevice_notifier(struct notifier_block *nb);
++ extern int unregister_netdevice_notifier(struct notifier_block *nb);
++ 
++ struct netdev_notifier_info {
++ 	struct net_device *dev;
++ };
++ 
++ static inline struct net_device *
++ netdev_notifier_info_to_dev(const struct netdev_notifier_info *info)
++ {
++ 	return info->dev;
++ }
++ 
++ extern int call_netdevice_notifiers_info(unsigned long val, struct net_device *dev,
++ 					 struct netdev_notifier_info *info);
++ extern int call_netdevice_notifiers(unsigned long val, struct net_device *dev);
+++>>>>>>> 351638e7deee (net: pass info struct via netdevice notifier)
+  
+  
+  extern rwlock_t				dev_base_lock;		/* Device list lock */
+diff --cc net/ipv4/netfilter/ipt_MASQUERADE.c
+index da7f02a0b868,dd5508bde799..000000000000
+--- a/net/ipv4/netfilter/ipt_MASQUERADE.c
++++ b/net/ipv4/netfilter/ipt_MASQUERADE.c
+@@@ -47,17 -46,100 +47,68 @@@ static int masquerade_tg_check(const st
+  static unsigned int
+  masquerade_tg(struct sk_buff *skb, const struct xt_action_param *par)
+  {
+ -	struct nf_conn *ct;
+ -	struct nf_conn_nat *nat;
+ -	enum ip_conntrack_info ctinfo;
+ -	struct nf_nat_range newrange;
+ +	struct nf_nat_range range;
+  	const struct nf_nat_ipv4_multi_range_compat *mr;
+ -	const struct rtable *rt;
+ -	__be32 newsrc, nh;
+ -
+ -	NF_CT_ASSERT(par->hooknum == NF_INET_POST_ROUTING);
+ -
+ -	ct = nf_ct_get(skb, &ctinfo);
+ -	nat = nfct_nat(ct);
+ -
+ -	NF_CT_ASSERT(ct && (ctinfo == IP_CT_NEW || ctinfo == IP_CT_RELATED ||
+ -			    ctinfo == IP_CT_RELATED_REPLY));
+ -
+ -	/* Source address is 0.0.0.0 - locally generated packet that is
+ -	 * probably not supposed to be masqueraded.
+ -	 */
+ -	if (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip == 0)
+ -		return NF_ACCEPT;
+  
+  	mr = par->targinfo;
+ -	rt = skb_rtable(skb);
+ -	nh = rt_nexthop(rt, ip_hdr(skb)->daddr);
+ -	newsrc = inet_select_addr(par->out, nh, RT_SCOPE_UNIVERSE);
+ -	if (!newsrc) {
+ -		pr_info("%s ate my IP address\n", par->out->name);
+ -		return NF_DROP;
+ -	}
+ -
+ -	nat->masq_index = par->out->ifindex;
+ +	range.flags = mr->range[0].flags;
+ +	range.min_proto = mr->range[0].min;
+ +	range.max_proto = mr->range[0].max;
+  
+ -	/* Transfer from original range. */
+ -	memset(&newrange.min_addr, 0, sizeof(newrange.min_addr));
+ -	memset(&newrange.max_addr, 0, sizeof(newrange.max_addr));
+ -	newrange.flags       = mr->range[0].flags | NF_NAT_RANGE_MAP_IPS;
+ -	newrange.min_addr.ip = newsrc;
+ -	newrange.max_addr.ip = newsrc;
+ -	newrange.min_proto   = mr->range[0].min;
+ -	newrange.max_proto   = mr->range[0].max;
+ -
+ -	/* Hand modified range to generic setup. */
+ -	return nf_nat_setup_info(ct, &newrange, NF_NAT_MANIP_SRC);
+ +	return nf_nat_masquerade_ipv4(skb, par->hooknum, &range, par->out);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ device_cmp(struct nf_conn *i, void *ifindex)
++ {
++ 	const struct nf_conn_nat *nat = nfct_nat(i);
++ 
++ 	if (!nat)
++ 		return 0;
++ 	if (nf_ct_l3num(i) != NFPROTO_IPV4)
++ 		return 0;
++ 	return nat->masq_index == (int)(long)ifindex;
++ }
++ 
++ static int masq_device_event(struct notifier_block *this,
++ 			     unsigned long event,
++ 			     void *ptr)
++ {
++ 	const struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++ 	struct net *net = dev_net(dev);
++ 
++ 	if (event == NETDEV_DOWN) {
++ 		/* Device was downed.  Search entire table for
++ 		   conntracks which were associated with that device,
++ 		   and forget them. */
++ 		NF_CT_ASSERT(dev->ifindex != 0);
++ 
++ 		nf_ct_iterate_cleanup(net, device_cmp,
++ 				      (void *)(long)dev->ifindex);
++ 	}
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static int masq_inet_event(struct notifier_block *this,
++ 			   unsigned long event,
++ 			   void *ptr)
++ {
++ 	struct net_device *dev = ((struct in_ifaddr *)ptr)->ifa_dev->dev;
++ 	return masq_device_event(this, event, dev);
++ }
++ 
++ static struct notifier_block masq_dev_notifier = {
++ 	.notifier_call	= masq_device_event,
++ };
++ 
++ static struct notifier_block masq_inet_notifier = {
++ 	.notifier_call	= masq_inet_event,
++ };
++ 
+++>>>>>>> 351638e7deee (net: pass info struct via netdevice notifier)
+  static struct xt_target masquerade_tg_reg __read_mostly = {
+  	.name		= "MASQUERADE",
+  	.family		= NFPROTO_IPV4,
+diff --cc net/ipv6/netfilter/ip6t_MASQUERADE.c
+index 7f9f45d829d2,b76257cd7e1e..000000000000
+--- a/net/ipv6/netfilter/ip6t_MASQUERADE.c
++++ b/net/ipv6/netfilter/ip6t_MASQUERADE.c
+@@@ -36,6 -57,46 +36,49 @@@ static int masquerade_tg6_checkentry(co
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int device_cmp(struct nf_conn *ct, void *ifindex)
++ {
++ 	const struct nf_conn_nat *nat = nfct_nat(ct);
++ 
++ 	if (!nat)
++ 		return 0;
++ 	if (nf_ct_l3num(ct) != NFPROTO_IPV6)
++ 		return 0;
++ 	return nat->masq_index == (int)(long)ifindex;
++ }
++ 
++ static int masq_device_event(struct notifier_block *this,
++ 			     unsigned long event, void *ptr)
++ {
++ 	const struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++ 	struct net *net = dev_net(dev);
++ 
++ 	if (event == NETDEV_DOWN)
++ 		nf_ct_iterate_cleanup(net, device_cmp,
++ 				      (void *)(long)dev->ifindex);
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static struct notifier_block masq_dev_notifier = {
++ 	.notifier_call	= masq_device_event,
++ };
++ 
++ static int masq_inet_event(struct notifier_block *this,
++ 			   unsigned long event, void *ptr)
++ {
++ 	struct inet6_ifaddr *ifa = ptr;
++ 
++ 	return masq_device_event(this, event, ifa->idev->dev);
++ }
++ 
++ static struct notifier_block masq_inet_notifier = {
++ 	.notifier_call	= masq_inet_event,
++ };
++ 
+++>>>>>>> 351638e7deee (net: pass info struct via netdevice notifier)
+  static struct xt_target masquerade_tg6_reg __read_mostly = {
+  	.name		= "MASQUERADE",
+  	.family		= NFPROTO_IPV6,
+diff --cc net/mac80211/iface.c
+index 2ce1784757ad,d2c3fd178dbe..000000000000
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@@ -1890,11 -1719,7 +1890,15 @@@ void ieee80211_remove_interfaces(struc
+  static int netdev_notify(struct notifier_block *nb,
+  			 unsigned long state, void *ptr)
+  {
+++<<<<<<< HEAD
+ +#if 0 /* Not in RHEL */
+ +	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ +#else
+ +	struct net_device *dev = ptr;
+ +#endif
+++=======
++ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+++>>>>>>> 351638e7deee (net: pass info struct via netdevice notifier)
+  	struct ieee80211_sub_if_data *sdata;
+  
+  	if (state != NETDEV_CHANGENAME)
+diff --cc net/wireless/core.c
+index d7e52db952ab,01e41191f1bf..000000000000
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@@ -903,77 -868,30 +903,84 @@@ void __cfg80211_leave(struct cfg80211_r
+  		wdev->wext.ie_len = 0;
+  		wdev->wext.connect.auth_type = NL80211_AUTHTYPE_AUTOMATIC;
+  #endif
+ -		__cfg80211_disconnect(rdev, dev,
+ -				      WLAN_REASON_DEAUTH_LEAVING, true);
+ -		wdev_unlock(wdev);
+ +		cfg80211_disconnect(rdev, dev,
+ +				    WLAN_REASON_DEAUTH_LEAVING, true);
+  		break;
+  	case NL80211_IFTYPE_MESH_POINT:
+ -		cfg80211_leave_mesh(rdev, dev);
+ +		__cfg80211_leave_mesh(rdev, dev);
+  		break;
+  	case NL80211_IFTYPE_AP:
+ -		cfg80211_stop_ap(rdev, dev);
+ +	case NL80211_IFTYPE_P2P_GO:
+ +		__cfg80211_stop_ap(rdev, dev, true);
+  		break;
+ -	default:
+ +	case NL80211_IFTYPE_OCB:
+ +		__cfg80211_leave_ocb(rdev, dev);
+ +		break;
+ +	case NL80211_IFTYPE_WDS:
+ +		/* must be handled by mac80211/driver, has no APIs */
+ +		break;
+ +	case NL80211_IFTYPE_P2P_DEVICE:
+ +		/* cannot happen, has no netdev */
+ +		break;
+ +	case NL80211_IFTYPE_AP_VLAN:
+ +	case NL80211_IFTYPE_MONITOR:
+ +		/* nothing to do */
+ +		break;
+ +	case NL80211_IFTYPE_UNSPECIFIED:
+ +	case NUM_NL80211_IFTYPES:
+ +		/* invalid */
+  		break;
+  	}
+ +}
+ +
+++<<<<<<< HEAD
+ +void cfg80211_leave(struct cfg80211_registered_device *rdev,
+ +		    struct wireless_dev *wdev)
+ +{
+ +	wdev_lock(wdev);
+ +	__cfg80211_leave(rdev, wdev);
+ +	wdev_unlock(wdev);
+ +}
+ +
+ +void cfg80211_stop_iface(struct wiphy *wiphy, struct wireless_dev *wdev,
+ +			 gfp_t gfp)
+ +{
+ +	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+ +	struct cfg80211_event *ev;
+ +	unsigned long flags;
+ +
+ +	trace_cfg80211_stop_iface(wiphy, wdev);
+ +
+ +	ev = kzalloc(sizeof(*ev), gfp);
+ +	if (!ev)
+ +		return;
+  
+ -	wdev->beacon_interval = 0;
+ +	ev->type = EVENT_STOPPED;
+ +
+ +	spin_lock_irqsave(&wdev->event_lock, flags);
+ +	list_add_tail(&ev->list, &wdev->event_list);
+ +	spin_unlock_irqrestore(&wdev->event_lock, flags);
+ +	queue_work(cfg80211_wq, &rdev->event_work);
+  }
+ +EXPORT_SYMBOL(cfg80211_stop_iface);
+  
+ +static int cfg80211_netdev_notifier_call(struct notifier_block *nb,
+ +					 unsigned long state, void *ptr)
+ +{
+ +#if 0 /* Not in RHEL */
+ +	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ +#else
+ +	struct net_device *dev = ptr;
+ +#endif
+++=======
++ static int cfg80211_netdev_notifier_call(struct notifier_block *nb,
++ 					 unsigned long state, void *ptr)
++ {
++ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+++>>>>>>> 351638e7deee (net: pass info struct via netdevice notifier)
+  	struct wireless_dev *wdev = dev->ieee80211_ptr;
+  	struct cfg80211_registered_device *rdev;
+ -	int ret;
+ +	struct cfg80211_sched_scan_request *sched_scan_req;
+  
+  	if (!wdev)
+  		return NOTIFY_DONE;
+diff --git a/arch/ia64/hp/sim/simeth.c b/arch/ia64/hp/sim/simeth.c
+index c13064e422df..d1b04c4c95e3 100644
+--- a/arch/ia64/hp/sim/simeth.c
++++ b/arch/ia64/hp/sim/simeth.c
+@@ -268,7 +268,7 @@ static __inline__ int dev_is_ethdev(struct net_device *dev)
+ static int
+ simeth_device_event(struct notifier_block *this,unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct simeth_local *local;
+ 	struct in_device *in_dev;
+ 	struct in_ifaddr **ifap = NULL;
+diff --git a/arch/mips/txx9/generic/setup_tx4939.c b/arch/mips/txx9/generic/setup_tx4939.c
+index 729a50991780..b7eccbd17bf7 100644
+--- a/arch/mips/txx9/generic/setup_tx4939.c
++++ b/arch/mips/txx9/generic/setup_tx4939.c
+@@ -331,7 +331,8 @@ static int tx4939_netdev_event(struct notifier_block *this,
+ 			       unsigned long event,
+ 			       void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
+ 	if (event == NETDEV_CHANGE && netif_carrier_ok(dev)) {
+ 		__u64 bit = 0;
+ 		if (dev->irq == TXX9_IRQ_BASE + TX4939_IR_ETH(0))
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index f4286d802f85..4c946cf025b5 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -3441,9 +3441,9 @@ static int cma_netdev_change(struct net_device *ndev, struct rdma_id_private *id
+ }
+ 
+ static int cma_netdev_callback(struct notifier_block *self, unsigned long event,
+-			       void *ctx)
++			       void *ptr)
+ {
+-	struct net_device *ndev = (struct net_device *)ctx;
++	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
+ 	struct cma_device *cma_dev;
+ 	struct rdma_id_private *id_priv;
+ 	int ret = NOTIFY_DONE;
+* Unmerged path drivers/infiniband/hw/mlx4/main.c
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 6140359bd6b8..b58215488f3a 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -3046,7 +3046,7 @@ static int bond_slave_netdev_event(unsigned long event,
+ static int bond_netdev_event(struct notifier_block *this,
+ 			     unsigned long event, void *ptr)
+ {
+-	struct net_device *event_dev = (struct net_device *)ptr;
++	struct net_device *event_dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	netdev_dbg(event_dev, "event: %lx\n", event);
+ 
+diff --git a/drivers/net/can/led.c b/drivers/net/can/led.c
+index f27fca65dc4a..a3d99a8fd2d1 100644
+--- a/drivers/net/can/led.c
++++ b/drivers/net/can/led.c
+@@ -88,9 +88,9 @@ EXPORT_SYMBOL_GPL(devm_can_led_init);
+ 
+ /* NETDEV rename notifier to rename the associated led triggers too */
+ static int can_led_notifier(struct notifier_block *nb, unsigned long msg,
+-			void *data)
++			    void *ptr)
+ {
+-	struct net_device *netdev = data;
++	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+ 	struct can_priv *priv = safe_candev_priv(netdev);
+ 	char name[CAN_LED_NAME_SZ];
+ 
+diff --git a/drivers/net/ethernet/broadcom/cnic.c b/drivers/net/ethernet/broadcom/cnic.c
+index ac91d96f34cf..6d98332a7629 100644
+--- a/drivers/net/ethernet/broadcom/cnic.c
++++ b/drivers/net/ethernet/broadcom/cnic.c
+@@ -5649,7 +5649,7 @@ static void cnic_rcv_netevent(struct cnic_local *cp, unsigned long event,
+ static int cnic_netdev_event(struct notifier_block *this, unsigned long event,
+ 							 void *ptr)
+ {
+-	struct net_device *netdev = ptr;
++	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+ 	struct cnic_dev *dev;
+ 	int new_dev = 0;
+ 
+diff --git a/drivers/net/ethernet/marvell/skge.c b/drivers/net/ethernet/marvell/skge.c
+index f1e8b24b782a..f37fc707f22e 100644
+--- a/drivers/net/ethernet/marvell/skge.c
++++ b/drivers/net/ethernet/marvell/skge.c
+@@ -3706,7 +3706,7 @@ static const struct file_operations skge_debug_fops = {
+ static int skge_device_event(struct notifier_block *unused,
+ 			     unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct skge_port *skge;
+ 	struct dentry *d;
+ 
+diff --git a/drivers/net/ethernet/marvell/sky2.c b/drivers/net/ethernet/marvell/sky2.c
+index 6da7a36b1717..7621a71962f1 100644
+--- a/drivers/net/ethernet/marvell/sky2.c
++++ b/drivers/net/ethernet/marvell/sky2.c
+@@ -4642,7 +4642,7 @@ static const struct file_operations sky2_debug_fops = {
+ static int sky2_device_event(struct notifier_block *unused,
+ 			     unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct sky2_port *sky2 = netdev_priv(dev);
+ 
+ 	if (dev->netdev_ops->ndo_open != sky2_open || !sky2_debug)
+diff --git a/drivers/net/ethernet/qlogic/netxen/netxen_nic_main.c b/drivers/net/ethernet/qlogic/netxen/netxen_nic_main.c
+index 93e63768f1eb..a2f3a35ad015 100644
+--- a/drivers/net/ethernet/qlogic/netxen/netxen_nic_main.c
++++ b/drivers/net/ethernet/qlogic/netxen/netxen_nic_main.c
+@@ -3387,7 +3387,7 @@ static int netxen_netdev_event(struct notifier_block *this,
+ 				 unsigned long event, void *ptr)
+ {
+ 	struct netxen_adapter *adapter;
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net_device *orig_dev = dev;
+ 	struct net_device *slave;
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 294ddd6b27dd..82663648f719 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -4190,7 +4190,7 @@ static int qlcnic_netdev_event(struct notifier_block *this,
+ 				 unsigned long event, void *ptr)
+ {
+ 	struct qlcnic_adapter *adapter;
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ recheck:
+ 	if (dev == NULL)
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 273bd5c7bbec..41ba799eca7a 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -2341,7 +2341,7 @@ static void efx_update_name(struct efx_nic *efx)
+ static int efx_netdev_event(struct notifier_block *this,
+ 			    unsigned long event, void *ptr)
+ {
+-	struct net_device *net_dev = ptr;
++	struct net_device *net_dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if ((net_dev->netdev_ops == &efx_netdev_ops) &&
+ 	    event == NETDEV_CHANGENAME)
+diff --git a/drivers/net/hamradio/bpqether.c b/drivers/net/hamradio/bpqether.c
+index 02de6c891670..f91bf0ddf031 100644
+--- a/drivers/net/hamradio/bpqether.c
++++ b/drivers/net/hamradio/bpqether.c
+@@ -103,7 +103,7 @@ static struct packet_type bpq_packet_type __read_mostly = {
+ };
+ 
+ static struct notifier_block bpq_dev_notifier = {
+-	.notifier_call =bpq_device_event,
++	.notifier_call = bpq_device_event,
+ };
+ 
+ 
+@@ -544,9 +544,10 @@ static void bpq_free_device(struct net_device *ndev)
+ /*
+  *	Handle device status changes.
+  */
+-static int bpq_device_event(struct notifier_block *this,unsigned long event, void *ptr)
++static int bpq_device_event(struct notifier_block *this,
++			    unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
+index 69af51e20961..0ed2d47d8a23 100644
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@ -1050,7 +1050,7 @@ static struct rtnl_link_ops macvlan_link_ops = {
+ static int macvlan_device_event(struct notifier_block *unused,
+ 				unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct macvlan_dev *vlan, *next;
+ 	struct macvlan_port *port;
+ 	LIST_HEAD(list_kill);
+diff --git a/drivers/net/macvtap.c b/drivers/net/macvtap.c
+index d589b6d38e55..d6a824dbcdda 100644
+--- a/drivers/net/macvtap.c
++++ b/drivers/net/macvtap.c
+@@ -1368,7 +1368,7 @@ EXPORT_SYMBOL_GPL(macvtap_get_socket);
+ static int macvtap_device_event(struct notifier_block *unused,
+ 				unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct macvlan_dev *vlan;
+ 	struct device *classdev;
+ 	dev_t devt;
+diff --git a/drivers/net/netconsole.c b/drivers/net/netconsole.c
+index 59ac143dec25..1d1d0a12765c 100644
+--- a/drivers/net/netconsole.c
++++ b/drivers/net/netconsole.c
+@@ -653,12 +653,11 @@ static struct configfs_subsystem netconsole_subsys = {
+ 
+ /* Handle network interface device notifications */
+ static int netconsole_netdev_event(struct notifier_block *this,
+-				   unsigned long event,
+-				   void *ptr)
++				   unsigned long event, void *ptr)
+ {
+ 	unsigned long flags;
+ 	struct netconsole_target *nt;
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	bool stopped = false;
+ 
+ 	if (!(event == NETDEV_CHANGENAME || event == NETDEV_UNREGISTER ||
+diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
+index be40cd28db04..a24d115c7d08 100644
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -338,7 +338,7 @@ static void pppoe_flush_dev(struct net_device *dev)
+ static int pppoe_device_event(struct notifier_block *this,
+ 			      unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	/* Only look at sockets that are using this specific device. */
+ 	switch (event) {
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 5f5e3119da82..3ca4b5e004d1 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -2876,7 +2876,7 @@ static void team_port_change_check(struct team_port *port, bool linkup)
+ static int team_device_event(struct notifier_block *unused,
+ 			     unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *) ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct team_port *port;
+ 
+ 	port = team_port_get_rtnl(dev);
+diff --git a/drivers/net/wan/dlci.c b/drivers/net/wan/dlci.c
+index 76658aa369ab..51f61adfdf4e 100644
+--- a/drivers/net/wan/dlci.c
++++ b/drivers/net/wan/dlci.c
+@@ -495,7 +495,7 @@ static void dlci_setup(struct net_device *dev)
+ static int dlci_dev_event(struct notifier_block *unused,
+ 			  unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *) ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (dev_net(dev) != &init_net)
+ 		return NOTIFY_DONE;
+diff --git a/drivers/net/wan/hdlc.c b/drivers/net/wan/hdlc.c
+index a0a932c63d0a..9c33ca918e19 100644
+--- a/drivers/net/wan/hdlc.c
++++ b/drivers/net/wan/hdlc.c
+@@ -99,7 +99,7 @@ static inline void hdlc_proto_stop(struct net_device *dev)
+ static int hdlc_device_event(struct notifier_block *this, unsigned long event,
+ 			     void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	hdlc_device *hdlc;
+ 	unsigned long flags;
+ 	int on;
+diff --git a/drivers/net/wan/lapbether.c b/drivers/net/wan/lapbether.c
+index a73b49eb87e3..a33a46fa88dd 100644
+--- a/drivers/net/wan/lapbether.c
++++ b/drivers/net/wan/lapbether.c
+@@ -370,7 +370,7 @@ static int lapbeth_device_event(struct notifier_block *this,
+ 				unsigned long event, void *ptr)
+ {
+ 	struct lapbethdev *lapbeth;
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (dev_net(dev) != &init_net)
+ 		return NOTIFY_DONE;
+diff --git a/drivers/scsi/fcoe/fcoe.c b/drivers/scsi/fcoe/fcoe.c
+index e678ac0b5aac..10424380e694 100644
+--- a/drivers/scsi/fcoe/fcoe.c
++++ b/drivers/scsi/fcoe/fcoe.c
+@@ -1983,7 +1983,7 @@ static int fcoe_device_notification(struct notifier_block *notifier,
+ {
+ 	struct fcoe_ctlr_device *cdev;
+ 	struct fc_lport *lport = NULL;
+-	struct net_device *netdev = ptr;
++	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+ 	struct fcoe_ctlr *ctlr;
+ 	struct fcoe_interface *fcoe;
+ 	struct fcoe_port *port;
+diff --git a/drivers/scsi/fcoe/fcoe_transport.c b/drivers/scsi/fcoe/fcoe_transport.c
+index 3d1c07031529..8e87a5a7c501 100644
+--- a/drivers/scsi/fcoe/fcoe_transport.c
++++ b/drivers/scsi/fcoe/fcoe_transport.c
+@@ -731,7 +731,7 @@ static struct net_device *fcoe_if_to_netdev(const char *buffer)
+ static int libfcoe_device_notification(struct notifier_block *notifier,
+ 				    ulong event, void *ptr)
+ {
+-	struct net_device *netdev = ptr;
++	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	switch (event) {
+ 	case NETDEV_UNREGISTER:
+diff --git a/drivers/staging/csr/netdev.c b/drivers/staging/csr/netdev.c
+index a0177d998978..d49cdf84a496 100644
+--- a/drivers/staging/csr/netdev.c
++++ b/drivers/staging/csr/netdev.c
+@@ -2891,7 +2891,7 @@ void uf_net_get_name(struct net_device *dev, char *name, int len)
+  */
+ static int
+ uf_netdev_event(struct notifier_block *notif, unsigned long event, void* ptr) {
+-    struct net_device *netdev = ptr;
++    struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+     netInterface_priv_t *interfacePriv = (netInterface_priv_t *)netdev_priv(netdev);
+     unifi_priv_t *priv = NULL;
+     static const CsrWifiMacAddress broadcast_address = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+diff --git a/drivers/staging/ft1000/ft1000-pcmcia/ft1000_proc.c b/drivers/staging/ft1000/ft1000-pcmcia/ft1000_proc.c
+index 94e426e4d98b..b2330f1df7e7 100644
+--- a/drivers/staging/ft1000/ft1000-pcmcia/ft1000_proc.c
++++ b/drivers/staging/ft1000/ft1000-pcmcia/ft1000_proc.c
+@@ -164,7 +164,7 @@ static const struct file_operations ft1000_proc_fops = {
+ static int ft1000NotifyProc(struct notifier_block *this, unsigned long event,
+ 				void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct ft1000_info *info;
+ 
+ 	info = netdev_priv(dev);
+diff --git a/drivers/staging/ft1000/ft1000-usb/ft1000_proc.c b/drivers/staging/ft1000/ft1000-usb/ft1000_proc.c
+index eca6f0292b4b..5ead942be680 100644
+--- a/drivers/staging/ft1000/ft1000-usb/ft1000_proc.c
++++ b/drivers/staging/ft1000/ft1000-usb/ft1000_proc.c
+@@ -166,7 +166,7 @@ static const struct file_operations ft1000_proc_fops = {
+ static int
+ ft1000NotifyProc(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct ft1000_info *info;
+ 	struct proc_dir_entry *ft1000_proc_file;
+ 
+diff --git a/drivers/staging/silicom/bpctl_mod.c b/drivers/staging/silicom/bpctl_mod.c
+index b7e570ccb759..c8ddb99e8526 100644
+--- a/drivers/staging/silicom/bpctl_mod.c
++++ b/drivers/staging/silicom/bpctl_mod.c
+@@ -133,7 +133,7 @@ static unsigned long str_to_hex(char *p);
+ static int bp_device_event(struct notifier_block *unused,
+ 			   unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	static bpctl_dev_t *pbpctl_dev = NULL, *pbpctl_dev_m = NULL;
+ 	int dev_num = 0, ret = 0, ret_d = 0, time_left = 0;
+ 	/* printk("BP_PROC_SUPPORT event =%d %s %d\n", event,dev->name, dev->ifindex ); */
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/8021q/vlan.c b/net/8021q/vlan.c
+index 1d512256f545..efb5b4f28f8e 100644
+--- a/net/8021q/vlan.c
++++ b/net/8021q/vlan.c
+@@ -343,7 +343,7 @@ static void __vlan_device_event(struct net_device *dev, unsigned long event)
+ static int vlan_device_event(struct notifier_block *unused, unsigned long event,
+ 			     void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct vlan_group *grp;
+ 	struct vlan_info *vlan_info;
+ 	int i, flgs;
+diff --git a/net/appletalk/aarp.c b/net/appletalk/aarp.c
+index 173a2e82f486..690356fa52b9 100644
+--- a/net/appletalk/aarp.c
++++ b/net/appletalk/aarp.c
+@@ -332,7 +332,7 @@ static void aarp_expire_timeout(unsigned long unused)
+ static int aarp_device_event(struct notifier_block *this, unsigned long event,
+ 			     void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	int ct;
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+diff --git a/net/appletalk/ddp.c b/net/appletalk/ddp.c
+index 0018daccdea9..7d424ac6e760 100644
+--- a/net/appletalk/ddp.c
++++ b/net/appletalk/ddp.c
+@@ -644,7 +644,7 @@ static inline void atalk_dev_down(struct net_device *dev)
+ static int ddp_device_event(struct notifier_block *this, unsigned long event,
+ 			    void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+diff --git a/net/atm/clip.c b/net/atm/clip.c
+index d1d8f524179f..302603c2d587 100644
+--- a/net/atm/clip.c
++++ b/net/atm/clip.c
+@@ -539,9 +539,9 @@ static int clip_create(int number)
+ }
+ 
+ static int clip_device_event(struct notifier_block *this, unsigned long event,
+-			     void *arg)
++			     void *ptr)
+ {
+-	struct net_device *dev = arg;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+diff --git a/net/atm/mpc.c b/net/atm/mpc.c
+index f4c8af1c60d8..2a5c9843350d 100644
+--- a/net/atm/mpc.c
++++ b/net/atm/mpc.c
+@@ -998,14 +998,12 @@ int msg_to_mpoad(struct k_message *mesg, struct mpoa_client *mpc)
+ }
+ 
+ static int mpoa_event_listener(struct notifier_block *mpoa_notifier,
+-			       unsigned long event, void *dev_ptr)
++			       unsigned long event, void *ptr)
+ {
+-	struct net_device *dev;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct mpoa_client *mpc;
+ 	struct lec_priv *priv;
+ 
+-	dev = dev_ptr;
+-
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+ 
+diff --git a/net/ax25/af_ax25.c b/net/ax25/af_ax25.c
+index ba6db78a02b1..78c474f8f615 100644
+--- a/net/ax25/af_ax25.c
++++ b/net/ax25/af_ax25.c
+@@ -111,9 +111,9 @@ again:
+  *	Handle device status changes.
+  */
+ static int ax25_device_event(struct notifier_block *this, unsigned long event,
+-	void *ptr)
++			     void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+@@ -1974,7 +1974,7 @@ static struct packet_type ax25_packet_type __read_mostly = {
+ };
+ 
+ static struct notifier_block ax25_dev_notifier = {
+-	.notifier_call =ax25_device_event,
++	.notifier_call = ax25_device_event,
+ };
+ 
+ static int __init ax25_init(void)
+diff --git a/net/batman-adv/hard-interface.c b/net/batman-adv/hard-interface.c
+index 522243aff2f3..b6504eac0ed8 100644
+--- a/net/batman-adv/hard-interface.c
++++ b/net/batman-adv/hard-interface.c
+@@ -595,7 +595,7 @@ void batadv_hardif_remove_interfaces(void)
+ static int batadv_hard_if_event(struct notifier_block *this,
+ 				unsigned long event, void *ptr)
+ {
+-	struct net_device *net_dev = ptr;
++	struct net_device *net_dev = netdev_notifier_info_to_dev(ptr);
+ 	struct batadv_hard_iface *hard_iface;
+ 	struct batadv_hard_iface *primary_if = NULL;
+ 	struct batadv_priv *bat_priv;
+diff --git a/net/bridge/br_notify.c b/net/bridge/br_notify.c
+index 7800ad84fd97..2998dd1769a0 100644
+--- a/net/bridge/br_notify.c
++++ b/net/bridge/br_notify.c
+@@ -31,7 +31,7 @@ struct notifier_block br_device_notifier = {
+  */
+ static int br_device_event(struct notifier_block *unused, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net_bridge_port *p;
+ 	struct net_bridge *br;
+ 	bool changed_addr;
+diff --git a/net/caif/caif_dev.c b/net/caif/caif_dev.c
+index 1f9ece1a9c34..4dca159435cf 100644
+--- a/net/caif/caif_dev.c
++++ b/net/caif/caif_dev.c
+@@ -352,9 +352,9 @@ EXPORT_SYMBOL(caif_enroll_dev);
+ 
+ /* notify Caif of device events */
+ static int caif_device_notify(struct notifier_block *me, unsigned long what,
+-			      void *arg)
++			      void *ptr)
+ {
+-	struct net_device *dev = arg;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct caif_device_entry *caifd = NULL;
+ 	struct caif_dev_common *caifdev;
+ 	struct cfcnfg *cfg;
+diff --git a/net/caif/caif_usb.c b/net/caif/caif_usb.c
+index 942e00a425fd..75ed04b78fa4 100644
+--- a/net/caif/caif_usb.c
++++ b/net/caif/caif_usb.c
+@@ -121,9 +121,9 @@ static struct packet_type caif_usb_type __read_mostly = {
+ };
+ 
+ static int cfusbl_device_notify(struct notifier_block *me, unsigned long what,
+-				void *arg)
++				void *ptr)
+ {
+-	struct net_device *dev = arg;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct caif_dev_common common;
+ 	struct cflayer *layer, *link_support;
+ 	struct usbnet *usbnet;
+diff --git a/net/can/af_can.c b/net/can/af_can.c
+index c4e50852c9f4..3ab8dd2e1282 100644
+--- a/net/can/af_can.c
++++ b/net/can/af_can.c
+@@ -794,9 +794,9 @@ EXPORT_SYMBOL(can_proto_unregister);
+  * af_can notifier to create/remove CAN netdevice specific structs
+  */
+ static int can_notifier(struct notifier_block *nb, unsigned long msg,
+-			void *data)
++			void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)data;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct dev_rcv_lists *d;
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+diff --git a/net/can/bcm.c b/net/can/bcm.c
+index 8f113e6ff327..46f20bfafc0e 100644
+--- a/net/can/bcm.c
++++ b/net/can/bcm.c
+@@ -1350,9 +1350,9 @@ static int bcm_sendmsg(struct kiocb *iocb, struct socket *sock,
+  * notification handler for netdevice status changes
+  */
+ static int bcm_notifier(struct notifier_block *nb, unsigned long msg,
+-			void *data)
++			void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)data;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct bcm_sock *bo = container_of(nb, struct bcm_sock, notifier);
+ 	struct sock *sk = &bo->sk;
+ 	struct bcm_op *op;
+diff --git a/net/can/gw.c b/net/can/gw.c
+index de25455b4e3e..6bdc265fe08f 100644
+--- a/net/can/gw.c
++++ b/net/can/gw.c
+@@ -445,9 +445,9 @@ static inline void cgw_unregister_filter(struct cgw_job *gwj)
+ }
+ 
+ static int cgw_notifier(struct notifier_block *nb,
+-			unsigned long msg, void *data)
++			unsigned long msg, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)data;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+diff --git a/net/can/raw.c b/net/can/raw.c
+index 1085e65f848e..641e1c895123 100644
+--- a/net/can/raw.c
++++ b/net/can/raw.c
+@@ -239,9 +239,9 @@ static int raw_enable_allfilters(struct net_device *dev, struct sock *sk)
+ }
+ 
+ static int raw_notifier(struct notifier_block *nb,
+-			unsigned long msg, void *data)
++			unsigned long msg, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)data;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct raw_sock *ro = container_of(nb, struct raw_sock, notifier);
+ 	struct sock *sk = &ro->sk;
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index ce5758e98847..9b061434ea7b 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1464,6 +1464,20 @@ void dev_disable_lro(struct net_device *dev)
+ }
+ EXPORT_SYMBOL(dev_disable_lro);
+ 
++static void netdev_notifier_info_init(struct netdev_notifier_info *info,
++				      struct net_device *dev)
++{
++	info->dev = dev;
++}
++
++static int call_netdevice_notifier(struct notifier_block *nb, unsigned long val,
++				   struct net_device *dev)
++{
++	struct netdev_notifier_info info;
++
++	netdev_notifier_info_init(&info, dev);
++	return nb->notifier_call(nb, val, &info);
++}
+ 
+ static int dev_boot_phase = 1;
+ 
+@@ -1496,7 +1510,7 @@ int register_netdevice_notifier(struct notifier_block *nb)
+ 		goto unlock;
+ 	for_each_net(net) {
+ 		for_each_netdev(net, dev) {
+-			err = nb->notifier_call(nb, NETDEV_REGISTER, dev);
++			err = call_netdevice_notifier(nb, NETDEV_REGISTER, dev);
+ 			err = notifier_to_errno(err);
+ 			if (err)
+ 				goto rollback;
+@@ -1504,7 +1518,7 @@ int register_netdevice_notifier(struct notifier_block *nb)
+ 			if (!(dev->flags & IFF_UP))
+ 				continue;
+ 
+-			nb->notifier_call(nb, NETDEV_UP, dev);
++			call_netdevice_notifier(nb, NETDEV_UP, dev);
+ 		}
+ 	}
+ 
+@@ -1520,10 +1534,11 @@ rollback:
+ 				goto outroll;
+ 
+ 			if (dev->flags & IFF_UP) {
+-				nb->notifier_call(nb, NETDEV_GOING_DOWN, dev);
+-				nb->notifier_call(nb, NETDEV_DOWN, dev);
++				call_netdevice_notifier(nb, NETDEV_GOING_DOWN,
++							dev);
++				call_netdevice_notifier(nb, NETDEV_DOWN, dev);
+ 			}
+-			nb->notifier_call(nb, NETDEV_UNREGISTER, dev);
++			call_netdevice_notifier(nb, NETDEV_UNREGISTER, dev);
+ 		}
+ 	}
+ 
+@@ -1561,10 +1576,11 @@ int unregister_netdevice_notifier(struct notifier_block *nb)
+ 	for_each_net(net) {
+ 		for_each_netdev(net, dev) {
+ 			if (dev->flags & IFF_UP) {
+-				nb->notifier_call(nb, NETDEV_GOING_DOWN, dev);
+-				nb->notifier_call(nb, NETDEV_DOWN, dev);
++				call_netdevice_notifier(nb, NETDEV_GOING_DOWN,
++							dev);
++				call_netdevice_notifier(nb, NETDEV_DOWN, dev);
+ 			}
+-			nb->notifier_call(nb, NETDEV_UNREGISTER, dev);
++			call_netdevice_notifier(nb, NETDEV_UNREGISTER, dev);
+ 		}
+ 	}
+ unlock:
+@@ -1573,6 +1589,25 @@ unlock:
+ }
+ EXPORT_SYMBOL(unregister_netdevice_notifier);
+ 
++/**
++ *	call_netdevice_notifiers_info - call all network notifier blocks
++ *	@val: value passed unmodified to notifier function
++ *	@dev: net_device pointer passed unmodified to notifier function
++ *	@info: notifier information data
++ *
++ *	Call all network notifier blocks.  Parameters and return value
++ *	are as for raw_notifier_call_chain().
++ */
++
++int call_netdevice_notifiers_info(unsigned long val, struct net_device *dev,
++				  struct netdev_notifier_info *info)
++{
++	ASSERT_RTNL();
++	netdev_notifier_info_init(info, dev);
++	return raw_notifier_call_chain(&netdev_chain, val, info);
++}
++EXPORT_SYMBOL(call_netdevice_notifiers_info);
++
+ /**
+  *	call_netdevice_notifiers - call all network notifier blocks
+  *      @val: value passed unmodified to notifier function
+@@ -1584,8 +1619,9 @@ EXPORT_SYMBOL(unregister_netdevice_notifier);
+ 
+ int call_netdevice_notifiers(unsigned long val, struct net_device *dev)
+ {
+-	ASSERT_RTNL();
+-	return raw_notifier_call_chain(&netdev_chain, val, dev);
++	struct netdev_notifier_info info;
++
++	return call_netdevice_notifiers_info(val, dev, &info);
+ }
+ EXPORT_SYMBOL(call_netdevice_notifiers);
+ 
+diff --git a/net/core/drop_monitor.c b/net/core/drop_monitor.c
+index 342380061035..95897183226e 100644
+--- a/net/core/drop_monitor.c
++++ b/net/core/drop_monitor.c
+@@ -300,9 +300,9 @@ static int net_dm_cmd_trace(struct sk_buff *skb,
+ }
+ 
+ static int dropmon_net_event(struct notifier_block *ev_block,
+-			unsigned long event, void *ptr)
++			     unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct dm_hw_stat_delta *new_stat = NULL;
+ 	struct dm_hw_stat_delta *tmp;
+ 
+diff --git a/net/core/dst.c b/net/core/dst.c
+index 65dccfb58d44..27e030f3d50c 100644
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@ -360,7 +360,7 @@ static void dst_ifdown(struct dst_entry *dst, struct net_device *dev,
+ static int dst_dev_event(struct notifier_block *this, unsigned long event,
+ 			 void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct dst_entry *dst, *last = NULL;
+ 
+ 	switch (event) {
+diff --git a/net/core/fib_rules.c b/net/core/fib_rules.c
+index 2771bcd5bded..5ac250c52c18 100644
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@ -695,9 +695,9 @@ static void detach_rules(struct list_head *rules, struct net_device *dev)
+ 
+ 
+ static int fib_rules_event(struct notifier_block *this, unsigned long event,
+-			    void *ptr)
++			   void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net *net = dev_net(dev);
+ 	struct fib_rules_ops *ops;
+ 
+diff --git a/net/core/netprio_cgroup.c b/net/core/netprio_cgroup.c
+index 0777d0aa18c3..e533259dce3c 100644
+--- a/net/core/netprio_cgroup.c
++++ b/net/core/netprio_cgroup.c
+@@ -261,7 +261,7 @@ struct cgroup_subsys net_prio_subsys = {
+ static int netprio_device_event(struct notifier_block *unused,
+ 				unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct netprio_map *old;
+ 
+ 	/*
+diff --git a/net/core/pktgen.c b/net/core/pktgen.c
+index bb26b23a6a90..a4459748075d 100644
+--- a/net/core/pktgen.c
++++ b/net/core/pktgen.c
+@@ -1951,7 +1951,7 @@ static void pktgen_change_name(const struct pktgen_net *pn, struct net_device *d
+ static int pktgen_device_event(struct notifier_block *unused,
+ 			       unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct pktgen_net *pn = net_generic(dev_net(dev), pg_net_id);
+ 
+ 	if (pn->pktgen_exiting)
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index bca0c57300c0..2e984857befa 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -3109,7 +3109,7 @@ static void rtnetlink_rcv(struct sk_buff *skb)
+ 
+ static int rtnetlink_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	switch (event) {
+ 	case NETDEV_UP:
+diff --git a/net/decnet/af_decnet.c b/net/decnet/af_decnet.c
+index c21f200eed93..dd4d506ef923 100644
+--- a/net/decnet/af_decnet.c
++++ b/net/decnet/af_decnet.c
+@@ -2078,9 +2078,9 @@ out_err:
+ }
+ 
+ static int dn_device_event(struct notifier_block *this, unsigned long event,
+-			void *ptr)
++			   void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+diff --git a/net/ieee802154/6lowpan.c b/net/ieee802154/6lowpan.c
+index 31b127e8086b..a47f582c210b 100644
+--- a/net/ieee802154/6lowpan.c
++++ b/net/ieee802154/6lowpan.c
+@@ -1352,10 +1352,9 @@ static inline void lowpan_netlink_fini(void)
+ }
+ 
+ static int lowpan_device_event(struct notifier_block *unused,
+-				unsigned long event,
+-				void *ptr)
++			       unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	LIST_HEAD(del_list);
+ 	struct lowpan_dev_record *entry, *tmp;
+ 
+diff --git a/net/ipv4/arp.c b/net/ipv4/arp.c
+index eb2b67ce4b84..359ed1541226 100644
+--- a/net/ipv4/arp.c
++++ b/net/ipv4/arp.c
+@@ -1237,7 +1237,7 @@ out:
+ static int arp_netdev_event(struct notifier_block *this, unsigned long event,
+ 			    void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	switch (event) {
+ 	case NETDEV_CHANGEADDR:
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index 25ce9bd1a367..2167d0b6708e 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -1338,7 +1338,7 @@ static void inetdev_send_gratuitous_arp(struct net_device *dev,
+ static int inetdev_event(struct notifier_block *this, unsigned long event,
+ 			 void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct in_device *in_dev = __in_dev_get_rtnl(dev);
+ 
+ 	ASSERT_RTNL();
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index 59c306b4d24b..7a42392f1c5b 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -1045,7 +1045,7 @@ static int fib_inetaddr_event(struct notifier_block *this, unsigned long event,
+ 
+ static int fib_netdev_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct in_device *in_dev;
+ 	struct net *net = dev_net(dev);
+ 
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index 824b638c085c..6eb4925d518b 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -1619,7 +1619,7 @@ int ipmr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
+ 
+ static int ipmr_device_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net *net = dev_net(dev);
+ 	struct mr_table *mrt;
+ 	struct vif_device *v;
+* Unmerged path net/ipv4/netfilter/ipt_MASQUERADE.c
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index 1fa5aee38495..41c3b1f378dc 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -2840,9 +2840,9 @@ ipv6_inherit_linklocal(struct inet6_dev *idev, struct net_device *link_dev)
+ }
+ 
+ static int addrconf_notify(struct notifier_block *this, unsigned long event,
+-			   void *data)
++			   void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *) data;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct inet6_dev *idev = __in6_dev_get(dev);
+ 	int run_pending = 0;
+ 	int err;
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+index fc54dd5e1e38..37c3f5548ec8 100644
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -1326,7 +1326,7 @@ static int ip6mr_mfc_delete(struct mr6_table *mrt, struct mf6cctl *mfc,
+ static int ip6mr_device_event(struct notifier_block *this,
+ 			      unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net *net = dev_net(dev);
+ 	struct mr6_table *mrt;
+ 	struct mif_device *v;
+diff --git a/net/ipv6/ndisc.c b/net/ipv6/ndisc.c
+index a9a67c3fc33d..804d71a15965 100644
+--- a/net/ipv6/ndisc.c
++++ b/net/ipv6/ndisc.c
+@@ -1575,7 +1575,7 @@ int ndisc_rcv(struct sk_buff *skb)
+ 
+ static int ndisc_netdev_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net *net = dev_net(dev);
+ 	struct inet6_dev *idev;
+ 
+* Unmerged path net/ipv6/netfilter/ip6t_MASQUERADE.c
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 3b8548adff8a..afc9fd11411a 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -2867,9 +2867,9 @@ errout:
+ }
+ 
+ static int ip6_route_dev_notify(struct notifier_block *this,
+-				unsigned long event, void *data)
++				unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)data;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net *net = dev_net(dev);
+ 
+ 	if (event == NETDEV_REGISTER && (dev->flags & IFF_LOOPBACK)) {
+diff --git a/net/ipx/af_ipx.c b/net/ipx/af_ipx.c
+index e0897377b3b4..e096025b477f 100644
+--- a/net/ipx/af_ipx.c
++++ b/net/ipx/af_ipx.c
+@@ -330,7 +330,7 @@ static __inline__ void __ipxitf_put(struct ipx_interface *intrfc)
+ static int ipxitf_device_event(struct notifier_block *notifier,
+ 				unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct ipx_interface *i, *tmp;
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+diff --git a/net/iucv/af_iucv.c b/net/iucv/af_iucv.c
+index e22a0c58a269..046f5da713e9 100644
+--- a/net/iucv/af_iucv.c
++++ b/net/iucv/af_iucv.c
+@@ -2290,7 +2290,7 @@ out_unlock:
+ static int afiucv_netdev_event(struct notifier_block *this,
+ 			       unsigned long event, void *ptr)
+ {
+-	struct net_device *event_dev = (struct net_device *)ptr;
++	struct net_device *event_dev = netdev_notifier_info_to_dev(ptr);
+ 	struct sock *sk;
+ 	struct iucv_sock *iucv;
+ 
+* Unmerged path net/mac80211/iface.c
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index 13c85fbc0b3a..8fb98187ab08 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -1487,9 +1487,9 @@ ip_vs_forget_dev(struct ip_vs_dest *dest, struct net_device *dev)
+  * Currently only NETDEV_DOWN is handled to release refs to cached dsts
+  */
+ static int ip_vs_dst_event(struct notifier_block *this, unsigned long event,
+-			    void *ptr)
++			   void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net *net = dev_net(dev);
+ 	struct netns_ipvs *ipvs = net_ipvs(net);
+ 	struct ip_vs_service *svc;
+diff --git a/net/netfilter/nfnetlink_queue_core.c b/net/netfilter/nfnetlink_queue_core.c
+index b5cda594b57a..b63062feb756 100644
+--- a/net/netfilter/nfnetlink_queue_core.c
++++ b/net/netfilter/nfnetlink_queue_core.c
+@@ -764,7 +764,7 @@ static int
+ nfqnl_rcv_dev_event(struct notifier_block *this,
+ 		    unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	/* Drop any packets associated with the downed device */
+ 	if (event == NETDEV_DOWN)
+diff --git a/net/netfilter/xt_TEE.c b/net/netfilter/xt_TEE.c
+index bd93e51d30ac..292934d23482 100644
+--- a/net/netfilter/xt_TEE.c
++++ b/net/netfilter/xt_TEE.c
+@@ -200,7 +200,7 @@ tee_tg6(struct sk_buff *skb, const struct xt_action_param *par)
+ static int tee_netdev_event(struct notifier_block *this, unsigned long event,
+ 			    void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct xt_tee_priv *priv;
+ 
+ 	priv = container_of(this, struct xt_tee_priv, notifier);
+diff --git a/net/netlabel/netlabel_unlabeled.c b/net/netlabel/netlabel_unlabeled.c
+index d2e531aac07a..f2ad4f36193b 100644
+--- a/net/netlabel/netlabel_unlabeled.c
++++ b/net/netlabel/netlabel_unlabeled.c
+@@ -708,7 +708,7 @@ unlhsh_remove_return:
+  * netlbl_unlhsh_netdev_handler - Network device notification handler
+  * @this: notifier block
+  * @event: the event
+- * @ptr: the network device (cast to void)
++ * @ptr: the netdevice notifier info (cast to void)
+  *
+  * Description:
+  * Handle network device events, although at present all we care about is a
+@@ -717,10 +717,9 @@ unlhsh_remove_return:
+  *
+  */
+ static int netlbl_unlhsh_netdev_handler(struct notifier_block *this,
+-					unsigned long event,
+-					void *ptr)
++					unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct netlbl_unlhsh_iface *iface = NULL;
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+diff --git a/net/netrom/af_netrom.c b/net/netrom/af_netrom.c
+index 13b92982a506..53c19a35fc6d 100644
+--- a/net/netrom/af_netrom.c
++++ b/net/netrom/af_netrom.c
+@@ -117,7 +117,7 @@ static void nr_kill_by_device(struct net_device *dev)
+  */
+ static int nr_device_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+diff --git a/net/openvswitch/dp_notify.c b/net/openvswitch/dp_notify.c
+index aad5eae29198..2c631fe76be1 100644
+--- a/net/openvswitch/dp_notify.c
++++ b/net/openvswitch/dp_notify.c
+@@ -76,7 +76,7 @@ static int dp_device_event(struct notifier_block *unused, unsigned long event,
+ 			   void *ptr)
+ {
+ 	struct ovs_net *ovs_net;
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct vport *vport = NULL;
+ 
+ 	if (!ovs_is_internal_dev(dev))
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 8fa79e4b0909..05cbb2401576 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -3468,10 +3468,11 @@ static int packet_getsockopt(struct socket *sock, int level, int optname,
+ }
+ 
+ 
+-static int packet_notifier(struct notifier_block *this, unsigned long msg, void *data)
++static int packet_notifier(struct notifier_block *this,
++			   unsigned long msg, void *ptr)
+ {
+ 	struct sock *sk;
+-	struct net_device *dev = data;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct net *net = dev_net(dev);
+ 
+ 	rcu_read_lock();
+diff --git a/net/phonet/pn_dev.c b/net/phonet/pn_dev.c
+index 45a7df6575de..56a6146ac94b 100644
+--- a/net/phonet/pn_dev.c
++++ b/net/phonet/pn_dev.c
+@@ -292,9 +292,9 @@ static void phonet_route_autodel(struct net_device *dev)
+ 
+ /* notify Phonet of device events */
+ static int phonet_device_notify(struct notifier_block *me, unsigned long what,
+-				void *arg)
++				void *ptr)
+ {
+-	struct net_device *dev = arg;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	switch (what) {
+ 	case NETDEV_REGISTER:
+diff --git a/net/rose/af_rose.c b/net/rose/af_rose.c
+index abf0ad6311d0..33af77246bfe 100644
+--- a/net/rose/af_rose.c
++++ b/net/rose/af_rose.c
+@@ -202,10 +202,10 @@ static void rose_kill_by_device(struct net_device *dev)
+ /*
+  *	Handle device status changes.
+  */
+-static int rose_device_event(struct notifier_block *this, unsigned long event,
+-	void *ptr)
++static int rose_device_event(struct notifier_block *this,
++			     unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+ 		return NOTIFY_DONE;
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 5d676edc22a6..977c10e0631b 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -243,7 +243,7 @@ nla_put_failure:
+ static int mirred_device_event(struct notifier_block *unused,
+ 			       unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct tcf_mirred *m;
+ 
+ 	if (event == NETDEV_UNREGISTER)
+diff --git a/net/tipc/eth_media.c b/net/tipc/eth_media.c
+index 120a676a3360..fc60bea63169 100644
+--- a/net/tipc/eth_media.c
++++ b/net/tipc/eth_media.c
+@@ -251,9 +251,9 @@ static void disable_bearer(struct tipc_bearer *tb_ptr)
+  * specified device.
+  */
+ static int recv_notification(struct notifier_block *nb, unsigned long evt,
+-			     void *dv)
++			     void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)dv;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct eth_bearer *eb_ptr = &eth_bearers[0];
+ 	struct eth_bearer *stop = &eth_bearers[MAX_ETH_BEARERS];
+ 
+diff --git a/net/tipc/ib_media.c b/net/tipc/ib_media.c
+index 2a2864c25e15..baa9df4327d9 100644
+--- a/net/tipc/ib_media.c
++++ b/net/tipc/ib_media.c
+@@ -244,9 +244,9 @@ static void disable_bearer(struct tipc_bearer *tb_ptr)
+  * specified device.
+  */
+ static int recv_notification(struct notifier_block *nb, unsigned long evt,
+-			     void *dv)
++			     void *ptr)
+ {
+-	struct net_device *dev = (struct net_device *)dv;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct ib_bearer *ib_ptr = &ib_bearers[0];
+ 	struct ib_bearer *stop = &ib_bearers[MAX_IB_BEARERS];
+ 
+* Unmerged path net/wireless/core.c
+diff --git a/net/x25/af_x25.c b/net/x25/af_x25.c
+index f96af3b96322..7622789d3750 100644
+--- a/net/x25/af_x25.c
++++ b/net/x25/af_x25.c
+@@ -224,7 +224,7 @@ static void x25_kill_by_device(struct net_device *dev)
+ static int x25_device_event(struct notifier_block *this, unsigned long event,
+ 			    void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct x25_neigh *nb;
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index ea582d85d7f5..9103881cc036 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -2822,7 +2822,7 @@ static void __net_init xfrm_dst_ops_init(struct net *net)
+ 
+ static int xfrm_dev_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	switch (event) {
+ 	case NETDEV_DOWN:
+diff --git a/security/selinux/netif.c b/security/selinux/netif.c
+index 548651a73876..485524c477a4 100644
+--- a/security/selinux/netif.c
++++ b/security/selinux/netif.c
+@@ -261,7 +261,7 @@ void sel_netif_flush(void)
+ static int sel_netif_netdev_notifier_handler(struct notifier_block *this,
+ 					     unsigned long event, void *ptr)
+ {
+-	struct net_device *dev = ptr;
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (event == NETDEV_DOWN)
+ 		sel_netif_kill(dev_net(dev), dev->ifindex);
