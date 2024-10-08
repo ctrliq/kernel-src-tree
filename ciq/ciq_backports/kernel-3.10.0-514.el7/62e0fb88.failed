@@ -1,0 +1,963 @@
+drm/i915/skl: Update plane watermarks atomically during plane updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] i915/skl: Update plane watermarks atomically during plane updates (Lyude Paul) [1341633 1355776]
+Rebuild_FUZZ: 97.01%
+commit-author Lyude <cpaul@redhat.com>
+commit 62e0fb880123c98793e5c3ba8355501b0305e92e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/62e0fb88.failed
+
+Thanks to Ville for suggesting this as a potential solution to pipe
+underruns on Skylake.
+
+On Skylake all of the registers for configuring planes, including the
+registers for configuring their watermarks, are double buffered. New
+values written to them won't take effect until said registers are
+"armed", which is done by writing to the PLANE_SURF (or in the case of
+cursor planes, the CURBASE register) register.
+
+With this in mind, up until now we've been updating watermarks on skl
+like this:
+
+  non-modeset {
+   - calculate (during atomic check phase)
+   - finish_atomic_commit:
+     - intel_pre_plane_update:
+        - intel_update_watermarks()
+     - {vblank happens; new watermarks + old plane values => underrun }
+     - drm_atomic_helper_commit_planes_on_crtc:
+        - start vblank evasion
+        - write new plane registers
+        - end vblank evasion
+  }
+
+  or
+
+  modeset {
+   - calculate (during atomic check phase)
+   - finish_atomic_commit:
+     - crtc_enable:
+        - intel_update_watermarks()
+     - {vblank happens; new watermarks + old plane values => underrun }
+     - drm_atomic_helper_commit_planes_on_crtc:
+        - start vblank evasion
+        - write new plane registers
+        - end vblank evasion
+  }
+
+Now we update watermarks atomically like this:
+
+  non-modeset {
+   - calculate (during atomic check phase)
+   - finish_atomic_commit:
+     - intel_pre_plane_update:
+        - intel_update_watermarks() (wm values aren't written yet)
+     - drm_atomic_helper_commit_planes_on_crtc:
+        - start vblank evasion
+        - write new plane registers
+        - write new wm values
+        - end vblank evasion
+  }
+
+  modeset {
+   - calculate (during atomic check phase)
+   - finish_atomic_commit:
+     - crtc_enable:
+        - intel_update_watermarks() (actual wm values aren't written
+          yet)
+     - drm_atomic_helper_commit_planes_on_crtc:
+        - start vblank evasion
+        - write new plane registers
+	- write new wm values
+        - end vblank evasion
+  }
+
+So this patch moves all of the watermark writes into the right place;
+inside of the vblank evasion where we update all of the registers for
+each plane. While this patch doesn't fix everything, it does allow us to
+update the watermark values in the way the hardware expects us to.
+
+Changes since original patch series:
+ - Remove mutex_lock/mutex_unlock since they don't do anything and we're
+   not touching global state
+ - Move skl_write_cursor_wm/skl_write_plane_wm functions into
+   intel_pm.c, make externally visible
+ - Add skl_write_plane_wm calls to skl_update_plane
+ - Fix conditional for for loop in skl_write_plane_wm (level < max_level
+   should be level <= max_level)
+ - Make diagram in commit more accurate to what's actually happening
+ - Add Fixes:
+
+Changes since v1:
+ - Use IS_GEN9() instead of IS_SKYLAKE() since these fixes apply to more
+   then just Skylake
+ - Update description to make it clear this patch doesn't fix everything
+ - Check if pipes were actually changed before writing watermarks
+
+Changes since v2:
+ - Write PIPE_WM_LINETIME during vblank evasion
+
+Changes since v3:
+ - Rebase against new SAGV patch changes
+
+Changes since v4:
+ - Add a parameter to choose what skl_wm_values struct to use when
+   writing new plane watermarks
+
+Changes since v5:
+ - Remove cursor ddb entry write in skl_write_cursor_wm(), defer until
+   patch 6
+ - Write WM_LINETIME in intel_begin_crtc_commit()
+
+Changes since v6:
+ - Remove redundant dirty_pipes check in skl_write_plane_wm (we check
+   this in all places where we call this function, and it was supposed
+   to have been removed earlier anyway)
+ - In i9xx_update_cursor(), use dev_priv->info.gen >= 9 instead of
+   IS_GEN9(dev_priv). We do this everywhere else and I'd imagine this
+   needs to be done for gen10 as well
+
+Changes since v7:
+ - Fix rebase fail (unused variable obj)
+ - Make struct skl_wm_values *wm const
+ - Fix indenting
+ - Use INTEL_GEN() instead of dev_priv->info.gen
+
+Changes since v8:
+ - Don't forget calls to skl_write_plane_wm() when disabling planes
+ - Use INTEL_GEN(), not INTEL_INFO()->gen in intel_begin_crtc_commit()
+
+Fixes: 2d41c0b59afc ("drm/i915/skl: SKL Watermark Computation")
+	Signed-off-by: Lyude <cpaul@redhat.com>
+	Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+	Cc: stable@vger.kernel.org
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+	Cc: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1471884608-10671-1-git-send-email-cpaul@redhat.com
+Link: http://patchwork.freedesktop.org/patch/msgid/1471884608-10671-1-git-send-email-cpaul@redhat.com
+(cherry picked from commit 62e0fb880123c98793e5c3ba8355501b0305e92e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+#	drivers/gpu/drm/i915/intel_drv.h
+#	drivers/gpu/drm/i915/intel_pm.c
+#	drivers/gpu/drm/i915/intel_sprite.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 0caacf8c3858,2dd2c0e9ae32..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -2891,139 -3210,248 +2891,197 @@@ static void ironlake_update_primary_pla
+  	POSTING_READ(reg);
+  }
+  
+ -u32 intel_fb_stride_alignment(const struct drm_i915_private *dev_priv,
+ -			      uint64_t fb_modifier, uint32_t pixel_format)
+ -{
+ -	if (fb_modifier == DRM_FORMAT_MOD_NONE) {
+ -		return 64;
+ -	} else {
+ -		int cpp = drm_format_plane_cpp(pixel_format, 0);
+ -
+ -		return intel_tile_width_bytes(dev_priv, fb_modifier, cpp);
+ -	}
+ -}
+ -
+ -u32 intel_fb_gtt_offset(struct drm_framebuffer *fb,
+ -			unsigned int rotation)
+ -{
+ -	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+ -	struct i915_ggtt_view view;
+ -	struct i915_vma *vma;
+ -
+ -	intel_fill_fb_ggtt_view(&view, fb, rotation);
+ -
+ -	vma = i915_gem_object_to_ggtt(obj, &view);
+ -	if (WARN(!vma, "ggtt vma for display object not found! (view=%u)\n",
+ -		 view.type))
+ -		return -1;
+ -
+ -	return i915_ggtt_offset(vma);
+ -}
+ -
+ -static void skl_detach_scaler(struct intel_crtc *intel_crtc, int id)
+ -{
+ -	struct drm_device *dev = intel_crtc->base.dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ -
+ -	I915_WRITE(SKL_PS_CTRL(intel_crtc->pipe, id), 0);
+ -	I915_WRITE(SKL_PS_WIN_POS(intel_crtc->pipe, id), 0);
+ -	I915_WRITE(SKL_PS_WIN_SZ(intel_crtc->pipe, id), 0);
+ -}
+ -
+ -/*
+ - * This function detaches (aka. unbinds) unused scalers in hardware
+ - */
+ -static void skl_detach_scalers(struct intel_crtc *intel_crtc)
+ -{
+ -	struct intel_crtc_scaler_state *scaler_state;
+ -	int i;
+ -
+ -	scaler_state = &intel_crtc->config->scaler_state;
+ -
+ -	/* loop through and disable scalers that aren't in use */
+ -	for (i = 0; i < intel_crtc->num_scalers; i++) {
+ -		if (!scaler_state->scalers[i].in_use)
+ -			skl_detach_scaler(intel_crtc, i);
+ -	}
+ -}
+ -
+ -u32 skl_plane_stride(const struct drm_framebuffer *fb, int plane,
+ -		     unsigned int rotation)
+ +u32 intel_fb_stride_alignment(struct drm_device *dev, uint64_t fb_modifier,
+ +			      uint32_t pixel_format)
+  {
+ -	const struct drm_i915_private *dev_priv = to_i915(fb->dev);
+ -	u32 stride = intel_fb_pitch(fb, plane, rotation);
+ -
+ -	/*
+ -	 * The stride is either expressed as a multiple of 64 bytes chunks for
+ -	 * linear buffers or in number of tiles for tiled buffers.
+ -	 */
+ -	if (intel_rotation_90_or_270(rotation)) {
+ -		int cpp = drm_format_plane_cpp(fb->pixel_format, plane);
+ -
+ -		stride /= intel_tile_height(dev_priv, fb->modifier[0], cpp);
+ -	} else {
+ -		stride /= intel_fb_stride_alignment(dev_priv, fb->modifier[0],
+ -						    fb->pixel_format);
+ -	}
+ -
+ -	return stride;
+ -}
+ +	u32 bits_per_pixel = drm_format_plane_cpp(pixel_format, 0) * 8;
+  
+ -u32 skl_plane_ctl_format(uint32_t pixel_format)
+ -{
+ -	switch (pixel_format) {
+ -	case DRM_FORMAT_C8:
+ -		return PLANE_CTL_FORMAT_INDEXED;
+ -	case DRM_FORMAT_RGB565:
+ -		return PLANE_CTL_FORMAT_RGB_565;
+ -	case DRM_FORMAT_XBGR8888:
+ -		return PLANE_CTL_FORMAT_XRGB_8888 | PLANE_CTL_ORDER_RGBX;
+ -	case DRM_FORMAT_XRGB8888:
+ -		return PLANE_CTL_FORMAT_XRGB_8888;
+  	/*
+ -	 * XXX: For ARBG/ABGR formats we default to expecting scanout buffers
+ -	 * to be already pre-multiplied. We need to add a knob (or a different
+ -	 * DRM_FORMAT) for user-space to configure that.
+ +	 * The stride is either expressed as a multiple of 64 bytes
+ +	 * chunks for linear buffers or in number of tiles for tiled
+ +	 * buffers.
+  	 */
+ -	case DRM_FORMAT_ABGR8888:
+ -		return PLANE_CTL_FORMAT_XRGB_8888 | PLANE_CTL_ORDER_RGBX |
+ -			PLANE_CTL_ALPHA_SW_PREMULTIPLY;
+ -	case DRM_FORMAT_ARGB8888:
+ -		return PLANE_CTL_FORMAT_XRGB_8888 |
+ -			PLANE_CTL_ALPHA_SW_PREMULTIPLY;
+ -	case DRM_FORMAT_XRGB2101010:
+ -		return PLANE_CTL_FORMAT_XRGB_2101010;
+ -	case DRM_FORMAT_XBGR2101010:
+ -		return PLANE_CTL_ORDER_RGBX | PLANE_CTL_FORMAT_XRGB_2101010;
+ -	case DRM_FORMAT_YUYV:
+ -		return PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_YUYV;
+ -	case DRM_FORMAT_YVYU:
+ -		return PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_YVYU;
+ -	case DRM_FORMAT_UYVY:
+ -		return PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_UYVY;
+ -	case DRM_FORMAT_VYUY:
+ -		return PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_VYUY;
+ -	default:
+ -		MISSING_CASE(pixel_format);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -u32 skl_plane_ctl_tiling(uint64_t fb_modifier)
+ -{
+  	switch (fb_modifier) {
+  	case DRM_FORMAT_MOD_NONE:
+ -		break;
+ +		return 64;
+  	case I915_FORMAT_MOD_X_TILED:
+ -		return PLANE_CTL_TILED_X;
+ +		if (INTEL_INFO(dev)->gen == 2)
+ +			return 128;
+ +		return 512;
+  	case I915_FORMAT_MOD_Y_TILED:
+ -		return PLANE_CTL_TILED_Y;
+ +		/* No need to check for old gens and Y tiling since this is
+ +		 * about the display engine and those will be blocked before
+ +		 * we get here.
+ +		 */
+ +		return 128;
+  	case I915_FORMAT_MOD_Yf_TILED:
+ -		return PLANE_CTL_TILED_YF;
+ +		if (bits_per_pixel == 8)
+ +			return 64;
+ +		else
+ +			return 128;
+  	default:
+  		MISSING_CASE(fb_modifier);
+ +		return 64;
+  	}
+ -
+ -	return 0;
+  }
+  
+ -u32 skl_plane_ctl_rotation(unsigned int rotation)
+ +unsigned long intel_plane_obj_offset(struct intel_plane *intel_plane,
+ +				     struct drm_i915_gem_object *obj)
+  {
+ -	switch (rotation) {
+ -	case DRM_ROTATE_0:
+ -		break;
+ -	/*
+ -	 * DRM_ROTATE_ is counter clockwise to stay compatible with Xrandr
+ -	 * while i915 HW rotation is clockwise, thats why this swapping.
+ -	 */
+ -	case DRM_ROTATE_90:
+ -		return PLANE_CTL_ROTATE_270;
+ -	case DRM_ROTATE_180:
+ -		return PLANE_CTL_ROTATE_180;
+ -	case DRM_ROTATE_270:
+ -		return PLANE_CTL_ROTATE_90;
+ -	default:
+ -		MISSING_CASE(rotation);
+ -	}
+ +	const struct i915_ggtt_view *view = &i915_ggtt_view_normal;
+  
+ -	return 0;
+ +	if (intel_rotation_90_or_270(intel_plane->base.state->rotation))
+ +		view = &i915_ggtt_view_rotated;
+ +
+ +	return i915_gem_obj_ggtt_offset_view(obj, view);
+  }
+  
+ -static void skylake_update_primary_plane(struct drm_plane *plane,
+ -					 const struct intel_crtc_state *crtc_state,
+ -					 const struct intel_plane_state *plane_state)
+ +static void skylake_update_primary_plane(struct drm_crtc *crtc,
+ +					 struct drm_framebuffer *fb,
+ +					 int x, int y)
+  {
+++<<<<<<< HEAD
+ +	struct drm_device *dev = crtc->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ +	struct drm_i915_gem_object *obj;
+++=======
++ 	struct drm_device *dev = plane->dev;
++ 	struct drm_i915_private *dev_priv = to_i915(dev);
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc_state->base.crtc);
++ 	struct drm_framebuffer *fb = plane_state->base.fb;
++ 	const struct skl_wm_values *wm = &dev_priv->wm.skl_results;
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  	int pipe = intel_crtc->pipe;
+ -	u32 plane_ctl;
+ -	unsigned int rotation = plane_state->base.rotation;
+ -	u32 stride = skl_plane_stride(fb, 0, rotation);
+ -	u32 surf_addr = plane_state->main.offset;
+ -	int scaler_id = plane_state->scaler_id;
+ -	int src_x = plane_state->main.x;
+ -	int src_y = plane_state->main.y;
+ -	int src_w = drm_rect_width(&plane_state->base.src) >> 16;
+ -	int src_h = drm_rect_height(&plane_state->base.src) >> 16;
+ -	int dst_x = plane_state->base.dst.x1;
+ -	int dst_y = plane_state->base.dst.y1;
+ -	int dst_w = drm_rect_width(&plane_state->base.dst);
+ -	int dst_h = drm_rect_height(&plane_state->base.dst);
+ +	u32 plane_ctl, stride_div;
+ +	unsigned long surf_addr;
+ +
+ +	if (!intel_crtc->primary_enabled) {
+ +		I915_WRITE(PLANE_CTL(pipe, 0), 0);
+ +		I915_WRITE(PLANE_SURF(pipe, 0), 0);
+ +		POSTING_READ(PLANE_CTL(pipe, 0));
+ +		return;
+ +	}
+  
+  	plane_ctl = PLANE_CTL_ENABLE |
+  		    PLANE_CTL_PIPE_GAMMA_ENABLE |
+  		    PLANE_CTL_PIPE_CSC_ENABLE;
+  
+++<<<<<<< HEAD
+ +	switch (fb->pixel_format) {
+ +	case DRM_FORMAT_RGB565:
+ +		plane_ctl |= PLANE_CTL_FORMAT_RGB_565;
+ +		break;
+ +	case DRM_FORMAT_XRGB8888:
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888;
+ +		break;
+ +	case DRM_FORMAT_ARGB8888:
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888;
+ +		plane_ctl |= PLANE_CTL_ALPHA_SW_PREMULTIPLY;
+ +		break;
+ +	case DRM_FORMAT_XBGR8888:
+ +		plane_ctl |= PLANE_CTL_ORDER_RGBX;
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888;
+ +		break;
+ +	case DRM_FORMAT_ABGR8888:
+ +		plane_ctl |= PLANE_CTL_ORDER_RGBX;
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888;
+ +		plane_ctl |= PLANE_CTL_ALPHA_SW_PREMULTIPLY;
+ +		break;
+ +	case DRM_FORMAT_XRGB2101010:
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_2101010;
+ +		break;
+ +	case DRM_FORMAT_XBGR2101010:
+ +		plane_ctl |= PLANE_CTL_ORDER_RGBX;
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_2101010;
+ +		break;
+ +	default:
+ +		BUG();
+++=======
++ 	plane_ctl |= skl_plane_ctl_format(fb->pixel_format);
++ 	plane_ctl |= skl_plane_ctl_tiling(fb->modifier[0]);
++ 	plane_ctl |= PLANE_CTL_PLANE_GAMMA_DISABLE;
++ 	plane_ctl |= skl_plane_ctl_rotation(rotation);
++ 
++ 	/* Sizes are 0 based */
++ 	src_w--;
++ 	src_h--;
++ 	dst_w--;
++ 	dst_h--;
++ 
++ 	intel_crtc->adjusted_x = src_x;
++ 	intel_crtc->adjusted_y = src_y;
++ 
++ 	if (wm->dirty_pipes & drm_crtc_mask(&intel_crtc->base))
++ 		skl_write_plane_wm(intel_crtc, wm, 0);
++ 
++ 	I915_WRITE(PLANE_CTL(pipe, 0), plane_ctl);
++ 	I915_WRITE(PLANE_OFFSET(pipe, 0), (src_y << 16) | src_x);
++ 	I915_WRITE(PLANE_STRIDE(pipe, 0), stride);
++ 	I915_WRITE(PLANE_SIZE(pipe, 0), (src_h << 16) | src_w);
++ 
++ 	if (scaler_id >= 0) {
++ 		uint32_t ps_ctrl = 0;
++ 
++ 		WARN_ON(!dst_w || !dst_h);
++ 		ps_ctrl = PS_SCALER_EN | PS_PLANE_SEL(0) |
++ 			crtc_state->scaler_state.scalers[scaler_id].mode;
++ 		I915_WRITE(SKL_PS_CTRL(pipe, scaler_id), ps_ctrl);
++ 		I915_WRITE(SKL_PS_PWR_GATE(pipe, scaler_id), 0);
++ 		I915_WRITE(SKL_PS_WIN_POS(pipe, scaler_id), (dst_x << 16) | dst_y);
++ 		I915_WRITE(SKL_PS_WIN_SZ(pipe, scaler_id), (dst_w << 16) | dst_h);
++ 		I915_WRITE(PLANE_POS(pipe, 0), 0);
++ 	} else {
++ 		I915_WRITE(PLANE_POS(pipe, 0), (dst_y << 16) | dst_x);
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+ +	}
+ +
+ +	switch (fb->modifier[0]) {
+ +	case DRM_FORMAT_MOD_NONE:
+ +		break;
+ +	case I915_FORMAT_MOD_X_TILED:
+ +		plane_ctl |= PLANE_CTL_TILED_X;
+ +		break;
+ +	case I915_FORMAT_MOD_Y_TILED:
+ +		plane_ctl |= PLANE_CTL_TILED_Y;
+ +		break;
+ +	case I915_FORMAT_MOD_Yf_TILED:
+ +		plane_ctl |= PLANE_CTL_TILED_YF;
+ +		break;
+ +	default:
+ +		MISSING_CASE(fb->modifier[0]);
+  	}
+  
+ -	I915_WRITE(PLANE_SURF(pipe, 0),
+ -		   intel_fb_gtt_offset(fb, rotation) + surf_addr);
+ +	plane_ctl |= PLANE_CTL_PLANE_GAMMA_DISABLE;
+ +	if (crtc->primary->state->rotation == BIT(DRM_ROTATE_180))
+ +		plane_ctl |= PLANE_CTL_ROTATE_180;
+  
+ -	POSTING_READ(PLANE_SURF(pipe, 0));
+ -}
+++<<<<<<< HEAD
+ +	obj = intel_fb_obj(fb);
+ +	stride_div = intel_fb_stride_alignment(dev, fb->modifier[0],
+ +					       fb->pixel_format);
+ +	surf_addr = intel_plane_obj_offset(to_intel_plane(crtc->primary), obj);
+  
+ +	I915_WRITE(PLANE_CTL(pipe, 0), plane_ctl);
+ +	I915_WRITE(PLANE_POS(pipe, 0), 0);
+ +	I915_WRITE(PLANE_OFFSET(pipe, 0), (y << 16) | x);
+ +	I915_WRITE(PLANE_SIZE(pipe, 0),
+ +		   (intel_crtc->config->pipe_src_h - 1) << 16 |
+ +		   (intel_crtc->config->pipe_src_w - 1));
+ +	I915_WRITE(PLANE_STRIDE(pipe, 0), fb->pitches[0] / stride_div);
+ +	I915_WRITE(PLANE_SURF(pipe, 0), surf_addr);
+++=======
++ static void skylake_disable_primary_plane(struct drm_plane *primary,
++ 					  struct drm_crtc *crtc)
++ {
++ 	struct drm_device *dev = crtc->dev;
++ 	struct drm_i915_private *dev_priv = to_i915(dev);
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 	int pipe = intel_crtc->pipe;
++ 
++ 	skl_write_plane_wm(intel_crtc, &dev_priv->wm.skl_results, 0);
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  
+ -	I915_WRITE(PLANE_CTL(pipe, 0), 0);
+ -	I915_WRITE(PLANE_SURF(pipe, 0), 0);
+  	POSTING_READ(PLANE_SURF(pipe, 0));
+  }
+  
+@@@ -8815,18 -10815,22 +8873,26 @@@ static void i845_update_cursor(struct d
+  	}
+  }
+  
+ -static void i9xx_update_cursor(struct drm_crtc *crtc, u32 base,
+ -			       const struct intel_plane_state *plane_state)
+ +static void i9xx_update_cursor(struct drm_crtc *crtc, u32 base)
+  {
+  	struct drm_device *dev = crtc->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+  	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 	const struct skl_wm_values *wm = &dev_priv->wm.skl_results;
+  	int pipe = intel_crtc->pipe;
+ -	uint32_t cntl = 0;
+ +	uint32_t cntl;
+  
+++<<<<<<< HEAD
+ +	cntl = 0;
+ +	if (base) {
+++=======
++ 	if (INTEL_GEN(dev_priv) >= 9 && wm->dirty_pipes & drm_crtc_mask(crtc))
++ 		skl_write_cursor_wm(intel_crtc, wm);
++ 
++ 	if (plane_state && plane_state->base.visible) {
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  		cntl = MCURSOR_GAMMA_ENABLE;
+ -		switch (plane_state->base.crtc_w) {
+ +		switch (intel_crtc->base.cursor->state->crtc_w) {
+  			case 64:
+  				cntl |= CURSOR_MODE_64_ARGB_AX;
+  				break;
+@@@ -12631,136 -14747,44 +12697,158 @@@ intel_check_primary_plane(struct drm_pl
+  	return 0;
+  }
+  
+ -static void intel_begin_crtc_commit(struct drm_crtc *crtc,
+ -				    struct drm_crtc_state *old_crtc_state)
+ +static void
+ +intel_commit_primary_plane(struct drm_plane *plane,
+ +			   struct intel_plane_state *state)
+  {
+++<<<<<<< HEAD
+ +	struct drm_crtc *crtc = state->base.crtc;
+ +	struct drm_framebuffer *fb = state->base.fb;
+ +	struct drm_device *dev = plane->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_crtc *intel_crtc;
+ +	struct drm_rect *src = &state->src;
+++=======
++ 	struct drm_device *dev = crtc->dev;
++ 	struct drm_i915_private *dev_priv = to_i915(dev);
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 	struct intel_crtc_state *old_intel_state =
++ 		to_intel_crtc_state(old_crtc_state);
++ 	bool modeset = needs_modeset(crtc->state);
++ 	enum pipe pipe = intel_crtc->pipe;
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  
+ -	/* Perform vblank evasion around commit operation */
+ -	intel_pipe_update_start(intel_crtc);
+ +	crtc = crtc ? crtc : plane->crtc;
+ +	intel_crtc = to_intel_crtc(crtc);
+  
+ -	if (modeset)
+ -		return;
+ +	plane->fb = fb;
+ +	crtc->x = src->x1 >> 16;
+ +	crtc->y = src->y1 >> 16;
+ +
+ +	if (intel_crtc->active) {
+ +		if (state->visible) {
+ +			/* FIXME: kill this fastboot hack */
+ +			intel_update_pipe_size(intel_crtc);
+  
+ -	if (crtc->state->color_mgmt_changed || to_intel_crtc_state(crtc->state)->update_pipe) {
+ -		intel_color_set_csc(crtc->state);
+ -		intel_color_load_luts(crtc->state);
+ +			intel_crtc->primary_enabled = true;
+ +
+ +			dev_priv->display.update_primary_plane(crtc, plane->fb,
+ +					crtc->x, crtc->y);
+ +		} else {
+ +			/*
+ +			 * If clipping results in a non-visible primary plane,
+ +			 * we'll disable the primary plane.  Note that this is
+ +			 * a bit different than what happens if userspace
+ +			 * explicitly disables the plane by passing fb=0
+ +			 * because plane->fb still gets set and pinned.
+ +			 */
+ +			intel_disable_primary_hw_plane(plane, crtc);
+ +		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (to_intel_crtc_state(crtc->state)->update_pipe)
++ 		intel_update_pipe_config(intel_crtc, old_intel_state);
++ 	else if (INTEL_GEN(dev_priv) >= 9) {
++ 		skl_detach_scalers(intel_crtc);
++ 
++ 		I915_WRITE(PIPE_WM_LINETIME(pipe),
++ 			   dev_priv->wm.skl_hw.wm_linetime[pipe]);
++ 	}
+ -}
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+ +}
+ +
+ +static void intel_begin_crtc_commit(struct drm_crtc *crtc)
+ +{
+ +	struct drm_device *dev = crtc->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ +	struct intel_plane *intel_plane;
+ +	struct drm_plane *p;
+ +	unsigned fb_bits = 0;
+ +
+ +	/* Track fb's for any planes being disabled */
+ +	list_for_each_entry(p, &dev->mode_config.plane_list, head) {
+ +		intel_plane = to_intel_plane(p);
+ +
+ +		if (intel_crtc->atomic.disabled_planes &
+ +		    (1 << drm_plane_index(p))) {
+ +			switch (p->type) {
+ +			case DRM_PLANE_TYPE_PRIMARY:
+ +				fb_bits = INTEL_FRONTBUFFER_PRIMARY(intel_plane->pipe);
+ +				break;
+ +			case DRM_PLANE_TYPE_CURSOR:
+ +				fb_bits = INTEL_FRONTBUFFER_CURSOR(intel_plane->pipe);
+ +				break;
+ +			case DRM_PLANE_TYPE_OVERLAY:
+ +				fb_bits = INTEL_FRONTBUFFER_SPRITE(intel_plane->pipe);
+ +				break;
+ +			}
+ +
+ +			mutex_lock(&dev->struct_mutex);
+ +			i915_gem_track_fb(intel_fb_obj(p->fb), NULL, fb_bits);
+ +			mutex_unlock(&dev->struct_mutex);
+ +		}
+ +	}
+ +
+ +	if (intel_crtc->atomic.wait_for_flips)
+ +		intel_crtc_wait_for_pending_flips(crtc);
+ +
+ +	if (intel_crtc->atomic.disable_fbc)
+ +		intel_fbc_disable(dev);
+ +
+ +	if (intel_crtc->atomic.disable_ips)
+ +		hsw_disable_ips(intel_crtc);
+ +
+ +	if (intel_crtc->atomic.pre_disable_primary)
+ +		intel_pre_disable_primary(crtc);
+ +
+ +	if (intel_crtc->atomic.update_wm)
+ +		intel_update_watermarks(crtc);
+ +
+ +	intel_runtime_pm_get(dev_priv);
+ +
+ +	/* Perform vblank evasion around commit operation */
+ +	if (intel_crtc->active)
+ +		intel_crtc->atomic.evade =
+ +			intel_pipe_update_start(intel_crtc,
+ +						&intel_crtc->atomic.start_vbl_count);
+ +}
+ +
+ +static void intel_finish_crtc_commit(struct drm_crtc *crtc)
+ +{
+ +	struct drm_device *dev = crtc->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ +	struct drm_plane *p;
+ +
+ +	if (intel_crtc->atomic.evade)
+ +		intel_pipe_update_end(intel_crtc,
+ +				      intel_crtc->atomic.start_vbl_count);
+ +
+ +	intel_runtime_pm_put(dev_priv);
+ +
+ +	if (intel_crtc->atomic.wait_vblank)
+ +		intel_wait_for_vblank(dev, intel_crtc->pipe);
+ +
+ +	intel_frontbuffer_flip(dev, intel_crtc->atomic.fb_bits);
+ +
+ +	if (intel_crtc->atomic.update_fbc) {
+ +		mutex_lock(&dev->struct_mutex);
+ +		intel_fbc_update(dev);
+ +		mutex_unlock(&dev->struct_mutex);
+ +	}
+  
+ -static void intel_finish_crtc_commit(struct drm_crtc *crtc,
+ -				     struct drm_crtc_state *old_crtc_state)
+ -{
+ -	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ +	if (intel_crtc->atomic.post_enable_primary)
+ +		intel_post_enable_primary(crtc);
+ +
+ +	drm_for_each_legacy_plane(p, &dev->mode_config.plane_list)
+ +		if (intel_crtc->atomic.update_sprite_watermarks & drm_plane_index(p))
+ +			intel_update_sprite_watermarks(p, crtc, 0, 0, 0,
+ +						       false, false);
+  
+ -	intel_pipe_update_end(intel_crtc, NULL);
+ +	memset(&intel_crtc->atomic, 0, sizeof(intel_crtc->atomic));
+  }
+  
+  /**
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 640e923ced09,690fa463a6bc..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -1268,10 -1740,25 +1268,28 @@@ void ilk_wm_get_hw_state(struct drm_dev
+  void skl_wm_get_hw_state(struct drm_device *dev);
+  void skl_ddb_get_hw_state(struct drm_i915_private *dev_priv,
+  			  struct skl_ddb_allocation *ddb /* out */);
+- 
+++<<<<<<< HEAD
+++
+++=======
++ bool skl_can_enable_sagv(struct drm_atomic_state *state);
++ int skl_enable_sagv(struct drm_i915_private *dev_priv);
++ int skl_disable_sagv(struct drm_i915_private *dev_priv);
++ void skl_write_cursor_wm(struct intel_crtc *intel_crtc,
++ 			 const struct skl_wm_values *wm);
++ void skl_write_plane_wm(struct intel_crtc *intel_crtc,
++ 			const struct skl_wm_values *wm,
++ 			int plane);
++ uint32_t ilk_pipe_pixel_rate(const struct intel_crtc_state *pipe_config);
++ bool ilk_disable_lp_wm(struct drm_device *dev);
++ int sanitize_rc6_option(struct drm_i915_private *dev_priv, int enable_rc6);
++ static inline int intel_enable_rc6(void)
++ {
++ 	return i915.enable_rc6;
++ }
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  
+  /* intel_sdvo.c */
+ -bool intel_sdvo_init(struct drm_device *dev,
+ -		     i915_reg_t reg, enum port port);
+ +bool intel_sdvo_init(struct drm_device *dev, uint32_t sdvo_reg, bool is_sdvob);
+  
+  
+  /* intel_sprite.c */
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 29a433e4d2d1,2f4438d4af55..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -3084,31 -3872,19 +3117,40 @@@ void skl_write_cursor_wm(struct intel_c
+  static void skl_write_wm_values(struct drm_i915_private *dev_priv,
+  				const struct skl_wm_values *new)
+  {
+ -	struct drm_device *dev = &dev_priv->drm;
+ +	struct drm_device *dev = dev_priv->dev;
+  	struct intel_crtc *crtc;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head) {
+ +		int i, level, max_level = ilk_wm_max_level(dev);
+++=======
++ 	for_each_intel_crtc(dev, crtc) {
++ 		int i;
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  		enum pipe pipe = crtc->pipe;
+  
+ -		if ((new->dirty_pipes & drm_crtc_mask(&crtc->base)) == 0)
+ -			continue;
+ -		if (!crtc->active)
+ +		if (!new->dirty[pipe])
+  			continue;
+  
+++<<<<<<< HEAD
+ +		I915_WRITE(PIPE_WM_LINETIME(pipe), new->wm_linetime[pipe]);
+ +
+ +		for (level = 0; level <= max_level; level++) {
+ +			for (i = 0; i < intel_num_planes(crtc); i++)
+ +				I915_WRITE(PLANE_WM(pipe, i, level),
+ +					   new->plane[pipe][i][level]);
+ +			I915_WRITE(CUR_WM(pipe, level),
+ +				   new->cursor[pipe][level]);
+ +		}
+ +		for (i = 0; i < intel_num_planes(crtc); i++)
+ +			I915_WRITE(PLANE_WM_TRANS(pipe, i),
+ +				   new->plane_trans[pipe][i]);
+ +		I915_WRITE(CUR_WM_TRANS(pipe), new->cursor_trans[pipe]);
+ +
+ +		for (i = 0; i < intel_num_planes(crtc); i++)
+++=======
++ 		for (i = 0; i < intel_num_planes(crtc); i++) {
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  			skl_ddb_entry_write(dev_priv,
+  					    PLANE_BUF_CFG(pipe, i),
+  					    &new->ddb.plane[pipe][i]);
+diff --cc drivers/gpu/drm/i915/intel_sprite.c
+index a4c0a04b5044,0df783a66bfb..000000000000
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@@ -177,99 -195,45 +177,109 @@@ static void intel_update_primary_plane(
+  }
+  
+  static void
+ -skl_update_plane(struct drm_plane *drm_plane,
+ -		 const struct intel_crtc_state *crtc_state,
+ -		 const struct intel_plane_state *plane_state)
+ +skl_update_plane(struct drm_plane *drm_plane, struct drm_crtc *crtc,
+ +		 struct drm_framebuffer *fb,
+ +		 int crtc_x, int crtc_y,
+ +		 unsigned int crtc_w, unsigned int crtc_h,
+ +		 uint32_t x, uint32_t y,
+ +		 uint32_t src_w, uint32_t src_h)
+  {
+  	struct drm_device *dev = drm_plane->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+  	struct intel_plane *intel_plane = to_intel_plane(drm_plane);
+++<<<<<<< HEAD
+ +	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+++=======
++ 	struct drm_framebuffer *fb = plane_state->base.fb;
++ 	const struct skl_wm_values *wm = &dev_priv->wm.skl_results;
++ 	struct drm_crtc *crtc = crtc_state->base.crtc;
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+++>>>>>>> 62e0fb880123 (drm/i915/skl: Update plane watermarks atomically during plane updates)
+  	const int pipe = intel_plane->pipe;
+  	const int plane = intel_plane->plane + 1;
+ -	u32 plane_ctl;
+ -	const struct drm_intel_sprite_colorkey *key = &plane_state->ckey;
+ -	u32 surf_addr = plane_state->main.offset;
+ -	unsigned int rotation = plane_state->base.rotation;
+ -	u32 stride = skl_plane_stride(fb, 0, rotation);
+ -	int crtc_x = plane_state->base.dst.x1;
+ -	int crtc_y = plane_state->base.dst.y1;
+ -	uint32_t crtc_w = drm_rect_width(&plane_state->base.dst);
+ -	uint32_t crtc_h = drm_rect_height(&plane_state->base.dst);
+ -	uint32_t x = plane_state->main.x;
+ -	uint32_t y = plane_state->main.y;
+ -	uint32_t src_w = drm_rect_width(&plane_state->base.src) >> 16;
+ -	uint32_t src_h = drm_rect_height(&plane_state->base.src) >> 16;
+ +	u32 plane_ctl, stride_div;
+ +	int pixel_size = drm_format_plane_cpp(fb->pixel_format, 0);
+ +	const struct drm_intel_sprite_colorkey *key = &intel_plane->ckey;
+ +	unsigned long surf_addr;
+  
+  	plane_ctl = PLANE_CTL_ENABLE |
+ -		PLANE_CTL_PIPE_GAMMA_ENABLE |
+  		PLANE_CTL_PIPE_CSC_ENABLE;
+  
+ -	plane_ctl |= skl_plane_ctl_format(fb->pixel_format);
+ -	plane_ctl |= skl_plane_ctl_tiling(fb->modifier[0]);
+ +	switch (fb->pixel_format) {
+ +	case DRM_FORMAT_RGB565:
+ +		plane_ctl |= PLANE_CTL_FORMAT_RGB_565;
+ +		break;
+ +	case DRM_FORMAT_XBGR8888:
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888 | PLANE_CTL_ORDER_RGBX;
+ +		break;
+ +	case DRM_FORMAT_XRGB8888:
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888;
+ +		break;
+ +	/*
+ +	 * XXX: For ARBG/ABGR formats we default to expecting scanout buffers
+ +	 * to be already pre-multiplied. We need to add a knob (or a different
+ +	 * DRM_FORMAT) for user-space to configure that.
+ +	 */
+ +	case DRM_FORMAT_ABGR8888:
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888 |
+ +			     PLANE_CTL_ORDER_RGBX |
+ +			     PLANE_CTL_ALPHA_SW_PREMULTIPLY;
+ +		break;
+ +	case DRM_FORMAT_ARGB8888:
+ +		plane_ctl |= PLANE_CTL_FORMAT_XRGB_8888 |
+ +			     PLANE_CTL_ALPHA_SW_PREMULTIPLY;
+ +		break;
+ +	case DRM_FORMAT_YUYV:
+ +		plane_ctl |= PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_YUYV;
+ +		break;
+ +	case DRM_FORMAT_YVYU:
+ +		plane_ctl |= PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_YVYU;
+ +		break;
+ +	case DRM_FORMAT_UYVY:
+ +		plane_ctl |= PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_UYVY;
+ +		break;
+ +	case DRM_FORMAT_VYUY:
+ +		plane_ctl |= PLANE_CTL_FORMAT_YUV422 | PLANE_CTL_YUV422_VYUY;
+ +		break;
+ +	default:
+ +		BUG();
+ +	}
+ +
+ +	switch (fb->modifier[0]) {
+ +	case DRM_FORMAT_MOD_NONE:
+ +		break;
+ +	case I915_FORMAT_MOD_X_TILED:
+ +		plane_ctl |= PLANE_CTL_TILED_X;
+ +		break;
+ +	case I915_FORMAT_MOD_Y_TILED:
+ +		plane_ctl |= PLANE_CTL_TILED_Y;
+ +		break;
+ +	case I915_FORMAT_MOD_Yf_TILED:
+ +		plane_ctl |= PLANE_CTL_TILED_YF;
+ +		break;
+ +	default:
+ +		MISSING_CASE(fb->modifier[0]);
+ +	}
+ +
+ +	if (drm_plane->state->rotation == BIT(DRM_ROTATE_180))
+ +		plane_ctl |= PLANE_CTL_ROTATE_180;
+ +
+ +	intel_update_sprite_watermarks(drm_plane, crtc, src_w, src_h,
+ +				       pixel_size, true,
+ +				       src_w != crtc_w || src_h != crtc_h);
+ +
+ +	stride_div = intel_fb_stride_alignment(dev, fb->modifier[0],
+ +					       fb->pixel_format);
+  
+ -	plane_ctl |= skl_plane_ctl_rotation(rotation);
+ +	/* Sizes are 0 based */
+ +	src_w--;
+ +	src_h--;
+ +	crtc_w--;
+ +	crtc_h--;
+  
++ 	if (wm->dirty_pipes & drm_crtc_mask(crtc))
++ 		skl_write_plane_wm(intel_crtc, wm, plane);
++ 
+  	if (key->flags) {
+  		I915_WRITE(PLANE_KEYVAL(pipe, plane), key->min_value);
+  		I915_WRITE(PLANE_KEYMAX(pipe, plane), key->max_value);
+@@@ -301,13 -292,13 +311,16 @@@ skl_disable_plane(struct drm_plane *drm
+  	const int pipe = intel_plane->pipe;
+  	const int plane = intel_plane->plane + 1;
+  
++ 	skl_write_plane_wm(to_intel_crtc(crtc), &dev_priv->wm.skl_results,
++ 			   plane);
++ 
+  	I915_WRITE(PLANE_CTL(pipe, plane), 0);
+  
+ +	/* Activate double buffered register update */
+  	I915_WRITE(PLANE_SURF(pipe, plane), 0);
+  	POSTING_READ(PLANE_SURF(pipe, plane));
+ +
+ +	intel_update_sprite_watermarks(drm_plane, crtc, 0, 0, 0, false, false);
+  }
+  
+  static void
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
+* Unmerged path drivers/gpu/drm/i915/intel_sprite.c
