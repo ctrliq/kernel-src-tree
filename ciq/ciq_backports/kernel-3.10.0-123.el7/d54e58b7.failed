@@ -1,0 +1,285 @@
+KEYS: Fix the keyring hash function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author David Howells <dhowells@redhat.com>
+commit d54e58b7f01552b0eb7d445f4b58de4499ad5ea6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/d54e58b7.failed
+
+The keyring hash function (used by the associative array) is supposed to clear
+the bottommost nibble of the index key (where the hash value resides) for
+keyrings and make sure it is non-zero for non-keyrings.  This is done to make
+keyrings cluster together on one branch of the tree separately to other keys.
+
+Unfortunately, the wrong mask is used, so only the bottom two bits are
+examined and cleared and not the whole bottom nibble.  This means that keys
+and keyrings can still be successfully searched for under most circumstances
+as the hash is consistent in its miscalculation, but if a keyring's
+associative array bottom node gets filled up then approx 75% of the keyrings
+will not be put into the 0 branch.
+
+The consequence of this is that a key in a keyring linked to by another
+keyring, ie.
+
+	keyring A -> keyring B -> key
+
+may not be found if the search starts at keyring A and then descends into
+keyring B because search_nested_keyrings() only searches up the 0 branch (as it
+"knows" all keyrings must be there and not elsewhere in the tree).
+
+The fix is to use the right mask.
+
+This can be tested with:
+
+	r=`keyctl newring sandbox @s`
+	for ((i=0; i<=16; i++)); do keyctl newring ring$i $r; done
+	for ((i=0; i<=16; i++)); do keyctl add user a$i a %:ring$i; done
+	for ((i=0; i<=16; i++)); do keyctl search $r user a$i; done
+
+This creates a sandbox keyring, then creates 17 keyrings therein (labelled
+ring0..ring16).  This causes the root node of the sandbox's associative array
+to overflow and for the tree to have extra nodes inserted.
+
+Each keyring then is given a user key (labelled aN for ringN) for us to search
+for.
+
+We then search for the user keys we added, starting from the sandbox.  If
+working correctly, it should return the same ordered list of key IDs as
+for...keyctl add... did.  Without this patch, it reports ENOKEY "Required key
+not available" for some of the keys.  Just which keys get this depends as the
+kernel pointer to the key type forms part of the hash function.
+
+	Reported-by: Nalin Dahyabhai <nalin@redhat.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Tested-by: Stephen Gallagher <sgallagh@redhat.com>
+(cherry picked from commit d54e58b7f01552b0eb7d445f4b58de4499ad5ea6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/keys/keyring.c
+diff --cc security/keys/keyring.c
+index eeef1a073db4,0adbc77a59b9..000000000000
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@@ -145,6 -155,215 +145,218 @@@ static int keyring_match(const struct k
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Hash a key type and description.
++  */
++ static unsigned long hash_key_type_and_desc(const struct keyring_index_key *index_key)
++ {
++ 	const unsigned level_shift = ASSOC_ARRAY_LEVEL_STEP;
++ 	const unsigned long fan_mask = ASSOC_ARRAY_FAN_MASK;
++ 	const char *description = index_key->description;
++ 	unsigned long hash, type;
++ 	u32 piece;
++ 	u64 acc;
++ 	int n, desc_len = index_key->desc_len;
++ 
++ 	type = (unsigned long)index_key->type;
++ 
++ 	acc = mult_64x32_and_fold(type, desc_len + 13);
++ 	acc = mult_64x32_and_fold(acc, 9207);
++ 	for (;;) {
++ 		n = desc_len;
++ 		if (n <= 0)
++ 			break;
++ 		if (n > 4)
++ 			n = 4;
++ 		piece = 0;
++ 		memcpy(&piece, description, n);
++ 		description += n;
++ 		desc_len -= n;
++ 		acc = mult_64x32_and_fold(acc, piece);
++ 		acc = mult_64x32_and_fold(acc, 9207);
++ 	}
++ 
++ 	/* Fold the hash down to 32 bits if need be. */
++ 	hash = acc;
++ 	if (ASSOC_ARRAY_KEY_CHUNK_SIZE == 32)
++ 		hash ^= acc >> 32;
++ 
++ 	/* Squidge all the keyrings into a separate part of the tree to
++ 	 * ordinary keys by making sure the lowest level segment in the hash is
++ 	 * zero for keyrings and non-zero otherwise.
++ 	 */
++ 	if (index_key->type != &key_type_keyring && (hash & fan_mask) == 0)
++ 		return hash | (hash >> (ASSOC_ARRAY_KEY_CHUNK_SIZE - level_shift)) | 1;
++ 	if (index_key->type == &key_type_keyring && (hash & fan_mask) != 0)
++ 		return (hash + (hash << level_shift)) & ~fan_mask;
++ 	return hash;
++ }
++ 
++ /*
++  * Build the next index key chunk.
++  *
++  * On 32-bit systems the index key is laid out as:
++  *
++  *	0	4	5	9...
++  *	hash	desclen	typeptr	desc[]
++  *
++  * On 64-bit systems:
++  *
++  *	0	8	9	17...
++  *	hash	desclen	typeptr	desc[]
++  *
++  * We return it one word-sized chunk at a time.
++  */
++ static unsigned long keyring_get_key_chunk(const void *data, int level)
++ {
++ 	const struct keyring_index_key *index_key = data;
++ 	unsigned long chunk = 0;
++ 	long offset = 0;
++ 	int desc_len = index_key->desc_len, n = sizeof(chunk);
++ 
++ 	level /= ASSOC_ARRAY_KEY_CHUNK_SIZE;
++ 	switch (level) {
++ 	case 0:
++ 		return hash_key_type_and_desc(index_key);
++ 	case 1:
++ 		return ((unsigned long)index_key->type << 8) | desc_len;
++ 	case 2:
++ 		if (desc_len == 0)
++ 			return (u8)((unsigned long)index_key->type >>
++ 				    (ASSOC_ARRAY_KEY_CHUNK_SIZE - 8));
++ 		n--;
++ 		offset = 1;
++ 	default:
++ 		offset += sizeof(chunk) - 1;
++ 		offset += (level - 3) * sizeof(chunk);
++ 		if (offset >= desc_len)
++ 			return 0;
++ 		desc_len -= offset;
++ 		if (desc_len > n)
++ 			desc_len = n;
++ 		offset += desc_len;
++ 		do {
++ 			chunk <<= 8;
++ 			chunk |= ((u8*)index_key->description)[--offset];
++ 		} while (--desc_len > 0);
++ 
++ 		if (level == 2) {
++ 			chunk <<= 8;
++ 			chunk |= (u8)((unsigned long)index_key->type >>
++ 				      (ASSOC_ARRAY_KEY_CHUNK_SIZE - 8));
++ 		}
++ 		return chunk;
++ 	}
++ }
++ 
++ static unsigned long keyring_get_object_key_chunk(const void *object, int level)
++ {
++ 	const struct key *key = keyring_ptr_to_key(object);
++ 	return keyring_get_key_chunk(&key->index_key, level);
++ }
++ 
++ static bool keyring_compare_object(const void *object, const void *data)
++ {
++ 	const struct keyring_index_key *index_key = data;
++ 	const struct key *key = keyring_ptr_to_key(object);
++ 
++ 	return key->index_key.type == index_key->type &&
++ 		key->index_key.desc_len == index_key->desc_len &&
++ 		memcmp(key->index_key.description, index_key->description,
++ 		       index_key->desc_len) == 0;
++ }
++ 
++ /*
++  * Compare the index keys of a pair of objects and determine the bit position
++  * at which they differ - if they differ.
++  */
++ static int keyring_diff_objects(const void *_a, const void *_b)
++ {
++ 	const struct key *key_a = keyring_ptr_to_key(_a);
++ 	const struct key *key_b = keyring_ptr_to_key(_b);
++ 	const struct keyring_index_key *a = &key_a->index_key;
++ 	const struct keyring_index_key *b = &key_b->index_key;
++ 	unsigned long seg_a, seg_b;
++ 	int level, i;
++ 
++ 	level = 0;
++ 	seg_a = hash_key_type_and_desc(a);
++ 	seg_b = hash_key_type_and_desc(b);
++ 	if ((seg_a ^ seg_b) != 0)
++ 		goto differ;
++ 
++ 	/* The number of bits contributed by the hash is controlled by a
++ 	 * constant in the assoc_array headers.  Everything else thereafter we
++ 	 * can deal with as being machine word-size dependent.
++ 	 */
++ 	level += ASSOC_ARRAY_KEY_CHUNK_SIZE / 8;
++ 	seg_a = a->desc_len;
++ 	seg_b = b->desc_len;
++ 	if ((seg_a ^ seg_b) != 0)
++ 		goto differ;
++ 
++ 	/* The next bit may not work on big endian */
++ 	level++;
++ 	seg_a = (unsigned long)a->type;
++ 	seg_b = (unsigned long)b->type;
++ 	if ((seg_a ^ seg_b) != 0)
++ 		goto differ;
++ 
++ 	level += sizeof(unsigned long);
++ 	if (a->desc_len == 0)
++ 		goto same;
++ 
++ 	i = 0;
++ 	if (((unsigned long)a->description | (unsigned long)b->description) &
++ 	    (sizeof(unsigned long) - 1)) {
++ 		do {
++ 			seg_a = *(unsigned long *)(a->description + i);
++ 			seg_b = *(unsigned long *)(b->description + i);
++ 			if ((seg_a ^ seg_b) != 0)
++ 				goto differ_plus_i;
++ 			i += sizeof(unsigned long);
++ 		} while (i < (a->desc_len & (sizeof(unsigned long) - 1)));
++ 	}
++ 
++ 	for (; i < a->desc_len; i++) {
++ 		seg_a = *(unsigned char *)(a->description + i);
++ 		seg_b = *(unsigned char *)(b->description + i);
++ 		if ((seg_a ^ seg_b) != 0)
++ 			goto differ_plus_i;
++ 	}
++ 
++ same:
++ 	return -1;
++ 
++ differ_plus_i:
++ 	level += i;
++ differ:
++ 	i = level * 8 + __ffs(seg_a ^ seg_b);
++ 	return i;
++ }
++ 
++ /*
++  * Free an object after stripping the keyring flag off of the pointer.
++  */
++ static void keyring_free_object(void *object)
++ {
++ 	key_put(keyring_ptr_to_key(object));
++ }
++ 
++ /*
++  * Operations for keyring management by the index-tree routines.
++  */
++ static const struct assoc_array_ops keyring_assoc_array_ops = {
++ 	.get_key_chunk		= keyring_get_key_chunk,
++ 	.get_object_key_chunk	= keyring_get_object_key_chunk,
++ 	.compare_object		= keyring_compare_object,
++ 	.diff_objects		= keyring_diff_objects,
++ 	.free_object		= keyring_free_object,
++ };
++ 
++ /*
+++>>>>>>> d54e58b7f015 (KEYS: Fix the keyring hash function)
+   * Clean up a keyring when it is destroyed.  Unpublish its name if it had one
+   * and dispose of its data.
+   *
+* Unmerged path security/keys/keyring.c
