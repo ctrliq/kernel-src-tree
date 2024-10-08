@@ -1,0 +1,186 @@
+nfs: Provide and use helper functions for marking a page as unstable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tom Haynes <thomas.haynes@primarydata.com>
+commit d15bc38df607c893c36f4962dca0f57174c6a5c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d15bc38d.failed
+
+	Signed-off-by: Tom Haynes <loghyr@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit d15bc38df607c893c36f4962dca0f57174c6a5c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/filelayout/filelayout.c
+#	fs/nfs/flexfilelayout/flexfilelayout.c
+#	fs/nfs/write.c
+diff --cc fs/nfs/filelayout/filelayout.c
+index 91e88a7ecef0,e1e5ea262a13..000000000000
+--- a/fs/nfs/filelayout/filelayout.c
++++ b/fs/nfs/filelayout/filelayout.c
+@@@ -960,20 -960,48 +960,38 @@@ filelayout_mark_request_commit(struct n
+  {
+  	struct nfs4_filelayout_segment *fl = FILELAYOUT_LSEG(lseg);
+  	u32 i, j;
+ -	struct list_head *list;
+ -	struct pnfs_commit_bucket *buckets;
+  
+  	if (fl->commit_through_mds) {
+ -		list = &cinfo->mds->list;
+ -		spin_lock(cinfo->lock);
+ -		goto mds_commit;
+ -	}
+ -
+ -	/* Note that we are calling nfs4_fl_calc_j_index on each page
+ -	 * that ends up being committed to a data server.  An attractive
+ -	 * alternative is to add a field to nfs_write_data and nfs_page
+ -	 * to store the value calculated in filelayout_write_pagelist
+ -	 * and just use that here.
+ -	 */
+ -	j = nfs4_fl_calc_j_index(lseg, req_offset(req));
+ -	i = select_bucket_index(fl, j);
+ -	spin_lock(cinfo->lock);
+ -	buckets = cinfo->ds->buckets;
+ -	list = &buckets[i].written;
+ -	if (list_empty(list)) {
+ -		/* Non-empty buckets hold a reference on the lseg.  That ref
+ -		 * is normally transferred to the COMMIT call and released
+ -		 * there.  It could also be released if the last req is pulled
+ -		 * off due to a rewrite, in which case it will be done in
+ -		 * pnfs_generic_clear_request_commit
+ +		nfs_request_add_commit_list(req, &cinfo->mds->list, cinfo);
+ +	} else {
+ +		/* Note that we are calling nfs4_fl_calc_j_index on each page
+ +		 * that ends up being committed to a data server.  An attractive
+ +		 * alternative is to add a field to nfs_write_data and nfs_page
+ +		 * to store the value calculated in filelayout_write_pagelist
+ +		 * and just use that here.
+  		 */
+++<<<<<<< HEAD
+ +		j = nfs4_fl_calc_j_index(lseg, req_offset(req));
+ +		i = select_bucket_index(fl, j);
+ +		pnfs_layout_mark_request_commit(req, lseg, cinfo, i);
+ +	}
+++=======
++ 		buckets[i].wlseg = pnfs_get_lseg(lseg);
++ 	}
++ 	set_bit(PG_COMMIT_TO_DS, &req->wb_flags);
++ 	cinfo->ds->nwritten++;
++ 
++ mds_commit:
++ 	/* nfs_request_add_commit_list(). We need to add req to list without
++ 	 * dropping cinfo lock.
++ 	 */
++ 	set_bit(PG_CLEAN, &(req)->wb_flags);
++ 	nfs_list_add_request(req, list);
++ 	cinfo->mds->ncommit++;
++ 	spin_unlock(cinfo->lock);
++ 	if (!cinfo->dreq)
++ 		nfs_mark_page_unstable(req->wb_page);
+++>>>>>>> d15bc38df607 (nfs: Provide and use helper functions for marking a page as unstable)
+  }
+  
+  static u32 calc_ds_index_from_commit(struct pnfs_layout_segment *lseg, u32 i)
+diff --cc fs/nfs/flexfilelayout/flexfilelayout.c
+index 1c96a0e2c3d6,423c2bc371fa..000000000000
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@@ -1332,6 -1332,42 +1332,45 @@@ ff_layout_write_pagelist(struct nfs_pgi
+  	return PNFS_ATTEMPTED;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ ff_layout_mark_request_commit(struct nfs_page *req,
++ 			      struct pnfs_layout_segment *lseg,
++ 			      struct nfs_commit_info *cinfo,
++ 			      u32 ds_commit_idx)
++ {
++ 	struct list_head *list;
++ 	struct pnfs_commit_bucket *buckets;
++ 
++ 	spin_lock(cinfo->lock);
++ 	buckets = cinfo->ds->buckets;
++ 	list = &buckets[ds_commit_idx].written;
++ 	if (list_empty(list)) {
++ 		/* Non-empty buckets hold a reference on the lseg.  That ref
++ 		 * is normally transferred to the COMMIT call and released
++ 		 * there.  It could also be released if the last req is pulled
++ 		 * off due to a rewrite, in which case it will be done in
++ 		 * pnfs_common_clear_request_commit
++ 		 */
++ 		WARN_ON_ONCE(buckets[ds_commit_idx].wlseg != NULL);
++ 		buckets[ds_commit_idx].wlseg = pnfs_get_lseg(lseg);
++ 	}
++ 	set_bit(PG_COMMIT_TO_DS, &req->wb_flags);
++ 	cinfo->ds->nwritten++;
++ 
++ 	/* nfs_request_add_commit_list(). We need to add req to list without
++ 	 * dropping cinfo lock.
++ 	 */
++ 	set_bit(PG_CLEAN, &(req)->wb_flags);
++ 	nfs_list_add_request(req, list);
++ 	cinfo->mds->ncommit++;
++ 	spin_unlock(cinfo->lock);
++ 	if (!cinfo->dreq)
++ 		nfs_mark_page_unstable(req->wb_page);
++ }
++ 
+++>>>>>>> d15bc38df607 (nfs: Provide and use helper functions for marking a page as unstable)
+  static u32 calc_ds_index_from_commit(struct pnfs_layout_segment *lseg, u32 i)
+  {
+  	return i;
+diff --cc fs/nfs/write.c
+index c8bb9cb461f4,76c278acaefc..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -789,13 -789,8 +789,18 @@@ nfs_request_add_commit_list(struct nfs_
+  	nfs_list_add_request(req, dst);
+  	cinfo->mds->ncommit++;
+  	spin_unlock(cinfo->lock);
+++<<<<<<< HEAD
+ +	if (!cinfo->dreq) {
+ +		inc_zone_page_state(req->wb_page, NR_UNSTABLE_NFS);
+ +		inc_bdi_stat(page_file_mapping(req->wb_page)->backing_dev_info,
+ +			     BDI_RECLAIMABLE);
+ +		__mark_inode_dirty(req->wb_context->dentry->d_inode,
+ +				   I_DIRTY_DATASYNC);
+ +	}
+++=======
++ 	if (!cinfo->dreq)
++ 		nfs_mark_page_unstable(req->wb_page);
+++>>>>>>> d15bc38df607 (nfs: Provide and use helper functions for marking a page as unstable)
+  }
+  EXPORT_SYMBOL_GPL(nfs_request_add_commit_list);
+  
+* Unmerged path fs/nfs/filelayout/filelayout.c
+* Unmerged path fs/nfs/flexfilelayout/flexfilelayout.c
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 756432218866..f7f050cc5cf1 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -599,6 +599,19 @@ void nfs_super_set_maxbytes(struct super_block *sb, __u64 maxfilesize)
+ 		sb->s_maxbytes = MAX_LFS_FILESIZE;
+ }
+ 
++/*
++ * Record the page as unstable and mark its inode as dirty.
++ */
++static inline
++void nfs_mark_page_unstable(struct page *page)
++{
++	struct inode *inode = page_file_mapping(page)->host;
++
++	inc_zone_page_state(page, NR_UNSTABLE_NFS);
++	inc_bdi_stat(inode_to_bdi(inode), BDI_RECLAIMABLE);
++	 __mark_inode_dirty(inode, I_DIRTY_DATASYNC);
++}
++
+ /*
+  * Determine the number of bytes of data the page contains
+  */
+* Unmerged path fs/nfs/write.c
