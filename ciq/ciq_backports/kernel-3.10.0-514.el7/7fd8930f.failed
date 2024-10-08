@@ -1,0 +1,200 @@
+nvme: add a common helper to read Identify Controller data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7fd8930f26be4c9078684b2fef14da0503771bf2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7fd8930f.failed
+
+And add the 64-bit register read operation for it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 7fd8930f26be4c9078684b2fef14da0503771bf2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,086563fe6ed1..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -95,6 -105,44 +95,47 @@@ struct async_cmd_info 
+  };
+  
+  /*
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
++  */
++ struct nvme_dev {
++ 	struct list_head node;
++ 	struct nvme_queue **queues;
++ 	struct blk_mq_tag_set tagset;
++ 	struct blk_mq_tag_set admin_tagset;
++ 	u32 __iomem *dbs;
++ 	struct device *dev;
++ 	struct dma_pool *prp_page_pool;
++ 	struct dma_pool *prp_small_pool;
++ 	unsigned queue_count;
++ 	unsigned online_queues;
++ 	unsigned max_qid;
++ 	int q_depth;
++ 	u32 db_stride;
++ 	struct msix_entry *entry;
++ 	void __iomem *bar;
++ 	struct list_head namespaces;
++ 	struct device *device;
++ 	struct work_struct reset_work;
++ 	struct work_struct probe_work;
++ 	struct work_struct scan_work;
++ 	bool subsystem;
++ 	void __iomem *cmb;
++ 	dma_addr_t cmb_dma_addr;
++ 	u64 cmb_size;
++ 	u32 cmbsz;
++ 
++ 	struct nvme_ctrl ctrl;
++ };
++ 
++ static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
++ {
++ 	return container_of(ctrl, struct nvme_dev, ctrl);
++ }
++ 
++ /*
+++>>>>>>> 7fd8930f26be (nvme: add a common helper to read Identify Controller data):drivers/nvme/host/pci.c
+   * An NVM Express queue.  Each device has at least two (one for admin
+   * commands and one for I/O commands).
+   */
+@@@ -2135,15 -1590,16 +2176,23 @@@ static void nvme_alloc_ns(struct nvme_d
+  	list_add_tail(&ns->list, &dev->namespaces);
+  
+  	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+- 	if (dev->max_hw_sectors) {
+- 		blk_queue_max_hw_sectors(ns->queue, dev->max_hw_sectors);
++ 	if (dev->ctrl.max_hw_sectors) {
++ 		blk_queue_max_hw_sectors(ns->queue, dev->ctrl.max_hw_sectors);
+  		blk_queue_max_segments(ns->queue,
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +			(dev->max_hw_sectors / (dev->page_size >> 9)) + 1);
+ +	}
+ +	if (dev->stripe_size)
+ +		blk_queue_chunk_sectors(ns->queue, dev->stripe_size >> 9);
+ +	if (dev->vwc & NVME_CTRL_VWC_PRESENT)
+++=======
++ 			(dev->ctrl.max_hw_sectors / (dev->ctrl.page_size >> 9)) + 1);
++ 	}
++ 	if (dev->ctrl.stripe_size)
++ 		blk_queue_chunk_sectors(ns->queue, dev->ctrl.stripe_size >> 9);
++ 	if (dev->ctrl.vwc & NVME_CTRL_VWC_PRESENT)
+++>>>>>>> 7fd8930f26be (nvme: add a common helper to read Identify Controller data):drivers/nvme/host/pci.c
+  		blk_queue_flush(ns->queue, REQ_FLUSH | REQ_FUA);
+ -	blk_queue_virt_boundary(ns->queue, dev->ctrl.page_size - 1);
+  
+  	disk->major = nvme_major;
+  	disk->first_minor = 0;
+@@@ -2411,50 -1930,11 +2460,57 @@@ static void nvme_dev_scan(struct work_s
+   */
+  static int nvme_dev_add(struct nvme_dev *dev)
+  {
+ +	struct pci_dev *pdev = dev->pci_dev;
+  	int res;
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	unsigned nn;
+ +	struct nvme_id_ctrl *ctrl;
+ +	void *mem;
+ +	dma_addr_t dma_addr;
+ +	int shift = NVME_CAP_MPSMIN(readq(&dev->bar->cap)) + 12;
+ +
+ +	mem = dma_alloc_coherent(&pdev->dev, 4096, &dma_addr, GFP_KERNEL);
+ +	if (!mem)
+ +		return -ENOMEM;
+ +
+ +	res = nvme_identify(dev, 0, 1, dma_addr);
+ +	if (res) {
+ +		dev_err(&pdev->dev, "Identify Controller failed (%d)\n", res);
+ +		dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+ +		return -EIO;
+ +	}
+ +
+ +	ctrl = mem;
+ +	nn = le32_to_cpup(&ctrl->nn);
+ +	dev->oncs = le16_to_cpup(&ctrl->oncs);
+ +	dev->abort_limit = ctrl->acl + 1;
+ +	dev->vwc = ctrl->vwc;
+ +	memcpy(dev->serial, ctrl->sn, sizeof(ctrl->sn));
+ +	memcpy(dev->model, ctrl->mn, sizeof(ctrl->mn));
+ +	memcpy(dev->firmware_rev, ctrl->fr, sizeof(ctrl->fr));
+ +	if (ctrl->mdts)
+ +		dev->max_hw_sectors = 1 << (ctrl->mdts + shift - 9);
+ +	else
+ +		dev->max_hw_sectors = UINT_MAX;
+ +	if ((pdev->vendor == PCI_VENDOR_ID_INTEL) &&
+ +			(pdev->device == 0x0953) && ctrl->vs[3]) {
+ +		unsigned int max_hw_sectors;
+ +
+ +		dev->stripe_size = 1 << (ctrl->vs[3] + shift);
+ +		max_hw_sectors = dev->stripe_size >> (shift - 9);
+ +		if (dev->max_hw_sectors) {
+ +			dev->max_hw_sectors = min(max_hw_sectors,
+ +							dev->max_hw_sectors);
+ +		} else
+ +			dev->max_hw_sectors = max_hw_sectors;
+ +	}
+ +	dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+++=======
++ 
++ 	res = nvme_init_identify(&dev->ctrl);
++ 	if (res)
++ 		return res;
+++>>>>>>> 7fd8930f26be (nvme: add a common helper to read Identify Controller data):drivers/nvme/host/pci.c
+  
+  	if (!dev->tagset.tags) {
+  		dev->tagset.ops = &nvme_mq_ops;
+@@@ -3100,7 -2555,31 +3156,35 @@@ static ssize_t nvme_sysfs_reset(struct 
+  }
+  static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static void nvme_async_probe(struct work_struct *work);
+++=======
++ static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
++ {
++ 	*val = readl(to_nvme_dev(ctrl)->bar + off);
++ 	return 0;
++ }
++ 
++ static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
++ {
++ 	writel(val, to_nvme_dev(ctrl)->bar + off);
++ 	return 0;
++ }
++ 
++ static int nvme_pci_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
++ {
++ 	*val = readq(to_nvme_dev(ctrl)->bar + off);
++ 	return 0;
++ }
++ 
++ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
++ 	.reg_read32		= nvme_pci_reg_read32,
++ 	.reg_write32		= nvme_pci_reg_write32,
++ 	.reg_read64		= nvme_pci_reg_read64,
++ 	.free_ctrl		= nvme_pci_free_ctrl,
++ };
++ 
+++>>>>>>> 7fd8930f26be (nvme: add a common helper to read Identify Controller data):drivers/nvme/host/pci.c
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+  	int node, result = -ENOMEM;
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
