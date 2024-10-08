@@ -1,0 +1,289 @@
+hrtimer: Get rid of hrtimer softirq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit c6eb3f70d4482806dc2d3e1e3c7736f497b1d418
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c6eb3f70.failed
+
+hrtimer softirq is a leftover from the initial implementation and
+serves only the purpose to handle the enqueueing of already expired
+timers in the high resolution timer mode. We discussed whether we
+change the return value and force all start sites to handle that the
+timer is already expired, but that would be a Herculean task and I'm
+not sure whether its a good idea to enforce that handling on
+everyone.
+
+A simpler solution is to enforce a timer interrupt instead of raising
+and scheduling a softirq. Just use the existing infrastructure to do
+so and remove all the softirq leftovers.
+
+The HRTIMER softirq enum is now unused, but kept around because trace
+parsers rely on the existing numbering.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+	Cc: Viresh Kumar <viresh.kumar@linaro.org>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Link: http://lkml.kernel.org/r/20150414203501.840834708@linutronix.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit c6eb3f70d4482806dc2d3e1e3c7736f497b1d418)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/hrtimer.c
+#	kernel/time/tick-common.c
+diff --cc kernel/hrtimer.c
+index b2012c5568af,fc6b6d25f93d..000000000000
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@@ -606,19 -559,13 +604,13 @@@ hrtimer_force_reprogram(struct hrtimer_
+   * timers, we have to check, whether it expires earlier than the timer for
+   * which the clock event device was armed.
+   *
+-  * Note, that in case the state has HRTIMER_STATE_CALLBACK set, no reprogramming
+-  * and no expiry check happens. The timer gets enqueued into the rbtree. The
+-  * reprogramming and expiry check is done in the hrtimer_interrupt or in the
+-  * softirq.
+-  *
+   * Called with interrupts disabled and base->cpu_base.lock held
+   */
+- static int hrtimer_reprogram(struct hrtimer *timer,
+- 			     struct hrtimer_clock_base *base)
++ static void hrtimer_reprogram(struct hrtimer *timer,
++ 			      struct hrtimer_clock_base *base)
+  {
+ -	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
+ +	struct hrtimer_cpu_base *cpu_base = &__get_cpu_var(hrtimer_bases);
+  	ktime_t expires = ktime_sub(hrtimer_get_expires(timer), base->offset);
+- 	int res;
+  
+  	WARN_ON_ONCE(hrtimer_get_expires_tv64(timer) < 0);
+  
+@@@ -634,15 -588,16 +633,20 @@@
+  
+  	/*
+  	 * CLOCK_REALTIME timer might be requested with an absolute
+- 	 * expiry time which is less than base->offset. Nothing wrong
+- 	 * about that, just avoid to call into the tick code, which
+- 	 * has now objections against negative expiry values.
++ 	 * expiry time which is less than base->offset. Set it to 0.
+  	 */
+  	if (expires.tv64 < 0)
+- 		return -ETIME;
++ 		expires.tv64 = 0;
+  
+  	if (expires.tv64 >= cpu_base->expires_next.tv64)
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +		return 0;
+++=======
++ 		return;
++ 
++ 	/* Update the pointer to the next expiring timer */
++ 	cpu_base->next_timer = timer;
+++>>>>>>> c6eb3f70d448 (hrtimer: Get rid of hrtimer softirq):kernel/time/hrtimer.c
+  
+  	/*
+  	 * If a hang was detected in the last timer interrupt then we
+@@@ -703,19 -648,11 +706,22 @@@ static void retrigger_next_event(void *
+   */
+  static int hrtimer_switch_to_hres(void)
+  {
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	int i, cpu = smp_processor_id();
+ +	struct hrtimer_cpu_base *base = &per_cpu(hrtimer_bases, cpu);
+ +	unsigned long flags;
+ +
+ +	if (base->hres_active)
+ +		return 1;
+ +
+ +	local_irq_save(flags);
+++=======
++ 	struct hrtimer_cpu_base *base = this_cpu_ptr(&hrtimer_bases);
+++>>>>>>> c6eb3f70d448 (hrtimer: Get rid of hrtimer softirq):kernel/time/hrtimer.c
+  
+  	if (tick_init_highres()) {
+- 		local_irq_restore(flags);
+  		printk(KERN_WARNING "Could not switch to high resolution "
+- 				    "mode on CPU %d\n", cpu);
++ 				    "mode on CPU %d\n", base->cpu);
+  		return 0;
+  	}
+  	base->hres_active = 1;
+@@@ -1019,26 -963,8 +1024,31 @@@ int __hrtimer_start_range_ns(struct hrt
+  		 * on dynticks target.
+  		 */
+  		wake_up_nohz_cpu(new_base->cpu_base->cpu);
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	} else if (new_base->cpu_base == &__get_cpu_var(hrtimer_bases) &&
+ +			hrtimer_reprogram(timer, new_base)) {
+ +		/*
+ +		 * Only allow reprogramming if the new base is on this CPU.
+ +		 * (it might still be on another CPU if the timer was pending)
+ +		 *
+ +		 * XXX send_remote_softirq() ?
+ +		 */
+ +		if (wakeup) {
+ +			/*
+ +			 * We need to drop cpu_base->lock to avoid a
+ +			 * lock ordering issue vs. rq->lock.
+ +			 */
+ +			raw_spin_unlock(&new_base->cpu_base->lock);
+ +			raise_softirq_irqoff(HRTIMER_SOFTIRQ);
+ +			local_irq_restore(flags);
+ +			return ret;
+ +		} else {
+ +			__raise_softirq_irqoff(HRTIMER_SOFTIRQ);
+ +		}
+++=======
++ 	} else {
++ 		hrtimer_reprogram(timer, new_base);
+++>>>>>>> c6eb3f70d448 (hrtimer: Get rid of hrtimer softirq):kernel/time/hrtimer.c
+  	}
+  
+  	unlock_hrtimer_base(timer, &flags);
+@@@ -1494,38 -1338,28 +1457,57 @@@ static inline void __hrtimer_peek_ahead
+   */
+  void hrtimer_run_queues(void)
+  {
+ -	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
+ -	ktime_t now;
+ +	struct timerqueue_node *node;
+ +	struct hrtimer_cpu_base *cpu_base = &__get_cpu_var(hrtimer_bases);
+ +	struct hrtimer_clock_base *base;
+ +	int index, gettime = 1;
+  
+ -	if (__hrtimer_hres_active(cpu_base))
+ +	if (hrtimer_hres_active())
+  		return;
+  
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	for (index = 0; index < HRTIMER_MAX_CLOCK_BASES; index++) {
+ +		base = &cpu_base->clock_base[index];
+ +		if (!timerqueue_getnext(&base->active))
+ +			continue;
+ +
+ +		if (gettime) {
+ +			hrtimer_get_softirq_time(cpu_base);
+ +			gettime = 0;
+ +		}
+ +
+ +		raw_spin_lock(&cpu_base->lock);
+ +
+ +		while ((node = timerqueue_getnext(&base->active))) {
+ +			struct hrtimer *timer;
+ +
+ +			timer = container_of(node, struct hrtimer, node);
+ +			if (base->softirq_time.tv64 <=
+ +					hrtimer_get_expires_tv64(timer))
+ +				break;
+ +
+ +			__run_hrtimer(timer, &base->softirq_time);
+ +		}
+ +		raw_spin_unlock(&cpu_base->lock);
+ +	}
+++=======
++ 	/*
++ 	 * This _is_ ugly: We have to check periodically, whether we
++ 	 * can switch to highres and / or nohz mode. The clocksource
++ 	 * switch happens with xtime_lock held. Notification from
++ 	 * there only sets the check bit in the tick_oneshot code,
++ 	 * otherwise we might deadlock vs. xtime_lock.
++ 	 */
++ 	if (tick_check_oneshot_change(!hrtimer_is_hres_enabled())) {
++ 		hrtimer_switch_to_hres();
++ 		return;
++ 	}
++ 
++ 	raw_spin_lock(&cpu_base->lock);
++ 	now = hrtimer_update_base(cpu_base);
++ 	__hrtimer_run_queues(cpu_base, now);
++ 	raw_spin_unlock(&cpu_base->lock);
+++>>>>>>> c6eb3f70d448 (hrtimer: Get rid of hrtimer softirq):kernel/time/hrtimer.c
+  }
+  
+  /*
+diff --cc kernel/time/tick-common.c
+index 111a7ddcbff3,ea5f9eae8f74..000000000000
+--- a/kernel/time/tick-common.c
++++ b/kernel/time/tick-common.c
+@@@ -88,14 -102,25 +88,28 @@@ void tick_handle_periodic(struct clock_
+  
+  	tick_periodic(cpu);
+  
+++<<<<<<< HEAD
+ +	if (dev->mode != CLOCK_EVT_MODE_ONESHOT)
+++=======
++ #if defined(CONFIG_HIGH_RES_TIMERS) || defined(CONFIG_NO_HZ_COMMON)
++ 	/*
++ 	 * The cpu might have transitioned to HIGHRES or NOHZ mode via
++ 	 * update_process_times() -> run_local_timers() ->
++ 	 * hrtimer_run_queues().
++ 	 */
++ 	if (dev->event_handler != tick_handle_periodic)
++ 		return;
++ #endif
++ 
++ 	if (dev->state != CLOCK_EVT_STATE_ONESHOT)
+++>>>>>>> c6eb3f70d448 (hrtimer: Get rid of hrtimer softirq)
+  		return;
+ +	/*
+ +	 * Setup the next period for devices, which do not have
+ +	 * periodic mode:
+ +	 */
+ +	next = ktime_add(dev->next_event, tick_period);
+  	for (;;) {
+ -		/*
+ -		 * Setup the next period for devices, which do not have
+ -		 * periodic mode:
+ -		 */
+ -		next = ktime_add(next, tick_period);
+ -
+  		if (!clockevents_program_event(dev, next, false))
+  			return;
+  		/*
+diff --git a/include/linux/hrtimer.h b/include/linux/hrtimer.h
+index 9944ae0be366..d2544b6c4e5e 100644
+--- a/include/linux/hrtimer.h
++++ b/include/linux/hrtimer.h
+@@ -452,7 +452,6 @@ extern int schedule_hrtimeout(ktime_t *expires, const enum hrtimer_mode mode);
+ 
+ /* Soft interrupt function to run the hrtimer queues: */
+ extern void hrtimer_run_queues(void);
+-extern void hrtimer_run_pending(void);
+ 
+ /* Bootup initialization: */
+ extern void __init hrtimers_init(void);
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index e8401d092732..39526e3a0607 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -452,7 +452,8 @@ enum
+ 	BLOCK_IOPOLL_SOFTIRQ,
+ 	TASKLET_SOFTIRQ,
+ 	SCHED_SOFTIRQ,
+-	HRTIMER_SOFTIRQ,
++	HRTIMER_SOFTIRQ, /* Unused, but kept as tools rely on the
++			    numbering. Sigh! */
+ 	RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
+ 
+ 	NR_SOFTIRQS
+* Unmerged path kernel/hrtimer.c
+* Unmerged path kernel/time/tick-common.c
+diff --git a/kernel/timer.c b/kernel/timer.c
+index 62910332f08c..63d46a341058 100644
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@ -1395,8 +1395,6 @@ static void run_timer_softirq(struct softirq_action *h)
+ {
+ 	struct tvec_base *base = __this_cpu_read(tvec_bases);
+ 
+-	hrtimer_run_pending();
+-
+ 	if (time_after_eq(jiffies, base->timer_jiffies))
+ 		__run_timers(base);
+ }
