@@ -67,8 +67,6 @@
 #include <asm/kvm_ppc.h>
 #include <asm/hugetlb.h>
 
-#include "setup.h"
-
 #ifdef DEBUG
 #define DBG(fmt...) udbg_printf(fmt)
 #else
