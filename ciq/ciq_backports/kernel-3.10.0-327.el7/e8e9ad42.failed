@@ -1,0 +1,163 @@
+xfs: take i_mmap_lock on extent manipulation operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit e8e9ad42c1f1e1bfbe0e8c32c8cac02e9ebfb7ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e8e9ad42.failed
+
+Now we have the i_mmap_lock being held across the page fault IO
+path, we now add extent manipulation operation exclusion by adding
+the lock to the paths that directly modify extent maps. This
+includes truncate, hole punching and other fallocate based
+operations. The operations will now take both the i_iolock and the
+i_mmaplock in exclusive mode, thereby ensuring that all IO and page
+faults block without holding any page locks while the extent
+manipulation is in progress.
+
+This gives us the lock order during truncate of i_iolock ->
+i_mmaplock -> page_lock -> i_lock, hence providing the same
+lock order as the iolock provides the normal IO path without
+involving the mmap_sem.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit e8e9ad42c1f1e1bfbe0e8c32c8cac02e9ebfb7ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_ioctl.c
+#	fs/xfs/xfs_iops.c
+diff --cc fs/xfs/xfs_file.c
+index 91b548987ce6,609b5aaddd8e..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -856,10 -832,18 +856,21 @@@ xfs_file_fallocate
+  
+  	if (!S_ISREG(inode->i_mode))
+  		return -EINVAL;
+ -	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
+ -		     FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE))
+ +	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	xfs_ilock(ip, XFS_IOLOCK_EXCL);
+++=======
++ 	xfs_ilock(ip, iolock);
++ 	error = xfs_break_layouts(inode, &iolock);
++ 	if (error)
++ 		goto out_unlock;
++ 
++ 	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
++ 	iolock |= XFS_MMAPLOCK_EXCL;
++ 
+++>>>>>>> e8e9ad42c1f1 (xfs: take i_mmap_lock on extent manipulation operations)
+  	if (mode & FALLOC_FL_PUNCH_HOLE) {
+  		error = xfs_free_file_space(ip, offset, len);
+  		if (error)
+diff --cc fs/xfs/xfs_ioctl.c
+index c6e180d60c21,4ee44ddfdfb7..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -651,23 -618,34 +651,35 @@@ xfs_ioc_space
+  	 */
+  	if (!xfs_sb_version_hasextflgbit(&ip->i_mount->m_sb) &&
+  	    !capable(CAP_SYS_ADMIN))
+ -		return -EPERM;
+ +		return -XFS_ERROR(EPERM);
+  
+  	if (inode->i_flags & (S_IMMUTABLE|S_APPEND))
+ -		return -EPERM;
+ +		return -XFS_ERROR(EPERM);
+  
+  	if (!(filp->f_mode & FMODE_WRITE))
+ -		return -EBADF;
+ +		return -XFS_ERROR(EBADF);
+  
+  	if (!S_ISREG(inode->i_mode))
+++<<<<<<< HEAD
+ +		return -XFS_ERROR(EINVAL);
+++=======
++ 		return -EINVAL;
++ 
++ 	if (filp->f_flags & O_DSYNC)
++ 		flags |= XFS_PREALLOC_SYNC;
++ 	if (ioflags & XFS_IO_INVIS)
++ 		flags |= XFS_PREALLOC_INVISIBLE;
+++>>>>>>> e8e9ad42c1f1 (xfs: take i_mmap_lock on extent manipulation operations)
+  
+  	error = mnt_want_write_file(filp);
+  	if (error)
+  		return error;
+  
+ -	xfs_ilock(ip, iolock);
+ -	error = xfs_break_layouts(inode, &iolock);
+ -	if (error)
+ -		goto out_unlock;
+ +	xfs_ilock(ip, XFS_IOLOCK_EXCL);
+  
++ 	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
++ 	iolock |= XFS_MMAPLOCK_EXCL;
++ 
+  	switch (bf->l_whence) {
+  	case 0: /*SEEK_SET*/
+  		break;
+diff --cc fs/xfs/xfs_iops.c
+index 8eaf00dae5eb,7f59ad34b5c5..000000000000
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@@ -736,16 -755,17 +736,17 @@@ xfs_setattr_size
+  	trace_xfs_setattr(ip);
+  
+  	if (mp->m_flags & XFS_MOUNT_RDONLY)
+ -		return -EROFS;
+ +		return XFS_ERROR(EROFS);
+  
+  	if (XFS_FORCED_SHUTDOWN(mp))
+ -		return -EIO;
+ +		return XFS_ERROR(EIO);
+  
+ -	error = inode_change_ok(inode, iattr);
+ +	error = -inode_change_ok(inode, iattr);
+  	if (error)
+ -		return error;
+ +		return XFS_ERROR(error);
+  
+  	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
++ 	ASSERT(xfs_isilocked(ip, XFS_MMAPLOCK_EXCL));
+  	ASSERT(S_ISREG(ip->i_d.di_mode));
+  	ASSERT((iattr->ia_valid & (ATTR_UID|ATTR_GID|ATTR_ATIME|ATTR_ATIME_SET|
+  		ATTR_MTIME_SET|ATTR_KILL_PRIV|ATTR_TIMES_SET)) == 0);
+@@@ -961,9 -981,17 +962,23 @@@ xfs_vn_setattr
+  	int			error;
+  
+  	if (iattr->ia_valid & ATTR_SIZE) {
+++<<<<<<< HEAD
+ +		xfs_ilock(ip, XFS_IOLOCK_EXCL);
+ +		error = xfs_setattr_size(ip, iattr);
+ +		xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+++=======
++ 		uint		iolock = XFS_IOLOCK_EXCL;
++ 
++ 		xfs_ilock(ip, iolock);
++ 		error = xfs_break_layouts(dentry->d_inode, &iolock);
++ 		if (!error) {
++ 			xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
++ 			iolock |= XFS_MMAPLOCK_EXCL;
++ 
++ 			error = xfs_setattr_size(ip, iattr);
++ 		}
++ 		xfs_iunlock(ip, iolock);
+++>>>>>>> e8e9ad42c1f1 (xfs: take i_mmap_lock on extent manipulation operations)
+  	} else {
+  		error = xfs_setattr_nonsize(ip, iattr, 0);
+  	}
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_ioctl.c
+* Unmerged path fs/xfs/xfs_iops.c
