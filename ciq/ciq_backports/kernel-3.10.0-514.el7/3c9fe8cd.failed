@@ -1,0 +1,172 @@
+vfs: add lookup_hash() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 3c9fe8cdff1b889a059a30d22f130372f2b3885f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3c9fe8cd.failed
+
+Overlayfs needs lookup without inode_permission() and already has the name
+hash (in form of dentry->d_name on overlayfs dentry).  It also doesn't
+support filesystems with d_op->d_hash() so basically it only needs
+the actual hashed lookup from lookup_one_len_unlocked()
+
+So add a new helper that does unlocked lookup of a hashed name.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 3c9fe8cdff1b889a059a30d22f130372f2b3885f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+#	include/linux/namei.h
+diff --cc fs/namei.c
+index c10882eb7ad0,1a1ea79a7ba0..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -2133,28 -2259,40 +2133,55 @@@ int vfs_path_lookup(struct dentry *dent
+  		    const char *name, unsigned int flags,
+  		    struct path *path)
+  {
+ -	struct path root = {.mnt = mnt, .dentry = dentry};
+ -	/* the first argument of filename_lookup() is ignored with root */
+ -	return filename_lookup(AT_FDCWD, getname_kernel(name),
+ -			       flags , path, &root);
+ +	struct nameidata nd;
+ +	int err;
+ +	nd.root.dentry = dentry;
+ +	nd.root.mnt = mnt;
+ +	BUG_ON(flags & LOOKUP_PARENT);
+ +	/* the first argument of do_path_lookup() is ignored with LOOKUP_ROOT */
+ +	err = do_path_lookup(AT_FDCWD, name, flags | LOOKUP_ROOT, &nd);
+ +	if (!err)
+ +		*path = nd.path;
+ +	return err;
+ +}
+ +
+ +/*
+ + * Restricted form of lookup. Doesn't follow links, single-component only,
+ + * needs parent already locked. Doesn't follow mounts.
+ + * SMP-safe.
+ + */
+ +static struct dentry *lookup_hash(struct nameidata *nd)
+ +{
+ +	return __lookup_hash(&nd->last, nd->path.dentry, nd->flags);
+  }
+ -EXPORT_SYMBOL(vfs_path_lookup);
+  
++ /**
++  * lookup_hash - lookup single pathname component on already hashed name
++  * @name:	name and hash to lookup
++  * @base:	base directory to lookup from
++  *
++  * The name must have been verified and hashed (see lookup_one_len()).  Using
++  * this after just full_name_hash() is unsafe.
++  *
++  * This function also doesn't check for search permission on base directory.
++  *
++  * Use lookup_one_len_unlocked() instead, unless you really know what you are
++  * doing.
++  *
++  * Do not hold i_mutex; this helper takes i_mutex if necessary.
++  */
++ struct dentry *lookup_hash(const struct qstr *name, struct dentry *base)
++ {
++ 	struct dentry *ret;
++ 
++ 	ret = lookup_dcache(name, base, 0);
++ 	if (!ret)
++ 		ret = lookup_slow(name, base, 0);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(lookup_hash);
++ 
+  /**
+   * lookup_one_len - filesystem helper to lookup single pathname component
+   * @name:	pathname component to lookup
+@@@ -2206,6 -2344,60 +2233,63 @@@ struct dentry *lookup_one_len(const cha
+  
+  	return __lookup_hash(&this, base, 0);
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL(lookup_one_len);
++ 
++ /**
++  * lookup_one_len_unlocked - filesystem helper to lookup single pathname component
++  * @name:	pathname component to lookup
++  * @base:	base directory to lookup from
++  * @len:	maximum length @len should be interpreted to
++  *
++  * Note that this routine is purely a helper for filesystem usage and should
++  * not be called by generic code.
++  *
++  * Unlike lookup_one_len, it should be called without the parent
++  * i_mutex held, and will take the i_mutex itself if necessary.
++  */
++ struct dentry *lookup_one_len_unlocked(const char *name,
++ 				       struct dentry *base, int len)
++ {
++ 	struct qstr this;
++ 	unsigned int c;
++ 	int err;
++ 
++ 	this.name = name;
++ 	this.len = len;
++ 	this.hash = full_name_hash(name, len);
++ 	if (!len)
++ 		return ERR_PTR(-EACCES);
++ 
++ 	if (unlikely(name[0] == '.')) {
++ 		if (len < 2 || (len == 2 && name[1] == '.'))
++ 			return ERR_PTR(-EACCES);
++ 	}
++ 
++ 	while (len--) {
++ 		c = *(const unsigned char *)name++;
++ 		if (c == '/' || c == '\0')
++ 			return ERR_PTR(-EACCES);
++ 	}
++ 	/*
++ 	 * See if the low-level filesystem might want
++ 	 * to use its own hash..
++ 	 */
++ 	if (base->d_flags & DCACHE_OP_HASH) {
++ 		int err = base->d_op->d_hash(base, &this);
++ 		if (err < 0)
++ 			return ERR_PTR(err);
++ 	}
++ 
++ 	err = inode_permission(base->d_inode, MAY_EXEC);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	return lookup_hash(&this, base);
++ }
++ EXPORT_SYMBOL(lookup_one_len_unlocked);
+++>>>>>>> 3c9fe8cdff1b (vfs: add lookup_hash() helper)
+  
+  int user_path_at_empty(int dfd, const char __user *name, unsigned flags,
+  		 struct path *path, int *empty)
+diff --cc include/linux/namei.h
+index 8e47bc7a1665,ec5ec2818a28..000000000000
+--- a/include/linux/namei.h
++++ b/include/linux/namei.h
+@@@ -73,6 -78,9 +73,12 @@@ extern struct dentry *kern_path_locked(
+  extern int kern_path_mountpoint(int, const char *, struct path *, unsigned int);
+  
+  extern struct dentry *lookup_one_len(const char *, struct dentry *, int);
+++<<<<<<< HEAD
+++=======
++ extern struct dentry *lookup_one_len_unlocked(const char *, struct dentry *, int);
++ struct qstr;
++ extern struct dentry *lookup_hash(const struct qstr *, struct dentry *);
+++>>>>>>> 3c9fe8cdff1b (vfs: add lookup_hash() helper)
+  
+  extern int follow_down_one(struct path *);
+  extern int follow_down(struct path *);
+* Unmerged path fs/namei.c
+* Unmerged path include/linux/namei.h
