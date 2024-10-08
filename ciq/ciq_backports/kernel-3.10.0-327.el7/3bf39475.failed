@@ -1,0 +1,182 @@
+vxlan: Improve support for header flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit 3bf3947526c1053ddf2523f261395d682718f56c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3bf39475.failed
+
+This patch cleans up the header flags of VXLAN in anticipation of
+defining some new ones:
+
+- Move header related definitions from vxlan.c to vxlan.h
+- Change VXLAN_FLAGS to be VXLAN_HF_VNI (only currently defined flag)
+- Move check for unknown flags to after we find vxlan_sock, this
+  assumes that some flags may be processed based on tunnel
+  configuration
+- Add a comment about why the stack treating unknown set flags as an
+  error instead of ignoring them
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3bf3947526c1053ddf2523f261395d682718f56c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+diff --cc drivers/net/vxlan.c
+index 3440d933b3ec,3a18d8ed89ca..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -60,18 -61,6 +60,21 @@@
+  #define FDB_AGE_DEFAULT 300 /* 5 min */
+  #define FDB_AGE_INTERVAL (10 * HZ)	/* rescan interval */
+  
+++<<<<<<< HEAD
+ +#define VXLAN_N_VID	(1u << 24)
+ +#define VXLAN_VID_MASK	(VXLAN_N_VID - 1)
+ +#define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
+ +
+ +#define VXLAN_FLAGS 0x08000000	/* struct vxlanhdr.vx_flags required value. */
+ +
+ +/* VXLAN protocol header */
+ +struct vxlanhdr {
+ +	__be32 vx_flags;
+ +	__be32 vx_vni;
+ +};
+ +
+++=======
+++>>>>>>> 3bf3947526c1 (vxlan: Improve support for header flags)
+  /* UDP port for VXLAN traffic.
+   * The IANA assigned port is 4789, but the Linux default is 8472
+   * for compatibility with early adopters.
+@@@ -1572,43 -1577,17 +1595,43 @@@ static int vxlan6_xmit_skb(struct net *
+  	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+- 	vxh->vx_flags = htonl(VXLAN_FLAGS);
++ 	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+  	vxh->vx_vni = vni;
+  
+ -	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+ +
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -	udp_tunnel6_xmit_skb(vs->sock, dst, skb, dev, saddr, daddr, prio,
+ -			     ttl, src_port, dst_port);
+ +	uh->len = htons(skb->len);
+ +
+ +	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ +	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ +			      IPSKB_REROUTED);
+ +	skb_dst_drop(skb);
+ +	skb_dst_set(skb, dst);
+ +
+ +	udp6_set_csum(udp_get_no_check6_tx(vs->sock->sk), skb,
+ +		      saddr, daddr, skb->len);
+ +
+ +	__skb_push(skb, sizeof(*ip6h));
+ +	skb_reset_network_header(skb);
+ +	ip6h		  = ipv6_hdr(skb);
+ +	ip6h->version	  = 6;
+ +	ip6h->priority	  = prio;
+ +	ip6h->flow_lbl[0] = 0;
+ +	ip6h->flow_lbl[1] = 0;
+ +	ip6h->flow_lbl[2] = 0;
+ +	ip6h->payload_len = htons(skb->len);
+ +	ip6h->nexthdr     = IPPROTO_UDP;
+ +	ip6h->hop_limit   = ttl;
+ +	ip6h->daddr	  = *daddr;
+ +	ip6h->saddr	  = *saddr;
+ +
+ +	ip6tunnel_xmit(skb, dev);
+  	return 0;
+ -err:
+ -	dst_release(dst);
+ -	return err;
+  }
+  #endif
+  
+@@@ -1632,36 -1611,23 +1655,36 @@@ int vxlan_xmit_skb(struct net *net, str
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+ -	if (unlikely(err)) {
+ -		kfree_skb(skb);
+ +	if (unlikely(err))
+  		return err;
+ -	}
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb))
+ -		return -ENOMEM;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+- 	vxh->vx_flags = htonl(VXLAN_FLAGS);
++ 	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+  	vxh->vx_vni = vni;
+  
+ -	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+ +
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+ +
+ +	uh->len = htons(skb->len);
+  
+ -	return udp_tunnel_xmit_skb(vs->sock, rt, skb, src, dst, tos,
+ -				   ttl, df, src_port, dst_port, xnet);
+ +	udp_set_csum(vs->sock->sk->sk_no_check_tx, skb,
+ +		     src, dst, skb->len);
+ +
+ +	return iptunnel_xmit(vs->sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+ +			     tos, ttl, df);
+  }
+  EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+  
+diff --cc include/net/vxlan.h
+index 1ddc74769f81,a0d80736224f..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -8,6 -11,19 +8,22 @@@
+  #define VNI_HASH_BITS	10
+  #define VNI_HASH_SIZE	(1<<VNI_HASH_BITS)
+  
+++<<<<<<< HEAD
+++=======
++ /* VXLAN protocol header */
++ struct vxlanhdr {
++ 	__be32 vx_flags;
++ 	__be32 vx_vni;
++ };
++ 
++ /* VXLAN header flags. */
++ #define VXLAN_HF_VNI 0x08000000
++ 
++ #define VXLAN_N_VID     (1u << 24)
++ #define VXLAN_VID_MASK  (VXLAN_N_VID - 1)
++ #define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
++ 
+++>>>>>>> 3bf3947526c1 (vxlan: Improve support for header flags)
+  struct vxlan_sock;
+  typedef void (vxlan_rcv_t)(struct vxlan_sock *vh, struct sk_buff *skb, __be32 key);
+  
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
