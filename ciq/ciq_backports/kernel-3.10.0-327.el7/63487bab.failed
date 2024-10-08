@@ -1,0 +1,272 @@
+net: Move fou_build_header into fou.c and refactor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] fou: Move fou_build_header into fou.c and refactor (Marcelo Leitner) [1206570]
+Rebuild_FUZZ: 94.00%
+commit-author Tom Herbert <therbert@google.com>
+commit 63487babf08d6d67483c67ed21d8cea6674a44ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/63487bab.failed
+
+Move fou_build_header out of ip_tunnel.c and into fou.c splitting
+it up into fou_build_header, gue_build_header, and fou_build_udp.
+This allows for other users for TX of FOU or GUE. Change ip_tunnel_encap
+to call fou_build_header or gue_build_header based on the tunnel
+encapsulation type. Similarly, added fou_encap_hlen and gue_encap_hlen
+functions which are called by ip_encap_hlen. New net/fou.h has
+prototypes and defines for this.
+
+Added NET_FOU_IP_TUNNELS configuration. When this is set, IP tunnels
+can use FOU/GUE and fou module is also selected.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 63487babf08d6d67483c67ed21d8cea6674a44ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/Kconfig
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/Kconfig
+index b3a44b841f5b,bd2901604842..000000000000
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@@ -326,6 -322,29 +326,32 @@@ config NET_FO
+  	  network mechanisms and optimizations for UDP (such as ECMP
+  	  and RSS) can be leveraged to provide better service.
+  
+++<<<<<<< HEAD
+++=======
++ config NET_FOU_IP_TUNNELS
++ 	bool "IP: FOU encapsulation of IP tunnels"
++ 	depends on NET_IPIP || NET_IPGRE || IPV6_SIT
++ 	select NET_FOU
++ 	---help---
++ 	  Allow configuration of FOU or GUE encapsulation for IP tunnels.
++ 	  When this option is enabled IP tunnels can be configured to use
++ 	  FOU or GUE encapsulation.
++ 
++ config GENEVE
++ 	tristate "Generic Network Virtualization Encapsulation (Geneve)"
++ 	depends on INET
++ 	select NET_UDP_TUNNEL
++ 	---help---
++ 	This allows one to create Geneve virtual interfaces that provide
++ 	Layer 2 Networks over Layer 3 Networks. Geneve is often used
++ 	to tunnel virtual network infrastructure in virtualized environments.
++ 	For more information see:
++ 	  http://tools.ietf.org/html/draft-gross-geneve-01
++ 
++ 	  To compile this driver as a module, choose M here: the module
++ 
++ 
+++>>>>>>> 63487babf08d (net: Move fou_build_header into fou.c and refactor)
+  config INET_AH
+  	tristate "IP: AH transformation"
+  	select XFRM_ALGO
+diff --cc net/ipv4/ip_tunnel.c
+index 1129aec53c2c,c3587e1c8b82..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -54,6 -55,11 +54,14 @@@
+  #include <net/net_namespace.h>
+  #include <net/netns/generic.h>
+  #include <net/rtnetlink.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/udp.h>
++ 
++ #if IS_ENABLED(CONFIG_NET_FOU)
++ #include <net/fou.h>
++ #endif
+++>>>>>>> 63487babf08d (net: Move fou_build_header into fou.c and refactor)
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+  #include <net/ipv6.h>
+@@@ -479,6 -492,63 +487,66 @@@ drop
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_rcv);
+  
+++<<<<<<< HEAD
+++=======
++ static int ip_encap_hlen(struct ip_tunnel_encap *e)
++ {
++ 	switch (e->type) {
++ 	case TUNNEL_ENCAP_NONE:
++ 		return 0;
++ #if IS_ENABLED(CONFIG_NET_FOU)
++ 	case TUNNEL_ENCAP_FOU:
++ 		return fou_encap_hlen(e);
++ 	case TUNNEL_ENCAP_GUE:
++ 		return gue_encap_hlen(e);
++ #endif
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ int ip_tunnel_encap_setup(struct ip_tunnel *t,
++ 			  struct ip_tunnel_encap *ipencap)
++ {
++ 	int hlen;
++ 
++ 	memset(&t->encap, 0, sizeof(t->encap));
++ 
++ 	hlen = ip_encap_hlen(ipencap);
++ 	if (hlen < 0)
++ 		return hlen;
++ 
++ 	t->encap.type = ipencap->type;
++ 	t->encap.sport = ipencap->sport;
++ 	t->encap.dport = ipencap->dport;
++ 	t->encap.flags = ipencap->flags;
++ 
++ 	t->encap_hlen = hlen;
++ 	t->hlen = t->encap_hlen + t->tun_hlen;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(ip_tunnel_encap_setup);
++ 
++ int ip_tunnel_encap(struct sk_buff *skb, struct ip_tunnel *t,
++ 		    u8 *protocol, struct flowi4 *fl4)
++ {
++ 	switch (t->encap.type) {
++ 	case TUNNEL_ENCAP_NONE:
++ 		return 0;
++ #if IS_ENABLED(CONFIG_NET_FOU)
++ 	case TUNNEL_ENCAP_FOU:
++ 		return fou_build_header(skb, &t->encap, protocol, fl4);
++ 	case TUNNEL_ENCAP_GUE:
++ 		return gue_build_header(skb, &t->encap, protocol, fl4);
++ #endif
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ EXPORT_SYMBOL(ip_tunnel_encap);
++ 
+++>>>>>>> 63487babf08d (net: Move fou_build_header into fou.c and refactor)
+  static int tnl_update_pmtu(struct net_device *dev, struct sk_buff *skb,
+  			    struct rtable *rt, __be16 df)
+  {
+diff --git a/include/net/fou.h b/include/net/fou.h
+new file mode 100644
+index 000000000000..cf4ce8874f92
+--- /dev/null
++++ b/include/net/fou.h
+@@ -0,0 +1,26 @@
++#ifndef __NET_FOU_H
++#define __NET_FOU_H
++
++#include <linux/skbuff.h>
++
++#include <net/flow.h>
++#include <net/gue.h>
++#include <net/ip_tunnels.h>
++#include <net/udp.h>
++
++int fou_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++		     u8 *protocol, struct flowi4 *fl4);
++int gue_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++		     u8 *protocol, struct flowi4 *fl4);
++
++static size_t fou_encap_hlen(struct ip_tunnel_encap *e)
++{
++	return sizeof(struct udphdr);
++}
++
++static size_t gue_encap_hlen(struct ip_tunnel_encap *e)
++{
++	return sizeof(struct udphdr) + sizeof(struct guehdr);
++}
++
++#endif
+* Unmerged path net/ipv4/Kconfig
+diff --git a/net/ipv4/fou.c b/net/ipv4/fou.c
+index 32e78924e246..5446c1c8c26c 100644
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@ -487,6 +487,79 @@ static const struct genl_ops fou_nl_ops[] = {
+ 	},
+ };
+ 
++static void fou_build_udp(struct sk_buff *skb, struct ip_tunnel_encap *e,
++			  struct flowi4 *fl4, u8 *protocol, __be16 sport)
++{
++	struct udphdr *uh;
++
++	skb_push(skb, sizeof(struct udphdr));
++	skb_reset_transport_header(skb);
++
++	uh = udp_hdr(skb);
++
++	uh->dest = e->dport;
++	uh->source = sport;
++	uh->len = htons(skb->len);
++	uh->check = 0;
++	udp_set_csum(!(e->flags & TUNNEL_ENCAP_FLAG_CSUM), skb,
++		     fl4->saddr, fl4->daddr, skb->len);
++
++	*protocol = IPPROTO_UDP;
++}
++
++int fou_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++		     u8 *protocol, struct flowi4 *fl4)
++{
++	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++	__be16 sport;
++
++	skb = iptunnel_handle_offloads(skb, csum, type);
++
++	if (IS_ERR(skb))
++		return PTR_ERR(skb);
++
++	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++					       skb, 0, 0, false);
++	fou_build_udp(skb, e, fl4, protocol, sport);
++
++	return 0;
++}
++EXPORT_SYMBOL(fou_build_header);
++
++int gue_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++		     u8 *protocol, struct flowi4 *fl4)
++{
++	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++	struct guehdr *guehdr;
++	size_t hdr_len = sizeof(struct guehdr);
++	__be16 sport;
++
++	skb = iptunnel_handle_offloads(skb, csum, type);
++
++	if (IS_ERR(skb))
++		return PTR_ERR(skb);
++
++	/* Get source port (based on flow hash) before skb_push */
++	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++					       skb, 0, 0, false);
++
++	skb_push(skb, hdr_len);
++
++	guehdr = (struct guehdr *)skb->data;
++
++	guehdr->version = 0;
++	guehdr->hlen = 0;
++	guehdr->flags = 0;
++	guehdr->next_hdr = *protocol;
++
++	fou_build_udp(skb, e, fl4, protocol, sport);
++
++	return 0;
++}
++EXPORT_SYMBOL(gue_build_header);
++
+ static int __init fou_init(void)
+ {
+ 	int ret;
+* Unmerged path net/ipv4/ip_tunnel.c
