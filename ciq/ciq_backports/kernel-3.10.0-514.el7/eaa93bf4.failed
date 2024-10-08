@@ -1,0 +1,154 @@
+vxlan: fix populating tclass in vxlan6_get_route
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit eaa93bf4c6090809395605d1775a0db9970eda5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/eaa93bf4.failed
+
+Jiri mentioned that flowi6_tos of struct flowi6 is never used/read
+anywhere. In fact, rest of the kernel uses the flowi6's flowlabel,
+where the traffic class _and_ the flowlabel (aka flowinfo) is encoded.
+
+For example, for policy routing, fib6_rule_match() uses ip6_tclass()
+that is applied on the flowlabel member for matching on tclass. Similar
+fix is needed for geneve, where flowi6_tos is set as well. Installing
+a v6 blackhole rule that f.e. matches on tos is now working with vxlan.
+
+Fixes: 1400615d64cf ("vxlan: allow setting ipv6 traffic class")
+	Reported-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eaa93bf4c6090809395605d1775a0db9970eda5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/ipv6.h
+diff --cc drivers/net/vxlan.c
+index 000e4c57a81e,7bfcb9a62a5d..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1816,12 -1748,86 +1816,93 @@@ int vxlan_xmit_skb(struct rtable *rt, s
+  		vxlan_build_gbp_hdr(vxh, vxflags, md);
+  
+  	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ -	return 0;
+ +
+ +	return udp_tunnel_xmit_skb(rt, sk, skb, src, dst, tos,
+ +				   ttl, df, src_port, dst_port, xnet,
+ +				   !(vxflags & VXLAN_F_UDP_CSUM));
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+++=======
++ 
++ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
++ 				      struct sk_buff *skb, int oif, u8 tos,
++ 				      __be32 daddr, __be32 *saddr,
++ 				      struct dst_cache *dst_cache,
++ 				      const struct ip_tunnel_info *info)
++ {
++ 	bool use_cache = ip_tunnel_dst_cache_usable(skb, info);
++ 	struct rtable *rt = NULL;
++ 	struct flowi4 fl4;
++ 
++ 	if (tos && !info)
++ 		use_cache = false;
++ 	if (use_cache) {
++ 		rt = dst_cache_get_ip4(dst_cache, saddr);
++ 		if (rt)
++ 			return rt;
++ 	}
++ 
++ 	memset(&fl4, 0, sizeof(fl4));
++ 	fl4.flowi4_oif = oif;
++ 	fl4.flowi4_tos = RT_TOS(tos);
++ 	fl4.flowi4_mark = skb->mark;
++ 	fl4.flowi4_proto = IPPROTO_UDP;
++ 	fl4.daddr = daddr;
++ 	fl4.saddr = vxlan->cfg.saddr.sin.sin_addr.s_addr;
++ 
++ 	rt = ip_route_output_key(vxlan->net, &fl4);
++ 	if (!IS_ERR(rt)) {
++ 		*saddr = fl4.saddr;
++ 		if (use_cache)
++ 			dst_cache_set_ip4(dst_cache, &rt->dst, fl4.saddr);
++ 	}
++ 	return rt;
++ }
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
++ 					  struct sk_buff *skb, int oif, u8 tos,
++ 					  __be32 label,
++ 					  const struct in6_addr *daddr,
++ 					  struct in6_addr *saddr,
++ 					  struct dst_cache *dst_cache,
++ 					  const struct ip_tunnel_info *info)
++ {
++ 	bool use_cache = ip_tunnel_dst_cache_usable(skb, info);
++ 	struct dst_entry *ndst;
++ 	struct flowi6 fl6;
++ 	int err;
++ 
++ 	if (tos && !info)
++ 		use_cache = false;
++ 	if (use_cache) {
++ 		ndst = dst_cache_get_ip6(dst_cache, saddr);
++ 		if (ndst)
++ 			return ndst;
++ 	}
++ 
++ 	memset(&fl6, 0, sizeof(fl6));
++ 	fl6.flowi6_oif = oif;
++ 	fl6.daddr = *daddr;
++ 	fl6.saddr = vxlan->cfg.saddr.sin6.sin6_addr;
++ 	fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tos), label);
++ 	fl6.flowi6_mark = skb->mark;
++ 	fl6.flowi6_proto = IPPROTO_UDP;
++ 
++ 	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
++ 					 vxlan->vn6_sock->sock->sk,
++ 					 &ndst, &fl6);
++ 	if (err < 0)
++ 		return ERR_PTR(err);
++ 
++ 	*saddr = fl6.saddr;
++ 	if (use_cache)
++ 		dst_cache_set_ip6(dst_cache, ndst, saddr);
++ 	return ndst;
++ }
++ #endif
+++>>>>>>> eaa93bf4c609 (vxlan: fix populating tclass in vxlan6_get_route)
+  
+  /* Bypass encapsulation if the destination is local */
+  static void vxlan_encap_bypass(struct sk_buff *skb, struct vxlan_dev *src_vxlan,
+diff --cc include/net/ipv6.h
+index 5dca98c3fc9f,d0aeb97aec5d..000000000000
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@@ -711,6 -831,16 +711,19 @@@ static inline __be32 ip6_flowlabel(cons
+  	return *(__be32 *)hdr & IPV6_FLOWLABEL_MASK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u8 ip6_tclass(__be32 flowinfo)
++ {
++ 	return ntohl(flowinfo & IPV6_TCLASS_MASK) >> IPV6_TCLASS_SHIFT;
++ }
++ 
++ static inline __be32 ip6_make_flowinfo(unsigned int tclass, __be32 flowlabel)
++ {
++ 	return htonl(tclass << IPV6_TCLASS_SHIFT) | flowlabel;
++ }
++ 
+++>>>>>>> eaa93bf4c609 (vxlan: fix populating tclass in vxlan6_get_route)
+  /*
+   *	Prototypes exported by ipv6
+   */
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/ipv6.h
