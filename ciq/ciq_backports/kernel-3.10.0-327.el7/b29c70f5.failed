@@ -1,0 +1,155 @@
+xfs: split metadata and log buffer completion to separate workqueues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit b29c70f59870dad0945b0e0b3fe3758ad528e268
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b29c70f5.failed
+
+XFS traditionally sends all buffer I/O completion work to a single
+workqueue. This includes metadata buffer completion and log buffer
+completion. The log buffer completion requires a high priority queue to
+prevent stalls due to log forces getting stuck behind other queued work.
+
+Rather than continue to prioritize all buffer I/O completion due to the
+needs of log completion, split log buffer completion off to
+m_log_workqueue and move the high priority flag from m_buf_workqueue to
+m_log_workqueue.
+
+Add a b_ioend_wq wq pointer to xfs_buf to allow completion workqueue
+customization on a per-buffer basis. Initialize b_ioend_wq to
+m_buf_workqueue by default in the generic buffer I/O submission path.
+Finally, override the default wq with the high priority m_log_workqueue
+in the log buffer I/O submission path.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit b29c70f59870dad0945b0e0b3fe3758ad528e268)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+#	fs/xfs/xfs_super.c
+diff --cc fs/xfs/xfs_buf.c
+index 84e0417dc6f7,945bea924e48..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1046,40 -1032,26 +1046,56 @@@ xfs_buf_iodone_work
+  		(*(bp->b_iodone))(bp);
+  	else if (bp->b_flags & XBF_ASYNC)
+  		xfs_buf_relse(bp);
+ -	else
+ +	else {
+ +		ASSERT(read && bp->b_ops);
+  		complete(&bp->b_iowait);
+ -}
+  
+++<<<<<<< HEAD
+ +		/* release the !XBF_ASYNC ref now we are done. */
+ +		xfs_buf_rele(bp);
+ +	}
+++=======
++ static void
++ xfs_buf_ioend_work(
++ 	struct work_struct	*work)
++ {
++ 	struct xfs_buf		*bp =
++ 		container_of(work, xfs_buf_t, b_ioend_work);
++ 
++ 	xfs_buf_ioend(bp);
+++>>>>>>> b29c70f59870 (xfs: split metadata and log buffer completion to separate workqueues)
+  }
+  
+  void
+ -xfs_buf_ioend_async(
+ -	struct xfs_buf	*bp)
+ +xfs_buf_ioend(
+ +	struct xfs_buf	*bp,
+ +	int		schedule)
+  {
+++<<<<<<< HEAD
+ +	bool		read = !!(bp->b_flags & XBF_READ);
+ +
+ +	trace_xfs_buf_iodone(bp, _RET_IP_);
+ +
+ +	if (bp->b_error == 0)
+ +		bp->b_flags |= XBF_DONE;
+ +
+ +	if (bp->b_iodone || (read && bp->b_ops) || (bp->b_flags & XBF_ASYNC)) {
+ +		if (schedule) {
+ +			INIT_WORK(&bp->b_iodone_work, xfs_buf_iodone_work);
+ +			queue_work(bp->b_target->bt_mount->m_buf_workqueue,
+ +				   &bp->b_iodone_work);
+ +		} else {
+ +			xfs_buf_iodone_work(&bp->b_iodone_work);
+ +		}
+ +	} else {
+ +		bp->b_flags &= ~(XBF_READ | XBF_WRITE | XBF_READ_AHEAD);
+ +		complete(&bp->b_iowait);
+ +		xfs_buf_rele(bp);
+ +	}
+++=======
++ 	INIT_WORK(&bp->b_ioend_work, xfs_buf_ioend_work);
++ 	queue_work(bp->b_ioend_wq, &bp->b_ioend_work);
+++>>>>>>> b29c70f59870 (xfs: split metadata and log buffer completion to separate workqueues)
+  }
+  
+  void
+diff --cc fs/xfs/xfs_super.c
+index 757300878222,b5aacfc462af..000000000000
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@@ -876,7 -867,7 +875,11 @@@ xfs_init_mount_workqueues
+  		goto out_destroy_cil;
+  
+  	mp->m_log_workqueue = alloc_workqueue("xfs-log/%s",
+++<<<<<<< HEAD
+ +			WQ_NON_REENTRANT|WQ_FREEZABLE, 0, mp->m_fsname);
+++=======
++ 			WQ_FREEZABLE|WQ_HIGHPRI, 0, mp->m_fsname);
+++>>>>>>> b29c70f59870 (xfs: split metadata and log buffer completion to separate workqueues)
+  	if (!mp->m_log_workqueue)
+  		goto out_destroy_reclaim;
+  
+* Unmerged path fs/xfs/xfs_buf.c
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index 75e98ced9b68..f5476fb63873 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -160,7 +160,8 @@ typedef struct xfs_buf {
+ 	struct xfs_perag	*b_pag;		/* contains rbtree root */
+ 	xfs_buftarg_t		*b_target;	/* buffer target (device) */
+ 	void			*b_addr;	/* virtual address of buffer */
+-	struct work_struct	b_iodone_work;
++	struct work_struct	b_ioend_work;
++	struct workqueue_struct	*b_ioend_wq;	/* I/O completion wq */
+ 	xfs_buf_iodone_t	b_iodone;	/* I/O completion function */
+ 	struct completion	b_iowait;	/* queue for I/O waiters */
+ 	void			*b_fspriv;
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index b7fb382e491a..77e540311536 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -1808,6 +1808,8 @@ xlog_sync(
+ 	XFS_BUF_ZEROFLAGS(bp);
+ 	XFS_BUF_ASYNC(bp);
+ 	bp->b_flags |= XBF_SYNCIO;
++	/* use high priority completion wq */
++	bp->b_ioend_wq = log->l_mp->m_log_workqueue;
+ 
+ 	if (log->l_mp->m_flags & XFS_MOUNT_BARRIER) {
+ 		bp->b_flags |= XBF_FUA;
+@@ -1856,6 +1858,8 @@ xlog_sync(
+ 		bp->b_flags |= XBF_SYNCIO;
+ 		if (log->l_mp->m_flags & XFS_MOUNT_BARRIER)
+ 			bp->b_flags |= XBF_FUA;
++		/* use high priority completion wq */
++		bp->b_ioend_wq = log->l_mp->m_log_workqueue;
+ 
+ 		ASSERT(XFS_BUF_ADDR(bp) <= log->l_logBBsize-1);
+ 		ASSERT(XFS_BUF_ADDR(bp) + BTOBB(count) <= log->l_logBBsize);
+* Unmerged path fs/xfs/xfs_super.c
