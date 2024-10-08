@@ -1,0 +1,76 @@
+sched: Avoid throttle_cfs_rq() racing with period_timer stopping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Ben Segall <bsegall@google.com>
+commit f9f9ffc237dd924f048204e8799da74f9ecf40cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f9f9ffc2.failed
+
+throttle_cfs_rq() doesn't check to make sure that period_timer is running,
+and while update_curr/assign_cfs_runtime does, a concurrently running
+period_timer on another cpu could cancel itself between this cpu's
+update_curr and throttle_cfs_rq(). If there are no other cfs_rqs running
+in the tg to restart the timer, this causes the cfs_rq to be stranded
+forever.
+
+Fix this by calling __start_cfs_bandwidth() in throttle if the timer is
+inactive.
+
+(Also add some sched_debug lines for cfs_bandwidth.)
+
+Tested: make a run/sleep task in a cgroup, loop switching the cgroup
+between 1ms/100ms quota and unlimited, checking for timer_active=0 and
+throttled=1 as a failure. With the throttle_cfs_rq() change commented out
+this fails, with the full patch it passes.
+
+	Signed-off-by: Ben Segall <bsegall@google.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: pjt@google.com
+Link: http://lkml.kernel.org/r/20131016181632.22647.84174.stgit@sword-of-the-dawn.mtv.corp.google.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit f9f9ffc237dd924f048204e8799da74f9ecf40cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/debug.c
+diff --cc kernel/sched/debug.c
+index 79ddda051e58,5c34d1817e8f..000000000000
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@@ -228,7 -226,19 +228,19 @@@ void print_cfs_rq(struct seq_file *m, i
+  	SEQ_printf(m, "  .%-30s: %d\n", "tg->runnable_avg",
+  			atomic_read(&cfs_rq->tg->runnable_avg));
+  #endif
+++<<<<<<< HEAD
+++=======
++ #endif
++ #ifdef CONFIG_CFS_BANDWIDTH
++ 	SEQ_printf(m, "  .%-30s: %d\n", "tg->cfs_bandwidth.timer_active",
++ 			cfs_rq->tg->cfs_bandwidth.timer_active);
++ 	SEQ_printf(m, "  .%-30s: %d\n", "throttled",
++ 			cfs_rq->throttled);
++ 	SEQ_printf(m, "  .%-30s: %d\n", "throttle_count",
++ 			cfs_rq->throttle_count);
++ #endif
+++>>>>>>> f9f9ffc237dd (sched: Avoid throttle_cfs_rq() racing with period_timer stopping)
+  
+ -#ifdef CONFIG_FAIR_GROUP_SCHED
+  	print_cfs_group_stats(m, cpu, cfs_rq->tg);
+  #endif
+  }
+* Unmerged path kernel/sched/debug.c
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6868c5f9839f..63a1b64d3b8a 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3252,6 +3252,8 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ 	cfs_rq->throttled_clock = rq_clock(rq);
+ 	raw_spin_lock(&cfs_b->lock);
+ 	list_add_tail_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
++	if (!cfs_b->timer_active)
++		__start_cfs_bandwidth(cfs_b);
+ 	raw_spin_unlock(&cfs_b->lock);
+ }
+ 
