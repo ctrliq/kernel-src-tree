@@ -1,0 +1,282 @@
+be2iscsi: Cleanup processing of BMBX completion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit c448427b96ed1a71700728a67323e3e5c76563d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c448427b.failed
+
+Remove confusingly named be_mcc_compl_is_new and be_mcc_compl_use
+functions in processing of BMBX. Rearrange beiscsi_process_mbox_compl
+function.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c448427b96ed1a71700728a67323e3e5c76563d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_cmds.c
+diff --cc drivers/scsi/be2iscsi/be_cmds.c
+index f6abd01429a1,728aa133717f..000000000000
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@@ -254,56 -263,8 +254,59 @@@ int beiscsi_mccq_compl(struct beiscsi_h
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +void free_mcc_tag(struct be_ctrl_info *ctrl, unsigned int tag)
+ +{
+ +	spin_lock(&ctrl->mcc_lock);
+ +	tag = tag & MCC_Q_CMD_TAG_MASK;
+ +	ctrl->mcc_tag[ctrl->mcc_free_index] = tag;
+ +	if (ctrl->mcc_free_index == (MAX_MCC_CMD - 1))
+ +		ctrl->mcc_free_index = 0;
+ +	else
+ +		ctrl->mcc_free_index++;
+ +	ctrl->mcc_tag_available++;
+ +	spin_unlock(&ctrl->mcc_lock);
+ +}
+ +
+ +bool is_link_state_evt(u32 trailer)
+ +{
+ +	return (((trailer >> ASYNC_TRAILER_EVENT_CODE_SHIFT) &
+ +		  ASYNC_TRAILER_EVENT_CODE_MASK) ==
+ +		  ASYNC_EVENT_CODE_LINK_STATE);
+ +}
+ +
+ +static bool is_iscsi_evt(u32 trailer)
+ +{
+ +	return (((trailer >> ASYNC_TRAILER_EVENT_CODE_SHIFT) &
+ +		  ASYNC_TRAILER_EVENT_CODE_MASK) ==
+ +		  ASYNC_EVENT_CODE_ISCSI);
+ +}
+ +
+ +static int iscsi_evt_type(u32 trailer)
+ +{
+ +	return ((trailer >> ASYNC_TRAILER_EVENT_TYPE_SHIFT) &
+ +		 ASYNC_TRAILER_EVENT_TYPE_MASK);
+ +}
+ +
+ +static inline bool be_mcc_compl_is_new(struct be_mcc_compl *compl)
+ +{
+ +	if (compl->flags != 0) {
+ +		compl->flags = le32_to_cpu(compl->flags);
+ +		WARN_ON((compl->flags & CQE_FLAGS_VALID_MASK) == 0);
+ +		return true;
+ +	} else
+ +		return false;
+ +}
+ +
+ +static inline void be_mcc_compl_use(struct be_mcc_compl *compl)
+ +{
+ +	compl->flags = 0;
+ +}
+ +
+++=======
+++>>>>>>> c448427b96ed (be2iscsi: Cleanup processing of BMBX completion)
+  /*
+ - * beiscsi_process_mbox_compl()- Check the MBX completion status
+ + * be_mcc_compl_process()- Check the MBX comapletion status
+   * @ctrl: Function specific MBX data structure
+   * @compl: Completion status of MBX Command
+   *
+@@@ -322,34 -283,171 +325,50 @@@ static int be_mcc_compl_process(struct 
+  	struct be_cmd_req_hdr *hdr = embedded_payload(wrb);
+  	struct be_cmd_resp_hdr *resp_hdr;
+  
+- 	be_dws_le_to_cpu(compl, 4);
++ 	/**
++ 	 * To check if valid bit is set, check the entire word as we don't know
++ 	 * the endianness of the data (old entry is host endian while a new
++ 	 * entry is little endian)
++ 	 */
++ 	if (!compl->flags) {
++ 		beiscsi_log(phba, KERN_ERR,
++ 				BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
++ 				"BC_%d : BMBX busy, no completion\n");
++ 		return -EBUSY;
++ 	}
++ 	compl->flags = le32_to_cpu(compl->flags);
++ 	WARN_ON((compl->flags & CQE_FLAGS_VALID_MASK) == 0);
+  
++ 	/**
++ 	 * Just swap the status to host endian;
++ 	 * mcc tag is opaquely copied from mcc_wrb.
++ 	 */
++ 	be_dws_le_to_cpu(compl, 4);
+  	compl_status = (compl->status >> CQE_STATUS_COMPL_SHIFT) &
+- 					CQE_STATUS_COMPL_MASK;
+- 	if (compl_status != MCC_STATUS_SUCCESS) {
+- 		extd_status = (compl->status >> CQE_STATUS_EXTD_SHIFT) &
+- 						CQE_STATUS_EXTD_MASK;
++ 		CQE_STATUS_COMPL_MASK;
++ 	extd_status = (compl->status >> CQE_STATUS_EXTD_SHIFT) &
++ 		CQE_STATUS_EXTD_MASK;
++ 	/* Need to reset the entire word that houses the valid bit */
++ 	compl->flags = 0;
+  
+- 		beiscsi_log(phba, KERN_ERR,
+- 			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+- 			    "BC_%d : error in cmd completion: "
+- 			    "Subsystem : %d Opcode : %d "
+- 			    "status(compl/extd)=%d/%d\n",
+- 			    hdr->subsystem, hdr->opcode,
+- 			    compl_status, extd_status);
+- 
+- 		if (compl_status == MCC_STATUS_INSUFFICIENT_BUFFER) {
+- 			resp_hdr = (struct be_cmd_resp_hdr *) hdr;
+- 			if (resp_hdr->response_length)
+- 				return 0;
+- 		}
+- 		return -EINVAL;
++ 	if (compl_status == MCC_STATUS_SUCCESS)
++ 		return 0;
++ 
++ 	beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
++ 		    "BC_%d : error in cmd completion: Subsystem : %d Opcode : %d status(compl/extd)=%d/%d\n",
++ 		    hdr->subsystem, hdr->opcode, compl_status, extd_status);
++ 
++ 	if (compl_status == MCC_STATUS_INSUFFICIENT_BUFFER) {
++ 		/* if status is insufficient buffer, check the length */
++ 		resp_hdr = (struct be_cmd_resp_hdr *) hdr;
++ 		if (resp_hdr->response_length)
++ 			return 0;
+  	}
+- 	return 0;
++ 	return -EINVAL;
+  }
+  
+ -static void beiscsi_process_async_link(struct beiscsi_hba *phba,
+ -				       struct be_mcc_compl *compl)
+ -{
+ -	struct be_async_event_link_state *evt;
+ -
+ -	evt = (struct be_async_event_link_state *)compl;
+ -
+ -	phba->port_speed = evt->port_speed;
+ -	/**
+ -	 * Check logical link status in ASYNC event.
+ -	 * This has been newly introduced in SKH-R Firmware 10.0.338.45.
+ -	 **/
+ -	if (evt->port_link_status & BE_ASYNC_LINK_UP_MASK) {
+ -		phba->state = BE_ADAPTER_LINK_UP | BE_ADAPTER_CHECK_BOOT;
+ -		phba->get_boot = BE_GET_BOOT_RETRIES;
+ -		__beiscsi_log(phba, KERN_ERR,
+ -			      "BC_%d : Link Up on Port %d tag 0x%x\n",
+ -			      evt->physical_port, evt->event_tag);
+ -	} else {
+ -		phba->state = BE_ADAPTER_LINK_DOWN;
+ -		__beiscsi_log(phba, KERN_ERR,
+ -			      "BC_%d : Link Down on Port %d tag 0x%x\n",
+ -			      evt->physical_port, evt->event_tag);
+ -		iscsi_host_for_each_session(phba->shost,
+ -					    beiscsi_fail_session);
+ -	}
+ -}
+ -
+ -static char *beiscsi_port_misconf_event_msg[] = {
+ -	"Physical Link is functional.",
+ -	"Optics faulted/incorrectly installed/not installed - Reseat optics, if issue not resolved, replace.",
+ -	"Optics of two types installed - Remove one optic or install matching pair of optics.",
+ -	"Incompatible optics - Replace with compatible optics for card to function.",
+ -	"Unqualified optics - Replace with Avago optics for Warranty and Technical Support.",
+ -	"Uncertified optics - Replace with Avago Certified optics to enable link operation."
+ -};
+ -
+ -static void beiscsi_process_async_sli(struct beiscsi_hba *phba,
+ -				      struct be_mcc_compl *compl)
+ -{
+ -	struct be_async_event_sli *async_sli;
+ -	u8 evt_type, state, old_state, le;
+ -	char *sev = KERN_WARNING;
+ -	char *msg = NULL;
+ -
+ -	evt_type = compl->flags >> ASYNC_TRAILER_EVENT_TYPE_SHIFT;
+ -	evt_type &= ASYNC_TRAILER_EVENT_TYPE_MASK;
+ -
+ -	/* processing only MISCONFIGURED physical port event */
+ -	if (evt_type != ASYNC_SLI_EVENT_TYPE_MISCONFIGURED)
+ -		return;
+ -
+ -	async_sli = (struct be_async_event_sli *)compl;
+ -	state = async_sli->event_data1 >>
+ -		 (phba->fw_config.phys_port * 8) & 0xff;
+ -	le = async_sli->event_data2 >>
+ -		 (phba->fw_config.phys_port * 8) & 0xff;
+ -
+ -	old_state = phba->optic_state;
+ -	phba->optic_state = state;
+ -
+ -	if (state >= ARRAY_SIZE(beiscsi_port_misconf_event_msg)) {
+ -		/* fw is reporting a state we don't know, log and return */
+ -		__beiscsi_log(phba, KERN_ERR,
+ -			    "BC_%d : Port %c: Unrecognized optic state 0x%x\n",
+ -			    phba->port_name, async_sli->event_data1);
+ -		return;
+ -	}
+ -
+ -	if (ASYNC_SLI_LINK_EFFECT_VALID(le)) {
+ -		/* log link effect for unqualified-4, uncertified-5 optics */
+ -		if (state > 3)
+ -			msg = (ASYNC_SLI_LINK_EFFECT_STATE(le)) ?
+ -				" Link is non-operational." :
+ -				" Link is operational.";
+ -		/* 1 - info */
+ -		if (ASYNC_SLI_LINK_EFFECT_SEV(le) == 1)
+ -			sev = KERN_INFO;
+ -		/* 2 - error */
+ -		if (ASYNC_SLI_LINK_EFFECT_SEV(le) == 2)
+ -			sev = KERN_ERR;
+ -	}
+ -
+ -	if (old_state != phba->optic_state)
+ -		__beiscsi_log(phba, sev, "BC_%d : Port %c: %s%s\n",
+ -			      phba->port_name,
+ -			      beiscsi_port_misconf_event_msg[state],
+ -			      !msg ? "" : msg);
+ -}
+ -
+ -void beiscsi_process_async_event(struct beiscsi_hba *phba,
+ -				struct be_mcc_compl *compl)
+ -{
+ -	char *sev = KERN_INFO;
+ -	u8 evt_code;
+ -
+ -	/* interpret flags as an async trailer */
+ -	evt_code = compl->flags >> ASYNC_TRAILER_EVENT_CODE_SHIFT;
+ -	evt_code &= ASYNC_TRAILER_EVENT_CODE_MASK;
+ -	switch (evt_code) {
+ -	case ASYNC_EVENT_CODE_LINK_STATE:
+ -		beiscsi_process_async_link(phba, compl);
+ -		break;
+ -	case ASYNC_EVENT_CODE_ISCSI:
+ -		phba->state |= BE_ADAPTER_CHECK_BOOT;
+ -		phba->get_boot = BE_GET_BOOT_RETRIES;
+ -		sev = KERN_ERR;
+ -		break;
+ -	case ASYNC_EVENT_CODE_SLI:
+ -		beiscsi_process_async_sli(phba, compl);
+ -		break;
+ -	default:
+ -		/* event not registered */
+ -		sev = KERN_ERR;
+ -	}
+ -
+ -	beiscsi_log(phba, sev, BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+ -		    "BC_%d : ASYNC Event %x: status 0x%08x flags 0x%08x\n",
+ -		    evt_code, compl->status, compl->flags);
+ -}
+ -
+ -int beiscsi_process_mcc_compl(struct be_ctrl_info *ctrl,
+ -			      struct be_mcc_compl *compl)
+ +int be_mcc_compl_process_isr(struct be_ctrl_info *ctrl,
+ +				    struct be_mcc_compl *compl)
+  {
+  	struct beiscsi_hba *phba = pci_get_drvdata(ctrl->pdev);
+  	u16 compl_status, extd_status;
+* Unmerged path drivers/scsi/be2iscsi/be_cmds.c
