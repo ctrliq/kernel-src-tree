@@ -496,6 +496,11 @@ struct mlx4_ib_iov_port {
 	struct mlx4_ib_iov_sysfs_attr mcg_dentry;
 };
 
+struct counter_index {
+	u32		index;
+	u8		allocated;
+};
+
 struct mlx4_ib_dev {
 	struct ib_device	ib_dev;
 	struct mlx4_dev	       *dev;
@@ -514,7 +519,7 @@ struct mlx4_ib_dev {
 	struct mutex		cap_mask_mutex;
 	bool			ib_active;
 	struct mlx4_ib_iboe	iboe;
-	int			counters[MLX4_MAX_PORTS];
+	struct counter_index    counters[MLX4_MAX_PORTS];
 	int		       *eq_table;
 	int			eq_added;
 	struct kobject	       *iov_parent;
