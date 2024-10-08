@@ -1,0 +1,144 @@
+be2net: Refactor be_xmit_enqueue() routine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Sriharsha Basavapatna <sriharsha.basavapatna@emulex.com>
+commit 79a0d7d8e0b2981dabc241cbeec6b99620dd7c5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/79a0d7d8.failed
+
+- Reduce code duplication by moving WRB-frags setup into a function.
+- Do not setup WRB-header before frags are setup, which is unncessary if
+  there's errors while setting up frags. We should only grab an entry for
+  the header, setup the frags and if everything is fine setup the header.
+- The error cleanup can be moved into a small function.
+
+	Signed-off-by: Sriharsha Basavapatna <sriharsha.basavapatna@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 79a0d7d8e0b2981dabc241cbeec6b99620dd7c5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index c937ac36edcc,a6df4c96150f..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -789,27 -811,96 +789,107 @@@ static void unmap_tx_frag(struct devic
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/* Returns the number of WRBs used up by the skb */
+ +static u32 be_xmit_enqueue(struct be_adapter *adapter, struct be_tx_obj *txo,
+ +			   struct sk_buff *skb, bool skip_hw_vlan)
+++=======
++ /* Grab a WRB header for xmit */
++ static u16 be_tx_get_wrb_hdr(struct be_tx_obj *txo)
+++>>>>>>> 79a0d7d8e0b2 (be2net: Refactor be_xmit_enqueue() routine)
+  {
+- 	u32 i, copied = 0, wrb_cnt = skb_wrb_cnt(skb);
+- 	struct device *dev = &adapter->pdev->dev;
++ 	u16 head = txo->q.head;
++ 
++ 	queue_head_inc(&txo->q);
++ 	return head;
++ }
++ 
++ /* Set up the WRB header for xmit */
++ static void be_tx_setup_wrb_hdr(struct be_adapter *adapter,
++ 				struct be_tx_obj *txo,
++ 				struct be_wrb_params *wrb_params,
++ 				struct sk_buff *skb, u16 head)
++ {
++ 	u32 num_frags = skb_wrb_cnt(skb);
+  	struct be_queue_info *txq = &txo->q;
+- 	struct be_eth_hdr_wrb *hdr;
+- 	bool map_single = false;
+- 	struct be_eth_wrb *wrb;
+- 	dma_addr_t busaddr;
+- 	u16 head = txq->head;
++ 	struct be_eth_hdr_wrb *hdr = queue_index_node(txq, head);
+  
+++<<<<<<< HEAD
+ +	hdr = queue_head_node(txq);
+ +	wrb_fill_hdr(adapter, hdr, skb, wrb_cnt, skb->len, skip_hw_vlan);
+++=======
++ 	wrb_fill_hdr(adapter, hdr, wrb_params, skb);
+++>>>>>>> 79a0d7d8e0b2 (be2net: Refactor be_xmit_enqueue() routine)
+  	be_dws_cpu_to_le(hdr, sizeof(*hdr));
+  
++ 	BUG_ON(txo->sent_skb_list[head]);
++ 	txo->sent_skb_list[head] = skb;
++ 	txo->last_req_hdr = head;
++ 	atomic_add(num_frags, &txq->used);
++ 	txo->last_req_wrb_cnt = num_frags;
++ 	txo->pend_wrb_cnt += num_frags;
++ }
++ 
++ /* Setup a WRB fragment (buffer descriptor) for xmit */
++ static void be_tx_setup_wrb_frag(struct be_tx_obj *txo, dma_addr_t busaddr,
++ 				 int len)
++ {
++ 	struct be_eth_wrb *wrb;
++ 	struct be_queue_info *txq = &txo->q;
++ 
++ 	wrb = queue_head_node(txq);
++ 	wrb_fill(wrb, busaddr, len);
+  	queue_head_inc(txq);
++ }
++ 
++ /* Bring the queue back to the state it was in before be_xmit_enqueue() routine
++  * was invoked. The producer index is restored to the previous packet and the
++  * WRBs of the current packet are unmapped. Invoked to handle tx setup errors.
++  */
++ static void be_xmit_restore(struct be_adapter *adapter,
++ 			    struct be_tx_obj *txo, u16 head, bool map_single,
++ 			    u32 copied)
++ {
++ 	struct device *dev;
++ 	struct be_eth_wrb *wrb;
++ 	struct be_queue_info *txq = &txo->q;
++ 
++ 	dev = &adapter->pdev->dev;
++ 	txq->head = head;
++ 
++ 	/* skip the first wrb (hdr); it's not mapped */
++ 	queue_head_inc(txq);
++ 	while (copied) {
++ 		wrb = queue_head_node(txq);
++ 		unmap_tx_frag(dev, wrb, map_single);
++ 		map_single = false;
++ 		copied -= le32_to_cpu(wrb->frag_len);
++ 		queue_head_inc(txq);
++ 	}
++ 
++ 	txq->head = head;
++ }
++ 
++ /* Enqueue the given packet for transmit. This routine allocates WRBs for the
++  * packet, dma maps the packet buffers and sets up the WRBs. Returns the number
++  * of WRBs used up by the packet.
++  */
++ static u32 be_xmit_enqueue(struct be_adapter *adapter, struct be_tx_obj *txo,
++ 			   struct sk_buff *skb,
++ 			   struct be_wrb_params *wrb_params)
++ {
++ 	u32 i, copied = 0, wrb_cnt = skb_wrb_cnt(skb);
++ 	struct device *dev = &adapter->pdev->dev;
++ 	struct be_queue_info *txq = &txo->q;
++ 	bool map_single = false;
++ 	u16 head = txq->head;
++ 	dma_addr_t busaddr;
++ 	int len;
++ 
++ 	head = be_tx_get_wrb_hdr(txo);
+  
+  	if (skb->len > skb->data_len) {
+- 		int len = skb_headlen(skb);
++ 		len = skb_headlen(skb);
+  
+  		busaddr = dma_map_single(dev, skb->data, len, DMA_TO_DEVICE);
+  		if (dma_mapping_error(dev, busaddr))
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
