@@ -1,0 +1,108 @@
+svcrdma: Use correct XID in error replies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit f3ea53fb3bc3908b6e9ef39e53a75b55df7f78f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f3ea53fb.failed
+
+When constructing an error reply, svc_rdma_xdr_encode_error()
+needs to view the client's request message so it can get the
+failing request's XID.
+
+svc_rdma_xdr_decode_req() is supposed to return a pointer to the
+client's request header. But if it fails to decode the client's
+message (and thus an error reply is needed) it does not return the
+pointer. The server then sends a bogus XID in the error reply.
+
+Instead, unconditionally generate the pointer to the client's header
+in svc_rdma_recvfrom(), and pass that pointer to both functions.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Tested-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit f3ea53fb3bc3908b6e9ef39e53a75b55df7f78f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+index f0c3ff67ca98,8f68cb6d89fe..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+@@@ -615,14 -653,19 +615,22 @@@ int svc_rdma_recvfrom(struct svc_rqst *
+  	rdma_build_arg_xdr(rqstp, ctxt, ctxt->byte_len);
+  
+  	/* Decode the RDMA header. */
+++<<<<<<< HEAD
+ +	len = svc_rdma_xdr_decode_req(&rmsgp, rqstp);
+ +	rqstp->rq_xprt_hlen = len;
+++=======
++ 	rmsgp = (struct rpcrdma_msg *)rqstp->rq_arg.head[0].iov_base;
++ 	ret = svc_rdma_xdr_decode_req(rmsgp, rqstp);
++ 	if (ret < 0)
++ 		goto out_err;
++ 	rqstp->rq_xprt_hlen = ret;
+++>>>>>>> f3ea53fb3bc3 (svcrdma: Use correct XID in error replies)
+  
+ -	if (svc_rdma_is_backchannel_reply(xprt, rmsgp)) {
+ -		ret = svc_rdma_handle_bc_reply(xprt->xpt_bc_xprt, rmsgp,
+ -					       &rqstp->rq_arg);
+ -		svc_rdma_put_context(ctxt, 0);
+ -		if (ret)
+ -			goto repost;
+ -		return ret;
+ +	/* If the request is invalid, reply with an error */
+ +	if (len < 0) {
+ +		if (len == -ENOSYS)
+ +			svc_rdma_send_error(rdma_xprt, rmsgp, ERR_VERS);
+ +		goto close_out;
+  	}
+  
+  	/* Read read-list data. */
+diff --git a/include/linux/sunrpc/svc_rdma.h b/include/linux/sunrpc/svc_rdma.h
+index aa20d5f0dab3..583874049ac5 100644
+--- a/include/linux/sunrpc/svc_rdma.h
++++ b/include/linux/sunrpc/svc_rdma.h
+@@ -191,7 +191,7 @@ struct svcxprt_rdma {
+ #define RPCSVC_MAXPAYLOAD_RDMA	RPCSVC_MAXPAYLOAD
+ 
+ /* svc_rdma_marshal.c */
+-extern int svc_rdma_xdr_decode_req(struct rpcrdma_msg **, struct svc_rqst *);
++extern int svc_rdma_xdr_decode_req(struct rpcrdma_msg *, struct svc_rqst *);
+ extern int svc_rdma_xdr_encode_error(struct svcxprt_rdma *,
+ 				     struct rpcrdma_msg *,
+ 				     enum rpcrdma_errcode, __be32 *);
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_marshal.c b/net/sunrpc/xprtrdma/svc_rdma_marshal.c
+index e2fca7617242..c011b121309b 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_marshal.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_marshal.c
+@@ -145,15 +145,11 @@ static __be32 *decode_reply_array(__be32 *va, __be32 *vaend)
+ 	return (__be32 *)&ary->wc_array[nchunks];
+ }
+ 
+-int svc_rdma_xdr_decode_req(struct rpcrdma_msg **rdma_req,
+-			    struct svc_rqst *rqstp)
++int svc_rdma_xdr_decode_req(struct rpcrdma_msg *rmsgp, struct svc_rqst *rqstp)
+ {
+-	struct rpcrdma_msg *rmsgp = NULL;
+ 	__be32 *va, *vaend;
+ 	u32 hdr_len;
+ 
+-	rmsgp = (struct rpcrdma_msg *)rqstp->rq_arg.head[0].iov_base;
+-
+ 	/* Verify that there's enough bytes for header + something */
+ 	if (rqstp->rq_arg.len <= RPCRDMA_HDRLEN_MIN) {
+ 		dprintk("svcrdma: header too short = %d\n",
+@@ -201,7 +197,6 @@ int svc_rdma_xdr_decode_req(struct rpcrdma_msg **rdma_req,
+ 	hdr_len = (unsigned long)va - (unsigned long)rmsgp;
+ 	rqstp->rq_arg.head[0].iov_len -= hdr_len;
+ 
+-	*rdma_req = rmsgp;
+ 	return hdr_len;
+ }
+ 
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
