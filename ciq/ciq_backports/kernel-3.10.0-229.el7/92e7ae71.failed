@@ -1,0 +1,267 @@
+iw_cxgb4: Choose appropriate hw mtu index and ISS for iWARP connections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [infiniband] cxgb4: Choose appropriate hw mtu index and ISS for iWARP connections (Sai Vemuri) [1124947]
+Rebuild_FUZZ: 97.84%
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 92e7ae71726ca9e16a8a88ebeee14eb5177575a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/92e7ae71.failed
+
+Select the appropriate hw mtu index and initial sequence number to optimize
+hw memory performance.
+
+Add new cxgb4_best_aligned_mtu() which allows callers to provide enough
+information to be used to [possibly] select an MTU which will result in the
+TCP Data Segment Size (AKA Maximum Segment Size) to be an aligned value.
+
+If an RTR message exhange is required, then align the ISS to 8B - 1 + 4, so
+that after the SYN the send seqno will align on a 4B boundary. The RTR
+message exchange will leave the send seqno aligned on an 8B boundary.
+If an RTR is not required, then align the ISS to 8B - 1.  The goal is
+to have the send seqno be 8B aligned when we send the first FPDU.
+
+Based on original work by Casey Leedom <leeedom@chelsio.com> and
+Steve Wise <swise@opengridcomputing.com>
+
+	Signed-off-by: Casey Leedom <leedom@chelsio.com>
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 92e7ae71726ca9e16a8a88ebeee14eb5177575a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/cm.c
+diff --cc drivers/infiniband/hw/cxgb4/cm.c
+index 96d7131ab974,d2e9f72ec9bf..000000000000
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@@ -533,36 -532,15 +537,48 @@@ static int send_abort(struct c4iw_ep *e
+  	return c4iw_l2t_send(&ep->com.dev->rdev, skb, ep->l2t);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * c4iw_form_pm_msg - Form a port mapper message with mapping info
+ + */
+ +static void c4iw_form_pm_msg(struct c4iw_ep *ep,
+ +				struct iwpm_sa_data *pm_msg)
+ +{
+ +	memcpy(&pm_msg->loc_addr, &ep->com.local_addr,
+ +		sizeof(ep->com.local_addr));
+ +	memcpy(&pm_msg->rem_addr, &ep->com.remote_addr,
+ +		sizeof(ep->com.remote_addr));
+ +}
+ +
+ +/*
+ + * c4iw_form_reg_msg - Form a port mapper message with dev info
+ + */
+ +static void c4iw_form_reg_msg(struct c4iw_dev *dev,
+ +				struct iwpm_dev_data *pm_msg)
+ +{
+ +	memcpy(pm_msg->dev_name, dev->ibdev.name, IWPM_DEVNAME_SIZE);
+ +	memcpy(pm_msg->if_name, dev->rdev.lldi.ports[0]->name,
+ +				IWPM_IFNAME_SIZE);
+ +}
+ +
+ +static void c4iw_record_pm_msg(struct c4iw_ep *ep,
+ +			struct iwpm_sa_data *pm_msg)
+ +{
+ +	memcpy(&ep->com.mapped_local_addr, &pm_msg->mapped_loc_addr,
+ +		sizeof(ep->com.mapped_local_addr));
+ +	memcpy(&ep->com.mapped_remote_addr, &pm_msg->mapped_rem_addr,
+ +		sizeof(ep->com.mapped_remote_addr));
+++=======
++ static void best_mtu(const unsigned short *mtus, unsigned short mtu,
++ 		     unsigned int *idx, int use_ts)
++ {
++ 	unsigned short hdr_size = sizeof(struct iphdr) +
++ 				  sizeof(struct tcphdr) +
++ 				  (use_ts ? 12 : 0);
++ 	unsigned short data_size = mtu - hdr_size;
++ 
++ 	cxgb4_best_aligned_mtu(mtus, hdr_size, data_size, 8, idx);
+++>>>>>>> 92e7ae71726c (iw_cxgb4: Choose appropriate hw mtu index and ISS for iWARP connections)
+  }
+  
+  static int send_connect(struct c4iw_ep *ep)
+* Unmerged path drivers/infiniband/hw/cxgb4/cm.c
+diff --git a/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h b/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
+index 6121ca08fe58..91289a051af9 100644
+--- a/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
++++ b/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
+@@ -848,6 +848,7 @@ enum {                     /* TCP congestion control algorithms */
+ #define V_CONG_CNTRL(x) ((x) << S_CONG_CNTRL)
+ #define G_CONG_CNTRL(x) (((x) >> S_CONG_CNTRL) & M_CONG_CNTRL)
+ 
++#define CONG_CNTRL_VALID   (1 << 18)
+ #define T5_OPT_2_VALID       (1 << 31)
+ 
+ #endif /* _T4FW_RI_API_H_ */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index f3175d10aa80..f341e20a1088 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -3427,6 +3427,77 @@ unsigned int cxgb4_best_mtu(const unsigned short *mtus, unsigned short mtu,
+ }
+ EXPORT_SYMBOL(cxgb4_best_mtu);
+ 
++/**
++ *     cxgb4_best_aligned_mtu - find best MTU, [hopefully] data size aligned
++ *     @mtus: the HW MTU table
++ *     @header_size: Header Size
++ *     @data_size_max: maximum Data Segment Size
++ *     @data_size_align: desired Data Segment Size Alignment (2^N)
++ *     @mtu_idxp: HW MTU Table Index return value pointer (possibly NULL)
++ *
++ *     Similar to cxgb4_best_mtu() but instead of searching the Hardware
++ *     MTU Table based solely on a Maximum MTU parameter, we break that
++ *     parameter up into a Header Size and Maximum Data Segment Size, and
++ *     provide a desired Data Segment Size Alignment.  If we find an MTU in
++ *     the Hardware MTU Table which will result in a Data Segment Size with
++ *     the requested alignment _and_ that MTU isn't "too far" from the
++ *     closest MTU, then we'll return that rather than the closest MTU.
++ */
++unsigned int cxgb4_best_aligned_mtu(const unsigned short *mtus,
++				    unsigned short header_size,
++				    unsigned short data_size_max,
++				    unsigned short data_size_align,
++				    unsigned int *mtu_idxp)
++{
++	unsigned short max_mtu = header_size + data_size_max;
++	unsigned short data_size_align_mask = data_size_align - 1;
++	int mtu_idx, aligned_mtu_idx;
++
++	/* Scan the MTU Table till we find an MTU which is larger than our
++	 * Maximum MTU or we reach the end of the table.  Along the way,
++	 * record the last MTU found, if any, which will result in a Data
++	 * Segment Length matching the requested alignment.
++	 */
++	for (mtu_idx = 0, aligned_mtu_idx = -1; mtu_idx < NMTUS; mtu_idx++) {
++		unsigned short data_size = mtus[mtu_idx] - header_size;
++
++		/* If this MTU minus the Header Size would result in a
++		 * Data Segment Size of the desired alignment, remember it.
++		 */
++		if ((data_size & data_size_align_mask) == 0)
++			aligned_mtu_idx = mtu_idx;
++
++		/* If we're not at the end of the Hardware MTU Table and the
++		 * next element is larger than our Maximum MTU, drop out of
++		 * the loop.
++		 */
++		if (mtu_idx+1 < NMTUS && mtus[mtu_idx+1] > max_mtu)
++			break;
++	}
++
++	/* If we fell out of the loop because we ran to the end of the table,
++	 * then we just have to use the last [largest] entry.
++	 */
++	if (mtu_idx == NMTUS)
++		mtu_idx--;
++
++	/* If we found an MTU which resulted in the requested Data Segment
++	 * Length alignment and that's "not far" from the largest MTU which is
++	 * less than or equal to the maximum MTU, then use that.
++	 */
++	if (aligned_mtu_idx >= 0 &&
++	    mtu_idx - aligned_mtu_idx <= 1)
++		mtu_idx = aligned_mtu_idx;
++
++	/* If the caller has passed in an MTU Index pointer, pass the
++	 * MTU Index back.  Return the MTU value.
++	 */
++	if (mtu_idxp)
++		*mtu_idxp = mtu_idx;
++	return mtus[mtu_idx];
++}
++EXPORT_SYMBOL(cxgb4_best_aligned_mtu);
++
+ /**
+  *	cxgb4_port_chan - get the HW channel of a port
+  *	@dev: the net device for the port
+@@ -5572,13 +5643,41 @@ static int adap_init0(struct adapter *adap)
+ #undef FW_PARAM_PFVF
+ #undef FW_PARAM_DEV
+ 
+-	/*
+-	 * These are finalized by FW initialization, load their values now.
++	/* The MTU/MSS Table is initialized by now, so load their values.  If
++	 * we're initializing the adapter, then we'll make any modifications
++	 * we want to the MTU/MSS Table and also initialize the congestion
++	 * parameters.
+ 	 */
+ 	t4_read_mtu_tbl(adap, adap->params.mtus, NULL);
+-	t4_load_mtus(adap, adap->params.mtus, adap->params.a_wnd,
+-		     adap->params.b_wnd);
++	if (state != DEV_STATE_INIT) {
++		int i;
++
++		/* The default MTU Table contains values 1492 and 1500.
++		 * However, for TCP, it's better to have two values which are
++		 * a multiple of 8 +/- 4 bytes apart near this popular MTU.
++		 * This allows us to have a TCP Data Payload which is a
++		 * multiple of 8 regardless of what combination of TCP Options
++		 * are in use (always a multiple of 4 bytes) which is
++		 * important for performance reasons.  For instance, if no
++		 * options are in use, then we have a 20-byte IP header and a
++		 * 20-byte TCP header.  In this case, a 1500-byte MSS would
++		 * result in a TCP Data Payload of 1500 - 40 == 1460 bytes
++		 * which is not a multiple of 8.  So using an MSS of 1488 in
++		 * this case results in a TCP Data Payload of 1448 bytes which
++		 * is a multiple of 8.  On the other hand, if 12-byte TCP Time
++		 * Stamps have been negotiated, then an MTU of 1500 bytes
++		 * results in a TCP Data Payload of 1448 bytes which, as
++		 * above, is a multiple of 8 bytes ...
++		 */
++		for (i = 0; i < NMTUS; i++)
++			if (adap->params.mtus[i] == 1492) {
++				adap->params.mtus[i] = 1488;
++				break;
++			}
+ 
++		t4_load_mtus(adap, adap->params.mtus, adap->params.a_wnd,
++			     adap->params.b_wnd);
++	}
+ 	t4_init_tp_params(adap);
+ 	adap->flags |= FW_OK;
+ 	return 0;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index 87af314518a4..55e9daf7f9d4 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@ -276,6 +276,11 @@ unsigned int cxgb4_port_viid(const struct net_device *dev);
+ unsigned int cxgb4_port_idx(const struct net_device *dev);
+ unsigned int cxgb4_best_mtu(const unsigned short *mtus, unsigned short mtu,
+ 			    unsigned int *idx);
++unsigned int cxgb4_best_aligned_mtu(const unsigned short *mtus,
++				    unsigned short header_size,
++				    unsigned short data_size_max,
++				    unsigned short data_size_align,
++				    unsigned int *mtu_idxp);
+ void cxgb4_get_tcp_stats(struct pci_dev *pdev, struct tp_tcp_stats *v4,
+ 			 struct tp_tcp_stats *v6);
+ void cxgb4_iscsi_init(struct net_device *dev, unsigned int tag_mask,
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+index f2738c710789..a4d7bdb20866 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+@@ -278,6 +278,15 @@ struct cpl_pass_accept_rpl {
+ 	__be64 opt0;
+ };
+ 
++struct cpl_t5_pass_accept_rpl {
++	WR_HDR;
++	union opcode_tid ot;
++	__be32 opt2;
++	__be64 opt0;
++	__be32 iss;
++	__be32 rsvd;
++};
++
+ struct cpl_act_open_req {
+ 	WR_HDR;
+ 	union opcode_tid ot;
