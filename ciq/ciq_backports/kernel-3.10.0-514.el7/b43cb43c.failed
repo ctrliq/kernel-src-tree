@@ -1,0 +1,156 @@
+watchdog: implement error handling in update_watchdog_all_cpus() and callers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ulrich Obergfell <uobergfe@redhat.com>
+commit b43cb43cb85b91d79d9f0719ff581e8cb6dfbb8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b43cb43c.failed
+
+update_watchdog_all_cpus() now passes errors from watchdog_park_threads()
+up to functions in the call chain.  This allows watchdog_enable_all_cpus()
+and proc_watchdog_update() to handle such errors too.
+
+	Signed-off-by: Ulrich Obergfell <uobergfe@redhat.com>
+	Reviewed-by: Aaron Tomlin <atomlin@redhat.com>
+	Acked-by: Don Zickus <dzickus@redhat.com>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b43cb43cb85b91d79d9f0719ff581e8cb6dfbb8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/watchdog.c
+diff --cc kernel/watchdog.c
+index 38d892b5a511,704f93317666..000000000000
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@@ -713,49 -687,64 +713,63 @@@ static void watchdog_unpark_threads(voi
+  	put_online_cpus();
+  }
+  
+ -/*
+ - * Suspend the hard and soft lockup detector by parking the watchdog threads.
+ - */
+ -int lockup_detector_suspend(void)
+ +static void restart_watchdog_hrtimer(void *info)
+  {
+ -	int ret = 0;
+ +	struct hrtimer *hrtimer = &__raw_get_cpu_var(watchdog_hrtimer);
+ +	int ret;
+  
+ -	mutex_lock(&watchdog_proc_mutex);
+  	/*
+ -	 * Multiple suspend requests can be active in parallel (counted by
+ -	 * the 'watchdog_suspended' variable). If the watchdog threads are
+ -	 * running, the first caller takes care that they will be parked.
+ -	 * The state of 'watchdog_running' cannot change while a suspend
+ -	 * request is active (see related code in 'proc' handlers).
+ +	 * No need to cancel and restart hrtimer if it is currently executing
+ +	 * because it will reprogram itself with the new period now.
+ +	 * We should never see it unqueued here because we are running per-cpu
+ +	 * with interrupts disabled.
+  	 */
+ -	if (watchdog_running && !watchdog_suspended)
+ -		ret = watchdog_park_threads();
+ -
+ -	if (ret == 0)
+ -		watchdog_suspended++;
+ -
+ -	mutex_unlock(&watchdog_proc_mutex);
+ -
+ -	return ret;
+ +	ret = hrtimer_try_to_cancel(hrtimer);
+ +	if (ret == 1)
+ +		hrtimer_start(hrtimer, ns_to_ktime(sample_period),
+ +				HRTIMER_MODE_REL_PINNED);
+  }
+  
+ -/*
+ - * Resume the hard and soft lockup detector by unparking the watchdog threads.
+ - */
+ -void lockup_detector_resume(void)
+ +static void update_timers(int cpu)
+  {
+ -	mutex_lock(&watchdog_proc_mutex);
+ -
+ -	watchdog_suspended--;
+  	/*
+ -	 * The watchdog threads are unparked if they were previously running
+ -	 * and if there is no more active suspend request.
+ +	 * Make sure that perf event counter will adopt to a new
+ +	 * sampling period. Updating the sampling period directly would
+ +	 * be much nicer but we do not have an API for that now so
+ +	 * let's use a big hammer.
+ +	 * Hrtimer will adopt the new period on the next tick but this
+ +	 * might be late already so we have to restart the timer as well.
+  	 */
+ -	if (watchdog_running && !watchdog_suspended)
+ -		watchdog_unpark_threads();
+ -
+ -	mutex_unlock(&watchdog_proc_mutex);
+ +	watchdog_nmi_disable(cpu);
+ +	smp_call_function_single(cpu, restart_watchdog_hrtimer, NULL, 1);
+ +	watchdog_nmi_enable(cpu);
+  }
+  
+++<<<<<<< HEAD
+ +static void update_timers_all_cpus(void)
+ +{
+ +	int cpu;
+ +
+ +	get_online_cpus();
+ +	for_each_online_cpu(cpu)
+ +		update_timers(cpu);
+ +	put_online_cpus();
+++=======
++ static int update_watchdog_all_cpus(void)
++ {
++ 	int ret;
++ 
++ 	ret = watchdog_park_threads();
++ 	if (ret)
++ 		return ret;
++ 
++ 	watchdog_unpark_threads();
++ 
++ 	return 0;
+++>>>>>>> b43cb43cb85b (watchdog: implement error handling in update_watchdog_all_cpus() and callers)
+  }
+  
+ -static int watchdog_enable_all_cpus(void)
+ +static int watchdog_enable_all_cpus(bool sample_period_changed)
+  {
+  	int err = 0;
+  
+@@@ -765,10 -755,22 +779,27 @@@
+  			pr_err("Failed to create watchdog threads, disabled\n");
+  		else
+  			watchdog_running = 1;
+++<<<<<<< HEAD
+ +	} else if (sample_period_changed) {
+ +		update_timers_all_cpus();
+++=======
++ 	} else {
++ 		/*
++ 		 * Enable/disable the lockup detectors or
++ 		 * change the sample period 'on the fly'.
++ 		 */
++ 		err = update_watchdog_all_cpus();
++ 
++ 		if (err) {
++ 			watchdog_disable_all_cpus();
++ 			pr_err("Failed to update lockup detectors, disabled\n");
++ 		}
+++>>>>>>> b43cb43cb85b (watchdog: implement error handling in update_watchdog_all_cpus() and callers)
+  	}
+  
++ 	if (err)
++ 		watchdog_enabled = 0;
++ 
+  	return err;
+  }
+  
+* Unmerged path kernel/watchdog.c
