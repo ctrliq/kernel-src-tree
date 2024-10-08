@@ -1,0 +1,331 @@
+dm stats: add support for request-based DM devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] dm-stats: add support for request-based DM devices (Mike Snitzer) [1254801]
+Rebuild_FUZZ: 98.00%
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit e262f34741522e0d821642e5449c6eeb512723fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e262f347.failed
+
+This makes it possible to use dm stats with DM multipath.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit e262f34741522e0d821642e5449c6eeb512723fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index f0d4f8bb8d41,90dc49e3c78f..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -977,57 -993,22 +980,68 @@@ static void clone_endio(struct bio *bio
+  	dec_pending(io, error);
+  }
+  
+ -static struct dm_rq_target_io *tio_from_request(struct request *rq)
+ +/*
+ + * Partial completion handling for request-based dm
+ + */
+ +static void end_clone_bio(struct bio *clone, int error)
+  {
+ -	return (rq->q->mq_ops ? blk_mq_rq_to_pdu(rq) : rq->special);
+ +	struct dm_rq_clone_bio_info *info =
+ +		container_of(clone, struct dm_rq_clone_bio_info, clone);
+ +	struct dm_rq_target_io *tio = info->tio;
+ +	struct bio *bio = info->orig;
+ +	unsigned int nr_bytes = info->orig->bi_size;
+ +
+ +	bio_put(clone);
+ +
+ +	if (tio->error)
+ +		/*
+ +		 * An error has already been detected on the request.
+ +		 * Once error occurred, just let clone->end_io() handle
+ +		 * the remainder.
+ +		 */
+ +		return;
+ +	else if (error) {
+ +		/*
+ +		 * Don't notice the error to the upper layer yet.
+ +		 * The error handling decision is made by the target driver,
+ +		 * when the request is completed.
+ +		 */
+ +		tio->error = error;
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * I/O for the bio successfully completed.
+ +	 * Notice the data completion to the upper layer.
+ +	 */
+ +
+ +	/*
+ +	 * bios are processed from the head of the list.
+ +	 * So the completing bio should always be rq->bio.
+ +	 * If it's not, something wrong is happening.
+ +	 */
+ +	if (tio->orig->bio != bio)
+ +		DMERR("bio completion is going in the middle of the request");
+ +
+ +	/*
+ +	 * Update the original request.
+ +	 * Do not use blk_end_request() here, because it may complete
+ +	 * the original request before the clone, and break the ordering.
+ +	 */
+ +	blk_update_request(tio->orig, 0, nr_bytes);
+  }
+  
++ static void rq_end_stats(struct mapped_device *md, struct request *orig)
++ {
++ 	if (unlikely(dm_stats_used(&md->stats))) {
++ 		struct dm_rq_target_io *tio = tio_from_request(orig);
++ 		tio->duration_jiffies = jiffies - tio->duration_jiffies;
++ 		dm_stats_account_io(&md->stats, orig->cmd_flags, blk_rq_pos(orig),
++ 				    tio->n_sectors, true, tio->duration_jiffies,
++ 				    &tio->stats_aux);
++ 	}
++ }
++ 
+  /*
+   * Don't touch any member of the md after calling this function because
+   * the md may be freed in dm_put() at the end of this function.
+@@@ -1100,7 -1092,11 +1114,15 @@@ static void dm_end_request(struct reque
+  	}
+  
+  	free_rq_clone(clone);
+++<<<<<<< HEAD
+ +	blk_end_request_all(rq, error);
+++=======
++ 	rq_end_stats(md, rq);
++ 	if (!rq->q->mq_ops)
++ 		blk_end_request_all(rq, error);
++ 	else
++ 		blk_mq_end_request(rq, error);
+++>>>>>>> e262f3474152 (dm stats: add support for request-based DM devices)
+  	rq_completed(md, rw, true);
+  }
+  
+@@@ -1126,11 -1122,26 +1148,21 @@@ static void dm_requeue_unmapped_origina
+  	struct request_queue *q = rq->q;
+  	unsigned long flags;
+  
+ +	dm_unprep_request(rq);
+ +
+++<<<<<<< HEAD
+  	spin_lock_irqsave(q->queue_lock, flags);
+  	blk_requeue_request(q, rq);
+ -	blk_run_queue_async(q);
+  	spin_unlock_irqrestore(q->queue_lock, flags);
+ -}
+ -
+ -static void dm_requeue_original_request(struct mapped_device *md,
+ -					struct request *rq)
+ -{
+ -	int rw = rq_data_dir(rq);
+ -
+ -	dm_unprep_request(rq);
+ -
+++=======
++ 	rq_end_stats(md, rq);
++ 	if (!rq->q->mq_ops)
++ 		old_requeue_request(rq);
++ 	else {
++ 		blk_mq_requeue_request(rq);
++ 		blk_mq_kick_requeue_list(rq->q);
++ 	}
+++>>>>>>> e262f3474152 (dm stats: add support for request-based DM devices)
+  
+  	rq_completed(md, rw, false);
+  }
+@@@ -1209,13 -1222,21 +1241,26 @@@ static void dm_done(struct request *clo
+  static void dm_softirq_done(struct request *rq)
+  {
+  	bool mapped = true;
+ -	struct dm_rq_target_io *tio = tio_from_request(rq);
+ +	struct dm_rq_target_io *tio = rq->special;
+  	struct request *clone = tio->clone;
+ -	int rw;
+  
+  	if (!clone) {
+++<<<<<<< HEAD
+ +		blk_end_request_all(rq, tio->error);
+ +		rq_completed(tio->md, rq_data_dir(rq), false);
+ +		free_rq_tio(tio);
+++=======
++ 		rq_end_stats(tio->md, rq);
++ 		rw = rq_data_dir(rq);
++ 		if (!rq->q->mq_ops) {
++ 			blk_end_request_all(rq, tio->error);
++ 			rq_completed(tio->md, rw, false);
++ 			free_rq_tio(tio);
++ 		} else {
++ 			blk_mq_end_request(rq, tio->error);
++ 			rq_completed(tio->md, rw, false);
++ 		}
+++>>>>>>> e262f3474152 (dm stats: add support for request-based DM devices)
+  		return;
+  	}
+  
+@@@ -2703,7 -2642,136 +2756,140 @@@ static int dm_init_request_based_queue(
+  
+  	elv_register_queue(md->queue);
+  
+++<<<<<<< HEAD
+ +	return 1;
+++=======
++ 	return 0;
++ }
++ 
++ static int dm_mq_init_request(void *data, struct request *rq,
++ 			      unsigned int hctx_idx, unsigned int request_idx,
++ 			      unsigned int numa_node)
++ {
++ 	struct mapped_device *md = data;
++ 	struct dm_rq_target_io *tio = blk_mq_rq_to_pdu(rq);
++ 
++ 	/*
++ 	 * Must initialize md member of tio, otherwise it won't
++ 	 * be available in dm_mq_queue_rq.
++ 	 */
++ 	tio->md = md;
++ 
++ 	return 0;
++ }
++ 
++ static int dm_mq_queue_rq(struct blk_mq_hw_ctx *hctx,
++ 			  const struct blk_mq_queue_data *bd)
++ {
++ 	struct request *rq = bd->rq;
++ 	struct dm_rq_target_io *tio = blk_mq_rq_to_pdu(rq);
++ 	struct mapped_device *md = tio->md;
++ 	int srcu_idx;
++ 	struct dm_table *map = dm_get_live_table(md, &srcu_idx);
++ 	struct dm_target *ti;
++ 	sector_t pos;
++ 
++ 	/* always use block 0 to find the target for flushes for now */
++ 	pos = 0;
++ 	if (!(rq->cmd_flags & REQ_FLUSH))
++ 		pos = blk_rq_pos(rq);
++ 
++ 	ti = dm_table_find_target(map, pos);
++ 	if (!dm_target_is_valid(ti)) {
++ 		dm_put_live_table(md, srcu_idx);
++ 		DMERR_LIMIT("request attempted access beyond the end of device");
++ 		/*
++ 		 * Must perform setup, that rq_completed() requires,
++ 		 * before returning BLK_MQ_RQ_QUEUE_ERROR
++ 		 */
++ 		dm_start_request(md, rq);
++ 		return BLK_MQ_RQ_QUEUE_ERROR;
++ 	}
++ 	dm_put_live_table(md, srcu_idx);
++ 
++ 	if (ti->type->busy && ti->type->busy(ti))
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 
++ 	dm_start_request(md, rq);
++ 
++ 	/* Init tio using md established in .init_request */
++ 	init_tio(tio, rq, md);
++ 
++ 	/*
++ 	 * Establish tio->ti before queuing work (map_tio_request)
++ 	 * or making direct call to map_request().
++ 	 */
++ 	tio->ti = ti;
++ 
++ 	/* Clone the request if underlying devices aren't blk-mq */
++ 	if (dm_table_get_type(map) == DM_TYPE_REQUEST_BASED) {
++ 		/* clone request is allocated at the end of the pdu */
++ 		tio->clone = (void *)blk_mq_rq_to_pdu(rq) + sizeof(struct dm_rq_target_io);
++ 		(void) clone_rq(rq, md, tio, GFP_ATOMIC);
++ 		queue_kthread_work(&md->kworker, &tio->work);
++ 	} else {
++ 		/* Direct call is fine since .queue_rq allows allocations */
++ 		if (map_request(tio, rq, md) == DM_MAPIO_REQUEUE) {
++ 			/* Undo dm_start_request() before requeuing */
++ 			rq_end_stats(md, rq);
++ 			rq_completed(md, rq_data_dir(rq), false);
++ 			return BLK_MQ_RQ_QUEUE_BUSY;
++ 		}
++ 	}
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ }
++ 
++ static struct blk_mq_ops dm_mq_ops = {
++ 	.queue_rq = dm_mq_queue_rq,
++ 	.map_queue = blk_mq_map_queue,
++ 	.complete = dm_softirq_done,
++ 	.init_request = dm_mq_init_request,
++ };
++ 
++ static int dm_init_request_based_blk_mq_queue(struct mapped_device *md)
++ {
++ 	unsigned md_type = dm_get_md_type(md);
++ 	struct request_queue *q;
++ 	int err;
++ 
++ 	memset(&md->tag_set, 0, sizeof(md->tag_set));
++ 	md->tag_set.ops = &dm_mq_ops;
++ 	md->tag_set.queue_depth = BLKDEV_MAX_RQ;
++ 	md->tag_set.numa_node = NUMA_NO_NODE;
++ 	md->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
++ 	md->tag_set.nr_hw_queues = 1;
++ 	if (md_type == DM_TYPE_REQUEST_BASED) {
++ 		/* make the memory for non-blk-mq clone part of the pdu */
++ 		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io) + sizeof(struct request);
++ 	} else
++ 		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io);
++ 	md->tag_set.driver_data = md;
++ 
++ 	err = blk_mq_alloc_tag_set(&md->tag_set);
++ 	if (err)
++ 		return err;
++ 
++ 	q = blk_mq_init_allocated_queue(&md->tag_set, md->queue);
++ 	if (IS_ERR(q)) {
++ 		err = PTR_ERR(q);
++ 		goto out_tag_set;
++ 	}
++ 	md->queue = q;
++ 	dm_init_md_queue(md);
++ 
++ 	/* backfill 'mq' sysfs registration normally done in blk_register_queue */
++ 	blk_mq_register_disk(md->disk);
++ 
++ 	if (md_type == DM_TYPE_REQUEST_BASED)
++ 		init_rq_based_worker_thread(md);
++ 
++ 	return 0;
++ 
++ out_tag_set:
++ 	blk_mq_free_tag_set(&md->tag_set);
++ 	return err;
+++>>>>>>> e262f3474152 (dm stats: add support for request-based DM devices)
+  }
+  
+  /*
+diff --git a/drivers/md/dm-stats.c b/drivers/md/dm-stats.c
+index 14e63b507c94..4961375b97f2 100644
+--- a/drivers/md/dm-stats.c
++++ b/drivers/md/dm-stats.c
+@@ -1155,11 +1155,6 @@ int dm_stats_message(struct mapped_device *md, unsigned argc, char **argv,
+ {
+ 	int r;
+ 
+-	if (dm_request_based(md)) {
+-		DMWARN("Statistics are only supported for bio-based devices");
+-		return -EOPNOTSUPP;
+-	}
+-
+ 	/* All messages here must start with '@' */
+ 	if (!strcasecmp(argv[0], "@stats_create"))
+ 		r = message_stats_create(md, argc, argv, result, maxlen);
+* Unmerged path drivers/md/dm.c
