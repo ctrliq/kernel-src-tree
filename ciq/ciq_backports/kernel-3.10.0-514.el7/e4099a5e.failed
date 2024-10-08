@@ -1,0 +1,162 @@
+sched/deadline: Fix up the smp-affinity mask tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit e4099a5e929435cd6349343f002583f29868c900
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e4099a5e.failed
+
+For now deadline tasks are not allowed to set smp affinity; however
+the current tests are wrong, cure this.
+
+The test in __sched_setscheduler() also uses an on-stack cpumask_t
+which is a no-no.
+
+Change both tests to use cpumask_subset() such that we test the root
+domain span to be a subset of the cpus_allowed mask. This way we're
+sure the tasks can always run on all CPUs they can be balanced over,
+and have no effective affinity constraints.
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/n/tip-fyqtb1lapxca3lhsxv9cumdc@git.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e4099a5e929435cd6349343f002583f29868c900)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index f167fdc57a94,27c6375d182a..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4233,8 -3380,24 +4233,28 @@@ recheck
+  			task_rq_unlock(rq, p, &flags);
+  			return -EPERM;
+  		}
+++<<<<<<< HEAD
+++=======
++ #endif
++ #ifdef CONFIG_SMP
++ 		if (dl_bandwidth_enabled() && dl_policy(policy)) {
++ 			cpumask_t *span = rq->rd->span;
++ 
++ 			/*
++ 			 * Don't allow tasks with an affinity mask smaller than
++ 			 * the entire root_domain to become SCHED_DEADLINE. We
++ 			 * will also fail if there's no bandwidth available.
++ 			 */
++ 			if (!cpumask_subset(span, &p->cpus_allowed) ||
++ 			    rq->rd->dl_bw.bw == 0) {
++ 				task_rq_unlock(rq, p, &flags);
++ 				return -EPERM;
++ 			}
++ 		}
++ #endif
+++>>>>>>> e4099a5e9294 (sched/deadline: Fix up the smp-affinity mask tests)
+  	}
+ +#endif
+  
+  	/* recheck policy now with rq lock held */
+  	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
+@@@ -4242,6 -3405,17 +4262,20 @@@
+  		task_rq_unlock(rq, p, &flags);
+  		goto recheck;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * If setscheduling to SCHED_DEADLINE (or changing the parameters
++ 	 * of a SCHED_DEADLINE task) we need to check if enough bandwidth
++ 	 * is available.
++ 	 */
++ 	if ((dl_policy(policy) || dl_task(p)) && dl_overflow(p, policy, attr)) {
++ 		task_rq_unlock(rq, p, &flags);
++ 		return -EBUSY;
++ 	}
++ 
+++>>>>>>> e4099a5e9294 (sched/deadline: Fix up the smp-affinity mask tests)
+  	on_rq = p->on_rq;
+  	running = task_current(rq, p);
+  	if (on_rq)
+@@@ -4470,8 -3850,26 +4504,31 @@@ long sched_setaffinity(pid_t pid, cons
+  	if (retval)
+  		goto out_unlock;
+  
+++<<<<<<< HEAD
+++	cpuset_cpus_allowed(p, cpus_allowed);
+++	cpumask_and(new_mask, in_mask, cpus_allowed);
+++=======
++ 
+  	cpuset_cpus_allowed(p, cpus_allowed);
+  	cpumask_and(new_mask, in_mask, cpus_allowed);
++ 
++ 	/*
++ 	 * Since bandwidth control happens on root_domain basis,
++ 	 * if admission test is enabled, we only admit -deadline
++ 	 * tasks allowed to run on all the CPUs in the task's
++ 	 * root_domain.
++ 	 */
++ #ifdef CONFIG_SMP
++ 	if (task_has_dl_policy(p)) {
++ 		const struct cpumask *span = task_rq(p)->rd->span;
++ 
++ 		if (dl_bandwidth_enabled() && !cpumask_subset(span, new_mask)) {
++ 			retval = -EBUSY;
++ 			goto out_unlock;
++ 		}
++ 	}
++ #endif
+++>>>>>>> e4099a5e9294 (sched/deadline: Fix up the smp-affinity mask tests)
+  again:
+  	retval = set_cpus_allowed_ptr(p, new_mask);
+  
+@@@ -5126,6 -4522,42 +5183,45 @@@ out
+  EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * When dealing with a -deadline task, we have to check if moving it to
++  * a new CPU is possible or not. In fact, this is only true iff there
++  * is enough bandwidth available on such CPU, otherwise we want the
++  * whole migration procedure to fail over.
++  */
++ static inline
++ bool set_task_cpu_dl(struct task_struct *p, unsigned int cpu)
++ {
++ 	struct dl_bw *dl_b = dl_bw_of(task_cpu(p));
++ 	struct dl_bw *cpu_b = dl_bw_of(cpu);
++ 	int ret = 1;
++ 	u64 bw;
++ 
++ 	if (dl_b == cpu_b)
++ 		return 1;
++ 
++ 	raw_spin_lock(&dl_b->lock);
++ 	raw_spin_lock(&cpu_b->lock);
++ 
++ 	bw = cpu_b->bw * cpumask_weight(cpu_rq(cpu)->rd->span);
++ 	if (dl_bandwidth_enabled() &&
++ 	    bw < cpu_b->total_bw + p->dl.dl_bw) {
++ 		ret = 0;
++ 		goto unlock;
++ 	}
++ 	dl_b->total_bw -= p->dl.dl_bw;
++ 	cpu_b->total_bw += p->dl.dl_bw;
++ 
++ unlock:
++ 	raw_spin_unlock(&cpu_b->lock);
++ 	raw_spin_unlock(&dl_b->lock);
++ 
++ 	return ret;
++ }
++ 
++ /*
+++>>>>>>> e4099a5e9294 (sched/deadline: Fix up the smp-affinity mask tests)
+   * Move (not current) task off this cpu, onto dest cpu. We're doing
+   * this because either it can't run here any more (set_cpus_allowed()
+   * away from this CPU, or CPU going down), or because we're
+* Unmerged path kernel/sched/core.c
