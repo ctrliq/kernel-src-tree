@@ -611,6 +611,7 @@ static unsigned int refill_fl(struct adapter *adap, struct sge_fl *q, int n,
 				       PCI_DMA_FROMDEVICE);
 		if (unlikely(dma_mapping_error(adap->pdev_dev, mapping))) {
 			__free_pages(pg, s->fl_pg_order);
+			q->mapping_err++;
 			goto out;   /* do not try small pages for this error */
 		}
 		mapping |= RX_LARGE_PG_BUF;
@@ -640,6 +641,7 @@ alloc_small_pages:
 				       PCI_DMA_FROMDEVICE);
 		if (unlikely(dma_mapping_error(adap->pdev_dev, mapping))) {
 			put_page(pg);
+			q->mapping_err++;
 			goto out;
 		}
 		*d++ = cpu_to_be64(mapping);
@@ -661,6 +663,7 @@ out:	cred = q->avail - cred;
 
 	if (unlikely(fl_starving(adap, q))) {
 		smp_wmb();
+		q->low++;
 		set_bit(q->cntxt_id - adap->sge.egr_start,
 			adap->sge.starving_fl);
 	}
