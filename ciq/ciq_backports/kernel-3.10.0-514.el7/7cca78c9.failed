@@ -1,0 +1,189 @@
+libceph: replace ceph_monc_request_next_osdmap()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 7cca78c9dcd1afa243e46edc31896730df85d2b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7cca78c9.failed
+
+... with a wrapper around maybe_request_map() - no need for two
+osdmap-specific functions.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 7cca78c9dcd1afa243e46edc31896730df85d2b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/mon_client.c
+diff --cc net/ceph/mon_client.c
+index 46dc90a5f37f,72a910bf7819..000000000000
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@@ -257,41 -309,87 +257,49 @@@ bad
+  }
+  
+  /*
+ - * Register interest in a map
+ - *
+ - * @sub: one of CEPH_SUB_*
+ - * @epoch: X for "every map since X", or 0 for "just the latest"
+ + * Keep track of which maps we have
+   */
+ -static bool __ceph_monc_want_map(struct ceph_mon_client *monc, int sub,
+ -				 u32 epoch, bool continuous)
+ -{
+ -	__le64 start = cpu_to_le64(epoch);
+ -	u8 flags = !continuous ? CEPH_SUBSCRIBE_ONETIME : 0;
+ -
+ -	dout("%s %s epoch %u continuous %d\n", __func__, ceph_sub_str[sub],
+ -	     epoch, continuous);
+ -
+ -	if (monc->subs[sub].want &&
+ -	    monc->subs[sub].item.start == start &&
+ -	    monc->subs[sub].item.flags == flags)
+ -		return false;
+ -
+ -	monc->subs[sub].item.start = start;
+ -	monc->subs[sub].item.flags = flags;
+ -	monc->subs[sub].want = true;
+ -
+ -	return true;
+ -}
+ -
+ -bool ceph_monc_want_map(struct ceph_mon_client *monc, int sub, u32 epoch,
+ -			bool continuous)
+ +int ceph_monc_got_mdsmap(struct ceph_mon_client *monc, u32 got)
+  {
+ -	bool need_request;
+ -
+  	mutex_lock(&monc->mutex);
+ -	need_request = __ceph_monc_want_map(monc, sub, epoch, continuous);
+ +	monc->have_mdsmap = got;
+  	mutex_unlock(&monc->mutex);
+ -
+ -	return need_request;
+ -}
+ -EXPORT_SYMBOL(ceph_monc_want_map);
+ -
+ -/*
+ - * Keep track of which maps we have
+ - *
+ - * @sub: one of CEPH_SUB_*
+ - */
+ -static void __ceph_monc_got_map(struct ceph_mon_client *monc, int sub,
+ -				u32 epoch)
+ -{
+ -	dout("%s %s epoch %u\n", __func__, ceph_sub_str[sub], epoch);
+ -
+ -	if (monc->subs[sub].want) {
+ -		if (monc->subs[sub].item.flags & CEPH_SUBSCRIBE_ONETIME)
+ -			monc->subs[sub].want = false;
+ -		else
+ -			monc->subs[sub].item.start = cpu_to_le64(epoch + 1);
+ -	}
+ -
+ -	monc->subs[sub].have = epoch;
+ +	return 0;
+  }
+ +EXPORT_SYMBOL(ceph_monc_got_mdsmap);
+  
+ -void ceph_monc_got_map(struct ceph_mon_client *monc, int sub, u32 epoch)
+ +int ceph_monc_got_osdmap(struct ceph_mon_client *monc, u32 got)
+  {
+  	mutex_lock(&monc->mutex);
+ -	__ceph_monc_got_map(monc, sub, epoch);
+ +	monc->have_osdmap = got;
+ +	monc->want_next_osdmap = 0;
+  	mutex_unlock(&monc->mutex);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL(ceph_monc_got_map);
+  
+ -void ceph_monc_renew_subs(struct ceph_mon_client *monc)
+ +/*
+++<<<<<<< HEAD
+ + * Register interest in the next osdmap
+ + */
+ +void ceph_monc_request_next_osdmap(struct ceph_mon_client *monc)
+  {
+ +	dout("request_next_osdmap have %u\n", monc->have_osdmap);
+  	mutex_lock(&monc->mutex);
+ -	__send_subscribe(monc);
+ +	if (!monc->want_next_osdmap)
+ +		monc->want_next_osdmap = 1;
+ +	if (monc->want_next_osdmap < 2)
+ +		__send_subscribe(monc);
+  	mutex_unlock(&monc->mutex);
+  }
+ -EXPORT_SYMBOL(ceph_monc_renew_subs);
+ +EXPORT_SYMBOL(ceph_monc_request_next_osdmap);
+  
+ -/*
+++=======
++  * Wait for an osdmap with a given epoch.
++  *
++  * @epoch: epoch to wait for
++  * @timeout: in jiffies, 0 means "wait forever"
++  */
+++>>>>>>> 7cca78c9dcd1 (libceph: replace ceph_monc_request_next_osdmap())
+  int ceph_monc_wait_osdmap(struct ceph_mon_client *monc, u32 epoch,
+  			  unsigned long timeout)
+  {
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index fe1cb3b14b74..132f7a7aaa5a 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -5080,7 +5080,7 @@ again:
+ 			return ret;
+ 
+ 		if (rbdc->client->osdc.osdmap->epoch < newest_epoch) {
+-			ceph_monc_request_next_osdmap(&rbdc->client->monc);
++			ceph_osdc_maybe_request_map(&rbdc->client->osdc);
+ 			(void) ceph_monc_wait_osdmap(&rbdc->client->monc,
+ 						     newest_epoch, timeout);
+ 			goto again;
+diff --git a/include/linux/ceph/mon_client.h b/include/linux/ceph/mon_client.h
+index 604ce57921e7..a1c31a9b41bd 100644
+--- a/include/linux/ceph/mon_client.h
++++ b/include/linux/ceph/mon_client.h
+@@ -112,7 +112,6 @@ extern void ceph_monc_stop(struct ceph_mon_client *monc);
+ extern int ceph_monc_got_mdsmap(struct ceph_mon_client *monc, u32 have);
+ extern int ceph_monc_got_osdmap(struct ceph_mon_client *monc, u32 have);
+ 
+-extern void ceph_monc_request_next_osdmap(struct ceph_mon_client *monc);
+ extern int ceph_monc_wait_osdmap(struct ceph_mon_client *monc, u32 epoch,
+ 				 unsigned long timeout);
+ 
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index cc16ab3e4c14..ce2f4b259723 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -345,6 +345,7 @@ extern int ceph_osdc_wait_request(struct ceph_osd_client *osdc,
+ extern void ceph_osdc_sync(struct ceph_osd_client *osdc);
+ 
+ extern void ceph_osdc_flush_notifies(struct ceph_osd_client *osdc);
++void ceph_osdc_maybe_request_map(struct ceph_osd_client *osdc);
+ 
+ extern int ceph_osdc_readpages(struct ceph_osd_client *osdc,
+ 			       struct ceph_vino vino,
+* Unmerged path net/ceph/mon_client.c
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index b1bd089d52f0..94441b7511a3 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -2589,6 +2589,13 @@ void ceph_osdc_flush_notifies(struct ceph_osd_client *osdc)
+ }
+ EXPORT_SYMBOL(ceph_osdc_flush_notifies);
+ 
++void ceph_osdc_maybe_request_map(struct ceph_osd_client *osdc)
++{
++	down_read(&osdc->lock);
++	maybe_request_map(osdc);
++	up_read(&osdc->lock);
++}
++EXPORT_SYMBOL(ceph_osdc_maybe_request_map);
+ 
+ /*
+  * init, shutdown
