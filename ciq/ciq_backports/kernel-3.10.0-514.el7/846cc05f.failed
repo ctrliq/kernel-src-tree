@@ -1,0 +1,233 @@
+nvme: simplify resets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 846cc05f95d599801f296d8599e82686ebd395f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/846cc05f.failed
+
+Don't delete the controller from dev_list before queuing a reset, instead
+just check for it being reset in the polling kthread.  This allows to remove
+the dev_list_lock in various places, and in addition we can simply rely on
+checking the queue_work return value to see if we could reset a controller.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 846cc05f95d599801f296d8599e82686ebd395f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,febcef5ae0aa..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -79,11 -73,14 +79,14 @@@ static struct task_struct *nvme_thread
+  static struct workqueue_struct *nvme_workq;
+  static wait_queue_head_t nvme_kthread_wait;
+  
+ -struct nvme_dev;
+ -struct nvme_queue;
+ -struct nvme_iod;
+ +static struct class *nvme_class;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static void nvme_reset_failed_dev(struct work_struct *ws);
+++=======
+++>>>>>>> 846cc05f95d5 (nvme: simplify resets):drivers/nvme/host/pci.c
+  static int nvme_reset(struct nvme_dev *dev);
+ -static void nvme_process_cq(struct nvme_queue *nvmeq);
+ -static void nvme_unmap_data(struct nvme_dev *dev, struct nvme_iod *iod);
+ -static void nvme_dead_ctrl(struct nvme_dev *dev);
+ +static int nvme_process_cq(struct nvme_queue *nvmeq);
+  
+  struct async_cmd_info {
+  	struct kthread_work work;
+@@@ -1096,30 -1086,27 +1099,39 @@@ static void nvme_abort_req(struct reque
+  	struct nvme_cmd_info *abort_cmd;
+  	struct nvme_command cmd;
+  
+ -	/*
+ -	 * Schedule controller reset if the command was already aborted once
+ -	 * before and still hasn't been returned to the driver, or if this is
+ -	 * the admin queue.
+ -	 */
+  	if (!nvmeq->qid || cmd_rq->aborted) {
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +		unsigned long flags;
+ +
+ +		spin_lock_irqsave(&dev_list_lock, flags);
+ +		if (work_busy(&dev->reset_work))
+ +			goto out;
+ +		list_del_init(&dev->node);
+ +		dev_warn(&dev->pci_dev->dev,
+ +			"I/O %d QID %d timeout, reset controller\n",
+ +							req->tag, nvmeq->qid);
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +		queue_work(nvme_workq, &dev->reset_work);
+ + out:
+ +		spin_unlock_irqrestore(&dev_list_lock, flags);
+ +		return;
+++=======
++ 		if (queue_work(nvme_workq, &dev->reset_work)) {
++ 			dev_warn(dev->dev,
++ 				 "I/O %d QID %d timeout, reset controller\n",
++ 				 req->tag, nvmeq->qid);
++ 		}
++ 		return BLK_EH_RESET_TIMER;
+++>>>>>>> 846cc05f95d5 (nvme: simplify resets):drivers/nvme/host/pci.c
+  	}
+  
+ -	if (!dev->ctrl.abort_limit)
+ -		return BLK_EH_RESET_TIMER;
+ +	if (!dev->abort_limit)
+ +		return;
+  
+ -	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE,
+ -			BLK_MQ_REQ_NOWAIT);
+ +	abort_req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC,
+ +									false);
+  	if (IS_ERR(abort_req))
+ -		return BLK_EH_RESET_TIMER;
+ +		return;
+  
+  	abort_cmd = blk_mq_rq_to_pdu(abort_req);
+  	nvme_set_info(abort_cmd, abort_req, abort_completion);
+@@@ -2069,19 -1491,21 +2081,33 @@@ static int nvme_kthread(void *data
+  		spin_lock(&dev_list_lock);
+  		list_for_each_entry_safe(dev, next, &dev_list, node) {
+  			int i;
+ -			u32 csts = readl(dev->bar + NVME_REG_CSTS);
+ +			u32 csts = readl(&dev->bar->csts);
+  
++ 			/*
++ 			 * Skip controllers currently under reset.
++ 			 */
++ 			if (work_pending(&dev->reset_work) || work_busy(&dev->reset_work))
++ 				continue;
++ 
+  			if ((dev->subsystem && (csts & NVME_CSTS_NSSRO)) ||
+  							csts & NVME_CSTS_CFS) {
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +				if (work_busy(&dev->reset_work))
+ +					continue;
+ +				list_del_init(&dev->node);
+ +				dev_warn(&dev->pci_dev->dev,
+ +					"Failed status: %x, reset controller\n",
+ +					readl(&dev->bar->csts));
+ +				PREPARE_WORK(&dev->reset_work,
+ +							nvme_reset_failed_dev);
+ +				queue_work(nvme_workq, &dev->reset_work);
+++=======
++ 				if (queue_work(nvme_workq, &dev->reset_work)) {
++ 					dev_warn(dev->dev,
++ 						"Failed status: %x, reset controller\n",
++ 						readl(dev->bar + NVME_REG_CSTS));
++ 				}
+++>>>>>>> 846cc05f95d5 (nvme: simplify resets):drivers/nvme/host/pci.c
+  				continue;
+  			}
+  			for (i = 0; i < dev->queue_count; i++) {
+@@@ -3055,52 -2231,58 +3081,58 @@@ static void nvme_dev_reset(struct nvme_
+  	schedule_work(&dev->probe_work);
+  }
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static void nvme_reset_failed_dev(struct work_struct *ws)
+ +{
+ +	struct nvme_dev *dev = container_of(ws, struct nvme_dev, reset_work);
+ +	nvme_dev_reset(dev);
+ +}
+ +
+ +static int nvme_reset(struct nvme_dev *dev)
+ +{
+ +	int ret = -EBUSY;
+ +
+ +	if (!dev->admin_q || blk_queue_dying(dev->admin_q))
+ +		return -ENODEV;
+ +
+ +	spin_lock(&dev_list_lock);
+ +	if (!work_pending(&dev->reset_work)) {
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +		queue_work(nvme_workq, &dev->reset_work);
+ +		ret = 0;
+ +	}
+ +	spin_unlock(&dev_list_lock);
+++=======
++ static int nvme_reset(struct nvme_dev *dev)
++ {
++ 	if (!dev->ctrl.admin_q || blk_queue_dying(dev->ctrl.admin_q))
++ 		return -ENODEV;
+  
+- 	if (!ret) {
+- 		flush_work(&dev->reset_work);
+- 		flush_work(&dev->probe_work);
+- 		return 0;
+- 	}
++ 	if (!queue_work(nvme_workq, &dev->reset_work))
++ 		return -EBUSY;
+++>>>>>>> 846cc05f95d5 (nvme: simplify resets):drivers/nvme/host/pci.c
+  
+- 	return ret;
++ 	flush_work(&dev->reset_work);
++ 	flush_work(&dev->probe_work);
++ 	return 0;
+  }
+  
+ -static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
+ +static ssize_t nvme_sysfs_reset(struct device *dev,
+ +				struct device_attribute *attr, const char *buf,
+ +				size_t count)
+  {
+ -	*val = readl(to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ -}
+ +	struct nvme_dev *ndev = dev_get_drvdata(dev);
+ +	int ret;
+  
+ -static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
+ -{
+ -	writel(val, to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ -}
+ +	ret = nvme_reset(ndev);
+ +	if (ret < 0)
+ +		return ret;
+  
+ -static int nvme_pci_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
+ -{
+ -	*val = readq(to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ +	return count;
+  }
+ +static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
+  
+ -static bool nvme_pci_io_incapable(struct nvme_ctrl *ctrl)
+ -{
+ -	struct nvme_dev *dev = to_nvme_dev(ctrl);
+ -
+ -	return !dev->bar || dev->online_queues < 2;
+ -}
+ -
+ -static int nvme_pci_reset_ctrl(struct nvme_ctrl *ctrl)
+ -{
+ -	return nvme_reset(to_nvme_dev(ctrl));
+ -}
+ -
+ -static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
+ -	.reg_read32		= nvme_pci_reg_read32,
+ -	.reg_write32		= nvme_pci_reg_write32,
+ -	.reg_read64		= nvme_pci_reg_read64,
+ -	.io_incapable		= nvme_pci_io_incapable,
+ -	.reset_ctrl		= nvme_pci_reset_ctrl,
+ -	.free_ctrl		= nvme_pci_free_ctrl,
+ -};
+ -
+ +static void nvme_async_probe(struct work_struct *work);
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+  	int node, result = -ENOMEM;
+* Unmerged path drivers/block/nvme-core.c
