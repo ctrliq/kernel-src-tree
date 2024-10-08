@@ -1,0 +1,248 @@
+mei: me: change power gating function name conventions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Usyskin <alexander.usyskin@intel.com>
+commit 2d1995fce3f9b9a0bdb88d47144509e3b84db0f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2d1995fc.failed
+
+The current power gating naming was confusing,
+we wish to swap meanings of register and flow level power gating terms,
+
+For registers writing level use terms set and unset:
+	mei_me_pg_set, mei_me_pg_unset
+
+For flow/high level use power gating enter and power gating exit terms
+	mei_me_pg_enter_sync, mei_me_pg_exit_sync
+
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 2d1995fce3f9b9a0bdb88d47144509e3b84db0f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/pci-me.c
+diff --cc drivers/misc/mei/pci-me.c
+index 1eebd0f6a9f0,72fb381a1245..000000000000
+--- a/drivers/misc/mei/pci-me.c
++++ b/drivers/misc/mei/pci-me.c
+@@@ -346,8 -355,114 +346,118 @@@ static int mei_me_pci_resume(struct dev
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ #endif /* CONFIG_PM_SLEEP */
++ 
++ #ifdef CONFIG_PM
++ static int mei_me_pm_runtime_idle(struct device *device)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(device);
++ 	struct mei_device *dev;
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime_idle\n");
++ 
++ 	dev = pci_get_drvdata(pdev);
++ 	if (!dev)
++ 		return -ENODEV;
++ 	if (mei_write_is_idle(dev))
++ 		pm_runtime_autosuspend(device);
++ 
++ 	return -EBUSY;
++ }
++ 
++ static int mei_me_pm_runtime_suspend(struct device *device)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(device);
++ 	struct mei_device *dev;
++ 	int ret;
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime suspend\n");
++ 
++ 	dev = pci_get_drvdata(pdev);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	mutex_lock(&dev->device_lock);
++ 
++ 	if (mei_write_is_idle(dev))
++ 		ret = mei_me_pg_enter_sync(dev);
++ 	else
++ 		ret = -EAGAIN;
++ 
++ 	mutex_unlock(&dev->device_lock);
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime suspend ret=%d\n", ret);
++ 
++ 	return ret;
++ }
++ 
++ static int mei_me_pm_runtime_resume(struct device *device)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(device);
++ 	struct mei_device *dev;
++ 	int ret;
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime resume\n");
++ 
++ 	dev = pci_get_drvdata(pdev);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	mutex_lock(&dev->device_lock);
++ 
++ 	ret = mei_me_pg_exit_sync(dev);
++ 
++ 	mutex_unlock(&dev->device_lock);
++ 
++ 	dev_dbg(&pdev->dev, "rpm: me: runtime resume ret = %d\n", ret);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * mei_me_set_pm_domain - fill and set pm domain structure for device
++  *
++  * @dev: mei_device
++  */
++ static inline void mei_me_set_pm_domain(struct mei_device *dev)
++ {
++ 	struct pci_dev *pdev  = to_pci_dev(dev->dev);
++ 
++ 	if (pdev->dev.bus && pdev->dev.bus->pm) {
++ 		dev->pg_domain.ops = *pdev->dev.bus->pm;
++ 
++ 		dev->pg_domain.ops.runtime_suspend = mei_me_pm_runtime_suspend;
++ 		dev->pg_domain.ops.runtime_resume = mei_me_pm_runtime_resume;
++ 		dev->pg_domain.ops.runtime_idle = mei_me_pm_runtime_idle;
++ 
++ 		pdev->dev.pm_domain = &dev->pg_domain;
++ 	}
++ }
++ 
++ /**
++  * mei_me_unset_pm_domain - clean pm domain structure for device
++  *
++  * @dev: mei_device
++  */
++ static inline void mei_me_unset_pm_domain(struct mei_device *dev)
++ {
++ 	/* stop using pm callbacks if any */
++ 	dev->dev->pm_domain = NULL;
++ }
++ 
++ static const struct dev_pm_ops mei_me_pm_ops = {
++ 	SET_SYSTEM_SLEEP_PM_OPS(mei_me_pci_suspend,
++ 				mei_me_pci_resume)
++ 	SET_RUNTIME_PM_OPS(
++ 		mei_me_pm_runtime_suspend,
++ 		mei_me_pm_runtime_resume,
++ 		mei_me_pm_runtime_idle)
++ };
+++>>>>>>> 2d1995fce3f9 (mei: me: change power gating function name conventions)
+  
+ +static SIMPLE_DEV_PM_OPS(mei_me_pm_ops, mei_me_pci_suspend, mei_me_pci_resume);
+  #define MEI_ME_PM_OPS	(&mei_me_pm_ops)
+  #else
+  #define MEI_ME_PM_OPS	NULL
+diff --git a/drivers/misc/mei/hw-me.c b/drivers/misc/mei/hw-me.c
+index 1707fa5ea02a..5a58c478f2b9 100644
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -469,11 +469,11 @@ static int mei_me_read_slots(struct mei_device *dev, unsigned char *buffer,
+ }
+ 
+ /**
+- * mei_me_pg_enter - write pg enter register
++ * mei_me_pg_set - write pg enter register
+  *
+  * @dev: the device structure
+  */
+-static void mei_me_pg_enter(struct mei_device *dev)
++static void mei_me_pg_set(struct mei_device *dev)
+ {
+ 	struct mei_me_hw *hw = to_me_hw(dev);
+ 	u32 reg = mei_me_reg_read(hw, H_HPG_CSR);
+@@ -482,11 +482,11 @@ static void mei_me_pg_enter(struct mei_device *dev)
+ }
+ 
+ /**
+- * mei_me_pg_exit - write pg exit register
++ * mei_me_pg_unset - write pg exit register
+  *
+  * @dev: the device structure
+  */
+-static void mei_me_pg_exit(struct mei_device *dev)
++static void mei_me_pg_unset(struct mei_device *dev)
+ {
+ 	struct mei_me_hw *hw = to_me_hw(dev);
+ 	u32 reg = mei_me_reg_read(hw, H_HPG_CSR);
+@@ -498,13 +498,13 @@ static void mei_me_pg_exit(struct mei_device *dev)
+ }
+ 
+ /**
+- * mei_me_pg_set_sync - perform pg entry procedure
++ * mei_me_pg_enter_sync - perform pg entry procedure
+  *
+  * @dev: the device structure
+  *
+  * returns 0 on success an error code otherwise
+  */
+-int mei_me_pg_set_sync(struct mei_device *dev)
++int mei_me_pg_enter_sync(struct mei_device *dev)
+ {
+ 	struct mei_me_hw *hw = to_me_hw(dev);
+ 	unsigned long timeout = mei_secs_to_jiffies(MEI_PGI_TIMEOUT);
+@@ -522,7 +522,7 @@ int mei_me_pg_set_sync(struct mei_device *dev)
+ 	mutex_lock(&dev->device_lock);
+ 
+ 	if (dev->pg_event == MEI_PG_EVENT_RECEIVED) {
+-		mei_me_pg_enter(dev);
++		mei_me_pg_set(dev);
+ 		ret = 0;
+ 	} else {
+ 		ret = -ETIME;
+@@ -535,13 +535,13 @@ int mei_me_pg_set_sync(struct mei_device *dev)
+ }
+ 
+ /**
+- * mei_me_pg_unset_sync - perform pg exit procedure
++ * mei_me_pg_exit_sync - perform pg exit procedure
+  *
+  * @dev: the device structure
+  *
+  * returns 0 on success an error code otherwise
+  */
+-int mei_me_pg_unset_sync(struct mei_device *dev)
++int mei_me_pg_exit_sync(struct mei_device *dev)
+ {
+ 	struct mei_me_hw *hw = to_me_hw(dev);
+ 	unsigned long timeout = mei_secs_to_jiffies(MEI_PGI_TIMEOUT);
+@@ -552,7 +552,7 @@ int mei_me_pg_unset_sync(struct mei_device *dev)
+ 
+ 	dev->pg_event = MEI_PG_EVENT_WAIT;
+ 
+-	mei_me_pg_exit(dev);
++	mei_me_pg_unset(dev);
+ 
+ 	mutex_unlock(&dev->device_lock);
+ 	wait_event_timeout(dev->wait_pg,
+diff --git a/drivers/misc/mei/hw-me.h b/drivers/misc/mei/hw-me.h
+index 98ceac2cee68..f652d2b033a8 100644
+--- a/drivers/misc/mei/hw-me.h
++++ b/drivers/misc/mei/hw-me.h
+@@ -45,8 +45,8 @@ extern const struct mei_cfg mei_me_lpt_cfg;
+ struct mei_device *mei_me_dev_init(struct pci_dev *pdev,
+ 				   const struct mei_cfg *cfg);
+ 
+-int mei_me_pg_set_sync(struct mei_device *dev);
+-int mei_me_pg_unset_sync(struct mei_device *dev);
++int mei_me_pg_enter_sync(struct mei_device *dev);
++int mei_me_pg_exit_sync(struct mei_device *dev);
+ 
+ irqreturn_t mei_me_irq_quick_handler(int irq, void *dev_id);
+ irqreturn_t mei_me_irq_thread_handler(int irq, void *dev_id);
+* Unmerged path drivers/misc/mei/pci-me.c
