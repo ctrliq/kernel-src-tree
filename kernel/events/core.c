@@ -1124,6 +1124,8 @@ retry:
 		if (!atomic_inc_not_zero(&ctx->refcount)) {
 			raw_spin_unlock(&ctx->lock);
 			ctx = NULL;
+		} else {
+			WARN_ON_ONCE(ctx->task != task);
 		}
 	}
 	rcu_read_unlock();
