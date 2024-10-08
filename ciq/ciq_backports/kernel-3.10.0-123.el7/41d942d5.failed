@@ -1,0 +1,685 @@
+net/mlx4_en: Datapath resources allocated dynamically
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [ethernet] mlx4: Datapath resources allocated dynamically (Amir Vadai) [1030563 1030565 1030568 1030570 1030571 1030573 1030575]
+Rebuild_FUZZ: 92.93%
+commit-author Eugenia Emantayev <eugenia@mellanox.com>
+commit 41d942d56cfd21058fba465804e14ba349541442
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/41d942d5.failed
+
+Currently all TX/RX rings and completion queues are part of the
+netdev priv structure and are allocated statically. This patch
+will change the priv to hold only arrays of pointers and therefore
+all TX/RX rings and completetion queues will be allocated
+dynamically. This is in preparation for NUMA aware allocations.
+
+	Signed-off-by: Yevgeny Petrilin <yevgenyp@mellanox.com>
+	Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+	Reviewed-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Signed-off-by: Amir Vadai <amirv@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 41d942d56cfd21058fba465804e14ba349541442)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index f0d04dcc8df1,0596f9f85a0e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@@ -269,12 -274,17 +269,22 @@@ static void mlx4_en_get_ethtool_stats(s
+  		}
+  	}
+  	for (i = 0; i < priv->tx_ring_num; i++) {
+- 		data[index++] = priv->tx_ring[i].packets;
+- 		data[index++] = priv->tx_ring[i].bytes;
++ 		data[index++] = priv->tx_ring[i]->packets;
++ 		data[index++] = priv->tx_ring[i]->bytes;
+  	}
+  	for (i = 0; i < priv->rx_ring_num; i++) {
+++<<<<<<< HEAD
+ +		data[index++] = priv->rx_ring[i].packets;
+ +		data[index++] = priv->rx_ring[i].bytes;
+++=======
++ 		data[index++] = priv->rx_ring[i]->packets;
++ 		data[index++] = priv->rx_ring[i]->bytes;
++ #ifdef CONFIG_NET_RX_BUSY_POLL
++ 		data[index++] = priv->rx_ring[i]->yields;
++ 		data[index++] = priv->rx_ring[i]->misses;
++ 		data[index++] = priv->rx_ring[i]->cleaned;
++ #endif
+++>>>>>>> 41d942d56cfd (net/mlx4_en: Datapath resources allocated dynamically)
+  	}
+  	spin_unlock_bh(&priv->stats_lock);
+  
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 39ca6f97fa10,f430788cc4fe..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -67,6 -68,34 +67,37 @@@ int mlx4_en_setup_tc(struct net_device 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_RX_BUSY_POLL
++ /* must be called with local_bh_disable()d */
++ static int mlx4_en_low_latency_recv(struct napi_struct *napi)
++ {
++ 	struct mlx4_en_cq *cq = container_of(napi, struct mlx4_en_cq, napi);
++ 	struct net_device *dev = cq->dev;
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	struct mlx4_en_rx_ring *rx_ring = priv->rx_ring[cq->ring];
++ 	int done;
++ 
++ 	if (!priv->port_up)
++ 		return LL_FLUSH_FAILED;
++ 
++ 	if (!mlx4_en_cq_lock_poll(cq))
++ 		return LL_FLUSH_BUSY;
++ 
++ 	done = mlx4_en_process_rx_cq(dev, cq, 4);
++ 	if (likely(done))
++ 		rx_ring->cleaned += done;
++ 	else
++ 		rx_ring->misses++;
++ 
++ 	mlx4_en_cq_unlock_poll(cq);
++ 
++ 	return done;
++ }
++ #endif	/* CONFIG_NET_RX_BUSY_POLL */
++ 
+++>>>>>>> 41d942d56cfd (net/mlx4_en: Datapath resources allocated dynamically)
+  #ifdef CONFIG_RFS_ACCEL
+  
+  struct mlx4_en_filter {
+@@@ -1472,8 -1500,10 +1502,8 @@@ int mlx4_en_start_port(struct net_devic
+  		return err;
+  	}
+  	for (i = 0; i < priv->rx_ring_num; i++) {
+- 		cq = &priv->rx_cq[i];
++ 		cq = priv->rx_cq[i];
+  
+ -		mlx4_en_cq_init_lock(cq);
+ -
+  		err = mlx4_en_activate_cq(priv, cq, i);
+  		if (err) {
+  			en_err(priv, "Failed activating Rx CQ\n");
+@@@ -1723,14 -1756,20 +1753,30 @@@ void mlx4_en_stop_port(struct net_devic
+  
+  	/* Free RX Rings */
+  	for (i = 0; i < priv->rx_ring_num; i++) {
+++<<<<<<< HEAD
+ +		mlx4_en_deactivate_rx_ring(priv, &priv->rx_ring[i]);
+ +		while (test_bit(NAPI_STATE_SCHED, &priv->rx_cq[i].napi.state))
+ +			msleep(1);
+ +		mlx4_en_deactivate_cq(priv, &priv->rx_cq[i]);
+++=======
++ 		struct mlx4_en_cq *cq = priv->rx_cq[i];
++ 
++ 		local_bh_disable();
++ 		while (!mlx4_en_cq_lock_napi(cq)) {
++ 			pr_info("CQ %d locked\n", i);
++ 			mdelay(1);
++ 		}
++ 		local_bh_enable();
++ 
++ 		while (test_bit(NAPI_STATE_SCHED, &cq->napi.state))
++ 			msleep(1);
++ 		mlx4_en_deactivate_rx_ring(priv, priv->rx_ring[i]);
++ 		mlx4_en_deactivate_cq(priv, cq);
+++>>>>>>> 41d942d56cfd (net/mlx4_en: Datapath resources allocated dynamically)
+  	}
+ +
+ +	/* close port*/
+ +	mlx4_CLOSE_PORT(mdev->dev, priv->port);
+  }
+  
+  static void mlx4_en_restart(struct work_struct *work)
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 49b90487ac48,b2547ae07dfa..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@@ -562,6 -580,115 +562,118 @@@ struct mlx4_mac_entry 
+  	struct rcu_head rcu;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_RX_BUSY_POLL
++ static inline void mlx4_en_cq_init_lock(struct mlx4_en_cq *cq)
++ {
++ 	spin_lock_init(&cq->poll_lock);
++ 	cq->state = MLX4_EN_CQ_STATE_IDLE;
++ }
++ 
++ /* called from the device poll rutine to get ownership of a cq */
++ static inline bool mlx4_en_cq_lock_napi(struct mlx4_en_cq *cq)
++ {
++ 	int rc = true;
++ 	spin_lock(&cq->poll_lock);
++ 	if (cq->state & MLX4_CQ_LOCKED) {
++ 		WARN_ON(cq->state & MLX4_EN_CQ_STATE_NAPI);
++ 		cq->state |= MLX4_EN_CQ_STATE_NAPI_YIELD;
++ 		rc = false;
++ 	} else
++ 		/* we don't care if someone yielded */
++ 		cq->state = MLX4_EN_CQ_STATE_NAPI;
++ 	spin_unlock(&cq->poll_lock);
++ 	return rc;
++ }
++ 
++ /* returns true is someone tried to get the cq while napi had it */
++ static inline bool mlx4_en_cq_unlock_napi(struct mlx4_en_cq *cq)
++ {
++ 	int rc = false;
++ 	spin_lock(&cq->poll_lock);
++ 	WARN_ON(cq->state & (MLX4_EN_CQ_STATE_POLL |
++ 			       MLX4_EN_CQ_STATE_NAPI_YIELD));
++ 
++ 	if (cq->state & MLX4_EN_CQ_STATE_POLL_YIELD)
++ 		rc = true;
++ 	cq->state = MLX4_EN_CQ_STATE_IDLE;
++ 	spin_unlock(&cq->poll_lock);
++ 	return rc;
++ }
++ 
++ /* called from mlx4_en_low_latency_poll() */
++ static inline bool mlx4_en_cq_lock_poll(struct mlx4_en_cq *cq)
++ {
++ 	int rc = true;
++ 	spin_lock_bh(&cq->poll_lock);
++ 	if ((cq->state & MLX4_CQ_LOCKED)) {
++ 		struct net_device *dev = cq->dev;
++ 		struct mlx4_en_priv *priv = netdev_priv(dev);
++ 		struct mlx4_en_rx_ring *rx_ring = priv->rx_ring[cq->ring];
++ 
++ 		cq->state |= MLX4_EN_CQ_STATE_POLL_YIELD;
++ 		rc = false;
++ 		rx_ring->yields++;
++ 	} else
++ 		/* preserve yield marks */
++ 		cq->state |= MLX4_EN_CQ_STATE_POLL;
++ 	spin_unlock_bh(&cq->poll_lock);
++ 	return rc;
++ }
++ 
++ /* returns true if someone tried to get the cq while it was locked */
++ static inline bool mlx4_en_cq_unlock_poll(struct mlx4_en_cq *cq)
++ {
++ 	int rc = false;
++ 	spin_lock_bh(&cq->poll_lock);
++ 	WARN_ON(cq->state & (MLX4_EN_CQ_STATE_NAPI));
++ 
++ 	if (cq->state & MLX4_EN_CQ_STATE_POLL_YIELD)
++ 		rc = true;
++ 	cq->state = MLX4_EN_CQ_STATE_IDLE;
++ 	spin_unlock_bh(&cq->poll_lock);
++ 	return rc;
++ }
++ 
++ /* true if a socket is polling, even if it did not get the lock */
++ static inline bool mlx4_en_cq_ll_polling(struct mlx4_en_cq *cq)
++ {
++ 	WARN_ON(!(cq->state & MLX4_CQ_LOCKED));
++ 	return cq->state & CQ_USER_PEND;
++ }
++ #else
++ static inline void mlx4_en_cq_init_lock(struct mlx4_en_cq *cq)
++ {
++ }
++ 
++ static inline bool mlx4_en_cq_lock_napi(struct mlx4_en_cq *cq)
++ {
++ 	return true;
++ }
++ 
++ static inline bool mlx4_en_cq_unlock_napi(struct mlx4_en_cq *cq)
++ {
++ 	return false;
++ }
++ 
++ static inline bool mlx4_en_cq_lock_poll(struct mlx4_en_cq *cq)
++ {
++ 	return false;
++ }
++ 
++ static inline bool mlx4_en_cq_unlock_poll(struct mlx4_en_cq *cq)
++ {
++ 	return false;
++ }
++ 
++ static inline bool mlx4_en_cq_ll_polling(struct mlx4_en_cq *cq)
++ {
++ 	return false;
++ }
++ #endif /* CONFIG_NET_RX_BUSY_POLL */
++ 
+++>>>>>>> 41d942d56cfd (net/mlx4_en: Datapath resources allocated dynamically)
+  #define MLX4_EN_WOL_DO_MODIFY (1ULL << 63)
+  
+  void mlx4_en_update_loopback_state(struct net_device *dev,
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_cq.c b/drivers/net/ethernet/mellanox/mlx4/en_cq.c
+index 1e6c594d6d04..d093731f769e 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_cq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_cq.c
+@@ -44,12 +44,19 @@ static void mlx4_en_cq_event(struct mlx4_cq *cq, enum mlx4_event event)
+ 
+ 
+ int mlx4_en_create_cq(struct mlx4_en_priv *priv,
+-		      struct mlx4_en_cq *cq,
++		      struct mlx4_en_cq **pcq,
+ 		      int entries, int ring, enum cq_type mode)
+ {
+ 	struct mlx4_en_dev *mdev = priv->mdev;
++	struct mlx4_en_cq *cq;
+ 	int err;
+ 
++	cq = kzalloc(sizeof(*cq), GFP_KERNEL);
++	if (!cq) {
++		en_err(priv, "Failed to allocate CQ structure\n");
++		return -ENOMEM;
++	}
++
+ 	cq->size = entries;
+ 	cq->buf_size = cq->size * mdev->dev->caps.cqe_size;
+ 
+@@ -60,14 +67,22 @@ int mlx4_en_create_cq(struct mlx4_en_priv *priv,
+ 	err = mlx4_alloc_hwq_res(mdev->dev, &cq->wqres,
+ 				cq->buf_size, 2 * PAGE_SIZE);
+ 	if (err)
+-		return err;
++		goto err_cq;
+ 
+ 	err = mlx4_en_map_buffer(&cq->wqres.buf);
+ 	if (err)
+-		mlx4_free_hwq_res(mdev->dev, &cq->wqres, cq->buf_size);
+-	else
+-		cq->buf = (struct mlx4_cqe *) cq->wqres.buf.direct.buf;
++		goto err_res;
++
++	cq->buf = (struct mlx4_cqe *)cq->wqres.buf.direct.buf;
++	*pcq = cq;
+ 
++	return 0;
++
++err_res:
++	mlx4_free_hwq_res(mdev->dev, &cq->wqres, cq->buf_size);
++err_cq:
++	kfree(cq);
++	*pcq = NULL;
+ 	return err;
+ }
+ 
+@@ -117,12 +132,12 @@ int mlx4_en_activate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq,
+ 		struct mlx4_en_cq *rx_cq;
+ 
+ 		cq_idx = cq_idx % priv->rx_ring_num;
+-		rx_cq = &priv->rx_cq[cq_idx];
++		rx_cq = priv->rx_cq[cq_idx];
+ 		cq->vector = rx_cq->vector;
+ 	}
+ 
+ 	if (!cq->is_tx)
+-		cq->size = priv->rx_ring[cq->ring].actual_size;
++		cq->size = priv->rx_ring[cq->ring]->actual_size;
+ 
+ 	if ((cq->is_tx && priv->hwtstamp_config.tx_type) ||
+ 	    (!cq->is_tx && priv->hwtstamp_config.rx_filter))
+@@ -145,9 +160,10 @@ int mlx4_en_activate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq,
+ 	return 0;
+ }
+ 
+-void mlx4_en_destroy_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq)
++void mlx4_en_destroy_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq **pcq)
+ {
+ 	struct mlx4_en_dev *mdev = priv->mdev;
++	struct mlx4_en_cq *cq = *pcq;
+ 
+ 	mlx4_en_unmap_buffer(&cq->wqres.buf);
+ 	mlx4_free_hwq_res(mdev->dev, &cq->wqres, cq->buf_size);
+@@ -156,6 +172,8 @@ void mlx4_en_destroy_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq)
+ 	cq->vector = 0;
+ 	cq->buf_size = 0;
+ 	cq->buf = NULL;
++	kfree(cq);
++	*pcq = NULL;
+ }
+ 
+ void mlx4_en_deactivate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq)
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_port.c b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+index 5f8535e408a3..dae1a1f4ae55 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+@@ -140,18 +140,18 @@ int mlx4_en_DUMP_ETH_STATS(struct mlx4_en_dev *mdev, u8 port, u8 reset)
+ 	priv->port_stats.rx_chksum_good = 0;
+ 	priv->port_stats.rx_chksum_none = 0;
+ 	for (i = 0; i < priv->rx_ring_num; i++) {
+-		stats->rx_packets += priv->rx_ring[i].packets;
+-		stats->rx_bytes += priv->rx_ring[i].bytes;
+-		priv->port_stats.rx_chksum_good += priv->rx_ring[i].csum_ok;
+-		priv->port_stats.rx_chksum_none += priv->rx_ring[i].csum_none;
++		stats->rx_packets += priv->rx_ring[i]->packets;
++		stats->rx_bytes += priv->rx_ring[i]->bytes;
++		priv->port_stats.rx_chksum_good += priv->rx_ring[i]->csum_ok;
++		priv->port_stats.rx_chksum_none += priv->rx_ring[i]->csum_none;
+ 	}
+ 	stats->tx_packets = 0;
+ 	stats->tx_bytes = 0;
+ 	priv->port_stats.tx_chksum_offload = 0;
+ 	for (i = 0; i < priv->tx_ring_num; i++) {
+-		stats->tx_packets += priv->tx_ring[i].packets;
+-		stats->tx_bytes += priv->tx_ring[i].bytes;
+-		priv->port_stats.tx_chksum_offload += priv->tx_ring[i].tx_csum;
++		stats->tx_packets += priv->tx_ring[i]->packets;
++		stats->tx_bytes += priv->tx_ring[i]->bytes;
++		priv->port_stats.tx_chksum_offload += priv->tx_ring[i]->tx_csum;
+ 	}
+ 
+ 	stats->rx_errors = be64_to_cpu(mlx4_en_stats->PCS) +
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index a964fbbb897f..3bea94b2e7c8 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -262,7 +262,7 @@ static int mlx4_en_fill_rx_buffers(struct mlx4_en_priv *priv)
+ 
+ 	for (buf_ind = 0; buf_ind < priv->prof->rx_ring_size; buf_ind++) {
+ 		for (ring_ind = 0; ring_ind < priv->rx_ring_num; ring_ind++) {
+-			ring = &priv->rx_ring[ring_ind];
++			ring = priv->rx_ring[ring_ind];
+ 
+ 			if (mlx4_en_prepare_rx_desc(priv, ring,
+ 						    ring->actual_size,
+@@ -287,7 +287,7 @@ static int mlx4_en_fill_rx_buffers(struct mlx4_en_priv *priv)
+ 
+ reduce_rings:
+ 	for (ring_ind = 0; ring_ind < priv->rx_ring_num; ring_ind++) {
+-		ring = &priv->rx_ring[ring_ind];
++		ring = priv->rx_ring[ring_ind];
+ 		while (ring->actual_size > new_size) {
+ 			ring->actual_size--;
+ 			ring->prod--;
+@@ -317,12 +317,20 @@ static void mlx4_en_free_rx_buf(struct mlx4_en_priv *priv,
+ }
+ 
+ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
+-			   struct mlx4_en_rx_ring *ring, u32 size, u16 stride)
++			   struct mlx4_en_rx_ring **pring,
++			   u32 size, u16 stride)
+ {
+ 	struct mlx4_en_dev *mdev = priv->mdev;
++	struct mlx4_en_rx_ring *ring;
+ 	int err = -ENOMEM;
+ 	int tmp;
+ 
++	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
++	if (!ring) {
++		en_err(priv, "Failed to allocate RX ring structure\n");
++		return -ENOMEM;
++	}
++
+ 	ring->prod = 0;
+ 	ring->cons = 0;
+ 	ring->size = size;
+@@ -334,8 +342,10 @@ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
+ 	tmp = size * roundup_pow_of_two(MLX4_EN_MAX_RX_FRAGS *
+ 					sizeof(struct mlx4_en_rx_alloc));
+ 	ring->rx_info = vmalloc(tmp);
+-	if (!ring->rx_info)
+-		return -ENOMEM;
++	if (!ring->rx_info) {
++		err = -ENOMEM;
++		goto err_ring;
++	}
+ 
+ 	en_dbg(DRV, priv, "Allocated rx_info ring at addr:%p size:%d\n",
+ 		 ring->rx_info, tmp);
+@@ -343,7 +353,7 @@ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
+ 	err = mlx4_alloc_hwq_res(mdev->dev, &ring->wqres,
+ 				 ring->buf_size, 2 * PAGE_SIZE);
+ 	if (err)
+-		goto err_ring;
++		goto err_info;
+ 
+ 	err = mlx4_en_map_buffer(&ring->wqres.buf);
+ 	if (err) {
+@@ -354,13 +364,18 @@ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
+ 
+ 	ring->hwtstamp_rx_filter = priv->hwtstamp_config.rx_filter;
+ 
++	*pring = ring;
+ 	return 0;
+ 
+ err_hwq:
+ 	mlx4_free_hwq_res(mdev->dev, &ring->wqres, ring->buf_size);
+-err_ring:
++err_info:
+ 	vfree(ring->rx_info);
+ 	ring->rx_info = NULL;
++err_ring:
++	kfree(ring);
++	*pring = NULL;
++
+ 	return err;
+ }
+ 
+@@ -374,12 +389,12 @@ int mlx4_en_activate_rx_rings(struct mlx4_en_priv *priv)
+ 					DS_SIZE * priv->num_frags);
+ 
+ 	for (ring_ind = 0; ring_ind < priv->rx_ring_num; ring_ind++) {
+-		ring = &priv->rx_ring[ring_ind];
++		ring = priv->rx_ring[ring_ind];
+ 
+ 		ring->prod = 0;
+ 		ring->cons = 0;
+ 		ring->actual_size = 0;
+-		ring->cqn = priv->rx_cq[ring_ind].mcq.cqn;
++		ring->cqn = priv->rx_cq[ring_ind]->mcq.cqn;
+ 
+ 		ring->stride = stride;
+ 		if (ring->stride <= TXBB_SIZE)
+@@ -410,7 +425,7 @@ int mlx4_en_activate_rx_rings(struct mlx4_en_priv *priv)
+ 		goto err_buffers;
+ 
+ 	for (ring_ind = 0; ring_ind < priv->rx_ring_num; ring_ind++) {
+-		ring = &priv->rx_ring[ring_ind];
++		ring = priv->rx_ring[ring_ind];
+ 
+ 		ring->size_mask = ring->actual_size - 1;
+ 		mlx4_en_update_rx_prod_db(ring);
+@@ -420,30 +435,34 @@ int mlx4_en_activate_rx_rings(struct mlx4_en_priv *priv)
+ 
+ err_buffers:
+ 	for (ring_ind = 0; ring_ind < priv->rx_ring_num; ring_ind++)
+-		mlx4_en_free_rx_buf(priv, &priv->rx_ring[ring_ind]);
++		mlx4_en_free_rx_buf(priv, priv->rx_ring[ring_ind]);
+ 
+ 	ring_ind = priv->rx_ring_num - 1;
+ err_allocator:
+ 	while (ring_ind >= 0) {
+-		if (priv->rx_ring[ring_ind].stride <= TXBB_SIZE)
+-			priv->rx_ring[ring_ind].buf -= TXBB_SIZE;
+-		mlx4_en_destroy_allocator(priv, &priv->rx_ring[ring_ind]);
++		if (priv->rx_ring[ring_ind]->stride <= TXBB_SIZE)
++			priv->rx_ring[ring_ind]->buf -= TXBB_SIZE;
++		mlx4_en_destroy_allocator(priv, priv->rx_ring[ring_ind]);
+ 		ring_ind--;
+ 	}
+ 	return err;
+ }
+ 
+ void mlx4_en_destroy_rx_ring(struct mlx4_en_priv *priv,
+-			     struct mlx4_en_rx_ring *ring, u32 size, u16 stride)
++			     struct mlx4_en_rx_ring **pring,
++			     u32 size, u16 stride)
+ {
+ 	struct mlx4_en_dev *mdev = priv->mdev;
++	struct mlx4_en_rx_ring *ring = *pring;
+ 
+ 	mlx4_en_unmap_buffer(&ring->wqres.buf);
+ 	mlx4_free_hwq_res(mdev->dev, &ring->wqres, size * stride + TXBB_SIZE);
+ 	vfree(ring->rx_info);
+ 	ring->rx_info = NULL;
++	kfree(ring);
++	*pring = NULL;
+ #ifdef CONFIG_RFS_ACCEL
+-	mlx4_en_cleanup_filters(priv, ring);
++	mlx4_en_cleanup_filters(priv);
+ #endif
+ }
+ 
+@@ -590,7 +609,7 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 	struct mlx4_en_dev *mdev = priv->mdev;
+ 	struct mlx4_cqe *cqe;
+-	struct mlx4_en_rx_ring *ring = &priv->rx_ring[cq->ring];
++	struct mlx4_en_rx_ring *ring = priv->rx_ring[cq->ring];
+ 	struct mlx4_en_rx_alloc *frags;
+ 	struct mlx4_en_rx_desc *rx_desc;
+ 	struct sk_buff *skb;
+@@ -979,7 +998,7 @@ int mlx4_en_config_rss_steer(struct mlx4_en_priv *priv)
+ 
+ 	for (i = 0; i < priv->rx_ring_num; i++) {
+ 		qpn = rss_map->base_qpn + i;
+-		err = mlx4_en_config_rss_qp(priv, qpn, &priv->rx_ring[i],
++		err = mlx4_en_config_rss_qp(priv, qpn, priv->rx_ring[i],
+ 					    &rss_map->state[i],
+ 					    &rss_map->qps[i]);
+ 		if (err)
+@@ -996,7 +1015,7 @@ int mlx4_en_config_rss_steer(struct mlx4_en_priv *priv)
+ 	}
+ 	rss_map->indir_qp.event = mlx4_en_sqp_event;
+ 	mlx4_en_fill_qp_context(priv, 0, 0, 0, 1, priv->base_qpn,
+-				priv->rx_ring[0].cqn, -1, &context);
++				priv->rx_ring[0]->cqn, -1, &context);
+ 
+ 	if (!priv->prof->rss_rings || priv->prof->rss_rings > priv->rx_ring_num)
+ 		rss_rings = priv->rx_ring_num;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_selftest.c b/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
+index 2448f0d669e6..40626690e8a8 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
+@@ -156,7 +156,7 @@ retry_tx:
+ 		 * since we turned the carrier off */
+ 		msleep(200);
+ 		for (i = 0; i < priv->tx_ring_num && carrier_ok; i++) {
+-			tx_ring = &priv->tx_ring[i];
++			tx_ring = priv->tx_ring[i];
+ 			if (tx_ring->prod != (tx_ring->cons + tx_ring->last_nr_txbb))
+ 				goto retry_tx;
+ 		}
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 43b8faafe2af..7f5a00c8f239 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -54,13 +54,20 @@ module_param_named(inline_thold, inline_thold, int, 0444);
+ MODULE_PARM_DESC(inline_thold, "threshold for using inline data");
+ 
+ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+-			   struct mlx4_en_tx_ring *ring, int qpn, u32 size,
++			   struct mlx4_en_tx_ring **pring, int qpn, u32 size,
+ 			   u16 stride)
+ {
+ 	struct mlx4_en_dev *mdev = priv->mdev;
++	struct mlx4_en_tx_ring *ring;
+ 	int tmp;
+ 	int err;
+ 
++	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
++	if (!ring) {
++		en_err(priv, "Failed allocating TX ring\n");
++		return -ENOMEM;
++	}
++
+ 	ring->size = size;
+ 	ring->size_mask = size - 1;
+ 	ring->stride = stride;
+@@ -69,8 +76,10 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+ 
+ 	tmp = size * sizeof(struct mlx4_en_tx_info);
+ 	ring->tx_info = vmalloc(tmp);
+-	if (!ring->tx_info)
+-		return -ENOMEM;
++	if (!ring->tx_info) {
++		err = -ENOMEM;
++		goto err_ring;
++	}
+ 
+ 	en_dbg(DRV, priv, "Allocated tx_info ring at addr:%p size:%d\n",
+ 		 ring->tx_info, tmp);
+@@ -78,7 +87,7 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+ 	ring->bounce_buf = kmalloc(MAX_DESC_SIZE, GFP_KERNEL);
+ 	if (!ring->bounce_buf) {
+ 		err = -ENOMEM;
+-		goto err_tx;
++		goto err_info;
+ 	}
+ 	ring->buf_size = ALIGN(size * ring->stride, MLX4_EN_PAGE_SIZE);
+ 
+@@ -120,6 +129,7 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+ 
+ 	ring->hwtstamp_tx_type = priv->hwtstamp_config.tx_type;
+ 
++	*pring = ring;
+ 	return 0;
+ 
+ err_map:
+@@ -129,16 +139,20 @@ err_hwq_res:
+ err_bounce:
+ 	kfree(ring->bounce_buf);
+ 	ring->bounce_buf = NULL;
+-err_tx:
++err_info:
+ 	vfree(ring->tx_info);
+ 	ring->tx_info = NULL;
++err_ring:
++	kfree(ring);
++	*pring = NULL;
+ 	return err;
+ }
+ 
+ void mlx4_en_destroy_tx_ring(struct mlx4_en_priv *priv,
+-			     struct mlx4_en_tx_ring *ring)
++			     struct mlx4_en_tx_ring **pring)
+ {
+ 	struct mlx4_en_dev *mdev = priv->mdev;
++	struct mlx4_en_tx_ring *ring = *pring;
+ 	en_dbg(DRV, priv, "Destroying tx ring, qpn: %d\n", ring->qpn);
+ 
+ 	if (ring->bf_enabled)
+@@ -151,6 +165,8 @@ void mlx4_en_destroy_tx_ring(struct mlx4_en_priv *priv,
+ 	ring->bounce_buf = NULL;
+ 	vfree(ring->tx_info);
+ 	ring->tx_info = NULL;
++	kfree(ring);
++	*pring = NULL;
+ }
+ 
+ int mlx4_en_activate_tx_ring(struct mlx4_en_priv *priv,
+@@ -315,7 +331,7 @@ static void mlx4_en_process_tx_cq(struct net_device *dev, struct mlx4_en_cq *cq)
+ {
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 	struct mlx4_cq *mcq = &cq->mcq;
+-	struct mlx4_en_tx_ring *ring = &priv->tx_ring[cq->ring];
++	struct mlx4_en_tx_ring *ring = priv->tx_ring[cq->ring];
+ 	struct mlx4_cqe *cqe;
+ 	u16 index;
+ 	u16 new_index, ring_index;
+@@ -599,7 +615,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	}
+ 
+ 	tx_ind = skb->queue_mapping;
+-	ring = &priv->tx_ring[tx_ind];
++	ring = priv->tx_ring[tx_ind];
+ 	if (vlan_tx_tag_present(skb))
+ 		vlan_tag = vlan_tx_tag_get(skb);
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
