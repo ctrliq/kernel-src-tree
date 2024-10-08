@@ -1,0 +1,308 @@
+nvme: remove dead controllers from a work item
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5c8809e650772be87ba04595a8ccf278bab7b543
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5c8809e6.failed
+
+Compared to the kthread this gives us multiple call prevention for free.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 5c8809e650772be87ba04595a8ccf278bab7b543)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,26e982359a74..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -79,11 -73,15 +79,18 @@@ static struct task_struct *nvme_thread
+  static struct workqueue_struct *nvme_workq;
+  static wait_queue_head_t nvme_kthread_wait;
+  
+ -struct nvme_dev;
+ -struct nvme_queue;
+ -struct nvme_iod;
+ +static struct class *nvme_class;
+  
+ +static void nvme_reset_failed_dev(struct work_struct *ws);
+  static int nvme_reset(struct nvme_dev *dev);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static int nvme_process_cq(struct nvme_queue *nvmeq);
+++=======
++ static void nvme_process_cq(struct nvme_queue *nvmeq);
++ static void nvme_unmap_data(struct nvme_dev *dev, struct nvme_iod *iod);
++ static void nvme_remove_dead_ctrl(struct nvme_dev *dev);
++ static void nvme_dev_shutdown(struct nvme_dev *dev);
+++>>>>>>> 5c8809e65077 (nvme: remove dead controllers from a work item):drivers/nvme/host/pci.c
+  
+  struct async_cmd_info {
+  	struct kthread_work work;
+@@@ -95,6 -93,45 +102,48 @@@
+  };
+  
+  /*
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
++  */
++ struct nvme_dev {
++ 	struct list_head node;
++ 	struct nvme_queue **queues;
++ 	struct blk_mq_tag_set tagset;
++ 	struct blk_mq_tag_set admin_tagset;
++ 	u32 __iomem *dbs;
++ 	struct device *dev;
++ 	struct dma_pool *prp_page_pool;
++ 	struct dma_pool *prp_small_pool;
++ 	unsigned queue_count;
++ 	unsigned online_queues;
++ 	unsigned max_qid;
++ 	int q_depth;
++ 	u32 db_stride;
++ 	struct msix_entry *entry;
++ 	void __iomem *bar;
++ 	struct work_struct reset_work;
++ 	struct work_struct scan_work;
++ 	struct work_struct remove_work;
++ 	struct mutex shutdown_lock;
++ 	bool subsystem;
++ 	void __iomem *cmb;
++ 	dma_addr_t cmb_dma_addr;
++ 	u64 cmb_size;
++ 	u32 cmbsz;
++ 	unsigned long flags;
++ #define NVME_CTRL_RESETTING    0
++ 
++ 	struct nvme_ctrl ctrl;
++ };
++ 
++ static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
++ {
++ 	return container_of(ctrl, struct nvme_dev, ctrl);
++ }
++ 
++ /*
+++>>>>>>> 5c8809e65077 (nvme: remove dead controllers from a work item):drivers/nvme/host/pci.c
+   * An NVM Express queue.  Each device has at least two (one for admin
+   * commands and one for I/O commands).
+   */
+@@@ -2977,130 -2216,81 +3026,151 @@@ static int nvme_dev_start(struct nvme_d
+  	dev->queues[0]->tags = NULL;
+   disable:
+  	nvme_disable_queue(dev, 0);
+ +	nvme_dev_list_remove(dev);
+   unmap:
+  	nvme_dev_unmap(dev);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	return result;
+++=======
++  out:
++ 	nvme_remove_dead_ctrl(dev);
+++>>>>>>> 5c8809e65077 (nvme: remove dead controllers from a work item):drivers/nvme/host/pci.c
+  }
+  
+- static int nvme_remove_dead_ctrl(void *arg)
++ static void nvme_remove_dead_ctrl_work(struct work_struct *work)
+  {
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	struct nvme_dev *dev = (struct nvme_dev *)arg;
+ +	struct pci_dev *pdev = dev->pci_dev;
+ +
+ +	if (pci_get_drvdata(pdev))
+ +		pci_stop_and_remove_bus_device_locked(pdev);
+ +	kref_put(&dev->kref, nvme_free_dev);
+ +	return 0;
+ +}
+ +
+ +static void nvme_remove_disks(struct work_struct *ws)
+ +{
+ +	struct nvme_dev *dev = container_of(ws, struct nvme_dev, reset_work);
+ +
+ +	nvme_free_queues(dev, 1);
+ +	nvme_dev_remove(dev);
+ +}
+ +
+ +static int nvme_dev_resume(struct nvme_dev *dev)
+ +{
+ +	int ret;
+ +
+ +	ret = nvme_dev_start(dev);
+ +	if (ret)
+ +		return ret;
+ +	if (dev->online_queues < 2) {
+ +		spin_lock(&dev_list_lock);
+ +		PREPARE_WORK(&dev->reset_work, nvme_remove_disks);
+ +		queue_work(nvme_workq, &dev->reset_work);
+ +		spin_unlock(&dev_list_lock);
+ +	} else {
+ +		nvme_unfreeze_queues(dev);
+ +		nvme_dev_add(dev);
+ +		nvme_set_irq_hints(dev);
+ +	}
+ +	return 0;
+++=======
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, remove_work);
++ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
++ 
++ 	if (pci_get_drvdata(pdev))
++ 		pci_stop_and_remove_bus_device_locked(pdev);
++ 	nvme_put_ctrl(&dev->ctrl);
+++>>>>>>> 5c8809e65077 (nvme: remove dead controllers from a work item):drivers/nvme/host/pci.c
+  }
+  
+- static void nvme_dead_ctrl(struct nvme_dev *dev)
++ static void nvme_remove_dead_ctrl(struct nvme_dev *dev)
+  {
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	dev_warn(&dev->pci_dev->dev, "Device failed to resume\n");
+ +	kref_get(&dev->kref);
+ +	if (IS_ERR(kthread_run(nvme_remove_dead_ctrl, dev, "nvme%d",
+ +						dev->instance))) {
+ +		dev_err(&dev->pci_dev->dev,
+ +			"Failed to start controller remove task\n");
+ +		kref_put(&dev->kref, nvme_free_dev);
+ +	}
+++=======
++ 	dev_warn(dev->dev, "Removing after probe failure\n");
++ 	kref_get(&dev->ctrl.kref);
++ 	if (!schedule_work(&dev->remove_work))
++ 		nvme_put_ctrl(&dev->ctrl);
+++>>>>>>> 5c8809e65077 (nvme: remove dead controllers from a work item):drivers/nvme/host/pci.c
+  }
+  
+ -static int nvme_reset(struct nvme_dev *dev)
+ +static void nvme_dev_reset(struct nvme_dev *dev)
+  {
+ -	if (!dev->ctrl.admin_q || blk_queue_dying(dev->ctrl.admin_q))
+ -		return -ENODEV;
+ +	bool in_probe = work_busy(&dev->probe_work);
+  
+ -	if (!queue_work(nvme_workq, &dev->reset_work))
+ -		return -EBUSY;
+ +	nvme_dev_shutdown(dev);
+  
+ -	flush_work(&dev->reset_work);
+ -	return 0;
+ -}
+ +	/* Synchronize with device probe so that work will see failure status
+ +	 * and exit gracefully without trying to schedule another reset */
+ +	flush_work(&dev->probe_work);
+  
+ -static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
+ -{
+ -	*val = readl(to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ +	/* Fail this device if reset occured during probe to avoid
+ +	 * infinite initialization loops. */
+ +	if (in_probe) {
+ +		nvme_dead_ctrl(dev);
+ +		return;
+ +	}
+ +	/* Schedule device resume asynchronously so the reset work is available
+ +	 * to cleanup errors that may occur during reinitialization */
+ +	schedule_work(&dev->probe_work);
+  }
+  
+ -static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
+ +static void nvme_reset_failed_dev(struct work_struct *ws)
+  {
+ -	writel(val, to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ +	struct nvme_dev *dev = container_of(ws, struct nvme_dev, reset_work);
+ +	nvme_dev_reset(dev);
+  }
+  
+ -static int nvme_pci_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
+ +static int nvme_reset(struct nvme_dev *dev)
+  {
+ -	*val = readq(to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ -}
+ +	int ret = -EBUSY;
+  
+ -static bool nvme_pci_io_incapable(struct nvme_ctrl *ctrl)
+ -{
+ -	struct nvme_dev *dev = to_nvme_dev(ctrl);
+ +	if (!dev->admin_q || blk_queue_dying(dev->admin_q))
+ +		return -ENODEV;
+ +
+ +	spin_lock(&dev_list_lock);
+ +	if (!work_pending(&dev->reset_work)) {
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +		queue_work(nvme_workq, &dev->reset_work);
+ +		ret = 0;
+ +	}
+ +	spin_unlock(&dev_list_lock);
+ +
+ +	if (!ret) {
+ +		flush_work(&dev->reset_work);
+ +		flush_work(&dev->probe_work);
+ +		return 0;
+ +	}
+  
+ -	return !dev->bar || dev->online_queues < 2;
+ +	return ret;
+  }
+  
+ -static int nvme_pci_reset_ctrl(struct nvme_ctrl *ctrl)
+ +static ssize_t nvme_sysfs_reset(struct device *dev,
+ +				struct device_attribute *attr, const char *buf,
+ +				size_t count)
+  {
+ -	return nvme_reset(to_nvme_dev(ctrl));
+ -}
+ +	struct nvme_dev *ndev = dev_get_drvdata(dev);
+ +	int ret;
+  
+ -static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
+ -	.reg_read32		= nvme_pci_reg_read32,
+ -	.reg_write32		= nvme_pci_reg_write32,
+ -	.reg_read64		= nvme_pci_reg_read64,
+ -	.io_incapable		= nvme_pci_io_incapable,
+ -	.reset_ctrl		= nvme_pci_reset_ctrl,
+ -	.free_ctrl		= nvme_pci_free_ctrl,
+ -};
+ +	ret = nvme_reset(ndev);
+ +	if (ret < 0)
+ +		return ret;
+  
+ +	return count;
+ +}
+ +static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
+ +
+ +static void nvme_async_probe(struct work_struct *work);
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+  	int node, result = -ENOMEM;
+@@@ -3122,11 -2312,16 +3192,22 @@@
+  	if (!dev->queues)
+  		goto free;
+  
+ -	dev->dev = get_device(&pdev->dev);
+ +	INIT_LIST_HEAD(&dev->namespaces);
+ +	INIT_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +	dev->pci_dev = pci_dev_get(pdev);
+  	pci_set_drvdata(pdev, dev);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	result = nvme_set_instance(dev);
+++=======
++ 
++ 	INIT_LIST_HEAD(&dev->node);
++ 	INIT_WORK(&dev->scan_work, nvme_dev_scan);
++ 	INIT_WORK(&dev->reset_work, nvme_reset_work);
++ 	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
++ 	mutex_init(&dev->shutdown_lock);
++ 
++ 	result = nvme_setup_prp_pools(dev);
+++>>>>>>> 5c8809e65077 (nvme: remove dead controllers from a work item):drivers/nvme/host/pci.c
+  	if (result)
+  		goto put_pci;
+  
+* Unmerged path drivers/block/nvme-core.c
