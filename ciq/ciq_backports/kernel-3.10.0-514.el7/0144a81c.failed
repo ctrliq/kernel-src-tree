@@ -1,0 +1,129 @@
+tcp: fix ipv4 mapped request socks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 0144a81cccf7532bead90f0542f517bd028d3b3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0144a81c.failed
+
+ss should display ipv4 mapped request sockets like this :
+
+tcp    SYN-RECV   0      0  ::ffff:192.168.0.1:8080   ::ffff:192.0.2.1:35261
+
+and not like this :
+
+tcp    SYN-RECV   0      0  192.168.0.1:8080   192.0.2.1:35261
+
+We should init ireq->ireq_family based on listener sk_family,
+not the actual protocol carried by SYN packet.
+
+This means we can set ireq_family in inet_reqsk_alloc()
+
+Fixes: 3f66b083a5b7 ("inet: introduce ireq_family")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0144a81cccf7532bead90f0542f517bd028d3b3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/syncookies.c
+#	net/ipv4/tcp_input.c
+#	net/ipv6/syncookies.c
+diff --cc net/ipv4/syncookies.c
+index 650ced499f23,df849e5a10f1..000000000000
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@@ -341,7 -346,9 +341,13 @@@ struct sock *cookie_v4_check(struct soc
+  	ireq->tstamp_ok		= tcp_opt.saw_tstamp;
+  	req->ts_recent		= tcp_opt.saw_tstamp ? tcp_opt.rcv_tsval : 0;
+  	treq->snt_synack	= tcp_opt.saw_tstamp ? tcp_opt.rcv_tsecr : 0;
+++<<<<<<< HEAD
+ +	treq->listener		= NULL;
+++=======
++ 	treq->tfo_listener	= false;
++ 
++ 	ireq->ir_iif = sk->sk_bound_dev_if;
+++>>>>>>> 0144a81cccf7 (tcp: fix ipv4 mapped request socks)
+  
+  	/* We throwed the options of the initial SYN away, so we hope
+  	 * the ACK carries the same options again (see RFC1122 4.2.3.8)
+diff --cc net/ipv4/tcp_input.c
+index 0b920619f257,023196f7ec37..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -5953,6 -5942,51 +5953,54 @@@ static void tcp_ecn_create_request(stru
+  		inet_rsk(req)->ecn_ok = 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcp_openreq_init(struct request_sock *req,
++ 			     const struct tcp_options_received *rx_opt,
++ 			     struct sk_buff *skb, const struct sock *sk)
++ {
++ 	struct inet_request_sock *ireq = inet_rsk(req);
++ 
++ 	req->rcv_wnd = 0;		/* So that tcp_send_synack() knows! */
++ 	req->cookie_ts = 0;
++ 	tcp_rsk(req)->rcv_isn = TCP_SKB_CB(skb)->seq;
++ 	tcp_rsk(req)->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
++ 	tcp_rsk(req)->snt_synack = tcp_time_stamp;
++ 	tcp_rsk(req)->last_oow_ack_time = 0;
++ 	req->mss = rx_opt->mss_clamp;
++ 	req->ts_recent = rx_opt->saw_tstamp ? rx_opt->rcv_tsval : 0;
++ 	ireq->tstamp_ok = rx_opt->tstamp_ok;
++ 	ireq->sack_ok = rx_opt->sack_ok;
++ 	ireq->snd_wscale = rx_opt->snd_wscale;
++ 	ireq->wscale_ok = rx_opt->wscale_ok;
++ 	ireq->acked = 0;
++ 	ireq->ecn_ok = 0;
++ 	ireq->ir_rmt_port = tcp_hdr(skb)->source;
++ 	ireq->ir_num = ntohs(tcp_hdr(skb)->dest);
++ 	ireq->ir_mark = inet_request_mark(sk, skb);
++ }
++ 
++ struct request_sock *inet_reqsk_alloc(const struct request_sock_ops *ops,
++ 				      struct sock *sk_listener)
++ {
++ 	struct request_sock *req = reqsk_alloc(ops, sk_listener);
++ 
++ 	if (req) {
++ 		struct inet_request_sock *ireq = inet_rsk(req);
++ 
++ 		kmemcheck_annotate_bitfield(ireq, flags);
++ 		ireq->opt = NULL;
++ 		atomic64_set(&ireq->ir_cookie, 0);
++ 		ireq->ireq_state = TCP_NEW_SYN_RECV;
++ 		write_pnet(&ireq->ireq_net, sock_net(sk_listener));
++ 		ireq->ireq_family = sk_listener->sk_family;
++ 	}
++ 
++ 	return req;
++ }
++ EXPORT_SYMBOL(inet_reqsk_alloc);
++ 
+++>>>>>>> 0144a81cccf7 (tcp: fix ipv4 mapped request socks)
+  int tcp_conn_request(struct request_sock_ops *rsk_ops,
+  		     const struct tcp_request_sock_ops *af_ops,
+  		     struct sock *sk, struct sk_buff *skb)
+diff --cc net/ipv6/syncookies.c
+index 47e5432f7b07,21bc2eb53c57..000000000000
+--- a/net/ipv6/syncookies.c
++++ b/net/ipv6/syncookies.c
+@@@ -192,7 -196,7 +192,11 @@@ struct sock *cookie_v6_check(struct soc
+  
+  	ireq = inet_rsk(req);
+  	treq = tcp_rsk(req);
+++<<<<<<< HEAD
+ +	treq->listener = NULL;
+++=======
++ 	treq->tfo_listener = false;
+++>>>>>>> 0144a81cccf7 (tcp: fix ipv4 mapped request socks)
+  
+  	if (security_inet_conn_request(sk, skb, req))
+  		goto out_free;
+* Unmerged path net/ipv4/syncookies.c
+* Unmerged path net/ipv4/tcp_input.c
+* Unmerged path net/ipv6/syncookies.c
