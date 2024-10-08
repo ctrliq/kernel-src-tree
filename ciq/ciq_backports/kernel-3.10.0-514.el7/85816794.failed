@@ -1,0 +1,131 @@
+fanotify: Fix use after free for permission events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 85816794240b9659e66e4d9b0df7c6e814e5f603
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/85816794.failed
+
+Currently struct fanotify_event_info has been destroyed immediately
+after reporting its contents to userspace. However that is wrong for
+permission events because those need to stay around until userspace
+provides response which is filled back in fanotify_event_info. So change
+to code to free permission events only after we have got the response
+from userspace.
+
+Reported-and-tested-by: Jiri Kosina <jkosina@suse.cz>
+Reported-and-tested-by: Dave Jones <davej@fedoraproject.org>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 85816794240b9659e66e4d9b0df7c6e814e5f603)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+#	fs/notify/fanotify/fanotify.h
+#	fs/notify/fanotify/fanotify_user.c
+diff --cc fs/notify/fanotify/fanotify.c
+index 0c2f9122b262,0e792f5e3147..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -217,6 -142,71 +217,74 @@@ static bool fanotify_should_send_event(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int fanotify_handle_event(struct fsnotify_group *group,
++ 				 struct inode *inode,
++ 				 struct fsnotify_mark *inode_mark,
++ 				 struct fsnotify_mark *fanotify_mark,
++ 				 u32 mask, void *data, int data_type,
++ 				 const unsigned char *file_name)
++ {
++ 	int ret = 0;
++ 	struct fanotify_event_info *event;
++ 	struct fsnotify_event *fsn_event;
++ 
++ 	BUILD_BUG_ON(FAN_ACCESS != FS_ACCESS);
++ 	BUILD_BUG_ON(FAN_MODIFY != FS_MODIFY);
++ 	BUILD_BUG_ON(FAN_CLOSE_NOWRITE != FS_CLOSE_NOWRITE);
++ 	BUILD_BUG_ON(FAN_CLOSE_WRITE != FS_CLOSE_WRITE);
++ 	BUILD_BUG_ON(FAN_OPEN != FS_OPEN);
++ 	BUILD_BUG_ON(FAN_EVENT_ON_CHILD != FS_EVENT_ON_CHILD);
++ 	BUILD_BUG_ON(FAN_Q_OVERFLOW != FS_Q_OVERFLOW);
++ 	BUILD_BUG_ON(FAN_OPEN_PERM != FS_OPEN_PERM);
++ 	BUILD_BUG_ON(FAN_ACCESS_PERM != FS_ACCESS_PERM);
++ 	BUILD_BUG_ON(FAN_ONDIR != FS_ISDIR);
++ 
++ 	if (!fanotify_should_send_event(inode_mark, fanotify_mark, mask, data,
++ 					data_type))
++ 		return 0;
++ 
++ 	pr_debug("%s: group=%p inode=%p mask=%x\n", __func__, group, inode,
++ 		 mask);
++ 
++ 	event = kmem_cache_alloc(fanotify_event_cachep, GFP_KERNEL);
++ 	if (unlikely(!event))
++ 		return -ENOMEM;
++ 
++ 	fsn_event = &event->fse;
++ 	fsnotify_init_event(fsn_event, inode, mask);
++ 	event->tgid = get_pid(task_tgid(current));
++ 	if (data_type == FSNOTIFY_EVENT_PATH) {
++ 		struct path *path = data;
++ 		event->path = *path;
++ 		path_get(&event->path);
++ 	} else {
++ 		event->path.mnt = NULL;
++ 		event->path.dentry = NULL;
++ 	}
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	event->response = 0;
++ #endif
++ 
++ 	ret = fsnotify_add_notify_event(group, fsn_event, fanotify_merge);
++ 	if (ret) {
++ 		BUG_ON(mask & FAN_ALL_PERM_EVENTS);
++ 		/* Our event wasn't used in the end. Free it. */
++ 		fsnotify_destroy_event(group, fsn_event);
++ 		ret = 0;
++ 	}
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS) {
++ 		ret = fanotify_get_response_from_access(group, event);
++ 		fsnotify_destroy_event(group, fsn_event);
++ 	}
++ #endif
++ 	return ret;
++ }
++ 
+++>>>>>>> 85816794240b (fanotify: Fix use after free for permission events)
+  static void fanotify_free_group_priv(struct fsnotify_group *group)
+  {
+  	struct user_struct *user;
+diff --cc fs/notify/fanotify/fanotify_user.c
+index 8ef1b0f829ee,b6175fa11bf8..000000000000
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@@ -321,7 -319,12 +321,16 @@@ static ssize_t fanotify_read(struct fil
+  			if (IS_ERR(kevent))
+  				break;
+  			ret = copy_event_to_user(group, kevent, buf);
+++<<<<<<< HEAD
+ +			fsnotify_put_event(kevent);
+++=======
++ 			/*
++ 			 * Permission events get destroyed after we
++ 			 * receive response
++ 			 */
++ 			if (!(kevent->mask & FAN_ALL_PERM_EVENTS))
++ 				fsnotify_destroy_event(group, kevent);
+++>>>>>>> 85816794240b (fanotify: Fix use after free for permission events)
+  			if (ret < 0)
+  				break;
+  			buf += ret;
+* Unmerged path fs/notify/fanotify/fanotify.h
+* Unmerged path fs/notify/fanotify/fanotify.c
+* Unmerged path fs/notify/fanotify/fanotify.h
+* Unmerged path fs/notify/fanotify/fanotify_user.c
