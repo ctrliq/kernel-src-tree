@@ -1,0 +1,97 @@
+net: pktgen: packet bursting via skb->xmit_more
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] pktgen: packet bursting via skb->xmit_more (Alexander Duyck) [1205266]
+Rebuild_FUZZ: 94.38%
+commit-author Alexei Starovoitov <ast@plumgrid.com>
+commit 38b2cf2982dc73d3f07fe84fec8cc4ed9f64c1c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/38b2cf29.failed
+
+This patch demonstrates the effect of delaying update of HW tailptr.
+(based on earlier patch by Jesper)
+
+burst=1 is the default. It sends one packet with xmit_more=false
+burst=2 sends one packet with xmit_more=true and
+        2nd copy of the same packet with xmit_more=false
+burst=3 sends two copies of the same packet with xmit_more=true and
+        3rd copy with xmit_more=false
+
+Performance with ixgbe (usec 30):
+burst=1  tx:9.2 Mpps
+burst=2  tx:13.5 Mpps
+burst=3  tx:14.5 Mpps full 10G line rate
+
+	Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 38b2cf2982dc73d3f07fe84fec8cc4ed9f64c1c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/pktgen.c
+diff --cc net/core/pktgen.c
+index dc189dd7ca08,443256bdcddc..000000000000
+--- a/net/core/pktgen.c
++++ b/net/core/pktgen.c
+@@@ -3201,11 -3311,9 +3215,12 @@@ static void pktgen_wait_for_skb(struct 
+  
+  static void pktgen_xmit(struct pktgen_dev *pkt_dev)
+  {
++ 	unsigned int burst = ACCESS_ONCE(pkt_dev->burst);
+  	struct net_device *odev = pkt_dev->odev;
+ +	netdev_tx_t (*xmit)(struct sk_buff *, struct net_device *)
+ +		= odev->netdev_ops->ndo_start_xmit;
+  	struct netdev_queue *txq;
+ +	u16 queue_map;
+  	int ret;
+  
+  	/* If device is offline, then don't send */
+@@@ -3253,8 -3362,10 +3268,15 @@@
+  		pkt_dev->last_ok = 0;
+  		goto unlock;
+  	}
+++<<<<<<< HEAD
+ +	atomic_inc(&(pkt_dev->skb->users));
+ +	ret = (*xmit)(pkt_dev->skb, odev);
+++=======
++ 	atomic_add(burst, &pkt_dev->skb->users);
++ 
++ xmit_more:
++ 	ret = netdev_start_xmit(pkt_dev->skb, odev, txq, --burst > 0);
+++>>>>>>> 38b2cf2982dc (net: pktgen: packet bursting via skb->xmit_more)
+  
+  	switch (ret) {
+  	case NETDEV_TX_OK:
+@@@ -3281,8 -3393,12 +3305,10 @@@
+  		atomic_dec(&(pkt_dev->skb->users));
+  		pkt_dev->last_ok = 0;
+  	}
++ 	if (unlikely(burst))
++ 		atomic_sub(burst, &pkt_dev->skb->users);
+  unlock:
+ -	HARD_TX_UNLOCK(odev, txq);
+ -
+ -	local_bh_enable();
+ +	__netif_tx_unlock_bh(txq);
+  
+  	/* If pkt_dev->count is zero, then run forever */
+  	if ((pkt_dev->count != 0) && (pkt_dev->sofar >= pkt_dev->count)) {
+diff --git a/Documentation/networking/pktgen.txt b/Documentation/networking/pktgen.txt
+index 75e4fd708ccb..25f53eaba91a 100644
+--- a/Documentation/networking/pktgen.txt
++++ b/Documentation/networking/pktgen.txt
+@@ -71,6 +71,9 @@ Examples:
+ 
+  pgset "clone_skb 1"     sets the number of copies of the same packet
+  pgset "clone_skb 0"     use single SKB for all transmits
++ pgset "burst 8"         uses xmit_more API to queue 8 copies of the same
++                         packet and update HW tx queue tail pointer once.
++                         "burst 1" is the default
+  pgset "pkt_size 9014"   sets packet size to 9014
+  pgset "frags 5"         packet will consist of 5 fragments
+  pgset "count 200000"    sets number of packets to send, set to zero
+* Unmerged path net/core/pktgen.c
