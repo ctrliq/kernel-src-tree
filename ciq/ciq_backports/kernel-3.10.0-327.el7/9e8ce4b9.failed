@@ -1,0 +1,148 @@
+Revert "x86/PCI: Refine the way to release PCI IRQ resources"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] revert "pci: Refine the way to release PCI IRQ resources" (Steve Best) [1231358 1238216]
+Rebuild_FUZZ: 96.61%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 9e8ce4b96b781b003e3174fbbc62e1d4388c8b8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9e8ce4b9.failed
+
+Commit b4b55cda5874 (Refine the way to release PCI IRQ resources)
+introduced a regression in the PCI IRQ resource management by causing
+the IRQ resource of a device, established when pci_enabled_device()
+is called on a fully disabled device, to be released when the driver
+is unbound from the device, regardless of the enable_cnt.
+
+This leads to the situation that an ill-behaved driver can now make a
+device unusable to subsequent drivers by an imbalance in their use of
+pci_enable/disable_device().  That is a serious problem for secondary
+drivers like vfio-pci, which are innocent of the transgressions of
+the previous driver.
+
+Since the solution of this problem is not immediate and requires
+further discussion, revert commit b4b55cda5874 and the issue it was
+supposed to address (a bug related to xen-pciback) will be taken
+care of in a different way going forward.
+
+	Reported-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 9e8ce4b96b781b003e3174fbbc62e1d4388c8b8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/pci/irq.c
+#	arch/x86/pci/mrst.c
+#	drivers/acpi/pci_irq.c
+diff --cc arch/x86/pci/irq.c
+index 84112f55dd7a,5dc6ca5e1741..000000000000
+--- a/arch/x86/pci/irq.c
++++ b/arch/x86/pci/irq.c
+@@@ -1254,3 -1255,25 +1254,28 @@@ static int pirq_enable_irq(struct pci_d
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool mp_should_keep_irq(struct device *dev)
++ {
++ 	if (dev->power.is_prepared)
++ 		return true;
++ #ifdef CONFIG_PM
++ 	if (dev->power.runtime_status == RPM_SUSPENDING)
++ 		return true;
++ #endif
++ 
++ 	return false;
++ }
++ 
++ static void pirq_disable_irq(struct pci_dev *dev)
++ {
++ 	if (io_apic_assign_pci_irqs && !mp_should_keep_irq(&dev->dev) &&
++ 	    dev->irq_managed && dev->irq) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq = 0;
++ 		dev->irq_managed = 0;
++ 	}
++ }
+++>>>>>>> 9e8ce4b96b78 (Revert "x86/PCI: Refine the way to release PCI IRQ resources")
+diff --cc arch/x86/pci/mrst.c
+index 903fded50786,852aa4c92da0..000000000000
+--- a/arch/x86/pci/mrst.c
++++ b/arch/x86/pci/mrst.c
+@@@ -225,7 -232,16 +225,20 @@@ static int mrst_pci_irq_enable(struct p
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:arch/x86/pci/mrst.c
+ +struct pci_ops pci_mrst_ops = {
+++=======
++ static void intel_mid_pci_irq_disable(struct pci_dev *dev)
++ {
++ 	if (!mp_should_keep_irq(&dev->dev) && dev->irq_managed &&
++ 	    dev->irq > 0) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq_managed = 0;
++ 	}
++ }
++ 
++ struct pci_ops intel_mid_pci_ops = {
+++>>>>>>> 9e8ce4b96b78 (Revert "x86/PCI: Refine the way to release PCI IRQ resources"):arch/x86/pci/intel_mid_pci.c
+  	.read = pci_read,
+  	.write = pci_write,
+  };
+diff --cc drivers/acpi/pci_irq.c
+index d8cd9b655f87,b1def411c0b8..000000000000
+--- a/drivers/acpi/pci_irq.c
++++ b/drivers/acpi/pci_irq.c
+@@@ -465,9 -482,17 +465,17 @@@ void acpi_pci_irq_disable(struct pci_de
+  	u8 pin;
+  
+  	pin = dev->pin;
+ -	if (!pin || !dev->irq_managed || dev->irq <= 0)
+ +	if (!pin)
+  		return;
+  
++ 	/* Keep IOAPIC pin configuration when suspending */
++ 	if (dev->dev.power.is_prepared)
++ 		return;
++ #ifdef	CONFIG_PM
++ 	if (dev->dev.power.runtime_status == RPM_SUSPENDING)
++ 		return;
++ #endif
++ 
+  	entry = acpi_pci_irq_lookup(dev, pin);
+  	if (!entry)
+  		return;
+@@@ -485,5 -510,8 +493,12 @@@
+  	 */
+  
+  	dev_dbg(&dev->dev, "PCI INT %c disabled\n", pin_name(pin));
+++<<<<<<< HEAD
+ +	acpi_unregister_gsi(gsi);
+++=======
++ 	if (gsi >= 0) {
++ 		acpi_unregister_gsi(gsi);
++ 		dev->irq_managed = 0;
++ 	}
+++>>>>>>> 9e8ce4b96b78 (Revert "x86/PCI: Refine the way to release PCI IRQ resources")
+  }
+diff --git a/arch/x86/include/asm/pci_x86.h b/arch/x86/include/asm/pci_x86.h
+index fa1195dae425..164e3f8d3c3d 100644
+--- a/arch/x86/include/asm/pci_x86.h
++++ b/arch/x86/include/asm/pci_x86.h
+@@ -93,6 +93,8 @@ extern raw_spinlock_t pci_config_lock;
+ extern int (*pcibios_enable_irq)(struct pci_dev *dev);
+ extern void (*pcibios_disable_irq)(struct pci_dev *dev);
+ 
++extern bool mp_should_keep_irq(struct device *dev);
++
+ struct pci_raw_ops {
+ 	int (*read)(unsigned int domain, unsigned int bus, unsigned int devfn,
+ 						int reg, int len, u32 *val);
+* Unmerged path arch/x86/pci/irq.c
+* Unmerged path arch/x86/pci/mrst.c
+* Unmerged path drivers/acpi/pci_irq.c
