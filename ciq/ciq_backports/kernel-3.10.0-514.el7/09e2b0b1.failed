@@ -1,0 +1,201 @@
+scsi: rescan VPD attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hannes Reinecke <hare@suse.de>
+commit 09e2b0b14690fb13ccfc04af49f156df3e25b152
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/09e2b0b1.failed
+
+The VPD page information might change, so we need to be able to update
+it. This patch implements a VPD page rescan whenever the 'rescan' sysfs
+attribute is triggered.
+
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Reviewed-by: Shane Seymour <shane.seymour@hpe.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 09e2b0b14690fb13ccfc04af49f156df3e25b152)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_scan.c
+#	drivers/scsi/ses.c
+#	include/scsi/scsi_device.h
+diff --cc drivers/scsi/scsi_scan.c
+index d27d3fd86f2a,a1c195d71fd1..000000000000
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@@ -1595,17 -1516,18 +1596,26 @@@ EXPORT_SYMBOL(scsi_add_device)
+  
+  void scsi_rescan_device(struct device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct scsi_driver *drv;
+ +	
+ +	if (!dev->driver)
+ +		return;
+++=======
++ 	device_lock(dev);
++ 
++ 	scsi_attach_vpd(to_scsi_device(dev));
++ 
++ 	if (dev->driver && try_module_get(dev->driver->owner)) {
++ 		struct scsi_driver *drv = to_scsi_driver(dev->driver);
+++>>>>>>> 09e2b0b14690 (scsi: rescan VPD attributes)
+  
+ +	drv = to_scsi_driver(dev->driver);
+ +	if (try_module_get(drv->owner)) {
+  		if (drv->rescan)
+  			drv->rescan(dev);
+ -		module_put(dev->driver->owner);
+ +		module_put(drv->owner);
+  	}
+ -	device_unlock(dev);
+  }
+  EXPORT_SYMBOL(scsi_rescan_device);
+  
+diff --cc drivers/scsi/ses.c
+index 62d483aef57a,e234da78ce6e..000000000000
+--- a/drivers/scsi/ses.c
++++ b/drivers/scsi/ses.c
+@@@ -492,15 -553,37 +492,46 @@@ static void ses_enclosure_data_process(
+  static void ses_match_to_enclosure(struct enclosure_device *edev,
+  				   struct scsi_device *sdev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned char *desc;
++ 	unsigned char __rcu *vpd_pg83;
+++>>>>>>> 09e2b0b14690 (scsi: rescan VPD attributes)
+  	struct efd efd = {
+  		.addr = 0,
+  	};
+  
+  	ses_enclosure_data_process(edev, to_scsi_device(edev->edev.parent), 0);
+  
+++<<<<<<< HEAD
+ +	if (is_sas_attached(sdev))
+ +		efd.addr = sas_get_address(sdev);
+ +
+++=======
++ 	rcu_read_lock();
++ 	vpd_pg83 = rcu_dereference(sdev->vpd_pg83);
++ 	if (!vpd_pg83) {
++ 		rcu_read_unlock();
++ 		return;
++ 	}
++ 
++ 	desc = vpd_pg83 + 4;
++ 	while (desc < vpd_pg83 + sdev->vpd_pg83_len) {
++ 		enum scsi_protocol proto = desc[0] >> 4;
++ 		u8 code_set = desc[0] & 0x0f;
++ 		u8 piv = desc[1] & 0x80;
++ 		u8 assoc = (desc[1] & 0x30) >> 4;
++ 		u8 type = desc[1] & 0x0f;
++ 		u8 len = desc[3];
++ 
++ 		if (piv && code_set == 1 && assoc == 1
++ 		    && proto == SCSI_PROTOCOL_SAS && type == 3 && len == 8)
++ 			efd.addr = get_unaligned_be64(&desc[4]);
++ 
++ 		desc += len + 4;
++ 	}
++ 	rcu_read_unlock();
+++>>>>>>> 09e2b0b14690 (scsi: rescan VPD attributes)
+  	if (efd.addr) {
+  		efd.dev = &sdev->sdev_gendev;
+  
+diff --cc include/scsi/scsi_device.h
+index cd40a437ed26,bde4077f2864..000000000000
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@@ -115,6 -115,12 +116,15 @@@ struct scsi_device 
+  	const char * vendor;		/* [back_compat] point into 'inquiry' ... */
+  	const char * model;		/* ... after scan; point to static string */
+  	const char * rev;		/* ... "nullnullnullnull" before scan */
+++<<<<<<< HEAD
+++=======
++ 
++ #define SCSI_VPD_PG_LEN                255
++ 	int vpd_pg83_len;
++ 	unsigned char __rcu *vpd_pg83;
++ 	int vpd_pg80_len;
++ 	unsigned char __rcu *vpd_pg80;
+++>>>>>>> 09e2b0b14690 (scsi: rescan VPD attributes)
+  	unsigned char current_tag;	/* current tag */
+  	struct scsi_target      *sdev_target;   /* used only for single_lun */
+  
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index a9080c4f426e..4b94a73e2878 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -964,7 +964,7 @@ void scsi_attach_vpd(struct scsi_device *sdev)
+ 	int vpd_len = SCSI_VPD_PG_LEN;
+ 	int pg80_supported = 0;
+ 	int pg83_supported = 0;
+-	unsigned char *vpd_buf;
++	unsigned char __rcu *vpd_buf, *orig_vpd_buf = NULL;
+ 
+ 	if (sdev->skip_vpd_pages)
+ 		return;
+@@ -1010,8 +1010,16 @@ retry_pg80:
+ 			kfree(vpd_buf);
+ 			goto retry_pg80;
+ 		}
++		mutex_lock(&sdev->inquiry_mutex);
++		orig_vpd_buf = sdev->vpd_pg80;
+ 		sdev->vpd_pg80_len = result;
+-		sdev->vpd_pg80 = vpd_buf;
++		rcu_assign_pointer(sdev->vpd_pg80, vpd_buf);
++		mutex_unlock(&sdev->inquiry_mutex);
++		synchronize_rcu();
++		if (orig_vpd_buf) {
++			kfree(orig_vpd_buf);
++			orig_vpd_buf = NULL;
++		}
+ 		vpd_len = SCSI_VPD_PG_LEN;
+ 	}
+ 
+@@ -1031,8 +1039,14 @@ retry_pg83:
+ 			kfree(vpd_buf);
+ 			goto retry_pg83;
+ 		}
++		mutex_lock(&sdev->inquiry_mutex);
++		orig_vpd_buf = sdev->vpd_pg83;
+ 		sdev->vpd_pg83_len = result;
+-		sdev->vpd_pg83 = vpd_buf;
++		rcu_assign_pointer(sdev->vpd_pg83, vpd_buf);
++		mutex_unlock(&sdev->inquiry_mutex);
++		synchronize_rcu();
++		if (orig_vpd_buf)
++			kfree(orig_vpd_buf);
+ 	}
+ }
+ 
+* Unmerged path drivers/scsi/scsi_scan.c
+diff --git a/drivers/scsi/scsi_sysfs.c b/drivers/scsi/scsi_sysfs.c
+index 97a026ae730c..33e46bf6612f 100644
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -826,11 +826,15 @@ show_vpd_##_page(struct file *filp, struct kobject *kobj,	\
+ {									\
+ 	struct device *dev = container_of(kobj, struct device, kobj);	\
+ 	struct scsi_device *sdev = to_scsi_device(dev);			\
++	int ret;							\
+ 	if (!sdev->vpd_##_page)						\
+ 		return -EINVAL;						\
+-	return memory_read_from_buffer(buf, count, &off,		\
+-				       sdev->vpd_##_page,		\
++	rcu_read_lock();						\
++	ret = memory_read_from_buffer(buf, count, &off,			\
++				      rcu_dereference(sdev->vpd_##_page), \
+ 				       sdev->vpd_##_page##_len);	\
++	rcu_read_unlock();						\
++	return ret;						\
+ }									\
+ static struct bin_attribute dev_attr_vpd_##_page = {		\
+ 	.attr =	{.name = __stringify(vpd_##_page), .mode = S_IRUGO },	\
+* Unmerged path drivers/scsi/ses.c
+* Unmerged path include/scsi/scsi_device.h
