@@ -1,0 +1,152 @@
+sched/idle: Optimize try-to-wake-up IPI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit e3baac47f0e82c4be632f4f97215bb93bf16b342
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e3baac47.failed
+
+[ This series reduces the number of IPIs on Andy's workload by something like
+  99%. It's down from many hundreds per second to very few.
+
+  The basic idea behind this series is to make TIF_POLLING_NRFLAG be a
+  reliable indication that the idle task is polling.  Once that's done,
+  the rest is reasonably straightforward. ]
+
+When enqueueing tasks on remote LLC domains, we send an IPI to do the
+work 'locally' and avoid bouncing all the cachelines over.
+
+However, when the remote CPU is idle (and polling, say x86 mwait), we
+don't need to send an IPI, we can simply kick the TIF word to wake it
+up and have the 'idle' loop do the work.
+
+So when _TIF_POLLING_NRFLAG is set, but _TIF_NEED_RESCHED is not (yet)
+set, set _TIF_NEED_RESCHED and avoid sending the IPI.
+
+Much-requested-by: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+[Edited by Andy Lutomirski, but this is mostly Peter Zijlstra's code.]
+	Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+	Cc: nicolas.pitre@linaro.org
+	Cc: daniel.lezcano@linaro.org
+	Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Cc: umgwanakikbuti@gmail.com
+	Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/r/ce06f8b02e7e337be63e97597fc4b248d3aa6f9b.1401902905.git.luto@amacapital.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e3baac47f0e82c4be632f4f97215bb93bf16b342)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/idle.c
+diff --cc kernel/sched/core.c
+index bb1463993f6a,60d4e05d64dd..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -523,6 -506,71 +523,74 @@@ static inline void init_hrtick(void
+  #endif	/* CONFIG_SCHED_HRTICK */
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * cmpxchg based fetch_or, macro so it works for different integer types
++  */
++ #define fetch_or(ptr, val)						\
++ ({	typeof(*(ptr)) __old, __val = *(ptr);				\
++  	for (;;) {							\
++  		__old = cmpxchg((ptr), __val, __val | (val));		\
++  		if (__old == __val)					\
++  			break;						\
++  		__val = __old;						\
++  	}								\
++  	__old;								\
++ })
++ 
++ #if defined(CONFIG_SMP) && defined(TIF_POLLING_NRFLAG)
++ /*
++  * Atomically set TIF_NEED_RESCHED and test for TIF_POLLING_NRFLAG,
++  * this avoids any races wrt polling state changes and thereby avoids
++  * spurious IPIs.
++  */
++ static bool set_nr_and_not_polling(struct task_struct *p)
++ {
++ 	struct thread_info *ti = task_thread_info(p);
++ 	return !(fetch_or(&ti->flags, _TIF_NEED_RESCHED) & _TIF_POLLING_NRFLAG);
++ }
++ 
++ /*
++  * Atomically set TIF_NEED_RESCHED if TIF_POLLING_NRFLAG is set.
++  *
++  * If this returns true, then the idle task promises to call
++  * sched_ttwu_pending() and reschedule soon.
++  */
++ static bool set_nr_if_polling(struct task_struct *p)
++ {
++ 	struct thread_info *ti = task_thread_info(p);
++ 	typeof(ti->flags) old, val = ACCESS_ONCE(ti->flags);
++ 
++ 	for (;;) {
++ 		if (!(val & _TIF_POLLING_NRFLAG))
++ 			return false;
++ 		if (val & _TIF_NEED_RESCHED)
++ 			return true;
++ 		old = cmpxchg(&ti->flags, val, val | _TIF_NEED_RESCHED);
++ 		if (old == val)
++ 			break;
++ 		val = old;
++ 	}
++ 	return true;
++ }
++ 
++ #else
++ static bool set_nr_and_not_polling(struct task_struct *p)
++ {
++ 	set_tsk_need_resched(p);
++ 	return true;
++ }
++ 
++ #ifdef CONFIG_SMP
++ static bool set_nr_if_polling(struct task_struct *p)
++ {
++ 	return false;
++ }
++ #endif
++ #endif
++ 
++ /*
+++>>>>>>> e3baac47f0e8 (sched/idle: Optimize try-to-wake-up IPI)
+   * resched_task - mark a task 'to be rescheduled now'.
+   *
+   * On UP this means the setting of the need_resched flag, on SMP it
+* Unmerged path kernel/sched/idle.c
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/idle.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 7f24e53654a1..20f7300c37eb 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -570,6 +570,8 @@ extern int migrate_swap(struct task_struct *, struct task_struct *);
+ 
+ #ifdef CONFIG_SMP
+ 
++extern void sched_ttwu_pending(void);
++
+ #define rcu_dereference_check_sched_domain(p) \
+ 	rcu_dereference_check((p), \
+ 			      lockdep_is_held(&sched_domains_mutex))
+@@ -685,6 +687,10 @@ static inline unsigned int group_first_cpu(struct sched_group *group)
+ 
+ extern int group_balance_cpu(struct sched_group *sg);
+ 
++#else
++
++static inline void sched_ttwu_pending(void) { }
++
+ #endif /* CONFIG_SMP */
+ 
+ #include "stats.h"
