@@ -1,0 +1,272 @@
+time: Add cycles to nanoseconds translation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christopher S. Hall <christopher.s.hall@intel.com>
+commit 6bd58f09e1d8cc6c50a824c00bf0d617919986a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6bd58f09.failed
+
+The timekeeping code does not currently provide a way to translate
+externally provided clocksource cycles to system time. The cycle count
+is always provided by the result clocksource read() method internal to
+the timekeeping code. The added function timekeeping_cycles_to_ns()
+calculated a nanosecond value from a cycle count that can be added to
+tk_read_base.base value yielding the current system time. This allows
+clocksource cycle values external to the timekeeping code to provide a
+cycle count that can be transformed to system time.
+
+	Cc: Prarit Bhargava <prarit@redhat.com>
+	Cc: Richard Cochran <richardcochran@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: kevin.b.stanton@intel.com
+	Cc: kevin.j.clarke@intel.com
+	Cc: hpa@zytor.com
+	Cc: jeffrey.t.kirsher@intel.com
+	Cc: netdev@vger.kernel.org
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Christopher S. Hall <christopher.s.hall@intel.com>
+	Signed-off-by: John Stultz <john.stultz@linaro.org>
+(cherry picked from commit 6bd58f09e1d8cc6c50a824c00bf0d617919986a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/time/timekeeping.c
+diff --cc kernel/time/timekeeping.c
+index 7bb86335a3a9,4243d28177ac..000000000000
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@@ -159,45 -298,195 +159,91 @@@ u32 (*arch_gettimeoffset)(void) = defau
+  static inline u32 arch_gettimeoffset(void) { return 0; }
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline s64 timekeeping_get_ns(struct timekeeper *tk)
+ +{
+ +	cycle_t cycle_now, delta;
+ +	struct clocksource *clock;
+ +	s64 nsec;
+ +
+ +	/* read clocksource: */
+ +	clock = tk->clock;
+ +	cycle_now = clock->read(clock);
+ +
+ +	/* calculate the delta since the last update_wall_time: */
+ +	delta = clocksource_delta(cycle_now, clock->cycle_last, clock->mask);
+ +
+ +	nsec = delta * tk->mult + tk->xtime_nsec;
+ +	nsec >>= tk->shift;
+++=======
++ static inline s64 timekeeping_delta_to_ns(struct tk_read_base *tkr,
++ 					  cycle_t delta)
++ {
++ 	s64 nsec;
++ 
++ 	nsec = delta * tkr->mult + tkr->xtime_nsec;
++ 	nsec >>= tkr->shift;
+++>>>>>>> 6bd58f09e1d8 (time: Add cycles to nanoseconds translation)
+  
+  	/* If arch requires, add in get_arch_timeoffset() */
+  	return nsec + arch_gettimeoffset();
+  }
+  
+++<<<<<<< HEAD
+ +static inline s64 timekeeping_get_ns_raw(struct timekeeper *tk)
+++=======
++ static inline s64 timekeeping_get_ns(struct tk_read_base *tkr)
++ {
++ 	cycle_t delta;
++ 
++ 	delta = timekeeping_get_delta(tkr);
++ 	return timekeeping_delta_to_ns(tkr, delta);
++ }
++ 
++ static inline s64 timekeeping_cycles_to_ns(struct tk_read_base *tkr,
++ 					    cycle_t cycles)
++ {
++ 	cycle_t delta;
++ 
++ 	/* calculate the delta since the last update_wall_time */
++ 	delta = clocksource_delta(cycles, tkr->cycle_last, tkr->mask);
++ 	return timekeeping_delta_to_ns(tkr, delta);
++ }
++ 
++ /**
++  * update_fast_timekeeper - Update the fast and NMI safe monotonic timekeeper.
++  * @tkr: Timekeeping readout base from which we take the update
++  *
++  * We want to use this from any context including NMI and tracing /
++  * instrumenting the timekeeping code itself.
++  *
++  * Employ the latch technique; see @raw_write_seqcount_latch.
++  *
++  * So if a NMI hits the update of base[0] then it will use base[1]
++  * which is still consistent. In the worst case this can result is a
++  * slightly wrong timestamp (a few nanoseconds). See
++  * @ktime_get_mono_fast_ns.
++  */
++ static void update_fast_timekeeper(struct tk_read_base *tkr, struct tk_fast *tkf)
+++>>>>>>> 6bd58f09e1d8 (time: Add cycles to nanoseconds translation)
+  {
+ -	struct tk_read_base *base = tkf->base;
+ -
+ -	/* Force readers off to base[1] */
+ -	raw_write_seqcount_latch(&tkf->seq);
+ -
+ -	/* Update base[0] */
+ -	memcpy(base, tkr, sizeof(*base));
+ -
+ -	/* Force readers back to base[0] */
+ -	raw_write_seqcount_latch(&tkf->seq);
+ -
+ -	/* Update base[1] */
+ -	memcpy(base + 1, base, sizeof(*base));
+ -}
+ -
+ -/**
+ - * ktime_get_mono_fast_ns - Fast NMI safe access to clock monotonic
+ - *
+ - * This timestamp is not guaranteed to be monotonic across an update.
+ - * The timestamp is calculated by:
+ - *
+ - *	now = base_mono + clock_delta * slope
+ - *
+ - * So if the update lowers the slope, readers who are forced to the
+ - * not yet updated second array are still using the old steeper slope.
+ - *
+ - * tmono
+ - * ^
+ - * |    o  n
+ - * |   o n
+ - * |  u
+ - * | o
+ - * |o
+ - * |12345678---> reader order
+ - *
+ - * o = old slope
+ - * u = update
+ - * n = new slope
+ - *
+ - * So reader 6 will observe time going backwards versus reader 5.
+ - *
+ - * While other CPUs are likely to be able observe that, the only way
+ - * for a CPU local observation is when an NMI hits in the middle of
+ - * the update. Timestamps taken from that NMI context might be ahead
+ - * of the following timestamps. Callers need to be aware of that and
+ - * deal with it.
+ - */
+ -static __always_inline u64 __ktime_get_fast_ns(struct tk_fast *tkf)
+ -{
+ -	struct tk_read_base *tkr;
+ -	unsigned int seq;
+ -	u64 now;
+ -
+ -	do {
+ -		seq = raw_read_seqcount_latch(&tkf->seq);
+ -		tkr = tkf->base + (seq & 0x01);
+ -		now = ktime_to_ns(tkr->base) + timekeeping_get_ns(tkr);
+ -	} while (read_seqcount_retry(&tkf->seq, seq));
+ -
+ -	return now;
+ -}
+ -
+ -u64 ktime_get_mono_fast_ns(void)
+ -{
+ -	return __ktime_get_fast_ns(&tk_fast_mono);
+ -}
+ -EXPORT_SYMBOL_GPL(ktime_get_mono_fast_ns);
+ -
+ -u64 ktime_get_raw_fast_ns(void)
+ -{
+ -	return __ktime_get_fast_ns(&tk_fast_raw);
+ -}
+ -EXPORT_SYMBOL_GPL(ktime_get_raw_fast_ns);
+ -
+ -/* Suspend-time cycles value for halted fast timekeeper. */
+ -static cycle_t cycles_at_suspend;
+ -
+ -static cycle_t dummy_clock_read(struct clocksource *cs)
+ -{
+ -	return cycles_at_suspend;
+ -}
+ -
+ -/**
+ - * halt_fast_timekeeper - Prevent fast timekeeper from accessing clocksource.
+ - * @tk: Timekeeper to snapshot.
+ - *
+ - * It generally is unsafe to access the clocksource after timekeeping has been
+ - * suspended, so take a snapshot of the readout base of @tk and use it as the
+ - * fast timekeeper's readout base while suspended.  It will return the same
+ - * number of cycles every time until timekeeping is resumed at which time the
+ - * proper readout base for the fast timekeeper will be restored automatically.
+ - */
+ -static void halt_fast_timekeeper(struct timekeeper *tk)
+ -{
+ -	static struct tk_read_base tkr_dummy;
+ -	struct tk_read_base *tkr = &tk->tkr_mono;
+ -
+ -	memcpy(&tkr_dummy, tkr, sizeof(tkr_dummy));
+ -	cycles_at_suspend = tkr->read(tkr->clock);
+ -	tkr_dummy.read = dummy_clock_read;
+ -	update_fast_timekeeper(&tkr_dummy, &tk_fast_mono);
+ -
+ -	tkr = &tk->tkr_raw;
+ -	memcpy(&tkr_dummy, tkr, sizeof(tkr_dummy));
+ -	tkr_dummy.read = dummy_clock_read;
+ -	update_fast_timekeeper(&tkr_dummy, &tk_fast_raw);
+ -}
+ +	cycle_t cycle_now, delta;
+ +	struct clocksource *clock;
+ +	s64 nsec;
+  
+ -#ifdef CONFIG_GENERIC_TIME_VSYSCALL_OLD
+ +	/* read clocksource: */
+ +	clock = tk->clock;
+ +	cycle_now = clock->read(clock);
+  
+ -static inline void update_vsyscall(struct timekeeper *tk)
+ -{
+ -	struct timespec xt, wm;
+ +	/* calculate the delta since the last update_wall_time: */
+ +	delta = clocksource_delta(cycle_now, clock->cycle_last, clock->mask);
+  
+ -	xt = timespec64_to_timespec(tk_xtime(tk));
+ -	wm = timespec64_to_timespec(tk->wall_to_monotonic);
+ -	update_vsyscall_old(&xt, &wm, tk->tkr_mono.clock, tk->tkr_mono.mult,
+ -			    tk->tkr_mono.cycle_last);
+ -}
+ +	/* convert delta to nanoseconds. */
+ +	nsec = clocksource_cyc2ns(delta, clock->mult, clock->shift);
+  
+ -static inline void old_vsyscall_fixup(struct timekeeper *tk)
+ -{
+ -	s64 remainder;
+ -
+ -	/*
+ -	* Store only full nanoseconds into xtime_nsec after rounding
+ -	* it up and add the remainder to the error difference.
+ -	* XXX - This is necessary to avoid small 1ns inconsistnecies caused
+ -	* by truncating the remainder in vsyscalls. However, it causes
+ -	* additional work to be done in timekeeping_adjust(). Once
+ -	* the vsyscall implementations are converted to use xtime_nsec
+ -	* (shifted nanoseconds), and CONFIG_GENERIC_TIME_VSYSCALL_OLD
+ -	* users are removed, this can be killed.
+ -	*/
+ -	remainder = tk->tkr_mono.xtime_nsec & ((1ULL << tk->tkr_mono.shift) - 1);
+ -	tk->tkr_mono.xtime_nsec -= remainder;
+ -	tk->tkr_mono.xtime_nsec += 1ULL << tk->tkr_mono.shift;
+ -	tk->ntp_error += remainder << tk->ntp_error_shift;
+ -	tk->ntp_error -= (1ULL << tk->tkr_mono.shift) << tk->ntp_error_shift;
+ +	/* If arch requires, add in get_arch_timeoffset() */
+ +	return nsec + arch_gettimeoffset();
+  }
+ -#else
+ -#define old_vsyscall_fixup(tk)
+ -#endif
+  
+  static RAW_NOTIFIER_HEAD(pvclock_gtod_chain);
+  
+* Unmerged path kernel/time/timekeeping.c
