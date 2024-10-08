@@ -1,0 +1,98 @@
+kvm: do not handle APIC access page if in-kernel irqchip is not in use
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit f439ed27f8b8b90d243ae15acb193d37f96eebe0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f439ed27.failed
+
+This fixes the following OOPS:
+
+   loaded kvm module (v3.17-rc1-168-gcec26bc)
+   BUG: unable to handle kernel paging request at fffffffffffffffe
+   IP: [<ffffffff81168449>] put_page+0x9/0x30
+   PGD 1e15067 PUD 1e17067 PMD 0
+   Oops: 0000 [#1] PREEMPT SMP
+    [<ffffffffa063271d>] ? kvm_vcpu_reload_apic_access_page+0x5d/0x70 [kvm]
+    [<ffffffffa013b6db>] vmx_vcpu_reset+0x21b/0x470 [kvm_intel]
+    [<ffffffffa0658816>] ? kvm_pmu_reset+0x76/0xb0 [kvm]
+    [<ffffffffa064032a>] kvm_vcpu_reset+0x15a/0x1b0 [kvm]
+    [<ffffffffa06403ac>] kvm_arch_vcpu_setup+0x2c/0x50 [kvm]
+    [<ffffffffa062e540>] kvm_vm_ioctl+0x200/0x780 [kvm]
+    [<ffffffff81212170>] do_vfs_ioctl+0x2d0/0x4b0
+    [<ffffffff8108bd99>] ? __mmdrop+0x69/0xb0
+    [<ffffffff812123d1>] SyS_ioctl+0x81/0xa0
+    [<ffffffff8112a6f6>] ? __audit_syscall_exit+0x1f6/0x2a0
+    [<ffffffff817229e9>] system_call_fastpath+0x16/0x1b
+   Code: c6 78 ce a3 81 4c 89 e7 e8 d9 80 ff ff 0f 0b 4c 89 e7 e8 8f f6 ff ff e9 fa fe ff ff 66 2e 0f 1f 84 00 00 00 00 00 66 66 66 66 90 <48> f7 07 00 c0 00 00 55 48 89 e5 75 1e 8b 47 1c 85 c0 74 27 f0
+   RIP  [<ffffffff81193045>] put_page+0x5/0x50
+
+when not using the in-kernel irqchip ("-machine kernel_irqchip=off"
+with QEMU).  The fix is to make the same check in
+kvm_vcpu_reload_apic_access_page that we already have
+in vmx.c's vm_need_virtualize_apic_accesses().
+
+	Reported-by: Jan Kiszka <jan.kiszka@siemens.com>
+	Tested-by: Jan Kiszka <jan.kiszka@siemens.com>
+Fixes: 4256f43f9fab91e1c17b5846a240cf4b66a768a8
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f439ed27f8b8b90d243ae15acb193d37f96eebe0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index fbab0434f978,5430e4b0af29..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -5916,6 -6020,44 +5916,47 @@@ static void vcpu_scan_ioapic(struct kvm
+  	kvm_apic_update_tmr(vcpu, tmr);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kvm_vcpu_flush_tlb(struct kvm_vcpu *vcpu)
++ {
++ 	++vcpu->stat.tlb_flush;
++ 	kvm_x86_ops->tlb_flush(vcpu);
++ }
++ 
++ void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
++ {
++ 	struct page *page = NULL;
++ 
++ 	if (!irqchip_in_kernel(vcpu->kvm))
++ 		return;
++ 
++ 	if (!kvm_x86_ops->set_apic_access_page_addr)
++ 		return;
++ 
++ 	page = gfn_to_page(vcpu->kvm, APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT);
++ 	kvm_x86_ops->set_apic_access_page_addr(vcpu, page_to_phys(page));
++ 
++ 	/*
++ 	 * Do not pin apic access page in memory, the MMU notifier
++ 	 * will call us again if it is migrated or swapped out.
++ 	 */
++ 	put_page(page);
++ }
++ EXPORT_SYMBOL_GPL(kvm_vcpu_reload_apic_access_page);
++ 
++ void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
++ 					   unsigned long address)
++ {
++ 	/*
++ 	 * The physical address of apic access page is stored in the VMCS.
++ 	 * Update it when it becomes invalid.
++ 	 */
++ 	if (address == gfn_to_hva(kvm, APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT))
++ 		kvm_make_all_cpus_request(kvm, KVM_REQ_APIC_PAGE_RELOAD);
++ }
++ 
+++>>>>>>> f439ed27f8b8 (kvm: do not handle APIC access page if in-kernel irqchip is not in use)
+  /*
+   * Returns 1 to let __vcpu_run() continue the guest execution loop without
+   * exiting to the userspace.  Otherwise, the value will be returned to the
+* Unmerged path arch/x86/kvm/x86.c
