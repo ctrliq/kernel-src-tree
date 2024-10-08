@@ -1,0 +1,371 @@
+dm mpath: eliminate use of spinlock in IO fast-paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 2da1610ae20e995e53658c3b10166d2ad74e30bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2da1610a.failed
+
+The primary motivation of this commit is to improve the scalability of
+DM multipath on large NUMA systems where m->lock spinlock contention has
+been proven to be a serious bottleneck on really fast storage.
+
+The ability to atomically read a pointer, using lockless_dereference(),
+is leveraged in this commit.  But all pointer writes are still protected
+by the m->lock spinlock (which is fine since these all now occur in the
+slow-path).
+
+The following functions no longer require the m->lock spinlock in their
+fast-path: multipath_busy(), __multipath_map(), and do_end_io()
+
+And choose_pgpath() is modified to _not_ update m->current_pgpath unless
+it also switches the path-group.  This is done to avoid needing to take
+the m->lock everytime __multipath_map() calls choose_pgpath().
+But m->current_pgpath will be reset if it is failed via fail_path().
+
+	Suggested-by: Jeff Moyer <jmoyer@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Tested-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 2da1610ae20e995e53658c3b10166d2ad74e30bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index e077a28bdb3f,52baf8a5b0f4..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -295,51 -300,73 +295,73 @@@ static int __pg_init_all_paths(struct m
+  			continue;
+  		if (queue_delayed_work(kmpath_handlerd, &pgpath->activate_path,
+  				       pg_init_delay))
+ -			atomic_inc(&m->pg_init_in_progress);
+ +			m->pg_init_in_progress++;
+  	}
+ -	return atomic_read(&m->pg_init_in_progress);
+ +	return m->pg_init_in_progress;
+  }
+  
+- static void __switch_pg(struct multipath *m, struct pgpath *pgpath)
++ static int pg_init_all_paths(struct multipath *m)
+  {
+- 	m->current_pg = pgpath->pg;
++ 	int r;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&m->lock, flags);
++ 	r = __pg_init_all_paths(m);
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 
++ 	return r;
++ }
++ 
++ static void __switch_pg(struct multipath *m, struct priority_group *pg)
++ {
++ 	m->current_pg = pg;
+  
+  	/* Must we initialise the PG first, and queue I/O till it's ready? */
+  	if (m->hw_handler_name) {
+ -		set_bit(MPATHF_PG_INIT_REQUIRED, &m->flags);
+ -		set_bit(MPATHF_QUEUE_IO, &m->flags);
+ +		m->pg_init_required = true;
+ +		m->queue_io = true;
+  	} else {
+ -		clear_bit(MPATHF_PG_INIT_REQUIRED, &m->flags);
+ -		clear_bit(MPATHF_QUEUE_IO, &m->flags);
+ +		m->pg_init_required = false;
+ +		m->queue_io = false;
+  	}
+  
+ -	atomic_set(&m->pg_init_count, 0);
+ +	m->pg_init_count = 0;
+  }
+  
+- static int __choose_path_in_pg(struct multipath *m, struct priority_group *pg,
+- 			       size_t nr_bytes)
++ static struct pgpath *choose_path_in_pg(struct multipath *m,
++ 					struct priority_group *pg,
++ 					size_t nr_bytes)
+  {
++ 	unsigned long flags;
+  	struct dm_path *path;
++ 	struct pgpath *pgpath;
+  
+  	path = pg->ps.type->select_path(&pg->ps, nr_bytes);
+  	if (!path)
+- 		return -ENXIO;
++ 		return ERR_PTR(-ENXIO);
+  
+- 	m->current_pgpath = path_to_pgpath(path);
++ 	pgpath = path_to_pgpath(path);
+  
+- 	if (m->current_pg != pg)
+- 		__switch_pg(m, m->current_pgpath);
++ 	if (unlikely(lockless_dereference(m->current_pg) != pg)) {
++ 		/* Only update current_pgpath if pg changed */
++ 		spin_lock_irqsave(&m->lock, flags);
++ 		m->current_pgpath = pgpath;
++ 		__switch_pg(m, pg);
++ 		spin_unlock_irqrestore(&m->lock, flags);
++ 	}
+  
+- 	return 0;
++ 	return pgpath;
+  }
+  
+- static void __choose_pgpath(struct multipath *m, size_t nr_bytes)
++ static struct pgpath *choose_pgpath(struct multipath *m, size_t nr_bytes)
+  {
++ 	unsigned long flags;
+  	struct priority_group *pg;
++ 	struct pgpath *pgpath;
+  	bool bypassed = true;
+  
+ -	if (!atomic_read(&m->nr_valid_paths)) {
+ -		clear_bit(MPATHF_QUEUE_IO, &m->flags);
+ +	if (!m->nr_valid_paths) {
+ +		m->queue_io = false;
+  		goto failed;
+  	}
+  
+@@@ -365,10 -404,11 +399,16 @@@ check_current_pg
+  		list_for_each_entry(pg, &m->priority_groups, list) {
+  			if (pg->bypassed == bypassed)
+  				continue;
+- 			if (!__choose_path_in_pg(m, pg, nr_bytes)) {
++ 			pgpath = choose_path_in_pg(m, pg, nr_bytes);
++ 			if (!IS_ERR_OR_NULL(pgpath)) {
+  				if (!bypassed)
+++<<<<<<< HEAD
+ +					m->pg_init_delay_retry = true;
+ +				return;
+++=======
++ 					set_bit(MPATHF_PG_INIT_DELAY_RETRY, &m->flags);
++ 				return pgpath;
+++>>>>>>> 2da1610ae20e (dm mpath: eliminate use of spinlock in IO fast-paths)
+  			}
+  		}
+  	} while (bypassed--);
+@@@ -389,10 -431,11 +431,10 @@@ failed
+   * and multipath_resume() calls and we have no need to check
+   * for the DMF_NOFLUSH_SUSPENDING flag.
+   */
+- static int __must_push_back(struct multipath *m)
++ static int must_push_back(struct multipath *m)
+  {
+ -	return (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) ||
+ -		((test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) !=
+ -		  test_bit(MPATHF_SAVED_QUEUE_IF_NO_PATH, &m->flags)) &&
+ +	return (m->queue_if_no_path ||
+ +		(m->queue_if_no_path != m->saved_queue_if_no_path &&
+  		 dm_noflush_suspending(m->ti)));
+  }
+  
+@@@ -410,21 -453,19 +452,33 @@@ static int __multipath_map(struct dm_ta
+  	struct block_device *bdev;
+  	struct dm_mpath_io *mpio;
+  
+- 	spin_lock_irq(&m->lock);
+- 
+  	/* Do we need to select a new pgpath? */
+++<<<<<<< HEAD
+ +	if (!m->current_pgpath || !m->queue_io)
+ +		__choose_pgpath(m, nr_bytes);
+ +
+ +	pgpath = m->current_pgpath;
+++=======
++ 	pgpath = lockless_dereference(m->current_pgpath);
++ 	if (!pgpath || !test_bit(MPATHF_QUEUE_IO, &m->flags))
++ 		pgpath = choose_pgpath(m, nr_bytes);
+++>>>>>>> 2da1610ae20e (dm mpath: eliminate use of spinlock in IO fast-paths)
+  
+  	if (!pgpath) {
+- 		if (!__must_push_back(m))
++ 		if (!must_push_back(m))
+  			r = -EIO;	/* Failed */
+++<<<<<<< HEAD
+ +		goto out_unlock;
+ +	} else if (m->queue_io || m->pg_init_required) {
+ +		__pg_init_all_paths(m);
+ +		goto out_unlock;
+++=======
++ 		return r;
++ 	} else if (test_bit(MPATHF_QUEUE_IO, &m->flags) ||
++ 		   test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags)) {
++ 		pg_init_all_paths(m);
++ 		return r;
+++>>>>>>> 2da1610ae20e (dm mpath: eliminate use of spinlock in IO fast-paths)
+  	}
+  
+  	mpio = set_mpio(m, map_context);
+@@@ -437,10 -478,11 +491,8 @@@
+  
+  	bdev = pgpath->path.dev->bdev;
+  
+- 	spin_unlock_irq(&m->lock);
+- 
+  	if (clone) {
+ -		/*
+ -		 * Old request-based interface: allocated clone is passed in.
+ -		 * Used by: .request_fn stacked on .request_fn path(s).
+ -		 */
+ +		/* Old request-based interface: allocated clone is passed in */
+  		clone->q = bdev_get_queue(bdev);
+  		clone->rq_disk = bdev->bd_disk;
+  		clone->cmd_flags |= REQ_FAILFAST_TRANSPORT;
+@@@ -1305,10 -1345,9 +1351,16 @@@ static int do_end_io(struct multipath *
+  	if (mpio->pgpath)
+  		fail_path(mpio->pgpath);
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&m->lock, flags);
+ +	if (!m->nr_valid_paths) {
+ +		if (!m->queue_if_no_path) {
+ +			if (!__must_push_back(m))
+++=======
++ 	if (!atomic_read(&m->nr_valid_paths)) {
++ 		if (!test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
++ 			if (!must_push_back(m))
+++>>>>>>> 2da1610ae20e (dm mpath: eliminate use of spinlock in IO fast-paths)
+  				r = -EIO;
+  		} else {
+  			if (error == -EBADE)
+@@@ -1566,54 -1606,41 +1617,88 @@@ out
+  	return r;
+  }
+  
+ -static int multipath_prepare_ioctl(struct dm_target *ti,
+ -		struct block_device **bdev, fmode_t *mode)
+ +static int multipath_ioctl(struct dm_target *ti, unsigned int cmd,
+ +			   unsigned long arg)
+  {
+  	struct multipath *m = ti->private;
+++<<<<<<< HEAD
+ +	struct pgpath *pgpath;
+ +	struct block_device *bdev;
+ +	fmode_t mode;
+ +	unsigned long flags;
+ +	int r;
+ +
+ +	bdev = NULL;
+ +	mode = 0;
+ +	r = 0;
+ +
+ +	spin_lock_irqsave(&m->lock, flags);
+ +
+ +	if (!m->current_pgpath)
+ +		__choose_pgpath(m, 0);
+ +
+ +	pgpath = m->current_pgpath;
+ +
+ +	if (pgpath) {
+ +		bdev = pgpath->path.dev->bdev;
+ +		mode = pgpath->path.dev->mode;
+ +	}
+ +
+ +	if ((pgpath && m->queue_io) || (!pgpath && m->queue_if_no_path))
+ +		r = -ENOTCONN;
+ +	else if (!bdev)
+ +		r = -EIO;
+ +
+ +	spin_unlock_irqrestore(&m->lock, flags);
+ +
+ +	/*
+ +	 * Only pass ioctls through if the device sizes match exactly.
+ +	 */
+ +	if (!r && ti->len != i_size_read(bdev->bd_inode) >> SECTOR_SHIFT)
+ +		r = scsi_verify_blk_ioctl(NULL, cmd);
+ +
+ +	if (r == -ENOTCONN && !fatal_signal_pending(current)) {
+ +		spin_lock_irqsave(&m->lock, flags);
+ +		if (!m->current_pg) {
+++=======
++ 	struct pgpath *current_pgpath;
++ 	int r;
++ 
++ 	current_pgpath = lockless_dereference(m->current_pgpath);
++ 	if (!current_pgpath)
++ 		current_pgpath = choose_pgpath(m, 0);
++ 
++ 	if (current_pgpath) {
++ 		if (!test_bit(MPATHF_QUEUE_IO, &m->flags)) {
++ 			*bdev = current_pgpath->path.dev->bdev;
++ 			*mode = current_pgpath->path.dev->mode;
++ 			r = 0;
++ 		} else {
++ 			/* pg_init has not started or completed */
++ 			r = -ENOTCONN;
++ 		}
++ 	} else {
++ 		/* No path is available */
++ 		if (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))
++ 			r = -ENOTCONN;
++ 		else
++ 			r = -EIO;
++ 	}
++ 
++ 	if (r == -ENOTCONN) {
++ 		if (!lockless_dereference(m->current_pg)) {
+++>>>>>>> 2da1610ae20e (dm mpath: eliminate use of spinlock in IO fast-paths)
+  			/* Path status changed, redo selection */
+- 			__choose_pgpath(m, 0);
++ 			(void) choose_pgpath(m, 0);
+  		}
+++<<<<<<< HEAD
+ +		if (m->pg_init_required)
+ +			__pg_init_all_paths(m);
+ +		spin_unlock_irqrestore(&m->lock, flags);
+++=======
++ 		if (test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags))
++ 			pg_init_all_paths(m);
+++>>>>>>> 2da1610ae20e (dm mpath: eliminate use of spinlock in IO fast-paths)
+  		dm_table_run_md_queue_async(m->ti->table);
+  	}
+  
+@@@ -1659,27 -1691,24 +1744,32 @@@ static int multipath_busy(struct dm_tar
+  {
+  	bool busy = false, has_active = false;
+  	struct multipath *m = ti->private;
+- 	struct priority_group *pg;
++ 	struct priority_group *pg, *next_pg;
+  	struct pgpath *pgpath;
+- 	unsigned long flags;
+- 
+- 	spin_lock_irqsave(&m->lock, flags);
+  
+  	/* pg_init in progress or no paths available */
+++<<<<<<< HEAD
+ +	if (m->pg_init_in_progress ||
+ +	    (!m->nr_valid_paths && m->queue_if_no_path)) {
+ +		busy = true;
+ +		goto out;
+ +	}
+++=======
++ 	if (atomic_read(&m->pg_init_in_progress) ||
++ 	    (!atomic_read(&m->nr_valid_paths) && test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)))
++ 		return true;
++ 
+++>>>>>>> 2da1610ae20e (dm mpath: eliminate use of spinlock in IO fast-paths)
+  	/* Guess which priority_group will be used at next mapping time */
+- 	if (unlikely(!m->current_pgpath && m->next_pg))
+- 		pg = m->next_pg;
+- 	else if (likely(m->current_pg))
+- 		pg = m->current_pg;
+- 	else
++ 	pg = lockless_dereference(m->current_pg);
++ 	next_pg = lockless_dereference(m->next_pg);
++ 	if (unlikely(!lockless_dereference(m->current_pgpath) && next_pg))
++ 		pg = next_pg;
++ 
++ 	if (!pg) {
+  		/*
+  		 * We don't know which pg will be used at next mapping time.
+- 		 * We don't call __choose_pgpath() here to avoid to trigger
++ 		 * We don't call choose_pgpath() here to avoid to trigger
+  		 * pg_init just by busy checking.
+  		 * So we don't know whether underlying devices we will be using
+  		 * at next mapping time are busy or not. Just try mapping.
+* Unmerged path drivers/md/dm-mpath.c
