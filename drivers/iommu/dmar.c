@@ -724,6 +724,7 @@ static int alloc_iommu(struct dmar_drhd_unit *drhd)
 	}
 	iommu->agaw = agaw;
 	iommu->msagaw = msagaw;
+	iommu->segment = drhd->segment;
 
 	iommu->node = -1;
 
