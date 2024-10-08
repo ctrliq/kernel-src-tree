@@ -1,0 +1,173 @@
+perf callchain: Move cpumode resolve code to add_callchain_ip
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] callchain: Move cpumode resolve code to add_callchain_ip (Jiri Olsa) [1209607]
+Rebuild_FUZZ: 95.73%
+commit-author Kan Liang <kan.liang@intel.com>
+commit 2e77784bb7d882647c33d8e75a650625e6df0f8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2e77784b.failed
+
+Using flag to distinguish between branch_history and normal callchain.
+
+Move the cpumode to add_callchain_ip function.
+
+No change in behavior.
+
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Acked-by: Jiri Olsa <jolsa@redhat.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/r/1417532814-26208-3-git-send-email-kan.liang@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 2e77784bb7d882647c33d8e75a650625e6df0f8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/machine.c
+diff --cc tools/perf/util/machine.c
+index b75b487574c7,94de3e48b490..000000000000
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@@ -1391,8 -1392,39 +1391,43 @@@ static int add_callchain_ip(struct thre
+  
+  	al.filtered = 0;
+  	al.sym = NULL;
+++<<<<<<< HEAD
+ +	thread__find_addr_location(thread, cpumode, MAP__FUNCTION,
+++=======
++ 	if (branch_history)
++ 		thread__find_cpumode_addr_location(thread, MAP__FUNCTION,
++ 						   ip, &al);
++ 	else {
++ 		u8 cpumode = PERF_RECORD_MISC_USER;
++ 
++ 		if (ip >= PERF_CONTEXT_MAX) {
++ 			switch (ip) {
++ 			case PERF_CONTEXT_HV:
++ 				cpumode = PERF_RECORD_MISC_HYPERVISOR;
++ 				break;
++ 			case PERF_CONTEXT_KERNEL:
++ 				cpumode = PERF_RECORD_MISC_KERNEL;
++ 				break;
++ 			case PERF_CONTEXT_USER:
++ 				cpumode = PERF_RECORD_MISC_USER;
++ 				break;
++ 			default:
++ 				pr_debug("invalid callchain context: "
++ 					 "%"PRId64"\n", (s64) ip);
++ 				/*
++ 				 * It seems the callchain is corrupted.
++ 				 * Discard all.
++ 				 */
++ 				callchain_cursor_reset(&callchain_cursor);
++ 				return 1;
++ 			}
++ 			return 0;
++ 		}
++ 		thread__find_addr_location(thread, cpumode, MAP__FUNCTION,
+++>>>>>>> 2e77784bb7d8 (perf callchain: Move cpumode resolve code to add_callchain_ip)
+  				   ip, &al);
++ 	}
++ 
+  	if (al.sym != NULL) {
+  		if (sort__has_parent && !*parent &&
+  		    symbol__match_regex(al.sym, &parent_regex))
+@@@ -1433,15 -1507,78 +1468,88 @@@ static int thread__resolve_callchain_sa
+  					     struct addr_location *root_al,
+  					     int max_stack)
+  {
+- 	u8 cpumode = PERF_RECORD_MISC_USER;
+  	int chain_nr = min(max_stack, (int)chain->nr);
+++<<<<<<< HEAD
+ +	int i;
+ +	int j;
+ +	int err;
+ +	int skip_idx __maybe_unused;
+ +
+ +	callchain_cursor_reset(&callchain_cursor);
+ +
+++=======
++ 	int i, j, err;
++ 	int skip_idx = -1;
++ 	int first_call = 0;
++ 
++ 	/*
++ 	 * Based on DWARF debug information, some architectures skip
++ 	 * a callchain entry saved by the kernel.
++ 	 */
++ 	if (chain->nr < PERF_MAX_STACK_DEPTH)
++ 		skip_idx = arch_skip_callchain_idx(thread, chain);
++ 
++ 	callchain_cursor_reset(&callchain_cursor);
++ 
++ 	/*
++ 	 * Add branches to call stack for easier browsing. This gives
++ 	 * more context for a sample than just the callers.
++ 	 *
++ 	 * This uses individual histograms of paths compared to the
++ 	 * aggregated histograms the normal LBR mode uses.
++ 	 *
++ 	 * Limitations for now:
++ 	 * - No extra filters
++ 	 * - No annotations (should annotate somehow)
++ 	 */
++ 
++ 	if (branch && callchain_param.branch_callstack) {
++ 		int nr = min(max_stack, (int)branch->nr);
++ 		struct branch_entry be[nr];
++ 
++ 		if (branch->nr > PERF_MAX_BRANCH_DEPTH) {
++ 			pr_warning("corrupted branch chain. skipping...\n");
++ 			goto check_calls;
++ 		}
++ 
++ 		for (i = 0; i < nr; i++) {
++ 			if (callchain_param.order == ORDER_CALLEE) {
++ 				be[i] = branch->entries[i];
++ 				/*
++ 				 * Check for overlap into the callchain.
++ 				 * The return address is one off compared to
++ 				 * the branch entry. To adjust for this
++ 				 * assume the calling instruction is not longer
++ 				 * than 8 bytes.
++ 				 */
++ 				if (i == skip_idx ||
++ 				    chain->ips[first_call] >= PERF_CONTEXT_MAX)
++ 					first_call++;
++ 				else if (be[i].from < chain->ips[first_call] &&
++ 				    be[i].from >= chain->ips[first_call] - 8)
++ 					first_call++;
++ 			} else
++ 				be[i] = branch->entries[branch->nr - i - 1];
++ 		}
++ 
++ 		nr = remove_loops(be, nr);
++ 
++ 		for (i = 0; i < nr; i++) {
++ 			err = add_callchain_ip(thread, parent, root_al,
++ 					       true, be[i].to);
++ 			if (!err)
++ 				err = add_callchain_ip(thread, parent, root_al,
++ 						       true, be[i].from);
++ 			if (err == -EINVAL)
++ 				break;
++ 			if (err)
++ 				return err;
++ 		}
++ 		chain_nr -= nr;
++ 	}
++ 
++ check_calls:
+++>>>>>>> 2e77784bb7d8 (perf callchain: Move cpumode resolve code to add_callchain_ip)
+  	if (chain->nr > PERF_MAX_STACK_DEPTH) {
+  		pr_warning("corrupted callchain. skipping...\n");
+  		return 0;
+* Unmerged path tools/perf/util/machine.c
