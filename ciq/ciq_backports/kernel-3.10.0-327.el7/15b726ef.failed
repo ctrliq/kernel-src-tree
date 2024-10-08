@@ -1,0 +1,120 @@
+userfaultfd: optimize read() and poll() to be O(1)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 15b726ef048b31a24b3fefb6863083a25fe34800
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/15b726ef.failed
+
+This makes read O(1) and poll that was already O(1) becomes lockless.
+
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Acked-by: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Sanidhya Kashyap <sanidhya.gatech@gmail.com>
+	Cc: zhang.zhanghailiang@huawei.com
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Andres Lagar-Cavilla <andreslc@google.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Peter Feiner <pfeiner@google.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: "Huangpeng (Peter)" <peter.huangpeng@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 15b726ef048b31a24b3fefb6863083a25fe34800)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/userfaultfd.c
+diff --cc fs/userfaultfd.c
+index 726330a69a14,232cbf37c59f..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -50,13 -52,8 +52,8 @@@ struct userfaultfd_ctx 
+  };
+  
+  struct userfaultfd_wait_queue {
+ -	struct uffd_msg msg;
+ +	unsigned long address;
+  	wait_queue_t wq;
+- 	/*
+- 	 * Only relevant when queued in fault_wqh and only used by the
+- 	 * read operation to avoid reading the same userfault twice.
+- 	 */
+- 	bool pending;
+  	struct userfaultfd_ctx *ctx;
+  };
+  
+@@@ -246,11 -259,10 +243,15 @@@ int handle_userfault(struct vm_area_str
+  
+  	init_waitqueue_func_entry(&uwq.wq, userfaultfd_wake_function);
+  	uwq.wq.private = current;
+++<<<<<<< HEAD
+ +	uwq.address = userfault_address(address, flags, reason);
+ +	uwq.pending = true;
+++=======
++ 	uwq.msg = userfault_msg(address, flags, reason);
+++>>>>>>> 15b726ef048b (userfaultfd: optimize read() and poll() to be O(1))
+  	uwq.ctx = ctx;
+  
+- 	spin_lock(&ctx->fault_wqh.lock);
++ 	spin_lock(&ctx->fault_pending_wqh.lock);
+  	/*
+  	 * After the __add_wait_queue the uwq is visible to userland
+  	 * through poll/read().
+@@@ -422,16 -446,36 +435,43 @@@ static ssize_t userfaultfd_ctx_read(str
+  	__add_wait_queue(&ctx->fd_wqh, &wait);
+  	for (;;) {
+  		set_current_state(TASK_INTERRUPTIBLE);
+- 		spin_lock(&ctx->fault_wqh.lock);
+- 		if (find_userfault(ctx, &uwq)) {
++ 		spin_lock(&ctx->fault_pending_wqh.lock);
++ 		uwq = find_userfault(ctx);
++ 		if (uwq) {
+  			/*
+- 			 * The fault_wqh.lock prevents the uwq to
+- 			 * disappear from under us.
++ 			 * The fault_pending_wqh.lock prevents the uwq
++ 			 * to disappear from under us.
++ 			 *
++ 			 * Refile this userfault from
++ 			 * fault_pending_wqh to fault_wqh, it's not
++ 			 * pending anymore after we read it.
++ 			 *
++ 			 * Use list_del() by hand (as
++ 			 * userfaultfd_wake_function also uses
++ 			 * list_del_init() by hand) to be sure nobody
++ 			 * changes __remove_wait_queue() to use
++ 			 * list_del_init() in turn breaking the
++ 			 * !list_empty_careful() check in
++ 			 * handle_userfault(). The uwq->wq.task_list
++ 			 * must never be empty at any time during the
++ 			 * refile, or the waitqueue could disappear
++ 			 * from under us. The "wait_queue_head_t"
++ 			 * parameter of __remove_wait_queue() is unused
++ 			 * anyway.
+  			 */
+++<<<<<<< HEAD
+ +			uwq->pending = false;
+ +			/* careful to always initialize addr if ret == 0 */
+ +			*addr = uwq->address;
+ +			spin_unlock(&ctx->fault_wqh.lock);
+++=======
++ 			list_del(&uwq->wq.task_list);
++ 			__add_wait_queue(&ctx->fault_wqh, &uwq->wq);
++ 
++ 			/* careful to always initialize msg if ret == 0 */
++ 			*msg = uwq->msg;
++ 			spin_unlock(&ctx->fault_pending_wqh.lock);
+++>>>>>>> 15b726ef048b (userfaultfd: optimize read() and poll() to be O(1))
+  			ret = 0;
+  			break;
+  		}
+* Unmerged path fs/userfaultfd.c
