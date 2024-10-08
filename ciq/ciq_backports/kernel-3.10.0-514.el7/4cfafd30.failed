@@ -1,0 +1,451 @@
+sched,perf: Fix periodic timers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 4cfafd3082afc707653aeb82e9f8e7b596fbbfd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4cfafd30.failed
+
+In the below two commits (see Fixes) we have periodic timers that can
+stop themselves when they're no longer required, but need to be
+(re)-started when their idle condition changes.
+
+Further complications is that we want the timer handler to always do
+the forward such that it will always correctly deal with the overruns,
+and we do not want to race such that the handler has already decided
+to stop, but the (external) restart sees the timer still active and we
+end up with a 'lost' timer.
+
+The problem with the current code is that the re-start can come before
+the callback does the forward, at which point the forward from the
+callback will WARN about forwarding an enqueued timer.
+
+Now, conceptually its easy to detect if you're before or after the fwd
+by comparing the expiration time against the current time. Of course,
+that's expensive (and racy) because we don't have the current time.
+
+Alternatively one could cache this state inside the timer, but then
+everybody pays the overhead of maintaining this extra state, and that
+is undesired.
+
+The only other option that I could see is the external timer_active
+variable, which I tried to kill before. I would love a nicer interface
+for this seemingly simple 'problem' but alas.
+
+Fixes: 272325c4821f ("perf: Fix mux_interval hrtimer wreckage")
+Fixes: 77a4d1a1b9a1 ("sched: Cleanup bandwidth timers")
+	Cc: pjt@google.com
+	Cc: tglx@linutronix.de
+	Cc: klamm@yandex-team.ru
+	Cc: mingo@kernel.org
+	Cc: bsegall@google.com
+	Cc: hpa@zytor.com
+	Cc: Sasha Levin <sasha.levin@oracle.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20150514102311.GX21418@twins.programming.kicks-ass.net
+(cherry picked from commit 4cfafd3082afc707653aeb82e9f8e7b596fbbfd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+#	kernel/sched/core.c
+#	kernel/sched/fair.c
+#	kernel/sched/rt.c
+#	kernel/sched/sched.h
+diff --cc include/linux/perf_event.h
+index 41fd463bc411,cf3342a8ad80..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -561,10 -566,11 +561,16 @@@ struct perf_cpu_context 
+  	struct perf_event_context	*task_ctx;
+  	int				active_oncpu;
+  	int				exclusive;
++ 
++ 	raw_spinlock_t			hrtimer_lock;
+  	struct hrtimer			hrtimer;
+  	ktime_t				hrtimer_interval;
+++<<<<<<< HEAD
+ +
+ +	RH_KABI_DEPRECATE(struct list_head,	rotation_list)
+++=======
++ 	unsigned int			hrtimer_active;
+++>>>>>>> 4cfafd3082af (sched,perf: Fix periodic timers)
+  
+  	struct pmu			*unique_pmu;
+  	struct perf_cgroup		*cgrp;
+diff --cc kernel/sched/core.c
+index 04c5c65570ca,e84aeb280777..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -89,31 -90,6 +89,34 @@@
+  #define CREATE_TRACE_POINTS
+  #include <trace/events/sched.h>
+  
+++<<<<<<< HEAD
+ +#ifdef smp_mb__before_atomic
+ +void __smp_mb__before_atomic(void)
+ +{
+ +	smp_mb__before_atomic();
+ +}
+ +EXPORT_SYMBOL(__smp_mb__before_atomic);
+ +#endif
+ +
+ +#ifdef smp_mb__after_atomic
+ +void __smp_mb__after_atomic(void)
+ +{
+ +	smp_mb__after_atomic();
+ +}
+ +EXPORT_SYMBOL(__smp_mb__after_atomic);
+ +#endif
+ +
+ +void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
+ +{
+ +	if (hrtimer_active(period_timer))
+ +		return;
+ +
+ +	hrtimer_forward_now(period_timer, period);
+ +	hrtimer_start_expires(period_timer, HRTIMER_MODE_ABS_PINNED);
+ +}
+ +
+++=======
+++>>>>>>> 4cfafd3082af (sched,perf: Fix periodic timers)
+  DEFINE_MUTEX(sched_domains_mutex);
+  DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+  
+diff --cc kernel/sched/fair.c
+index e3632fb98b67,69be2825262d..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -3668,28 -4040,15 +3671,38 @@@ static void init_cfs_rq_runtime(struct 
+  	INIT_LIST_HEAD(&cfs_rq->throttled_list);
+  }
+  
+ -void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ +/* requires cfs_b->lock, may release to reprogram timer */
+ +void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b, bool force)
+  {
+++<<<<<<< HEAD
+ +	/*
+ +	 * The timer may be active because we're trying to set a new bandwidth
+ +	 * period or because we're racing with the tear-down path
+ +	 * (timer_active==0 becomes visible before the hrtimer call-back
+ +	 * terminates).  In either case we ensure that it's re-programmed
+ +	 */
+ +	while (unlikely(hrtimer_active(&cfs_b->period_timer)) &&
+ +	       hrtimer_try_to_cancel(&cfs_b->period_timer) < 0) {
+ +		/* bounce the lock to allow do_sched_cfs_period_timer to run */
+ +		raw_spin_unlock(&cfs_b->lock);
+ +		cpu_relax();
+ +		raw_spin_lock(&cfs_b->lock);
+ +		/* if someone else restarted the timer then we're done */
+ +		if (!force && cfs_b->timer_active)
+ +			return;
+ +	}
+ +
+ +	cfs_b->timer_active = 1;
+ +	start_bandwidth_timer(&cfs_b->period_timer, cfs_b->period);
+++=======
++ 	lockdep_assert_held(&cfs_b->lock);
++ 
++ 	if (!cfs_b->period_active) {
++ 		cfs_b->period_active = 1;
++ 		hrtimer_forward_now(&cfs_b->period_timer, cfs_b->period);
++ 		hrtimer_start_expires(&cfs_b->period_timer, HRTIMER_MODE_ABS_PINNED);
++ 	}
+++>>>>>>> 4cfafd3082af (sched,perf: Fix periodic timers)
+  }
+  
+  static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+diff --cc kernel/sched/rt.c
+index 27f9ed8f4b17,e43da5391dcd..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -28,8 -27,13 +28,14 @@@ static enum hrtimer_restart sched_rt_pe
+  		if (!overrun)
+  			break;
+  
+ -		raw_spin_unlock(&rt_b->rt_runtime_lock);
+  		idle = do_sched_rt_period_timer(rt_b, overrun);
+ -		raw_spin_lock(&rt_b->rt_runtime_lock);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (idle)
++ 		rt_b->rt_period_active = 0;
++ 	raw_spin_unlock(&rt_b->rt_runtime_lock);
+++>>>>>>> 4cfafd3082af (sched,perf: Fix periodic timers)
+  
+  	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
+  }
+@@@ -51,11 -55,12 +57,15 @@@ static void start_rt_bandwidth(struct r
+  	if (!rt_bandwidth_enabled() || rt_b->rt_runtime == RUNTIME_INF)
+  		return;
+  
+ +	if (hrtimer_active(&rt_b->rt_period_timer))
+ +		return;
+ +
+  	raw_spin_lock(&rt_b->rt_runtime_lock);
+- 	start_bandwidth_timer(&rt_b->rt_period_timer, rt_b->rt_period);
++ 	if (!rt_b->rt_period_active) {
++ 		rt_b->rt_period_active = 1;
++ 		hrtimer_forward_now(&rt_b->rt_period_timer, rt_b->rt_period);
++ 		hrtimer_start_expires(&rt_b->rt_period_timer, HRTIMER_MODE_ABS_PINNED);
++ 	}
+  	raw_spin_unlock(&rt_b->rt_runtime_lock);
+  }
+  
+diff --cc kernel/sched/sched.h
+index b976abe32e72,f9a58ef373b4..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -101,8 -131,72 +101,9 @@@ struct rt_bandwidth 
+  	ktime_t			rt_period;
+  	u64			rt_runtime;
+  	struct hrtimer		rt_period_timer;
++ 	unsigned int		rt_period_active;
+  };
+  
+ -void __dl_clear_params(struct task_struct *p);
+ -
+ -/*
+ - * To keep the bandwidth of -deadline tasks and groups under control
+ - * we need some place where:
+ - *  - store the maximum -deadline bandwidth of the system (the group);
+ - *  - cache the fraction of that bandwidth that is currently allocated.
+ - *
+ - * This is all done in the data structure below. It is similar to the
+ - * one used for RT-throttling (rt_bandwidth), with the main difference
+ - * that, since here we are only interested in admission control, we
+ - * do not decrease any runtime while the group "executes", neither we
+ - * need a timer to replenish it.
+ - *
+ - * With respect to SMP, the bandwidth is given on a per-CPU basis,
+ - * meaning that:
+ - *  - dl_bw (< 100%) is the bandwidth of the system (group) on each CPU;
+ - *  - dl_total_bw array contains, in the i-eth element, the currently
+ - *    allocated bandwidth on the i-eth CPU.
+ - * Moreover, groups consume bandwidth on each CPU, while tasks only
+ - * consume bandwidth on the CPU they're running on.
+ - * Finally, dl_total_bw_cpu is used to cache the index of dl_total_bw
+ - * that will be shown the next time the proc or cgroup controls will
+ - * be red. It on its turn can be changed by writing on its own
+ - * control.
+ - */
+ -struct dl_bandwidth {
+ -	raw_spinlock_t dl_runtime_lock;
+ -	u64 dl_runtime;
+ -	u64 dl_period;
+ -};
+ -
+ -static inline int dl_bandwidth_enabled(void)
+ -{
+ -	return sysctl_sched_rt_runtime >= 0;
+ -}
+ -
+ -extern struct dl_bw *dl_bw_of(int i);
+ -
+ -struct dl_bw {
+ -	raw_spinlock_t lock;
+ -	u64 bw, total_bw;
+ -};
+ -
+ -static inline
+ -void __dl_clear(struct dl_bw *dl_b, u64 tsk_bw)
+ -{
+ -	dl_b->total_bw -= tsk_bw;
+ -}
+ -
+ -static inline
+ -void __dl_add(struct dl_bw *dl_b, u64 tsk_bw)
+ -{
+ -	dl_b->total_bw += tsk_bw;
+ -}
+ -
+ -static inline
+ -bool __dl_overflow(struct dl_bw *dl_b, int cpus, u64 old_bw, u64 new_bw)
+ -{
+ -	return dl_b->bw != -1 &&
+ -	       dl_b->bw * cpus < dl_b->total_bw - old_bw + new_bw;
+ -}
+ -
+  extern struct mutex sched_domains_mutex;
+  
+  #ifdef CONFIG_CGROUP_SCHED
+@@@ -119,10 -213,10 +120,14 @@@ struct cfs_bandwidth 
+  	raw_spinlock_t lock;
+  	ktime_t period;
+  	u64 quota, runtime;
+ -	s64 hierarchical_quota;
+ +	s64 hierarchal_quota;
+  	u64 runtime_expires;
+  
+++<<<<<<< HEAD
+ +	int idle, timer_active;
+++=======
++ 	int idle, period_active;
+++>>>>>>> 4cfafd3082af (sched,perf: Fix periodic timers)
+  	struct hrtimer period_timer, slack_timer;
+  	struct list_head throttled_cfs_rq;
+  
+@@@ -1211,7 -1407,81 +1216,85 @@@ static inline void sched_rt_avg_update(
+  static inline void sched_avg_update(struct rq *rq) { }
+  #endif
+  
+++<<<<<<< HEAD
+ +extern void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period);
+++=======
++ /*
++  * __task_rq_lock - lock the rq @p resides on.
++  */
++ static inline struct rq *__task_rq_lock(struct task_struct *p)
++ 	__acquires(rq->lock)
++ {
++ 	struct rq *rq;
++ 
++ 	lockdep_assert_held(&p->pi_lock);
++ 
++ 	for (;;) {
++ 		rq = task_rq(p);
++ 		raw_spin_lock(&rq->lock);
++ 		if (likely(rq == task_rq(p) && !task_on_rq_migrating(p)))
++ 			return rq;
++ 		raw_spin_unlock(&rq->lock);
++ 
++ 		while (unlikely(task_on_rq_migrating(p)))
++ 			cpu_relax();
++ 	}
++ }
++ 
++ /*
++  * task_rq_lock - lock p->pi_lock and lock the rq @p resides on.
++  */
++ static inline struct rq *task_rq_lock(struct task_struct *p, unsigned long *flags)
++ 	__acquires(p->pi_lock)
++ 	__acquires(rq->lock)
++ {
++ 	struct rq *rq;
++ 
++ 	for (;;) {
++ 		raw_spin_lock_irqsave(&p->pi_lock, *flags);
++ 		rq = task_rq(p);
++ 		raw_spin_lock(&rq->lock);
++ 		/*
++ 		 *	move_queued_task()		task_rq_lock()
++ 		 *
++ 		 *	ACQUIRE (rq->lock)
++ 		 *	[S] ->on_rq = MIGRATING		[L] rq = task_rq()
++ 		 *	WMB (__set_task_cpu())		ACQUIRE (rq->lock);
++ 		 *	[S] ->cpu = new_cpu		[L] task_rq()
++ 		 *					[L] ->on_rq
++ 		 *	RELEASE (rq->lock)
++ 		 *
++ 		 * If we observe the old cpu in task_rq_lock, the acquire of
++ 		 * the old rq->lock will fully serialize against the stores.
++ 		 *
++ 		 * If we observe the new cpu in task_rq_lock, the acquire will
++ 		 * pair with the WMB to ensure we must then also see migrating.
++ 		 */
++ 		if (likely(rq == task_rq(p) && !task_on_rq_migrating(p)))
++ 			return rq;
++ 		raw_spin_unlock(&rq->lock);
++ 		raw_spin_unlock_irqrestore(&p->pi_lock, *flags);
++ 
++ 		while (unlikely(task_on_rq_migrating(p)))
++ 			cpu_relax();
++ 	}
++ }
++ 
++ static inline void __task_rq_unlock(struct rq *rq)
++ 	__releases(rq->lock)
++ {
++ 	raw_spin_unlock(&rq->lock);
++ }
++ 
++ static inline void
++ task_rq_unlock(struct rq *rq, struct task_struct *p, unsigned long *flags)
++ 	__releases(rq->lock)
++ 	__releases(p->pi_lock)
++ {
++ 	raw_spin_unlock(&rq->lock);
++ 	raw_spin_unlock_irqrestore(&p->pi_lock, *flags);
++ }
+++>>>>>>> 4cfafd3082af (sched,perf: Fix periodic timers)
+  
+  #ifdef CONFIG_SMP
+  #ifdef CONFIG_PREEMPT
+* Unmerged path include/linux/perf_event.h
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 9f73b14462a1..d91be79c8cfd 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -787,24 +787,21 @@ perf_cgroup_mark_enabled(struct perf_event *event,
+ static enum hrtimer_restart perf_mux_hrtimer_handler(struct hrtimer *hr)
+ {
+ 	struct perf_cpu_context *cpuctx;
+-	enum hrtimer_restart ret = HRTIMER_NORESTART;
+ 	int rotations = 0;
+ 
+ 	WARN_ON(!irqs_disabled());
+ 
+ 	cpuctx = container_of(hr, struct perf_cpu_context, hrtimer);
+-
+ 	rotations = perf_rotate_context(cpuctx);
+ 
+-	/*
+-	 * arm timer if needed
+-	 */
+-	if (rotations) {
++	raw_spin_lock(&cpuctx->hrtimer_lock);
++	if (rotations)
+ 		hrtimer_forward_now(hr, cpuctx->hrtimer_interval);
+-		ret = HRTIMER_RESTART;
+-	}
++	else
++		cpuctx->hrtimer_active = 0;
++	raw_spin_unlock(&cpuctx->hrtimer_lock);
+ 
+-	return ret;
++	return rotations ? HRTIMER_RESTART : HRTIMER_NORESTART;
+ }
+ 
+ static void __perf_mux_hrtimer_init(struct perf_cpu_context *cpuctx, int cpu)
+@@ -827,7 +824,8 @@ static void __perf_mux_hrtimer_init(struct perf_cpu_context *cpuctx, int cpu)
+ 
+ 	cpuctx->hrtimer_interval = ns_to_ktime(NSEC_PER_MSEC * interval);
+ 
+-	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
++	raw_spin_lock_init(&cpuctx->hrtimer_lock);
++	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
+ 	timer->function = perf_mux_hrtimer_handler;
+ }
+ 
+@@ -835,15 +833,20 @@ static int perf_mux_hrtimer_restart(struct perf_cpu_context *cpuctx)
+ {
+ 	struct hrtimer *timer = &cpuctx->hrtimer;
+ 	struct pmu *pmu = cpuctx->ctx.pmu;
++	unsigned long flags;
+ 
+ 	/* not for SW PMU */
+ 	if (pmu->task_ctx_nr == perf_sw_context)
+ 		return 0;
+ 
+-	if (hrtimer_is_queued(timer))
+-		return 0;
++	raw_spin_lock_irqsave(&cpuctx->hrtimer_lock, flags);
++	if (!cpuctx->hrtimer_active) {
++		cpuctx->hrtimer_active = 1;
++		hrtimer_forward_now(timer, cpuctx->hrtimer_interval);
++		hrtimer_start_expires(timer, HRTIMER_MODE_ABS_PINNED);
++	}
++	raw_spin_unlock_irqrestore(&cpuctx->hrtimer_lock, flags);
+ 
+-	hrtimer_start(timer, cpuctx->hrtimer_interval, HRTIMER_MODE_REL_PINNED);
+ 	return 0;
+ }
+ 
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/rt.c
+* Unmerged path kernel/sched/sched.h
