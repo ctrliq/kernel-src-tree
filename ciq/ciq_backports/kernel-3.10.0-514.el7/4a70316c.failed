@@ -1,0 +1,186 @@
+nfs: Fix truncated client owner id without proto type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kinglong Mee <kinglongmee@gmail.com>
+commit 4a70316caef7d158445e672e146eb9f1b8c1aeee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4a70316c.failed
+
+The length of "Linux NFSv4.0 " is 14, not 10.
+
+Without this patch, I get a truncated client owner id as,
+"Linux NFSv4.0 ::1/::1"
+
+With this patch,
+"Linux NFSv4.0 ::1/::1 tcp"
+
+Fixes: a319268891 ("nfs: make nfs4_init_nonuniform_client_string use a dynamically allocated buffer")
+	Signed-off-by: Kinglong Mee <kinglongmee@gmail.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 4a70316caef7d158445e672e146eb9f1b8c1aeee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index cce1cbe1f482,3f73539579e5..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -5045,38 -5008,128 +5045,68 @@@ static void nfs4_init_boot_verifier(con
+  	memcpy(bootverf->data, verf, sizeof(bootverf->data));
+  }
+  
+ -static int
+ -nfs4_init_nonuniform_client_string(struct nfs_client *clp)
+ +static unsigned int
+ +nfs4_init_nonuniform_client_string(const struct nfs_client *clp,
+ +				   char *buf, size_t len)
+  {
+++<<<<<<< HEAD
+ +	unsigned int result;
+++=======
++ 	int result;
++ 	size_t len;
++ 	char *str;
++ 	bool retried = false;
++ 
++ 	if (clp->cl_owner_id != NULL)
++ 		return 0;
++ retry:
++ 	rcu_read_lock();
++ 	len = 14 + strlen(clp->cl_ipaddr) + 1 +
++ 		strlen(rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR)) +
++ 		1 +
++ 		strlen(rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO)) +
++ 		1;
++ 	rcu_read_unlock();
++ 
++ 	if (len > NFS4_OPAQUE_LIMIT + 1)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Since this string is allocated at mount time, and held until the
++ 	 * nfs_client is destroyed, we can use GFP_KERNEL here w/o worrying
++ 	 * about a memory-reclaim deadlock.
++ 	 */
++ 	str = kmalloc(len, GFP_KERNEL);
++ 	if (!str)
++ 		return -ENOMEM;
+++>>>>>>> 4a70316caef7 (nfs: Fix truncated client owner id without proto type)
+  
+  	rcu_read_lock();
+ -	result = scnprintf(str, len, "Linux NFSv4.0 %s/%s %s",
+ -			clp->cl_ipaddr,
+ -			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR),
+ -			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO));
+ +	result = scnprintf(buf, len, "Linux NFSv4.0 %s/%s %s",
+ +				clp->cl_ipaddr,
+ +				rpc_peeraddr2str(clp->cl_rpcclient,
+ +							RPC_DISPLAY_ADDR),
+ +				rpc_peeraddr2str(clp->cl_rpcclient,
+ +							RPC_DISPLAY_PROTO));
+  	rcu_read_unlock();
+ -
+ -	/* Did something change? */
+ -	if (result >= len) {
+ -		kfree(str);
+ -		if (retried)
+ -			return -EINVAL;
+ -		retried = true;
+ -		goto retry;
+ -	}
+ -	clp->cl_owner_id = str;
+ -	return 0;
+ -}
+ -
+ -static int
+ -nfs4_init_uniquifier_client_string(struct nfs_client *clp)
+ -{
+ -	int result;
+ -	size_t len;
+ -	char *str;
+ -
+ -	len = 10 + 10 + 1 + 10 + 1 +
+ -		strlen(nfs4_client_id_uniquifier) + 1 +
+ -		strlen(clp->cl_rpcclient->cl_nodename) + 1;
+ -
+ -	if (len > NFS4_OPAQUE_LIMIT + 1)
+ -		return -EINVAL;
+ -
+ -	/*
+ -	 * Since this string is allocated at mount time, and held until the
+ -	 * nfs_client is destroyed, we can use GFP_KERNEL here w/o worrying
+ -	 * about a memory-reclaim deadlock.
+ -	 */
+ -	str = kmalloc(len, GFP_KERNEL);
+ -	if (!str)
+ -		return -ENOMEM;
+ -
+ -	result = scnprintf(str, len, "Linux NFSv%u.%u %s/%s",
+ -			clp->rpc_ops->version, clp->cl_minorversion,
+ -			nfs4_client_id_uniquifier,
+ -			clp->cl_rpcclient->cl_nodename);
+ -	if (result >= len) {
+ -		kfree(str);
+ -		return -EINVAL;
+ -	}
+ -	clp->cl_owner_id = str;
+ -	return 0;
+ +	return result;
+  }
+  
+ -static int
+ -nfs4_init_uniform_client_string(struct nfs_client *clp)
+ +static unsigned int
+ +nfs4_init_uniform_client_string(const struct nfs_client *clp,
+ +				char *buf, size_t len)
+  {
+ -	int result;
+ -	size_t len;
+ -	char *str;
+ -
+ -	if (clp->cl_owner_id != NULL)
+ -		return 0;
+ +	const char *nodename = clp->cl_rpcclient->cl_nodename;
+  
+  	if (nfs4_client_id_uniquifier[0] != '\0')
+ -		return nfs4_init_uniquifier_client_string(clp);
+ -
+ -	len = 10 + 10 + 1 + 10 + 1 +
+ -		strlen(clp->cl_rpcclient->cl_nodename) + 1;
+ -
+ -	if (len > NFS4_OPAQUE_LIMIT + 1)
+ -		return -EINVAL;
+ -
+ -	/*
+ -	 * Since this string is allocated at mount time, and held until the
+ -	 * nfs_client is destroyed, we can use GFP_KERNEL here w/o worrying
+ -	 * about a memory-reclaim deadlock.
+ -	 */
+ -	str = kmalloc(len, GFP_KERNEL);
+ -	if (!str)
+ -		return -ENOMEM;
+ -
+ -	result = scnprintf(str, len, "Linux NFSv%u.%u %s",
+ -			clp->rpc_ops->version, clp->cl_minorversion,
+ -			clp->cl_rpcclient->cl_nodename);
+ -	if (result >= len) {
+ -		kfree(str);
+ -		return -EINVAL;
+ -	}
+ -	clp->cl_owner_id = str;
+ -	return 0;
+ +		return scnprintf(buf, len, "Linux NFSv%u.%u %s/%s",
+ +				clp->rpc_ops->version,
+ +				clp->cl_minorversion,
+ +				nfs4_client_id_uniquifier,
+ +				nodename);
+ +	return scnprintf(buf, len, "Linux NFSv%u.%u %s",
+ +				clp->rpc_ops->version, clp->cl_minorversion,
+ +				nodename);
+  }
+  
+  /*
+* Unmerged path fs/nfs/nfs4proc.c
