@@ -94,6 +94,8 @@ struct filename;
 extern void audit_log_session_info(struct audit_buffer *ab);
 
 #ifdef CONFIG_AUDITSYSCALL
+#include <asm/syscall.h> /* for syscall_get_arch() */
+
 /* These are defined in auditsc.c */
 				/* Public API */
 extern int  audit_alloc(struct task_struct *task);
