@@ -1,0 +1,870 @@
+openvswitch: Use regular VXLAN net_device device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit 614732eaa12dd462c0ab274700bed14f36afea5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/614732ea.failed
+
+This gets rid of all OVS specific VXLAN code in the receive and
+transmit path by using a VXLAN net_device to represent the vport.
+Only a small shim layer remains which takes care of handling the
+VXLAN specific OVS Netlink configuration.
+
+Unexports vxlan_sock_add(), vxlan_sock_release(), vxlan_xmit_skb()
+since they are no longer needed.
+
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 614732eaa12dd462c0ab274700bed14f36afea5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/rtnetlink.h
+#	include/net/vxlan.h
+#	net/core/rtnetlink.c
+#	net/openvswitch/vport-netdev.c
+diff --cc drivers/net/vxlan.c
+index e2461103c0f3,e9feefb41f0b..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1200,6 -1268,32 +1298,35 @@@ static int vxlan_udp_encap_recv(struct 
+  		vni &= VXLAN_VNI_MASK;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vxlan_collect_metadata(vs)) {
++ 		const struct iphdr *iph = ip_hdr(skb);
++ 
++ 		tun_dst = metadata_dst_alloc(sizeof(*md), GFP_ATOMIC);
++ 		if (!tun_dst)
++ 			goto drop;
++ 
++ 		info = &tun_dst->u.tun_info;
++ 		info->key.ipv4_src = iph->saddr;
++ 		info->key.ipv4_dst = iph->daddr;
++ 		info->key.ipv4_tos = iph->tos;
++ 		info->key.ipv4_ttl = iph->ttl;
++ 		info->key.tp_src = udp_hdr(skb)->source;
++ 		info->key.tp_dst = udp_hdr(skb)->dest;
++ 
++ 		info->mode = IP_TUNNEL_INFO_RX;
++ 		info->key.tun_flags = TUNNEL_KEY;
++ 		info->key.tun_id = cpu_to_be64(vni >> 8);
++ 		if (udp_hdr(skb)->check != 0)
++ 			info->key.tun_flags |= TUNNEL_CSUM;
++ 
++ 		md = ip_tunnel_info_opts(info, sizeof(*md));
++ 	} else {
++ 		memset(md, 0, sizeof(*md));
++ 	}
++ 
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  	/* For backwards compatibility, only allow reserved fields to be
+  	 * used by VXLAN extensions if explicitly requested.
+  	 */
+@@@ -1231,8 -1328,7 +1358,12 @@@
+  		goto bad_flags;
+  	}
+  
+++<<<<<<< HEAD
+ +	md.vni = vxh->vx_vni;
+ +	vs->rcv(vs, skb, &md);
+++=======
++ 	vxlan_rcv(vs, skb, md, vni >> 8, tun_dst);
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  	return 0;
+  
+  drop:
+@@@ -1249,89 -1348,6 +1380,92 @@@ error
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ +		      struct vxlan_metadata *md)
+ +{
+ +	struct iphdr *oip = NULL;
+ +	struct ipv6hdr *oip6 = NULL;
+ +	struct vxlan_dev *vxlan;
+ +	struct pcpu_sw_netstats *stats;
+ +	union vxlan_addr saddr;
+ +	__u32 vni;
+ +	int err = 0;
+ +	union vxlan_addr *remote_ip;
+ +
+ +	vni = ntohl(md->vni) >> 8;
+ +	/* Is this VNI defined? */
+ +	vxlan = vxlan_vs_find_vni(vs, vni);
+ +	if (!vxlan)
+ +		goto drop;
+ +
+ +	remote_ip = &vxlan->default_dst.remote_ip;
+ +	skb_reset_mac_header(skb);
+ +	skb_scrub_packet(skb, !net_eq(vxlan->net, dev_net(vxlan->dev)));
+ +	skb->protocol = eth_type_trans(skb, vxlan->dev);
+ +	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+ +
+ +	/* Ignore packet loops (and multicast echo) */
+ +	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
+ +		goto drop;
+ +
+ +	/* Re-examine inner Ethernet packet */
+ +	if (remote_ip->sa.sa_family == AF_INET) {
+ +		oip = ip_hdr(skb);
+ +		saddr.sin.sin_addr.s_addr = oip->saddr;
+ +		saddr.sa.sa_family = AF_INET;
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	} else {
+ +		oip6 = ipv6_hdr(skb);
+ +		saddr.sin6.sin6_addr = oip6->saddr;
+ +		saddr.sa.sa_family = AF_INET6;
+ +#endif
+ +	}
+ +
+ +	if ((vxlan->flags & VXLAN_F_LEARN) &&
+ +	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
+ +		goto drop;
+ +
+ +	skb_reset_network_header(skb);
+ +	skb->mark = md->gbp;
+ +
+ +	if (oip6)
+ +		err = IP6_ECN_decapsulate(oip6, skb);
+ +	if (oip)
+ +		err = IP_ECN_decapsulate(oip, skb);
+ +
+ +	if (unlikely(err)) {
+ +		if (log_ecn_error) {
+ +			if (oip6)
+ +				net_info_ratelimited("non-ECT from %pI6\n",
+ +						     &oip6->saddr);
+ +			if (oip)
+ +				net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
+ +						     &oip->saddr, oip->tos);
+ +		}
+ +		if (err > 1) {
+ +			++vxlan->dev->stats.rx_frame_errors;
+ +			++vxlan->dev->stats.rx_errors;
+ +			goto drop;
+ +		}
+ +	}
+ +
+ +	stats = this_cpu_ptr(vxlan->dev->tstats);
+ +	u64_stats_update_begin(&stats->syncp);
+ +	stats->rx_packets++;
+ +	stats->rx_bytes += skb->len;
+ +	u64_stats_update_end(&stats->syncp);
+ +
+ +	netif_rx(skb);
+ +
+ +	return;
+ +drop:
+ +	/* Consume bad packet */
+ +	kfree_skb(skb);
+ +}
+ +
+++=======
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  static int arp_reduce(struct net_device *dev, struct sk_buff *skb)
+  {
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+@@@ -1956,14 -2009,11 +2089,20 @@@ static void vxlan_xmit_one(struct sk_bu
+  
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+++<<<<<<< HEAD
+ +		md.vni = htonl(vni << 8);
+ +		md.gbp = skb->mark;
+ +
+ +		err = vxlan_xmit_skb(rt, sk, skb, fl4.saddr,
+ +				     dst->sin.sin_addr.s_addr, tos, ttl, df,
+ +				     src_port, dst_port, &md,
+++=======
++ 		err = vxlan_xmit_skb(rt, sk, skb, fl4.saddr,
++ 				     dst->sin.sin_addr.s_addr, tos, ttl, df,
++ 				     src_port, dst_port, htonl(vni << 8), md,
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  				     !net_eq(vxlan->net, dev_net(vxlan->dev)),
+ -				     flags);
+ +				     vxlan->flags);
+  		if (err < 0) {
+  			/* skb is already freed. */
+  			skb = NULL;
+@@@ -2016,11 -2066,10 +2155,18 @@@
+  		}
+  
+  		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+++<<<<<<< HEAD
+ +		md.vni = htonl(vni << 8);
+ +		md.gbp = skb->mark;
+ +
+ +		err = vxlan6_xmit_skb(ndst, sk, skb, dev, &fl6.saddr, &fl6.daddr,
+ +				      0, ttl, src_port, dst_port, &md,
+++=======
++ 		md->gbp = skb->mark;
++ 
++ 		err = vxlan6_xmit_skb(ndst, sk, skb, dev, &fl6.saddr, &fl6.daddr,
++ 				      0, ttl, src_port, dst_port, htonl(vni << 8), md,
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  				      !net_eq(vxlan->net, dev_net(vxlan->dev)),
+  				      vxlan->flags);
+  #endif
+@@@ -2205,8 -2264,8 +2351,13 @@@ static int vxlan_open(struct net_devic
+  	struct vxlan_sock *vs;
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	vs = vxlan_sock_add(vxlan->net, vxlan->dst_port, vxlan_rcv, NULL,
+ +			    false, vxlan->flags);
+++=======
++ 	vs = vxlan_sock_add(vxlan->net, vxlan->cfg.dst_port,
++ 			    vxlan->cfg.no_share, vxlan->flags);
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  	if (IS_ERR(vs))
+  		return PTR_ERR(vs);
+  
+@@@ -2574,12 -2629,11 +2721,11 @@@ static struct vxlan_sock *vxlan_sock_ad
+  		spin_unlock(&vn->sock_lock);
+  	}
+  
+- 	return vxlan_socket_create(net, port, rcv, data, flags);
++ 	return vxlan_socket_create(net, port, flags);
+  }
+- EXPORT_SYMBOL_GPL(vxlan_sock_add);
+  
+ -static int vxlan_dev_configure(struct net *src_net, struct net_device *dev,
+ -			       struct vxlan_config *conf)
+ +static int vxlan_newlink(struct net *src_net, struct net_device *dev,
+ +			 struct nlattr *tb[], struct nlattr *data[])
+  {
+  	struct vxlan_net *vn = net_generic(src_net, vxlan_net_id);
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+diff --cc include/net/rtnetlink.h
+index b09052b2d93b,18fdb98185ab..000000000000
+--- a/include/net/rtnetlink.h
++++ b/include/net/rtnetlink.h
+@@@ -148,18 -131,18 +148,28 @@@ struct rtnl_af_ops 
+  					       const struct nlattr *attr);
+  };
+  
+ -void __rtnl_af_unregister(struct rtnl_af_ops *ops);
+ +extern int	__rtnl_af_register(struct rtnl_af_ops *ops);
+ +extern void	__rtnl_af_unregister(struct rtnl_af_ops *ops);
+  
+ -void rtnl_af_register(struct rtnl_af_ops *ops);
+ -void rtnl_af_unregister(struct rtnl_af_ops *ops);
+ +extern int	rtnl_af_register(struct rtnl_af_ops *ops);
+ +extern void	rtnl_af_unregister(struct rtnl_af_ops *ops);
+  
+++<<<<<<< HEAD
+ +
+ +extern struct net *rtnl_link_get_net(struct net *src_net, struct nlattr *tb[]);
+ +extern struct net_device *rtnl_create_link(struct net *net,
+ +	char *ifname, const struct rtnl_link_ops *ops, struct nlattr *tb[]);
+ +extern int rtnl_configure_link(struct net_device *dev,
+ +			       const struct ifinfomsg *ifm);
+++=======
++ struct net *rtnl_link_get_net(struct net *src_net, struct nlattr *tb[]);
++ struct net_device *rtnl_create_link(struct net *net, const char *ifname,
++ 				    unsigned char name_assign_type,
++ 				    const struct rtnl_link_ops *ops,
++ 				    struct nlattr *tb[]);
++ int rtnl_delete_link(struct net_device *dev);
++ int rtnl_configure_link(struct net_device *dev, const struct ifinfomsg *ifm);
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  
+  int rtnl_nla_parse_ifla(struct nlattr **tb, const struct nlattr *head, int len);
+  
+diff --cc include/net/vxlan.h
+index 0082b5d33d7d,eb8d721cdb67..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -94,8 -95,12 +94,7 @@@ struct vxlanhdr 
+  #define VXLAN_VNI_MASK  (VXLAN_VID_MASK << 8)
+  #define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
+  
+ -#define VNI_HASH_BITS	10
+ -#define VNI_HASH_SIZE	(1<<VNI_HASH_BITS)
+ -#define FDB_HASH_BITS	8
+ -#define FDB_HASH_SIZE	(1<<FDB_HASH_BITS)
+ -
+  struct vxlan_metadata {
+- 	__be32		vni;
+  	u32		gbp;
+  };
+  
+@@@ -137,18 -189,17 +130,28 @@@ struct vxlan_sock 
+  #define VXLAN_F_RCV_FLAGS		(VXLAN_F_GBP |			\
+  					 VXLAN_F_UDP_ZERO_CSUM6_RX |	\
+  					 VXLAN_F_REMCSUM_RX |		\
+ -					 VXLAN_F_REMCSUM_NOPARTIAL |	\
+ -					 VXLAN_F_COLLECT_METADATA |	\
+ -					 VXLAN_F_FLOW_BASED)
+ +					 VXLAN_F_REMCSUM_NOPARTIAL)
+ +
+++<<<<<<< HEAD
+ +struct vxlan_sock *vxlan_sock_add(struct net *net, __be16 port,
+ +				  vxlan_rcv_t *rcv, void *data,
+ +				  bool no_share, u32 flags);
+ +
+ +void vxlan_sock_release(struct vxlan_sock *vs);
+  
+ +int vxlan_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
+ +		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+ +		   __be16 src_port, __be16 dst_port, struct vxlan_metadata *md,
+ +		   bool xnet, u32 vxflags);
+++=======
++ struct net_device *vxlan_dev_create(struct net *net, const char *name,
++ 				    u8 name_assign_type, struct vxlan_config *conf);
++ 
++ static inline __be16 vxlan_dev_dst_port(struct vxlan_dev *vxlan)
++ {
++ 	return inet_sk(vxlan->vn_sock->sock->sk)->inet_sport;
++ }
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  
+  static inline netdev_features_t vxlan_features_check(struct sk_buff *skb,
+  						     netdev_features_t features)
+diff --cc net/core/rtnetlink.c
+index bca0c57300c0,5fb4af20c6dd..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1864,6 -1924,58 +1864,61 @@@ errout
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rtnl_group_dellink(const struct net *net, int group)
++ {
++ 	struct net_device *dev, *aux;
++ 	LIST_HEAD(list_kill);
++ 	bool found = false;
++ 
++ 	if (!group)
++ 		return -EPERM;
++ 
++ 	for_each_netdev(net, dev) {
++ 		if (dev->group == group) {
++ 			const struct rtnl_link_ops *ops;
++ 
++ 			found = true;
++ 			ops = dev->rtnl_link_ops;
++ 			if (!ops || !ops->dellink)
++ 				return -EOPNOTSUPP;
++ 		}
++ 	}
++ 
++ 	if (!found)
++ 		return -ENODEV;
++ 
++ 	for_each_netdev_safe(net, dev, aux) {
++ 		if (dev->group == group) {
++ 			const struct rtnl_link_ops *ops;
++ 
++ 			ops = dev->rtnl_link_ops;
++ 			ops->dellink(dev, &list_kill);
++ 		}
++ 	}
++ 	unregister_netdevice_many(&list_kill);
++ 
++ 	return 0;
++ }
++ 
++ int rtnl_delete_link(struct net_device *dev)
++ {
++ 	const struct rtnl_link_ops *ops;
++ 	LIST_HEAD(list_kill);
++ 
++ 	ops = dev->rtnl_link_ops;
++ 	if (!ops || !ops->dellink)
++ 		return -EOPNOTSUPP;
++ 
++ 	ops->dellink(dev, &list_kill);
++ 	unregister_netdevice_many(&list_kill);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(rtnl_delete_link);
++ 
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  static int rtnl_dellink(struct sk_buff *skb, struct nlmsghdr *nlh)
+  {
+  	struct net *net = sock_net(skb->sk);
+@@@ -1893,14 -2005,7 +1946,18 @@@
+  	if (!dev)
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	ops = dev->rtnl_link_ops;
+ +	if (!ops || !ops->dellink)
+ +		return -EOPNOTSUPP;
+ +
+ +	ops->dellink(dev, &list_kill);
+ +	unregister_netdevice_many(&list_kill);
+ +	list_del(&list_kill);
+ +	return 0;
+++=======
++ 	return rtnl_delete_link(dev);
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  }
+  
+  int rtnl_configure_link(struct net_device *dev, const struct ifinfomsg *ifm)
+diff --cc net/openvswitch/vport-netdev.c
+index 33e6d6e2908f,68d0582fc001..000000000000
+--- a/net/openvswitch/vport-netdev.c
++++ b/net/openvswitch/vport-netdev.c
+@@@ -144,13 -136,24 +148,19 @@@ error
+  	return ERR_PTR(err);
+  }
+  
+ -static struct vport *netdev_create(const struct vport_parms *parms)
+ -{
+ -	struct vport *vport;
+ -
+ -	vport = ovs_vport_alloc(0, &ovs_netdev_vport_ops, parms);
+ -	if (IS_ERR(vport))
+ -		return vport;
+ -
+ -	return netdev_link(vport, parms->name);
+ -}
+ -
+  static void free_port_rcu(struct rcu_head *rcu)
+  {
+ -	struct vport *vport = container_of(rcu, struct vport, rcu);
+ +	struct netdev_vport *netdev_vport = container_of(rcu,
+ +					struct netdev_vport, rcu);
+  
+++<<<<<<< HEAD
+ +	dev_put(netdev_vport->dev);
+ +	ovs_vport_free(vport_from_priv(netdev_vport));
+++=======
++ 	if (vport->dev)
++ 		dev_put(vport->dev);
++ 	ovs_vport_free(vport);
+++>>>>>>> 614732eaa12d (openvswitch: Use regular VXLAN net_device device)
+  }
+  
+  void ovs_netdev_detach_dev(struct vport *vport)
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/rtnetlink.h
+* Unmerged path include/net/vxlan.h
+* Unmerged path net/core/rtnetlink.c
+diff --git a/net/openvswitch/Kconfig b/net/openvswitch/Kconfig
+index 15840401a2ce..1119f46b80b4 100644
+--- a/net/openvswitch/Kconfig
++++ b/net/openvswitch/Kconfig
+@@ -44,18 +44,6 @@ config OPENVSWITCH_GRE
+ 
+ 	  If unsure, say Y.
+ 
+-config OPENVSWITCH_VXLAN
+-	tristate "Open vSwitch VXLAN tunneling support"
+-	depends on OPENVSWITCH
+-	depends on VXLAN
+-	default OPENVSWITCH
+-	---help---
+-	  If you say Y here, then the Open vSwitch will be able create vxlan vport.
+-
+-	  Say N to exclude this support and reduce the binary size.
+-
+-	  If unsure, say Y.
+-
+ config OPENVSWITCH_GENEVE
+ 	tristate "Open vSwitch Geneve tunneling support"
+ 	depends on OPENVSWITCH
+diff --git a/net/openvswitch/Makefile b/net/openvswitch/Makefile
+index 91b9478413ef..38e0e149c55e 100644
+--- a/net/openvswitch/Makefile
++++ b/net/openvswitch/Makefile
+@@ -16,5 +16,4 @@ openvswitch-y := \
+ 	vport-netdev.o
+ 
+ obj-$(CONFIG_OPENVSWITCH_GENEVE)+= vport-geneve.o
+-obj-$(CONFIG_OPENVSWITCH_VXLAN)	+= vport-vxlan.o
+ obj-$(CONFIG_OPENVSWITCH_GRE)	+= vport-gre.o
+diff --git a/net/openvswitch/flow_netlink.c b/net/openvswitch/flow_netlink.c
+index 7f4707e70b38..6fb62e9032ea 100644
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@ -47,9 +47,9 @@
+ #include <net/ipv6.h>
+ #include <net/ndisc.h>
+ #include <net/mpls.h>
++#include <net/vxlan.h>
+ 
+ #include "flow_netlink.h"
+-#include "vport-vxlan.h"
+ 
+ struct ovs_len_tbl {
+ 	int len;
+@@ -475,7 +475,7 @@ static int vxlan_tun_opt_from_nlattr(const struct nlattr *a,
+ {
+ 	struct nlattr *tb[OVS_VXLAN_EXT_MAX+1];
+ 	unsigned long opt_key_offset;
+-	struct ovs_vxlan_opts opts;
++	struct vxlan_metadata opts;
+ 	int err;
+ 
+ 	BUILD_BUG_ON(sizeof(opts) > sizeof(match->key->tun_opts));
+@@ -626,7 +626,7 @@ static int ipv4_tun_from_nlattr(const struct nlattr *attr,
+ static int vxlan_opt_to_nlattr(struct sk_buff *skb,
+ 			       const void *tun_opts, int swkey_tun_opts_len)
+ {
+-	const struct ovs_vxlan_opts *opts = tun_opts;
++	const struct vxlan_metadata *opts = tun_opts;
+ 	struct nlattr *nla;
+ 
+ 	nla = nla_nest_start(skb, OVS_TUNNEL_KEY_ATTR_VXLAN_OPTS);
+* Unmerged path net/openvswitch/vport-netdev.c
+diff --git a/net/openvswitch/vport-vxlan.c b/net/openvswitch/vport-vxlan.c
+deleted file mode 100644
+index 6f7986fabb70..000000000000
+--- a/net/openvswitch/vport-vxlan.c
++++ /dev/null
+@@ -1,322 +0,0 @@
+-/*
+- * Copyright (c) 2014 Nicira, Inc.
+- * Copyright (c) 2013 Cisco Systems, Inc.
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of version 2 of the GNU General Public
+- * License as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful, but
+- * WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+- * 02110-1301, USA
+- */
+-
+-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+-
+-#include <linux/in.h>
+-#include <linux/ip.h>
+-#include <linux/net.h>
+-#include <linux/rculist.h>
+-#include <linux/udp.h>
+-#include <linux/module.h>
+-
+-#include <net/icmp.h>
+-#include <net/ip.h>
+-#include <net/udp.h>
+-#include <net/ip_tunnels.h>
+-#include <net/rtnetlink.h>
+-#include <net/route.h>
+-#include <net/dsfield.h>
+-#include <net/inet_ecn.h>
+-#include <net/net_namespace.h>
+-#include <net/netns/generic.h>
+-#include <net/vxlan.h>
+-
+-#include "datapath.h"
+-#include "vport.h"
+-#include "vport-vxlan.h"
+-
+-/**
+- * struct vxlan_port - Keeps track of open UDP ports
+- * @vs: vxlan_sock created for the port.
+- * @name: vport name.
+- */
+-struct vxlan_port {
+-	struct vxlan_sock *vs;
+-	char name[IFNAMSIZ];
+-	u32 exts; /* VXLAN_F_* in <net/vxlan.h> */
+-};
+-
+-static struct vport_ops ovs_vxlan_vport_ops;
+-
+-static inline struct vxlan_port *vxlan_vport(const struct vport *vport)
+-{
+-	return vport_priv(vport);
+-}
+-
+-/* Called with rcu_read_lock and BH disabled. */
+-static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+-		      struct vxlan_metadata *md)
+-{
+-	struct ip_tunnel_info tun_info;
+-	struct vxlan_port *vxlan_port;
+-	struct vport *vport = vs->data;
+-	struct iphdr *iph;
+-	struct ovs_vxlan_opts opts = {
+-		.gbp = md->gbp,
+-	};
+-	__be64 key;
+-	__be16 flags;
+-
+-	flags = TUNNEL_KEY | (udp_hdr(skb)->check != 0 ? TUNNEL_CSUM : 0);
+-	vxlan_port = vxlan_vport(vport);
+-	if (vxlan_port->exts & VXLAN_F_GBP && md->gbp)
+-		flags |= TUNNEL_VXLAN_OPT;
+-
+-	/* Save outer tunnel values */
+-	iph = ip_hdr(skb);
+-	key = cpu_to_be64(ntohl(md->vni) >> 8);
+-	ip_tunnel_info_init(&tun_info, iph,
+-			    udp_hdr(skb)->source, udp_hdr(skb)->dest,
+-			    key, flags, &opts, sizeof(opts));
+-
+-	ovs_vport_receive(vport, skb, &tun_info);
+-}
+-
+-static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
+-{
+-	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+-	__be16 dst_port = inet_sk(vxlan_port->vs->sock->sk)->inet_sport;
+-
+-	if (nla_put_u16(skb, OVS_TUNNEL_ATTR_DST_PORT, ntohs(dst_port)))
+-		return -EMSGSIZE;
+-
+-	if (vxlan_port->exts) {
+-		struct nlattr *exts;
+-
+-		exts = nla_nest_start(skb, OVS_TUNNEL_ATTR_EXTENSION);
+-		if (!exts)
+-			return -EMSGSIZE;
+-
+-		if (vxlan_port->exts & VXLAN_F_GBP &&
+-		    nla_put_flag(skb, OVS_VXLAN_EXT_GBP))
+-			return -EMSGSIZE;
+-
+-		nla_nest_end(skb, exts);
+-	}
+-
+-	return 0;
+-}
+-
+-static void vxlan_tnl_destroy(struct vport *vport)
+-{
+-	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+-
+-	vxlan_sock_release(vxlan_port->vs);
+-
+-	ovs_vport_deferred_free(vport);
+-}
+-
+-static const struct nla_policy exts_policy[OVS_VXLAN_EXT_MAX+1] = {
+-	[OVS_VXLAN_EXT_GBP]	= { .type = NLA_FLAG, },
+-};
+-
+-static int vxlan_configure_exts(struct vport *vport, struct nlattr *attr)
+-{
+-	struct nlattr *exts[OVS_VXLAN_EXT_MAX+1];
+-	struct vxlan_port *vxlan_port;
+-	int err;
+-
+-	if (nla_len(attr) < sizeof(struct nlattr))
+-		return -EINVAL;
+-
+-	err = nla_parse_nested(exts, OVS_VXLAN_EXT_MAX, attr, exts_policy);
+-	if (err < 0)
+-		return err;
+-
+-	vxlan_port = vxlan_vport(vport);
+-
+-	if (exts[OVS_VXLAN_EXT_GBP])
+-		vxlan_port->exts |= VXLAN_F_GBP;
+-
+-	return 0;
+-}
+-
+-static struct vport *vxlan_tnl_create(const struct vport_parms *parms)
+-{
+-	struct net *net = ovs_dp_get_net(parms->dp);
+-	struct nlattr *options = parms->options;
+-	struct vxlan_port *vxlan_port;
+-	struct vxlan_sock *vs;
+-	struct vport *vport;
+-	struct nlattr *a;
+-	u16 dst_port;
+-	int err;
+-
+-	if (!options) {
+-		err = -EINVAL;
+-		goto error;
+-	}
+-	a = nla_find_nested(options, OVS_TUNNEL_ATTR_DST_PORT);
+-	if (a && nla_len(a) == sizeof(u16)) {
+-		dst_port = nla_get_u16(a);
+-	} else {
+-		/* Require destination port from userspace. */
+-		err = -EINVAL;
+-		goto error;
+-	}
+-
+-	vport = ovs_vport_alloc(sizeof(struct vxlan_port),
+-				&ovs_vxlan_vport_ops, parms);
+-	if (IS_ERR(vport))
+-		return vport;
+-
+-	vxlan_port = vxlan_vport(vport);
+-	strncpy(vxlan_port->name, parms->name, IFNAMSIZ);
+-
+-	a = nla_find_nested(options, OVS_TUNNEL_ATTR_EXTENSION);
+-	if (a) {
+-		err = vxlan_configure_exts(vport, a);
+-		if (err) {
+-			ovs_vport_free(vport);
+-			goto error;
+-		}
+-	}
+-
+-	vs = vxlan_sock_add(net, htons(dst_port), vxlan_rcv, vport, true,
+-			    vxlan_port->exts);
+-	if (IS_ERR(vs)) {
+-		ovs_vport_free(vport);
+-		return (void *)vs;
+-	}
+-	vxlan_port->vs = vs;
+-
+-	return vport;
+-
+-error:
+-	return ERR_PTR(err);
+-}
+-
+-static int vxlan_ext_gbp(struct sk_buff *skb)
+-{
+-	const struct ip_tunnel_info *tun_info;
+-	const struct ovs_vxlan_opts *opts;
+-
+-	tun_info = OVS_CB(skb)->egress_tun_info;
+-	opts = tun_info->options;
+-
+-	if (tun_info->key.tun_flags & TUNNEL_VXLAN_OPT &&
+-	    tun_info->options_len >= sizeof(*opts))
+-		return opts->gbp;
+-	else
+-		return 0;
+-}
+-
+-static int vxlan_tnl_send(struct vport *vport, struct sk_buff *skb)
+-{
+-	struct net *net = ovs_dp_get_net(vport->dp);
+-	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+-	struct sock *sk = vxlan_port->vs->sock->sk;
+-	__be16 dst_port = inet_sk(sk)->inet_sport;
+-	const struct ip_tunnel_key *tun_key;
+-	struct vxlan_metadata md = {0};
+-	struct rtable *rt;
+-	struct flowi4 fl;
+-	__be16 src_port;
+-	__be16 df;
+-	int err;
+-	u32 vxflags;
+-
+-	if (unlikely(!OVS_CB(skb)->egress_tun_info)) {
+-		err = -EINVAL;
+-		goto error;
+-	}
+-
+-	tun_key = &OVS_CB(skb)->egress_tun_info->key;
+-	rt = ovs_tunnel_route_lookup(net, tun_key, skb->mark, &fl, IPPROTO_UDP);
+-	if (IS_ERR(rt)) {
+-		err = PTR_ERR(rt);
+-		goto error;
+-	}
+-
+-	df = tun_key->tun_flags & TUNNEL_DONT_FRAGMENT ?
+-		htons(IP_DF) : 0;
+-
+-	skb->ignore_df = 1;
+-
+-	src_port = udp_flow_src_port(net, skb, 0, 0, true);
+-	md.vni = htonl(be64_to_cpu(tun_key->tun_id) << 8);
+-	md.gbp = vxlan_ext_gbp(skb);
+-	vxflags = vxlan_port->exts |
+-		      (tun_key->tun_flags & TUNNEL_CSUM ? VXLAN_F_UDP_CSUM : 0);
+-
+-	err = vxlan_xmit_skb(rt, sk, skb, fl.saddr, tun_key->ipv4_dst,
+-			     tun_key->ipv4_tos, tun_key->ipv4_ttl, df,
+-			     src_port, dst_port,
+-			     &md, false, vxflags);
+-	if (err < 0)
+-		ip_rt_put(rt);
+-	return err;
+-error:
+-	kfree_skb(skb);
+-	return err;
+-}
+-
+-static int vxlan_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
+-				     struct ip_tunnel_info *egress_tun_info)
+-{
+-	struct net *net = ovs_dp_get_net(vport->dp);
+-	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+-	__be16 dst_port = inet_sk(vxlan_port->vs->sock->sk)->inet_sport;
+-	__be16 src_port;
+-	int port_min;
+-	int port_max;
+-
+-	inet_get_local_port_range(net, &port_min, &port_max);
+-	src_port = udp_flow_src_port(net, skb, 0, 0, true);
+-
+-	return ovs_tunnel_get_egress_info(egress_tun_info, net,
+-					  OVS_CB(skb)->egress_tun_info,
+-					  IPPROTO_UDP, skb->mark,
+-					  src_port, dst_port);
+-}
+-
+-static const char *vxlan_get_name(const struct vport *vport)
+-{
+-	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+-	return vxlan_port->name;
+-}
+-
+-static struct vport_ops ovs_vxlan_vport_ops = {
+-	.type		= OVS_VPORT_TYPE_VXLAN,
+-	.create		= vxlan_tnl_create,
+-	.destroy	= vxlan_tnl_destroy,
+-	.get_name	= vxlan_get_name,
+-	.get_options	= vxlan_get_options,
+-	.send		= vxlan_tnl_send,
+-	.get_egress_tun_info	= vxlan_get_egress_tun_info,
+-	.owner		= THIS_MODULE,
+-};
+-
+-static int __init ovs_vxlan_tnl_init(void)
+-{
+-	return ovs_vport_ops_register(&ovs_vxlan_vport_ops);
+-}
+-
+-static void __exit ovs_vxlan_tnl_exit(void)
+-{
+-	ovs_vport_ops_unregister(&ovs_vxlan_vport_ops);
+-}
+-
+-module_init(ovs_vxlan_tnl_init);
+-module_exit(ovs_vxlan_tnl_exit);
+-
+-MODULE_DESCRIPTION("OVS: VXLAN switching port");
+-MODULE_LICENSE("GPL");
+-MODULE_ALIAS("vport-type-4");
+diff --git a/net/openvswitch/vport-vxlan.h b/net/openvswitch/vport-vxlan.h
+deleted file mode 100644
+index 4b08233e73d5..000000000000
+--- a/net/openvswitch/vport-vxlan.h
++++ /dev/null
+@@ -1,11 +0,0 @@
+-#ifndef VPORT_VXLAN_H
+-#define VPORT_VXLAN_H 1
+-
+-#include <linux/kernel.h>
+-#include <linux/types.h>
+-
+-struct ovs_vxlan_opts {
+-	__u32 gbp;
+-};
+-
+-#endif
