@@ -1,0 +1,171 @@
+dm bufio: store stacktrace in buffers to help find buffer leaks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 86bad0c7071c24efee0a395d8b622764bdd24320
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/86bad0c7.failed
+
+The option DM_DEBUG_BLOCK_STACK_TRACING is moved from persistent-data
+directory to device mapper directory because it will now be used by
+persistent-data and bufio.  When the option is enabled, each bufio buffer
+stores the stacktrace of the last dm_bufio_get(), dm_bufio_read() or
+dm_bufio_new() call that increased the hold count to 1.  The buffer's
+stacktrace is printed if the buffer was not released before the bufio
+client is destroyed.
+
+When DM_DEBUG_BLOCK_STACK_TRACING is enabled, any bufio buffer leaks are
+considered warnings - i.e. the kernel continues afterwards.  If not
+enabled, buffer leaks are considered BUGs and the kernel with crash.
+Reasoning on this disposition is: if we only ever warned on buffer leaks
+users would generally ignore them and the problematic code would never
+get fixed.
+
+Successfully used to find source of bufio leaks fixed with commit
+fce079f63c3 ("dm btree: fix bufio buffer leaks in dm_btree_del() error
+path").
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 86bad0c7071c24efee0a395d8b622764bdd24320)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/persistent-data/Kconfig
+diff --cc drivers/md/persistent-data/Kconfig
+index 0c2dec7aec20,a53cbc928af1..000000000000
+--- a/drivers/md/persistent-data/Kconfig
++++ b/drivers/md/persistent-data/Kconfig
+@@@ -7,12 -7,3 +7,15 @@@ config DM_PERSISTENT_DAT
+  	 Library providing immutable on-disk data structure support for
+  	 device-mapper targets such as the thin provisioning target.
+  
+++<<<<<<< HEAD
+ +config DM_DEBUG_BLOCK_STACK_TRACING
+ +       boolean "Keep stack trace of persistent data block lock holders"
+ +       depends on STACKTRACE_SUPPORT && DM_PERSISTENT_DATA
+ +       select STACKTRACE
+ +       ---help---
+ +	 Enable this for messages that may help debug problems with the
+ +	 block manager locking used by thin provisioning and caching.
+ +
+ +	 If unsure, say N.
+++=======
+++>>>>>>> 86bad0c7071c (dm bufio: store stacktrace in buffers to help find buffer leaks)
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index e723dddaac4e..ea97ac760a3f 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -222,6 +222,15 @@ config DM_BUFIO
+ 	 as a cache, holding recently-read blocks in memory and performing
+ 	 delayed writes.
+ 
++config DM_DEBUG_BLOCK_STACK_TRACING
++       bool "Keep stack trace of persistent data block lock holders"
++       depends on STACKTRACE_SUPPORT && DM_BUFIO
++       select STACKTRACE
++       ---help---
++	 Enable this for messages that may help debug problems with the
++	 block manager locking used by thin provisioning and caching.
++
++	 If unsure, say N.
+ config DM_BIO_PRISON
+        tristate
+        depends on BLK_DEV_DM
+diff --git a/drivers/md/dm-bufio.c b/drivers/md/dm-bufio.c
+index b31d063d71b3..34b33c017036 100644
+--- a/drivers/md/dm-bufio.c
++++ b/drivers/md/dm-bufio.c
+@@ -16,6 +16,7 @@
+ #include <linux/shrinker.h>
+ #include <linux/module.h>
+ #include <linux/rbtree.h>
++#include <linux/stacktrace.h>
+ 
+ #define DM_MSG_PREFIX "bufio"
+ 
+@@ -149,6 +150,11 @@ struct dm_buffer {
+ 	struct list_head write_list;
+ 	struct bio bio;
+ 	struct bio_vec bio_vec[DM_BUFIO_INLINE_VECS];
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++#define MAX_STACK 10
++	struct stack_trace stack_trace;
++	unsigned long stack_entries[MAX_STACK];
++#endif
+ };
+ 
+ /*----------------------------------------------------------------*/
+@@ -253,6 +259,17 @@ static LIST_HEAD(dm_bufio_all_clients);
+  */
+ static DEFINE_MUTEX(dm_bufio_clients_lock);
+ 
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++static void buffer_record_stack(struct dm_buffer *b)
++{
++	b->stack_trace.nr_entries = 0;
++	b->stack_trace.max_entries = MAX_STACK;
++	b->stack_trace.entries = b->stack_entries;
++	b->stack_trace.skip = 2;
++	save_stack_trace(&b->stack_trace);
++}
++#endif
++
+ /*----------------------------------------------------------------
+  * A red/black tree acts as an index for all the buffers.
+  *--------------------------------------------------------------*/
+@@ -454,6 +471,9 @@ static struct dm_buffer *alloc_buffer(struct dm_bufio_client *c, gfp_t gfp_mask)
+ 
+ 	adjust_total_allocated(b->data_mode, (long)c->block_size);
+ 
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++	memset(&b->stack_trace, 0, sizeof(b->stack_trace));
++#endif
+ 	return b;
+ }
+ 
+@@ -1069,6 +1089,10 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
+ 
+ 	dm_bufio_lock(c);
+ 	b = __bufio_new(c, block, nf, &need_submit, &write_list);
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++	if (b && b->hold_count == 1)
++		buffer_record_stack(b);
++#endif
+ 	dm_bufio_unlock(c);
+ 
+ 	__flush_write_list(&write_list);
+@@ -1470,6 +1494,7 @@ static void drop_buffers(struct dm_bufio_client *c)
+ {
+ 	struct dm_buffer *b;
+ 	int i;
++	bool warned = false;
+ 
+ 	BUG_ON(dm_bufio_in_request());
+ 
+@@ -1484,9 +1509,21 @@ static void drop_buffers(struct dm_bufio_client *c)
+ 		__free_buffer_wake(b);
+ 
+ 	for (i = 0; i < LIST_SIZE; i++)
+-		list_for_each_entry(b, &c->lru[i], lru_list)
++		list_for_each_entry(b, &c->lru[i], lru_list) {
++			WARN_ON(!warned);
++			warned = true;
+ 			DMERR("leaked buffer %llx, hold count %u, list %d",
+ 			      (unsigned long long)b->block, b->hold_count, i);
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++			print_stack_trace(&b->stack_trace, 1);
++			b->hold_count = 0; /* mark unclaimed to avoid BUG_ON below */
++#endif
++		}
++
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++	while ((b = __get_unclaimed_buffer(c)))
++		__free_buffer_wake(b);
++#endif
+ 
+ 	for (i = 0; i < LIST_SIZE; i++)
+ 		BUG_ON(!list_empty(&c->lru[i]));
+* Unmerged path drivers/md/persistent-data/Kconfig
