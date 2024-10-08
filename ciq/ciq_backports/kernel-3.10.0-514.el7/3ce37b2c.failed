@@ -1,0 +1,207 @@
+gfs2: Fix gfs2_lookup_by_inum lock inversion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 3ce37b2cb4917674fa5b776e857dcea94c0e0835
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3ce37b2c.failed
+
+The current gfs2_lookup_by_inum takes the glock of a presumed inode
+identified by block number, verifies that the block is indeed an inode,
+and then instantiates and reads the new inode via gfs2_inode_lookup.
+
+However, instantiating a new inode may block on freeing a previous
+instance of that inode (__wait_on_freeing_inode), and freeing an inode
+requires to take the glock already held, leading to lock inversion and
+deadlock.
+
+Fix this by first instantiating the new inode, then verifying that the
+block is an inode (if required), and then reading in the new inode, all
+in gfs2_inode_lookup.
+
+If the block we are looking for is not an inode, we discard the new
+inode via iget_failed, which marks inodes as bad and unhashes them.
+Other tasks waiting on that inode will get back a bad inode back from
+ilookup or iget_locked; in that case, retry the lookup.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 3ce37b2cb4917674fa5b776e857dcea94c0e0835)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/dir.c
+#	fs/gfs2/inode.c
+#	fs/gfs2/inode.h
+#	fs/gfs2/ops_fstype.c
+diff --cc fs/gfs2/dir.c
+index 68c8b73800ed,1b02665357b2..000000000000
+--- a/fs/gfs2/dir.c
++++ b/fs/gfs2/dir.c
+@@@ -1626,7 -1660,11 +1626,15 @@@ struct inode *gfs2_dir_search(struct in
+  		brelse(bh);
+  		if (fail_on_exist)
+  			return ERR_PTR(-EEXIST);
+++<<<<<<< HEAD
+ +		return gfs2_inode_lookup(dir->i_sb, dtype, addr, formal_ino, 0);
+++=======
++ 		inode = gfs2_inode_lookup(dir->i_sb, dtype, addr, formal_ino,
++ 					  GFS2_BLKST_FREE /* ignore */);
++ 		if (!IS_ERR(inode))
++ 			GFS2_I(inode)->i_rahead = rahead;
++ 		return inode;
+++>>>>>>> 3ce37b2cb491 (gfs2: Fix gfs2_lookup_by_inum lock inversion)
+  	}
+  	return ERR_PTR(-ENOENT);
+  }
+diff --cc fs/gfs2/inode.c
+index afe33e59be1b,6d5c6bbec416..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -79,28 -104,38 +105,53 @@@ static void gfs2_set_iop(struct inode *
+  /**
+   * gfs2_inode_lookup - Lookup an inode
+   * @sb: The super block
+-  * @no_addr: The inode number
+   * @type: The type of the inode
+++<<<<<<< HEAD
+ + * non_block: Can we block on inodes that are being freed?
+++=======
++  * @no_addr: The inode number
++  * @no_formal_ino: The inode generation number
++  * @blktype: Requested block type (GFS2_BLKST_DINODE or GFS2_BLKST_UNLINKED;
++  *           GFS2_BLKST_FREE do indicate not to verify)
++  *
++  * If @type is DT_UNKNOWN, the inode type is fetched from disk.
++  *
++  * If @blktype is anything other than GFS2_BLKST_FREE (which is used as a
++  * placeholder because it doesn't otherwise make sense), the on-disk block type
++  * is verified to be @blktype.
+++>>>>>>> 3ce37b2cb491 (gfs2: Fix gfs2_lookup_by_inum lock inversion)
+   *
+   * Returns: A VFS inode, or an error
+   */
+  
+  struct inode *gfs2_inode_lookup(struct super_block *sb, unsigned int type,
+++<<<<<<< HEAD
+ +				u64 no_addr, u64 no_formal_ino, int non_block)
+++=======
++ 				u64 no_addr, u64 no_formal_ino,
++ 				unsigned int blktype)
+++>>>>>>> 3ce37b2cb491 (gfs2: Fix gfs2_lookup_by_inum lock inversion)
+  {
+  	struct inode *inode;
+  	struct gfs2_inode *ip;
+  	struct gfs2_glock *io_gl = NULL;
++ 	struct gfs2_holder i_gh;
++ 	bool unlock = false;
+  	int error;
+  
+++<<<<<<< HEAD
+ +	inode = iget_locked(sb, (unsigned long)no_addr);
+++=======
++ 	inode = gfs2_iget(sb, no_addr);
++ 	if (!inode)
++ 		return ERR_PTR(-ENOMEM);
++ 
+++>>>>>>> 3ce37b2cb491 (gfs2: Fix gfs2_lookup_by_inum lock inversion)
+  	ip = GFS2_I(inode);
+- 	ip->i_no_addr = no_addr;
+  
+ +	if (!inode)
+ +		return ERR_PTR(-ENOBUFS);
+ +
+  	if (inode->i_state & I_NEW) {
+  		struct gfs2_sbd *sdp = GFS2_SB(inode);
+  		ip->i_no_formal_ino = no_formal_ino;
+@@@ -157,23 -215,12 +231,26 @@@ struct inode *gfs2_lookup_by_inum(struc
+  				  u64 *no_formal_ino, unsigned int blktype)
+  {
+  	struct super_block *sb = sdp->sd_vfs;
+- 	struct gfs2_holder i_gh;
+- 	struct inode *inode = NULL;
++ 	struct inode *inode;
+  	int error;
+  
+++<<<<<<< HEAD
+ +	/* Must not read in block until block type is verified */
+ +	error = gfs2_glock_nq_num(sdp, no_addr, &gfs2_inode_glops,
+ +				  LM_ST_EXCLUSIVE, GL_SKIP, &i_gh);
+ +	if (error)
+ +		return ERR_PTR(error);
+ +
+ +	error = gfs2_check_blk_type(sdp, no_addr, blktype);
+ +	if (error)
+ +		goto fail;
+ +
+ +	inode = gfs2_inode_lookup(sb, DT_UNKNOWN, no_addr, 0, 1);
+++=======
++ 	inode = gfs2_inode_lookup(sb, DT_UNKNOWN, no_addr, 0, blktype);
+++>>>>>>> 3ce37b2cb491 (gfs2: Fix gfs2_lookup_by_inum lock inversion)
+  	if (IS_ERR(inode))
+- 		goto fail;
++ 		return inode;
+  
+  	/* Two extra checks for NFS only */
+  	if (no_formal_ino) {
+diff --cc fs/gfs2/inode.h
+index d5caed1f9acf,443b46cfb8f2..000000000000
+--- a/fs/gfs2/inode.h
++++ b/fs/gfs2/inode.h
+@@@ -95,7 -95,7 +95,11 @@@ err
+  
+  extern struct inode *gfs2_inode_lookup(struct super_block *sb, unsigned type, 
+  				       u64 no_addr, u64 no_formal_ino,
+++<<<<<<< HEAD
+ +				       int non_block);
+++=======
++ 				       unsigned int blktype);
+++>>>>>>> 3ce37b2cb491 (gfs2: Fix gfs2_lookup_by_inum lock inversion)
+  extern struct inode *gfs2_lookup_by_inum(struct gfs2_sbd *sdp, u64 no_addr,
+  					 u64 *no_formal_ino,
+  					 unsigned int blktype);
+diff --cc fs/gfs2/ops_fstype.c
+index 902da6b6e2b5,b8f6fc9513ef..000000000000
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@@ -435,7 -454,8 +435,12 @@@ static int gfs2_lookup_root(struct supe
+  	struct dentry *dentry;
+  	struct inode *inode;
+  
+++<<<<<<< HEAD
+ +	inode = gfs2_inode_lookup(sb, DT_DIR, no_addr, 0, 0);
+++=======
++ 	inode = gfs2_inode_lookup(sb, DT_DIR, no_addr, 0,
++ 				  GFS2_BLKST_FREE /* ignore */);
+++>>>>>>> 3ce37b2cb491 (gfs2: Fix gfs2_lookup_by_inum lock inversion)
+  	if (IS_ERR(inode)) {
+  		fs_err(sdp, "can't read in %s inode: %ld\n", name, PTR_ERR(inode));
+  		return PTR_ERR(inode);
+* Unmerged path fs/gfs2/dir.c
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 8d60e81f5dfd..028858806c80 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -635,7 +635,7 @@ static void delete_work_func(struct work_struct *work)
+ 	struct gfs2_glock *gl = container_of(work, struct gfs2_glock, gl_delete);
+ 	struct gfs2_sbd *sdp = gl->gl_sbd;
+ 	struct gfs2_inode *ip;
+-	struct inode *inode;
++	struct inode *inode = NULL;
+ 	u64 no_addr = gl->gl_name.ln_number;
+ 
+ 	ip = gl->gl_object;
+@@ -643,7 +643,7 @@ static void delete_work_func(struct work_struct *work)
+ 
+ 	if (ip)
+ 		inode = gfs2_ilookup(sdp->sd_vfs, no_addr);
+-	else
++	if (IS_ERR_OR_NULL(inode))
+ 		inode = gfs2_lookup_by_inum(sdp, no_addr, NULL, GFS2_BLKST_UNLINKED);
+ 	if (inode && !IS_ERR(inode)) {
+ 		d_prune_aliases(inode);
+* Unmerged path fs/gfs2/inode.c
+* Unmerged path fs/gfs2/inode.h
+* Unmerged path fs/gfs2/ops_fstype.c
