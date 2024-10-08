@@ -1,0 +1,195 @@
+powerpc/powernv: Implement accessor to TCE entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Implement accessor to TCE entry (David Gibson) [1213665]
+Rebuild_FUZZ: 90.91%
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit c5bb44edee19b2c19221a0b5a68add37ea5733c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c5bb44ed.failed
+
+This replaces direct accesses to TCE table with a helper which
+returns an TCE entry address. This does not make difference now but will
+when multi-level TCE tables get introduces.
+
+No change in behavior is expected.
+
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Reviewed-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit c5bb44edee19b2c19221a0b5a68add37ea5733c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci.c
+diff --cc arch/powerpc/platforms/powernv/pci.c
+index 17649771621c,a07b83283ccc..000000000000
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@@ -599,49 -572,123 +599,84 @@@ struct pci_ops pnv_pci_ops = 
+  	.write = pnv_pci_write_config,
+  };
+  
+++<<<<<<< HEAD
+ +static int pnv_tce_build(struct iommu_table *tbl, long index, long npages,
+ +			 unsigned long uaddr, enum dma_data_direction direction,
+ +			 struct dma_attrs *attrs)
+ +{
+ +	u64 proto_tce = iommu_direction_to_tce_perm(direction);
+ +	__be64 *tcep, *tces;
+ +	u64 rpn;
+ +
+ +	tces = tcep = ((__be64 *)tbl->it_base) + index - tbl->it_offset;
+ +	rpn = __pa(uaddr) >> tbl->it_page_shift;
+ +
+ +	while (npages--)
+ +		*(tcep++) = cpu_to_be64(proto_tce |
+ +				(rpn++ << tbl->it_page_shift));
+ +
+ +	/* Some implementations won't cache invalid TCEs and thus may not
+ +	 * need that flush. We'll probably turn it_type into a bit mask
+ +	 * of flags if that becomes the case
+ +	 */
+ +	if (tbl->it_type & TCE_PCI_SWINV_CREATE)
+ +		pnv_pci_ioda_tce_invalidate(tbl, tces, tcep - 1);
+++=======
++ static __be64 *pnv_tce(struct iommu_table *tbl, long idx)
++ {
++ 	__be64 *tmp = ((__be64 *)tbl->it_base);
++ 
++ 	return tmp + idx;
++ }
++ 
++ int pnv_tce_build(struct iommu_table *tbl, long index, long npages,
++ 		unsigned long uaddr, enum dma_data_direction direction,
++ 		struct dma_attrs *attrs)
++ {
++ 	u64 proto_tce = iommu_direction_to_tce_perm(direction);
++ 	u64 rpn = __pa(uaddr) >> tbl->it_page_shift;
++ 	long i;
++ 
++ 	for (i = 0; i < npages; i++) {
++ 		unsigned long newtce = proto_tce |
++ 			((rpn + i) << tbl->it_page_shift);
++ 		unsigned long idx = index - tbl->it_offset + i;
++ 
++ 		*(pnv_tce(tbl, idx)) = cpu_to_be64(newtce);
++ 	}
+++>>>>>>> c5bb44edee19 (powerpc/powernv: Implement accessor to TCE entry)
+  
+  	return 0;
+  }
+  
+ -void pnv_tce_free(struct iommu_table *tbl, long index, long npages)
+ +static void pnv_tce_free(struct iommu_table *tbl, long index, long npages)
+  {
+++<<<<<<< HEAD
+ +	__be64 *tcep, *tces;
+ +
+ +	tces = tcep = ((__be64 *)tbl->it_base) + index - tbl->it_offset;
+ +
+ +	while (npages--)
+ +		*(tcep++) = cpu_to_be64(0);
+ +
+ +	if (tbl->it_type & TCE_PCI_SWINV_FREE)
+ +		pnv_pci_ioda_tce_invalidate(tbl, tces, tcep - 1);
+++=======
++ 	long i;
++ 
++ 	for (i = 0; i < npages; i++) {
++ 		unsigned long idx = index - tbl->it_offset + i;
++ 
++ 		*(pnv_tce(tbl, idx)) = cpu_to_be64(0);
++ 	}
+++>>>>>>> c5bb44edee19 (powerpc/powernv: Implement accessor to TCE entry)
+  }
+  
+ -unsigned long pnv_tce_get(struct iommu_table *tbl, long index)
+ +static unsigned long pnv_tce_get(struct iommu_table *tbl, long index)
+  {
+- 	return ((u64 *)tbl->it_base)[index - tbl->it_offset];
++ 	return *(pnv_tce(tbl, index - tbl->it_offset));
+  }
+  
+ -struct iommu_table *pnv_pci_table_alloc(int nid)
+ -{
+ -	struct iommu_table *tbl;
+ -
+ -	tbl = kzalloc_node(sizeof(struct iommu_table), GFP_KERNEL, nid);
+ -	INIT_LIST_HEAD_RCU(&tbl->it_group_list);
+ -
+ -	return tbl;
+ -}
+ -
+ -long pnv_pci_link_table_and_group(int node, int num,
+ -		struct iommu_table *tbl,
+ -		struct iommu_table_group *table_group)
+ -{
+ -	struct iommu_table_group_link *tgl = NULL;
+ -
+ -	if (WARN_ON(!tbl || !table_group))
+ -		return -EINVAL;
+ -
+ -	tgl = kzalloc_node(sizeof(struct iommu_table_group_link), GFP_KERNEL,
+ -			node);
+ -	if (!tgl)
+ -		return -ENOMEM;
+ -
+ -	tgl->table_group = table_group;
+ -	list_add_rcu(&tgl->next, &tbl->it_group_list);
+ -
+ -	table_group->tables[num] = tbl;
+ -
+ -	return 0;
+ -}
+ -
+ -static void pnv_iommu_table_group_link_free(struct rcu_head *head)
+ -{
+ -	struct iommu_table_group_link *tgl = container_of(head,
+ -			struct iommu_table_group_link, rcu);
+ -
+ -	kfree(tgl);
+ -}
+ -
+ -void pnv_pci_unlink_table_and_group(struct iommu_table *tbl,
+ -		struct iommu_table_group *table_group)
+ -{
+ -	long i;
+ -	bool found;
+ -	struct iommu_table_group_link *tgl;
+ -
+ -	if (!tbl || !table_group)
+ -		return;
+ -
+ -	/* Remove link to a group from table's list of attached groups */
+ -	found = false;
+ -	list_for_each_entry_rcu(tgl, &tbl->it_group_list, next) {
+ -		if (tgl->table_group == table_group) {
+ -			list_del_rcu(&tgl->next);
+ -			call_rcu(&tgl->rcu, pnv_iommu_table_group_link_free);
+ -			found = true;
+ -			break;
+ -		}
+ -	}
+ -	if (WARN_ON(!found))
+ -		return;
+ -
+ -	/* Clean a pointer to iommu_table in iommu_table_group::tables[] */
+ -	found = false;
+ -	for (i = 0; i < IOMMU_TABLE_GROUP_MAX_TABLES; ++i) {
+ -		if (table_group->tables[i] == tbl) {
+ -			table_group->tables[i] = NULL;
+ -			found = true;
+ -			break;
+ -		}
+ -	}
+ -	WARN_ON(!found);
+ -}
+ -
+  void pnv_pci_setup_iommu_table(struct iommu_table *tbl,
+  			       void *tce_mem, u64 tce_size,
+  			       u64 dma_offset, unsigned page_shift)
+* Unmerged path arch/powerpc/platforms/powernv/pci.c
