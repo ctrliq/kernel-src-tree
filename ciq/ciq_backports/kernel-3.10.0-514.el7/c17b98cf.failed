@@ -1,0 +1,1213 @@
+KVM: PPC: Book3S HV: Remove code for PPC970 processors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s_hv: Remove code for PPC970 processors (Thomas Huth) [1287973]
+Rebuild_FUZZ: 93.20%
+commit-author Paul Mackerras <paulus@samba.org>
+commit c17b98cf6028704e1f953d6a25ed6140425ccfd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c17b98cf.failed
+
+This removes the code that was added to enable HV KVM to work
+on PPC970 processors.  The PPC970 is an old CPU that doesn't
+support virtualizing guest memory.  Removing PPC970 support also
+lets us remove the code for allocating and managing contiguous
+real-mode areas, the code for the !kvm->arch.using_mmu_notifiers
+case, the code for pinning pages of guest memory when first
+accessed and keeping track of which pages have been pinned, and
+the code for handling H_ENTER hypercalls in virtual mode.
+
+Book3S HV KVM is now supported only on POWER7 and POWER8 processors.
+The KVM_CAP_PPC_RMA capability now always returns 0.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit c17b98cf6028704e1f953d6a25ed6140425ccfd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_mmu_hv.c
+#	arch/powerpc/kvm/book3s_hv_builtin.c
+#	arch/powerpc/kvm/book3s_hv_rm_mmu.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 8afd9d68ffc0,534acb3c6c3d..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@@ -37,12 -37,8 +37,9 @@@
+  #include <asm/ppc-opcode.h>
+  #include <asm/cputable.h>
+  
+ +#include "book3s_hv_cma.h"
+  #include "trace_hv.h"
+  
+- /* POWER7 has 10-bit LPIDs, PPC970 has 6-bit LPIDs */
+- #define MAX_LPID_970	63
+- 
+  /* Power architecture requires HPT is at least 256kB */
+  #define PPC_MIN_HPT_ORDER	18
+  
+@@@ -1008,11 -864,9 +863,15 @@@ static int kvm_age_rmapp(struct kvm *kv
+  	return ret;
+  }
+  
+ -int kvm_age_hva_hv(struct kvm *kvm, unsigned long start, unsigned long end)
+ +int kvm_age_hva_hv(struct kvm *kvm, unsigned long hva)
+  {
+++<<<<<<< HEAD
+ +	if (!kvm->arch.using_mmu_notifiers)
+ +		return 0;
+ +	return kvm_handle_hva(kvm, hva, kvm_age_rmapp);
+++=======
++ 	return kvm_handle_hva_range(kvm, start, end, kvm_age_rmapp);
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  }
+  
+  static int kvm_test_age_rmapp(struct kvm *kvm, unsigned long *rmapp,
+diff --cc arch/powerpc/kvm/book3s_hv_builtin.c
+index a8c240dd73a3,1786bf80bf00..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@@ -35,92 -33,8 +35,85 @@@
+   * By default we reserve 5% of memory for hash pagetable allocation.
+   */
+  static unsigned long kvm_cma_resv_ratio = 5;
+- /*
+-  * We allocate RMAs (real mode areas) for KVM guests from the KVM CMA area.
+-  * Each RMA has to be physically contiguous and of a size that the
+-  * hardware supports.  PPC970 and POWER7 support 64MB, 128MB and 256MB,
+-  * and other larger sizes.  Since we are unlikely to be allocate that
+-  * much physically contiguous memory after the system is up and running,
+-  * we preallocate a set of RMAs in early boot using CMA.
+-  * should be power of 2.
+-  */
+- unsigned long kvm_rma_pages = (1 << 27) >> PAGE_SHIFT;	/* 128MB */
+- EXPORT_SYMBOL_GPL(kvm_rma_pages);
+  
+++<<<<<<< HEAD
+ +/* Work out RMLS (real mode limit selector) field value for a given RMA size.
+ +   Assumes POWER7 or PPC970. */
+ +static inline int lpcr_rmls(unsigned long rma_size)
+ +{
+ +	switch (rma_size) {
+ +	case 32ul << 20:	/* 32 MB */
+ +		if (cpu_has_feature(CPU_FTR_ARCH_206))
+ +			return 8;	/* only supported on POWER7 */
+ +		return -1;
+ +	case 64ul << 20:	/* 64 MB */
+ +		return 3;
+ +	case 128ul << 20:	/* 128 MB */
+ +		return 7;
+ +	case 256ul << 20:	/* 256 MB */
+ +		return 4;
+ +	case 1ul << 30:		/* 1 GB */
+ +		return 2;
+ +	case 16ul << 30:	/* 16 GB */
+ +		return 1;
+ +	case 256ul << 30:	/* 256 GB */
+ +		return 0;
+ +	default:
+ +		return -1;
+ +	}
+ +}
+ +
+ +static int __init early_parse_rma_size(char *p)
+ +{
+ +	unsigned long kvm_rma_size;
+ +
+ +	pr_debug("%s(%s)\n", __func__, p);
+ +	if (!p)
+ +		return -EINVAL;
+ +	kvm_rma_size = memparse(p, &p);
+ +	/*
+ +	 * Check that the requested size is one supported in hardware
+ +	 */
+ +	if (lpcr_rmls(kvm_rma_size) < 0) {
+ +		pr_err("RMA size of 0x%lx not supported\n", kvm_rma_size);
+ +		return -EINVAL;
+ +	}
+ +	kvm_rma_pages = kvm_rma_size >> PAGE_SHIFT;
+ +	return 0;
+ +}
+ +early_param("kvm_rma_size", early_parse_rma_size);
+ +
+ +struct kvm_rma_info *kvm_alloc_rma()
+ +{
+ +	struct page *page;
+ +	struct kvm_rma_info *ri;
+ +
+ +	ri = kmalloc(sizeof(struct kvm_rma_info), GFP_KERNEL);
+ +	if (!ri)
+ +		return NULL;
+ +	page = kvm_alloc_cma(kvm_rma_pages, kvm_rma_pages);
+ +	if (!page)
+ +		goto err_out;
+ +	atomic_set(&ri->use_count, 1);
+ +	ri->base_pfn = page_to_pfn(page);
+ +	return ri;
+ +err_out:
+ +	kfree(ri);
+ +	return NULL;
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_alloc_rma);
+ +
+ +void kvm_release_rma(struct kvm_rma_info *ri)
+ +{
+ +	if (atomic_dec_and_test(&ri->use_count)) {
+ +		kvm_release_cma(pfn_to_page(ri->base_pfn), kvm_rma_pages);
+ +		kfree(ri);
+ +	}
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_release_rma);
+++=======
++ static struct cma *kvm_cma;
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  
+  static int __init early_parse_kvm_cma_resv(char *p)
+  {
+@@@ -133,12 -47,9 +126,18 @@@ early_param("kvm_cma_resv_ratio", early
+  
+  struct page *kvm_alloc_hpt(unsigned long nr_pages)
+  {
+++<<<<<<< HEAD
+ +	unsigned long align_pages = HPT_ALIGN_PAGES;
+ +
+ +	/* Old CPUs require HPT aligned on a multiple of its size */
+ +	if (!cpu_has_feature(CPU_FTR_ARCH_206))
+ +		align_pages = nr_pages;
+ +	return kvm_alloc_cma(nr_pages, align_pages);
+++=======
++ 	VM_BUG_ON(order_base_2(nr_pages) < KVM_CMA_CHUNK_ORDER - PAGE_SHIFT);
++ 
++ 	return cma_alloc(kvm_cma, nr_pages, order_base_2(HPT_ALIGN_PAGES));
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  }
+  EXPORT_SYMBOL_GPL(kvm_alloc_hpt);
+  
+@@@ -179,50 -90,10 +178,56 @@@ void __init kvm_cma_reserve(void
+  	if (selected_size) {
+  		pr_debug("%s: reserving %ld MiB for global area\n", __func__,
+  			 (unsigned long)selected_size / SZ_1M);
+++<<<<<<< HEAD
+ +		/*
+ +		 * Old CPUs require HPT aligned on a multiple of its size. So for them
+ +		 * make the alignment as max size we could request.
+ +		 */
+ +		if (!cpu_has_feature(CPU_FTR_ARCH_206))
+ +			align_size = __rounddown_pow_of_two(selected_size);
+ +		else
+ +			align_size = HPT_ALIGN_PAGES << PAGE_SHIFT;
+ +
+ +		align_size = max(kvm_rma_pages << PAGE_SHIFT, align_size);
+ +		kvm_cma_declare_contiguous(selected_size, align_size);
+++=======
++ 		align_size = HPT_ALIGN_PAGES << PAGE_SHIFT;
++ 		cma_declare_contiguous(0, selected_size, 0, align_size,
++ 			KVM_CMA_CHUNK_ORDER - PAGE_SHIFT, false, &kvm_cma);
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+ +	}
+ +}
+ +
+ +/*
+ + * Real-mode H_CONFER implementation.
+ + * We check if we are the only vcpu out of this virtual core
+ + * still running in the guest and not ceded.  If so, we pop up
+ + * to the virtual-mode implementation; if not, just return to
+ + * the guest.
+ + */
+ +long int kvmppc_rm_h_confer(struct kvm_vcpu *vcpu, int target,
+ +			    unsigned int yield_count)
+ +{
+ +	struct kvmppc_vcore *vc = local_paca->kvm_hstate.kvm_vcore;
+ +	int ptid = local_paca->kvm_hstate.ptid;
+ +	int threads_running;
+ +	int threads_ceded;
+ +	int threads_conferring;
+ +	u64 stop = get_tb() + 10 * tb_ticks_per_usec;
+ +	int rv = H_SUCCESS; /* => don't yield */
+ +
+ +	set_bit(ptid, &vc->conferring_threads);
+ +	while ((get_tb() < stop) && !VCORE_IS_EXITING(vc)) {
+ +		threads_running = VCORE_ENTRY_MAP(vc);
+ +		threads_ceded = vc->napping_threads;
+ +		threads_conferring = vc->conferring_threads;
+ +		if ((threads_ceded | threads_conferring) == threads_running) {
+ +			rv = H_TOO_HARD; /* => do yield */
+ +			break;
+ +		}
+  	}
+ +	clear_bit(ptid, &vc->conferring_threads);
+ +	return rv;
+  }
+  
+  /*
+diff --cc arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index a2ab27702b4d,510bdfbc4073..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@@ -154,14 -166,13 +150,18 @@@ long kvmppc_do_h_enter(struct kvm *kvm
+  	struct revmap_entry *rev;
+  	unsigned long g_ptel;
+  	struct kvm_memory_slot *memslot;
+++<<<<<<< HEAD
+ +	unsigned long *physp, pte_size;
+ +	unsigned hpage_shift;
+++=======
++ 	unsigned long pte_size;
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  	unsigned long is_io;
+  	unsigned long *rmap;
+ -	pte_t pte;
+ +	pte_t *ptep;
+  	unsigned int writing;
+  	unsigned long mmu_seq;
+ -	unsigned long rcbits;
+ +	unsigned long rcbits, irq_flags = 0;
+  
+  	psize = hpte_page_size(pteh, ptel);
+  	if (!psize)
+@@@ -198,69 -206,24 +195,87 @@@
+  	slot_fn = gfn - memslot->base_gfn;
+  	rmap = &memslot->arch.rmap[slot_fn];
+  
+++<<<<<<< HEAD
+ +	if (!kvm->arch.using_mmu_notifiers) {
+ +		physp = memslot->arch.slot_phys;
+ +		if (!physp)
+ +			return H_PARAMETER;
+ +		physp += slot_fn;
+ +		if (realmode)
+ +			physp = real_vmalloc_addr(physp);
+ +		pa = *physp;
+ +		if (!pa)
+ +			return H_TOO_HARD;
+ +		is_io = pa & (HPTE_R_I | HPTE_R_W);
+ +		pte_size = PAGE_SIZE << (pa & KVMPPC_PAGE_ORDER_MASK);
+ +		pa &= PAGE_MASK;
+ +		pa |= gpa & ~PAGE_MASK;
+ +
+ +		if (pte_size < psize)
+ +			return H_PARAMETER;
+ +	} else {
+ +		/* Translate to host virtual address */
+ +		hva = __gfn_to_hva_memslot(memslot, gfn);
+ +		/*
+ +		 * If we had a page table table change after lookup, we would
+ +		 * retry via mmu_notifier_retry.
+ +		 */
+ +		if (realmode)
+ +			ptep = __find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
+ +		else {
+ +			local_irq_save(irq_flags);
+ +			ptep = find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
+ +		}
+ +		if (ptep) {
+ +			pte_t pte;
+ +			unsigned int host_pte_size;
+++=======
++ 	/* Translate to host virtual address */
++ 	hva = __gfn_to_hva_memslot(memslot, gfn);
++ 
++ 	/* Look up the Linux PTE for the backing page */
++ 	pte_size = psize;
++ 	pte = lookup_linux_pte_and_update(pgdir, hva, writing, &pte_size);
++ 	if (pte_present(pte) && !pte_numa(pte)) {
++ 		if (writing && !pte_write(pte))
++ 			/* make the actual HPTE be read-only */
++ 			ptel = hpte_make_readonly(ptel);
++ 		is_io = hpte_cache_bits(pte_val(pte));
++ 		pa = pte_pfn(pte) << PAGE_SHIFT;
++ 		pa |= hva & (pte_size - 1);
++ 		pa |= gpa & ~PAGE_MASK;
++ 	}
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  
+ -	if (pte_size < psize)
+ -		return H_PARAMETER;
+ +			if (hpage_shift)
+ +				host_pte_size = 1ul << hpage_shift;
+ +			else
+ +				host_pte_size = PAGE_SIZE;
+ +			/*
+ +			 * We should always find the guest page size
+ +			 * to <= host page size, if host is using hugepage
+ +			 */
+ +
+ +			if (host_pte_size < psize) {
+ +				if (!realmode)
+ +					local_irq_restore(flags);
+ +				return H_PARAMETER;
+ +			}
+ +
+ +			pte = kvmppc_read_update_linux_pte(ptep, writing);
+ +			if (pte_present(pte) && !pte_numa(pte)) {
+ +				if (writing && !pte_write(pte))
+ +					/* make the actual HPTE be read-only */
+ +					ptel = hpte_make_readonly(ptel);
+ +				is_io = hpte_cache_bits(pte_val(pte));
+ +				pa = pte_pfn(pte) << PAGE_SHIFT;
+ +				pa |= hva & (host_pte_size - 1);
+ +				pa |= gpa & ~PAGE_MASK;
+ +			}
+ +		}
+ +		if (!realmode)
+ +			local_irq_restore(irq_flags);
+ +	}
+  
+  	ptel &= ~(HPTE_R_PP0 - psize);
+  	ptel |= pa;
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 6ca1b3fc4ce2,c0f9e68c5db2..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -590,99 -453,28 +576,32 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S
+  
+  	li	r0,1
+  	stb	r0,VCORE_IN_GUEST(r5)	/* signal secondaries to continue */
+++<<<<<<< HEAD
+ +	b	31f
+++=======
++ 	b	10f
+  
+- 	/*
+- 	 * PPC970 host -> guest partition switch code.
+- 	 * We have to lock against concurrent tlbies,
+- 	 * using native_tlbie_lock to lock against host tlbies
+- 	 * and kvm->arch.tlbie_lock to lock against guest tlbies.
+- 	 * We also have to invalidate the TLB since its
+- 	 * entries aren't tagged with the LPID.
+- 	 */
+- 30:	ld	r5,HSTATE_KVM_VCORE(r13)
+- 	ld	r9,VCORE_KVM(r5)	/* pointer to struct kvm */
+- 
+- 	/* first take native_tlbie_lock */
+- 	.section ".toc","aw"
+- toc_tlbie_lock:
+- 	.tc	native_tlbie_lock[TC],native_tlbie_lock
+- 	.previous
+- 	ld	r3,toc_tlbie_lock@toc(r2)
+- #ifdef __BIG_ENDIAN__
+- 	lwz	r8,PACA_LOCK_TOKEN(r13)
+- #else
+- 	lwz	r8,PACAPACAINDEX(r13)
+- #endif
+- 24:	lwarx	r0,0,r3
+- 	cmpwi	r0,0
+- 	bne	24b
+- 	stwcx.	r8,0,r3
+- 	bne	24b
+- 	isync
+- 
+- 	ld	r5,HSTATE_KVM_VCORE(r13)
+- 	ld	r7,VCORE_LPCR(r5)	/* use vcore->lpcr to store HID4 */
+- 	li	r0,0x18f
+- 	rotldi	r0,r0,HID4_LPID5_SH	/* all lpid bits in HID4 = 1 */
+- 	or	r0,r7,r0
+- 	ptesync
+- 	sync
+- 	mtspr	SPRN_HID4,r0		/* switch to reserved LPID */
+- 	isync
+- 	li	r0,0
+- 	stw	r0,0(r3)		/* drop native_tlbie_lock */
+- 
+- 	/* invalidate the whole TLB */
+- 	li	r0,256
+- 	mtctr	r0
+- 	li	r6,0
+- 25:	tlbiel	r6
+- 	addi	r6,r6,0x1000
+- 	bdnz	25b
+- 	ptesync
+- 
+- 	/* Take the guest's tlbie_lock */
+- 	addi	r3,r9,KVM_TLBIE_LOCK
+- 24:	lwarx	r0,0,r3
++ 	/* Secondary threads wait for primary to have done partition switch */
++ 20:	lbz	r0,VCORE_IN_GUEST(r5)
+  	cmpwi	r0,0
+- 	bne	24b
+- 	stwcx.	r8,0,r3
+- 	bne	24b
+- 	isync
+- 	ld	r6,KVM_SDR1(r9)
+- 	mtspr	SPRN_SDR1,r6		/* switch to partition page table */
++ 	beq	20b
+  
+- 	/* Set up HID4 with the guest's LPID etc. */
+- 	sync
+- 	mtspr	SPRN_HID4,r7
++ 	/* Set LPCR and RMOR. */
++ 10:	ld	r8,VCORE_LPCR(r5)
++ 	mtspr	SPRN_LPCR,r8
++ 	ld	r8,KVM_RMOR(r9)
++ 	mtspr	SPRN_RMOR,r8
+  	isync
+  
+- 	/* drop the guest's tlbie_lock */
+- 	li	r0,0
+- 	stw	r0,0(r3)
+- 
+  	/* Check if HDEC expires soon */
+  	mfspr	r3,SPRN_HDEC
+- 	cmpwi	r3,10
++ 	cmpwi	r3,512		/* 1 microsecond */
+  	li	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
+  	blt	hdec_soon
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  
+- 	/* Enable HDEC interrupts */
+- 	mfspr	r0,SPRN_HID0
+- 	li	r3,1
+- 	rldimi	r0,r3, HID0_HDICE_SH, 64-HID0_HDICE_SH-1
+- 	sync
+- 	mtspr	SPRN_HID0,r0
+- 	mfspr	r0,SPRN_HID0
+- 	mfspr	r0,SPRN_HID0
+- 	mfspr	r0,SPRN_HID0
+- 	mfspr	r0,SPRN_HID0
+- 	mfspr	r0,SPRN_HID0
+- 	mfspr	r0,SPRN_HID0
+- 31:
+  	/* Do we have a guest vcpu to run? */
+ -	cmpdi	r4, 0
+ +10:	cmpdi	r4, 0
+  	beq	kvmppc_primary_no_guest
+  kvmppc_got_guest:
+  
+@@@ -1253,24 -983,20 +1154,30 @@@ END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR
+  
+  	stw	r12,VCPU_TRAP(r9)
+  
+ -	/* Save HEIR (HV emulation assist reg) in last_inst
+ +	/* Save HEIR (HV emulation assist reg) in emul_inst
+  	   if this is an HEI (HV emulation interrupt, e40) */
+  	li	r3,KVM_INST_FETCH_FAILED
+++<<<<<<< HEAD
+ +	stw	r3,VCPU_LAST_INST(r9)
+ +BEGIN_FTR_SECTION
+ +	cmpwi	r12,BOOK3S_INTERRUPT_H_EMUL_ASSIST
+ +	bne	11f
+ +	mfspr	r3,SPRN_HEIR
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ +11:	stw	r3,VCPU_HEIR(r9)
+++=======
++ 	cmpwi	r12,BOOK3S_INTERRUPT_H_EMUL_ASSIST
++ 	bne	11f
++ 	mfspr	r3,SPRN_HEIR
++ 11:	stw	r3,VCPU_LAST_INST(r9)
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  
+  	/* these are volatile across C function calls */
+  	mfctr	r3
+  	mfxer	r4
+  	std	r3, VCPU_CTR(r9)
+ -	stw	r4, VCPU_XER(r9)
+ +	std	r4, VCPU_XER(r9)
+  
+- BEGIN_FTR_SECTION
+  	/* If this is a page table miss then see if it's theirs or ours */
+  	cmpwi	r12, BOOK3S_INTERRUPT_H_DATA_STORAGE
+  	beq	kvmppc_hdsi
+@@@ -1289,18 -1014,6 +1195,21 @@@
+  	cmpwi	r12,BOOK3S_INTERRUPT_SYSCALL
+  	beq	hcall_try_real_mode
+  
+++<<<<<<< HEAD
+ +	/* Hypervisor doorbell - exit only if host IPI flag set */
+ +	cmpwi	r12, BOOK3S_INTERRUPT_H_DOORBELL
+ +	bne	3f
+ +	lbz	r0, HSTATE_HOST_IPI(r13)
+ +	cmpwi	r0, 0
+ +	beq	4f
+ +	b	guest_exit_cont
+ +3:
+ +	/* Only handle external interrupts here on arch 206 and later */
+ +BEGIN_FTR_SECTION
+ +	b	ext_interrupt_to_host
+ +END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206)
+++=======
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  	/* External interrupt ? */
+  	cmpwi	r12, BOOK3S_INTERRUPT_EXTERNAL
+  	bne+	ext_interrupt_to_host
+@@@ -1330,11 -1043,9 +1239,14 @@@ guest_exit_cont:		/* r9 = vcpu, r12 = t
+  	mfdsisr	r7
+  	std	r6, VCPU_DAR(r9)
+  	stw	r7, VCPU_DSISR(r9)
+- BEGIN_FTR_SECTION
+  	/* don't overwrite fault_dar/fault_dsisr if HDSI */
+  	cmpwi	r12,BOOK3S_INTERRUPT_H_DATA_STORAGE
+++<<<<<<< HEAD
+ +	beq	mc_cont
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+++=======
++ 	beq	6f
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  	std	r6, VCPU_FAULT_DAR(r9)
+  	stw	r7, VCPU_FAULT_DSISR(r9)
+  
+@@@ -1713,11 -1397,9 +1609,15 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S
+  	slbia
+  	ptesync
+  
+++<<<<<<< HEAD
+ +BEGIN_FTR_SECTION
+ +	b	32f
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+++=======
++ hdec_soon:			/* r12 = trap, r13 = paca */
+++>>>>>>> c17b98cf6028 (KVM: PPC: Book3S HV: Remove code for PPC970 processors)
+  	/*
+- 	 * POWER7 guest -> host partition switch code.
++ 	 * POWER7/POWER8 guest -> host partition switch code.
+  	 * We don't have to lock against tlbies but we do
+  	 * have to coordinate the hardware threads.
+  	 */
+@@@ -2226,13 -1873,10 +2048,10 @@@ _GLOBAL(kvmppc_h_cede
+  	lbz	r5,VCPU_PRODDED(r3)
+  	cmpwi	r5,0
+  	bne	kvm_cede_prodded
+ -	li	r0,0		/* set trap to 0 to say hcall is handled */
+ -	stw	r0,VCPU_TRAP(r3)
+ +	li	r12,0		/* set trap to 0 to say hcall is handled */
+ +	stw	r12,VCPU_TRAP(r3)
+  	li	r0,H_SUCCESS
+  	std	r0,VCPU_GPR(R3)(r3)
+- BEGIN_FTR_SECTION
+- 	b	kvm_cede_exit	/* just send it up to host on 970 */
+- END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206)
+  
+  	/*
+  	 * Set our bit in the bitmask of napping threads unless all the
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index f436be4132fd..05a875ac05a2 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -166,8 +166,6 @@ extern void *kvmppc_pin_guest_page(struct kvm *kvm, unsigned long addr,
+ 			unsigned long *nb_ret);
+ extern void kvmppc_unpin_guest_page(struct kvm *kvm, void *addr,
+ 			unsigned long gpa, bool dirty);
+-extern long kvmppc_virtmode_h_enter(struct kvm_vcpu *vcpu, unsigned long flags,
+-			long pte_index, unsigned long pteh, unsigned long ptel);
+ extern long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+ 			long pte_index, unsigned long pteh, unsigned long ptel,
+ 			pgd_t *pgdir, bool realmode, unsigned long *idx_ret);
+diff --git a/arch/powerpc/include/asm/kvm_book3s_64.h b/arch/powerpc/include/asm/kvm_book3s_64.h
+index 73896e8148e1..b5ea1e5fd18f 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@ -37,7 +37,6 @@ static inline void svcpu_put(struct kvmppc_book3s_shadow_vcpu *svcpu)
+ 
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ #define KVM_DEFAULT_HPT_ORDER	24	/* 16MB HPT by default */
+-extern unsigned long kvm_rma_pages;
+ #endif
+ 
+ #define VRMA_VSID	0x1ffffffUL	/* 1TB VSID reserved for VRMA */
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index a8a745023181..dfdebf71fe56 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -185,11 +185,6 @@ struct kvmppc_spapr_tce_table {
+ 	struct page *pages[0];
+ };
+ 
+-struct kvm_rma_info {
+-	atomic_t use_count;
+-	unsigned long base_pfn;
+-};
+-
+ /* XICS components, defined in book3s_xics.c */
+ struct kvmppc_xics;
+ struct kvmppc_icp;
+@@ -219,16 +214,9 @@ struct revmap_entry {
+ #define KVMPPC_RMAP_PRESENT	0x100000000ul
+ #define KVMPPC_RMAP_INDEX	0xfffffffful
+ 
+-/* Low-order bits in memslot->arch.slot_phys[] */
+-#define KVMPPC_PAGE_ORDER_MASK	0x1f
+-#define KVMPPC_PAGE_NO_CACHE	HPTE_R_I	/* 0x20 */
+-#define KVMPPC_PAGE_WRITETHRU	HPTE_R_W	/* 0x40 */
+-#define KVMPPC_GOT_PAGE		0x80
+-
+ struct kvm_arch_memory_slot {
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	unsigned long *rmap;
+-	unsigned long *slot_phys;
+ #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+ };
+ 
+@@ -247,14 +235,12 @@ struct kvm_arch {
+ 	struct kvm_rma_info *rma;
+ 	unsigned long vrma_slb_v;
+ 	int rma_setup_done;
+-	int using_mmu_notifiers;
+ 	u32 hpt_order;
+ 	atomic_t vcpus_running;
+ 	u32 online_vcores;
+ 	unsigned long hpt_npte;
+ 	unsigned long hpt_mask;
+ 	atomic_t hpte_mod_interest;
+-	spinlock_t slot_phys_lock;
+ 	cpumask_t need_tlb_flush;
+ 	int hpt_cma_alloc;
+ #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index f646fbd41a1b..426f5b7dd387 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -171,8 +171,6 @@ extern long kvmppc_h_put_tce(struct kvm_vcpu *vcpu, unsigned long liobn,
+ 			     unsigned long ioba, unsigned long tce);
+ extern long kvmppc_h_get_tce(struct kvm_vcpu *vcpu, unsigned long liobn,
+ 			     unsigned long ioba);
+-extern struct kvm_rma_info *kvm_alloc_rma(void);
+-extern void kvm_release_rma(struct kvm_rma_info *ri);
+ extern struct page *kvm_alloc_hpt(unsigned long nr_pages);
+ extern void kvm_release_hpt(struct page *page, unsigned long nr_pages);
+ extern int kvmppc_core_init_vm(struct kvm *kvm);
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index c65560f9a64f..cb33c85190e7 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -483,7 +483,6 @@ int main(void)
+ 	DEFINE(KVM_HOST_LPID, offsetof(struct kvm, arch.host_lpid));
+ 	DEFINE(KVM_HOST_LPCR, offsetof(struct kvm, arch.host_lpcr));
+ 	DEFINE(KVM_HOST_SDR1, offsetof(struct kvm, arch.host_sdr1));
+-	DEFINE(KVM_TLBIE_LOCK, offsetof(struct kvm, arch.tlbie_lock));
+ 	DEFINE(KVM_NEED_FLUSH, offsetof(struct kvm, arch.need_tlb_flush.bits));
+ 	DEFINE(KVM_ENABLED_HCALLS, offsetof(struct kvm, arch.enabled_hcalls));
+ 	DEFINE(KVM_LPCR, offsetof(struct kvm, arch.lpcr));
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_hv.c
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 24c07628d44c..57b540d025e5 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -244,9 +244,6 @@ int kvmppc_set_arch_compat(struct kvm_vcpu *vcpu, u32 arch_compat)
+ 	struct kvmppc_vcore *vc = vcpu->arch.vcore;
+ 
+ 	if (arch_compat) {
+-		if (!cpu_has_feature(CPU_FTR_ARCH_206))
+-			return -EINVAL;	/* 970 has no compat mode support */
+-
+ 		switch (arch_compat) {
+ 		case PVR_ARCH_205:
+ 			/*
+@@ -697,14 +694,6 @@ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+ 		return RESUME_HOST;
+ 
+ 	switch (req) {
+-	case H_ENTER:
+-		idx = srcu_read_lock(&vcpu->kvm->srcu);
+-		ret = kvmppc_virtmode_h_enter(vcpu, kvmppc_get_gpr(vcpu, 4),
+-					      kvmppc_get_gpr(vcpu, 5),
+-					      kvmppc_get_gpr(vcpu, 6),
+-					      kvmppc_get_gpr(vcpu, 7));
+-		srcu_read_unlock(&vcpu->kvm->srcu, idx);
+-		break;
+ 	case H_CEDE:
+ 		break;
+ 	case H_PROD:
+@@ -2559,7 +2548,7 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 	/* Order vcpus_running vs. rma_setup_done, see kvmppc_alloc_reset_hpt */
+ 	smp_mb();
+ 
+-	/* On the first time here, set up HTAB and VRMA or RMA */
++	/* On the first time here, set up HTAB and VRMA */
+ 	if (!vcpu->kvm->arch.rma_setup_done) {
+ 		r = kvmppc_hv_setup_htab_rma(vcpu);
+ 		if (r)
+@@ -2596,98 +2585,6 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 	return r;
+ }
+ 
+-
+-/* Work out RMLS (real mode limit selector) field value for a given RMA size.
+-   Assumes POWER7 or PPC970. */
+-static inline int lpcr_rmls(unsigned long rma_size)
+-{
+-	switch (rma_size) {
+-	case 32ul << 20:	/* 32 MB */
+-		if (cpu_has_feature(CPU_FTR_ARCH_206))
+-			return 8;	/* only supported on POWER7 */
+-		return -1;
+-	case 64ul << 20:	/* 64 MB */
+-		return 3;
+-	case 128ul << 20:	/* 128 MB */
+-		return 7;
+-	case 256ul << 20:	/* 256 MB */
+-		return 4;
+-	case 1ul << 30:		/* 1 GB */
+-		return 2;
+-	case 16ul << 30:	/* 16 GB */
+-		return 1;
+-	case 256ul << 30:	/* 256 GB */
+-		return 0;
+-	default:
+-		return -1;
+-	}
+-}
+-
+-static int kvm_rma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+-{
+-	struct page *page;
+-	struct kvm_rma_info *ri = vma->vm_file->private_data;
+-
+-	if (vmf->pgoff >= kvm_rma_pages)
+-		return VM_FAULT_SIGBUS;
+-
+-	page = pfn_to_page(ri->base_pfn + vmf->pgoff);
+-	get_page(page);
+-	vmf->page = page;
+-	return 0;
+-}
+-
+-static const struct vm_operations_struct kvm_rma_vm_ops = {
+-	.fault = kvm_rma_fault,
+-};
+-
+-static int kvm_rma_mmap(struct file *file, struct vm_area_struct *vma)
+-{
+-	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+-	vma->vm_ops = &kvm_rma_vm_ops;
+-	return 0;
+-}
+-
+-static int kvm_rma_release(struct inode *inode, struct file *filp)
+-{
+-	struct kvm_rma_info *ri = filp->private_data;
+-
+-	kvm_release_rma(ri);
+-	return 0;
+-}
+-
+-static const struct file_operations kvm_rma_fops = {
+-	.mmap           = kvm_rma_mmap,
+-	.release	= kvm_rma_release,
+-};
+-
+-static long kvm_vm_ioctl_allocate_rma(struct kvm *kvm,
+-				      struct kvm_allocate_rma *ret)
+-{
+-	long fd;
+-	struct kvm_rma_info *ri;
+-	/*
+-	 * Only do this on PPC970 in HV mode
+-	 */
+-	if (!cpu_has_feature(CPU_FTR_HVMODE) ||
+-	    !cpu_has_feature(CPU_FTR_ARCH_201))
+-		return -EINVAL;
+-
+-	if (!kvm_rma_pages)
+-		return -EINVAL;
+-
+-	ri = kvm_alloc_rma();
+-	if (!ri)
+-		return -ENOMEM;
+-
+-	fd = anon_inode_getfd("kvm-rma", &kvm_rma_fops, ri, O_RDWR | O_CLOEXEC);
+-	if (fd < 0)
+-		kvm_release_rma(ri);
+-
+-	ret->rma_size = kvm_rma_pages << PAGE_SHIFT;
+-	return fd;
+-}
+-
+ static void kvmppc_add_seg_page_size(struct kvm_ppc_one_seg_page_size **sps,
+ 				     int linux_psize)
+ {
+@@ -2768,26 +2665,6 @@ out:
+ 	return r;
+ }
+ 
+-static void unpin_slot(struct kvm_memory_slot *memslot)
+-{
+-	unsigned long *physp;
+-	unsigned long j, npages, pfn;
+-	struct page *page;
+-
+-	physp = memslot->arch.slot_phys;
+-	npages = memslot->npages;
+-	if (!physp)
+-		return;
+-	for (j = 0; j < npages; j++) {
+-		if (!(physp[j] & KVMPPC_GOT_PAGE))
+-			continue;
+-		pfn = physp[j] >> PAGE_SHIFT;
+-		page = pfn_to_page(pfn);
+-		SetPageDirty(page);
+-		put_page(page);
+-	}
+-}
+-
+ static void kvmppc_core_free_memslot_hv(struct kvm_memory_slot *free,
+ 					struct kvm_memory_slot *dont)
+ {
+@@ -2795,11 +2672,6 @@ static void kvmppc_core_free_memslot_hv(struct kvm_memory_slot *free,
+ 		vfree(free->arch.rmap);
+ 		free->arch.rmap = NULL;
+ 	}
+-	if (!dont || free->arch.slot_phys != dont->arch.slot_phys) {
+-		unpin_slot(free);
+-		vfree(free->arch.slot_phys);
+-		free->arch.slot_phys = NULL;
+-	}
+ }
+ 
+ static int kvmppc_core_create_memslot_hv(struct kvm_memory_slot *slot,
+@@ -2808,7 +2680,6 @@ static int kvmppc_core_create_memslot_hv(struct kvm_memory_slot *slot,
+ 	slot->arch.rmap = vzalloc(npages * sizeof(*slot->arch.rmap));
+ 	if (!slot->arch.rmap)
+ 		return -ENOMEM;
+-	slot->arch.slot_phys = NULL;
+ 
+ 	return 0;
+ }
+@@ -2817,17 +2688,6 @@ static int kvmppc_core_prepare_memory_region_hv(struct kvm *kvm,
+ 					struct kvm_memory_slot *memslot,
+ 					const struct kvm_userspace_memory_region *mem)
+ {
+-	unsigned long *phys;
+-
+-	/* Allocate a slot_phys array if needed */
+-	phys = memslot->arch.slot_phys;
+-	if (!kvm->arch.using_mmu_notifiers && !phys && memslot->npages) {
+-		phys = vzalloc(memslot->npages * sizeof(unsigned long));
+-		if (!phys)
+-			return -ENOMEM;
+-		memslot->arch.slot_phys = phys;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -2888,17 +2748,11 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+ {
+ 	int err = 0;
+ 	struct kvm *kvm = vcpu->kvm;
+-	struct kvm_rma_info *ri = NULL;
+ 	unsigned long hva;
+ 	struct kvm_memory_slot *memslot;
+ 	struct vm_area_struct *vma;
+ 	unsigned long lpcr = 0, senc;
+-	unsigned long lpcr_mask = 0;
+ 	unsigned long psize, porder;
+-	unsigned long rma_size;
+-	unsigned long rmls;
+-	unsigned long *physp;
+-	unsigned long i, npages;
+ 	int srcu_idx;
+ 
+ 	mutex_lock(&kvm->lock);
+@@ -2933,88 +2787,25 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+ 	psize = vma_kernel_pagesize(vma);
+ 	porder = __ilog2(psize);
+ 
+-	/* Is this one of our preallocated RMAs? */
+-	if (vma->vm_file && vma->vm_file->f_op == &kvm_rma_fops &&
+-	    hva == vma->vm_start)
+-		ri = vma->vm_file->private_data;
+-
+ 	up_read(&current->mm->mmap_sem);
+ 
+-	if (!ri) {
+-		/* On POWER7, use VRMA; on PPC970, give up */
+-		err = -EPERM;
+-		if (cpu_has_feature(CPU_FTR_ARCH_201)) {
+-			pr_err("KVM: CPU requires an RMO\n");
+-			goto out_srcu;
+-		}
+-
+-		/* We can handle 4k, 64k or 16M pages in the VRMA */
+-		err = -EINVAL;
+-		if (!(psize == 0x1000 || psize == 0x10000 ||
+-		      psize == 0x1000000))
+-			goto out_srcu;
+-
+-		/* Update VRMASD field in the LPCR */
+-		senc = slb_pgsize_encoding(psize);
+-		kvm->arch.vrma_slb_v = senc | SLB_VSID_B_1T |
+-			(VRMA_VSID << SLB_VSID_SHIFT_1T);
+-		lpcr_mask = LPCR_VRMASD;
+-		/* the -4 is to account for senc values starting at 0x10 */
+-		lpcr = senc << (LPCR_VRMASD_SH - 4);
++	/* We can handle 4k, 64k or 16M pages in the VRMA */
++	err = -EINVAL;
++	if (!(psize == 0x1000 || psize == 0x10000 ||
++	      psize == 0x1000000))
++		goto out_srcu;
+ 
+-		/* Create HPTEs in the hash page table for the VRMA */
+-		kvmppc_map_vrma(vcpu, memslot, porder);
++	/* Update VRMASD field in the LPCR */
++	senc = slb_pgsize_encoding(psize);
++	kvm->arch.vrma_slb_v = senc | SLB_VSID_B_1T |
++		(VRMA_VSID << SLB_VSID_SHIFT_1T);
++	/* the -4 is to account for senc values starting at 0x10 */
++	lpcr = senc << (LPCR_VRMASD_SH - 4);
+ 
+-	} else {
+-		/* Set up to use an RMO region */
+-		rma_size = kvm_rma_pages;
+-		if (rma_size > memslot->npages)
+-			rma_size = memslot->npages;
+-		rma_size <<= PAGE_SHIFT;
+-		rmls = lpcr_rmls(rma_size);
+-		err = -EINVAL;
+-		if ((long)rmls < 0) {
+-			pr_err("KVM: Can't use RMA of 0x%lx bytes\n", rma_size);
+-			goto out_srcu;
+-		}
+-		atomic_inc(&ri->use_count);
+-		kvm->arch.rma = ri;
+-
+-		/* Update LPCR and RMOR */
+-		if (cpu_has_feature(CPU_FTR_ARCH_201)) {
+-			/* PPC970; insert RMLS value (split field) in HID4 */
+-			lpcr_mask = (1ul << HID4_RMLS0_SH) |
+-				(3ul << HID4_RMLS2_SH) | HID4_RMOR;
+-			lpcr = ((rmls >> 2) << HID4_RMLS0_SH) |
+-				((rmls & 3) << HID4_RMLS2_SH);
+-			/* RMOR is also in HID4 */
+-			lpcr |= ((ri->base_pfn >> (26 - PAGE_SHIFT)) & 0xffff)
+-				<< HID4_RMOR_SH;
+-		} else {
+-			/* POWER7 */
+-			lpcr_mask = LPCR_VPM0 | LPCR_VRMA_L | LPCR_RMLS;
+-			lpcr = rmls << LPCR_RMLS_SH;
+-			kvm->arch.rmor = ri->base_pfn << PAGE_SHIFT;
+-		}
+-		pr_info("KVM: Using RMO at %lx size %lx (LPCR = %lx)\n",
+-			ri->base_pfn << PAGE_SHIFT, rma_size, lpcr);
+-
+-		/* Initialize phys addrs of pages in RMO */
+-		npages = kvm_rma_pages;
+-		porder = __ilog2(npages);
+-		physp = memslot->arch.slot_phys;
+-		if (physp) {
+-			if (npages > memslot->npages)
+-				npages = memslot->npages;
+-			spin_lock(&kvm->arch.slot_phys_lock);
+-			for (i = 0; i < npages; ++i)
+-				physp[i] = ((ri->base_pfn + i) << PAGE_SHIFT) +
+-					porder;
+-			spin_unlock(&kvm->arch.slot_phys_lock);
+-		}
+-	}
++	/* Create HPTEs in the hash page table for the VRMA */
++	kvmppc_map_vrma(vcpu, memslot, porder);
+ 
+-	kvmppc_update_lpcr(kvm, lpcr, lpcr_mask);
++	kvmppc_update_lpcr(kvm, lpcr, LPCR_VRMASD);
+ 
+ 	/* Order updates to kvm->arch.lpcr etc. vs. rma_setup_done */
+ 	smp_wmb();
+@@ -3053,35 +2844,21 @@ static int kvmppc_core_init_vm_hv(struct kvm *kvm)
+ 	memcpy(kvm->arch.enabled_hcalls, default_enabled_hcalls,
+ 	       sizeof(kvm->arch.enabled_hcalls));
+ 
+-	kvm->arch.rma = NULL;
+-
+ 	kvm->arch.host_sdr1 = mfspr(SPRN_SDR1);
+ 
+-	if (cpu_has_feature(CPU_FTR_ARCH_201)) {
+-		/* PPC970; HID4 is effectively the LPCR */
+-		kvm->arch.host_lpid = 0;
+-		kvm->arch.host_lpcr = lpcr = mfspr(SPRN_HID4);
+-		lpcr &= ~((3 << HID4_LPID1_SH) | (0xful << HID4_LPID5_SH));
+-		lpcr |= ((lpid >> 4) << HID4_LPID1_SH) |
+-			((lpid & 0xf) << HID4_LPID5_SH);
+-	} else {
+-		/* POWER7; init LPCR for virtual RMA mode */
+-		kvm->arch.host_lpid = mfspr(SPRN_LPID);
+-		kvm->arch.host_lpcr = lpcr = mfspr(SPRN_LPCR);
+-		lpcr &= LPCR_PECE | LPCR_LPES;
+-		lpcr |= (4UL << LPCR_DPFD_SH) | LPCR_HDICE |
+-			LPCR_VPM0 | LPCR_VPM1;
+-		kvm->arch.vrma_slb_v = SLB_VSID_B_1T |
+-			(VRMA_VSID << SLB_VSID_SHIFT_1T);
+-		/* On POWER8 turn on online bit to enable PURR/SPURR */
+-		if (cpu_has_feature(CPU_FTR_ARCH_207S))
+-			lpcr |= LPCR_ONL;
+-	}
++	/* Init LPCR for virtual RMA mode */
++	kvm->arch.host_lpid = mfspr(SPRN_LPID);
++	kvm->arch.host_lpcr = lpcr = mfspr(SPRN_LPCR);
++	lpcr &= LPCR_PECE | LPCR_LPES;
++	lpcr |= (4UL << LPCR_DPFD_SH) | LPCR_HDICE |
++		LPCR_VPM0 | LPCR_VPM1;
++	kvm->arch.vrma_slb_v = SLB_VSID_B_1T |
++		(VRMA_VSID << SLB_VSID_SHIFT_1T);
++	/* On POWER8 turn on online bit to enable PURR/SPURR */
++	if (cpu_has_feature(CPU_FTR_ARCH_207S))
++		lpcr |= LPCR_ONL;
+ 	kvm->arch.lpcr = lpcr;
+ 
+-	kvm->arch.using_mmu_notifiers = !!cpu_has_feature(CPU_FTR_ARCH_206);
+-	spin_lock_init(&kvm->arch.slot_phys_lock);
+-
+ 	/*
+ 	 * Track that we now have a HV mode VM active. This blocks secondary
+ 	 * CPU threads from coming online.
+@@ -3106,10 +2883,6 @@ static void kvmppc_core_destroy_vm_hv(struct kvm *kvm)
+ 	kvm_hv_vm_deactivated();
+ 
+ 	kvmppc_free_vcores(kvm);
+-	if (kvm->arch.rma) {
+-		kvm_release_rma(kvm->arch.rma);
+-		kvm->arch.rma = NULL;
+-	}
+ 
+ 	kvmppc_free_hpt(kvm);
+ }
+@@ -3135,7 +2908,8 @@ static int kvmppc_core_emulate_mfspr_hv(struct kvm_vcpu *vcpu, int sprn,
+ 
+ static int kvmppc_core_check_processor_compat_hv(void)
+ {
+-	if (!cpu_has_feature(CPU_FTR_HVMODE))
++	if (!cpu_has_feature(CPU_FTR_HVMODE) ||
++	    !cpu_has_feature(CPU_FTR_ARCH_206))
+ 		return -EIO;
+ 	return 0;
+ }
+@@ -3149,16 +2923,6 @@ static long kvm_arch_vm_ioctl_hv(struct file *filp,
+ 
+ 	switch (ioctl) {
+ 
+-	case KVM_ALLOCATE_RMA: {
+-		struct kvm_allocate_rma rma;
+-		struct kvm *kvm = filp->private_data;
+-
+-		r = kvm_vm_ioctl_allocate_rma(kvm, &rma);
+-		if (r >= 0 && copy_to_user(argp, &rma, sizeof(rma)))
+-			r = -EFAULT;
+-		break;
+-	}
+-
+ 	case KVM_PPC_ALLOCATE_HTAB: {
+ 		u32 htab_order;
+ 
+* Unmerged path arch/powerpc/kvm/book3s_hv_builtin.c
+diff --git a/arch/powerpc/kvm/book3s_hv_interrupts.S b/arch/powerpc/kvm/book3s_hv_interrupts.S
+index 731be7478b27..36540a99d178 100644
+--- a/arch/powerpc/kvm/book3s_hv_interrupts.S
++++ b/arch/powerpc/kvm/book3s_hv_interrupts.S
+@@ -52,10 +52,8 @@ _GLOBAL(__kvmppc_vcore_entry)
+ 	std	r3, _CCR(r1)
+ 
+ 	/* Save host DSCR */
+-BEGIN_FTR_SECTION
+ 	mfspr	r3, SPRN_DSCR
+ 	std	r3, HSTATE_DSCR(r13)
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ 
+ BEGIN_FTR_SECTION
+ 	/* Save host DABR */
+@@ -84,11 +82,9 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ 	mfspr	r7, SPRN_MMCR0		/* save MMCR0 */
+ 	mtspr	SPRN_MMCR0, r3		/* freeze all counters, disable interrupts */
+ 	mfspr	r6, SPRN_MMCRA
+-BEGIN_FTR_SECTION
+-	/* On P7, clear MMCRA in order to disable SDAR updates */
++	/* Clear MMCRA in order to disable SDAR updates */
+ 	li	r5, 0
+ 	mtspr	SPRN_MMCRA, r5
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ 	isync
+ 	ld	r3, PACALPPACAPTR(r13)	/* is the host using the PMU? */
+ 	lbz	r5, LPPACA_PMCINUSE(r3)
+@@ -113,20 +109,12 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ 	mfspr	r7, SPRN_PMC4
+ 	mfspr	r8, SPRN_PMC5
+ 	mfspr	r9, SPRN_PMC6
+-BEGIN_FTR_SECTION
+-	mfspr	r10, SPRN_PMC7
+-	mfspr	r11, SPRN_PMC8
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ 	stw	r3, HSTATE_PMC(r13)
+ 	stw	r5, HSTATE_PMC + 4(r13)
+ 	stw	r6, HSTATE_PMC + 8(r13)
+ 	stw	r7, HSTATE_PMC + 12(r13)
+ 	stw	r8, HSTATE_PMC + 16(r13)
+ 	stw	r9, HSTATE_PMC + 20(r13)
+-BEGIN_FTR_SECTION
+-	stw	r10, HSTATE_PMC + 24(r13)
+-	stw	r11, HSTATE_PMC + 28(r13)
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ 31:
+ 
+ 	/*
+@@ -140,31 +128,6 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ 	add	r8,r8,r7
+ 	std	r8,HSTATE_DECEXP(r13)
+ 
+-#ifdef CONFIG_SMP
+-	/*
+-	 * On PPC970, if the guest vcpu has an external interrupt pending,
+-	 * send ourselves an IPI so as to interrupt the guest once it
+-	 * enables interrupts.  (It must have interrupts disabled,
+-	 * otherwise we would already have delivered the interrupt.)
+-	 *
+-	 * XXX If this is a UP build, smp_send_reschedule is not available,
+-	 * so the interrupt will be delayed until the next time the vcpu
+-	 * enters the guest with interrupts enabled.
+-	 */
+-BEGIN_FTR_SECTION
+-	ld	r4, HSTATE_KVM_VCPU(r13)
+-	ld	r0, VCPU_PENDING_EXC(r4)
+-	li	r7, (1 << BOOK3S_IRQPRIO_EXTERNAL)
+-	oris	r7, r7, (1 << BOOK3S_IRQPRIO_EXTERNAL_LEVEL)@h
+-	and.	r0, r0, r7
+-	beq	32f
+-	lhz	r3, PACAPACAINDEX(r13)
+-	bl	smp_send_reschedule
+-	nop
+-32:
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+-#endif /* CONFIG_SMP */
+-
+ 	/* Jump to partition switch code */
+ 	bl	kvmppc_hv_entry_trampoline
+ 	nop
+diff --git a/arch/powerpc/kvm/book3s_hv_ras.c b/arch/powerpc/kvm/book3s_hv_ras.c
+index d562c8e2bc30..60081bd75847 100644
+--- a/arch/powerpc/kvm/book3s_hv_ras.c
++++ b/arch/powerpc/kvm/book3s_hv_ras.c
+@@ -138,8 +138,5 @@ out:
+ 
+ long kvmppc_realmode_machine_check(struct kvm_vcpu *vcpu)
+ {
+-	if (cpu_has_feature(CPU_FTR_ARCH_206))
+-		return kvmppc_realmode_mc_power7(vcpu);
+-
+-	return 0;
++	return kvmppc_realmode_mc_power7(vcpu);
+ }
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_mmu.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index 8c3938ebe7ad..4b601fa5af1e 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -540,18 +540,12 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 			r = 0;
+ 		break;
+ 	case KVM_CAP_PPC_RMA:
+-		r = hv_enabled;
+-		/* PPC970 requires an RMA */
+-		if (r && cpu_has_feature(CPU_FTR_ARCH_201))
+-			r = 2;
++		r = 0;
+ 		break;
+ #endif
+ 	case KVM_CAP_SYNC_MMU:
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+-		if (hv_enabled)
+-			r = cpu_has_feature(CPU_FTR_ARCH_206) ? 1 : 0;
+-		else
+-			r = 0;
++		r = hv_enabled;
+ #elif defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+ 		r = 1;
+ #else
