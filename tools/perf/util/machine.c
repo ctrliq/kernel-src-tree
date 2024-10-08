@@ -617,7 +617,7 @@ size_t machine__fprintf_vmlinux_path(struct machine *machine, FILE *fp)
 {
 	int i;
 	size_t printed = 0;
-	struct dso *kdso = machine__kernel_map(machine, MAP__FUNCTION)->dso;
+	struct dso *kdso = machine__kernel_map(machine)->dso;
 
 	if (kdso->has_build_id) {
 		char filename[PATH_MAX];
@@ -742,7 +742,7 @@ int __machine__create_kernel_maps(struct machine *machine, struct dso *kernel)
 		machine->vmlinux_maps[type]->map_ip =
 			machine->vmlinux_maps[type]->unmap_ip =
 				identity__map_ip;
-		map = machine__kernel_map(machine, type);
+		map = __machine__kernel_map(machine, type);
 		kmap = map__kmap(map);
 		if (!kmap)
 			return -1;
@@ -760,7 +760,7 @@ void machine__destroy_kernel_maps(struct machine *machine)
 
 	for (type = 0; type < MAP__NR_TYPES; ++type) {
 		struct kmap *kmap;
-		struct map *map = machine__kernel_map(machine, type);
+		struct map *map = __machine__kernel_map(machine, type);
 
 		if (map == NULL)
 			continue;
@@ -860,7 +860,7 @@ int machines__create_kernel_maps(struct machines *machines, pid_t pid)
 int machine__load_kallsyms(struct machine *machine, const char *filename,
 			   enum map_type type, symbol_filter_t filter)
 {
-	struct map *map = machine__kernel_map(machine, MAP__FUNCTION);
+	struct map *map = machine__kernel_map(machine);
 	int ret = dso__load_kallsyms(map->dso, filename, map, filter);
 
 	if (ret > 0) {
@@ -879,7 +879,7 @@ int machine__load_kallsyms(struct machine *machine, const char *filename,
 int machine__load_vmlinux_path(struct machine *machine, enum map_type type,
 			       symbol_filter_t filter)
 {
-	struct map *map = machine__kernel_map(machine, MAP__FUNCTION);
+	struct map *map = machine__kernel_map(machine);
 	int ret = dso__load_vmlinux_path(map->dso, map, filter);
 
 	if (ret > 0)
@@ -1237,8 +1237,7 @@ static int machine__process_kernel_mmap_event(struct machine *machine,
 			/*
 			 * preload dso of guest kernel and modules
 			 */
-			dso__load(kernel, machine__kernel_map(machine, MAP__FUNCTION),
-				  NULL);
+			dso__load(kernel, machine__kernel_map(machine), NULL);
 		}
 	}
 	return 0;
@@ -1986,7 +1985,7 @@ int machine__set_current_tid(struct machine *machine, int cpu, pid_t pid,
 
 int machine__get_kernel_start(struct machine *machine)
 {
-	struct map *map = machine__kernel_map(machine, MAP__FUNCTION);
+	struct map *map = machine__kernel_map(machine);
 	int err = 0;
 
 	/*
