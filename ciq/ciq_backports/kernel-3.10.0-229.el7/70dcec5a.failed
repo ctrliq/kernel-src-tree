@@ -1,0 +1,253 @@
+cfg80211: don't WARN about two consecutive Country IE hint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+commit 70dcec5a488a7b81779190ac8089475fe4b8b962
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/70dcec5a.failed
+
+This can happen and there is no point in added more
+detection code lower in the stack. Catching these in one
+single point (cfg80211) is enough. Stop WARNING about this
+case.
+
+This fixes:
+https://bugzilla.kernel.org/show_bug.cgi?id=89001
+
+	Cc: stable@vger.kernel.org
+Fixes: 2f1c6c572d7b ("cfg80211: process non country IE conflicting first")
+	Signed-off-by: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 70dcec5a488a7b81779190ac8089475fe4b8b962)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/wireless/reg.c
+diff --cc net/wireless/reg.c
+index cc35fbaa4578,c9f5ad5d5d94..000000000000
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@@ -1530,14 -1815,235 +1530,218 @@@ new_request
+  	return REG_REQ_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * reg_process_hint_user - process user regulatory requests
++  * @user_request: a pending user regulatory request
++  *
++  * The wireless subsystem can use this function to process
++  * a regulatory request initiated by userspace.
++  *
++  * Returns one of the different reg request treatment values.
++  */
++ static enum reg_request_treatment
++ reg_process_hint_user(struct regulatory_request *user_request)
++ {
++ 	enum reg_request_treatment treatment;
++ 
++ 	treatment = __reg_process_hint_user(user_request);
++ 	if (treatment == REG_REQ_IGNORE ||
++ 	    treatment == REG_REQ_ALREADY_SET ||
++ 	    treatment == REG_REQ_USER_HINT_HANDLED) {
++ 		reg_free_request(user_request);
++ 		return treatment;
++ 	}
++ 
++ 	user_request->intersect = treatment == REG_REQ_INTERSECT;
++ 	user_request->processed = false;
++ 
++ 	reg_update_last_request(user_request);
++ 
++ 	user_alpha2[0] = user_request->alpha2[0];
++ 	user_alpha2[1] = user_request->alpha2[1];
++ 
++ 	return reg_call_crda(user_request);
++ }
++ 
++ static enum reg_request_treatment
++ __reg_process_hint_driver(struct regulatory_request *driver_request)
++ {
++ 	struct regulatory_request *lr = get_last_request();
++ 
++ 	if (lr->initiator == NL80211_REGDOM_SET_BY_CORE) {
++ 		if (regdom_changes(driver_request->alpha2))
++ 			return REG_REQ_OK;
++ 		return REG_REQ_ALREADY_SET;
++ 	}
++ 
++ 	/*
++ 	 * This would happen if you unplug and plug your card
++ 	 * back in or if you add a new device for which the previously
++ 	 * loaded card also agrees on the regulatory domain.
++ 	 */
++ 	if (lr->initiator == NL80211_REGDOM_SET_BY_DRIVER &&
++ 	    !regdom_changes(driver_request->alpha2))
++ 		return REG_REQ_ALREADY_SET;
++ 
++ 	return REG_REQ_INTERSECT;
++ }
++ 
++ /**
++  * reg_process_hint_driver - process driver regulatory requests
++  * @driver_request: a pending driver regulatory request
++  *
++  * The wireless subsystem can use this function to process
++  * a regulatory request issued by an 802.11 driver.
++  *
++  * Returns one of the different reg request treatment values.
++  */
++ static enum reg_request_treatment
++ reg_process_hint_driver(struct wiphy *wiphy,
++ 			struct regulatory_request *driver_request)
++ {
++ 	const struct ieee80211_regdomain *regd, *tmp;
++ 	enum reg_request_treatment treatment;
++ 
++ 	treatment = __reg_process_hint_driver(driver_request);
++ 
++ 	switch (treatment) {
++ 	case REG_REQ_OK:
++ 		break;
++ 	case REG_REQ_IGNORE:
++ 	case REG_REQ_USER_HINT_HANDLED:
++ 		reg_free_request(driver_request);
++ 		return treatment;
++ 	case REG_REQ_INTERSECT:
++ 		/* fall through */
++ 	case REG_REQ_ALREADY_SET:
++ 		regd = reg_copy_regd(get_cfg80211_regdom());
++ 		if (IS_ERR(regd)) {
++ 			reg_free_request(driver_request);
++ 			return REG_REQ_IGNORE;
++ 		}
++ 
++ 		tmp = get_wiphy_regdom(wiphy);
++ 		rcu_assign_pointer(wiphy->regd, regd);
++ 		rcu_free_regdom(tmp);
++ 	}
++ 
++ 
++ 	driver_request->intersect = treatment == REG_REQ_INTERSECT;
++ 	driver_request->processed = false;
++ 
++ 	reg_update_last_request(driver_request);
++ 
++ 	/*
++ 	 * Since CRDA will not be called in this case as we already
++ 	 * have applied the requested regulatory domain before we just
++ 	 * inform userspace we have processed the request
++ 	 */
++ 	if (treatment == REG_REQ_ALREADY_SET) {
++ 		nl80211_send_reg_change_event(driver_request);
++ 		reg_set_request_processed();
++ 		return treatment;
++ 	}
++ 
++ 	return reg_call_crda(driver_request);
++ }
++ 
++ static enum reg_request_treatment
++ __reg_process_hint_country_ie(struct wiphy *wiphy,
++ 			      struct regulatory_request *country_ie_request)
++ {
++ 	struct wiphy *last_wiphy = NULL;
++ 	struct regulatory_request *lr = get_last_request();
++ 
++ 	if (reg_request_cell_base(lr)) {
++ 		/* Trust a Cell base station over the AP's country IE */
++ 		if (regdom_changes(country_ie_request->alpha2))
++ 			return REG_REQ_IGNORE;
++ 		return REG_REQ_ALREADY_SET;
++ 	} else {
++ 		if (wiphy->regulatory_flags & REGULATORY_COUNTRY_IE_IGNORE)
++ 			return REG_REQ_IGNORE;
++ 	}
++ 
++ 	if (unlikely(!is_an_alpha2(country_ie_request->alpha2)))
++ 		return -EINVAL;
++ 
++ 	if (lr->initiator != NL80211_REGDOM_SET_BY_COUNTRY_IE)
++ 		return REG_REQ_OK;
++ 
++ 	last_wiphy = wiphy_idx_to_wiphy(lr->wiphy_idx);
++ 
++ 	if (last_wiphy != wiphy) {
++ 		/*
++ 		 * Two cards with two APs claiming different
++ 		 * Country IE alpha2s. We could
++ 		 * intersect them, but that seems unlikely
++ 		 * to be correct. Reject second one for now.
++ 		 */
++ 		if (regdom_changes(country_ie_request->alpha2))
++ 			return REG_REQ_IGNORE;
++ 		return REG_REQ_ALREADY_SET;
++ 	}
++ 
++ 	if (regdom_changes(country_ie_request->alpha2))
++ 		return REG_REQ_OK;
++ 	return REG_REQ_ALREADY_SET;
++ }
++ 
++ /**
++  * reg_process_hint_country_ie - process regulatory requests from country IEs
++  * @country_ie_request: a regulatory request from a country IE
++  *
++  * The wireless subsystem can use this function to process
++  * a regulatory request issued by a country Information Element.
++  *
++  * Returns one of the different reg request treatment values.
++  */
++ static enum reg_request_treatment
++ reg_process_hint_country_ie(struct wiphy *wiphy,
++ 			    struct regulatory_request *country_ie_request)
++ {
++ 	enum reg_request_treatment treatment;
++ 
++ 	treatment = __reg_process_hint_country_ie(wiphy, country_ie_request);
++ 
++ 	switch (treatment) {
++ 	case REG_REQ_OK:
++ 		break;
++ 	case REG_REQ_IGNORE:
++ 	case REG_REQ_USER_HINT_HANDLED:
++ 		/* fall through */
++ 	case REG_REQ_ALREADY_SET:
++ 		reg_free_request(country_ie_request);
++ 		return treatment;
++ 	case REG_REQ_INTERSECT:
++ 		reg_free_request(country_ie_request);
++ 		/*
++ 		 * This doesn't happen yet, not sure we
++ 		 * ever want to support it for this case.
++ 		 */
++ 		WARN_ONCE(1, "Unexpected intersection for country IEs");
++ 		return REG_REQ_IGNORE;
++ 	}
++ 
++ 	country_ie_request->intersect = false;
++ 	country_ie_request->processed = false;
++ 
++ 	reg_update_last_request(country_ie_request);
++ 
++ 	return reg_call_crda(country_ie_request);
++ }
++ 
+++>>>>>>> 70dcec5a488a (cfg80211: don't WARN about two consecutive Country IE hint)
+  /* This processes *all* regulatory hints */
+ -static void reg_process_hint(struct regulatory_request *reg_request)
+ +static void reg_process_hint(struct regulatory_request *reg_request,
+ +			     enum nl80211_reg_initiator reg_initiator)
+  {
+  	struct wiphy *wiphy = NULL;
+ -	enum reg_request_treatment treatment;
+ +
+ +	if (WARN_ON(!reg_request->alpha2))
+ +		return;
+  
+  	if (reg_request->wiphy_idx != WIPHY_IDX_INVALID)
+  		wiphy = wiphy_idx_to_wiphy(reg_request->wiphy_idx);
+* Unmerged path net/wireless/reg.c
