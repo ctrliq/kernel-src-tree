@@ -1,0 +1,83 @@
+drm/nouveau: punt fbcon resume out to a workqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] nouveau: punt fbcon resume out to a workqueue (Rob Clark) [1173317]
+Rebuild_FUZZ: 95.74%
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit 634ffcccfbe59d77652804e1beb415d3329b1bc6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/634ffccc.failed
+
+Preparation for some runtime pm fixes.  Currently we skip over fbcon
+suspend/resume in the runtime path, which causes issues on resume if
+fbcon tries to write to the framebuffer before the BAR subdev has
+been resumed to restore the BAR1 VM setup.
+
+As we might be woken up via a sysfs connector, we are unable to call
+fb_set_suspend() in the resume path as it could make its way down to
+a modeset and cause all sorts of locking hilarity.
+
+To solve this, we'll just delay the fbcon resume to a workqueue.
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit 634ffcccfbe59d77652804e1beb415d3329b1bc6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nouveau_fbcon.c
+diff --cc drivers/gpu/drm/nouveau/nouveau_fbcon.c
+index fa81047bd1be,49fe6075cc7c..000000000000
+--- a/drivers/gpu/drm/nouveau/nouveau_fbcon.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fbcon.c
+@@@ -462,9 -513,11 +472,10 @@@ nouveau_fbcon_init(struct drm_device *d
+  	if (!fbcon)
+  		return -ENOMEM;
+  
++ 	INIT_WORK(&fbcon->work, nouveau_fbcon_set_suspend_work);
+  	fbcon->dev = dev;
+  	drm->fbcon = fbcon;
+ -
+ -	drm_fb_helper_prepare(dev, &fbcon->helper, &nouveau_fbcon_helper_funcs);
+ +	fbcon->helper.funcs = &nouveau_fbcon_helper_funcs;
+  
+  	ret = drm_fb_helper_init(dev, &fbcon->helper,
+  				 dev->mode_config.num_crtc, 4);
+@@@ -527,12 -562,14 +538,23 @@@ nouveau_fbcon_set_suspend(struct drm_de
+  {
+  	struct nouveau_drm *drm = nouveau_drm(dev);
+  	if (drm->fbcon) {
+++<<<<<<< HEAD
+ +		console_lock();
+ +		if (state == 0)
+ +			nouveau_fbcon_save_disable_accel(dev);
+ +		fb_set_suspend(drm->fbcon->helper.fbdev, state);
+ +		if (state == 1)
+ +			nouveau_fbcon_restore_accel(dev);
+++=======
++ 		if (state == FBINFO_STATE_RUNNING) {
++ 			schedule_work(&drm->fbcon->work);
++ 			return;
++ 		}
++ 		flush_work(&drm->fbcon->work);
++ 		console_lock();
++ 		fb_set_suspend(drm->fbcon->helper.fbdev, state);
++ 		nouveau_fbcon_accel_save_disable(dev);
+++>>>>>>> 634ffcccfbe5 (drm/nouveau: punt fbcon resume out to a workqueue)
+  		console_unlock();
+  	}
+  }
+* Unmerged path drivers/gpu/drm/nouveau/nouveau_fbcon.c
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fbcon.h b/drivers/gpu/drm/nouveau/nouveau_fbcon.h
+index fdfc0c94fbcc..28a67bb604e7 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fbcon.h
++++ b/drivers/gpu/drm/nouveau/nouveau_fbcon.h
+@@ -36,6 +36,7 @@ struct nouveau_fbdev {
+ 	struct nouveau_framebuffer nouveau_fb;
+ 	struct list_head fbdev_list;
+ 	struct drm_device *dev;
++	struct work_struct work;
+ 	unsigned int saved_flags;
+ };
+ 
