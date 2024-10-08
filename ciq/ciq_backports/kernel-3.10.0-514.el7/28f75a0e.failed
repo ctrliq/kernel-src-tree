@@ -1,0 +1,199 @@
+Btrfs: refill block reserves during truncate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chris Mason <clm@fb.com>
+commit 28f75a0e6cdfbce8115487ecbc0968a2c4e01806
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/28f75a0e.failed
+
+When truncate starts, it allocates some space in the block reserves so
+that we'll have enough to update metadata along the way.
+
+For very large files, we can easily go through all of that space as we
+loop through the extents.  This changes truncate to refill the space
+reservation as it progresses through the file.
+
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 28f75a0e6cdfbce8115487ecbc0968a2c4e01806)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/extent-tree.c
+index 86d1e1b51efa,75f4bed6e6db..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -2626,6 -2632,25 +2626,28 @@@ static inline u64 heads_to_leaves(struc
+  	return div_u64(num_bytes, BTRFS_LEAF_DATA_SIZE(root));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Takes the number of bytes to be csumm'ed and figures out how many leaves it
++  * would require to store the csums for that many bytes.
++  */
++ u64 btrfs_csum_bytes_to_leaves(struct btrfs_root *root, u64 csum_bytes)
++ {
++ 	u64 csum_size;
++ 	u64 num_csums_per_leaf;
++ 	u64 num_csums;
++ 
++ 	csum_size = BTRFS_LEAF_DATA_SIZE(root) - sizeof(struct btrfs_item);
++ 	num_csums_per_leaf = div64_u64(csum_size,
++ 			(u64)btrfs_super_csum_size(root->fs_info->super_copy));
++ 	num_csums = div64_u64(csum_bytes, root->sectorsize);
++ 	num_csums += num_csums_per_leaf - 1;
++ 	num_csums = div64_u64(num_csums, num_csums_per_leaf);
++ 	return num_csums;
++ }
++ 
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  int btrfs_check_space_for_delayed_refs(struct btrfs_trans_handle *trans,
+  				       struct btrfs_root *root)
+  {
+@@@ -2639,6 -2665,7 +2661,10 @@@
+  	if (num_heads > 1)
+  		num_bytes += (num_heads - 1) * root->nodesize;
+  	num_bytes <<= 1;
+++<<<<<<< HEAD
+++=======
++ 	num_bytes += btrfs_csum_bytes_to_leaves(root, csum_bytes) * root->nodesize;
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  	global_rsv = &root->fs_info->global_block_rsv;
+  
+  	/*
+@@@ -5074,21 -5098,12 +5100,29 @@@ static u64 calc_csum_metadata_size(stru
+  	    BTRFS_I(inode)->csum_bytes == 0)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	old_csums = (int)div64_u64(BTRFS_I(inode)->csum_bytes, root->sectorsize);
+++=======
++ 	old_csums = btrfs_csum_bytes_to_leaves(root, BTRFS_I(inode)->csum_bytes);
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  	if (reserve)
+  		BTRFS_I(inode)->csum_bytes += num_bytes;
+  	else
+  		BTRFS_I(inode)->csum_bytes -= num_bytes;
+++<<<<<<< HEAD
+ +	csum_size = BTRFS_LEAF_DATA_SIZE(root) - sizeof(struct btrfs_item);
+ +	num_csums_per_leaf = (int)div_u64(csum_size,
+ +					    sizeof(struct btrfs_csum_item) +
+ +					    sizeof(struct btrfs_disk_key));
+ +	num_csums = (int)div64_u64(BTRFS_I(inode)->csum_bytes, root->sectorsize);
+ +	num_csums = num_csums + num_csums_per_leaf - 1;
+ +	num_csums = num_csums / num_csums_per_leaf;
+ +
+ +	old_csums = old_csums + num_csums_per_leaf - 1;
+ +	old_csums = old_csums / num_csums_per_leaf;
+++=======
++ 	num_csums = btrfs_csum_bytes_to_leaves(root, BTRFS_I(inode)->csum_bytes);
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  
+  	/* No change, no need to reserve more */
+  	if (old_csums == num_csums)
+diff --cc fs/btrfs/inode.c
+index e4204db85b0a,88537c52e114..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -4201,9 -4212,11 +4216,15 @@@ int btrfs_truncate_inode_items(struct b
+  	int extent_type = -1;
+  	int ret;
+  	int err = 0;
+ +	int be_nice = 0;
+  	u64 ino = btrfs_ino(inode);
+  	u64 bytes_deleted = 0;
+++<<<<<<< HEAD
+++=======
++ 	bool be_nice = 0;
++ 	bool should_throttle = 0;
++ 	bool should_end = 0;
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  
+  	BUG_ON(new_size > 0 && min_type != BTRFS_EXTENT_DATA_KEY);
+  
+@@@ -4409,11 -4424,18 +4432,23 @@@ delete
+  						btrfs_header_owner(leaf),
+  						ino, extent_offset, 0);
+  			BUG_ON(ret);
+ -			if (btrfs_should_throttle_delayed_refs(trans, root))
+ +			if (be_nice && pending_del_nr &&
+ +			    (pending_del_nr % 16 == 0) &&
+ +			    bytes_deleted > 1024 * 1024) {
+  				btrfs_async_run_delayed_refs(root,
+  					trans->delayed_ref_updates * 2, 0);
+++<<<<<<< HEAD
+++=======
++ 			if (be_nice) {
++ 				if (truncate_space_check(trans, root,
++ 							 extent_num_bytes)) {
++ 					should_end = 1;
++ 				}
++ 				if (btrfs_should_throttle_delayed_refs(trans,
++ 								       root)) {
++ 					should_throttle = 1;
++ 				}
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  			}
+  		}
+  
+@@@ -4421,7 -4443,8 +4456,12 @@@
+  			break;
+  
+  		if (path->slots[0] == 0 ||
+++<<<<<<< HEAD
+ +		    path->slots[0] != pending_del_slot) {
+++=======
++ 		    path->slots[0] != pending_del_slot ||
++ 		    should_throttle || should_end) {
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  			if (pending_del_nr) {
+  				ret = btrfs_del_items(trans, root, path,
+  						pending_del_slot,
+@@@ -4434,6 -4457,23 +4474,26 @@@
+  				pending_del_nr = 0;
+  			}
+  			btrfs_release_path(path);
+++<<<<<<< HEAD
+++=======
++ 			if (should_throttle) {
++ 				unsigned long updates = trans->delayed_ref_updates;
++ 				if (updates) {
++ 					trans->delayed_ref_updates = 0;
++ 					ret = btrfs_run_delayed_refs(trans, root, updates * 2);
++ 					if (ret && !err)
++ 						err = ret;
++ 				}
++ 			}
++ 			/*
++ 			 * if we failed to refill our space rsv, bail out
++ 			 * and let the transaction restart
++ 			 */
++ 			if (should_end) {
++ 				err = -EAGAIN;
++ 				goto error;
++ 			}
+++>>>>>>> 28f75a0e6cdf (Btrfs: refill block reserves during truncate)
+  			goto search_again;
+  		} else {
+  			path->slots[0]--;
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 5e1958622d83..aa7385d31e08 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3293,6 +3293,9 @@ static inline gfp_t btrfs_alloc_write_mask(struct address_space *mapping)
+ }
+ 
+ /* extent-tree.c */
++
++u64 btrfs_csum_bytes_to_leaves(struct btrfs_root *root, u64 csum_bytes);
++
+ static inline u64 btrfs_calc_trans_metadata_size(struct btrfs_root *root,
+ 						 unsigned num_items)
+ {
+* Unmerged path fs/btrfs/extent-tree.c
+* Unmerged path fs/btrfs/inode.c
