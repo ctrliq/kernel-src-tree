@@ -1,0 +1,122 @@
+HID: multitouch: Fetch feature reports on demand for Win8 devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hid] multitouch: Fetch feature reports on demand for Win8 devices (Benjamin Tissoires) [1311883]
+Rebuild_FUZZ: 96.00%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 6d4f5440a3a2bb2e9d0d582bbf98234e9e9bb095
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6d4f5440.failed
+
+Some newer Intel Skylake based Dell laptops with Win8 precision touchpad
+fail when initial feature reports are fetched from it. Below is an example
+output with some additional debug included:
+
+ i2c_hid i2c-DLL0704:01: Fetching the HID descriptor
+ i2c_hid i2c-DLL0704:01: __i2c_hid_command: cmd=20 00
+ i2c_hid i2c-DLL0704:01: HID Descriptor: 1e 00 00 01 99 02 21 00 24 ...
+ ...
+ i2c_hid i2c-DLL0704:01: i2c_hid_get_report
+ i2c_hid i2c-DLL0704:01: __i2c_hid_command: cmd=22 00 38 02 23 00
+ i2c_hid i2c-DLL0704:01: report (len=4): 04 00 08 05
+ i2c_hid i2c-DLL0704:01: report id 13
+ i2c_hid i2c-DLL0704:01: i2c_hid_get_report
+ i2c_hid i2c-DLL0704:01: __i2c_hid_command: cmd=22 00 3d 02 23 00
+ i2c_hid i2c-DLL0704:01: failed to retrieve report from device.
+ i2c_hid i2c-DLL0704:01: report id 7
+ i2c_hid i2c-DLL0704:01: i2c_hid_get_report
+ i2c_hid i2c-DLL0704:01: __i2c_hid_command: cmd=22 00 37 02 23 00
+ i2c_hid i2c-DLL0704:01: report (len=259): 03 01 07 fc 28 fe 84 40 ...
+ i2c_hid i2c-DLL0704:01: report id 4
+ i2c_hid i2c-DLL0704:01: i2c_hid_get_report
+ i2c_hid i2c-DLL0704:01: __i2c_hid_command: cmd=22 00 34 02 23 00
+
+We manage to fetch few reports but then the touchpad dies:
+
+ i2c_designware i2c_designware.1: i2c_dw_handle_tx_abort: lost arbitration
+ i2c_hid i2c-DLL0704:01: failed to retrieve report from device.
+
+it eventually pulls the whole I2C bus low:
+
+ i2c_designware i2c_designware.1: controller timed out
+ i2c_hid i2c-DLL0704:01: failed to set a report to device.
+
+Fix this by preventing initial feature report retrieval for Win8 devices.
+Instead we fetch reports as needed in mt_feature_mapping(). This prevents
+fetching reports which might cause problems with the device in question.
+
+	Suggested-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Tested-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 6d4f5440a3a2bb2e9d0d582bbf98234e9e9bb095)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/hid-multitouch.c
+diff --cc drivers/hid/hid-multitouch.c
+index ac1a207a60ca,dd64461e5e85..000000000000
+--- a/drivers/hid/hid-multitouch.c
++++ b/drivers/hid/hid-multitouch.c
+@@@ -340,18 -374,16 +377,26 @@@ static void mt_feature_mapping(struct h
+  			td->maxcontacts = td->mtclass.maxcontacts;
+  
+  		break;
+ -	case HID_DG_BUTTONTYPE:
+ -		if (usage->usage_index >= field->report_count) {
+ -			dev_err(&hdev->dev, "HID_DG_BUTTONTYPE out of range\n");
+ -			break;
+ +	case 0xff0000c5:
+ +		if (field->report_count == 256 && field->report_size == 8) {
+ +			/* Win 8 devices need special quirks */
+ +			__s32 *quirks = &td->mtclass.quirks;
+ +			*quirks |= MT_QUIRK_ALWAYS_VALID;
+ +			*quirks |= MT_QUIRK_IGNORE_DUPLICATES;
+ +			*quirks |= MT_QUIRK_HOVERING;
+ +			*quirks |= MT_QUIRK_CONTACT_CNT_ACCURATE;
+ +			*quirks &= ~MT_QUIRK_NOT_SEEN_MEANS_UP;
+ +			*quirks &= ~MT_QUIRK_VALID_IS_INRANGE;
+ +			*quirks &= ~MT_QUIRK_VALID_IS_CONFIDENCE;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		mt_get_feature(hdev, field->report);
++ 		if (field->value[usage->usage_index] == MT_BUTTONTYPE_CLICKPAD)
++ 			td->is_buttonpad = true;
++ 
+++>>>>>>> 6d4f5440a3a2 (HID: multitouch: Fetch feature reports on demand for Win8 devices)
+  		break;
+  	}
+  }
+@@@ -954,6 -1058,23 +999,26 @@@ static int mt_probe(struct hid_device *
+  	hdev->quirks |= HID_QUIRK_MULTI_INPUT;
+  	hdev->quirks |= HID_QUIRK_NO_EMPTY_INPUT;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Handle special quirks for Windows 8 certified devices.
++ 	 */
++ 	if (id->group == HID_GROUP_MULTITOUCH_WIN_8)
++ 		/*
++ 		 * Some multitouch screens do not like to be polled for input
++ 		 * reports. Fortunately, the Win8 spec says that all touches
++ 		 * should be sent during each report, making the initialization
++ 		 * of input reports unnecessary.
++ 		 *
++ 		 * In addition some touchpads do not behave well if we read
++ 		 * all feature reports from them. Instead we prevent
++ 		 * initial report fetching and then selectively fetch each
++ 		 * report we are interested in.
++ 		 */
++ 		hdev->quirks |= HID_QUIRK_NO_INIT_REPORTS;
++ 
+++>>>>>>> 6d4f5440a3a2 (HID: multitouch: Fetch feature reports on demand for Win8 devices)
+  	td = devm_kzalloc(&hdev->dev, sizeof(struct mt_device), GFP_KERNEL);
+  	if (!td) {
+  		dev_err(&hdev->dev, "cannot allocate multitouch data\n");
+* Unmerged path drivers/hid/hid-multitouch.c
