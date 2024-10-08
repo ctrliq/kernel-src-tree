@@ -1,0 +1,136 @@
+bnx2x: replace mechanism to check for next available packet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Dmitry Kravkov <dmitry@broadcom.com>
+commit 75b2945988274078bccf4c0b84e90c77b4fcaf96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/75b29459.failed
+
+Check next packet availability by validating that HW has finished CQE
+placement. This saves latency of another dma transaction performed to update
+SB indexes.
+
+	Signed-off-by: Dmitry Kravkov <dmitry@broadcom.com>
+	Signed-off-by: Eilon Greenstein <eilong@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 75b2945988274078bccf4c0b84e90c77b4fcaf96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+diff --cc drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+index 4e42bdd7c522,ca7f2bb08f44..000000000000
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@@ -3095,6 -3114,32 +3089,35 @@@ int bnx2x_poll(struct napi_struct *napi
+  	return work_done;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_LL_RX_POLL
++ /* must be called with local_bh_disable()d */
++ int bnx2x_low_latency_recv(struct napi_struct *napi)
++ {
++ 	struct bnx2x_fastpath *fp = container_of(napi, struct bnx2x_fastpath,
++ 						 napi);
++ 	struct bnx2x *bp = fp->bp;
++ 	int found = 0;
++ 
++ 	if ((bp->state == BNX2X_STATE_CLOSED) ||
++ 	    (bp->state == BNX2X_STATE_ERROR) ||
++ 	    (bp->flags & (TPA_ENABLE_FLAG | GRO_ENABLE_FLAG)))
++ 		return LL_FLUSH_FAILED;
++ 
++ 	if (!bnx2x_fp_lock_poll(fp))
++ 		return LL_FLUSH_BUSY;
++ 
++ 	if (bnx2x_has_rx_work(fp))
++ 		found = bnx2x_rx_int(fp, 4);
++ 
++ 	bnx2x_fp_unlock_poll(fp);
++ 
++ 	return found;
++ }
++ #endif
++ 
+++>>>>>>> 75b294598827 (bnx2x: replace mechanism to check for next available packet)
+  /* we split the first BD into headers and data BDs
+   * to ease the pain of our fellow microcode engineers
+   * we use one mapping for both BDs
+* Unmerged path drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
+index 650bb52155a8..842812e54456 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
+@@ -59,6 +59,16 @@ extern int int_mode;
+ 		   (unsigned long long)(*y), x); \
+ 	} while (0)
+ 
++#define BNX2X_PCI_FALLOC(x, y, size) \
++	do { \
++		x = dma_alloc_coherent(&bp->pdev->dev, size, y, GFP_KERNEL); \
++		if (x == NULL) \
++			goto alloc_mem_err; \
++		memset((void *)x, 0xFFFFFFFF, size); \
++		DP(NETIF_MSG_HW, "BNX2X_PCI_FALLOC: Physical %Lx Virtual %p\n",\
++		   (unsigned long long)(*y), x); \
++	} while (0)
++
+ #define BNX2X_ALLOC(x, size) \
+ 	do { \
+ 		x = kzalloc(size, GFP_KERNEL); \
+@@ -798,16 +808,18 @@ static inline bool bnx2x_has_tx_work(struct bnx2x_fastpath *fp)
+ 	return false;
+ }
+ 
++#define BNX2X_IS_CQE_COMPLETED(cqe_fp) (cqe_fp->marker == 0x0)
++#define BNX2X_SEED_CQE(cqe_fp) (cqe_fp->marker = 0xFFFFFFFF)
+ static inline int bnx2x_has_rx_work(struct bnx2x_fastpath *fp)
+ {
+-	u16 rx_cons_sb;
++	u16 cons;
++	union eth_rx_cqe *cqe;
++	struct eth_fast_path_rx_cqe *cqe_fp;
+ 
+-	/* Tell compiler that status block fields can change */
+-	barrier();
+-	rx_cons_sb = le16_to_cpu(*fp->rx_cons_sb);
+-	if ((rx_cons_sb & MAX_RCQ_DESC_CNT) == MAX_RCQ_DESC_CNT)
+-		rx_cons_sb++;
+-	return (fp->rx_comp_cons != rx_cons_sb);
++	cons = RCQ_BD(fp->rx_comp_cons);
++	cqe = &fp->rx_comp_ring[cons];
++	cqe_fp = &cqe->fast_path_cqe;
++	return BNX2X_IS_CQE_COMPLETED(cqe_fp);
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_hsi.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_hsi.h
+index 5ef3f964e544..5018e52ae2ad 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_hsi.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_hsi.h
+@@ -3818,7 +3818,8 @@ struct eth_fast_path_rx_cqe {
+ 	__le16 len_on_bd;
+ 	struct parsing_flags pars_flags;
+ 	union eth_sgl_or_raw_data sgl_or_raw_data;
+-	__le32 reserved1[8];
++	__le32 reserved1[7];
++	u32 marker;
+ };
+ 
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index 658b9fd0275f..436c5e9bd247 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -1866,7 +1866,6 @@ irqreturn_t bnx2x_interrupt(int irq, void *dev_instance)
+ 		mask = 0x2 << (fp->index + CNIC_SUPPORT(bp));
+ 		if (status & mask) {
+ 			/* Handle Rx or Tx according to SB id */
+-			prefetch(fp->rx_cons_sb);
+ 			for_each_cos_in_tx_queue(fp, cos)
+ 				prefetch(fp->txdata_ptr[cos]->tx_cons_sb);
+ 			prefetch(&fp->sb_running_index[SM_RX_ID]);
