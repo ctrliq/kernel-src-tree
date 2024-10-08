@@ -33,6 +33,7 @@
 
 
 #define PL2303_QUIRK_UART_STATE_IDX0		BIT(0)
+#define PL2303_QUIRK_LEGACY			BIT(1)
 
 static const struct usb_device_id id_table[] = {
 	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID) },
@@ -227,6 +228,8 @@ static int pl2303_startup(struct usb_serial *serial)
 
 	spriv->type = type;
 	spriv->quirks = (unsigned long)usb_get_serial_data(serial);
+	if (type == TYPE_01)
+		spriv->quirks |= PL2303_QUIRK_LEGACY;
 
 	usb_set_serial_data(serial, spriv);
 
@@ -240,7 +243,7 @@ static int pl2303_startup(struct usb_serial *serial)
 	pl2303_vendor_read(serial, 0x8383, buf);
 	pl2303_vendor_write(serial, 0, 1);
 	pl2303_vendor_write(serial, 1, 0);
-	if (type == TYPE_01)
+	if (spriv->quirks & PL2303_QUIRK_LEGACY)
 		pl2303_vendor_write(serial, 2, 0x24);
 	else
 		pl2303_vendor_write(serial, 2, 0x44);
@@ -536,7 +539,7 @@ static void pl2303_set_termios(struct tty_struct *tty,
 	}
 
 	if (C_CRTSCTS(tty)) {
-		if (spriv->type == TYPE_01)
+		if (spriv->quirks & PL2303_QUIRK_LEGACY)
 			pl2303_vendor_write(serial, 0x0, 0x41);
 		else
 			pl2303_vendor_write(serial, 0x0, 0x61);
@@ -576,7 +579,7 @@ static int pl2303_open(struct tty_struct *tty, struct usb_serial_port *port)
 	struct pl2303_serial_private *spriv = usb_get_serial_data(serial);
 	int result;
 
-	if (spriv->type == TYPE_01) {
+	if (spriv->quirks & PL2303_QUIRK_LEGACY) {
 		usb_clear_halt(serial->dev, port->write_urb->pipe);
 		usb_clear_halt(serial->dev, port->read_urb->pipe);
 	} else {
