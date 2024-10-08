@@ -1,0 +1,177 @@
+tcp: fix a potential deadlock in tcp_get_info()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit d654976cbf852ee20612ee10dbe57cdacda9f452
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d654976c.failed
+
+Taking socket spinlock in tcp_get_info() can deadlock, as
+inet_diag_dump_icsk() holds the &hashinfo->ehash_locks[i],
+while packet processing can use the reverse locking order.
+
+We could avoid this locking for TCP_LISTEN states, but lockdep would
+certainly get confused as all TCP sockets share same lockdep classes.
+
+[  523.722504] ======================================================
+[  523.728706] [ INFO: possible circular locking dependency detected ]
+[  523.734990] 4.1.0-dbg-DEV #1676 Not tainted
+[  523.739202] -------------------------------------------------------
+[  523.745474] ss/18032 is trying to acquire lock:
+[  523.750002]  (slock-AF_INET){+.-...}, at: [<ffffffff81669d44>] tcp_get_info+0x2c4/0x360
+[  523.758129]
+[  523.758129] but task is already holding lock:
+[  523.763968]  (&(&hashinfo->ehash_locks[i])->rlock){+.-...}, at: [<ffffffff816bcb75>] inet_diag_dump_icsk+0x1d5/0x6c0
+[  523.774661]
+[  523.774661] which lock already depends on the new lock.
+[  523.774661]
+[  523.782850]
+[  523.782850] the existing dependency chain (in reverse order) is:
+[  523.790326]
+-> #1 (&(&hashinfo->ehash_locks[i])->rlock){+.-...}:
+[  523.796599]        [<ffffffff811126bb>] lock_acquire+0xbb/0x270
+[  523.802565]        [<ffffffff816f5868>] _raw_spin_lock+0x38/0x50
+[  523.808628]        [<ffffffff81665af8>] __inet_hash_nolisten+0x78/0x110
+[  523.815273]        [<ffffffff816819db>] tcp_v4_syn_recv_sock+0x24b/0x350
+[  523.822067]        [<ffffffff81684d41>] tcp_check_req+0x3c1/0x500
+[  523.828199]        [<ffffffff81682d09>] tcp_v4_do_rcv+0x239/0x3d0
+[  523.834331]        [<ffffffff816842fe>] tcp_v4_rcv+0xa8e/0xc10
+[  523.840202]        [<ffffffff81658fa3>] ip_local_deliver_finish+0x133/0x3e0
+[  523.847214]        [<ffffffff81659a9a>] ip_local_deliver+0xaa/0xc0
+[  523.853440]        [<ffffffff816593b8>] ip_rcv_finish+0x168/0x5c0
+[  523.859624]        [<ffffffff81659db7>] ip_rcv+0x307/0x420
+
+Lets use u64_sync infrastructure instead. As a bonus, 64bit
+arches get optimized, as these are nop for them.
+
+Fixes: 0df48c26d841 ("tcp: add tcpi_bytes_acked to tcp_info")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d654976cbf852ee20612ee10dbe57cdacda9f452)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp.c
+#	net/ipv4/tcp_fastopen.c
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp.c
+index d8ad7f7bb200,f1377f2a0472..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -2686,9 -2667,11 +2688,17 @@@ void tcp_get_info(struct sock *sk, stru
+  	rate = READ_ONCE(sk->sk_max_pacing_rate);
+  	info->tcpi_max_pacing_rate = rate != ~0U ? rate : ~0ULL;
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&sk->sk_lock.slock);
+ +	info->tcpi_bytes_acked = tp->bytes_acked;
+ +	spin_unlock_bh(&sk->sk_lock.slock);
+++=======
++ 	do {
++ 		start = u64_stats_fetch_begin_irq(&tp->syncp);
++ 		info->tcpi_bytes_acked = tp->bytes_acked;
++ 		info->tcpi_bytes_received = tp->bytes_received;
++ 	} while (u64_stats_fetch_retry_irq(&tp->syncp, start));
+++>>>>>>> d654976cbf85 (tcp: fix a potential deadlock in tcp_get_info())
+  }
+  EXPORT_SYMBOL_GPL(tcp_get_info);
+  
+diff --cc net/ipv4/tcp_fastopen.c
+index d57bae06bc0b,46b087a27503..000000000000
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@@ -190,22 -191,37 +190,48 @@@ static bool tcp_fastopen_create_child(s
+  	 * (any reason not to?) but no need to queue the skb since
+  	 * there is no data. How about SYN+FIN?
+  	 */
+++<<<<<<< HEAD
+ +	if (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1) {
+ +		skb = skb_get(skb);
+ +		skb_dst_drop(skb);
+ +		__skb_pull(skb, tcp_hdr(skb)->doff * 4);
+ +		skb_set_owner_r(skb, child);
+ +		__skb_queue_tail(&child->sk_receive_queue, skb);
+ +		tp->syn_data_acked = 1;
+++=======
++ 	end_seq = TCP_SKB_CB(skb)->end_seq;
++ 	if (end_seq != TCP_SKB_CB(skb)->seq + 1) {
++ 		struct sk_buff *skb2;
++ 
++ 		if (unlikely(skb_shared(skb)))
++ 			skb2 = skb_clone(skb, GFP_ATOMIC);
++ 		else
++ 			skb2 = skb_get(skb);
++ 
++ 		if (likely(skb2)) {
++ 			skb_dst_drop(skb2);
++ 			__skb_pull(skb2, tcp_hdrlen(skb));
++ 			skb_set_owner_r(skb2, child);
++ 			__skb_queue_tail(&child->sk_receive_queue, skb2);
++ 			tp->syn_data_acked = 1;
++ 
++ 			/* u64_stats_update_begin(&tp->syncp) not needed here,
++ 			 * as we certainly are not changing upper 32bit value (0)
++ 			 */
++ 			tp->bytes_received = end_seq - TCP_SKB_CB(skb)->seq - 1;
++ 		} else {
++ 			end_seq = TCP_SKB_CB(skb)->seq + 1;
++ 		}
+++>>>>>>> d654976cbf85 (tcp: fix a potential deadlock in tcp_get_info())
+  	}
+ -	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = end_seq;
+ -	sk->sk_data_ready(sk);
+ +	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +	sk->sk_data_ready(sk, 0);
+  	bh_unlock_sock(child);
+  	sock_put(child);
+ -	WARN_ON(!req->sk);
+ +	WARN_ON(req->sk == NULL);
+  	return true;
+  }
+ +EXPORT_SYMBOL(tcp_fastopen_create_child);
+  
+  static bool tcp_fastopen_queue_check(struct sock *sk)
+  {
+diff --cc net/ipv4/tcp_input.c
+index a74414e9e6cd,c9ab964189a0..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -3264,6 -3292,17 +3266,20 @@@ static void tcp_snd_una_update(struct t
+  	tp->snd_una = ack;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* If we update tp->rcv_nxt, also update tp->bytes_received */
++ static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
++ {
++ 	u32 delta = seq - tp->rcv_nxt;
++ 
++ 	u64_stats_update_begin(&tp->syncp);
++ 	tp->bytes_received += delta;
++ 	u64_stats_update_end(&tp->syncp);
++ 	tp->rcv_nxt = seq;
++ }
++ 
+++>>>>>>> d654976cbf85 (tcp: fix a potential deadlock in tcp_get_info())
+  /* Update our send window.
+   *
+   * Window update algorithm, described in RFC793/RFC1122 (used in linux-2.2
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index 1c6e31feb254..51b8206d2a58 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -156,6 +156,8 @@ struct tcp_sock {
+ 				 * sum(delta(snd_una)), or how many bytes
+ 				 * were acked.
+ 				 */
++	struct u64_stats_sync syncp; /* protects 64bit vars (cf tcp_get_info()) */
++
+  	u32	snd_una;	/* First byte we want an ack for	*/
+  	u32	snd_sml;	/* Last byte of the most recently transmitted small packet */
+ 	u32	rcv_tstamp;	/* timestamp of last received ACK (for keepalives) */
+* Unmerged path net/ipv4/tcp.c
+* Unmerged path net/ipv4/tcp_fastopen.c
+* Unmerged path net/ipv4/tcp_input.c
