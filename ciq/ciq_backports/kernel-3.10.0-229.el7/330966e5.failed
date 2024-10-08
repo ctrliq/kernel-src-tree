@@ -1,0 +1,134 @@
+net: make skb_gso_segment error handling more robust
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] gso: make skb_gso_segment error handling more robust (Jiri Benc) [1144571]
+Rebuild_FUZZ: 94.23%
+commit-author Florian Westphal <fw@strlen.de>
+commit 330966e501ffe282d7184fde4518d5e0c24bc7f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/330966e5.failed
+
+skb_gso_segment has three possible return values:
+1. a pointer to the first segmented skb
+2. an errno value (IS_ERR())
+3. NULL.  This can happen when GSO is used for header verification.
+
+However, several callers currently test IS_ERR instead of IS_ERR_OR_NULL
+and would oops when NULL is returned.
+
+Note that these call sites should never actually see such a NULL return
+value; all callers mask out the GSO bits in the feature argument.
+
+However, there have been issues with some protocol handlers erronously not
+respecting the specified feature mask in some cases.
+
+It is preferable to get 'have to turn off hw offloading, else slow' reports
+rather than 'kernel crashes'.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 330966e501ffe282d7184fde4518d5e0c24bc7f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_output.c
+diff --cc net/ipv4/ip_output.c
+index b29ba5853083,bc6471d4abcd..000000000000
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@@ -211,12 -211,46 +211,49 @@@ static inline int ip_finish_output2(str
+  	return -EINVAL;
+  }
+  
+ -static int ip_finish_output_gso(struct sk_buff *skb)
+ +static inline int ip_skb_dst_mtu(struct sk_buff *skb)
+  {
+ -	netdev_features_t features;
+ -	struct sk_buff *segs;
+ -	int ret = 0;
+ +	struct inet_sock *inet = skb->sk ? inet_sk(skb->sk) : NULL;
+  
+++<<<<<<< HEAD
+ +	return (inet && inet->pmtudisc == IP_PMTUDISC_PROBE) ?
+ +	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+++=======
++ 	/* common case: locally created skb or seglen is <= mtu */
++ 	if (((IPCB(skb)->flags & IPSKB_FORWARDED) == 0) ||
++ 	      skb_gso_network_seglen(skb) <= ip_skb_dst_mtu(skb))
++ 		return ip_finish_output2(skb);
++ 
++ 	/* Slowpath -  GSO segment length is exceeding the dst MTU.
++ 	 *
++ 	 * This can happen in two cases:
++ 	 * 1) TCP GRO packet, DF bit not set
++ 	 * 2) skb arrived via virtio-net, we thus get TSO/GSO skbs directly
++ 	 * from host network stack.
++ 	 */
++ 	features = netif_skb_features(skb);
++ 	segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
++ 	if (IS_ERR_OR_NULL(segs)) {
++ 		kfree_skb(skb);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	consume_skb(skb);
++ 
++ 	do {
++ 		struct sk_buff *nskb = segs->next;
++ 		int err;
++ 
++ 		segs->next = NULL;
++ 		err = ip_fragment(segs, ip_finish_output2);
++ 
++ 		if (err && ret == 0)
++ 			ret = err;
++ 		segs = nskb;
++ 	} while (segs);
++ 
++ 	return ret;
+++>>>>>>> 330966e501ff (net: make skb_gso_segment error handling more robust)
+  }
+  
+  static int ip_finish_output(struct sk_buff *skb)
+* Unmerged path net/ipv4/ip_output.c
+diff --git a/net/netfilter/nfnetlink_queue_core.c b/net/netfilter/nfnetlink_queue_core.c
+index c227d2679708..814b5b54298d 100644
+--- a/net/netfilter/nfnetlink_queue_core.c
++++ b/net/netfilter/nfnetlink_queue_core.c
+@@ -616,7 +616,7 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
+ 	 * returned by nf_queue.  For instance, callers rely on -ECANCELED to
+ 	 * mean 'ignore this hook'.
+ 	 */
+-	if (IS_ERR(segs))
++	if (IS_ERR_OR_NULL(segs))
+ 		goto out_err;
+ 	queued = 0;
+ 	err = 0;
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 4cd9aea30532..a7cabca64783 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -314,6 +314,8 @@ static int queue_gso_packets(struct datapath *dp, struct sk_buff *skb,
+ 	segs = __skb_gso_segment(skb, NETIF_F_SG, false);
+ 	if (IS_ERR(segs))
+ 		return PTR_ERR(segs);
++	if (segs == NULL)
++		return -EINVAL;
+ 
+ 	/* Queue all of the segments. */
+ 	skb = segs;
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 0cf003dfa8fc..ffa9a0ba3f1f 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -158,6 +158,8 @@ static int xfrm_output_gso(struct sk_buff *skb)
+ 	kfree_skb(skb);
+ 	if (IS_ERR(segs))
+ 		return PTR_ERR(segs);
++	if (segs == NULL)
++		return -EINVAL;
+ 
+ 	do {
+ 		struct sk_buff *nskb = segs->next;
