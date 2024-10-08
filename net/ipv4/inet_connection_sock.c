@@ -101,6 +101,7 @@ int inet_csk_get_port(struct sock *sk, unsigned short snum)
 	struct net *net = sock_net(sk);
 	int smallest_size = -1, smallest_rover;
 	kuid_t uid = sock_i_uid(sk);
+	int attempt_half = (sk->sk_reuse == SK_CAN_REUSE) ? 1 : 0;
 
 	local_bh_disable();
 	if (!snum) {
@@ -108,6 +109,14 @@ int inet_csk_get_port(struct sock *sk, unsigned short snum)
 
 again:
 		inet_get_local_port_range(net, &low, &high);
+		if (attempt_half) {
+			int half = low + ((high - low) >> 1);
+
+			if (attempt_half == 1)
+				high = half;
+			else
+				low = half;
+		}
 		remaining = (high - low) + 1;
 		smallest_rover = rover = net_random() % remaining + low;
 
@@ -160,6 +169,11 @@ again:
 			if (smallest_size != -1) {
 				snum = smallest_rover;
 				goto have_snum;
+			}
+			if (attempt_half == 1) {
+				/* OK we now try the upper half of the range */
+				attempt_half = 2;
+				goto again;
 			}
 			goto fail;
 		}
