@@ -1,0 +1,402 @@
+drm/i915/dp: workaround BIOS eDP bpp clamping issue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [drm] i915/dp: workaround BIOS eDP bpp clamping issue (Rob Clark) [1054409]
+Rebuild_FUZZ: 95.92%
+commit-author Jani Nikula <jani.nikula@intel.com>
+commit c6cd2ee2d59111a07cd9199564c9bdcb2d11e5cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/c6cd2ee2.failed
+
+This isn't a real fix to the problem, but rather a stopgap measure while
+trying to find a proper solution.
+
+There are several laptops out there that fail to light up the eDP panel
+in UEFI boot mode. They seem to be mostly IVB machines, including but
+apparently not limited to Dell XPS 13, Asus TX300, Asus UX31A, Asus
+UX32VD, Acer Aspire S7. They seem to work in CSM or legacy boot.
+
+The difference between UEFI and CSM is that the BIOS provides a
+different VBT to the kernel. The UEFI VBT typically specifies 18 bpp and
+1.62 GHz link for eDP, while CSM VBT has 24 bpp and 2.7 GHz link. We end
+up clamping to 18 bpp in UEFI mode, which we can fit in the 1.62 Ghz
+link, and for reasons yet unknown fail to light up the panel.
+
+Dithering from 24 to 18 bpp itself seems to work; if we use 18 bpp with
+2.7 GHz link, the eDP panel lights up. So essentially this is a link
+speed issue, and *not* a bpp clamping issue.
+
+The bug raised its head since
+commit 657445fe8660100ad174600ebfa61536392b7624
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Sat May 4 10:09:18 2013 +0200
+
+    Revert "drm/i915: revert eDP bpp clamping code changes"
+
+which started clamping bpp *before* computing the link requirements, and
+thus affecting the required bandwidth. Clamping after the computations
+kept the link at 2.7 GHz.
+
+Even though the BIOS tells us to use 18 bpp through the VBT, it happily
+boots up at 24 bpp and 2.7 GHz itself! Use this information to
+selectively ignore the VBT provided value.
+
+We can't ignore the VBT eDP bpp altogether, as there are other laptops
+that do require the clamping to be used due to EDID reporting higher bpp
+than the panel can support.
+
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=59841
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=67950
+	Tested-by: Ulf Winkelvos <ulf@winkelvos.de>
+	Tested-by: jkp <jkp@iki.fi>
+CC: stable@vger.kernel.org
+	Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit c6cd2ee2d59111a07cd9199564c9bdcb2d11e5cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_dp.c
+diff --cc drivers/gpu/drm/i915/intel_dp.c
+index 70789b1b5642,1a431377d83b..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@@ -1335,6 -1359,332 +1335,335 @@@ static bool intel_dp_get_hw_state(struc
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void intel_dp_get_config(struct intel_encoder *encoder,
++ 				struct intel_crtc_config *pipe_config)
++ {
++ 	struct intel_dp *intel_dp = enc_to_intel_dp(&encoder->base);
++ 	u32 tmp, flags = 0;
++ 	struct drm_device *dev = encoder->base.dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	enum port port = dp_to_dig_port(intel_dp)->port;
++ 	struct intel_crtc *crtc = to_intel_crtc(encoder->base.crtc);
++ 
++ 	if ((port == PORT_A) || !HAS_PCH_CPT(dev)) {
++ 		tmp = I915_READ(intel_dp->output_reg);
++ 		if (tmp & DP_SYNC_HS_HIGH)
++ 			flags |= DRM_MODE_FLAG_PHSYNC;
++ 		else
++ 			flags |= DRM_MODE_FLAG_NHSYNC;
++ 
++ 		if (tmp & DP_SYNC_VS_HIGH)
++ 			flags |= DRM_MODE_FLAG_PVSYNC;
++ 		else
++ 			flags |= DRM_MODE_FLAG_NVSYNC;
++ 	} else {
++ 		tmp = I915_READ(TRANS_DP_CTL(crtc->pipe));
++ 		if (tmp & TRANS_DP_HSYNC_ACTIVE_HIGH)
++ 			flags |= DRM_MODE_FLAG_PHSYNC;
++ 		else
++ 			flags |= DRM_MODE_FLAG_NHSYNC;
++ 
++ 		if (tmp & TRANS_DP_VSYNC_ACTIVE_HIGH)
++ 			flags |= DRM_MODE_FLAG_PVSYNC;
++ 		else
++ 			flags |= DRM_MODE_FLAG_NVSYNC;
++ 	}
++ 
++ 	pipe_config->adjusted_mode.flags |= flags;
++ 
++ 	if (dp_to_dig_port(intel_dp)->port == PORT_A) {
++ 		if ((I915_READ(DP_A) & DP_PLL_FREQ_MASK) == DP_PLL_FREQ_160MHZ)
++ 			pipe_config->port_clock = 162000;
++ 		else
++ 			pipe_config->port_clock = 270000;
++ 	}
++ 
++ 	if (is_edp(intel_dp) && dev_priv->vbt.edp_bpp &&
++ 	    pipe_config->pipe_bpp > dev_priv->vbt.edp_bpp) {
++ 		/*
++ 		 * This is a big fat ugly hack.
++ 		 *
++ 		 * Some machines in UEFI boot mode provide us a VBT that has 18
++ 		 * bpp and 1.62 GHz link bandwidth for eDP, which for reasons
++ 		 * unknown we fail to light up. Yet the same BIOS boots up with
++ 		 * 24 bpp and 2.7 GHz link. Use the same bpp as the BIOS uses as
++ 		 * max, not what it tells us to use.
++ 		 *
++ 		 * Note: This will still be broken if the eDP panel is not lit
++ 		 * up by the BIOS, and thus we can't get the mode at module
++ 		 * load.
++ 		 */
++ 		DRM_DEBUG_KMS("pipe has %d bpp for eDP panel, overriding BIOS-provided max %d bpp\n",
++ 			      pipe_config->pipe_bpp, dev_priv->vbt.edp_bpp);
++ 		dev_priv->vbt.edp_bpp = pipe_config->pipe_bpp;
++ 	}
++ }
++ 
++ static bool is_edp_psr(struct intel_dp *intel_dp)
++ {
++ 	return is_edp(intel_dp) &&
++ 		intel_dp->psr_dpcd[0] & DP_PSR_IS_SUPPORTED;
++ }
++ 
++ static bool intel_edp_is_psr_enabled(struct drm_device *dev)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 
++ 	if (!IS_HASWELL(dev))
++ 		return false;
++ 
++ 	return I915_READ(EDP_PSR_CTL) & EDP_PSR_ENABLE;
++ }
++ 
++ static void intel_edp_psr_write_vsc(struct intel_dp *intel_dp,
++ 				    struct edp_vsc_psr *vsc_psr)
++ {
++ 	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
++ 	struct drm_device *dev = dig_port->base.base.dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct intel_crtc *crtc = to_intel_crtc(dig_port->base.base.crtc);
++ 	u32 ctl_reg = HSW_TVIDEO_DIP_CTL(crtc->config.cpu_transcoder);
++ 	u32 data_reg = HSW_TVIDEO_DIP_VSC_DATA(crtc->config.cpu_transcoder);
++ 	uint32_t *data = (uint32_t *) vsc_psr;
++ 	unsigned int i;
++ 
++ 	/* As per BSPec (Pipe Video Data Island Packet), we need to disable
++ 	   the video DIP being updated before program video DIP data buffer
++ 	   registers for DIP being updated. */
++ 	I915_WRITE(ctl_reg, 0);
++ 	POSTING_READ(ctl_reg);
++ 
++ 	for (i = 0; i < VIDEO_DIP_VSC_DATA_SIZE; i += 4) {
++ 		if (i < sizeof(struct edp_vsc_psr))
++ 			I915_WRITE(data_reg + i, *data++);
++ 		else
++ 			I915_WRITE(data_reg + i, 0);
++ 	}
++ 
++ 	I915_WRITE(ctl_reg, VIDEO_DIP_ENABLE_VSC_HSW);
++ 	POSTING_READ(ctl_reg);
++ }
++ 
++ static void intel_edp_psr_setup(struct intel_dp *intel_dp)
++ {
++ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct edp_vsc_psr psr_vsc;
++ 
++ 	if (intel_dp->psr_setup_done)
++ 		return;
++ 
++ 	/* Prepare VSC packet as per EDP 1.3 spec, Table 3.10 */
++ 	memset(&psr_vsc, 0, sizeof(psr_vsc));
++ 	psr_vsc.sdp_header.HB0 = 0;
++ 	psr_vsc.sdp_header.HB1 = 0x7;
++ 	psr_vsc.sdp_header.HB2 = 0x2;
++ 	psr_vsc.sdp_header.HB3 = 0x8;
++ 	intel_edp_psr_write_vsc(intel_dp, &psr_vsc);
++ 
++ 	/* Avoid continuous PSR exit by masking memup and hpd */
++ 	I915_WRITE(EDP_PSR_DEBUG_CTL, EDP_PSR_DEBUG_MASK_MEMUP |
++ 		   EDP_PSR_DEBUG_MASK_HPD | EDP_PSR_DEBUG_MASK_LPSP);
++ 
++ 	intel_dp->psr_setup_done = true;
++ }
++ 
++ static void intel_edp_psr_enable_sink(struct intel_dp *intel_dp)
++ {
++ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	uint32_t aux_clock_divider = get_aux_clock_divider(intel_dp, 0);
++ 	int precharge = 0x3;
++ 	int msg_size = 5;       /* Header(4) + Message(1) */
++ 
++ 	/* Enable PSR in sink */
++ 	if (intel_dp->psr_dpcd[1] & DP_PSR_NO_TRAIN_ON_EXIT)
++ 		intel_dp_aux_native_write_1(intel_dp, DP_PSR_EN_CFG,
++ 					    DP_PSR_ENABLE &
++ 					    ~DP_PSR_MAIN_LINK_ACTIVE);
++ 	else
++ 		intel_dp_aux_native_write_1(intel_dp, DP_PSR_EN_CFG,
++ 					    DP_PSR_ENABLE |
++ 					    DP_PSR_MAIN_LINK_ACTIVE);
++ 
++ 	/* Setup AUX registers */
++ 	I915_WRITE(EDP_PSR_AUX_DATA1, EDP_PSR_DPCD_COMMAND);
++ 	I915_WRITE(EDP_PSR_AUX_DATA2, EDP_PSR_DPCD_NORMAL_OPERATION);
++ 	I915_WRITE(EDP_PSR_AUX_CTL,
++ 		   DP_AUX_CH_CTL_TIME_OUT_400us |
++ 		   (msg_size << DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT) |
++ 		   (precharge << DP_AUX_CH_CTL_PRECHARGE_2US_SHIFT) |
++ 		   (aux_clock_divider << DP_AUX_CH_CTL_BIT_CLOCK_2X_SHIFT));
++ }
++ 
++ static void intel_edp_psr_enable_source(struct intel_dp *intel_dp)
++ {
++ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	uint32_t max_sleep_time = 0x1f;
++ 	uint32_t idle_frames = 1;
++ 	uint32_t val = 0x0;
++ 
++ 	if (intel_dp->psr_dpcd[1] & DP_PSR_NO_TRAIN_ON_EXIT) {
++ 		val |= EDP_PSR_LINK_STANDBY;
++ 		val |= EDP_PSR_TP2_TP3_TIME_0us;
++ 		val |= EDP_PSR_TP1_TIME_0us;
++ 		val |= EDP_PSR_SKIP_AUX_EXIT;
++ 	} else
++ 		val |= EDP_PSR_LINK_DISABLE;
++ 
++ 	I915_WRITE(EDP_PSR_CTL, val |
++ 		   EDP_PSR_MIN_LINK_ENTRY_TIME_8_LINES |
++ 		   max_sleep_time << EDP_PSR_MAX_SLEEP_TIME_SHIFT |
++ 		   idle_frames << EDP_PSR_IDLE_FRAME_SHIFT |
++ 		   EDP_PSR_ENABLE);
++ }
++ 
++ static bool intel_edp_psr_match_conditions(struct intel_dp *intel_dp)
++ {
++ 	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
++ 	struct drm_device *dev = dig_port->base.base.dev;
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	struct drm_crtc *crtc = dig_port->base.base.crtc;
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 	struct drm_i915_gem_object *obj = to_intel_framebuffer(crtc->fb)->obj;
++ 	struct intel_encoder *intel_encoder = &dp_to_dig_port(intel_dp)->base;
++ 
++ 	if (!IS_HASWELL(dev)) {
++ 		DRM_DEBUG_KMS("PSR not supported on this platform\n");
++ 		dev_priv->no_psr_reason = PSR_NO_SOURCE;
++ 		return false;
++ 	}
++ 
++ 	if ((intel_encoder->type != INTEL_OUTPUT_EDP) ||
++ 	    (dig_port->port != PORT_A)) {
++ 		DRM_DEBUG_KMS("HSW ties PSR to DDI A (eDP)\n");
++ 		dev_priv->no_psr_reason = PSR_HSW_NOT_DDIA;
++ 		return false;
++ 	}
++ 
++ 	if (!is_edp_psr(intel_dp)) {
++ 		DRM_DEBUG_KMS("PSR not supported by this panel\n");
++ 		dev_priv->no_psr_reason = PSR_NO_SINK;
++ 		return false;
++ 	}
++ 
++ 	if (!i915_enable_psr) {
++ 		DRM_DEBUG_KMS("PSR disable by flag\n");
++ 		dev_priv->no_psr_reason = PSR_MODULE_PARAM;
++ 		return false;
++ 	}
++ 
++ 	crtc = dig_port->base.base.crtc;
++ 	if (crtc == NULL) {
++ 		DRM_DEBUG_KMS("crtc not active for PSR\n");
++ 		dev_priv->no_psr_reason = PSR_CRTC_NOT_ACTIVE;
++ 		return false;
++ 	}
++ 
++ 	intel_crtc = to_intel_crtc(crtc);
++ 	if (!intel_crtc->active || !crtc->fb || !crtc->mode.clock) {
++ 		DRM_DEBUG_KMS("crtc not active for PSR\n");
++ 		dev_priv->no_psr_reason = PSR_CRTC_NOT_ACTIVE;
++ 		return false;
++ 	}
++ 
++ 	obj = to_intel_framebuffer(crtc->fb)->obj;
++ 	if (obj->tiling_mode != I915_TILING_X ||
++ 	    obj->fence_reg == I915_FENCE_REG_NONE) {
++ 		DRM_DEBUG_KMS("PSR condition failed: fb not tiled or fenced\n");
++ 		dev_priv->no_psr_reason = PSR_NOT_TILED;
++ 		return false;
++ 	}
++ 
++ 	if (I915_READ(SPRCTL(intel_crtc->pipe)) & SPRITE_ENABLE) {
++ 		DRM_DEBUG_KMS("PSR condition failed: Sprite is Enabled\n");
++ 		dev_priv->no_psr_reason = PSR_SPRITE_ENABLED;
++ 		return false;
++ 	}
++ 
++ 	if (I915_READ(HSW_STEREO_3D_CTL(intel_crtc->config.cpu_transcoder)) &
++ 	    S3D_ENABLE) {
++ 		DRM_DEBUG_KMS("PSR condition failed: Stereo 3D is Enabled\n");
++ 		dev_priv->no_psr_reason = PSR_S3D_ENABLED;
++ 		return false;
++ 	}
++ 
++ 	if (crtc->mode.flags & DRM_MODE_FLAG_INTERLACE) {
++ 		DRM_DEBUG_KMS("PSR condition failed: Interlaced is Enabled\n");
++ 		dev_priv->no_psr_reason = PSR_INTERLACED_ENABLED;
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static void intel_edp_psr_do_enable(struct intel_dp *intel_dp)
++ {
++ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++ 
++ 	if (!intel_edp_psr_match_conditions(intel_dp) ||
++ 	    intel_edp_is_psr_enabled(dev))
++ 		return;
++ 
++ 	/* Setup PSR once */
++ 	intel_edp_psr_setup(intel_dp);
++ 
++ 	/* Enable PSR on the panel */
++ 	intel_edp_psr_enable_sink(intel_dp);
++ 
++ 	/* Enable PSR on the host */
++ 	intel_edp_psr_enable_source(intel_dp);
++ }
++ 
++ void intel_edp_psr_enable(struct intel_dp *intel_dp)
++ {
++ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++ 
++ 	if (intel_edp_psr_match_conditions(intel_dp) &&
++ 	    !intel_edp_is_psr_enabled(dev))
++ 		intel_edp_psr_do_enable(intel_dp);
++ }
++ 
++ void intel_edp_psr_disable(struct intel_dp *intel_dp)
++ {
++ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 
++ 	if (!intel_edp_is_psr_enabled(dev))
++ 		return;
++ 
++ 	I915_WRITE(EDP_PSR_CTL, I915_READ(EDP_PSR_CTL) & ~EDP_PSR_ENABLE);
++ 
++ 	/* Wait till PSR is idle */
++ 	if (_wait_for((I915_READ(EDP_PSR_STATUS_CTL) &
++ 		       EDP_PSR_STATUS_STATE_MASK) == 0, 2000, 10))
++ 		DRM_ERROR("Timed out waiting for PSR Idle State\n");
++ }
++ 
++ void intel_edp_psr_update(struct drm_device *dev)
++ {
++ 	struct intel_encoder *encoder;
++ 	struct intel_dp *intel_dp = NULL;
++ 
++ 	list_for_each_entry(encoder, &dev->mode_config.encoder_list, base.head)
++ 		if (encoder->type == INTEL_OUTPUT_EDP) {
++ 			intel_dp = enc_to_intel_dp(&encoder->base);
++ 
++ 			if (!is_edp_psr(intel_dp))
++ 				return;
++ 
++ 			if (!intel_edp_psr_match_conditions(intel_dp))
++ 				intel_edp_psr_disable(intel_dp);
++ 			else
++ 				if (!intel_edp_is_psr_enabled(dev))
++ 					intel_edp_psr_do_enable(intel_dp);
++ 		}
++ }
++ 
+++>>>>>>> c6cd2ee2d591 (drm/i915/dp: workaround BIOS eDP bpp clamping issue)
+  static void intel_disable_dp(struct intel_encoder *encoder)
+  {
+  	struct intel_dp *intel_dp = enc_to_intel_dp(&encoder->base);
+* Unmerged path drivers/gpu/drm/i915/intel_dp.c
