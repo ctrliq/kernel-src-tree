@@ -1,0 +1,137 @@
+gfs2: Extended attribute readahead optimization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 39b0555f7a1f96ecd303103df15596db49c36c65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/39b0555f.failed
+
+Instead of submitting a READ_SYNC bio for the inode and a READA bio for
+the inode's extended attributes through submit_bh, submit a single READ_SYNC
+bio for both through submit_bio when possible.  This can be more
+efficient on some kinds of block devices.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 39b0555f7a1f96ecd303103df15596db49c36c65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/meta_io.c
+diff --cc fs/gfs2/meta_io.c
+index 1a80ffddabcd,e137d96f1b17..000000000000
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@@ -197,6 -187,52 +197,55 @@@ struct buffer_head *gfs2_meta_new(struc
+  	return bh;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void gfs2_meta_read_endio(struct bio *bio)
++ {
++ 	struct bio_vec *bvec;
++ 	int i;
++ 
++ 	bio_for_each_segment_all(bvec, bio, i) {
++ 		struct page *page = bvec->bv_page;
++ 		struct buffer_head *bh = page_buffers(page);
++ 		unsigned int len = bvec->bv_len;
++ 
++ 		while (bh_offset(bh) < bvec->bv_offset)
++ 			bh = bh->b_this_page;
++ 		do {
++ 			struct buffer_head *next = bh->b_this_page;
++ 			len -= bh->b_size;
++ 			bh->b_end_io(bh, !bio->bi_error);
++ 			bh = next;
++ 		} while (bh && len);
++ 	}
++ 	bio_put(bio);
++ }
++ 
++ /*
++  * Submit several consecutive buffer head I/O requests as a single bio I/O
++  * request.  (See submit_bh_wbc.)
++  */
++ static void gfs2_submit_bhs(int rw, struct buffer_head *bhs[], int num)
++ {
++ 	struct buffer_head *bh = bhs[0];
++ 	struct bio *bio;
++ 	int i;
++ 
++ 	if (!num)
++ 		return;
++ 
++ 	bio = bio_alloc(GFP_NOIO, num);
++ 	bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
++ 	bio->bi_bdev = bh->b_bdev;
++ 	for (i = 0; i < num; i++) {
++ 		bh = bhs[i];
++ 		bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
++ 	}
++ 	bio->bi_end_io = gfs2_meta_read_endio;
++ 	submit_bio(rw, bio);
++ }
++ 
+++>>>>>>> 39b0555f7a1f (gfs2: Extended attribute readahead optimization)
+  /**
+   * gfs2_meta_read - Read a block from disk
+   * @gl: The glock covering the block
+@@@ -208,10 -244,11 +257,16 @@@
+   */
+  
+  int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
+ -		   int rahead, struct buffer_head **bhp)
+ +		   struct buffer_head **bhp)
+  {
+++<<<<<<< HEAD
+ +	struct gfs2_sbd *sdp = gl->gl_sbd;
+ +	struct buffer_head *bh;
+++=======
++ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++ 	struct buffer_head *bh, *bhs[2];
++ 	int num = 0;
+++>>>>>>> 39b0555f7a1f (gfs2: Extended attribute readahead optimization)
+  
+  	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags))) {
+  		*bhp = NULL;
+@@@ -223,11 -260,27 +278,35 @@@
+  	lock_buffer(bh);
+  	if (buffer_uptodate(bh)) {
+  		unlock_buffer(bh);
+++<<<<<<< HEAD
+ +		return 0;
+ +	}
+ +	bh->b_end_io = end_buffer_read_sync;
+ +	get_bh(bh);
+ +	submit_bh(READ_SYNC | REQ_META | REQ_PRIO, bh);
+++=======
++ 		flags &= ~DIO_WAIT;
++ 	} else {
++ 		bh->b_end_io = end_buffer_read_sync;
++ 		get_bh(bh);
++ 		bhs[num++] = bh;
++ 	}
++ 
++ 	if (rahead) {
++ 		bh = gfs2_getbuf(gl, blkno + 1, CREATE);
++ 
++ 		lock_buffer(bh);
++ 		if (buffer_uptodate(bh)) {
++ 			unlock_buffer(bh);
++ 			brelse(bh);
++ 		} else {
++ 			bh->b_end_io = end_buffer_read_sync;
++ 			bhs[num++] = bh;
++ 		}
++ 	}
++ 
++ 	gfs2_submit_bhs(READ_SYNC | REQ_META | REQ_PRIO, bhs, num);
+++>>>>>>> 39b0555f7a1f (gfs2: Extended attribute readahead optimization)
+  	if (!(flags & DIO_WAIT))
+  		return 0;
+  
+* Unmerged path fs/gfs2/meta_io.c
