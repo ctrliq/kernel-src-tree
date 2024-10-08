@@ -1,0 +1,253 @@
+IB/hfi1: Consistently call ops->remove outside spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit b85ced91511f6c3add9a74ae13e12ba568bfa1af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b85ced91.failed
+
+The ops->remove() callback was called by hfi1_mmu_unregister() with a
+NULL mm argument while holding a spinlock.  In the case of sdma_rb_remove()
+this caused it to pass current->mm to hfi1_release_user_pages()
+
+This had 2 problems.  First this would attempt to acquire the mmap_sem
+under a spin lock.  Second the use of current->mm is not always guaranteed
+to be the proper mm when the fd is being closed.
+
+Rather than depend on this implicit behavior we move all calls to
+ops->remove outside of the spinlock.  This also allows the correct
+mm to be used in the remove callback without fear of deadlock.
+
+Because the MMU notifier is not guaranteed to hold mm->mmap_sem, but
+usually does, we must delay all remove callbacks until out of the notifier,
+when the callbacks can take the mmap_sem if they need to.
+
+Code comments were added to clarify what the expectations are for the
+users of the mmu rb tree.
+
+	Suggested-by: Jim Foraker <foraker1@llnl.gov>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit b85ced91511f6c3add9a74ae13e12ba568bfa1af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/mmu_rb.c
+#	drivers/infiniband/hw/hfi1/user_exp_rcv.c
+#	drivers/staging/hfi1/user_sdma.c
+#	drivers/staging/hfi1/user_sdma.h
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 47c9c87af47a,751aa2260c1c..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -297,6 -306,20 +297,23 @@@ static int defer_packet_queue
+  	struct sdma_txreq *,
+  	unsigned seq);
+  static void activate_packet_queue(struct iowait *, int);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ static bool sdma_rb_filter(struct mmu_rb_node *, unsigned long, unsigned long);
++ static int sdma_rb_insert(void *, struct mmu_rb_node *);
++ static int sdma_rb_evict(void *arg, struct mmu_rb_node *mnode,
++ 			 void *arg2, bool *stop);
++ static void sdma_rb_remove(void *, struct mmu_rb_node *, struct mm_struct *);
++ static int sdma_rb_invalidate(void *, struct mmu_rb_node *);
++ 
++ static struct mmu_rb_ops sdma_rb_ops = {
++ 	.filter = sdma_rb_filter,
++ 	.insert = sdma_rb_insert,
++ 	.evict = sdma_rb_evict,
++ 	.remove = sdma_rb_remove,
++ 	.invalidate = sdma_rb_invalidate
++ };
+++>>>>>>> b85ced91511f (IB/hfi1: Consistently call ops->remove outside spinlock):drivers/infiniband/hw/hfi1/user_sdma.c
+  
+  static int defer_packet_queue(
+  	struct sdma_engine *sde,
+@@@ -415,6 -445,13 +432,16 @@@ int hfi1_user_sdma_alloc_queues(struct 
+  	cq->nentries = hfi1_sdma_comp_ring_size;
+  	fd->cq = cq;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 	ret = hfi1_mmu_rb_register(pq, pq->mm, &sdma_rb_ops, dd->pport->hfi1_wq,
++ 				   &pq->handler);
++ 	if (ret) {
++ 		dd_dev_err(dd, "Failed to register with MMU %d", ret);
++ 		goto done;
++ 	}
++ 
+++>>>>>>> b85ced91511f (IB/hfi1: Consistently call ops->remove outside spinlock):drivers/infiniband/hw/hfi1/user_sdma.c
+  	spin_lock_irqsave(&uctxt->sdma_qlock, flags);
+  	list_add(&pq->list, &uctxt->sdma_queues);
+  	spin_unlock_irqrestore(&uctxt->sdma_qlock, flags);
+@@@ -1484,3 -1601,67 +1511,70 @@@ static inline void set_comp_state(struc
+  	trace_hfi1_sdma_user_completion(pq->dd, pq->ctxt, pq->subctxt,
+  					idx, state, ret);
+  }
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 
++ static bool sdma_rb_filter(struct mmu_rb_node *node, unsigned long addr,
++ 			   unsigned long len)
++ {
++ 	return (bool)(node->addr == addr);
++ }
++ 
++ static int sdma_rb_insert(void *arg, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	atomic_inc(&node->refcount);
++ 	return 0;
++ }
++ 
++ /*
++  * Return 1 to remove the node from the rb tree and call the remove op.
++  *
++  * Called with the rb tree lock held.
++  */
++ static int sdma_rb_evict(void *arg, struct mmu_rb_node *mnode,
++ 			 void *evict_arg, bool *stop)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 	struct evict_data *evict_data = evict_arg;
++ 
++ 	/* is this node still being used? */
++ 	if (atomic_read(&node->refcount))
++ 		return 0; /* keep this node */
++ 
++ 	/* this node will be evicted, add its pages to our count */
++ 	evict_data->cleared += node->npages;
++ 
++ 	/* have enough pages been cleared? */
++ 	if (evict_data->cleared >= evict_data->target)
++ 		*stop = true;
++ 
++ 	return 1; /* remove this node */
++ }
++ 
++ static void sdma_rb_remove(void *arg, struct mmu_rb_node *mnode,
++ 			   struct mm_struct *mm)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	atomic_sub(node->npages, &node->pq->n_locked);
++ 
++ 	unpin_vector_pages(node->pq->mm, node->pages, 0, node->npages);
++ 
++ 	kfree(node);
++ }
++ 
++ static int sdma_rb_invalidate(void *arg, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	if (!atomic_read(&node->refcount))
++ 		return 1;
++ 	return 0;
++ }
+++>>>>>>> b85ced91511f (IB/hfi1: Consistently call ops->remove outside spinlock):drivers/infiniband/hw/hfi1/user_sdma.c
+diff --cc drivers/staging/hfi1/user_sdma.h
+index 7ebbc4634989,e4f853fa91e6..000000000000
+--- a/drivers/staging/hfi1/user_sdma.h
++++ b/drivers/staging/hfi1/user_sdma.h
+@@@ -47,45 -44,45 +47,77 @@@
+   * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   *
+   */
+ -#ifndef _HFI1_MMU_RB_H
+ -#define _HFI1_MMU_RB_H
+ +#include <linux/device.h>
+ +#include <linux/wait.h>
+ +
+ +#include "common.h"
+ +#include "iowait.h"
+  
+ -#include "hfi.h"
+ +#define EXP_TID_TIDLEN_MASK   0x7FFULL
+ +#define EXP_TID_TIDLEN_SHIFT  0
+ +#define EXP_TID_TIDCTRL_MASK  0x3ULL
+ +#define EXP_TID_TIDCTRL_SHIFT 20
+ +#define EXP_TID_TIDIDX_MASK   0x7FFULL
+ +#define EXP_TID_TIDIDX_SHIFT  22
+ +#define EXP_TID_GET(tid, field)	\
+ +	(((tid) >> EXP_TID_TID##field##_SHIFT) & EXP_TID_TID##field##_MASK)
+  
+ -struct mmu_rb_node {
+ -	unsigned long addr;
+ -	unsigned long len;
+ -	unsigned long __last;
+ -	struct rb_node node;
+ +extern uint extended_psn;
+ +
+ +struct hfi1_user_sdma_pkt_q {
+  	struct list_head list;
+ +	unsigned ctxt;
+ +	unsigned subctxt;
+ +	u16 n_max_reqs;
+ +	atomic_t n_reqs;
+ +	u16 reqidx;
+ +	struct hfi1_devdata *dd;
+ +	struct kmem_cache *txreq_cache;
+ +	struct user_sdma_request *reqs;
+ +	struct iowait busy;
+ +	unsigned state;
+ +	wait_queue_head_t wait;
+ +	unsigned long unpinned;
+ +};
+ +
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.h
+ +struct hfi1_user_sdma_comp_q {
+ +	u16 nentries;
+ +	struct hfi1_sdma_comp_entry *comps;
+  };
+  
+ +int hfi1_user_sdma_alloc_queues(struct hfi1_ctxtdata *, struct file *);
+ +int hfi1_user_sdma_free_queues(struct hfi1_filedata *);
+ +int hfi1_user_sdma_process_request(struct file *, struct iovec *, unsigned long,
+ +				   unsigned long *);
+++=======
++ /*
++  * NOTE: filter, insert, invalidate, and evict must not sleep.  Only remove is
++  * allowed to sleep.
++  */
++ struct mmu_rb_ops {
++ 	bool (*filter)(struct mmu_rb_node *node, unsigned long addr,
++ 		       unsigned long len);
++ 	int (*insert)(void *ops_arg, struct mmu_rb_node *mnode);
++ 	void (*remove)(void *ops_arg, struct mmu_rb_node *mnode,
++ 		       struct mm_struct *mm);
++ 	int (*invalidate)(void *ops_arg, struct mmu_rb_node *node);
++ 	int (*evict)(void *ops_arg, struct mmu_rb_node *mnode,
++ 		     void *evict_arg, bool *stop);
++ };
++ 
++ int hfi1_mmu_rb_register(void *ops_arg, struct mm_struct *mm,
++ 			 struct mmu_rb_ops *ops,
++ 			 struct workqueue_struct *wq,
++ 			 struct mmu_rb_handler **handler);
++ void hfi1_mmu_rb_unregister(struct mmu_rb_handler *handler);
++ int hfi1_mmu_rb_insert(struct mmu_rb_handler *handler,
++ 		       struct mmu_rb_node *mnode);
++ void hfi1_mmu_rb_evict(struct mmu_rb_handler *handler, void *evict_arg);
++ void hfi1_mmu_rb_remove(struct mmu_rb_handler *handler,
++ 			struct mmu_rb_node *mnode);
++ struct mmu_rb_node *hfi1_mmu_rb_extract(struct mmu_rb_handler *handler,
++ 					unsigned long addr, unsigned long len);
++ 
++ #endif /* _HFI1_MMU_RB_H */
+++>>>>>>> b85ced91511f (IB/hfi1: Consistently call ops->remove outside spinlock):drivers/infiniband/hw/hfi1/mmu_rb.h
+* Unmerged path drivers/infiniband/hw/hfi1/mmu_rb.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.c
+* Unmerged path drivers/infiniband/hw/hfi1/mmu_rb.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.c
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+* Unmerged path drivers/staging/hfi1/user_sdma.h
