@@ -1,0 +1,113 @@
+qdisc: bulk dequeue support for qdiscs with TCQ_F_ONETXQUEUE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 5772e9a3463b264cee5a4e73ef586ad482d7ba48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5772e9a3.failed
+
+Based on DaveM's recent API work on dev_hard_start_xmit(), that allows
+sending/processing an entire skb list.
+
+This patch implements qdisc bulk dequeue, by allowing multiple packets
+to be dequeued in dequeue_skb().
+
+The optimization principle for this is two fold, (1) to amortize
+locking cost and (2) avoid expensive tailptr update for notifying HW.
+ (1) Several packets are dequeued while holding the qdisc root_lock,
+amortizing locking cost over several packet.  The dequeued SKB list is
+processed under the TXQ lock in dev_hard_start_xmit(), thus also
+amortizing the cost of the TXQ lock.
+ (2) Further more, dev_hard_start_xmit() will utilize the skb->xmit_more
+API to delay HW tailptr update, which also reduces the cost per
+packet.
+
+One restriction of the new API is that every SKB must belong to the
+same TXQ.  This patch takes the easy way out, by restricting bulk
+dequeue to qdisc's with the TCQ_F_ONETXQUEUE flag, that specifies the
+qdisc only have attached a single TXQ.
+
+Some detail about the flow; dev_hard_start_xmit() will process the skb
+list, and transmit packets individually towards the driver (see
+xmit_one()).  In case the driver stops midway in the list, the
+remaining skb list is returned by dev_hard_start_xmit().  In
+sch_direct_xmit() this returned list is requeued by dev_requeue_skb().
+
+To avoid overshooting the HW limits, which results in requeuing, the
+patch limits the amount of bytes dequeued, based on the drivers BQL
+limits.  In-effect bulking will only happen for BQL enabled drivers.
+
+Small amounts for extra HoL blocking (2x MTU/0.24ms) were
+measured at 100Mbit/s, with bulking 8 packets, but the
+oscillating nature of the measurement indicate something, like
+sched latency might be causing this effect. More comparisons
+show, that this oscillation goes away occationally. Thus, we
+disregard this artifact completely and remove any "magic" bulking
+limit.
+
+For now, as a conservative approach, stop bulking when seeing TSO and
+segmented GSO packets.  They already benefit from bulking on their own.
+A followup patch add this, to allow easier bisect-ability for finding
+regressions.
+
+Jointed work with Hannes, Daniel and Florian.
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5772e9a3463b264cee5a4e73ef586ad482d7ba48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/sch_generic.c
+diff --cc include/net/sch_generic.h
+index de28b0700a5c,d17ed6fb2f70..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -6,6 -6,8 +6,11 @@@
+  #include <linux/rcupdate.h>
+  #include <linux/pkt_sched.h>
+  #include <linux/pkt_cls.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/percpu.h>
++ #include <linux/dynamic_queue_limits.h>
+++>>>>>>> 5772e9a3463b (qdisc: bulk dequeue support for qdiscs with TCQ_F_ONETXQUEUE)
+  #include <net/gen_stats.h>
+  #include <net/rtnetlink.h>
+  
+diff --cc net/sched/sch_generic.c
+index bba00963a92a,c2e87e63b832..000000000000
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@@ -69,8 -105,18 +104,23 @@@ static inline struct sk_buff *dequeue_s
+  		} else
+  			skb = NULL;
+  	} else {
+++<<<<<<< HEAD
+ +		if (!(q->flags & TCQ_F_ONETXQUEUE) || !netif_xmit_frozen_or_stopped(txq))
+ +			skb = q->dequeue(q);
+++=======
++ 		if (!(q->flags & TCQ_F_ONETXQUEUE) ||
++ 		    !netif_xmit_frozen_or_stopped(txq)) {
++ 			int bytelimit = qdisc_avail_bulklimit(txq);
++ 
++ 			skb = q->dequeue(q);
++ 			if (skb) {
++ 				bytelimit -= skb->len;
++ 				skb = validate_xmit_skb(skb, qdisc_dev(q));
++ 			}
++ 			if (skb && qdisc_may_bulk(q))
++ 				skb = try_bulk_dequeue_skb(q, skb, bytelimit);
++ 		}
+++>>>>>>> 5772e9a3463b (qdisc: bulk dequeue support for qdiscs with TCQ_F_ONETXQUEUE)
+  	}
+  
+  	return skb;
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/sch_generic.c
