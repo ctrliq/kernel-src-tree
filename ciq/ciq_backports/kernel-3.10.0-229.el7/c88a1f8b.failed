@@ -1,0 +1,150 @@
+cpufreq: Store cpufreq policies in a list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Store cpufreq policies in a list (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 87.67%
+commit-author Lukasz Majewski <l.majewski@samsung.com>
+commit c88a1f8b96e7384627b918dfabbfc0c615a4a914
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c88a1f8b.failed
+
+Policies available in the cpufreq framework are now linked together.
+They are accessible via cpufreq_policy_list defined in the cpufreq
+core.
+
+[rjw: Fix from Yinghai Lu folded in]
+	Signed-off-by: Lukasz Majewski <l.majewski@samsung.com>
+	Signed-off-by: Myungjoo Ham <myungjoo.ham@samsung.com>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit c88a1f8b96e7384627b918dfabbfc0c615a4a914)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 3e5c5b7058fc,75c5bd424d59..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -37,8 -37,10 +37,9 @@@
+   */
+  static struct cpufreq_driver *cpufreq_driver;
+  static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data);
+ -static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data_fallback);
+  static DEFINE_RWLOCK(cpufreq_driver_lock);
+  static DEFINE_MUTEX(cpufreq_governor_lock);
++ static LIST_HEAD(cpufreq_policy_list);
+  
+  #ifdef CONFIG_HOTPLUG_CPU
+  /* This one keeps track of the previously set governor of a removed CPU */
+@@@ -904,16 -925,60 +905,73 @@@ static int cpufreq_add_policy_cpu(unsig
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	INIT_LIST_HEAD(&policy->policy_list);
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	unsigned long flags;
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	list_del(&policy->policy_list);
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
++ 			     bool frozen)
+++>>>>>>> c88a1f8b96e7 (cpufreq: Store cpufreq policies in a list)
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+@@@ -1017,9 -1081,15 +1075,21 @@@
+  	}
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+++<<<<<<< HEAD
+ +	ret = cpufreq_add_dev_interface(cpu, policy, dev);
+ +	if (ret)
+ +		goto err_out_unregister;
+++=======
++ 	if (!frozen) {
++ 		ret = cpufreq_add_dev_interface(policy, dev);
++ 		if (ret)
++ 			goto err_out_unregister;
++ 
++ 		write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 		list_add(&policy->policy_list, &cpufreq_policy_list);
++ 		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 	}
+++>>>>>>> c88a1f8b96e7 (cpufreq: Store cpufreq policies in a list)
+  
+  	cpufreq_init_policy(policy);
+  
+* Unmerged path drivers/cpufreq/cpufreq.c
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 94c9bbcb39e4..74311298ef39 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -112,6 +112,7 @@ struct cpufreq_policy {
+ 
+ 	struct cpufreq_real_policy	user_policy;
+ 
++	struct list_head        policy_list;
+ 	struct kobject		kobj;
+ 	struct completion	kobj_unregister;
+ 	int			transition_ongoing; /* Tracks transition status */
