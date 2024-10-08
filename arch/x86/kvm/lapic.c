@@ -481,10 +481,10 @@ int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu)
 
 static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 			     int vector, int level, int trig_mode,
-			     unsigned long *dest_map);
+			     struct dest_map *dest_map);
 
 int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
-		unsigned long *dest_map)
+		     struct dest_map *dest_map)
 {
 	struct kvm_lapic *apic = vcpu->arch.apic;
 
@@ -675,7 +675,7 @@ bool kvm_apic_match_dest(struct kvm_vcpu *vcpu, struct kvm_lapic *source,
 }
 
 bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
-		struct kvm_lapic_irq *irq, int *r, unsigned long *dest_map)
+		struct kvm_lapic_irq *irq, int *r, struct dest_map *dest_map)
 {
 	struct kvm_apic_map *map;
 	unsigned long bitmap = 1;
@@ -859,7 +859,7 @@ out:
  */
 static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 			     int vector, int level, int trig_mode,
-			     unsigned long *dest_map)
+			     struct dest_map *dest_map)
 {
 	int result = 0;
 	struct kvm_vcpu *vcpu = apic->vcpu;
@@ -877,7 +877,7 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 		result = 1;
 
 		if (dest_map)
-			__set_bit(vcpu->vcpu_id, dest_map);
+			__set_bit(vcpu->vcpu_id, dest_map->map);
 
 		if (kvm_x86_ops->deliver_posted_interrupt)
 			kvm_x86_ops->deliver_posted_interrupt(vcpu, vector);
