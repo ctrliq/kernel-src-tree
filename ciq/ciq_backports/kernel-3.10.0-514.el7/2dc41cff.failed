@@ -1,0 +1,200 @@
+udp: Use hash2 for long hash1 chains in __udp*_lib_mcast_deliver.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] udp: Use hash2 for long hash1 chains in __udp*_lib_mcast_deliver (Jiri Benc) [1297504]
+Rebuild_FUZZ: 99.22%
+commit-author David Held <drheld@google.com>
+commit 2dc41cff7545d55c6294525c811594576f8e119c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2dc41cff.failed
+
+Many multicast sources can have the same port which can result in a very
+large list when hashing by port only. Hash by address and port instead
+if this is the case. This makes multicast more similar to unicast.
+
+On a 24-core machine receiving from 500 multicast sockets on the same
+port, before this patch 80% of system CPU was used up by spin locking
+and only ~25% of packets were successfully delivered.
+
+With this patch, all packets are delivered and kernel overhead is ~8%
+system CPU on spinlocks.
+
+	Signed-off-by: David Held <drheld@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2dc41cff7545d55c6294525c811594576f8e119c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp.c
+#	net/ipv6/udp.c
+diff --cc net/ipv4/udp.c
+index 556580e2c4f8,f31053b90ee0..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1641,30 -1649,36 +1643,56 @@@ static int __udp4_lib_mcast_deliver(str
+  				    struct udp_table *udptable)
+  {
+  	struct sock *sk, *stack[256 / sizeof(struct sock *)];
+++<<<<<<< HEAD
+ +	struct udp_hslot *hslot = udp_hashslot(udptable, net, ntohs(uh->dest));
+ +	int dif;
+ +	unsigned int i, count = 0;
+ +
+ +	spin_lock(&hslot->lock);
+ +	sk = sk_nulls_head(&hslot->head);
+ +	dif = skb->dev->ifindex;
+ +	sk = udp_v4_mcast_next(net, sk, uh->dest, daddr, uh->source, saddr, dif);
+ +	while (sk) {
+ +		stack[count++] = sk;
+ +		sk = udp_v4_mcast_next(net, sk_nulls_next(sk), uh->dest,
+ +				       daddr, uh->source, saddr, dif);
+ +		if (unlikely(count == ARRAY_SIZE(stack))) {
+ +			if (!sk)
+ +				break;
+ +			flush_stack(stack, count, skb, ~0);
+ +			count = 0;
+++=======
++ 	struct hlist_nulls_node *node;
++ 	unsigned short hnum = ntohs(uh->dest);
++ 	struct udp_hslot *hslot = udp_hashslot(udptable, net, hnum);
++ 	int dif = skb->dev->ifindex;
++ 	unsigned int count = 0, offset = offsetof(typeof(*sk), sk_nulls_node);
++ 	unsigned int hash2 = 0, hash2_any = 0, use_hash2 = (hslot->count > 10);
++ 
++ 	if (use_hash2) {
++ 		hash2_any = udp4_portaddr_hash(net, htonl(INADDR_ANY), hnum) &
++ 			    udp_table.mask;
++ 		hash2 = udp4_portaddr_hash(net, daddr, hnum) & udp_table.mask;
++ start_lookup:
++ 		hslot = &udp_table.hash2[hash2];
++ 		offset = offsetof(typeof(*sk), __sk_common.skc_portaddr_node);
++ 	}
++ 
++ 	spin_lock(&hslot->lock);
++ 	sk_nulls_for_each_entry_offset(sk, node, &hslot->head, offset) {
++ 		if (__udp_is_mcast_sock(net, sk,
++ 					uh->dest, daddr,
++ 					uh->source, saddr,
++ 					dif, hnum)) {
++ 			if (unlikely(count == ARRAY_SIZE(stack))) {
++ 				flush_stack(stack, count, skb, ~0);
++ 				count = 0;
++ 			}
++ 			stack[count++] = sk;
++ 			sock_hold(sk);
+++>>>>>>> 2dc41cff7545 (udp: Use hash2 for long hash1 chains in __udp*_lib_mcast_deliver.)
+  		}
+  	}
+- 	/*
+- 	 * before releasing chain lock, we must take a reference on sockets
+- 	 */
+- 	for (i = 0; i < count; i++)
+- 		sock_hold(stack[i]);
+  
+  	spin_unlock(&hslot->lock);
+  
+diff --cc net/ipv6/udp.c
+index 2c9dae38dffd,f9d8800bb72f..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -786,35 -771,40 +787,65 @@@ static int __udp6_lib_mcast_deliver(str
+  {
+  	struct sock *sk, *stack[256 / sizeof(struct sock *)];
+  	const struct udphdr *uh = udp_hdr(skb);
+++<<<<<<< HEAD
+ +	struct udp_hslot *hslot = udp_hashslot(udptable, net, ntohs(uh->dest));
+ +	int dif;
+ +	unsigned int i, count = 0;
+ +
+ +	spin_lock(&hslot->lock);
+ +	sk = sk_nulls_head(&hslot->head);
+ +	dif = inet6_iif(skb);
+ +	sk = udp_v6_mcast_next(net, sk, uh->dest, daddr, uh->source, saddr, dif);
+ +	while (sk) {
+ +		/* If zero checksum and no_check is not on for
+ +		 * the socket then skip it.
+ +		 */
+ +		if (uh->check || udp_sk(sk)->no_check6_rx)
+ +			stack[count++] = sk;
+ +
+ +		sk = udp_v6_mcast_next(net, sk_nulls_next(sk), uh->dest, daddr,
+ +				       uh->source, saddr, dif);
+ +		if (unlikely(count == ARRAY_SIZE(stack))) {
+ +			if (!sk)
+ +				break;
+ +			flush_stack(stack, count, skb, ~0);
+ +			count = 0;
+++=======
++ 	struct hlist_nulls_node *node;
++ 	unsigned short hnum = ntohs(uh->dest);
++ 	struct udp_hslot *hslot = udp_hashslot(udptable, net, hnum);
++ 	int dif = inet6_iif(skb);
++ 	unsigned int count = 0, offset = offsetof(typeof(*sk), sk_nulls_node);
++ 	unsigned int hash2 = 0, hash2_any = 0, use_hash2 = (hslot->count > 10);
++ 
++ 	if (use_hash2) {
++ 		hash2_any = udp6_portaddr_hash(net, &in6addr_any, hnum) &
++ 			    udp_table.mask;
++ 		hash2 = udp6_portaddr_hash(net, daddr, hnum) & udp_table.mask;
++ start_lookup:
++ 		hslot = &udp_table.hash2[hash2];
++ 		offset = offsetof(typeof(*sk), __sk_common.skc_portaddr_node);
++ 	}
++ 
++ 	spin_lock(&hslot->lock);
++ 	sk_nulls_for_each_entry_offset(sk, node, &hslot->head, offset) {
++ 		if (__udp_v6_is_mcast_sock(net, sk,
++ 					   uh->dest, daddr,
++ 					   uh->source, saddr,
++ 					   dif, hnum) &&
++ 		    /* If zero checksum and no_check is not on for
++ 		     * the socket then skip it.
++ 		     */
++ 		    (uh->check || udp_sk(sk)->no_check6_rx)) {
++ 			if (unlikely(count == ARRAY_SIZE(stack))) {
++ 				flush_stack(stack, count, skb, ~0);
++ 				count = 0;
++ 			}
++ 			stack[count++] = sk;
++ 			sock_hold(sk);
+++>>>>>>> 2dc41cff7545 (udp: Use hash2 for long hash1 chains in __udp*_lib_mcast_deliver.)
+  		}
+  	}
+- 	/*
+- 	 * before releasing the lock, we must take reference on sockets
+- 	 */
+- 	for (i = 0; i < count; i++)
+- 		sock_hold(stack[i]);
+  
+  	spin_unlock(&hslot->lock);
+  
+diff --git a/include/net/sock.h b/include/net/sock.h
+index d2b60f37533f..5bf90abe7dbd 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -674,6 +674,20 @@ static inline void sk_add_bind_node(struct sock *sk,
+ #define sk_for_each_bound(__sk, list) \
+ 	hlist_for_each_entry(__sk, list, sk_bind_node)
+ 
++/**
++ * sk_nulls_for_each_entry_offset - iterate over a list at a given struct offset
++ * @tpos:	the type * to use as a loop cursor.
++ * @pos:	the &struct hlist_node to use as a loop cursor.
++ * @head:	the head for your list.
++ * @offset:	offset of hlist_node within the struct.
++ *
++ */
++#define sk_nulls_for_each_entry_offset(tpos, pos, head, offset)		       \
++	for (pos = (head)->first;					       \
++	     (!is_a_nulls(pos)) &&					       \
++		({ tpos = (typeof(*tpos) *)((void *)pos - offset); 1;});       \
++	     pos = pos->next)
++
+ static inline struct user_namespace *sk_user_ns(struct sock *sk)
+ {
+ 	/* Careful only use this in a context where these parameters
+* Unmerged path net/ipv4/udp.c
+* Unmerged path net/ipv6/udp.c
