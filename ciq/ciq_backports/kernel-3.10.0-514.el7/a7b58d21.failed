@@ -1,0 +1,116 @@
+perf/x86/intel/lbr: Allow time stamp for free running PEBSv3
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit a7b58d211ba18c9175b139e18b68c86a6bcc3c3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a7b58d21.failed
+
+With PEBSv3 the PEBS record contains a time stamp. That means we can allow
+free-running PEBS without a PMI even if the user program requested a time stamp.
+This avoids the need to use -T to get free running PEBS, and also avoids
+any problems with mis-identifying MMAPs later.
+
+Move the free_running_flags state into a variable in x86_pmu and use it.
+This only works when no explicit clock_id is set.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: acme@kernel.org
+	Cc: eranian@google.com
+	Cc: jolsa@redhat.com
+	Cc: kan.liang@intel.com
+Link: http://lkml.kernel.org/r/1432786398-23861-2-git-send-email-andi@firstfloor.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a7b58d211ba18c9175b139e18b68c86a6bcc3c3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/perf_event_intel_ds.c
+diff --cc arch/x86/kernel/cpu/perf_event_intel_ds.c
+index 923d9fc3cc3a,03773c230fb0..000000000000
+--- a/arch/x86/kernel/cpu/perf_event_intel_ds.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+@@@ -1211,6 -1268,14 +1211,17 @@@ void __init intel_ds_init(void
+  			x86_pmu.drain_pebs = intel_pmu_drain_pebs_nhm;
+  			break;
+  
+++<<<<<<< HEAD
+++=======
++ 		case 3:
++ 			pr_cont("PEBS fmt3%c, ", pebs_type);
++ 			x86_pmu.pebs_record_size =
++ 						sizeof(struct pebs_record_skl);
++ 			x86_pmu.drain_pebs = intel_pmu_drain_pebs_nhm;
++ 			x86_pmu.free_running_flags |= PERF_SAMPLE_TIME;
++ 			break;
++ 
+++>>>>>>> a7b58d211ba1 (perf/x86/intel/lbr: Allow time stamp for free running PEBSv3)
+  		default:
+  			printk(KERN_CONT "no PEBS fmt%d%c, ", format, pebs_type);
+  			x86_pmu.pebs = 0;
+diff --git a/arch/x86/kernel/cpu/perf_event.h b/arch/x86/kernel/cpu/perf_event.h
+index 4f267b7e7f82..e52e800db36b 100644
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@ -592,6 +592,7 @@ struct x86_pmu {
+ 	struct event_constraint *pebs_constraints;
+ 	void		(*pebs_aliases)(struct perf_event *event);
+ 	int 		max_pebs_events;
++	unsigned long	free_running_flags;
+ 
+ 	/*
+ 	 * Intel LBR
+diff --git a/arch/x86/kernel/cpu/perf_event_intel.c b/arch/x86/kernel/cpu/perf_event_intel.c
+index afadbe248f73..0beb7e6362cf 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -2224,6 +2224,15 @@ static void intel_pebs_aliases_snb(struct perf_event *event)
+ 	}
+ }
+ 
++static unsigned long intel_pmu_free_running_flags(struct perf_event *event)
++{
++	unsigned long flags = x86_pmu.free_running_flags;
++
++	if (event->attr.use_clockid)
++		flags &= ~PERF_SAMPLE_TIME;
++	return flags;
++}
++
+ static int intel_pmu_hw_config(struct perf_event *event)
+ {
+ 	int ret = x86_pmu_hw_config(event);
+@@ -2234,7 +2243,8 @@ static int intel_pmu_hw_config(struct perf_event *event)
+ 	if (event->attr.precise_ip) {
+ 		if (!event->attr.freq) {
+ 			event->hw.flags |= PERF_X86_EVENT_AUTO_RELOAD;
+-			if (!(event->attr.sample_type & ~PEBS_FREERUNNING_FLAGS))
++			if (!(event->attr.sample_type &
++			      ~intel_pmu_free_running_flags(event)))
+ 				event->hw.flags |= PERF_X86_EVENT_FREERUNNING;
+ 		}
+ 		if (x86_pmu.pebs_aliases)
+@@ -2665,6 +2675,8 @@ static __initconst const struct x86_pmu core_pmu = {
+ 	.event_map		= intel_pmu_event_map,
+ 	.max_events		= ARRAY_SIZE(intel_perfmon_event_map),
+ 	.apic			= 1,
++	.free_running_flags	= PEBS_FREERUNNING_FLAGS,
++
+ 	/*
+ 	 * Intel PMCs cannot be accessed sanely above 32-bit width,
+ 	 * so we install an artificial 1<<31 period regardless of
+@@ -2703,6 +2715,7 @@ static __initconst const struct x86_pmu intel_pmu = {
+ 	.event_map		= intel_pmu_event_map,
+ 	.max_events		= ARRAY_SIZE(intel_perfmon_event_map),
+ 	.apic			= 1,
++	.free_running_flags	= PEBS_FREERUNNING_FLAGS,
+ 	/*
+ 	 * Intel PMCs cannot be accessed sanely above 32 bit width,
+ 	 * so we install an artificial 1<<31 period regardless of
+* Unmerged path arch/x86/kernel/cpu/perf_event_intel_ds.c
