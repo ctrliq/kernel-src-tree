@@ -1,0 +1,660 @@
+IB/hfi1: Make use of mm consistent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ira Weiny <ira.weiny@intel.com>
+commit 3faa3d9a308e539cc48355b1f419a5ed9f8274a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3faa3d9a.failed
+
+The hfi1 driver registers a mmu_notifier callback when /dev/hfi1_* is
+opened, and unregisters it when the device is closed.  The driver
+incorrectly assumes that the close will always happen from the same
+context as the open.  In particular, closes due to SIGKILL or OOM killer
+activity may happen from a different context.  In these cases, the wrong
+mm is passed to mmu_notifier_unregister(), which causes improper reference
+counting for the victim mm, and eventual memory corruption.
+
+Preserve the mm for all open file descriptors and use this mm rather than
+current->mm for memory operations for the lifetime of that fd.  Note: this
+patch leaves 1 use of current->mm in place.  This use is removed in a
+follow on patch because other functional changes were required prior to
+that use being removed.
+
+If registration fails, there is no reason to keep the handler object
+around.  Free the handler object rather than add it to the list to
+prevent any mmu_notifier operations, including unregister, when
+registration fails.
+
+	Suggested-by: Jim Foraker <foraker1@llnl.gov>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 3faa3d9a308e539cc48355b1f419a5ed9f8274a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/mmu_rb.c
+#	drivers/infiniband/hw/hfi1/user_exp_rcv.c
+#	drivers/staging/hfi1/debugfs.h
+#	drivers/staging/hfi1/file_ops.c
+#	drivers/staging/hfi1/hfi.h
+#	drivers/staging/hfi1/user_pages.c
+#	drivers/staging/hfi1/user_sdma.c
+#	drivers/staging/hfi1/user_sdma.h
+diff --cc drivers/staging/hfi1/debugfs.h
+index 92d6fe146714,489a691856e5..000000000000
+--- a/drivers/staging/hfi1/debugfs.h
++++ b/drivers/staging/hfi1/debugfs.h
+@@@ -49,30 -44,33 +49,40 @@@
+   * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   *
+   */
+ -#ifndef _HFI1_MMU_RB_H
+ -#define _HFI1_MMU_RB_H
+  
+ -#include "hfi.h"
+ +struct hfi1_ibdev;
+ +#ifdef CONFIG_DEBUG_FS
+ +void hfi1_dbg_ibdev_init(struct hfi1_ibdev *ibd);
+ +void hfi1_dbg_ibdev_exit(struct hfi1_ibdev *ibd);
+ +void hfi1_dbg_init(void);
+ +void hfi1_dbg_exit(void);
+ +#else
+ +static inline void hfi1_dbg_ibdev_init(struct hfi1_ibdev *ibd)
+ +{
+ +}
+  
+ -struct mmu_rb_node {
+ -	unsigned long addr;
+ -	unsigned long len;
+ -	unsigned long __last;
+ -	struct rb_node node;
+ -};
+ +void hfi1_dbg_ibdev_exit(struct hfi1_ibdev *ibd)
+ +{
+ +}
+  
+ -struct mmu_rb_ops {
+ -	bool (*filter)(struct mmu_rb_node *node, unsigned long addr,
+ -		       unsigned long len);
+ -	int (*insert)(struct rb_root *root, struct mmu_rb_node *mnode);
+ -	void (*remove)(struct rb_root *root, struct mmu_rb_node *mnode,
+ -		       struct mm_struct *mm);
+ -	int (*invalidate)(struct rb_root *root, struct mmu_rb_node *node);
+ -};
+ +void hfi1_dbg_init(void)
+ +{
+ +}
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/debugfs.h
+ +void hfi1_dbg_exit(void)
+ +{
+ +}
+++=======
++ int hfi1_mmu_rb_register(struct mm_struct *mm, struct rb_root *root,
++ 			 struct mmu_rb_ops *ops);
++ void hfi1_mmu_rb_unregister(struct rb_root *);
++ int hfi1_mmu_rb_insert(struct rb_root *, struct mmu_rb_node *);
++ void hfi1_mmu_rb_remove(struct rb_root *, struct mmu_rb_node *);
++ struct mmu_rb_node *hfi1_mmu_rb_extract(struct rb_root *, unsigned long,
++ 					unsigned long);
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/mmu_rb.h
+ +
+ +#endif
+  
+ -#endif /* _HFI1_MMU_RB_H */
+ +#endif                          /* _HFI1_DEBUGFS_H */
+diff --cc drivers/staging/hfi1/file_ops.c
+index 834243df87b3,302f0cdd8119..000000000000
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@@ -194,122 -168,74 +194,136 @@@ static inline int is_valid_mmap(u64 tok
+  
+  static int hfi1_file_open(struct inode *inode, struct file *fp)
+  {
+ -	struct hfi1_filedata *fd;
+ -	struct hfi1_devdata *dd = container_of(inode->i_cdev,
+ -					       struct hfi1_devdata,
+ -					       user_cdev);
+ -
+ -	/* Just take a ref now. Not all opens result in a context assign */
+ -	kobject_get(&dd->kobj);
+ -
+  	/* The real work is performed later in assign_ctxt() */
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +	fp->private_data = kzalloc(sizeof(struct hfi1_filedata), GFP_KERNEL);
+ +	if (fp->private_data) /* no cpu affinity by default */
+ +		((struct hfi1_filedata *)fp->private_data)->rec_cpu_num = -1;
+ +	return fp->private_data ? 0 : -ENOMEM;
+++=======
++ 
++ 	fd = kzalloc(sizeof(*fd), GFP_KERNEL);
++ 
++ 	if (fd) {
++ 		fd->rec_cpu_num = -1; /* no cpu affinity by default */
++ 		fd->mm = current->mm;
++ 	}
++ 
++ 	fp->private_data = fd;
++ 
++ 	return fd ? 0 : -ENOMEM;
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/file_ops.c
+  }
+  
+ -static long hfi1_file_ioctl(struct file *fp, unsigned int cmd,
+ -			    unsigned long arg)
+ +static ssize_t hfi1_file_write(struct file *fp, const char __user *data,
+ +			       size_t count, loff_t *offset)
+  {
+ +	const struct hfi1_cmd __user *ucmd;
+  	struct hfi1_filedata *fd = fp->private_data;
+  	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+ +	struct hfi1_cmd cmd;
+  	struct hfi1_user_info uinfo;
+  	struct hfi1_tid_info tinfo;
+ -	int ret = 0;
+ -	unsigned long addr;
+ -	int uval = 0;
+ -	unsigned long ul_uval = 0;
+ -	u16 uval16 = 0;
+ -
+ -	hfi1_cdbg(IOCTL, "IOCTL recv: 0x%x", cmd);
+ -	if (cmd != HFI1_IOCTL_ASSIGN_CTXT &&
+ -	    cmd != HFI1_IOCTL_GET_VERS &&
+ -	    !uctxt)
+ -		return -EINVAL;
+ +	ssize_t consumed = 0, copy = 0, ret = 0;
+ +	void *dest = NULL;
+ +	__u64 user_val = 0;
+ +	int uctxt_required = 1;
+ +	int must_be_root = 0;
+ +
+ +	if (count < sizeof(cmd)) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +
+ +	ucmd = (const struct hfi1_cmd __user *)data;
+ +	if (copy_from_user(&cmd, ucmd, sizeof(cmd))) {
+ +		ret = -EFAULT;
+ +		goto bail;
+ +	}
+ +
+ +	consumed = sizeof(cmd);
+ +
+ +	switch (cmd.type) {
+ +	case HFI1_CMD_ASSIGN_CTXT:
+ +		uctxt_required = 0;	/* assigned user context not required */
+ +		copy = sizeof(uinfo);
+ +		dest = &uinfo;
+ +		break;
+ +	case HFI1_CMD_CREDIT_UPD:
+ +		copy = 0;
+ +		break;
+ +	case HFI1_CMD_TID_UPDATE:
+ +	case HFI1_CMD_TID_FREE:
+ +		copy = sizeof(tinfo);
+ +		dest = &tinfo;
+ +		break;
+ +	case HFI1_CMD_USER_INFO:
+ +	case HFI1_CMD_RECV_CTRL:
+ +	case HFI1_CMD_POLL_TYPE:
+ +	case HFI1_CMD_ACK_EVENT:
+ +	case HFI1_CMD_CTXT_INFO:
+ +	case HFI1_CMD_SET_PKEY:
+ +	case HFI1_CMD_CTXT_RESET:
+ +		copy = 0;
+ +		user_val = cmd.addr;
+ +		break;
+ +	case HFI1_CMD_EP_INFO:
+ +	case HFI1_CMD_EP_ERASE_CHIP:
+ +	case HFI1_CMD_EP_ERASE_RANGE:
+ +	case HFI1_CMD_EP_READ_RANGE:
+ +	case HFI1_CMD_EP_WRITE_RANGE:
+ +		uctxt_required = 0;	/* assigned user context not required */
+ +		must_be_root = 1;	/* validate user */
+ +		copy = 0;
+ +		break;
+ +	case HFI1_CMD_TID_INVAL_READ:
+ +	default:
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+  
+ -	switch (cmd) {
+ -	case HFI1_IOCTL_ASSIGN_CTXT:
+ -		if (uctxt)
+ -			return -EINVAL;
+ +	/* If the command comes with user data, copy it. */
+ +	if (copy) {
+ +		if (copy_from_user(dest, (void __user *)cmd.addr, copy)) {
+ +			ret = -EFAULT;
+ +			goto bail;
+ +		}
+ +		consumed += copy;
+ +	}
+  
+ -		if (copy_from_user(&uinfo,
+ -				   (struct hfi1_user_info __user *)arg,
+ -				   sizeof(uinfo)))
+ -			return -EFAULT;
+ +	/*
+ +	 * Make sure there is a uctxt when needed.
+ +	 */
+ +	if (uctxt_required && !uctxt) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+  
+ +	/* only root can do these operations */
+ +	if (must_be_root && !capable(CAP_SYS_ADMIN)) {
+ +		ret = -EPERM;
+ +		goto bail;
+ +	}
+ +
+ +	switch (cmd.type) {
+ +	case HFI1_CMD_ASSIGN_CTXT:
+  		ret = assign_ctxt(fp, &uinfo);
+  		if (ret < 0)
+ -			return ret;
+ -		setup_ctxt(fp);
+ +			goto bail;
+ +		ret = setup_ctxt(fp);
+  		if (ret)
+ -			return ret;
+ +			goto bail;
+  		ret = user_init(fp);
+  		break;
+ -	case HFI1_IOCTL_CTXT_INFO:
+ -		ret = get_ctxt_info(fp, (void __user *)(unsigned long)arg,
+ -				    sizeof(struct hfi1_ctxt_info));
+ +	case HFI1_CMD_CTXT_INFO:
+ +		ret = get_ctxt_info(fp, (void __user *)(unsigned long)
+ +				    user_val, cmd.len);
+  		break;
+ -	case HFI1_IOCTL_USER_INFO:
+ -		ret = get_base_info(fp, (void __user *)(unsigned long)arg,
+ -				    sizeof(struct hfi1_base_info));
+ +	case HFI1_CMD_USER_INFO:
+ +		ret = get_base_info(fp, (void __user *)(unsigned long)
+ +				    user_val, cmd.len);
+  		break;
+ -	case HFI1_IOCTL_CREDIT_UPD:
+ +	case HFI1_CMD_CREDIT_UPD:
+  		if (uctxt && uctxt->sc)
+  			sc_return_credits(uctxt->sc);
+  		break;
+diff --cc drivers/staging/hfi1/hfi.h
+index 1a5d37c2e56a,67f37c9ea960..000000000000
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@@ -1157,11 -1200,12 +1157,17 @@@ struct hfi1_filedata 
+  	spinlock_t tid_lock; /* protect tid_[limit,used] counters */
+  	u32 tid_limit;
+  	u32 tid_used;
+ +	spinlock_t rb_lock; /* protect tid_rb_root RB tree */
+  	u32 *invalid_tids;
+  	u32 invalid_tid_idx;
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+ +	spinlock_t invalid_lock; /* protect the invalid_tids array */
+ +	int (*mmu_rb_insert)(struct rb_root *, struct mmu_rb_node *);
+++=======
++ 	/* protect invalid_tids array and invalid_tid_idx */
++ 	spinlock_t invalid_lock;
++ 	struct mm_struct *mm;
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/hfi.h
+  };
+  
+  extern struct list_head hfi1_dev_list;
+@@@ -1628,8 -1701,12 +1634,17 @@@ void shutdown_led_override(struct hfi1_
+   */
+  #define DEFAULT_RCVHDR_ENTSIZE 32
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+ +int hfi1_acquire_user_pages(unsigned long, size_t, bool, struct page **);
+ +void hfi1_release_user_pages(struct page **, size_t, bool);
+++=======
++ bool hfi1_can_pin_pages(struct hfi1_devdata *dd, struct mm_struct *mm,
++ 			u32 nlocked, u32 npages);
++ int hfi1_acquire_user_pages(struct mm_struct *mm, unsigned long vaddr,
++ 			    size_t npages, bool writable, struct page **pages);
++ void hfi1_release_user_pages(struct mm_struct *mm, struct page **p,
++ 			     size_t npages, bool dirty);
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/hfi.h
+  
+  static inline void clear_rcvhdrtail(const struct hfi1_ctxtdata *rcd)
+  {
+diff --cc drivers/staging/hfi1/user_pages.c
+index 692de658f0dc,20f4ddcac3b0..000000000000
+--- a/drivers/staging/hfi1/user_pages.c
++++ b/drivers/staging/hfi1/user_pages.c
+@@@ -54,34 -51,61 +54,58 @@@
+  
+  #include "hfi.h"
+  
+ -static unsigned long cache_size = 256;
+ -module_param(cache_size, ulong, S_IRUGO | S_IWUSR);
+ -MODULE_PARM_DESC(cache_size, "Send and receive side cache size limit (in MB)");
+ -
+ -/*
+ - * Determine whether the caller can pin pages.
+ - *
+ - * This function should be used in the implementation of buffer caches.
+ - * The cache implementation should call this function prior to attempting
+ - * to pin buffer pages in order to determine whether they should do so.
+ - * The function computes cache limits based on the configured ulimit and
+ - * cache size. Use of this function is especially important for caches
+ - * which are not limited in any other way (e.g. by HW resources) and, thus,
+ - * could keeping caching buffers.
+ +/**
+ + * hfi1_map_page - a safety wrapper around pci_map_page()
+   *
+   */
+++<<<<<<< HEAD:drivers/staging/hfi1/user_pages.c
+ +dma_addr_t hfi1_map_page(struct pci_dev *hwdev, struct page *page,
+ +			 unsigned long offset, size_t size, int direction)
+++=======
++ bool hfi1_can_pin_pages(struct hfi1_devdata *dd, struct mm_struct *mm,
++ 			u32 nlocked, u32 npages)
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/user_pages.c
+  {
+ -	unsigned long ulimit = rlimit(RLIMIT_MEMLOCK), pinned, cache_limit,
+ -		size = (cache_size * (1UL << 20)); /* convert to bytes */
+ -	unsigned usr_ctxts = dd->num_rcv_contexts - dd->first_user_ctxt;
+ -	bool can_lock = capable(CAP_IPC_LOCK);
+ +	dma_addr_t phys;
+  
+ -	/*
+ -	 * Calculate per-cache size. The calculation below uses only a quarter
+ -	 * of the available per-context limit. This leaves space for other
+ -	 * pinning. Should we worry about shared ctxts?
+ -	 */
+ -	cache_limit = (ulimit / usr_ctxts) / 4;
+ +	phys = pci_map_page(hwdev, page, offset, size, direction);
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_pages.c
+ +	return phys;
+++=======
++ 	/* If ulimit isn't set to "unlimited" and is smaller than cache_size. */
++ 	if (ulimit != (-1UL) && size > cache_limit)
++ 		size = cache_limit;
++ 
++ 	/* Convert to number of pages */
++ 	size = DIV_ROUND_UP(size, PAGE_SIZE);
++ 
++ 	down_read(&mm->mmap_sem);
++ 	pinned = mm->pinned_vm;
++ 	up_read(&mm->mmap_sem);
++ 
++ 	/* First, check the absolute limit against all pinned pages. */
++ 	if (pinned + npages >= ulimit && !can_lock)
++ 		return false;
++ 
++ 	return ((nlocked + npages) <= size) || can_lock;
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/user_pages.c
+  }
+  
+- int hfi1_acquire_user_pages(unsigned long vaddr, size_t npages, bool writable,
+- 			    struct page **pages)
++ int hfi1_acquire_user_pages(struct mm_struct *mm, unsigned long vaddr, size_t npages,
++ 			    bool writable, struct page **pages)
+  {
+ +	unsigned long pinned, lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+ +	bool can_lock = capable(CAP_IPC_LOCK);
+  	int ret;
+  
+ +	down_read(&current->mm->mmap_sem);
+ +	pinned = current->mm->pinned_vm;
+ +	up_read(&current->mm->mmap_sem);
+ +
+ +	if (pinned + npages > lock_limit && !can_lock)
+ +		return -ENOMEM;
+ +
+  	ret = get_user_pages_fast(vaddr, npages, writable, pages);
+  	if (ret < 0)
+  		return ret;
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 47c9c87af47a,640c244b665b..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -386,9 -410,13 +386,16 @@@ int hfi1_user_sdma_alloc_queues(struct 
+  	pq->state = SDMA_PKT_Q_INACTIVE;
+  	atomic_set(&pq->n_reqs, 0);
+  	init_waitqueue_head(&pq->wait);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 	pq->sdma_rb_root = RB_ROOT;
++ 	INIT_LIST_HEAD(&pq->evict);
++ 	spin_lock_init(&pq->evict_lock);
++ 	pq->mm = fd->mm;
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/user_sdma.c
+  
+  	iowait_init(&pq->busy, 0, NULL, defer_packet_queue,
+ -		    activate_packet_queue, NULL);
+ +		    activate_packet_queue);
+  	pq->reqidx = 0;
+  	snprintf(buf, 64, "txreq-kmem-cache-%u-%u-%u", dd->unit, uctxt->ctxt,
+  		 fd->subctxt);
+@@@ -415,6 -443,12 +422,15 @@@
+  	cq->nentries = hfi1_sdma_comp_ring_size;
+  	fd->cq = cq;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 	ret = hfi1_mmu_rb_register(pq->mm, &pq->sdma_rb_root, &sdma_rb_ops);
++ 	if (ret) {
++ 		dd_dev_err(dd, "Failed to register with MMU %d", ret);
++ 		goto done;
++ 	}
++ 
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/user_sdma.c
+  	spin_lock_irqsave(&uctxt->sdma_qlock, flags);
+  	list_add(&pq->list, &uctxt->sdma_queues);
+  	spin_unlock_irqrestore(&uctxt->sdma_qlock, flags);
+@@@ -1069,40 -1124,145 +1085,107 @@@ static inline int num_user_pages(const 
+  	return 1 + ((epage - spage) >> PAGE_SHIFT);
+  }
+  
+ -static u32 sdma_cache_evict(struct hfi1_user_sdma_pkt_q *pq, u32 npages)
+ -{
+ -	u32 cleared = 0;
+ -	struct sdma_mmu_node *node, *ptr;
+ -	struct list_head to_evict = LIST_HEAD_INIT(to_evict);
+ -
+ -	spin_lock(&pq->evict_lock);
+ -	list_for_each_entry_safe_reverse(node, ptr, &pq->evict, list) {
+ -		/* Make sure that no one is still using the node. */
+ -		if (!atomic_read(&node->refcount)) {
+ -			set_bit(SDMA_CACHE_NODE_EVICT, &node->flags);
+ -			list_del_init(&node->list);
+ -			list_add(&node->list, &to_evict);
+ -			cleared += node->npages;
+ -			if (cleared >= npages)
+ -				break;
+ -		}
+ -	}
+ -	spin_unlock(&pq->evict_lock);
+ -
+ -	list_for_each_entry_safe(node, ptr, &to_evict, list)
+ -		hfi1_mmu_rb_remove(&pq->sdma_rb_root, &node->rb);
+ -
+ -	return cleared;
+ -}
+ -
+  static int pin_vector_pages(struct user_sdma_request *req,
+ -			    struct user_sdma_iovec *iovec)
+ -{
+ -	int ret = 0, pinned, npages, cleared;
+ -	struct page **pages;
+ -	struct hfi1_user_sdma_pkt_q *pq = req->pq;
+ -	struct sdma_mmu_node *node = NULL;
+ -	struct mmu_rb_node *rb_node;
+ -
+ -	rb_node = hfi1_mmu_rb_extract(&pq->sdma_rb_root,
+ -				      (unsigned long)iovec->iov.iov_base,
+ -				      iovec->iov.iov_len);
+ -	if (rb_node && !IS_ERR(rb_node))
+ -		node = container_of(rb_node, struct sdma_mmu_node, rb);
+ -	else
+ -		rb_node = NULL;
+ -
+ -	if (!node) {
+ -		node = kzalloc(sizeof(*node), GFP_KERNEL);
+ -		if (!node)
+ -			return -ENOMEM;
+ -
+ -		node->rb.addr = (unsigned long)iovec->iov.iov_base;
+ -		node->pq = pq;
+ -		atomic_set(&node->refcount, 0);
+ -		INIT_LIST_HEAD(&node->list);
+ -	}
+ +			    struct user_sdma_iovec *iovec) {
+ +	int pinned, npages;
+  
+  	npages = num_user_pages(&iovec->iov);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +	iovec->pages = kcalloc(npages, sizeof(*iovec->pages), GFP_KERNEL);
+ +	if (!iovec->pages) {
+ +		SDMA_DBG(req, "Failed page array alloc");
+ +		return -ENOMEM;
+++=======
++ 	if (node->npages < npages) {
++ 		pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
++ 		if (!pages) {
++ 			SDMA_DBG(req, "Failed page array alloc");
++ 			ret = -ENOMEM;
++ 			goto bail;
++ 		}
++ 		memcpy(pages, node->pages, node->npages * sizeof(*pages));
++ 
++ 		npages -= node->npages;
++ 
++ 		/*
++ 		 * If rb_node is NULL, it means that this is brand new node
++ 		 * and, therefore not on the eviction list.
++ 		 * If, however, the rb_node is non-NULL, it means that the
++ 		 * node is already in RB tree and, therefore on the eviction
++ 		 * list (nodes are unconditionally inserted in the eviction
++ 		 * list). In that case, we have to remove the node prior to
++ 		 * calling the eviction function in order to prevent it from
++ 		 * freeing this node.
++ 		 */
++ 		if (rb_node) {
++ 			spin_lock(&pq->evict_lock);
++ 			list_del_init(&node->list);
++ 			spin_unlock(&pq->evict_lock);
++ 		}
++ retry:
++ 		if (!hfi1_can_pin_pages(pq->dd, pq->mm, pq->n_locked, npages)) {
++ 			cleared = sdma_cache_evict(pq, npages);
++ 			if (cleared >= npages)
++ 				goto retry;
++ 		}
++ 		pinned = hfi1_acquire_user_pages(pq->mm,
++ 			((unsigned long)iovec->iov.iov_base +
++ 			 (node->npages * PAGE_SIZE)), npages, 0,
++ 			pages + node->npages);
++ 		if (pinned < 0) {
++ 			kfree(pages);
++ 			ret = pinned;
++ 			goto bail;
++ 		}
++ 		if (pinned != npages) {
++ 			unpin_vector_pages(pq->mm, pages, node->npages,
++ 					   pinned);
++ 			ret = -EFAULT;
++ 			goto bail;
++ 		}
++ 		kfree(node->pages);
++ 		node->rb.len = iovec->iov.iov_len;
++ 		node->pages = pages;
++ 		node->npages += pinned;
++ 		npages = node->npages;
++ 		spin_lock(&pq->evict_lock);
++ 		list_add(&node->list, &pq->evict);
++ 		pq->n_locked += pinned;
++ 		spin_unlock(&pq->evict_lock);
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/user_sdma.c
+  	}
+ -	iovec->pages = node->pages;
+ -	iovec->npages = npages;
+ -	iovec->node = node;
+  
+ -	ret = hfi1_mmu_rb_insert(&req->pq->sdma_rb_root, &node->rb);
+ -	if (ret) {
+ -		spin_lock(&pq->evict_lock);
+ -		if (!list_empty(&node->list))
+ -			list_del(&node->list);
+ -		pq->n_locked -= node->npages;
+ -		spin_unlock(&pq->evict_lock);
+ -		iovec->node = NULL;
+ -		goto bail;
+ +	pinned = hfi1_acquire_user_pages((unsigned long)iovec->iov.iov_base,
+ +					 npages, 0, iovec->pages);
+ +
+ +	if (pinned < 0)
+ +		return pinned;
+ +
+ +	iovec->npages = pinned;
+ +	if (pinned != npages) {
+ +		SDMA_DBG(req, "Failed to pin pages (%d/%u)", pinned, npages);
+ +		unpin_vector_pages(iovec);
+ +		return -EFAULT;
+  	}
+  	return 0;
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ bail:
++ 	if (rb_node)
++ 		unpin_vector_pages(pq->mm, node->pages, 0, node->npages);
++ 	kfree(node);
++ 	return ret;
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/user_sdma.c
+  }
+  
+ -static void unpin_vector_pages(struct mm_struct *mm, struct page **pages,
+ -			       unsigned start, unsigned npages)
+ +static void unpin_vector_pages(struct user_sdma_iovec *iovec)
+  {
+ -	hfi1_release_user_pages(mm, pages + start, npages, false);
+ -	kfree(pages);
+ +	hfi1_release_user_pages(iovec->pages, iovec->npages, 0);
+ +
+ +	kfree(iovec->pages);
+ +	iovec->pages = NULL;
+ +	iovec->npages = 0;
+ +	iovec->offset = 0;
+  }
+  
+  static int check_header_template(struct user_sdma_request *req,
+diff --cc drivers/staging/hfi1/user_sdma.h
+index 7ebbc4634989,ff49f74f43f4..000000000000
+--- a/drivers/staging/hfi1/user_sdma.h
++++ b/drivers/staging/hfi1/user_sdma.h
+@@@ -78,6 -68,11 +78,14 @@@ struct hfi1_user_sdma_pkt_q 
+  	unsigned state;
+  	wait_queue_head_t wait;
+  	unsigned long unpinned;
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.h
+++=======
++ 	struct rb_root sdma_rb_root;
++ 	u32 n_locked;
++ 	struct list_head evict;
++ 	spinlock_t evict_lock; /* protect evict and n_locked */
++ 	struct mm_struct *mm;
+++>>>>>>> 3faa3d9a308e (IB/hfi1: Make use of mm consistent):drivers/infiniband/hw/hfi1/user_sdma.h
+  };
+  
+  struct hfi1_user_sdma_comp_q {
+* Unmerged path drivers/infiniband/hw/hfi1/mmu_rb.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.c
+* Unmerged path drivers/infiniband/hw/hfi1/mmu_rb.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.c
+* Unmerged path drivers/staging/hfi1/debugfs.h
+* Unmerged path drivers/staging/hfi1/file_ops.c
+* Unmerged path drivers/staging/hfi1/hfi.h
+* Unmerged path drivers/staging/hfi1/user_pages.c
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+* Unmerged path drivers/staging/hfi1/user_sdma.h
