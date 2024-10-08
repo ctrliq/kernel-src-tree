@@ -1,0 +1,202 @@
+nfs: fix nonblocking calls to nfs_page_group_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit bc8a309e88a86205fc3e17f06e42a2e56fc6f807
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/bc8a309e.failed
+
+nfs_page_group_lock was calling wait_on_bit_lock even when told not to
+block. Fix by first trying test_and_set_bit, followed by wait_on_bit_lock
+if and only if blocking is allowed.  Return -EAGAIN if nonblocking and the
+test_and_set of the bit was already locked.
+
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Reviewed-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit bc8a309e88a86205fc3e17f06e42a2e56fc6f807)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+diff --cc fs/nfs/pagelist.c
+index 3e37cab99ceb,89d5d433e351..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -133,6 -136,170 +133,173 @@@ nfs_iocounter_wait(struct nfs_io_counte
+  	return __nfs_iocounter_wait(c);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * nfs_page_group_lock - lock the head of the page group
++  * @req - request in group that is to be locked
++  * @nonblock - if true don't block waiting for lock
++  *
++  * this lock must be held if modifying the page group list
++  *
++  * return 0 on success, < 0 on error: -EDELAY if nonblocking or the
++  * result from wait_on_bit_lock
++  *
++  * NOTE: calling with nonblock=false should always have set the
++  *       lock bit (see fs/buffer.c and other uses of wait_on_bit_lock
++  *       with TASK_UNINTERRUPTIBLE), so there is no need to check the result.
++  */
++ int
++ nfs_page_group_lock(struct nfs_page *req, bool nonblock)
++ {
++ 	struct nfs_page *head = req->wb_head;
++ 
++ 	WARN_ON_ONCE(head != head->wb_head);
++ 
++ 	if (!test_and_set_bit(PG_HEADLOCK, &head->wb_flags))
++ 		return 0;
++ 
++ 	if (!nonblock)
++ 		return wait_on_bit_lock(&head->wb_flags, PG_HEADLOCK,
++ 				TASK_UNINTERRUPTIBLE);
++ 
++ 	return -EAGAIN;
++ }
++ 
++ /*
++  * nfs_page_group_unlock - unlock the head of the page group
++  * @req - request in group that is to be unlocked
++  */
++ void
++ nfs_page_group_unlock(struct nfs_page *req)
++ {
++ 	struct nfs_page *head = req->wb_head;
++ 
++ 	WARN_ON_ONCE(head != head->wb_head);
++ 
++ 	smp_mb__before_atomic();
++ 	clear_bit(PG_HEADLOCK, &head->wb_flags);
++ 	smp_mb__after_atomic();
++ 	wake_up_bit(&head->wb_flags, PG_HEADLOCK);
++ }
++ 
++ /*
++  * nfs_page_group_sync_on_bit_locked
++  *
++  * must be called with page group lock held
++  */
++ static bool
++ nfs_page_group_sync_on_bit_locked(struct nfs_page *req, unsigned int bit)
++ {
++ 	struct nfs_page *head = req->wb_head;
++ 	struct nfs_page *tmp;
++ 
++ 	WARN_ON_ONCE(!test_bit(PG_HEADLOCK, &head->wb_flags));
++ 	WARN_ON_ONCE(test_and_set_bit(bit, &req->wb_flags));
++ 
++ 	tmp = req->wb_this_page;
++ 	while (tmp != req) {
++ 		if (!test_bit(bit, &tmp->wb_flags))
++ 			return false;
++ 		tmp = tmp->wb_this_page;
++ 	}
++ 
++ 	/* true! reset all bits */
++ 	tmp = req;
++ 	do {
++ 		clear_bit(bit, &tmp->wb_flags);
++ 		tmp = tmp->wb_this_page;
++ 	} while (tmp != req);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * nfs_page_group_sync_on_bit - set bit on current request, but only
++  *   return true if the bit is set for all requests in page group
++  * @req - request in page group
++  * @bit - PG_* bit that is used to sync page group
++  */
++ bool nfs_page_group_sync_on_bit(struct nfs_page *req, unsigned int bit)
++ {
++ 	bool ret;
++ 
++ 	nfs_page_group_lock(req, false);
++ 	ret = nfs_page_group_sync_on_bit_locked(req, bit);
++ 	nfs_page_group_unlock(req);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * nfs_page_group_init - Initialize the page group linkage for @req
++  * @req - a new nfs request
++  * @prev - the previous request in page group, or NULL if @req is the first
++  *         or only request in the group (the head).
++  */
++ static inline void
++ nfs_page_group_init(struct nfs_page *req, struct nfs_page *prev)
++ {
++ 	WARN_ON_ONCE(prev == req);
++ 
++ 	if (!prev) {
++ 		/* a head request */
++ 		req->wb_head = req;
++ 		req->wb_this_page = req;
++ 	} else {
++ 		/* a subrequest */
++ 		WARN_ON_ONCE(prev->wb_this_page != prev->wb_head);
++ 		WARN_ON_ONCE(!test_bit(PG_HEADLOCK, &prev->wb_head->wb_flags));
++ 		req->wb_head = prev->wb_head;
++ 		req->wb_this_page = prev->wb_this_page;
++ 		prev->wb_this_page = req;
++ 
++ 		/* All subrequests take a ref on the head request until
++ 		 * nfs_page_group_destroy is called */
++ 		kref_get(&req->wb_head->wb_kref);
++ 
++ 		/* grab extra ref if head request has extra ref from
++ 		 * the write/commit path to handle handoff between write
++ 		 * and commit lists */
++ 		if (test_bit(PG_INODE_REF, &prev->wb_head->wb_flags)) {
++ 			set_bit(PG_INODE_REF, &req->wb_flags);
++ 			kref_get(&req->wb_kref);
++ 		}
++ 	}
++ }
++ 
++ /*
++  * nfs_page_group_destroy - sync the destruction of page groups
++  * @req - request that no longer needs the page group
++  *
++  * releases the page group reference from each member once all
++  * members have called this function.
++  */
++ static void
++ nfs_page_group_destroy(struct kref *kref)
++ {
++ 	struct nfs_page *req = container_of(kref, struct nfs_page, wb_kref);
++ 	struct nfs_page *tmp, *next;
++ 
++ 	/* subrequests must release the ref on the head request */
++ 	if (req->wb_head != req)
++ 		nfs_release_request(req->wb_head);
++ 
++ 	if (!nfs_page_group_sync_on_bit(req, PG_TEARDOWN))
++ 		return;
++ 
++ 	tmp = req;
++ 	do {
++ 		next = tmp->wb_this_page;
++ 		/* unlink and free */
++ 		tmp->wb_this_page = tmp;
++ 		tmp->wb_head = tmp;
++ 		nfs_free_request(tmp);
++ 		tmp = next;
++ 	} while (tmp != req);
++ }
++ 
+++>>>>>>> bc8a309e88a8 (nfs: fix nonblocking calls to nfs_page_group_lock)
+  /**
+   * nfs_create_request - Create an NFS read/write request.
+   * @ctx: open context to use
+* Unmerged path fs/nfs/pagelist.c
