@@ -1221,6 +1221,7 @@ static int blk_mq_init_hw_queues(struct request_queue *q,
 		blk_mq_unregister_cpu_notifier(&hctx->cpu_notifier);
 		blk_mq_free_rq_map(hctx);
 		kfree(hctx->ctxs);
+		kfree(hctx->ctx_map);
 	}
 
 	return 1;
