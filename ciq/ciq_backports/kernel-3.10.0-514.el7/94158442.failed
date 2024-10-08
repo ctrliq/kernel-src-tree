@@ -1,0 +1,201 @@
+IB/hfi1: Don't attempt to free resources if initialization failed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit 94158442eb0c66bbb0b733999e108fa26a7673ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/94158442.failed
+
+Attempting to free resources which have not been allocated and
+initialized properly led to the following kernel backtrace:
+
+    BUG: unable to handle kernel NULL pointer dereference at           (null)
+    IP: [<ffffffffa09658fe>] unlock_exp_tids.isra.8+0x2e/0x120 [hfi1]
+    PGD 852a43067 PUD 85d4a6067 PMD 0
+    Oops: 0000 [#1] SMP
+    CPU: 0 PID: 2831 Comm: osu_bw Tainted: G          IO 3.12.18-wfr+ #1
+    task: ffff88085b15b540 ti: ffff8808588fe000 task.ti: ffff8808588fe000
+    RIP: 0010:[<ffffffffa09658fe>]  [<ffffffffa09658fe>] unlock_exp_tids.isra.8+0x2e/0x120 [hfi1]
+    RSP: 0018:ffff8808588ffde0  EFLAGS: 00010282
+    RAX: 0000000000000000 RBX: ffff880858a31800 RCX: 0000000000000000
+    RDX: ffff88085d971bc0 RSI: ffff880858a318f8 RDI: ffff880858a318c0
+    RBP: ffff8808588ffe20 R08: 0000000000000000 R09: 0000000000000000
+    R10: ffff88087ffd6f40 R11: 0000000001100348 R12: ffff880852900000
+    R13: ffff880858a318c0 R14: 0000000000000000 R15: ffff88085d971be8
+    FS:  00007f4674e83740(0000) GS:ffff88087f400000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 0000000000000000 CR3: 000000085c377000 CR4: 00000000001407f0
+    Stack:
+     ffffffffa0941a71 ffff880858a318f8 ffff88085d971bc0 ffff880858a31800
+     ffff880852900000 ffff880858a31800 00000000003ffff7 ffff88085d971bc0
+     ffff8808588ffe60 ffffffffa09663fc ffff8808588ffe60 ffff880858a31800
+    Call Trace:
+     [<ffffffffa0941a71>] ? find_mmu_handler+0x51/0x70 [hfi1]
+     [<ffffffffa09663fc>] hfi1_user_exp_rcv_free+0x6c/0x120 [hfi1]
+     [<ffffffffa0932809>] hfi1_file_close+0x1a9/0x340 [hfi1]
+     [<ffffffff8116c189>] __fput+0xe9/0x270
+     [<ffffffff8116c35e>] ____fput+0xe/0x10
+     [<ffffffff81065707>] task_work_run+0xa7/0xe0
+     [<ffffffff81002969>] do_notify_resume+0x59/0x80
+     [<ffffffff814ffc1a>] int_signal+0x12/0x17
+
+This commit re-arranges the context initialization code in a way that
+would allow for context event flags to be used to determine whether
+the context has been successfully initialized.
+
+In turn, this can be used to skip the resource de-allocation if they
+were never allocated in the first place.
+
+Fixes: 3abb33ac6521 ("staging/hfi1: Add TID cache receive init and free funcs")
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com.
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 94158442eb0c66bbb0b733999e108fa26a7673ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/file_ops.c
+#	drivers/staging/rdma/hfi1/user_exp_rcv.c
+diff --cc drivers/staging/hfi1/file_ops.c
+index cc3b4e0b66e2,ec6c2269d739..000000000000
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@@ -802,14 -801,9 +806,17 @@@ static int hfi1_file_close(struct inod
+  	uctxt->pionowait = 0;
+  	uctxt->event_flags = 0;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +	hfi1_clear_tids(uctxt);
+ +	hfi1_clear_ctxt_pkey(dd, uctxt->ctxt);
+ +
+ +	if (uctxt->tid_pg_list)
+ +		unlock_exp_tids(uctxt);
+ +
+++=======
+++>>>>>>> 94158442eb0c (IB/hfi1: Don't attempt to free resources if initialization failed):drivers/staging/rdma/hfi1/file_ops.c
+  	hfi1_stats.sps_ctxts--;
+ -	if (++dd->freectxts == dd->num_user_contexts)
+ -		aspm_enable_all(dd);
+ +	dd->freectxts++;
+  	mutex_unlock(&hfi1_mutex);
+  	hfi1_free_ctxtdata(dd, uctxt);
+  done:
+@@@ -1120,21 -1133,8 +1126,26 @@@ static int user_init(struct file *fp
+  	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+  
+  	/* make sure that the context has already been setup */
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +	if (!test_bit(HFI1_CTXT_SETUP_DONE, &uctxt->event_flags)) {
+ +		ret = -EFAULT;
+ +		goto done;
+ +	}
+ +
+ +	/*
+ +	 * Subctxts don't need to initialize anything since master
+ +	 * has done it.
+ +	 */
+ +	if (fd->subctxt) {
+ +		ret = wait_event_interruptible(uctxt->wait,
+ +			!test_bit(HFI1_CTXT_MASTER_UNINIT,
+ +			&uctxt->event_flags));
+ +		goto done;
+ +	}
+++=======
++ 	if (!test_bit(HFI1_CTXT_SETUP_DONE, &uctxt->event_flags))
++ 		return -EFAULT;
+++>>>>>>> 94158442eb0c (IB/hfi1: Don't attempt to free resources if initialization failed):drivers/staging/rdma/hfi1/file_ops.c
+  
+  	/* initialize poll variables... */
+  	uctxt->urgent = 0;
+@@@ -1188,10 -1188,8 +1199,14 @@@
+  		clear_bit(HFI1_CTXT_MASTER_UNINIT, &uctxt->event_flags);
+  		wake_up(&uctxt->wait);
+  	}
+ +	ret = 0;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +done:
+ +	return ret;
+++=======
++ 	return 0;
+++>>>>>>> 94158442eb0c (IB/hfi1: Don't attempt to free resources if initialization failed):drivers/staging/rdma/hfi1/file_ops.c
+  }
+  
+  static int get_ctxt_info(struct file *fp, void __user *ubase, __u32 len)
+@@@ -1259,48 -1257,27 +1274,70 @@@ static int setup_ctxt(struct file *fp
+  			if (ret)
+  				goto done;
+  		}
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +		/* Setup Expected Rcv memories */
+ +		uctxt->tid_pg_list = vzalloc(uctxt->expected_count *
+ +					     sizeof(struct page **));
+ +		if (!uctxt->tid_pg_list) {
+ +			ret = -ENOMEM;
+ +			goto done;
+ +		}
+ +		uctxt->physshadow = vzalloc(uctxt->expected_count *
+ +					    sizeof(*uctxt->physshadow));
+ +		if (!uctxt->physshadow) {
+ +			ret = -ENOMEM;
+ +			goto done;
+ +		}
+ +		/* allocate expected TID map and initialize the cursor */
+ +		atomic_set(&uctxt->tidcursor, 0);
+ +		uctxt->numtidgroups = uctxt->expected_count /
+ +			dd->rcv_entries.group_size;
+ +		uctxt->tidmapcnt = uctxt->numtidgroups / BITS_PER_LONG +
+ +			!!(uctxt->numtidgroups % BITS_PER_LONG);
+ +		uctxt->tidusemap = kzalloc_node(uctxt->tidmapcnt *
+ +						sizeof(*uctxt->tidusemap),
+ +						GFP_KERNEL, uctxt->numa_id);
+ +		if (!uctxt->tidusemap) {
+ +			ret = -ENOMEM;
+ +			goto done;
+ +		}
+ +		/*
+ +		 * In case that the number of groups is not a multiple of
+ +		 * 64 (the number of groups in a tidusemap element), mark
+ +		 * the extra ones as used. This will effectively make them
+ +		 * permanently used and should never be assigned. Otherwise,
+ +		 * the code which checks how many free groups we have will
+ +		 * get completely confused about the state of the bits.
+ +		 */
+ +		if (uctxt->numtidgroups % BITS_PER_LONG)
+ +			uctxt->tidusemap[uctxt->tidmapcnt - 1] =
+ +				~((1ULL << (uctxt->numtidgroups %
+ +					    BITS_PER_LONG)) - 1);
+ +		trace_hfi1_exp_tid_map(uctxt->ctxt, fd->subctxt, 0,
+ +				       uctxt->tidusemap, uctxt->tidmapcnt);
+++=======
++ 	} else {
++ 		ret = wait_event_interruptible(uctxt->wait, !test_bit(
++ 					       HFI1_CTXT_MASTER_UNINIT,
++ 					       &uctxt->event_flags));
++ 		if (ret)
++ 			goto done;
+++>>>>>>> 94158442eb0c (IB/hfi1: Don't attempt to free resources if initialization failed):drivers/staging/rdma/hfi1/file_ops.c
+  	}
++ 
+  	ret = hfi1_user_sdma_alloc_queues(uctxt, fp);
++ 	if (ret)
++ 		goto done;
++ 	/*
++ 	 * Expected receive has to be setup for all processes (including
++ 	 * shared contexts). However, it has to be done after the master
++ 	 * context has been fully configured as it depends on the
++ 	 * eager/expected split of the RcvArray entries.
++ 	 * Setting it up here ensures that the subcontexts will be waiting
++ 	 * (due to the above wait_event_interruptible() until the master
++ 	 * is setup.
++ 	 */
++ 	ret = hfi1_user_exp_rcv_init(fp);
+  	if (ret)
+  		goto done;
+  
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
+* Unmerged path drivers/staging/hfi1/file_ops.c
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
