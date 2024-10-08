@@ -37,7 +37,6 @@
 #define BYT_TURBO_RATIOS	0x66c
 #define BYT_TURBO_VIDS		0x66d
 
-
 #define FRAC_BITS 8
 #define int_tofp(X) ((int64_t)(X) << FRAC_BITS)
 #define fp_toint(X) ((X) >> FRAC_BITS)
@@ -165,7 +164,6 @@ static inline void pid_i_gain_set(struct _pid *pid, int percent)
 
 static inline void pid_d_gain_set(struct _pid *pid, int percent)
 {
-
 	pid->d_gain = div_fp(int_tofp(percent), int_tofp(100));
 }
 
@@ -214,6 +212,7 @@ static inline void intel_pstate_busy_pid_reset(struct cpudata *cpu)
 static inline void intel_pstate_reset_all_pid(void)
 {
 	unsigned int cpu;
+
 	for_each_online_cpu(cpu) {
 		if (all_cpu_data[cpu])
 			intel_pstate_busy_pid_reset(all_cpu_data[cpu]);
@@ -227,6 +226,7 @@ static int pid_param_set(void *data, u64 val)
 	intel_pstate_reset_all_pid();
 	return 0;
 }
+
 static int pid_param_get(void *data, u64 *val)
 {
 	*val = *(u32 *)data;
@@ -280,6 +280,7 @@ static ssize_t store_no_turbo(struct kobject *a, struct attribute *b,
 {
 	unsigned int input;
 	int ret;
+
 	ret = sscanf(buf, "%u", &input);
 	if (ret != 1)
 		return -EINVAL;
@@ -296,6 +297,7 @@ static ssize_t store_max_perf_pct(struct kobject *a, struct attribute *b,
 {
 	unsigned int input;
 	int ret;
+
 	ret = sscanf(buf, "%u", &input);
 	if (ret != 1)
 		return -EINVAL;
@@ -303,6 +305,7 @@ static ssize_t store_max_perf_pct(struct kobject *a, struct attribute *b,
 	limits.max_sysfs_pct = clamp_t(int, input, 0 , 100);
 	limits.max_perf_pct = min(limits.max_policy_pct, limits.max_sysfs_pct);
 	limits.max_perf = div_fp(int_tofp(limits.max_perf_pct), int_tofp(100));
+
 	return count;
 }
 
@@ -311,6 +314,7 @@ static ssize_t store_min_perf_pct(struct kobject *a, struct attribute *b,
 {
 	unsigned int input;
 	int ret;
+
 	ret = sscanf(buf, "%u", &input);
 	if (ret != 1)
 		return -EINVAL;
@@ -355,6 +359,7 @@ static void __init intel_pstate_sysfs_expose_params(void)
 static int byt_get_min_pstate(void)
 {
 	u64 value;
+
 	rdmsrl(BYT_RATIOS, value);
 	return (value >> 8) & 0x7F;
 }
@@ -362,6 +367,7 @@ static int byt_get_min_pstate(void)
 static int byt_get_max_pstate(void)
 {
 	u64 value;
+
 	rdmsrl(BYT_RATIOS, value);
 	return (value >> 16) & 0x7F;
 }
@@ -369,6 +375,7 @@ static int byt_get_max_pstate(void)
 static int byt_get_turbo_pstate(void)
 {
 	u64 value;
+
 	rdmsrl(BYT_TURBO_RATIOS, value);
 	return value & 0x7F;
 }
@@ -402,7 +409,6 @@ static void byt_get_vid(struct cpudata *cpudata)
 {
 	u64 value;
 
-
 	rdmsrl(BYT_VIDS, value);
 	cpudata->vid.min = int_tofp((value >> 8) & 0x7f);
 	cpudata->vid.max = int_tofp((value >> 16) & 0x7f);
@@ -415,10 +421,10 @@ static void byt_get_vid(struct cpudata *cpudata)
 	cpudata->vid.turbo = value & 0x7f;
 }
 
-
 static int core_get_min_pstate(void)
 {
 	u64 value;
+
 	rdmsrl(MSR_PLATFORM_INFO, value);
 	return (value >> 40) & 0xFF;
 }
@@ -426,6 +432,7 @@ static int core_get_min_pstate(void)
 static int core_get_max_pstate(void)
 {
 	u64 value;
+
 	rdmsrl(MSR_PLATFORM_INFO, value);
 	return (value >> 8) & 0xFF;
 }
@@ -434,6 +441,7 @@ static int core_get_turbo_pstate(void)
 {
 	u64 value;
 	int nont, ret;
+
 	rdmsrl(MSR_NHM_TURBO_RATIO_LIMIT, value);
 	nont = core_get_max_pstate();
 	ret = ((value) & 255);
@@ -488,12 +496,12 @@ static struct cpu_defaults byt_params = {
 	},
 };
 
-
 static void intel_pstate_get_min_max(struct cpudata *cpu, int *min, int *max)
 {
 	int max_perf = cpu->pstate.turbo_pstate;
 	int max_perf_adj;
 	int min_perf;
+
 	if (limits.no_turbo)
 		max_perf = cpu->pstate.max_pstate;
 
