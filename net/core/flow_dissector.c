@@ -144,6 +144,7 @@ ipv6:
 		break;
 	}
 
+	flow->n_proto = proto;
 	flow->ip_proto = ip_proto;
 	poff = proto_ports_offset(ip_proto);
 	if (poff >= 0) {
