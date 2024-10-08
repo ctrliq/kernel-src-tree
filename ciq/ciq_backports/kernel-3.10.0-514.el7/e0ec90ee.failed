@@ -1,0 +1,228 @@
+mm, hugetlbfs: optimize when NUMA=n
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] hugetlbfs: optimize when NUMA=n (Dave Anderson) [1274624]
+Rebuild_FUZZ: 93.94%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit e0ec90ee7e6f6cbaa6d59ffb48d2a7af5e80e61d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e0ec90ee.failed
+
+My recent patch "mm, hugetlb: use memory policy when available" added some
+bloat to hugetlb.o.  This patch aims to get some of the bloat back,
+especially when NUMA is not in play.
+
+It does this with an implicit #ifdef and marking some things static that
+should have been static in my first patch.  It also makes the warnings
+only VM_WARN_ON()s.  They were responsible for a pretty big chunk of the
+bloat.
+
+Doing this gets our NUMA=n text size back to a wee bit _below_ where we
+started before the original patch.
+
+It also shaves a bit of space off the NUMA=y case, but not much.
+Enforcing the mempolicy definitely takes some text and it's hard to avoid.
+
+size(1) output:
+
+   text	   data	    bss	    dec	    hex	filename
+  30745	   3433	   2492	  36670	   8f3e	hugetlb.o.nonuma.baseline
+  31305	   3755	   2492	  37552	   92b0	hugetlb.o.nonuma.patch1
+  30713	   3433	   2492	  36638	   8f1e	hugetlb.o.nonuma.patch2 (this patch)
+  25235	    473	  41276	  66984	  105a8	hugetlb.o.numa.baseline
+  25715	    475	  41276	  67466	  1078a	hugetlb.o.numa.patch1
+  25491	    473	  41276	  67240	  106a8	hugetlb.o.numa.patch2 (this patch)
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e0ec90ee7e6f6cbaa6d59ffb48d2a7af5e80e61d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 71d89b84e581,241de2712b36..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1068,7 -1402,117 +1068,121 @@@ static int free_pool_huge_page(struct h
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static struct page *alloc_buddy_huge_page(struct hstate *h, int nid)
+++=======
++ /*
++  * Dissolve a given free hugepage into free buddy pages. This function does
++  * nothing for in-use (including surplus) hugepages.
++  */
++ static void dissolve_free_huge_page(struct page *page)
++ {
++ 	spin_lock(&hugetlb_lock);
++ 	if (PageHuge(page) && !page_count(page)) {
++ 		struct hstate *h = page_hstate(page);
++ 		int nid = page_to_nid(page);
++ 		list_del(&page->lru);
++ 		h->free_huge_pages--;
++ 		h->free_huge_pages_node[nid]--;
++ 		update_and_free_page(h, page);
++ 	}
++ 	spin_unlock(&hugetlb_lock);
++ }
++ 
++ /*
++  * Dissolve free hugepages in a given pfn range. Used by memory hotplug to
++  * make specified memory blocks removable from the system.
++  * Note that start_pfn should aligned with (minimum) hugepage size.
++  */
++ void dissolve_free_huge_pages(unsigned long start_pfn, unsigned long end_pfn)
++ {
++ 	unsigned long pfn;
++ 
++ 	if (!hugepages_supported())
++ 		return;
++ 
++ 	VM_BUG_ON(!IS_ALIGNED(start_pfn, 1 << minimum_order));
++ 	for (pfn = start_pfn; pfn < end_pfn; pfn += 1 << minimum_order)
++ 		dissolve_free_huge_page(pfn_to_page(pfn));
++ }
++ 
++ /*
++  * There are 3 ways this can get called:
++  * 1. With vma+addr: we use the VMA's memory policy
++  * 2. With !vma, but nid=NUMA_NO_NODE:  We try to allocate a huge
++  *    page from any node, and let the buddy allocator itself figure
++  *    it out.
++  * 3. With !vma, but nid!=NUMA_NO_NODE.  We allocate a huge page
++  *    strictly from 'nid'
++  */
++ static struct page *__hugetlb_alloc_buddy_huge_page(struct hstate *h,
++ 		struct vm_area_struct *vma, unsigned long addr, int nid)
++ {
++ 	int order = huge_page_order(h);
++ 	gfp_t gfp = htlb_alloc_mask(h)|__GFP_COMP|__GFP_REPEAT|__GFP_NOWARN;
++ 	unsigned int cpuset_mems_cookie;
++ 
++ 	/*
++ 	 * We need a VMA to get a memory policy.  If we do not
++ 	 * have one, we use the 'nid' argument.
++ 	 *
++ 	 * The mempolicy stuff below has some non-inlined bits
++ 	 * and calls ->vm_ops.  That makes it hard to optimize at
++ 	 * compile-time, even when NUMA is off and it does
++ 	 * nothing.  This helps the compiler optimize it out.
++ 	 */
++ 	if (!IS_ENABLED(CONFIG_NUMA) || !vma) {
++ 		/*
++ 		 * If a specific node is requested, make sure to
++ 		 * get memory from there, but only when a node
++ 		 * is explicitly specified.
++ 		 */
++ 		if (nid != NUMA_NO_NODE)
++ 			gfp |= __GFP_THISNODE;
++ 		/*
++ 		 * Make sure to call something that can handle
++ 		 * nid=NUMA_NO_NODE
++ 		 */
++ 		return alloc_pages_node(nid, gfp, order);
++ 	}
++ 
++ 	/*
++ 	 * OK, so we have a VMA.  Fetch the mempolicy and try to
++ 	 * allocate a huge page with it.  We will only reach this
++ 	 * when CONFIG_NUMA=y.
++ 	 */
++ 	do {
++ 		struct page *page;
++ 		struct mempolicy *mpol;
++ 		struct zonelist *zl;
++ 		nodemask_t *nodemask;
++ 
++ 		cpuset_mems_cookie = read_mems_allowed_begin();
++ 		zl = huge_zonelist(vma, addr, gfp, &mpol, &nodemask);
++ 		mpol_cond_put(mpol);
++ 		page = __alloc_pages_nodemask(gfp, order, zl, nodemask);
++ 		if (page)
++ 			return page;
++ 	} while (read_mems_allowed_retry(cpuset_mems_cookie));
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * There are two ways to allocate a huge page:
++  * 1. When you have a VMA and an address (like a fault)
++  * 2. When you have no VMA (like when setting /proc/.../nr_hugepages)
++  *
++  * 'vma' and 'addr' are only for (1).  'nid' is always NUMA_NO_NODE in
++  * this case which signifies that the allocation should be done with
++  * respect for the VMA's memory policy.
++  *
++  * For (2), we ignore 'vma' and 'addr' and use 'nid' exclusively. This
++  * implies that memory policies will not be taken in to account.
++  */
++ static struct page *__alloc_buddy_huge_page(struct hstate *h,
++ 		struct vm_area_struct *vma, unsigned long addr, int nid)
+++>>>>>>> e0ec90ee7e6f (mm, hugetlbfs: optimize when NUMA=n)
+  {
+  	struct page *page;
+  	unsigned int r_nid;
+@@@ -1077,6 -1521,15 +1191,18 @@@
+  		return NULL;
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * Make sure that anyone specifying 'nid' is not also specifying a VMA.
++ 	 * This makes sure the caller is picking _one_ of the modes with which
++ 	 * we can call this function, not both.
++ 	 */
++ 	if (vma || (addr != -1)) {
++ 		VM_WARN_ON_ONCE(addr == -1);
++ 		VM_WARN_ON_ONCE(nid != NUMA_NO_NODE);
++ 	}
++ 	/*
+++>>>>>>> e0ec90ee7e6f (mm, hugetlbfs: optimize when NUMA=n)
+  	 * Assume we will successfully allocate the surplus page to
+  	 * prevent racing processes from causing the surplus to exceed
+  	 * overcommit
+@@@ -1146,6 -1587,29 +1272,32 @@@
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Allocate a huge page from 'nid'.  Note, 'nid' may be
++  * NUMA_NO_NODE, which means that it may be allocated
++  * anywhere.
++  */
++ static
++ struct page *__alloc_buddy_huge_page_no_mpol(struct hstate *h, int nid)
++ {
++ 	unsigned long addr = -1;
++ 
++ 	return __alloc_buddy_huge_page(h, NULL, addr, nid);
++ }
++ 
++ /*
++  * Use the VMA's mpolicy to allocate a huge page from the buddy.
++  */
++ static
++ struct page *__alloc_buddy_huge_page_with_mpol(struct hstate *h,
++ 		struct vm_area_struct *vma, unsigned long addr)
++ {
++ 	return __alloc_buddy_huge_page(h, vma, addr, NUMA_NO_NODE);
++ }
++ 
++ /*
+++>>>>>>> e0ec90ee7e6f (mm, hugetlbfs: optimize when NUMA=n)
+   * This allocation function is useful in the context where vma is irrelevant.
+   * E.g. soft-offlining uses this function because it only cares physical
+   * address of error page.
+* Unmerged path mm/hugetlb.c
