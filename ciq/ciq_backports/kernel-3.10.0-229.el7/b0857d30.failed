@@ -1,0 +1,178 @@
+ext4: defer clearing of PageWriteback after extent conversion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jan Kara <jack@suse.cz>
+commit b0857d309faefaf5443752458e8af1a4b22b3e92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b0857d30.failed
+
+Currently PageWriteback bit gets cleared from put_io_page() called
+from ext4_end_bio().  This is somewhat inconvenient as extent tree is
+not fully updated at that time (unwritten extents are not marked as
+written) so we cannot read the data back yet.  This design was
+dictated by lock ordering as we cannot start a transaction while
+PageWriteback bit is set (we could easily deadlock with
+ext4_da_writepages()).  But now that we use transaction reservation
+for extent conversion, locking issues are solved and we can move
+PageWriteback bit clearing after extent conversion is done.  As a
+result we can remove wait for unwritten extent conversion from
+ext4_sync_file() because it already implicitely happens through
+wait_on_page_writeback().
+
+We implement deferring of PageWriteback clearing by queueing completed
+bios to appropriate io_end and processing all the pages when io_end is
+going to be freed instead of at the moment ext4_io_end() is called.
+
+	Reviewed-by: Zheng Liu <wenqing.lz@taobao.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+(cherry picked from commit b0857d309faefaf5443752458e8af1a4b22b3e92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/page-io.c
+diff --cc fs/ext4/page-io.c
+index 50012c299f2e,755741c211a4..000000000000
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@@ -65,10 -64,74 +65,73 @@@ void ext4_ioend_shutdown(struct inode *
+  		cancel_work_sync(&EXT4_I(inode)->i_unrsv_conversion_work);
+  }
+  
++ /*
++  * Print an buffer I/O error compatible with the fs/buffer.c.  This
++  * provides compatibility with dmesg scrapers that look for a specific
++  * buffer I/O error message.  We really need a unified error reporting
++  * structure to userspace ala Digital Unix's uerf system, but it's
++  * probably not going to happen in my lifetime, due to LKML politics...
++  */
++ static void buffer_io_error(struct buffer_head *bh)
++ {
++ 	char b[BDEVNAME_SIZE];
++ 	printk(KERN_ERR "Buffer I/O error on device %s, logical block %llu\n",
++ 			bdevname(bh->b_bdev, b),
++ 			(unsigned long long)bh->b_blocknr);
++ }
++ 
++ static void ext4_finish_bio(struct bio *bio)
++ {
++ 	int i;
++ 	int error = !test_bit(BIO_UPTODATE, &bio->bi_flags);
++ 
++ 	for (i = 0; i < bio->bi_vcnt; i++) {
++ 		struct bio_vec *bvec = &bio->bi_io_vec[i];
++ 		struct page *page = bvec->bv_page;
++ 		struct buffer_head *bh, *head;
++ 		unsigned bio_start = bvec->bv_offset;
++ 		unsigned bio_end = bio_start + bvec->bv_len;
++ 		unsigned under_io = 0;
++ 		unsigned long flags;
++ 
++ 		if (!page)
++ 			continue;
++ 
++ 		if (error) {
++ 			SetPageError(page);
++ 			set_bit(AS_EIO, &page->mapping->flags);
++ 		}
++ 		bh = head = page_buffers(page);
++ 		/*
++ 		 * We check all buffers in the page under BH_Uptodate_Lock
++ 		 * to avoid races with other end io clearing async_write flags
++ 		 */
++ 		local_irq_save(flags);
++ 		bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
++ 		do {
++ 			if (bh_offset(bh) < bio_start ||
++ 			    bh_offset(bh) + bh->b_size > bio_end) {
++ 				if (buffer_async_write(bh))
++ 					under_io++;
++ 				continue;
++ 			}
++ 			clear_buffer_async_write(bh);
++ 			if (error)
++ 				buffer_io_error(bh);
++ 		} while ((bh = bh->b_this_page) != head);
++ 		bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
++ 		local_irq_restore(flags);
++ 		if (!under_io)
++ 			end_page_writeback(page);
++ 	}
++ }
++ 
+  static void ext4_release_io_end(ext4_io_end_t *io_end)
+  {
++ 	struct bio *bio, *next_bio;
++ 
+  	BUG_ON(!list_empty(&io_end->list));
+  	BUG_ON(io_end->flag & EXT4_IO_END_UNWRITTEN);
+ -	WARN_ON(io_end->handle);
+  
+  	if (atomic_dec_and_test(&EXT4_I(io_end->inode)->i_ioend_count))
+  		wake_up_all(ext4_ioend_wq(io_end->inode));
+@@@ -263,21 -336,6 +332,24 @@@ ext4_io_end_t *ext4_get_io_end(ext4_io_
+  	return io_end;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Print an buffer I/O error compatible with the fs/buffer.c.  This
+ + * provides compatibility with dmesg scrapers that look for a specific
+ + * buffer I/O error message.  We really need a unified error reporting
+ + * structure to userspace ala Digital Unix's uerf system, but it's
+ + * probably not going to happen in my lifetime, due to LKML politics...
+ + */
+ +static void buffer_io_error(struct buffer_head *bh)
+ +{
+ +	char b[BDEVNAME_SIZE];
+ +	printk_ratelimited(KERN_ERR "Buffer I/O error on device %s, logical block %llu\n",
+ +			bdevname(bh->b_bdev, b),
+ +			(unsigned long long)bh->b_blocknr);
+ +}
+ +
+++=======
+++>>>>>>> b0857d309fae (ext4: defer clearing of PageWriteback after extent conversion)
+  static void ext4_end_bio(struct bio *bio, int error)
+  {
+  	ext4_io_end_t *io_end = bio->bi_private;
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 78452f969588..65749d6058ce 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -196,8 +196,7 @@ struct mpage_da_data {
+  * Flags for ext4_io_end->flags
+  */
+ #define	EXT4_IO_END_UNWRITTEN	0x0001
+-#define EXT4_IO_END_ERROR	0x0002
+-#define EXT4_IO_END_DIRECT	0x0004
++#define EXT4_IO_END_DIRECT	0x0002
+ 
+ /*
+  * For converting uninitialized extents on a work queue.
+@@ -205,6 +204,8 @@ struct mpage_da_data {
+ typedef struct ext4_io_end {
+ 	struct list_head	list;		/* per-file finished IO list */
+ 	struct inode		*inode;		/* file being written to */
++	struct bio		*bio;		/* Linked list of completed
++						 * bios covering the extent */
+ 	unsigned int		flag;		/* unwritten or not */
+ 	loff_t			offset;		/* offset in the file */
+ 	ssize_t			size;		/* size of the extent */
+diff --git a/fs/ext4/fsync.c b/fs/ext4/fsync.c
+index 427b22866c38..41e008a86a2c 100644
+--- a/fs/ext4/fsync.c
++++ b/fs/ext4/fsync.c
+@@ -137,10 +137,6 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ 		goto out;
+ 	}
+ 
+-	ret = ext4_flush_unwritten_io(inode);
+-	if (ret < 0)
+-		goto out;
+-
+ 	if (!journal) {
+ 		ret = __sync_inode(inode, datasync);
+ 		if (!ret && !hlist_empty(&inode->i_dentry))
+* Unmerged path fs/ext4/page-io.c
