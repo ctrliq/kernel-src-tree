@@ -1,0 +1,309 @@
+perf tools: Make binary data printer code in trace_event public available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit c339b1a90e6cd638a1d99cbbf49d870ce233198e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c339b1a9.failed
+
+Move code printing binray data from trace_event() to utils.c and allows
+passing different printer. Further commits will use this logic to print
+bpf output event.
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1456312845-111583-2-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit c339b1a90e6cd638a1d99cbbf49d870ce233198e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/util.c
+#	tools/perf/util/util.h
+diff --cc tools/perf/util/util.c
+index c21706e983b8,b7766c577b01..000000000000
+--- a/tools/perf/util/util.c
++++ b/tools/perf/util/util.c
+@@@ -13,8 -14,10 +13,9 @@@
+  #include <limits.h>
+  #include <byteswap.h>
+  #include <linux/kernel.h>
++ #include <linux/log2.h>
+  #include <unistd.h>
+  #include "callchain.h"
+ -#include "strlist.h"
+  
+  struct callchain_param	callchain_param = {
+  	.mode	= CHAIN_GRAPH_ABS,
+@@@ -585,3 -588,122 +586,125 @@@ bool find_process(const char *name
+  	closedir(dir);
+  	return ret ? false : true;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int
++ fetch_kernel_version(unsigned int *puint, char *str,
++ 		     size_t str_size)
++ {
++ 	struct utsname utsname;
++ 	int version, patchlevel, sublevel, err;
++ 
++ 	if (uname(&utsname))
++ 		return -1;
++ 
++ 	if (str && str_size) {
++ 		strncpy(str, utsname.release, str_size);
++ 		str[str_size - 1] = '\0';
++ 	}
++ 
++ 	err = sscanf(utsname.release, "%d.%d.%d",
++ 		     &version, &patchlevel, &sublevel);
++ 
++ 	if (err != 3) {
++ 		pr_debug("Unablt to get kernel version from uname '%s'\n",
++ 			 utsname.release);
++ 		return -1;
++ 	}
++ 
++ 	if (puint)
++ 		*puint = (version << 16) + (patchlevel << 8) + sublevel;
++ 	return 0;
++ }
++ 
++ const char *perf_tip(const char *dirpath)
++ {
++ 	struct strlist *tips;
++ 	struct str_node *node;
++ 	char *tip = NULL;
++ 	struct strlist_config conf = {
++ 		.dirname = dirpath,
++ 		.file_only = true,
++ 	};
++ 
++ 	tips = strlist__new("tips.txt", &conf);
++ 	if (tips == NULL)
++ 		return errno == ENOENT ? NULL : "Tip: get more memory! ;-p";
++ 
++ 	if (strlist__nr_entries(tips) == 0)
++ 		goto out;
++ 
++ 	node = strlist__entry(tips, random() % strlist__nr_entries(tips));
++ 	if (asprintf(&tip, "Tip: %s", node->s) < 0)
++ 		tip = (char *)"Tip: get more memory! ;-)";
++ 
++ out:
++ 	strlist__delete(tips);
++ 
++ 	return tip;
++ }
++ 
++ bool is_regular_file(const char *file)
++ {
++ 	struct stat st;
++ 
++ 	if (stat(file, &st))
++ 		return false;
++ 
++ 	return S_ISREG(st.st_mode);
++ }
++ 
++ int fetch_current_timestamp(char *buf, size_t sz)
++ {
++ 	struct timeval tv;
++ 	struct tm tm;
++ 	char dt[32];
++ 
++ 	if (gettimeofday(&tv, NULL) || !localtime_r(&tv.tv_sec, &tm))
++ 		return -1;
++ 
++ 	if (!strftime(dt, sizeof(dt), "%Y%m%d%H%M%S", &tm))
++ 		return -1;
++ 
++ 	scnprintf(buf, sz, "%s%02u", dt, (unsigned)tv.tv_usec / 10000);
++ 
++ 	return 0;
++ }
++ 
++ void print_binary(unsigned char *data, size_t len,
++ 		  size_t bytes_per_line, print_binary_t printer,
++ 		  void *extra)
++ {
++ 	size_t i, j, mask;
++ 
++ 	if (!printer)
++ 		return;
++ 
++ 	bytes_per_line = roundup_pow_of_two(bytes_per_line);
++ 	mask = bytes_per_line - 1;
++ 
++ 	printer(BINARY_PRINT_DATA_BEGIN, 0, extra);
++ 	for (i = 0; i < len; i++) {
++ 		if ((i & mask) == 0) {
++ 			printer(BINARY_PRINT_LINE_BEGIN, -1, extra);
++ 			printer(BINARY_PRINT_ADDR, i, extra);
++ 		}
++ 
++ 		printer(BINARY_PRINT_NUM_DATA, data[i], extra);
++ 
++ 		if (((i & mask) == mask) || i == len - 1) {
++ 			for (j = 0; j < mask-(i & mask); j++)
++ 				printer(BINARY_PRINT_NUM_PAD, -1, extra);
++ 
++ 			printer(BINARY_PRINT_SEP, i, extra);
++ 			for (j = i & ~mask; j <= i; j++)
++ 				printer(BINARY_PRINT_CHAR_DATA, data[j], extra);
++ 			for (j = 0; j < mask-(i & mask); j++)
++ 				printer(BINARY_PRINT_CHAR_PAD, i, extra);
++ 			printer(BINARY_PRINT_LINE_END, -1, extra);
++ 		}
++ 	}
++ 	printer(BINARY_PRINT_DATA_END, -1, extra);
++ }
+++>>>>>>> c339b1a90e6c (perf tools: Make binary data printer code in trace_event public available)
+diff --cc tools/perf/util/util.h
+index 76b77563c57f,7015019ee5fb..000000000000
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@@ -347,4 -333,36 +347,39 @@@ static inline char *asprintf_expr_not_i
+  
+  int get_stack_size(const char *str, unsigned long *_size);
+  
+++<<<<<<< HEAD
+++=======
++ int fetch_kernel_version(unsigned int *puint,
++ 			 char *str, size_t str_sz);
++ #define KVER_VERSION(x)		(((x) >> 16) & 0xff)
++ #define KVER_PATCHLEVEL(x)	(((x) >> 8) & 0xff)
++ #define KVER_SUBLEVEL(x)	((x) & 0xff)
++ #define KVER_FMT	"%d.%d.%d"
++ #define KVER_PARAM(x)	KVER_VERSION(x), KVER_PATCHLEVEL(x), KVER_SUBLEVEL(x)
++ 
++ const char *perf_tip(const char *dirpath);
++ bool is_regular_file(const char *file);
++ int fetch_current_timestamp(char *buf, size_t sz);
++ 
++ enum binary_printer_ops {
++ 	BINARY_PRINT_DATA_BEGIN,
++ 	BINARY_PRINT_LINE_BEGIN,
++ 	BINARY_PRINT_ADDR,
++ 	BINARY_PRINT_NUM_DATA,
++ 	BINARY_PRINT_NUM_PAD,
++ 	BINARY_PRINT_SEP,
++ 	BINARY_PRINT_CHAR_DATA,
++ 	BINARY_PRINT_CHAR_PAD,
++ 	BINARY_PRINT_LINE_END,
++ 	BINARY_PRINT_DATA_END,
++ };
++ 
++ typedef void (*print_binary_t)(enum binary_printer_ops,
++ 			       unsigned int val,
++ 			       void *extra);
++ 
++ void print_binary(unsigned char *data, size_t len,
++ 		  size_t bytes_per_line, print_binary_t printer,
++ 		  void *extra);
+++>>>>>>> c339b1a90e6c (perf tools: Make binary data printer code in trace_event public available)
+  #endif /* GIT_COMPAT_UTIL_H */
+diff --git a/tools/perf/util/debug.c b/tools/perf/util/debug.c
+index ff7e86ad1b06..8c4212abd19b 100644
+--- a/tools/perf/util/debug.c
++++ b/tools/perf/util/debug.c
+@@ -106,40 +106,61 @@ int dump_printf(const char *fmt, ...)
+ 	return ret;
+ }
+ 
++static void trace_event_printer(enum binary_printer_ops op,
++				unsigned int val, void *extra)
++{
++	const char *color = PERF_COLOR_BLUE;
++	union perf_event *event = (union perf_event *)extra;
++	unsigned char ch = (unsigned char)val;
++
++	switch (op) {
++	case BINARY_PRINT_DATA_BEGIN:
++		printf(".");
++		color_fprintf(stdout, color, "\n. ... raw event: size %d bytes\n",
++				event->header.size);
++		break;
++	case BINARY_PRINT_LINE_BEGIN:
++		printf(".");
++		break;
++	case BINARY_PRINT_ADDR:
++		color_fprintf(stdout, color, "  %04x: ", val);
++		break;
++	case BINARY_PRINT_NUM_DATA:
++		color_fprintf(stdout, color, " %02x", val);
++		break;
++	case BINARY_PRINT_NUM_PAD:
++		color_fprintf(stdout, color, "   ");
++		break;
++	case BINARY_PRINT_SEP:
++		color_fprintf(stdout, color, "  ");
++		break;
++	case BINARY_PRINT_CHAR_DATA:
++		color_fprintf(stdout, color, "%c",
++			      isprint(ch) ? ch : '.');
++		break;
++	case BINARY_PRINT_CHAR_PAD:
++		color_fprintf(stdout, color, " ");
++		break;
++	case BINARY_PRINT_LINE_END:
++		color_fprintf(stdout, color, "\n");
++		break;
++	case BINARY_PRINT_DATA_END:
++		printf("\n");
++		break;
++	default:
++		break;
++	}
++}
++
+ void trace_event(union perf_event *event)
+ {
+ 	unsigned char *raw_event = (void *)event;
+-	const char *color = PERF_COLOR_BLUE;
+-	int i, j;
+ 
+ 	if (!dump_trace)
+ 		return;
+ 
+-	printf(".");
+-	color_fprintf(stdout, color, "\n. ... raw event: size %d bytes\n",
+-		      event->header.size);
+-
+-	for (i = 0; i < event->header.size; i++) {
+-		if ((i & 15) == 0) {
+-			printf(".");
+-			color_fprintf(stdout, color, "  %04x: ", i);
+-		}
+-
+-		color_fprintf(stdout, color, " %02x", raw_event[i]);
+-
+-		if (((i & 15) == 15) || i == event->header.size-1) {
+-			color_fprintf(stdout, color, "  ");
+-			for (j = 0; j < 15-(i & 15); j++)
+-				color_fprintf(stdout, color, "   ");
+-			for (j = i & ~15; j <= i; j++) {
+-				color_fprintf(stdout, color, "%c",
+-					      isprint(raw_event[j]) ?
+-					      raw_event[j] : '.');
+-			}
+-			color_fprintf(stdout, color, "\n");
+-		}
+-	}
+-	printf(".\n");
++	print_binary(raw_event, event->header.size, 16,
++		     trace_event_printer, event);
+ }
+ 
+ static struct debug_variable {
+* Unmerged path tools/perf/util/util.c
+* Unmerged path tools/perf/util/util.h
