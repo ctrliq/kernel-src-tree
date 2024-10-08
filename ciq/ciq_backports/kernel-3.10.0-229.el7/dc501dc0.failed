@@ -1,0 +1,218 @@
+blk-mq: pass along blk_mq_alloc_tag_set return values
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Robert Elliott <elliott@hp.com>
+commit dc501dc0d9dc9cbabc18b920f91a26c207e9476c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/dc501dc0.failed
+
+Two of the blk-mq based drivers do not pass back the return value
+from blk_mq_alloc_tag_set, instead just returning -ENOMEM.
+
+blk_mq_alloc_tag_set returns -EINVAL if the number of queues or
+queue depth is bad.  -ENOMEM implies that retrying after freeing some
+memory might be more successful, but that won't ever change
+in the -EINVAL cases.
+
+Change the null_blk and mtip32xx drivers to pass along
+the return value.
+
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit dc501dc0d9dc9cbabc18b920f91a26c207e9476c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/mtip32xx/mtip32xx.c
+#	drivers/block/null_blk.c
+diff --cc drivers/block/mtip32xx/mtip32xx.c
+index 9912f3d7777e,5c8e7fe07745..000000000000
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@@ -4191,6 -3903,45 +4191,48 @@@ static int mtip_block_initialize(struc
+  
+  	mtip_hw_debugfs_init(dd);
+  
+++<<<<<<< HEAD
+++=======
++ skip_create_disk:
++ 	memset(&dd->tags, 0, sizeof(dd->tags));
++ 	dd->tags.ops = &mtip_mq_ops;
++ 	dd->tags.nr_hw_queues = 1;
++ 	dd->tags.queue_depth = MTIP_MAX_COMMAND_SLOTS;
++ 	dd->tags.reserved_tags = 1;
++ 	dd->tags.cmd_size = sizeof(struct mtip_cmd);
++ 	dd->tags.numa_node = dd->numa_node;
++ 	dd->tags.flags = BLK_MQ_F_SHOULD_MERGE;
++ 	dd->tags.driver_data = dd;
++ 
++ 	rv = blk_mq_alloc_tag_set(&dd->tags);
++ 	if (rv) {
++ 		dev_err(&dd->pdev->dev,
++ 			"Unable to allocate request queue\n");
++ 		goto block_queue_alloc_init_error;
++ 	}
++ 
++ 	/* Allocate the request queue. */
++ 	dd->queue = blk_mq_init_queue(&dd->tags);
++ 	if (IS_ERR(dd->queue)) {
++ 		dev_err(&dd->pdev->dev,
++ 			"Unable to allocate request queue\n");
++ 		rv = -ENOMEM;
++ 		goto block_queue_alloc_init_error;
++ 	}
++ 
++ 	dd->disk->queue		= dd->queue;
++ 	dd->queue->queuedata	= dd;
++ 
++ 	/* Initialize the protocol layer. */
++ 	wait_for_rebuild = mtip_hw_get_identify(dd);
++ 	if (wait_for_rebuild < 0) {
++ 		dev_err(&dd->pdev->dev,
++ 			"Protocol layer initialization failed\n");
++ 		rv = -EINVAL;
++ 		goto init_hw_cmds_error;
++ 	}
++ 
+++>>>>>>> dc501dc0d9dc (blk-mq: pass along blk_mq_alloc_tag_set return values)
+  	/*
+  	 * if rebuild pending, start the service thread, and delay the block
+  	 * queue creation and add_disk()
+diff --cc drivers/block/null_blk.c
+index 3ae5f19b54ef,00d469c7f9f7..000000000000
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@@ -503,39 -462,57 +503,81 @@@ static int null_add_dev(void
+  	struct gendisk *disk;
+  	struct nullb *nullb;
+  	sector_t size;
++ 	int rv;
+  
+  	nullb = kzalloc_node(sizeof(*nullb), GFP_KERNEL, home_node);
+++<<<<<<< HEAD
+ +	if (!nullb)
+ +		return -ENOMEM;
+ +
+ +	spin_lock_init(&nullb->lock);
+ +
+ +	if (setup_queues(nullb))
+ +		goto err;
+++=======
++ 	if (!nullb) {
++ 		rv = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	spin_lock_init(&nullb->lock);
++ 
++ 	if (queue_mode == NULL_Q_MQ && use_per_node_hctx)
++ 		submit_queues = nr_online_nodes;
++ 
++ 	rv = setup_queues(nullb);
++ 	if (rv)
++ 		goto out_free_nullb;
+++>>>>>>> dc501dc0d9dc (blk-mq: pass along blk_mq_alloc_tag_set return values)
+  
+  	if (queue_mode == NULL_Q_MQ) {
+ -		nullb->tag_set.ops = &null_mq_ops;
+ -		nullb->tag_set.nr_hw_queues = submit_queues;
+ -		nullb->tag_set.queue_depth = hw_queue_depth;
+ -		nullb->tag_set.numa_node = home_node;
+ -		nullb->tag_set.cmd_size	= sizeof(struct nullb_cmd);
+ -		nullb->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+ -		nullb->tag_set.driver_data = nullb;
+ +		null_mq_reg.numa_node = home_node;
+ +		null_mq_reg.queue_depth = hw_queue_depth;
+ +		null_mq_reg.nr_hw_queues = submit_queues;
+ +
+++<<<<<<< HEAD
+ +		if (use_per_node_hctx) {
+ +			null_mq_reg.ops->alloc_hctx = null_alloc_hctx;
+ +			null_mq_reg.ops->free_hctx = null_free_hctx;
+ +		} else {
+ +			null_mq_reg.ops->alloc_hctx = blk_mq_alloc_single_hw_queue;
+ +			null_mq_reg.ops->free_hctx = blk_mq_free_single_hw_queue;
+ +		}
+  
+ +		nullb->q = blk_mq_init_queue(&null_mq_reg, nullb);
+ +	} else if (queue_mode == NULL_Q_BIO) {
+ +		nullb->q = blk_alloc_queue_node(GFP_KERNEL, home_node);
+++=======
++ 		rv = blk_mq_alloc_tag_set(&nullb->tag_set);
++ 		if (rv)
++ 			goto out_cleanup_queues;
++ 
++ 		nullb->q = blk_mq_init_queue(&nullb->tag_set);
++ 		if (!nullb->q) {
++ 			rv = -ENOMEM;
++ 			goto out_cleanup_tags;
++ 		}
++ 	} else if (queue_mode == NULL_Q_BIO) {
++ 		nullb->q = blk_alloc_queue_node(GFP_KERNEL, home_node);
++ 		if (!nullb->q) {
++ 			rv = -ENOMEM;
++ 			goto out_cleanup_queues;
++ 		}
+++>>>>>>> dc501dc0d9dc (blk-mq: pass along blk_mq_alloc_tag_set return values)
+  		blk_queue_make_request(nullb->q, null_queue_bio);
+  		init_driver_queues(nullb);
+  	} else {
+  		nullb->q = blk_init_queue_node(null_request_fn, &nullb->lock, home_node);
+++<<<<<<< HEAD
+++=======
++ 		if (!nullb->q) {
++ 			rv = -ENOMEM;
++ 			goto out_cleanup_queues;
++ 		}
+++>>>>>>> dc501dc0d9dc (blk-mq: pass along blk_mq_alloc_tag_set return values)
+  		blk_queue_prep_rq(nullb->q, null_rq_prep_fn);
+ -		blk_queue_softirq_done(nullb->q, null_softirq_done_fn);
+ +		if (nullb->q)
+ +			blk_queue_softirq_done(nullb->q, null_softirq_done_fn);
+  		init_driver_queues(nullb);
+  	}
+  
+@@@ -547,12 -521,8 +589,17 @@@
+  
+  	disk = nullb->disk = alloc_disk_node(1, home_node);
+  	if (!disk) {
+++<<<<<<< HEAD
+ +queue_fail:
+ +		blk_cleanup_queue(nullb->q);
+ +		cleanup_queues(nullb);
+ +err:
+ +		kfree(nullb);
+ +		return -ENOMEM;
+++=======
++ 		rv = -ENOMEM;
++ 		goto out_cleanup_blk_queue;
+++>>>>>>> dc501dc0d9dc (blk-mq: pass along blk_mq_alloc_tag_set return values)
+  	}
+  
+  	mutex_lock(&lock);
+@@@ -576,6 -546,18 +623,21 @@@
+  	sprintf(disk->disk_name, "nullb%d", nullb->index);
+  	add_disk(disk);
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ out_cleanup_blk_queue:
++ 	blk_cleanup_queue(nullb->q);
++ out_cleanup_tags:
++ 	if (queue_mode == NULL_Q_MQ)
++ 		blk_mq_free_tag_set(&nullb->tag_set);
++ out_cleanup_queues:
++ 	cleanup_queues(nullb);
++ out_free_nullb:
++ 	kfree(nullb);
++ out:
++ 	return rv;
+++>>>>>>> dc501dc0d9dc (blk-mq: pass along blk_mq_alloc_tag_set return values)
+  }
+  
+  static int __init null_init(void)
+* Unmerged path drivers/block/mtip32xx/mtip32xx.c
+* Unmerged path drivers/block/null_blk.c
