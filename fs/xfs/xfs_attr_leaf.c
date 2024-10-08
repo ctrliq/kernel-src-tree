@@ -546,7 +546,7 @@ xfs_attr_shortform_remove(xfs_da_args_t *args)
 		break;
 	}
 	if (i == end)
-		return(XFS_ERROR(ENOATTR));
+		return XFS_ERROR(ENOATTR);
 
 	/*
 	 * Fix up the attribute fork data, covering the hole
@@ -581,7 +581,7 @@ xfs_attr_shortform_remove(xfs_da_args_t *args)
 
 	xfs_sbversion_add_attr2(mp, args->trans);
 
-	return(0);
+	return 0;
 }
 
 /*
@@ -610,9 +610,9 @@ xfs_attr_shortform_lookup(xfs_da_args_t *args)
 			continue;
 		if (!xfs_attr_namesp_match(args->flags, sfe->flags))
 			continue;
-		return(XFS_ERROR(EEXIST));
+		return XFS_ERROR(EEXIST);
 	}
-	return(XFS_ERROR(ENOATTR));
+	return XFS_ERROR(ENOATTR);
 }
 
 /*
@@ -639,18 +639,18 @@ xfs_attr_shortform_getvalue(xfs_da_args_t *args)
 			continue;
 		if (args->flags & ATTR_KERNOVAL) {
 			args->valuelen = sfe->valuelen;
-			return(XFS_ERROR(EEXIST));
+			return XFS_ERROR(EEXIST);
 		}
 		if (args->valuelen < sfe->valuelen) {
 			args->valuelen = sfe->valuelen;
-			return(XFS_ERROR(ERANGE));
+			return XFS_ERROR(ERANGE);
 		}
 		args->valuelen = sfe->valuelen;
 		memcpy(args->value, &sfe->nameval[args->namelen],
 						    args->valuelen);
-		return(XFS_ERROR(EEXIST));
+		return XFS_ERROR(EEXIST);
 	}
-	return(XFS_ERROR(ENOATTR));
+	return XFS_ERROR(ENOATTR);
 }
 
 /*
@@ -740,7 +740,7 @@ xfs_attr_shortform_to_leaf(xfs_da_args_t *args)
 
 out:
 	kmem_free(tmpbuffer);
-	return(error);
+	return error;
 }
 
 /*
@@ -768,12 +768,12 @@ xfs_attr_shortform_allfit(
 		if (entry->flags & XFS_ATTR_INCOMPLETE)
 			continue;		/* don't copy partial entries */
 		if (!(entry->flags & XFS_ATTR_LOCAL))
-			return(0);
+			return 0;
 		name_loc = xfs_attr3_leaf_name_local(leaf, i);
 		if (name_loc->namelen >= XFS_ATTR_SF_ENTSIZE_MAX)
-			return(0);
+			return 0;
 		if (be16_to_cpu(name_loc->valuelen) >= XFS_ATTR_SF_ENTSIZE_MAX)
-			return(0);
+			return 0;
 		bytes += sizeof(struct xfs_attr_sf_entry) - 1
 				+ name_loc->namelen
 				+ be16_to_cpu(name_loc->valuelen);
@@ -1016,10 +1016,10 @@ xfs_attr3_leaf_split(
 	ASSERT(oldblk->magic == XFS_ATTR_LEAF_MAGIC);
 	error = xfs_da_grow_inode(state->args, &blkno);
 	if (error)
-		return(error);
+		return error;
 	error = xfs_attr3_leaf_create(state->args, blkno, &newblk->bp);
 	if (error)
-		return(error);
+		return error;
 	newblk->blkno = blkno;
 	newblk->magic = XFS_ATTR_LEAF_MAGIC;
 
@@ -1030,7 +1030,7 @@ xfs_attr3_leaf_split(
 	xfs_attr3_leaf_rebalance(state, oldblk, newblk);
 	error = xfs_da3_blk_link(state, oldblk, newblk);
 	if (error)
-		return(error);
+		return error;
 
 	/*
 	 * Save info on "old" attribute for "atomic rename" ops, leaf_add()
@@ -1052,7 +1052,7 @@ xfs_attr3_leaf_split(
 	 */
 	oldblk->hashval = xfs_attr_leaf_lasthash(oldblk->bp, NULL);
 	newblk->hashval = xfs_attr_leaf_lasthash(newblk->bp, NULL);
-	return(error);
+	return error;
 }
 
 /*
@@ -1704,7 +1704,7 @@ xfs_attr3_leaf_toosmall(
 		ichdr.usedbytes;
 	if (bytes > (state->blocksize >> 1)) {
 		*action = 0;	/* blk over 50%, don't try to join */
-		return(0);
+		return 0;
 	}
 
 	/*
@@ -1723,7 +1723,7 @@ xfs_attr3_leaf_toosmall(
 		error = xfs_da3_path_shift(state, &state->altpath, forward,
 						 0, &retval);
 		if (error)
-			return(error);
+			return error;
 		if (retval) {
 			*action = 0;
 		} else {
@@ -1752,7 +1752,7 @@ xfs_attr3_leaf_toosmall(
 		error = xfs_attr3_leaf_read(state->args->trans, state->args->dp,
 					blkno, -1, &bp);
 		if (error)
-			return(error);
+			return error;
 
 		xfs_attr3_leaf_hdr_from_disk(&ichdr2, bp->b_addr);
 
@@ -1768,7 +1768,7 @@ xfs_attr3_leaf_toosmall(
 	}
 	if (i >= 2) {
 		*action = 0;
-		return(0);
+		return 0;
 	}
 
 	/*
@@ -1784,13 +1784,13 @@ xfs_attr3_leaf_toosmall(
 						 0, &retval);
 	}
 	if (error)
-		return(error);
+		return error;
 	if (retval) {
 		*action = 0;
 	} else {
 		*action = 1;
 	}
-	return(0);
+	return 0;
 }
 
 /*
@@ -2489,7 +2489,7 @@ xfs_attr3_leaf_clearflag(
 	 */
 	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, -1, &bp);
 	if (error)
-		return(error);
+		return error;
 
 	leaf = bp->b_addr;
 	entry = &xfs_attr3_leaf_entryp(leaf)[args->index];
@@ -2556,7 +2556,7 @@ xfs_attr3_leaf_setflag(
 	 */
 	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, -1, &bp);
 	if (error)
-		return(error);
+		return error;
 
 	leaf = bp->b_addr;
 #ifdef DEBUG
