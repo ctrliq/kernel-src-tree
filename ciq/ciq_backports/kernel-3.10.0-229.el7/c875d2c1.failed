@@ -1,0 +1,195 @@
+iommu/vt-d: Exclude devices using RMRRs from IOMMU API domains
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Exclude devices using RMRRs from IOMMU API domains (Myron Stowe) [1097907]
+Rebuild_FUZZ: 94.92%
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit c875d2c1b8083cd627ea0463e20bf22c2d7421ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c875d2c1.failed
+
+The user of the IOMMU API domain expects to have full control of
+the IOVA space for the domain.  RMRRs are fundamentally incompatible
+with that idea.  We can neither map the RMRR into the IOMMU API
+domain, nor can we guarantee that the device won't continue DMA with
+the area described by the RMRR as part of the new domain.  Therefore
+we must prevent such devices from being used by the IOMMU API.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Cc: David Woodhouse <dwmw2@infradead.org>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit c875d2c1b8083cd627ea0463e20bf22c2d7421ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index e246bb7572b4,d1f5caad04f9..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -2395,58 -2542,90 +2395,100 @@@ static bool device_has_rmrr(struct pci_
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int iommu_should_identity_map(struct pci_dev *pdev, int startup)
+++=======
++ /*
++  * There are a couple cases where we need to restrict the functionality of
++  * devices associated with RMRRs.  The first is when evaluating a device for
++  * identity mapping because problems exist when devices are moved in and out
++  * of domains and their respective RMRR information is lost.  This means that
++  * a device with associated RMRRs will never be in a "passthrough" domain.
++  * The second is use of the device through the IOMMU API.  This interface
++  * expects to have full control of the IOVA space for the device.  We cannot
++  * satisfy both the requirement that RMRR access is maintained and have an
++  * unencumbered IOVA space.  We also have no ability to quiesce the device's
++  * use of the RMRR space or even inform the IOMMU API user of the restriction.
++  * We therefore prevent devices associated with an RMRR from participating in
++  * the IOMMU API, which eliminates them from device assignment.
++  *
++  * In both cases we assume that PCI USB devices with RMRRs have them largely
++  * for historical reasons and that the RMRR space is not actively used post
++  * boot.  This exclusion may change if vendors begin to abuse it.
++  */
++ static bool device_is_rmrr_locked(struct device *dev)
++ {
++ 	if (!device_has_rmrr(dev))
++ 		return false;
++ 
++ 	if (dev_is_pci(dev)) {
++ 		struct pci_dev *pdev = to_pci_dev(dev);
++ 
++ 		if ((pdev->class >> 8) == PCI_CLASS_SERIAL_USB)
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static int iommu_should_identity_map(struct device *dev, int startup)
+++>>>>>>> c875d2c1b808 (iommu/vt-d: Exclude devices using RMRRs from IOMMU API domains)
+  {
+  
+ -	if (dev_is_pci(dev)) {
+ -		struct pci_dev *pdev = to_pci_dev(dev);
+ +	/*
+ +	 * We want to prevent any device associated with an RMRR from
+ +	 * getting placed into the SI Domain. This is done because
+ +	 * problems exist when devices are moved in and out of domains
+ +	 * and their respective RMRR info is lost. We exempt USB devices
+ +	 * from this process due to their usage of RMRRs that are known
+ +	 * to not be needed after BIOS hand-off to OS.
+ +	 */
+ +	if (device_has_rmrr(pdev) &&
+ +	    (pdev->class >> 8) != PCI_CLASS_SERIAL_USB)
+ +		return 0;
+  
+++<<<<<<< HEAD
+ +	if ((iommu_identity_mapping & IDENTMAP_AZALIA) && IS_AZALIA(pdev))
+ +		return 1;
+++=======
++ 		if (device_is_rmrr_locked(dev))
++ 			return 0;
+++>>>>>>> c875d2c1b808 (iommu/vt-d: Exclude devices using RMRRs from IOMMU API domains)
+  
+ -		if ((iommu_identity_mapping & IDENTMAP_AZALIA) && IS_AZALIA(pdev))
+ -			return 1;
+ -
+ -		if ((iommu_identity_mapping & IDENTMAP_GFX) && IS_GFX_DEVICE(pdev))
+ -			return 1;
+ +	if ((iommu_identity_mapping & IDENTMAP_GFX) && IS_GFX_DEVICE(pdev))
+ +		return 1;
+  
+ -		if (!(iommu_identity_mapping & IDENTMAP_ALL))
+ -			return 0;
+ +	if (!(iommu_identity_mapping & IDENTMAP_ALL))
+ +		return 0;
+  
+ -		/*
+ -		 * We want to start off with all devices in the 1:1 domain, and
+ -		 * take them out later if we find they can't access all of memory.
+ -		 *
+ -		 * However, we can't do this for PCI devices behind bridges,
+ -		 * because all PCI devices behind the same bridge will end up
+ -		 * with the same source-id on their transactions.
+ -		 *
+ -		 * Practically speaking, we can't change things around for these
+ -		 * devices at run-time, because we can't be sure there'll be no
+ -		 * DMA transactions in flight for any of their siblings.
+ -		 *
+ -		 * So PCI devices (unless they're on the root bus) as well as
+ -		 * their parent PCI-PCI or PCIe-PCI bridges must be left _out_ of
+ -		 * the 1:1 domain, just in _case_ one of their siblings turns out
+ -		 * not to be able to map all of memory.
+ -		 */
+ -		if (!pci_is_pcie(pdev)) {
+ -			if (!pci_is_root_bus(pdev->bus))
+ -				return 0;
+ -			if (pdev->class >> 8 == PCI_CLASS_BRIDGE_PCI)
+ -				return 0;
+ -		} else if (pci_pcie_type(pdev) == PCI_EXP_TYPE_PCI_BRIDGE)
+ +	/*
+ +	 * We want to start off with all devices in the 1:1 domain, and
+ +	 * take them out later if we find they can't access all of memory.
+ +	 *
+ +	 * However, we can't do this for PCI devices behind bridges,
+ +	 * because all PCI devices behind the same bridge will end up
+ +	 * with the same source-id on their transactions.
+ +	 *
+ +	 * Practically speaking, we can't change things around for these
+ +	 * devices at run-time, because we can't be sure there'll be no
+ +	 * DMA transactions in flight for any of their siblings.
+ +	 * 
+ +	 * So PCI devices (unless they're on the root bus) as well as
+ +	 * their parent PCI-PCI or PCIe-PCI bridges must be left _out_ of
+ +	 * the 1:1 domain, just in _case_ one of their siblings turns out
+ +	 * not to be able to map all of memory.
+ +	 */
+ +	if (!pci_is_pcie(pdev)) {
+ +		if (!pci_is_root_bus(pdev->bus))
+  			return 0;
+ -	} else {
+ -		if (device_has_rmrr(dev))
+ +		if (pdev->class >> 8 == PCI_CLASS_BRIDGE_PCI)
+  			return 0;
+ -	}
+ +	} else if (pci_pcie_type(pdev) == PCI_EXP_TYPE_PCI_BRIDGE)
+ +		return 0;
+  
+ -	/*
+ +	/* 
+  	 * At boot time, we don't yet know if devices will be 64-bit capable.
+ -	 * Assume that they will — if they turn out not to be, then we can
+ +	 * Assume that they will -- if they turn out not to be, then we can 
+  	 * take them out of the 1:1 domain later.
+  	 */
+  	if (!startup) {
+@@@ -4109,12 -4241,17 +4151,22 @@@ static int intel_iommu_attach_device(st
+  				     struct device *dev)
+  {
+  	struct dmar_domain *dmar_domain = domain->priv;
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+  	struct intel_iommu *iommu;
+  	int addr_width;
+ -	u8 bus, devfn;
+  
+++<<<<<<< HEAD
+ +	/* normally pdev is not mapped */
+ +	if (unlikely(domain_context_mapped(pdev))) {
+++=======
++ 	if (device_is_rmrr_locked(dev)) {
++ 		dev_warn(dev, "Device is ineligible for IOMMU domain attach due to platform RMRR requirement.  Contact your platform vendor.\n");
++ 		return -EPERM;
++ 	}
++ 
++ 	/* normally dev is not mapped */
++ 	if (unlikely(domain_context_mapped(dev))) {
+++>>>>>>> c875d2c1b808 (iommu/vt-d: Exclude devices using RMRRs from IOMMU API domains)
+  		struct dmar_domain *old_domain;
+  
+  		old_domain = find_domain(dev);
+* Unmerged path drivers/iommu/intel-iommu.c
