@@ -1,0 +1,205 @@
+perf hists: Resort after filtering hierarchy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 70642850fa581df219d7bc03cd7aca6e1956968c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/70642850.failed
+
+In hierarchy mode, a filter can affect periods of entries in upper
+hierarchy.  So it needs to resort the hists after filter.
+
+For example, let's look at following example:
+
+ Overhead      Command / Shared Object / Symbol
+ ------------  --------------------------------
+ 30.00%        perf
+    20.00%        perf
+       10.00%        main
+        5.00%        pr_debug
+        5.00%        memcpy
+    10.00%        [kernel.vmlinux]
+        8.00%        memset
+        2.00%        cpu_idle
+
+If we apply simbol filter for 'mem' it should look like this
+
+ 13.00%        perf
+     8.00%        [kernel.vmlinux]
+        8.00%        memset
+     5.00%        perf
+        5.00%        memcpy
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1456326830-30456-8-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 70642850fa581df219d7bc03cd7aca6e1956968c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/hist.c
+diff --cc tools/perf/util/hist.c
+index e1380b8f8200,a44bf5ae6acb..000000000000
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@@ -1428,6 -1666,148 +1428,151 @@@ void hists__filter_by_symbol(struct his
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void resort_filtered_entry(struct rb_root *root, struct hist_entry *he)
++ {
++ 	struct rb_node **p = &root->rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct hist_entry *iter;
++ 	struct rb_root new_root = RB_ROOT;
++ 	struct rb_node *nd;
++ 
++ 	while (*p != NULL) {
++ 		parent = *p;
++ 		iter = rb_entry(parent, struct hist_entry, rb_node);
++ 
++ 		if (hist_entry__sort(he, iter) > 0)
++ 			p = &(*p)->rb_left;
++ 		else
++ 			p = &(*p)->rb_right;
++ 	}
++ 
++ 	rb_link_node(&he->rb_node, parent, p);
++ 	rb_insert_color(&he->rb_node, root);
++ 
++ 	if (he->leaf || he->filtered)
++ 		return;
++ 
++ 	nd = rb_first(&he->hroot_out);
++ 	while (nd) {
++ 		struct hist_entry *h = rb_entry(nd, struct hist_entry, rb_node);
++ 
++ 		nd = rb_next(nd);
++ 		rb_erase(&h->rb_node, &he->hroot_out);
++ 
++ 		resort_filtered_entry(&new_root, h);
++ 	}
++ 
++ 	he->hroot_out = new_root;
++ }
++ 
++ static void hists__filter_hierarchy(struct hists *hists, int type, const void *arg)
++ {
++ 	struct rb_node *nd;
++ 	struct rb_root new_root = RB_ROOT;
++ 
++ 	hists->stats.nr_non_filtered_samples = 0;
++ 
++ 	hists__reset_filter_stats(hists);
++ 	hists__reset_col_len(hists);
++ 
++ 	nd = rb_first(&hists->entries);
++ 	while (nd) {
++ 		struct hist_entry *h = rb_entry(nd, struct hist_entry, rb_node);
++ 		int ret;
++ 
++ 		ret = hist_entry__filter(h, type, arg);
++ 
++ 		/*
++ 		 * case 1. non-matching type
++ 		 * zero out the period, set filter marker and move to child
++ 		 */
++ 		if (ret < 0) {
++ 			memset(&h->stat, 0, sizeof(h->stat));
++ 			h->filtered |= (1 << type);
++ 
++ 			nd = __rb_hierarchy_next(&h->rb_node, HMD_FORCE_CHILD);
++ 		}
++ 		/*
++ 		 * case 2. matched type (filter out)
++ 		 * set filter marker and move to next
++ 		 */
++ 		else if (ret == 1) {
++ 			h->filtered |= (1 << type);
++ 
++ 			nd = __rb_hierarchy_next(&h->rb_node, HMD_FORCE_SIBLING);
++ 		}
++ 		/*
++ 		 * case 3. ok (not filtered)
++ 		 * add period to hists and parents, erase the filter marker
++ 		 * and move to next sibling
++ 		 */
++ 		else {
++ 			hists__remove_entry_filter(hists, h, type);
++ 
++ 			nd = __rb_hierarchy_next(&h->rb_node, HMD_FORCE_SIBLING);
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * resort output after applying a new filter since filter in a lower
++ 	 * hierarchy can change periods in a upper hierarchy.
++ 	 */
++ 	nd = rb_first(&hists->entries);
++ 	while (nd) {
++ 		struct hist_entry *h = rb_entry(nd, struct hist_entry, rb_node);
++ 
++ 		nd = rb_next(nd);
++ 		rb_erase(&h->rb_node, &hists->entries);
++ 
++ 		resort_filtered_entry(&new_root, h);
++ 	}
++ 
++ 	hists->entries = new_root;
++ }
++ 
++ void hists__filter_by_thread(struct hists *hists)
++ {
++ 	if (symbol_conf.report_hierarchy)
++ 		hists__filter_hierarchy(hists, HIST_FILTER__THREAD,
++ 					hists->thread_filter);
++ 	else
++ 		hists__filter_by_type(hists, HIST_FILTER__THREAD,
++ 				      hists__filter_entry_by_thread);
++ }
++ 
++ void hists__filter_by_dso(struct hists *hists)
++ {
++ 	if (symbol_conf.report_hierarchy)
++ 		hists__filter_hierarchy(hists, HIST_FILTER__DSO,
++ 					hists->dso_filter);
++ 	else
++ 		hists__filter_by_type(hists, HIST_FILTER__DSO,
++ 				      hists__filter_entry_by_dso);
++ }
++ 
++ void hists__filter_by_symbol(struct hists *hists)
++ {
++ 	if (symbol_conf.report_hierarchy)
++ 		hists__filter_hierarchy(hists, HIST_FILTER__SYMBOL,
++ 					hists->symbol_filter_str);
++ 	else
++ 		hists__filter_by_type(hists, HIST_FILTER__SYMBOL,
++ 				      hists__filter_entry_by_symbol);
++ }
++ 
++ void hists__filter_by_socket(struct hists *hists)
++ {
++ 	if (symbol_conf.report_hierarchy)
++ 		hists__filter_hierarchy(hists, HIST_FILTER__SOCKET,
++ 					&hists->socket_filter);
++ 	else
++ 		hists__filter_by_type(hists, HIST_FILTER__SOCKET,
++ 				      hists__filter_entry_by_socket);
++ }
++ 
+++>>>>>>> 70642850fa58 (perf hists: Resort after filtering hierarchy)
+  void events_stats__inc(struct events_stats *stats, u32 type)
+  {
+  	++stats->nr_events[0];
+* Unmerged path tools/perf/util/hist.c
