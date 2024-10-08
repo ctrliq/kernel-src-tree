@@ -122,7 +122,6 @@ struct rt6_info {
 	u32				rt6i_metric;
 
 	struct inet6_dev		*rt6i_idev;
-	unsigned long			_rt6i_peer;
 
 	/* RHEL specific:
 	 * this field is not used any more since commit
@@ -135,36 +134,6 @@ struct rt6_info {
 
 	u8				rt6i_protocol;
 };
-
-static inline struct inet_peer *rt6_peer_ptr(struct rt6_info *rt)
-{
-	return inetpeer_ptr(rt->_rt6i_peer);
-}
-
-static inline bool rt6_has_peer(struct rt6_info *rt)
-{
-	return inetpeer_ptr_is_peer(rt->_rt6i_peer);
-}
-
-static inline void __rt6_set_peer(struct rt6_info *rt, struct inet_peer *peer)
-{
-	__inetpeer_ptr_set_peer(&rt->_rt6i_peer, peer);
-}
-
-static inline bool rt6_set_peer(struct rt6_info *rt, struct inet_peer *peer)
-{
-	return inetpeer_ptr_set_peer(&rt->_rt6i_peer, peer);
-}
-
-static inline void rt6_init_peer(struct rt6_info *rt, struct inet_peer_base *base)
-{
-	inetpeer_init_ptr(&rt->_rt6i_peer, base);
-}
-
-static inline void rt6_transfer_peer(struct rt6_info *rt, struct rt6_info *ort)
-{
-	inetpeer_transfer_peer(&rt->_rt6i_peer, &ort->_rt6i_peer);
-}
 
 static inline struct inet6_dev *ip6_dst_idev(struct dst_entry *dst)
 {
