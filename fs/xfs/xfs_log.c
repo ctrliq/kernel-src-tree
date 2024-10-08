@@ -1397,6 +1397,8 @@ xlog_alloc_log(
 	ASSERT(xfs_buf_islocked(bp));
 	xfs_buf_unlock(bp);
 
+	/* use high priority wq for log I/O completion */
+	bp->b_ioend_wq = mp->m_log_workqueue;
 	bp->b_iodone = xlog_iodone;
 	log->l_xbuf = bp;
 
@@ -1429,6 +1431,8 @@ xlog_alloc_log(
 		ASSERT(xfs_buf_islocked(bp));
 		xfs_buf_unlock(bp);
 
+		/* use high priority wq for log I/O completion */
+		bp->b_ioend_wq = mp->m_log_workqueue;
 		bp->b_iodone = xlog_iodone;
 		iclog->ic_bp = bp;
 		iclog->ic_data = bp->b_addr;
