@@ -1,0 +1,186 @@
+Drivers: hv: vmbus: Improve the CPU affiliation for channels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hv] vmbus: Improve the CPU affiliation for channels (Vitaly Kuznetsov) [1321073]
+Rebuild_FUZZ: 87.85%
+commit-author K. Y. Srinivasan <kys@microsoft.com>
+commit 9f01ec53458d9e9b68f1c555e773b5d1a1f66e94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9f01ec53.failed
+
+The current code tracks the assigned CPUs within a NUMA node in the context of
+the primary channel. So, if we have a VM with a single NUMA node with 8 VCPUs, we may
+end up unevenly distributing the channel load. Fix the issue by tracking affiliations
+globally.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9f01ec53458d9e9b68f1c555e773b5d1a1f66e94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel_mgmt.c
+#	drivers/hv/hv.c
+#	drivers/hv/hyperv_vmbus.h
+#	include/linux/hyperv.h
+diff --cc drivers/hv/channel_mgmt.c
+index 19b6510e7e18,39c5afc7970c..000000000000
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@@ -388,7 -389,10 +388,14 @@@ static void init_vp_index(struct vmbus_
+  	u32 cur_cpu;
+  	int i;
+  	bool perf_chn = false;
+++<<<<<<< HEAD
+ +	u32 max_cpus = num_online_cpus();
+++=======
++ 	struct vmbus_channel *primary = channel->primary_channel;
++ 	int next_node;
++ 	struct cpumask available_mask;
++ 	struct cpumask *alloced_mask;
+++>>>>>>> 9f01ec53458d (Drivers: hv: vmbus: Improve the CPU affiliation for channels)
+  
+  	for (i = IDE; i < MAX_PERF_CHN; i++) {
+  		if (!memcmp(type_guid->b, hp_devs[i].guid,
+@@@ -405,11 -409,48 +412,55 @@@
+  		 * Also if the channel is not a performance critical
+  		 * channel, bind it to cpu 0.
+  		 */
+++<<<<<<< HEAD
+++=======
++ 		channel->numa_node = 0;
+++>>>>>>> 9f01ec53458d (Drivers: hv: vmbus: Improve the CPU affiliation for channels)
+  		channel->target_cpu = 0;
+  		channel->target_vp = hv_context.vp_index[0];
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	cur_cpu = (++next_vp % max_cpus);
+++=======
++ 
++ 	/*
++ 	 * We distribute primary channels evenly across all the available
++ 	 * NUMA nodes and within the assigned NUMA node we will assign the
++ 	 * first available CPU to the primary channel.
++ 	 * The sub-channels will be assigned to the CPUs available in the
++ 	 * NUMA node evenly.
++ 	 */
++ 	if (!primary) {
++ 		while (true) {
++ 			next_node = next_numa_node_id++;
++ 			if (next_node == nr_node_ids)
++ 				next_node = next_numa_node_id = 0;
++ 			if (cpumask_empty(cpumask_of_node(next_node)))
++ 				continue;
++ 			break;
++ 		}
++ 		channel->numa_node = next_node;
++ 		primary = channel;
++ 	}
++ 	alloced_mask = &hv_context.hv_numa_map[primary->numa_node];
++ 
++ 	if (cpumask_weight(alloced_mask) ==
++ 	    cpumask_weight(cpumask_of_node(primary->numa_node))) {
++ 		/*
++ 		 * We have cycled through all the CPUs in the node;
++ 		 * reset the alloced map.
++ 		 */
++ 		cpumask_clear(alloced_mask);
++ 	}
++ 
++ 	cpumask_xor(&available_mask, alloced_mask,
++ 		    cpumask_of_node(primary->numa_node));
++ 
++ 	cur_cpu = cpumask_next(-1, &available_mask);
++ 	cpumask_set_cpu(cur_cpu, alloced_mask);
++ 
+++>>>>>>> 9f01ec53458d (Drivers: hv: vmbus: Improve the CPU affiliation for channels)
+  	channel->target_cpu = cur_cpu;
+  	channel->target_vp = hv_context.vp_index[cur_cpu];
+  }
+diff --cc drivers/hv/hv.c
+index ecc62fc8d7b1,fd93cfde96d0..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -348,8 -329,16 +348,15 @@@ u16 hv_signal_event(void *con_id
+  int hv_synic_alloc(void)
+  {
+  	size_t size = sizeof(struct tasklet_struct);
+ -	size_t ced_size = sizeof(struct clock_event_device);
+  	int cpu;
+  
++ 	hv_context.hv_numa_map = kzalloc(sizeof(struct cpumask) * nr_node_ids,
++ 					 GFP_ATOMIC);
++ 	if (hv_context.hv_numa_map == NULL) {
++ 		pr_err("Unable to allocate NUMA map\n");
++ 		goto err;
++ 	}
++ 
+  	for_each_online_cpu(cpu) {
+  		hv_context.event_dpc[cpu] = kmalloc(size, GFP_ATOMIC);
+  		if (hv_context.event_dpc[cpu] == NULL) {
+@@@ -358,6 -347,14 +365,17 @@@
+  		}
+  		tasklet_init(hv_context.event_dpc[cpu], vmbus_on_event, cpu);
+  
+++<<<<<<< HEAD
+++=======
++ 		hv_context.clk_evt[cpu] = kzalloc(ced_size, GFP_ATOMIC);
++ 		if (hv_context.clk_evt[cpu] == NULL) {
++ 			pr_err("Unable to allocate clock event device\n");
++ 			goto err;
++ 		}
++ 
++ 		hv_init_clockevent_device(hv_context.clk_evt[cpu], cpu);
++ 
+++>>>>>>> 9f01ec53458d (Drivers: hv: vmbus: Improve the CPU affiliation for channels)
+  		hv_context.synic_message_page[cpu] =
+  			(void *)get_zeroed_page(GFP_ATOMIC);
+  
+diff --cc drivers/hv/hyperv_vmbus.h
+index c18b50fea4bb,6f258255ac94..000000000000
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@@ -531,6 -547,15 +531,18 @@@ struct hv_context 
+  	 * buffer to post messages to the host.
+  	 */
+  	void *post_msg_page[NR_CPUS];
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Support PV clockevent device.
++ 	 */
++ 	struct clock_event_device *clk_evt[NR_CPUS];
++ 	/*
++ 	 * To manage allocations in a NUMA node.
++ 	 * Array indexed by numa node ID.
++ 	 */
++ 	struct cpumask *hv_numa_map;
+++>>>>>>> 9f01ec53458d (Drivers: hv: vmbus: Improve the CPU affiliation for channels)
+  };
+  
+  extern struct hv_context hv_context;
+diff --cc include/linux/hyperv.h
+index 5538109db318,5a3df5a47c8f..000000000000
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@@ -695,6 -697,10 +695,13 @@@ struct vmbus_channel 
+  	/* The corresponding CPUID in the guest */
+  	u32 target_cpu;
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * State to manage the CPU affiliation of channels.
++ 	 */
++ 	int numa_node;
++ 	/*
+++>>>>>>> 9f01ec53458d (Drivers: hv: vmbus: Improve the CPU affiliation for channels)
+  	 * Support for sub-channels. For high performance devices,
+  	 * it will be useful to have multiple sub-channels to support
+  	 * a scalable communication infrastructure with the host.
+* Unmerged path drivers/hv/channel_mgmt.c
+* Unmerged path drivers/hv/hv.c
+* Unmerged path drivers/hv/hyperv_vmbus.h
+* Unmerged path include/linux/hyperv.h
