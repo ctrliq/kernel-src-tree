@@ -612,6 +612,7 @@ static void xprt_autoclose(struct work_struct *work)
 	xprt->ops->close(xprt);
 	clear_bit(XPRT_CLOSE_WAIT, &xprt->state);
 	xprt_release_write(xprt, NULL);
+	wake_up_bit(&xprt->state, XPRT_LOCKED);
 }
 
 /**
@@ -722,6 +723,7 @@ void xprt_unlock_connect(struct rpc_xprt *xprt, void *cookie)
 	xprt->ops->release_xprt(xprt, NULL);
 out:
 	spin_unlock_bh(&xprt->transport_lock);
+	wake_up_bit(&xprt->state, XPRT_LOCKED);
 }
 
 /**
@@ -1388,6 +1390,10 @@ out:
 static void xprt_destroy(struct rpc_xprt *xprt)
 {
 	dprintk("RPC:       destroying transport %p\n", xprt);
+
+	/* Exclude transport connect/disconnect handlers */
+	wait_on_bit_lock(&xprt->state, XPRT_LOCKED, TASK_UNINTERRUPTIBLE);
+
 	del_timer_sync(&xprt->timer);
 
 	rpc_xprt_debugfs_unregister(xprt);
