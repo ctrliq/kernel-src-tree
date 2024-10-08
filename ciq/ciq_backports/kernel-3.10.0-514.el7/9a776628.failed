@@ -1,0 +1,104 @@
+netfilter: Use rhashtable walk iterator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 9a7766288274ef765245ed65e6176a2727b96706
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9a776628.failed
+
+This patch gets rid of the manual rhashtable walk in nft_hash
+which touches rhashtable internals that should not be exposed.
+It does so by using the rhashtable iterator primitives.
+
+Note that I'm leaving nft_hash_destroy alone since it's only
+invoked on shutdown and it shouldn't be affected by changes
+to rhashtable internals (or at least not what I'm planning to
+change).
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9a7766288274ef765245ed65e6176a2727b96706)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_hash.c
+diff --cc net/netfilter/nft_hash.c
+index f14a5e14123a,61e6c407476a..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -129,32 -129,51 +129,56 @@@ static int nft_hash_get(const struct nf
+  static void nft_hash_walk(const struct nft_ctx *ctx, const struct nft_set *set,
+  			  struct nft_set_iter *iter)
+  {
+++<<<<<<< HEAD
+ +	const struct rhashtable *priv = nft_set_priv(set);
+ +	const struct bucket_table *tbl;
+++=======
++ 	struct rhashtable *priv = nft_set_priv(set);
+++>>>>>>> 9a7766288274 (netfilter: Use rhashtable walk iterator)
+  	const struct nft_hash_elem *he;
++ 	struct rhashtable_iter hti;
+  	struct nft_set_elem elem;
+- 	unsigned int i;
++ 	int err;
++ 
++ 	err = rhashtable_walk_init(priv, &hti);
++ 	iter->err = err;
++ 	if (err)
++ 		return;
++ 
++ 	err = rhashtable_walk_start(&hti);
++ 	if (err && err != -EAGAIN) {
++ 		iter->err = err;
++ 		goto out;
++ 	}
+  
+- 	tbl = rht_dereference_rcu(priv->tbl, priv);
+- 	for (i = 0; i < tbl->size; i++) {
+- 		struct rhash_head *pos;
++ 	while ((he = rhashtable_walk_next(&hti))) {
++ 		if (IS_ERR(he)) {
++ 			err = PTR_ERR(he);
++ 			if (err != -EAGAIN) {
++ 				iter->err = err;
++ 				goto out;
++ 			}
++ 		}
++ 
++ 		if (iter->count < iter->skip)
++ 			goto cont;
+  
+- 		rht_for_each_entry_rcu(he, pos, tbl, i, node) {
+- 			if (iter->count < iter->skip)
+- 				goto cont;
++ 		memcpy(&elem.key, &he->key, sizeof(elem.key));
++ 		if (set->flags & NFT_SET_MAP)
++ 			memcpy(&elem.data, he->data, sizeof(elem.data));
++ 		elem.flags = 0;
+  
+- 			memcpy(&elem.key, &he->key, sizeof(elem.key));
+- 			if (set->flags & NFT_SET_MAP)
+- 				memcpy(&elem.data, he->data, sizeof(elem.data));
+- 			elem.flags = 0;
++ 		iter->err = iter->fn(ctx, set, iter, &elem);
++ 		if (iter->err < 0)
++ 			goto out;
+  
+- 			iter->err = iter->fn(ctx, set, iter, &elem);
+- 			if (iter->err < 0)
+- 				return;
+  cont:
+- 			iter->count++;
+- 		}
++ 		iter->count++;
+  	}
++ 
++ out:
++ 	rhashtable_walk_stop(&hti);
++ 	rhashtable_walk_exit(&hti);
+  }
+  
+  static unsigned int nft_hash_privsize(const struct nlattr * const nla[])
+* Unmerged path net/netfilter/nft_hash.c
