@@ -1,0 +1,253 @@
+IB/hfi1: Specify mm when releasing pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit bd3a8947de916534722b0861d865d3a809c0743c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bd3a8947.failed
+
+This change adds a pointer to the process mm_struct when
+calling hfi1_release_user_pages().
+
+Previously, the function used the mm_struct of the current
+process to adjust the number of pinned pages. However, is some
+cases, namely when unpinning pages due to a MMU notifier call,
+we want to drop into that code block as it will cause a deadlock
+(the MMU notifiers take the process' mmap_sem prior to calling
+the callbacks).
+
+By allowing to caller to specify the pointer to the mm_struct,
+the caller has finer control over that part of hfi1_release_user_pages().
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit bd3a8947de916534722b0861d865d3a809c0743c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/user_sdma.c
+#	drivers/staging/rdma/hfi1/user_exp_rcv.c
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 6967deb7956a,bf55a41d151a..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -278,7 -277,7 +278,11 @@@ static inline void pq_update(struct hfi
+  static void user_sdma_free_request(struct user_sdma_request *, bool);
+  static int pin_vector_pages(struct user_sdma_request *,
+  			    struct user_sdma_iovec *);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +static void unpin_vector_pages(struct user_sdma_iovec *);
+++=======
++ static void unpin_vector_pages(struct mm_struct *, struct page **, unsigned);
+++>>>>>>> bd3a8947de91 (IB/hfi1: Specify mm when releasing pages):drivers/staging/rdma/hfi1/user_sdma.c
+  static int check_header_template(struct user_sdma_request *,
+  				 struct hfi1_pkt_header *, u32, u32);
+  static int set_txreq_header(struct user_sdma_request *,
+@@@ -1038,38 -1029,79 +1042,77 @@@ static inline int num_user_pages(const 
+  
+  static int pin_vector_pages(struct user_sdma_request *req,
+  			    struct user_sdma_iovec *iovec) {
+ -	int ret = 0, pinned, npages;
+ -	struct page **pages;
+ -	struct hfi1_user_sdma_pkt_q *pq = req->pq;
+ -	struct sdma_mmu_node *node = NULL;
+ -	struct mmu_rb_node *rb_node;
+ -
+ -	rb_node = hfi1_mmu_rb_search(&pq->sdma_rb_root,
+ -				     (unsigned long)iovec->iov.iov_base,
+ -				     iovec->iov.iov_len);
+ -	if (rb_node)
+ -		node = container_of(rb_node, struct sdma_mmu_node, rb);
+ -
+ -	if (!node) {
+ -		node = kzalloc(sizeof(*node), GFP_KERNEL);
+ -		if (!node)
+ -			return -ENOMEM;
+ -
+ -		node->rb.addr = (unsigned long)iovec->iov.iov_base;
+ -		node->rb.len = iovec->iov.iov_len;
+ -		atomic_set(&node->refcount, 0);
+ -	}
+ +	int pinned, npages;
+  
+  	npages = num_user_pages(&iovec->iov);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +	iovec->pages = kcalloc(npages, sizeof(*iovec->pages), GFP_KERNEL);
+ +	if (!iovec->pages) {
+ +		SDMA_DBG(req, "Failed page array alloc");
+ +		return -ENOMEM;
+++=======
++ 	if (node->npages < npages) {
++ 		pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
++ 		if (!pages) {
++ 			SDMA_DBG(req, "Failed page array alloc");
++ 			ret = -ENOMEM;
++ 			goto bail;
++ 		}
++ 		memcpy(pages, node->pages, node->npages * sizeof(*pages));
++ 
++ 		npages -= node->npages;
++ 		pinned = hfi1_acquire_user_pages(
++ 			((unsigned long)iovec->iov.iov_base +
++ 			 (node->npages * PAGE_SIZE)), npages, 0,
++ 			pages + node->npages);
++ 		if (pinned < 0) {
++ 			kfree(pages);
++ 			ret = pinned;
++ 			goto bail;
++ 		}
++ 		if (pinned != npages) {
++ 			unpin_vector_pages(current->mm, pages, pinned);
++ 			ret = -EFAULT;
++ 			goto bail;
++ 		}
++ 		kfree(node->pages);
++ 		node->pages = pages;
++ 		node->npages += pinned;
++ 		npages = node->npages;
+++>>>>>>> bd3a8947de91 (IB/hfi1: Specify mm when releasing pages):drivers/staging/rdma/hfi1/user_sdma.c
+  	}
+ -	iovec->pages = node->pages;
+ -	iovec->npages = npages;
+  
+ -	if (!rb_node) {
+ -		if (hfi1_mmu_rb_insert(&req->pq->sdma_rb_root, &node->rb))
+ -			goto bail;
+ -	} else {
+ -		atomic_inc(&node->refcount);
+ +	pinned = hfi1_acquire_user_pages((unsigned long)iovec->iov.iov_base,
+ +					 npages, 0, iovec->pages);
+ +
+ +	if (pinned < 0)
+ +		return pinned;
+ +
+ +	iovec->npages = pinned;
+ +	if (pinned != npages) {
+ +		SDMA_DBG(req, "Failed to pin pages (%d/%u)", pinned, npages);
+ +		unpin_vector_pages(iovec);
+ +		return -EFAULT;
+  	}
+  	return 0;
+ -bail:
+ -	if (!rb_node)
+ -		kfree(node);
+ -	return ret;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +static void unpin_vector_pages(struct user_sdma_iovec *iovec)
+ +{
+ +	hfi1_release_user_pages(iovec->pages, iovec->npages, 0);
+ +
+ +	kfree(iovec->pages);
+ +	iovec->pages = NULL;
+ +	iovec->npages = 0;
+ +	iovec->offset = 0;
+++=======
++ static void unpin_vector_pages(struct mm_struct *mm, struct page **pages,
++ 			       unsigned npages)
++ {
++ 	hfi1_release_user_pages(mm, pages, npages, 0);
++ 	kfree(pages);
+++>>>>>>> bd3a8947de91 (IB/hfi1: Specify mm when releasing pages):drivers/staging/rdma/hfi1/user_sdma.c
+  }
+  
+  static int check_header_template(struct user_sdma_request *req,
+@@@ -1451,3 -1481,45 +1494,48 @@@ static inline void set_comp_state(struc
+  	trace_hfi1_sdma_user_completion(pq->dd, pq->ctxt, pq->subctxt,
+  					idx, state, ret);
+  }
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 
++ static bool sdma_rb_filter(struct mmu_rb_node *node, unsigned long addr,
++ 			   unsigned long len)
++ {
++ 	return (bool)(node->addr == addr);
++ }
++ 
++ static int sdma_rb_insert(struct rb_root *root, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	atomic_inc(&node->refcount);
++ 	return 0;
++ }
++ 
++ static void sdma_rb_remove(struct rb_root *root, struct mmu_rb_node *mnode,
++ 			   bool notifier)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	unpin_vector_pages(notifier ? NULL : current->mm, node->pages,
++ 			   node->npages);
++ 	/*
++ 	 * If called by the MMU notifier, we have to adjust the pinned
++ 	 * page count ourselves.
++ 	 */
++ 	if (notifier)
++ 		current->mm->pinned_vm -= node->npages;
++ 	kfree(node);
++ }
++ 
++ static int sdma_rb_invalidate(struct rb_root *root, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	if (!atomic_read(&node->refcount))
++ 		return 1;
++ 	return 0;
++ }
+++>>>>>>> bd3a8947de91 (IB/hfi1: Specify mm when releasing pages):drivers/staging/rdma/hfi1/user_sdma.c
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index 6438dccf5749..32f21ae008b7 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -1631,7 +1631,7 @@ void shutdown_led_override(struct hfi1_pportdata *ppd);
+ #define DEFAULT_RCVHDR_ENTSIZE 32
+ 
+ int hfi1_acquire_user_pages(unsigned long, size_t, bool, struct page **);
+-void hfi1_release_user_pages(struct page **, size_t, bool);
++void hfi1_release_user_pages(struct mm_struct *, struct page **, size_t, bool);
+ 
+ static inline void clear_rcvhdrtail(const struct hfi1_ctxtdata *rcd)
+ {
+diff --git a/drivers/staging/hfi1/user_pages.c b/drivers/staging/hfi1/user_pages.c
+index 692de658f0dc..1d378a979525 100644
+--- a/drivers/staging/hfi1/user_pages.c
++++ b/drivers/staging/hfi1/user_pages.c
+@@ -93,7 +93,8 @@ int hfi1_acquire_user_pages(unsigned long vaddr, size_t npages, bool writable,
+ 	return ret;
+ }
+ 
+-void hfi1_release_user_pages(struct page **p, size_t npages, bool dirty)
++void hfi1_release_user_pages(struct mm_struct *mm, struct page **p,
++			     size_t npages, bool dirty)
+ {
+ 	size_t i;
+ 
+@@ -103,9 +104,9 @@ void hfi1_release_user_pages(struct page **p, size_t npages, bool dirty)
+ 		put_page(p[i]);
+ 	}
+ 
+-	if (current->mm) { /* during close after signal, mm can be NULL */
+-		down_write(&current->mm->mmap_sem);
+-		current->mm->pinned_vm -= npages;
+-		up_write(&current->mm->mmap_sem);
++	if (mm) { /* during close after signal, mm can be NULL */
++		down_write(&mm->mmap_sem);
++		mm->pinned_vm -= npages;
++		up_write(&mm->mmap_sem);
+ 	}
+ }
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
