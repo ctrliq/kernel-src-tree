@@ -1,0 +1,184 @@
+blk-mq: request initialization optimizations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 4b570521be54666e6ad7e5f47af92fd609fbd8b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4b570521.failed
+
+We currently clear a lot more than we need to, so make that a bit
+more clever. Make some of the init dependent on features, like
+only setting start_time if we are going to use it.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 4b570521be54666e6ad7e5f47af92fd609fbd8b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 210626be5c6c,6160128085fc..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -192,10 -194,40 +192,43 @@@ static void blk_mq_rq_ctx_init(struct r
+  	if (blk_queue_io_stat(q))
+  		rw_flags |= REQ_IO_STAT;
+  
+ -	INIT_LIST_HEAD(&rq->queuelist);
+ -	/* csd/requeue_work/fifo_time is initialized before use */
+ -	rq->q = q;
+  	rq->mq_ctx = ctx;
+++<<<<<<< HEAD
+ +	rq->cmd_flags = rw_flags;
+ +	rq->start_time = jiffies;
+ +	set_start_time_ns(rq);
+++=======
++ 	rq->cmd_flags |= rw_flags;
++ 	/* do not touch atomic flags, it needs atomic ops against the timer */
++ 	rq->cpu = -1;
++ 	INIT_HLIST_NODE(&rq->hash);
++ 	RB_CLEAR_NODE(&rq->rb_node);
++ 	rq->rq_disk = NULL;
++ 	rq->part = NULL;
++ #ifdef CONFIG_BLK_CGROUP
++ 	rq->rl = NULL;
++ 	set_start_time_ns(rq);
++ 	rq->io_start_time_ns = 0;
++ #endif
++ 	rq->nr_phys_segments = 0;
++ #if defined(CONFIG_BLK_DEV_INTEGRITY)
++ 	rq->nr_integrity_segments = 0;
++ #endif
++ 	rq->special = NULL;
++ 	/* tag was already set */
++ 	rq->errors = 0;
++ 
++ 	rq->extra_len = 0;
++ 	rq->sense_len = 0;
++ 	rq->resid_len = 0;
++ 	rq->sense = NULL;
++ 
++ 	INIT_LIST_HEAD(&rq->timeout_list);
++ 	rq->end_io = NULL;
++ 	rq->end_io_data = NULL;
++ 	rq->next_rq = NULL;
++ 
+++>>>>>>> 4b570521be54 (blk-mq: request initialization optimizations)
+  	ctx->rq_dispatched[rw_is_sync(rw_flags)]++;
+  }
+  
+@@@ -374,10 -421,24 +407,17 @@@ static void blk_mq_start_request(struc
+  	/*
+  	 * Just mark start time and set the started bit. Due to memory
+  	 * ordering, we know we'll see the correct deadline as long as
+ -	 * REQ_ATOMIC_STARTED is seen. Use the default queue timeout,
+ -	 * unless one has been set in the request.
+ -	 */
+ -	if (!rq->timeout)
+ -		rq->deadline = jiffies + q->rq_timeout;
+ -	else
+ -		rq->deadline = jiffies + rq->timeout;
+ -
+ -	/*
+ -	 * Mark us as started and clear complete. Complete might have been
+ -	 * set if requeue raced with timeout, which then marked it as
+ -	 * complete. So be sure to clear complete again when we start
+ -	 * the request, otherwise we'll ignore the completion event.
+ +	 * REQ_ATOMIC_STARTED is seen.
+  	 */
+++<<<<<<< HEAD
+ +	rq->deadline = jiffies + q->rq_timeout;
+ +	set_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+++=======
++ 	if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
++ 		set_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
++ 	if (test_bit(REQ_ATOM_COMPLETE, &rq->atomic_flags))
++ 		clear_bit(REQ_ATOM_COMPLETE, &rq->atomic_flags);
+++>>>>>>> 4b570521be54 (blk-mq: request initialization optimizations)
+  
+  	if (q->dma_drain_size && blk_rq_bytes(rq)) {
+  		/*
+@@@ -861,39 -1100,56 +901,43 @@@ void blk_mq_flush_plug_list(struct blk_
+  static void blk_mq_bio_to_request(struct request *rq, struct bio *bio)
+  {
+  	init_request_from_bio(rq, bio);
+- 	blk_account_io_start(rq, 1);
++ 
++ 	if (blk_do_io_stat(rq)) {
++ 		rq->start_time = jiffies;
++ 		blk_account_io_start(rq, 1);
++ 	}
+  }
+  
+ -static inline bool blk_mq_merge_queue_io(struct blk_mq_hw_ctx *hctx,
+ -					 struct blk_mq_ctx *ctx,
+ -					 struct request *rq, struct bio *bio)
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct request_queue *q = hctx->queue;
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_ctx *ctx;
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	int rw = bio_data_dir(bio);
+ +	struct request *rq;
+ +	unsigned int use_plug, request_count = 0;
+  
+ -	if (!(hctx->flags & BLK_MQ_F_SHOULD_MERGE)) {
+ -		blk_mq_bio_to_request(rq, bio);
+ -		spin_lock(&ctx->lock);
+ -insert_rq:
+ -		__blk_mq_insert_request(hctx, rq, false);
+ -		spin_unlock(&ctx->lock);
+ -		return false;
+ -	} else {
+ -		spin_lock(&ctx->lock);
+ -		if (!blk_mq_attempt_merge(q, ctx, bio)) {
+ -			blk_mq_bio_to_request(rq, bio);
+ -			goto insert_rq;
+ -		}
+ +	/*
+ +	 * If we have multiple hardware queues, just go directly to
+ +	 * one of those for sync IO.
+ +	 */
+ +	use_plug = !is_flush_fua && ((q->nr_hw_queues == 1) || !is_sync);
+  
+ -		spin_unlock(&ctx->lock);
+ -		__blk_mq_free_request(hctx, ctx, rq);
+ -		return true;
+ -	}
+ -}
+ +	blk_queue_bounce(q, &bio);
+  
+ -struct blk_map_ctx {
+ -	struct blk_mq_hw_ctx *hctx;
+ -	struct blk_mq_ctx *ctx;
+ -};
+ +	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ +		bio_endio(bio, -EIO);
+ +		return;
+ +	}
+  
+ -static struct request *blk_mq_map_request(struct request_queue *q,
+ -					  struct bio *bio,
+ -					  struct blk_map_ctx *data)
+ -{
+ -	struct blk_mq_hw_ctx *hctx;
+ -	struct blk_mq_ctx *ctx;
+ -	struct request *rq;
+ -	int rw = bio_data_dir(bio);
+ +	if (use_plug && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count))
+ +		return;
+  
+ -	if (unlikely(blk_mq_queue_enter(q))) {
+ +	if (blk_mq_queue_enter(q)) {
+  		bio_endio(bio, -EIO);
+ -		return NULL;
+ +		return;
+  	}
+  
+  	ctx = blk_mq_get_ctx(q);
+* Unmerged path block/blk-mq.c
