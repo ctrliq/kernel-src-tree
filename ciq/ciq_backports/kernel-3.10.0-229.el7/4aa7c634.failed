@@ -1,0 +1,150 @@
+vfs: add i_op->dentry_open()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Miklos Szeredi <mszeredi@suse.cz>
+commit 4aa7c6346be395bdf776f82bbb2e3e2bc60bdd2b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4aa7c634.failed
+
+Add a new inode operation i_op->dentry_open().  This is for stacked filesystems
+that want to return a struct file from a different filesystem.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+(cherry picked from commit 4aa7c6346be395bdf776f82bbb2e3e2bc60bdd2b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/Locking
+#	Documentation/filesystems/vfs.txt
+#	include/linux/fs.h
+diff --cc Documentation/filesystems/Locking
+index ad6a5a7a678c,b30753cbf431..000000000000
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@@ -64,6 -66,8 +64,11 @@@ prototypes
+  	int (*atomic_open)(struct inode *, struct dentry *,
+  				struct file *, unsigned open_flag,
+  				umode_t create_mode, int *opened);
+++<<<<<<< HEAD
+++=======
++ 	int (*tmpfile) (struct inode *, struct dentry *, umode_t);
++ 	int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+++>>>>>>> 4aa7c6346be3 (vfs: add i_op->dentry_open())
+  
+  locking rules:
+  	all may block
+@@@ -91,6 -96,8 +96,11 @@@ removexattr:	ye
+  fiemap:		no
+  update_time:	no
+  atomic_open:	yes
+++<<<<<<< HEAD
+++=======
++ tmpfile:	no
++ dentry_open:	no
+++>>>>>>> 4aa7c6346be3 (vfs: add i_op->dentry_open())
+  
+  	Additionally, ->rmdir(), ->unlink() and ->rename() have ->i_mutex on
+  victim.
+diff --cc Documentation/filesystems/vfs.txt
+index 17a310f1b313,20bf204426ca..000000000000
+--- a/Documentation/filesystems/vfs.txt
++++ b/Documentation/filesystems/vfs.txt
+@@@ -360,7 -362,9 +360,13 @@@ struct inode_operations 
+  	int (*removexattr) (struct dentry *, const char *);
+  	void (*update_time)(struct inode *, struct timespec *, int);
+  	int (*atomic_open)(struct inode *, struct dentry *, struct file *,
+++<<<<<<< HEAD
+ +	    		unsigned open_flag, umode_t create_mode, int *opened);
+++=======
++ 			unsigned open_flag, umode_t create_mode, int *opened);
++ 	int (*tmpfile) (struct inode *, struct dentry *, umode_t);
++ 	int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+++>>>>>>> 4aa7c6346be3 (vfs: add i_op->dentry_open())
+  };
+  
+  Again, all methods are called without any locks being held, unless
+diff --cc include/linux/fs.h
+index 8171b14c718b,5cf7f6759679..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1587,6 -1526,11 +1587,14 @@@ struct inode_operations 
+  	int (*atomic_open)(struct inode *, struct dentry *,
+  			   struct file *, unsigned open_flag,
+  			   umode_t create_mode, int *opened);
+++<<<<<<< HEAD
+++=======
++ 	int (*tmpfile) (struct inode *, struct dentry *, umode_t);
++ 	int (*set_acl)(struct inode *, struct posix_acl *, int);
++ 
++ 	/* WARNING: probably going away soon, do not use! */
++ 	int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+++>>>>>>> 4aa7c6346be3 (vfs: add i_op->dentry_open())
+  } ____cacheline_aligned;
+  
+  ssize_t rw_copy_check_uvector(int type, const struct iovec __user * uvector,
+* Unmerged path Documentation/filesystems/Locking
+* Unmerged path Documentation/filesystems/vfs.txt
+diff --git a/fs/namei.c b/fs/namei.c
+index 2a716bb03d5d..23194f946ede 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3091,9 +3091,12 @@ finish_open_created:
+ 	error = may_open(&nd->path, acc_mode, open_flag);
+ 	if (error)
+ 		goto out;
+-	file->f_path.mnt = nd->path.mnt;
+-	error = finish_open(file, nd->path.dentry, NULL, opened);
+-	if (error) {
++
++	BUG_ON(*opened & FILE_OPENED); /* once it's opened, it's opened */
++	error = vfs_open(&nd->path, file, current_cred());
++	if (!error) {
++		*opened |= FILE_OPENED;
++	} else {
+ 		if (error == -EOPENSTALE)
+ 			goto stale_open;
+ 		goto out;
+diff --git a/fs/open.c b/fs/open.c
+index 05cad6df8e3f..e9465f0d1e60 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -847,8 +847,7 @@ struct file *dentry_open(const struct path *path, int flags,
+ 	f = get_empty_filp();
+ 	if (!IS_ERR(f)) {
+ 		f->f_flags = flags;
+-		f->f_path = *path;
+-		error = do_dentry_open(f, NULL, cred);
++		error = vfs_open(path, f, cred);
+ 		if (!error) {
+ 			/* from now on we need fput() to dispose of f */
+ 			error = open_check_o_direct(f);
+@@ -865,6 +864,26 @@ struct file *dentry_open(const struct path *path, int flags,
+ }
+ EXPORT_SYMBOL(dentry_open);
+ 
++/**
++ * vfs_open - open the file at the given path
++ * @path: path to open
++ * @filp: newly allocated file with f_flag initialized
++ * @cred: credentials to use
++ */
++int vfs_open(const struct path *path, struct file *filp,
++	     const struct cred *cred)
++{
++	struct inode *inode = path->dentry->d_inode;
++
++	if (inode->i_op->dentry_open)
++		return inode->i_op->dentry_open(path->dentry, filp, cred);
++	else {
++		filp->f_path = *path;
++		return do_dentry_open(filp, NULL, cred);
++	}
++}
++EXPORT_SYMBOL(vfs_open);
++
+ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
+ {
+ 	int lookup_flags = 0;
+* Unmerged path include/linux/fs.h
