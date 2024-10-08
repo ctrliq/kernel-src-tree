@@ -1,0 +1,201 @@
+openvswitch: Refactor action alloc and copy api.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] openvswitch: Refactor action alloc and copy api (Jiri Benc) [1156461 1211348]
+Rebuild_FUZZ: 98.95%
+commit-author Pravin B Shelar <pshelar@nicira.com>
+commit 2fdb957d634a906ae8939bff23d45968307acbf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2fdb957d.failed
+
+There are two separate API to allocate and copy actions list. Anytime
+OVS needs to copy action list, it needs to call both functions.
+Following patch moves action allocation to copy function to avoid
+code duplication.
+
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+	Acked-by: Jarno Rajahalme <jrajahalme@nicira.com>
+(cherry picked from commit 2fdb957d634a906ae8939bff23d45968307acbf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/flow_netlink.c
+diff --cc net/openvswitch/flow_netlink.c
+index a7adbbc83ea3,482a0cbb22e8..000000000000
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@@ -1369,9 -1396,15 +1369,17 @@@ static inline void add_nested_action_en
+  	a->nla_len = sfa->actions_len - st_offset;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __ovs_nla_copy_actions(const struct nlattr *attr,
++ 				  const struct sw_flow_key *key,
++ 				  int depth, struct sw_flow_actions **sfa,
++ 				  __be16 eth_type, __be16 vlan_tci);
++ 
+++>>>>>>> 2fdb957d634a (openvswitch: Refactor action alloc and copy api.)
+  static int validate_and_copy_sample(const struct nlattr *attr,
+  				    const struct sw_flow_key *key, int depth,
+ -				    struct sw_flow_actions **sfa,
+ -				    __be16 eth_type, __be16 vlan_tci)
+ +				    struct sw_flow_actions **sfa)
+  {
+  	const struct nlattr *attrs[OVS_SAMPLE_ATTR_MAX + 1];
+  	const struct nlattr *probability, *actions;
+@@@ -1408,7 -1441,8 +1416,12 @@@
+  	if (st_acts < 0)
+  		return st_acts;
+  
+++<<<<<<< HEAD
+ +	err = ovs_nla_copy_actions(actions, key, depth + 1, sfa);
+++=======
++ 	err = __ovs_nla_copy_actions(actions, key, depth + 1, sfa,
++ 				     eth_type, vlan_tci);
+++>>>>>>> 2fdb957d634a (openvswitch: Refactor action alloc and copy api.)
+  	if (err)
+  		return err;
+  
+@@@ -1642,12 -1684,13 +1655,19 @@@ static int copy_action(const struct nla
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int ovs_nla_copy_actions(const struct nlattr *attr,
+ +			 const struct sw_flow_key *key,
+ +			 int depth,
+ +			 struct sw_flow_actions **sfa)
+++=======
++ static int __ovs_nla_copy_actions(const struct nlattr *attr,
++ 				  const struct sw_flow_key *key,
++ 				  int depth, struct sw_flow_actions **sfa,
++ 				  __be16 eth_type, __be16 vlan_tci)
+++>>>>>>> 2fdb957d634a (openvswitch: Refactor action alloc and copy api.)
+  {
+  	const struct nlattr *a;
+ -	bool out_tnl_port = false;
+  	int rem, err;
+  
+  	if (depth >= SAMPLE_ACTION_DEPTH)
+@@@ -1747,6 -1842,24 +1767,27 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int ovs_nla_copy_actions(const struct nlattr *attr,
++ 			 const struct sw_flow_key *key,
++ 			 struct sw_flow_actions **sfa)
++ {
++ 	int err;
++ 
++ 	*sfa = nla_alloc_flow_actions(nla_len(attr));
++ 	if (IS_ERR(*sfa))
++ 		return PTR_ERR(*sfa);
++ 
++ 	err = __ovs_nla_copy_actions(attr, key, 0, sfa, key->eth.type,
++ 				     key->eth.tci);
++ 	if (err)
++ 		kfree(*sfa);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 2fdb957d634a (openvswitch: Refactor action alloc and copy api.)
+  static int sample_action_to_attr(const struct nlattr *attr, struct sk_buff *skb)
+  {
+  	const struct nlattr *a;
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 0f7641b7bff9..0cb12095d211 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -543,18 +543,12 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ 	if (err)
+ 		goto err_flow_free;
+ 
+-	acts = ovs_nla_alloc_flow_actions(nla_len(a[OVS_PACKET_ATTR_ACTIONS]));
+-	err = PTR_ERR(acts);
+-	if (IS_ERR(acts))
+-		goto err_flow_free;
+-
+ 	err = ovs_nla_copy_actions(a[OVS_PACKET_ATTR_ACTIONS],
+ 				   &flow->key, 0, &acts);
+ 	if (err)
+ 		goto err_flow_free;
+ 
+ 	rcu_assign_pointer(flow->sf_acts, acts);
+-
+ 	OVS_CB(packet)->egress_tun_info = NULL;
+ 	packet->priority = flow->key.phy.priority;
+ 	packet->mark = flow->key.phy.skb_mark;
+@@ -872,16 +866,11 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 	ovs_flow_mask_key(&new_flow->key, &new_flow->unmasked_key, &mask);
+ 
+ 	/* Validate actions. */
+-	acts = ovs_nla_alloc_flow_actions(nla_len(a[OVS_FLOW_ATTR_ACTIONS]));
+-	error = PTR_ERR(acts);
+-	if (IS_ERR(acts))
+-		goto err_kfree_flow;
+-
+ 	error = ovs_nla_copy_actions(a[OVS_FLOW_ATTR_ACTIONS], &new_flow->key,
+ 				     0, &acts);
+ 	if (error) {
+ 		OVS_NLERR("Flow actions may not be safe on all matching packets.\n");
+-		goto err_kfree_acts;
++		goto err_kfree_flow;
+ 	}
+ 
+ 	reply = ovs_flow_cmd_alloc_info(acts, info, false);
+@@ -972,6 +961,7 @@ error:
+ 	return error;
+ }
+ 
++/* Factor out action copy to avoid "Wframe-larger-than=1024" warning. */
+ static struct sw_flow_actions *get_flow_actions(const struct nlattr *a,
+ 						const struct sw_flow_key *key,
+ 						const struct sw_flow_mask *mask)
+@@ -980,15 +970,10 @@ static struct sw_flow_actions *get_flow_actions(const struct nlattr *a,
+ 	struct sw_flow_key masked_key;
+ 	int error;
+ 
+-	acts = ovs_nla_alloc_flow_actions(nla_len(a));
+-	if (IS_ERR(acts))
+-		return acts;
+-
+ 	ovs_flow_mask_key(&masked_key, key, mask);
+ 	error = ovs_nla_copy_actions(a, &masked_key, 0, &acts);
+ 	if (error) {
+-		OVS_NLERR("Flow actions may not be safe on all matching packets.\n");
+-		kfree(acts);
++		OVS_NLERR("Actions may not be safe on all matching packets.\n");
+ 		return ERR_PTR(error);
+ 	}
+ 
+@@ -1028,10 +1013,8 @@ static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
+ 			error = PTR_ERR(acts);
+ 			goto error;
+ 		}
+-	}
+ 
+-	/* Can allocate before locking if have acts. */
+-	if (acts) {
++		/* Can allocate before locking if have acts. */
+ 		reply = ovs_flow_cmd_alloc_info(acts, info, false);
+ 		if (IS_ERR(reply)) {
+ 			error = PTR_ERR(reply);
+* Unmerged path net/openvswitch/flow_netlink.c
+diff --git a/net/openvswitch/flow_netlink.h b/net/openvswitch/flow_netlink.h
+index ea521d55ea2a..814c8cb37d04 100644
+--- a/net/openvswitch/flow_netlink.h
++++ b/net/openvswitch/flow_netlink.h
+@@ -56,7 +56,6 @@ int ovs_nla_copy_actions(const struct nlattr *attr,
+ int ovs_nla_put_actions(const struct nlattr *attr,
+ 			int len, struct sk_buff *skb);
+ 
+-struct sw_flow_actions *ovs_nla_alloc_flow_actions(int actions_len);
+ void ovs_nla_free_flow_actions(struct sw_flow_actions *);
+ 
+ #endif /* flow_netlink.h */
