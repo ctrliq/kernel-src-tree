@@ -766,6 +766,8 @@ static int tpm_tis_init(struct device *dev, acpi_handle acpi_dev_handle,
 			iowrite32(intmask,
 				  chip->vendor.iobase +
 				  TPM_INT_ENABLE(chip->vendor.locality));
+
+			devm_free_irq(dev, i, chip);
 		}
 	}
 	if (chip->vendor.irq) {
