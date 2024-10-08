@@ -1,0 +1,182 @@
+uprobes/x86: Emulate unconditional relative jmp's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Emulate unconditional relative jmp's (Oleg Nesterov) [1073627]
+Rebuild_FUZZ: 95.74%
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 7ba6db2d688bdf83049a18c8e55b2d1e58e8b0bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/7ba6db2d.failed
+
+Currently we always execute all insns out-of-line, including relative
+jmp's and call's. This assumes that even if regs->ip points to nowhere
+after the single-step, default_post_xol_op(UPROBE_FIX_IP) logic will
+update it correctly.
+
+However, this doesn't work if this regs->ip == xol_vaddr + insn_offset
+is not canonical. In this case CPU generates #GP and general_protection()
+kills the task which tries to execute this insn out-of-line.
+
+Now that we have uprobe_xol_ops we can teach uprobes to emulate these
+insns and solve the problem. This patch adds branch_xol_ops which has
+a single branch_emulate_op() hook, so far it can only handle rel8/32
+relative jmp's.
+
+TODO: move ->fixup into the union along with rip_rela_target_address.
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Reported-by: Jonathan Lebon <jlebon@redhat.com>
+	Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit 7ba6db2d688bdf83049a18c8e55b2d1e58e8b0bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/uprobes.h
+#	arch/x86/kernel/uprobes.c
+diff --cc arch/x86/include/asm/uprobes.h
+index 6e5197910fd8,e9fd4d5537ed..000000000000
+--- a/arch/x86/include/asm/uprobes.h
++++ b/arch/x86/include/asm/uprobes.h
+@@@ -33,12 -33,26 +33,23 @@@ typedef u8 uprobe_opcode_t
+  #define UPROBE_SWBP_INSN		0xcc
+  #define UPROBE_SWBP_INSN_SIZE		   1
+  
+ -struct uprobe_xol_ops;
+ -
+  struct arch_uprobe {
+ -	union {
+ -		u8			insn[MAX_UINSN_BYTES];
+ -		u8			ixol[MAX_UINSN_BYTES];
+ -	};
+ -
+  	u16				fixups;
+++<<<<<<< HEAD
+ +	u8				insn[MAX_UINSN_BYTES];
+++=======
++ 	const struct uprobe_xol_ops	*ops;
++ 
++ 	union {
+++>>>>>>> 7ba6db2d688b (uprobes/x86: Emulate unconditional relative jmp's)
+  #ifdef CONFIG_X86_64
+- 	unsigned long			rip_rela_target_address;
++ 		unsigned long			rip_rela_target_address;
+  #endif
++ 		struct {
++ 			s32	offs;
++ 			u8	ilen;
++ 		}				branch;
++ 	};
+  };
+  
+  struct arch_uprobe_task {
+diff --cc arch/x86/kernel/uprobes.c
+index 7ea7d2b3594b,c3baeaacf1b6..000000000000
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@@ -402,6 -402,99 +402,102 @@@ static int validate_insn_bits(struct ar
+  }
+  #endif /* CONFIG_X86_64 */
+  
+++<<<<<<< HEAD
+++=======
++ struct uprobe_xol_ops {
++ 	bool	(*emulate)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*pre_xol)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*post_xol)(struct arch_uprobe *, struct pt_regs *);
++ };
++ 
++ static inline int sizeof_long(void)
++ {
++ 	return is_ia32_task() ? 4 : 8;
++ }
++ 
++ static int default_pre_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	pre_xol_rip_insn(auprobe, regs, &current->utask->autask);
++ 	return 0;
++ }
++ 
++ /*
++  * Adjust the return address pushed by a call insn executed out of line.
++  */
++ static int adjust_ret_addr(unsigned long sp, long correction)
++ {
++ 	int rasize = sizeof_long();
++ 	long ra;
++ 
++ 	if (copy_from_user(&ra, (void __user *)sp, rasize))
++ 		return -EFAULT;
++ 
++ 	ra += correction;
++ 	if (copy_to_user((void __user *)sp, &ra, rasize))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	struct uprobe_task *utask = current->utask;
++ 	long correction = (long)(utask->vaddr - utask->xol_vaddr);
++ 
++ 	handle_riprel_post_xol(auprobe, regs, &correction);
++ 	if (auprobe->fixups & UPROBE_FIX_IP)
++ 		regs->ip += correction;
++ 
++ 	if (auprobe->fixups & UPROBE_FIX_CALL) {
++ 		if (adjust_ret_addr(regs->sp, correction)) {
++ 			regs->sp += sizeof_long();
++ 			return -ERESTART;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct uprobe_xol_ops default_xol_ops = {
++ 	.pre_xol  = default_pre_xol_op,
++ 	.post_xol = default_post_xol_op,
++ };
++ 
++ static bool branch_emulate_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	regs->ip += auprobe->branch.ilen + auprobe->branch.offs;
++ 	return true;
++ }
++ 
++ static struct uprobe_xol_ops branch_xol_ops = {
++ 	.emulate  = branch_emulate_op,
++ };
++ 
++ /* Returns -ENOSYS if branch_xol_ops doesn't handle this insn */
++ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 
++ 	switch (OPCODE1(insn)) {
++ 	case 0xeb:	/* jmp 8 */
++ 	case 0xe9:	/* jmp 32 */
++ 		break;
++ 	default:
++ 		return -ENOSYS;
++ 	}
++ 
++ 	/* has the side-effect of processing the entire instruction */
++ 	insn_get_length(insn);
++ 	if (WARN_ON_ONCE(!insn_complete(insn)))
++ 		return -ENOEXEC;
++ 
++ 	auprobe->branch.ilen = insn->length;
++ 	auprobe->branch.offs = insn->immediate.value;
++ 
++ 	auprobe->ops = &branch_xol_ops;
++ 	return 0;
++ }
++ 
+++>>>>>>> 7ba6db2d688b (uprobes/x86: Emulate unconditional relative jmp's)
+  /**
+   * arch_uprobe_analyze_insn - instruction analysis including validity and fixups.
+   * @mm: the probed address space.
+* Unmerged path arch/x86/include/asm/uprobes.h
+* Unmerged path arch/x86/kernel/uprobes.c
