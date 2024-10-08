@@ -76,7 +76,6 @@ void context_tracking_user_enter(void)
 	local_irq_save(flags);
 	if ( __this_cpu_read(context_tracking.state) != IN_USER) {
 		if (__this_cpu_read(context_tracking.active)) {
-			trace_user_enter(0);
 			/*
 			 * At this stage, only low level arch entry code remains and
 			 * then we'll run in userspace. We can assume there won't be
@@ -84,7 +83,10 @@ void context_tracking_user_enter(void)
 			 * user_exit() or rcu_irq_enter(). Let's remove RCU's dependency
 			 * on the tick.
 			 */
-			vtime_user_enter(current);
+			if (state == CONTEXT_USER) {
+				trace_user_enter(0);
+				vtime_user_enter(current);
+			}
 			rcu_user_enter();
 		}
 		/*
@@ -174,8 +176,10 @@ void context_tracking_user_exit(void)
 			 * RCU core about that (ie: we may need the tick again).
 			 */
 			rcu_user_exit();
-			vtime_user_exit(current);
-			trace_user_exit(0);
+			if (state == CONTEXT_USER) {
+				vtime_user_exit(current);
+				trace_user_exit(0);
+			}
 		}
 		__this_cpu_write(context_tracking.state, IN_KERNEL);
 	}
