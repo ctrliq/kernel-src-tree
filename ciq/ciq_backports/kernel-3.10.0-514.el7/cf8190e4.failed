@@ -1,0 +1,163 @@
+hv_netvsc: Fix race condition on Multi-Send Data field
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit cf8190e4c26c8ccf87d80793f8f1f7fe150cdf8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cf8190e4.failed
+
+In commit 2a04ae8acb14 ("hv_netvsc: remove locking in netvsc_send()"), the
+locking for MSD (Multi-Send Data) field was removed. This could cause a
+race condition between RNDIS control messages and data packets processing,
+because these two types of traffic are not synchronized.
+This patch fixes this issue by sending control messages out directly
+without reading MSD field.
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cf8190e4c26c8ccf87d80793f8f1f7fe150cdf8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 74ee1b57e623,059fc5231601..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -817,13 -838,122 +817,132 @@@ int netvsc_send(struct hv_device *devic
+  			   packet, ret);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ret != 0) {
+ +		if (section_index != NETVSC_INVALID_INDEX)
+ +			netvsc_free_send_slot(net_device, section_index);
+ +	} else if (skb) {
+ +		dev_kfree_skb_any(skb);
+ +	}
+ +
+++=======
++ 	return ret;
++ }
++ 
++ int netvsc_send(struct hv_device *device,
++ 		struct hv_netvsc_packet *packet,
++ 		struct rndis_message *rndis_msg,
++ 		struct hv_page_buffer **pb,
++ 		struct sk_buff *skb)
++ {
++ 	struct netvsc_device *net_device;
++ 	int ret = 0, m_ret = 0;
++ 	struct vmbus_channel *out_channel;
++ 	u16 q_idx = packet->q_idx;
++ 	u32 pktlen = packet->total_data_buflen, msd_len = 0;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	struct multi_send_data *msdp;
++ 	struct hv_netvsc_packet *msd_send = NULL, *cur_send = NULL;
++ 	bool try_batch;
++ 	bool xmit_more = (skb != NULL) ? skb->xmit_more : false;
++ 
++ 	net_device = get_outbound_net_device(device);
++ 	if (!net_device)
++ 		return -ENODEV;
++ 
++ 	out_channel = net_device->chn_table[q_idx];
++ 
++ 	packet->send_buf_index = NETVSC_INVALID_INDEX;
++ 	packet->cp_partial = false;
++ 
++ 	/* Send control message directly without accessing msd (Multi-Send
++ 	 * Data) field which may be changed during data packet processing.
++ 	 */
++ 	if (!skb) {
++ 		cur_send = packet;
++ 		goto send_now;
++ 	}
++ 
++ 	msdp = &net_device->msd[q_idx];
++ 
++ 	/* batch packets in send buffer if possible */
++ 	if (msdp->pkt)
++ 		msd_len = msdp->pkt->total_data_buflen;
++ 
++ 	try_batch = (skb != NULL) && msd_len > 0 && msdp->count <
++ 		    net_device->max_pkt;
++ 
++ 	if (try_batch && msd_len + pktlen + net_device->pkt_align <
++ 	    net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 
++ 	} else if (try_batch && msd_len + packet->rmsg_size <
++ 		   net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 		packet->cp_partial = true;
++ 
++ 	} else if ((skb != NULL) && pktlen + net_device->pkt_align <
++ 		   net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 				msd_send = msdp->pkt;
++ 				msdp->pkt = NULL;
++ 				msdp->count = 0;
++ 				msd_len = 0;
++ 		}
++ 	}
++ 
++ 	if (section_index != NETVSC_INVALID_INDEX) {
++ 		netvsc_copy_to_send_buf(net_device,
++ 					section_index, msd_len,
++ 					packet, rndis_msg, pb, skb);
++ 
++ 		packet->send_buf_index = section_index;
++ 
++ 		if (packet->cp_partial) {
++ 			packet->page_buf_cnt -= packet->rmsg_pgcnt;
++ 			packet->total_data_buflen = msd_len + packet->rmsg_size;
++ 		} else {
++ 			packet->page_buf_cnt = 0;
++ 			packet->total_data_buflen += msd_len;
++ 		}
++ 
++ 		if (msdp->pkt)
++ 			dev_kfree_skb_any(skb);
++ 
++ 		if (xmit_more && !packet->cp_partial) {
++ 			msdp->pkt = packet;
++ 			msdp->count++;
++ 		} else {
++ 			cur_send = packet;
++ 			msdp->pkt = NULL;
++ 			msdp->count = 0;
++ 		}
++ 	} else {
++ 		msd_send = msdp->pkt;
++ 		msdp->pkt = NULL;
++ 		msdp->count = 0;
++ 		cur_send = packet;
++ 	}
++ 
++ 	if (msd_send) {
++ 		m_ret = netvsc_send_pkt(msd_send, net_device, pb, skb);
++ 
++ 		if (m_ret != 0) {
++ 			netvsc_free_send_slot(net_device,
++ 					      msd_send->send_buf_index);
++ 			dev_kfree_skb_any(skb);
++ 		}
++ 	}
++ 
++ send_now:
++ 	if (cur_send)
++ 		ret = netvsc_send_pkt(cur_send, net_device, pb, skb);
++ 
++ 	if (ret != 0 && section_index != NETVSC_INVALID_INDEX)
++ 		netvsc_free_send_slot(net_device, section_index);
++ 
+++>>>>>>> cf8190e4c26c (hv_netvsc: Fix race condition on Multi-Send Data field)
+  	return ret;
+  }
+  
+* Unmerged path drivers/net/hyperv/netvsc.c
