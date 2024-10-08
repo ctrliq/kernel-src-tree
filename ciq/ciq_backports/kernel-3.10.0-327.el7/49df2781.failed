@@ -1,0 +1,306 @@
+IB/iser: Fix sparse warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] iser: Fix sparse warnings (Amir Vadai) [1164539]
+Rebuild_FUZZ: 94.34%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 49df2781b101a729e9f46eddc845a587fc5665a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/49df2781.failed
+
+Use uintptr_t to handle wr_id casting, which was found by Kbuild test
+robot and smatch.  Also remove an internal definition of variable which
+potentially shadows an external one (and make sparse happy).
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 49df2781b101a729e9f46eddc845a587fc5665a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 4cafd44ad193,fb5ec3553de8..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -1020,7 -1077,7 +1020,11 @@@ int iser_post_recvl(struct iser_conn *i
+  	sge.length = ISER_RX_LOGIN_SIZE;
+  	sge.lkey   = ib_conn->device->mr->lkey;
+  
+++<<<<<<< HEAD
+ +	rx_wr.wr_id   = (unsigned long)ib_conn->login_resp_buf;
+++=======
++ 	rx_wr.wr_id   = (uintptr_t)iser_conn->login_resp_buf;
+++>>>>>>> 49df2781b101 (IB/iser: Fix sparse warnings)
+  	rx_wr.sg_list = &sge;
+  	rx_wr.num_sge = 1;
+  	rx_wr.next    = NULL;
+@@@ -1042,8 -1100,8 +1046,13 @@@ int iser_post_recvm(struct iser_conn *i
+  	struct iser_rx_desc *rx_desc;
+  
+  	for (rx_wr = ib_conn->rx_wr, i = 0; i < count; i++, rx_wr++) {
+++<<<<<<< HEAD
+ +		rx_desc		= &ib_conn->rx_descs[my_rx_head];
+ +		rx_wr->wr_id	= (unsigned long)rx_desc;
+++=======
++ 		rx_desc		= &iser_conn->rx_descs[my_rx_head];
++ 		rx_wr->wr_id	= (uintptr_t)rx_desc;
+++>>>>>>> 49df2781b101 (IB/iser: Fix sparse warnings)
+  		rx_wr->sg_list	= &rx_desc->rx_sg;
+  		rx_wr->num_sge	= 1;
+  		rx_wr->next	= rx_wr + 1;
+@@@ -1075,10 -1134,11 +1084,10 @@@ int iser_post_send(struct iser_conn *ib
+  	struct ib_send_wr send_wr, *send_wr_failed;
+  
+  	ib_dma_sync_single_for_device(ib_conn->device->ib_device,
+ -				      tx_desc->dma_addr, ISER_HEADERS_LEN,
+ -				      DMA_TO_DEVICE);
+ +		tx_desc->dma_addr, ISER_HEADERS_LEN, DMA_TO_DEVICE);
+  
+  	send_wr.next	   = NULL;
+- 	send_wr.wr_id	   = (unsigned long)tx_desc;
++ 	send_wr.wr_id	   = (uintptr_t)tx_desc;
+  	send_wr.sg_list	   = tx_desc->tx_sg;
+  	send_wr.num_sge	   = tx_desc->num_sge;
+  	send_wr.opcode	   = IB_WR_SEND;
+@@@ -1094,105 -1151,136 +1103,157 @@@
+  	return ib_ret;
+  }
+  
+ -/**
+ - * is_iser_tx_desc - Indicate if the completion wr_id
+ - *     is a TX descriptor or not.
+ - * @iser_conn: iser connection
+ - * @wr_id: completion WR identifier
+ - *
+ - * Since we cannot rely on wc opcode in FLUSH errors
+ - * we must work around it by checking if the wr_id address
+ - * falls in the iser connection rx_descs buffer. If so
+ - * it is an RX descriptor, otherwize it is a TX.
+ - */
+ -static inline bool
+ -is_iser_tx_desc(struct iser_conn *iser_conn, void *wr_id)
+ +static void iser_handle_comp_error(struct iser_tx_desc *desc,
+ +				struct iser_conn *ib_conn)
+  {
+ -	void *start = iser_conn->rx_descs;
+ -	int len = iser_conn->num_rx_descs * sizeof(*iser_conn->rx_descs);
+ +	if (desc && desc->type == ISCSI_TX_DATAOUT)
+ +		kmem_cache_free(ig.desc_cache, desc);
+ +
+++<<<<<<< HEAD
+ +	if (ib_conn->post_recv_buf_count == 0 &&
+ +	    atomic_read(&ib_conn->post_send_buf_count) == 0) {
+ +		/**
+ +		 * getting here when the state is UP means that the conn is
+ +		 * being terminated asynchronously from the iSCSI layer's
+ +		 * perspective. It is safe to peek at the connection state
+ +		 * since iscsi_conn_failure is allowed to be called twice.
+ +		 **/
+ +		if (ib_conn->state == ISER_CONN_UP)
+ +			iscsi_conn_failure(ib_conn->iscsi_conn,
+ +					   ISCSI_ERR_CONN_FAILED);
+  
+ +		/* no more non completed posts to the QP, complete the
+ +		 * termination process w.o worrying on disconnect event */
+ +		complete(&ib_conn->flush_completion);
+++=======
++ 	if (wr_id >= start && wr_id < start + len)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /**
++  * iser_handle_comp_error() - Handle error completion
++  * @ib_conn:   connection RDMA resources
++  * @wc:        work completion
++  *
++  * Notes: We may handle a FLUSH error completion and in this case
++  *        we only cleanup in case TX type was DATAOUT. For non-FLUSH
++  *        error completion we should also notify iscsi layer that
++  *        connection is failed (in case we passed bind stage).
++  */
++ static void
++ iser_handle_comp_error(struct ib_conn *ib_conn,
++ 		       struct ib_wc *wc)
++ {
++ 	void *wr_id = (void *)(uintptr_t)wc->wr_id;
++ 	struct iser_conn *iser_conn = container_of(ib_conn, struct iser_conn,
++ 						   ib_conn);
++ 
++ 	if (wc->status != IB_WC_WR_FLUSH_ERR)
++ 		if (iser_conn->iscsi_conn)
++ 			iscsi_conn_failure(iser_conn->iscsi_conn,
++ 					   ISCSI_ERR_CONN_FAILED);
++ 
++ 	if (is_iser_tx_desc(iser_conn, wr_id)) {
++ 		struct iser_tx_desc *desc = wr_id;
++ 
++ 		if (desc->type == ISCSI_TX_DATAOUT)
++ 			kmem_cache_free(ig.desc_cache, desc);
++ 	} else {
++ 		ib_conn->post_recv_buf_count--;
+++>>>>>>> 49df2781b101 (IB/iser: Fix sparse warnings)
+  	}
+  }
+  
+ -/**
+ - * iser_handle_wc - handle a single work completion
+ - * @wc: work completion
+ - *
+ - * Soft-IRQ context, work completion can be either
+ - * SEND or RECV, and can turn out successful or
+ - * with error (or flush error).
+ - */
+ -static void iser_handle_wc(struct ib_wc *wc)
+ +static int iser_drain_tx_cq(struct iser_device  *device, int cq_index)
+  {
+ -	struct ib_conn *ib_conn;
+ +	struct ib_cq  *cq = device->tx_cq[cq_index];
+ +	struct ib_wc  wc;
+  	struct iser_tx_desc *tx_desc;
+ -	struct iser_rx_desc *rx_desc;
+ -
+ +	struct iser_conn *ib_conn;
+ +	int completed_tx = 0;
+ +
+++<<<<<<< HEAD
+ +	while (ib_poll_cq(cq, 1, &wc) == 1) {
+ +		tx_desc	= (struct iser_tx_desc *) (unsigned long) wc.wr_id;
+ +		ib_conn = wc.qp->qp_context;
+ +		if (wc.status == IB_WC_SUCCESS) {
+ +			if (wc.opcode == IB_WC_SEND)
+ +				iser_snd_completion(tx_desc, ib_conn);
+ +			else
+ +				iser_err("expected opcode %d got %d\n",
+ +					IB_WC_SEND, wc.opcode);
+++=======
++ 	ib_conn = wc->qp->qp_context;
++ 	if (wc->status == IB_WC_SUCCESS) {
++ 		if (wc->opcode == IB_WC_RECV) {
++ 			rx_desc = (struct iser_rx_desc *)(uintptr_t)wc->wr_id;
++ 			iser_rcv_completion(rx_desc, wc->byte_len,
++ 					    ib_conn);
++ 		} else
++ 		if (wc->opcode == IB_WC_SEND) {
++ 			tx_desc = (struct iser_tx_desc *)(uintptr_t)wc->wr_id;
++ 			iser_snd_completion(tx_desc, ib_conn);
+++>>>>>>> 49df2781b101 (IB/iser: Fix sparse warnings)
+  		} else {
+ -			iser_err("Unknown wc opcode %d\n", wc->opcode);
+ +			iser_err("tx id %llx status %d vend_err %x\n",
+ +				 wc.wr_id, wc.status, wc.vendor_err);
+ +			if (wc.wr_id != ISER_FASTREG_LI_WRID) {
+ +				atomic_dec(&ib_conn->post_send_buf_count);
+ +				iser_handle_comp_error(tx_desc, ib_conn);
+ +			}
+  		}
+ -	} else {
+ -		if (wc->status != IB_WC_WR_FLUSH_ERR)
+ -			iser_err("wr id %llx status %d vend_err %x\n",
+ -				 wc->wr_id, wc->status, wc->vendor_err);
+ -		else
+ -			iser_dbg("flush error: wr id %llx\n", wc->wr_id);
+ -
+ -		if (wc->wr_id != ISER_FASTREG_LI_WRID &&
+ -		    wc->wr_id != ISER_BEACON_WRID)
+ -			iser_handle_comp_error(ib_conn, wc);
+ -
+ -		/* complete in case all flush errors were consumed */
+ -		if (wc->wr_id == ISER_BEACON_WRID)
+ -			complete(&ib_conn->flush_comp);
+ +		completed_tx++;
+  	}
+ +	return completed_tx;
+  }
+  
+ -/**
+ - * iser_cq_tasklet_fn - iSER completion polling loop
+ - * @data: iSER completion context
+ - *
+ - * Soft-IRQ context, polling connection CQ until
+ - * either CQ was empty or we exausted polling budget
+ - */
+ +
+  static void iser_cq_tasklet_fn(unsigned long data)
+  {
+ -	struct iser_comp *comp = (struct iser_comp *)data;
+ -	struct ib_cq *cq = comp->cq;
+ -	struct ib_wc *const wcs = comp->wcs;
+ -	int i, n, completed = 0;
+ -
+ -	while ((n = ib_poll_cq(cq, ARRAY_SIZE(comp->wcs), wcs)) > 0) {
+ -		for (i = 0; i < n; i++)
+ -			iser_handle_wc(&wcs[i]);
+ -
+ -		completed += n;
+ -		if (completed >= iser_cq_poll_limit)
+ -			break;
+ -	}
+ -
+ -	/*
+ -	 * It is assumed here that arming CQ only once its empty
+ -	 * would not cause interrupts to be missed.
+ +	struct iser_cq_desc *cq_desc = (struct iser_cq_desc *)data;
+ +	struct iser_device  *device = cq_desc->device;
+ +	int cq_index = cq_desc->cq_index;
+ +	struct ib_cq	     *cq = device->rx_cq[cq_index];
+ +	 struct ib_wc	     wc;
+ +	 struct iser_rx_desc *desc;
+ +	 unsigned long	     xfer_len;
+ +	struct iser_conn *ib_conn;
+ +	int completed_tx, completed_rx = 0;
+ +
+ +	/* First do tx drain, so in a case where we have rx flushes and a successful
+ +	 * tx completion we will still go through completion error handling.
+  	 */
+ +	completed_tx = iser_drain_tx_cq(device, cq_index);
+ +
+ +	while (ib_poll_cq(cq, 1, &wc) == 1) {
+ +		desc	 = (struct iser_rx_desc *) (unsigned long) wc.wr_id;
+ +		BUG_ON(desc == NULL);
+ +		ib_conn = wc.qp->qp_context;
+ +		if (wc.status == IB_WC_SUCCESS) {
+ +			if (wc.opcode == IB_WC_RECV) {
+ +				xfer_len = (unsigned long)wc.byte_len;
+ +				iser_rcv_completion(desc, xfer_len, ib_conn);
+ +			} else
+ +				iser_err("expected opcode %d got %d\n",
+ +					IB_WC_RECV, wc.opcode);
+ +		} else {
+ +			if (wc.status != IB_WC_WR_FLUSH_ERR)
+ +				iser_err("rx id %llx status %d vend_err %x\n",
+ +					wc.wr_id, wc.status, wc.vendor_err);
+ +			ib_conn->post_recv_buf_count--;
+ +			iser_handle_comp_error(NULL, ib_conn);
+ +		}
+ +		completed_rx++;
+ +		if (!(completed_rx & 63))
+ +			completed_tx += iser_drain_tx_cq(device, cq_index);
+ +	}
+ +	/* #warning "it is assumed here that arming CQ only once its empty" *
+ +	 * " would not cause interrupts to be missed"                       */
+  	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+  
+ -	iser_dbg("got %d completions\n", completed);
+ +	iser_dbg("got %d rx %d tx completions\n", completed_rx, completed_tx);
+  }
+  
+  static void iser_cq_callback(struct ib_cq *cq, void *cq_context)
+diff --git a/drivers/infiniband/ulp/iser/iser_memory.c b/drivers/infiniband/ulp/iser/iser_memory.c
+index afa4349a5c3f..e6e3e23a6173 100644
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@ -73,7 +73,6 @@ static int iser_start_rdma_unaligned_sg(struct iscsi_iser_task *iser_task,
+ 
+ 	if (cmd_dir == ISER_DIR_OUT) {
+ 		/* copy the unaligned sg the buffer which is used for RDMA */
+-		int i;
+ 		char *p, *from;
+ 
+ 		sgl = (struct scatterlist *)data->buf;
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
