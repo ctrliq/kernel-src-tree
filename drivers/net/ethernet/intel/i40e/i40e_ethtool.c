@@ -273,6 +273,12 @@ static void i40e_get_settings_link_up(struct i40e_hw *hw,
 	case I40E_PHY_TYPE_40GBASE_LR4:
 		ecmd->supported = SUPPORTED_40000baseLR4_Full;
 		break;
+	case I40E_PHY_TYPE_20GBASE_KR2:
+		ecmd->supported = SUPPORTED_Autoneg |
+				  SUPPORTED_20000baseKR2_Full;
+		ecmd->advertising = ADVERTISED_Autoneg |
+				    ADVERTISED_20000baseKR2_Full;
+		break;
 	case I40E_PHY_TYPE_10GBASE_KX4:
 		ecmd->supported = SUPPORTED_Autoneg |
 				  SUPPORTED_10000baseKX4_Full;
@@ -351,6 +357,9 @@ static void i40e_get_settings_link_up(struct i40e_hw *hw,
 		/* need a SPEED_40000 in ethtool.h */
 		ethtool_cmd_speed_set(ecmd, 40000);
 		break;
+	case I40E_LINK_SPEED_20GB:
+		ethtool_cmd_speed_set(ecmd, SPEED_20000);
+		break;
 	case I40E_LINK_SPEED_10GB:
 		ethtool_cmd_speed_set(ecmd, SPEED_10000);
 		break;
@@ -415,6 +424,11 @@ static void i40e_get_settings_link_down(struct i40e_hw *hw,
 			ecmd->advertising |= ADVERTISED_1000baseT_Full;
 		if (hw_link_info->requested_speeds & I40E_LINK_SPEED_100MB)
 			ecmd->advertising |= ADVERTISED_100baseT_Full;
+		break;
+	case I40E_DEV_ID_20G_KR2:
+		/* backplane 20G */
+		ecmd->supported = SUPPORTED_20000baseKR2_Full;
+		ecmd->advertising = ADVERTISED_20000baseKR2_Full;
 		break;
 	default:
 		/* all the rest are 10G/1G */
@@ -631,6 +645,8 @@ static int i40e_set_settings(struct net_device *netdev,
 	    advertise & ADVERTISED_10000baseKX4_Full ||
 	    advertise & ADVERTISED_10000baseKR_Full)
 		config.link_speed |= I40E_LINK_SPEED_10GB;
+	if (advertise & ADVERTISED_20000baseKR2_Full)
+		config.link_speed |= I40E_LINK_SPEED_20GB;
 	if (advertise & ADVERTISED_40000baseKR4_Full ||
 	    advertise & ADVERTISED_40000baseCR4_Full ||
 	    advertise & ADVERTISED_40000baseSR4_Full ||
