@@ -3435,7 +3435,7 @@ exit:
 	return reserved;
 }
 
-int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct)
+int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct)
 {
 	u64 spte;
 	bool reserved;
@@ -3444,7 +3444,7 @@ int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct)
 		return RET_MMIO_PF_EMULATE;
 
 	reserved = walk_shadow_page_get_mmio_spte(vcpu, addr, &spte);
-	if (unlikely(reserved))
+	if (WARN_ON(reserved))
 		return RET_MMIO_PF_BUG;
 
 	if (is_mmio_spte(spte)) {
@@ -3468,17 +3468,7 @@ int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct)
 	 */
 	return RET_MMIO_PF_RETRY;
 }
-EXPORT_SYMBOL_GPL(handle_mmio_page_fault_common);
-
-static int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr,
-				  u32 error_code, bool direct)
-{
-	int ret;
-
-	ret = handle_mmio_page_fault_common(vcpu, addr, direct);
-	WARN_ON(ret == RET_MMIO_PF_BUG);
-	return ret;
-}
+EXPORT_SYMBOL_GPL(handle_mmio_page_fault);
 
 static int nonpaging_page_fault(struct kvm_vcpu *vcpu, gva_t gva,
 				u32 error_code, bool prefault)
@@ -3489,7 +3479,7 @@ static int nonpaging_page_fault(struct kvm_vcpu *vcpu, gva_t gva,
 	pgprintk("%s: gva %lx error %x\n", __func__, gva, error_code);
 
 	if (unlikely(error_code & PFERR_RSVD_MASK)) {
-		r = handle_mmio_page_fault(vcpu, gva, error_code, true);
+		r = handle_mmio_page_fault(vcpu, gva, true);
 
 		if (likely(r != RET_MMIO_PF_INVALID))
 			return r;
@@ -3569,7 +3559,7 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
 	MMU_WARN_ON(!VALID_PAGE(vcpu->arch.mmu.root_hpa));
 
 	if (unlikely(error_code & PFERR_RSVD_MASK)) {
-		r = handle_mmio_page_fault(vcpu, gpa, error_code, true);
+		r = handle_mmio_page_fault(vcpu, gpa, true);
 
 		if (likely(r != RET_MMIO_PF_INVALID))
 			return r;
