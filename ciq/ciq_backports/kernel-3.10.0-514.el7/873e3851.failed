@@ -1,0 +1,251 @@
+nfs: make nfs4_init_uniform_client_string use a dynamically allocated buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jeff Layton <jlayton@poochiereds.net>
+commit 873e385116b2cc5c7daca8f51881371fadb90970
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/873e3851.failed
+
+Change the uniform client string generator to dynamically allocate the
+NFSv4 client name string buffer. With this patch, we can eliminate the
+buffers that are embedded within the "args" structs and simply use the
+name string that is hanging off the client.
+
+This uniform string case is a little simpler than the nonuniform since
+we don't need to deal with RCU, but we do have two different cases,
+depending on whether there is a uniquifier or not.
+
+	Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 873e385116b2cc5c7daca8f51881371fadb90970)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 4a74bf22dd3e,d181090124db..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -5004,38 -4957,128 +5004,113 @@@ static void nfs4_init_boot_verifier(con
+  	memcpy(bootverf->data, verf, sizeof(bootverf->data));
+  }
+  
+ -static int
+ -nfs4_init_nonuniform_client_string(struct nfs_client *clp)
+ +static unsigned int
+ +nfs4_init_nonuniform_client_string(const struct nfs_client *clp,
+ +				   char *buf, size_t len)
+  {
+ -	int result;
+ -	size_t len;
+ -	char *str;
+ -	bool retried = false;
+ +	unsigned int result;
+  
+ -	if (clp->cl_owner_id != NULL)
+ -		return 0;
+ -retry:
+  	rcu_read_lock();
+ -	len = 10 + strlen(clp->cl_ipaddr) + 1 +
+ -		strlen(rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR)) +
+ -		1 +
+ -		strlen(rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO)) +
+ -		1;
+ +	result = scnprintf(buf, len, "Linux NFSv4.0 %s/%s %s",
+ +				clp->cl_ipaddr,
+ +				rpc_peeraddr2str(clp->cl_rpcclient,
+ +							RPC_DISPLAY_ADDR),
+ +				rpc_peeraddr2str(clp->cl_rpcclient,
+ +							RPC_DISPLAY_PROTO));
+  	rcu_read_unlock();
+ -
+ -	if (len > NFS4_OPAQUE_LIMIT + 1)
+ -		return -EINVAL;
+ -
+ -	/*
+ -	 * Since this string is allocated at mount time, and held until the
+ -	 * nfs_client is destroyed, we can use GFP_KERNEL here w/o worrying
+ -	 * about a memory-reclaim deadlock.
+ -	 */
+ -	str = kmalloc(len, GFP_KERNEL);
+ -	if (!str)
+ -		return -ENOMEM;
+ -
+ -	rcu_read_lock();
+ -	result = scnprintf(str, len, "Linux NFSv4.0 %s/%s %s",
+ -			clp->cl_ipaddr,
+ -			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR),
+ -			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO));
+ -	rcu_read_unlock();
+ -
+ -	/* Did something change? */
+ -	if (result >= len) {
+ -		kfree(str);
+ -		if (retried)
+ -			return -EINVAL;
+ -		retried = true;
+ -		goto retry;
+ -	}
+ -	clp->cl_owner_id = str;
+ -	return 0;
+ +	return result;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int
+ +nfs4_init_uniform_client_string(const struct nfs_client *clp,
+ +				char *buf, size_t len)
+ +{
+ +	const char *nodename = clp->cl_rpcclient->cl_nodename;
+ +
+ +	if (nfs4_client_id_uniquifier[0] != '\0')
+ +		return scnprintf(buf, len, "Linux NFSv%u.%u %s/%s",
+ +				clp->rpc_ops->version,
+ +				clp->cl_minorversion,
+ +				nfs4_client_id_uniquifier,
+ +				nodename);
+ +	return scnprintf(buf, len, "Linux NFSv%u.%u %s",
+ +				clp->rpc_ops->version, clp->cl_minorversion,
+ +				nodename);
+++=======
++ static int
++ nfs4_init_uniquifier_client_string(struct nfs_client *clp)
++ {
++ 	int result;
++ 	size_t len;
++ 	char *str;
++ 
++ 	len = 10 + 10 + 1 + 10 + 1 +
++ 		strlen(nfs4_client_id_uniquifier) + 1 +
++ 		strlen(clp->cl_rpcclient->cl_nodename) + 1;
++ 
++ 	if (len > NFS4_OPAQUE_LIMIT + 1)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Since this string is allocated at mount time, and held until the
++ 	 * nfs_client is destroyed, we can use GFP_KERNEL here w/o worrying
++ 	 * about a memory-reclaim deadlock.
++ 	 */
++ 	str = kmalloc(len, GFP_KERNEL);
++ 	if (!str)
++ 		return -ENOMEM;
++ 
++ 	result = scnprintf(str, len, "Linux NFSv%u.%u %s/%s",
++ 			clp->rpc_ops->version, clp->cl_minorversion,
++ 			nfs4_client_id_uniquifier,
++ 			clp->cl_rpcclient->cl_nodename);
++ 	if (result >= len) {
++ 		kfree(str);
++ 		return -EINVAL;
++ 	}
++ 	clp->cl_owner_id = str;
++ 	return 0;
++ }
++ 
++ static int
++ nfs4_init_uniform_client_string(struct nfs_client *clp)
++ {
++ 	int result;
++ 	size_t len;
++ 	char *str;
++ 
++ 	if (clp->cl_owner_id != NULL)
++ 		return 0;
++ 
++ 	if (nfs4_client_id_uniquifier[0] != '\0')
++ 		return nfs4_init_uniquifier_client_string(clp);
++ 
++ 	len = 10 + 10 + 1 + 10 + 1 +
++ 		strlen(clp->cl_rpcclient->cl_nodename) + 1;
++ 
++ 	if (len > NFS4_OPAQUE_LIMIT + 1)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Since this string is allocated at mount time, and held until the
++ 	 * nfs_client is destroyed, we can use GFP_KERNEL here w/o worrying
++ 	 * about a memory-reclaim deadlock.
++ 	 */
++ 	str = kmalloc(len, GFP_KERNEL);
++ 	if (!str)
++ 		return -ENOMEM;
++ 
++ 	result = scnprintf(str, len, "Linux NFSv%u.%u %s",
++ 			clp->rpc_ops->version, clp->cl_minorversion,
++ 			clp->cl_rpcclient->cl_nodename);
++ 	if (result >= len) {
++ 		kfree(str);
++ 		return -EINVAL;
++ 	}
++ 	clp->cl_owner_id = str;
++ 	return 0;
+++>>>>>>> 873e385116b2 (nfs: make nfs4_init_uniform_client_string use a dynamically allocated buffer)
+  }
+  
+  /*
+@@@ -5102,21 -5145,14 +5177,32 @@@ int nfs4_proc_setclientid(struct nfs_cl
+  
+  	/* nfs_client_id4 */
+  	nfs4_init_boot_verifier(clp, &sc_verifier);
+++<<<<<<< HEAD
+ +	if (test_bit(NFS_CS_MIGRATION, &clp->cl_flags))
+ +		setclientid.sc_name_len =
+ +				nfs4_init_uniform_client_string(clp,
+ +						setclientid.sc_name,
+ +						sizeof(setclientid.sc_name));
+ +	else
+ +		setclientid.sc_name_len =
+ +				nfs4_init_nonuniform_client_string(clp,
+ +						setclientid.sc_name,
+ +						sizeof(setclientid.sc_name));
+ +
+ +	if (!clp->cl_owner_id) {
+ +		status = -ENOMEM;
+ +		goto out;
+ +	}
+++=======
++ 
++ 	if (test_bit(NFS_CS_MIGRATION, &clp->cl_flags))
++ 		status = nfs4_init_uniform_client_string(clp);
++ 	else
++ 		status = nfs4_init_nonuniform_client_string(clp);
++ 
++ 	if (status)
++ 		goto out;
+++>>>>>>> 873e385116b2 (nfs: make nfs4_init_uniform_client_string use a dynamically allocated buffer)
+  
+  	/* cb_client4 */
+  	setclientid.sc_netid_len =
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index 9e76683d2c5f..dab9fad6c750 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -984,11 +984,8 @@ struct nfs4_readlink_res {
+ 	struct nfs4_sequence_res	seq_res;
+ };
+ 
+-#define NFS4_SETCLIENTID_NAMELEN	(127)
+ struct nfs4_setclientid {
+ 	const nfs4_verifier *		sc_verifier;
+-	unsigned int			sc_name_len;
+-	char				sc_name[NFS4_SETCLIENTID_NAMELEN + 1];
+ 	u32				sc_prog;
+ 	unsigned int			sc_netid_len;
+ 	char				sc_netid[RPCBIND_MAXNETIDLEN + 1];
+@@ -1142,12 +1139,9 @@ struct nfs41_state_protection {
+ 	struct nfs4_op_map allow;
+ };
+ 
+-#define NFS4_EXCHANGE_ID_LEN	(127)
+ struct nfs41_exchange_id_args {
+ 	struct nfs_client		*client;
+ 	nfs4_verifier			*verifier;
+-	unsigned int 			id_len;
+-	char 				id[NFS4_EXCHANGE_ID_LEN];
+ 	u32				flags;
+ 	struct nfs41_state_protection	state_protect;
+ };
