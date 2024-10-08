@@ -1,0 +1,181 @@
+KVM: nVMX: Rework interception of IRQs and NMIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/nvmx: Rework interception of IRQs and NMIs (Paolo Bonzini) [1116936]
+Rebuild_FUZZ: 96.77%
+commit-author Jan Kiszka <jan.kiszka@siemens.com>
+commit b6b8a1451fc40412c57d10c94b62e22acab28f94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b6b8a145.failed
+
+Move the check for leaving L2 on pending and intercepted IRQs or NMIs
+from the *_allowed handler into a dedicated callback. Invoke this
+callback at the relevant points before KVM checks if IRQs/NMIs can be
+injected. The callback has the task to switch from L2 to L1 if needed
+and inject the proper vmexit events.
+
+The rework fixes L2 wakeups from HLT and provides the foundation for
+preemption timer emulation.
+
+	Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b6b8a1451fc40412c57d10c94b62e22acab28f94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 827c1e271e94,11718b44a62d..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -4566,25 -4631,8 +4566,30 @@@ static void vmx_set_nmi_mask(struct kvm
+  
+  static int vmx_nmi_allowed(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	if (is_guest_mode(vcpu)) {
+ +		struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ +
+ +		if (to_vmx(vcpu)->nested.nested_run_pending)
+ +			return 0;
+ +		if (nested_exit_on_nmi(vcpu)) {
+ +			nested_vmx_vmexit(vcpu);
+ +			vmcs12->vm_exit_reason = EXIT_REASON_EXCEPTION_NMI;
+ +			vmcs12->vm_exit_intr_info = NMI_VECTOR |
+ +				INTR_TYPE_NMI_INTR | INTR_INFO_VALID_MASK;
+ +			/*
+ +			 * The NMI-triggered VM exit counts as injection:
+ +			 * clear this one and block further NMIs.
+ +			 */
+ +			vcpu->arch.nmi_pending = 0;
+ +			vmx_set_nmi_mask(vcpu, true);
+ +			return 0;
+ +		}
+ +	}
+++=======
++ 	if (to_vmx(vcpu)->nested.nested_run_pending)
++ 		return 0;
+++>>>>>>> b6b8a1451fc4 (KVM: nVMX: Rework interception of IRQs and NMIs)
+  
+  	if (!cpu_has_virtual_nmis() && to_vmx(vcpu)->soft_vnmi_blocked)
+  		return 0;
+@@@ -4596,23 -4644,8 +4601,28 @@@
+  
+  static int vmx_interrupt_allowed(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	if (is_guest_mode(vcpu)) {
+ +		struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ +
+ +		if (to_vmx(vcpu)->nested.nested_run_pending)
+ +			return 0;
+ +		if (nested_exit_on_intr(vcpu)) {
+ +			nested_vmx_vmexit(vcpu);
+ +			vmcs12->vm_exit_reason =
+ +				EXIT_REASON_EXTERNAL_INTERRUPT;
+ +			vmcs12->vm_exit_intr_info = 0;
+ +			/*
+ +			 * fall through to normal code, but now in L1, not L2
+ +			 */
+ +		}
+ +	}
+ +
+ +	return (vmcs_readl(GUEST_RFLAGS) & X86_EFLAGS_IF) &&
+++=======
++ 	return (!to_vmx(vcpu)->nested.nested_run_pending &&
++ 		vmcs_readl(GUEST_RFLAGS) & X86_EFLAGS_IF) &&
+++>>>>>>> b6b8a1451fc4 (KVM: nVMX: Rework interception of IRQs and NMIs)
+  		!(vmcs_read32(GUEST_INTERRUPTIBILITY_INFO) &
+  			(GUEST_INTR_STATE_STI | GUEST_INTR_STATE_MOV_SS));
+  }
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 020713b49e2a..a9d6fd89a408 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -765,6 +765,8 @@ struct kvm_x86_ops {
+ 			       enum x86_intercept_stage stage);
+ 	void (*handle_external_intr)(struct kvm_vcpu *vcpu);
+ 	bool (*mpx_supported)(void);
++
++	int (*check_nested_events)(struct kvm_vcpu *vcpu, bool external_intr);
+ };
+ 
+ struct kvm_arch_async_pf {
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 069e61ca9f37..24ceae4bf14d 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5825,8 +5825,10 @@ static void update_cr8_intercept(struct kvm_vcpu *vcpu)
+ 	kvm_x86_ops->update_cr8_intercept(vcpu, tpr, max_irr);
+ }
+ 
+-static void inject_pending_event(struct kvm_vcpu *vcpu)
++static int inject_pending_event(struct kvm_vcpu *vcpu, bool req_int_win)
+ {
++	int r;
++
+ 	/* try to reinject previous events if any */
+ 	if (vcpu->arch.exception.pending) {
+ 		trace_kvm_inj_exception(vcpu->arch.exception.nr,
+@@ -5836,17 +5838,23 @@ static void inject_pending_event(struct kvm_vcpu *vcpu)
+ 					  vcpu->arch.exception.has_error_code,
+ 					  vcpu->arch.exception.error_code,
+ 					  vcpu->arch.exception.reinject);
+-		return;
++		return 0;
+ 	}
+ 
+ 	if (vcpu->arch.nmi_injected) {
+ 		kvm_x86_ops->set_nmi(vcpu);
+-		return;
++		return 0;
+ 	}
+ 
+ 	if (vcpu->arch.interrupt.pending) {
+ 		kvm_x86_ops->set_irq(vcpu);
+-		return;
++		return 0;
++	}
++
++	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events) {
++		r = kvm_x86_ops->check_nested_events(vcpu, req_int_win);
++		if (r != 0)
++			return r;
+ 	}
+ 
+ 	/* try to inject new event if pending */
+@@ -5863,6 +5871,7 @@ static void inject_pending_event(struct kvm_vcpu *vcpu)
+ 			kvm_x86_ops->set_irq(vcpu);
+ 		}
+ 	}
++	return 0;
+ }
+ 
+ static void process_nmi(struct kvm_vcpu *vcpu)
+@@ -5967,10 +5976,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			goto out;
+ 		}
+ 
+-		inject_pending_event(vcpu);
+-
++		if (inject_pending_event(vcpu, req_int_win) != 0)
++			req_immediate_exit = true;
+ 		/* enable NMI/IRQ window open exits if needed */
+-		if (vcpu->arch.nmi_pending)
++		else if (vcpu->arch.nmi_pending)
+ 			req_immediate_exit =
+ 				kvm_x86_ops->enable_nmi_window(vcpu) != 0;
+ 		else if (kvm_cpu_has_injectable_intr(vcpu) || req_int_win)
+@@ -7299,6 +7308,9 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
+ 
+ int kvm_arch_vcpu_runnable(struct kvm_vcpu *vcpu)
+ {
++	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events)
++		kvm_x86_ops->check_nested_events(vcpu, false);
++
+ 	return (vcpu->arch.mp_state == KVM_MP_STATE_RUNNABLE &&
+ 		!vcpu->arch.apf.halted)
+ 		|| !list_empty_careful(&vcpu->async_pf.done)
