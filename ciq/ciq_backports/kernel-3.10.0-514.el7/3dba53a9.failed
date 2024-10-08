@@ -1,0 +1,156 @@
+dm thin: use __blkdev_issue_discard for async discard support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 3dba53a958a758fe7bed5002f6a2846e1acefe8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3dba53a9.failed
+
+With commit 38f25255330 ("block: add __blkdev_issue_discard") DM thinp
+no longer needs to carry its own async discard method.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Acked-by: Joe Thornber <ejt@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 3dba53a958a758fe7bed5002f6a2846e1acefe8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin.c
+diff --cc drivers/md/dm-thin.c
+index 6c9ed579302c,598a78ba894b..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -322,114 -322,6 +322,117 @@@ struct thin_c 
+  
+  /*----------------------------------------------------------------*/
+  
+++<<<<<<< HEAD
+ +/**
+ + * __blkdev_issue_discard_async - queue a discard with async completion
+ + * @bdev:	blockdev to issue discard for
+ + * @sector:	start sector
+ + * @nr_sects:	number of sectors to discard
+ + * @gfp_mask:	memory allocation flags (for bio_alloc)
+ + * @flags:	BLKDEV_IFL_* flags to control behaviour
+ + * @parent_bio: parent discard bio that all sub discards get chained to
+ + *
+ + * Description:
+ + *    Asynchronously issue a discard request for the sectors in question.
+ + *    NOTE: this variant of blk-core's blkdev_issue_discard() is a stop-gap
+ + *    that is being kept local to DM thinp until the block changes to allow
+ + *    late bio splitting land upstream.
+ + */
+ +static int __blkdev_issue_discard_async(struct block_device *bdev, sector_t sector,
+ +					sector_t nr_sects, gfp_t gfp_mask, unsigned long flags,
+ +					struct bio *parent_bio)
+ +{
+ +	struct request_queue *q = bdev_get_queue(bdev);
+ +	int type = REQ_WRITE | REQ_DISCARD;
+ +	unsigned int max_discard_sectors, granularity;
+ +	int alignment;
+ +	struct bio *bio;
+ +	int ret = 0;
+ +	struct blk_plug plug;
+ +
+ +	if (!q)
+ +		return -ENXIO;
+ +
+ +	if (!blk_queue_discard(q))
+ +		return -EOPNOTSUPP;
+ +
+ +	/* Zero-sector (unknown) and one-sector granularities are the same.  */
+ +	granularity = max(q->limits.discard_granularity >> 9, 1U);
+ +	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
+ +
+ +	/*
+ +	 * Ensure that max_discard_sectors is of the proper
+ +	 * granularity, so that requests stay aligned after a split.
+ +	 */
+ +	max_discard_sectors = min(q->limits.max_discard_sectors, UINT_MAX >> 9);
+ +	max_discard_sectors -= max_discard_sectors % granularity;
+ +	if (unlikely(!max_discard_sectors)) {
+ +		/* Avoid infinite loop below. Being cautious never hurts. */
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	if (flags & BLKDEV_DISCARD_SECURE) {
+ +		if (!blk_queue_secdiscard(q))
+ +			return -EOPNOTSUPP;
+ +		type |= REQ_SECURE;
+ +	}
+ +
+ +	blk_start_plug(&plug);
+ +	while (nr_sects) {
+ +		unsigned int req_sects;
+ +		sector_t end_sect, tmp;
+ +
+ +		/*
+ +		 * Required bio_put occurs in bio_endio thanks to bio_chain below
+ +		 */
+ +		bio = bio_alloc(gfp_mask, 1);
+ +		if (!bio) {
+ +			ret = -ENOMEM;
+ +			break;
+ +		}
+ +
+ +		req_sects = min_t(sector_t, nr_sects, max_discard_sectors);
+ +
+ +		/*
+ +		 * If splitting a request, and the next starting sector would be
+ +		 * misaligned, stop the discard at the previous aligned sector.
+ +		 */
+ +		end_sect = sector + req_sects;
+ +		tmp = end_sect;
+ +		if (req_sects < nr_sects &&
+ +		    sector_div(tmp, granularity) != alignment) {
+ +			end_sect = end_sect - alignment;
+ +			sector_div(end_sect, granularity);
+ +			end_sect = end_sect * granularity + alignment;
+ +			req_sects = end_sect - sector;
+ +		}
+ +
+ +		bio_chain(bio, parent_bio);
+ +
+ +		bio->bi_sector = sector;
+ +		bio->bi_bdev = bdev;
+ +
+ +		bio->bi_size = req_sects << 9;
+ +		nr_sects -= req_sects;
+ +		sector = end_sect;
+ +
+ +		submit_bio(type, bio);
+ +
+ +		/*
+ +		 * We can loop for a long time in here, if someone does
+ +		 * full device discards (like mkfs). Be nice and allow
+ +		 * us to schedule out to avoid softlocking if preempt
+ +		 * is disabled.
+ +		 */
+ +		cond_resched();
+ +	}
+ +	blk_finish_plug(&plug);
+ +
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 3dba53a958a7 (dm thin: use __blkdev_issue_discard for async discard support)
+  static bool block_size_is_power_of_two(struct pool *pool)
+  {
+  	return pool->sectors_per_block_shift >= 0;
+@@@ -1611,9 -1509,9 +1626,9 @@@ static void break_up_discard_bio(struc
+  		 *
+  		 * This per-mapping bi_remaining increment is paired with
+  		 * the implicit decrement that occurs via bio_endio() in
+- 		 * process_prepared_discard_{passdown,no_passdown}.
++ 		 * process_prepared_discard_passdown().
+  		 */
+ -		bio_inc_remaining(bio);
+ +		__bio_inc_remaining(bio);
+  		if (!dm_deferred_set_add_work(pool->all_io_ds, &m->list))
+  			pool->process_prepared_discard(m);
+  
+* Unmerged path drivers/md/dm-thin.c
