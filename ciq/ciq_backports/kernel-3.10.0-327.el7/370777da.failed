@@ -1,0 +1,78 @@
+KVM: VMX: fix vmwrite to invalid VMCS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Radim Krčmář <rkrcmar@redhat.com>
+commit 370777daab3f024f1645177039955088e2e9ae73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/370777da.failed
+
+fpu_activate is called outside of vcpu_load(), which means it should not
+touch VMCS, but fpu_activate needs to.  Avoid the call by moving it to a
+point where we know that the guest needs eager FPU and VMCS is loaded.
+
+This will get rid of the following trace
+
+ vmwrite error: reg 6800 value 0 (err 1)
+  [<ffffffff8162035b>] dump_stack+0x19/0x1b
+  [<ffffffffa046c701>] vmwrite_error+0x2c/0x2e [kvm_intel]
+  [<ffffffffa045f26f>] vmcs_writel+0x1f/0x30 [kvm_intel]
+  [<ffffffffa04617e5>] vmx_fpu_activate.part.61+0x45/0xb0 [kvm_intel]
+  [<ffffffffa0461865>] vmx_fpu_activate+0x15/0x20 [kvm_intel]
+  [<ffffffffa0560b91>] kvm_arch_vcpu_create+0x51/0x70 [kvm]
+  [<ffffffffa0548011>] kvm_vm_ioctl+0x1c1/0x760 [kvm]
+  [<ffffffff8118b55a>] ? handle_mm_fault+0x49a/0xec0
+  [<ffffffff811e47d5>] do_vfs_ioctl+0x2e5/0x4c0
+  [<ffffffff8127abbe>] ? file_has_perm+0xae/0xc0
+  [<ffffffff811e4a51>] SyS_ioctl+0xa1/0xc0
+  [<ffffffff81630949>] system_call_fastpath+0x16/0x1b
+
+(Note: we also unconditionally activate FPU in vmx_vcpu_reset(), so the
+ removed code added nothing.)
+
+Fixes: c447e76b4cab ("kvm/fpu: Enable eager restore kvm FPU for MPX")
+	Cc: <stable@vger.kernel.org>
+	Reported-by: Vlastimil Holer <vlastimil.holer@gmail.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 370777daab3f024f1645177039955088e2e9ae73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.c
+diff --cc arch/x86/kvm/cpuid.c
+index 292827dbed59,2fbea2544f24..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -97,7 -97,9 +97,13 @@@ int kvm_update_cpuid(struct kvm_vcpu *v
+  	if (best && (best->eax & (F(XSAVES) | F(XSAVEC))))
+  		best->ebx = xstate_required_size(vcpu->arch.xcr0, true);
+  
+++<<<<<<< HEAD
+ +	vcpu->arch.eager_fpu = guest_cpuid_has_mpx(vcpu);
+++=======
++ 	vcpu->arch.eager_fpu = use_eager_fpu() || guest_cpuid_has_mpx(vcpu);
++ 	if (vcpu->arch.eager_fpu)
++ 		kvm_x86_ops->fpu_activate(vcpu);
+++>>>>>>> 370777daab3f (KVM: VMX: fix vmwrite to invalid VMCS)
+  
+  	/*
+  	 * The existing code assumes virtual address is 48-bit in the canonical
+* Unmerged path arch/x86/kvm/cpuid.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b974c76d1459..b8dc82455bd4 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6989,11 +6989,6 @@ struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
+ 
+ 	vcpu = kvm_x86_ops->vcpu_create(kvm, id);
+ 
+-	/*
+-	 * Activate fpu unconditionally in case the guest needs eager FPU.  It will be
+-	 * deactivated soon if it doesn't.
+-	 */
+-	kvm_x86_ops->fpu_activate(vcpu);
+ 	return vcpu;
+ }
+ 
