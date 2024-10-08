@@ -1,0 +1,233 @@
+blk-mq: let blk_mq_tag_to_rq() take blk_mq_tags as the main parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [block] mtip32xx: let blk_mq_tag_to_rq() take blk_mq_tags as the main parameter (Mike Snitzer) [1105703]
+Rebuild_FUZZ: 91.43%
+commit-author Jens Axboe <axboe@fb.com>
+commit 0e62f51f8753b048f391ee2d7f2af1f7297b0be5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0e62f51f.failed
+
+We currently pass in the hardware queue, and get the tags from there.
+But from scsi-mq, with a shared tag space, it's a lot more convenient
+to pass in the blk_mq_tags instead as the hardware queue isn't always
+directly available. So instead of having to re-map to a given
+hardware queue from rq->mq_ctx, just pass in the tags structure.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0e62f51f8753b048f391ee2d7f2af1f7297b0be5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	drivers/block/mtip32xx/mtip32xx.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index db22b9855e34,4e4cd6208052..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -393,6 -461,91 +393,94 @@@ static void blk_mq_requeue_request(stru
+  		rq->nr_phys_segments--;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void blk_mq_requeue_request(struct request *rq)
++ {
++ 	__blk_mq_requeue_request(rq);
++ 	blk_clear_rq_complete(rq);
++ 
++ 	BUG_ON(blk_queued_rq(rq));
++ 	blk_mq_add_to_requeue_list(rq, true);
++ }
++ EXPORT_SYMBOL(blk_mq_requeue_request);
++ 
++ static void blk_mq_requeue_work(struct work_struct *work)
++ {
++ 	struct request_queue *q =
++ 		container_of(work, struct request_queue, requeue_work);
++ 	LIST_HEAD(rq_list);
++ 	struct request *rq, *next;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	list_splice_init(&q->requeue_list, &rq_list);
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ 
++ 	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
++ 		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
++ 			continue;
++ 
++ 		rq->cmd_flags &= ~REQ_SOFTBARRIER;
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, true, false, false);
++ 	}
++ 
++ 	while (!list_empty(&rq_list)) {
++ 		rq = list_entry(rq_list.next, struct request, queuelist);
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, false, false, false);
++ 	}
++ 
++ 	blk_mq_run_queues(q, false);
++ }
++ 
++ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
++ {
++ 	struct request_queue *q = rq->q;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * We abuse this flag that is otherwise used by the I/O scheduler to
++ 	 * request head insertation from the workqueue.
++ 	 */
++ 	BUG_ON(rq->cmd_flags & REQ_SOFTBARRIER);
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	if (at_head) {
++ 		rq->cmd_flags |= REQ_SOFTBARRIER;
++ 		list_add(&rq->queuelist, &q->requeue_list);
++ 	} else {
++ 		list_add_tail(&rq->queuelist, &q->requeue_list);
++ 	}
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ }
++ EXPORT_SYMBOL(blk_mq_add_to_requeue_list);
++ 
++ void blk_mq_kick_requeue_list(struct request_queue *q)
++ {
++ 	kblockd_schedule_work(&q->requeue_work);
++ }
++ EXPORT_SYMBOL(blk_mq_kick_requeue_list);
++ 
++ static inline bool is_flush_request(struct request *rq, unsigned int tag)
++ {
++ 	return ((rq->cmd_flags & REQ_FLUSH_SEQ) &&
++ 			rq->q->flush_rq->tag == tag);
++ }
++ 
++ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
++ {
++ 	struct request *rq = tags->rqs[tag];
++ 
++ 	if (!is_flush_request(rq, tag))
++ 		return rq;
++ 
++ 	return rq->q->flush_rq;
++ }
++ EXPORT_SYMBOL(blk_mq_tag_to_rq);
++ 
+++>>>>>>> 0e62f51f8753 (blk-mq: let blk_mq_tag_to_rq() take blk_mq_tags as the main parameter)
+  struct blk_mq_timeout_data {
+  	struct blk_mq_hw_ctx *hctx;
+  	unsigned long *next;
+@@@ -414,12 -567,13 +502,18 @@@ static void blk_mq_timeout_check(void *
+  	do {
+  		struct request *rq;
+  
+ -		tag = find_next_zero_bit(free_tags, hctx->tags->nr_tags, tag);
+ -		if (tag >= hctx->tags->nr_tags)
+ +		tag = find_next_zero_bit(free_tags, hctx->queue_depth, tag);
+ +		if (tag >= hctx->queue_depth)
+  			break;
+  
+++<<<<<<< HEAD
+ +		rq = hctx->rqs[tag++];
+ +
+++=======
++ 		rq = blk_mq_tag_to_rq(hctx->tags, tag++);
++ 		if (rq->q != hctx->queue)
++ 			continue;
+++>>>>>>> 0e62f51f8753 (blk-mq: let blk_mq_tag_to_rq() take blk_mq_tags as the main parameter)
+  		if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
+  			continue;
+  
+diff --cc drivers/block/mtip32xx/mtip32xx.c
+index 9912f3d7777e,74abd49fabdc..000000000000
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@@ -214,19 -188,22 +214,33 @@@ static int get_slot(struct mtip_port *p
+  }
+  
+  /*
+ - * Once we add support for one hctx per mtip group, this will change a bit
+ + * Release a command slot.
+ + *
+ + * @port Pointer to the port data structure.
+ + * @tag  Tag of command to release
+ + *
+ + * return value
+ + *	None
+   */
+ -static struct request *mtip_rq_from_tag(struct driver_data *dd,
+ -					unsigned int tag)
+ +static inline void release_slot(struct mtip_port *port, int tag)
+  {
+++<<<<<<< HEAD
+ +	smp_mb__before_clear_bit();
+ +	clear_bit(tag, port->allocated);
+ +	smp_mb__after_clear_bit();
+++=======
++ 	struct blk_mq_hw_ctx *hctx = dd->queue->queue_hw_ctx[0];
++ 
++ 	return blk_mq_tag_to_rq(hctx->tags, tag);
++ }
++ 
++ static struct mtip_cmd *mtip_cmd_from_tag(struct driver_data *dd,
++ 					  unsigned int tag)
++ {
++ 	struct request *rq = mtip_rq_from_tag(dd, tag);
++ 
++ 	return blk_mq_rq_to_pdu(rq);
+++>>>>>>> 0e62f51f8753 (blk-mq: let blk_mq_tag_to_rq() take blk_mq_tags as the main parameter)
+  }
+  
+  /*
+diff --cc include/linux/blk-mq.h
+index 53e154b834ca,0feedebfde48..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -125,26 -153,19 +125,32 @@@ void blk_mq_insert_request(struct reque
+  void blk_mq_run_queues(struct request_queue *q, bool async);
+  void blk_mq_free_request(struct request *rq);
+  bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+++<<<<<<< HEAD
+ +struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_rq_from_tag(struct request_queue *q, unsigned int tag);
+++=======
++ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
++ 		gfp_t gfp, bool reserved);
++ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+++>>>>>>> 0e62f51f8753 (blk-mq: let blk_mq_tag_to_rq() take blk_mq_tags as the main parameter)
+  
+  struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ -struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *, unsigned int);
+ +void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+  
+ -void blk_mq_end_io(struct request *rq, int error);
+ -void __blk_mq_end_io(struct request *rq, int error);
+ +bool blk_mq_end_io_partial(struct request *rq, int error,
+ +		unsigned int nr_bytes);
+ +static inline void blk_mq_end_io(struct request *rq, int error)
+ +{
+ +	bool done = !blk_mq_end_io_partial(rq, error, blk_rq_bytes(rq));
+ +	BUG_ON(!done);
+ +}
+  
+ -void blk_mq_requeue_request(struct request *rq);
+ -void blk_mq_add_to_requeue_list(struct request *rq, bool at_head);
+ -void blk_mq_kick_requeue_list(struct request_queue *q);
+ +/*
+ + * Complete request through potential IPI for right placement. Driver must
+ + * have defined a mq_ops->complete() hook for this.
+ + */
+  void blk_mq_complete_request(struct request *rq);
+  
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+* Unmerged path block/blk-mq.c
+* Unmerged path drivers/block/mtip32xx/mtip32xx.c
+* Unmerged path include/linux/blk-mq.h
