@@ -1,0 +1,169 @@
+x86/mpx: Use the new get_xsave_field_ptr()API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mpx: Use the new get_xsave_field_ptr()API (Rui Wang) [1138650]
+Rebuild_FUZZ: 95.35%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit a84eeaa96b36a03188e1423349669c108d3a4bd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a84eeaa9.failed
+
+The MPX registers (bndcsr/bndcfgu/bndstatus) are not directly
+accessible via normal instructions.  They essentially act as
+if they were floating point registers and are saved/restored
+along with those registers.
+
+There are two main paths in the MPX code where we care about
+the contents of these registers:
+
+	1. #BR (bounds) faults
+	2. the prctl() code where we are setting MPX up
+
+Both of those paths _might_ be called without the FPU having
+been used.  That means that 'tsk->thread.fpu.state' might
+never be allocated.
+
+Also, fpu_save_init() is not preempt-safe.  It was a bug to
+call it without disabling preemption.  The new
+get_xsave_addr() calls unlazy_fpu() instead and properly
+disables preemption.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Fenghua Yu <fenghua.yu@intel.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Suresh Siddha <sbsiddha@gmail.com>
+	Cc: bp@alien8.de
+Link: http://lkml.kernel.org/r/20150607183701.BC0D37CF@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a84eeaa96b36a03188e1423349669c108d3a4bd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mpx.h
+#	arch/x86/kernel/traps.c
+#	arch/x86/mm/mpx.c
+diff --cc arch/x86/kernel/traps.c
+index 9823443df079,42f15314b361..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -58,6 -58,9 +58,12 @@@
+  #include <asm/mce.h>
+  #include <asm/fixmap.h>
+  #include <asm/mach_traps.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/alternative.h>
++ #include <asm/fpu/xstate.h>
++ #include <asm/mpx.h>
+++>>>>>>> a84eeaa96b36 (x86/mpx: Use the new get_xsave_field_ptr()API)
+  
+  #ifdef CONFIG_X86_64
+  #include <asm/x86_init.h>
+@@@ -247,7 -369,88 +253,92 @@@ dotraplinkage void do_double_fault(stru
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +dotraplinkage void __kprobes
+++=======
++ dotraplinkage void do_bounds(struct pt_regs *regs, long error_code)
++ {
++ 	struct task_struct *tsk = current;
++ 	enum ctx_state prev_state;
++ 	const struct bndcsr *bndcsr;
++ 	siginfo_t *info;
++ 
++ 	prev_state = exception_enter();
++ 	if (notify_die(DIE_TRAP, "bounds", regs, error_code,
++ 			X86_TRAP_BR, SIGSEGV) == NOTIFY_STOP)
++ 		goto exit;
++ 	conditional_sti(regs);
++ 
++ 	if (!user_mode(regs))
++ 		die("bounds", regs, error_code);
++ 
++ 	if (!cpu_feature_enabled(X86_FEATURE_MPX)) {
++ 		/* The exception is not from Intel MPX */
++ 		goto exit_trap;
++ 	}
++ 
++ 	/*
++ 	 * We need to look at BNDSTATUS to resolve this exception.
++ 	 * A NULL here might mean that it is in its 'init state',
++ 	 * which is all zeros which indicates MPX was not
++ 	 * responsible for the exception.
++ 	 */
++ 	bndcsr = get_xsave_field_ptr(XSTATE_BNDCSR);
++ 	if (!bndcsr)
++ 		goto exit_trap;
++ 
++ 	/*
++ 	 * The error code field of the BNDSTATUS register communicates status
++ 	 * information of a bound range exception #BR or operation involving
++ 	 * bound directory.
++ 	 */
++ 	switch (bndcsr->bndstatus & MPX_BNDSTA_ERROR_CODE) {
++ 	case 2:	/* Bound directory has invalid entry. */
++ 		if (mpx_handle_bd_fault(tsk))
++ 			goto exit_trap;
++ 		break; /* Success, it was handled */
++ 	case 1: /* Bound violation. */
++ 		info = mpx_generate_siginfo(regs, tsk);
++ 		if (IS_ERR(info)) {
++ 			/*
++ 			 * We failed to decode the MPX instruction.  Act as if
++ 			 * the exception was not caused by MPX.
++ 			 */
++ 			goto exit_trap;
++ 		}
++ 		/*
++ 		 * Success, we decoded the instruction and retrieved
++ 		 * an 'info' containing the address being accessed
++ 		 * which caused the exception.  This information
++ 		 * allows and application to possibly handle the
++ 		 * #BR exception itself.
++ 		 */
++ 		do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, info);
++ 		kfree(info);
++ 		break;
++ 	case 0: /* No exception caused by Intel MPX operations. */
++ 		goto exit_trap;
++ 	default:
++ 		die("bounds", regs, error_code);
++ 	}
++ 
++ exit:
++ 	exception_exit(prev_state);
++ 	return;
++ exit_trap:
++ 	/*
++ 	 * This path out is for all the cases where we could not
++ 	 * handle the exception in some way (like allocating a
++ 	 * table or telling userspace about it.  We will also end
++ 	 * up here if the kernel has MPX turned off at compile
++ 	 * time..
++ 	 */
++ 	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, NULL);
++ 	exception_exit(prev_state);
++ }
++ 
++ dotraplinkage void
+++>>>>>>> a84eeaa96b36 (x86/mpx: Use the new get_xsave_field_ptr()API)
+  do_general_protection(struct pt_regs *regs, long error_code)
+  {
+  	struct task_struct *tsk;
+* Unmerged path arch/x86/include/asm/mpx.h
+* Unmerged path arch/x86/mm/mpx.c
+* Unmerged path arch/x86/include/asm/mpx.h
+* Unmerged path arch/x86/kernel/traps.c
+* Unmerged path arch/x86/mm/mpx.c
