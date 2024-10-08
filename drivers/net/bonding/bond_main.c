@@ -1324,6 +1324,7 @@ static void bond_compute_features(struct bonding *bond)
 
 	if (!bond->first_slave)
 		goto done;
+	vlan_features &= NETIF_F_ALL_FOR_ALL;
 
 	bond_for_each_slave(bond, slave, i) {
 		vlan_features = netdev_increment_features(vlan_features,
