@@ -1,0 +1,132 @@
+s390/signal: always restore saved runtime instrumentation psw bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [s390] signal: always restore saved runtime instrumentation psw bit (Hendrik Brueckner) [1029884]
+Rebuild_FUZZ: 96.00%
+commit-author Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+commit aa7e04b3808614980d474735cdb0bf35ac5cdf26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/aa7e04b3.failed
+
+Commit "s390: fix handling of runtime instrumentation psw bit" (5ebf250dab)
+changed the behavior of setting the runtime instrumentation psw bit.  This
+commit restores the original logic:
+
+1. When returning from the signal handler, the runtime instrumentation psw bit
+   is restored to its saved state.
+2. If the runtime instrumentation psw bit is enabled during the signal handler,
+   it is always turned off when leaving the signal handler.  The saved state
+   is restored as described in 1.  That also implies that turning on runtime
+   instrumentation in the signal handler is only effective while running in the
+   signal context.
+
+	Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+(cherry picked from commit aa7e04b3808614980d474735cdb0bf35ac5cdf26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/compat_signal.c
+#	arch/s390/kernel/signal.c
+diff --cc arch/s390/kernel/compat_signal.c
+index c439ac9ced09,95e7ba0fbb7e..000000000000
+--- a/arch/s390/kernel/compat_signal.c
++++ b/arch/s390/kernel/compat_signal.c
+@@@ -181,29 -183,36 +181,47 @@@ static int restore_sigregs32(struct pt_
+  	/* Alwys make any pending restarted system call return -EINTR */
+  	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+  
+++<<<<<<< HEAD
+ +	err = __copy_from_user(&regs32, &sregs->regs, sizeof(regs32));
+ +	if (err)
+ +		return err;
+ +	regs->psw.mask = (regs->psw.mask & ~PSW_MASK_USER) |
+ +		(__u64)(regs32.psw.mask & PSW32_MASK_USER) << 32 |
+ +		(__u64)(regs32.psw.addr & PSW32_ADDR_AMODE);
+++=======
++ 	if (__copy_from_user(&user_sregs, &sregs->regs, sizeof(user_sregs)))
++ 		return -EFAULT;
++ 
++ 	if (!is_ri_task(current) && (user_sregs.regs.psw.mask & PSW32_MASK_RI))
++ 		return -EINVAL;
++ 
++ 	/* Loading the floating-point-control word can fail. Do that first. */
++ 	if (restore_fp_ctl(&user_sregs.fpregs.fpc))
++ 		return -EINVAL;
++ 
++ 	/* Use regs->psw.mask instead of PSW_USER_BITS to preserve PER bit. */
++ 	regs->psw.mask = (regs->psw.mask & ~(PSW_MASK_USER | PSW_MASK_RI)) |
++ 		(__u64)(user_sregs.regs.psw.mask & PSW32_MASK_USER) << 32 |
++ 		(__u64)(user_sregs.regs.psw.mask & PSW32_MASK_RI) << 32 |
++ 		(__u64)(user_sregs.regs.psw.addr & PSW32_ADDR_AMODE);
+++>>>>>>> aa7e04b38086 (s390/signal: always restore saved runtime instrumentation psw bit)
+  	/* Check for invalid user address space control. */
+ -	if ((regs->psw.mask & PSW_MASK_ASC) == PSW_ASC_HOME)
+ -		regs->psw.mask = PSW_ASC_PRIMARY |
+ +	if ((regs->psw.mask & PSW_MASK_ASC) >= (psw_kernel_bits & PSW_MASK_ASC))
+ +		regs->psw.mask = (psw_user_bits & PSW_MASK_ASC) |
+  			(regs->psw.mask & ~PSW_MASK_ASC);
+ -	regs->psw.addr = (__u64)(user_sregs.regs.psw.addr & PSW32_ADDR_INSN);
+ +	regs->psw.addr = (__u64)(regs32.psw.addr & PSW32_ADDR_INSN);
+  	for (i = 0; i < NUM_GPRS; i++)
+ -		regs->gprs[i] = (__u64) user_sregs.regs.gprs[i];
+ -	memcpy(&current->thread.acrs, &user_sregs.regs.acrs,
+ -	       sizeof(current->thread.acrs));
+ +		regs->gprs[i] = (__u64) regs32.gprs[i];
+ +	memcpy(current->thread.acrs, regs32.acrs, sizeof(current->thread.acrs));
+  	restore_access_regs(current->thread.acrs);
+  
+ -	memcpy(&current->thread.fp_regs, &user_sregs.fpregs,
+ -	       sizeof(current->thread.fp_regs));
+ +	err = __copy_from_user(&current->thread.fp_regs, &sregs->fpregs,
+ +			       sizeof(_s390_fp_regs32));
+ +	current->thread.fp_regs.fpc &= FPC_VALID_MASK;
+ +	if (err)
+ +		return err;
+  
+ -	restore_fp_regs(current->thread.fp_regs.fprs);
+ +	restore_fp_regs(&current->thread.fp_regs);
+  	clear_thread_flag(TIF_SYSCALL);	/* No longer in a system call */
+  	return 0;
+  }
+diff --cc arch/s390/kernel/signal.c
+index c45becf82e01,d8fd508ccd1e..000000000000
+--- a/arch/s390/kernel/signal.c
++++ b/arch/s390/kernel/signal.c
+@@@ -82,15 -83,22 +82,31 @@@ static int restore_sigregs(struct pt_re
+  	/* Alwys make any pending restarted system call return -EINTR */
+  	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+  
+++<<<<<<< HEAD
+ +	err = __copy_from_user(&user_sregs, sregs, sizeof(_sigregs));
+ +	if (err)
+ +		return err;
+ +	/* Use regs->psw.mask instead of psw_user_bits to preserve PER bit. */
+ +	regs->psw.mask = (regs->psw.mask & ~PSW_MASK_USER) |
+ +		(user_sregs.regs.psw.mask & PSW_MASK_USER);
+++=======
++ 	if (__copy_from_user(&user_sregs, sregs, sizeof(user_sregs)))
++ 		return -EFAULT;
++ 
++ 	if (!is_ri_task(current) && (user_sregs.regs.psw.mask & PSW_MASK_RI))
++ 		return -EINVAL;
++ 
++ 	/* Loading the floating-point-control word can fail. Do that first. */
++ 	if (restore_fp_ctl(&user_sregs.fpregs.fpc))
++ 		return -EINVAL;
++ 
++ 	/* Use regs->psw.mask instead of PSW_USER_BITS to preserve PER bit. */
++ 	regs->psw.mask = (regs->psw.mask & ~(PSW_MASK_USER | PSW_MASK_RI)) |
++ 		(user_sregs.regs.psw.mask & (PSW_MASK_USER | PSW_MASK_RI));
+++>>>>>>> aa7e04b38086 (s390/signal: always restore saved runtime instrumentation psw bit)
+  	/* Check for invalid user address space control. */
+ -	if ((regs->psw.mask & PSW_MASK_ASC) == PSW_ASC_HOME)
+ -		regs->psw.mask = PSW_ASC_PRIMARY |
+ +	if ((regs->psw.mask & PSW_MASK_ASC) >= (psw_kernel_bits & PSW_MASK_ASC))
+ +		regs->psw.mask = (psw_user_bits & PSW_MASK_ASC) |
+  			(regs->psw.mask & ~PSW_MASK_ASC);
+  	/* Check for invalid amode */
+  	if (regs->psw.mask & PSW_MASK_EA)
+* Unmerged path arch/s390/kernel/compat_signal.c
+* Unmerged path arch/s390/kernel/signal.c
