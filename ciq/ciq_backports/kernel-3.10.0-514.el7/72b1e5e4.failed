@@ -1,0 +1,413 @@
+netfilter: bridge: reduce nf_bridge_info to 32 bytes again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 72b1e5e4cac72efa6b739b47e41f53e4520b4194
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/72b1e5e4.failed
+
+We can use union for most of the temporary cruft (original ipv4/ipv6
+address, source mac, physoutdev) since they're used during different
+stages of br netfilter traversal.
+
+Also get rid of the last two ->mask users.
+
+Shrinks struct from 48 to 32 on 64bit arch.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 72b1e5e4cac72efa6b739b47e41f53e4520b4194)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter_bridge.h
+#	include/linux/skbuff.h
+#	net/bridge/br_netfilter.c
+#	net/bridge/br_netfilter_ipv6.c
+#	net/ipv4/netfilter/nf_defrag_ipv4.c
+#	net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+diff --cc include/linux/netfilter_bridge.h
+index 91f08439b405,2437b8a5d7a9..000000000000
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@@ -15,93 -15,9 +15,96 @@@ enum nf_br_hook_priorities 
+  	NF_BR_PRI_LAST = INT_MAX,
+  };
+  
+ -#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +
+++<<<<<<< HEAD
+ +#define BRNF_PKT_TYPE			0x01
+ +#define BRNF_BRIDGED_DNAT		0x02
+ +#define BRNF_NF_BRIDGE_PREROUTING	0x08
+ +#define BRNF_8021Q			0x10
+ +#define BRNF_PPPoE			0x20
+ +
+ +static inline unsigned int nf_bridge_encap_header_len(const struct sk_buff *skb)
+ +{
+ +	switch (skb->protocol) {
+ +	case __cpu_to_be16(ETH_P_8021Q):
+ +		return VLAN_HLEN;
+ +	case __cpu_to_be16(ETH_P_PPP_SES):
+ +		return PPPOE_SES_HLEN;
+ +	default:
+ +		return 0;
+ +	}
+ +}
+ +
+ +static inline void nf_bridge_update_protocol(struct sk_buff *skb)
+ +{
+ +	if (skb->nf_bridge->mask & BRNF_8021Q)
+ +		skb->protocol = htons(ETH_P_8021Q);
+ +	else if (skb->nf_bridge->mask & BRNF_PPPoE)
+ +		skb->protocol = htons(ETH_P_PPP_SES);
+ +}
+ +
+ +/* Fill in the header for fragmented IP packets handled by
+ + * the IPv4 connection tracking code.
+ + *
+ + * Only used in br_forward.c
+ + */
+ +static inline int nf_bridge_copy_header(struct sk_buff *skb)
+ +{
+ +	int err;
+ +	unsigned int header_size;
+ +
+ +	nf_bridge_update_protocol(skb);
+ +	header_size = ETH_HLEN + nf_bridge_encap_header_len(skb);
+ +	err = skb_cow_head(skb, header_size);
+ +	if (err)
+ +		return err;
+ +
+ +	skb_copy_to_linear_data_offset(skb, -header_size,
+ +				       skb->nf_bridge->data, header_size);
+ +	__skb_push(skb, nf_bridge_encap_header_len(skb));
+ +	return 0;
+ +}
+  
+ +static inline int nf_bridge_maybe_copy_header(struct sk_buff *skb)
+ +{
+ +	if (skb->nf_bridge &&
+ +	    skb->nf_bridge->mask & (BRNF_BRIDGED | BRNF_BRIDGED_DNAT))
+ +		return nf_bridge_copy_header(skb);
+ +  	return 0;
+ +}
+ +
+ +static inline unsigned int nf_bridge_mtu_reduction(const struct sk_buff *skb)
+ +{
+ +	if (unlikely(skb->nf_bridge->mask & BRNF_PPPoE))
+ +		return PPPOE_SES_HLEN;
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again)
+  int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb);
+ +/* Only used in br_device.c */
+ +static inline int br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
+ +{
+ +	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+ +
+ +	skb_pull(skb, ETH_HLEN);
+ +	nf_bridge->mask ^= BRNF_BRIDGED_DNAT;
+ +	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN-ETH_ALEN),
+ +				       skb->nf_bridge->data, ETH_HLEN-ETH_ALEN);
+ +	skb->dev = nf_bridge->physindev;
+ +	return br_handle_frame_finish(NULL, skb);
+ +}
+ +
+ +/* This is called by the IP fragmenting code and it ensures there is
+ + * enough room for the encapsulating header (if there is one). */
+ +static inline unsigned int nf_bridge_pad(const struct sk_buff *skb)
+ +{
+ +	if (skb->nf_bridge)
+ +		return nf_bridge_encap_header_len(skb);
+ +	return 0;
+ +}
+  
+  static inline void br_drop_fake_rtable(struct sk_buff *skb)
+  {
+@@@ -111,10 -27,50 +114,55 @@@
+  		skb_dst_drop(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int nf_bridge_get_physinif(const struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge;
++ 
++ 	if (skb->nf_bridge == NULL)
++ 		return 0;
++ 
++ 	nf_bridge = skb->nf_bridge;
++ 	return nf_bridge->physindev ? nf_bridge->physindev->ifindex : 0;
++ }
++ 
++ static inline int nf_bridge_get_physoutif(const struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge;
++ 
++ 	if (skb->nf_bridge == NULL)
++ 		return 0;
++ 
++ 	nf_bridge = skb->nf_bridge;
++ 	return nf_bridge->physoutdev ? nf_bridge->physoutdev->ifindex : 0;
++ }
++ 
++ static inline struct net_device *
++ nf_bridge_get_physindev(const struct sk_buff *skb)
++ {
++ 	return skb->nf_bridge ? skb->nf_bridge->physindev : NULL;
++ }
++ 
++ static inline struct net_device *
++ nf_bridge_get_physoutdev(const struct sk_buff *skb)
++ {
++ 	return skb->nf_bridge ? skb->nf_bridge->physoutdev : NULL;
++ }
++ 
++ static inline bool nf_bridge_in_prerouting(const struct sk_buff *skb)
++ {
++ 	return skb->nf_bridge && skb->nf_bridge->in_prerouting;
++ }
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again)
+  #else
+ +#define nf_bridge_maybe_copy_header(skb)	(0)
+ +#define nf_bridge_pad(skb)			(0)
+  #define br_drop_fake_rtable(skb)	        do { } while (0)
++ static inline bool nf_bridge_in_prerouting(const struct sk_buff *skb)
++ {
++ 	return false;
++ }
+  #endif /* CONFIG_BRIDGE_NETFILTER */
+  
+  #endif
+diff --cc include/linux/skbuff.h
+index 2e271768b46a,ac732e67a6c8..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -163,13 -165,33 +163,40 @@@ struct nf_conntrack 
+  };
+  #endif
+  
+ -#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+  struct nf_bridge_info {
+  	atomic_t		use;
+++<<<<<<< HEAD
+ +	unsigned int		mask;
+ +	struct net_device	*physindev;
+ +	struct net_device	*physoutdev;
+ +	unsigned long		data[32 / sizeof(unsigned long)];
+++=======
++ 	enum {
++ 		BRNF_PROTO_UNCHANGED,
++ 		BRNF_PROTO_8021Q,
++ 		BRNF_PROTO_PPPOE
++ 	} orig_proto:8;
++ 	u8			pkt_otherhost:1;
++ 	u8			in_prerouting:1;
++ 	u8			bridged_dnat:1;
++ 	__u16			frag_max_size;
++ 	struct net_device	*physindev;
++ 	union {
++ 		/* prerouting: detect dnat in orig/reply direction */
++ 		__be32          ipv4_daddr;
++ 		struct in6_addr ipv6_daddr;
++ 
++ 		/* after prerouting + nat detected: store original source
++ 		 * mac since neigh resolution overwrites it, only used while
++ 		 * skb is out in neigh layer.
++ 		 */
++ 		char neigh_header[8];
++ 
++ 		/* always valid & non-NULL from FORWARD on, for physdev match */
++ 		struct net_device *physoutdev;
++ 	};
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again)
+  };
+  #endif
+  
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,ec51c2ba30e9..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -358,10 -281,11 +358,15 @@@ static int br_nf_pre_routing_finish_bri
+  			 */
+  			skb_copy_from_linear_data_offset(skb,
+  							 -(ETH_HLEN-ETH_ALEN),
+ -							 nf_bridge->neigh_header,
+ +							 skb->nf_bridge->data,
+  							 ETH_HLEN-ETH_ALEN);
+  			/* tell br_dev_xmit to continue with forwarding */
+++<<<<<<< HEAD:net/bridge/br_netfilter.c
+ +			nf_bridge->mask |= BRNF_BRIDGED_DNAT;
+++=======
++ 			nf_bridge->bridged_dnat = 1;
++ 			/* FIXME Need to refragment */
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again):net/bridge/br_netfilter_hooks.c
+  			ret = neigh->output(neigh, skb);
+  		}
+  		neigh_release(neigh);
+@@@ -434,12 -350,14 +439,17 @@@ static int br_nf_pre_routing_finish(str
+  	struct rtable *rt;
+  	int err;
+  
+ -	nf_bridge->frag_max_size = IPCB(skb)->frag_max_size;
+ -
+ -	if (nf_bridge->pkt_otherhost) {
+ +	if (nf_bridge->mask & BRNF_PKT_TYPE) {
+  		skb->pkt_type = PACKET_OTHERHOST;
+ -		nf_bridge->pkt_otherhost = false;
+ +		nf_bridge->mask ^= BRNF_PKT_TYPE;
+  	}
+++<<<<<<< HEAD:net/bridge/br_netfilter.c
+ +	nf_bridge->mask ^= BRNF_NF_BRIDGE_PREROUTING;
+ +	if (dnat_took_place(skb)) {
+++=======
++ 	nf_bridge->in_prerouting = 0;
++ 	if (br_nf_ipv4_daddr_was_changed(skb, nf_bridge)) {
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again):net/bridge/br_netfilter_hooks.c
+  		if ((err = ip_route_input(skb, iph->daddr, iph->saddr, iph->tos, dev))) {
+  			struct in_device *in_dev = __in_dev_get_rcu(dev);
+  
+@@@ -523,16 -441,17 +533,16 @@@ static struct net_device *setup_pre_rou
+  
+  	if (skb->pkt_type == PACKET_OTHERHOST) {
+  		skb->pkt_type = PACKET_HOST;
+ -		nf_bridge->pkt_otherhost = true;
+ +		nf_bridge->mask |= BRNF_PKT_TYPE;
+  	}
+  
+- 	nf_bridge->mask |= BRNF_NF_BRIDGE_PREROUTING;
++ 	nf_bridge->in_prerouting = 1;
+  	nf_bridge->physindev = skb->dev;
+  	skb->dev = brnf_get_logical_dev(skb, skb->dev);
+ -
+  	if (skb->protocol == htons(ETH_P_8021Q))
+ -		nf_bridge->orig_proto = BRNF_PROTO_8021Q;
+ +		nf_bridge->mask |= BRNF_8021Q;
+  	else if (skb->protocol == htons(ETH_P_PPP_SES))
+ -		nf_bridge->orig_proto = BRNF_PROTO_PPPOE;
+ +		nf_bridge->mask |= BRNF_PPPoE;
+  
+  	/* Must drop socket now because of tproxy. */
+  	skb_orphan(skb);
+@@@ -927,18 -848,54 +937,59 @@@ static unsigned int br_nf_post_routing(
+   * for the second time. */
+  static unsigned int ip_sabotage_in(const struct nf_hook_ops *ops,
+  				   struct sk_buff *skb,
+ +				   const struct net_device *in,
+ +				   const struct net_device *out,
+  				   const struct nf_hook_state *state)
+  {
+- 	if (skb->nf_bridge &&
+- 	    !(skb->nf_bridge->mask & BRNF_NF_BRIDGE_PREROUTING)) {
++ 	if (skb->nf_bridge && !skb->nf_bridge->in_prerouting)
+  		return NF_STOP;
+- 	}
+  
+  	return NF_ACCEPT;
+  }
+  
+++<<<<<<< HEAD:net/bridge/br_netfilter.c
+++=======
++ /* This is called when br_netfilter has called into iptables/netfilter,
++  * and DNAT has taken place on a bridge-forwarded packet.
++  *
++  * neigh->output has created a new MAC header, with local br0 MAC
++  * as saddr.
++  *
++  * This restores the original MAC saddr of the bridged packet
++  * before invoking bridge forward logic to transmit the packet.
++  */
++ static void br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
++ 
++ 	skb_pull(skb, ETH_HLEN);
++ 	nf_bridge->bridged_dnat = 0;
++ 
++ 	BUILD_BUG_ON(sizeof(nf_bridge->neigh_header) != (ETH_HLEN - ETH_ALEN));
++ 
++ 	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN - ETH_ALEN),
++ 				       nf_bridge->neigh_header,
++ 				       ETH_HLEN - ETH_ALEN);
++ 	skb->dev = nf_bridge->physindev;
++ 
++ 	nf_bridge->physoutdev = NULL;
++ 	br_handle_frame_finish(NULL, skb);
++ }
++ 
++ static int br_nf_dev_xmit(struct sk_buff *skb)
++ {
++ 	if (skb->nf_bridge && skb->nf_bridge->bridged_dnat) {
++ 		br_nf_pre_routing_finish_bridge_slow(skb);
++ 		return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static const struct nf_br_ops br_ops = {
++ 	.br_dev_xmit_hook =	br_nf_dev_xmit,
++ };
++ 
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again):net/bridge/br_netfilter_hooks.c
+  void br_netfilter_enable(void)
+  {
+  }
+diff --cc net/ipv4/netfilter/nf_defrag_ipv4.c
+index 98fb69342b21,b69e82bda215..000000000000
+--- a/net/ipv4/netfilter/nf_defrag_ipv4.c
++++ b/net/ipv4/netfilter/nf_defrag_ipv4.c
+@@@ -49,12 -49,9 +49,16 @@@ static enum ip_defrag_users nf_ct_defra
+  	if (skb->nfct)
+  		zone = nf_ct_zone((struct nf_conn *)skb->nfct);
+  #endif
+++<<<<<<< HEAD
+ +
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	if (skb->nf_bridge &&
+ +	    skb->nf_bridge->mask & BRNF_NF_BRIDGE_PREROUTING)
+++=======
++ 	if (nf_bridge_in_prerouting(skb))
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again)
+  		return IP_DEFRAG_CONNTRACK_BRIDGE_IN + zone;
+- #endif
++ 
+  	if (hooknum == NF_INET_PRE_ROUTING)
+  		return IP_DEFRAG_CONNTRACK_IN + zone;
+  	else
+diff --cc net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+index 1218e80349e4,267fb8d5876e..000000000000
+--- a/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
++++ b/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+@@@ -39,12 -39,9 +39,16 @@@ static enum ip6_defrag_users nf_ct6_def
+  	if (skb->nfct)
+  		zone = nf_ct_zone((struct nf_conn *)skb->nfct);
+  #endif
+++<<<<<<< HEAD
+ +
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	if (skb->nf_bridge &&
+ +	    skb->nf_bridge->mask & BRNF_NF_BRIDGE_PREROUTING)
+++=======
++ 	if (nf_bridge_in_prerouting(skb))
+++>>>>>>> 72b1e5e4cac7 (netfilter: bridge: reduce nf_bridge_info to 32 bytes again)
+  		return IP6_DEFRAG_CONNTRACK_BRIDGE_IN + zone;
+- #endif
++ 
+  	if (hooknum == NF_INET_PRE_ROUTING)
+  		return IP6_DEFRAG_CONNTRACK_IN + zone;
+  	else
+* Unmerged path net/bridge/br_netfilter_ipv6.c
+* Unmerged path include/linux/netfilter_bridge.h
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/bridge/br_netfilter.c
+* Unmerged path net/bridge/br_netfilter_ipv6.c
+* Unmerged path net/ipv4/netfilter/nf_defrag_ipv4.c
+* Unmerged path net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
