@@ -3970,25 +3970,23 @@ out:
 
 static int init_rmode_identity_map(struct kvm *kvm)
 {
-	int i, idx, r, ret = 0;
+	int i, idx, r = 0;
 	pfn_t identity_map_pfn;
 	u32 tmp;
 
 	if (!enable_ept)
-		return 1;
+		return 0;
 
 	/* Protect kvm->arch.ept_identity_pagetable_done. */
 	mutex_lock(&kvm->slots_lock);
 
-	if (likely(kvm->arch.ept_identity_pagetable_done)) {
-		ret = 1;
+	if (likely(kvm->arch.ept_identity_pagetable_done))
 		goto out2;
-	}
 
 	identity_map_pfn = kvm->arch.ept_identity_map_addr >> PAGE_SHIFT;
 
 	r = alloc_identity_pagetable(kvm);
-	if (r)
+	if (r < 0)
 		goto out2;
 
 	idx = srcu_read_lock(&kvm->srcu);
@@ -4005,13 +4003,13 @@ static int init_rmode_identity_map(struct kvm *kvm)
 			goto out;
 	}
 	kvm->arch.ept_identity_pagetable_done = true;
-	ret = 1;
+
 out:
 	srcu_read_unlock(&kvm->srcu, idx);
 
 out2:
 	mutex_unlock(&kvm->slots_lock);
-	return ret;
+	return r;
 }
 
 static void seg_setup(int seg)
@@ -7799,8 +7797,8 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 		if (!kvm->arch.ept_identity_map_addr)
 			kvm->arch.ept_identity_map_addr =
 				VMX_EPT_IDENTITY_PAGETABLE_ADDR;
-		err = -ENOMEM;
-		if (!init_rmode_identity_map(kvm))
+		err = init_rmode_identity_map(kvm);
+		if (err)
 			goto free_vmcs;
 	}
 
