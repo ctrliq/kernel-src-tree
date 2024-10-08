@@ -193,19 +193,9 @@ EXPORT_SYMBOL_GPL(watchdog_unregister_device);
 
 static int __init watchdog_init(void)
 {
-	int err;
-
-	watchdog_class = class_create(THIS_MODULE, "watchdog");
-	if (IS_ERR(watchdog_class)) {
-		pr_err("couldn't create class\n");
+	watchdog_class = watchdog_dev_init();
+	if (IS_ERR(watchdog_class))
 		return PTR_ERR(watchdog_class);
-	}
-
-	err = watchdog_dev_init();
-	if (err < 0) {
-		class_destroy(watchdog_class);
-		return err;
-	}
 
 	return 0;
 }
@@ -213,7 +203,6 @@ static int __init watchdog_init(void)
 static void __exit watchdog_exit(void)
 {
 	watchdog_dev_exit();
-	class_destroy(watchdog_class);
 	ida_destroy(&watchdog_ida);
 }
 
