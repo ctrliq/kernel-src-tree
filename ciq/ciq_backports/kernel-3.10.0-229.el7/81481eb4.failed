@@ -1,0 +1,521 @@
+blk-mq: fix and simplify tag iteration for the timeout handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 81481eb423c295c5480a3fab9bb961cf286c91e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/81481eb4.failed
+
+Don't do a kmalloc from timer to handle timeouts, chances are we could be
+under heavy load or similar and thus just miss out on the timeouts.
+Fortunately it is very easy to just iterate over all in use tags, and doing
+this properly actually cleans up the blk_mq_busy_iter API as well, and
+prepares us for the next patch by passing a reserved argument to the
+iterator.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 81481eb423c295c5480a3fab9bb961cf286c91e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+#	include/scsi/scsi_tcq.h
+diff --cc block/blk-mq-tag.c
+index d50cc52e39c1,b08788086414..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -103,31 -392,150 +103,60 @@@ void blk_mq_put_tag(struct blk_mq_tags 
+  		__blk_mq_put_reserved_tag(tags, tag);
+  }
+  
+++<<<<<<< HEAD
+ +static int __blk_mq_tag_iter(unsigned id, void *data)
+ +{
+ +	unsigned long *tag_map = data;
+ +	__set_bit(id, tag_map);
+ +	return 0;
+++=======
++ static void bt_for_each(struct blk_mq_hw_ctx *hctx,
++ 		struct blk_mq_bitmap_tags *bt, unsigned int off,
++ 		busy_iter_fn *fn, void *data, bool reserved)
++ {
++ 	struct request *rq;
++ 	int bit, i;
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		struct blk_align_bitmap *bm = &bt->map[i];
++ 
++ 		for (bit = find_first_bit(&bm->word, bm->depth);
++ 		     bit < bm->depth;
++ 		     bit = find_next_bit(&bm->word, bm->depth, bit + 1)) {
++ 		     	rq = blk_mq_tag_to_rq(hctx->tags, off + bit);
++ 			if (rq->q == hctx->queue)
++ 				fn(hctx, rq, data, reserved);
++ 		}
++ 
++ 		off += (1 << bt->bits_per_word);
++ 	}
+++>>>>>>> 81481eb423c2 (blk-mq: fix and simplify tag iteration for the timeout handler)
+  }
+  
+- void blk_mq_tag_busy_iter(struct blk_mq_tags *tags,
+- 			  void (*fn)(void *, unsigned long *), void *data)
++ void blk_mq_tag_busy_iter(struct blk_mq_hw_ctx *hctx, busy_iter_fn *fn,
++ 		void *priv)
+  {
+- 	unsigned long *tag_map;
+- 	size_t map_size;
++ 	struct blk_mq_tags *tags = hctx->tags;
+  
+++<<<<<<< HEAD
+ +	map_size = ALIGN(tags->nr_tags, BITS_PER_LONG) / BITS_PER_LONG;
+ +	tag_map = kzalloc(map_size * sizeof(unsigned long), GFP_ATOMIC);
+ +	if (!tag_map)
+ +		return;
+ +
+ +	percpu_ida_for_each_free(&tags->free_tags, __blk_mq_tag_iter, tag_map);
+ +	if (tags->nr_reserved_tags)
+ +		percpu_ida_for_each_free(&tags->reserved_tags, __blk_mq_tag_iter,
+ +			tag_map);
+ +
+ +	fn(data, tag_map);
+ +	kfree(tag_map);
+++=======
++ 	if (tags->nr_reserved_tags)
++ 		bt_for_each(hctx, &tags->breserved_tags, 0, fn, priv, true);
++ 	bt_for_each(hctx, &tags->bitmap_tags, tags->nr_reserved_tags, fn, priv,
++ 			false);
+ -}
+ -EXPORT_SYMBOL(blk_mq_tag_busy_iter);
+ -
+ -static unsigned int bt_unused_tags(struct blk_mq_bitmap_tags *bt)
+ -{
+ -	unsigned int i, used;
+ -
+ -	for (i = 0, used = 0; i < bt->map_nr; i++) {
+ -		struct blk_align_bitmap *bm = &bt->map[i];
+ -
+ -		used += bitmap_weight(&bm->word, bm->depth);
+ -	}
+ -
+ -	return bt->depth - used;
+ -}
+ -
+ -static void bt_update_count(struct blk_mq_bitmap_tags *bt,
+ -			    unsigned int depth)
+ -{
+ -	unsigned int tags_per_word = 1U << bt->bits_per_word;
+ -	unsigned int map_depth = depth;
+ -
+ -	if (depth) {
+ -		int i;
+ -
+ -		for (i = 0; i < bt->map_nr; i++) {
+ -			bt->map[i].depth = min(map_depth, tags_per_word);
+ -			map_depth -= bt->map[i].depth;
+ -		}
+ -	}
+ -
+ -	bt->wake_cnt = BT_WAIT_BATCH;
+ -	if (bt->wake_cnt > depth / 4)
+ -		bt->wake_cnt = max(1U, depth / 4);
+ -
+ -	bt->depth = depth;
+ -}
+ -
+ -static int bt_alloc(struct blk_mq_bitmap_tags *bt, unsigned int depth,
+ -			int node, bool reserved)
+ -{
+ -	int i;
+ -
+ -	bt->bits_per_word = ilog2(BITS_PER_LONG);
+ -
+ -	/*
+ -	 * Depth can be zero for reserved tags, that's not a failure
+ -	 * condition.
+ -	 */
+ -	if (depth) {
+ -		unsigned int nr, tags_per_word;
+ -
+ -		tags_per_word = (1 << bt->bits_per_word);
+ -
+ -		/*
+ -		 * If the tag space is small, shrink the number of tags
+ -		 * per word so we spread over a few cachelines, at least.
+ -		 * If less than 4 tags, just forget about it, it's not
+ -		 * going to work optimally anyway.
+ -		 */
+ -		if (depth >= 4) {
+ -			while (tags_per_word * 4 > depth) {
+ -				bt->bits_per_word--;
+ -				tags_per_word = (1 << bt->bits_per_word);
+ -			}
+ -		}
+ -
+ -		nr = ALIGN(depth, tags_per_word) / tags_per_word;
+ -		bt->map = kzalloc_node(nr * sizeof(struct blk_align_bitmap),
+ -						GFP_KERNEL, node);
+ -		if (!bt->map)
+ -			return -ENOMEM;
+ -
+ -		bt->map_nr = nr;
+ -	}
+ -
+ -	bt->bs = kzalloc(BT_WAIT_QUEUES * sizeof(*bt->bs), GFP_KERNEL);
+ -	if (!bt->bs) {
+ -		kfree(bt->map);
+ -		return -ENOMEM;
+ -	}
+ -
+ -	bt_update_count(bt, depth);
+ -
+ -	for (i = 0; i < BT_WAIT_QUEUES; i++) {
+ -		init_waitqueue_head(&bt->bs[i].wait);
+ -		atomic_set(&bt->bs[i].wait_cnt, bt->wake_cnt);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static void bt_free(struct blk_mq_bitmap_tags *bt)
+ -{
+ -	kfree(bt->map);
+ -	kfree(bt->bs);
+ -}
+ -
+ -static struct blk_mq_tags *blk_mq_init_bitmap_tags(struct blk_mq_tags *tags,
+ -						   int node)
+ -{
+ -	unsigned int depth = tags->nr_tags - tags->nr_reserved_tags;
+ -
+ -	if (bt_alloc(&tags->bitmap_tags, depth, node, false))
+ -		goto enomem;
+ -	if (bt_alloc(&tags->breserved_tags, tags->nr_reserved_tags, node, true))
+ -		goto enomem;
+ -
+ -	return tags;
+ -enomem:
+ -	bt_free(&tags->bitmap_tags);
+ -	kfree(tags);
+ -	return NULL;
+++>>>>>>> 81481eb423c2 (blk-mq: fix and simplify tag iteration for the timeout handler)
+  }
+  
+  struct blk_mq_tags *blk_mq_init_tags(unsigned int total_tags,
+diff --cc block/blk-mq.c
+index 6fcf1deefe8d,3baebcaf36db..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -372,77 -429,166 +372,230 @@@ static void blk_mq_requeue_request(stru
+  	struct request_queue *q = rq->q;
+  
+  	trace_block_rq_requeue(q, rq);
+ +	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+  
+ -	if (test_and_clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags)) {
+ -		if (q->dma_drain_size && blk_rq_bytes(rq))
+ -			rq->nr_phys_segments--;
+ -	}
+ +	rq->cmd_flags &= ~REQ_END;
+ +
+ +	if (q->dma_drain_size && blk_rq_bytes(rq))
+ +		rq->nr_phys_segments--;
+ +}
+ +
+++<<<<<<< HEAD
+ +struct blk_mq_timeout_data {
+ +	struct blk_mq_hw_ctx *hctx;
+ +	unsigned long *next;
+ +	unsigned int *next_set;
+ +};
+ +
+ +static void blk_mq_timeout_check(void *__data, unsigned long *free_tags)
+ +{
+ +	struct blk_mq_timeout_data *data = __data;
+ +	struct blk_mq_hw_ctx *hctx = data->hctx;
+ +	unsigned int tag;
+ +
+ +	 /* It may not be in flight yet (this is where
+ +	 * the REQ_ATOMIC_STARTED flag comes in). The requests are
+ +	 * statically allocated, so we know it's always safe to access the
+ +	 * memory associated with a bit offset into ->rqs[].
+ +	 */
+ +	tag = 0;
+ +	do {
+ +		struct request *rq;
+ +
+ +		tag = find_next_zero_bit(free_tags, hctx->queue_depth, tag);
+ +		if (tag >= hctx->queue_depth)
+ +			break;
+ +
+ +		rq = hctx->rqs[tag++];
+ +
+ +		if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
+ +			continue;
+ +
+ +		blk_rq_check_expired(rq, data->next, data->next_set);
+ +	} while (1);
+ +}
+ +
+ +static void blk_mq_hw_ctx_check_timeout(struct blk_mq_hw_ctx *hctx,
+ +					unsigned long *next,
+ +					unsigned int *next_set)
+ +{
+ +	struct blk_mq_timeout_data data = {
+ +		.hctx		= hctx,
+ +		.next		= next,
+ +		.next_set	= next_set,
+ +	};
+ +
+ +	/*
+ +	 * Ask the tagging code to iterate busy requests, so we can
+ +	 * check them for timeout.
+ +	 */
+ +	blk_mq_tag_busy_iter(hctx->tags, blk_mq_timeout_check, &data);
+  }
+  
+ +static void blk_mq_rq_timer(unsigned long data)
+++=======
++ void blk_mq_requeue_request(struct request *rq)
+  {
+- 	struct request_queue *q = (struct request_queue *) data;
++ 	__blk_mq_requeue_request(rq);
++ 	blk_clear_rq_complete(rq);
++ 
++ 	BUG_ON(blk_queued_rq(rq));
++ 	blk_mq_add_to_requeue_list(rq, true);
++ }
++ EXPORT_SYMBOL(blk_mq_requeue_request);
++ 
++ static void blk_mq_requeue_work(struct work_struct *work)
++ {
++ 	struct request_queue *q =
++ 		container_of(work, struct request_queue, requeue_work);
++ 	LIST_HEAD(rq_list);
++ 	struct request *rq, *next;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	list_splice_init(&q->requeue_list, &rq_list);
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ 
++ 	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
++ 		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
++ 			continue;
++ 
++ 		rq->cmd_flags &= ~REQ_SOFTBARRIER;
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, true, false, false);
++ 	}
++ 
++ 	while (!list_empty(&rq_list)) {
++ 		rq = list_entry(rq_list.next, struct request, queuelist);
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, false, false, false);
++ 	}
++ 
++ 	/*
++ 	 * Use the start variant of queue running here, so that running
++ 	 * the requeue work will kick stopped queues.
++ 	 */
++ 	blk_mq_start_hw_queues(q);
++ }
++ 
++ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
++ {
++ 	struct request_queue *q = rq->q;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * We abuse this flag that is otherwise used by the I/O scheduler to
++ 	 * request head insertation from the workqueue.
++ 	 */
++ 	BUG_ON(rq->cmd_flags & REQ_SOFTBARRIER);
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	if (at_head) {
++ 		rq->cmd_flags |= REQ_SOFTBARRIER;
++ 		list_add(&rq->queuelist, &q->requeue_list);
++ 	} else {
++ 		list_add_tail(&rq->queuelist, &q->requeue_list);
++ 	}
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ }
++ EXPORT_SYMBOL(blk_mq_add_to_requeue_list);
++ 
++ void blk_mq_kick_requeue_list(struct request_queue *q)
++ {
++ 	kblockd_schedule_work(&q->requeue_work);
++ }
++ EXPORT_SYMBOL(blk_mq_kick_requeue_list);
++ 
++ static inline bool is_flush_request(struct request *rq, unsigned int tag)
++ {
++ 	return ((rq->cmd_flags & REQ_FLUSH_SEQ) &&
++ 			rq->q->flush_rq->tag == tag);
++ }
++ 
++ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
++ {
++ 	struct request *rq = tags->rqs[tag];
++ 
++ 	if (!is_flush_request(rq, tag))
++ 		return rq;
++ 
++ 	return rq->q->flush_rq;
++ }
++ EXPORT_SYMBOL(blk_mq_tag_to_rq);
++ 
++ static enum blk_eh_timer_return blk_mq_rq_timed_out(struct request *rq)
++ {
++ 	struct request_queue *q = rq->q;
++ 
++ 	/*
++ 	 * We know that complete is set at this point. If STARTED isn't set
++ 	 * anymore, then the request isn't active and the "timeout" should
++ 	 * just be ignored. This can happen due to the bitflag ordering.
++ 	 * Timeout first checks if STARTED is set, and if it is, assumes
++ 	 * the request is active. But if we race with completion, then
++ 	 * we both flags will get cleared. So check here again, and ignore
++ 	 * a timeout event with a request that isn't active.
++ 	 */
++ 	if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
++ 		return BLK_EH_NOT_HANDLED;
++ 
++ 	if (!q->mq_ops->timeout)
++ 		return BLK_EH_RESET_TIMER;
++ 
++ 	return q->mq_ops->timeout(rq);
++ }
++ 		
++ struct blk_mq_timeout_data {
++ 	unsigned long next;
++ 	unsigned int next_set;
++ };
++ 
++ static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
++ 		struct request *rq, void *priv, bool reserved)
+++>>>>>>> 81481eb423c2 (blk-mq: fix and simplify tag iteration for the timeout handler)
++ {
++ 	struct blk_mq_timeout_data *data = priv;
++ 
++ 	if (test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
++ 		blk_rq_check_expired(rq, &data->next, &data->next_set);
++ }
++ 
++ static void blk_mq_rq_timer(unsigned long priv)
++ {
++ 	struct request_queue *q = (struct request_queue *)priv;
++ 	struct blk_mq_timeout_data data = {
++ 		.next		= 0,
++ 		.next_set	= 0,
++ 	};
+  	struct blk_mq_hw_ctx *hctx;
+- 	unsigned long next = 0;
+- 	int i, next_set = 0;
++ 	int i;
+  
+++<<<<<<< HEAD
+ +	queue_for_each_hw_ctx(q, hctx, i)
+ +		blk_mq_hw_ctx_check_timeout(hctx, &next, &next_set);
+ +
+ +	if (next_set)
+ +		mod_timer(&q->timeout, round_jiffies_up(next));
+++=======
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		/*
++ 		 * If not software queues are currently mapped to this
++ 		 * hardware queue, there's nothing to check
++ 		 */
++ 		if (!hctx->nr_ctx || !hctx->tags)
++ 			continue;
++ 
++ 		blk_mq_tag_busy_iter(hctx, blk_mq_check_expired, &data);
++ 	}
++ 
++ 	if (data.next_set) {
++ 		data.next = blk_rq_timeout(round_jiffies_up(data.next));
++ 		mod_timer(&q->timeout, data.next);
++ 	} else {
++ 		queue_for_each_hw_ctx(q, hctx, i)
++ 			blk_mq_tag_idle(hctx);
++ 	}
+++>>>>>>> 81481eb423c2 (blk-mq: fix and simplify tag iteration for the timeout handler)
+  }
+  
+  /*
+diff --cc include/linux/blk-mq.h
+index 712a6b843fbe,0eb0f642be4b..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -59,15 -69,26 +59,18 @@@ struct blk_mq_reg 
+  	int			numa_node;
+  	unsigned int		timeout;
+  	unsigned int		flags;		/* BLK_MQ_F_* */
+ -	void			*driver_data;
+ -
+ -	struct blk_mq_tags	**tags;
+ -
+ -	struct mutex		tag_list_lock;
+ -	struct list_head	tag_list;
+  };
+  
+ -typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *, bool);
+ +typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+  typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+ +typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+ +typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+  typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+  typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ -typedef int (init_request_fn)(void *, struct request *, unsigned int,
+ -		unsigned int, unsigned int);
+ -typedef void (exit_request_fn)(void *, struct request *, unsigned int,
+ -		unsigned int);
+  
++ typedef void (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
++ 		bool);
++ 
+  struct blk_mq_ops {
+  	/*
+  	 * Queue request
+@@@ -151,7 -174,11 +154,13 @@@ void blk_mq_complete_request(struct req
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+  void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);
+  void blk_mq_stop_hw_queues(struct request_queue *q);
+ -void blk_mq_start_hw_queues(struct request_queue *q);
+  void blk_mq_start_stopped_hw_queues(struct request_queue *q, bool async);
+++<<<<<<< HEAD
+++=======
++ void blk_mq_delay_queue(struct blk_mq_hw_ctx *hctx, unsigned long msecs);
++ void blk_mq_tag_busy_iter(struct blk_mq_hw_ctx *hctx, busy_iter_fn *fn,
++ 		void *priv);
+++>>>>>>> 81481eb423c2 (blk-mq: fix and simplify tag iteration for the timeout handler)
+  
+  /*
+   * Driver command data is immediately after the request. So subtract request
+diff --cc include/scsi/scsi_tcq.h
+index 81dd12edc38c,e64583560701..000000000000
+--- a/include/scsi/scsi_tcq.h
++++ b/include/scsi/scsi_tcq.h
+@@@ -67,7 -67,8 +67,12 @@@ static inline void scsi_activate_tcq(st
+  	if (!sdev->tagged_supported)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (!blk_queue_tagged(sdev->request_queue))
+++=======
++ 	if (!shost_use_blk_mq(sdev->host) &&
++ 	    !blk_queue_tagged(sdev->request_queue))
+++>>>>>>> 81481eb423c2 (blk-mq: fix and simplify tag iteration for the timeout handler)
+  		blk_queue_init_tags(sdev->request_queue, depth,
+  				    sdev->host->bqt);
+  
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
+* Unmerged path include/scsi/scsi_tcq.h
