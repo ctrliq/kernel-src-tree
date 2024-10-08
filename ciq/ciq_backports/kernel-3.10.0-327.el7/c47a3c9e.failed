@@ -1,0 +1,449 @@
+IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon (Amir Vadai) [1164539]
+Rebuild_FUZZ: 97.71%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit c47a3c9ed5be167f49a6fd3f696dac03536282eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c47a3c9e.failed
+
+iscsi daemon is in user-space, thus we can't rely on it to be invoked
+at connection teardown (if not running or does not receive CPU time).
+
+This patch addresses the issue by re-structuring iSER connection
+teardown logic and CM events handling.
+
+The CM events will dictate the RDMA resources destruction (ib_conn)
+and iser_conn is kept around as long as iscsi_conn is left around
+allowing iscsi/iser callbacks to continue after RDMA transport was
+destroyed.
+
+This patch introduces a separation in logic when handling CM events:
+
+- DISCONNECTED_HANDLER, ADDR_CHANGED
+  This events indicate the start of teardown process.
+  Actions:
+  1. Terminate the connection: rdma_disconnect (send DREQ/DREP)
+  2. Notify iSCSI of connection failure
+  3. Change state to TERMINATING
+  4. Poll for all flush errors to be consumed
+
+- TIMEWAIT_EXIT, DEVICE_REMOVAL
+  These events indicate the final stage of termination process and
+  we can free RDMA related resources.
+  Actions:
+  1. Call disconnected handler (we are not guaranteed that DISCONNECTED
+     event was invoked in the past)
+  2. Cleanup RDMA related resources
+  3. For DEVICE_REMOVAL return non-zero rc from cma_handler to
+     implicitly destroy the cm_id (Can't rely on user-space, make sure
+     we have forward progress)
+
+We replace flush_completion (indicate all flushes were consumed) with
+ib_completion (rdma resources were cleaned up).
+
+The iser_conn_release_work will wait for teardown completions:
+
+- conn_stop was completed (tasks were cleaned-up) - stop_completion
+- RDMA resources were destroyed - ib_completion
+
+And then will continue to free iser connection representation (iser_conn).
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+	Signed-off-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit c47a3c9ed5be167f49a6fd3f696dac03536282eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index 9f0e0e34d6ca,95c484d0f881..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -329,13 -368,11 +329,13 @@@ struct iser_conn 
+  	unsigned		     qp_max_recv_dtos; /* num of rx buffers */
+  	unsigned		     qp_max_recv_dtos_mask; /* above minus 1 */
+  	unsigned		     min_posted_rx; /* qp_max_recv_dtos >> 2 */
+ +	int                          post_recv_buf_count; /* posted rx count  */
+ +	atomic_t                     post_send_buf_count; /* posted tx count   */
+  	char 			     name[ISER_OBJECT_NAME_SIZE];
+  	struct work_struct	     release_work;
+- 	struct completion	     stop_completion;
+  	struct mutex		     state_mutex;
+- 	struct completion	     flush_completion;
++ 	struct completion	     stop_completion;
++ 	struct completion	     ib_completion;
+  	struct completion	     up_completion;
+  	struct list_head	     conn_list;       /* entry in ig conn list */
+  
+@@@ -419,11 -438,11 +419,15 @@@ void iscsi_iser_recv(struct iscsi_conn 
+  		     char                   *rx_data,
+  		     int                    rx_data_len);
+  
+ -void iser_conn_init(struct iser_conn *iser_conn);
+ +void iser_conn_init(struct iser_conn *ib_conn);
+  
+ -void iser_conn_release(struct iser_conn *iser_conn);
+ +void iser_conn_release(struct iser_conn *ib_conn);
+  
+++<<<<<<< HEAD
+ +void iser_conn_terminate(struct iser_conn *ib_conn);
+++=======
++ int iser_conn_terminate(struct iser_conn *iser_conn);
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  
+  void iser_release_work(struct work_struct *work);
+  
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index fbf2a1e0f2e2,6170d06a8acc..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -591,51 -565,81 +592,107 @@@ static int iser_conn_state_comp_exch(st
+  
+  void iser_release_work(struct work_struct *work)
+  {
+ -	struct iser_conn *iser_conn;
+ +	struct iser_conn *ib_conn;
+  	int rc;
+  
+ -	iser_conn = container_of(work, struct iser_conn, release_work);
+ +	ib_conn = container_of(work, struct iser_conn, release_work);
+  
+  	/* wait for .conn_stop callback */
+ -	rc = wait_for_completion_timeout(&iser_conn->stop_completion, 30 * HZ);
+ +	rc = wait_for_completion_timeout(&ib_conn->stop_completion, 30 * HZ);
+ +	WARN_ON(rc == 0);
+ +
+++<<<<<<< HEAD
+ +	/* wait for the qp`s post send and post receive buffers to empty */
+ +	rc = wait_for_completion_timeout(&ib_conn->flush_completion, 30 * HZ);
+  	WARN_ON(rc == 0);
+  
+ +	ib_conn->state = ISER_CONN_DOWN;
+++=======
++ 	rc = wait_for_completion_timeout(&iser_conn->ib_completion, 30 * HZ);
++ 	if (rc == 0)
++ 		iser_warn("conn %p, IB cleanup didn't complete in 30 "
++ 			  "seconds, continue with release\n", iser_conn);
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  
+ -	mutex_lock(&iser_conn->state_mutex);
+ -	iser_conn->state = ISER_CONN_DOWN;
+ -	mutex_unlock(&iser_conn->state_mutex);
+ +	mutex_lock(&ib_conn->state_mutex);
+ +	ib_conn->state = ISER_CONN_DOWN;
+ +	mutex_unlock(&ib_conn->state_mutex);
+  
+++<<<<<<< HEAD
+ +	iser_conn_release(ib_conn);
+++=======
++ 	iser_conn_release(iser_conn);
++ }
++ 
++ /**
++  * iser_free_ib_conn_res - release IB related resources
++  * @iser_conn: iser connection struct
++  * @destroy_device: indicator if we need to try to release
++  *     the iser device (only iscsi shutdown and DEVICE_REMOVAL
++  *     will use this.
++  *
++  * This routine is called with the iser state mutex held
++  * so the cm_id removal is out of here. It is Safe to
++  * be invoked multiple times.
++  */
++ static void iser_free_ib_conn_res(struct iser_conn *iser_conn,
++ 				  bool destroy_device)
++ {
++ 	struct ib_conn *ib_conn = &iser_conn->ib_conn;
++ 	struct iser_device *device = ib_conn->device;
++ 
++ 	iser_info("freeing conn %p cma_id %p qp %p\n",
++ 		  iser_conn, ib_conn->cma_id, ib_conn->qp);
++ 
++ 	iser_free_rx_descriptors(iser_conn);
++ 
++ 	if (ib_conn->qp != NULL) {
++ 		ib_conn->device->cq_active_qps[ib_conn->cq_index]--;
++ 		rdma_destroy_qp(ib_conn->cma_id);
++ 		ib_conn->qp = NULL;
++ 	}
++ 
++ 	if (destroy_device && device != NULL) {
++ 		iser_device_try_release(device);
++ 		ib_conn->device = NULL;
++ 	}
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  }
+  
+  /**
+   * Frees all conn objects and deallocs conn descriptor
+   */
+ -void iser_conn_release(struct iser_conn *iser_conn)
+ +void iser_conn_release(struct iser_conn *ib_conn)
+  {
+ -	struct ib_conn *ib_conn = &iser_conn->ib_conn;
+ +	struct iser_device  *device = ib_conn->device;
+  
+  	mutex_lock(&ig.connlist_mutex);
+ -	list_del(&iser_conn->conn_list);
+ +	list_del(&ib_conn->conn_list);
+  	mutex_unlock(&ig.connlist_mutex);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ib_conn->state_mutex);
+ +	BUG_ON(ib_conn->state != ISER_CONN_DOWN);
+++=======
++ 	mutex_lock(&iser_conn->state_mutex);
++ 	BUG_ON(iser_conn->state != ISER_CONN_DOWN);
++ 	/*
++ 	 * In case we never got to bind stage, we still need to
++ 	 * release IB resources (which is safe to call more than once).
++ 	 */
++ 	iser_free_ib_conn_res(iser_conn, true);
++ 	mutex_unlock(&iser_conn->state_mutex);
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+ +
+ +	iser_free_rx_descriptors(ib_conn);
+ +	iser_free_ib_conn_res(ib_conn);
+ +	ib_conn->device = NULL;
+ +	/* on EVENT_ADDR_ERROR there's no device yet for this conn */
+ +	if (device != NULL)
+ +		iser_device_try_release(device);
+ +	mutex_unlock(&ib_conn->state_mutex);
+  
+ +	/* if cma handler context, the caller actually destroy the id */
+  	if (ib_conn->cma_id != NULL) {
+  		rdma_destroy_id(ib_conn->cma_id);
+  		ib_conn->cma_id = NULL;
+@@@ -644,22 -649,68 +701,79 @@@
+  }
+  
+  /**
+-  * triggers start of the disconnect procedures and wait for them to be done
++  * iser_poll_for_flush_errors - Don't settle for less than all.
++  * @struct ib_conn: IB context of the connection
++  *
++  * This routine is called when the QP is in error state
++  * It polls the send CQ until all flush errors are consumed and
++  * returns when all flush errors were processed.
+   */
+++<<<<<<< HEAD
+ +void iser_conn_terminate(struct iser_conn *ib_conn)
+++=======
++ static void iser_poll_for_flush_errors(struct ib_conn *ib_conn)
++ {
++ 	struct iser_device *device = ib_conn->device;
++ 	int count = 0;
++ 
++ 	while (ib_conn->post_recv_buf_count > 0 ||
++ 	       atomic_read(&ib_conn->post_send_buf_count) > 0) {
++ 		msleep(100);
++ 		if (atomic_read(&ib_conn->post_send_buf_count) > 0)
++ 			iser_drain_tx_cq(device, ib_conn->cq_index);
++ 
++ 		count++;
++ 		/* Don't flood with prints */
++ 		if (count % 30 == 0)
++ 			iser_dbg("post_recv %d post_send %d",
++ 				 ib_conn->post_recv_buf_count,
++ 				 atomic_read(&ib_conn->post_send_buf_count));
++ 	}
++ }
++ 
++ /**
++  * triggers start of the disconnect procedures and wait for them to be done
++  * Called with state mutex held
++  */
++ int iser_conn_terminate(struct iser_conn *iser_conn)
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  {
+ -	struct ib_conn *ib_conn = &iser_conn->ib_conn;
+  	int err = 0;
+  
+- 	/* change the ib conn state only if the conn is UP, however always call
+- 	 * rdma_disconnect since this is the only way to cause the CMA to change
+- 	 * the QP state to ERROR
+- 	 */
++ 	/* terminate the iser conn only if the conn state is UP */
++ 	if (!iser_conn_state_comp_exch(iser_conn, ISER_CONN_UP,
++ 				       ISER_CONN_TERMINATING))
++ 		return 0;
+  
+++<<<<<<< HEAD
+ +	iser_conn_state_comp_exch(ib_conn, ISER_CONN_UP, ISER_CONN_TERMINATING);
+ +	err = rdma_disconnect(ib_conn->cma_id);
+ +	if (err)
+ +		iser_err("Failed to disconnect, conn: 0x%p err %d\n",
+ +			 ib_conn,err);
+++=======
++ 	iser_info("iser_conn %p state %d\n", iser_conn, iser_conn->state);
++ 
++ 	/* suspend queuing of new iscsi commands */
++ 	if (iser_conn->iscsi_conn)
++ 		iscsi_suspend_queue(iser_conn->iscsi_conn);
++ 
++ 	/*
++ 	 * In case we didn't already clean up the cma_id (peer initiated
++ 	 * a disconnection), we need to Cause the CMA to change the QP
++ 	 * state to ERROR.
++ 	 */
++ 	if (ib_conn->cma_id) {
++ 		err = rdma_disconnect(ib_conn->cma_id);
++ 		if (err)
++ 			iser_err("Failed to disconnect, conn: 0x%p err %d\n",
++ 				 iser_conn, err);
++ 
++ 		iser_poll_for_flush_errors(ib_conn);
++ 	}
++ 
++ 	return 1;
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  }
+  
+  /**
+@@@ -779,35 -833,38 +893,67 @@@ static void iser_connected_handler(stru
+  
+  static void iser_disconnected_handler(struct rdma_cm_id *cma_id)
+  {
+++<<<<<<< HEAD
+ +	struct iser_conn *ib_conn;
+ +
+ +	ib_conn = (struct iser_conn *)cma_id->context;
+ +
+ +	/* getting here when the state is UP means that the conn is being *
+ +	 * terminated asynchronously from the iSCSI layer's perspective.  */
+ +	if (iser_conn_state_comp_exch(ib_conn, ISER_CONN_UP,
+ +					ISER_CONN_TERMINATING)){
+ +		if (ib_conn->iscsi_conn)
+ +			iscsi_conn_failure(ib_conn->iscsi_conn, ISCSI_ERR_CONN_FAILED);
+ +		else
+ +			iser_err("iscsi_iser connection isn't bound\n");
+ +	}
+ +
+ +	/* Complete the termination process if no posts are pending. This code
+ +	 * block also exists in iser_handle_comp_error(), but it is needed here
+ +	 * for cases of no flushes at all, e.g. discovery over rdma.
+ +	 */
+ +	if (ib_conn->post_recv_buf_count == 0 &&
+ +	    (atomic_read(&ib_conn->post_send_buf_count) == 0)) {
+ +		complete(&ib_conn->flush_completion);
+ +	}
+++=======
++ 	struct iser_conn *iser_conn = (struct iser_conn *)cma_id->context;
++ 
++ 	if (iser_conn_terminate(iser_conn)) {
++ 		if (iser_conn->iscsi_conn)
++ 			iscsi_conn_failure(iser_conn->iscsi_conn,
++ 					   ISCSI_ERR_CONN_FAILED);
++ 		else
++ 			iser_err("iscsi_iser connection isn't bound\n");
++ 	}
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  }
+  
++ static void iser_cleanup_handler(struct rdma_cm_id *cma_id,
++ 				 bool destroy_device)
++ {
++ 	struct iser_conn *iser_conn = (struct iser_conn *)cma_id->context;
++ 
++ 	/*
++ 	 * We are not guaranteed that we visited disconnected_handler
++ 	 * by now, call it here to be safe that we handle CM drep
++ 	 * and flush errors.
++ 	 */
++ 	iser_disconnected_handler(cma_id);
++ 	iser_free_ib_conn_res(iser_conn, destroy_device);
++ 	complete(&iser_conn->ib_completion);
++ };
++ 
+  static int iser_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+  {
+++<<<<<<< HEAD
+ +	struct iser_conn *ib_conn;
+++=======
++ 	struct iser_conn *iser_conn;
++ 	int ret = 0;
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  
+ -	iser_conn = (struct iser_conn *)cma_id->context;
+ +	ib_conn = (struct iser_conn *)cma_id->context;
+  	iser_info("event %d status %d conn %p id %p\n",
+  		  event->event, event->status, cma_id->context, cma_id);
+  
+@@@ -839,21 -907,22 +996,39 @@@
+  		iser_err("Unexpected RDMA CM event (%d)\n", event->event);
+  		break;
+  	}
+++<<<<<<< HEAD
+ +	mutex_unlock(&ib_conn->state_mutex);
+ +	return 0;
+++=======
++ 	mutex_unlock(&iser_conn->state_mutex);
++ 
++ 	return ret;
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  }
+  
+ -void iser_conn_init(struct iser_conn *iser_conn)
+ +void iser_conn_init(struct iser_conn *ib_conn)
+  {
+++<<<<<<< HEAD
+ +	ib_conn->state = ISER_CONN_INIT;
+ +	ib_conn->post_recv_buf_count = 0;
+ +	atomic_set(&ib_conn->post_send_buf_count, 0);
+ +	init_completion(&ib_conn->stop_completion);
+ +	init_completion(&ib_conn->flush_completion);
+ +	init_completion(&ib_conn->up_completion);
+ +	INIT_LIST_HEAD(&ib_conn->conn_list);
+ +	spin_lock_init(&ib_conn->lock);
+ +	mutex_init(&ib_conn->state_mutex);
+++=======
++ 	iser_conn->state = ISER_CONN_INIT;
++ 	iser_conn->ib_conn.post_recv_buf_count = 0;
++ 	atomic_set(&iser_conn->ib_conn.post_send_buf_count, 0);
++ 	init_completion(&iser_conn->stop_completion);
++ 	init_completion(&iser_conn->ib_completion);
++ 	init_completion(&iser_conn->up_completion);
++ 	INIT_LIST_HEAD(&iser_conn->conn_list);
++ 	spin_lock_init(&iser_conn->ib_conn.lock);
++ 	mutex_init(&iser_conn->state_mutex);
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  }
+  
+   /**
+@@@ -1095,23 -1169,6 +1270,26 @@@ static void iser_handle_comp_error(stru
+  {
+  	if (desc && desc->type == ISCSI_TX_DATAOUT)
+  		kmem_cache_free(ig.desc_cache, desc);
+++<<<<<<< HEAD
+ +
+ +	if (ib_conn->post_recv_buf_count == 0 &&
+ +	    atomic_read(&ib_conn->post_send_buf_count) == 0) {
+ +		/**
+ +		 * getting here when the state is UP means that the conn is
+ +		 * being terminated asynchronously from the iSCSI layer's
+ +		 * perspective. It is safe to peek at the connection state
+ +		 * since iscsi_conn_failure is allowed to be called twice.
+ +		 **/
+ +		if (ib_conn->state == ISER_CONN_UP)
+ +			iscsi_conn_failure(ib_conn->iscsi_conn,
+ +					   ISCSI_ERR_CONN_FAILED);
+ +
+ +		/* no more non completed posts to the QP, complete the
+ +		 * termination process w.o worrying on disconnect event */
+ +		complete(&ib_conn->flush_completion);
+ +	}
+++=======
+++>>>>>>> c47a3c9ed5be (IB/iser: Fix DEVICE REMOVAL handling in the absence of iscsi daemon)
+  }
+  
+  static int iser_drain_tx_cq(struct iser_device  *device, int cq_index)
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
