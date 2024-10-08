@@ -1,0 +1,679 @@
+sched/numa: Set preferred NUMA node based on number of private faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Mel Gorman <mgorman@suse.de>
+commit b795854b1fa70f6aee923ae5df74ff7afeaddcaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/b795854b.failed
+
+Ideally it would be possible to distinguish between NUMA hinting faults that
+are private to a task and those that are shared. If treated identically
+there is a risk that shared pages bounce between nodes depending on
+the order they are referenced by tasks. Ultimately what is desirable is
+that task private pages remain local to the task while shared pages are
+interleaved between sharing tasks running on different nodes to give good
+average performance. This is further complicated by THP as even
+applications that partition their data may not be partitioning on a huge
+page boundary.
+
+To start with, this patch assumes that multi-threaded or multi-process
+applications partition their data and that in general the private accesses
+are more important for cpu->memory locality in the general case. Also,
+no new infrastructure is required to treat private pages properly but
+interleaving for shared pages requires additional infrastructure.
+
+To detect private accesses the pid of the last accessing task is required
+but the storage requirements are a high. This patch borrows heavily from
+Ingo Molnar's patch "numa, mm, sched: Implement last-CPU+PID hash tracking"
+to encode some bits from the last accessing task in the page flags as
+well as the node information. Collisions will occur but it is better than
+just depending on the node information. Node information is then used to
+determine if a page needs to migrate. The PID information is used to detect
+private/shared accesses. The preferred NUMA node is selected based on where
+the maximum number of approximately private faults were measured. Shared
+faults are not taken into consideration for a few reasons.
+
+First, if there are many tasks sharing the page then they'll all move
+towards the same node. The node will be compute overloaded and then
+scheduled away later only to bounce back again. Alternatively the shared
+tasks would just bounce around nodes because the fault information is
+effectively noise. Either way accounting for shared faults the same as
+private faults can result in lower performance overall.
+
+The second reason is based on a hypothetical workload that has a small
+number of very important, heavily accessed private pages but a large shared
+array. The shared array would dominate the number of faults and be selected
+as a preferred node even though it's the wrong decision.
+
+The third reason is that multiple threads in a process will race each
+other to fault the shared page making the fault information unreliable.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+[ Fix complication error when !NUMA_BALANCING. ]
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1381141781-10992-30-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b795854b1fa70f6aee923ae5df74ff7afeaddcaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+#	mm/huge_memory.c
+#	mm/memory.c
+diff --cc kernel/sched/fair.c
+index ee90b28e4ef6,b1de7c55e9f7..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -876,16 -988,30 +876,36 @@@ static void task_numa_placement(struct 
+  /*
+   * Got a PROT_NONE fault for a page on @node.
+   */
+++<<<<<<< HEAD
+ +void task_numa_fault(int node, int pages, bool migrated)
+++=======
++ void task_numa_fault(int last_nidpid, int node, int pages, bool migrated)
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  {
+  	struct task_struct *p = current;
+ -	int priv;
+  
+  	if (!numabalancing_enabled)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* for example, ksmd faulting in a user's mm */
++ 	if (!p->mm)
++ 		return;
++ 
++ 	/*
++ 	 * First accesses are treated as private, otherwise consider accesses
++ 	 * to be private if the accessing pid has not changed
++ 	 */
++ 	if (!nidpid_pid_unset(last_nidpid))
++ 		priv = ((p->pid & LAST__PID_MASK) == nidpid_to_pid(last_nidpid));
++ 	else
++ 		priv = 1;
++ 
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  	/* Allocate buffer to track faults on a per-node basis */
+  	if (unlikely(!p->numa_faults)) {
+ -		int size = sizeof(*p->numa_faults) * 2 * nr_node_ids;
+ +		int size = sizeof(*p->numa_faults) * nr_node_ids;
+  
+  		/* numa_faults and numa_faults_buffer share the allocation */
+  		p->numa_faults = kzalloc(size * 2, GFP_KERNEL|__GFP_NOWARN);
+diff --cc mm/huge_memory.c
+index ba9f65152a91,0baf0e4d5203..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1294,7 -1282,7 +1294,11 @@@ int do_huge_pmd_numa_page(struct mm_str
+  	struct page *page;
+  	unsigned long haddr = addr & HPAGE_PMD_MASK;
+  	int page_nid = -1, this_nid = numa_node_id();
+++<<<<<<< HEAD
+ +	int target_nid;
+++=======
++ 	int target_nid, last_nidpid = -1;
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  	bool page_locked;
+  	bool migrated = false;
+  
+@@@ -1305,6 -1293,7 +1309,10 @@@
+  	page = pmd_page(pmd);
+  	BUG_ON(is_huge_zero_page(page));
+  	page_nid = page_to_nid(page);
+++<<<<<<< HEAD
+++=======
++ 	last_nidpid = page_nidpid_last(page);
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  	count_vm_numa_event(NUMA_HINT_FAULTS);
+  	if (page_nid == this_nid)
+  		count_vm_numa_event(NUMA_HINT_FAULTS_LOCAL);
+@@@ -1373,7 -1362,7 +1381,11 @@@ out
+  		page_unlock_anon_vma_read(anon_vma);
+  
+  	if (page_nid != -1)
+++<<<<<<< HEAD
+ +		task_numa_fault(page_nid, HPAGE_PMD_NR, migrated);
+++=======
++ 		task_numa_fault(last_nidpid, page_nid, HPAGE_PMD_NR, migrated);
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  
+  	return 0;
+  }
+diff --cc mm/memory.c
+index 6285e7df615f,cc7f20691c82..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3533,6 -3536,7 +3533,10 @@@ int do_numa_page(struct mm_struct *mm, 
+  	struct page *page = NULL;
+  	spinlock_t *ptl;
+  	int page_nid = -1;
+++<<<<<<< HEAD
+++=======
++ 	int last_nidpid;
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  	int target_nid;
+  	bool migrated = false;
+  
+@@@ -3563,6 -3567,7 +3567,10 @@@
+  	}
+  	BUG_ON(is_zero_pfn(page_to_pfn(page)));
+  
+++<<<<<<< HEAD
+++=======
++ 	last_nidpid = page_nidpid_last(page);
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  	page_nid = page_to_nid(page);
+  	target_nid = numa_migrate_prep(page, vma, addr, page_nid);
+  	pte_unmap_unlock(ptep, ptl);
+@@@ -3578,7 -3583,7 +3586,11 @@@
+  
+  out:
+  	if (page_nid != -1)
+++<<<<<<< HEAD
+ +		task_numa_fault(page_nid, 1, migrated);
+++=======
++ 		task_numa_fault(last_nidpid, page_nid, 1, migrated);
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  	return 0;
+  }
+  
+@@@ -3593,6 -3598,7 +3605,10 @@@ static int do_pmd_numa_page(struct mm_s
+  	unsigned long offset;
+  	spinlock_t *ptl;
+  	bool numa = false;
+++<<<<<<< HEAD
+++=======
++ 	int last_nidpid;
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  
+  	spin_lock(&mm->page_table_lock);
+  	pmd = *pmdp;
+@@@ -3637,6 -3643,7 +3653,10 @@@
+  		if (unlikely(!page))
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		last_nidpid = page_nidpid_last(page);
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  		page_nid = page_to_nid(page);
+  		target_nid = numa_migrate_prep(page, vma, addr, page_nid);
+  		pte_unmap_unlock(pte, ptl);
+@@@ -3649,7 -3656,7 +3669,11 @@@
+  		}
+  
+  		if (page_nid != -1)
+++<<<<<<< HEAD
+ +			task_numa_fault(page_nid, 1, migrated);
+++=======
++ 			task_numa_fault(last_nidpid, page_nid, 1, migrated);
+++>>>>>>> b795854b1fa7 (sched/numa: Set preferred NUMA node based on number of private faults)
+  
+  		pte = pte_offset_map_lock(mm, pmdp, addr, &ptl);
+  	}
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 958e9efd02a7..3ab858c35cd4 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -585,11 +585,11 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
+  * sets it, so none of the operations on it need to be atomic.
+  */
+ 
+-/* Page flags: | [SECTION] | [NODE] | ZONE | [LAST_NID] | ... | FLAGS | */
++/* Page flags: | [SECTION] | [NODE] | ZONE | [LAST_NIDPID] | ... | FLAGS | */
+ #define SECTIONS_PGOFF		((sizeof(unsigned long)*8) - SECTIONS_WIDTH)
+ #define NODES_PGOFF		(SECTIONS_PGOFF - NODES_WIDTH)
+ #define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
+-#define LAST_NID_PGOFF		(ZONES_PGOFF - LAST_NID_WIDTH)
++#define LAST_NIDPID_PGOFF	(ZONES_PGOFF - LAST_NIDPID_WIDTH)
+ 
+ /*
+  * Define the bit shifts to access each section.  For non-existent
+@@ -599,7 +599,7 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
+ #define SECTIONS_PGSHIFT	(SECTIONS_PGOFF * (SECTIONS_WIDTH != 0))
+ #define NODES_PGSHIFT		(NODES_PGOFF * (NODES_WIDTH != 0))
+ #define ZONES_PGSHIFT		(ZONES_PGOFF * (ZONES_WIDTH != 0))
+-#define LAST_NID_PGSHIFT	(LAST_NID_PGOFF * (LAST_NID_WIDTH != 0))
++#define LAST_NIDPID_PGSHIFT	(LAST_NIDPID_PGOFF * (LAST_NIDPID_WIDTH != 0))
+ 
+ /* NODE:ZONE or SECTION:ZONE is used to ID a zone for the buddy allocator */
+ #ifdef NODE_NOT_IN_PAGE_FLAGS
+@@ -621,7 +621,7 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
+ #define ZONES_MASK		((1UL << ZONES_WIDTH) - 1)
+ #define NODES_MASK		((1UL << NODES_WIDTH) - 1)
+ #define SECTIONS_MASK		((1UL << SECTIONS_WIDTH) - 1)
+-#define LAST_NID_MASK		((1UL << LAST_NID_WIDTH) - 1)
++#define LAST_NIDPID_MASK	((1UL << LAST_NIDPID_WIDTH) - 1)
+ #define ZONEID_MASK		((1UL << ZONEID_SHIFT) - 1)
+ 
+ static inline enum zone_type page_zonenum(const struct page *page)
+@@ -665,48 +665,93 @@ static inline int page_to_nid(const struct page *page)
+ #endif
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+-#ifdef LAST_NID_NOT_IN_PAGE_FLAGS
+-static inline int page_nid_xchg_last(struct page *page, int nid)
++static inline int nid_pid_to_nidpid(int nid, int pid)
+ {
+-	return xchg(&page->_last_nid, nid);
++	return ((nid & LAST__NID_MASK) << LAST__PID_SHIFT) | (pid & LAST__PID_MASK);
+ }
+ 
+-static inline int page_nid_last(struct page *page)
++static inline int nidpid_to_pid(int nidpid)
+ {
+-	return page->_last_nid;
++	return nidpid & LAST__PID_MASK;
+ }
+-static inline void page_nid_reset_last(struct page *page)
++
++static inline int nidpid_to_nid(int nidpid)
++{
++	return (nidpid >> LAST__PID_SHIFT) & LAST__NID_MASK;
++}
++
++static inline bool nidpid_pid_unset(int nidpid)
++{
++	return nidpid_to_pid(nidpid) == (-1 & LAST__PID_MASK);
++}
++
++static inline bool nidpid_nid_unset(int nidpid)
+ {
+-	page->_last_nid = -1;
++	return nidpid_to_nid(nidpid) == (-1 & LAST__NID_MASK);
++}
++
++#ifdef LAST_NIDPID_NOT_IN_PAGE_FLAGS
++static inline int page_nidpid_xchg_last(struct page *page, int nid)
++{
++	return xchg(&page->_last_nidpid, nid);
++}
++
++static inline int page_nidpid_last(struct page *page)
++{
++	return page->_last_nidpid;
++}
++static inline void page_nidpid_reset_last(struct page *page)
++{
++	page->_last_nidpid = -1;
+ }
+ #else
+-static inline int page_nid_last(struct page *page)
++static inline int page_nidpid_last(struct page *page)
+ {
+-	return (page->flags >> LAST_NID_PGSHIFT) & LAST_NID_MASK;
++	return (page->flags >> LAST_NIDPID_PGSHIFT) & LAST_NIDPID_MASK;
+ }
+ 
+-extern int page_nid_xchg_last(struct page *page, int nid);
++extern int page_nidpid_xchg_last(struct page *page, int nidpid);
+ 
+-static inline void page_nid_reset_last(struct page *page)
++static inline void page_nidpid_reset_last(struct page *page)
+ {
+-	int nid = (1 << LAST_NID_SHIFT) - 1;
++	int nidpid = (1 << LAST_NIDPID_SHIFT) - 1;
+ 
+-	page->flags &= ~(LAST_NID_MASK << LAST_NID_PGSHIFT);
+-	page->flags |= (nid & LAST_NID_MASK) << LAST_NID_PGSHIFT;
++	page->flags &= ~(LAST_NIDPID_MASK << LAST_NIDPID_PGSHIFT);
++	page->flags |= (nidpid & LAST_NIDPID_MASK) << LAST_NIDPID_PGSHIFT;
+ }
+-#endif /* LAST_NID_NOT_IN_PAGE_FLAGS */
++#endif /* LAST_NIDPID_NOT_IN_PAGE_FLAGS */
+ #else
+-static inline int page_nid_xchg_last(struct page *page, int nid)
++static inline int page_nidpid_xchg_last(struct page *page, int nidpid)
+ {
+ 	return page_to_nid(page);
+ }
+ 
+-static inline int page_nid_last(struct page *page)
++static inline int page_nidpid_last(struct page *page)
+ {
+ 	return page_to_nid(page);
+ }
+ 
+-static inline void page_nid_reset_last(struct page *page)
++static inline int nidpid_to_nid(int nidpid)
++{
++	return -1;
++}
++
++static inline int nidpid_to_pid(int nidpid)
++{
++	return -1;
++}
++
++static inline int nid_pid_to_nidpid(int nid, int pid)
++{
++	return -1;
++}
++
++static inline bool nidpid_pid_unset(int nidpid)
++{
++	return 1;
++}
++
++static inline void page_nidpid_reset_last(struct page *page)
+ {
+ }
+ #endif
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index ace9a5f01c64..ccb20b923743 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -174,8 +174,8 @@ struct page {
+ 	void *shadow;
+ #endif
+ 
+-#ifdef LAST_NID_NOT_IN_PAGE_FLAGS
+-	int _last_nid;
++#ifdef LAST_NIDPID_NOT_IN_PAGE_FLAGS
++	int _last_nidpid;
+ #endif
+ }
+ /*
+diff --git a/include/linux/page-flags-layout.h b/include/linux/page-flags-layout.h
+index 93506a114034..02bc9184f16b 100644
+--- a/include/linux/page-flags-layout.h
++++ b/include/linux/page-flags-layout.h
+@@ -38,10 +38,10 @@
+  * The last is when there is insufficient space in page->flags and a separate
+  * lookup is necessary.
+  *
+- * No sparsemem or sparsemem vmemmap: |       NODE     | ZONE |          ... | FLAGS |
+- *         " plus space for last_nid: |       NODE     | ZONE | LAST_NID ... | FLAGS |
+- * classic sparse with space for node:| SECTION | NODE | ZONE |          ... | FLAGS |
+- *         " plus space for last_nid: | SECTION | NODE | ZONE | LAST_NID ... | FLAGS |
++ * No sparsemem or sparsemem vmemmap: |       NODE     | ZONE |             ... | FLAGS |
++ *      " plus space for last_nidpid: |       NODE     | ZONE | LAST_NIDPID ... | FLAGS |
++ * classic sparse with space for node:| SECTION | NODE | ZONE |             ... | FLAGS |
++ *      " plus space for last_nidpid: | SECTION | NODE | ZONE | LAST_NIDPID ... | FLAGS |
+  * classic sparse no space for node:  | SECTION |     ZONE    | ... | FLAGS |
+  */
+ #if defined(CONFIG_SPARSEMEM) && !defined(CONFIG_SPARSEMEM_VMEMMAP)
+@@ -62,15 +62,21 @@
+ #endif
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+-#define LAST_NID_SHIFT NODES_SHIFT
++#define LAST__PID_SHIFT 8
++#define LAST__PID_MASK  ((1 << LAST__PID_SHIFT)-1)
++
++#define LAST__NID_SHIFT NODES_SHIFT
++#define LAST__NID_MASK  ((1 << LAST__NID_SHIFT)-1)
++
++#define LAST_NIDPID_SHIFT (LAST__PID_SHIFT+LAST__NID_SHIFT)
+ #else
+-#define LAST_NID_SHIFT 0
++#define LAST_NIDPID_SHIFT 0
+ #endif
+ 
+-#if SECTIONS_WIDTH+ZONES_WIDTH+NODES_SHIFT+LAST_NID_SHIFT <= BITS_PER_LONG - NR_PAGEFLAGS
+-#define LAST_NID_WIDTH LAST_NID_SHIFT
++#if SECTIONS_WIDTH+ZONES_WIDTH+NODES_SHIFT+LAST_NIDPID_SHIFT <= BITS_PER_LONG - NR_PAGEFLAGS
++#define LAST_NIDPID_WIDTH LAST_NIDPID_SHIFT
+ #else
+-#define LAST_NID_WIDTH 0
++#define LAST_NIDPID_WIDTH 0
+ #endif
+ 
+ /*
+@@ -81,8 +87,8 @@
+ #define NODE_NOT_IN_PAGE_FLAGS
+ #endif
+ 
+-#if defined(CONFIG_NUMA_BALANCING) && LAST_NID_WIDTH == 0
+-#define LAST_NID_NOT_IN_PAGE_FLAGS
++#if defined(CONFIG_NUMA_BALANCING) && LAST_NIDPID_WIDTH == 0
++#define LAST_NIDPID_NOT_IN_PAGE_FLAGS
+ #endif
+ 
+ #endif /* _LINUX_PAGE_FLAGS_LAYOUT */
+* Unmerged path kernel/sched/fair.c
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/memory.c
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 74310017296e..97fe8bbbd323 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2288,9 +2288,11 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long
+ 
+ 	/* Migrate the page towards the node whose CPU is referencing it */
+ 	if (pol->flags & MPOL_F_MORON) {
+-		int last_nid;
++		int last_nidpid;
++		int this_nidpid;
+ 
+ 		polnid = numa_node_id();
++		this_nidpid = nid_pid_to_nidpid(polnid, current->pid);
+ 
+ 		/*
+ 		 * Multi-stage node selection is used in conjunction
+@@ -2313,8 +2315,8 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long
+ 		 * it less likely we act on an unlikely task<->page
+ 		 * relation.
+ 		 */
+-		last_nid = page_nid_xchg_last(page, polnid);
+-		if (last_nid != polnid)
++		last_nidpid = page_nidpid_xchg_last(page, this_nidpid);
++		if (!nidpid_pid_unset(last_nidpid) && nidpid_to_nid(last_nidpid) != polnid)
+ 			goto out;
+ 	}
+ 
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 1698b7393558..da4d614284dc 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1495,7 +1495,7 @@ static struct page *alloc_misplaced_dst_page(struct page *page,
+ 					  __GFP_NOWARN) &
+ 					 ~GFP_IOFS, 0);
+ 	if (newpage)
+-		page_nid_xchg_last(newpage, page_nid_last(page));
++		page_nidpid_xchg_last(newpage, page_nidpid_last(page));
+ 
+ 	return newpage;
+ }
+@@ -1672,7 +1672,7 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
+ 	if (!new_page)
+ 		goto out_fail;
+ 
+-	page_nid_xchg_last(new_page, page_nid_last(page));
++	page_nidpid_xchg_last(new_page, page_nidpid_last(page));
+ 
+ 	isolated = numamigrate_isolate_page(pgdat, page);
+ 	if (!isolated) {
+diff --git a/mm/mm_init.c b/mm/mm_init.c
+index c280a02ea11e..eecdc641d07d 100644
+--- a/mm/mm_init.c
++++ b/mm/mm_init.c
+@@ -69,26 +69,26 @@ void __init mminit_verify_pageflags_layout(void)
+ 	unsigned long or_mask, add_mask;
+ 
+ 	shift = 8 * sizeof(unsigned long);
+-	width = shift - SECTIONS_WIDTH - NODES_WIDTH - ZONES_WIDTH - LAST_NID_SHIFT;
++	width = shift - SECTIONS_WIDTH - NODES_WIDTH - ZONES_WIDTH - LAST_NIDPID_SHIFT;
+ 	mminit_dprintk(MMINIT_TRACE, "pageflags_layout_widths",
+-		"Section %d Node %d Zone %d Lastnid %d Flags %d\n",
++		"Section %d Node %d Zone %d Lastnidpid %d Flags %d\n",
+ 		SECTIONS_WIDTH,
+ 		NODES_WIDTH,
+ 		ZONES_WIDTH,
+-		LAST_NID_WIDTH,
++		LAST_NIDPID_WIDTH,
+ 		NR_PAGEFLAGS);
+ 	mminit_dprintk(MMINIT_TRACE, "pageflags_layout_shifts",
+-		"Section %d Node %d Zone %d Lastnid %d\n",
++		"Section %d Node %d Zone %d Lastnidpid %d\n",
+ 		SECTIONS_SHIFT,
+ 		NODES_SHIFT,
+ 		ZONES_SHIFT,
+-		LAST_NID_SHIFT);
++		LAST_NIDPID_SHIFT);
+ 	mminit_dprintk(MMINIT_TRACE, "pageflags_layout_pgshifts",
+-		"Section %lu Node %lu Zone %lu Lastnid %lu\n",
++		"Section %lu Node %lu Zone %lu Lastnidpid %lu\n",
+ 		(unsigned long)SECTIONS_PGSHIFT,
+ 		(unsigned long)NODES_PGSHIFT,
+ 		(unsigned long)ZONES_PGSHIFT,
+-		(unsigned long)LAST_NID_PGSHIFT);
++		(unsigned long)LAST_NIDPID_PGSHIFT);
+ 	mminit_dprintk(MMINIT_TRACE, "pageflags_layout_nodezoneid",
+ 		"Node/Zone ID: %lu -> %lu\n",
+ 		(unsigned long)(ZONEID_PGOFF + ZONEID_SHIFT),
+@@ -100,9 +100,9 @@ void __init mminit_verify_pageflags_layout(void)
+ 	mminit_dprintk(MMINIT_TRACE, "pageflags_layout_nodeflags",
+ 		"Node not in page flags");
+ #endif
+-#ifdef LAST_NID_NOT_IN_PAGE_FLAGS
++#ifdef LAST_NIDPID_NOT_IN_PAGE_FLAGS
+ 	mminit_dprintk(MMINIT_TRACE, "pageflags_layout_nodeflags",
+-		"Last nid not in page flags");
++		"Last nidpid not in page flags");
+ #endif
+ 
+ 	if (SECTIONS_WIDTH) {
+diff --git a/mm/mmzone.c b/mm/mmzone.c
+index 2ac0afbd68f3..25bb477deb26 100644
+--- a/mm/mmzone.c
++++ b/mm/mmzone.c
+@@ -97,20 +97,20 @@ void lruvec_init(struct lruvec *lruvec)
+ 		INIT_LIST_HEAD(&lruvec->lists[lru]);
+ }
+ 
+-#if defined(CONFIG_NUMA_BALANCING) && !defined(LAST_NID_NOT_IN_PAGE_FLAGS)
+-int page_nid_xchg_last(struct page *page, int nid)
++#if defined(CONFIG_NUMA_BALANCING) && !defined(LAST_NIDPID_NOT_IN_PAGE_FLAGS)
++int page_nidpid_xchg_last(struct page *page, int nidpid)
+ {
+ 	unsigned long old_flags, flags;
+-	int last_nid;
++	int last_nidpid;
+ 
+ 	do {
+ 		old_flags = flags = page->flags;
+-		last_nid = page_nid_last(page);
++		last_nidpid = page_nidpid_last(page);
+ 
+-		flags &= ~(LAST_NID_MASK << LAST_NID_PGSHIFT);
+-		flags |= (nid & LAST_NID_MASK) << LAST_NID_PGSHIFT;
++		flags &= ~(LAST_NIDPID_MASK << LAST_NIDPID_PGSHIFT);
++		flags |= (nidpid & LAST_NIDPID_MASK) << LAST_NIDPID_PGSHIFT;
+ 	} while (unlikely(cmpxchg(&page->flags, old_flags, flags) != old_flags));
+ 
+-	return last_nid;
++	return last_nidpid;
+ }
+ #endif
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 41e02923fcd9..f0b087d1069c 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -37,14 +37,15 @@ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
+ 
+ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long addr, unsigned long end, pgprot_t newprot,
+-		int dirty_accountable, int prot_numa, bool *ret_all_same_node)
++		int dirty_accountable, int prot_numa, bool *ret_all_same_nidpid)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pte_t *pte, oldpte;
+ 	spinlock_t *ptl;
+ 	unsigned long pages = 0;
+-	bool all_same_node = true;
++	bool all_same_nidpid = true;
+ 	int last_nid = -1;
++	int last_pid = -1;
+ 
+ 	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+ 	arch_enter_lazy_mmu_mode();
+@@ -63,11 +64,18 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 
+ 				page = vm_normal_page(vma, addr, oldpte);
+ 				if (page) {
+-					int this_nid = page_to_nid(page);
++					int nidpid = page_nidpid_last(page);
++					int this_nid = nidpid_to_nid(nidpid);
++					int this_pid = nidpid_to_pid(nidpid);
++
+ 					if (last_nid == -1)
+ 						last_nid = this_nid;
+-					if (last_nid != this_nid)
+-						all_same_node = false;
++					if (last_pid == -1)
++						last_pid = this_pid;
++					if (last_nid != this_nid ||
++					    last_pid != this_pid) {
++						all_same_nidpid = false;
++					}
+ 
+ 					if (!pte_numa(oldpte)) {
+ 						ptent = pte_mknuma(ptent);
+@@ -107,7 +115,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 	arch_leave_lazy_mmu_mode();
+ 	pte_unmap_unlock(pte - 1, ptl);
+ 
+-	*ret_all_same_node = all_same_node;
++	*ret_all_same_nidpid = all_same_nidpid;
+ 	return pages;
+ }
+ 
+@@ -134,7 +142,7 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
+ 	pmd_t *pmd;
+ 	unsigned long next;
+ 	unsigned long pages = 0;
+-	bool all_same_node;
++	bool all_same_nidpid;
+ 
+ 	pmd = pmd_offset(pud, addr);
+ 	do {
+@@ -158,7 +166,7 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
+ 		if (pmd_none_or_clear_bad(pmd))
+ 			continue;
+ 		pages += change_pte_range(vma, pmd, addr, next, newprot,
+-				 dirty_accountable, prot_numa, &all_same_node);
++				 dirty_accountable, prot_numa, &all_same_nidpid);
+ 
+ 		/*
+ 		 * If we are changing protections for NUMA hinting faults then
+@@ -166,7 +174,7 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
+ 		 * node. This allows a regular PMD to be handled as one fault
+ 		 * and effectively batches the taking of the PTL
+ 		 */
+-		if (prot_numa && all_same_node)
++		if (prot_numa && all_same_nidpid)
+ 			change_pmd_protnuma(vma->vm_mm, addr, pmd);
+ 	} while (pmd++, addr = next, addr != end);
+ 
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index c3edb624fccf..0d14c4fb9e02 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -614,7 +614,7 @@ static inline int free_pages_check(struct page *page)
+ 		bad_page(page);
+ 		return 1;
+ 	}
+-	page_nid_reset_last(page);
++	page_nidpid_reset_last(page);
+ 	if (page->flags & PAGE_FLAGS_CHECK_AT_PREP)
+ 		page->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
+ 	return 0;
+@@ -3938,7 +3938,7 @@ void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+ 		mminit_verify_page_links(page, zone, nid, pfn);
+ 		init_page_count(page);
+ 		page_mapcount_reset(page);
+-		page_nid_reset_last(page);
++		page_nidpid_reset_last(page);
+ 		SetPageReserved(page);
+ 		/*
+ 		 * Mark the block movable so that blocks are reserved for
