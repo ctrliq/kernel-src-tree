@@ -1,0 +1,247 @@
+swap: change swap_info singly-linked list to list_head
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Dan Streetman <ddstreet@ieee.org>
+commit adfab836f4908deb049a5128082719e689eed964
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/adfab836.failed
+
+The logic controlling the singly-linked list of swap_info_struct entries
+for all active, i.e.  swapon'ed, swap targets is rather complex, because:
+
+ - it stores the entries in priority order
+ - there is a pointer to the highest priority entry
+ - there is a pointer to the highest priority not-full entry
+ - there is a highest_priority_index variable set outside the swap_lock
+ - swap entries of equal priority should be used equally
+
+this complexity leads to bugs such as: https://lkml.org/lkml/2014/2/13/181
+where different priority swap targets are incorrectly used equally.
+
+That bug probably could be solved with the existing singly-linked lists,
+but I think it would only add more complexity to the already difficult to
+understand get_swap_page() swap_list iteration logic.
+
+The first patch changes from a singly-linked list to a doubly-linked list
+using list_heads; the highest_priority_index and related code are removed
+and get_swap_page() starts each iteration at the highest priority
+swap_info entry, even if it's full.  While this does introduce unnecessary
+list iteration (i.e.  Schlemiel the painter's algorithm) in the case where
+one or more of the highest priority entries are full, the iteration and
+manipulation code is much simpler and behaves correctly re: the above bug;
+and the fourth patch removes the unnecessary iteration.
+
+The second patch adds some minor plist helper functions; nothing new
+really, just functions to match existing regular list functions.  These
+are used by the next two patches.
+
+The third patch adds plist_requeue(), which is used by get_swap_page() in
+the next patch - it performs the requeueing of same-priority entries
+(which moves the entry to the end of its priority in the plist), so that
+all equal-priority swap_info_structs get used equally.
+
+The fourth patch converts the main list into a plist, and adds a new plist
+that contains only swap_info entries that are both active and not full.
+As Mel suggested using plists allows removing all the ordering code from
+swap - plists handle ordering automatically.  The list naming is also
+clarified now that there are two lists, with the original list changed
+from swap_list_head to swap_active_head and the new list named
+swap_avail_head.  A new spinlock is also added for the new list, so
+swap_info entries can be added or removed from the new list immediately as
+they become full or not full.
+
+This patch (of 4):
+
+Replace the singly-linked list tracking active, i.e.  swapon'ed,
+swap_info_struct entries with a doubly-linked list using struct
+list_heads.  Simplify the logic iterating and manipulating the list of
+entries, especially get_swap_page(), by using standard list_head
+functions, and removing the highest priority iteration logic.
+
+The change fixes the bug:
+https://lkml.org/lkml/2014/2/13/181
+in which different priority swap entries after the highest priority entry
+are incorrectly used equally in pairs.  The swap behavior is now as
+advertised, i.e. different priority swap entries are used in order, and
+equal priority swap targets are used concurrently.
+
+	Signed-off-by: Dan Streetman <ddstreet@ieee.org>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Cc: Shaohua Li <shli@fusionio.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Dan Streetman <ddstreet@ieee.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Christian Ehrhardt <ehrhardt@linux.vnet.ibm.com>
+	Cc: Weijie Yang <weijieut@gmail.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Bob Liu <bob.liu@oracle.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit adfab836f4908deb049a5128082719e689eed964)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swapfile.c
+diff --cc mm/swapfile.c
+index 746af55b8455,6c95a8c63b1a..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -1509,9 -1731,10 +1478,9 @@@ static int setup_swap_extents(struct sw
+  }
+  
+  static void _enable_swap_info(struct swap_info_struct *p, int prio,
+ -				unsigned char *swap_map,
+ -				struct swap_cluster_info *cluster_info)
+ +				unsigned char *swap_map)
+  {
+- 	int i, prev;
++ 	struct swap_info_struct *si;
+  
+  	if (prio >= 0)
+  		p->prio = prio;
+@@@ -1566,8 -1802,8 +1545,13 @@@ SYSCALL_DEFINE1(swapoff, const char __u
+  	struct address_space *mapping;
+  	struct inode *inode;
+  	struct filename *pathname;
+++<<<<<<< HEAD
+ +	int i, type, prev;
+ +	int err;
+++=======
++ 	int err, found = 0;
++ 	unsigned int old_block_size;
+++>>>>>>> adfab836f490 (swap: change swap_info singly-linked list to list_head)
+  
+  	if (!capable(CAP_SYS_ADMIN))
+  		return -EPERM;
+@@@ -1660,17 -1894,21 +1639,27 @@@
+  	p->max = 0;
+  	swap_map = p->swap_map;
+  	p->swap_map = NULL;
+ -	cluster_info = p->cluster_info;
+ -	p->cluster_info = NULL;
+ +	p->flags = 0;
+  	frontswap_map = frontswap_map_get(p);
+ +	frontswap_map_set(p, NULL);
+  	spin_unlock(&p->lock);
+  	spin_unlock(&swap_lock);
+++<<<<<<< HEAD
+ +	frontswap_invalidate_area(type);
+++=======
++ 	frontswap_invalidate_area(p->type);
++ 	frontswap_map_set(p, NULL);
+++>>>>>>> adfab836f490 (swap: change swap_info singly-linked list to list_head)
+  	mutex_unlock(&swapon_mutex);
+ -	free_percpu(p->percpu_cluster);
+ -	p->percpu_cluster = NULL;
+  	vfree(swap_map);
+ -	vfree(cluster_info);
+  	vfree(frontswap_map);
+++<<<<<<< HEAD
+ +	/* Destroy swap account informatin */
+ +	swap_cgroup_swapoff(type);
+++=======
++ 	/* Destroy swap account information */
++ 	swap_cgroup_swapoff(p->type);
+++>>>>>>> adfab836f490 (swap: change swap_info singly-linked list to list_head)
+  
+  	inode = mapping->host;
+  	if (S_ISBLK(inode->i_mode)) {
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 4f306c49df07..68e99abc42bb 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -182,8 +182,8 @@ enum {
+ struct swap_info_struct {
+ 	unsigned long	flags;		/* SWP_USED etc: see above */
+ 	signed short	prio;		/* swap priority of this type */
++	struct list_head list;		/* entry in swap list */
+ 	signed char	type;		/* strange name for an index */
+-	signed char	next;		/* next type on the swap list */
+ 	unsigned int	max;		/* extent of the swap_map */
+ 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
+ 	unsigned int lowest_bit;	/* index of first free in swap_map */
+@@ -217,11 +217,6 @@ struct swap_info_struct {
+ 					 */
+ };
+ 
+-struct swap_list_t {
+-	int head;	/* head of priority-ordered swapfile list */
+-	int next;	/* swapfile to be used next */
+-};
+-
+ /* linux/mm/workingset.c */
+ void *workingset_eviction(struct address_space *mapping, struct page *page);
+ bool workingset_refault(void *shadow);
+diff --git a/include/linux/swapfile.h b/include/linux/swapfile.h
+index e282624e8c10..2eab382d593d 100644
+--- a/include/linux/swapfile.h
++++ b/include/linux/swapfile.h
+@@ -6,7 +6,7 @@
+  * want to expose them to the dozens of source files that include swap.h
+  */
+ extern spinlock_t swap_lock;
+-extern struct swap_list_t swap_list;
++extern struct list_head swap_list_head;
+ extern struct swap_info_struct *swap_info[];
+ extern int try_to_unuse(unsigned int, bool, unsigned long);
+ 
+diff --git a/mm/frontswap.c b/mm/frontswap.c
+index 1b24bdcb3197..fae11602e8a9 100644
+--- a/mm/frontswap.c
++++ b/mm/frontswap.c
+@@ -327,15 +327,12 @@ EXPORT_SYMBOL(__frontswap_invalidate_area);
+ 
+ static unsigned long __frontswap_curr_pages(void)
+ {
+-	int type;
+ 	unsigned long totalpages = 0;
+ 	struct swap_info_struct *si = NULL;
+ 
+ 	assert_spin_locked(&swap_lock);
+-	for (type = swap_list.head; type >= 0; type = si->next) {
+-		si = swap_info[type];
++	list_for_each_entry(si, &swap_list_head, list)
+ 		totalpages += atomic_read(&si->frontswap_pages);
+-	}
+ 	return totalpages;
+ }
+ 
+@@ -347,11 +344,9 @@ static int __frontswap_unuse_pages(unsigned long total, unsigned long *unused,
+ 	int si_frontswap_pages;
+ 	unsigned long total_pages_to_unuse = total;
+ 	unsigned long pages = 0, pages_to_unuse = 0;
+-	int type;
+ 
+ 	assert_spin_locked(&swap_lock);
+-	for (type = swap_list.head; type >= 0; type = si->next) {
+-		si = swap_info[type];
++	list_for_each_entry(si, &swap_list_head, list) {
+ 		si_frontswap_pages = atomic_read(&si->frontswap_pages);
+ 		if (total_pages_to_unuse < si_frontswap_pages) {
+ 			pages = pages_to_unuse = total_pages_to_unuse;
+@@ -366,7 +361,7 @@ static int __frontswap_unuse_pages(unsigned long total, unsigned long *unused,
+ 		}
+ 		vm_unacct_memory(pages);
+ 		*unused = pages_to_unuse;
+-		*swapid = type;
++		*swapid = si->type;
+ 		ret = 0;
+ 		break;
+ 	}
+@@ -413,7 +408,7 @@ void frontswap_shrink(unsigned long target_pages)
+ 	/*
+ 	 * we don't want to hold swap_lock while doing a very
+ 	 * lengthy try_to_unuse, but swap_list may change
+-	 * so restart scan from swap_list.head each time
++	 * so restart scan from swap_list_head each time
+ 	 */
+ 	spin_lock(&swap_lock);
+ 	ret = __frontswap_shrink(target_pages, &pages_to_unuse, &type);
+* Unmerged path mm/swapfile.c
