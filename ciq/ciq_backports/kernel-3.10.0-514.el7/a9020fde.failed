@@ -1,0 +1,251 @@
+openvswitch: Move tunnel destroy function to oppenvswitch module.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] openvswitch: Move tunnel destroy function to oppenvswitch module (Lance Richardson) [1283886]
+Rebuild_FUZZ: 99.22%
+commit-author Pravin B Shelar <pshelar@nicira.com>
+commit a9020fde67a6eb77f8130feff633189f99264db1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a9020fde.failed
+
+This function will be used in gre and geneve vport implementations.
+
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a9020fde67a6eb77f8130feff633189f99264db1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/vport-netdev.c
+#	net/openvswitch/vport-vxlan.c
+diff --cc net/openvswitch/vport-netdev.c
+index 6c7a9d49beb5,4b70aaa4a746..000000000000
+--- a/net/openvswitch/vport-netdev.c
++++ b/net/openvswitch/vport-netdev.c
+@@@ -137,33 -129,43 +137,45 @@@ error_master_upper_dev_unlink
+  error_unlock:
+  	rtnl_unlock();
+  error_put:
+ -	dev_put(vport->dev);
+ +	dev_put(netdev_vport->dev);
+  error_free_vport:
+  	ovs_vport_free(vport);
+ +error:
+  	return ERR_PTR(err);
+  }
+ -EXPORT_SYMBOL_GPL(ovs_netdev_link);
+  
+ -static struct vport *netdev_create(const struct vport_parms *parms)
+ +static void free_port_rcu(struct rcu_head *rcu)
+  {
+ -	struct vport *vport;
+ -
+ -	vport = ovs_vport_alloc(0, &ovs_netdev_vport_ops, parms);
+ -	if (IS_ERR(vport))
+ -		return vport;
+ +	struct netdev_vport *netdev_vport = container_of(rcu,
+ +					struct netdev_vport, rcu);
+  
+ -	return ovs_netdev_link(vport, parms->name);
+ +	dev_put(netdev_vport->dev);
+ +	ovs_vport_free(vport_from_priv(netdev_vport));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vport_netdev_free(struct rcu_head *rcu)
++ {
++ 	struct vport *vport = container_of(rcu, struct vport, rcu);
++ 
++ 	if (vport->dev)
++ 		dev_put(vport->dev);
++ 	ovs_vport_free(vport);
++ }
++ 
+++>>>>>>> a9020fde67a6 (openvswitch: Move tunnel destroy function to oppenvswitch module.)
+  void ovs_netdev_detach_dev(struct vport *vport)
+  {
+ +	struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
+ +
+  	ASSERT_RTNL();
+ -	vport->dev->priv_flags &= ~IFF_OVS_DATAPATH;
+ -	netdev_rx_handler_unregister(vport->dev);
+ -	netdev_upper_dev_unlink(vport->dev,
+ -				netdev_master_upper_dev_get(vport->dev));
+ -	dev_set_promiscuity(vport->dev, -1);
+ +	netdev_vport->dev->priv_flags &= ~IFF_OVS_DATAPATH;
+ +	netdev_rx_handler_unregister(netdev_vport->dev);
+ +	netdev_upper_dev_unlink(netdev_vport->dev,
+ +				netdev_master_upper_dev_get(netdev_vport->dev));
+ +	dev_set_promiscuity(netdev_vport->dev, -1);
+  }
+ -EXPORT_SYMBOL_GPL(ovs_netdev_detach_dev);
+  
+  static void netdev_destroy(struct vport *vport)
+  {
+@@@ -174,14 -174,24 +186,34 @@@
+  		ovs_netdev_detach_dev(vport);
+  	rtnl_unlock();
+  
+++<<<<<<< HEAD
+ +	call_rcu(&netdev_vport->rcu, free_port_rcu);
+ +}
+ +
+ +const char *ovs_netdev_get_name(const struct vport *vport)
+ +{
+ +	const struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
+ +	return netdev_vport->dev->name;
+++=======
++ 	call_rcu(&vport->rcu, vport_netdev_free);
+++>>>>>>> a9020fde67a6 (openvswitch: Move tunnel destroy function to oppenvswitch module.)
++ }
++ 
++ void ovs_netdev_tunnel_destroy(struct vport *vport)
++ {
++ 	rtnl_lock();
++ 	if (vport->dev->priv_flags & IFF_OVS_DATAPATH)
++ 		ovs_netdev_detach_dev(vport);
++ 
++ 	/* Early release so we can unregister the device */
++ 	dev_put(vport->dev);
++ 	rtnl_delete_link(vport->dev);
++ 	vport->dev = NULL;
++ 	rtnl_unlock();
++ 
++ 	call_rcu(&vport->rcu, vport_netdev_free);
+  }
++ EXPORT_SYMBOL_GPL(ovs_netdev_tunnel_destroy);
+  
+  static unsigned int packet_length(const struct sk_buff *skb)
+  {
+diff --cc net/openvswitch/vport-vxlan.c
+index 6f7986fabb70,1e8b00a23a23..000000000000
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@@ -203,71 -135,17 +203,74 @@@ error
+  	return ERR_PTR(err);
+  }
+  
+ -static struct vport *vxlan_create(const struct vport_parms *parms)
+ +static int vxlan_ext_gbp(struct sk_buff *skb)
+  {
+ -	struct vport *vport;
+ +	const struct ip_tunnel_info *tun_info;
+ +	const struct ovs_vxlan_opts *opts;
+  
+ -	vport = vxlan_tnl_create(parms);
+ -	if (IS_ERR(vport))
+ -		return vport;
+ +	tun_info = OVS_CB(skb)->egress_tun_info;
+ +	opts = tun_info->options;
+  
+ -	return ovs_netdev_link(vport, parms->name);
+ +	if (tun_info->key.tun_flags & TUNNEL_VXLAN_OPT &&
+ +	    tun_info->options_len >= sizeof(*opts))
+ +		return opts->gbp;
+ +	else
+ +		return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int vxlan_tnl_send(struct vport *vport, struct sk_buff *skb)
+ +{
+ +	struct net *net = ovs_dp_get_net(vport->dp);
+ +	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+ +	struct sock *sk = vxlan_port->vs->sock->sk;
+ +	__be16 dst_port = inet_sk(sk)->inet_sport;
+ +	const struct ip_tunnel_key *tun_key;
+ +	struct vxlan_metadata md = {0};
+ +	struct rtable *rt;
+ +	struct flowi4 fl;
+ +	__be16 src_port;
+ +	__be16 df;
+ +	int err;
+ +	u32 vxflags;
+ +
+ +	if (unlikely(!OVS_CB(skb)->egress_tun_info)) {
+ +		err = -EINVAL;
+ +		goto error;
+ +	}
+ +
+ +	tun_key = &OVS_CB(skb)->egress_tun_info->key;
+ +	rt = ovs_tunnel_route_lookup(net, tun_key, skb->mark, &fl, IPPROTO_UDP);
+ +	if (IS_ERR(rt)) {
+ +		err = PTR_ERR(rt);
+ +		goto error;
+ +	}
+ +
+ +	df = tun_key->tun_flags & TUNNEL_DONT_FRAGMENT ?
+ +		htons(IP_DF) : 0;
+ +
+ +	skb->ignore_df = 1;
+ +
+ +	src_port = udp_flow_src_port(net, skb, 0, 0, true);
+ +	md.vni = htonl(be64_to_cpu(tun_key->tun_id) << 8);
+ +	md.gbp = vxlan_ext_gbp(skb);
+ +	vxflags = vxlan_port->exts |
+ +		      (tun_key->tun_flags & TUNNEL_CSUM ? VXLAN_F_UDP_CSUM : 0);
+ +
+ +	err = vxlan_xmit_skb(rt, sk, skb, fl.saddr, tun_key->ipv4_dst,
+ +			     tun_key->ipv4_tos, tun_key->ipv4_ttl, df,
+ +			     src_port, dst_port,
+ +			     &md, false, vxflags);
+ +	if (err < 0)
+ +		ip_rt_put(rt);
+ +	return err;
+ +error:
+ +	kfree_skb(skb);
+ +	return err;
+ +}
+ +
+++=======
+++>>>>>>> a9020fde67a6 (openvswitch: Move tunnel destroy function to oppenvswitch module.)
+  static int vxlan_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
+  				     struct ip_tunnel_info *egress_tun_info)
+  {
+@@@ -287,21 -165,13 +290,30 @@@
+  					  src_port, dst_port);
+  }
+  
+++<<<<<<< HEAD
+ +static const char *vxlan_get_name(const struct vport *vport)
+ +{
+ +	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+ +	return vxlan_port->name;
+ +}
+ +
+ +static struct vport_ops ovs_vxlan_vport_ops = {
+ +	.type		= OVS_VPORT_TYPE_VXLAN,
+ +	.create		= vxlan_tnl_create,
+ +	.destroy	= vxlan_tnl_destroy,
+ +	.get_name	= vxlan_get_name,
+ +	.get_options	= vxlan_get_options,
+ +	.send		= vxlan_tnl_send,
+++=======
++ static struct vport_ops ovs_vxlan_netdev_vport_ops = {
++ 	.type			= OVS_VPORT_TYPE_VXLAN,
++ 	.create			= vxlan_create,
++ 	.destroy		= ovs_netdev_tunnel_destroy,
++ 	.get_options		= vxlan_get_options,
++ 	.send			= ovs_netdev_send,
+++>>>>>>> a9020fde67a6 (openvswitch: Move tunnel destroy function to oppenvswitch module.)
+  	.get_egress_tun_info	= vxlan_get_egress_tun_info,
+ +	.owner		= THIS_MODULE,
+  };
+  
+  static int __init ovs_vxlan_tnl_init(void)
+* Unmerged path net/openvswitch/vport-netdev.c
+diff --git a/net/openvswitch/vport-netdev.h b/net/openvswitch/vport-netdev.h
+index 6f7038e79c52..5a5205b79573 100644
+--- a/net/openvswitch/vport-netdev.h
++++ b/net/openvswitch/vport-netdev.h
+@@ -44,4 +44,5 @@ void ovs_netdev_detach_dev(struct vport *);
+ int __init ovs_netdev_init(void);
+ void ovs_netdev_exit(void);
+ 
++void ovs_netdev_tunnel_destroy(struct vport *vport);
+ #endif /* vport_netdev.h */
+* Unmerged path net/openvswitch/vport-vxlan.c
