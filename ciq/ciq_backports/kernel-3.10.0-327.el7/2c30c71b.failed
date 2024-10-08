@@ -1,0 +1,393 @@
+block: Convert various code to bio_for_each_segment()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [fs] btrfs: Convert various code to bio_for_each_segment() (Eric Sandeen) [1205873]
+Rebuild_FUZZ: 92.45%
+commit-author Kent Overstreet <kmo@daterainc.com>
+commit 2c30c71bd653afcbed7f6754e8fe3d16e0e708a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2c30c71b.failed
+
+With immutable biovecs we don't want code accessing bi_io_vec directly -
+the uses this patch changes weren't incorrect since they all own the
+bio, but it makes the code harder to audit for no good reason - also,
+this will help with multipage bvecs later.
+
+	Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Chris Mason <chris.mason@fusionio.com>
+	Cc: Jaegeuk Kim <jaegeuk.kim@samsung.com>
+	Cc: Joern Engel <joern@logfs.org>
+	Cc: Prasad Joshi <prasadjoshi.linux@gmail.com>
+	Cc: Trond Myklebust <Trond.Myklebust@netapp.com>
+(cherry picked from commit 2c30c71bd653afcbed7f6754e8fe3d16e0e708a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent_io.c
+#	fs/f2fs/data.c
+#	fs/nfs/blocklayout/blocklayout.c
+diff --cc fs/btrfs/extent_io.c
+index f96ea62e4cf9,8b5f9e1d1f0e..000000000000
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@@ -2388,12 -2332,15 +2388,18 @@@ int end_extent_writepage(struct page *p
+   */
+  static void end_bio_extent_writepage(struct bio *bio, int err)
+  {
+++<<<<<<< HEAD
+ +	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+++=======
++ 	struct bio_vec *bvec;
++ 	struct extent_io_tree *tree;
+++>>>>>>> 2c30c71bd653 (block: Convert various code to bio_for_each_segment())
+  	u64 start;
+  	u64 end;
++ 	int i;
+  
+- 	do {
++ 	bio_for_each_segment_all(bvec, bio, i) {
+  		struct page *page = bvec->bv_page;
+ -		tree = &BTRFS_I(page->mapping->host)->io_tree;
+  
+  		/* We always issue full-page reads, but if some block
+  		 * in a page fails to read, blk_update_request() will
+@@@ -3565,13 -3427,12 +3562,12 @@@ static void end_bio_extent_buffer_write
+  			continue;
+  
+  		end_extent_buffer_writeback(eb);
+- 	} while (bvec >= bio->bi_io_vec);
++ 	}
+  
+  	bio_put(bio);
+- 
+  }
+  
+ -static int write_one_eb(struct extent_buffer *eb,
+ +static noinline_for_stack int write_one_eb(struct extent_buffer *eb,
+  			struct btrfs_fs_info *fs_info,
+  			struct writeback_control *wbc,
+  			struct extent_page_data *epd)
+diff --cc fs/f2fs/data.c
+index 91ff93b0b0f4,a4949096cf4c..000000000000
+--- a/fs/f2fs/data.c
++++ b/fs/f2fs/data.c
+@@@ -348,8 -364,7 +345,12 @@@ static void read_end_io(struct bio *bio
+  			SetPageError(page);
+  		}
+  		unlock_page(page);
+++<<<<<<< HEAD
+ +	} while (bvec >= bio->bi_io_vec);
+ +	kfree(bio->bi_private);
+++=======
++ 	}
+++>>>>>>> 2c30c71bd653 (block: Convert various code to bio_for_each_segment())
+  	bio_put(bio);
+  }
+  
+diff --cc fs/nfs/blocklayout/blocklayout.c
+index 5b7b41d3b0f9,da768923bf7c..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.c
++++ b/fs/nfs/blocklayout/blocklayout.c
+@@@ -201,19 -201,16 +201,26 @@@ static struct bio *bl_add_page_to_bio(s
+  static void bl_end_io_read(struct bio *bio, int err)
+  {
+  	struct parallel_io *par = bio->bi_private;
+- 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+- 	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
++ 	struct bio_vec *bvec;
++ 	int i;
+  
+- 	do {
+- 		struct page *page = bvec->bv_page;
++ 	if (!err)
++ 		bio_for_each_segment_all(bvec, bio, i)
++ 			SetPageUptodate(bvec->bv_page);
+  
+++<<<<<<< HEAD
+ +		if (--bvec >= bio->bi_io_vec)
+ +			prefetchw(&bvec->bv_page->flags);
+ +		if (uptodate)
+ +			SetPageUptodate(page);
+ +	} while (bvec >= bio->bi_io_vec);
+ +	if (!uptodate) {
+ +		struct nfs_pgio_header *header = par->data;
+++=======
++ 	if (err) {
++ 		struct nfs_read_data *rdata = par->data;
++ 		struct nfs_pgio_header *header = rdata->header;
+++>>>>>>> 2c30c71bd653 (block: Convert various code to bio_for_each_segment())
+  
+  		if (!header->pnfs_error)
+  			header->pnfs_error = -EIO;
+@@@ -389,21 -379,18 +396,23 @@@ static void mark_extents_written(struc
+  static void bl_end_io_write_zero(struct bio *bio, int err)
+  {
+  	struct parallel_io *par = bio->bi_private;
+- 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+- 	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
++ 	struct bio_vec *bvec;
++ 	int i;
+  
+- 	do {
+- 		struct page *page = bvec->bv_page;
+- 
+- 		if (--bvec >= bio->bi_io_vec)
+- 			prefetchw(&bvec->bv_page->flags);
++ 	bio_for_each_segment_all(bvec, bio, i) {
+  		/* This is the zeroing page we added */
+- 		end_page_writeback(page);
+- 		page_cache_release(page);
+- 	} while (bvec >= bio->bi_io_vec);
++ 		end_page_writeback(bvec->bv_page);
++ 		page_cache_release(bvec->bv_page);
++ 	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!uptodate)) {
+ +		struct nfs_pgio_header *header = par->data;
+++=======
++ 	if (unlikely(err)) {
++ 		struct nfs_write_data *data = par->data;
++ 		struct nfs_pgio_header *header = data->header;
+++>>>>>>> 2c30c71bd653 (block: Convert various code to bio_for_each_segment())
+  
+  		if (!header->pnfs_error)
+  			header->pnfs_error = -EIO;
+diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+index 9aa231d9f96d..ace79c6457c7 100644
+--- a/fs/btrfs/compression.c
++++ b/fs/btrfs/compression.c
+@@ -200,18 +200,16 @@ csum_failed:
+ 	if (cb->errors) {
+ 		bio_io_error(cb->orig_bio);
+ 	} else {
+-		int bio_index = 0;
+-		struct bio_vec *bvec = cb->orig_bio->bi_io_vec;
++		int i;
++		struct bio_vec *bvec;
+ 
+ 		/*
+ 		 * we have verified the checksum already, set page
+ 		 * checked so the end_io handlers know about it
+ 		 */
+-		while (bio_index < cb->orig_bio->bi_vcnt) {
++		bio_for_each_segment_all(bvec, cb->orig_bio, i)
+ 			SetPageChecked(bvec->bv_page);
+-			bvec++;
+-			bio_index++;
+-		}
++
+ 		bio_endio(cb->orig_bio, 0);
+ 	}
+ 
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 4e2b3dcf79c5..e91faa6f16a6 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -859,20 +859,17 @@ int btrfs_wq_submit_bio(struct btrfs_fs_info *fs_info, struct inode *inode,
+ 
+ static int btree_csum_one_bio(struct bio *bio)
+ {
+-	struct bio_vec *bvec = bio->bi_io_vec;
+-	int bio_index = 0;
++	struct bio_vec *bvec;
+ 	struct btrfs_root *root;
+-	int ret = 0;
++	int i, ret = 0;
+ 
+-	WARN_ON(bio->bi_vcnt <= 0);
+-	while (bio_index < bio->bi_vcnt) {
++	bio_for_each_segment_all(bvec, bio, i) {
+ 		root = BTRFS_I(bvec->bv_page->mapping->host)->root;
+ 		ret = csum_dirty_buffer(root, bvec->bv_page);
+ 		if (ret)
+ 			break;
+-		bio_index++;
+-		bvec++;
+ 	}
++
+ 	return ret;
+ }
+ 
+* Unmerged path fs/btrfs/extent_io.c
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index a4bd5317d647..ae685e9b4ab3 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -7189,17 +7189,16 @@ unlock_err:
+ static void btrfs_endio_direct_read(struct bio *bio, int err)
+ {
+ 	struct btrfs_dio_private *dip = bio->bi_private;
+-	struct bio_vec *bvec_end = bio->bi_io_vec + bio->bi_vcnt - 1;
+-	struct bio_vec *bvec = bio->bi_io_vec;
++	struct bio_vec *bvec;
+ 	struct inode *inode = dip->inode;
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+ 	struct bio *dio_bio;
+ 	u32 *csums = (u32 *)dip->csum;
+-	int index = 0;
+ 	u64 start;
++	int i;
+ 
+ 	start = dip->logical_offset;
+-	do {
++	bio_for_each_segment_all(bvec, bio, i) {
+ 		if (!(BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)) {
+ 			struct page *page = bvec->bv_page;
+ 			char *kaddr;
+@@ -7215,18 +7214,16 @@ static void btrfs_endio_direct_read(struct bio *bio, int err)
+ 			local_irq_restore(flags);
+ 
+ 			flush_dcache_page(bvec->bv_page);
+-			if (csum != csums[index]) {
++			if (csum != csums[i]) {
+ 				btrfs_err(root->fs_info, "csum failed ino %llu off %llu csum %u expected csum %u",
+ 					  btrfs_ino(inode), start, csum,
+-					  csums[index]);
++					  csums[i]);
+ 				err = -EIO;
+ 			}
+ 		}
+ 
+ 		start += bvec->bv_len;
+-		bvec++;
+-		index++;
+-	} while (bvec <= bvec_end);
++	}
+ 
+ 	unlock_extent(&BTRFS_I(inode)->io_tree, dip->logical_offset,
+ 		      dip->logical_offset + dip->bytes - 1);
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 7d6335f93656..17bffa7469b1 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -65,9 +65,9 @@ static void ext4_finish_bio(struct bio *bio)
+ {
+ 	int i;
+ 	int error = !test_bit(BIO_UPTODATE, &bio->bi_flags);
++	struct bio_vec *bvec;
+ 
+-	for (i = 0; i < bio->bi_vcnt; i++) {
+-		struct bio_vec *bvec = &bio->bi_io_vec[i];
++	bio_for_each_segment_all(bvec, bio, i) {
+ 		struct page *page = bvec->bv_page;
+ 		struct buffer_head *bh, *head;
+ 		unsigned bio_start = bvec->bv_offset;
+* Unmerged path fs/f2fs/data.c
+diff --git a/fs/f2fs/segment.c b/fs/f2fs/segment.c
+index d8e84e49a5c3..3f08cfa78afe 100644
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@ -635,16 +635,14 @@ static const struct segment_allocation default_salloc_ops = {
+ 
+ static void f2fs_end_io_write(struct bio *bio, int err)
+ {
+-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+ 	struct bio_private *p = bio->bi_private;
++	struct bio_vec *bvec;
++	int i;
+ 
+-	do {
++	bio_for_each_segment_all(bvec, bio, i) {
+ 		struct page *page = bvec->bv_page;
+ 
+-		if (--bvec >= bio->bi_io_vec)
+-			prefetchw(&bvec->bv_page->flags);
+-		if (!uptodate) {
++		if (err) {
+ 			SetPageError(page);
+ 			if (page->mapping)
+ 				set_bit(AS_EIO, &page->mapping->flags);
+@@ -653,7 +651,7 @@ static void f2fs_end_io_write(struct bio *bio, int err)
+ 		}
+ 		end_page_writeback(page);
+ 		dec_page_count(p->sbi, F2FS_WRITEBACK);
+-	} while (bvec >= bio->bi_io_vec);
++	}
+ 
+ 	if (p->is_sync)
+ 		complete(p->wait);
+diff --git a/fs/logfs/dev_bdev.c b/fs/logfs/dev_bdev.c
+index 550475ca6a0e..5cbcc23e0a95 100644
+--- a/fs/logfs/dev_bdev.c
++++ b/fs/logfs/dev_bdev.c
+@@ -67,22 +67,18 @@ static DECLARE_WAIT_QUEUE_HEAD(wq);
+ static void writeseg_end_io(struct bio *bio, int err)
+ {
+ 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
++	struct bio_vec *bvec;
++	int i;
+ 	struct super_block *sb = bio->bi_private;
+ 	struct logfs_super *super = logfs_super(sb);
+-	struct page *page;
+ 
+ 	BUG_ON(!uptodate); /* FIXME: Retry io or write elsewhere */
+ 	BUG_ON(err);
+-	BUG_ON(bio->bi_vcnt == 0);
+-	do {
+-		page = bvec->bv_page;
+-		if (--bvec >= bio->bi_io_vec)
+-			prefetchw(&bvec->bv_page->flags);
+-
+-		end_page_writeback(page);
+-		page_cache_release(page);
+-	} while (bvec >= bio->bi_io_vec);
++
++	bio_for_each_segment_all(bvec, bio, i) {
++		end_page_writeback(bvec->bv_page);
++		page_cache_release(bvec->bv_page);
++	}
+ 	bio_put(bio);
+ 	if (atomic_dec_and_test(&super->s_pending_writes))
+ 		wake_up(&wq);
+diff --git a/fs/mpage.c b/fs/mpage.c
+index 0face1c4d4c6..dd6d5878f4d9 100644
+--- a/fs/mpage.c
++++ b/fs/mpage.c
+@@ -43,16 +43,14 @@
+  */
+ static void mpage_end_io(struct bio *bio, int err)
+ {
+-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
++	struct bio_vec *bv;
++	int i;
+ 
+-	do {
+-		struct page *page = bvec->bv_page;
++	bio_for_each_segment_all(bv, bio, i) {
++		struct page *page = bv->bv_page;
+ 
+-		if (--bvec >= bio->bi_io_vec)
+-			prefetchw(&bvec->bv_page->flags);
+ 		if (bio_data_dir(bio) == READ) {
+-			if (uptodate) {
++			if (!err) {
+ 				SetPageUptodate(page);
+ 			} else {
+ 				ClearPageUptodate(page);
+@@ -60,14 +58,15 @@ static void mpage_end_io(struct bio *bio, int err)
+ 			}
+ 			unlock_page(page);
+ 		} else { /* bio_data_dir(bio) == WRITE */
+-			if (!uptodate) {
++			if (err) {
+ 				SetPageError(page);
+ 				if (page->mapping)
+ 					set_bit(AS_EIO, &page->mapping->flags);
+ 			}
+ 			end_page_writeback(page);
+ 		}
+-	} while (bvec >= bio->bi_io_vec);
++	}
++
+ 	bio_put(bio);
+ }
+ 
+* Unmerged path fs/nfs/blocklayout/blocklayout.c
