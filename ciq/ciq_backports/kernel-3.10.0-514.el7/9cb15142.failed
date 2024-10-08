@@ -1,0 +1,411 @@
+mmc: mmci: Add qcom dml support to the driver.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] mmci: Add qcom dml support to the driver (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 93.02%
+commit-author Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+commit 9cb15142d0e336874ecc753e9a4e5696c46a67d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9cb15142.failed
+
+On Qualcomm APQ8064 SOCs, SD card controller has an additional glue
+called DML (Data Mover Local/Lite) to assist dma transfers.
+This hardware needs to be setup before any dma transfer is requested.
+DML itself is not a DMA engine, its just a gule between the SD card
+controller and dma controller.
+
+Most of this code has been ported from qualcomm's 3.4 kernel.
+
+This patch adds the code necessary to intialize the hardware and setup
+before doing any dma transfers.
+
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+	Reviewed-by: Stephen Boyd <sboyd@codeaurora.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 9cb15142d0e336874ecc753e9a4e5696c46a67d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/mmci.c
+diff --cc drivers/mmc/host/mmci.c
+index f4f3038c1df0,a7b3af9e9a2a..000000000000
+--- a/drivers/mmc/host/mmci.c
++++ b/drivers/mmc/host/mmci.c
+@@@ -55,12 -60,23 +56,21 @@@ static unsigned int fmax = 515633
+   *	      is asserted (likewise for RX)
+   * @fifohalfsize: number of bytes that can be written when MCI_TXFIFOHALFEMPTY
+   *		  is asserted (likewise for RX)
+ - * @data_cmd_enable: enable value for data commands.
+   * @sdio: variant supports SDIO
+   * @st_clkdiv: true if using a ST-specific clock divider algorithm
+ - * @datactrl_mask_ddrmode: ddr mode mask in datactrl register.
+   * @blksz_datactrl16: true if Block size is at b16..b30 position in datactrl register
+ - * @blksz_datactrl4: true if Block size is at b4..b16 position in datactrl
+ - *		     register
+   * @pwrreg_powerup: power up value for MMCIPOWER register
+ - * @f_max: maximum clk frequency supported by the controller.
+   * @signal_direction: input/out direction of bus signals can be indicated
+   * @pwrreg_clkgate: MMCIPOWER register must be used to gate the clock
+++<<<<<<< HEAD
+++=======
++  * @busy_detect: true if busy detection on dat0 is supported
++  * @pwrreg_nopower: bits in MMCIPOWER don't controls ext. power supply
++  * @explicit_mclk_control: enable explicit mclk control in driver.
++  * @qcom_fifo: enables qcom specific fifo pio read logic.
++  * @qcom_dml: enables qcom specific dma glue for dma transfers.
++  * @reversed_irq_handling: handle data irq before cmd irq.
+++>>>>>>> 9cb15142d0e3 (mmc: mmci: Add qcom dml support to the driver.)
+   */
+  struct variant_data {
+  	unsigned int		clkreg;
+@@@ -71,9 -89,19 +81,18 @@@
+  	bool			sdio;
+  	bool			st_clkdiv;
+  	bool			blksz_datactrl16;
+ -	bool			blksz_datactrl4;
+  	u32			pwrreg_powerup;
+ -	u32			f_max;
+  	bool			signal_direction;
+  	bool			pwrreg_clkgate;
+++<<<<<<< HEAD
+++=======
++ 	bool			busy_detect;
++ 	bool			pwrreg_nopower;
++ 	bool			explicit_mclk_control;
++ 	bool			qcom_fifo;
++ 	bool			qcom_dml;
++ 	bool			reversed_irq_handling;
+++>>>>>>> 9cb15142d0e3 (mmc: mmci: Add qcom dml support to the driver.)
+  };
+  
+  static struct variant_data variant_arm = {
+@@@ -144,10 -189,50 +163,50 @@@ static struct variant_data variant_ux50
+  	.st_clkdiv		= true,
+  	.blksz_datactrl16	= true,
+  	.pwrreg_powerup		= MCI_PWR_ON,
+ -	.f_max			= 100000000,
+  	.signal_direction	= true,
+  	.pwrreg_clkgate		= true,
+ -	.busy_detect		= true,
+ -	.pwrreg_nopower		= true,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct variant_data variant_qcom = {
++ 	.fifosize		= 16 * 4,
++ 	.fifohalfsize		= 8 * 4,
++ 	.clkreg			= MCI_CLK_ENABLE,
++ 	.clkreg_enable		= MCI_QCOM_CLK_FLOWENA |
++ 				  MCI_QCOM_CLK_SELECT_IN_FBCLK,
++ 	.clkreg_8bit_bus_enable = MCI_QCOM_CLK_WIDEBUS_8,
++ 	.datactrl_mask_ddrmode	= MCI_QCOM_CLK_SELECT_IN_DDR_MODE,
++ 	.data_cmd_enable	= MCI_QCOM_CSPM_DATCMD,
++ 	.blksz_datactrl4	= true,
++ 	.datalength_bits	= 24,
++ 	.pwrreg_powerup		= MCI_PWR_UP,
++ 	.f_max			= 208000000,
++ 	.explicit_mclk_control	= true,
++ 	.qcom_fifo		= true,
++ 	.qcom_dml		= true,
++ };
++ 
++ static int mmci_card_busy(struct mmc_host *mmc)
++ {
++ 	struct mmci_host *host = mmc_priv(mmc);
++ 	unsigned long flags;
++ 	int busy = 0;
++ 
++ 	pm_runtime_get_sync(mmc_dev(mmc));
++ 
++ 	spin_lock_irqsave(&host->lock, flags);
++ 	if (readl(host->base + MMCISTATUS) & MCI_ST_CARDBUSY)
++ 		busy = 1;
++ 	spin_unlock_irqrestore(&host->lock, flags);
++ 
++ 	pm_runtime_mark_last_busy(mmc_dev(mmc));
++ 	pm_runtime_put_autosuspend(mmc_dev(mmc));
++ 
++ 	return busy;
++ }
++ 
+++>>>>>>> 9cb15142d0e3 (mmc: mmci: Add qcom dml support to the driver.)
+  /*
+   * Validate mmc prerequisites
+   */
+@@@ -300,14 -423,12 +359,15 @@@ static void mmci_init_sg(struct mmci_ho
+  #ifdef CONFIG_DMA_ENGINE
+  static void mmci_dma_setup(struct mmci_host *host)
+  {
+ +	struct mmci_platform_data *plat = host->plat;
+  	const char *rxname, *txname;
+  	dma_cap_mask_t mask;
++ 	struct variant_data *variant = host->variant;
+  
+ -	host->dma_rx_channel = dma_request_slave_channel(mmc_dev(host->mmc), "rx");
+ -	host->dma_tx_channel = dma_request_slave_channel(mmc_dev(host->mmc), "tx");
+ +	if (!plat || !plat->dma_filter) {
+ +		dev_info(mmc_dev(host->mmc), "no DMA platform data\n");
+ +		return;
+ +	}
+  
+  	/* initialize pre request cookie */
+  	host->next_data.cookie = 1;
+diff --git a/drivers/mmc/host/Kconfig b/drivers/mmc/host/Kconfig
+index 04b13d36f04a..12567926abe1 100644
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -14,6 +14,17 @@ config MMC_ARMMMCI
+ 
+ 	  If unsure, say N.
+ 
++config MMC_QCOM_DML
++	tristate "Qualcomm Data Mover for SD Card Controller"
++	depends on MMC_ARMMMCI && QCOM_BAM_DMA
++	default y
++	help
++	  This selects the Qualcomm Data Mover lite/local on SD Card controller.
++	  This option will enable the dma to work correctly, if you are using
++	  Qcom SOCs and MMC, you would probably need this option to get DMA working.
++
++	  if unsure, say N.
++
+ config MMC_PXA
+ 	tristate "Intel PXA25x/26x/27x Multimedia Card Interface support"
+ 	depends on ARCH_PXA
+diff --git a/drivers/mmc/host/Makefile b/drivers/mmc/host/Makefile
+index 748cebeaed0d..fb16187641cd 100644
+--- a/drivers/mmc/host/Makefile
++++ b/drivers/mmc/host/Makefile
+@@ -3,6 +3,7 @@
+ #
+ 
+ obj-$(CONFIG_MMC_ARMMMCI)	+= mmci.o
++obj-$(CONFIG_MMC_QCOM_DML)	+= mmci_qcom_dml.o
+ obj-$(CONFIG_MMC_PXA)		+= pxamci.o
+ obj-$(CONFIG_MMC_MXC)		+= mxcmmc.o
+ obj-$(CONFIG_MMC_MXS)		+= mxs-mmc.o
+* Unmerged path drivers/mmc/host/mmci.c
+diff --git a/drivers/mmc/host/mmci_qcom_dml.c b/drivers/mmc/host/mmci_qcom_dml.c
+new file mode 100644
+index 000000000000..2b7fc3764803
+--- /dev/null
++++ b/drivers/mmc/host/mmci_qcom_dml.c
+@@ -0,0 +1,177 @@
++/*
++ *
++ * Copyright (c) 2011, The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/of.h>
++#include <linux/of_dma.h>
++#include <linux/bitops.h>
++#include <linux/mmc/host.h>
++#include <linux/mmc/card.h>
++#include "mmci.h"
++
++/* Registers */
++#define DML_CONFIG			0x00
++#define PRODUCER_CRCI_MSK		GENMASK(1, 0)
++#define PRODUCER_CRCI_DISABLE		0
++#define PRODUCER_CRCI_X_SEL		BIT(0)
++#define PRODUCER_CRCI_Y_SEL		BIT(1)
++#define CONSUMER_CRCI_MSK		GENMASK(3, 2)
++#define CONSUMER_CRCI_DISABLE		0
++#define CONSUMER_CRCI_X_SEL		BIT(2)
++#define CONSUMER_CRCI_Y_SEL		BIT(3)
++#define PRODUCER_TRANS_END_EN		BIT(4)
++#define BYPASS				BIT(16)
++#define DIRECT_MODE			BIT(17)
++#define INFINITE_CONS_TRANS		BIT(18)
++
++#define DML_SW_RESET			0x08
++#define DML_PRODUCER_START		0x0c
++#define DML_CONSUMER_START		0x10
++#define DML_PRODUCER_PIPE_LOGICAL_SIZE	0x14
++#define DML_CONSUMER_PIPE_LOGICAL_SIZE	0x18
++#define DML_PIPE_ID			0x1c
++#define PRODUCER_PIPE_ID_SHFT		0
++#define PRODUCER_PIPE_ID_MSK		GENMASK(4, 0)
++#define CONSUMER_PIPE_ID_SHFT		16
++#define CONSUMER_PIPE_ID_MSK		GENMASK(20, 16)
++
++#define DML_PRODUCER_BAM_BLOCK_SIZE	0x24
++#define DML_PRODUCER_BAM_TRANS_SIZE	0x28
++
++/* other definitions */
++#define PRODUCER_PIPE_LOGICAL_SIZE	4096
++#define CONSUMER_PIPE_LOGICAL_SIZE	4096
++
++#define DML_OFFSET			0x800
++
++void dml_start_xfer(struct mmci_host *host, struct mmc_data *data)
++{
++	u32 config;
++	void __iomem *base = host->base + DML_OFFSET;
++
++	if (data->flags & MMC_DATA_READ) {
++		/* Read operation: configure DML for producer operation */
++		/* Set producer CRCI-x and disable consumer CRCI */
++		config = readl_relaxed(base + DML_CONFIG);
++		config = (config & ~PRODUCER_CRCI_MSK) | PRODUCER_CRCI_X_SEL;
++		config = (config & ~CONSUMER_CRCI_MSK) | CONSUMER_CRCI_DISABLE;
++		writel_relaxed(config, base + DML_CONFIG);
++
++		/* Set the Producer BAM block size */
++		writel_relaxed(data->blksz, base + DML_PRODUCER_BAM_BLOCK_SIZE);
++
++		/* Set Producer BAM Transaction size */
++		writel_relaxed(data->blocks * data->blksz,
++			       base + DML_PRODUCER_BAM_TRANS_SIZE);
++		/* Set Producer Transaction End bit */
++		config = readl_relaxed(base + DML_CONFIG);
++		config |= PRODUCER_TRANS_END_EN;
++		writel_relaxed(config, base + DML_CONFIG);
++		/* Trigger producer */
++		writel_relaxed(1, base + DML_PRODUCER_START);
++	} else {
++		/* Write operation: configure DML for consumer operation */
++		/* Set consumer CRCI-x and disable producer CRCI*/
++		config = readl_relaxed(base + DML_CONFIG);
++		config = (config & ~CONSUMER_CRCI_MSK) | CONSUMER_CRCI_X_SEL;
++		config = (config & ~PRODUCER_CRCI_MSK) | PRODUCER_CRCI_DISABLE;
++		writel_relaxed(config, base + DML_CONFIG);
++		/* Clear Producer Transaction End bit */
++		config = readl_relaxed(base + DML_CONFIG);
++		config &= ~PRODUCER_TRANS_END_EN;
++		writel_relaxed(config, base + DML_CONFIG);
++		/* Trigger consumer */
++		writel_relaxed(1, base + DML_CONSUMER_START);
++	}
++
++	/* make sure the dml is configured before dma is triggered */
++	wmb();
++}
++
++static int of_get_dml_pipe_index(struct device_node *np, const char *name)
++{
++	int index;
++	struct of_phandle_args	dma_spec;
++
++	index = of_property_match_string(np, "dma-names", name);
++
++	if (index < 0)
++		return -ENODEV;
++
++	if (of_parse_phandle_with_args(np, "dmas", "#dma-cells", index,
++				       &dma_spec))
++		return -ENODEV;
++
++	if (dma_spec.args_count)
++		return dma_spec.args[0];
++
++	return -ENODEV;
++}
++
++/* Initialize the dml hardware connected to SD Card controller */
++int dml_hw_init(struct mmci_host *host, struct device_node *np)
++{
++	u32 config;
++	void __iomem *base;
++	int consumer_id, producer_id;
++
++	consumer_id = of_get_dml_pipe_index(np, "tx");
++	producer_id = of_get_dml_pipe_index(np, "rx");
++
++	if (producer_id < 0 || consumer_id < 0)
++		return -ENODEV;
++
++	base = host->base + DML_OFFSET;
++
++	/* Reset the DML block */
++	writel_relaxed(1, base + DML_SW_RESET);
++
++	/* Disable the producer and consumer CRCI */
++	config = (PRODUCER_CRCI_DISABLE | CONSUMER_CRCI_DISABLE);
++	/*
++	 * Disable the bypass mode. Bypass mode will only be used
++	 * if data transfer is to happen in PIO mode and don't
++	 * want the BAM interface to connect with SDCC-DML.
++	 */
++	config &= ~BYPASS;
++	/*
++	 * Disable direct mode as we don't DML to MASTER the AHB bus.
++	 * BAM connected with DML should MASTER the AHB bus.
++	 */
++	config &= ~DIRECT_MODE;
++	/*
++	 * Disable infinite mode transfer as we won't be doing any
++	 * infinite size data transfers. All data transfer will be
++	 * of finite data size.
++	 */
++	config &= ~INFINITE_CONS_TRANS;
++	writel_relaxed(config, base + DML_CONFIG);
++
++	/*
++	 * Initialize the logical BAM pipe size for producer
++	 * and consumer.
++	 */
++	writel_relaxed(PRODUCER_PIPE_LOGICAL_SIZE,
++		       base + DML_PRODUCER_PIPE_LOGICAL_SIZE);
++	writel_relaxed(CONSUMER_PIPE_LOGICAL_SIZE,
++		       base + DML_CONSUMER_PIPE_LOGICAL_SIZE);
++
++	/* Initialize Producer/consumer pipe id */
++	writel_relaxed(producer_id | (consumer_id << CONSUMER_PIPE_ID_SHFT),
++		       base + DML_PIPE_ID);
++
++	/* Make sure dml intialization is finished */
++	mb();
++
++	return 0;
++}
+diff --git a/drivers/mmc/host/mmci_qcom_dml.h b/drivers/mmc/host/mmci_qcom_dml.h
+new file mode 100644
+index 000000000000..6e405d09d534
+--- /dev/null
++++ b/drivers/mmc/host/mmci_qcom_dml.h
+@@ -0,0 +1,31 @@
++/*
++ *
++ * Copyright (c) 2011, The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#ifndef __MMC_QCOM_DML_H__
++#define __MMC_QCOM_DML_H__
++
++#ifdef CONFIG_MMC_QCOM_DML
++int dml_hw_init(struct mmci_host *host, struct device_node *np);
++void dml_start_xfer(struct mmci_host *host, struct mmc_data *data);
++#else
++static inline int dml_hw_init(struct mmci_host *host, struct device_node *np)
++{
++	return -ENOSYS;
++}
++static inline void dml_start_xfer(struct mmci_host *host, struct mmc_data *data)
++{
++}
++#endif /* CONFIG_MMC_QCOM_DML */
++
++#endif /* __MMC_QCOM_DML_H__ */
