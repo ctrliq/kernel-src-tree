@@ -1,0 +1,268 @@
+NFS: Deletion of unnecessary checks before the function call "nfs_put_client"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Markus Elfring <elfring@users.sourceforge.net>
+commit fe0bf1185ddf7e9d193cfe397ed1414d91526e19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fe0bf118.failed
+
+The nfs_put_client() function tests whether its argument is NULL and then
+returns immediately. Thus the test around the call is not needed.
+
+This issue was detected by using the Coccinelle software.
+
+	Signed-off-by: Markus Elfring <elfring@users.sourceforge.net>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit fe0bf1185ddf7e9d193cfe397ed1414d91526e19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/filelayout/filelayoutdev.c
+diff --cc fs/nfs/filelayout/filelayoutdev.c
+index 4f372e224603,bfecac781f19..000000000000
+--- a/fs/nfs/filelayout/filelayoutdev.c
++++ b/fs/nfs/filelayout/filelayoutdev.c
+@@@ -41,6 -42,183 +41,186 @@@
+  static unsigned int dataserver_timeo = NFS4_DEF_DS_TIMEO;
+  static unsigned int dataserver_retrans = NFS4_DEF_DS_RETRANS;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Data server cache
++  *
++  * Data servers can be mapped to different device ids.
++  * nfs4_pnfs_ds reference counting
++  *   - set to 1 on allocation
++  *   - incremented when a device id maps a data server already in the cache.
++  *   - decremented when deviceid is removed from the cache.
++  */
++ static DEFINE_SPINLOCK(nfs4_ds_cache_lock);
++ static LIST_HEAD(nfs4_data_server_cache);
++ 
++ /* Debug routines */
++ void
++ print_ds(struct nfs4_pnfs_ds *ds)
++ {
++ 	if (ds == NULL) {
++ 		printk("%s NULL device\n", __func__);
++ 		return;
++ 	}
++ 	printk("        ds %s\n"
++ 		"        ref count %d\n"
++ 		"        client %p\n"
++ 		"        cl_exchange_flags %x\n",
++ 		ds->ds_remotestr,
++ 		atomic_read(&ds->ds_count), ds->ds_clp,
++ 		ds->ds_clp ? ds->ds_clp->cl_exchange_flags : 0);
++ }
++ 
++ static bool
++ same_sockaddr(struct sockaddr *addr1, struct sockaddr *addr2)
++ {
++ 	struct sockaddr_in *a, *b;
++ 	struct sockaddr_in6 *a6, *b6;
++ 
++ 	if (addr1->sa_family != addr2->sa_family)
++ 		return false;
++ 
++ 	switch (addr1->sa_family) {
++ 	case AF_INET:
++ 		a = (struct sockaddr_in *)addr1;
++ 		b = (struct sockaddr_in *)addr2;
++ 
++ 		if (a->sin_addr.s_addr == b->sin_addr.s_addr &&
++ 		    a->sin_port == b->sin_port)
++ 			return true;
++ 		break;
++ 
++ 	case AF_INET6:
++ 		a6 = (struct sockaddr_in6 *)addr1;
++ 		b6 = (struct sockaddr_in6 *)addr2;
++ 
++ 		/* LINKLOCAL addresses must have matching scope_id */
++ 		if (ipv6_addr_src_scope(&a6->sin6_addr) ==
++ 		    IPV6_ADDR_SCOPE_LINKLOCAL &&
++ 		    a6->sin6_scope_id != b6->sin6_scope_id)
++ 			return false;
++ 
++ 		if (ipv6_addr_equal(&a6->sin6_addr, &b6->sin6_addr) &&
++ 		    a6->sin6_port == b6->sin6_port)
++ 			return true;
++ 		break;
++ 
++ 	default:
++ 		dprintk("%s: unhandled address family: %u\n",
++ 			__func__, addr1->sa_family);
++ 		return false;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool
++ _same_data_server_addrs_locked(const struct list_head *dsaddrs1,
++ 			       const struct list_head *dsaddrs2)
++ {
++ 	struct nfs4_pnfs_ds_addr *da1, *da2;
++ 
++ 	/* step through both lists, comparing as we go */
++ 	for (da1 = list_first_entry(dsaddrs1, typeof(*da1), da_node),
++ 	     da2 = list_first_entry(dsaddrs2, typeof(*da2), da_node);
++ 	     da1 != NULL && da2 != NULL;
++ 	     da1 = list_entry(da1->da_node.next, typeof(*da1), da_node),
++ 	     da2 = list_entry(da2->da_node.next, typeof(*da2), da_node)) {
++ 		if (!same_sockaddr((struct sockaddr *)&da1->da_addr,
++ 				   (struct sockaddr *)&da2->da_addr))
++ 			return false;
++ 	}
++ 	if (da1 == NULL && da2 == NULL)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Lookup DS by addresses.  nfs4_ds_cache_lock is held
++  */
++ static struct nfs4_pnfs_ds *
++ _data_server_lookup_locked(const struct list_head *dsaddrs)
++ {
++ 	struct nfs4_pnfs_ds *ds;
++ 
++ 	list_for_each_entry(ds, &nfs4_data_server_cache, ds_node)
++ 		if (_same_data_server_addrs_locked(&ds->ds_addrs, dsaddrs))
++ 			return ds;
++ 	return NULL;
++ }
++ 
++ /*
++  * Create an rpc connection to the nfs4_pnfs_ds data server
++  * Currently only supports IPv4 and IPv6 addresses
++  */
++ static int
++ nfs4_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds)
++ {
++ 	struct nfs_client *clp = ERR_PTR(-EIO);
++ 	struct nfs4_pnfs_ds_addr *da;
++ 	int status = 0;
++ 
++ 	dprintk("--> %s DS %s au_flavor %d\n", __func__, ds->ds_remotestr,
++ 		mds_srv->nfs_client->cl_rpcclient->cl_auth->au_flavor);
++ 
++ 	list_for_each_entry(da, &ds->ds_addrs, da_node) {
++ 		dprintk("%s: DS %s: trying address %s\n",
++ 			__func__, ds->ds_remotestr, da->da_remotestr);
++ 
++ 		clp = nfs4_set_ds_client(mds_srv->nfs_client,
++ 					(struct sockaddr *)&da->da_addr,
++ 					da->da_addrlen, IPPROTO_TCP,
++ 					dataserver_timeo, dataserver_retrans);
++ 		if (!IS_ERR(clp))
++ 			break;
++ 	}
++ 
++ 	if (IS_ERR(clp)) {
++ 		status = PTR_ERR(clp);
++ 		goto out;
++ 	}
++ 
++ 	status = nfs4_init_ds_session(clp, mds_srv->nfs_client->cl_lease_time);
++ 	if (status)
++ 		goto out_put;
++ 
++ 	smp_wmb();
++ 	ds->ds_clp = clp;
++ 	dprintk("%s [new] addr: %s\n", __func__, ds->ds_remotestr);
++ out:
++ 	return status;
++ out_put:
++ 	nfs_put_client(clp);
++ 	goto out;
++ }
++ 
++ static void
++ destroy_ds(struct nfs4_pnfs_ds *ds)
++ {
++ 	struct nfs4_pnfs_ds_addr *da;
++ 
++ 	dprintk("--> %s\n", __func__);
++ 	ifdebug(FACILITY)
++ 		print_ds(ds);
++ 
++ 	nfs_put_client(ds->ds_clp);
++ 
++ 	while (!list_empty(&ds->ds_addrs)) {
++ 		da = list_first_entry(&ds->ds_addrs,
++ 				      struct nfs4_pnfs_ds_addr,
++ 				      da_node);
++ 		list_del_init(&da->da_node);
++ 		kfree(da->da_remotestr);
++ 		kfree(da);
++ 	}
++ 
++ 	kfree(ds->ds_remotestr);
++ 	kfree(ds);
++ }
++ 
+++>>>>>>> fe0bf1185ddf (NFS: Deletion of unnecessary checks before the function call "nfs_put_client")
+  void
+  nfs4_fl_free_deviceid(struct nfs4_file_layout_dsaddr *dsaddr)
+  {
+* Unmerged path fs/nfs/filelayout/filelayoutdev.c
+diff --git a/fs/nfs/nfs4client.c b/fs/nfs/nfs4client.c
+index 657e39a07be1..23bee9aac98f 100644
+--- a/fs/nfs/nfs4client.c
++++ b/fs/nfs/nfs4client.c
+@@ -498,8 +498,7 @@ int nfs40_walk_client_list(struct nfs_client *new,
+ 			atomic_inc(&pos->cl_count);
+ 			spin_unlock(&nn->nfs_client_lock);
+ 
+-			if (prev)
+-				nfs_put_client(prev);
++			nfs_put_client(prev);
+ 			prev = pos;
+ 
+ 			status = nfs_wait_client_init_complete(pos);
+@@ -517,8 +516,7 @@ int nfs40_walk_client_list(struct nfs_client *new,
+ 		atomic_inc(&pos->cl_count);
+ 		spin_unlock(&nn->nfs_client_lock);
+ 
+-		if (prev)
+-			nfs_put_client(prev);
++		nfs_put_client(prev);
+ 		prev = pos;
+ 
+ 		status = nfs4_proc_setclientid_confirm(pos, &clid, cred);
+@@ -549,8 +547,7 @@ int nfs40_walk_client_list(struct nfs_client *new,
+ 
+ 	/* No match found. The server lost our clientid */
+ out:
+-	if (prev)
+-		nfs_put_client(prev);
++	nfs_put_client(prev);
+ 	dprintk("NFS: <-- %s status = %d\n", __func__, status);
+ 	return status;
+ }
+@@ -635,8 +632,7 @@ int nfs41_walk_client_list(struct nfs_client *new,
+ 			atomic_inc(&pos->cl_count);
+ 			spin_unlock(&nn->nfs_client_lock);
+ 
+-			if (prev)
+-				nfs_put_client(prev);
++			nfs_put_client(prev);
+ 			prev = pos;
+ 
+ 			status = nfs_wait_client_init_complete(pos);
+@@ -674,8 +670,7 @@ int nfs41_walk_client_list(struct nfs_client *new,
+ 	/* No matching nfs_client found. */
+ 	spin_unlock(&nn->nfs_client_lock);
+ 	dprintk("NFS: <-- %s status = %d\n", __func__, status);
+-	if (prev)
+-		nfs_put_client(prev);
++	nfs_put_client(prev);
+ 	return status;
+ }
+ #endif	/* CONFIG_NFS_V4_1 */
