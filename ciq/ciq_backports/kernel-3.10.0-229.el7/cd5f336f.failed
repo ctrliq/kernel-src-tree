@@ -1,0 +1,110 @@
+netfilter: ctnetlink: fix refcnt leak in dying/unconfirmed list dumper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit cd5f336f1780cb20e83146cde64d3d5779e175e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/cd5f336f.failed
+
+'last' keeps track of the ct that had its refcnt bumped during previous
+dump cycle.  Thus it must not be overwritten until end-of-function.
+
+Another (unrelated, theoretical) issue: Don't attempt to bump refcnt of a conntrack
+whose reference count is already 0.  Such conntrack is being destroyed
+right now, its memory is freed once we release the percpu dying spinlock.
+
+Fixes: b7779d06 ('netfilter: conntrack: spinlock per cpu to protect special lists.')
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit cd5f336f1780cb20e83146cde64d3d5779e175e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 45b335fdc999,70123f48b6c9..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -1150,37 -1163,50 +1150,76 @@@ ctnetlink_dump_list(struct sk_buff *skb
+  	if (cb->args[2])
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&nf_conntrack_lock);
+ +	last = (struct nf_conn *)cb->args[1];
+ +restart:
+ +	hlist_nulls_for_each_entry(h, n, list, hnnode) {
+ +		ct = nf_ct_tuplehash_to_ctrack(h);
+ +		if (l3proto && nf_ct_l3num(ct) != l3proto)
+ +			continue;
+++=======
++ 	last = (struct nf_conn *)cb->args[1];
++ 
++ 	for (cpu = cb->args[0]; cpu < nr_cpu_ids; cpu++) {
++ 		struct ct_pcpu *pcpu;
++ 
++ 		if (!cpu_possible(cpu))
++ 			continue;
++ 
++ 		pcpu = per_cpu_ptr(net->ct.pcpu_lists, cpu);
++ 		spin_lock_bh(&pcpu->lock);
++ 		list = dying ? &pcpu->dying : &pcpu->unconfirmed;
++ restart:
++ 		hlist_nulls_for_each_entry(h, n, list, hnnode) {
++ 			ct = nf_ct_tuplehash_to_ctrack(h);
++ 			if (l3proto && nf_ct_l3num(ct) != l3proto)
++ 				continue;
++ 			if (cb->args[1]) {
++ 				if (ct != last)
++ 					continue;
++ 				cb->args[1] = 0;
++ 			}
++ 			rcu_read_lock();
++ 			res = ctnetlink_fill_info(skb, NETLINK_CB(cb->skb).portid,
++ 						  cb->nlh->nlmsg_seq,
++ 						  NFNL_MSG_TYPE(cb->nlh->nlmsg_type),
++ 						  ct);
++ 			rcu_read_unlock();
++ 			if (res < 0) {
++ 				if (!atomic_inc_not_zero(&ct->ct_general.use))
++ 					continue;
++ 				cb->args[0] = cpu;
++ 				cb->args[1] = (unsigned long)ct;
++ 				spin_unlock_bh(&pcpu->lock);
++ 				goto out;
++ 			}
++ 		}
+++>>>>>>> cd5f336f1780 (netfilter: ctnetlink: fix refcnt leak in dying/unconfirmed list dumper)
+  		if (cb->args[1]) {
+ +			if (ct != last)
+ +				continue;
+  			cb->args[1] = 0;
+ -			goto restart;
+  		}
+ -		spin_unlock_bh(&pcpu->lock);
+ +		rcu_read_lock();
+ +		res = ctnetlink_fill_info(skb, NETLINK_CB(cb->skb).portid,
+ +					  cb->nlh->nlmsg_seq,
+ +					  NFNL_MSG_TYPE(cb->nlh->nlmsg_type),
+ +					  ct);
+ +		rcu_read_unlock();
+ +		if (res < 0) {
+ +			nf_conntrack_get(&ct->ct_general);
+ +			cb->args[1] = (unsigned long)ct;
+ +			goto out;
+ +		}
+  	}
+ -	cb->args[2] = 1;
+ +	if (cb->args[1]) {
+ +		cb->args[1] = 0;
+ +		goto restart;
+ +	} else
+ +		cb->args[2] = 1;
+  out:
+ +	spin_unlock_bh(&nf_conntrack_lock);
+  	if (last)
+  		nf_ct_put(last);
+  
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
