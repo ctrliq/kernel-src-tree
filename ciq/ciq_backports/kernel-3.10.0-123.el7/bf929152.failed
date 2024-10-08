@@ -1,0 +1,191 @@
+mm, thp: change pmd_trans_huge_lock() to return taken lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] thp: change pmd_trans_huge_lock() to return taken lock (Rik van Riel) [1058896]
+Rebuild_FUZZ: 96.43%
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit bf929152e9f6c49b66fad4ebf08cc95b02ce48f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/bf929152.failed
+
+With split ptlock it's important to know which lock
+pmd_trans_huge_lock() took.  This patch adds one more parameter to the
+function to return the lock.
+
+In most places migration to new api is trivial.  Exception is
+move_huge_pmd(): we need to take two locks if pmd tables are different.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Tested-by: Alex Thorlton <athorlton@sgi.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: "Eric W . Biederman" <ebiederm@xmission.com>
+	Cc: "Paul E . McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Dave Jones <davej@redhat.com>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Robin Holt <robinmholt@gmail.com>
+	Cc: Sedat Dilek <sedat.dilek@gmail.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit bf929152e9f6c49b66fad4ebf08cc95b02ce48f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+#	mm/huge_memory.c
+diff --cc fs/proc/task_mmu.c
+index bf4d995fbdba,42b5cf5d0326..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -904,13 -999,21 +904,25 @@@ static int pagemap_pte_range(pmd_t *pmd
+  {
+  	struct vm_area_struct *vma;
+  	struct pagemapread *pm = walk->private;
++ 	spinlock_t *ptl;
+  	pte_t *pte;
+  	int err = 0;
+ -	pagemap_entry_t pme = make_pme(PM_NOT_PRESENT(pm->v2));
+ +	pagemap_entry_t pme = make_pme(PM_NOT_PRESENT);
+  
+  	/* find the first VMA at or above 'addr' */
+  	vma = find_vma(walk->mm, addr);
+++<<<<<<< HEAD
+ +	if (vma && pmd_trans_huge_lock(pmd, vma) == 1) {
+++=======
++ 	if (vma && pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
++ 		int pmd_flags2;
++ 
++ 		if ((vma->vm_flags & VM_SOFTDIRTY) || pmd_soft_dirty(*pmd))
++ 			pmd_flags2 = __PM_SOFT_DIRTY;
++ 		else
++ 			pmd_flags2 = 0;
++ 
+++>>>>>>> bf929152e9f6 (mm, thp: change pmd_trans_huge_lock() to return taken lock)
+  		for (; addr != end; addr += PAGE_SIZE) {
+  			unsigned long offset;
+  
+diff --cc mm/huge_memory.c
+index cfdc44cd7986,471eb04066ff..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1467,12 -1458,21 +1470,26 @@@ int move_huge_pmd(struct vm_area_struc
+  		goto out;
+  	}
+  
+- 	ret = __pmd_trans_huge_lock(old_pmd, vma);
++ 	/*
++ 	 * We don't have to worry about the ordering of src and dst
++ 	 * ptlocks because exclusive mmap_sem prevents deadlock.
++ 	 */
++ 	ret = __pmd_trans_huge_lock(old_pmd, vma, &old_ptl);
+  	if (ret == 1) {
++ 		new_ptl = pmd_lockptr(mm, new_pmd);
++ 		if (new_ptl != old_ptl)
++ 			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
+  		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
+  		VM_BUG_ON(!pmd_none(*new_pmd));
+++<<<<<<< HEAD
+ +		set_pmd_at(mm, new_addr, new_pmd, pmd);
+ +		spin_unlock(&mm->page_table_lock);
+++=======
++ 		set_pmd_at(mm, new_addr, new_pmd, pmd_mksoft_dirty(pmd));
++ 		if (new_ptl != old_ptl)
++ 			spin_unlock(new_ptl);
++ 		spin_unlock(old_ptl);
+++>>>>>>> bf929152e9f6 (mm, thp: change pmd_trans_huge_lock() to return taken lock)
+  	}
+  out:
+  	return ret;
+* Unmerged path fs/proc/task_mmu.c
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index e2dbefb38e3b..b3080d55cc66 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -132,15 +132,15 @@ extern void __vma_adjust_trans_huge(struct vm_area_struct *vma,
+ 				    unsigned long start,
+ 				    unsigned long end,
+ 				    long adjust_next);
+-extern int __pmd_trans_huge_lock(pmd_t *pmd,
+-				 struct vm_area_struct *vma);
++extern int __pmd_trans_huge_lock(pmd_t *pmd, struct vm_area_struct *vma,
++		spinlock_t **ptl);
+ /* mmap_sem must be held on entry */
+-static inline int pmd_trans_huge_lock(pmd_t *pmd,
+-				      struct vm_area_struct *vma)
++static inline int pmd_trans_huge_lock(pmd_t *pmd, struct vm_area_struct *vma,
++		spinlock_t **ptl)
+ {
+ 	VM_BUG_ON(!rwsem_is_locked(&vma->vm_mm->mmap_sem));
+ 	if (pmd_trans_huge(*pmd))
+-		return __pmd_trans_huge_lock(pmd, vma);
++		return __pmd_trans_huge_lock(pmd, vma, ptl);
+ 	else
+ 		return 0;
+ }
+@@ -218,8 +218,8 @@ static inline void vma_adjust_trans_huge(struct vm_area_struct *vma,
+ 					 long adjust_next)
+ {
+ }
+-static inline int pmd_trans_huge_lock(pmd_t *pmd,
+-				      struct vm_area_struct *vma)
++static inline int pmd_trans_huge_lock(pmd_t *pmd, struct vm_area_struct *vma,
++		spinlock_t **ptl)
+ {
+ 	return 0;
+ }
+* Unmerged path mm/huge_memory.c
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 194721839cf5..bc2539e89f55 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -6593,10 +6593,10 @@ static int mem_cgroup_count_precharge_pte_range(pmd_t *pmd,
+ 	pte_t *pte;
+ 	spinlock_t *ptl;
+ 
+-	if (pmd_trans_huge_lock(pmd, vma) == 1) {
++	if (pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+ 		if (get_mctgt_type_thp(vma, addr, *pmd, NULL) == MC_TARGET_PAGE)
+ 			mc.precharge += HPAGE_PMD_NR;
+-		spin_unlock(&vma->vm_mm->page_table_lock);
++		spin_unlock(ptl);
+ 		return 0;
+ 	}
+ 
+@@ -6782,9 +6782,9 @@ static int mem_cgroup_move_charge_pte_range(pmd_t *pmd,
+ 	 *    to be unlocked in __split_huge_page_splitting(), where the main
+ 	 *    part of thp split is not executed yet.
+ 	 */
+-	if (pmd_trans_huge_lock(pmd, vma) == 1) {
++	if (pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+ 		if (mc.precharge < HPAGE_PMD_NR) {
+-			spin_unlock(&vma->vm_mm->page_table_lock);
++			spin_unlock(ptl);
+ 			return 0;
+ 		}
+ 		target_type = get_mctgt_type_thp(vma, addr, *pmd, &target);
+@@ -6801,7 +6801,7 @@ static int mem_cgroup_move_charge_pte_range(pmd_t *pmd,
+ 			}
+ 			put_page(page);
+ 		}
+-		spin_unlock(&vma->vm_mm->page_table_lock);
++		spin_unlock(ptl);
+ 		return 0;
+ 	}
+ 
