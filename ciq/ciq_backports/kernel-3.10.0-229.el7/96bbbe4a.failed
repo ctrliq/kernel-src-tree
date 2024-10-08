@@ -1,0 +1,599 @@
+cpufreq: Remove unnecessary variable/parameter 'frozen'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Remove unnecessary variable/parameter 'frozen' (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 91.09%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 96bbbe4a2a5b13c440a19dd7a5ff33de3303aac4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/96bbbe4a.failed
+
+We have used 'frozen' variable/function parameter at many places to
+distinguish between CPU offline/online on suspend/resume vs sysfs
+removals. We now have another variable cpufreq_suspended which can
+be used in these cases, so we can get rid of all those variables or
+function parameters.
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 96bbbe4a2a5b13c440a19dd7a5ff33de3303aac4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index c8bc717e8458,571723b338f9..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -911,24 -951,105 +911,119 @@@ static int cpufreq_add_policy_cpu(unsig
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	policy->governor = NULL;
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	INIT_LIST_HEAD(&policy->policy_list);
++ 	init_rwsem(&policy->rwsem);
++ 
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_put_kobj(struct cpufreq_policy *policy)
++ {
++ 	struct kobject *kobj;
++ 	struct completion *cmp;
++ 
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_REMOVE_POLICY, policy);
++ 
++ 	down_read(&policy->rwsem);
++ 	kobj = &policy->kobj;
++ 	cmp = &policy->kobj_unregister;
++ 	up_read(&policy->rwsem);
++ 	kobject_put(kobj);
++ 
++ 	/*
++ 	 * We need to make sure that the underlying kobj is
++ 	 * actually not referenced anymore by anybody before we
++ 	 * proceed with unloading.
++ 	 */
++ 	pr_debug("waiting for dropping of refcount\n");
++ 	wait_for_completion(cmp);
++ 	pr_debug("wait complete\n");
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
++ {
++ 	if (WARN_ON(cpu == policy->cpu))
++ 		return;
++ 
++ 	down_write(&policy->rwsem);
++ 
++ 	policy->last_cpu = policy->cpu;
++ 	policy->cpu = cpu;
++ 
++ 	up_write(&policy->rwsem);
++ 
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_UPDATE_POLICY_CPU, policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+  	struct cpufreq_policy *policy;
+  	unsigned long flags;
++ 	bool recover_policy = cpufreq_suspended;
+  #ifdef CONFIG_HOTPLUG_CPU
+ -	struct cpufreq_policy *tpolicy;
+ +	struct cpufreq_governor *gov;
+ +	int sibling;
+  #endif
+  
+  	if (cpu_is_offline(cpu))
+@@@ -964,23 -1084,31 +1059,48 @@@
+  	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  #endif
+  
+++<<<<<<< HEAD
+ +	policy = kzalloc(sizeof(struct cpufreq_policy), GFP_KERNEL);
+ +	if (!policy)
+ +		goto nomem_out;
+ +
+ +	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
+ +		goto err_free_policy;
+++=======
++ 	/*
++ 	 * Restore the saved policy when doing light-weight init and fall back
++ 	 * to the full init if that fails.
++ 	 */
++ 	policy = recover_policy ? cpufreq_policy_restore(cpu) : NULL;
++ 	if (!policy) {
++ 		recover_policy = false;
++ 		policy = cpufreq_policy_alloc();
++ 		if (!policy)
++ 			goto nomem_out;
++ 	}
++ 
++ 	/*
++ 	 * In the resume path, since we restore a saved policy, the assignment
++ 	 * to policy->cpu is like an update of the existing policy, rather than
++ 	 * the creation of a brand new one. So we need to perform this update
++ 	 * by invoking update_policy_cpu().
++ 	 */
++ 	if (recover_policy && cpu != policy->cpu)
++ 		update_policy_cpu(policy, cpu);
++ 	else
++ 		policy->cpu = cpu;
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+ +
+ +	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
+ +		goto err_free_cpumask;
+  
+ +	policy->cpu = cpu;
+ +	policy->governor = CPUFREQ_DEFAULT_GOVERNOR;
+  	cpumask_copy(policy->cpus, cpumask_of(cpu));
+  
+ +	/* Initially set CPU itself as the policy_cpu */
+ +	per_cpu(cpufreq_policy_cpu, cpu) = cpu;
+ +
+  	init_completion(&policy->kobj_unregister);
+  	INIT_WORK(&policy->update, handle_update);
+  
+@@@ -993,6 -1121,26 +1113,29 @@@
+  		goto err_set_policy_cpu;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* related cpus should atleast have policy->cpus */
++ 	cpumask_or(policy->related_cpus, policy->related_cpus, policy->cpus);
++ 
++ 	/*
++ 	 * affected cpus must always be the one, which are online. We aren't
++ 	 * managing offline cpus here.
++ 	 */
++ 	cpumask_and(policy->cpus, policy->cpus, cpu_online_mask);
++ 
++ 	if (!recover_policy) {
++ 		policy->user_policy.min = policy->min;
++ 		policy->user_policy.max = policy->max;
++ 	}
++ 
++ 	down_write(&policy->rwsem);
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	for_each_cpu(j, policy->cpus)
++ 		per_cpu(cpufreq_cpu_data, j) = policy;
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  	if (cpufreq_driver->get) {
+  		policy->cur = cpufreq_driver->get(policy->cpu);
+  		if (!policy->cur) {
+@@@ -1056,30 -1192,29 +1199,48 @@@
+  	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+  				     CPUFREQ_START, policy);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_HOTPLUG_CPU
+ +	gov = __find_governor(per_cpu(cpufreq_cpu_governor, cpu));
+ +	if (gov) {
+ +		policy->governor = gov;
+ +		pr_debug("Restoring governor %s for cpu %d\n",
+ +		       policy->governor->name, cpu);
+++=======
++ 	if (!recover_policy) {
++ 		ret = cpufreq_add_dev_interface(policy, dev);
++ 		if (ret)
++ 			goto err_out_unregister;
++ 		blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 				CPUFREQ_CREATE_POLICY, policy);
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  	}
+ +#endif
+  
+  	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	list_add(&policy->policy_list, &cpufreq_policy_list);
+ +	for_each_cpu(j, policy->cpus) {
+ +		per_cpu(cpufreq_cpu_data, j) = policy;
+ +		per_cpu(cpufreq_policy_cpu, j) = policy->cpu;
+ +	}
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+ +	ret = cpufreq_add_dev_interface(cpu, policy, dev);
+ +	if (ret)
+ +		goto err_out_unregister;
+ +
+  	cpufreq_init_policy(policy);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!recover_policy) {
++ 		policy->user_policy.policy = policy->policy;
++ 		policy->user_policy.governor = policy->governor;
++ 	}
++ 	up_write(&policy->rwsem);
++ 
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  	kobject_uevent(&policy->kobj, KOBJ_ADD);
+  	up_read(&cpufreq_rwsem);
+ -
+  	pr_debug("initialization complete\n");
+  
+  	return 0;
+@@@ -1097,35 -1229,34 +1258,49 @@@ err_get_freq
+  	if (cpufreq_driver->exit)
+  		cpufreq_driver->exit(policy);
+  err_set_policy_cpu:
+++<<<<<<< HEAD
+ +	per_cpu(cpufreq_policy_cpu, cpu) = -1;
+ +	free_cpumask_var(policy->related_cpus);
+ +err_free_cpumask:
+ +	free_cpumask_var(policy->cpus);
+ +err_free_policy:
+ +	kfree(policy);
+++=======
++ 	if (recover_policy) {
++ 		/* Do not leave stale fallback data behind. */
++ 		per_cpu(cpufreq_cpu_data_fallback, cpu) = NULL;
++ 		cpufreq_policy_put_kobj(policy);
++ 	}
++ 	cpufreq_policy_free(policy);
++ 
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  nomem_out:
+  	up_read(&cpufreq_rwsem);
+ -
+  	return ret;
+  }
+  
+ -/**
+ - * cpufreq_add_dev - add a CPU device
+ - *
+ - * Adds the cpufreq interface for a CPU device.
+ - *
+ - * The Oracle says: try running cpufreq registration/unregistration concurrently
+ - * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ - * mess up, but more thorough testing is needed. - Mathieu
+ - */
+ -static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+ +static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	int j;
+ +
+ +	policy->last_cpu = policy->cpu;
+ +	policy->cpu = cpu;
+ +
+ +	for_each_cpu(j, policy->cpus)
+ +		per_cpu(cpufreq_policy_cpu, j) = cpu;
+ +
+ +#ifdef CONFIG_CPU_FREQ_TABLE
+ +	cpufreq_frequency_table_update_policy_cpu(policy);
+ +#endif
+ +	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+ +			CPUFREQ_UPDATE_POLICY_CPU, policy);
+++=======
++ 	return __cpufreq_add_dev(dev, sif);
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  }
+  
+ -static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *policy,
+ +static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *data,
+  					   unsigned int old_cpu)
+  {
+  	struct device *cpu_dev;
+@@@ -1157,27 -1283,23 +1332,40 @@@
+  	return cpu_dev->id;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * __cpufreq_remove_dev - remove a CPU device
+ + *
+ + * Removes the cpufreq interface for a CPU device.
+ + */
+ +static int __cpufreq_remove_dev(struct device *dev,
+ +		struct subsys_interface *sif)
+++=======
++ static int __cpufreq_remove_dev_prepare(struct device *dev,
++ 					struct subsys_interface *sif)
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  {
+  	unsigned int cpu = dev->id, cpus;
+ -	int new_cpu, ret;
+ +	int new_cpu;
+  	unsigned long flags;
+ -	struct cpufreq_policy *policy;
+ +	struct cpufreq_policy *data;
+ +	struct kobject *kobj;
+ +	struct completion *cmp;
+  
+  	pr_debug("%s: unregistering CPU %u\n", __func__, cpu);
+  
+  	write_lock_irqsave(&cpufreq_driver_lock, flags);
+  
+++<<<<<<< HEAD
+ +	data = per_cpu(cpufreq_cpu_data, cpu);
+ +	per_cpu(cpufreq_cpu_data, cpu) = NULL;
+++=======
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 
++ 	/* Save the policy somewhere when doing a light-weight tear-down */
++ 	if (cpufreq_suspended)
++ 		per_cpu(cpufreq_cpu_data_fallback, cpu) = policy;
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+@@@ -1186,65 -1308,101 +1374,123 @@@
+  		return -EINVAL;
+  	}
+  
+ -	if (has_target()) {
+ -		ret = __cpufreq_governor(policy, CPUFREQ_GOV_STOP);
+ -		if (ret) {
+ -			pr_err("%s: Failed to stop governor\n", __func__);
+ -			return ret;
+ -		}
+ -	}
+ +	if (cpufreq_driver->target)
+ +		__cpufreq_governor(data, CPUFREQ_GOV_STOP);
+  
+ +#ifdef CONFIG_HOTPLUG_CPU
+  	if (!cpufreq_driver->setpolicy)
+  		strncpy(per_cpu(cpufreq_cpu_governor, cpu),
+ -			policy->governor->name, CPUFREQ_NAME_LEN);
+ +			data->governor->name, CPUFREQ_NAME_LEN);
+ +#endif
+  
+++<<<<<<< HEAD
+ +	WARN_ON(lock_policy_rwsem_write(cpu));
+ +	cpus = cpumask_weight(data->cpus);
+++=======
++ 	down_read(&policy->rwsem);
++ 	cpus = cpumask_weight(policy->cpus);
++ 	up_read(&policy->rwsem);
++ 
++ 	if (cpu != policy->cpu) {
++ 		sysfs_remove_link(&dev->kobj, "cpufreq");
++ 	} else if (cpus > 1) {
++ 		new_cpu = cpufreq_nominate_new_policy_cpu(policy, cpu);
++ 		if (new_cpu >= 0) {
++ 			update_policy_cpu(policy, new_cpu);
++ 
++ 			if (!cpufreq_suspended) {
++ 				pr_debug("%s: policy Kobject moved to cpu: %d from: %d\n",
++ 					 __func__, new_cpu, cpu);
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int __cpufreq_remove_dev_finish(struct device *dev,
++ 				       struct subsys_interface *sif)
++ {
++ 	unsigned int cpu = dev->id, cpus;
++ 	int ret;
++ 	unsigned long flags;
++ 	struct cpufreq_policy *policy;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy) {
++ 		pr_debug("%s: No cpu_data found\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	down_write(&policy->rwsem);
++ 	cpus = cpumask_weight(policy->cpus);
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  
+  	if (cpus > 1)
+ -		cpumask_clear_cpu(cpu, policy->cpus);
+ -	up_write(&policy->rwsem);
+ +		cpumask_clear_cpu(cpu, data->cpus);
+ +	unlock_policy_rwsem_write(cpu);
+  
+ -	/* If cpu is last user of policy, free policy */
+ -	if (cpus == 1) {
+ -		if (has_target()) {
+ -			ret = __cpufreq_governor(policy,
+ -					CPUFREQ_GOV_POLICY_EXIT);
+ -			if (ret) {
+ -				pr_err("%s: Failed to exit governor\n",
+ -				       __func__);
+ -				return ret;
+ -			}
+ +	if (cpu != data->cpu) {
+ +		sysfs_remove_link(&dev->kobj, "cpufreq");
+ +	} else if (cpus > 1) {
+ +
+ +		new_cpu = cpufreq_nominate_new_policy_cpu(data, cpu);
+ +		if (new_cpu >= 0) {
+ +			WARN_ON(lock_policy_rwsem_write(cpu));
+ +			update_policy_cpu(data, new_cpu);
+ +			unlock_policy_rwsem_write(cpu);
+ +			pr_debug("%s: policy Kobject moved to cpu: %d "
+ +				 "from: %d\n",__func__, new_cpu, cpu);
+  		}
+ +	}
+  
+ +	/* If cpu is last user of policy, free policy */
+ +	if (cpus == 1) {
+ +		if (cpufreq_driver->target)
+ +			__cpufreq_governor(data, CPUFREQ_GOV_POLICY_EXIT);
+ +
+++<<<<<<< HEAD
+ +		lock_policy_rwsem_read(cpu);
+ +		kobj = &data->kobj;
+ +		cmp = &data->kobj_unregister;
+ +		unlock_policy_rwsem_read(cpu);
+ +		kobject_put(kobj);
+++=======
++ 		if (!cpufreq_suspended)
++ 			cpufreq_policy_put_kobj(policy);
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  
+ -		/*
+ -		 * Perform the ->exit() even during light-weight tear-down,
+ -		 * since this is a core component, and is essential for the
+ -		 * subsequent light-weight ->init() to succeed.
+ +		/* we need to make sure that the underlying kobj is actually
+ +		 * not referenced anymore by anybody before we proceed with
+ +		 * unloading.
+  		 */
+ +		pr_debug("waiting for dropping of refcount\n");
+ +		wait_for_completion(cmp);
+ +		pr_debug("wait complete\n");
+ +
+  		if (cpufreq_driver->exit)
+ -			cpufreq_driver->exit(policy);
+ +			cpufreq_driver->exit(data);
+  
+++<<<<<<< HEAD
+ +		free_cpumask_var(data->related_cpus);
+ +		free_cpumask_var(data->cpus);
+ +		kfree(data);
+++=======
++ 		/* Remove policy from list of active policies */
++ 		write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 		list_del(&policy->policy_list);
++ 		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 		if (!cpufreq_suspended)
++ 			cpufreq_policy_free(policy);
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  	} else {
+ -		if (has_target()) {
+ -			if ((ret = __cpufreq_governor(policy, CPUFREQ_GOV_START)) ||
+ -					(ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))) {
+ -				pr_err("%s: Failed to start governor\n",
+ -				       __func__);
+ -				return ret;
+ -			}
+ +		if (cpufreq_driver->target) {
+ +			__cpufreq_governor(data, CPUFREQ_GOV_START);
+ +			__cpufreq_governor(data, CPUFREQ_GOV_LIMITS);
+  		}
+  	}
+  
+@@@ -1260,8 -1423,12 +1506,17 @@@ static int cpufreq_remove_dev(struct de
+  	if (cpu_is_offline(cpu))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	retval = __cpufreq_remove_dev(dev, sif);
+ +	return retval;
+++=======
++ 	ret = __cpufreq_remove_dev_prepare(dev, sif);
++ 
++ 	if (!ret)
++ 		ret = __cpufreq_remove_dev_finish(dev, sif);
++ 
++ 	return ret;
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  }
+  
+  static void handle_update(struct work_struct *work)
+@@@ -1967,19 -2183,21 +2222,37 @@@ static int cpufreq_cpu_callback(struct 
+  
+  	dev = get_cpu_device(cpu);
+  	if (dev) {
+++<<<<<<< HEAD
+ +		switch (action) {
+ +		case CPU_ONLINE:
+ +		case CPU_ONLINE_FROZEN:
+ +			cpufreq_add_dev(dev, NULL);
+ +			cpufreq_update_policy(cpu);
+++=======
++ 		switch (action & ~CPU_TASKS_FROZEN) {
++ 		case CPU_ONLINE:
++ 			__cpufreq_add_dev(dev, NULL);
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  			break;
+ -
+  		case CPU_DOWN_PREPARE:
+++<<<<<<< HEAD
+ +		case CPU_DOWN_PREPARE_FROZEN:
+ +			__cpufreq_remove_dev(dev, NULL);
+ +			break;
+ +		case CPU_DOWN_FAILED:
+ +		case CPU_DOWN_FAILED_FROZEN:
+ +			cpufreq_add_dev(dev, NULL);
+++=======
++ 			__cpufreq_remove_dev_prepare(dev, NULL);
++ 			break;
++ 
++ 		case CPU_POST_DEAD:
++ 			__cpufreq_remove_dev_finish(dev, NULL);
++ 			break;
++ 
++ 		case CPU_DOWN_FAILED:
++ 			__cpufreq_add_dev(dev, NULL);
+++>>>>>>> 96bbbe4a2a5b (cpufreq: Remove unnecessary variable/parameter 'frozen')
+  			break;
+  		}
+  	}
+* Unmerged path drivers/cpufreq/cpufreq.c
