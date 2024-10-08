@@ -1,0 +1,264 @@
+netfilter: bridge: don't use nf_bridge_info data to store mac header
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit e70deecbf8e1562cac0b19f23848919e2f5d65aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e70deecb.failed
+
+br_netfilter maintains an extra state, nf_bridge_info, which is attached
+to skb via skb->nf_bridge pointer.
+
+Amongst other things we use skb->nf_bridge->data to store the original
+mac header for every processed skb.
+
+This is required for ip refragmentation when using conntrack
+on top of bridge, because ip_fragment doesn't copy it from original skb.
+
+However there is no need anymore to do this unconditionally.
+
+Move this to the one place where its needed -- when br_netfilter calls
+ip_fragment().
+
+Also switch to percpu storage for this so we can handle fragmenting
+without accessing nf_bridge meta data.
+
+Only user left is neigh resolution when DNAT is detected, to hold
+the original source mac address (neigh resolution builds new mac header
+using bridge mac), so rename ->data and reduce its size to whats needed.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit e70deecbf8e1562cac0b19f23848919e2f5d65aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netfilter.c
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,ca1cb6704a78..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -110,65 -111,18 +110,80 @@@ static inline __be16 pppoe_proto(const 
+  	 pppoe_proto(skb) == htons(PPP_IPV6) && \
+  	 brnf_filter_pppoe_tagged)
+  
+++<<<<<<< HEAD
+ +static void fake_update_pmtu(struct dst_entry *dst, struct sock *sk,
+ +			     struct sk_buff *skb, u32 mtu)
+ +{
+ +}
+ +
+ +static void fake_redirect(struct dst_entry *dst, struct sock *sk,
+ +			  struct sk_buff *skb)
+ +{
+ +}
+ +
+ +static u32 *fake_cow_metrics(struct dst_entry *dst, unsigned long old)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static struct neighbour *fake_neigh_lookup(const struct dst_entry *dst,
+ +					   struct sk_buff *skb,
+ +					   const void *daddr)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static unsigned int fake_mtu(const struct dst_entry *dst)
+ +{
+ +	return dst->dev->mtu;
+ +}
+ +
+ +static struct dst_ops fake_dst_ops = {
+ +	.family =		AF_INET,
+ +	.protocol =		cpu_to_be16(ETH_P_IP),
+ +	.update_pmtu =		fake_update_pmtu,
+ +	.redirect =		fake_redirect,
+ +	.cow_metrics =		fake_cow_metrics,
+ +	.neigh_lookup =		fake_neigh_lookup,
+ +	.mtu =			fake_mtu,
+ +};
+ +
+ +/*
+ + * Initialize bogus route table used to keep netfilter happy.
+ + * Currently, we fill in the PMTU entry because netfilter
+ + * refragmentation needs it, and the rt_flags entry because
+ + * ipt_REJECT needs it.  Future netfilter modules might
+ + * require us to fill additional fields.
+ + */
+ +static const u32 br_dst_default_metrics[RTAX_MAX] = {
+ +	[RTAX_MTU - 1] = 1500,
+ +};
+ +
+ +void br_netfilter_rtable_init(struct net_bridge *br)
+ +{
+ +	struct rtable *rt = &br->fake_rtable;
+ +
+ +	atomic_set(&rt->dst.__refcnt, 1);
+ +	rt->dst.dev = br->dev;
+ +	rt->dst.path = &rt->dst;
+ +	dst_init_metrics(&rt->dst, br_dst_default_metrics, true);
+ +	rt->dst.flags	= DST_NOXFRM | DST_NOPEER | DST_FAKE_RTABLE;
+ +	rt->dst.ops = &fake_dst_ops;
+ +}
+++=======
++ /* largest possible L2 header, see br_nf_dev_queue_xmit() */
++ #define NF_BRIDGE_MAX_MAC_HEADER_LENGTH (PPPOE_SES_HLEN + ETH_HLEN)
++ 
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
++ struct brnf_frag_data {
++ 	char mac[NF_BRIDGE_MAX_MAC_HEADER_LENGTH];
++ 	u8 encap_size;
++ 	u8 size;
++ };
++ 
++ static DEFINE_PER_CPU(struct brnf_frag_data, brnf_frag_data_storage);
++ #endif
+++>>>>>>> e70deecbf8e1 (netfilter: bridge: don't use nf_bridge_info data to store mac header)
+  
+  static inline struct rtable *bridge_parent_rtable(const struct net_device *dev)
+  {
+@@@ -848,20 -814,61 +855,76 @@@ static unsigned int br_nf_forward_arp(c
+  	return NF_STOLEN;
+  }
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_NF_CONNTRACK_IPV4)
+ +static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+++=======
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
++ static int br_nf_push_frag_xmit(struct sk_buff *skb)
++ {
++ 	struct brnf_frag_data *data;
++ 	int err;
++ 
++ 	data = this_cpu_ptr(&brnf_frag_data_storage);
++ 	err = skb_cow_head(skb, data->size);
++ 
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return 0;
++ 	}
++ 
++ 	skb_copy_to_linear_data_offset(skb, -data->size, data->mac, data->size);
++ 	__skb_push(skb, data->encap_size);
++ 
++ 	return br_dev_queue_push_xmit(skb);
++ }
++ 
++ static int br_nf_dev_queue_xmit(struct sk_buff *skb)
+++>>>>>>> e70deecbf8e1 (netfilter: bridge: don't use nf_bridge_info data to store mac header)
+  {
+  	int ret;
+ -	int frag_max_size;
+ -	unsigned int mtu_reserved;
+  
+++<<<<<<< HEAD
+ +	if (skb->nfct != NULL && skb->protocol == htons(ETH_P_IP) &&
+ +	    skb->len + nf_bridge_mtu_reduction(skb) > skb->dev->mtu &&
+ +	    !skb_is_gso(skb)) {
+ +		if (br_parse_ip_options(skb))
+ +			/* Drop invalid packet */
+ +			return NF_DROP;
+ +		ret = ip_fragment(sk, skb, br_dev_queue_push_xmit);
+ +	} else
+ +		ret = br_dev_queue_push_xmit(sk, skb);
+++=======
++ 	if (skb_is_gso(skb) || skb->protocol != htons(ETH_P_IP))
++ 		return br_dev_queue_push_xmit(skb);
++ 
++ 	mtu_reserved = nf_bridge_mtu_reduction(skb);
++ 	/* This is wrong! We should preserve the original fragment
++ 	 * boundaries by preserving frag_list rather than refragmenting.
++ 	 */
++ 	if (skb->len + mtu_reserved > skb->dev->mtu) {
++ 		struct brnf_frag_data *data;
++ 
++ 		frag_max_size = BR_INPUT_SKB_CB(skb)->frag_max_size;
++ 		if (br_parse_ip_options(skb))
++ 			/* Drop invalid packet */
++ 			return NF_DROP;
++ 		IPCB(skb)->frag_max_size = frag_max_size;
++ 
++ 		nf_bridge_update_protocol(skb);
++ 
++ 		data = this_cpu_ptr(&brnf_frag_data_storage);
++ 		data->encap_size = nf_bridge_encap_header_len(skb);
++ 		data->size = ETH_HLEN + data->encap_size;
++ 
++ 		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
++ 						 data->size);
++ 
++ 		ret = ip_fragment(skb, br_nf_push_frag_xmit);
++ 	} else {
++ 		ret = br_dev_queue_push_xmit(skb);
++ 	}
+++>>>>>>> e70deecbf8e1 (netfilter: bridge: don't use nf_bridge_info data to store mac header)
+  
+  	return ret;
+  }
+@@@ -939,6 -944,44 +1001,47 @@@ static unsigned int ip_sabotage_in(cons
+  	return NF_ACCEPT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This is called when br_netfilter has called into iptables/netfilter,
++  * and DNAT has taken place on a bridge-forwarded packet.
++  *
++  * neigh->output has created a new MAC header, with local br0 MAC
++  * as saddr.
++  *
++  * This restores the original MAC saddr of the bridged packet
++  * before invoking bridge forward logic to transmit the packet.
++  */
++ static void br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
++ 
++ 	skb_pull(skb, ETH_HLEN);
++ 	nf_bridge->mask &= ~BRNF_BRIDGED_DNAT;
++ 
++ 	BUILD_BUG_ON(sizeof(nf_bridge->neigh_header) != (ETH_HLEN - ETH_ALEN));
++ 
++ 	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN - ETH_ALEN),
++ 				       nf_bridge->neigh_header,
++ 				       ETH_HLEN - ETH_ALEN);
++ 	skb->dev = nf_bridge->physindev;
++ 	br_handle_frame_finish(skb);
++ }
++ 
++ static int br_nf_dev_xmit(struct sk_buff *skb)
++ {
++ 	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
++ 		br_nf_pre_routing_finish_bridge_slow(skb);
++ 		return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static const struct nf_br_ops br_ops = {
++ 	.br_dev_xmit_hook =	br_nf_dev_xmit,
++ };
++ 
+++>>>>>>> e70deecbf8e1 (netfilter: bridge: don't use nf_bridge_info data to store mac header)
+  void br_netfilter_enable(void)
+  {
+  }
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 2e271768b46a..0e022eca9fb7 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -169,7 +169,7 @@ struct nf_bridge_info {
+ 	unsigned int		mask;
+ 	struct net_device	*physindev;
+ 	struct net_device	*physoutdev;
+-	unsigned long		data[32 / sizeof(unsigned long)];
++	char			neigh_header[8];
+ };
+ #endif
+ 
+* Unmerged path net/bridge/br_netfilter.c
