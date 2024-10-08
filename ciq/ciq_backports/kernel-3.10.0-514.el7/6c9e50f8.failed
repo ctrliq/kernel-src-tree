@@ -1,0 +1,185 @@
+staging/rdma/hfi1: Method to toggle "fast ECN" detection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Method to toggle "fast ECN" detection (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 92.31%
+commit-author Vennila Megavannan <vennila.megavannan@intel.com>
+commit 6c9e50f894458810591f7883bdd6f0f8474b06a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6c9e50f8.failed
+
+Add a per port sysfs paramter to toggle cc_prescan/Fast ECN Detection and
+remove the Kconfig option which was previously used to control this.
+
+While am updating the sysfs documentation, fix the name of CCMgtA.
+
+	Reviewed-by: Arthur Kepner <arthur.kepner@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Vennila Megavannan <vennila.megavannan@intel.com>
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 6c9e50f894458810591f7883bdd6f0f8474b06a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/Kconfig
+#	drivers/staging/hfi1/driver.c
+diff --cc drivers/staging/hfi1/Kconfig
+index 78bc89ef28cc,3e668d852f03..000000000000
+--- a/drivers/staging/hfi1/Kconfig
++++ b/drivers/staging/hfi1/Kconfig
+@@@ -25,13 -26,3 +25,16 @@@ config CONFIG_SDMA_VERBOSIT
+  	---help---
+  	This is a configuration flag to enable verbose
+  	SDMA debug
+++<<<<<<< HEAD:drivers/staging/hfi1/Kconfig
+ +config CONFIG_PRESCAN_RXQ
+ +	bool "Enable prescanning of the RX queue for ECNs"
+ +	depends on INFINIBAND_HFI1
+ +	default n
+ +	---help---
+ +	This option toggles the prescanning of the receive queue for
+ +	Explicit Congestion Notifications. If an ECN is detected, it
+ +	is processed as quickly as possible, the ECN is toggled off.
+ +	After the prescanning step, the receive queue is processed as
+ +	usual.
+++=======
+++>>>>>>> 6c9e50f89445 (staging/rdma/hfi1: Method to toggle "fast ECN" detection):drivers/staging/rdma/hfi1/Kconfig
+diff --cc drivers/staging/hfi1/driver.c
+index fca20e92c79b,59ce85f8d155..000000000000
+--- a/drivers/staging/hfi1/driver.c
++++ b/drivers/staging/hfi1/driver.c
+@@@ -434,12 -453,7 +434,16 @@@ static inline void init_packet(struct h
+  	packet->rcv_flags = 0;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/driver.c
+ +#ifndef CONFIG_PRESCAN_RXQ
+ +static void prescan_rxq(struct hfi1_packet *packet) {}
+ +#else /* !CONFIG_PRESCAN_RXQ */
+ +static int prescan_receive_queue;
+ +
+ +static void process_ecn(struct hfi1_qp *qp, struct hfi1_ib_header *hdr,
+++=======
++ static void process_ecn(struct rvt_qp *qp, struct hfi1_ib_header *hdr,
+++>>>>>>> 6c9e50f89445 (staging/rdma/hfi1: Method to toggle "fast ECN" detection):drivers/staging/rdma/hfi1/driver.c
+  			struct hfi1_other_headers *ohdr,
+  			u64 rhf, u32 bth1, struct ib_grh *grh)
+  {
+diff --git a/Documentation/infiniband/sysfs.txt b/Documentation/infiniband/sysfs.txt
+index 23d1b6dc65c9..018e4bd464e4 100644
+--- a/Documentation/infiniband/sysfs.txt
++++ b/Documentation/infiniband/sysfs.txt
+@@ -80,9 +80,10 @@ HFI1
+    chip_reset - diagnostic (root only)
+    boardversion - board version
+    ports/1/
+-          CMgtA/
++          CCMgtA/
+                cc_settings_bin - CCA tables used by PSM2
+                cc_table_bin
++               cc_prescan - enable prescaning for faster BECN response
+           sc2v/ - 32 files (0 - 31) used to translate sl->vl
+           sl2sc/ - 32 files (0 - 31) used to translate sl->sc
+           vl2mtu/ - 16 (0 - 15) files used to determine MTU for vl
+* Unmerged path drivers/staging/hfi1/Kconfig
+* Unmerged path drivers/staging/hfi1/driver.c
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index 8c6839cc9104..7692117126cb 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -744,6 +744,8 @@ struct hfi1_pportdata {
+ 	/* Error events that will cause a port bounce. */
+ 	u32 port_error_action;
+ 	struct work_struct linkstate_active_work;
++	/* Does this port need to prescan for FECNs */
++	bool cc_prescan;
+ };
+ 
+ typedef int (*rhf_rcv_function_ptr)(struct hfi1_packet *packet);
+diff --git a/drivers/staging/hfi1/sysfs.c b/drivers/staging/hfi1/sysfs.c
+index 1645ca8a2c0f..dd2ce4f0bf85 100644
+--- a/drivers/staging/hfi1/sysfs.c
++++ b/drivers/staging/hfi1/sysfs.c
+@@ -99,10 +99,6 @@ static void port_release(struct kobject *kobj)
+ 	/* nothing to do since memory is freed by hfi1_free_devdata() */
+ }
+ 
+-static struct kobj_type port_cc_ktype = {
+-	.release = port_release,
+-};
+-
+ static struct bin_attribute cc_table_bin_attr = {
+ 	.attr = {.name = "cc_table_bin", .mode = 0444},
+ 	.read = read_cc_table_bin,
+@@ -151,6 +147,68 @@ static struct bin_attribute cc_setting_bin_attr = {
+ 	.size = PAGE_SIZE,
+ };
+ 
++struct hfi1_port_attr {
++	struct attribute attr;
++	ssize_t	(*show)(struct hfi1_pportdata *, char *);
++	ssize_t	(*store)(struct hfi1_pportdata *, const char *, size_t);
++};
++
++static ssize_t cc_prescan_show(struct hfi1_pportdata *ppd, char *buf)
++{
++	return sprintf(buf, "%s\n", ppd->cc_prescan ? "on" : "off");
++}
++
++static ssize_t cc_prescan_store(struct hfi1_pportdata *ppd, const char *buf,
++				size_t count)
++{
++	if (!memcmp(buf, "on", 2))
++		ppd->cc_prescan = true;
++	else if (!memcmp(buf, "off", 3))
++		ppd->cc_prescan = false;
++
++	return count;
++}
++
++static struct hfi1_port_attr cc_prescan_attr =
++		__ATTR(cc_prescan, 0600, cc_prescan_show, cc_prescan_store);
++
++static ssize_t cc_attr_show(struct kobject *kobj, struct attribute *attr,
++			    char *buf)
++{
++	struct hfi1_port_attr *port_attr =
++		container_of(attr, struct hfi1_port_attr, attr);
++	struct hfi1_pportdata *ppd =
++		container_of(kobj, struct hfi1_pportdata, pport_cc_kobj);
++
++	return port_attr->show(ppd, buf);
++}
++
++static ssize_t cc_attr_store(struct kobject *kobj, struct attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct hfi1_port_attr *port_attr =
++		container_of(attr, struct hfi1_port_attr, attr);
++	struct hfi1_pportdata *ppd =
++		container_of(kobj, struct hfi1_pportdata, pport_cc_kobj);
++
++	return port_attr->store(ppd, buf, count);
++}
++
++static const struct sysfs_ops port_cc_sysfs_ops = {
++	.show = cc_attr_show,
++	.store = cc_attr_store
++};
++
++static struct attribute *port_cc_default_attributes[] = {
++	&cc_prescan_attr.attr
++};
++
++static struct kobj_type port_cc_ktype = {
++	.release = port_release,
++	.sysfs_ops = &port_cc_sysfs_ops,
++	.default_attrs = port_cc_default_attributes
++};
++
+ /* Start sc2vl */
+ #define HFI1_SC2VL_ATTR(N)				    \
+ 	static struct hfi1_sc2vl_attr hfi1_sc2vl_attr_##N = { \
