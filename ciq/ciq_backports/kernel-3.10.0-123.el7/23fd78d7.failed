@@ -1,0 +1,295 @@
+KEYS: Fix multiple key add into associative array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 23fd78d76415729b338ff1802a0066b4a62f7fb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/23fd78d7.failed
+
+If sufficient keys (or keyrings) are added into a keyring such that a node in
+the associative array's tree overflows (each node has a capacity N, currently
+16) and such that all N+1 keys have the same index key segment for that level
+of the tree (the level'th nibble of the index key), then assoc_array_insert()
+calls ops->diff_objects() to indicate at which bit position the two index keys
+vary.
+
+However, __key_link_begin() passes a NULL object to assoc_array_insert() with
+the intention of supplying the correct pointer later before we commit the
+change.  This means that keyring_diff_objects() is given a NULL pointer as one
+of its arguments which it does not expect.  This results in an oops like the
+attached.
+
+With the previous patch to fix the keyring hash function, this can be forced
+much more easily by creating a keyring and only adding keyrings to it.  Add any
+other sort of key and a different insertion path is taken - all 16+1 objects
+must want to cluster in the same node slot.
+
+This can be tested by:
+
+	r=`keyctl newring sandbox @s`
+	for ((i=0; i<=16; i++)); do keyctl newring ring$i $r; done
+
+This should work fine, but oopses when the 17th keyring is added.
+
+Since ops->diff_objects() is always called with the first pointer pointing to
+the object to be inserted (ie. the NULL pointer), we can fix the problem by
+changing the to-be-inserted object pointer to point to the index key passed
+into assoc_array_insert() instead.
+
+Whilst we're at it, we also switch the arguments so that they are the same as
+for ->compare_object().
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000088
+IP: [<ffffffff81191ee4>] hash_key_type_and_desc+0x18/0xb0
+...
+RIP: 0010:[<ffffffff81191ee4>] hash_key_type_and_desc+0x18/0xb0
+...
+Call Trace:
+ [<ffffffff81191f9d>] keyring_diff_objects+0x21/0xd2
+ [<ffffffff811f09ef>] assoc_array_insert+0x3b6/0x908
+ [<ffffffff811929a7>] __key_link_begin+0x78/0xe5
+ [<ffffffff81191a2e>] key_create_or_update+0x17d/0x36a
+ [<ffffffff81192e0a>] SyS_add_key+0x123/0x183
+ [<ffffffff81400ddb>] tracesys+0xdd/0xe2
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Tested-by: Stephen Gallagher <sgallagh@redhat.com>
+(cherry picked from commit 23fd78d76415729b338ff1802a0066b4a62f7fb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/assoc_array.txt
+#	include/linux/assoc_array.h
+#	lib/assoc_array.c
+#	security/keys/keyring.c
+diff --cc security/keys/keyring.c
+index eeef1a073db4,3dd8445cd489..000000000000
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@@ -145,6 -155,214 +145,217 @@@ static int keyring_match(const struct k
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Hash a key type and description.
++  */
++ static unsigned long hash_key_type_and_desc(const struct keyring_index_key *index_key)
++ {
++ 	const unsigned level_shift = ASSOC_ARRAY_LEVEL_STEP;
++ 	const unsigned long fan_mask = ASSOC_ARRAY_FAN_MASK;
++ 	const char *description = index_key->description;
++ 	unsigned long hash, type;
++ 	u32 piece;
++ 	u64 acc;
++ 	int n, desc_len = index_key->desc_len;
++ 
++ 	type = (unsigned long)index_key->type;
++ 
++ 	acc = mult_64x32_and_fold(type, desc_len + 13);
++ 	acc = mult_64x32_and_fold(acc, 9207);
++ 	for (;;) {
++ 		n = desc_len;
++ 		if (n <= 0)
++ 			break;
++ 		if (n > 4)
++ 			n = 4;
++ 		piece = 0;
++ 		memcpy(&piece, description, n);
++ 		description += n;
++ 		desc_len -= n;
++ 		acc = mult_64x32_and_fold(acc, piece);
++ 		acc = mult_64x32_and_fold(acc, 9207);
++ 	}
++ 
++ 	/* Fold the hash down to 32 bits if need be. */
++ 	hash = acc;
++ 	if (ASSOC_ARRAY_KEY_CHUNK_SIZE == 32)
++ 		hash ^= acc >> 32;
++ 
++ 	/* Squidge all the keyrings into a separate part of the tree to
++ 	 * ordinary keys by making sure the lowest level segment in the hash is
++ 	 * zero for keyrings and non-zero otherwise.
++ 	 */
++ 	if (index_key->type != &key_type_keyring && (hash & fan_mask) == 0)
++ 		return hash | (hash >> (ASSOC_ARRAY_KEY_CHUNK_SIZE - level_shift)) | 1;
++ 	if (index_key->type == &key_type_keyring && (hash & fan_mask) != 0)
++ 		return (hash + (hash << level_shift)) & ~fan_mask;
++ 	return hash;
++ }
++ 
++ /*
++  * Build the next index key chunk.
++  *
++  * On 32-bit systems the index key is laid out as:
++  *
++  *	0	4	5	9...
++  *	hash	desclen	typeptr	desc[]
++  *
++  * On 64-bit systems:
++  *
++  *	0	8	9	17...
++  *	hash	desclen	typeptr	desc[]
++  *
++  * We return it one word-sized chunk at a time.
++  */
++ static unsigned long keyring_get_key_chunk(const void *data, int level)
++ {
++ 	const struct keyring_index_key *index_key = data;
++ 	unsigned long chunk = 0;
++ 	long offset = 0;
++ 	int desc_len = index_key->desc_len, n = sizeof(chunk);
++ 
++ 	level /= ASSOC_ARRAY_KEY_CHUNK_SIZE;
++ 	switch (level) {
++ 	case 0:
++ 		return hash_key_type_and_desc(index_key);
++ 	case 1:
++ 		return ((unsigned long)index_key->type << 8) | desc_len;
++ 	case 2:
++ 		if (desc_len == 0)
++ 			return (u8)((unsigned long)index_key->type >>
++ 				    (ASSOC_ARRAY_KEY_CHUNK_SIZE - 8));
++ 		n--;
++ 		offset = 1;
++ 	default:
++ 		offset += sizeof(chunk) - 1;
++ 		offset += (level - 3) * sizeof(chunk);
++ 		if (offset >= desc_len)
++ 			return 0;
++ 		desc_len -= offset;
++ 		if (desc_len > n)
++ 			desc_len = n;
++ 		offset += desc_len;
++ 		do {
++ 			chunk <<= 8;
++ 			chunk |= ((u8*)index_key->description)[--offset];
++ 		} while (--desc_len > 0);
++ 
++ 		if (level == 2) {
++ 			chunk <<= 8;
++ 			chunk |= (u8)((unsigned long)index_key->type >>
++ 				      (ASSOC_ARRAY_KEY_CHUNK_SIZE - 8));
++ 		}
++ 		return chunk;
++ 	}
++ }
++ 
++ static unsigned long keyring_get_object_key_chunk(const void *object, int level)
++ {
++ 	const struct key *key = keyring_ptr_to_key(object);
++ 	return keyring_get_key_chunk(&key->index_key, level);
++ }
++ 
++ static bool keyring_compare_object(const void *object, const void *data)
++ {
++ 	const struct keyring_index_key *index_key = data;
++ 	const struct key *key = keyring_ptr_to_key(object);
++ 
++ 	return key->index_key.type == index_key->type &&
++ 		key->index_key.desc_len == index_key->desc_len &&
++ 		memcmp(key->index_key.description, index_key->description,
++ 		       index_key->desc_len) == 0;
++ }
++ 
++ /*
++  * Compare the index keys of a pair of objects and determine the bit position
++  * at which they differ - if they differ.
++  */
++ static int keyring_diff_objects(const void *object, const void *data)
++ {
++ 	const struct key *key_a = keyring_ptr_to_key(object);
++ 	const struct keyring_index_key *a = &key_a->index_key;
++ 	const struct keyring_index_key *b = data;
++ 	unsigned long seg_a, seg_b;
++ 	int level, i;
++ 
++ 	level = 0;
++ 	seg_a = hash_key_type_and_desc(a);
++ 	seg_b = hash_key_type_and_desc(b);
++ 	if ((seg_a ^ seg_b) != 0)
++ 		goto differ;
++ 
++ 	/* The number of bits contributed by the hash is controlled by a
++ 	 * constant in the assoc_array headers.  Everything else thereafter we
++ 	 * can deal with as being machine word-size dependent.
++ 	 */
++ 	level += ASSOC_ARRAY_KEY_CHUNK_SIZE / 8;
++ 	seg_a = a->desc_len;
++ 	seg_b = b->desc_len;
++ 	if ((seg_a ^ seg_b) != 0)
++ 		goto differ;
++ 
++ 	/* The next bit may not work on big endian */
++ 	level++;
++ 	seg_a = (unsigned long)a->type;
++ 	seg_b = (unsigned long)b->type;
++ 	if ((seg_a ^ seg_b) != 0)
++ 		goto differ;
++ 
++ 	level += sizeof(unsigned long);
++ 	if (a->desc_len == 0)
++ 		goto same;
++ 
++ 	i = 0;
++ 	if (((unsigned long)a->description | (unsigned long)b->description) &
++ 	    (sizeof(unsigned long) - 1)) {
++ 		do {
++ 			seg_a = *(unsigned long *)(a->description + i);
++ 			seg_b = *(unsigned long *)(b->description + i);
++ 			if ((seg_a ^ seg_b) != 0)
++ 				goto differ_plus_i;
++ 			i += sizeof(unsigned long);
++ 		} while (i < (a->desc_len & (sizeof(unsigned long) - 1)));
++ 	}
++ 
++ 	for (; i < a->desc_len; i++) {
++ 		seg_a = *(unsigned char *)(a->description + i);
++ 		seg_b = *(unsigned char *)(b->description + i);
++ 		if ((seg_a ^ seg_b) != 0)
++ 			goto differ_plus_i;
++ 	}
++ 
++ same:
++ 	return -1;
++ 
++ differ_plus_i:
++ 	level += i;
++ differ:
++ 	i = level * 8 + __ffs(seg_a ^ seg_b);
++ 	return i;
++ }
++ 
++ /*
++  * Free an object after stripping the keyring flag off of the pointer.
++  */
++ static void keyring_free_object(void *object)
++ {
++ 	key_put(keyring_ptr_to_key(object));
++ }
++ 
++ /*
++  * Operations for keyring management by the index-tree routines.
++  */
++ static const struct assoc_array_ops keyring_assoc_array_ops = {
++ 	.get_key_chunk		= keyring_get_key_chunk,
++ 	.get_object_key_chunk	= keyring_get_object_key_chunk,
++ 	.compare_object		= keyring_compare_object,
++ 	.diff_objects		= keyring_diff_objects,
++ 	.free_object		= keyring_free_object,
++ };
++ 
++ /*
+++>>>>>>> 23fd78d76415 (KEYS: Fix multiple key add into associative array)
+   * Clean up a keyring when it is destroyed.  Unpublish its name if it had one
+   * and dispose of its data.
+   *
+* Unmerged path Documentation/assoc_array.txt
+* Unmerged path include/linux/assoc_array.h
+* Unmerged path lib/assoc_array.c
+* Unmerged path Documentation/assoc_array.txt
+* Unmerged path include/linux/assoc_array.h
+* Unmerged path lib/assoc_array.c
+* Unmerged path security/keys/keyring.c
