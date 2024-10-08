@@ -1,0 +1,147 @@
+vfs: use lockred "dead" flag to mark unrecoverably dead dentries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 0d98439ea3c6ffb2af931f6de4480e744634e2c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/0d98439e.failed
+
+This simplifies the RCU to refcounting code in particular.
+
+I was originally intending to leave this for later, but walking through
+all the dput() logic (see previous commit), I realized that the dput()
+"might_sleep()" check was misleadingly weak.  And I removed it as
+misleading, both for performance profiling and for debugging.
+
+However, the might_sleep() debugging case is actually true: the final
+dput() can indeed sleep, if the inode of the dentry that you are
+releasing ends up sleeping at iput time (see dentry_iput()).  So the
+problem with the might_sleep() in dput() wasn't that it wasn't true, it
+was that it wasn't actually testing and triggering on the interesting
+case.
+
+In particular, just about *any* dput() can indeed sleep, if you happen
+to race with another thread deleting the file in question, and you then
+lose the race to the be the last dput() for that file.  But because it's
+a very rare race, the debugging code would never trigger it in practice.
+
+Why is this problematic? The new d_rcu_to_refcount() (see commit
+15570086b590: "vfs: reimplement d_rcu_to_refcount() using
+lockref_get_or_lock()") does a dput() for the failure case, and it does
+it under the RCU lock.  So potentially sleeping really is a bug.
+
+But there's no way I'm going to fix this with the previous complicated
+"lockref_get_or_lock()" interface.  And rather than revert to the old
+and crufty nested dentry locking code (which did get this right by
+delaying the reference count updates until they were verified to be
+safe), let's make forward progress.
+
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0d98439ea3c6ffb2af931f6de4480e744634e2c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	fs/namei.c
+diff --cc fs/dcache.c
+index c1d239fbff60,ca8e9cd60f87..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -229,7 -229,7 +229,11 @@@ static void __d_free(struct rcu_head *h
+   */
+  static void d_free(struct dentry *dentry)
+  {
+++<<<<<<< HEAD
+ +	BUG_ON(dentry->d_count);
+++=======
++ 	BUG_ON((int)dentry->d_lockref.count > 0);
+++>>>>>>> 0d98439ea3c6 (vfs: use lockred "dead" flag to mark unrecoverably dead dentries)
+  	this_cpu_dec(nr_dentry);
+  	if (dentry->d_op && dentry->d_op->d_release)
+  		dentry->d_op->d_release(dentry);
+@@@ -466,8 -468,11 +470,16 @@@ relock
+  		goto relock;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ref)
+ +		dentry->d_count--;
+++=======
++ 	/*
++ 	 * The dentry is now unrecoverably dead to the world.
++ 	 */
++ 	lockref_mark_dead(&dentry->d_lockref);
++ 
+++>>>>>>> 0d98439ea3c6 (vfs: use lockred "dead" flag to mark unrecoverably dead dentries)
+  	/*
+  	 * inform the fs via d_prune that this dentry is about to be
+  	 * unhashed and destroyed.
+@@@ -778,13 -782,9 +790,17 @@@ static void try_prune_one_dentry(struc
+  	/* Prune ancestors. */
+  	dentry = parent;
+  	while (dentry) {
+ -		if (lockref_put_or_lock(&dentry->d_lockref))
+ +		spin_lock(&dentry->d_lock);
+ +		if (dentry->d_count > 1) {
+ +			dentry->d_count--;
+ +			spin_unlock(&dentry->d_lock);
+  			return;
+++<<<<<<< HEAD
+ +		}
+ +		dentry = dentry_kill(dentry, 1);
+++=======
++ 		dentry = dentry_kill(dentry);
+++>>>>>>> 0d98439ea3c6 (vfs: use lockred "dead" flag to mark unrecoverably dead dentries)
+  	}
+  }
+  
+diff --cc fs/namei.c
+index b8c893be1266,cc4bcfaa8624..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -494,6 -494,37 +494,40 @@@ static inline void unlock_rcu_walk(void
+  	br_read_unlock(&vfsmount_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * When we move over from the RCU domain to properly refcounted
++  * long-lived dentries, we need to check the sequence numbers
++  * we got before lookup very carefully.
++  *
++  * We cannot blindly increment a dentry refcount - even if it
++  * is not locked - if it is zero, because it may have gone
++  * through the final d_kill() logic already.
++  *
++  * So for a zero refcount, we need to get the spinlock (which is
++  * safe even for a dead dentry because the de-allocation is
++  * RCU-delayed), and check the sequence count under the lock.
++  *
++  * Once we have checked the sequence count, we know it is live,
++  * and since we hold the spinlock it cannot die from under us.
++  *
++  * In contrast, if the reference count wasn't zero, we can just
++  * increment the lockref without having to take the spinlock.
++  * Even if the sequence number ends up being stale, we haven't
++  * gone through the final dput() and killed the dentry yet.
++  */
++ static inline int d_rcu_to_refcount(struct dentry *dentry, seqcount_t *validate, unsigned seq)
++ {
++ 	if (likely(lockref_get_not_dead(&dentry->d_lockref))) {
++ 		if (!read_seqcount_retry(validate, seq))
++ 				return 0;
++ 		dput(dentry);
++ 	}
++ 	return -ECHILD;
++ }
++ 
+++>>>>>>> 0d98439ea3c6 (vfs: use lockred "dead" flag to mark unrecoverably dead dentries)
+  /**
+   * unlazy_walk - try to switch to ref-walk mode.
+   * @nd: nameidata pathwalk data
+* Unmerged path fs/dcache.c
+* Unmerged path fs/namei.c
