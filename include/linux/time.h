@@ -75,13 +75,6 @@ static inline struct timespec timespec_sub(struct timespec lhs,
 	return ts_delta;
 }
 
-#define KTIME_MAX			((s64)~((u64)1 << 63))
-#if (BITS_PER_LONG == 64)
-# define KTIME_SEC_MAX			(KTIME_MAX / NSEC_PER_SEC)
-#else
-# define KTIME_SEC_MAX			LONG_MAX
-#endif
-
 /*
  * Returns true if the timespec is norm, false if denorm:
  */
@@ -153,8 +146,40 @@ extern int do_setitimer(int which, struct itimerval *value,
 			struct itimerval *ovalue);
 extern unsigned int alarm_setitimer(unsigned int seconds);
 extern int do_getitimer(int which, struct itimerval *value);
-extern int __getnstimeofday(struct timespec *tv);
-extern void getnstimeofday(struct timespec *tv);
+
+extern int __getnstimeofday64(struct timespec64 *tv);
+extern void getnstimeofday64(struct timespec64 *tv);
+
+#if BITS_PER_LONG == 64
+static inline int __getnstimeofday(struct timespec *ts)
+{
+	return __getnstimeofday64(ts);
+}
+
+static inline void getnstimeofday(struct timespec *ts)
+{
+	getnstimeofday64(ts);
+}
+
+#else
+static inline int __getnstimeofday(struct timespec *ts)
+{
+	struct timespec64 ts64;
+	int ret = __getnstimeofday64(&ts64);
+
+	*ts = timespec64_to_timespec(ts64);
+	return ret;
+}
+
+static inline void getnstimeofday(struct timespec *ts)
+{
+	struct timespec64 ts64;
+
+	getnstimeofday64(&ts64);
+	*ts = timespec64_to_timespec(ts64);
+}
+#endif
+
 extern void getrawmonotonic(struct timespec *ts);
 extern void getnstime_raw_and_real(struct timespec *ts_raw,
 		struct timespec *ts_real);

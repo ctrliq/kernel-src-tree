@@ -157,7 +157,7 @@ struct vport *ovs_vport_alloc(int priv_size, const struct vport_ops *ops,
 		return ERR_PTR(-EINVAL);
 	}
 
-	vport->percpu_stats = alloc_percpu(struct pcpu_tstats);
+	vport->percpu_stats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
 	if (!vport->percpu_stats) {
 		kfree(vport);
 		return ERR_PTR(-ENOMEM);
@@ -309,16 +309,16 @@ void ovs_vport_get_stats(struct vport *vport, struct ovs_vport_stats *stats)
 	stats->rx_dropped = atomic_long_read(&vport->err_stats.rx_dropped);
 
 	for_each_possible_cpu(i) {
-		const struct pcpu_tstats *percpu_stats;
-		struct pcpu_tstats local_stats;
+		const struct pcpu_sw_netstats *percpu_stats;
+		struct pcpu_sw_netstats local_stats;
 		unsigned int start;
 
 		percpu_stats = per_cpu_ptr(vport->percpu_stats, i);
 
 		do {
-			start = u64_stats_fetch_begin_bh(&percpu_stats->syncp);
+			start = u64_stats_fetch_begin_irq(&percpu_stats->syncp);
 			local_stats = *percpu_stats;
-		} while (u64_stats_fetch_retry_bh(&percpu_stats->syncp, start));
+		} while (u64_stats_fetch_retry_irq(&percpu_stats->syncp, start));
 
 		stats->rx_bytes		+= local_stats.rx_bytes;
 		stats->rx_packets	+= local_stats.rx_packets;
@@ -471,14 +471,15 @@ u32 ovs_vport_find_upcall_portid(const struct vport *vport, struct sk_buff *skb)
 void ovs_vport_receive(struct vport *vport, struct sk_buff *skb,
 		       const struct ovs_tunnel_info *tun_info)
 {
-	struct pcpu_tstats *stats;
+	struct pcpu_sw_netstats *stats;
 	struct sw_flow_key key;
 	int error;
 
 	stats = this_cpu_ptr(vport->percpu_stats);
 	u64_stats_update_begin(&stats->syncp);
 	stats->rx_packets++;
-	stats->rx_bytes += skb->len + (vlan_tx_tag_present(skb) ? VLAN_HLEN : 0);
+	stats->rx_bytes += skb->len +
+			   (skb_vlan_tag_present(skb) ? VLAN_HLEN : 0);
 	u64_stats_update_end(&stats->syncp);
 
 	OVS_CB(skb)->input_vport = vport;
@@ -507,7 +508,7 @@ int ovs_vport_send(struct vport *vport, struct sk_buff *skb)
 	int sent = vport->ops->send(vport, skb);
 
 	if (likely(sent > 0)) {
-		struct pcpu_tstats *stats;
+		struct pcpu_sw_netstats *stats;
 
 		stats = this_cpu_ptr(vport->percpu_stats);
 

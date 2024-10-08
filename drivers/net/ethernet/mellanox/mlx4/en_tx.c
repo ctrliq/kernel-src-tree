@@ -67,6 +67,7 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
 	ring->size_mask = size - 1;
 	ring->stride = stride;
 	ring->inline_thold = priv->prof->inline_thold;
+	ring->full_size = ring->size - HEADROOM - MAX_DESC_TXBBS;
 
 	tmp = size * sizeof(struct mlx4_en_tx_info);
 	ring->tx_info = kmalloc_node(tmp, GFP_KERNEL | __GFP_NOWARN, node);
@@ -92,10 +93,10 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
 	ring->buf_size = ALIGN(size * ring->stride, MLX4_EN_PAGE_SIZE);
 
 	/* Allocate HW buffers on provided NUMA node */
-	set_dev_node(&mdev->dev->pdev->dev, node);
+	set_dev_node(&mdev->dev->persist->pdev->dev, node);
 	err = mlx4_alloc_hwq_res(mdev->dev, &ring->wqres, ring->buf_size,
 				 2 * PAGE_SIZE);
-	set_dev_node(&mdev->dev->pdev->dev, mdev->dev->numa_node);
+	set_dev_node(&mdev->dev->persist->pdev->dev, mdev->dev->numa_node);
 	if (err) {
 		en_err(priv, "Failed allocating hwq resources\n");
 		goto err_bounce;
@@ -231,6 +232,11 @@ void mlx4_en_deactivate_tx_ring(struct mlx4_en_priv *priv,
 
 	mlx4_qp_modify(mdev->dev, NULL, ring->qp_state,
 		       MLX4_QP_STATE_RST, NULL, 0, 0, &ring->qp);
+}
+
+static inline bool mlx4_en_is_tx_ring_full(struct mlx4_en_tx_ring *ring)
+{
+	return ring->prod - ring->cons > ring->full_size;
 }
 
 static void mlx4_en_stamp_wqe(struct mlx4_en_priv *priv,
@@ -474,11 +480,10 @@ static bool mlx4_en_process_tx_cq(struct net_device *dev,
 
 	netdev_tx_completed_queue(ring->tx_queue, packets, bytes);
 
-	/*
-	 * Wakeup Tx queue if this stopped, and at least 1 packet
-	 * was completed
+	/* Wakeup Tx queue if this stopped, and ring is not full.
 	 */
-	if (netif_tx_queue_stopped(ring->tx_queue) && txbbs_skipped > 0) {
+	if (netif_tx_queue_stopped(ring->tx_queue) &&
+	    !mlx4_en_is_tx_ring_full(ring)) {
 		netif_tx_wake_queue(ring->tx_queue);
 		ring->wake_queue++;
 	}
@@ -684,8 +689,8 @@ u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb)
 	if (dev->num_tc)
 		return skb_tx_hash(dev, skb);
 
-	if (vlan_tx_tag_present(skb))
-		up = vlan_tx_tag_get(skb) >> VLAN_PRIO_SHIFT;
+	if (skb_vlan_tag_present(skb))
+		up = skb_vlan_tag_get(skb) >> VLAN_PRIO_SHIFT;
 
 	return __netdev_pick_tx(dev, skb) % rings_p_up + up * rings_p_up;
 }
@@ -744,8 +749,8 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto tx_drop;
 	}
 
-	if (vlan_tx_tag_present(skb))
-		vlan_tag = vlan_tx_tag_get(skb);
+	if (skb_vlan_tag_present(skb))
+		vlan_tag = skb_vlan_tag_get(skb);
 
 
 	prefetchw(&ring->tx_queue->dql);
@@ -835,8 +840,9 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
 	 * For timestamping add flag to skb_shinfo and
 	 * set flag for further reference
 	 */
+	tx_info->ts_requested = 0;
 	if (unlikely(ring->hwtstamp_tx_type == HWTSTAMP_TX_ON &&
-		     shinfo->tx_flags & SKBTX_HW_TSTAMP)) {
+	    shinfo->tx_flags & SKBTX_HW_TSTAMP)) {
 		shinfo->tx_flags |= SKBTX_IN_PROGRESS;
 		tx_info->ts_requested = 1;
 	}
@@ -920,8 +926,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
 	skb_tx_timestamp(skb);
 
 	/* Check available TXBBs And 2K spare for prefetch */
-	stop_queue = (int)(ring->prod - ring_cons) >
-		      ring->size - HEADROOM - MAX_DESC_TXBBS;
+	stop_queue = mlx4_en_is_tx_ring_full(ring);
 	if (unlikely(stop_queue)) {
 		netif_tx_stop_queue(ring->tx_queue);
 		ring->queue_stopped++;
@@ -931,7 +936,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
 	real_size = (real_size / 16) & 0x3f;
 
 	if (ring->bf_enabled && desc_size <= MAX_BF && !bounce &&
-	    !vlan_tx_tag_present(skb) && send_doorbell) {
+	    !skb_vlan_tag_present(skb) && send_doorbell) {
 		tx_desc->ctrl.bf_qpn = ring->doorbell_qpn |
 				       cpu_to_be32(real_size);
 
@@ -953,7 +958,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
 	} else {
 		tx_desc->ctrl.vlan_tag = cpu_to_be16(vlan_tag);
 		tx_desc->ctrl.ins_vlan = MLX4_WQE_CTRL_INS_VLAN *
-			!!vlan_tx_tag_present(skb);
+			!!skb_vlan_tag_present(skb);
 		tx_desc->ctrl.fence_size = real_size;
 
 		/* Ensure new descriptor hits memory
@@ -990,8 +995,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
 		smp_rmb();
 
 		ring_cons = ACCESS_ONCE(ring->cons);
-		if (unlikely(((int)(ring->prod - ring_cons)) <=
-			     ring->size - HEADROOM - MAX_DESC_TXBBS)) {
+		if (unlikely(!mlx4_en_is_tx_ring_full(ring))) {
 			netif_tx_wake_queue(ring->tx_queue);
 			ring->wake_queue++;
 		}

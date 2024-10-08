@@ -26,7 +26,6 @@
 #include "xfs_trans_resv.h"
 #include "xfs_bit.h"
 #include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_inode.h"
 #include "xfs_trans.h"
@@ -64,10 +63,10 @@ xfs_qm_scall_quotaoff(
 	/*
 	 * No file system can have quotas enabled on disk but not in core.
 	 * Note that quota utilities (like quotaoff) _expect_
-	 * errno == EEXIST here.
+	 * errno == -EEXIST here.
 	 */
 	if ((mp->m_qflags & flags) == 0)
-		return XFS_ERROR(EEXIST);
+		return -EEXIST;
 	error = 0;
 
 	flags &= (XFS_ALL_QUOTA_ACCT | XFS_ALL_QUOTA_ENFD);
@@ -93,8 +92,7 @@ xfs_qm_scall_quotaoff(
 		mutex_unlock(&q->qi_quotaofflock);
 
 		/* XXX what to do if error ? Revert back to old vals incore ? */
-		error = xfs_qm_write_sb_changes(mp, XFS_SB_QFLAGS);
-		return error;
+		return xfs_sync_sb(mp, false);
 	}
 
 	dqtype = 0;
@@ -278,13 +276,13 @@ xfs_qm_scall_trunc_qfiles(
 	xfs_mount_t	*mp,
 	uint		flags)
 {
-	int		error = EINVAL;
+	int		error = -EINVAL;
 
 	if (!xfs_sb_version_hasquota(&mp->m_sb) || flags == 0 ||
 	    (flags & ~XFS_DQ_ALLTYPES)) {
 		xfs_debug(mp, "%s: flags=%x m_qflags=%x",
 			__func__, flags, mp->m_qflags);
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	}
 
 	if (flags & XFS_DQ_USER) {
@@ -315,7 +313,6 @@ xfs_qm_scall_quotaon(
 {
 	int		error;
 	uint		qf;
-	__int64_t	sbflags;
 
 	flags &= (XFS_ALL_QUOTA_ACCT | XFS_ALL_QUOTA_ENFD);
 	/*
@@ -323,12 +320,10 @@ xfs_qm_scall_quotaon(
 	 */
 	flags &= ~(XFS_ALL_QUOTA_ACCT);
 
-	sbflags = 0;
-
 	if (flags == 0) {
 		xfs_debug(mp, "%s: zero flags, m_qflags=%x",
 			__func__, mp->m_qflags);
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	}
 
 	/*
@@ -345,13 +340,13 @@ xfs_qm_scall_quotaon(
 		xfs_debug(mp,
 			"%s: Can't enforce without acct, flags=%x sbflags=%x",
 			__func__, flags, mp->m_sb.sb_qflags);
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	}
 	/*
 	 * If everything's up to-date incore, then don't waste time.
 	 */
 	if ((mp->m_qflags & flags) == flags)
-		return XFS_ERROR(EEXIST);
+		return -EEXIST;
 
 	/*
 	 * Change sb_qflags on disk but not incore mp->qflags
@@ -365,11 +360,11 @@ xfs_qm_scall_quotaon(
 	/*
 	 * There's nothing to change if it's the same.
 	 */
-	if ((qf & flags) == flags && sbflags == 0)
-		return XFS_ERROR(EEXIST);
-	sbflags |= XFS_SB_QFLAGS;
+	if ((qf & flags) == flags)
+		return -EEXIST;
 
-	if ((error = xfs_qm_write_sb_changes(mp, sbflags)))
+	error = xfs_sync_sb(mp, false);
+	if (error)
 		return error;
 	/*
 	 * If we aren't trying to switch on quota enforcement, we are done.
@@ -383,7 +378,7 @@ xfs_qm_scall_quotaon(
 		return 0;
 
 	if (! XFS_IS_QUOTA_RUNNING(mp))
-		return XFS_ERROR(ESRCH);
+		return -ESRCH;
 
 	/*
 	 * Switch on quota enforcement in core.
@@ -569,7 +564,7 @@ xfs_qm_scall_setqlim(
 	xfs_qcnt_t		hard, soft;
 
 	if (newlim->d_fieldmask & ~XFS_DQ_MASK)
-		return EINVAL;
+		return -EINVAL;
 	if ((newlim->d_fieldmask & XFS_DQ_MASK) == 0)
 		return 0;
 
@@ -589,7 +584,7 @@ xfs_qm_scall_setqlim(
 	 */
 	error = xfs_qm_dqget(mp, NULL, id, type, XFS_QMOPT_DQALLOC, &dqp);
 	if (error) {
-		ASSERT(error != ENOENT);
+		ASSERT(error != -ENOENT);
 		goto out_unlock;
 	}
 	xfs_dqunlock(dqp);
@@ -776,7 +771,7 @@ xfs_qm_log_quotaoff(
 	mp->m_sb.sb_qflags = (mp->m_qflags & ~(flags)) & XFS_MOUNT_QUOTA_ALL;
 	spin_unlock(&mp->m_sb_lock);
 
-	xfs_mod_sb(tp, XFS_SB_QFLAGS);
+	xfs_log_sb(tp);
 
 	/*
 	 * We have to make sure that the transaction is secure on disk before we
@@ -818,7 +813,7 @@ xfs_qm_scall_getquota(
 	 * our utility programs are concerned.
 	 */
 	if (XFS_IS_DQUOT_UNINITIALIZED(dqp)) {
-		error = XFS_ERROR(ENOENT);
+		error = -ENOENT;
 		goto out_put;
 	}
 

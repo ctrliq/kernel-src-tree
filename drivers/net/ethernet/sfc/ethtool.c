@@ -734,7 +734,7 @@ static int efx_ethtool_set_pauseparam(struct net_device *net_dev,
 	/* Reconfigure the MAC. The PHY *may* generate a link state change event
 	 * if the user just changed the advertised capabilities, but there's no
 	 * harm doing this twice */
-	efx->type->reconfigure_mac(efx);
+	efx_mac_reconfigure(efx);
 
 out:
 	mutex_unlock(&efx->mac_lock);
@@ -1086,22 +1086,31 @@ static u32 efx_ethtool_get_rxfh_indir_size(struct net_device *net_dev)
 		0 : ARRAY_SIZE(efx->rx_indir_table));
 }
 
-static int efx_ethtool_get_rxfh_indir(struct net_device *net_dev, u32 *indir)
+static int efx_ethtool_get_rxfh(struct net_device *net_dev, u32 *indir, u8 *key,
+				u8 *hfunc)
 {
 	struct efx_nic *efx = netdev_priv(net_dev);
 
-	memcpy(indir, efx->rx_indir_table, sizeof(efx->rx_indir_table));
+	if (hfunc)
+		*hfunc = ETH_RSS_HASH_TOP;
+	if (indir)
+		memcpy(indir, efx->rx_indir_table, sizeof(efx->rx_indir_table));
 	return 0;
 }
 
-static int efx_ethtool_set_rxfh_indir(struct net_device *net_dev,
-				      const u32 *indir)
+static int efx_ethtool_set_rxfh(struct net_device *net_dev, const u32 *indir,
+				const u8 *key, const u8 hfunc)
 {
 	struct efx_nic *efx = netdev_priv(net_dev);
 
-	memcpy(efx->rx_indir_table, indir, sizeof(efx->rx_indir_table));
-	efx->type->rx_push_rss_config(efx);
-	return 0;
+	/* We do not allow change in unsupported parameters */
+	if (key ||
+	    (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP))
+		return -EOPNOTSUPP;
+	if (!indir)
+		return 0;
+
+	return efx->type->rx_push_rss_config(efx, true, indir);
 }
 
 static int efx_ethtool_get_ts_info(struct net_device *net_dev,
@@ -1178,8 +1187,8 @@ const struct ethtool_ops efx_ethtool_ops = {
 	.get_rxnfc		= efx_ethtool_get_rxnfc,
 	.set_rxnfc		= efx_ethtool_set_rxnfc,
 	.get_rxfh_indir_size	= efx_ethtool_get_rxfh_indir_size,
-	.get_rxfh_indir		= efx_ethtool_get_rxfh_indir,
-	.set_rxfh_indir		= efx_ethtool_set_rxfh_indir,
+	.get_rxfh		= efx_ethtool_get_rxfh,
+	.set_rxfh		= efx_ethtool_set_rxfh,
 	.get_ts_info		= efx_ethtool_get_ts_info,
 	.get_module_info	= efx_ethtool_get_module_info,
 	.get_module_eeprom	= efx_ethtool_get_module_eeprom,

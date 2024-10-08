@@ -136,10 +136,9 @@ int line6_pcm_acquire(struct snd_line6_pcm *line6pcm, int channels)
 		   a bug, we therefore report an error if capturing is restarted
 		   too soon.
 		 */
-		if (line6pcm->active_urb_in || line6pcm->unlink_urb_in) {
+		if (line6pcm->active_urb_in | line6pcm->unlink_urb_in) {
 			dev_err(line6pcm->line6->ifcdev, "Device not yet ready\n");
-			err = -EBUSY;
-			goto pcm_acquire_error;
+			return -EBUSY;
 		}
 
 		line6pcm->count_in = 0;
@@ -171,7 +170,7 @@ int line6_pcm_acquire(struct snd_line6_pcm *line6pcm, int channels)
 		/*
 		  See comment above regarding PCM restart.
 		*/
-		if (line6pcm->active_urb_out || line6pcm->unlink_urb_out) {
+		if (line6pcm->active_urb_out | line6pcm->unlink_urb_out) {
 			dev_err(line6pcm->line6->ifcdev, "Device not yet ready\n");
 			return -EBUSY;
 		}
@@ -227,19 +226,19 @@ int snd_line6_trigger(struct snd_pcm_substream *substream, int cmd)
 	struct snd_line6_pcm *line6pcm = snd_pcm_substream_chip(substream);
 	struct snd_pcm_substream *s;
 	int err;
+	unsigned long flags;
 
-	spin_lock(&line6pcm->lock_trigger);
+	spin_lock_irqsave(&line6pcm->lock_trigger, flags);
 	clear_bit(LINE6_INDEX_PREPARED, &line6pcm->flags);
 
 	snd_pcm_group_for_each_entry(s, substream) {
-		if (s->pcm->card != substream->pcm->card)
-			continue;
 		switch (s->stream) {
 		case SNDRV_PCM_STREAM_PLAYBACK:
 			err = snd_line6_playback_trigger(line6pcm, cmd);
 
 			if (err < 0) {
-				spin_unlock(&line6pcm->lock_trigger);
+				spin_unlock_irqrestore(&line6pcm->lock_trigger,
+						       flags);
 				return err;
 			}
 
@@ -249,7 +248,8 @@ int snd_line6_trigger(struct snd_pcm_substream *substream, int cmd)
 			err = snd_line6_capture_trigger(line6pcm, cmd);
 
 			if (err < 0) {
-				spin_unlock(&line6pcm->lock_trigger);
+				spin_unlock_irqrestore(&line6pcm->lock_trigger,
+						       flags);
 				return err;
 			}
 
@@ -261,7 +261,7 @@ int snd_line6_trigger(struct snd_pcm_substream *substream, int cmd)
 		}
 	}
 
-	spin_unlock(&line6pcm->lock_trigger);
+	spin_unlock_irqrestore(&line6pcm->lock_trigger, flags);
 	return 0;
 }
 
@@ -554,6 +554,9 @@ int snd_line6_prepare(struct snd_pcm_substream *substream)
 			line6_unlink_wait_clear_audio_in_urbs(line6pcm);
 
 		break;
+
+	default:
+		MISSING_CASE;
 	}
 
 	if (!test_and_set_bit(LINE6_INDEX_PREPARED, &line6pcm->flags)) {

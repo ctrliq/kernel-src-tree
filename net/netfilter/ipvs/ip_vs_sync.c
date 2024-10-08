@@ -836,7 +836,7 @@ static void ip_vs_proc_conn(struct net *net, struct ip_vs_conn_param *param,
 	if (!(flags & IP_VS_CONN_F_TEMPLATE)) {
 		cp = ip_vs_conn_in_get(param);
 		if (cp && ((cp->dport != dport) ||
-			   !ip_vs_addr_equal(cp->daf, &cp->daddr, daddr))) {
+			   !ip_vs_addr_equal(cp->af, &cp->daddr, daddr))) {
 			if (!(flags & IP_VS_CONN_F_INACTIVE)) {
 				ip_vs_conn_expire_now(cp);
 				__ip_vs_conn_put(cp);
@@ -1384,9 +1384,11 @@ join_mcast_group(struct sock *sk, struct in_addr *addr, char *ifname)
 
 	mreq.imr_ifindex = dev->ifindex;
 
+	rtnl_lock();
 	lock_sock(sk);
 	ret = ip_mc_join_group(sk, &mreq);
 	release_sock(sk);
+	rtnl_unlock();
 
 	return ret;
 }

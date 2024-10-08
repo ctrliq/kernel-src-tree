@@ -207,8 +207,9 @@ static const struct tnt tnts[] = {
 	{ TAINT_CRAP,			'C', ' ' },
 	{ TAINT_FIRMWARE_WORKAROUND,	'I', ' ' },
 	{ TAINT_OOT_MODULE,		'O', ' ' },
-	{ TAINT_14,			'?', '-' },
-	{ TAINT_15,			'?', '-' },
+	{ TAINT_UNSIGNED_MODULE,	'E', ' ' },
+	{ TAINT_SOFTLOCKUP,		'L', ' ' },
+	{ TAINT_LIVEPATCH,		'K', ' ' },
 	{ TAINT_16,			'?', '-' },
 	{ TAINT_17,			'?', '-' },
 	{ TAINT_18,			'?', '-' },
@@ -242,6 +243,9 @@ static const struct tnt tnts[] = {
  *  'C' - modules from drivers/staging are loaded.
  *  'I' - Working around severe firmware bug.
  *  'O' - Out-of-tree module has been loaded.
+ *  'E' - Unsigned module has been loaded.
+ *  'L' - A soft lockup has previously occurred.
+ *  'K' - Kernel has been live patched.
  *
  *	The string is overwritten by the next call to print_tainted().
  */

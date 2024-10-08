@@ -57,7 +57,7 @@
  * Globals/Macros
  */
 
-#ifdef RPC_DEBUG
+#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 # define RPCDBG_FACILITY	RPCDBG_TRANS
 #endif
 
@@ -313,7 +313,7 @@ rpcrdma_flush_cqs(struct rpcrdma_ep *ep)
 	rpcrdma_sendcq_upcall(ep->rep_attr.send_cq, ep);
 }
 
-#ifdef RPC_DEBUG
+#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 static const char * const conn[] = {
 	"address resolved",
 	"address error",
@@ -344,7 +344,7 @@ rpcrdma_conn_upcall(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	struct rpcrdma_xprt *xprt = id->context;
 	struct rpcrdma_ia *ia = &xprt->rx_ia;
 	struct rpcrdma_ep *ep = &xprt->rx_ep;
-#ifdef RPC_DEBUG
+#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 	struct sockaddr_in *addr = (struct sockaddr_in *) &ep->rep_remote_addr;
 #endif
 	struct ib_qp_attr attr;
@@ -408,7 +408,7 @@ connected:
 		break;
 	}
 
-#ifdef RPC_DEBUG
+#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 	if (connstate == 1) {
 		int ird = attr.max_dest_rd_atomic;
 		int tird = ep->rep_remote_cma.responder_resources;
@@ -657,6 +657,7 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
 {
 	struct ib_device_attr devattr;
 	struct ib_cq *sendcq, *recvcq;
+	struct ib_cq_init_attr cq_attr = {};
 	int rc, err;
 
 	rc = ib_query_device(ia->ri_id->device, &devattr);
@@ -740,9 +741,9 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
 	init_waitqueue_head(&ep->rep_connect_wait);
 	INIT_DELAYED_WORK(&ep->rep_connect_worker, rpcrdma_connect_worker);
 
+	cq_attr.cqe = ep->rep_attr.cap.max_send_wr + 1;
 	sendcq = ib_create_cq(ia->ri_id->device, rpcrdma_sendcq_upcall,
-				  rpcrdma_cq_async_error_upcall, ep,
-				  ep->rep_attr.cap.max_send_wr + 1, 0);
+				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
 	if (IS_ERR(sendcq)) {
 		rc = PTR_ERR(sendcq);
 		dprintk("RPC:       %s: failed to create send CQ: %i\n",
@@ -757,9 +758,9 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
 		goto out2;
 	}
 
+	cq_attr.cqe = ep->rep_attr.cap.max_recv_wr + 1;
 	recvcq = ib_create_cq(ia->ri_id->device, rpcrdma_recvcq_upcall,
-				  rpcrdma_cq_async_error_upcall, ep,
-				  ep->rep_attr.cap.max_recv_wr + 1, 0);
+				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
 	if (IS_ERR(recvcq)) {
 		rc = PTR_ERR(recvcq);
 		dprintk("RPC:       %s: failed to create recv CQ: %i\n",

@@ -20,7 +20,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
-#include <linux/hash.h>
+#include <linux/jhash.h>
 #include <linux/random.h>
 #include <linux/rhashtable.h>
 
@@ -531,7 +531,7 @@ static size_t rounded_hashtable_size(struct rhashtable_params *params)
  *	.head_offset = offsetof(struct test_obj, node),
  *	.key_offset = offsetof(struct test_obj, key),
  *	.key_len = sizeof(int),
- *	.hashfn = arch_fast_hash,
+ *	.hashfn = jhash,
  *	.mutex_is_held = &my_mutex_is_held,
  * };
  *
@@ -550,7 +550,7 @@ static size_t rounded_hashtable_size(struct rhashtable_params *params)
  *
  * struct rhashtable_params params = {
  *	.head_offset = offsetof(struct test_obj, node),
- *	.hashfn = arch_fast_hash,
+ *	.hashfn = jhash,
  *	.obj_hashfn = my_hash_fn,
  *	.mutex_is_held = &my_mutex_is_held,
  * };
@@ -766,7 +766,7 @@ static int __init test_rht_init(void)
 		.head_offset = offsetof(struct test_obj, node),
 		.key_offset = offsetof(struct test_obj, value),
 		.key_len = sizeof(int),
-		.hashfn = arch_fast_hash,
+		.hashfn = jhash,
 		.mutex_is_held = &test_mutex_is_held,
 		.grow_decision = rht_grow_above_75,
 		.shrink_decision = rht_shrink_below_30,

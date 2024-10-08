@@ -82,7 +82,6 @@
 /* Software defined banks */
 #define MCE_EXTENDED_BANK	128
 #define MCE_THERMAL_BANK	(MCE_EXTENDED_BANK + 0)
-#define K8_MCE_THRESHOLD_BASE   (MCE_EXTENDED_BANK + 1)
 
 #define MCE_LOG_LEN 32
 #define MCE_LOG_SIGNATURE	"MACHINECHECK"
@@ -192,14 +191,13 @@ typedef DECLARE_BITMAP(mce_banks_t, MAX_NR_BANKS);
 DECLARE_PER_CPU(mce_banks_t, mce_poll_banks);
 
 enum mcp_flags {
-	MCP_TIMESTAMP = (1 << 0),	/* log time stamp */
-	MCP_UC = (1 << 1),		/* log uncorrected errors */
-	MCP_DONTLOG = (1 << 2),		/* only clear, don't log */
+	MCP_TIMESTAMP	= BIT(0),	/* log time stamp */
+	MCP_UC		= BIT(1),	/* log uncorrected errors */
+	MCP_DONTLOG	= BIT(2),	/* only clear, don't log */
 };
-void machine_check_poll(enum mcp_flags flags, mce_banks_t *b);
+bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b);
 
 int mce_notify_irq(void);
-void mce_notify_process(void);
 
 DECLARE_PER_CPU(struct mce, injectm);
 

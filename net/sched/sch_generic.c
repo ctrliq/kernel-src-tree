@@ -46,7 +46,6 @@ EXPORT_SYMBOL(default_qdisc_ops);
 
 static inline int dev_requeue_skb(struct sk_buff *skb, struct Qdisc *q)
 {
-	skb_dst_force(skb);
 	q->gso_skb = skb;
 	q->qstats.requeues++;
 	q->q.qlen++;	/* it's still part of the queue */
@@ -55,6 +54,35 @@ static inline int dev_requeue_skb(struct sk_buff *skb, struct Qdisc *q)
 	return 0;
 }
 
+static struct sk_buff *try_bulk_dequeue_skb(struct Qdisc *q,
+					    struct sk_buff *head_skb,
+					    int bytelimit)
+{
+	struct sk_buff *skb, *tail_skb = head_skb;
+
+	while (bytelimit > 0) {
+		skb = q->dequeue(q);
+		if (!skb)
+			break;
+
+		bytelimit -= skb->len; /* covers GSO len */
+		skb = validate_xmit_skb(skb, qdisc_dev(q));
+		if (!skb)
+			break;
+
+		while (tail_skb->next) /* GSO list goto tail */
+			tail_skb = tail_skb->next;
+
+		tail_skb->next = skb;
+		tail_skb = skb;
+	}
+
+	return head_skb;
+}
+
+/* Note that dequeue_skb can possibly return a SKB list (via skb->next).
+ * A requeued skb (via q->gso_skb) can also be a SKB list.
+ */
 static inline struct sk_buff *dequeue_skb(struct Qdisc *q)
 {
 	struct sk_buff *skb = q->gso_skb;
@@ -62,15 +90,25 @@ static inline struct sk_buff *dequeue_skb(struct Qdisc *q)
 
 	if (unlikely(skb)) {
 		/* check the reason of requeuing without tx lock first */
-		txq = netdev_get_tx_queue(txq->dev, skb_get_queue_mapping(skb));
+		txq = skb_get_tx_queue(txq->dev, skb);
 		if (!netif_xmit_frozen_or_stopped(txq)) {
 			q->gso_skb = NULL;
 			q->q.qlen--;
 		} else
 			skb = NULL;
 	} else {
-		if (!(q->flags & TCQ_F_ONETXQUEUE) || !netif_xmit_frozen_or_stopped(txq))
+		if (!(q->flags & TCQ_F_ONETXQUEUE) ||
+		    !netif_xmit_frozen_or_stopped(txq)) {
+			int bytelimit = qdisc_avail_bulklimit(txq);
+
 			skb = q->dequeue(q);
+			if (skb) {
+				bytelimit -= skb->len;
+				skb = validate_xmit_skb(skb, qdisc_dev(q));
+			}
+			if (skb && qdisc_may_bulk(q))
+				skb = try_bulk_dequeue_skb(q, skb, bytelimit);
+		}
 	}
 
 	return skb;
@@ -89,7 +127,7 @@ static inline int handle_dev_cpu_collision(struct sk_buff *skb,
 		 * detect it by checking xmit owner and drop the packet when
 		 * deadloop is detected. Return OK to try the next skb.
 		 */
-		kfree_skb(skb);
+		kfree_skb_list(skb);
 		net_warn_ratelimited("Dead loop on netdevice %s, fix it urgently!\n",
 				     dev_queue->dev->name);
 		ret = qdisc_qlen(q);
@@ -106,9 +144,9 @@ static inline int handle_dev_cpu_collision(struct sk_buff *skb,
 }
 
 /*
- * Transmit one skb, and handle the return status as required. Holding the
- * __QDISC_STATE_RUNNING bit guarantees that only one CPU can execute this
- * function.
+ * Transmit possibly several skbs, and handle the return status as
+ * required. Holding the __QDISC___STATE_RUNNING bit guarantees that
+ * only one CPU can execute this function.
  *
  * Returns to the caller:
  *				0  - queue is empty or throttled.
@@ -125,7 +163,7 @@ int sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
 
 	HARD_TX_LOCK(dev, txq, smp_processor_id());
 	if (!netif_xmit_frozen_or_stopped(txq))
-		ret = dev_hard_start_xmit(skb, dev, txq);
+		skb = dev_hard_start_xmit(skb, dev, txq, &ret);
 
 	HARD_TX_UNLOCK(dev, txq);
 
@@ -182,10 +220,10 @@ static inline int qdisc_restart(struct Qdisc *q)
 	skb = dequeue_skb(q);
 	if (unlikely(!skb))
 		return 0;
-	WARN_ON_ONCE(skb_dst_is_noref(skb));
+
 	root_lock = qdisc_lock(q);
 	dev = qdisc_dev(q);
-	txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
+	txq = skb_get_tx_queue(dev, skb);
 
 	return sch_direct_xmit(skb, q, dev, txq, root_lock);
 }

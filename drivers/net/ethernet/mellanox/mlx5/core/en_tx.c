@@ -34,6 +34,33 @@
 #include <linux/if_vlan.h>
 #include "en.h"
 
+#define MLX5E_SQ_NOPS_ROOM  MLX5_SEND_WQE_MAX_WQEBBS
+#define MLX5E_SQ_STOP_ROOM (MLX5_SEND_WQE_MAX_WQEBBS +\
+			    MLX5E_SQ_NOPS_ROOM)
+
+void mlx5e_send_nop(struct mlx5e_sq *sq, bool notify_hw)
+{
+	struct mlx5_wq_cyc                *wq  = &sq->wq;
+
+	u16 pi = sq->pc & wq->sz_m1;
+	struct mlx5e_tx_wqe              *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
+
+	struct mlx5_wqe_ctrl_seg         *cseg = &wqe->ctrl;
+
+	memset(cseg, 0, sizeof(*cseg));
+
+	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_NOP);
+	cseg->qpn_ds           = cpu_to_be32((sq->sqn << 8) | 0x01);
+
+	sq->skb[pi] = NULL;
+	sq->pc++;
+
+	if (notify_hw) {
+		cseg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+		mlx5e_tx_notify_hw(sq, wqe);
+	}
+}
+
 static void mlx5e_dma_pop_last_pushed(struct mlx5e_sq *sq, dma_addr_t *addr,
 				      u32 *size)
 {
@@ -69,17 +96,16 @@ static inline void mlx5e_dma_get(struct mlx5e_sq *sq, u32 i, dma_addr_t *addr,
 	*size = sq->dma_fifo[i & sq->dma_fifo_mask].size;
 }
 
-u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb,
-		       void *accel_priv, select_queue_fallback_t fallback)
+u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb)
 {
 	struct mlx5e_priv *priv = netdev_priv(dev);
-	int channel_ix = fallback(dev, skb);
+	int channel_ix = __netdev_pick_tx(dev, skb);
 	int up = skb_vlan_tag_present(skb)        ?
 		 skb->vlan_tci >> VLAN_PRIO_SHIFT :
 		 priv->default_vlan_prio;
 	int tc = netdev_get_prio_tc_map(dev, up);
 
-	return (tc << priv->order_base_2_num_channels) | channel_ix;
+	return priv->channel[channel_ix]->tc_to_txq_map[tc];
 }
 
 static inline u16 mlx5e_get_inline_hdr_size(struct mlx5e_sq *sq,
@@ -87,21 +113,6 @@ static inline u16 mlx5e_get_inline_hdr_size(struct mlx5e_sq *sq,
 {
 #define MLX5E_MIN_INLINE 16 /* eth header with vlan (w/o next ethertype) */
 	return MLX5E_MIN_INLINE;
-}
-
-static inline void mlx5e_insert_vlan(void *start, struct sk_buff *skb, u16 ihs)
-{
-	struct vlan_ethhdr *vhdr = (struct vlan_ethhdr *)start;
-	int cpy1_sz = 2 * ETH_ALEN;
-	int cpy2_sz = ihs - cpy1_sz - VLAN_HLEN;
-
-	skb_copy_from_linear_data(skb, vhdr, cpy1_sz);
-	skb_pull_inline(skb, cpy1_sz);
-	vhdr->h_vlan_proto = skb->vlan_proto;
-	vhdr->h_vlan_TCI = cpu_to_be16(skb_vlan_tag_get(skb));
-	skb_copy_from_linear_data(skb, &vhdr->h_vlan_encapsulated_proto,
-				  cpy2_sz);
-	skb_pull_inline(skb, cpy2_sz);
 }
 
 static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
@@ -146,12 +157,8 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
 							ETH_ZLEN);
 	}
 
-	if (skb_vlan_tag_present(skb)) {
-		mlx5e_insert_vlan(eseg->inline_hdr_start, skb, ihs);
-	} else {
-		skb_copy_from_linear_data(skb, eseg->inline_hdr_start, ihs);
-		skb_pull_inline(skb, ihs);
-	}
+	skb_copy_from_linear_data(skb, eseg->inline_hdr_start, ihs);
+	skb_pull_inline(skb, ihs);
 
 	eseg->inline_hdr_sz = cpu_to_be16(ihs);
 
@@ -211,7 +218,7 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
 
 	netdev_tx_sent_queue(sq->txq, MLX5E_TX_SKB_CB(skb)->num_bytes);
 
-	if (unlikely(!mlx5e_sq_has_room_for(sq, MLX5_SEND_WQE_MAX_WQEBBS))) {
+	if (unlikely(!mlx5e_sq_has_room_for(sq, MLX5E_SQ_STOP_ROOM))) {
 		netif_tx_stop_queue(sq->txq);
 		sq->stats.stopped++;
 	}
@@ -220,6 +227,10 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
 		cseg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
 		mlx5e_tx_notify_hw(sq, wqe);
 	}
+
+	/* fill sq edge with nops to avoid wqe wrap around */
+	while ((sq->pc & wq->sz_m1) > sq->edge)
+		mlx5e_send_nop(sq, false);
 
 	sq->stats.packets++;
 	return NETDEV_TX_OK;
@@ -236,21 +247,7 @@ dma_unmap_wqe_err:
 netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct mlx5e_priv *priv = netdev_priv(dev);
-	int ix = skb->queue_mapping;
-	int tc = 0;
-	struct mlx5e_channel *c = priv->channel[ix];
-	struct mlx5e_sq *sq = &c->sq[tc];
-
-	return mlx5e_sq_xmit(sq, skb);
-}
-
-netdev_tx_t mlx5e_xmit_multi_tc(struct sk_buff *skb, struct net_device *dev)
-{
-	struct mlx5e_priv *priv = netdev_priv(dev);
-	int ix = skb->queue_mapping & priv->queue_mapping_channel_mask;
-	int tc = skb->queue_mapping >> priv->order_base_2_num_channels;
-	struct mlx5e_channel *c = priv->channel[ix];
-	struct mlx5e_sq *sq = &c->sq[tc];
+	struct mlx5e_sq *sq = priv->txq_to_sq_map[skb_get_queue_mapping(skb)];
 
 	return mlx5e_sq_xmit(sq, skb);
 }
@@ -268,7 +265,7 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq)
 	if (!test_and_clear_bit(MLX5E_CQ_HAS_CQES, &cq->flags))
 		return false;
 
-	sq = cq->sqrq;
+	sq = container_of(cq, struct mlx5e_sq, cq);
 
 	npkts = 0;
 	nbytes = 0;
@@ -338,7 +335,7 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq)
 	netdev_tx_completed_queue(sq->txq, npkts, nbytes);
 
 	if (netif_tx_queue_stopped(sq->txq) &&
-	    mlx5e_sq_has_room_for(sq, MLX5_SEND_WQE_MAX_WQEBBS) &&
+	    mlx5e_sq_has_room_for(sq, MLX5E_SQ_STOP_ROOM) &&
 	    likely(test_bit(MLX5E_SQ_STATE_WAKE_TXQ_ENABLE, &sq->state))) {
 				netif_tx_wake_queue(sq->txq);
 				sq->stats.wake++;

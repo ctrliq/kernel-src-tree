@@ -590,7 +590,7 @@ static int tpm_stm_i2c_recv(struct tpm_chip *chip, unsigned char *buf,
 
 	size = recv_data(chip, buf, TPM_HEADER_SIZE);
 	if (size < TPM_HEADER_SIZE) {
-		dev_err(chip->dev, "Unable to read header\n");
+		dev_err(chip->pdev, "Unable to read header\n");
 		goto out;
 	}
 
@@ -603,7 +603,7 @@ static int tpm_stm_i2c_recv(struct tpm_chip *chip, unsigned char *buf,
 	size += recv_data(chip, &buf[TPM_HEADER_SIZE],
 			expected - TPM_HEADER_SIZE);
 	if (size < expected) {
-		dev_err(chip->dev, "Unable to read remainder of result\n");
+		dev_err(chip->pdev, "Unable to read remainder of result\n");
 		size = -ETIME;
 		goto out;
 	}
@@ -640,14 +640,14 @@ static int tpm_stm_i2c_of_request_resources(struct tpm_chip *chip)
 
 	pp = client->dev.of_node;
 	if (!pp) {
-		dev_err(chip->dev, "No platform data\n");
+		dev_err(chip->pdev, "No platform data\n");
 		return -ENODEV;
 	}
 
 	/* Get GPIO from device tree */
 	gpio = of_get_named_gpio(pp, "lpcpd-gpios", 0);
 	if (gpio < 0) {
-		dev_err(chip->dev, "Failed to retrieve lpcpd-gpios from dts.\n");
+		dev_err(chip->pdev, "Failed to retrieve lpcpd-gpios from dts.\n");
 		tpm_dev->io_lpcpd = -1;
 		/*
 		 * lpcpd pin is not specified. This is not an issue as
@@ -660,7 +660,7 @@ static int tpm_stm_i2c_of_request_resources(struct tpm_chip *chip)
 	ret = devm_gpio_request_one(&client->dev, gpio,
 			GPIOF_OUT_INIT_HIGH, "TPM IO LPCPD");
 	if (ret) {
-		dev_err(chip->dev, "Failed to request lpcpd pin\n");
+		dev_err(chip->pdev, "Failed to request lpcpd pin\n");
 		return -ENODEV;
 	}
 	tpm_dev->io_lpcpd = gpio;
@@ -683,7 +683,7 @@ static int tpm_stm_i2c_request_resources(struct i2c_client *client,
 
 	pdata = client->dev.platform_data;
 	if (!pdata) {
-		dev_err(chip->dev, "No platform data\n");
+		dev_err(chip->pdev, "No platform data\n");
 		return -ENODEV;
 	}
 
@@ -695,7 +695,7 @@ static int tpm_stm_i2c_request_resources(struct i2c_client *client,
 				pdata->io_lpcpd, GPIOF_OUT_INIT_HIGH,
 				"TPM IO_LPCPD");
 		if (ret) {
-			dev_err(chip->dev, "%s : reset gpio_request failed\n",
+			dev_err(chip->pdev, "%s : reset gpio_request failed\n",
 				__FILE__);
 			return ret;
 		}
@@ -736,11 +736,9 @@ tpm_stm_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	if (!tpm_dev)
 		return -ENOMEM;
 
-	chip = tpm_register_hardware(&client->dev, &st_i2c_tpm);
-	if (!chip) {
-		dev_info(&client->dev, "fail chip\n");
-		return -ENODEV;
-	}
+	chip = tpmm_chip_alloc(&client->dev, &st_i2c_tpm);
+	if (IS_ERR(chip))
+		return PTR_ERR(chip);
 
 	TPM_VPRIV(chip) = tpm_dev;
 	tpm_dev->client = client;
@@ -779,7 +777,7 @@ tpm_stm_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
 				IRQF_TRIGGER_HIGH,
 				"TPM SERIRQ management", chip);
 		if (ret < 0) {
-			dev_err(chip->dev , "TPM SERIRQ signals %d not available\n",
+			dev_err(chip->pdev, "TPM SERIRQ signals %d not available\n",
 				client->irq);
 			goto _tpm_clean_answer;
 		}
@@ -808,11 +806,9 @@ tpm_stm_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	tpm_get_timeouts(chip);
 	tpm_do_selftest(chip);
 
-	dev_info(chip->dev, "TPM I2C Initialized\n");
-	return 0;
+	return tpm_chip_register(chip);
 _tpm_clean_answer:
-	tpm_remove_hardware(chip->dev);
-	dev_info(chip->dev, "TPM I2C initialisation fail\n");
+	dev_info(chip->pdev, "TPM I2C initialisation fail\n");
 	return ret;
 }
 
@@ -827,7 +823,7 @@ static int tpm_stm_i2c_remove(struct i2c_client *client)
 		(struct tpm_chip *) i2c_get_clientdata(client);
 
 	if (chip)
-		tpm_remove_hardware(chip->dev);
+		tpm_chip_unregister(chip);
 
 	return 0;
 }

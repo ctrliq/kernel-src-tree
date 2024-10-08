@@ -356,6 +356,11 @@ _GLOBAL(ppc64_swapcontext)
 	bl	sys_swapcontext
 	b	.Lsyscall_exit
 
+_GLOBAL(ppc_switch_endian)
+	bl	save_nvgprs
+	bl	sys_switch_endian
+	b	.Lsyscall_exit
+
 _GLOBAL(ret_from_fork)
 	bl	schedule_tail
 	REST_NVGPRS(r1)
@@ -905,6 +910,11 @@ restore_check_irq_replay:
 	bne	1f
 	addi	r3,r1,STACK_FRAME_OVERHEAD;
  	bl	do_IRQ
+	b	ret_from_except
+1:	cmpwi	cr0,r3,0xe60
+	bne	1f
+	addi	r3,r1,STACK_FRAME_OVERHEAD;
+	bl	handle_hmi_exception
 	b	ret_from_except
 1:	cmpwi	cr0,r3,0x900
 	bne	1f

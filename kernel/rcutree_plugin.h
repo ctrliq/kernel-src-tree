@@ -82,7 +82,7 @@ static void __init rcu_bootup_announce_oddness(void)
 	printk(KERN_INFO "\tFour-level hierarchy is enabled.\n");
 #endif
 	if (rcu_fanout_leaf != CONFIG_RCU_FANOUT_LEAF)
-		printk(KERN_INFO "\tExperimental boot-time adjustment of leaf fanout to %d.\n", rcu_fanout_leaf);
+		pr_info("\tBoot-time adjustment of leaf fanout to %d.\n", rcu_fanout_leaf);
 	if (nr_cpu_ids != NR_CPUS)
 		printk(KERN_INFO "\tRCU restricting CPUs from NR_CPUS=%d to nr_cpu_ids=%d.\n", NR_CPUS, nr_cpu_ids);
 #ifdef CONFIG_RCU_NOCB_CPU
@@ -92,19 +92,19 @@ static void __init rcu_bootup_announce_oddness(void)
 		have_rcu_nocb_mask = true;
 	}
 #ifdef CONFIG_RCU_NOCB_CPU_ZERO
-	pr_info("\tExperimental no-CBs CPU 0\n");
+	pr_info("\tOffload RCU callbacks from CPU 0\n");
 	cpumask_set_cpu(0, rcu_nocb_mask);
 #endif /* #ifdef CONFIG_RCU_NOCB_CPU_ZERO */
 #ifdef CONFIG_RCU_NOCB_CPU_ALL
-	pr_info("\tExperimental no-CBs for all CPUs\n");
+	pr_info("\tOffload RCU callbacks from all CPUs\n");
 	cpumask_setall(rcu_nocb_mask);
 #endif /* #ifdef CONFIG_RCU_NOCB_CPU_ALL */
 #endif /* #ifndef CONFIG_RCU_NOCB_CPU_NONE */
 	if (have_rcu_nocb_mask) {
 		cpulist_scnprintf(nocb_buf, sizeof(nocb_buf), rcu_nocb_mask);
-		pr_info("\tExperimental no-CBs CPUs: %s.\n", nocb_buf);
+		pr_info("\tOffload RCU callbacks from CPUs: %s.\n", nocb_buf);
 		if (rcu_nocb_poll)
-			pr_info("\tExperimental polled no-CBs CPUs.\n");
+			pr_info("\tPoll for callbacks from no-CBs CPUs.\n");
 	}
 #endif /* #ifdef CONFIG_RCU_NOCB_CPU */
 }
@@ -1541,9 +1541,9 @@ static void rcu_prepare_kthreads(int cpu)
  * Because we not have RCU_FAST_NO_HZ, just check whether this CPU needs
  * any flavor of RCU.
  */
-int rcu_needs_cpu(int cpu, unsigned long *delta_jiffies)
+int rcu_needs_cpu(int cpu, u64 *nextevt)
 {
-	*delta_jiffies = ULONG_MAX;
+	*nextevt = KTIME_MAX;
 	return rcu_cpu_has_callbacks(cpu, NULL);
 }
 
@@ -1645,16 +1645,17 @@ static bool rcu_try_advance_all_cbs(void)
  *
  * The caller must have disabled interrupts.
  */
-int rcu_needs_cpu(int cpu, unsigned long *dj)
+int rcu_needs_cpu(int cpu, u64 *nextevt)
 {
 	struct rcu_dynticks *rdtp = &per_cpu(rcu_dynticks, cpu);
+	unsigned long dj;
 
 	/* Snapshot to detect later posting of non-lazy callback. */
 	rdtp->nonlazy_posted_snap = rdtp->nonlazy_posted;
 
 	/* If no callbacks, RCU doesn't need the CPU. */
 	if (!rcu_cpu_has_callbacks(cpu, &rdtp->all_lazy)) {
-		*dj = ULONG_MAX;
+		*nextevt = KTIME_MAX;
 		return 0;
 	}
 
@@ -1668,11 +1669,12 @@ int rcu_needs_cpu(int cpu, unsigned long *dj)
 
 	/* Request timer delay depending on laziness, and round. */
 	if (!rdtp->all_lazy) {
-		*dj = round_up(rcu_idle_gp_delay + jiffies,
+		dj = round_up(rcu_idle_gp_delay + jiffies,
 			       rcu_idle_gp_delay) - jiffies;
 	} else {
-		*dj = round_jiffies(rcu_idle_lazy_gp_delay + jiffies) - jiffies;
+		dj = round_jiffies(rcu_idle_lazy_gp_delay + jiffies) - jiffies;
 	}
+	*nextevt = basemono + dj * TICK_NSEC;
 	return 0;
 }
 

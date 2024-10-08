@@ -109,7 +109,7 @@ static u32 qlcnic_vlan_tx_check(struct qlcnic_adapter *adapter)
 	{PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, (device)), \
 	.class = PCI_CLASS_NETWORK_ETHERNET << 8, .class_mask = ~0}
 
-static DEFINE_PCI_DEVICE_TABLE(qlcnic_pci_tbl) = {
+static const struct pci_device_id qlcnic_pci_tbl[] = {
 	ENTRY(PCI_DEVICE_ID_QLOGIC_QLE824X),
 	ENTRY(PCI_DEVICE_ID_QLOGIC_QLE834X),
 	ENTRY(PCI_DEVICE_ID_QLOGIC_QLE8830),
@@ -502,9 +502,12 @@ static void qlcnic_del_vxlan_port(struct net_device *netdev,
 	adapter->flags |= QLCNIC_DEL_VXLAN_PORT;
 }
 
-static bool qlcnic_gso_check(struct sk_buff *skb, struct net_device *dev)
+static netdev_features_t qlcnic_features_check(struct sk_buff *skb,
+					       struct net_device *dev,
+					       netdev_features_t features)
 {
-	return vxlan_gso_check(skb);
+	features = vlan_features_check(skb, features);
+	return vxlan_features_check(skb, features);
 }
 #endif
 
@@ -529,14 +532,14 @@ static const struct net_device_ops qlcnic_netdev_ops = {
 #ifdef CONFIG_QLCNIC_VXLAN
 	.ndo_add_vxlan_port	= qlcnic_add_vxlan_port,
 	.ndo_del_vxlan_port	= qlcnic_del_vxlan_port,
-	.ndo_gso_check		= qlcnic_gso_check,
+	.ndo_features_check	= qlcnic_features_check,
 #endif
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller = qlcnic_poll_controller,
 #endif
 #ifdef CONFIG_QLCNIC_SRIOV
 	.ndo_set_vf_mac		= qlcnic_sriov_set_vf_mac,
-	.ndo_set_vf_tx_rate	= qlcnic_sriov_set_vf_tx_rate,
+	.ndo_set_vf_rate	= qlcnic_sriov_set_vf_tx_rate,
 	.ndo_get_vf_config	= qlcnic_sriov_get_vf_config,
 	.ndo_set_vf_vlan	= qlcnic_sriov_set_vf_vlan,
 	.ndo_set_vf_spoofchk	= qlcnic_sriov_set_vf_spoofchk,

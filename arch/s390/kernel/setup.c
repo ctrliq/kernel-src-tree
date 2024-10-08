@@ -341,6 +341,9 @@ static void __init setup_lowcore(void)
 		__ctl_set_bit(14, 29);
 	}
 #else
+	if (MACHINE_HAS_VX)
+		lc->vector_save_area_addr =
+			(unsigned long) &lc->vector_save_area;
 	lc->vdso_per_cpu_data = (unsigned long) &lc->paste[0];
 #endif
 	lc->sync_enter_timer = S390_lowcore.sync_enter_timer;
@@ -372,6 +375,10 @@ static void __init setup_lowcore(void)
 	mem_assign_absolute(S390_lowcore.restart_data, lc->restart_data);
 	mem_assign_absolute(S390_lowcore.restart_source, lc->restart_source);
 	mem_assign_absolute(S390_lowcore.restart_psw, lc->restart_psw);
+
+#ifdef CONFIG_SMP
+	lc->spinlock_lockval = arch_spin_lockval(0);
+#endif
 
 	set_prefix((u32)(unsigned long) lc);
 	lowcore_ptr[0] = lc;
@@ -915,6 +922,12 @@ static void __init setup_hwcaps(void)
 	 */
 	if (test_facility(50) && test_facility(73))
 		elf_hwcap |= HWCAP_S390_TE;
+
+	/*
+	 * Vector extension HWCAP_S390_VXRS is bit 11.
+	 */
+	if (test_facility(129))
+		elf_hwcap |= HWCAP_S390_VXRS;
 #endif
 
 	get_cpu_id(&cpu_id);
@@ -951,6 +964,9 @@ static void __init setup_hwcaps(void)
 	case 0x2827:
 	case 0x2828:
 		strcpy(elf_platform, "zEC12");
+		break;
+	case 0x2964:
+		strcpy(elf_platform, "z13");
 		break;
 	}
 }

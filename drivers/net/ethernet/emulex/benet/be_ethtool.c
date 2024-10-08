@@ -123,7 +123,6 @@ static const struct be_ethtool_stat et_stats[] = {
 	{DRVSTAT_INFO(dma_map_errors)},
 	/* Number of packets dropped due to random early drop function */
 	{DRVSTAT_INFO(eth_red_drops)},
-	{DRVSTAT_INFO(be_on_die_temperature)},
 	{DRVSTAT_INFO(rx_roce_bytes_lsd)},
 	{DRVSTAT_INFO(rx_roce_bytes_msd)},
 	{DRVSTAT_INFO(rx_roce_frames)},
@@ -264,8 +263,8 @@ static int lancer_cmd_read_file(struct be_adapter *adapter, u8 *file_name,
 	int status = 0;
 
 	read_cmd.size = LANCER_READ_FILE_CHUNK;
-	read_cmd.va = pci_alloc_consistent(adapter->pdev, read_cmd.size,
-					   &read_cmd.dma);
+	read_cmd.va = dma_zalloc_coherent(&adapter->pdev->dev, read_cmd.size,
+					  &read_cmd.dma, GFP_ATOMIC);
 
 	if (!read_cmd.va) {
 		dev_err(&adapter->pdev->dev,
@@ -289,8 +288,8 @@ static int lancer_cmd_read_file(struct be_adapter *adapter, u8 *file_name,
 			break;
 		}
 	}
-	pci_free_consistent(adapter->pdev, read_cmd.size, read_cmd.va,
-			    read_cmd.dma);
+	dma_free_coherent(&adapter->pdev->dev, read_cmd.size, read_cmd.va,
+			  read_cmd.dma);
 
 	return status;
 }
@@ -368,6 +367,14 @@ static int be_set_coalesce(struct net_device *netdev,
 		aic++;
 	}
 
+	/* For Skyhawk, the EQD setting happens via EQ_DB when AIC is enabled.
+	 * When AIC is disabled, persistently force set EQD value via the
+	 * FW cmd, so that we don't have to calculate the delay multiplier
+	 * encode value each time EQ_DB is rung
+	 */
+	if (!et->use_adaptive_rx_coalesce && skyhawk_chip(adapter))
+		be_eqd_update(adapter, true);
+
 	return 0;
 }
 
@@ -390,10 +397,10 @@ static void be_get_ethtool_stats(struct net_device *netdev,
 		struct be_rx_stats *stats = rx_stats(rxo);
 
 		do {
-			start = u64_stats_fetch_begin_bh(&stats->sync);
+			start = u64_stats_fetch_begin_irq(&stats->sync);
 			data[base] = stats->rx_bytes;
 			data[base + 1] = stats->rx_pkts;
-		} while (u64_stats_fetch_retry_bh(&stats->sync, start));
+		} while (u64_stats_fetch_retry_irq(&stats->sync, start));
 
 		for (i = 2; i < ETHTOOL_RXSTATS_NUM; i++) {
 			p = (u8 *)stats + et_rx_stats[i].offset;
@@ -406,19 +413,19 @@ static void be_get_ethtool_stats(struct net_device *netdev,
 		struct be_tx_stats *stats = tx_stats(txo);
 
 		do {
-			start = u64_stats_fetch_begin_bh(&stats->sync_compl);
+			start = u64_stats_fetch_begin_irq(&stats->sync_compl);
 			data[base] = stats->tx_compl;
-		} while (u64_stats_fetch_retry_bh(&stats->sync_compl, start));
+		} while (u64_stats_fetch_retry_irq(&stats->sync_compl, start));
 
 		do {
-			start = u64_stats_fetch_begin_bh(&stats->sync);
+			start = u64_stats_fetch_begin_irq(&stats->sync);
 			for (i = 1; i < ETHTOOL_TXSTATS_NUM; i++) {
 				p = (u8 *)stats + et_tx_stats[i].offset;
 				data[base + i] =
 					(et_tx_stats[i].size == sizeof(u64)) ?
 						*(u64 *)p : *(u32 *)p;
 			}
-		} while (u64_stats_fetch_retry_bh(&stats->sync, start));
+		} while (u64_stats_fetch_retry_irq(&stats->sync, start));
 		base += ETHTOOL_TXSTATS_NUM;
 	}
 }
@@ -818,8 +825,9 @@ static int be_test_ddr_dma(struct be_adapter *adapter)
 	};
 
 	ddrdma_cmd.size = sizeof(struct be_cmd_req_ddrdma_test);
-	ddrdma_cmd.va = dma_alloc_coherent(&adapter->pdev->dev, ddrdma_cmd.size,
-					   &ddrdma_cmd.dma, GFP_KERNEL);
+	ddrdma_cmd.va = dma_zalloc_coherent(&adapter->pdev->dev,
+					    ddrdma_cmd.size, &ddrdma_cmd.dma,
+					    GFP_KERNEL);
 	if (!ddrdma_cmd.va)
 		return -ENOMEM;
 
@@ -952,8 +960,9 @@ static int be_read_eeprom(struct net_device *netdev,
 
 	memset(&eeprom_cmd, 0, sizeof(struct be_dma_mem));
 	eeprom_cmd.size = sizeof(struct be_cmd_req_seeprom_read);
-	eeprom_cmd.va = dma_alloc_coherent(&adapter->pdev->dev, eeprom_cmd.size,
-					   &eeprom_cmd.dma, GFP_KERNEL);
+	eeprom_cmd.va = dma_zalloc_coherent(&adapter->pdev->dev,
+					    eeprom_cmd.size, &eeprom_cmd.dma,
+					    GFP_KERNEL);
 
 	if (!eeprom_cmd.va)
 		return -ENOMEM;
@@ -1182,7 +1191,8 @@ static u32 be_get_rxfh_key_size(struct net_device *netdev)
 	return RSS_HASH_KEY_LEN;
 }
 
-static int be_get_rxfh(struct net_device *netdev, u32 *indir, u8 *hkey)
+static int be_get_rxfh(struct net_device *netdev, u32 *indir, u8 *hkey,
+		       u8 *hfunc)
 {
 	struct be_adapter *adapter = netdev_priv(netdev);
 	int i;
@@ -1196,15 +1206,22 @@ static int be_get_rxfh(struct net_device *netdev, u32 *indir, u8 *hkey)
 	if (hkey)
 		memcpy(hkey, rss->rss_hkey, RSS_HASH_KEY_LEN);
 
+	if (hfunc)
+		*hfunc = ETH_RSS_HASH_TOP;
+
 	return 0;
 }
 
 static int be_set_rxfh(struct net_device *netdev, const u32 *indir,
-		       const u8 *hkey)
+		       const u8 *hkey, const u8 hfunc)
 {
 	int rc = 0, i, j;
 	struct be_adapter *adapter = netdev_priv(netdev);
 	u8 rsstable[RSS_INDIR_TABLE_LEN];
+
+	/* We do not allow change in unsupported parameters */
+	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP)
+		return -EOPNOTSUPP;
 
 	if (indir) {
 		struct be_rx_obj *rxo;

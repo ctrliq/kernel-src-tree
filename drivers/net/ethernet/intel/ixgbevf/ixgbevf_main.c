@@ -56,7 +56,7 @@ const char ixgbevf_driver_name[] = "ixgbevf";
 static const char ixgbevf_driver_string[] =
 	"Intel(R) 10 Gigabit PCI Express Virtual Function Network Driver";
 
-#define DRV_VERSION "2.12.1-k"
+#define DRV_VERSION "2.12.1-k-rh7.2"
 const char ixgbevf_driver_version[] = DRV_VERSION;
 static char ixgbevf_copyright[] =
 	"Copyright (c) 2009 - 2012 Intel Corporation.";
@@ -76,7 +76,7 @@ static const struct ixgbevf_info *ixgbevf_info_tbl[] = {
  * { Vendor ID, Device ID, SubVendor ID, SubDevice ID,
  *   Class, Class Mask, private data (not used) }
  */
-static DEFINE_PCI_DEVICE_TABLE(ixgbevf_pci_tbl) = {
+static const struct pci_device_id ixgbevf_pci_tbl[] = {
 	{PCI_VDEVICE(INTEL, IXGBE_DEV_ID_82599_VF), board_82599_vf },
 	{PCI_VDEVICE(INTEL, IXGBE_DEV_ID_X540_VF), board_X540_vf },
 	{PCI_VDEVICE(INTEL, IXGBE_DEV_ID_X550_VF), board_X550_vf },
@@ -676,46 +676,6 @@ static void ixgbevf_alloc_rx_buffers(struct ixgbevf_ring *rx_ring,
 }
 
 /**
- * ixgbevf_pull_tail - ixgbevf specific version of skb_pull_tail
- * @rx_ring: rx descriptor ring packet is being transacted on
- * @skb: pointer to current skb being adjusted
- *
- * This function is an ixgbevf specific version of __pskb_pull_tail.  The
- * main difference between this version and the original function is that
- * this function can make several assumptions about the state of things
- * that allow for significant optimizations versus the standard function.
- * As a result we can do things like drop a frag and maintain an accurate
- * truesize for the skb.
- **/
-static void ixgbevf_pull_tail(struct ixgbevf_ring *rx_ring,
-			      struct sk_buff *skb)
-{
-	struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
-	unsigned char *va;
-	unsigned int pull_len;
-
-	/* it is valid to use page_address instead of kmap since we are
-	 * working with pages allocated out of the lomem pool per
-	 * alloc_page(GFP_ATOMIC)
-	 */
-	va = skb_frag_address(frag);
-
-	/* we need the header to contain the greater of either ETH_HLEN or
-	 * 60 bytes if the skb->len is less than 60 for skb_pad.
-	 */
-	pull_len = eth_get_headlen(va, IXGBEVF_RX_HDR_SIZE);
-
-	/* align pull length to size of long to optimize memcpy performance */
-	skb_copy_to_linear_data(skb, va, ALIGN(pull_len, sizeof(long)));
-
-	/* update all of the pointers */
-	skb_frag_size_sub(frag, pull_len);
-	frag->page_offset += pull_len;
-	skb->data_len -= pull_len;
-	skb->tail += pull_len;
-}
-
-/**
  * ixgbevf_cleanup_headers - Correct corrupted or empty headers
  * @rx_ring: rx descriptor ring packet is being transacted on
  * @rx_desc: pointer to the EOP Rx descriptor
@@ -748,18 +708,9 @@ static bool ixgbevf_cleanup_headers(struct ixgbevf_ring *rx_ring,
 		}
 	}
 
-	/* place header in linear portion of buffer */
-	if (skb_is_nonlinear(skb))
-		ixgbevf_pull_tail(rx_ring, skb);
-
-	/* if skb_pad returns an error the skb was freed */
-	if (unlikely(skb->len < 60)) {
-		int pad_len = 60 - skb->len;
-
-		if (skb_pad(skb, pad_len))
-			return true;
-		__skb_put(skb, pad_len);
-	}
+	/* if eth_skb_pad returns an error the skb was freed */
+	if (eth_skb_pad(skb))
+		return true;
 
 	return false;
 }
@@ -821,16 +772,19 @@ static bool ixgbevf_add_rx_frag(struct ixgbevf_ring *rx_ring,
 				struct sk_buff *skb)
 {
 	struct page *page = rx_buffer->page;
+	unsigned char *va = page_address(page) + rx_buffer->page_offset;
 	unsigned int size = le16_to_cpu(rx_desc->wb.upper.length);
 #if (PAGE_SIZE < 8192)
 	unsigned int truesize = IXGBEVF_RX_BUFSZ;
 #else
 	unsigned int truesize = ALIGN(size, L1_CACHE_BYTES);
 #endif
+	unsigned int pull_len;
 
-	if ((size <= IXGBEVF_RX_HDR_SIZE) && !skb_is_nonlinear(skb)) {
-		unsigned char *va = page_address(page) + rx_buffer->page_offset;
+	if (unlikely(skb_is_nonlinear(skb)))
+		goto add_tail_frag;
 
+	if (likely(size <= IXGBEVF_RX_HDR_SIZE)) {
 		memcpy(__skb_put(skb, size), va, ALIGN(size, sizeof(long)));
 
 		/* page is not reserved, we can reuse buffer as is */
@@ -842,8 +796,21 @@ static bool ixgbevf_add_rx_frag(struct ixgbevf_ring *rx_ring,
 		return false;
 	}
 
+	/* we need the header to contain the greater of either ETH_HLEN or
+	 * 60 bytes if the skb->len is less than 60 for skb_pad.
+	 */
+	pull_len = eth_get_headlen(va, IXGBEVF_RX_HDR_SIZE);
+
+	/* align pull length to size of long to optimize memcpy performance */
+	memcpy(__skb_put(skb, pull_len), va, ALIGN(pull_len, sizeof(long)));
+
+	/* update all of the pointers */
+	va += pull_len;
+	size -= pull_len;
+
+add_tail_frag:
 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
-			rx_buffer->page_offset, size, truesize);
+			(unsigned long)va & ~PAGE_MASK, size, truesize);
 
 	/* avoid re-using remote pages */
 	if (unlikely(ixgbevf_page_is_reserved(page)))
@@ -3676,8 +3643,8 @@ static int ixgbevf_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 	first->bytecount = skb->len;
 	first->gso_segs = 1;
 
-	if (vlan_tx_tag_present(skb)) {
-		tx_flags |= vlan_tx_tag_get(skb);
+	if (skb_vlan_tag_present(skb)) {
+		tx_flags |= skb_vlan_tag_get(skb);
 		tx_flags <<= IXGBE_TX_FLAGS_VLAN_SHIFT;
 		tx_flags |= IXGBE_TX_FLAGS_VLAN;
 	}
@@ -3889,10 +3856,10 @@ static struct rtnl_link_stats64 *ixgbevf_get_stats(struct net_device *netdev,
 	for (i = 0; i < adapter->num_rx_queues; i++) {
 		ring = adapter->rx_ring[i];
 		do {
-			start = u64_stats_fetch_begin_bh(&ring->syncp);
+			start = u64_stats_fetch_begin_irq(&ring->syncp);
 			bytes = ring->stats.bytes;
 			packets = ring->stats.packets;
-		} while (u64_stats_fetch_retry_bh(&ring->syncp, start));
+		} while (u64_stats_fetch_retry_irq(&ring->syncp, start));
 		stats->rx_bytes += bytes;
 		stats->rx_packets += packets;
 	}
@@ -3900,10 +3867,10 @@ static struct rtnl_link_stats64 *ixgbevf_get_stats(struct net_device *netdev,
 	for (i = 0; i < adapter->num_tx_queues; i++) {
 		ring = adapter->tx_ring[i];
 		do {
-			start = u64_stats_fetch_begin_bh(&ring->syncp);
+			start = u64_stats_fetch_begin_irq(&ring->syncp);
 			bytes = ring->stats.bytes;
 			packets = ring->stats.packets;
-		} while (u64_stats_fetch_retry_bh(&ring->syncp, start));
+		} while (u64_stats_fetch_retry_irq(&ring->syncp, start));
 		stats->tx_bytes += bytes;
 		stats->tx_packets += packets;
 	}

@@ -182,12 +182,31 @@ static int readpage_nounlock(struct file *filp, struct page *page)
 	struct ceph_osd_client *osdc = 
 		&ceph_inode_to_client(inode)->client->osdc;
 	int err = 0;
+	u64 off = page_offset(page);
 	u64 len = PAGE_CACHE_SIZE;
+
+	if (off >= i_size_read(inode)) {
+		zero_user_segment(page, 0, PAGE_CACHE_SIZE);
+		SetPageUptodate(page);
+		return 0;
+	}
+
+	if (ci->i_inline_version != CEPH_INLINE_NONE) {
+		/*
+		 * Uptodate inline data should have been added
+		 * into page cache while getting Fcr caps.
+		 */
+		if (off == 0)
+			return -EINVAL;
+		zero_user_segment(page, 0, PAGE_CACHE_SIZE);
+		SetPageUptodate(page);
+		return 0;
+	}
 
 	dout("readpage inode %p file %p page %p index %lu\n",
 	     inode, filp, page, page->index);
 	err = ceph_osdc_readpages(osdc, ceph_vino(inode), &ci->i_layout,
-				  (u64) page_offset(page), &len,
+				  off, &len,
 				  ci->i_truncate_seq, ci->i_truncate_size,
 				  &page, 1, 0);
 	if (err == -ENOENT)
@@ -301,7 +320,7 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
 	     off, len);
 	vino = ceph_vino(inode);
 	req = ceph_osdc_new_request(osdc, &ci->i_layout, vino, off, &len,
-				    1, CEPH_OSD_OP_READ,
+				    0, 1, CEPH_OSD_OP_READ,
 				    CEPH_OSD_FLAG_READ, NULL,
 				    ci->i_truncate_seq, ci->i_truncate_size,
 				    false);
@@ -364,6 +383,9 @@ static int ceph_readpages(struct file *file, struct address_space *mapping,
 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
 	int rc = 0;
 	int max = 0;
+
+	if (ceph_inode(inode)->i_inline_version != CEPH_INLINE_NONE)
+		return -EINVAL;
 
 	if (fsc->mount_options->rsize >= PAGE_CACHE_SIZE)
 		max = (fsc->mount_options->rsize + PAGE_CACHE_SIZE - 1)
@@ -722,7 +744,6 @@ retry:
 	last_snapc = snapc;
 
 	while (!done && index <= end) {
-		int num_ops = do_sync ? 2 : 1;
 		unsigned i;
 		int first;
 		pgoff_t next;
@@ -822,7 +843,8 @@ get_more_pages:
 				len = wsize;
 				req = ceph_osdc_new_request(&fsc->client->osdc,
 							&ci->i_layout, vino,
-							offset, &len, num_ops,
+							offset, &len, 0,
+							do_sync ? 2 : 1,
 							CEPH_OSD_OP_WRITE,
 							CEPH_OSD_FLAG_WRITE |
 							CEPH_OSD_FLAG_ONDISK,
@@ -833,6 +855,9 @@ get_more_pages:
 					unlock_page(page);
 					break;
 				}
+
+				if (do_sync)
+					osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC);
 
 				req->r_callback = writepages_finish;
 				req->r_inode = inode;
@@ -1192,8 +1217,8 @@ static int ceph_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 		want = CEPH_CAP_FILE_CACHE;
 	while (1) {
 		got = 0;
-		ret = ceph_get_caps(ci, CEPH_CAP_FILE_RD, want, -1,
-				    &got, &pinned_page);
+		ret = ceph_get_caps(ci, CEPH_CAP_FILE_RD, want,
+				    -1, &got, &pinned_page);
 		if (ret == 0)
 			break;
 		if (ret != -ERESTARTSYS) {
@@ -1204,7 +1229,11 @@ static int ceph_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	dout("filemap_fault %p %llu~%zd got cap refs on %s\n",
 	     inode, off, (size_t)PAGE_CACHE_SIZE, ceph_cap_string(got));
 
-	ret = filemap_fault(vma, vmf);
+	if ((got & (CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO)) ||
+	    ci->i_inline_version == CEPH_INLINE_NONE)
+		ret = filemap_fault(vma, vmf);
+	else
+		ret = -EAGAIN;
 
 	dout("filemap_fault %p %llu~%zd dropping cap refs on %s ret %d\n",
 	     inode, off, (size_t)PAGE_CACHE_SIZE, ceph_cap_string(got), ret);
@@ -1212,6 +1241,42 @@ static int ceph_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 		page_cache_release(pinned_page);
 	ceph_put_cap_refs(ci, got);
 
+	if (ret != -EAGAIN)
+		return ret;
+
+	/* read inline data */
+	if (off >= PAGE_CACHE_SIZE) {
+		/* does not support inline data > PAGE_SIZE */
+		ret = VM_FAULT_SIGBUS;
+	} else {
+		int ret1;
+		struct address_space *mapping = inode->i_mapping;
+		struct page *page = find_or_create_page(mapping, 0,
+						mapping_gfp_mask(mapping) &
+						~__GFP_FS);
+		if (!page) {
+			ret = VM_FAULT_OOM;
+			goto out;
+		}
+		ret1 = __ceph_do_getattr(inode, page,
+					 CEPH_STAT_CAP_INLINE_DATA, true);
+		if (ret1 < 0 || off >= i_size_read(inode)) {
+			unlock_page(page);
+			page_cache_release(page);
+			ret = VM_FAULT_SIGBUS;
+			goto out;
+		}
+		if (ret1 < PAGE_CACHE_SIZE)
+			zero_user_segment(page, ret1, PAGE_CACHE_SIZE);
+		else
+			flush_dcache_page(page);
+		SetPageUptodate(page);
+		vmf->page = page;
+		ret = VM_FAULT_MAJOR | VM_FAULT_LOCKED;
+	}
+out:
+	dout("filemap_fault %p %llu~%zd read inline data ret %d\n",
+	     inode, off, (size_t)PAGE_CACHE_SIZE, ret);
 	return ret;
 }
 

@@ -14,8 +14,6 @@
 #include <drm/drm_crtc_helper.h>
 #include "mgag200_drv.h"
 
-extern int mgag200_preferred_depth __read_mostly;
-
 static void mga_user_framebuffer_destroy(struct drm_framebuffer *fb)
 {
 	struct mga_framebuffer *mga_fb = to_mga_framebuffer(fb);
@@ -219,28 +217,10 @@ int mgag200_driver_load(struct drm_device *dev, unsigned long flags)
 
 	drm_mode_config_init(dev);
 	dev->mode_config.funcs = (void *)&mga_mode_funcs;
-	if (mgag200_preferred_depth == 0) {
-		if (IS_G200_SE(mdev) && mdev->mc.vram_size <= (2048*1024)) {
-			mdev->preferred_bpp =
-				dev->mode_config.preferred_depth = 16;
-		} else {
-			/* prefer 16bpp on low end gpus with limited VRAM */
-			mdev->preferred_bpp = 32;
-			dev->mode_config.preferred_depth = 24;
-		}
-	} else {
-		dev->mode_config.preferred_depth = mgag200_preferred_depth;
-		switch (mgag200_preferred_depth) {
-		case 16:
-			mdev->preferred_bpp = 16;
-			break;
-		case 24:
-			mdev->preferred_bpp = 32;
-			break;
-		default:
-			goto out;
-		}
-	}
+	if (IS_G200_SE(mdev) && mdev->mc.vram_size < (2048*1024))
+		dev->mode_config.preferred_depth = 16;
+	else
+		dev->mode_config.preferred_depth = 24;
 	dev->mode_config.prefer_shadow = 1;
 
 	r = mgag200_modeset_init(mdev);

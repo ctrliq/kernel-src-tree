@@ -110,6 +110,7 @@ struct mlx4_ib_cq {
 	struct mutex		resize_mutex;
 	struct ib_umem	       *umem;
 	struct ib_umem	       *resize_umem;
+	int			create_flags;
 	/* List of qps that it serves.*/
 	struct list_head		send_qp_list;
 	struct list_head		recv_qp_list;
@@ -137,10 +138,17 @@ struct mlx4_ib_fmr {
 	struct mlx4_fmr         mfmr;
 };
 
+#define MAX_REGS_PER_FLOW 2
+
+struct mlx4_flow_reg_id {
+	u64 id;
+	u64 mirror;
+};
+
 struct mlx4_ib_flow {
 	struct ib_flow ibflow;
 	/* translating DMFS verbs sniffer rule to FW API requires two reg IDs */
-	u64 reg_id[2];
+	struct mlx4_flow_reg_id reg_id[MAX_REGS_PER_FLOW];
 };
 
 struct mlx4_ib_wq {
@@ -521,7 +529,6 @@ struct mlx4_ib_dev {
 	struct mlx4_ib_iboe	iboe;
 	struct counter_index    counters[MLX4_MAX_PORTS];
 	int		       *eq_table;
-	int			eq_added;
 	struct kobject	       *iov_parent;
 	struct kobject	       *ports_parent;
 	struct kobject	       *dev_ports_parent[MLX4_MFUNC_MAX];
@@ -551,6 +558,21 @@ struct mlx4_ib_qp_tunnel_init_attr {
 	int slave;
 	enum ib_qp_type proxy_qp_type;
 	u8 port;
+};
+
+struct mlx4_uverbs_ex_query_device {
+	__u32 comp_mask;
+	__u32 reserved;
+};
+
+enum query_device_resp_mask {
+	QUERY_DEVICE_RESP_MASK_TIMESTAMP = 1UL << 0,
+};
+
+struct mlx4_uverbs_ex_query_device_resp {
+	__u32 comp_mask;
+	__u32 response_length;
+	__u64 hca_core_clock_offset;
 };
 
 static inline struct mlx4_ib_dev *to_mdev(struct ib_device *ibdev)
@@ -666,7 +688,8 @@ void mlx4_ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list);
 
 int mlx4_ib_modify_cq(struct ib_cq *cq, u16 cq_count, u16 cq_period);
 int mlx4_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata);
-struct ib_cq *mlx4_ib_create_cq(struct ib_device *ibdev, int entries, int vector,
+struct ib_cq *mlx4_ib_create_cq(struct ib_device *ibdev,
+				const struct ib_cq_init_attr *attr,
 				struct ib_ucontext *context,
 				struct ib_udata *udata);
 int mlx4_ib_destroy_cq(struct ib_cq *cq);

@@ -509,12 +509,8 @@ static inline void irq_set_percpu_devid_flags(unsigned int irq)
 }
 
 /* Handle dynamic irq creation and destruction */
-extern unsigned int create_irq_nr(unsigned int irq_want, int node);
-extern unsigned int __create_irqs(unsigned int from, unsigned int count,
-				  int node);
 extern int create_irq(void);
 extern void destroy_irq(unsigned int irq);
-extern void destroy_irqs(unsigned int irq, unsigned int count);
 
 /*
  * Dynamic irq helper functions. Obsolete. Use irq_alloc_desc* and
@@ -579,6 +575,8 @@ static inline struct msi_desc *irq_data_get_msi(struct irq_data *d)
 {
 	return d->msi_desc;
 }
+
+unsigned int arch_dynirq_lower_bound(unsigned int from);
 
 int __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,
 		struct module *owner);

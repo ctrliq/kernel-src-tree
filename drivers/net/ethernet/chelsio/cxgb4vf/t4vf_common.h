@@ -67,7 +67,7 @@ enum chip_type {
 /*
  * The "len16" field of a Firmware Command Structure ...
  */
-#define FW_LEN16(fw_struct) FW_CMD_LEN16(sizeof(fw_struct) / 16)
+#define FW_LEN16(fw_struct) FW_CMD_LEN16_V(sizeof(fw_struct) / 16)
 
 /*
  * Per-VF statistics.
@@ -284,11 +284,11 @@ int t4vf_fw_reset(struct adapter *);
 int t4vf_set_params(struct adapter *, unsigned int, const u32 *, const u32 *);
 
 enum t4_bar2_qtype { T4_BAR2_QTYPE_EGRESS, T4_BAR2_QTYPE_INGRESS };
-int t4_bar2_sge_qregs(struct adapter *adapter,
-		      unsigned int qid,
-		      enum t4_bar2_qtype qtype,
-		      u64 *pbar2_qoffset,
-		      unsigned int *pbar2_qid);
+int t4vf_bar2_sge_qregs(struct adapter *adapter,
+			unsigned int qid,
+			enum t4_bar2_qtype qtype,
+			u64 *pbar2_qoffset,
+			unsigned int *pbar2_qid);
 
 int t4vf_get_sge_params(struct adapter *);
 int t4vf_get_vpd_params(struct adapter *);

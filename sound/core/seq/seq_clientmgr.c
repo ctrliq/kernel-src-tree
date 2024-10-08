@@ -2447,7 +2447,7 @@ EXPORT_SYMBOL(snd_seq_kernel_client_write_poll);
 
 /*---------------------------------------------------------------------------*/
 
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 /*
  *  /proc interface
  */
@@ -2549,7 +2549,7 @@ void snd_seq_info_clients_read(struct snd_info_entry *entry,
 		snd_seq_client_unlock(client);
 	}
 }
-#endif /* CONFIG_PROC_FS */
+#endif /* CONFIG_SND_PROC_FS */
 
 /*---------------------------------------------------------------------------*/
 
@@ -2586,9 +2586,8 @@ int __init snd_sequencer_device_init(void)
 	if (mutex_lock_interruptible(&register_mutex))
 		return -ERESTARTSYS;
 
-	err = snd_register_device_for_dev(SNDRV_DEVICE_TYPE_SEQUENCER, NULL, 0,
-					  &snd_seq_f_ops, NULL,
-					  &seq_dev, NULL, NULL);
+	err = snd_register_device(SNDRV_DEVICE_TYPE_SEQUENCER, NULL, 0,
+				  &snd_seq_f_ops, NULL, &seq_dev);
 	if (err < 0) {
 		mutex_unlock(&register_mutex);
 		put_device(&seq_dev);
@@ -2607,6 +2606,6 @@ int __init snd_sequencer_device_init(void)
  */
 void __exit snd_sequencer_device_done(void)
 {
-	snd_unregister_device(SNDRV_DEVICE_TYPE_SEQUENCER, NULL, 0);
+	snd_unregister_device(&seq_dev);
 	put_device(&seq_dev);
 }

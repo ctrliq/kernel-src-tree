@@ -336,15 +336,10 @@ void mlx4_en_set_num_rx_rings(struct mlx4_en_dev *mdev)
 	struct mlx4_dev *dev = mdev->dev;
 
 	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_ETH) {
-		if (!dev->caps.comp_pool)
-			num_of_eqs = max_t(int, MIN_RX_RINGS,
-					   min_t(int,
-						 dev->caps.num_comp_vectors,
-						 DEF_RX_RINGS));
-		else
-			num_of_eqs = min_t(int, MAX_MSIX_P_PORT,
-					   dev->caps.comp_pool/
-					   dev->caps.num_ports) - 1;
+		num_of_eqs = max_t(int, MIN_RX_RINGS,
+				   min_t(int,
+					 mlx4_get_eqs_per_port(mdev->dev, i),
+					 DEF_RX_RINGS));
 
 		num_rx_rings = mlx4_low_memory_profile() ? MIN_RX_RINGS :
 			min_t(int, num_of_eqs,
@@ -395,10 +390,10 @@ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
 		 ring->rx_info, tmp);
 
 	/* Allocate HW buffers on provided NUMA node */
-	set_dev_node(&mdev->dev->pdev->dev, node);
+	set_dev_node(&mdev->dev->persist->pdev->dev, node);
 	err = mlx4_alloc_hwq_res(mdev->dev, &ring->wqres,
 				 ring->buf_size, 2 * PAGE_SIZE);
-	set_dev_node(&mdev->dev->pdev->dev, mdev->dev->numa_node);
+	set_dev_node(&mdev->dev->persist->pdev->dev, mdev->dev->numa_node);
 	if (err)
 		goto err_info;
 
@@ -1048,21 +1043,19 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 		cpu_curr = smp_processor_id();
 		aff = irq_desc_get_irq_data(cq->irq_desc)->affinity;
 
-		if (unlikely(!cpumask_test_cpu(cpu_curr, aff))) {
-			/* Current cpu is not according to smp_irq_affinity -
-			 * probably affinity changed. need to stop this NAPI
-			 * poll, and restart it on the right CPU
-			 */
-			napi_complete(napi);
-			mlx4_en_arm_cq(priv, cq);
-			return 0;
-		}
+		if (likely(cpumask_test_cpu(cpu_curr, aff)))
+			return budget;
+
+		/* Current cpu is not according to smp_irq_affinity -
+		 * probably affinity changed. need to stop this NAPI
+		 * poll, and restart it on the right CPU
+		 */
+		done = 0;
 #endif
-	} else {
-		/* Done for now */
-		napi_complete(napi);
-		mlx4_en_arm_cq(priv, cq);
 	}
+	/* Done for now */
+	napi_complete_done(napi, done);
+	mlx4_en_arm_cq(priv, cq);
 	return done;
 }
 
@@ -1201,9 +1194,6 @@ int mlx4_en_config_rss_steer(struct mlx4_en_priv *priv)
 	int i, qpn;
 	int err = 0;
 	int good_qps = 0;
-	static const u32 rsskey[10] = { 0xD181C62C, 0xF7F4DB5B, 0x1983A2FC,
-				0x943E1ADB, 0xD9389E6B, 0xD1039C2C, 0xA74499AD,
-				0x593D56D9, 0xF3253C06, 0x2ADC1FFC};
 
 	en_dbg(DRV, priv, "Configuring rss steering\n");
 	err = mlx4_qp_reserve_range(mdev->dev, priv->rx_ring_num,
@@ -1258,9 +1248,19 @@ int mlx4_en_config_rss_steer(struct mlx4_en_priv *priv)
 
 	rss_context->flags = rss_mask;
 	rss_context->hash_fn = MLX4_RSS_HASH_TOP;
-	for (i = 0; i < 10; i++)
-		rss_context->rss_key[i] = cpu_to_be32(rsskey[i]);
-
+	if (priv->rss_hash_fn == ETH_RSS_HASH_XOR) {
+		rss_context->hash_fn = MLX4_RSS_HASH_XOR;
+	} else if (priv->rss_hash_fn == ETH_RSS_HASH_TOP) {
+		rss_context->hash_fn = MLX4_RSS_HASH_TOP;
+		memcpy(rss_context->rss_key, priv->rss_key,
+		       MLX4_EN_RSS_KEY_SIZE);
+		netdev_rss_key_fill(rss_context->rss_key,
+				    MLX4_EN_RSS_KEY_SIZE);
+	} else {
+		en_err(priv, "Unknown RSS hash function requested\n");
+		err = -EINVAL;
+		goto indir_err;
+	}
 	err = mlx4_qp_to_ready(mdev->dev, &priv->res.mtt, &context,
 			       &rss_map->indir_qp, &rss_map->indir_state);
 	if (err)

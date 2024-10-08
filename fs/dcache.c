@@ -216,9 +216,9 @@ static inline int dentry_cmp(const struct dentry *dentry, const unsigned char *c
 
 static void __d_free(struct rcu_head *head)
 {
-	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+	struct dentry *dentry = container_of(
+		(struct hlist_node *)head, struct dentry, d_alias);
 
-	WARN_ON(!hlist_unhashed(&dentry->d_alias));
 	if (dname_external(dentry))
 		kfree(dentry->d_name.name);
 	kmem_cache_free(dentry_cache, dentry); 
@@ -229,6 +229,7 @@ static void __d_free(struct rcu_head *head)
  */
 static void d_free(struct dentry *dentry)
 {
+	struct rcu_head *p = (struct rcu_head *)&dentry->d_alias;
 	BUG_ON((int)dentry->d_lockref.count > 0);
 	this_cpu_dec(nr_dentry);
 	if (dentry->d_op && dentry->d_op->d_release)
@@ -236,9 +237,9 @@ static void d_free(struct dentry *dentry)
 
 	/* if dentry was never visible to RCU, immediate free is OK */
 	if (!(dentry->d_flags & DCACHE_RCUACCESS))
-		__d_free(&dentry->d_u.d_rcu);
+		__d_free(p);
 	else
-		call_rcu(&dentry->d_u.d_rcu, __d_free);
+		call_rcu(p, __d_free);
 }
 
 /**
@@ -370,9 +371,9 @@ static struct dentry *d_kill(struct dentry *dentry, struct dentry *parent)
 	__releases(parent->d_lock)
 	__releases(dentry->d_inode->i_lock)
 {
-	list_del(&dentry->d_u.d_child);
+	__list_del_entry(&dentry->d_u.d_child);
 	/*
-	 * Inform try_to_ascend() that we are no longer attached to the
+	 * Inform d_walk() that we are no longer attached to the
 	 * dentry tree
 	 */
 	dentry->d_flags |= DCACHE_DENTRY_KILLED;
@@ -1007,34 +1008,6 @@ void shrink_dcache_for_umount(struct super_block *sb)
 	}
 }
 
-/*
- * This tries to ascend one level of parenthood, but
- * we can race with renaming, so we need to re-check
- * the parenthood after dropping the lock and check
- * that the sequence number still matches.
- */
-static struct dentry *try_to_ascend(struct dentry *old, unsigned seq)
-{
-	struct dentry *new = old->d_parent;
-
-	rcu_read_lock();
-	spin_unlock(&old->d_lock);
-	spin_lock(&new->d_lock);
-
-	/*
-	 * might go back up the wrong parent if we have had a rename
-	 * or deletion
-	 */
-	if (new != old->d_parent ||
-		 (old->d_flags & DCACHE_DENTRY_KILLED) ||
-		 need_seqretry(&rename_lock, seq)) {
-		spin_unlock(&new->d_lock);
-		new = NULL;
-	}
-	rcu_read_unlock();
-	return new;
-}
-
 /**
  * enum d_walk_ret - action to talke during tree walk
  * @D_WALK_CONTINUE:	contrinue walk
@@ -1121,18 +1094,31 @@ resume:
 	/*
 	 * All done at this level ... ascend and resume the search.
 	 */
+	rcu_read_lock();
+ascend:
 	if (this_parent != parent) {
 		struct dentry *child = this_parent;
-		this_parent = try_to_ascend(this_parent, seq);
-		if (!this_parent)
+		this_parent = child->d_parent;
+
+		spin_unlock(&child->d_lock);
+		spin_lock(&this_parent->d_lock);
+
+		/* might go back up the wrong parent if we have had a rename. */
+		if (need_seqretry(&rename_lock, seq))
 			goto rename_retry;
-		next = child->d_u.d_child.next;
+		/* go into the first sibling still alive */
+		do {
+			next = child->d_u.d_child.next;
+			if (next == &this_parent->d_subdirs)
+				goto ascend;
+			child = list_entry(next, struct dentry, d_u.d_child);
+		} while (unlikely(child->d_flags & DCACHE_DENTRY_KILLED));
+		rcu_read_unlock();
 		goto resume;
 	}
-	if (need_seqretry(&rename_lock, seq)) {
-		spin_unlock(&this_parent->d_lock);
+	if (need_seqretry(&rename_lock, seq))
 		goto rename_retry;
-	}
+	rcu_read_unlock();
 	if (finish)
 		finish(data);
 
@@ -1142,6 +1128,9 @@ out_unlock:
 	return;
 
 rename_retry:
+	spin_unlock(&this_parent->d_lock);
+	rcu_read_unlock();
+	BUG_ON(seq & 1);
 	if (!retry)
 		return;
 	seq = 1;
@@ -2782,6 +2771,13 @@ restart:
 		struct dentry * parent;
 
 		if (dentry == vfsmnt->mnt_root || IS_ROOT(dentry)) {
+			/* Escaped? */
+			if (dentry != vfsmnt->mnt_root) {
+				bptr = *buffer;
+				blen = *buflen;
+				error = 3;
+				break;
+			}
 			/* Global root? */
 			if (mnt_has_parent(mnt)) {
 				dentry = mnt->mnt_mountpoint;

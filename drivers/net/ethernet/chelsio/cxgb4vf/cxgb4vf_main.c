@@ -347,9 +347,9 @@ static void qenable(struct sge_rspq *rspq)
 	 * enable interrupts.
 	 */
 	t4_write_reg(rspq->adapter, T4VF_SGE_BASE_ADDR + SGE_VF_GTS,
-		     CIDXINC(0) |
-		     SEINTARM(rspq->intr_params) |
-		     INGRESSQID(rspq->cntxt_id));
+		     CIDXINC_V(0) |
+		     SEINTARM_V(rspq->intr_params) |
+		     INGRESSQID_V(rspq->cntxt_id));
 }
 
 /*
@@ -370,9 +370,9 @@ static void enable_rx(struct adapter *adapter)
 	 */
 	if (adapter->flags & USING_MSI)
 		t4_write_reg(adapter, T4VF_SGE_BASE_ADDR + SGE_VF_GTS,
-			     CIDXINC(0) |
-			     SEINTARM(s->intrq.intr_params) |
-			     INGRESSQID(s->intrq.cntxt_id));
+			     CIDXINC_V(0) |
+			     SEINTARM_V(s->intrq.intr_params) |
+			     INGRESSQID_V(s->intrq.cntxt_id));
 
 }
 
@@ -417,7 +417,7 @@ static int fwevtq_handler(struct sge_rspq *rspq, const __be64 *rsp,
 		/* FW can send EGR_UPDATEs encapsulated in a CPL_FW4_MSG.
 		 */
 		const struct cpl_sge_egr_update *p = (void *)(rsp + 3);
-		opcode = G_CPL_OPCODE(ntohl(p->opcode_qid));
+		opcode = CPL_OPCODE_G(ntohl(p->opcode_qid));
 		if (opcode != CPL_SGE_EGR_UPDATE) {
 			dev_err(adapter->pdev_dev, "unexpected FW4/CPL %#x on FW event queue\n"
 				, opcode);
@@ -438,7 +438,7 @@ static int fwevtq_handler(struct sge_rspq *rspq, const __be64 *rsp,
 		 * free TX Queue Descriptors ...
 		 */
 		const struct cpl_sge_egr_update *p = cpl;
-		unsigned int qid = EGR_QID(be32_to_cpu(p->opcode_qid));
+		unsigned int qid = EGR_QID_G(be32_to_cpu(p->opcode_qid));
 		struct sge *s = &adapter->sge;
 		struct sge_txq *tq;
 		struct sge_eth_txq *txq;
@@ -988,7 +988,7 @@ static int closest_thres(const struct sge *s, int thres)
 static unsigned int qtimer_val(const struct adapter *adapter,
 			       const struct sge_rspq *rspq)
 {
-	unsigned int timer_idx = QINTR_TIMER_IDX_GET(rspq->intr_params);
+	unsigned int timer_idx = QINTR_TIMER_IDX_G(rspq->intr_params);
 
 	return timer_idx < SGE_NTIMERS
 		? adapter->sge.timer_val[timer_idx]
@@ -1030,10 +1030,10 @@ static int set_rxq_intr_params(struct adapter *adapter, struct sge_rspq *rspq,
 
 		pktcnt_idx = closest_thres(&adapter->sge, cnt);
 		if (rspq->desc && rspq->pktcnt_idx != pktcnt_idx) {
-			v = FW_PARAMS_MNEM(FW_PARAMS_MNEM_DMAQ) |
-			    FW_PARAMS_PARAM_X(
+			v = FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DMAQ) |
+			    FW_PARAMS_PARAM_X_V(
 					FW_PARAMS_PARAM_DMAQ_IQ_INTCNTTHRESH) |
-			    FW_PARAMS_PARAM_YZ(rspq->cntxt_id);
+			    FW_PARAMS_PARAM_YZ_V(rspq->cntxt_id);
 			err = t4vf_set_params(adapter, 1, &v, &pktcnt_idx);
 			if (err)
 				return err;
@@ -1053,8 +1053,8 @@ static int set_rxq_intr_params(struct adapter *adapter, struct sge_rspq *rspq,
 	 * Update the response queue's interrupt coalescing parameters and
 	 * return success.
 	 */
-	rspq->intr_params = (QINTR_TIMER_IDX(timer_idx) |
-			     (cnt > 0 ? QINTR_CNT_EN : 0));
+	rspq->intr_params = (QINTR_TIMER_IDX_V(timer_idx) |
+			     QINTR_CNT_EN_V(cnt > 0));
 	return 0;
 }
 
@@ -1230,14 +1230,14 @@ static void cxgb4vf_get_drvinfo(struct net_device *dev,
 		sizeof(drvinfo->bus_info));
 	snprintf(drvinfo->fw_version, sizeof(drvinfo->fw_version),
 		 "%u.%u.%u.%u, TP %u.%u.%u.%u",
-		 FW_HDR_FW_VER_MAJOR_GET(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_MINOR_GET(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_MICRO_GET(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_BUILD_GET(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_MAJOR_GET(adapter->params.dev.tprev),
-		 FW_HDR_FW_VER_MINOR_GET(adapter->params.dev.tprev),
-		 FW_HDR_FW_VER_MICRO_GET(adapter->params.dev.tprev),
-		 FW_HDR_FW_VER_BUILD_GET(adapter->params.dev.tprev));
+		 FW_HDR_FW_VER_MAJOR_G(adapter->params.dev.fwrev),
+		 FW_HDR_FW_VER_MINOR_G(adapter->params.dev.fwrev),
+		 FW_HDR_FW_VER_MICRO_G(adapter->params.dev.fwrev),
+		 FW_HDR_FW_VER_BUILD_G(adapter->params.dev.fwrev),
+		 FW_HDR_FW_VER_MAJOR_G(adapter->params.dev.tprev),
+		 FW_HDR_FW_VER_MINOR_G(adapter->params.dev.tprev),
+		 FW_HDR_FW_VER_MICRO_G(adapter->params.dev.tprev),
+		 FW_HDR_FW_VER_BUILD_G(adapter->params.dev.tprev));
 }
 
 /*
@@ -1327,7 +1327,7 @@ static int cxgb4vf_get_coalesce(struct net_device *dev,
 
 	coalesce->rx_coalesce_usecs = qtimer_val(adapter, rspq);
 	coalesce->rx_max_coalesced_frames =
-		((rspq->intr_params & QINTR_CNT_EN)
+		((rspq->intr_params & QINTR_CNT_EN_F)
 		 ? adapter->sge.counter_val[rspq->pktcnt_idx]
 		 : 0);
 	return 0;
@@ -1561,7 +1561,7 @@ static void cxgb4vf_get_regs(struct net_device *dev,
 	reg_block_dump(adapter, regbuf,
 		       T4VF_PL_BASE_ADDR + T4VF_MOD_MAP_PL_FIRST,
 		       T4VF_PL_BASE_ADDR + (is_t4(adapter->params.chip)
-		       ? A_PL_VF_WHOAMI : A_PL_VF_REVISION));
+		       ? PL_VF_WHOAMI_A : PL_VF_REVISION_A));
 	reg_block_dump(adapter, regbuf,
 		       T4VF_CIM_BASE_ADDR + T4VF_MOD_MAP_CIM_FIRST,
 		       T4VF_CIM_BASE_ADDR + T4VF_MOD_MAP_CIM_LAST);
@@ -2095,7 +2095,6 @@ static int adap_init0(struct adapter *adapter)
 	unsigned int ethqsets;
 	int err;
 	u32 param, val = 0;
-	unsigned int chipid;
 
 	/*
 	 * Wait for the device to become ready before proceeding ...
@@ -2121,17 +2120,6 @@ static int adap_init0(struct adapter *adapter)
 	if (err < 0) {
 		dev_err(adapter->pdev_dev, "FW reset failed: err=%d\n", err);
 		return err;
-	}
-
-	adapter->params.chip = 0;
-	switch (adapter->pdev->device >> 12) {
-	case CHELSIO_T4:
-		adapter->params.chip = CHELSIO_CHIP_CODE(CHELSIO_T4, 0);
-		break;
-	case CHELSIO_T5:
-		chipid = G_REV(t4_read_reg(adapter, A_PL_VF_REV));
-		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T5, chipid);
-		break;
 	}
 
 	/*
@@ -2184,8 +2172,8 @@ static int adap_init0(struct adapter *adapter)
 	 * firmware won't understand this and we'll just get
 	 * unencapsulated messages ...
 	 */
-	param = FW_PARAMS_MNEM(FW_PARAMS_MNEM_PFVF) |
-		FW_PARAMS_PARAM_X(FW_PARAMS_PARAM_PFVF_CPLFW4MSG_ENCAP);
+	param = FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_PFVF) |
+		FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_PFVF_CPLFW4MSG_ENCAP);
 	val = 1;
 	(void) t4vf_set_params(adapter, 1, &param, &val);
 
@@ -2194,26 +2182,22 @@ static int adap_init0(struct adapter *adapter)
 	 * threshold values from the SGE parameters.
 	 */
 	s->timer_val[0] = core_ticks_to_us(adapter,
-		TIMERVALUE0_GET(sge_params->sge_timer_value_0_and_1));
+		TIMERVALUE0_G(sge_params->sge_timer_value_0_and_1));
 	s->timer_val[1] = core_ticks_to_us(adapter,
-		TIMERVALUE1_GET(sge_params->sge_timer_value_0_and_1));
+		TIMERVALUE1_G(sge_params->sge_timer_value_0_and_1));
 	s->timer_val[2] = core_ticks_to_us(adapter,
-		TIMERVALUE0_GET(sge_params->sge_timer_value_2_and_3));
+		TIMERVALUE0_G(sge_params->sge_timer_value_2_and_3));
 	s->timer_val[3] = core_ticks_to_us(adapter,
-		TIMERVALUE1_GET(sge_params->sge_timer_value_2_and_3));
+		TIMERVALUE1_G(sge_params->sge_timer_value_2_and_3));
 	s->timer_val[4] = core_ticks_to_us(adapter,
-		TIMERVALUE0_GET(sge_params->sge_timer_value_4_and_5));
+		TIMERVALUE0_G(sge_params->sge_timer_value_4_and_5));
 	s->timer_val[5] = core_ticks_to_us(adapter,
-		TIMERVALUE1_GET(sge_params->sge_timer_value_4_and_5));
+		TIMERVALUE1_G(sge_params->sge_timer_value_4_and_5));
 
-	s->counter_val[0] =
-		THRESHOLD_0_GET(sge_params->sge_ingress_rx_threshold);
-	s->counter_val[1] =
-		THRESHOLD_1_GET(sge_params->sge_ingress_rx_threshold);
-	s->counter_val[2] =
-		THRESHOLD_2_GET(sge_params->sge_ingress_rx_threshold);
-	s->counter_val[3] =
-		THRESHOLD_3_GET(sge_params->sge_ingress_rx_threshold);
+	s->counter_val[0] = THRESHOLD_0_G(sge_params->sge_ingress_rx_threshold);
+	s->counter_val[1] = THRESHOLD_1_G(sge_params->sge_ingress_rx_threshold);
+	s->counter_val[2] = THRESHOLD_2_G(sge_params->sge_ingress_rx_threshold);
+	s->counter_val[3] = THRESHOLD_3_G(sge_params->sge_ingress_rx_threshold);
 
 	/*
 	 * Grab our Virtual Interface resource allocation, extract the
@@ -2297,8 +2281,9 @@ static inline void init_rspq(struct sge_rspq *rspq, u8 timer_idx,
 			     u8 pkt_cnt_idx, unsigned int size,
 			     unsigned int iqe_size)
 {
-	rspq->intr_params = (QINTR_TIMER_IDX(timer_idx) |
-			     (pkt_cnt_idx < SGE_NCOUNTERS ? QINTR_CNT_EN : 0));
+	rspq->intr_params = (QINTR_TIMER_IDX_V(timer_idx) |
+			     (pkt_cnt_idx < SGE_NCOUNTERS ?
+			      QINTR_CNT_EN_F : 0));
 	rspq->pktcnt_idx = (pkt_cnt_idx < SGE_NCOUNTERS
 			    ? pkt_cnt_idx
 			    : 0);
@@ -2935,67 +2920,18 @@ static void cxgb4vf_pci_shutdown(struct pci_dev *pdev)
 	pci_set_drvdata(pdev, NULL);
 }
 
-/*
- * PCI Device registration data structures.
+/* Macros needed to support the PCI Device ID Table ...
  */
-#define CH_DEVICE(devid) \
-	{ PCI_VENDOR_ID_CHELSIO, devid, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 }
+#define CH_PCI_DEVICE_ID_TABLE_DEFINE_BEGIN \
+	static const struct pci_device_id cxgb4vf_pci_tbl[] = {
+#define CH_PCI_DEVICE_ID_FUNCTION	0x8
 
-static const struct pci_device_id cxgb4vf_pci_tbl[] = {
-	CH_DEVICE(0xb000),	/* PE10K FPGA */
-	CH_DEVICE(0x4801),	/* T420-cr */
-	CH_DEVICE(0x4802),	/* T422-cr */
-	CH_DEVICE(0x4803),	/* T440-cr */
-	CH_DEVICE(0x4804),	/* T420-bch */
-	CH_DEVICE(0x4805),	/* T440-bch */
-	CH_DEVICE(0x4806),	/* T460-ch */
-	CH_DEVICE(0x4807),	/* T420-so */
-	CH_DEVICE(0x4808),	/* T420-cx */
-	CH_DEVICE(0x4809),	/* T420-bt */
-	CH_DEVICE(0x480a),	/* T404-bt */
-	CH_DEVICE(0x480d),	/* T480-cr */
-	CH_DEVICE(0x480e),	/* T440-lp-cr */
-	CH_DEVICE(0x4880),
-	CH_DEVICE(0x4881),
-	CH_DEVICE(0x4882),
-	CH_DEVICE(0x4883),
-	CH_DEVICE(0x4884),
-	CH_DEVICE(0x4885),
-	CH_DEVICE(0x4886),
-	CH_DEVICE(0x4887),
-	CH_DEVICE(0x4888),
-	CH_DEVICE(0x5801),	/* T520-cr */
-	CH_DEVICE(0x5802),	/* T522-cr */
-	CH_DEVICE(0x5803),	/* T540-cr */
-	CH_DEVICE(0x5804),	/* T520-bch */
-	CH_DEVICE(0x5805),	/* T540-bch */
-	CH_DEVICE(0x5806),	/* T540-ch */
-	CH_DEVICE(0x5807),	/* T520-so */
-	CH_DEVICE(0x5808),	/* T520-cx */
-	CH_DEVICE(0x5809),	/* T520-bt */
-	CH_DEVICE(0x580a),	/* T504-bt */
-	CH_DEVICE(0x580b),	/* T520-sr */
-	CH_DEVICE(0x580c),	/* T504-bt */
-	CH_DEVICE(0x580d),	/* T580-cr */
-	CH_DEVICE(0x580e),	/* T540-lp-cr */
-	CH_DEVICE(0x580f),	/* Amsterdam */
-	CH_DEVICE(0x5810),	/* T580-lp-cr */
-	CH_DEVICE(0x5811),	/* T520-lp-cr */
-	CH_DEVICE(0x5812),	/* T560-cr */
-	CH_DEVICE(0x5813),	/* T580-cr */
-	CH_DEVICE(0x5814),	/* T580-so-cr */
-	CH_DEVICE(0x5815),	/* T502-bt */
-	CH_DEVICE(0x5880),
-	CH_DEVICE(0x5881),
-	CH_DEVICE(0x5882),
-	CH_DEVICE(0x5883),
-	CH_DEVICE(0x5884),
-	CH_DEVICE(0x5885),
-	CH_DEVICE(0x5886),
-	CH_DEVICE(0x5887),
-	CH_DEVICE(0x5888),
-	{ 0, }
-};
+#define CH_PCI_ID_TABLE_ENTRY(devid) \
+		{ PCI_VDEVICE(CHELSIO, (devid)), 0 }
+
+#define CH_PCI_DEVICE_ID_TABLE_DEFINE_END { 0, } }
+
+#include "../cxgb4/t4_pci_id_tbl.h"
 
 MODULE_DESCRIPTION(DRV_DESC);
 MODULE_AUTHOR("Chelsio Communications");

@@ -5,6 +5,8 @@
 #include <linux/netdevice.h>
 #include <uapi/linux/netfilter/x_tables.h>
 
+#include <linux/rh_kabi.h>
+
 /**
  * struct xt_action_param - parameters for matches/targets
  *
@@ -178,6 +180,11 @@ struct xt_target {
 	unsigned short proto;
 
 	unsigned short family;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 /* Furniture shopping... */

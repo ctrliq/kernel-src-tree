@@ -459,6 +459,9 @@ void fm10k_down(struct fm10k_intfc *interface);
 void fm10k_update_stats(struct fm10k_intfc *interface);
 void fm10k_service_event_schedule(struct fm10k_intfc *interface);
 void fm10k_update_rx_drop_en(struct fm10k_intfc *interface);
+#ifdef CONFIG_NET_POLL_CONTROLLER
+void fm10k_netpoll(struct net_device *netdev);
+#endif
 
 /* Netdev */
 struct net_device *fm10k_alloc_netdev(void);
@@ -490,8 +493,7 @@ s32 fm10k_iov_update_pvid(struct fm10k_intfc *interface, u16 glort, u16 pvid);
 int fm10k_ndo_set_vf_mac(struct net_device *netdev, int vf_idx, u8 *mac);
 int fm10k_ndo_set_vf_vlan(struct net_device *netdev,
 			  int vf_idx, u16 vid, u8 qos);
-int fm10k_ndo_set_vf_bw(struct net_device *netdev, int vf_idx, int rate,
-			int unused);
+int fm10k_ndo_set_vf_bw(struct net_device *netdev, int vf_idx, int rate);
 int fm10k_ndo_get_vf_config(struct net_device *netdev,
 			    int vf_idx, struct ifla_vf_info *ivi);
 

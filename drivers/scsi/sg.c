@@ -1351,7 +1351,7 @@ sg_rq_end_io(struct request *rq, int uptodate)
 		if ((sdp->sgdebug > 0) &&
 		    ((CHECK_CONDITION == srp->header.masked_status) ||
 		     (COMMAND_TERMINATED == srp->header.masked_status)))
-			__scsi_print_sense(__func__, sense,
+			__scsi_print_sense(sdp->device, __func__, sense,
 					   SCSI_SENSE_BUFFERSIZE);
 
 		/* Following if statement is a patch supplied by Eric Youngdale */
@@ -1712,10 +1712,25 @@ sg_start_req(Sg_request *srp, unsigned char *cmd)
 			return -ENOMEM;
 	}
 
-	rq = blk_get_request(q, rw, GFP_ATOMIC);
-	if (!rq) {
+	/*
+	 * NOTE
+	 *
+	 * With scsi-mq enabled, there are a fixed number of preallocated
+	 * requests equal in number to shost->can_queue.  If all of the
+	 * preallocated requests are already in use, then using GFP_ATOMIC with
+	 * blk_get_request() will return -EWOULDBLOCK, whereas using GFP_KERNEL
+	 * will cause blk_get_request() to sleep until an active command
+	 * completes, freeing up a request.  Neither option is ideal, but
+	 * GFP_KERNEL is the better choice to prevent userspace from getting an
+	 * unexpected EWOULDBLOCK.
+	 *
+	 * With scsi-mq disabled, blk_get_request() with GFP_KERNEL usually
+	 * does not sleep except under memory pressure.
+	 */
+	rq = blk_get_request(q, rw, GFP_KERNEL);
+	if (IS_ERR(rq)) {
 		kfree(long_cmdp);
-		return -ENOMEM;
+		return PTR_ERR(rq);
 	}
 
 	blk_rq_set_block_pc(rq);
@@ -2576,7 +2591,7 @@ static int sg_proc_seq_show_dev(struct seq_file *s, void *v)
 			      scsidp->id, scsidp->lun, (int) scsidp->type,
 			      1,
 			      (int) scsidp->queue_depth,
-			      (int) scsidp->device_busy,
+			      (int) atomic_read(&scsidp->device_busy),
 			      (int) scsi_device_online(scsidp));
 	}
 	read_unlock_irqrestore(&sg_index_lock, iflags);

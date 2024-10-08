@@ -865,6 +865,7 @@ int efx_mcdi_set_mac(struct efx_nic *efx)
 
 	BUILD_BUG_ON(MC_CMD_SET_MAC_OUT_LEN != 0);
 
+	/* This has no effect on EF10 */
 	ether_addr_copy(MCDI_PTR(cmdbytes, SET_MAC_IN_ADDR),
 			efx->net_dev->dev_addr);
 
@@ -947,8 +948,12 @@ static int efx_mcdi_mac_stats(struct efx_nic *efx,
 	MCDI_SET_DWORD(inbuf, MAC_STATS_IN_DMA_LEN, dma_len);
 	MCDI_SET_DWORD(inbuf, MAC_STATS_IN_PORT_ID, nic_data->vport_id);
 
-	rc = efx_mcdi_rpc(efx, MC_CMD_MAC_STATS, inbuf, sizeof(inbuf),
-			  NULL, 0, NULL);
+	rc = efx_mcdi_rpc_quiet(efx, MC_CMD_MAC_STATS, inbuf, sizeof(inbuf),
+				NULL, 0, NULL);
+	/* Expect ENOENT if DMA queues have not been set up */
+	if (rc && (rc != -ENOENT || atomic_read(&efx->active_queues)))
+		efx_mcdi_display_error(efx, MC_CMD_MAC_STATS, sizeof(inbuf),
+				       NULL, 0, rc);
 	return rc;
 }
 

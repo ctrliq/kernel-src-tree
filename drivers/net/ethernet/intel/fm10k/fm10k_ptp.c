@@ -318,6 +318,7 @@ static int fm10k_ptp_settime(struct ptp_clock_info *ptp,
 	return 0;
 }
 
+#if 0
 static int fm10k_ptp_enable(struct ptp_clock_info *ptp,
 			    struct ptp_clock_request *rq,
 			    int __always_unused on)
@@ -402,6 +403,7 @@ static int fm10k_ptp_verify(struct ptp_clock_info *ptp, unsigned int pin,
 
 	return 0;
 }
+#endif
 
 void fm10k_ptp_register(struct fm10k_intfc *interface)
 {
@@ -424,6 +426,8 @@ void fm10k_ptp_register(struct fm10k_intfc *interface)
 	ptp_caps->settime	= fm10k_ptp_settime;
 
 	/* provide pins if BAR4 is accessible */
+#if 0
+	/* Not functional in RHEL7 */
 	if (interface->sw_addr) {
 		/* enable periodic outputs */
 		ptp_caps->n_per_out = 2;
@@ -434,7 +438,7 @@ void fm10k_ptp_register(struct fm10k_intfc *interface)
 		ptp_caps->n_pins = 2;
 		ptp_caps->pin_config = fm10k_ptp_pd;
 	}
-
+#endif
 	ptp_clock = ptp_clock_register(ptp_caps, dev);
 	if (IS_ERR(ptp_clock)) {
 		ptp_clock = NULL;

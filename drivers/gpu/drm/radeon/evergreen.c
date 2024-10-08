@@ -22,11 +22,11 @@
  * Authors: Alex Deucher
  */
 #include <linux/firmware.h>
-#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <drm/drmP.h>
 #include "radeon.h"
 #include "radeon_asic.h"
+#include "radeon_audio.h"
 #include <drm/radeon_drm.h>
 #include "evergreend.h"
 #include "atom.h"
@@ -1003,6 +1003,34 @@ static void evergreen_init_golden_registers(struct radeon_device *rdev)
 		break;
 	default:
 		break;
+	}
+}
+
+/**
+ * evergreen_get_allowed_info_register - fetch the register for the info ioctl
+ *
+ * @rdev: radeon_device pointer
+ * @reg: register offset in bytes
+ * @val: register value
+ *
+ * Returns 0 for success or -EINVAL for an invalid register
+ *
+ */
+int evergreen_get_allowed_info_register(struct radeon_device *rdev,
+					u32 reg, u32 *val)
+{
+	switch (reg) {
+	case GRBM_STATUS:
+	case GRBM_STATUS_SE0:
+	case GRBM_STATUS_SE1:
+	case SRBM_STATUS:
+	case SRBM_STATUS2:
+	case DMA_STATUS_REG:
+	case UVD_STATUS:
+		*val = RREG32(reg);
+		return 0;
+	default:
+		return -EINVAL;
 	}
 }
 
@@ -2346,6 +2374,9 @@ void evergreen_bandwidth_update(struct radeon_device *rdev)
 	u32 num_heads = 0, lb_size;
 	int i;
 
+	if (!rdev->mode_info.mode_config_initialized)
+		return;
+
 	radeon_update_display_priority(rdev);
 
 	for (i = 0; i < rdev->num_crtc; i++) {
@@ -2424,7 +2455,6 @@ static int evergreen_pcie_gart_enable(struct radeon_device *rdev)
 	r = radeon_gart_table_vram_pin(rdev);
 	if (r)
 		return r;
-	radeon_gart_restore(rdev);
 	/* Setup L2 cache */
 	WREG32(VM_L2_CNTL, ENABLE_L2_CACHE | ENABLE_L2_FRAGMENT_PROCESSING |
 				ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE |
@@ -2678,7 +2708,7 @@ void evergreen_mc_resume(struct radeon_device *rdev, struct evergreen_mc_save *s
 		if (save->crtc_enabled[i]) {
 			if (ASIC_IS_DCE6(rdev)) {
 				tmp = RREG32(EVERGREEN_CRTC_BLANK_CONTROL + crtc_offsets[i]);
-				tmp |= EVERGREEN_CRTC_BLANK_DATA_EN;
+				tmp &= ~EVERGREEN_CRTC_BLANK_DATA_EN;
 				WREG32(EVERGREEN_CRTC_UPDATE_LOCK + crtc_offsets[i], 1);
 				WREG32(EVERGREEN_CRTC_BLANK_CONTROL + crtc_offsets[i], tmp);
 				WREG32(EVERGREEN_CRTC_UPDATE_LOCK + crtc_offsets[i], 0);
@@ -2871,7 +2901,7 @@ static int evergreen_cp_start(struct radeon_device *rdev)
 	radeon_ring_write(ring, PACKET3_ME_INITIALIZE_DEVICE_ID(1));
 	radeon_ring_write(ring, 0);
 	radeon_ring_write(ring, 0);
-	radeon_ring_unlock_commit(rdev, ring);
+	radeon_ring_unlock_commit(rdev, ring, false);
 
 	cp_me = 0xff;
 	WREG32(CP_ME_CNTL, cp_me);
@@ -2914,7 +2944,7 @@ static int evergreen_cp_start(struct radeon_device *rdev)
 	radeon_ring_write(ring, 0x0000000e); /* VGT_VERTEX_REUSE_BLOCK_CNTL */
 	radeon_ring_write(ring, 0x00000010); /*  */
 
-	radeon_ring_unlock_commit(rdev, ring);
+	radeon_ring_unlock_commit(rdev, ring, false);
 
 	return 0;
 }
@@ -3008,7 +3038,7 @@ static void evergreen_gpu_init(struct radeon_device *rdev)
 	u32 vgt_cache_invalidation;
 	u32 hdp_host_path_cntl, tmp;
 	u32 disabled_rb_mask;
-	int i, j, num_shader_engines, ps_thread_count;
+	int i, j, ps_thread_count;
 
 	switch (rdev->family) {
 	case CHIP_CYPRESS:
@@ -3251,6 +3281,8 @@ static void evergreen_gpu_init(struct radeon_device *rdev)
 	}
 
 	WREG32(GRBM_CNTL, GRBM_READ_TIMEOUT(0xff));
+	WREG32(SRBM_INT_CNTL, 0x1);
+	WREG32(SRBM_INT_ACK, 0x1);
 
 	evergreen_fix_pci_max_read_req_size(rdev);
 
@@ -3305,8 +3337,6 @@ static void evergreen_gpu_init(struct radeon_device *rdev)
 	rdev->config.evergreen.tile_config |= 0 << 8;
 	rdev->config.evergreen.tile_config |=
 		((gb_addr_config & 0x30000000) >> 28) << 12;
-
-	num_shader_engines = (gb_addr_config & NUM_SHADER_ENGINES(3) >> 12) + 1;
 
 	if ((rdev->family >= CHIP_CEDAR) && (rdev->family <= CHIP_HEMLOCK)) {
 		u32 efuse_straps_4;
@@ -4024,7 +4054,8 @@ int sumo_rlc_init(struct radeon_device *rdev)
 		/* save restore block */
 		if (rdev->rlc.save_restore_obj == NULL) {
 			r = radeon_bo_create(rdev, dws * 4, PAGE_SIZE, true,
-					     RADEON_GEM_DOMAIN_VRAM, NULL, &rdev->rlc.save_restore_obj);
+					     RADEON_GEM_DOMAIN_VRAM, 0, NULL,
+					     NULL, &rdev->rlc.save_restore_obj);
 			if (r) {
 				dev_warn(rdev->dev, "(%d) create RLC sr bo failed\n", r);
 				return r;
@@ -4102,7 +4133,8 @@ int sumo_rlc_init(struct radeon_device *rdev)
 
 		if (rdev->rlc.clear_state_obj == NULL) {
 			r = radeon_bo_create(rdev, dws * 4, PAGE_SIZE, true,
-					     RADEON_GEM_DOMAIN_VRAM, NULL, &rdev->rlc.clear_state_obj);
+					     RADEON_GEM_DOMAIN_VRAM, 0, NULL,
+					     NULL, &rdev->rlc.clear_state_obj);
 			if (r) {
 				dev_warn(rdev->dev, "(%d) create RLC c bo failed\n", r);
 				sumo_rlc_fini(rdev);
@@ -4176,8 +4208,10 @@ int sumo_rlc_init(struct radeon_device *rdev)
 
 	if (rdev->rlc.cp_table_size) {
 		if (rdev->rlc.cp_table_obj == NULL) {
-			r = radeon_bo_create(rdev, rdev->rlc.cp_table_size, PAGE_SIZE, true,
-					     RADEON_GEM_DOMAIN_VRAM, NULL, &rdev->rlc.cp_table_obj);
+			r = radeon_bo_create(rdev, rdev->rlc.cp_table_size,
+					     PAGE_SIZE, true,
+					     RADEON_GEM_DOMAIN_VRAM, 0, NULL,
+					     NULL, &rdev->rlc.cp_table_obj);
 			if (r) {
 				dev_warn(rdev->dev, "(%d) create RLC cp table bo failed\n", r);
 				sumo_rlc_fini(rdev);
@@ -4320,6 +4354,7 @@ void evergreen_disable_interrupt_state(struct radeon_device *rdev)
 	tmp = RREG32(DMA_CNTL) & ~TRAP_ENABLE;
 	WREG32(DMA_CNTL, tmp);
 	WREG32(GRBM_INT_CNTL, 0);
+	WREG32(SRBM_INT_CNTL, 0);
 	WREG32(INT_MASK + EVERGREEN_CRTC0_REGISTER_OFFSET, 0);
 	WREG32(INT_MASK + EVERGREEN_CRTC1_REGISTER_OFFSET, 0);
 	if (rdev->num_crtc >= 4) {
@@ -4385,12 +4420,12 @@ int evergreen_irq_set(struct radeon_device *rdev)
 		return 0;
 	}
 
-	hpd1 = RREG32(DC_HPD1_INT_CONTROL) & ~DC_HPDx_INT_EN;
-	hpd2 = RREG32(DC_HPD2_INT_CONTROL) & ~DC_HPDx_INT_EN;
-	hpd3 = RREG32(DC_HPD3_INT_CONTROL) & ~DC_HPDx_INT_EN;
-	hpd4 = RREG32(DC_HPD4_INT_CONTROL) & ~DC_HPDx_INT_EN;
-	hpd5 = RREG32(DC_HPD5_INT_CONTROL) & ~DC_HPDx_INT_EN;
-	hpd6 = RREG32(DC_HPD6_INT_CONTROL) & ~DC_HPDx_INT_EN;
+	hpd1 = RREG32(DC_HPD1_INT_CONTROL) & ~(DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN);
+	hpd2 = RREG32(DC_HPD2_INT_CONTROL) & ~(DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN);
+	hpd3 = RREG32(DC_HPD3_INT_CONTROL) & ~(DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN);
+	hpd4 = RREG32(DC_HPD4_INT_CONTROL) & ~(DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN);
+	hpd5 = RREG32(DC_HPD5_INT_CONTROL) & ~(DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN);
+	hpd6 = RREG32(DC_HPD6_INT_CONTROL) & ~(DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN);
 	if (rdev->family == CHIP_ARUBA)
 		thermal_int = RREG32(TN_CG_THERMAL_INT_CTRL) &
 			~(THERM_INT_MASK_HIGH | THERM_INT_MASK_LOW);
@@ -4479,27 +4514,27 @@ int evergreen_irq_set(struct radeon_device *rdev)
 	}
 	if (rdev->irq.hpd[0]) {
 		DRM_DEBUG("evergreen_irq_set: hpd 1\n");
-		hpd1 |= DC_HPDx_INT_EN;
+		hpd1 |= DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN;
 	}
 	if (rdev->irq.hpd[1]) {
 		DRM_DEBUG("evergreen_irq_set: hpd 2\n");
-		hpd2 |= DC_HPDx_INT_EN;
+		hpd2 |= DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN;
 	}
 	if (rdev->irq.hpd[2]) {
 		DRM_DEBUG("evergreen_irq_set: hpd 3\n");
-		hpd3 |= DC_HPDx_INT_EN;
+		hpd3 |= DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN;
 	}
 	if (rdev->irq.hpd[3]) {
 		DRM_DEBUG("evergreen_irq_set: hpd 4\n");
-		hpd4 |= DC_HPDx_INT_EN;
+		hpd4 |= DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN;
 	}
 	if (rdev->irq.hpd[4]) {
 		DRM_DEBUG("evergreen_irq_set: hpd 5\n");
-		hpd5 |= DC_HPDx_INT_EN;
+		hpd5 |= DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN;
 	}
 	if (rdev->irq.hpd[5]) {
 		DRM_DEBUG("evergreen_irq_set: hpd 6\n");
-		hpd6 |= DC_HPDx_INT_EN;
+		hpd6 |= DC_HPDx_INT_EN | DC_HPDx_RX_INT_EN;
 	}
 	if (rdev->irq.afmt[0]) {
 		DRM_DEBUG("evergreen_irq_set: hdmi 0\n");
@@ -4585,6 +4620,9 @@ int evergreen_irq_set(struct radeon_device *rdev)
 	WREG32(AFMT_AUDIO_PACKET_CONTROL + EVERGREEN_CRTC3_REGISTER_OFFSET, afmt4);
 	WREG32(AFMT_AUDIO_PACKET_CONTROL + EVERGREEN_CRTC4_REGISTER_OFFSET, afmt5);
 	WREG32(AFMT_AUDIO_PACKET_CONTROL + EVERGREEN_CRTC5_REGISTER_OFFSET, afmt6);
+
+	/* posting read */
+	RREG32(SRBM_STATUS);
 
 	return 0;
 }
@@ -4690,6 +4728,38 @@ static void evergreen_irq_ack(struct radeon_device *rdev)
 		tmp |= DC_HPDx_INT_ACK;
 		WREG32(DC_HPD6_INT_CONTROL, tmp);
 	}
+
+	if (rdev->irq.stat_regs.evergreen.disp_int & DC_HPD1_RX_INTERRUPT) {
+		tmp = RREG32(DC_HPD1_INT_CONTROL);
+		tmp |= DC_HPDx_RX_INT_ACK;
+		WREG32(DC_HPD1_INT_CONTROL, tmp);
+	}
+	if (rdev->irq.stat_regs.evergreen.disp_int_cont & DC_HPD2_RX_INTERRUPT) {
+		tmp = RREG32(DC_HPD2_INT_CONTROL);
+		tmp |= DC_HPDx_RX_INT_ACK;
+		WREG32(DC_HPD2_INT_CONTROL, tmp);
+	}
+	if (rdev->irq.stat_regs.evergreen.disp_int_cont2 & DC_HPD3_RX_INTERRUPT) {
+		tmp = RREG32(DC_HPD3_INT_CONTROL);
+		tmp |= DC_HPDx_RX_INT_ACK;
+		WREG32(DC_HPD3_INT_CONTROL, tmp);
+	}
+	if (rdev->irq.stat_regs.evergreen.disp_int_cont3 & DC_HPD4_RX_INTERRUPT) {
+		tmp = RREG32(DC_HPD4_INT_CONTROL);
+		tmp |= DC_HPDx_RX_INT_ACK;
+		WREG32(DC_HPD4_INT_CONTROL, tmp);
+	}
+	if (rdev->irq.stat_regs.evergreen.disp_int_cont4 & DC_HPD5_RX_INTERRUPT) {
+		tmp = RREG32(DC_HPD5_INT_CONTROL);
+		tmp |= DC_HPDx_RX_INT_ACK;
+		WREG32(DC_HPD5_INT_CONTROL, tmp);
+	}
+	if (rdev->irq.stat_regs.evergreen.disp_int_cont5 & DC_HPD6_RX_INTERRUPT) {
+		tmp = RREG32(DC_HPD5_INT_CONTROL);
+		tmp |= DC_HPDx_RX_INT_ACK;
+		WREG32(DC_HPD6_INT_CONTROL, tmp);
+	}
+
 	if (rdev->irq.stat_regs.evergreen.afmt_status1 & AFMT_AZ_FORMAT_WTRIG) {
 		tmp = RREG32(AFMT_AUDIO_PACKET_CONTROL + EVERGREEN_CRTC0_REGISTER_OFFSET);
 		tmp |= AFMT_AZ_FORMAT_WTRIG_ACK;
@@ -4747,17 +4817,17 @@ static u32 evergreen_get_ih_wptr(struct radeon_device *rdev)
 		wptr = RREG32(IH_RB_WPTR);
 
 	if (wptr & RB_OVERFLOW) {
+		wptr &= ~RB_OVERFLOW;
 		/* When a ring buffer overflow happen start parsing interrupt
 		 * from the last not overwritten vector (wptr + 16). Hopefully
 		 * this should allow us to catchup.
 		 */
-		dev_warn(rdev->dev, "IH ring buffer overflow (0x%08X, %d, %d)\n",
-			wptr, rdev->ih.rptr, (wptr + 16) + rdev->ih.ptr_mask);
+		dev_warn(rdev->dev, "IH ring buffer overflow (0x%08X, 0x%08X, 0x%08X)\n",
+			 wptr, rdev->ih.rptr, (wptr + 16) & rdev->ih.ptr_mask);
 		rdev->ih.rptr = (wptr + 16) & rdev->ih.ptr_mask;
 		tmp = RREG32(IH_RB_CNTL);
 		tmp |= IH_WPTR_OVERFLOW_CLEAR;
 		WREG32(IH_RB_CNTL, tmp);
-		wptr &= ~RB_OVERFLOW;
 	}
 	return (wptr & rdev->ih.ptr_mask);
 }
@@ -4770,6 +4840,7 @@ int evergreen_irq_process(struct radeon_device *rdev)
 	u32 ring_index;
 	bool queue_hotplug = false;
 	bool queue_hdmi = false;
+	bool queue_dp = false;
 	bool queue_thermal = false;
 	u32 status, addr;
 
@@ -4784,7 +4855,7 @@ restart_ih:
 		return IRQ_NONE;
 
 	rptr = rdev->ih.rptr;
-	DRM_DEBUG("r600_irq_process start: rptr %d, wptr %d\n", rptr, wptr);
+	DRM_DEBUG("evergreen_irq_process start: rptr %d, wptr %d\n", rptr, wptr);
 
 	/* Order reading of wptr vs. reading of IH ring data */
 	rmb();
@@ -4802,23 +4873,27 @@ restart_ih:
 		case 1: /* D1 vblank/vline */
 			switch (src_data) {
 			case 0: /* D1 vblank */
-				if (rdev->irq.stat_regs.evergreen.disp_int & LB_D1_VBLANK_INTERRUPT) {
-					if (rdev->irq.crtc_vblank_int[0]) {
-						drm_handle_vblank(rdev->ddev, 0);
-						rdev->pm.vblank_sync = true;
-						wake_up(&rdev->irq.vblank_queue);
-					}
-					if (atomic_read(&rdev->irq.pflip[0]))
-						radeon_crtc_handle_vblank(rdev, 0);
-					rdev->irq.stat_regs.evergreen.disp_int &= ~LB_D1_VBLANK_INTERRUPT;
-					DRM_DEBUG("IH: D1 vblank\n");
+				if (!(rdev->irq.stat_regs.evergreen.disp_int & LB_D1_VBLANK_INTERRUPT))
+					DRM_DEBUG("IH: D1 vblank - IH event w/o asserted irq bit?\n");
+
+				if (rdev->irq.crtc_vblank_int[0]) {
+					drm_handle_vblank(rdev->ddev, 0);
+					rdev->pm.vblank_sync = true;
+					wake_up(&rdev->irq.vblank_queue);
 				}
+				if (atomic_read(&rdev->irq.pflip[0]))
+					radeon_crtc_handle_vblank(rdev, 0);
+				rdev->irq.stat_regs.evergreen.disp_int &= ~LB_D1_VBLANK_INTERRUPT;
+				DRM_DEBUG("IH: D1 vblank\n");
+
 				break;
 			case 1: /* D1 vline */
-				if (rdev->irq.stat_regs.evergreen.disp_int & LB_D1_VLINE_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int &= ~LB_D1_VLINE_INTERRUPT;
-					DRM_DEBUG("IH: D1 vline\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int & LB_D1_VLINE_INTERRUPT))
+					DRM_DEBUG("IH: D1 vline - IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int &= ~LB_D1_VLINE_INTERRUPT;
+				DRM_DEBUG("IH: D1 vline\n");
+
 				break;
 			default:
 				DRM_DEBUG("Unhandled interrupt: %d %d\n", src_id, src_data);
@@ -4828,23 +4903,27 @@ restart_ih:
 		case 2: /* D2 vblank/vline */
 			switch (src_data) {
 			case 0: /* D2 vblank */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont & LB_D2_VBLANK_INTERRUPT) {
-					if (rdev->irq.crtc_vblank_int[1]) {
-						drm_handle_vblank(rdev->ddev, 1);
-						rdev->pm.vblank_sync = true;
-						wake_up(&rdev->irq.vblank_queue);
-					}
-					if (atomic_read(&rdev->irq.pflip[1]))
-						radeon_crtc_handle_vblank(rdev, 1);
-					rdev->irq.stat_regs.evergreen.disp_int_cont &= ~LB_D2_VBLANK_INTERRUPT;
-					DRM_DEBUG("IH: D2 vblank\n");
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont & LB_D2_VBLANK_INTERRUPT))
+					DRM_DEBUG("IH: D2 vblank - IH event w/o asserted irq bit?\n");
+
+				if (rdev->irq.crtc_vblank_int[1]) {
+					drm_handle_vblank(rdev->ddev, 1);
+					rdev->pm.vblank_sync = true;
+					wake_up(&rdev->irq.vblank_queue);
 				}
+				if (atomic_read(&rdev->irq.pflip[1]))
+					radeon_crtc_handle_vblank(rdev, 1);
+				rdev->irq.stat_regs.evergreen.disp_int_cont &= ~LB_D2_VBLANK_INTERRUPT;
+				DRM_DEBUG("IH: D2 vblank\n");
+
 				break;
 			case 1: /* D2 vline */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont & LB_D2_VLINE_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont &= ~LB_D2_VLINE_INTERRUPT;
-					DRM_DEBUG("IH: D2 vline\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont & LB_D2_VLINE_INTERRUPT))
+					DRM_DEBUG("IH: D2 vline - IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont &= ~LB_D2_VLINE_INTERRUPT;
+				DRM_DEBUG("IH: D2 vline\n");
+
 				break;
 			default:
 				DRM_DEBUG("Unhandled interrupt: %d %d\n", src_id, src_data);
@@ -4854,23 +4933,27 @@ restart_ih:
 		case 3: /* D3 vblank/vline */
 			switch (src_data) {
 			case 0: /* D3 vblank */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont2 & LB_D3_VBLANK_INTERRUPT) {
-					if (rdev->irq.crtc_vblank_int[2]) {
-						drm_handle_vblank(rdev->ddev, 2);
-						rdev->pm.vblank_sync = true;
-						wake_up(&rdev->irq.vblank_queue);
-					}
-					if (atomic_read(&rdev->irq.pflip[2]))
-						radeon_crtc_handle_vblank(rdev, 2);
-					rdev->irq.stat_regs.evergreen.disp_int_cont2 &= ~LB_D3_VBLANK_INTERRUPT;
-					DRM_DEBUG("IH: D3 vblank\n");
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont2 & LB_D3_VBLANK_INTERRUPT))
+					DRM_DEBUG("IH: D3 vblank - IH event w/o asserted irq bit?\n");
+
+				if (rdev->irq.crtc_vblank_int[2]) {
+					drm_handle_vblank(rdev->ddev, 2);
+					rdev->pm.vblank_sync = true;
+					wake_up(&rdev->irq.vblank_queue);
 				}
+				if (atomic_read(&rdev->irq.pflip[2]))
+					radeon_crtc_handle_vblank(rdev, 2);
+				rdev->irq.stat_regs.evergreen.disp_int_cont2 &= ~LB_D3_VBLANK_INTERRUPT;
+				DRM_DEBUG("IH: D3 vblank\n");
+
 				break;
 			case 1: /* D3 vline */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont2 & LB_D3_VLINE_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont2 &= ~LB_D3_VLINE_INTERRUPT;
-					DRM_DEBUG("IH: D3 vline\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont2 & LB_D3_VLINE_INTERRUPT))
+					DRM_DEBUG("IH: D3 vline - IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont2 &= ~LB_D3_VLINE_INTERRUPT;
+				DRM_DEBUG("IH: D3 vline\n");
+
 				break;
 			default:
 				DRM_DEBUG("Unhandled interrupt: %d %d\n", src_id, src_data);
@@ -4880,23 +4963,27 @@ restart_ih:
 		case 4: /* D4 vblank/vline */
 			switch (src_data) {
 			case 0: /* D4 vblank */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont3 & LB_D4_VBLANK_INTERRUPT) {
-					if (rdev->irq.crtc_vblank_int[3]) {
-						drm_handle_vblank(rdev->ddev, 3);
-						rdev->pm.vblank_sync = true;
-						wake_up(&rdev->irq.vblank_queue);
-					}
-					if (atomic_read(&rdev->irq.pflip[3]))
-						radeon_crtc_handle_vblank(rdev, 3);
-					rdev->irq.stat_regs.evergreen.disp_int_cont3 &= ~LB_D4_VBLANK_INTERRUPT;
-					DRM_DEBUG("IH: D4 vblank\n");
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont3 & LB_D4_VBLANK_INTERRUPT))
+					DRM_DEBUG("IH: D4 vblank - IH event w/o asserted irq bit?\n");
+
+				if (rdev->irq.crtc_vblank_int[3]) {
+					drm_handle_vblank(rdev->ddev, 3);
+					rdev->pm.vblank_sync = true;
+					wake_up(&rdev->irq.vblank_queue);
 				}
+				if (atomic_read(&rdev->irq.pflip[3]))
+					radeon_crtc_handle_vblank(rdev, 3);
+				rdev->irq.stat_regs.evergreen.disp_int_cont3 &= ~LB_D4_VBLANK_INTERRUPT;
+				DRM_DEBUG("IH: D4 vblank\n");
+
 				break;
 			case 1: /* D4 vline */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont3 & LB_D4_VLINE_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont3 &= ~LB_D4_VLINE_INTERRUPT;
-					DRM_DEBUG("IH: D4 vline\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont3 & LB_D4_VLINE_INTERRUPT))
+					DRM_DEBUG("IH: D4 vline - IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont3 &= ~LB_D4_VLINE_INTERRUPT;
+				DRM_DEBUG("IH: D4 vline\n");
+
 				break;
 			default:
 				DRM_DEBUG("Unhandled interrupt: %d %d\n", src_id, src_data);
@@ -4906,23 +4993,27 @@ restart_ih:
 		case 5: /* D5 vblank/vline */
 			switch (src_data) {
 			case 0: /* D5 vblank */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont4 & LB_D5_VBLANK_INTERRUPT) {
-					if (rdev->irq.crtc_vblank_int[4]) {
-						drm_handle_vblank(rdev->ddev, 4);
-						rdev->pm.vblank_sync = true;
-						wake_up(&rdev->irq.vblank_queue);
-					}
-					if (atomic_read(&rdev->irq.pflip[4]))
-						radeon_crtc_handle_vblank(rdev, 4);
-					rdev->irq.stat_regs.evergreen.disp_int_cont4 &= ~LB_D5_VBLANK_INTERRUPT;
-					DRM_DEBUG("IH: D5 vblank\n");
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont4 & LB_D5_VBLANK_INTERRUPT))
+					DRM_DEBUG("IH: D5 vblank - IH event w/o asserted irq bit?\n");
+
+				if (rdev->irq.crtc_vblank_int[4]) {
+					drm_handle_vblank(rdev->ddev, 4);
+					rdev->pm.vblank_sync = true;
+					wake_up(&rdev->irq.vblank_queue);
 				}
+				if (atomic_read(&rdev->irq.pflip[4]))
+					radeon_crtc_handle_vblank(rdev, 4);
+				rdev->irq.stat_regs.evergreen.disp_int_cont4 &= ~LB_D5_VBLANK_INTERRUPT;
+				DRM_DEBUG("IH: D5 vblank\n");
+
 				break;
 			case 1: /* D5 vline */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont4 & LB_D5_VLINE_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont4 &= ~LB_D5_VLINE_INTERRUPT;
-					DRM_DEBUG("IH: D5 vline\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont4 & LB_D5_VLINE_INTERRUPT))
+					DRM_DEBUG("IH: D5 vline - IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont4 &= ~LB_D5_VLINE_INTERRUPT;
+				DRM_DEBUG("IH: D5 vline\n");
+
 				break;
 			default:
 				DRM_DEBUG("Unhandled interrupt: %d %d\n", src_id, src_data);
@@ -4932,23 +5023,27 @@ restart_ih:
 		case 6: /* D6 vblank/vline */
 			switch (src_data) {
 			case 0: /* D6 vblank */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont5 & LB_D6_VBLANK_INTERRUPT) {
-					if (rdev->irq.crtc_vblank_int[5]) {
-						drm_handle_vblank(rdev->ddev, 5);
-						rdev->pm.vblank_sync = true;
-						wake_up(&rdev->irq.vblank_queue);
-					}
-					if (atomic_read(&rdev->irq.pflip[5]))
-						radeon_crtc_handle_vblank(rdev, 5);
-					rdev->irq.stat_regs.evergreen.disp_int_cont5 &= ~LB_D6_VBLANK_INTERRUPT;
-					DRM_DEBUG("IH: D6 vblank\n");
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont5 & LB_D6_VBLANK_INTERRUPT))
+					DRM_DEBUG("IH: D6 vblank - IH event w/o asserted irq bit?\n");
+
+				if (rdev->irq.crtc_vblank_int[5]) {
+					drm_handle_vblank(rdev->ddev, 5);
+					rdev->pm.vblank_sync = true;
+					wake_up(&rdev->irq.vblank_queue);
 				}
+				if (atomic_read(&rdev->irq.pflip[5]))
+					radeon_crtc_handle_vblank(rdev, 5);
+				rdev->irq.stat_regs.evergreen.disp_int_cont5 &= ~LB_D6_VBLANK_INTERRUPT;
+				DRM_DEBUG("IH: D6 vblank\n");
+
 				break;
 			case 1: /* D6 vline */
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont5 & LB_D6_VLINE_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont5 &= ~LB_D6_VLINE_INTERRUPT;
-					DRM_DEBUG("IH: D6 vline\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont5 & LB_D6_VLINE_INTERRUPT))
+					DRM_DEBUG("IH: D6 vline - IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont5 &= ~LB_D6_VLINE_INTERRUPT;
+				DRM_DEBUG("IH: D6 vline\n");
+
 				break;
 			default:
 				DRM_DEBUG("Unhandled interrupt: %d %d\n", src_id, src_data);
@@ -4962,51 +5057,106 @@ restart_ih:
 		case 16: /* D5 page flip */
 		case 18: /* D6 page flip */
 			DRM_DEBUG("IH: D%d flip\n", ((src_id - 8) >> 1) + 1);
-			radeon_crtc_handle_flip(rdev, (src_id - 8) >> 1);
+			if (radeon_use_pflipirq > 0)
+				radeon_crtc_handle_flip(rdev, (src_id - 8) >> 1);
 			break;
 		case 42: /* HPD hotplug */
 			switch (src_data) {
 			case 0:
-				if (rdev->irq.stat_regs.evergreen.disp_int & DC_HPD1_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int &= ~DC_HPD1_INTERRUPT;
-					queue_hotplug = true;
-					DRM_DEBUG("IH: HPD1\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int & DC_HPD1_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int &= ~DC_HPD1_INTERRUPT;
+				queue_hotplug = true;
+				DRM_DEBUG("IH: HPD1\n");
 				break;
 			case 1:
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont & DC_HPD2_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont &= ~DC_HPD2_INTERRUPT;
-					queue_hotplug = true;
-					DRM_DEBUG("IH: HPD2\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont & DC_HPD2_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont &= ~DC_HPD2_INTERRUPT;
+				queue_hotplug = true;
+				DRM_DEBUG("IH: HPD2\n");
 				break;
 			case 2:
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont2 & DC_HPD3_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont2 &= ~DC_HPD3_INTERRUPT;
-					queue_hotplug = true;
-					DRM_DEBUG("IH: HPD3\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont2 & DC_HPD3_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont2 &= ~DC_HPD3_INTERRUPT;
+				queue_hotplug = true;
+				DRM_DEBUG("IH: HPD3\n");
 				break;
 			case 3:
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont3 & DC_HPD4_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont3 &= ~DC_HPD4_INTERRUPT;
-					queue_hotplug = true;
-					DRM_DEBUG("IH: HPD4\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont3 & DC_HPD4_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont3 &= ~DC_HPD4_INTERRUPT;
+				queue_hotplug = true;
+				DRM_DEBUG("IH: HPD4\n");
 				break;
 			case 4:
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont4 & DC_HPD5_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont4 &= ~DC_HPD5_INTERRUPT;
-					queue_hotplug = true;
-					DRM_DEBUG("IH: HPD5\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont4 & DC_HPD5_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont4 &= ~DC_HPD5_INTERRUPT;
+				queue_hotplug = true;
+				DRM_DEBUG("IH: HPD5\n");
 				break;
 			case 5:
-				if (rdev->irq.stat_regs.evergreen.disp_int_cont5 & DC_HPD6_INTERRUPT) {
-					rdev->irq.stat_regs.evergreen.disp_int_cont5 &= ~DC_HPD6_INTERRUPT;
-					queue_hotplug = true;
-					DRM_DEBUG("IH: HPD6\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont5 & DC_HPD6_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont5 &= ~DC_HPD6_INTERRUPT;
+				queue_hotplug = true;
+				DRM_DEBUG("IH: HPD6\n");
+				break;
+			case 6:
+				if (!(rdev->irq.stat_regs.evergreen.disp_int & DC_HPD1_RX_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int &= ~DC_HPD1_RX_INTERRUPT;
+				queue_dp = true;
+				DRM_DEBUG("IH: HPD_RX 1\n");
+				break;
+			case 7:
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont & DC_HPD2_RX_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont &= ~DC_HPD2_RX_INTERRUPT;
+				queue_dp = true;
+				DRM_DEBUG("IH: HPD_RX 2\n");
+				break;
+			case 8:
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont2 & DC_HPD3_RX_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont2 &= ~DC_HPD3_RX_INTERRUPT;
+				queue_dp = true;
+				DRM_DEBUG("IH: HPD_RX 3\n");
+				break;
+			case 9:
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont3 & DC_HPD4_RX_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont3 &= ~DC_HPD4_RX_INTERRUPT;
+				queue_dp = true;
+				DRM_DEBUG("IH: HPD_RX 4\n");
+				break;
+			case 10:
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont4 & DC_HPD5_RX_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont4 &= ~DC_HPD5_RX_INTERRUPT;
+				queue_dp = true;
+				DRM_DEBUG("IH: HPD_RX 5\n");
+				break;
+			case 11:
+				if (!(rdev->irq.stat_regs.evergreen.disp_int_cont5 & DC_HPD6_RX_INTERRUPT))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.disp_int_cont5 &= ~DC_HPD6_RX_INTERRUPT;
+				queue_dp = true;
+				DRM_DEBUG("IH: HPD_RX 6\n");
 				break;
 			default:
 				DRM_DEBUG("Unhandled interrupt: %d %d\n", src_id, src_data);
@@ -5016,51 +5166,61 @@ restart_ih:
 		case 44: /* hdmi */
 			switch (src_data) {
 			case 0:
-				if (rdev->irq.stat_regs.evergreen.afmt_status1 & AFMT_AZ_FORMAT_WTRIG) {
-					rdev->irq.stat_regs.evergreen.afmt_status1 &= ~AFMT_AZ_FORMAT_WTRIG;
-					queue_hdmi = true;
-					DRM_DEBUG("IH: HDMI0\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.afmt_status1 & AFMT_AZ_FORMAT_WTRIG))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.afmt_status1 &= ~AFMT_AZ_FORMAT_WTRIG;
+				queue_hdmi = true;
+				DRM_DEBUG("IH: HDMI0\n");
 				break;
 			case 1:
-				if (rdev->irq.stat_regs.evergreen.afmt_status2 & AFMT_AZ_FORMAT_WTRIG) {
-					rdev->irq.stat_regs.evergreen.afmt_status2 &= ~AFMT_AZ_FORMAT_WTRIG;
-					queue_hdmi = true;
-					DRM_DEBUG("IH: HDMI1\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.afmt_status2 & AFMT_AZ_FORMAT_WTRIG))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.afmt_status2 &= ~AFMT_AZ_FORMAT_WTRIG;
+				queue_hdmi = true;
+				DRM_DEBUG("IH: HDMI1\n");
 				break;
 			case 2:
-				if (rdev->irq.stat_regs.evergreen.afmt_status3 & AFMT_AZ_FORMAT_WTRIG) {
-					rdev->irq.stat_regs.evergreen.afmt_status3 &= ~AFMT_AZ_FORMAT_WTRIG;
-					queue_hdmi = true;
-					DRM_DEBUG("IH: HDMI2\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.afmt_status3 & AFMT_AZ_FORMAT_WTRIG))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.afmt_status3 &= ~AFMT_AZ_FORMAT_WTRIG;
+				queue_hdmi = true;
+				DRM_DEBUG("IH: HDMI2\n");
 				break;
 			case 3:
-				if (rdev->irq.stat_regs.evergreen.afmt_status4 & AFMT_AZ_FORMAT_WTRIG) {
-					rdev->irq.stat_regs.evergreen.afmt_status4 &= ~AFMT_AZ_FORMAT_WTRIG;
-					queue_hdmi = true;
-					DRM_DEBUG("IH: HDMI3\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.afmt_status4 & AFMT_AZ_FORMAT_WTRIG))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.afmt_status4 &= ~AFMT_AZ_FORMAT_WTRIG;
+				queue_hdmi = true;
+				DRM_DEBUG("IH: HDMI3\n");
 				break;
 			case 4:
-				if (rdev->irq.stat_regs.evergreen.afmt_status5 & AFMT_AZ_FORMAT_WTRIG) {
-					rdev->irq.stat_regs.evergreen.afmt_status5 &= ~AFMT_AZ_FORMAT_WTRIG;
-					queue_hdmi = true;
-					DRM_DEBUG("IH: HDMI4\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.afmt_status5 & AFMT_AZ_FORMAT_WTRIG))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.afmt_status5 &= ~AFMT_AZ_FORMAT_WTRIG;
+				queue_hdmi = true;
+				DRM_DEBUG("IH: HDMI4\n");
 				break;
 			case 5:
-				if (rdev->irq.stat_regs.evergreen.afmt_status6 & AFMT_AZ_FORMAT_WTRIG) {
-					rdev->irq.stat_regs.evergreen.afmt_status6 &= ~AFMT_AZ_FORMAT_WTRIG;
-					queue_hdmi = true;
-					DRM_DEBUG("IH: HDMI5\n");
-				}
+				if (!(rdev->irq.stat_regs.evergreen.afmt_status6 & AFMT_AZ_FORMAT_WTRIG))
+					DRM_DEBUG("IH: IH event w/o asserted irq bit?\n");
+
+				rdev->irq.stat_regs.evergreen.afmt_status6 &= ~AFMT_AZ_FORMAT_WTRIG;
+				queue_hdmi = true;
+				DRM_DEBUG("IH: HDMI5\n");
 				break;
 			default:
 				DRM_ERROR("Unhandled interrupt: %d %d\n", src_id, src_data);
 				break;
 			}
+		case 96:
+			DRM_ERROR("SRBM_READ_ERROR: 0x%x\n", RREG32(SRBM_READ_ERROR));
+			WREG32(SRBM_INT_ACK, 0x1);
+			break;
 		case 124: /* UVD */
 			DRM_DEBUG("IH: UVD int: 0x%08x\n", src_data);
 			radeon_fence_process(rdev, R600_RING_TYPE_UVD_INDEX);
@@ -5134,7 +5294,10 @@ restart_ih:
 		/* wptr/rptr are in bytes! */
 		rptr += 16;
 		rptr &= rdev->ih.ptr_mask;
+		WREG32(IH_RB_RPTR, rptr);
 	}
+	if (queue_dp)
+		schedule_work(&rdev->dp_work);
 	if (queue_hotplug)
 		schedule_work(&rdev->hotplug_work);
 	if (queue_hdmi)
@@ -5142,7 +5305,6 @@ restart_ih:
 	if (queue_thermal && rdev->pm.dpm_enabled)
 		schedule_work(&rdev->pm.dpm.thermal.work);
 	rdev->ih.rptr = rptr;
-	WREG32(IH_RB_RPTR, rdev->ih.rptr);
 	atomic_set(&rdev->ih.lock, 0);
 
 	/* make sure wptr hasn't changed while processing */
@@ -5282,7 +5444,7 @@ static int evergreen_startup(struct radeon_device *rdev)
 		return r;
 	}
 
-	r = r600_audio_init(rdev);
+	r = radeon_audio_init(rdev);
 	if (r) {
 		DRM_ERROR("radeon: audio init failed\n");
 		return r;
@@ -5328,7 +5490,7 @@ int evergreen_resume(struct radeon_device *rdev)
 int evergreen_suspend(struct radeon_device *rdev)
 {
 	radeon_pm_suspend(rdev);
-	r600_audio_fini(rdev);
+	radeon_audio_fini(rdev);
 	uvd_v1_0_fini(rdev);
 	radeon_uvd_suspend(rdev);
 	r700_cp_stop(rdev);
@@ -5478,7 +5640,7 @@ int evergreen_init(struct radeon_device *rdev)
 void evergreen_fini(struct radeon_device *rdev)
 {
 	radeon_pm_fini(rdev);
-	r600_audio_fini(rdev);
+	radeon_audio_fini(rdev);
 	r700_cp_fini(rdev);
 	r600_dma_fini(rdev);
 	r600_irq_fini(rdev);

@@ -22,16 +22,13 @@
  * functions
  */
 int mgag200_modeset = -1;
-int mgag200_preferred_depth __read_mostly = 0;
 
 MODULE_PARM_DESC(modeset, "Disable/Enable modesetting");
 module_param_named(modeset, mgag200_modeset, int, 0400);
-MODULE_PARM_DESC(preferreddepth, "Set preferred bpp");
-module_param_named(preferreddepth, mgag200_preferred_depth, int, 0400);
 
 static struct drm_driver driver;
 
-static DEFINE_PCI_DEVICE_TABLE(pciidlist) = {
+static const struct pci_device_id pciidlist[] = {
 	{ PCI_VENDOR_ID_MATROX, 0x522, PCI_ANY_ID, PCI_ANY_ID, 0, 0, G200_SE_A },
 	{ PCI_VENDOR_ID_MATROX, 0x524, PCI_ANY_ID, PCI_ANY_ID, 0, 0, G200_SE_B },
 	{ PCI_VENDOR_ID_MATROX, 0x530, PCI_ANY_ID, PCI_ANY_ID, 0, 0, G200_EV },
@@ -94,6 +91,7 @@ static struct drm_driver driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET,
 	.load = mgag200_driver_load,
 	.unload = mgag200_driver_unload,
+	.set_busid = drm_pci_set_busid,
 	.fops = &mgag200_driver_fops,
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
@@ -124,14 +122,6 @@ static int __init mgag200_init(void)
 
 	if (mgag200_modeset == 0)
 		return -EINVAL;
-	switch (mgag200_preferred_depth) {
-	case 0: /* driver default */
-	case 16:
-	case 24:
-		break;
-	default:
-		return -EINVAL;
-	}
 	return drm_pci_init(&driver, &mgag200_pci_driver);
 }
 

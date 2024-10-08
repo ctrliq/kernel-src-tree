@@ -59,6 +59,7 @@
 #include <linux/gfp.h>
 #include <linux/migrate.h>
 #include <linux/string.h>
+#include <linux/userfaultfd_k.h>
 
 #include <asm/io.h>
 #include <asm/pgalloc.h>
@@ -242,6 +243,7 @@ void tlb_flush_mmu(struct mmu_gather *tlb)
 		return;
 	tlb->need_flush = 0;
 	tlb_flush(tlb);
+	mmu_notifier_invalidate_range(tlb->mm, tlb->start, tlb->end);
 #ifdef CONFIG_HAVE_RCU_TABLE_FREE
 	tlb_table_flush(tlb);
 #endif
@@ -1494,7 +1496,21 @@ struct page *follow_page_mask(struct vm_area_struct *vma,
 
 	page = follow_huge_addr(mm, address, flags & FOLL_WRITE);
 	if (!IS_ERR(page)) {
-		BUG_ON(flags & FOLL_GET);
+		/*
+		 * RHEL: BZ1268999 quick-and-dirty-fix
+		 *
+		 * On powerpc a race between a THP pmd clear path and
+		 * follow_huge_addr() can result in follow_huge_addr()
+		 * returning NULL when a THP PMD has just been cleared
+		 * - usually follow_huge_addr() should return
+		 * ERR_PTR(-EINVAL) on a THP PMD.  This hack avoids
+		 * the BUG_ON() while waiting for a proper upstream
+		 * fix.  It will mean follow_page_mask() fails, but
+		 * should trigger a fall back to a faultin path which
+		 * should populate the pages.
+		 */
+		if (page)
+			BUG_ON(flags & FOLL_GET);
 		goto out;
 	}
 
@@ -1831,6 +1847,11 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 					fault_flags |= FAULT_FLAG_ALLOW_RETRY;
 				if (foll_flags & FOLL_NOWAIT)
 					fault_flags |= (FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_RETRY_NOWAIT);
+				if (foll_flags & FOLL_TRIED) {
+					WARN_ON_ONCE(fault_flags &
+						     FAULT_FLAG_ALLOW_RETRY);
+					fault_flags |= FAULT_FLAG_TRIED;
+				}
 
 				ret = handle_mm_fault(mm, vma, start,
 							fault_flags);
@@ -1965,6 +1986,185 @@ int fixup_user_fault(struct task_struct *tsk, struct mm_struct *mm,
 	return 0;
 }
 
+static __always_inline long __get_user_pages_locked(struct task_struct *tsk,
+						struct mm_struct *mm,
+						unsigned long start,
+						unsigned long nr_pages,
+						int write, int force,
+						struct page **pages,
+						struct vm_area_struct **vmas,
+						int *locked, bool notify_drop,
+						unsigned int flags)
+{
+	long ret, pages_done;
+	bool lock_dropped;
+
+	if (locked) {
+		/* if VM_FAULT_RETRY can be returned, vmas become invalid */
+		BUG_ON(vmas);
+		/* check caller initialized locked */
+		BUG_ON(*locked != 1);
+	}
+
+	if (pages)
+		flags |= FOLL_GET;
+	if (write)
+		flags |= FOLL_WRITE;
+	if (force)
+		flags |= FOLL_FORCE;
+
+	pages_done = 0;
+	lock_dropped = false;
+	for (;;) {
+		ret = __get_user_pages(tsk, mm, start, nr_pages, flags, pages,
+				       vmas, locked);
+		if (!locked)
+			/* VM_FAULT_RETRY couldn't trigger, bypass */
+			return ret;
+
+		/* VM_FAULT_RETRY cannot return errors */
+		if (!*locked) {
+			BUG_ON(ret < 0);
+			BUG_ON(ret >= nr_pages);
+		}
+
+		if (!pages)
+			/* If it's a prefault don't insist harder */
+			return ret;
+
+		if (ret > 0) {
+			nr_pages -= ret;
+			pages_done += ret;
+			if (!nr_pages)
+				break;
+		}
+		if (*locked) {
+			/* VM_FAULT_RETRY didn't trigger */
+			if (!pages_done)
+				pages_done = ret;
+			break;
+		}
+		/* VM_FAULT_RETRY triggered, so seek to the faulting offset */
+		pages += ret;
+		start += ret << PAGE_SHIFT;
+
+		/*
+		 * Repeat on the address that fired VM_FAULT_RETRY
+		 * without FAULT_FLAG_ALLOW_RETRY but with
+		 * FAULT_FLAG_TRIED.
+		 */
+		*locked = 1;
+		lock_dropped = true;
+		down_read(&mm->mmap_sem);
+		ret = __get_user_pages(tsk, mm, start, 1, flags | FOLL_TRIED,
+				       pages, NULL, NULL);
+		if (ret != 1) {
+			BUG_ON(ret > 1);
+			if (!pages_done)
+				pages_done = ret;
+			break;
+		}
+		nr_pages--;
+		pages_done++;
+		if (!nr_pages)
+			break;
+		pages++;
+		start += PAGE_SIZE;
+	}
+	if (notify_drop && lock_dropped && *locked) {
+		/*
+		 * We must let the caller know we temporarily dropped the lock
+		 * and so the critical section protected by it was lost.
+		 */
+		up_read(&mm->mmap_sem);
+		*locked = 0;
+	}
+	return pages_done;
+}
+
+/*
+ * We can leverage the VM_FAULT_RETRY functionality in the page fault
+ * paths better by using either get_user_pages_locked() or
+ * get_user_pages_unlocked().
+ *
+ * get_user_pages_locked() is suitable to replace the form:
+ *
+ *      down_read(&mm->mmap_sem);
+ *      do_something()
+ *      get_user_pages(tsk, mm, ..., pages, NULL);
+ *      up_read(&mm->mmap_sem);
+ *
+ *  to:
+ *
+ *      int locked = 1;
+ *      down_read(&mm->mmap_sem);
+ *      do_something()
+ *      get_user_pages_locked(tsk, mm, ..., pages, &locked);
+ *      if (locked)
+ *          up_read(&mm->mmap_sem);
+ */
+long get_user_pages_locked(struct task_struct *tsk, struct mm_struct *mm,
+			   unsigned long start, unsigned long nr_pages,
+			   int write, int force, struct page **pages,
+			   int *locked)
+{
+	return __get_user_pages_locked(tsk, mm, start, nr_pages, write, force,
+				       pages, NULL, locked, true, FOLL_TOUCH);
+}
+EXPORT_SYMBOL(get_user_pages_locked);
+
+/*
+ * Same as get_user_pages_unlocked(...., FOLL_TOUCH) but it allows to
+ * pass additional gup_flags as last parameter (like FOLL_HWPOISON).
+ *
+ * NOTE: here FOLL_TOUCH is not set implicitly and must be set by the
+ * caller if required (just like with __get_user_pages). "FOLL_GET",
+ * "FOLL_WRITE" and "FOLL_FORCE" are set implicitly as needed
+ * according to the parameters "pages", "write", "force"
+ * respectively.
+ */
+__always_inline long __get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
+					       unsigned long start, unsigned long nr_pages,
+					       int write, int force, struct page **pages,
+					       unsigned int gup_flags)
+{
+	long ret;
+	int locked = 1;
+	down_read(&mm->mmap_sem);
+	ret = __get_user_pages_locked(tsk, mm, start, nr_pages, write, force,
+				      pages, NULL, &locked, false, gup_flags);
+	if (locked)
+		up_read(&mm->mmap_sem);
+	return ret;
+}
+EXPORT_SYMBOL(__get_user_pages_unlocked);
+
+/*
+ * get_user_pages_unlocked() is suitable to replace the form:
+ *
+ *      down_read(&mm->mmap_sem);
+ *      get_user_pages(tsk, mm, ..., pages, NULL);
+ *      up_read(&mm->mmap_sem);
+ *
+ *  with:
+ *
+ *      get_user_pages_unlocked(tsk, mm, ..., pages);
+ *
+ * It is functionally equivalent to get_user_pages_fast so
+ * get_user_pages_fast should be used instead, if the two parameters
+ * "tsk" and "mm" are respectively equal to current and current->mm,
+ * or if "force" shall be set to 1 (get_user_pages_fast misses the
+ * "force" parameter).
+ */
+long get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
+			     unsigned long start, unsigned long nr_pages,
+			     int write, int force, struct page **pages)
+{
+	return __get_user_pages_unlocked(tsk, mm, start, nr_pages, write,
+					 force, pages, FOLL_TOUCH);
+}
+EXPORT_SYMBOL(get_user_pages_unlocked);
+
 /*
  * get_user_pages() - pin user pages in memory
  * @tsk:	the task_struct to use for page fault accounting, or
@@ -2015,22 +2215,18 @@ int fixup_user_fault(struct task_struct *tsk, struct mm_struct *mm,
  * use the correct cache flushing APIs.
  *
  * See also get_user_pages_fast, for performance critical applications.
+ *
+ * get_user_pages should be phased out in favor of
+ * get_user_pages_locked|unlocked or get_user_pages_fast. Nothing
+ * should use get_user_pages because it cannot pass
+ * FAULT_FLAG_ALLOW_RETRY to handle_mm_fault.
  */
 long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		unsigned long start, unsigned long nr_pages, int write,
 		int force, struct page **pages, struct vm_area_struct **vmas)
 {
-	int flags = FOLL_TOUCH;
-
-	if (pages)
-		flags |= FOLL_GET;
-	if (write)
-		flags |= FOLL_WRITE;
-	if (force)
-		flags |= FOLL_FORCE;
-
-	return __get_user_pages(tsk, mm, start, nr_pages, flags, pages, vmas,
-				NULL);
+	return __get_user_pages_locked(tsk, mm, start, nr_pages, write, force,
+				       pages, vmas, NULL, false, FOLL_TOUCH);
 }
 EXPORT_SYMBOL(get_user_pages);
 
@@ -2835,7 +3031,7 @@ gotten:
 		 * seen in the presence of one thread doing SMC and another
 		 * thread doing COW.
 		 */
-		ptep_clear_flush(vma, address, page_table);
+		ptep_clear_flush_notify(vma, address, page_table);
 		page_add_new_anon_rmap(new_page, vma, address);
 		/*
 		 * We call the notify macro here because, when using secondary
@@ -3235,6 +3431,10 @@ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 
 	pte_unmap(page_table);
 
+	/* File mapping without ->vm_ops ? */
+	if (vma->vm_flags & VM_SHARED)
+		return VM_FAULT_SIGBUS;
+
 	/* Check if we need to add a guard page to the stack */
 	if (check_stack_guard_page(vma, address) < 0)
 		return VM_FAULT_SIGBUS;
@@ -3246,6 +3446,12 @@ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
 		if (!pte_none(*page_table))
 			goto unlock;
+		/* Deliver the page fault to userland, check inside PT lock */
+		if (userfaultfd_missing(vma)) {
+			pte_unmap_unlock(page_table, ptl);
+			return handle_userfault(vma, address, flags,
+						VM_UFFD_MISSING);
+		}
 		goto setpte;
 	}
 
@@ -3272,6 +3478,15 @@ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
 	if (!pte_none(*page_table))
 		goto release;
+
+	/* Deliver the page fault to userland, check inside PT lock */
+	if (userfaultfd_missing(vma)) {
+		pte_unmap_unlock(page_table, ptl);
+		mem_cgroup_uncharge_page(page);
+		page_cache_release(page);
+		return handle_userfault(vma, address, flags,
+					VM_UFFD_MISSING);
+	}
 
 	inc_mm_counter_fast(mm, MM_ANONPAGES);
 	page_add_new_anon_rmap(page, vma, address);
@@ -3500,6 +3715,9 @@ static int do_linear_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 			- vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
 
 	pte_unmap(page_table);
+	/* The VMA was not fully populated on mmap() or missing VM_DONTEXPAND */
+	if (!vma->vm_ops->fault)
+		return VM_FAULT_SIGBUS;
 	return __do_fault(mm, vma, address, pmd, pgoff, flags, orig_pte);
 }
 
@@ -3560,9 +3778,6 @@ int do_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	int target_nid;
 	bool migrated = false;
 	int flags = 0;
-
-	/* A PROT_NONE fault should not end up here */
-	BUG_ON(!(vma->vm_flags & (VM_READ | VM_EXEC | VM_WRITE)));
 
 	/*
 	* The "pte" at this point cannot be used safely without
@@ -3651,11 +3866,9 @@ static int handle_pte_fault(struct mm_struct *mm,
 	entry = *pte;
 	if (!pte_present(entry)) {
 		if (pte_none(entry)) {
-			if (vma->vm_ops) {
-				if (likely(vma->vm_ops->fault))
-					return do_linear_fault(mm, vma, address,
+			if (vma->vm_ops)
+				return do_linear_fault(mm, vma, address,
 						pte, pmd, flags, entry);
-			}
 			return do_anonymous_page(mm, vma, address,
 						 pte, pmd, flags);
 		}
@@ -3779,6 +3992,7 @@ static int __handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 
 	return handle_pte_fault(mm, vma, address, pte, pmd, flags);
 }
+EXPORT_SYMBOL_GPL(handle_mm_fault);
 
 int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 		    unsigned long address, unsigned int flags)
@@ -3816,7 +4030,6 @@ int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(handle_mm_fault);
 
 #ifndef __PAGETABLE_PUD_FOLDED
 /*

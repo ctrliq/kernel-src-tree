@@ -49,7 +49,8 @@ static unsigned long __initdata default_hstate_max_huge_pages;
 static unsigned long __initdata default_hstate_size;
 
 /*
- * Protects updates to hugepage_freelists, nr_huge_pages, and free_huge_pages
+ * Protects updates to hugepage_freelists, hugepage_activelist, nr_huge_pages,
+ * free_huge_pages, and surplus_huge_pages.
  */
 DEFINE_SPINLOCK(hugetlb_lock);
 
@@ -142,15 +143,8 @@ static inline struct hugepage_subpool *subpool_vma(struct vm_area_struct *vma)
  * Region tracking -- allows tracking of reservations and instantiated pages
  *                    across the pages in a mapping.
  *
- * The region data structures are protected by a combination of the mmap_sem
- * and the hugetlb_instantion_mutex.  To access or modify a region the caller
- * must either hold the mmap_sem for write, or the mmap_sem for read and
- * the hugetlb_instantiation mutex:
- *
- *	down_write(&mm->mmap_sem);
- * or
- *	down_read(&mm->mmap_sem);
- *	mutex_lock(&hugetlb_instantiation_mutex);
+ * The region data structures are embedded into a resv_map and
+ * protected by a resv_map's lock
  */
 struct file_region {
 	struct list_head link;
@@ -158,10 +152,12 @@ struct file_region {
 	long to;
 };
 
-static long region_add(struct list_head *head, long f, long t)
+static long region_add(struct resv_map *resv, long f, long t)
 {
+	struct list_head *head = &resv->regions;
 	struct file_region *rg, *nrg, *trg;
 
+	spin_lock(&resv->lock);
 	/* Locate the region we are either in or before. */
 	list_for_each_entry(rg, head, link)
 		if (f <= rg->to)
@@ -191,14 +187,18 @@ static long region_add(struct list_head *head, long f, long t)
 	}
 	nrg->from = f;
 	nrg->to = t;
+	spin_unlock(&resv->lock);
 	return 0;
 }
 
-static long region_chg(struct list_head *head, long f, long t)
+static long region_chg(struct resv_map *resv, long f, long t)
 {
-	struct file_region *rg, *nrg;
+	struct list_head *head = &resv->regions;
+	struct file_region *rg, *nrg = NULL;
 	long chg = 0;
 
+retry:
+	spin_lock(&resv->lock);
 	/* Locate the region we are before or in. */
 	list_for_each_entry(rg, head, link)
 		if (f <= rg->to)
@@ -208,15 +208,21 @@ static long region_chg(struct list_head *head, long f, long t)
 	 * Subtle, allocate a new region at the position but make it zero
 	 * size such that we can guarantee to record the reservation. */
 	if (&rg->link == head || t < rg->from) {
-		nrg = kmalloc(sizeof(*nrg), GFP_KERNEL);
-		if (!nrg)
-			return -ENOMEM;
-		nrg->from = f;
-		nrg->to   = f;
-		INIT_LIST_HEAD(&nrg->link);
-		list_add(&nrg->link, rg->link.prev);
+		if (!nrg) {
+			spin_unlock(&resv->lock);
+			nrg = kmalloc(sizeof(*nrg), GFP_KERNEL);
+			if (!nrg)
+				return -ENOMEM;
 
-		return t - f;
+			nrg->from = f;
+			nrg->to   = f;
+			INIT_LIST_HEAD(&nrg->link);
+			goto retry;
+		}
+
+		list_add(&nrg->link, rg->link.prev);
+		chg = t - f;
+		goto out_nrg;
 	}
 
 	/* Round our left edge to the current segment if it encloses us. */
@@ -229,7 +235,7 @@ static long region_chg(struct list_head *head, long f, long t)
 		if (&rg->link == head)
 			break;
 		if (rg->from > t)
-			return chg;
+			goto out;
 
 		/* We overlap with this area, if it extends further than
 		 * us then we must extend ourselves.  Account for its
@@ -240,20 +246,30 @@ static long region_chg(struct list_head *head, long f, long t)
 		}
 		chg -= rg->to - rg->from;
 	}
+
+out:
+	spin_unlock(&resv->lock);
+	/*  We already know we raced and no longer need the new region */
+	kfree(nrg);
+	return chg;
+out_nrg:
+	spin_unlock(&resv->lock);
 	return chg;
 }
 
-static long region_truncate(struct list_head *head, long end)
+static long region_truncate(struct resv_map *resv, long end)
 {
+	struct list_head *head = &resv->regions;
 	struct file_region *rg, *trg;
 	long chg = 0;
 
+	spin_lock(&resv->lock);
 	/* Locate the region we are either in or before. */
 	list_for_each_entry(rg, head, link)
 		if (end <= rg->to)
 			break;
 	if (&rg->link == head)
-		return 0;
+		goto out;
 
 	/* If we are in the middle of a region then adjust it. */
 	if (end > rg->from) {
@@ -270,14 +286,19 @@ static long region_truncate(struct list_head *head, long end)
 		list_del(&rg->link);
 		kfree(rg);
 	}
+
+out:
+	spin_unlock(&resv->lock);
 	return chg;
 }
 
-static long region_count(struct list_head *head, long f, long t)
+static long region_count(struct resv_map *resv, long f, long t)
 {
+	struct list_head *head = &resv->regions;
 	struct file_region *rg;
 	long chg = 0;
 
+	spin_lock(&resv->lock);
 	/* Locate each segment we overlap with, and count that overlap. */
 	list_for_each_entry(rg, head, link) {
 		long seg_from;
@@ -293,6 +314,7 @@ static long region_count(struct list_head *head, long f, long t)
 
 		chg += seg_to - seg_from;
 	}
+	spin_unlock(&resv->lock);
 
 	return chg;
 }
@@ -390,6 +412,7 @@ struct resv_map *resv_map_alloc(void)
 		return NULL;
 
 	kref_init(&resv_map->refs);
+	spin_lock_init(&resv_map->lock);
 	INIT_LIST_HEAD(&resv_map->regions);
 
 	return resv_map;
@@ -400,7 +423,7 @@ void resv_map_release(struct kref *ref)
 	struct resv_map *resv_map = container_of(ref, struct resv_map, refs);
 
 	/* Clear out any active regions before we release the map. */
-	region_truncate(&resv_map->regions, 0);
+	region_truncate(resv_map, 0);
 	kfree(resv_map);
 }
 
@@ -806,6 +829,31 @@ struct hstate *size_to_hstate(unsigned long size)
 	return NULL;
 }
 
+/*
+ * Test to determine whether the hugepage is "active/in-use" (i.e. being linked
+ * to hstate->hugepage_activelist.)
+ *
+ * This function can be called for tail pages, but never returns true for them.
+ */
+bool page_huge_active(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageHuge(page), page);
+	return PageHead(page) && PagePrivate(&page[1]);
+}
+
+/* never called for tail page */
+static void set_page_huge_active(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageHeadHuge(page), page);
+	SetPagePrivate(&page[1]);
+}
+
+static void clear_page_huge_active(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageHeadHuge(page), page);
+	ClearPagePrivate(&page[1]);
+}
+
 void free_huge_page(struct page *page)
 {
 	/*
@@ -826,6 +874,7 @@ void free_huge_page(struct page *page)
 	ClearPagePrivate(page);
 
 	spin_lock(&hugetlb_lock);
+	clear_page_huge_active(page);
 	hugetlb_cgroup_uncharge_page(hstate_index(h),
 				     pages_per_huge_page(h), page);
 	if (restore_reserve)
@@ -1260,7 +1309,7 @@ static long vma_needs_reservation(struct hstate *h,
 		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
 		struct resv_map *resv = inode->i_mapping->private_data;
 
-		return region_chg(&resv->regions, idx, idx + 1);
+		return region_chg(resv, idx, idx + 1);
 
 	} else if (!is_vma_resv_set(vma, HPAGE_RESV_OWNER)) {
 		return 1;
@@ -1270,7 +1319,7 @@ static long vma_needs_reservation(struct hstate *h,
 		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
 		struct resv_map *reservations = vma_resv_map(vma);
 
-		err = region_chg(&reservations->regions, idx, idx + 1);
+		err = region_chg(reservations, idx, idx + 1);
 		if (err < 0)
 			return err;
 		return 0;
@@ -1286,14 +1335,14 @@ static void vma_commit_reservation(struct hstate *h,
 		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
 		struct resv_map *resv = inode->i_mapping->private_data;
 
-		region_add(&resv->regions, idx, idx + 1);
+		region_add(resv, idx, idx + 1);
 
 	} else if (is_vma_resv_set(vma, HPAGE_RESV_OWNER)) {
 		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
 		struct resv_map *reservations = vma_resv_map(vma);
 
 		/* Mark this page used in the map. */
-		region_add(&reservations->regions, idx, idx + 1);
+		region_add(reservations, idx, idx + 1);
 	}
 }
 
@@ -2409,7 +2458,7 @@ static void hugetlb_vm_op_close(struct vm_area_struct *vma)
 		end = vma_hugecache_offset(h, vma, vma->vm_end);
 
 		reserve = (end - start) -
-			region_count(&reservations->regions, start, end);
+			region_count(reservations, start, end);
 
 		resv_map_put(vma);
 
@@ -2507,8 +2556,11 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
 		src_ptl = huge_pte_lockptr(h, src, src_pte);
 		spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
 		if (!huge_pte_none(huge_ptep_get(src_pte))) {
-			if (cow)
+			if (cow) {
 				huge_ptep_set_wrprotect(src, addr, src_pte);
+				mmu_notifier_invalidate_range(src, mmun_start,
+							      mmun_end);
+			}
 			entry = huge_ptep_get(src_pte);
 			ptepage = pte_page(entry);
 			get_page(ptepage);
@@ -2827,6 +2879,7 @@ retry_avoidcopy:
 	copy_user_huge_page(new_page, old_page, address, vma,
 			    pages_per_huge_page(h));
 	__SetPageUptodate(new_page);
+	set_page_huge_active(new_page);
 
 	mmun_start = address & huge_page_mask(h);
 	mmun_end = mmun_start + huge_page_size(h);
@@ -2842,6 +2895,7 @@ retry_avoidcopy:
 
 		/* Break COW */
 		huge_ptep_clear_flush(vma, address, ptep);
+		mmu_notifier_invalidate_range(mm, mmun_start, mmun_end);
 		set_huge_pte_at(mm, address, ptep,
 				make_huge_pte(vma, new_page, 1));
 		page_remove_rmap(old_page);
@@ -2936,6 +2990,7 @@ retry:
 		}
 		clear_huge_page(page, address, pages_per_huge_page(h));
 		__SetPageUptodate(page);
+		set_page_huge_active(page);
 
 		if (vma->vm_flags & VM_MAYSHARE) {
 			int err;
@@ -3325,6 +3380,7 @@ unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
 	 * and that page table be reused and filled with junk.
 	 */
 	flush_tlb_range(vma, start, end);
+	mmu_notifier_invalidate_range(mm, start, end);
 	mutex_unlock(&vma->vm_file->f_mapping->i_mmap_mutex);
 
 	return pages << h->order;
@@ -3357,7 +3413,7 @@ int hugetlb_reserve_pages(struct inode *inode,
 	if (!vma || vma->vm_flags & VM_MAYSHARE) {
 		resv_map = inode->i_mapping->private_data;
 
-		chg = region_chg(&resv_map->regions, from, to);
+		chg = region_chg(resv_map, from, to);
 
 	} else {
 		resv_map = resv_map_alloc();
@@ -3403,7 +3459,7 @@ int hugetlb_reserve_pages(struct inode *inode,
 	 * else has to be done for private mappings here
 	 */
 	if (!vma || vma->vm_flags & VM_MAYSHARE)
-		region_add(&resv_map->regions, from, to);
+		region_add(resv_map, from, to);
 	return 0;
 out_err:
 	if (vma)
@@ -3419,7 +3475,7 @@ void hugetlb_unreserve_pages(struct inode *inode, long offset, long freed)
 	struct hugepage_subpool *spool = subpool_inode(inode);
 
 	if (resv_map)
-		chg = region_truncate(&resv_map->regions, offset);
+		chg = region_truncate(resv_map, offset);
 	spin_lock(&inode->i_lock);
 	inode->i_blocks -= (blocks_per_huge_page(h) * freed);
 	spin_unlock(&inode->i_lock);
@@ -3429,20 +3485,6 @@ void hugetlb_unreserve_pages(struct inode *inode, long offset, long freed)
 }
 
 #ifdef CONFIG_MEMORY_FAILURE
-
-/* Should be called in hugetlb_lock */
-static int is_hugepage_on_freelist(struct page *hpage)
-{
-	struct page *page;
-	struct page *tmp;
-	struct hstate *h = page_hstate(hpage);
-	int nid = page_to_nid(hpage);
-
-	list_for_each_entry_safe(page, tmp, &h->hugepage_freelists[nid], lru)
-		if (page == hpage)
-			return 1;
-	return 0;
-}
 
 /*
  * This function is called from memory failure code.
@@ -3455,7 +3497,11 @@ int dequeue_hwpoisoned_huge_page(struct page *hpage)
 	int ret = -EBUSY;
 
 	spin_lock(&hugetlb_lock);
-	if (is_hugepage_on_freelist(hpage)) {
+	/*
+	 * Just checking !page_huge_active is not enough, because that could be
+	 * an isolated/hwpoisoned hugepage (which have >0 refcount).
+	 */
+	if (!page_huge_active(hpage) && !page_count(hpage)) {
 		/*
 		 * Hwpoisoned hugepage isn't linked to activelist or freelist,
 		 * but dangling hpage->lru can trigger list-debug warnings
@@ -3472,3 +3518,30 @@ int dequeue_hwpoisoned_huge_page(struct page *hpage)
 	return ret;
 }
 #endif
+
+bool isolate_huge_page(struct page *page, struct list_head *list)
+{
+	bool ret = true;
+
+	VM_BUG_ON_PAGE(!PageHead(page), page);
+	spin_lock(&hugetlb_lock);
+	if (!page_huge_active(page) || !get_page_unless_zero(page)) {
+		ret = false;
+		goto unlock;
+	}
+	clear_page_huge_active(page);
+	list_move_tail(&page->lru, list);
+unlock:
+	spin_unlock(&hugetlb_lock);
+	return ret;
+}
+
+void putback_active_hugepage(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageHead(page), page);
+	spin_lock(&hugetlb_lock);
+	set_page_huge_active(page);
+	list_move_tail(&page->lru, &(page_hstate(page))->hugepage_activelist);
+	spin_unlock(&hugetlb_lock);
+	put_page(page);
+}

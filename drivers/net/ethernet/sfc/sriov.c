@@ -11,8 +11,6 @@
 #include "nic.h"
 #include "sriov.h"
 
-#ifdef CONFIG_SFC_SRIOV
-
 int efx_sriov_set_vf_mac(struct net_device *net_dev, int vf_i, u8 *mac)
 {
 	struct efx_nic *efx = netdev_priv(net_dev);
@@ -61,4 +59,25 @@ int efx_sriov_get_vf_config(struct net_device *net_dev, int vf_i,
 		return -EOPNOTSUPP;
 }
 
-#endif
+int efx_sriov_set_vf_link_state(struct net_device *net_dev, int vf_i,
+				int link_state)
+{
+	struct efx_nic *efx = netdev_priv(net_dev);
+
+	if (efx->type->sriov_set_vf_link_state)
+		return efx->type->sriov_set_vf_link_state(efx, vf_i,
+							  link_state);
+	else
+		return -EOPNOTSUPP;
+}
+
+int efx_sriov_get_phys_port_id(struct net_device *net_dev,
+			       struct netdev_phys_port_id *ppid)
+{
+	struct efx_nic *efx = netdev_priv(net_dev);
+
+	if (efx->type->sriov_get_phys_port_id)
+		return efx->type->sriov_get_phys_port_id(efx, ppid);
+	else
+		return -EOPNOTSUPP;
+}

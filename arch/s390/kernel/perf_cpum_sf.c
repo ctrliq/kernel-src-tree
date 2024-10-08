@@ -558,16 +558,12 @@ static DEFINE_MUTEX(pmc_reserve_mutex);
 
 #define PMC_INIT      0
 #define PMC_RELEASE   1
+#define PMC_FAILURE   2
 static void setup_pmc_cpu(void *flags)
 {
 	int err;
 	struct cpu_hw_sf *cpusf = &__get_cpu_var(cpu_hw_sf);
 
-	/* XXX Improve error handling and pass a flag in the *flags
-	 *     variable to indicate failures.  Alternatively, ignore
-	 *     (print) errors here and let the PMU functions fail if
-	 *     the per-cpu PMU_F_RESERVED flag is not.
-	 */
 	err = 0;
 	switch (*((int *) flags)) {
 	case PMC_INIT:
@@ -595,6 +591,8 @@ static void setup_pmc_cpu(void *flags)
 				    "setup_pmc_cpu: released: cpuhw=%p\n", cpusf);
 		break;
 	}
+	if (err)
+		*((int *) flags) |= PMC_FAILURE;
 }
 
 static void release_pmc_hardware(void)
@@ -603,13 +601,22 @@ static void release_pmc_hardware(void)
 
 	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
 	on_each_cpu(setup_pmc_cpu, &flags, 1);
+	perf_release_sampling();
 }
 
 static int reserve_pmc_hardware(void)
 {
 	int flags = PMC_INIT;
+	int err;
 
+	err = perf_reserve_sampling();
+	if (err)
+		return err;
 	on_each_cpu(setup_pmc_cpu, &flags, 1);
+	if (flags & PMC_FAILURE) {
+		release_pmc_hardware();
+		return -ENODEV;
+	}
 	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
 
 	return 0;
@@ -980,14 +987,16 @@ static int perf_push_sample(struct perf_event *event, struct sf_raw_sample *sfr)
 	raw.data = sfr;
 	data.raw = &raw;
 
-	/* Setup pt_regs to look like an CPU-measurement external interrupt
-	 * using the Program Request Alert code.  The regs.int_parm_long
-	 * field which is unused contains additional sample-data-entry related
-	 * indicators.
+	/* Setup pt_regs to look like an CPU-measurement external interrupt.
+	 * To later detect an embedded perf_sf_sde_regs structure, mark the
+	 * PSW with the PERF_CPUM_SF_PSW_MASK.  This actually generates a
+	 * PSW mask that does not occur in normal cases.
+	 * The regs.int_parm_long field which is unused contains additional
+	 * sample-data-entry related indicators.
 	 */
 	memset(&regs, 0, sizeof(regs));
 	regs.int_code = 0x1407;
-	regs.int_parm = CPU_MF_INT_SF_PRA;
+	regs.psw.mask |= PERF_CPUM_SF_PSW_MASK;
 	sde_regs = (struct perf_sf_sde_regs *) &regs.int_parm_long;
 
 	regs.psw.addr = sfr->basic.ia;
@@ -1501,8 +1510,8 @@ static void cpumf_measurement_alert(struct ext_code ext_code,
 	}
 }
 
-static int __cpuinit cpumf_pmu_notifier(struct notifier_block *self,
-					unsigned long action, void *hcpu)
+static int cpumf_pmu_notifier(struct notifier_block *self,
+			      unsigned long action, void *hcpu)
 {
 	unsigned int cpu = (long) hcpu;
 	int flags;
@@ -1610,7 +1619,8 @@ static int __init init_cpum_sampling_pmu(void)
 		pr_err("Registering for s390dbf failed\n");
 	debug_register_view(sfdbg, &debug_sprintf_view);
 
-	err = register_external_interrupt(0x1407, cpumf_measurement_alert);
+	err = register_external_irq(EXT_IRQ_MEASURE_ALERT,
+				    cpumf_measurement_alert);
 	if (err) {
 		pr_cpumsf_err(RS_INIT_FAILURE_ALRT);
 		goto out;
@@ -1619,7 +1629,8 @@ static int __init init_cpum_sampling_pmu(void)
 	err = perf_pmu_register(&cpumf_sampling, "cpum_sf", PERF_TYPE_RAW);
 	if (err) {
 		pr_cpumsf_err(RS_INIT_FAILURE_PERF);
-		unregister_external_interrupt(0x1407, cpumf_measurement_alert);
+		unregister_external_irq(EXT_IRQ_MEASURE_ALERT,
+					cpumf_measurement_alert);
 		goto out;
 	}
 	perf_cpu_notifier(cpumf_pmu_notifier);

@@ -34,7 +34,7 @@ static int nf_ct_ipv4_gather_frags(struct sk_buff *skb, u_int32_t user)
 
 	if (!err) {
 		ip_send_check(ip_hdr(skb));
-		skb->local_df = 1;
+		skb->ignore_df = 1;
 	}
 
 	return err;
@@ -65,7 +65,7 @@ static unsigned int ipv4_conntrack_defrag(const struct nf_hook_ops *ops,
 					  struct sk_buff *skb,
 					  const struct net_device *in,
 					  const struct net_device *out,
-					  int (*okfn)(struct sk_buff *))
+					  const struct nf_hook_state *state)
 {
 	struct sock *sk = skb->sk;
 	struct inet_sock *inet = inet_sk(skb->sk);

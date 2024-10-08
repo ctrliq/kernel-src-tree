@@ -2755,7 +2755,7 @@
 #define MC_CMD_0x2e_PRIVILEGE_CTG SRIOV_CTG_GENERAL
 
 /* MC_CMD_MAC_STATS_IN msgrequest */
-#define    MC_CMD_MAC_STATS_IN_LEN 16
+#define    MC_CMD_MAC_STATS_IN_LEN 20
 /* ??? */
 #define       MC_CMD_MAC_STATS_IN_DMA_ADDR_OFST 0
 #define       MC_CMD_MAC_STATS_IN_DMA_ADDR_LEN 8
@@ -2777,6 +2777,8 @@
 #define        MC_CMD_MAC_STATS_IN_PERIOD_MS_LBN 16
 #define        MC_CMD_MAC_STATS_IN_PERIOD_MS_WIDTH 16
 #define       MC_CMD_MAC_STATS_IN_DMA_LEN_OFST 12
+/* port id so vadapter stats can be provided */
+#define       MC_CMD_MAC_STATS_IN_PORT_ID_OFST 16
 
 /* MC_CMD_MAC_STATS_OUT_DMA msgresponse */
 #define    MC_CMD_MAC_STATS_OUT_DMA_LEN 0
@@ -4244,6 +4246,38 @@
 #define          MC_CMD_GET_WORKAROUNDS_OUT_BUG35388 0x4
 /* enum: Bug35017 workaround (A64 tables must be identity map) */
 #define          MC_CMD_GET_WORKAROUNDS_OUT_BUG35017 0x8
+
+
+/***********************************/
+/* MC_CMD_LINK_STATE_MODE
+ * Read/set link state mode of a VF
+ */
+#define MC_CMD_LINK_STATE_MODE 0x5c
+
+#define MC_CMD_0x5c_PRIVILEGE_CTG SRIOV_CTG_GENERAL
+
+/* MC_CMD_LINK_STATE_MODE_IN msgrequest */
+#define    MC_CMD_LINK_STATE_MODE_IN_LEN 8
+/* The target function to have its link state mode read or set, must be a VF
+ * e.g. VF 1,3 = 0x00030001
+ */
+#define       MC_CMD_LINK_STATE_MODE_IN_FUNCTION_OFST 0
+#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_PF_LBN 0
+#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_PF_WIDTH 16
+#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_VF_LBN 16
+#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_VF_WIDTH 16
+/* New link state mode to be set */
+#define       MC_CMD_LINK_STATE_MODE_IN_NEW_MODE_OFST 4
+#define          MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_AUTO       0x0 /* enum */
+#define          MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_UP         0x1 /* enum */
+#define          MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_DOWN       0x2 /* enum */
+/* enum: Use this value to just read the existing setting without modifying it.
+ */
+#define          MC_CMD_LINK_STATE_MODE_IN_DO_NOT_CHANGE         0xffffffff
+
+/* MC_CMD_LINK_STATE_MODE_OUT msgresponse */
+#define    MC_CMD_LINK_STATE_MODE_OUT_LEN 4
+#define       MC_CMD_LINK_STATE_MODE_OUT_OLD_MODE_OFST 0
 
 
 /***********************************/
@@ -5944,6 +5978,46 @@
 
 
 /***********************************/
+/* MC_CMD_VADAPTOR_SET_MAC
+ * assign a new MAC address to a v-adaptor.
+ */
+#define MC_CMD_VADAPTOR_SET_MAC 0x5d
+
+#define MC_CMD_0x5d_PRIVILEGE_CTG SRIOV_CTG_GENERAL
+
+/* MC_CMD_VADAPTOR_SET_MAC_IN msgrequest */
+#define    MC_CMD_VADAPTOR_SET_MAC_IN_LEN 10
+/* The port to which the v-adaptor is connected. */
+#define       MC_CMD_VADAPTOR_SET_MAC_IN_UPSTREAM_PORT_ID_OFST 0
+/* The new MAC address to assign to this v-adaptor */
+#define       MC_CMD_VADAPTOR_SET_MAC_IN_MACADDR_OFST 4
+#define       MC_CMD_VADAPTOR_SET_MAC_IN_MACADDR_LEN 6
+
+/* MC_CMD_VADAPTOR_SET_MAC_OUT msgresponse */
+#define    MC_CMD_VADAPTOR_SET_MAC_OUT_LEN 0
+
+
+/***********************************/
+/* MC_CMD_VADAPTOR_GET_MAC
+ * read the MAC address assigned to a v-adaptor.
+ */
+#define MC_CMD_VADAPTOR_GET_MAC 0x5e
+
+#define MC_CMD_0x5e_PRIVILEGE_CTG SRIOV_CTG_GENERAL
+
+/* MC_CMD_VADAPTOR_GET_MAC_IN msgrequest */
+#define    MC_CMD_VADAPTOR_GET_MAC_IN_LEN 4
+/* The port to which the v-adaptor is connected. */
+#define       MC_CMD_VADAPTOR_GET_MAC_IN_UPSTREAM_PORT_ID_OFST 0
+
+/* MC_CMD_VADAPTOR_GET_MAC_OUT msgresponse */
+#define    MC_CMD_VADAPTOR_GET_MAC_OUT_LEN 6
+/* The MAC address assigned to this v-adaptor */
+#define       MC_CMD_VADAPTOR_GET_MAC_OUT_MACADDR_OFST 0
+#define       MC_CMD_VADAPTOR_GET_MAC_OUT_MACADDR_LEN 6
+
+
+/***********************************/
 /* MC_CMD_EVB_PORT_ASSIGN
  * assign a port to a PCI function.
  */
@@ -6803,7 +6877,7 @@
 #define    MC_CMD_DUMP_BUFTBL_ENTRIES_OUT_LENMIN 12
 #define    MC_CMD_DUMP_BUFTBL_ENTRIES_OUT_LENMAX 252
 #define    MC_CMD_DUMP_BUFTBL_ENTRIES_OUT_LEN(num) (0+12*(num))
-/* Raw buffer table entries, layed out as BUFTBL_ENTRY. */
+/* Raw buffer table entries, laid out as BUFTBL_ENTRY. */
 #define       MC_CMD_DUMP_BUFTBL_ENTRIES_OUT_ENTRY_OFST 0
 #define       MC_CMD_DUMP_BUFTBL_ENTRIES_OUT_ENTRY_LEN 12
 #define       MC_CMD_DUMP_BUFTBL_ENTRIES_OUT_ENTRY_MINNUM 1

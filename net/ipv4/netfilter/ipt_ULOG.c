@@ -466,10 +466,6 @@ static int __init ulog_tg_init(void)
 		return -EINVAL;
 	}
 
-	ret = register_pernet_subsys(&ulog_tg_net_ops);
-	if (ret)
-		goto out_pernet;
-
 	ret = xt_register_target(&ulog_tg_reg);
 	if (ret < 0)
 		goto out_target;
@@ -482,13 +478,18 @@ static int __init ulog_tg_init(void)
 		}
 	}
 
+	ret = register_pernet_subsys(&ulog_tg_net_ops);
+	if (ret)
+		goto out_pernet;
+
 	return 0;
 
+out_pernet:
+	if (nflog)
+		nf_log_unregister(&ipt_ulog_logger);
 out_register:
 	xt_unregister_target(&ulog_tg_reg);
 out_target:
-	unregister_pernet_subsys(&ulog_tg_net_ops);
-out_pernet:
 	return ret;
 }
 

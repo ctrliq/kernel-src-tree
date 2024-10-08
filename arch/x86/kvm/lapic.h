@@ -14,6 +14,7 @@ struct kvm_timer {
 	u32 timer_mode;
 	u32 timer_mode_mask;
 	u64 tscdeadline;
+	u64 expired_tscdeadline;
 	atomic_t pending;			/* accumulated triggered timers */
 };
 
@@ -25,6 +26,7 @@ struct kvm_lapic {
 	struct kvm_vcpu *vcpu;
 	bool sw_enabled;
 	bool irr_pending;
+	bool lvt0_in_nmi_mode;
 	/* Number of bits set in ISR. */
 	s16 isr_count;
 	/* The highest vector set in ISR; if -1 - invalid, must scan ISR. */
@@ -168,6 +170,13 @@ static inline bool kvm_apic_has_events(struct kvm_vcpu *vcpu)
 	return kvm_vcpu_has_lapic(vcpu) && vcpu->arch.apic->pending_events;
 }
 
+static inline int kvm_lapic_latched_init(struct kvm_vcpu *vcpu)
+{
+	return kvm_vcpu_has_lapic(vcpu) && test_bit(KVM_APIC_INIT, &vcpu->arch.apic->pending_events);
+}
+
 bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector);
+
+void wait_lapic_expire(struct kvm_vcpu *vcpu);
 
 #endif

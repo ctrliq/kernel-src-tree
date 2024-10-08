@@ -488,7 +488,7 @@ qla2x00_start_iocbs(struct scsi_qla_host *vha, struct req_que *req)
 			req->ring_ptr++;
 
 		/* Set chip new ring index. */
-		if (ha->mqenable || IS_QLA83XX(ha)) {
+		if (ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha)) {
 			WRT_REG_DWORD(req->req_q_in, req->ring_index);
 			RD_REG_DWORD_RELAXED(&ha->iobase->isp24.hccr);
 		} else if (IS_QLAFX00(ha)) {
@@ -1478,8 +1478,8 @@ qla24xx_start_scsi(srb_t *sp)
 	tot_dsds = nseg;
 	req_cnt = qla24xx_calc_iocbs(vha, tot_dsds);
 	if (req->cnt < (req_cnt + 2)) {
-		cnt = RD_REG_DWORD_RELAXED(req->req_q_out);
-
+		cnt = IS_SHADOW_REG_CAPABLE(ha) ? *req->out_ptr :
+		    RD_REG_DWORD_RELAXED(req->req_q_out);
 		if (req->ring_index < cnt)
 			req->cnt = cnt - req->ring_index;
 		else
@@ -1697,8 +1697,8 @@ qla24xx_dif_start_scsi(srb_t *sp)
 	tot_prot_dsds = nseg;
 	tot_dsds += nseg;
 	if (req->cnt < (req_cnt + 2)) {
-		cnt = RD_REG_DWORD_RELAXED(req->req_q_out);
-
+		cnt = IS_SHADOW_REG_CAPABLE(ha) ? *req->out_ptr :
+		    RD_REG_DWORD_RELAXED(req->req_q_out);
 		if (req->ring_index < cnt)
 			req->cnt = cnt - req->ring_index;
 		else
@@ -1838,8 +1838,8 @@ qla2x00_alloc_iocbs(scsi_qla_host_t *vha, srb_t *sp)
 
 skip_cmd_array:
 	/* Check for room on request queue. */
-	if (req->cnt < req_cnt) {
-		if (ha->mqenable || IS_QLA83XX(ha))
+	if (req->cnt < req_cnt + 2) {
+		if (ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha))
 			cnt = RD_REG_DWORD(&reg->isp25mq.req_q_out);
 		else if (IS_P3P_TYPE(ha))
 			cnt = RD_REG_DWORD(&reg->isp82.req_q_out);
@@ -1857,7 +1857,7 @@ skip_cmd_array:
 			req->cnt = req->length -
 			    (req->ring_index - cnt);
 	}
-	if (req->cnt < req_cnt)
+	if (req->cnt < req_cnt + 2)
 		goto queuing_error;
 
 	/* Prep packet */
@@ -2825,8 +2825,8 @@ qla2x00_start_bidir(srb_t *sp, struct scsi_qla_host *vha, uint32_t tot_dsds)
 
 	/* Check for room on request queue. */
 	if (req->cnt < req_cnt + 2) {
-		cnt = RD_REG_DWORD_RELAXED(req->req_q_out);
-
+		cnt = IS_SHADOW_REG_CAPABLE(ha) ? *req->out_ptr :
+		    RD_REG_DWORD_RELAXED(req->req_q_out);
 		if  (req->ring_index < cnt)
 			req->cnt = cnt - req->ring_index;
 		else

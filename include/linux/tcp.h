@@ -60,6 +60,7 @@ static inline unsigned int tcp_optlen(const struct sk_buff *skb)
 struct tcp_fastopen_cookie {
 	s8	len;
 	u8	val[TCP_FASTOPEN_COOKIE_MAX];
+	bool	exp;	/* In RFC6994 experimental option format */
 };
 
 /* This defines a selective acknowledgement block. */
@@ -112,10 +113,7 @@ struct tcp_request_sock_ops;
 
 struct tcp_request_sock {
 	struct inet_request_sock 	req;
-#ifdef CONFIG_TCP_MD5SIG
-	/* Only used by TCP MD5 Signature so far. */
 	const struct tcp_request_sock_ops *af_specific;
-#endif
 	struct sock			*listener; /* needed for TFO */
 	u32				rcv_isn;
 	u32				snt_isn;
@@ -136,7 +134,7 @@ struct tcp_sock {
 	/* inet_connection_sock has to be the first member of tcp_sock */
 	struct inet_connection_sock	inet_conn;
 	u16	tcp_header_len;	/* Bytes of tcp header to send		*/
-	u16	xmit_size_goal_segs; /* Goal for segmenting output packets */
+	u16	gso_segs;	/* Max number of segs per GSO packet	*/
 
 /*
  *	Header prediction flags
@@ -199,18 +197,22 @@ struct tcp_sock {
 	u8	do_early_retrans:1,/* Enable RFC5827 early-retransmit  */
 		syn_data:1,	/* SYN includes data */
 		syn_fastopen:1,	/* SYN includes Fast Open option */
-		syn_data_acked:1;/* data in SYN is acked by SYN-ACK */
+		syn_fastopen_exp:1,/* SYN includes Fast Open exp. option */
+		syn_data_acked:1,/* data in SYN is acked by SYN-ACK */
+		is_cwnd_limited:1;/* forward progress limited by snd_cwnd? */
 	u32	tlp_high_seq;	/* snd_nxt at the time of TLP retransmit. */
 
 /* RTT measurement */
-	u32	srtt;		/* smoothed round trip time << 3	*/
-	u32	mdev;		/* medium deviation			*/
-	u32	mdev_max;	/* maximal mdev for the last rtt period	*/
-	u32	rttvar;		/* smoothed mdev_max			*/
+	u32	srtt_us;	/* smoothed round trip time << 3 in usecs */
+	u32	mdev_us;	/* medium deviation			*/
+	u32	mdev_max_us;	/* maximal mdev for the last rtt period	*/
+	u32	rttvar_us;	/* smoothed mdev_max			*/
 	u32	rtt_seq;	/* sequence number to update rttvar	*/
 
 	u32	packets_out;	/* Packets which are "in flight"	*/
 	u32	retrans_out;	/* Retransmitted packets out		*/
+	u32	max_packets_out;  /* max packets_out in last window */
+	u32	max_packets_seq;  /* right edge of max_packets_out flight */
 
 	u16	urg_data;	/* Saved octet of OOB data and control flags */
 	u8	ecn_flags;	/* ECN status bits.			*/
@@ -239,6 +241,7 @@ struct tcp_sock {
 
  	u32	rcv_wnd;	/* Current receiver window		*/
 	u32	write_seq;	/* Tail(+1) of data held in tcp send buffer */
+	u32	notsent_lowat;	/* TCP_NOTSENT_LOWAT */
 	u32	pushed_seq;	/* Last pushed seq, required to talk to windows */
 	u32	lost_out;	/* Lost packets			*/
 	u32	sacked_out;	/* SACK'd packets			*/
@@ -277,7 +280,7 @@ struct tcp_sock {
 	u32	retrans_stamp;	/* Timestamp of the last retransmit,
 				 * also used in SYN-SENT to remember stamp of
 				 * the first SYN. */
-	u32	undo_marker;	/* tracking retrans started here. */
+	u32	undo_marker;	/* snd_una upon a new recovery episode. */
 	int	undo_retrans;	/* number of undoable retransmissions. */
 	u32	total_retrans;	/* Total retransmits for entire connection */
 
@@ -368,11 +371,6 @@ static inline bool tcp_passive_fastopen(const struct sock *sk)
 {
 	return (sk->sk_state == TCP_SYN_RECV &&
 		tcp_sk(sk)->fastopen_rsk != NULL);
-}
-
-static inline bool fastopen_cookie_present(struct tcp_fastopen_cookie *foc)
-{
-	return foc->len != -1;
 }
 
 extern void tcp_sock_destruct(struct sock *sk);

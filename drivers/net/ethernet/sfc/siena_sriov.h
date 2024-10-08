@@ -44,12 +44,10 @@
 int efx_siena_sriov_configure(struct efx_nic *efx, int num_vfs);
 int efx_siena_sriov_init(struct efx_nic *efx);
 void efx_siena_sriov_fini(struct efx_nic *efx);
-void efx_siena_sriov_mac_address_changed(struct efx_nic *efx);
+int efx_siena_sriov_mac_address_changed(struct efx_nic *efx);
 bool efx_siena_sriov_wanted(struct efx_nic *efx);
 void efx_siena_sriov_reset(struct efx_nic *efx);
 void efx_siena_sriov_flr(struct efx_nic *efx, unsigned flr);
-
-#ifdef CONFIG_SFC_SRIOV
 
 int efx_siena_sriov_set_vf_mac(struct efx_nic *efx, int vf, u8 *mac);
 int efx_siena_sriov_set_vf_vlan(struct efx_nic *efx, int vf,
@@ -58,6 +56,8 @@ int efx_siena_sriov_set_vf_spoofchk(struct efx_nic *efx, int vf,
 				    bool spoofchk);
 int efx_siena_sriov_get_vf_config(struct efx_nic *efx, int vf,
 				  struct ifla_vf_info *ivf);
+
+#ifdef CONFIG_SFC_SRIOV
 
 static inline bool efx_siena_sriov_enabled(struct efx_nic *efx)
 {

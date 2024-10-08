@@ -29,14 +29,14 @@
 #define XSAVE_YMM_OFFSET    (XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET)
 
 /* Supported features which support lazy state saving */
-#define XSTATE_LAZY	(XSTATE_FP | XSTATE_SSE | XSTATE_YMM)
+#define XSTATE_LAZY	(XSTATE_FP | XSTATE_SSE | XSTATE_YMM		      \
+			| XSTATE_OPMASK | XSTATE_ZMM_Hi256 | XSTATE_Hi16_ZMM)
 
 /* Supported features which require eager state saving */
 #define XSTATE_EAGER	(XSTATE_BNDREGS | XSTATE_BNDCSR)
 
 /* All currently supported features */
-#define XCNTXT_MASK	(XSTATE_FP | XSTATE_SSE | XSTATE_YMM  \
-			| XSTATE_OPMASK | XSTATE_ZMM_Hi256 | XSTATE_Hi16_ZMM)
+#define XCNTXT_MASK	(XSTATE_LAZY | XSTATE_EAGER)
 
 #ifdef CONFIG_X86_64
 #define REX_PREFIX	"0x48, "

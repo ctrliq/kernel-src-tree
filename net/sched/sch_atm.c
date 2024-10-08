@@ -415,7 +415,7 @@ done:
 	if (ret != NET_XMIT_SUCCESS) {
 drop: __maybe_unused
 		if (net_xmit_drop_count(ret)) {
-			sch->qstats.drops++;
+			qdisc_qstats_drop(sch);
 			if (flow)
 				flow->qstats.drops++;
 		}
@@ -623,8 +623,7 @@ static int atm_tc_dump_class(struct Qdisc *sch, unsigned long cl,
 		if (nla_put_u32(skb, TCA_ATM_EXCESS, 0))
 			goto nla_put_failure;
 	}
-	nla_nest_end(skb, nest);
-	return skb->len;
+	return nla_nest_end(skb, nest);
 
 nla_put_failure:
 	nla_nest_cancel(skb, nest);

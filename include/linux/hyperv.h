@@ -115,15 +115,6 @@ struct hv_ring_buffer_info {
 	u32 ring_data_startoffset;
 };
 
-struct hv_ring_buffer_debug_info {
-	u32 current_interrupt_mask;
-	u32 current_read_index;
-	u32 current_write_index;
-	u32 bytes_avail_toread;
-	u32 bytes_avail_towrite;
-};
-
-
 /*
  *
  * hv_get_ringbuffer_availbytes()
@@ -386,10 +377,7 @@ enum vmbus_channel_message_type {
 	CHANNELMSG_INITIATE_CONTACT		= 14,
 	CHANNELMSG_VERSION_RESPONSE		= 15,
 	CHANNELMSG_UNLOAD			= 16,
-#ifdef VMBUS_FEATURE_PARENT_OR_PEER_MEMORY_MAPPED_INTO_A_CHILD
-	CHANNELMSG_VIEWRANGE_ADD		= 17,
-	CHANNELMSG_VIEWRANGE_REMOVE		= 18,
-#endif
+	CHANNELMSG_UNLOAD_RESPONSE		= 17,
 	CHANNELMSG_COUNT
 };
 
@@ -546,21 +534,6 @@ struct vmbus_channel_gpadl_torndown {
 	u32 gpadl;
 } __packed;
 
-#ifdef VMBUS_FEATURE_PARENT_OR_PEER_MEMORY_MAPPED_INTO_A_CHILD
-struct vmbus_channel_view_range_add {
-	struct vmbus_channel_message_header header;
-	PHYSICAL_ADDRESS viewrange_base;
-	u64 viewrange_length;
-	u32 child_relid;
-} __packed;
-
-struct vmbus_channel_view_range_remove {
-	struct vmbus_channel_message_header header;
-	PHYSICAL_ADDRESS viewrange_base;
-	u32 child_relid;
-} __packed;
-#endif
-
 struct vmbus_channel_relid_released {
 	struct vmbus_channel_message_header header;
 	u32 child_relid;
@@ -585,18 +558,6 @@ enum vmbus_channel_state {
 	CHANNEL_OPENING_STATE,
 	CHANNEL_OPEN_STATE,
 	CHANNEL_OPENED_STATE,
-};
-
-struct vmbus_channel_debug_info {
-	u32 servermonitor_pending;
-	u32 servermonitor_latency;
-	u32 servermonitor_connectionid;
-	u32 clientmonitor_pending;
-	u32 clientmonitor_latency;
-	u32 clientmonitor_connectionid;
-
-	struct hv_ring_buffer_debug_info inbound;
-	struct hv_ring_buffer_debug_info outbound;
 };
 
 /*
@@ -655,11 +616,12 @@ struct hv_input_signal_event_buffer {
 };
 
 struct vmbus_channel {
+	/* Unique channel id */
+	int id;
+
 	struct list_head listentry;
 
 	struct hv_device *device_obj;
-
-	struct work_struct work;
 
 	enum vmbus_channel_state state;
 
@@ -681,7 +643,6 @@ struct vmbus_channel {
 	struct hv_ring_buffer_info outbound;	/* send to parent */
 	struct hv_ring_buffer_info inbound;	/* receive from parent */
 	spinlock_t inbound_lock;
-	struct workqueue_struct *controlwq;
 
 	struct vmbus_close_msg close_msg;
 
@@ -743,7 +704,12 @@ struct vmbus_channel {
 	 */
 	void (*sc_creation_callback)(struct vmbus_channel *new_sc);
 
-	spinlock_t sc_lock;
+	/*
+	 * The spinlock to protect the structure. It is being used to protect
+	 * test-and-set access to various attributes of the structure as well
+	 * as all sc_list operations.
+	 */
+	spinlock_t lock;
 	/*
 	 * All Sub-channels of a primary channel are linked here.
 	 */
@@ -847,7 +813,7 @@ extern int vmbus_open(struct vmbus_channel *channel,
 extern void vmbus_close(struct vmbus_channel *channel);
 
 extern int vmbus_sendpacket(struct vmbus_channel *channel,
-				  const void *buffer,
+				  void *buffer,
 				  u32 bufferLen,
 				  u64 requestid,
 				  enum vmbus_packet_type type,
@@ -887,18 +853,7 @@ extern int vmbus_recvpacket_raw(struct vmbus_channel *channel,
 				     u64 *requestid);
 
 
-extern void vmbus_get_debug_info(struct vmbus_channel *channel,
-				     struct vmbus_channel_debug_info *debug);
-
 extern void vmbus_ontimer(unsigned long data);
-
-struct hv_dev_port_info {
-	u32 int_mask;
-	u32 read_idx;
-	u32 write_idx;
-	u32 bytes_avail_toread;
-	u32 bytes_avail_towrite;
-};
 
 /* Base driver object */
 struct hv_driver {
@@ -1209,6 +1164,7 @@ void hv_kvp_onchannelcallback(void *);
 int hv_vss_init(struct hv_util_service *);
 void hv_vss_deinit(void);
 void hv_vss_onchannelcallback(void *);
+void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid);
 
 extern struct resource hyperv_mmio;
 

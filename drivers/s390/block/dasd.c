@@ -1658,14 +1658,6 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
 		device->discipline->check_for_device_change(device, cqr, irb);
 		dasd_put_device(device);
 	}
-
-	/* check for for attention message */
-	if (scsw_dstat(&irb->scsw) & DEV_STAT_ATTENTION) {
-		device = dasd_device_from_cdev_locked(cdev);
-		device->discipline->check_attention(device, irb->esw.esw1.lpum);
-		dasd_put_device(device);
-	}
-
 	if (!cqr)
 		return;
 
@@ -2320,20 +2312,10 @@ retry:
 			return -EAGAIN;
 
 		/* normal recovery for basedev IO */
-		if (__dasd_sleep_on_erp(cqr)) {
+		if (__dasd_sleep_on_erp(cqr))
+			/* handle erp first */
 			goto retry;
-			/* remember that ERP was needed */
-			rc = 1;
-			/* skip processing for active cqr */
-			if (cqr->status != DASD_CQR_TERMINATED &&
-			    cqr->status != DASD_CQR_NEED_ERP)
-				break;
-		}
 	}
-
-	/* start ERP requests in upper loop */
-	if (rc)
-		goto retry;
 
 	return 0;
 }

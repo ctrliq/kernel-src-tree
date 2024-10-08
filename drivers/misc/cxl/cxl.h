@@ -18,6 +18,7 @@
 #include <linux/pid.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/idr.h>
 #include <asm/cputable.h>
 #include <asm/mmu.h>
 #include <asm/reg.h>

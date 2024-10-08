@@ -48,7 +48,10 @@
 #define MLX4_STATS_TRAFFIC_COUNTERS_MASK	0xfULL
 #define MLX4_STATS_TRAFFIC_DROPS_MASK		0xc0ULL
 #define MLX4_STATS_ERROR_COUNTERS_MASK		0x1ffc30ULL
-#define MLX4_STATS_PORT_COUNTERS_MASK		0x7fe00000ULL
+#define MLX4_STATS_PORT_COUNTERS_MASK		0x1fe00000ULL
+
+#define MLX4_FLAG_V_IGNORE_FCS_MASK		0x2
+#define MLX4_IGNORE_FCS_MASK			0x1
 
 void mlx4_init_mac_table(struct mlx4_dev *dev, struct mlx4_mac_table *table)
 {
@@ -556,9 +559,9 @@ int mlx4_get_slave_num_gids(struct mlx4_dev *dev, int slave, int port)
 		slaves_pport_actv = mlx4_phys_to_slaves_pport_actv(
 				    dev, &exclusive_ports);
 		slave_gid -= bitmap_weight(slaves_pport_actv.slaves,
-					   dev->num_vfs + 1);
+					   dev->persist->num_vfs + 1);
 	}
-	vfs = bitmap_weight(slaves_pport.slaves, dev->num_vfs + 1) - 1;
+	vfs = bitmap_weight(slaves_pport.slaves, dev->persist->num_vfs + 1) - 1;
 	if (slave_gid <= ((MLX4_ROCE_MAX_GIDS - MLX4_ROCE_PF_GIDS) % vfs))
 		return ((MLX4_ROCE_MAX_GIDS - MLX4_ROCE_PF_GIDS) / vfs) + 1;
 	return (MLX4_ROCE_MAX_GIDS - MLX4_ROCE_PF_GIDS) / vfs;
@@ -593,10 +596,10 @@ int mlx4_get_base_gid_ix(struct mlx4_dev *dev, int slave, int port)
 		slaves_pport_actv = mlx4_phys_to_slaves_pport_actv(
 				    dev, &exclusive_ports);
 		slave_gid -= bitmap_weight(slaves_pport_actv.slaves,
-					   dev->num_vfs + 1);
+					   dev->persist->num_vfs + 1);
 	}
 	gids = MLX4_ROCE_MAX_GIDS - MLX4_ROCE_PF_GIDS;
-	vfs = bitmap_weight(slaves_pport.slaves, dev->num_vfs + 1) - 1;
+	vfs = bitmap_weight(slaves_pport.slaves, dev->persist->num_vfs + 1) - 1;
 	if (slave_gid <= gids % vfs)
 		return MLX4_ROCE_PF_GIDS + ((gids / vfs) + 1) * (slave_gid - 1);
 
@@ -647,7 +650,7 @@ void mlx4_reset_roce_gids(struct mlx4_dev *dev, int slave)
 	int num_eth_ports, err;
 	int i;
 
-	if (slave < 0 || slave > dev->num_vfs)
+	if (slave < 0 || slave > dev->persist->num_vfs)
 		return;
 
 	actv_ports = mlx4_get_active_ports(dev, slave);
@@ -840,6 +843,12 @@ static int mlx4_common_set_port(struct mlx4_dev *dev, int slave, u32 in_mod,
 				MLX4_CMD_NATIVE);
 	}
 
+	/* Slaves are not allowed to SET_PORT beacon (LED) blink */
+	if (op_mod == MLX4_SET_PORT_BEACON_OPCODE) {
+		mlx4_warn(dev, "denying SET_PORT Beacon slave:%d\n", slave);
+		return -EPERM;
+	}
+
 	/* For IB, we only consider:
 	 * - The capability mask, which is set to the aggregate of all
 	 *   slave function capabilities
@@ -1026,6 +1035,32 @@ int mlx4_SET_PORT_qpn_calc(struct mlx4_dev *dev, u8 port, u32 base_qpn,
 }
 EXPORT_SYMBOL(mlx4_SET_PORT_qpn_calc);
 
+int mlx4_SET_PORT_fcs_check(struct mlx4_dev *dev, u8 port, u8 ignore_fcs_value)
+{
+	struct mlx4_cmd_mailbox *mailbox;
+	struct mlx4_set_port_general_context *context;
+	u32 in_mod;
+	int err;
+
+	mailbox = mlx4_alloc_cmd_mailbox(dev);
+	if (IS_ERR(mailbox))
+		return PTR_ERR(mailbox);
+	context = mailbox->buf;
+	context->v_ignore_fcs |= MLX4_FLAG_V_IGNORE_FCS_MASK;
+	if (ignore_fcs_value)
+		context->ignore_fcs |= MLX4_IGNORE_FCS_MASK;
+	else
+		context->ignore_fcs &= ~MLX4_IGNORE_FCS_MASK;
+
+	in_mod = MLX4_SET_PORT_GENERAL << 8 | port;
+	err = mlx4_cmd(dev, mailbox->dma, in_mod, 1, MLX4_CMD_SET_PORT,
+		       MLX4_CMD_TIME_CLASS_B, MLX4_CMD_NATIVE);
+
+	mlx4_free_cmd_mailbox(dev, mailbox);
+	return err;
+}
+EXPORT_SYMBOL(mlx4_SET_PORT_fcs_check);
+
 enum {
 	VXLAN_ENABLE_MODIFY	= 1 << 7,
 	VXLAN_STEERING_MODIFY	= 1 << 6,
@@ -1068,6 +1103,26 @@ int mlx4_SET_PORT_VXLAN(struct mlx4_dev *dev, u8 port, u8 steering, int enable)
 	return err;
 }
 EXPORT_SYMBOL(mlx4_SET_PORT_VXLAN);
+
+int mlx4_SET_PORT_BEACON(struct mlx4_dev *dev, u8 port, u16 time)
+{
+	int err;
+	struct mlx4_cmd_mailbox *mailbox;
+
+	mailbox = mlx4_alloc_cmd_mailbox(dev);
+	if (IS_ERR(mailbox))
+		return PTR_ERR(mailbox);
+
+	*((__be32 *)mailbox->buf) = cpu_to_be32(time);
+
+	err = mlx4_cmd(dev, mailbox->dma, port, MLX4_SET_PORT_BEACON_OPCODE,
+		       MLX4_CMD_SET_PORT, MLX4_CMD_TIME_CLASS_B,
+		       MLX4_CMD_NATIVE);
+
+	mlx4_free_cmd_mailbox(dev, mailbox);
+	return err;
+}
+EXPORT_SYMBOL(mlx4_SET_PORT_BEACON);
 
 int mlx4_SET_MCAST_FLTR_wrapper(struct mlx4_dev *dev, int slave,
 				struct mlx4_vhcr *vhcr,
@@ -1120,22 +1175,6 @@ int mlx4_DUMP_ETH_STATS_wrapper(struct mlx4_dev *dev, int slave,
 					  vhcr->in_modifier, outbox);
 }
 
-void mlx4_set_stats_bitmap(struct mlx4_dev *dev, u64 *stats_bitmap)
-{
-	if (!mlx4_is_mfunc(dev)) {
-		*stats_bitmap = 0;
-		return;
-	}
-
-	*stats_bitmap = (MLX4_STATS_TRAFFIC_COUNTERS_MASK |
-			 MLX4_STATS_TRAFFIC_DROPS_MASK |
-			 MLX4_STATS_PORT_COUNTERS_MASK);
-
-	if (mlx4_is_master(dev))
-		*stats_bitmap |= MLX4_STATS_ERROR_COUNTERS_MASK;
-}
-EXPORT_SYMBOL(mlx4_set_stats_bitmap);
-
 int mlx4_get_slave_from_roce_gid(struct mlx4_dev *dev, int port, u8 *gid,
 				 int *slave_id)
 {
@@ -1150,7 +1189,8 @@ int mlx4_get_slave_from_roce_gid(struct mlx4_dev *dev, int port, u8 *gid,
 		return -EINVAL;
 
 	slaves_pport = mlx4_phys_to_slaves_pport(dev, port);
-	num_vfs = bitmap_weight(slaves_pport.slaves, dev->num_vfs + 1) - 1;
+	num_vfs = bitmap_weight(slaves_pport.slaves,
+				dev->persist->num_vfs + 1) - 1;
 
 	for (i = 0; i < MLX4_ROCE_MAX_GIDS; i++) {
 		if (!memcmp(priv->port[port].gid_table.roce_gids[i].raw, gid,
@@ -1194,7 +1234,7 @@ int mlx4_get_slave_from_roce_gid(struct mlx4_dev *dev, int port, u8 *gid,
 							dev, &exclusive_ports);
 				num_vfs_before += bitmap_weight(
 						slaves_pport_actv.slaves,
-						dev->num_vfs + 1);
+						dev->persist->num_vfs + 1);
 			}
 
 			/* candidate_slave_gid isn't necessarily the correct slave, but
@@ -1224,7 +1264,7 @@ int mlx4_get_slave_from_roce_gid(struct mlx4_dev *dev, int port, u8 *gid,
 						dev, &exclusive_ports);
 				slave_gid += bitmap_weight(
 						slaves_pport_actv.slaves,
-						dev->num_vfs + 1);
+						dev->persist->num_vfs + 1);
 			}
 		}
 		*slave_id = slave_gid;

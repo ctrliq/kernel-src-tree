@@ -14,8 +14,8 @@ struct blk_mq_ctx {
 	unsigned int		cpu;
 	unsigned int		index_hw;
 
-	RH_KABI_REPLACE(unsigned int ipi_redirect,
-		        unsigned int last_tag ____cacheline_aligned_in_smp)
+	RH_KABI_REPLACE_UNSAFE(unsigned int ipi_redirect,
+		               unsigned int last_tag ____cacheline_aligned_in_smp)
 
 	/* incremented at dispatch time */
 	unsigned long		rq_dispatched[2];
@@ -30,7 +30,6 @@ struct blk_mq_ctx {
 
 void __blk_mq_complete_request(struct request *rq);
 void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
-int blk_mq_init_flush(struct request_queue *q);
 void blk_mq_freeze_queue(struct request_queue *q);
 void blk_mq_free_queue(struct request_queue *q);
 void blk_mq_clone_flush_request(struct request *flush_rq,
@@ -55,7 +54,8 @@ void blk_mq_disable_hotplug(void);
  * CPU -> queue mappings
  */
 extern unsigned int *blk_mq_make_queue_map(struct blk_mq_tag_set *set);
-extern int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues);
+extern int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues,
+				   const struct cpumask *online_mask);
 extern int blk_mq_hw_queue_to_node(unsigned int *map, unsigned int);
 
 /*
@@ -65,6 +65,8 @@ extern int blk_mq_sysfs_register(struct request_queue *q);
 extern void blk_mq_sysfs_unregister(struct request_queue *q);
 
 extern void blk_mq_rq_timed_out(struct request *req, bool reserved);
+
+void blk_mq_release(struct request_queue *q);
 
 /*
  * Basic implementation of sparser bitmap, allowing the user to spread

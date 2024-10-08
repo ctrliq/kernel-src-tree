@@ -22,8 +22,6 @@
 #include "xfs_log_format.h"
 #include "xfs_shared.h"
 #include "xfs_trans_resv.h"
-#include "xfs_ag.h"
-#include "xfs_sb.h"
 #include "xfs_mount.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_inode.h"
@@ -133,9 +131,9 @@ xfs_symlink_read_verify(
 		return;
 
 	if (!xfs_buf_verify_cksum(bp, XFS_SYMLINK_CRC_OFF))
-		xfs_buf_ioerror(bp, EFSBADCRC);
+		xfs_buf_ioerror(bp, -EFSBADCRC);
 	else if (!xfs_symlink_verify(bp))
-		xfs_buf_ioerror(bp, EFSCORRUPTED);
+		xfs_buf_ioerror(bp, -EFSCORRUPTED);
 
 	if (bp->b_error)
 		xfs_verifier_error(bp);
@@ -153,7 +151,7 @@ xfs_symlink_write_verify(
 		return;
 
 	if (!xfs_symlink_verify(bp)) {
-		xfs_buf_ioerror(bp, EFSCORRUPTED);
+		xfs_buf_ioerror(bp, -EFSCORRUPTED);
 		xfs_verifier_error(bp);
 		return;
 	}

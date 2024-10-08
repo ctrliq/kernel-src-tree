@@ -38,16 +38,7 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/syscalls.h>
 
-enum s390_regset {
-	REGSET_GENERAL,
-	REGSET_FP,
-	REGSET_LAST_BREAK,
-	REGSET_TDB,
-	REGSET_SYSTEM_CALL,
-	REGSET_GENERAL_EXTENDED,
-};
-
-void update_per_regs(struct task_struct *task)
+void update_cr_regs(struct task_struct *task)
 {
 	struct pt_regs *regs = task_pt_regs(task);
 	struct thread_struct *thread = &task->thread;
@@ -55,18 +46,39 @@ void update_per_regs(struct task_struct *task)
 
 #ifdef CONFIG_64BIT
 	/* Take care of the enable/disable of transactional execution. */
-	if (MACHINE_HAS_TE) {
-		unsigned long cr0, cr0_new;
+	if (MACHINE_HAS_TE || MACHINE_HAS_VX) {
+		unsigned long cr, cr_new;
 
-		__ctl_store(cr0, 0, 0);
-		/* set or clear transaction execution bit 8. */
-		if (task->thread.per_flags & PER_FLAG_NO_TE)
-			cr0_new = cr0 & ~(1UL << 55);
-		else
-			cr0_new = cr0 | (1UL << 55);
-		/* Only load control register 0 if necessary. */
-		if (cr0 != cr0_new)
-			__ctl_load(cr0_new, 0, 0);
+		__ctl_store(cr, 0, 0);
+		cr_new = cr;
+		if (MACHINE_HAS_TE) {
+			/* Set or clear transaction execution TXC bit 8. */
+			cr_new |= (1UL << 55);
+			if (task->thread.per_flags & PER_FLAG_NO_TE)
+				cr_new &= ~(1UL << 55);
+		}
+		if (MACHINE_HAS_VX) {
+			/* Enable/disable of vector extension */
+			cr_new &= ~(1UL << 17);
+			if (task->thread.vxrs)
+				cr_new |= (1UL << 17);
+		}
+		if (cr_new != cr)
+			__ctl_load(cr_new, 0, 0);
+		if (MACHINE_HAS_TE) {
+			/* Set/clear transaction execution TDC bits 62/63. */
+			__ctl_store(cr, 2, 2);
+			cr_new = cr & ~3UL;
+			if (task->thread.per_flags & PER_FLAG_TE_ABORT_RAND) {
+				if (task->thread.per_flags &
+				    PER_FLAG_TE_ABORT_RAND_TEND)
+					cr_new |= 1UL;
+				else
+					cr_new |= 2UL;
+			}
+			if (cr_new != cr)
+				__ctl_load(cr_new, 2, 2);
+		}
 	}
 #endif
 	/* Copy user specified PER registers */
@@ -75,12 +87,15 @@ void update_per_regs(struct task_struct *task)
 	new.end = thread->per_user.end;
 
 	/* merge TIF_SINGLE_STEP into user specified PER registers. */
-	if (test_tsk_thread_flag(task, TIF_SINGLE_STEP)) {
+	if (test_tsk_thread_flag(task, TIF_SINGLE_STEP) ||
+	    test_tsk_thread_flag(task, TIF_UPROBE_SINGLESTEP)) {
 		new.control |= PER_EVENT_IFETCH;
 #ifdef CONFIG_64BIT
 		new.control |= PER_CONTROL_SUSPENSION;
 		new.control |= PER_EVENT_TRANSACTION_END;
 #endif
+		if (test_tsk_thread_flag(task, TIF_UPROBE_SINGLESTEP))
+			new.control |= PER_EVENT_IFETCH;
 		new.start = 0;
 		new.end = PSW_ADDR_INSN;
 	}
@@ -100,14 +115,14 @@ void user_enable_single_step(struct task_struct *task)
 {
 	set_tsk_thread_flag(task, TIF_SINGLE_STEP);
 	if (task == current)
-		update_per_regs(task);
+		update_cr_regs(task);
 }
 
 void user_disable_single_step(struct task_struct *task)
 {
 	clear_tsk_thread_flag(task, TIF_SINGLE_STEP);
 	if (task == current)
-		update_per_regs(task);
+		update_cr_regs(task);
 }
 
 /*
@@ -483,6 +498,26 @@ long arch_ptrace(struct task_struct *child, long request,
 		if (!MACHINE_HAS_TE)
 			return -EIO;
 		child->thread.per_flags |= PER_FLAG_NO_TE;
+		child->thread.per_flags &= ~PER_FLAG_TE_ABORT_RAND;
+		return 0;
+	case PTRACE_TE_ABORT_RAND:
+		if (!MACHINE_HAS_TE || (child->thread.per_flags & PER_FLAG_NO_TE))
+			return -EIO;
+		switch (data) {
+		case 0UL:
+			child->thread.per_flags &= ~PER_FLAG_TE_ABORT_RAND;
+			break;
+		case 1UL:
+			child->thread.per_flags |= PER_FLAG_TE_ABORT_RAND;
+			child->thread.per_flags |= PER_FLAG_TE_ABORT_RAND_TEND;
+			break;
+		case 2UL:
+			child->thread.per_flags |= PER_FLAG_TE_ABORT_RAND;
+			child->thread.per_flags &= ~PER_FLAG_TE_ABORT_RAND_TEND;
+			break;
+		default:
+			return -EINVAL;
+		}
 		return 0;
 	default:
 		/* Removing high order bit from addr (only for 31 bit). */
@@ -938,7 +973,15 @@ static int s390_fpregs_get(struct task_struct *target,
 		save_fp_ctl(&target->thread.fp_regs.fpc);
 		save_fp_regs(target->thread.fp_regs.fprs);
 	}
+#ifdef CONFIG_64BIT
+	else if (target->thread.vxrs) {
+		int i;
 
+		for (i = 0; i < __NUM_VXRS_LOW; i++)
+			target->thread.fp_regs.fprs[i] =
+				*(freg_t *)(target->thread.vxrs + i);
+	}
+#endif
 	return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
 				   &target->thread.fp_regs, 0, -1);
 }
@@ -972,9 +1015,20 @@ static int s390_fpregs_set(struct task_struct *target,
 					target->thread.fp_regs.fprs,
 					offsetof(s390_fp_regs, fprs), -1);
 
-	if (rc == 0 && target == current) {
-		restore_fp_ctl(&target->thread.fp_regs.fpc);
-		restore_fp_regs(target->thread.fp_regs.fprs);
+	if (rc == 0) {
+		if (target == current) {
+			restore_fp_ctl(&target->thread.fp_regs.fpc);
+			restore_fp_regs(target->thread.fp_regs.fprs);
+		}
+#ifdef CONFIG_64BIT
+		else if (target->thread.vxrs) {
+			int i;
+
+			for (i = 0; i < __NUM_VXRS_LOW; i++)
+				*(freg_t *)(target->thread.vxrs + i) =
+					target->thread.fp_regs.fprs[i];
+		}
+#endif
 	}
 
 	return rc;
@@ -1030,6 +1084,97 @@ static int s390_tdb_set(struct task_struct *target,
 	return 0;
 }
 
+static int s390_vxrs_low_get(struct task_struct *target,
+			     const struct user_regset *regset,
+			     unsigned int pos, unsigned int count,
+			     void *kbuf, void __user *ubuf)
+{
+	__u64 vxrs[__NUM_VXRS_LOW];
+	int i;
+
+	if (!MACHINE_HAS_VX)
+		return -ENODEV;
+	if (target->thread.vxrs) {
+		if (target == current)
+			save_vx_regs(target->thread.vxrs);
+		for (i = 0; i < __NUM_VXRS_LOW; i++)
+			vxrs[i] = *((__u64 *)(target->thread.vxrs + i) + 1);
+	} else
+		memset(vxrs, 0, sizeof(vxrs));
+	return user_regset_copyout(&pos, &count, &kbuf, &ubuf, vxrs, 0, -1);
+}
+
+static int s390_vxrs_low_set(struct task_struct *target,
+			     const struct user_regset *regset,
+			     unsigned int pos, unsigned int count,
+			     const void *kbuf, const void __user *ubuf)
+{
+	__u64 vxrs[__NUM_VXRS_LOW];
+	int i, rc;
+
+	if (!MACHINE_HAS_VX)
+		return -ENODEV;
+	if (!target->thread.vxrs) {
+		rc = alloc_vector_registers(target);
+		if (rc)
+			return rc;
+	} else if (target == current)
+		save_vx_regs(target->thread.vxrs);
+
+	rc = user_regset_copyin(&pos, &count, &kbuf, &ubuf, vxrs, 0, -1);
+	if (rc == 0) {
+		for (i = 0; i < __NUM_VXRS_LOW; i++)
+			*((__u64 *)(target->thread.vxrs + i) + 1) = vxrs[i];
+		if (target == current)
+			restore_vx_regs(target->thread.vxrs);
+	}
+
+	return rc;
+}
+
+static int s390_vxrs_high_get(struct task_struct *target,
+			      const struct user_regset *regset,
+			      unsigned int pos, unsigned int count,
+			      void *kbuf, void __user *ubuf)
+{
+	__vector128 vxrs[__NUM_VXRS_HIGH];
+
+	if (!MACHINE_HAS_VX)
+		return -ENODEV;
+	if (target->thread.vxrs) {
+		if (target == current)
+			save_vx_regs(target->thread.vxrs);
+		memcpy(vxrs, target->thread.vxrs + __NUM_VXRS_LOW,
+		       sizeof(vxrs));
+	} else
+		memset(vxrs, 0, sizeof(vxrs));
+	return user_regset_copyout(&pos, &count, &kbuf, &ubuf, vxrs, 0, -1);
+}
+
+static int s390_vxrs_high_set(struct task_struct *target,
+			      const struct user_regset *regset,
+			      unsigned int pos, unsigned int count,
+			      const void *kbuf, const void __user *ubuf)
+{
+	int rc;
+
+	if (!MACHINE_HAS_VX)
+		return -ENODEV;
+	if (!target->thread.vxrs) {
+		rc = alloc_vector_registers(target);
+		if (rc)
+			return rc;
+	} else if (target == current)
+		save_vx_regs(target->thread.vxrs);
+
+	rc = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
+				target->thread.vxrs + __NUM_VXRS_LOW, 0, -1);
+	if (rc == 0 && target == current)
+		restore_vx_regs(target->thread.vxrs);
+
+	return rc;
+}
+
 #endif
 
 static int s390_system_call_get(struct task_struct *target,
@@ -1053,7 +1198,7 @@ static int s390_system_call_set(struct task_struct *target,
 }
 
 static const struct user_regset s390_regsets[] = {
-	[REGSET_GENERAL] = {
+	{
 		.core_note_type = NT_PRSTATUS,
 		.n = sizeof(s390_regs) / sizeof(long),
 		.size = sizeof(long),
@@ -1061,7 +1206,7 @@ static const struct user_regset s390_regsets[] = {
 		.get = s390_regs_get,
 		.set = s390_regs_set,
 	},
-	[REGSET_FP] = {
+	{
 		.core_note_type = NT_PRFPREG,
 		.n = sizeof(s390_fp_regs) / sizeof(long),
 		.size = sizeof(long),
@@ -1069,25 +1214,7 @@ static const struct user_regset s390_regsets[] = {
 		.get = s390_fpregs_get,
 		.set = s390_fpregs_set,
 	},
-#ifdef CONFIG_64BIT
-	[REGSET_LAST_BREAK] = {
-		.core_note_type = NT_S390_LAST_BREAK,
-		.n = 1,
-		.size = sizeof(long),
-		.align = sizeof(long),
-		.get = s390_last_break_get,
-		.set = s390_last_break_set,
-	},
-	[REGSET_TDB] = {
-		.core_note_type = NT_S390_TDB,
-		.n = 1,
-		.size = 256,
-		.align = 1,
-		.get = s390_tdb_get,
-		.set = s390_tdb_set,
-	},
-#endif
-	[REGSET_SYSTEM_CALL] = {
+	{
 		.core_note_type = NT_S390_SYSTEM_CALL,
 		.n = 1,
 		.size = sizeof(unsigned int),
@@ -1095,6 +1222,40 @@ static const struct user_regset s390_regsets[] = {
 		.get = s390_system_call_get,
 		.set = s390_system_call_set,
 	},
+#ifdef CONFIG_64BIT
+	{
+		.core_note_type = NT_S390_LAST_BREAK,
+		.n = 1,
+		.size = sizeof(long),
+		.align = sizeof(long),
+		.get = s390_last_break_get,
+		.set = s390_last_break_set,
+	},
+	{
+		.core_note_type = NT_S390_TDB,
+		.n = 1,
+		.size = 256,
+		.align = 1,
+		.get = s390_tdb_get,
+		.set = s390_tdb_set,
+	},
+	{
+		.core_note_type = NT_S390_VXRS_LOW,
+		.n = __NUM_VXRS_LOW,
+		.size = sizeof(__u64),
+		.align = sizeof(__u64),
+		.get = s390_vxrs_low_get,
+		.set = s390_vxrs_low_set,
+	},
+	{
+		.core_note_type = NT_S390_VXRS_HIGH,
+		.n = __NUM_VXRS_HIGH,
+		.size = sizeof(__vector128),
+		.align = sizeof(__vector128),
+		.get = s390_vxrs_high_get,
+		.set = s390_vxrs_high_set,
+	},
+#endif
 };
 
 static const struct user_regset_view user_s390_view = {
@@ -1259,7 +1420,7 @@ static int s390_compat_last_break_set(struct task_struct *target,
 }
 
 static const struct user_regset s390_compat_regsets[] = {
-	[REGSET_GENERAL] = {
+	{
 		.core_note_type = NT_PRSTATUS,
 		.n = sizeof(s390_compat_regs) / sizeof(compat_long_t),
 		.size = sizeof(compat_long_t),
@@ -1267,7 +1428,7 @@ static const struct user_regset s390_compat_regsets[] = {
 		.get = s390_compat_regs_get,
 		.set = s390_compat_regs_set,
 	},
-	[REGSET_FP] = {
+	{
 		.core_note_type = NT_PRFPREG,
 		.n = sizeof(s390_fp_regs) / sizeof(compat_long_t),
 		.size = sizeof(compat_long_t),
@@ -1275,23 +1436,7 @@ static const struct user_regset s390_compat_regsets[] = {
 		.get = s390_fpregs_get,
 		.set = s390_fpregs_set,
 	},
-	[REGSET_LAST_BREAK] = {
-		.core_note_type = NT_S390_LAST_BREAK,
-		.n = 1,
-		.size = sizeof(long),
-		.align = sizeof(long),
-		.get = s390_compat_last_break_get,
-		.set = s390_compat_last_break_set,
-	},
-	[REGSET_TDB] = {
-		.core_note_type = NT_S390_TDB,
-		.n = 1,
-		.size = 256,
-		.align = 1,
-		.get = s390_tdb_get,
-		.set = s390_tdb_set,
-	},
-	[REGSET_SYSTEM_CALL] = {
+	{
 		.core_note_type = NT_S390_SYSTEM_CALL,
 		.n = 1,
 		.size = sizeof(compat_uint_t),
@@ -1299,7 +1444,39 @@ static const struct user_regset s390_compat_regsets[] = {
 		.get = s390_system_call_get,
 		.set = s390_system_call_set,
 	},
-	[REGSET_GENERAL_EXTENDED] = {
+	{
+		.core_note_type = NT_S390_LAST_BREAK,
+		.n = 1,
+		.size = sizeof(long),
+		.align = sizeof(long),
+		.get = s390_compat_last_break_get,
+		.set = s390_compat_last_break_set,
+	},
+	{
+		.core_note_type = NT_S390_TDB,
+		.n = 1,
+		.size = 256,
+		.align = 1,
+		.get = s390_tdb_get,
+		.set = s390_tdb_set,
+	},
+	{
+		.core_note_type = NT_S390_VXRS_LOW,
+		.n = __NUM_VXRS_LOW,
+		.size = sizeof(__u64),
+		.align = sizeof(__u64),
+		.get = s390_vxrs_low_get,
+		.set = s390_vxrs_low_set,
+	},
+	{
+		.core_note_type = NT_S390_VXRS_HIGH,
+		.n = __NUM_VXRS_HIGH,
+		.size = sizeof(__vector128),
+		.align = sizeof(__vector128),
+		.get = s390_vxrs_high_get,
+		.set = s390_vxrs_high_set,
+	},
+	{
 		.core_note_type = NT_S390_HIGH_GPRS,
 		.n = sizeof(s390_compat_regs_high) / sizeof(compat_long_t),
 		.size = sizeof(compat_long_t),

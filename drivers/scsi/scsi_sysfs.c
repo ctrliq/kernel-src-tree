@@ -333,8 +333,8 @@ store_shost_eh_deadline(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR(eh_deadline, S_IRUGO | S_IWUSR, show_shost_eh_deadline, store_shost_eh_deadline);
 
+shost_rd_attr(use_blk_mq, "%d\n");
 shost_rd_attr(unique_id, "%u\n");
-shost_rd_attr(host_busy, "%hu\n");
 shost_rd_attr(cmd_per_lun, "%hd\n");
 shost_rd_attr(can_queue, "%hd\n");
 shost_rd_attr(sg_tablesize, "%hu\n");
@@ -344,7 +344,16 @@ shost_rd_attr(prot_capabilities, "%u\n");
 shost_rd_attr(prot_guard_type, "%hd\n");
 shost_rd_attr2(proc_name, hostt->proc_name, "%s\n");
 
+static ssize_t
+show_host_busy(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct Scsi_Host *shost = class_to_shost(dev);
+	return snprintf(buf, 20, "%d\n", atomic_read(&shost->host_busy));
+}
+static DEVICE_ATTR(host_busy, S_IRUGO, show_host_busy, NULL);
+
 static struct attribute *scsi_sysfs_shost_attrs[] = {
+	&dev_attr_use_blk_mq.attr,
 	&dev_attr_unique_id.attr,
 	&dev_attr_host_busy.attr,
 	&dev_attr_cmd_per_lun.attr,
@@ -582,13 +591,64 @@ static int scsi_sdev_check_buf_bit(const char *buf)
 /*
  * Create the actual show/store functions and data structures.
  */
-sdev_rd_attr (device_blocked, "%d\n");
-sdev_rd_attr (device_busy, "%d\n");
 sdev_rd_attr (type, "%d\n");
 sdev_rd_attr (scsi_level, "%d\n");
 sdev_rd_attr (vendor, "%.8s\n");
 sdev_rd_attr (model, "%.16s\n");
 sdev_rd_attr (rev, "%.4s\n");
+
+static ssize_t
+sdev_show_unpriv_sgio (struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct scsi_device *sdev;
+	int bit;
+
+	sdev = to_scsi_device(dev);
+	bit = test_bit(QUEUE_FLAG_UNPRIV_SGIO, &sdev->request_queue->queue_flags);
+	return snprintf(buf, 20, "%d\n", bit);
+}
+
+static ssize_t
+sdev_store_unpriv_sgio (struct device *dev, struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	struct scsi_device *sdev;
+	struct request_queue *q;
+	int val;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	sdev = to_scsi_device(dev);
+	q = sdev->request_queue;
+	sscanf (buf, "%d\n", &val);
+	spin_lock_irq(q->queue_lock);
+	if (val)
+		queue_flag_set(QUEUE_FLAG_UNPRIV_SGIO, q);
+	else
+		queue_flag_clear(QUEUE_FLAG_UNPRIV_SGIO, q);
+	spin_unlock_irq(q->queue_lock);
+	return count;
+}
+static DEVICE_ATTR(unpriv_sgio, S_IRUGO | S_IWUSR, sdev_show_unpriv_sgio, sdev_store_unpriv_sgio);
+
+static ssize_t
+sdev_show_device_busy(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	struct scsi_device *sdev = to_scsi_device(dev);
+	return snprintf(buf, 20, "%d\n", atomic_read(&sdev->device_busy));
+}
+static DEVICE_ATTR(device_busy, S_IRUGO, sdev_show_device_busy, NULL);
+
+static ssize_t
+sdev_show_device_blocked(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	struct scsi_device *sdev = to_scsi_device(dev);
+	return snprintf(buf, 20, "%d\n", atomic_read(&sdev->device_blocked));
+}
+static DEVICE_ATTR(device_blocked, S_IRUGO, sdev_show_device_blocked, NULL);
 
 /*
  * TODO: can we make these symlinks to the block layer ones?
@@ -948,6 +1008,7 @@ static struct attribute *scsi_sdev_attrs[] = {
 	&dev_attr_rescan.attr,
 	&dev_attr_delete.attr,
 	&dev_attr_state.attr,
+	&dev_attr_unpriv_sgio.attr,
 	&dev_attr_timeout.attr,
 	&dev_attr_eh_timeout.attr,
 	&dev_attr_iocounterbits.attr,

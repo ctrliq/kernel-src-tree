@@ -55,7 +55,7 @@
  * Local variables
  */
 
-#ifdef RPC_DEBUG
+#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 # define RPCDBG_FACILITY	RPCDBG_XPRT
 #endif
 
@@ -1336,6 +1336,8 @@ found:
 		return ERR_PTR(-ENOMEM);
 	}
 
+	rpc_xprt_debugfs_register(xprt);
+
 	dprintk("RPC:       created transport %p with %u slots\n", xprt,
 			xprt->max_reqs);
 out:
@@ -1352,6 +1354,7 @@ static void xprt_destroy(struct rpc_xprt *xprt)
 	dprintk("RPC:       destroying transport %p\n", xprt);
 	del_timer_sync(&xprt->timer);
 
+	rpc_xprt_debugfs_unregister(xprt);
 	rpc_destroy_wait_queue(&xprt->binding);
 	rpc_destroy_wait_queue(&xprt->pending);
 	rpc_destroy_wait_queue(&xprt->sending);

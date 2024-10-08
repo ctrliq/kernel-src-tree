@@ -46,8 +46,11 @@
 
 #include "mlx4.h"
 #include "fw.h"
+#include "mlx4_stats.h"
 
 #define MLX4_MAC_VALID		(1ull << 63)
+#define MLX4_PF_COUNTERS_PER_PORT	2
+#define MLX4_VF_COUNTERS_PER_PORT	1
 
 struct mac_res {
 	struct list_head list;
@@ -304,12 +307,13 @@ static inline int mlx4_grant_resource(struct mlx4_dev *dev, int slave,
 	int allocated, free, reserved, guaranteed, from_free;
 	int from_rsvd;
 
-	if (slave > dev->num_vfs)
+	if (slave > dev->persist->num_vfs)
 		return -EINVAL;
 
 	spin_lock(&res_alloc->alloc_lock);
 	allocated = (port > 0) ?
-		res_alloc->allocated[(port - 1) * (dev->num_vfs + 1) + slave] :
+		res_alloc->allocated[(port - 1) *
+		(dev->persist->num_vfs + 1) + slave] :
 		res_alloc->allocated[slave];
 	free = (port > 0) ? res_alloc->res_port_free[port - 1] :
 		res_alloc->res_free;
@@ -347,7 +351,8 @@ static inline int mlx4_grant_resource(struct mlx4_dev *dev, int slave,
 	if (!err) {
 		/* grant the request */
 		if (port > 0) {
-			res_alloc->allocated[(port - 1) * (dev->num_vfs + 1) + slave] += count;
+			res_alloc->allocated[(port - 1) *
+			(dev->persist->num_vfs + 1) + slave] += count;
 			res_alloc->res_port_free[port - 1] -= count;
 			res_alloc->res_port_rsvd[port - 1] -= from_rsvd;
 		} else {
@@ -371,13 +376,14 @@ static inline void mlx4_release_resource(struct mlx4_dev *dev, int slave,
 		&priv->mfunc.master.res_tracker.res_alloc[res_type];
 	int allocated, guaranteed, from_rsvd;
 
-	if (slave > dev->num_vfs)
+	if (slave > dev->persist->num_vfs)
 		return;
 
 	spin_lock(&res_alloc->alloc_lock);
 
 	allocated = (port > 0) ?
-		res_alloc->allocated[(port - 1) * (dev->num_vfs + 1) + slave] :
+		res_alloc->allocated[(port - 1) *
+		(dev->persist->num_vfs + 1) + slave] :
 		res_alloc->allocated[slave];
 	guaranteed = res_alloc->guaranteed[slave];
 
@@ -392,7 +398,8 @@ static inline void mlx4_release_resource(struct mlx4_dev *dev, int slave,
 	}
 
 	if (port > 0) {
-		res_alloc->allocated[(port - 1) * (dev->num_vfs + 1) + slave] -= count;
+		res_alloc->allocated[(port - 1) *
+		(dev->persist->num_vfs + 1) + slave] -= count;
 		res_alloc->res_port_free[port - 1] += count;
 		res_alloc->res_port_rsvd[port - 1] += from_rsvd;
 	} else {
@@ -410,7 +417,8 @@ static inline void initialize_res_quotas(struct mlx4_dev *dev,
 					 enum mlx4_resource res_type,
 					 int vf, int num_instances)
 {
-	res_alloc->guaranteed[vf] = num_instances / (2 * (dev->num_vfs + 1));
+	res_alloc->guaranteed[vf] = num_instances /
+				    (2 * (dev->persist->num_vfs + 1));
 	res_alloc->quota[vf] = (num_instances / 2) + res_alloc->guaranteed[vf];
 	if (vf == mlx4_master_func_num(dev)) {
 		res_alloc->res_free = num_instances;
@@ -454,11 +462,21 @@ void mlx4_init_quotas(struct mlx4_dev *dev)
 	dev->quotas.mpt =
 		priv->mfunc.master.res_tracker.res_alloc[RES_MPT].quota[pf];
 }
+
+static int get_max_gauranteed_vfs_counter(struct mlx4_dev *dev)
+{
+	/* reduce the sink counter */
+	return (dev->caps.max_counters - 1 -
+		(MLX4_PF_COUNTERS_PER_PORT * MLX4_MAX_PORTS))
+		/ MLX4_MAX_PORTS;
+}
+
 int mlx4_init_resource_tracker(struct mlx4_dev *dev)
 {
 	struct mlx4_priv *priv = mlx4_priv(dev);
 	int i, j;
 	int t;
+	int max_vfs_guarantee_counter = get_max_gauranteed_vfs_counter(dev);
 
 	priv->mfunc.master.res_tracker.slave_list =
 		kzalloc(dev->num_slaves * sizeof(struct slave_list),
@@ -481,21 +499,29 @@ int mlx4_init_resource_tracker(struct mlx4_dev *dev)
 	for (i = 0; i < MLX4_NUM_OF_RESOURCE_TYPE; i++) {
 		struct resource_allocator *res_alloc =
 			&priv->mfunc.master.res_tracker.res_alloc[i];
-		res_alloc->quota = kmalloc((dev->num_vfs + 1) * sizeof(int), GFP_KERNEL);
-		res_alloc->guaranteed = kmalloc((dev->num_vfs + 1) * sizeof(int), GFP_KERNEL);
+		res_alloc->quota = kmalloc((dev->persist->num_vfs + 1) *
+					   sizeof(int), GFP_KERNEL);
+		res_alloc->guaranteed = kmalloc((dev->persist->num_vfs + 1) *
+						sizeof(int), GFP_KERNEL);
 		if (i == RES_MAC || i == RES_VLAN)
 			res_alloc->allocated = kzalloc(MLX4_MAX_PORTS *
-						       (dev->num_vfs + 1) * sizeof(int),
-							GFP_KERNEL);
+						       (dev->persist->num_vfs
+						       + 1) *
+						       sizeof(int), GFP_KERNEL);
 		else
-			res_alloc->allocated = kzalloc((dev->num_vfs + 1) * sizeof(int), GFP_KERNEL);
+			res_alloc->allocated = kzalloc((dev->persist->
+							num_vfs + 1) *
+						       sizeof(int), GFP_KERNEL);
+		/* Reduce the sink counter */
+		if (i == RES_COUNTER)
+			res_alloc->res_free = dev->caps.max_counters - 1;
 
 		if (!res_alloc->quota || !res_alloc->guaranteed ||
 		    !res_alloc->allocated)
 			goto no_mem_err;
 
 		spin_lock_init(&res_alloc->alloc_lock);
-		for (t = 0; t < dev->num_vfs + 1; t++) {
+		for (t = 0; t < dev->persist->num_vfs + 1; t++) {
 			struct mlx4_active_ports actv_ports =
 				mlx4_get_active_ports(dev, t);
 			switch (i) {
@@ -567,9 +593,17 @@ int mlx4_init_resource_tracker(struct mlx4_dev *dev)
 				break;
 			case RES_COUNTER:
 				res_alloc->quota[t] = dev->caps.max_counters;
-				res_alloc->guaranteed[t] = 0;
 				if (t == mlx4_master_func_num(dev))
-					res_alloc->res_free = res_alloc->quota[t];
+					res_alloc->guaranteed[t] =
+						MLX4_PF_COUNTERS_PER_PORT *
+						MLX4_MAX_PORTS;
+				else if (t <= max_vfs_guarantee_counter)
+					res_alloc->guaranteed[t] =
+						MLX4_VF_COUNTERS_PER_PORT *
+						MLX4_MAX_PORTS;
+				else
+					res_alloc->guaranteed[t] = 0;
+				res_alloc->res_free -= res_alloc->guaranteed[t];
 				break;
 			default:
 				break;
@@ -762,6 +796,7 @@ static int update_vport_qp_param(struct mlx4_dev *dev,
 		qpc->pri_path.feup |= MLX4_FEUP_FORCE_ETH_UP | MLX4_FVL_FORCE_ETH_VLAN;
 		qpc->pri_path.sched_queue &= 0xC7;
 		qpc->pri_path.sched_queue |= (vp_oper->state.default_qos) << 3;
+		qpc->qos_vport = vp_oper->state.qos_vport;
 	}
 	if (vp_oper->state.spoofchk) {
 		qpc->pri_path.feup |= MLX4_FSM_FORCE_ETH_SRC_MAC;
@@ -1025,7 +1060,7 @@ static struct res_common *alloc_srq_tr(int id)
 	return &ret->com;
 }
 
-static struct res_common *alloc_counter_tr(int id)
+static struct res_common *alloc_counter_tr(int id, int port)
 {
 	struct res_counter *ret;
 
@@ -1035,6 +1070,7 @@ static struct res_common *alloc_counter_tr(int id)
 
 	ret->com.res_id = id;
 	ret->com.state = RES_COUNTER_ALLOCATED;
+	ret->port = port;
 
 	return &ret->com;
 }
@@ -1095,7 +1131,7 @@ static struct res_common *alloc_tr(u64 id, enum mlx4_resource type, int slave,
 		pr_err("implementation missing\n");
 		return NULL;
 	case RES_COUNTER:
-		ret = alloc_counter_tr(id);
+		ret = alloc_counter_tr(id, extra);
 		break;
 	case RES_XRCD:
 		ret = alloc_xrcdn_tr(id);
@@ -1110,6 +1146,53 @@ static struct res_common *alloc_tr(u64 id, enum mlx4_resource type, int slave,
 		ret->owner = slave;
 
 	return ret;
+}
+
+int mlx4_calc_vf_counters(struct mlx4_dev *dev, int slave, int port,
+			  struct mlx4_counter *data)
+{
+	struct mlx4_priv *priv = mlx4_priv(dev);
+	struct mlx4_resource_tracker *tracker = &priv->mfunc.master.res_tracker;
+	struct res_common *tmp;
+	struct res_counter *counter;
+	int *counters_arr;
+	int i = 0, err = 0;
+
+	memset(data, 0, sizeof(*data));
+
+	counters_arr = kmalloc_array(dev->caps.max_counters,
+				     sizeof(*counters_arr), GFP_KERNEL);
+	if (!counters_arr)
+		return -ENOMEM;
+
+	spin_lock_irq(mlx4_tlock(dev));
+	list_for_each_entry(tmp,
+			    &tracker->slave_list[slave].res_list[RES_COUNTER],
+			    list) {
+		counter = container_of(tmp, struct res_counter, com);
+		if (counter->port == port) {
+			counters_arr[i] = (int)tmp->res_id;
+			i++;
+		}
+	}
+	spin_unlock_irq(mlx4_tlock(dev));
+	counters_arr[i] = -1;
+
+	i = 0;
+
+	while (counters_arr[i] != -1) {
+		err = mlx4_get_counter_stats(dev, counters_arr[i], data,
+					     0);
+		if (err) {
+			memset(data, 0, sizeof(*data));
+			goto table_changed;
+		}
+		i++;
+	}
+
+table_changed:
+	kfree(counters_arr);
+	return 0;
 }
 
 static int add_res_range(struct mlx4_dev *dev, int slave, u64 base, int count,
@@ -2408,6 +2491,9 @@ static int counter_free_res(struct mlx4_dev *dev, int slave, int op, int cmd,
 		return -EINVAL;
 
 	index = get_param_l(&in_param);
+	if (index == MLX4_SINK_COUNTER_INDEX(dev))
+		return 0;
+
 	err = rem_res_range(dev, slave, index, 1, RES_COUNTER, 0);
 	if (err)
 		return err;
@@ -3024,8 +3110,12 @@ static int verify_qp_parameters(struct mlx4_dev *dev,
 	qp_type	= (be32_to_cpu(qp_ctx->flags) >> 16) & 0xff;
 	optpar	= be32_to_cpu(*(__be32 *) inbox->buf);
 
-	if (slave != mlx4_master_func_num(dev))
+	if (slave != mlx4_master_func_num(dev)) {
 		qp_ctx->params2 &= ~MLX4_QP_BIT_FPP;
+		/* setting QP rate-limit is disallowed for VFs */
+		if (qp_ctx->rate_limit_params)
+			return -EPERM;
+	}
 
 	switch (qp_type) {
 	case MLX4_QP_ST_RC:
@@ -3104,7 +3194,7 @@ int mlx4_WRITE_MTT_wrapper(struct mlx4_dev *dev, int slave,
 
 	/* Call the SW implementation of write_mtt:
 	 * - Prepare a dummy mtt struct
-	 * - Translate inbox contents to simple addresses in host endianess */
+	 * - Translate inbox contents to simple addresses in host endianness */
 	mtt.offset = 0;  /* TBD this is broken but I don't handle it since
 			    we don't really use it */
 	mtt.order = 0;
@@ -5018,6 +5108,11 @@ void mlx4_vf_immed_vlan_work_handler(struct work_struct *_work)
 					qp->sched_queue & 0xC7;
 				upd_context->qp_context.pri_path.sched_queue |=
 					((work->qos & 0x7) << 3);
+				upd_context->qp_mask |=
+					cpu_to_be64(1ULL <<
+						    MLX4_UPD_QP_MASK_QOS_VPP);
+				upd_context->qp_context.qos_vport =
+					work->qos_vport;
 			}
 
 			err = mlx4_cmd(dev, mailbox->dma,

@@ -289,6 +289,22 @@ static int usb_dev_uevent(struct device *dev, struct kobj_uevent_env *env)
 	return 0;
 }
 
+/* To disable USB, kernel command line is 'nousb' not 'usbcore.nousb' */
+#ifdef MODULE
+module_param(nousb, bool, 0444);
+#else
+core_param(nousb, nousb, bool, 0444);
+#endif
+
+/*
+ * for external read access to <nousb>
+ */
+int usb_disabled(void)
+{
+	return nousb;
+}
+EXPORT_SYMBOL_GPL(usb_disabled);
+
 #ifdef	CONFIG_PM
 
 /* USB device Power-Management thunks.
@@ -965,22 +981,6 @@ void usb_buffer_unmap_sg(const struct usb_device *dev, int is_in,
 }
 EXPORT_SYMBOL_GPL(usb_buffer_unmap_sg);
 #endif
-
-/* To disable USB, kernel command line is 'nousb' not 'usbcore.nousb' */
-#ifdef MODULE
-module_param(nousb, bool, 0444);
-#else
-core_param(nousb, nousb, bool, 0444);
-#endif
-
-/*
- * for external read access to <nousb>
- */
-int usb_disabled(void)
-{
-	return nousb;
-}
-EXPORT_SYMBOL_GPL(usb_disabled);
 
 /*
  * Notifications of device and interface registration

@@ -79,12 +79,12 @@ int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
-int kvm_arch_hardware_enable(void *garbage)
+int kvm_arch_hardware_enable(void)
 {
 	return 0;
 }
 
-void kvm_arch_hardware_disable(void *garbage)
+void kvm_arch_hardware_disable(void)
 {
 }
 
@@ -209,7 +209,7 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 	return 0;
 }
 
-void kvm_arch_memslots_updated(struct kvm *kvm)
+void kvm_arch_memslots_updated(struct kvm *kvm, struct kvm_memslots *slots)
 {
 }
 
@@ -868,8 +868,9 @@ kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
 	return -ENOIOCTLCMD;
 }
 
-void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+int kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
 {
+	return 0;
 }
 
 int kvm_arch_vcpu_ioctl_get_fpu(struct kvm_vcpu *vcpu, struct kvm_fpu *fpu)

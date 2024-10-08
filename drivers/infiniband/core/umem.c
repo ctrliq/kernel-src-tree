@@ -72,7 +72,7 @@ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int d
  * ib_umem_get - Pin and DMA map userspace memory.
  *
  * If access flags indicate ODP memory, avoid pinning. Instead, stores
- * the mm for future page fault handling.
+ * the mm for future page fault handling in conjunction with MMU notifiers.
  *
  * @context: userspace context to pin memory for
  * @addr: userspace virtual address to start at
@@ -123,13 +123,15 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
 	umem->page_size = PAGE_SIZE;
 	umem->pid       = get_task_pid(current, PIDTYPE_PID);
 	/*
-	 * We ask for writable memory if any access flags other than
-	 * "remote read" are set.  "Local write" and "remote write"
+	 * We ask for writable memory if any of the following
+	 * access flags are set.  "Local write" and "remote write"
 	 * obviously require write access.  "Remote atomic" can do
 	 * things like fetch and add, which will modify memory, and
 	 * "MW bind" can change permissions by binding a window.
 	 */
-	umem->writable  = !!(access & ~IB_ACCESS_REMOTE_READ);
+	umem->writable  = !!(access &
+		(IB_ACCESS_LOCAL_WRITE   | IB_ACCESS_REMOTE_WRITE |
+		 IB_ACCESS_REMOTE_ATOMIC | IB_ACCESS_MW_BIND));
 
 	if (access & IB_ACCESS_ON_DEMAND) {
 		ret = ib_umem_odp_get(context, umem);

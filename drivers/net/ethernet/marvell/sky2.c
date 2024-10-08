@@ -99,7 +99,7 @@ static int legacy_pme = 0;
 module_param(legacy_pme, int, 0);
 MODULE_PARM_DESC(legacy_pme, "Legacy power management");
 
-static DEFINE_PCI_DEVICE_TABLE(sky2_id_table) = {
+static const struct pci_device_id sky2_id_table[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_SYSKONNECT, 0x9000) }, /* SK-9Sxx */
 	{ PCI_DEVICE(PCI_VENDOR_ID_SYSKONNECT, 0x9E00) }, /* SK-9Exx */
 	{ PCI_DEVICE(PCI_VENDOR_ID_SYSKONNECT, 0x9E01) }, /* SK-9E21M */
@@ -1897,14 +1897,14 @@ static netdev_tx_t sky2_xmit_frame(struct sk_buff *skb,
 	ctrl = 0;
 
 	/* Add VLAN tag, can piggyback on LRGLEN or ADDR64 */
-	if (vlan_tx_tag_present(skb)) {
+	if (skb_vlan_tag_present(skb)) {
 		if (!le) {
 			le = get_tx_le(sky2, &slot);
 			le->addr = 0;
 			le->opcode = OP_VLAN|HW_OWNER;
 		} else
 			le->opcode |= OP_VLAN;
-		le->length = cpu_to_be16(vlan_tx_tag_get(skb));
+		le->length = cpu_to_be16(skb_vlan_tag_get(skb));
 		ctrl |= INS_VLAN;
 	}
 
@@ -2595,7 +2595,7 @@ static struct sk_buff *sky2_receive(struct net_device *dev,
 	sky2->rx_next = (sky2->rx_next + 1) % sky2->rx_pending;
 	prefetch(sky2->rx_ring + sky2->rx_next);
 
-	if (vlan_tx_tag_present(re->skb))
+	if (skb_vlan_tag_present(re->skb))
 		count -= VLAN_HLEN;	/* Account for vlan tag */
 
 	/* This chip has hardware problems that generates bogus status.
@@ -3906,19 +3906,19 @@ static struct rtnl_link_stats64 *sky2_get_stats(struct net_device *dev,
 	u64 _bytes, _packets;
 
 	do {
-		start = u64_stats_fetch_begin_bh(&sky2->rx_stats.syncp);
+		start = u64_stats_fetch_begin_irq(&sky2->rx_stats.syncp);
 		_bytes = sky2->rx_stats.bytes;
 		_packets = sky2->rx_stats.packets;
-	} while (u64_stats_fetch_retry_bh(&sky2->rx_stats.syncp, start));
+	} while (u64_stats_fetch_retry_irq(&sky2->rx_stats.syncp, start));
 
 	stats->rx_packets = _packets;
 	stats->rx_bytes = _bytes;
 
 	do {
-		start = u64_stats_fetch_begin_bh(&sky2->tx_stats.syncp);
+		start = u64_stats_fetch_begin_irq(&sky2->tx_stats.syncp);
 		_bytes = sky2->tx_stats.bytes;
 		_packets = sky2->tx_stats.packets;
-	} while (u64_stats_fetch_retry_bh(&sky2->tx_stats.syncp, start));
+	} while (u64_stats_fetch_retry_irq(&sky2->tx_stats.syncp, start));
 
 	stats->tx_packets = _packets;
 	stats->tx_bytes = _bytes;

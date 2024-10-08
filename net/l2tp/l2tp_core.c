@@ -1019,7 +1019,7 @@ static int l2tp_xmit_core(struct l2tp_session *session, struct sk_buff *skb,
 	}
 
 	/* Queue the packet to IP for output */
-	skb->local_df = 1;
+	skb->ignore_df = 1;
 #if IS_ENABLED(CONFIG_IPV6)
 	if (skb->sk->sk_family == PF_INET6 && !tunnel->v4mapped)
 		error = inet6_csk_xmit(skb, NULL);
@@ -1394,7 +1394,7 @@ static int l2tp_tunnel_sock_create(struct net *net,
 		if (!cfg->use_udp_checksums)
 			sock->sk->sk_no_check_tx = 1;
 
-		udp_set_convert_csum(sock->sk, true);
+		inet_inc_convert_csum(sock->sk);
 
 		break;
 

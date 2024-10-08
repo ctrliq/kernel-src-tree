@@ -99,7 +99,7 @@ static unsigned int ipv6_helper(const struct nf_hook_ops *ops,
 				struct sk_buff *skb,
 				const struct net_device *in,
 				const struct net_device *out,
-				int (*okfn)(struct sk_buff *))
+				const struct nf_hook_state *state)
 {
 	struct nf_conn *ct;
 	const struct nf_conn_help *help;
@@ -137,7 +137,7 @@ static unsigned int ipv6_confirm(const struct nf_hook_ops *ops,
 				 struct sk_buff *skb,
 				 const struct net_device *in,
 				 const struct net_device *out,
-				 int (*okfn)(struct sk_buff *))
+				 const struct nf_hook_state *state)
 {
 	struct nf_conn *ct;
 	enum ip_conntrack_info ctinfo;
@@ -173,23 +173,23 @@ static unsigned int ipv6_conntrack_in(const struct nf_hook_ops *ops,
 				      struct sk_buff *skb,
 				      const struct net_device *in,
 				      const struct net_device *out,
-				      int (*okfn)(struct sk_buff *))
+				      const struct nf_hook_state *state)
 {
-	return nf_conntrack_in(dev_net(in), PF_INET6, ops->hooknum, skb);
+	return nf_conntrack_in(dev_net(state->in), PF_INET6, ops->hooknum, skb);
 }
 
 static unsigned int ipv6_conntrack_local(const struct nf_hook_ops *ops,
 					 struct sk_buff *skb,
 					 const struct net_device *in,
 					 const struct net_device *out,
-					 int (*okfn)(struct sk_buff *))
+					 const struct nf_hook_state *state)
 {
 	/* root is playing with raw sockets. */
 	if (skb->len < sizeof(struct ipv6hdr)) {
 		net_notice_ratelimited("ipv6_conntrack_local: packet too short\n");
 		return NF_ACCEPT;
 	}
-	return nf_conntrack_in(dev_net(out), PF_INET6, ops->hooknum, skb);
+	return nf_conntrack_in(dev_net(state->out), PF_INET6, ops->hooknum, skb);
 }
 
 static struct nf_hook_ops ipv6_conntrack_ops[] __read_mostly = {
@@ -290,10 +290,8 @@ ipv6_getorigdst(struct sock *sk, int optval, void __user *user, int *len)
 static int ipv6_tuple_to_nlattr(struct sk_buff *skb,
 				const struct nf_conntrack_tuple *tuple)
 {
-	if (nla_put(skb, CTA_IP_V6_SRC, sizeof(u_int32_t) * 4,
-		    &tuple->src.u3.ip6) ||
-	    nla_put(skb, CTA_IP_V6_DST, sizeof(u_int32_t) * 4,
-		    &tuple->dst.u3.ip6))
+	if (nla_put_in6_addr(skb, CTA_IP_V6_SRC, &tuple->src.u3.in6) ||
+	    nla_put_in6_addr(skb, CTA_IP_V6_DST, &tuple->dst.u3.in6))
 		goto nla_put_failure;
 	return 0;
 

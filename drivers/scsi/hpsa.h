@@ -46,14 +46,38 @@ struct hpsa_scsi_dev_t {
 	unsigned char model[16];        /* bytes 16-31 of inquiry data */
 	unsigned char raid_level;	/* from inquiry page 0xC1 */
 	unsigned char volume_offline;	/* discovered via TUR or VPD */
+	u16 queue_depth;		/* max queue_depth for this device */
+	atomic_t reset_cmds_out;	/* Count of commands to-be affected */
+	atomic_t ioaccel_cmds_out;	/* Only used for physical devices
+					 * counts commands sent to physical
+					 * device via "ioaccel" path.
+					 */
 	u32 ioaccel_handle;
 	int offload_config;		/* I/O accel RAID offload configured */
 	int offload_enabled;		/* I/O accel RAID offload enabled */
+	int offload_to_be_enabled;
+	int hba_ioaccel_enabled;
 	int offload_to_mirror;		/* Send next I/O accelerator RAID
 					 * offload request to mirror drive
 					 */
 	struct raid_map_data raid_map;	/* I/O accelerator RAID map */
 
+	/*
+	 * Pointers from logical drive map indices to the phys drives that
+	 * make those logical drives.  Note, multiple logical drives may
+	 * share physical drives.  You can have for instance 5 physical
+	 * drives with 3 logical drives each using those same 5 physical
+	 * disks. We need these pointers for counting i/o's out to physical
+	 * devices in order to honor physical device queue depth limits.
+	 */
+	struct hpsa_scsi_dev_t *phys_disk[RAID_MAP_MAX_ENTRIES];
+	int nphysical_disks;
+	int supports_aborts;
+#define HPSA_DO_NOT_EXPOSE	0x0
+#define HPSA_SG_ATTACH		0x1
+#define HPSA_ULD_ATTACH		0x2
+#define HPSA_SCSI_ADD		(HPSA_SG_ATTACH | HPSA_ULD_ATTACH)
+	u8 expose_state;
 };
 
 struct reply_queue_buffer {
@@ -139,6 +163,7 @@ struct ctlr_info {
 	u8 max_cmd_sg_entries;
 	int chainsize;
 	struct SGDescriptor **cmd_sg_list;
+	struct ioaccel2_sg_element **ioaccel2_cmd_sg_list;
 
 	/* pointers to command and error info pool */
 	struct CommandList 	*cmd_pool;
@@ -167,9 +192,8 @@ struct ctlr_info {
 	unsigned long transMethod;
 
 	/* cap concurrent passthrus at some reasonable maximum */
-#define HPSA_MAX_CONCURRENT_PASSTHRUS (20)
-	spinlock_t passthru_count_lock; /* protects passthru_count */
-	int passthru_count;
+#define HPSA_MAX_CONCURRENT_PASSTHRUS (10)
+	atomic_t passthru_cmds_avail;
 
 	/*
 	 * Performant mode completion buffers
@@ -193,9 +217,11 @@ struct ctlr_info {
 	atomic_t firmware_flash_in_progress;
 	u32 __percpu *lockup_detected;
 	struct delayed_work monitor_ctlr_work;
+	struct delayed_work rescan_ctlr_work;
 	int remove_in_progress;
 	/* Address of h->q[x] is passed to intr handler to know which queue */
 	u8 q[MAX_REPLY_QUEUES];
+	char intrname[MAX_REPLY_QUEUES][16];	/* "hpsa0-msix00" names */
 	u32 TMFSupportFlags; /* cache what task mgmt funcs are supported. */
 #define HPSATMF_BITS_SUPPORTED  (1 << 0)
 #define HPSATMF_PHYS_LUN_RESET  (1 << 1)
@@ -207,6 +233,7 @@ struct ctlr_info {
 #define HPSATMF_PHYS_QRY_TASK   (1 << 7)
 #define HPSATMF_PHYS_QRY_TSET   (1 << 8)
 #define HPSATMF_PHYS_QRY_ASYNC  (1 << 9)
+#define HPSATMF_IOACCEL_ENABLED (1 << 15)
 #define HPSATMF_MASK_SUPPORTED  (1 << 16)
 #define HPSATMF_LOG_LUN_RESET   (1 << 17)
 #define HPSATMF_LOG_NEX_RESET   (1 << 18)
@@ -236,6 +263,13 @@ struct ctlr_info {
 	struct list_head offline_device_list;
 	int	acciopath_status;
 	int	raid_offload_debug;
+	int	needs_abort_tags_swizzled;
+	struct workqueue_struct *resubmit_wq;
+	struct workqueue_struct *rescan_ctlr_wq;
+	atomic_t abort_cmds_available;
+	wait_queue_head_t abort_cmd_wait_queue;
+	wait_queue_head_t event_sync_wait_queue;
+	struct mutex reset_mutex;
 };
 
 struct offline_device_entry {
@@ -294,6 +328,8 @@ struct offline_device_entry {
  */
 #define SA5_DOORBELL	0x20
 #define SA5_REQUEST_PORT_OFFSET	0x40
+#define SA5_REQUEST_PORT64_LO_OFFSET 0xC0
+#define SA5_REQUEST_PORT64_HI_OFFSET 0xC4
 #define SA5_REPLY_INTR_MASK_OFFSET	0x34
 #define SA5_REPLY_PORT_OFFSET		0x44
 #define SA5_INTR_STATUS		0x30

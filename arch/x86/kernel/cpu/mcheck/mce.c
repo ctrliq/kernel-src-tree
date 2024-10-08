@@ -58,7 +58,7 @@ static DEFINE_MUTEX(mce_chrdev_read_mutex);
 #define CREATE_TRACE_POINTS
 #include <trace/events/mce.h>
 
-#define SPINUNIT 100	/* 100ns */
+#define SPINUNIT		100	/* 100ns */
 
 DEFINE_PER_CPU(unsigned, mce_exception_count);
 
@@ -87,9 +87,6 @@ static DECLARE_WAIT_QUEUE_HEAD(mce_chrdev_wait);
 
 static DEFINE_PER_CPU(struct mce, mces_seen);
 static int			cpu_missing;
-
-/* CMCI storm detection filter */
-static DEFINE_PER_CPU(unsigned long, mce_polled_error);
 
 /*
  * MCA banks polled by the period polling timer for corrected events.
@@ -590,8 +587,9 @@ DEFINE_PER_CPU(unsigned, mce_poll_count);
  * is already totally * confused. In this case it's likely it will
  * not fully execute the machine check handler either.
  */
-void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
+bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 {
+	bool error_logged = false;
 	struct mce m;
 	int i;
 
@@ -613,7 +611,7 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 		if (!(m.status & MCI_STATUS_VAL))
 			continue;
 
-		this_cpu_write(mce_polled_error, 1);
+
 		/*
 		 * Uncorrected or signalled events are handled by the exception
 		 * handler when it is enabled, so don't process those here.
@@ -632,8 +630,10 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 		 * Don't get the IP here because it's unlikely to
 		 * have anything to do with the actual error location.
 		 */
-		if (!(flags & MCP_DONTLOG) && !mca_cfg.dont_log_ce)
+		if (!(flags & MCP_DONTLOG) && !mca_cfg.dont_log_ce) {
+			error_logged = true;
 			mce_log(&m);
+		}
 
 		/*
 		 * Clear state for this bank.
@@ -647,6 +647,8 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 	 */
 
 	sync_core();
+
+	return error_logged;
 }
 EXPORT_SYMBOL_GPL(machine_check_poll);
 
@@ -701,7 +703,7 @@ static int mce_timed_out(u64 *t, const char *msg)
 	if (!mca_cfg.monarch_timeout)
 		goto out;
 	if ((s64)*t < SPINUNIT) {
-		if (mca_cfg.tolerant <= 1)
+		if (mca_cfg.tolerant < 1)
 			mce_panic(msg, NULL, NULL);
 		cpu_missing = 1;
 		return 1;
@@ -958,51 +960,6 @@ static void mce_clear_state(unsigned long *toclear)
 }
 
 /*
- * Need to save faulting physical address associated with a process
- * in the machine check handler some place where we can grab it back
- * later in mce_notify_process()
- */
-#define	MCE_INFO_MAX	16
-
-static struct mce_info {
-	atomic_t		inuse;
-	struct task_struct	*t;
-	__u64			paddr;
-	int			restartable;
-} mce_info[MCE_INFO_MAX];
-
-static void mce_save_info(__u64 addr, int c)
-{
-	struct mce_info *mi;
-
-	for (mi = mce_info; mi < &mce_info[MCE_INFO_MAX]; mi++) {
-		if (atomic_cmpxchg(&mi->inuse, 0, 1) == 0) {
-			mi->t = current;
-			mi->paddr = addr;
-			mi->restartable = c;
-			return;
-		}
-	}
-
-	mce_panic("Too many concurrent recoverable errors", NULL, NULL);
-}
-
-static struct mce_info *mce_find_info(void)
-{
-	struct mce_info *mi;
-
-	for (mi = mce_info; mi < &mce_info[MCE_INFO_MAX]; mi++)
-		if (atomic_read(&mi->inuse) && mi->t == current)
-			return mi;
-	return NULL;
-}
-
-static void mce_clear_info(struct mce_info *mi)
-{
-	atomic_set(&mi->inuse, 0);
-}
-
-/*
  * The actual machine check handler. This only handles real
  * exceptions when something got corrupted coming in through int 18.
  *
@@ -1039,6 +996,8 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	DECLARE_BITMAP(toclear, MAX_NR_BANKS);
 	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS);
 	char *msg = "Unknown";
+	u64 recover_paddr = ~0ull;
+	int flags = MF_ACTION_REQUIRED;
 
 	this_cpu_inc(mce_exception_count);
 
@@ -1158,9 +1117,9 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 		if (no_way_out)
 			mce_panic("Fatal machine check on current CPU", &m, msg);
 		if (worst == MCE_AR_SEVERITY) {
-			/* schedule action before return to userland */
-			mce_save_info(m.addr, m.mcgstatus & MCG_STATUS_RIPV);
-			set_thread_flag(TIF_MCE_NOTIFY);
+			recover_paddr = m.addr;
+			if (!(m.mcgstatus & MCG_STATUS_RIPV))
+				flags |= MF_MUST_KILL;
 		} else if (kill_it) {
 			force_sig(SIGBUS, current);
 		}
@@ -1171,6 +1130,23 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
 out:
 	sync_core();
+
+	if (recover_paddr == ~0ull)
+		return;
+
+	pr_err("Uncorrected hardware memory error in user-access at %llx",
+		 recover_paddr);
+	/*
+	 * We must call memory_failure() here even if the current process is
+	 * doomed. We still need to mark the page as poisoned and alert any
+	 * other users of the page.
+	 */
+	local_irq_enable();
+	if (memory_failure(recover_paddr >> PAGE_SHIFT, MCE_VECTOR, flags) < 0) {
+		pr_err("Memory error not recovered");
+		force_sig(SIGBUS, current);
+	}
+	local_irq_disable();
 }
 EXPORT_SYMBOL_GPL(do_machine_check);
 
@@ -1186,42 +1162,6 @@ int memory_failure(unsigned long pfn, int vector, int flags)
 	return 0;
 }
 #endif
-
-/*
- * Called in process context that interrupted by MCE and marked with
- * TIF_MCE_NOTIFY, just before returning to erroneous userland.
- * This code is allowed to sleep.
- * Attempt possible recovery such as calling the high level VM handler to
- * process any corrupted pages, and kill/signal current process if required.
- * Action required errors are handled here.
- */
-void mce_notify_process(void)
-{
-	unsigned long pfn;
-	struct mce_info *mi = mce_find_info();
-	int flags = MF_ACTION_REQUIRED;
-
-	if (!mi)
-		mce_panic("Lost physical address for unconsumed uncorrectable error", NULL, NULL);
-	pfn = mi->paddr >> PAGE_SHIFT;
-
-	clear_thread_flag(TIF_MCE_NOTIFY);
-
-	pr_err("Uncorrected hardware memory error in user-access at %llx",
-		 mi->paddr);
-	/*
-	 * We must call memory_failure() here even if the current process is
-	 * doomed. We still need to mark the page as poisoned and alert any
-	 * other users of the page.
-	 */
-	if (!mi->restartable)
-		flags |= MF_MUST_KILL;
-	if (memory_failure(pfn, MCE_VECTOR, flags) < 0) {
-		pr_err("Memory error not recovered");
-		force_sig(SIGBUS, current);
-	}
-	mce_clear_info(mi);
-}
 
 /*
  * Action optional processing happens here (picking up
@@ -1266,7 +1206,7 @@ void mce_log_therm_throt_event(__u64 status)
  * poller finds an MCE, poll 2x faster.  When the poller finds no more
  * errors, poll 2x slower (up to check_interval seconds).
  */
-static unsigned long check_interval = 5 * 60; /* 5 minutes */
+static unsigned long check_interval = INITIAL_CHECK_INTERVAL;
 
 static DEFINE_PER_CPU(unsigned long, mce_next_interval); /* in jiffies */
 static DEFINE_PER_CPU(struct timer_list, mce_timer);
@@ -1276,59 +1216,14 @@ static unsigned long mce_adjust_timer_default(unsigned long interval)
 	return interval;
 }
 
-static unsigned long (*mce_adjust_timer)(unsigned long interval) =
-	mce_adjust_timer_default;
+static unsigned long (*mce_adjust_timer)(unsigned long interval) = mce_adjust_timer_default;
 
-static int cmc_error_seen(void)
+static void __restart_timer(struct timer_list *t, unsigned long interval)
 {
-	unsigned long *v = &__get_cpu_var(mce_polled_error);
-
-	return test_and_clear_bit(0, v);
-}
-
-static void mce_timer_fn(unsigned long data)
-{
-	struct timer_list *t = &__get_cpu_var(mce_timer);
-	unsigned long iv;
-	int notify;
-
-	WARN_ON(smp_processor_id() != data);
-
-	if (mce_available(__this_cpu_ptr(&cpu_info))) {
-		machine_check_poll(MCP_TIMESTAMP,
-				&__get_cpu_var(mce_poll_banks));
-		mce_intel_cmci_poll();
-	}
-
-	/*
-	 * Alert userspace if needed.  If we logged an MCE, reduce the
-	 * polling interval, otherwise increase the polling interval.
-	 */
-	iv = __this_cpu_read(mce_next_interval);
-	notify = mce_notify_irq();
-	notify |= cmc_error_seen();
-	if (notify) {
-		iv = max(iv / 2, (unsigned long) HZ/100);
-	} else {
-		iv = min(iv * 2, round_jiffies_relative(check_interval * HZ));
-		iv = mce_adjust_timer(iv);
-	}
-	__this_cpu_write(mce_next_interval, iv);
-	/* Might have become 0 after CMCI storm subsided */
-	if (iv) {
-		t->expires = jiffies + iv;
-		add_timer_on(t, smp_processor_id());
-	}
-}
-
-/*
- * Ensure that the timer is firing in @interval from now.
- */
-void mce_timer_kick(unsigned long interval)
-{
-	struct timer_list *t = &__get_cpu_var(mce_timer);
 	unsigned long when = jiffies + interval;
-	unsigned long iv = __this_cpu_read(mce_next_interval);
+	unsigned long flags;
+
+	local_irq_save(flags);
 
 	if (timer_pending(t)) {
 		if (time_before(when, t->expires))
@@ -1337,6 +1232,53 @@ void mce_timer_kick(unsigned long interval)
 		t->expires = round_jiffies(when);
 		add_timer_on(t, smp_processor_id());
 	}
+
+	local_irq_restore(flags);
+}
+
+static void mce_timer_fn(unsigned long data)
+{
+	struct timer_list *t = &__get_cpu_var(mce_timer);
+	int cpu = smp_processor_id();
+	unsigned long iv;
+
+	WARN_ON(cpu != data);
+
+	iv = __this_cpu_read(mce_next_interval);
+
+	if (mce_available(__this_cpu_ptr(&cpu_info))) {
+		machine_check_poll(MCP_TIMESTAMP, this_cpu_ptr(&mce_poll_banks));
+
+		if (mce_intel_cmci_poll()) {
+			iv = mce_adjust_timer(iv);
+			goto done;
+		}
+	}
+
+	/*
+	 * Alert userspace if needed. If we logged an MCE, reduce the polling
+	 * interval, otherwise increase the polling interval.
+	 */
+	if (mce_notify_irq())
+		iv = max(iv / 2, (unsigned long) HZ/100);
+	else
+		iv = min(iv * 2, round_jiffies_relative(check_interval * HZ));
+
+done:
+	__this_cpu_write(mce_next_interval, iv);
+	__restart_timer(t, iv);
+}
+
+/*
+ * Ensure that the timer is firing in @interval from now.
+ */
+void mce_timer_kick(unsigned long interval)
+{
+	struct timer_list *t = &__get_cpu_var(mce_timer);
+	unsigned long iv = __this_cpu_read(mce_next_interval);
+
+	__restart_timer(t, interval);
+
 	if (interval < iv)
 		__this_cpu_write(mce_next_interval, interval);
 }
@@ -1638,7 +1580,7 @@ static void __mcheck_cpu_init_vendor(struct cpuinfo_x86 *c)
 	switch (c->x86_vendor) {
 	case X86_VENDOR_INTEL:
 		mce_intel_feature_init(c);
-		mce_adjust_timer = mce_intel_adjust_timer;
+		mce_adjust_timer = cmci_intel_adjust_timer;
 		break;
 	case X86_VENDOR_AMD:
 		mce_amd_feature_init(c);
@@ -2142,7 +2084,7 @@ static ssize_t set_bank(struct device *s, struct device_attribute *attr,
 {
 	u64 new;
 
-	if (strict_strtoull(buf, 0, &new) < 0)
+	if (kstrtou64(buf, 0, &new) < 0)
 		return -EINVAL;
 
 	attr_to_bank(attr)->ctl = new;
@@ -2180,7 +2122,7 @@ static ssize_t set_ignore_ce(struct device *s,
 {
 	u64 new;
 
-	if (strict_strtoull(buf, 0, &new) < 0)
+	if (kstrtou64(buf, 0, &new) < 0)
 		return -EINVAL;
 
 	if (mca_cfg.ignore_ce ^ !!new) {
@@ -2204,7 +2146,7 @@ static ssize_t set_cmci_disabled(struct device *s,
 {
 	u64 new;
 
-	if (strict_strtoull(buf, 0, &new) < 0)
+	if (kstrtou64(buf, 0, &new) < 0)
 		return -EINVAL;
 
 	if (mca_cfg.cmci_disabled ^ !!new) {

@@ -54,7 +54,6 @@
 
 #define KVM_ARCH_WANT_MMU_NOTIFIER
 
-struct kvm;
 extern int kvm_unmap_hva(struct kvm *kvm, unsigned long hva);
 extern int kvm_unmap_hva_range(struct kvm *kvm,
 			       unsigned long start, unsigned long end);
@@ -84,10 +83,6 @@ static inline void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
 /* Physical Address Mask - allowed range of real mode RAM access */
 #define KVM_PAM			0x0fffffffffffffffULL
 
-struct kvm;
-struct kvm_run;
-struct kvm_vcpu;
-
 struct lppaca;
 struct slb_shadow;
 struct dtl_entry;
@@ -116,18 +111,19 @@ struct kvm_vcpu_stat {
 	u32 emulated_inst_exits;
 	u32 dec_exits;
 	u32 ext_intr_exits;
+	u32 halt_successful_poll;
 	u32 halt_wakeup;
 	u32 dbell_exits;
 	u32 gdbell_exits;
+	u32 ld;
+	u32 st;
 #ifdef CONFIG_PPC_BOOK3S
 	u32 pf_storage;
 	u32 pf_instruc;
 	u32 sp_storage;
 	u32 sp_instruc;
 	u32 queue_intr;
-	u32 ld;
 	u32 ld_slow;
-	u32 st;
 	u32 st_slow;
 #endif
 };
@@ -285,23 +281,25 @@ struct kvm_arch {
 
 /*
  * Struct for a virtual core.
- * Note: entry_exit_count combines an entry count in the bottom 8 bits
- * and an exit count in the next 8 bits.  This is so that we can
- * atomically increment the entry count iff the exit count is 0
- * without taking the lock.
+ * Note: entry_exit_map combines a bitmap of threads that have entered
+ * in the bottom 8 bits and a bitmap of threads that have exited in the
+ * next 8 bits.  This is so that we can atomically set the entry bit
+ * iff the exit map is 0 without taking a lock.
  */
 struct kvmppc_vcore {
 	int n_runnable;
 	int n_busy;
 	int num_threads;
-	int entry_exit_count;
+	int entry_exit_map;
 	int napping_threads;
 	int first_vcpuid;
 	u16 pcpu;
 	u16 last_cpu;
 	u8 vcore_state;
 	u8 in_guest;
+	struct kvmppc_vcore *master_vcore;
 	struct list_head runnable_threads;
+	struct list_head preempt_list;
 	spinlock_t lock;
 	wait_queue_head_t wq;
 	spinlock_t stoltb_lock;	/* protects stolen_tb and preempt_tb */
@@ -314,18 +312,28 @@ struct kvmppc_vcore {
 	u32 arch_compat;
 	ulong pcr;
 	ulong dpdes;		/* doorbell state (POWER8) */
-	void *mpp_buffer; /* Micro Partition Prefetch buffer */
-	bool mpp_buffer_is_valid;
+	ulong conferring_threads;
 };
 
-#define VCORE_ENTRY_COUNT(vc)	((vc)->entry_exit_count & 0xff)
-#define VCORE_EXIT_COUNT(vc)	((vc)->entry_exit_count >> 8)
+#define VCORE_ENTRY_MAP(vc)	((vc)->entry_exit_map & 0xff)
+#define VCORE_EXIT_MAP(vc)	((vc)->entry_exit_map >> 8)
+#define VCORE_IS_EXITING(vc)	(VCORE_EXIT_MAP(vc) != 0)
 
-/* Values for vcore_state */
+/* This bit is used when a vcore exit is triggered from outside the vcore */
+#define VCORE_EXIT_REQ		0x10000
+
+/*
+ * Values for vcore_state.
+ * Note that these are arranged such that lower values
+ * (< VCORE_SLEEPING) don't require stolen time accounting
+ * on load/unload, and higher values do.
+ */
 #define VCORE_INACTIVE	0
-#define VCORE_SLEEPING	1
-#define VCORE_RUNNING	2
-#define VCORE_EXITING	3
+#define VCORE_PREEMPT	1
+#define VCORE_PIGGYBACK	2
+#define VCORE_SLEEPING	3
+#define VCORE_RUNNING	4
+#define VCORE_EXITING	5
 
 /*
  * Struct used to manage memory for a virtual processor area
@@ -640,6 +648,7 @@ struct kvm_vcpu_arch {
 	int trap;
 	int state;
 	int ptid;
+	int thread_cpu;
 	bool timer_running;
 	wait_queue_head_t cpu_run;
 
@@ -681,6 +690,8 @@ struct kvm_vcpu_arch {
 	spinlock_t tbacct_lock;
 	u64 busy_stolen;
 	u64 busy_preempt;
+
+	u32 emul_inst;
 #endif
 };
 

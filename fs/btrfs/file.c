@@ -299,7 +299,7 @@ static int __btrfs_run_defrag_inode(struct btrfs_fs_info *fs_info,
 
 	/* get the inode */
 	key.objectid = defrag->root;
-	btrfs_set_key_type(&key, BTRFS_ROOT_ITEM_KEY);
+	key.type = BTRFS_ROOT_ITEM_KEY;
 	key.offset = (u64)-1;
 
 	index = srcu_read_lock(&fs_info->subvol_srcu);
@@ -311,7 +311,7 @@ static int __btrfs_run_defrag_inode(struct btrfs_fs_info *fs_info,
 	}
 
 	key.objectid = defrag->ino;
-	btrfs_set_key_type(&key, BTRFS_INODE_ITEM_KEY);
+	key.type = BTRFS_INODE_ITEM_KEY;
 	key.offset = 0;
 	inode = btrfs_iget(fs_info->sb, &key, inode_root, NULL);
 	if (IS_ERR(inode)) {
@@ -457,7 +457,7 @@ static noinline int btrfs_copy_from_user(loff_t pos, int num_pages,
 		if (unlikely(copied == 0))
 			break;
 
-		if (unlikely(copied < PAGE_CACHE_SIZE - offset)) {
+		if (copied < PAGE_CACHE_SIZE - offset) {
 			offset += copied;
 		} else {
 			pg++;
@@ -1432,7 +1432,7 @@ static noinline int check_can_nocow(struct inode *inode, loff_t pos,
 	u64 num_bytes;
 	int ret;
 
-	ret = btrfs_start_nocow_write(root);
+	ret = btrfs_start_write_no_snapshoting(root);
 	if (!ret)
 		return -ENOSPC;
 
@@ -1455,7 +1455,7 @@ static noinline int check_can_nocow(struct inode *inode, loff_t pos,
 	ret = can_nocow_extent(inode, lockstart, &num_bytes, NULL, NULL, NULL);
 	if (ret <= 0) {
 		ret = 0;
-		btrfs_end_nocow_write(root);
+		btrfs_end_write_no_snapshoting(root);
 	} else {
 		*write_bytes = min_t(size_t, *write_bytes ,
 				     num_bytes - pos + lockstart);
@@ -1485,9 +1485,8 @@ static noinline ssize_t __btrfs_buffered_write(struct file *file,
 	bool force_page_uptodate = false;
 	bool need_unlock;
 
-	nrptrs = min((iov_iter_count(i) + PAGE_CACHE_SIZE - 1) /
-		     PAGE_CACHE_SIZE, PAGE_CACHE_SIZE /
-		     (sizeof(struct page *)));
+	nrptrs = min(DIV_ROUND_UP(iov_iter_count(i), PAGE_CACHE_SIZE),
+			PAGE_CACHE_SIZE / (sizeof(struct page *)));
 	nrptrs = min(nrptrs, current->nr_dirtied_pause - current->nr_dirtied);
 	nrptrs = max(nrptrs, 8);
 	pages = kmalloc(nrptrs * sizeof(struct page *), GFP_KERNEL);
@@ -1501,8 +1500,8 @@ static noinline ssize_t __btrfs_buffered_write(struct file *file,
 		size_t write_bytes = min(iov_iter_count(i),
 					 nrptrs * (size_t)PAGE_CACHE_SIZE -
 					 offset);
-		size_t num_pages = (write_bytes + offset +
-				    PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+		size_t num_pages = DIV_ROUND_UP(write_bytes + offset,
+						PAGE_CACHE_SIZE);
 		size_t reserve_bytes;
 		size_t dirty_pages;
 		size_t copied;
@@ -1530,9 +1529,8 @@ static noinline ssize_t __btrfs_buffered_write(struct file *file,
 				 * our prealloc extent may be smaller than
 				 * write_bytes, so scale down.
 				 */
-				num_pages = (write_bytes + offset +
-					     PAGE_CACHE_SIZE - 1) >>
-					PAGE_CACHE_SHIFT;
+				num_pages = DIV_ROUND_UP(write_bytes + offset,
+							 PAGE_CACHE_SIZE);
 				reserve_bytes = num_pages << PAGE_CACHE_SHIFT;
 				ret = 0;
 			} else {
@@ -1549,7 +1547,7 @@ static noinline ssize_t __btrfs_buffered_write(struct file *file,
 				btrfs_free_reserved_data_space(inode,
 							       reserve_bytes);
 			else
-				btrfs_end_nocow_write(root);
+				btrfs_end_write_no_snapshoting(root);
 			break;
 		}
 
@@ -1594,9 +1592,8 @@ again:
 			dirty_pages = 0;
 		} else {
 			force_page_uptodate = false;
-			dirty_pages = (copied + offset +
-				       PAGE_CACHE_SIZE - 1) >>
-				       PAGE_CACHE_SHIFT;
+			dirty_pages = DIV_ROUND_UP(copied + offset,
+						   PAGE_CACHE_SIZE);
 		}
 
 		/*
@@ -1639,7 +1636,7 @@ again:
 
 		release_bytes = 0;
 		if (only_release_metadata)
-			btrfs_end_nocow_write(root);
+			btrfs_end_write_no_snapshoting(root);
 
 		if (only_release_metadata && copied > 0) {
 			u64 lockstart = round_down(pos, root->sectorsize);
@@ -1668,7 +1665,7 @@ again:
 
 	if (release_bytes) {
 		if (only_release_metadata) {
-			btrfs_end_nocow_write(root);
+			btrfs_end_write_no_snapshoting(root);
 			btrfs_delalloc_release_metadata(inode, release_bytes);
 		} else {
 			btrfs_delalloc_release_space(inode, release_bytes);
@@ -1684,6 +1681,7 @@ static ssize_t __btrfs_direct_write(struct kiocb *iocb,
 				    loff_t *ppos, size_t count, size_t ocount)
 {
 	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
 	struct iov_iter i;
 	ssize_t written;
 	ssize_t written_buffered;
@@ -1709,13 +1707,10 @@ static ssize_t __btrfs_direct_write(struct kiocb *iocb,
 	 * able to read what was just written.
 	 */
 	endbyte = pos + written_buffered - 1;
-	err = filemap_fdatawrite_range(file->f_mapping, pos, endbyte);
-	if (!err && test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
-			     &BTRFS_I(file_inode(file))->runtime_flags))
-		err = filemap_fdatawrite_range(file->f_mapping, pos, endbyte);
+	err = btrfs_fdatawrite_range(inode, pos, endbyte);
 	if (err)
 		goto out;
-	err = filemap_fdatawait_range(file->f_mapping, pos, endbyte);
+	err = filemap_fdatawait_range(inode->i_mapping, pos, endbyte);
 	if (err)
 		goto out;
 	written += written_buffered;
@@ -1820,7 +1815,7 @@ static ssize_t btrfs_file_aio_write(struct kiocb *iocb,
 	if (sync)
 		atomic_inc(&BTRFS_I(inode)->sync_writers);
 
-	if (unlikely(file->f_flags & O_DIRECT)) {
+	if (file->f_flags & O_DIRECT) {
 		num_written = __btrfs_direct_write(iocb, iov, nr_segs,
 						   pos, ppos, count, ocount);
 	} else {
@@ -1875,10 +1870,7 @@ static int start_ordered_ops(struct inode *inode, loff_t start, loff_t end)
 	int ret;
 
 	atomic_inc(&BTRFS_I(inode)->sync_writers);
-	ret = filemap_fdatawrite_range(inode->i_mapping, start, end);
-	if (!ret && test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
-			     &BTRFS_I(inode)->runtime_flags))
-		ret = filemap_fdatawrite_range(inode->i_mapping, start, end);
+	ret = btrfs_fdatawrite_range(inode, start, end);
 	atomic_dec(&BTRFS_I(inode)->sync_writers);
 
 	return ret;
@@ -2841,4 +2833,30 @@ int btrfs_auto_defrag_init(void)
 		return -ENOMEM;
 
 	return 0;
+}
+
+int btrfs_fdatawrite_range(struct inode *inode, loff_t start, loff_t end)
+{
+	int ret;
+
+	/*
+	 * So with compression we will find and lock a dirty page and clear the
+	 * first one as dirty, setup an async extent, and immediately return
+	 * with the entire range locked but with nobody actually marked with
+	 * writeback.  So we can't just filemap_write_and_wait_range() and
+	 * expect it to work since it will just kick off a thread to do the
+	 * actual work.  So we need to call filemap_fdatawrite_range _again_
+	 * since it will wait on the page lock, which won't be unlocked until
+	 * after the pages have been marked as writeback and so we're good to go
+	 * from there.  We have to do this otherwise we'll miss the ordered
+	 * extents and that results in badness.  Please Josef, do not think you
+	 * know better and pull this out at some point in the future, it is
+	 * right and you are wrong.
+	 */
+	ret = filemap_fdatawrite_range(inode->i_mapping, start, end);
+	if (!ret && test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+			     &BTRFS_I(inode)->runtime_flags))
+		ret = filemap_fdatawrite_range(inode->i_mapping, start, end);
+
+	return ret;
 }

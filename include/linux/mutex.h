@@ -57,7 +57,7 @@ struct mutex {
 	struct task_struct	*owner;
 #endif
 #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
-	RH_KABI_REPLACE_P(void			*spin_mlock,	/* Spinner MCS lock */
+	RH_KABI_REPLACE(void			*spin_mlock,	/* Spinner MCS lock */
 		          struct optimistic_spin_queue	*osq)	/* Spinner MCS lock */
 #endif
 #ifdef CONFIG_DEBUG_MUTEXES

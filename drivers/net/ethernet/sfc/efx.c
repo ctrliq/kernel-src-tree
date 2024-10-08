@@ -77,6 +77,7 @@ const char *const efx_reset_type_names[] = {
 	[RESET_TYPE_RECOVER_OR_ALL]     = "RECOVER_OR_ALL",
 	[RESET_TYPE_WORLD]              = "WORLD",
 	[RESET_TYPE_RECOVER_OR_DISABLE] = "RECOVER_OR_DISABLE",
+	[RESET_TYPE_DATAPATH]           = "DATAPATH",
 	[RESET_TYPE_MC_BIST]		= "MC_BIST",
 	[RESET_TYPE_DISABLE]            = "DISABLE",
 	[RESET_TYPE_TX_WATCHDOG]        = "TX_WATCHDOG",
@@ -963,6 +964,16 @@ void efx_link_set_wanted_fc(struct efx_nic *efx, u8 wanted_fc)
 
 static void efx_fini_port(struct efx_nic *efx);
 
+/* We assume that efx->type->reconfigure_mac will always try to sync RX
+ * filters and therefore needs to read-lock the filter table against freeing
+ */
+void efx_mac_reconfigure(struct efx_nic *efx)
+{
+	down_read(&efx->filter_sem);
+	efx->type->reconfigure_mac(efx);
+	up_read(&efx->filter_sem);
+}
+
 /* Push loopback/power/transmit disable settings to the PHY, and reconfigure
  * the MAC appropriately. All other PHY configuration changes are pushed
  * through phy_op->set_settings(), and pushed asynchronously to the MAC
@@ -1016,7 +1027,7 @@ static void efx_mac_work(struct work_struct *data)
 
 	mutex_lock(&efx->mac_lock);
 	if (efx->port_enabled)
-		efx->type->reconfigure_mac(efx);
+		efx_mac_reconfigure(efx);
 	mutex_unlock(&efx->mac_lock);
 }
 
@@ -1056,7 +1067,7 @@ static int efx_init_port(struct efx_nic *efx)
 
 	/* Reconfigure the MAC before creating dma queues (required for
 	 * Falcon/A1 where RX_INGR_EN/TX_DRAIN_EN isn't supported) */
-	efx->type->reconfigure_mac(efx);
+	efx_mac_reconfigure(efx);
 
 	/* Ensure the PHY advertises the correct flow control settings */
 	rc = efx->phy_op->reconfigure(efx);
@@ -1082,7 +1093,7 @@ static void efx_start_port(struct efx_nic *efx)
 	efx->port_enabled = true;
 
 	/* Ensure MAC ingress/egress is enabled */
-	efx->type->reconfigure_mac(efx);
+	efx_mac_reconfigure(efx);
 
 	mutex_unlock(&efx->mac_lock);
 }
@@ -1215,9 +1226,11 @@ static int efx_init_io(struct efx_nic *efx)
 	struct pci_dev *pci_dev = efx->pci_dev;
 	dma_addr_t dma_mask = efx->type->max_dma_mask;
 	unsigned int mem_map_size = efx->type->mem_map_size(efx);
-	int rc;
+	int rc, bar;
 
 	netif_dbg(efx, probe, efx->net_dev, "initialising I/O\n");
+
+	bar = efx->type->mem_bar;
 
 	rc = pci_enable_device(pci_dev);
 	if (rc) {
@@ -1249,8 +1262,8 @@ static int efx_init_io(struct efx_nic *efx)
 	netif_dbg(efx, probe, efx->net_dev,
 		  "using DMA mask %llx\n", (unsigned long long) dma_mask);
 
-	efx->membase_phys = pci_resource_start(efx->pci_dev, EFX_MEM_BAR);
-	rc = pci_request_region(pci_dev, EFX_MEM_BAR, "sfc");
+	efx->membase_phys = pci_resource_start(efx->pci_dev, bar);
+	rc = pci_request_region(pci_dev, bar, "sfc");
 	if (rc) {
 		netif_err(efx, probe, efx->net_dev,
 			  "request for memory BAR failed\n");
@@ -1273,7 +1286,7 @@ static int efx_init_io(struct efx_nic *efx)
 	return 0;
 
  fail4:
-	pci_release_region(efx->pci_dev, EFX_MEM_BAR);
+	pci_release_region(efx->pci_dev, bar);
  fail3:
 	efx->membase_phys = 0;
  fail2:
@@ -1284,6 +1297,8 @@ static int efx_init_io(struct efx_nic *efx)
 
 static void efx_fini_io(struct efx_nic *efx)
 {
+	int bar;
+
 	netif_dbg(efx, drv, efx->net_dev, "shutting down I/O\n");
 
 	if (efx->membase) {
@@ -1292,11 +1307,23 @@ static void efx_fini_io(struct efx_nic *efx)
 	}
 
 	if (efx->membase_phys) {
-		pci_release_region(efx->pci_dev, EFX_MEM_BAR);
+		bar = efx->type->mem_bar;
+		pci_release_region(efx->pci_dev, bar);
 		efx->membase_phys = 0;
 	}
 
-	pci_disable_device(efx->pci_dev);
+	/* Don't disable bus-mastering if VFs are assigned */
+	if (!pci_vfs_assigned(efx->pci_dev))
+		pci_disable_device(efx->pci_dev);
+}
+
+void efx_set_default_rx_indir_table(struct efx_nic *efx)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(efx->rx_indir_table); i++)
+		efx->rx_indir_table[i] =
+			ethtool_rxfh_indir_default(i, efx->rss_spread);
 }
 
 static unsigned int efx_wanted_parallelism(struct efx_nic *efx)
@@ -1450,8 +1477,10 @@ static int efx_probe_interrupts(struct efx_nic *efx)
 		efx->rss_spread = ((efx->n_rx_channels > 1 ||
 				    !efx->type->sriov_wanted(efx)) ?
 				   efx->n_rx_channels : efx_vf_size(efx));
+		return 0;
 	}
 #endif
+	efx->rss_spread = efx->n_rx_channels;
 
 	return 0;
 }
@@ -1615,7 +1644,6 @@ static void efx_set_channels(struct efx_nic *efx)
 
 static int efx_probe_nic(struct efx_nic *efx)
 {
-	size_t i;
 	int rc;
 
 	netif_dbg(efx, probe, efx->net_dev, "creating NIC\n");
@@ -1638,10 +1666,9 @@ static int efx_probe_nic(struct efx_nic *efx)
 		goto fail2;
 
 	if (efx->n_channels > 1)
-		netdev_rss_key_fill(&efx->rx_hash_key, sizeof(efx->rx_hash_key));
-	for (i = 0; i < ARRAY_SIZE(efx->rx_indir_table); i++)
-		efx->rx_indir_table[i] =
-			ethtool_rxfh_indir_default(i, efx->rss_spread);
+		netdev_rss_key_fill(&efx->rx_hash_key,
+				    sizeof(efx->rx_hash_key));
+	efx_set_default_rx_indir_table(efx);
 
 	netif_set_real_num_tx_queues(efx->net_dev, efx->n_tx_channels);
 	netif_set_real_num_rx_queues(efx->net_dev, efx->n_rx_channels);
@@ -1672,10 +1699,11 @@ static int efx_probe_filters(struct efx_nic *efx)
 	int rc;
 
 	spin_lock_init(&efx->filter_lock);
-
+	init_rwsem(&efx->filter_sem);
+	down_write(&efx->filter_sem);
 	rc = efx->type->filter_table_probe(efx);
 	if (rc)
-		return rc;
+		goto out_unlock;
 
 #ifdef CONFIG_RFS_ACCEL
 	if (efx->type->offload_features & NETIF_F_NTUPLE) {
@@ -1684,12 +1712,14 @@ static int efx_probe_filters(struct efx_nic *efx)
 					   GFP_KERNEL);
 		if (!efx->rps_flow_id) {
 			efx->type->filter_table_remove(efx);
-			return -ENOMEM;
+			rc = -ENOMEM;
+			goto out_unlock;
 		}
 	}
 #endif
-
-	return 0;
+out_unlock:
+	up_write(&efx->filter_sem);
+	return rc;
 }
 
 static void efx_remove_filters(struct efx_nic *efx)
@@ -1697,12 +1727,16 @@ static void efx_remove_filters(struct efx_nic *efx)
 #ifdef CONFIG_RFS_ACCEL
 	kfree(efx->rps_flow_id);
 #endif
+	down_write(&efx->filter_sem);
 	efx->type->filter_table_remove(efx);
+	up_write(&efx->filter_sem);
 }
 
 static void efx_restore_filters(struct efx_nic *efx)
 {
+	down_read(&efx->filter_sem);
 	efx->type->filter_table_restore(efx);
+	up_read(&efx->filter_sem);
 }
 
 /**************************************************************************
@@ -1734,21 +1768,33 @@ static int efx_probe_all(struct efx_nic *efx)
 	}
 	efx->rxq_entries = efx->txq_entries = EFX_DEFAULT_DMAQ_SIZE;
 
+#ifdef CONFIG_SFC_SRIOV
+	rc = efx->type->vswitching_probe(efx);
+	if (rc) /* not fatal; the PF will still work fine */
+		netif_warn(efx, probe, efx->net_dev,
+			   "failed to setup vswitching rc=%d;"
+			   " VFs may not function\n", rc);
+#endif
+
 	rc = efx_probe_filters(efx);
 	if (rc) {
 		netif_err(efx, probe, efx->net_dev,
 			  "failed to create filter tables\n");
-		goto fail3;
+		goto fail4;
 	}
 
 	rc = efx_probe_channels(efx);
 	if (rc)
-		goto fail4;
+		goto fail5;
 
 	return 0;
 
- fail4:
+ fail5:
 	efx_remove_filters(efx);
+ fail4:
+#ifdef CONFIG_SFC_SRIOV
+	efx->type->vswitching_remove(efx);
+#endif
  fail3:
 	efx_remove_port(efx);
  fail2:
@@ -1838,6 +1884,9 @@ static void efx_remove_all(struct efx_nic *efx)
 {
 	efx_remove_channels(efx);
 	efx_remove_filters(efx);
+#ifdef CONFIG_SFC_SRIOV
+	efx->type->vswitching_remove(efx);
+#endif
 	efx_remove_port(efx);
 	efx_remove_nic(efx);
 }
@@ -2081,7 +2130,7 @@ static int efx_busy_poll(struct napi_struct *napi)
  *************************************************************************/
 
 /* Context: process, rtnl_lock() held. */
-static int efx_net_open(struct net_device *net_dev)
+int efx_net_open(struct net_device *net_dev)
 {
 	struct efx_nic *efx = netdev_priv(net_dev);
 	int rc;
@@ -2110,7 +2159,7 @@ static int efx_net_open(struct net_device *net_dev)
  * Note that the kernel will ignore our return code; this method
  * should really be a void.
  */
-static int efx_net_stop(struct net_device *net_dev)
+int efx_net_stop(struct net_device *net_dev)
 {
 	struct efx_nic *efx = netdev_priv(net_dev);
 
@@ -2168,7 +2217,7 @@ static int efx_change_mtu(struct net_device *net_dev, int new_mtu)
 
 	mutex_lock(&efx->mac_lock);
 	net_dev->mtu = new_mtu;
-	efx->type->reconfigure_mac(efx);
+	efx_mac_reconfigure(efx);
 	mutex_unlock(&efx->mac_lock);
 
 	efx_start_all(efx);
@@ -2181,6 +2230,8 @@ static int efx_set_mac_address(struct net_device *net_dev, void *data)
 	struct efx_nic *efx = netdev_priv(net_dev);
 	struct sockaddr *addr = data;
 	u8 *new_addr = addr->sa_data;
+	u8 old_addr[6];
+	int rc;
 
 	if (!is_valid_ether_addr(new_addr)) {
 		netif_err(efx, drv, efx->net_dev,
@@ -2189,13 +2240,20 @@ static int efx_set_mac_address(struct net_device *net_dev, void *data)
 		return -EADDRNOTAVAIL;
 	}
 
+	/* save old address */
+	ether_addr_copy(old_addr, net_dev->dev_addr);
 	ether_addr_copy(net_dev->dev_addr, new_addr);
-	if (efx->type->sriov_mac_address_changed)
-		efx->type->sriov_mac_address_changed(efx);
+	if (efx->type->set_mac_address) {
+		rc = efx->type->set_mac_address(efx);
+		if (rc) {
+			ether_addr_copy(net_dev->dev_addr, old_addr);
+			return rc;
+		}
+	}
 
 	/* Reconfigure the MAC */
 	mutex_lock(&efx->mac_lock);
-	efx->type->reconfigure_mac(efx);
+	efx_mac_reconfigure(efx);
 	mutex_unlock(&efx->mac_lock);
 
 	return 0;
@@ -2239,6 +2297,8 @@ static const struct net_device_ops efx_netdev_ops = {
 	.ndo_set_vf_vlan	= efx_sriov_set_vf_vlan,
 	.ndo_set_vf_spoofchk	= efx_sriov_set_vf_spoofchk,
 	.ndo_get_vf_config	= efx_sriov_get_vf_config,
+	.ndo_set_vf_link_state  = efx_sriov_set_vf_link_state,
+	.ndo_get_phys_port_id   = efx_sriov_get_phys_port_id,
 #endif
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller = efx_netpoll,
@@ -2424,7 +2484,8 @@ void efx_reset_down(struct efx_nic *efx, enum reset_type method)
 	efx_disable_interrupts(efx);
 
 	mutex_lock(&efx->mac_lock);
-	if (efx->port_initialized && method != RESET_TYPE_INVISIBLE)
+	if (efx->port_initialized && method != RESET_TYPE_INVISIBLE &&
+	    method != RESET_TYPE_DATAPATH)
 		efx->phy_op->fini(efx);
 	efx->type->fini(efx);
 }
@@ -2453,7 +2514,8 @@ int efx_reset_up(struct efx_nic *efx, enum reset_type method, bool ok)
 	if (!ok)
 		goto fail;
 
-	if (efx->port_initialized && method != RESET_TYPE_INVISIBLE) {
+	if (efx->port_initialized && method != RESET_TYPE_INVISIBLE &&
+	    method != RESET_TYPE_DATAPATH) {
 		rc = efx->phy_op->init(efx);
 		if (rc)
 			goto fail;
@@ -2466,7 +2528,18 @@ int efx_reset_up(struct efx_nic *efx, enum reset_type method, bool ok)
 	rc = efx_enable_interrupts(efx);
 	if (rc)
 		goto fail;
+
+#ifdef CONFIG_SFC_SRIOV
+	rc = efx->type->vswitching_restore(efx);
+	if (rc) /* not fatal; the PF will still work fine */
+		netif_warn(efx, probe, efx->net_dev,
+			   "failed to restore vswitching rc=%d;"
+			   " VFs may not function\n", rc);
+#endif
+
+	down_read(&efx->filter_sem);
 	efx_restore_filters(efx);
+	up_read(&efx->filter_sem);
 	if (efx->type->sriov_reset)
 		efx->type->sriov_reset(efx);
 
@@ -2556,9 +2629,7 @@ int efx_try_recovery(struct efx_nic *efx)
 	 * schedule a 'recover or reset', leading to this recovery handler.
 	 * Manually call the eeh failure check function.
 	 */
-	struct eeh_dev *eehdev =
-		of_node_to_eeh_dev(pci_device_to_OF_node(efx->pci_dev));
-
+	struct eeh_dev *eehdev = pci_dev_to_eeh_dev(efx->pci_dev);
 	if (eeh_dev_check_failure(eehdev)) {
 		/* The EEH mechanisms will handle the error and reset the
 		 * device if necessary.
@@ -2640,6 +2711,7 @@ void efx_schedule_reset(struct efx_nic *efx, enum reset_type type)
 	case RESET_TYPE_WORLD:
 	case RESET_TYPE_DISABLE:
 	case RESET_TYPE_RECOVER_OR_DISABLE:
+	case RESET_TYPE_DATAPATH:
 	case RESET_TYPE_MC_BIST:
 	case RESET_TYPE_MCDI_TIMEOUT:
 		method = type;
@@ -2690,6 +2762,8 @@ static const struct pci_device_id efx_pci_table[] = {
 	 .driver_data = (unsigned long) &siena_a0_nic_type},
 	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x0903),  /* SFC9120 PF */
 	 .driver_data = (unsigned long) &efx_hunt_a0_nic_type},
+	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x1903),  /* SFC9120 VF */
+	 .driver_data = (unsigned long) &efx_hunt_a0_vf_nic_type},
 	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x0923),  /* SFC9140 PF */
 	 .driver_data = (unsigned long) &efx_hunt_a0_nic_type},
 	{0}			/* end of list */
@@ -2844,7 +2918,8 @@ static void efx_pci_remove_main(struct efx_nic *efx)
 }
 
 /* Final NIC shutdown
- * This is called only at module unload (or hotplug removal).
+ * This is called only at module unload (or hotplug removal).  A PF can call
+ * this on its VFs to ensure they are unbound first.
  */
 static void efx_pci_remove(struct pci_dev *pci_dev)
 {
@@ -3046,7 +3121,8 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 	netif_info(efx, probe, efx->net_dev,
 		   "Solarflare NIC detected\n");
 
-	efx_probe_vpd_strings(efx);
+	if (!efx->type->is_vf)
+		efx_probe_vpd_strings(efx);
 
 	/* Set up basic I/O (BAR mappings etc) */
 	rc = efx_init_io(efx);
@@ -3114,7 +3190,7 @@ static int efx_pci_sriov_configure(struct pci_dev *dev, int num_vfs)
 		else
 			return num_vfs;
 	} else
-		return -ENOSYS;
+		return -EOPNOTSUPP;
 }
 #endif
 
@@ -3273,7 +3349,7 @@ static pci_ers_result_t efx_io_error_detected(struct pci_dev *pdev,
 	return status;
 }
 
-/* Fake a successfull reset, which will be performed later in efx_io_resume. */
+/* Fake a successful reset, which will be performed later in efx_io_resume. */
 static pci_ers_result_t efx_io_slot_reset(struct pci_dev *pdev)
 {
 	struct efx_nic *efx = pci_get_drvdata(pdev);
@@ -3365,9 +3441,11 @@ static int __init efx_init_module(void)
 	if (rc)
 		goto err_notifier;
 
+#ifdef CONFIG_SFC_SRIOV
 	rc = efx_init_sriov();
 	if (rc)
 		goto err_sriov;
+#endif
 
 	reset_workqueue = create_singlethread_workqueue("sfc_reset");
 	if (!reset_workqueue) {
@@ -3384,8 +3462,10 @@ static int __init efx_init_module(void)
  err_pci:
 	destroy_workqueue(reset_workqueue);
  err_reset:
+#ifdef CONFIG_SFC_SRIOV
 	efx_fini_sriov();
  err_sriov:
+#endif
 	unregister_netdevice_notifier(&efx_netdev_notifier);
  err_notifier:
 	return rc;
@@ -3397,7 +3477,9 @@ static void __exit efx_exit_module(void)
 
 	pci_unregister_driver(&efx_pci_driver);
 	destroy_workqueue(reset_workqueue);
+#ifdef CONFIG_SFC_SRIOV
 	efx_fini_sriov();
+#endif
 	unregister_netdevice_notifier(&efx_netdev_notifier);
 
 }

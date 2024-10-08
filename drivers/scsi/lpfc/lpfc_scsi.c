@@ -5338,7 +5338,15 @@ lpfc_target_reset_handler(struct scsi_cmnd *cmnd)
 	if (status == FAILED) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_FCP,
 			"0722 Target Reset rport failure: rdata x%p\n", rdata);
-		return FAILED;
+		if (pnode) {
+			spin_lock_irq(shost->host_lock);
+			pnode->nlp_flag &= ~NLP_NPR_ADISC;
+			pnode->nlp_fcp_info &= ~NLP_FCP_2_DEVICE;
+			spin_unlock_irq(shost->host_lock);
+		}
+		lpfc_reset_flush_io_context(vport, tgt_id, lun_id,
+					  LPFC_CTX_TGT);
+		return FAST_IO_FAIL;
 	}
 
 	scsi_event.event_type = FC_REG_SCSI_EVENT;
@@ -6010,9 +6018,8 @@ struct scsi_host_template lpfc_template_s3 = {
 	.shost_attrs		= lpfc_hba_attrs,
 	.max_sectors		= 0xFFFF,
 	.vendor_id		= LPFC_NL_VENDOR_ID,
-	.change_queue_depth	= scsi_change_queue_depth,
-	.use_blk_tags		= 1,
-	.track_queue_depth	= 1,
+	.change_queue_depth	= lpfc_change_queue_depth,
+	.change_queue_type	= lpfc_change_queue_type,
 };
 
 struct scsi_host_template lpfc_template = {

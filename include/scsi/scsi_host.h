@@ -7,6 +7,9 @@
 #include <linux/workqueue.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
+#ifndef __GENKSYMS__
+#include <linux/blk-mq.h>
+#endif
 #include <scsi/scsi.h>
 
 #include <linux/rh_kabi.h>
@@ -486,6 +489,9 @@ struct scsi_host_template {
 	 */
 	unsigned no_async_abort:1;
 
+	/* temporary flag to disable blk-mq I/O path */
+	RH_KABI_EXTEND(unsigned disable_blk_mq:1)
+
 	/*
 	 * Countdown for host blocking with no commands outstanding.
 	 */
@@ -615,15 +621,19 @@ struct Scsi_Host {
 	 * Area to keep a shared tag map (if needed, will be
 	 * NULL if not).
 	 */
+#ifndef __GENKSYMS__
+	union {
+		struct blk_queue_tag	*bqt;
+		struct blk_mq_tag_set	*tag_set;
+	};
+#else
 	struct blk_queue_tag	*bqt;
+#endif
 
-	/*
-	 * The following two fields are protected with host_lock;
-	 * however, eh routines can safely access during eh processing
-	 * without acquiring the lock.
-	 */
-	unsigned int host_busy;		   /* commands actually active on low-level */
-	unsigned int host_failed;	   /* commands that failed. */
+	RH_KABI_REPLACE(unsigned int host_busy, atomic_t host_busy)
+					   /* commands actually active on low-level */
+	unsigned int host_failed;	   /* commands that failed.
+					      protected by host_lock */
 	unsigned int host_eh_scheduled;    /* EH scheduled without command */
     
 	unsigned int host_no;  /* Used for IOCTL_GET_IDLUN, /proc/scsi et al. */
@@ -709,6 +719,11 @@ struct Scsi_Host {
 	/* The controller does not support WRITE SAME */
 	unsigned no_write_same:1;
 
+	RH_KABI_EXTEND(unsigned use_blk_mq:1)
+
+	/* The transport requires the LUN bits NOT to be stored in CDB[1] */
+	RH_KABI_FILL_HOLE(unsigned no_scsi2_lun_in_cdb:1)
+
 	/*
 	 * Optional work queue to be utilized by the transport
 	 */
@@ -720,13 +735,10 @@ struct Scsi_Host {
 	 */
 	struct workqueue_struct *tmf_work_q;
 
-	/* The transport requires the LUN bits NOT to be stored in CDB[1] */
-	unsigned no_scsi2_lun_in_cdb:1;
-
 	/*
 	 * Host has rejected a command because it was busy.
 	 */
-	unsigned int host_blocked;
+	RH_KABI_REPLACE(unsigned int host_blocked, atomic_t host_blocked)
 
 	/*
 	 * Value host_blocked counts down from
@@ -834,6 +846,13 @@ static inline int scsi_host_in_recovery(struct Scsi_Host *shost)
 		shost->shost_state == SHOST_CANCEL_RECOVERY ||
 		shost->shost_state == SHOST_DEL_RECOVERY ||
 		shost->tmf_in_progress;
+}
+
+extern bool scsi_use_blk_mq;
+
+static inline bool shost_use_blk_mq(struct Scsi_Host *shost)
+{
+	return shost->use_blk_mq;
 }
 
 extern int scsi_queue_work(struct Scsi_Host *, struct work_struct *);

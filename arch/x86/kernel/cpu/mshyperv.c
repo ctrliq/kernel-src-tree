@@ -18,6 +18,7 @@
 #include <linux/efi.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
+#include <linux/kexec.h>
 #include <asm/processor.h>
 #include <asm/hypervisor.h>
 #include <asm/hyperv.h>
@@ -27,9 +28,13 @@
 #include <asm/irq_regs.h>
 #include <asm/i8259.h>
 #include <asm/timer.h>
+#include <asm/reboot.h>
 
 struct ms_hyperv_info ms_hyperv;
 EXPORT_SYMBOL_GPL(ms_hyperv);
+
+static void (*hv_kexec_handler)(void);
+static void (*hv_crash_handler)(struct pt_regs *regs);
 
 #if IS_ENABLED(CONFIG_HYPERV)
 static void (*vmbus_handler)(void);
@@ -41,7 +46,7 @@ void hyperv_vector_handler(struct pt_regs *regs)
 	irq_enter();
 	exit_idle();
 
-	inc_irq_stat(irq_hv_callback_count);
+	rh_inc_irq_stat(irq_hv_callback_count);
 	if (vmbus_handler)
 		vmbus_handler();
 
@@ -68,7 +73,46 @@ void hv_remove_vmbus_irq(void)
 }
 EXPORT_SYMBOL_GPL(hv_setup_vmbus_irq);
 EXPORT_SYMBOL_GPL(hv_remove_vmbus_irq);
+
+void hv_setup_kexec_handler(void (*handler)(void))
+{
+	hv_kexec_handler = handler;
+}
+EXPORT_SYMBOL_GPL(hv_setup_kexec_handler);
+
+void hv_remove_kexec_handler(void)
+{
+	hv_kexec_handler = NULL;
+}
+EXPORT_SYMBOL_GPL(hv_remove_kexec_handler);
+
+void hv_setup_crash_handler(void (*handler)(struct pt_regs *regs))
+{
+	hv_crash_handler = handler;
+}
+EXPORT_SYMBOL_GPL(hv_setup_crash_handler);
+
+void hv_remove_crash_handler(void)
+{
+	hv_crash_handler = NULL;
+}
+EXPORT_SYMBOL_GPL(hv_remove_crash_handler);
 #endif
+
+static void hv_machine_shutdown(void)
+{
+	if (kexec_in_progress && hv_kexec_handler)
+		hv_kexec_handler();
+	native_machine_shutdown();
+}
+
+static void hv_machine_crash_shutdown(struct pt_regs *regs)
+{
+	if (hv_crash_handler)
+		hv_crash_handler(regs);
+	native_machine_crash_shutdown(regs);
+}
+
 
 static uint32_t  __init ms_hyperv_platform(void)
 {
@@ -117,6 +161,7 @@ static void __init ms_hyperv_init_platform(void)
 	 * Extract the features and hints
 	 */
 	ms_hyperv.features = cpuid_eax(HYPERV_CPUID_FEATURES);
+	ms_hyperv.misc_features = cpuid_edx(HYPERV_CPUID_FEATURES);
 	ms_hyperv.hints    = cpuid_eax(HYPERV_CPUID_ENLIGHTMENT_INFO);
 
 	printk(KERN_INFO "HyperV: features 0x%x, hints 0x%x\n",
@@ -142,6 +187,8 @@ static void __init ms_hyperv_init_platform(void)
 	no_timer_check = 1;
 #endif
 
+	machine_ops.shutdown = hv_machine_shutdown;
+	machine_ops.crash_shutdown = hv_machine_crash_shutdown;
 	mark_tsc_unstable("running on Hyper-V");
 }
 

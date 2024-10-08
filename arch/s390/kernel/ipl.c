@@ -2032,7 +2032,8 @@ static void do_reset_calls(void)
 
 u32 dump_prefix_page;
 
-void s390_reset_system(void (*func)(void *), void *data)
+void s390_reset_system(void (*fn_pre)(void),
+		       void (*fn_post)(void *), void *data)
 {
 	struct _lowcore *lc;
 
@@ -2063,7 +2064,11 @@ void s390_reset_system(void (*func)(void *), void *data)
 	/* Store status at absolute zero */
 	store_status();
 
+	/* Call function before reset */
+	if (fn_pre)
+		fn_pre();
 	do_reset_calls();
-	if (func)
-		func(data);
+	/* Call function after reset */
+	if (fn_post)
+		fn_post(data);
 }

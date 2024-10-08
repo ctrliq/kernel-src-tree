@@ -77,7 +77,9 @@ extern s8  __read_mostly tlb_flushall_shift;
 
 /* this struct is NEVER under kabi restrictions */
 struct rh_cpuinfo_x86 {
-	int dummy; /* this dummy entry can be removed */
+	/* Cache QoS architectural values: */
+	int			x86_cache_max_rmid;
+	int			x86_cache_occ_scale;
 };
 
 /*
@@ -151,6 +153,7 @@ struct cpuinfo_x86 {
  * capabilities of CPUs
  */
 extern struct cpuinfo_x86	boot_cpu_data;
+extern struct rh_cpuinfo_x86	rh_boot_cpu_data;
 extern struct cpuinfo_x86	new_cpu_data;
 
 extern struct tss_struct	doublefault_tss;
@@ -161,6 +164,7 @@ extern __u32			cpu_caps_set[NCAPINTS];
 DECLARE_PER_CPU_SHARED_ALIGNED(struct cpuinfo_x86, cpu_info);
 DECLARE_PER_CPU_SHARED_ALIGNED(struct rh_cpuinfo_x86, rh_cpu_info);
 #define cpu_data(cpu)		per_cpu(cpu_info, cpu)
+#define rh_cpu_data(cpu)	per_cpu(rh_cpu_info, cpu)
 #else
 #define cpu_info		boot_cpu_data
 #define cpu_data(cpu)		boot_cpu_data

@@ -90,7 +90,7 @@ xfs_difree(
 	struct xfs_trans *tp,		/* transaction pointer */
 	xfs_ino_t	inode,		/* inode to be freed */
 	struct xfs_bmap_free *flist,	/* extents to free */
-	int		*delete,	/* set if inode cluster was deleted */
+	int		*deleted,	/* set if inode cluster was deleted */
 	xfs_ino_t	*first_ino);	/* first inode in deleted cluster */
 
 /*
@@ -159,5 +159,9 @@ int xfs_ialloc_inode_init(struct xfs_mount *mp, struct xfs_trans *tp,
 			  struct list_head *buffer_list,
 			  xfs_agnumber_t agno, xfs_agblock_t agbno,
 			  xfs_agblock_t length, unsigned int gen);
+
+int xfs_read_agi(struct xfs_mount *mp, struct xfs_trans *tp,
+		xfs_agnumber_t agno, struct xfs_buf **bpp);
+
 
 #endif	/* __XFS_IALLOC_H__ */

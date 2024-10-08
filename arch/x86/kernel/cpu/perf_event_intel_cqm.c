@@ -263,7 +263,7 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
 	/*
 	 * Events that target same task are placed into the same cache group.
 	 */
-	if (a->hw.cqm_target == b->hw.cqm_target)
+	if (a->hw.target == b->hw.target)
 		return true;
 
 	/*
@@ -279,7 +279,7 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
 static inline struct perf_cgroup *event_to_cgroup(struct perf_event *event)
 {
 	if (event->attach_state & PERF_ATTACH_TASK)
-		return perf_cgroup_from_task(event->hw.cqm_target);
+		return perf_cgroup_from_task(event->hw.target);
 
 	return event->cgrp;
 }
@@ -1244,14 +1244,14 @@ static inline void cqm_pick_event_reader(int cpu)
 static void intel_cqm_cpu_starting(unsigned int cpu)
 {
 	struct intel_cqm_state *state = &per_cpu(cqm_state, cpu);
-	struct cpuinfo_x86 *c = &cpu_data(cpu);
+	struct rh_cpuinfo_x86 *rh_c = &rh_cpu_data(cpu);
 
 	raw_spin_lock_init(&state->lock);
 	state->rmid = 0;
 	state->cnt  = 0;
 
-	WARN_ON(c->x86_cache_max_rmid != cqm_max_rmid);
-	WARN_ON(c->x86_cache_occ_scale != cqm_l3_scale);
+	WARN_ON(rh_c->x86_cache_max_rmid != cqm_max_rmid);
+	WARN_ON(rh_c->x86_cache_occ_scale != cqm_l3_scale);
 }
 
 static void intel_cqm_cpu_exit(unsigned int cpu)
@@ -1307,7 +1307,7 @@ static int __init intel_cqm_init(void)
 	if (!x86_match_cpu(intel_cqm_match))
 		return -ENODEV;
 
-	cqm_l3_scale = boot_cpu_data.x86_cache_occ_scale;
+	cqm_l3_scale = rh_boot_cpu_data.x86_cache_occ_scale;
 
 	/*
 	 * It's possible that not all resources support the same number
@@ -1321,12 +1321,12 @@ static int __init intel_cqm_init(void)
 	cpu_notifier_register_begin();
 
 	for_each_online_cpu(cpu) {
-		struct cpuinfo_x86 *c = &cpu_data(cpu);
+		struct rh_cpuinfo_x86 *rh_c = &rh_cpu_data(cpu);
 
-		if (c->x86_cache_max_rmid < cqm_max_rmid)
-			cqm_max_rmid = c->x86_cache_max_rmid;
+		if (rh_c->x86_cache_max_rmid < cqm_max_rmid)
+			cqm_max_rmid = rh_c->x86_cache_max_rmid;
 
-		if (c->x86_cache_occ_scale != cqm_l3_scale) {
+		if (rh_c->x86_cache_occ_scale != cqm_l3_scale) {
 			pr_err("Multiple LLC scale values, disabling\n");
 			ret = -EINVAL;
 			goto out;
@@ -1363,8 +1363,7 @@ static int __init intel_cqm_init(void)
 
 	__perf_cpu_notifier(intel_cqm_cpu_notifier);
 
-	ret = perf_pmu_register(&intel_cqm_pmu, "intel_cqm",
-				PERF_TYPE_INTEL_CQM);
+	ret = perf_pmu_register(&intel_cqm_pmu, "intel_cqm", -1);
 	if (ret)
 		pr_err("Intel CQM perf registration failed: %d\n", ret);
 	else

@@ -1,5 +1,6 @@
 /*
- *  scsi_lib.c Copyright (C) 1999 Eric Youngdale
+ * Copyright (C) 1999 Eric Youngdale
+ * Copyright (C) 2014 Christoph Hellwig
  *
  *  SCSI queueing library.
  *      Initial versions: Eric Youngdale (eric@andante.org).
@@ -20,6 +21,9 @@
 #include <linux/delay.h>
 #include <linux/hardirq.h>
 #include <linux/scatterlist.h>
+#ifndef __GENKSYMS__
+#include <linux/blk-mq.h>
+#endif
 #include <linux/ratelimit.h>
 
 #include <scsi/scsi.h>
@@ -100,16 +104,28 @@ scsi_set_blocked(struct scsi_cmnd *cmd, int reason)
 	 */
 	switch (reason) {
 	case SCSI_MLQUEUE_HOST_BUSY:
-		host->host_blocked = host->max_host_blocked;
+		atomic_set(&host->host_blocked, host->max_host_blocked);
 		break;
 	case SCSI_MLQUEUE_DEVICE_BUSY:
 	case SCSI_MLQUEUE_EH_RETRY:
-		device->device_blocked = device->max_device_blocked;
+		atomic_set(&device->device_blocked,
+			   device->max_device_blocked);
 		break;
 	case SCSI_MLQUEUE_TARGET_BUSY:
-		starget->target_blocked = starget->max_target_blocked;
+		atomic_set(&starget->target_blocked,
+			   starget->max_target_blocked);
 		break;
 	}
+}
+
+static void scsi_mq_requeue_cmd(struct scsi_cmnd *cmd)
+{
+	struct scsi_device *sdev = cmd->device;
+	struct request_queue *q = cmd->request->q;
+
+	blk_mq_requeue_request(cmd->request);
+	blk_mq_kick_requeue_list(q);
+	put_device(&sdev->sdev_gendev);
 }
 
 /**
@@ -149,6 +165,10 @@ static void __scsi_queue_insert(struct scsi_cmnd *cmd, int reason, int unbusy)
 	 * before blk_cleanup_queue() finishes.
 	 */
 	cmd->result = 0;
+	if (q->mq_ops) {
+		scsi_mq_requeue_cmd(cmd);
+		return;
+	}
 	spin_lock_irqsave(q->queue_lock, flags);
 	blk_requeue_request(q, cmd->request);
 	kblockd_schedule_work(&device->requeue_work);
@@ -204,7 +224,7 @@ int scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 	int ret = DRIVER_ERROR << 24;
 
 	req = blk_get_request(sdev->request_queue, write, __GFP_WAIT);
-	if (!req)
+	if (IS_ERR(req))
 		return ret;
 	blk_rq_set_block_pc(req);
 
@@ -293,16 +313,26 @@ void scsi_device_unbusy(struct scsi_device *sdev)
 	struct scsi_target *starget = scsi_target(sdev);
 	unsigned long flags;
 
-	spin_lock_irqsave(shost->host_lock, flags);
-	shost->host_busy--;
-	atomic_dec(&starget->target_busy);
+	atomic_dec(&shost->host_busy);
+	if (starget->can_queue > 0)
+		atomic_dec(&starget->target_busy);
+
 	if (unlikely(scsi_host_in_recovery(shost) &&
-		     (shost->host_failed || shost->host_eh_scheduled)))
+		     (shost->host_failed || shost->host_eh_scheduled))) {
+		spin_lock_irqsave(shost->host_lock, flags);
 		scsi_eh_wakeup(shost);
-	spin_unlock(shost->host_lock);
-	spin_lock(sdev->request_queue->queue_lock);
-	sdev->device_busy--;
-	spin_unlock_irqrestore(sdev->request_queue->queue_lock, flags);
+		spin_unlock_irqrestore(shost->host_lock, flags);
+	}
+
+	atomic_dec(&sdev->device_busy);
+}
+
+static void scsi_kick_queue(struct request_queue *q)
+{
+	if (q->mq_ops)
+		blk_mq_start_hw_queues(q);
+	else
+		blk_run_queue(q);
 }
 
 /*
@@ -329,7 +359,7 @@ static void scsi_single_lun_run(struct scsi_device *current_sdev)
 	 * but in most cases, we will be first. Ideally, each LU on the
 	 * target would get some limited time or requests on the target.
 	 */
-	blk_run_queue(current_sdev->request_queue);
+	scsi_kick_queue(current_sdev->request_queue);
 
 	spin_lock_irqsave(shost->host_lock, flags);
 	if (starget->starget_sdev_user)
@@ -342,7 +372,7 @@ static void scsi_single_lun_run(struct scsi_device *current_sdev)
 			continue;
 
 		spin_unlock_irqrestore(shost->host_lock, flags);
-		blk_run_queue(sdev->request_queue);
+		scsi_kick_queue(sdev->request_queue);
 		spin_lock_irqsave(shost->host_lock, flags);
 	
 		scsi_device_put(sdev);
@@ -351,28 +381,36 @@ static void scsi_single_lun_run(struct scsi_device *current_sdev)
 	spin_unlock_irqrestore(shost->host_lock, flags);
 }
 
-static inline int scsi_device_is_busy(struct scsi_device *sdev)
+static inline bool scsi_device_is_busy(struct scsi_device *sdev)
 {
-	if (sdev->device_busy >= sdev->queue_depth || sdev->device_blocked)
-		return 1;
-
-	return 0;
+	if (atomic_read(&sdev->device_busy) >= sdev->queue_depth)
+		return true;
+	if (atomic_read(&sdev->device_blocked) > 0)
+		return true;
+	return false;
 }
 
-static inline int scsi_target_is_busy(struct scsi_target *starget)
+static inline bool scsi_target_is_busy(struct scsi_target *starget)
 {
-	return ((starget->can_queue > 0 &&
-		 atomic_read(&starget->target_busy) >= starget->can_queue) ||
-		 starget->target_blocked);
+	if (starget->can_queue > 0) {
+		if (atomic_read(&starget->target_busy) >= starget->can_queue)
+			return true;
+		if (atomic_read(&starget->target_blocked) > 0)
+			return true;
+	}
+	return false;
 }
 
-static inline int scsi_host_is_busy(struct Scsi_Host *shost)
+static inline bool scsi_host_is_busy(struct Scsi_Host *shost)
 {
-	if ((shost->can_queue > 0 && shost->host_busy >= shost->can_queue) ||
-	    shost->host_blocked || shost->host_self_blocked)
-		return 1;
-
-	return 0;
+	if (shost->can_queue > 0 &&
+	    atomic_read(&shost->host_busy) >= shost->can_queue)
+		return true;
+	if (atomic_read(&shost->host_blocked) > 0)
+		return true;
+	if (shost->host_self_blocked)
+		return true;
+	return false;
 }
 
 static void scsi_starved_list_run(struct Scsi_Host *shost)
@@ -424,7 +462,7 @@ static void scsi_starved_list_run(struct Scsi_Host *shost)
 			continue;
 		spin_unlock_irqrestore(shost->host_lock, flags);
 
-		blk_run_queue(slq);
+		scsi_kick_queue(slq);
 		blk_put_queue(slq);
 
 		spin_lock_irqsave(shost->host_lock, flags);
@@ -455,7 +493,10 @@ static void scsi_run_queue(struct request_queue *q)
 	if (!list_empty(&sdev->host->starved_list))
 		scsi_starved_list_run(sdev->host);
 
-	blk_run_queue(q);
+	if (q->mq_ops)
+		blk_mq_start_stopped_hw_queues(q, false);
+	else
+		blk_run_queue(q);
 }
 
 void scsi_requeue_run_queue(struct work_struct *work)
@@ -553,23 +594,70 @@ static struct scatterlist *scsi_sg_alloc(unsigned int nents, gfp_t gfp_mask)
 	return mempool_alloc(sgp->pool, gfp_mask);
 }
 
-static void scsi_free_sgtable(struct scsi_data_buffer *sdb)
+static void scsi_free_sgtable(struct scsi_data_buffer *sdb, bool mq)
 {
-	__sg_free_table(&sdb->table, SCSI_MAX_SG_SEGMENTS, false, scsi_sg_free);
+	if (mq && sdb->table.orig_nents <= SCSI_MAX_SG_SEGMENTS)
+		return;
+	__sg_free_table(&sdb->table, SCSI_MAX_SG_SEGMENTS, mq, scsi_sg_free);
 }
 
 static int scsi_alloc_sgtable(struct scsi_data_buffer *sdb, int nents,
-			      gfp_t gfp_mask)
+			      gfp_t gfp_mask, bool mq)
 {
+	struct scatterlist *first_chunk = NULL;
 	int ret;
 
 	BUG_ON(!nents);
 
+	if (mq) {
+		if (nents <= SCSI_MAX_SG_SEGMENTS) {
+			sdb->table.nents = sdb->table.orig_nents = nents;
+			sg_init_table(sdb->table.sgl, nents);
+			return 0;
+		}
+		first_chunk = sdb->table.sgl;
+	}
+
 	ret = __sg_alloc_table(&sdb->table, nents, SCSI_MAX_SG_SEGMENTS,
-			       NULL, gfp_mask, scsi_sg_alloc);
+			       first_chunk, gfp_mask, scsi_sg_alloc);
 	if (unlikely(ret))
-		scsi_free_sgtable(sdb);
+		scsi_free_sgtable(sdb, mq);
 	return ret;
+}
+
+static void scsi_uninit_cmd(struct scsi_cmnd *cmd)
+{
+	if (cmd->request->cmd_type == REQ_TYPE_FS) {
+		struct scsi_driver *drv = scsi_cmd_to_driver(cmd);
+
+		if (drv->uninit_command)
+			drv->uninit_command(cmd);
+	}
+}
+
+static void scsi_mq_free_sgtables(struct scsi_cmnd *cmd)
+{
+	if (cmd->sdb.table.nents)
+		scsi_free_sgtable(&cmd->sdb, true);
+	if (cmd->request->next_rq && cmd->request->next_rq->special)
+		scsi_free_sgtable(cmd->request->next_rq->special, true);
+	if (scsi_prot_sg_count(cmd))
+		scsi_free_sgtable(cmd->prot_sdb, true);
+}
+
+static void scsi_mq_uninit_cmd(struct scsi_cmnd *cmd)
+{
+	struct scsi_device *sdev = cmd->device;
+	unsigned long flags;
+
+	BUG_ON(list_empty(&cmd->list));
+
+	scsi_mq_free_sgtables(cmd);
+	scsi_uninit_cmd(cmd);
+
+	spin_lock_irqsave(&sdev->list_lock, flags);
+	list_del_init(&cmd->list);
+	spin_unlock_irqrestore(&sdev->list_lock, flags);
 }
 
 /*
@@ -591,12 +679,12 @@ static int scsi_alloc_sgtable(struct scsi_data_buffer *sdb, int nents,
 void scsi_release_buffers(struct scsi_cmnd *cmd)
 {
 	if (cmd->sdb.table.nents)
-		scsi_free_sgtable(&cmd->sdb);
+		scsi_free_sgtable(&cmd->sdb, false);
 
 	memset(&cmd->sdb, 0, sizeof(cmd->sdb));
 
 	if (scsi_prot_sg_count(cmd))
-		scsi_free_sgtable(cmd->prot_sdb);
+		scsi_free_sgtable(cmd->prot_sdb, false);
 }
 EXPORT_SYMBOL(scsi_release_buffers);
 
@@ -604,7 +692,7 @@ static void scsi_release_bidi_buffers(struct scsi_cmnd *cmd)
 {
 	struct scsi_data_buffer *bidi_sdb = cmd->request->next_rq->special;
 
-	scsi_free_sgtable(bidi_sdb);
+	scsi_free_sgtable(bidi_sdb, false);
 	kmem_cache_free(scsi_sdb_cache, bidi_sdb);
 	cmd->request->next_rq->special = NULL;
 }
@@ -615,8 +703,6 @@ static bool scsi_end_request(struct request *req, int error,
 	struct scsi_cmnd *cmd = req->special;
 	struct scsi_device *sdev = cmd->device;
 	struct request_queue *q = sdev->request_queue;
-	unsigned long flags;
-
 
 	if (blk_update_request(req, error, bytes))
 		return true;
@@ -629,14 +715,38 @@ static bool scsi_end_request(struct request *req, int error,
 	if (blk_queue_add_random(q))
 		add_disk_randomness(req->rq_disk);
 
-	spin_lock_irqsave(q->queue_lock, flags);
-	blk_finish_request(req, error);
-	spin_unlock_irqrestore(q->queue_lock, flags);
+	if (req->mq_ctx) {
+		/*
+		 * In the MQ case the command gets freed by __blk_mq_end_io,
+		 * so we have to do all cleanup that depends on it earlier.
+		 *
+		 * We also can't kick the queues from irq context, so we
+		 * will have to defer it to a workqueue.
+		 */
+		scsi_mq_uninit_cmd(cmd);
 
-	if (bidi_bytes)
-		scsi_release_bidi_buffers(cmd);
-	scsi_release_buffers(cmd);
-	scsi_next_command(cmd);
+		__blk_mq_end_request(req, error);
+
+		if (scsi_target(sdev)->single_lun ||
+		    !list_empty(&sdev->host->starved_list))
+			kblockd_schedule_work(&sdev->requeue_work);
+		else
+			blk_mq_start_stopped_hw_queues(q, true);
+
+		put_device(&sdev->sdev_gendev);
+	} else {
+		unsigned long flags;
+
+		spin_lock_irqsave(q->queue_lock, flags);
+		blk_finish_request(req, error);
+		spin_unlock_irqrestore(q->queue_lock, flags);
+
+		if (bidi_bytes)
+			scsi_release_bidi_buffers(cmd);
+		scsi_release_buffers(cmd);
+		scsi_next_command(cmd);
+	}
+
 	return false;
 }
 
@@ -722,12 +832,10 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 	struct request *req = cmd->request;
 	int error = 0;
 	struct scsi_sense_hdr sshdr;
-	int sense_valid = 0;
-	int sense_deferred = 0;
+	bool sense_valid = false;
+	int sense_deferred = 0, level = 0;
 	enum {ACTION_FAIL, ACTION_REPREP, ACTION_RETRY,
 	      ACTION_DELAYED_RETRY} action;
-	static DEFINE_RATELIMIT_STATE(rs,  DEFAULT_RATELIMIT_INTERVAL,
-					DEFAULT_RATELIMIT_BURST);
 	unsigned long wait_for = (cmd->allowed + 1) * req->timeout;
 
 	if (result) {
@@ -797,7 +905,7 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 		if ((sshdr.asc == 0x0) && (sshdr.ascq == 0x1d))
 			;
 		else if (!(req->cmd_flags & REQ_QUIET))
-			scsi_print_sense("", cmd);
+			scsi_print_sense(cmd);
 		result = 0;
 		/* BLOCK_PC may have set error */
 		error = 0;
@@ -923,11 +1031,25 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 	switch (action) {
 	case ACTION_FAIL:
 		/* Give up and fail the remainder of the request */
-		if (!(req->cmd_flags & REQ_QUIET) && __ratelimit(&rs)) {
-			scsi_print_result(cmd);
-			if (driver_byte(result) & DRIVER_SENSE)
-				scsi_print_sense("", cmd);
-			scsi_print_command(cmd);
+		if (!(req->cmd_flags & REQ_QUIET)) {
+			static DEFINE_RATELIMIT_STATE(_rs,
+					DEFAULT_RATELIMIT_INTERVAL,
+					DEFAULT_RATELIMIT_BURST);
+
+			if (unlikely(scsi_logging_level))
+				level = SCSI_LOG_LEVEL(SCSI_LOG_MLCOMPLETE_SHIFT,
+						       SCSI_LOG_MLCOMPLETE_BITS);
+
+			/*
+			 * if logging is enabled the failure will be printed
+			 * in scsi_log_completion(), so avoid duplicate messages
+			 */
+			if (!level && __ratelimit(&_rs)) {
+				scsi_print_result(cmd, NULL, FAILED);
+				if (driver_byte(result) & DRIVER_SENSE)
+					scsi_print_sense(cmd);
+				scsi_print_command(cmd);
+			}
 		}
 		if (!scsi_end_request(req, error, blk_rq_err_bytes(req), 0))
 			return;
@@ -937,8 +1059,14 @@ void scsi_io_completion(struct scsi_cmnd *cmd, unsigned int good_bytes)
 		/* Unprep the request and put it back at the head of the queue.
 		 * A new command will be prepared and issued.
 		 */
-		scsi_release_buffers(cmd);
-		scsi_requeue_command(q, cmd);
+		if (q->mq_ops) {
+			cmd->request->cmd_flags &= ~REQ_DONTPREP;
+			scsi_mq_uninit_cmd(cmd);
+			scsi_mq_requeue_cmd(cmd);
+		} else {
+			scsi_release_buffers(cmd);
+			scsi_requeue_command(q, cmd);
+		}
 		break;
 	case ACTION_RETRY:
 		/* Retry the same command immediately */
@@ -960,9 +1088,8 @@ static int scsi_init_sgtable(struct request *req, struct scsi_data_buffer *sdb,
 	 * If sg table allocation fails, requeue request later.
 	 */
 	if (unlikely(scsi_alloc_sgtable(sdb, req->nr_phys_segments,
-					gfp_mask))) {
+					gfp_mask, req->mq_ctx != NULL)))
 		return BLKPREP_DEFER;
-	}
 
 	req->buffer = NULL;
 
@@ -992,6 +1119,7 @@ int scsi_init_io(struct scsi_cmnd *cmd, gfp_t gfp_mask)
 {
 	struct scsi_device *sdev = cmd->device;
 	struct request *rq = cmd->request;
+	bool is_mq = (rq->mq_ctx != NULL);
 	int error;
 
 	BUG_ON(!rq->nr_phys_segments);
@@ -1001,15 +1129,19 @@ int scsi_init_io(struct scsi_cmnd *cmd, gfp_t gfp_mask)
 		goto err_exit;
 
 	if (blk_bidi_rq(rq)) {
-		struct scsi_data_buffer *bidi_sdb = kmem_cache_zalloc(
-			scsi_sdb_cache, GFP_ATOMIC);
-		if (!bidi_sdb) {
-			error = BLKPREP_DEFER;
-			goto err_exit;
+		if (!rq->q->mq_ops) {
+			struct scsi_data_buffer *bidi_sdb =
+				kmem_cache_zalloc(scsi_sdb_cache, GFP_ATOMIC);
+			if (!bidi_sdb) {
+				error = BLKPREP_DEFER;
+				goto err_exit;
+			}
+
+			rq->next_rq->special = bidi_sdb;
 		}
 
-		rq->next_rq->special = bidi_sdb;
-		error = scsi_init_sgtable(rq->next_rq, bidi_sdb, GFP_ATOMIC);
+		error = scsi_init_sgtable(rq->next_rq, rq->next_rq->special,
+					  GFP_ATOMIC);
 		if (error)
 			goto err_exit;
 	}
@@ -1031,7 +1163,7 @@ int scsi_init_io(struct scsi_cmnd *cmd, gfp_t gfp_mask)
 
 		ivecs = blk_rq_count_integrity_sg(rq->q, rq->bio);
 
-		if (scsi_alloc_sgtable(prot_sdb, ivecs, gfp_mask)) {
+		if (scsi_alloc_sgtable(prot_sdb, ivecs, gfp_mask, is_mq)) {
 			error = BLKPREP_DEFER;
 			goto err_exit;
 		}
@@ -1045,13 +1177,16 @@ int scsi_init_io(struct scsi_cmnd *cmd, gfp_t gfp_mask)
 		cmd->prot_sdb->table.nents = count;
 	}
 
-	return BLKPREP_OK ;
-
+	return BLKPREP_OK;
 err_exit:
-	scsi_release_buffers(cmd);
-	cmd->request->special = NULL;
-	scsi_put_command(cmd);
-	put_device(&sdev->sdev_gendev);
+	if (is_mq) {
+		scsi_mq_free_sgtables(cmd);
+	} else {
+		scsi_release_buffers(cmd);
+		cmd->request->special = NULL;
+		scsi_put_command(cmd);
+		put_device(&sdev->sdev_gendev);
+	}
 	return error;
 }
 EXPORT_SYMBOL(scsi_init_io);
@@ -1230,7 +1365,7 @@ scsi_prep_return(struct request_queue *q, struct request *req, int ret)
 		 * queue must be restarted, so we schedule a callback to happen
 		 * shortly.
 		 */
-		if (sdev->device_busy == 0)
+		if (atomic_read(&sdev->device_busy) == 0)
 			blk_delay_queue(q, SCSI_QUEUE_DELAY);
 		break;
 	default:
@@ -1263,13 +1398,7 @@ out:
 
 static void scsi_unprep_fn(struct request_queue *q, struct request *req)
 {
-	if (req->cmd_type == REQ_TYPE_FS) {
-		struct scsi_cmnd *cmd = req->special;
-		struct scsi_driver *drv = scsi_cmd_to_driver(cmd);
-
-		if (drv->uninit_command)
-			drv->uninit_command(cmd);
-	}
+	scsi_uninit_cmd(req->special);
 }
 
 /*
@@ -1281,25 +1410,36 @@ static void scsi_unprep_fn(struct request_queue *q, struct request *req)
 static inline int scsi_dev_queue_ready(struct request_queue *q,
 				  struct scsi_device *sdev)
 {
-	if (sdev->device_busy == 0 && sdev->device_blocked) {
+	unsigned int busy;
+
+	busy = atomic_inc_return(&sdev->device_busy) - 1;
+	if (atomic_read(&sdev->device_blocked)) {
+		if (busy)
+			goto out_dec;
+
 		/*
 		 * unblock after device_blocked iterates to zero
 		 */
-		if (--sdev->device_blocked == 0) {
-			SCSI_LOG_MLQUEUE(3,
-				   sdev_printk(KERN_INFO, sdev,
-				   "unblocking device at zero depth\n"));
-		} else {
-			blk_delay_queue(q, SCSI_QUEUE_DELAY);
-			return 0;
+		if (atomic_dec_return(&sdev->device_blocked) > 0) {
+			/*
+			 * For the MQ case we take care of this in the caller.
+			 */
+			if (!q->mq_ops)
+				blk_delay_queue(q, SCSI_QUEUE_DELAY);
+			goto out_dec;
 		}
+		SCSI_LOG_MLQUEUE(3, sdev_printk(KERN_INFO, sdev,
+				   "unblocking device at zero depth\n"));
 	}
-	if (scsi_device_is_busy(sdev))
-		return 0;
+
+	if (busy >= sdev->queue_depth)
+		goto out_dec;
 
 	return 1;
+out_dec:
+	atomic_dec(&sdev->device_busy);
+	return 0;
 }
-
 
 /*
  * scsi_target_queue_ready: checks if there we can send commands to target
@@ -1322,26 +1462,25 @@ static inline int scsi_target_queue_ready(struct Scsi_Host *shost,
 		spin_unlock_irq(shost->host_lock);
 	}
 
+	if (starget->can_queue <= 0)
+		return 1;
+
 	busy = atomic_inc_return(&starget->target_busy) - 1;
-	if (starget->target_blocked) {
+	if (atomic_read(&starget->target_blocked) > 0) {
 		if (busy)
 			goto starved;
 
 		/*
 		 * unblock after target_blocked iterates to zero
 		 */
-		spin_lock_irq(shost->host_lock);
-		if (--starget->target_blocked != 0) {
-			spin_unlock_irq(shost->host_lock);
+		if (atomic_dec_return(&starget->target_blocked) > 0)
 			goto out_dec;
-		}
-		spin_unlock_irq(shost->host_lock);
 
 		SCSI_LOG_MLQUEUE(3, starget_printk(KERN_INFO, starget,
 				 "unblocking target at zero depth\n"));
 	}
 
-	if (starget->can_queue > 0 && busy >= starget->can_queue)
+	if (busy >= starget->can_queue)
 		goto starved;
 
 	return 1;
@@ -1351,7 +1490,8 @@ starved:
 	list_move_tail(&sdev->starved_entry, &shost->starved_list);
 	spin_unlock_irq(shost->host_lock);
 out_dec:
-	atomic_dec(&starget->target_busy);
+	if (starget->can_queue > 0)
+		atomic_dec(&starget->target_busy);
 	return 0;
 }
 
@@ -1364,38 +1504,50 @@ static inline int scsi_host_queue_ready(struct request_queue *q,
 				   struct Scsi_Host *shost,
 				   struct scsi_device *sdev)
 {
-	int ret = 0;
-
-	spin_lock_irq(shost->host_lock);
+	unsigned int busy;
 
 	if (scsi_host_in_recovery(shost))
-		goto out;
-	if (shost->host_busy == 0 && shost->host_blocked) {
+		return 0;
+
+	busy = atomic_inc_return(&shost->host_busy) - 1;
+	if (atomic_read(&shost->host_blocked) > 0) {
+		if (busy)
+			goto starved;
+
 		/*
 		 * unblock after host_blocked iterates to zero
 		 */
-		if (--shost->host_blocked != 0)
-			goto out;
+		if (atomic_dec_return(&shost->host_blocked) > 0)
+			goto out_dec;
 
 		SCSI_LOG_MLQUEUE(3,
 			shost_printk(KERN_INFO, shost,
 				     "unblocking host at zero depth\n"));
 	}
-	if (scsi_host_is_busy(shost)) {
-		if (list_empty(&sdev->starved_entry))
-			list_add_tail(&sdev->starved_entry, &shost->starved_list);
-		goto out;
-	}
+
+	if (shost->can_queue > 0 && busy >= shost->can_queue)
+		goto starved;
+	if (shost->host_self_blocked)
+		goto starved;
 
 	/* We're OK to process the command, so we can't be starved */
-	if (!list_empty(&sdev->starved_entry))
-		list_del_init(&sdev->starved_entry);
+	if (!list_empty(&sdev->starved_entry)) {
+		spin_lock_irq(shost->host_lock);
+		if (!list_empty(&sdev->starved_entry))
+			list_del_init(&sdev->starved_entry);
+		spin_unlock_irq(shost->host_lock);
+	}
 
-	shost->host_busy++;
-	ret = 1;
-out:
+	return 1;
+
+starved:
+	spin_lock_irq(shost->host_lock);
+	if (list_empty(&sdev->starved_entry))
+		list_add_tail(&sdev->starved_entry, &shost->starved_list);
 	spin_unlock_irq(shost->host_lock);
-	return ret;
+out_dec:
+	atomic_dec(&shost->host_busy);
+	return 0;
 }
 
 /*
@@ -1458,13 +1610,10 @@ static void scsi_kill_request(struct request *req, struct request_queue *q)
 	 * bump busy counts.  To bump the counters, we need to dance
 	 * with the locks as normal issue path does.
 	 */
-	sdev->device_busy++;
-	spin_unlock(sdev->request_queue->queue_lock);
-	spin_lock(shost->host_lock);
-	shost->host_busy++;
-	atomic_inc(&starget->target_busy);
-	spin_unlock(shost->host_lock);
-	spin_lock(sdev->request_queue->queue_lock);
+	atomic_inc(&sdev->device_busy);
+	atomic_inc(&shost->host_busy);
+	if (starget->can_queue > 0)
+		atomic_inc(&starget->target_busy);
 
 	blk_complete_request(req);
 }
@@ -1558,7 +1707,7 @@ static void scsi_request_fn(struct request_queue *q)
 		 * accept it.
 		 */
 		req = blk_peek_request(q);
-		if (!req || !scsi_dev_queue_ready(q, sdev))
+		if (!req)
 			break;
 
 		if (unlikely(!scsi_device_online(sdev))) {
@@ -1568,13 +1717,14 @@ static void scsi_request_fn(struct request_queue *q)
 			continue;
 		}
 
+		if (!scsi_dev_queue_ready(q, sdev))
+			break;
 
 		/*
 		 * Remove the request from the request list.
 		 */
 		if (!(blk_queue_tagged(q) && !blk_queue_start_tag(q, req)))
 			blk_start_request(req);
-		sdev->device_busy++;
 
 		spin_unlock_irq(q->queue_lock);
 		cmd = req->special;
@@ -1632,7 +1782,8 @@ static void scsi_request_fn(struct request_queue *q)
 	return;
 
  host_not_ready:
-	atomic_dec(&scsi_target(sdev)->target_busy);
+	if (scsi_target(sdev)->can_queue > 0)
+		atomic_dec(&scsi_target(sdev)->target_busy);
  not_ready:
 	/*
 	 * lock q, handle tag, requeue req, and decrement device_busy. We
@@ -1644,10 +1795,205 @@ static void scsi_request_fn(struct request_queue *q)
 	 */
 	spin_lock_irq(q->queue_lock);
 	blk_requeue_request(q, req);
-	sdev->device_busy--;
+	atomic_dec(&sdev->device_busy);
 out_delay:
-	if (sdev->device_busy == 0 && !scsi_device_blocked(sdev))
+	if (!atomic_read(&sdev->device_busy) && !scsi_device_blocked(sdev))
 		blk_delay_queue(q, SCSI_QUEUE_DELAY);
+}
+
+static inline int prep_to_mq(int ret)
+{
+	switch (ret) {
+	case BLKPREP_OK:
+		return 0;
+	case BLKPREP_DEFER:
+		return BLK_MQ_RQ_QUEUE_BUSY;
+	default:
+		return BLK_MQ_RQ_QUEUE_ERROR;
+	}
+}
+
+static int scsi_mq_prep_fn(struct request *req)
+{
+	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
+	struct scsi_device *sdev = req->q->queuedata;
+	struct Scsi_Host *shost = sdev->host;
+	unsigned char *sense_buf = cmd->sense_buffer;
+	struct scatterlist *sg;
+
+	memset(cmd, 0, sizeof(struct scsi_cmnd));
+
+	req->special = cmd;
+
+	cmd->request = req;
+	cmd->device = sdev;
+	cmd->sense_buffer = sense_buf;
+
+	cmd->tag = req->tag;
+
+	cmd->cmnd = req->cmd;
+	cmd->prot_op = SCSI_PROT_NORMAL;
+
+	INIT_LIST_HEAD(&cmd->list);
+	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
+	cmd->jiffies_at_alloc = jiffies;
+
+	/*
+	 * XXX: cmd_list lookups are only used by two drivers, try to get
+	 * rid of this list in common code.
+	 */
+	spin_lock_irq(&sdev->list_lock);
+	list_add_tail(&cmd->list, &sdev->cmd_list);
+	spin_unlock_irq(&sdev->list_lock);
+
+	sg = (void *)cmd + sizeof(struct scsi_cmnd) + shost->hostt->cmd_size;
+	cmd->sdb.table.sgl = sg;
+
+	if (scsi_host_get_prot(shost)) {
+		cmd->prot_sdb = (void *)sg +
+			min_t(unsigned int,
+			      shost->sg_tablesize, SCSI_MAX_SG_SEGMENTS) *
+			sizeof(struct scatterlist);
+		memset(cmd->prot_sdb, 0, sizeof(struct scsi_data_buffer));
+
+		cmd->prot_sdb->table.sgl =
+			(struct scatterlist *)(cmd->prot_sdb + 1);
+	}
+
+	if (blk_bidi_rq(req)) {
+		struct request *next_rq = req->next_rq;
+		struct scsi_data_buffer *bidi_sdb = blk_mq_rq_to_pdu(next_rq);
+
+		memset(bidi_sdb, 0, sizeof(struct scsi_data_buffer));
+		bidi_sdb->table.sgl =
+			(struct scatterlist *)(bidi_sdb + 1);
+
+		next_rq->special = bidi_sdb;
+	}
+
+	blk_mq_start_request(req);
+
+	return scsi_setup_cmnd(sdev, req);
+}
+
+static void scsi_mq_done(struct scsi_cmnd *cmd)
+{
+	trace_scsi_dispatch_cmd_done(cmd);
+	blk_mq_complete_request(cmd->request);
+}
+
+static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+			 const struct blk_mq_queue_data *bd)
+{
+	struct request *req = bd->rq;
+	struct request_queue *q = req->q;
+	struct scsi_device *sdev = q->queuedata;
+	struct Scsi_Host *shost = sdev->host;
+	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
+	int ret;
+	int reason;
+
+	ret = prep_to_mq(scsi_prep_state_check(sdev, req));
+	if (ret)
+		goto out;
+
+	ret = BLK_MQ_RQ_QUEUE_BUSY;
+	if (!get_device(&sdev->sdev_gendev))
+		goto out;
+
+	if (!scsi_dev_queue_ready(q, sdev))
+		goto out_put_device;
+	if (!scsi_target_queue_ready(shost, sdev))
+		goto out_dec_device_busy;
+	if (!scsi_host_queue_ready(q, shost, sdev))
+		goto out_dec_target_busy;
+
+
+	if (!(req->cmd_flags & REQ_DONTPREP)) {
+		ret = prep_to_mq(scsi_mq_prep_fn(req));
+		if (ret)
+			goto out_dec_host_busy;
+		req->cmd_flags |= REQ_DONTPREP;
+	} else {
+		blk_mq_start_request(req);
+	}
+
+	if (blk_queue_tagged(q))
+		req->cmd_flags |= REQ_QUEUED;
+	else
+		req->cmd_flags &= ~REQ_QUEUED;
+
+	scsi_init_cmd_errh(cmd);
+	cmd->scsi_done = scsi_mq_done;
+
+	reason = scsi_dispatch_cmd(cmd);
+	if (reason) {
+		scsi_set_blocked(cmd, reason);
+		ret = BLK_MQ_RQ_QUEUE_BUSY;
+		goto out_dec_host_busy;
+	}
+
+	return BLK_MQ_RQ_QUEUE_OK;
+
+out_dec_host_busy:
+	atomic_dec(&shost->host_busy);
+out_dec_target_busy:
+	if (scsi_target(sdev)->can_queue > 0)
+		atomic_dec(&scsi_target(sdev)->target_busy);
+out_dec_device_busy:
+	atomic_dec(&sdev->device_busy);
+out_put_device:
+	put_device(&sdev->sdev_gendev);
+out:
+	switch (ret) {
+	case BLK_MQ_RQ_QUEUE_BUSY:
+		blk_mq_stop_hw_queue(hctx);
+		if (atomic_read(&sdev->device_busy) == 0 &&
+		    !scsi_device_blocked(sdev))
+			blk_mq_delay_queue(hctx, SCSI_QUEUE_DELAY);
+		break;
+	case BLK_MQ_RQ_QUEUE_ERROR:
+		/*
+		 * Make sure to release all allocated ressources when
+		 * we hit an error, as we will never see this command
+		 * again.
+		 */
+		if (req->cmd_flags & REQ_DONTPREP)
+			scsi_mq_uninit_cmd(cmd);
+		break;
+	default:
+		break;
+	}
+	return ret;
+}
+
+static enum blk_eh_timer_return scsi_timeout(struct request *req,
+               bool reserved)
+{
+       if (reserved)
+               return BLK_EH_RESET_TIMER;
+       return scsi_times_out(req);
+}
+
+static int scsi_init_request(void *data, struct request *rq,
+		unsigned int hctx_idx, unsigned int request_idx,
+		unsigned int numa_node)
+{
+	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
+
+	cmd->sense_buffer = kzalloc_node(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL,
+			numa_node);
+	if (!cmd->sense_buffer)
+		return -ENOMEM;
+	return 0;
+}
+
+static void scsi_exit_request(void *data, struct request *rq,
+		unsigned int hctx_idx, unsigned int request_idx)
+{
+	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
+
+	kfree(cmd->sense_buffer);
 }
 
 u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
@@ -1672,15 +2018,9 @@ u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
 }
 EXPORT_SYMBOL(scsi_calculate_bounce_limit);
 
-struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
-					 request_fn_proc *request_fn)
+static void __scsi_init_queue(struct Scsi_Host *shost, struct request_queue *q)
 {
-	struct request_queue *q;
 	struct device *dev = shost->dma_dev;
-
-	q = blk_init_queue(request_fn, NULL);
-	if (!q)
-		return NULL;
 
 	/*
 	 * this limit is imposed by hardware restrictions
@@ -1712,7 +2052,17 @@ struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
 	 * blk_queue_update_dma_alignment() later.
 	 */
 	blk_queue_dma_alignment(q, 0x03);
+}
 
+struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
+					 request_fn_proc *request_fn)
+{
+	struct request_queue *q;
+
+	q = blk_init_queue(request_fn, NULL);
+	if (!q)
+		return NULL;
+	__scsi_init_queue(shost, q);
 	return q;
 }
 EXPORT_SYMBOL(__scsi_alloc_queue);
@@ -1731,6 +2081,58 @@ struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
 	blk_queue_rq_timed_out(q, scsi_times_out);
 	blk_queue_lld_busy(q, scsi_lld_busy);
 	return q;
+}
+
+static struct blk_mq_ops scsi_mq_ops = {
+	.map_queue	= blk_mq_map_queue,
+	.queue_rq	= scsi_queue_rq,
+	.complete	= scsi_softirq_done,
+	.timeout        = scsi_timeout,
+	.init_request	= scsi_init_request,
+	.exit_request	= scsi_exit_request,
+};
+
+struct request_queue *scsi_mq_alloc_queue(struct scsi_device *sdev)
+{
+	sdev->request_queue = blk_mq_init_queue(sdev->host->tag_set);
+	if (IS_ERR(sdev->request_queue))
+		return NULL;
+
+	sdev->request_queue->queuedata = sdev;
+	__scsi_init_queue(sdev->host, sdev->request_queue);
+	return sdev->request_queue;
+}
+
+int scsi_mq_setup_tags(struct Scsi_Host *shost)
+{
+	unsigned int cmd_size, sgl_size, tbl_size;
+
+	tbl_size = shost->sg_tablesize;
+	if (tbl_size > SCSI_MAX_SG_SEGMENTS)
+		tbl_size = SCSI_MAX_SG_SEGMENTS;
+	sgl_size = tbl_size * sizeof(struct scatterlist);
+	cmd_size = sizeof(struct scsi_cmnd) + shost->hostt->cmd_size + sgl_size;
+	if (scsi_host_get_prot(shost))
+		cmd_size += sizeof(struct scsi_data_buffer) + sgl_size;
+
+	shost->tag_set = kzalloc(sizeof(*shost->tag_set), GFP_KERNEL);
+	if (!shost->tag_set)
+		return -ENOMEM;
+
+	shost->tag_set->ops = &scsi_mq_ops;
+	shost->tag_set->nr_hw_queues = 1;
+	shost->tag_set->queue_depth = shost->can_queue;
+	shost->tag_set->cmd_size = cmd_size;
+	shost->tag_set->numa_node = NUMA_NO_NODE;
+	shost->tag_set->flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
+	shost->tag_set->driver_data = shost;
+
+	return blk_mq_alloc_tag_set(shost->tag_set);
+}
+
+void scsi_mq_destroy_tags(struct Scsi_Host *shost)
+{
+	blk_mq_free_tag_set(shost->tag_set);
 }
 
 /*
@@ -2386,7 +2788,7 @@ scsi_device_quiesce(struct scsi_device *sdev)
 		return err;
 
 	scsi_run_queue(sdev->request_queue);
-	while (sdev->device_busy) {
+	while (atomic_read(&sdev->device_busy)) {
 		msleep_interruptible(200);
 		scsi_run_queue(sdev->request_queue);
 	}
@@ -2478,9 +2880,13 @@ scsi_internal_device_block(struct scsi_device *sdev)
 	 * block layer from calling the midlayer with this device's
 	 * request queue. 
 	 */
-	spin_lock_irqsave(q->queue_lock, flags);
-	blk_stop_queue(q);
-	spin_unlock_irqrestore(q->queue_lock, flags);
+	if (q->mq_ops) {
+		blk_mq_stop_hw_queues(q);
+	} else {
+		spin_lock_irqsave(q->queue_lock, flags);
+		blk_stop_queue(q);
+		spin_unlock_irqrestore(q->queue_lock, flags);
+	}
 
 	return 0;
 }
@@ -2526,9 +2932,13 @@ scsi_internal_device_unblock(struct scsi_device *sdev,
 		 sdev->sdev_state != SDEV_OFFLINE)
 		return -EINVAL;
 
-	spin_lock_irqsave(q->queue_lock, flags);
-	blk_start_queue(q);
-	spin_unlock_irqrestore(q->queue_lock, flags);
+	if (q->mq_ops) {
+		blk_mq_start_stopped_hw_queues(q, false);
+	} else {
+		spin_lock_irqsave(q->queue_lock, flags);
+		blk_start_queue(q);
+		spin_unlock_irqrestore(q->queue_lock, flags);
+	}
 
 	return 0;
 }

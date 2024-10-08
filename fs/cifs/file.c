@@ -43,7 +43,6 @@
 #include "cifs_fs_sb.h"
 #include "fscache.h"
 
-
 static inline int cifs_convert_flags(unsigned int flags)
 {
 	if ((flags & O_ACCMODE) == O_RDONLY)
@@ -774,7 +773,7 @@ int cifs_closedir(struct inode *inode, struct file *file)
 
 	cifs_dbg(FYI, "Freeing private data in close dir\n");
 	spin_lock(&cifs_file_list_lock);
-	if (!cfile->srch_inf.endOfSearch && !cfile->invalidHandle) {
+	if (server->ops->dir_needs_close(cfile)) {
 		cfile->invalidHandle = true;
 		spin_unlock(&cifs_file_list_lock);
 		if (server->ops->close_dir)
@@ -1682,8 +1681,8 @@ cifs_write(struct cifsFileInfo *open_file, __u32 pid, const char *write_data,
 					break;
 			}
 
-			len = min((size_t)cifs_sb->wsize,
-				  write_size - total_written);
+			len = min(server->ops->wp_retry_size(dentry->d_inode),
+				  (unsigned int)write_size - total_written);
 			/* iov[0] is reserved for smb header */
 			iov[1].iov_base = (char *)write_data + total_written;
 			iov[1].iov_len = len;
@@ -2044,6 +2043,7 @@ static int cifs_writepages(struct address_space *mapping,
 			   struct writeback_control *wbc)
 {
 	struct cifs_sb_info *cifs_sb = CIFS_SB(mapping->host->i_sb);
+	struct TCP_Server_Info *server;
 	bool done = false, scanned = false, range_whole = false;
 	pgoff_t end, index;
 	struct cifs_writedata *wdata;
@@ -2066,23 +2066,30 @@ static int cifs_writepages(struct address_space *mapping,
 			range_whole = true;
 		scanned = true;
 	}
+	server = cifs_sb_master_tcon(cifs_sb)->ses->server;
 retry:
 	while (!done && index <= end) {
-		unsigned int i, nr_pages, found_pages;
+		unsigned int i, nr_pages, found_pages, wsize, credits;
 		pgoff_t next = 0, tofind, saved_index = index;
 
-		tofind = min((cifs_sb->wsize / PAGE_CACHE_SIZE) - 1,
-				end - index) + 1;
+		rc = server->ops->wait_mtu_credits(server, cifs_sb->wsize,
+						   &wsize, &credits);
+		if (rc)
+			break;
+
+		tofind = min((wsize / PAGE_CACHE_SIZE) - 1, end - index) + 1;
 
 		wdata = wdata_alloc_and_fillpages(tofind, mapping, end, &index,
 						  &found_pages);
 		if (!wdata) {
 			rc = -ENOMEM;
+			add_credits_and_wake_if(server, credits, 0);
 			break;
 		}
 
 		if (found_pages == 0) {
 			kref_put(&wdata->refcount, cifs_writedata_release);
+			add_credits_and_wake_if(server, credits, 0);
 			break;
 		}
 
@@ -2092,13 +2099,17 @@ retry:
 		/* nothing to write? */
 		if (nr_pages == 0) {
 			kref_put(&wdata->refcount, cifs_writedata_release);
+			add_credits_and_wake_if(server, credits, 0);
 			continue;
 		}
+
+		wdata->credits = credits;
 
 		rc = wdata_send_pages(wdata, nr_pages, mapping, wbc);
 
 		/* send failure -- clean up the mess */
 		if (rc != 0) {
+			add_credits_and_wake_if(server, wdata->credits, 0);
 			for (i = 0; i < nr_pages; ++i) {
 				if (rc == -EAGAIN)
 					redirty_page_for_writepage(wbc,
@@ -2414,125 +2425,109 @@ cifs_uncached_writev_complete(struct work_struct *work)
 	kref_put(&wdata->refcount, cifs_uncached_writedata_release);
 }
 
-/* attempt to send write to server, retry on any -EAGAIN errors */
 static int
-cifs_uncached_retry_writev(struct cifs_writedata *wdata)
+wdata_fill_from_iovec(struct cifs_writedata *wdata, struct iov_iter *from,
+		      size_t *len, unsigned long *num_pages)
 {
-	int rc;
-	struct TCP_Server_Info *server;
+	size_t save_len, copied, bytes, cur_len = *len;
+	unsigned long i, nr_pages = *num_pages;
 
-	server = tlink_tcon(wdata->cfile->tlink)->ses->server;
+	save_len = cur_len;
+	for (i = 0; i < nr_pages; i++) {
+		bytes = min_t(const size_t, cur_len, PAGE_SIZE);
+		copied = copy_page_from_iter(wdata->pages[i], 0, bytes, from);
+		cur_len -= copied;
+		/*
+		 * If we didn't copy as much as we expected, then that
+		 * may mean we trod into an unmapped area. Stop copying
+		 * at that point. On the next pass through the big
+		 * loop, we'll likely end up getting a zero-length
+		 * write and bailing out of it.
+		 */
+		if (copied < bytes)
+			break;
+	}
+	cur_len = save_len - cur_len;
+	*len = cur_len;
 
-	do {
-		if (wdata->cfile->invalidHandle) {
-			rc = cifs_reopen_file(wdata->cfile, false);
-			if (rc != 0)
-				continue;
-		}
-		rc = server->ops->async_writev(wdata,
-					       cifs_uncached_writedata_release);
-	} while (rc == -EAGAIN);
+	/*
+	 * If we have no data to send, then that probably means that
+	 * the copy above failed altogether. That's most likely because
+	 * the address in the iovec was bogus. Return -EFAULT and let
+	 * the caller free anything we allocated and bail out.
+	 */
+	if (!cur_len)
+		return -EFAULT;
 
-	return rc;
+	/*
+	 * i + 1 now represents the number of pages we actually used in
+	 * the copy phase above.
+	 */
+	*num_pages = i + 1;
+	return 0;
 }
 
-static ssize_t
-cifs_iovec_write(struct file *file, const struct iovec *iov,
-		 unsigned long nr_segs, loff_t *poffset)
+static int
+cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
+		     struct cifsFileInfo *open_file,
+		     struct cifs_sb_info *cifs_sb, struct list_head *wdata_list)
 {
-	unsigned long nr_pages, i;
-	size_t bytes, copied, len, cur_len;
-	ssize_t total_written = 0;
-	loff_t offset;
-	struct iov_iter it;
-	struct cifsFileInfo *open_file;
-	struct cifs_tcon *tcon;
-	struct cifs_sb_info *cifs_sb;
-	struct cifs_writedata *wdata, *tmp;
-	struct list_head wdata_list;
-	int rc;
+	int rc = 0;
+	size_t cur_len;
+	unsigned long nr_pages, num_pages, i;
+	struct cifs_writedata *wdata;
+	struct iov_iter saved_from;
+	loff_t saved_offset = offset;
 	pid_t pid;
-
-	len = iov_length(iov, nr_segs);
-	if (!len)
-		return 0;
-
-	rc = generic_write_checks(file, poffset, &len, 0);
-	if (rc)
-		return rc;
-
-	INIT_LIST_HEAD(&wdata_list);
-	cifs_sb = CIFS_SB(file->f_path.dentry->d_sb);
-	open_file = file->private_data;
-	tcon = tlink_tcon(open_file->tlink);
-
-	if (!tcon->ses->server->ops->async_writev)
-		return -ENOSYS;
-
-	offset = *poffset;
+	struct TCP_Server_Info *server;
 
 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_RWPIDFORWARD)
 		pid = open_file->pid;
 	else
 		pid = current->tgid;
 
-	iov_iter_init(&it, iov, nr_segs, len, 0);
-	do {
-		size_t save_len;
+	server = tlink_tcon(open_file->tlink)->ses->server;
+	memcpy(&saved_from, from, sizeof(struct iov_iter));
 
-		nr_pages = get_numpages(cifs_sb->wsize, len, &cur_len);
+	do {
+		unsigned int wsize, credits;
+
+		rc = server->ops->wait_mtu_credits(server, cifs_sb->wsize,
+						   &wsize, &credits);
+		if (rc)
+			break;
+
+		nr_pages = get_numpages(wsize, len, &cur_len);
 		wdata = cifs_writedata_alloc(nr_pages,
 					     cifs_uncached_writev_complete);
 		if (!wdata) {
 			rc = -ENOMEM;
+			add_credits_and_wake_if(server, credits, 0);
 			break;
 		}
 
 		rc = cifs_write_allocate_pages(wdata->pages, nr_pages);
 		if (rc) {
 			kfree(wdata);
+			add_credits_and_wake_if(server, credits, 0);
 			break;
 		}
 
-		save_len = cur_len;
-		for (i = 0; i < nr_pages; i++) {
-			bytes = min_t(const size_t, cur_len, PAGE_SIZE);
-			copied = iov_iter_copy_from_user(wdata->pages[i], &it,
-							 0, bytes);
-			cur_len -= copied;
-			iov_iter_advance(&it, copied);
-			/*
-			 * If we didn't copy as much as we expected, then that
-			 * may mean we trod into an unmapped area. Stop copying
-			 * at that point. On the next pass through the big
-			 * loop, we'll likely end up getting a zero-length
-			 * write and bailing out of it.
-			 */
-			if (copied < bytes)
-				break;
-		}
-		cur_len = save_len - cur_len;
-
-		/*
-		 * If we have no data to send, then that probably means that
-		 * the copy above failed altogether. That's most likely because
-		 * the address in the iovec was bogus. Set the rc to -EFAULT,
-		 * free anything we allocated and bail out.
-		 */
-		if (!cur_len) {
+		num_pages = nr_pages;
+		rc = wdata_fill_from_iovec(wdata, from, &cur_len, &num_pages);
+		if (rc) {
 			for (i = 0; i < nr_pages; i++)
 				put_page(wdata->pages[i]);
 			kfree(wdata);
-			rc = -EFAULT;
+			add_credits_and_wake_if(server, credits, 0);
 			break;
 		}
 
 		/*
-		 * i + 1 now represents the number of pages we actually used in
-		 * the copy phase above. Bring nr_pages down to that, and free
-		 * any pages that we didn't use.
+		 * Bring nr_pages down to the number of pages we actually used,
+		 * and free any pages that we didn't use.
 		 */
-		for ( ; nr_pages > i + 1; nr_pages--)
+		for ( ; nr_pages > num_pages; nr_pages--)
 			put_page(wdata->pages[nr_pages - 1]);
 
 		wdata->sync_mode = WB_SYNC_ALL;
@@ -2543,17 +2538,68 @@ cifs_iovec_write(struct file *file, const struct iovec *iov,
 		wdata->bytes = cur_len;
 		wdata->pagesz = PAGE_SIZE;
 		wdata->tailsz = cur_len - ((nr_pages - 1) * PAGE_SIZE);
-		rc = cifs_uncached_retry_writev(wdata);
+		wdata->credits = credits;
+
+		if (!wdata->cfile->invalidHandle ||
+		    !cifs_reopen_file(wdata->cfile, false))
+			rc = server->ops->async_writev(wdata,
+					cifs_uncached_writedata_release);
 		if (rc) {
+			add_credits_and_wake_if(server, wdata->credits, 0);
 			kref_put(&wdata->refcount,
 				 cifs_uncached_writedata_release);
+			if (rc == -EAGAIN) {
+				memcpy(from, &saved_from,
+				       sizeof(struct iov_iter));
+				iov_iter_advance(from, offset - saved_offset);
+				continue;
+			}
 			break;
 		}
 
-		list_add_tail(&wdata->list, &wdata_list);
+		list_add_tail(&wdata->list, wdata_list);
 		offset += cur_len;
 		len -= cur_len;
 	} while (len > 0);
+
+	return rc;
+}
+
+static ssize_t
+cifs_iovec_write(struct file *file, struct iov_iter *from, loff_t *poffset)
+{
+	size_t len;
+	ssize_t total_written = 0;
+	struct cifsFileInfo *open_file;
+	struct cifs_tcon *tcon;
+	struct cifs_sb_info *cifs_sb;
+	struct cifs_writedata *wdata, *tmp;
+	struct list_head wdata_list;
+	struct iov_iter saved_from;
+	int rc;
+
+	len = iov_iter_count(from);
+	rc = generic_write_checks(file, poffset, &len, 0);
+	if (rc)
+		return rc;
+
+	if (!len)
+		return 0;
+
+	iov_iter_truncate(from, len);
+
+	INIT_LIST_HEAD(&wdata_list);
+	cifs_sb = CIFS_SB(file->f_path.dentry->d_sb);
+	open_file = file->private_data;
+	tcon = tlink_tcon(open_file->tlink);
+
+	if (!tcon->ses->server->ops->async_writev)
+		return -ENOSYS;
+
+	memcpy(&saved_from, from, sizeof(struct iov_iter));
+
+	rc = cifs_write_from_iter(*poffset, len, from, open_file, cifs_sb,
+				  &wdata_list);
 
 	/*
 	 * If at least one write was successfully sent, then discard any rc
@@ -2583,7 +2629,25 @@ restart_loop:
 
 			/* resend call if it's a retryable error */
 			if (rc == -EAGAIN) {
-				rc = cifs_uncached_retry_writev(wdata);
+				struct list_head tmp_list;
+				struct iov_iter tmp_from;
+
+				INIT_LIST_HEAD(&tmp_list);
+				list_del_init(&wdata->list);
+
+				memcpy(&tmp_from, &saved_from,
+				       sizeof(struct iov_iter));
+				iov_iter_advance(&tmp_from,
+						 wdata->offset - *poffset);
+
+				rc = cifs_write_from_iter(wdata->offset,
+						wdata->bytes, &tmp_from,
+						open_file, cifs_sb, &tmp_list);
+
+				list_splice(&tmp_list, &wdata_list);
+
+				kref_put(&wdata->refcount,
+					 cifs_uncached_writedata_release);
 				goto restart_loop;
 			}
 		}
@@ -2603,6 +2667,9 @@ ssize_t cifs_user_writev(struct kiocb *iocb, const struct iovec *iov,
 {
 	ssize_t written;
 	struct inode *inode;
+	struct iov_iter from;
+
+        iov_iter_init(&from, iov, nr_segs, iov_length(iov, nr_segs), 0);
 
 	inode = file_inode(iocb->ki_filp);
 
@@ -2612,7 +2679,7 @@ ssize_t cifs_user_writev(struct kiocb *iocb, const struct iovec *iov,
 	 * write request.
 	 */
 
-	written = cifs_iovec_write(iocb->ki_filp, iov, nr_segs, &pos);
+	written = cifs_iovec_write(iocb->ki_filp, &from, &pos);
 	if (written > 0) {
 		set_bit(CIFS_INO_INVALID_MAPPING, &CIFS_I(inode)->flags);
 		iocb->ki_pos = pos;
@@ -2866,59 +2933,38 @@ cifs_uncached_read_into_pages(struct TCP_Server_Info *server,
 						rdata->got_bytes : result;
 }
 
-ssize_t cifs_user_readv(struct kiocb *iocb, const struct iovec *iov,
-			       unsigned long nr_segs, loff_t pos)
+static int
+cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
+		     struct cifs_sb_info *cifs_sb, struct list_head *rdata_list)
 {
-	struct file *file = iocb->ki_filp;
-	ssize_t rc;
-	size_t len, cur_len;
-	ssize_t total_read = 0;
-	loff_t offset = pos;
-	unsigned int npages;
-	struct cifs_sb_info *cifs_sb;
-	struct cifs_tcon *tcon;
-	struct cifsFileInfo *open_file;
-	struct cifs_readdata *rdata, *tmp;
-	struct list_head rdata_list;
-	struct iov_iter to;
+	struct cifs_readdata *rdata;
+	unsigned int npages, rsize, credits;
+	size_t cur_len;
+	int rc;
 	pid_t pid;
 	struct TCP_Server_Info *server;
 
 	server = tlink_tcon(open_file->tlink)->ses->server;
-
-	if (!nr_segs)
-		return 0;
-
-	len = iov_length(iov, nr_segs);
-	if (!len)
-		return 0;
-
-	iov_iter_init(&to, iov, nr_segs, len, 0);
-
-	INIT_LIST_HEAD(&rdata_list);
-	cifs_sb = CIFS_SB(file->f_path.dentry->d_sb);
-	open_file = file->private_data;
-	tcon = tlink_tcon(open_file->tlink);
-
-	if (!tcon->ses->server->ops->async_readv)
-		return -ENOSYS;
 
 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_RWPIDFORWARD)
 		pid = open_file->pid;
 	else
 		pid = current->tgid;
 
-	if ((file->f_flags & O_ACCMODE) == O_WRONLY)
-		cifs_dbg(FYI, "attempting read on write only file instance\n");
-
 	do {
-		cur_len = min_t(const size_t, len - total_read, cifs_sb->rsize);
+		rc = server->ops->wait_mtu_credits(server, cifs_sb->rsize,
+						   &rsize, &credits);
+		if (rc)
+			break;
+
+		cur_len = min_t(const size_t, len, rsize);
 		npages = DIV_ROUND_UP(cur_len, PAGE_SIZE);
 
 		/* allocate a readdata struct */
 		rdata = cifs_readdata_alloc(npages,
 					    cifs_uncached_readv_complete);
 		if (!rdata) {
+			add_credits_and_wake_if(server, credits, 0);
 			rc = -ENOMEM;
 			break;
 		}
@@ -2934,12 +2980,14 @@ ssize_t cifs_user_readv(struct kiocb *iocb, const struct iovec *iov,
 		rdata->pid = pid;
 		rdata->pagesz = PAGE_SIZE;
 		rdata->read_into_pages = cifs_uncached_read_into_pages;
+		rdata->credits = credits;
 
 		if (!rdata->cfile->invalidHandle ||
 		    !cifs_reopen_file(rdata->cfile, true))
 			rc = server->ops->async_readv(rdata);
 error:
 		if (rc) {
+			add_credits_and_wake_if(server, rdata->credits, 0);
 			kref_put(&rdata->refcount,
 				 cifs_uncached_readdata_release);
 			if (rc == -EAGAIN)
@@ -2947,16 +2995,49 @@ error:
 			break;
 		}
 
-		list_add_tail(&rdata->list, &rdata_list);
+		list_add_tail(&rdata->list, rdata_list);
 		offset += cur_len;
 		len -= cur_len;
 	} while (len > 0);
+
+	return rc;
+}
+
+ssize_t cifs_user_readv(struct kiocb *iocb, struct iov_iter *to)
+{
+	struct file *file = iocb->ki_filp;
+	ssize_t rc;
+	size_t len;
+	ssize_t total_read = 0;
+	loff_t offset = iocb->ki_pos;
+	struct cifs_sb_info *cifs_sb;
+	struct cifs_tcon *tcon;
+	struct cifsFileInfo *open_file;
+	struct cifs_readdata *rdata, *tmp;
+	struct list_head rdata_list;
+
+	len = iov_iter_count(to);
+	if (!len)
+		return 0;
+
+	INIT_LIST_HEAD(&rdata_list);
+	cifs_sb = CIFS_SB(file->f_path.dentry->d_sb);
+	open_file = file->private_data;
+	tcon = tlink_tcon(open_file->tlink);
+
+	if (!tcon->ses->server->ops->async_readv)
+		return -ENOSYS;
+
+	if ((file->f_flags & O_ACCMODE) == O_WRONLY)
+		cifs_dbg(FYI, "attempting read on write only file instance\n");
+
+	rc = cifs_send_async_read(offset, len, open_file, cifs_sb, &rdata_list);
 
 	/* if at least one read request send succeeded, then reset rc */
 	if (!list_empty(&rdata_list))
 		rc = 0;
 
-	len = iov_iter_count(&to);
+	len = iov_iter_count(to);
 	/* the loop below should proceed in the order of increasing offsets */
 again:
 	list_for_each_entry_safe(rdata, tmp, &rdata_list, list) {
@@ -2965,28 +3046,44 @@ again:
 			rc = wait_for_completion_killable(&rdata->done);
 			if (rc)
 				rc = -EINTR;
-			else if (rdata->result) {
-				rc = rdata->result;
+			else if (rdata->result == -EAGAIN) {
 				/* resend call if it's a retryable error */
-				if (rc == -EAGAIN) {
-					struct list_head tmp_list;
+				struct list_head tmp_list;
+				unsigned int got_bytes = rdata->got_bytes;
 
-					list_del_init(&rdata->list);
-					INIT_LIST_HEAD(&tmp_list);
+				list_del_init(&rdata->list);
+				INIT_LIST_HEAD(&tmp_list);
 
-					rc = cifs_send_async_read(rdata->offset,
-						rdata->bytes, rdata->cfile,
-						cifs_sb, &tmp_list);
-
-					list_splice(&tmp_list, &rdata_list);
-
-					kref_put(&rdata->refcount,
+				/*
+				 * Got a part of data and then reconnect has
+				 * happened -- fill the buffer and continue
+				 * reading.
+				 */
+				if (got_bytes && got_bytes < rdata->bytes) {
+					rc = cifs_readdata_to_iov(rdata, to);
+					if (rc) {
+						kref_put(&rdata->refcount,
 						cifs_uncached_readdata_release);
-					goto again;
+						continue;
+					}
 				}
-			} else {
-				rc = cifs_readdata_to_iov(rdata, &to);
-			}
+
+				rc = cifs_send_async_read(
+						rdata->offset + got_bytes,
+						rdata->bytes - got_bytes,
+						rdata->cfile, cifs_sb,
+						&tmp_list);
+
+				list_splice(&tmp_list, &rdata_list);
+
+				kref_put(&rdata->refcount,
+					 cifs_uncached_readdata_release);
+				goto again;
+			} else if (rdata->result)
+				rc = rdata->result;
+			else
+				rc = cifs_readdata_to_iov(rdata, to);
+
 			/* if there was a short read -- discard anything left */
 			if (rdata->got_bytes && rdata->got_bytes < rdata->bytes)
 				rc = -ENODATA;
@@ -2995,7 +3092,7 @@ again:
 		kref_put(&rdata->refcount, cifs_uncached_readdata_release);
 	}
 
-	total_read = len - iov_iter_count(&to);
+	total_read = len - iov_iter_count(to);
 
 	cifs_stats_bytes_read(tcon, total_read);
 
@@ -3004,15 +3101,25 @@ again:
 		rc = 0;
 
 	if (total_read) {
-		iocb->ki_pos = pos + total_read;
+		iocb->ki_pos += total_read;
 		return total_read;
 	}
 	return rc;
 }
 
+ssize_t cifs_user_readv_wrapper(struct kiocb *iocb, const struct iovec *iov,
+			unsigned long nr_segs, loff_t pos)
+{
+	struct iov_iter to;
+
+	iov_iter_init(&to, iov, nr_segs, iov_length(iov, nr_segs), 0);
+	return cifs_user_readv(iocb, &to);
+}
+
+
 ssize_t
 cifs_strict_readv(struct kiocb *iocb, const struct iovec *iov,
-		  unsigned long nr_segs, loff_t pos)
+		 unsigned long nr_segs, loff_t pos)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct cifsInodeInfo *cinode = CIFS_I(inode);
@@ -3031,7 +3138,7 @@ cifs_strict_readv(struct kiocb *iocb, const struct iovec *iov,
 	 * pos+len-1.
 	 */
 	if (!CIFS_CACHE_READ(cinode))
-		return cifs_user_readv(iocb, iov, nr_segs, pos);
+		return cifs_user_readv_wrapper(iocb, iov, nr_segs, pos);
 
 	if (cap_unix(tcon->ses) &&
 	    (CIFS_UNIX_FCNTL_CAP & le64_to_cpu(tcon->fsUnixInfo.Capability)) &&
@@ -3415,10 +3522,16 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 	 * the rdata->pages, then we want them in increasing order.
 	 */
 	while (!list_empty(page_list)) {
-		unsigned int i, nr_pages, bytes;
+		unsigned int i, nr_pages, bytes, rsize;
 		loff_t offset;
 		struct page *page, *tpage;
 		struct cifs_readdata *rdata;
+		unsigned credits;
+
+		rc = server->ops->wait_mtu_credits(server, cifs_sb->rsize,
+						   &rsize, &credits);
+		if (rc)
+			break;
 
 		/*
 		 * Give up immediately if rsize is too small to read an entire
@@ -3426,13 +3539,17 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 		 * reach this point however since we set ra_pages to 0 when the
 		 * rsize is smaller than a cache page.
 		 */
-		if (unlikely(cifs_sb->rsize < PAGE_CACHE_SIZE))
+		if (unlikely(rsize < PAGE_CACHE_SIZE)) {
+			add_credits_and_wake_if(server, credits, 0);
 			return 0;
+		}
 
-		rc = readpages_get_pages(mapping, page_list, cifs_sb->rsize,
-					 &tmplist, &nr_pages, &offset, &bytes);
-		if (rc)
+		rc = readpages_get_pages(mapping, page_list, rsize, &tmplist,
+					 &nr_pages, &offset, &bytes);
+		if (rc) {
+			add_credits_and_wake_if(server, credits, 0);
 			break;
+		}
 
 		rdata = cifs_readdata_alloc(nr_pages, cifs_readv_complete);
 		if (!rdata) {
@@ -3444,6 +3561,7 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 				page_cache_release(page);
 			}
 			rc = -ENOMEM;
+			add_credits_and_wake_if(server, credits, 0);
 			break;
 		}
 
@@ -3454,6 +3572,7 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 		rdata->pid = pid;
 		rdata->pagesz = PAGE_CACHE_SIZE;
 		rdata->read_into_pages = cifs_readpages_read_into_pages;
+		rdata->credits = credits;
 
 		list_for_each_entry_safe(page, tpage, &tmplist, lru) {
 			list_del(&page->lru);
@@ -3464,6 +3583,7 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 		    !cifs_reopen_file(rdata->cfile, true))
 			rc = server->ops->async_readv(rdata);
 		if (rc) {
+			add_credits_and_wake_if(server, rdata->credits, 0);
 			for (i = 0; i < rdata->nr_pages; i++) {
 				page = rdata->pages[i];
 				lru_cache_add_file(page);

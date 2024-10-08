@@ -100,8 +100,24 @@ MODULE_PARM_DESC(max_luns,
 
 static char scsi_scan_type[6] = SCSI_SCAN_TYPE_DEFAULT;
 
+#define MAX_INIT_REPORT_LUNS 511
+
 module_param_string(scan, scsi_scan_type, sizeof(scsi_scan_type), S_IRUGO);
 MODULE_PARM_DESC(scan, "sync, async or none");
+
+/*
+ * max_scsi_report_luns: the maximum number of LUNS that will be
+ * returned from the REPORT LUNS command. 8 times this value must
+ * be allocated. In theory this could be up to an 8 byte value, but
+ * in practice, the maximum number of LUNs suppored by any device
+ * is about 16k.
+ */
+static unsigned int max_scsi_report_luns = 16383;
+
+module_param_named(max_report_luns, max_scsi_report_luns, uint, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(max_report_luns,
+		 "REPORT LUNS maximum number of LUNS received (should be"
+		 " between 1 and 16383)");
 
 static unsigned int scsi_inq_timeout = SCSI_TIMEOUT/HZ + 18;
 
@@ -264,7 +280,10 @@ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
 	 */
 	sdev->borken = 1;
 
-	sdev->request_queue = scsi_alloc_queue(sdev);
+	if (shost_use_blk_mq(shost))
+		sdev->request_queue = scsi_mq_alloc_queue(sdev);
+	else
+		sdev->request_queue = scsi_alloc_queue(sdev);
 	if (!sdev->request_queue) {
 		/* release fn is set up in scsi_sysfs_device_initialise, so
 		 * have to free and put manually here */
@@ -670,9 +689,10 @@ static int scsi_probe_lun(struct scsi_device *sdev, unsigned char *inq_result,
 	 * strings.
 	 */
 	if (sdev->inquiry_len < 36) {
-		sdev_printk(KERN_INFO, sdev,
-			    "scsi scan: INQUIRY result too short (%d),"
-			    " using 36\n", sdev->inquiry_len);
+		printk_once(KERN_INFO
+			    "%s %s: scsi scan: INQUIRY result too short (%d),"
+			    " using 36\n", dev_driver_string(&sdev->sdev_gendev),
+			    dev_name(&sdev->sdev_gendev), sdev->inquiry_len);
 		sdev->inquiry_len = 36;
 	}
 
@@ -1321,7 +1341,7 @@ static int scsi_report_lun_scan(struct scsi_target *starget, int bflags,
 {
 	char devname[64];
 	unsigned char scsi_cmd[MAX_COMMAND_SIZE];
-	unsigned int length;
+	unsigned int length, new_length;
 	unsigned int lun;
 	unsigned int num_luns;
 	unsigned int retries;
@@ -1366,10 +1386,11 @@ static int scsi_report_lun_scan(struct scsi_target *starget, int bflags,
 
 	/*
 	 * Allocate enough to hold the header (the same size as one scsi_lun)
-	 * plus the number of luns we are requesting.  511 was the default
-	 * value of the now removed max_report_luns parameter.
+	 * plus the number of luns we are requesting.
 	 */
-	length = (511 + 1) * sizeof(struct scsi_lun);
+	length = (max_scsi_report_luns < MAX_INIT_REPORT_LUNS) ?
+		(max_scsi_report_luns + 1) * sizeof(struct scsi_lun) :
+		(MAX_INIT_REPORT_LUNS + 1) * sizeof(struct scsi_lun);
 retry:
 	lun_data = kmalloc(length, GFP_KERNEL |
 			   (sdev->host->unchecked_isa_dma ? __GFP_DMA : 0));
@@ -1434,18 +1455,29 @@ retry:
 	}
 
 	/*
-	 * Get the length from the first four bytes of lun_data.
+	 * Get the new length from the first four bytes of lun_data.
 	 */
-	if (get_unaligned_be32(lun_data->scsi_lun) +
-	    sizeof(struct scsi_lun) > length) {
-		length = get_unaligned_be32(lun_data->scsi_lun) +
-			 sizeof(struct scsi_lun);
+	new_length =
+		get_unaligned_be32(lun_data->scsi_lun) +
+		sizeof(struct scsi_lun);
+	num_luns =
+		get_unaligned_be32(lun_data->scsi_lun) /
+		sizeof(struct scsi_lun);
+
+	if (new_length > length && num_luns <= max_scsi_report_luns) {
+		length = new_length;
 		kfree(lun_data);
 		goto retry;
 	}
-	length = get_unaligned_be32(lun_data->scsi_lun);
 
-	num_luns = (length / sizeof(struct scsi_lun));
+	if (num_luns > max_scsi_report_luns) {
+		sdev_printk(KERN_WARNING, sdev,
+			    "Only %d (max_scsi_report_luns)"
+			    " of %d luns reported, try increasing"
+			    " max_report_luns.\n",
+			    max_scsi_report_luns, num_luns);
+		num_luns = max_scsi_report_luns;
+	}
 
 	SCSI_LOG_SCAN_BUS(3, sdev_printk (KERN_INFO, sdev,
 		"scsi scan: REPORT LUN scan\n"));
@@ -1463,6 +1495,7 @@ retry:
 		 */
 		if (memcmp(&lunp->scsi_lun[sizeof(lun)], "\0\0\0\0", 4)) {
 			int i;
+			u8 *data;
 
 			/*
 			 * Output an error displaying the LUN in byte order,

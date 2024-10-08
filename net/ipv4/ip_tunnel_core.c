@@ -48,17 +48,15 @@
 
 int iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 		  __be32 src, __be32 dst, __u8 proto,
-		  __u8 tos, __u8 ttl, __be16 df)
+		  __u8 tos, __u8 ttl, __be16 df, bool xnet)
 {
 	int pkt_len = skb->len;
 	struct iphdr *iph;
 	int err;
 
-	nf_reset(skb);
-	secpath_reset(skb);
-	skb_clear_hash(skb);
-	skb_dst_drop(skb);
+	skb_scrub_packet(skb, xnet);
 
+	skb_clear_hash(skb);
 	skb_dst_set(skb, &rt->dst);
 	memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
 
@@ -159,3 +157,34 @@ error:
 	return ERR_PTR(err);
 }
 EXPORT_SYMBOL_GPL(iptunnel_handle_offloads);
+
+/* Often modified stats are per cpu, other are shared (netdev->stats) */
+struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+						struct rtnl_link_stats64 *tot)
+{
+	int i;
+
+	netdev_stats_to_stats64(tot, &dev->stats);
+
+	for_each_possible_cpu(i) {
+		const struct pcpu_sw_netstats *tstats = per_cpu_ptr(dev->tstats, i);
+		u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
+		unsigned int start;
+
+		do {
+			start = u64_stats_fetch_begin_irq(&tstats->syncp);
+			rx_packets = tstats->rx_packets;
+			tx_packets = tstats->tx_packets;
+			rx_bytes = tstats->rx_bytes;
+			tx_bytes = tstats->tx_bytes;
+		} while (u64_stats_fetch_retry_irq(&tstats->syncp, start));
+
+		tot->rx_packets += rx_packets;
+		tot->tx_packets += tx_packets;
+		tot->rx_bytes   += rx_bytes;
+		tot->tx_bytes   += tx_bytes;
+	}
+
+	return tot;
+}
+EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);

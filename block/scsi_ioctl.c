@@ -142,7 +142,7 @@ static void blk_set_cmd_filter_defaults(struct blk_cmd_filter *filter)
 	__set_bit(GPCMD_VERIFY_10, filter->read_ok);
 	__set_bit(VERIFY_16, filter->read_ok);
 	__set_bit(REPORT_LUNS, filter->read_ok);
-	__set_bit(SERVICE_ACTION_IN, filter->read_ok);
+	__set_bit(SERVICE_ACTION_IN_16, filter->read_ok);
 	__set_bit(RECEIVE_DIAGNOSTIC, filter->read_ok);
 	__set_bit(MAINTENANCE_IN, filter->read_ok);
 	__set_bit(GPCMD_READ_BUFFER_CAPACITY, filter->read_ok);
@@ -317,8 +317,8 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
 		}
 
 	rq = blk_get_request(q, writing ? WRITE : READ, GFP_KERNEL);
-	if (!rq)
-		return -ENOMEM;
+	if (IS_ERR(rq))
+		return PTR_ERR(rq);
 	blk_rq_set_block_pc(rq);
 
 	if (blk_fill_sghdr_rq(q, rq, hdr, mode)) {
@@ -465,10 +465,11 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
 	}
 
 	rq = blk_get_request(q, in_len ? WRITE : READ, __GFP_WAIT);
-	if (!rq) {
-		err = -ENODEV;
+	if (IS_ERR(rq)) {
+		err = PTR_ERR(rq);
 		goto error_free_buffer;
 	}
+	blk_rq_set_block_pc(rq);
 
 	cmdlen = COMMAND_SIZE(opcode);
 
@@ -522,7 +523,6 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
 	memset(sense, 0, sizeof(sense));
 	rq->sense = sense;
 	rq->sense_len = 0;
-	blk_rq_set_block_pc(rq);
 
 	blk_execute_rq(q, disk, rq, 0);
 
@@ -541,8 +541,10 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
 	
 error:
 	blk_put_request(rq);
+
 error_free_buffer:
 	kfree(buffer);
+
 	return err;
 }
 EXPORT_SYMBOL_GPL(sg_scsi_ioctl);
@@ -555,8 +557,8 @@ static int __blk_send_generic(struct request_queue *q, struct gendisk *bd_disk,
 	int err;
 
 	rq = blk_get_request(q, WRITE, __GFP_WAIT);
-	if (!rq)
-		return -ENODEV;
+	if (IS_ERR(rq))
+		return PTR_ERR(rq);
 	blk_rq_set_block_pc(rq);
 	rq->timeout = BLK_DEFAULT_SG_TIMEOUT;
 	rq->cmd[0] = cmd;

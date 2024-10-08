@@ -256,7 +256,7 @@ static int alloc_pebs_buffer(int cpu)
 	if (!x86_pmu.pebs)
 		return 0;
 
-	buffer = kmalloc_node(PEBS_BUFFER_SIZE, GFP_KERNEL | __GFP_ZERO, node);
+	buffer = kzalloc_node(PEBS_BUFFER_SIZE, GFP_KERNEL, node);
 	if (unlikely(!buffer))
 		return -ENOMEM;
 
@@ -310,7 +310,7 @@ static int alloc_bts_buffer(int cpu)
 	if (!x86_pmu.bts)
 		return 0;
 
-	buffer = kmalloc_node(BTS_BUFFER_SIZE, GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN, node);
+	buffer = kzalloc_node(BTS_BUFFER_SIZE, GFP_KERNEL | __GFP_NOWARN, node);
 	if (unlikely(!buffer)) {
 		WARN_ONCE(1, "%s: BTS buffer allocation failure\n", __func__);
 		return -ENOMEM;
@@ -345,7 +345,7 @@ static int alloc_ds_buffer(int cpu)
 	int node = cpu_to_node(cpu);
 	struct debug_store *ds;
 
-	ds = kmalloc_node(sizeof(*ds), GFP_KERNEL | __GFP_ZERO, node);
+	ds = kzalloc_node(sizeof(*ds), GFP_KERNEL, node);
 	if (unlikely(!ds))
 		return -ENOMEM;
 
@@ -705,9 +705,9 @@ void intel_pmu_pebs_disable(struct perf_event *event)
 
 	cpuc->pebs_enabled &= ~(1ULL << hwc->idx);
 
-	if (event->hw.constraint->flags & PERF_X86_EVENT_PEBS_LDLAT)
+	if (event->hw.flags & PERF_X86_EVENT_PEBS_LDLAT)
 		cpuc->pebs_enabled &= ~(1ULL << (hwc->idx + 32));
-	else if (event->hw.constraint->flags & PERF_X86_EVENT_PEBS_ST)
+	else if (event->hw.flags & PERF_X86_EVENT_PEBS_ST)
 		cpuc->pebs_enabled &= ~(1ULL << 63);
 
 	if (cpuc->enabled)

@@ -230,6 +230,18 @@ struct vm_region {
 						* this region */
 };
 
+#ifdef CONFIG_USERFAULTFD
+#define NULL_VM_UFFD_CTX ((struct vm_userfaultfd_ctx) { NULL, })
+struct vm_userfaultfd_ctx {
+	struct userfaultfd_ctx *ctx;
+};
+#else /* CONFIG_USERFAULTFD */
+#define NULL_VM_UFFD_CTX ((struct vm_userfaultfd_ctx) {0, })
+struct vm_userfaultfd_ctx {
+	unsigned long rh_reserved1_placeholder;
+};
+#endif /* CONFIG_USERFAULTFD */
+
 /*
  * This struct defines a memory VMM memory area. There is one of these
  * per VM-area/task.  A VM area is any part of the process virtual memory
@@ -302,7 +314,7 @@ struct vm_area_struct {
 #endif
 
 	/* reserved for Red Hat */
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -456,8 +468,15 @@ struct mm_struct {
 	struct uprobes_state uprobes_state;
 
 	/* reserved for Red Hat */
+#if defined(__GENKSYMS__) || !defined(CONFIG_SPAPR_TCE_IOMMU)
+	/* We're adding a list_head, so we need to take two reserved
+	 * fields, unfortunately there are no handy RH_KABI macros for
+	 * that case */
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
+#else
+	struct list_head iommu_group_mem_list;
+#endif
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)

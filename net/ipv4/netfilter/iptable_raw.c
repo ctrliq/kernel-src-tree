@@ -22,7 +22,7 @@ static const struct xt_table packet_raw = {
 static unsigned int
 iptable_raw_hook(const struct nf_hook_ops *ops, struct sk_buff *skb,
 		 const struct net_device *in, const struct net_device *out,
-		 int (*okfn)(struct sk_buff *))
+		 const struct nf_hook_state *state)
 {
 	const struct net *net;
 
@@ -32,8 +32,8 @@ iptable_raw_hook(const struct nf_hook_ops *ops, struct sk_buff *skb,
 		/* root is playing with raw sockets. */
 		return NF_ACCEPT;
 
-	net = dev_net((in != NULL) ? in : out);
-	return ipt_do_table(skb, ops->hooknum, in, out, net->ipv4.iptable_raw);
+	net = dev_net(state->in ? state->in : state->out);
+	return ipt_do_table(skb, ops->hooknum, state, net->ipv4.iptable_raw);
 }
 
 static struct nf_hook_ops *rawtable_ops __read_mostly;

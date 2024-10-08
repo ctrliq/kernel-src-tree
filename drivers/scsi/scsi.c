@@ -519,9 +519,9 @@ void scsi_log_send(struct scsi_cmnd *cmd)
 	 *
 	 * 1: nothing (match completion)
 	 *
-	 * 2: log opcode + command of all commands
+	 * 2: log opcode + command of all commands + cmd address
 	 *
-	 * 3: same as 2 plus dump cmd address
+	 * 3: same as 2
 	 *
 	 * 4: same as 3
 	 */
@@ -529,10 +529,8 @@ void scsi_log_send(struct scsi_cmnd *cmd)
 		level = SCSI_LOG_LEVEL(SCSI_LOG_MLQUEUE_SHIFT,
 				       SCSI_LOG_MLQUEUE_BITS);
 		if (level > 1) {
-			scmd_printk(KERN_INFO, cmd, "Send: ");
-			if (level > 2)
-				printk("0x%p ", cmd);
-			printk("\n");
+			scmd_printk(KERN_INFO, cmd,
+				    "Send: scmd 0x%p\n", cmd);
 			scsi_print_command(cmd);
 		}
 	}
@@ -550,7 +548,7 @@ void scsi_log_completion(struct scsi_cmnd *cmd, int disposition)
 	 *
 	 * 2: same as 1 but for all command completions.
 	 *
-	 * 3: same as 2 plus dump cmd address
+	 * 3: same as 2
 	 *
 	 * 4: same as 3 plus dump extra junk
 	 */
@@ -559,43 +557,14 @@ void scsi_log_completion(struct scsi_cmnd *cmd, int disposition)
 				       SCSI_LOG_MLCOMPLETE_BITS);
 		if (((level > 0) && (cmd->result || disposition != SUCCESS)) ||
 		    (level > 1)) {
-			scmd_printk(KERN_INFO, cmd, "Done: ");
-			if (level > 2)
-				printk("0x%p ", cmd);
-			/*
-			 * Dump truncated values, so we usually fit within
-			 * 80 chars.
-			 */
-			switch (disposition) {
-			case SUCCESS:
-				printk("SUCCESS\n");
-				break;
-			case NEEDS_RETRY:
-				printk("RETRY\n");
-				break;
-			case ADD_TO_MLQUEUE:
-				printk("MLQUEUE\n");
-				break;
-			case FAILED:
-				printk("FAILED\n");
-				break;
-			case TIMEOUT_ERROR:
-				/* 
-				 * If called via scsi_times_out.
-				 */
-				printk("TIMEOUT\n");
-				break;
-			default:
-				printk("UNKNOWN\n");
-			}
-			scsi_print_result(cmd);
+			scsi_print_result(cmd, "Done", disposition);
 			scsi_print_command(cmd);
 			if (status_byte(cmd->result) & CHECK_CONDITION)
-				scsi_print_sense("", cmd);
+				scsi_print_sense(cmd);
 			if (level > 3)
 				scmd_printk(KERN_INFO, cmd,
 					    "scsi host busy %d failed %d\n",
-					    cmd->device->host->host_busy,
+					    atomic_read(&cmd->device->host->host_busy),
 					    cmd->device->host->host_failed);
 		}
 	}
@@ -717,17 +686,16 @@ void scsi_finish_command(struct scsi_cmnd *cmd)
 
 	scsi_device_unbusy(sdev);
 
-        /*
-         * Clear the flags which say that the device/host is no longer
-         * capable of accepting new commands.  These are set in scsi_queue.c
-         * for both the queue full condition on a device, and for a
-         * host full condition on the host.
-	 *
-	 * XXX(hch): What about locking?
-         */
-        shost->host_blocked = 0;
-	starget->target_blocked = 0;
-        sdev->device_blocked = 0;
+	/*
+	 * Clear the flags that say that the device/target/host is no longer
+	 * capable of accepting new commands.
+	 */
+	if (atomic_read(&shost->host_blocked))
+		atomic_set(&shost->host_blocked, 0);
+	if (atomic_read(&starget->target_blocked))
+		atomic_set(&starget->target_blocked, 0);
+	if (atomic_read(&sdev->device_blocked))
+		atomic_set(&sdev->device_blocked, 0);
 
 	/*
 	 * If we have valid sense information, then some kind of recovery
@@ -798,7 +766,7 @@ void scsi_adjust_queue_depth(struct scsi_device *sdev, int tagged, int tags)
 	 * is more IO than the LLD's can_queue (so there are not enuogh
 	 * tags) request_fn's host queue ready check will handle it.
 	 */
-	if (!sdev->host->bqt) {
+	if (!shost_use_blk_mq(sdev->host) && !sdev->host->bqt) {
 		if (blk_queue_tagged(sdev->request_queue) &&
 		    blk_queue_resize_tags(sdev->request_queue, tags) != 0)
 			goto out;
@@ -1354,9 +1322,15 @@ MODULE_LICENSE("GPL");
 module_param(scsi_logging_level, int, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(scsi_logging_level, "a bit mask of logging levels");
 
+bool scsi_use_blk_mq = false;
+module_param_named(use_blk_mq, scsi_use_blk_mq, bool, S_IWUSR | S_IRUGO);
+
 static int __init init_scsi(void)
 {
 	int error;
+
+	if (scsi_use_blk_mq)
+		mark_tech_preview("scsi-mq", THIS_MODULE);
 
 	error = scsi_init_queue();
 	if (error)

@@ -26,6 +26,7 @@
 #include <linux/time.h>
 #include <linux/pm_qos.h>
 #include <linux/aio.h>
+#include <linux/io.h>
 #include <linux/dma-mapping.h>
 #include <sound/core.h>
 #include <sound/control.h>
@@ -34,7 +35,6 @@
 #include <sound/pcm_params.h>
 #include <sound/timer.h>
 #include <sound/minors.h>
-#include <asm/io.h>
 
 /*
  *  Compatibility
@@ -1136,6 +1136,28 @@ int snd_pcm_drain_done(struct snd_pcm_substream *substream)
 	return snd_pcm_action_single(&snd_pcm_action_stop, substream,
 				     SNDRV_PCM_STATE_SETUP);
 }
+
+/**
+ * snd_pcm_stop_xrun - stop the running streams as XRUN
+ * @substream: the PCM substream instance
+ *
+ * This stops the given running substream (and all linked substreams) as XRUN.
+ * Unlike snd_pcm_stop(), this function takes the substream lock by itself.
+ *
+ * Return: Zero if successful, or a negative error code.
+ */
+int snd_pcm_stop_xrun(struct snd_pcm_substream *substream)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	snd_pcm_stream_lock_irqsave(substream, flags);
+	if (snd_pcm_running(substream))
+		ret = snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
+	snd_pcm_stream_unlock_irqrestore(substream, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(snd_pcm_stop_xrun);
 
 /*
  * pause callbacks

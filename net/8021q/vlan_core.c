@@ -9,7 +9,7 @@ bool vlan_do_receive(struct sk_buff **skbp)
 {
 	struct sk_buff *skb = *skbp;
 	__be16 vlan_proto = skb->vlan_proto;
-	u16 vlan_id = vlan_tx_tag_get_id(skb);
+	u16 vlan_id = skb_vlan_tag_get_id(skb);
 	struct net_device *vlan_dev;
 	struct vlan_pcpu_stats *rx_stats;
 
@@ -106,6 +106,12 @@ u16 vlan_dev_vlan_id(const struct net_device *dev)
 }
 EXPORT_SYMBOL(vlan_dev_vlan_id);
 
+__be16 vlan_dev_vlan_proto(const struct net_device *dev)
+{
+	return vlan_dev_priv(dev)->vlan_proto;
+}
+EXPORT_SYMBOL(vlan_dev_vlan_proto);
+
 static struct sk_buff *vlan_reorder_header(struct sk_buff *skb)
 {
 	if (skb_cow(skb, skb_headroom(skb)) < 0)
@@ -120,7 +126,7 @@ struct sk_buff *vlan_untag(struct sk_buff *skb)
 	struct vlan_hdr *vhdr;
 	u16 vlan_tci;
 
-	if (unlikely(vlan_tx_tag_present(skb))) {
+	if (unlikely(skb_vlan_tag_present(skb))) {
 		/* vlan_tci is already set-up so leave this for another time */
 		return skb;
 	}

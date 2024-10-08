@@ -58,6 +58,16 @@ enum instruction_type {
 	INST_SC,		/* system call */
 };
 
+enum xlate_instdata {
+	XLATE_INST,		/* translate instruction address */
+	XLATE_DATA		/* translate data address */
+};
+
+enum xlate_readwrite {
+	XLATE_READ,		/* check for read permissions */
+	XLATE_WRITE		/* check for write permissions */
+};
+
 extern int kvmppc_vcpu_run(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu);
 extern int __kvmppc_vcpu_run(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu);
 extern void kvmppc_handler_highmem(void);
@@ -76,6 +86,10 @@ extern int kvmppc_handle_store(struct kvm_run *run, struct kvm_vcpu *vcpu,
 extern int kvmppc_load_last_inst(struct kvm_vcpu *vcpu,
 				 enum instruction_type type, u32 *inst);
 
+extern int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+		     bool data);
+extern int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+		     bool data);
 extern int kvmppc_emulate_instruction(struct kvm_run *run,
                                       struct kvm_vcpu *vcpu);
 extern int kvmppc_emulate_loadstore(struct kvm_vcpu *vcpu);
@@ -101,6 +115,9 @@ extern gpa_t kvmppc_mmu_xlate(struct kvm_vcpu *vcpu, unsigned int gtlb_index,
                               gva_t eaddr);
 extern void kvmppc_mmu_dtlb_miss(struct kvm_vcpu *vcpu);
 extern void kvmppc_mmu_itlb_miss(struct kvm_vcpu *vcpu);
+extern int kvmppc_xlate(struct kvm_vcpu *vcpu, ulong eaddr,
+			enum xlate_instdata xlid, enum xlate_readwrite xlrw,
+			struct kvmppc_pte *pte);
 
 extern struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm,
                                                 unsigned int id);
@@ -168,10 +185,11 @@ extern int kvmppc_core_create_memslot(struct kvm *kvm,
 				      unsigned long npages);
 extern int kvmppc_core_prepare_memory_region(struct kvm *kvm,
 				struct kvm_memory_slot *memslot,
-				struct kvm_userspace_memory_region *mem);
+				const struct kvm_userspace_memory_region *mem);
 extern void kvmppc_core_commit_memory_region(struct kvm *kvm,
-				struct kvm_userspace_memory_region *mem,
-				const struct kvm_memory_slot *old);
+				const struct kvm_userspace_memory_region *mem,
+				const struct kvm_memory_slot *old,
+				const struct kvm_memory_slot *new);
 extern int kvm_vm_ioctl_get_smmu_info(struct kvm *kvm,
 				      struct kvm_ppc_smmu_info *info);
 extern void kvmppc_core_flush_memslot(struct kvm *kvm,
@@ -226,10 +244,11 @@ struct kvmppc_ops {
 	void (*flush_memslot)(struct kvm *kvm, struct kvm_memory_slot *memslot);
 	int (*prepare_memory_region)(struct kvm *kvm,
 				     struct kvm_memory_slot *memslot,
-				     struct kvm_userspace_memory_region *mem);
+				     const struct kvm_userspace_memory_region *mem);
 	void (*commit_memory_region)(struct kvm *kvm,
-				     struct kvm_userspace_memory_region *mem,
-				     const struct kvm_memory_slot *old);
+				     const struct kvm_userspace_memory_region *mem,
+				     const struct kvm_memory_slot *old,
+				     const struct kvm_memory_slot *new);
 	int (*unmap_hva)(struct kvm *kvm, unsigned long hva);
 	int (*unmap_hva_range)(struct kvm *kvm, unsigned long start,
 			   unsigned long end);

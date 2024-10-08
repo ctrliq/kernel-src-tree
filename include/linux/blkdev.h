@@ -38,6 +38,7 @@ struct request;
 struct sg_io_hdr;
 struct bsg_job;
 struct blkcg_gq;
+struct blk_flush_queue;
 
 #define BLKDEV_MIN_RQ	4
 #define BLKDEV_MAX_RQ	128	/* Default maximum */
@@ -359,7 +360,7 @@ struct request_queue {
 	unsigned int		*mq_map;
 
 	/* sw queues */
-	RH_KABI_REPLACE_P(struct blk_mq_ctx	*queue_ctx,
+	RH_KABI_REPLACE(struct blk_mq_ctx	*queue_ctx,
 		          struct blk_mq_ctx __percpu	*queue_ctx)
 
 	unsigned int		nr_queues;
@@ -479,14 +480,14 @@ struct request_queue {
 	 */
 	unsigned int		flush_flags;
 	unsigned int		flush_not_queueable:1;
-	unsigned int		flush_queue_delayed:1;
-	unsigned int		flush_pending_idx:1;
-	unsigned int		flush_running_idx:1;
-	unsigned long		flush_pending_since;
-	struct list_head	flush_queue[2];
-	struct list_head	flush_data_in_flight;
-	struct request		*flush_rq;
-	spinlock_t		mq_flush_lock;
+	RH_KABI_DEPRECATE(unsigned int,            flush_queue_delayed:1)
+	RH_KABI_DEPRECATE(unsigned int,            flush_pending_idx:1)
+	RH_KABI_DEPRECATE(unsigned int,            flush_running_idx:1)
+	RH_KABI_DEPRECATE(unsigned long,           flush_pending_since)
+	RH_KABI_DEPRECATE(struct list_head,        flush_queue[2])
+	RH_KABI_DEPRECATE(struct list_head,        flush_data_in_flight)
+	RH_KABI_DEPRECATE(struct request *,        flush_rq)
+	RH_KABI_DEPRECATE(spinlock_t,              mq_flush_lock)
 
 	struct mutex		sysfs_lock;
 
@@ -504,7 +505,7 @@ struct request_queue {
 #endif
 	struct rcu_head		rcu_head;
 	wait_queue_head_t	mq_freeze_wq;
-	struct percpu_ref	mq_usage_counter;
+	RH_KABI_DEPRECATE(struct percpu_counter, mq_usage_counter)
 	struct list_head	all_q_node;
 
 	RH_KABI_EXTEND(unprep_rq_fn		*unprep_rq_fn)
@@ -516,6 +517,9 @@ struct request_queue {
 	RH_KABI_EXTEND(spinlock_t			requeue_lock)
 	RH_KABI_EXTEND(struct work_struct		requeue_work)
 	RH_KABI_EXTEND(int				mq_freeze_depth)
+	RH_KABI_EXTEND(struct blk_flush_queue   *fq)
+	RH_KABI_EXTEND(struct percpu_ref	mq_usage_counter)
+	RH_KABI_EXTEND(bool			mq_sysfs_init_done)
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */

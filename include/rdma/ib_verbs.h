@@ -51,6 +51,7 @@
 #include <uapi/linux/if_ether.h>
 
 #include <linux/atomic.h>
+#include <linux/mmu_notifier.h>
 #include <asm/uaccess.h>
 
 extern struct workqueue_struct *ib_wq;
@@ -132,7 +133,8 @@ enum ib_device_cap_flags {
 	IB_DEVICE_RC_IP_CSUM		= (1<<25),
 	IB_DEVICE_RAW_IP_CSUM		= (1<<26),
 	IB_DEVICE_MANAGED_FLOW_STEERING = (1<<29),
-	IB_DEVICE_SIGNATURE_HANDOVER	= (1<<30)
+	IB_DEVICE_SIGNATURE_HANDOVER	= (1<<30),
+	IB_DEVICE_ON_DEMAND_PAGING	= (1<<31),
 };
 
 enum ib_signature_prot_cap {
@@ -150,6 +152,37 @@ enum ib_atomic_cap {
 	IB_ATOMIC_NONE,
 	IB_ATOMIC_HCA,
 	IB_ATOMIC_GLOB
+};
+
+enum ib_odp_general_cap_bits {
+	IB_ODP_SUPPORT = 1 << 0,
+};
+
+enum ib_odp_transport_cap_bits {
+	IB_ODP_SUPPORT_SEND	= 1 << 0,
+	IB_ODP_SUPPORT_RECV	= 1 << 1,
+	IB_ODP_SUPPORT_WRITE	= 1 << 2,
+	IB_ODP_SUPPORT_READ	= 1 << 3,
+	IB_ODP_SUPPORT_ATOMIC	= 1 << 4,
+};
+
+struct ib_odp_caps {
+	uint64_t general_caps;
+	struct {
+		uint32_t  rc_odp_caps;
+		uint32_t  uc_odp_caps;
+		uint32_t  ud_odp_caps;
+	} per_transport_caps;
+};
+
+enum ib_cq_creation_flags {
+	IB_CQ_FLAGS_TIMESTAMP_COMPLETION   = 1 << 0,
+};
+
+struct ib_cq_init_attr {
+	unsigned int	cqe;
+	int		comp_vector;
+	u32		flags;
 };
 
 struct ib_device_attr {
@@ -195,6 +228,9 @@ struct ib_device_attr {
 	u8			local_ca_ack_delay;
 	int			sig_prot_cap;
 	int			sig_guard_cap;
+	struct ib_odp_caps	odp_caps;
+	uint64_t		timestamp_mask;
+	uint64_t		hca_core_clock; /* in KHZ */
 };
 
 enum ib_mtu {
@@ -538,20 +574,14 @@ struct ib_mr_init_attr {
 	u32	    flags;
 };
 
-enum ib_signature_type {
-	IB_SIG_TYPE_T10_DIF,
-};
-
 /**
- * T10-DIF Signature types
- * T10-DIF types are defined by SCSI
- * specifications.
+ * Signature types
+ * IB_SIG_TYPE_NONE: Unprotected.
+ * IB_SIG_TYPE_T10_DIF: Type T10-DIF
  */
-enum ib_t10_dif_type {
-	IB_T10DIF_NONE,
-	IB_T10DIF_TYPE1,
-	IB_T10DIF_TYPE2,
-	IB_T10DIF_TYPE3
+enum ib_signature_type {
+	IB_SIG_TYPE_NONE,
+	IB_SIG_TYPE_T10_DIF,
 };
 
 /**
@@ -567,24 +597,26 @@ enum ib_t10_dif_bg_type {
 /**
  * struct ib_t10_dif_domain - Parameters specific for T10-DIF
  *     domain.
- * @type: T10-DIF type (0|1|2|3)
  * @bg_type: T10-DIF block guard type (CRC|CSUM)
  * @pi_interval: protection information interval.
  * @bg: seed of guard computation.
  * @app_tag: application tag of guard block
  * @ref_tag: initial guard block reference tag.
- * @type3_inc_reftag: T10-DIF type 3 does not state
- *     about the reference tag, it is the user
- *     choice to increment it or not.
+ * @ref_remap: Indicate wethear the reftag increments each block
+ * @app_escape: Indicate to skip block check if apptag=0xffff
+ * @ref_escape: Indicate to skip block check if reftag=0xffffffff
+ * @apptag_check_mask: check bitmask of application tag.
  */
 struct ib_t10_dif_domain {
-	enum ib_t10_dif_type	type;
 	enum ib_t10_dif_bg_type bg_type;
 	u16			pi_interval;
 	u16			bg;
 	u16			app_tag;
 	u32			ref_tag;
-	bool			type3_inc_reftag;
+	bool			ref_remap;
+	bool			app_escape;
+	bool			ref_escape;
+	u16			apptag_check_mask;
 };
 
 /**
@@ -1125,7 +1157,8 @@ enum ib_access_flags {
 	IB_ACCESS_REMOTE_READ	= (1<<2),
 	IB_ACCESS_REMOTE_ATOMIC	= (1<<3),
 	IB_ACCESS_MW_BIND	= (1<<4),
-	IB_ZERO_BASED		= (1<<5)
+	IB_ZERO_BASED		= (1<<5),
+	IB_ACCESS_ON_DEMAND     = (1<<6),
 };
 
 struct ib_phys_buf {
@@ -1167,6 +1200,8 @@ struct ib_fmr_attr {
 	u8	page_shift;
 };
 
+struct ib_umem;
+
 struct ib_ucontext {
 	struct ib_device       *device;
 	struct list_head	pd_list;
@@ -1181,6 +1216,22 @@ struct ib_ucontext {
 	int			closing;
 
 	struct pid             *tgid;
+#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+	struct rb_root      umem_tree;
+	/*
+	 * Protects .umem_rbroot and tree, as well as odp_mrs_count and
+	 * mmu notifiers registration.
+	 */
+	struct rw_semaphore	umem_rwsem;
+	void (*invalidate_range)(struct ib_umem *umem,
+				 unsigned long start, unsigned long end);
+
+	struct mmu_notifier	mn;
+	atomic_t		notifier_count;
+	/* A list of umems that don't have private mmu notifier counters yet. */
+	struct list_head	no_private_counters;
+	int                     odp_mrs_count;
+#endif
 };
 
 struct ib_uobject {
@@ -1515,7 +1566,8 @@ struct ib_device {
 	int		           (*get_protocol_stats)(struct ib_device *device,
 							 union rdma_protocol_stats *stats);
 	int		           (*query_device)(struct ib_device *device,
-						   struct ib_device_attr *device_attr);
+						   struct ib_device_attr *device_attr,
+						   struct ib_udata *udata);
 	int		           (*query_port)(struct ib_device *device,
 						 u8 port_num,
 						 struct ib_port_attr *port_attr);
@@ -1579,8 +1631,8 @@ struct ib_device {
 	int                        (*post_recv)(struct ib_qp *qp,
 						struct ib_recv_wr *recv_wr,
 						struct ib_recv_wr **bad_recv_wr);
-	struct ib_cq *             (*create_cq)(struct ib_device *device, int cqe,
-						int comp_vector,
+	struct ib_cq *             (*create_cq)(struct ib_device *device,
+						const struct ib_cq_init_attr *attr,
 						struct ib_ucontext *context,
 						struct ib_udata *udata);
 	int                        (*modify_cq)(struct ib_cq *cq, u16 cq_count,
@@ -1694,6 +1746,7 @@ struct ib_device {
 	char			     node_desc[64];
 	__be64			     node_guid;
 	u32			     local_dma_lkey;
+	u16                          is_switch:1;
 	u8                           node_type;
 	u8                           phys_port_cnt;
 
@@ -1736,10 +1789,7 @@ static inline int ib_copy_from_udata(void *dest, struct ib_udata *udata, size_t 
 
 static inline int ib_copy_to_udata(struct ib_udata *udata, void *src, size_t len)
 {
-	size_t copy_sz;
-
-	copy_sz = min_t(size_t, len, udata->outlen);
-	return copy_to_user(udata->outbuf, src, copy_sz) ? -EFAULT : 0;
+	return copy_to_user(udata->outbuf, src, len) ? -EFAULT : 0;
 }
 
 /**
@@ -1776,6 +1826,20 @@ enum rdma_link_layer rdma_port_get_link_layer(struct ib_device *device,
 					       u8 port_num);
 
 /**
+ * rdma_cap_ib_switch - Check if the device is IB switch
+ * @device: Device to check
+ *
+ * Device driver is responsible for setting is_switch bit on
+ * in ib_device structure at init time.
+ *
+ * Return: true if the device is IB switch.
+ */
+static inline bool rdma_cap_ib_switch(const struct ib_device *device)
+{
+	return device->is_switch;
+}
+
+/**
  * rdma_start_port - Return the first valid port number for the device
  * specified
  *
@@ -1785,7 +1849,7 @@ enum rdma_link_layer rdma_port_get_link_layer(struct ib_device *device,
  */
 static inline u8 rdma_start_port(const struct ib_device *device)
 {
-	return (device->node_type == RDMA_NODE_IB_SWITCH) ? 0 : 1;
+	return rdma_cap_ib_switch(device) ? 0 : 1;
 }
 
 /**
@@ -1798,8 +1862,7 @@ static inline u8 rdma_start_port(const struct ib_device *device)
  */
 static inline u8 rdma_end_port(const struct ib_device *device)
 {
-	return (device->node_type == RDMA_NODE_IB_SWITCH) ?
-		0 : device->phys_port_cnt;
+	return rdma_cap_ib_switch(device) ? 0 : device->phys_port_cnt;
 }
 
 static inline bool rdma_protocol_ib(const struct ib_device *device, u8 port_num)
@@ -2322,16 +2385,15 @@ static inline int ib_post_recv(struct ib_qp *qp,
  *   asynchronous event not associated with a completion occurs on the CQ.
  * @cq_context: Context associated with the CQ returned to the user via
  *   the associated completion and event handlers.
- * @cqe: The minimum size of the CQ.
- * @comp_vector - Completion vector used to signal completion events.
- *     Must be >= 0 and < context->num_comp_vectors.
+ * @cq_attr: The attributes the CQ should be created upon.
  *
  * Users can examine the cq structure to determine the actual CQ size.
  */
 struct ib_cq *ib_create_cq(struct ib_device *device,
 			   ib_comp_handler comp_handler,
 			   void (*event_handler)(struct ib_event *, void *),
-			   void *cq_context, int cqe, int comp_vector);
+			   void *cq_context,
+			   const struct ib_cq_init_attr *cq_attr);
 
 /**
  * ib_resize_cq - Modifies the capacity of the CQ.

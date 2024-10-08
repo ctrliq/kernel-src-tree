@@ -103,6 +103,18 @@
 		(((__x) - ((__d) / 2)) / (__d));	\
 }							\
 )
+/*
+ * Same as above but for u64 dividends. divisor must be a 32-bit
+ * number.
+ */
+#define DIV_ROUND_CLOSEST_ULL(x, divisor)(		\
+{							\
+	typeof(divisor) __d = divisor;			\
+	unsigned long long _tmp = (x) + (__d) / 2;	\
+	do_div(_tmp, __d);				\
+	_tmp;						\
+}							\
+)
 
 /*
  * Multiplies an integer by a fraction, while avoiding unnecessary
@@ -469,9 +481,9 @@ extern enum system_states {
 #define TAINT_CRAP			10
 #define TAINT_FIRMWARE_WORKAROUND	11
 #define TAINT_OOT_MODULE		12
-#define TAINT_13			13
-#define TAINT_14			14
-#define TAINT_15			15
+#define TAINT_UNSIGNED_MODULE		13
+#define TAINT_SOFTLOCKUP		14
+#define TAINT_LIVEPATCH			15
 #define TAINT_16			16
 #define TAINT_17			17
 #define TAINT_18			18
@@ -857,4 +869,8 @@ struct module;
 void mark_hardware_unsupported(const char *msg);
 void mark_tech_preview(const char *msg, struct module *mod);
 
+#else
+#ifndef pr_fmt
+#define pr_fmt(fmt) fmt
+#endif
 #endif

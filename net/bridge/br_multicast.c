@@ -799,10 +799,10 @@ static void __br_multicast_send_query(struct net_bridge *br,
 		return;
 
 	if (port) {
-		__skb_push(skb, sizeof(struct ethhdr));
 		skb->dev = port->dev;
-		NF_HOOK(NFPROTO_BRIDGE, NF_BR_LOCAL_OUT, skb, NULL, skb->dev,
-			dev_queue_xmit);
+		NF_HOOK(NFPROTO_BRIDGE, NF_BR_LOCAL_OUT, NULL, skb,
+			NULL, skb->dev,
+			br_dev_queue_push_xmit);
 	} else
 		netif_rx(skb);
 }
@@ -2060,6 +2060,10 @@ unlock:
 	return err;
 }
 
+#if 0
+/* RHEL: not fully supported. Other parts of the patch needed to
+ * enable hardware bridging support
+ */
 /**
  * br_multicast_list_adjacent - Returns snooped multicast addresses
  * @dev:	The bridge port adjacent to which to retrieve addresses
@@ -2116,3 +2120,4 @@ unlock:
 	return count;
 }
 EXPORT_SYMBOL_GPL(br_multicast_list_adjacent);
+#endif

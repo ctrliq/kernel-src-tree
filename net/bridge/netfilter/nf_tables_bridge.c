@@ -19,11 +19,11 @@ nft_do_chain_bridge(const struct nf_hook_ops *ops,
 		    struct sk_buff *skb,
 		    const struct net_device *in,
 		    const struct net_device *out,
-		    int (*okfn)(struct sk_buff *))
+		    const struct nf_hook_state *state)
 {
 	struct nft_pktinfo pkt;
 
-	nft_set_pktinfo(&pkt, ops, skb, in, out);
+	nft_set_pktinfo(&pkt, ops, skb, state);
 
 	return nft_do_chain(&pkt, ops);
 }

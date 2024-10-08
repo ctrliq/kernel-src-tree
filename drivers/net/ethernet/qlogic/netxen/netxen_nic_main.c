@@ -1474,9 +1474,8 @@ netxen_nic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	u32 val;
 
 	if (pdev->revision >= NX_P3_A0 && pdev->revision <= NX_P3_B1) {
-		pr_warning("%s: chip revisions between 0x%x-0x%x "
-				"will not be enabled.\n",
-				module_name(THIS_MODULE), NX_P3_A0, NX_P3_B1);
+		pr_warn("%s: chip revisions between 0x%x-0x%x will not be enabled\n",
+			module_name(THIS_MODULE), NX_P3_A0, NX_P3_B1);
 		return -ENODEV;
 	}
 
@@ -1893,9 +1892,9 @@ netxen_tso_check(struct net_device *netdev,
 		protocol = vh->h_vlan_encapsulated_proto;
 		flags = FLAGS_VLAN_TAGGED;
 
-	} else if (vlan_tx_tag_present(skb)) {
+	} else if (skb_vlan_tag_present(skb)) {
 		flags = FLAGS_VLAN_OOB;
-		vid = vlan_tx_tag_get(skb);
+		vid = skb_vlan_tag_get(skb);
 		netxen_set_tx_vlan_tci(first_desc, vid);
 		vlan_oob = 1;
 	}

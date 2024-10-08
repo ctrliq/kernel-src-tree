@@ -95,7 +95,7 @@ static bool fm10k_alloc_mapped_page(struct fm10k_ring *rx_ring,
 		return true;
 
 	/* alloc new page for storage */
-	page = dev_alloc_page();
+	page = alloc_page(GFP_ATOMIC | __GFP_COLD);
 	if (unlikely(!page)) {
 		rx_ring->rx_stats.alloc_failed++;
 		return false;
@@ -941,6 +941,30 @@ static bool fm10k_tx_desc_push(struct fm10k_ring *tx_ring,
 	return i == tx_ring->count;
 }
 
+static int __fm10k_maybe_stop_tx(struct fm10k_ring *tx_ring, u16 size)
+{
+	netif_stop_subqueue(tx_ring->netdev, tx_ring->queue_index);
+
+	/* Memory barrier before checking head and tail */
+	smp_mb();
+
+	/* Check again in a case another CPU has just made room available */
+	if (likely(fm10k_desc_unused(tx_ring) < size))
+		return -EBUSY;
+
+	/* A reprieve! - use start_queue because it doesn't call schedule */
+	netif_start_subqueue(tx_ring->netdev, tx_ring->queue_index);
+	++tx_ring->tx_stats.restart_queue;
+	return 0;
+}
+
+static inline int fm10k_maybe_stop_tx(struct fm10k_ring *tx_ring, u16 size)
+{
+	if (likely(fm10k_desc_unused(tx_ring) >= size))
+		return 0;
+	return __fm10k_maybe_stop_tx(tx_ring, size);
+}
+
 static void fm10k_tx_map(struct fm10k_ring *tx_ring,
 			 struct fm10k_tx_buffer *first)
 {
@@ -958,8 +982,8 @@ static void fm10k_tx_map(struct fm10k_ring *tx_ring,
 	tx_desc = FM10K_TX_DESC(tx_ring, i);
 
 	/* add HW VLAN tag */
-	if (vlan_tx_tag_present(skb))
-		tx_desc->vlan = cpu_to_le16(vlan_tx_tag_get(skb));
+	if (skb_vlan_tag_present(skb))
+		tx_desc->vlan = cpu_to_le16(skb_vlan_tag_get(skb));
 	else
 		tx_desc->vlan = 0;
 
@@ -1058,30 +1082,6 @@ dma_error:
 	}
 
 	tx_ring->next_to_use = i;
-}
-
-static int __fm10k_maybe_stop_tx(struct fm10k_ring *tx_ring, u16 size)
-{
-	netif_stop_subqueue(tx_ring->netdev, tx_ring->queue_index);
-
-	smp_mb();
-
-	/* We need to check again in a case another CPU has just
-	 * made room available. */
-	if (likely(fm10k_desc_unused(tx_ring) < size))
-		return -EBUSY;
-
-	/* A reprieve! - use start_queue because it doesn't call schedule */
-	netif_start_subqueue(tx_ring->netdev, tx_ring->queue_index);
-	++tx_ring->tx_stats.restart_queue;
-	return 0;
-}
-
-static inline int fm10k_maybe_stop_tx(struct fm10k_ring *tx_ring, u16 size)
-{
-	if (likely(fm10k_desc_unused(tx_ring) >= size))
-		return 0;
-	return __fm10k_maybe_stop_tx(tx_ring, size);
 }
 
 netdev_tx_t fm10k_xmit_frame_ring(struct sk_buff *skb,

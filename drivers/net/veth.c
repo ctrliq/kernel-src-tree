@@ -156,10 +156,10 @@ static u64 veth_stats_one(struct pcpu_vstats *result, struct net_device *dev)
 		unsigned int start;
 
 		do {
-			start = u64_stats_fetch_begin_bh(&stats->syncp);
+			start = u64_stats_fetch_begin_irq(&stats->syncp);
 			packets = stats->packets;
 			bytes = stats->bytes;
-		} while (u64_stats_fetch_retry_bh(&stats->syncp, start));
+		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
 		result->packets += packets;
 		result->bytes += bytes;
 	}
@@ -244,6 +244,20 @@ static void veth_dev_free(struct net_device *dev)
 	free_netdev(dev);
 }
 
+static int veth_get_iflink(const struct net_device *dev)
+{
+	struct veth_priv *priv = netdev_priv(dev);
+	struct net_device *peer;
+	int iflink;
+
+	rcu_read_lock();
+	peer = rcu_dereference(priv->peer);
+	iflink = peer ? peer->ifindex : 0;
+	rcu_read_unlock();
+
+	return iflink;
+}
+
 static const struct net_device_ops veth_netdev_ops = {
 	.ndo_init            = veth_dev_init,
 	.ndo_open            = veth_open,
@@ -252,6 +266,7 @@ static const struct net_device_ops veth_netdev_ops = {
 	.ndo_change_mtu      = veth_change_mtu,
 	.ndo_get_stats64     = veth_get_stats64,
 	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_get_iflink		= veth_get_iflink,
 };
 
 #define VETH_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_ALL_TSO |    \

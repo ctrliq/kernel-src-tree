@@ -390,11 +390,13 @@ static void __blk_drain_queue(struct request_queue *q, bool drain_all)
 		 * be drained.  Check all the queues and counters.
 		 */
 		if (drain_all) {
+			struct blk_flush_queue *fq = blk_get_flush_queue(q, NULL);
 			drain |= !list_empty(&q->queue_head);
 			for (i = 0; i < 2; i++) {
 				drain |= q->nr_rqs[i];
 				drain |= q->in_flight[i];
-				drain |= !list_empty(&q->flush_queue[i]);
+				if (fq)
+				    drain |= !list_empty(&fq->flush_queue[i]);
 			}
 		}
 
@@ -622,9 +624,6 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 #ifdef CONFIG_BLK_CGROUP
 	INIT_LIST_HEAD(&q->blkg_list);
 #endif
-	INIT_LIST_HEAD(&q->flush_queue[0]);
-	INIT_LIST_HEAD(&q->flush_queue[1]);
-	INIT_LIST_HEAD(&q->flush_data_in_flight);
 	INIT_DELAYED_WORK(&q->delay_work, blk_delay_work);
 
 	kobject_init(&q->kobj, &blk_queue_ktype);
@@ -727,8 +726,8 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
 	if (!q)
 		return NULL;
 
-	q->flush_rq = kzalloc(sizeof(struct request), GFP_KERNEL);
-	if (!q->flush_rq)
+	q->fq = blk_alloc_flush_queue(q, NUMA_NO_NODE, 0);
+	if (!q->fq)
 		return NULL;
 
 	if (blk_init_rl(&q->root_rl, q, GFP_KERNEL))
@@ -764,7 +763,7 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
 	return q;
 
 fail:
-	kfree(q->flush_rq);
+	blk_free_flush_queue(q->fq);
 	return NULL;
 }
 EXPORT_SYMBOL(blk_init_allocated_queue);
@@ -951,9 +950,9 @@ static struct io_context *rq_ioc(struct bio *bio)
  * Get a free request from @q.  This function may fail under memory
  * pressure or if @q is dead.
  *
- * Must be callled with @q->queue_lock held and,
- * Returns %NULL on failure, with @q->queue_lock held.
- * Returns !%NULL on success, with @q->queue_lock *not held*.
+ * Must be called with @q->queue_lock held and,
+ * Returns ERR_PTR on failure, with @q->queue_lock held.
+ * Returns request pointer on success, with @q->queue_lock *not held*.
  */
 static struct request *__get_request(struct request_list *rl, int rw_flags,
 				     struct bio *bio, gfp_t gfp_mask)
@@ -967,7 +966,7 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
 	int may_queue;
 
 	if (unlikely(blk_queue_dying(q)))
-		return NULL;
+		return ERR_PTR(-ENODEV);
 
 	may_queue = elv_may_queue(q, rw_flags);
 	if (may_queue == ELV_MQUEUE_NO)
@@ -992,7 +991,7 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
 					 * process is not a "batcher", and not
 					 * exempted by the IO scheduler
 					 */
-					return NULL;
+					return ERR_PTR(-ENOMEM);
 				}
 			}
 		}
@@ -1010,7 +1009,7 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
 	 * allocated with any setting of ->nr_requests
 	 */
 	if (rl->count[is_sync] >= (3 * q->nr_requests / 2))
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 
 	q->nr_rqs[is_sync]++;
 	rl->count[is_sync]++;
@@ -1115,7 +1114,7 @@ fail_alloc:
 rq_starved:
 	if (unlikely(rl->count[is_sync] == 0))
 		rl->starved[is_sync] = 1;
-	return NULL;
+	return ERR_PTR(-ENOMEM);
 }
 
 /**
@@ -1128,9 +1127,9 @@ rq_starved:
  * Get a free request from @q.  If %__GFP_WAIT is set in @gfp_mask, this
  * function keeps retrying under memory pressure and fails iff @q is dead.
  *
- * Must be callled with @q->queue_lock held and,
- * Returns %NULL on failure, with @q->queue_lock held.
- * Returns !%NULL on success, with @q->queue_lock *not held*.
+ * Must be called with @q->queue_lock held and,
+ * Returns ERR_PTR on failure, with @q->queue_lock held.
+ * Returns request pointer on success, with @q->queue_lock *not held*.
  */
 static struct request *get_request(struct request_queue *q, int rw_flags,
 				   struct bio *bio, gfp_t gfp_mask)
@@ -1143,12 +1142,12 @@ static struct request *get_request(struct request_queue *q, int rw_flags,
 	rl = blk_get_rl(q, bio);	/* transferred to @rq on success */
 retry:
 	rq = __get_request(rl, rw_flags, bio, gfp_mask);
-	if (rq)
+	if (!IS_ERR(rq))
 		return rq;
 
 	if (!(gfp_mask & __GFP_WAIT) || unlikely(blk_queue_dying(q))) {
 		blk_put_rl(rl);
-		return NULL;
+		return rq;
 	}
 
 	/* wait on @rl and retry */
@@ -1185,7 +1184,7 @@ static struct request *blk_old_get_request(struct request_queue *q, int rw,
 
 	spin_lock_irq(q->queue_lock);
 	rq = get_request(q, rw, NULL, gfp_mask);
-	if (!rq)
+	if (IS_ERR(rq))
 		spin_unlock_irq(q->queue_lock);
 	/* q->queue_lock is unlocked at this point */
 
@@ -1237,8 +1236,8 @@ struct request *blk_make_request(struct request_queue *q, struct bio *bio,
 {
 	struct request *rq = blk_get_request(q, bio_data_dir(bio), gfp_mask);
 
-	if (unlikely(!rq))
-		return ERR_PTR(-ENOMEM);
+	if (IS_ERR(rq))
+		return rq;
 
 	blk_rq_set_block_pc(rq);
 
@@ -1270,7 +1269,6 @@ void blk_rq_set_block_pc(struct request *rq)
 	rq->__sector = (sector_t) -1;
 	rq->bio = rq->biotail = NULL;
 	memset(rq->__cmd, 0, sizeof(rq->__cmd));
-	rq->cmd = rq->__cmd;
 }
 EXPORT_SYMBOL(blk_rq_set_block_pc);
 
@@ -1517,7 +1515,8 @@ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
  * Caller must ensure !blk_queue_nomerges(q) beforehand.
  */
 bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
-			    unsigned int *request_count)
+			    unsigned int *request_count,
+			    struct request **same_queue_rq)
 {
 	struct blk_plug *plug;
 	struct request *rq;
@@ -1537,8 +1536,16 @@ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
 	list_for_each_entry_reverse(rq, plug_list, queuelist) {
 		int el_ret;
 
-		if (rq->q == q)
+		if (rq->q == q) {
 			(*request_count)++;
+			/*
+			 * Only blk-mq multiple hardware queues case checks the
+			 * rq in the same queue, there should be only one such
+			 * rq in a queue
+			 **/
+			if (same_queue_rq)
+				*same_queue_rq = rq;
+		}
 
 		if (rq->q != q || !blk_rq_merge_ok(rq, bio))
 			continue;
@@ -1603,7 +1610,7 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
 	 * any locks.
 	 */
 	if (!blk_queue_nomerges(q) &&
-	    blk_attempt_plug_merge(q, bio, &request_count))
+	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
 		return;
 
 	spin_lock_irq(q->queue_lock);
@@ -1640,8 +1647,8 @@ get_rq:
 	 * Returns with the queue unlocked.
 	 */
 	req = get_request(q, rw_flags, bio, GFP_NOIO);
-	if (unlikely(!req)) {
-		bio_endio(bio, -ENODEV);	/* @q is dead */
+	if (IS_ERR(req)) {
+		bio_endio(bio, PTR_ERR(req));	/* @q is dead */
 		goto out_unlock;
 	}
 

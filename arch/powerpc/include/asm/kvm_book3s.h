@@ -144,8 +144,8 @@ extern void kvmppc_mmu_hpte_sysexit(void);
 extern int kvmppc_mmu_hv_init(void);
 extern int kvmppc_book3s_hcall_implemented(struct kvm *kvm, unsigned long hc);
 
+/* XXX remove this export when load_last_inst() is generic */
 extern int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr, bool data);
-extern int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr, bool data);
 extern void kvmppc_book3s_queue_irqprio(struct kvm_vcpu *vcpu, unsigned int vec);
 extern void kvmppc_book3s_dequeue_irqprio(struct kvm_vcpu *vcpu,
 					  unsigned int vec);
@@ -158,9 +158,9 @@ extern pfn_t kvmppc_gpa_to_pfn(struct kvm_vcpu *vcpu, gpa_t gpa, bool writing,
 			bool *writable);
 extern void kvmppc_add_revmap_chain(struct kvm *kvm, struct revmap_entry *rev,
 			unsigned long *rmap, long pte_index, int realmode);
-extern void kvmppc_invalidate_hpte(struct kvm *kvm, unsigned long *hptep,
+extern void kvmppc_invalidate_hpte(struct kvm *kvm, __be64 *hptep,
 			unsigned long pte_index);
-void kvmppc_clear_ref_hpte(struct kvm *kvm, unsigned long *hptep,
+void kvmppc_clear_ref_hpte(struct kvm *kvm, __be64 *hptep,
 			unsigned long pte_index);
 extern void *kvmppc_pin_guest_page(struct kvm *kvm, unsigned long addr,
 			unsigned long *nb_ret);
@@ -282,6 +282,16 @@ static inline bool is_kvmppc_resume_guest(int r)
 {
 	return (r == RESUME_GUEST || r == RESUME_GUEST_NV);
 }
+
+static inline bool is_kvmppc_hv_enabled(struct kvm *kvm);
+static inline bool kvmppc_supports_magic_page(struct kvm_vcpu *vcpu)
+{
+	/* Only PR KVM supports the magic page */
+	return !is_kvmppc_hv_enabled(vcpu->kvm);
+}
+
+extern int kvmppc_h_logical_ci_load(struct kvm_vcpu *vcpu);
+extern int kvmppc_h_logical_ci_store(struct kvm_vcpu *vcpu);
 
 /* Magic register values loaded into r3 and r4 before the 'sc' assembly
  * instruction for the OSI hypercalls */

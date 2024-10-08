@@ -729,6 +729,10 @@ static int do_dentry_open(struct file *f,
 		return 0;
 	}
 
+	/* POSIX.1-2008/SUSv4 Section XSI 2.9.7 */
+	if (S_ISREG(inode->i_mode))
+		f->f_mode |= FMODE_ATOMIC_POS;
+
 	f->f_op = fops_get(inode->i_fop);
 
 	error = security_file_open(f, cred);
@@ -980,8 +984,14 @@ struct file *file_open_name(struct filename *name, int flags, umode_t mode)
  */
 struct file *filp_open(const char *filename, int flags, umode_t mode)
 {
-	struct filename name = {.name = filename};
-	return file_open_name(&name, flags, mode);
+	struct filename *name = getname_kernel(filename);
+	struct file *file = ERR_CAST(name);
+	
+	if (!IS_ERR(name)) {
+		file = file_open_name(name, flags, mode);
+		putname(name);
+	}
+	return file;
 }
 EXPORT_SYMBOL(filp_open);
 

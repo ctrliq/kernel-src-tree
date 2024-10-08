@@ -270,7 +270,7 @@ enum rhine_quirks {
 /* Beware of PCI posted writes */
 #define IOSYNC	do { ioread8(ioaddr + StationAddr); } while (0)
 
-static DEFINE_PCI_DEVICE_TABLE(rhine_pci_tbl) = {
+static const struct pci_device_id rhine_pci_tbl[] = {
 	{ 0x1106, 0x3043, PCI_ANY_ID, PCI_ANY_ID, },	/* VT86C100A */
 	{ 0x1106, 0x3065, PCI_ANY_ID, PCI_ANY_ID, },	/* VT6102 */
 	{ 0x1106, 0x3106, PCI_ANY_ID, PCI_ANY_ID, },	/* 6105{,L,LOM} */
@@ -1693,8 +1693,8 @@ static netdev_tx_t rhine_start_tx(struct sk_buff *skb,
 	rp->tx_ring[entry].desc_length =
 		cpu_to_le32(TXDESC | (skb->len >= ETH_ZLEN ? skb->len : ETH_ZLEN));
 
-	if (unlikely(vlan_tx_tag_present(skb))) {
-		u16 vid_pcp = vlan_tx_tag_get(skb);
+	if (unlikely(skb_vlan_tag_present(skb))) {
+		u16 vid_pcp = skb_vlan_tag_get(skb);
 
 		/* drop CFI/DEI bit, register needs VID and PCP */
 		vid_pcp = (vid_pcp & VLAN_VID_MASK) |
@@ -1715,7 +1715,7 @@ static netdev_tx_t rhine_start_tx(struct sk_buff *skb,
 
 	/* Non-x86 Todo: explicitly flush cache lines here. */
 
-	if (vlan_tx_tag_present(skb))
+	if (skb_vlan_tag_present(skb))
 		/* Tx queues are bits 7-0 (first Tx queue: bit 7) */
 		BYTE_REG_BITS_ON(1 << 7, ioaddr + TQWake);
 
@@ -2051,16 +2051,16 @@ rhine_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 	netdev_stats_to_stats64(stats, &dev->stats);
 
 	do {
-		start = u64_stats_fetch_begin_bh(&rp->rx_stats.syncp);
+		start = u64_stats_fetch_begin_irq(&rp->rx_stats.syncp);
 		stats->rx_packets = rp->rx_stats.packets;
 		stats->rx_bytes = rp->rx_stats.bytes;
-	} while (u64_stats_fetch_retry_bh(&rp->rx_stats.syncp, start));
+	} while (u64_stats_fetch_retry_irq(&rp->rx_stats.syncp, start));
 
 	do {
-		start = u64_stats_fetch_begin_bh(&rp->tx_stats.syncp);
+		start = u64_stats_fetch_begin_irq(&rp->tx_stats.syncp);
 		stats->tx_packets = rp->tx_stats.packets;
 		stats->tx_bytes = rp->tx_stats.bytes;
-	} while (u64_stats_fetch_retry_bh(&rp->tx_stats.syncp, start));
+	} while (u64_stats_fetch_retry_irq(&rp->tx_stats.syncp, start));
 
 	return stats;
 }

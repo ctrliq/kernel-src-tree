@@ -26,7 +26,6 @@
 #include "psb_drv.h"
 #include "psb_reg.h"
 #include "psb_intel_reg.h"
-#include <asm/mrst.h>
 #include <asm/intel_scu_ipc.h>
 #include "mid_bios.h"
 #include "intel_bios.h"

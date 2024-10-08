@@ -80,8 +80,7 @@ void fscache_enqueue_operation(struct fscache_operation *op)
 		_debug("queue for caller's attention");
 		break;
 	default:
-		printk(KERN_ERR "FS-Cache: Unexpected op type %lx",
-		       op->flags);
+		pr_err("Unexpected op type %lx", op->flags);
 		BUG();
 		break;
 	}
@@ -168,7 +167,7 @@ int fscache_submit_exclusive_op(struct fscache_object *object,
 	smp_rmb();
 
 	op->state = FSCACHE_OP_ST_PENDING;
-	flags = READ_ONCE(object->flags);
+	flags = ACCESS_ONCE(object->flags);
 	if (unlikely(!(flags & BIT(FSCACHE_OBJECT_IS_LIVE)))) {
 		fscache_stat(&fscache_n_op_rejected);
 		op->cancel(op);
@@ -253,7 +252,7 @@ int fscache_submit_op(struct fscache_object *object,
 	smp_rmb();
 
 	op->state = FSCACHE_OP_ST_PENDING;
-	flags = READ_ONCE(object->flags);
+	flags = ACCESS_ONCE(object->flags);
 	if (unlikely(!(flags & BIT(FSCACHE_OBJECT_IS_LIVE)))) {
 		fscache_stat(&fscache_n_op_rejected);
 		op->cancel(op);

@@ -103,7 +103,9 @@ struct symbol_conf {
 			event_group,
 			demangle,
 			demangle_kernel,
-			filter_relative;
+			filter_relative,
+			show_hist_headers,
+			branch_callstack;
 	const char	*vmlinux_name,
 			*kallsyms_name,
 			*source_prefix,
@@ -300,5 +302,15 @@ int setup_list(struct strlist **list, const char *list_str,
 	       const char *list_name);
 int setup_intlist(struct intlist **list, const char *list_str,
 		  const char *list_name);
+
+#ifdef HAVE_LIBELF_SUPPORT
+bool elf__needs_adjust_symbols(GElf_Ehdr ehdr);
+void arch__elf_sym_adjust(GElf_Sym *sym);
+#endif
+
+#define SYMBOL_A 0
+#define SYMBOL_B 1
+
+int arch__choose_best_symbol(struct symbol *syma, struct symbol *symb);
 
 #endif /* __PERF_SYMBOL */

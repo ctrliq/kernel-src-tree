@@ -78,6 +78,9 @@ static long			time_adjust;
 /* constant (boot-param configurable) NTP tick adjustment (upscaled)	*/
 static s64			ntp_tick_adj;
 
+/* second value of the next pending leapsecond, or TIME64_MAX if no leap */
+static time64_t			ntp_next_leap_sec = TIME64_MAX;
+
 #ifdef CONFIG_NTP_PPS
 
 /*
@@ -351,6 +354,7 @@ void ntp_clear(void)
 	tick_length	= tick_length_base;
 	time_offset	= 0;
 
+	ntp_next_leap_sec = TIME64_MAX;
 	/* Clear PPS state variables */
 	pps_clear();
 }
@@ -361,6 +365,21 @@ u64 ntp_tick_length(void)
 	return tick_length;
 }
 
+/**
+ * ntp_get_next_leap - Returns the next leapsecond in CLOCK_REALTIME ktime_t
+ *
+ * Provides the time of the next leapsecond against CLOCK_REALTIME in
+ * a ktime_t format. Returns KTIME_MAX if no leapsecond is pending.
+ */
+ktime_t ntp_get_next_leap(void)
+{
+	ktime_t ret;
+
+	if ((time_state == TIME_INS) && (time_status & STA_INS))
+		return ktime_set(ntp_next_leap_sec, 0);
+	ret.tv64 = KTIME_MAX;
+	return ret;
+}
 
 /*
  * this routine handles the overflow of the microsecond field
@@ -384,15 +403,21 @@ int second_overflow(unsigned long secs)
 	 */
 	switch (time_state) {
 	case TIME_OK:
-		if (time_status & STA_INS)
+		if (time_status & STA_INS) {
 			time_state = TIME_INS;
-		else if (time_status & STA_DEL)
+			ntp_next_leap_sec = secs + SECS_PER_DAY -
+						(secs % SECS_PER_DAY);
+		} else if (time_status & STA_DEL) {
 			time_state = TIME_DEL;
+			ntp_next_leap_sec = secs + SECS_PER_DAY -
+						 ((secs+1) % SECS_PER_DAY);
+		}
 		break;
 	case TIME_INS:
-		if (!(time_status & STA_INS))
+		if (!(time_status & STA_INS)) {
+			ntp_next_leap_sec = TIME64_MAX;
 			time_state = TIME_OK;
-		else if (secs % SECS_PER_DAY == 0) {
+		} else if (secs % SECS_PER_DAY == 0) {
 			leap = -1;
 			time_state = TIME_OOP;
 			printk(KERN_NOTICE
@@ -400,19 +425,21 @@ int second_overflow(unsigned long secs)
 		}
 		break;
 	case TIME_DEL:
-		if (!(time_status & STA_DEL))
+		if (!(time_status & STA_DEL)) {
+			ntp_next_leap_sec = TIME64_MAX;
 			time_state = TIME_OK;
-		else if ((secs + 1) % SECS_PER_DAY == 0) {
+		} else if ((secs + 1) % SECS_PER_DAY == 0) {
 			leap = 1;
+			ntp_next_leap_sec = TIME64_MAX;
 			time_state = TIME_WAIT;
 			printk(KERN_NOTICE
 				"Clock: deleting leap second 23:59:59 UTC\n");
 		}
 		break;
 	case TIME_OOP:
+		ntp_next_leap_sec = TIME64_MAX;
 		time_state = TIME_WAIT;
 		break;
-
 	case TIME_WAIT:
 		if (!(time_status & (STA_INS | STA_DEL)))
 			time_state = TIME_OK;
@@ -467,7 +494,8 @@ static DECLARE_DELAYED_WORK(sync_cmos_work, sync_cmos_clock);
 
 static void sync_cmos_clock(struct work_struct *work)
 {
-	struct timespec now, next;
+	struct timespec64 now;
+	struct timespec next;
 	int fail = 1;
 
 	/*
@@ -486,9 +514,9 @@ static void sync_cmos_clock(struct work_struct *work)
 		return;
 	}
 
-	getnstimeofday(&now);
+	getnstimeofday64(&now);
 	if (abs(now.tv_nsec - (NSEC_PER_SEC / 2)) <= tick_nsec * 5) {
-		struct timespec adjust = now;
+		struct timespec adjust = timespec64_to_timespec(now);
 
 		fail = -ENODEV;
 		if (persistent_clock_is_local)
@@ -531,11 +559,12 @@ void ntp_notify_cmos_timer(void) { }
 /*
  * Propagate a new txc->status value into the NTP state:
  */
-static inline void process_adj_status(struct timex *txc, struct timespec *ts)
+static inline void process_adj_status(struct timex *txc, struct timespec64 *ts)
 {
 	if ((time_status & STA_PLL) && !(txc->status & STA_PLL)) {
 		time_state = TIME_OK;
 		time_status = STA_UNSYNC;
+		ntp_next_leap_sec = TIME64_MAX;
 		/* restart PPS frequency calibration */
 		pps_reset_freq_interval();
 	}
@@ -554,7 +583,7 @@ static inline void process_adj_status(struct timex *txc, struct timespec *ts)
 
 
 static inline void process_adjtimex_modes(struct timex *txc,
-						struct timespec *ts,
+						struct timespec64 *ts,
 						s32 *time_tai)
 {
 	if (txc->modes & ADJ_STATUS)
@@ -640,7 +669,7 @@ int ntp_validate_timex(struct timex *txc)
  * adjtimex mainly allows reading (and writing, if superuser) of
  * kernel time-keeping variables. used by xntpd.
  */
-int __do_adjtimex(struct timex *txc, struct timespec *ts, s32 *time_tai)
+int __do_adjtimex(struct timex *txc, struct timespec64 *ts, s32 *time_tai)
 {
 	int result;
 
@@ -684,7 +713,7 @@ int __do_adjtimex(struct timex *txc, struct timespec *ts, s32 *time_tai)
 	/* fill PPS status fields */
 	pps_fill_timex(txc);
 
-	txc->time.tv_sec = ts->tv_sec;
+	txc->time.tv_sec = (time_t)ts->tv_sec;
 	txc->time.tv_usec = ts->tv_nsec;
 	if (!(time_status & STA_NANO))
 		txc->time.tv_usec /= NSEC_PER_USEC;

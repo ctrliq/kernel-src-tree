@@ -239,7 +239,7 @@ struct tty_struct {
 	int index;
 
 	/* Protects ldisc changes: Lock tty not pty */
-	struct ld_semaphore ldisc_sem;
+	struct mutex ldisc_mutex;		/* unused */
 	struct tty_ldisc *ldisc;
 
 	struct mutex atomic_write_lock;
@@ -273,11 +273,14 @@ struct tty_struct {
 #define N_TTY_BUF_SIZE 4096
 
 	unsigned char closing:1;
+	unsigned short minimum_to_wake;		/* unused */
 	unsigned char *write_buf;
 	int write_cnt;
 	/* If the tty has a pending do_SAK, queue it here - akpm */
 	struct work_struct SAK_work;
 	struct tty_port *port;
+
+	RH_KABI_EXTEND(struct ld_semaphore ldisc_sem)
 };
 
 /* Each of a tty's open files has private_data pointing to tty_file_private */

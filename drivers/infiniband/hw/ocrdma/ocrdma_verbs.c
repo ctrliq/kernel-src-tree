@@ -61,9 +61,13 @@ int ocrdma_query_gid(struct ib_device *ibdev, u8 port,
 	return 0;
 }
 
-int ocrdma_query_device(struct ib_device *ibdev, struct ib_device_attr *attr)
+int ocrdma_query_device(struct ib_device *ibdev, struct ib_device_attr *attr,
+			struct ib_udata *uhw)
 {
 	struct ocrdma_dev *dev = get_ocrdma_dev(ibdev);
+
+	if (uhw->inlen || uhw->outlen)
+		return -EINVAL;
 
 	memset(attr, 0, sizeof *attr);
 	memcpy(&attr->fw_ver, &dev->attr.fw_ver[0],
@@ -1004,16 +1008,21 @@ err:
 	return status;
 }
 
-struct ib_cq *ocrdma_create_cq(struct ib_device *ibdev, int entries, int vector,
+struct ib_cq *ocrdma_create_cq(struct ib_device *ibdev,
+			       const struct ib_cq_init_attr *attr,
 			       struct ib_ucontext *ib_ctx,
 			       struct ib_udata *udata)
 {
+	int entries = attr->cqe;
 	struct ocrdma_cq *cq;
 	struct ocrdma_dev *dev = get_ocrdma_dev(ibdev);
 	struct ocrdma_ucontext *uctx = NULL;
 	u16 pd_id = 0;
 	int status;
 	struct ocrdma_create_cq_ureq ureq;
+
+	if (attr->flags)
+		return ERR_PTR(-EINVAL);
 
 	if (udata) {
 		if (ib_copy_from_udata(&ureq, udata, sizeof(ureq)))

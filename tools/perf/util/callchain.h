@@ -64,6 +64,7 @@ struct callchain_param {
 	sort_chain_func_t	sort;
 	enum chain_order	order;
 	enum chain_key		key;
+	bool			branch_callstack;
 };
 
 extern struct callchain_param callchain_param;
@@ -174,6 +175,7 @@ int fill_callchain_info(struct addr_location *al, struct callchain_cursor_node *
 extern const char record_callchain_help[];
 int parse_callchain_record_opt(const char *arg);
 int parse_callchain_report_opt(const char *arg);
+int perf_callchain_config(const char *var, const char *value);
 
 static inline void callchain_cursor_snapshot(struct callchain_cursor *dest,
 					     struct callchain_cursor *src)

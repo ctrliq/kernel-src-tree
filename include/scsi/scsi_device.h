@@ -83,9 +83,8 @@ struct scsi_device {
 	struct list_head    siblings;   /* list of all devices on this host */
 	struct list_head    same_target_siblings; /* just the devices sharing same target id */
 
-	/* this is now protected by the request_queue->queue_lock */
-	unsigned int device_busy;	/* commands actually active on
-					 * low-level. protected by queue_lock. */
+	RH_KABI_REPLACE(unsigned int device_busy, atomic_t device_busy)
+					/* commands actually active on LLDD */
 	spinlock_t list_lock;
 	struct list_head cmd_list;	/* queue of in use SCSI Command structures */
 	struct list_head starved_entry;
@@ -170,7 +169,6 @@ struct scsi_device {
 	unsigned wce_default_on:1;	/* Cache is ON by default */
 	unsigned no_dif:1;	/* T10 PI (DIF) should be disabled */
 	unsigned broken_fua:1;		/* Don't set FUA bit */
-	unsigned lun_in_cdb:1;		/* Store LUN bits in CDB[1] */
 
 	/* FOR RH USE ONLY
 	 *
@@ -179,6 +177,7 @@ struct scsi_device {
 	 */
 	unsigned vpd_reserved:1;
 	unsigned xcopy_reserved:1;
+	RH_KABI_FILL_HOLE(unsigned lun_in_cdb:1) /* Store LUN bits in CDB[1] */
 
 	atomic_t disk_events_disable_depth; /* disable depth for disk events */
 
@@ -187,7 +186,8 @@ struct scsi_device {
 	struct list_head event_list;	/* asserted events */
 	struct work_struct event_work;
 
-	unsigned int device_blocked;	/* Device returned QUEUE_FULL. */
+	RH_KABI_REPLACE(unsigned int device_blocked, atomic_t device_blocked)
+					/* Device returned QUEUE_FULL. */
 
 	unsigned int max_device_blocked; /* what device_blocked counts down from  */
 #define SCSI_DEFAULT_DEVICE_BLOCKED	3
@@ -213,9 +213,9 @@ struct scsi_device {
 
 #define SCSI_VPD_PG_LEN                255
 
-	RH_KABI_REPLACE_P(void *vpd_reserved1, unsigned char *vpd_pg83)
+	RH_KABI_REPLACE(void *vpd_reserved1, unsigned char *vpd_pg83)
 	RH_KABI_REPLACE(void *vpd_reserved2, int vpd_pg83_len)
-	RH_KABI_REPLACE_P(void *vpd_reserved3, unsigned char *vpd_pg80)
+	RH_KABI_REPLACE(void *vpd_reserved3, unsigned char *vpd_pg80)
 	RH_KABI_REPLACE(void *vpd_reserved4, int vpd_pg80_len)
 	char	vpd_reserved5;
 	char	vpd_reserved6;
@@ -331,13 +331,13 @@ struct scsi_target {
 						 * a 3F/0E UA, other devices on
 						 * the same target will also. */
 	/* commands actually active on LLD. */
-	atomic_t		target_busy;
+	RH_KABI_REPLACE(unsigned int target_busy, atomic_t target_busy)
 	/*
 	 * LLDs should set this in the slave_alloc host template callout.
 	 * If set to zero then there is not limit.
 	 */
 	unsigned int		can_queue;
-	unsigned int		target_blocked;
+	RH_KABI_REPLACE(unsigned int target_blocked, atomic_t target_blocked)
 	unsigned int		max_target_blocked;
 #define SCSI_DEFAULT_TARGET_BLOCKED	3
 

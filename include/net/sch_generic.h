@@ -6,6 +6,7 @@
 #include <linux/rcupdate.h>
 #include <linux/pkt_sched.h>
 #include <linux/pkt_cls.h>
+#include <linux/dynamic_queue_limits.h>
 #include <net/gen_stats.h>
 #include <net/rtnetlink.h>
 
@@ -109,6 +110,21 @@ static inline bool qdisc_run_begin(struct Qdisc *qdisc)
 static inline void qdisc_run_end(struct Qdisc *qdisc)
 {
 	qdisc->__state &= ~__QDISC___STATE_RUNNING;
+}
+
+static inline bool qdisc_may_bulk(const struct Qdisc *qdisc)
+{
+	return qdisc->flags & TCQ_F_ONETXQUEUE;
+}
+
+static inline int qdisc_avail_bulklimit(const struct netdev_queue *txq)
+{
+#ifdef CONFIG_BQL
+	/* Non-BQL migrated drivers will return 0, too. */
+	return dql_avail(&txq->dql);
+#else
+	return 0;
+#endif
 }
 
 static inline bool qdisc_is_throttled(const struct Qdisc *qdisc)
@@ -491,11 +507,38 @@ static inline void qdisc_bstats_update(struct Qdisc *sch,
 	bstats_update(&sch->bstats, skb);
 }
 
+static inline void qdisc_qstats_backlog_dec(struct Qdisc *sch,
+					    const struct sk_buff *skb)
+{
+	sch->qstats.backlog -= qdisc_pkt_len(skb);
+}
+
+static inline void qdisc_qstats_backlog_inc(struct Qdisc *sch,
+					    const struct sk_buff *skb)
+{
+	sch->qstats.backlog += qdisc_pkt_len(skb);
+}
+
+static inline void __qdisc_qstats_drop(struct Qdisc *sch, int count)
+{
+	sch->qstats.drops += count;
+}
+
+static inline void qdisc_qstats_drop(struct Qdisc *sch)
+{
+	sch->qstats.drops++;
+}
+
+static inline void qdisc_qstats_overlimit(struct Qdisc *sch)
+{
+	sch->qstats.overlimits++;
+}
+
 static inline int __qdisc_enqueue_tail(struct sk_buff *skb, struct Qdisc *sch,
 				       struct sk_buff_head *list)
 {
 	__skb_queue_tail(list, skb);
-	sch->qstats.backlog += qdisc_pkt_len(skb);
+	qdisc_qstats_backlog_inc(sch, skb);
 
 	return NET_XMIT_SUCCESS;
 }
@@ -511,7 +554,7 @@ static inline struct sk_buff *__qdisc_dequeue_head(struct Qdisc *sch,
 	struct sk_buff *skb = __skb_dequeue(list);
 
 	if (likely(skb != NULL)) {
-		sch->qstats.backlog -= qdisc_pkt_len(skb);
+		qdisc_qstats_backlog_dec(sch, skb);
 		qdisc_bstats_update(sch, skb);
 	}
 
@@ -530,7 +573,7 @@ static inline unsigned int __qdisc_queue_drop_head(struct Qdisc *sch,
 
 	if (likely(skb != NULL)) {
 		unsigned int len = qdisc_pkt_len(skb);
-		sch->qstats.backlog -= len;
+		qdisc_qstats_backlog_dec(sch, skb);
 		kfree_skb(skb);
 		return len;
 	}
@@ -549,7 +592,7 @@ static inline struct sk_buff *__qdisc_dequeue_tail(struct Qdisc *sch,
 	struct sk_buff *skb = __skb_dequeue_tail(list);
 
 	if (likely(skb != NULL))
-		sch->qstats.backlog -= qdisc_pkt_len(skb);
+		qdisc_qstats_backlog_dec(sch, skb);
 
 	return skb;
 }
@@ -631,14 +674,14 @@ static inline unsigned int qdisc_queue_drop(struct Qdisc *sch)
 static inline int qdisc_drop(struct sk_buff *skb, struct Qdisc *sch)
 {
 	kfree_skb(skb);
-	sch->qstats.drops++;
+	qdisc_qstats_drop(sch);
 
 	return NET_XMIT_DROP;
 }
 
 static inline int qdisc_reshape_fail(struct sk_buff *skb, struct Qdisc *sch)
 {
-	sch->qstats.drops++;
+	qdisc_qstats_drop(sch);
 
 #ifdef CONFIG_NET_CLS_ACT
 	if (sch->reshape_fail == NULL || sch->reshape_fail(skb, sch))

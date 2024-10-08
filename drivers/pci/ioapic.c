@@ -37,7 +37,7 @@ static int ioapic_probe(struct pci_dev *dev, const struct pci_device_id *ent)
 	char *type;
 	struct resource *res;
 
-	handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	handle = ACPI_HANDLE(&dev->dev);
 	if (!handle)
 		return -EINVAL;
 
@@ -99,7 +99,7 @@ static void ioapic_remove(struct pci_dev *dev)
 }
 
 
-static DEFINE_PCI_DEVICE_TABLE(ioapic_devices) = {
+static const struct pci_device_id ioapic_devices[] = {
 	{ PCI_DEVICE_CLASS(PCI_CLASS_SYSTEM_PIC_IOAPIC, ~0) },
 	{ PCI_DEVICE_CLASS(PCI_CLASS_SYSTEM_PIC_IOXAPIC, ~0) },
 	{ }

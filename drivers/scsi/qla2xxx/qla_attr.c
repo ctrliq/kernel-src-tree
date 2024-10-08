@@ -147,6 +147,92 @@ static struct bin_attribute sysfs_fw_dump_attr = {
 };
 
 static ssize_t
+qla2x00_sysfs_read_fw_dump_template(struct file *filp, struct kobject *kobj,
+			   struct bin_attribute *bin_attr,
+			   char *buf, loff_t off, size_t count)
+{
+	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
+	    struct device, kobj)));
+	struct qla_hw_data *ha = vha->hw;
+
+	if (!ha->fw_dump_template || !ha->fw_dump_template_len)
+		return 0;
+
+	ql_dbg(ql_dbg_user, vha, 0x70e2,
+	    "chunk <- off=%llx count=%lx\n", off, count);
+	return memory_read_from_buffer(buf, count, &off,
+	    ha->fw_dump_template, ha->fw_dump_template_len);
+}
+
+static ssize_t
+qla2x00_sysfs_write_fw_dump_template(struct file *filp, struct kobject *kobj,
+			    struct bin_attribute *bin_attr,
+			    char *buf, loff_t off, size_t count)
+{
+	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
+	    struct device, kobj)));
+	struct qla_hw_data *ha = vha->hw;
+	uint32_t size;
+
+	if (off == 0) {
+		if (ha->fw_dump)
+			vfree(ha->fw_dump);
+		if (ha->fw_dump_template)
+			vfree(ha->fw_dump_template);
+
+		ha->fw_dump = NULL;
+		ha->fw_dump_len = 0;
+		ha->fw_dump_template = NULL;
+		ha->fw_dump_template_len = 0;
+
+		size = qla27xx_fwdt_template_size(buf);
+		ql_dbg(ql_dbg_user, vha, 0x70d1,
+		    "-> allocating fwdt (%x bytes)...\n", size);
+		ha->fw_dump_template = vmalloc(size);
+		if (!ha->fw_dump_template) {
+			ql_log(ql_log_warn, vha, 0x70d2,
+			    "Failed allocate fwdt (%x bytes).\n", size);
+			return -ENOMEM;
+		}
+		ha->fw_dump_template_len = size;
+	}
+
+	if (off + count > ha->fw_dump_template_len) {
+		count = ha->fw_dump_template_len - off;
+		ql_dbg(ql_dbg_user, vha, 0x70d3,
+		    "chunk -> truncating to %lx bytes.\n", count);
+	}
+
+	ql_dbg(ql_dbg_user, vha, 0x70d4,
+	    "chunk -> off=%llx count=%lx\n", off, count);
+	memcpy(ha->fw_dump_template + off, buf, count);
+
+	if (off + count == ha->fw_dump_template_len) {
+		size = qla27xx_fwdt_calculate_dump_size(vha);
+		ql_dbg(ql_dbg_user, vha, 0x70d5,
+		    "-> allocating fwdump (%x bytes)...\n", size);
+		ha->fw_dump = vmalloc(size);
+		if (!ha->fw_dump) {
+			ql_log(ql_log_warn, vha, 0x70d6,
+			    "Failed allocate fwdump (%x bytes).\n", size);
+			return -ENOMEM;
+		}
+		ha->fw_dump_len = size;
+	}
+
+	return count;
+}
+static struct bin_attribute sysfs_fw_dump_template_attr = {
+	.attr = {
+		.name = "fw_dump_template",
+		.mode = S_IRUSR | S_IWUSR,
+	},
+	.size = 0,
+	.read = qla2x00_sysfs_read_fw_dump_template,
+	.write = qla2x00_sysfs_write_fw_dump_template,
+};
+
+static ssize_t
 qla2x00_sysfs_read_nvram(struct file *filp, struct kobject *kobj,
 			 struct bin_attribute *bin_attr,
 			 char *buf, loff_t off, size_t count)
@@ -846,6 +932,7 @@ static struct sysfs_entry {
 	int is4GBp_only;
 } bin_file_entries[] = {
 	{ "fw_dump", &sysfs_fw_dump_attr, },
+	{ "fw_dump_template", &sysfs_fw_dump_template_attr, 0x27 },
 	{ "nvram", &sysfs_nvram_attr, },
 	{ "optrom", &sysfs_optrom_attr, },
 	{ "optrom_ctl", &sysfs_optrom_ctl_attr, },
@@ -870,6 +957,8 @@ qla2x00_alloc_sysfs_attr(scsi_qla_host_t *vha)
 		if (iter->is4GBp_only == 2 && !IS_QLA25XX(vha->hw))
 			continue;
 		if (iter->is4GBp_only == 3 && !(IS_CNA_CAPABLE(vha->hw)))
+			continue;
+		if (iter->is4GBp_only == 0x27 && !IS_QLA27XX(vha->hw))
 			continue;
 
 		ret = sysfs_create_bin_file(&host->shost_gendev.kobj,
@@ -928,7 +1017,7 @@ qla2x00_fw_version_show(struct device *dev,
 	char fw_str[128];
 
 	return scnprintf(buf, PAGE_SIZE, "%s\n",
-	    ha->isp_ops->fw_version_str(vha, fw_str));
+	    ha->isp_ops->fw_version_str(vha, fw_str, sizeof(fw_str)));
 }
 
 static ssize_t
@@ -1213,7 +1302,7 @@ qla2x00_optrom_gold_fw_version_show(struct device *dev,
 	scsi_qla_host_t *vha = shost_priv(class_to_shost(dev));
 	struct qla_hw_data *ha = vha->hw;
 
-	if (!IS_QLA81XX(ha) && !IS_QLA83XX(ha))
+	if (!IS_QLA81XX(ha) && !IS_QLA83XX(ha) && !IS_QLA27XX(ha))
 		return scnprintf(buf, PAGE_SIZE, "\n");
 
 	return scnprintf(buf, PAGE_SIZE, "%d.%02d.%02d (%d)\n",
@@ -1354,7 +1443,7 @@ qla2x00_fw_state_show(struct device *dev, struct device_attribute *attr,
 {
 	scsi_qla_host_t *vha = shost_priv(class_to_shost(dev));
 	int rval = QLA_FUNCTION_FAILED;
-	uint16_t state[5];
+	uint16_t state[6];
 	uint32_t pstate;
 
 	if (IS_QLAFX00(vha->hw)) {
@@ -1370,8 +1459,8 @@ qla2x00_fw_state_show(struct device *dev, struct device_attribute *attr,
 	if (rval != QLA_SUCCESS)
 		memset(state, -1, sizeof(state));
 
-	return scnprintf(buf, PAGE_SIZE, "0x%x 0x%x 0x%x 0x%x 0x%x\n", state[0],
-	    state[1], state[2], state[3], state[4]);
+	return scnprintf(buf, PAGE_SIZE, "0x%x 0x%x 0x%x 0x%x 0x%x 0x%x\n",
+	    state[0], state[1], state[2], state[3], state[4], state[5]);
 }
 
 static ssize_t
@@ -1569,6 +1658,9 @@ qla2x00_get_host_speed(struct Scsi_Host *shost)
 		break;
 	case PORT_SPEED_16GB:
 		speed = FC_PORTSPEED_16GBIT;
+		break;
+	case PORT_SPEED_32GB:
+		speed = FC_PORTSPEED_32GBIT;
 		break;
 	}
 	fc_host_speed(shost) = speed;
@@ -1835,7 +1927,8 @@ qla2x00_get_host_symbolic_name(struct Scsi_Host *shost)
 {
 	scsi_qla_host_t *vha = shost_priv(shost);
 
-	qla2x00_get_sym_node_name(vha, fc_host_symbolic_name(shost));
+	qla2x00_get_sym_node_name(vha, fc_host_symbolic_name(shost),
+	    sizeof(fc_host_symbolic_name(shost)));
 }
 
 static void
@@ -2219,6 +2312,9 @@ qla2x00_init_host_attr(scsi_qla_host_t *vha)
 	else if (IS_QLAFX00(ha))
 		speed = FC_PORTSPEED_8GBIT | FC_PORTSPEED_4GBIT |
 		    FC_PORTSPEED_2GBIT | FC_PORTSPEED_1GBIT;
+	else if (IS_QLA27XX(ha))
+		speed = FC_PORTSPEED_32GBIT | FC_PORTSPEED_16GBIT |
+		    FC_PORTSPEED_8GBIT;
 	else
 		speed = FC_PORTSPEED_1GBIT;
 	fc_host_supported_speeds(vha->host) = speed;

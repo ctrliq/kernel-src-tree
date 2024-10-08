@@ -162,6 +162,8 @@ cond_syscall(ppc_rtas);
 cond_syscall(sys_spu_run);
 cond_syscall(sys_spu_create);
 cond_syscall(sys_subpage_prot);
+cond_syscall(sys_s390_pci_mmio_read);
+cond_syscall(sys_s390_pci_mmio_write);
 
 /* mmu depending weak syscall entries */
 cond_syscall(sys_mprotect);
@@ -194,6 +196,8 @@ cond_syscall(compat_sys_timerfd_settime);
 cond_syscall(compat_sys_timerfd_gettime);
 cond_syscall(sys_eventfd);
 cond_syscall(sys_eventfd2);
+cond_syscall(sys_memfd_create);
+cond_syscall(sys_userfaultfd);
 
 /* performance counters: */
 cond_syscall(sys_perf_event_open);

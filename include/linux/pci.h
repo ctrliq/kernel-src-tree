@@ -250,6 +250,9 @@ struct pcie_link_state;
 struct pci_vpd;
 struct pci_sriov;
 struct pci_ats;
+#ifdef CONFIG_PPC64
+struct pci_dn;
+#endif
 
 /*
  * The pci_dev structure is used to describe PCI devices.
@@ -308,6 +311,7 @@ struct pci_dev {
 						   D3cold, not set for devices
 						   powered on/off by the
 						   corresponding bridge */
+	RH_KABI_FILL_HOLE(unsigned int  ignore_hotplug:1)
 	unsigned int	d3_delay;	/* D3->D0 transition time in ms */
 	unsigned int	d3cold_delay;	/* D3cold->D0 transition time in ms */
 
@@ -335,7 +339,6 @@ struct pci_dev {
 	unsigned int	is_added:1;
 	unsigned int	is_busmaster:1; /* device is busmaster */
 	unsigned int	no_msi:1;	/* device may not use msi */
-	unsigned int	no_64bit_msi:1; /* device may only use 32-bit MSIs */
 	unsigned int	block_cfg_access:1;	/* config space access is blocked */
 	unsigned int	broken_parity_status:1;	/* Device generates false positive parity */
 	unsigned int	irq_reroute_variant:2;	/* device needs IRQ rerouting variant */
@@ -353,6 +356,8 @@ struct pci_dev {
 	unsigned int	__aer_firmware_first:1;
 	unsigned int	broken_intx_masking:1;
 	unsigned int	io_window_1k:1;	/* Intel P2P bridge 1K I/O windows */
+	RH_KABI_FILL_HOLE(unsigned int no_64bit_msi:1) /* device may only use 32-bit MSIs */
+	RH_KABI_FILL_HOLE(unsigned int irq_managed:1)
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -389,7 +394,11 @@ struct pci_dev {
  * going forward.  This structure will never be under KABI restrictions.
  */
 struct pci_dev_rh {
-	RH_KABI_EXTEND(u8		dma_alias_devfn) /* devfn of DMA alias, if any */
+	RH_KABI_EXTEND(u8   dma_alias_devfn) /* devfn of DMA alias, if any */
+	RH_KABI_EXTEND(char *driver_override) /* Driver name to force a match */
+#ifdef CONFIG_PPC64
+	RH_KABI_EXTEND(struct pci_dn *pci_data) /* PCI device node*/
+#endif
 };
 
 static inline struct pci_dev *pci_physfn(struct pci_dev *dev)
@@ -655,9 +664,6 @@ struct pci_error_handlers {
 	/* PCI slot has been reset */
 	pci_ers_result_t (*slot_reset)(struct pci_dev *dev);
 
-	/* PCI function reset prepare or completed */
-	void (*reset_notify)(struct pci_dev *dev, bool prepare);
-
 	/* Device driver may resume normal operations */
 	void (*resume)(struct pci_dev *dev);
 };
@@ -702,6 +708,8 @@ struct pci_driver {
 struct pci_driver_rh {
 	unsigned int  size;	/* Note: always outside of __GENKSYMS__ check */
 #ifndef __GENKSYMS__
+	/* PCI function reset prepare or completed */
+	void (*reset_notify)(struct pci_dev *dev, bool prepare);
 #endif
 };
 
@@ -1045,6 +1053,12 @@ int pci_back_from_sleep(struct pci_dev *dev);
 bool pci_dev_run_wake(struct pci_dev *dev);
 bool pci_check_pme_status(struct pci_dev *dev);
 void pci_pme_wakeup_bus(struct pci_bus *bus);
+
+static inline void pci_ignore_hotplug(struct pci_dev *dev)
+{
+	dev->ignore_hotplug = 1;
+}
+
 int pci_enable_wake(struct pci_dev *dev, pci_power_t state, bool enable);
 
 /* PCI Virtual Channel */
@@ -1207,6 +1221,7 @@ struct msix_entry {
 
 #ifdef CONFIG_PCI_MSI
 int pci_msi_vec_count(struct pci_dev *dev);
+int pci_enable_msi_block(struct pci_dev *dev, int nvec);
 void pci_msi_shutdown(struct pci_dev *dev);
 void pci_disable_msi(struct pci_dev *dev);
 int pci_msix_vec_count(struct pci_dev *dev);
@@ -1235,6 +1250,8 @@ static inline int pci_enable_msix_exact(struct pci_dev *dev,
 }
 #else
 static inline int pci_msi_vec_count(struct pci_dev *dev) { return -ENOSYS; }
+static inline int pci_enable_msi_block(struct pci_dev *dev, int nvec)
+{ return -ENOSYS; }
 static inline void pci_msi_shutdown(struct pci_dev *dev) { }
 static inline void pci_disable_msi(struct pci_dev *dev) { }
 static inline int pci_msix_vec_count(struct pci_dev *dev) { return -ENOSYS; }
@@ -1641,13 +1658,25 @@ int pci_ext_cfg_avail(void);
 void __iomem *pci_ioremap_bar(struct pci_dev *pdev, int bar);
 
 #ifdef CONFIG_PCI_IOV
+int pci_iov_virtfn_bus(struct pci_dev *dev, int id);
+int pci_iov_virtfn_devfn(struct pci_dev *dev, int id);
+
 int pci_enable_sriov(struct pci_dev *dev, int nr_virtfn);
 void pci_disable_sriov(struct pci_dev *dev);
 int pci_num_vf(struct pci_dev *dev);
 int pci_vfs_assigned(struct pci_dev *dev);
 int pci_sriov_set_totalvfs(struct pci_dev *dev, u16 numvfs);
 int pci_sriov_get_totalvfs(struct pci_dev *dev);
+resource_size_t pci_iov_resource_size(struct pci_dev *dev, int resno);
 #else
+static inline int pci_iov_virtfn_bus(struct pci_dev *dev, int id)
+{
+	return -ENOSYS;
+}
+static inline int pci_iov_virtfn_devfn(struct pci_dev *dev, int id)
+{
+	return -ENOSYS;
+}
 static inline int pci_enable_sriov(struct pci_dev *dev, int nr_virtfn)
 { return -ENODEV; }
 static inline void pci_disable_sriov(struct pci_dev *dev) { }
@@ -1657,6 +1686,8 @@ static inline int pci_vfs_assigned(struct pci_dev *dev)
 static inline int pci_sriov_set_totalvfs(struct pci_dev *dev, u16 numvfs)
 { return 0; }
 static inline int pci_sriov_get_totalvfs(struct pci_dev *dev)
+{ return 0; }
+static inline resource_size_t pci_iov_resource_size(struct pci_dev *dev, int resno)
 { return 0; }
 #endif
 
@@ -1822,4 +1853,14 @@ int pci_for_each_dma_alias(struct pci_dev *pdev,
  */
 struct pci_dev *pci_find_upstream_pcie_bridge(struct pci_dev *pdev);
 
+/**
+ * pci_ari_enabled - query ARI forwarding status
+ * @bus: the PCI bus
+ *
+ * Returns true if ARI forwarding is enabled.
+ */
+static inline bool pci_ari_enabled(struct pci_bus *bus)
+{
+	return bus->self && bus->self->ari_enabled;
+}
 #endif /* LINUX_PCI_H */

@@ -274,7 +274,7 @@ static int reserve_pmc_hardware(void)
 	int flags = PMC_INIT;
 
 	on_each_cpu(setup_pmc_cpu, &flags, 1);
-	measurement_alert_subclass_register();
+	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
 
 	return 0;
 }
@@ -285,7 +285,7 @@ static void release_pmc_hardware(void)
 	int flags = PMC_RELEASE;
 
 	on_each_cpu(setup_pmc_cpu, &flags, 1);
-	measurement_alert_subclass_unregister();
+	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
 }
 
 /* Release the PMU if event is the last perf event */
@@ -673,7 +673,8 @@ static int __init cpumf_pmu_init(void)
 	ctl_clear_bit(0, 48);
 
 	/* register handler for measurement-alert interruptions */
-	rc = register_external_interrupt(0x1407, cpumf_measurement_alert);
+	rc = register_external_irq(EXT_IRQ_MEASURE_ALERT,
+				   cpumf_measurement_alert);
 	if (rc) {
 		pr_err("Registering for CPU-measurement alerts "
 		       "failed with rc=%i\n", rc);
@@ -684,7 +685,8 @@ static int __init cpumf_pmu_init(void)
 	rc = perf_pmu_register(&cpumf_pmu, "cpum_cf", PERF_TYPE_RAW);
 	if (rc) {
 		pr_err("Registering the cpum_cf PMU failed with rc=%i\n", rc);
-		unregister_external_interrupt(0x1407, cpumf_measurement_alert);
+		unregister_external_irq(EXT_IRQ_MEASURE_ALERT,
+					cpumf_measurement_alert);
 		goto out;
 	}
 	perf_cpu_notifier(cpumf_pmu_notifier);

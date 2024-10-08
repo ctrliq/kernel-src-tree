@@ -21,6 +21,10 @@ int efx_sriov_set_vf_spoofchk(struct net_device *net_dev, int vf_i,
 			      bool spoofchk);
 int efx_sriov_get_vf_config(struct net_device *net_dev, int vf_i,
 			    struct ifla_vf_info *ivi);
+int efx_sriov_set_vf_link_state(struct net_device *net_dev, int vf_i,
+				int link_state);
+int efx_sriov_get_phys_port_id(struct net_device *net_dev,
+			       struct netdev_phys_port_id *ppid);
 
 #endif /* CONFIG_SFC_SRIOV */
 

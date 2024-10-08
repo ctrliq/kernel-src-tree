@@ -11,18 +11,15 @@
  * ----------------------------------------------------------------------
  * |             Level            |   Last Value Used  |     Holes	|
  * ----------------------------------------------------------------------
- * | Module Init and Probe        |       0x017d       | 0x004b,0x0141	|
- * |                              |                    | 0x0144,0x0146	|
+ * | Module Init and Probe        |       0x017f       | 0x0146,	|
  * |                              |                    | 0x015b-0x0160	|
  * |                              |                    | 0x016e-0x0170	|
- * | Mailbox commands             |       0x118d       | 0x1018-0x1019	|
- * |                              |                    | 0x10ca         |
- * |                              |                    | 0x1115-0x1116  |
- * |                              |                    | 0x111a-0x111b	|
- * | Device Discovery             |       0x2095       | 0x2020-0x2022, |
+ * | Mailbox commands             |       0x118d       | 0x1115-0x1116	|
+ * |                              |                    | 0x111a-0x111b  |
+ * | Device Discovery             |       0x2016       | 0x2020-0x2022, |
  * |                              |                    | 0x2011-0x2012, |
- * |                              |                    | 0x2016         |
- * | Queue Command and IO tracing |       0x3059       | 0x3006-0x300b  |
+ * |                              |                    | 0x2099-0x20a4  |
+ * | Queue Command and IO tracing |       0x3075       | 0x300b         |
  * |                              |                    | 0x3027-0x3028  |
  * |                              |                    | 0x303d-0x3041  |
  * |                              |                    | 0x302d,0x3033  |
@@ -30,7 +27,7 @@
  * |                              |                    | 0x303a		|
  * | DPC Thread                   |       0x4023       | 0x4002,0x4013  |
  * | Async Events                 |       0x5087       | 0x502b-0x502f  |
- * |                              |                    | 0x5047,0x5052  |
+ * |                              |                    | 0x5047,  	|
  * |                              |                    | 0x5084,0x5075	|
  * |                              |                    | 0x503d,0x5044  |
  * |                              |                    | 0x507b,0x505f	|
@@ -63,7 +60,13 @@
  * |                              |                    | 0xb13c-0xb140  |
  * |                              |                    | 0xb149		|
  * | MultiQ                       |       0xc00c       |		|
- * | Misc                         |       0xd010       |		|
+ * | Misc                         |       0xd300       | 0xd016-0xd017	|
+ * |                              |                    | 0xd021,0xd024	|
+ * |                              |                    | 0xd025,0xd029	|
+ * |                              |                    | 0xd02a,0xd02e	|
+ * |                              |                    | 0xd031-0xd0ff	|
+ * |                              |                    | 0xd101-0xd1fe	|
+ * |                              |                    | 0xd213-0xd2fe	|
  * | Target Mode		  |	  0xe070       | 0xe021		|
  * | Target Mode Management	  |	  0xf072       | 0xf002-0xf003	|
  * |                              |                    | 0xf046-0xf049  |
@@ -109,6 +112,86 @@ qla2xxx_copy_queues(struct qla_hw_data *ha, void *ptr)
 }
 
 int
+qla27xx_dump_mpi_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
+	uint32_t ram_dwords, void **nxt)
+{
+	int rval;
+	uint32_t cnt, stat, timer, dwords, idx;
+	uint16_t mb0, mb1;
+	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
+	dma_addr_t dump_dma = ha->gid_list_dma;
+	uint32_t *dump = (uint32_t *)ha->gid_list;
+
+	rval = QLA_SUCCESS;
+	mb0 = 0;
+
+	WRT_REG_WORD(&reg->mailbox0, MBC_LOAD_DUMP_MPI_RAM);
+	clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags);
+
+	dwords = qla2x00_gid_list_size(ha) / 4;
+	for (cnt = 0; cnt < ram_dwords && rval == QLA_SUCCESS;
+	    cnt += dwords, addr += dwords) {
+		if (cnt + dwords > ram_dwords)
+			dwords = ram_dwords - cnt;
+
+		WRT_REG_WORD(&reg->mailbox1, LSW(addr));
+		WRT_REG_WORD(&reg->mailbox8, MSW(addr));
+
+		WRT_REG_WORD(&reg->mailbox2, MSW(dump_dma));
+		WRT_REG_WORD(&reg->mailbox3, LSW(dump_dma));
+		WRT_REG_WORD(&reg->mailbox6, MSW(MSD(dump_dma)));
+		WRT_REG_WORD(&reg->mailbox7, LSW(MSD(dump_dma)));
+
+		WRT_REG_WORD(&reg->mailbox4, MSW(dwords));
+		WRT_REG_WORD(&reg->mailbox5, LSW(dwords));
+
+		WRT_REG_WORD(&reg->mailbox9, 0);
+		WRT_REG_DWORD(&reg->hccr, HCCRX_SET_HOST_INT);
+
+		ha->flags.mbox_int = 0;
+		for (timer = 6000000; timer; timer--) {
+			/* Check for pending interrupts. */
+			stat = RD_REG_DWORD(&reg->host_status);
+			if (stat & HSRX_RISC_INT) {
+				stat &= 0xff;
+
+				if (stat == 0x1 || stat == 0x2 ||
+				    stat == 0x10 || stat == 0x11) {
+					set_bit(MBX_INTERRUPT,
+					    &ha->mbx_cmd_flags);
+
+					mb0 = RD_REG_WORD(&reg->mailbox0);
+					mb1 = RD_REG_WORD(&reg->mailbox1);
+
+					WRT_REG_DWORD(&reg->hccr,
+					    HCCRX_CLR_RISC_INT);
+					RD_REG_DWORD(&reg->hccr);
+					break;
+				}
+
+				/* Clear this intr; it wasn't a mailbox intr */
+				WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_INT);
+				RD_REG_DWORD(&reg->hccr);
+			}
+			udelay(5);
+		}
+		ha->flags.mbox_int = 1;
+
+		if (test_and_clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags)) {
+			rval = mb0 & MBS_MASK;
+			for (idx = 0; idx < dwords; idx++)
+				ram[cnt + idx] = IS_QLA27XX(ha) ?
+				    le32_to_cpu(dump[idx]) : swab32(dump[idx]);
+		} else {
+			rval = QLA_FUNCTION_FAILED;
+		}
+	}
+
+	*nxt = rval == QLA_SUCCESS ? &ram[cnt] : NULL;
+	return rval;
+}
+
+int
 qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
     uint32_t ram_dwords, void **nxt)
 {
@@ -143,6 +226,7 @@ qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 		WRT_REG_WORD(&reg->mailbox5, LSW(dwords));
 		WRT_REG_DWORD(&reg->hccr, HCCRX_SET_HOST_INT);
 
+		ha->flags.mbox_int = 0;
 		for (timer = 6000000; timer; timer--) {
 			/* Check for pending interrupts. */
 			stat = RD_REG_DWORD(&reg->host_status);
@@ -168,11 +252,13 @@ qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 			}
 			udelay(5);
 		}
+		ha->flags.mbox_int = 1;
 
 		if (test_and_clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags)) {
 			rval = mb0 & MBS_MASK;
 			for (idx = 0; idx < dwords; idx++)
-				ram[cnt + idx] = swab32(dump[idx]);
+				ram[cnt + idx] = IS_QLA27XX(ha) ?
+				    le32_to_cpu(dump[idx]) : swab32(dump[idx]);
 		} else {
 			rval = QLA_FUNCTION_FAILED;
 		}
@@ -543,7 +629,7 @@ qla25xx_copy_mq(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 	struct qla2xxx_mq_chain *mq = ptr;
 	device_reg_t __iomem *reg;
 
-	if (!ha->mqenable || IS_QLA83XX(ha))
+	if (!ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha))
 		return ptr;
 
 	mq = ptr;

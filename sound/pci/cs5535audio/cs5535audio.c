@@ -27,7 +27,7 @@
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/module.h>
-#include <asm/io.h>
+#include <linux/io.h>
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
@@ -289,8 +289,8 @@ static int snd_cs5535audio_create(struct snd_card *card,
 	if ((err = pci_enable_device(pci)) < 0)
 		return err;
 
-	if (pci_set_dma_mask(pci, DMA_BIT_MASK(32)) < 0 ||
-	    pci_set_consistent_dma_mask(pci, DMA_BIT_MASK(32)) < 0) {
+	if (dma_set_mask(&pci->dev, DMA_BIT_MASK(32)) < 0 ||
+	    dma_set_coherent_mask(&pci->dev, DMA_BIT_MASK(32)) < 0) {
 		dev_warn(card->dev, "unable to get 32bit dma\n");
 		err = -ENXIO;
 		goto pcifail;

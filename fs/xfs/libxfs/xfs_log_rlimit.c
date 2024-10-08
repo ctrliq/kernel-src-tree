@@ -21,8 +21,6 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_ag.h"
-#include "xfs_sb.h"
 #include "xfs_mount.h"
 #include "xfs_da_format.h"
 #include "xfs_trans_space.h"
@@ -42,7 +40,7 @@ xfs_log_calc_max_attrsetm_res(
 	int			size;
 	int			nblks;
 
-	size = xfs_attr_leaf_entsize_local_max(mp->m_sb.sb_blocksize) -
+	size = xfs_attr_leaf_entsize_local_max(mp->m_attr_geo->blksize) -
 	       MAXNAMELEN - 1;
 	nblks = XFS_DAENTER_SPACE_RES(mp, XFS_ATTR_FORK);
 	nblks += XFS_B_TO_FSB(mp, size);

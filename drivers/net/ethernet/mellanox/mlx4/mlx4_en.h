@@ -279,6 +279,7 @@ struct mlx4_en_tx_ring {
 	u32			size; /* number of TXBBs */
 	u32			size_mask;
 	u16			stride;
+	u32			full_size;
 	u16			cqn;	/* index of port CQ associated with this ring */
 	u32			buf_size;
 	__be32			doorbell_qpn;
@@ -339,7 +340,7 @@ struct mlx4_en_cq {
 	struct napi_struct	napi;
 	int size;
 	int buf_size;
-	unsigned vector;
+	int vector;
 	enum cq_type is_tx;
 	u16 moder_time;
 	u16 moder_cnt;
@@ -376,7 +377,6 @@ struct mlx4_en_port_profile {
 };
 
 struct mlx4_en_profile {
-	int rss_xor;
 	int udp_rss;
 	u8 rss_mask;
 	u32 active_ports;
@@ -482,8 +482,14 @@ enum {
 	MLX4_EN_FLAG_RX_CSUM_NON_TCP_UDP	= (1 << 5),
 };
 
+#define PORT_BEACON_MAX_LIMIT (65535)
 #define MLX4_EN_MAC_HASH_SIZE (1 << BITS_PER_BYTE)
 #define MLX4_EN_MAC_HASH_IDX 5
+
+struct mlx4_en_stats_bitmap {
+	DECLARE_BITMAP(bitmap, NUM_ALL_STATS);
+	struct mutex mutex; /* for mutual access to stats bitmap */
+};
 
 struct mlx4_en_priv {
 	struct mlx4_en_dev *mdev;
@@ -560,8 +566,13 @@ struct mlx4_en_priv {
 #endif
 	struct mlx4_en_perf_stats pstats;
 	struct mlx4_en_pkt_stats pkstats;
+	struct mlx4_en_counter_stats pf_stats;
+	struct mlx4_en_flow_stats_rx rx_priority_flowstats[MLX4_NUM_PRIORITIES];
+	struct mlx4_en_flow_stats_tx tx_priority_flowstats[MLX4_NUM_PRIORITIES];
+	struct mlx4_en_flow_stats_rx rx_flowstats;
+	struct mlx4_en_flow_stats_tx tx_flowstats;
 	struct mlx4_en_port_stats port_stats;
-	u64 stats_bitmap;
+	struct mlx4_en_stats_bitmap stats_bitmap;
 	struct list_head mc_list;
 	struct list_head curr_list;
 	u64 broadcast_id;
@@ -571,6 +582,7 @@ struct mlx4_en_priv {
 	struct device *ddev;
 	struct hlist_head mac_hash[MLX4_EN_MAC_HASH_SIZE];
 	struct hwtstamp_config hwtstamp_config;
+	u32 counter_index;
 
 #ifdef CONFIG_MLX4_EN_DCB
 	struct ieee_ets ets;
@@ -586,6 +598,8 @@ struct mlx4_en_priv {
 	__be16 vxlan_port;
 
 	u32 pflags;
+	u8 rss_key[MLX4_EN_RSS_KEY_SIZE];
+	u8 rss_hash_fn;
 };
 
 enum mlx4_en_wol {
@@ -726,6 +740,11 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
 int mlx4_en_start_port(struct net_device *dev);
 void mlx4_en_stop_port(struct net_device *dev, int detach);
 
+void mlx4_en_set_stats_bitmap(struct mlx4_dev *dev,
+			      struct mlx4_en_stats_bitmap *stats_bitmap,
+			      u8 rx_ppp, u8 rx_pause,
+			      u8 tx_ppp, u8 tx_pause);
+
 void mlx4_en_free_resources(struct mlx4_en_priv *priv);
 int mlx4_en_alloc_resources(struct mlx4_en_priv *priv);
 
@@ -811,6 +830,10 @@ void mlx4_en_ptp_overflow_check(struct mlx4_en_dev *mdev);
 int mlx4_en_reset_config(struct net_device *dev,
 			 struct hwtstamp_config ts_config,
 			 netdev_features_t new_features);
+void mlx4_en_update_pfc_stats_bitmap(struct mlx4_dev *dev,
+				     struct mlx4_en_stats_bitmap *stats_bitmap,
+				     u8 rx_ppp, u8 rx_pause,
+				     u8 tx_ppp, u8 tx_pause);
 
 /*
  * Functions for time stamping

@@ -1223,6 +1223,11 @@ static int snd_ctl_elem_add(struct snd_ctl_file *file,
 	unsigned int offset;
 	int err;
 
+	if (!*info->id.name)
+		return -EINVAL;
+	if (strnlen(info->id.name, sizeof(info->id.name)) >= sizeof(info->id.name))
+		return -EINVAL;
+
 	/* Delete a control to replace them if needed. */
 	if (replace) {
 		info->id.numid = 0;
@@ -1743,9 +1748,8 @@ static int snd_ctl_dev_register(struct snd_device *device)
 {
 	struct snd_card *card = device->device_data;
 
-	return snd_register_device_for_dev(SNDRV_DEVICE_TYPE_CONTROL, card,
-					   -1, &snd_ctl_f_ops, card,
-					   &card->ctl_dev, NULL, NULL);
+	return snd_register_device(SNDRV_DEVICE_TYPE_CONTROL, card, -1,
+				   &snd_ctl_f_ops, card, &card->ctl_dev);
 }
 
 /*
@@ -1763,7 +1767,7 @@ static int snd_ctl_dev_disconnect(struct snd_device *device)
 	}
 	read_unlock(&card->ctl_files_rwlock);
 
-	return snd_unregister_device(SNDRV_DEVICE_TYPE_CONTROL, card, -1);
+	return snd_unregister_device(&card->ctl_dev);
 }
 
 /*

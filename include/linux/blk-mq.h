@@ -5,12 +5,13 @@
 #include <linux/rh_kabi.h>
 
 struct blk_mq_tags;
+struct blk_flush_queue;
 
 struct blk_mq_cpu_notifier {
 	struct list_head list;
 	void *data;
-	RH_KABI_REPLACE_P(void (*notify)(void *data, unsigned long action, unsigned int cpu),
-			  int (*notify)(void *data, unsigned long action, unsigned int cpu))
+	RH_KABI_REPLACE(void (*notify)(void *data, unsigned long action, unsigned int cpu),
+			int (*notify)(void *data, unsigned long action, unsigned int cpu))
 };
 
 struct blk_mq_ctxmap {
@@ -43,14 +44,14 @@ struct blk_mq_hw_ctx {
 	RH_KABI_REPLACE(unsigned int		nr_ctx_map,
 			atomic_t		wait_index)
 
-	RH_KABI_REPLACE_P(unsigned long		*ctx_map,
-		          unsigned long		*padding1)
+	RH_KABI_REPLACE(unsigned long		*ctx_map,
+			unsigned long		*padding1)
 
-	RH_KABI_REPLACE_P(struct request		**rqs,
-		          struct request		**padding2)
+	RH_KABI_REPLACE(struct request		**rqs,
+			struct request		**padding2)
 
-	RH_KABI_REPLACE(struct list_head		page_list,
-		        struct list_head		padding3)
+	RH_KABI_REPLACE(struct list_head	page_list,
+			struct list_head	padding3)
 
 	struct blk_mq_tags	*tags;
 
@@ -61,7 +62,7 @@ struct blk_mq_hw_ctx {
 
 	unsigned int		queue_depth;	/* DEPRECATED: RHEL kABI padding, repurpose? */
 	unsigned int		numa_node;
-	unsigned int		cmd_size;	/* per-request extra data */
+	RH_KABI_DEPRECATE(unsigned int, cmd_size)
 
 	struct blk_mq_cpu_notifier	cpu_notifier;
 	struct kobject		kobj;
@@ -74,6 +75,8 @@ struct blk_mq_hw_ctx {
 	RH_KABI_EXTEND(struct blk_mq_ctxmap	ctx_map)
 
 	RH_KABI_EXTEND(atomic_t		nr_active)
+
+	RH_KABI_EXTEND(struct blk_flush_queue	*fq)
 };
 
 #ifdef __GENKSYMS__
@@ -106,9 +109,18 @@ struct blk_mq_tag_set {
 };
 #endif
 
-/* This thing was never covered by kabi */
-RH_KABI_REPLACE_P(typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *),
-	           typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *, bool))
+struct blk_mq_queue_data {
+	struct request *rq;
+	struct list_head *list;
+	bool last;
+};
+
+/* None of these function pointers are covered by RHEL kABI */
+#ifdef __GENKSYMS__
+typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+#else
+typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, const struct blk_mq_queue_data *);
+#endif
 
 typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
 #ifdef __GENKSYMS__
@@ -125,6 +137,7 @@ typedef void (exit_request_fn)(void *, struct request *, unsigned int,
 
 typedef void (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
 		bool);
+typedef void (busy_tag_iter_fn)(struct request *, void *, bool);
 
 struct blk_mq_ops {
 	/*
@@ -140,7 +153,7 @@ struct blk_mq_ops {
 	/*
 	 * Called on request timeout
 	 */
-	RH_KABI_REPLACE_P(rq_timed_out_fn *timeout, timeout_fn *timeout)
+	RH_KABI_REPLACE(rq_timed_out_fn *timeout, timeout_fn *timeout)
 
 	softirq_done_fn		*complete;
 
@@ -155,6 +168,10 @@ struct blk_mq_ops {
 	/*
 	 * Called for every command allocated by the block layer to allow
 	 * the driver to set up driver specific data.
+	 *
+	 * Tag greater than or equal to queue_depth is for setting up
+	 * flush request.
+	 *
 	 * Ditto for exit/teardown.
 	 */
 	init_request_fn		*init_request;
@@ -179,7 +196,7 @@ enum {
 	BLK_MQ_F_SHOULD_SORT	= 1 << 1,
 	BLK_MQ_F_TAG_SHARED	= 1 << 2,
 	BLK_MQ_F_SG_MERGE	= 1 << 3,
-	BLK_MQ_F_SYSFS_UP	= 1 << 4,
+	BLK_MQ_F_DEFER_ISSUE	= 1 << 5,
 
 	BLK_MQ_S_STOPPED	= 0,
 	BLK_MQ_S_TAG_ACTIVE	= 1,
@@ -190,6 +207,9 @@ enum {
 };
 
 struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *);
+struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+						  struct request_queue *q);
+void blk_mq_finish_init(struct request_queue *q);
 int blk_mq_register_disk(struct gendisk *);
 void blk_mq_unregister_disk(struct gendisk *);
 
@@ -205,6 +225,7 @@ bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
 struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
 		gfp_t gfp, bool reserved);
 struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+struct cpumask *blk_mq_tags_cpumask(struct blk_mq_tags *tags);
 
 enum {
 	BLK_MQ_UNIQUE_TAG_BITS = 16,
@@ -235,6 +256,7 @@ void blk_mq_requeue_request(struct request *rq);
 void blk_mq_add_to_requeue_list(struct request *rq, bool at_head);
 void blk_mq_cancel_requeue_work(struct request_queue *q);
 void blk_mq_kick_requeue_list(struct request_queue *q);
+void blk_mq_abort_requeue_list(struct request_queue *q);
 void blk_mq_complete_request(struct request *rq);
 
 void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
@@ -245,6 +267,8 @@ void blk_mq_start_stopped_hw_queues(struct request_queue *q, bool async);
 void blk_mq_run_hw_queues(struct request_queue *q, bool async);
 void blk_mq_delay_queue(struct blk_mq_hw_ctx *hctx, unsigned long msecs);
 void blk_mq_tag_busy_iter(struct blk_mq_hw_ctx *hctx, busy_iter_fn *fn,
+		void *priv);
+void blk_mq_all_tag_busy_iter(struct blk_mq_tags *tags, busy_tag_iter_fn *fn,
 		void *priv);
 void blk_mq_freeze_queue(struct request_queue *q);
 void blk_mq_unfreeze_queue(struct request_queue *q);

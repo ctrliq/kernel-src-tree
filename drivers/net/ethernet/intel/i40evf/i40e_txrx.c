@@ -787,7 +787,7 @@ static inline void i40e_rx_checksum(struct i40e_vsi *vsi,
 		return;
 
 	/* did the hardware decode the packet and checksum? */
-	if (!(rx_status & (1 << I40E_RX_DESC_STATUS_L3L4P_SHIFT)))
+	if (!(rx_status & BIT(I40E_RX_DESC_STATUS_L3L4P_SHIFT)))
 		return;
 
 	/* both known and outer_ip must be set for the below code to work */
@@ -802,25 +802,25 @@ static inline void i40e_rx_checksum(struct i40e_vsi *vsi,
 		ipv6 = true;
 
 	if (ipv4 &&
-	    (rx_error & ((1 << I40E_RX_DESC_ERROR_IPE_SHIFT) |
-			 (1 << I40E_RX_DESC_ERROR_EIPE_SHIFT))))
+	    (rx_error & (BIT(I40E_RX_DESC_ERROR_IPE_SHIFT) |
+			 BIT(I40E_RX_DESC_ERROR_EIPE_SHIFT))))
 		goto checksum_fail;
 
 	/* likely incorrect csum if alternate IP extension headers found */
 	if (ipv6 &&
-	    rx_status & (1 << I40E_RX_DESC_STATUS_IPV6EXADD_SHIFT))
+	    rx_status & BIT(I40E_RX_DESC_STATUS_IPV6EXADD_SHIFT))
 		/* don't increment checksum err here, non-fatal err */
 		return;
 
 	/* there was some L4 error, count error and punt packet to the stack */
-	if (rx_error & (1 << I40E_RX_DESC_ERROR_L4E_SHIFT))
+	if (rx_error & BIT(I40E_RX_DESC_ERROR_L4E_SHIFT))
 		goto checksum_fail;
 
 	/* handle packets that were not able to be checksummed due
 	 * to arrival speed, in this case the stack can compute
 	 * the csum.
 	 */
-	if (rx_error & (1 << I40E_RX_DESC_ERROR_PPRS_SHIFT))
+	if (rx_error & BIT(I40E_RX_DESC_ERROR_PPRS_SHIFT))
 		return;
 
 	/* If VXLAN traffic has an outer UDPv4 checksum we need to check
@@ -941,7 +941,7 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 		rx_status = (qword & I40E_RXD_QW1_STATUS_MASK) >>
 			I40E_RXD_QW1_STATUS_SHIFT;
 
-		if (!(rx_status & (1 << I40E_RX_DESC_STATUS_DD_SHIFT)))
+		if (!(rx_status & BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
 			break;
 
 		/* This memory barrier is needed to keep us from reading
@@ -977,8 +977,8 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 
 		rx_error = (qword & I40E_RXD_QW1_ERROR_MASK) >>
 			   I40E_RXD_QW1_ERROR_SHIFT;
-		rx_hbo = rx_error & (1 << I40E_RX_DESC_ERROR_HBO_SHIFT);
-		rx_error &= ~(1 << I40E_RX_DESC_ERROR_HBO_SHIFT);
+		rx_hbo = rx_error & BIT(I40E_RX_DESC_ERROR_HBO_SHIFT);
+		rx_error &= ~BIT(I40E_RX_DESC_ERROR_HBO_SHIFT);
 
 		rx_ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >>
 			   I40E_RXD_QW1_PTYPE_SHIFT;
@@ -1030,7 +1030,7 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 		I40E_RX_INCREMENT(rx_ring, i);
 
 		if (unlikely(
-		    !(rx_status & (1 << I40E_RX_DESC_STATUS_EOF_SHIFT)))) {
+		    !(rx_status & BIT(I40E_RX_DESC_STATUS_EOF_SHIFT)))) {
 			struct i40e_rx_buffer *next_buffer;
 
 			next_buffer = &rx_ring->rx_bi[i];
@@ -1040,7 +1040,7 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 		}
 
 		/* ERR_MASK will only have valid bits if EOP set */
-		if (unlikely(rx_error & (1 << I40E_RX_DESC_ERROR_RXE_SHIFT))) {
+		if (unlikely(rx_error & BIT(I40E_RX_DESC_ERROR_RXE_SHIFT))) {
 			dev_kfree_skb_any(skb);
 			continue;
 		}
@@ -1055,7 +1055,7 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 
 		i40e_rx_checksum(vsi, skb, rx_status, rx_error, rx_ptype);
 
-		vlan_tag = rx_status & (1 << I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
+		vlan_tag = rx_status & BIT(I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
 			 ? le16_to_cpu(rx_desc->wb.qword0.lo_dword.l2tag1)
 			 : 0;
 #ifdef I40E_FCOE
@@ -1067,7 +1067,6 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 		skb_mark_napi_id(skb, &rx_ring->q_vector->napi);
 		i40e_receive_skb(rx_ring, skb, vlan_tag);
 
-		rx_ring->netdev->last_rx = jiffies;
 		rx_desc->wb.qword1.status_error_len = 0;
 
 	} while (likely(total_rx_packets < budget));
@@ -1117,7 +1116,7 @@ static int i40e_clean_rx_irq_1buf(struct i40e_ring *rx_ring, int budget)
 		rx_status = (qword & I40E_RXD_QW1_STATUS_MASK) >>
 			I40E_RXD_QW1_STATUS_SHIFT;
 
-		if (!(rx_status & (1 << I40E_RX_DESC_STATUS_DD_SHIFT)))
+		if (!(rx_status & BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
 			break;
 
 		/* This memory barrier is needed to keep us from reading
@@ -1135,7 +1134,7 @@ static int i40e_clean_rx_irq_1buf(struct i40e_ring *rx_ring, int budget)
 
 		rx_error = (qword & I40E_RXD_QW1_ERROR_MASK) >>
 			   I40E_RXD_QW1_ERROR_SHIFT;
-		rx_error &= ~(1 << I40E_RX_DESC_ERROR_HBO_SHIFT);
+		rx_error &= ~BIT(I40E_RX_DESC_ERROR_HBO_SHIFT);
 
 		rx_ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >>
 			   I40E_RXD_QW1_PTYPE_SHIFT;
@@ -1153,13 +1152,13 @@ static int i40e_clean_rx_irq_1buf(struct i40e_ring *rx_ring, int budget)
 		I40E_RX_INCREMENT(rx_ring, i);
 
 		if (unlikely(
-		    !(rx_status & (1 << I40E_RX_DESC_STATUS_EOF_SHIFT)))) {
+		    !(rx_status & BIT(I40E_RX_DESC_STATUS_EOF_SHIFT)))) {
 			rx_ring->rx_stats.non_eop_descs++;
 			continue;
 		}
 
 		/* ERR_MASK will only have valid bits if EOP set */
-		if (unlikely(rx_error & (1 << I40E_RX_DESC_ERROR_RXE_SHIFT))) {
+		if (unlikely(rx_error & BIT(I40E_RX_DESC_ERROR_RXE_SHIFT))) {
 			dev_kfree_skb_any(skb);
 			/* TODO: shouldn't we increment a counter indicating the
 			 * drop?
@@ -1177,12 +1176,11 @@ static int i40e_clean_rx_irq_1buf(struct i40e_ring *rx_ring, int budget)
 
 		i40e_rx_checksum(vsi, skb, rx_status, rx_error, rx_ptype);
 
-		vlan_tag = rx_status & (1 << I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
+		vlan_tag = rx_status & BIT(I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
 			 ? le16_to_cpu(rx_desc->wb.qword0.lo_dword.l2tag1)
 			 : 0;
 		i40e_receive_skb(rx_ring, skb, vlan_tag);
 
-		rx_ring->netdev->last_rx = jiffies;
 		rx_desc->wb.qword1.status_error_len = 0;
 	} while (likely(total_rx_packets < budget));
 
@@ -1253,8 +1251,7 @@ static inline void i40e_update_enable_itr(struct i40e_vsi *vsi,
 		if (!test_bit(__I40E_DOWN, &vsi->state))
 			wr32(hw, I40E_VFINT_DYN_CTLN1(vector - 1), val);
 	} else {
-		i40evf_irq_enable_queues(vsi->back,
-					 1 << q_vector->v_idx);
+		i40evf_irq_enable_queues(vsi->back, BIT(q_vector->v_idx));
 	}
 }
 
@@ -1355,8 +1352,8 @@ static inline int i40evf_tx_prepare_vlan_flags(struct sk_buff *skb,
 	}
 
 	/* if we have a HW VLAN tag being added, default to the HW one */
-	if (vlan_tx_tag_present(skb)) {
-		tx_flags |= vlan_tx_tag_get(skb) << I40E_TX_FLAGS_VLAN_SHIFT;
+	if (skb_vlan_tag_present(skb)) {
+		tx_flags |= skb_vlan_tag_get(skb) << I40E_TX_FLAGS_VLAN_SHIFT;
 		tx_flags |= I40E_TX_FLAGS_HW_VLAN;
 	/* else if it is a SW VLAN, check the next protocol and store the tag */
 	} else if (protocol == htons(ETH_P_8021Q)) {

@@ -310,6 +310,30 @@ static inline int ktime_compare(const ktime_t cmp1, const ktime_t cmp2)
 	return 0;
 }
 
+/**
+ * ktime_after - Compare if a ktime_t value is bigger than another one.
+ * @cmp1:	comparable1
+ * @cmp2:	comparable2
+ *
+ * Return: true if cmp1 happened after cmp2.
+ */
+static inline bool ktime_after(const ktime_t cmp1, const ktime_t cmp2)
+{
+	return ktime_compare(cmp1, cmp2) > 0;
+}
+
+/**
+ * ktime_before - Compare if a ktime_t value is smaller than another one.
+ * @cmp1:	comparable1
+ * @cmp2:	comparable2
+ *
+ * Return: true if cmp1 happened before cmp2.
+ */
+static inline bool ktime_before(const ktime_t cmp1, const ktime_t cmp2)
+{
+	return ktime_compare(cmp1, cmp2) < 0;
+}
+
 static inline s64 ktime_to_us(const ktime_t kt)
 {
 	struct timeval tv = ktime_to_timeval(kt);
@@ -396,10 +420,39 @@ static inline __must_check bool ktime_to_timespec64_cond(const ktime_t kt,
 #define KTIME_LOW_RES		(ktime_t){ .tv64 = LOW_RES_NSEC }
 
 /* Get the monotonic time in timespec format: */
-extern void ktime_get_ts(struct timespec *ts);
+extern void ktime_get_ts64(struct timespec64 *ts);
+
+#if BITS_PER_LONG == 64
+static inline void ktime_get_ts(struct timespec *ts)
+{
+	ktime_get_ts64(ts);
+}
+
+static inline void ktime_get_real_ts(struct timespec *ts)
+{
+	getnstimeofday64(ts);
+}
+
+#else
+static inline void ktime_get_ts(struct timespec *ts)
+{
+	struct timespec64 ts64;
+
+	ktime_get_ts64(&ts64);
+	*ts = timespec64_to_timespec(ts64);
+}
+
+static inline void ktime_get_real_ts(struct timespec *ts)
+{
+	struct timespec64 ts64;
+
+	getnstimeofday64(&ts64);
+	*ts = timespec64_to_timespec(ts64);
+}
+#endif
 
 /* Get the real (wall-) time in timespec format: */
-#define ktime_get_real_ts(ts)	getnstimeofday(ts)
+#define ktime_get_real_ts64(ts)	getnstimeofday64(ts)
 
 static inline ktime_t ns_to_ktime(u64 ns)
 {

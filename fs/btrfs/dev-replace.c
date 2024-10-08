@@ -547,7 +547,7 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
 	}
 
 	printk_in_rcu(KERN_INFO
-		      "BTRFS: dev_replace from %s (devid %llu) to %s) finished\n",
+		      "BTRFS: dev_replace from %s (devid %llu) to %s finished\n",
 		      src_device->missing ? "<missing disk>" :
 		        rcu_str_deref(src_device->name),
 		      src_device->devid,
@@ -922,9 +922,9 @@ void btrfs_bio_counter_inc_noblocked(struct btrfs_fs_info *fs_info)
 	percpu_counter_inc(&fs_info->bio_counter);
 }
 
-void btrfs_bio_counter_dec(struct btrfs_fs_info *fs_info)
+void btrfs_bio_counter_sub(struct btrfs_fs_info *fs_info, s64 amount)
 {
-	percpu_counter_dec(&fs_info->bio_counter);
+	percpu_counter_sub(&fs_info->bio_counter, amount);
 
 	if (waitqueue_active(&fs_info->replace_wait))
 		wake_up(&fs_info->replace_wait);

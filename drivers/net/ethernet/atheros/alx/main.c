@@ -1593,7 +1593,7 @@ static SIMPLE_DEV_PM_OPS(alx_pm_ops, alx_suspend, alx_resume);
 #define ALX_PM_OPS      NULL
 #endif
 
-static DEFINE_PCI_DEVICE_TABLE(alx_pci_tbl) = {
+static const struct pci_device_id alx_pci_tbl[] = {
 	{ PCI_VDEVICE(ATTANSIC, ALX_DEV_ID_AR8161),
 	  .driver_data = ALX_DEV_QUIRK_MSI_INTX_DISABLE_BUG },
 	{ PCI_VDEVICE(ATTANSIC, ALX_DEV_ID_E2200),

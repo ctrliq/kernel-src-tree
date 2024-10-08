@@ -169,7 +169,7 @@ static void igb_restore_vf_multicasts(struct igb_adapter *adapter);
 static int igb_ndo_set_vf_mac(struct net_device *netdev, int vf, u8 *mac);
 static int igb_ndo_set_vf_vlan(struct net_device *netdev,
 			       int vf, u16 vlan, u8 qos);
-static int igb_ndo_set_vf_bw(struct net_device *netdev, int vf, int tx_rate);
+static int igb_ndo_set_vf_bw(struct net_device *, int, int, int);
 static int igb_ndo_set_vf_spoofchk(struct net_device *netdev, int vf,
 				   bool setting);
 static int igb_ndo_get_vf_config(struct net_device *netdev, int vf,
@@ -2076,7 +2076,7 @@ static const struct net_device_ops igb_netdev_ops = {
 	.ndo_vlan_rx_kill_vid	= igb_vlan_rx_kill_vid,
 	.ndo_set_vf_mac		= igb_ndo_set_vf_mac,
 	.ndo_set_vf_vlan	= igb_ndo_set_vf_vlan,
-	.ndo_set_vf_tx_rate	= igb_ndo_set_vf_bw,
+	.ndo_set_vf_rate	= igb_ndo_set_vf_bw,
 	.ndo_set_vf_spoofchk	= igb_ndo_set_vf_spoofchk,
 	.ndo_get_vf_config	= igb_ndo_get_vf_config,
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -4811,6 +4811,41 @@ static void igb_tx_olinfo_status(struct igb_ring *tx_ring,
 	tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
 }
 
+static int __igb_maybe_stop_tx(struct igb_ring *tx_ring, const u16 size)
+{
+	struct net_device *netdev = tx_ring->netdev;
+
+	netif_stop_subqueue(netdev, tx_ring->queue_index);
+
+	/* Herbert's original patch had:
+	 *  smp_mb__after_netif_stop_queue();
+	 * but since that doesn't exist yet, just open code it.
+	 */
+	smp_mb();
+
+	/* We need to check again in a case another CPU has just
+	 * made room available.
+	 */
+	if (igb_desc_unused(tx_ring) < size)
+		return -EBUSY;
+
+	/* A reprieve! */
+	netif_wake_subqueue(netdev, tx_ring->queue_index);
+
+	u64_stats_update_begin(&tx_ring->tx_syncp2);
+	tx_ring->tx_stats.restart_queue2++;
+	u64_stats_update_end(&tx_ring->tx_syncp2);
+
+	return 0;
+}
+
+static inline int igb_maybe_stop_tx(struct igb_ring *tx_ring, const u16 size)
+{
+	if (igb_desc_unused(tx_ring) >= size)
+		return 0;
+	return __igb_maybe_stop_tx(tx_ring, size);
+}
+
 static void igb_tx_map(struct igb_ring *tx_ring,
 		       struct igb_tx_buffer *first,
 		       const u8 hdr_len)
@@ -4913,13 +4948,17 @@ static void igb_tx_map(struct igb_ring *tx_ring,
 
 	tx_ring->next_to_use = i;
 
-	writel(i, tx_ring->tail);
+	/* Make sure there is space in the ring for the next send. */
+	igb_maybe_stop_tx(tx_ring, DESC_NEEDED);
 
-	/* we need this if more than one processor can write to our tail
-	 * at a time, it synchronizes IO on IA64/Altix systems
-	 */
-	mmiowb();
+	if (netif_xmit_stopped(txring_txq(tx_ring)) || !skb->xmit_more) {
+		writel(i, tx_ring->tail);
 
+		/* we need this if more than one processor can write to our tail
+		 * at a time, it synchronizes IO on IA64/Altix systems
+		 */
+		mmiowb();
+	}
 	return;
 
 dma_error:
@@ -4937,41 +4976,6 @@ dma_error:
 	}
 
 	tx_ring->next_to_use = i;
-}
-
-static int __igb_maybe_stop_tx(struct igb_ring *tx_ring, const u16 size)
-{
-	struct net_device *netdev = tx_ring->netdev;
-
-	netif_stop_subqueue(netdev, tx_ring->queue_index);
-
-	/* Herbert's original patch had:
-	 *  smp_mb__after_netif_stop_queue();
-	 * but since that doesn't exist yet, just open code it.
-	 */
-	smp_mb();
-
-	/* We need to check again in a case another CPU has just
-	 * made room available.
-	 */
-	if (igb_desc_unused(tx_ring) < size)
-		return -EBUSY;
-
-	/* A reprieve! */
-	netif_wake_subqueue(netdev, tx_ring->queue_index);
-
-	u64_stats_update_begin(&tx_ring->tx_syncp2);
-	tx_ring->tx_stats.restart_queue2++;
-	u64_stats_update_end(&tx_ring->tx_syncp2);
-
-	return 0;
-}
-
-static inline int igb_maybe_stop_tx(struct igb_ring *tx_ring, const u16 size)
-{
-	if (igb_desc_unused(tx_ring) >= size)
-		return 0;
-	return __igb_maybe_stop_tx(tx_ring, size);
 }
 
 netdev_tx_t igb_xmit_frame_ring(struct sk_buff *skb,
@@ -5022,9 +5026,9 @@ netdev_tx_t igb_xmit_frame_ring(struct sk_buff *skb,
 
 	skb_tx_timestamp(skb);
 
-	if (vlan_tx_tag_present(skb)) {
+	if (skb_vlan_tag_present(skb)) {
 		tx_flags |= IGB_TX_FLAGS_VLAN;
-		tx_flags |= (vlan_tx_tag_get(skb) << IGB_TX_FLAGS_VLAN_SHIFT);
+		tx_flags |= (skb_vlan_tag_get(skb) << IGB_TX_FLAGS_VLAN_SHIFT);
 	}
 
 	/* record initial flags and protocol */
@@ -5038,9 +5042,6 @@ netdev_tx_t igb_xmit_frame_ring(struct sk_buff *skb,
 		igb_tx_csum(tx_ring, first);
 
 	igb_tx_map(tx_ring, first, hdr_len);
-
-	/* Make sure there is space in the ring for the next send. */
-	igb_maybe_stop_tx(tx_ring, DESC_NEEDED);
 
 	return NETDEV_TX_OK;
 
@@ -5079,12 +5080,8 @@ static netdev_tx_t igb_xmit_frame(struct sk_buff *skb,
 	/* The minimum packet size with TCTL.PSP set is 17 so pad the skb
 	 * in order to meet this minimum size requirement.
 	 */
-	if (unlikely(skb->len < 17)) {
-		if (skb_pad(skb, 17 - skb->len))
-			return NETDEV_TX_OK;
-		skb->len = 17;
-		skb_set_tail_pointer(skb, 17);
-	}
+	if (skb_put_padto(skb, 17))
+		return NETDEV_TX_OK;
 
 	return igb_xmit_frame_ring(skb, igb_tx_queue_mapping(adapter, skb));
 }
@@ -5227,10 +5224,10 @@ void igb_update_stats(struct igb_adapter *adapter,
 		}
 
 		do {
-			start = u64_stats_fetch_begin_bh(&ring->rx_syncp);
+			start = u64_stats_fetch_begin_irq(&ring->rx_syncp);
 			_bytes = ring->rx_stats.bytes;
 			_packets = ring->rx_stats.packets;
-		} while (u64_stats_fetch_retry_bh(&ring->rx_syncp, start));
+		} while (u64_stats_fetch_retry_irq(&ring->rx_syncp, start));
 		bytes += _bytes;
 		packets += _packets;
 	}
@@ -5243,10 +5240,10 @@ void igb_update_stats(struct igb_adapter *adapter,
 	for (i = 0; i < adapter->num_tx_queues; i++) {
 		struct igb_ring *ring = adapter->tx_ring[i];
 		do {
-			start = u64_stats_fetch_begin_bh(&ring->tx_syncp);
+			start = u64_stats_fetch_begin_irq(&ring->tx_syncp);
 			_bytes = ring->tx_stats.bytes;
 			_packets = ring->tx_stats.packets;
-		} while (u64_stats_fetch_retry_bh(&ring->tx_syncp, start));
+		} while (u64_stats_fetch_retry_irq(&ring->tx_syncp, start));
 		bytes += _bytes;
 		packets += _packets;
 	}
@@ -6687,8 +6684,7 @@ static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
 #endif
 
 		/* allocate a skb to store the frags */
-		skb = netdev_alloc_skb_ip_align(rx_ring->netdev,
-						IGB_RX_HDR_LEN);
+		skb = napi_alloc_skb(&rx_ring->q_vector->napi, IGB_RX_HDR_LEN);
 		if (unlikely(!skb)) {
 			rx_ring->rx_stats.alloc_failed++;
 			return NULL;
@@ -6889,14 +6885,9 @@ static bool igb_cleanup_headers(struct igb_ring *rx_ring,
 	if (skb_is_nonlinear(skb))
 		igb_pull_tail(rx_ring, rx_desc, skb);
 
-	/* if skb_pad returns an error the skb was freed */
-	if (unlikely(skb->len < 60)) {
-		int pad_len = 60 - skb->len;
-
-		if (skb_pad(skb, pad_len))
-			return true;
-		__skb_put(skb, pad_len);
-	}
+	/* if eth_skb_pad returns an error the skb was freed */
+	if (eth_skb_pad(skb))
+		return true;
 
 	return false;
 }
@@ -7855,7 +7846,8 @@ static void igb_check_vf_rate_limit(struct igb_adapter *adapter)
 	}
 }
 
-static int igb_ndo_set_vf_bw(struct net_device *netdev, int vf, int tx_rate)
+static int igb_ndo_set_vf_bw(struct net_device *netdev, int vf,
+			     int min_tx_rate, int max_tx_rate)
 {
 	struct igb_adapter *adapter = netdev_priv(netdev);
 	struct e1000_hw *hw = &adapter->hw;
@@ -7864,15 +7856,19 @@ static int igb_ndo_set_vf_bw(struct net_device *netdev, int vf, int tx_rate)
 	if (hw->mac.type != e1000_82576)
 		return -EOPNOTSUPP;
 
+	if (min_tx_rate)
+		return -EINVAL;
+
 	actual_link_speed = igb_link_mbps(adapter->link_speed);
 	if ((vf >= adapter->vfs_allocated_count) ||
 	    (!(rd32(E1000_STATUS) & E1000_STATUS_LU)) ||
-	    (tx_rate < 0) || (tx_rate > actual_link_speed))
+	    (max_tx_rate < 0) ||
+	    (max_tx_rate > actual_link_speed))
 		return -EINVAL;
 
 	adapter->vf_rate_link_speed = actual_link_speed;
-	adapter->vf_data[vf].tx_rate = (u16)tx_rate;
-	igb_set_vf_rate_limit(hw, vf, tx_rate, actual_link_speed);
+	adapter->vf_data[vf].tx_rate = (u16)max_tx_rate;
+	igb_set_vf_rate_limit(hw, vf, max_tx_rate, actual_link_speed);
 
 	return 0;
 }
@@ -7912,7 +7908,8 @@ static int igb_ndo_get_vf_config(struct net_device *netdev,
 		return -EINVAL;
 	ivi->vf = vf;
 	memcpy(&ivi->mac, adapter->vf_data[vf].vf_mac_addresses, ETH_ALEN);
-	ivi->tx_rate = adapter->vf_data[vf].tx_rate;
+	ivi->max_tx_rate = adapter->vf_data[vf].tx_rate;
+	ivi->min_tx_rate = 0;
 	ivi->vlan = adapter->vf_data[vf].pf_vlan;
 	ivi->qos = adapter->vf_data[vf].pf_qos;
 	ivi->spoofchk = adapter->vf_data[vf].spoofchk_enabled;

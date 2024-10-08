@@ -107,22 +107,11 @@ EXPORT_SYMBOL(__smp_mb__after_atomic);
 
 void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
 {
-	unsigned long delta;
-	ktime_t soft, hard, now;
+	if (hrtimer_active(period_timer))
+		return;
 
-	for (;;) {
-		if (hrtimer_active(period_timer))
-			break;
-
-		now = hrtimer_cb_get_time(period_timer);
-		hrtimer_forward(period_timer, now, period);
-
-		soft = hrtimer_get_softexpires(period_timer);
-		hard = hrtimer_get_expires(period_timer);
-		delta = ktime_to_ns(ktime_sub(hard, soft));
-		__hrtimer_start_range_ns(period_timer, soft, delta,
-					 HRTIMER_MODE_ABS_PINNED, 0);
-	}
+	hrtimer_forward_now(period_timer, period);
+	hrtimer_start_expires(period_timer, HRTIMER_MODE_ABS_PINNED);
 }
 
 DEFINE_MUTEX(sched_domains_mutex);
@@ -299,6 +288,9 @@ const_debug unsigned int sysctl_sched_nr_migrate = 32;
  * default: 1s
  */
 const_debug unsigned int sysctl_sched_time_avg = MSEC_PER_SEC;
+
+/* cpus with isolated domains */
+cpumask_var_t cpu_isolated_map;
 
 /*
  * period over which we measure -rt task cpu usage in us.
@@ -486,8 +478,8 @@ static __init void init_hrtick(void)
  */
 void hrtick_start(struct rq *rq, u64 delay)
 {
-	__hrtimer_start_range_ns(&rq->hrtick_timer, ns_to_ktime(delay), 0,
-			HRTIMER_MODE_REL_PINNED, 0);
+	hrtimer_start(&rq->hrtick_timer, ns_to_ktime(delay),
+		      HRTIMER_MODE_REL_PINNED);
 }
 
 static inline void init_hrtick(void)
@@ -523,6 +515,71 @@ static inline void init_hrtick(void)
 #endif	/* CONFIG_SCHED_HRTICK */
 
 /*
+ * cmpxchg based fetch_or, macro so it works for different integer types
+ */
+#define fetch_or(ptr, val)						\
+({	typeof(*(ptr)) __old, __val = *(ptr);				\
+ 	for (;;) {							\
+ 		__old = cmpxchg((ptr), __val, __val | (val));		\
+ 		if (__old == __val)					\
+ 			break;						\
+ 		__val = __old;						\
+ 	}								\
+ 	__old;								\
+})
+
+#if defined(CONFIG_SMP) && defined(TIF_POLLING_NRFLAG)
+/*
+ * Atomically set TIF_NEED_RESCHED and test for TIF_POLLING_NRFLAG,
+ * this avoids any races wrt polling state changes and thereby avoids
+ * spurious IPIs.
+ */
+static bool set_nr_and_not_polling(struct task_struct *p)
+{
+	struct thread_info *ti = task_thread_info(p);
+	return !(fetch_or(&ti->flags, _TIF_NEED_RESCHED) & _TIF_POLLING_NRFLAG);
+}
+
+/*
+ * Atomically set TIF_NEED_RESCHED if TIF_POLLING_NRFLAG is set.
+ *
+ * If this returns true, then the idle task promises to call
+ * sched_ttwu_pending() and reschedule soon.
+ */
+static bool set_nr_if_polling(struct task_struct *p)
+{
+	struct thread_info *ti = task_thread_info(p);
+	typeof(ti->flags) old, val = ACCESS_ONCE(ti->flags);
+
+	for (;;) {
+		if (!(val & _TIF_POLLING_NRFLAG))
+			return false;
+		if (val & _TIF_NEED_RESCHED)
+			return true;
+		old = cmpxchg(&ti->flags, val, val | _TIF_NEED_RESCHED);
+		if (old == val)
+			break;
+		val = old;
+	}
+	return true;
+}
+
+#else
+static bool set_nr_and_not_polling(struct task_struct *p)
+{
+	set_tsk_need_resched(p);
+	return true;
+}
+
+#ifdef CONFIG_SMP
+static bool set_nr_if_polling(struct task_struct *p)
+{
+	return false;
+}
+#endif
+#endif
+
+/*
  * resched_task - mark a task 'to be rescheduled now'.
  *
  * On UP this means the setting of the need_resched flag, on SMP it
@@ -539,15 +596,13 @@ void resched_task(struct task_struct *p)
 	if (test_tsk_need_resched(p))
 		return;
 
-	set_tsk_need_resched(p);
-
 	cpu = task_cpu(p);
-	if (cpu == smp_processor_id())
+	if (cpu == smp_processor_id()) {
+		set_tsk_need_resched(p);
 		return;
+	}
 
-	/* NEED_RESCHED must be visible before we test polling */
-	smp_mb();
-	if (!tsk_is_polling(p))
+	if (set_nr_and_not_polling(p))
 		smp_send_reschedule(cpu);
 	else
 		trace_sched_wake_idle_without_ipi(cpu);
@@ -683,6 +738,23 @@ static inline bool got_nohz_idle_kick(void)
 bool sched_can_stop_tick(void)
 {
        struct rq *rq;
+
+	/*
+	 * FIFO realtime policy runs the highest priority task. Other runnable
+	 * tasks are of a lower priority. The scheduler tick does nothing.
+	 */
+	if (current->policy == SCHED_FIFO)
+		return true;
+
+	/*
+	 * Round-robin realtime tasks time slice with other tasks at the same
+	 * realtime priority. Is this task the only one at this priority?
+	 */
+	if (current->policy == SCHED_RR) {
+		struct sched_rt_entity *rt_se = &current->rt;
+
+		return rt_se->run_list.prev == rt_se->run_list.next;
+	}
 
        rq = this_rq();
 
@@ -998,13 +1070,6 @@ void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
 		rq->skip_clock_update = 1;
 }
 
-static ATOMIC_NOTIFIER_HEAD(task_migration_notifier);
-
-void register_task_migration_notifier(struct notifier_block *n)
-{
-	atomic_notifier_chain_register(&task_migration_notifier, n);
-}
-
 #ifdef CONFIG_SMP
 void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 {
@@ -1035,18 +1100,10 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 	trace_sched_migrate_task(p, new_cpu);
 
 	if (task_cpu(p) != new_cpu) {
-		struct task_migration_notifier tmn;
-
 		if (p->sched_class->migrate_task_rq)
 			p->sched_class->migrate_task_rq(p, new_cpu);
 		p->se.nr_migrations++;
-		perf_sw_event(PERF_COUNT_SW_CPU_MIGRATIONS, 1, NULL, 0);
-
-		tmn.task = p;
-		tmn.from_cpu = task_cpu(p);
-		tmn.to_cpu = new_cpu;
-
-		atomic_notifier_call_chain(&task_migration_notifier, 0, &tmn);
+		perf_sw_event_sched(PERF_COUNT_SW_CPU_MIGRATIONS, 1, 0);
 	}
 
 	__set_task_cpu(p, new_cpu);
@@ -1513,13 +1570,17 @@ static int ttwu_remote(struct task_struct *p, int wake_flags)
 }
 
 #ifdef CONFIG_SMP
-static void sched_ttwu_pending(void)
+void sched_ttwu_pending(void)
 {
 	struct rq *rq = this_rq();
 	struct llist_node *llist = llist_del_all(&rq->wake_list);
 	struct task_struct *p;
+	unsigned long flags;
 
-	raw_spin_lock(&rq->lock);
+	if (!llist)
+		return;
+
+	raw_spin_lock_irqsave(&rq->lock, flags);
 
 	while (llist) {
 		p = llist_entry(llist, struct task_struct, wake_entry);
@@ -1527,7 +1588,7 @@ static void sched_ttwu_pending(void)
 		ttwu_do_activate(rq, p, 0);
 	}
 
-	raw_spin_unlock(&rq->lock);
+	raw_spin_unlock_irqrestore(&rq->lock, flags);
 }
 
 void scheduler_ipi(void)
@@ -1566,8 +1627,14 @@ void scheduler_ipi(void)
 
 static void ttwu_queue_remote(struct task_struct *p, int cpu)
 {
-	if (llist_add(&p->wake_entry, &cpu_rq(cpu)->wake_list))
-		smp_send_reschedule(cpu);
+	struct rq *rq = cpu_rq(cpu);
+
+	if (llist_add(&p->wake_entry, &cpu_rq(cpu)->wake_list)) {
+		if (!set_nr_if_polling(rq->idle))
+			smp_send_reschedule(cpu);
+		else
+			trace_sched_wake_idle_without_ipi(cpu);
+	}
 }
 
 bool cpus_share_cache(int this_cpu, int that_cpu)
@@ -2855,53 +2922,16 @@ EXPORT_PER_CPU_SYMBOL(kstat);
 EXPORT_PER_CPU_SYMBOL(kernel_cpustat);
 
 /*
- * Return any ns on the sched_clock that have not yet been accounted in
- * @p in case that task is currently running.
- *
- * Called with task_rq_lock() held on @rq.
- */
-static u64 do_task_delta_exec(struct task_struct *p, struct rq *rq)
-{
-	u64 ns = 0;
-
-	/*
-	 * Must be ->curr _and_ ->on_rq.  If dequeued, we would
-	 * project cycles that may never be accounted to this
-	 * thread, breaking clock_gettime().
-	 */
-	if (task_current(rq, p) && p->on_rq) {
-		update_rq_clock(rq);
-		ns = rq_clock_task(rq) - p->se.exec_start;
-		if ((s64)ns < 0)
-			ns = 0;
-	}
-
-	return ns;
-}
-
-unsigned long long task_delta_exec(struct task_struct *p)
-{
-	unsigned long flags;
-	struct rq *rq;
-	u64 ns = 0;
-
-	rq = task_rq_lock(p, &flags);
-	ns = do_task_delta_exec(p, rq);
-	task_rq_unlock(rq, p, &flags);
-
-	return ns;
-}
-
-/*
  * Return accounted runtime for the task.
  * In case the task is currently running, return the runtime plus current's
  * pending runtime that have not been accounted yet.
  */
+
 unsigned long long task_sched_runtime(struct task_struct *p)
 {
 	unsigned long flags;
 	struct rq *rq;
-	u64 ns = 0;
+	u64 ns;
 
 #if defined(CONFIG_64BIT) && defined(CONFIG_SMP)
 	/*
@@ -2918,9 +2948,17 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 	if (!p->on_cpu || !p->on_rq)
 		return p->se.sum_exec_runtime;
 #endif
-
 	rq = task_rq_lock(p, &flags);
-	ns = p->se.sum_exec_runtime + do_task_delta_exec(p, rq);
+	/*
+	 * Must be ->curr _and_ ->on_rq.  If dequeued, we would
+	 * project cycles that may never be accounted to this
+	 * thread, breaking clock_gettime().
+	 */
+	if (task_current(rq, p) && p->on_rq) {
+		update_rq_clock(rq);
+		p->sched_class->update_curr(rq);
+	}
+	ns = p->se.sum_exec_runtime;
 	task_rq_unlock(rq, p, &flags);
 
 	return ns;
@@ -3272,7 +3310,7 @@ asmlinkage void __sched schedule_user(void)
 	 * we find a better solution.
 	 *
 	 * NB: There are buggy callers of this function.  Ideally we
-	 * should warn if prev_state != IN_USER, but that will trigger
+	 * should warn if prev_state != CONTEXT_USER, but that will trigger
 	 * too frequently to make sense yet.
 	 */
 	enum ctx_state prev_state = exception_enter();
@@ -4749,6 +4787,12 @@ EXPORT_SYMBOL_GPL(yield_to);
  * This task is about to go to sleep on IO. Increment rq->nr_iowait so
  * that process accounting knows that this is a task in IO wait state.
  */
+void __sched io_schedule(void)
+{
+	io_schedule_timeout(MAX_SCHEDULE_TIMEOUT);
+}
+EXPORT_SYMBOL(io_schedule);
+
 long __sched io_schedule_timeout(long timeout)
 {
 	int old_iowait = current->in_iowait;
@@ -6004,9 +6048,6 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
 
 	update_top_cache_domain(cpu);
 }
-
-/* cpus with isolated domains */
-static cpumask_var_t cpu_isolated_map;
 
 /* Setup the mask of cpus configured for isolated domains */
 static int __init isolated_cpu_setup(char *str)

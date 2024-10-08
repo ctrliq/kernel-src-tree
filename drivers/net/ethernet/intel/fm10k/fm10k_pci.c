@@ -19,6 +19,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/interrupt.h>
 #include <linux/aer.h>
 
 #include "fm10k.h"
@@ -646,7 +647,7 @@ static void fm10k_configure_rx_ring(struct fm10k_intfc *interface,
 	/* Configure the Rx buffer size for one buff without split */
 	srrctl |= FM10K_RX_BUFSZ >> FM10K_SRRCTL_BSIZEPKT_SHIFT;
 
-	/* Configure the Rx ring to supress loopback packets */
+	/* Configure the Rx ring to suppress loopback packets */
 	srrctl |= FM10K_SRRCTL_LOOPBACK_SUPPRESS;
 	fm10k_write_reg(hw, FM10K_SRRCTL(reg_idx), srrctl);
 
@@ -838,6 +839,28 @@ static irqreturn_t fm10k_msix_mbx_vf(int __always_unused irq, void *data)
 	return IRQ_HANDLED;
 }
 
+#ifdef CONFIG_NET_POLL_CONTROLLER
+/**
+ *  fm10k_netpoll - A Polling 'interrupt' handler
+ *  @netdev: network interface device structure
+ *
+ *  This is used by netconsole to send skbs without having to re-enable
+ *  interrupts. It's not called while the normal interrupt routine is executing.
+ **/
+void fm10k_netpoll(struct net_device *netdev)
+{
+	struct fm10k_intfc *interface = netdev_priv(netdev);
+	int i;
+
+	/* if interface is down do nothing */
+	if (test_bit(__FM10K_DOWN, &interface->state))
+		return;
+
+	for (i = 0; i < interface->num_q_vectors; i++)
+		fm10k_msix_clean_rings(0, interface->q_vector[i]);
+}
+
+#endif
 #define FM10K_ERR_MSG(type) case (type): error = #type; break
 static void fm10k_print_fault(struct fm10k_intfc *interface, int type,
 			      struct fm10k_fault *fault)

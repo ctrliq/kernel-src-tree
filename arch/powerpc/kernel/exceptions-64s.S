@@ -15,6 +15,7 @@
 #include <asm/hw_irq.h>
 #include <asm/exception-64s.h>
 #include <asm/ptrace.h>
+#include <asm/cpuidle.h>
 
 /*
  * We layout physical memory as follows:
@@ -101,23 +102,34 @@ system_reset_pSeries:
 #ifdef CONFIG_PPC_P7_NAP
 BEGIN_FTR_SECTION
 	/* Running native on arch 2.06 or later, check if we are
-	 * waking up from nap. We only handle no state loss and
-	 * supervisor state loss. We do -not- handle hypervisor
-	 * state loss at this time.
+	 * waking up from nap/sleep/winkle.
 	 */
 	mfspr	r13,SPRN_SRR1
 	rlwinm.	r13,r13,47-31,30,31
 	beq	9f
 
-	/* waking up from powersave (nap) state */
-	cmpwi	cr1,r13,2
-	/* Total loss of HV state is fatal, we could try to use the
-	 * PIR to locate a PACA, then use an emergency stack etc...
-	 * OPAL v3 based powernv platforms have new idle states
-	 * which fall in this catagory.
+	cmpwi	cr3,r13,2
+
+	/*
+	 * Check if last bit of HSPGR0 is set. This indicates whether we are
+	 * waking up from winkle.
 	 */
-	bgt	cr1,8f
 	GET_PACA(r13)
+	clrldi	r5,r13,63
+	clrrdi	r13,r13,1
+	cmpwi	cr4,r5,1
+	mtspr	SPRN_HSPRG0,r13
+
+	lbz	r0,PACA_THREAD_IDLE_STATE(r13)
+	cmpwi   cr2,r0,PNV_THREAD_NAP
+	bgt     cr2,8f				/* Either sleep or Winkle */
+
+	/* Waking up from nap should not cause hypervisor state loss */
+	bgt	cr3,.
+
+	/* Waking up from nap */
+	li	r0,PNV_THREAD_RUNNING
+	stb	r0,PACA_THREAD_IDLE_STATE(r13)	/* Clear thread state */
 
 #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
 	li	r0,KVM_HWTHREAD_IN_KERNEL
@@ -133,7 +145,7 @@ BEGIN_FTR_SECTION
 
 	/* Return SRR1 from power7_nap() */
 	mfspr	r3,SPRN_SRR1
-	beq	cr1,2f
+	beq	cr3,2f
 	b	power7_wakeup_noloss
 2:	b	power7_wakeup_loss
 
@@ -341,7 +353,7 @@ emulation_assist_trampoline:
 hv_exception_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
-	b	hmi_exception_hv
+	b	hmi_exception_early
 
 	. = 0xe80
 hv_doorbell_trampoline:
@@ -623,8 +635,59 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe22)
 	STD_EXCEPTION_HV_OOL(0xe42, emulation_assist)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe42)
-	STD_EXCEPTION_HV_OOL(0xe62, hmi_exception) /* need to flush cache ? */
+	MASKABLE_EXCEPTION_HV_OOL(0xe62, hmi_exception)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe62)
+
+	.globl hmi_exception_early
+hmi_exception_early:
+	EXCEPTION_PROLOG_1(PACA_EXGEN, NOTEST, 0xe60)
+	mr	r10,r1			/* Save r1			*/
+	ld	r1,PACAEMERGSP(r13)	/* Use emergency stack		*/
+	subi	r1,r1,INT_FRAME_SIZE	/* alloc stack frame		*/
+	std	r9,_CCR(r1)		/* save CR in stackframe	*/
+	mfspr	r11,SPRN_HSRR0		/* Save HSRR0 */
+	std	r11,_NIP(r1)		/* save HSRR0 in stackframe	*/
+	mfspr	r12,SPRN_HSRR1		/* Save SRR1 */
+	std	r12,_MSR(r1)		/* save SRR1 in stackframe	*/
+	std	r10,0(r1)		/* make stack chain pointer	*/
+	std	r0,GPR0(r1)		/* save r0 in stackframe	*/
+	std	r10,GPR1(r1)		/* save r1 in stackframe	*/
+	EXCEPTION_PROLOG_COMMON_2(PACA_EXGEN)
+	EXCEPTION_PROLOG_COMMON_3(0xe60)
+	addi	r3,r1,STACK_FRAME_OVERHEAD
+	bl	hmi_exception_realmode
+	/* Windup the stack. */
+	/* Move original HSRR0 and HSRR1 into the respective regs */
+	ld	r9,_MSR(r1)
+	mtspr	SPRN_HSRR1,r9
+	ld	r3,_NIP(r1)
+	mtspr	SPRN_HSRR0,r3
+	ld	r9,_CTR(r1)
+	mtctr	r9
+	ld	r9,_XER(r1)
+	mtxer	r9
+	ld	r9,_LINK(r1)
+	mtlr	r9
+	REST_GPR(0, r1)
+	REST_8GPRS(2, r1)
+	REST_GPR(10, r1)
+	ld	r11,_CCR(r1)
+	mtcr	r11
+	REST_GPR(11, r1)
+	REST_2GPRS(12, r1)
+	/* restore original r1. */
+	ld	r1,GPR1(r1)
+
+	/*
+	 * Go to virtual mode and pull the HMI event information from
+	 * firmware.
+	 */
+	.globl hmi_exception_after_realmode
+hmi_exception_after_realmode:
+	SET_SCRATCH0(r13)
+	EXCEPTION_PROLOG_0(PACA_EXGEN)
+	b	hmi_exception_hv
+
 	MASKABLE_EXCEPTION_HV_OOL(0xe82, h_doorbell)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe82)
 
@@ -645,6 +708,8 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
  * - If it was a decrementer interrupt, we bump the dec to max and and return.
  * - If it was a doorbell we return immediately since doorbells are edge
  *   triggered and won't automatically refire.
+ * - If it was a HMI we return immediately since we handled it in realmode
+ *   and it won't refire.
  * - else we hard disable and return.
  * This is called with r10 containing the value to OR to the paca field.
  */
@@ -661,6 +726,8 @@ masked_##_H##interrupt:					\
 	mtspr	SPRN_DEC,r10;				\
 	b	2f;					\
 1:	cmpwi	r10,PACA_IRQ_DBELL;			\
+	beq	2f;					\
+	cmpwi	r10,PACA_IRQ_HMI;			\
 	beq	2f;					\
 	mfspr	r10,SPRN_##_H##SRR1;			\
 	rldicl	r10,r10,48,1; /* clear MSR_EE */	\
@@ -801,7 +868,7 @@ kvmppc_skip_Hinterrupt:
 	STD_EXCEPTION_COMMON(0xd00, single_step, single_step_exception)
 	STD_EXCEPTION_COMMON(0xe00, trap_0e, unknown_exception)
 	STD_EXCEPTION_COMMON(0xe40, emulation_assist, emulation_assist_interrupt)
-	STD_EXCEPTION_COMMON(0xe60, hmi_exception, unknown_exception)
+	STD_EXCEPTION_COMMON_ASYNC(0xe60, hmi_exception, handle_hmi_exception)
 #ifdef CONFIG_PPC_DOORBELL
 	STD_EXCEPTION_COMMON_ASYNC(0xe80, h_doorbell, doorbell_exception)
 #else
@@ -1431,6 +1498,7 @@ machine_check_handle_early:
 	MACHINE_CHECK_HANDLER_WINDUP
 	GET_PACA(r13)
 	ld	r1,PACAR1(r13)
+	li	r3,PNV_THREAD_NAP
 	b	power7_enter_nap_mode
 4:
 #endif
@@ -1622,9 +1690,11 @@ END_MMU_FTR_SECTION_IFCLR(MMU_FTR_SLB)
 	 * r3 contains the faulting address
 	 * r4 contains the required access permissions
 	 * r5 contains the trap number
+	 * r6 contains dsisr
 	 *
 	 * at return r3 = 0 for success, 1 for page fault, negative for error
 	 */
+	ld      r6,_DSISR(r1)
 	bl	hash_page		/* build HPTE if possible */
 	cmpdi	r3,0			/* see if hash_page succeeded */
 

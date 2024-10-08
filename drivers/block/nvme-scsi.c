@@ -331,7 +331,7 @@ INQUIRY_EVPD_BIT_MASK) ? 1 : 0)
 (GET_U32_FROM_CDB(cdb, READ_CAP_16_CDB_ALLOC_LENGTH_OFFSET))
 
 #define IS_READ_CAP_16(cdb)					\
-((cdb[0] == SERVICE_ACTION_IN && cdb[1] == SAI_READ_CAPACITY_16) ? 1 : 0)
+((cdb[0] == SERVICE_ACTION_IN_16 && cdb[1] == SAI_READ_CAPACITY_16) ? 1 : 0)
 
 /* Request Sense Helper Macros */
 #define GET_REQUEST_SENSE_ALLOC_LENGTH(cdb)			\
@@ -2139,7 +2139,7 @@ static int nvme_trans_do_nvme_io(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 
 		nvme_offset += unit_num_blocks;
 
-		nvme_sc = nvme_submit_io_cmd(dev, &c, NULL);
+		nvme_sc = nvme_submit_io_cmd(dev, ns, &c, NULL);
 		if (nvme_sc != NVME_SC_SUCCESS) {
 			nvme_unmap_user_pages(dev,
 				(is_write) ? DMA_TO_DEVICE : DMA_FROM_DEVICE,
@@ -2696,7 +2696,7 @@ static int nvme_trans_start_stop(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 			c.common.opcode = nvme_cmd_flush;
 			c.common.nsid = cpu_to_le32(ns->ns_id);
 
-			nvme_sc = nvme_submit_io_cmd(ns->dev, &c, NULL);
+			nvme_sc = nvme_submit_io_cmd(ns->dev, ns, &c, NULL);
 			res = nvme_trans_status_code(hdr, nvme_sc);
 			if (res)
 				goto out;
@@ -2724,7 +2724,7 @@ static int nvme_trans_synchronize_cache(struct nvme_ns *ns,
 	c.common.opcode = nvme_cmd_flush;
 	c.common.nsid = cpu_to_le32(ns->ns_id);
 
-	nvme_sc = nvme_submit_io_cmd(ns->dev, &c, NULL);
+	nvme_sc = nvme_submit_io_cmd(ns->dev, ns, &c, NULL);
 
 	res = nvme_trans_status_code(hdr, nvme_sc);
 	if (res)
@@ -2932,7 +2932,7 @@ static int nvme_trans_unmap(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 	c.dsm.nr = cpu_to_le32(ndesc - 1);
 	c.dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
 
-	nvme_sc = nvme_submit_io_cmd(dev, &c, NULL);
+	nvme_sc = nvme_submit_io_cmd(dev, ns, &c, NULL);
 	res = nvme_trans_status_code(hdr, nvme_sc);
 
 	dma_free_coherent(&dev->pci_dev->dev, ndesc * sizeof(*range),
@@ -2993,7 +2993,7 @@ static int nvme_scsi_translate(struct nvme_ns *ns, struct sg_io_hdr *hdr)
 	case READ_CAPACITY:
 		retcode = nvme_trans_read_capacity(ns, hdr, cmd);
 		break;
-	case SERVICE_ACTION_IN:
+	case SERVICE_ACTION_IN_16:
 		if (IS_READ_CAP_16(cmd))
 			retcode = nvme_trans_read_capacity(ns, hdr, cmd);
 		else

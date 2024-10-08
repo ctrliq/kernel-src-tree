@@ -349,7 +349,8 @@ DEFINE_BUF_EVENT(xfs_buf_free);
 DEFINE_BUF_EVENT(xfs_buf_hold);
 DEFINE_BUF_EVENT(xfs_buf_rele);
 DEFINE_BUF_EVENT(xfs_buf_iodone);
-DEFINE_BUF_EVENT(xfs_buf_iorequest);
+DEFINE_BUF_EVENT(xfs_buf_submit);
+DEFINE_BUF_EVENT(xfs_buf_submit_wait);
 DEFINE_BUF_EVENT(xfs_buf_bawrite);
 DEFINE_BUF_EVENT(xfs_buf_lock);
 DEFINE_BUF_EVENT(xfs_buf_lock_done);
@@ -538,6 +539,64 @@ DEFINE_BUF_ITEM_EVENT(xfs_trans_bhold_release);
 DEFINE_BUF_ITEM_EVENT(xfs_trans_binval);
 DEFINE_BUF_ITEM_EVENT(xfs_trans_buf_ordered);
 
+DECLARE_EVENT_CLASS(xfs_filestream_class,
+	TP_PROTO(struct xfs_inode *ip, xfs_agnumber_t agno),
+	TP_ARGS(ip, agno),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_ino_t, ino)
+		__field(xfs_agnumber_t, agno)
+		__field(int, streams)
+	),
+	TP_fast_assign(
+		__entry->dev = VFS_I(ip)->i_sb->s_dev;
+		__entry->ino = ip->i_ino;
+		__entry->agno = agno;
+		__entry->streams = xfs_filestream_peek_ag(ip->i_mount, agno);
+	),
+	TP_printk("dev %d:%d ino 0x%llx agno %u streams %d",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino,
+		  __entry->agno,
+		  __entry->streams)
+)
+#define DEFINE_FILESTREAM_EVENT(name) \
+DEFINE_EVENT(xfs_filestream_class, name, \
+	TP_PROTO(struct xfs_inode *ip, xfs_agnumber_t agno), \
+	TP_ARGS(ip, agno))
+DEFINE_FILESTREAM_EVENT(xfs_filestream_free);
+DEFINE_FILESTREAM_EVENT(xfs_filestream_lookup);
+DEFINE_FILESTREAM_EVENT(xfs_filestream_scan);
+
+TRACE_EVENT(xfs_filestream_pick,
+	TP_PROTO(struct xfs_inode *ip, xfs_agnumber_t agno,
+		 xfs_extlen_t free, int nscan),
+	TP_ARGS(ip, agno, free, nscan),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_ino_t, ino)
+		__field(xfs_agnumber_t, agno)
+		__field(int, streams)
+		__field(xfs_extlen_t, free)
+		__field(int, nscan)
+	),
+	TP_fast_assign(
+		__entry->dev = VFS_I(ip)->i_sb->s_dev;
+		__entry->ino = ip->i_ino;
+		__entry->agno = agno;
+		__entry->streams = xfs_filestream_peek_ag(ip->i_mount, agno);
+		__entry->free = free;
+		__entry->nscan = nscan;
+	),
+	TP_printk("dev %d:%d ino 0x%llx agno %u streams %d free %d nscan %d",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino,
+		  __entry->agno,
+		  __entry->streams,
+		  __entry->free,
+		  __entry->nscan)
+);
+
 DECLARE_EVENT_CLASS(xfs_lock_class,
 	TP_PROTO(struct xfs_inode *ip, unsigned lock_flags,
 		 unsigned long caller_ip),
@@ -604,6 +663,7 @@ DEFINE_INODE_EVENT(xfs_inactive_symlink);
 DEFINE_INODE_EVENT(xfs_alloc_file_space);
 DEFINE_INODE_EVENT(xfs_free_file_space);
 DEFINE_INODE_EVENT(xfs_zero_file_space);
+DEFINE_INODE_EVENT(xfs_collapse_file_space);
 DEFINE_INODE_EVENT(xfs_readdir);
 #ifdef CONFIG_XFS_POSIX_ACL
 DEFINE_INODE_EVENT(xfs_get_acl);
@@ -624,6 +684,9 @@ DEFINE_INODE_EVENT(xfs_dquot_dqdetach);
 DEFINE_INODE_EVENT(xfs_inode_set_eofblocks_tag);
 DEFINE_INODE_EVENT(xfs_inode_clear_eofblocks_tag);
 DEFINE_INODE_EVENT(xfs_inode_free_eofblocks_invalid);
+
+DEFINE_INODE_EVENT(xfs_filemap_fault);
+DEFINE_INODE_EVENT(xfs_filemap_page_mkwrite);
 
 DECLARE_EVENT_CLASS(xfs_iref_class,
 	TP_PROTO(struct xfs_inode *ip, unsigned long caller_ip),

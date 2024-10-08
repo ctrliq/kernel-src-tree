@@ -155,15 +155,6 @@ struct net_bridge_port
 	struct rcu_head			rcu;
 
 	unsigned long 			flags;
-#define BR_HAIRPIN_MODE		0x00000001
-#define BR_BPDU_GUARD           0x00000002
-#define BR_ROOT_BLOCK		0x00000004
-#define BR_MULTICAST_FAST_LEAVE	0x00000008
-#define BR_ADMIN_COST		0x00000010
-#define BR_LEARNING		0x00000020
-#define BR_FLOOD		0x00000040
-#define BR_AUTO_MASK (BR_FLOOD | BR_LEARNING)
-#define BR_PROMISC		0x00000080
 
 #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
 	struct bridge_mcast_query	ip4_query;
@@ -204,21 +195,13 @@ static inline struct net_bridge_port *br_port_get_rtnl(const struct net_device *
 		rtnl_dereference(dev->rx_handler_data) : NULL;
 }
 
-struct br_cpu_netstats {
-	u64			rx_packets;
-	u64			rx_bytes;
-	u64			tx_packets;
-	u64			tx_bytes;
-	struct u64_stats_sync	syncp;
-};
-
 struct net_bridge
 {
 	spinlock_t			lock;
 	struct list_head		port_list;
 	struct net_device		*dev;
 
-	struct br_cpu_netstats __percpu *stats;
+	RH_KABI_REPLACE(struct br_cpu_netstats __percpu *stats, struct pcpu_sw_netstats		__percpu *stats)
 	spinlock_t			hash_lock;
 	struct hlist_head		hash[BR_HASH_SIZE];
 #ifdef CONFIG_BRIDGE_NETFILTER
@@ -412,10 +395,10 @@ void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p);
 
 /* br_forward.c */
 void br_deliver(const struct net_bridge_port *to, struct sk_buff *skb);
-int br_dev_queue_push_xmit(struct sk_buff *skb);
+int br_dev_queue_push_xmit(struct sock *sk, struct sk_buff *skb);
 void br_forward(const struct net_bridge_port *to,
 		struct sk_buff *skb, struct sk_buff *skb0);
-int br_forward_finish(struct sk_buff *skb);
+int br_forward_finish(struct sock *sk, struct sk_buff *skb);
 void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb, bool unicast);
 void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
 		      struct sk_buff *skb2, bool unicast);
@@ -434,7 +417,7 @@ void br_port_flags_change(struct net_bridge_port *port, unsigned long mask);
 void br_manage_promisc(struct net_bridge *br);
 
 /* br_input.c */
-int br_handle_frame_finish(struct sk_buff *skb);
+int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb);
 rx_handler_result_t br_handle_frame(struct sk_buff **pskb);
 
 static inline bool br_rx_handler_check_rcu(const struct net_device *dev)
@@ -634,8 +617,8 @@ static inline int br_vlan_get_tag(const struct sk_buff *skb, u16 *vid)
 {
 	int err = 0;
 
-	if (vlan_tx_tag_present(skb))
-		*vid = vlan_tx_tag_get(skb) & VLAN_VID_MASK;
+	if (skb_vlan_tag_present(skb))
+		*vid = skb_vlan_tag_get(skb) & VLAN_VID_MASK;
 	else {
 		*vid = 0;
 		err = -EINVAL;

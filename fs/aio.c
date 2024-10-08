@@ -135,7 +135,7 @@ static struct kmem_cache	*kioctx_cachep;
 
 static struct vfsmount *aio_mnt;
 
-static const struct file_operations aio_ring_fops;
+static const struct file_operations_extend aio_ring_fops;
 static const struct address_space_operations aio_ctx_aops;
 
 static void user_update_reqs_active(struct kioctx *ctx);
@@ -172,7 +172,7 @@ static struct file *aio_private_file(struct kioctx *ctx, loff_t nr_pages)
 	path.mnt = mntget(aio_mnt);
 
 	d_instantiate(path.dentry, inode);
-	file = alloc_file(&path, FMODE_READ | FMODE_WRITE, &aio_ring_fops);
+	file = alloc_file(&path, FMODE_READ | FMODE_WRITE, &aio_ring_fops.kabi_fops);
 	if (IS_ERR(file)) {
 		path_put(&path);
 		return file;
@@ -261,7 +261,7 @@ static void aio_free_ring(struct kioctx *ctx)
 
 static int aio_ring_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	vma->vm_flags |= VM_DONTEXPAND;
+	vma->vm_flags |= (VM_DONTEXPAND | VM_FOP_EXTEND);
 	vma->vm_ops = &generic_file_vm_ops;
 	return 0;
 }
@@ -269,28 +269,26 @@ static int aio_ring_mmap(struct file *file, struct vm_area_struct *vma)
 static void aio_ring_remap(struct file *file, struct vm_area_struct *vma)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	struct kioctx_table *table;
-	int i;
+	struct kioctx *ctx;
 
 	spin_lock(&mm->ioctx_lock);
 	rcu_read_lock();
-	table = rcu_dereference(mm->ioctx_table);
-	for (i = 0; i < table->nr; i++) {
-		struct kioctx *ctx;
-
-		ctx = table->table[i];
-		if (ctx && ctx->aio_ring_file == file) {
-			ctx->user_id = ctx->mmap_base = vma->vm_start;
+	hlist_for_each_entry_rcu(ctx, &mm->ioctx_list, list) {
+		if (ctx->aio_ring_file == file) {
+			struct aio_ring *ring = kmap_atomic(ctx->ring_pages[0]);
+			ring->id = ctx->user_id = ctx->mmap_base = vma->vm_start;
+			kunmap_atomic(ring);
 			break;
 		}
 	}
-
 	rcu_read_unlock();
 	spin_unlock(&mm->ioctx_lock);
 }
 
-static const struct file_operations aio_ring_fops = {
-	.mmap = aio_ring_mmap,
+static const struct file_operations_extend aio_ring_fops = {
+	.kabi_fops = {
+		.mmap = aio_ring_mmap,
+	},
 	.mremap = aio_ring_remap,
 };
 
@@ -656,6 +654,9 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 
 out_cleanup:
 	err = -EAGAIN;
+	atomic_set(&ctx->dead, 1);
+	if (ctx->mmap_size)
+		vm_munmap(ctx->mmap_base, ctx->mmap_size);
 	aio_free_ring(ctx);
 out_freectx:
 	mutex_unlock(&ctx->ring_lock);

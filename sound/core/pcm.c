@@ -669,6 +669,8 @@ static inline int snd_pcm_substream_proc_init(struct snd_pcm_substream *substrea
 static inline int snd_pcm_substream_proc_done(struct snd_pcm_substream *substream) { return 0; }
 #endif /* CONFIG_SND_VERBOSE_PROCFS */
 
+static const struct attribute_group *pcm_dev_attr_groups[];
+
 /**
  * snd_pcm_new_stream - create a new PCM stream
  * @pcm: the pcm instance
@@ -694,7 +696,15 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 	pstr->stream = stream;
 	pstr->pcm = pcm;
 	pstr->substream_count = substream_count;
-	if (substream_count > 0 && !pcm->internal) {
+	if (!substream_count)
+		return 0;
+
+	snd_device_initialize(&pstr->dev, pcm->card);
+	pstr->dev.groups = pcm_dev_attr_groups;
+	dev_set_name(&pstr->dev, "pcmC%iD%i%c", pcm->card->number, pcm->device,
+		     stream == SNDRV_PCM_STREAM_PLAYBACK ? 'p' : 'c');
+
+	if (!pcm->internal) {
 		err = snd_pcm_stream_proc_init(pstr);
 		if (err < 0) {
 			pcm_err(pcm, "Error in snd_pcm_stream_proc_init\n");
@@ -861,6 +871,8 @@ static void snd_pcm_free_stream(struct snd_pcm_str * pstr)
 		kfree(setup);
 	}
 #endif
+	if (pstr->substream_count)
+		put_device(&pstr->dev);
 }
 
 static int snd_pcm_free(struct snd_pcm *pcm)
@@ -1052,9 +1064,7 @@ static int snd_pcm_dev_register(struct snd_device *device)
 	int cidx, err;
 	struct snd_pcm_substream *substream;
 	struct snd_pcm_notify *notify;
-	char str[16];
 	struct snd_pcm *pcm;
-	struct device *dev;
 
 	if (snd_BUG_ON(!device || !device->device_data))
 		return -ENXIO;
@@ -1072,39 +1082,19 @@ static int snd_pcm_dev_register(struct snd_device *device)
 			continue;
 		switch (cidx) {
 		case SNDRV_PCM_STREAM_PLAYBACK:
-			sprintf(str, "pcmC%iD%ip", pcm->card->number, pcm->device);
 			devtype = SNDRV_DEVICE_TYPE_PCM_PLAYBACK;
 			break;
 		case SNDRV_PCM_STREAM_CAPTURE:
-			sprintf(str, "pcmC%iD%ic", pcm->card->number, pcm->device);
 			devtype = SNDRV_DEVICE_TYPE_PCM_CAPTURE;
 			break;
 		}
-		/* device pointer to use, pcm->dev takes precedence if
-		 * it is assigned, otherwise fall back to card's device
-		 * if possible */
-		dev = pcm->dev;
-		if (!dev)
-			dev = snd_card_get_device_link(pcm->card);
 		/* register pcm */
-		err = snd_register_device_for_dev(devtype, pcm->card,
-						  pcm->device,
-						  &snd_pcm_f_ops[cidx],
-						  pcm, NULL, dev, str);
+		err = snd_register_device(devtype, pcm->card, pcm->device,
+					  &snd_pcm_f_ops[cidx], pcm,
+					  &pcm->streams[cidx].dev);
 		if (err < 0) {
 			list_del_init(&pcm->list);
 			goto unlock;
-		}
-
-		dev = snd_get_device(devtype, pcm->card, pcm->device);
-		if (dev) {
-			err = sysfs_create_groups(&dev->kobj,
-						  pcm_dev_attr_groups);
-			if (err < 0)
-				dev_warn(dev,
-					 "pcm %d:%d: cannot create sysfs groups\n",
-					 pcm->card->number, pcm->device);
-			put_device(dev);
 		}
 
 		for (substream = pcm->streams[cidx].substream; substream; substream = substream->next)
@@ -1124,12 +1114,9 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
 	struct snd_pcm *pcm = device->device_data;
 	struct snd_pcm_notify *notify;
 	struct snd_pcm_substream *substream;
-	int cidx, devtype;
+	int cidx;
 
 	mutex_lock(&register_mutex);
-	if (list_empty(&pcm->list))
-		goto unlock;
-
 	mutex_lock(&pcm->open_mutex);
 	wake_up(&pcm->open_wait);
 	list_del_init(&pcm->list);
@@ -1149,23 +1136,14 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
 			notify->n_disconnect(pcm);
 	}
 	for (cidx = 0; cidx < 2; cidx++) {
-		devtype = -1;
-		switch (cidx) {
-		case SNDRV_PCM_STREAM_PLAYBACK:
-			devtype = SNDRV_DEVICE_TYPE_PCM_PLAYBACK;
-			break;
-		case SNDRV_PCM_STREAM_CAPTURE:
-			devtype = SNDRV_DEVICE_TYPE_PCM_CAPTURE;
-			break;
-		}
-		snd_unregister_device(devtype, pcm->card, pcm->device);
+		if (!pcm->internal)
+			snd_unregister_device(&pcm->streams[cidx].dev);
 		if (pcm->streams[cidx].chmap_kctl) {
 			snd_ctl_remove(pcm->card, pcm->streams[cidx].chmap_kctl);
 			pcm->streams[cidx].chmap_kctl = NULL;
 		}
 	}
 	mutex_unlock(&pcm->open_mutex);
- unlock:
 	mutex_unlock(&register_mutex);
 	return 0;
 }
@@ -1203,7 +1181,7 @@ int snd_pcm_notify(struct snd_pcm_notify *notify, int nfree)
 }
 EXPORT_SYMBOL(snd_pcm_notify);
 
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 /*
  *  Info interface
  */
@@ -1249,10 +1227,10 @@ static void snd_pcm_proc_done(void)
 	snd_info_free_entry(snd_pcm_proc_entry);
 }
 
-#else /* !CONFIG_PROC_FS */
+#else /* !CONFIG_SND_PROC_FS */
 #define snd_pcm_proc_init()
 #define snd_pcm_proc_done()
-#endif /* CONFIG_PROC_FS */
+#endif /* CONFIG_SND_PROC_FS */
 
 
 /*

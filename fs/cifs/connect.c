@@ -277,6 +277,7 @@ static const match_table_t cifs_smb_version_tokens = {
 	{ Smb_21, SMB21_VERSION_STRING },
 	{ Smb_30, SMB30_VERSION_STRING },
 	{ Smb_302, SMB302_VERSION_STRING },
+	{ Smb_version_err, NULL }
 };
 
 static int ip_connect(struct TCP_Server_Info *server);

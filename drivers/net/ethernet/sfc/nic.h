@@ -381,6 +381,7 @@ enum {
  * @efx: Pointer back to main interface structure
  * @wol_filter_id: Wake-on-LAN packet filter id
  * @stats: Hardware statistics
+ * @vf: Array of &struct siena_vf objects
  * @vf_buftbl_base: The zeroth buffer table index used to back VF queues.
  * @vfdi_status: Common VFDI status page to be dmad to VF address space.
  * @local_addr_list: List of local addresses. Protected by %local_lock.
@@ -394,6 +395,7 @@ struct siena_nic_data {
 	int wol_filter_id;
 	u64 stats[SIENA_STAT_COUNT];
 #ifdef CONFIG_SFC_SRIOV
+	struct siena_vf *vf;
 	struct efx_channel *vfdi_channel;
 	unsigned vf_buftbl_base;
 	struct efx_buffer vfdi_status;
@@ -501,6 +503,7 @@ enum {
  * @must_restore_piobufs: Flag: PIO buffers have yet to be restored after MC
  *	reboot
  * @rx_rss_context: Firmware handle for our RSS context
+ * @rx_rss_context_exclusive: Whether our RSS context is exclusive or shared
  * @stats: Hardware statistics
  * @workaround_35388: Flag: firmware supports workaround for bug 35388
  * @must_check_datapath_caps: Flag: @datapath_caps needs to be revalidated
@@ -510,6 +513,11 @@ enum {
  * @rx_dpcpu_fw_id: Firmware ID of the RxDPCPU
  * @tx_dpcpu_fw_id: Firmware ID of the TxDPCPU
  * @vport_id: The function's vport ID, only relevant for PFs
+ * @must_probe_vswitching: Flag: vswitching has yet to be setup after MC reboot
+ * @pf_index: The number for this PF, or the parent PF if this is a VF
+#ifdef CONFIG_SFC_SRIOV
+ * @vf: Pointer to VF data structure
+#endif
  */
 struct efx_ef10_nic_data {
 	struct efx_buffer mcdi_buf;
@@ -524,6 +532,7 @@ struct efx_ef10_nic_data {
 	unsigned int piobuf_handle[EF10_TX_PIOBUF_COUNT];
 	bool must_restore_piobufs;
 	u32 rx_rss_context;
+	bool rx_rss_context_exclusive;
 	u64 stats[EF10_STAT_COUNT];
 	bool workaround_35388;
 	bool must_check_datapath_caps;
@@ -531,6 +540,14 @@ struct efx_ef10_nic_data {
 	unsigned int rx_dpcpu_fw_id;
 	unsigned int tx_dpcpu_fw_id;
 	unsigned int vport_id;
+	bool must_probe_vswitching;
+	unsigned int pf_index;
+	u8 port_id[ETH_ALEN];
+#ifdef CONFIG_SFC_SRIOV
+	unsigned int vf_index;
+	struct ef10_vf *vf;
+#endif
+	u8 vport_mac[ETH_ALEN];
 };
 
 int efx_init_sriov(void);
@@ -567,6 +584,7 @@ extern const struct efx_nic_type falcon_a1_nic_type;
 extern const struct efx_nic_type falcon_b0_nic_type;
 extern const struct efx_nic_type siena_a0_nic_type;
 extern const struct efx_nic_type efx_hunt_a0_nic_type;
+extern const struct efx_nic_type efx_hunt_a0_vf_nic_type;
 
 /**************************************************************************
  *

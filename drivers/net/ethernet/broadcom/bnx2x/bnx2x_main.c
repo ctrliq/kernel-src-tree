@@ -11578,13 +11578,13 @@ static void bnx2x_get_cnic_mac_hwinfo(struct bnx2x *bp)
 	/* Disable iSCSI OOO if MAC configuration is invalid. */
 	if (!is_valid_ether_addr(iscsi_mac)) {
 		bp->flags |= NO_ISCSI_OOO_FLAG | NO_ISCSI_FLAG;
-		memset(iscsi_mac, 0, ETH_ALEN);
+		eth_zero_addr(iscsi_mac);
 	}
 
 	/* Disable FCoE if MAC configuration is invalid. */
 	if (!is_valid_ether_addr(fip_mac)) {
 		bp->flags |= NO_FCOE_FLAG;
-		memset(bp->fip_mac, 0, ETH_ALEN);
+		eth_zero_addr(bp->fip_mac);
 	}
 }
 
@@ -11595,7 +11595,7 @@ static void bnx2x_get_mac_hwinfo(struct bnx2x *bp)
 	int port = BP_PORT(bp);
 
 	/* Zero primary MAC configuration */
-	memset(bp->dev->dev_addr, 0, ETH_ALEN);
+	eth_zero_addr(bp->dev->dev_addr);
 
 	if (BP_NOMCP(bp)) {
 		BNX2X_ERROR("warning: random MAC workaround active\n");
@@ -12588,9 +12588,12 @@ static int bnx2x_get_phys_port_id(struct net_device *netdev,
 	return 0;
 }
 
-static bool bnx2x_gso_check(struct sk_buff *skb, struct net_device *dev)
+static netdev_features_t bnx2x_features_check(struct sk_buff *skb,
+					      struct net_device *dev,
+					      netdev_features_t features)
 {
-	return vxlan_gso_check(skb);
+	features = vlan_features_check(skb, features);
+	return vxlan_features_check(skb, features);
 }
 
 static const struct net_device_ops bnx2x_netdev_ops = {
@@ -12624,7 +12627,7 @@ static const struct net_device_ops bnx2x_netdev_ops = {
 #endif
 	.ndo_get_phys_port_id	= bnx2x_get_phys_port_id,
 	.ndo_set_vf_link_state	= bnx2x_set_vf_link_state,
-	.ndo_gso_check		= bnx2x_gso_check,
+	.ndo_features_check	= bnx2x_features_check,
 };
 
 static int bnx2x_set_coherency_mask(struct bnx2x *bp)

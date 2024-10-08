@@ -53,7 +53,7 @@ struct ovs_key_ipv4_tunnel {
 
 struct ovs_tunnel_info {
 	struct ovs_key_ipv4_tunnel tunnel;
-	const struct geneve_opt *options;
+	const void *options;
 	u8 options_len;
 };
 
@@ -61,10 +61,10 @@ struct ovs_tunnel_info {
  * maximum size. This allows us to get the benefits of variable length
  * matching for small options.
  */
-#define GENEVE_OPTS(flow_key, opt_len)	\
-	((struct geneve_opt *)((flow_key)->tun_opts + \
-			       FIELD_SIZEOF(struct sw_flow_key, tun_opts) - \
-			       opt_len))
+#define TUN_METADATA_OFFSET(opt_len) \
+	(FIELD_SIZEOF(struct sw_flow_key, tun_opts) - opt_len)
+#define TUN_METADATA_OPTS(flow_key, opt_len) \
+	((void *)((flow_key)->tun_opts + TUN_METADATA_OFFSET(opt_len)))
 
 static inline void __ovs_flow_tun_info_init(struct ovs_tunnel_info *tun_info,
 					    __be32 saddr, __be32 daddr,
@@ -73,7 +73,7 @@ static inline void __ovs_flow_tun_info_init(struct ovs_tunnel_info *tun_info,
 					    __be16 tp_dst,
 					    __be64 tun_id,
 					    __be16 tun_flags,
-					    const struct geneve_opt *opts,
+					    const void *opts,
 					    u8 opts_len)
 {
 	tun_info->tunnel.tun_id = tun_id;
@@ -105,7 +105,7 @@ static inline void ovs_flow_tun_info_init(struct ovs_tunnel_info *tun_info,
 					  __be16 tp_dst,
 					  __be64 tun_id,
 					  __be16 tun_flags,
-					  const struct geneve_opt *opts,
+					  const void *opts,
 					  u8 opts_len)
 {
 	__ovs_flow_tun_info_init(tun_info, iph->saddr, iph->daddr,
@@ -136,12 +136,17 @@ struct sw_flow_key {
 		__be16 tci;		/* 0 if no VLAN, VLAN_TAG_PRESENT set otherwise. */
 		__be16 type;		/* Ethernet frame type. */
 	} eth;
-	struct {
-		u8     proto;		/* IP protocol or lower 8 bits of ARP opcode. */
-		u8     tos;		/* IP ToS. */
-		u8     ttl;		/* IP TTL/hop limit. */
-		u8     frag;		/* One of OVS_FRAG_TYPE_*. */
-	} ip;
+	union {
+		struct {
+			__be32 top_lse;	/* top label stack entry */
+		} mpls;
+		struct {
+			u8     proto;	/* IP protocol or lower 8 bits of ARP opcode. */
+			u8     tos;	    /* IP ToS. */
+			u8     ttl;	    /* IP TTL/hop limit. */
+			u8     frag;	/* One of OVS_FRAG_TYPE_*. */
+		} ip;
+	};
 	struct {
 		__be16 src;		/* TCP/UDP/SCTP source port. */
 		__be16 dst;		/* TCP/UDP/SCTP destination port. */
@@ -192,6 +197,16 @@ struct sw_flow_match {
 	struct sw_flow_mask *mask;
 };
 
+#define MAX_UFID_LENGTH 16 /* 128 bits */
+
+struct sw_flow_id {
+	u32 ufid_len;
+	union {
+		u32 ufid[MAX_UFID_LENGTH / 4];
+		struct sw_flow_key *unmasked_key;
+	};
+};
+
 struct sw_flow_actions {
 	struct rcu_head rcu;
 	u32 actions_len;
@@ -208,13 +223,15 @@ struct flow_stats {
 
 struct sw_flow {
 	struct rcu_head rcu;
-	struct hlist_node hash_node[2];
-	u32 hash;
+	struct {
+		struct hlist_node node[2];
+		u32 hash;
+	} flow_table, ufid_table;
 	int stats_last_writer;		/* NUMA-node id of the last writer on
 					 * 'stats[0]'.
 					 */
 	struct sw_flow_key key;
-	struct sw_flow_key unmasked_key;
+	struct sw_flow_id id;
 	struct sw_flow_mask *mask;
 	struct sw_flow_actions __rcu *sf_acts;
 	struct flow_stats __rcu *stats[]; /* One for each NUMA node.  First one
@@ -238,6 +255,16 @@ struct arp_eth_header {
 	unsigned char       ar_tip[4];		/* target IP address        */
 } __packed;
 
+static inline bool ovs_identifier_is_ufid(const struct sw_flow_id *sfid)
+{
+	return sfid->ufid_len;
+}
+
+static inline bool ovs_identifier_is_key(const struct sw_flow_id *sfid)
+{
+	return !ovs_identifier_is_ufid(sfid);
+}
+
 void ovs_flow_stats_update(struct sw_flow *, __be16 tcp_flags,
 			   const struct sk_buff *);
 void ovs_flow_stats_get(const struct sw_flow *, struct ovs_flow_stats *,
@@ -252,6 +279,6 @@ int ovs_flow_key_extract(const struct ovs_tunnel_info *tun_info,
 /* Extract key from packet coming from userspace. */
 int ovs_flow_key_extract_userspace(const struct nlattr *attr,
 				   struct sk_buff *skb,
-				   struct sw_flow_key *key);
+				   struct sw_flow_key *key, bool log);
 
 #endif /* flow.h */

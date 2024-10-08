@@ -114,7 +114,8 @@ static void gfs2_set_iop(struct inode *inode)
 		else
 			inode->i_fop = &gfs2_file_fops;
 	} else if (S_ISDIR(mode)) {
-		inode->i_op = &gfs2_dir_iops;
+		inode->i_flags |= S_IOPS_WRAPPER;
+		inode->i_op = &gfs2_dir_iops.ops;
 		if (gfs2_localflocks(sdp))
 			inode->i_fop = &gfs2_dir_fops_nolock;
 		else
@@ -383,7 +384,7 @@ static int alloc_dinode(struct gfs2_inode *ip, u32 flags)
 	int error;
 	int dblocks = 1;
 
-	error = gfs2_quota_lock_check(ip);
+	error = gfs2_quota_lock_check(ip, &ap);
 	if (error)
 		goto out;
 
@@ -477,7 +478,7 @@ static int link_dinode(struct gfs2_inode *dip, const struct qstr *name,
 	int error;
 
 	if (arq) {
-		error = gfs2_quota_lock_check(dip);
+		error = gfs2_quota_lock_check(dip, &ap);
 		if (error)
 			goto fail_quota_locks;
 
@@ -892,7 +893,7 @@ static int gfs2_link(struct dentry *old_dentry, struct inode *dir,
 
 	if (alloc_required) {
 		struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
-		error = gfs2_quota_lock_check(dip);
+		error = gfs2_quota_lock_check(dip, &ap);
 		if (error)
 			goto out_gunlock;
 
@@ -1447,7 +1448,7 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 
 	if (alloc_required) {
 		struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
-		error = gfs2_quota_lock_check(ndip);
+		error = gfs2_quota_lock_check(ndip, &ap);
 		if (error)
 			goto out_gunlock;
 
@@ -1791,6 +1792,7 @@ static int setattr_chown(struct inode *inode, struct iattr *attr)
 	kuid_t ouid, nuid;
 	kgid_t ogid, ngid;
 	int error;
+	struct gfs2_alloc_parms ap;
 
 	ouid = inode->i_uid;
 	ogid = inode->i_gid;
@@ -1818,9 +1820,11 @@ static int setattr_chown(struct inode *inode, struct iattr *attr)
 	if (error)
 		goto out;
 
+	ap.target = gfs2_get_inode_blocks(&ip->i_inode);
+
 	if (!uid_eq(ouid, NO_UID_QUOTA_CHANGE) ||
 	    !gid_eq(ogid, NO_GID_QUOTA_CHANGE)) {
-		error = gfs2_quota_check(ip, nuid, ngid);
+		error = gfs2_quota_check(ip, nuid, ngid, &ap);
 		if (error)
 			goto out_gunlock_q;
 	}
@@ -1835,9 +1839,8 @@ static int setattr_chown(struct inode *inode, struct iattr *attr)
 
 	if (!uid_eq(ouid, NO_UID_QUOTA_CHANGE) ||
 	    !gid_eq(ogid, NO_GID_QUOTA_CHANGE)) {
-		u64 blocks = gfs2_get_inode_blocks(&ip->i_inode);
-		gfs2_quota_change(ip, -blocks, ouid, ogid);
-		gfs2_quota_change(ip, blocks, nuid, ngid);
+		gfs2_quota_change(ip, -(s64)ap.target, ouid, ogid);
+		gfs2_quota_change(ip, ap.target, nuid, ngid);
 	}
 
 out_end_trans:
@@ -2052,7 +2055,8 @@ const struct inode_operations gfs2_file_iops = {
 	.get_acl = gfs2_get_acl,
 };
 
-const struct inode_operations gfs2_dir_iops = {
+const struct inode_operations_wrapper gfs2_dir_iops = {
+	.ops = {
 	.create = gfs2_create,
 	.lookup = gfs2_lookup,
 	.link = gfs2_link,
@@ -2061,7 +2065,7 @@ const struct inode_operations gfs2_dir_iops = {
 	.mkdir = gfs2_mkdir,
 	.rmdir = gfs2_unlink,
 	.mknod = gfs2_mknod,
-	.rename2 = gfs2_rename2,
+	.rename = gfs2_rename,
 	.permission = gfs2_permission,
 	.setattr = gfs2_setattr,
 	.getattr = gfs2_getattr,
@@ -2072,6 +2076,8 @@ const struct inode_operations gfs2_dir_iops = {
 	.fiemap = gfs2_fiemap,
 	.get_acl = gfs2_get_acl,
 	.atomic_open = gfs2_atomic_open,
+	},
+	.rename2 = gfs2_rename2,
 };
 
 const struct inode_operations gfs2_symlink_iops = {

@@ -82,7 +82,7 @@ int btrfs_insert_xattr_item(struct btrfs_trans_handle *trans,
 	BUG_ON(name_len + data_len > BTRFS_MAX_XATTR_SIZE(root));
 
 	key.objectid = objectid;
-	btrfs_set_key_type(&key, BTRFS_XATTR_ITEM_KEY);
+	key.type = BTRFS_XATTR_ITEM_KEY;
 	key.offset = btrfs_name_hash(name, name_len);
 
 	data_size = sizeof(*dir_item) + name_len + data_len;
@@ -133,7 +133,7 @@ int btrfs_insert_dir_item(struct btrfs_trans_handle *trans, struct btrfs_root
 	u32 data_size;
 
 	key.objectid = btrfs_ino(dir);
-	btrfs_set_key_type(&key, BTRFS_DIR_ITEM_KEY);
+	key.type = BTRFS_DIR_ITEM_KEY;
 	key.offset = btrfs_name_hash(name, name_len);
 
 	path = btrfs_alloc_path();
@@ -200,7 +200,7 @@ struct btrfs_dir_item *btrfs_lookup_dir_item(struct btrfs_trans_handle *trans,
 	int cow = mod != 0;
 
 	key.objectid = dir;
-	btrfs_set_key_type(&key, BTRFS_DIR_ITEM_KEY);
+	key.type = BTRFS_DIR_ITEM_KEY;
 
 	key.offset = btrfs_name_hash(name, name_len);
 
@@ -230,7 +230,7 @@ int btrfs_check_dir_item_collision(struct btrfs_root *root, u64 dir,
 		return -ENOMEM;
 
 	key.objectid = dir;
-	btrfs_set_key_type(&key, BTRFS_DIR_ITEM_KEY);
+	key.type = BTRFS_DIR_ITEM_KEY;
 	key.offset = btrfs_name_hash(name, name_len);
 
 	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
@@ -293,7 +293,7 @@ btrfs_lookup_dir_index_item(struct btrfs_trans_handle *trans,
 	int cow = mod != 0;
 
 	key.objectid = dir;
-	btrfs_set_key_type(&key, BTRFS_DIR_INDEX_KEY);
+	key.type = BTRFS_DIR_INDEX_KEY;
 	key.offset = objectid;
 
 	ret = btrfs_search_slot(trans, root, &key, path, ins_len, cow);
@@ -363,7 +363,7 @@ struct btrfs_dir_item *btrfs_lookup_xattr(struct btrfs_trans_handle *trans,
 	int cow = mod != 0;
 
 	key.objectid = dir;
-	btrfs_set_key_type(&key, BTRFS_XATTR_ITEM_KEY);
+	key.type = BTRFS_XATTR_ITEM_KEY;
 	key.offset = btrfs_name_hash(name, name_len);
 	ret = btrfs_search_slot(trans, root, &key, path, ins_len, cow);
 	if (ret < 0)

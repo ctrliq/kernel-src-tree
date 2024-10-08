@@ -29,6 +29,9 @@ extern int line6_midibuf_init(struct midi_buffer *mb, int size, int split);
 extern int line6_midibuf_read(struct midi_buffer *mb, unsigned char *data,
 			      int length);
 extern void line6_midibuf_reset(struct midi_buffer *mb);
+extern int line6_midibuf_skip_message(struct midi_buffer *mb,
+				      unsigned short mask);
+extern void line6_midibuf_status(struct midi_buffer *mb);
 extern int line6_midibuf_write(struct midi_buffer *mb, unsigned char *data,
 			       int length);
 

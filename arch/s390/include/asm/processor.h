@@ -13,6 +13,7 @@
 
 #ifndef __ASSEMBLY__
 
+#include <linux/rh_kabi.h>
 #include <linux/linkage.h>
 #include <linux/irqflags.h>
 #include <asm/cpu.h>
@@ -90,10 +91,19 @@ struct thread_struct {
 	int ri_signum;
 #ifdef CONFIG_64BIT
 	unsigned char trap_tdb[256];	/* Transaction abort diagnose block */
+	RH_KABI_EXTEND(__vector128 *vxrs) /* Vector register save area */
 #endif
 };
 
-#define PER_FLAG_NO_TE		1UL	/* Flag to disable transactions. */
+/* Flag to disable transactions. */
+#define PER_FLAG_NO_TE			1UL
+/* Flag to enable random transaction aborts. */
+#define PER_FLAG_TE_ABORT_RAND		2UL
+/* Flag to specify random transaction abort mode:
+ * - abort each transaction at a random instruction before TEND if set.
+ * - abort random transactions at a random instruction if cleared.
+ */
+#define PER_FLAG_TE_ABORT_RAND_TEND	4UL
 
 typedef struct thread_struct thread_struct;
 

@@ -151,7 +151,7 @@ static int wr_log_show(struct seq_file *seq, void *v)
 	int prev_ts_set = 0;
 	int idx, end;
 
-#define ts2ns(ts) div64_ul((ts) * dev->rdev.lldi.cclk_ps, 1000)
+#define ts2ns(ts) div64_u64((ts) * dev->rdev.lldi.cclk_ps, 1000)
 
 	idx = atomic_read(&dev->rdev.wr_log_idx) &
 		(dev->rdev.wr_log_size - 1);
@@ -827,10 +827,10 @@ static int c4iw_rdev_open(struct c4iw_rdev *rdev)
 	     rdev->lldi.vr->qp.size,
 	     rdev->lldi.vr->cq.start,
 	     rdev->lldi.vr->cq.size);
-	PDBG("udb len 0x%x udb base %llx db_reg %p gts_reg %p qpshift %lu "
+	PDBG("udb len 0x%x udb base %p db_reg %p gts_reg %p qpshift %lu "
 	     "qpmask 0x%x cqshift %lu cqmask 0x%x\n",
 	     (unsigned)pci_resource_len(rdev->lldi.pdev, 2),
-	     (u64)pci_resource_start(rdev->lldi.pdev, 2),
+	     (void *)pci_resource_start(rdev->lldi.pdev, 2),
 	     rdev->lldi.db_reg,
 	     rdev->lldi.gts_reg,
 	     rdev->qpshift, rdev->qpmask,
@@ -1395,7 +1395,7 @@ static void recover_lost_dbs(struct uld_ctx *ctx, struct qp_list *qp_list)
 					  t4_sq_host_wq_pidx(&qp->wq),
 					  t4_sq_wq_size(&qp->wq));
 		if (ret) {
-			pr_err(KERN_ERR MOD "%s: Fatal error - "
+			pr_err(MOD "%s: Fatal error - "
 			       "DB overflow recovery failed - "
 			       "error syncing SQ qid %u\n",
 			       pci_name(ctx->lldi.pdev), qp->wq.sq.qid);
@@ -1411,7 +1411,7 @@ static void recover_lost_dbs(struct uld_ctx *ctx, struct qp_list *qp_list)
 					  t4_rq_wq_size(&qp->wq));
 
 		if (ret) {
-			pr_err(KERN_ERR MOD "%s: Fatal error - "
+			pr_err(MOD "%s: Fatal error - "
 			       "DB overflow recovery failed - "
 			       "error syncing RQ qid %u\n",
 			       pci_name(ctx->lldi.pdev), qp->wq.rq.qid);

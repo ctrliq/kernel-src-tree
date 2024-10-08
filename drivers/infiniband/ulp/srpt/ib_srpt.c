@@ -1357,11 +1357,8 @@ static int srpt_abort_cmd(struct srpt_send_ioctx *ioctx)
 
 		/* XXX(hch): this is a horrible layering violation.. */
 		spin_lock_irqsave(&ioctx->cmd.t_state_lock, flags);
-		ioctx->cmd.transport_state |= CMD_T_LUN_STOP;
 		ioctx->cmd.transport_state &= ~CMD_T_ACTIVE;
 		spin_unlock_irqrestore(&ioctx->cmd.t_state_lock, flags);
-
-		complete(&ioctx->cmd.transport_lun_stop_comp);
 		break;
 	case SRPT_STATE_CMD_RSP_SENT:
 		/*
@@ -1369,9 +1366,6 @@ static int srpt_abort_cmd(struct srpt_send_ioctx *ioctx)
 		 * not been received in time.
 		 */
 		srpt_unmap_sg_to_ib_sge(ioctx->ch, ioctx);
-		spin_lock_irqsave(&ioctx->cmd.t_state_lock, flags);
-		ioctx->cmd.transport_state |= CMD_T_LUN_STOP;
-		spin_unlock_irqrestore(&ioctx->cmd.t_state_lock, flags);
 		target_put_sess_cmd(ioctx->ch->sess, &ioctx->cmd);
 		break;
 	case SRPT_STATE_MGMT_RSP_SENT:
@@ -1481,7 +1475,6 @@ static void srpt_handle_rdma_err_comp(struct srpt_rdma_ch *ch,
 {
 	struct se_cmd *cmd;
 	enum srpt_command_state state;
-	unsigned long flags;
 
 	cmd = &ioctx->cmd;
 	state = srpt_get_cmd_state(ioctx);
@@ -1501,9 +1494,6 @@ static void srpt_handle_rdma_err_comp(struct srpt_rdma_ch *ch,
 			       __func__, __LINE__, state);
 		break;
 	case SRPT_RDMA_WRITE_LAST:
-		spin_lock_irqsave(&ioctx->cmd.t_state_lock, flags);
-		ioctx->cmd.transport_state |= CMD_T_LUN_STOP;
-		spin_unlock_irqrestore(&ioctx->cmd.t_state_lock, flags);
 		break;
 	default:
 		pr_err("%s[%d]: opcode = %u\n", __func__, __LINE__, opcode);
@@ -1716,22 +1706,22 @@ static int srpt_handle_cmd(struct srpt_rdma_ch *ch,
 
 	switch (srp_cmd->task_attr) {
 	case SRP_CMD_SIMPLE_Q:
-		cmd->sam_task_attr = MSG_SIMPLE_TAG;
+		cmd->sam_task_attr = TCM_SIMPLE_TAG;
 		break;
 	case SRP_CMD_ORDERED_Q:
 	default:
-		cmd->sam_task_attr = MSG_ORDERED_TAG;
+		cmd->sam_task_attr = TCM_ORDERED_TAG;
 		break;
 	case SRP_CMD_HEAD_OF_Q:
-		cmd->sam_task_attr = MSG_HEAD_TAG;
+		cmd->sam_task_attr = TCM_HEAD_TAG;
 		break;
 	case SRP_CMD_ACA:
-		cmd->sam_task_attr = MSG_ACA_TAG;
+		cmd->sam_task_attr = TCM_ACA_TAG;
 		break;
 	}
 
 	if (srpt_get_desc_tbl(send_ioctx, srp_cmd, &dir, &data_len)) {
-		pr_err("0x%llx: parsing SRP descriptor table failed.\n",
+		printk(KERN_ERR "0x%llx: parsing SRP descriptor table failed.\n",
 		       srp_cmd->tag);
 		ret = TCM_INVALID_CDB_FIELD;
 		goto send_sense;
@@ -1741,7 +1731,7 @@ static int srpt_handle_cmd(struct srpt_rdma_ch *ch,
 				       sizeof(srp_cmd->lun));
 	rc = target_submit_cmd(cmd, ch->sess, srp_cmd->cdb,
 			&send_ioctx->sense_data[0], unpacked_lun, data_len,
-			MSG_SIMPLE_TAG, dir, TARGET_SCF_ACK_KREF);
+			TCM_SIMPLE_TAG, dir, TARGET_SCF_ACK_KREF);
 	if (rc != 0) {
 		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 		goto send_sense;
@@ -2091,6 +2081,7 @@ static int srpt_create_ch_ib(struct srpt_rdma_ch *ch)
 	struct srpt_port *sport = ch->sport;
 	struct srpt_device *sdev = sport->sdev;
 	u32 srp_sq_size = sport->port_attrib.srp_sq_size;
+	struct ib_cq_init_attr cq_attr = {};
 	int ret;
 
 	WARN_ON(ch->rq_size < 1);
@@ -2100,8 +2091,10 @@ static int srpt_create_ch_ib(struct srpt_rdma_ch *ch)
 	if (!qp_init)
 		goto out;
 
+retry:
+	cq_attr.cqe = ch->rq_size + srp_sq_size;
 	ch->cq = ib_create_cq(sdev->device, srpt_completion, NULL, ch,
-			      ch->rq_size + srp_sq_size, 0);
+			      &cq_attr);
 	if (IS_ERR(ch->cq)) {
 		ret = PTR_ERR(ch->cq);
 		pr_err("failed to create CQ cqe= %d ret= %d\n",
@@ -2123,6 +2116,13 @@ static int srpt_create_ch_ib(struct srpt_rdma_ch *ch)
 	ch->qp = ib_create_qp(sdev->pd, qp_init);
 	if (IS_ERR(ch->qp)) {
 		ret = PTR_ERR(ch->qp);
+		if (ret == -ENOMEM) {
+			srp_sq_size /= 2;
+			if (srp_sq_size >= MIN_SRPT_SQ_SIZE) {
+				ib_destroy_cq(ch->cq);
+				goto retry;
+			}
+		}
 		pr_err("failed to create_qp ret= %d\n", ret);
 		goto err_destroy_cq;
 	}
@@ -2593,7 +2593,7 @@ static int srpt_cm_req_recv(struct ib_cm_id *cm_id,
 		goto destroy_ib;
 	}
 
-	ch->sess = transport_init_session();
+	ch->sess = transport_init_session(TARGET_PROT_NORMAL);
 	if (IS_ERR(ch->sess)) {
 		rej->reason = __constant_cpu_to_be32(
 				SRP_LOGIN_REJ_INSUFFICIENT_RESOURCES);
@@ -3010,7 +3010,7 @@ static u8 tcm_to_srp_tsk_mgmt_status(const int tcm_mgmt_status)
  * Callback function called by the TCM core. Must not block since it can be
  * invoked on the context of the IB completion handler.
  */
-static int srpt_queue_response(struct se_cmd *cmd)
+static void srpt_queue_response(struct se_cmd *cmd)
 {
 	struct srpt_rdma_ch *ch;
 	struct srpt_send_ioctx *ioctx;
@@ -3020,8 +3020,6 @@ static int srpt_queue_response(struct se_cmd *cmd)
 	enum dma_data_direction dir;
 	int resp_len;
 	u8 srp_tm_status;
-
-	ret = 0;
 
 	ioctx = container_of(cmd, struct srpt_send_ioctx, cmd);
 	ch = ioctx->ch;
@@ -3048,7 +3046,7 @@ static int srpt_queue_response(struct se_cmd *cmd)
 		     || WARN_ON_ONCE(state == SRPT_STATE_CMD_RSP_SENT))) {
 		atomic_inc(&ch->req_lim_delta);
 		srpt_abort_cmd(ioctx);
-		goto out;
+		return;
 	}
 
 	dir = ioctx->cmd.data_direction;
@@ -3060,7 +3058,7 @@ static int srpt_queue_response(struct se_cmd *cmd)
 		if (ret) {
 			pr_err("xfer_data failed for tag %llu\n",
 			       ioctx->tag);
-			goto out;
+			return;
 		}
 	}
 
@@ -3081,9 +3079,25 @@ static int srpt_queue_response(struct se_cmd *cmd)
 		srpt_set_cmd_state(ioctx, SRPT_STATE_DONE);
 		target_put_sess_cmd(ioctx->ch->sess, &ioctx->cmd);
 	}
+}
 
-out:
-	return ret;
+static int srpt_queue_data_in(struct se_cmd *cmd)
+{
+	srpt_queue_response(cmd);
+	return 0;
+}
+
+static void srpt_queue_tm_rsp(struct se_cmd *cmd)
+{
+	srpt_queue_response(cmd);
+}
+
+static void srpt_aborted_task(struct se_cmd *cmd)
+{
+	struct srpt_send_ioctx *ioctx = container_of(cmd,
+				struct srpt_send_ioctx, cmd);
+
+	srpt_unmap_sg_to_ib_sge(ioctx->ch, ioctx);
 }
 
 static int srpt_queue_status(struct se_cmd *cmd)
@@ -3096,7 +3110,8 @@ static int srpt_queue_status(struct se_cmd *cmd)
 	    (SCF_TRANSPORT_TASK_SENSE | SCF_EMULATED_TASK_SENSE))
 		WARN_ON(cmd->scsi_status != SAM_STAT_CHECK_CONDITION);
 	ioctx->queue_status_only = true;
-	return srpt_queue_response(cmd);
+	srpt_queue_response(cmd);
+	return 0;
 }
 
 static void srpt_refresh_port_work(struct work_struct *work)
@@ -3500,7 +3515,7 @@ static void srpt_close_session(struct se_session *se_sess)
 	DECLARE_COMPLETION_ONSTACK(release_done);
 	struct srpt_rdma_ch *ch;
 	struct srpt_device *sdev;
-	int res;
+	unsigned long res;
 
 	ch = se_sess->fabric_sess_ptr;
 	WARN_ON(ch->sess != se_sess);
@@ -3515,7 +3530,7 @@ static void srpt_close_session(struct se_session *se_sess)
 	spin_unlock_irq(&sdev->spinlock);
 
 	res = wait_for_completion_timeout(&release_done, 60 * HZ);
-	WARN_ON(res <= 0);
+	WARN_ON(res == 0);
 }
 
 /**
@@ -3564,7 +3579,7 @@ static int srpt_parse_i_port_id(u8 i_port_id[16], const char *name)
 	int ret, rc;
 
 	p = name;
-	if (strnicmp(p, "0x", 2) == 0)
+	if (strncasecmp(p, "0x", 2) == 0)
 		p += 2;
 	ret = -EINVAL;
 	len = strlen(p);
@@ -3669,7 +3684,7 @@ static ssize_t srpt_tpg_attrib_store_srp_max_rdma_size(
 	unsigned long val;
 	int ret;
 
-	ret = strict_strtoul(page, 0, &val);
+	ret = kstrtoul(page, 0, &val);
 	if (ret < 0) {
 		pr_err("strict_strtoul() failed with ret: %d\n", ret);
 		return -EINVAL;
@@ -3709,7 +3724,7 @@ static ssize_t srpt_tpg_attrib_store_srp_max_rsp_size(
 	unsigned long val;
 	int ret;
 
-	ret = strict_strtoul(page, 0, &val);
+	ret = kstrtoul(page, 0, &val);
 	if (ret < 0) {
 		pr_err("strict_strtoul() failed with ret: %d\n", ret);
 		return -EINVAL;
@@ -3749,7 +3764,7 @@ static ssize_t srpt_tpg_attrib_store_srp_sq_size(
 	unsigned long val;
 	int ret;
 
-	ret = strict_strtoul(page, 0, &val);
+	ret = kstrtoul(page, 0, &val);
 	if (ret < 0) {
 		pr_err("strict_strtoul() failed with ret: %d\n", ret);
 		return -EINVAL;
@@ -3796,7 +3811,7 @@ static ssize_t srpt_tpg_store_enable(
 	unsigned long tmp;
         int ret;
 
-	ret = strict_strtoul(page, 0, &tmp);
+	ret = kstrtoul(page, 0, &tmp);
 	if (ret < 0) {
 		pr_err("Unable to extract srpt_tpg_store_enable\n");
 		return -EINVAL;
@@ -3928,9 +3943,10 @@ static struct target_core_fabric_ops srpt_template = {
 	.set_default_node_attributes	= srpt_set_default_node_attrs,
 	.get_task_tag			= srpt_get_task_tag,
 	.get_cmd_state			= srpt_get_tcm_cmd_state,
-	.queue_data_in			= srpt_queue_response,
+	.queue_data_in			= srpt_queue_data_in,
 	.queue_status			= srpt_queue_status,
-	.queue_tm_rsp			= srpt_queue_response,
+	.queue_tm_rsp			= srpt_queue_tm_rsp,
+	.aborted_task			= srpt_aborted_task,
 	/*
 	 * Setup function pointers for generic logic in
 	 * target_core_fabric_configfs.c

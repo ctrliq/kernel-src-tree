@@ -381,11 +381,11 @@ static int i40evf_get_rss_hash_opts(struct i40evf_adapter *adapter,
 
 	switch (cmd->flow_type) {
 	case TCP_V4_FLOW:
-		if (hena & ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_TCP))
+		if (hena & BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_TCP))
 			cmd->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
 		break;
 	case UDP_V4_FLOW:
-		if (hena & ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_UDP))
+		if (hena & BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_UDP))
 			cmd->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
 		break;
 
@@ -397,11 +397,11 @@ static int i40evf_get_rss_hash_opts(struct i40evf_adapter *adapter,
 		break;
 
 	case TCP_V6_FLOW:
-		if (hena & ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_TCP))
+		if (hena & BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_TCP))
 			cmd->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
 		break;
 	case UDP_V6_FLOW:
-		if (hena & ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_UDP))
+		if (hena & BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_UDP))
 			cmd->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
 		break;
 
@@ -479,10 +479,10 @@ static int i40evf_set_rss_hash_opt(struct i40evf_adapter *adapter,
 	case TCP_V4_FLOW:
 		switch (nfc->data & (RXH_L4_B_0_1 | RXH_L4_B_2_3)) {
 		case 0:
-			hena &= ~((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_TCP);
+			hena &= ~BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_TCP);
 			break;
 		case (RXH_L4_B_0_1 | RXH_L4_B_2_3):
-			hena |= ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_TCP);
+			hena |= BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_TCP);
 			break;
 		default:
 			return -EINVAL;
@@ -491,10 +491,10 @@ static int i40evf_set_rss_hash_opt(struct i40evf_adapter *adapter,
 	case TCP_V6_FLOW:
 		switch (nfc->data & (RXH_L4_B_0_1 | RXH_L4_B_2_3)) {
 		case 0:
-			hena &= ~((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_TCP);
+			hena &= ~BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_TCP);
 			break;
 		case (RXH_L4_B_0_1 | RXH_L4_B_2_3):
-			hena |= ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_TCP);
+			hena |= BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_TCP);
 			break;
 		default:
 			return -EINVAL;
@@ -503,12 +503,12 @@ static int i40evf_set_rss_hash_opt(struct i40evf_adapter *adapter,
 	case UDP_V4_FLOW:
 		switch (nfc->data & (RXH_L4_B_0_1 | RXH_L4_B_2_3)) {
 		case 0:
-			hena &= ~(((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_UDP) |
-				  ((u64)1 << I40E_FILTER_PCTYPE_FRAG_IPV4));
+			hena &= ~(BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_UDP) |
+				  BIT_ULL(I40E_FILTER_PCTYPE_FRAG_IPV4));
 			break;
 		case (RXH_L4_B_0_1 | RXH_L4_B_2_3):
-			hena |= (((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_UDP) |
-				 ((u64)1 << I40E_FILTER_PCTYPE_FRAG_IPV4));
+			hena |= (BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_UDP) |
+				 BIT_ULL(I40E_FILTER_PCTYPE_FRAG_IPV4));
 			break;
 		default:
 			return -EINVAL;
@@ -517,12 +517,12 @@ static int i40evf_set_rss_hash_opt(struct i40evf_adapter *adapter,
 	case UDP_V6_FLOW:
 		switch (nfc->data & (RXH_L4_B_0_1 | RXH_L4_B_2_3)) {
 		case 0:
-			hena &= ~(((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_UDP) |
-				  ((u64)1 << I40E_FILTER_PCTYPE_FRAG_IPV6));
+			hena &= ~(BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_UDP) |
+				  BIT_ULL(I40E_FILTER_PCTYPE_FRAG_IPV6));
 			break;
 		case (RXH_L4_B_0_1 | RXH_L4_B_2_3):
-			hena |= (((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_UDP) |
-				 ((u64)1 << I40E_FILTER_PCTYPE_FRAG_IPV6));
+			hena |= (BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_UDP) |
+				 BIT_ULL(I40E_FILTER_PCTYPE_FRAG_IPV6));
 			break;
 		default:
 			return -EINVAL;
@@ -535,7 +535,7 @@ static int i40evf_set_rss_hash_opt(struct i40evf_adapter *adapter,
 		if ((nfc->data & RXH_L4_B_0_1) ||
 		    (nfc->data & RXH_L4_B_2_3))
 			return -EINVAL;
-		hena |= ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_OTHER);
+		hena |= BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_OTHER);
 		break;
 	case AH_ESP_V6_FLOW:
 	case AH_V6_FLOW:
@@ -544,15 +544,15 @@ static int i40evf_set_rss_hash_opt(struct i40evf_adapter *adapter,
 		if ((nfc->data & RXH_L4_B_0_1) ||
 		    (nfc->data & RXH_L4_B_2_3))
 			return -EINVAL;
-		hena |= ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_OTHER);
+		hena |= BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_OTHER);
 		break;
 	case IPV4_FLOW:
-		hena |= ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV4_OTHER) |
-			((u64)1 << I40E_FILTER_PCTYPE_FRAG_IPV4);
+		hena |= (BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV4_OTHER) |
+			 BIT_ULL(I40E_FILTER_PCTYPE_FRAG_IPV4));
 		break;
 	case IPV6_FLOW:
-		hena |= ((u64)1 << I40E_FILTER_PCTYPE_NONF_IPV6_OTHER) |
-			((u64)1 << I40E_FILTER_PCTYPE_FRAG_IPV6);
+		hena |= (BIT_ULL(I40E_FILTER_PCTYPE_NONF_IPV6_OTHER) |
+			 BIT_ULL(I40E_FILTER_PCTYPE_FRAG_IPV6));
 		break;
 	default:
 		return -EINVAL;
@@ -623,43 +623,61 @@ static u32 i40evf_get_rxfh_indir_size(struct net_device *netdev)
 }
 
 /**
- * i40evf_get_rxfh_indir - get the rx flow hash indirection table
+ * i40evf_get_rxfh - get the rx flow hash indirection table
  * @netdev: network interface device structure
  * @indir: indirection table
+ * @key: hash key
  *
  * Reads the indirection table directly from the hardware. Always returns 0.
  **/
-static int i40evf_get_rxfh_indir(struct net_device *netdev, u32 *indir)
+static int i40evf_get_rxfh(struct net_device *netdev, u32 *indir, u8 *key,
+			   u8 *hfunc)
 {
 	struct i40evf_adapter *adapter = netdev_priv(netdev);
 	struct i40e_hw *hw = &adapter->hw;
 	u32 hlut_val;
 	int i, j;
 
-	for (i = 0, j = 0; i <= I40E_VFQF_HLUT_MAX_INDEX; i++) {
-		hlut_val = rd32(hw, I40E_VFQF_HLUT(i));
-		indir[j++] = hlut_val & 0xff;
-		indir[j++] = (hlut_val >> 8) & 0xff;
-		indir[j++] = (hlut_val >> 16) & 0xff;
-		indir[j++] = (hlut_val >> 24) & 0xff;
+	if (hfunc)
+		*hfunc = ETH_RSS_HASH_TOP;
+	if (!indir)
+		return 0;
+
+	if (indir) {
+		for (i = 0, j = 0; i <= I40E_VFQF_HLUT_MAX_INDEX; i++) {
+			hlut_val = rd32(hw, I40E_VFQF_HLUT(i));
+			indir[j++] = hlut_val & 0xff;
+			indir[j++] = (hlut_val >> 8) & 0xff;
+			indir[j++] = (hlut_val >> 16) & 0xff;
+			indir[j++] = (hlut_val >> 24) & 0xff;
+		}
 	}
 	return 0;
 }
 
 /**
- * i40evf_set_rxfh_indir - set the rx flow hash indirection table
+ * i40evf_set_rxfh - set the rx flow hash indirection table
  * @netdev: network interface device structure
  * @indir: indirection table
+ * @key: hash key
  *
  * Returns -EINVAL if the table specifies an inavlid queue id, otherwise
  * returns 0 after programming the table.
  **/
-static int i40evf_set_rxfh_indir(struct net_device *netdev, const u32 *indir)
+static int i40evf_set_rxfh(struct net_device *netdev, const u32 *indir,
+			   const u8 *key, const u8 hfunc)
 {
 	struct i40evf_adapter *adapter = netdev_priv(netdev);
 	struct i40e_hw *hw = &adapter->hw;
 	u32 hlut_val;
 	int i, j;
+
+	/* We do not allow change in unsupported parameters */
+	if (key ||
+	    (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP))
+		return -EOPNOTSUPP;
+	if (!indir)
+		return 0;
 
 	for (i = 0, j = 0; i <= I40E_VFQF_HLUT_MAX_INDEX; i++) {
 		hlut_val = indir[j++];
@@ -688,8 +706,8 @@ static const struct ethtool_ops i40evf_ethtool_ops = {
 	.get_rxnfc		= i40evf_get_rxnfc,
 	.set_rxnfc		= i40evf_set_rxnfc,
 	.get_rxfh_indir_size	= i40evf_get_rxfh_indir_size,
-	.get_rxfh_indir		= i40evf_get_rxfh_indir,
-	.set_rxfh_indir		= i40evf_set_rxfh_indir,
+	.get_rxfh		= i40evf_get_rxfh,
+	.set_rxfh		= i40evf_set_rxfh,
 	.get_channels		= i40evf_get_channels,
 };
 

@@ -46,7 +46,7 @@ static const char e1000_copyright[] = "Copyright (c) 1999-2006 Intel Corporation
  * Macro expands to...
  *   {PCI_DEVICE(PCI_VENDOR_ID_INTEL, device_id)}
  */
-static DEFINE_PCI_DEVICE_TABLE(e1000_pci_tbl) = {
+static const struct pci_device_id e1000_pci_tbl[] = {
 	INTEL_E1000_ETHERNET_DEVICE(0x1000),
 	INTEL_E1000_ETHERNET_DEVICE(0x1001),
 	INTEL_E1000_ETHERNET_DEVICE(0x1004),
@@ -3216,9 +3216,9 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
 		return NETDEV_TX_BUSY;
 	}
 
-	if (vlan_tx_tag_present(skb)) {
+	if (skb_vlan_tag_present(skb)) {
 		tx_flags |= E1000_TX_FLAGS_VLAN;
-		tx_flags |= (vlan_tx_tag_get(skb) << E1000_TX_FLAGS_VLAN_SHIFT);
+		tx_flags |= (skb_vlan_tag_get(skb) << E1000_TX_FLAGS_VLAN_SHIFT);
 	}
 
 	first = tx_ring->next_to_use;
@@ -3846,7 +3846,7 @@ static bool e1000_clean_tx_irq(struct e1000_adapter *adapter,
 	while ((eop_desc->upper.data & cpu_to_le32(E1000_TXD_STAT_DD)) &&
 	       (count < tx_ring->count)) {
 		bool cleaned = false;
-		rmb();	/* read buffer_info after eop_desc */
+		dma_rmb();	/* read buffer_info after eop_desc */
 		for ( ; !cleaned; count++) {
 			tx_desc = E1000_TX_DESC(*tx_ring, i);
 			buffer_info = &tx_ring->buffer_info[i];
@@ -4040,7 +4040,7 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_adapter *adapter,
 		if (*work_done >= work_to_do)
 			break;
 		(*work_done)++;
-		rmb(); /* read descriptor and rx_buffer_info after status DD */
+		dma_rmb(); /* read descriptor and rx_buffer_info after status DD */
 
 		status = rx_desc->status;
 		skb = buffer_info->skb;
@@ -4253,7 +4253,7 @@ static bool e1000_clean_rx_irq(struct e1000_adapter *adapter,
 		if (*work_done >= work_to_do)
 			break;
 		(*work_done)++;
-		rmb(); /* read descriptor and rx_buffer_info after status DD */
+		dma_rmb(); /* read descriptor and rx_buffer_info after status DD */
 
 		status = rx_desc->status;
 		skb = buffer_info->skb;

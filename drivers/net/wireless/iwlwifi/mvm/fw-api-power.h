@@ -6,6 +6,7 @@
  * GPL LICENSE SUMMARY
  *
  * Copyright(c) 2012 - 2014 Intel Corporation. All rights reserved.
+ * Copyright(c) 2013 - 2014 Intel Mobile Communications GmbH
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -31,6 +32,7 @@
  * BSD LICENSE
  *
  * Copyright(c) 2012 - 2014 Intel Corporation. All rights reserved.
+ * Copyright(c) 2013 - 2014 Intel Mobile Communications GmbH
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -90,14 +92,32 @@ enum iwl_ltr_config_flags {
 };
 
 /**
+ * struct iwl_ltr_config_cmd_v1 - configures the LTR
+ * @flags: See %enum iwl_ltr_config_flags
+ */
+struct iwl_ltr_config_cmd_v1 {
+	__le32 flags;
+	__le32 static_long;
+	__le32 static_short;
+} __packed; /* LTR_CAPABLE_API_S_VER_1 */
+
+#define LTR_VALID_STATES_NUM 4
+
+/**
  * struct iwl_ltr_config_cmd - configures the LTR
  * @flags: See %enum iwl_ltr_config_flags
+ * @static_long:
+ * @static_short:
+ * @ltr_cfg_values:
+ * @ltr_short_idle_timeout:
  */
 struct iwl_ltr_config_cmd {
 	__le32 flags;
 	__le32 static_long;
 	__le32 static_short;
-} __packed;
+	__le32 ltr_cfg_values[LTR_VALID_STATES_NUM];
+	__le32 ltr_short_idle_timeout;
+} __packed; /* LTR_CAPABLE_API_S_VER_2 */
 
 /* Radio LP RX Energy Threshold measured in dBm */
 #define POWER_LPRX_RSSI_THRESHOLD	75
@@ -278,6 +298,40 @@ struct iwl_uapsd_misbehaving_ap_notif {
 } __packed;
 
 /**
+ * struct iwl_reduce_tx_power_cmd - TX power reduction command
+ * REDUCE_TX_POWER_CMD = 0x9f
+ * @flags: (reserved for future implementation)
+ * @mac_context_id: id of the mac ctx for which we are reducing TX power.
+ * @pwr_restriction: TX power restriction in dBms.
+ */
+struct iwl_reduce_tx_power_cmd {
+	u8 flags;
+	u8 mac_context_id;
+	__le16 pwr_restriction;
+} __packed; /* TX_REDUCED_POWER_API_S_VER_1 */
+
+/**
+ * struct iwl_dev_tx_power_cmd - TX power reduction command
+ * REDUCE_TX_POWER_CMD = 0x9f
+ * @set_mode: 0 - MAC tx power, 1 - device tx power
+ * @mac_context_id: id of the mac ctx for which we are reducing TX power.
+ * @pwr_restriction: TX power restriction in 1/8 dBms.
+ * @dev_24: device TX power restriction in 1/8 dBms
+ * @dev_52_low: device TX power restriction upper band - low
+ * @dev_52_high: device TX power restriction upper band - high
+ */
+struct iwl_dev_tx_power_cmd {
+	__le32 set_mode;
+	__le32 mac_context_id;
+	__le16 pwr_restriction;
+	__le16 dev_24;
+	__le16 dev_52_low;
+	__le16 dev_52_high;
+} __packed; /* TX_REDUCED_POWER_API_S_VER_2 */
+
+#define IWL_DEV_MAX_TX_POWER 0x7FFF
+
+/**
  * struct iwl_beacon_filter_cmd
  * REPLY_BEACON_FILTERING_CMD = 0xd2 (command)
  * @id_and_color: MAC contex identifier
@@ -368,8 +422,8 @@ struct iwl_beacon_filter_cmd {
 #define IWL_BF_DEBUG_FLAG_DEFAULT 0
 #define IWL_BF_DEBUG_FLAG_D0I3 0
 
-#define IWL_BF_ESCAPE_TIMER_DEFAULT 50
-#define IWL_BF_ESCAPE_TIMER_D0I3 1024
+#define IWL_BF_ESCAPE_TIMER_DEFAULT 0
+#define IWL_BF_ESCAPE_TIMER_D0I3 0
 #define IWL_BF_ESCAPE_TIMER_MAX 1024
 #define IWL_BF_ESCAPE_TIMER_MIN 0
 

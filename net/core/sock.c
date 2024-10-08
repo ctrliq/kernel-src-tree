@@ -615,6 +615,25 @@ static inline void sock_valbool_flag(struct sock *sk, int bit, int valbool)
 		sock_reset_flag(sk, bit);
 }
 
+bool sk_mc_loop(struct sock *sk)
+{
+	if (dev_recursion_level())
+		return false;
+	if (!sk)
+		return true;
+	switch (sk->sk_family) {
+	case AF_INET:
+		return inet_sk(sk)->mc_loop;
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6:
+		return inet6_sk(sk)->mc_loop;
+#endif
+	}
+	WARN_ON(1);
+	return true;
+}
+EXPORT_SYMBOL(sk_mc_loop);
+
 /*
  *	This is meant for all protocols to use and covers goings on
  *	at the socket level. Everything here is generic.
@@ -913,6 +932,13 @@ set_rcvbuf:
 		}
 		break;
 #endif
+
+	case SO_MAX_PACING_RATE:
+		sk->sk_max_pacing_rate = val;
+		sk->sk_pacing_rate = min(sk->sk_pacing_rate,
+					 sk->sk_max_pacing_rate);
+		break;
+
 	default:
 		ret = -ENOPROTOOPT;
 		break;
@@ -1180,6 +1206,10 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 		break;
 #endif
 
+	case SO_MAX_PACING_RATE:
+		v.val = sk->sk_max_pacing_rate;
+		break;
+
 	default:
 		return -ENOPROTOOPT;
 	}
@@ -1414,7 +1444,6 @@ void sk_release_kernel(struct sock *sk)
 
 	sock_hold(sk);
 	sock_release(sk->sk_socket);
-	release_net(sock_net(sk));
 	sock_net_set(sk, get_net(&init_net));
 	sock_put(sk);
 }
@@ -1588,6 +1617,12 @@ void sock_rfree(struct sk_buff *skb)
 	sk_mem_uncharge(sk, len);
 }
 EXPORT_SYMBOL(sock_rfree);
+
+void sock_efree(struct sk_buff *skb)
+{
+	sock_put(skb->sk);
+}
+EXPORT_SYMBOL(sock_efree);
 
 void sock_edemux(struct sk_buff *skb)
 {
@@ -1914,20 +1949,21 @@ static void __release_sock(struct sock *sk)
  * sk_wait_data - wait for data to arrive at sk_receive_queue
  * @sk:    sock to wait on
  * @timeo: for how long
+ * @skb:   last skb seen on sk_receive_queue
  *
  * Now socket state including sk->sk_err is changed only under lock,
  * hence we may omit checks after joining wait queue.
  * We check receive queue before schedule() only as optimization;
  * it is very likely that release_sock() added new data.
  */
-int sk_wait_data(struct sock *sk, long *timeo)
+int sk_wait_data(struct sock *sk, long *timeo, const struct sk_buff *skb)
 {
 	int rc;
 	DEFINE_WAIT(wait);
 
 	prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
 	set_bit(SOCK_ASYNC_WAITDATA, &sk->sk_socket->flags);
-	rc = sk_wait_event(sk, timeo, !skb_queue_empty(&sk->sk_receive_queue));
+	rc = sk_wait_event(sk, timeo, skb_peek_tail(&sk->sk_receive_queue) != skb);
 	clear_bit(SOCK_ASYNC_WAITDATA, &sk->sk_socket->flags);
 	finish_wait(sk_sleep(sk), &wait);
 	return rc;
@@ -2297,6 +2333,7 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	sk->sk_ll_usec		=	sysctl_net_busy_read;
 #endif
 
+	sk->sk_max_pacing_rate = ~0U;
 	sk->sk_pacing_rate = ~0U;
 	/*
 	 * Before updating sk_refcnt, we must commit prior changes to memory

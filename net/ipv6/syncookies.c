@@ -24,6 +24,8 @@
 #define COOKIEBITS 24	/* Upper bits store count */
 #define COOKIEMASK (((__u32)1 << COOKIEBITS) - 1)
 
+static u32 syncookie6_secret[2][16-4+SHA_DIGEST_WORDS];
+
 /* RFC 2460, Section 8.3:
  * [ipv6 tcp] MSS must be computed as the maximum packet size minus 60 [..]
  *
@@ -61,14 +63,18 @@ static DEFINE_PER_CPU(__u32 [16 + 5 + SHA_WORKSPACE_WORDS],
 static u32 cookie_hash(const struct in6_addr *saddr, const struct in6_addr *daddr,
 		       __be16 sport, __be16 dport, u32 count, int c)
 {
-	__u32 *tmp = __get_cpu_var(ipv6_cookie_scratch);
+	__u32 *tmp;
+
+	net_get_random_once(syncookie6_secret, sizeof(syncookie6_secret));
+
+	tmp  = __get_cpu_var(ipv6_cookie_scratch);
 
 	/*
 	 * we have 320 bits of information to hash, copy in the remaining
-	 * 192 bits required for sha_transform, from the syncookie_secret
+	 * 192 bits required for sha_transform, from the syncookie6_secret
 	 * and overwrite the digest with the secret
 	 */
-	memcpy(tmp + 10, syncookie_secret[c], 44);
+	memcpy(tmp + 10, syncookie6_secret[c], 44);
 	memcpy(tmp, saddr, 16);
 	memcpy(tmp + 4, daddr, 16);
 	tmp[8] = ((__force u32)sport << 16) + (__force u32)dport;
@@ -160,7 +166,6 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 	int mss;
 	struct dst_entry *dst;
 	__u8 rcv_wscale;
-	bool ecn_ok = false;
 
 	if (!sysctl_tcp_syncookies || !th->ack || th->rst)
 		goto out;
@@ -177,11 +182,11 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 	memset(&tcp_opt, 0, sizeof(tcp_opt));
 	tcp_parse_options(skb, &tcp_opt, 0, NULL);
 
-	if (!cookie_check_timestamp(&tcp_opt, sock_net(sk), &ecn_ok))
+	if (!cookie_timestamp_decode(&tcp_opt))
 		goto out;
 
 	ret = NULL;
-	req = inet6_reqsk_alloc(&tcp6_request_sock_ops);
+	req = inet_reqsk_alloc(&tcp6_request_sock_ops);
 	if (!req)
 		goto out;
 
@@ -212,7 +217,6 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 
 	req->expires = 0UL;
 	req->num_retrans = 0;
-	ireq->ecn_ok		= ecn_ok;
 	ireq->snd_wscale	= tcp_opt.snd_wscale;
 	ireq->sack_ok		= tcp_opt.sack_ok;
 	ireq->wscale_ok		= tcp_opt.wscale_ok;
@@ -241,7 +245,7 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 		fl6.fl6_sport = inet_sk(sk)->inet_sport;
 		security_req_classify_flow(req, flowi6_to_flowi(&fl6));
 
-		dst = ip6_dst_lookup_flow(sk, &fl6, final_p, false);
+		dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
 		if (IS_ERR(dst))
 			goto out_free;
 	}
@@ -253,6 +257,7 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 				  dst_metric(dst, RTAX_INITRWND));
 
 	ireq->rcv_wscale = rcv_wscale;
+	ireq->ecn_ok = cookie_ecn_ok(&tcp_opt, sock_net(sk), dst);
 
 	ret = get_cookie_sock(sk, skb, req, dst);
 out:

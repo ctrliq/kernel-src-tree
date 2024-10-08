@@ -49,6 +49,7 @@ static inline int rtnl_msg_family(const struct nlmsghdr *nlh)
  *			    to create when creating a new device.
  *	@get_num_rx_queues: Function to determine number of receive queues
  *			    to create when creating a new device.
+ *	@get_link_net: Function to get the i/o netns of the device
  */
 struct rtnl_link_ops {
 	struct list_head	list;
@@ -90,13 +91,18 @@ struct rtnl_link_ops {
 	 * to replace reserved slots with required structure field
 	 * additions of your backport.
 	 */
-	RH_KABI_RESERVE_P(1)
-	RH_KABI_RESERVE_P(2)
-	RH_KABI_RESERVE_P(3)
-	RH_KABI_RESERVE_P(4)
-	RH_KABI_RESERVE_P(5)
-	RH_KABI_RESERVE_P(6)
-	RH_KABI_RESERVE_P(7)
+	RH_KABI_USE_P(1, struct net	*(*get_link_net)(const struct net_device *dev))
+	RH_KABI_USE_P(2, int	slave_maxtype)
+	RH_KABI_USE_P(3, const struct nla_policy *slave_policy)
+	RH_KABI_USE_P(4, int	(*slave_validate)(struct nlattr *tb[], struct nlattr *data[]))
+	RH_KABI_USE_P(5, int	(*slave_changelink)(struct net_device *dev,
+						    struct net_device *slave_dev,
+						    struct nlattr *tb[], struct nlattr *data[]))
+	RH_KABI_USE_P(6, size_t	(*get_slave_size)(const struct net_device *dev,
+						  const struct net_device *slave_dev))
+	RH_KABI_USE_P(7, int	(*fill_slave_info)(struct sk_buff *skb,
+						   const struct net_device *dev,
+						   const struct net_device *slave_dev))
 	RH_KABI_RESERVE_P(8)
 	RH_KABI_RESERVE_P(9)
 	RH_KABI_RESERVE_P(10)

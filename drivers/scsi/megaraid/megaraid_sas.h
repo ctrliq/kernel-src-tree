@@ -35,7 +35,7 @@
 /*
  * MegaRAID SAS Driver meta data
  */
-#define MEGASAS_VERSION				"06.807.10.00-rc1"
+#define MEGASAS_VERSION				"06.807.10.00-rh1"
 #define MEGASAS_RELDATE				"March 6, 2015"
 
 /*
@@ -153,6 +153,9 @@
 #define MFI_FRAME_DIR_READ			0x0010
 #define MFI_FRAME_DIR_BOTH			0x0018
 #define MFI_FRAME_IEEE                          0x0020
+
+/* Driver internal */
+#define DRV_DCMD_POLLED_MODE		0x1
 
 /*
  * Definition for cmd_status
@@ -1043,11 +1046,6 @@ struct megasas_ctrl_info {
 
 #define VD_EXT_DEBUG 0
 
-enum MR_MFI_MPT_PTHR_FLAGS {
-	MFI_MPT_DETACHED = 0,
-	MFI_LIST_ADDED = 1,
-	MFI_MPT_ATTACHED = 2,
-};
 
 enum MR_SCSI_CMD_TYPE {
 	READ_WRITE_LDIO = 0,
@@ -1879,9 +1877,13 @@ struct megasas_instance_template {
 #define MEGASAS_IS_LOGICAL(scp)						\
 	(scp->device->channel < MEGASAS_MAX_PD_CHANNELS) ? 0 : 1
 
-#define MEGASAS_DEV_INDEX(inst, scp)					\
-	((scp->device->channel % 2) * MEGASAS_MAX_DEV_PER_CHANNEL) + 	\
-	scp->device->id
+#define MEGASAS_DEV_INDEX(scp)						\
+	(((scp->device->channel % 2) * MEGASAS_MAX_DEV_PER_CHANNEL) +	\
+	scp->device->id)
+
+#define MEGASAS_PD_INDEX(scp)						\
+	((scp->device->channel * MEGASAS_MAX_DEV_PER_CHANNEL) +		\
+	scp->device->id)
 
 struct megasas_cmd {
 
@@ -1892,17 +1894,14 @@ struct megasas_cmd {
 
 	u32 index;
 	u8 sync_cmd;
-	u8 cmd_status;
+	u8 cmd_status_drv;
 	u8 abort_aen;
 	u8 retry_for_fw_reset;
 
 
 	struct list_head list;
 	struct scsi_cmnd *scmd;
-
-	void *mpt_pthr_cmd_blocked;
-	atomic_t mfi_mpt_pthr;
-	u8 is_wait_event;
+	u8 flags;
 
 	struct megasas_instance *instance;
 	union {

@@ -36,7 +36,7 @@ char vmxnet3_driver_name[] = "vmxnet3";
  * PCI Device ID Table
  * Last entry must be all 0s
  */
-static DEFINE_PCI_DEVICE_TABLE(vmxnet3_pciid_table) = {
+static const struct pci_device_id vmxnet3_pciid_table[] = {
 	{PCI_VDEVICE(VMWARE, PCI_DEVICE_ID_VMWARE_VMXNET3)},
 	{0}
 };
@@ -1052,9 +1052,9 @@ vmxnet3_tq_xmit(struct sk_buff *skb, struct vmxnet3_tx_queue *tq,
 		le32_add_cpu(&tq->shared->txNumDeferred, 1);
 	}
 
-	if (vlan_tx_tag_present(skb)) {
+	if (skb_vlan_tag_present(skb)) {
 		gdesc->txd.ti = 1;
-		gdesc->txd.tci = vlan_tx_tag_get(skb);
+		gdesc->txd.tci = skb_vlan_tag_get(skb);
 	}
 
 	/* finally flips the GEN bit of the SOP desc. */

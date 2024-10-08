@@ -45,14 +45,14 @@ static bool static_hdmi_pcm;
 module_param(static_hdmi_pcm, bool, 0644);
 MODULE_PARM_DESC(static_hdmi_pcm, "Don't restrict PCM parameters per ELD info");
 
-#define is_haswell(codec)  ((codec)->vendor_id == 0x80862807)
-#define is_broadwell(codec)    ((codec)->vendor_id == 0x80862808)
-#define is_skylake(codec) ((codec)->vendor_id == 0x80862809)
+#define is_haswell(codec)  ((codec)->core.vendor_id == 0x80862807)
+#define is_broadwell(codec)    ((codec)->core.vendor_id == 0x80862808)
+#define is_skylake(codec) ((codec)->core.vendor_id == 0x80862809)
 #define is_haswell_plus(codec) (is_haswell(codec) || is_broadwell(codec) \
 					|| is_skylake(codec))
 
-#define is_valleyview(codec) ((codec)->vendor_id == 0x80862882)
-#define is_cherryview(codec) ((codec)->vendor_id == 0x80862883)
+#define is_valleyview(codec) ((codec)->core.vendor_id == 0x80862882)
+#define is_cherryview(codec) ((codec)->core.vendor_id == 0x80862883)
 #define is_valleyview_plus(codec) (is_valleyview(codec) || is_cherryview(codec))
 
 struct hdmi_spec_per_cvt {
@@ -86,7 +86,7 @@ struct hdmi_spec_per_pin {
 	bool non_pcm;
 	bool chmap_set;		/* channel-map override by ALSA API? */
 	unsigned char chmap[8]; /* ALSA API channel-map */
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 	struct snd_info_entry *proc_entry;
 #endif
 };
@@ -548,7 +548,7 @@ static void hdmi_set_channel_count(struct hda_codec *codec,
  * ELD proc files
  */
 
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 static void print_eld_info(struct snd_info_entry *entry,
 			   struct snd_info_buffer *buffer)
 {
@@ -1391,13 +1391,12 @@ static void intel_not_share_assigned_cvt(struct hda_codec *codec,
 			hda_nid_t pin_nid, int mux_idx)
 {
 	struct hdmi_spec *spec = codec->spec;
-	hda_nid_t nid, end_nid;
+	hda_nid_t nid;
 	int cvt_idx, curr;
 	struct hdmi_spec_per_cvt *per_cvt;
 
 	/* configure all pins, including "no physical connection" ones */
-	end_nid = codec->start_nid + codec->num_nodes;
-	for (nid = codec->start_nid; nid < end_nid; nid++) {
+	for_each_hda_codec_node(nid, codec) {
 		unsigned int wid_caps = get_wcaps(codec, nid);
 		unsigned int wid_type = get_wcaps_type(wid_caps);
 
@@ -1546,7 +1545,7 @@ static bool hdmi_present_sense(struct hdmi_spec_per_pin *per_pin, int repoll)
 	bool eld_changed = false;
 	bool ret;
 
-	snd_hda_power_up(codec);
+	snd_hda_power_up_pm(codec);
 	present = snd_hda_pin_sense(codec, pin_nid);
 
 	mutex_lock(&per_pin->lock);
@@ -1632,7 +1631,7 @@ static bool hdmi_present_sense(struct hdmi_spec_per_pin *per_pin, int repoll)
 		jack->block_report = !ret;
 
 	mutex_unlock(&per_pin->lock);
-	snd_hda_power_down(codec);
+	snd_hda_power_down_pm(codec);
 	return ret;
 }
 
@@ -1728,7 +1727,7 @@ static int hdmi_parse_codec(struct hda_codec *codec)
 	hda_nid_t nid;
 	int i, nodes;
 
-	nodes = snd_hda_get_sub_nodes(codec, codec->afg, &nid);
+	nodes = snd_hda_get_sub_nodes(codec, codec->core.afg, &nid);
 	if (!nid || nodes < 0) {
 		codec_warn(codec, "HDMI: failed to get afg sub nodes\n");
 		return -EINVAL;
@@ -2080,7 +2079,7 @@ static int generic_hdmi_build_jack(struct hda_codec *codec, int pin_idx)
 		strncat(hdmi_str, " Phantom",
 			sizeof(hdmi_str) - strlen(hdmi_str) - 1);
 
-	return snd_hda_jack_add_kctl(codec, per_pin->pin_nid, hdmi_str, 0);
+	return snd_hda_jack_add_kctl(codec, per_pin->pin_nid, hdmi_str);
 }
 
 static int generic_hdmi_build_controls(struct hda_codec *codec)
@@ -2210,8 +2209,7 @@ static int generic_hdmi_resume(struct hda_codec *codec)
 	int pin_idx;
 
 	codec->patch_ops.init(codec);
-	snd_hda_codec_resume_amp(codec);
-	snd_hda_codec_resume_cache(codec);
+	regcache_sync(codec->core.regmap);
 
 	for (pin_idx = 0; pin_idx < spec->num_pins; pin_idx++) {
 		struct hdmi_spec_per_pin *per_pin = get_pin(spec, pin_idx);
@@ -2298,6 +2296,7 @@ static void intel_haswell_fixup_enable_dp12(struct hda_codec *codec)
 
 	/* enable DP1.2 mode */
 	vendor_param |= INTEL_EN_DP12;
+	snd_hdac_regmap_add_vendor_verb(&codec->core, INTEL_SET_VENDOR_VERB);
 	snd_hda_codec_write_cache(codec, INTEL_VENDOR_NID, 0,
 				INTEL_SET_VENDOR_VERB, vendor_param);
 }
@@ -2333,6 +2332,15 @@ static int patch_generic_hdmi(struct hda_codec *codec)
 		intel_haswell_enable_all_pins(codec, true);
 		intel_haswell_fixup_enable_dp12(codec);
 	}
+
+	/* For Valleyview/Cherryview, only the display codec is in the display
+	 * power well and can use link_power ops to request/release the power.
+	 * For Haswell/Broadwell, the controller is also in the power well and
+	 * can cover the codec power request, and so need not set this flag.
+	 * For previous platforms, there is no such power well feature.
+	 */
+	if (is_valleyview_plus(codec) || is_skylake(codec))
+		codec->core.link_power_control = 1;
 
 	if (is_haswell_plus(codec) || is_valleyview_plus(codec))
 		codec->depop_delay = 0;
@@ -3091,7 +3099,8 @@ static int patch_tegra_hdmi(struct hda_codec *codec)
  */
 
 #define is_amdhdmi_rev3_or_later(codec) \
-	((codec)->vendor_id == 0x1002aa01 && ((codec)->revision_id & 0xff00) >= 0x0300)
+	((codec)->core.vendor_id == 0x1002aa01 && \
+	 ((codec)->core.revision_id & 0xff00) >= 0x0300)
 #define has_amd_full_remap_support(codec) is_amdhdmi_rev3_or_later(codec)
 
 /* ATI/AMD specific HDA pin verbs, see the AMD HDA Verbs specification */

@@ -65,9 +65,7 @@ enum {
 };
 
 struct neigh_parms {
-#ifdef CONFIG_NET_NS
-	struct net *net;
-#endif
+	possible_net_t net;
 	struct net_device *dev;
 	struct neigh_parms *next;
 	int	(*neigh_setup)(struct neighbour *);
@@ -162,9 +160,7 @@ struct neigh_ops {
 
 struct pneigh_entry {
 	struct pneigh_entry	*next;
-#ifdef CONFIG_NET_NS
-	struct net		*net;
-#endif
+	possible_net_t		net;
 	struct net_device	*dev;
 	u8			flags;
 	u8			key[0];

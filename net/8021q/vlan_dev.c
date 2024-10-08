@@ -563,7 +563,6 @@ static int vlan_dev_init(struct net_device *dev)
 	/* IFF_BROADCAST|IFF_MULTICAST; ??? */
 	dev->flags  = real_dev->flags & ~(IFF_UP | IFF_PROMISC | IFF_ALLMULTI |
 					  IFF_MASTER | IFF_SLAVE);
-	dev->iflink = real_dev->ifindex;
 	dev->state  = (real_dev->state & ((1<<__LINK_STATE_NOCARRIER) |
 					  (1<<__LINK_STATE_DORMANT))) |
 		      (1<<__LINK_STATE_PRESENT);
@@ -575,6 +574,8 @@ static int vlan_dev_init(struct net_device *dev)
 
 	dev->features |= real_dev->vlan_features | NETIF_F_LLTX;
 	dev->gso_max_size = real_dev->gso_max_size;
+
+	dev->vlan_features = real_dev->vlan_features & ~NETIF_F_ALL_FCOE;
 
 	/* ipv6 shared card related stuff */
 	dev->dev_id = real_dev->dev_id;
@@ -606,7 +607,7 @@ static int vlan_dev_init(struct net_device *dev)
 
 	vlan_dev_set_lockdep_class(dev, subclass);
 
-	vlan_dev_priv(dev)->vlan_pcpu_stats = alloc_percpu(struct vlan_pcpu_stats);
+	vlan_dev_priv(dev)->vlan_pcpu_stats = netdev_alloc_pcpu_stats(struct vlan_pcpu_stats);
 	if (!vlan_dev_priv(dev)->vlan_pcpu_stats)
 		return -ENOMEM;
 
@@ -675,13 +676,13 @@ static struct rtnl_link_stats64 *vlan_dev_get_stats64(struct net_device *dev, st
 
 			p = per_cpu_ptr(vlan_dev_priv(dev)->vlan_pcpu_stats, i);
 			do {
-				start = u64_stats_fetch_begin_bh(&p->syncp);
+				start = u64_stats_fetch_begin_irq(&p->syncp);
 				rxpackets	= p->rx_packets;
 				rxbytes		= p->rx_bytes;
 				rxmulticast	= p->rx_multicast;
 				txpackets	= p->tx_packets;
 				txbytes		= p->tx_bytes;
-			} while (u64_stats_fetch_retry_bh(&p->syncp, start));
+			} while (u64_stats_fetch_retry_irq(&p->syncp, start));
 
 			stats->rx_packets	+= rxpackets;
 			stats->rx_bytes		+= rxbytes;
@@ -743,6 +744,13 @@ static void vlan_dev_netpoll_cleanup(struct net_device *dev)
 }
 #endif /* CONFIG_NET_POLL_CONTROLLER */
 
+static int vlan_dev_get_iflink(const struct net_device *dev)
+{
+	struct net_device *real_dev = vlan_dev_priv(dev)->real_dev;
+
+	return real_dev->ifindex;
+}
+
 static const struct ethtool_ops vlan_ethtool_ops = {
 	.get_settings	        = vlan_ethtool_get_settings,
 	.get_drvinfo	        = vlan_ethtool_get_drvinfo,
@@ -777,6 +785,7 @@ static const struct net_device_ops vlan_netdev_ops = {
 	.ndo_netpoll_cleanup	= vlan_dev_netpoll_cleanup,
 #endif
 	.ndo_fix_features	= vlan_dev_fix_features,
+	.ndo_get_iflink		= vlan_dev_get_iflink,
 };
 
 void vlan_setup(struct net_device *dev)
@@ -784,7 +793,8 @@ void vlan_setup(struct net_device *dev)
 	ether_setup(dev);
 
 	dev->priv_flags		|= IFF_802_1Q_VLAN;
-	dev->priv_flags		&= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
+	dev->priv_flags		&= ~IFF_TX_SKB_SHARING;
+	netif_keep_dst(dev);
 	dev->tx_queue_len	= 0;
 
 	dev->netdev_ops		= &vlan_netdev_ops;

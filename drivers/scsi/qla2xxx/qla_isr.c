@@ -327,15 +327,16 @@ qla81xx_idc_event(scsi_qla_host_t *vha, uint16_t aen, uint16_t descr)
 const char *
 qla2x00_get_link_speed_str(struct qla_hw_data *ha, uint16_t speed)
 {
-	static const char * const link_speeds[] = {
-		"1", "2", "?", "4", "8", "16", "10"
+	static const char *const link_speeds[] = {
+		"1", "2", "?", "4", "8", "16", "32", "10"
 	};
+#define	QLA_LAST_SPEED	7
 
 	if (IS_QLA2100(ha) || IS_QLA2200(ha))
 		return link_speeds[0];
 	else if (speed == 0x13)
-		return link_speeds[6];
-	else if (speed < 6)
+		return link_speeds[QLA_LAST_SPEED];
+	else if (speed < QLA_LAST_SPEED)
 		return link_speeds[speed];
 	else
 		return link_speeds[LS_UNKNOWN];
@@ -621,7 +622,7 @@ skip_rio:
 		break;
 
 	case MBA_SYSTEM_ERR:		/* System Error */
-		mbx = (IS_QLA81XX(ha) || IS_QLA83XX(ha)) ?
+		mbx = (IS_QLA81XX(ha) || IS_QLA83XX(ha) || IS_QLA27XX(ha)) ?
 			RD_REG_WORD(&reg24->mailbox7) : 0;
 		ql_log(ql_log_warn, vha, 0x5003,
 		    "ISP System Error - mbx1=%xh mbx2=%xh mbx3=%xh "
@@ -638,7 +639,7 @@ skip_rio:
 				vha->device_flags |= DFLG_DEV_FAILED;
 			} else {
 				/* Check to see if MPI timeout occurred */
-				if ((mbx & MBX_3) && (ha->flags.port0))
+				if ((mbx & MBX_3) && (ha->port_no == 0))
 					set_bit(MPI_RESET_NEEDED,
 					    &vha->dpc_flags);
 
@@ -721,6 +722,26 @@ skip_rio:
 		if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
 			atomic_set(&vha->loop_state, LOOP_DOWN);
 			atomic_set(&vha->loop_down_timer, LOOP_DOWN_TIME);
+			/*
+			 * In case of loop down, restore WWPN from
+			 * NVRAM in case of FA-WWPN capable ISP
+			 * Restore for Physical Port only
+			 */
+			if (!vha->vp_idx) {
+				if (ha->flags.fawwpn_enabled) {
+					void *wwpn = ha->init_cb->port_name;
+					memcpy(vha->port_name, wwpn, WWN_SIZE);
+					fc_host_port_name(vha->host) =
+					    wwn_to_u64(vha->port_name);
+					ql_dbg(ql_dbg_init + ql_dbg_verbose,
+					    vha, 0x0144, "LOOP DOWN detected,"
+					    "restore WWPN %016llx\n",
+					    wwn_to_u64(vha->port_name));
+				}
+
+				clear_bit(VP_CONFIG_OK, &vha->vp_flags);
+			}
+
 			vha->device_flags |= DFLG_NO_CABLE;
 			qla2x00_mark_all_devices_lost(vha, 1);
 		}
@@ -905,6 +926,7 @@ skip_rio:
 
 		set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
 		set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
+		set_bit(VP_CONFIG_OK, &vha->vp_flags);
 
 		qlt_async_event(mb[0], vha, mb);
 		break;
@@ -1067,6 +1089,14 @@ skip_rio:
 		mb[6] = RD_REG_WORD(&reg24->mailbox6);
 		mb[7] = RD_REG_WORD(&reg24->mailbox7);
 		qla83xx_handle_8200_aen(vha, mb);
+		break;
+
+	case MBA_DPORT_DIAGNOSTICS:
+		ql_dbg(ql_dbg_async, vha, 0x5052,
+		    "D-Port Diagnostics: %04x %04x=%s\n", mb[0], mb[1],
+		    mb[1] == 0 ? "start" :
+		    mb[1] == 1 ? "done (ok)" :
+		    mb[1] == 2 ? "done (error)" : "other");
 		break;
 
 	default:
@@ -1984,14 +2014,18 @@ qla2x00_status_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, void *pkt)
 	}
 
 	/* Validate handle. */
-	if (handle < req->num_outstanding_cmds)
+	if (handle < req->num_outstanding_cmds) {
 		sp = req->outstanding_cmds[handle];
-	else
-		sp = NULL;
-
-	if (sp == NULL) {
+		if (!sp) {
+			ql_dbg(ql_dbg_io, vha, 0x3075,
+			    "%s(%ld): Already returned command for status handle (0x%x).\n",
+			    __func__, vha->host_no, sts->handle);
+			return;
+		}
+	} else {
 		ql_dbg(ql_dbg_io, vha, 0x3017,
-		    "Invalid status handle (0x%x).\n", sts->handle);
+		    "Invalid status handle, out of range (0x%x).\n",
+		    sts->handle);
 
 		if (!test_bit(ABORT_ISP_ACTIVE, &vha->dpc_flags)) {
 			if (IS_P3P_TYPE(ha))
@@ -2278,12 +2312,12 @@ out:
 		ql_dbg(ql_dbg_io, fcport->vha, 0x3022,
 		    "FCP command status: 0x%x-0x%x (0x%x) nexus=%ld:%d:%d "
 		    "portid=%02x%02x%02x oxid=0x%x cdb=%10phN len=0x%x "
-		    "rsp_info=0x%x resid=0x%x fw_resid=0x%x.\n",
+		    "rsp_info=0x%x resid=0x%x fw_resid=0x%x sp=%p cp=%p.\n",
 		    comp_status, scsi_status, res, vha->host_no,
 		    cp->device->id, cp->device->lun, fcport->d_id.b.domain,
 		    fcport->d_id.b.area, fcport->d_id.b.al_pa, ox_id,
 		    cp->cmnd, scsi_bufflen(cp), rsp_info_len,
-		    resid_len, fw_resid_len);
+		    resid_len, fw_resid_len, sp, cp);
 
 	if (rsp->status_srb == NULL)
 		sp->done(ha, sp, res);
@@ -2542,7 +2576,8 @@ qla2xxx_check_risc_status(scsi_qla_host_t *vha)
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 
-	if (!IS_QLA25XX(ha) && !IS_QLA81XX(ha) && !IS_QLA83XX(ha))
+	if (!IS_QLA25XX(ha) && !IS_QLA81XX(ha) && !IS_QLA83XX(ha) &&
+	    !IS_QLA27XX(ha))
 		return;
 
 	rval = QLA_SUCCESS;
@@ -2972,7 +3007,7 @@ msix_register_fail:
 	}
 
 	/* Enable MSI-X vector for response queue update for queue 0 */
-	if (IS_QLA83XX(ha)) {
+	if (IS_QLA83XX(ha) || IS_QLA27XX(ha)) {
 		if (ha->msixbase && ha->mqiobase &&
 		    (ha->max_rsp_queues > 1 || ha->max_req_queues > 1))
 			ha->mqenable = 1;
@@ -2996,12 +3031,13 @@ int
 qla2x00_request_irqs(struct qla_hw_data *ha, struct rsp_que *rsp)
 {
 	int ret = QLA_FUNCTION_FAILED;
-	device_reg_t __iomem *reg = ha->iobase;
+	device_reg_t *reg = ha->iobase;
 	scsi_qla_host_t *vha = pci_get_drvdata(ha->pdev);
 
 	/* If possible, enable MSI-X. */
 	if (!IS_QLA2432(ha) && !IS_QLA2532(ha) && !IS_QLA8432(ha) &&
-		!IS_CNA_CAPABLE(ha) && !IS_QLA2031(ha) && !IS_QLAFX00(ha))
+	    !IS_CNA_CAPABLE(ha) && !IS_QLA2031(ha) && !IS_QLAFX00(ha) &&
+	    !IS_QLA27XX(ha))
 		goto skip_msi;
 
 	if (ha->pdev->subsystem_vendor == PCI_VENDOR_ID_HP &&
@@ -3036,7 +3072,8 @@ skip_msix:
 	    "Falling back-to MSI mode -%d.\n", ret);
 
 	if (!IS_QLA24XX(ha) && !IS_QLA2532(ha) && !IS_QLA8432(ha) &&
-	    !IS_QLA8001(ha) && !IS_P3P_TYPE(ha) && !IS_QLAFX00(ha))
+	    !IS_QLA8001(ha) && !IS_P3P_TYPE(ha) && !IS_QLAFX00(ha) &&
+	    !IS_QLA27XX(ha))
 		goto skip_msi;
 
 	ret = pci_enable_msi(ha->pdev);

@@ -881,7 +881,7 @@ static int __cmd_report(bool display_info)
 	if (select_key())
 		goto out_delete;
 
-	err = perf_session__process_events(session, &eops);
+	err = perf_session__process_events(session);
 	if (err)
 		goto out_delete;
 

@@ -20,7 +20,6 @@
 
 #include "xfs_inode_buf.h"
 #include "xfs_inode_fork.h"
-#include "xfs_dinode.h"
 
 /*
  * Kernel only inode definitions
@@ -63,6 +62,7 @@ typedef struct xfs_inode {
 	/* Miscellaneous state. */
 	unsigned long		i_flags;	/* see defined flags below */
 	unsigned int		i_delayed_blks;	/* count of delay alloc blks */
+	spinlock_t		i_size_lock;	/* concurrent dio i_size lock */
 
 	xfs_icdinode_t		i_d;		/* most of ondisk inode */
 
@@ -210,7 +210,6 @@ xfs_get_initial_prid(struct xfs_inode *dp)
 #define XFS_ISTALE		(1 << 1) /* inode has been staled */
 #define XFS_IRECLAIMABLE	(1 << 2) /* inode can be reclaimed */
 #define XFS_INEW		(1 << 3) /* inode has just been allocated */
-#define XFS_IFILESTREAM		(1 << 4) /* inode is in a filestream dir. */
 #define XFS_ITRUNCATED		(1 << 5) /* truncated down so flush-on-close */
 #define XFS_IDIRTY_RELEASE	(1 << 6) /* dirty release already seen */
 #define __XFS_IFLOCK_BIT	7	 /* inode is being flushed right now */
@@ -226,8 +225,7 @@ xfs_get_initial_prid(struct xfs_inode *dp)
  */
 #define XFS_IRECLAIM_RESET_FLAGS	\
 	(XFS_IRECLAIMABLE | XFS_IRECLAIM | \
-	 XFS_IDIRTY_RELEASE | XFS_ITRUNCATED | \
-	 XFS_IFILESTREAM);
+	 XFS_IDIRTY_RELEASE | XFS_ITRUNCATED)
 
 /*
  * Synchronize processes attempting to flush the in-core inode back to disk.
@@ -341,7 +339,6 @@ static inline int xfs_isiflocked(struct xfs_inode *ip)
 	(((pip)->i_mount->m_flags & XFS_MOUNT_GRPID) || \
 	 ((pip)->i_d.di_mode & S_ISGID))
 
-
 int		xfs_release(struct xfs_inode *ip);
 void		xfs_inactive(struct xfs_inode *ip);
 int		xfs_lookup(struct xfs_inode *dp, struct xfs_name *name,
@@ -357,7 +354,7 @@ int		xfs_link(struct xfs_inode *tdp, struct xfs_inode *sip,
 int		xfs_rename(struct xfs_inode *src_dp, struct xfs_name *src_name,
 			   struct xfs_inode *src_ip, struct xfs_inode *target_dp,
 			   struct xfs_name *target_name,
-			   struct xfs_inode *target_ip);
+			   struct xfs_inode *target_ip, unsigned int flags);
 
 void		xfs_ilock(xfs_inode_t *, uint);
 int		xfs_ilock_nowait(xfs_inode_t *, uint);
@@ -394,12 +391,42 @@ int		xfs_dir_ialloc(struct xfs_trans **, struct xfs_inode *, umode_t,
 			       struct xfs_inode **, int *);
 int		xfs_droplink(struct xfs_trans *, struct xfs_inode *);
 int		xfs_bumplink(struct xfs_trans *, struct xfs_inode *);
-void		xfs_bump_ino_vers2(struct xfs_trans *, struct xfs_inode *);
 
 /* from xfs_file.c */
-int		xfs_zero_eof(struct xfs_inode *, xfs_off_t, xfs_fsize_t);
-int		xfs_iozero(struct xfs_inode *, loff_t, size_t);
+enum xfs_prealloc_flags {
+	XFS_PREALLOC_SET	= (1 << 1),
+	XFS_PREALLOC_CLEAR	= (1 << 2),
+	XFS_PREALLOC_SYNC	= (1 << 3),
+	XFS_PREALLOC_INVISIBLE	= (1 << 4),
+};
 
+int	xfs_update_prealloc_flags(struct xfs_inode *ip,
+				  enum xfs_prealloc_flags flags);
+int	xfs_zero_eof(struct xfs_inode *ip, xfs_off_t offset,
+		     xfs_fsize_t isize, bool *did_zeroing);
+int	xfs_iozero(struct xfs_inode *ip, loff_t pos, size_t count);
+
+/* from xfs_iops.c */
+/*
+ * When setting up a newly allocated inode, we need to call
+ * xfs_finish_inode_setup() once the inode is fully instantiated at
+ * the VFS level to prevent the rest of the world seeing the inode
+ * before we've completed instantiation. Otherwise we can do it
+ * the moment the inode lookup is complete.
+ */
+extern void xfs_setup_inode(struct xfs_inode *ip);
+static inline void xfs_finish_inode_setup(struct xfs_inode *ip)
+{
+	xfs_iflags_clear(ip, XFS_INEW);
+	barrier();
+	unlock_new_inode(VFS_I(ip));
+}
+
+static inline void xfs_setup_existing_inode(struct xfs_inode *ip)
+{
+	xfs_setup_inode(ip);
+	xfs_finish_inode_setup(ip);
+}
 
 #define IHOLD(ip) \
 do { \
@@ -415,5 +442,15 @@ do { \
 } while (0)
 
 extern struct kmem_zone	*xfs_inode_zone;
+
+/*
+ * Flags for read/write calls
+ */
+#define XFS_IO_ISDIRECT	0x00001		/* bypass page cache */
+#define XFS_IO_INVIS	0x00002		/* don't update inode timestamps */
+
+#define XFS_IO_FLAGS \
+	{ XFS_IO_ISDIRECT,	"DIRECT" }, \
+	{ XFS_IO_INVIS,		"INVIS"}
 
 #endif	/* __XFS_INODE_H__ */

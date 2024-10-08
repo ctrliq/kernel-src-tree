@@ -30,7 +30,7 @@
  *
  * Neither the 82576 nor the 82580 offer registers wide enough to hold
  * nanoseconds time values for very long. For the 82580, SYSTIM always
- * counts nanoseconds, but the upper 24 bits are not availible. The
+ * counts nanoseconds, but the upper 24 bits are not available. The
  * frequency is adjusted by changing the 32 bit fractional nanoseconds
  * register, TIMINCA.
  *
@@ -629,7 +629,8 @@ static void igb_ptp_overflow_check(struct work_struct *work)
 
 	igb->ptp_caps.gettime64(&igb->ptp_caps, &ts);
 
-	pr_debug("igb overflow check at %lld.%09lu\n", ts.tv_sec, ts.tv_nsec);
+	pr_debug("igb overflow check at %lld.%09lu\n",
+		 (long long) ts.tv_sec, ts.tv_nsec);
 
 	schedule_delayed_work(&igb->ptp_overflow_work,
 			      IGB_SYSTIM_OVERFLOW_PERIOD);

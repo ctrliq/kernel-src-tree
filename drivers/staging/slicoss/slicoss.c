@@ -791,8 +791,8 @@ static bool slic_mac_filter(struct adapter *adapter,
 			struct mcast_address *mcaddr = adapter->mcastaddrs;
 
 			while (mcaddr) {
-				if (ether_addr_equal(mcaddr->address,
-						     ether_frame->ether_dhost)) {
+				if (!compare_ether_addr(mcaddr->address,
+							ether_frame->ether_dhost)) {
 					adapter->rcv_multicasts++;
 					netdev->stats.multicast++;
 					return true;
@@ -2333,7 +2333,7 @@ static int slic_mcast_add_list(struct adapter *adapter, char *address)
 	/* Check to see if it already exists */
 	mlist = adapter->mcastaddrs;
 	while (mlist) {
-		if (ether_addr_equal(mlist->address, address))
+		if (!compare_ether_addr(mlist->address, address))
 			return 0;
 		mlist = mlist->next;
 	}

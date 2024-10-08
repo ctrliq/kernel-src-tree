@@ -474,6 +474,28 @@ static void loop_add_bio(struct loop_device *lo, struct bio *bio)
 	bio_list_add(&lo->lo_bio_list, bio);
 }
 
+static void loop_reread_partitions(struct loop_device *lo,
+				   struct block_device *bdev)
+{
+	int rc;
+
+	/*
+	 * bd_mutex has been held already in release path, so don't
+	 * acquire it if this function is called in such case.
+	 *
+	 * If the reread partition isn't from release path, lo_refcnt
+	 * must be at least one and it can only become zero when the
+	 * current holder is released.
+	 */
+	if (!atomic_read(&lo->lo_refcnt))
+		rc = __blkdev_reread_part(bdev);
+	else
+		rc = blkdev_reread_part(bdev);
+	if (rc)
+		pr_warn("%s: partition scan of loop%d (%s) failed (rc=%d)\n",
+			__func__, lo->lo_number, lo->lo_file_name, rc);
+}
+
 /*
  * Grab first pending buffer
  */
@@ -626,28 +648,6 @@ out:
 	complete(&p->wait);
 }
 
-
-static void loop_reread_partitions(struct loop_device *lo,
-				   struct block_device *bdev)
-{
-	int rc;
-
-	/*
-	 * bd_mutex has been held already in release path, so don't
-	 * acquire it if this function is called in such case.
-	 *
-	 * If the reread partition isn't from release path, lo_refcnt
-	 * must be at least one and it can only become zero when the
-	 * current holder is released.
-	 */
-	if (!atomic_read(&lo->lo_refcnt))
-		rc = __blkdev_reread_part(bdev);
-	else
-		rc = blkdev_reread_part(bdev);
-	if (rc)
-		pr_warn("%s: partition scan of loop%d (%s) failed (rc=%d)\n",
-			__func__, lo->lo_number, lo->lo_file_name, rc);
-}
 
 /*
  * loop_change_fd switched the backing store of a loopback device to
@@ -1031,9 +1031,6 @@ static int loop_clr_fd(struct loop_device *lo)
 	if (filp == NULL)
 		return -EINVAL;
 
-	/* freeze request queue during the transition */
-	blk_mq_freeze_queue(lo->lo_queue);
-
 	spin_lock_irq(&lo->lo_lock);
 	lo->lo_state = Lo_rundown;
 	spin_unlock_irq(&lo->lo_lock);
@@ -1071,7 +1068,6 @@ static int loop_clr_fd(struct loop_device *lo)
 	lo->lo_state = Lo_unbound;
 	/* This is safe: open() is still holding a reference. */
 	module_put(THIS_MODULE);
-	blk_mq_unfreeze_queue(lo->lo_queue);
 
 	if (lo->lo_flags & LO_FLAGS_PARTSCAN && bdev)
 		loop_reread_partitions(lo, bdev);

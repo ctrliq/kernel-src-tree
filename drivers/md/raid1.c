@@ -496,7 +496,6 @@ static void raid1_end_write_request(struct bio *bio, int error)
 		bio_put(to_put);
 }
 
-
 /*
  * This routine returns the disk from which the requested read should
  * be done. There is a per-array 'next expected sequential IO' sector
@@ -839,10 +838,12 @@ static void raise_barrier(struct r1conf *conf, sector_t sector_nr)
 	 * C: next_resync + RESYNC_SECTORS > start_next_window, meaning
 	 *    next resync will reach to the window which normal bios are
 	 *    handling.
+	 * D: while there are any active requests in the current window.
 	 */
 	wait_event_lock_irq(conf->wait_barrier,
 			    !conf->array_frozen &&
 			    conf->barrier < RESYNC_DEPTH &&
+			    conf->current_window_requests == 0 &&
 			    (conf->start_next_window >=
 			     conf->next_resync + RESYNC_SECTORS),
 			    conf->resync_lock);
@@ -869,12 +870,10 @@ static bool need_to_wait_for_sync(struct r1conf *conf, struct bio *bio)
 	if (conf->array_frozen || !bio)
 		wait = true;
 	else if (conf->barrier && bio_data_dir(bio) == WRITE) {
-		if (conf->next_resync < RESYNC_WINDOW_SECTORS)
-			wait = true;
-		else if ((conf->next_resync - RESYNC_WINDOW_SECTORS
-				>= bio_end_sector(bio)) ||
-			 (conf->next_resync + NEXT_NORMALIO_DISTANCE
-				<= bio->bi_sector))
+		if ((conf->mddev->curr_resync_completed
+		     >= bio_end_sector(bio)) ||
+		    (conf->next_resync + NEXT_NORMALIO_DISTANCE
+		     <= bio->bi_sector))
 			wait = false;
 		else
 			wait = true;
@@ -911,8 +910,7 @@ static sector_t wait_barrier(struct r1conf *conf, struct bio *bio)
 	}
 
 	if (bio && bio_data_dir(bio) == WRITE) {
-		if (conf->next_resync + NEXT_NORMALIO_DISTANCE
-		    <= bio->bi_sector) {
+		if (bio->bi_sector >= conf->next_resync) {
 			if (conf->start_next_window == MaxSector)
 				conf->start_next_window =
 					conf->next_resync +
@@ -994,8 +992,7 @@ static void unfreeze_array(struct r1conf *conf)
 	spin_unlock_irq(&conf->resync_lock);
 }
 
-
-/* duplicate the data pages for behind I/O 
+/* duplicate the data pages for behind I/O
  */
 static void alloc_behind_pages(struct bio *bio, struct r1bio *r1_bio)
 {
@@ -1461,7 +1458,6 @@ static void status(struct seq_file *seq, struct mddev *mddev)
 	seq_printf(seq, "]");
 }
 
-
 static void error(struct mddev *mddev, struct md_rdev *rdev)
 {
 	char b[BDEVNAME_SIZE];
@@ -1539,7 +1535,7 @@ static void close_sync(struct r1conf *conf)
 	conf->r1buf_pool = NULL;
 
 	spin_lock_irq(&conf->resync_lock);
-	conf->next_resync = 0;
+	conf->next_resync = MaxSector - 2 * NEXT_NORMALIO_DISTANCE;
 	conf->start_next_window = MaxSector;
 	conf->current_window_requests +=
 		conf->next_window_requests;
@@ -1555,7 +1551,7 @@ static int raid1_spare_active(struct mddev *mddev)
 	unsigned long flags;
 
 	/*
-	 * Find all failed disks within the RAID1 configuration 
+	 * Find all failed disks within the RAID1 configuration
 	 * and mark them readable.
 	 * Called under mddev lock, so rcu protection not needed.
 	 * device_lock used to avoid races with raid1_end_read_request
@@ -1597,7 +1593,6 @@ static int raid1_spare_active(struct mddev *mddev)
 	print_conf(conf);
 	return count;
 }
-
 
 static int raid1_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 {
@@ -1726,7 +1721,6 @@ abort:
 	print_conf(conf);
 	return err;
 }
-
 
 static void end_sync_read(struct bio *bio, int error)
 {
@@ -2448,7 +2442,6 @@ static void raid1d(struct md_thread *thread)
 	blk_finish_plug(&plug);
 }
 
-
 static int init_resync(struct r1conf *conf)
 {
 	int buffs;
@@ -2705,7 +2698,7 @@ static sector_t sync_request(struct mddev *mddev, sector_t sector_nr, int *skipp
 						/* remove last page from this bio */
 						bio->bi_vcnt--;
 						bio->bi_size -= len;
-						bio->bi_flags &= ~(1<< BIO_SEG_VALID);
+						__clear_bit(BIO_SEG_VALID, &bio->bi_flags);
 					}
 					goto bio_full;
 				}
@@ -2872,7 +2865,7 @@ static struct r1conf *setup_conf(struct mddev *mddev)
 	return ERR_PTR(err);
 }
 
-static int stop(struct mddev *mddev);
+static void raid1_free(struct mddev *mddev, void *priv);
 static int run(struct mddev *mddev)
 {
 	struct r1conf *conf;
@@ -2894,7 +2887,7 @@ static int run(struct mddev *mddev)
 	/*
 	 * copy the already verified devices into our private RAID1
 	 * bookkeeping area. [whatever we allocate in run(),
-	 * should be freed in stop()]
+	 * should be freed in raid1_free()]
 	 */
 	if (mddev->private == NULL)
 		conf = setup_conf(mddev);
@@ -2930,9 +2923,9 @@ static int run(struct mddev *mddev)
 		printk(KERN_NOTICE "md/raid1:%s: not clean"
 		       " -- starting background reconstruction\n",
 		       mdname(mddev));
-	printk(KERN_INFO 
+	printk(KERN_INFO
 		"md/raid1:%s: active with %d out of %d mirrors\n",
-		mdname(mddev), mddev->raid_disks - mddev->degraded, 
+		mdname(mddev), mddev->raid_disks - mddev->degraded,
 		mddev->raid_disks);
 
 	/*
@@ -2954,37 +2947,23 @@ static int run(struct mddev *mddev)
 	}
 
 	ret =  md_integrity_register(mddev);
-	if (ret)
-		stop(mddev);
+	if (ret) {
+		md_unregister_thread(&mddev->thread);
+		raid1_free(mddev, conf);
+	}
 	return ret;
 }
 
-static int stop(struct mddev *mddev)
+static void raid1_free(struct mddev *mddev, void *priv)
 {
-	struct r1conf *conf = mddev->private;
-	struct bitmap *bitmap = mddev->bitmap;
+	struct r1conf *conf = priv;
 
-	/* wait for behind writes to complete */
-	if (bitmap && atomic_read(&bitmap->behind_writes) > 0) {
-		printk(KERN_INFO "md/raid1:%s: behind writes in progress - waiting to stop.\n",
-		       mdname(mddev));
-		/* need to kick something here to make sure I/O goes? */
-		wait_event(bitmap->behind_wait,
-			   atomic_read(&bitmap->behind_writes) == 0);
-	}
-
-	freeze_array(conf, 0);
-	unfreeze_array(conf);
-
-	md_unregister_thread(&mddev->thread);
 	if (conf->r1bio_pool)
 		mempool_destroy(conf->r1bio_pool);
 	kfree(conf->mirrors);
 	safe_put_page(conf->tmppage);
 	kfree(conf->poolinfo);
 	kfree(conf);
-	mddev->private = NULL;
-	return 0;
 }
 
 static int raid1_resize(struct mddev *mddev, sector_t sectors)
@@ -3167,7 +3146,7 @@ static struct md_personality raid1_personality =
 	.owner		= THIS_MODULE,
 	.make_request	= make_request,
 	.run		= run,
-	.stop		= stop,
+	.free		= raid1_free,
 	.status		= status,
 	.error_handler	= error,
 	.hot_add_disk	= raid1_add_disk,

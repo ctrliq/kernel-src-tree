@@ -2484,8 +2484,9 @@ SYSCALL_DEFINE3(getcpu, unsigned __user *, cpup, unsigned __user *, nodep,
 }
 
 char poweroff_cmd[POWEROFF_CMD_PATH_LEN] = "/sbin/poweroff";
+static const char reboot_cmd[] = "/sbin/reboot";
 
-static int __orderly_poweroff(bool force)
+static int run_cmd(const char *cmd)
 {
 	char **argv;
 	static char *envp[] = {
@@ -2494,20 +2495,41 @@ static int __orderly_poweroff(bool force)
 		NULL
 	};
 	int ret;
-
-	argv = argv_split(GFP_KERNEL, poweroff_cmd, NULL);
+	argv = argv_split(GFP_KERNEL, cmd, NULL);
 	if (argv) {
 		ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
 		argv_free(argv);
 	} else {
-		printk(KERN_WARNING "%s failed to allocate memory for \"%s\"\n",
-					 __func__, poweroff_cmd);
 		ret = -ENOMEM;
 	}
 
+	return ret;
+}
+
+static int __orderly_reboot(void)
+{
+	int ret;
+
+	ret = run_cmd(reboot_cmd);
+
+	if (ret) {
+		pr_warn("Failed to start orderly reboot: forcing the issue\n");
+		emergency_sync();
+		kernel_restart(NULL);
+	}
+
+	return ret;
+}
+
+static int __orderly_poweroff(bool force)
+{
+	int ret;
+
+	ret = run_cmd(poweroff_cmd);
+
 	if (ret && force) {
-		printk(KERN_WARNING "Failed to start orderly shutdown: "
-					"forcing the issue\n");
+		pr_warn("Failed to start orderly shutdown: forcing the issue\n");
+
 		/*
 		 * I guess this should try to kick off some daemon to sync and
 		 * poweroff asap.  Or not even bother syncing if we're doing an
@@ -2536,14 +2558,32 @@ static DECLARE_WORK(poweroff_work, poweroff_work_func);
  * This may be called from any context to trigger a system shutdown.
  * If the orderly shutdown fails, it will force an immediate shutdown.
  */
-int orderly_poweroff(bool force)
+void orderly_poweroff(bool force)
 {
 	if (force) /* do not override the pending "true" */
 		poweroff_force = true;
 	schedule_work(&poweroff_work);
-	return 0;
 }
 EXPORT_SYMBOL_GPL(orderly_poweroff);
+
+static void reboot_work_func(struct work_struct *work)
+{
+	__orderly_reboot();
+}
+
+static DECLARE_WORK(reboot_work, reboot_work_func);
+
+/**
+ * orderly_reboot - Trigger an orderly system reboot
+ *
+ * This may be called from any context to trigger a system reboot.
+ * If the orderly reboot fails, it will force an immediate reboot.
+ */
+void orderly_reboot(void)
+{
+	schedule_work(&reboot_work);
+}
+EXPORT_SYMBOL_GPL(orderly_reboot);
 
 /**
  * do_sysinfo - fill in sysinfo struct

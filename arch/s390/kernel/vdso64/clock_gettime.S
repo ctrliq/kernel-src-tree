@@ -22,9 +22,7 @@ __kernel_clock_gettime:
 	larl	%r5,_vdso_data
 	cghi	%r2,__CLOCK_REALTIME
 	je	4f
-	cghi	%r2,__CLOCK_THREAD_CPUTIME_ID
-	je	9f
-	cghi	%r2,-2		/* Per-thread CPUCLOCK with PID=0, VIRT=1 */
+	cghi	%r2,-3		/* Per-thread CPUCLOCK with PID=0, VIRT=1 */
 	je	9f
 	cghi	%r2,__CLOCK_MONOTONIC
 	jne	12f
@@ -83,7 +81,7 @@ __kernel_clock_gettime:
 8:	lghi	%r2,0
 	br	%r14
 
-	/* CLOCK_THREAD_CPUTIME_ID for this thread */
+	/* CPUCLOCK_VIRT for this thread */
 9:	icm	%r0,15,__VDSO_ECTG_OK(%r5)
 	jz	12f
 	ear	%r2,%a4

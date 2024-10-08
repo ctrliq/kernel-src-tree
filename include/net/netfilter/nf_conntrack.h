@@ -108,9 +108,7 @@ struct nf_conn {
 
 	/* Extensions */
 	struct nf_ct_ext *ext;
-#ifdef CONFIG_NET_NS
-	struct net *ct_net;
-#endif
+	possible_net_t ct_net;
 
 	/* Storage reserved for other modules, must be the last member */
 	union nf_conntrack_proto proto;

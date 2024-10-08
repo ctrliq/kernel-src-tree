@@ -22,8 +22,6 @@
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
 #include "xfs_bit.h"
-#include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_da_format.h"
 #include "xfs_da_btree.h"
@@ -42,7 +40,6 @@
 #include "xfs_quota.h"
 #include "xfs_trans_space.h"
 #include "xfs_trace.h"
-#include "xfs_dinode.h"
 
 /*
  * xfs_attr.c
@@ -85,7 +82,7 @@ xfs_attr_args_init(
 {
 
 	if (!name)
-		return EINVAL;
+		return -EINVAL;
 
 	memset(args, 0, sizeof(*args));
 	args->geo = dp->i_mount->m_attr_geo;
@@ -95,7 +92,7 @@ xfs_attr_args_init(
 	args->name = name;
 	args->namelen = strlen((const char *)name);
 	if (args->namelen >= MAXNAMELEN)
-		return EFAULT;		/* match IRIX behaviour */
+		return -EFAULT;		/* match IRIX behaviour */
 
 	args->hashval = xfs_da_hashname(args->name, args->namelen);
 	return 0;
@@ -131,10 +128,10 @@ xfs_attr_get(
 	XFS_STATS_INC(xs_attr_get);
 
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
-		return EIO;
+		return -EIO;
 
 	if (!xfs_inode_hasattr(ip))
-		return ENOATTR;
+		return -ENOATTR;
 
 	error = xfs_attr_args_init(&args, ip, name, flags);
 	if (error)
@@ -145,7 +142,7 @@ xfs_attr_get(
 
 	lock_mode = xfs_ilock_attr_map_shared(ip);
 	if (!xfs_inode_hasattr(ip))
-		error = ENOATTR;
+		error = -ENOATTR;
 	else if (ip->i_d.di_aformat == XFS_DINODE_FMT_LOCAL)
 		error = xfs_attr_shortform_getvalue(&args);
 	else if (xfs_bmap_one_block(ip, XFS_ATTR_FORK))
@@ -155,7 +152,7 @@ xfs_attr_get(
 	xfs_iunlock(ip, lock_mode);
 
 	*valuelenp = args.valuelen;
-	return error == EEXIST ? 0 : error;
+	return error == -EEXIST ? 0 : error;
 }
 
 /*
@@ -163,12 +160,10 @@ xfs_attr_get(
  */
 STATIC int
 xfs_attr_calc_size(
-	struct xfs_inode 	*ip,
-	int			namelen,
-	int			valuelen,
+	struct xfs_da_args	*args,
 	int			*local)
 {
-	struct xfs_mount 	*mp = ip->i_mount;
+	struct xfs_mount	*mp = args->dp->i_mount;
 	int			size;
 	int			nblks;
 
@@ -176,12 +171,10 @@ xfs_attr_calc_size(
 	 * Determine space new attribute will use, and if it would be
 	 * "local" or "remote" (note: local != inline).
 	 */
-	size = xfs_attr_leaf_newentsize(namelen, valuelen,
-					mp->m_sb.sb_blocksize, local);
-
+	size = xfs_attr_leaf_newentsize(args, local);
 	nblks = XFS_DAENTER_SPACE_RES(mp, XFS_ATTR_FORK);
 	if (*local) {
-		if (size > (mp->m_sb.sb_blocksize >> 1)) {
+		if (size > (args->geo->blksize / 2)) {
 			/* Double split possible */
 			nblks *= 2;
 		}
@@ -190,7 +183,7 @@ xfs_attr_calc_size(
 		 * Out of line attribute, cannot double split, but
 		 * make room for the attribute value itself.
 		 */
-		uint	dblocks = xfs_attr3_rmt_blocks(mp, valuelen);
+		uint	dblocks = xfs_attr3_rmt_blocks(mp, args->valuelen);
 		nblks += dblocks;
 		nblks += XFS_NEXTENTADD_SPACE_RES(mp, dblocks, XFS_ATTR_FORK);
 	}
@@ -217,7 +210,7 @@ xfs_attr_set(
 	XFS_STATS_INC(xs_attr_set);
 
 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
-		return EIO;
+		return -EIO;
 
 	error = xfs_attr_args_init(&args, dp, name, flags);
 	if (error)
@@ -228,9 +221,7 @@ xfs_attr_set(
 	args.firstblock = &firstblock;
 	args.flist = &flist;
 	args.op_flags = XFS_DA_OP_ADDNAME | XFS_DA_OP_OKNOENT;
-
-	/* Size is now blocks for attribute data */
-	args.total = xfs_attr_calc_size(dp, args.namelen, valuelen, &local);
+	args.total = xfs_attr_calc_size(&args, &local);
 
 	error = xfs_qm_dqattach(dp, 0);
 	if (error)
@@ -310,7 +301,7 @@ xfs_attr_set(
 		 * the inode.
 		 */
 		error = xfs_attr_shortform_addname(&args);
-		if (error != ENOSPC) {
+		if (error != -ENOSPC) {
 			/*
 			 * Commit the shortform mods, and we're done.
 			 * NOTE: this is also the error path (EEXIST, etc).
@@ -425,10 +416,10 @@ xfs_attr_remove(
 	XFS_STATS_INC(xs_attr_remove);
 
 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
-		return EIO;
+		return -EIO;
 
 	if (!xfs_inode_hasattr(dp))
-		return ENOATTR;
+		return -ENOATTR;
 
 	error = xfs_attr_args_init(&args, dp, name, flags);
 	if (error)
@@ -483,7 +474,7 @@ xfs_attr_remove(
 	xfs_trans_ijoin(args.trans, dp, 0);
 
 	if (!xfs_inode_hasattr(dp)) {
-		error = XFS_ERROR(ENOATTR);
+		error = -ENOATTR;
 	} else if (dp->i_d.di_aformat == XFS_DINODE_FMT_LOCAL) {
 		ASSERT(dp->i_afp->if_flags & XFS_IFINLINE);
 		error = xfs_attr_shortform_remove(&args);
@@ -540,9 +531,9 @@ xfs_attr_shortform_addname(xfs_da_args_t *args)
 	trace_xfs_attr_sf_addname(args);
 
 	retval = xfs_attr_shortform_lookup(args);
-	if ((args->flags & ATTR_REPLACE) && (retval == ENOATTR)) {
+	if ((args->flags & ATTR_REPLACE) && (retval == -ENOATTR)) {
 		return retval;
-	} else if (retval == EEXIST) {
+	} else if (retval == -EEXIST) {
 		if (args->flags & ATTR_CREATE)
 			return retval;
 		retval = xfs_attr_shortform_remove(args);
@@ -551,14 +542,14 @@ xfs_attr_shortform_addname(xfs_da_args_t *args)
 
 	if (args->namelen >= XFS_ATTR_SF_ENTSIZE_MAX ||
 	    args->valuelen >= XFS_ATTR_SF_ENTSIZE_MAX)
-		return XFS_ERROR(ENOSPC);
+		return -ENOSPC;
 
 	newsize = XFS_ATTR_SF_TOTSIZE(args->dp);
 	newsize += XFS_ATTR_SF_ENTSIZE_BYNAME(args->namelen, args->valuelen);
 
 	forkoff = xfs_attr_shortform_bytesfit(args->dp, newsize);
 	if (!forkoff)
-		return XFS_ERROR(ENOSPC);
+		return -ENOSPC;
 
 	xfs_attr_shortform_add(args, forkoff);
 	return 0;
@@ -598,10 +589,10 @@ xfs_attr_leaf_addname(xfs_da_args_t *args)
 	 * the given flags produce an error or call for an atomic rename.
 	 */
 	retval = xfs_attr3_leaf_lookup_int(bp, args);
-	if ((args->flags & ATTR_REPLACE) && (retval == ENOATTR)) {
+	if ((args->flags & ATTR_REPLACE) && (retval == -ENOATTR)) {
 		xfs_trans_brelse(args->trans, bp);
 		return retval;
-	} else if (retval == EEXIST) {
+	} else if (retval == -EEXIST) {
 		if (args->flags & ATTR_CREATE) {	/* pure create op */
 			xfs_trans_brelse(args->trans, bp);
 			return retval;
@@ -632,7 +623,7 @@ xfs_attr_leaf_addname(xfs_da_args_t *args)
 	 * if required.
 	 */
 	retval = xfs_attr3_leaf_add(bp, args);
-	if (retval == ENOSPC) {
+	if (retval == -ENOSPC) {
 		/*
 		 * Promote the attribute list to the Btree format, then
 		 * Commit that transaction so that the node_addname() call
@@ -801,7 +792,7 @@ xfs_attr_leaf_removename(xfs_da_args_t *args)
 		return error;
 
 	error = xfs_attr3_leaf_lookup_int(bp, args);
-	if (error == ENOATTR) {
+	if (error == -ENOATTR) {
 		xfs_trans_brelse(args->trans, bp);
 		return error;
 	}
@@ -856,7 +847,7 @@ xfs_attr_leaf_get(xfs_da_args_t *args)
 		return error;
 
 	error = xfs_attr3_leaf_lookup_int(bp, args);
-	if (error != EEXIST)  {
+	if (error != -EEXIST)  {
 		xfs_trans_brelse(args->trans, bp);
 		return error;
 	}
@@ -869,7 +860,7 @@ xfs_attr_leaf_get(xfs_da_args_t *args)
 }
 
 /*========================================================================
- * External routines when attribute list size > XFS_LBSIZE(mp).
+ * External routines when attribute list size > geo->blksize
  *========================================================================*/
 
 /*
@@ -902,8 +893,6 @@ restart:
 	state = xfs_da_state_alloc();
 	state->args = args;
 	state->mp = mp;
-	state->blocksize = state->mp->m_sb.sb_blocksize;
-	state->node_ents = state->mp->m_attr_node_ents;
 
 	/*
 	 * Search to see if name already exists, and get back a pointer
@@ -914,9 +903,9 @@ restart:
 		goto out;
 	blk = &state->path.blk[ state->path.active-1 ];
 	ASSERT(blk->magic == XFS_ATTR_LEAF_MAGIC);
-	if ((args->flags & ATTR_REPLACE) && (retval == ENOATTR)) {
+	if ((args->flags & ATTR_REPLACE) && (retval == -ENOATTR)) {
 		goto out;
-	} else if (retval == EEXIST) {
+	} else if (retval == -EEXIST) {
 		if (args->flags & ATTR_CREATE)
 			goto out;
 
@@ -941,7 +930,7 @@ restart:
 	}
 
 	retval = xfs_attr3_leaf_add(blk->bp, state->args);
-	if (retval == ENOSPC) {
+	if (retval == -ENOSPC) {
 		if (state->path.active == 1) {
 			/*
 			 * Its really a single leaf node, but it had
@@ -1081,8 +1070,6 @@ restart:
 		state = xfs_da_state_alloc();
 		state->args = args;
 		state->mp = mp;
-		state->blocksize = state->mp->m_sb.sb_blocksize;
-		state->node_ents = state->mp->m_attr_node_ents;
 		state->inleaf = 0;
 		error = xfs_da3_node_lookup_int(state, &retval);
 		if (error)
@@ -1173,14 +1160,12 @@ xfs_attr_node_removename(xfs_da_args_t *args)
 	state = xfs_da_state_alloc();
 	state->args = args;
 	state->mp = dp->i_mount;
-	state->blocksize = state->mp->m_sb.sb_blocksize;
-	state->node_ents = state->mp->m_attr_node_ents;
 
 	/*
 	 * Search to see if name exists, and get back a pointer to it.
 	 */
 	error = xfs_da3_node_lookup_int(state, &retval);
-	if (error || (retval != EEXIST)) {
+	if (error || (retval != -EEXIST)) {
 		if (error == 0)
 			error = retval;
 		goto out;
@@ -1436,8 +1421,6 @@ xfs_attr_node_get(xfs_da_args_t *args)
 	state = xfs_da_state_alloc();
 	state->args = args;
 	state->mp = args->dp->i_mount;
-	state->blocksize = state->mp->m_sb.sb_blocksize;
-	state->node_ents = state->mp->m_attr_node_ents;
 
 	/*
 	 * Search to see if name exists, and get back a pointer to it.
@@ -1445,7 +1428,7 @@ xfs_attr_node_get(xfs_da_args_t *args)
 	error = xfs_da3_node_lookup_int(state, &retval);
 	if (error) {
 		retval = error;
-	} else if (retval == EEXIST) {
+	} else if (retval == -EEXIST) {
 		blk = &state->path.blk[ state->path.active-1 ];
 		ASSERT(blk->bp != NULL);
 		ASSERT(blk->magic == XFS_ATTR_LEAF_MAGIC);

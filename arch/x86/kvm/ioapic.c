@@ -260,7 +260,9 @@ void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap,
 		    kvm_irq_has_notifier(ioapic->kvm, KVM_IRQCHIP_IOAPIC, index) ||
 		    index == RTC_GSI) {
 			if (kvm_apic_match_dest(vcpu, NULL, 0,
-				e->fields.dest_id, e->fields.dest_mode)) {
+			             e->fields.dest_id, e->fields.dest_mode) ||
+			    (e->fields.trig_mode == IOAPIC_EDGE_TRIG &&
+			     kvm_apic_pending_eoi(vcpu, e->fields.vector))) {
 				__set_bit(e->fields.vector,
 					(unsigned long *)eoi_exit_bitmap);
 				if (e->fields.trig_mode == IOAPIC_LEVEL_TRIG)
@@ -583,11 +585,6 @@ static int ioapic_mmio_write(struct kvm_io_device *this, gpa_t addr, int len,
 	case IOAPIC_REG_WINDOW:
 		ioapic_write_indirect(ioapic, data);
 		break;
-#ifdef	CONFIG_IA64
-	case IOAPIC_REG_EOI:
-		__kvm_ioapic_update_eoi(NULL, ioapic, data, IOAPIC_LEVEL_TRIG);
-		break;
-#endif
 
 	default:
 		break;

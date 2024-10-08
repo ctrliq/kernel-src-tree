@@ -173,14 +173,14 @@ static pci_power_t acpi_pci_choose_state(struct pci_dev *pdev)
 
 static bool acpi_pci_power_manageable(struct pci_dev *dev)
 {
-	acpi_handle handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	acpi_handle handle = ACPI_HANDLE(&dev->dev);
 
 	return handle ? acpi_bus_power_manageable(handle) : false;
 }
 
 static int acpi_pci_set_power_state(struct pci_dev *dev, pci_power_t state)
 {
-	acpi_handle handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	acpi_handle handle = ACPI_HANDLE(&dev->dev);
 	acpi_handle tmp;
 	static const u8 state_conv[] = {
 		[PCI_D0] = ACPI_STATE_D0,
@@ -218,7 +218,7 @@ static int acpi_pci_set_power_state(struct pci_dev *dev, pci_power_t state)
 
 static bool acpi_pci_can_wakeup(struct pci_dev *dev)
 {
-	acpi_handle handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	acpi_handle handle = ACPI_HANDLE(&dev->dev);
 
 	return handle ? acpi_bus_can_wakeup(handle) : false;
 }
@@ -313,13 +313,7 @@ static struct acpi_device *acpi_pci_find_companion(struct device *dev)
 	bool check_children;
 	u64 addr;
 
-	/*
-	 * pci_is_bridge() is not suitable here, because pci_dev->subordinate
-	 * is set only after acpi_pci_find_device() has been called for the
-	 * given device.
-	 */
-	check_children = pci_dev->hdr_type == PCI_HEADER_TYPE_BRIDGE
-			|| pci_dev->hdr_type == PCI_HEADER_TYPE_CARDBUS;
+	check_children = pci_is_bridge(pci_dev);
 	/* Please ref to ACPI spec for the syntax of _ADR */
 	addr = (PCI_SLOT(pci_dev->devfn) << 16) | PCI_FUNC(pci_dev->devfn);
 	return acpi_find_child_device(ACPI_COMPANION(dev->parent), addr,

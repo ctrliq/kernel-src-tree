@@ -358,6 +358,9 @@ typedef efi_status_t efi_query_variable_store_t(u32 attributes, unsigned long si
 #define SMBIOS_TABLE_GUID    \
     EFI_GUID(  0xeb9d2d31, 0x2d88, 0x11d3, 0x9a, 0x16, 0x0, 0x90, 0x27, 0x3f, 0xc1, 0x4d )
 
+#define SMBIOS3_TABLE_GUID    \
+    EFI_GUID(  0xf2fd1544, 0x9794, 0x4a2c, 0x99, 0x2e, 0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94 )
+
 #define SAL_SYSTEM_TABLE_GUID    \
     EFI_GUID(  0xeb9d2d32, 0x2d88, 0x11d3, 0x9a, 0x16, 0x0, 0x90, 0x27, 0x3f, 0xc1, 0x4d )
 
@@ -576,7 +579,7 @@ extern struct efi {
 	unsigned long mps;		/* MPS table */
 	unsigned long acpi;		/* ACPI table  (IA64 ext 0.71) */
 	unsigned long acpi20;		/* ACPI table  (ACPI 2.0) */
-	unsigned long smbios;		/* SM BIOS table */
+	unsigned long smbios;		/* SMBIOS table (32 bit entry point) */
 	unsigned long sal_systab;	/* SAL system table */
 	unsigned long boot_info;	/* boot info table */
 	unsigned long hcdp;		/* HCDP table */
@@ -599,6 +602,8 @@ extern struct efi {
 	efi_reset_system_t *reset_system;
 	efi_set_virtual_address_map_t *set_virtual_address_map;
 	struct efi_memory_map *memmap;
+	/* SMBIOS table (64 bit entry point) */
+	RH_KABI_EXTEND(unsigned long smbios3)
 } efi;
 
 static inline int

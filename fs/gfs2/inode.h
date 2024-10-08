@@ -112,7 +112,7 @@ extern void gfs2_dinode_out(const struct gfs2_inode *ip, void *buf);
 extern int gfs2_open_common(struct inode *inode, struct file *file);
 
 extern const struct inode_operations gfs2_file_iops;
-extern const struct inode_operations gfs2_dir_iops;
+extern const struct inode_operations_wrapper gfs2_dir_iops;
 extern const struct inode_operations gfs2_symlink_iops;
 extern const struct file_operations gfs2_file_fops_nolock;
 extern const struct file_operations gfs2_dir_fops_nolock;

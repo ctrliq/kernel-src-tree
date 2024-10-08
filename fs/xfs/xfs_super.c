@@ -21,9 +21,7 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_inum.h"
 #include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_da_format.h"
 #include "xfs_inode.h"
@@ -44,7 +42,6 @@
 #include "xfs_icache.h"
 #include "xfs_trace.h"
 #include "xfs_icreate_item.h"
-#include "xfs_dinode.h"
 #include "xfs_filestream.h"
 #include "xfs_quota.h"
 #include "xfs_sysfs.h"
@@ -191,7 +188,7 @@ xfs_parseargs(
 	 */
 	mp->m_fsname = kstrndup(sb->s_id, MAXNAMELEN, GFP_KERNEL);
 	if (!mp->m_fsname)
-		return ENOMEM;
+		return -ENOMEM;
 	mp->m_fsname_len = strlen(mp->m_fsname) + 1;
 
 	/*
@@ -210,9 +207,6 @@ xfs_parseargs(
 	 */
 	mp->m_flags |= XFS_MOUNT_BARRIER;
 	mp->m_flags |= XFS_MOUNT_COMPAT_IOSIZE;
-#if !XFS_BIG_INUMS
-	mp->m_flags |= XFS_MOUNT_SMALL_INUMS;
-#endif
 
 	/*
 	 * These can be overridden by the mount option parsing.
@@ -233,57 +227,57 @@ xfs_parseargs(
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			if (kstrtoint(value, 10, &mp->m_logbufs))
-				return EINVAL;
+				return -EINVAL;
 		} else if (!strcmp(this_char, MNTOPT_LOGBSIZE)) {
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			if (suffix_kstrtoint(value, 10, &mp->m_logbsize))
-				return EINVAL;
+				return -EINVAL;
 		} else if (!strcmp(this_char, MNTOPT_LOGDEV)) {
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			mp->m_logname = kstrndup(value, MAXNAMELEN, GFP_KERNEL);
 			if (!mp->m_logname)
-				return ENOMEM;
+				return -ENOMEM;
 		} else if (!strcmp(this_char, MNTOPT_MTPT)) {
 			xfs_warn(mp, "%s option not allowed on this system",
 				this_char);
-			return EINVAL;
+			return -EINVAL;
 		} else if (!strcmp(this_char, MNTOPT_RTDEV)) {
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			mp->m_rtname = kstrndup(value, MAXNAMELEN, GFP_KERNEL);
 			if (!mp->m_rtname)
-				return ENOMEM;
+				return -ENOMEM;
 		} else if (!strcmp(this_char, MNTOPT_BIOSIZE)) {
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			if (kstrtoint(value, 10, &iosize))
-				return EINVAL;
+				return -EINVAL;
 			iosizelog = ffs(iosize) - 1;
 		} else if (!strcmp(this_char, MNTOPT_ALLOCSIZE)) {
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			if (suffix_kstrtoint(value, 10, &iosize))
-				return EINVAL;
+				return -EINVAL;
 			iosizelog = ffs(iosize) - 1;
 		} else if (!strcmp(this_char, MNTOPT_GRPID) ||
 			   !strcmp(this_char, MNTOPT_BSDGROUPS)) {
@@ -303,27 +297,22 @@ xfs_parseargs(
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			if (kstrtoint(value, 10, &dsunit))
-				return EINVAL;
+				return -EINVAL;
 		} else if (!strcmp(this_char, MNTOPT_SWIDTH)) {
 			if (!value || !*value) {
 				xfs_warn(mp, "%s option requires an argument",
 					this_char);
-				return EINVAL;
+				return -EINVAL;
 			}
 			if (kstrtoint(value, 10, &dswidth))
-				return EINVAL;
+				return -EINVAL;
 		} else if (!strcmp(this_char, MNTOPT_32BITINODE)) {
 			mp->m_flags |= XFS_MOUNT_SMALL_INUMS;
 		} else if (!strcmp(this_char, MNTOPT_64BITINODE)) {
 			mp->m_flags &= ~XFS_MOUNT_SMALL_INUMS;
-#if !XFS_BIG_INUMS
-			xfs_warn(mp, "%s option not allowed on this system",
-				this_char);
-			return EINVAL;
-#endif
 		} else if (!strcmp(this_char, MNTOPT_NOUUID)) {
 			mp->m_flags |= XFS_MOUNT_NOUUID;
 		} else if (!strcmp(this_char, MNTOPT_BARRIER)) {
@@ -396,7 +385,7 @@ xfs_parseargs(
 	"irixsgid is now a sysctl(2) variable, option is deprecated.");
 		} else {
 			xfs_warn(mp, "unknown mount option [%s].", this_char);
-			return EINVAL;
+			return -EINVAL;
 		}
 	}
 
@@ -406,32 +395,32 @@ xfs_parseargs(
 	if ((mp->m_flags & XFS_MOUNT_NORECOVERY) &&
 	    !(mp->m_flags & XFS_MOUNT_RDONLY)) {
 		xfs_warn(mp, "no-recovery mounts must be read-only.");
-		return EINVAL;
+		return -EINVAL;
 	}
 
 	if ((mp->m_flags & XFS_MOUNT_NOALIGN) && (dsunit || dswidth)) {
 		xfs_warn(mp,
 	"sunit and swidth options incompatible with the noalign option");
-		return EINVAL;
+		return -EINVAL;
 	}
 
 #ifndef CONFIG_XFS_QUOTA
 	if (XFS_IS_QUOTA_RUNNING(mp)) {
 		xfs_warn(mp, "quota support not available in this kernel.");
-		return EINVAL;
+		return -EINVAL;
 	}
 #endif
 
 	if ((dsunit && !dswidth) || (!dsunit && dswidth)) {
 		xfs_warn(mp, "sunit and swidth must be specified together");
-		return EINVAL;
+		return -EINVAL;
 	}
 
 	if (dsunit && (dswidth % dsunit != 0)) {
 		xfs_warn(mp,
 	"stripe width (%d) must be a multiple of the stripe unit (%d)",
 			dswidth, dsunit);
-		return EINVAL;
+		return -EINVAL;
 	}
 
 done:
@@ -452,7 +441,7 @@ done:
 	     mp->m_logbufs > XLOG_MAX_ICLOGS)) {
 		xfs_warn(mp, "invalid logbufs value: %d [not %d-%d]",
 			mp->m_logbufs, XLOG_MIN_ICLOGS, XLOG_MAX_ICLOGS);
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	}
 	if (mp->m_logbsize != -1 &&
 	    mp->m_logbsize !=  0 &&
@@ -462,7 +451,7 @@ done:
 		xfs_warn(mp,
 			"invalid logbufsize: %d [not 16k,32k,64k,128k or 256k]",
 			mp->m_logbsize);
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	}
 
 	if (iosizelog) {
@@ -471,7 +460,7 @@ done:
 			xfs_warn(mp, "invalid log iosize: %d [not %d-%d]",
 				iosizelog, XFS_MIN_IO_LOG,
 				XFS_MAX_IO_LOG);
-			return XFS_ERROR(EINVAL);
+			return -EINVAL;
 		}
 
 		mp->m_flags |= XFS_MOUNT_DFLT_IOSIZE;
@@ -699,7 +688,7 @@ xfs_blkdev_get(
 		xfs_warn(mp, "Invalid device [%s], error=%d", name, error);
 	}
 
-	return -error;
+	return error;
 }
 
 STATIC void
@@ -769,7 +758,7 @@ xfs_open_devices(
 		if (rtdev == ddev || rtdev == logdev) {
 			xfs_warn(mp,
 	"Cannot mount filesystem with identical rtdev and ddev/logdev.");
-			error = EINVAL;
+			error = -EINVAL;
 			goto out_close_rtdev;
 		}
 	}
@@ -777,7 +766,7 @@ xfs_open_devices(
 	/*
 	 * Setup xfs_mount buffer target pointers
 	 */
-	error = ENOMEM;
+	error = -ENOMEM;
 	mp->m_ddev_targp = xfs_alloc_buftarg(mp, ddev);
 	if (!mp->m_ddev_targp)
 		goto out_close_rtdev;
@@ -850,8 +839,7 @@ xfs_init_mount_workqueues(
 	struct xfs_mount	*mp)
 {
 	mp->m_buf_workqueue = alloc_workqueue("xfs-buf/%s",
-			WQ_MEM_RECLAIM|WQ_HIGHPRI|WQ_FREEZABLE, 1,
-			mp->m_fsname);
+			WQ_MEM_RECLAIM|WQ_FREEZABLE, 1, mp->m_fsname);
 	if (!mp->m_buf_workqueue)
 		goto out;
 
@@ -876,7 +864,8 @@ xfs_init_mount_workqueues(
 		goto out_destroy_cil;
 
 	mp->m_log_workqueue = alloc_workqueue("xfs-log/%s",
-			WQ_NON_REENTRANT|WQ_FREEZABLE, 0, mp->m_fsname);
+			WQ_NON_REENTRANT|WQ_FREEZABLE|WQ_HIGHPRI, 0,
+			mp->m_fsname);
 	if (!mp->m_log_workqueue)
 		goto out_destroy_reclaim;
 
@@ -997,6 +986,7 @@ xfs_fs_inode_init_once(
 	/* xfs inode */
 	atomic_set(&ip->i_pincount, 0);
 	spin_lock_init(&ip->i_flags_lock);
+	spin_lock_init(&ip->i_size_lock);
 
 	mrlock_init(&ip->i_mmaplock, MRLOCK_ALLOW_EQUAL_PRI|MRLOCK_BARRIER,
 		     "xfsino", ip->i_ino);
@@ -1047,24 +1037,6 @@ xfs_free_fsname(
 	kfree(mp->m_logname);
 }
 
-STATIC void
-xfs_fs_put_super(
-	struct super_block	*sb)
-{
-	struct xfs_mount	*mp = XFS_M(sb);
-
-	xfs_notice(mp, "Unmounting Filesystem");
-	xfs_filestream_unmount(mp);
-	xfs_unmountfs(mp);
-
-	xfs_freesb(mp);
-	xfs_icsb_destroy_counters(mp);
-	xfs_destroy_mount_workqueues(mp);
-	xfs_close_devices(mp);
-	xfs_free_fsname(mp);
-	kfree(mp);
-}
-
 STATIC int
 xfs_fs_sync_fs(
 	struct super_block	*sb,
@@ -1100,6 +1072,9 @@ xfs_fs_statfs(
 	xfs_sb_t		*sbp = &mp->m_sb;
 	struct xfs_inode	*ip = XFS_I(dentry->d_inode);
 	__uint64_t		fakeinos, id;
+	__uint64_t		icount;
+	__uint64_t		ifree;
+	__uint64_t		fdblocks;
 	xfs_extlen_t		lsize;
 	__int64_t		ffree;
 
@@ -1110,17 +1085,21 @@ xfs_fs_statfs(
 	statp->f_fsid.val[0] = (u32)id;
 	statp->f_fsid.val[1] = (u32)(id >> 32);
 
-	xfs_icsb_sync_counters(mp, XFS_ICSB_LAZY_COUNT);
+	icount = percpu_counter_sum(&mp->m_icount);
+	ifree = percpu_counter_sum(&mp->m_ifree);
+	fdblocks = percpu_counter_sum(&mp->m_fdblocks);
 
 	spin_lock(&mp->m_sb_lock);
 	statp->f_bsize = sbp->sb_blocksize;
 	lsize = sbp->sb_logstart ? sbp->sb_logblocks : 0;
 	statp->f_blocks = sbp->sb_dblocks - lsize;
-	statp->f_bfree = statp->f_bavail =
-				sbp->sb_fdblocks - XFS_ALLOC_SET_ASIDE(mp);
+	spin_unlock(&mp->m_sb_lock);
+
+	statp->f_bfree = fdblocks - XFS_ALLOC_SET_ASIDE(mp);
+	statp->f_bavail = statp->f_bfree;
+
 	fakeinos = statp->f_bfree << sbp->sb_inopblog;
-	statp->f_files =
-	    MIN(sbp->sb_icount + fakeinos, (__uint64_t)XFS_MAXINUMBER);
+	statp->f_files = MIN(icount + fakeinos, (__uint64_t)XFS_MAXINUMBER);
 	if (mp->m_maxicount)
 		statp->f_files = min_t(typeof(statp->f_files),
 					statp->f_files,
@@ -1132,10 +1111,9 @@ xfs_fs_statfs(
 					sbp->sb_icount);
 
 	/* make sure statp->f_ffree does not underflow */
-	ffree = statp->f_files - (sbp->sb_icount - sbp->sb_ifree);
+	ffree = statp->f_files - (icount - ifree);
 	statp->f_ffree = max_t(__int64_t, ffree, 0);
 
-	spin_unlock(&mp->m_sb_lock);
 
 	if ((ip->i_d.di_flags & XFS_DIFLAG_PROJINHERIT) &&
 	    ((mp->m_qflags & (XFS_PQUOTA_ACCT|XFS_PQUOTA_ENFD))) ==
@@ -1282,13 +1260,13 @@ xfs_fs_remount(
 		 * If this is the first remount to writeable state we
 		 * might have some superblock changes to update.
 		 */
-		if (mp->m_update_flags) {
-			error = xfs_mount_log_sb(mp, mp->m_update_flags);
+		if (mp->m_update_sb) {
+			error = xfs_sync_sb(mp, false);
 			if (error) {
 				xfs_warn(mp, "failed to write sb changes");
 				return error;
 			}
-			mp->m_update_flags = 0;
+			mp->m_update_sb = false;
 		}
 
 		/*
@@ -1318,8 +1296,9 @@ xfs_fs_remount(
 
 /*
  * Second stage of a freeze. The data is already frozen so we only
- * need to take care of the metadata. Once that's done write a dummy
- * record to dirty the log in case of a crash while frozen.
+ * need to take care of the metadata. Once that's done sync the superblock
+ * to the log to dirty it in case of a crash while frozen. This ensures that we
+ * will recover the unlinked inode lists on the next mount.
  */
 STATIC int
 xfs_fs_freeze(
@@ -1329,7 +1308,7 @@ xfs_fs_freeze(
 
 	xfs_save_resvblks(mp);
 	xfs_quiesce_attr(mp);
-	return -xfs_fs_log_dummy(mp);
+	return xfs_sync_sb(mp, true);
 }
 
 STATIC int
@@ -1348,7 +1327,7 @@ xfs_fs_show_options(
 	struct seq_file		*m,
 	struct dentry		*root)
 {
-	return -xfs_showargs(XFS_M(root->d_sb), m);
+	return xfs_showargs(XFS_M(root->d_sb), m);
 }
 
 /*
@@ -1370,14 +1349,14 @@ xfs_finish_flags(
 			   mp->m_logbsize < mp->m_sb.sb_logsunit) {
 			xfs_warn(mp,
 		"logbuf size must be greater than or equal to log stripe size");
-			return XFS_ERROR(EINVAL);
+			return -EINVAL;
 		}
 	} else {
 		/* Fail a mount if the logbuf is larger than 32K */
 		if (mp->m_logbsize > XLOG_BIG_RECORD_BSIZE) {
 			xfs_warn(mp,
 		"logbuf size for version 1 logs must be 16K or 32K");
-			return XFS_ERROR(EINVAL);
+			return -EINVAL;
 		}
 	}
 
@@ -1389,7 +1368,7 @@ xfs_finish_flags(
 		xfs_warn(mp,
 "Cannot mount a V5 filesystem as %s. %s is always enabled for V5 filesystems.",
 			MNTOPT_NOATTR2, MNTOPT_ATTR2);
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	}
 
 	/*
@@ -1406,7 +1385,7 @@ xfs_finish_flags(
 	if ((mp->m_sb.sb_flags & XFS_SBF_READONLY) && !ronly) {
 		xfs_warn(mp,
 			"cannot mount a read-only filesystem as read-write");
-		return XFS_ERROR(EROFS);
+		return -EROFS;
 	}
 
 	if ((mp->m_qflags & (XFS_GQUOTA_ACCT | XFS_GQUOTA_ACTIVE)) &&
@@ -1414,10 +1393,55 @@ xfs_finish_flags(
 	    !xfs_sb_version_has_pquotino(&mp->m_sb)) {
 		xfs_warn(mp,
 		  "Super block does not support project and group quota together");
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	}
 
 	return 0;
+}
+
+static int
+xfs_init_percpu_counters(
+	struct xfs_mount	*mp)
+{
+	int		error;
+
+	error = percpu_counter_init(&mp->m_icount, 0, GFP_KERNEL);
+	if (error)
+		return -ENOMEM;
+
+	error = percpu_counter_init(&mp->m_ifree, 0, GFP_KERNEL);
+	if (error)
+		goto free_icount;
+
+	error = percpu_counter_init(&mp->m_fdblocks, 0, GFP_KERNEL);
+	if (error)
+		goto free_ifree;
+
+	return 0;
+
+free_ifree:
+	percpu_counter_destroy(&mp->m_ifree);
+free_icount:
+	percpu_counter_destroy(&mp->m_icount);
+	return -ENOMEM;
+}
+
+void
+xfs_reinit_percpu_counters(
+	struct xfs_mount	*mp)
+{
+	percpu_counter_set(&mp->m_icount, mp->m_sb.sb_icount);
+	percpu_counter_set(&mp->m_ifree, mp->m_sb.sb_ifree);
+	percpu_counter_set(&mp->m_fdblocks, mp->m_sb.sb_fdblocks);
+}
+
+static void
+xfs_destroy_percpu_counters(
+	struct xfs_mount	*mp)
+{
+	percpu_counter_destroy(&mp->m_icount);
+	percpu_counter_destroy(&mp->m_ifree);
+	percpu_counter_destroy(&mp->m_fdblocks);
 }
 
 STATIC int
@@ -1428,7 +1452,7 @@ xfs_fs_fill_super(
 {
 	struct inode		*root;
 	struct xfs_mount	*mp = NULL;
-	int			flags = 0, error = ENOMEM;
+	int			flags = 0, error = -ENOMEM;
 
 	mp = kzalloc(sizeof(struct xfs_mount), GFP_KERNEL);
 	if (!mp)
@@ -1463,11 +1487,11 @@ xfs_fs_fill_super(
 	if (error)
 		goto out_free_fsname;
 
-	error = -xfs_init_mount_workqueues(mp);
+	error = xfs_init_mount_workqueues(mp);
 	if (error)
 		goto out_close_devices;
 
-	error = -xfs_icsb_init_counters(mp);
+	error = xfs_init_percpu_counters(mp);
 	if (error)
 		goto out_destroy_workqueues;
 
@@ -1509,12 +1533,12 @@ xfs_fs_fill_super(
 
 	root = igrab(VFS_I(mp->m_rootip));
 	if (!root) {
-		error = ENOENT;
+		error = -ENOENT;
 		goto out_unmount;
 	}
 	sb->s_root = d_make_root(root);
 	if (!sb->s_root) {
-		error = ENOMEM;
+		error = -ENOMEM;
 		goto out_unmount;
 	}
 
@@ -1525,7 +1549,7 @@ xfs_fs_fill_super(
  out_free_sb:
 	xfs_freesb(mp);
  out_destroy_counters:
-	xfs_icsb_destroy_counters(mp);
+	xfs_destroy_percpu_counters(mp);
 out_destroy_workqueues:
 	xfs_destroy_mount_workqueues(mp);
  out_close_devices:
@@ -1534,12 +1558,30 @@ out_destroy_workqueues:
 	xfs_free_fsname(mp);
 	kfree(mp);
  out:
-	return -error;
+	return error;
 
  out_unmount:
 	xfs_filestream_unmount(mp);
 	xfs_unmountfs(mp);
 	goto out_free_sb;
+}
+
+STATIC void
+xfs_fs_put_super(
+	struct super_block	*sb)
+{
+	struct xfs_mount	*mp = XFS_M(sb);
+
+	xfs_notice(mp, "Unmounting Filesystem");
+	xfs_filestream_unmount(mp);
+	xfs_unmountfs(mp);
+
+	xfs_freesb(mp);
+	xfs_destroy_percpu_counters(mp);
+	xfs_destroy_mount_workqueues(mp);
+	xfs_close_devices(mp);
+	xfs_free_fsname(mp);
+	kfree(mp);
 }
 
 STATIC struct dentry *
@@ -1784,13 +1826,9 @@ init_xfs_fs(void)
 	if (error)
 		goto out_destroy_wq;
 
-	error = xfs_filestream_init();
-	if (error)
-		goto out_mru_cache_uninit;
-
 	error = xfs_buf_init();
 	if (error)
-		goto out_filestream_uninit;
+		goto out_mru_cache_uninit;
 
 	error = xfs_init_procfs();
 	if (error)
@@ -1836,8 +1874,6 @@ init_xfs_fs(void)
 	xfs_cleanup_procfs();
  out_buf_terminate:
 	xfs_buf_terminate();
- out_filestream_uninit:
-	xfs_filestream_uninit();
  out_mru_cache_uninit:
 	xfs_mru_cache_uninit();
  out_destroy_wq:
@@ -1860,7 +1896,6 @@ exit_xfs_fs(void)
 	xfs_sysctl_unregister();
 	xfs_cleanup_procfs();
 	xfs_buf_terminate();
-	xfs_filestream_uninit();
 	xfs_mru_cache_uninit();
 	xfs_destroy_workqueues();
 	xfs_destroy_zones();

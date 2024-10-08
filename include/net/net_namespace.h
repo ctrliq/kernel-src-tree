@@ -8,6 +8,7 @@
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/sysctl.h>
+#include <linux/idr.h>
 
 #include <net/netns/core.h>
 #include <net/netns/mib.h>
@@ -47,11 +48,6 @@ struct net {
 	atomic_t		count;		/* To decided when the network
 						 *  namespace should be shut down.
 						 */
-#ifdef NETNS_REFCNT_DEBUG
-	atomic_t		use_count;	/* To track references we
-						 * destroy on demand
-						 */
-#endif
 	spinlock_t		rules_mod_lock;
 
 	struct list_head	list;		/* list of network namespaces */
@@ -129,6 +125,26 @@ struct net {
 	RH_KABI_EXTEND(atomic_t		fnhe_genid)
 	RH_KABI_EXTEND(int		sysctl_ip_no_pmtu_disc)
 	RH_KABI_EXTEND(int		sysctl_ip_fwd_use_pmtu)
+	/* upstream has this as part of netns_ipv4 */
+	RH_KABI_EXTEND(struct local_ports ipv4_sysctl_local_ports)
+	RH_KABI_EXTEND(struct idr	netns_ids)
+	RH_KABI_EXTEND(spinlock_t	nsid_lock)
+	/* upstream has this as part of netns_ipv4 */
+	RH_KABI_EXTEND(struct sock  * __percpu *ipv4_tcp_sk)
+#ifdef CONFIG_XFRM
+	/* upstream has this as part of netns_xfrm */
+	RH_KABI_EXTEND(spinlock_t xfrm_state_lock)
+	RH_KABI_EXTEND(rwlock_t xfrm_policy_lock)
+	RH_KABI_EXTEND(struct mutex xfrm_cfg_mutex)
+	/* flow cache part */
+	RH_KABI_EXTEND(struct flow_cache flow_cache_global)
+	RH_KABI_EXTEND(atomic_t flow_cache_genid)
+	RH_KABI_EXTEND(struct list_head flow_cache_gc_list)
+	RH_KABI_EXTEND(spinlock_t flow_cache_gc_lock)
+	RH_KABI_EXTEND(struct work_struct flow_cache_gc_work)
+	RH_KABI_EXTEND(struct work_struct flow_cache_flush_work)
+	RH_KABI_EXTEND(struct mutex flow_flush_sem)
+#endif
 };
 
 /*
@@ -227,48 +243,23 @@ int net_eq(const struct net *net1, const struct net *net2)
 #endif
 
 
-#ifdef NETNS_REFCNT_DEBUG
-static inline struct net *hold_net(struct net *net)
-{
-	if (net)
-		atomic_inc(&net->use_count);
-	return net;
-}
+#define possible_net_t	struct net *
 
-static inline void release_net(struct net *net)
+static inline void write_pnet(possible_net_t *pnet, struct net *net)
 {
-	if (net)
-		atomic_dec(&net->use_count);
-}
-#else
-static inline struct net *hold_net(struct net *net)
-{
-	return net;
-}
-
-static inline void release_net(struct net *net)
-{
-}
-#endif
-
 #ifdef CONFIG_NET_NS
-
-static inline void write_pnet(struct net **pnet, struct net *net)
-{
 	*pnet = net;
-}
-
-static inline struct net *read_pnet(struct net * const *pnet)
-{
-	return *pnet;
-}
-
-#else
-
-#define write_pnet(pnet, net)	do { (void)(net);} while (0)
-#define read_pnet(pnet)		(&init_net)
-
 #endif
+}
+
+static inline struct net *read_pnet(possible_net_t const *pnet)
+{
+#ifdef CONFIG_NET_NS
+	return *pnet;
+#else
+	return &init_net;
+#endif
+}
 
 #define for_each_net(VAR)				\
 	list_for_each_entry(VAR, &net_namespace_list, list)
@@ -287,6 +278,11 @@ static inline struct net *read_pnet(struct net * const *pnet)
 #define __net_initdata	__initdata
 #define __net_initconst	__initconst
 #endif
+
+int peernet2id_alloc(struct net *net, struct net *peer);
+int peernet2id(struct net *net, struct net *peer);
+bool peernet_has_id(struct net *net, struct net *peer);
+struct net *get_net_ns_by_id(struct net *net, int id);
 
 struct pernet_operations {
 	struct list_head list;

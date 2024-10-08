@@ -3083,7 +3083,7 @@ static int __btrfs_mod_ref(struct btrfs_trans_handle *trans,
 	for (i = 0; i < nritems; i++) {
 		if (level == 0) {
 			btrfs_item_key_to_cpu(buf, &key, i);
-			if (btrfs_key_type(&key) != BTRFS_EXTENT_DATA_KEY)
+			if (key.type != BTRFS_EXTENT_DATA_KEY)
 				continue;
 			fi = btrfs_item_ptr(buf, i,
 					    struct btrfs_file_extent_item);
@@ -3492,7 +3492,7 @@ static int update_space_info(struct btrfs_fs_info *info, u64 flags,
 	if (!found)
 		return -ENOMEM;
 
-	ret = percpu_counter_init(&found->total_bytes_pinned, 0);
+	ret = percpu_counter_init(&found->total_bytes_pinned, 0, GFP_KERNEL);
 	if (ret) {
 		kfree(found);
 		return ret;
@@ -6486,7 +6486,7 @@ static noinline int find_free_extent(struct btrfs_root *orig_root,
 	bool have_caching_bg = false;
 
 	WARN_ON(num_bytes < root->sectorsize);
-	btrfs_set_key_type(ins, BTRFS_EXTENT_ITEM_KEY);
+	ins->type = BTRFS_EXTENT_ITEM_KEY;
 	ins->objectid = 0;
 	ins->offset = 0;
 
@@ -7234,17 +7234,19 @@ btrfs_init_new_buffer(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 	btrfs_set_buffer_uptodate(buf);
 
 	if (root->root_key.objectid == BTRFS_TREE_LOG_OBJECTID) {
+		buf->log_index = root->log_transid % 2;
 		/*
 		 * we allow two log transactions at a time, use different
 		 * EXENT bit to differentiate dirty pages.
 		 */
-		if (root->log_transid % 2 == 0)
+		if (buf->log_index == 0)
 			set_extent_dirty(&root->dirty_log_pages, buf->start,
 					buf->start + buf->len - 1, GFP_NOFS);
 		else
 			set_extent_new(&root->dirty_log_pages, buf->start,
 					buf->start + buf->len - 1, GFP_NOFS);
 	} else {
+		buf->log_index = -1;
 		set_extent_dirty(&trans->transaction->dirty_pages, buf->start,
 			 buf->start + buf->len - 1, GFP_NOFS);
 	}
@@ -9025,7 +9027,7 @@ int btrfs_read_block_groups(struct btrfs_root *root)
 	root = info->extent_root;
 	key.objectid = 0;
 	key.offset = 0;
-	btrfs_set_key_type(&key, BTRFS_BLOCK_GROUP_ITEM_KEY);
+	key.type = BTRFS_BLOCK_GROUP_ITEM_KEY;
 	path = btrfs_alloc_path();
 	if (!path)
 		return -ENOMEM;
@@ -9759,12 +9761,14 @@ int btrfs_trim_fs(struct btrfs_root *root, struct fstrim_range *range)
 }
 
 /*
- * btrfs_{start,end}_write() is similar to mnt_{want, drop}_write(),
- * they are used to prevent the some tasks writing data into the page cache
- * by nocow before the subvolume is snapshoted, but flush the data into
- * the disk after the snapshot creation.
+ * btrfs_{start,end}_write_no_snapshoting() are similar to
+ * mnt_{want,drop}_write(), they are used to prevent some tasks from writing
+ * data into the page cache through nocow before the subvolume is snapshoted,
+ * but flush the data into disk after the snapshot creation, or to prevent
+ * operations while snapshoting is ongoing and that cause the snapshot to be
+ * inconsistent (writes followed by expanding truncates for example).
  */
-void btrfs_end_nocow_write(struct btrfs_root *root)
+void btrfs_end_write_no_snapshoting(struct btrfs_root *root)
 {
 	percpu_counter_dec(&root->subv_writers->counter);
 	/*
@@ -9776,9 +9780,9 @@ void btrfs_end_nocow_write(struct btrfs_root *root)
 		wake_up(&root->subv_writers->wait);
 }
 
-int btrfs_start_nocow_write(struct btrfs_root *root)
+int btrfs_start_write_no_snapshoting(struct btrfs_root *root)
 {
-	if (unlikely(atomic_read(&root->will_be_snapshoted)))
+	if (atomic_read(&root->will_be_snapshoted))
 		return 0;
 
 	percpu_counter_inc(&root->subv_writers->counter);
@@ -9786,8 +9790,8 @@ int btrfs_start_nocow_write(struct btrfs_root *root)
 	 * Make sure counter is updated before we check for snapshot creation.
 	 */
 	smp_mb();
-	if (unlikely(atomic_read(&root->will_be_snapshoted))) {
-		btrfs_end_nocow_write(root);
+	if (atomic_read(&root->will_be_snapshoted)) {
+		btrfs_end_write_no_snapshoting(root);
 		return 0;
 	}
 	return 1;

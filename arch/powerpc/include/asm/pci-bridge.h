@@ -92,6 +92,9 @@ struct pci_controller {
 #endif	/* CONFIG_PPC64 */
 
 	void *private_data;
+#ifdef CONFIG_PPC64
+	RH_KABI_EXTEND(struct pci_dn *pci_data)
+#endif /* CONFIG_PPC64 */
 };
 
 /* These are used for config access before all the PCI probing
@@ -150,11 +153,18 @@ static inline int isa_vaddr_is_ioport(void __iomem *address)
 struct iommu_table;
 
 struct pci_dn {
+	int     flags;
+#define PCI_DN_FLAG_IOV_VF	0x01
+
 	int	busno;			/* pci bus number */
 	int	devfn;			/* pci device and function number */
+	int	vendor_id;		/* Vendor ID */
+	int	device_id;		/* Device ID */
+	int	class_code;		/* Device class code */
 
+	struct  pci_dn *parent;
 	struct  pci_controller *phb;	/* for pci devices */
-	struct	iommu_table *iommu_table;	/* for phb's or bridges */
+	struct	iommu_table_group *table_group;	/* for phb's or bridges */
 	struct	device_node *node;	/* back-pointer to the device_node */
 
 	int	pci_ext_config_space;	/* for pci devices */
@@ -170,16 +180,25 @@ struct pci_dn {
 	int	pe_number;
 #ifdef CONFIG_PCI_IOV
 	u16     vfs_expanded;		/* number of VFs IOV BAR expanded */
+	u16     num_vfs;		/* number of VFs enabled*/
+	int     offset;			/* PE# for the first VF PE */
+#define IODA_INVALID_M64        (-1)
+	int     m64_wins[PCI_SRIOV_NUM_BARS];
 #endif /* CONFIG_PCI_IOV */
 #endif
+	struct list_head child_list;
+	struct list_head list;
 };
 
 /* Get the pointer to a device_node's pci_dn */
 #define PCI_DN(dn)	((struct pci_dn *) (dn)->data)
 
+extern struct pci_dn *pci_get_pdn_by_devfn(struct pci_bus *bus,
+					   int devfn);
 extern struct pci_dn *pci_get_pdn(struct pci_dev *pdev);
-
-extern void * update_dn_pci_info(struct device_node *dn, void *data);
+extern struct pci_dn *add_dev_pci_data(struct pci_dev *pdev);
+extern void remove_dev_pci_data(struct pci_dev *pdev);
+extern void *update_dn_pci_info(struct device_node *dn, void *data);
 
 static inline int pci_device_from_OF_node(struct device_node *np,
 					  u8 *bus, u8 *devfn)
@@ -192,25 +211,11 @@ static inline int pci_device_from_OF_node(struct device_node *np,
 }
 
 #if defined(CONFIG_EEH)
-static inline struct eeh_dev *of_node_to_eeh_dev(struct device_node *dn)
-{
-	/*
-	 * For those OF nodes whose parent isn't PCI bridge, they
-	 * don't have PCI_DN actually. So we have to skip them for
-	 * any EEH operations.
-	 */
-	if (!dn || !PCI_DN(dn))
-		return NULL;
-
-	return PCI_DN(dn)->edev;
-}
-
 static inline struct eeh_dev *pdn_to_eeh_dev(struct pci_dn *pdn)
 {
 	return pdn ? pdn->edev : NULL;
 }
 #else
-#define of_node_to_eeh_dev(x)	(NULL)
 #define pdn_to_eeh_dev(x)	(NULL)
 #endif
 

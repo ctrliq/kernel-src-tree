@@ -107,10 +107,18 @@ NETDEVICE_SHOW_RO(dev_id, fmt_hex);
 NETDEVICE_SHOW_RO(dev_port, fmt_dec);
 NETDEVICE_SHOW_RO(addr_assign_type, fmt_dec);
 NETDEVICE_SHOW_RO(addr_len, fmt_dec);
-NETDEVICE_SHOW_RO(iflink, fmt_dec);
 NETDEVICE_SHOW_RO(ifindex, fmt_dec);
 NETDEVICE_SHOW_RO(type, fmt_dec);
 NETDEVICE_SHOW_RO(link_mode, fmt_dec);
+
+static ssize_t iflink_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct net_device *ndev = to_net_dev(dev);
+
+	return sprintf(buf, fmt_dec, dev_get_iflink(ndev));
+}
+static DEVICE_ATTR_RO(iflink);
 
 /* use same locking rules as GIFHWADDR ioctl's */
 static ssize_t address_show(struct device *dev, struct device_attribute *attr,
@@ -296,6 +304,23 @@ static ssize_t tx_queue_len_store(struct device *dev,
 }
 NETDEVICE_SHOW_RW(tx_queue_len, fmt_ulong);
 
+static int change_gro_flush_timeout(struct net_device *dev, unsigned long val)
+{
+	dev->gro_flush_timeout = val;
+	return 0;
+}
+
+static ssize_t gro_flush_timeout_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	return netdev_store(dev, attr, buf, len, change_gro_flush_timeout);
+}
+NETDEVICE_SHOW_RW(gro_flush_timeout, fmt_ulong);
+
 static ssize_t ifalias_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t len)
 {
@@ -391,6 +416,7 @@ static struct attribute *net_class_attrs[] = {
 	&dev_attr_mtu.attr,
 	&dev_attr_flags.attr,
 	&dev_attr_tx_queue_len.attr,
+	&dev_attr_gro_flush_timeout.attr,
 	&dev_attr_phys_port_id.attr,
 	NULL,
 };
@@ -1257,7 +1283,7 @@ static void netdev_release(struct device *d)
 	BUG_ON(dev->reg_state != NETREG_RELEASED);
 
 	kfree(dev->ifalias);
-	kfree((char *)dev - dev->padded);
+	netdev_freemem(dev);
 }
 
 static const void *net_namespace(struct device *d)

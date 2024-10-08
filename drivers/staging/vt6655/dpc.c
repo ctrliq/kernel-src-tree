@@ -172,9 +172,9 @@ s_vProcessRxMACHeader(PSDevice pDevice, unsigned char *pbyRxBufferAddr,
 	};
 
 	pbyRxBuffer = (unsigned char *)(pbyRxBufferAddr + cbHeaderSize);
-	if (ether_addr_equal(pbyRxBuffer, pDevice->abySNAP_Bridgetunnel)) {
+	if (!compare_ether_addr(pbyRxBuffer, &pDevice->abySNAP_Bridgetunnel[0])) {
 		cbHeaderSize += 6;
-	} else if (ether_addr_equal(pbyRxBuffer, pDevice->abySNAP_RFC1042)) {
+	} else if (!compare_ether_addr(pbyRxBuffer, &pDevice->abySNAP_RFC1042[0])) {
 		cbHeaderSize += 6;
 		pwType = (unsigned short *)(pbyRxBufferAddr + cbHeaderSize);
 		if ((*pwType != TYPE_PKT_IPX) && (*pwType != cpu_to_le16(0xF380))) {
@@ -420,8 +420,7 @@ device_receive_frame(
 	s_vGetDASA(skb->data+4, &cbHeaderSize, &pDevice->sRxEthHeader);
 
 	// filter packet send from myself
-	if (ether_addr_equal(pDevice->sRxEthHeader.abySrcAddr,
-			     pDevice->abyCurrentNetAddr))
+	if (!compare_ether_addr((unsigned char *)&(pDevice->sRxEthHeader.abySrcAddr[0]), pDevice->abyCurrentNetAddr))
 		return false;
 
 	if ((pMgmt->eCurrMode == WMAC_MODE_ESS_AP) || (pMgmt->eCurrMode == WMAC_MODE_IBSS_STA)) {

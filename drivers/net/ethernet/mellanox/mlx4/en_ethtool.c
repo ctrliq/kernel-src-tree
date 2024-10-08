@@ -38,6 +38,7 @@
 #include <linux/mlx4/device.h>
 #include <linux/in.h>
 #include <net/ip.h>
+#include <linux/bitmap.h>
 
 #include "mlx4_en.h"
 #include "en_port.h"
@@ -92,7 +93,7 @@ mlx4_en_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *drvinfo)
 		(u16) (mdev->dev->caps.fw_ver >> 32),
 		(u16) ((mdev->dev->caps.fw_ver >> 16) & 0xffff),
 		(u16) (mdev->dev->caps.fw_ver & 0xffff));
-	strlcpy(drvinfo->bus_info, pci_name(mdev->dev->pdev),
+	strlcpy(drvinfo->bus_info, pci_name(mdev->dev->persist->pdev),
 		sizeof(drvinfo->bus_info));
 	drvinfo->n_stats = 0;
 	drvinfo->regdump_len = 0;
@@ -104,6 +105,7 @@ static const char mlx4_en_priv_flags[][ETH_GSTRING_LEN] = {
 };
 
 static const char main_strings[][ETH_GSTRING_LEN] = {
+	/* main statistics */
 	"rx_packets", "tx_packets", "rx_bytes", "tx_bytes", "rx_errors",
 	"tx_errors", "rx_dropped", "tx_dropped", "multicast", "collisions",
 	"rx_length_errors", "rx_over_errors", "rx_crc_errors",
@@ -116,6 +118,54 @@ static const char main_strings[][ETH_GSTRING_LEN] = {
 	"xmit_more",
 	"queue_stopped", "wake_queue", "tx_timeout", "rx_alloc_failed",
 	"rx_csum_good", "rx_csum_none", "rx_csum_complete", "tx_chksum_offload",
+
+	/* pf statistics */
+	"pf_rx_packets",
+	"pf_rx_bytes",
+	"pf_tx_packets",
+	"pf_tx_bytes",
+
+	/* priority flow control statistics rx */
+	"rx_pause_prio_0", "rx_pause_duration_prio_0",
+	"rx_pause_transition_prio_0",
+	"rx_pause_prio_1", "rx_pause_duration_prio_1",
+	"rx_pause_transition_prio_1",
+	"rx_pause_prio_2", "rx_pause_duration_prio_2",
+	"rx_pause_transition_prio_2",
+	"rx_pause_prio_3", "rx_pause_duration_prio_3",
+	"rx_pause_transition_prio_3",
+	"rx_pause_prio_4", "rx_pause_duration_prio_4",
+	"rx_pause_transition_prio_4",
+	"rx_pause_prio_5", "rx_pause_duration_prio_5",
+	"rx_pause_transition_prio_5",
+	"rx_pause_prio_6", "rx_pause_duration_prio_6",
+	"rx_pause_transition_prio_6",
+	"rx_pause_prio_7", "rx_pause_duration_prio_7",
+	"rx_pause_transition_prio_7",
+
+	/* flow control statistics rx */
+	"rx_pause", "rx_pause_duration", "rx_pause_transition",
+
+	/* priority flow control statistics tx */
+	"tx_pause_prio_0", "tx_pause_duration_prio_0",
+	"tx_pause_transition_prio_0",
+	"tx_pause_prio_1", "tx_pause_duration_prio_1",
+	"tx_pause_transition_prio_1",
+	"tx_pause_prio_2", "tx_pause_duration_prio_2",
+	"tx_pause_transition_prio_2",
+	"tx_pause_prio_3", "tx_pause_duration_prio_3",
+	"tx_pause_transition_prio_3",
+	"tx_pause_prio_4", "tx_pause_duration_prio_4",
+	"tx_pause_transition_prio_4",
+	"tx_pause_prio_5", "tx_pause_duration_prio_5",
+	"tx_pause_transition_prio_5",
+	"tx_pause_prio_6", "tx_pause_duration_prio_6",
+	"tx_pause_transition_prio_6",
+	"tx_pause_prio_7", "tx_pause_duration_prio_7",
+	"tx_pause_transition_prio_7",
+
+	/* flow control statistics tx */
+	"tx_pause", "tx_pause_duration", "tx_pause_transition",
 
 	/* packet statistics */
 	"rx_multicast_packets",
@@ -244,14 +294,50 @@ static int mlx4_en_set_wol(struct net_device *netdev,
 	return err;
 }
 
+struct bitmap_iterator {
+	unsigned long *stats_bitmap;
+	unsigned int count;
+	unsigned int iterator;
+	bool advance_array; /* if set, force no increments */
+};
+
+static inline void bitmap_iterator_init(struct bitmap_iterator *h,
+					unsigned long *stats_bitmap,
+					int count)
+{
+	h->iterator = 0;
+	h->advance_array = !bitmap_empty(stats_bitmap, count);
+	h->count = h->advance_array ? bitmap_weight(stats_bitmap, count)
+		: count;
+	h->stats_bitmap = stats_bitmap;
+}
+
+static inline int bitmap_iterator_test(struct bitmap_iterator *h)
+{
+	return !h->advance_array ? 1 : test_bit(h->iterator, h->stats_bitmap);
+}
+
+static inline int bitmap_iterator_inc(struct bitmap_iterator *h)
+{
+	return h->iterator++;
+}
+
+static inline unsigned int
+bitmap_iterator_count(struct bitmap_iterator *h)
+{
+	return h->count;
+}
+
 static int mlx4_en_get_sset_count(struct net_device *dev, int sset)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
-	int bit_count = hweight64(priv->stats_bitmap);
+	struct bitmap_iterator it;
+
+	bitmap_iterator_init(&it, priv->stats_bitmap.bitmap, NUM_ALL_STATS);
 
 	switch (sset) {
 	case ETH_SS_STATS:
-		return (priv->stats_bitmap ? bit_count : NUM_ALL_STATS) +
+		return bitmap_iterator_count(&it) +
 			(priv->tx_ring_num * 2) +
 #ifdef CONFIG_NET_RX_BUSY_POLL
 			(priv->rx_ring_num * 5);
@@ -273,34 +359,50 @@ static void mlx4_en_get_ethtool_stats(struct net_device *dev,
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	int index = 0;
-	int i, j = 0;
+	int i;
+	struct bitmap_iterator it;
+
+	bitmap_iterator_init(&it, priv->stats_bitmap.bitmap, NUM_ALL_STATS);
 
 	spin_lock_bh(&priv->stats_lock);
 
-	if (!(priv->stats_bitmap)) {
-		for (i = 0; i < NUM_MAIN_STATS; i++)
+	for (i = 0; i < NUM_MAIN_STATS; i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
+			data[index++] = ((unsigned long *)&priv->stats)[i];
+
+	for (i = 0; i < NUM_PORT_STATS; i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
+			data[index++] = ((unsigned long *)&priv->port_stats)[i];
+
+	for (i = 0; i < NUM_PF_STATS; i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
 			data[index++] =
-				((unsigned long *) &priv->stats)[i];
-		for (i = 0; i < NUM_PORT_STATS; i++)
+				((unsigned long *)&priv->pf_stats)[i];
+
+	for (i = 0; i < NUM_FLOW_PRIORITY_STATS_RX;
+	     i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
 			data[index++] =
-				((unsigned long *) &priv->port_stats)[i];
-		for (i = 0; i < NUM_PKT_STATS; i++)
+				((u64 *)&priv->rx_priority_flowstats)[i];
+
+	for (i = 0; i < NUM_FLOW_STATS_RX; i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
+			data[index++] = ((u64 *)&priv->rx_flowstats)[i];
+
+	for (i = 0; i < NUM_FLOW_PRIORITY_STATS_TX;
+	     i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
 			data[index++] =
-				((unsigned long *) &priv->pkstats)[i];
-	} else {
-		for (i = 0; i < NUM_MAIN_STATS; i++) {
-			if ((priv->stats_bitmap >> j) & 1)
-				data[index++] =
-				((unsigned long *) &priv->stats)[i];
-			j++;
-		}
-		for (i = 0; i < NUM_PORT_STATS; i++) {
-			if ((priv->stats_bitmap >> j) & 1)
-				data[index++] =
-				((unsigned long *) &priv->port_stats)[i];
-			j++;
-		}
-	}
+				((u64 *)&priv->tx_priority_flowstats)[i];
+
+	for (i = 0; i < NUM_FLOW_STATS_TX; i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
+			data[index++] = ((u64 *)&priv->tx_flowstats)[i];
+
+	for (i = 0; i < NUM_PKT_STATS; i++, bitmap_iterator_inc(&it))
+		if (bitmap_iterator_test(&it))
+			data[index++] = ((unsigned long *)&priv->pkstats)[i];
+
 	for (i = 0; i < priv->tx_ring_num; i++) {
 		data[index++] = priv->tx_ring[i]->packets;
 		data[index++] = priv->tx_ring[i]->bytes;
@@ -329,7 +431,10 @@ static void mlx4_en_get_strings(struct net_device *dev,
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	int index = 0;
-	int i;
+	int i, strings = 0;
+	struct bitmap_iterator it;
+
+	bitmap_iterator_init(&it, priv->stats_bitmap.bitmap, NUM_ALL_STATS);
 
 	switch (stringset) {
 	case ETH_SS_TEST:
@@ -342,29 +447,36 @@ static void mlx4_en_get_strings(struct net_device *dev,
 
 	case ETH_SS_STATS:
 		/* Add main counters */
-		if (!priv->stats_bitmap) {
-			for (i = 0; i < NUM_MAIN_STATS; i++)
+		for (i = 0; i < NUM_MAIN_STATS; i++, strings++,
+		     bitmap_iterator_inc(&it))
+			if (bitmap_iterator_test(&it))
 				strcpy(data + (index++) * ETH_GSTRING_LEN,
-					main_strings[i]);
-			for (i = 0; i < NUM_PORT_STATS; i++)
+				       main_strings[strings]);
+
+		for (i = 0; i < NUM_PORT_STATS; i++, strings++,
+		     bitmap_iterator_inc(&it))
+			if (bitmap_iterator_test(&it))
 				strcpy(data + (index++) * ETH_GSTRING_LEN,
-					main_strings[i +
-					NUM_MAIN_STATS]);
-			for (i = 0; i < NUM_PKT_STATS; i++)
+				       main_strings[strings]);
+
+		for (i = 0; i < NUM_PF_STATS; i++, strings++,
+		     bitmap_iterator_inc(&it))
+			if (bitmap_iterator_test(&it))
 				strcpy(data + (index++) * ETH_GSTRING_LEN,
-					main_strings[i +
-					NUM_MAIN_STATS +
-					NUM_PORT_STATS]);
-		} else
-			for (i = 0; i < NUM_MAIN_STATS + NUM_PORT_STATS; i++) {
-				if ((priv->stats_bitmap >> i) & 1) {
-					strcpy(data +
-					       (index++) * ETH_GSTRING_LEN,
-					       main_strings[i]);
-				}
-				if (!(priv->stats_bitmap >> i))
-					break;
-			}
+				       main_strings[strings]);
+
+		for (i = 0; i < NUM_FLOW_STATS; i++, strings++,
+		     bitmap_iterator_inc(&it))
+			if (bitmap_iterator_test(&it))
+				strcpy(data + (index++) * ETH_GSTRING_LEN,
+				       main_strings[strings]);
+
+		for (i = 0; i < NUM_PKT_STATS; i++, strings++,
+		     bitmap_iterator_inc(&it))
+			if (bitmap_iterator_test(&it))
+				strcpy(data + (index++) * ETH_GSTRING_LEN,
+				       main_strings[strings]);
+
 		for (i = 0; i < priv->tx_ring_num; i++) {
 			sprintf(data + (index++) * ETH_GSTRING_LEN,
 				"tx%d_packets", i);
@@ -905,6 +1017,12 @@ static int mlx4_en_set_pauseparam(struct net_device *dev,
 				    priv->prof->rx_ppp);
 	if (err)
 		en_err(priv, "Failed setting pause params\n");
+	else
+		mlx4_en_update_pfc_stats_bitmap(mdev->dev, &priv->stats_bitmap,
+						priv->prof->rx_ppp,
+						priv->prof->rx_pause,
+						priv->prof->tx_ppp,
+						priv->prof->tx_pause);
 
 	return err;
 }
@@ -991,7 +1109,35 @@ static u32 mlx4_en_get_rxfh_indir_size(struct net_device *dev)
 	return priv->rx_ring_num;
 }
 
-static int mlx4_en_get_rxfh_indir(struct net_device *dev, u32 *ring_index)
+static u32 mlx4_en_get_rxfh_key_size(struct net_device *netdev)
+{
+	return MLX4_EN_RSS_KEY_SIZE;
+}
+
+static int mlx4_en_check_rxfh_func(struct net_device *dev, u8 hfunc)
+{
+	struct mlx4_en_priv *priv = netdev_priv(dev);
+
+	/* check if requested function is supported by the device */
+	if (hfunc == ETH_RSS_HASH_TOP) {
+		if (!(priv->mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_RSS_TOP))
+			return -EINVAL;
+		if (!(dev->features & NETIF_F_RXHASH))
+			en_warn(priv, "Toeplitz hash function should be used in conjunction with RX hashing for optimal performance\n");
+		return 0;
+	} else if (hfunc == ETH_RSS_HASH_XOR) {
+		if (!(priv->mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_RSS_XOR))
+			return -EINVAL;
+		if (dev->features & NETIF_F_RXHASH)
+			en_warn(priv, "Enabling both XOR Hash function and RX Hashing can limit RPS functionality\n");
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int mlx4_en_get_rxfh(struct net_device *dev, u32 *ring_index, u8 *key,
+			    u8 *hfunc)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	struct mlx4_en_rss_map *rss_map = &priv->rss_map;
@@ -1003,15 +1149,20 @@ static int mlx4_en_get_rxfh_indir(struct net_device *dev, u32 *ring_index)
 	rss_rings = 1 << ilog2(rss_rings);
 
 	while (n--) {
+		if (!ring_index)
+			break;
 		ring_index[n] = rss_map->qps[n % rss_rings].qpn -
 			rss_map->base_qpn;
 	}
-
+	if (key)
+		memcpy(key, priv->rss_key, MLX4_EN_RSS_KEY_SIZE);
+	if (hfunc)
+		*hfunc = priv->rss_hash_fn;
 	return err;
 }
 
-static int mlx4_en_set_rxfh_indir(struct net_device *dev,
-		const u32 *ring_index)
+static int mlx4_en_set_rxfh(struct net_device *dev, const u32 *ring_index,
+			    const u8 *key, const u8 hfunc)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	struct mlx4_en_dev *mdev = priv->mdev;
@@ -1024,6 +1175,8 @@ static int mlx4_en_set_rxfh_indir(struct net_device *dev,
 	 * between rings
 	 */
 	for (i = 0; i < priv->rx_ring_num; i++) {
+		if (!ring_index)
+			continue;
 		if (i > 0 && !ring_index[i] && !rss_rings)
 			rss_rings = i;
 
@@ -1038,13 +1191,24 @@ static int mlx4_en_set_rxfh_indir(struct net_device *dev,
 	if (!is_power_of_2(rss_rings))
 		return -EINVAL;
 
+	if (hfunc != ETH_RSS_HASH_NO_CHANGE) {
+		err = mlx4_en_check_rxfh_func(dev, hfunc);
+		if (err)
+			return err;
+	}
+
 	mutex_lock(&mdev->state_lock);
 	if (priv->port_up) {
 		port_up = 1;
 		mlx4_en_stop_port(dev, 1);
 	}
 
-	priv->prof->rss_rings = rss_rings;
+	if (ring_index)
+		priv->prof->rss_rings = rss_rings;
+	if (key)
+		memcpy(priv->rss_key, key, MLX4_EN_RSS_KEY_SIZE);
+	if (hfunc !=  ETH_RSS_HASH_NO_CHANGE)
+		priv->rss_hash_fn = hfunc;
 
 	if (port_up) {
 		err = mlx4_en_start_port(dev);
@@ -1753,6 +1917,32 @@ static int mlx4_en_get_module_eeprom(struct net_device *dev,
 	return 0;
 }
 
+static int mlx4_en_set_phys_id(struct net_device *dev,
+			       enum ethtool_phys_id_state state)
+{
+	int err;
+	u16 beacon_duration;
+	struct mlx4_en_priv *priv = netdev_priv(dev);
+	struct mlx4_en_dev *mdev = priv->mdev;
+
+	if (!(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_PORT_BEACON))
+		return -EOPNOTSUPP;
+
+	switch (state) {
+	case ETHTOOL_ID_ACTIVE:
+		beacon_duration = PORT_BEACON_MAX_LIMIT;
+		break;
+	case ETHTOOL_ID_INACTIVE:
+		beacon_duration = 0;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	err = mlx4_SET_PORT_BEACON(mdev->dev, priv->port, beacon_duration);
+	return err;
+}
+
 const struct ethtool_ops mlx4_en_ethtool_ops = {
 	.get_drvinfo = mlx4_en_get_drvinfo,
 	.get_settings = mlx4_en_get_settings,
@@ -1762,6 +1952,7 @@ const struct ethtool_ops mlx4_en_ethtool_ops = {
 	.get_sset_count = mlx4_en_get_sset_count,
 	.get_ethtool_stats = mlx4_en_get_ethtool_stats,
 	.self_test = mlx4_en_self_test,
+	.set_phys_id = mlx4_en_set_phys_id,
 	.get_wol = mlx4_en_get_wol,
 	.set_wol = mlx4_en_set_wol,
 	.get_msglevel = mlx4_en_get_msglevel,
@@ -1775,8 +1966,9 @@ const struct ethtool_ops mlx4_en_ethtool_ops = {
 	.get_rxnfc = mlx4_en_get_rxnfc,
 	.set_rxnfc = mlx4_en_set_rxnfc,
 	.get_rxfh_indir_size = mlx4_en_get_rxfh_indir_size,
-	.get_rxfh_indir = mlx4_en_get_rxfh_indir,
-	.set_rxfh_indir = mlx4_en_set_rxfh_indir,
+	.get_rxfh_key_size = mlx4_en_get_rxfh_key_size,
+	.get_rxfh = mlx4_en_get_rxfh,
+	.set_rxfh = mlx4_en_set_rxfh,
 	.get_channels = mlx4_en_get_channels,
 	.set_channels = mlx4_en_set_channels,
 	.get_ts_info = mlx4_en_get_ts_info,

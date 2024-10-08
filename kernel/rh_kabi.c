@@ -11,9 +11,14 @@
  */
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/netfilter.h>
 
 struct rh_kabi_structs_7_0 {
 	int pad; /* avoid an empty struct */
+};
+
+struct rh_kabi_structs_7_2 {
+	struct nf_hook_state *nf_hook_state;
 };
 
 void rh_kabi_7_0(struct rh_kabi_structs_7_0 *rh_kabi_structs_7_0)
@@ -22,3 +27,10 @@ void rh_kabi_7_0(struct rh_kabi_structs_7_0 *rh_kabi_structs_7_0)
 	panic("Problem exists between keyboard and your seat.");
 }
 EXPORT_SYMBOL_GPL(rh_kabi_7_0);
+
+void rh_kabi_7_2(struct rh_kabi_structs_7_2 *rh_kabi_structs_7_2)
+{
+	/* No need to duplicate the string above */
+	rh_kabi_7_0(NULL);
+}
+EXPORT_SYMBOL_GPL(rh_kabi_7_2);

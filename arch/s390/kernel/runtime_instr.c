@@ -137,10 +137,11 @@ static int __init runtime_instr_init(void)
 	if (!runtime_instr_avail())
 		return 0;
 
-	measurement_alert_subclass_register();
-	rc = register_external_interrupt(0x1407, runtime_instr_int_handler);
+	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+	rc = register_external_irq(EXT_IRQ_MEASURE_ALERT,
+				   runtime_instr_int_handler);
 	if (rc)
-		measurement_alert_subclass_unregister();
+		irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
 	else
 		pr_info("Runtime instrumentation facility initialized\n");
 	return rc;

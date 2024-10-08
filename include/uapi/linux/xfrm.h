@@ -14,7 +14,9 @@
 typedef union {
 	__be32		a4;
 	__be32		a6[4];
+#ifndef __GENKSYMS__
 	struct in6_addr	in6;
+#endif
 } xfrm_address_t;
 
 /* Ident of a specific xfrm_state. It is used on input to lookup

@@ -10,6 +10,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/platform_device.h>
 #include <linux/device.h>
 #include <linux/hw_random.h>

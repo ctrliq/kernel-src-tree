@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <symbol/kallsyms.h>
 #include "unwind.h"
+#include "linux/hash.h"
 
 static void dsos__init(struct dsos *dsos)
 {
@@ -1408,15 +1409,44 @@ struct mem_info *sample__resolve_mem(struct perf_sample *sample,
 static int add_callchain_ip(struct thread *thread,
 			    struct symbol **parent,
 			    struct addr_location *root_al,
-			    int cpumode,
+			    u8 *cpumode,
 			    u64 ip)
 {
 	struct addr_location al;
 
 	al.filtered = 0;
 	al.sym = NULL;
-	thread__find_addr_location(thread, cpumode, MAP__FUNCTION,
-				   ip, &al);
+	if (!cpumode) {
+		thread__find_cpumode_addr_location(thread, MAP__FUNCTION,
+						   ip, &al);
+	} else {
+		if (ip >= PERF_CONTEXT_MAX) {
+			switch (ip) {
+			case PERF_CONTEXT_HV:
+				*cpumode = PERF_RECORD_MISC_HYPERVISOR;
+				break;
+			case PERF_CONTEXT_KERNEL:
+				*cpumode = PERF_RECORD_MISC_KERNEL;
+				break;
+			case PERF_CONTEXT_USER:
+				*cpumode = PERF_RECORD_MISC_USER;
+				break;
+			default:
+				pr_debug("invalid callchain context: "
+					 "%"PRId64"\n", (s64) ip);
+				/*
+				 * It seems the callchain is corrupted.
+				 * Discard all.
+				 */
+				callchain_cursor_reset(&callchain_cursor);
+				return 1;
+			}
+			return 0;
+		}
+		thread__find_addr_location(thread, *cpumode, MAP__FUNCTION,
+					   ip, &al);
+	}
+
 	if (al.sym != NULL) {
 		if (sort__has_parent && !*parent &&
 		    symbol__match_regex(al.sym, &parent_regex))
@@ -1451,33 +1481,214 @@ struct branch_info *sample__resolve_bstack(struct perf_sample *sample,
 	return bi;
 }
 
-static int thread__resolve_callchain_sample(struct thread *thread,
-					     struct ip_callchain *chain,
-					     struct symbol **parent,
-					     struct addr_location *root_al,
-					     int max_stack)
+#define CHASHSZ 127
+#define CHASHBITS 7
+#define NO_ENTRY 0xff
+
+#define PERF_MAX_BRANCH_DEPTH 127
+
+/* Remove loops. */
+static int remove_loops(struct branch_entry *l, int nr)
 {
-	u8 cpumode = PERF_RECORD_MISC_USER;
+	int i, j, off;
+	unsigned char chash[CHASHSZ];
+
+	memset(chash, NO_ENTRY, sizeof(chash));
+
+	BUG_ON(PERF_MAX_BRANCH_DEPTH > 255);
+
+	for (i = 0; i < nr; i++) {
+		int h = hash_64(l[i].from, CHASHBITS) % CHASHSZ;
+
+		/* no collision handling for now */
+		if (chash[h] == NO_ENTRY) {
+			chash[h] = i;
+		} else if (l[chash[h]].from == l[i].from) {
+			bool is_loop = true;
+			/* check if it is a real loop */
+			off = 0;
+			for (j = chash[h]; j < i && i + off < nr; j++, off++)
+				if (l[j].from != l[i + off].from) {
+					is_loop = false;
+					break;
+				}
+			if (is_loop) {
+				memmove(l + i, l + i + off,
+					(nr - (i + off)) * sizeof(*l));
+				nr -= off;
+			}
+		}
+	}
+	return nr;
+}
+
+/*
+ * Recolve LBR callstack chain sample
+ * Return:
+ * 1 on success get LBR callchain information
+ * 0 no available LBR callchain information, should try fp
+ * negative error code on other errors.
+ */
+static int resolve_lbr_callchain_sample(struct thread *thread,
+					struct perf_sample *sample,
+					struct symbol **parent,
+					struct addr_location *root_al,
+					int max_stack)
+{
+	struct ip_callchain *chain = sample->callchain;
 	int chain_nr = min(max_stack, (int)chain->nr);
-	int i;
-	int j;
-	int err;
-	int skip_idx __maybe_unused;
+	u8 cpumode = PERF_RECORD_MISC_USER;
+	int i, j, err;
+	u64 ip;
+
+	for (i = 0; i < chain_nr; i++) {
+		if (chain->ips[i] == PERF_CONTEXT_USER)
+			break;
+	}
+
+	/* LBR only affects the user callchain */
+	if (i != chain_nr) {
+		struct branch_stack *lbr_stack = sample->branch_stack;
+		int lbr_nr = lbr_stack->nr;
+		/*
+		 * LBR callstack can only get user call chain.
+		 * The mix_chain_nr is kernel call chain
+		 * number plus LBR user call chain number.
+		 * i is kernel call chain number,
+		 * 1 is PERF_CONTEXT_USER,
+		 * lbr_nr + 1 is the user call chain number.
+		 * For details, please refer to the comments
+		 * in callchain__printf
+		 */
+		int mix_chain_nr = i + 1 + lbr_nr + 1;
+
+		if (mix_chain_nr > PERF_MAX_STACK_DEPTH + PERF_MAX_BRANCH_DEPTH) {
+			pr_warning("corrupted callchain. skipping...\n");
+			return 0;
+		}
+
+		for (j = 0; j < mix_chain_nr; j++) {
+			if (callchain_param.order == ORDER_CALLEE) {
+				if (j < i + 1)
+					ip = chain->ips[j];
+				else if (j > i + 1)
+					ip = lbr_stack->entries[j - i - 2].from;
+				else
+					ip = lbr_stack->entries[0].to;
+			} else {
+				if (j < lbr_nr)
+					ip = lbr_stack->entries[lbr_nr - j - 1].from;
+				else if (j > lbr_nr)
+					ip = chain->ips[i + 1 - (j - lbr_nr)];
+				else
+					ip = lbr_stack->entries[0].to;
+			}
+
+			err = add_callchain_ip(thread, parent, root_al, &cpumode, ip);
+			if (err)
+				return (err < 0) ? err : 0;
+		}
+		return 1;
+	}
+
+	return 0;
+}
+
+static int thread__resolve_callchain_sample(struct thread *thread,
+					    struct perf_evsel *evsel,
+					    struct perf_sample *sample,
+					    struct symbol **parent,
+					    struct addr_location *root_al,
+					    int max_stack)
+{
+	struct branch_stack *branch = sample->branch_stack;
+	struct ip_callchain *chain = sample->callchain;
+	int chain_nr = min(max_stack, (int)chain->nr);
+	u8 cpumode = PERF_RECORD_MISC_USER;
+	int i, j, err;
+	int skip_idx = -1;
+	int first_call = 0;
 
 	callchain_cursor_reset(&callchain_cursor);
 
-	if (chain->nr > PERF_MAX_STACK_DEPTH) {
-		pr_warning("corrupted callchain. skipping...\n");
-		return 0;
+	if (has_branch_callstack(evsel)) {
+		err = resolve_lbr_callchain_sample(thread, sample, parent,
+						   root_al, max_stack);
+		if (err)
+			return (err < 0) ? err : 0;
 	}
 
 	/*
 	 * Based on DWARF debug information, some architectures skip
 	 * a callchain entry saved by the kernel.
 	 */
-	skip_idx = arch_skip_callchain_idx(thread, chain);
+	if (chain->nr < PERF_MAX_STACK_DEPTH)
+		skip_idx = arch_skip_callchain_idx(thread, chain);
 
-	for (i = 0; i < chain_nr; i++) {
+	/*
+	 * Add branches to call stack for easier browsing. This gives
+	 * more context for a sample than just the callers.
+	 *
+	 * This uses individual histograms of paths compared to the
+	 * aggregated histograms the normal LBR mode uses.
+	 *
+	 * Limitations for now:
+	 * - No extra filters
+	 * - No annotations (should annotate somehow)
+	 */
+
+	if (branch && callchain_param.branch_callstack) {
+		int nr = min(max_stack, (int)branch->nr);
+		struct branch_entry be[nr];
+
+		if (branch->nr > PERF_MAX_BRANCH_DEPTH) {
+			pr_warning("corrupted branch chain. skipping...\n");
+			goto check_calls;
+		}
+
+		for (i = 0; i < nr; i++) {
+			if (callchain_param.order == ORDER_CALLEE) {
+				be[i] = branch->entries[i];
+				/*
+				 * Check for overlap into the callchain.
+				 * The return address is one off compared to
+				 * the branch entry. To adjust for this
+				 * assume the calling instruction is not longer
+				 * than 8 bytes.
+				 */
+				if (i == skip_idx ||
+				    chain->ips[first_call] >= PERF_CONTEXT_MAX)
+					first_call++;
+				else if (be[i].from < chain->ips[first_call] &&
+				    be[i].from >= chain->ips[first_call] - 8)
+					first_call++;
+			} else
+				be[i] = branch->entries[branch->nr - i - 1];
+		}
+
+		nr = remove_loops(be, nr);
+
+		for (i = 0; i < nr; i++) {
+			err = add_callchain_ip(thread, parent, root_al,
+					       NULL, be[i].to);
+			if (!err)
+				err = add_callchain_ip(thread, parent, root_al,
+						       NULL, be[i].from);
+			if (err == -EINVAL)
+				break;
+			if (err)
+				return err;
+		}
+		chain_nr -= nr;
+	}
+
+check_calls:
+	if (chain->nr > PERF_MAX_STACK_DEPTH) {
+		pr_warning("corrupted callchain. skipping...\n");
+		return 0;
+	}
+
+	for (i = first_call; i < chain_nr; i++) {
 		u64 ip;
 
 		if (callchain_param.order == ORDER_CALLEE)
@@ -1491,36 +1702,10 @@ static int thread__resolve_callchain_sample(struct thread *thread,
 #endif
 		ip = chain->ips[j];
 
-		if (ip >= PERF_CONTEXT_MAX) {
-			switch (ip) {
-			case PERF_CONTEXT_HV:
-				cpumode = PERF_RECORD_MISC_HYPERVISOR;
-				break;
-			case PERF_CONTEXT_KERNEL:
-				cpumode = PERF_RECORD_MISC_KERNEL;
-				break;
-			case PERF_CONTEXT_USER:
-				cpumode = PERF_RECORD_MISC_USER;
-				break;
-			default:
-				pr_debug("invalid callchain context: "
-					 "%"PRId64"\n", (s64) ip);
-				/*
-				 * It seems the callchain is corrupted.
-				 * Discard all.
-				 */
-				callchain_cursor_reset(&callchain_cursor);
-				return 0;
-			}
-			continue;
-		}
+		err = add_callchain_ip(thread, parent, root_al, &cpumode, ip);
 
-		err = add_callchain_ip(thread, parent, root_al,
-				       cpumode, ip);
-		if (err == -EINVAL)
-			break;
 		if (err)
-			return err;
+			return (err < 0) ? err : 0;
 	}
 
 	return 0;
@@ -1540,8 +1725,9 @@ int thread__resolve_callchain(struct thread *thread,
 			      struct addr_location *root_al,
 			      int max_stack)
 {
-	int ret = thread__resolve_callchain_sample(thread, sample->callchain,
-						   parent, root_al, max_stack);
+	int ret = thread__resolve_callchain_sample(thread, evsel,
+						   sample, parent,
+						   root_al, max_stack);
 	if (ret)
 		return ret;
 

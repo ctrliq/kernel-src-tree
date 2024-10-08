@@ -1256,11 +1256,17 @@ nfsd4_umh_cltrack_init(struct net *net)
 	return ret;
 }
 
+static int nfsd_wait_bit_uninterruptible(void *word)
+{
+	io_schedule();
+	return 0;
+}
+
 static void
 nfsd4_cltrack_upcall_lock(struct nfs4_client *clp)
 {
 	wait_on_bit_lock(&clp->cl_flags, NFSD4_CLIENT_UPCALL_LOCK,
-			 TASK_UNINTERRUPTIBLE);
+			 nfsd_wait_bit_uninterruptible, TASK_UNINTERRUPTIBLE);
 }
 
 static void

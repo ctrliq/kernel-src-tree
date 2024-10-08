@@ -61,6 +61,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "inst_emu",   VCPU_STAT(emulated_inst_exits) },
 	{ "dec",        VCPU_STAT(dec_exits) },
 	{ "ext_intr",   VCPU_STAT(ext_intr_exits) },
+	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll) },
 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
 	{ "doorbell", VCPU_STAT(dbell_exits) },
 	{ "guest doorbell", VCPU_STAT(gdbell_exits) },
@@ -1589,14 +1590,15 @@ int kvmppc_core_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 
 int kvmppc_core_prepare_memory_region(struct kvm *kvm,
 				      struct kvm_memory_slot *memslot,
-				      struct kvm_userspace_memory_region *mem)
+				      const struct kvm_userspace_memory_region *mem)
 {
 	return 0;
 }
 
 void kvmppc_core_commit_memory_region(struct kvm *kvm,
-				struct kvm_userspace_memory_region *mem,
-				const struct kvm_memory_slot *old)
+				const struct kvm_userspace_memory_region *mem,
+				const struct kvm_memory_slot *old,
+				const struct kvm_memory_slot *new)
 {
 }
 
@@ -1653,6 +1655,57 @@ void kvmppc_decrementer_func(struct kvm_vcpu *vcpu)
 	}
 
 	kvmppc_set_tsr_bits(vcpu, TSR_DIS);
+}
+
+int kvmppc_xlate(struct kvm_vcpu *vcpu, ulong eaddr, enum xlate_instdata xlid,
+		 enum xlate_readwrite xlrw, struct kvmppc_pte *pte)
+{
+	int gtlb_index;
+	gpa_t gpaddr;
+
+#ifdef CONFIG_KVM_E500V2
+	if (!(vcpu->arch.shared->msr & MSR_PR) &&
+	    (eaddr & PAGE_MASK) == vcpu->arch.magic_page_ea) {
+		pte->eaddr = eaddr;
+		pte->raddr = (vcpu->arch.magic_page_pa & PAGE_MASK) |
+			     (eaddr & ~PAGE_MASK);
+		pte->vpage = eaddr >> PAGE_SHIFT;
+		pte->may_read = true;
+		pte->may_write = true;
+		pte->may_execute = true;
+
+		return 0;
+	}
+#endif
+
+	/* Check the guest TLB. */
+	switch (xlid) {
+	case XLATE_INST:
+		gtlb_index = kvmppc_mmu_itlb_index(vcpu, eaddr);
+		break;
+	case XLATE_DATA:
+		gtlb_index = kvmppc_mmu_dtlb_index(vcpu, eaddr);
+		break;
+	default:
+		BUG();
+	}
+
+	/* Do we have a TLB entry at all? */
+	if (gtlb_index < 0)
+		return -ENOENT;
+
+	gpaddr = kvmppc_mmu_xlate(vcpu, gtlb_index, eaddr);
+
+	pte->eaddr = eaddr;
+	pte->raddr = (gpaddr & PAGE_MASK) | (eaddr & ~PAGE_MASK);
+	pte->vpage = eaddr >> PAGE_SHIFT;
+
+	/* XXX read permissions from the guest TLB */
+	pte->may_read = true;
+	pte->may_write = true;
+	pte->may_execute = true;
+
+	return 0;
 }
 
 void kvmppc_booke_vcpu_load(struct kvm_vcpu *vcpu, int cpu)

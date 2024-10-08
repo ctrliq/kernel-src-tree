@@ -21,8 +21,6 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_inode.h"
 #include "xfs_error.h"
@@ -30,7 +28,6 @@
 #include "xfs_icache.h"
 #include "xfs_trans.h"
 #include "xfs_ialloc.h"
-#include "xfs_dinode.h"
 
 /*
  * Check that none of the inode's in the buffer have a next
@@ -101,7 +98,7 @@ xfs_inode_buf_verify(
 				return;
 			}
 
-			xfs_buf_ioerror(bp, EFSCORRUPTED);
+			xfs_buf_ioerror(bp, -EFSCORRUPTED);
 			xfs_verifier_error(bp);
 #ifdef DEBUG
 			xfs_alert(mp,
@@ -174,14 +171,14 @@ xfs_imap_to_bp(
 				   (int)imap->im_len, buf_flags, &bp,
 				   &xfs_inode_buf_ops);
 	if (error) {
-		if (error == EAGAIN) {
+		if (error == -EAGAIN) {
 			ASSERT(buf_flags & XBF_TRYLOCK);
 			return error;
 		}
 
-		if (error == EFSCORRUPTED &&
+		if (error == -EFSCORRUPTED &&
 		    (iget_flags & XFS_IGET_UNTRUSTED))
-			return XFS_ERROR(EINVAL);
+			return -EINVAL;
 
 		xfs_warn(mp, "%s: xfs_trans_read_buf() returned error %d.",
 			__func__, error);
@@ -390,7 +387,7 @@ xfs_iread(
 				__func__, ip->i_ino);
 
 		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp, dip);
-		error = XFS_ERROR(EFSCORRUPTED);
+		error = -EFSCORRUPTED;
 		goto out_brelse;
 	}
 
@@ -437,17 +434,16 @@ xfs_iread(
 	}
 
 	/*
-	 * The inode format changed when we moved the link count and
-	 * made it 32 bits long.  If this is an old format inode,
-	 * convert it in memory to look like a new one.  If it gets
-	 * flushed to disk we will convert back before flushing or
-	 * logging it.  We zero out the new projid field and the old link
-	 * count field.  We'll handle clearing the pad field (the remains
-	 * of the old uuid field) when we actually convert the inode to
-	 * the new format. We don't change the version number so that we
-	 * can distinguish this from a real new format inode.
+	 * Automatically convert version 1 inode formats in memory to version 2
+	 * inode format. If the inode is modified, it will get logged and
+	 * rewritten as a version 2 inode. We can do this because we set the
+	 * superblock feature bit for v2 inodes unconditionally during mount
+	 * and it means the reast of the code can assume the inode version is 2
+	 * or higher.
 	 */
 	if (ip->i_d.di_version == 1) {
+		ip->i_d.di_version = 2;
+		memset(&(ip->i_d.di_pad[0]), 0, sizeof(ip->i_d.di_pad));
 		ip->i_d.di_nlink = ip->i_d.di_onlink;
 		ip->i_d.di_onlink = 0;
 		xfs_set_projid(ip, 0);

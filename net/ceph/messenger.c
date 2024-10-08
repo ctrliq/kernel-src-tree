@@ -412,7 +412,7 @@ static void ceph_sock_write_space(struct sock *sk)
 	 * and net/core/stream.c:sk_stream_write_space().
 	 */
 	if (con_flag_test(con, CON_FLAG_WRITE_PENDING)) {
-		if (sk_stream_wspace(sk) >= sk_stream_min_wspace(sk)) {
+		if (sk_stream_is_writeable(sk)) {
 			dout("%s %p queueing write work\n", __func__, con);
 			clear_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 			queue_con(con);
@@ -481,7 +481,7 @@ static int ceph_tcp_connect(struct ceph_connection *con)
 			       IPPROTO_TCP, &sock);
 	if (ret)
 		return ret;
-	sock->sk->sk_allocation = GFP_NOFS | __GFP_MEMALLOC;
+	sock->sk->sk_allocation = GFP_NOFS;
 
 #ifdef CONFIG_LOCKDEP
 	lockdep_set_class(&sock->sk->sk_lock, &socket_class);
@@ -505,7 +505,15 @@ static int ceph_tcp_connect(struct ceph_connection *con)
 		return ret;
 	}
 
-	sk_set_memalloc(sock->sk);
+	if (con->msgr->tcp_nodelay) {
+		int optval = 1;
+
+		ret = kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY,
+					(char *)&optval, sizeof(optval));
+		if (ret)
+			pr_err("kernel_setsockopt(TCP_NODELAY) failed: %d",
+			       ret);
+	}
 
 	con->sock = sock;
 	return 0;
@@ -2797,10 +2805,7 @@ static void con_work(struct work_struct *work)
 {
 	struct ceph_connection *con = container_of(work, struct ceph_connection,
 						   work.work);
-	unsigned long pflags = current->flags;
 	bool fault;
-
-	current->flags |= PF_MEMALLOC;
 
 	mutex_lock(&con->mutex);
 	while (true) {
@@ -2857,8 +2862,6 @@ static void con_work(struct work_struct *work)
 		con_fault_finish(con);
 
 	con->ops->put(con);
-
-	tsk_restore_flags(current, pflags, PF_MEMALLOC);
 }
 
 /*
@@ -2925,7 +2928,8 @@ void ceph_messenger_init(struct ceph_messenger *msgr,
 			struct ceph_entity_addr *myaddr,
 			u64 supported_features,
 			u64 required_features,
-			bool nocrc)
+			bool nocrc,
+			bool tcp_nodelay)
 {
 	msgr->supported_features = supported_features;
 	msgr->required_features = required_features;
@@ -2940,6 +2944,7 @@ void ceph_messenger_init(struct ceph_messenger *msgr,
 	get_random_bytes(&msgr->inst.addr.nonce, sizeof(msgr->inst.addr.nonce));
 	encode_my_addr(msgr);
 	msgr->nocrc = nocrc;
+	msgr->tcp_nodelay = tcp_nodelay;
 
 	atomic_set(&msgr->stopping, 0);
 

@@ -89,6 +89,7 @@ static inline pte_t native_ptep_get_and_clear(pte_t *xp)
 
 static inline pmd_t native_pmdp_get_and_clear(pmd_t *xp)
 {
+	mm_track_pmd(xp);
 #ifdef CONFIG_SMP
 	return native_make_pmd(xchg(&xp->pmd, 0));
 #else

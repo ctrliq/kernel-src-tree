@@ -67,6 +67,7 @@ static const struct irq_class irqclass_sub_desc[NR_ARCH_IRQS] = {
 	{.irq = IRQEXT_CMS, .name = "CMS", .desc = "[EXT] CPU-Measurement: Sampling"},
 	{.irq = IRQEXT_CMC, .name = "CMC", .desc = "[EXT] CPU-Measurement: Counter"},
 	{.irq = IRQEXT_CMR, .name = "CMR", .desc = "[EXT] CPU-Measurement: RI"},
+	{.irq = IRQEXT_FTP, .name = "FTP", .desc = "[EXT] HMC FTP Service"},
 	{.irq = IRQIO_CIO,  .name = "CIO", .desc = "[I/O] Common I/O Layer Interrupt"},
 	{.irq = IRQIO_QAI,  .name = "QAI", .desc = "[I/O] QDIO Adapter Interrupt"},
 	{.irq = IRQIO_DAS,  .name = "DAS", .desc = "[I/O] DASD"},
@@ -201,7 +202,7 @@ static inline int ext_hash(u16 code)
 	return (code + (code >> 9)) & 0xff;
 }
 
-int register_external_interrupt(u16 code, ext_int_handler_t handler)
+int register_external_irq(u16 code, ext_int_handler_t handler)
 {
 	struct ext_int_info *p;
 	unsigned long flags;
@@ -219,9 +220,9 @@ int register_external_interrupt(u16 code, ext_int_handler_t handler)
 	spin_unlock_irqrestore(&ext_int_hash_lock, flags);
 	return 0;
 }
-EXPORT_SYMBOL(register_external_interrupt);
+EXPORT_SYMBOL(register_external_irq);
 
-int unregister_external_interrupt(u16 code, ext_int_handler_t handler)
+int unregister_external_irq(u16 code, ext_int_handler_t handler)
 {
 	struct ext_int_info *p;
 	unsigned long flags;
@@ -237,7 +238,7 @@ int unregister_external_interrupt(u16 code, ext_int_handler_t handler)
 	spin_unlock_irqrestore(&ext_int_hash_lock, flags);
 	return 0;
 }
-EXPORT_SYMBOL(unregister_external_interrupt);
+EXPORT_SYMBOL(unregister_external_irq);
 
 void __irq_entry do_extint(struct pt_regs *regs, struct ext_code ext_code,
 			   unsigned int param32, unsigned long param64)
@@ -253,7 +254,7 @@ void __irq_entry do_extint(struct pt_regs *regs, struct ext_code ext_code,
 		clock_comparator_work();
 	}
 	kstat_incr_irqs_this_cpu(EXTERNAL_INTERRUPT, NULL);
-	if (ext_code.code != 0x1004)
+	if (ext_code.code != EXT_IRQ_CLK_COMP)
 		__get_cpu_var(s390_idle).nohz_delay = 1;
 
 	index = ext_hash(ext_code.code);
@@ -271,51 +272,28 @@ void __init init_IRQ(void)
 	init_external_interrupts();
 }
 
-static DEFINE_SPINLOCK(sc_irq_lock);
-static int sc_irq_refcount;
+static DEFINE_SPINLOCK(irq_subclass_lock);
+static unsigned char irq_subclass_refcount[64];
 
-void service_subclass_irq_register(void)
+void irq_subclass_register(enum irq_subclass subclass)
 {
-	spin_lock(&sc_irq_lock);
-	if (!sc_irq_refcount)
-		ctl_set_bit(0, 9);
-	sc_irq_refcount++;
-	spin_unlock(&sc_irq_lock);
+	spin_lock(&irq_subclass_lock);
+	if (!irq_subclass_refcount[subclass])
+		ctl_set_bit(0, subclass);
+	irq_subclass_refcount[subclass]++;
+	spin_unlock(&irq_subclass_lock);
 }
-EXPORT_SYMBOL(service_subclass_irq_register);
+EXPORT_SYMBOL(irq_subclass_register);
 
-void service_subclass_irq_unregister(void)
+void irq_subclass_unregister(enum irq_subclass subclass)
 {
-	spin_lock(&sc_irq_lock);
-	sc_irq_refcount--;
-	if (!sc_irq_refcount)
-		ctl_clear_bit(0, 9);
-	spin_unlock(&sc_irq_lock);
+	spin_lock(&irq_subclass_lock);
+	irq_subclass_refcount[subclass]--;
+	if (!irq_subclass_refcount[subclass])
+		ctl_clear_bit(0, subclass);
+	spin_unlock(&irq_subclass_lock);
 }
-EXPORT_SYMBOL(service_subclass_irq_unregister);
-
-static DEFINE_SPINLOCK(ma_subclass_lock);
-static int ma_subclass_refcount;
-
-void measurement_alert_subclass_register(void)
-{
-	spin_lock(&ma_subclass_lock);
-	if (!ma_subclass_refcount)
-		ctl_set_bit(0, 5);
-	ma_subclass_refcount++;
-	spin_unlock(&ma_subclass_lock);
-}
-EXPORT_SYMBOL(measurement_alert_subclass_register);
-
-void measurement_alert_subclass_unregister(void)
-{
-	spin_lock(&ma_subclass_lock);
-	ma_subclass_refcount--;
-	if (!ma_subclass_refcount)
-		ctl_clear_bit(0, 5);
-	spin_unlock(&ma_subclass_lock);
-}
-EXPORT_SYMBOL(measurement_alert_subclass_unregister);
+EXPORT_SYMBOL(irq_subclass_unregister);
 
 #ifdef CONFIG_SMP
 void synchronize_irq(unsigned int irq)

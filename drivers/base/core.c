@@ -1072,6 +1072,10 @@ int device_add(struct device *dev)
 	if (!dev)
 		goto done;
 
+	/* allocate the Red Hat only struct */
+	dev->device_rh = kzalloc(sizeof(struct device_rh),
+				 GFP_KERNEL | __GFP_NOFAIL);
+
 	if (!dev->p) {
 		error = device_private_init(dev);
 		if (error)
@@ -1316,6 +1320,8 @@ void device_del(struct device *dev)
 	kobject_uevent(&dev->kobj, KOBJ_REMOVE);
 	cleanup_device_parent(dev);
 	kobject_del(&dev->kobj);
+	/* This free's the allocation done in device_add() */
+	kfree(dev->device_rh);
 	put_device(parent);
 }
 

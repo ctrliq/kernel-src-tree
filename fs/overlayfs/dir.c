@@ -118,14 +118,14 @@ int ovl_create_real(struct inode *dir, struct dentry *newdentry,
 
 static int ovl_set_opaque(struct dentry *upperdentry)
 {
-	return ovl_do_setxattr(upperdentry, ovl_opaque_xattr, "y", 1, 0);
+	return ovl_do_setxattr(upperdentry, OVL_XATTR_OPAQUE, "y", 1, 0);
 }
 
 static void ovl_remove_opaque(struct dentry *upperdentry)
 {
 	int err;
 
-	err = ovl_do_removexattr(upperdentry, ovl_opaque_xattr);
+	err = ovl_do_removexattr(upperdentry, OVL_XATTR_OPAQUE);
 	if (err) {
 		pr_warn("overlayfs: failed to remove opaque from '%s' (%i)\n",
 			upperdentry->d_name.name, err);
@@ -221,6 +221,9 @@ static struct dentry *ovl_clear_empty(struct dentry *dentry,
 	struct dentry *opaquedir;
 	struct kstat stat;
 	int err;
+
+	if (WARN_ON(!workdir))
+		return ERR_PTR(-EROFS);
 
 	err = ovl_lock_rename_workdir(workdir, upperdir);
 	if (err)
@@ -321,6 +324,9 @@ static int ovl_create_over_whiteout(struct dentry *dentry, struct inode *inode,
 	struct dentry *upper;
 	struct dentry *newdentry;
 	int err;
+
+	if (WARN_ON(!workdir))
+		return -EROFS;
 
 	err = ovl_lock_rename_workdir(workdir, upperdir);
 	if (err)
@@ -505,6 +511,9 @@ static int ovl_remove_and_whiteout(struct dentry *dentry, bool is_dir)
 	struct dentry *upper;
 	struct dentry *opaquedir = NULL;
 	int err;
+
+	if (WARN_ON(!workdir))
+		return -EROFS;
 
 	if (is_dir) {
 		if (OVL_TYPE_MERGE_OR_LOWER(ovl_path_type(dentry))) {

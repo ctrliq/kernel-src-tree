@@ -62,6 +62,7 @@ struct bio_list;
 struct fs_struct;
 struct perf_event_context;
 struct blk_plug;
+struct filename;
 
 /*
  * List of flags we want to share for kernel threads,
@@ -107,14 +108,6 @@ extern unsigned long this_cpu_load(void);
 
 extern void calc_global_load(unsigned long ticks);
 extern void update_cpu_load_nohz(void);
-
-/* Notifier for when a task gets migrated to a new CPU */
-struct task_migration_notifier {
-	struct task_struct *task;
-	int from_cpu;
-	int to_cpu;
-};
-extern void register_task_migration_notifier(struct notifier_block *n);
 
 extern unsigned long get_parent_ip(unsigned long addr);
 
@@ -230,6 +223,8 @@ extern asmlinkage void schedule_tail(struct task_struct *prev);
 extern void init_idle(struct task_struct *idle, int cpu);
 extern void init_idle_bootup_task(struct task_struct *idle);
 
+extern cpumask_var_t cpu_isolated_map;
+
 extern int runqueue_is_locked(int cpu);
 
 #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
@@ -259,6 +254,9 @@ extern void show_regs(struct pt_regs *);
  * trace (or NULL if the entire call-chain of the task should be shown).
  */
 extern void show_stack(struct task_struct *task, unsigned long *sp);
+
+void io_schedule(void);
+long io_schedule_timeout(long timeout);
 
 extern void cpu_init (void);
 extern void trap_init(void);
@@ -315,13 +313,6 @@ extern signed long schedule_timeout_killable(signed long timeout);
 extern signed long schedule_timeout_uninterruptible(signed long timeout);
 asmlinkage void schedule(void);
 extern void schedule_preempt_disabled(void);
-
-extern long io_schedule_timeout(long timeout);
-
-static inline void io_schedule(void)
-{
-	io_schedule_timeout(MAX_SCHEDULE_TIMEOUT);
-}
 
 struct nsproxy;
 struct user_namespace;
@@ -807,21 +798,21 @@ enum cpu_idle_type {
 extern int __weak arch_sd_sibiling_asym_packing(void);
 
 #ifdef CONFIG_SCHED_SMT
-static inline const int cpu_smt_flags(void)
+static inline int cpu_smt_flags(void)
 {
 	return SD_SHARE_CPUPOWER | SD_SHARE_PKG_RESOURCES;
 }
 #endif
 
 #ifdef CONFIG_SCHED_MC
-static inline const int cpu_core_flags(void)
+static inline int cpu_core_flags(void)
 {
 	return SD_SHARE_PKG_RESOURCES;
 }
 #endif
 
 #ifdef CONFIG_NUMA
-static inline const int cpu_numa_flags(void)
+static inline int cpu_numa_flags(void)
 {
 	return SD_NUMA;
 }
@@ -936,7 +927,7 @@ void free_sched_domains(cpumask_var_t doms[], unsigned int ndoms);
 bool cpus_share_cache(int this_cpu, int that_cpu);
 
 typedef const struct cpumask *(*sched_domain_mask_f)(int cpu);
-typedef const int (*sched_domain_flags_f)(void);
+typedef int (*sched_domain_flags_f)(void);
 
 #define SDTL_OVERLAP	0x01
 
@@ -1535,17 +1526,11 @@ struct task_struct {
 		unsigned long memsw_nr_pages; /* uncharged mem+swap usage */
 	} memcg_batch;
 	unsigned int memcg_kmem_skip_account;
-	struct memcg_oom_info {
-		struct mem_cgroup *memcg;
-		gfp_t gfp_mask;
-		int order;
-		unsigned int may_oom:1;
-	} memcg_oom;
 #endif
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
 	atomic_t ptrace_bp_refcnt;
 #endif
-#ifdef CONFIG_UPROBES
+#if !defined(CONFIG_S390) && defined(CONFIG_UPROBES)
 	struct uprobe_task *utask;
 #endif
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
@@ -1560,12 +1545,26 @@ struct task_struct {
 	RH_KABI_RESERVE(1)
 #endif
 	RH_KABI_USE(2, unsigned long atomic_flags)
+#if defined(CONFIG_S390) && defined(CONFIG_UPROBES)
+	RH_KABI_USE(3, struct uprobe_task *utask)
+#else
 	RH_KABI_RESERVE(3)
+#endif
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
+#ifndef __GENKSYMS__
+#ifdef CONFIG_MEMCG
+	struct memcg_oom_info {
+		struct mem_cgroup *memcg;
+		gfp_t gfp_mask;
+		int order;
+		unsigned int may_oom:1;
+	} memcg_oom;
+#endif
+#endif /* __GENKSYMS__ */
 };
 
 /* Future-safe accessor for struct task_struct's cpus_allowed. */
@@ -2343,7 +2342,7 @@ extern void do_group_exit(int);
 extern int allow_signal(int);
 extern int disallow_signal(int);
 
-extern int do_execve(const char *,
+extern int do_execve(struct filename *,
 		     const char __user * const __user *,
 		     const char __user * const __user *);
 extern long do_fork(unsigned long, unsigned long, unsigned long, int __user *, int __user *);

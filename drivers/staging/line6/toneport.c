@@ -37,6 +37,9 @@ static struct line6_pcm_properties toneport_pcm_properties = {
 					   SNDRV_PCM_INFO_BLOCK_TRANSFER |
 					   SNDRV_PCM_INFO_MMAP_VALID |
 					   SNDRV_PCM_INFO_PAUSE |
+#ifdef CONFIG_PM
+					   SNDRV_PCM_INFO_RESUME |
+#endif
 					   SNDRV_PCM_INFO_SYNC_START),
 				  .formats = SNDRV_PCM_FMTBIT_S16_LE,
 				  .rates = SNDRV_PCM_RATE_KNOT,
@@ -54,6 +57,9 @@ static struct line6_pcm_properties toneport_pcm_properties = {
 					  SNDRV_PCM_INFO_INTERLEAVED |
 					  SNDRV_PCM_INFO_BLOCK_TRANSFER |
 					  SNDRV_PCM_INFO_MMAP_VALID |
+#ifdef CONFIG_PM
+					  SNDRV_PCM_INFO_RESUME |
+#endif
 					  SNDRV_PCM_INFO_SYNC_START),
 				 .formats = SNDRV_PCM_FMTBIT_S16_LE,
 				 .rates = SNDRV_PCM_RATE_KNOT,
@@ -381,9 +387,11 @@ static int toneport_try_init(struct usb_interface *interface,
 
 	toneport_setup(toneport);
 
-	setup_timer(&toneport->timer, toneport_start_pcm,
-		    (unsigned long)toneport);
-	mod_timer(&toneport->timer, jiffies + TONEPORT_PCM_DELAY * HZ);
+	init_timer(&toneport->timer);
+	toneport->timer.expires = jiffies + TONEPORT_PCM_DELAY * HZ;
+	toneport->timer.function = toneport_start_pcm;
+	toneport->timer.data = (unsigned long)toneport;
+	add_timer(&toneport->timer);
 
 	return 0;
 }

@@ -1029,7 +1029,8 @@ static void start_next_msg(struct ssif_info *ssif_info, unsigned long *flags)
 }
 
 static void sender(void                *send_info,
-		   struct ipmi_smi_msg *msg)
+		   struct ipmi_smi_msg *msg,
+		   int                 priority)
 {
 	struct ssif_info *ssif_info = (struct ssif_info *) send_info;
 	unsigned long oflags, *flags;
@@ -1648,6 +1649,7 @@ static int ssif_probe(struct i2c_client *client, const struct i2c_device_id *id)
 			       ssif_info,
 			       &ssif_info->device_id,
 			       &ssif_info->client->dev,
+			       "ssif",
 			       slave_addr);
 	 if (rv) {
 		pr_err(PFX "Unable to register device: error %d\n", rv);

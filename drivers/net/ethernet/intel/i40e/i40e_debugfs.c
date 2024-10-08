@@ -35,7 +35,7 @@ static struct dentry *i40e_dbg_root;
 
 /**
  * i40e_dbg_find_vsi - searches for the vsi with the given seid
- * @pf - the pf structure to search for the vsi
+ * @pf - the PF structure to search for the vsi
  * @seid - seid of the vsi it is searching for
  **/
 static struct i40e_vsi *i40e_dbg_find_vsi(struct i40e_pf *pf, int seid)
@@ -54,7 +54,7 @@ static struct i40e_vsi *i40e_dbg_find_vsi(struct i40e_pf *pf, int seid)
 
 /**
  * i40e_dbg_find_veb - searches for the veb with the given seid
- * @pf - the pf structure to search for the veb
+ * @pf - the PF structure to search for the veb
  * @seid - seid of the veb it is searching for
  **/
 static struct i40e_veb *i40e_dbg_find_veb(struct i40e_pf *pf, int seid)
@@ -112,7 +112,7 @@ static ssize_t i40e_dbg_dump_read(struct file *filp, char __user *buffer,
 
 /**
  * i40e_dbg_prep_dump_buf
- * @pf: the pf we're working with
+ * @pf: the PF we're working with
  * @buflen: the desired buffer length
  *
  * Return positive if success, 0 if failed
@@ -680,7 +680,7 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 		 vsi->info.resp_reserved[8], vsi->info.resp_reserved[9],
 		 vsi->info.resp_reserved[10], vsi->info.resp_reserved[11]);
 	if (vsi->back)
-		dev_info(&pf->pdev->dev, "    pf = %p\n", vsi->back);
+		dev_info(&pf->pdev->dev, "    PF = %p\n", vsi->back);
 	dev_info(&pf->pdev->dev, "    idx = %d\n", vsi->idx);
 	dev_info(&pf->pdev->dev,
 		 "    tc_config: numtc = %d, enabled_tc = 0x%x\n",
@@ -951,7 +951,7 @@ static void i40e_dbg_dump_veb_all(struct i40e_pf *pf)
 
 /**
  * i40e_dbg_cmd_fd_ctrl - Enable/disable FD sideband/ATR
- * @pf: the pf that would be altered
+ * @pf: the PF that would be altered
  * @flag: flag that needs enabling or disabling
  * @enable: Enable/disable FD SD/ATR
  **/
@@ -963,8 +963,8 @@ static void i40e_dbg_cmd_fd_ctrl(struct i40e_pf *pf, u64 flag, bool enable)
 		pf->flags &= ~flag;
 		pf->auto_disable_flags |= flag;
 	}
-	dev_info(&pf->pdev->dev, "requesting a pf reset\n");
-	i40e_do_reset_safe(pf, (1 << __I40E_PF_RESET_REQUESTED));
+	dev_info(&pf->pdev->dev, "requesting a PF reset\n");
+	i40e_do_reset_safe(pf, BIT(__I40E_PF_RESET_REQUESTED));
 }
 
 #define I40E_MAX_DEBUG_OUT_BUFFER (4096*4)
@@ -1146,7 +1146,7 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 		}
 
 		f = i40e_add_filter(vsi, ma, vlan, false, false);
-		ret = i40e_sync_vsi_filters(vsi);
+		ret = i40e_sync_vsi_filters(vsi, true);
 		if (f && !ret)
 			dev_info(&pf->pdev->dev,
 				 "add macaddr: %pM vlan=%d added to VSI %d\n",
@@ -1183,7 +1183,7 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 		}
 
 		i40e_del_filter(vsi, ma, vlan, false, false);
-		ret = i40e_sync_vsi_filters(vsi);
+		ret = i40e_sync_vsi_filters(vsi, true);
 		if (!ret)
 			dev_info(&pf->pdev->dev,
 				 "del macaddr: %pM vlan=%d removed from VSI %d\n",
@@ -1336,6 +1336,8 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 			bw_data = NULL;
 
 			dev_info(&pf->pdev->dev,
+				 "port dcbx_mode=%d\n", cfg->dcbx_mode);
+			dev_info(&pf->pdev->dev,
 				 "port ets_cfg: willing=%d cbs=%d, maxtcs=%d\n",
 				 cfg->etscfg.willing, cfg->etscfg.cbs,
 				 cfg->etscfg.maxtcs);
@@ -1469,19 +1471,19 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 		}
 	} else if (strncmp(cmd_buf, "pfr", 3) == 0) {
 		dev_info(&pf->pdev->dev, "debugfs: forcing PFR\n");
-		i40e_do_reset_safe(pf, (1 << __I40E_PF_RESET_REQUESTED));
+		i40e_do_reset_safe(pf, BIT(__I40E_PF_RESET_REQUESTED));
 
 	} else if (strncmp(cmd_buf, "corer", 5) == 0) {
 		dev_info(&pf->pdev->dev, "debugfs: forcing CoreR\n");
-		i40e_do_reset_safe(pf, (1 << __I40E_CORE_RESET_REQUESTED));
+		i40e_do_reset_safe(pf, BIT(__I40E_CORE_RESET_REQUESTED));
 
 	} else if (strncmp(cmd_buf, "globr", 5) == 0) {
 		dev_info(&pf->pdev->dev, "debugfs: forcing GlobR\n");
-		i40e_do_reset_safe(pf, (1 << __I40E_GLOBAL_RESET_REQUESTED));
+		i40e_do_reset_safe(pf, BIT(__I40E_GLOBAL_RESET_REQUESTED));
 
 	} else if (strncmp(cmd_buf, "empr", 4) == 0) {
 		dev_info(&pf->pdev->dev, "debugfs: forcing EMPR\n");
-		i40e_do_reset_safe(pf, (1 << __I40E_EMP_RESET_REQUESTED));
+		i40e_do_reset_safe(pf, BIT(__I40E_EMP_RESET_REQUESTED));
 
 	} else if (strncmp(cmd_buf, "read", 4) == 0) {
 		u32 address;
@@ -1493,9 +1495,9 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 		}
 
 		/* check the range on address */
-		if (address >= I40E_MAX_REGISTER) {
-			dev_info(&pf->pdev->dev, "read reg address 0x%08x too large\n",
-				 address);
+		if (address > (pf->ioremap_len - sizeof(u32))) {
+			dev_info(&pf->pdev->dev, "read reg address 0x%08x too large, max=0x%08lx\n",
+				 address, (unsigned long int)(pf->ioremap_len - sizeof(u32)));
 			goto command_write_done;
 		}
 
@@ -1512,9 +1514,9 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 		}
 
 		/* check the range on address */
-		if (address >= I40E_MAX_REGISTER) {
-			dev_info(&pf->pdev->dev, "write reg address 0x%08x too large\n",
-				 address);
+		if (address > (pf->ioremap_len - sizeof(u32))) {
+			dev_info(&pf->pdev->dev, "write reg address 0x%08x too large, max=0x%08lx\n",
+				 address, (unsigned long int)(pf->ioremap_len - sizeof(u32)));
 			goto command_write_done;
 		}
 		wr32(&pf->hw, address, value);
@@ -2185,8 +2187,8 @@ static const struct file_operations i40e_dbg_netdev_ops_fops = {
 };
 
 /**
- * i40e_dbg_pf_init - setup the debugfs directory for the pf
- * @pf: the pf that is starting up
+ * i40e_dbg_pf_init - setup the debugfs directory for the PF
+ * @pf: the PF that is starting up
  **/
 void i40e_dbg_pf_init(struct i40e_pf *pf)
 {
@@ -2222,8 +2224,8 @@ create_failed:
 }
 
 /**
- * i40e_dbg_pf_exit - clear out the pf's debugfs entries
- * @pf: the pf that is stopping
+ * i40e_dbg_pf_exit - clear out the PF's debugfs entries
+ * @pf: the PF that is stopping
  **/
 void i40e_dbg_pf_exit(struct i40e_pf *pf)
 {

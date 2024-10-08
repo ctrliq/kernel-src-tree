@@ -23,8 +23,8 @@ struct ovl_cache_entry {
 	u64 ino;
 	struct list_head l_node;
 	struct rb_node node;
+	struct ovl_cache_entry *next_maybe_whiteout;
 	bool is_whiteout;
-	bool is_cursor;
 	char name[];
 };
 
@@ -45,7 +45,7 @@ struct ovl_readdir_data {
 	struct rb_root root;
 	struct list_head *list;
 	struct list_head middle;
-	struct dentry *dir;
+	struct ovl_cache_entry *first_maybe_whiteout;
 	int count;
 	int err;
 };
@@ -54,7 +54,7 @@ struct ovl_dir_file {
 	bool is_real;
 	bool is_upper;
 	struct ovl_dir_cache *cache;
-	struct ovl_cache_entry cursor;
+	struct list_head *cursor;
 	struct file *realfile;
 	struct file *upperfile;
 };
@@ -85,23 +85,28 @@ static struct ovl_cache_entry *ovl_cache_entry_find(struct rb_root *root,
 	return NULL;
 }
 
-static struct ovl_cache_entry *ovl_cache_entry_new(const char *name, int len,
+static struct ovl_cache_entry *ovl_cache_entry_new(struct ovl_readdir_data *rdd,
+						   const char *name, int len,
 						   u64 ino, unsigned int d_type)
 {
 	struct ovl_cache_entry *p;
 	size_t size = offsetof(struct ovl_cache_entry, name[len + 1]);
 
 	p = kmalloc(size, GFP_KERNEL);
-	if (p) {
-		memcpy(p->name, name, len);
-		p->name[len] = '\0';
-		p->len = len;
-		p->type = d_type;
-		p->ino = ino;
-		p->is_whiteout = false;
-		p->is_cursor = false;
-	}
+	if (!p)
+		return NULL;
 
+	memcpy(p->name, name, len);
+	p->name[len] = '\0';
+	p->len = len;
+	p->type = d_type;
+	p->ino = ino;
+	p->is_whiteout = false;
+
+	if (d_type == DT_CHR) {
+		p->next_maybe_whiteout = rdd->first_maybe_whiteout;
+		rdd->first_maybe_whiteout = p;
+	}
 	return p;
 }
 
@@ -128,35 +133,9 @@ static int ovl_cache_entry_add_rb(struct ovl_readdir_data *rdd,
 			return 0;
 	}
 
-	p = ovl_cache_entry_new(name, len, ino, d_type);
+	p = ovl_cache_entry_new(rdd, name, len, ino, d_type);
 	if (p == NULL)
 		return -ENOMEM;
-
-	if (d_type == DT_CHR) {
-		struct dentry *dentry;
-		const struct cred *old_cred;
-		struct cred *override_cred;
-
-		override_cred = prepare_creds();
-		if (!override_cred) {
-			kfree(p);
-			return -ENOMEM;
-		}
-
-		/*
-		 * CAP_DAC_OVERRIDE for lookup
-		 */
-		cap_raise(override_cred->cap_effective, CAP_DAC_OVERRIDE);
-		old_cred = override_creds(override_cred);
-
-		dentry = lookup_one_len(name, rdd->dir, len);
-		if (!IS_ERR(dentry)) {
-			p->is_whiteout = ovl_is_whiteout(dentry);
-			dput(dentry);
-		}
-		revert_creds(old_cred);
-		put_cred(override_cred);
-	}
 
 	list_add_tail(&p->l_node, rdd->list);
 	rb_link_node(&p->node, parent, newp);
@@ -175,7 +154,7 @@ static int ovl_fill_lower(struct ovl_readdir_data *rdd,
 	if (p) {
 		list_move_tail(&p->l_node, &rdd->middle);
 	} else {
-		p = ovl_cache_entry_new(name, namelen, ino, d_type);
+		p = ovl_cache_entry_new(rdd, name, namelen, ino, d_type);
 		if (p == NULL)
 			rdd->err = -ENOMEM;
 		else
@@ -200,7 +179,6 @@ static void ovl_cache_put(struct ovl_dir_file *od, struct dentry *dentry)
 {
 	struct ovl_dir_cache *cache = od->cache;
 
-	list_del_init(&od->cursor.l_node);
 	WARN_ON(cache->refcount <= 0);
 	cache->refcount--;
 	if (!cache->refcount) {
@@ -226,6 +204,43 @@ static int ovl_fill_merge(void *buf, const char *name, int namelen,
 		return ovl_fill_lower(rdd, name, namelen, offset, ino, d_type);
 }
 
+static int ovl_check_whiteouts(struct dentry *dir, struct ovl_readdir_data *rdd)
+{
+	int err;
+	struct ovl_cache_entry *p;
+	struct dentry *dentry;
+	const struct cred *old_cred;
+	struct cred *override_cred;
+
+	override_cred = prepare_creds();
+	if (!override_cred)
+		return -ENOMEM;
+
+	/*
+	 * CAP_DAC_OVERRIDE for lookup
+	 */
+	cap_raise(override_cred->cap_effective, CAP_DAC_OVERRIDE);
+	old_cred = override_creds(override_cred);
+
+	err = mutex_lock_killable(&dir->d_inode->i_mutex);
+	if (!err) {
+		while (rdd->first_maybe_whiteout) {
+			p = rdd->first_maybe_whiteout;
+			rdd->first_maybe_whiteout = p->next_maybe_whiteout;
+			dentry = lookup_one_len(p->name, dir, p->len);
+			if (!IS_ERR(dentry)) {
+				p->is_whiteout = ovl_is_whiteout(dentry);
+				dput(dentry);
+			}
+		}
+		mutex_unlock(&dir->d_inode->i_mutex);
+	}
+	revert_creds(old_cred);
+	put_cred(override_cred);
+
+	return err;
+}
+
 static inline int ovl_dir_read(struct path *realpath,
 			       struct ovl_readdir_data *rdd)
 {
@@ -236,6 +251,7 @@ static inline int ovl_dir_read(struct path *realpath,
 	if (IS_ERR(realfile))
 		return PTR_ERR(realfile);
 
+	rdd->first_maybe_whiteout = NULL;
 	//rdd->ctx.pos = 0;
 	do {
 		rdd->count = 0;
@@ -244,6 +260,10 @@ static inline int ovl_dir_read(struct path *realpath,
 		if (err >= 0)
 			err = rdd->err;
 	} while (!err && rdd->count);
+
+	if (!err && rdd->first_maybe_whiteout)
+		err = ovl_check_whiteouts(realpath->dentry, rdd);
+
 	fput(realfile);
 
 	return err;
@@ -259,6 +279,7 @@ static void ovl_dir_reset(struct file *file)
 	if (cache && ovl_dentry_version_get(dentry) != cache->version) {
 		ovl_cache_put(od, dentry);
 		od->cache = NULL;
+		od->cursor = NULL;
 	}
 	WARN_ON(!od->is_real && !OVL_TYPE_MERGE(type));
 	if (od->is_real && OVL_TYPE_MERGE(type))
@@ -281,7 +302,6 @@ static int ovl_dir_read_merged(struct dentry *dentry, struct list_head *list)
 		next = ovl_path_next(idx, dentry, &realpath);
 
 		if (next != -1) {
-			rdd.dir = realpath.dentry;
 			err = ovl_dir_read(&realpath, &rdd);
 			if (err)
 				break;
@@ -301,17 +321,16 @@ static int ovl_dir_read_merged(struct dentry *dentry, struct list_head *list)
 
 static void ovl_seek_cursor(struct ovl_dir_file *od, loff_t pos)
 {
-	struct ovl_cache_entry *p;
+	struct list_head *p;
 	loff_t off = 0;
 
-	list_for_each_entry(p, &od->cache->entries, l_node) {
-		if (p->is_cursor)
-			continue;
+	list_for_each(p, &od->cache->entries) {
 		if (off >= pos)
 			break;
 		off++;
 	}
-	list_move_tail(&od->cursor.l_node, &p->l_node);
+	/* Cursor is safe since the cache is stable */
+	od->cursor = p;
 }
 
 static struct ovl_dir_cache *ovl_cache_get(struct dentry *dentry)
@@ -350,6 +369,7 @@ static int ovl_readdir(struct file *file, void *buf, filldir_t filler)
 {
 	struct ovl_dir_file *od = file->private_data;
 	struct dentry *dentry = file->f_path.dentry;
+	struct ovl_cache_entry *p;
 	int res;
 
 	if (!file->f_pos)
@@ -373,24 +393,13 @@ static int ovl_readdir(struct file *file, void *buf, filldir_t filler)
 		ovl_seek_cursor(od, file->f_pos);
 	}
 
-	while (od->cursor.l_node.next != &od->cache->entries) {
-		int over;
-		loff_t off;
-		struct ovl_cache_entry *p;
-
-		p = list_entry(od->cursor.l_node.next, struct ovl_cache_entry, l_node);
-		off = file->f_pos;
-		/* Skip cursors */
-		if (!p->is_cursor) {
-			if (!p->is_whiteout) {
-				over = filler(buf, p->name, p->len, off, p->ino,
-					      p->type);
-				if (over)
-					break;
-			}
-			file->f_pos++;
-		}
-		list_move(&od->cursor.l_node, &p->l_node);
+	while (od->cursor != &od->cache->entries) {
+		p = list_entry(od->cursor, struct ovl_cache_entry, l_node);
+		if (!p->is_whiteout)
+			if (filler(buf, p->name, p->len, file->f_pos, p->ino, p->type))
+				break;
+		od->cursor = p->l_node.next;
+		file->f_pos++;
 	}
 	return 0;
 }
@@ -509,11 +518,9 @@ static int ovl_dir_open(struct inode *inode, struct file *file)
 		kfree(od);
 		return PTR_ERR(realfile);
 	}
-	INIT_LIST_HEAD(&od->cursor.l_node);
 	od->realfile = realfile;
 	od->is_real = !OVL_TYPE_MERGE(type);
 	od->is_upper = OVL_TYPE_UPPER(type);
-	od->cursor.is_cursor = true;
 	file->private_data = od;
 
 	return 0;

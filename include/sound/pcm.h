@@ -520,6 +520,7 @@ struct snd_pcm_str {
 #endif
 #endif
 	struct snd_kcontrol *chmap_kctl; /* channel-mapping controls */
+	struct device dev;
 };
 
 struct snd_pcm {
@@ -536,7 +537,6 @@ struct snd_pcm {
 	wait_queue_head_t open_wait;
 	void *private_data;
 	void (*private_free) (struct snd_pcm *pcm);
-	struct device *dev; /* actual hw device this belongs to */
 	bool internal; /* pcm is for internal use only */
 	bool nonatomic; /* whole PCM operations are in non-atomic context */
 #if defined(CONFIG_SND_PCM_OSS) || defined(CONFIG_SND_PCM_OSS_MODULE)
@@ -579,6 +579,7 @@ int snd_pcm_status(struct snd_pcm_substream *substream,
 int snd_pcm_start(struct snd_pcm_substream *substream);
 int snd_pcm_stop(struct snd_pcm_substream *substream, snd_pcm_state_t status);
 int snd_pcm_drain_done(struct snd_pcm_substream *substream);
+int snd_pcm_stop_xrun(struct snd_pcm_substream *substream);
 #ifdef CONFIG_PM
 int snd_pcm_suspend(struct snd_pcm_substream *substream);
 int snd_pcm_suspend_all(struct snd_pcm *pcm);

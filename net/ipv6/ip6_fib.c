@@ -638,12 +638,67 @@ static inline bool rt6_qualify_for_ecmp(struct rt6_info *rt)
 	       RTF_GATEWAY;
 }
 
+static void fib6_copy_metrics(u32 *mp, const struct mx6_config *mxc)
+{
+	int i;
+
+	for (i = 0; i < RTAX_MAX; i++) {
+		if (test_bit(i, mxc->mx_valid))
+			mp[i] = mxc->mx[i];
+	}
+}
+
+static int fib6_commit_metrics(struct dst_entry *dst, struct mx6_config *mxc)
+{
+	if (!mxc->mx)
+		return 0;
+
+	if (dst->flags & DST_HOST) {
+		u32 *mp = dst_metrics_write_ptr(dst);
+
+		if (unlikely(!mp))
+			return -ENOMEM;
+
+		fib6_copy_metrics(mp, mxc);
+	} else {
+		dst_init_metrics(dst, mxc->mx, false);
+
+		/* We've stolen mx now. */
+		mxc->mx = NULL;
+	}
+
+	return 0;
+}
+
+static void fib6_purge_rt(struct rt6_info *rt, struct fib6_node *fn,
+			  struct net *net)
+{
+	if (atomic_read(&rt->rt6i_ref) != 1) {
+		/* This route is used as dummy address holder in some split
+		 * nodes. It is not leaked, but it still holds other resources,
+		 * which must be released in time. So, scan ascendant nodes
+		 * and replace dummy references to this route with references
+		 * to still alive ones.
+		 */
+		while (fn) {
+			if (!(fn->fn_flags & RTN_RTINFO) && fn->leaf == rt) {
+				fn->leaf = fib6_find_prefix(net, fn);
+				atomic_inc(&fn->leaf->rt6i_ref);
+				rt6_release(rt);
+			}
+			fn = fn->parent;
+		}
+		/* No more references are possible at this point. */
+		BUG_ON(atomic_read(&rt->rt6i_ref) != 1);
+	}
+}
+
 /*
  *	Insert routing information in a node.
  */
 
 static int fib6_add_rt2node(struct fib6_node *fn, struct rt6_info *rt,
-			    struct nl_info *info)
+			    struct nl_info *info, struct mx6_config *mxc)
 {
 	struct rt6_info *iter = NULL;
 	struct rt6_info **ins;
@@ -653,6 +708,7 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct rt6_info *rt,
 		   (info->nlh->nlmsg_flags & NLM_F_CREATE));
 	int found = 0;
 	bool rt_can_ecmp = rt6_qualify_for_ecmp(rt);
+	int err;
 
 	ins = &fn->leaf;
 
@@ -751,6 +807,10 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct rt6_info *rt,
 			pr_warn("NLM_F_CREATE should be set when creating new route\n");
 
 add:
+		err = fib6_commit_metrics(&rt->dst, mxc);
+		if (err)
+			return err;
+
 		rt->dst.rt6_next = iter;
 		*ins = rt;
 		rt->rt6i_node = fn;
@@ -770,16 +830,22 @@ add:
 			pr_warn("NLM_F_REPLACE set, but no existing node found!\n");
 			return -ENOENT;
 		}
+
+		err = fib6_commit_metrics(&rt->dst, mxc);
+		if (err)
+			return err;
+
 		*ins = rt;
 		rt->rt6i_node = fn;
 		rt->dst.rt6_next = iter->dst.rt6_next;
 		atomic_inc(&rt->rt6i_ref);
 		inet6_rt_notify(RTM_NEWROUTE, rt, info);
-		rt6_release(iter);
 		if (!(fn->fn_flags & RTN_RTINFO)) {
 			info->nl_net->ipv6.rt6_stats->fib_route_nodes++;
 			fn->fn_flags |= RTN_RTINFO;
 		}
+		fib6_purge_rt(iter, fn, info->nl_net);
+		rt6_release(iter);
 	}
 
 	return 0;
@@ -806,7 +872,8 @@ void fib6_force_start_gc(struct net *net)
  *	with source addr info in sub-trees
  */
 
-int fib6_add(struct fib6_node *root, struct rt6_info *rt, struct nl_info *info)
+int fib6_add(struct fib6_node *root, struct rt6_info *rt,
+	     struct nl_info *info, struct mx6_config *mxc)
 {
 	struct fib6_node *fn, *pn = NULL;
 	int err = -ENOMEM;
@@ -900,7 +967,7 @@ int fib6_add(struct fib6_node *root, struct rt6_info *rt, struct nl_info *info)
 	}
 #endif
 
-	err = fib6_add_rt2node(fn, rt, info);
+	err = fib6_add_rt2node(fn, rt, info, mxc);
 	if (!err) {
 		fib6_start_gc(info->nl_net, rt);
 		if (!(rt->rt6i_flags & RTF_CACHE))
@@ -1284,24 +1351,7 @@ static void fib6_del_route(struct fib6_node *fn, struct rt6_info **rtp,
 		fn = fib6_repair_tree(net, fn);
 	}
 
-	if (atomic_read(&rt->rt6i_ref) != 1) {
-		/* This route is used as dummy address holder in some split
-		 * nodes. It is not leaked, but it still holds other resources,
-		 * which must be released in time. So, scan ascendant nodes
-		 * and replace dummy references to this route with references
-		 * to still alive ones.
-		 */
-		while (fn) {
-			if (!(fn->fn_flags & RTN_RTINFO) && fn->leaf == rt) {
-				fn->leaf = fib6_find_prefix(net, fn);
-				atomic_inc(&fn->leaf->rt6i_ref);
-				rt6_release(rt);
-			}
-			fn = fn->parent;
-		}
-		/* No more references are possible at this point. */
-		BUG_ON(atomic_read(&rt->rt6i_ref) != 1);
-	}
+	fib6_purge_rt(rt, fn, net);
 
 	inet6_rt_notify(RTM_DELROUTE, rt, info);
 	rt6_release(rt);

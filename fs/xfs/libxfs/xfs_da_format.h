@@ -19,10 +19,6 @@
 #ifndef __XFS_DA_FORMAT_H__
 #define __XFS_DA_FORMAT_H__
 
-/*========================================================================
- * Directory Structure when greater than XFS_LBSIZE(mp) bytes.
- *========================================================================*/
-
 /*
  * This structure is common to both leaf nodes and non-leaf nodes in the Btree.
  *
@@ -121,8 +117,6 @@ struct xfs_da3_icnode_hdr {
 	__uint16_t	count;
 	__uint16_t	level;
 };
-
-#define	XFS_LBSIZE(mp)	(mp)->m_sb.sb_blocksize
 
 /*
  * Directory version 2.
@@ -510,140 +504,12 @@ struct xfs_dir3_leaf {
 #define XFS_DIR3_LEAF_CRC_OFF  offsetof(struct xfs_dir3_leaf_hdr, info.crc)
 
 /*
- * Get address of the bestcount field in the single-leaf block.
- */
-static inline struct xfs_dir2_leaf_tail *
-xfs_dir2_leaf_tail_p(struct xfs_mount *mp, struct xfs_dir2_leaf *lp)
-{
-	return (struct xfs_dir2_leaf_tail *)
-		((char *)lp + mp->m_dirblksize -
-		  sizeof(struct xfs_dir2_leaf_tail));
-}
-
-/*
  * Get address of the bests array in the single-leaf block.
  */
 static inline __be16 *
 xfs_dir2_leaf_bests_p(struct xfs_dir2_leaf_tail *ltp)
 {
 	return (__be16 *)ltp - be32_to_cpu(ltp->bestcount);
-}
-
-/*
- * DB blocks here are logical directory block numbers, not filesystem blocks.
- */
-
-/*
- * Convert dataptr to byte in file space
- */
-static inline xfs_dir2_off_t
-xfs_dir2_dataptr_to_byte(struct xfs_mount *mp, xfs_dir2_dataptr_t dp)
-{
-	return (xfs_dir2_off_t)dp << XFS_DIR2_DATA_ALIGN_LOG;
-}
-
-/*
- * Convert byte in file space to dataptr.  It had better be aligned.
- */
-static inline xfs_dir2_dataptr_t
-xfs_dir2_byte_to_dataptr(struct xfs_mount *mp, xfs_dir2_off_t by)
-{
-	return (xfs_dir2_dataptr_t)(by >> XFS_DIR2_DATA_ALIGN_LOG);
-}
-
-/*
- * Convert byte in space to (DB) block
- */
-static inline xfs_dir2_db_t
-xfs_dir2_byte_to_db(struct xfs_mount *mp, xfs_dir2_off_t by)
-{
-	return (xfs_dir2_db_t)
-		(by >> (mp->m_sb.sb_blocklog + mp->m_sb.sb_dirblklog));
-}
-
-/*
- * Convert dataptr to a block number
- */
-static inline xfs_dir2_db_t
-xfs_dir2_dataptr_to_db(struct xfs_mount *mp, xfs_dir2_dataptr_t dp)
-{
-	return xfs_dir2_byte_to_db(mp, xfs_dir2_dataptr_to_byte(mp, dp));
-}
-
-/*
- * Convert byte in space to offset in a block
- */
-static inline xfs_dir2_data_aoff_t
-xfs_dir2_byte_to_off(struct xfs_mount *mp, xfs_dir2_off_t by)
-{
-	return (xfs_dir2_data_aoff_t)(by &
-		((1 << (mp->m_sb.sb_blocklog + mp->m_sb.sb_dirblklog)) - 1));
-}
-
-/*
- * Convert dataptr to a byte offset in a block
- */
-static inline xfs_dir2_data_aoff_t
-xfs_dir2_dataptr_to_off(struct xfs_mount *mp, xfs_dir2_dataptr_t dp)
-{
-	return xfs_dir2_byte_to_off(mp, xfs_dir2_dataptr_to_byte(mp, dp));
-}
-
-/*
- * Convert block and offset to byte in space
- */
-static inline xfs_dir2_off_t
-xfs_dir2_db_off_to_byte(struct xfs_mount *mp, xfs_dir2_db_t db,
-			xfs_dir2_data_aoff_t o)
-{
-	return ((xfs_dir2_off_t)db <<
-		(mp->m_sb.sb_blocklog + mp->m_sb.sb_dirblklog)) + o;
-}
-
-/*
- * Convert block (DB) to block (dablk)
- */
-static inline xfs_dablk_t
-xfs_dir2_db_to_da(struct xfs_mount *mp, xfs_dir2_db_t db)
-{
-	return (xfs_dablk_t)(db << mp->m_sb.sb_dirblklog);
-}
-
-/*
- * Convert byte in space to (DA) block
- */
-static inline xfs_dablk_t
-xfs_dir2_byte_to_da(struct xfs_mount *mp, xfs_dir2_off_t by)
-{
-	return xfs_dir2_db_to_da(mp, xfs_dir2_byte_to_db(mp, by));
-}
-
-/*
- * Convert block and offset to dataptr
- */
-static inline xfs_dir2_dataptr_t
-xfs_dir2_db_off_to_dataptr(struct xfs_mount *mp, xfs_dir2_db_t db,
-			   xfs_dir2_data_aoff_t o)
-{
-	return xfs_dir2_byte_to_dataptr(mp, xfs_dir2_db_off_to_byte(mp, db, o));
-}
-
-/*
- * Convert block (dablk) to block (DB)
- */
-static inline xfs_dir2_db_t
-xfs_dir2_da_to_db(struct xfs_mount *mp, xfs_dablk_t da)
-{
-	return (xfs_dir2_db_t)(da >> mp->m_sb.sb_dirblklog);
-}
-
-/*
- * Convert block (dablk) to byte offset in space
- */
-static inline xfs_dir2_off_t
-xfs_dir2_da_to_byte(struct xfs_mount *mp, xfs_dablk_t da)
-{
-	return xfs_dir2_db_off_to_byte(mp, xfs_dir2_da_to_db(mp, da), 0);
 }
 
 /*
@@ -730,16 +596,6 @@ typedef struct xfs_dir2_block_tail {
 } xfs_dir2_block_tail_t;
 
 /*
- * Pointer to the leaf header embedded in a data block (1-block format)
- */
-static inline struct xfs_dir2_block_tail *
-xfs_dir2_block_tail_p(struct xfs_mount *mp, struct xfs_dir2_data_hdr *hdr)
-{
-	return ((struct xfs_dir2_block_tail *)
-		((char *)hdr + mp->m_dirblksize)) - 1;
-}
-
-/*
  * Pointer to the leaf entries embedded in a data block (1-block format)
  */
 static inline struct xfs_dir2_leaf_entry *
@@ -757,10 +613,6 @@ xfs_dir2_block_leaf_p(struct xfs_dir2_block_tail *btp)
  * then that int is used as the index into the Btree.  Since the hashval
  * of an attribute name may not be unique, we may have duplicate keys.  The
  * internal links in the Btree are logical block offsets into the file.
- *
- *========================================================================
- * Attribute structure when equal to XFS_LBSIZE(mp) bytes.
- *========================================================================
  *
  * Struct leaf_entry's are packed from the top.  Name/values grow from the
  * bottom but are not packed.  The freemap contains run-length-encoded entries

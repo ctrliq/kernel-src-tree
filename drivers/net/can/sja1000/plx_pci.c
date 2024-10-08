@@ -16,7 +16,8 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * along with this program; if not, write to the Free Software Foundation,
+ * Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  */
 
 #include <linux/kernel.h>
@@ -233,7 +234,7 @@ static struct plx_pci_card_info plx_pci_card_info_cti = {
 	/* based on PLX9030 */
 };
 
-static DEFINE_PCI_DEVICE_TABLE(plx_pci_tbl) = {
+static const struct pci_device_id plx_pci_tbl[] = {
 	{
 		/* Adlink PCI-7841/cPCI-7841 */
 		ADLINK_PCI_VENDOR_ID, ADLINK_PCI_DEVICE_ID,

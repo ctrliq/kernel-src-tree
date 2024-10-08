@@ -35,6 +35,8 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/if_link.h>
+#include <linux/mlx4/device.h>
+#include <linux/netdevice.h>
 
 enum {
 	/* initialization and general commands */
@@ -73,6 +75,7 @@ enum {
 
 	/*master notify fw on finish for slave's flr*/
 	MLX4_CMD_INFORM_FLR_DONE = 0x5b,
+	MLX4_CMD_VIRT_PORT_MAP   = 0x5c,
 	MLX4_CMD_GET_OP_REQ      = 0x59,
 
 	/* TPT commands */
@@ -173,6 +176,12 @@ enum {
 };
 
 enum {
+	/* virtual to physical port mapping opcode modifiers */
+	MLX4_GET_PORT_VIRT2PHY = 0x0,
+	MLX4_SET_PORT_VIRT2PHY = 0x1,
+};
+
+enum {
 	MLX4_MAILBOX_SIZE	= 4096,
 	MLX4_ACCESS_MEM_ALIGN	= 256,
 };
@@ -181,6 +190,7 @@ enum {
 	/* Set port opcode modifiers */
 	MLX4_SET_PORT_IB_OPCODE		= 0x0,
 	MLX4_SET_PORT_ETH_OPCODE	= 0x1,
+	MLX4_SET_PORT_BEACON_OPCODE	= 0x4,
 };
 
 enum {
@@ -279,14 +289,22 @@ static inline int mlx4_cmd_imm(struct mlx4_dev *dev, u64 in_param, u64 *out_para
 struct mlx4_cmd_mailbox *mlx4_alloc_cmd_mailbox(struct mlx4_dev *dev);
 void mlx4_free_cmd_mailbox(struct mlx4_dev *dev, struct mlx4_cmd_mailbox *mailbox);
 
+int mlx4_get_counter_stats(struct mlx4_dev *dev, int counter_index,
+			   struct mlx4_counter *counter_stats, int reset);
+int mlx4_get_vf_stats(struct mlx4_dev *dev, int port, int vf_idx,
+		      struct ifla_vf_stats *vf_stats);
 u32 mlx4_comm_get_version(void);
 int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u64 mac);
 int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos);
+int mlx4_set_vf_rate(struct mlx4_dev *dev, int port, int vf, int min_tx_rate,
+		     int max_tx_rate);
 int mlx4_set_vf_spoofchk(struct mlx4_dev *dev, int port, int vf, bool setting);
 int mlx4_get_vf_config(struct mlx4_dev *dev, int port, int vf, struct ifla_vf_info *ivf);
 int mlx4_set_vf_link_state(struct mlx4_dev *dev, int port, int vf, int link_state);
 int mlx4_config_dev_retrieval(struct mlx4_dev *dev,
 			      struct mlx4_config_dev_params *params);
+void mlx4_cmd_wake_completions(struct mlx4_dev *dev);
+void mlx4_report_internal_err_comm_event(struct mlx4_dev *dev);
 /*
  * mlx4_get_slave_default_vlan -
  * return true if VST ( default vlan)
@@ -296,5 +314,6 @@ bool mlx4_get_slave_default_vlan(struct mlx4_dev *dev, int port, int slave,
 				 u16 *vlan, u8 *qos);
 
 #define MLX4_COMM_GET_IF_REV(cmd_chan_ver) (u8)((cmd_chan_ver) >> 8)
+#define COMM_CHAN_EVENT_INTERNAL_ERR (1 << 17)
 
 #endif /* MLX4_CMD_H */

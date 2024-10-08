@@ -1558,6 +1558,7 @@ struct btrfs_fs_info {
 	struct btrfs_workqueue *endio_workers;
 	struct btrfs_workqueue *endio_meta_workers;
 	struct btrfs_workqueue *endio_raid56_workers;
+	struct btrfs_workqueue *endio_repair_workers;
 	struct btrfs_workqueue *rmw_workers;
 	struct btrfs_workqueue *endio_meta_write_workers;
 	struct btrfs_workqueue *endio_write_workers;
@@ -1838,9 +1839,7 @@ struct btrfs_root {
 
 	u64 highest_objectid;
 
-#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 	u64 alloc_bytenr;
-#endif
 
 	u64 defrag_trans_start;
 	struct btrfs_key defrag_progress;
@@ -3492,8 +3491,8 @@ int btrfs_init_space_info(struct btrfs_fs_info *fs_info);
 int btrfs_delayed_refs_qgroup_accounting(struct btrfs_trans_handle *trans,
 					 struct btrfs_fs_info *fs_info);
 int __get_raid_index(u64 flags);
-int btrfs_start_nocow_write(struct btrfs_root *root);
-void btrfs_end_nocow_write(struct btrfs_root *root);
+int btrfs_start_write_no_snapshoting(struct btrfs_root *root);
+void btrfs_end_write_no_snapshoting(struct btrfs_root *root);
 /* ctree.c */
 int btrfs_bin_search(struct extent_buffer *eb, struct btrfs_key *key,
 		     int level, int *slot);
@@ -3799,8 +3798,7 @@ int btrfs_del_csums(struct btrfs_trans_handle *trans,
 int btrfs_lookup_bio_sums(struct btrfs_root *root, struct inode *inode,
 			  struct bio *bio, u32 *dst);
 int btrfs_lookup_bio_sums_dio(struct btrfs_root *root, struct inode *inode,
-			      struct btrfs_dio_private *dip, struct bio *bio,
-			      u64 logical_offset);
+			      struct bio *bio, u64 logical_offset);
 int btrfs_insert_file_extent(struct btrfs_trans_handle *trans,
 			     struct btrfs_root *root,
 			     u64 objectid, u64 pos,
@@ -3927,6 +3925,7 @@ int btrfs_prealloc_file_range_trans(struct inode *inode,
 				    struct btrfs_trans_handle *trans, int mode,
 				    u64 start, u64 num_bytes, u64 min_size,
 				    loff_t actual_len, u64 *alloc_hint);
+int btrfs_inode_check_errors(struct inode *inode);
 extern const struct dentry_operations btrfs_dentry_operations;
 
 /* ioctl.c */
@@ -3971,6 +3970,7 @@ int btrfs_dirty_pages(struct btrfs_root *root, struct inode *inode,
 		      struct page **pages, size_t num_pages,
 		      loff_t pos, size_t write_bytes,
 		      struct extent_state **cached);
+int btrfs_fdatawrite_range(struct inode *inode, loff_t start, loff_t end);
 
 /* tree-defrag.c */
 int btrfs_defrag_leaves(struct btrfs_trans_handle *trans,
@@ -4170,7 +4170,12 @@ int btrfs_scrub_progress(struct btrfs_root *root, u64 devid,
 /* dev-replace.c */
 void btrfs_bio_counter_inc_blocked(struct btrfs_fs_info *fs_info);
 void btrfs_bio_counter_inc_noblocked(struct btrfs_fs_info *fs_info);
-void btrfs_bio_counter_dec(struct btrfs_fs_info *fs_info);
+void btrfs_bio_counter_sub(struct btrfs_fs_info *fs_info, s64 amount);
+
+static inline void btrfs_bio_counter_dec(struct btrfs_fs_info *fs_info)
+{
+	btrfs_bio_counter_sub(fs_info, 1);
+}
 
 /* reada.c */
 struct reada_control {

@@ -72,11 +72,11 @@ static int btrfs_cleanup_transaction(struct btrfs_root *root);
 static void btrfs_error_commit_super(struct btrfs_root *root);
 
 /*
- * end_io_wq structs are used to do processing in task context when an IO is
- * complete.  This is used during reads to verify checksums, and it is used
+ * btrfs_end_io_wq structs are used to do processing in task context when an IO
+ * is complete.  This is used during reads to verify checksums, and it is used
  * by writes to insert metadata for new file extents after IO is complete.
  */
-struct end_io_wq {
+struct btrfs_end_io_wq {
 	struct bio *bio;
 	bio_end_io_t *end_io;
 	void *private;
@@ -86,6 +86,26 @@ struct end_io_wq {
 	struct list_head list;
 	struct btrfs_work work;
 };
+
+static struct kmem_cache *btrfs_end_io_wq_cache;
+
+int __init btrfs_end_io_wq_init(void)
+{
+	btrfs_end_io_wq_cache = kmem_cache_create("btrfs_end_io_wq",
+					sizeof(struct btrfs_end_io_wq),
+					0,
+					SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD,
+					NULL);
+	if (!btrfs_end_io_wq_cache)
+		return -ENOMEM;
+	return 0;
+}
+
+void btrfs_end_io_wq_exit(void)
+{
+	if (btrfs_end_io_wq_cache)
+		kmem_cache_destroy(btrfs_end_io_wq_cache);
+}
 
 /*
  * async submit bios are used to offload expensive checksumming
@@ -606,7 +626,7 @@ static int btree_readpage_end_io_hook(struct btrfs_io_bio *io_bio,
 		goto err;
 
 	eb->read_mirror = mirror;
-	if (test_bit(EXTENT_BUFFER_IOERR, &eb->bflags)) {
+	if (test_bit(EXTENT_BUFFER_READ_ERR, &eb->bflags)) {
 		ret = -EIO;
 		goto err;
 	}
@@ -679,7 +699,7 @@ static int btree_io_failed_hook(struct page *page, int failed_mirror)
 	struct btrfs_root *root = BTRFS_I(page->mapping->host)->root;
 
 	eb = (struct extent_buffer *)page->private;
-	set_bit(EXTENT_BUFFER_IOERR, &eb->bflags);
+	set_bit(EXTENT_BUFFER_READ_ERR, &eb->bflags);
 	eb->read_mirror = failed_mirror;
 	atomic_dec(&eb->io_pages);
 	if (test_and_clear_bit(EXTENT_BUFFER_READAHEAD, &eb->bflags))
@@ -689,7 +709,7 @@ static int btree_io_failed_hook(struct page *page, int failed_mirror)
 
 static void end_workqueue_bio(struct bio *bio, int err)
 {
-	struct end_io_wq *end_io_wq = bio->bi_private;
+	struct btrfs_end_io_wq *end_io_wq = bio->bi_private;
 	struct btrfs_fs_info *fs_info;
 	struct btrfs_workqueue *wq;
 	btrfs_work_func_t func;
@@ -712,7 +732,11 @@ static void end_workqueue_bio(struct bio *bio, int err)
 			func = btrfs_endio_write_helper;
 		}
 	} else {
-		if (end_io_wq->metadata == BTRFS_WQ_ENDIO_RAID56) {
+		if (unlikely(end_io_wq->metadata ==
+			     BTRFS_WQ_ENDIO_DIO_REPAIR)) {
+			wq = fs_info->endio_repair_workers;
+			func = btrfs_endio_repair_helper;
+		} else if (end_io_wq->metadata == BTRFS_WQ_ENDIO_RAID56) {
 			wq = fs_info->endio_raid56_workers;
 			func = btrfs_endio_raid56_helper;
 		} else if (end_io_wq->metadata) {
@@ -731,8 +755,9 @@ static void end_workqueue_bio(struct bio *bio, int err)
 int btrfs_bio_wq_end_io(struct btrfs_fs_info *info, struct bio *bio,
 			enum btrfs_wq_endio_type metadata)
 {
-	struct end_io_wq *end_io_wq;
-	end_io_wq = kmalloc(sizeof(*end_io_wq), GFP_NOFS);
+	struct btrfs_end_io_wq *end_io_wq;
+
+	end_io_wq = kmem_cache_alloc(btrfs_end_io_wq_cache, GFP_NOFS);
 	if (!end_io_wq)
 		return -ENOMEM;
 
@@ -1171,7 +1196,7 @@ static struct btrfs_subvolume_writers *btrfs_alloc_subvolume_writers(void)
 	if (!writers)
 		return ERR_PTR(-ENOMEM);
 
-	ret = percpu_counter_init(&writers->counter, 0);
+	ret = percpu_counter_init(&writers->counter, 0, GFP_KERNEL);
 	if (ret < 0) {
 		kfree(writers);
 		return ERR_PTR(ret);
@@ -1717,17 +1742,17 @@ static int setup_bdi(struct btrfs_fs_info *info, struct backing_dev_info *bdi)
 static void end_workqueue_fn(struct btrfs_work *work)
 {
 	struct bio *bio;
-	struct end_io_wq *end_io_wq;
+	struct btrfs_end_io_wq *end_io_wq;
 	int error;
 
-	end_io_wq = container_of(work, struct end_io_wq, work);
+	end_io_wq = container_of(work, struct btrfs_end_io_wq, work);
 	bio = end_io_wq->bio;
 
 	error = end_io_wq->error;
 	bio->bi_private = end_io_wq->private;
 	bio->bi_end_io = end_io_wq->end_io;
-	kfree(end_io_wq);
-	bio_endio_nodec(bio, error);
+	kmem_cache_free(btrfs_end_io_wq_cache, end_io_wq);
+	bio_endio(bio, error);
 }
 
 static int cleaner_kthread(void *arg)
@@ -2047,6 +2072,7 @@ static void btrfs_stop_all_workers(struct btrfs_fs_info *fs_info)
 	btrfs_destroy_workqueue(fs_info->endio_workers);
 	btrfs_destroy_workqueue(fs_info->endio_meta_workers);
 	btrfs_destroy_workqueue(fs_info->endio_raid56_workers);
+	btrfs_destroy_workqueue(fs_info->endio_repair_workers);
 	btrfs_destroy_workqueue(fs_info->rmw_workers);
 	btrfs_destroy_workqueue(fs_info->endio_meta_write_workers);
 	btrfs_destroy_workqueue(fs_info->endio_write_workers);
@@ -2170,7 +2196,7 @@ int open_ctree(struct super_block *sb,
 		goto fail_srcu;
 	}
 
-	ret = percpu_counter_init(&fs_info->dirty_metadata_bytes, 0);
+	ret = percpu_counter_init(&fs_info->dirty_metadata_bytes, 0, GFP_KERNEL);
 	if (ret) {
 		err = ret;
 		goto fail_bdi;
@@ -2178,13 +2204,13 @@ int open_ctree(struct super_block *sb,
 	fs_info->dirty_metadata_batch = PAGE_CACHE_SIZE *
 					(1 + ilog2(nr_cpu_ids));
 
-	ret = percpu_counter_init(&fs_info->delalloc_bytes, 0);
+	ret = percpu_counter_init(&fs_info->delalloc_bytes, 0, GFP_KERNEL);
 	if (ret) {
 		err = ret;
 		goto fail_dirty_metadata_bytes;
 	}
 
-	ret = percpu_counter_init(&fs_info->bio_counter, 0);
+	ret = percpu_counter_init(&fs_info->bio_counter, 0, GFP_KERNEL);
 	if (ret) {
 		err = ret;
 		goto fail_delalloc_bytes;
@@ -2567,6 +2593,8 @@ int open_ctree(struct super_block *sb,
 		btrfs_alloc_workqueue("endio-meta-write", flags, max_active, 2);
 	fs_info->endio_raid56_workers =
 		btrfs_alloc_workqueue("endio-raid56", flags, max_active, 4);
+	fs_info->endio_repair_workers =
+		btrfs_alloc_workqueue("endio-repair", flags, 1, 0);
 	fs_info->rmw_workers =
 		btrfs_alloc_workqueue("rmw", flags, max_active, 2);
 	fs_info->endio_write_workers =
@@ -2588,6 +2616,7 @@ int open_ctree(struct super_block *sb,
 	      fs_info->submit_workers && fs_info->flush_workers &&
 	      fs_info->endio_workers && fs_info->endio_meta_workers &&
 	      fs_info->endio_meta_write_workers &&
+	      fs_info->endio_repair_workers &&
 	      fs_info->endio_write_workers && fs_info->endio_raid56_workers &&
 	      fs_info->endio_freespace_worker && fs_info->rmw_workers &&
 	      fs_info->caching_workers && fs_info->readahead_workers &&

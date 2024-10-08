@@ -642,7 +642,7 @@ union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx)
 	/*
 	 * Check if event was unmapped due to a POLLHUP/POLLERR.
 	 */
-	if (!atomic_read(&md->refcnt))
+	if (!md->refcnt)
 		return NULL;
 
 	head = perf_mmap__read_head(md);

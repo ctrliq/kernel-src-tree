@@ -2277,15 +2277,15 @@ static void igb_get_ethtool_stats(struct net_device *netdev,
 
 		ring = adapter->tx_ring[j];
 		do {
-			start = u64_stats_fetch_begin_bh(&ring->tx_syncp);
+			start = u64_stats_fetch_begin_irq(&ring->tx_syncp);
 			data[i]   = ring->tx_stats.packets;
 			data[i+1] = ring->tx_stats.bytes;
 			data[i+2] = ring->tx_stats.restart_queue;
-		} while (u64_stats_fetch_retry_bh(&ring->tx_syncp, start));
+		} while (u64_stats_fetch_retry_irq(&ring->tx_syncp, start));
 		do {
-			start = u64_stats_fetch_begin_bh(&ring->tx_syncp2);
+			start = u64_stats_fetch_begin_irq(&ring->tx_syncp2);
 			restart2  = ring->tx_stats.restart_queue2;
-		} while (u64_stats_fetch_retry_bh(&ring->tx_syncp2, start));
+		} while (u64_stats_fetch_retry_irq(&ring->tx_syncp2, start));
 		data[i+2] += restart2;
 
 		i += IGB_TX_QUEUE_STATS_LEN;
@@ -2293,13 +2293,13 @@ static void igb_get_ethtool_stats(struct net_device *netdev,
 	for (j = 0; j < adapter->num_rx_queues; j++) {
 		ring = adapter->rx_ring[j];
 		do {
-			start = u64_stats_fetch_begin_bh(&ring->rx_syncp);
+			start = u64_stats_fetch_begin_irq(&ring->rx_syncp);
 			data[i]   = ring->rx_stats.packets;
 			data[i+1] = ring->rx_stats.bytes;
 			data[i+2] = ring->rx_stats.drops;
 			data[i+3] = ring->rx_stats.csum_err;
 			data[i+4] = ring->rx_stats.alloc_failed;
-		} while (u64_stats_fetch_retry_bh(&ring->rx_syncp, start));
+		} while (u64_stats_fetch_retry_irq(&ring->rx_syncp, start));
 		i += IGB_RX_QUEUE_STATS_LEN;
 	}
 	spin_unlock(&adapter->stats64_lock);
@@ -2842,11 +2842,16 @@ static u32 igb_get_rxfh_indir_size(struct net_device *netdev)
 	return IGB_RETA_SIZE;
 }
 
-static int igb_get_rxfh_indir(struct net_device *netdev, u32 *indir)
+static int igb_get_rxfh(struct net_device *netdev, u32 *indir, u8 *key,
+			u8 *hfunc)
 {
 	struct igb_adapter *adapter = netdev_priv(netdev);
 	int i;
 
+	if (hfunc)
+		*hfunc = ETH_RSS_HASH_TOP;
+	if (!indir)
+		return 0;
 	for (i = 0; i < IGB_RETA_SIZE; i++)
 		indir[i] = adapter->rss_indir_tbl[i];
 
@@ -2888,12 +2893,20 @@ void igb_write_rss_indir_tbl(struct igb_adapter *adapter)
 	}
 }
 
-static int igb_set_rxfh_indir(struct net_device *netdev, const u32 *indir)
+static int igb_set_rxfh(struct net_device *netdev, const u32 *indir,
+			const u8 *key, const u8 hfunc)
 {
 	struct igb_adapter *adapter = netdev_priv(netdev);
 	struct e1000_hw *hw = &adapter->hw;
 	int i;
 	u32 num_queues;
+
+	/* We do not allow change in unsupported parameters */
+	if (key ||
+	    (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP))
+		return -EOPNOTSUPP;
+	if (!indir)
+		return 0;
 
 	num_queues = adapter->rss_queues;
 
@@ -3037,8 +3050,8 @@ static const struct ethtool_ops igb_ethtool_ops = {
 	.get_module_info	= igb_get_module_info,
 	.get_module_eeprom	= igb_get_module_eeprom,
 	.get_rxfh_indir_size	= igb_get_rxfh_indir_size,
-	.get_rxfh_indir		= igb_get_rxfh_indir,
-	.set_rxfh_indir		= igb_set_rxfh_indir,
+	.get_rxfh		= igb_get_rxfh,
+	.set_rxfh		= igb_set_rxfh,
 	.get_channels		= igb_get_channels,
 	.set_channels		= igb_set_channels,
 	.begin			= igb_ethtool_begin,

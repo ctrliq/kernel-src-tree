@@ -8005,9 +8005,9 @@ static netdev_tx_t tg3_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	    !mss && skb->len > VLAN_ETH_FRAME_LEN)
 		base_flags |= TXD_FLAG_JMB_PKT;
 
-	if (vlan_tx_tag_present(skb)) {
+	if (skb_vlan_tag_present(skb)) {
 		base_flags |= TXD_FLAG_VLAN;
-		vlan = vlan_tx_tag_get(skb);
+		vlan = skb_vlan_tag_get(skb);
 	}
 
 	if ((unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) &&
@@ -12562,10 +12562,15 @@ static u32 tg3_get_rxfh_indir_size(struct net_device *dev)
 	return size;
 }
 
-static int tg3_get_rxfh(struct net_device *dev, u32 *indir, u8 *key)
+static int tg3_get_rxfh(struct net_device *dev, u32 *indir, u8 *key, u8 *hfunc)
 {
 	struct tg3 *tp = netdev_priv(dev);
 	int i;
+
+	if (hfunc)
+		*hfunc = ETH_RSS_HASH_TOP;
+	if (!indir)
+		return 0;
 
 	for (i = 0; i < TG3_RSS_INDIR_TBL_SIZE; i++)
 		indir[i] = tp->rss_ind_tbl[i];
@@ -12573,10 +12578,21 @@ static int tg3_get_rxfh(struct net_device *dev, u32 *indir, u8 *key)
 	return 0;
 }
 
-static int tg3_set_rxfh(struct net_device *dev, const u32 *indir, const u8 *key)
+static int tg3_set_rxfh(struct net_device *dev, const u32 *indir, const u8 *key,
+			const u8 hfunc)
 {
 	struct tg3 *tp = netdev_priv(dev);
 	size_t i;
+
+	/* We require at least one supported parameter to be changed and no
+	 * change in any of the unsupported parameters
+	 */
+	if (key ||
+	    (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP))
+		return -EOPNOTSUPP;
+
+	if (!indir)
+		return 0;
 
 	for (i = 0; i < TG3_RSS_INDIR_TBL_SIZE; i++)
 		tp->rss_ind_tbl[i] = indir[i];

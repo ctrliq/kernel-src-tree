@@ -240,9 +240,11 @@ void __init smp_store_boot_cpu_info(void)
 {
 	int id = 0; /* CPU 0 */
 	struct cpuinfo_x86 *c = &cpu_data(id);
+	struct rh_cpuinfo_x86 *rh_c = &rh_cpu_data(id);
 
 	*c = boot_cpu_data;
 	c->cpu_index = id;
+	*rh_c = rh_boot_cpu_data;
 }
 
 /*

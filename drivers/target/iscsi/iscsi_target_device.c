@@ -2,9 +2,7 @@
  * This file contains the iSCSI Virtual Device and Disk Transport
  * agnostic related functions.
  *
- \u00a9 Copyright 2007-2011 RisingTide Systems LLC.
- *
- * Licensed to the Linux Foundation under the General Public License (GPL) version 2.
+ * (c) Copyright 2007-2013 Datera, Inc.
  *
  * Author: Nicholas A. Bellinger <nab@linux-iscsi.org>
  *
@@ -23,7 +21,7 @@
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
 
-#include "iscsi_target_core.h"
+#include <target/iscsi/iscsi_target_core.h>
 #include "iscsi_target_device.h"
 #include "iscsi_target_tpg.h"
 #include "iscsi_target_util.h"

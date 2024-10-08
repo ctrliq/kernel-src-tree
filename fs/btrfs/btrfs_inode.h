@@ -44,6 +44,17 @@
 #define BTRFS_INODE_IN_DELALLOC_LIST		9
 #define BTRFS_INODE_READDIO_NEED_LOCK		10
 #define BTRFS_INODE_HAS_PROPS		        11
+/*
+ * The following 3 bits are meant only for the btree inode.
+ * When any of them is set, it means an error happened while writing an
+ * extent buffer belonging to:
+ * 1) a non-log btree
+ * 2) a log btree and first log sub-transaction
+ * 3) a log btree and second log sub-transaction
+ */
+#define BTRFS_INODE_BTREE_ERR		        12
+#define BTRFS_INODE_BTREE_LOG1_ERR		13
+#define BTRFS_INODE_BTREE_LOG2_ERR		14
 
 /* in memory btrfs inode */
 struct btrfs_inode {
@@ -254,8 +265,11 @@ static inline int btrfs_inode_in_log(struct inode *inode, u64 generation)
 	return 0;
 }
 
+#define BTRFS_DIO_ORIG_BIO_SUBMITTED	0x1
+
 struct btrfs_dio_private {
 	struct inode *inode;
+	unsigned long flags;
 	u64 logical_offset;
 	u64 disk_bytenr;
 	u64 bytes;
@@ -272,7 +286,12 @@ struct btrfs_dio_private {
 
 	/* dio_bio came from fs/direct-io.c */
 	struct bio *dio_bio;
-	u8 csum[0];
+
+	/*
+	 * The original bio may be splited to several sub-bios, this is
+	 * done during endio of sub-bios
+	 */
+	int (*subio_endio)(struct inode *, struct btrfs_io_bio *, int);
 };
 
 /*

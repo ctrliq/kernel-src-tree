@@ -180,6 +180,12 @@ struct cpuinfo_x86 boot_cpu_data __read_mostly = {
 	.wp_works_ok = -1,
 };
 EXPORT_SYMBOL(boot_cpu_data);
+/* KABI immune per_cpu data */
+struct rh_cpuinfo_x86 rh_boot_cpu_data __read_mostly = {
+	.x86_cache_max_rmid = -1,
+	.x86_cache_occ_scale = -1,
+};
+EXPORT_SYMBOL(rh_boot_cpu_data);
 
 unsigned int def_to_bigsmp;
 
@@ -204,6 +210,12 @@ struct cpuinfo_x86 boot_cpu_data __read_mostly = {
 	.x86_phys_bits = MAX_PHYSMEM_BITS,
 };
 EXPORT_SYMBOL(boot_cpu_data);
+/* KABI immune per_cpu data */
+struct rh_cpuinfo_x86 rh_boot_cpu_data __read_mostly = {
+	.x86_cache_max_rmid = -1,
+	.x86_cache_occ_scale = -1,
+};
+EXPORT_SYMBOL(rh_boot_cpu_data);
 #endif
 
 
@@ -870,7 +882,12 @@ static void rh_check_supported(void)
 	if ((boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) &&
 	    ((boot_cpu_data.x86 == 6))) {
 		switch (boot_cpu_data.x86_model) {
+		case 94: /* Skylake-S */
+		case 86: /* Broadwell-DE SoC */
+		case 79: /* Broadwell-EP */
+		case 78: /* Skylake-Y */
 		case 77: /* Atom Avoton */
+		case 71: /* Broadwell-H */
 		case 70: /* Crystal Well */
 		case 69: /* Haswell ULT */
 			break;

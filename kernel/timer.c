@@ -81,12 +81,12 @@ struct tvec_base {
 	unsigned long timer_jiffies;
 	unsigned long next_timer;
 	unsigned long active_timers;
-	unsigned long all_timers;
 	struct tvec_root tv1;
 	struct tvec tv2;
 	struct tvec tv3;
 	struct tvec tv4;
 	struct tvec tv5;
+	RH_KABI_EXTEND(unsigned long all_timers)
 } ____cacheline_aligned;
 
 struct tvec_base boot_tvec_bases;
@@ -1296,54 +1296,48 @@ cascade:
  * Check, if the next hrtimer event is before the next timer wheel
  * event:
  */
-static unsigned long cmp_next_hrtimer_event(unsigned long now,
-					    unsigned long expires)
+static u64 cmp_next_hrtimer_event(u64 basem, u64 expires)
 {
-	ktime_t hr_delta = hrtimer_get_next_event();
-	struct timespec tsdelta;
-	unsigned long delta;
+	u64 nextevt = hrtimer_get_next_event();
 
-	if (hr_delta.tv64 == KTIME_MAX)
+	/*
+	 * If high resolution timers are enabled
+	 * hrtimer_get_next_event() returns KTIME_MAX.
+	 */
+	if (expires <= nextevt)
 		return expires;
 
 	/*
-	 * Expired timer available, let it expire in the next tick
+	 * If the next timer is already expired, return the tick base
+	 * time so the tick is fired immediately.
 	 */
-	if (hr_delta.tv64 <= 0)
-		return now + 1;
-
-	tsdelta = ktime_to_timespec(hr_delta);
-	delta = timespec_to_jiffies(&tsdelta);
+	if (nextevt <= basem)
+		return basem;
 
 	/*
-	 * Limit the delta to the max value, which is checked in
-	 * tick_nohz_stop_sched_tick():
+	 * Round up to the next jiffie. High resolution timers are
+	 * off, so the hrtimers are expired in the tick and we need to
+	 * make sure that this tick really expires the timer to avoid
+	 * a ping pong of the nohz stop code.
+	 *
+	 * Use DIV_ROUND_UP_ULL to prevent gcc calling __divdi3
 	 */
-	if (delta > NEXT_TIMER_MAX_DELTA)
-		delta = NEXT_TIMER_MAX_DELTA;
-
-	/*
-	 * Take rounding errors in to account and make sure, that it
-	 * expires in the next tick. Otherwise we go into an endless
-	 * ping pong due to tick_nohz_stop_sched_tick() retriggering
-	 * the timer softirq
-	 */
-	if (delta < 1)
-		delta = 1;
-	now += delta;
-	if (time_before(now, expires))
-		return now;
-	return expires;
+	return DIV_ROUND_UP_ULL(nextevt, TICK_NSEC) * TICK_NSEC;
 }
 
 /**
- * get_next_timer_interrupt - return the jiffy of the next pending timer
- * @now: current time (in jiffies)
+ * get_next_timer_interrupt - return the time (clock mono) of the next timer
+ * @basej:	base time jiffies
+ * @basem:	base time clock monotonic
+ *
+ * Returns the tick aligned clock monotonic time of the next pending
+ * timer or KTIME_MAX if no timer is pending.
  */
-unsigned long get_next_timer_interrupt(unsigned long now)
+u64 get_next_timer_interrupt(unsigned long basej, u64 basem)
 {
 	struct tvec_base *base = __this_cpu_read(tvec_bases);
-	unsigned long expires = now + NEXT_TIMER_MAX_DELTA;
+	u64 expires = KTIME_MAX;
+	unsigned long nextevt;
 
 	/*
 	 * Pretend that there is no timer pending if the cpu is offline.
@@ -1356,14 +1350,15 @@ unsigned long get_next_timer_interrupt(unsigned long now)
 	if (base->active_timers) {
 		if (time_before_eq(base->next_timer, base->timer_jiffies))
 			base->next_timer = __next_timer_interrupt(base);
-		expires = base->next_timer;
+		nextevt = base->next_timer;
+		if (time_before_eq(nextevt, basej))
+			expires = basem;
+		else
+			expires = basem + (nextevt - basej) * TICK_NSEC;
 	}
 	spin_unlock(&base->lock);
 
-	if (time_before_eq(expires, now))
-		return now;
-
-	return cmp_next_hrtimer_event(now, expires);
+	return cmp_next_hrtimer_event(basem, expires);
 }
 #endif
 
@@ -1394,8 +1389,6 @@ void update_process_times(int user_tick)
 static void run_timer_softirq(struct softirq_action *h)
 {
 	struct tvec_base *base = __this_cpu_read(tvec_bases);
-
-	hrtimer_run_pending();
 
 	if (time_after_eq(jiffies, base->timer_jiffies))
 		__run_timers(base);

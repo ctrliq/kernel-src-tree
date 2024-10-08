@@ -702,6 +702,11 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	account_cfs_rq_runtime(cfs_rq, delta_exec);
 }
 
+static void update_curr_fair(struct rq *rq)
+{
+	update_curr(cfs_rq_of(&rq->curr->se));
+}
+
 static inline void
 update_stats_wait_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
@@ -1860,8 +1865,10 @@ void task_numa_work(struct callback_head *work)
 		vma = mm->mmap;
 	}
 	for (; vma; vma = vma->vm_next) {
-		if (!vma_migratable(vma) || !vma_policy_mof(p, vma))
+		if (!vma_migratable(vma) || !vma_policy_mof(p, vma) ||
+			is_vm_hugetlb_page(vma)) {
 			continue;
+		}
 
 		/*
 		 * Shared library pages mapped by multiple processes are not
@@ -3258,6 +3265,8 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	cfs_rq->throttled_clock = rq_clock(rq);
 	raw_spin_lock(&cfs_b->lock);
 	list_add_tail_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
+	if (!cfs_b->timer_active)
+		__start_cfs_bandwidth(cfs_b);
 	raw_spin_unlock(&cfs_b->lock);
 }
 
@@ -7444,6 +7453,8 @@ const struct sched_class fair_sched_class = {
 	.switched_to		= switched_to_fair,
 
 	.get_rr_interval	= get_rr_interval_fair,
+
+	.update_curr		= update_curr_fair,
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	.task_move_group	= task_move_group_fair,

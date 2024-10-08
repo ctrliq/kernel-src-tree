@@ -21,15 +21,7 @@
 
 extern int sysctl_tcp_syncookies;
 
-__u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
-EXPORT_SYMBOL(syncookie_secret);
-
-static __init int init_syncookies(void)
-{
-	get_random_bytes(syncookie_secret, sizeof(syncookie_secret));
-	return 0;
-}
-__initcall(init_syncookies);
+static u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
 
 #define COOKIEBITS 24	/* Upper bits store count */
 #define COOKIEMASK (((__u32)1 << COOKIEBITS) - 1)
@@ -64,8 +56,11 @@ static DEFINE_PER_CPU(__u32 [16 + 5 + SHA_WORKSPACE_WORDS],
 static u32 cookie_hash(__be32 saddr, __be32 daddr, __be16 sport, __be16 dport,
 		       u32 count, int c)
 {
-	__u32 *tmp = __get_cpu_var(ipv4_cookie_scratch);
+	__u32 *tmp;
 
+	net_get_random_once(syncookie_secret, sizeof(syncookie_secret));
+
+	tmp  = __get_cpu_var(ipv4_cookie_scratch);
 	memcpy(tmp + 4, syncookie_secret[c], sizeof(syncookie_secret[c]));
 	tmp[0] = (__force u32)saddr;
 	tmp[1] = (__force u32)daddr;
@@ -197,7 +192,8 @@ u32 __cookie_v4_init_sequence(const struct iphdr *iph, const struct tcphdr *th,
 }
 EXPORT_SYMBOL_GPL(__cookie_v4_init_sequence);
 
-__u32 cookie_v4_init_sequence(struct sock *sk, struct sk_buff *skb, __u16 *mssp)
+__u32 cookie_v4_init_sequence(struct sock *sk, const struct sk_buff *skb,
+			      __u16 *mssp)
 {
 	const struct iphdr *iph = ip_hdr(skb);
 	const struct tcphdr *th = tcp_hdr(skb);
@@ -245,10 +241,10 @@ static inline struct sock *get_cookie_sock(struct sock *sk, struct sk_buff *skb,
  * additional tcp options in the timestamp.
  * This extracts these options from the timestamp echo.
  *
- * return false if we decode an option that should not be.
+ * return false if we decode a tcp option that is disabled
+ * on the host.
  */
-bool cookie_check_timestamp(struct tcp_options_received *tcp_opt,
-			struct net *net, bool *ecn_ok)
+bool cookie_timestamp_decode(struct tcp_options_received *tcp_opt)
 {
 	/* echoed timestamp, lowest bits contain options */
 	u32 options = tcp_opt->rcv_tsecr;
@@ -262,9 +258,6 @@ bool cookie_check_timestamp(struct tcp_options_received *tcp_opt,
 		return false;
 
 	tcp_opt->sack_ok = (options & TS_OPT_SACK) ? TCP_SACK_SEEN : 0;
-	*ecn_ok = options & TS_OPT_ECN;
-	if (*ecn_ok && !net->ipv4.sysctl_tcp_ecn)
-		return false;
 
 	if (tcp_opt->sack_ok && !sysctl_tcp_sack)
 		return false;
@@ -277,7 +270,22 @@ bool cookie_check_timestamp(struct tcp_options_received *tcp_opt,
 
 	return sysctl_tcp_window_scaling != 0;
 }
-EXPORT_SYMBOL(cookie_check_timestamp);
+EXPORT_SYMBOL(cookie_timestamp_decode);
+
+bool cookie_ecn_ok(const struct tcp_options_received *tcp_opt,
+		   const struct net *net, const struct dst_entry *dst)
+{
+	bool ecn_ok = tcp_opt->rcv_tsecr & TS_OPT_ECN;
+
+	if (!ecn_ok)
+		return false;
+
+	if (net->ipv4.sysctl_tcp_ecn)
+		return true;
+
+	return dst_feature(dst, RTAX_FEATURE_ECN);
+}
+EXPORT_SYMBOL(cookie_ecn_ok);
 
 struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
 			     struct ip_options *opt)
@@ -293,7 +301,6 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
 	int mss;
 	struct rtable *rt;
 	__u8 rcv_wscale;
-	bool ecn_ok = false;
 	struct flowi4 fl4;
 
 	if (!sysctl_tcp_syncookies || !th->ack || th->rst)
@@ -311,7 +318,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
 	memset(&tcp_opt, 0, sizeof(tcp_opt));
 	tcp_parse_options(skb, &tcp_opt, 0, NULL);
 
-	if (!cookie_check_timestamp(&tcp_opt, sock_net(sk), &ecn_ok))
+	if (!cookie_timestamp_decode(&tcp_opt))
 		goto out;
 
 	ret = NULL;
@@ -328,7 +335,6 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
 	ireq->ir_rmt_port	= th->source;
 	ireq->ir_loc_addr	= ip_hdr(skb)->daddr;
 	ireq->ir_rmt_addr	= ip_hdr(skb)->saddr;
-	ireq->ecn_ok		= ecn_ok;
 	ireq->snd_wscale	= tcp_opt.snd_wscale;
 	ireq->sack_ok		= tcp_opt.sack_ok;
 	ireq->wscale_ok		= tcp_opt.wscale_ok;
@@ -385,6 +391,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
 				  dst_metric(&rt->dst, RTAX_INITRWND));
 
 	ireq->rcv_wscale  = rcv_wscale;
+	ireq->ecn_ok = cookie_ecn_ok(&tcp_opt, sock_net(sk), &rt->dst);
 
 	ret = get_cookie_sock(sk, skb, req, &rt->dst);
 	/* ip_queue_xmit() depends on our flow being setup

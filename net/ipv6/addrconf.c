@@ -1646,13 +1646,11 @@ void addrconf_dad_failure(struct inet6_ifaddr *ifp)
 	addrconf_mod_dad_work(ifp, 0);
 }
 
-/* Join to solicited addr multicast group. */
-
+/* Join to solicited addr multicast group.
+ * caller must hold RTNL */
 void addrconf_join_solict(struct net_device *dev, const struct in6_addr *addr)
 {
 	struct in6_addr maddr;
-
-	ASSERT_RTNL();
 
 	if (dev->flags&(IFF_LOOPBACK|IFF_NOARP))
 		return;
@@ -1661,11 +1659,10 @@ void addrconf_join_solict(struct net_device *dev, const struct in6_addr *addr)
 	ipv6_dev_mc_inc(dev, &maddr);
 }
 
+/* caller must hold RTNL */
 void addrconf_leave_solict(struct inet6_dev *idev, const struct in6_addr *addr)
 {
 	struct in6_addr maddr;
-
-	ASSERT_RTNL();
 
 	if (idev->dev->flags&(IFF_LOOPBACK|IFF_NOARP))
 		return;
@@ -1674,11 +1671,10 @@ void addrconf_leave_solict(struct inet6_dev *idev, const struct in6_addr *addr)
 	__ipv6_dev_mc_dec(idev, &maddr);
 }
 
+/* caller must hold RTNL */
 static void addrconf_join_anycast(struct inet6_ifaddr *ifp)
 {
 	struct in6_addr addr;
-
-	ASSERT_RTNL();
 
 	if (ifp->prefix_len >= 127) /* RFC 6164 */
 		return;
@@ -1688,11 +1684,10 @@ static void addrconf_join_anycast(struct inet6_ifaddr *ifp)
 	ipv6_dev_ac_inc(ifp->idev->dev, &addr);
 }
 
+/* caller must hold RTNL */
 static void addrconf_leave_anycast(struct inet6_ifaddr *ifp)
 {
 	struct in6_addr addr;
-
-	ASSERT_RTNL();
 
 	if (ifp->prefix_len >= 127) /* RFC 6164 */
 		return;
@@ -3990,11 +3985,11 @@ static int inet6_fill_ifaddr(struct sk_buff *skb, struct inet6_ifaddr *ifa,
 	}
 
 	if (ipv6_addr_type(&ifa->peer_addr) != IPV6_ADDR_ANY) {
-		if (nla_put(skb, IFA_LOCAL, 16, &ifa->addr) < 0 ||
-		    nla_put(skb, IFA_ADDRESS, 16, &ifa->peer_addr) < 0)
+		if (nla_put_in6_addr(skb, IFA_LOCAL, &ifa->addr) < 0 ||
+		    nla_put_in6_addr(skb, IFA_ADDRESS, &ifa->peer_addr) < 0)
 			goto error;
 	} else
-		if (nla_put(skb, IFA_ADDRESS, 16, &ifa->addr) < 0)
+		if (nla_put_in6_addr(skb, IFA_ADDRESS, &ifa->addr) < 0)
 			goto error;
 
 	if (put_cacheinfo(skb, ifa->cstamp, ifa->tstamp, preferred, valid) < 0)
@@ -4025,7 +4020,7 @@ static int inet6_fill_ifmcaddr(struct sk_buff *skb, struct ifmcaddr6 *ifmca,
 		return -EMSGSIZE;
 
 	put_ifaddrmsg(nlh, 128, IFA_F_PERMANENT, scope, ifindex);
-	if (nla_put(skb, IFA_MULTICAST, 16, &ifmca->mca_addr) < 0 ||
+	if (nla_put_in6_addr(skb, IFA_MULTICAST, &ifmca->mca_addr) < 0 ||
 	    put_cacheinfo(skb, ifmca->mca_cstamp, ifmca->mca_tstamp,
 			  INFINITY_LIFE_TIME, INFINITY_LIFE_TIME) < 0) {
 		nlmsg_cancel(skb, nlh);
@@ -4050,7 +4045,7 @@ static int inet6_fill_ifacaddr(struct sk_buff *skb, struct ifacaddr6 *ifaca,
 		return -EMSGSIZE;
 
 	put_ifaddrmsg(nlh, 128, IFA_F_PERMANENT, scope, ifindex);
-	if (nla_put(skb, IFA_ANYCAST, 16, &ifaca->aca_addr) < 0 ||
+	if (nla_put_in6_addr(skb, IFA_ANYCAST, &ifaca->aca_addr) < 0 ||
 	    put_cacheinfo(skb, ifaca->aca_cstamp, ifaca->aca_tstamp,
 			  INFINITY_LIFE_TIME, INFINITY_LIFE_TIME) < 0) {
 		nlmsg_cancel(skb, nlh);
@@ -4576,8 +4571,8 @@ static int inet6_fill_ifinfo(struct sk_buff *skb, struct inet6_dev *idev,
 	    (dev->addr_len &&
 	     nla_put(skb, IFLA_ADDRESS, dev->addr_len, dev->dev_addr)) ||
 	    nla_put_u32(skb, IFLA_MTU, dev->mtu) ||
-	    (dev->ifindex != dev->iflink &&
-	     nla_put_u32(skb, IFLA_LINK, dev->iflink)))
+	    (dev->ifindex != dev_get_iflink(dev) &&
+	     nla_put_u32(skb, IFLA_LINK, dev_get_iflink(dev))))
 		goto nla_put_failure;
 	protoinfo = nla_nest_start(skb, IFLA_PROTINFO);
 	if (protoinfo == NULL)

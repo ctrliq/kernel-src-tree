@@ -220,7 +220,8 @@ int __fscache_attr_changed(struct fscache_cookie *cookie)
 
 	spin_lock(&cookie->lock);
 
-	if (hlist_empty(&cookie->backing_objects))
+	if (!fscache_cookie_enabled(cookie) ||
+	    hlist_empty(&cookie->backing_objects))
 		goto nobufs;
 	object = hlist_entry(cookie->backing_objects.first,
 			     struct fscache_object, cookie_link);
@@ -438,7 +439,7 @@ int __fscache_read_or_alloc_page(struct fscache_cookie *cookie,
 		return -ERESTARTSYS;
 
 	op = fscache_alloc_retrieval(cookie, page->mapping,
-				     end_io_func,context);
+				     end_io_func, context);
 	if (!op) {
 		_leave(" = -ENOMEM");
 		return -ENOMEM;
@@ -447,7 +448,8 @@ int __fscache_read_or_alloc_page(struct fscache_cookie *cookie,
 
 	spin_lock(&cookie->lock);
 
-	if (hlist_empty(&cookie->backing_objects))
+	if (!fscache_cookie_enabled(cookie) ||
+	    hlist_empty(&cookie->backing_objects))
 		goto nobufs_unlock;
 	object = hlist_entry(cookie->backing_objects.first,
 			     struct fscache_object, cookie_link);
@@ -574,7 +576,8 @@ int __fscache_read_or_alloc_pages(struct fscache_cookie *cookie,
 
 	spin_lock(&cookie->lock);
 
-	if (hlist_empty(&cookie->backing_objects))
+	if (!fscache_cookie_enabled(cookie) ||
+	    hlist_empty(&cookie->backing_objects))
 		goto nobufs_unlock;
 	object = hlist_entry(cookie->backing_objects.first,
 			     struct fscache_object, cookie_link);
@@ -684,7 +687,8 @@ int __fscache_alloc_page(struct fscache_cookie *cookie,
 
 	spin_lock(&cookie->lock);
 
-	if (hlist_empty(&cookie->backing_objects))
+	if (!fscache_cookie_enabled(cookie) ||
+	    hlist_empty(&cookie->backing_objects))
 		goto nobufs_unlock;
 	object = hlist_entry(cookie->backing_objects.first,
 			     struct fscache_object, cookie_link);
@@ -955,7 +959,8 @@ int __fscache_write_page(struct fscache_cookie *cookie,
 	ret = -ENOBUFS;
 	spin_lock(&cookie->lock);
 
-	if (hlist_empty(&cookie->backing_objects))
+	if (!fscache_cookie_enabled(cookie) ||
+	    hlist_empty(&cookie->backing_objects))
 		goto nobufs;
 	object = hlist_entry(cookie->backing_objects.first,
 			     struct fscache_object, cookie_link);
@@ -1120,10 +1125,8 @@ void fscache_mark_page_cached(struct fscache_retrieval *op, struct page *page)
 		static bool once_only;
 		if (!once_only) {
 			once_only = true;
-			printk(KERN_WARNING "FS-Cache:"
-			       " Cookie type %s marked page %lx"
-			       " multiple times\n",
-			       cookie->def->name, page->index);
+			pr_warn("Cookie type %s marked page %lx multiple times\n",
+				cookie->def->name, page->index);
 		}
 	}
 

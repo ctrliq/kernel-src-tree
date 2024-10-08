@@ -309,19 +309,16 @@ void alarm_init(struct alarm *alarm, enum alarmtimer_type type,
  * @alarm: ptr to alarm to set
  * @start: time to run the alarm
  */
-int alarm_start(struct alarm *alarm, ktime_t start)
+void alarm_start(struct alarm *alarm, ktime_t start)
 {
 	struct alarm_base *base = &alarm_bases[alarm->type];
 	unsigned long flags;
-	int ret;
 
 	spin_lock_irqsave(&base->lock, flags);
 	alarm->node.expires = start;
 	alarmtimer_enqueue(base, alarm);
-	ret = hrtimer_start(&alarm->timer, alarm->node.expires,
-				HRTIMER_MODE_ABS);
+	hrtimer_start(&alarm->timer, alarm->node.expires, HRTIMER_MODE_ABS);
 	spin_unlock_irqrestore(&base->lock, flags);
-	return ret;
 }
 
 /**

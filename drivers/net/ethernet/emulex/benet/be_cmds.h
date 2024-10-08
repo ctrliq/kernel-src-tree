@@ -105,6 +105,7 @@ struct be_mcc_compl {
 #define ASYNC_DEBUG_EVENT_TYPE_QNQ	1
 #define ASYNC_EVENT_CODE_SLIPORT	0x11
 #define ASYNC_EVENT_PORT_MISCONFIG	0x9
+#define ASYNC_EVENT_FW_CONTROL		0x5
 
 enum {
 	LINK_DOWN	= 0x0,
@@ -179,6 +180,22 @@ struct be_async_event_misconfig_port {
 	u32 event_data_word2;
 	u32 rsvd0;
 	u32 flags;
+} __packed;
+
+#define BMC_FILT_BROADCAST_ARP				BIT(0)
+#define BMC_FILT_BROADCAST_DHCP_CLIENT			BIT(1)
+#define BMC_FILT_BROADCAST_DHCP_SERVER			BIT(2)
+#define BMC_FILT_BROADCAST_NET_BIOS			BIT(3)
+#define BMC_FILT_BROADCAST				BIT(7)
+#define BMC_FILT_MULTICAST_IPV6_NEIGH_ADVER		BIT(8)
+#define BMC_FILT_MULTICAST_IPV6_RA			BIT(9)
+#define BMC_FILT_MULTICAST_IPV6_RAS			BIT(10)
+#define BMC_FILT_MULTICAST				BIT(15)
+struct be_async_fw_control {
+	u32 event_data_word1;
+	u32 event_data_word2;
+	u32 evt_tag;
+	u32 event_data_word4;
 } __packed;
 
 struct be_mcc_mailbox {
@@ -1620,10 +1637,12 @@ struct be_cmd_req_set_qos {
 struct mgmt_hba_attribs {
 	u32 rsvd0[24];
 	u8 controller_model_number[32];
-	u32 rsvd1[79];
-	u8 rsvd2[3];
+	u32 rsvd1[16];
+	u32 controller_serial_number[8];
+	u32 rsvd2[55];
+	u8 rsvd3[3];
 	u8 phy_port;
-	u32 rsvd3[13];
+	u32 rsvd4[13];
 } __packed;
 
 struct mgmt_controller_attrib {

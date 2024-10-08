@@ -83,7 +83,7 @@ static struct dentry *debugfs_dir;
 /* Translate memory window 0,1 to BAR 2,4 */
 #define MW_TO_BAR(mw)	(mw * 2 + 2)
 
-static DEFINE_PCI_DEVICE_TABLE(ntb_pci_tbl) = {
+static const struct pci_device_id ntb_pci_tbl[] = {
 	{PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_NTB_B2B_BWD)},
 	{PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_NTB_B2B_JSF)},
 	{PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_NTB_CLASSIC_JSF)},

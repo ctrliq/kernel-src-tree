@@ -148,6 +148,17 @@ static int selinux_secmark_enabled(void)
 	return (atomic_read(&selinux_secmark_refcount) > 0);
 }
 
+static int selinux_netcache_avc_callback(u32 event)
+{
+	if (event == AVC_CALLBACK_RESET) {
+		sel_netif_flush();
+		sel_netnode_flush();
+		sel_netport_flush();
+		synchronize_net();
+	}
+	return 0;
+}
+
 /*
  * initialise the security for the init task
  */
@@ -3977,7 +3988,7 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 		if (snum) {
 			int low, high;
 
-			inet_get_local_port_range(&low, &high);
+			inet_get_local_port_range(sock_net(sk), &low, &high);
 
 			if (snum < max(PROT_SOCK, low) || snum > high) {
 				err = sel_netport_sid(sk->sk_protocol,
@@ -4718,9 +4729,9 @@ static unsigned int selinux_ipv4_forward(const struct nf_hook_ops *ops,
 					 struct sk_buff *skb,
 					 const struct net_device *in,
 					 const struct net_device *out,
-					 int (*okfn)(struct sk_buff *))
+					 const struct nf_hook_state *state)
 {
-	return selinux_ip_forward(skb, in, PF_INET);
+	return selinux_ip_forward(skb, state->in, PF_INET);
 }
 
 #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
@@ -4728,9 +4739,9 @@ static unsigned int selinux_ipv6_forward(const struct nf_hook_ops *ops,
 					 struct sk_buff *skb,
 					 const struct net_device *in,
 					 const struct net_device *out,
-					 int (*okfn)(struct sk_buff *))
+					 const struct nf_hook_state *state)
 {
-	return selinux_ip_forward(skb, in, PF_INET6);
+	return selinux_ip_forward(skb, state->in, PF_INET6);
 }
 #endif	/* IPV6 */
 
@@ -4780,7 +4791,7 @@ static unsigned int selinux_ipv4_output(const struct nf_hook_ops *ops,
 					struct sk_buff *skb,
 					const struct net_device *in,
 					const struct net_device *out,
-					int (*okfn)(struct sk_buff *))
+					const struct nf_hook_state *state)
 {
 	return selinux_ip_output(skb, PF_INET);
 }
@@ -4958,9 +4969,9 @@ static unsigned int selinux_ipv4_postroute(const struct nf_hook_ops *ops,
 					   struct sk_buff *skb,
 					   const struct net_device *in,
 					   const struct net_device *out,
-					   int (*okfn)(struct sk_buff *))
+					   const struct nf_hook_state *state)
 {
-	return selinux_ip_postroute(skb, out, PF_INET);
+	return selinux_ip_postroute(skb, state->out, PF_INET);
 }
 
 #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
@@ -4968,9 +4979,9 @@ static unsigned int selinux_ipv6_postroute(const struct nf_hook_ops *ops,
 					   struct sk_buff *skb,
 					   const struct net_device *in,
 					   const struct net_device *out,
-					   int (*okfn)(struct sk_buff *))
+					   const struct nf_hook_state *state)
 {
-	return selinux_ip_postroute(skb, out, PF_INET6);
+	return selinux_ip_postroute(skb, state->out, PF_INET6);
 }
 #endif	/* IPV6 */
 
@@ -5951,6 +5962,9 @@ static __init int selinux_init(void)
 
 	if (register_security(&selinux_ops))
 		panic("SELinux: Unable to register with kernel.\n");
+
+	if (avc_add_callback(selinux_netcache_avc_callback, AVC_CALLBACK_RESET))
+		panic("SELinux: Unable to register AVC netcache callback\n");
 
 	if (selinux_enforcing)
 		printk(KERN_DEBUG "SELinux:  Starting in enforcing mode\n");

@@ -319,6 +319,14 @@ enum {
 #define AUDIT_STATUS_PID		0x0004
 #define AUDIT_STATUS_RATE_LIMIT		0x0008
 #define AUDIT_STATUS_BACKLOG_LIMIT	0x0010
+
+#define AUDIT_FEATURE_BITMAP_BACKLOG_LIMIT	0x00000001
+#define AUDIT_FEATURE_BITMAP_ALL (AUDIT_FEATURE_BITMAP_BACKLOG_LIMIT)
+
+/* deprecated: AUDIT_VERSION_* */
+#define AUDIT_VERSION_LATEST 		AUDIT_FEATURE_BITMAP_ALL
+#define AUDIT_VERSION_BACKLOG_LIMIT	AUDIT_FEATURE_BITMAP_BACKLOG_LIMIT
+
 				/* Failure-to-log actions */
 #define AUDIT_FAIL_SILENT	0
 #define AUDIT_FAIL_PRINTK	1
@@ -373,7 +381,10 @@ struct audit_status {
 	__u32		backlog_limit;	/* waiting messages limit */
 	__u32		lost;		/* messages lost */
 	__u32		backlog;	/* messages waiting in queue */
-	__u32		version;	/* audit api version number */
+	union {
+		__u32	version;	/* deprecated: audit api version num */
+		__u32	feature_bitmap;	/* bitmap of kernel audit features */
+	};
 };
 
 struct audit_features {

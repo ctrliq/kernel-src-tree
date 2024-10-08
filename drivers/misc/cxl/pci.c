@@ -335,7 +335,7 @@ static int init_implementation_adapter_regs(struct cxl *adapter, struct pci_dev 
 	u64 psl_dsnctl;
 	u64 chipid;
 
-	if (!(np = pnv_pci_to_phb_node(dev)))
+	if (!(np = pnv_pci_get_phb_node(dev)))
 		return -ENODEV;
 
 	while (np && !(prop = of_get_property(np, "ibm,chip-id", NULL)))
@@ -995,8 +995,14 @@ static struct cxl *cxl_init_adapter(struct pci_dev *dev)
 	if ((rc = init_implementation_adapter_regs(adapter, dev)))
 		goto err3;
 
-	if ((rc = pnv_phb_to_cxl(dev)))
+	if ((rc = pnv_phb_to_cxl_mode(dev, OPAL_PHB_CAPI_MODE_CAPI)))
 		goto err3;
+
+	/* If recovery happened, the last step is to turn on snooping.
+	 * In the non-recovery case this has no effect */
+	if ((rc = pnv_phb_to_cxl_mode(dev, OPAL_PHB_CAPI_MODE_SNOOP_ON))) {
+		goto err3;
+	}
 
 	if ((rc = cxl_register_psl_err_irq(adapter)))
 		goto err3;

@@ -96,8 +96,8 @@ void pci_update_resource(struct pci_dev *dev, int resno)
 		pci_write_config_dword(dev, reg + 4, new);
 		pci_read_config_dword(dev, reg + 4, &check);
 		if (check != new) {
-			dev_err(&dev->dev, "BAR %d: error updating "
-			       "(high %#08x != %#08x)\n", resno, new, check);
+			dev_err(&dev->dev, "BAR %d: error updating (high %#08x != %#08x)\n",
+				resno, new, check);
 		}
 	}
 
@@ -270,8 +270,8 @@ int pci_assign_resource(struct pci_dev *dev, int resno)
 	res->flags |= IORESOURCE_UNSET;
 	align = pci_resource_alignment(dev, res);
 	if (!align) {
-		dev_info(&dev->dev, "BAR %d: can't assign %pR "
-			 "(bogus alignment)\n", resno, res);
+		dev_info(&dev->dev, "BAR %d: can't assign %pR (bogus alignment)\n",
+			 resno, res);
 		return -EINVAL;
 	}
 
@@ -302,6 +302,7 @@ int pci_assign_resource(struct pci_dev *dev, int resno)
 
 	return 0;
 }
+EXPORT_SYMBOL(pci_assign_resource);
 
 int pci_reassign_resource(struct pci_dev *dev, int resno, resource_size_t addsize,
 			resource_size_t min_align)
@@ -314,8 +315,8 @@ int pci_reassign_resource(struct pci_dev *dev, int resno, resource_size_t addsiz
 	flags = res->flags;
 	res->flags |= IORESOURCE_UNSET;
 	if (!res->parent) {
-		dev_info(&dev->dev, "BAR %d: can't reassign an unassigned resource %pR "
-			 "\n", resno, res);
+		dev_info(&dev->dev, "BAR %d: can't reassign an unassigned resource %pR\n",
+			 resno, res);
 		return -EINVAL;
 	}
 

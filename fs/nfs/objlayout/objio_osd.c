@@ -537,11 +537,12 @@ int objio_write_pagelist(struct nfs_pgio_header *hdr, int how)
 static size_t objio_pg_test(struct nfs_pageio_descriptor *pgio,
 			  struct nfs_page *prev, struct nfs_page *req)
 {
+	struct nfs_pgio_mirror *mirror = nfs_pgio_current_mirror(pgio);
 	unsigned int size;
 
 	size = pnfs_generic_pg_test(pgio, prev, req);
 
-	if (!size || pgio->pg_count + req->wb_bytes >
+	if (!size || mirror->pg_count + req->wb_bytes >
 	    (unsigned long)pgio->pg_layout_private)
 		return 0;
 
@@ -655,9 +656,11 @@ objlayout_init(void)
 		printk(KERN_INFO
 			"NFS: %s: Registering OSD pNFS Layout Driver failed: error=%d\n",
 			__func__, ret);
-	else
+	else {
 		printk(KERN_INFO "NFS: %s: Registered OSD pNFS Layout Driver\n",
 			__func__);
+		mark_tech_preview("OSD pNFS Layout Driver", NULL);
+	}
 	return ret;
 }
 

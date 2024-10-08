@@ -47,8 +47,8 @@ struct dst_entry {
 	void			*__pad1;
 #endif
 	int			(*input)(struct sk_buff *);
-	RH_KABI_REPLACE_P(int			(*output)(struct sk_buff *),
-		          int			(*output)(struct sock *sk, struct sk_buff *skb))
+	RH_KABI_REPLACE(int			(*output)(struct sk_buff *),
+			int			(*output)(struct sock *sk, struct sk_buff *skb))
 
 	unsigned short		flags;
 #define DST_HOST		0x0001
@@ -124,9 +124,11 @@ struct dst_entry {
 extern u32 *dst_cow_metrics_generic(struct dst_entry *dst, unsigned long old);
 extern const u32 dst_default_metrics[];
 
-#define DST_METRICS_READ_ONLY	0x1UL
+#define DST_METRICS_READ_ONLY		0x1UL
+#define DST_METRICS_FORCE_OVERWRITE	0x2UL
+#define DST_METRICS_FLAGS		0x3UL
 #define __DST_METRICS_PTR(Y)	\
-	((u32 *)((Y) & ~DST_METRICS_READ_ONLY))
+	((u32 *)((Y) & ~DST_METRICS_FLAGS))
 #define DST_METRICS_PTR(X)	__DST_METRICS_PTR((X)->_metrics)
 
 static inline bool dst_metrics_read_only(const struct dst_entry *dst)
@@ -134,7 +136,12 @@ static inline bool dst_metrics_read_only(const struct dst_entry *dst)
 	return dst->_metrics & DST_METRICS_READ_ONLY;
 }
 
-extern void __dst_destroy_metrics_generic(struct dst_entry *dst, unsigned long old);
+static inline void dst_metrics_set_force_overwrite(struct dst_entry *dst)
+{
+	dst->_metrics |= DST_METRICS_FORCE_OVERWRITE;
+}
+
+void __dst_destroy_metrics_generic(struct dst_entry *dst, unsigned long old);
 
 static inline void dst_destroy_metrics_generic(struct dst_entry *dst)
 {
@@ -216,6 +223,12 @@ static inline void dst_metric_set(struct dst_entry *dst, int metric, u32 val)
 	if (p)
 		p[metric-1] = val;
 }
+
+/* Kernel-internal feature bits that are unallocated in user space. */
+#define DST_FEATURE_ECN_CA	(1 << 31)
+
+#define DST_FEATURE_MASK	(DST_FEATURE_ECN_CA)
+#define DST_FEATURE_ECN_MASK	(DST_FEATURE_ECN_CA | RTAX_FEATURE_ECN)
 
 static inline u32
 dst_feature(const struct dst_entry *dst, u32 feature)
@@ -326,11 +339,13 @@ static inline void skb_dst_force(struct sk_buff *skb)
  *	__skb_tunnel_rx - prepare skb for rx reinsert
  *	@skb: buffer
  *	@dev: tunnel device
+ *	@net: netns for packet i/o
  *
  *	After decapsulation, packet is going to re-enter (netif_rx()) our stack,
  *	so make some cleanups. (no accounting done)
  */
-static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
+static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev,
+				   struct net *net)
 {
 	skb->dev = dev;
 
@@ -341,8 +356,7 @@ static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
 	 */
 	skb_clear_hash_if_not_l4(skb);
 	skb_set_queue_mapping(skb, 0);
-	skb_dst_drop(skb);
-	nf_reset(skb);
+	skb_scrub_packet(skb, !net_eq(net, dev_net(dev)));
 }
 
 /**
@@ -354,12 +368,13 @@ static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
  *	so make some cleanups, and perform accounting.
  *	Note: this accounting is not SMP safe.
  */
-static inline void skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
+static inline void skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev,
+				 struct net *net)
 {
 	/* TODO : stats should be SMP safe */
 	dev->stats.rx_packets++;
 	dev->stats.rx_bytes += skb->len;
-	__skb_tunnel_rx(skb, dev);
+	__skb_tunnel_rx(skb, dev, net);
 }
 
 /* Children define the path of the packet through the
@@ -488,6 +503,8 @@ extern void		dst_init(void);
 /* Flags for xfrm_lookup flags argument. */
 enum {
 	XFRM_LOOKUP_ICMP = 1 << 0,
+	XFRM_LOOKUP_QUEUE = 1 << 1,
+	XFRM_LOOKUP_KEEP_DST_REF = 1 << 2,
 };
 
 struct flowi;

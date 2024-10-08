@@ -228,6 +228,8 @@ int inet_listen(struct socket *sock, int backlog)
 				err = 0;
 			if (err)
 				goto out;
+
+			tcp_fastopen_init_key_once(true);
 		}
 		err = inet_csk_listen_start(sk, backlog);
 		if (err)
@@ -1123,7 +1125,7 @@ static int inet_sk_reselect_saddr(struct sock *sk)
 	fl4 = &inet->cork.fl.u.ip4;
 	rt = ip_route_connect(fl4, daddr, 0, RT_CONN_FLAGS(sk),
 			      sk->sk_bound_dev_if, sk->sk_protocol,
-			      inet->inet_sport, inet->inet_dport, sk, false);
+			      inet->inet_sport, inet->inet_dport, sk);
 	if (IS_ERR(rt))
 		return PTR_ERR(rt);
 
@@ -1201,40 +1203,6 @@ int inet_sk_rebuild_header(struct sock *sk)
 }
 EXPORT_SYMBOL(inet_sk_rebuild_header);
 
-static int inet_gso_send_check(struct sk_buff *skb)
-{
-	const struct net_offload *ops;
-	const struct iphdr *iph;
-	int proto;
-	int ihl;
-	int err = -EINVAL;
-
-	if (unlikely(!pskb_may_pull(skb, sizeof(*iph))))
-		goto out;
-
-	iph = ip_hdr(skb);
-	ihl = iph->ihl * 4;
-	if (ihl < sizeof(*iph))
-		goto out;
-
-	proto = iph->protocol;
-
-	/* Warning: after this point, iph might be no longer valid */
-	if (unlikely(!pskb_may_pull(skb, ihl)))
-		goto out;
-	__skb_pull(skb, ihl);
-
-	skb_reset_transport_header(skb);
-	err = -EPROTONOSUPPORT;
-
-	ops = rcu_dereference(inet_offloads[proto]);
-	if (likely(ops && ops->callbacks.gso_send_check))
-		err = ops->callbacks.gso_send_check(skb);
-
-out:
-	return err;
-}
-
 static struct sk_buff *inet_gso_segment(struct sk_buff *skb,
 					netdev_features_t features)
 {
@@ -1260,6 +1228,7 @@ static struct sk_buff *inet_gso_segment(struct sk_buff *skb,
 		       SKB_GSO_TCPV6 |
 		       SKB_GSO_UDP_TUNNEL |
 		       SKB_GSO_UDP_TUNNEL_CSUM |
+		       SKB_GSO_TUNNEL_REMCSUM |
 		       SKB_GSO_MPLS |
 		       0)))
 		goto out;
@@ -1503,9 +1472,9 @@ u64 snmp_fold_field64(void __percpu *mib[], int offt, size_t syncp_offset)
 		bhptr = per_cpu_ptr(mib[0], cpu);
 		syncp = (struct u64_stats_sync *)(bhptr + syncp_offset);
 		do {
-			start = u64_stats_fetch_begin_bh(syncp);
+			start = u64_stats_fetch_begin_irq(syncp);
 			v = *(((u64 *) bhptr) + offt);
-		} while (u64_stats_fetch_retry_bh(syncp, start));
+		} while (u64_stats_fetch_retry_irq(syncp, start));
 
 		res += v;
 	}
@@ -1641,7 +1610,6 @@ static int ipv4_proc_init(void);
 static struct packet_offload ip_packet_offload __read_mostly = {
 	.type = cpu_to_be16(ETH_P_IP),
 	.callbacks = {
-		.gso_send_check = inet_gso_send_check,
 		.gso_segment = inet_gso_segment,
 		.gro_receive = inet_gro_receive,
 		.gro_complete = inet_gro_complete,
@@ -1650,7 +1618,6 @@ static struct packet_offload ip_packet_offload __read_mostly = {
 
 static const struct net_offload ipip_offload = {
 	.callbacks = {
-		.gso_send_check = inet_gso_send_check,
 		.gso_segment	= inet_gso_segment,
 	},
 };

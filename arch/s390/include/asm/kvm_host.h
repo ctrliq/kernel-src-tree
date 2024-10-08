@@ -13,8 +13,11 @@
 
 #ifndef ASM_KVM_HOST_H
 #define ASM_KVM_HOST_H
+
+#include <linux/types.h>
 #include <linux/hrtimer.h>
 #include <linux/interrupt.h>
+#include <linux/kvm_types.h>
 #include <linux/kvm_host.h>
 #include <asm/debug.h>
 #include <asm/cpu.h>
@@ -124,6 +127,7 @@ struct kvm_vcpu_stat {
 	u32 exit_stop_request;
 	u32 exit_validity;
 	u32 exit_instruction;
+	u32 halt_successful_poll;
 	u32 instruction_lctl;
 	u32 instruction_lctlg;
 	u32 exit_program_interruption;

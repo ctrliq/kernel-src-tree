@@ -35,7 +35,7 @@ char atl1e_driver_version[] = DRV_VERSION;
  * { Vendor ID, Device ID, SubVendor ID, SubDevice ID,
  *   Class, Class Mask, private data (not used) }
  */
-static DEFINE_PCI_DEVICE_TABLE(atl1e_pci_tbl) = {
+static const struct pci_device_id atl1e_pci_tbl[] = {
 	{PCI_DEVICE(PCI_VENDOR_ID_ATTANSIC, PCI_DEVICE_ID_ATTANSIC_L1E)},
 	{PCI_DEVICE(PCI_VENDOR_ID_ATTANSIC, 0x1066)},
 	/* required last entry */
@@ -1850,8 +1850,8 @@ static netdev_tx_t atl1e_xmit_frame(struct sk_buff *skb,
 
 	tpd = atl1e_get_tpd(adapter);
 
-	if (vlan_tx_tag_present(skb)) {
-		u16 vlan_tag = vlan_tx_tag_get(skb);
+	if (skb_vlan_tag_present(skb)) {
+		u16 vlan_tag = skb_vlan_tag_get(skb);
 		u16 atl1e_vlan_tag;
 
 		tpd->word3 |= 1 << TPD_INS_VL_TAG_SHIFT;

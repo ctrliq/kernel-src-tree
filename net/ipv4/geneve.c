@@ -96,7 +96,7 @@ static void geneve_build_header(struct genevehdr *geneveh,
 	memcpy(geneveh->options, options, options_len);
 }
 
-/* Transmit a fully formated Geneve frame.
+/* Transmit a fully formatted Geneve frame.
  *
  * When calling this function. The skb->data should point
  * to the geneve header which is fully formed.
@@ -107,19 +107,15 @@ int geneve_xmit_skb(struct geneve_sock *gs, struct rtable *rt,
 		    struct sk_buff *skb, __be32 src, __be32 dst, __u8 tos,
 		    __u8 ttl, __be16 df, __be16 src_port, __be16 dst_port,
 		    __be16 tun_flags, u8 vni[3], u8 opt_len, u8 *opt,
-		    bool xnet)
+		    bool csum, bool xnet)
 {
 	struct genevehdr *gnvh;
 	int min_headroom;
 	int err;
 
-	skb = udp_tunnel_handle_offloads(skb, !gs->sock->sk->sk_no_check_tx);
-	if (IS_ERR(skb))
-		return PTR_ERR(skb);
-
 	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
 			+ GENEVE_BASE_HLEN + opt_len + sizeof(struct iphdr)
-			+ (vlan_tx_tag_present(skb) ? VLAN_HLEN : 0);
+			+ (skb_vlan_tag_present(skb) ? VLAN_HLEN : 0);
 
 	err = skb_cow_head(skb, min_headroom);
 	if (unlikely(err)) {
@@ -127,23 +123,22 @@ int geneve_xmit_skb(struct geneve_sock *gs, struct rtable *rt,
 		return err;
 	}
 
-	if (vlan_tx_tag_present(skb)) {
-		if (unlikely(!__vlan_put_tag(skb,
-					     skb->vlan_proto,
-					     vlan_tx_tag_get(skb)))) {
-			err = -ENOMEM;
-			return err;
-		}
-		skb->vlan_tci = 0;
-	}
+	skb = vlan_hwaccel_push_inside(skb);
+	if (unlikely(!skb))
+		return -ENOMEM;
+
+	skb = udp_tunnel_handle_offloads(skb, csum);
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
 
 	gnvh = (struct genevehdr *)__skb_push(skb, sizeof(*gnvh) + opt_len);
 	geneve_build_header(gnvh, tun_flags, vni, opt_len, opt);
 
 	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
 
-	return udp_tunnel_xmit_skb(gs->sock, rt, skb, src, dst,
-				   tos, ttl, df, src_port, dst_port, xnet);
+	return udp_tunnel_xmit_skb(rt, gs->sock->sk, skb, src, dst,
+				   tos, ttl, df, src_port, dst_port, xnet,
+				   !csum);
 }
 EXPORT_SYMBOL_GPL(geneve_xmit_skb);
 
@@ -201,7 +196,7 @@ static struct sk_buff **geneve_gro_receive(struct sk_buff **head,
 
 	rcu_read_lock();
 	ptype = gro_find_receive_by_type(type);
-	if (ptype == NULL) {
+	if (!ptype) {
 		flush = 1;
 		goto out_unlock;
 	}
@@ -235,7 +230,7 @@ static int geneve_gro_complete(struct sk_buff *skb, int nhoff,
 
 	rcu_read_lock();
 	ptype = gro_find_complete_by_type(type);
-	if (ptype != NULL)
+	if (ptype)
 		err = ptype->callbacks.gro_complete(skb, nhoff + gh_len);
 
 	rcu_read_unlock();

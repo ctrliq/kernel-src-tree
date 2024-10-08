@@ -461,7 +461,7 @@ static void svc_tcp_write_space(struct sock *sk)
 	struct svc_sock *svsk = (struct svc_sock *)(sk->sk_user_data);
 	struct socket *sock = sk->sk_socket;
 
-	if (!(sk_stream_wspace(sk) >= sk_stream_min_wspace(sk)) || !sock)
+	if (!sk_stream_is_writeable(sk) || !sock)
 		return;
 	if (!svsk || svc_tcp_has_wspace(&svsk->sk_xprt))
 		clear_bit(SOCK_NOSPACE, &sock->flags);

@@ -256,7 +256,7 @@ s32 fm10k_iov_update_pvid(struct fm10k_intfc *interface, u16 glort, u16 pvid)
 	if (vf_idx >= iov_data->num_vfs)
 		return FM10K_ERR_PARAM;
 
-	/* determine if an update has occured and if so notify the VF */
+	/* determine if an update has occurred and if so notify the VF */
 	vf_info = &iov_data->vf_info[vf_idx];
 	if (vf_info->sw_vid != pvid) {
 		vf_info->sw_vid = pvid;
@@ -469,8 +469,7 @@ int fm10k_ndo_set_vf_vlan(struct net_device *netdev, int vf_idx, u16 vid,
 	return 0;
 }
 
-int fm10k_ndo_set_vf_bw(struct net_device *netdev, int vf_idx,
-			int __always_unused unused, int rate)
+int fm10k_ndo_set_vf_bw(struct net_device *netdev, int vf_idx, int rate)
 {
 	struct fm10k_intfc *interface = netdev_priv(netdev);
 	struct fm10k_iov_data *iov_data = interface->iov_data;

@@ -41,6 +41,24 @@ enum {
 	NFS_LSEG_LAYOUTRETURN,	/* layoutreturn bit set for layoutreturn */
 };
 
+/* Individual ip address */
+struct nfs4_pnfs_ds_addr {
+	struct sockaddr_storage	da_addr;
+	size_t			da_addrlen;
+	struct list_head	da_node;  /* nfs4_pnfs_dev_hlist dev_dslist */
+	char			*da_remotestr;	/* human readable addr+port */
+};
+
+struct nfs4_pnfs_ds {
+	struct list_head	ds_node;  /* nfs4_pnfs_dev_hlist dev_dslist */
+	char			*ds_remotestr;	/* comma sep list of addrs */
+	struct list_head	ds_addrs;
+	struct nfs_client	*ds_clp;
+	atomic_t		ds_count;
+	unsigned long		ds_state;
+#define NFS4DS_CONNECTING	0	/* ds is establishing connection */
+};
+
 struct pnfs_layout_segment {
 	struct list_head pls_list;
 	struct list_head pls_lc_list;
@@ -122,7 +140,8 @@ struct pnfs_layoutdriver_type {
 	struct pnfs_ds_commit_info *(*get_ds_info) (struct inode *inode);
 	void (*mark_request_commit) (struct nfs_page *req,
 				     struct pnfs_layout_segment *lseg,
-				     struct nfs_commit_info *cinfo);
+				     struct nfs_commit_info *cinfo,
+				     u32 ds_commit_idx);
 	void (*clear_request_commit) (struct nfs_page *req,
 				      struct nfs_commit_info *cinfo);
 	int (*scan_commit_lists) (struct nfs_commit_info *cinfo,
@@ -198,9 +217,6 @@ extern int pnfs_register_layoutdriver(struct pnfs_layoutdriver_type *);
 extern void pnfs_unregister_layoutdriver(struct pnfs_layoutdriver_type *);
 
 /* nfs4proc.c */
-extern int nfs4_proc_getdevicelist(struct nfs_server *server,
-				   const struct nfs_fh *fh,
-				   struct pnfs_devicelist *devlist);
 extern int nfs4_proc_getdeviceinfo(struct nfs_server *server,
 				   struct pnfs_device *dev,
 				   struct rpc_cred *cred);
@@ -300,8 +316,38 @@ bool nfs4_put_deviceid_node(struct nfs4_deviceid_node *);
 void nfs4_mark_deviceid_unavailable(struct nfs4_deviceid_node *node);
 bool nfs4_test_deviceid_unavailable(struct nfs4_deviceid_node *node);
 void nfs4_deviceid_purge_client(const struct nfs_client *);
-int nfs4_deviceid_getdevicelist(struct nfs_server *server,
-		const struct nfs_fh *fh);
+
+/* pnfs_nfs.c */
+void pnfs_generic_clear_request_commit(struct nfs_page *req,
+				       struct nfs_commit_info *cinfo);
+void pnfs_generic_commit_release(void *calldata);
+void pnfs_generic_prepare_to_resend_writes(struct nfs_commit_data *data);
+void pnfs_generic_rw_release(void *data);
+void pnfs_generic_recover_commit_reqs(struct list_head *dst,
+				      struct nfs_commit_info *cinfo);
+int pnfs_generic_commit_pagelist(struct inode *inode,
+				 struct list_head *mds_pages,
+				 int how,
+				 struct nfs_commit_info *cinfo,
+				 int (*initiate_commit)(struct nfs_commit_data *data,
+							int how));
+int pnfs_generic_scan_commit_lists(struct nfs_commit_info *cinfo, int max);
+void pnfs_generic_write_commit_done(struct rpc_task *task, void *data);
+void nfs4_pnfs_ds_put(struct nfs4_pnfs_ds *ds);
+struct nfs4_pnfs_ds *nfs4_pnfs_ds_add(struct list_head *dsaddrs,
+				      gfp_t gfp_flags);
+void nfs4_pnfs_v3_ds_connect_unload(void);
+void nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
+			  struct nfs4_deviceid_node *devid, unsigned int timeo,
+			  unsigned int retrans, u32 version, u32 minor_version,
+			  rpc_authflavor_t au_flavor);
+struct nfs4_pnfs_ds_addr *nfs4_decode_mp_ds_addr(struct net *net,
+						 struct xdr_stream *xdr,
+						 gfp_t gfp_flags);
+void pnfs_layout_mark_request_commit(struct nfs_page *req,
+				     struct pnfs_layout_segment *lseg,
+				     struct nfs_commit_info *cinfo,
+				     u32 ds_commit_idx);
 
 static inline struct nfs4_deviceid_node *
 nfs4_get_deviceid(struct nfs4_deviceid_node *d)
@@ -365,16 +411,22 @@ pnfs_get_ds_info(struct inode *inode)
 	return ld->get_ds_info(inode);
 }
 
+static inline void
+pnfs_generic_mark_devid_invalid(struct nfs4_deviceid_node *node)
+{
+	set_bit(NFS_DEVICEID_INVALID, &node->flags);
+}
+
 static inline bool
 pnfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
-			 struct nfs_commit_info *cinfo)
+			 struct nfs_commit_info *cinfo, u32 ds_commit_idx)
 {
 	struct inode *inode = req->wb_context->dentry->d_inode;
 	struct pnfs_layoutdriver_type *ld = NFS_SERVER(inode)->pnfs_curr_ld;
 
 	if (lseg == NULL || ld->mark_request_commit == NULL)
 		return false;
-	ld->mark_request_commit(req, lseg, cinfo);
+	ld->mark_request_commit(req, lseg, cinfo, ds_commit_idx);
 	return true;
 }
 
@@ -398,15 +450,6 @@ pnfs_scan_commit_lists(struct inode *inode, struct nfs_commit_info *cinfo,
 		return 0;
 	else
 		return NFS_SERVER(inode)->pnfs_curr_ld->scan_commit_lists(cinfo, max);
-}
-
-static inline void
-pnfs_recover_commit_reqs(struct inode *inode, struct list_head *list,
-			 struct nfs_commit_info *cinfo)
-{
-	if (cinfo->ds == NULL || cinfo->ds->nwritten == 0)
-		return;
-	NFS_SERVER(inode)->pnfs_curr_ld->recover_commit_reqs(list, cinfo);
 }
 
 static inline struct nfs_page *
@@ -561,7 +604,7 @@ pnfs_get_ds_info(struct inode *inode)
 
 static inline bool
 pnfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
-			 struct nfs_commit_info *cinfo)
+			 struct nfs_commit_info *cinfo, u32 ds_commit_idx)
 {
 	return false;
 }
@@ -577,12 +620,6 @@ pnfs_scan_commit_lists(struct inode *inode, struct nfs_commit_info *cinfo,
 		       int max)
 {
 	return 0;
-}
-
-static inline void
-pnfs_recover_commit_reqs(struct inode *inode, struct list_head *list,
-			 struct nfs_commit_info *cinfo)
-{
 }
 
 static inline struct nfs_page *
@@ -614,6 +651,10 @@ pnfs_layoutcommit_outstanding(struct inode *inode)
 static inline struct nfs4_threshold *pnfs_mdsthreshold_alloc(void)
 {
 	return NULL;
+}
+
+static inline void nfs4_pnfs_v3_ds_connect_unload(void)
+{
 }
 
 #endif /* CONFIG_NFS_V4_1 */

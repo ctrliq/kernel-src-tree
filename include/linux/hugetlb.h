@@ -27,6 +27,7 @@ struct hugepage_subpool {
 
 struct resv_map {
 	struct kref refs;
+	spinlock_t lock;
 	struct list_head regions;
 };
 extern struct resv_map *resv_map_alloc(void);
@@ -41,6 +42,7 @@ struct hugepage_subpool *hugepage_new_subpool(long nr_blocks);
 void hugepage_put_subpool(struct hugepage_subpool *spool);
 
 int PageHuge(struct page *page);
+bool page_huge_active(struct page *page);
 
 void reset_vma_resv_huge_pages(struct vm_area_struct *vma);
 int hugetlb_sysctl_handler(struct ctl_table *, int, void __user *, size_t *, loff_t *);
@@ -78,6 +80,8 @@ int hugetlb_reserve_pages(struct inode *inode, long from, long to,
 void hugetlb_unreserve_pages(struct inode *inode, long offset, long freed);
 int dequeue_hwpoisoned_huge_page(struct page *page);
 void free_huge_page(struct page *page);
+bool isolate_huge_page(struct page *page, struct list_head *list);
+void putback_active_hugepage(struct page *page);
 
 extern unsigned long hugepages_treat_as_movable;
 extern const unsigned long hugetlb_zero, hugetlb_infinity;
@@ -104,6 +108,11 @@ unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
 #else /* !CONFIG_HUGETLB_PAGE */
 
 static inline int PageHuge(struct page *page)
+{
+	return 0;
+}
+
+static inline bool page_huge_active(struct page *page)
 {
 	return 0;
 }
@@ -142,6 +151,8 @@ static inline int dequeue_hwpoisoned_huge_page(struct page *page)
 	return 0;
 }
 
+#define isolate_huge_page(p, l) false
+#define putback_active_hugepage(p)	do {} while (0)
 static inline unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end, pgprot_t newprot)
 {

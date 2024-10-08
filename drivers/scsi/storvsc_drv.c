@@ -1099,7 +1099,8 @@ static void storvsc_command_completion(struct storvsc_cmd_request *cmd_request)
 	if (scmnd->result) {
 		if (scsi_normalize_sense(scmnd->sense_buffer,
 				SCSI_SENSE_BUFFERSIZE, &sense_hdr))
-			scsi_print_sense_hdr("storvsc", &sense_hdr);
+			scsi_print_sense_hdr(scmnd->device, "storvsc",
+					     &sense_hdr);
 	}
 
 	if (vm_srb->srb_status != SRB_STATUS_SUCCESS)
@@ -1385,6 +1386,19 @@ static int storvsc_device_configure(struct scsi_device *sdevice)
 
 	sdevice->no_write_same = 1;
 
+	/*
+	 * If the host is WIN8 or WIN8 R2, claim conformance to SPC-3
+	 * if the device is a MSFT virtual device.
+	 */
+	if (!strncmp(sdevice->vendor, "Msft", 4)) {
+		switch (vmbus_proto_version) {
+		case VERSION_WIN8:
+		case VERSION_WIN8_1:
+			sdevice->scsi_level = SCSI_SPC_3;
+			break;
+		}
+	}
+
 	return 0;
 }
 
@@ -1499,7 +1513,8 @@ static int storvsc_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmnd)
 	int ret;
 	struct hv_host_device *host_dev = shost_priv(host);
 	struct hv_device *dev = host_dev->dev;
-	struct storvsc_cmd_request *cmd_request = scsi_cmd_priv(scmnd);
+	struct storvsc_cmd_request *cmd_request =
+		(struct storvsc_cmd_request *)(scmnd + 1);
 	int i;
 	struct scatterlist *sgl;
 	unsigned int sg_count = 0;

@@ -2365,7 +2365,7 @@ int aac_scsi_cmd(struct scsi_cmnd * scsicmd)
 			  (fsa_dev_ptr[cid].sense_data.sense_key ==
 			   NOT_READY)) {
 				switch (scsicmd->cmnd[0]) {
-				case SERVICE_ACTION_IN:
+				case SERVICE_ACTION_IN_16:
 					if (!(dev->raw_io_interface) ||
 					    !(dev->raw_io_64) ||
 					    ((scsicmd->cmnd[1] & 0x1f) != SAI_READ_CAPACITY_16))
@@ -2503,7 +2503,7 @@ int aac_scsi_cmd(struct scsi_cmnd * scsicmd)
 		scsi_sg_copy_from_buffer(scsicmd, &inq_data, sizeof(inq_data));
 		return aac_get_container_name(scsicmd);
 	}
-	case SERVICE_ACTION_IN:
+	case SERVICE_ACTION_IN_16:
 		if (!(dev->raw_io_interface) ||
 		    !(dev->raw_io_64) ||
 		    ((scsicmd->cmnd[1] & 0x1f) != SAI_READ_CAPACITY_16))

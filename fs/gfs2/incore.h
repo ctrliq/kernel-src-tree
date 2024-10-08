@@ -292,8 +292,10 @@ struct gfs2_blkreserv {
  * to the allocation code.
  */
 struct gfs2_alloc_parms {
-	u32 target;
+	u64 target;
+	u32 min_target;
 	u32 aflags;
+	u64 allowed;
 };
 
 enum {
@@ -413,6 +415,7 @@ enum {
 	QDF_CHANGE		= 1,
 	QDF_LOCKED		= 2,
 	QDF_REFRESH		= 3,
+	QDF_QMSG_QUIET          = 4,
 };
 
 struct gfs2_quota_data {

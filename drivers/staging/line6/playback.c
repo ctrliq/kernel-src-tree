@@ -38,8 +38,7 @@ static void change_volume(struct urb *urb_out, int volume[],
 		buf_end = p + urb_out->transfer_buffer_length / sizeof(*p);
 
 		for (; p < buf_end; ++p) {
-			int val = (*p * volume[chn & 1]) >> 8;
-			*p = clamp(val, 0x7fff, -0x8000);
+			*p = (*p * volume[chn & 1]) >> 8;
 			++chn;
 		}
 	} else if (bytes_per_frame == 6) {
@@ -51,7 +50,6 @@ static void change_volume(struct urb *urb_out, int volume[],
 			int val;
 			val = p[0] + (p[1] << 8) + ((signed char)p[2] << 16);
 			val = (val * volume[chn & 1]) >> 8;
-			val = clamp(val, 0x7fffff, -0x800000);
 			p[0] = val;
 			p[1] = val >> 8;
 			p[2] = val >> 16;
@@ -122,10 +120,8 @@ static void add_monitor_signal(struct urb *urb_out, unsigned char *signal,
 		po = (short *)urb_out->transfer_buffer;
 		buf_end = po + urb_out->transfer_buffer_length / sizeof(*po);
 
-		for (; po < buf_end; ++pi, ++po) {
-			int val = *po + ((*pi * volume) >> 8);
-			*po = clamp(val, 0x7fff, -0x8000);
-		}
+		for (; po < buf_end; ++pi, ++po)
+			*po += (*pi * volume) >> 8;
 	}
 
 	/*
@@ -451,6 +447,18 @@ static int snd_line6_playback_hw_params(struct snd_pcm_substream *substream,
 	int ret;
 	struct snd_line6_pcm *line6pcm = snd_pcm_substream_chip(substream);
 
+	/* -- Florian Demski [FD] */
+	/* don't ask me why, but this fixes the bug on my machine */
+	if (line6pcm == NULL) {
+		if (substream->pcm == NULL)
+			return -ENOMEM;
+		if (substream->pcm->private_data == NULL)
+			return -ENOMEM;
+		substream->private_data = substream->pcm->private_data;
+		line6pcm = snd_pcm_substream_chip(substream);
+	}
+	/* -- [FD] end */
+
 	ret = line6_pcm_acquire(line6pcm, LINE6_BIT_PCM_ALSA_PLAYBACK_BUFFER);
 
 	if (ret < 0)
@@ -482,7 +490,9 @@ int snd_line6_playback_trigger(struct snd_line6_pcm *line6pcm, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+#ifdef CONFIG_PM
 	case SNDRV_PCM_TRIGGER_RESUME:
+#endif
 		err = line6_pcm_acquire(line6pcm,
 					LINE6_BIT_PCM_ALSA_PLAYBACK_STREAM);
 
@@ -492,7 +502,9 @@ int snd_line6_playback_trigger(struct snd_line6_pcm *line6pcm, int cmd)
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
+#ifdef CONFIG_PM
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+#endif
 		err = line6_pcm_release(line6pcm,
 					LINE6_BIT_PCM_ALSA_PLAYBACK_STREAM);
 

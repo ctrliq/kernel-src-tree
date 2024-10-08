@@ -240,7 +240,8 @@ static int nfs_callback_start_svc(int minorversion, struct rpc_xprt *xprt,
 	sprintf(svc_name, "nfsv4.%u-svc", minorversion);
 	cb_info->serv = serv;
 	cb_info->rqst = rqstp;
-	cb_info->task = kthread_run(callback_svc, cb_info->rqst, svc_name);
+	cb_info->task = kthread_create(callback_svc, cb_info->rqst,
+				    "nfsv4.%u-svc", minorversion);
 	if (IS_ERR(cb_info->task)) {
 		ret = PTR_ERR(cb_info->task);
 		svc_exit_thread(cb_info->rqst);
@@ -249,6 +250,7 @@ static int nfs_callback_start_svc(int minorversion, struct rpc_xprt *xprt,
 		return ret;
 	}
 	rqstp->rq_task = cb_info->task;
+	wake_up_process(cb_info->task);
 	dprintk("nfs_callback_up: service started\n");
 	return 0;
 }

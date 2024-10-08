@@ -729,6 +729,7 @@ static struct rfcomm_session *rfcomm_session_create(bdaddr_t *src,
 	addr.l2_family = AF_BLUETOOTH;
 	addr.l2_psm    = 0;
 	addr.l2_cid    = 0;
+	addr.l2_bdaddr_type = BDADDR_BREDR;
 	*err = kernel_bind(sock, (struct sockaddr *) &addr, sizeof(addr));
 	if (*err < 0)
 		goto failed;
@@ -1977,12 +1978,11 @@ static void rfcomm_process_sessions(void)
 			continue;
 		}
 
-		if (s->state == BT_LISTEN) {
+		switch (s->state) {
+		case BT_LISTEN:
 			rfcomm_accept_connection(s);
 			continue;
-		}
 
-		switch (s->state) {
 		case BT_BOUND:
 			s = rfcomm_check_connection(s);
 			break;
@@ -2019,6 +2019,7 @@ static int rfcomm_add_listener(bdaddr_t *ba)
 	addr.l2_family = AF_BLUETOOTH;
 	addr.l2_psm    = __constant_cpu_to_le16(RFCOMM_PSM);
 	addr.l2_cid    = 0;
+	addr.l2_bdaddr_type = BDADDR_BREDR;
 	err = kernel_bind(sock, (struct sockaddr *) &addr, sizeof(addr));
 	if (err < 0) {
 		BT_ERR("Bind failed %d", err);

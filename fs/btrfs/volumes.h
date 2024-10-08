@@ -268,8 +268,9 @@ struct btrfs_fs_devices {
  */
 typedef void (btrfs_io_bio_end_io_t) (struct btrfs_io_bio *bio, int err);
 struct btrfs_io_bio {
-	unsigned long mirror_num;
-	unsigned long stripe_index;
+	unsigned int mirror_num;
+	unsigned int stripe_index;
+	u64 logical;
 	u8 *csum;
 	u8 csum_inline[BTRFS_BIO_INLINE_CSUM_SIZE];
 	u8 *csum_allocated;
@@ -291,8 +292,6 @@ struct btrfs_bio_stripe {
 struct btrfs_bio;
 typedef void (btrfs_bio_end_io_t) (struct btrfs_bio *bio, int err);
 
-#define BTRFS_BIO_ORIG_BIO_SUBMITTED	0x1
-
 struct btrfs_bio {
 	atomic_t stripes_pending;
 	struct btrfs_fs_info *fs_info;
@@ -304,6 +303,8 @@ struct btrfs_bio {
 	int max_errors;
 	int num_stripes;
 	int mirror_num;
+	int num_tgtdevs;
+	int *tgtdev_map;
 	struct btrfs_bio_stripe stripes[];
 };
 
@@ -386,12 +387,18 @@ struct btrfs_balance_control {
 int btrfs_account_dev_extents_size(struct btrfs_device *device, u64 start,
 				   u64 end, u64 *length);
 
-#define btrfs_bio_size(n) (sizeof(struct btrfs_bio) + \
-			    (sizeof(struct btrfs_bio_stripe) * (n)))
+#define btrfs_bio_size(total_stripes, real_stripes)		\
+	(sizeof(struct btrfs_bio) +				\
+	 (sizeof(struct btrfs_bio_stripe) * (total_stripes)) +	\
+	 (sizeof(int) * (real_stripes)))
 
 int btrfs_map_block(struct btrfs_fs_info *fs_info, int rw,
 		    u64 logical, u64 *length,
 		    struct btrfs_bio **bbio_ret, int mirror_num);
+int btrfs_map_sblock(struct btrfs_fs_info *fs_info, int rw,
+		     u64 logical, u64 *length,
+		     struct btrfs_bio **bbio_ret, int mirror_num,
+		     u64 **raid_map_ret);
 int btrfs_rmap_block(struct btrfs_mapping_tree *map_tree,
 		     u64 chunk_start, u64 physical, u64 devid,
 		     u64 **logical, int *naddrs, int *stripe_len);

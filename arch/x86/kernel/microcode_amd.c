@@ -246,7 +246,8 @@ static int install_equiv_cpu_table(const u8 *buf)
 		return -EINVAL;
 	}
 
-	equiv_cpu_table = vmalloc(size);
+	/* RHEL7: switch to kmalloc */
+	equiv_cpu_table = kmalloc(size, GFP_ATOMIC);
 	if (!equiv_cpu_table) {
 		pr_err("failed to allocate equivalent CPU table\n");
 		return -ENOMEM;
@@ -260,7 +261,8 @@ static int install_equiv_cpu_table(const u8 *buf)
 
 static void free_equiv_cpu_table(void)
 {
-	vfree(equiv_cpu_table);
+	/* RHEL7: switch to kmalloc */
+	kfree(equiv_cpu_table);
 	equiv_cpu_table = NULL;
 }
 
@@ -313,13 +315,15 @@ static int verify_and_add_patch(u8 family, u8 *fw, unsigned int leftover)
 		return crnt_size;
 	}
 
-	patch = kzalloc(sizeof(*patch), GFP_KERNEL);
+	/* RHEL7: switch to GFP_ATOMIC */
+	patch = kzalloc(sizeof(*patch), GFP_ATOMIC);
 	if (!patch) {
 		pr_err("Patch allocation failure.\n");
 		return -EINVAL;
 	}
 
-	patch->data = kzalloc(patch_size, GFP_KERNEL);
+	/* RHEL7: switch to GFP_ATOMIC */
+	patch->data = kzalloc(patch_size, GFP_ATOMIC);
 	if (!patch->data) {
 		pr_err("Patch data allocation failure.\n");
 		kfree(patch);

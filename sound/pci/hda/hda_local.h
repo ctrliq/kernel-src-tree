@@ -127,18 +127,16 @@ int snd_hda_mixer_amp_switch_put_beep(struct snd_kcontrol *kcontrol,
 				      struct snd_ctl_elem_value *ucontrol);
 #endif
 /* lowlevel accessor with caching; use carefully */
-int snd_hda_codec_amp_read(struct hda_codec *codec, hda_nid_t nid, int ch,
-			   int direction, int index);
-int snd_hda_codec_amp_update(struct hda_codec *codec, hda_nid_t nid, int ch,
-			     int direction, int idx, int mask, int val);
+#define snd_hda_codec_amp_read(codec, nid, ch, dir, idx) \
+	snd_hdac_regmap_get_amp(&(codec)->core, nid, ch, dir, idx)
+int snd_hda_codec_amp_update(struct hda_codec *codec, hda_nid_t nid,
+			     int ch, int dir, int idx, int mask, int val);
 int snd_hda_codec_amp_stereo(struct hda_codec *codec, hda_nid_t nid,
 			     int dir, int idx, int mask, int val);
 int snd_hda_codec_amp_init(struct hda_codec *codec, hda_nid_t nid, int ch,
 			   int direction, int idx, int mask, int val);
 int snd_hda_codec_amp_init_stereo(struct hda_codec *codec, hda_nid_t nid,
 				  int dir, int idx, int mask, int val);
-void snd_hda_codec_resume_amp(struct hda_codec *codec);
-
 void snd_hda_set_vmaster_tlv(struct hda_codec *codec, hda_nid_t nid, int dir,
 			     unsigned int *tlv);
 struct snd_kcontrol *snd_hda_find_mixer_ctl(struct hda_codec *codec,
@@ -150,6 +148,7 @@ int __snd_hda_add_vmaster(struct hda_codec *codec, char *name,
 #define snd_hda_add_vmaster(codec, name, tlv, slaves, suffix) \
 	__snd_hda_add_vmaster(codec, name, tlv, slaves, suffix, true, NULL)
 int snd_hda_codec_reset(struct hda_codec *codec);
+void snd_hda_codec_register(struct hda_codec *codec);
 void snd_hda_codec_cleanup_for_unbind(struct hda_codec *codec);
 
 enum {
@@ -331,7 +330,7 @@ int snd_hda_multi_out_analog_cleanup(struct hda_codec *codec,
 /*
  * generic proc interface
  */
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 int snd_hda_codec_proc_new(struct hda_codec *codec);
 #else
 static inline int snd_hda_codec_proc_new(struct hda_codec *codec) { return 0; }
@@ -515,15 +514,18 @@ int snd_hda_codec_get_pin_target(struct hda_codec *codec, hda_nid_t nid);
 int snd_hda_codec_set_pin_target(struct hda_codec *codec, hda_nid_t nid,
 				 unsigned int val);
 
+#define for_each_hda_codec_node(nid, codec) \
+	for ((nid) = (codec)->core.start_nid; (nid) < (codec)->core.end_nid; (nid)++)
+
 /*
  * get widget capabilities
  */
 static inline u32 get_wcaps(struct hda_codec *codec, hda_nid_t nid)
 {
-	if (nid < codec->start_nid ||
-	    nid >= codec->start_nid + codec->num_nodes)
+	if (nid < codec->core.start_nid ||
+	    nid >= codec->core.start_nid + codec->core.num_nodes)
 		return 0;
-	return codec->wcaps[nid - codec->start_nid];
+	return codec->wcaps[nid - codec->core.start_nid];
 }
 
 /* get the widget type from widget capability bits */
@@ -547,17 +549,49 @@ static inline unsigned int get_wcaps_channels(u32 wcaps)
 static inline void snd_hda_override_wcaps(struct hda_codec *codec,
 					  hda_nid_t nid, u32 val)
 {
-	if (nid >= codec->start_nid &&
-	    nid < codec->start_nid + codec->num_nodes)
-		codec->wcaps[nid - codec->start_nid] = val;
+	if (nid >= codec->core.start_nid &&
+	    nid < codec->core.start_nid + codec->core.num_nodes)
+		codec->wcaps[nid - codec->core.start_nid] = val;
 }
 
 u32 query_amp_caps(struct hda_codec *codec, hda_nid_t nid, int direction);
 int snd_hda_override_amp_caps(struct hda_codec *codec, hda_nid_t nid, int dir,
 			      unsigned int caps);
-u32 snd_hda_query_pin_caps(struct hda_codec *codec, hda_nid_t nid);
-int snd_hda_override_pin_caps(struct hda_codec *codec, hda_nid_t nid,
-			      unsigned int caps);
+/**
+ * snd_hda_query_pin_caps - Query PIN capabilities
+ * @codec: the HD-auio codec
+ * @nid: the NID to query
+ *
+ * Query PIN capabilities for the given widget.
+ * Returns the obtained capability bits.
+ *
+ * When cap bits have been already read, this doesn't read again but
+ * returns the cached value.
+ */
+static inline u32
+snd_hda_query_pin_caps(struct hda_codec *codec, hda_nid_t nid)
+{
+	return snd_hda_param_read(codec, nid, AC_PAR_PIN_CAP);
+
+}
+
+/**
+ * snd_hda_override_pin_caps - Override the pin capabilities
+ * @codec: the CODEC
+ * @nid: the NID to override
+ * @caps: the capability bits to set
+ *
+ * Override the cached PIN capabilitiy bits value by the given one.
+ *
+ * Returns zero if successful or a negative error code.
+ */
+static inline int
+snd_hda_override_pin_caps(struct hda_codec *codec, hda_nid_t nid,
+			  unsigned int caps)
+{
+	return snd_hdac_override_parm(&codec->core, nid, AC_PAR_PIN_CAP, caps);
+}
+
 bool snd_hda_check_amp_caps(struct hda_codec *codec, hda_nid_t nid,
 			   int dir, unsigned int bits);
 
@@ -743,7 +777,7 @@ int snd_hdmi_get_eld_ati(struct hda_codec *codec, hda_nid_t nid,
 			 unsigned char *buf, int *eld_size,
 			 bool rev3_or_later);
 
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 void snd_hdmi_print_eld_info(struct hdmi_eld *eld,
 			     struct snd_info_buffer *buffer);
 void snd_hdmi_write_eld_info(struct hdmi_eld *eld,

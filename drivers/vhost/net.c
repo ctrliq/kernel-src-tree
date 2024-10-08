@@ -372,7 +372,7 @@ static void handle_tx(struct vhost_net *net)
 			      % UIO_MAXIOV == nvq->done_idx))
 			break;
 
-		head = vhost_get_vq_desc(&net->dev, vq, vq->iov,
+		head = vhost_get_vq_desc(vq, vq->iov,
 					 ARRAY_SIZE(vq->iov),
 					 &out, &in,
 					 NULL, NULL);
@@ -408,7 +408,7 @@ static void handle_tx(struct vhost_net *net)
 
 		/* use msg_control to pass vhost zerocopy ubuf info to skb */
 		if (zcopy_used) {
-			vq->heads[nvq->upend_idx].id = head;
+			vq->heads[nvq->upend_idx].id = cpu_to_vhost32(vq, head);
 			if (!vhost_net_tx_select_zcopy(net) ||
 			    len < VHOST_GOODCOPY_LEN) {
 				/* copy don't need to wait for DMA done */
@@ -474,7 +474,7 @@ static int peek_head_len(struct sock *sk)
 	head = skb_peek(&sk->sk_receive_queue);
 	if (likely(head)) {
 		len = head->len;
-		if (vlan_tx_tag_present(head))
+		if (skb_vlan_tag_present(head))
 			len += VLAN_HLEN;
 	}
 
@@ -505,13 +505,17 @@ static int get_rx_bufs(struct vhost_virtqueue *vq,
 	int headcount = 0;
 	unsigned d;
 	int r, nlogs = 0;
+	/* len is always initialized before use since we are always called with
+	 * datalen > 0.
+	 */
+	u32 uninitialized_var(len);
 
 	while (datalen > 0 && headcount < quota) {
 		if (unlikely(seg >= UIO_MAXIOV)) {
 			r = -ENOBUFS;
 			goto err;
 		}
-		r = vhost_get_vq_desc(vq->dev, vq, vq->iov + seg,
+		r = vhost_get_vq_desc(vq, vq->iov + seg,
 				      ARRAY_SIZE(vq->iov) - seg, &out,
 				      &in, log, log_num);
 		if (unlikely(r < 0))
@@ -532,13 +536,14 @@ static int get_rx_bufs(struct vhost_virtqueue *vq,
 			nlogs += *log_num;
 			log += *log_num;
 		}
-		heads[headcount].id = d;
-		heads[headcount].len = iov_length(vq->iov + seg, in);
-		datalen -= heads[headcount].len;
+		heads[headcount].id = cpu_to_vhost32(vq, d);
+		len = iov_length(vq->iov + seg, in);
+		heads[headcount].len = cpu_to_vhost32(vq, len);
+		datalen -= len;
 		++headcount;
 		seg += in;
 	}
-	heads[headcount - 1].len += datalen;
+	heads[headcount - 1].len = cpu_to_vhost32(vq, len + datalen);
 	*iovcount = seg;
 	if (unlikely(log))
 		*log_num = nlogs;

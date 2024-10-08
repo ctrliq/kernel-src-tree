@@ -17,6 +17,7 @@ typedef struct {
 #endif
 	RH_KABI_EXTEND(unsigned int timer_irqs_event)
 	RH_KABI_EXTEND(unsigned int timer_irqs_others)
+	RH_KABI_EXTEND(unsigned int hmi_exceptions)
 } ____cacheline_aligned irq_cpustat_t;
 
 DECLARE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);

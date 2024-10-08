@@ -299,7 +299,8 @@ static void ttm_pool_update_free_locked(struct ttm_page_pool *pool,
  * @free_all: If set to true will free all pages in pool
  * @use_static: Safe to use static buffer
  **/
-static int ttm_page_pool_free(struct ttm_page_pool *pool, unsigned nr_free, bool use_static)
+static int ttm_page_pool_free(struct ttm_page_pool *pool, unsigned nr_free,
+			      bool use_static)
 {
 	static struct page *static_buf[NUM_PAGES_TO_ALLOC];
 	unsigned long irq_flags;
@@ -315,7 +316,7 @@ static int ttm_page_pool_free(struct ttm_page_pool *pool, unsigned nr_free, bool
 		pages_to_free = static_buf;
 	else
 		pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
-				GFP_KERNEL);
+					GFP_KERNEL);
 	if (!pages_to_free) {
 		pr_err("Failed to allocate memory for pool free operation\n");
 		return 0;
@@ -383,22 +384,15 @@ out:
 	return nr_free;
 }
 
-/* Get good estimation how many pages are free in pools */
-static int ttm_pool_get_num_unused_pages(void)
-{
-	unsigned i;
-	int total = 0;
-	for (i = 0; i < NUM_POOLS; ++i)
-		total += _manager->pools[i].npages;
-
-	return total;
-}
-
 /**
  * Callback for mm to request pool to reduce number of page held.
+ *
+ * XXX: (dchinner) Deadlock warning!
+ *
+ * This code is crying out for a shrinker per pool....
  */
-static int ttm_pool_mm_shrink(struct shrinker *shrink,
-			      struct shrink_control *sc)
+static unsigned long
+ttm_pool_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 {
 	static DEFINE_MUTEX(lock);
 	static unsigned start_pool;
@@ -406,9 +400,10 @@ static int ttm_pool_mm_shrink(struct shrinker *shrink,
 	unsigned pool_offset;
 	struct ttm_page_pool *pool;
 	int shrink_pages = sc->nr_to_scan;
+	unsigned long freed = 0;
 
 	if (!mutex_trylock(&lock))
-		return 0;
+		return SHRINK_STOP;
 	pool_offset = ++start_pool % NUM_POOLS;
 	/* select start pool in round robin fashion */
 	for (i = 0; i < NUM_POOLS; ++i) {
@@ -416,16 +411,31 @@ static int ttm_pool_mm_shrink(struct shrinker *shrink,
 		if (shrink_pages == 0)
 			break;
 		pool = &_manager->pools[(i + pool_offset)%NUM_POOLS];
+		/* OK to use static buffer since global mutex is held. */
 		shrink_pages = ttm_page_pool_free(pool, nr_free, true);
+		freed += nr_free - shrink_pages;
 	}
 	mutex_unlock(&lock);
-	/* return estimated number of unused pages in pool */
-	return ttm_pool_get_num_unused_pages();
+	return freed;
+}
+
+
+static unsigned long
+ttm_pool_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
+{
+	unsigned i;
+	unsigned long count = 0;
+
+	for (i = 0; i < NUM_POOLS; ++i)
+		count += _manager->pools[i].npages;
+
+	return count;
 }
 
 static void ttm_pool_mm_shrink_init(struct ttm_pool_manager *manager)
 {
-	manager->mm_shrink.shrink = &ttm_pool_mm_shrink;
+	manager->mm_shrink.count_objects = ttm_pool_shrink_count;
+	manager->mm_shrink.scan_objects = ttm_pool_shrink_scan;
 	manager->mm_shrink.seeks = 1;
 	register_shrinker(&manager->mm_shrink);
 }
@@ -788,7 +798,7 @@ static int ttm_get_pages(struct page **pages, unsigned npages, int flags,
 	return 0;
 }
 
-static void ttm_page_pool_init_locked(struct ttm_page_pool *pool, int flags,
+static void ttm_page_pool_init_locked(struct ttm_page_pool *pool, gfp_t flags,
 		char *name)
 {
 	spin_lock_init(&pool->lock);

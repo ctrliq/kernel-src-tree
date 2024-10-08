@@ -29,6 +29,8 @@
 #include <asm/kexec.h>
 #include <asm/ppc-opcode.h>
 
+#include <misc/cxl.h>
+
 #ifdef DEBUG_LOW
 #define DBG_LOW(fmt...) udbg_printf(fmt)
 #else
@@ -149,8 +151,10 @@ static inline void __tlbiel(unsigned long vpn, int psize, int apsize, int ssize)
 static inline void tlbie(unsigned long vpn, int psize, int apsize,
 			 int ssize, int local)
 {
-	unsigned int use_local = local && mmu_has_feature(MMU_FTR_TLBIEL);
+	unsigned int use_local;
 	int lock_tlbie = !mmu_has_feature(MMU_FTR_LOCKLESS_TLBIE);
+
+	use_local = local && mmu_has_feature(MMU_FTR_TLBIEL) && !cxl_ctx_in_use();
 
 	if (use_local)
 		use_local = mmu_psize_defs[psize].tlbiel;
@@ -279,11 +283,11 @@ static long native_hpte_remove(unsigned long hpte_group)
 
 static long native_hpte_updatepp(unsigned long slot, unsigned long newpp,
 				 unsigned long vpn, int bpsize,
-				 int apsize, int ssize, int local)
+				 int apsize, int ssize, unsigned long flags)
 {
 	struct hash_pte *hptep = htab_address + slot;
 	unsigned long hpte_v, want_v;
-	int ret = 0;
+	int ret = 0, local = 0;
 
 	want_v = hpte_encode_avpn(vpn, bpsize, ssize);
 
@@ -311,8 +315,13 @@ static long native_hpte_updatepp(unsigned long slot, unsigned long newpp,
 	}
 	native_unlock_hpte(hptep);
 
-	/* Ensure it is out of the tlb too. */
-	tlbie(vpn, bpsize, apsize, ssize, local);
+	if (flags & HPTE_LOCAL_UPDATE)
+		local = 1;
+       	/*
+	 * Ensure it is out of the tlb too if it is not a nohpte fault
+	 */
+	if (!(flags & HPTE_NOHPTE_UPDATE))
+		tlbie(vpn, bpsize, apsize, ssize, local);
 
 	return ret;
 }
@@ -417,7 +426,7 @@ static void native_hugepage_invalidate(unsigned long vsid,
 				       unsigned char *hpte_slot_array,
 				       int psize, int ssize)
 {
-	int i, lock_tlbie;
+	int i;
 	struct hash_pte *hptep;
 	int actual_psize = MMU_PAGE_16M;
 	unsigned int max_hpte_count, valid;
@@ -456,22 +465,13 @@ static void native_hugepage_invalidate(unsigned long vsid,
 		else
 			/* Invalidate the hpte. NOTE: this also unlocks it */
 			hptep->v = 0;
+		/*
+		 * We need to do tlb invalidate for all the address, tlbie
+		 * instruction compares entry_VA in tlb with the VA specified
+		 * here
+		 */
+		tlbie(vpn, psize, actual_psize, ssize, 0);
 	}
-	/*
-	 * Since this is a hugepage, we just need a single tlbie.
-	 * use the last vpn.
-	 */
-	lock_tlbie = !mmu_has_feature(MMU_FTR_LOCKLESS_TLBIE);
-	if (lock_tlbie)
-		raw_spin_lock(&native_tlbie_lock);
-
-	asm volatile("ptesync":::"memory");
-	__tlbie(vpn, psize, actual_psize, ssize);
-	asm volatile("eieio; tlbsync; ptesync":::"memory");
-
-	if (lock_tlbie)
-		raw_spin_unlock(&native_tlbie_lock);
-
 	local_irq_restore(flags);
 }
 

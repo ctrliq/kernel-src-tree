@@ -134,14 +134,23 @@ static void intel_pmu_lbr_filter(struct cpu_hw_events *cpuc);
 
 static void __intel_pmu_lbr_enable(void)
 {
-	u64 debugctl;
 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
+	u64 debugctl, lbr_select = 0;
 
-	if (cpuc->lbr_sel)
-		wrmsrl(MSR_LBR_SELECT, cpuc->lbr_sel->config);
+	if (cpuc->lbr_sel) {
+		lbr_select = cpuc->lbr_sel->config;
+		wrmsrl(MSR_LBR_SELECT, lbr_select);
+	}
 
 	rdmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
-	debugctl |= (DEBUGCTLMSR_LBR | DEBUGCTLMSR_FREEZE_LBRS_ON_PMI);
+	debugctl |= DEBUGCTLMSR_LBR;
+	/*
+	 * LBR callstack does not work well with FREEZE_LBRS_ON_PMI.
+	 * If FREEZE_LBRS_ON_PMI is set, PMI near call/return instructions
+	 * may cause superfluous increase/decrease of LBR_TOS.
+	 */
+	if (!(lbr_select & LBR_CALL_STACK))
+		debugctl |= DEBUGCTLMSR_FREEZE_LBRS_ON_PMI;
 	wrmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
 }
 
@@ -183,9 +192,116 @@ void intel_pmu_lbr_reset(void)
 		intel_pmu_lbr_reset_64();
 }
 
+/*
+ * TOS = most recently recorded branch
+ */
+static inline u64 intel_pmu_lbr_tos(void)
+{
+	u64 tos;
+
+	rdmsrl(x86_pmu.lbr_tos, tos);
+	return tos;
+}
+
+enum {
+	LBR_NONE,
+	LBR_VALID,
+};
+
+static void __intel_pmu_lbr_restore(struct x86_perf_task_context *task_ctx)
+{
+	int i;
+	unsigned lbr_idx, mask;
+	u64 tos;
+
+	if (task_ctx->lbr_callstack_users == 0 ||
+	    task_ctx->lbr_stack_state == LBR_NONE) {
+		intel_pmu_lbr_reset();
+		return;
+	}
+
+	mask = x86_pmu.lbr_nr - 1;
+	tos = intel_pmu_lbr_tos();
+	for (i = 0; i < x86_pmu.lbr_nr; i++) {
+		lbr_idx = (tos - i) & mask;
+		wrmsrl(x86_pmu.lbr_from + lbr_idx, task_ctx->lbr_from[i]);
+		wrmsrl(x86_pmu.lbr_to + lbr_idx, task_ctx->lbr_to[i]);
+	}
+	task_ctx->lbr_stack_state = LBR_NONE;
+}
+
+static void __intel_pmu_lbr_save(struct x86_perf_task_context *task_ctx)
+{
+	int i;
+	unsigned lbr_idx, mask;
+	u64 tos;
+
+	if (task_ctx->lbr_callstack_users == 0) {
+		task_ctx->lbr_stack_state = LBR_NONE;
+		return;
+	}
+
+	mask = x86_pmu.lbr_nr - 1;
+	tos = intel_pmu_lbr_tos();
+	for (i = 0; i < x86_pmu.lbr_nr; i++) {
+		lbr_idx = (tos - i) & mask;
+		rdmsrl(x86_pmu.lbr_from + lbr_idx, task_ctx->lbr_from[i]);
+		rdmsrl(x86_pmu.lbr_to + lbr_idx, task_ctx->lbr_to[i]);
+	}
+	task_ctx->lbr_stack_state = LBR_VALID;
+}
+
+void intel_pmu_lbr_sched_task(struct perf_event_context *ctx, bool sched_in)
+{
+	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+	struct x86_perf_task_context *task_ctx;
+
+	if (!x86_pmu.lbr_nr)
+		return;
+
+	/*
+	 * If LBR callstack feature is enabled and the stack was saved when
+	 * the task was scheduled out, restore the stack. Otherwise flush
+	 * the LBR stack.
+	 */
+	task_ctx = ctx ? ctx->task_ctx_data : NULL;
+	if (task_ctx) {
+		if (sched_in) {
+			__intel_pmu_lbr_restore(task_ctx);
+			cpuc->lbr_context = ctx;
+		} else {
+			__intel_pmu_lbr_save(task_ctx);
+		}
+		return;
+	}
+
+	/*
+	 * When sampling the branck stack in system-wide, it may be
+	 * necessary to flush the stack on context switch. This happens
+	 * when the branch stack does not tag its entries with the pid
+	 * of the current task. Otherwise it becomes impossible to
+	 * associate a branch entry with a task. This ambiguity is more
+	 * likely to appear when the branch stack supports priv level
+	 * filtering and the user sets it to monitor only at the user
+	 * level (which could be a useful measurement in system-wide
+	 * mode). In that case, the risk is high of having a branch
+	 * stack with branch from multiple tasks.
+ 	 */
+	if (sched_in) {
+		intel_pmu_lbr_reset();
+		cpuc->lbr_context = ctx;
+	}
+}
+
+static inline bool branch_user_callstack(unsigned br_sel)
+{
+	return (br_sel & X86_BR_USER) && (br_sel & X86_BR_CALL_STACK);
+}
+
 void intel_pmu_lbr_enable(struct perf_event *event)
 {
 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
+	struct x86_perf_task_context *task_ctx;
 
 	if (!x86_pmu.lbr_nr)
 		return;
@@ -200,18 +316,33 @@ void intel_pmu_lbr_enable(struct perf_event *event)
 	}
 	cpuc->br_sel = event->hw.branch_reg.reg;
 
+	if (branch_user_callstack(cpuc->br_sel) && event->ctx &&
+					event->ctx->task_ctx_data) {
+		task_ctx = event->ctx->task_ctx_data;
+		task_ctx->lbr_callstack_users++;
+	}
+
 	cpuc->lbr_users++;
+	perf_sched_cb_inc(event->ctx->pmu);
 }
 
 void intel_pmu_lbr_disable(struct perf_event *event)
 {
 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
+	struct x86_perf_task_context *task_ctx;
 
 	if (!x86_pmu.lbr_nr)
 		return;
 
+	if (branch_user_callstack(cpuc->br_sel) && event->ctx &&
+					event->ctx->task_ctx_data) {
+		task_ctx = event->ctx->task_ctx_data;
+		task_ctx->lbr_callstack_users--;
+	}
+
 	cpuc->lbr_users--;
 	WARN_ON_ONCE(cpuc->lbr_users < 0);
+	perf_sched_cb_dec(event->ctx->pmu);
 
 	if (cpuc->enabled && !cpuc->lbr_users) {
 		__intel_pmu_lbr_disable();
@@ -234,18 +365,6 @@ void intel_pmu_lbr_disable_all(void)
 
 	if (cpuc->lbr_users)
 		__intel_pmu_lbr_disable();
-}
-
-/*
- * TOS = most recently recorded branch
- */
-static inline u64 intel_pmu_lbr_tos(void)
-{
-	u64 tos;
-
-	rdmsrl(x86_pmu.lbr_tos, tos);
-
-	return tos;
 }
 
 static void intel_pmu_lbr_read_32(struct cpu_hw_events *cpuc)
@@ -418,7 +537,7 @@ static int intel_pmu_setup_hw_lbr_filter(struct perf_event *event)
 	u64 mask = 0, v;
 	int i;
 
-	for (i = 0; i < PERF_SAMPLE_BRANCH_SELECT_MAP_SIZE; i++) {
+	for (i = 0; i < PERF_SAMPLE_BRANCH_MAX_SHIFT; i++) {
 		if (!(br_type & (1ULL << i)))
 			continue;
 
@@ -689,7 +808,7 @@ intel_pmu_lbr_filter(struct cpu_hw_events *cpuc)
 /*
  * Map interface branch filters onto LBR filters
  */
-static const int nhm_lbr_sel_map[PERF_SAMPLE_BRANCH_SELECT_MAP_SIZE] = {
+static const int nhm_lbr_sel_map[PERF_SAMPLE_BRANCH_MAX_SHIFT] = {
 	[PERF_SAMPLE_BRANCH_ANY_SHIFT]		= LBR_ANY,
 	[PERF_SAMPLE_BRANCH_USER_SHIFT]		= LBR_USER,
 	[PERF_SAMPLE_BRANCH_KERNEL_SHIFT]	= LBR_KERNEL,
@@ -708,7 +827,7 @@ static const int nhm_lbr_sel_map[PERF_SAMPLE_BRANCH_SELECT_MAP_SIZE] = {
 	[PERF_SAMPLE_BRANCH_COND_SHIFT]     = LBR_JCC,
 };
 
-static const int snb_lbr_sel_map[PERF_SAMPLE_BRANCH_SELECT_MAP_SIZE] = {
+static const int snb_lbr_sel_map[PERF_SAMPLE_BRANCH_MAX_SHIFT] = {
 	[PERF_SAMPLE_BRANCH_ANY_SHIFT]		= LBR_ANY,
 	[PERF_SAMPLE_BRANCH_USER_SHIFT]		= LBR_USER,
 	[PERF_SAMPLE_BRANCH_KERNEL_SHIFT]	= LBR_KERNEL,
@@ -720,7 +839,7 @@ static const int snb_lbr_sel_map[PERF_SAMPLE_BRANCH_SELECT_MAP_SIZE] = {
 	[PERF_SAMPLE_BRANCH_COND_SHIFT]		= LBR_JCC,
 };
 
-static const int hsw_lbr_sel_map[PERF_SAMPLE_BRANCH_SELECT_MAP_SIZE] = {
+static const int hsw_lbr_sel_map[PERF_SAMPLE_BRANCH_MAX_SHIFT] = {
 	[PERF_SAMPLE_BRANCH_ANY_SHIFT]		= LBR_ANY,
 	[PERF_SAMPLE_BRANCH_USER_SHIFT]		= LBR_USER,
 	[PERF_SAMPLE_BRANCH_KERNEL_SHIFT]	= LBR_KERNEL,

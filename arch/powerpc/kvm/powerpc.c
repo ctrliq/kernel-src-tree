@@ -310,12 +310,87 @@ int kvmppc_emulate_mmio(struct kvm_run *run, struct kvm_vcpu *vcpu)
 }
 EXPORT_SYMBOL_GPL(kvmppc_emulate_mmio);
 
-int kvm_arch_hardware_enable(void *garbage)
+int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+	      bool data)
+{
+	ulong mp_pa = vcpu->arch.magic_page_pa & KVM_PAM & PAGE_MASK;
+	struct kvmppc_pte pte;
+	int r;
+
+	vcpu->stat.st++;
+
+	r = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
+			 XLATE_WRITE, &pte);
+	if (r < 0)
+		return r;
+
+	*eaddr = pte.raddr;
+
+	if (!pte.may_write)
+		return -EPERM;
+
+	/* Magic page override */
+	if (kvmppc_supports_magic_page(vcpu) && mp_pa &&
+	    ((pte.raddr & KVM_PAM & PAGE_MASK) == mp_pa) &&
+	    !(kvmppc_get_msr(vcpu) & MSR_PR)) {
+		void *magic = vcpu->arch.shared;
+		magic += pte.eaddr & 0xfff;
+		memcpy(magic, ptr, size);
+		return EMULATE_DONE;
+	}
+
+	if (kvm_write_guest(vcpu->kvm, pte.raddr, ptr, size))
+		return EMULATE_DO_MMIO;
+
+	return EMULATE_DONE;
+}
+EXPORT_SYMBOL_GPL(kvmppc_st);
+
+int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+		      bool data)
+{
+	ulong mp_pa = vcpu->arch.magic_page_pa & KVM_PAM & PAGE_MASK;
+	struct kvmppc_pte pte;
+	int rc;
+
+	vcpu->stat.ld++;
+
+	rc = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
+			  XLATE_READ, &pte);
+	if (rc)
+		return rc;
+
+	*eaddr = pte.raddr;
+
+	if (!pte.may_read)
+		return -EPERM;
+
+	if (!data && !pte.may_execute)
+		return -ENOEXEC;
+
+	/* Magic page override */
+	if (kvmppc_supports_magic_page(vcpu) && mp_pa &&
+	    ((pte.raddr & KVM_PAM & PAGE_MASK) == mp_pa) &&
+	    !(kvmppc_get_msr(vcpu) & MSR_PR)) {
+		void *magic = vcpu->arch.shared;
+		magic += pte.eaddr & 0xfff;
+		memcpy(ptr, magic, size);
+		return EMULATE_DONE;
+	}
+
+	if (kvm_read_guest(vcpu->kvm, pte.raddr, ptr, size))
+		return EMULATE_DO_MMIO;
+
+	return EMULATE_DONE;
+}
+EXPORT_SYMBOL_GPL(kvmppc_ld);
+
+int kvm_arch_hardware_enable(void)
 {
 	return 0;
 }
 
-void kvm_arch_hardware_disable(void *garbage)
+void kvm_arch_hardware_disable(void)
 {
 }
 
@@ -534,24 +609,25 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 	return kvmppc_core_create_memslot(kvm, slot, npages);
 }
 
-void kvm_arch_memslots_updated(struct kvm *kvm)
+void kvm_arch_memslots_updated(struct kvm *kvm, struct kvm_memslots *slots)
 {
 }
 
 int kvm_arch_prepare_memory_region(struct kvm *kvm,
 				   struct kvm_memory_slot *memslot,
-				   struct kvm_userspace_memory_region *mem,
+				   const struct kvm_userspace_memory_region *mem,
 				   enum kvm_mr_change change)
 {
 	return kvmppc_core_prepare_memory_region(kvm, memslot, mem);
 }
 
 void kvm_arch_commit_memory_region(struct kvm *kvm,
-				   struct kvm_userspace_memory_region *mem,
+				   const struct kvm_userspace_memory_region *mem,
 				   const struct kvm_memory_slot *old,
+				   const struct kvm_memory_slot *new,
 				   enum kvm_mr_change change)
 {
-	kvmppc_core_commit_memory_region(kvm, mem, old);
+	kvmppc_core_commit_memory_region(kvm, mem, old, new);
 }
 
 void kvm_arch_flush_shadow_all(struct kvm *kvm)

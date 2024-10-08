@@ -346,7 +346,7 @@ static int nfs4_delay(struct rpc_clnt *clnt, long *timeout)
 /* This is the error handling routine for processes that are allowed
  * to sleep.
  */
-static int nfs4_handle_exception(struct nfs_server *server, int errorcode, struct nfs4_exception *exception)
+int nfs4_handle_exception(struct nfs_server *server, int errorcode, struct nfs4_exception *exception)
 {
 	struct nfs_client *clp = server->nfs_client;
 	struct nfs4_state *state = exception->state;
@@ -891,7 +891,6 @@ static int nfs4_call_sync_sequence(struct rpc_clnt *clnt,
 	return ret;
 }
 
-static
 int nfs4_call_sync(struct rpc_clnt *clnt,
 		   struct nfs_server *server,
 		   struct rpc_message *msg,
@@ -7861,54 +7860,6 @@ int nfs4_proc_layoutreturn(struct nfs4_layoutreturn *lrp, bool sync)
 	return status;
 }
 
-/*
- * Retrieve the list of Data Server devices from the MDS.
- */
-static int _nfs4_getdevicelist(struct nfs_server *server,
-				    const struct nfs_fh *fh,
-				    struct pnfs_devicelist *devlist)
-{
-	struct nfs4_getdevicelist_args args = {
-		.fh = fh,
-		.layoutclass = server->pnfs_curr_ld->id,
-	};
-	struct nfs4_getdevicelist_res res = {
-		.devlist = devlist,
-	};
-	struct rpc_message msg = {
-		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_GETDEVICELIST],
-		.rpc_argp = &args,
-		.rpc_resp = &res,
-	};
-	int status;
-
-	dprintk("--> %s\n", __func__);
-	status = nfs4_call_sync(server->client, server, &msg, &args.seq_args,
-				&res.seq_res, 0);
-	dprintk("<-- %s status=%d\n", __func__, status);
-	return status;
-}
-
-int nfs4_proc_getdevicelist(struct nfs_server *server,
-			    const struct nfs_fh *fh,
-			    struct pnfs_devicelist *devlist)
-{
-	struct nfs4_exception exception = { };
-	int err;
-
-	do {
-		err = nfs4_handle_exception(server,
-				_nfs4_getdevicelist(server, fh, devlist),
-				&exception);
-	} while (exception.retry);
-
-	dprintk("%s: err=%d, num_devs=%u\n", __func__,
-		err, devlist->num_devs);
-
-	return err;
-}
-EXPORT_SYMBOL_GPL(nfs4_proc_getdevicelist);
-
 static int
 _nfs4_proc_getdeviceinfo(struct nfs_server *server,
 		struct pnfs_device *pdev,
@@ -8510,7 +8461,10 @@ static const struct nfs4_minor_version_ops nfs_v4_2_minor_ops = {
 		| NFS_CAP_CHANGE_ATTR
 		| NFS_CAP_POSIX_LOCK
 		| NFS_CAP_STATEID_NFSV41
-		| NFS_CAP_ATOMIC_OPEN_V1,
+		| NFS_CAP_ATOMIC_OPEN_V1
+		| NFS_CAP_ALLOCATE
+		| NFS_CAP_DEALLOCATE
+		| NFS_CAP_SEEK,
 	.init_client = nfs41_init_client,
 	.shutdown_client = nfs41_shutdown_client,
 	.match_stateid = nfs41_match_stateid,

@@ -20,11 +20,11 @@
 
 struct lockref {
 	union {
-#ifdef CONFIG_PPC64
+#if defined(CONFIG_PPC64) || defined(CONFIG_S390)
 #ifdef CONFIG_CMPXCHG_LOCKREF
 		RH_KABI_EXTEND(aligned_u64 lock_count)
 #endif
-#else /* CONFIG_PPC64 */
+#else /* CONFIG_PPC64 || CONFIG_S390 */
 #ifdef CONFIG_CMPXCHG_LOCKREF
 		aligned_u64 lock_count;
 #endif

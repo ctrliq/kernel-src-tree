@@ -17,11 +17,11 @@
  */
 #include "xfs.h"
 #include "xfs_fs.h"
+#include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
 #include "xfs_bit.h"
 #include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_trans.h"
 #include "xfs_buf_item.h"
@@ -492,10 +492,10 @@ xfs_buf_item_unpin(
 		xfs_buf_lock(bp);
 		xfs_buf_hold(bp);
 		bp->b_flags |= XBF_ASYNC;
-		xfs_buf_ioerror(bp, EIO);
+		xfs_buf_ioerror(bp, -EIO);
 		XFS_BUF_UNDONE(bp);
 		xfs_buf_stale(bp);
-		xfs_buf_ioend(bp, 0);
+		xfs_buf_ioend(bp);
 	}
 }
 
@@ -729,7 +729,7 @@ xfs_buf_item_get_format(
 	bip->bli_formats = kmem_zalloc(count * sizeof(struct xfs_buf_log_format),
 				KM_SLEEP);
 	if (!bip->bli_formats)
-		return ENOMEM;
+		return -ENOMEM;
 	return 0;
 }
 
@@ -1085,7 +1085,7 @@ xfs_buf_iodone_callbacks(
 	 * a way to shut the filesystem down if the writes keep failing.
 	 *
 	 * In practice we'll shut the filesystem down soon as non-transient
-	 * erorrs tend to affect the whole device and a failing log write
+	 * errors tend to affect the whole device and a failing log write
 	 * will make us give up.  But we really ought to do better here.
 	 */
 	if (XFS_BUF_ISASYNC(bp)) {
@@ -1098,7 +1098,7 @@ xfs_buf_iodone_callbacks(
 		if (!(bp->b_flags & (XBF_STALE|XBF_WRITE_FAIL))) {
 			bp->b_flags |= XBF_WRITE | XBF_ASYNC |
 				       XBF_DONE | XBF_WRITE_FAIL;
-			xfs_buf_iorequest(bp);
+			xfs_buf_submit(bp);
 		} else {
 			xfs_buf_relse(bp);
 		}
@@ -1119,7 +1119,7 @@ do_callbacks:
 	xfs_buf_do_callbacks(bp);
 	bp->b_fspriv = NULL;
 	bp->b_iodone = NULL;
-	xfs_buf_ioend(bp, 0);
+	xfs_buf_ioend(bp);
 }
 
 /*

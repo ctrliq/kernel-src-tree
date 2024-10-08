@@ -69,7 +69,7 @@ void lg_double_lock(struct lglock *lg, int cpu1, int cpu2)
 		swap(cpu1, cpu2);
 
 	preempt_disable();
-	lock_acquire_shared(&lg->lock_dep_map, 0, 0, NULL, _RET_IP_);
+	rwlock_acquire_read(&lg->lock_dep_map, 0, 0, _RET_IP_);
 	arch_spin_lock(per_cpu_ptr(lg->lock, cpu1));
 	arch_spin_lock(per_cpu_ptr(lg->lock, cpu2));
 }

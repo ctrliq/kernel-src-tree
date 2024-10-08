@@ -845,11 +845,6 @@ static int ixgbe_alloc_q_vector(struct ixgbe_adapter *adapter,
 		       ixgbe_poll, 64);
 	napi_hash_add(&q_vector->napi);
 
-#ifdef CONFIG_NET_RX_BUSY_POLL
-	/* initialize busy poll */
-	atomic_set(&q_vector->state, IXGBE_QV_STATE_DISABLE);
-
-#endif
 	/* tie q_vector and adapter together */
 	adapter->q_vector[v_idx] = q_vector;
 	q_vector->adapter = adapter;
@@ -1126,13 +1121,11 @@ static void ixgbe_set_interrupt_capability(struct ixgbe_adapter *adapter)
 	adapter->num_q_vectors = 1;
 
 	err = pci_enable_msi(adapter->pdev);
-	if (err) {
-		netif_printk(adapter, hw, KERN_DEBUG, adapter->netdev,
-			     "Unable to allocate MSI interrupt, "
-			     "falling back to legacy.  Error: %d\n", err);
-		return;
-	}
-	adapter->flags |= IXGBE_FLAG_MSI_ENABLED;
+	if (err)
+		e_dev_warn("Failed to allocate MSI interrupt, falling back to legacy. Error: %d\n",
+			   err);
+	else
+		adapter->flags |= IXGBE_FLAG_MSI_ENABLED;
 }
 
 /**

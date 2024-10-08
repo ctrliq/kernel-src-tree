@@ -647,7 +647,7 @@ static bool efx_check_tx_flush_complete(struct efx_nic *efx)
 }
 
 /* Flush all the transmit queues, and continue flushing receive queues until
- * they're all flushed. Wait for the DRAIN events to be recieved so that there
+ * they're all flushed. Wait for the DRAIN events to be received so that there
  * are no more RX and TX events left on any channel. */
 static int efx_farch_do_flush(struct efx_nic *efx)
 {
@@ -1110,7 +1110,7 @@ efx_farch_handle_tx_flush_done(struct efx_nic *efx, efx_qword_t *event)
 }
 
 /* If this flush done event corresponds to a &struct efx_rx_queue: If the flush
- * was succesful then send an %EFX_CHANNEL_MAGIC_RX_DRAIN, otherwise add
+ * was successful then send an %EFX_CHANNEL_MAGIC_RX_DRAIN, otherwise add
  * the RX queue back to the mask of RX queues in need of flushing.
  */
 static void
@@ -1200,13 +1200,17 @@ efx_farch_handle_driver_event(struct efx_channel *channel, efx_qword_t *event)
 		netif_vdbg(efx, hw, efx->net_dev, "channel %d TXQ %d flushed\n",
 			   channel->channel, ev_sub_data);
 		efx_farch_handle_tx_flush_done(efx, event);
+#ifdef CONFIG_SFC_SRIOV
 		efx_siena_sriov_tx_flush_done(efx, event);
+#endif
 		break;
 	case FSE_AZ_RX_DESCQ_FLS_DONE_EV:
 		netif_vdbg(efx, hw, efx->net_dev, "channel %d RXQ %d flushed\n",
 			   channel->channel, ev_sub_data);
 		efx_farch_handle_rx_flush_done(efx, event);
+#ifdef CONFIG_SFC_SRIOV
 		efx_siena_sriov_rx_flush_done(efx, event);
+#endif
 		break;
 	case FSE_AZ_EVQ_INIT_DONE_EV:
 		netif_dbg(efx, hw, efx->net_dev,
@@ -1244,8 +1248,11 @@ efx_farch_handle_driver_event(struct efx_channel *channel, efx_qword_t *event)
 				  " RX Q %d is disabled.\n", ev_sub_data,
 				  ev_sub_data);
 			efx_schedule_reset(efx, RESET_TYPE_DMA_ERROR);
-		} else
+		}
+#ifdef CONFIG_SFC_SRIOV
+		else
 			efx_siena_sriov_desc_fetch_err(efx, ev_sub_data);
+#endif
 		break;
 	case FSE_BZ_TX_DSC_ERROR_EV:
 		if (ev_sub_data < EFX_VI_BASE) {
@@ -1254,8 +1261,11 @@ efx_farch_handle_driver_event(struct efx_channel *channel, efx_qword_t *event)
 				  " TX Q %d is disabled.\n", ev_sub_data,
 				  ev_sub_data);
 			efx_schedule_reset(efx, RESET_TYPE_DMA_ERROR);
-		} else
+		}
+#ifdef CONFIG_SFC_SRIOV
+		else
 			efx_siena_sriov_desc_fetch_err(efx, ev_sub_data);
+#endif
 		break;
 	default:
 		netif_vdbg(efx, hw, efx->net_dev,
@@ -1319,9 +1329,11 @@ int efx_farch_ev_process(struct efx_channel *channel, int budget)
 		case FSE_AZ_EV_CODE_DRIVER_EV:
 			efx_farch_handle_driver_event(channel, &event);
 			break;
+#ifdef CONFIG_SFC_SRIOV
 		case FSE_CZ_EV_CODE_USER_EV:
 			efx_siena_sriov_event(channel, &event);
 			break;
+#endif
 		case FSE_CZ_EV_CODE_MCDI_EV:
 			efx_mcdi_process_event(channel, &event);
 			break;

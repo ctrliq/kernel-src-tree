@@ -58,22 +58,28 @@ struct report {
 	const char		*symbol_filter_str;
 	float			min_percent;
 	u64			nr_entries;
+	u64			queue_size;
 	DECLARE_BITMAP(cpu_bitmap, MAX_NR_CPUS);
 };
 
 static int report__config(const char *var, const char *value, void *cb)
 {
+	struct report *rep = cb;
+
 	if (!strcmp(var, "report.group")) {
 		symbol_conf.event_group = perf_config_bool(var, value);
 		return 0;
 	}
 	if (!strcmp(var, "report.percent-limit")) {
-		struct report *rep = cb;
 		rep->min_percent = strtof(value, NULL);
 		return 0;
 	}
 	if (!strcmp(var, "report.children")) {
 		symbol_conf.cumulate_callchain = perf_config_bool(var, value);
+		return 0;
+	}
+	if (!strcmp(var, "report.queue-size")) {
+		rep->queue_size = perf_config_u64(var, value);
 		return 0;
 	}
 
@@ -476,7 +482,7 @@ static int __cmd_report(struct report *rep)
 	if (ret)
 		return ret;
 
-	ret = perf_session__process_events(session, &rep->tool);
+	ret = perf_session__process_events(session);
 	if (ret)
 		return ret;
 
@@ -645,8 +651,8 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
 		   "regex filter to identify parent, see: '--sort parent'"),
 	OPT_BOOLEAN('x', "exclude-other", &symbol_conf.exclude_other,
 		    "Only display entries with parent-match"),
-	OPT_CALLBACK_DEFAULT('g', "call-graph", &report, "output_type,min_percent[,print_limit],call_order",
-		     "Display callchains using output_type (graph, flat, fractal, or none) , min percent threshold, optional print limit, callchain order, key (function or address). "
+	OPT_CALLBACK_DEFAULT('g', "call-graph", &report, "output_type,min_percent[,print_limit],call_order[,branch]",
+		     "Display callchains using output_type (graph, flat, fractal, or none) , min percent threshold, optional print limit, callchain order, key (function or address), add branches. "
 		     "Default: fractal,0.5,callee,function", &report_parse_callchain_opt, callchain_default_opt),
 	OPT_BOOLEAN(0, "children", &symbol_conf.cumulate_callchain,
 		    "Accumulate callchains of children and show total overhead as well"),
@@ -749,6 +755,11 @@ repeat:
 	session = perf_session__new(&file, false, &report.tool);
 	if (session == NULL)
 		return -1;
+
+	if (report.queue_size) {
+		ordered_events__set_alloc_size(&session->ordered_events,
+					       report.queue_size);
+	}
 
 	report.session = session;
 

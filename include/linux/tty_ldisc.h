@@ -194,16 +194,19 @@ struct tty_ldisc_ops {
 			       char *fp, int count);
 	void	(*write_wakeup)(struct tty_struct *);
 	void	(*dcd_change)(struct tty_struct *, unsigned int);
-	void	(*fasync)(struct tty_struct *tty, int on);
 
 	struct  module *owner;
 
 	int refcount;
+
+	RH_KABI_EXTEND(void (*fasync)(struct tty_struct *tty, int on))
 };
 
 struct tty_ldisc {
 	struct tty_ldisc_ops *ops;
-	struct tty_struct *tty;
+	atomic_t users;			/* unused */
+	wait_queue_head_t wq_idle;	/* unused */
+	RH_KABI_EXTEND(struct tty_struct *tty)
 };
 
 #define TTY_LDISC_MAGIC	0x5403

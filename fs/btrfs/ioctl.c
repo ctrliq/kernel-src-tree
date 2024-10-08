@@ -534,7 +534,7 @@ static noinline int create_subvol(struct inode *dir,
 
 	key.objectid = objectid;
 	key.offset = 0;
-	btrfs_set_key_type(&key, BTRFS_ROOT_ITEM_KEY);
+	key.type = BTRFS_ROOT_ITEM_KEY;
 	ret = btrfs_insert_root(trans, root->fs_info->tree_root, &key,
 				&root_item);
 	if (ret)
@@ -614,7 +614,7 @@ fail:
 	return ret;
 }
 
-static void btrfs_wait_nocow_write(struct btrfs_root *root)
+static void btrfs_wait_for_no_snapshoting_writes(struct btrfs_root *root)
 {
 	s64 writers;
 	DEFINE_WAIT(wait);
@@ -646,7 +646,7 @@ static int create_snapshot(struct btrfs_root *root, struct inode *dir,
 
 	atomic_inc(&root->will_be_snapshoted);
 	smp_mb__after_atomic_inc();
-	btrfs_wait_nocow_write(root);
+	btrfs_wait_for_no_snapshoting_writes(root);
 
 	ret = btrfs_start_delalloc_inodes(root, 0);
 	if (ret)
@@ -729,7 +729,8 @@ fail:
 free:
 	kfree(pending_snapshot);
 out:
-	atomic_dec(&root->will_be_snapshoted);
+	if (atomic_dec_and_test(&root->will_be_snapshoted))
+		wake_up_atomic_t(&root->will_be_snapshoted);
 	return ret;
 }
 
@@ -1317,8 +1318,7 @@ int btrfs_defrag_file(struct inode *inode, struct file *file,
 		inode->i_mapping->writeback_index = i;
 
 	while (i <= last_index && defrag_count < max_to_defrag &&
-	       (i < (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
-		PAGE_CACHE_SHIFT)) {
+	       (i < DIV_ROUND_UP(i_size_read(inode), PAGE_CACHE_SIZE))) {
 		/*
 		 * make sure we stop running if someone unmounts
 		 * the FS
@@ -1341,7 +1341,7 @@ int btrfs_defrag_file(struct inode *inode, struct file *file,
 			 * the should_defrag function tells us how much to skip
 			 * bump our counter by the suggested amount
 			 */
-			next = (skip + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+			next = DIV_ROUND_UP(skip, PAGE_CACHE_SIZE);
 			i = max(i + 1, next);
 			continue;
 		}
@@ -3150,7 +3150,7 @@ static void clone_update_extent_map(struct inode *inode,
 					em->start + em->len - 1, 0);
 	}
 
-	if (unlikely(ret))
+	if (ret)
 		set_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
 			&BTRFS_I(inode)->runtime_flags);
 }
@@ -3238,11 +3238,11 @@ process_slot:
 		slot = path->slots[0];
 
 		btrfs_item_key_to_cpu(leaf, &key, slot);
-		if (btrfs_key_type(&key) > BTRFS_EXTENT_DATA_KEY ||
+		if (key.type > BTRFS_EXTENT_DATA_KEY ||
 		    key.objectid != btrfs_ino(src))
 			break;
 
-		if (btrfs_key_type(&key) == BTRFS_EXTENT_DATA_KEY) {
+		if (key.type == BTRFS_EXTENT_DATA_KEY) {
 			struct btrfs_file_extent_item *extent;
 			int type;
 			u32 size;

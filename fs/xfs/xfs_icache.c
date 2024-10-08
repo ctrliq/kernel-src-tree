@@ -20,9 +20,7 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_inum.h"
 #include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_inode.h"
 #include "xfs_error.h"
@@ -162,7 +160,7 @@ xfs_iget_cache_hit(
 	if (ip->i_ino != ino) {
 		trace_xfs_iget_skip(ip);
 		XFS_STATS_INC(xs_ig_frecycle);
-		error = EAGAIN;
+		error = -EAGAIN;
 		goto out_error;
 	}
 
@@ -180,7 +178,7 @@ xfs_iget_cache_hit(
 	if (ip->i_flags & (XFS_INEW|XFS_IRECLAIM)) {
 		trace_xfs_iget_skip(ip);
 		XFS_STATS_INC(xs_ig_frecycle);
-		error = EAGAIN;
+		error = -EAGAIN;
 		goto out_error;
 	}
 
@@ -188,7 +186,7 @@ xfs_iget_cache_hit(
 	 * If lookup is racing with unlink return an error immediately.
 	 */
 	if (ip->i_d.di_mode == 0 && !(flags & XFS_IGET_CREATE)) {
-		error = ENOENT;
+		error = -ENOENT;
 		goto out_error;
 	}
 
@@ -210,7 +208,7 @@ xfs_iget_cache_hit(
 		spin_unlock(&ip->i_flags_lock);
 		rcu_read_unlock();
 
-		error = -inode_init_always(mp->m_super, inode);
+		error = inode_init_always(mp->m_super, inode);
 		if (error) {
 			/*
 			 * Re-initializing the inode failed, and we are in deep
@@ -247,7 +245,7 @@ xfs_iget_cache_hit(
 		/* If the VFS inode is being torn down, pause and try again. */
 		if (!igrab(inode)) {
 			trace_xfs_iget_skip(ip);
-			error = EAGAIN;
+			error = -EAGAIN;
 			goto out_error;
 		}
 
@@ -289,7 +287,7 @@ xfs_iget_cache_miss(
 
 	ip = xfs_inode_alloc(mp, ino);
 	if (!ip)
-		return ENOMEM;
+		return -ENOMEM;
 
 	error = xfs_iread(mp, tp, ip, flags);
 	if (error)
@@ -298,7 +296,7 @@ xfs_iget_cache_miss(
 	trace_xfs_iget_miss(ip);
 
 	if ((ip->i_d.di_mode == 0) && !(flags & XFS_IGET_CREATE)) {
-		error = ENOENT;
+		error = -ENOENT;
 		goto out_destroy;
 	}
 
@@ -309,7 +307,7 @@ xfs_iget_cache_miss(
 	 * recurse into the file system.
 	 */
 	if (radix_tree_preload(GFP_NOFS)) {
-		error = EAGAIN;
+		error = -EAGAIN;
 		goto out_destroy;
 	}
 
@@ -345,7 +343,7 @@ xfs_iget_cache_miss(
 	if (unlikely(error)) {
 		WARN_ON(error != -EEXIST);
 		XFS_STATS_INC(xs_ig_dup);
-		error = EAGAIN;
+		error = -EAGAIN;
 		goto out_preload_end;
 	}
 	spin_unlock(&pag->pag_ici_lock);
@@ -412,7 +410,7 @@ xfs_iget(
 
 	/* reject inode numbers outside existing AGs */
 	if (!ino || XFS_INO_TO_AGNO(mp, ino) >= mp->m_sb.sb_agcount)
-		return EINVAL;
+		return -EINVAL;
 
 	/* get the perag structure and ensure that it's inode capable */
 	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ino));
@@ -441,15 +439,15 @@ again:
 	*ipp = ip;
 
 	/*
-	 * If we have a real type for an on-disk inode, we can set ops(&unlock)
+	 * If we have a real type for an on-disk inode, we can setup the inode
 	 * now.	 If it's a new inode being created, xfs_ialloc will handle it.
 	 */
 	if (xfs_iflags_test(ip, XFS_INEW) && ip->i_d.di_mode != 0)
-		xfs_setup_inode(ip);
+		xfs_setup_existing_inode(ip);
 	return 0;
 
 out_error_or_again:
-	if (error == EAGAIN) {
+	if (error == -EAGAIN) {
 		delay(1);
 		goto again;
 	}
@@ -493,18 +491,18 @@ xfs_inode_ag_walk_grab(
 
 	/* nothing to sync during shutdown */
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
-		return EFSCORRUPTED;
+		return -EFSCORRUPTED;
 
 	/* If we can't grab the inode, it must on it's way to reclaim. */
 	if (!igrab(inode))
-		return ENOENT;
+		return -ENOENT;
 
 	/* inode is valid */
 	return 0;
 
 out_unlock_noent:
 	spin_unlock(&ip->i_flags_lock);
-	return ENOENT;
+	return -ENOENT;
 }
 
 STATIC int
@@ -587,16 +585,16 @@ restart:
 				continue;
 			error = execute(batch[i], flags, args);
 			IRELE(batch[i]);
-			if (error == EAGAIN) {
+			if (error == -EAGAIN) {
 				skipped++;
 				continue;
 			}
-			if (error && last_error != EFSCORRUPTED)
+			if (error && last_error != -EFSCORRUPTED)
 				last_error = error;
 		}
 
 		/* bail out if the filesystem is corrupted.  */
-		if (error == EFSCORRUPTED)
+		if (error == -EFSCORRUPTED)
 			break;
 
 		cond_resched();
@@ -656,11 +654,11 @@ xfs_inode_ag_iterator(
 		xfs_perag_put(pag);
 		if (error) {
 			last_error = error;
-			if (error == EFSCORRUPTED)
+			if (error == -EFSCORRUPTED)
 				break;
 		}
 	}
-	return XFS_ERROR(last_error);
+	return last_error;
 }
 
 int
@@ -684,11 +682,11 @@ xfs_inode_ag_iterator_tag(
 		xfs_perag_put(pag);
 		if (error) {
 			last_error = error;
-			if (error == EFSCORRUPTED)
+			if (error == -EFSCORRUPTED)
 				break;
 		}
 	}
-	return XFS_ERROR(last_error);
+	return last_error;
 }
 
 /*
@@ -948,7 +946,7 @@ restart:
 	 * see the stale flag set on the inode.
 	 */
 	error = xfs_iflush(ip, &bp);
-	if (error == EAGAIN) {
+	if (error == -EAGAIN) {
 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
 		/* backoff longer than in xfs_ifree_cluster */
 		delay(2);
@@ -1001,7 +999,7 @@ out:
 	xfs_iflags_clear(ip, XFS_IRECLAIM);
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 	/*
-	 * We could return EAGAIN here to make reclaim rescan the inode tree in
+	 * We could return -EAGAIN here to make reclaim rescan the inode tree in
 	 * a short while. However, this just burns CPU time scanning the tree
 	 * waiting for IO to complete and the reclaim work never goes back to
 	 * the idle state. Instead, return 0 to let the next scheduled
@@ -1104,7 +1102,7 @@ restart:
 				if (!batch[i])
 					continue;
 				error = xfs_reclaim_inode(batch[i], pag, flags);
-				if (error && last_error != EFSCORRUPTED)
+				if (error && last_error != -EFSCORRUPTED)
 					last_error = error;
 			}
 
@@ -1133,7 +1131,7 @@ restart:
 		trylock = 0;
 		goto restart;
 	}
-	return XFS_ERROR(last_error);
+	return last_error;
 }
 
 int
@@ -1284,7 +1282,7 @@ xfs_inode_free_eofblocks(
 	ret = xfs_free_eofblocks(ip->i_mount, ip, need_iolock);
 
 	/* don't revisit the inode if we're not waiting */
-	if (ret == EAGAIN && !(flags & SYNC_WAIT))
+	if (ret == -EAGAIN && !(flags & SYNC_WAIT))
 		ret = 0;
 
 	return ret;

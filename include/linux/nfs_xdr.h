@@ -252,17 +252,6 @@ struct nfs4_layoutget {
 	gfp_t gfp_flags;
 };
 
-struct nfs4_getdevicelist_args {
-	struct nfs4_sequence_args seq_args;
-	const struct nfs_fh *fh;
-	u32 layoutclass;
-};
-
-struct nfs4_getdevicelist_res {
-	struct nfs4_sequence_res seq_res;
-	struct pnfs_devicelist *devlist;
-};
-
 struct nfs4_getdeviceinfo_args {
 	struct nfs4_sequence_args seq_args;
 	struct pnfs_device *pdev;
@@ -1258,6 +1247,43 @@ nfs_free_pnfs_ds_cinfo(struct pnfs_ds_commit_info *cinfo)
 
 #endif /* CONFIG_NFS_V4_1 */
 
+#ifdef CONFIG_NFS_V4_2
+struct nfs42_falloc_args {
+	struct nfs4_sequence_args	seq_args;
+
+	struct nfs_fh			*falloc_fh;
+	nfs4_stateid			 falloc_stateid;
+	u64				 falloc_offset;
+	u64				 falloc_length;
+	const u32			*falloc_bitmask;
+};
+
+struct nfs42_falloc_res {
+	struct nfs4_sequence_res	seq_res;
+	unsigned int			status;
+
+	struct nfs_fattr		*falloc_fattr;
+	const struct nfs_server		*falloc_server;
+};
+
+struct nfs42_seek_args {
+	struct nfs4_sequence_args	seq_args;
+
+	struct nfs_fh			*sa_fh;
+	nfs4_stateid			sa_stateid;
+	u64				sa_offset;
+	u32				sa_what;
+};
+
+struct nfs42_seek_res {
+	struct nfs4_sequence_res	seq_res;
+	unsigned int			status;
+
+	u32	sr_eof;
+	u64	sr_offset;
+};
+#endif
+
 struct nfs_page;
 
 #define NFS_PAGEVEC_SIZE	(8U)
@@ -1309,6 +1335,7 @@ struct nfs_pgio_header {
 	struct nfs_page_array	page_array;
 	struct nfs_client	*ds_clp;	/* pNFS data server */
 	int			ds_commit_idx;	/* ds index if ds_clp is set */
+	int			pgio_mirror_idx;/* mirror index in pgio layer */
 };
 
 struct nfs_mds_commit_info {

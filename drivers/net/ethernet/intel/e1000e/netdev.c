@@ -945,7 +945,7 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 		if (*work_done >= work_to_do)
 			break;
 		(*work_done)++;
-		rmb();	/* read descriptor and rx_buffer_info after status DD */
+		dma_rmb();	/* read descriptor and rx_buffer_info after status DD */
 
 		skb = buffer_info->skb;
 		buffer_info->skb = NULL;
@@ -1232,7 +1232,7 @@ static bool e1000_clean_tx_irq(struct e1000_ring *tx_ring)
 	while ((eop_desc->upper.data & cpu_to_le32(E1000_TXD_STAT_DD)) &&
 	       (count < tx_ring->count)) {
 		bool cleaned = false;
-		rmb();		/* read buffer_info after eop_desc */
+		dma_rmb();		/* read buffer_info after eop_desc */
 		for (; !cleaned; count++) {
 			tx_desc = E1000_TX_DESC(*tx_ring, i);
 			buffer_info = &tx_ring->buffer_info[i];
@@ -1332,7 +1332,7 @@ static bool e1000_clean_rx_irq_ps(struct e1000_ring *rx_ring, int *work_done,
 			break;
 		(*work_done)++;
 		skb = buffer_info->skb;
-		rmb();	/* read descriptor and rx_buffer_info after status DD */
+		dma_rmb();	/* read descriptor and rx_buffer_info after status DD */
 
 		/* in the packet split case this is header only */
 		prefetch(skb->data - NET_IP_ALIGN);
@@ -1536,7 +1536,7 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 		if (*work_done >= work_to_do)
 			break;
 		(*work_done)++;
-		rmb();	/* read descriptor and rx_buffer_info after status DD */
+		dma_rmb();	/* read descriptor and rx_buffer_info after status DD */
 
 		skb = buffer_info->skb;
 		buffer_info->skb = NULL;
@@ -5604,8 +5604,8 @@ static int e1000_transfer_dhcp_info(struct e1000_adapter *adapter,
 	struct e1000_hw *hw = &adapter->hw;
 	u16 length, offset;
 
-	if (vlan_tx_tag_present(skb) &&
-	    !((vlan_tx_tag_get(skb) == adapter->hw.mng_cookie.vlan_id) &&
+	if (skb_vlan_tag_present(skb) &&
+	    !((skb_vlan_tag_get(skb) == adapter->hw.mng_cookie.vlan_id) &&
 	      (adapter->hw.mng_cookie.status &
 	       E1000_MNG_DHCP_COOKIE_STATUS_VLAN)))
 		return 0;
@@ -5695,12 +5695,8 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
 	/* The minimum packet size with TCTL.PSP set is 17 bytes so
 	 * pad skb in order to meet this minimum size requirement
 	 */
-	if (unlikely(skb->len < 17)) {
-		if (skb_pad(skb, 17 - skb->len))
-			return NETDEV_TX_OK;
-		skb->len = 17;
-		skb_set_tail_pointer(skb, 17);
-	}
+	if (skb_put_padto(skb, 17))
+		return NETDEV_TX_OK;
 
 	mss = skb_shinfo(skb)->gso_size;
 	if (mss) {
@@ -5748,9 +5744,9 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
 	if (e1000_maybe_stop_tx(tx_ring, count + 2))
 		return NETDEV_TX_BUSY;
 
-	if (vlan_tx_tag_present(skb)) {
+	if (skb_vlan_tag_present(skb)) {
 		tx_flags |= E1000_TX_FLAGS_VLAN;
-		tx_flags |= (vlan_tx_tag_get(skb) << E1000_TX_FLAGS_VLAN_SHIFT);
+		tx_flags |= (skb_vlan_tag_get(skb) << E1000_TX_FLAGS_VLAN_SHIFT);
 	}
 
 	first = tx_ring->next_to_use;
@@ -7304,7 +7300,7 @@ static const struct pci_error_handlers e1000_err_handler = {
 	.resume = e1000_io_resume,
 };
 
-static DEFINE_PCI_DEVICE_TABLE(e1000_pci_tbl) = {
+static const struct pci_device_id e1000_pci_tbl[] = {
 	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_82571EB_COPPER), board_82571 },
 	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_82571EB_FIBER), board_82571 },
 	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_82571EB_QUAD_COPPER), board_82571 },

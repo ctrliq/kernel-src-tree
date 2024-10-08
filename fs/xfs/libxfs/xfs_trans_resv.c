@@ -22,10 +22,9 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_da_format.h"
+#include "xfs_da_btree.h"
 #include "xfs_inode.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_ialloc.h"
@@ -253,6 +252,19 @@ xfs_calc_rename_reservation(
 }
 
 /*
+ * For removing an inode from unlinked list at first, we can modify:
+ *    the agi hash list and counters: sector size
+ *    the on disk inode before ours in the agi hash list: inode cluster size
+ */
+STATIC uint
+xfs_calc_iunlink_remove_reservation(
+	struct xfs_mount        *mp)
+{
+	return xfs_calc_buf_res(1, mp->m_sb.sb_sectsize) +
+	       max_t(uint, XFS_FSB_TO_B(mp,1), mp->m_inode_cluster_size);
+}
+
+/*
  * For creating a link to an inode:
  *    the parent directory inode: inode size
  *    the linked inode: inode size
@@ -269,6 +281,7 @@ xfs_calc_link_reservation(
 	struct xfs_mount	*mp)
 {
 	return XFS_DQUOT_LOGRES(mp) +
+		xfs_calc_iunlink_remove_reservation(mp) +
 		MAX((xfs_calc_inode_res(mp, 2) +
 		     xfs_calc_buf_res(XFS_DIROP_LOG_COUNT(mp),
 				      XFS_FSB_TO_B(mp, 1))),
@@ -464,9 +477,9 @@ xfs_calc_ifree_reservation(
 {
 	return XFS_DQUOT_LOGRES(mp) +
 		xfs_calc_inode_res(mp, 1) +
-		xfs_calc_buf_res(2, mp->m_sb.sb_sectsize) +
+		xfs_calc_buf_res(1, mp->m_sb.sb_sectsize) +
 		xfs_calc_buf_res(1, XFS_FSB_TO_B(mp, 1)) +
-		max_t(uint, XFS_FSB_TO_B(mp, 1), mp->m_inode_cluster_size) +
+		xfs_calc_iunlink_remove_reservation(mp) +
 		xfs_calc_buf_res(1, 0) +
 		xfs_calc_buf_res(2 + mp->m_ialloc_blks +
 				 mp->m_in_maxlevels, 0) +
@@ -595,7 +608,7 @@ xfs_calc_addafork_reservation(
 	return XFS_DQUOT_LOGRES(mp) +
 		xfs_calc_inode_res(mp, 1) +
 		xfs_calc_buf_res(2, mp->m_sb.sb_sectsize) +
-		xfs_calc_buf_res(1, mp->m_dirblksize) +
+		xfs_calc_buf_res(1, mp->m_dir_geo->blksize) +
 		xfs_calc_buf_res(XFS_DAENTER_BMAP1B(mp, XFS_DATA_FORK) + 1,
 				 XFS_FSB_TO_B(mp, 1)) +
 		xfs_calc_buf_res(XFS_ALLOCFREE_LOG_COUNT(mp, 1),
@@ -697,17 +710,6 @@ xfs_calc_attrrm_reservation(
  */
 STATIC uint
 xfs_calc_clear_agi_bucket_reservation(
-	struct xfs_mount	*mp)
-{
-	return xfs_calc_buf_res(1, mp->m_sb.sb_sectsize);
-}
-
-/*
- * Clearing the quotaflags in the superblock.
- *	the super block for changing quota flags: sector size
- */
-STATIC uint
-xfs_calc_qm_sbchange_reservation(
 	struct xfs_mount	*mp)
 {
 	return xfs_calc_buf_res(1, mp->m_sb.sb_sectsize);
@@ -851,9 +853,6 @@ xfs_trans_resv_calc(
 	 * The following transactions are logged in logical format with
 	 * a default log count.
 	 */
-	resp->tr_qm_sbchange.tr_logres = xfs_calc_qm_sbchange_reservation(mp);
-	resp->tr_qm_sbchange.tr_logcount = XFS_DEFAULT_LOG_COUNT;
-
 	resp->tr_qm_setqlim.tr_logres = xfs_calc_qm_setqlim_reservation(mp);
 	resp->tr_qm_setqlim.tr_logcount = XFS_DEFAULT_LOG_COUNT;
 

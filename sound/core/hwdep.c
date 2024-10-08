@@ -430,10 +430,9 @@ static int snd_hwdep_dev_register(struct snd_device *device)
 		return -EBUSY;
 	}
 	list_add_tail(&hwdep->list, &snd_hwdep_devices);
-	err = snd_register_device_for_dev(SNDRV_DEVICE_TYPE_HWDEP,
-					  hwdep->card, hwdep->device,
-					  &snd_hwdep_f_ops, hwdep,
-					  &hwdep->dev, NULL, NULL);
+	err = snd_register_device(SNDRV_DEVICE_TYPE_HWDEP,
+				  hwdep->card, hwdep->device,
+				  &snd_hwdep_f_ops, hwdep, &hwdep->dev);
 	if (err < 0) {
 		dev_err(&hwdep->dev, "unable to register\n");
 		list_del(&hwdep->list);
@@ -478,14 +477,14 @@ static int snd_hwdep_dev_disconnect(struct snd_device *device)
 	if (hwdep->ossreg)
 		snd_unregister_oss_device(hwdep->oss_type, hwdep->card, hwdep->device);
 #endif
-	snd_unregister_device(SNDRV_DEVICE_TYPE_HWDEP, hwdep->card, hwdep->device);
+	snd_unregister_device(&hwdep->dev);
 	list_del_init(&hwdep->list);
 	mutex_unlock(&hwdep->open_mutex);
 	mutex_unlock(&register_mutex);
 	return 0;
 }
 
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 /*
  *  Info interface
  */
@@ -522,10 +521,10 @@ static void __exit snd_hwdep_proc_done(void)
 {
 	snd_info_free_entry(snd_hwdep_proc_entry);
 }
-#else /* !CONFIG_PROC_FS */
+#else /* !CONFIG_SND_PROC_FS */
 #define snd_hwdep_proc_init()
 #define snd_hwdep_proc_done()
-#endif /* CONFIG_PROC_FS */
+#endif /* CONFIG_SND_PROC_FS */
 
 
 /*

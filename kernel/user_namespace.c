@@ -22,6 +22,7 @@
 #include <linux/ctype.h>
 #include <linux/projid.h>
 #include <linux/fs_struct.h>
+#include <linux/moduleparam.h>
 
 static struct kmem_cache *user_ns_cachep __read_mostly;
 static DEFINE_MUTEX(userns_state_mutex);
@@ -48,6 +49,11 @@ static void set_cred_user_ns(struct cred *cred, struct user_namespace *user_ns)
 	cred->user_ns = user_ns;
 }
 
+/* While user namespaces remain in tech preview disable them */
+static bool enable_user_ns_creation;
+module_param_named(enable, enable_user_ns_creation, bool, 0444);
+MODULE_PARM_DESC(enable, "Enable creation of new user namespaces");
+
 /*
  * Create a new user namespace, deriving the creator from the user in the
  * passed credentials, and replacing that user with the new root user for the
@@ -62,9 +68,16 @@ int create_user_ns(struct cred *new)
 	kuid_t owner = new->euid;
 	kgid_t group = new->egid;
 	int ret;
+	static int __read_mostly called_mark_tech_preview = 0;
 
-	/* Currently disabled in RHEL7 */
-	return -EINVAL;
+	if (!enable_user_ns_creation)
+		return -EINVAL;
+
+	if (!called_mark_tech_preview && !xchg(&called_mark_tech_preview, 1))
+		mark_tech_preview("user namespace", NULL);
+
+	if (parent_ns->level > 32)
+		return -EUSERS;
 
 	/*
 	 * Verify that we can not violate the policy of which files
@@ -96,8 +109,14 @@ int create_user_ns(struct cred *new)
 	atomic_set(&ns->count, 1);
 	/* Leave the new->user_ns reference with the new user namespace. */
 	ns->parent = parent_ns;
+	ns->level = parent_ns->level + 1;
 	ns->owner = owner;
 	ns->group = group;
+
+	/* Inherit USERNS_SETGROUPS_ALLOWED from our parent */
+	mutex_lock(&userns_state_mutex);
+	ns->flags = parent_ns->flags;
+	mutex_unlock(&userns_state_mutex);
 
 	set_cred_user_ns(new, ns);
 
@@ -820,11 +839,6 @@ static bool new_idmap_permitted(const struct file *file,
 			    gid_eq(gid, cred->egid))
 				return true;
 		}
-		else if (cap_setid == CAP_SETGID) {
-			kgid_t gid = make_kgid(ns->parent, id);
-			if (gid_eq(gid, file->f_cred->fsgid))
-				return true;
-		}
 	}
 
 	/* Allow anyone to set a mapping that doesn't require privilege */
@@ -842,6 +856,84 @@ static bool new_idmap_permitted(const struct file *file,
 	return false;
 }
 
+int proc_setgroups_show(struct seq_file *seq, void *v)
+{
+	struct user_namespace *ns = seq->private;
+	unsigned long userns_flags = ACCESS_ONCE(ns->flags);
+
+	seq_printf(seq, "%s\n",
+		   (userns_flags & USERNS_SETGROUPS_ALLOWED) ?
+		   "allow" : "deny");
+	return 0;
+}
+
+ssize_t proc_setgroups_write(struct file *file, const char __user *buf,
+			     size_t count, loff_t *ppos)
+{
+	struct seq_file *seq = file->private_data;
+	struct user_namespace *ns = seq->private;
+	char kbuf[8], *pos;
+	bool setgroups_allowed;
+	ssize_t ret;
+
+	/* Only allow a very narrow range of strings to be written */
+	ret = -EINVAL;
+	if ((*ppos != 0) || (count >= sizeof(kbuf)))
+		goto out;
+
+	/* What was written? */
+	ret = -EFAULT;
+	if (copy_from_user(kbuf, buf, count))
+		goto out;
+	kbuf[count] = '\0';
+	pos = kbuf;
+
+	/* What is being requested? */
+	ret = -EINVAL;
+	if (strncmp(pos, "allow", 5) == 0) {
+		pos += 5;
+		setgroups_allowed = true;
+	}
+	else if (strncmp(pos, "deny", 4) == 0) {
+		pos += 4;
+		setgroups_allowed = false;
+	}
+	else
+		goto out;
+
+	/* Verify there is not trailing junk on the line */
+	pos = skip_spaces(pos);
+	if (*pos != '\0')
+		goto out;
+
+	ret = -EPERM;
+	mutex_lock(&userns_state_mutex);
+	if (setgroups_allowed) {
+		/* Enabling setgroups after setgroups has been disabled
+		 * is not allowed.
+		 */
+		if (!(ns->flags & USERNS_SETGROUPS_ALLOWED))
+			goto out_unlock;
+	} else {
+		/* Permanently disabling setgroups after setgroups has
+		 * been enabled by writing the gid_map is not allowed.
+		 */
+		if (ns->gid_map.nr_extents != 0)
+			goto out_unlock;
+		ns->flags &= ~USERNS_SETGROUPS_ALLOWED;
+	}
+	mutex_unlock(&userns_state_mutex);
+
+	/* Report a successful write */
+	*ppos = count;
+	ret = count;
+out:
+	return ret;
+out_unlock:
+	mutex_unlock(&userns_state_mutex);
+	goto out;
+}
+
 bool userns_may_setgroups(const struct user_namespace *ns)
 {
 	bool allowed;
@@ -851,6 +943,8 @@ bool userns_may_setgroups(const struct user_namespace *ns)
 	 * the user namespace has been established.
 	 */
 	allowed = ns->gid_map.nr_extents != 0;
+	/* Is setgroups allowed? */
+	allowed = allowed && (ns->flags & USERNS_SETGROUPS_ALLOWED);
 	mutex_unlock(&userns_state_mutex);
 
 	return allowed;

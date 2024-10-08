@@ -36,7 +36,8 @@ int ocrdma_post_recv(struct ib_qp *, struct ib_recv_wr *,
 int ocrdma_poll_cq(struct ib_cq *, int num_entries, struct ib_wc *wc);
 int ocrdma_arm_cq(struct ib_cq *, enum ib_cq_notify_flags flags);
 
-int ocrdma_query_device(struct ib_device *, struct ib_device_attr *props);
+int ocrdma_query_device(struct ib_device *, struct ib_device_attr *props,
+			struct ib_udata *uhw);
 int ocrdma_query_port(struct ib_device *, u8 port, struct ib_port_attr *props);
 int ocrdma_modify_port(struct ib_device *, u8 port, int mask,
 		       struct ib_port_modify *props);
@@ -59,8 +60,10 @@ struct ib_pd *ocrdma_alloc_pd(struct ib_device *,
 			      struct ib_ucontext *, struct ib_udata *);
 int ocrdma_dealloc_pd(struct ib_pd *pd);
 
-struct ib_cq *ocrdma_create_cq(struct ib_device *, int entries, int vector,
-			       struct ib_ucontext *, struct ib_udata *);
+struct ib_cq *ocrdma_create_cq(struct ib_device *ibdev,
+			       const struct ib_cq_init_attr *attr,
+			       struct ib_ucontext *ib_ctx,
+			       struct ib_udata *udata);
 int ocrdma_resize_cq(struct ib_cq *, int cqe, struct ib_udata *);
 int ocrdma_destroy_cq(struct ib_cq *);
 

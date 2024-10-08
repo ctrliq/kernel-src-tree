@@ -432,8 +432,8 @@ static int bpf_jit_insn(struct bpf_jit *jit, struct sock_filter *filter,
 		EMIT4_DISP(0x88500000, K);
 		break;
 	case BPF_S_ALU_NEG: /* A = -A */
-		/* lnr %r5,%r5 */
-		EMIT2(0x1155);
+		/* lcr %r5,%r5 */
+		EMIT2(0x1355);
 		break;
 	case BPF_S_JMP_JA: /* ip += K */
 		offset = addrs[i + K] + jit->start - jit->prg;
@@ -700,10 +700,10 @@ call_fn:	/* lg %r1,<d(function)>(%r13) */
 		/* icm	%r5,3,<d(type)>(%r1) */
 		EMIT4_DISP(0xbf531000, offsetof(struct net_device, type));
 		break;
-	case BPF_S_ANC_RXHASH: /* A = skb->rxhash */
-		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, rxhash) != 4);
-		/* l %r5,<d(rxhash)>(%r2) */
-		EMIT4_DISP(0x58502000, offsetof(struct sk_buff, rxhash));
+	case BPF_S_ANC_RXHASH: /* A = skb->hash */
+		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, hash) != 4);
+		/* l %r5,<d(hash)>(%r2) */
+		EMIT4_DISP(0x58502000, offsetof(struct sk_buff, hash));
 		break;
 	case BPF_S_ANC_VLAN_TAG:
 	case BPF_S_ANC_VLAN_TAG_PRESENT:

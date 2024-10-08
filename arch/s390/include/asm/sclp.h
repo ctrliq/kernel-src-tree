@@ -27,7 +27,7 @@ struct sclp_ipl_info {
 };
 
 struct sclp_cpu_entry {
-	u8 address;
+	u8 core_id;
 	u8 reserved0[13];
 	u8 type;
 	u8 reserved1;
@@ -47,6 +47,9 @@ int sclp_cpu_deconfigure(u8 cpu);
 unsigned long long sclp_get_rnmax(void);
 unsigned long long sclp_get_rzm(void);
 unsigned int sclp_get_max_cpu(void);
+unsigned int sclp_get_mtid(u8 cpu_type);
+unsigned int sclp_get_mtid_max(void);
+unsigned int sclp_get_mtid_prev(void);
 int sclp_sdias_blk_count(void);
 int sclp_sdias_copy(void *dest, int blk_num, int nr_blks);
 int sclp_chp_configure(struct chp_id chpid);

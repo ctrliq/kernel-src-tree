@@ -702,11 +702,12 @@ static void virtio_ccw_reset(struct virtio_device *vdev)
 	kfree(ccw);
 }
 
-static u32 virtio_ccw_get_features(struct virtio_device *vdev)
+static u64 virtio_ccw_get_features(struct virtio_device *vdev)
 {
 	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
 	struct virtio_feature_desc *features;
-	int ret, rc;
+	int ret;
+	u64 rc;
 	struct ccw1 *ccw;
 
 	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
@@ -719,7 +720,6 @@ static u32 virtio_ccw_get_features(struct virtio_device *vdev)
 		goto out_free;
 	}
 	/* Read the feature bits from the host. */
-	/* TODO: Features > 32 bits */
 	features->index = 0;
 	ccw->cmd_code = CCW_CMD_READ_FEAT;
 	ccw->flags = 0;
@@ -733,18 +733,31 @@ static u32 virtio_ccw_get_features(struct virtio_device *vdev)
 
 	rc = le32_to_cpu(features->features);
 
+	if (vcdev->revision == 0)
+		goto out_free;
+
+	/* Read second half of the feature bits from the host. */
+	features->index = 1;
+	ccw->cmd_code = CCW_CMD_READ_FEAT;
+	ccw->flags = 0;
+	ccw->count = sizeof(*features);
+	ccw->cda = (__u32)(unsigned long)features;
+	ret = ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_READ_FEAT);
+	if (ret == 0)
+		rc |= (u64)le32_to_cpu(features->features) << 32;
+
 out_free:
 	kfree(features);
 	kfree(ccw);
 	return rc;
 }
 
-static void virtio_ccw_finalize_features(struct virtio_device *vdev)
+static int virtio_ccw_finalize_features(struct virtio_device *vdev)
 {
 	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
 	struct virtio_feature_desc *features;
-	int i;
 	struct ccw1 *ccw;
+	int ret;
 
 	if (vcdev->revision >= 1 &&
 	    !__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
@@ -755,31 +768,44 @@ static void virtio_ccw_finalize_features(struct virtio_device *vdev)
 
 	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
 	if (!ccw)
-		return;
+		return -ENOMEM;
 
 	features = kzalloc(sizeof(*features), GFP_DMA | GFP_KERNEL);
-	if (!features)
+	if (!features) {
+		ret = -ENOMEM;
 		goto out_free;
-
+	}
 	/* Give virtio_ring a chance to accept features. */
 	vring_transport_features(vdev);
 
-	for (i = 0; i < sizeof(*vdev->features) / sizeof(features->features);
-	     i++) {
-		int highbits = i % 2 ? 32 : 0;
-		features->index = i;
-		features->features = cpu_to_le32(vdev->features[i / 2]
-						 >> highbits);
-		/* Write the feature bits to the host. */
-		ccw->cmd_code = CCW_CMD_WRITE_FEAT;
-		ccw->flags = 0;
-		ccw->count = sizeof(*features);
-		ccw->cda = (__u32)(unsigned long)features;
-		ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_WRITE_FEAT);
-	}
+	features->index = 0;
+	features->features = cpu_to_le32((u32)vdev->features);
+	/* Write the first half of the feature bits to the host. */
+	ccw->cmd_code = CCW_CMD_WRITE_FEAT;
+	ccw->flags = 0;
+	ccw->count = sizeof(*features);
+	ccw->cda = (__u32)(unsigned long)features;
+	ret = ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_WRITE_FEAT);
+	if (ret)
+		goto out_free;
+
+	if (vcdev->revision == 0)
+		goto out_free;
+
+	features->index = 1;
+	features->features = cpu_to_le32(vdev->features >> 32);
+	/* Write the second half of the feature bits to the host. */
+	ccw->cmd_code = CCW_CMD_WRITE_FEAT;
+	ccw->flags = 0;
+	ccw->count = sizeof(*features);
+	ccw->cda = (__u32)(unsigned long)features;
+	ret = ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_WRITE_FEAT);
+
 out_free:
 	kfree(features);
 	kfree(ccw);
+
+	return ret;
 }
 
 static void virtio_ccw_get_config(struct virtio_device *vdev,
@@ -995,11 +1021,7 @@ static void virtio_ccw_int_handler(struct ccw_device *cdev,
 		vring_interrupt(0, vq);
 	}
 	if (test_bit(0, &vcdev->indicators2)) {
-		drv = container_of(vcdev->vdev.dev.driver,
-				   struct virtio_driver, driver);
-
-		if (drv && drv->config_changed)
-			drv->config_changed(&vcdev->vdev);
+		virtio_config_changed(&vcdev->vdev);
 		clear_bit(0, &vcdev->indicators2);
 	}
 }

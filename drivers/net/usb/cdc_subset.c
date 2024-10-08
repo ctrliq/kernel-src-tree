@@ -101,16 +101,6 @@ static void m5632_recover(struct usbnet *dev)
 	usb_unlock_device(udev);
 }
 
-static int dummy_prereset(struct usb_interface *intf)
-{
-	return 0;
-}
-
-static int dummy_postreset(struct usb_interface *intf)
-{
-	return 0;
-}
-
 static const struct driver_info	ali_m5632_info = {
 	.description =	"ALi M5632",
 	.flags       = FLAG_POINTTOPOINT,
@@ -119,7 +109,6 @@ static const struct driver_info	ali_m5632_info = {
 
 #endif
 
-
 #ifdef	CONFIG_USB_AN2720
 #define	HAVE_HARDWARE
 
@@ -353,6 +342,15 @@ static const struct usb_device_id	products [] = {
 MODULE_DEVICE_TABLE(usb, products);
 
 /*-------------------------------------------------------------------------*/
+static int dummy_prereset(struct usb_interface *intf)
+{
+        return 0;
+}
+
+static int dummy_postreset(struct usb_interface *intf)
+{
+        return 0;
+}
 
 static struct usb_driver cdc_subset_driver = {
 	.name =		"cdc_subset",

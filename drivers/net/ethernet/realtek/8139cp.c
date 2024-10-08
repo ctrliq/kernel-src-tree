@@ -382,7 +382,7 @@ static int cp_get_eeprom(struct net_device *dev,
 static int cp_set_eeprom(struct net_device *dev,
 			 struct ethtool_eeprom *eeprom, u8 *data);
 
-static DEFINE_PCI_DEVICE_TABLE(cp_pci_tbl) = {
+static const struct pci_device_id cp_pci_tbl[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_REALTEK,	PCI_DEVICE_ID_REALTEK_8139), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_TTTECH,	PCI_DEVICE_ID_TTTECH_MC322), },
 	{ },
@@ -514,7 +514,7 @@ rx_status_loop:
 		netif_dbg(cp, rx_status, dev, "rx slot %d status 0x%x len %d\n",
 			  rx_tail, status, len);
 
-		new_skb = netdev_alloc_skb_ip_align(dev, buflen);
+		new_skb = napi_alloc_skb(napi, buflen);
 		if (!new_skb) {
 			dev->stats.rx_dropped++;
 			goto rx_next;
@@ -718,8 +718,8 @@ static void cp_tx (struct cp_private *cp)
 
 static inline u32 cp_tx_vlan_tag(struct sk_buff *skb)
 {
-	return vlan_tx_tag_present(skb) ?
-		TxVlanTag | swab16(vlan_tx_tag_get(skb)) : 0x00;
+	return skb_vlan_tag_present(skb) ?
+		TxVlanTag | swab16(skb_vlan_tag_get(skb)) : 0x00;
 }
 
 static void unwind_tx_frag_mapping(struct cp_private *cp, struct sk_buff *skb,

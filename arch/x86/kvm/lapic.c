@@ -33,6 +33,7 @@
 #include <asm/page.h>
 #include <asm/current.h>
 #include <asm/apicdef.h>
+#include <asm/delay.h>
 #include <linux/atomic.h>
 #include <linux/jump_label.h>
 #include "kvm_cache_regs.h"
@@ -346,6 +347,8 @@ void kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir)
 		if (pir_val)
 			*((u32 *)(apic->regs + APIC_IRR + i * 0x10)) |= pir_val;
 	}
+
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
 }
 EXPORT_SYMBOL_GPL(kvm_apic_update_irr);
 
@@ -789,7 +792,9 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 		break;
 
 	case APIC_DM_SMI:
-		apic_debug("Ignoring guest SMI\n");
+		result = 1;
+		kvm_make_request(KVM_REQ_SMI, vcpu);
+		kvm_vcpu_kick(vcpu);
 		break;
 
 	case APIC_DM_NMI:
@@ -1080,6 +1085,53 @@ static void update_divide_count(struct kvm_lapic *apic)
 				   apic->divide_count);
 }
 
+/*
+ * On APICv, this test will cause a busy wait
+ * during a higher-priority task.
+ */
+
+static bool lapic_timer_int_injected(struct kvm_vcpu *vcpu)
+{
+	struct kvm_lapic *apic = vcpu->arch.apic;
+	u32 reg = kvm_apic_get_reg(apic, APIC_LVTT);
+
+	if (kvm_apic_hw_enabled(apic)) {
+		int vec = reg & APIC_VECTOR_MASK;
+		void *bitmap = apic->regs + APIC_ISR;
+
+		if (kvm_x86_ops->deliver_posted_interrupt)
+			bitmap = apic->regs + APIC_IRR;
+
+		if (apic_test_vector(vec, bitmap))
+			return true;
+	}
+	return false;
+}
+
+void wait_lapic_expire(struct kvm_vcpu *vcpu)
+{
+	struct kvm_lapic *apic = vcpu->arch.apic;
+	u64 guest_tsc, tsc_deadline;
+
+	if (!kvm_vcpu_has_lapic(vcpu))
+		return;
+
+	if (apic->lapic_timer.expired_tscdeadline == 0)
+		return;
+
+	if (!lapic_timer_int_injected(vcpu))
+		return;
+
+	tsc_deadline = apic->lapic_timer.expired_tscdeadline;
+	apic->lapic_timer.expired_tscdeadline = 0;
+	guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu, native_read_tsc());
+	trace_kvm_wait_lapic_expire(vcpu->vcpu_id, guest_tsc - tsc_deadline);
+
+	/* __delay is delay_tsc whenever the hardware has TSC, thus always.  */
+	if (guest_tsc < tsc_deadline)
+		__delay(tsc_deadline - guest_tsc);
+}
+
 static void apic_update_lvtt(struct kvm_lapic *apic)
 {
 	u32 timer_mode = kvm_apic_get_reg(apic, APIC_LVTT) &
@@ -1159,6 +1211,7 @@ static void start_apic_timer(struct kvm_lapic *apic)
 		/* lapic timer in tsc deadline mode */
 		u64 guest_tsc, tscdeadline = apic->lapic_timer.tscdeadline;
 		u64 ns = 0;
+		ktime_t expire;
 		struct kvm_vcpu *vcpu = apic->vcpu;
 		unsigned long this_tsc_khz = vcpu->arch.virtual_tsc_khz;
 		unsigned long flags;
@@ -1173,8 +1226,10 @@ static void start_apic_timer(struct kvm_lapic *apic)
 		if (likely(tscdeadline > guest_tsc)) {
 			ns = (tscdeadline - guest_tsc) * 1000000ULL;
 			do_div(ns, this_tsc_khz);
+			expire = ktime_add_ns(now, ns);
+			expire = ktime_sub_ns(expire, lapic_timer_advance_ns);
 			hrtimer_start(&apic->lapic_timer.timer,
-				ktime_add_ns(now, ns), HRTIMER_MODE_ABS);
+				      expire, HRTIMER_MODE_ABS);
 		} else
 			apic_timer_expired(apic);
 
@@ -1184,16 +1239,17 @@ static void start_apic_timer(struct kvm_lapic *apic)
 
 static void apic_manage_nmi_watchdog(struct kvm_lapic *apic, u32 lvt0_val)
 {
-	int nmi_wd_enabled = apic_lvt_nmi_mode(kvm_apic_get_reg(apic, APIC_LVT0));
+	bool lvt0_in_nmi_mode = apic_lvt_nmi_mode(lvt0_val);
 
-	if (apic_lvt_nmi_mode(lvt0_val)) {
-		if (!nmi_wd_enabled) {
+	if (apic->lvt0_in_nmi_mode != lvt0_in_nmi_mode) {
+		apic->lvt0_in_nmi_mode = lvt0_in_nmi_mode;
+		if (lvt0_in_nmi_mode) {
 			apic_debug("Receive NMI setting on APIC_LVT0 "
 				   "for cpu %d\n", apic->vcpu->vcpu_id);
 			atomic_inc(&apic->vcpu->kvm->arch.vapics_in_nmi_mode);
-		}
-	} else if (nmi_wd_enabled)
-		atomic_dec(&apic->vcpu->kvm->arch.vapics_in_nmi_mode);
+		} else
+			atomic_dec(&apic->vcpu->kvm->arch.vapics_in_nmi_mode);
+	}
 }
 
 static int apic_reg_write(struct kvm_lapic *apic, u32 reg, u32 val)
@@ -1522,8 +1578,10 @@ void kvm_lapic_reset(struct kvm_vcpu *vcpu)
 	for (i = 0; i < APIC_LVT_NUM; i++)
 		apic_set_reg(apic, APIC_LVTT + 0x10 * i, APIC_LVT_MASKED);
 	apic_update_lvtt(apic);
-	apic_set_reg(apic, APIC_LVT0,
-		     SET_APIC_DELIVERY_MODE(0, APIC_MODE_EXTINT));
+	if (!(vcpu->kvm->arch.disabled_quirks & KVM_QUIRK_LINT0_REENABLED))
+		apic_set_reg(apic, APIC_LVT0,
+			     SET_APIC_DELIVERY_MODE(0, APIC_MODE_EXTINT));
+	apic_manage_nmi_watchdog(apic, kvm_apic_get_reg(apic, APIC_LVT0));
 
 	apic_set_reg(apic, APIC_DFR, 0xffffffffU);
 	apic_set_spiv(apic, 0xff);
@@ -1616,6 +1674,9 @@ static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
 	struct kvm_lapic *apic = container_of(ktimer, struct kvm_lapic, lapic_timer);
 
 	apic_timer_expired(apic);
+
+	if (apic_lvtt_tscdeadline(apic))
+		ktimer->expired_tscdeadline = ktimer->tscdeadline;
 
 	if (lapic_is_periodic(apic)) {
 		hrtimer_add_expires_ns(&ktimer->timer, ktimer->period);
@@ -1991,8 +2052,19 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
 	if (!kvm_vcpu_has_lapic(vcpu) || !apic->pending_events)
 		return;
 
-	pe = xchg(&apic->pending_events, 0);
+	/*
+	 * INITs are latched while in SMM.  Because an SMM CPU cannot
+	 * be in KVM_MP_STATE_INIT_RECEIVED state, just eat SIPIs
+	 * and delay processing of INIT until the next RSM.
+	 */
+	if (is_smm(vcpu)) {
+		WARN_ON_ONCE(vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED);
+		if (test_bit(KVM_APIC_SIPI, &apic->pending_events))
+			clear_bit(KVM_APIC_SIPI, &apic->pending_events);
+		return;
+	}
 
+	pe = xchg(&apic->pending_events, 0);
 	if (test_bit(KVM_APIC_INIT, &pe)) {
 		kvm_lapic_reset(vcpu);
 		kvm_vcpu_reset(vcpu);

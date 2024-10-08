@@ -3696,7 +3696,7 @@ int scsi_debug_queuecommand_lck(struct scsi_cmnd *SCpnt, done_funct_t done)
 	case READ_CAPACITY:
 		errsts = resp_readcap(SCpnt, devip);
 		break;
-	case SERVICE_ACTION_IN:
+	case SERVICE_ACTION_IN_16:
 		if (cmd[1] == SAI_READ_CAPACITY_16)
 			errsts = resp_readcap16(SCpnt, devip);
 		else if (cmd[1] == SAI_GET_LBA_STATUS) {

@@ -332,10 +332,10 @@ static void set_subtitle(void)
 	list_for_each_entry(sp, &trail, entries) {
 		if (sp->text) {
 			if (pos) {
-				pos->next = xcalloc(1, sizeof(*pos));
+				pos->next = xcalloc(sizeof(*pos), 1);
 				pos = pos->next;
 			} else {
-				subtitles = pos = xcalloc(1, sizeof(*pos));
+				subtitles = pos = xcalloc(sizeof(*pos), 1);
 			}
 			pos->text = sp->text;
 		}

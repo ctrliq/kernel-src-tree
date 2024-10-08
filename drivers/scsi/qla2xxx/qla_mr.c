@@ -40,7 +40,7 @@ qlafx00_mailbox_command(scsi_qla_host_t *vha, struct mbx_cmd_32 *mcp)
 {
 	int		rval;
 	unsigned long    flags = 0;
-	device_reg_t __iomem *reg;
+	device_reg_t *reg;
 	uint8_t		abort_active;
 	uint8_t		io_lock_on;
 	uint16_t	command = 0;
@@ -695,11 +695,11 @@ qlafx00_pci_info_str(struct scsi_qla_host *vha, char *str)
 }
 
 char *
-qlafx00_fw_version_str(struct scsi_qla_host *vha, char *str)
+qlafx00_fw_version_str(struct scsi_qla_host *vha, char *str, size_t size)
 {
 	struct qla_hw_data *ha = vha->hw;
 
-	sprintf(str, "%s", ha->mr.fw_version);
+	snprintf(str, size, "%s", ha->mr.fw_version);
 	return str;
 }
 

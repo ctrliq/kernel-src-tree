@@ -8,6 +8,7 @@
 #include <linux/security.h>
 #include <linux/file.h>
 #include <linux/seq_file.h>
+#include <linux/fs.h>
 
 #include <linux/proc_fs.h>
 
@@ -48,16 +49,20 @@ static int seq_show(struct seq_file *m, void *v)
 		put_files_struct(files);
 	}
 
-	if (!ret) {
-		seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\n",
-			   (long long)file->f_pos, f_flags,
-			   real_mount(file->f_path.mnt)->mnt_id);
-		if (file->f_op->show_fdinfo)
-			ret = file->f_op->show_fdinfo(m, file);
-		fput(file);
-	}
+	if (ret)
+		return ret;
 
-	return ret;
+	seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\n",
+		   (long long)file->f_pos, f_flags,
+		   real_mount(file->f_path.mnt)->mnt_id);
+
+	show_fd_locks(m, file, files);
+
+	if (file->f_op->show_fdinfo)
+		ret = file->f_op->show_fdinfo(m, file);
+
+	fput(file);
+	return 0;
 }
 
 static int seq_fdinfo_open(struct inode *inode, struct file *file)

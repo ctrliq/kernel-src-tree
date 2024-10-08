@@ -407,10 +407,10 @@ static int __blkdev_issue_discard_async(struct block_device *bdev, sector_t sect
 
 		bio_chain(bio, parent_bio);
 
-		bio->bi_iter.bi_sector = sector;
+		bio->bi_sector = sector;
 		bio->bi_bdev = bdev;
 
-		bio->bi_iter.bi_size = req_sects << 9;
+		bio->bi_size = req_sects << 9;
 		nr_sects -= req_sects;
 		sector = end_sect;
 
@@ -708,8 +708,8 @@ static void get_bio_block_range(struct thin_c *tc, struct bio *bio,
 				dm_block_t *begin, dm_block_t *end)
 {
 	struct pool *pool = tc->pool;
-	sector_t b = bio->bi_iter.bi_sector;
-	sector_t e = b + (bio->bi_iter.bi_size >> SECTOR_SHIFT);
+	sector_t b = bio->bi_sector;
+	sector_t e = b + (bio->bi_size >> SECTOR_SHIFT);
 
 	b += pool->sectors_per_block - 1ull; /* so we round up */
 
@@ -874,6 +874,8 @@ static void overwrite_endio(struct bio *bio, int err)
 	struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
 	struct dm_thin_new_mapping *m = h->overwrite_mapping;
 
+	bio->bi_end_io = m->saved_bi_end_io;
+
 	m->err = err;
 	complete_mapping_preparation(m);
 }
@@ -962,8 +964,6 @@ static void inc_remap_and_issue_cell(struct thin_c *tc,
 
 static void process_prepared_mapping_fail(struct dm_thin_new_mapping *m)
 {
-	if (m->bio)
-		m->bio->bi_end_io = m->saved_bi_end_io;
 	cell_error(m->tc->pool, m->cell);
 	list_del(&m->list);
 	mempool_free(m, m->tc->pool->mapping_pool);
@@ -973,12 +973,8 @@ static void process_prepared_mapping(struct dm_thin_new_mapping *m)
 {
 	struct thin_c *tc = m->tc;
 	struct pool *pool = tc->pool;
-	struct bio *bio;
+	struct bio *bio = m->bio;
 	int r;
-
-	bio = m->bio;
-	if (bio)
-		bio->bi_end_io = m->saved_bi_end_io;
 
 	if (m->err) {
 		cell_error(pool, m->cell);
@@ -1547,9 +1543,9 @@ static void process_discard_cell_no_passdown(struct thin_c *tc,
  */
 static inline void __bio_inc_remaining(struct bio *bio)
 {
-	bio->bi_flags |= (1 << BIO_CHAIN);
+	bio->bio_aux->bi_flags |= (1 << BIO_AUX_CHAIN);
 	smp_mb__before_atomic();
-	atomic_inc(&bio->__bi_remaining);
+	atomic_inc(&bio->bio_aux->__bi_remaining);
 }
 
 static void break_up_discard_bio(struct thin_c *tc, dm_block_t begin, dm_block_t end,

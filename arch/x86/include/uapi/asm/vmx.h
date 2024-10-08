@@ -73,6 +73,7 @@
 #define EXIT_REASON_XSETBV              55
 #define EXIT_REASON_APIC_WRITE          56
 #define EXIT_REASON_INVPCID             58
+#define EXIT_REASON_PML_FULL            62
 
 #define VMX_EXIT_REASONS \
 	{ EXIT_REASON_EXCEPTION_NMI,         "EXCEPTION_NMI" }, \

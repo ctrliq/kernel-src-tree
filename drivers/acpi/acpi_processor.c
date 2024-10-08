@@ -178,7 +178,7 @@ static int acpi_processor_hotadd_init(struct acpi_processor *pr)
 	if (ACPI_FAILURE(status) || !(sta & ACPI_STA_DEVICE_PRESENT))
 		return -ENODEV;
 
-	ret = acpi_map_lsapic(pr->handle, &pr->id);
+	ret = acpi_map_lsapic(pr->handle, pr->phys_id, &pr->id);
 	if (ret)
 		return ret;
 
@@ -209,7 +209,7 @@ static int acpi_processor_get_info(struct acpi_device *device)
 	union acpi_object object = { 0 };
 	struct acpi_buffer buffer = { sizeof(union acpi_object), &object };
 	struct acpi_processor *pr = acpi_driver_data(device);
-	int apic_id, cpu_index, device_declaration = 0;
+	int phys_id, cpu_index, device_declaration = 0;
 	acpi_status status = AE_OK;
 	static int cpu0_initialized;
 
@@ -264,17 +264,20 @@ static int acpi_processor_get_info(struct acpi_device *device)
 		pr->acpi_id = value;
 	}
 
-	apic_id = acpi_get_apicid(pr->handle, device_declaration, pr->acpi_id);
-	if (apic_id < 0) {
-		acpi_handle_debug(pr->handle, "failed to get CPU APIC ID.\n");
+	phys_id = acpi_get_phys_id(pr->handle, device_declaration, pr->acpi_id);
+	if (phys_id < 0) {
+		acpi_handle_debug(pr->handle, "failed to get CPU physical ID.\n");
 		return -ENODEV;
 	}
-	pr->apic_id = apic_id;
+	pr->phys_id = phys_id;
 
-	cpu_index = acpi_map_cpuid(pr->apic_id, pr->acpi_id);
+	cpu_index = acpi_map_cpuid(pr->phys_id, pr->acpi_id);
 	if (!cpu0_initialized) {
 		cpu0_initialized = 1;
-		/* Handle UP system running SMP kernel, with no LAPIC in MADT */
+		/*
+		 * Handle UP system running SMP kernel, with no CPU
+		 * entry in MADT
+		 */
 		if ((cpu_index == -1) && (num_online_cpus() == 1))
 			cpu_index = 0;
 	}

@@ -1278,16 +1278,6 @@ static int efx_mcdi_drv_attach(struct efx_nic *efx, bool driver_operating,
 	 * and are completely trusted by firmware.  Abort probing
 	 * if that's not true for this function.
 	 */
-	if (driver_operating &&
-	    (efx->mcdi->fn_flags &
-	     (1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_LINKCTRL |
-	      1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_TRUSTED)) !=
-	    (1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_LINKCTRL |
-	     1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_TRUSTED)) {
-		netif_err(efx, probe, efx->net_dev,
-			  "This driver version only supports one function per port\n");
-		return -ENODEV;
-	}
 
 	if (was_attached != NULL)
 		*was_attached = MCDI_DWORD(outbuf, DRV_ATTACH_OUT_OLD_STATE);
@@ -1660,7 +1650,9 @@ int efx_mcdi_reset(struct efx_nic *efx, enum reset_type method)
 	if (rc)
 		return rc;
 
-	if (method == RESET_TYPE_WORLD)
+	if (method == RESET_TYPE_DATAPATH)
+		return 0;
+	else if (method == RESET_TYPE_WORLD)
 		return efx_mcdi_reset_mc(efx);
 	else
 		return efx_mcdi_reset_func(efx);

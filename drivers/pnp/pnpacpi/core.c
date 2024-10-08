@@ -88,7 +88,7 @@ static int pnpacpi_set_resources(struct pnp_dev *dev)
 
 	pnp_dbg(&dev->dev, "set resources\n");
 
-	handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	handle = ACPI_HANDLE(&dev->dev);
 	if (!handle || acpi_bus_get_device(handle, &acpi_dev)) {
 		dev_dbg(&dev->dev, "ACPI device not found in %s!\n", __func__);
 		return -ENODEV;
@@ -128,7 +128,7 @@ static int pnpacpi_disable_resources(struct pnp_dev *dev)
 
 	dev_dbg(&dev->dev, "disable resources\n");
 
-	handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	handle = ACPI_HANDLE(&dev->dev);
 	if (!handle || acpi_bus_get_device(handle, &acpi_dev)) {
 		dev_dbg(&dev->dev, "ACPI device not found in %s!\n", __func__);
 		return 0;
@@ -152,7 +152,7 @@ static bool pnpacpi_can_wakeup(struct pnp_dev *dev)
 	struct acpi_device *acpi_dev;
 	acpi_handle handle;
 
-	handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	handle = ACPI_HANDLE(&dev->dev);
 	if (!handle || acpi_bus_get_device(handle, &acpi_dev)) {
 		dev_dbg(&dev->dev, "ACPI device not found in %s!\n", __func__);
 		return false;
@@ -167,7 +167,7 @@ static int pnpacpi_suspend(struct pnp_dev *dev, pm_message_t state)
 	acpi_handle handle;
 	int error = 0;
 
-	handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	handle = ACPI_HANDLE(&dev->dev);
 	if (!handle || acpi_bus_get_device(handle, &acpi_dev)) {
 		dev_dbg(&dev->dev, "ACPI device not found in %s!\n", __func__);
 		return 0;
@@ -202,7 +202,7 @@ static int pnpacpi_suspend(struct pnp_dev *dev, pm_message_t state)
 static int pnpacpi_resume(struct pnp_dev *dev)
 {
 	struct acpi_device *acpi_dev;
-	acpi_handle handle = DEVICE_ACPI_HANDLE(&dev->dev);
+	acpi_handle handle = ACPI_HANDLE(&dev->dev);
 	int error = 0;
 
 	if (!handle || acpi_bus_get_device(handle, &acpi_dev)) {

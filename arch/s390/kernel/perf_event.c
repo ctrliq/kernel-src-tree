@@ -107,10 +107,11 @@ static unsigned long perf_misc_flags_sf(struct pt_regs *regs)
 unsigned long perf_misc_flags(struct pt_regs *regs)
 {
 	/* Check if the cpum_sf PMU has created the pt_regs structure.
-	 * In this case, perf misc flags can be easily extracted.  Otherwise,
-	 * do regular checks on the pt_regs content.
+	 * In this case, additional perf misc flags are available.
+	 * Otherwise, do regular checks on the pt_regs content only.
 	 */
-	if (regs->int_code == 0x1407 && regs->int_parm == CPU_MF_INT_SF_PRA)
+	if (regs->int_code == 0x1407 &&
+	    (regs->psw.mask & PERF_CPUM_SF_PSW_MASK))
 		if (!regs->gprs[15])
 			return perf_misc_flags_sf(regs);
 
@@ -292,3 +293,33 @@ ssize_t cpumf_events_sysfs_show(struct device *dev,
 	return sprintf(page, "event=0x%04llx,name=%s\n",
 		       pmu_attr->id, attr->attr.name);
 }
+
+/* Reserve/release functions for sharing perf hardware */
+static DEFINE_SPINLOCK(perf_hw_owner_lock);
+static void *perf_sampling_owner;
+
+int perf_reserve_sampling(void)
+{
+	int err;
+
+	err = 0;
+	spin_lock(&perf_hw_owner_lock);
+	if (perf_sampling_owner) {
+		pr_warn("The sampling facility is already reserved by %p\n",
+			perf_sampling_owner);
+		err = -EBUSY;
+	} else
+		perf_sampling_owner = __builtin_return_address(0);
+	spin_unlock(&perf_hw_owner_lock);
+	return err;
+}
+EXPORT_SYMBOL(perf_reserve_sampling);
+
+void perf_release_sampling(void)
+{
+	spin_lock(&perf_hw_owner_lock);
+	WARN_ON(!perf_sampling_owner);
+	perf_sampling_owner = NULL;
+	spin_unlock(&perf_hw_owner_lock);
+}
+EXPORT_SYMBOL(perf_release_sampling);

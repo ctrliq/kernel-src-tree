@@ -148,8 +148,7 @@ BSSpSearchBSSList(
 			if (pDevice->bLinkPass == false) pCurrBSS->bSelected = false;
 			if ((pCurrBSS->bActive) &&
 			    (pCurrBSS->bSelected == false)) {
-				if (ether_addr_equal(pCurrBSS->abyBSSID,
-						     pbyBSSID)) {
+				if (!compare_ether_addr(pCurrBSS->abyBSSID, pbyBSSID)) {
 					if (pSSID != NULL) {
 						// compare ssid
 						if (!memcmp(pSSID->abySSID,
@@ -276,8 +275,7 @@ BSSvClearBSSList(
 	for (ii = 0; ii < MAX_BSS_NUM; ii++) {
 		if (bKeepCurrBSSID) {
 			if (pMgmt->sBSSList[ii].bActive &&
-			    ether_addr_equal(pMgmt->sBSSList[ii].abyBSSID,
-					     pMgmt->abyCurrBSSID)) {
+			    !compare_ether_addr(pMgmt->sBSSList[ii].abyBSSID, pMgmt->abyCurrBSSID)) {
 				// bKeepCurrBSSID = false;
 				continue;
 			}
@@ -320,7 +318,7 @@ BSSpAddrIsInBSSList(
 	for (ii = 0; ii < MAX_BSS_NUM; ii++) {
 		pBSSList = &(pMgmt->sBSSList[ii]);
 		if (pBSSList->bActive) {
-			if (ether_addr_equal(pBSSList->abyBSSID, abyBSSID)) {
+			if (!compare_ether_addr(pBSSList->abyBSSID, abyBSSID)) {
 				if (pSSID->len == ((PWLAN_IE_SSID)pBSSList->abySSID)->len) {
 					if (memcmp(pSSID->abySSID,
 						   ((PWLAN_IE_SSID)pBSSList->abySSID)->abySSID,
@@ -735,8 +733,7 @@ BSSDBbIsSTAInNodeDB(void *pMgmtObject, unsigned char *abyDstAddr,
 	// Index = 0 reserved for AP Node
 	for (ii = 1; ii < (MAX_NODE_NUM + 1); ii++) {
 		if (pMgmt->sNodeDBTable[ii].bActive) {
-			if (ether_addr_equal(abyDstAddr,
-					     pMgmt->sNodeDBTable[ii].abyMACAddr)) {
+			if (!compare_ether_addr(abyDstAddr, pMgmt->sNodeDBTable[ii].abyMACAddr)) {
 				*puNodeIndex = ii;
 				return true;
 			}

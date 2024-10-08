@@ -70,8 +70,9 @@
 // reawaken network queue this soon after stopping; else watchdog barks
 #define TX_TIMEOUT_JIFFIES	(5*HZ)
 
-// throttle rx/tx briefly after some faults, so khubd might disconnect()
-// us (it polls at HZ/4 usually) before we report too many false errors.
+/* throttle rx/tx briefly after some faults, so hub_wq might disconnect()
+ * us (it polls at HZ/4 usually) before we report too many false errors.
+ */
 #define THROTTLE_JIFFIES	(HZ/8)
 
 // between wakeups
@@ -534,17 +535,19 @@ static inline void rx_process (struct usbnet *dev, struct sk_buff *skb)
 	}
 	// else network stack removes extra byte if we forced a short packet
 
-	if (skb->len) {
-		/* all data was already cloned from skb inside the driver */
-		if (dev->driver_info->flags & FLAG_MULTI_PACKET)
-			dev_kfree_skb_any(skb);
-		else
-			usbnet_skb_return(dev, skb);
+	/* all data was already cloned from skb inside the driver */
+	if (dev->driver_info->flags & FLAG_MULTI_PACKET)
+		goto done;
+
+	if (skb->len < ETH_HLEN) {
+		dev->net->stats.rx_errors++;
+		dev->net->stats.rx_length_errors++;
+		netif_dbg(dev, rx_err, dev->net, "rx length %d\n", skb->len);
+	} else {
+		usbnet_skb_return(dev, skb);
 		return;
 	}
 
-	netif_dbg(dev, rx_err, dev->net, "drop\n");
-	dev->net->stats.rx_errors++;
 done:
 	skb_queue_tail(&dev->done, skb);
 }
@@ -566,13 +569,6 @@ static void rx_complete (struct urb *urb)
 	switch (urb_status) {
 	/* success */
 	case 0:
-		if (skb->len < dev->net->hard_header_len) {
-			state = rx_cleanup;
-			dev->net->stats.rx_errors++;
-			dev->net->stats.rx_length_errors++;
-			netif_dbg(dev, rx_err, dev->net,
-				  "rx length %d\n", skb->len);
-		}
 		break;
 
 	/* stalls need manual reset. this is rare ... except that
@@ -592,9 +588,9 @@ static void rx_complete (struct urb *urb)
 			  "rx shutdown, code %d\n", urb_status);
 		goto block;
 
-	/* we get controller i/o faults during khubd disconnect() delays.
+	/* we get controller i/o faults during hub_wq disconnect() delays.
 	 * throttle down resubmits, to avoid log floods; just temporarily,
-	 * so we still recover when the fault isn't a khubd delay.
+	 * so we still recover when the fault isn't a hub_wq delay.
 	 */
 	case -EPROTO:
 	case -ETIME:
@@ -1201,8 +1197,9 @@ static void tx_complete (struct urb *urb)
 		case -ESHUTDOWN:		// hardware gone
 			break;
 
-		// like rx, tx gets controller i/o faults during khubd delays
-		// and so it uses the same throttling mechanism.
+		/* like rx, tx gets controller i/o faults during hub_wq
+		 * delays and so it uses the same throttling mechanism.
+		 */
 		case -EPROTO:
 		case -ETIME:
 		case -EILSEQ:

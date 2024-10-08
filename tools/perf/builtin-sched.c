@@ -1503,15 +1503,15 @@ static int perf_sched__read_events(struct perf_sched *sched)
 		goto out_delete;
 
 	if (perf_session__has_traces(session, "record -R")) {
-		int err = perf_session__process_events(session, &sched->tool);
+		int err = perf_session__process_events(session);
 		if (err) {
 			pr_err("Failed to process events, error %d", err);
 			goto out_delete;
 		}
 
-		sched->nr_events      = session->stats.nr_events[0];
-		sched->nr_lost_events = session->stats.total_lost;
-		sched->nr_lost_chunks = session->stats.nr_events[PERF_RECORD_LOST];
+		sched->nr_events      = session->evlist->stats.nr_events[0];
+		sched->nr_lost_events = session->evlist->stats.total_lost;
+		sched->nr_lost_chunks = session->evlist->stats.nr_events[PERF_RECORD_LOST];
 	}
 
 	rc = 0;

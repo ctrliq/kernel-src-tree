@@ -22,8 +22,6 @@
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
 #include "xfs_bit.h"
-#include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_da_format.h"
 #include "xfs_da_btree.h"
@@ -39,7 +37,6 @@
 #include "xfs_trace.h"
 #include "xfs_buf_item.h"
 #include "xfs_cksum.h"
-#include "xfs_dinode.h"
 #include "xfs_dir2.h"
 
 STATIC int
@@ -150,7 +147,7 @@ xfs_attr_shortform_list(xfs_attr_list_context_t *context)
 					     XFS_ERRLEVEL_LOW,
 					     context->dp->i_mount, sfe);
 			kmem_free(sbuf);
-			return XFS_ERROR(EFSCORRUPTED);
+			return -EFSCORRUPTED;
 		}
 
 		sbp->entno = i;
@@ -228,6 +225,7 @@ xfs_attr_node_list(xfs_attr_list_context_t *context)
 	int error, i;
 	struct xfs_buf *bp;
 	struct xfs_inode	*dp = context->dp;
+	struct xfs_mount	*mp = dp->i_mount;
 
 	trace_xfs_attr_node_list(context);
 
@@ -243,7 +241,7 @@ xfs_attr_node_list(xfs_attr_list_context_t *context)
 	if (cursor->blkno > 0) {
 		error = xfs_da3_node_read(NULL, dp, cursor->blkno, -1,
 					      &bp, XFS_ATTR_FORK);
-		if ((error != 0) && (error != EFSCORRUPTED))
+		if ((error != 0) && (error != -EFSCORRUPTED))
 			return error;
 		if (bp) {
 			struct xfs_attr_leaf_entry *entries;
@@ -259,7 +257,8 @@ xfs_attr_node_list(xfs_attr_list_context_t *context)
 			case XFS_ATTR_LEAF_MAGIC:
 			case XFS_ATTR3_LEAF_MAGIC:
 				leaf = bp->b_addr;
-				xfs_attr3_leaf_hdr_from_disk(&leafhdr, leaf);
+				xfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo,
+							     &leafhdr, leaf);
 				entries = xfs_attr3_leaf_entryp(leaf);
 				if (cursor->hashval > be32_to_cpu(
 						entries[leafhdr.count - 1].hashval)) {
@@ -308,7 +307,7 @@ xfs_attr_node_list(xfs_attr_list_context_t *context)
 						     context->dp->i_mount,
 						     node);
 				xfs_trans_brelse(NULL, bp);
-				return XFS_ERROR(EFSCORRUPTED);
+				return -EFSCORRUPTED;
 			}
 
 			dp->d_ops->node_hdr_from_disk(&nodehdr, node);
@@ -343,7 +342,7 @@ xfs_attr_node_list(xfs_attr_list_context_t *context)
 			xfs_trans_brelse(NULL, bp);
 			return error;
 		}
-		xfs_attr3_leaf_hdr_from_disk(&leafhdr, leaf);
+		xfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &leafhdr, leaf);
 		if (context->seen_enough || leafhdr.forw == 0)
 			break;
 		cursor->blkno = leafhdr.forw;
@@ -371,11 +370,12 @@ xfs_attr3_leaf_list_int(
 	struct xfs_attr_leaf_entry	*entry;
 	int				retval;
 	int				i;
+	struct xfs_mount		*mp = context->dp->i_mount;
 
 	trace_xfs_attr_list_leaf(context);
 
 	leaf = bp->b_addr;
-	xfs_attr3_leaf_hdr_from_disk(&ichdr, leaf);
+	xfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &ichdr, leaf);
 	entries = xfs_attr3_leaf_entryp(leaf);
 
 	cursor = context->cursor;
@@ -496,11 +496,11 @@ xfs_attr_leaf_list(xfs_attr_list_context_t *context)
 	context->cursor->blkno = 0;
 	error = xfs_attr3_leaf_read(NULL, context->dp, 0, -1, &bp);
 	if (error)
-		return XFS_ERROR(error);
+		return error;
 
 	error = xfs_attr3_leaf_list_int(bp, context);
 	xfs_trans_brelse(NULL, bp);
-	return XFS_ERROR(error);
+	return error;
 }
 
 int
@@ -514,7 +514,7 @@ xfs_attr_list_int(
 	XFS_STATS_INC(xs_attr_list);
 
 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
-		return EIO;
+		return -EIO;
 
 	/*
 	 * Decide on what work routines to call based on the inode size.
@@ -616,16 +616,16 @@ xfs_attr_list(
 	 * Validate the cursor.
 	 */
 	if (cursor->pad1 || cursor->pad2)
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 	if ((cursor->initted == 0) &&
 	    (cursor->hashval || cursor->blkno || cursor->offset))
-		return XFS_ERROR(EINVAL);
+		return -EINVAL;
 
 	/*
 	 * Check for a properly aligned buffer.
 	 */
 	if (((long)buffer) & (sizeof(int)-1))
-		return XFS_ERROR(EFAULT);
+		return -EFAULT;
 	if (flags & ATTR_KERNOVAL)
 		bufsize = 0;
 
@@ -648,6 +648,6 @@ xfs_attr_list(
 	alist->al_offset[0] = context.bufsize;
 
 	error = xfs_attr_list_int(&context);
-	ASSERT(error >= 0);
+	ASSERT(error <= 0);
 	return error;
 }

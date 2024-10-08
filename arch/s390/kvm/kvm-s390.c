@@ -49,6 +49,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "exit_instruction", VCPU_STAT(exit_instruction) },
 	{ "exit_program_interruption", VCPU_STAT(exit_program_interruption) },
 	{ "exit_instr_and_program_int", VCPU_STAT(exit_instr_and_program) },
+	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll) },
 	{ "instruction_lctlg", VCPU_STAT(instruction_lctlg) },
 	{ "instruction_lctl", VCPU_STAT(instruction_lctl) },
 	{ "deliver_emergency_signal", VCPU_STAT(deliver_emergency_signal) },
@@ -95,13 +96,13 @@ static inline int test_vfacility(unsigned long nr)
 }
 
 /* Section: not file related */
-int kvm_arch_hardware_enable(void *garbage)
+int kvm_arch_hardware_enable(void)
 {
 	/* every s390 is virtualization enabled ;-) */
 	return 0;
 }
 
-void kvm_arch_hardware_disable(void *garbage)
+void kvm_arch_hardware_disable(void)
 {
 }
 
@@ -1105,14 +1106,14 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 	return 0;
 }
 
-void kvm_arch_memslots_updated(struct kvm *kvm)
+void kvm_arch_memslots_updated(struct kvm *kvm, struct kvm_memslots *slots)
 {
 }
 
 /* Section: memory related */
 int kvm_arch_prepare_memory_region(struct kvm *kvm,
 				   struct kvm_memory_slot *memslot,
-				   struct kvm_userspace_memory_region *mem,
+				   const struct kvm_userspace_memory_region *mem,
 				   enum kvm_mr_change change)
 {
 	/* A few sanity checks. We can have memory slots which have to be
@@ -1130,8 +1131,9 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 }
 
 void kvm_arch_commit_memory_region(struct kvm *kvm,
-				struct kvm_userspace_memory_region *mem,
+				const struct kvm_userspace_memory_region *mem,
 				const struct kvm_memory_slot *old,
+				const struct kvm_memory_slot *new,
 				enum kvm_mr_change change)
 {
 	int rc;

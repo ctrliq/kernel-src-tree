@@ -1,10 +1,9 @@
 /*
    raid0.c : Multiple Devices driver for Linux
-             Copyright (C) 1994-96 Marc ZYNGIER
+	     Copyright (C) 1994-96 Marc ZYNGIER
 	     <zyngier@ufr-info-p7.ibp.fr> or
 	     <maz@gloups.fdn.fr>
-             Copyright (C) 1999, 2000 Ingo Molnar, Red Hat
-
+	     Copyright (C) 1999, 2000 Ingo Molnar, Red Hat
 
    RAID-0 management functions.
 
@@ -12,10 +11,10 @@
    it under the terms of the GNU General Public License as published by
    the Free Software Foundation; either version 2, or (at your option)
    any later version.
-   
+
    You should have received a copy of the GNU General Public License
    (for example /usr/src/linux/COPYING); if not, write to the Free
-   Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.  
+   Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
 #include <linux/blkdev.h>
@@ -25,6 +24,11 @@
 #include "md.h"
 #include "raid0.h"
 #include "raid5.h"
+
+static bool devices_discard_performance = false;
+module_param(devices_discard_performance, bool, 0644);
+MODULE_PARM_DESC(devices_discard_performance,
+		 "Set to Y if all devices in each array handles discard requests at proper speed");
 
 static int raid0_congested(struct mddev *mddev, int bits)
 {
@@ -405,7 +409,7 @@ static sector_t raid0_size(struct mddev *mddev, sector_t sectors, int raid_disks
 	return array_sectors;
 }
 
-static int raid0_stop(struct mddev *mddev);
+static void raid0_free(struct mddev *mddev, void *priv);
 
 static int raid0_run(struct mddev *mddev)
 {
@@ -446,6 +450,22 @@ static int raid0_run(struct mddev *mddev)
 			if (blk_queue_discard(bdev_get_queue(rdev->bdev)))
 				discard_supported = true;
 		}
+
+		/* Unfortunately, some devices have awful discard performance,
+		 * especially for small sized requests. This is particularly
+		 * bad for RAID0 with a small chunk size resulting in a small
+		 * DISCARD requests hitting the underlaying drives.
+		 * Only allow DISCARD if the sysadmin confirms that all devices
+		 * in use can handle small DISCARD requests at reasonable speed,
+		 * by setting a module parameter.
+		 */
+		if (!devices_discard_performance) {
+			if (discard_supported) {
+				pr_info("md/raid0: discard support disabled due to performance uncertainty.\n");
+				pr_info("Set raid0.devices_discard_performance=Y to override.\n");
+			}
+			discard_supported = false;
+		}
 		if (!discard_supported)
 			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
 		else
@@ -479,21 +499,18 @@ static int raid0_run(struct mddev *mddev)
 
 	ret = md_integrity_register(mddev);
 	if (ret)
-		raid0_stop(mddev);
+		raid0_free(mddev, conf);
 
 	return ret;
 }
 
-static int raid0_stop(struct mddev *mddev)
+static void raid0_free(struct mddev *mddev, void *priv)
 {
-	struct r0conf *conf = mddev->private;
+	struct r0conf *conf = priv;
 
-	blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
 	kfree(conf->strip_zone);
 	kfree(conf->devlist);
 	kfree(conf);
-	mddev->private = NULL;
-	return 0;
 }
 
 /*
@@ -746,7 +763,7 @@ static struct md_personality raid0_personality=
 	.owner		= THIS_MODULE,
 	.make_request	= raid0_make_request,
 	.run		= raid0_run,
-	.stop		= raid0_stop,
+	.free		= raid0_free,
 	.status		= raid0_status,
 	.size		= raid0_size,
 	.takeover	= raid0_takeover,

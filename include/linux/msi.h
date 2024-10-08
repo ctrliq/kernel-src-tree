@@ -26,7 +26,6 @@ struct msi_desc {
 	struct {
 		__u8	is_msix	: 1;
 		__u8	multiple: 3;	/* log2 num of messages allocated */
-		__u8	multi_cap : 3;	/* log2 num of messages supported */
 		__u8	maskbit	: 1;	/* mask-pending bit supported ? */
 		__u8	is_64	: 1;	/* Address size: 0=32bit 1=64bit */
 		__u8	pos;		/* Location of the msi capability */
@@ -37,6 +36,10 @@ struct msi_desc {
 	u32 masked;			/* mask bits */
 	unsigned int irq;
 	unsigned int nvec_used;		/* number of messages */
+
+	/* RHEL KABI: upstream has 'multi_cap' within 'msi_attrib' */
+	RH_KABI_FILL_HOLE(__u8	multi_cap : 3)	/* log2 num msgs supported */
+
 	struct list_head list;
 
 	union {

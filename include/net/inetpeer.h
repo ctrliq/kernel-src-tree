@@ -14,12 +14,13 @@
 #include <linux/rtnetlink.h>
 #include <net/ipv6.h>
 #include <linux/atomic.h>
+#include <linux/rh_kabi.h>
 
 struct inetpeer_addr_base {
 	union {
 		__be32			a4;
 		__be32			a6[4];
-		struct in6_addr		in6;
+		RH_KABI_EXTEND(struct in6_addr in6)
 	};
 };
 

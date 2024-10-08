@@ -59,6 +59,8 @@
 #define MLX5_FLD_SZ_BYTES(typ, fld) (__mlx5_bit_sz(typ, fld) / 8)
 #define MLX5_ST_SZ_BYTES(typ) (sizeof(struct mlx5_ifc_##typ##_bits) / 8)
 #define MLX5_ST_SZ_DW(typ) (sizeof(struct mlx5_ifc_##typ##_bits) / 32)
+#define MLX5_UN_SZ_BYTES(typ) (sizeof(union mlx5_ifc_##typ##_bits) / 8)
+#define MLX5_UN_SZ_DW(typ) (sizeof(union mlx5_ifc_##typ##_bits) / 32)
 #define MLX5_BYTE_OFF(typ, fld) (__mlx5_bit_off(typ, fld) / 8)
 #define MLX5_ADDR_OF(typ, p, fld) ((char *)(p) + MLX5_BYTE_OFF(typ, fld))
 
@@ -97,6 +99,12 @@ __mlx5_mask(typ, fld))
 
 #define MLX5_GET64(typ, p, fld) be64_to_cpu(*((__be64 *)(p) + __mlx5_64_off(typ, fld)))
 
+#define MLX5_GET64_PR(typ, p, fld) ({ \
+	u64 ___t = MLX5_GET64(typ, p, fld); \
+	pr_debug(#fld " = 0x%llx\n", ___t); \
+	___t; \
+})
+
 enum {
 	MLX5_MAX_COMMANDS		= 32,
 	MLX5_CMD_DATA_BLOCK_SIZE	= 512,
@@ -121,6 +129,10 @@ enum {
 
 enum {
 	MLX5_INLINE_SEG = 0x80000000,
+};
+
+enum {
+	MLX5_HW_START_PADDING = MLX5_INLINE_SEG,
 };
 
 enum {
@@ -327,13 +339,6 @@ enum {
 
 enum {
 	MLX5_CAP_OFF_CMDIF_CSUM		= 46,
-};
-
-enum {
-	HCA_CAP_OPMOD_GET_MAX	= 0,
-	HCA_CAP_OPMOD_GET_CUR	= 1,
-	HCA_CAP_OPMOD_GET_ODP_MAX = 4,
-	HCA_CAP_OPMOD_GET_ODP_CUR = 5
 };
 
 struct mlx5_inbox_hdr {
@@ -1107,5 +1112,88 @@ enum {
 	MLX5_RQC_RQ_TYPE_MEMORY_RQ_INLINE = 0x0,
 	MLX5_RQC_RQ_TYPE_MEMORY_RQ_RPM    = 0x1,
 };
+
+/* MLX5 DEV CAPs */
+
+/* TODO: EAT.ME */
+enum mlx5_cap_mode {
+	HCA_CAP_OPMOD_GET_MAX	= 0,
+	HCA_CAP_OPMOD_GET_CUR	= 1,
+};
+
+enum mlx5_cap_type {
+	MLX5_CAP_GENERAL = 0,
+	MLX5_CAP_ETHERNET_OFFLOADS,
+	MLX5_CAP_ODP,
+	MLX5_CAP_ATOMIC,
+	MLX5_CAP_ROCE,
+	MLX5_CAP_IPOIB_OFFLOADS,
+	MLX5_CAP_EOIB_OFFLOADS,
+	MLX5_CAP_FLOW_TABLE,
+	/* NUM OF CAP Types */
+	MLX5_CAP_NUM
+};
+
+/* GET Dev Caps macros */
+#define MLX5_CAP_GEN(mdev, cap) \
+	MLX5_GET(cmd_hca_cap, mdev->hca_caps_cur[MLX5_CAP_GENERAL], cap)
+
+#define MLX5_CAP_GEN_MAX(mdev, cap) \
+	MLX5_GET(cmd_hca_cap, mdev->hca_caps_max[MLX5_CAP_GENERAL], cap)
+
+#define MLX5_CAP_ETH(mdev, cap) \
+	MLX5_GET(per_protocol_networking_offload_caps,\
+		 mdev->hca_caps_cur[MLX5_CAP_ETHERNET_OFFLOADS], cap)
+
+#define MLX5_CAP_ETH_MAX(mdev, cap) \
+	MLX5_GET(per_protocol_networking_offload_caps,\
+		 mdev->hca_caps_max[MLX5_CAP_ETHERNET_OFFLOADS], cap)
+
+#define MLX5_CAP_ROCE(mdev, cap) \
+	MLX5_GET(roce_cap, mdev->hca_caps_cur[MLX5_CAP_ROCE], cap)
+
+#define MLX5_CAP_ROCE_MAX(mdev, cap) \
+	MLX5_GET(roce_cap, mdev->hca_caps_max[MLX5_CAP_ROCE], cap)
+
+#define MLX5_CAP_ATOMIC(mdev, cap) \
+	MLX5_GET(atomic_caps, mdev->hca_caps_cur[MLX5_CAP_ATOMIC], cap)
+
+#define MLX5_CAP_ATOMIC_MAX(mdev, cap) \
+	MLX5_GET(atomic_caps, mdev->hca_caps_max[MLX5_CAP_ATOMIC], cap)
+
+#define MLX5_CAP_FLOWTABLE(mdev, cap) \
+	MLX5_GET(flow_table_nic_cap, mdev->hca_caps_cur[MLX5_CAP_FLOW_TABLE], cap)
+
+#define MLX5_CAP_FLOWTABLE_MAX(mdev, cap) \
+	MLX5_GET(flow_table_nic_cap, mdev->hca_caps_max[MLX5_CAP_FLOW_TABLE], cap)
+
+#define MLX5_CAP_ODP(mdev, cap)\
+	MLX5_GET(odp_cap, mdev->hca_caps_cur[MLX5_CAP_ODP], cap)
+
+enum {
+	MLX5_CMD_STAT_OK			= 0x0,
+	MLX5_CMD_STAT_INT_ERR			= 0x1,
+	MLX5_CMD_STAT_BAD_OP_ERR		= 0x2,
+	MLX5_CMD_STAT_BAD_PARAM_ERR		= 0x3,
+	MLX5_CMD_STAT_BAD_SYS_STATE_ERR		= 0x4,
+	MLX5_CMD_STAT_BAD_RES_ERR		= 0x5,
+	MLX5_CMD_STAT_RES_BUSY			= 0x6,
+	MLX5_CMD_STAT_LIM_ERR			= 0x8,
+	MLX5_CMD_STAT_BAD_RES_STATE_ERR		= 0x9,
+	MLX5_CMD_STAT_IX_ERR			= 0xa,
+	MLX5_CMD_STAT_NO_RES_ERR		= 0xf,
+	MLX5_CMD_STAT_BAD_INP_LEN_ERR		= 0x50,
+	MLX5_CMD_STAT_BAD_OUTP_LEN_ERR		= 0x51,
+	MLX5_CMD_STAT_BAD_QP_STATE_ERR		= 0x10,
+	MLX5_CMD_STAT_BAD_PKT_ERR		= 0x30,
+	MLX5_CMD_STAT_BAD_SIZE_OUTS_CQES_ERR	= 0x40,
+};
+
+static inline u16 mlx5_to_sw_pkey_sz(int pkey_sz)
+{
+	if (pkey_sz > MLX5_MAX_LOG_PKEY_TABLE)
+		return 0;
+	return MLX5_MIN_PKEY_TABLE_SIZE << pkey_sz;
+}
 
 #endif /* MLX5_DEVICE_H */

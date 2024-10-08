@@ -48,6 +48,7 @@
 #include "current_stateid.h"
 
 #include "netns.h"
+#include "pnfs.h"
 
 #define NFSDDBG_FACILITY                NFSDDBG_PROC
 
@@ -394,14 +395,6 @@ static unsigned int file_hashval(struct knfsd_fh *fh)
 	return nfsd_fh_hashval(fh) & (FILE_HASH_SIZE - 1);
 }
 
-static bool nfsd_fh_match(struct knfsd_fh *fh1, struct knfsd_fh *fh2)
-{
-	return fh1->fh_size == fh2->fh_size &&
-		!memcmp(fh1->fh_base.fh_pad,
-				fh2->fh_base.fh_pad,
-				fh1->fh_size);
-}
-
 static struct hlist_head file_hashtbl[FILE_HASH_SIZE];
 
 static void
@@ -683,7 +676,7 @@ static void nfs4_put_deleg_lease(struct nfs4_file *fp)
 	spin_unlock(&fp->fi_lock);
 
 	if (filp) {
-		vfs_setlease(filp, F_UNLCK, NULL);
+		vfs_setlease(filp, F_UNLCK, NULL, (void **)&fp);
 		fput(filp);
 	}
 }
@@ -705,12 +698,15 @@ hash_delegation_locked(struct nfs4_delegation *dp, struct nfs4_file *fp)
 	list_add(&dp->dl_perclnt, &dp->dl_stid.sc_client->cl_delegations);
 }
 
-static void
+static bool
 unhash_delegation_locked(struct nfs4_delegation *dp)
 {
 	struct nfs4_file *fp = dp->dl_stid.sc_file;
 
 	lockdep_assert_held(&state_lock);
+
+	if (list_empty(&dp->dl_perfile))
+		return false;
 
 	dp->dl_stid.sc_type = NFS4_CLOSED_DELEG_STID;
 	/* Ensure that deleg break won't try to requeue it */
@@ -720,15 +716,20 @@ unhash_delegation_locked(struct nfs4_delegation *dp)
 	list_del_init(&dp->dl_recall_lru);
 	list_del_init(&dp->dl_perfile);
 	spin_unlock(&fp->fi_lock);
+	return true;
 }
 
 static void destroy_delegation(struct nfs4_delegation *dp)
 {
+	bool unhashed;
+
 	spin_lock(&state_lock);
-	unhash_delegation_locked(dp);
+	unhashed = unhash_delegation_locked(dp);
 	spin_unlock(&state_lock);
-	nfs4_put_deleg_lease(dp->dl_stid.sc_file);
-	nfs4_put_stid(&dp->dl_stid);
+	if (unhashed) {
+		nfs4_put_deleg_lease(dp->dl_stid.sc_file);
+		nfs4_put_stid(&dp->dl_stid);
+	}
 }
 
 static void revoke_delegation(struct nfs4_delegation *dp)
@@ -1163,7 +1164,7 @@ hash_sessionid(struct nfs4_sessionid *sessionid)
 	return sid->sequence % SESSION_HASH_SIZE;
 }
 
-#ifdef NFSD_DEBUG
+#ifdef CONFIG_SUNRPC_DEBUG
 static inline void
 dump_sessionid(const char *fn, struct nfs4_sessionid *sessionid)
 {
@@ -1559,6 +1560,9 @@ static struct nfs4_client *alloc_client(struct xdr_netobj name)
 	INIT_LIST_HEAD(&clp->cl_lru);
 	INIT_LIST_HEAD(&clp->cl_callbacks);
 	INIT_LIST_HEAD(&clp->cl_revoked);
+#ifdef CONFIG_NFSD_PNFS
+	INIT_LIST_HEAD(&clp->cl_lo_states);
+#endif
 	spin_lock_init(&clp->cl_lock);
 	rpc_init_wait_queue(&clp->cl_cb_waitq, "Backchannel slot table");
 	return clp;
@@ -1643,7 +1647,7 @@ __destroy_client(struct nfs4_client *clp)
 	spin_lock(&state_lock);
 	while (!list_empty(&clp->cl_delegations)) {
 		dp = list_entry(clp->cl_delegations.next, struct nfs4_delegation, dl_perclnt);
-		unhash_delegation_locked(dp);
+		WARN_ON(!unhash_delegation_locked(dp));
 		list_add(&dp->dl_recall_lru, &reaplist);
 	}
 	spin_unlock(&state_lock);
@@ -1663,6 +1667,7 @@ __destroy_client(struct nfs4_client *clp)
 		atomic_inc(&oo->oo_owner.so_count);
 		release_openowner(oo);
 	}
+	nfsd4_return_all_client_layouts(clp);
 	nfsd4_shutdown_callback(clp);
 	if (clp->cl_cb_conn.cb_xprt)
 		svc_xprt_put(clp->cl_cb_conn.cb_xprt);
@@ -2147,8 +2152,11 @@ nfsd4_replay_cache_entry(struct nfsd4_compoundres *resp,
 static void
 nfsd4_set_ex_flags(struct nfs4_client *new, struct nfsd4_exchange_id *clid)
 {
-	/* pNFS is not supported */
+#ifdef CONFIG_NFSD_PNFS
+	new->cl_exchange_flags |= EXCHGID4_FLAG_USE_PNFS_MDS;
+#else
 	new->cl_exchange_flags |= EXCHGID4_FLAG_USE_NON_PNFS;
+#endif
 
 	/* Referrals are supported, Migration is not. */
 	new->cl_exchange_flags |= EXCHGID4_FLAG_SUPP_MOVED_REFER;
@@ -3077,6 +3085,10 @@ static void nfsd4_init_file(struct nfs4_file *fp, struct knfsd_fh *fh)
 	fp->fi_share_deny = 0;
 	memset(fp->fi_fds, 0, sizeof(fp->fi_fds));
 	memset(fp->fi_access, 0, sizeof(fp->fi_access));
+#ifdef CONFIG_NFSD_PNFS
+	INIT_LIST_HEAD(&fp->fi_lo_states);
+	atomic_set(&fp->fi_lo_recalls, 0);
+#endif
 	hlist_add_head(&fp->fi_hash, &file_hashtbl[hashval]);
 }
 
@@ -3308,7 +3320,7 @@ find_file_locked(struct knfsd_fh *fh)
 	lockdep_assert_held(&state_lock);
 
 	hlist_for_each_entry(fp, &file_hashtbl[hashval], fi_hash) {
-		if (nfsd_fh_match(&fp->fi_fhandle, fh)) {
+		if (fh_match(&fp->fi_fhandle, fh)) {
 			get_nfs4_file(fp);
 			return fp;
 		}
@@ -3842,7 +3854,7 @@ static int nfs4_setlease(struct nfs4_delegation *dp)
 		return -EBADF;
 	}
 	fl->fl_file = filp;
-	status = vfs_setlease(filp, fl->fl_type, &fl);
+	status = vfs_setlease(filp, fl->fl_type, &fl, NULL);
 	if (status) {
 		locks_free_lock(fl);
 		goto out_fput;
@@ -4243,7 +4255,7 @@ nfs4_laundromat(struct nfsd_net *nn)
 			new_timeo = min(new_timeo, t);
 			break;
 		}
-		unhash_delegation_locked(dp);
+		WARN_ON(!unhash_delegation_locked(dp));
 		list_add(&dp->dl_recall_lru, &reaplist);
 	}
 	spin_unlock(&state_lock);
@@ -4296,7 +4308,7 @@ laundromat_main(struct work_struct *laundry)
 
 static inline __be32 nfs4_check_fh(struct svc_fh *fhp, struct nfs4_ol_stateid *stp)
 {
-	if (!nfsd_fh_match(&fhp->fh_handle, &stp->st_stid.sc_file->fi_fhandle))
+	if (!fh_match(&fhp->fh_handle, &stp->st_stid.sc_file->fi_fhandle))
 		return nfserr_bad_stateid;
 	return nfs_ok;
 }
@@ -4863,6 +4875,9 @@ nfsd4_close(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		goto out; 
 	update_stateid(&stp->st_stid.sc_stateid);
 	memcpy(&close->cl_stateid, &stp->st_stid.sc_stateid, sizeof(stateid_t));
+
+	nfsd4_return_all_file_layouts(stp->st_stateowner->so_client,
+				      stp->st_stid.sc_file);
 
 	nfsd4_close_open_stateid(stp);
 
@@ -6140,7 +6155,7 @@ static u64 nfsd_find_all_delegations(struct nfs4_client *clp, u64 max,
 				continue;
 
 			atomic_inc(&clp->cl_refcount);
-			unhash_delegation_locked(dp);
+			WARN_ON(!unhash_delegation_locked(dp));
 			list_add(&dp->dl_recall_lru, victims);
 		}
 		++count;
@@ -6470,7 +6485,7 @@ nfs4_state_shutdown_net(struct net *net)
 	spin_lock(&state_lock);
 	list_for_each_safe(pos, next, &nn->del_recall_lru) {
 		dp = list_entry (pos, struct nfs4_delegation, dl_recall_lru);
-		unhash_delegation_locked(dp);
+		WARN_ON(!unhash_delegation_locked(dp));
 		list_add(&dp->dl_recall_lru, &reaplist);
 	}
 	spin_unlock(&state_lock);

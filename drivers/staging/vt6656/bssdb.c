@@ -126,7 +126,7 @@ PKnownBSS BSSpSearchBSSList(struct vnt_private *pDevice,
 
             if ((pCurrBSS->bActive) &&
                 (pCurrBSS->bSelected == false)) {
-		    if (ether_addr_equal(pCurrBSS->abyBSSID, pbyBSSID)) {
+		    if (!compare_ether_addr(pCurrBSS->abyBSSID, pbyBSSID)) {
                     if (pSSID != NULL) {
                         // compare ssid
                         if ( !memcmp(pSSID->abySSID,
@@ -242,8 +242,8 @@ void BSSvClearBSSList(struct vnt_private *pDevice, int bKeepCurrBSSID)
     for (ii = 0; ii < MAX_BSS_NUM; ii++) {
         if (bKeepCurrBSSID) {
             if (pMgmt->sBSSList[ii].bActive &&
-		ether_addr_equal(pMgmt->sBSSList[ii].abyBSSID,
-				 pMgmt->abyCurrBSSID)) {
+		!compare_ether_addr(pMgmt->sBSSList[ii].abyBSSID,
+				    pMgmt->abyCurrBSSID)) {
  //mike mark: there are two BSSID's in list. If that AP is in hidden ssid mode, one SSID is null,
  //                 but other's might not be obvious, so if it associate's with your STA,
  //                 you must keep the two of them!!
@@ -277,7 +277,7 @@ PKnownBSS BSSpAddrIsInBSSList(struct vnt_private *pDevice,
     for (ii = 0; ii < MAX_BSS_NUM; ii++) {
         pBSSList = &(pMgmt->sBSSList[ii]);
         if (pBSSList->bActive) {
-		if (ether_addr_equal(pBSSList->abyBSSID, abyBSSID)) {
+		if (!compare_ether_addr(pBSSList->abyBSSID, abyBSSID)) {
                 if (pSSID->len == ((PWLAN_IE_SSID)pBSSList->abySSID)->len){
                     if (memcmp(pSSID->abySSID,
                             ((PWLAN_IE_SSID)pBSSList->abySSID)->abySSID,
@@ -623,8 +623,8 @@ int BSSbIsSTAInNodeDB(struct vnt_private *pDevice,
     // Index = 0 reserved for AP Node
     for (ii = 1; ii < (MAX_NODE_NUM + 1); ii++) {
         if (pMgmt->sNodeDBTable[ii].bActive) {
-		if (ether_addr_equal(abyDstAddr,
-				     pMgmt->sNodeDBTable[ii].abyMACAddr)) {
+		if (!compare_ether_addr(abyDstAddr,
+					pMgmt->sNodeDBTable[ii].abyMACAddr)) {
                 *puNodeIndex = ii;
                 return true;
             }

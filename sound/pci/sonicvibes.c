@@ -30,6 +30,7 @@
 #include <linux/gameport.h>
 #include <linux/module.h>
 #include <linux/dma-mapping.h>
+#include <linux/io.h>
 
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -38,8 +39,6 @@
 #include <sound/mpu401.h>
 #include <sound/opl3.h>
 #include <sound/initval.h>
-
-#include <asm/io.h>
 
 MODULE_AUTHOR("Jaroslav Kysela <perex@perex.cz>");
 MODULE_DESCRIPTION("S3 SonicVibes PCI");
@@ -1260,8 +1259,8 @@ static int snd_sonicvibes_create(struct snd_card *card,
 	if ((err = pci_enable_device(pci)) < 0)
 		return err;
 	/* check, if we can restrict PCI DMA transfers to 24 bits */
-        if (pci_set_dma_mask(pci, DMA_BIT_MASK(24)) < 0 ||
-	    pci_set_consistent_dma_mask(pci, DMA_BIT_MASK(24)) < 0) {
+	if (dma_set_mask(&pci->dev, DMA_BIT_MASK(24)) < 0 ||
+	    dma_set_coherent_mask(&pci->dev, DMA_BIT_MASK(24)) < 0) {
 		dev_err(card->dev,
 			"architecture does not support 24bit PCI busmaster DMA\n");
 		pci_disable_device(pci);

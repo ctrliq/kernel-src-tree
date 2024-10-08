@@ -892,7 +892,7 @@ sclp_check_interface(void)
 
 	spin_lock_irqsave(&sclp_lock, flags);
 	/* Prepare init mask command */
-	rc = register_external_interrupt(0x2401, sclp_check_handler);
+	rc = register_external_irq(EXT_IRQ_SERVICE_SIG, sclp_check_handler);
 	if (rc) {
 		spin_unlock_irqrestore(&sclp_lock, flags);
 		return rc;
@@ -910,12 +910,12 @@ sclp_check_interface(void)
 		spin_unlock_irqrestore(&sclp_lock, flags);
 		/* Enable service-signal interruption - needs to happen
 		 * with IRQs enabled. */
-		service_subclass_irq_register();
+		irq_subclass_register(IRQ_SUBCLASS_SERVICE_SIGNAL);
 		/* Wait for signal from interrupt or timeout */
 		sclp_sync_wait();
 		/* Disable service-signal interruption - needs to happen
 		 * with IRQs enabled. */
-		service_subclass_irq_unregister();
+		irq_subclass_unregister(IRQ_SUBCLASS_SERVICE_SIGNAL);
 		spin_lock_irqsave(&sclp_lock, flags);
 		del_timer(&sclp_request_timer);
 		if (sclp_init_req.status == SCLP_REQ_DONE &&
@@ -925,7 +925,7 @@ sclp_check_interface(void)
 		} else
 			rc = -EBUSY;
 	}
-	unregister_external_interrupt(0x2401, sclp_check_handler);
+	unregister_external_irq(EXT_IRQ_SERVICE_SIG, sclp_check_handler);
 	spin_unlock_irqrestore(&sclp_lock, flags);
 	return rc;
 }
@@ -1124,14 +1124,14 @@ sclp_init(void)
 	if (rc)
 		goto fail_init_state_uninitialized;
 	/* Register interrupt handler */
-	rc = register_external_interrupt(0x2401, sclp_interrupt_handler);
+	rc = register_external_irq(EXT_IRQ_SERVICE_SIG, sclp_interrupt_handler);
 	if (rc)
 		goto fail_unregister_reboot_notifier;
 	sclp_init_state = sclp_init_state_initialized;
 	spin_unlock_irqrestore(&sclp_lock, flags);
 	/* Enable service-signal external interruption - needs to happen with
 	 * IRQs enabled. */
-	service_subclass_irq_register();
+	irq_subclass_register(IRQ_SUBCLASS_SERVICE_SIGNAL);
 	sclp_init_mask(1);
 	return 0;
 

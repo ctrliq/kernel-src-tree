@@ -833,7 +833,7 @@ static int ceph_sync_setxattr(struct dentry *dentry, const char *name,
 	struct ceph_pagelist *pagelist = NULL;
 	int err;
 
-	if (value) {
+	if (size > 0) {
 		/* copy value into pagelist */
 		pagelist = kmalloc(sizeof(*pagelist), GFP_NOFS);
 		if (!pagelist)
@@ -843,7 +843,7 @@ static int ceph_sync_setxattr(struct dentry *dentry, const char *name,
 		err = ceph_pagelist_append(pagelist, value, size);
 		if (err)
 			goto out;
-	} else {
+	} else if (!value) {
 		flags |= CEPH_XATTR_REMOVE;
 	}
 
@@ -856,15 +856,22 @@ static int ceph_sync_setxattr(struct dentry *dentry, const char *name,
 		err = PTR_ERR(req);
 		goto out;
 	}
-	req->r_inode = inode;
-	ihold(inode);
-	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
-	req->r_num_caps = 1;
+
 	req->r_args.setxattr.flags = cpu_to_le32(flags);
 	req->r_path2 = kstrdup(name, GFP_NOFS);
+	if (!req->r_path2) {
+		ceph_mdsc_put_request(req);
+		err = -ENOMEM;
+		goto out;
+	}
 
 	req->r_pagelist = pagelist;
 	pagelist = NULL;
+
+	req->r_inode = inode;
+	ihold(inode);
+	req->r_num_caps = 1;
+	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
 
 	dout("xattr.ver (before): %lld\n", ci->i_xattrs.version);
 	err = ceph_mdsc_do_request(mdsc, NULL, req);
@@ -895,6 +902,9 @@ int ceph_setxattr(struct dentry *dentry, const char *name,
 
 	if (ceph_snap(inode) != CEPH_NOSNAP)
 		return -EROFS;
+
+	if (size == 0)
+		value = "";  /* empty EA, do not remove */
 
 	if (!ceph_is_valid_xattr(name))
 		return -EOPNOTSUPP;
@@ -986,12 +996,14 @@ static int ceph_send_removexattr(struct dentry *dentry, const char *name)
 				       USE_AUTH_MDS);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
+	req->r_path2 = kstrdup(name, GFP_NOFS);
+	if (!req->r_path2)
+		return -ENOMEM;
+
 	req->r_inode = inode;
 	ihold(inode);
-	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
 	req->r_num_caps = 1;
-	req->r_path2 = kstrdup(name, GFP_NOFS);
-
+	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
 	err = ceph_mdsc_do_request(mdsc, NULL, req);
 	ceph_mdsc_put_request(req);
 	return err;

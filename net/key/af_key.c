@@ -1383,10 +1383,9 @@ static int pfkey_acquire(struct sock *sk, struct sk_buff *skb, const struct sadb
 		return 0;
 
 	spin_lock_bh(&x->lock);
-	if (x->km.state == XFRM_STATE_ACQ) {
+	if (x->km.state == XFRM_STATE_ACQ)
 		x->km.state = XFRM_STATE_ERROR;
-		wake_up(&net->xfrm.km_waitq);
-	}
+
 	spin_unlock_bh(&x->lock);
 	xfrm_state_put(x);
 	return 0;
@@ -1788,7 +1787,9 @@ static int pfkey_dump_sa(struct pfkey_sock *pfk)
 
 static void pfkey_dump_sa_done(struct pfkey_sock *pfk)
 {
-	xfrm_state_walk_done(&pfk->dump.u.state);
+	struct net *net = sock_net(&pfk->sk);
+
+	xfrm_state_walk_done(&pfk->dump.u.state, net);
 }
 
 static int pfkey_dump(struct sock *sk, struct sk_buff *skb, const struct sadb_msg *hdr, void * const *ext_hdrs)
@@ -1864,7 +1865,7 @@ static u32 gen_reqid(struct net *net)
 			reqid = IPSEC_MANUAL_REQID_MAX+1;
 		xfrm_policy_walk_init(&walk, XFRM_POLICY_TYPE_MAIN);
 		rc = xfrm_policy_walk(net, &walk, check_reqid, (void*)&reqid);
-		xfrm_policy_walk_done(&walk);
+		xfrm_policy_walk_done(&walk, net);
 		if (rc != -EEXIST)
 			return reqid;
 	} while (reqid != start);
@@ -2492,6 +2493,7 @@ static int pfkey_migrate(struct sock *sk, struct sk_buff *skb,
 	struct xfrm_selector sel;
 	struct xfrm_migrate m[XFRM_MAX_DEPTH];
 	struct xfrm_kmaddress k;
+	struct net *net = sock_net(sk);
 
 	if (!present_and_same_family(ext_hdrs[SADB_EXT_ADDRESS_SRC - 1],
 				     ext_hdrs[SADB_EXT_ADDRESS_DST - 1]) ||
@@ -2565,7 +2567,7 @@ static int pfkey_migrate(struct sock *sk, struct sk_buff *skb,
 	}
 
 	return xfrm_migrate(&sel, dir, XFRM_POLICY_TYPE_MAIN, m, i,
-			    kma ? &k : NULL);
+			    kma ? &k : NULL, net);
 
  out:
 	return err;
@@ -2666,7 +2668,9 @@ static int pfkey_dump_sp(struct pfkey_sock *pfk)
 
 static void pfkey_dump_sp_done(struct pfkey_sock *pfk)
 {
-	xfrm_policy_walk_done(&pfk->dump.u.policy);
+	struct net *net = sock_net((struct sock *)pfk);
+
+	xfrm_policy_walk_done(&pfk->dump.u.policy, net);
 }
 
 static int pfkey_spddump(struct sock *sk, struct sk_buff *skb, const struct sadb_msg *hdr, void * const *ext_hdrs)
@@ -3576,6 +3580,7 @@ static int pfkey_sendmsg(struct kiocb *kiocb,
 	struct sk_buff *skb = NULL;
 	struct sadb_msg *hdr = NULL;
 	int err;
+	struct net *net = sock_net(sk);
 
 	err = -EOPNOTSUPP;
 	if (msg->msg_flags & MSG_OOB)
@@ -3598,9 +3603,9 @@ static int pfkey_sendmsg(struct kiocb *kiocb,
 	if (!hdr)
 		goto out;
 
-	mutex_lock(&xfrm_cfg_mutex);
+	mutex_lock(&net->xfrm_cfg_mutex);
 	err = pfkey_process(sk, skb, hdr);
-	mutex_unlock(&xfrm_cfg_mutex);
+	mutex_unlock(&net->xfrm_cfg_mutex);
 
 out:
 	if (err && hdr && pfkey_error(hdr, err, sk) == 0)

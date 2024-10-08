@@ -494,6 +494,7 @@ static int srp_create_ch_ib(struct srp_rdma_ch *ch)
 	struct ib_fmr_pool *fmr_pool = NULL;
 	struct srp_fr_pool *fr_pool = NULL;
 	const int m = 1 + dev->use_fast_reg;
+	struct ib_cq_init_attr cq_attr = {};
 	int ret;
 
 	init_attr = kzalloc(sizeof *init_attr, GFP_KERNEL);
@@ -501,15 +502,19 @@ static int srp_create_ch_ib(struct srp_rdma_ch *ch)
 		return -ENOMEM;
 
 	/* + 1 for SRP_LAST_WR_ID */
+	cq_attr.cqe = target->queue_size + 1;
+	cq_attr.comp_vector = ch->comp_vector;
 	recv_cq = ib_create_cq(dev->dev, srp_recv_completion, NULL, ch,
-			       target->queue_size + 1, ch->comp_vector);
+			       &cq_attr);
 	if (IS_ERR(recv_cq)) {
 		ret = PTR_ERR(recv_cq);
 		goto err;
 	}
 
+	cq_attr.cqe = m * target->queue_size;
+	cq_attr.comp_vector = ch->comp_vector;
 	send_cq = ib_create_cq(dev->dev, srp_send_completion, NULL, ch,
-			       m * target->queue_size, ch->comp_vector);
+			       &cq_attr);
 	if (IS_ERR(send_cq)) {
 		ret = PTR_ERR(send_cq);
 		goto err_recv_cq;
@@ -3276,7 +3281,7 @@ static void srp_add_one(struct ib_device *device)
 	struct srp_device *srp_dev;
 	struct ib_device_attr *dev_attr;
 	struct srp_host *host;
-	int mr_page_shift, s, e, p;
+	int mr_page_shift, p;
 	u64 max_pages_per_mr;
 
 	dev_attr = kmalloc(sizeof *dev_attr, GFP_KERNEL);
@@ -3340,15 +3345,7 @@ static void srp_add_one(struct ib_device *device)
 	if (IS_ERR(srp_dev->mr))
 		goto err_pd;
 
-	if (device->node_type == RDMA_NODE_IB_SWITCH) {
-		s = 0;
-		e = 0;
-	} else {
-		s = 1;
-		e = device->phys_port_cnt;
-	}
-
-	for (p = s; p <= e; ++p) {
+	for (p = rdma_start_port(device); p <= rdma_end_port(device); ++p) {
 		host = srp_add_port(srp_dev, p);
 		if (host)
 			list_add_tail(&host->list, &srp_dev->dev_list);

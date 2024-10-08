@@ -481,7 +481,7 @@ static int rawv6_recvmsg(struct kiocb *iocb, struct sock *sk,
 			goto csum_copy_err;
 		err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
 	} else {
-		err = skb_copy_and_csum_datagram_iovec(skb, 0, msg->msg_iov);
+		err = skb_copy_and_csum_datagram_iovec(skb, 0, msg->msg_iov, copied);
 		if (err == -EINVAL)
 			goto csum_copy_err;
 	}
@@ -642,8 +642,8 @@ static int rawv6_send_hdrinc(struct sock *sk, void *from, int length,
 		goto error_fault;
 
 	IP6_UPD_PO_STATS(sock_net(sk), rt->rt6i_idev, IPSTATS_MIB_OUT, skb->len);
-	err = NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_OUT, skb, NULL,
-		      rt->dst.dev, dst_output);
+	err = NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_OUT, sk, skb,
+		      NULL, rt->dst.dev, dst_output_sk);
 	if (err > 0)
 		err = net_xmit_errno(err);
 	if (err)
@@ -857,7 +857,7 @@ static int rawv6_sendmsg(struct kiocb *iocb, struct sock *sk,
 		fl6.flowi6_oif = np->ucast_oif;
 	security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
 
-	dst = ip6_dst_lookup_flow(sk, &fl6, final_p, true);
+	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto out;

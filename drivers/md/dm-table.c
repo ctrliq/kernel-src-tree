@@ -18,6 +18,8 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/atomic.h>
+#include <linux/blk-mq.h>
+#include <linux/mount.h>
 
 #define DM_MSG_PREFIX "table"
 
@@ -372,23 +374,18 @@ int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
 	int r;
 	dev_t uninitialized_var(dev);
 	struct dm_dev_internal *dd;
-	unsigned int major, minor;
 	struct dm_table *t = ti->table;
-	char dummy;
+	struct block_device *bdev;
 
 	BUG_ON(!t);
 
-	if (sscanf(path, "%u:%u%c", &major, &minor, &dummy) == 2) {
-		/* Extract the major/minor numbers */
-		dev = MKDEV(major, minor);
-		if (MAJOR(dev) != major || MINOR(dev) != minor)
-			return -EOVERFLOW;
+	/* convert the path to a device */
+	bdev = lookup_bdev(path);
+	if (IS_ERR(bdev)) {
+		dev = name_to_dev_t(path);
+		if (!dev)
+			return -ENODEV;
 	} else {
-		/* convert the path to a device */
-		struct block_device *bdev = lookup_bdev(path);
-
-		if (IS_ERR(bdev))
-			return PTR_ERR(bdev);
 		dev = bdev->bd_dev;
 		bdput(bdev);
 	}
@@ -941,7 +938,7 @@ bool dm_table_mq_request_based(struct dm_table *t)
 	return dm_table_get_type(t) == DM_TYPE_MQ_REQUEST_BASED;
 }
 
-static int dm_table_alloc_md_mempools(struct dm_table *t)
+static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *md)
 {
 	unsigned type = dm_table_get_type(t);
 	unsigned per_bio_data_size = 0;
@@ -959,7 +956,7 @@ static int dm_table_alloc_md_mempools(struct dm_table *t)
 			per_bio_data_size = max(per_bio_data_size, tgt->per_bio_data_size);
 		}
 
-	t->mempools = dm_alloc_md_mempools(type, t->integrity_supported, per_bio_data_size);
+	t->mempools = dm_alloc_md_mempools(md, type, t->integrity_supported, per_bio_data_size);
 	if (!t->mempools)
 		return -ENOMEM;
 
@@ -1129,7 +1126,7 @@ int dm_table_complete(struct dm_table *t)
 		return r;
 	}
 
-	r = dm_table_alloc_md_mempools(t);
+	r = dm_table_alloc_md_mempools(t, t->md);
 	if (r)
 		DMERR("unable to allocate mempools");
 
@@ -1443,25 +1440,6 @@ static bool dm_table_supports_write_same(struct dm_table *t)
 	return true;
 }
 
-void dm_table_run_md_queue_async(struct dm_table *t)
-{
-	struct mapped_device *md;
-	struct request_queue *queue;
-	unsigned long flags;
-
-	if (!dm_table_request_based(t))
-		return;
-
-	md = dm_table_get_md(t);
-	queue = dm_get_md_queue(md);
-	if (queue) {
-		spin_lock_irqsave(queue->queue_lock, flags);
-		blk_run_queue_async(queue);
-		spin_unlock_irqrestore(queue->queue_lock, flags);
-	}
-}
-EXPORT_SYMBOL(dm_table_run_md_queue_async);
-
 static int device_discard_capable(struct dm_target *ti, struct dm_dev *dev,
 				  sector_t start, sector_t len, void *data)
 {
@@ -1703,4 +1681,27 @@ struct mapped_device *dm_table_get_md(struct dm_table *t)
 	return t->md;
 }
 EXPORT_SYMBOL(dm_table_get_md);
+
+void dm_table_run_md_queue_async(struct dm_table *t)
+{
+	struct mapped_device *md;
+	struct request_queue *queue;
+	unsigned long flags;
+
+	if (!dm_table_request_based(t))
+		return;
+
+	md = dm_table_get_md(t);
+	queue = dm_get_md_queue(md);
+	if (queue) {
+		if (queue->mq_ops)
+			blk_mq_run_hw_queues(queue, true);
+		else {
+			spin_lock_irqsave(queue->queue_lock, flags);
+			blk_run_queue_async(queue);
+			spin_unlock_irqrestore(queue->queue_lock, flags);
+		}
+	}
+}
+EXPORT_SYMBOL(dm_table_run_md_queue_async);
 

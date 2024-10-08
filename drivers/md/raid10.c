@@ -366,7 +366,6 @@ static void raid10_end_read_request(struct bio *bio, int error)
 	struct md_rdev *rdev;
 	struct r10conf *conf = r10_bio->mddev->private;
 
-
 	slot = r10_bio->read_slot;
 	dev = r10_bio->devs[slot].devnum;
 	rdev = r10_bio->devs[slot].rdev;
@@ -1786,7 +1785,6 @@ static int raid10_spare_active(struct mddev *mddev)
 	return count;
 }
 
-
 static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 {
 	struct r10conf *conf = mddev->private;
@@ -1932,7 +1930,6 @@ abort:
 	print_conf(conf);
 	return err;
 }
-
 
 static void end_sync_read(struct bio *bio, int error)
 {
@@ -2298,7 +2295,6 @@ static void recovery_request_write(struct mddev *mddev, struct r10bio *r10_bio)
 		generic_make_request(wbio2);
 	}
 }
-
 
 /*
  * Used by fix_read_error() to decay the per rdev read_errors.
@@ -2857,7 +2853,6 @@ static void raid10d(struct md_thread *thread)
 	blk_finish_plug(&plug);
 }
 
-
 static int init_resync(struct r10conf *conf)
 {
 	int buffs;
@@ -3385,7 +3380,7 @@ static sector_t sync_request(struct mddev *mddev, sector_t sector_nr,
 				/* remove last page from this bio */
 				bio2->bi_vcnt--;
 				bio2->bi_size -= len;
-				bio2->bi_flags &= ~(1<< BIO_SEG_VALID);
+				__clear_bit(BIO_SEG_VALID, &bio2->bi_flags);
 			}
 			goto bio_full;
 		}
@@ -3770,7 +3765,6 @@ static int run(struct mddev *mddev)
 			mddev->queue->backing_dev_info.ra_pages = 2 * stripe;
 	}
 
-
 	if (md_integrity_register(mddev))
 		goto out_free_conf;
 
@@ -3812,17 +3806,9 @@ out:
 	return -EIO;
 }
 
-static int stop(struct mddev *mddev)
+static void raid10_free(struct mddev *mddev, void *priv)
 {
-	struct r10conf *conf = mddev->private;
-
-	raise_barrier(conf, 0);
-	lower_barrier(conf);
-
-	md_unregister_thread(&mddev->thread);
-	if (mddev->queue)
-		/* the unplug fn references 'conf'*/
-		blk_sync_queue(mddev->queue);
+	struct r10conf *conf = priv;
 
 	if (conf->r10bio_pool)
 		mempool_destroy(conf->r10bio_pool);
@@ -3831,8 +3817,6 @@ static int stop(struct mddev *mddev)
 	kfree(conf->mirrors_old);
 	kfree(conf->mirrors_new);
 	kfree(conf);
-	mddev->private = NULL;
-	return 0;
 }
 
 static void raid10_quiesce(struct mddev *mddev, int state)
@@ -4419,7 +4403,7 @@ read_more:
 	read_bio->bi_end_io = end_sync_read;
 	read_bio->bi_rw = READ;
 	read_bio->bi_flags &= (~0UL << BIO_RESET_BITS);
-	read_bio->bi_flags |= 1 << BIO_UPTODATE;
+	__set_bit(BIO_UPTODATE, &read_bio->bi_flags);
 	read_bio->bi_vcnt = 0;
 	read_bio->bi_size = 0;
 	r10_bio->master_bio = read_bio;
@@ -4475,7 +4459,7 @@ read_more:
 				/* Remove last page from this bio */
 				bio2->bi_vcnt--;
 				bio2->bi_size -= len;
-				bio2->bi_flags &= ~(1<<BIO_SEG_VALID);
+				__clear_bit(BIO_SEG_VALID, &bio2->bi_flags);
 			}
 			goto bio_full;
 		}
@@ -4576,7 +4560,6 @@ static void end_reshape(struct r10conf *conf)
 	}
 	conf->fullsync = 0;
 }
-
 
 static int handle_reshape_read_error(struct mddev *mddev,
 				     struct r10bio *r10_bio)
@@ -4721,7 +4704,7 @@ static struct md_personality raid10_personality =
 	.owner		= THIS_MODULE,
 	.make_request	= make_request,
 	.run		= run,
-	.stop		= stop,
+	.free		= raid10_free,
 	.status		= status,
 	.error_handler	= error,
 	.hot_add_disk	= raid10_add_disk,

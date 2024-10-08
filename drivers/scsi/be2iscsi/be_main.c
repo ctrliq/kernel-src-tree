@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2005 - 2014 Emulex
+ * Copyright (C) 2005 - 2015 Emulex
  * All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -233,20 +233,20 @@ static int beiscsi_eh_abort(struct scsi_cmnd *sc)
 	cls_session = starget_to_session(scsi_target(sc->device));
 	session = cls_session->dd_data;
 
-	spin_lock_bh(&session->lock);
+	spin_lock_bh(&session->frwd_lock);
 	if (!aborted_task || !aborted_task->sc) {
 		/* we raced */
-		spin_unlock_bh(&session->lock);
+		spin_unlock_bh(&session->frwd_lock);
 		return SUCCESS;
 	}
 
 	aborted_io_task = aborted_task->dd_data;
 	if (!aborted_io_task->scsi_cmnd) {
 		/* raced or invalid command */
-		spin_unlock_bh(&session->lock);
+		spin_unlock_bh(&session->frwd_lock);
 		return SUCCESS;
 	}
-	spin_unlock_bh(&session->lock);
+	spin_unlock_bh(&session->frwd_lock);
 	/* Invalidate WRB Posted for this Task */
 	AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
 		      aborted_io_task->pwrb_handle->pwrb,
@@ -311,9 +311,9 @@ static int beiscsi_eh_device_reset(struct scsi_cmnd *sc)
 	/* invalidate iocbs */
 	cls_session = starget_to_session(scsi_target(sc->device));
 	session = cls_session->dd_data;
-	spin_lock_bh(&session->lock);
+	spin_lock_bh(&session->frwd_lock);
 	if (!session->leadconn || session->state != ISCSI_STATE_LOGGED_IN) {
-		spin_unlock_bh(&session->lock);
+		spin_unlock_bh(&session->frwd_lock);
 		return FAILED;
 	}
 	conn = session->leadconn;
@@ -342,7 +342,7 @@ static int beiscsi_eh_device_reset(struct scsi_cmnd *sc)
 		num_invalidate++;
 		inv_tbl++;
 	}
-	spin_unlock_bh(&session->lock);
+	spin_unlock_bh(&session->frwd_lock);
 	inv_tbl = phba->inv_tbl;
 
 	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
@@ -539,7 +539,7 @@ static umode_t beiscsi_eth_get_attr_visibility(void *data, int type)
 }
 
 /*------------------- PCI Driver operations and data ----------------- */
-static DEFINE_PCI_DEVICE_TABLE(beiscsi_pci_id_table) = {
+static const struct pci_device_id beiscsi_pci_id_table[] = {
 	{ PCI_DEVICE(BE_VENDOR_ID, BE_DEVICE_ID1) },
 	{ PCI_DEVICE(BE_VENDOR_ID, BE_DEVICE_ID2) },
 	{ PCI_DEVICE(BE_VENDOR_ID, OC_DEVICE_ID1) },
@@ -1188,9 +1188,9 @@ beiscsi_process_async_pdu(struct beiscsi_conn *beiscsi_conn,
 		return 1;
 	}
 
-	spin_lock_bh(&session->lock);
+	spin_lock_bh(&session->back_lock);
 	__iscsi_complete_pdu(conn, (struct iscsi_hdr *)ppdu, pbuffer, buf_len);
-	spin_unlock_bh(&session->lock);
+	spin_unlock_bh(&session->back_lock);
 	return 0;
 }
 
@@ -1611,7 +1611,7 @@ static void hwi_complete_cmd(struct beiscsi_conn *beiscsi_conn,
 	pwrb = pwrb_handle->pwrb;
 	type = ((struct beiscsi_io_task *)task->dd_data)->wrb_type;
 
-	spin_lock_bh(&session->lock);
+	spin_lock_bh(&session->back_lock);
 	switch (type) {
 	case HWH_TYPE_IO:
 	case HWH_TYPE_IO_RD:
@@ -1650,7 +1650,7 @@ static void hwi_complete_cmd(struct beiscsi_conn *beiscsi_conn,
 		break;
 	}
 
-	spin_unlock_bh(&session->lock);
+	spin_unlock_bh(&session->back_lock);
 }
 
 static struct list_head *hwi_get_async_busy_list(struct hwi_async_pdu_context
@@ -2102,11 +2102,16 @@ static void  beiscsi_process_mcc_isr(struct beiscsi_hba *phba)
 				/* Interpret compl as a async link evt */
 				beiscsi_async_link_state_process(phba,
 				(struct be_async_event_link_state *) mcc_compl);
-			else
+			else {
 				beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_MBOX,
 					    "BM_%d :  Unsupported Async Event, flags"
 					    " = 0x%08x\n",
 					    mcc_compl->flags);
+				if (phba->state & BE_ADAPTER_LINK_UP) {
+					phba->state |= BE_ADAPTER_CHECK_BOOT;
+					phba->get_boot = BE_GET_BOOT_RETRIES;
+				}
+			}
 		} else if (mcc_compl->flags & CQE_FLAGS_COMPLETED_MASK) {
 			be_mcc_compl_process_isr(&phba->ctrl, mcc_compl);
 			atomic_dec(&phba->ctrl.mcc_obj.q.used);
@@ -4400,8 +4405,14 @@ static int beiscsi_get_boot_info(struct beiscsi_hba *phba)
 		beiscsi_log(phba, KERN_ERR,
 			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
 			    "BM_%d : No boot session\n");
+
+		if (ret == -ENXIO)
+			phba->get_boot = 0;
+
+
 		return ret;
 	}
+	phba->get_boot = 0;
 	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
 				sizeof(*session_resp),
 				&nonemb_cmd.dma);
@@ -4730,9 +4741,9 @@ beiscsi_offload_connection(struct beiscsi_conn *beiscsi_conn,
 	 * login/startup related tasks.
 	 */
 	beiscsi_conn->login_in_progress = 0;
-	spin_lock_bh(&session->lock);
+	spin_lock_bh(&session->back_lock);
 	beiscsi_cleanup_task(task);
-	spin_unlock_bh(&session->lock);
+	spin_unlock_bh(&session->back_lock);
 
 	pwrb_handle = alloc_wrb_handle(phba, beiscsi_conn->beiscsi_conn_cid);
 
@@ -5454,8 +5465,14 @@ beiscsi_hw_health_check(struct work_struct *work)
 	be_eqd_update(phba);
 
 	if (phba->state & BE_ADAPTER_CHECK_BOOT) {
-		phba->state &= ~BE_ADAPTER_CHECK_BOOT;
-		be_check_boot_session(phba);
+		if ((phba->get_boot > 0) && (!phba->boot_kset)) {
+			phba->get_boot--;
+			if (!(phba->get_boot % BE_GET_BOOT_TO))
+				be_check_boot_session(phba);
+		} else {
+			phba->state &= ~BE_ADAPTER_CHECK_BOOT;
+			phba->get_boot = 0;
+		}
 	}
 
 	beiscsi_ue_detect(phba);

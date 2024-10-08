@@ -52,6 +52,7 @@ struct perf_sf_sde_regs {
 #define PERF_CPUM_CF_MAX_CTR		256
 
 /* Perf PMU definitions for the sampling facility */
+#define PERF_CPUM_SF_PSW_MASK		0x8000000000000000UL
 #define PERF_CPUM_SF_MAX_CTR		2
 #define PERF_EVENT_CPUM_SF		0xB0000UL /* Event: Basic-sampling */
 #define PERF_EVENT_CPUM_SF_DIAG		0xBD000UL /* Event: Combined-sampling */
@@ -87,6 +88,10 @@ struct sf_raw_sample {
 	struct hws_diag_entry	 diag;	  /* Diagnostic-sampling data entry */
 	u8		    padding[];	  /* Padding to next multiple of 8 */
 } __packed;
+
+/* Perf hardware reserve and release functions */
+int perf_reserve_sampling(void);
+void perf_release_sampling(void);
 
 #endif /* CONFIG_64BIT */
 #endif /* _ASM_S390_PERF_EVENT_H */

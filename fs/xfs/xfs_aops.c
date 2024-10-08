@@ -20,8 +20,6 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_inode.h"
 #include "xfs_trans.h"
@@ -33,7 +31,6 @@
 #include "xfs_bmap.h"
 #include "xfs_bmap_util.h"
 #include "xfs_bmap_btree.h"
-#include "xfs_dinode.h"
 #include <linux/aio.h>
 #include <linux/gfp.h>
 #include <linux/mpage.h>
@@ -248,7 +245,7 @@ xfs_end_io(
 
 done:
 	if (error)
-		ioend->io_error = -error;
+		ioend->io_error = error;
 	xfs_destroy_ioend(ioend);
 }
 
@@ -319,14 +316,14 @@ xfs_map_blocks(
 	int			nimaps = 1;
 
 	if (XFS_FORCED_SHUTDOWN(mp))
-		return -XFS_ERROR(EIO);
+		return -EIO;
 
 	if (type == XFS_IO_UNWRITTEN)
 		bmapi_flags |= XFS_BMAPI_IGSTATE;
 
 	if (!xfs_ilock_nowait(ip, XFS_ILOCK_SHARED)) {
 		if (nonblocking)
-			return -XFS_ERROR(EAGAIN);
+			return -EAGAIN;
 		xfs_ilock(ip, XFS_ILOCK_SHARED);
 	}
 
@@ -343,14 +340,14 @@ xfs_map_blocks(
 	xfs_iunlock(ip, XFS_ILOCK_SHARED);
 
 	if (error)
-		return -XFS_ERROR(error);
+		return error;
 
 	if (type == XFS_IO_DELALLOC &&
 	    (!nimaps || isnullstartblock(imap->br_startblock))) {
 		error = xfs_iomap_write_allocate(ip, offset, imap);
 		if (!error)
 			trace_xfs_map_blocks_alloc(ip, offset, count, type, imap);
-		return -XFS_ERROR(error);
+		return error;
 	}
 
 #ifdef DEBUG
@@ -525,7 +522,7 @@ xfs_submit_ioend(
 		 * time.
 		 */
 		if (fail) {
-			ioend->io_error = -fail;
+			ioend->io_error = fail;
 			xfs_finish_ioend(ioend);
 			continue;
 		}
@@ -1283,7 +1280,7 @@ __xfs_get_blocks(
 	int			new = 0;
 
 	if (XFS_FORCED_SHUTDOWN(mp))
-		return -XFS_ERROR(EIO);
+		return -EIO;
 
 	offset = (xfs_off_t)iblock << inode->i_blkbits;
 	ASSERT(bh_result->b_size >= (1 << inode->i_blkbits));
@@ -1332,7 +1329,7 @@ __xfs_get_blocks(
 			error = xfs_iomap_write_direct(ip, offset, size,
 						       &imap, nimaps);
 			if (error)
-				return -error;
+				return error;
 			new = 1;
 		} else {
 			/*
@@ -1443,7 +1440,7 @@ __xfs_get_blocks(
 
 out_unlock:
 	xfs_iunlock(ip, lockmode);
-	return -error;
+	return error;
 }
 
 int
@@ -1487,15 +1484,24 @@ xfs_end_io_direct_write(
 	bool			is_async)
 {
 	struct xfs_ioend	*ioend = iocb->private;
+	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+	unsigned long		flags;
 
 	/*
 	 * While the generic direct I/O code updates the inode size, it does
 	 * so only after the end_io handler is called, which means our
 	 * end_io handler thinks the on-disk size is outside the in-core
 	 * size.  To prevent this just update it a little bit earlier here.
+	 *
+	 * We need to lock the test/set EOF update as we can be racing with
+	 * other IO completions here to update the EOF. Failing to serialise
+	 * here can result in EOF moving backwards and Bad Things Happen when
+	 * that occurs.
 	 */
+	spin_lock_irqsave(&ip->i_size_lock, flags);
 	if (offset + size > i_size_read(ioend->io_inode))
 		i_size_write(ioend->io_inode, offset + size);
+	spin_unlock_irqrestore(&ip->i_size_lock, flags);
 
 	/*
 	 * blockdev_direct_IO can return an error even after the I/O

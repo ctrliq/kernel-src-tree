@@ -4,11 +4,11 @@ SUBLEVEL = 0
 EXTRAVERSION =
 NAME = Unicycling Gorilla
 RHEL_MAJOR = 7
-RHEL_MINOR = 1
-RHEL_RELEASE = 229
-RHEL_DRM_VERSION = 3
-RHEL_DRM_PATCHLEVEL = 16
-RHEL_DRM_SUBLEVEL = 7
+RHEL_MINOR = 2
+RHEL_RELEASE = 327
+RHEL_DRM_VERSION = 4
+RHEL_DRM_PATCHLEVEL = 1
+RHEL_DRM_SUBLEVEL = 0
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
@@ -381,9 +381,16 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -Wno-format-security \
 		   -fno-delete-null-pointer-checks
 
+ifneq ($(WITH_GCOV),1)
 ifeq ($(KBUILD_EXTMOD),)
-ifneq (,$(filter $(ARCH), x86 x86_64))
+ifneq (,$(filter $(ARCH), x86 x86_64 powerpc))
 KBUILD_CFLAGS   += $(call cc-ifversion, -eq, 0408, -Werror)
+endif
+# powerpc is compiled with -O3 and gcc 4.8 has some known problems
+# with compiler warnings when using -O3, so let's disable them:
+ifeq ($(ARCH)-$(call cc-version),powerpc-0408)
+KBUILD_CFLAGS += -Wno-error=maybe-uninitialized -Wno-error=array-bounds
+endif
 endif
 endif
 

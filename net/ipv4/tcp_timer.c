@@ -135,10 +135,9 @@ static bool retransmits_timed_out(struct sock *sk,
 	if (!inet_csk(sk)->icsk_retransmits)
 		return false;
 
-	if (unlikely(!tcp_sk(sk)->retrans_stamp))
-		start_ts = TCP_SKB_CB(tcp_write_queue_head(sk))->when;
-	else
-		start_ts = tcp_sk(sk)->retrans_stamp;
+	start_ts = tcp_sk(sk)->retrans_stamp;
+	if (unlikely(!start_ts))
+		start_ts = tcp_skb_timestamp(tcp_write_queue_head(sk));
 
 	if (likely(timeout == 0)) {
 		linear_backoff_thresh = ilog2(TCP_RTO_MAX/rto_base);
@@ -164,7 +163,7 @@ static int tcp_write_timeout(struct sock *sk)
 		if (icsk->icsk_retransmits) {
 			dst_negative_advice(sk);
 			if (tp->syn_fastopen || tp->syn_data)
-				tcp_fastopen_cache_set(sk, 0, NULL, true);
+				tcp_fastopen_cache_set(sk, 0, NULL, true, 0);
 			if (tp->syn_data)
 				NET_INC_STATS_BH(sock_net(sk),
 						 LINUX_MIB_TCPFASTOPENACTIVEFAIL);
@@ -181,7 +180,7 @@ static int tcp_write_timeout(struct sock *sk)
 
 		retry_until = sysctl_tcp_retries2;
 		if (sock_flag(sk, SOCK_DEAD)) {
-			const int alive = (icsk->icsk_rto < TCP_RTO_MAX);
+			const int alive = icsk->icsk_rto < TCP_RTO_MAX;
 
 			retry_until = tcp_orphan_retries(sk, alive);
 			do_reset = alive ||
@@ -295,7 +294,7 @@ static void tcp_probe_timer(struct sock *sk)
 
 	max_probes = sysctl_tcp_retries2;
 	if (sock_flag(sk, SOCK_DEAD)) {
-		const int alive = ((icsk->icsk_rto << icsk->icsk_backoff) < TCP_RTO_MAX);
+		const int alive = inet_csk_rto_backoff(icsk, TCP_RTO_MAX) < TCP_RTO_MAX;
 
 		max_probes = tcp_orphan_retries(sk, alive);
 		if (!alive && icsk->icsk_backoff >= max_probes)
@@ -392,7 +391,7 @@ void tcp_retransmit_timer(struct sock *sk)
 			tcp_write_err(sk);
 			goto out;
 		}
-		tcp_enter_loss(sk, 0);
+		tcp_enter_loss(sk);
 		tcp_retransmit_skb(sk, tcp_write_queue_head(sk));
 		__sk_dst_reset(sk);
 		goto out_reset_timer;
@@ -423,7 +422,7 @@ void tcp_retransmit_timer(struct sock *sk)
 		NET_INC_STATS_BH(sock_net(sk), mib_idx);
 	}
 
-	tcp_enter_loss(sk, 0);
+	tcp_enter_loss(sk);
 
 	if (tcp_retransmit_skb(sk, tcp_write_queue_head(sk)) > 0) {
 		/* Retransmission failed because of local congestion,

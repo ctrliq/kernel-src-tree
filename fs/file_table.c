@@ -136,6 +136,7 @@ struct file *get_empty_filp(void)
 	atomic_long_set(&f->f_count, 1);
 	rwlock_init(&f->f_owner.lock);
 	spin_lock_init(&f->f_lock);
+	mutex_init(&f->f_pos_lock);
 	eventpoll_init_file(f);
 	/* f->f_version: 0 */
 	return f;
@@ -360,5 +361,5 @@ void __init files_init(unsigned long mempages)
 	n = (mempages * (PAGE_SIZE / 1024)) / 10;
 	files_stat.max_files = max_t(unsigned long, n, NR_FILE);
 	files_defer_init();
-	percpu_counter_init(&nr_files, 0);
+	percpu_counter_init(&nr_files, 0, GFP_KERNEL);
 } 

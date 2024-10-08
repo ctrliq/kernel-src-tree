@@ -42,12 +42,12 @@
 	do { \
 		memset(&(__pcmd), 0, sizeof(__pcmd)); \
 		(__pcmd).op_to_portid = \
-			cpu_to_be32(FW_CMD_OP(FW_PORT_CMD) | \
-				    FW_CMD_REQUEST | \
-				    FW_CMD_##__op | \
-				    FW_PORT_CMD_PORTID(__port)); \
+			cpu_to_be32(FW_CMD_OP_V(FW_PORT_CMD) | \
+				    FW_CMD_REQUEST_F | \
+				    FW_CMD_##__op##_F | \
+				    FW_PORT_CMD_PORTID_V(__port)); \
 		(__pcmd).action_to_len16 = \
-			cpu_to_be32(FW_PORT_CMD_ACTION(__action) | \
+			cpu_to_be32(FW_PORT_CMD_ACTION_V(__action) | \
 				    FW_LEN16(pcmd)); \
 	} while (0)
 
@@ -62,6 +62,13 @@
 
 #define INIT_PORT_DCB_WRITE_CMD(__pcmd, __port) \
 	INIT_PORT_DCB_CMD(__pcmd, __port, EXEC, FW_PORT_ACTION_L2_DCB_CFG)
+
+#define IEEE_FAUX_SYNC(__dev, __dcb) \
+	do { \
+		if ((__dcb)->dcb_version == FW_PORT_DCB_VER_IEEE) \
+			cxgb4_dcb_state_fsm((__dev), \
+					    CXGB4_DCB_STATE_FW_ALLSYNCED); \
+	} while (0)
 
 /* States we can be in for a port's Data Center Bridging.
  */
@@ -108,11 +115,13 @@ struct port_dcb_info {
 	 * Native Endian format).
 	 */
 	u32	pgid;			/* Priority Group[0..7] */
+	u8	dcb_version;		/* Running DCBx version */
 	u8	pfcen;			/* Priority Flow Control[0..7] */
 	u8	pg_num_tcs_supported;	/* max PG Traffic Classes */
 	u8	pfc_num_tcs_supported;	/* max PFC Traffic Classes */
 	u8	pgrate[8];		/* Priority Group Rate[0..7] */
 	u8	priorate[8];		/* Priority Rate[0..7] */
+	u8	tsa[8];			/* TSA Algorithm[0..7] */
 	struct app_priority { /* Application Information */
 		u8	user_prio_map;	/* Priority Map bitfield */
 		u8	sel_field;	/* Protocol ID interpretation */
@@ -121,6 +130,7 @@ struct port_dcb_info {
 };
 
 void cxgb4_dcb_state_init(struct net_device *);
+void cxgb4_dcb_version_init(struct net_device *);
 void cxgb4_dcb_state_fsm(struct net_device *, enum cxgb4_dcb_state_input);
 void cxgb4_dcb_handle_fw_update(struct adapter *, const struct fw_port_cmd *);
 void cxgb4_dcb_set_caps(struct adapter *, const struct fw_port_cmd *);

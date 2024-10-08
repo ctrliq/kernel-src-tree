@@ -30,6 +30,7 @@ enum btrfs_wq_endio_type {
 	BTRFS_WQ_ENDIO_METADATA = 1,
 	BTRFS_WQ_ENDIO_FREE_SPACE = 2,
 	BTRFS_WQ_ENDIO_RAID56 = 3,
+	BTRFS_WQ_ENDIO_DIO_REPAIR = 4,
 };
 
 static inline u64 btrfs_sb_offset(int mirror)
@@ -140,6 +141,8 @@ int btree_lock_page_hook(struct page *page, void *data,
 				void (*flush_fn)(void *));
 int btrfs_calc_num_tolerated_disk_barrier_failures(
 	struct btrfs_fs_info *fs_info);
+int __init btrfs_end_io_wq_init(void);
+void btrfs_end_io_wq_exit(void);
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 void btrfs_init_lockdep(void);

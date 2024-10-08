@@ -110,14 +110,14 @@ static int rtas_pci_read_config(struct pci_bus *bus,
 	if (!found)
 		return PCIBIOS_DEVICE_NOT_FOUND;
 #ifdef CONFIG_EEH
-	edev = of_node_to_eeh_dev(dn);
-	if (edev && edev->pe && edev->pe->state & EEH_PE_RESET)
+	edev = pdn_to_eeh_dev(pdn);
+	if (edev && edev->pe && edev->pe->state & EEH_PE_CFG_BLOCKED)
 		return PCIBIOS_DEVICE_NOT_FOUND;
 #endif
 
 	ret = rtas_read_config(pdn, where, size, val);
 	if (*val == EEH_IO_ERROR_VALUE(size) &&
-	    eeh_dev_check_failure(of_node_to_eeh_dev(dn)))
+	    eeh_dev_check_failure(pdn_to_eeh_dev(pdn)))
 		return PCIBIOS_DEVICE_NOT_FOUND;
 
 	return ret;
@@ -174,8 +174,8 @@ static int rtas_pci_write_config(struct pci_bus *bus,
 	if (!found)
 		return PCIBIOS_DEVICE_NOT_FOUND;
 #ifdef CONFIG_EEH
-	edev = of_node_to_eeh_dev(dn);
-	if (edev && edev->pe && (edev->pe->state & EEH_PE_RESET))
+	edev = pdn_to_eeh_dev(pdn);
+	if (edev && edev->pe && (edev->pe->state & EEH_PE_CFG_BLOCKED))
 		return PCIBIOS_DEVICE_NOT_FOUND;
 #endif
 	ret = rtas_write_config(pdn, where, size, val);

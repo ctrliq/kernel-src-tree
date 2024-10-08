@@ -207,6 +207,19 @@ cifs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+static long cifs_fallocate(struct file *file, int mode, loff_t off, loff_t len)
+{
+	struct super_block *sb = file->f_path.dentry->d_sb;
+	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
+	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
+	struct TCP_Server_Info *server = tcon->ses->server;
+
+	if (server->ops->fallocate)
+		return server->ops->fallocate(file, tcon, mode, off, len);
+
+	return -EOPNOTSUPP;
+}
+
 static int cifs_permission(struct inode *inode, int mask)
 {
 	struct cifs_sb_info *cifs_sb;
@@ -724,6 +737,20 @@ out_nls:
 	goto out;
 }
 
+static ssize_t
+cifs_loose_read(struct kiocb *iocb, const struct iovec *iov,
+                                   unsigned long nr_segs, loff_t pos)
+{
+	ssize_t rc;
+	struct inode *inode = file_inode(iocb->ki_filp);
+
+	rc = cifs_revalidate_mapping(inode);
+	if (rc)
+		return rc;
+
+	return generic_file_aio_read(iocb, iov, nr_segs, pos);
+}
+
 static ssize_t cifs_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 				   unsigned long nr_segs, loff_t pos)
 {
@@ -787,7 +814,8 @@ static loff_t cifs_llseek(struct file *file, loff_t offset, int whence)
 	return generic_file_llseek(file, offset, whence);
 }
 
-static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
+static int
+cifs_setlease(struct file *file, long arg, struct file_lock **lease, void **priv)
 {
 	/*
 	 * Note that this is called by vfs setlease with i_lock held to
@@ -803,7 +831,7 @@ static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
 	if (arg == F_UNLCK ||
 	    ((arg == F_RDLCK) && CIFS_CACHE_READ(CIFS_I(inode))) ||
 	    ((arg == F_WRLCK) && CIFS_CACHE_WRITE(CIFS_I(inode))))
-		return generic_setlease(file, arg, lease);
+		return generic_setlease(file, arg, lease, priv);
 	else if (tlink_tcon(cfile->tlink)->local_lease &&
 		 !CIFS_CACHE_READ(CIFS_I(inode)))
 		/*
@@ -814,7 +842,7 @@ static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
 		 * knows that the file won't be changed on the server by anyone
 		 * else.
 		 */
-		return generic_setlease(file, arg, lease);
+		return generic_setlease(file, arg, lease, priv);
 	else
 		return -EAGAIN;
 }
@@ -891,7 +919,7 @@ const struct inode_operations cifs_symlink_inode_ops = {
 const struct file_operations cifs_file_ops = {
 	.read = do_sync_read,
 	.write = do_sync_write,
-	.aio_read = generic_file_aio_read,
+	.aio_read = cifs_loose_read,
 	.aio_write = cifs_file_aio_write,
 	.open = cifs_open,
 	.release = cifs_close,
@@ -905,6 +933,7 @@ const struct file_operations cifs_file_ops = {
 	.unlocked_ioctl	= cifs_ioctl,
 #endif /* CONFIG_CIFS_POSIX */
 	.setlease = cifs_setlease,
+	.fallocate = cifs_fallocate,
 };
 
 const struct file_operations cifs_file_strict_ops = {
@@ -924,13 +953,14 @@ const struct file_operations cifs_file_strict_ops = {
 	.unlocked_ioctl	= cifs_ioctl,
 #endif /* CONFIG_CIFS_POSIX */
 	.setlease = cifs_setlease,
+	.fallocate = cifs_fallocate,
 };
 
 const struct file_operations cifs_file_direct_ops = {
 	/* BB reevaluate whether they can be done with directio, no cache */
 	.read = do_sync_read,
 	.write = do_sync_write,
-	.aio_read = cifs_user_readv,
+	.aio_read = cifs_user_readv_wrapper,
 	.aio_write = cifs_user_writev,
 	.open = cifs_open,
 	.release = cifs_close,
@@ -944,12 +974,13 @@ const struct file_operations cifs_file_direct_ops = {
 #endif /* CONFIG_CIFS_POSIX */
 	.llseek = cifs_llseek,
 	.setlease = cifs_setlease,
+	.fallocate = cifs_fallocate,
 };
 
 const struct file_operations cifs_file_nobrl_ops = {
 	.read = do_sync_read,
 	.write = do_sync_write,
-	.aio_read = generic_file_aio_read,
+	.aio_read = cifs_loose_read,
 	.aio_write = cifs_file_aio_write,
 	.open = cifs_open,
 	.release = cifs_close,
@@ -962,6 +993,7 @@ const struct file_operations cifs_file_nobrl_ops = {
 	.unlocked_ioctl	= cifs_ioctl,
 #endif /* CONFIG_CIFS_POSIX */
 	.setlease = cifs_setlease,
+	.fallocate = cifs_fallocate,
 };
 
 const struct file_operations cifs_file_strict_nobrl_ops = {
@@ -980,13 +1012,14 @@ const struct file_operations cifs_file_strict_nobrl_ops = {
 	.unlocked_ioctl	= cifs_ioctl,
 #endif /* CONFIG_CIFS_POSIX */
 	.setlease = cifs_setlease,
+	.fallocate = cifs_fallocate,
 };
 
 const struct file_operations cifs_file_direct_nobrl_ops = {
 	/* BB reevaluate whether they can be done with directio, no cache */
 	.read = do_sync_read,
 	.write = do_sync_write,
-	.aio_read = cifs_user_readv,
+	.aio_read = cifs_user_readv_wrapper,
 	.aio_write = cifs_user_writev,
 	.open = cifs_open,
 	.release = cifs_close,
@@ -999,6 +1032,7 @@ const struct file_operations cifs_file_direct_nobrl_ops = {
 #endif /* CONFIG_CIFS_POSIX */
 	.llseek = cifs_llseek,
 	.setlease = cifs_setlease,
+	.fallocate = cifs_fallocate,
 };
 
 const struct file_operations cifs_dir_ops = {

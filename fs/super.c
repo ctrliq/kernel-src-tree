@@ -69,9 +69,6 @@ static int prune_super(struct shrinker *shrink, struct shrink_control *sc)
 	if (sc->nr_to_scan && !(sc->gfp_mask & __GFP_FS))
 		return -1;
 
-	if (!grab_super_passive(sb))
-		return -1;
-
 	if (sb->s_op && sb->s_op->nr_cached_objects)
 		fs_objects = sb->s_op->nr_cached_objects(sb);
 
@@ -106,7 +103,6 @@ static int prune_super(struct shrinker *shrink, struct shrink_control *sc)
 	}
 
 	total_objects = (total_objects / 100) * sysctl_vfs_cache_pressure;
-	drop_super(sb);
 	return total_objects;
 }
 
@@ -148,7 +144,8 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags)
 	if (security_sb_alloc(s))
 		goto fail;
 	for (i = 0; i < SB_FREEZE_LEVELS; i++) {
-		if (percpu_counter_init(&s->s_writers.counter[i], 0) < 0)
+		if (percpu_counter_init(&s->s_writers.counter[i], 0,
+					GFP_KERNEL) < 0)
 			goto fail;
 		lockdep_init_map(&s->s_writers.lock_map[i], sb_writers_name[i],
 				 &type->s_writers_key[i], 0);
@@ -247,10 +244,9 @@ void deactivate_locked_super(struct super_block *s)
 	struct file_system_type *fs = s->s_type;
 	if (atomic_dec_and_test(&s->s_active)) {
 		cleancache_invalidate_fs(s);
+		unregister_shrinker(&s->s_shrink);
 		fs->kill_sb(s);
 
-		/* caches are now gone, we can safely kill the shrinker now */
-		unregister_shrinker(&s->s_shrink);
 		put_filesystem(fs);
 		put_super(s);
 	} else {

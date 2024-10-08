@@ -954,7 +954,13 @@ static const struct x86_cpu_id rapl_ids[] = {
 	{ X86_VENDOR_INTEL, 6, 0x3c},/* Haswell */
 	{ X86_VENDOR_INTEL, 6, 0x3d},/* Broadwell */
 	{ X86_VENDOR_INTEL, 6, 0x3f},/* Haswell */
+	{ X86_VENDOR_INTEL, 6, 0x4f},/* Broadwell servers */
 	{ X86_VENDOR_INTEL, 6, 0x45},/* Haswell ULT */
+	{ X86_VENDOR_INTEL, 6, 0x47},/* Broadwell-H */
+	{ X86_VENDOR_INTEL, 6, 0x4E},/* Skylake */
+	{ X86_VENDOR_INTEL, 6, 0x56},/* Future Xeon */
+	{ X86_VENDOR_INTEL, 6, 0x57},/* Knights Landing */
+	{ X86_VENDOR_INTEL, 6, 0x5E},/* Skylake-H/S */
 	/* TODO: Add more CPU IDs after testing */
 	{}
 };
@@ -1127,8 +1133,7 @@ err_cleanup_package:
 static int rapl_check_domain(int cpu, int domain)
 {
 	unsigned msr;
-	u64 val1, val2 = 0;
-	int retry = 0;
+	u64 val = 0;
 
 	switch (domain) {
 	case RAPL_DOMAIN_PACKAGE:
@@ -1147,21 +1152,13 @@ static int rapl_check_domain(int cpu, int domain)
 		pr_err("invalid domain id %d\n", domain);
 		return -EINVAL;
 	}
-	if (rdmsrl_safe_on_cpu(cpu, msr, &val1))
+	/* make sure domain counters are available and contains non-zero
+	 * values, otherwise skip it.
+	 */
+	if (rdmsrl_safe_on_cpu(cpu, msr, &val) || !val)
 		return -ENODEV;
 
-	/* energy counters roll slowly on some domains */
-	while (++retry < 10) {
-		usleep_range(10000, 15000);
-		rdmsrl_safe_on_cpu(cpu, msr, &val2);
-		if ((val1 & ENERGY_STATUS_MASK) != (val2 & ENERGY_STATUS_MASK))
-			return 0;
-	}
-	/* if energy counter does not change, report as bad domain */
-	pr_info("domain %s energy ctr %llu:%llu not working, skip\n",
-		rapl_domain_names[domain], val1, val2);
-
-	return -ENODEV;
+	return 0;
 }
 
 /* Detect active and valid domains for the given CPU, caller must
@@ -1176,8 +1173,10 @@ static int rapl_detect_domains(struct rapl_package *rp, int cpu)
 
 	for (i = 0; i < RAPL_DOMAIN_MAX; i++) {
 		/* use physical package id to read counters */
-		if (!rapl_check_domain(cpu, i))
+		if (!rapl_check_domain(cpu, i)) {
 			rp->domain_map |= 1 << i;
+			pr_info("Found RAPL domain %s\n", rapl_domain_names[i]);
+		}
 	}
 	rp->nr_domains = bitmap_weight(&rp->domain_map,	RAPL_DOMAIN_MAX);
 	if (!rp->nr_domains) {

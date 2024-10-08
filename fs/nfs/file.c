@@ -946,7 +946,7 @@ EXPORT_SYMBOL_GPL(nfs_flock);
  * There is no protocol support for leases, so we have no way to implement
  * them correctly in the face of opens by other clients.
  */
-int nfs_setlease(struct file *file, long arg, struct file_lock **fl)
+int nfs_setlease(struct file *file, long arg, struct file_lock **fl, void **priv)
 {
 	dprintk("NFS: setlease(%pD2, arg=%ld)\n", file, arg);
 	return -EINVAL;

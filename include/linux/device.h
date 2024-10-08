@@ -662,7 +662,7 @@ struct acpi_device;
 
 struct acpi_dev_node {
 #ifdef CONFIG_ACPI
-	RH_KABI_REPLACE_P(void	*handle,
+	RH_KABI_REPLACE(void	*handle,
 		          struct acpi_device *companion)
 
 #endif
@@ -809,8 +809,7 @@ struct device {
  * going forward.  This structure will never be under KABI restrictions.
  */
 struct device_rh {
-#ifndef __GENKSYMS__
-#endif
+	RH_KABI_EXTEND(struct dev_pm_info_rh power)
 };
 
 static inline struct device *kobj_to_dev(struct kobject *kobj)
@@ -914,6 +913,13 @@ static inline int device_trylock(struct device *dev)
 static inline void device_unlock(struct device *dev)
 {
 	mutex_unlock(&dev->mutex);
+}
+
+static inline struct device_node *dev_of_node(struct device *dev)
+{
+	if (!IS_ENABLED(CONFIG_OF))
+		return NULL;
+	return dev->of_node;
 }
 
 void driver_init(void);

@@ -23,8 +23,6 @@
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
 #include "xfs_bit.h"
-#include "xfs_sb.h"
-#include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_da_format.h"
 #include "xfs_da_btree.h"
@@ -167,8 +165,8 @@ xfs_da3_node_verify(
 	 * we don't know if the node is for and attribute or directory tree,
 	 * so only fail if the count is outside both bounds
 	 */
-	if (ichdr.count > mp->m_dir_node_ents &&
-	    ichdr.count > mp->m_attr_node_ents)
+	if (ichdr.count > mp->m_dir_geo->node_ents &&
+	    ichdr.count > mp->m_attr_geo->node_ents)
 		return false;
 
 	/* XXX: hash order check? */
@@ -185,7 +183,7 @@ xfs_da3_node_write_verify(
 	struct xfs_da3_node_hdr *hdr3 = bp->b_addr;
 
 	if (!xfs_da3_node_verify(bp)) {
-		xfs_buf_ioerror(bp, EFSCORRUPTED);
+		xfs_buf_ioerror(bp, -EFSCORRUPTED);
 		xfs_verifier_error(bp);
 		return;
 	}
@@ -214,13 +212,13 @@ xfs_da3_node_read_verify(
 	switch (be16_to_cpu(info->magic)) {
 		case XFS_DA3_NODE_MAGIC:
 			if (!xfs_buf_verify_cksum(bp, XFS_DA3_NODE_CRC_OFF)) {
-				xfs_buf_ioerror(bp, EFSBADCRC);
+				xfs_buf_ioerror(bp, -EFSBADCRC);
 				break;
 			}
 			/* fall through */
 		case XFS_DA_NODE_MAGIC:
 			if (!xfs_da3_node_verify(bp)) {
-				xfs_buf_ioerror(bp, EFSCORRUPTED);
+				xfs_buf_ioerror(bp, -EFSCORRUPTED);
 				break;
 			}
 			return;
@@ -385,7 +383,7 @@ xfs_da3_split(
 		switch (oldblk->magic) {
 		case XFS_ATTR_LEAF_MAGIC:
 			error = xfs_attr3_leaf_split(state, oldblk, newblk);
-			if ((error != 0) && (error != ENOSPC)) {
+			if ((error != 0) && (error != -ENOSPC)) {
 				return error;	/* GROT: attr is inconsistent */
 			}
 			if (!error) {
@@ -514,7 +512,6 @@ xfs_da3_root_split(
 	struct xfs_buf		*bp;
 	struct xfs_inode	*dp;
 	struct xfs_trans	*tp;
-	struct xfs_mount	*mp;
 	struct xfs_dir2_leaf	*leaf;
 	xfs_dablk_t		blkno;
 	int			level;
@@ -534,7 +531,6 @@ xfs_da3_root_split(
 
 	dp = args->dp;
 	tp = args->trans;
-	mp = state->mp;
 	error = xfs_da_get_buf(tp, dp, blkno, -1, &bp, args->whichfork);
 	if (error)
 		return error;
@@ -598,7 +594,7 @@ xfs_da3_root_split(
 	 * Set up the new root node.
 	 */
 	error = xfs_da3_node_create(args,
-		(args->whichfork == XFS_DATA_FORK) ? mp->m_dirleafblk : 0,
+		(args->whichfork == XFS_DATA_FORK) ? args->geo->leafblk : 0,
 		level + 1, &bp, args->whichfork);
 	if (error)
 		return error;
@@ -616,10 +612,10 @@ xfs_da3_root_split(
 #ifdef DEBUG
 	if (oldroot->hdr.info.magic == cpu_to_be16(XFS_DIR2_LEAFN_MAGIC) ||
 	    oldroot->hdr.info.magic == cpu_to_be16(XFS_DIR3_LEAFN_MAGIC)) {
-		ASSERT(blk1->blkno >= mp->m_dirleafblk &&
-		       blk1->blkno < mp->m_dirfreeblk);
-		ASSERT(blk2->blkno >= mp->m_dirleafblk &&
-		       blk2->blkno < mp->m_dirfreeblk);
+		ASSERT(blk1->blkno >= args->geo->leafblk &&
+		       blk1->blkno < args->geo->freeblk);
+		ASSERT(blk2->blkno >= args->geo->leafblk &&
+		       blk2->blkno < args->geo->freeblk);
 	}
 #endif
 
@@ -663,7 +659,7 @@ xfs_da3_node_split(
 	/*
 	 * Do we have to split the node?
 	 */
-	if (nodehdr.count + newcount > state->node_ents) {
+	if (nodehdr.count + newcount > state->args->geo->node_ents) {
 		/*
 		 * Allocate a new node, add to the doubly linked chain of
 		 * nodes, then move some of our excess entries into it.
@@ -894,8 +890,8 @@ xfs_da3_node_add(
 	ASSERT(oldblk->index >= 0 && oldblk->index <= nodehdr.count);
 	ASSERT(newblk->blkno != 0);
 	if (state->args->whichfork == XFS_DATA_FORK)
-		ASSERT(newblk->blkno >= state->mp->m_dirleafblk &&
-		       newblk->blkno < state->mp->m_dirfreeblk);
+		ASSERT(newblk->blkno >= state->args->geo->leafblk &&
+		       newblk->blkno < state->args->geo->freeblk);
 
 	/*
 	 * We may need to make some room before we insert the new node.
@@ -1089,14 +1085,15 @@ xfs_da3_root_join(
 	 * that could occur. For dir3 blocks we also need to update the block
 	 * number in the buffer header.
 	 */
-	memcpy(root_blk->bp->b_addr, bp->b_addr, state->blocksize);
+	memcpy(root_blk->bp->b_addr, bp->b_addr, args->geo->blksize);
 	root_blk->bp->b_ops = bp->b_ops;
 	xfs_trans_buf_copy_type(root_blk->bp, bp);
 	if (oldroothdr.magic == XFS_DA3_NODE_MAGIC) {
 		struct xfs_da3_blkinfo *da3 = root_blk->bp->b_addr;
 		da3->blkno = cpu_to_be64(root_blk->bp->b_bn);
 	}
-	xfs_trans_log_buf(args->trans, root_blk->bp, 0, state->blocksize - 1);
+	xfs_trans_log_buf(args->trans, root_blk->bp, 0,
+			  args->geo->blksize - 1);
 	error = xfs_da_shrink_inode(args, child, bp);
 	return error;
 }
@@ -1139,7 +1136,7 @@ xfs_da3_node_toosmall(
 	info = blk->bp->b_addr;
 	node = (xfs_da_intnode_t *)info;
 	dp->d_ops->node_hdr_from_disk(&nodehdr, node);
-	if (nodehdr.count > (state->node_ents >> 1)) {
+	if (nodehdr.count > (state->args->geo->node_ents >> 1)) {
 		*action = 0;	/* blk over 50%, don't try to join */
 		return 0;	/* blk over 50%, don't try to join */
 	}
@@ -1176,8 +1173,8 @@ xfs_da3_node_toosmall(
 	 * We prefer coalescing with the lower numbered sibling so as
 	 * to shrink a directory over time.
 	 */
-	count  = state->node_ents;
-	count -= state->node_ents >> 2;
+	count  = state->args->geo->node_ents;
+	count -= state->args->geo->node_ents >> 2;
 	count -= nodehdr.count;
 
 	/* start with smaller blk num */
@@ -1472,7 +1469,7 @@ xfs_da3_node_lookup_int(
 	 * Descend thru the B-tree searching each level for the right
 	 * node to use, until the right hashval is found.
 	 */
-	blkno = (args->whichfork == XFS_DATA_FORK)? state->mp->m_dirleafblk : 0;
+	blkno = (args->whichfork == XFS_DATA_FORK)? args->geo->leafblk : 0;
 	for (blk = &state->path.blk[0], state->path.active = 1;
 			 state->path.active <= XFS_DA_NODE_MAXDEPTH;
 			 blk++, state->path.active++) {
@@ -1578,9 +1575,9 @@ xfs_da3_node_lookup_int(
 			args->blkno = blk->blkno;
 		} else {
 			ASSERT(0);
-			return XFS_ERROR(EFSCORRUPTED);
+			return -EFSCORRUPTED;
 		}
-		if (((retval == ENOENT) || (retval == ENOATTR)) &&
+		if (((retval == -ENOENT) || (retval == -ENOATTR)) &&
 		    (blk->hashval == args->hashval)) {
 			error = xfs_da3_path_shift(state, &state->path, 1, 1,
 							 &retval);
@@ -1590,7 +1587,7 @@ xfs_da3_node_lookup_int(
 				continue;
 			} else if (blk->magic == XFS_ATTR_LEAF_MAGIC) {
 				/* path_shift() gives ENOENT */
-				retval = XFS_ERROR(ENOATTR);
+				retval = -ENOATTR;
 			}
 		}
 		break;
@@ -1858,7 +1855,7 @@ xfs_da3_path_shift(
 		}
 	}
 	if (level < 0) {
-		*result = XFS_ERROR(ENOENT);	/* we're out of our tree */
+		*result = -ENOENT;	/* we're out of our tree */
 		ASSERT(args->op_flags & XFS_DA_OP_OKNOENT);
 		return 0;
 	}
@@ -2003,7 +2000,7 @@ xfs_da_grow_inode_int(
 	struct xfs_trans	*tp = args->trans;
 	struct xfs_inode	*dp = args->dp;
 	int			w = args->whichfork;
-	xfs_drfsbno_t		nblks = dp->i_d.di_nblocks;
+	xfs_rfsblock_t		nblks = dp->i_d.di_nblocks;
 	struct xfs_bmbt_irec	map, *mapp;
 	int			nmap, error, got, i, mapi;
 
@@ -2067,7 +2064,7 @@ xfs_da_grow_inode_int(
 	if (got != count || mapp[0].br_startoff != *bno ||
 	    mapp[mapi - 1].br_startoff + mapp[mapi - 1].br_blockcount !=
 	    *bno + count) {
-		error = XFS_ERROR(ENOSPC);
+		error = -ENOSPC;
 		goto out_free_map;
 	}
 
@@ -2090,20 +2087,12 @@ xfs_da_grow_inode(
 	xfs_dablk_t		*new_blkno)
 {
 	xfs_fileoff_t		bno;
-	int			count;
 	int			error;
 
 	trace_xfs_da_grow_inode(args);
 
-	if (args->whichfork == XFS_DATA_FORK) {
-		bno = args->dp->i_mount->m_dirleafblk;
-		count = args->dp->i_mount->m_dirblkfsbs;
-	} else {
-		bno = 0;
-		count = 1;
-	}
-
-	error = xfs_da_grow_inode_int(args, &bno, count);
+	bno = args->geo->leafblk;
+	error = xfs_da_grow_inode_int(args, &bno, args->geo->fsbcount);
 	if (!error)
 		*new_blkno = (xfs_dablk_t)bno;
 	return error;
@@ -2158,27 +2147,27 @@ xfs_da3_swap_lastblock(
 	w = args->whichfork;
 	ASSERT(w == XFS_DATA_FORK);
 	mp = dp->i_mount;
-	lastoff = mp->m_dirfreeblk;
+	lastoff = args->geo->freeblk;
 	error = xfs_bmap_last_before(tp, dp, &lastoff, w);
 	if (error)
 		return error;
 	if (unlikely(lastoff == 0)) {
 		XFS_ERROR_REPORT("xfs_da_swap_lastblock(1)", XFS_ERRLEVEL_LOW,
 				 mp);
-		return XFS_ERROR(EFSCORRUPTED);
+		return -EFSCORRUPTED;
 	}
 	/*
 	 * Read the last block in the btree space.
 	 */
-	last_blkno = (xfs_dablk_t)lastoff - mp->m_dirblkfsbs;
+	last_blkno = (xfs_dablk_t)lastoff - args->geo->fsbcount;
 	error = xfs_da3_node_read(tp, dp, last_blkno, -1, &last_buf, w);
 	if (error)
 		return error;
 	/*
 	 * Copy the last block into the dead buffer and log it.
 	 */
-	memcpy(dead_buf->b_addr, last_buf->b_addr, mp->m_dirblksize);
-	xfs_trans_log_buf(tp, dead_buf, 0, mp->m_dirblksize - 1);
+	memcpy(dead_buf->b_addr, last_buf->b_addr, args->geo->blksize);
+	xfs_trans_log_buf(tp, dead_buf, 0, args->geo->blksize - 1);
 	dead_info = dead_buf->b_addr;
 	/*
 	 * Get values from the moved block.
@@ -2216,7 +2205,7 @@ xfs_da3_swap_lastblock(
 		    sib_info->magic != dead_info->magic)) {
 			XFS_ERROR_REPORT("xfs_da_swap_lastblock(2)",
 					 XFS_ERRLEVEL_LOW, mp);
-			error = XFS_ERROR(EFSCORRUPTED);
+			error = -EFSCORRUPTED;
 			goto done;
 		}
 		sib_info->forw = cpu_to_be32(dead_blkno);
@@ -2238,7 +2227,7 @@ xfs_da3_swap_lastblock(
 		       sib_info->magic != dead_info->magic)) {
 			XFS_ERROR_REPORT("xfs_da_swap_lastblock(3)",
 					 XFS_ERRLEVEL_LOW, mp);
-			error = XFS_ERROR(EFSCORRUPTED);
+			error = -EFSCORRUPTED;
 			goto done;
 		}
 		sib_info->back = cpu_to_be32(dead_blkno);
@@ -2247,7 +2236,7 @@ xfs_da3_swap_lastblock(
 					sizeof(sib_info->back)));
 		sib_buf = NULL;
 	}
-	par_blkno = mp->m_dirleafblk;
+	par_blkno = args->geo->leafblk;
 	level = -1;
 	/*
 	 * Walk down the tree looking for the parent of the moved block.
@@ -2261,7 +2250,7 @@ xfs_da3_swap_lastblock(
 		if (level >= 0 && level != par_hdr.level + 1) {
 			XFS_ERROR_REPORT("xfs_da_swap_lastblock(4)",
 					 XFS_ERRLEVEL_LOW, mp);
-			error = XFS_ERROR(EFSCORRUPTED);
+			error = -EFSCORRUPTED;
 			goto done;
 		}
 		level = par_hdr.level;
@@ -2274,7 +2263,7 @@ xfs_da3_swap_lastblock(
 		if (entno == par_hdr.count) {
 			XFS_ERROR_REPORT("xfs_da_swap_lastblock(5)",
 					 XFS_ERRLEVEL_LOW, mp);
-			error = XFS_ERROR(EFSCORRUPTED);
+			error = -EFSCORRUPTED;
 			goto done;
 		}
 		par_blkno = be32_to_cpu(btree[entno].before);
@@ -2301,7 +2290,7 @@ xfs_da3_swap_lastblock(
 		if (unlikely(par_blkno == 0)) {
 			XFS_ERROR_REPORT("xfs_da_swap_lastblock(6)",
 					 XFS_ERRLEVEL_LOW, mp);
-			error = XFS_ERROR(EFSCORRUPTED);
+			error = -EFSCORRUPTED;
 			goto done;
 		}
 		error = xfs_da3_node_read(tp, dp, par_blkno, -1, &par_buf, w);
@@ -2312,7 +2301,7 @@ xfs_da3_swap_lastblock(
 		if (par_hdr.level != level) {
 			XFS_ERROR_REPORT("xfs_da_swap_lastblock(7)",
 					 XFS_ERRLEVEL_LOW, mp);
-			error = XFS_ERROR(EFSCORRUPTED);
+			error = -EFSCORRUPTED;
 			goto done;
 		}
 		btree = dp->d_ops->node_tree_p(par_node);
@@ -2349,18 +2338,13 @@ xfs_da_shrink_inode(
 	xfs_inode_t *dp;
 	int done, error, w, count;
 	xfs_trans_t *tp;
-	xfs_mount_t *mp;
 
 	trace_xfs_da_shrink_inode(args);
 
 	dp = args->dp;
 	w = args->whichfork;
 	tp = args->trans;
-	mp = dp->i_mount;
-	if (w == XFS_DATA_FORK)
-		count = mp->m_dirblkfsbs;
-	else
-		count = 1;
+	count = args->geo->fsbcount;
 	for (;;) {
 		/*
 		 * Remove extents.  If we get ENOSPC for a dir we have to move
@@ -2369,7 +2353,7 @@ xfs_da_shrink_inode(
 		error = xfs_bunmapi(tp, dp, dead_blkno, count,
 				    xfs_bmapi_aflag(w)|XFS_BMAPI_METADATA,
 				    0, args->firstblock, args->flist, &done);
-		if (error == ENOSPC) {
+		if (error == -ENOSPC) {
 			if (w != XFS_DATA_FORK)
 				break;
 			error = xfs_da3_swap_lastblock(args, &dead_blkno,
@@ -2437,7 +2421,7 @@ xfs_buf_map_from_irec(
 		map = kmem_zalloc(nirecs * sizeof(struct xfs_buf_map),
 				  KM_SLEEP | KM_NOFS);
 		if (!map)
-			return ENOMEM;
+			return -ENOMEM;
 		*mapp = map;
 	}
 
@@ -2479,7 +2463,10 @@ xfs_dabuf_map(
 	ASSERT(map && *map);
 	ASSERT(*nmaps == 1);
 
-	nfsb = (whichfork == XFS_DATA_FORK) ? mp->m_dirblkfsbs : 1;
+	if (whichfork == XFS_DATA_FORK)
+		nfsb = mp->m_dir_geo->fsbcount;
+	else
+		nfsb = mp->m_attr_geo->fsbcount;
 
 	/*
 	 * Caller doesn't have a mapping.  -2 means don't complain
@@ -2507,8 +2494,8 @@ xfs_dabuf_map(
 	}
 
 	if (!xfs_da_map_covers_blocks(nirecs, irecs, bno, nfsb)) {
-		error = mappedbno == -2 ? -1 : XFS_ERROR(EFSCORRUPTED);
-		if (unlikely(error == EFSCORRUPTED)) {
+		error = mappedbno == -2 ? -1 : -EFSCORRUPTED;
+		if (unlikely(error == -EFSCORRUPTED)) {
 			if (xfs_error_level >= XFS_ERRLEVEL_LOW) {
 				int i;
 				xfs_alert(mp, "%s: bno %lld dir: inode %lld",
@@ -2568,7 +2555,7 @@ xfs_da_get_buf(
 
 	bp = xfs_trans_get_buf_map(trans, dp->i_mount->m_ddev_targp,
 				    mapp, nmap, 0);
-	error = bp ? bp->b_error : XFS_ERROR(EIO);
+	error = bp ? bp->b_error : -EIO;
 	if (error) {
 		if (bp)
 			xfs_trans_brelse(trans, bp);
