@@ -1,0 +1,169 @@
+iommu/vt-d: Remove segment from struct device_domain_info()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Remove segment from struct device_domain_info() (Myron Stowe) [1129880 1087643]
+Rebuild_FUZZ: 94.64%
+commit-author David Woodhouse <David.Woodhouse@intel.com>
+commit 41e80dca52bd0497c1bb292713fc0164415e9ae6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/41e80dca.failed
+
+It's accessible via info->iommu->segment so this is redundant.
+
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 41e80dca52bd0497c1bb292713fc0164415e9ae6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 78f8d07de7e0,5c89eb7ae398..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -397,10 -369,9 +397,9 @@@ struct dmar_domain 
+  struct device_domain_info {
+  	struct list_head link;	/* link to domain siblings */
+  	struct list_head global; /* link to global list */
+- 	int segment;		/* PCI domain */
+  	u8 bus;			/* PCI bus number */
+  	u8 devfn;		/* PCI devfn number */
+ -	struct device *dev; /* it's NULL for PCIe-to-PCI bridge */
+ +	struct pci_dev *dev; /* it's NULL for PCIe-to-PCI bridge */
+  	struct intel_iommu *iommu; /* IOMMU used by this device */
+  	struct dmar_domain *domain; /* pointer to domain */
+  };
+@@@ -2029,25 -2135,26 +2028,31 @@@ dmar_search_domain_by_dev_info(int segm
+  	struct device_domain_info *info;
+  
+  	list_for_each_entry(info, &device_domain_list, global)
+- 		if (info->segment == segment && info->bus == bus &&
++ 		if (info->iommu->segment == segment && info->bus == bus &&
+  		    info->devfn == devfn)
+ -			return info;
+ +			return info->domain;
+  
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static int dmar_insert_dev_info(int segment, int bus, int devfn,
+ +				struct pci_dev *dev, struct dmar_domain **domp)
+++=======
++ static struct dmar_domain *dmar_insert_dev_info(struct intel_iommu *iommu,
++ 						int bus, int devfn,
++ 						struct device *dev,
++ 						struct dmar_domain *domain)
+++>>>>>>> 41e80dca52bd (iommu/vt-d: Remove segment from struct device_domain_info())
+  {
+ -	struct dmar_domain *found = NULL;
+ +	struct dmar_domain *found, *domain = *domp;
+  	struct device_domain_info *info;
+  	unsigned long flags;
+  
+  	info = alloc_devinfo_mem();
+  	if (!info)
+ -		return NULL;
+ +		return -ENOMEM;
+  
+- 	info->segment = segment;
+  	info->bus = bus;
+  	info->devfn = devfn;
+  	info->dev = dev;
+@@@ -2057,9 -2165,13 +2062,19 @@@
+  
+  	spin_lock_irqsave(&device_domain_lock, flags);
+  	if (dev)
+++<<<<<<< HEAD
+ +		found = find_domain(&dev->dev);
+ +	else
+ +		found = dmar_search_domain_by_dev_info(segment, bus, devfn);
+++=======
++ 		found = find_domain(dev);
++ 	else {
++ 		struct device_domain_info *info2;
++ 		info2 = dmar_search_domain_by_dev_info(iommu->segment, bus, devfn);
++ 		if (info2)
++ 			found = info2->domain;
++ 	}
+++>>>>>>> 41e80dca52bd (iommu/vt-d: Remove segment from struct device_domain_info())
+  	if (found) {
+  		spin_unlock_irqrestore(&device_domain_lock, flags);
+  		free_devinfo_mem(info);
+@@@ -2134,21 -2248,20 +2149,32 @@@ static struct dmar_domain *get_domain_f
+  
+  	/* register pcie-to-pci device */
+  	if (dev_tmp) {
+++<<<<<<< HEAD
+ +		if (dmar_insert_dev_info(segment, bus, devfn, NULL, &domain))
+++=======
++ 		domain = dmar_insert_dev_info(iommu, bus, devfn, NULL,
++ 					      domain);
++ 		if (!domain)
+++>>>>>>> 41e80dca52bd (iommu/vt-d: Remove segment from struct device_domain_info())
+  			goto error;
+ +		else
+ +			free = NULL;
+  	}
+  
+  found_domain:
+++<<<<<<< HEAD
+ +	if (dmar_insert_dev_info(segment, pdev->bus->number, pdev->devfn,
+ +				 pdev, &domain) == 0)
+ +		return domain;
+++=======
++ 	domain = dmar_insert_dev_info(iommu, pdev->bus->number,
++ 				      pdev->devfn, &pdev->dev, domain);
+++>>>>>>> 41e80dca52bd (iommu/vt-d: Remove segment from struct device_domain_info())
+  error:
+ -	if (free != domain)
+ +	if (free)
+  		domain_exit(free);
+ -
+ -	return domain;
+ +	/* recheck it here, maybe others set it */
+ +	return find_domain(&pdev->dev);
+  }
+  
+  static int iommu_identity_mapping;
+@@@ -2343,25 -2457,19 +2369,32 @@@ static int domain_add_dev_info(struct d
+  			       struct pci_dev *pdev,
+  			       int translation)
+  {
+ -	struct dmar_domain *ndomain;
+ -	struct intel_iommu *iommu;
+ +	struct device_domain_info *info;
+ +	unsigned long flags;
+  	int ret;
+  
+ -	iommu = device_to_iommu(pci_domain_nr(pdev->bus),
+ -				pdev->bus->number, pdev->devfn);
+ -	if (!iommu)
+ -		return -ENODEV;
+ +	info = alloc_devinfo_mem();
+ +	if (!info)
+ +		return -ENOMEM;
+ +
+++<<<<<<< HEAD
+ +	info->segment = pci_domain_nr(pdev->bus);
+ +	info->bus = pdev->bus->number;
+ +	info->devfn = pdev->devfn;
+ +	info->dev = pdev;
+ +	info->domain = domain;
+  
+ +	spin_lock_irqsave(&device_domain_lock, flags);
+ +	list_add(&info->link, &domain->devices);
+ +	list_add(&info->global, &device_domain_list);
+ +	pdev->dev.archdata.iommu = info;
+ +	spin_unlock_irqrestore(&device_domain_lock, flags);
+++=======
++ 	ndomain = dmar_insert_dev_info(iommu, pdev->bus->number, pdev->devfn,
++ 				       &pdev->dev, domain);
++ 	if (ndomain != domain)
++ 		return -EBUSY;
+++>>>>>>> 41e80dca52bd (iommu/vt-d: Remove segment from struct device_domain_info())
+  
+  	ret = domain_context_mapping(domain, pdev, translation);
+  	if (ret) {
+* Unmerged path drivers/iommu/intel-iommu.c
