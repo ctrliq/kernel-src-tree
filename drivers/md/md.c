@@ -405,12 +405,12 @@ static void md_submit_flush_data(struct work_struct *ws)
 
 void md_flush_request(struct mddev *mddev, struct bio *bio)
 {
-	spin_lock_irq(&mddev->write_lock);
+	spin_lock_irq(&mddev->lock);
 	wait_event_lock_irq(mddev->sb_wait,
 			    !mddev->flush_bio,
-			    mddev->write_lock);
+			    mddev->lock);
 	mddev->flush_bio = bio;
-	spin_unlock_irq(&mddev->write_lock);
+	spin_unlock_irq(&mddev->lock);
 
 	INIT_WORK(&mddev->flush_work, submit_flushes);
 	queue_work(md_wq, &mddev->flush_work);
@@ -473,7 +473,7 @@ void mddev_init(struct mddev *mddev)
 	atomic_set(&mddev->active, 1);
 	atomic_set(&mddev->openers, 0);
 	atomic_set(&mddev->active_io, 0);
-	spin_lock_init(&mddev->write_lock);
+	spin_lock_init(&mddev->lock);
 	atomic_set(&mddev->flush_pending, 0);
 	init_waitqueue_head(&mddev->sb_wait);
 	init_waitqueue_head(&mddev->recovery_wait);
@@ -2375,7 +2375,7 @@ repeat:
 		return;
 	}
 
-	spin_lock_irq(&mddev->write_lock);
+	spin_lock(&mddev->lock);
 
 	mddev->utime = get_seconds();
 
@@ -2432,7 +2432,7 @@ repeat:
 	}
 
 	sync_sbs(mddev, nospares);
-	spin_unlock_irq(&mddev->write_lock);
+	spin_unlock(&mddev->lock);
 
 	pr_debug("md: updating %s RAID superblock on device (in sync %d)\n",
 		 mdname(mddev), mddev->in_sync);
@@ -2471,15 +2471,15 @@ repeat:
 	md_super_wait(mddev);
 	/* if there was a failure, MD_CHANGE_DEVS was set, and we re-write super */
 
-	spin_lock_irq(&mddev->write_lock);
+	spin_lock(&mddev->lock);
 	if (mddev->in_sync != sync_req ||
 	    test_bit(MD_CHANGE_DEVS, &mddev->flags)) {
 		/* have to write it out again */
-		spin_unlock_irq(&mddev->write_lock);
+		spin_unlock(&mddev->lock);
 		goto repeat;
 	}
 	clear_bit(MD_CHANGE_PENDING, &mddev->flags);
-	spin_unlock_irq(&mddev->write_lock);
+	spin_unlock(&mddev->lock);
 	wake_up(&mddev->sb_wait);
 	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
 		sysfs_notify(&mddev->kobj, NULL, "sync_completed");
@@ -3876,7 +3876,7 @@ array_state_store(struct mddev *mddev, const char *buf, size_t len)
 	case clean:
 		if (mddev->pers) {
 			restart_array(mddev);
-			spin_lock_irq(&mddev->write_lock);
+			spin_lock(&mddev->lock);
 			if (atomic_read(&mddev->writes_pending) == 0) {
 				if (mddev->in_sync == 0) {
 					mddev->in_sync = 1;
@@ -3887,7 +3887,7 @@ array_state_store(struct mddev *mddev, const char *buf, size_t len)
 				err = 0;
 			} else
 				err = -EBUSY;
-			spin_unlock_irq(&mddev->write_lock);
+			spin_unlock(&mddev->lock);
 		} else
 			err = -EINVAL;
 		break;
@@ -7270,7 +7270,7 @@ void md_write_start(struct mddev *mddev, struct bio *bi)
 	if (mddev->safemode == 1)
 		mddev->safemode = 0;
 	if (mddev->in_sync) {
-		spin_lock_irq(&mddev->write_lock);
+		spin_lock(&mddev->lock);
 		if (mddev->in_sync) {
 			mddev->in_sync = 0;
 			set_bit(MD_CHANGE_CLEAN, &mddev->flags);
@@ -7278,7 +7278,7 @@ void md_write_start(struct mddev *mddev, struct bio *bi)
 			md_wakeup_thread(mddev->thread);
 			did_change = 1;
 		}
-		spin_unlock_irq(&mddev->write_lock);
+		spin_unlock(&mddev->lock);
 	}
 	if (did_change)
 		sysfs_notify_dirent_safe(mddev->sysfs_state);
@@ -7316,7 +7316,7 @@ int md_allow_write(struct mddev *mddev)
 	if (!mddev->pers->sync_request)
 		return 0;
 
-	spin_lock_irq(&mddev->write_lock);
+	spin_lock(&mddev->lock);
 	if (mddev->in_sync) {
 		mddev->in_sync = 0;
 		set_bit(MD_CHANGE_CLEAN, &mddev->flags);
@@ -7324,11 +7324,11 @@ int md_allow_write(struct mddev *mddev)
 		if (mddev->safemode_delay &&
 		    mddev->safemode == 0)
 			mddev->safemode = 1;
-		spin_unlock_irq(&mddev->write_lock);
+		spin_unlock(&mddev->lock);
 		md_update_sb(mddev, 0);
 		sysfs_notify_dirent_safe(mddev->sysfs_state);
 	} else
-		spin_unlock_irq(&mddev->write_lock);
+		spin_unlock(&mddev->lock);
 
 	if (test_bit(MD_CHANGE_PENDING, &mddev->flags))
 		return -EAGAIN;
@@ -7856,7 +7856,7 @@ void md_check_recovery(struct mddev *mddev)
 
 		if (!mddev->external) {
 			int did_change = 0;
-			spin_lock_irq(&mddev->write_lock);
+			spin_lock(&mddev->lock);
 			if (mddev->safemode &&
 			    !atomic_read(&mddev->writes_pending) &&
 			    !mddev->in_sync &&
@@ -7867,7 +7867,7 @@ void md_check_recovery(struct mddev *mddev)
 			}
 			if (mddev->safemode == 1)
 				mddev->safemode = 0;
-			spin_unlock_irq(&mddev->write_lock);
+			spin_unlock(&mddev->lock);
 			if (did_change)
 				sysfs_notify_dirent_safe(mddev->sysfs_state);
 		}
