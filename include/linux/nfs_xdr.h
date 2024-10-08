@@ -485,7 +485,7 @@ struct nfs4_delegreturnargs {
 struct nfs4_delegreturnres {
 	struct nfs4_sequence_res	seq_res;
 	struct nfs_fattr * fattr;
-	const struct nfs_server *server;
+	struct nfs_server *server;
 };
 
 /*
@@ -558,7 +558,7 @@ struct nfs_removeargs {
 
 struct nfs_removeres {
 	struct nfs4_sequence_res 	seq_res;
-	const struct nfs_server *server;
+	struct nfs_server *server;
 	struct nfs_fattr	*dir_attr;
 	struct nfs4_change_info	cinfo;
 };
@@ -576,7 +576,7 @@ struct nfs_renameargs {
 
 struct nfs_renameres {
 	struct nfs4_sequence_res	seq_res;
-	const struct nfs_server		*server;
+	struct nfs_server		*server;
 	struct nfs4_change_info		old_cinfo;
 	struct nfs_fattr		*old_fattr;
 	struct nfs4_change_info		new_cinfo;
