@@ -1,0 +1,114 @@
+ext4: note the error in ext4_end_bio()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Matthew Wilcox <willy@linux.intel.com>
+commit 9503c67c93ed0b95ba62d12d1fd09da6245dbdd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9503c67c.failed
+
+ext4_end_bio() currently throws away the error that it receives.  Chances
+are this is part of a spate of errors, one of which will end up getting
+the error returned to userspace somehow, but we shouldn't take that risk.
+Also print out the errno to aid in debug.
+
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 9503c67c93ed0b95ba62d12d1fd09da6245dbdd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/page-io.c
+diff --cc fs/ext4/page-io.c
+index 44bfba203e32,c18d95b50540..000000000000
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@@ -284,59 -304,37 +284,66 @@@ static void ext4_end_bio(struct bio *bi
+  	bio->bi_end_io = NULL;
+  	if (test_bit(BIO_UPTODATE, &bio->bi_flags))
+  		error = 0;
+ +	for (i = 0; i < bio->bi_vcnt; i++) {
+ +		struct bio_vec *bvec = &bio->bi_io_vec[i];
+ +		struct page *page = bvec->bv_page;
+ +		struct buffer_head *bh, *head;
+ +		unsigned bio_start = bvec->bv_offset;
+ +		unsigned bio_end = bio_start + bvec->bv_len;
+ +		unsigned under_io = 0;
+ +		unsigned long flags;
+ +
+ +		if (!page)
+ +			continue;
+ +
+ +		if (error) {
+ +			SetPageError(page);
+ +			set_bit(AS_EIO, &page->mapping->flags);
+ +		}
+ +		bh = head = page_buffers(page);
+ +		/*
+ +		 * We check all buffers in the page under BH_Uptodate_Lock
+ +		 * to avoid races with other end io clearing async_write flags
+ +		 */
+ +		local_irq_save(flags);
+ +		bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
+ +		do {
+ +			if (bh_offset(bh) < bio_start ||
+ +			    bh_offset(bh) + blocksize > bio_end) {
+ +				if (buffer_async_write(bh))
+ +					under_io++;
+ +				continue;
+ +			}
+ +			clear_buffer_async_write(bh);
+ +			if (error)
+ +				buffer_io_error(bh);
+ +		} while ((bh = bh->b_this_page) != head);
+ +		bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
+ +		local_irq_restore(flags);
+ +		if (!under_io)
+ +			end_page_writeback(page);
+ +	}
+ +	bio_put(bio);
+  
+  	if (error) {
+++<<<<<<< HEAD
+ +		io_end->flag |= EXT4_IO_END_ERROR;
+ +		ext4_warning(inode->i_sb, "I/O error writing to inode %lu "
+++=======
++ 		struct inode *inode = io_end->inode;
++ 
++ 		ext4_warning(inode->i_sb, "I/O error %d writing to inode %lu "
+++>>>>>>> 9503c67c93ed (ext4: note the error in ext4_end_bio())
+  			     "(offset %llu size %ld starting block %llu)",
+- 			     inode->i_ino,
++ 			     error, inode->i_ino,
+  			     (unsigned long long) io_end->offset,
+  			     (long) io_end->size,
+  			     (unsigned long long)
+  			     bi_sector >> (inode->i_blkbits - 9));
++ 		mapping_set_error(inode->i_mapping, error);
+  	}
+  
+ -	if (io_end->flag & EXT4_IO_END_UNWRITTEN) {
+ -		/*
+ -		 * Link bio into list hanging from io_end. We have to do it
+ -		 * atomically as bio completions can be racing against each
+ -		 * other.
+ -		 */
+ -		bio->bi_private = xchg(&io_end->bio, bio);
+ -		ext4_put_io_end_defer(io_end);
+ -	} else {
+ -		/*
+ -		 * Drop io_end reference early. Inode can get freed once
+ -		 * we finish the bio.
+ -		 */
+ -		ext4_put_io_end_defer(io_end);
+ -		ext4_finish_bio(bio);
+ -		bio_put(bio);
+ -	}
+ +	ext4_put_io_end_defer(io_end);
+  }
+  
+  void ext4_io_submit(struct ext4_io_submit *io)
+* Unmerged path fs/ext4/page-io.c
