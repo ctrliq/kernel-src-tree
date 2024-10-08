@@ -1,0 +1,1271 @@
+sched/deadline: Add SCHED_DEADLINE structures & implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dario Faggioli <raistlin@linux.it>
+commit aab03e05e8f7e26f51dee792beddcb5cca9215a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/aab03e05.failed
+
+Introduces the data structures, constants and symbols needed for
+SCHED_DEADLINE implementation.
+
+Core data structure of SCHED_DEADLINE are defined, along with their
+initializers. Hooks for checking if a task belong to the new policy
+are also added where they are needed.
+
+Adds a scheduling class, in sched/dl.c and a new policy called
+SCHED_DEADLINE. It is an implementation of the Earliest Deadline
+First (EDF) scheduling algorithm, augmented with a mechanism (called
+Constant Bandwidth Server, CBS) that makes it possible to isolate
+the behaviour of tasks between each other.
+
+The typical -deadline task will be made up of a computation phase
+(instance) which is activated on a periodic or sporadic fashion. The
+expected (maximum) duration of such computation is called the task's
+runtime; the time interval by which each instance need to be completed
+is called the task's relative deadline. The task's absolute deadline
+is dynamically calculated as the time instant a task (better, an
+instance) activates plus the relative deadline.
+
+The EDF algorithms selects the task with the smallest absolute
+deadline as the one to be executed first, while the CBS ensures each
+task to run for at most its runtime every (relative) deadline
+length time interval, avoiding any interference between different
+tasks (bandwidth isolation).
+Thanks to this feature, also tasks that do not strictly comply with
+the computational model sketched above can effectively use the new
+policy.
+
+To summarize, this patch:
+ - introduces the data structures, constants and symbols needed;
+ - implements the core logic of the scheduling algorithm in the new
+   scheduling class file;
+ - provides all the glue code between the new scheduling class and
+   the core scheduler and refines the interactions between sched/dl
+   and the other existing scheduling classes.
+
+	Signed-off-by: Dario Faggioli <raistlin@linux.it>
+	Signed-off-by: Michael Trimarchi <michael@amarulasolutions.com>
+	Signed-off-by: Fabio Checconi <fchecconi@gmail.com>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1383831828-15501-4-git-send-email-juri.lelli@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit aab03e05e8f7e26f51dee792beddcb5cca9215a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/Makefile
+#	kernel/sched/core.c
+diff --cc include/linux/sched.h
+index e57aba91f593,6c196794fc12..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -55,6 -56,70 +55,73 @@@ struct sched_param 
+  
+  #include <asm/processor.h>
+  
+++<<<<<<< HEAD
+++=======
++ #define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
++ 
++ /*
++  * Extended scheduling parameters data structure.
++  *
++  * This is needed because the original struct sched_param can not be
++  * altered without introducing ABI issues with legacy applications
++  * (e.g., in sched_getparam()).
++  *
++  * However, the possibility of specifying more than just a priority for
++  * the tasks may be useful for a wide variety of application fields, e.g.,
++  * multimedia, streaming, automation and control, and many others.
++  *
++  * This variant (sched_attr) is meant at describing a so-called
++  * sporadic time-constrained task. In such model a task is specified by:
++  *  - the activation period or minimum instance inter-arrival time;
++  *  - the maximum (or average, depending on the actual scheduling
++  *    discipline) computation time of all instances, a.k.a. runtime;
++  *  - the deadline (relative to the actual activation time) of each
++  *    instance.
++  * Very briefly, a periodic (sporadic) task asks for the execution of
++  * some specific computation --which is typically called an instance--
++  * (at most) every period. Moreover, each instance typically lasts no more
++  * than the runtime and must be completed by time instant t equal to
++  * the instance activation time + the deadline.
++  *
++  * This is reflected by the actual fields of the sched_attr structure:
++  *
++  *  @size		size of the structure, for fwd/bwd compat.
++  *
++  *  @sched_policy	task's scheduling policy
++  *  @sched_flags	for customizing the scheduler behaviour
++  *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH)
++  *  @sched_priority	task's static priority (SCHED_FIFO/RR)
++  *  @sched_deadline	representative of the task's deadline
++  *  @sched_runtime	representative of the task's runtime
++  *  @sched_period	representative of the task's period
++  *
++  * Given this task model, there are a multiplicity of scheduling algorithms
++  * and policies, that can be used to ensure all the tasks will make their
++  * timing constraints.
++  *
++  * As of now, the SCHED_DEADLINE policy (sched_dl scheduling class) is the
++  * only user of this new interface. More information about the algorithm
++  * available in the scheduling class file or in Documentation/.
++  */
++ struct sched_attr {
++ 	u32 size;
++ 
++ 	u32 sched_policy;
++ 	u64 sched_flags;
++ 
++ 	/* SCHED_NORMAL, SCHED_BATCH */
++ 	s32 sched_nice;
++ 
++ 	/* SCHED_FIFO, SCHED_RR */
++ 	u32 sched_priority;
++ 
++ 	/* SCHED_DEADLINE */
++ 	u64 sched_runtime;
++ 	u64 sched_deadline;
++ 	u64 sched_period;
++ };
++ 
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  struct exec_domain;
+  struct futex_pi_state;
+  struct robust_list_head;
+diff --cc kernel/sched/Makefile
+index deaf90e4a1de,b039035a9376..000000000000
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@@ -11,7 -11,9 +11,13 @@@ ifneq ($(CONFIG_SCHED_OMIT_FRAME_POINTE
+  CFLAGS_core.o := $(PROFILING) -fno-omit-frame-pointer
+  endif
+  
+++<<<<<<< HEAD
+ +obj-y += core.o clock.o cputime.o idle_task.o fair.o rt.o stop_task.o
+++=======
++ obj-y += core.o proc.o clock.o cputime.o
++ obj-y += idle_task.o fair.o rt.o deadline.o stop_task.o
++ obj-y += wait.o completion.o
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  obj-$(CONFIG_SMP) += cpupri.o
+  obj-$(CONFIG_SCHED_AUTOGROUP) += auto_group.o
+  obj-$(CONFIG_SCHEDSTATS) += stats.o
+diff --cc kernel/sched/core.c
+index f167fdc57a94,203aecdcfccb..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4083,22 -3009,78 +4100,93 @@@ static struct task_struct *find_process
+  	return pid ? find_task_by_vpid(pid) : current;
+  }
+  
+++<<<<<<< HEAD
+ +/* Actually do priority change: must hold rq lock. */
+ +static void
+ +__setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
+++=======
++ /*
++  * This function initializes the sched_dl_entity of a newly becoming
++  * SCHED_DEADLINE task.
++  *
++  * Only the static values are considered here, the actual runtime and the
++  * absolute deadline will be properly calculated when the task is enqueued
++  * for the first time with its new policy.
++  */
++ static void
++ __setparam_dl(struct task_struct *p, const struct sched_attr *attr)
++ {
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	init_dl_task_timer(dl_se);
++ 	dl_se->dl_runtime = attr->sched_runtime;
++ 	dl_se->dl_deadline = attr->sched_deadline;
++ 	dl_se->flags = attr->sched_flags;
++ 	dl_se->dl_throttled = 0;
++ 	dl_se->dl_new = 1;
++ }
++ 
++ /* Actually do priority change: must hold pi & rq lock. */
++ static void __setscheduler(struct rq *rq, struct task_struct *p,
++ 			   const struct sched_attr *attr)
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  {
+ -	int policy = attr->sched_policy;
+ -
+  	p->policy = policy;
+++<<<<<<< HEAD
+ +	p->rt_priority = prio;
+++=======
++ 
++ 	if (dl_policy(policy))
++ 		__setparam_dl(p, attr);
++ 	else if (rt_policy(policy))
++ 		p->rt_priority = attr->sched_priority;
++ 	else
++ 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
++ 
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  	p->normal_prio = normal_prio(p);
+ +	/* we are holding p->pi_lock already */
+  	p->prio = rt_mutex_getprio(p);
+++<<<<<<< HEAD
+ +	if (rt_prio(p->prio))
+++=======
++ 
++ 	if (dl_prio(p->prio))
++ 		p->sched_class = &dl_sched_class;
++ 	else if (rt_prio(p->prio))
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  		p->sched_class = &rt_sched_class;
+  	else
+  		p->sched_class = &fair_sched_class;
+  	set_load_weight(p);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ __getparam_dl(struct task_struct *p, struct sched_attr *attr)
++ {
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	attr->sched_priority = p->rt_priority;
++ 	attr->sched_runtime = dl_se->dl_runtime;
++ 	attr->sched_deadline = dl_se->dl_deadline;
++ 	attr->sched_flags = dl_se->flags;
++ }
++ 
++ /*
++  * This function validates the new parameters of a -deadline task.
++  * We ask for the deadline not being zero, and greater or equal
++  * than the runtime.
++  */
++ static bool
++ __checkparam_dl(const struct sched_attr *attr)
++ {
++ 	return attr && attr->sched_deadline != 0 &&
++ 	       (s64)(attr->sched_deadline - attr->sched_runtime) >= 0;
++ }
++ 
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  /*
+   * check the target process has a UID that matches the current process's
+   */
+@@@ -4146,11 -3131,12 +4235,16 @@@ recheck
+  	 * 1..MAX_USER_RT_PRIO-1, valid priority for SCHED_NORMAL,
+  	 * SCHED_BATCH and SCHED_IDLE is 0.
+  	 */
+ -	if (attr->sched_priority < 0 ||
+ -	    (p->mm && attr->sched_priority > MAX_USER_RT_PRIO-1) ||
+ -	    (!p->mm && attr->sched_priority > MAX_RT_PRIO-1))
+ +	if (param->sched_priority < 0 ||
+ +	    (p->mm && param->sched_priority > MAX_USER_RT_PRIO-1) ||
+ +	    (!p->mm && param->sched_priority > MAX_RT_PRIO-1))
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	if (rt_policy(policy) != (param->sched_priority != 0))
+++=======
++ 	if ((dl_policy(policy) && !__checkparam_dl(attr)) ||
++ 	    (rt_policy(policy) != (attr->sched_priority != 0)))
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  		return -EINVAL;
+  
+  	/*
+@@@ -4215,8 -3206,14 +4309,19 @@@
+  	/*
+  	 * If not changing anything there's no need to proceed further:
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(policy == p->policy && (!rt_policy(policy) ||
+ +			param->sched_priority == p->rt_priority))) {
+++=======
++ 	if (unlikely(policy == p->policy)) {
++ 		if (fair_policy(policy) && attr->sched_nice != TASK_NICE(p))
++ 			goto change;
++ 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
++ 			goto change;
++ 		if (dl_policy(policy))
++ 			goto change;
++ 
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  		task_rq_unlock(rq, p, &flags);
+  		return 0;
+  	}
+@@@ -4426,6 -3542,94 +4535,97 @@@ out_unlock
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int sched_read_attr(struct sched_attr __user *uattr,
++ 			   struct sched_attr *attr,
++ 			   unsigned int usize)
++ {
++ 	int ret;
++ 
++ 	if (!access_ok(VERIFY_WRITE, uattr, usize))
++ 		return -EFAULT;
++ 
++ 	/*
++ 	 * If we're handed a smaller struct than we know of,
++ 	 * ensure all the unknown bits are 0 - i.e. old
++ 	 * user-space does not get uncomplete information.
++ 	 */
++ 	if (usize < sizeof(*attr)) {
++ 		unsigned char *addr;
++ 		unsigned char *end;
++ 
++ 		addr = (void *)attr + usize;
++ 		end  = (void *)attr + sizeof(*attr);
++ 
++ 		for (; addr < end; addr++) {
++ 			if (*addr)
++ 				goto err_size;
++ 		}
++ 
++ 		attr->size = usize;
++ 	}
++ 
++ 	ret = copy_to_user(uattr, attr, usize);
++ 	if (ret)
++ 		return -EFAULT;
++ 
++ out:
++ 	return ret;
++ 
++ err_size:
++ 	ret = -E2BIG;
++ 	goto out;
++ }
++ 
++ /**
++  * sys_sched_getattr - similar to sched_getparam, but with sched_attr
++  * @pid: the pid in question.
++  * @attr: structure containing the extended parameters.
++  * @size: sizeof(attr) for fwd/bwd comp.
++  */
++ SYSCALL_DEFINE3(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
++ 		unsigned int, size)
++ {
++ 	struct sched_attr attr = {
++ 		.size = sizeof(struct sched_attr),
++ 	};
++ 	struct task_struct *p;
++ 	int retval;
++ 
++ 	if (!uattr || pid < 0 || size > PAGE_SIZE ||
++ 	    size < SCHED_ATTR_SIZE_VER0)
++ 		return -EINVAL;
++ 
++ 	rcu_read_lock();
++ 	p = find_process_by_pid(pid);
++ 	retval = -ESRCH;
++ 	if (!p)
++ 		goto out_unlock;
++ 
++ 	retval = security_task_getscheduler(p);
++ 	if (retval)
++ 		goto out_unlock;
++ 
++ 	attr.sched_policy = p->policy;
++ 	if (task_has_dl_policy(p))
++ 		__getparam_dl(p, &attr);
++ 	else if (task_has_rt_policy(p))
++ 		attr.sched_priority = p->rt_priority;
++ 	else
++ 		attr.sched_nice = TASK_NICE(p);
++ 
++ 	rcu_read_unlock();
++ 
++ 	retval = sched_read_attr(uattr, &attr, size);
++ 	return retval;
++ 
++ out_unlock:
++ 	rcu_read_unlock();
++ 	return retval;
++ }
++ 
+++>>>>>>> aab03e05e8f7 (sched/deadline: Add SCHED_DEADLINE structures & implementation)
+  long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+  {
+  	cpumask_var_t cpus_allowed, new_mask;
+* Unmerged path include/linux/sched.h
+diff --git a/include/linux/sched/deadline.h b/include/linux/sched/deadline.h
+new file mode 100644
+index 000000000000..9d303b8847df
+--- /dev/null
++++ b/include/linux/sched/deadline.h
+@@ -0,0 +1,24 @@
++#ifndef _SCHED_DEADLINE_H
++#define _SCHED_DEADLINE_H
++
++/*
++ * SCHED_DEADLINE tasks has negative priorities, reflecting
++ * the fact that any of them has higher prio than RT and
++ * NORMAL/BATCH tasks.
++ */
++
++#define MAX_DL_PRIO		0
++
++static inline int dl_prio(int prio)
++{
++	if (unlikely(prio < MAX_DL_PRIO))
++		return 1;
++	return 0;
++}
++
++static inline int dl_task(struct task_struct *p)
++{
++	return dl_prio(p->prio);
++}
++
++#endif /* _SCHED_DEADLINE_H */
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 5a0f945927ac..2d5e49a2a6d2 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -39,6 +39,7 @@
+ #define SCHED_BATCH		3
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
++#define SCHED_DEADLINE		6
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index a14b2bbebc6a..f8564d652b36 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1330,7 +1330,9 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ #endif
+ 
+ 	/* Perform scheduler related setup. Assign this task to a CPU. */
+-	sched_fork(clone_flags, p);
++	retval = sched_fork(clone_flags, p);
++	if (retval)
++		goto bad_fork_cleanup_policy;
+ 
+ 	retval = perf_event_init_task(p);
+ 	if (retval)
+diff --git a/kernel/hrtimer.c b/kernel/hrtimer.c
+index 805603e9c459..55936844e876 100644
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@ -46,6 +46,7 @@
+ #include <linux/sched.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/sched/rt.h>
++#include <linux/sched/deadline.h>
+ #include <linux/timer.h>
+ #include <linux/freezer.h>
+ 
+@@ -1517,7 +1518,7 @@ long hrtimer_nanosleep(struct timespec *rqtp, struct timespec __user *rmtp,
+ 	unsigned long slack;
+ 
+ 	slack = current->timer_slack_ns;
+-	if (rt_task(current))
++	if (dl_task(current) || rt_task(current))
+ 		slack = 0;
+ 
+ 	hrtimer_init_on_stack(&t.timer, clockid, mode);
+* Unmerged path kernel/sched/Makefile
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+new file mode 100644
+index 000000000000..93d82b2a88bd
+--- /dev/null
++++ b/kernel/sched/deadline.c
+@@ -0,0 +1,684 @@
++/*
++ * Deadline Scheduling Class (SCHED_DEADLINE)
++ *
++ * Earliest Deadline First (EDF) + Constant Bandwidth Server (CBS).
++ *
++ * Tasks that periodically executes their instances for less than their
++ * runtime won't miss any of their deadlines.
++ * Tasks that are not periodic or sporadic or that tries to execute more
++ * than their reserved bandwidth will be slowed down (and may potentially
++ * miss some of their deadlines), and won't affect any other task.
++ *
++ * Copyright (C) 2012 Dario Faggioli <raistlin@linux.it>,
++ *                    Michael Trimarchi <michael@amarulasolutions.com>,
++ *                    Fabio Checconi <fchecconi@gmail.com>
++ */
++#include "sched.h"
++
++static inline int dl_time_before(u64 a, u64 b)
++{
++	return (s64)(a - b) < 0;
++}
++
++static inline struct task_struct *dl_task_of(struct sched_dl_entity *dl_se)
++{
++	return container_of(dl_se, struct task_struct, dl);
++}
++
++static inline struct rq *rq_of_dl_rq(struct dl_rq *dl_rq)
++{
++	return container_of(dl_rq, struct rq, dl);
++}
++
++static inline struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
++{
++	struct task_struct *p = dl_task_of(dl_se);
++	struct rq *rq = task_rq(p);
++
++	return &rq->dl;
++}
++
++static inline int on_dl_rq(struct sched_dl_entity *dl_se)
++{
++	return !RB_EMPTY_NODE(&dl_se->rb_node);
++}
++
++static inline int is_leftmost(struct task_struct *p, struct dl_rq *dl_rq)
++{
++	struct sched_dl_entity *dl_se = &p->dl;
++
++	return dl_rq->rb_leftmost == &dl_se->rb_node;
++}
++
++void init_dl_rq(struct dl_rq *dl_rq, struct rq *rq)
++{
++	dl_rq->rb_root = RB_ROOT;
++}
++
++static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags);
++static void __dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags);
++static void check_preempt_curr_dl(struct rq *rq, struct task_struct *p,
++				  int flags);
++
++/*
++ * We are being explicitly informed that a new instance is starting,
++ * and this means that:
++ *  - the absolute deadline of the entity has to be placed at
++ *    current time + relative deadline;
++ *  - the runtime of the entity has to be set to the maximum value.
++ *
++ * The capability of specifying such event is useful whenever a -deadline
++ * entity wants to (try to!) synchronize its behaviour with the scheduler's
++ * one, and to (try to!) reconcile itself with its own scheduling
++ * parameters.
++ */
++static inline void setup_new_dl_entity(struct sched_dl_entity *dl_se)
++{
++	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
++	struct rq *rq = rq_of_dl_rq(dl_rq);
++
++	WARN_ON(!dl_se->dl_new || dl_se->dl_throttled);
++
++	/*
++	 * We use the regular wall clock time to set deadlines in the
++	 * future; in fact, we must consider execution overheads (time
++	 * spent on hardirq context, etc.).
++	 */
++	dl_se->deadline = rq_clock(rq) + dl_se->dl_deadline;
++	dl_se->runtime = dl_se->dl_runtime;
++	dl_se->dl_new = 0;
++}
++
++/*
++ * Pure Earliest Deadline First (EDF) scheduling does not deal with the
++ * possibility of a entity lasting more than what it declared, and thus
++ * exhausting its runtime.
++ *
++ * Here we are interested in making runtime overrun possible, but we do
++ * not want a entity which is misbehaving to affect the scheduling of all
++ * other entities.
++ * Therefore, a budgeting strategy called Constant Bandwidth Server (CBS)
++ * is used, in order to confine each entity within its own bandwidth.
++ *
++ * This function deals exactly with that, and ensures that when the runtime
++ * of a entity is replenished, its deadline is also postponed. That ensures
++ * the overrunning entity can't interfere with other entity in the system and
++ * can't make them miss their deadlines. Reasons why this kind of overruns
++ * could happen are, typically, a entity voluntarily trying to overcome its
++ * runtime, or it just underestimated it during sched_setscheduler_ex().
++ */
++static void replenish_dl_entity(struct sched_dl_entity *dl_se)
++{
++	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
++	struct rq *rq = rq_of_dl_rq(dl_rq);
++
++	/*
++	 * We keep moving the deadline away until we get some
++	 * available runtime for the entity. This ensures correct
++	 * handling of situations where the runtime overrun is
++	 * arbitrary large.
++	 */
++	while (dl_se->runtime <= 0) {
++		dl_se->deadline += dl_se->dl_deadline;
++		dl_se->runtime += dl_se->dl_runtime;
++	}
++
++	/*
++	 * At this point, the deadline really should be "in
++	 * the future" with respect to rq->clock. If it's
++	 * not, we are, for some reason, lagging too much!
++	 * Anyway, after having warn userspace abut that,
++	 * we still try to keep the things running by
++	 * resetting the deadline and the budget of the
++	 * entity.
++	 */
++	if (dl_time_before(dl_se->deadline, rq_clock(rq))) {
++		static bool lag_once = false;
++
++		if (!lag_once) {
++			lag_once = true;
++			printk_sched("sched: DL replenish lagged to much\n");
++		}
++		dl_se->deadline = rq_clock(rq) + dl_se->dl_deadline;
++		dl_se->runtime = dl_se->dl_runtime;
++	}
++}
++
++/*
++ * Here we check if --at time t-- an entity (which is probably being
++ * [re]activated or, in general, enqueued) can use its remaining runtime
++ * and its current deadline _without_ exceeding the bandwidth it is
++ * assigned (function returns true if it can't). We are in fact applying
++ * one of the CBS rules: when a task wakes up, if the residual runtime
++ * over residual deadline fits within the allocated bandwidth, then we
++ * can keep the current (absolute) deadline and residual budget without
++ * disrupting the schedulability of the system. Otherwise, we should
++ * refill the runtime and set the deadline a period in the future,
++ * because keeping the current (absolute) deadline of the task would
++ * result in breaking guarantees promised to other tasks.
++ *
++ * This function returns true if:
++ *
++ *   runtime / (deadline - t) > dl_runtime / dl_deadline ,
++ *
++ * IOW we can't recycle current parameters.
++ */
++static bool dl_entity_overflow(struct sched_dl_entity *dl_se, u64 t)
++{
++	u64 left, right;
++
++	/*
++	 * left and right are the two sides of the equation above,
++	 * after a bit of shuffling to use multiplications instead
++	 * of divisions.
++	 *
++	 * Note that none of the time values involved in the two
++	 * multiplications are absolute: dl_deadline and dl_runtime
++	 * are the relative deadline and the maximum runtime of each
++	 * instance, runtime is the runtime left for the last instance
++	 * and (deadline - t), since t is rq->clock, is the time left
++	 * to the (absolute) deadline. Even if overflowing the u64 type
++	 * is very unlikely to occur in both cases, here we scale down
++	 * as we want to avoid that risk at all. Scaling down by 10
++	 * means that we reduce granularity to 1us. We are fine with it,
++	 * since this is only a true/false check and, anyway, thinking
++	 * of anything below microseconds resolution is actually fiction
++	 * (but still we want to give the user that illusion >;).
++	 */
++	left = (dl_se->dl_deadline >> 10) * (dl_se->runtime >> 10);
++	right = ((dl_se->deadline - t) >> 10) * (dl_se->dl_runtime >> 10);
++
++	return dl_time_before(right, left);
++}
++
++/*
++ * When a -deadline entity is queued back on the runqueue, its runtime and
++ * deadline might need updating.
++ *
++ * The policy here is that we update the deadline of the entity only if:
++ *  - the current deadline is in the past,
++ *  - using the remaining runtime with the current deadline would make
++ *    the entity exceed its bandwidth.
++ */
++static void update_dl_entity(struct sched_dl_entity *dl_se)
++{
++	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
++	struct rq *rq = rq_of_dl_rq(dl_rq);
++
++	/*
++	 * The arrival of a new instance needs special treatment, i.e.,
++	 * the actual scheduling parameters have to be "renewed".
++	 */
++	if (dl_se->dl_new) {
++		setup_new_dl_entity(dl_se);
++		return;
++	}
++
++	if (dl_time_before(dl_se->deadline, rq_clock(rq)) ||
++	    dl_entity_overflow(dl_se, rq_clock(rq))) {
++		dl_se->deadline = rq_clock(rq) + dl_se->dl_deadline;
++		dl_se->runtime = dl_se->dl_runtime;
++	}
++}
++
++/*
++ * If the entity depleted all its runtime, and if we want it to sleep
++ * while waiting for some new execution time to become available, we
++ * set the bandwidth enforcement timer to the replenishment instant
++ * and try to activate it.
++ *
++ * Notice that it is important for the caller to know if the timer
++ * actually started or not (i.e., the replenishment instant is in
++ * the future or in the past).
++ */
++static int start_dl_timer(struct sched_dl_entity *dl_se)
++{
++	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
++	struct rq *rq = rq_of_dl_rq(dl_rq);
++	ktime_t now, act;
++	ktime_t soft, hard;
++	unsigned long range;
++	s64 delta;
++
++	/*
++	 * We want the timer to fire at the deadline, but considering
++	 * that it is actually coming from rq->clock and not from
++	 * hrtimer's time base reading.
++	 */
++	act = ns_to_ktime(dl_se->deadline);
++	now = hrtimer_cb_get_time(&dl_se->dl_timer);
++	delta = ktime_to_ns(now) - rq_clock(rq);
++	act = ktime_add_ns(act, delta);
++
++	/*
++	 * If the expiry time already passed, e.g., because the value
++	 * chosen as the deadline is too small, don't even try to
++	 * start the timer in the past!
++	 */
++	if (ktime_us_delta(act, now) < 0)
++		return 0;
++
++	hrtimer_set_expires(&dl_se->dl_timer, act);
++
++	soft = hrtimer_get_softexpires(&dl_se->dl_timer);
++	hard = hrtimer_get_expires(&dl_se->dl_timer);
++	range = ktime_to_ns(ktime_sub(hard, soft));
++	__hrtimer_start_range_ns(&dl_se->dl_timer, soft,
++				 range, HRTIMER_MODE_ABS, 0);
++
++	return hrtimer_active(&dl_se->dl_timer);
++}
++
++/*
++ * This is the bandwidth enforcement timer callback. If here, we know
++ * a task is not on its dl_rq, since the fact that the timer was running
++ * means the task is throttled and needs a runtime replenishment.
++ *
++ * However, what we actually do depends on the fact the task is active,
++ * (it is on its rq) or has been removed from there by a call to
++ * dequeue_task_dl(). In the former case we must issue the runtime
++ * replenishment and add the task back to the dl_rq; in the latter, we just
++ * do nothing but clearing dl_throttled, so that runtime and deadline
++ * updating (and the queueing back to dl_rq) will be done by the
++ * next call to enqueue_task_dl().
++ */
++static enum hrtimer_restart dl_task_timer(struct hrtimer *timer)
++{
++	struct sched_dl_entity *dl_se = container_of(timer,
++						     struct sched_dl_entity,
++						     dl_timer);
++	struct task_struct *p = dl_task_of(dl_se);
++	struct rq *rq = task_rq(p);
++	raw_spin_lock(&rq->lock);
++
++	/*
++	 * We need to take care of a possible races here. In fact, the
++	 * task might have changed its scheduling policy to something
++	 * different from SCHED_DEADLINE or changed its reservation
++	 * parameters (through sched_setscheduler()).
++	 */
++	if (!dl_task(p) || dl_se->dl_new)
++		goto unlock;
++
++	sched_clock_tick();
++	update_rq_clock(rq);
++	dl_se->dl_throttled = 0;
++	if (p->on_rq) {
++		enqueue_task_dl(rq, p, ENQUEUE_REPLENISH);
++		if (task_has_dl_policy(rq->curr))
++			check_preempt_curr_dl(rq, p, 0);
++		else
++			resched_task(rq->curr);
++	}
++unlock:
++	raw_spin_unlock(&rq->lock);
++
++	return HRTIMER_NORESTART;
++}
++
++void init_dl_task_timer(struct sched_dl_entity *dl_se)
++{
++	struct hrtimer *timer = &dl_se->dl_timer;
++
++	if (hrtimer_active(timer)) {
++		hrtimer_try_to_cancel(timer);
++		return;
++	}
++
++	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	timer->function = dl_task_timer;
++}
++
++static
++int dl_runtime_exceeded(struct rq *rq, struct sched_dl_entity *dl_se)
++{
++	int dmiss = dl_time_before(dl_se->deadline, rq_clock(rq));
++	int rorun = dl_se->runtime <= 0;
++
++	if (!rorun && !dmiss)
++		return 0;
++
++	/*
++	 * If we are beyond our current deadline and we are still
++	 * executing, then we have already used some of the runtime of
++	 * the next instance. Thus, if we do not account that, we are
++	 * stealing bandwidth from the system at each deadline miss!
++	 */
++	if (dmiss) {
++		dl_se->runtime = rorun ? dl_se->runtime : 0;
++		dl_se->runtime -= rq_clock(rq) - dl_se->deadline;
++	}
++
++	return 1;
++}
++
++/*
++ * Update the current task's runtime statistics (provided it is still
++ * a -deadline task and has not been removed from the dl_rq).
++ */
++static void update_curr_dl(struct rq *rq)
++{
++	struct task_struct *curr = rq->curr;
++	struct sched_dl_entity *dl_se = &curr->dl;
++	u64 delta_exec;
++
++	if (!dl_task(curr) || !on_dl_rq(dl_se))
++		return;
++
++	/*
++	 * Consumed budget is computed considering the time as
++	 * observed by schedulable tasks (excluding time spent
++	 * in hardirq context, etc.). Deadlines are instead
++	 * computed using hard walltime. This seems to be the more
++	 * natural solution, but the full ramifications of this
++	 * approach need further study.
++	 */
++	delta_exec = rq_clock_task(rq) - curr->se.exec_start;
++	if (unlikely((s64)delta_exec < 0))
++		delta_exec = 0;
++
++	schedstat_set(curr->se.statistics.exec_max,
++		      max(curr->se.statistics.exec_max, delta_exec));
++
++	curr->se.sum_exec_runtime += delta_exec;
++	account_group_exec_runtime(curr, delta_exec);
++
++	curr->se.exec_start = rq_clock_task(rq);
++	cpuacct_charge(curr, delta_exec);
++
++	dl_se->runtime -= delta_exec;
++	if (dl_runtime_exceeded(rq, dl_se)) {
++		__dequeue_task_dl(rq, curr, 0);
++		if (likely(start_dl_timer(dl_se)))
++			dl_se->dl_throttled = 1;
++		else
++			enqueue_task_dl(rq, curr, ENQUEUE_REPLENISH);
++
++		if (!is_leftmost(curr, &rq->dl))
++			resched_task(curr);
++	}
++}
++
++static void __enqueue_dl_entity(struct sched_dl_entity *dl_se)
++{
++	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
++	struct rb_node **link = &dl_rq->rb_root.rb_node;
++	struct rb_node *parent = NULL;
++	struct sched_dl_entity *entry;
++	int leftmost = 1;
++
++	BUG_ON(!RB_EMPTY_NODE(&dl_se->rb_node));
++
++	while (*link) {
++		parent = *link;
++		entry = rb_entry(parent, struct sched_dl_entity, rb_node);
++		if (dl_time_before(dl_se->deadline, entry->deadline))
++			link = &parent->rb_left;
++		else {
++			link = &parent->rb_right;
++			leftmost = 0;
++		}
++	}
++
++	if (leftmost)
++		dl_rq->rb_leftmost = &dl_se->rb_node;
++
++	rb_link_node(&dl_se->rb_node, parent, link);
++	rb_insert_color(&dl_se->rb_node, &dl_rq->rb_root);
++
++	dl_rq->dl_nr_running++;
++}
++
++static void __dequeue_dl_entity(struct sched_dl_entity *dl_se)
++{
++	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
++
++	if (RB_EMPTY_NODE(&dl_se->rb_node))
++		return;
++
++	if (dl_rq->rb_leftmost == &dl_se->rb_node) {
++		struct rb_node *next_node;
++
++		next_node = rb_next(&dl_se->rb_node);
++		dl_rq->rb_leftmost = next_node;
++	}
++
++	rb_erase(&dl_se->rb_node, &dl_rq->rb_root);
++	RB_CLEAR_NODE(&dl_se->rb_node);
++
++	dl_rq->dl_nr_running--;
++}
++
++static void
++enqueue_dl_entity(struct sched_dl_entity *dl_se, int flags)
++{
++	BUG_ON(on_dl_rq(dl_se));
++
++	/*
++	 * If this is a wakeup or a new instance, the scheduling
++	 * parameters of the task might need updating. Otherwise,
++	 * we want a replenishment of its runtime.
++	 */
++	if (!dl_se->dl_new && flags & ENQUEUE_REPLENISH)
++		replenish_dl_entity(dl_se);
++	else
++		update_dl_entity(dl_se);
++
++	__enqueue_dl_entity(dl_se);
++}
++
++static void dequeue_dl_entity(struct sched_dl_entity *dl_se)
++{
++	__dequeue_dl_entity(dl_se);
++}
++
++static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
++{
++	/*
++	 * If p is throttled, we do nothing. In fact, if it exhausted
++	 * its budget it needs a replenishment and, since it now is on
++	 * its rq, the bandwidth timer callback (which clearly has not
++	 * run yet) will take care of this.
++	 */
++	if (p->dl.dl_throttled)
++		return;
++
++	enqueue_dl_entity(&p->dl, flags);
++	inc_nr_running(rq);
++}
++
++static void __dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
++{
++	dequeue_dl_entity(&p->dl);
++}
++
++static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
++{
++	update_curr_dl(rq);
++	__dequeue_task_dl(rq, p, flags);
++
++	dec_nr_running(rq);
++}
++
++/*
++ * Yield task semantic for -deadline tasks is:
++ *
++ *   get off from the CPU until our next instance, with
++ *   a new runtime. This is of little use now, since we
++ *   don't have a bandwidth reclaiming mechanism. Anyway,
++ *   bandwidth reclaiming is planned for the future, and
++ *   yield_task_dl will indicate that some spare budget
++ *   is available for other task instances to use it.
++ */
++static void yield_task_dl(struct rq *rq)
++{
++	struct task_struct *p = rq->curr;
++
++	/*
++	 * We make the task go to sleep until its current deadline by
++	 * forcing its runtime to zero. This way, update_curr_dl() stops
++	 * it and the bandwidth timer will wake it up and will give it
++	 * new scheduling parameters (thanks to dl_new=1).
++	 */
++	if (p->dl.runtime > 0) {
++		rq->curr->dl.dl_new = 1;
++		p->dl.runtime = 0;
++	}
++	update_curr_dl(rq);
++}
++
++/*
++ * Only called when both the current and waking task are -deadline
++ * tasks.
++ */
++static void check_preempt_curr_dl(struct rq *rq, struct task_struct *p,
++				  int flags)
++{
++	if (dl_time_before(p->dl.deadline, rq->curr->dl.deadline))
++		resched_task(rq->curr);
++}
++
++#ifdef CONFIG_SCHED_HRTICK
++static void start_hrtick_dl(struct rq *rq, struct task_struct *p)
++{
++	s64 delta = p->dl.dl_runtime - p->dl.runtime;
++
++	if (delta > 10000)
++		hrtick_start(rq, p->dl.runtime);
++}
++#endif
++
++static struct sched_dl_entity *pick_next_dl_entity(struct rq *rq,
++						   struct dl_rq *dl_rq)
++{
++	struct rb_node *left = dl_rq->rb_leftmost;
++
++	if (!left)
++		return NULL;
++
++	return rb_entry(left, struct sched_dl_entity, rb_node);
++}
++
++struct task_struct *pick_next_task_dl(struct rq *rq)
++{
++	struct sched_dl_entity *dl_se;
++	struct task_struct *p;
++	struct dl_rq *dl_rq;
++
++	dl_rq = &rq->dl;
++
++	if (unlikely(!dl_rq->dl_nr_running))
++		return NULL;
++
++	dl_se = pick_next_dl_entity(rq, dl_rq);
++	BUG_ON(!dl_se);
++
++	p = dl_task_of(dl_se);
++	p->se.exec_start = rq_clock_task(rq);
++#ifdef CONFIG_SCHED_HRTICK
++	if (hrtick_enabled(rq))
++		start_hrtick_dl(rq, p);
++#endif
++	return p;
++}
++
++static void put_prev_task_dl(struct rq *rq, struct task_struct *p)
++{
++	update_curr_dl(rq);
++}
++
++static void task_tick_dl(struct rq *rq, struct task_struct *p, int queued)
++{
++	update_curr_dl(rq);
++
++#ifdef CONFIG_SCHED_HRTICK
++	if (hrtick_enabled(rq) && queued && p->dl.runtime > 0)
++		start_hrtick_dl(rq, p);
++#endif
++}
++
++static void task_fork_dl(struct task_struct *p)
++{
++	/*
++	 * SCHED_DEADLINE tasks cannot fork and this is achieved through
++	 * sched_fork()
++	 */
++}
++
++static void task_dead_dl(struct task_struct *p)
++{
++	struct hrtimer *timer = &p->dl.dl_timer;
++
++	if (hrtimer_active(timer))
++		hrtimer_try_to_cancel(timer);
++}
++
++static void set_curr_task_dl(struct rq *rq)
++{
++	struct task_struct *p = rq->curr;
++
++	p->se.exec_start = rq_clock_task(rq);
++}
++
++static void switched_from_dl(struct rq *rq, struct task_struct *p)
++{
++	if (hrtimer_active(&p->dl.dl_timer))
++		hrtimer_try_to_cancel(&p->dl.dl_timer);
++}
++
++static void switched_to_dl(struct rq *rq, struct task_struct *p)
++{
++	/*
++	 * If p is throttled, don't consider the possibility
++	 * of preempting rq->curr, the check will be done right
++	 * after its runtime will get replenished.
++	 */
++	if (unlikely(p->dl.dl_throttled))
++		return;
++
++	if (p->on_rq || rq->curr != p) {
++		if (task_has_dl_policy(rq->curr))
++			check_preempt_curr_dl(rq, p, 0);
++		else
++			resched_task(rq->curr);
++	}
++}
++
++static void prio_changed_dl(struct rq *rq, struct task_struct *p,
++			    int oldprio)
++{
++	switched_to_dl(rq, p);
++}
++
++#ifdef CONFIG_SMP
++static int
++select_task_rq_dl(struct task_struct *p, int prev_cpu, int sd_flag, int flags)
++{
++	return task_cpu(p);
++}
++#endif
++
++const struct sched_class dl_sched_class = {
++	.next			= &rt_sched_class,
++	.enqueue_task		= enqueue_task_dl,
++	.dequeue_task		= dequeue_task_dl,
++	.yield_task		= yield_task_dl,
++
++	.check_preempt_curr	= check_preempt_curr_dl,
++
++	.pick_next_task		= pick_next_task_dl,
++	.put_prev_task		= put_prev_task_dl,
++
++#ifdef CONFIG_SMP
++	.select_task_rq		= select_task_rq_dl,
++#endif
++
++	.set_curr_task		= set_curr_task_dl,
++	.task_tick		= task_tick_dl,
++	.task_fork              = task_fork_dl,
++	.task_dead		= task_dead_dl,
++
++	.prio_changed           = prio_changed_dl,
++	.switched_from		= switched_from_dl,
++	.switched_to		= switched_to_dl,
++};
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index b976abe32e72..06dd81bb25a2 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2,6 +2,7 @@
+ #include <linux/sched.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/sched/rt.h>
++#include <linux/sched/deadline.h>
+ #include <linux/mutex.h>
+ #include <linux/spinlock.h>
+ #include <linux/stop_machine.h>
+@@ -82,11 +83,21 @@ static inline int rt_policy(int policy)
+ 	return 0;
+ }
+ 
++static inline int dl_policy(int policy)
++{
++	return policy == SCHED_DEADLINE;
++}
++
+ static inline int task_has_rt_policy(struct task_struct *p)
+ {
+ 	return rt_policy(p->policy);
+ }
+ 
++static inline int task_has_dl_policy(struct task_struct *p)
++{
++	return dl_policy(p->policy);
++}
++
+ /*
+  * This is the priority-queue data structure of the RT scheduling class:
+  */
+@@ -361,6 +372,15 @@ struct rt_rq {
+ #endif
+ };
+ 
++/* Deadline class' related fields in a runqueue */
++struct dl_rq {
++	/* runqueue is an rbtree, ordered by deadline */
++	struct rb_root rb_root;
++	struct rb_node *rb_leftmost;
++
++	unsigned long dl_nr_running;
++};
++
+ #ifdef CONFIG_SMP
+ 
+ /*
+@@ -431,6 +451,7 @@ struct rq {
+ 
+ 	struct cfs_rq cfs;
+ 	struct rt_rq rt;
++	struct dl_rq dl;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this cpu: */
+@@ -1012,6 +1033,7 @@ static const u32 prio_to_wmult[40] = {
+ #else
+ #define ENQUEUE_WAKING		0
+ #endif
++#define ENQUEUE_REPLENISH	8
+ 
+ #define DEQUEUE_SLEEP		1
+ 
+@@ -1068,6 +1090,7 @@ struct sched_class {
+    for (class = sched_class_highest; class; class = class->next)
+ 
+ extern const struct sched_class stop_sched_class;
++extern const struct sched_class dl_sched_class;
+ extern const struct sched_class rt_sched_class;
+ extern const struct sched_class fair_sched_class;
+ extern const struct sched_class idle_sched_class;
+@@ -1112,6 +1135,8 @@ extern void resched_cpu(int cpu);
+ extern struct rt_bandwidth def_rt_bandwidth;
+ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+ 
++extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
++
+ extern void update_idle_cpu_load(struct rq *this_rq);
+ 
+ #ifdef CONFIG_PARAVIRT
+@@ -1391,6 +1416,7 @@ extern void print_rt_stats(struct seq_file *m, int cpu);
+ 
+ extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+ extern void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq);
++extern void init_dl_rq(struct dl_rq *dl_rq, struct rq *rq);
+ 
+ extern void cfs_bandwidth_usage_inc(void);
+ extern void cfs_bandwidth_usage_dec(void);
+diff --git a/kernel/sched/stop_task.c b/kernel/sched/stop_task.c
+index 76512cf5e86e..cdbea050e481 100644
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@ -107,7 +107,7 @@ static void update_curr_stop(struct rq *rq)
+  * Simple, special scheduling class for the per-CPU stop tasks:
+  */
+ const struct sched_class stop_sched_class = {
+-	.next			= &rt_sched_class,
++	.next			= &dl_sched_class,
+ 
+ 	.enqueue_task		= enqueue_task_stop,
+ 	.dequeue_task		= dequeue_task_stop,
