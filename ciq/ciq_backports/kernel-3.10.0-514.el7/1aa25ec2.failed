@@ -1,0 +1,255 @@
+sctp: fix the issue sctp requeue auth chunk incorrectly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 1aa25ec227a4be21515594f485b0f4985109f0d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1aa25ec2.failed
+
+sctp needs to queue auth chunk back when we know that we are going
+to generate another segment. But commit f1533cce60d1 ("sctp: fix
+panic when sending auth chunks") requeues the last chunk processed
+which is probably not the auth chunk.
+
+It causes panic when calculating the MAC in sctp_auth_calculate_hmac(),
+as the incorrect offset of the auth chunk in skb->data.
+
+This fix is to requeue it by using packet->auth.
+
+Fixes: f1533cce60d1 ("sctp: fix panic when sending auth chunks")
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1aa25ec227a4be21515594f485b0f4985109f0d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/output.c
+diff --cc net/sctp/output.c
+index b1ac80d971ea,1f1682b9a6a8..000000000000
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@@ -452,91 -490,144 +452,117 @@@ int sctp_packet_transmit(struct sctp_pa
+  	sh->vtag     = htonl(packet->vtag);
+  	sh->checksum = 0;
+  
+ -	pr_debug("***sctp_transmit_packet***\n");
+ +	/**
+ +	 * 6.10 Bundling
+ +	 *
+ +	 *    An endpoint bundles chunks by simply including multiple
+ +	 *    chunks in one outbound SCTP packet.  ...
+ +	 */
+  
+ -	do {
+ -		/* Set up convenience variables... */
+ -		chunk = list_entry(packet->chunk_list.next, struct sctp_chunk, list);
+ -		pktcount++;
+ +	/**
+ +	 * 3.2  Chunk Field Descriptions
+ +	 *
+ +	 * The total length of a chunk (including Type, Length and
+ +	 * Value fields) MUST be a multiple of 4 bytes.  If the length
+ +	 * of the chunk is not a multiple of 4 bytes, the sender MUST
+ +	 * pad the chunk with all zero bytes and this padding is not
+ +	 * included in the chunk length field.  The sender should
+ +	 * never pad with more than 3 bytes.
+ +	 *
+ +	 * [This whole comment explains WORD_ROUND() below.]
+ +	 */
+ +	SCTP_DEBUG_PRINTK("***sctp_transmit_packet***\n");
+ +	list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
+ +		list_del_init(&chunk->list);
+ +		if (sctp_chunk_is_data(chunk)) {
+ +			/* 6.3.1 C4) When data is in flight and when allowed
+ +			 * by rule C5, a new RTT measurement MUST be made each
+ +			 * round trip.  Furthermore, new RTT measurements
+ +			 * SHOULD be made no more than once per round-trip
+ +			 * for a given destination transport address.
+ +			 */
+  
+ -		/* Calculate packet size, so it fits in PMTU. Leave
+ -		 * other chunks for the next packets.
+ -		 */
+ -		if (gso) {
+ -			pkt_size = packet->overhead;
+ -			list_for_each_entry(chunk, &packet->chunk_list, list) {
+ -				int padded = WORD_ROUND(chunk->skb->len);
+ -
+ -				if (pkt_size + padded > tp->pathmtu)
+ -					break;
+ -				pkt_size += padded;
+ +			if (!chunk->resent && !tp->rto_pending) {
+ +				chunk->rtt_in_progress = 1;
+ +				tp->rto_pending = 1;
+  			}
+  
+ -			/* Allocate a new skb. */
+ -			nskb = alloc_skb(pkt_size + MAX_HEADER, gfp);
+ -			if (!nskb)
+ -				goto nomem;
+ -
+ -			/* Make sure the outbound skb has enough header
+ -			 * room reserved.
+ -			 */
+ -			skb_reserve(nskb, packet->overhead + MAX_HEADER);
+ -		} else {
+ -			nskb = head;
+ +			has_data = 1;
+  		}
+  
+ -		/**
+ -		 * 3.2  Chunk Field Descriptions
+ -		 *
+ -		 * The total length of a chunk (including Type, Length and
+ -		 * Value fields) MUST be a multiple of 4 bytes.  If the length
+ -		 * of the chunk is not a multiple of 4 bytes, the sender MUST
+ -		 * pad the chunk with all zero bytes and this padding is not
+ -		 * included in the chunk length field.  The sender should
+ -		 * never pad with more than 3 bytes.
+ -		 *
+ -		 * [This whole comment explains WORD_ROUND() below.]
+ -		 */
+ -
+ -		pkt_size -= packet->overhead;
+ -		list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
+ -			list_del_init(&chunk->list);
+ -			if (sctp_chunk_is_data(chunk)) {
+ -				/* 6.3.1 C4) When data is in flight and when allowed
+ -				 * by rule C5, a new RTT measurement MUST be made each
+ -				 * round trip.  Furthermore, new RTT measurements
+ -				 * SHOULD be made no more than once per round-trip
+ -				 * for a given destination transport address.
+ -				 */
+ -
+ -				if (!chunk->resent && !tp->rto_pending) {
+ -					chunk->rtt_in_progress = 1;
+ -					tp->rto_pending = 1;
+ -				}
+ +		padding = WORD_ROUND(chunk->skb->len) - chunk->skb->len;
+ +		if (padding)
+ +			memset(skb_put(chunk->skb, padding), 0, padding);
+  
+ -				has_data = 1;
+ -			}
+ -
+ -			padding = WORD_ROUND(chunk->skb->len) - chunk->skb->len;
+ -			if (padding)
+ -				memset(skb_put(chunk->skb, padding), 0, padding);
+ -
+ -			/* if this is the auth chunk that we are adding,
+ -			 * store pointer where it will be added and put
+ -			 * the auth into the packet.
+ -			 */
+ -			if (chunk == packet->auth)
+ -				auth = skb_tail_pointer(nskb);
+ +		/* if this is the auth chunk that we are adding,
+ +		 * store pointer where it will be added and put
+ +		 * the auth into the packet.
+ +		 */
+ +		if (chunk == packet->auth)
+ +			auth = skb_tail_pointer(nskb);
+  
+ -			memcpy(skb_put(nskb, chunk->skb->len),
+ +		memcpy(skb_put(nskb, chunk->skb->len),
+  			       chunk->skb->data, chunk->skb->len);
+  
+ -			pr_debug("*** Chunk:%p[%s] %s 0x%x, length:%d, chunk->skb->len:%d, rtt_in_progress:%d\n",
+ -				 chunk,
+ -				 sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)),
+ -				 chunk->has_tsn ? "TSN" : "No TSN",
+ -				 chunk->has_tsn ? ntohl(chunk->subh.data_hdr->tsn) : 0,
+ -				 ntohs(chunk->chunk_hdr->length), chunk->skb->len,
+ -				 chunk->rtt_in_progress);
+ -
+ -			/* If this is a control chunk, this is our last
+ -			 * reference. Free data chunks after they've been
+ -			 * acknowledged or have failed.
+ -			 * Re-queue auth chunks if needed.
+ -			 */
+ -			pkt_size -= WORD_ROUND(chunk->skb->len);
+ -
+ -			if (!sctp_chunk_is_data(chunk) && chunk != packet->auth)
+ -				sctp_chunk_free(chunk);
+ -
+ -			if (!pkt_size)
+ -				break;
+ -		}
+ -
+ -		/* SCTP-AUTH, Section 6.2
+ -		 *    The sender MUST calculate the MAC as described in RFC2104 [2]
+ -		 *    using the hash function H as described by the MAC Identifier and
+ -		 *    the shared association key K based on the endpoint pair shared key
+ -		 *    described by the shared key identifier.  The 'data' used for the
+ -		 *    computation of the AUTH-chunk is given by the AUTH chunk with its
+ -		 *    HMAC field set to zero (as shown in Figure 6) followed by all
+ -		 *    chunks that are placed after the AUTH chunk in the SCTP packet.
+ +		SCTP_DEBUG_PRINTK("%s %p[%s] %s 0x%x, %s %d, %s %d, %s %d\n",
+ +				  "*** Chunk", chunk,
+ +				  sctp_cname(SCTP_ST_CHUNK(
+ +					  chunk->chunk_hdr->type)),
+ +				  chunk->has_tsn ? "TSN" : "No TSN",
+ +				  chunk->has_tsn ?
+ +				  ntohl(chunk->subh.data_hdr->tsn) : 0,
+ +				  "length", ntohs(chunk->chunk_hdr->length),
+ +				  "chunk->skb->len", chunk->skb->len,
+ +				  "rtt_in_progress", chunk->rtt_in_progress);
+ +
+ +		/*
+ +		 * If this is a control chunk, this is our last
+ +		 * reference. Free data chunks after they've been
+ +		 * acknowledged or have failed.
+  		 */
+ -		if (auth)
+ -			sctp_auth_calculate_hmac(asoc, nskb,
+ -						 (struct sctp_auth_chunk *)auth,
+ -						 gfp);
+ +		if (!sctp_chunk_is_data(chunk))
+ +			sctp_chunk_free(chunk);
+ +	}
+  
+++<<<<<<< HEAD
+ +	/* SCTP-AUTH, Section 6.2
+ +	 *    The sender MUST calculate the MAC as described in RFC2104 [2]
+ +	 *    using the hash function H as described by the MAC Identifier and
+ +	 *    the shared association key K based on the endpoint pair shared key
+ +	 *    described by the shared key identifier.  The 'data' used for the
+ +	 *    computation of the AUTH-chunk is given by the AUTH chunk with its
+ +	 *    HMAC field set to zero (as shown in Figure 6) followed by all
+ +	 *    chunks that are placed after the AUTH chunk in the SCTP packet.
+ +	 */
+ +	if (auth)
+ +		sctp_auth_calculate_hmac(asoc, nskb,
+ +					 (struct sctp_auth_chunk *)auth,
+ +					 gfp);
+++=======
++ 		if (packet->auth) {
++ 			if (!list_empty(&packet->chunk_list)) {
++ 				/* We will generate more packets, so re-queue
++ 				 * auth chunk.
++ 				 */
++ 				list_add(&packet->auth->list,
++ 					 &packet->chunk_list);
++ 			} else {
++ 				sctp_chunk_free(packet->auth);
++ 				packet->auth = NULL;
++ 			}
++ 		}
++ 
++ 		if (!gso)
++ 			break;
++ 
++ 		if (skb_gro_receive(&head, nskb))
++ 			goto nomem;
++ 		nskb = NULL;
++ 		if (WARN_ON_ONCE(skb_shinfo(head)->gso_segs >=
++ 				 sk->sk_gso_max_segs))
++ 			goto nomem;
++ 	} while (!list_empty(&packet->chunk_list));
+++>>>>>>> 1aa25ec227a4 (sctp: fix the issue sctp requeue auth chunk incorrectly)
+  
+  	/* 2) Calculate the Adler-32 checksum of the whole packet,
+  	 *    including the SCTP common header and all the
+* Unmerged path net/sctp/output.c
