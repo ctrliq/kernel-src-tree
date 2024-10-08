@@ -1,0 +1,253 @@
+memblock: introduce a for_each_reserved_mem_region iterator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Robin Holt <holt@sgi.com>
+commit 8e7a7f8619f1f93736d9bb7e31caf4721bdc739d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8e7a7f86.failed
+
+Struct page initialisation had been identified as one of the reasons why
+large machines take a long time to boot. Patches were posted a long time ago
+to defer initialisation until they were first used.  This was rejected on
+the grounds it should not be necessary to hurt the fast paths. This series
+reuses much of the work from that time but defers the initialisation of
+memory to kswapd so that one thread per node initialises memory local to
+that node.
+
+After applying the series and setting the appropriate Kconfig variable I
+see this in the boot log on a 64G machine
+
+[    7.383764] kswapd 0 initialised deferred memory in 188ms
+[    7.404253] kswapd 1 initialised deferred memory in 208ms
+[    7.411044] kswapd 3 initialised deferred memory in 216ms
+[    7.411551] kswapd 2 initialised deferred memory in 216ms
+
+On a 1TB machine, I see
+
+[    8.406511] kswapd 3 initialised deferred memory in 1116ms
+[    8.428518] kswapd 1 initialised deferred memory in 1140ms
+[    8.435977] kswapd 0 initialised deferred memory in 1148ms
+[    8.437416] kswapd 2 initialised deferred memory in 1148ms
+
+Once booted the machine appears to work as normal. Boot times were measured
+from the time shutdown was called until ssh was available again.  In the
+64G case, the boot time savings are negligible. On the 1TB machine, the
+savings were 16 seconds.
+
+Nate Zimmer said:
+
+: On an older 8 TB box with lots and lots of cpus the boot time, as
+: measure from grub to login prompt, the boot time improved from 1484
+: seconds to exactly 1000 seconds.
+
+Waiman Long said:
+
+: I ran a bootup timing test on a 12-TB 16-socket IvyBridge-EX system.  From
+: grub menu to ssh login, the bootup time was 453s before the patch and 265s
+: after the patch - a saving of 188s (42%).
+
+Daniel Blueman said:
+
+: On a 7TB, 1728-core NumaConnect system with 108 NUMA nodes, we're seeing
+: stock 4.0 boot in 7136s.  This drops to 2159s, or a 70% reduction with
+: this patchset.  Non-temporal PMD init (https://lkml.org/lkml/2015/4/23/350)
+: drops this to 1045s.
+
+This patch (of 13):
+
+As part of initializing struct page's in 2MiB chunks, we noticed that at
+the end of free_all_bootmem(), there was nothing which had forced the
+reserved/allocated 4KiB pages to be initialized.
+
+This helper function will be used for that expansion.
+
+	Signed-off-by: Robin Holt <holt@sgi.com>
+	Signed-off-by: Nate Zimmer <nzimmer@sgi.com>
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Tested-by: Nate Zimmer <nzimmer@sgi.com>
+	Tested-by: Waiman Long <waiman.long@hp.com>
+	Tested-by: Daniel J Blueman <daniel@numascale.com>
+	Acked-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Robin Holt <robinmholt@gmail.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Waiman Long <waiman.long@hp.com>
+	Cc: Scott Norton <scott.norton@hp.com>
+	Cc: "Luck, Tony" <tony.luck@intel.com>
+	Cc: Ingo Molnar <mingo@elte.hu>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8e7a7f8619f1f93736d9bb7e31caf4721bdc739d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memblock.h
+#	mm/memblock.c
+diff --cc include/linux/memblock.h
+index 39082db5d5cd,cc4b01972060..000000000000
+--- a/include/linux/memblock.h
++++ b/include/linux/memblock.h
+@@@ -70,6 -79,87 +70,90 @@@ int memblock_reserve(phys_addr_t base, 
+  void memblock_trim_memory(phys_addr_t align);
+  int memblock_mark_hotplug(phys_addr_t base, phys_addr_t size);
+  int memblock_clear_hotplug(phys_addr_t base, phys_addr_t size);
+++<<<<<<< HEAD
+++=======
++ int memblock_mark_mirror(phys_addr_t base, phys_addr_t size);
++ ulong choose_memblock_flags(void);
++ 
++ /* Low level functions */
++ int memblock_add_range(struct memblock_type *type,
++ 		       phys_addr_t base, phys_addr_t size,
++ 		       int nid, unsigned long flags);
++ 
++ int memblock_remove_range(struct memblock_type *type,
++ 			  phys_addr_t base,
++ 			  phys_addr_t size);
++ 
++ void __next_mem_range(u64 *idx, int nid, ulong flags,
++ 		      struct memblock_type *type_a,
++ 		      struct memblock_type *type_b, phys_addr_t *out_start,
++ 		      phys_addr_t *out_end, int *out_nid);
++ 
++ void __next_mem_range_rev(u64 *idx, int nid, ulong flags,
++ 			  struct memblock_type *type_a,
++ 			  struct memblock_type *type_b, phys_addr_t *out_start,
++ 			  phys_addr_t *out_end, int *out_nid);
++ 
++ void __next_reserved_mem_region(u64 *idx, phys_addr_t *out_start,
++ 			       phys_addr_t *out_end);
++ 
++ /**
++  * for_each_mem_range - iterate through memblock areas from type_a and not
++  * included in type_b. Or just type_a if type_b is NULL.
++  * @i: u64 used as loop variable
++  * @type_a: ptr to memblock_type to iterate
++  * @type_b: ptr to memblock_type which excludes from the iteration
++  * @nid: node selector, %NUMA_NO_NODE for all nodes
++  * @flags: pick from blocks based on memory attributes
++  * @p_start: ptr to phys_addr_t for start address of the range, can be %NULL
++  * @p_end: ptr to phys_addr_t for end address of the range, can be %NULL
++  * @p_nid: ptr to int for nid of the range, can be %NULL
++  */
++ #define for_each_mem_range(i, type_a, type_b, nid, flags,		\
++ 			   p_start, p_end, p_nid)			\
++ 	for (i = 0, __next_mem_range(&i, nid, flags, type_a, type_b,	\
++ 				     p_start, p_end, p_nid);		\
++ 	     i != (u64)ULLONG_MAX;					\
++ 	     __next_mem_range(&i, nid, flags, type_a, type_b,		\
++ 			      p_start, p_end, p_nid))
++ 
++ /**
++  * for_each_mem_range_rev - reverse iterate through memblock areas from
++  * type_a and not included in type_b. Or just type_a if type_b is NULL.
++  * @i: u64 used as loop variable
++  * @type_a: ptr to memblock_type to iterate
++  * @type_b: ptr to memblock_type which excludes from the iteration
++  * @nid: node selector, %NUMA_NO_NODE for all nodes
++  * @flags: pick from blocks based on memory attributes
++  * @p_start: ptr to phys_addr_t for start address of the range, can be %NULL
++  * @p_end: ptr to phys_addr_t for end address of the range, can be %NULL
++  * @p_nid: ptr to int for nid of the range, can be %NULL
++  */
++ #define for_each_mem_range_rev(i, type_a, type_b, nid, flags,		\
++ 			       p_start, p_end, p_nid)			\
++ 	for (i = (u64)ULLONG_MAX,					\
++ 		     __next_mem_range_rev(&i, nid, flags, type_a, type_b,\
++ 					 p_start, p_end, p_nid);	\
++ 	     i != (u64)ULLONG_MAX;					\
++ 	     __next_mem_range_rev(&i, nid, flags, type_a, type_b,	\
++ 				  p_start, p_end, p_nid))
++ 
++ /**
++  * for_each_reserved_mem_region - iterate over all reserved memblock areas
++  * @i: u64 used as loop variable
++  * @p_start: ptr to phys_addr_t for start address of the range, can be %NULL
++  * @p_end: ptr to phys_addr_t for end address of the range, can be %NULL
++  *
++  * Walks over reserved areas of memblock. Available as soon as memblock
++  * is initialized.
++  */
++ #define for_each_reserved_mem_region(i, p_start, p_end)			\
++ 	for (i = 0UL,							\
++ 	     __next_reserved_mem_region(&i, p_start, p_end);		\
++ 	     i != (u64)ULLONG_MAX;					\
++ 	     __next_reserved_mem_region(&i, p_start, p_end))
++ 
+++>>>>>>> 8e7a7f8619f1 (memblock: introduce a for_each_reserved_mem_region iterator)
+  #ifdef CONFIG_MOVABLE_NODE
+  static inline bool memblock_is_hotpluggable(struct memblock_region *m)
+  {
+diff --cc mm/memblock.c
+index 4158cb85f9e7,114df622853f..000000000000
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@@ -735,9 -805,59 +735,60 @@@ int __init_memblock memblock_clear_hotp
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * __next_free_mem_range - next function for for_each_free_mem_range()
+++=======
++  * memblock_mark_mirror - Mark mirrored memory with flag MEMBLOCK_MIRROR.
++  * @base: the base phys addr of the region
++  * @size: the size of the region
++  *
++  * Return 0 on succees, -errno on failure.
++  */
++ int __init_memblock memblock_mark_mirror(phys_addr_t base, phys_addr_t size)
++ {
++ 	system_has_some_mirror = true;
++ 
++ 	return memblock_setclr_flag(base, size, 1, MEMBLOCK_MIRROR);
++ }
++ 
++ 
++ /**
++  * __next_reserved_mem_region - next function for for_each_reserved_region()
++  * @idx: pointer to u64 loop variable
++  * @out_start: ptr to phys_addr_t for start address of the region, can be %NULL
++  * @out_end: ptr to phys_addr_t for end address of the region, can be %NULL
++  *
++  * Iterate over all reserved memory regions.
++  */
++ void __init_memblock __next_reserved_mem_region(u64 *idx,
++ 					   phys_addr_t *out_start,
++ 					   phys_addr_t *out_end)
++ {
++ 	struct memblock_type *rsv = &memblock.reserved;
++ 
++ 	if (*idx >= 0 && *idx < rsv->cnt) {
++ 		struct memblock_region *r = &rsv->regions[*idx];
++ 		phys_addr_t base = r->base;
++ 		phys_addr_t size = r->size;
++ 
++ 		if (out_start)
++ 			*out_start = base;
++ 		if (out_end)
++ 			*out_end = base + size - 1;
++ 
++ 		*idx += 1;
++ 		return;
++ 	}
++ 
++ 	/* signal end of iteration */
++ 	*idx = ULLONG_MAX;
++ }
++ 
++ /**
++  * __next__mem_range - next function for for_each_free_mem_range() etc.
+++>>>>>>> 8e7a7f8619f1 (memblock: introduce a for_each_reserved_mem_region iterator)
+   * @idx: pointer to u64 loop variable
+   * @nid: node selector, %NUMA_NO_NODE for all nodes
+ - * @flags: pick from blocks based on memory attributes
+ - * @type_a: pointer to memblock_type from where the range is taken
+ - * @type_b: pointer to memblock_type which excludes memory from being taken
+   * @out_start: ptr to phys_addr_t for start address of the range, can be %NULL
+   * @out_end: ptr to phys_addr_t for end address of the range, can be %NULL
+   * @out_nid: ptr to int for nid of the range, can be %NULL
+* Unmerged path include/linux/memblock.h
+* Unmerged path mm/memblock.c
