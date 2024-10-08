@@ -1,0 +1,266 @@
+powerpc/powernv/cpuidle: Back-end cpuidle driver for powernv platform.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] powernv/cpuidle: Back-end cpuidle driver for powernv platform (Don Zickus) [1127366]
+Rebuild_FUZZ: 93.13%
+commit-author Deepthi Dharwar <deepthi@linux.vnet.ibm.com>
+commit 2c2e6ecfd077cbae72d32568af58c4ba57826c84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2c2e6ecf.failed
+
+Following patch ports the cpuidle framework for powernv
+platform and also implements a cpuidle back-end powernv
+idle driver calling on to power7_nap and snooze idle states.
+
+	Signed-off-by: Deepthi Dharwar <deepthi@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 2c2e6ecfd077cbae72d32568af58c4ba57826c84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpuidle/Kconfig.powerpc
+#	drivers/cpuidle/Makefile
+diff --cc drivers/cpuidle/Makefile
+index 0d8bd55e776f,f71ae1b373c5..000000000000
+--- a/drivers/cpuidle/Makefile
++++ b/drivers/cpuidle/Makefile
+@@@ -5,5 -5,16 +5,21 @@@
+  obj-y += cpuidle.o driver.o governor.o sysfs.o governors/
+  obj-$(CONFIG_ARCH_NEEDS_CPU_IDLE_COUPLED) += coupled.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_CPU_IDLE_CALXEDA) += cpuidle-calxeda.o
+ +obj-$(CONFIG_ARCH_KIRKWOOD) += cpuidle-kirkwood.o
+++=======
++ ##################################################################################
++ # ARM SoC drivers
++ obj-$(CONFIG_ARM_BIG_LITTLE_CPUIDLE)	+= cpuidle-big_little.o
++ obj-$(CONFIG_ARM_HIGHBANK_CPUIDLE)	+= cpuidle-calxeda.o
++ obj-$(CONFIG_ARM_KIRKWOOD_CPUIDLE)	+= cpuidle-kirkwood.o
++ obj-$(CONFIG_ARM_ZYNQ_CPUIDLE)		+= cpuidle-zynq.o
++ obj-$(CONFIG_ARM_U8500_CPUIDLE)         += cpuidle-ux500.o
++ obj-$(CONFIG_ARM_AT91_CPUIDLE)          += cpuidle-at91.o
++ 
++ ###############################################################################
++ # POWERPC drivers
++ obj-$(CONFIG_PSERIES_CPUIDLE)		+= cpuidle-pseries.o
++ obj-$(CONFIG_POWERNV_CPUIDLE)		+= cpuidle-powernv.o
+++>>>>>>> 2c2e6ecfd077 (powerpc/powernv/cpuidle: Back-end cpuidle driver for powernv platform.)
+* Unmerged path drivers/cpuidle/Kconfig.powerpc
+diff --git a/arch/powerpc/platforms/powernv/setup.c b/arch/powerpc/platforms/powernv/setup.c
+index 049e9788d8e1..ba0b57c52f14 100644
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -25,6 +25,7 @@
+ #include <linux/of.h>
+ #include <linux/interrupt.h>
+ #include <linux/bug.h>
++#include <linux/cpuidle.h>
+ 
+ #include <asm/machdep.h>
+ #include <asm/firmware.h>
+@@ -215,6 +216,16 @@ static int __init pnv_probe(void)
+ 	return 1;
+ }
+ 
++void powernv_idle(void)
++{
++	/* Hook to cpuidle framework if available, else
++	 * call on default platform idle code
++	 */
++	if (cpuidle_idle_call()) {
++		power7_idle();
++	}
++}
++
+ define_machine(powernv) {
+ 	.name			= "PowerNV",
+ 	.probe			= pnv_probe,
+@@ -224,7 +235,7 @@ define_machine(powernv) {
+ 	.show_cpuinfo		= pnv_show_cpuinfo,
+ 	.progress		= pnv_progress,
+ 	.machine_shutdown	= pnv_shutdown,
+-	.power_save             = power7_idle,
++	.power_save             = powernv_idle,
+ 	.calibrate_decr		= generic_calibrate_decr,
+ #ifdef CONFIG_KEXEC
+ 	.kexec_cpu_down		= pnv_kexec_cpu_down,
+* Unmerged path drivers/cpuidle/Kconfig.powerpc
+* Unmerged path drivers/cpuidle/Makefile
+diff --git a/drivers/cpuidle/cpuidle-powernv.c b/drivers/cpuidle/cpuidle-powernv.c
+new file mode 100644
+index 000000000000..78fd174c57e8
+--- /dev/null
++++ b/drivers/cpuidle/cpuidle-powernv.c
+@@ -0,0 +1,169 @@
++/*
++ *  cpuidle-powernv - idle state cpuidle driver.
++ *  Adapted from drivers/cpuidle/cpuidle-pseries
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/moduleparam.h>
++#include <linux/cpuidle.h>
++#include <linux/cpu.h>
++#include <linux/notifier.h>
++
++#include <asm/machdep.h>
++#include <asm/firmware.h>
++
++struct cpuidle_driver powernv_idle_driver = {
++	.name             = "powernv_idle",
++	.owner            = THIS_MODULE,
++};
++
++static int max_idle_state;
++static struct cpuidle_state *cpuidle_state_table;
++
++static int snooze_loop(struct cpuidle_device *dev,
++			struct cpuidle_driver *drv,
++			int index)
++{
++	local_irq_enable();
++	set_thread_flag(TIF_POLLING_NRFLAG);
++
++	while (!need_resched()) {
++		HMT_low();
++		HMT_very_low();
++	}
++
++	HMT_medium();
++	clear_thread_flag(TIF_POLLING_NRFLAG);
++	smp_mb();
++	return index;
++}
++
++static int nap_loop(struct cpuidle_device *dev,
++			struct cpuidle_driver *drv,
++			int index)
++{
++	power7_idle();
++	return index;
++}
++
++/*
++ * States for dedicated partition case.
++ */
++static struct cpuidle_state powernv_states[] = {
++	{ /* Snooze */
++		.name = "snooze",
++		.desc = "snooze",
++		.flags = CPUIDLE_FLAG_TIME_VALID,
++		.exit_latency = 0,
++		.target_residency = 0,
++		.enter = &snooze_loop },
++	{ /* NAP */
++		.name = "NAP",
++		.desc = "NAP",
++		.flags = CPUIDLE_FLAG_TIME_VALID,
++		.exit_latency = 10,
++		.target_residency = 100,
++		.enter = &nap_loop },
++};
++
++static int powernv_cpuidle_add_cpu_notifier(struct notifier_block *n,
++			unsigned long action, void *hcpu)
++{
++	int hotcpu = (unsigned long)hcpu;
++	struct cpuidle_device *dev =
++				per_cpu(cpuidle_devices, hotcpu);
++
++	if (dev && cpuidle_get_driver()) {
++		switch (action) {
++		case CPU_ONLINE:
++		case CPU_ONLINE_FROZEN:
++			cpuidle_pause_and_lock();
++			cpuidle_enable_device(dev);
++			cpuidle_resume_and_unlock();
++			break;
++
++		case CPU_DEAD:
++		case CPU_DEAD_FROZEN:
++			cpuidle_pause_and_lock();
++			cpuidle_disable_device(dev);
++			cpuidle_resume_and_unlock();
++			break;
++
++		default:
++			return NOTIFY_DONE;
++		}
++	}
++	return NOTIFY_OK;
++}
++
++static struct notifier_block setup_hotplug_notifier = {
++	.notifier_call = powernv_cpuidle_add_cpu_notifier,
++};
++
++/*
++ * powernv_cpuidle_driver_init()
++ */
++static int powernv_cpuidle_driver_init(void)
++{
++	int idle_state;
++	struct cpuidle_driver *drv = &powernv_idle_driver;
++
++	drv->state_count = 0;
++
++	for (idle_state = 0; idle_state < max_idle_state; ++idle_state) {
++		/* Is the state not enabled? */
++		if (cpuidle_state_table[idle_state].enter == NULL)
++			continue;
++
++		drv->states[drv->state_count] =	/* structure copy */
++			cpuidle_state_table[idle_state];
++
++		drv->state_count += 1;
++	}
++
++	return 0;
++}
++
++/*
++ * powernv_idle_probe()
++ * Choose state table for shared versus dedicated partition
++ */
++static int powernv_idle_probe(void)
++{
++
++	if (cpuidle_disable != IDLE_NO_OVERRIDE)
++		return -ENODEV;
++
++	if (firmware_has_feature(FW_FEATURE_OPALv3)) {
++		cpuidle_state_table = powernv_states;
++		max_idle_state = ARRAY_SIZE(powernv_states);
++ 	} else
++ 		return -ENODEV;
++
++	return 0;
++}
++
++static int __init powernv_processor_idle_init(void)
++{
++	int retval;
++
++	retval = powernv_idle_probe();
++	if (retval)
++		return retval;
++
++	powernv_cpuidle_driver_init();
++	retval = cpuidle_register(&powernv_idle_driver, NULL);
++	if (retval) {
++		printk(KERN_DEBUG "Registration of powernv driver failed.\n");
++		return retval;
++	}
++
++	register_cpu_notifier(&setup_hotplug_notifier);
++	printk(KERN_DEBUG "powernv_idle_driver registered\n");
++	return 0;
++}
++
++device_initcall(powernv_processor_idle_init);
