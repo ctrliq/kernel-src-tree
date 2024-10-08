@@ -1,0 +1,126 @@
+nfs: use > 1 request to handle bsize < PAGE_SIZE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit f0cb9ab8d5589fc553761068200e5a8342f61de0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f0cb9ab8.failed
+
+Use the newly added support for multiple requests per page for
+rsize/wsize < PAGE_SIZE, instead of having multiple read / write
+data structures per pageio header.
+
+This allows us to get rid of nfs_pgio_multi.
+
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit f0cb9ab8d5589fc553761068200e5a8342f61de0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+diff --cc fs/nfs/pagelist.c
+index 00f3d2d2a504,ec4311df05d9..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -340,6 -736,94 +332,97 @@@ void nfs_pageio_init(struct nfs_pageio_
+  }
+  EXPORT_SYMBOL_GPL(nfs_pageio_init);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * nfs_pgio_result - Basic pageio error handling
++  * @task: The task that ran
++  * @calldata: Pageio data to check
++  */
++ static void nfs_pgio_result(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_data *data = calldata;
++ 	struct inode *inode = data->header->inode;
++ 
++ 	dprintk("NFS: %s: %5u, (status %d)\n", __func__,
++ 		task->tk_pid, task->tk_status);
++ 
++ 	if (data->header->rw_ops->rw_done(task, data, inode) != 0)
++ 		return;
++ 	if (task->tk_status < 0)
++ 		nfs_set_pgio_error(data->header, task->tk_status, data->args.offset);
++ 	else
++ 		data->header->rw_ops->rw_result(task, data);
++ }
++ 
++ /*
++  * Create an RPC task for the given read or write request and kick it.
++  * The page must have been locked by the caller.
++  *
++  * It may happen that the page we're passed is not marked dirty.
++  * This is the case if nfs_updatepage detects a conflicting request
++  * that has been written but not committed.
++  */
++ int nfs_generic_pgio(struct nfs_pageio_descriptor *desc,
++ 		     struct nfs_pgio_header *hdr)
++ {
++ 	struct nfs_page		*req;
++ 	struct page		**pages;
++ 	struct nfs_pgio_data	*data;
++ 	struct list_head *head = &desc->pg_list;
++ 	struct nfs_commit_info cinfo;
++ 
++ 	data = nfs_pgio_data_alloc(hdr, nfs_page_array_len(desc->pg_base,
++ 							   desc->pg_count));
++ 	if (!data)
++ 		return nfs_pgio_error(desc, hdr);
++ 
++ 	nfs_init_cinfo(&cinfo, desc->pg_inode, desc->pg_dreq);
++ 	pages = data->pages.pagevec;
++ 	while (!list_empty(head)) {
++ 		req = nfs_list_entry(head->next);
++ 		nfs_list_remove_request(req);
++ 		nfs_list_add_request(req, &hdr->pages);
++ 		*pages++ = req->wb_page;
++ 	}
++ 
++ 	if ((desc->pg_ioflags & FLUSH_COND_STABLE) &&
++ 	    (desc->pg_moreio || nfs_reqs_to_commit(&cinfo)))
++ 		desc->pg_ioflags &= ~FLUSH_COND_STABLE;
++ 
++ 	/* Set up the argument struct */
++ 	nfs_pgio_rpcsetup(data, desc->pg_count, 0, desc->pg_ioflags, &cinfo);
++ 	list_add(&data->list, &hdr->rpc_list);
++ 	desc->pg_rpc_callops = &nfs_pgio_common_ops;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nfs_generic_pgio);
++ 
++ static int nfs_generic_pg_pgios(struct nfs_pageio_descriptor *desc)
++ {
++ 	struct nfs_rw_header *rw_hdr;
++ 	struct nfs_pgio_header *hdr;
++ 	int ret;
++ 
++ 	rw_hdr = nfs_rw_header_alloc(desc->pg_rw_ops);
++ 	if (!rw_hdr) {
++ 		desc->pg_completion_ops->error_cleanup(&desc->pg_list);
++ 		return -ENOMEM;
++ 	}
++ 	hdr = &rw_hdr->header;
++ 	nfs_pgheader_init(desc, hdr, nfs_rw_header_free);
++ 	atomic_inc(&hdr->refcnt);
++ 	ret = nfs_generic_pgio(desc, hdr);
++ 	if (ret == 0)
++ 		ret = nfs_do_multiple_pgios(&hdr->rpc_list,
++ 					    desc->pg_rpc_callops,
++ 					    desc->pg_ioflags);
++ 	if (atomic_dec_and_test(&hdr->refcnt))
++ 		hdr->completion_ops->completion(hdr);
++ 	return ret;
++ }
++ 
+++>>>>>>> f0cb9ab8d558 (nfs: use > 1 request to handle bsize < PAGE_SIZE)
+  static bool nfs_match_open_context(const struct nfs_open_context *ctx1,
+  		const struct nfs_open_context *ctx2)
+  {
+* Unmerged path fs/nfs/pagelist.c
