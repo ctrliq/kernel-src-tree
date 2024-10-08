@@ -1,0 +1,205 @@
+vxlan: Fix double free of skb.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] vxlan: Fix double free of skb (Marcelo Leitner) [1206570]
+Rebuild_FUZZ: 98.31%
+commit-author Pravin B Shelar <pshelar@nicira.com>
+commit 74f47278cb056ffe1d261df3e094d608c3569829
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/74f47278.failed
+
+In case of error vxlan_xmit_one() can free already freed skb.
+Also fixes memory leak of dst-entry.
+
+Fixes: acbf74a7630 ("vxlan: Refactor vxlan driver to make use
+of the common UDP tunnel functions").
+
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 74f47278cb056ffe1d261df3e094d608c3569829)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 53990534b6ec,7fbd89fbe107..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1582,17 -1570,21 +1582,25 @@@ static int vxlan6_xmit_skb(struct net *
+  			   struct dst_entry *dst, struct sk_buff *skb,
+  			   struct net_device *dev, struct in6_addr *saddr,
+  			   struct in6_addr *daddr, __u8 prio, __u8 ttl,
+ -			   __be16 src_port, __be16 dst_port, __be32 vni,
+ -			   bool xnet)
+ +			   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+ +	struct ipv6hdr *ip6h;
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !udp_get_no_check6_tx(vs->sock->sk);
+  
+++<<<<<<< HEAD
+ +	skb = vxlan_handle_offloads(skb, !udp_get_no_check6_tx(vs->sock->sk));
+ +	if (IS_ERR(skb))
+ +		return -EINVAL;
+++=======
++ 	skb = udp_tunnel_handle_offloads(skb, udp_sum);
++ 	if (IS_ERR(skb)) {
++ 		err = -EINVAL;
++ 		goto err;
++ 	}
+ -
+ -	skb_scrub_packet(skb, xnet);
+++>>>>>>> 74f47278cb05 (vxlan: Fix double free of skb.)
+  
+  	min_headroom = LL_RESERVED_SPACE(dst->dev) + dst->header_len
+  			+ VXLAN_HLEN + sizeof(struct ipv6hdr)
+@@@ -1600,72 -1592,45 +1608,84 @@@
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+- 	if (unlikely(err))
+- 		return err;
++ 	if (unlikely(err)) {
++ 		kfree_skb(skb);
++ 		goto err;
++ 	}
+  
+++<<<<<<< HEAD
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+++=======
++ 	skb = vlan_hwaccel_push_inside(skb);
++ 	if (WARN_ON(!skb)) {
++ 		err = -ENOMEM;
++ 		goto err;
+++>>>>>>> 74f47278cb05 (vxlan: Fix double free of skb.)
+  	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+  	vxh->vx_flags = htonl(VXLAN_FLAGS);
+  	vxh->vx_vni = vni;
+  
+ -	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+ +
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -	udp_tunnel6_xmit_skb(vs->sock, dst, skb, dev, saddr, daddr, prio,
+ -			     ttl, src_port, dst_port);
+ +	uh->len = htons(skb->len);
+ +
+ +	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ +	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ +			      IPSKB_REROUTED);
+ +	skb_dst_drop(skb);
+ +	skb_dst_set(skb, dst);
+ +
+ +	udp6_set_csum(udp_get_no_check6_tx(vs->sock->sk), skb,
+ +		      saddr, daddr, skb->len);
+ +
+ +	__skb_push(skb, sizeof(*ip6h));
+ +	skb_reset_network_header(skb);
+ +	ip6h		  = ipv6_hdr(skb);
+ +	ip6h->version	  = 6;
+ +	ip6h->priority	  = prio;
+ +	ip6h->flow_lbl[0] = 0;
+ +	ip6h->flow_lbl[1] = 0;
+ +	ip6h->flow_lbl[2] = 0;
+ +	ip6h->payload_len = htons(skb->len);
+ +	ip6h->nexthdr     = IPPROTO_UDP;
+ +	ip6h->hop_limit   = ttl;
+ +	ip6h->daddr	  = *daddr;
+ +	ip6h->saddr	  = *saddr;
+ +
+ +	ip6tunnel_xmit(skb, dev);
+  	return 0;
++ err:
++ 	dst_release(dst);
++ 	return err;
+  }
+  #endif
+  
+ -int vxlan_xmit_skb(struct vxlan_sock *vs,
+ +int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+  		   struct rtable *rt, struct sk_buff *skb,
+  		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+ -		   __be16 src_port, __be16 dst_port, __be32 vni, bool xnet)
+ +		   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !vs->sock->sk->sk_no_check_tx;
+  
+ -	skb = udp_tunnel_handle_offloads(skb, udp_sum);
+ +	skb = vxlan_handle_offloads(skb, !vs->sock->sk->sk_no_check_tx);
+  	if (IS_ERR(skb))
+- 		return -EINVAL;
++ 		return PTR_ERR(skb);
+  
+  	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+  			+ VXLAN_HLEN + sizeof(struct iphdr)
+@@@ -1673,17 -1638,14 +1693,19 @@@
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+- 	if (unlikely(err))
++ 	if (unlikely(err)) {
++ 		kfree_skb(skb);
+  		return err;
++ 	}
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb))
+ -		return -ENOMEM;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+  	vxh->vx_flags = htonl(VXLAN_FLAGS);
+@@@ -1829,13 -1782,17 +1851,23 @@@ static void vxlan_xmit_one(struct sk_bu
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+  
+ -		err = vxlan_xmit_skb(vxlan->vn_sock, rt, skb,
+ +		err = vxlan_xmit_skb(dev_net(dev), vxlan->vn_sock, rt, skb,
+  				     fl4.saddr, dst->sin.sin_addr.s_addr,
+  				     tos, ttl, df, src_port, dst_port,
+++<<<<<<< HEAD
+ +				     htonl(vni << 8));
+ +
+ +		if (err < 0)
+++=======
++ 				     htonl(vni << 8),
++ 				     !net_eq(vxlan->net, dev_net(vxlan->dev)));
++ 		if (err < 0) {
++ 			/* skb is already freed. */
++ 			skb = NULL;
+++>>>>>>> 74f47278cb05 (vxlan: Fix double free of skb.)
+  			goto rt_tx_error;
++ 		}
++ 
+  		iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+* Unmerged path drivers/net/vxlan.c
