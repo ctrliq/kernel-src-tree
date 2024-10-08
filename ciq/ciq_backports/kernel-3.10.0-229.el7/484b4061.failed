@@ -1,0 +1,460 @@
+blk-mq: save memory by freeing requests on unused hardware queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 484b4061e6683e0e6a09c7455f80781128dc8a6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/484b4061.failed
+
+Depending on the topology of the machine and the number of queues
+exposed by a device, we can end up in a situation where some of
+the hardware queues are unused (as in, they don't map to any
+software queues). For this case, free up the memory used by the
+request map, as we will not use it. This can be a substantial
+amount of memory, depending on the number of queues vs CPUs and
+the queue depth of the device.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 484b4061e6683e0e6a09c7455f80781128dc8a6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index a6fc109357ae,103aa1dbc000..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -458,11 -597,24 +458,19 @@@ static void blk_mq_rq_timer(unsigned lo
+  	unsigned long next = 0;
+  	int i, next_set = 0;
+  
+- 	queue_for_each_hw_ctx(q, hctx, i)
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		/*
++ 		 * If not software queues are currently mapped to this
++ 		 * hardware queue, there's nothing to check
++ 		 */
++ 		if (!hctx->nr_ctx || !hctx->tags)
++ 			continue;
++ 
+  		blk_mq_hw_ctx_check_timeout(hctx, &next, &next_set);
++ 	}
+  
+ -	if (next_set) {
+ -		next = blk_rq_timeout(round_jiffies_up(next));
+ -		mod_timer(&q->timeout, next);
+ -	} else {
+ -		queue_for_each_hw_ctx(q, hctx, i)
+ -			blk_mq_tag_idle(hctx);
+ -	}
+ +	if (next_set)
+ +		mod_timer(&q->timeout, round_jiffies_up(next));
+  }
+  
+  /*
+@@@ -984,86 -1204,24 +992,91 @@@ void blk_mq_free_single_hw_queue(struc
+  }
+  EXPORT_SYMBOL(blk_mq_free_single_hw_queue);
+  
+ -static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ -		struct blk_mq_tags *tags, unsigned int hctx_idx)
+++<<<<<<< HEAD
+ +static int blk_mq_hctx_notify(void *data, unsigned long action,
+ +			      unsigned int cpu)
+  {
+ -	struct page *page;
+ +	struct blk_mq_hw_ctx *hctx = data;
+ +	struct request_queue *q = hctx->queue;
+ +	struct blk_mq_ctx *ctx;
+ +	LIST_HEAD(tmp);
+  
+ -	if (tags->rqs && set->ops->exit_request) {
+ -		int i;
+ +	if (action != CPU_DEAD && action != CPU_DEAD_FROZEN)
+ +		return NOTIFY_OK;
+  
+ -		for (i = 0; i < tags->nr_tags; i++) {
+ -			if (!tags->rqs[i])
+ -				continue;
+ -			set->ops->exit_request(set->driver_data, tags->rqs[i],
+ -						hctx_idx, i);
+ -		}
+ +	/*
+ +	 * Move ctx entries to new CPU, if this one is going away.
+ +	 */
+ +	ctx = __blk_mq_get_ctx(q, cpu);
+ +
+ +	spin_lock(&ctx->lock);
+ +	if (!list_empty(&ctx->rq_list)) {
+ +		list_splice_init(&ctx->rq_list, &tmp);
+ +		clear_bit(ctx->index_hw, hctx->ctx_map);
+ +	}
+ +	spin_unlock(&ctx->lock);
+ +
+ +	if (list_empty(&tmp))
+ +		return NOTIFY_OK;
+ +
+ +	ctx = blk_mq_get_ctx(q);
+ +	spin_lock(&ctx->lock);
+ +
+ +	while (!list_empty(&tmp)) {
+ +		struct request *rq;
+ +
+ +		rq = list_first_entry(&tmp, struct request, queuelist);
+ +		rq->mq_ctx = ctx;
+ +		list_move_tail(&rq->queuelist, &ctx->rq_list);
+ +	}
+ +
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +	blk_mq_hctx_mark_pending(hctx, ctx);
+ +
+ +	spin_unlock(&ctx->lock);
+ +
+ +	blk_mq_run_hw_queue(hctx, true);
+ +	blk_mq_put_ctx(ctx);
+ +	return NOTIFY_OK;
+ +}
+ +
+ +static void blk_mq_init_hw_commands(struct blk_mq_hw_ctx *hctx,
+ +				    void (*init)(void *, struct blk_mq_hw_ctx *,
+ +					struct request *, unsigned int),
+ +				    void *data)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < hctx->queue_depth; i++) {
+ +		struct request *rq = hctx->rqs[i];
+ +
+ +		init(data, hctx, rq, i);
+  	}
+ +}
+  
+ -	while (!list_empty(&tags->page_list)) {
+ -		page = list_first_entry(&tags->page_list, struct page, lru);
+ +void blk_mq_init_commands(struct request_queue *q,
+ +			  void (*init)(void *, struct blk_mq_hw_ctx *,
+ +					struct request *, unsigned int),
+ +			  void *data)
+ +{
+ +	struct blk_mq_hw_ctx *hctx;
+ +	unsigned int i;
+ +
+ +	queue_for_each_hw_ctx(q, hctx, i)
+ +		blk_mq_init_hw_commands(hctx, init, data);
+ +}
+ +EXPORT_SYMBOL(blk_mq_init_commands);
+ +
+ +static void blk_mq_free_rq_map(struct blk_mq_hw_ctx *hctx)
+++=======
+++static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+++		struct blk_mq_tags *tags, unsigned int hctx_idx)
+++>>>>>>> 484b4061e668 (blk-mq: save memory by freeing requests on unused hardware queues)
+ +{
+ +	struct page *page;
+ +
+ +	while (!list_empty(&hctx->page_list)) {
+ +		page = list_first_entry(&hctx->page_list, struct page, lru);
+  		list_del_init(&page->lru);
+  		__free_pages(page, page->private);
+  	}
+@@@ -1155,8 -1345,79 +1168,79 @@@ err_rq_map
+  	return 0;
+  }
+  
++ static int blk_mq_hctx_cpu_offline(struct blk_mq_hw_ctx *hctx, int cpu)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 	struct blk_mq_ctx *ctx;
++ 	LIST_HEAD(tmp);
++ 
++ 	/*
++ 	 * Move ctx entries to new CPU, if this one is going away.
++ 	 */
++ 	ctx = __blk_mq_get_ctx(q, cpu);
++ 
++ 	spin_lock(&ctx->lock);
++ 	if (!list_empty(&ctx->rq_list)) {
++ 		list_splice_init(&ctx->rq_list, &tmp);
++ 		blk_mq_hctx_clear_pending(hctx, ctx);
++ 	}
++ 	spin_unlock(&ctx->lock);
++ 
++ 	if (list_empty(&tmp))
++ 		return NOTIFY_OK;
++ 
++ 	ctx = blk_mq_get_ctx(q);
++ 	spin_lock(&ctx->lock);
++ 
++ 	while (!list_empty(&tmp)) {
++ 		struct request *rq;
++ 
++ 		rq = list_first_entry(&tmp, struct request, queuelist);
++ 		rq->mq_ctx = ctx;
++ 		list_move_tail(&rq->queuelist, &ctx->rq_list);
++ 	}
++ 
++ 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
++ 	blk_mq_hctx_mark_pending(hctx, ctx);
++ 
++ 	spin_unlock(&ctx->lock);
++ 
++ 	blk_mq_run_hw_queue(hctx, true);
++ 	blk_mq_put_ctx(ctx);
++ 	return NOTIFY_OK;
++ }
++ 
++ static int blk_mq_hctx_cpu_online(struct blk_mq_hw_ctx *hctx, int cpu)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 
++ 	if (set->tags[hctx->queue_num])
++ 		return NOTIFY_OK;
++ 
++ 	set->tags[hctx->queue_num] = blk_mq_init_rq_map(set, hctx->queue_num);
++ 	if (!set->tags[hctx->queue_num])
++ 		return NOTIFY_STOP;
++ 
++ 	hctx->tags = set->tags[hctx->queue_num];
++ 	return NOTIFY_OK;
++ }
++ 
++ static int blk_mq_hctx_notify(void *data, unsigned long action,
++ 			      unsigned int cpu)
++ {
++ 	struct blk_mq_hw_ctx *hctx = data;
++ 
++ 	if (action == CPU_DEAD || action == CPU_DEAD_FROZEN)
++ 		return blk_mq_hctx_cpu_offline(hctx, cpu);
++ 	else if (action == CPU_ONLINE || action == CPU_ONLINE_FROZEN)
++ 		return blk_mq_hctx_cpu_online(hctx, cpu);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
+  static int blk_mq_init_hw_queues(struct request_queue *q,
+ -		struct blk_mq_tag_set *set)
+ +				 struct blk_mq_reg *reg, void *driver_data)
+  {
+  	struct blk_mq_hw_ctx *hctx;
+  	unsigned int i, j;
+@@@ -1289,30 -1543,87 +1373,56 @@@ static void blk_mq_map_swqueue(struct r
+  		ctx->index_hw = hctx->nr_ctx;
+  		hctx->ctxs[hctx->nr_ctx++] = ctx;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		/*
++ 		 * If not software queues are mapped to this hardware queue,
++ 		 * disable it and free the request entries
++ 		 */
++ 		if (!hctx->nr_ctx) {
++ 			struct blk_mq_tag_set *set = q->tag_set;
++ 
++ 			if (set->tags[i]) {
++ 				blk_mq_free_rq_map(set, set->tags[i], i);
++ 				set->tags[i] = NULL;
++ 				hctx->tags = NULL;
++ 			}
++ 			continue;
++ 		}
++ 
++ 		/*
++ 		 * Initialize batch roundrobin counts
++ 		 */
++ 		hctx->next_cpu = cpumask_first(hctx->cpumask);
++ 		hctx->next_cpu_batch = BLK_MQ_CPU_WORK_BATCH;
++ 	}
+++>>>>>>> 484b4061e668 (blk-mq: save memory by freeing requests on unused hardware queues)
+  }
+  
+ -static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set)
+ +struct request_queue *blk_mq_init_queue(struct blk_mq_reg *reg,
+ +					void *driver_data)
+  {
+ -	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_hw_ctx **hctxs;
+ +	struct blk_mq_ctx *ctx;
+  	struct request_queue *q;
+ -	bool shared;
+  	int i;
+  
+ -	if (set->tag_list.next == set->tag_list.prev)
+ -		shared = false;
+ -	else
+ -		shared = true;
+ -
+ -	list_for_each_entry(q, &set->tag_list, tag_set_list) {
+ -		blk_mq_freeze_queue(q);
+ +	if (!reg->nr_hw_queues ||
+ +	    !reg->ops->queue_rq || !reg->ops->map_queue ||
+ +	    !reg->ops->alloc_hctx || !reg->ops->free_hctx)
+ +		return ERR_PTR(-EINVAL);
+  
+ -		queue_for_each_hw_ctx(q, hctx, i) {
+ -			if (shared)
+ -				hctx->flags |= BLK_MQ_F_TAG_SHARED;
+ -			else
+ -				hctx->flags &= ~BLK_MQ_F_TAG_SHARED;
+ -		}
+ -		blk_mq_unfreeze_queue(q);
+ +	if (!reg->queue_depth)
+ +		reg->queue_depth = BLK_MQ_MAX_DEPTH;
+ +	else if (reg->queue_depth > BLK_MQ_MAX_DEPTH) {
+ +		pr_err("blk-mq: queuedepth too large (%u)\n", reg->queue_depth);
+ +		reg->queue_depth = BLK_MQ_MAX_DEPTH;
+  	}
+ -}
+ -
+ -static void blk_mq_del_queue_tag_set(struct request_queue *q)
+ -{
+ -	struct blk_mq_tag_set *set = q->tag_set;
+  
+ -	blk_mq_freeze_queue(q);
+ -
+ -	mutex_lock(&set->tag_list_lock);
+ -	list_del_init(&q->tag_set_list);
+ -	blk_mq_update_tag_set_depth(set);
+ -	mutex_unlock(&set->tag_list_lock);
+ -
+ -	blk_mq_unfreeze_queue(q);
+ -}
+ -
+ -static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+ -				     struct request_queue *q)
+ -{
+ -	q->tag_set = set;
+ -
+ -	mutex_lock(&set->tag_list_lock);
+ -	list_add_tail(&q->tag_set_list, &set->tag_list);
+ -	blk_mq_update_tag_set_depth(set);
+ -	mutex_unlock(&set->tag_list_lock);
+ -}
+ -
+ -struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ -{
+ -	struct blk_mq_hw_ctx **hctxs;
+ -	struct blk_mq_ctx *ctx;
+ -	struct request_queue *q;
+ -	int i;
+ +	if (reg->queue_depth < (reg->reserved_tags + BLK_MQ_TAG_MIN))
+ +		return ERR_PTR(-EINVAL);
+  
+  	ctx = alloc_percpu(struct blk_mq_ctx);
+  	if (!ctx)
+@@@ -1374,15 -1692,17 +1484,20 @@@
+  	if (!q->flush_rq)
+  		goto err_hw;
+  
+ -	if (blk_mq_init_hw_queues(q, set))
+ +	if (blk_mq_init_hw_queues(q, reg, driver_data))
+  		goto err_flush_rq;
+  
+- 	blk_mq_map_swqueue(q);
+- 
+  	mutex_lock(&all_q_mutex);
+  	list_add_tail(&q->all_q_node, &all_q_list);
+  	mutex_unlock(&all_q_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ 	blk_mq_add_queue_tag_set(set, q);
++ 
++ 	blk_mq_map_swqueue(q);
++ 
+++>>>>>>> 484b4061e668 (blk-mq: save memory by freeing requests on unused hardware queues)
+  	return q;
+  
+  err_flush_rq:
+@@@ -1474,6 -1794,83 +1589,86 @@@ static int __cpuinit blk_mq_queue_reini
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	if (!set->nr_hw_queues)
++ 		return -EINVAL;
++ 	if (!set->queue_depth || set->queue_depth > BLK_MQ_MAX_DEPTH)
++ 		return -EINVAL;
++ 	if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
++ 		return -EINVAL;
++ 
++ 	if (!set->nr_hw_queues ||
++ 	    !set->ops->queue_rq || !set->ops->map_queue ||
++ 	    !set->ops->alloc_hctx || !set->ops->free_hctx)
++ 		return -EINVAL;
++ 
++ 
++ 	set->tags = kmalloc_node(set->nr_hw_queues *
++ 				 sizeof(struct blk_mq_tags *),
++ 				 GFP_KERNEL, set->numa_node);
++ 	if (!set->tags)
++ 		goto out;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		set->tags[i] = blk_mq_init_rq_map(set, i);
++ 		if (!set->tags[i])
++ 			goto out_unwind;
++ 	}
++ 
++ 	mutex_init(&set->tag_list_lock);
++ 	INIT_LIST_HEAD(&set->tag_list);
++ 
++ 	return 0;
++ 
++ out_unwind:
++ 	while (--i >= 0)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ out:
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL(blk_mq_alloc_tag_set);
++ 
++ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		if (set->tags[i])
++ 			blk_mq_free_rq_map(set, set->tags[i], i);
++ 	}
++ 
++ 	kfree(set->tags);
++ }
++ EXPORT_SYMBOL(blk_mq_free_tag_set);
++ 
++ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
++ {
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 	struct blk_mq_hw_ctx *hctx;
++ 	int i, ret;
++ 
++ 	if (!set || nr > set->queue_depth)
++ 		return -EINVAL;
++ 
++ 	ret = 0;
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		ret = blk_mq_tag_update_depth(hctx->tags, nr);
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	if (!ret)
++ 		q->nr_requests = nr;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 484b4061e668 (blk-mq: save memory by freeing requests on unused hardware queues)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+* Unmerged path block/blk-mq.c
