@@ -1,0 +1,167 @@
+netfilter: bridge: refactor frag_max_size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bernhard Thaler <bernhard.thaler@wvnet.at>
+commit 411ffb4fde80705a9a8db4c2d38dbeef6f5bd689
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/411ffb4f.failed
+
+Currently frag_max_size is member of br_input_skb_cb and copied back and
+forth using IPCB(skb) and BR_INPUT_SKB_CB(skb) each time it is changed or
+used.
+
+Attach frag_max_size to nf_bridge_info and set value in pre_routing and
+forward functions. Use its value in forward and xmit functions.
+
+	Signed-off-by: Bernhard Thaler <bernhard.thaler@wvnet.at>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 411ffb4fde80705a9a8db4c2d38dbeef6f5bd689)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/bridge/br_netfilter.c
+#	net/bridge/br_private.h
+diff --cc include/linux/skbuff.h
+index 2e271768b46a,32b105e682b3..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -163,13 -165,26 +163,23 @@@ struct nf_conntrack 
+  };
+  #endif
+  
+ -#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+  struct nf_bridge_info {
+  	atomic_t		use;
+++<<<<<<< HEAD
+++=======
++ 	enum {
++ 		BRNF_PROTO_UNCHANGED,
++ 		BRNF_PROTO_8021Q,
++ 		BRNF_PROTO_PPPOE
++ 	} orig_proto:8;
++ 	bool			pkt_otherhost;
++ 	__u16			frag_max_size;
+++>>>>>>> 411ffb4fde80 (netfilter: bridge: refactor frag_max_size)
+  	unsigned int		mask;
+  	struct net_device	*physindev;
+ -	union {
+ -		struct net_device *physoutdev;
+ -		char neigh_header[8];
+ -	};
+ -	union {
+ -		__be32          ipv4_daddr;
+ -		struct in6_addr ipv6_daddr;
+ -	};
+ +	struct net_device	*physoutdev;
+ +	unsigned long		data[32 / sizeof(unsigned long)];
+  };
+  #endif
+  
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,1f30b28745de..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -434,12 -441,14 +434,18 @@@ static int br_nf_pre_routing_finish(str
+  	struct rtable *rt;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (nf_bridge->mask & BRNF_PKT_TYPE) {
+++=======
++ 	nf_bridge->frag_max_size = IPCB(skb)->frag_max_size;
++ 
++ 	if (nf_bridge->pkt_otherhost) {
+++>>>>>>> 411ffb4fde80 (netfilter: bridge: refactor frag_max_size)
+  		skb->pkt_type = PACKET_OTHERHOST;
+ -		nf_bridge->pkt_otherhost = false;
+ +		nf_bridge->mask ^= BRNF_PKT_TYPE;
+  	}
+ -	nf_bridge->mask &= ~BRNF_NF_BRIDGE_PREROUTING;
+ -	if (daddr_was_changed(skb, nf_bridge)) {
+ +	nf_bridge->mask ^= BRNF_NF_BRIDGE_PREROUTING;
+ +	if (dnat_took_place(skb)) {
+  		if ((err = ip_route_input(skb, iph->daddr, iph->saddr, iph->tos, dev))) {
+  			struct in_device *in_dev = __in_dev_get_rcu(dev);
+  
+@@@ -852,16 -897,42 +853,53 @@@ static unsigned int br_nf_forward_arp(c
+  static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+  {
+  	int ret;
+++<<<<<<< HEAD
+ +
+ +	if (skb->nfct != NULL && skb->protocol == htons(ETH_P_IP) &&
+ +	    skb->len + nf_bridge_mtu_reduction(skb) > skb->dev->mtu &&
+ +	    !skb_is_gso(skb)) {
+ +		if (br_parse_ip_options(skb))
+ +			/* Drop invalid packet */
+ +			return NF_DROP;
+ +		ret = ip_fragment(sk, skb, br_dev_queue_push_xmit);
+ +	} else
+++=======
++ 	struct nf_bridge_info *nf_bridge;
++ 	unsigned int mtu_reserved;
++ 
++ 	if (skb_is_gso(skb) || skb->protocol != htons(ETH_P_IP)) {
++ 		nf_bridge_info_free(skb);
++ 		return br_dev_queue_push_xmit(sk, skb);
++ 	}
++ 
++ 	mtu_reserved = nf_bridge_mtu_reduction(skb);
++ 	nf_bridge = nf_bridge_info_get(skb);
++ 	/* This is wrong! We should preserve the original fragment
++ 	 * boundaries by preserving frag_list rather than refragmenting.
++ 	 */
++ 	if (skb->len + mtu_reserved > skb->dev->mtu) {
++ 		struct brnf_frag_data *data;
++ 
++ 		if (br_parse_ip_options(skb))
++ 			/* Drop invalid packet */
++ 			return NF_DROP;
++ 
++ 		IPCB(skb)->frag_max_size = nf_bridge->frag_max_size;
++ 
++ 		nf_bridge_update_protocol(skb);
++ 
++ 		data = this_cpu_ptr(&brnf_frag_data_storage);
++ 		data->encap_size = nf_bridge_encap_header_len(skb);
++ 		data->size = ETH_HLEN + data->encap_size;
++ 
++ 		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
++ 						 data->size);
++ 
++ 		ret = br_nf_ip_fragment(sk, skb, br_nf_push_frag_xmit);
++ 	} else {
++ 		nf_bridge_info_free(skb);
+++>>>>>>> 411ffb4fde80 (netfilter: bridge: refactor frag_max_size)
+  		ret = br_dev_queue_push_xmit(sk, skb);
+ -	}
+  
+  	return ret;
+  }
+diff --cc net/bridge/br_private.h
+index 42f63e0bc8cf,8cde96e68fd5..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -288,6 -303,12 +288,15 @@@ struct br_input_skb_cb 
+  	int igmp;
+  	int mrouters_only;
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ 	bool proxyarp_replied;
++ 
++ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
++ 	bool vlan_filtered;
++ #endif
+++>>>>>>> 411ffb4fde80 (netfilter: bridge: refactor frag_max_size)
+  };
+  
+  #define BR_INPUT_SKB_CB(__skb)	((struct br_input_skb_cb *)(__skb)->cb)
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/bridge/br_netfilter.c
+* Unmerged path net/bridge/br_private.h
