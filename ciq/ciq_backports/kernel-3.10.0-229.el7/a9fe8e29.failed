@@ -1,0 +1,154 @@
+ipv4: implement igmp_qrv sysctl to tune igmp robustness variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit a9fe8e29945d56f35235a3a0fba99b4cf181d211
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a9fe8e29.failed
+
+As in IPv6 people might increase the igmp query robustness variable to
+make sure unsolicited state change reports aren't lost on the network. Add
+and document this new knob to igmp code.
+
+RFCs allow tuning this parameter back to first IGMP RFC, so we also use
+this setting for all counters, including source specific multicast.
+
+Also take over sysctl value when upping the interface and don't reuse
+the last one seen on the interface.
+
+	Cc: Flavio Leitner <fbl@redhat.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Acked-by: Flavio Leitner <fbl@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a9fe8e29945d56f35235a3a0fba99b4cf181d211)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/igmp.c
+diff --cc net/ipv4/igmp.c
+index 248c83d1f50a,4146153d875d..000000000000
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@@ -114,9 -114,10 +114,9 @@@
+  
+  #define IGMP_V1_Router_Present_Timeout		(400*HZ)
+  #define IGMP_V2_Router_Present_Timeout		(400*HZ)
+ -#define IGMP_V2_Unsolicited_Report_Interval	(10*HZ)
+ -#define IGMP_V3_Unsolicited_Report_Interval	(1*HZ)
+ +#define IGMP_Unsolicited_Report_Interval	(10*HZ)
+  #define IGMP_Query_Response_Interval		(10*HZ)
+- #define IGMP_Unsolicited_Report_Count		2
++ #define IGMP_Query_Robustness_Variable		2
+  
+  
+  #define IGMP_Initial_Report_Delay		(1)
+@@@ -1253,8 -1318,8 +1250,13 @@@ void ip_mc_inc_group(struct in_device *
+  	atomic_set(&im->refcnt, 1);
+  	spin_lock_init(&im->lock);
+  #ifdef CONFIG_IP_MULTICAST
+++<<<<<<< HEAD
+ +	setup_timer(&im->timer, &igmp_timer_expire, (unsigned long)im);
+ +	im->unsolicit_count = IGMP_Unsolicited_Report_Count;
+++=======
++ 	setup_timer(&im->timer, igmp_timer_expire, (unsigned long)im);
++ 	im->unsolicit_count = sysctl_igmp_qrv;
+++>>>>>>> a9fe8e29945d (ipv4: implement igmp_qrv sysctl to tune igmp robustness variable)
+  #endif
+  
+  	im->next_rcu = in_dev->mc_list;
+@@@ -1384,16 -1452,12 +1386,16 @@@ void ip_mc_init_dev(struct in_device *i
+  {
+  	ASSERT_RTNL();
+  
+ +	in_dev->mc_tomb = NULL;
+  #ifdef CONFIG_IP_MULTICAST
+ +	in_dev->mr_gq_running = 0;
+  	setup_timer(&in_dev->mr_gq_timer, igmp_gq_timer_expire,
+  			(unsigned long)in_dev);
+ +	in_dev->mr_ifc_count = 0;
+ +	in_dev->mc_count     = 0;
+  	setup_timer(&in_dev->mr_ifc_timer, igmp_ifc_timer_expire,
+  			(unsigned long)in_dev);
+- 	in_dev->mr_qrv = IGMP_Unsolicited_Report_Count;
++ 	in_dev->mr_qrv = sysctl_igmp_qrv;
+  #endif
+  
+  	spin_lock_init(&in_dev->mc_tomb_lock);
+@@@ -1572,10 -1640,9 +1578,9 @@@ static int ip_mc_del_src(struct in_devi
+  		/* filter mode change */
+  		pmc->sfmode = MCAST_INCLUDE;
+  #ifdef CONFIG_IP_MULTICAST
+- 		pmc->crcount = in_dev->mr_qrv ? in_dev->mr_qrv :
+- 			IGMP_Unsolicited_Report_Count;
++ 		pmc->crcount = in_dev->mr_qrv ?: sysctl_igmp_qrv;
+  		in_dev->mr_ifc_count = pmc->crcount;
+ -		for (psf = pmc->sources; psf; psf = psf->sf_next)
+ +		for (psf=pmc->sources; psf; psf = psf->sf_next)
+  			psf->sf_crcount = 0;
+  		igmp_ifc_event(pmc->interface);
+  	} else if (sf_setstate(pmc) || changerec) {
+@@@ -1751,10 -1818,9 +1756,9 @@@ static int ip_mc_add_src(struct in_devi
+  #ifdef CONFIG_IP_MULTICAST
+  		/* else no filters; keep old mode for reports */
+  
+- 		pmc->crcount = in_dev->mr_qrv ? in_dev->mr_qrv :
+- 			IGMP_Unsolicited_Report_Count;
++ 		pmc->crcount = in_dev->mr_qrv ?: sysctl_igmp_qrv;
+  		in_dev->mr_ifc_count = pmc->crcount;
+ -		for (psf = pmc->sources; psf; psf = psf->sf_next)
+ +		for (psf=pmc->sources; psf; psf = psf->sf_next)
+  			psf->sf_crcount = 0;
+  		igmp_ifc_event(in_dev);
+  	} else if (sf_setstate(pmc)) {
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index 1997f9aff3d3..3895db1f37e9 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -785,6 +785,11 @@ igmp_max_memberships - INTEGER
+ 
+ 	conf/all/*	  is special, changes the settings for all interfaces
+ 
++igmp_qrv - INTEGER
++	 Controls the IGMP query robustness variable (see RFC2236 8.1).
++	 Default: 2 (as specified by RFC2236 8.1)
++	 Minimum: 1 (as specified by RFC6636 4.5)
++
+ log_martians - BOOLEAN
+ 	Log packets with impossible addresses to kernel log.
+ 	log_martians for the interface will be enabled if at least one of
+diff --git a/include/linux/igmp.h b/include/linux/igmp.h
+index d88f60f71a94..753fa14e7905 100644
+--- a/include/linux/igmp.h
++++ b/include/linux/igmp.h
+@@ -39,6 +39,7 @@ static inline struct igmpv3_query *
+ 
+ extern int sysctl_igmp_max_memberships;
+ extern int sysctl_igmp_max_msf;
++extern int sysctl_igmp_qrv;
+ 
+ struct ip_sf_socklist {
+ 	unsigned int		sl_max;
+* Unmerged path net/ipv4/igmp.c
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 6900b8b97d93..4ad2fe4da57c 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -502,6 +502,16 @@ static struct ctl_table ipv4_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec
+ 	},
++#ifdef CONFIG_IP_MULTICAST
++	{
++		.procname	= "igmp_qrv",
++		.data		= &sysctl_igmp_qrv,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one
++	},
++#endif
+ 	{
+ 		.procname	= "inet_peer_threshold",
+ 		.data		= &inet_peer_threshold,
