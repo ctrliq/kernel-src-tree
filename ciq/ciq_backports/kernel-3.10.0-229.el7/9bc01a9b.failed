@@ -1,0 +1,582 @@
+KVM: PPC: Book3S HV: Work around POWER8 performance monitor bugs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: book3s hv - Work around POWER8 performance monitor bugs (Don Zickus) [1127366]
+Rebuild_FUZZ: 95.31%
+commit-author Paul Mackerras <paulus@samba.org>
+commit 9bc01a9bc77edac2ea6db62c5111a7f4335d4021
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9bc01a9b.failed
+
+This adds workarounds for two hardware bugs in the POWER8 performance
+monitor unit (PMU), both related to interrupt generation.  The effect
+of these bugs is that PMU interrupts can get lost, leading to tools
+such as perf reporting fewer counts and samples than they should.
+
+The first bug relates to the PMAO (perf. mon. alert occurred) bit in
+MMCR0; setting it should cause an interrupt, but doesn't.  The other
+bug relates to the PMAE (perf. mon. alert enable) bit in MMCR0.
+Setting PMAE when a counter is negative and counter negative
+conditions are enabled to cause alerts should cause an alert, but
+doesn't.
+
+The workaround for the first bug is to create conditions where a
+counter will overflow, whenever we are about to restore a MMCR0
+value that has PMAO set (and PMAO_SYNC clear).  The workaround for
+the second bug is to freeze all counters using MMCR2 before reading
+MMCR0.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 9bc01a9bc77edac2ea6db62c5111a7f4335d4021)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/reg.h
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/include/asm/reg.h
+index e983e00762dc,4852bcf270f3..000000000000
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@@ -650,9 -678,12 +650,16 @@@
+  #define   MMCR0_PMCC	0x000c0000UL /* PMC control */
+  #define   MMCR0_PMCC_U6	0x00080000UL /* PMC1-6 are R/W by user (PR) */
+  #define   MMCR0_PMC1CE	0x00008000UL /* PMC1 count enable*/
+- #define   MMCR0_PMCjCE	0x00004000UL /* PMCj count enable*/
++ #define   MMCR0_PMCjCE	ASM_CONST(0x00004000) /* PMCj count enable*/
+  #define   MMCR0_TRIGGER	0x00002000UL /* TRIGGER enable */
+++<<<<<<< HEAD
+ +#define   MMCR0_PMAO	0x00000080UL /* performance monitor alert has occurred, set to 0 after handling exception */
+++=======
++ #define   MMCR0_PMAO_SYNC ASM_CONST(0x00000800) /* PMU intr is synchronous */
++ #define   MMCR0_C56RUN	ASM_CONST(0x00000100) /* PMC5/6 count when RUN=0 */
++ /* performance monitor alert has occurred, set to 0 after handling exception */
++ #define   MMCR0_PMAO	ASM_CONST(0x00000080)
+++>>>>>>> 9bc01a9bc77e (KVM: PPC: Book3S HV: Work around POWER8 performance monitor bugs)
+  #define   MMCR0_SHRFC	0x00000040UL /* SHRre freeze conditions between threads */
+  #define   MMCR0_FC56	0x00000010UL /* freeze counters 5 and 6 */
+  #define   MMCR0_FCTI	0x00000008UL /* freeze counters in tags inactive mode */
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 0ae4c28ae4b6,60fe8ba318cf..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -642,6 -581,321 +648,324 @@@ toc_tlbie_lock
+  	addi	r6,r6,VCPU_SLB_SIZE
+  	bdnz	1b
+  9:
+++<<<<<<< HEAD
+++=======
++ 	/* Increment yield count if they have a VPA */
++ 	ld	r3, VCPU_VPA(r4)
++ 	cmpdi	r3, 0
++ 	beq	25f
++ 	lwz	r5, LPPACA_YIELDCOUNT(r3)
++ 	addi	r5, r5, 1
++ 	stw	r5, LPPACA_YIELDCOUNT(r3)
++ 	li	r6, 1
++ 	stb	r6, VCPU_VPA_DIRTY(r4)
++ 25:
++ 
++ BEGIN_FTR_SECTION
++ 	/* Save purr/spurr */
++ 	mfspr	r5,SPRN_PURR
++ 	mfspr	r6,SPRN_SPURR
++ 	std	r5,HSTATE_PURR(r13)
++ 	std	r6,HSTATE_SPURR(r13)
++ 	ld	r7,VCPU_PURR(r4)
++ 	ld	r8,VCPU_SPURR(r4)
++ 	mtspr	SPRN_PURR,r7
++ 	mtspr	SPRN_SPURR,r8
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
++ 
++ BEGIN_FTR_SECTION
++ 	/* Set partition DABR */
++ 	/* Do this before re-enabling PMU to avoid P7 DABR corruption bug */
++ 	lwz	r5,VCPU_DABRX(r4)
++ 	ld	r6,VCPU_DABR(r4)
++ 	mtspr	SPRN_DABRX,r5
++ 	mtspr	SPRN_DABR,r6
++  BEGIN_FTR_SECTION_NESTED(89)
++ 	isync
++  END_FTR_SECTION_NESTED(CPU_FTR_ARCH_206, CPU_FTR_ARCH_206, 89)
++ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
++ 
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ BEGIN_FTR_SECTION
++ 	b	skip_tm
++ END_FTR_SECTION_IFCLR(CPU_FTR_TM)
++ 
++ 	/* Turn on TM/FP/VSX/VMX so we can restore them. */
++ 	mfmsr	r5
++ 	li	r6, MSR_TM >> 32
++ 	sldi	r6, r6, 32
++ 	or	r5, r5, r6
++ 	ori	r5, r5, MSR_FP
++ 	oris	r5, r5, (MSR_VEC | MSR_VSX)@h
++ 	mtmsrd	r5
++ 
++ 	/*
++ 	 * The user may change these outside of a transaction, so they must
++ 	 * always be context switched.
++ 	 */
++ 	ld	r5, VCPU_TFHAR(r4)
++ 	ld	r6, VCPU_TFIAR(r4)
++ 	ld	r7, VCPU_TEXASR(r4)
++ 	mtspr	SPRN_TFHAR, r5
++ 	mtspr	SPRN_TFIAR, r6
++ 	mtspr	SPRN_TEXASR, r7
++ 
++ 	ld	r5, VCPU_MSR(r4)
++ 	rldicl. r5, r5, 64 - MSR_TS_S_LG, 62
++ 	beq	skip_tm	/* TM not active in guest */
++ 
++ 	/* Make sure the failure summary is set, otherwise we'll program check
++ 	 * when we trechkpt.  It's possible that this might have been not set
++ 	 * on a kvmppc_set_one_reg() call but we shouldn't let this crash the
++ 	 * host.
++ 	 */
++ 	oris	r7, r7, (TEXASR_FS)@h
++ 	mtspr	SPRN_TEXASR, r7
++ 
++ 	/*
++ 	 * We need to load up the checkpointed state for the guest.
++ 	 * We need to do this early as it will blow away any GPRs, VSRs and
++ 	 * some SPRs.
++ 	 */
++ 
++ 	mr	r31, r4
++ 	addi	r3, r31, VCPU_FPRS_TM
++ 	bl	.load_fp_state
++ 	addi	r3, r31, VCPU_VRS_TM
++ 	bl	.load_vr_state
++ 	mr	r4, r31
++ 	lwz	r7, VCPU_VRSAVE_TM(r4)
++ 	mtspr	SPRN_VRSAVE, r7
++ 
++ 	ld	r5, VCPU_LR_TM(r4)
++ 	lwz	r6, VCPU_CR_TM(r4)
++ 	ld	r7, VCPU_CTR_TM(r4)
++ 	ld	r8, VCPU_AMR_TM(r4)
++ 	ld	r9, VCPU_TAR_TM(r4)
++ 	mtlr	r5
++ 	mtcr	r6
++ 	mtctr	r7
++ 	mtspr	SPRN_AMR, r8
++ 	mtspr	SPRN_TAR, r9
++ 
++ 	/*
++ 	 * Load up PPR and DSCR values but don't put them in the actual SPRs
++ 	 * till the last moment to avoid running with userspace PPR and DSCR for
++ 	 * too long.
++ 	 */
++ 	ld	r29, VCPU_DSCR_TM(r4)
++ 	ld	r30, VCPU_PPR_TM(r4)
++ 
++ 	std	r2, PACATMSCRATCH(r13) /* Save TOC */
++ 
++ 	/* Clear the MSR RI since r1, r13 are all going to be foobar. */
++ 	li	r5, 0
++ 	mtmsrd	r5, 1
++ 
++ 	/* Load GPRs r0-r28 */
++ 	reg = 0
++ 	.rept	29
++ 	ld	reg, VCPU_GPRS_TM(reg)(r31)
++ 	reg = reg + 1
++ 	.endr
++ 
++ 	mtspr	SPRN_DSCR, r29
++ 	mtspr	SPRN_PPR, r30
++ 
++ 	/* Load final GPRs */
++ 	ld	29, VCPU_GPRS_TM(29)(r31)
++ 	ld	30, VCPU_GPRS_TM(30)(r31)
++ 	ld	31, VCPU_GPRS_TM(31)(r31)
++ 
++ 	/* TM checkpointed state is now setup.  All GPRs are now volatile. */
++ 	TRECHKPT
++ 
++ 	/* Now let's get back the state we need. */
++ 	HMT_MEDIUM
++ 	GET_PACA(r13)
++ 	ld	r29, HSTATE_DSCR(r13)
++ 	mtspr	SPRN_DSCR, r29
++ 	ld	r4, HSTATE_KVM_VCPU(r13)
++ 	ld	r1, HSTATE_HOST_R1(r13)
++ 	ld	r2, PACATMSCRATCH(r13)
++ 
++ 	/* Set the MSR RI since we have our registers back. */
++ 	li	r5, MSR_RI
++ 	mtmsrd	r5, 1
++ skip_tm:
++ #endif
++ 
++ 	/* Load guest PMU registers */
++ 	/* R4 is live here (vcpu pointer) */
++ 	li	r3, 1
++ 	sldi	r3, r3, 31		/* MMCR0_FC (freeze counters) bit */
++ 	mtspr	SPRN_MMCR0, r3		/* freeze all counters, disable ints */
++ 	isync
++ BEGIN_FTR_SECTION
++ 	ld	r3, VCPU_MMCR(r4)
++ 	andi.	r5, r3, MMCR0_PMAO_SYNC | MMCR0_PMAO
++ 	cmpwi	r5, MMCR0_PMAO
++ 	beql	kvmppc_fix_pmao
++ END_FTR_SECTION_IFSET(CPU_FTR_PMAO_BUG)
++ 	lwz	r3, VCPU_PMC(r4)	/* always load up guest PMU registers */
++ 	lwz	r5, VCPU_PMC + 4(r4)	/* to prevent information leak */
++ 	lwz	r6, VCPU_PMC + 8(r4)
++ 	lwz	r7, VCPU_PMC + 12(r4)
++ 	lwz	r8, VCPU_PMC + 16(r4)
++ 	lwz	r9, VCPU_PMC + 20(r4)
++ BEGIN_FTR_SECTION
++ 	lwz	r10, VCPU_PMC + 24(r4)
++ 	lwz	r11, VCPU_PMC + 28(r4)
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
++ 	mtspr	SPRN_PMC1, r3
++ 	mtspr	SPRN_PMC2, r5
++ 	mtspr	SPRN_PMC3, r6
++ 	mtspr	SPRN_PMC4, r7
++ 	mtspr	SPRN_PMC5, r8
++ 	mtspr	SPRN_PMC6, r9
++ BEGIN_FTR_SECTION
++ 	mtspr	SPRN_PMC7, r10
++ 	mtspr	SPRN_PMC8, r11
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
++ 	ld	r3, VCPU_MMCR(r4)
++ 	ld	r5, VCPU_MMCR + 8(r4)
++ 	ld	r6, VCPU_MMCR + 16(r4)
++ 	ld	r7, VCPU_SIAR(r4)
++ 	ld	r8, VCPU_SDAR(r4)
++ 	mtspr	SPRN_MMCR1, r5
++ 	mtspr	SPRN_MMCRA, r6
++ 	mtspr	SPRN_SIAR, r7
++ 	mtspr	SPRN_SDAR, r8
++ BEGIN_FTR_SECTION
++ 	ld	r5, VCPU_MMCR + 24(r4)
++ 	ld	r6, VCPU_SIER(r4)
++ 	lwz	r7, VCPU_PMC + 24(r4)
++ 	lwz	r8, VCPU_PMC + 28(r4)
++ 	ld	r9, VCPU_MMCR + 32(r4)
++ 	mtspr	SPRN_MMCR2, r5
++ 	mtspr	SPRN_SIER, r6
++ 	mtspr	SPRN_SPMC1, r7
++ 	mtspr	SPRN_SPMC2, r8
++ 	mtspr	SPRN_MMCRS, r9
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++ 	mtspr	SPRN_MMCR0, r3
++ 	isync
++ 
++ 	/* Load up FP, VMX and VSX registers */
++ 	bl	kvmppc_load_fp
++ 
++ 	ld	r14, VCPU_GPR(R14)(r4)
++ 	ld	r15, VCPU_GPR(R15)(r4)
++ 	ld	r16, VCPU_GPR(R16)(r4)
++ 	ld	r17, VCPU_GPR(R17)(r4)
++ 	ld	r18, VCPU_GPR(R18)(r4)
++ 	ld	r19, VCPU_GPR(R19)(r4)
++ 	ld	r20, VCPU_GPR(R20)(r4)
++ 	ld	r21, VCPU_GPR(R21)(r4)
++ 	ld	r22, VCPU_GPR(R22)(r4)
++ 	ld	r23, VCPU_GPR(R23)(r4)
++ 	ld	r24, VCPU_GPR(R24)(r4)
++ 	ld	r25, VCPU_GPR(R25)(r4)
++ 	ld	r26, VCPU_GPR(R26)(r4)
++ 	ld	r27, VCPU_GPR(R27)(r4)
++ 	ld	r28, VCPU_GPR(R28)(r4)
++ 	ld	r29, VCPU_GPR(R29)(r4)
++ 	ld	r30, VCPU_GPR(R30)(r4)
++ 	ld	r31, VCPU_GPR(R31)(r4)
++ 
++ BEGIN_FTR_SECTION
++ 	/* Switch DSCR to guest value */
++ 	ld	r5, VCPU_DSCR(r4)
++ 	mtspr	SPRN_DSCR, r5
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
++ 
++ BEGIN_FTR_SECTION
++ 	/* Skip next section on POWER7 or PPC970 */
++ 	b	8f
++ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
++ 	/* Turn on TM so we can access TFHAR/TFIAR/TEXASR */
++ 	mfmsr	r8
++ 	li	r0, 1
++ 	rldimi	r8, r0, MSR_TM_LG, 63-MSR_TM_LG
++ 	mtmsrd	r8
++ 
++ 	/* Load up POWER8-specific registers */
++ 	ld	r5, VCPU_IAMR(r4)
++ 	lwz	r6, VCPU_PSPB(r4)
++ 	ld	r7, VCPU_FSCR(r4)
++ 	mtspr	SPRN_IAMR, r5
++ 	mtspr	SPRN_PSPB, r6
++ 	mtspr	SPRN_FSCR, r7
++ 	ld	r5, VCPU_DAWR(r4)
++ 	ld	r6, VCPU_DAWRX(r4)
++ 	ld	r7, VCPU_CIABR(r4)
++ 	ld	r8, VCPU_TAR(r4)
++ 	mtspr	SPRN_DAWR, r5
++ 	mtspr	SPRN_DAWRX, r6
++ 	mtspr	SPRN_CIABR, r7
++ 	mtspr	SPRN_TAR, r8
++ 	ld	r5, VCPU_IC(r4)
++ 	ld	r6, VCPU_VTB(r4)
++ 	mtspr	SPRN_IC, r5
++ 	mtspr	SPRN_VTB, r6
++ 	ld	r8, VCPU_EBBHR(r4)
++ 	mtspr	SPRN_EBBHR, r8
++ 	ld	r5, VCPU_EBBRR(r4)
++ 	ld	r6, VCPU_BESCR(r4)
++ 	ld	r7, VCPU_CSIGR(r4)
++ 	ld	r8, VCPU_TACR(r4)
++ 	mtspr	SPRN_EBBRR, r5
++ 	mtspr	SPRN_BESCR, r6
++ 	mtspr	SPRN_CSIGR, r7
++ 	mtspr	SPRN_TACR, r8
++ 	ld	r5, VCPU_TCSCR(r4)
++ 	ld	r6, VCPU_ACOP(r4)
++ 	lwz	r7, VCPU_GUEST_PID(r4)
++ 	ld	r8, VCPU_WORT(r4)
++ 	mtspr	SPRN_TCSCR, r5
++ 	mtspr	SPRN_ACOP, r6
++ 	mtspr	SPRN_PID, r7
++ 	mtspr	SPRN_WORT, r8
++ 8:
++ 
++ 	/*
++ 	 * Set the decrementer to the guest decrementer.
++ 	 */
++ 	ld	r8,VCPU_DEC_EXPIRES(r4)
++ 	/* r8 is a host timebase value here, convert to guest TB */
++ 	ld	r5,HSTATE_KVM_VCORE(r13)
++ 	ld	r6,VCORE_TB_OFFSET(r5)
++ 	add	r8,r8,r6
++ 	mftb	r7
++ 	subf	r3,r7,r8
++ 	mtspr	SPRN_DEC,r3
++ 	stw	r3,VCPU_DEC(r4)
++ 
++ 	ld	r5, VCPU_SPRG0(r4)
++ 	ld	r6, VCPU_SPRG1(r4)
++ 	ld	r7, VCPU_SPRG2(r4)
++ 	ld	r8, VCPU_SPRG3(r4)
++ 	mtspr	SPRN_SPRG0, r5
++ 	mtspr	SPRN_SPRG1, r6
++ 	mtspr	SPRN_SPRG2, r7
++ 	mtspr	SPRN_SPRG3, r8
++ 
++ 	/* Load up DAR and DSISR */
++ 	ld	r5, VCPU_DAR(r4)
++ 	lwz	r6, VCPU_DSISR(r4)
++ 	mtspr	SPRN_DAR, r5
++ 	mtspr	SPRN_DSISR, r6
++ 
++ BEGIN_FTR_SECTION
++ 	/* Restore AMR and UAMOR, set AMOR to all 1s */
++ 	ld	r5,VCPU_AMR(r4)
++ 	ld	r6,VCPU_UAMOR(r4)
++ 	li	r7,-1
++ 	mtspr	SPRN_AMR,r5
++ 	mtspr	SPRN_UAMOR,r6
++ 	mtspr	SPRN_AMOR,r7
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+++>>>>>>> 9bc01a9bc77e (KVM: PPC: Book3S HV: Work around POWER8 performance monitor bugs)
+  
+  	/* Restore state of CTRL run bit; assume 1 on entry */
+  	lwz	r5,VCPU_CTRL(r4)
+@@@ -1235,106 -1655,6 +1559,148 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206
+  	li	r0, KVM_GUEST_MODE_NONE
+  	stb	r0, HSTATE_IN_GUEST(r13)
+  
+ +	/* Switch DSCR back to host value */
+ +BEGIN_FTR_SECTION
+ +	mfspr	r8, SPRN_DSCR
+ +	ld	r7, HSTATE_DSCR(r13)
+ +	std	r8, VCPU_DSCR(r9)
+ +	mtspr	SPRN_DSCR, r7
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ +
+ +	/* Save non-volatile GPRs */
+ +	std	r14, VCPU_GPR(R14)(r9)
+ +	std	r15, VCPU_GPR(R15)(r9)
+ +	std	r16, VCPU_GPR(R16)(r9)
+ +	std	r17, VCPU_GPR(R17)(r9)
+ +	std	r18, VCPU_GPR(R18)(r9)
+ +	std	r19, VCPU_GPR(R19)(r9)
+ +	std	r20, VCPU_GPR(R20)(r9)
+ +	std	r21, VCPU_GPR(R21)(r9)
+ +	std	r22, VCPU_GPR(R22)(r9)
+ +	std	r23, VCPU_GPR(R23)(r9)
+ +	std	r24, VCPU_GPR(R24)(r9)
+ +	std	r25, VCPU_GPR(R25)(r9)
+ +	std	r26, VCPU_GPR(R26)(r9)
+ +	std	r27, VCPU_GPR(R27)(r9)
+ +	std	r28, VCPU_GPR(R28)(r9)
+ +	std	r29, VCPU_GPR(R29)(r9)
+ +	std	r30, VCPU_GPR(R30)(r9)
+ +	std	r31, VCPU_GPR(R31)(r9)
+ +
+ +	/* Save SPRGs */
+ +	mfspr	r3, SPRN_SPRG0
+ +	mfspr	r4, SPRN_SPRG1
+ +	mfspr	r5, SPRN_SPRG2
+ +	mfspr	r6, SPRN_SPRG3
+ +	std	r3, VCPU_SPRG0(r9)
+ +	std	r4, VCPU_SPRG1(r9)
+ +	std	r5, VCPU_SPRG2(r9)
+ +	std	r6, VCPU_SPRG3(r9)
+ +
+ +	/* save FP state */
+ +	mr	r3, r9
+ +	bl	kvmppc_save_fp
+ +
+ +	/* Increment yield count if they have a VPA */
+ +	ld	r8, VCPU_VPA(r9)	/* do they have a VPA? */
+ +	cmpdi	r8, 0
+ +	beq	25f
+ +	lwz	r3, LPPACA_YIELDCOUNT(r8)
+ +	addi	r3, r3, 1
+ +	stw	r3, LPPACA_YIELDCOUNT(r8)
+ +	li	r3, 1
+ +	stb	r3, VCPU_VPA_DIRTY(r9)
+ +25:
+ +	/* Save PMU registers if requested */
+ +	/* r8 and cr0.eq are live here */
+++BEGIN_FTR_SECTION
+++	/*
+++	 * POWER8 seems to have a hardware bug where setting
+++	 * MMCR0[PMAE] along with MMCR0[PMC1CE] and/or MMCR0[PMCjCE]
+++	 * when some counters are already negative doesn't seem
+++	 * to cause a performance monitor alert (and hence interrupt).
+++	 * The effect of this is that when saving the PMU state,
+++	 * if there is no PMU alert pending when we read MMCR0
+++	 * before freezing the counters, but one becomes pending
+++	 * before we read the counters, we lose it.
+++	 * To work around this, we need a way to freeze the counters
+++	 * before reading MMCR0.  Normally, freezing the counters
+++	 * is done by writing MMCR0 (to set MMCR0[FC]) which
+++	 * unavoidably writes MMCR0[PMA0] as well.  On POWER8,
+++	 * we can also freeze the counters using MMCR2, by writing
+++	 * 1s to all the counter freeze condition bits (there are
+++	 * 9 bits each for 6 counters).
+++	 */
+++	li	r3, -1			/* set all freeze bits */
+++	clrrdi	r3, r3, 10
+++	mfspr	r10, SPRN_MMCR2
+++	mtspr	SPRN_MMCR2, r3
+++	isync
+++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ +	li	r3, 1
+ +	sldi	r3, r3, 31		/* MMCR0_FC (freeze counters) bit */
+ +	mfspr	r4, SPRN_MMCR0		/* save MMCR0 */
+ +	mtspr	SPRN_MMCR0, r3		/* freeze all counters, disable ints */
+ +	mfspr	r6, SPRN_MMCRA
+ +BEGIN_FTR_SECTION
+ +	/* On P7, clear MMCRA in order to disable SDAR updates */
+ +	li	r7, 0
+ +	mtspr	SPRN_MMCRA, r7
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ +	isync
+ +	beq	21f			/* if no VPA, save PMU stuff anyway */
+ +	lbz	r7, LPPACA_PMCINUSE(r8)
+ +	cmpwi	r7, 0			/* did they ask for PMU stuff to be saved? */
+ +	bne	21f
+ +	std	r3, VCPU_MMCR(r9)	/* if not, set saved MMCR0 to FC */
+ +	b	22f
+ +21:	mfspr	r5, SPRN_MMCR1
+ +	mfspr	r7, SPRN_SIAR
+ +	mfspr	r8, SPRN_SDAR
+ +	std	r4, VCPU_MMCR(r9)
+ +	std	r5, VCPU_MMCR + 8(r9)
+ +	std	r6, VCPU_MMCR + 16(r9)
+++BEGIN_FTR_SECTION
+++	std	r10, VCPU_MMCR + 24(r9)
+++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ +	std	r7, VCPU_SIAR(r9)
+ +	std	r8, VCPU_SDAR(r9)
+ +	mfspr	r3, SPRN_PMC1
+ +	mfspr	r4, SPRN_PMC2
+ +	mfspr	r5, SPRN_PMC3
+ +	mfspr	r6, SPRN_PMC4
+ +	mfspr	r7, SPRN_PMC5
+ +	mfspr	r8, SPRN_PMC6
+ +BEGIN_FTR_SECTION
+ +	mfspr	r10, SPRN_PMC7
+ +	mfspr	r11, SPRN_PMC8
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ +	stw	r3, VCPU_PMC(r9)
+ +	stw	r4, VCPU_PMC + 4(r9)
+ +	stw	r5, VCPU_PMC + 8(r9)
+ +	stw	r6, VCPU_PMC + 12(r9)
+ +	stw	r7, VCPU_PMC + 16(r9)
+ +	stw	r8, VCPU_PMC + 20(r9)
+ +BEGIN_FTR_SECTION
+ +	stw	r10, VCPU_PMC + 24(r9)
+ +	stw	r11, VCPU_PMC + 28(r9)
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+++<<<<<<< HEAD
+++=======
+++BEGIN_FTR_SECTION
+++	mfspr	r5, SPRN_SIER
+++	mfspr	r6, SPRN_SPMC1
+++	mfspr	r7, SPRN_SPMC2
+++	mfspr	r8, SPRN_MMCRS
+++	std	r5, VCPU_SIER(r9)
+++	stw	r6, VCPU_PMC + 24(r9)
+++	stw	r7, VCPU_PMC + 28(r9)
+++	std	r8, VCPU_MMCR + 32(r9)
+++	lis	r4, 0x8000
+++	mtspr	SPRN_MMCRS, r4
+++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+++>>>>>>> 9bc01a9bc77e (KVM: PPC: Book3S HV: Work around POWER8 performance monitor bugs)
+ +22:
+  	ld	r0, 112+PPC_LR_STKOFF(r1)
+  	addi	r1, r1, 112
+  	mtlr	r0
+@@@ -1965,3 -2331,38 +2331,41 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC
+   */
+  kvmppc_bad_host_intr:
+  	b	.
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * This mimics the MSR transition on IRQ delivery.  The new guest MSR is taken
++  * from VCPU_INTR_MSR and is modified based on the required TM state changes.
++  *   r11 has the guest MSR value (in/out)
++  *   r9 has a vcpu pointer (in)
++  *   r0 is used as a scratch register
++  */
++ kvmppc_msr_interrupt:
++ 	rldicl	r0, r11, 64 - MSR_TS_S_LG, 62
++ 	cmpwi	r0, 2 /* Check if we are in transactional state..  */
++ 	ld	r11, VCPU_INTR_MSR(r9)
++ 	bne	1f
++ 	/* ... if transactional, change to suspended */
++ 	li	r0, 1
++ 1:	rldimi	r11, r0, MSR_TS_S_LG, 63 - MSR_TS_T_LG
++ 	blr
++ 
++ /*
++  * This works around a hardware bug on POWER8E processors, where
++  * writing a 1 to the MMCR0[PMAO] bit doesn't generate a
++  * performance monitor interrupt.  Instead, when we need to have
++  * an interrupt pending, we have to arrange for a counter to overflow.
++  */
++ kvmppc_fix_pmao:
++ 	li	r3, 0
++ 	mtspr	SPRN_MMCR2, r3
++ 	lis	r3, (MMCR0_PMXE | MMCR0_FCECE)@h
++ 	ori	r3, r3, MMCR0_PMCjCE | MMCR0_C56RUN
++ 	mtspr	SPRN_MMCR0, r3
++ 	lis	r3, 0x7fff
++ 	ori	r3, r3, 0xffff
++ 	mtspr	SPRN_PMC6, r3
++ 	isync
++ 	blr
+++>>>>>>> 9bc01a9bc77e (KVM: PPC: Book3S HV: Work around POWER8 performance monitor bugs)
+* Unmerged path arch/powerpc/include/asm/reg.h
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
