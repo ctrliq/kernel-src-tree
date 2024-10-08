@@ -1,0 +1,150 @@
+percpu: implement asynchronous chunk population
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 1a4d76076cda69b0abf15463a8cebc172406da25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1a4d7607.failed
+
+The percpu allocator now supports atomic allocations by only
+allocating from already populated areas but the mechanism to ensure
+that there's adequate amount of populated areas was missing.
+
+This patch expands pcpu_balance_work so that in addition to freeing
+excess free chunks it also populates chunks to maintain an adequate
+level of populated areas.  pcpu_alloc() schedules pcpu_balance_work if
+the amount of free populated areas is too low or after an atomic
+allocation failure.
+
+* PERPCU_DYNAMIC_RESERVE is increased by two pages to account for
+  PCPU_EMPTY_POP_PAGES_LOW.
+
+* pcpu_async_enabled is added to gate both async jobs -
+  chunk->map_extend_work and pcpu_balance_work - so that we don't end
+  up scheduling them while the needed subsystems aren't up yet.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 1a4d76076cda69b0abf15463a8cebc172406da25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/percpu.c
+diff --cc mm/percpu.c
+index 576643473552,867efd38d879..000000000000
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@@ -166,9 -164,28 +168,34 @@@ static DEFINE_MUTEX(pcpu_alloc_mutex);	
+  
+  static struct list_head *pcpu_slot __read_mostly; /* chunk list slots */
+  
+++<<<<<<< HEAD
+ +/* reclaim work to release fully free chunks, scheduled from free path */
+ +static void pcpu_reclaim(struct work_struct *work);
+ +static DECLARE_WORK(pcpu_reclaim_work, pcpu_reclaim);
+++=======
++ /*
++  * The number of empty populated pages, protected by pcpu_lock.  The
++  * reserved chunk doesn't contribute to the count.
++  */
++ static int pcpu_nr_empty_pop_pages;
++ 
++ /*
++  * Balance work is used to populate or destroy chunks asynchronously.  We
++  * try to keep the number of populated free pages between
++  * PCPU_EMPTY_POP_PAGES_LOW and HIGH for atomic allocations and at most one
++  * empty chunk.
++  */
++ static void pcpu_balance_workfn(struct work_struct *work);
++ static DECLARE_WORK(pcpu_balance_work, pcpu_balance_workfn);
++ static bool pcpu_async_enabled __read_mostly;
++ static bool pcpu_atomic_alloc_failed;
++ 
++ static void pcpu_schedule_balance_work(void)
++ {
++ 	if (pcpu_async_enabled)
++ 		schedule_work(&pcpu_balance_work);
++ }
+++>>>>>>> 1a4d76076cda (percpu: implement asynchronous chunk population)
+  
+  static bool pcpu_addr_in_first_chunk(void *addr)
+  {
+@@@ -884,6 -1018,12 +912,15 @@@ area_found
+  		mutex_unlock(&pcpu_alloc_mutex);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (chunk != pcpu_reserved_chunk)
++ 		pcpu_nr_empty_pop_pages -= occ_pages;
++ 
++ 	if (pcpu_nr_empty_pop_pages < PCPU_EMPTY_POP_PAGES_LOW)
++ 		pcpu_schedule_balance_work();
++ 
+++>>>>>>> 1a4d76076cda (percpu: implement asynchronous chunk population)
+  	/* clear the areas and return address relative to base address */
+  	for_each_possible_cpu(cpu)
+  		memset((void *)pcpu_chunk_addr(chunk, cpu, 0) + off, 0, size);
+@@@ -947,20 -1104,22 +989,29 @@@ void __percpu *__alloc_reserved_percpu(
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * pcpu_reclaim - reclaim fully free chunks, workqueue function
+++=======
++  * pcpu_balance_workfn - manage the amount of free chunks and populated pages
+++>>>>>>> 1a4d76076cda (percpu: implement asynchronous chunk population)
+   * @work: unused
+   *
+   * Reclaim all fully free chunks except for the first one.
+ + *
+ + * CONTEXT:
+ + * workqueue context.
+   */
+ -static void pcpu_balance_workfn(struct work_struct *work)
+ +static void pcpu_reclaim(struct work_struct *work)
+  {
+ -	LIST_HEAD(to_free);
+ -	struct list_head *free_head = &pcpu_slot[pcpu_nr_slots - 1];
+ +	LIST_HEAD(todo);
+ +	struct list_head *head = &pcpu_slot[pcpu_nr_slots - 1];
+  	struct pcpu_chunk *chunk, *next;
++ 	int slot, nr_to_pop, ret;
+  
++ 	/*
++ 	 * There's no reason to keep around multiple unused chunks and VM
++ 	 * areas can be scarce.  Destroy all free chunks except for one.
++ 	 */
+  	mutex_lock(&pcpu_alloc_mutex);
+  	spin_lock_irq(&pcpu_lock);
+  
+@@@ -1025,7 -1257,7 +1144,11 @@@ void free_percpu(void __percpu *ptr
+  
+  		list_for_each_entry(pos, &pcpu_slot[pcpu_nr_slots - 1], list)
+  			if (pos != chunk) {
+++<<<<<<< HEAD
+ +				schedule_work(&pcpu_reclaim_work);
+++=======
++ 				pcpu_schedule_balance_work();
+++>>>>>>> 1a4d76076cda (percpu: implement asynchronous chunk population)
+  				break;
+  			}
+  	}
+diff --git a/include/linux/percpu.h b/include/linux/percpu.h
+index d56038effeef..80946ee73306 100644
+--- a/include/linux/percpu.h
++++ b/include/linux/percpu.h
+@@ -74,9 +74,9 @@
+  * intelligent way to determine this would be nice.
+  */
+ #if BITS_PER_LONG > 32
+-#define PERCPU_DYNAMIC_RESERVE		(20 << 10)
++#define PERCPU_DYNAMIC_RESERVE		(28 << 10)
+ #else
+-#define PERCPU_DYNAMIC_RESERVE		(12 << 10)
++#define PERCPU_DYNAMIC_RESERVE		(20 << 10)
+ #endif
+ 
+ extern void *pcpu_base_addr;
+* Unmerged path mm/percpu.c
