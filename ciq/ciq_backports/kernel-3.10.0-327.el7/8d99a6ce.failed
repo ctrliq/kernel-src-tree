@@ -1,0 +1,161 @@
+perf tools: Limit ordered events queue size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [tools] perf: Limit ordered events queue size (Jiri Olsa) [1169436]
+Rebuild_FUZZ: 92.50%
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 8d99a6ceebe862ac4afd832cdab332ee7b3b5599
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8d99a6ce.failed
+
+Add limit to the ordered events queue allocation. This way we will be
+able to control the size of the queue buffers.
+
+There's no limit at the moment (it's set to (u64) -1). The config code
+will come in following patches.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Cc: Corey Ashford <cjashfor@linux.vnet.ibm.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Jean Pihet <jean.pihet@linaro.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/n/tip-lw1ny3mk4ctb6su5ght5rsng@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 8d99a6ceebe862ac4afd832cdab332ee7b3b5599)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/session.c
+diff --cc tools/perf/util/session.c
+index 8f2eedc2c5c3,8d4538c91076..000000000000
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@@ -469,6 -471,104 +471,107 @@@ static void perf_session_free_sample_bu
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* The queue is ordered by time */
++ static void queue_event(struct ordered_events *oe, struct ordered_event *new)
++ {
++ 	struct ordered_event *last = oe->last;
++ 	u64 timestamp = new->timestamp;
++ 	struct list_head *p;
++ 
++ 	++oe->nr_events;
++ 	oe->last = new;
++ 
++ 	if (!last) {
++ 		list_add(&new->list, &oe->events);
++ 		oe->max_timestamp = timestamp;
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * last event might point to some random place in the list as it's
++ 	 * the last queued event. We expect that the new event is close to
++ 	 * this.
++ 	 */
++ 	if (last->timestamp <= timestamp) {
++ 		while (last->timestamp <= timestamp) {
++ 			p = last->list.next;
++ 			if (p == &oe->events) {
++ 				list_add_tail(&new->list, &oe->events);
++ 				oe->max_timestamp = timestamp;
++ 				return;
++ 			}
++ 			last = list_entry(p, struct ordered_event, list);
++ 		}
++ 		list_add_tail(&new->list, &last->list);
++ 	} else {
++ 		while (last->timestamp > timestamp) {
++ 			p = last->list.prev;
++ 			if (p == &oe->events) {
++ 				list_add(&new->list, &oe->events);
++ 				return;
++ 			}
++ 			last = list_entry(p, struct ordered_event, list);
++ 		}
++ 		list_add(&new->list, &last->list);
++ 	}
++ }
++ 
++ #define MAX_SAMPLE_BUFFER	(64 * 1024 / sizeof(struct ordered_event))
++ static struct ordered_event *alloc_event(struct ordered_events *oe)
++ {
++ 	struct list_head *cache = &oe->cache;
++ 	struct ordered_event *new = NULL;
++ 
++ 	if (!list_empty(cache)) {
++ 		new = list_entry(cache->next, struct ordered_event, list);
++ 		list_del(&new->list);
++ 	} else if (oe->buffer) {
++ 		new = oe->buffer + oe->buffer_idx;
++ 		if (++oe->buffer_idx == MAX_SAMPLE_BUFFER)
++ 			oe->buffer = NULL;
++ 	} else if (oe->cur_alloc_size < oe->max_alloc_size) {
++ 		size_t size = MAX_SAMPLE_BUFFER * sizeof(*new);
++ 
++ 		oe->buffer = malloc(size);
++ 		if (!oe->buffer)
++ 			return NULL;
++ 
++ 		oe->cur_alloc_size += size;
++ 		list_add(&oe->buffer->list, &oe->to_free);
++ 
++ 		/* First entry is abused to maintain the to_free list. */
++ 		oe->buffer_idx = 2;
++ 		new = oe->buffer + 1;
++ 	}
++ 
++ 	return new;
++ }
++ 
++ static struct ordered_event *
++ ordered_events__new(struct ordered_events *oe, u64 timestamp)
++ {
++ 	struct ordered_event *new;
++ 
++ 	new = alloc_event(oe);
++ 	if (new) {
++ 		new->timestamp = timestamp;
++ 		queue_event(oe, new);
++ 	}
++ 
++ 	return new;
++ }
++ 
++ static void
++ ordered_events__delete(struct ordered_events *oe, struct ordered_event *event)
++ {
++ 	list_del(&event->list);
++ 	list_add(&event->list, &oe->cache);
++ 	oe->nr_events--;
++ }
++ 
+++>>>>>>> 8d99a6ceebe8 (perf tools: Limit ordered events queue size)
+  static int perf_session_deliver_event(struct perf_session *session,
+  				      union perf_event *event,
+  				      struct perf_sample *sample,
+* Unmerged path tools/perf/util/session.c
+diff --git a/tools/perf/util/session.h b/tools/perf/util/session.h
+index 419eb50e1cd3..e2fbaf2567e1 100644
+--- a/tools/perf/util/session.h
++++ b/tools/perf/util/session.h
+@@ -20,6 +20,8 @@ struct ordered_events {
+ 	u64			last_flush;
+ 	u64			next_flush;
+ 	u64			max_timestamp;
++	u64			max_alloc_size;
++	u64			cur_alloc_size;
+ 	struct list_head	events;
+ 	struct list_head	cache;
+ 	struct list_head	to_free;
