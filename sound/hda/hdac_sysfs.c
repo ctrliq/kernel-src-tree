@@ -36,6 +36,7 @@ static ssize_t type##_show(struct device *dev,			\
 } \
 static DEVICE_ATTR_RO(type)
 
+CODEC_ATTR(type);
 CODEC_ATTR(vendor_id);
 CODEC_ATTR(subsystem_id);
 CODEC_ATTR(revision_id);
@@ -52,6 +53,7 @@ static ssize_t modalias_show(struct device *dev, struct device_attribute *attr,
 static DEVICE_ATTR_RO(modalias);
 
 static struct attribute *hdac_dev_attrs[] = {
+	&dev_attr_type.attr,
 	&dev_attr_vendor_id.attr,
 	&dev_attr_subsystem_id.attr,
 	&dev_attr_revision_id.attr,
