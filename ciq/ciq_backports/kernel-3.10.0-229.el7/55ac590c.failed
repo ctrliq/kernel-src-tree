@@ -1,0 +1,185 @@
+memblock, mem_hotplug: make memblock skip hotpluggable regions if needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Tang Chen <tangchen@cn.fujitsu.com>
+commit 55ac590c2fadad785d60dd70c12d62823bc2cd39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/55ac590c.failed
+
+Linux kernel cannot migrate pages used by the kernel.  As a result,
+hotpluggable memory used by the kernel won't be able to be hot-removed.
+To solve this problem, the basic idea is to prevent memblock from
+allocating hotpluggable memory for the kernel at early time, and arrange
+all hotpluggable memory in ACPI SRAT(System Resource Affinity Table) as
+ZONE_MOVABLE when initializing zones.
+
+In the previous patches, we have marked hotpluggable memory regions with
+MEMBLOCK_HOTPLUG flag in memblock.memory.
+
+In this patch, we make memblock skip these hotpluggable memory regions
+in the default top-down allocation function if movable_node boot option
+is specified.
+
+[akpm@linux-foundation.org: coding-style fixes]
+	Signed-off-by: Tang Chen <tangchen@cn.fujitsu.com>
+	Signed-off-by: Zhang Yanfei <zhangyanfei@cn.fujitsu.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: "Rafael J . Wysocki" <rjw@sisk.pl>
+	Cc: Chen Tang <imtangchen@gmail.com>
+	Cc: Gong Chen <gong.chen@linux.intel.com>
+	Cc: Ingo Molnar <mingo@elte.hu>
+	Cc: Jiang Liu <jiang.liu@huawei.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Lai Jiangshan <laijs@cn.fujitsu.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Len Brown <lenb@kernel.org>
+	Cc: Liu Jiang <jiang.liu@huawei.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michal Nazarewicz <mina86@mina86.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Prarit Bhargava <prarit@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Taku Izumi <izumi.taku@jp.fujitsu.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Thomas Renninger <trenn@suse.de>
+	Cc: Toshi Kani <toshi.kani@hp.com>
+	Cc: Vasilis Liaskovitis <vasilis.liaskovitis@profitbricks.com>
+	Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+	Cc: Wen Congyang <wency@cn.fujitsu.com>
+	Cc: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 55ac590c2fadad785d60dd70c12d62823bc2cd39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory_hotplug.c
+diff --cc mm/memory_hotplug.c
+index de0f05d184eb,01e39afde1cb..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -1386,6 -1423,37 +1386,40 @@@ static bool can_offline_normal(struct z
+  }
+  #endif /* CONFIG_MOVABLE_NODE */
+  
+++<<<<<<< HEAD
+++=======
++ static int __init cmdline_parse_movable_node(char *p)
++ {
++ #ifdef CONFIG_MOVABLE_NODE
++ 	/*
++ 	 * Memory used by the kernel cannot be hot-removed because Linux
++ 	 * cannot migrate the kernel pages. When memory hotplug is
++ 	 * enabled, we should prevent memblock from allocating memory
++ 	 * for the kernel.
++ 	 *
++ 	 * ACPI SRAT records all hotpluggable memory ranges. But before
++ 	 * SRAT is parsed, we don't know about it.
++ 	 *
++ 	 * The kernel image is loaded into memory at very early time. We
++ 	 * cannot prevent this anyway. So on NUMA system, we set any
++ 	 * node the kernel resides in as un-hotpluggable.
++ 	 *
++ 	 * Since on modern servers, one node could have double-digit
++ 	 * gigabytes memory, we can assume the memory around the kernel
++ 	 * image is also un-hotpluggable. So before SRAT is parsed, just
++ 	 * allocate memory near the kernel image to try the best to keep
++ 	 * the kernel away from hotpluggable memory.
++ 	 */
++ 	memblock_set_bottom_up(true);
++ 	movable_node_enabled = true;
++ #else
++ 	pr_warn("movable_node option not supported\n");
++ #endif
++ 	return 0;
++ }
++ early_param("movable_node", cmdline_parse_movable_node);
++ 
+++>>>>>>> 55ac590c2fad (memblock, mem_hotplug: make memblock skip hotpluggable regions if needed)
+  /* check which state of node_states will be changed when offline memory */
+  static void node_states_check_changes_offline(unsigned long nr_pages,
+  		struct zone *zone, struct memory_notify *arg)
+diff --git a/include/linux/memblock.h b/include/linux/memblock.h
+index c565b464c941..8448b9d37467 100644
+--- a/include/linux/memblock.h
++++ b/include/linux/memblock.h
+@@ -47,6 +47,10 @@ struct memblock {
+ 
+ extern struct memblock memblock;
+ extern int memblock_debug;
++#ifdef CONFIG_MOVABLE_NODE
++/* If movable_node boot option specified */
++extern bool movable_node_enabled;
++#endif /* CONFIG_MOVABLE_NODE */
+ 
+ #define memblock_dbg(fmt, ...) \
+ 	if (memblock_debug) printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+@@ -65,6 +69,26 @@ int memblock_reserve(phys_addr_t base, phys_addr_t size);
+ void memblock_trim_memory(phys_addr_t align);
+ int memblock_mark_hotplug(phys_addr_t base, phys_addr_t size);
+ int memblock_clear_hotplug(phys_addr_t base, phys_addr_t size);
++#ifdef CONFIG_MOVABLE_NODE
++static inline bool memblock_is_hotpluggable(struct memblock_region *m)
++{
++	return m->flags & MEMBLOCK_HOTPLUG;
++}
++
++static inline bool movable_node_is_enabled(void)
++{
++	return movable_node_enabled;
++}
++#else
++static inline bool memblock_is_hotpluggable(struct memblock_region *m)
++{
++	return false;
++}
++static inline bool movable_node_is_enabled(void)
++{
++	return false;
++}
++#endif
+ 
+ #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+ void __next_mem_pfn_range(int *idx, int nid, unsigned long *out_start_pfn,
+diff --git a/mm/memblock.c b/mm/memblock.c
+index 216e77ad2efe..681d0abb1156 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -39,6 +39,9 @@ struct memblock memblock __initdata_memblock = {
+ };
+ 
+ int memblock_debug __initdata_memblock;
++#ifdef CONFIG_MOVABLE_NODE
++bool movable_node_enabled __initdata_memblock = false;
++#endif
+ static int memblock_can_resize __initdata_memblock;
+ static int memblock_memory_in_slab __initdata_memblock = 0;
+ static int memblock_reserved_in_slab __initdata_memblock = 0;
+@@ -820,6 +823,11 @@ void __init_memblock __next_free_mem_range(u64 *idx, int nid,
+  * @out_nid: ptr to int for nid of the range, can be %NULL
+  *
+  * Reverse of __next_free_mem_range().
++ *
++ * Linux kernel cannot migrate pages used by itself. Memory hotplug users won't
++ * be able to hot-remove hotpluggable memory used by the kernel. So this
++ * function skip hotpluggable regions if needed when allocating memory for the
++ * kernel.
+  */
+ void __init_memblock __next_free_mem_range_rev(u64 *idx, int nid,
+ 					   phys_addr_t *out_start,
+@@ -844,6 +852,10 @@ void __init_memblock __next_free_mem_range_rev(u64 *idx, int nid,
+ 		if (nid != MAX_NUMNODES && nid != memblock_get_region_node(m))
+ 			continue;
+ 
++		/* skip hotpluggable memory regions if needed */
++		if (movable_node_is_enabled() && memblock_is_hotpluggable(m))
++			continue;
++
+ 		/* scan areas before each reservation for intersection */
+ 		for ( ; ri >= 0; ri--) {
+ 			struct memblock_region *r = &rsv->regions[ri];
+* Unmerged path mm/memory_hotplug.c
