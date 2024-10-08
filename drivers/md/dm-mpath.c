@@ -120,7 +120,6 @@ static struct kmem_cache *_mpio_cache;
 static struct workqueue_struct *kmultipathd, *kmpath_handlerd;
 static void trigger_event(struct work_struct *work);
 static void activate_path(struct work_struct *work);
-static int __pgpath_busy(struct pgpath *pgpath);
 
 
 /*-----------------------------------------------
@@ -1645,7 +1644,7 @@ out:
 	return ret;
 }
 
-static int __pgpath_busy(struct pgpath *pgpath)
+static int pgpath_busy(struct pgpath *pgpath)
 {
 	struct request_queue *q = bdev_get_queue(pgpath->path.dev->bdev);
 
@@ -1699,8 +1698,7 @@ static int multipath_busy(struct dm_target *ti)
 	list_for_each_entry(pgpath, &pg->pgpaths, list)
 		if (pgpath->is_active) {
 			has_active = true;
-
-			if (!__pgpath_busy(pgpath)) {
+			if (!pgpath_busy(pgpath)) {
 				busy = false;
 				break;
 			}
