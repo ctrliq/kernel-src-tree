@@ -1,0 +1,467 @@
+drm/i915: use the correct force_wake function at the PC8 code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [drm] i915: use the correct force_wake function at the PC8 code (Rob Clark) [1054409]
+Rebuild_FUZZ: 96.61%
+commit-author Paulo Zanoni <paulo.r.zanoni@intel.com>
+commit a1216444283e81fd904593a4a77c90adfe5d14d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/a1216444.failed
+
+When I submitted the first patch adding these force wake functions,
+Chris Wilson observed that I was using the wrong functions, so I sent
+a second version of the patch to correct this problem. The problem is
+that v1 was merged instead of v2.
+
+I was able to notice the problem when running the
+debugfs-forcewake-user subtest of pm_pc8 from intel-gpu-tools.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+	Reviewed-by: Rodrigo Vivi <rodrigo.vivi@gmail.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit a1216444283e81fd904593a4a77c90adfe5d14d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index bcc9e0539bc8,350afee39b18..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -5748,33 -6258,440 +5748,430 @@@ static bool ironlake_get_pipe_config(st
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void assert_can_disable_lcpll(struct drm_i915_private *dev_priv)
++ {
++ 	struct drm_device *dev = dev_priv->dev;
++ 	struct intel_ddi_plls *plls = &dev_priv->ddi_plls;
++ 	struct intel_crtc *crtc;
++ 	unsigned long irqflags;
++ 	uint32_t val;
++ 
++ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head)
++ 		WARN(crtc->base.enabled, "CRTC for pipe %c enabled\n",
++ 		     pipe_name(crtc->pipe));
++ 
++ 	WARN(I915_READ(HSW_PWR_WELL_DRIVER), "Power well on\n");
++ 	WARN(plls->spll_refcount, "SPLL enabled\n");
++ 	WARN(plls->wrpll1_refcount, "WRPLL1 enabled\n");
++ 	WARN(plls->wrpll2_refcount, "WRPLL2 enabled\n");
++ 	WARN(I915_READ(PCH_PP_STATUS) & PP_ON, "Panel power on\n");
++ 	WARN(I915_READ(BLC_PWM_CPU_CTL2) & BLM_PWM_ENABLE,
++ 	     "CPU PWM1 enabled\n");
++ 	WARN(I915_READ(HSW_BLC_PWM2_CTL) & BLM_PWM_ENABLE,
++ 	     "CPU PWM2 enabled\n");
++ 	WARN(I915_READ(BLC_PWM_PCH_CTL1) & BLM_PCH_PWM_ENABLE,
++ 	     "PCH PWM1 enabled\n");
++ 	WARN(I915_READ(UTIL_PIN_CTL) & UTIL_PIN_ENABLE,
++ 	     "Utility pin enabled\n");
++ 	WARN(I915_READ(PCH_GTC_CTL) & PCH_GTC_ENABLE, "PCH GTC enabled\n");
++ 
++ 	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
++ 	val = I915_READ(DEIMR);
++ 	WARN((val & ~DE_PCH_EVENT_IVB) != val,
++ 	     "Unexpected DEIMR bits enabled: 0x%x\n", val);
++ 	val = I915_READ(SDEIMR);
++ 	WARN((val | SDE_HOTPLUG_MASK_CPT) != 0xffffffff,
++ 	     "Unexpected SDEIMR bits enabled: 0x%x\n", val);
++ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
++ }
++ 
++ /*
++  * This function implements pieces of two sequences from BSpec:
++  * - Sequence for display software to disable LCPLL
++  * - Sequence for display software to allow package C8+
++  * The steps implemented here are just the steps that actually touch the LCPLL
++  * register. Callers should take care of disabling all the display engine
++  * functions, doing the mode unset, fixing interrupts, etc.
++  */
++ static void hsw_disable_lcpll(struct drm_i915_private *dev_priv,
++ 			      bool switch_to_fclk, bool allow_power_down)
++ {
++ 	uint32_t val;
++ 
++ 	assert_can_disable_lcpll(dev_priv);
++ 
++ 	val = I915_READ(LCPLL_CTL);
++ 
++ 	if (switch_to_fclk) {
++ 		val |= LCPLL_CD_SOURCE_FCLK;
++ 		I915_WRITE(LCPLL_CTL, val);
++ 
++ 		if (wait_for_atomic_us(I915_READ(LCPLL_CTL) &
++ 				       LCPLL_CD_SOURCE_FCLK_DONE, 1))
++ 			DRM_ERROR("Switching to FCLK failed\n");
++ 
++ 		val = I915_READ(LCPLL_CTL);
++ 	}
++ 
++ 	val |= LCPLL_PLL_DISABLE;
++ 	I915_WRITE(LCPLL_CTL, val);
++ 	POSTING_READ(LCPLL_CTL);
++ 
++ 	if (wait_for((I915_READ(LCPLL_CTL) & LCPLL_PLL_LOCK) == 0, 1))
++ 		DRM_ERROR("LCPLL still locked\n");
++ 
++ 	val = I915_READ(D_COMP);
++ 	val |= D_COMP_COMP_DISABLE;
++ 	mutex_lock(&dev_priv->rps.hw_lock);
++ 	if (sandybridge_pcode_write(dev_priv, GEN6_PCODE_WRITE_D_COMP, val))
++ 		DRM_ERROR("Failed to disable D_COMP\n");
++ 	mutex_unlock(&dev_priv->rps.hw_lock);
++ 	POSTING_READ(D_COMP);
++ 	ndelay(100);
++ 
++ 	if (wait_for((I915_READ(D_COMP) & D_COMP_RCOMP_IN_PROGRESS) == 0, 1))
++ 		DRM_ERROR("D_COMP RCOMP still in progress\n");
++ 
++ 	if (allow_power_down) {
++ 		val = I915_READ(LCPLL_CTL);
++ 		val |= LCPLL_POWER_DOWN_ALLOW;
++ 		I915_WRITE(LCPLL_CTL, val);
++ 		POSTING_READ(LCPLL_CTL);
++ 	}
++ }
++ 
++ /*
++  * Fully restores LCPLL, disallowing power down and switching back to LCPLL
++  * source.
++  */
++ static void hsw_restore_lcpll(struct drm_i915_private *dev_priv)
++ {
++ 	uint32_t val;
++ 
++ 	val = I915_READ(LCPLL_CTL);
++ 
++ 	if ((val & (LCPLL_PLL_LOCK | LCPLL_PLL_DISABLE | LCPLL_CD_SOURCE_FCLK |
++ 		    LCPLL_POWER_DOWN_ALLOW)) == LCPLL_PLL_LOCK)
++ 		return;
++ 
++ 	/* Make sure we're not on PC8 state before disabling PC8, otherwise
++ 	 * we'll hang the machine! */
++ 	gen6_gt_force_wake_get(dev_priv);
++ 
++ 	if (val & LCPLL_POWER_DOWN_ALLOW) {
++ 		val &= ~LCPLL_POWER_DOWN_ALLOW;
++ 		I915_WRITE(LCPLL_CTL, val);
++ 		POSTING_READ(LCPLL_CTL);
++ 	}
++ 
++ 	val = I915_READ(D_COMP);
++ 	val |= D_COMP_COMP_FORCE;
++ 	val &= ~D_COMP_COMP_DISABLE;
++ 	mutex_lock(&dev_priv->rps.hw_lock);
++ 	if (sandybridge_pcode_write(dev_priv, GEN6_PCODE_WRITE_D_COMP, val))
++ 		DRM_ERROR("Failed to enable D_COMP\n");
++ 	mutex_unlock(&dev_priv->rps.hw_lock);
++ 	POSTING_READ(D_COMP);
++ 
++ 	val = I915_READ(LCPLL_CTL);
++ 	val &= ~LCPLL_PLL_DISABLE;
++ 	I915_WRITE(LCPLL_CTL, val);
++ 
++ 	if (wait_for(I915_READ(LCPLL_CTL) & LCPLL_PLL_LOCK, 5))
++ 		DRM_ERROR("LCPLL not locked yet\n");
++ 
++ 	if (val & LCPLL_CD_SOURCE_FCLK) {
++ 		val = I915_READ(LCPLL_CTL);
++ 		val &= ~LCPLL_CD_SOURCE_FCLK;
++ 		I915_WRITE(LCPLL_CTL, val);
++ 
++ 		if (wait_for_atomic_us((I915_READ(LCPLL_CTL) &
++ 					LCPLL_CD_SOURCE_FCLK_DONE) == 0, 1))
++ 			DRM_ERROR("Switching back to LCPLL failed\n");
++ 	}
++ 
++ 	gen6_gt_force_wake_put(dev_priv);
++ }
++ 
++ void hsw_enable_pc8_work(struct work_struct *__work)
++ {
++ 	struct drm_i915_private *dev_priv =
++ 		container_of(to_delayed_work(__work), struct drm_i915_private,
++ 			     pc8.enable_work);
++ 	struct drm_device *dev = dev_priv->dev;
++ 	uint32_t val;
++ 
++ 	if (dev_priv->pc8.enabled)
++ 		return;
++ 
++ 	DRM_DEBUG_KMS("Enabling package C8+\n");
++ 
++ 	dev_priv->pc8.enabled = true;
++ 
++ 	if (dev_priv->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE) {
++ 		val = I915_READ(SOUTH_DSPCLK_GATE_D);
++ 		val &= ~PCH_LP_PARTITION_LEVEL_DISABLE;
++ 		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
++ 	}
++ 
++ 	lpt_disable_clkout_dp(dev);
++ 	hsw_pc8_disable_interrupts(dev);
++ 	hsw_disable_lcpll(dev_priv, true, true);
++ }
++ 
++ static void __hsw_enable_package_c8(struct drm_i915_private *dev_priv)
++ {
++ 	WARN_ON(!mutex_is_locked(&dev_priv->pc8.lock));
++ 	WARN(dev_priv->pc8.disable_count < 1,
++ 	     "pc8.disable_count: %d\n", dev_priv->pc8.disable_count);
++ 
++ 	dev_priv->pc8.disable_count--;
++ 	if (dev_priv->pc8.disable_count != 0)
++ 		return;
++ 
++ 	schedule_delayed_work(&dev_priv->pc8.enable_work,
++ 			      msecs_to_jiffies(i915_pc8_timeout));
++ }
++ 
++ static void __hsw_disable_package_c8(struct drm_i915_private *dev_priv)
++ {
++ 	struct drm_device *dev = dev_priv->dev;
++ 	uint32_t val;
++ 
++ 	WARN_ON(!mutex_is_locked(&dev_priv->pc8.lock));
++ 	WARN(dev_priv->pc8.disable_count < 0,
++ 	     "pc8.disable_count: %d\n", dev_priv->pc8.disable_count);
++ 
++ 	dev_priv->pc8.disable_count++;
++ 	if (dev_priv->pc8.disable_count != 1)
++ 		return;
++ 
++ 	cancel_delayed_work_sync(&dev_priv->pc8.enable_work);
++ 	if (!dev_priv->pc8.enabled)
++ 		return;
++ 
++ 	DRM_DEBUG_KMS("Disabling package C8+\n");
++ 
++ 	hsw_restore_lcpll(dev_priv);
++ 	hsw_pc8_restore_interrupts(dev);
++ 	lpt_init_pch_refclk(dev);
++ 
++ 	if (dev_priv->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE) {
++ 		val = I915_READ(SOUTH_DSPCLK_GATE_D);
++ 		val |= PCH_LP_PARTITION_LEVEL_DISABLE;
++ 		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
++ 	}
++ 
++ 	intel_prepare_ddi(dev);
++ 	i915_gem_init_swizzling(dev);
++ 	mutex_lock(&dev_priv->rps.hw_lock);
++ 	gen6_update_ring_freq(dev);
++ 	mutex_unlock(&dev_priv->rps.hw_lock);
++ 	dev_priv->pc8.enabled = false;
++ }
++ 
++ void hsw_enable_package_c8(struct drm_i915_private *dev_priv)
++ {
++ 	if (!HAS_PC8(dev_priv->dev))
++ 		return;
++ 
++ 	mutex_lock(&dev_priv->pc8.lock);
++ 	__hsw_enable_package_c8(dev_priv);
++ 	mutex_unlock(&dev_priv->pc8.lock);
++ }
++ 
++ void hsw_disable_package_c8(struct drm_i915_private *dev_priv)
++ {
++ 	if (!HAS_PC8(dev_priv->dev))
++ 		return;
++ 
++ 	mutex_lock(&dev_priv->pc8.lock);
++ 	__hsw_disable_package_c8(dev_priv);
++ 	mutex_unlock(&dev_priv->pc8.lock);
++ }
++ 
++ static bool hsw_can_enable_package_c8(struct drm_i915_private *dev_priv)
++ {
++ 	struct drm_device *dev = dev_priv->dev;
++ 	struct intel_crtc *crtc;
++ 	uint32_t val;
++ 
++ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head)
++ 		if (crtc->base.enabled)
++ 			return false;
++ 
++ 	/* This case is still possible since we have the i915.disable_power_well
++ 	 * parameter and also the KVMr or something else might be requesting the
++ 	 * power well. */
++ 	val = I915_READ(HSW_PWR_WELL_DRIVER);
++ 	if (val != 0) {
++ 		DRM_DEBUG_KMS("Not enabling PC8: power well on\n");
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ /* Since we're called from modeset_global_resources there's no way to
++  * symmetrically increase and decrease the refcount, so we use
++  * dev_priv->pc8.requirements_met to track whether we already have the refcount
++  * or not.
++  */
++ static void hsw_update_package_c8(struct drm_device *dev)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	bool allow;
++ 
++ 	if (!HAS_PC8(dev_priv->dev))
++ 		return;
++ 
++ 	if (!i915_enable_pc8)
++ 		return;
++ 
++ 	mutex_lock(&dev_priv->pc8.lock);
++ 
++ 	allow = hsw_can_enable_package_c8(dev_priv);
++ 
++ 	if (allow == dev_priv->pc8.requirements_met)
++ 		goto done;
++ 
++ 	dev_priv->pc8.requirements_met = allow;
++ 
++ 	if (allow)
++ 		__hsw_enable_package_c8(dev_priv);
++ 	else
++ 		__hsw_disable_package_c8(dev_priv);
++ 
++ done:
++ 	mutex_unlock(&dev_priv->pc8.lock);
++ }
++ 
++ static void hsw_package_c8_gpu_idle(struct drm_i915_private *dev_priv)
++ {
++ 	if (!HAS_PC8(dev_priv->dev))
++ 		return;
++ 
++ 	mutex_lock(&dev_priv->pc8.lock);
++ 	if (!dev_priv->pc8.gpu_idle) {
++ 		dev_priv->pc8.gpu_idle = true;
++ 		__hsw_enable_package_c8(dev_priv);
++ 	}
++ 	mutex_unlock(&dev_priv->pc8.lock);
++ }
++ 
++ static void hsw_package_c8_gpu_busy(struct drm_i915_private *dev_priv)
++ {
++ 	if (!HAS_PC8(dev_priv->dev))
++ 		return;
++ 
++ 	mutex_lock(&dev_priv->pc8.lock);
++ 	if (dev_priv->pc8.gpu_idle) {
++ 		dev_priv->pc8.gpu_idle = false;
++ 		__hsw_disable_package_c8(dev_priv);
++ 	}
++ 	mutex_unlock(&dev_priv->pc8.lock);
++ }
++ 
++ #define for_each_power_domain(domain, mask)				\
++ 	for ((domain) = 0; (domain) < POWER_DOMAIN_NUM; (domain)++)	\
++ 		if ((1 << (domain)) & (mask))
++ 
++ static unsigned long get_pipe_power_domains(struct drm_device *dev,
++ 					    enum pipe pipe, bool pfit_enabled)
++ {
++ 	unsigned long mask;
++ 	enum transcoder transcoder;
++ 
++ 	transcoder = intel_pipe_to_cpu_transcoder(dev->dev_private, pipe);
++ 
++ 	mask = BIT(POWER_DOMAIN_PIPE(pipe));
++ 	mask |= BIT(POWER_DOMAIN_TRANSCODER(transcoder));
++ 	if (pfit_enabled)
++ 		mask |= BIT(POWER_DOMAIN_PIPE_PANEL_FITTER(pipe));
++ 
++ 	return mask;
++ }
++ 
++ void intel_display_set_init_power(struct drm_device *dev, bool enable)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 
++ 	if (dev_priv->power_domains.init_power_on == enable)
++ 		return;
++ 
++ 	if (enable)
++ 		intel_display_power_get(dev, POWER_DOMAIN_INIT);
++ 	else
++ 		intel_display_power_put(dev, POWER_DOMAIN_INIT);
++ 
++ 	dev_priv->power_domains.init_power_on = enable;
++ }
++ 
++ static void modeset_update_power_wells(struct drm_device *dev)
++ {
++ 	unsigned long pipe_domains[I915_MAX_PIPES] = { 0, };
++ 	struct intel_crtc *crtc;
++ 
++ 	/*
++ 	 * First get all needed power domains, then put all unneeded, to avoid
++ 	 * any unnecessary toggling of the power wells.
++ 	 */
++ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head) {
++ 		enum intel_display_power_domain domain;
++ 
++ 		if (!crtc->base.enabled)
++ 			continue;
++ 
++ 		pipe_domains[crtc->pipe] = get_pipe_power_domains(dev,
++ 						crtc->pipe,
++ 						crtc->config.pch_pfit.enabled);
++ 
++ 		for_each_power_domain(domain, pipe_domains[crtc->pipe])
++ 			intel_display_power_get(dev, domain);
++ 	}
++ 
++ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head) {
++ 		enum intel_display_power_domain domain;
++ 
++ 		for_each_power_domain(domain, crtc->enabled_power_domains)
++ 			intel_display_power_put(dev, domain);
++ 
++ 		crtc->enabled_power_domains = pipe_domains[crtc->pipe];
++ 	}
++ 
++ 	intel_display_set_init_power(dev, false);
++ }
++ 
+++>>>>>>> a1216444283e (drm/i915: use the correct force_wake function at the PC8 code)
+  static void haswell_modeset_global_resources(struct drm_device *dev)
+  {
+ -	modeset_update_power_wells(dev);
+ -	hsw_update_package_c8(dev);
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	bool enable = false;
+ +	struct intel_crtc *crtc;
+ +	struct intel_encoder *encoder;
+ +
+ +	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head) {
+ +		if (crtc->pipe != PIPE_A && crtc->base.enabled)
+ +			enable = true;
+ +		/* XXX: Should check for edp transcoder here, but thanks to init
+ +		 * sequence that's not yet available. Just in case desktop eDP
+ +		 * on PORT D is possible on haswell, too. */
+ +	}
+ +
+ +	list_for_each_entry(encoder, &dev->mode_config.encoder_list,
+ +			    base.head) {
+ +		if (encoder->type != INTEL_OUTPUT_EDP &&
+ +		    encoder->connectors_active)
+ +			enable = true;
+ +	}
+ +
+ +	/* Even the eDP panel fitter is outside the always-on well. */
+ +	if (dev_priv->pch_pf_size)
+ +		enable = true;
+ +
+ +	intel_set_power_well(dev, enable);
+  }
+  
+  static int haswell_crtc_mode_set(struct drm_crtc *crtc,
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
