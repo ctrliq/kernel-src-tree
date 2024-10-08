@@ -528,7 +528,6 @@ static ssize_t userfaultfd_read(struct file *file, char __user *buf,
 
 	if (ctx->state == UFFD_STATE_WAIT_API)
 		return -EINVAL;
-	BUG_ON(ctx->state != UFFD_STATE_RUNNING);
 
 	for (;;) {
 		if (count < sizeof(addr))
@@ -1062,6 +1061,9 @@ static long userfaultfd_ioctl(struct file *file, unsigned cmd,
 {
 	int ret = -EINVAL;
 	struct userfaultfd_ctx *ctx = file->private_data;
+
+	if (cmd != UFFDIO_API && ctx->state == UFFD_STATE_WAIT_API)
+		return -EINVAL;
 
 	switch(cmd) {
 	case UFFDIO_API:
