@@ -299,7 +299,7 @@ static struct usb_wireless_ep_comp_descriptor *rpipe_epc_find(
 			break;
 		}
 		itr += hdr->bLength;
-		itr_size -= hdr->bDescriptorType;
+		itr_size -= hdr->bLength;
 	}
 out:
 	return epcd;
