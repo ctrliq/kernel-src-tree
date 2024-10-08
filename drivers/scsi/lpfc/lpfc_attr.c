@@ -674,9 +674,6 @@ lpfc_do_offline(struct lpfc_hba *phba, uint32_t type)
 	int i;
 	int rc;
 
-	if (phba->pport->fc_flag & FC_OFFLINE_MODE)
-		return 0;
-
 	init_completion(&online_compl);
 	rc = lpfc_workq_post_event(phba, &status, &online_compl,
 			      LPFC_EVT_OFFLINE_PREP);
@@ -2594,9 +2591,12 @@ LPFC_VPORT_ATTR_R(enable_da_id, 1, 0, 1,
 
 /*
 # lun_queue_depth:  This parameter is used to limit the number of outstanding
-# commands per FCP LUN. Value range is [1,128]. Default value is 30.
+# commands per FCP LUN. Value range is [1,512]. Default value is 30.
+# If this parameter value is greater than 1/8th the maximum number of exchanges
+# supported by the HBA port, then the lun queue depth will be reduced to
+# 1/8th the maximum number of exchanges.
 */
-LPFC_VPORT_ATTR_R(lun_queue_depth, 30, 1, 128,
+LPFC_VPORT_ATTR_R(lun_queue_depth, 30, 1, 512,
 		  "Max number of FCP commands we can queue to a specific LUN");
 
 /*
@@ -2604,7 +2604,7 @@ LPFC_VPORT_ATTR_R(lun_queue_depth, 30, 1, 128,
 # commands per target port. Value range is [10,65535]. Default value is 65535.
 */
 LPFC_VPORT_ATTR_R(tgt_queue_depth, 65535, 10, 65535,
-	"Max number of FCP commands we can queue to a specific target port");
+		  "Max number of FCP commands we can queue to a specific target port");
 
 /*
 # hba_queue_depth:  This parameter is used to limit the number of outstanding
@@ -3952,6 +3952,14 @@ LPFC_VPORT_ATTR_RW(use_adisc, 0, 0, 1,
 		   "Use ADISC on rediscovery to authenticate FCP devices");
 
 /*
+# lpfc_first_burst_size: First burst size to use on the NPorts
+# that support first burst.
+# Value range is [0,65536]. Default value is 0.
+*/
+LPFC_VPORT_ATTR_RW(first_burst_size, 0, 0, 65536,
+		   "First burst size for Targets that support first burst");
+
+/*
 # lpfc_max_scsicmpl_time: Use scsi command completion time to control I/O queue
 # depth. Default value is 0. When the value of this parameter is zero the
 # SCSI command completion time is not used for controlling I/O queue depth. When
@@ -4269,6 +4277,7 @@ struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_lpfc_devloss_tmo,
 	&dev_attr_lpfc_fcp_class,
 	&dev_attr_lpfc_use_adisc,
+	&dev_attr_lpfc_first_burst_size,
 	&dev_attr_lpfc_ack0,
 	&dev_attr_lpfc_topology,
 	&dev_attr_lpfc_scan_down,
@@ -4344,6 +4353,7 @@ struct device_attribute *lpfc_vport_attrs[] = {
 	&dev_attr_lpfc_restrict_login,
 	&dev_attr_lpfc_fcp_class,
 	&dev_attr_lpfc_use_adisc,
+	&dev_attr_lpfc_first_burst_size,
 	&dev_attr_lpfc_fdmi_on,
 	&dev_attr_lpfc_max_luns,
 	&dev_attr_nport_evt_cnt,
@@ -5322,6 +5332,7 @@ lpfc_get_vport_cfgparam(struct lpfc_vport *vport)
 	lpfc_restrict_login_init(vport, lpfc_restrict_login);
 	lpfc_fcp_class_init(vport, lpfc_fcp_class);
 	lpfc_use_adisc_init(vport, lpfc_use_adisc);
+	lpfc_first_burst_size_init(vport, lpfc_first_burst_size);
 	lpfc_max_scsicmpl_time_init(vport, lpfc_max_scsicmpl_time);
 	lpfc_fdmi_on_init(vport, lpfc_fdmi_on);
 	lpfc_discovery_threads_init(vport, lpfc_discovery_threads);

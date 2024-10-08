@@ -495,6 +495,16 @@ void scsi_requeue_run_queue(struct work_struct *work)
 	scsi_run_queue(q);
 }
 
+static void scsi_uninit_command(struct scsi_cmnd *cmd)
+{
+	if (cmd->request->cmd_type == REQ_TYPE_FS) {
+		struct scsi_driver *drv = scsi_cmd_to_driver(cmd);
+
+		if (drv->uninit_command)
+			drv->uninit_command(cmd);
+	}
+}
+
 /*
  * Function:	scsi_requeue_command()
  *
@@ -526,6 +536,8 @@ static void scsi_requeue_command(struct request_queue *q, struct scsi_cmnd *cmd)
 	 * releases its reference on the device.
 	 */
 	get_device(&sdev->sdev_gendev);
+
+	scsi_uninit_command(cmd);
 
 	spin_lock_irqsave(q->queue_lock, flags);
 	scsi_unprep_request(req);
@@ -726,6 +738,8 @@ EXPORT_SYMBOL(scsi_release_buffers);
  * -ENOLINK	temporary transport failure
  * -EREMOTEIO	permanent target failure, do not retry
  * -EBADE	permanent nexus failure, retry on other path
+ * -ENOSPC	No write space available
+ * -ENODATA	Medium error
  * -EIO		unspecified I/O error
  */
 static int __scsi_error_from_host_byte(struct scsi_cmnd *cmd, int result)
@@ -743,6 +757,14 @@ static int __scsi_error_from_host_byte(struct scsi_cmnd *cmd, int result)
 	case DID_NEXUS_FAILURE:
 		set_host_byte(cmd, DID_OK);
 		error = -EBADE;
+		break;
+	case DID_ALLOC_FAILURE:
+		set_host_byte(cmd, DID_OK);
+		error = -ENOSPC;
+		break;
+	case DID_MEDIUM_ERROR:
+		set_host_byte(cmd, DID_OK);
+		error = -ENODATA;
 		break;
 	default:
 		error = -EIO;
@@ -1329,17 +1351,6 @@ out:
 	return scsi_prep_return(q, req, ret);
 }
 
-static void scsi_unprep_fn(struct request_queue *q, struct request *req)
-{
-	if (req->cmd_type == REQ_TYPE_FS) {
-		struct scsi_cmnd *cmd = req->special;
-		struct scsi_driver *drv = scsi_cmd_to_driver(cmd);
-
-		if (drv->uninit_command)
-			drv->uninit_command(cmd);
-	}
-}
-
 /*
  * scsi_dev_queue_ready: if we can send requests to sdev, return 1 else
  * return 0.
@@ -1767,7 +1778,6 @@ struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
 		return NULL;
 
 	blk_queue_prep_rq(q, scsi_prep_fn);
-	blk_queue_unprep_rq(q, scsi_unprep_fn);
 	blk_queue_softirq_done(q, scsi_softirq_done);
 	blk_queue_rq_timed_out(q, scsi_times_out);
 	blk_queue_lld_busy(q, scsi_lld_busy);

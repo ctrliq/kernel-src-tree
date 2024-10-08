@@ -68,14 +68,12 @@ struct scsi_dif_tuple {
 	__be32 ref_tag;         /* Target LBA or indirect LBA */
 };
 
-#if !defined(SCSI_PROT_GUARD_CHECK) || !defined(SCSI_PROT_REF_CHECK)
-#define scsi_prot_flagged(sc, flg)	sc
-#endif
-
 static void
 lpfc_release_scsi_buf_s4(struct lpfc_hba *phba, struct lpfc_scsi_buf *psb);
 static void
 lpfc_release_scsi_buf_s3(struct lpfc_hba *phba, struct lpfc_scsi_buf *psb);
+static int
+lpfc_prot_group_type(struct lpfc_hba *phba, struct scsi_cmnd *sc);
 
 static void
 lpfc_debug_save_data(struct lpfc_hba *phba, struct scsi_cmnd *cmnd)
@@ -132,6 +130,30 @@ lpfc_debug_save_dif(struct lpfc_hba *phba, struct scsi_cmnd *cmnd)
 		dst += sgde->length;
 		sgde = sg_next(sgde);
 	}
+}
+
+static inline unsigned
+lpfc_cmd_blksize(struct scsi_cmnd *sc)
+{
+	return sc->device->sector_size;
+}
+
+#define LPFC_CHECK_PROTECT_GUARD	1
+#define LPFC_CHECK_PROTECT_REF		2
+static inline unsigned
+lpfc_cmd_protect(struct scsi_cmnd *sc, int flag)
+{
+	return 1;
+}
+
+static inline unsigned
+lpfc_cmd_guard_csum(struct scsi_cmnd *sc)
+{
+	if (lpfc_prot_group_type(NULL, sc) == LPFC_PG_TYPE_NO_DIF)
+		return 0;
+	if (scsi_host_get_guard(sc->device->host) == SHOST_DIX_GUARD_IP)
+		return 1;
+	return 0;
 }
 
 /**
@@ -904,10 +926,10 @@ lpfc_sli4_repost_scsi_sgl_list(struct lpfc_hba *phba)
 
 	/* get all SCSI buffers need to repost to a local list */
 	spin_lock_irq(&phba->scsi_buf_list_get_lock);
-	spin_lock_irq(&phba->scsi_buf_list_put_lock);
+	spin_lock(&phba->scsi_buf_list_put_lock);
 	list_splice_init(&phba->lpfc_scsi_buf_list_get, &post_sblist);
 	list_splice(&phba->lpfc_scsi_buf_list_put, &post_sblist);
-	spin_unlock_irq(&phba->scsi_buf_list_put_lock);
+	spin_unlock(&phba->scsi_buf_list_put_lock);
 	spin_unlock_irq(&phba->scsi_buf_list_get_lock);
 
 	/* post the list of scsi buffer sgls to port if available */
@@ -990,20 +1012,25 @@ lpfc_new_scsi_buf_s4(struct lpfc_vport *vport, int num_to_alloc)
 			break;
 		}
 
-		/* Allocate iotag for psb->cur_iocbq. */
-		iotag = lpfc_sli_next_iotag(phba, &psb->cur_iocbq);
-		if (iotag == 0) {
-			pci_pool_free(phba->lpfc_scsi_dma_buf_pool,
-				psb->data, psb->dma_handle);
-			kfree(psb);
-			break;
-		}
 
 		lxri = lpfc_sli4_next_xritag(phba);
 		if (lxri == NO_XRI) {
 			pci_pool_free(phba->lpfc_scsi_dma_buf_pool,
 			      psb->data, psb->dma_handle);
 			kfree(psb);
+			break;
+		}
+
+		/* Allocate iotag for psb->cur_iocbq. */
+		iotag = lpfc_sli_next_iotag(phba, &psb->cur_iocbq);
+		if (iotag == 0) {
+			pci_pool_free(phba->lpfc_scsi_dma_buf_pool,
+				psb->data, psb->dma_handle);
+			kfree(psb);
+			lpfc_printf_log(phba, KERN_ERR, LOG_FCP,
+					"3368 Failed to allocated IOTAG for"
+					" XRI:0x%x\n", lxri);
+			lpfc_sli4_free_xri(phba, lxri);
 			break;
 		}
 		psb->cur_iocbq.sli4_lxritag = lxri;
@@ -1115,22 +1142,21 @@ lpfc_get_scsi_buf_s3(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp)
 {
 	struct  lpfc_scsi_buf * lpfc_cmd = NULL;
 	struct list_head *scsi_buf_list_get = &phba->lpfc_scsi_buf_list_get;
-	unsigned long gflag = 0;
-	unsigned long pflag = 0;
+	unsigned long iflag = 0;
 
-	spin_lock_irqsave(&phba->scsi_buf_list_get_lock, gflag);
+	spin_lock_irqsave(&phba->scsi_buf_list_get_lock, iflag);
 	list_remove_head(scsi_buf_list_get, lpfc_cmd, struct lpfc_scsi_buf,
 			 list);
 	if (!lpfc_cmd) {
-		spin_lock_irqsave(&phba->scsi_buf_list_put_lock, pflag);
+		spin_lock(&phba->scsi_buf_list_put_lock);
 		list_splice(&phba->lpfc_scsi_buf_list_put,
 			    &phba->lpfc_scsi_buf_list_get);
 		INIT_LIST_HEAD(&phba->lpfc_scsi_buf_list_put);
 		list_remove_head(scsi_buf_list_get, lpfc_cmd,
 				 struct lpfc_scsi_buf, list);
-		spin_unlock_irqrestore(&phba->scsi_buf_list_put_lock, pflag);
+		spin_unlock(&phba->scsi_buf_list_put_lock);
 	}
-	spin_unlock_irqrestore(&phba->scsi_buf_list_get_lock, gflag);
+	spin_unlock_irqrestore(&phba->scsi_buf_list_get_lock, iflag);
 	return  lpfc_cmd;
 }
 /**
@@ -1148,11 +1174,10 @@ static struct lpfc_scsi_buf*
 lpfc_get_scsi_buf_s4(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp)
 {
 	struct lpfc_scsi_buf *lpfc_cmd, *lpfc_cmd_next;
-	unsigned long gflag = 0;
-	unsigned long pflag = 0;
+	unsigned long iflag = 0;
 	int found = 0;
 
-	spin_lock_irqsave(&phba->scsi_buf_list_get_lock, gflag);
+	spin_lock_irqsave(&phba->scsi_buf_list_get_lock, iflag);
 	list_for_each_entry_safe(lpfc_cmd, lpfc_cmd_next,
 				 &phba->lpfc_scsi_buf_list_get, list) {
 		if (lpfc_test_rrq_active(phba, ndlp,
@@ -1163,11 +1188,11 @@ lpfc_get_scsi_buf_s4(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp)
 		break;
 	}
 	if (!found) {
-		spin_lock_irqsave(&phba->scsi_buf_list_put_lock, pflag);
+		spin_lock(&phba->scsi_buf_list_put_lock);
 		list_splice(&phba->lpfc_scsi_buf_list_put,
 			    &phba->lpfc_scsi_buf_list_get);
 		INIT_LIST_HEAD(&phba->lpfc_scsi_buf_list_put);
-		spin_unlock_irqrestore(&phba->scsi_buf_list_put_lock, pflag);
+		spin_unlock(&phba->scsi_buf_list_put_lock);
 		list_for_each_entry_safe(lpfc_cmd, lpfc_cmd_next,
 					 &phba->lpfc_scsi_buf_list_get, list) {
 			if (lpfc_test_rrq_active(
@@ -1178,7 +1203,7 @@ lpfc_get_scsi_buf_s4(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp)
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&phba->scsi_buf_list_get_lock, gflag);
+	spin_unlock_irqrestore(&phba->scsi_buf_list_get_lock, iflag);
 	if (!found)
 		return NULL;
 	return  lpfc_cmd;
@@ -1411,12 +1436,6 @@ lpfc_scsi_prep_dma_buf_s3(struct lpfc_hba *phba, struct lpfc_scsi_buf *lpfc_cmd)
 	 */
 	iocb_cmd->un.fcpi.fcpi_parm = scsi_bufflen(scsi_cmnd);
 	return 0;
-}
-
-static inline unsigned
-lpfc_cmd_blksize(struct scsi_cmnd *sc)
-{
-	return sc->device->sector_size;
 }
 
 #ifdef CONFIG_SCSI_LPFC_DEBUG_FS
@@ -1851,10 +1870,9 @@ static int
 lpfc_sc_to_bg_opcodes(struct lpfc_hba *phba, struct scsi_cmnd *sc,
 		uint8_t *txop, uint8_t *rxop)
 {
-	uint8_t guard_type = scsi_host_get_guard(sc->device->host);
 	uint8_t ret = 0;
 
-	if (guard_type == SHOST_DIX_GUARD_IP) {
+	if (lpfc_cmd_guard_csum(sc)) {
 		switch (scsi_get_prot_op(sc)) {
 		case SCSI_PROT_READ_INSERT:
 		case SCSI_PROT_WRITE_STRIP:
@@ -1932,10 +1950,9 @@ static int
 lpfc_bg_err_opcodes(struct lpfc_hba *phba, struct scsi_cmnd *sc,
 		uint8_t *txop, uint8_t *rxop)
 {
-	uint8_t guard_type = scsi_host_get_guard(sc->device->host);
 	uint8_t ret = 0;
 
-	if (guard_type == SHOST_DIX_GUARD_IP) {
+	if (lpfc_cmd_guard_csum(sc)) {
 		switch (scsi_get_prot_op(sc)) {
 		case SCSI_PROT_READ_INSERT:
 		case SCSI_PROT_WRITE_STRIP:
@@ -2082,12 +2099,12 @@ lpfc_bg_setup_bpl(struct lpfc_hba *phba, struct scsi_cmnd *sc,
 	 * protection data is automatically generated, not checked.
 	 */
 	if (datadir == DMA_FROM_DEVICE) {
-		if (scsi_prot_flagged(sc, SCSI_PROT_GUARD_CHECK))
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_GUARD))
 			bf_set(pde6_ce, pde6, checking);
 		else
 			bf_set(pde6_ce, pde6, 0);
 
-		if (scsi_prot_flagged(sc, SCSI_PROT_REF_CHECK))
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_REF))
 			bf_set(pde6_re, pde6, checking);
 		else
 			bf_set(pde6_re, pde6, 0);
@@ -2244,12 +2261,12 @@ lpfc_bg_setup_bpl_prot(struct lpfc_hba *phba, struct scsi_cmnd *sc,
 		bf_set(pde6_optx, pde6, txop);
 		bf_set(pde6_oprx, pde6, rxop);
 
-		if (scsi_prot_flagged(sc, SCSI_PROT_GUARD_CHECK))
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_GUARD))
 			bf_set(pde6_ce, pde6, checking);
 		else
 			bf_set(pde6_ce, pde6, 0);
 
-		if (scsi_prot_flagged(sc, SCSI_PROT_REF_CHECK))
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_REF))
 			bf_set(pde6_re, pde6, checking);
 		else
 			bf_set(pde6_re, pde6, 0);
@@ -2458,12 +2475,12 @@ lpfc_bg_setup_sgl(struct lpfc_hba *phba, struct scsi_cmnd *sc,
 	 * protection data is automatically generated, not checked.
 	 */
 	if (sc->sc_data_direction == DMA_FROM_DEVICE) {
-		if (scsi_prot_flagged(sc, SCSI_PROT_GUARD_CHECK))
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_GUARD))
 			bf_set(lpfc_sli4_sge_dif_ce, diseed, checking);
 		else
 			bf_set(lpfc_sli4_sge_dif_ce, diseed, 0);
 
-		if (scsi_prot_flagged(sc, SCSI_PROT_REF_CHECK))
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_REF))
 			bf_set(lpfc_sli4_sge_dif_re, diseed, checking);
 		else
 			bf_set(lpfc_sli4_sge_dif_re, diseed, 0);
@@ -2614,7 +2631,7 @@ lpfc_bg_setup_sgl_prot(struct lpfc_hba *phba, struct scsi_cmnd *sc,
 		diseed->ref_tag = cpu_to_le32(reftag);
 		diseed->ref_tag_tran = diseed->ref_tag;
 
-		if (scsi_prot_flagged(sc, SCSI_PROT_GUARD_CHECK)) {
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_GUARD)) {
 			bf_set(lpfc_sli4_sge_dif_ce, diseed, checking);
 
 		} else {
@@ -2633,7 +2650,7 @@ lpfc_bg_setup_sgl_prot(struct lpfc_hba *phba, struct scsi_cmnd *sc,
 		}
 
 
-		if (scsi_prot_flagged(sc, SCSI_PROT_REF_CHECK))
+		if (lpfc_cmd_protect(sc, LPFC_CHECK_PROTECT_REF))
 			bf_set(lpfc_sli4_sge_dif_re, diseed, checking);
 		else
 			bf_set(lpfc_sli4_sge_dif_re, diseed, 0);
@@ -2796,11 +2813,12 @@ lpfc_prot_group_type(struct lpfc_hba *phba, struct scsi_cmnd *sc)
 		ret = LPFC_PG_TYPE_DIF_BUF;
 		break;
 	default:
-		lpfc_printf_log(phba, KERN_ERR, LOG_FCP,
-				"9021 Unsupported protection op:%d\n", op);
+		if (phba)
+			lpfc_printf_log(phba, KERN_ERR, LOG_FCP,
+					"9021 Unsupported protection op:%d\n",
+					op);
 		break;
 	}
-
 	return ret;
 }
 
@@ -2825,22 +2843,22 @@ lpfc_bg_scsi_adjust_dl(struct lpfc_hba *phba,
 
 	/* Check if there is protection data on the wire */
 	if (sc->sc_data_direction == DMA_FROM_DEVICE) {
-		/* Read */
+		/* Read check for protection data */
 		if (scsi_get_prot_op(sc) ==  SCSI_PROT_READ_INSERT)
 			return fcpdl;
 
 	} else {
-		/* Write */
+		/* Write check for protection data */
 		if (scsi_get_prot_op(sc) ==  SCSI_PROT_WRITE_STRIP)
 			return fcpdl;
 	}
 
 	/*
 	 * If we are in DIF Type 1 mode every data block has a 8 byte
-	 * DIF (trailer) attached to it. Must ajust FCP data length.
+	 * DIF (trailer) attached to it. Must ajust FCP data length
+	 * to account for the protection data.
 	 */
-	if (scsi_prot_flagged(sc, SCSI_PROT_TRANSFER_PI))
-		fcpdl += (fcpdl / lpfc_cmd_blksize(sc)) * 8;
+	fcpdl += (fcpdl / lpfc_cmd_blksize(sc)) * 8;
 
 	return fcpdl;
 }
@@ -3094,11 +3112,19 @@ lpfc_calc_bg_err(struct lpfc_hba *phba, struct lpfc_scsi_buf *lpfc_cmd)
 					goto skipit;
 				}
 
-				/* App Tag checking */
-				app_tag = src->app_tag;
-				if (chk_app && (app_tag != start_app_tag)) {
-					err_type = BGS_APPTAG_ERR_MASK;
-					goto out;
+				/* First Guard Tag checking */
+				if (chk_guard) {
+					guard_tag = src->guard_tag;
+					if (lpfc_cmd_guard_csum(cmd))
+						sum = lpfc_bg_csum(data_src,
+								   blksize);
+					else
+						sum = lpfc_bg_crc(data_src,
+								  blksize);
+					if ((guard_tag != sum)) {
+						err_type = BGS_GUARD_ERR_MASK;
+						goto out;
+					}
 				}
 
 				/* Reference Tag checking */
@@ -3109,19 +3135,11 @@ lpfc_calc_bg_err(struct lpfc_hba *phba, struct lpfc_scsi_buf *lpfc_cmd)
 				}
 				start_ref_tag++;
 
-				/* Guard Tag checking */
-				if (chk_guard) {
-					guard_tag = src->guard_tag;
-					if (guard_type == SHOST_DIX_GUARD_IP)
-						sum = lpfc_bg_csum(data_src,
-								   blksize);
-					else
-						sum = lpfc_bg_crc(data_src,
-								  blksize);
-					if ((guard_tag != sum)) {
-						err_type = BGS_GUARD_ERR_MASK;
-						goto out;
-					}
+				/* App Tag checking */
+				app_tag = src->app_tag;
+				if (chk_app && (app_tag != start_app_tag)) {
+					err_type = BGS_APPTAG_ERR_MASK;
+					goto out;
 				}
 skipit:
 				len -= sizeof(struct scsi_dif_tuple);
@@ -4078,7 +4096,8 @@ lpfc_scsi_cmd_iocb_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *pIocbIn,
 			 cmd->device ? cmd->device->id : 0xffff,
 			 cmd->device ? cmd->device->lun : 0xffff,
 			 lpfc_cmd->status, lpfc_cmd->result,
-			 vport->fc_myDID, pnode->nlp_DID,
+			 vport->fc_myDID,
+			 (pnode) ? pnode->nlp_DID : 0,
 			 phba->sli_rev == LPFC_SLI_REV4 ?
 			     lpfc_cmd->cur_iocbq.sli4_xritag : 0xffff,
 			 pIocbOut->iocb.ulpContext,
@@ -4329,6 +4348,7 @@ lpfc_scsi_prep_cmnd(struct lpfc_vport *vport, struct lpfc_scsi_buf *lpfc_cmd,
 	char tag[2];
 	uint8_t *ptr;
 	bool sli4;
+	uint32_t fcpdl;
 
 	if (!pnode || !NLP_CHK_NODE_ACT(pnode))
 		return;
@@ -4374,6 +4394,15 @@ lpfc_scsi_prep_cmnd(struct lpfc_vport *vport, struct lpfc_scsi_buf *lpfc_cmd,
 		if (datadir == DMA_TO_DEVICE) {
 			iocb_cmd->ulpCommand = CMD_FCP_IWRITE64_CR;
 			iocb_cmd->ulpPU = PARM_READ_CHECK;
+			if (vport->cfg_first_burst_size &&
+			    (pnode->nlp_flag & NLP_FIRSTBURST)) {
+				fcpdl = scsi_bufflen(scsi_cmnd);
+				if (fcpdl < vport->cfg_first_burst_size)
+					piocbq->iocb.un.fcpi.fcpi_XRdy = fcpdl;
+				else
+					piocbq->iocb.un.fcpi.fcpi_XRdy =
+						vport->cfg_first_burst_size;
+			}
 			fcp_cmnd->fcpCntl3 = WRITE_DATA;
 			phba->fc4OutputRequests++;
 		} else {
@@ -4753,6 +4782,24 @@ lpfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
 				  &lpfc_cmd->cur_iocbq, SLI_IOCB_RET_IOCB);
 	if (err) {
 		atomic_dec(&ndlp->cmd_pending);
+		lpfc_printf_vlog(vport, KERN_INFO, LOG_FCP,
+				 "3376 FCP could not issue IOCB err %x"
+				 "FCP cmd x%x <%d/%d> "
+				 "sid: x%x did: x%x oxid: x%x "
+				 "Data: x%x x%x x%x x%x\n",
+				 err, cmnd->cmnd[0],
+				 cmnd->device ? cmnd->device->id : 0xffff,
+				 cmnd->device ? cmnd->device->lun : 0xffff,
+				 vport->fc_myDID, ndlp->nlp_DID,
+				 phba->sli_rev == LPFC_SLI_REV4 ?
+				 lpfc_cmd->cur_iocbq.sli4_xritag : 0xffff,
+				 lpfc_cmd->cur_iocbq.iocb.ulpContext,
+				 lpfc_cmd->cur_iocbq.iocb.ulpIoTag,
+				 lpfc_cmd->cur_iocbq.iocb.ulpTimeout,
+				 (uint32_t)
+				 (cmnd->request->timeout / 1000));
+
+
 		goto out_host_busy_free_buf;
 	}
 	if (phba->cfg_poll & ENABLE_FCP_RING_POLLING) {

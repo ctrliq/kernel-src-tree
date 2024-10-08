@@ -22,6 +22,7 @@
 #include <linux/sysctl.h>
 #include <linux/rwsem.h>
 #include <linux/atomic.h>
+#include <linux/assoc_array.h>
 
 #ifdef __KERNEL__
 #include <linux/uidgid.h>
@@ -167,6 +168,9 @@ struct key {
 #define KEY_FLAG_NEGATIVE	5	/* set if key is negative */
 #define KEY_FLAG_ROOT_CAN_CLEAR	6	/* set if key can be cleared by root without permission */
 #define KEY_FLAG_INVALIDATED	7	/* set if key has been invalidated */
+#define KEY_FLAG_TRUSTED	8	/* set if key is trusted */
+#define KEY_FLAG_TRUSTED_ONLY	9	/* set if keyring only accepts links to trusted keys */
+#define KEY_FLAG_ROOT_CAN_INVAL	10	/* set if key can be invalidated by root without permission */
 
 	/* the key type and key description string
 	 * - the desc is used to match a key against search criteria
@@ -196,11 +200,14 @@ struct key {
 	 *   whatever
 	 */
 	union {
-		unsigned long		value;
-		void __rcu		*rcudata;
-		void			*data;
-		struct keyring_list __rcu *subscriptions;
-	} payload;
+		union {
+			unsigned long		value;
+			void __rcu		*rcudata;
+			void			*data;
+			void			*data2[2];
+		} payload;
+		struct assoc_array keys;
+	};
 };
 
 extern struct key *key_alloc(struct key_type *type,
@@ -214,6 +221,7 @@ extern struct key *key_alloc(struct key_type *type,
 #define KEY_ALLOC_IN_QUOTA	0x0000	/* add to quota, reject if would overrun */
 #define KEY_ALLOC_QUOTA_OVERRUN	0x0001	/* add to quota, permit even if overrun */
 #define KEY_ALLOC_NOT_IN_QUOTA	0x0002	/* not in quota */
+#define KEY_ALLOC_TRUSTED	0x0004	/* Key should be flagged as trusted */
 
 extern void key_revoke(struct key *key);
 extern void key_invalidate(struct key *key);

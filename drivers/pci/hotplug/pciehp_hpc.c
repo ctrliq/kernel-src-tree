@@ -69,7 +69,7 @@ static void start_int_poll_timer(struct controller *ctrl, int sec)
 {
 	/* Clamp to sane value */
 	if ((sec <= 0) || (sec > 60))
-        	sec = 2;
+		sec = 2;
 
 	ctrl->poll_timer.function = &int_poll_timeout;
 	ctrl->poll_timer.data = (unsigned long)ctrl;
@@ -168,7 +168,7 @@ static void pcie_write_cmd(struct controller *ctrl, u16 cmd, u16 mask)
 			ctrl_dbg(ctrl, "CMD_COMPLETED not clear after 1 sec\n");
 		} else if (!NO_CMD_CMPL(ctrl)) {
 			/*
-			 * This controller semms to notify of command completed
+			 * This controller seems to notify of command completed
 			 * event even though it supports none of power
 			 * controller, attention led, power led and EMI.
 			 */
@@ -797,7 +797,7 @@ struct controller *pcie_init(struct pcie_device *dev)
 		PCI_EXP_SLTSTA_MRLSC | PCI_EXP_SLTSTA_PDC |
 		PCI_EXP_SLTSTA_CC);
 
-	/* Disable sotfware notification */
+	/* Disable software notification */
 	pcie_disable_notification(ctrl);
 
 	ctrl_info(ctrl, "Slot #%d AttnBtn%c AttnInd%c PwrInd%c PwrCtrl%c MRL%c Interlock%c NoCompl%c LLActRep%c\n",

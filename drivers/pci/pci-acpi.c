@@ -47,6 +47,9 @@ static void pci_acpi_wake_dev(acpi_handle handle, u32 event, void *context)
 	if (event != ACPI_NOTIFY_DEVICE_WAKE || !pci_dev)
 		return;
 
+	if (pci_dev->pme_poll)
+		pci_dev->pme_poll = false;
+
 	if (pci_dev->current_state == PCI_D3cold) {
 		pci_wakeup_event(pci_dev);
 		pm_runtime_resume(&pci_dev->dev);
@@ -56,9 +59,6 @@ static void pci_acpi_wake_dev(acpi_handle handle, u32 event, void *context)
 	/* Clear PME Status if set. */
 	if (pci_dev->pme_support)
 		pci_check_pme_status(pci_dev);
-
-	if (pci_dev->pme_poll)
-		pci_dev->pme_poll = false;
 
 	pci_wakeup_event(pci_dev);
 	pm_runtime_resume(&pci_dev->dev);
@@ -141,7 +141,7 @@ phys_addr_t acpi_pci_root_get_mcfg_addr(acpi_handle handle)
  * if (_PRW at S-state x)
  *	choose from highest power _SxD to lowest power _SxW
  * else // no _PRW at S-state x
- * 	choose highest power _SxD or any lower power
+ *	choose highest power _SxD or any lower power
  */
 
 static pci_power_t acpi_pci_choose_state(struct pci_dev *pdev)

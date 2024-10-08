@@ -139,6 +139,20 @@ static int ad198x_suspend(struct hda_codec *codec)
 }
 #endif
 
+/* follow EAPD via vmaster hook */
+static void ad_vmaster_eapd_hook(void *private_data, int enabled)
+{
+	struct hda_codec *codec = private_data;
+	struct ad198x_spec *spec = codec->spec;
+
+	if (!spec->eapd_nid)
+		return;
+	if (codec->inv_eapd)
+		enabled = !enabled;
+	snd_hda_codec_update_cache(codec, spec->eapd_nid, 0,
+				   AC_VERB_SET_EAPD_BTLENABLE,
+				   enabled ? 0x02 : 0x00);
+}
 
 /*
  * Automatic parse of I/O pins from the BIOS configuration
@@ -225,6 +239,8 @@ static void ad_fixup_inv_jack_detect(struct hda_codec *codec,
 	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
 		codec->inv_jack_detect = 1;
 		spec->gen.keep_eapd_on = 1;
+		spec->gen.vmaster_mute.hook = ad_vmaster_eapd_hook;
+		spec->eapd_nid = 0x1b;
 	}
 }
 
@@ -482,16 +498,6 @@ static int patch_ad1983(struct hda_codec *codec)
 /*
  * AD1981 HD specific
  */
-
-/* follow EAPD via vmaster hook */
-static void ad_vmaster_eapd_hook(void *private_data, int enabled)
-{
-	struct hda_codec *codec = private_data;
-	struct ad198x_spec *spec = codec->spec;
-	snd_hda_codec_update_cache(codec, spec->eapd_nid, 0,
-				   AC_VERB_SET_EAPD_BTLENABLE,
-				   enabled ? 0x02 : 0x00);
-}
 
 static void ad1981_fixup_hp_eapd(struct hda_codec *codec,
 				 const struct hda_fixup *fix, int action)
@@ -945,18 +951,42 @@ static void ad1884_fixup_amp_override(struct hda_codec *codec,
 					  (1 << AC_AMPCAP_MUTE_SHIFT));
 }
 
+/* toggle GPIO1 according to the mute state */
+static void ad1884_vmaster_hp_gpio_hook(void *private_data, int enabled)
+{
+	struct hda_codec *codec = private_data;
+	struct ad198x_spec *spec = codec->spec;
+
+	if (spec->eapd_nid)
+		ad_vmaster_eapd_hook(private_data, enabled);
+	snd_hda_codec_update_cache(codec, 0x01, 0,
+				   AC_VERB_SET_GPIO_DATA,
+				   enabled ? 0x00 : 0x02);
+}
+
 static void ad1884_fixup_hp_eapd(struct hda_codec *codec,
 				 const struct hda_fixup *fix, int action)
 {
 	struct ad198x_spec *spec = codec->spec;
+	static const struct hda_verb gpio_init_verbs[] = {
+		{0x01, AC_VERB_SET_GPIO_MASK, 0x02},
+		{0x01, AC_VERB_SET_GPIO_DIRECTION, 0x02},
+		{0x01, AC_VERB_SET_GPIO_DATA, 0x02},
+		{},
+	};
 
-	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
+	switch (action) {
+	case HDA_FIXUP_ACT_PRE_PROBE:
+		spec->gen.vmaster_mute.hook = ad1884_vmaster_hp_gpio_hook;
+		spec->gen.own_eapd_ctl = 1;
+		snd_hda_sequence_write_cache(codec, gpio_init_verbs);
+		break;
+	case HDA_FIXUP_ACT_PROBE:
 		if (spec->gen.autocfg.line_out_type == AUTO_PIN_SPEAKER_OUT)
 			spec->eapd_nid = spec->gen.autocfg.line_out_pins[0];
 		else
 			spec->eapd_nid = spec->gen.autocfg.speaker_pins[0];
-		if (spec->eapd_nid)
-			spec->gen.vmaster_mute.hook = ad_vmaster_eapd_hook;
+		break;
 	}
 }
 

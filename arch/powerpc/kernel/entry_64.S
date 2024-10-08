@@ -450,15 +450,6 @@ END_FTR_SECTION_IFSET(CPU_FTR_DSCR)
 
 #ifdef CONFIG_PPC_BOOK3S_64
 BEGIN_FTR_SECTION
-	/*
-	 * Back up the TAR across context switches.  Note that the TAR is not
-	 * available for use in the kernel.  (To provide this, the TAR should
-	 * be backed up/restored on exception entry/exit instead, and be in
-	 * pt_regs.  FIXME, this should be in pt_regs anyway (for debug).)
-	 */
-	mfspr	r0,SPRN_TAR
-	std	r0,THREAD_TAR(r3)
-
 	/* Event based branch registers */
 	mfspr	r0, SPRN_BESCR
 	std	r0, THREAD_BESCR(r3)
@@ -692,8 +683,16 @@ _GLOBAL(ret_from_except_lite)
 	bl	.restore_interrupts
 	SCHEDULE_USER
 	b	.ret_from_except_lite
-
-2:	bl	.save_nvgprs
+2:
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+	andi.	r0,r4,_TIF_USER_WORK_MASK & ~_TIF_RESTORE_TM
+	bne	3f		/* only restore TM if nothing else to do */
+	addi	r3,r1,STACK_FRAME_OVERHEAD
+	bl	.restore_tm_state
+	b	restore
+3:
+#endif
+	bl	.save_nvgprs
 	bl	.restore_interrupts
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	.do_notify_resume
@@ -1053,7 +1052,7 @@ _GLOBAL(enter_rtas)
 	
         li      r9,1
         rldicr  r9,r9,MSR_SF_LG,(63-MSR_SF_LG)
-	ori	r9,r9,MSR_IR|MSR_DR|MSR_FE0|MSR_FE1|MSR_FP|MSR_RI
+	ori	r9,r9,MSR_IR|MSR_DR|MSR_FE0|MSR_FE1|MSR_FP|MSR_RI|MSR_LE
 	andc	r6,r0,r9
 	sync				/* disable interrupts so SRR0/1 */
 	mtmsrd	r0			/* don't get trashed */
@@ -1068,6 +1067,8 @@ _GLOBAL(enter_rtas)
 	b	.	/* prevent speculative execution */
 
 _STATIC(rtas_return_loc)
+	FIXUP_ENDIAN
+
 	/* relocation is off at this point */
 	GET_PACA(r4)
 	clrldi	r4,r4,2			/* convert to realmode address */
@@ -1139,28 +1140,30 @@ _GLOBAL(enter_prom)
 	std	r10,_CCR(r1)
 	std	r11,_MSR(r1)
 
-	/* Get the PROM entrypoint */
-	mtlr	r4
+	/* Put PROM address in SRR0 */
+	mtsrr0	r4
 
-	/* Switch MSR to 32 bits mode
+	/* Setup our trampoline return addr in LR */
+	bcl	20,31,$+4
+0:	mflr	r4
+	addi	r4,r4,(1f - 0b)
+       	mtlr	r4
+
+	/* Prepare a 32-bit mode big endian MSR
 	 */
 #ifdef CONFIG_PPC_BOOK3E
 	rlwinm	r11,r11,0,1,31
-	mtmsr	r11
+	mtsrr1	r11
+	rfi
 #else /* CONFIG_PPC_BOOK3E */
-        mfmsr   r11
-        li      r12,1
-        rldicr  r12,r12,MSR_SF_LG,(63-MSR_SF_LG)
-        andc    r11,r11,r12
-        li      r12,1
-        rldicr  r12,r12,MSR_ISF_LG,(63-MSR_ISF_LG)
-        andc    r11,r11,r12
-        mtmsrd  r11
+	LOAD_REG_IMMEDIATE(r12, MSR_SF | MSR_ISF | MSR_LE)
+	andc	r11,r11,r12
+	mtsrr1	r11
+	rfid
 #endif /* CONFIG_PPC_BOOK3E */
-        isync
 
-	/* Enter PROM here... */
-	blrl
+1:	/* Return from OF */
+	FIXUP_ENDIAN
 
 	/* Just make sure that r1 top 32 bits didn't get
 	 * corrupt by OF

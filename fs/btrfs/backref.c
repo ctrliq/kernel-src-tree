@@ -119,6 +119,26 @@ struct __prelim_ref {
 	u64 wanted_disk_byte;
 };
 
+static struct kmem_cache *btrfs_prelim_ref_cache;
+
+int __init btrfs_prelim_ref_init(void)
+{
+	btrfs_prelim_ref_cache = kmem_cache_create("btrfs_prelim_ref",
+					sizeof(struct __prelim_ref),
+					0,
+					SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD,
+					NULL);
+	if (!btrfs_prelim_ref_cache)
+		return -ENOMEM;
+	return 0;
+}
+
+void btrfs_prelim_ref_exit(void)
+{
+	if (btrfs_prelim_ref_cache)
+		kmem_cache_destroy(btrfs_prelim_ref_cache);
+}
+
 /*
  * the rules for all callers of this function are:
  * - obtaining the parent is the goal
@@ -165,7 +185,10 @@ static int __add_prelim_ref(struct list_head *head, u64 root_id,
 {
 	struct __prelim_ref *ref;
 
-	ref = kmalloc(sizeof(*ref), gfp_mask);
+	if (root_id == BTRFS_DATA_RELOC_TREE_OBJECTID)
+		return 0;
+
+	ref = kmem_cache_alloc(btrfs_prelim_ref_cache, gfp_mask);
 	if (!ref)
 		return -ENOMEM;
 
@@ -367,7 +390,8 @@ static int __resolve_indirect_refs(struct btrfs_fs_info *fs_info,
 
 		/* additional parents require new refs being added here */
 		while ((node = ulist_next(parents, &uiter))) {
-			new_ref = kmalloc(sizeof(*new_ref), GFP_NOFS);
+			new_ref = kmem_cache_alloc(btrfs_prelim_ref_cache,
+						   GFP_NOFS);
 			if (!new_ref) {
 				ret = -ENOMEM;
 				goto out;
@@ -491,7 +515,7 @@ static void __merge_refs(struct list_head *head, int mode)
 			ref1->count += ref2->count;
 
 			list_del(&ref2->list);
-			kfree(ref2);
+			kmem_cache_free(btrfs_prelim_ref_cache, ref2);
 		}
 
 	}
@@ -954,7 +978,7 @@ again:
 			}
 		}
 		list_del(&ref->list);
-		kfree(ref);
+		kmem_cache_free(btrfs_prelim_ref_cache, ref);
 	}
 
 out:
@@ -962,13 +986,13 @@ out:
 	while (!list_empty(&prefs)) {
 		ref = list_first_entry(&prefs, struct __prelim_ref, list);
 		list_del(&ref->list);
-		kfree(ref);
+		kmem_cache_free(btrfs_prelim_ref_cache, ref);
 	}
 	while (!list_empty(&prefs_delayed)) {
 		ref = list_first_entry(&prefs_delayed, struct __prelim_ref,
 				       list);
 		list_del(&ref->list);
-		kfree(ref);
+		kmem_cache_free(btrfs_prelim_ref_cache, ref);
 	}
 
 	return ret;

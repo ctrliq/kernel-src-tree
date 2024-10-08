@@ -509,6 +509,7 @@ void clear_inode(struct inode *inode)
 	 */
 	spin_lock_irq(&inode->i_data.tree_lock);
 	BUG_ON(inode->i_data.nrpages);
+	BUG_ON(inode->i_data.nrshadows);
 	spin_unlock_irq(&inode->i_data.tree_lock);
 	BUG_ON(!list_empty(&inode->i_data.private_list));
 	BUG_ON(!(inode->i_state & I_FREEING));
@@ -554,8 +555,7 @@ static void evict(struct inode *inode)
 	if (op->evict_inode) {
 		op->evict_inode(inode);
 	} else {
-		if (inode->i_data.nrpages)
-			truncate_inode_pages(&inode->i_data, 0);
+		truncate_inode_pages_final(&inode->i_data);
 		clear_inode(inode);
 	}
 	if (S_ISBLK(inode->i_mode) && inode->i_bdev)
@@ -1923,6 +1923,11 @@ void inode_dio_wait(struct inode *inode)
 }
 EXPORT_SYMBOL(inode_dio_wait);
 
+void __inode_dio_done(struct inode *inode)
+{
+	wake_up_bit(&inode->i_state, __I_DIO_WAKEUP);
+}
+
 /*
  * inode_dio_done - signal finish of a direct I/O requests
  * @inode: inode the direct I/O happens on
@@ -1933,6 +1938,6 @@ EXPORT_SYMBOL(inode_dio_wait);
 void inode_dio_done(struct inode *inode)
 {
 	if (atomic_dec_and_test(&inode->i_dio_count))
-		wake_up_bit(&inode->i_state, __I_DIO_WAKEUP);
+		__inode_dio_done(inode);
 }
 EXPORT_SYMBOL(inode_dio_done);

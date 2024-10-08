@@ -667,7 +667,7 @@ static DECLARE_WORK(nohz_kick_work, nohz_kick_work_fn);
  */
 static void posix_cpu_timer_kick_nohz(void)
 {
-	if (context_tracking_is_enabled())
+	if (static_key_false(&context_tracking_enabled))
 		schedule_work(&nohz_kick_work);
 }
 

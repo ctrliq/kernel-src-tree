@@ -89,7 +89,7 @@ extern struct mm_struct *pgd_page_get_mm(struct page *page);
  */
 static inline int pte_dirty(pte_t pte)
 {
-	return pte_flags(pte) & _PAGE_DIRTY;
+	return pte_flags(pte) & (_PAGE_DIRTY | _PAGE_SOFTDIRTY);
 }
 
 static inline int pte_young(pte_t pte)
@@ -187,7 +187,7 @@ static inline pte_t pte_clear_flags(pte_t pte, pteval_t clear)
 
 static inline pte_t pte_mkclean(pte_t pte)
 {
-	return pte_clear_flags(pte, _PAGE_DIRTY);
+	return pte_clear_flags(pte, (_PAGE_DIRTY | _PAGE_SOFTDIRTY));
 }
 
 static inline pte_t pte_mkold(pte_t pte)
@@ -421,7 +421,7 @@ static inline bool pte_accessible(struct mm_struct *mm, pte_t a)
 		return true;
 
 	if ((pte_flags(a) & (_PAGE_PROTNONE | _PAGE_NUMA)) &&
-			mm_tlb_flush_pending(mm))
+			tlb_flush_pending(mm))
 		return true;
 
 	return false;

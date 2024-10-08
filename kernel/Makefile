@@ -10,7 +10,8 @@ obj-y     = fork.o exec_domain.o panic.o printk.o \
 	    kthread.o wait.o sys_ni.o posix-cpu-timers.o mutex.o \
 	    hrtimer.o rwsem.o nsproxy.o srcu.o semaphore.o \
 	    notifier.o ksysfs.o cred.o \
-	    async.o range.o groups.o lglock.o smpboot.o
+	    async.o range.o groups.o lglock.o smpboot.o \
+	    rh_taint.o rh_kabi.o rh_shadowman.o
 
 ifdef CONFIG_FUNCTION_TRACER
 # Do not trace debug files and internal ftrace files
@@ -52,8 +53,10 @@ obj-$(CONFIG_SMP) += spinlock.o
 obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
 obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
 obj-$(CONFIG_UID16) += uid16.o
+obj-$(CONFIG_SYSTEM_TRUSTED_KEYRING) += system_keyring.o system_certificates.o
 obj-$(CONFIG_MODULES) += module.o
-obj-$(CONFIG_MODULE_SIG) += module_signing.o modsign_pubkey.o modsign_certificate.o
+obj-$(CONFIG_MODULE_SIG) += module_signing.o
+obj-$(CONFIG_MODULE_SIG_UEFI) += modsign_uefi.o
 obj-$(CONFIG_KALLSYMS) += kallsyms.o
 obj-$(CONFIG_BSD_PROCESS_ACCT) += acct.o
 obj-$(CONFIG_KEXEC) += kexec.o
@@ -113,6 +116,8 @@ obj-$(CONFIG_CONTEXT_TRACKING) += context_tracking.o
 
 $(obj)/configs.o: $(obj)/config_data.h
 
+$(obj)/modsign_uefi.o: KBUILD_CFLAGS += -fshort-wchar
+
 # config_data.h contains the same information as ikconfig.h but gzipped.
 # Info from config_data can be extracted from /proc/config*
 targets += config_data.gz
@@ -140,11 +145,11 @@ targets += timeconst.h
 $(obj)/timeconst.h: $(obj)/hz.bc $(src)/timeconst.bc FORCE
 	$(call if_changed,bc)
 
-ifeq ($(CONFIG_MODULE_SIG),y)
 ###############################################################################
 #
 # Roll all the X.509 certificates that we can find together and pull them into
-# the kernel.
+# the kernel so that they get loaded into the system trusted keyring during
+# boot.
 #
 # We look in the source root and the build root for all files whose name ends
 # in ".x509".  Unfortunately, this will generate duplicate filenames, so we
@@ -152,6 +157,7 @@ ifeq ($(CONFIG_MODULE_SIG),y)
 # duplicates.
 #
 ###############################################################################
+ifeq ($(CONFIG_SYSTEM_TRUSTED_KEYRING),y)
 X509_CERTIFICATES-y := $(wildcard *.x509) $(wildcard $(srctree)/*.x509)
 X509_CERTIFICATES-$(CONFIG_MODULE_SIG) += signing_key.x509
 X509_CERTIFICATES := $(sort $(foreach CERT,$(X509_CERTIFICATES-y), \
@@ -168,10 +174,11 @@ $(shell rm $(obj)/.x509.list)
 endif
 endif
 
-kernel/modsign_certificate.o: $(obj)/x509_certificate_list
+kernel/system_certificates.o: $(obj)/x509_certificate_list
 
 quiet_cmd_x509certs  = CERTS   $@
-      cmd_x509certs  = cat $(X509_CERTIFICATES) /dev/null >$@
+      cmd_x509certs  = cat $(X509_CERTIFICATES) /dev/null >$@ $(foreach X509,$(X509_CERTIFICATES),; echo "  - Including cert $(X509)")
+
 targets += $(obj)/x509_certificate_list
 $(obj)/x509_certificate_list: $(X509_CERTIFICATES) $(obj)/.x509.list
 	$(call if_changed,x509certs)
@@ -181,7 +188,9 @@ $(obj)/.x509.list:
 	@echo $(X509_CERTIFICATES) >$@
 
 clean-files := x509_certificate_list .x509.list
+endif
 
+ifeq ($(CONFIG_MODULE_SIG),y)
 ###############################################################################
 #
 # If module signing is requested, say by allyesconfig, but a key has not been

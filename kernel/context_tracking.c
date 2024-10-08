@@ -20,15 +20,21 @@
 #include <linux/hardirq.h>
 #include <linux/export.h>
 
-DEFINE_PER_CPU(struct context_tracking, context_tracking) = {
-#ifdef CONFIG_CONTEXT_TRACKING_FORCE
-	.active = true,
-#endif
-};
+#define CREATE_TRACE_POINTS
+#include <trace/events/context_tracking.h>
+
+struct static_key context_tracking_enabled = STATIC_KEY_INIT_FALSE;
+EXPORT_SYMBOL_GPL(context_tracking_enabled);
+
+DEFINE_PER_CPU(struct context_tracking, context_tracking);
+EXPORT_SYMBOL_GPL(context_tracking);
 
 void context_tracking_cpu_set(int cpu)
 {
-	per_cpu(context_tracking.active, cpu) = true;
+	if (!per_cpu(context_tracking.active, cpu)) {
+		per_cpu(context_tracking.active, cpu) = true;
+		static_key_slow_inc(&context_tracking_enabled);
+	}
 }
 
 /**
@@ -61,6 +67,7 @@ void context_tracking_user_enter(void)
 	local_irq_save(flags);
 	if ( __this_cpu_read(context_tracking.state) != IN_USER) {
 		if (__this_cpu_read(context_tracking.active)) {
+			trace_user_enter(0);
 			/*
 			 * At this stage, only low level arch entry code remains and
 			 * then we'll run in userspace. We can assume there won't be
@@ -156,35 +163,15 @@ void context_tracking_user_exit(void)
 			 */
 			rcu_user_exit();
 			vtime_user_exit(current);
+			trace_user_exit(0);
 		}
 		__this_cpu_write(context_tracking.state, IN_KERNEL);
 	}
 	local_irq_restore(flags);
 }
 
-#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
-void guest_enter(void)
-{
-	if (vtime_accounting_enabled())
-		vtime_guest_enter(current);
-	else
-		current->flags |= PF_VCPU;
-}
-EXPORT_SYMBOL_GPL(guest_enter);
-
-void guest_exit(void)
-{
-	if (vtime_accounting_enabled())
-		vtime_guest_exit(current);
-	else
-		current->flags &= ~PF_VCPU;
-}
-EXPORT_SYMBOL_GPL(guest_exit);
-#endif /* CONFIG_VIRT_CPU_ACCOUNTING_GEN */
-
-
 /**
- * context_tracking_task_switch - context switch the syscall callbacks
+ * __context_tracking_task_switch - context switch the syscall callbacks
  * @prev: the task that is being switched out
  * @next: the task that is being switched in
  *
@@ -196,9 +183,19 @@ EXPORT_SYMBOL_GPL(guest_exit);
  * migrate to some CPU that doesn't do the context tracking. As such the TIF
  * flag may not be desired there.
  */
-void context_tracking_task_switch(struct task_struct *prev,
-			     struct task_struct *next)
+void __context_tracking_task_switch(struct task_struct *prev,
+				    struct task_struct *next)
 {
 	clear_tsk_thread_flag(prev, TIF_NOHZ);
 	set_tsk_thread_flag(next, TIF_NOHZ);
 }
+
+#ifdef CONFIG_CONTEXT_TRACKING_FORCE
+void __init context_tracking_init(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		context_tracking_cpu_set(cpu);
+}
+#endif

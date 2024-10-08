@@ -99,6 +99,8 @@ static struct sk_buff *ipv6_gso_segment(struct sk_buff *skb,
 		       SKB_GSO_DODGY |
 		       SKB_GSO_TCP_ECN |
 		       SKB_GSO_GRE |
+		       SKB_GSO_IPIP |
+		       SKB_GSO_SIT |
 		       SKB_GSO_UDP_TUNNEL |
 		       SKB_GSO_MPLS |
 		       SKB_GSO_TCPV6 |
@@ -191,7 +193,7 @@ static struct sk_buff **ipv6_gro_receive(struct sk_buff **head,
 	unsigned int nlen;
 	unsigned int hlen;
 	unsigned int off;
-	int flush = 1;
+	u16 flush = 1;
 	int proto;
 	__wsum csum;
 
@@ -309,6 +311,13 @@ static struct packet_offload ipv6_packet_offload __read_mostly = {
 	},
 };
 
+static const struct net_offload sit_offload = {
+	.callbacks = {
+		.gso_send_check = ipv6_gso_send_check,
+		.gso_segment	= ipv6_gso_segment,
+	},
+};
+
 static int __init ipv6_offload_init(void)
 {
 
@@ -320,6 +329,9 @@ static int __init ipv6_offload_init(void)
 		pr_crit("%s: Cannot add EXTHDRS protocol offload\n", __func__);
 
 	dev_add_offload(&ipv6_packet_offload);
+
+	inet_add_offload(&sit_offload, IPPROTO_IPV6);
+
 	return 0;
 }
 

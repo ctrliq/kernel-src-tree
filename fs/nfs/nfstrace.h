@@ -158,6 +158,569 @@ DEFINE_NFS_INODE_EVENT_DONE(nfs_fsync_exit);
 DEFINE_NFS_INODE_EVENT(nfs_access_enter);
 DEFINE_NFS_INODE_EVENT_DONE(nfs_access_exit);
 
+#define show_lookup_flags(flags) \
+	__print_flags((unsigned long)flags, "|", \
+			{ LOOKUP_AUTOMOUNT, "AUTOMOUNT" }, \
+			{ LOOKUP_DIRECTORY, "DIRECTORY" }, \
+			{ LOOKUP_OPEN, "OPEN" }, \
+			{ LOOKUP_CREATE, "CREATE" }, \
+			{ LOOKUP_EXCL, "EXCL" })
+
+DECLARE_EVENT_CLASS(nfs_lookup_event,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct dentry *dentry,
+			unsigned int flags
+		),
+
+		TP_ARGS(dir, dentry, flags),
+
+		TP_STRUCT__entry(
+			__field(unsigned int, flags)
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->flags = flags;
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"flags=%u (%s) name=%02x:%02x:%llu/%s",
+			__entry->flags,
+			show_lookup_flags(__entry->flags),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+#define DEFINE_NFS_LOOKUP_EVENT(name) \
+	DEFINE_EVENT(nfs_lookup_event, name, \
+			TP_PROTO( \
+				const struct inode *dir, \
+				const struct dentry *dentry, \
+				unsigned int flags \
+			), \
+			TP_ARGS(dir, dentry, flags))
+
+DECLARE_EVENT_CLASS(nfs_lookup_event_done,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct dentry *dentry,
+			unsigned int flags,
+			int error
+		),
+
+		TP_ARGS(dir, dentry, flags, error),
+
+		TP_STRUCT__entry(
+			__field(int, error)
+			__field(unsigned int, flags)
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->error = error;
+			__entry->flags = flags;
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"error=%d flags=%u (%s) name=%02x:%02x:%llu/%s",
+			__entry->error,
+			__entry->flags,
+			show_lookup_flags(__entry->flags),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+#define DEFINE_NFS_LOOKUP_EVENT_DONE(name) \
+	DEFINE_EVENT(nfs_lookup_event_done, name, \
+			TP_PROTO( \
+				const struct inode *dir, \
+				const struct dentry *dentry, \
+				unsigned int flags, \
+				int error \
+			), \
+			TP_ARGS(dir, dentry, flags, error))
+
+DEFINE_NFS_LOOKUP_EVENT(nfs_lookup_enter);
+DEFINE_NFS_LOOKUP_EVENT_DONE(nfs_lookup_exit);
+DEFINE_NFS_LOOKUP_EVENT(nfs_lookup_revalidate_enter);
+DEFINE_NFS_LOOKUP_EVENT_DONE(nfs_lookup_revalidate_exit);
+
+#define show_open_flags(flags) \
+	__print_flags((unsigned long)flags, "|", \
+		{ O_CREAT, "O_CREAT" }, \
+		{ O_EXCL, "O_EXCL" }, \
+		{ O_TRUNC, "O_TRUNC" }, \
+		{ O_APPEND, "O_APPEND" }, \
+		{ O_DSYNC, "O_DSYNC" }, \
+		{ O_DIRECT, "O_DIRECT" }, \
+		{ O_DIRECTORY, "O_DIRECTORY" })
+
+#define show_fmode_flags(mode) \
+	__print_flags(mode, "|", \
+		{ ((__force unsigned long)FMODE_READ), "READ" }, \
+		{ ((__force unsigned long)FMODE_WRITE), "WRITE" }, \
+		{ ((__force unsigned long)FMODE_EXEC), "EXEC" })
+
+TRACE_EVENT(nfs_atomic_open_enter,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct nfs_open_context *ctx,
+			unsigned int flags
+		),
+
+		TP_ARGS(dir, ctx, flags),
+
+		TP_STRUCT__entry(
+			__field(unsigned int, flags)
+			__field(unsigned int, fmode)
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, ctx->dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->flags = flags;
+			__entry->fmode = (__force unsigned int)ctx->mode;
+			__assign_str(name, ctx->dentry->d_name.name);
+		),
+
+		TP_printk(
+			"flags=%u (%s) fmode=%s name=%02x:%02x:%llu/%s",
+			__entry->flags,
+			show_open_flags(__entry->flags),
+			show_fmode_flags(__entry->fmode),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+TRACE_EVENT(nfs_atomic_open_exit,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct nfs_open_context *ctx,
+			unsigned int flags,
+			int error
+		),
+
+		TP_ARGS(dir, ctx, flags, error),
+
+		TP_STRUCT__entry(
+			__field(int, error)
+			__field(unsigned int, flags)
+			__field(unsigned int, fmode)
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, ctx->dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->error = error;
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->flags = flags;
+			__entry->fmode = (__force unsigned int)ctx->mode;
+			__assign_str(name, ctx->dentry->d_name.name);
+		),
+
+		TP_printk(
+			"error=%d flags=%u (%s) fmode=%s "
+			"name=%02x:%02x:%llu/%s",
+			__entry->error,
+			__entry->flags,
+			show_open_flags(__entry->flags),
+			show_fmode_flags(__entry->fmode),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+TRACE_EVENT(nfs_create_enter,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct dentry *dentry,
+			unsigned int flags
+		),
+
+		TP_ARGS(dir, dentry, flags),
+
+		TP_STRUCT__entry(
+			__field(unsigned int, flags)
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->flags = flags;
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"flags=%u (%s) name=%02x:%02x:%llu/%s",
+			__entry->flags,
+			show_open_flags(__entry->flags),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+TRACE_EVENT(nfs_create_exit,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct dentry *dentry,
+			unsigned int flags,
+			int error
+		),
+
+		TP_ARGS(dir, dentry, flags, error),
+
+		TP_STRUCT__entry(
+			__field(int, error)
+			__field(unsigned int, flags)
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->error = error;
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->flags = flags;
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"error=%d flags=%u (%s) name=%02x:%02x:%llu/%s",
+			__entry->error,
+			__entry->flags,
+			show_open_flags(__entry->flags),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+DECLARE_EVENT_CLASS(nfs_directory_event,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct dentry *dentry
+		),
+
+		TP_ARGS(dir, dentry),
+
+		TP_STRUCT__entry(
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"name=%02x:%02x:%llu/%s",
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+#define DEFINE_NFS_DIRECTORY_EVENT(name) \
+	DEFINE_EVENT(nfs_directory_event, name, \
+			TP_PROTO( \
+				const struct inode *dir, \
+				const struct dentry *dentry \
+			), \
+			TP_ARGS(dir, dentry))
+
+DECLARE_EVENT_CLASS(nfs_directory_event_done,
+		TP_PROTO(
+			const struct inode *dir,
+			const struct dentry *dentry,
+			int error
+		),
+
+		TP_ARGS(dir, dentry, error),
+
+		TP_STRUCT__entry(
+			__field(int, error)
+			__field(dev_t, dev)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->error = error;
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"error=%d name=%02x:%02x:%llu/%s",
+			__entry->error,
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+#define DEFINE_NFS_DIRECTORY_EVENT_DONE(name) \
+	DEFINE_EVENT(nfs_directory_event_done, name, \
+			TP_PROTO( \
+				const struct inode *dir, \
+				const struct dentry *dentry, \
+				int error \
+			), \
+			TP_ARGS(dir, dentry, error))
+
+DEFINE_NFS_DIRECTORY_EVENT(nfs_mknod_enter);
+DEFINE_NFS_DIRECTORY_EVENT_DONE(nfs_mknod_exit);
+DEFINE_NFS_DIRECTORY_EVENT(nfs_mkdir_enter);
+DEFINE_NFS_DIRECTORY_EVENT_DONE(nfs_mkdir_exit);
+DEFINE_NFS_DIRECTORY_EVENT(nfs_rmdir_enter);
+DEFINE_NFS_DIRECTORY_EVENT_DONE(nfs_rmdir_exit);
+DEFINE_NFS_DIRECTORY_EVENT(nfs_remove_enter);
+DEFINE_NFS_DIRECTORY_EVENT_DONE(nfs_remove_exit);
+DEFINE_NFS_DIRECTORY_EVENT(nfs_unlink_enter);
+DEFINE_NFS_DIRECTORY_EVENT_DONE(nfs_unlink_exit);
+DEFINE_NFS_DIRECTORY_EVENT(nfs_symlink_enter);
+DEFINE_NFS_DIRECTORY_EVENT_DONE(nfs_symlink_exit);
+
+TRACE_EVENT(nfs_link_enter,
+		TP_PROTO(
+			const struct inode *inode,
+			const struct inode *dir,
+			const struct dentry *dentry
+		),
+
+		TP_ARGS(inode, dir, dentry),
+
+		TP_STRUCT__entry(
+			__field(dev_t, dev)
+			__field(u64, fileid)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = inode->i_sb->s_dev;
+			__entry->fileid = NFS_FILEID(inode);
+			__entry->dir = NFS_FILEID(dir);
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"fileid=%02x:%02x:%llu name=%02x:%02x:%llu/%s",
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			__entry->fileid,
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+TRACE_EVENT(nfs_link_exit,
+		TP_PROTO(
+			const struct inode *inode,
+			const struct inode *dir,
+			const struct dentry *dentry,
+			int error
+		),
+
+		TP_ARGS(inode, dir, dentry, error),
+
+		TP_STRUCT__entry(
+			__field(int, error)
+			__field(dev_t, dev)
+			__field(u64, fileid)
+			__field(u64, dir)
+			__string(name, dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = inode->i_sb->s_dev;
+			__entry->fileid = NFS_FILEID(inode);
+			__entry->dir = NFS_FILEID(dir);
+			__entry->error = error;
+			__assign_str(name, dentry->d_name.name);
+		),
+
+		TP_printk(
+			"error=%d fileid=%02x:%02x:%llu name=%02x:%02x:%llu/%s",
+			__entry->error,
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			__entry->fileid,
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
+
+DECLARE_EVENT_CLASS(nfs_rename_event,
+		TP_PROTO(
+			const struct inode *old_dir,
+			const struct dentry *old_dentry,
+			const struct inode *new_dir,
+			const struct dentry *new_dentry
+		),
+
+		TP_ARGS(old_dir, old_dentry, new_dir, new_dentry),
+
+		TP_STRUCT__entry(
+			__field(dev_t, dev)
+			__field(u64, old_dir)
+			__field(u64, new_dir)
+			__string(old_name, old_dentry->d_name.name)
+			__string(new_name, new_dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = old_dir->i_sb->s_dev;
+			__entry->old_dir = NFS_FILEID(old_dir);
+			__entry->new_dir = NFS_FILEID(new_dir);
+			__assign_str(old_name, old_dentry->d_name.name);
+			__assign_str(new_name, new_dentry->d_name.name);
+		),
+
+		TP_printk(
+			"old_name=%02x:%02x:%llu/%s new_name=%02x:%02x:%llu/%s",
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->old_dir,
+			__get_str(old_name),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->new_dir,
+			__get_str(new_name)
+		)
+);
+#define DEFINE_NFS_RENAME_EVENT(name) \
+	DEFINE_EVENT(nfs_rename_event, name, \
+			TP_PROTO( \
+				const struct inode *old_dir, \
+				const struct dentry *old_dentry, \
+				const struct inode *new_dir, \
+				const struct dentry *new_dentry \
+			), \
+			TP_ARGS(old_dir, old_dentry, new_dir, new_dentry))
+
+DECLARE_EVENT_CLASS(nfs_rename_event_done,
+		TP_PROTO(
+			const struct inode *old_dir,
+			const struct dentry *old_dentry,
+			const struct inode *new_dir,
+			const struct dentry *new_dentry,
+			int error
+		),
+
+		TP_ARGS(old_dir, old_dentry, new_dir, new_dentry, error),
+
+		TP_STRUCT__entry(
+			__field(dev_t, dev)
+			__field(int, error)
+			__field(u64, old_dir)
+			__string(old_name, old_dentry->d_name.name)
+			__field(u64, new_dir)
+			__string(new_name, new_dentry->d_name.name)
+		),
+
+		TP_fast_assign(
+			__entry->dev = old_dir->i_sb->s_dev;
+			__entry->old_dir = NFS_FILEID(old_dir);
+			__entry->new_dir = NFS_FILEID(new_dir);
+			__entry->error = error;
+			__assign_str(old_name, old_dentry->d_name.name);
+			__assign_str(new_name, new_dentry->d_name.name);
+		),
+
+		TP_printk(
+			"error=%d old_name=%02x:%02x:%llu/%s "
+			"new_name=%02x:%02x:%llu/%s",
+			__entry->error,
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->old_dir,
+			__get_str(old_name),
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->new_dir,
+			__get_str(new_name)
+		)
+);
+#define DEFINE_NFS_RENAME_EVENT_DONE(name) \
+	DEFINE_EVENT(nfs_rename_event_done, name, \
+			TP_PROTO( \
+				const struct inode *old_dir, \
+				const struct dentry *old_dentry, \
+				const struct inode *new_dir, \
+				const struct dentry *new_dentry, \
+				int error \
+			), \
+			TP_ARGS(old_dir, old_dentry, new_dir, \
+				new_dentry, error))
+
+DEFINE_NFS_RENAME_EVENT(nfs_rename_enter);
+DEFINE_NFS_RENAME_EVENT_DONE(nfs_rename_exit);
+
+DEFINE_NFS_RENAME_EVENT_DONE(nfs_sillyrename_rename);
+
+TRACE_EVENT(nfs_sillyrename_unlink,
+		TP_PROTO(
+			const struct nfs_unlinkdata *data,
+			int error
+		),
+
+		TP_ARGS(data, error),
+
+		TP_STRUCT__entry(
+			__field(dev_t, dev)
+			__field(int, error)
+			__field(u64, dir)
+			__dynamic_array(char, name, data->args.name.len + 1)
+		),
+
+		TP_fast_assign(
+			struct inode *dir = data->dir;
+			size_t len = data->args.name.len;
+			__entry->dev = dir->i_sb->s_dev;
+			__entry->dir = NFS_FILEID(dir);
+			__entry->error = error;
+			memcpy(__get_dynamic_array(name),
+				data->args.name.name, len);
+			((char *)__get_dynamic_array(name))[len] = 0;
+		),
+
+		TP_printk(
+			"error=%d name=%02x:%02x:%llu/%s",
+			__entry->error,
+			MAJOR(__entry->dev), MINOR(__entry->dev),
+			(unsigned long long)__entry->dir,
+			__get_str(name)
+		)
+);
 #endif /* _TRACE_NFS_H */
 
 #undef TRACE_INCLUDE_PATH

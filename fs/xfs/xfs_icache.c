@@ -18,26 +18,21 @@
 #include "xfs.h"
 #include "xfs_fs.h"
 #include "xfs_format.h"
-#include "xfs_types.h"
-#include "xfs_log.h"
-#include "xfs_log_priv.h"
+#include "xfs_log_format.h"
+#include "xfs_trans_resv.h"
 #include "xfs_inum.h"
-#include "xfs_trans.h"
-#include "xfs_trans_priv.h"
 #include "xfs_sb.h"
 #include "xfs_ag.h"
 #include "xfs_mount.h"
-#include "xfs_bmap_btree.h"
 #include "xfs_inode.h"
-#include "xfs_dinode.h"
 #include "xfs_error.h"
-#include "xfs_filestream.h"
-#include "xfs_vnodeops.h"
+#include "xfs_trans.h"
+#include "xfs_trans_priv.h"
 #include "xfs_inode_item.h"
 #include "xfs_quota.h"
 #include "xfs_trace.h"
-#include "xfs_fsops.h"
 #include "xfs_icache.h"
+#include "xfs_bmap_util.h"
 
 #include <linux/kthread.h>
 #include <linux/freezer.h>
@@ -48,7 +43,7 @@ STATIC void __xfs_inode_clear_reclaim_tag(struct xfs_mount *mp,
 /*
  * Allocate and initialise an xfs_inode.
  */
-STATIC struct xfs_inode *
+struct xfs_inode *
 xfs_inode_alloc(
 	struct xfs_mount	*mp,
 	xfs_ino_t		ino)
@@ -98,7 +93,7 @@ xfs_inode_free_callback(
 	kmem_zone_free(xfs_inode_zone, ip);
 }
 
-STATIC void
+void
 xfs_inode_free(
 	struct xfs_inode	*ip)
 {
@@ -499,11 +494,6 @@ xfs_inode_ag_walk_grab(
 	/* If we can't grab the inode, it must on it's way to reclaim. */
 	if (!igrab(inode))
 		return ENOENT;
-
-	if (is_bad_inode(inode)) {
-		IRELE(ip);
-		return ENOENT;
-	}
 
 	/* inode is valid */
 	return 0;
@@ -918,8 +908,6 @@ restart:
 		xfs_iflock(ip);
 	}
 
-	if (is_bad_inode(VFS_I(ip)))
-		goto reclaim;
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
 		xfs_iunpin_wait(ip);
 		xfs_iflush_abort(ip, false);

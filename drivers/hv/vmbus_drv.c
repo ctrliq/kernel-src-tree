@@ -440,7 +440,7 @@ static void vmbus_on_msg_dpc(unsigned long data)
 		 * will not deliver any more messages since there is
 		 * no empty slot
 		 */
-		smp_mb();
+		mb();
 
 		if (msg->header.message_flags.msg_pending) {
 			/*
@@ -841,7 +841,6 @@ static void __exit vmbus_exit(void)
 
 
 MODULE_LICENSE("GPL");
-MODULE_VERSION(HV_DRV_VERSION);
 
 subsys_initcall(hv_acpi_init);
 module_exit(vmbus_exit);

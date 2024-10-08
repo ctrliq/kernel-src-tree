@@ -17,40 +17,37 @@
  */
 #include "xfs.h"
 #include "xfs_fs.h"
-#include "xfs_format.h"
 #include "xfs_shared.h"
+#include "xfs_format.h"
+#include "xfs_log_format.h"
+#include "xfs_trans_resv.h"
 #include "xfs_bit.h"
-#include "xfs_log.h"
 #include "xfs_inum.h"
-#include "xfs_trans.h"
 #include "xfs_sb.h"
 #include "xfs_ag.h"
-#include "xfs_dir2.h"
 #include "xfs_mount.h"
+#include "xfs_da_format.h"
 #include "xfs_da_btree.h"
-#include "xfs_bmap_btree.h"
-#include "xfs_alloc_btree.h"
-#include "xfs_ialloc_btree.h"
-#include "xfs_dinode.h"
+#include "xfs_dir2.h"
 #include "xfs_inode.h"
 #include "xfs_btree.h"
-#include "xfs_mount.h"
-#include "xfs_itable.h"
+#include "xfs_trans.h"
 #include "xfs_inode_item.h"
 #include "xfs_extfree_item.h"
 #include "xfs_alloc.h"
 #include "xfs_bmap.h"
 #include "xfs_bmap_util.h"
+#include "xfs_bmap_btree.h"
 #include "xfs_rtalloc.h"
 #include "xfs_error.h"
-#include "xfs_attr_leaf.h"
 #include "xfs_quota.h"
 #include "xfs_trans_space.h"
 #include "xfs_buf_item.h"
-#include "xfs_filestream.h"
-#include "xfs_vnodeops.h"
 #include "xfs_trace.h"
 #include "xfs_symlink.h"
+#include "xfs_attr_leaf.h"
+#include "xfs_dinode.h"
+#include "xfs_filestream.h"
 
 
 kmem_zone_t		*xfs_bmap_free_item_zone;
@@ -1140,6 +1137,7 @@ xfs_bmap_add_attrfork(
 	int			committed;	/* xaction was committed */
 	int			logflags;	/* logging flags */
 	int			error;		/* error return value */
+	int			cancel_flags = 0;
 
 	ASSERT(XFS_IFORK_Q(ip) == 0);
 
@@ -1149,20 +1147,21 @@ xfs_bmap_add_attrfork(
 	blks = XFS_ADDAFORK_SPACE_RES(mp);
 	if (rsvd)
 		tp->t_flags |= XFS_TRANS_RESERVE;
-	if ((error = xfs_trans_reserve(tp, blks, XFS_ADDAFORK_LOG_RES(mp), 0,
-			XFS_TRANS_PERM_LOG_RES, XFS_ADDAFORK_LOG_COUNT)))
-		goto error0;
+	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_addafork, blks, 0);
+	if (error) {
+		xfs_trans_cancel(tp, 0);
+		return error;
+	}
+	cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
 	error = xfs_trans_reserve_quota_nblks(tp, ip, blks, 0, rsvd ?
 			XFS_QMOPT_RES_REGBLKS | XFS_QMOPT_FORCE_RES :
 			XFS_QMOPT_RES_REGBLKS);
-	if (error) {
-		xfs_iunlock(ip, XFS_ILOCK_EXCL);
-		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES);
-		return error;
-	}
+	if (error)
+		goto trans_cancel;
+	cancel_flags |= XFS_TRANS_ABORT;
 	if (XFS_IFORK_Q(ip))
-		goto error1;
+		goto trans_cancel;
 	if (ip->i_d.di_aformat != XFS_DINODE_FMT_EXTENTS) {
 		/*
 		 * For inodes coming from pre-6.2 filesystems.
@@ -1172,7 +1171,7 @@ xfs_bmap_add_attrfork(
 	}
 	ASSERT(ip->i_d.di_anextents == 0);
 
-	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+	xfs_trans_ijoin(tp, ip, 0);
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 
 	switch (ip->i_d.di_format) {
@@ -1194,7 +1193,7 @@ xfs_bmap_add_attrfork(
 	default:
 		ASSERT(0);
 		error = XFS_ERROR(EINVAL);
-		goto error1;
+		goto trans_cancel;
 	}
 
 	ASSERT(ip->i_afp == NULL);
@@ -1222,7 +1221,7 @@ xfs_bmap_add_attrfork(
 	if (logflags)
 		xfs_trans_log_inode(tp, ip, logflags);
 	if (error)
-		goto error2;
+		goto bmap_cancel;
 	if (!xfs_sb_version_hasattr(&mp->m_sb) ||
 	   (!xfs_sb_version_hasattr2(&mp->m_sb) && version == 2)) {
 		__int64_t sbfields = 0;
@@ -1245,14 +1244,16 @@ xfs_bmap_add_attrfork(
 
 	error = xfs_bmap_finish(&tp, &flist, &committed);
 	if (error)
-		goto error2;
-	return xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
-error2:
-	xfs_bmap_cancel(&flist);
-error1:
+		goto bmap_cancel;
+	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
-error0:
-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
+	return error;
+
+bmap_cancel:
+	xfs_bmap_cancel(&flist);
+trans_cancel:
+	xfs_trans_cancel(tp, cancel_flags);
+	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 	return error;
 }
 
@@ -4012,7 +4013,6 @@ xfs_bmapi_read(
 	ASSERT(*nmap >= 1);
 	ASSERT(!(flags & ~(XFS_BMAPI_ATTRFORK|XFS_BMAPI_ENTIRE|
 			   XFS_BMAPI_IGSTATE)));
-	ASSERT(xfs_isilocked(ip, XFS_ILOCK_SHARED|XFS_ILOCK_EXCL));
 
 	if (unlikely(XFS_TEST_ERROR(
 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
@@ -4207,7 +4207,6 @@ xfs_bmapi_delay(
 	ASSERT(*nmap >= 1);
 	ASSERT(*nmap <= XFS_BMAP_MAX_NMAP);
 	ASSERT(!(flags & ~XFS_BMAPI_ENTIRE));
-	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
 
 	if (unlikely(XFS_TEST_ERROR(
 	    (XFS_IFORK_FORMAT(ip, XFS_DATA_FORK) != XFS_DINODE_FMT_EXTENTS &&
@@ -4501,7 +4500,6 @@ xfs_bmapi_write(
 	ASSERT(tp != NULL);
 	ASSERT(len > 0);
 	ASSERT(XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_LOCAL);
-	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
 
 	if (unlikely(XFS_TEST_ERROR(
 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
@@ -5053,7 +5051,6 @@ xfs_bunmapi(
 	if (XFS_FORCED_SHUTDOWN(mp))
 		return XFS_ERROR(EIO);
 
-	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
 	ASSERT(len > 0);
 	ASSERT(nexts >= 0);
 

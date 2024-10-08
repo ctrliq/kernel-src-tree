@@ -166,6 +166,7 @@ BUILD_TRAP_HANDLER(bug)
 
 BUILD_TRAP_HANDLER(nmi)
 {
+	unsigned int cpu = smp_processor_id();
 	TRAP_HANDLER_DECL;
 
 	nmi_enter();

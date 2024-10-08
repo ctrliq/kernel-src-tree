@@ -292,8 +292,8 @@ static void assign_requested_resources_sorted(struct list_head *head,
 				      (!(res->flags & IORESOURCE_ROM_ENABLE))))
 					add_to_list(fail_head,
 						    dev_res->dev, res,
-						    0 /* dont care */,
-						    0 /* dont care */);
+						    0 /* don't care */,
+						    0 /* don't care */);
 			}
 			reset_resource(res);
 		}
@@ -667,9 +667,9 @@ static void pci_bridge_check_ranges(struct pci_bus *bus)
 	if (!io) {
 		pci_write_config_word(bridge, PCI_IO_BASE, 0xf0f0);
 		pci_read_config_word(bridge, PCI_IO_BASE, &io);
- 		pci_write_config_word(bridge, PCI_IO_BASE, 0x0);
- 	}
- 	if (io)
+		pci_write_config_word(bridge, PCI_IO_BASE, 0x0);
+	}
+	if (io)
 		b_res[0].flags |= IORESOURCE_IO;
 	/*  DECchip 21050 pass 2 errata: the bridge may miss an address
 	    disconnect boundary by one PCI data phase.
@@ -819,7 +819,7 @@ static void pbus_size_io(struct pci_bus *bus, resource_size_t min_size,
 	resource_size_t min_align, align;
 
 	if (!b_res)
- 		return;
+		return;
 
 	min_align = window_alignment(bus, IORESOURCE_IO);
 	list_for_each_entry(dev, &bus->devices, bus_list) {
@@ -950,7 +950,7 @@ static int pbus_size_mem(struct pci_bus *bus, unsigned long mask,
 			if (realloc_head && i >= PCI_IOV_RESOURCES &&
 					i <= PCI_IOV_RESOURCE_END) {
 				r->end = r->start - 1;
-				add_to_list(realloc_head, dev, r, r_size, 0/* dont' care */);
+				add_to_list(realloc_head, dev, r, r_size, 0/* don't care */);
 				children_add_size += r_size;
 				continue;
 			}
@@ -1456,10 +1456,10 @@ static enum enable_type pci_realloc_detect(struct pci_bus *bus,
 
 /*
  * first try will not touch pci bridge res
- * second  and later try will clear small leaf bridge res
- * will stop till to the max  deepth if can not find good one
+ * second and later try will clear small leaf bridge res
+ * will stop till to the max depth if can not find good one
  */
-static void pci_assign_unassigned_root_bus_resources(struct pci_bus *bus)
+void pci_assign_unassigned_root_bus_resources(struct pci_bus *bus)
 {
 	LIST_HEAD(realloc_head); /* list of resources that
 					want additional resources */
@@ -1503,7 +1503,7 @@ again:
 
 	/* any device complain? */
 	if (list_empty(&fail_head))
-		goto enable_and_dump;
+		goto dump;
 
 	if (tried_times >= pci_try_num) {
 		if (enable_local == undefined)
@@ -1512,7 +1512,7 @@ again:
 			dev_info(&bus->dev, "Automatically enabled pci realloc, if you have problem, try booting with pci=realloc=off\n");
 
 		free_list(&fail_head);
-		goto enable_and_dump;
+		goto dump;
 	}
 
 	dev_printk(KERN_DEBUG, &bus->dev,
@@ -1545,10 +1545,7 @@ again:
 
 	goto again;
 
-enable_and_dump:
-	/* Depth last, update the hardware. */
-	pci_enable_bridges(bus);
-
+dump:
 	/* dump the resource on buses */
 	pci_bus_dump_resources(bus);
 }
@@ -1619,7 +1616,6 @@ enable_all:
 	if (retval)
 		dev_err(&bridge->dev, "Error reenabling bridge (%d)\n", retval);
 	pci_set_master(bridge);
-	pci_enable_bridges(parent);
 }
 EXPORT_SYMBOL_GPL(pci_assign_unassigned_bridge_resources);
 

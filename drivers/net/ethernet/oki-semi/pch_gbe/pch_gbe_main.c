@@ -1468,9 +1468,9 @@ pch_gbe_alloc_rx_buffers_pool(struct pch_gbe_adapter *adapter,
 	bufsz = adapter->rx_buffer_len;
 
 	size = rx_ring->count * bufsz + PCH_GBE_RESERVE_MEMORY;
-	rx_ring->rx_buff_pool =
-		dma_zalloc_coherent(&pdev->dev, size,
-				    &rx_ring->rx_buff_pool_logic, GFP_KERNEL);
+	rx_ring->rx_buff_pool = dma_alloc_coherent(&pdev->dev, size,
+						   &rx_ring->rx_buff_pool_logic,
+						   GFP_KERNEL | __GFP_ZERO);
 	if (!rx_ring->rx_buff_pool)
 		return -ENOMEM;
 
@@ -1771,8 +1771,9 @@ int pch_gbe_setup_tx_resources(struct pch_gbe_adapter *adapter,
 
 	tx_ring->size = tx_ring->count * (int)sizeof(struct pch_gbe_tx_desc);
 
-	tx_ring->desc = dma_zalloc_coherent(&pdev->dev, tx_ring->size,
-					    &tx_ring->dma, GFP_KERNEL);
+	tx_ring->desc = dma_alloc_coherent(&pdev->dev, tx_ring->size,
+					   &tx_ring->dma,
+					   GFP_KERNEL | __GFP_ZERO);
 	if (!tx_ring->desc) {
 		vfree(tx_ring->buffer_info);
 		return -ENOMEM;
@@ -1815,8 +1816,9 @@ int pch_gbe_setup_rx_resources(struct pch_gbe_adapter *adapter,
 		return -ENOMEM;
 
 	rx_ring->size = rx_ring->count * (int)sizeof(struct pch_gbe_rx_desc);
-	rx_ring->desc =	dma_zalloc_coherent(&pdev->dev, rx_ring->size,
-					    &rx_ring->dma, GFP_KERNEL);
+	rx_ring->desc =	dma_alloc_coherent(&pdev->dev, rx_ring->size,
+					   &rx_ring->dma,
+					   GFP_KERNEL | __GFP_ZERO);
 	if (!rx_ring->desc) {
 		vfree(rx_ring->buffer_info);
 		return -ENOMEM;

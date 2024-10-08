@@ -296,6 +296,8 @@ struct key *key_alloc(struct key_type *type, const char *desc,
 
 	if (!(flags & KEY_ALLOC_NOT_IN_QUOTA))
 		key->flags |= 1 << KEY_FLAG_IN_QUOTA;
+	if (flags & KEY_ALLOC_TRUSTED)
+		key->flags |= 1 << KEY_FLAG_TRUSTED;
 
 #ifdef KEY_DEBUGGING
 	key->magic = KEY_DEBUG_MAGIC;
@@ -403,7 +405,7 @@ static int __key_instantiate_and_link(struct key *key,
 				      struct key_preparsed_payload *prep,
 				      struct key *keyring,
 				      struct key *authkey,
-				      unsigned long *_prealloc)
+				      struct assoc_array_edit **_edit)
 {
 	int ret, awaken;
 
@@ -430,7 +432,7 @@ static int __key_instantiate_and_link(struct key *key,
 
 			/* and link it into the destination keyring */
 			if (keyring)
-				__key_link(keyring, key, _prealloc);
+				__key_link(key, _edit);
 
 			/* disable the authorisation key */
 			if (authkey)
@@ -470,7 +472,7 @@ int key_instantiate_and_link(struct key *key,
 			     struct key *authkey)
 {
 	struct key_preparsed_payload prep;
-	unsigned long prealloc;
+	struct assoc_array_edit *edit;
 	int ret;
 
 	memset(&prep, 0, sizeof(prep));
@@ -484,16 +486,15 @@ int key_instantiate_and_link(struct key *key,
 	}
 
 	if (keyring) {
-		ret = __key_link_begin(keyring, &key->index_key, &prealloc);
+		ret = __key_link_begin(keyring, &key->index_key, &edit);
 		if (ret < 0)
 			goto error_free_preparse;
 	}
 
-	ret = __key_instantiate_and_link(key, &prep, keyring, authkey,
-					 &prealloc);
+	ret = __key_instantiate_and_link(key, &prep, keyring, authkey, &edit);
 
 	if (keyring)
-		__key_link_end(keyring, &key->index_key, prealloc);
+		__key_link_end(keyring, &key->index_key, edit);
 
 error_free_preparse:
 	if (key->type->preparse)
@@ -531,7 +532,7 @@ int key_reject_and_link(struct key *key,
 			struct key *keyring,
 			struct key *authkey)
 {
-	unsigned long prealloc;
+	struct assoc_array_edit *edit;
 	struct timespec now;
 	int ret, awaken, link_ret = 0;
 
@@ -542,7 +543,7 @@ int key_reject_and_link(struct key *key,
 	ret = -EBUSY;
 
 	if (keyring)
-		link_ret = __key_link_begin(keyring, &key->index_key, &prealloc);
+		link_ret = __key_link_begin(keyring, &key->index_key, &edit);
 
 	mutex_lock(&key_construction_mutex);
 
@@ -550,9 +551,10 @@ int key_reject_and_link(struct key *key,
 	if (!test_bit(KEY_FLAG_INSTANTIATED, &key->flags)) {
 		/* mark the key as being negatively instantiated */
 		atomic_inc(&key->user->nikeys);
+		key->type_data.reject_error = -error;
+		smp_wmb();
 		set_bit(KEY_FLAG_NEGATIVE, &key->flags);
 		set_bit(KEY_FLAG_INSTANTIATED, &key->flags);
-		key->type_data.reject_error = -error;
 		now = current_kernel_time();
 		key->expiry = now.tv_sec + timeout;
 		key_schedule_gc(key->expiry + key_gc_delay);
@@ -564,7 +566,7 @@ int key_reject_and_link(struct key *key,
 
 		/* and link it into the destination keyring */
 		if (keyring && link_ret == 0)
-			__key_link(keyring, key, &prealloc);
+			__key_link(key, &edit);
 
 		/* disable the authorisation key */
 		if (authkey)
@@ -574,7 +576,7 @@ int key_reject_and_link(struct key *key,
 	mutex_unlock(&key_construction_mutex);
 
 	if (keyring)
-		__key_link_end(keyring, &key->index_key, prealloc);
+		__key_link_end(keyring, &key->index_key, edit);
 
 	/* wake up anyone waiting for a key to be constructed */
 	if (awaken)
@@ -777,8 +779,8 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
 		.description	= description,
 	};
 	struct key_preparsed_payload prep;
+	struct assoc_array_edit *edit;
 	const struct cred *cred = current_cred();
-	unsigned long prealloc;
 	struct key *keyring, *key = NULL;
 	key_ref_t key_ref;
 	int ret;
@@ -808,6 +810,7 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
 	prep.data = payload;
 	prep.datalen = plen;
 	prep.quotalen = index_key.type->def_datalen;
+	prep.trusted = flags & KEY_ALLOC_TRUSTED;
 	if (index_key.type->preparse) {
 		ret = index_key.type->preparse(&prep);
 		if (ret < 0) {
@@ -822,7 +825,12 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
 	}
 	index_key.desc_len = strlen(index_key.description);
 
-	ret = __key_link_begin(keyring, &index_key, &prealloc);
+	key_ref = ERR_PTR(-EPERM);
+	if (!prep.trusted && test_bit(KEY_FLAG_TRUSTED_ONLY, &keyring->flags))
+		goto error_free_prep;
+	flags |= prep.trusted ? KEY_ALLOC_TRUSTED : 0;
+
+	ret = __key_link_begin(keyring, &index_key, &edit);
 	if (ret < 0) {
 		key_ref = ERR_PTR(ret);
 		goto error_free_prep;
@@ -841,8 +849,8 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
 	 * update that instead if possible
 	 */
 	if (index_key.type->update) {
-		key_ref = __keyring_search_one(keyring_ref, &index_key);
-		if (!IS_ERR(key_ref))
+		key_ref = find_key_to_update(keyring_ref, &index_key);
+		if (key_ref)
 			goto found_matching_key;
 	}
 
@@ -868,7 +876,7 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
 	}
 
 	/* instantiate it and link it into the target keyring */
-	ret = __key_instantiate_and_link(key, &prep, keyring, NULL, &prealloc);
+	ret = __key_instantiate_and_link(key, &prep, keyring, NULL, &edit);
 	if (ret < 0) {
 		key_put(key);
 		key_ref = ERR_PTR(ret);
@@ -878,7 +886,7 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
 	key_ref = make_key_ref(key, is_key_possessed(keyring_ref));
 
 error_link_end:
-	__key_link_end(keyring, &index_key, prealloc);
+	__key_link_end(keyring, &index_key, edit);
 error_free_prep:
 	if (index_key.type->preparse)
 		index_key.type->free_preparse(&prep);
@@ -891,7 +899,7 @@ error:
 	/* we found a matching key, so we're going to try to update it
 	 * - we can drop the locks first as we have the key pinned
 	 */
-	__key_link_end(keyring, &index_key, prealloc);
+	__key_link_end(keyring, &index_key, edit);
 
 	key_ref = __key_update(key_ref, &prep);
 	goto error_free_prep;

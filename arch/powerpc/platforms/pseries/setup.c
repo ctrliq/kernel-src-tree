@@ -183,7 +183,7 @@ static void __init pseries_mpic_init_IRQ(void)
 	np = of_find_node_by_path("/");
 	naddr = of_n_addr_cells(np);
 	opprop = of_get_property(np, "platform-open-pic", &opplen);
-	if (opprop != 0) {
+	if (opprop != NULL) {
 		openpic_addr = of_read_number(opprop, naddr);
 		printk(KERN_DEBUG "OpenPIC addr: %lx\n", openpic_addr);
 	}
@@ -443,6 +443,13 @@ static void pSeries_machine_kexec(struct kimage *image)
 
 static void __init pSeries_setup_arch(void)
 {
+	/* Power5 is unsupported in RHEL7 */
+	if (!strncmp(cur_cpu_spec->platform, "power5", 6))
+		mark_hardware_unsupported("Power5 Processor");
+	/* Power6 is unsupported in RHEL7 */
+	if (!strncmp(cur_cpu_spec->platform, "power6", 6))
+		mark_hardware_unsupported("Power6 Processor");
+
 	panic_timeout = 10;
 
 	/* Discover PIC type and setup ppc_md accordingly */

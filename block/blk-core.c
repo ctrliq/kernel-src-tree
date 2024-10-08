@@ -111,7 +111,6 @@ void blk_rq_init(struct request_queue *q, struct request *rq)
 	rq->cmd = rq->__cmd;
 	rq->cmd_len = BLK_MAX_CDB;
 	rq->tag = -1;
-	rq->ref_count = 1;
 	rq->start_time = jiffies;
 	set_start_time_ns(rq);
 	rq->part = NULL;
@@ -630,10 +629,12 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 	init_waitqueue_head(&q->mq_freeze_wq);
 
 	if (blkcg_init_queue(q))
-		goto fail_id;
+		goto fail_bdi;
 
 	return q;
 
+fail_bdi:
+	bdi_destroy(&q->backing_dev_info);
 fail_id:
 	ida_simple_remove(&blk_queue_ida, q->id);
 fail_c:
@@ -716,7 +717,6 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
 
 	q->request_fn		= rfn;
 	q->prep_rq_fn		= NULL;
-	q->unprep_rq_fn		= NULL;
 	q->queue_flags		|= QUEUE_FLAG_DEFAULT;
 
 	/* Override internal queue lock with supplied lock pointer */
@@ -1283,8 +1283,6 @@ static inline void blk_pm_put_request(struct request *rq) {}
 void __blk_put_request(struct request_queue *q, struct request *req)
 {
 	if (unlikely(!q))
-		return;
-	if (unlikely(--req->ref_count))
 		return;
 
 	if (q->mq_ops) {
@@ -2293,6 +2291,7 @@ void blk_start_request(struct request *req)
 	if (unlikely(blk_bidi_rq(req)))
 		req->next_rq->resid_len = blk_rq_bytes(req->next_rq);
 
+	BUG_ON(test_bit(REQ_ATOM_COMPLETE, &req->atomic_flags));
 	blk_add_timer(req);
 }
 EXPORT_SYMBOL(blk_start_request);
@@ -2378,6 +2377,12 @@ bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
 			break;
 		case -EBADE:
 			error_type = "critical nexus";
+			break;
+		case -ENOSPC:
+			error_type = "critical space allocation";
+			break;
+		case -ENODATA:
+			error_type = "critical medium";
 			break;
 		case -EIO:
 		default:
@@ -2475,18 +2480,12 @@ static bool blk_update_bidi_request(struct request *rq, int error,
  * @req:	the request
  *
  * This function makes a request ready for complete resubmission (or
- * completion).  It happens only after all error handling is complete,
- * so represents the appropriate moment to deallocate any resources
- * that were allocated to the request in the prep_rq_fn.  The queue
- * lock is held when calling this.
+ * completion).  It happens only after all error handling is complete.
+ * The queue lock is held when calling this.
  */
 void blk_unprep_request(struct request *req)
 {
-	struct request_queue *q = req->q;
-
 	req->cmd_flags &= ~REQ_DONTPREP;
-	if (q->unprep_rq_fn)
-		q->unprep_rq_fn(q, req);
 }
 EXPORT_SYMBOL_GPL(blk_unprep_request);
 

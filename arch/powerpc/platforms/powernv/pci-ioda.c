@@ -13,6 +13,7 @@
 
 #include <linux/kernel.h>
 #include <linux/pci.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/string.h>
 #include <linux/init.h>
@@ -32,6 +33,7 @@
 #include <asm/iommu.h>
 #include <asm/tce.h>
 #include <asm/xics.h>
+#include <asm/debug.h>
 
 #include "powernv.h"
 #include "pci.h"
@@ -1002,11 +1004,32 @@ static void pnv_pci_ioda_setup_DMA(void)
 	}
 }
 
+static void pnv_pci_ioda_create_dbgfs(void)
+{
+#ifdef CONFIG_DEBUG_FS
+	struct pci_controller *hose, *tmp;
+	struct pnv_phb *phb;
+	char name[16];
+
+	list_for_each_entry_safe(hose, tmp, &hose_list, list_node) {
+		phb = hose->private_data;
+
+		sprintf(name, "PCI%04x", hose->global_number);
+		phb->dbgfs = debugfs_create_dir(name, powerpc_debugfs_root);
+		if (!phb->dbgfs)
+			pr_warning("%s: Error on creating debugfs on PHB#%x\n",
+				__func__, hose->global_number);
+	}
+#endif /* CONFIG_DEBUG_FS */
+}
+
 static void pnv_pci_ioda_fixup(void)
 {
 	pnv_pci_ioda_setup_PEs();
 	pnv_pci_ioda_setup_seg();
 	pnv_pci_ioda_setup_DMA();
+
+	pnv_pci_ioda_create_dbgfs();
 
 #ifdef CONFIG_EEH
 	eeh_probe_mode_set(EEH_PROBE_MODE_DEV);
@@ -1160,12 +1183,13 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 		pr_err("  Failed to map registers !\n");
 
 	/* Initialize more IODA stuff */
+	phb->ioda.total_pe = 1;
 	prop32 = of_get_property(np, "ibm,opal-num-pes", NULL);
-	if (!prop32)
-		phb->ioda.total_pe = 1;
-	else
+	if (prop32)
 		phb->ioda.total_pe = be32_to_cpup(prop32);
-
+	prop32 = of_get_property(np, "ibm,opal-reserved-pe", NULL);
+	if (prop32)
+		phb->ioda.reserved_pe = be32_to_cpup(prop32);
 	phb->ioda.m32_size = resource_size(&hose->mem_resources[0]);
 	/* FW Has already off top 64k of M32 space (MSI space) */
 	phb->ioda.m32_size += 0x10000;
@@ -1194,7 +1218,7 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 	if (phb->type == PNV_PHB_IODA1)
 		phb->ioda.io_segmap = aux + iomap_off;
 	phb->ioda.pe_array = aux + pemap_off;
-	set_bit(0, phb->ioda.pe_alloc);
+	set_bit(phb->ioda.reserved_pe, phb->ioda.pe_alloc);
 
 	INIT_LIST_HEAD(&phb->ioda.pe_dma_list);
 	INIT_LIST_HEAD(&phb->ioda.pe_list);
@@ -1219,8 +1243,10 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 					 segment_size);
 #endif
 
-	pr_info("  %d PE's M32: 0x%x [segment=0x%x] IO: 0x%x [segment=0x%x]\n",
+	pr_info("  %d (%d) PE's M32: 0x%x [segment=0x%x]"
+		" IO: 0x%x [segment=0x%x]\n",
 		phb->ioda.total_pe,
+		phb->ioda.reserved_pe,
 		phb->ioda.m32_size, phb->ioda.m32_segsize,
 		phb->ioda.io_size, phb->ioda.io_segsize);
 
@@ -1257,13 +1283,6 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 	rc = opal_pci_reset(phb_id, OPAL_PCI_IODA_TABLE_RESET, OPAL_ASSERT_RESET);
 	if (rc)
 		pr_warning("  OPAL Error %ld performing IODA table reset !\n", rc);
-
-	/*
-	 * On IODA1 map everything to PE#0, on IODA2 we assume the IODA reset
-	 * has cleared the RTT which has the same effect
-	 */
-	if (ioda_type == PNV_PHB_IODA1)
-		opal_pci_set_pe(phb_id, 0, 0, 7, 1, 1 , OPAL_MAP_PE);
 }
 
 void pnv_pci_init_ioda2_phb(struct device_node *np)

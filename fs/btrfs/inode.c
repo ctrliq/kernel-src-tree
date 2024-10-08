@@ -4480,7 +4480,7 @@ void btrfs_evict_inode(struct inode *inode)
 
 	trace_btrfs_inode_evict(inode);
 
-	truncate_inode_pages(&inode->i_data, 0);
+	truncate_inode_pages_final(&inode->i_data);
 	if (inode->i_nlink &&
 	    ((btrfs_root_refs(&root->root_item) != 0 &&
 	      root->root_key.objectid != BTRFS_ROOT_TREE_OBJECTID) ||
@@ -5157,14 +5157,30 @@ next:
 	}
 
 	/* Reached end of directory/root. Bump pos past the last item. */
-	if (key_type == BTRFS_DIR_INDEX_KEY)
-		/*
-		 * 32-bit glibc will use getdents64, but then strtol -
-		 * so the last number we can serve is this.
-		 */
-		filp->f_pos = 0x7fffffff;
-	else
-		filp->f_pos++;
+	filp->f_pos++;
+	/*
+	 * Stop new entries from being returned after we return the last
+	 * entry.
+	 *
+	 * New directory entries are assigned a strictly increasing
+	 * offset.  This means that new entries created during readdir
+	 * are *guaranteed* to be seen in the future by that readdir.
+	 * This has broken buggy programs which operate on names as
+	 * they're returned by readdir.  Until we re-use freed offsets
+	 * we have this hack to stop new entries from being returned
+	 * under the assumption that they'll never reach this huge
+	 * offset.
+	 *
+	 * This is being careful not to overflow 32bit loff_t unless the
+	 * last entry requires it because doing so has broken 32bit apps
+	 * in the past.
+	 */
+	if (key_type == BTRFS_DIR_INDEX_KEY) {
+		if (filp->f_pos >= INT_MAX)
+			filp->f_pos = LLONG_MAX;
+		else
+			filp->f_pos = INT_MAX;
+		}
 nopos:
 	ret = 0;
 err:
@@ -7807,6 +7823,14 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
 	return inode;
 }
 
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+void btrfs_test_destroy_inode(struct inode *inode)
+{
+	btrfs_drop_extent_cache(inode, 0, (u64)-1, 0);
+	kmem_cache_free(btrfs_inode_cachep, BTRFS_I(inode));
+}
+#endif
+
 static void btrfs_i_callback(struct rcu_head *head)
 {
 	struct inode *inode = container_of(head, struct inode, i_rcu);
@@ -8006,7 +8030,7 @@ static int btrfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 
 	/* check for collisions, even if the  name isn't there */
-	ret = btrfs_check_dir_item_collision(root, new_dir->i_ino,
+	ret = btrfs_check_dir_item_collision(dest, new_dir->i_ino,
 			     new_dentry->d_name.name,
 			     new_dentry->d_name.len);
 

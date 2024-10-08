@@ -27,8 +27,6 @@ static LIST_HEAD(all_q_list);
 
 static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx);
 
-DEFINE_PER_CPU(struct llist_head, ipi_lists);
-
 static struct blk_mq_ctx *__blk_mq_get_ctx(struct request_queue *q,
 					   unsigned int cpu)
 {
@@ -285,38 +283,10 @@ void blk_mq_free_request(struct request *rq)
 	__blk_mq_free_request(hctx, ctx, rq);
 }
 
-static void blk_mq_bio_endio(struct request *rq, struct bio *bio, int error)
+bool blk_mq_end_io_partial(struct request *rq, int error, unsigned int nr_bytes)
 {
-	if (error)
-		clear_bit(BIO_UPTODATE, &bio->bi_flags);
-	else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
-		error = -EIO;
-
-	if (unlikely(rq->cmd_flags & REQ_QUIET))
-		set_bit(BIO_QUIET, &bio->bi_flags);
-
-	/* don't actually finish bio if it's part of flush sequence */
-	if (!(rq->cmd_flags & REQ_FLUSH_SEQ))
-		bio_endio(bio, error);
-}
-
-void blk_mq_complete_request(struct request *rq, int error)
-{
-	struct bio *bio = rq->bio;
-	unsigned int bytes = 0;
-
-	trace_block_rq_complete(rq->q, rq);
-
-	while (bio) {
-		struct bio *next = bio->bi_next;
-
-		bio->bi_next = NULL;
-		bytes += bio->bi_size;
-		blk_mq_bio_endio(rq, bio, error);
-		bio = next;
-	}
-
-	blk_account_io_completion(rq, bytes);
+	if (blk_update_request(rq, error, blk_rq_bytes(rq)))
+		return true;
 
 	blk_account_io_done(rq);
 
@@ -324,86 +294,55 @@ void blk_mq_complete_request(struct request *rq, int error)
 		rq->end_io(rq, error);
 	else
 		blk_mq_free_request(rq);
-}
-
-void __blk_mq_end_io(struct request *rq, int error)
-{
-	if (!blk_mark_rq_complete(rq))
-		blk_mq_complete_request(rq, error);
-}
-
-#if defined(CONFIG_SMP) && defined(CONFIG_USE_GENERIC_SMP_HELPERS)
-
-/*
- * Called with interrupts disabled.
- */
-static void ipi_end_io(void *data)
-{
-	struct llist_head *list = &per_cpu(ipi_lists, smp_processor_id());
-	struct llist_node *entry, *next;
-	struct request *rq;
-
-	entry = llist_del_all(list);
-
-	while (entry) {
-		next = entry->next;
-		rq = llist_entry(entry, struct request, ll_list);
-		__blk_mq_end_io(rq, rq->errors);
-		entry = next;
-	}
-}
-
-static int ipi_remote_cpu(struct blk_mq_ctx *ctx, const int cpu,
-			  struct request *rq, const int error)
-{
-	struct call_single_data *data = &rq->csd;
-
-	rq->errors = error;
-	rq->ll_list.next = NULL;
-
-	/*
-	 * If the list is non-empty, an existing IPI must already
-	 * be "in flight". If that is the case, we need not schedule
-	 * a new one.
-	 */
-	if (llist_add(&rq->ll_list, &per_cpu(ipi_lists, ctx->cpu))) {
-		data->func = ipi_end_io;
-		data->flags = 0;
-		__smp_call_function_single(ctx->cpu, data, 0);
-	}
-
-	return true;
-}
-#else /* CONFIG_SMP && CONFIG_USE_GENERIC_SMP_HELPERS */
-static int ipi_remote_cpu(struct blk_mq_ctx *ctx, const int cpu,
-			  struct request *rq, const int error)
-{
 	return false;
 }
-#endif
+EXPORT_SYMBOL(blk_mq_end_io_partial);
 
-/*
- * End IO on this request on a multiqueue enabled driver. We'll either do
- * it directly inline, or punt to a local IPI handler on the matching
- * remote CPU.
- */
-void blk_mq_end_io(struct request *rq, int error)
+static void __blk_mq_complete_request_remote(void *data)
+{
+	struct request *rq = data;
+
+	rq->q->softirq_done_fn(rq);
+}
+
+void __blk_mq_complete_request(struct request *rq)
 {
 	struct blk_mq_ctx *ctx = rq->mq_ctx;
 	int cpu;
 
-	if (!ctx->ipi_redirect)
-		return __blk_mq_end_io(rq, error);
+	if (!ctx->ipi_redirect) {
+		rq->q->softirq_done_fn(rq);
+		return;
+	}
 
 	cpu = get_cpu();
-
-	if (cpu == ctx->cpu || !cpu_online(ctx->cpu) ||
-	    !ipi_remote_cpu(ctx, cpu, rq, error))
-		__blk_mq_end_io(rq, error);
-
+	if (cpu != ctx->cpu && cpu_online(ctx->cpu)) {
+		rq->csd.func = __blk_mq_complete_request_remote;
+		rq->csd.info = rq;
+		rq->csd.flags = 0;
+		__smp_call_function_single(ctx->cpu, &rq->csd, 0);
+	} else {
+		rq->q->softirq_done_fn(rq);
+	}
 	put_cpu();
 }
-EXPORT_SYMBOL(blk_mq_end_io);
+
+/**
+ * blk_mq_complete_request - end I/O on a request
+ * @rq:		the request being processed
+ *
+ * Description:
+ *	Ends all I/O on a request. It does not handle partial completions.
+ *	The actual completion happens out-of-order, through a IPI handler.
+ **/
+void blk_mq_complete_request(struct request *rq)
+{
+	if (unlikely(blk_should_fake_timeout(rq->q)))
+		return;
+	if (!blk_mark_rq_complete(rq))
+		__blk_mq_complete_request(rq);
+}
+EXPORT_SYMBOL(blk_mq_complete_request);
 
 static void blk_mq_start_request(struct request *rq, bool last)
 {
@@ -758,60 +697,27 @@ static void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx,
 	blk_mq_add_timer(rq);
 }
 
-void blk_mq_insert_request(struct request_queue *q, struct request *rq,
-			   bool at_head, bool run_queue)
-{
-	struct blk_mq_hw_ctx *hctx;
-	struct blk_mq_ctx *ctx, *current_ctx;
-
-	ctx = rq->mq_ctx;
-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
-
-	if (rq->cmd_flags & (REQ_FLUSH | REQ_FUA)) {
-		blk_insert_flush(rq);
-	} else {
-		current_ctx = blk_mq_get_ctx(q);
-
-		if (!cpu_online(ctx->cpu)) {
-			ctx = current_ctx;
-			hctx = q->mq_ops->map_queue(q, ctx->cpu);
-			rq->mq_ctx = ctx;
-		}
-		spin_lock(&ctx->lock);
-		__blk_mq_insert_request(hctx, rq, at_head);
-		spin_unlock(&ctx->lock);
-
-		blk_mq_put_ctx(current_ctx);
-	}
-
-	if (run_queue)
-		__blk_mq_run_hw_queue(hctx);
-}
-EXPORT_SYMBOL(blk_mq_insert_request);
-
-/*
- * This is a special version of blk_mq_insert_request to bypass FLUSH request
- * check. Should only be used internally.
- */
-void blk_mq_run_request(struct request *rq, bool run_queue, bool async)
+void blk_mq_insert_request(struct request *rq, bool at_head, bool run_queue,
+		bool async)
 {
 	struct request_queue *q = rq->q;
 	struct blk_mq_hw_ctx *hctx;
-	struct blk_mq_ctx *ctx, *current_ctx;
+	struct blk_mq_ctx *ctx = rq->mq_ctx, *current_ctx;
 
 	current_ctx = blk_mq_get_ctx(q);
+	if (!cpu_online(ctx->cpu))
+		rq->mq_ctx = ctx = current_ctx;
 
-	ctx = rq->mq_ctx;
-	if (!cpu_online(ctx->cpu)) {
-		ctx = current_ctx;
-		rq->mq_ctx = ctx;
-	}
 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
 
-	/* ctx->cpu might be offline */
-	spin_lock(&ctx->lock);
-	__blk_mq_insert_request(hctx, rq, false);
-	spin_unlock(&ctx->lock);
+	if (rq->cmd_flags & (REQ_FLUSH | REQ_FUA) &&
+	    !(rq->cmd_flags & (REQ_FLUSH_SEQ))) {
+		blk_insert_flush(rq);
+	} else {
+		spin_lock(&ctx->lock);
+		__blk_mq_insert_request(hctx, rq, at_head);
+		spin_unlock(&ctx->lock);
+	}
 
 	blk_mq_put_ctx(current_ctx);
 
@@ -1413,6 +1319,9 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_reg *reg,
 	if (reg->timeout)
 		blk_queue_rq_timeout(q, reg->timeout);
 
+	if (reg->ops->complete)
+		blk_queue_softirq_done(q, reg->ops->complete);
+
 	blk_mq_init_flush(q);
 	blk_mq_init_cpu_queues(q, reg->nr_hw_queues);
 
@@ -1521,11 +1430,6 @@ static int __cpuinit blk_mq_queue_reinit_notify(struct notifier_block *nb,
 
 static int __init blk_mq_init(void)
 {
-	unsigned int i;
-
-	for_each_possible_cpu(i)
-		init_llist_head(&per_cpu(ipi_lists, i));
-
 	blk_mq_cpu_init();
 
 	/* Must be called after percpu_counter_hotcpu_callback() */

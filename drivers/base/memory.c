@@ -158,6 +158,8 @@ static ssize_t show_mem_removable(struct device *dev,
 		container_of(dev, struct memory_block, dev);
 
 	for (i = 0; i < sections_per_block; i++) {
+		if (!present_section_nr(mem->start_section_nr + i))
+			continue;
 		pfn = section_nr_to_pfn(mem->start_section_nr + i);
 		ret &= is_mem_section_removable(pfn, PAGES_PER_SECTION);
 	}
@@ -291,13 +293,7 @@ static int __memory_block_change_state(struct memory_block *mem,
 		mem->state = MEM_GOING_OFFLINE;
 
 	ret = memory_block_action(mem->start_section_nr, to_state, online_type);
-	if (ret) {
-		mem->state = from_state_req;
-	} else {
-		mem->state = to_state;
-		if (to_state == MEM_ONLINE)
-			mem->last_online = online_type;
-	}
+	mem->state = ret ? from_state_req : to_state;
 	return ret;
 }
 
@@ -310,7 +306,7 @@ static int memory_subsys_online(struct device *dev)
 
 	ret = mem->state == MEM_ONLINE ? 0 :
 		__memory_block_change_state(mem, MEM_ONLINE, MEM_OFFLINE,
-					    mem->last_online);
+					    ONLINE_KEEP);
 
 	mutex_unlock(&mem->state_mutex);
 	return ret;
@@ -618,7 +614,6 @@ static int init_memory_block(struct memory_block **memory,
 			base_memory_block_id(scn_nr) * sections_per_block;
 	mem->end_section_nr = mem->start_section_nr + sections_per_block - 1;
 	mem->state = state;
-	mem->last_online = ONLINE_KEEP;
 	mem->section_count++;
 	mutex_init(&mem->state_mutex);
 	start_pfn = section_nr_to_pfn(mem->start_section_nr);
@@ -734,27 +729,6 @@ int unregister_memory_section(struct mem_section *section)
 	return remove_memory_block(0, section, 0);
 }
 #endif /* CONFIG_MEMORY_HOTREMOVE */
-
-/*
- * offline one memory block. If the memory block has been offlined, do nothing.
- *
- * Call under device_hotplug_lock.
- */
-int offline_memory_block(struct memory_block *mem)
-{
-	int ret = 0;
-
-	mutex_lock(&mem->state_mutex);
-	if (mem->state != MEM_OFFLINE) {
-		ret = __memory_block_change_state_uevent(mem, MEM_OFFLINE,
-							 MEM_ONLINE, -1);
-		if (!ret)
-			mem->dev.offline = true;
-	}
-	mutex_unlock(&mem->state_mutex);
-
-	return ret;
-}
 
 /* return true if the memory block is offlined, otherwise, return false */
 bool is_memblock_offlined(struct memory_block *mem)

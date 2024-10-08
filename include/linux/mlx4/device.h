@@ -165,7 +165,8 @@ enum {
 	MLX4_DEV_CAP_FLAG2_VLAN_CONTROL		= 1LL <<  6,
 	MLX4_DEV_CAP_FLAG2_FSM			= 1LL <<  7,
 	MLX4_DEV_CAP_FLAG2_UPDATE_QP		= 1LL <<  8,
-	MLX4_DEV_CAP_FLAG2_VXLAN_OFFLOADS	= 1LL <<  9
+	MLX4_DEV_CAP_FLAG2_VXLAN_OFFLOADS	= 1LL <<  9,
+	MLX4_DEV_CAP_FLAG2_DMFS_IPOIB		= 1LL << 10
 };
 
 enum {
@@ -842,7 +843,7 @@ void mlx4_xrcd_free(struct mlx4_dev *dev, u32 xrcdn);
 
 int mlx4_uar_alloc(struct mlx4_dev *dev, struct mlx4_uar *uar);
 void mlx4_uar_free(struct mlx4_dev *dev, struct mlx4_uar *uar);
-int mlx4_bf_alloc(struct mlx4_dev *dev, struct mlx4_bf *bf);
+int mlx4_bf_alloc(struct mlx4_dev *dev, struct mlx4_bf *bf, int node);
 void mlx4_bf_free(struct mlx4_dev *dev, struct mlx4_bf *bf);
 
 int mlx4_mtt_init(struct mlx4_dev *dev, int npages, int page_shift,
@@ -1130,6 +1131,7 @@ int mlx4_SET_PORT_PRIO2TC(struct mlx4_dev *dev, u8 port, u8 *prio2tc);
 int mlx4_SET_PORT_SCHEDULER(struct mlx4_dev *dev, u8 port, u8 *tc_tx_bw,
 		u8 *pg, u16 *ratelimit);
 int mlx4_SET_PORT_VXLAN(struct mlx4_dev *dev, u8 port, u8 steering);
+int mlx4_find_cached_mac(struct mlx4_dev *dev, u8 port, u64 mac, int *idx);
 int mlx4_find_cached_vlan(struct mlx4_dev *dev, u8 port, u16 vid, int *idx);
 int mlx4_register_vlan(struct mlx4_dev *dev, u8 port, u16 vlan, int *index);
 void mlx4_unregister_vlan(struct mlx4_dev *dev, u8 port, u16 vlan);
@@ -1179,6 +1181,9 @@ int set_and_calc_slave_port_state(struct mlx4_dev *dev, int slave, u8 port, int 
 
 void mlx4_put_slave_node_guid(struct mlx4_dev *dev, int slave, __be64 guid);
 __be64 mlx4_get_slave_node_guid(struct mlx4_dev *dev, int slave);
+
+int mlx4_FLOW_STEERING_IB_UC_QP_RANGE(struct mlx4_dev *dev, u32 min_range_qpn,
+				      u32 max_range_qpn);
 
 cycle_t mlx4_read_clock(struct mlx4_dev *dev);
 

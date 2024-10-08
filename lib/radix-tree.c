@@ -305,7 +305,8 @@ static int radix_tree_extend(struct radix_tree_root *root, unsigned long index)
 
 		/* Increase the height.  */
 		newheight = root->height+1;
-		node->height = newheight;
+		BUG_ON(newheight & ~RADIX_TREE_HEIGHT_MASK);
+		node->path = newheight;
 		node->count = 1;
 		node->parent = NULL;
 		slot = root->rnode;
@@ -363,11 +364,12 @@ int __radix_tree_create(struct radix_tree_root *root, unsigned long index,
 			/* Have to add a child node.  */
 			if (!(slot = radix_tree_node_alloc(root)))
 				return -ENOMEM;
-			slot->height = height;
+			slot->path = height;
 			slot->parent = node;
 			if (node) {
 				rcu_assign_pointer(node->slots[offset], slot);
 				node->count++;
+				slot->path |= offset << RADIX_TREE_HEIGHT_SHIFT;
 			} else
 				rcu_assign_pointer(root->rnode, ptr_to_indirect(slot));
 		}
@@ -405,8 +407,6 @@ int radix_tree_insert(struct radix_tree_root *root,
 	BUG_ON(radix_tree_is_indirect_ptr(item));
 
 	error = __radix_tree_create(root, index, &node, &slot);
-	if (error)
-		return error;
 	if (*slot != NULL)
 		return -EEXIST;
 	rcu_assign_pointer(*slot, item);
@@ -461,7 +461,7 @@ void *__radix_tree_lookup(struct radix_tree_root *root, unsigned long index,
 	}
 	node = indirect_to_ptr(node);
 
-	height = node->height;
+	height = node->path & RADIX_TREE_HEIGHT_MASK;
 	if (index > radix_tree_maxindex(height))
 		return NULL;
 
@@ -667,7 +667,7 @@ int radix_tree_tag_get(struct radix_tree_root *root,
 		return (index == 0);
 	node = indirect_to_ptr(node);
 
-	height = node->height;
+	height = node->path & RADIX_TREE_HEIGHT_MASK;
 	if (index > radix_tree_maxindex(height))
 		return 0;
 
@@ -704,7 +704,7 @@ void **radix_tree_next_chunk(struct radix_tree_root *root,
 {
 	unsigned shift, tag = flags & RADIX_TREE_ITER_TAG_MASK;
 	struct radix_tree_node *rnode, *node;
-	unsigned long index, offset;
+	unsigned long index, offset, height;
 
 	if ((flags & RADIX_TREE_ITER_TAGGED) && !root_tag_get(root, tag))
 		return NULL;
@@ -735,7 +735,8 @@ void **radix_tree_next_chunk(struct radix_tree_root *root,
 		return NULL;
 
 restart:
-	shift = (rnode->height - 1) * RADIX_TREE_MAP_SHIFT;
+	height = rnode->path & RADIX_TREE_HEIGHT_MASK;
+	shift = (height - 1) * RADIX_TREE_MAP_SHIFT;
 	offset = index >> shift;
 
 	/* Index outside of the tree */
@@ -1105,7 +1106,7 @@ static unsigned long __locate(struct radix_tree_node *slot, void *item,
 	unsigned int shift, height;
 	unsigned long i;
 
-	height = slot->height;
+	height = slot->path & RADIX_TREE_HEIGHT_MASK;
 	shift = (height-1) * RADIX_TREE_MAP_SHIFT;
 
 	for ( ; height > 1; height--) {
@@ -1168,7 +1169,8 @@ unsigned long radix_tree_locate_item(struct radix_tree_root *root, void *item)
 		}
 
 		node = indirect_to_ptr(node);
-		max_index = radix_tree_maxindex(node->height);
+		max_index = radix_tree_maxindex(node->path &
+						RADIX_TREE_HEIGHT_MASK);
 		if (cur_index > max_index)
 			break;
 
@@ -1262,7 +1264,7 @@ static inline void radix_tree_shrink(struct radix_tree_root *root)
  *
  *	Returns %true if @node was freed, %false otherwise.
  */
-bool __radix_tree_delete_node(struct radix_tree_root *root, unsigned long index,
+bool __radix_tree_delete_node(struct radix_tree_root *root,
 			      struct radix_tree_node *node)
 {
 	bool deleted = false;
@@ -1281,9 +1283,10 @@ bool __radix_tree_delete_node(struct radix_tree_root *root, unsigned long index,
 
 		parent = node->parent;
 		if (parent) {
-			index >>= RADIX_TREE_MAP_SHIFT;
+			unsigned int offset;
 
-			parent->slots[index & RADIX_TREE_MAP_MASK] = NULL;
+			offset = node->path >> RADIX_TREE_HEIGHT_SHIFT;
+			parent->slots[offset] = NULL;
 			parent->count--;
 		} else {
 			root_tag_clear_all(root);
@@ -1347,7 +1350,7 @@ void *radix_tree_delete_item(struct radix_tree_root *root,
 	node->slots[offset] = NULL;
 	node->count--;
 
-	__radix_tree_delete_node(root, index, node);
+	__radix_tree_delete_node(root, node);
 
 	return entry;
 }
@@ -1380,9 +1383,12 @@ int radix_tree_tagged(struct radix_tree_root *root, unsigned int tag)
 EXPORT_SYMBOL(radix_tree_tagged);
 
 static void
-radix_tree_node_ctor(void *node)
+radix_tree_node_ctor(void *arg)
 {
-	memset(node, 0, sizeof(struct radix_tree_node));
+	struct radix_tree_node *node = arg;
+
+	memset(node, 0, sizeof(*node));
+	INIT_LIST_HEAD(&node->private_list);
 }
 
 static __init unsigned long __maxindex(unsigned int height)

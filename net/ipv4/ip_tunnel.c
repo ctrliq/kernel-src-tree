@@ -859,6 +859,10 @@ int ip_tunnel_init_net(struct net *net, int ip_tnl_net_id,
 
 	rtnl_lock();
 	itn->fb_tunnel_dev = __ip_tunnel_create(net, ops, &parms);
+
+	if (!IS_ERR(itn->fb_tunnel_dev))
+		ip_tunnel_add(itn, netdev_priv(itn->fb_tunnel_dev));
+
 	rtnl_unlock();
 
 	if (IS_ERR(itn->fb_tunnel_dev))

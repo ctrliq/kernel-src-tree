@@ -75,6 +75,7 @@ struct vfio_group {
 	struct notifier_block		nb;
 	struct list_head		vfio_next;
 	struct list_head		container_next;
+	atomic_t			opened;
 };
 
 struct vfio_device {
@@ -204,6 +205,7 @@ static struct vfio_group *vfio_create_group(struct iommu_group *iommu_group)
 	INIT_LIST_HEAD(&group->device_list);
 	mutex_init(&group->device_lock);
 	atomic_set(&group->container_users, 0);
+	atomic_set(&group->opened, 0);
 	group->iommu_group = iommu_group;
 
 	group->nb.notifier_call = vfio_iommu_group_notifier;
@@ -1106,7 +1108,7 @@ static int vfio_group_get_device_fd(struct vfio_group *group, char *buf)
 		 * We can't use anon_inode_getfd() because we need to modify
 		 * the f_mode flags directly to allow more than just ioctls
 		 */
-		ret = get_unused_fd();
+		ret = get_unused_fd_flags(O_CLOEXEC);
 		if (ret < 0) {
 			device->ops->release(device->device_data);
 			break;
@@ -1218,12 +1220,22 @@ static long vfio_group_fops_compat_ioctl(struct file *filep,
 static int vfio_group_fops_open(struct inode *inode, struct file *filep)
 {
 	struct vfio_group *group;
+	int opened;
 
 	group = vfio_group_get_from_minor(iminor(inode));
 	if (!group)
 		return -ENODEV;
 
+	/* Do we need multiple instances of the group open?  Seems not. */
+	opened = atomic_cmpxchg(&group->opened, 0, 1);
+	if (opened) {
+		vfio_group_put(group);
+		return -EBUSY;
+	}
+
+	/* Is something still in use from a previous open? */
 	if (group->container) {
+		atomic_dec(&group->opened);
 		vfio_group_put(group);
 		return -EBUSY;
 	}
@@ -1240,6 +1252,8 @@ static int vfio_group_fops_release(struct inode *inode, struct file *filep)
 	filep->private_data = NULL;
 
 	vfio_group_try_dissolve_container(group);
+
+	atomic_dec(&group->opened);
 
 	vfio_group_put(group);
 

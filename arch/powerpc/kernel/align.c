@@ -661,9 +661,9 @@ static int emulate_vsx(unsigned char __user *addr, unsigned int reg,
 	flush_vsx_to_thread(current);
 
 	if (reg < 32)
-		ptr = (char *) &current->thread.fpr[reg][0];
+		ptr = (char *) &current->thread.fp_state.fpr[reg][0];
 	else
-		ptr = (char *) &current->thread.vr[reg - 32];
+		ptr = (char *) &current->thread.vr_state.vr[reg - 32];
 
 	lptr = (unsigned long *) ptr;
 
@@ -810,6 +810,16 @@ int fix_alignment(struct pt_regs *regs)
 	nb = aligninfo[instr].len;
 	flags = aligninfo[instr].flags;
 
+	/* ldbrx/stdbrx overlap lfs/stfs in the DSISR unfortunately */
+	if (IS_XFORM(instruction) && ((instruction >> 1) & 0x3ff) == 532) {
+		nb = 8;
+		flags = LD+SW;
+	} else if (IS_XFORM(instruction) &&
+		   ((instruction >> 1) & 0x3ff) == 660) {
+		nb = 8;
+		flags = ST+SW;
+	}
+
 	/* Byteswap little endian loads and stores */
 	swiz = 0;
 	if ((regs->msr & MSR_LE) != (MSR_KERNEL & MSR_LE)) {
@@ -935,7 +945,7 @@ int fix_alignment(struct pt_regs *regs)
 			return -EFAULT;
 
 	} else if (flags & F) {
-		data.dd = current->thread.TS_FPR(reg);
+		data.ll = current->thread.TS_FPR(reg);
 		if (flags & S) {
 			/* Single-precision FP store requires conversion... */
 #ifdef CONFIG_PPC_FPU
@@ -1012,7 +1022,7 @@ int fix_alignment(struct pt_regs *regs)
 		if (unlikely(ret))
 			return -EFAULT;
 	} else if (flags & F)
-		current->thread.TS_FPR(reg) = data.dd;
+		current->thread.TS_FPR(reg) = data.ll;
 	else
 		regs->gpr[reg] = data.ll;
 

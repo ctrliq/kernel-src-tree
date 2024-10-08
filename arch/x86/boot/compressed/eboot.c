@@ -12,6 +12,7 @@
 #include <asm/efi.h>
 #include <asm/setup.h>
 #include <asm/desc.h>
+#include <asm/bootparam_utils.h>
 
 #undef memcpy			/* Use memcpy from misc.c */
 
@@ -421,6 +422,55 @@ void setup_graphics(struct boot_params *boot_params)
 }
 
 
+static int get_secure_boot(void)
+{
+	u8 sb, setup, moksbstate;
+	unsigned long datasize = sizeof(sb);
+	u32 attr;
+	efi_guid_t var_guid = EFI_GLOBAL_VARIABLE_GUID;
+	efi_status_t status;
+
+	status = efi_call_phys5(sys_table->runtime->get_variable,
+				L"SecureBoot", &var_guid, NULL, &datasize, &sb);
+
+	if (status != EFI_SUCCESS)
+		return 0;
+
+	if (sb == 0)
+		return 0;
+
+
+	status = efi_call_phys5(sys_table->runtime->get_variable,
+				L"SetupMode", &var_guid, NULL, &datasize,
+				&setup);
+
+	if (status != EFI_SUCCESS)
+		return 0;
+
+	if (setup == 1)
+		return 0;
+
+	/* See if a user has put shim into insecure_mode.  If so, and the variable
+	 * doesn't have the runtime attribute set, we might as well honor that.
+	 */
+	var_guid = EFI_SHIM_LOCK_GUID;
+	status = efi_call_phys5(sys_table->runtime->get_variable,
+				L"MokSBState", &var_guid, &attr, &datasize,
+				&moksbstate);
+
+	/* If it fails, we don't care why.  Default to secure */
+	if (status != EFI_SUCCESS)
+		return 1;
+
+	if (!(attr & EFI_VARIABLE_RUNTIME_ACCESS)) {
+		if (moksbstate == 1)
+			return 0;
+	}
+
+	return 1;
+}
+
+
 /*
  * Because the x86 boot code expects to be passed a boot_params we
  * need to create one ourselves (usually the bootloader would create
@@ -543,69 +593,47 @@ fail:
 	return NULL;
 }
 
-static efi_status_t exit_boot(struct boot_params *boot_params,
-			      void *handle)
+static void add_e820ext(struct boot_params *params,
+			struct setup_data *e820ext, u32 nr_entries)
 {
-	struct efi_info *efi = &boot_params->efi_info;
-	struct e820entry *e820_map = &boot_params->e820_map[0];
-	struct e820entry *prev = NULL;
-	unsigned long size, key, desc_size, _size;
-	efi_memory_desc_t *mem_map;
+	struct setup_data *data;
 	efi_status_t status;
-	__u32 desc_version;
-	u8 nr_entries;
+	unsigned long size;
+
+	e820ext->type = SETUP_E820_EXT;
+	e820ext->len = nr_entries * sizeof(struct e820entry);
+	e820ext->next = 0;
+
+	data = (struct setup_data *)(unsigned long)params->hdr.setup_data;
+
+	while (data && data->next)
+		data = (struct setup_data *)(unsigned long)data->next;
+
+	if (data)
+		data->next = (unsigned long)e820ext;
+	else
+		params->hdr.setup_data = (unsigned long)e820ext;
+}
+
+static efi_status_t setup_e820(struct boot_params *params,
+			       struct setup_data *e820ext, u32 e820ext_size)
+{
+	struct e820entry *e820_map = &params->e820_map[0];
+	struct efi_info *efi = &params->efi_info;
+	struct e820entry *prev = NULL;
+	u32 nr_entries;
+	u32 nr_desc;
 	int i;
 
-	size = sizeof(*mem_map) * 32;
-
-again:
-	size += sizeof(*mem_map);
-	_size = size;
-	status = efi_low_alloc(sys_table, size, 1, (unsigned long *)&mem_map);
-	if (status != EFI_SUCCESS)
-		return status;
-
-	status = efi_call_phys5(sys_table->boottime->get_memory_map, &size,
-				mem_map, &key, &desc_size, &desc_version);
-	if (status == EFI_BUFFER_TOO_SMALL) {
-		efi_free(sys_table, _size, (unsigned long)mem_map);
-		goto again;
-	}
-
-	if (status != EFI_SUCCESS)
-		goto free_mem_map;
-
-	memcpy(&efi->efi_loader_signature, EFI_LOADER_SIGNATURE, sizeof(__u32));
-	efi->efi_systab = (unsigned long)sys_table;
-	efi->efi_memdesc_size = desc_size;
-	efi->efi_memdesc_version = desc_version;
-	efi->efi_memmap = (unsigned long)mem_map;
-	efi->efi_memmap_size = size;
-
-#ifdef CONFIG_X86_64
-	efi->efi_systab_hi = (unsigned long)sys_table >> 32;
-	efi->efi_memmap_hi = (unsigned long)mem_map >> 32;
-#endif
-
-	/* Might as well exit boot services now */
-	status = efi_call_phys2(sys_table->boottime->exit_boot_services,
-				handle, key);
-	if (status != EFI_SUCCESS)
-		goto free_mem_map;
-
-	/* Historic? */
-	boot_params->alt_mem_k = 32 * 1024;
-
-	/*
-	 * Convert the EFI memory map to E820.
-	 */
 	nr_entries = 0;
-	for (i = 0; i < size / desc_size; i++) {
+	nr_desc = efi->efi_memmap_size / efi->efi_memdesc_size;
+
+	for (i = 0; i < nr_desc; i++) {
 		efi_memory_desc_t *d;
 		unsigned int e820_type = 0;
-		unsigned long m = (unsigned long)mem_map;
+		unsigned long m = efi->efi_memmap;
 
-		d = (efi_memory_desc_t *)(m + (i * desc_size));
+		d = (efi_memory_desc_t *)(m + (i * efi->efi_memdesc_size));
 		switch (d->type) {
 		case EFI_RESERVED_TYPE:
 		case EFI_RUNTIME_SERVICES_CODE:
@@ -642,23 +670,147 @@ again:
 
 		/* Merge adjacent mappings */
 		if (prev && prev->type == e820_type &&
-		    (prev->addr + prev->size) == d->phys_addr)
+		    (prev->addr + prev->size) == d->phys_addr) {
 			prev->size += d->num_pages << 12;
-		else {
-			e820_map->addr = d->phys_addr;
-			e820_map->size = d->num_pages << 12;
-			e820_map->type = e820_type;
-			prev = e820_map++;
-			nr_entries++;
+			continue;
 		}
+
+		if (nr_entries == ARRAY_SIZE(params->e820_map)) {
+			u32 need = (nr_desc - i) * sizeof(struct e820entry) +
+				   sizeof(struct setup_data);
+
+			if (!e820ext || e820ext_size < need)
+				return EFI_BUFFER_TOO_SMALL;
+
+			/* boot_params map full, switch to e820 extended */
+			e820_map = (struct e820entry *)e820ext->data;
+		}
+
+		e820_map->addr = d->phys_addr;
+		e820_map->size = d->num_pages << PAGE_SHIFT;
+		e820_map->type = e820_type;
+		prev = e820_map++;
+		nr_entries++;
 	}
 
-	boot_params->e820_entries = nr_entries;
+	if (nr_entries > ARRAY_SIZE(params->e820_map)) {
+		u32 nr_e820ext = nr_entries - ARRAY_SIZE(params->e820_map);
+
+		add_e820ext(params, e820ext, nr_e820ext);
+		nr_entries -= nr_e820ext;
+	}
+
+	params->e820_entries = (u8)nr_entries;
+
+	return EFI_SUCCESS;
+}
+
+static efi_status_t alloc_e820ext(u32 nr_desc, struct setup_data **e820ext,
+				  u32 *e820ext_size)
+{
+	efi_status_t status;
+	unsigned long size;
+
+	size = sizeof(struct setup_data) +
+		sizeof(struct e820entry) * nr_desc;
+
+	if (*e820ext) {
+		efi_call_phys1(sys_table->boottime->free_pool, *e820ext);
+		*e820ext = NULL;
+		*e820ext_size = 0;
+	}
+
+	status = efi_call_phys3(sys_table->boottime->allocate_pool,
+				EFI_LOADER_DATA, size, e820ext);
+
+	if (status == EFI_SUCCESS)
+		*e820ext_size = size;
+
+	return status;
+}
+
+static efi_status_t exit_boot(struct boot_params *boot_params,
+			      void *handle)
+{
+	struct efi_info *efi = &boot_params->efi_info;
+	unsigned long map_sz, key, desc_size;
+	efi_memory_desc_t *mem_map;
+	struct setup_data *e820ext;
+	__u32 e820ext_size;
+	__u32 nr_desc, prev_nr_desc;
+	efi_status_t status;
+	__u32 desc_version;
+	bool called_exit = false;
+	u8 nr_entries;
+	int i;
+
+	nr_desc = 0;
+	e820ext = NULL;
+	e820ext_size = 0;
+
+get_map:
+	status = efi_get_memory_map(sys_table, &mem_map, &map_sz, &desc_size,
+				    &desc_version, &key);
+
+	if (status != EFI_SUCCESS)
+		return status;
+
+	prev_nr_desc = nr_desc;
+	nr_desc = map_sz / desc_size;
+	if (nr_desc > prev_nr_desc &&
+	    nr_desc > ARRAY_SIZE(boot_params->e820_map)) {
+		u32 nr_e820ext = nr_desc - ARRAY_SIZE(boot_params->e820_map);
+
+		status = alloc_e820ext(nr_e820ext, &e820ext, &e820ext_size);
+		if (status != EFI_SUCCESS)
+			goto free_mem_map;
+
+		efi_call_phys1(sys_table->boottime->free_pool, mem_map);
+		goto get_map; /* Allocated memory, get map again */
+	}
+
+	memcpy(&efi->efi_loader_signature, EFI_LOADER_SIGNATURE, sizeof(__u32));
+	efi->efi_systab = (unsigned long)sys_table;
+	efi->efi_memdesc_size = desc_size;
+	efi->efi_memdesc_version = desc_version;
+	efi->efi_memmap = (unsigned long)mem_map;
+	efi->efi_memmap_size = map_sz;
+
+#ifdef CONFIG_X86_64
+	efi->efi_systab_hi = (unsigned long)sys_table >> 32;
+	efi->efi_memmap_hi = (unsigned long)mem_map >> 32;
+#endif
+
+	/* Might as well exit boot services now */
+	status = efi_call_phys2(sys_table->boottime->exit_boot_services,
+				handle, key);
+	if (status != EFI_SUCCESS) {
+		/*
+		 * ExitBootServices() will fail if any of the event
+		 * handlers change the memory map. In which case, we
+		 * must be prepared to retry, but only once so that
+		 * we're guaranteed to exit on repeated failures instead
+		 * of spinning forever.
+		 */
+		if (called_exit)
+			goto free_mem_map;
+
+		called_exit = true;
+		efi_call_phys1(sys_table->boottime->free_pool, mem_map);
+		goto get_map;
+	}
+
+	/* Historic? */
+	boot_params->alt_mem_k = 32 * 1024;
+
+	status = setup_e820(boot_params, e820ext, e820ext_size);
+	if (status != EFI_SUCCESS)
+		return status;
 
 	return EFI_SUCCESS;
 
 free_mem_map:
-	efi_free(sys_table, _size, (unsigned long)mem_map);
+	efi_call_phys1(sys_table->boottime->free_pool, mem_map);
 	return status;
 }
 
@@ -715,6 +867,10 @@ struct boot_params *efi_main(void *handle, efi_system_table_t *_table,
 	/* Check if we were booted by the EFI firmware */
 	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
 		goto fail;
+
+	sanitize_boot_params(boot_params);
+
+	boot_params->secure_boot = get_secure_boot();
 
 	setup_graphics(boot_params);
 

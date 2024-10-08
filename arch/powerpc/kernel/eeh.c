@@ -199,7 +199,7 @@ static size_t eeh_gather_pci_data(struct eeh_dev *edev, char * buf, size_t len)
 		       "EEH: PCI-E capabilities and status follow:\n");
 
 		for (i=0; i<=8; i++) {
-			eeh_ops->read_config(dn, cap+4*i, 4, &cfg);
+			eeh_ops->read_config(dn, dev->pcie_cap+4*i, 4, &cfg);
 			n += scnprintf(buf+n, len-n, "%02x:%x\n", 4*i, cfg);
 			printk(KERN_WARNING "EEH: PCI-E %02x: %08x\n", i, cfg);
 		}
@@ -332,7 +332,9 @@ static int eeh_phb_check_failure(struct eeh_pe *pe)
 	eeh_serialize_unlock(flags);
 	eeh_send_failure_event(phb_pe);
 
-	WARN(1, "EEH: PHB failure detected\n");
+	pr_err("EEH: PHB#%x failure detected\n",
+		phb_pe->phb->global_number);
+	dump_stack();
 
 	return 1;
 out:
@@ -447,7 +449,7 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
 	}
 
 	eeh_stats.slot_resets++;
- 
+
 	/* Avoid repeated reports of this failure, including problems
 	 * with other functions on this device, and functions under
 	 * bridges.
@@ -461,7 +463,10 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
 	 * a stack trace will help the device-driver authors figure
 	 * out what happened.  So print that out.
 	 */
-	WARN(1, "EEH: failure detected\n");
+	pr_err("EEH: Frozen PE#%x detected on PHB#%x\n",
+		pe->addr, pe->phb->global_number);
+	dump_stack();
+
 	return 1;
 
 dn_unlock:
@@ -602,7 +607,7 @@ static void eeh_reset_pe_once(struct eeh_pe *pe)
 	 * or a fundamental reset (3).
 	 * A fundamental reset required by any device under
 	 * Partitionable Endpoint trumps hot-reset.
-  	 */
+	 */
 	eeh_pe_dev_traverse(pe, eeh_set_dev_freset, &freset);
 
 	if (freset)
@@ -615,8 +620,8 @@ static void eeh_reset_pe_once(struct eeh_pe *pe)
 	 */
 #define PCI_BUS_RST_HOLD_TIME_MSEC 250
 	msleep(PCI_BUS_RST_HOLD_TIME_MSEC);
-	
-	/* We might get hit with another EEH freeze as soon as the 
+
+	/* We might get hit with another EEH freeze as soon as the
 	 * pci slot reset line is dropped. Make sure we don't miss
 	 * these, and clear the flag now.
 	 */
@@ -682,7 +687,7 @@ void eeh_save_bars(struct eeh_dev *edev)
 	if (!edev)
 		return;
 	dn = eeh_dev_to_of_node(edev);
-	
+
 	for (i = 0; i < 16; i++)
 		eeh_ops->read_config(dn, i * 4, 4, &edev->config_space[i]);
 }
@@ -752,11 +757,21 @@ int __exit eeh_ops_unregister(const char *name)
  * Even if force-off is set, the EEH hardware is still enabled, so that
  * newer systems can boot.
  */
-static int __init eeh_init(void)
+int eeh_init(void)
 {
 	struct pci_controller *hose, *tmp;
 	struct device_node *phb;
-	int ret;
+	static int cnt = 0;
+	int ret = 0;
+
+	/*
+	 * We have to delay the initialization on PowerNV after
+	 * the PCI hierarchy tree has been built because the PEs
+	 * are figured out based on PCI devices instead of device
+	 * tree nodes
+	 */
+	if (machine_is(powernv) && cnt++ <= 0)
+		return ret;
 
 	/* call platform initialization function */
 	if (!eeh_ops) {
@@ -781,6 +796,14 @@ static int __init eeh_init(void)
 			phb = hose->dn;
 			traverse_pci_devices(phb, eeh_ops->of_probe, NULL);
 		}
+	} else if (eeh_probe_mode_dev()) {
+		list_for_each_entry_safe(hose, tmp,
+			&hose_list, list_node)
+			pci_walk_bus(hose->bus, eeh_ops->dev_probe, NULL);
+	} else {
+		pr_warning("%s: Invalid probe mode %d\n",
+			   __func__, eeh_probe_mode);
+		return -EINVAL;
 	}
 
 	/*
@@ -816,7 +839,7 @@ core_initcall_sync(eeh_init);
  * on the CEC architecture, type of the device, on earlier boot
  * command-line arguments & etc.
  */
-static void eeh_add_device_early(struct device_node *dn)
+void eeh_add_device_early(struct device_node *dn)
 {
 	struct pci_controller *phb;
 
@@ -864,7 +887,7 @@ EXPORT_SYMBOL_GPL(eeh_add_device_tree_early);
  * This routine must be used to complete EEH initialization for PCI
  * devices that were added after system boot (e.g. hotplug, dlpar).
  */
-static void eeh_add_device_late(struct pci_dev *dev)
+void eeh_add_device_late(struct pci_dev *dev)
 {
 	struct device_node *dn;
 	struct eeh_dev *edev;
@@ -880,7 +903,22 @@ static void eeh_add_device_late(struct pci_dev *dev)
 		pr_debug("EEH: Already referenced !\n");
 		return;
 	}
-	WARN_ON(edev->pdev);
+
+	/*
+	 * The EEH cache might not be removed correctly because of
+	 * unbalanced kref to the device during unplug time, which
+	 * relies on pcibios_release_device(). So we have to remove
+	 * that here explicitly.
+	 */
+	if (edev->pdev) {
+		eeh_rmv_from_parent_pe(edev);
+		eeh_addr_cache_rmv_dev(edev->pdev);
+		eeh_sysfs_remove_device(edev->pdev);
+		edev->mode &= ~EEH_DEV_SYSFS;
+
+		edev->pdev = NULL;
+		dev->dev.archdata.edev = NULL;
+	}
 
 	edev->pdev = dev;
 	dev->dev.archdata.edev = edev;
@@ -908,12 +946,12 @@ void eeh_add_device_tree_late(struct pci_bus *bus)
 	struct pci_dev *dev;
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
- 		eeh_add_device_late(dev);
- 		if (dev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
- 			struct pci_bus *subbus = dev->subordinate;
- 			if (subbus)
- 				eeh_add_device_tree_late(subbus);
- 		}
+		eeh_add_device_late(dev);
+		if (dev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
+			struct pci_bus *subbus = dev->subordinate;
+			if (subbus)
+				eeh_add_device_tree_late(subbus);
+		}
 	}
 }
 EXPORT_SYMBOL_GPL(eeh_add_device_tree_late);
@@ -944,7 +982,6 @@ EXPORT_SYMBOL_GPL(eeh_add_sysfs_files);
 /**
  * eeh_remove_device - Undo EEH setup for the indicated pci device
  * @dev: pci device to be removed
- * @purge_pe: remove the PE or not
  *
  * This routine should be called when a device is removed from
  * a running system (e.g. by hotplug or dlpar).  It unregisters
@@ -952,7 +989,7 @@ EXPORT_SYMBOL_GPL(eeh_add_sysfs_files);
  * this device will no longer be detected after this call; thus,
  * i/o errors affecting this slot may leave this device unusable.
  */
-static void eeh_remove_device(struct pci_dev *dev, int purge_pe)
+void eeh_remove_device(struct pci_dev *dev)
 {
 	struct eeh_dev *edev;
 
@@ -963,40 +1000,28 @@ static void eeh_remove_device(struct pci_dev *dev, int purge_pe)
 	/* Unregister the device with the EEH/PCI address search system */
 	pr_debug("EEH: Removing device %s\n", pci_name(dev));
 
-	if (!edev || !edev->pdev) {
+	if (!edev || !edev->pdev || !edev->pe) {
 		pr_debug("EEH: Not referenced !\n");
 		return;
 	}
+
+	/*
+	 * During the hotplug for EEH error recovery, we need the EEH
+	 * device attached to the parent PE in order for BAR restore
+	 * a bit later. So we keep it for BAR restore and remove it
+	 * from the parent PE during the BAR resotre.
+	 */
 	edev->pdev = NULL;
 	dev->dev.archdata.edev = NULL;
+	if (!(edev->pe->state & EEH_PE_KEEP))
+		eeh_rmv_from_parent_pe(edev);
+	else
+		edev->mode |= EEH_DEV_DISCONNECTED;
 
-	eeh_rmv_from_parent_pe(edev, purge_pe);
 	eeh_addr_cache_rmv_dev(dev);
 	eeh_sysfs_remove_device(dev);
+	edev->mode &= ~EEH_DEV_SYSFS;
 }
-
-/**
- * eeh_remove_bus_device - Undo EEH setup for the indicated PCI device
- * @dev: PCI device
- * @purge_pe: remove the corresponding PE or not
- *
- * This routine must be called when a device is removed from the
- * running system through hotplug or dlpar. The corresponding
- * PCI address cache will be removed.
- */
-void eeh_remove_bus_device(struct pci_dev *dev, int purge_pe)
-{
-	struct pci_bus *bus = dev->subordinate;
-	struct pci_dev *child, *tmp;
-
-	eeh_remove_device(dev, purge_pe);
-
-	if (bus && dev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
-		list_for_each_entry_safe(child, tmp, &bus->devices, bus_list)
-			 eeh_remove_bus_device(child, purge_pe);
-	}
-}
-EXPORT_SYMBOL_GPL(eeh_remove_bus_device);
 
 static int proc_eeh_show(struct seq_file *m, void *v)
 {

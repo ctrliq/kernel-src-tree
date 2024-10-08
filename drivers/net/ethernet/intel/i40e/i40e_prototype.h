@@ -59,8 +59,7 @@ void i40e_debug_aq(struct i40e_hw *hw,
 
 void i40e_idle_aq(struct i40e_hw *hw);
 bool i40e_check_asq_alive(struct i40e_hw *hw);
-i40e_status i40e_aq_queue_shutdown(struct i40e_hw *hw,
-				   bool unloading);
+i40e_status i40e_aq_queue_shutdown(struct i40e_hw *hw, bool unloading);
 
 u32 i40e_led_get(struct i40e_hw *hw);
 void i40e_led_set(struct i40e_hw *hw, u32 mode, bool blink);
@@ -156,6 +155,12 @@ i40e_status i40e_aq_cfg_lldp_mib_change_event(struct i40e_hw *hw,
 i40e_status i40e_aq_stop_lldp(struct i40e_hw *hw, bool shutdown_agent,
 				struct i40e_asq_cmd_details *cmd_details);
 i40e_status i40e_aq_start_lldp(struct i40e_hw *hw,
+				struct i40e_asq_cmd_details *cmd_details);
+i40e_status i40e_aq_add_udp_tunnel(struct i40e_hw *hw,
+				u16 udp_port, u8 header_len,
+				u8 protocol_index, u8 *filter_index,
+				struct i40e_asq_cmd_details *cmd_details);
+i40e_status i40e_aq_del_udp_tunnel(struct i40e_hw *hw, u8 index,
 				struct i40e_asq_cmd_details *cmd_details);
 i40e_status i40e_aq_delete_element(struct i40e_hw *hw, u16 seid,
 				struct i40e_asq_cmd_details *cmd_details);

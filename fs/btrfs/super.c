@@ -55,6 +55,8 @@
 #include "rcu-string.h"
 #include "dev-replace.h"
 #include "free-space-cache.h"
+#include "backref.h"
+#include "tests/btrfs-tests.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/btrfs.h>
@@ -1780,10 +1782,36 @@ static void btrfs_print_info(void)
 #ifdef CONFIG_BTRFS_DEBUG
 			", debug=on"
 #endif
+#ifdef CONFIG_BTRFS_ASSERT
+			", assert=on"
+#endif
 #ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
 			", integrity-checker=on"
 #endif
 			"\n");
+}
+
+static int btrfs_run_sanity_tests(void)
+{
+	int ret;
+
+	ret = btrfs_init_test_fs();
+	if (ret)
+		return ret;
+
+	ret = btrfs_test_free_space_cache();
+	if (ret)
+		goto out;
+	ret = btrfs_test_extent_buffer_operations();
+	if (ret)
+		goto out;
+	ret = btrfs_test_extent_io();
+	if (ret)
+		goto out;
+	ret = btrfs_test_inodes();
+out:
+	btrfs_destroy_test_fs();
+	return ret;
 }
 
 static int __init init_btrfs_fs(void)
@@ -1824,23 +1852,32 @@ static int __init init_btrfs_fs(void)
 	if (err)
 		goto free_auto_defrag;
 
+	err = btrfs_prelim_ref_init();
+	if (err)
+		goto free_prelim_ref;
+
 	err = btrfs_interface_init();
 	if (err)
 		goto free_delayed_ref;
+
+	btrfs_init_lockdep();
+
+	btrfs_print_info();
+
+	err = btrfs_run_sanity_tests();
+	if (err)
+		goto unregister_ioctl;
 
 	err = register_filesystem(&btrfs_fs_type);
 	if (err)
 		goto unregister_ioctl;
 
-	btrfs_init_lockdep();
-
-	btrfs_print_info();
-	btrfs_test_free_space_cache();
-
 	return 0;
 
 unregister_ioctl:
 	btrfs_interface_exit();
+free_prelim_ref:
+	btrfs_prelim_ref_exit();
 free_delayed_ref:
 	btrfs_delayed_ref_exit();
 free_auto_defrag:
@@ -1867,6 +1904,7 @@ static void __exit exit_btrfs_fs(void)
 	btrfs_delayed_ref_exit();
 	btrfs_auto_defrag_exit();
 	btrfs_delayed_inode_exit();
+	btrfs_prelim_ref_exit();
 	ordered_data_exit();
 	extent_map_exit();
 	extent_io_exit();

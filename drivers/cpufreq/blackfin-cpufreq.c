@@ -20,23 +20,23 @@
 
 
 /* this is the table of CCLK frequencies, in Hz */
-/* .driver_data is the entry in the auxiliary dpm_state_table[] */
+/* .index is the entry in the auxiliary dpm_state_table[] */
 static struct cpufreq_frequency_table bfin_freq_table[] = {
 	{
 		.frequency = CPUFREQ_TABLE_END,
-		.driver_data = 0,
+		.index = 0,
 	},
 	{
 		.frequency = CPUFREQ_TABLE_END,
-		.driver_data = 1,
+		.index = 1,
 	},
 	{
 		.frequency = CPUFREQ_TABLE_END,
-		.driver_data = 2,
+		.index = 2,
 	},
 	{
 		.frequency = CPUFREQ_TABLE_END,
-		.driver_data = 0,
+		.index = 0,
 	},
 };
 

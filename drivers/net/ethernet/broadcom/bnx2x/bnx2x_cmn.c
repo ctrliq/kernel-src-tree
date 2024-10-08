@@ -24,10 +24,48 @@
 #include <net/tcp.h>
 #include <net/ipv6.h>
 #include <net/ip6_checksum.h>
+#include <net/busy_poll.h>
 #include <linux/prefetch.h>
 #include "bnx2x_cmn.h"
 #include "bnx2x_init.h"
 #include "bnx2x_sp.h"
+
+static void bnx2x_free_fp_mem_cnic(struct bnx2x *bp);
+static int bnx2x_alloc_fp_mem_cnic(struct bnx2x *bp);
+static int bnx2x_alloc_fp_mem(struct bnx2x *bp);
+static int bnx2x_poll(struct napi_struct *napi, int budget);
+
+static void bnx2x_add_all_napi_cnic(struct bnx2x *bp)
+{
+	int i;
+
+	/* Add NAPI objects */
+	for_each_rx_queue_cnic(bp, i) {
+		netif_napi_add(bp->dev, &bnx2x_fp(bp, i, napi),
+			       bnx2x_poll, NAPI_POLL_WEIGHT);
+		napi_hash_add(&bnx2x_fp(bp, i, napi));
+	}
+}
+
+static void bnx2x_add_all_napi(struct bnx2x *bp)
+{
+	int i;
+
+	/* Add NAPI objects */
+	for_each_eth_queue(bp, i) {
+		netif_napi_add(bp->dev, &bnx2x_fp(bp, i, napi),
+			       bnx2x_poll, NAPI_POLL_WEIGHT);
+		napi_hash_add(&bnx2x_fp(bp, i, napi));
+	}
+}
+
+static int bnx2x_calc_num_queues(struct bnx2x *bp)
+{
+	return  bnx2x_num_queues ?
+		 min_t(int, bnx2x_num_queues, BNX2X_MAX_QUEUES(bp)) :
+		 min_t(int, netif_get_num_default_rss_queues(),
+		       BNX2X_MAX_QUEUES(bp));
+}
 
 /**
  * bnx2x_move_fp - move content of the fastpath structure.
@@ -144,7 +182,7 @@ static void bnx2x_shrink_eth_fp(struct bnx2x *bp, int delta)
 	}
 }
 
-int load_count[2][3] = { {0} }; /* per-path: 0-common, 1-port0, 2-port1 */
+int bnx2x_load_count[2][3] = { {0} }; /* per-path: 0-common, 1-port0, 2-port1 */
 
 /* free skb in the packet ring at pos idx
  * return idx of last bd freed
@@ -817,23 +855,19 @@ void bnx2x_csum_validate(struct sk_buff *skb, union eth_rx_cqe *cqe,
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 }
 
-int bnx2x_rx_int(struct bnx2x_fastpath *fp, int budget)
+static int bnx2x_rx_int(struct bnx2x_fastpath *fp, int budget)
 {
 	struct bnx2x *bp = fp->bp;
 	u16 bd_cons, bd_prod, bd_prod_fw, comp_ring_cons;
-	u16 hw_comp_cons, sw_comp_cons, sw_comp_prod;
+	u16 sw_comp_cons, sw_comp_prod;
 	int rx_pkt = 0;
+	union eth_rx_cqe *cqe;
+	struct eth_fast_path_rx_cqe *cqe_fp;
 
 #ifdef BNX2X_STOP_ON_ERROR
 	if (unlikely(bp->panic))
 		return 0;
 #endif
-
-	/* CQ "next element" is of the size of the regular element,
-	   that's why it's ok here */
-	hw_comp_cons = le16_to_cpu(*fp->rx_cons_sb);
-	if ((hw_comp_cons & MAX_RCQ_DESC_CNT) == MAX_RCQ_DESC_CNT)
-		hw_comp_cons++;
 
 	bd_cons = fp->rx_bd_cons;
 	bd_prod = fp->rx_bd_prod;
@@ -841,20 +875,16 @@ int bnx2x_rx_int(struct bnx2x_fastpath *fp, int budget)
 	sw_comp_cons = fp->rx_comp_cons;
 	sw_comp_prod = fp->rx_comp_prod;
 
-	/* Memory barrier necessary as speculative reads of the rx
-	 * buffer can be ahead of the index in the status block
-	 */
-	rmb();
+	comp_ring_cons = RCQ_BD(sw_comp_cons);
+	cqe = &fp->rx_comp_ring[comp_ring_cons];
+	cqe_fp = &cqe->fast_path_cqe;
 
 	DP(NETIF_MSG_RX_STATUS,
-	   "queue[%d]:  hw_comp_cons %u  sw_comp_cons %u\n",
-	   fp->index, hw_comp_cons, sw_comp_cons);
+	   "queue[%d]: sw_comp_cons %u\n", fp->index, sw_comp_cons);
 
-	while (sw_comp_cons != hw_comp_cons) {
+	while (BNX2X_IS_CQE_COMPLETED(cqe_fp)) {
 		struct sw_rx_bd *rx_buf = NULL;
 		struct sk_buff *skb;
-		union eth_rx_cqe *cqe;
-		struct eth_fast_path_rx_cqe *cqe_fp;
 		u8 cqe_fp_flags;
 		enum eth_rx_cqe_type cqe_fp_type;
 		u16 len, pad, queue;
@@ -867,12 +897,9 @@ int bnx2x_rx_int(struct bnx2x_fastpath *fp, int budget)
 			return 0;
 #endif
 
-		comp_ring_cons = RCQ_BD(sw_comp_cons);
 		bd_prod = RX_BD(bd_prod);
 		bd_cons = RX_BD(bd_cons);
 
-		cqe = &fp->rx_comp_ring[comp_ring_cons];
-		cqe_fp = &cqe->fast_path_cqe;
 		cqe_fp_flags = cqe_fp->type_error_flags;
 		cqe_fp_type = cqe_fp_flags & ETH_FAST_PATH_RX_CQE_TYPE;
 
@@ -1019,8 +1046,13 @@ reuse_rx:
 		    PARSING_FLAGS_VLAN)
 			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
 					       le16_to_cpu(cqe_fp->vlan_tag));
-		napi_gro_receive(&fp->napi, skb);
 
+		skb_mark_napi_id(skb, &fp->napi);
+
+		if (bnx2x_fp_ll_polling(fp))
+			netif_receive_skb(skb);
+		else
+			napi_gro_receive(&fp->napi, skb);
 next_rx:
 		rx_buf->data = NULL;
 
@@ -1032,8 +1064,15 @@ next_cqe:
 		sw_comp_prod = NEXT_RCQ_IDX(sw_comp_prod);
 		sw_comp_cons = NEXT_RCQ_IDX(sw_comp_cons);
 
+		/* mark CQE as free */
+		BNX2X_SEED_CQE(cqe_fp);
+
 		if (rx_pkt == budget)
 			break;
+
+		comp_ring_cons = RCQ_BD(sw_comp_cons);
+		cqe = &fp->rx_comp_ring[comp_ring_cons];
+		cqe_fp = &cqe->fast_path_cqe;
 	} /* while */
 
 	fp->rx_bd_cons = bd_cons;
@@ -1069,8 +1108,6 @@ static irqreturn_t bnx2x_msix_fp_int(int irq, void *fp_cookie)
 #endif
 
 	/* Handle Rx and Tx according to MSI-X vector */
-	prefetch(fp->rx_cons_sb);
-
 	for_each_cos_in_tx_queue(fp, cos)
 		prefetch(fp->txdata_ptr[cos]->tx_cons_sb);
 
@@ -1488,7 +1525,7 @@ static void bnx2x_free_rx_skbs(struct bnx2x *bp)
 	}
 }
 
-void bnx2x_free_skbs_cnic(struct bnx2x *bp)
+static void bnx2x_free_skbs_cnic(struct bnx2x *bp)
 {
 	bnx2x_free_tx_skbs_cnic(bp);
 	bnx2x_free_rx_skbs_cnic(bp);
@@ -1777,32 +1814,46 @@ static void bnx2x_napi_enable_cnic(struct bnx2x *bp)
 {
 	int i;
 
-	for_each_rx_queue_cnic(bp, i)
+	for_each_rx_queue_cnic(bp, i) {
+		bnx2x_fp_init_lock(&bp->fp[i]);
 		napi_enable(&bnx2x_fp(bp, i, napi));
+	}
 }
 
 static void bnx2x_napi_enable(struct bnx2x *bp)
 {
 	int i;
 
-	for_each_eth_queue(bp, i)
+	for_each_eth_queue(bp, i) {
+		bnx2x_fp_init_lock(&bp->fp[i]);
 		napi_enable(&bnx2x_fp(bp, i, napi));
+	}
 }
 
 static void bnx2x_napi_disable_cnic(struct bnx2x *bp)
 {
 	int i;
 
-	for_each_rx_queue_cnic(bp, i)
+	local_bh_disable();
+	for_each_rx_queue_cnic(bp, i) {
 		napi_disable(&bnx2x_fp(bp, i, napi));
+		while (!bnx2x_fp_lock_napi(&bp->fp[i]))
+			mdelay(1);
+	}
+	local_bh_enable();
 }
 
 static void bnx2x_napi_disable(struct bnx2x *bp)
 {
 	int i;
 
-	for_each_eth_queue(bp, i)
+	local_bh_disable();
+	for_each_eth_queue(bp, i) {
 		napi_disable(&bnx2x_fp(bp, i, napi));
+		while (!bnx2x_fp_lock_napi(&bp->fp[i]))
+			mdelay(1);
+	}
+	local_bh_enable();
 }
 
 void bnx2x_netif_start(struct bnx2x *bp)
@@ -2293,16 +2344,16 @@ static int bnx2x_nic_load_no_mcp(struct bnx2x *bp, int port)
 	int path = BP_PATH(bp);
 
 	DP(NETIF_MSG_IFUP, "NO MCP - load counts[%d]      %d, %d, %d\n",
-	   path, load_count[path][0], load_count[path][1],
-	   load_count[path][2]);
-	load_count[path][0]++;
-	load_count[path][1 + port]++;
+	   path, bnx2x_load_count[path][0], bnx2x_load_count[path][1],
+	   bnx2x_load_count[path][2]);
+	bnx2x_load_count[path][0]++;
+	bnx2x_load_count[path][1 + port]++;
 	DP(NETIF_MSG_IFUP, "NO MCP - new load counts[%d]  %d, %d, %d\n",
-	   path, load_count[path][0], load_count[path][1],
-	   load_count[path][2]);
-	if (load_count[path][0] == 1)
+	   path, bnx2x_load_count[path][0], bnx2x_load_count[path][1],
+	   bnx2x_load_count[path][2]);
+	if (bnx2x_load_count[path][0] == 1)
 		return FW_MSG_CODE_DRV_LOAD_COMMON;
-	else if (load_count[path][1 + port] == 1)
+	else if (bnx2x_load_count[path][1 + port] == 1)
 		return FW_MSG_CODE_DRV_LOAD_PORT;
 	else
 		return FW_MSG_CODE_DRV_LOAD_FUNCTION;
@@ -3060,7 +3111,7 @@ int bnx2x_set_power_state(struct bnx2x *bp, pci_power_t state)
 /*
  * net_device service functions
  */
-int bnx2x_poll(struct napi_struct *napi, int budget)
+static int bnx2x_poll(struct napi_struct *napi, int budget)
 {
 	int work_done = 0;
 	u8 cos;
@@ -3075,6 +3126,8 @@ int bnx2x_poll(struct napi_struct *napi, int budget)
 			return 0;
 		}
 #endif
+		if (!bnx2x_fp_lock_napi(fp))
+			return work_done;
 
 		for_each_cos_in_tx_queue(fp, cos)
 			if (bnx2x_tx_queue_has_work(fp->txdata_ptr[cos]))
@@ -3084,12 +3137,15 @@ int bnx2x_poll(struct napi_struct *napi, int budget)
 			work_done += bnx2x_rx_int(fp, budget - work_done);
 
 			/* must not complete if we consumed full budget */
-			if (work_done >= budget)
+			if (work_done >= budget) {
+				bnx2x_fp_unlock_napi(fp);
 				break;
+			}
 		}
 
 		/* Fall out from the NAPI loop if needed */
-		if (!(bnx2x_has_rx_work(fp) || bnx2x_has_tx_work(fp))) {
+		if (!bnx2x_fp_unlock_napi(fp) &&
+		    !(bnx2x_has_rx_work(fp) || bnx2x_has_tx_work(fp))) {
 
 			/* No need to update SB for FCoE L2 ring as long as
 			 * it's connected to the default SB and the SB
@@ -3130,6 +3186,32 @@ int bnx2x_poll(struct napi_struct *napi, int budget)
 
 	return work_done;
 }
+
+#ifdef CONFIG_NET_RX_BUSY_POLL
+/* must be called with local_bh_disable()d */
+int bnx2x_low_latency_recv(struct napi_struct *napi)
+{
+	struct bnx2x_fastpath *fp = container_of(napi, struct bnx2x_fastpath,
+						 napi);
+	struct bnx2x *bp = fp->bp;
+	int found = 0;
+
+	if ((bp->state == BNX2X_STATE_CLOSED) ||
+	    (bp->state == BNX2X_STATE_ERROR) ||
+	    (bp->flags & (TPA_ENABLE_FLAG | GRO_ENABLE_FLAG)))
+		return LL_FLUSH_FAILED;
+
+	if (!bnx2x_fp_lock_poll(fp))
+		return LL_FLUSH_BUSY;
+
+	if (bnx2x_has_rx_work(fp))
+		found = bnx2x_rx_int(fp, 4);
+
+	bnx2x_fp_unlock_poll(fp);
+
+	return found;
+}
+#endif
 
 /* we split the first BD into headers and data BDs
  * to ease the pain of our fellow microcode engineers
@@ -4163,7 +4245,7 @@ static void bnx2x_free_fp_mem_at(struct bnx2x *bp, int fp_index)
 	/* end of fastpath */
 }
 
-void bnx2x_free_fp_mem_cnic(struct bnx2x *bp)
+static void bnx2x_free_fp_mem_cnic(struct bnx2x *bp)
 {
 	int i;
 	for_each_cnic_queue(bp, i)
@@ -4334,10 +4416,11 @@ static int bnx2x_alloc_fp_mem_at(struct bnx2x *bp, int index)
 				&bnx2x_fp(bp, index, rx_desc_mapping),
 				sizeof(struct eth_rx_bd) * NUM_RX_BD);
 
-		BNX2X_PCI_ALLOC(bnx2x_fp(bp, index, rx_comp_ring),
-				&bnx2x_fp(bp, index, rx_comp_mapping),
-				sizeof(struct eth_fast_path_rx_cqe) *
-				NUM_RCQ_BD);
+		/* Seed all CQEs by 1s */
+		BNX2X_PCI_FALLOC(bnx2x_fp(bp, index, rx_comp_ring),
+				 &bnx2x_fp(bp, index, rx_comp_mapping),
+				 sizeof(struct eth_fast_path_rx_cqe) *
+				 NUM_RCQ_BD);
 
 		/* SGE ring */
 		BNX2X_ALLOC(bnx2x_fp(bp, index, rx_page_ring),
@@ -4376,7 +4459,7 @@ alloc_mem_err:
 	return 0;
 }
 
-int bnx2x_alloc_fp_mem_cnic(struct bnx2x *bp)
+static int bnx2x_alloc_fp_mem_cnic(struct bnx2x *bp)
 {
 	if (!NO_FCOE(bp))
 		/* FCoE */
@@ -4389,7 +4472,7 @@ int bnx2x_alloc_fp_mem_cnic(struct bnx2x *bp)
 	return 0;
 }
 
-int bnx2x_alloc_fp_mem(struct bnx2x *bp)
+static int bnx2x_alloc_fp_mem(struct bnx2x *bp)
 {
 	int i;
 

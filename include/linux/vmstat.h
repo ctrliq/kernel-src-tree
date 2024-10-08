@@ -142,9 +142,6 @@ static inline unsigned long zone_page_state_snapshot(struct zone *zone,
 	return x;
 }
 
-extern unsigned long global_reclaimable_pages(void);
-extern unsigned long zone_reclaimable_pages(struct zone *zone);
-
 #ifdef CONFIG_NUMA
 /*
  * Determine the per node value of a stat item. This function
@@ -207,16 +204,6 @@ void set_pgdat_percpu_threshold(pg_data_t *pgdat,
 				int (*calculate_pressure)(struct zone *));
 #else /* CONFIG_SMP */
 
-/*
- * We do not maintain differentials in a single processor configuration.
- * The functions directly modify the zone and global counters.
- */
-static inline void __mod_zone_page_state(struct zone *zone,
-			enum zone_stat_item item, int delta)
-{
-	zone_page_state_add(delta, zone, item);
-}
-
 static inline void __inc_zone_state(struct zone *zone, enum zone_stat_item item)
 {
 	atomic_long_inc(&zone->vm_stat[item]);
@@ -227,6 +214,16 @@ static inline void __dec_zone_state(struct zone *zone, enum zone_stat_item item)
 {
 	atomic_long_dec(&zone->vm_stat[item]);
 	atomic_long_dec(&vm_stat[item]);
+}
+
+/*
+ * We do not maintain differentials in a single processor configuration.
+ * The functions directly modify the zone and global counters.
+ */
+static inline void __mod_zone_page_state(struct zone *zone,
+			enum zone_stat_item item, int delta)
+{
+	zone_page_state_add(delta, zone, item);
 }
 
 static inline void __inc_zone_page_state(struct page *page,
@@ -245,12 +242,12 @@ static inline void __dec_zone_page_state(struct page *page,
  * We only use atomic operations to update counters. So there is no need to
  * disable interrupts.
  */
+#define inc_zone_state __inc_zone_state
+#define dec_zone_state __dec_zone_state
+
 #define inc_zone_page_state __inc_zone_page_state
 #define dec_zone_page_state __dec_zone_page_state
 #define mod_zone_page_state __mod_zone_page_state
-
-#define inc_zone_state __inc_zone_state
-#define dec_zone_state __dec_zone_state
 
 #define set_pgdat_percpu_threshold(pgdat, callback) { }
 

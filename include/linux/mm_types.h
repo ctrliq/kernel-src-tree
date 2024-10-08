@@ -147,10 +147,11 @@ struct page {
 						 * system if PG_buddy is set.
 						 */
 #if USE_SPLIT_PTE_PTLOCKS
-		unsigned long ptl; /* It's spinlock_t if it fits to long,
-				    * otherwise it's pointer to dynamicaly
-				    * allocated spinlock_t.
-				    */
+#if BLOATED_SPINLOCKS
+		spinlock_t *ptl;
+#else
+		spinlock_t ptl;
+#endif
 #endif
 		struct kmem_cache *slab_cache;	/* SL[AU]B: Pointer to slab */
 		struct page *first_page;	/* Compound tail pages */
@@ -182,8 +183,8 @@ struct page {
 	void *shadow;
 #endif
 
-#ifdef LAST_NID_NOT_IN_PAGE_FLAGS
-	int _last_nid;
+#ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+	int _last_cpupid;
 #endif
 }
 /*
@@ -297,6 +298,12 @@ struct vm_area_struct {
 #ifdef CONFIG_NUMA
 	struct mempolicy *vm_policy;	/* NUMA policy for the VMA */
 #endif
+
+	/* reserved for Red Hat */
+	unsigned long rh_reserved1;
+	unsigned long rh_reserved2;
+	unsigned long rh_reserved3;
+	unsigned long rh_reserved4;
 };
 
 struct core_thread {
@@ -341,6 +348,7 @@ struct mm_struct {
 	void (*unmap_area) (struct mm_struct *mm, unsigned long addr);
 #endif
 	unsigned long mmap_base;		/* base of mmap area */
+	unsigned long mmap_legacy_base;         /* base of mmap area in bottom-up allocations */
 	unsigned long task_size;		/* size of task vm space */
 	unsigned long cached_hole_size; 	/* if non-zero, the largest hole below free_area_cache */
 	unsigned long free_area_cache;		/* first hole of size cached_hole_size or larger */
@@ -429,20 +437,11 @@ struct mm_struct {
 	 */
 	unsigned long numa_next_scan;
 
-	/* numa_next_reset is when the PTE scanner period will be reset */
-	unsigned long numa_next_reset;
-
 	/* Restart point for scanning and setting pte_numa */
 	unsigned long numa_scan_offset;
 
 	/* numa_scan_seq prevents two threads setting pte_numa */
 	int numa_scan_seq;
-
-	/*
-	 * The first node a task was scheduled on. If a task runs on
-	 * a different node than Make PTE Scan Go Now.
-	 */
-	int first_nid;
 #endif
 #if defined(CONFIG_NUMA_BALANCING) || defined(CONFIG_COMPACTION)
 	/*
@@ -453,11 +452,17 @@ struct mm_struct {
 	bool tlb_flush_pending;
 #endif
 	struct uprobes_state uprobes_state;
-};
 
-/* first nid will either be a valid NID or one of these values */
-#define NUMA_PTE_SCAN_INIT	-1
-#define NUMA_PTE_SCAN_ACTIVE	-2
+	/* reserved for Red Hat */
+	unsigned long rh_reserved1;
+	unsigned long rh_reserved2;
+	unsigned long rh_reserved3;
+	unsigned long rh_reserved4;
+	unsigned long rh_reserved5;
+	unsigned long rh_reserved6;
+	unsigned long rh_reserved7;
+	unsigned long rh_reserved8;
+};
 
 static inline void mm_init_cpumask(struct mm_struct *mm)
 {
@@ -479,7 +484,7 @@ static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
  * The barriers below prevent the compiler from re-ordering the instructions
  * around the memory barriers that are already present in the code.
  */
-static inline bool mm_tlb_flush_pending(struct mm_struct *mm)
+static inline bool tlb_flush_pending(struct mm_struct *mm)
 {
 	barrier();
 	return mm->tlb_flush_pending;
@@ -501,7 +506,7 @@ static inline void clear_tlb_flush_pending(struct mm_struct *mm)
 	mm->tlb_flush_pending = false;
 }
 #else
-static inline bool mm_tlb_flush_pending(struct mm_struct *mm)
+static inline bool tlb_flush_pending(struct mm_struct *mm)
 {
 	return false;
 }

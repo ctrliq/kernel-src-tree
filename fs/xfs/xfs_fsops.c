@@ -17,30 +17,29 @@
  */
 #include "xfs.h"
 #include "xfs_fs.h"
-#include "xfs_types.h"
-#include "xfs_format.h"
 #include "xfs_shared.h"
-#include "xfs_log.h"
-#include "xfs_trans.h"
+#include "xfs_format.h"
+#include "xfs_log_format.h"
+#include "xfs_trans_resv.h"
 #include "xfs_sb.h"
 #include "xfs_ag.h"
 #include "xfs_mount.h"
-#include "xfs_bmap_btree.h"
-#include "xfs_alloc_btree.h"
-#include "xfs_ialloc_btree.h"
-#include "xfs_dinode.h"
 #include "xfs_inode.h"
+#include "xfs_trans.h"
 #include "xfs_inode_item.h"
-#include "xfs_btree.h"
 #include "xfs_error.h"
+#include "xfs_btree.h"
+#include "xfs_alloc_btree.h"
 #include "xfs_alloc.h"
 #include "xfs_ialloc.h"
 #include "xfs_fsops.h"
 #include "xfs_itable.h"
 #include "xfs_trans_space.h"
 #include "xfs_rtalloc.h"
-#include "xfs_filestream.h"
 #include "xfs_trace.h"
+#include "xfs_log.h"
+#include "xfs_dinode.h"
+#include "xfs_filestream.h"
 
 /*
  * File system operations
@@ -207,8 +206,9 @@ xfs_growfs_data_private(
 
 	tp = xfs_trans_alloc(mp, XFS_TRANS_GROWFS);
 	tp->t_flags |= XFS_TRANS_RESERVE;
-	if ((error = xfs_trans_reserve(tp, XFS_GROWFS_SPACE_RES(mp),
-			XFS_GROWDATA_LOG_RES(mp), 0, 0, 0))) {
+	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_growdata,
+				  XFS_GROWFS_SPACE_RES(mp), 0);
+	if (error) {
 		xfs_trans_cancel(tp, 0);
 		return error;
 	}
@@ -751,8 +751,7 @@ xfs_fs_log_dummy(
 	int		error;
 
 	tp = _xfs_trans_alloc(mp, XFS_TRANS_DUMMY1, KM_SLEEP);
-	error = xfs_trans_reserve(tp, 0, XFS_SB_LOG_RES(mp), 0, 0,
-				  XFS_DEFAULT_LOG_COUNT);
+	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
 	if (error) {
 		xfs_trans_cancel(tp, 0);
 		return error;

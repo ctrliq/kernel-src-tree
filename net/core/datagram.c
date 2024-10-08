@@ -56,7 +56,7 @@
 #include <net/sock.h>
 #include <net/tcp_states.h>
 #include <trace/events/skb.h>
-#include <net/ll_poll.h>
+#include <net/busy_poll.h>
 
 /*
  *	Is a socket 'connection oriented' ?
@@ -208,7 +208,8 @@ struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned int flags,
 		}
 		spin_unlock_irqrestore(&queue->lock, cpu_flags);
 
-		if (sk_valid_ll(sk) && sk_poll_ll(sk, flags & MSG_DONTWAIT))
+		if (sk_can_busy_loop(sk) &&
+		    sk_busy_loop(sk, flags & MSG_DONTWAIT))
 			continue;
 
 		/* User doesn't want to wait */

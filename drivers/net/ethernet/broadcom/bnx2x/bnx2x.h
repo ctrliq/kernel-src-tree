@@ -246,8 +246,37 @@ enum {
 	BNX2X_MAX_CNIC_ETH_CL_ID_IDX,
 };
 
-#define BNX2X_CNIC_START_ETH_CID(bp)	(BNX2X_NUM_NON_CNIC_QUEUES(bp) *\
+/* use a value high enough to be above all the PFs, which has least significant
+ * nibble as 8, so when cnic needs to come up with a CID for UIO to use to
+ * calculate doorbell address according to old doorbell configuration scheme
+ * (db_msg_sz 1 << 7 * cid + 0x40 DPM offset) it can come up with a valid number
+ * We must avoid coming up with cid 8 for iscsi since according to this method
+ * the designated UIO cid will come out 0 and it has a special handling for that
+ * case which doesn't suit us. Therefore will will cieling to closes cid which
+ * has least signigifcant nibble 8 and if it is 8 we will move forward to 0x18.
+ */
+
+#define BNX2X_1st_NON_L2_ETH_CID(bp)	(BNX2X_NUM_NON_CNIC_QUEUES(bp) * \
 					 (bp)->max_cos)
+/* amount of cids traversed by UIO's DPM addition to doorbell */
+#define UIO_DPM				8
+/* roundup to DPM offset */
+#define UIO_ROUNDUP(bp)			(roundup(BNX2X_1st_NON_L2_ETH_CID(bp), \
+					 UIO_DPM))
+/* offset to nearest value which has lsb nibble matching DPM */
+#define UIO_CID_OFFSET(bp)		((UIO_ROUNDUP(bp) + UIO_DPM) % \
+					 (UIO_DPM * 2))
+/* add offset to rounded-up cid to get a value which could be used with UIO */
+#define UIO_DPM_ALIGN(bp)		(UIO_ROUNDUP(bp) + UIO_CID_OFFSET(bp))
+/* but wait - avoid UIO special case for cid 0 */
+#define UIO_DPM_CID0_OFFSET(bp)		((UIO_DPM * 2) * \
+					 (UIO_DPM_ALIGN(bp) == UIO_DPM))
+/* Properly DPM aligned CID dajusted to cid 0 secal case */
+#define BNX2X_CNIC_START_ETH_CID(bp)	(UIO_DPM_ALIGN(bp) + \
+					 (UIO_DPM_CID0_OFFSET(bp)))
+/* how many cids were wasted  - need this value for cid allocation */
+#define UIO_CID_PAD(bp)			(BNX2X_CNIC_START_ETH_CID(bp) - \
+					 BNX2X_1st_NON_L2_ETH_CID(bp))
 	/* iSCSI L2 */
 #define	BNX2X_ISCSI_ETH_CID(bp)		(BNX2X_CNIC_START_ETH_CID(bp))
 	/* FCoE L2 */
@@ -485,6 +514,21 @@ struct bnx2x_fastpath {
 	struct bnx2x		*bp; /* parent */
 
 	struct napi_struct	napi;
+
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	unsigned int state;
+#define BNX2X_FP_STATE_IDLE		      0
+#define BNX2X_FP_STATE_NAPI		(1 << 0)    /* NAPI owns this FP */
+#define BNX2X_FP_STATE_POLL		(1 << 1)    /* poll owns this FP */
+#define BNX2X_FP_STATE_NAPI_YIELD	(1 << 2)    /* NAPI yielded this FP */
+#define BNX2X_FP_STATE_POLL_YIELD	(1 << 3)    /* poll yielded this FP */
+#define BNX2X_FP_YIELD	(BNX2X_FP_STATE_NAPI_YIELD | BNX2X_FP_STATE_POLL_YIELD)
+#define BNX2X_FP_LOCKED	(BNX2X_FP_STATE_NAPI | BNX2X_FP_STATE_POLL)
+#define BNX2X_FP_USER_PEND (BNX2X_FP_STATE_POLL | BNX2X_FP_STATE_POLL_YIELD)
+	/* protect state */
+	spinlock_t lock;
+#endif /* CONFIG_NET_RX_BUSY_POLL */
+
 	union host_hc_status_block	status_blk;
 	/* chip independent shortcuts into sb structure */
 	__le16			*sb_index_values;
@@ -556,6 +600,116 @@ struct bnx2x_fastpath {
 #define bnx2x_sp_obj(bp, fp)	((bp)->sp_objs[(fp)->index])
 #define bnx2x_fp_stats(bp, fp)	(&((bp)->fp_stats[(fp)->index]))
 #define bnx2x_fp_qstats(bp, fp)	(&((bp)->fp_stats[(fp)->index].eth_q_stats))
+
+#ifdef CONFIG_NET_RX_BUSY_POLL
+static inline void bnx2x_fp_init_lock(struct bnx2x_fastpath *fp)
+{
+	spin_lock_init(&fp->lock);
+	fp->state = BNX2X_FP_STATE_IDLE;
+}
+
+/* called from the device poll routine to get ownership of a FP */
+static inline bool bnx2x_fp_lock_napi(struct bnx2x_fastpath *fp)
+{
+	bool rc = true;
+
+	spin_lock(&fp->lock);
+	if (fp->state & BNX2X_FP_LOCKED) {
+		WARN_ON(fp->state & BNX2X_FP_STATE_NAPI);
+		fp->state |= BNX2X_FP_STATE_NAPI_YIELD;
+		rc = false;
+	} else {
+		/* we don't care if someone yielded */
+		fp->state = BNX2X_FP_STATE_NAPI;
+	}
+	spin_unlock(&fp->lock);
+	return rc;
+}
+
+/* returns true is someone tried to get the FP while napi had it */
+static inline bool bnx2x_fp_unlock_napi(struct bnx2x_fastpath *fp)
+{
+	bool rc = false;
+
+	spin_lock(&fp->lock);
+	WARN_ON(fp->state &
+		(BNX2X_FP_STATE_POLL | BNX2X_FP_STATE_NAPI_YIELD));
+
+	if (fp->state & BNX2X_FP_STATE_POLL_YIELD)
+		rc = true;
+	fp->state = BNX2X_FP_STATE_IDLE;
+	spin_unlock(&fp->lock);
+	return rc;
+}
+
+/* called from bnx2x_low_latency_poll() */
+static inline bool bnx2x_fp_lock_poll(struct bnx2x_fastpath *fp)
+{
+	bool rc = true;
+
+	spin_lock_bh(&fp->lock);
+	if ((fp->state & BNX2X_FP_LOCKED)) {
+		fp->state |= BNX2X_FP_STATE_POLL_YIELD;
+		rc = false;
+	} else {
+		/* preserve yield marks */
+		fp->state |= BNX2X_FP_STATE_POLL;
+	}
+	spin_unlock_bh(&fp->lock);
+	return rc;
+}
+
+/* returns true if someone tried to get the FP while it was locked */
+static inline bool bnx2x_fp_unlock_poll(struct bnx2x_fastpath *fp)
+{
+	bool rc = false;
+
+	spin_lock_bh(&fp->lock);
+	WARN_ON(fp->state & BNX2X_FP_STATE_NAPI);
+
+	if (fp->state & BNX2X_FP_STATE_POLL_YIELD)
+		rc = true;
+	fp->state = BNX2X_FP_STATE_IDLE;
+	spin_unlock_bh(&fp->lock);
+	return rc;
+}
+
+/* true if a socket is polling, even if it did not get the lock */
+static inline bool bnx2x_fp_ll_polling(struct bnx2x_fastpath *fp)
+{
+	WARN_ON(!(fp->state & BNX2X_FP_LOCKED));
+	return fp->state & BNX2X_FP_USER_PEND;
+}
+#else
+static inline void bnx2x_fp_init_lock(struct bnx2x_fastpath *fp)
+{
+}
+
+static inline bool bnx2x_fp_lock_napi(struct bnx2x_fastpath *fp)
+{
+	return true;
+}
+
+static inline bool bnx2x_fp_unlock_napi(struct bnx2x_fastpath *fp)
+{
+	return false;
+}
+
+static inline bool bnx2x_fp_lock_poll(struct bnx2x_fastpath *fp)
+{
+	return false;
+}
+
+static inline bool bnx2x_fp_unlock_poll(struct bnx2x_fastpath *fp)
+{
+	return false;
+}
+
+static inline bool bnx2x_fp_ll_polling(struct bnx2x_fastpath *fp)
+{
+	return false;
+}
+#endif /* CONFIG_NET_RX_BUSY_POLL */
 
 /* Use 2500 as a mini-jumbo MTU for FCoE */
 #define BNX2X_FCOE_MINI_JUMBO_MTU	2500
@@ -1395,6 +1549,8 @@ struct bnx2x {
 #define IS_VF_FLAG			(1 << 22)
 #define INTERRUPTS_ENABLED_FLAG		(1 << 23)
 #define BC_SUPPORTS_RMMOD_CMD		(1 << 24)
+#define HAS_PHYS_PORT_ID		(1 << 25)
+#define AER_ENABLED			(1 << 26)
 
 #define BP_NOMCP(bp)			((bp)->flags & NO_MCP_FLAG)
 
@@ -1558,10 +1714,11 @@ struct bnx2x {
  * Maximum CID count that might be required by the bnx2x:
  * Max RSS * Max_Tx_Multi_Cos + FCoE + iSCSI
  */
+
 #define BNX2X_L2_CID_COUNT(bp)	(BNX2X_NUM_ETH_QUEUES(bp) * BNX2X_MULTI_TX_COS \
-				+ 2 * CNIC_SUPPORT(bp))
+				+ CNIC_SUPPORT(bp) * (2 + UIO_CID_PAD(bp)))
 #define BNX2X_L2_MAX_CID(bp)	(BNX2X_MAX_RSS_COUNT(bp) * BNX2X_MULTI_TX_COS \
-				+ 2 * CNIC_SUPPORT(bp))
+				+ CNIC_SUPPORT(bp) * (2 + UIO_CID_PAD(bp)))
 #define L2_ILT_LINES(bp)	(DIV_ROUND_UP(BNX2X_L2_CID_COUNT(bp),\
 					ILT_PAGE_CIDS))
 
@@ -1724,6 +1881,8 @@ struct bnx2x {
 	u32 dump_preset_idx;
 	bool					stats_started;
 	struct semaphore			stats_sema;
+
+	u8					phys_port_id[ETH_ALEN];
 };
 
 /* Tx queues may be less or equal to Rx queues */
@@ -1899,7 +2058,6 @@ int bnx2x_del_all_macs(struct bnx2x *bp,
 void bnx2x_func_init(struct bnx2x *bp, struct bnx2x_func_init_params *p);
 void bnx2x_init_sb(struct bnx2x *bp, dma_addr_t mapping, int vfid,
 		    u8 vf_valid, int fw_sb_id, int igu_sb_id);
-u32 bnx2x_get_pretend_reg(struct bnx2x *bp);
 int bnx2x_get_gpio(struct bnx2x *bp, int gpio_num, u8 port);
 int bnx2x_set_gpio(struct bnx2x *bp, int gpio_num, u32 mode, u8 port);
 int bnx2x_set_mult_gpio(struct bnx2x *bp, u8 pins, u32 mode);

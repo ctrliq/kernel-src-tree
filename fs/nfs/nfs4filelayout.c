@@ -39,6 +39,7 @@
 #include "internal.h"
 #include "delegation.h"
 #include "nfs4filelayout.h"
+#include "nfs4trace.h"
 
 #define NFSDBG_FACILITY         NFSDBG_PNFS_LD
 
@@ -90,10 +91,10 @@ static void filelayout_reset_write(struct nfs_write_data *data)
 
 	if (!test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags)) {
 		dprintk("%s Reset task %5u for i/o through MDS "
-			"(req %s/%lld, %u bytes @ offset %llu)\n", __func__,
+			"(req %s/%llu, %u bytes @ offset %llu)\n", __func__,
 			data->task.tk_pid,
 			hdr->inode->i_sb->s_id,
-			(long long)NFS_FILEID(hdr->inode),
+			(unsigned long long)NFS_FILEID(hdr->inode),
 			data->args.count,
 			(unsigned long long)data->args.offset);
 
@@ -111,10 +112,10 @@ static void filelayout_reset_read(struct nfs_read_data *data)
 
 	if (!test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags)) {
 		dprintk("%s Reset task %5u for i/o through MDS "
-			"(req %s/%lld, %u bytes @ offset %llu)\n", __func__,
+			"(req %s/%llu, %u bytes @ offset %llu)\n", __func__,
 			data->task.tk_pid,
 			hdr->inode->i_sb->s_id,
-			(long long)NFS_FILEID(hdr->inode),
+			(unsigned long long)NFS_FILEID(hdr->inode),
 			data->args.count,
 			(unsigned long long)data->args.offset);
 
@@ -247,6 +248,7 @@ static int filelayout_read_done_cb(struct rpc_task *task,
 	struct nfs_pgio_header *hdr = data->header;
 	int err;
 
+	trace_nfs4_pnfs_read(data, task->tk_status);
 	err = filelayout_async_handle_error(task, data->args.context->state,
 					    data->ds_clp, hdr->lseg);
 
@@ -334,8 +336,7 @@ static void filelayout_read_call_done(struct rpc_task *task, void *data)
 
 	if (test_bit(NFS_IOHDR_REDO, &rdata->header->flags) &&
 	    task->tk_status == 0) {
-		if (rdata->res.seq_res.sr_slot != NULL)
-			nfs41_sequence_done(task, &rdata->res.seq_res);
+		nfs41_sequence_done(task, &rdata->res.seq_res);
 		return;
 	}
 
@@ -366,6 +367,7 @@ static int filelayout_write_done_cb(struct rpc_task *task,
 	struct nfs_pgio_header *hdr = data->header;
 	int err;
 
+	trace_nfs4_pnfs_write(data, task->tk_status);
 	err = filelayout_async_handle_error(task, data->args.context->state,
 					    data->ds_clp, hdr->lseg);
 
@@ -398,6 +400,7 @@ static int filelayout_commit_done_cb(struct rpc_task *task,
 {
 	int err;
 
+	trace_nfs4_pnfs_commit_ds(data, task->tk_status);
 	err = filelayout_async_handle_error(task, NULL, data->ds_clp,
 					    data->lseg);
 
@@ -442,8 +445,7 @@ static void filelayout_write_call_done(struct rpc_task *task, void *data)
 
 	if (test_bit(NFS_IOHDR_REDO, &wdata->header->flags) &&
 	    task->tk_status == 0) {
-		if (wdata->res.seq_res.sr_slot != NULL)
-			nfs41_sequence_done(task, &wdata->res.seq_res);
+		nfs41_sequence_done(task, &wdata->res.seq_res);
 		return;
 	}
 

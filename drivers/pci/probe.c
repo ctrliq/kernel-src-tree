@@ -90,13 +90,14 @@ static void release_pcibus_dev(struct device *dev)
 		put_device(pci_bus->bridge);
 	pci_bus_remove_resources(pci_bus);
 	pci_release_bus_of_node(pci_bus);
+	kfree(pci_bus->pci_bus_rh);
 	kfree(pci_bus);
 }
 
 static struct class pcibus_class = {
 	.name		= "pci_bus",
 	.dev_release	= &release_pcibus_dev,
-	.dev_attrs	= pcibus_dev_attrs,
+	.dev_groups	= pcibus_groups,
 };
 
 static int __init pcibus_class_init(void)
@@ -122,6 +123,42 @@ static u64 pci_size(u64 base, u64 maxbase, u64 mask)
 
 	return size;
 }
+
+int pci_read_config_byte(const struct pci_dev *dev, int where, u8 *val)
+{
+	return pci_bus_read_config_byte(dev->bus, dev->devfn, where, val);
+}
+EXPORT_SYMBOL(pci_read_config_byte);
+
+int pci_read_config_word(const struct pci_dev *dev, int where, u16 *val)
+{
+	return pci_bus_read_config_word(dev->bus, dev->devfn, where, val);
+}
+EXPORT_SYMBOL(pci_read_config_word);
+
+int pci_read_config_dword(const struct pci_dev *dev, int where, u32 *val)
+{
+	return pci_bus_read_config_dword(dev->bus, dev->devfn, where, val);
+}
+EXPORT_SYMBOL(pci_read_config_dword);
+
+int pci_write_config_byte(const struct pci_dev *dev, int where, u8 val)
+{
+	return pci_bus_write_config_byte(dev->bus, dev->devfn, where, val);
+}
+EXPORT_SYMBOL(pci_write_config_byte);
+
+int pci_write_config_word(const struct pci_dev *dev, int where, u16 val)
+{
+	return pci_bus_write_config_word(dev->bus, dev->devfn, where, val);
+}
+EXPORT_SYMBOL(pci_write_config_word);
+
+int pci_write_config_dword(const struct pci_dev *dev, int where, u32 val)
+{
+	return pci_bus_write_config_dword(dev->bus, dev->devfn, where, val);
+}
+EXPORT_SYMBOL(pci_write_config_dword);
 
 static inline unsigned long decode_bar(struct pci_dev *dev, u32 bar)
 {
@@ -483,6 +520,12 @@ static struct pci_bus *pci_alloc_bus(void)
 	if (!b)
 		return NULL;
 
+	b->pci_bus_rh = kzalloc(sizeof(struct pci_bus_rh), GFP_KERNEL);
+	if (!b->pci_bus_rh) {
+		kfree(b);
+		return NULL;
+	}
+
 	INIT_LIST_HEAD(&b->node);
 	INIT_LIST_HEAD(&b->children);
 	INIT_LIST_HEAD(&b->devices);
@@ -582,7 +625,7 @@ static enum pci_bus_speed agp_speed(int agp3, int agpstat)
 		index = 1;
 	else
 		goto out;
-	
+
 	if (agp3) {
 		index += 2;
 		if (index == 5)
@@ -789,7 +832,7 @@ int pci_scan_bridge(struct pci_bus *bus, struct pci_dev *dev, int max, int pass)
 	}
 
 	/* Disable MasterAbortMode during probing to avoid reporting
-	   of bus errors (in some architectures) */ 
+	   of bus errors (in some architectures) */
 	pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &bctl);
 	pci_write_config_word(dev, PCI_BRIDGE_CONTROL,
 			      bctl & ~PCI_BRIDGE_CTL_MASTER_ABORT);
@@ -1005,7 +1048,7 @@ void set_pcie_hotplug_bridge(struct pci_dev *pdev)
  * pci_setup_device - fill in class and map information of a device
  * @dev: the device structure to fill
  *
- * Initialize the device structure with information about the device's 
+ * Initialize the device structure with information about the device's
  * vendor,class,memory and IO-space addresses,IRQ lines etc.
  * Called at initialisation of the PCI subsystem and by CardBus services.
  * Returns 0 on success and negative if unknown type of device (not normal,
@@ -1111,7 +1154,7 @@ int pci_setup_device(struct pci_dev *dev)
 			goto bad;
 		/* The PCI-to-PCI bridge spec requires that subtractive
 		   decoding (i.e. transparent) bridge must have programming
-		   interface code of 0x01. */ 
+		   interface code of 0x01. */
 		pci_read_irq(dev);
 		dev->transparent = ((dev->class & 0xff) == 1);
 		pci_read_bases(dev, 2, PCI_ROM_ADDRESS1);
@@ -1169,6 +1212,8 @@ static void pci_release_dev(struct device *dev)
 	pci_release_capabilities(pci_dev);
 	pci_release_of_node(pci_dev);
 	pcibios_release_device(pci_dev);
+	pci_bus_put(pci_dev->bus);
+	kfree(pci_dev->pci_dev_rh);
 	kfree(pci_dev);
 }
 
@@ -1233,6 +1278,12 @@ struct pci_dev *pci_alloc_dev(struct pci_bus *bus)
 	if (!dev)
 		return NULL;
 
+	dev->pci_dev_rh = kzalloc(sizeof(struct pci_dev_rh), GFP_KERNEL);
+	if (!dev->pci_dev_rh) {
+		kfree(dev);
+		return NULL;
+	}
+
 	INIT_LIST_HEAD(&dev->bus_list);
 	dev->dev.type = &pci_dev_type;
 	dev->bus = pci_bus_get(bus);
@@ -1295,11 +1346,10 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 	if (!pci_bus_read_dev_vendor_id(bus, devfn, &l, 60*1000))
 		return NULL;
 
-	dev = alloc_pci_dev();
+	dev = pci_alloc_dev(bus);
 	if (!dev)
 		return NULL;
 
-	dev->bus = bus;
 	dev->devfn = devfn;
 	dev->vendor = l & 0xffff;
 	dev->device = (l >> 16) & 0xffff;
@@ -1307,6 +1357,8 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 	pci_set_of_node(dev);
 
 	if (pci_setup_device(dev)) {
+		pci_bus_put(dev->bus);
+		kfree(dev->pci_dev_rh);
 		kfree(dev);
 		return NULL;
 	}
@@ -1569,7 +1621,7 @@ static void pcie_write_mrrs(struct pci_dev *dev)
 	 * subsequent read will verify if the value is acceptable or not.
 	 * If the MRRS value provided is not acceptable (e.g., too large),
 	 * shrink the value until it is acceptable to the HW.
- 	 */
+	 */
 	while (mrrs != pcie_get_readrq(dev) && mrrs >= 128) {
 		rc = pcie_set_readrq(dev, mrrs);
 		if (!rc)
@@ -2002,7 +2054,6 @@ unsigned int __ref pci_rescan_bus(struct pci_bus *bus)
 
 	max = pci_scan_child_bus(bus);
 	pci_assign_unassigned_bus_resources(bus);
-	pci_enable_bridges(bus);
 	pci_bus_add_devices(bus);
 
 	return max;

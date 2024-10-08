@@ -1278,7 +1278,7 @@ int perf_evsel__parse_sample(struct perf_evsel *evsel, union perf_event *event,
 	}
 
 	if (type & PERF_SAMPLE_IP) {
-		data->ip = event->ip.ip;
+		data->ip = *array;
 		array++;
 	}
 
@@ -1585,7 +1585,7 @@ int perf_event__synthesize_sample(union perf_event *event, u64 type,
 	}
 
 	if (type & PERF_SAMPLE_IP) {
-		event->ip.ip = sample->ip;
+		*array = sample->ip;
 		array++;
 	}
 

@@ -916,9 +916,9 @@ int nvme_submit_sync_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
 	return cmdinfo.status;
 }
 
-static int nvme_submit_async_cmd(struct nvme_queue *nvmeq,
-			struct nvme_command *cmd,
-			struct async_cmd_info *cmdinfo, unsigned timeout)
+int nvme_submit_async_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+						struct async_cmd_info *cmdinfo,
+						unsigned timeout)
 {
 	int cmdid;
 
@@ -937,11 +937,10 @@ int nvme_submit_admin_cmd(struct nvme_dev *dev, struct nvme_command *cmd,
 	return nvme_submit_sync_cmd(dev->queues[0], cmd, result, ADMIN_TIMEOUT);
 }
 
-static int nvme_submit_admin_cmd_async(struct nvme_dev *dev,
-		struct nvme_command *cmd, struct async_cmd_info *cmdinfo)
+int nvme_submit_admin_cmd_async(struct nvme_dev *dev, struct nvme_command *cmd,
+						struct async_cmd_info *cmdinfo)
 {
-	return nvme_submit_async_cmd(dev->queues[0], cmd, cmdinfo,
-								ADMIN_TIMEOUT);
+	return nvme_submit_async_cmd(dev->queues[0], cmd, cmdinfo, ADMIN_TIMEOUT);
 }
 
 static int adapter_delete_queue(struct nvme_dev *dev, u8 opcode, u16 id)
@@ -1091,7 +1090,7 @@ static void nvme_abort_cmd(int cmdid, struct nvme_queue *nvmeq)
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.abort.opcode = nvme_admin_abort_cmd;
 	cmd.abort.cid = cmdid;
-	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
+	cmd.abort.sqid = nvmeq->qid;
 	cmd.abort.command_id = a_cmdid;
 
 	--dev->abort_limit;
@@ -2140,7 +2139,7 @@ static void nvme_dev_unmap(struct nvme_dev *dev)
 
 struct nvme_delq_ctx {
 	struct task_struct *waiter;
-	struct kthread_worker *worker;
+	struct kthread_worker* worker;
 	atomic_t refcount;
 };
 

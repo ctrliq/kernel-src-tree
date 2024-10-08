@@ -448,7 +448,7 @@ static int adpt_queue_lck(struct scsi_cmnd * cmd, void (*done) (struct scsi_cmnd
 	}
 
 	rmb();
-	if ((pHba->state) & DPTI_STATE_RESET)
+	if((pHba->state) & DPTI_STATE_RESET)
 		return SCSI_MLQUEUE_HOST_BUSY;
 
 	// TODO if the cmd->device if offline then I may need to issue a bus rescan
@@ -1804,7 +1804,7 @@ static int adpt_i2o_passthru(adpt_hba* pHba, u32 __user *arg)
 		 * Stop any new commands from enterring the
 		 * controller while processing the ioctl
 		 */
-		if (pHba->host) {
+		if(pHba->host) {
 			scsi_block_requests(pHba->host);
 			spin_lock_irqsave(pHba->host->host_lock, flags);
 		}
@@ -1812,11 +1812,11 @@ static int adpt_i2o_passthru(adpt_hba* pHba, u32 __user *arg)
 		if (rcode != 0)
 			printk("adpt_i2o_passthru: post wait failed %d %p\n",
 					rcode, reply);
-		if (pHba->host) {
+		if(pHba->host) {
 			spin_unlock_irqrestore(pHba->host->host_lock, flags);
 			scsi_unblock_requests(pHba->host);
 		}
-	} while (rcode == -ETIMEDOUT);
+	} while(rcode == -ETIMEDOUT);
 
 	if(rcode){
 		goto cleanup;

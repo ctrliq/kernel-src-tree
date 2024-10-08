@@ -88,7 +88,18 @@ struct scsi_disk {
 	unsigned	lbpws : 1;
 	unsigned	lbpws10 : 1;
 	unsigned	lbpvpd : 1;
+	unsigned	ws10 : 1;
 	unsigned	ws16 : 1;
+
+	/* FOR RH USE ONLY
+	 *
+	 * The following padding has been inserted before ABI freeze to
+	 * allow extending the structure while preserving ABI.
+	 */
+	u32		xcopy_reserved;
+
+	unsigned int	rh_reserved1;
+	unsigned int	rh_reserved2;
 };
 #define to_scsi_disk(obj) container_of(obj,struct scsi_disk,dev)
 

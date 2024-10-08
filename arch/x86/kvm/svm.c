@@ -197,7 +197,7 @@ static int npt = true;
 module_param(npt, int, S_IRUGO);
 
 /* allow nested virtualization in KVM/SVM */
-static int nested = true;
+static int nested = false;
 module_param(nested, int, S_IRUGO);
 
 static void svm_flush_tlb(struct kvm_vcpu *vcpu);

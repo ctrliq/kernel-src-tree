@@ -86,7 +86,7 @@ MODULE_FIRMWARE(FW_RV2P_FILE_09_Ax);
 
 static int disable_msi = 0;
 
-module_param(disable_msi, int, 0);
+module_param(disable_msi, int, S_IRUGO);
 MODULE_PARM_DESC(disable_msi, "Disable Message Signaled Interrupt (MSI)");
 
 typedef enum {
@@ -5780,8 +5780,8 @@ bnx2_run_loopback(struct bnx2 *bp, int loopback_mode)
 	if (!skb)
 		return -ENOMEM;
 	packet = skb_put(skb, pkt_size);
-	memcpy(packet, bp->dev->dev_addr, 6);
-	memset(packet + 6, 0x0, 8);
+	memcpy(packet, bp->dev->dev_addr, ETH_ALEN);
+	memset(packet + ETH_ALEN, 0x0, 8);
 	for (i = 14; i < pkt_size; i++)
 		packet[i] = (unsigned char) (i & 0xff);
 
@@ -8538,7 +8538,7 @@ bnx2_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_set_drvdata(pdev, dev);
 
-	memcpy(dev->dev_addr, bp->mac_addr, 6);
+	memcpy(dev->dev_addr, bp->mac_addr, ETH_ALEN);
 
 	dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_SG |
 		NETIF_F_TSO | NETIF_F_TSO_ECN |
@@ -8791,18 +8791,4 @@ static struct pci_driver bnx2_pci_driver = {
 	.shutdown	= bnx2_shutdown,
 };
 
-static int __init bnx2_init(void)
-{
-	return pci_register_driver(&bnx2_pci_driver);
-}
-
-static void __exit bnx2_cleanup(void)
-{
-	pci_unregister_driver(&bnx2_pci_driver);
-}
-
-module_init(bnx2_init);
-module_exit(bnx2_cleanup);
-
-
-
+module_pci_driver(bnx2_pci_driver);

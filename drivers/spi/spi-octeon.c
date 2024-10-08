@@ -11,6 +11,7 @@
 #include <linux/spi/spi.h>
 #include <linux/module.h>
 #include <linux/delay.h>
+#include <linux/init.h>
 #include <linux/io.h>
 #include <linux/of.h>
 

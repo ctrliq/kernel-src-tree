@@ -356,7 +356,7 @@ struct nvme_abort_cmd {
 	__u16			command_id;
 	__u32			rsvd1[9];
 	__le16			sqid;
-	__u16			cid;
+	__le16			cid;
 	__u32			rsvd11[5];
 };
 

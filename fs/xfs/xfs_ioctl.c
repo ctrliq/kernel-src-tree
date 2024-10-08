@@ -17,35 +17,31 @@
  */
 #include "xfs.h"
 #include "xfs_fs.h"
-#include "xfs_format.h"
 #include "xfs_shared.h"
-#include "xfs_log.h"
-#include "xfs_trans.h"
+#include "xfs_format.h"
+#include "xfs_log_format.h"
+#include "xfs_trans_resv.h"
 #include "xfs_sb.h"
 #include "xfs_ag.h"
-#include "xfs_alloc.h"
 #include "xfs_mount.h"
-#include "xfs_bmap_btree.h"
-#include "xfs_dinode.h"
 #include "xfs_inode.h"
 #include "xfs_ioctl.h"
+#include "xfs_alloc.h"
 #include "xfs_rtalloc.h"
 #include "xfs_itable.h"
 #include "xfs_error.h"
 #include "xfs_attr.h"
 #include "xfs_bmap.h"
 #include "xfs_bmap_util.h"
-#include "xfs_buf_item.h"
-#include "xfs_utils.h"
-#include "xfs_dfrag.h"
 #include "xfs_fsops.h"
-#include "xfs_vnodeops.h"
 #include "xfs_discard.h"
 #include "xfs_quota.h"
-#include "xfs_inode_item.h"
 #include "xfs_export.h"
 #include "xfs_trace.h"
 #include "xfs_icache.h"
+#include "xfs_symlink.h"
+#include "xfs_dinode.h"
+#include "xfs_trans.h"
 
 #include <linux/capability.h>
 #include <linux/dcache.h>
@@ -349,6 +345,40 @@ xfs_readlink_by_handle(
 	return error;
 }
 
+int
+xfs_set_dmattrs(
+	xfs_inode_t     *ip,
+	u_int		evmask,
+	u_int16_t	state)
+{
+	xfs_mount_t	*mp = ip->i_mount;
+	xfs_trans_t	*tp;
+	int		error;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return XFS_ERROR(EPERM);
+
+	if (XFS_FORCED_SHUTDOWN(mp))
+		return XFS_ERROR(EIO);
+
+	tp = xfs_trans_alloc(mp, XFS_TRANS_SET_DMATTRS);
+	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
+	if (error) {
+		xfs_trans_cancel(tp, 0);
+		return error;
+	}
+	xfs_ilock(ip, XFS_ILOCK_EXCL);
+	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+
+	ip->i_d.di_dmevmask = evmask;
+	ip->i_d.di_dmstate  = state;
+
+	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+	error = xfs_trans_commit(tp, 0);
+
+	return error;
+}
+
 STATIC int
 xfs_fssetdm_by_handle(
 	struct file		*parfilp,
@@ -607,7 +637,11 @@ xfs_ioc_space(
 	unsigned int		cmd,
 	xfs_flock64_t		*bf)
 {
-	int			attr_flags = 0;
+	struct xfs_mount	*mp = ip->i_mount;
+	struct xfs_trans	*tp;
+	struct iattr		iattr;
+	bool			setprealloc = false;
+	bool			clrprealloc = false;
 	int			error;
 
 	/*
@@ -627,19 +661,128 @@ xfs_ioc_space(
 	if (!S_ISREG(inode->i_mode))
 		return -XFS_ERROR(EINVAL);
 
-	if (filp->f_flags & (O_NDELAY|O_NONBLOCK))
-		attr_flags |= XFS_ATTR_NONBLOCK;
-
-	if (filp->f_flags & O_DSYNC)
-		attr_flags |= XFS_ATTR_SYNC;
-
-	if (ioflags & IO_INVIS)
-		attr_flags |= XFS_ATTR_DMI;
-
 	error = mnt_want_write_file(filp);
 	if (error)
 		return error;
-	error = xfs_change_file_space(ip, cmd, bf, filp->f_pos, attr_flags);
+
+	xfs_ilock(ip, XFS_IOLOCK_EXCL);
+
+	switch (bf->l_whence) {
+	case 0: /*SEEK_SET*/
+		break;
+	case 1: /*SEEK_CUR*/
+		bf->l_start += filp->f_pos;
+		break;
+	case 2: /*SEEK_END*/
+		bf->l_start += XFS_ISIZE(ip);
+		break;
+	default:
+		error = XFS_ERROR(EINVAL);
+		goto out_unlock;
+	}
+
+	/*
+	 * length of <= 0 for resv/unresv/zero is invalid.  length for
+	 * alloc/free is ignored completely and we have no idea what userspace
+	 * might have set it to, so set it to zero to allow range
+	 * checks to pass.
+	 */
+	switch (cmd) {
+	case XFS_IOC_ZERO_RANGE:
+	case XFS_IOC_RESVSP:
+	case XFS_IOC_RESVSP64:
+	case XFS_IOC_UNRESVSP:
+	case XFS_IOC_UNRESVSP64:
+		if (bf->l_len <= 0) {
+			error = XFS_ERROR(EINVAL);
+			goto out_unlock;
+		}
+		break;
+	default:
+		bf->l_len = 0;
+		break;
+	}
+
+	if (bf->l_start < 0 ||
+	    bf->l_start > mp->m_super->s_maxbytes ||
+	    bf->l_start + bf->l_len < 0 ||
+	    bf->l_start + bf->l_len >= mp->m_super->s_maxbytes) {
+		error = XFS_ERROR(EINVAL);
+		goto out_unlock;
+	}
+
+	switch (cmd) {
+	case XFS_IOC_ZERO_RANGE:
+		error = xfs_zero_file_space(ip, bf->l_start, bf->l_len);
+		if (!error)
+			setprealloc = true;
+		break;
+	case XFS_IOC_RESVSP:
+	case XFS_IOC_RESVSP64:
+		error = xfs_alloc_file_space(ip, bf->l_start, bf->l_len,
+						XFS_BMAPI_PREALLOC);
+		if (!error)
+			setprealloc = true;
+		break;
+	case XFS_IOC_UNRESVSP:
+	case XFS_IOC_UNRESVSP64:
+		error = xfs_free_file_space(ip, bf->l_start, bf->l_len);
+		break;
+	case XFS_IOC_ALLOCSP:
+	case XFS_IOC_ALLOCSP64:
+	case XFS_IOC_FREESP:
+	case XFS_IOC_FREESP64:
+		if (bf->l_start > XFS_ISIZE(ip)) {
+			error = xfs_alloc_file_space(ip, XFS_ISIZE(ip),
+					bf->l_start - XFS_ISIZE(ip), 0);
+			if (error)
+				goto out_unlock;
+		}
+
+		iattr.ia_valid = ATTR_SIZE;
+		iattr.ia_size = bf->l_start;
+
+		error = xfs_setattr_size(ip, &iattr);
+		if (!error)
+			clrprealloc = true;
+		break;
+	default:
+		ASSERT(0);
+		error = XFS_ERROR(EINVAL);
+	}
+
+	if (error)
+		goto out_unlock;
+
+	tp = xfs_trans_alloc(mp, XFS_TRANS_WRITEID);
+	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_writeid, 0, 0);
+	if (error) {
+		xfs_trans_cancel(tp, 0);
+		goto out_unlock;
+	}
+
+	xfs_ilock(ip, XFS_ILOCK_EXCL);
+	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+
+	if (!(ioflags & IO_INVIS)) {
+		ip->i_d.di_mode &= ~S_ISUID;
+		if (ip->i_d.di_mode & S_IXGRP)
+			ip->i_d.di_mode &= ~S_ISGID;
+		xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+	}
+
+	if (setprealloc)
+		ip->i_d.di_flags |= XFS_DIFLAG_PREALLOC;
+	else if (clrprealloc)
+		ip->i_d.di_flags &= ~XFS_DIFLAG_PREALLOC;
+
+	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+	if (filp->f_flags & O_DSYNC)
+		xfs_trans_set_sync(tp);
+	error = xfs_trans_commit(tp, 0);
+
+out_unlock:
+	xfs_iunlock(ip, XFS_IOLOCK_EXCL);
 	mnt_drop_write_file(filp);
 	return -error;
 }
@@ -955,7 +1098,7 @@ xfs_ioctl_setattr(
 	 * first do an error checking pass.
 	 */
 	tp = xfs_trans_alloc(mp, XFS_TRANS_SETATTR_NOT_SIZE);
-	code = xfs_trans_reserve(tp, 0, XFS_ICHANGE_LOG_RES(mp), 0, 0, 0);
+	code = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
 	if (code)
 		goto error_return;
 
@@ -1323,6 +1466,75 @@ xfs_ioc_getbmapx(
 	return 0;
 }
 
+int
+xfs_ioc_swapext(
+	xfs_swapext_t	*sxp)
+{
+	xfs_inode_t     *ip, *tip;
+	struct fd	f, tmp;
+	int		error = 0;
+
+	/* Pull information for the target fd */
+	f = fdget((int)sxp->sx_fdtarget);
+	if (!f.file) {
+		error = XFS_ERROR(EINVAL);
+		goto out;
+	}
+
+	if (!(f.file->f_mode & FMODE_WRITE) ||
+	    !(f.file->f_mode & FMODE_READ) ||
+	    (f.file->f_flags & O_APPEND)) {
+		error = XFS_ERROR(EBADF);
+		goto out_put_file;
+	}
+
+	tmp = fdget((int)sxp->sx_fdtmp);
+	if (!tmp.file) {
+		error = XFS_ERROR(EINVAL);
+		goto out_put_file;
+	}
+
+	if (!(tmp.file->f_mode & FMODE_WRITE) ||
+	    !(tmp.file->f_mode & FMODE_READ) ||
+	    (tmp.file->f_flags & O_APPEND)) {
+		error = XFS_ERROR(EBADF);
+		goto out_put_tmp_file;
+	}
+
+	if (IS_SWAPFILE(file_inode(f.file)) ||
+	    IS_SWAPFILE(file_inode(tmp.file))) {
+		error = XFS_ERROR(EINVAL);
+		goto out_put_tmp_file;
+	}
+
+	ip = XFS_I(file_inode(f.file));
+	tip = XFS_I(file_inode(tmp.file));
+
+	if (ip->i_mount != tip->i_mount) {
+		error = XFS_ERROR(EINVAL);
+		goto out_put_tmp_file;
+	}
+
+	if (ip->i_ino == tip->i_ino) {
+		error = XFS_ERROR(EINVAL);
+		goto out_put_tmp_file;
+	}
+
+	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
+		error = XFS_ERROR(EIO);
+		goto out_put_tmp_file;
+	}
+
+	error = xfs_swap_extents(ip, tip, sxp);
+
+ out_put_tmp_file:
+	fdput(tmp);
+ out_put_file:
+	fdput(f);
+ out:
+	return error;
+}
+
 /*
  * Note: some of the ioctl's return positive numbers as a
  * byte count indicating success, such as readlink_by_handle.
@@ -1371,7 +1583,7 @@ xfs_file_ioctl(
 			XFS_IS_REALTIME_INODE(ip) ?
 			mp->m_rtdev_targp : mp->m_ddev_targp;
 
-		da.d_mem =  da.d_miniosz = target->bt_logical_sectorsize;
+		da.d_mem = da.d_miniosz = target->bt_logical_sectorsize;
 		da.d_maxiosz = INT_MAX & ~(da.d_miniosz - 1);
 
 		if (copy_to_user(arg, &da, sizeof(da)))
@@ -1467,7 +1679,7 @@ xfs_file_ioctl(
 		error = mnt_want_write_file(filp);
 		if (error)
 			return error;
-		error = xfs_swapext(&sxp);
+		error = xfs_ioc_swapext(&sxp);
 		mnt_drop_write_file(filp);
 		return -error;
 	}

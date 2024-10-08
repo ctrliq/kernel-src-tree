@@ -34,12 +34,13 @@
 #include <linux/backing-dev.h>
 #include <linux/freezer.h>
 
-#include "xfs_sb.h"
+#include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_log.h"
+#include "xfs_sb.h"
 #include "xfs_ag.h"
 #include "xfs_mount.h"
 #include "xfs_trace.h"
+#include "xfs_log.h"
 
 static kmem_zone_t *xfs_buf_zone;
 
@@ -750,7 +751,11 @@ xfs_buf_read_uncached(
 	bp->b_flags |= XBF_READ;
 	bp->b_ops = ops;
 
-	xfsbdstrat(target->bt_mount, bp);
+	if (XFS_FORCED_SHUTDOWN(target->bt_mount)) {
+		xfs_buf_relse(bp);
+		return NULL;
+	}
+	xfs_buf_iorequest(bp);
 	xfs_buf_iowait(bp);
 	return bp;
 }
@@ -1120,7 +1125,7 @@ xfs_bioerror(
  * This is meant for userdata errors; metadata bufs come with
  * iodone functions attached, so that we can track down errors.
  */
-STATIC int
+int
 xfs_bioerror_relse(
 	struct xfs_buf	*bp)
 {
@@ -1183,7 +1188,7 @@ xfs_bwrite(
 	ASSERT(xfs_buf_islocked(bp));
 
 	bp->b_flags |= XBF_WRITE;
-	bp->b_flags &= ~(XBF_ASYNC | XBF_READ | _XBF_DELWRI_Q);
+	bp->b_flags &= ~(XBF_ASYNC | XBF_READ | _XBF_DELWRI_Q | XBF_WRITE_FAIL);
 
 	xfs_bdstrat_cb(bp);
 
@@ -1193,25 +1198,6 @@ xfs_bwrite(
 				   SHUTDOWN_META_IO_ERROR);
 	}
 	return error;
-}
-
-/*
- * Wrapper around bdstrat so that we can stop data from going to disk in case
- * we are shutting down the filesystem.  Typically user data goes thru this
- * path; one of the exceptions is the superblock.
- */
-void
-xfsbdstrat(
-	struct xfs_mount	*mp,
-	struct xfs_buf		*bp)
-{
-	if (XFS_FORCED_SHUTDOWN(mp)) {
-		trace_xfs_bdstrat_shut(bp, _RET_IP_);
-		xfs_bioerror_relse(bp);
-		return;
-	}
-
-	xfs_buf_iorequest(bp);
 }
 
 STATIC void
@@ -1533,6 +1519,12 @@ restart:
 		 */
 		atomic_set(&bp->b_lru_ref, 0);
 		spin_unlock(&btp->bt_lru_lock);
+		if (bp->b_flags & XBF_WRITE_FAIL) {
+			xfs_alert(btp->bt_mount,
+"Corruption Alert: Buffer at block 0x%llx had permanent write failures!\n"
+"Please run xfs_repair to determine the extent of the problem.",
+				(long long)bp->b_bn);
+		}
 		xfs_buf_rele(bp);
 		spin_lock(&btp->bt_lru_lock);
 	}
@@ -1789,7 +1781,7 @@ __xfs_buf_delwri_submit(
 
 	blk_start_plug(&plug);
 	list_for_each_entry_safe(bp, n, io_list, b_list) {
-		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_ASYNC);
+		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_ASYNC | XBF_WRITE_FAIL);
 		bp->b_flags |= XBF_WRITE;
 
 		if (!wait) {

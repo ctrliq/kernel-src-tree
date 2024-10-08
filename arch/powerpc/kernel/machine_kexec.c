@@ -111,6 +111,45 @@ void machine_kexec(struct kimage *image)
 	for(;;);
 }
 
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+unsigned long long __init arch_default_crash_base(void)
+{
+#ifndef CONFIG_RELOCATABLE
+	return KDUMP_KERNELBASE;
+#else
+	return 0;
+#endif
+}
+
+unsigned long long __init arch_default_crash_size(unsigned long long total_size)
+{
+	if (total_size < KEXEC_AUTO_THRESHOLD)
+		return 0;
+
+#ifdef CONFIG_64BIT
+	/*
+	 * crashkernel 'auto' reservation scheme
+	 * 2G-4G:256M,4G-32G:512M,32G-64G:1G,64G-128G:2G,128G-:4G
+	 */
+	if (total_size < (1ULL<<32)) /* 4G */
+		return 1ULL<<28; /* 256M */
+	if (total_size < (1ULL<<35)) /* 32G */
+		return 1ULL<<29; /* 512M */
+	if (total_size < (1ULL<<36)) /* 64G */
+		return 1ULL<<30; /* 1G */
+	if (total_size < (1ULL<<37)) /* 128G */
+		return 1ULL<<31; /* 2G */
+
+	return 1ULL<<32; /* 4G */
+#else
+	if (total_size < (1ULL<<32))
+		return 1ULL<<27;
+	else
+		return 1ULL<<28;
+#endif
+}
+#endif
+
 void __init reserve_crashkernel(void)
 {
 	unsigned long long crash_size, crash_base;

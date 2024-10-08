@@ -71,6 +71,8 @@ static int lpfc_sli4_post_els_sgl_list(struct lpfc_hba *, struct list_head *,
 				       int);
 static void lpfc_sli4_hba_handle_eqe(struct lpfc_hba *, struct lpfc_eqe *,
 			uint32_t);
+static bool lpfc_sli4_mbox_completions_pending(struct lpfc_hba *phba);
+static bool lpfc_sli4_process_missed_mbox_completions(struct lpfc_hba *phba);
 
 static IOCB_t *
 lpfc_get_iocb_from_iocbq(struct lpfc_iocbq *iocbq)
@@ -633,7 +635,7 @@ lpfc_clr_rrq_active(struct lpfc_hba *phba,
 	if (!ndlp)
 		goto out;
 
-	if (test_and_clear_bit(xritag, ndlp->active_rrqs.xri_bitmap)) {
+	if (test_and_clear_bit(xritag, ndlp->active_rrqs_xri_bitmap)) {
 		rrq->send_rrq = 0;
 		rrq->xritag = 0;
 		rrq->rrq_stop_time = 0;
@@ -811,7 +813,9 @@ lpfc_test_rrq_active(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp,
 {
 	if (!ndlp)
 		return 0;
-	if (test_bit(xritag, ndlp->active_rrqs.xri_bitmap))
+	if (!ndlp->active_rrqs_xri_bitmap)
+		return 0;
+	if (test_bit(xritag, ndlp->active_rrqs_xri_bitmap))
 			return 1;
 	else
 		return 0;
@@ -861,7 +865,10 @@ lpfc_set_rrq_active(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp,
 	if (ndlp->vport && (ndlp->vport->load_flag & FC_UNLOADING))
 		goto out;
 
-	if (test_and_set_bit(xritag, ndlp->active_rrqs.xri_bitmap))
+	if (!ndlp->active_rrqs_xri_bitmap)
+		goto out;
+
+	if (test_and_set_bit(xritag, ndlp->active_rrqs_xri_bitmap))
 		goto out;
 
 	spin_unlock_irqrestore(&phba->hbalock, iflags);
@@ -1011,17 +1018,6 @@ __lpfc_sli_release_iocbq_s4(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq)
 	else
 		sglq = __lpfc_clear_active_sglq(phba, iocbq->sli4_lxritag);
 
-	/*
-	** This should have been removed from the txcmplq before calling
-	** iocbq_release. The normal completion
-	** path should have already done the list_del_init.
-	*/
-	if (unlikely(!list_empty(&iocbq->list))) {
-		if (iocbq->iocb_flag & LPFC_IO_ON_TXCMPLQ)
-			iocbq->iocb_flag &= ~LPFC_IO_ON_TXCMPLQ;
-		list_del_init(&iocbq->list);
-	}
-
 
 	if (sglq)  {
 		if ((iocbq->iocb_flag & LPFC_EXCHANGE_BUSY) &&
@@ -1070,13 +1066,6 @@ __lpfc_sli_release_iocbq_s3(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq)
 {
 	size_t start_clean = offsetof(struct lpfc_iocbq, iocb);
 
-	/*
-	** This should have been removed from the txcmplq before calling
-	** iocbq_release. The normal completion
-	** path should have already done the list_del_init.
-	*/
-	if (unlikely(!list_empty(&iocbq->list)))
-		list_del_init(&iocbq->list);
 
 	/*
 	 * Clean all volatile data fields, preserve iotag and node struct.
@@ -6181,6 +6170,7 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 		kfree(vpd);
 		goto out_free_mbox;
 	}
+
 	mqe = &mboxq->u.mqe;
 	phba->sli_rev = bf_get(lpfc_mbx_rd_rev_sli_lvl, &mqe->un.read_rev);
 	if (bf_get(lpfc_mbx_rd_rev_fcoe, &mqe->un.read_rev))
@@ -6266,6 +6256,16 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 			phba->vpd.rev.opFwName,
 			phba->vpd.rev.fcphHigh, phba->vpd.rev.fcphLow,
 			phba->vpd.rev.feaLevelHigh, phba->vpd.rev.feaLevelLow);
+
+	/* Reset the DFT_LUN_Q_DEPTH to (max xri >> 3)  */
+	rc = (phba->sli4_hba.max_cfg_param.max_xri >> 3);
+	if (phba->pport->cfg_lun_queue_depth > rc) {
+		lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
+				"3362 LUN queue depth changed from %d to %d\n",
+				phba->pport->cfg_lun_queue_depth, rc);
+		phba->pport->cfg_lun_queue_depth = rc;
+	}
+
 
 	/*
 	 * Discover the port's supported feature set and match it against the
@@ -6573,6 +6573,108 @@ lpfc_mbox_timeout(unsigned long ptr)
 	return;
 }
 
+/**
+ * lpfc_sli4_mbox_completions_pending - check to see if any mailbox completions
+ *                                    are pending
+ * @phba: Pointer to HBA context object.
+ *
+ * This function checks if any mailbox completions are present on the mailbox
+ * completion queue.
+ **/
+bool
+lpfc_sli4_mbox_completions_pending(struct lpfc_hba *phba)
+{
+
+	uint32_t idx;
+	struct lpfc_queue *mcq;
+	struct lpfc_mcqe *mcqe;
+	bool pending_completions = false;
+
+	if (unlikely(!phba) || (phba->sli_rev != LPFC_SLI_REV4))
+		return false;
+
+	/* Check for completions on mailbox completion queue */
+
+	mcq = phba->sli4_hba.mbx_cq;
+	idx = mcq->hba_index;
+	while (bf_get_le32(lpfc_cqe_valid, mcq->qe[idx].cqe)) {
+		mcqe = (struct lpfc_mcqe *)mcq->qe[idx].cqe;
+		if (bf_get_le32(lpfc_trailer_completed, mcqe) &&
+		    (!bf_get_le32(lpfc_trailer_async, mcqe))) {
+			pending_completions = true;
+			break;
+		}
+		idx = (idx + 1) % mcq->entry_count;
+		if (mcq->hba_index == idx)
+			break;
+	}
+	return pending_completions;
+
+}
+
+/**
+ * lpfc_sli4_process_missed_mbox_completions - process mbox completions
+ *					      that were missed.
+ * @phba: Pointer to HBA context object.
+ *
+ * For sli4, it is possible to miss an interrupt. As such mbox completions
+ * maybe missed causing erroneous mailbox timeouts to occur. This function
+ * checks to see if mbox completions are on the mailbox completion queue
+ * and will process all the completions associated with the eq for the
+ * mailbox completion queue.
+ **/
+bool
+lpfc_sli4_process_missed_mbox_completions(struct lpfc_hba *phba)
+{
+
+	uint32_t eqidx;
+	struct lpfc_queue *fpeq = NULL;
+	struct lpfc_eqe *eqe;
+	bool mbox_pending;
+
+	if (unlikely(!phba) || (phba->sli_rev != LPFC_SLI_REV4))
+		return false;
+
+	/* Find the eq associated with the mcq */
+
+	if (phba->sli4_hba.hba_eq)
+		for (eqidx = 0; eqidx < phba->cfg_fcp_io_channel; eqidx++)
+			if (phba->sli4_hba.hba_eq[eqidx]->queue_id ==
+			    phba->sli4_hba.mbx_cq->assoc_qid) {
+				fpeq = phba->sli4_hba.hba_eq[eqidx];
+				break;
+			}
+	if (!fpeq)
+		return false;
+
+	/* Turn off interrupts from this EQ */
+
+	lpfc_sli4_eq_clr_intr(fpeq);
+
+	/* Check to see if a mbox completion is pending */
+
+	mbox_pending = lpfc_sli4_mbox_completions_pending(phba);
+
+	/*
+	 * If a mbox completion is pending, process all the events on EQ
+	 * associated with the mbox completion queue (this could include
+	 * mailbox commands, async events, els commands, receive queue data
+	 * and fcp commands)
+	 */
+
+	if (mbox_pending)
+		while ((eqe = lpfc_sli4_eq_get(fpeq))) {
+			lpfc_sli4_hba_handle_eqe(phba, eqe, eqidx);
+			fpeq->EQ_processed++;
+		}
+
+	/* Always clear and re-arm the EQ */
+
+	lpfc_sli4_eq_release(fpeq, LPFC_QUEUE_REARM);
+
+	return mbox_pending;
+
+}
 
 /**
  * lpfc_mbox_timeout_handler - Worker thread function to handle mailbox timeout
@@ -6589,6 +6691,10 @@ lpfc_mbox_timeout_handler(struct lpfc_hba *phba)
 	MAILBOX_t *mb = &pmbox->u.mb;
 	struct lpfc_sli *psli = &phba->sli;
 	struct lpfc_sli_ring *pring;
+
+	/* If the mailbox completed, process the completion and return */
+	if (lpfc_sli4_process_missed_mbox_completions(phba))
+		return;
 
 	/* Check the pmbox pointer first.  There is a race condition
 	 * between the mbox timeout handler getting executed in the
@@ -7083,6 +7189,10 @@ lpfc_sli4_async_mbox_block(struct lpfc_hba *phba)
 						phba->sli.mbox_active) *
 						1000) + jiffies;
 	spin_unlock_irq(&phba->hbalock);
+
+	/* Make sure the mailbox is really active */
+	if (timeout)
+		lpfc_sli4_process_missed_mbox_completions(phba);
 
 	/* Wait for the outstnading mailbox command to complete */
 	while (phba->sli.mbox_active) {
@@ -7927,7 +8037,8 @@ lpfc_sli4_scmd_to_wqidx_distr(struct lpfc_hba *phba)
 	struct lpfc_vector_map_info *cpup;
 	int chann, cpu;
 
-	if (phba->cfg_fcp_io_sched == LPFC_FCP_SCHED_BY_CPU) {
+	if (phba->cfg_fcp_io_sched == LPFC_FCP_SCHED_BY_CPU
+	    && phba->cfg_fcp_io_channel > 1) {
 		cpu = smp_processor_id();
 		if (cpu < phba->sli4_hba.num_present_cpu) {
 			cpup = phba->sli4_hba.cpu_map;
@@ -8128,8 +8239,10 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 		command_type = FCP_COMMAND_DATA_OUT;
 		/* word3 iocb=iotag wqe=payload_offset_len */
 		/* Add the FCP_CMD and FCP_RSP sizes to get the offset */
-		wqe->fcp_iwrite.payload_offset_len =
-			xmit_len + sizeof(struct fcp_rsp);
+		bf_set(payload_offset_len, &wqe->fcp_iwrite,
+		       xmit_len + sizeof(struct fcp_rsp));
+		bf_set(cmd_buff_len, &wqe->fcp_iwrite,
+		       0);
 		/* word4 iocb=parameter wqe=total_xfer_length memcpy */
 		/* word5 iocb=initial_xfer_len wqe=initial_xfer_len memcpy */
 		bf_set(wqe_erp, &wqe->fcp_iwrite.wqe_com,
@@ -8147,8 +8260,10 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 	case CMD_FCP_IREAD64_CR:
 		/* word3 iocb=iotag wqe=payload_offset_len */
 		/* Add the FCP_CMD and FCP_RSP sizes to get the offset */
-		wqe->fcp_iread.payload_offset_len =
-			xmit_len + sizeof(struct fcp_rsp);
+		bf_set(payload_offset_len, &wqe->fcp_iread,
+		       xmit_len + sizeof(struct fcp_rsp));
+		bf_set(cmd_buff_len, &wqe->fcp_iread,
+		       0);
 		/* word4 iocb=parameter wqe=total_xfer_length memcpy */
 		/* word5 iocb=initial_xfer_len wqe=initial_xfer_len memcpy */
 		bf_set(wqe_erp, &wqe->fcp_iread.wqe_com,
@@ -8164,8 +8279,13 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 		bf_set(wqe_dbde, &wqe->fcp_iread.wqe_com, 1);
 		break;
 	case CMD_FCP_ICMND64_CR:
+		/* word3 iocb=iotag wqe=payload_offset_len */
+		/* Add the FCP_CMD and FCP_RSP sizes to get the offset */
+		bf_set(payload_offset_len, &wqe->fcp_icmd,
+		       xmit_len + sizeof(struct fcp_rsp));
+		bf_set(cmd_buff_len, &wqe->fcp_icmd,
+		       0);
 		/* word3 iocb=IO_TAG wqe=reserved */
-		wqe->fcp_icmd.rsrvd3 = 0;
 		bf_set(wqe_pu, &wqe->fcp_icmd.wqe_com, 0);
 		/* Always open the exchange */
 		bf_set(wqe_xc, &wqe->fcp_icmd.wqe_com, 0);
@@ -8734,7 +8854,7 @@ lpfc_sli4_abts_err_handler(struct lpfc_hba *phba,
 	lpfc_printf_log(phba, KERN_WARNING, LOG_SLI,
 			"3116 Port generated FCP XRI ABORT event on "
 			"vpi %d rpi %d xri x%x status 0x%x parameter x%x\n",
-			ndlp->vport->vpi, ndlp->nlp_rpi,
+			ndlp->vport->vpi, phba->sli4_hba.rpi_ids[ndlp->nlp_rpi],
 			bf_get(lpfc_wcqe_xa_xri, axri),
 			bf_get(lpfc_wcqe_xa_status, axri),
 			axri->parameter);
@@ -9790,7 +9910,7 @@ lpfc_sli_abort_fcp_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			struct lpfc_iocbq *rspiocb)
 {
 	lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
-			"3096 ABORT_XRI_CN completing on xri x%x "
+			"3096 ABORT_XRI_CN completing on rpi x%x "
 			"original iotag x%x, abort cmd iotag x%x "
 			"status 0x%x, reason 0x%x\n",
 			cmdiocb->iocb.un.acxri.abortContextTag,
@@ -10196,7 +10316,6 @@ lpfc_sli_issue_mbox_wait(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq,
 		 */
 		if (pmboxq->mbox_flag & LPFC_MBX_WAKE) {
 			retval = MBX_SUCCESS;
-			lpfc_sli4_swap_str(phba, pmboxq);
 		} else {
 			retval = MBX_TIMEOUT;
 			pmboxq->mbox_cmpl = lpfc_sli_def_mbox_cmpl;
@@ -12910,10 +13029,44 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 		    wq->page_count);
 	bf_set(lpfc_mbx_wq_create_cq_id, &wq_create->u.request,
 		    cq->queue_id);
+
+	/* wqv is the earliest version supported, NOT the latest */
 	bf_set(lpfc_mbox_hdr_version, &shdr->request,
 	       phba->sli4_hba.pc_sli4_params.wqv);
 
-	if (phba->sli4_hba.pc_sli4_params.wqv == LPFC_Q_CREATE_VERSION_1) {
+	switch (phba->sli4_hba.pc_sli4_params.wqv) {
+	case LPFC_Q_CREATE_VERSION_0:
+		switch (wq->entry_size) {
+		default:
+		case 64:
+			/* Nothing to do, version 0 ONLY supports 64 byte */
+			page = wq_create->u.request.page;
+			break;
+		case 128:
+			if (!(phba->sli4_hba.pc_sli4_params.wqsize &
+			    LPFC_WQ_SZ128_SUPPORT)) {
+				status = -ERANGE;
+				goto out;
+			}
+			/* If we get here the HBA MUST also support V1 and
+			 * we MUST use it
+			 */
+			bf_set(lpfc_mbox_hdr_version, &shdr->request,
+			       LPFC_Q_CREATE_VERSION_1);
+
+			bf_set(lpfc_mbx_wq_create_wqe_count,
+			       &wq_create->u.request_1, wq->entry_count);
+			bf_set(lpfc_mbx_wq_create_wqe_size,
+			       &wq_create->u.request_1,
+			       LPFC_WQ_WQE_SIZE_128);
+			bf_set(lpfc_mbx_wq_create_page_size,
+			       &wq_create->u.request_1,
+			       (PAGE_SIZE/SLI4_PAGE_SIZE));
+			page = wq_create->u.request_1.page;
+			break;
+		}
+		break;
+	case LPFC_Q_CREATE_VERSION_1:
 		bf_set(lpfc_mbx_wq_create_wqe_count, &wq_create->u.request_1,
 		       wq->entry_count);
 		switch (wq->entry_size) {
@@ -12924,6 +13077,11 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 			       LPFC_WQ_WQE_SIZE_64);
 			break;
 		case 128:
+			if (!(phba->sli4_hba.pc_sli4_params.wqsize &
+				LPFC_WQ_SZ128_SUPPORT)) {
+				status = -ERANGE;
+				goto out;
+			}
 			bf_set(lpfc_mbx_wq_create_wqe_size,
 			       &wq_create->u.request_1,
 			       LPFC_WQ_WQE_SIZE_128);
@@ -12932,9 +13090,12 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 		bf_set(lpfc_mbx_wq_create_page_size, &wq_create->u.request_1,
 		       (PAGE_SIZE/SLI4_PAGE_SIZE));
 		page = wq_create->u.request_1.page;
-	} else {
-		page = wq_create->u.request.page;
+		break;
+	default:
+		status = -ERANGE;
+		goto out;
 	}
+
 	list_for_each_entry(dmabuf, &wq->page_list, list) {
 		memset(dmabuf->virt, 0, hw_page_size);
 		page[dmabuf->buffer_tag].addr_lo = putPaddrLow(dmabuf->phys);
@@ -15103,6 +15264,7 @@ lpfc_sli4_alloc_rpi(struct lpfc_hba *phba)
 	uint16_t max_rpi, rpi_limit;
 	uint16_t rpi_remaining, lrpi = 0;
 	struct lpfc_rpi_hdr *rpi_hdr;
+	unsigned long iflag;
 
 	max_rpi = phba->sli4_hba.max_cfg_param.max_rpi;
 	rpi_limit = phba->sli4_hba.next_rpi;
@@ -15111,7 +15273,7 @@ lpfc_sli4_alloc_rpi(struct lpfc_hba *phba)
 	 * Fetch the next logical rpi.  Because this index is logical,
 	 * the  driver starts at 0 each time.
 	 */
-	spin_lock_irq(&phba->hbalock);
+	spin_lock_irqsave(&phba->hbalock, iflag);
 	rpi = find_next_zero_bit(phba->sli4_hba.rpi_bmask, rpi_limit, 0);
 	if (rpi >= rpi_limit)
 		rpi = LPFC_RPI_ALLOC_ERROR;
@@ -15127,7 +15289,7 @@ lpfc_sli4_alloc_rpi(struct lpfc_hba *phba)
 	 */
 	if ((rpi == LPFC_RPI_ALLOC_ERROR) &&
 	    (phba->sli4_hba.rpi_count >= max_rpi)) {
-		spin_unlock_irq(&phba->hbalock);
+		spin_unlock_irqrestore(&phba->hbalock, iflag);
 		return rpi;
 	}
 
@@ -15136,7 +15298,7 @@ lpfc_sli4_alloc_rpi(struct lpfc_hba *phba)
 	 * extents.
 	 */
 	if (!phba->sli4_hba.rpi_hdrs_in_use) {
-		spin_unlock_irq(&phba->hbalock);
+		spin_unlock_irqrestore(&phba->hbalock, iflag);
 		return rpi;
 	}
 
@@ -15147,7 +15309,7 @@ lpfc_sli4_alloc_rpi(struct lpfc_hba *phba)
 	 * how many are supported max by the device.
 	 */
 	rpi_remaining = phba->sli4_hba.next_rpi - phba->sli4_hba.rpi_count;
-	spin_unlock_irq(&phba->hbalock);
+	spin_unlock_irqrestore(&phba->hbalock, iflag);
 	if (rpi_remaining < LPFC_RPI_LOW_WATER_MARK) {
 		rpi_hdr = lpfc_sli4_create_rpi_hdr(phba);
 		if (!rpi_hdr) {
@@ -16395,7 +16557,7 @@ lpfc_drain_txq(struct lpfc_hba *phba)
 	union lpfc_wqe wqe;
 	int txq_cnt = 0;
 
-	spin_lock_irqsave(&phba->hbalock, iflags);
+	spin_lock_irqsave(&pring->ring_lock, iflags);
 	list_for_each_entry(piocbq, &pring->txq, list) {
 		txq_cnt++;
 	}
@@ -16403,14 +16565,14 @@ lpfc_drain_txq(struct lpfc_hba *phba)
 	if (txq_cnt > pring->txq_max)
 		pring->txq_max = txq_cnt;
 
-	spin_unlock_irqrestore(&phba->hbalock, iflags);
+	spin_unlock_irqrestore(&pring->ring_lock, iflags);
 
 	while (!list_empty(&pring->txq)) {
-		spin_lock_irqsave(&phba->hbalock, iflags);
+		spin_lock_irqsave(&pring->ring_lock, iflags);
 
 		piocbq = lpfc_sli_ringtx_get(phba, pring);
 		if (!piocbq) {
-			spin_unlock_irqrestore(&phba->hbalock, iflags);
+			spin_unlock_irqrestore(&pring->ring_lock, iflags);
 			lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
 				"2823 txq empty and txq_cnt is %d\n ",
 				txq_cnt);
@@ -16419,7 +16581,7 @@ lpfc_drain_txq(struct lpfc_hba *phba)
 		sglq = __lpfc_sli_get_sglq(phba, piocbq);
 		if (!sglq) {
 			__lpfc_sli_ringtx_put(phba, pring, piocbq);
-			spin_unlock_irqrestore(&phba->hbalock, iflags);
+			spin_unlock_irqrestore(&pring->ring_lock, iflags);
 			break;
 		}
 		txq_cnt--;
@@ -16447,7 +16609,7 @@ lpfc_drain_txq(struct lpfc_hba *phba)
 					piocbq->iotag, piocbq->sli4_xritag);
 			list_add_tail(&piocbq->list, &completions);
 		}
-		spin_unlock_irqrestore(&phba->hbalock, iflags);
+		spin_unlock_irqrestore(&pring->ring_lock, iflags);
 	}
 
 	/* Cancel all the IOCBs that cannot be issued */

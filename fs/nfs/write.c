@@ -960,10 +960,8 @@ int nfs_updatepage(struct file *file, struct page *page,
 
 	nfs_inc_stats(inode, NFSIOS_VFSUPDATEPAGE);
 
-	dprintk("NFS:       nfs_updatepage(%s/%s %d@%lld)\n",
-		file->f_path.dentry->d_parent->d_name.name,
-		file->f_path.dentry->d_name.name, count,
-		(long long)(page_file_offset(page) + offset));
+	dprintk("NFS:       nfs_updatepage(%pD2 %d@%lld)\n",
+		file, count, (long long)(page_file_offset(page) + offset));
 
 	if (nfs_can_extend_write(file, page, inode)) {
 		count = max(count + offset, nfs_page_length(page));
@@ -1021,12 +1019,15 @@ int nfs_initiate_write(struct rpc_clnt *clnt,
 	NFS_PROTO(inode)->write_setup(data, &msg);
 
 	dprintk("NFS: %5u initiated write call "
-		"(req %s/%lld, %u bytes @ offset %llu)\n",
+		"(req %s/%llu, %u bytes @ offset %llu)\n",
 		data->task.tk_pid,
 		inode->i_sb->s_id,
-		(long long)NFS_FILEID(inode),
+		(unsigned long long)NFS_FILEID(inode),
 		data->args.count,
 		(unsigned long long)data->args.offset);
+
+	nfs4_state_protect_write(NFS_SERVER(inode)->nfs_client,
+				 &task_setup_data.rpc_client, &msg, data);
 
 	task = rpc_run_task(&task_setup_data);
 	if (IS_ERR(task)) {
@@ -1494,6 +1495,9 @@ int nfs_initiate_commit(struct rpc_clnt *clnt, struct nfs_commit_data *data,
 
 	dprintk("NFS: %5u initiated commit call\n", data->task.tk_pid);
 
+	nfs4_state_protect(NFS_SERVER(data->inode)->nfs_client,
+		NFS_SP4_MACH_CRED_COMMIT, &task_setup_data.rpc_client, &msg);
+
 	task = rpc_run_task(&task_setup_data);
 	if (IS_ERR(task))
 		return PTR_ERR(task);
@@ -1608,9 +1612,9 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 		nfs_list_remove_request(req);
 		nfs_clear_page_commit(req->wb_page);
 
-		dprintk("NFS:       commit (%s/%lld %d@%lld)",
+		dprintk("NFS:       commit (%s/%llu %d@%lld)",
 			req->wb_context->dentry->d_sb->s_id,
-			(long long)NFS_FILEID(req->wb_context->dentry->d_inode),
+			(unsigned long long)NFS_FILEID(req->wb_context->dentry->d_inode),
 			req->wb_bytes,
 			(long long)req_offset(req));
 		if (status < 0) {

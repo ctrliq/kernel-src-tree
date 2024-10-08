@@ -22,6 +22,7 @@
 #include <asm/div64.h>
 #include <linux/aer.h>
 #include <linux/if_bridge.h>
+#include <net/busy_poll.h>
 
 MODULE_VERSION(DRV_VER);
 MODULE_DEVICE_TABLE(pci, be_dev_ids);
@@ -279,7 +280,8 @@ static int be_mac_addr_set(struct net_device *netdev, void *p)
 	/* Decide if the new MAC is successfully activated only after
 	 * querying the FW
 	 */
-	status = be_cmd_get_active_mac(adapter, curr_pmac_id, mac);
+	status = be_cmd_get_active_mac(adapter, curr_pmac_id, mac,
+				       adapter->if_handle, true, 0);
 	if (status)
 		goto err;
 
@@ -1078,7 +1080,7 @@ static int be_vid_config(struct be_adapter *adapter)
 			vids[num++] = cpu_to_le16(i);
 
 	status = be_cmd_vlan_config(adapter, adapter->if_handle,
-				    vids, num, 1, 0);
+				    vids, num, 0);
 
 	if (status) {
 		/* Set to VLAN promisc mode as setting VLAN filter failed */
@@ -1337,53 +1339,79 @@ static int be_set_vf_tx_rate(struct net_device *netdev,
 	return status;
 }
 
-static void be_eqd_update(struct be_adapter *adapter, struct be_eq_obj *eqo)
+static void be_aic_update(struct be_aic_obj *aic, u64 rx_pkts, u64 tx_pkts,
+			  ulong now)
 {
-	struct be_rx_stats *stats = rx_stats(&adapter->rx_obj[eqo->idx]);
-	ulong now = jiffies;
-	ulong delta = now - stats->rx_jiffies;
-	u64 pkts;
-	unsigned int start, eqd;
+	aic->rx_pkts_prev = rx_pkts;
+	aic->tx_reqs_prev = tx_pkts;
+	aic->jiffies = now;
+}
 
-	if (!eqo->enable_aic) {
-		eqd = eqo->eqd;
-		goto modify_eqd;
-	}
+static void be_eqd_update(struct be_adapter *adapter)
+{
+	struct be_set_eqd set_eqd[MAX_EVT_QS];
+	int eqd, i, num = 0, start;
+	struct be_aic_obj *aic;
+	struct be_eq_obj *eqo;
+	struct be_rx_obj *rxo;
+	struct be_tx_obj *txo;
+	u64 rx_pkts, tx_pkts;
+	ulong now;
+	u32 pps, delta;
 
-	if (eqo->idx >= adapter->num_rx_qs)
-		return;
+	for_all_evt_queues(adapter, eqo, i) {
+		aic = &adapter->aic_obj[eqo->idx];
+		if (!aic->enable) {
+			if (aic->jiffies)
+				aic->jiffies = 0;
+			eqd = aic->et_eqd;
+			goto modify_eqd;
+		}
 
-	stats = rx_stats(&adapter->rx_obj[eqo->idx]);
+		rxo = &adapter->rx_obj[eqo->idx];
+		do {
+			start = u64_stats_fetch_begin_bh(&rxo->stats.sync);
+			rx_pkts = rxo->stats.rx_pkts;
+		} while (u64_stats_fetch_retry_bh(&rxo->stats.sync, start));
 
-	/* Wrapped around */
-	if (time_before(now, stats->rx_jiffies)) {
-		stats->rx_jiffies = now;
-		return;
-	}
+		txo = &adapter->tx_obj[eqo->idx];
+		do {
+			start = u64_stats_fetch_begin_bh(&txo->stats.sync);
+			tx_pkts = txo->stats.tx_reqs;
+		} while (u64_stats_fetch_retry_bh(&txo->stats.sync, start));
 
-	/* Update once a second */
-	if (delta < HZ)
-		return;
 
-	do {
-		start = u64_stats_fetch_begin_bh(&stats->sync);
-		pkts = stats->rx_pkts;
-	} while (u64_stats_fetch_retry_bh(&stats->sync, start));
+		/* Skip, if wrapped around or first calculation */
+		now = jiffies;
+		if (!aic->jiffies || time_before(now, aic->jiffies) ||
+		    rx_pkts < aic->rx_pkts_prev ||
+		    tx_pkts < aic->tx_reqs_prev) {
+			be_aic_update(aic, rx_pkts, tx_pkts, now);
+			continue;
+		}
 
-	stats->rx_pps = (unsigned long)(pkts - stats->rx_pkts_prev) / (delta / HZ);
-	stats->rx_pkts_prev = pkts;
-	stats->rx_jiffies = now;
-	eqd = (stats->rx_pps / 110000) << 3;
-	eqd = min(eqd, eqo->max_eqd);
-	eqd = max(eqd, eqo->min_eqd);
-	if (eqd < 10)
-		eqd = 0;
+		delta = jiffies_to_msecs(now - aic->jiffies);
+		pps = (((u32)(rx_pkts - aic->rx_pkts_prev) * 1000) / delta) +
+			(((u32)(tx_pkts - aic->tx_reqs_prev) * 1000) / delta);
+		eqd = (pps / 15000) << 2;
 
+		if (eqd < 8)
+			eqd = 0;
+		eqd = min_t(u32, eqd, aic->max_eqd);
+		eqd = max_t(u32, eqd, aic->min_eqd);
+
+		be_aic_update(aic, rx_pkts, tx_pkts, now);
 modify_eqd:
-	if (eqd != eqo->cur_eqd) {
-		be_cmd_modify_eqd(adapter, eqo->q.id, eqd);
-		eqo->cur_eqd = eqd;
+		if (eqd != aic->prev_eqd) {
+			set_eqd[num].delay_multiplier = (eqd * 65)/100;
+			set_eqd[num].eq_id = eqo->q.id;
+			aic->prev_eqd = eqd;
+			num++;
+		}
 	}
+
+	if (num)
+		be_cmd_modify_eqd(adapter, set_eqd, num);
 }
 
 static void be_rx_stats_update(struct be_rx_obj *rxo,
@@ -1521,7 +1549,7 @@ static void skb_fill_rx_data(struct be_rx_obj *rxo, struct sk_buff *skb,
 }
 
 /* Process the RX completion indicated by rxcp when GRO is disabled */
-static void be_rx_compl_process(struct be_rx_obj *rxo,
+static void be_rx_compl_process(struct be_rx_obj *rxo, struct napi_struct *napi,
 				struct be_rx_compl_info *rxcp)
 {
 	struct be_adapter *adapter = rxo->adapter;
@@ -1545,8 +1573,8 @@ static void be_rx_compl_process(struct be_rx_obj *rxo,
 	skb->protocol = eth_type_trans(skb, netdev);
 	skb_record_rx_queue(skb, rxo - &adapter->rx_obj[0]);
 	if (netdev->features & NETIF_F_RXHASH)
-		skb->rxhash = rxcp->rss_hash;
-
+		skb_set_hash(skb, rxcp->rss_hash, PKT_HASH_TYPE_L3);
+	skb_mark_napi_id(skb, napi);
 
 	if (rxcp->vlanf)
 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), rxcp->vlan_tag);
@@ -1601,7 +1629,8 @@ static void be_rx_compl_process_gro(struct be_rx_obj *rxo,
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb_record_rx_queue(skb, rxo - &adapter->rx_obj[0]);
 	if (adapter->netdev->features & NETIF_F_RXHASH)
-		skb->rxhash = rxcp->rss_hash;
+		skb_set_hash(skb, rxcp->rss_hash, PKT_HASH_TYPE_L3);
+	skb_mark_napi_id(skb, napi);
 
 	if (rxcp->vlanf)
 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), rxcp->vlan_tag);
@@ -1785,6 +1814,8 @@ static void be_post_rx_frags(struct be_rx_obj *rxo, gfp_t gfp)
 
 	if (posted) {
 		atomic_add(posted, &rxq->used);
+		if (rxo->rx_post_starved)
+			rxo->rx_post_starved = false;
 		be_rxq_notify(adapter, rxq->id, posted);
 	} else if (atomic_read(&rxq->used) == 0) {
 		/* Let be_worker replenish when memory is available */
@@ -1985,6 +2016,7 @@ static void be_evt_queues_destroy(struct be_adapter *adapter)
 		if (eqo->q.created) {
 			be_eq_clean(eqo);
 			be_cmd_q_destroy(adapter, &eqo->q, QTYPE_EQ);
+			napi_hash_del(&eqo->napi);
 			netif_napi_del(&eqo->napi);
 		}
 		be_queue_free(adapter, &eqo->q);
@@ -1995,6 +2027,7 @@ static int be_evt_queues_create(struct be_adapter *adapter)
 {
 	struct be_queue_info *eq;
 	struct be_eq_obj *eqo;
+	struct be_aic_obj *aic;
 	int i, rc;
 
 	adapter->num_evt_qs = min_t(u16, num_irqs(adapter),
@@ -2003,11 +2036,13 @@ static int be_evt_queues_create(struct be_adapter *adapter)
 	for_all_evt_queues(adapter, eqo, i) {
 		netif_napi_add(adapter->netdev, &eqo->napi, be_poll,
 			       BE_NAPI_WEIGHT);
+		napi_hash_add(&eqo->napi);
+		aic = &adapter->aic_obj[i];
 		eqo->adapter = adapter;
 		eqo->tx_budget = BE_TX_BUDGET;
 		eqo->idx = i;
-		eqo->max_eqd = BE_MAX_EQD;
-		eqo->enable_aic = true;
+		aic->max_eqd = BE_MAX_EQD;
+		aic->enable = true;
 
 		eq = &eqo->q;
 		rc = be_queue_alloc(adapter, eq, EVNT_Q_LEN,
@@ -2224,7 +2259,7 @@ static inline bool do_gro(struct be_rx_compl_info *rxcp)
 }
 
 static int be_process_rx(struct be_rx_obj *rxo, struct napi_struct *napi,
-			int budget)
+			int budget, int polling)
 {
 	struct be_adapter *adapter = rxo->adapter;
 	struct be_queue_info *rx_cq = &rxo->cq;
@@ -2255,10 +2290,12 @@ static int be_process_rx(struct be_rx_obj *rxo, struct napi_struct *napi,
 			goto loop_continue;
 		}
 
-		if (do_gro(rxcp))
+		/* Don't do gro when we're busy_polling */
+		if (do_gro(rxcp) && polling != BUSY_POLLING)
 			be_rx_compl_process_gro(rxo, napi, rxcp);
 		else
-			be_rx_compl_process(rxo, rxcp);
+			be_rx_compl_process(rxo, napi, rxcp);
+
 loop_continue:
 		be_rx_stats_update(rxo, rxcp);
 	}
@@ -2266,7 +2303,11 @@ loop_continue:
 	if (work_done) {
 		be_cq_notify(adapter, rx_cq->id, true, work_done);
 
-		if (atomic_read(&rxo->q.used) < RX_FRAGS_REFILL_WM)
+		/* When an rx-obj gets into post_starved state, just
+		 * let be_worker do the posting.
+		 */
+		if (atomic_read(&rxo->q.used) < RX_FRAGS_REFILL_WM &&
+		    !rxo->rx_post_starved)
 			be_post_rx_frags(rxo, GFP_ATOMIC);
 	}
 
@@ -2311,6 +2352,7 @@ int be_poll(struct napi_struct *napi, int budget)
 	struct be_eq_obj *eqo = container_of(napi, struct be_eq_obj, napi);
 	struct be_adapter *adapter = eqo->adapter;
 	int max_work = 0, work, i, num_evts;
+	struct be_rx_obj *rxo;
 	bool tx_done;
 
 	num_evts = events_get(eqo);
@@ -2323,13 +2365,18 @@ int be_poll(struct napi_struct *napi, int budget)
 			max_work = budget;
 	}
 
-	/* This loop will iterate twice for EQ0 in which
-	 * completions of the last RXQ (default one) are also processed
-	 * For other EQs the loop iterates only once
-	 */
-	for (i = eqo->idx; i < adapter->num_rx_qs; i += adapter->num_evt_qs) {
-		work = be_process_rx(&adapter->rx_obj[i], napi, budget);
-		max_work = max(work, max_work);
+	if (be_lock_napi(eqo)) {
+		/* This loop will iterate twice for EQ0 in which
+		 * completions of the last RXQ (default one) are also processed
+		 * For other EQs the loop iterates only once
+		 */
+		for_all_rx_queues_on_eq(adapter, eqo, rxo, i) {
+			work = be_process_rx(rxo, napi, budget, NAPI_POLLING);
+			max_work = max(work, max_work);
+		}
+		be_unlock_napi(eqo);
+	} else {
+		max_work = budget;
 	}
 
 	if (is_mcc_eqo(eqo))
@@ -2344,6 +2391,28 @@ int be_poll(struct napi_struct *napi, int budget)
 	}
 	return max_work;
 }
+
+#ifdef CONFIG_NET_RX_BUSY_POLL
+static int be_busy_poll(struct napi_struct *napi)
+{
+	struct be_eq_obj *eqo = container_of(napi, struct be_eq_obj, napi);
+	struct be_adapter *adapter = eqo->adapter;
+	struct be_rx_obj *rxo;
+	int i, work = 0;
+
+	if (!be_lock_busy_poll(eqo))
+		return LL_FLUSH_BUSY;
+
+	for_all_rx_queues_on_eq(adapter, eqo, rxo, i) {
+		work = be_process_rx(rxo, napi, 4, BUSY_POLLING);
+		if (work)
+			break;
+	}
+
+	be_unlock_busy_poll(eqo);
+	return work;
+}
+#endif
 
 void be_detect_error(struct be_adapter *adapter)
 {
@@ -2585,8 +2654,10 @@ static int be_close(struct net_device *netdev)
 	be_roce_dev_close(adapter);
 
 	if (adapter->flags & BE_FLAGS_NAPI_ENABLED) {
-		for_all_evt_queues(adapter, eqo, i)
+		for_all_evt_queues(adapter, eqo, i) {
 			napi_disable(&eqo->napi);
+			be_disable_busy_poll(eqo);
+		}
 		adapter->flags &= ~BE_FLAGS_NAPI_ENABLED;
 	}
 
@@ -2705,6 +2776,7 @@ static int be_open(struct net_device *netdev)
 
 	for_all_evt_queues(adapter, eqo, i) {
 		napi_enable(&eqo->napi);
+		be_enable_busy_poll(eqo);
 		be_eq_notify(adapter, eqo->q.id, true, false, 0);
 	}
 	adapter->flags |= BE_FLAGS_NAPI_ENABLED;
@@ -2799,14 +2871,11 @@ static int be_vfs_mac_query(struct be_adapter *adapter)
 	int status, vf;
 	u8 mac[ETH_ALEN];
 	struct be_vf_cfg *vf_cfg;
-	bool active = false;
 
 	for_all_vfs(adapter, vf_cfg, vf) {
-		be_cmd_get_mac_from_list(adapter, mac, &active,
-					 &vf_cfg->pmac_id, 0);
-
-		status = be_cmd_mac_addr_query(adapter, mac, false,
-					       vf_cfg->if_handle, 0);
+		status = be_cmd_get_active_mac(adapter, vf_cfg->pmac_id,
+					       mac, vf_cfg->if_handle,
+					       false, vf+1);
 		if (status)
 			return status;
 		memcpy(vf_cfg->mac_addr, mac, ETH_ALEN);
@@ -3148,6 +3217,7 @@ static int be_get_resources(struct be_adapter *adapter)
 /* Routine to query per function resource limits */
 static int be_get_config(struct be_adapter *adapter)
 {
+	u16 profile_id;
 	int status;
 
 	status = be_cmd_query_fw_cfg(adapter, &adapter->port_num,
@@ -3156,6 +3226,13 @@ static int be_get_config(struct be_adapter *adapter)
 				     &adapter->asic_rev);
 	if (status)
 		return status;
+
+	 if (be_physfn(adapter)) {
+		status = be_cmd_get_active_profile(adapter, &profile_id);
+		if (!status)
+			dev_info(&adapter->pdev->dev,
+				 "Using profile 0x%x\n", profile_id);
+	}
 
 	status = be_get_resources(adapter);
 	if (status)
@@ -3328,6 +3405,8 @@ static int be_setup(struct be_adapter *adapter)
 		be_vid_config(adapter);
 
 	be_set_rx_mode(adapter->netdev);
+
+	be_cmd_get_acpi_wol_cap(adapter);
 
 	be_cmd_get_flow_control(adapter, &tx_fc, &rx_fc);
 
@@ -3979,6 +4058,9 @@ static const struct net_device_ops be_netdev_ops = {
 #endif
 	.ndo_bridge_setlink	= be_ndo_bridge_setlink,
 	.ndo_bridge_getlink	= be_ndo_bridge_getlink,
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	.ndo_busy_poll		= be_busy_poll
+#endif
 };
 
 static void be_netdev_init(struct net_device *netdev)
@@ -4195,74 +4277,22 @@ static void be_remove(struct pci_dev *pdev)
 	free_netdev(adapter->netdev);
 }
 
-bool be_is_wol_supported(struct be_adapter *adapter)
-{
-	return ((adapter->wol_cap & BE_WOL_CAP) &&
-		!be_is_wol_excluded(adapter)) ? true : false;
-}
-
-u32 be_get_fw_log_level(struct be_adapter *adapter)
-{
-	struct be_dma_mem extfat_cmd;
-	struct be_fat_conf_params *cfgs;
-	int status;
-	u32 level = 0;
-	int j;
-
-	if (lancer_chip(adapter))
-		return 0;
-
-	memset(&extfat_cmd, 0, sizeof(struct be_dma_mem));
-	extfat_cmd.size = sizeof(struct be_cmd_resp_get_ext_fat_caps);
-	extfat_cmd.va = pci_alloc_consistent(adapter->pdev, extfat_cmd.size,
-					     &extfat_cmd.dma);
-
-	if (!extfat_cmd.va) {
-		dev_err(&adapter->pdev->dev, "%s: Memory allocation failure\n",
-			__func__);
-		goto err;
-	}
-
-	status = be_cmd_get_ext_fat_capabilites(adapter, &extfat_cmd);
-	if (!status) {
-		cfgs = (struct be_fat_conf_params *)(extfat_cmd.va +
-						sizeof(struct be_cmd_resp_hdr));
-		for (j = 0; j < le32_to_cpu(cfgs->module[0].num_modes); j++) {
-			if (cfgs->module[0].trace_lvl[j].mode == MODE_UART)
-				level = cfgs->module[0].trace_lvl[j].dbg_lvl;
-		}
-	}
-	pci_free_consistent(adapter->pdev, extfat_cmd.size, extfat_cmd.va,
-			    extfat_cmd.dma);
-err:
-	return level;
-}
-
 static int be_get_initial_config(struct be_adapter *adapter)
 {
-	int status;
-	u32 level;
+	int status, level;
 
 	status = be_cmd_get_cntl_attributes(adapter);
 	if (status)
 		return status;
 
-	status = be_cmd_get_acpi_wol_cap(adapter);
-	if (status) {
-		/* in case of a failure to get wol capabillities
-		 * check the exclusion list to determine WOL capability */
-		if (!be_is_wol_excluded(adapter))
-			adapter->wol_cap |= BE_WOL_CAP;
-	}
-
-	if (be_is_wol_supported(adapter))
-		adapter->wol = true;
-
 	/* Must be a power of 2 or else MODULO will BUG_ON */
 	adapter->be_get_temp_freq = 64;
 
-	level = be_get_fw_log_level(adapter);
-	adapter->msg_enable = level <= FW_LOG_LEVEL_DEFAULT ? NETIF_MSG_HW : 0;
+	if (BEx_chip(adapter)) {
+		level = be_cmd_get_fw_log_level(adapter);
+		adapter->msg_enable =
+			level <= FW_LOG_LEVEL_DEFAULT ? NETIF_MSG_HW : 0;
+	}
 
 	adapter->cfg_num_qs = netif_get_num_default_rss_queues();
 	return 0;
@@ -4337,7 +4367,6 @@ static void be_worker(struct work_struct *work)
 	struct be_adapter *adapter =
 		container_of(work, struct be_adapter, work.work);
 	struct be_rx_obj *rxo;
-	struct be_eq_obj *eqo;
 	int i;
 
 	/* when interrupts are not yet enabled, just reap any pending
@@ -4362,14 +4391,14 @@ static void be_worker(struct work_struct *work)
 		be_cmd_get_die_temperature(adapter);
 
 	for_all_rx_queues(adapter, rxo, i) {
-		if (rxo->rx_post_starved) {
-			rxo->rx_post_starved = false;
+		/* Replenish RX-queues starved due to memory
+		 * allocation failures.
+		 */
+		if (rxo->rx_post_starved)
 			be_post_rx_frags(rxo, GFP_KERNEL);
-		}
 	}
 
-	for_all_evt_queues(adapter, eqo, i)
-		be_eqd_update(adapter, eqo);
+	be_eqd_update(adapter);
 
 reschedule:
 	adapter->work_counter++;
@@ -4426,19 +4455,11 @@ static int be_probe(struct pci_dev *pdev, const struct pci_device_id *pdev_id)
 	adapter->netdev = netdev;
 	SET_NETDEV_DEV(netdev, &pdev->dev);
 
-	status = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
+	status = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (!status) {
-		status = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
-		if (status < 0) {
-			dev_err(&pdev->dev, "dma_set_coherent_mask failed\n");
-			goto free_netdev;
-		}
 		netdev->features |= NETIF_F_HIGHDMA;
 	} else {
-		status = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
-		if (!status)
-			status = dma_set_coherent_mask(&pdev->dev,
-						       DMA_BIT_MASK(32));
+		status = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 		if (status) {
 			dev_err(&pdev->dev, "Could not set PCI DMA Mask\n");
 			goto free_netdev;
@@ -4534,7 +4555,7 @@ static int be_suspend(struct pci_dev *pdev, pm_message_t state)
 	struct be_adapter *adapter = pci_get_drvdata(pdev);
 	struct net_device *netdev =  adapter->netdev;
 
-	if (adapter->wol)
+	if (adapter->wol_en)
 		be_setup_wol(adapter, true);
 
 	be_intr_set(adapter, false);
@@ -4566,7 +4587,7 @@ static int be_resume(struct pci_dev *pdev)
 	if (status)
 		return status;
 
-	pci_set_power_state(pdev, 0);
+	pci_set_power_state(pdev, PCI_D0);
 	pci_restore_state(pdev);
 
 	status = be_fw_wait_ready(adapter);
@@ -4590,7 +4611,7 @@ static int be_resume(struct pci_dev *pdev)
 			      msecs_to_jiffies(1000));
 	netif_device_attach(netdev);
 
-	if (adapter->wol)
+	if (adapter->wol_en)
 		be_setup_wol(adapter, false);
 
 	return 0;
@@ -4667,7 +4688,7 @@ static pci_ers_result_t be_eeh_reset(struct pci_dev *pdev)
 		return PCI_ERS_RESULT_DISCONNECT;
 
 	pci_set_master(pdev);
-	pci_set_power_state(pdev, 0);
+	pci_set_power_state(pdev, PCI_D0);
 	pci_restore_state(pdev);
 
 	/* Check if card is ok and fw is ready */

@@ -19,9 +19,10 @@
 #include "xfs.h"
 #include "xfs_fs.h"
 #include "xfs_format.h"
+#include "xfs_log_format.h"
 #include "xfs_shared.h"
-#include "xfs_log.h"
-#include "xfs_trans.h"
+#include "xfs_trans_resv.h"
+#include "xfs_ag.h"
 #include "xfs_sb.h"
 #include "xfs_mount.h"
 #include "xfs_bmap_btree.h"
@@ -30,6 +31,7 @@
 #include "xfs_trace.h"
 #include "xfs_symlink.h"
 #include "xfs_cksum.h"
+#include "xfs_trans.h"
 #include "xfs_buf_item.h"
 
 
@@ -131,11 +133,13 @@ xfs_symlink_read_verify(
 	if (!xfs_sb_version_hascrc(&mp->m_sb))
 		return;
 
-	if (!xfs_buf_verify_cksum(bp, XFS_SYMLINK_CRC_OFF) ||
-	    !xfs_symlink_verify(bp)) {
-		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp, bp->b_addr);
+	if (!xfs_buf_verify_cksum(bp, XFS_SYMLINK_CRC_OFF))
+		xfs_buf_ioerror(bp, EFSBADCRC);
+	else if (!xfs_symlink_verify(bp))
 		xfs_buf_ioerror(bp, EFSCORRUPTED);
-	}
+
+	if (bp->b_error)
+		xfs_verifier_error(bp);
 }
 
 static void
@@ -150,8 +154,8 @@ xfs_symlink_write_verify(
 		return;
 
 	if (!xfs_symlink_verify(bp)) {
-		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp, bp->b_addr);
 		xfs_buf_ioerror(bp, EFSCORRUPTED);
+		xfs_verifier_error(bp);
 		return;
 	}
 

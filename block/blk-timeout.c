@@ -90,16 +90,17 @@ static void blk_rq_timed_out(struct request *req)
 	case BLK_EH_HANDLED:
 		/* Can we use req->errors here? */
 		if (q->mq_ops)
-			blk_mq_complete_request(req, req->errors);
+			__blk_mq_complete_request(req);
 		else
 			__blk_complete_request(req);
 		break;
 	case BLK_EH_RESET_TIMER:
-		blk_clear_rq_complete(req);
 		if (q->mq_ops)
 			blk_mq_add_timer(req);
 		else
 			blk_add_timer(req);
+
+		blk_clear_rq_complete(req);
 		break;
 	case BLK_EH_NOT_HANDLED:
 		/*
@@ -177,7 +178,6 @@ void __blk_add_timer(struct request *req, struct list_head *timeout_list)
 		return;
 
 	BUG_ON(!list_empty(&req->timeout_list));
-	BUG_ON(test_bit(REQ_ATOM_COMPLETE, &req->atomic_flags));
 
 	/*
 	 * Some LLDs, like scsi, peek at the timeout to prevent a

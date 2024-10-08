@@ -1672,7 +1672,8 @@ int mlx5_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	new_state = attr_mask & IB_QP_STATE ? attr->qp_state : cur_state;
 
 	if (ibqp->qp_type != MLX5_IB_QPT_REG_UMR &&
-	    !ib_modify_qp_is_ok(cur_state, new_state, ibqp->qp_type, attr_mask))
+	    !ib_modify_qp_is_ok(cur_state, new_state, ibqp->qp_type, attr_mask,
+				IB_LINK_LAYER_UNSPECIFIED))
 		goto out;
 
 	if ((attr_mask & IB_QP_PORT) &&
@@ -1803,6 +1804,7 @@ static void set_reg_umr_segment(struct mlx5_wqe_umr_ctrl_seg *umr,
 			MLX5_MKEY_MASK_PD		|
 			MLX5_MKEY_MASK_LR		|
 			MLX5_MKEY_MASK_LW		|
+			MLX5_MKEY_MASK_KEY		|
 			MLX5_MKEY_MASK_RR		|
 			MLX5_MKEY_MASK_RW		|
 			MLX5_MKEY_MASK_A		|
@@ -1859,7 +1861,8 @@ static void set_reg_mkey_segment(struct mlx5_mkey_seg *seg, struct ib_send_wr *w
 	seg->start_addr = cpu_to_be64(wr->wr.fast_reg.iova_start);
 	seg->len = cpu_to_be64(wr->wr.fast_reg.length);
 	seg->log2_page_size = wr->wr.fast_reg.page_shift;
-	seg->qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
+	seg->qpn_mkey7_0 = cpu_to_be32(0xffffff00 |
+				       mlx5_mkey_variant(wr->wr.fast_reg.rkey));
 }
 
 static void set_frwr_pages(struct mlx5_wqe_data_seg *dseg,

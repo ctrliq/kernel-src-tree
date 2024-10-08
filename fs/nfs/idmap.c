@@ -49,6 +49,7 @@
 
 #include "internal.h"
 #include "netns.h"
+#include "nfs4trace.h"
 
 #define NFS_UINT_MAXLEN 11
 
@@ -281,6 +282,8 @@ static struct key *nfs_idmap_request_key(const char *name, size_t namelen,
 						desc, "", 0, idmap);
 		mutex_unlock(&idmap->idmap_mutex);
 	}
+	if (!IS_ERR(rkey))
+		set_bit(KEY_FLAG_ROOT_CAN_INVAL, &rkey->flags);
 
 	kfree(desc);
 	return rkey;
@@ -735,6 +738,7 @@ int nfs_map_name_to_uid(const struct nfs_server *server, const char *name, size_
 		if (!uid_valid(*uid))
 			ret = -ERANGE;
 	}
+	trace_nfs4_map_name_to_uid(name, namelen, id, ret);
 	return ret;
 }
 
@@ -751,6 +755,7 @@ int nfs_map_group_to_gid(const struct nfs_server *server, const char *name, size
 		if (!gid_valid(*gid))
 			ret = -ERANGE;
 	}
+	trace_nfs4_map_group_to_gid(name, namelen, id, ret);
 	return ret;
 }
 
@@ -765,6 +770,7 @@ int nfs_map_uid_to_name(const struct nfs_server *server, kuid_t uid, char *buf, 
 		ret = nfs_idmap_lookup_name(id, "user", buf, buflen, idmap);
 	if (ret < 0)
 		ret = nfs_map_numeric_to_string(id, buf, buflen);
+	trace_nfs4_map_uid_to_name(buf, ret, id, ret);
 	return ret;
 }
 int nfs_map_gid_to_group(const struct nfs_server *server, kgid_t gid, char *buf, size_t buflen)
@@ -778,5 +784,6 @@ int nfs_map_gid_to_group(const struct nfs_server *server, kgid_t gid, char *buf,
 		ret = nfs_idmap_lookup_name(id, "group", buf, buflen, idmap);
 	if (ret < 0)
 		ret = nfs_map_numeric_to_string(id, buf, buflen);
+	trace_nfs4_map_gid_to_group(buf, ret, id, ret);
 	return ret;
 }

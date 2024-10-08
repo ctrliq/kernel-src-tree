@@ -52,12 +52,10 @@
 					 (d) == I40E_DEV_ID_QSFP_B  || \
 					 (d) == I40E_DEV_ID_QSFP_C)
 
-#define I40E_FW_API_VERSION_MAJOR  0x0001
-#define I40E_FW_API_VERSION_MINOR  0x0000
-
 #define I40E_MAX_VSI_QP			16
 #define I40E_MAX_VF_VSI			3
 #define I40E_MAX_CHAINED_RX_BUFFERS	5
+#define I40E_MAX_PF_UDP_OFFLOAD_PORTS	16
 
 /* Max default timeout in ms, */
 #define I40E_MAX_NVM_TIMEOUT		18000

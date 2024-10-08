@@ -866,7 +866,8 @@ static void dump_sample(struct perf_evsel *evsel, union perf_event *event,
 
 static struct machine *
 	perf_session__find_machine_for_cpumode(struct perf_session *session,
-					       union perf_event *event)
+					       union perf_event *event,
+					       struct perf_sample *sample)
 {
 	const u8 cpumode = event->header.misc & PERF_RECORD_MISC_CPUMODE_MASK;
 	struct machine *machine;
@@ -880,7 +881,7 @@ static struct machine *
 		    || event->header.type == PERF_RECORD_MMAP2)
 			pid = event->mmap.pid;
 		else
-			pid = event->ip.pid;
+			pid = sample->pid;
 
 		machine = perf_session__find_machine(session, pid);
 		if (!machine)
@@ -990,7 +991,8 @@ static int perf_session_deliver_event(struct perf_session *session,
 		hists__inc_nr_events(&evsel->hists, event->header.type);
 	}
 
-	machine = perf_session__find_machine_for_cpumode(session, event);
+	machine = perf_session__find_machine_for_cpumode(session, event,
+							 sample);
 
 	switch (event->header.type) {
 	case PERF_RECORD_SAMPLE:
@@ -1113,7 +1115,7 @@ void perf_event_header__bswap(struct perf_event_header *self)
 
 struct thread *perf_session__findnew(struct perf_session *session, pid_t pid)
 {
-	return machine__findnew_thread(&session->machines.host, pid);
+	return machine__findnew_thread(&session->machines.host, 0, pid);
 }
 
 static struct thread *perf_session__register_idle_thread(struct perf_session *self)

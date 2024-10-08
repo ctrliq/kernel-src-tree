@@ -64,6 +64,16 @@ struct ip_tunnel {
 	unsigned int		prl_count;	/* # of entries in PRL */
 	int			ip_tnl_net_id;
 	struct gro_cells	gro_cells;
+
+	/* Reserved slots. For Red Hat usage only. */
+	unsigned long rh_reserved1;
+	unsigned long rh_reserved2;
+	unsigned long rh_reserved3;
+	unsigned long rh_reserved4;
+	unsigned long rh_reserved5;
+	unsigned long rh_reserved6;
+	unsigned long rh_reserved7;
+	unsigned long rh_reserved8;
 };
 
 #define TUNNEL_CSUM	__cpu_to_be16(0x01)

@@ -23,17 +23,10 @@ struct xfs_dinode;
 struct xfs_imap;
 struct xfs_mount;
 struct xfs_trans;
+struct xfs_btree_cur;
 
-/*
- * Allocation parameters for inode allocation.
- */
-#define	XFS_IALLOC_BLOCKS(mp)	(mp)->m_ialloc_blks
-
-/*
- * Move inodes in clusters of this size.
- */
+/* Move inodes in clusters of this size */
 #define	XFS_INODE_BIG_CLUSTER_SIZE	8192
-#define	XFS_INODE_CLUSTER_SIZE(mp)	(mp)->m_inode_cluster_size
 
 /* Calculate and return the number of filesystem blocks per inode cluster */
 static inline int
@@ -51,7 +44,7 @@ xfs_icluster_size_fsb(
 static inline struct xfs_dinode *
 xfs_make_iptr(struct xfs_mount *mp, struct xfs_buf *b, int o)
 {
-	return (xfs_dinode_t *)
+	return (struct xfs_dinode *)
 		(xfs_buf_offset(b, o << (mp)->m_sb.sb_inodelog));
 }
 

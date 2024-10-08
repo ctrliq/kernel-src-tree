@@ -124,9 +124,8 @@ static inline int put_dreq(struct nfs_direct_req *dreq)
 ssize_t nfs_direct_IO(int rw, struct kiocb *iocb, const struct iovec *iov, loff_t pos, unsigned long nr_segs)
 {
 #ifndef CONFIG_NFS_SWAP
-	dprintk("NFS: nfs_direct_IO (%s) off/no(%Ld/%lu) EINVAL\n",
-			iocb->ki_filp->f_path.dentry->d_name.name,
-			(long long) pos, nr_segs);
+	dprintk("NFS: nfs_direct_IO (%pD) off/no(%Ld/%lu) EINVAL\n",
+			iocb->ki_filp, (long long) pos, nr_segs);
 
 	return -EINVAL;
 #else
@@ -256,9 +255,9 @@ static void nfs_direct_complete(struct nfs_direct_req *dreq, bool write)
 
 static void nfs_direct_readpage_release(struct nfs_page *req)
 {
-	dprintk("NFS: direct read done (%s/%lld %d@%lld)\n",
+	dprintk("NFS: direct read done (%s/%llu %d@%lld)\n",
 		req->wb_context->dentry->d_inode->i_sb->s_id,
-		(long long)NFS_FILEID(req->wb_context->dentry->d_inode),
+		(unsigned long long)NFS_FILEID(req->wb_context->dentry->d_inode),
 		req->wb_bytes,
 		(long long)req_offset(req));
 	nfs_release_request(req);
@@ -460,17 +459,59 @@ static ssize_t nfs_direct_read_schedule_iovec(struct nfs_direct_req *dreq,
 	return 0;
 }
 
-static ssize_t nfs_direct_read(struct kiocb *iocb, const struct iovec *iov,
-			       unsigned long nr_segs, loff_t pos, bool uio)
+/**
+ * nfs_file_direct_read - file direct read operation for NFS files
+ * @iocb: target I/O control block
+ * @iov: vector of user buffers into which to read data
+ * @nr_segs: size of iov vector
+ * @pos: byte offset in file where reading starts
+ *
+ * We use this function for direct reads instead of calling
+ * generic_file_aio_read() in order to avoid gfar's check to see if
+ * the request starts before the end of the file.  For that check
+ * to work, we must generate a GETATTR before each direct read, and
+ * even then there is a window between the GETATTR and the subsequent
+ * READ where the file size could change.  Our preference is simply
+ * to do all reads the application wants, and the server will take
+ * care of managing the end of file boundary.
+ *
+ * This function also eliminates unnecessarily updating the file's
+ * atime locally, as the NFS server sets the file's atime, and this
+ * client must read the updated atime from the server back into its
+ * cache.
+ */
+ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
+				unsigned long nr_segs, loff_t pos, bool uio)
 {
-	ssize_t result = -ENOMEM;
-	struct inode *inode = iocb->ki_filp->f_mapping->host;
+	struct file *file = iocb->ki_filp;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
 	struct nfs_direct_req *dreq;
 	struct nfs_lock_context *l_ctx;
+	ssize_t result = -EINVAL;
+	size_t count;
 
+	count = iov_length(iov, nr_segs);
+	nfs_add_stats(mapping->host, NFSIOS_DIRECTREADBYTES, count);
+
+	dfprintk(FILE, "NFS: direct read(%pD2, %zd@%Ld)\n",
+		file, count, (long long) pos);
+
+	result = 0;
+	if (!count)
+		goto out;
+
+	mutex_lock(&inode->i_mutex);
+	result = nfs_sync_mapping(mapping);
+	if (result)
+		goto out_unlock;
+
+	task_io_account_read(count);
+
+	result = -ENOMEM;
 	dreq = nfs_direct_req_alloc();
 	if (dreq == NULL)
-		goto out;
+		goto out_unlock;
 
 	dreq->inode = inode;
 	dreq->bytes_left = iov_length(iov, nr_segs);
@@ -486,10 +527,22 @@ static ssize_t nfs_direct_read(struct kiocb *iocb, const struct iovec *iov,
 
 	NFS_I(inode)->read_io += iov_length(iov, nr_segs);
 	result = nfs_direct_read_schedule_iovec(dreq, iov, nr_segs, pos, uio);
-	if (!result)
+
+	mutex_unlock(&inode->i_mutex);
+
+	if (!result) {
 		result = nfs_direct_wait(dreq);
+		if (result > 0)
+			iocb->ki_pos = pos + result;
+	}
+
+	nfs_direct_req_release(dreq);
+	return result;
+
 out_release:
 	nfs_direct_req_release(dreq);
+out_unlock:
+	mutex_unlock(&inode->i_mutex);
 out:
 	return result;
 }
@@ -857,61 +910,6 @@ static ssize_t nfs_direct_write_schedule_iovec(struct nfs_direct_req *dreq,
 }
 
 /**
- * nfs_file_direct_read - file direct read operation for NFS files
- * @iocb: target I/O control block
- * @iov: vector of user buffers into which to read data
- * @nr_segs: size of iov vector
- * @pos: byte offset in file where reading starts
- *
- * We use this function for direct reads instead of calling
- * generic_file_aio_read() in order to avoid gfar's check to see if
- * the request starts before the end of the file.  For that check
- * to work, we must generate a GETATTR before each direct read, and
- * even then there is a window between the GETATTR and the subsequent
- * READ where the file size could change.  Our preference is simply
- * to do all reads the application wants, and the server will take
- * care of managing the end of file boundary.
- *
- * This function also eliminates unnecessarily updating the file's
- * atime locally, as the NFS server sets the file's atime, and this
- * client must read the updated atime from the server back into its
- * cache.
- */
-ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
-				unsigned long nr_segs, loff_t pos, bool uio)
-{
-	ssize_t retval = -EINVAL;
-	struct file *file = iocb->ki_filp;
-	struct address_space *mapping = file->f_mapping;
-	size_t count;
-
-	count = iov_length(iov, nr_segs);
-	nfs_add_stats(mapping->host, NFSIOS_DIRECTREADBYTES, count);
-
-	dfprintk(FILE, "NFS: direct read(%s/%s, %zd@%Ld)\n",
-		file->f_path.dentry->d_parent->d_name.name,
-		file->f_path.dentry->d_name.name,
-		count, (long long) pos);
-
-	retval = 0;
-	if (!count)
-		goto out;
-
-	retval = nfs_sync_mapping(mapping);
-	if (retval)
-		goto out;
-
-	task_io_account_read(count);
-
-	retval = nfs_direct_read(iocb, iov, nr_segs, pos, uio);
-	if (retval > 0)
-		iocb->ki_pos = pos + retval;
-
-out:
-	return retval;
-}
-
-/**
  * nfs_file_direct_write - file direct write operation for NFS files
  * @iocb: target I/O control block
  * @iov: vector of user buffers from which to write data
@@ -950,10 +948,8 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
 
 	nfs_add_stats(mapping->host, NFSIOS_DIRECTWRITTENBYTES, count);
 
-	dfprintk(FILE, "NFS: direct write(%s/%s, %zd@%Ld)\n",
-		file->f_path.dentry->d_parent->d_name.name,
-		file->f_path.dentry->d_name.name,
-		count, (long long) pos);
+	dfprintk(FILE, "NFS: direct write(%pD2, %zd@%Ld)\n",
+		file, count, (long long) pos);
 
 	result = generic_write_checks(file, &pos, &count, 0);
 	if (result)

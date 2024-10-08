@@ -26,6 +26,18 @@ struct pci_dynid {
 	struct pci_device_id id;
 };
 
+bool dev_is_pf(struct device *dev)
+{
+	return ((dev_is_pci(dev) ? to_pci_dev(dev)->is_physfn : false));
+}
+EXPORT_SYMBOL_GPL(dev_is_pf);
+
+int dev_num_vf(struct device *dev)
+{
+	return ((dev_is_pci(dev) ? pci_num_vf(to_pci_dev(dev)) : 0));
+}
+EXPORT_SYMBOL_GPL(dev_num_vf);
+
 /**
  * pci_add_dynid - add a new PCI device ID to this driver and re-probe devices
  * @drv: target pci driver
@@ -242,6 +254,30 @@ static const struct pci_device_id *pci_match_device(struct pci_driver *drv,
 	return pci_match_id(drv->id_table, dev);
 }
 
+/**
+ * pci_hw_vendor_status - Tell if a PCI device is supported by the HW vendor
+ * @ids: array of PCI device id structures to search in
+ * @dev: the PCI device structure to match against
+ *
+ * Used by a driver to check whether this device is in its list of unsupported
+ * devices.  Returns the matching pci_device_id structure or %NULL if there is
+ * no match.
+ *
+ * Reserved for Internal Red Hat use only.
+ */
+const struct pci_device_id *pci_hw_vendor_status(
+						const struct pci_device_id *ids,
+						struct pci_dev *dev)
+{
+	const struct pci_device_id *ret = pci_match_id(ids, dev);
+
+	if (ret)
+		dev_printk(KERN_WARNING, &dev->dev,
+			   "The hardware vendor of this device has identified it as being unsupported.  Driver updates and fixes are limited for this device.  Please contact your device's hardware vendor for additional information.\n");
+
+	return ret;
+}
+
 struct drv_dev_and_id {
 	struct pci_driver *drv;
 	struct pci_dev *dev;
@@ -312,7 +348,7 @@ static int pci_call_probe(struct pci_driver *drv, struct pci_dev *dev,
  * __pci_device_probe - check if a driver wants to claim a specific PCI device
  * @drv: driver to call to check if it wants the PCI device
  * @pci_dev: PCI device being probed
- * 
+ *
  * returns 0 on success, else error.
  * side-effect: pci_dev->driver is set to drv when drv claims pci_dev.
  */
@@ -378,7 +414,7 @@ static int pci_device_remove(struct device * dev)
 	 * We would love to complain here if pci_dev->is_enabled is set, that
 	 * the driver should have called pci_disable_device(), but the
 	 * unfortunate fact is there are too many odd BIOS and bridge setups
-	 * that don't like drivers doing that all of the time.  
+	 * that don't like drivers doing that all of the time.
 	 * Oh well, we can dream of sane hardware when we sleep, no matter how
 	 * horrible the crap we have to deal with is when we are awake...
 	 */
@@ -1096,26 +1132,22 @@ static int pci_pm_runtime_idle(struct device *dev)
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+	int ret = 0;
 
 	/*
 	 * If pci_dev->driver is not set (unbound), the device should
 	 * always remain in D0 regardless of the runtime PM status
 	 */
 	if (!pci_dev->driver)
-		goto out;
+		return 0;
 
 	if (!pm)
 		return -ENOSYS;
 
-	if (pm->runtime_idle) {
-		int ret = pm->runtime_idle(dev);
-		if (ret)
-			return ret;
-	}
+	if (pm->runtime_idle)
+		ret = pm->runtime_idle(dev);
 
-out:
-	pm_runtime_suspend(dev);
-	return 0;
+	return ret;
 }
 
 #else /* !CONFIG_PM_RUNTIME */
@@ -1160,15 +1192,31 @@ static const struct dev_pm_ops pci_dev_pm_ops = {
  * @drv: the driver structure to register
  * @owner: owner module of drv
  * @mod_name: module name string
- * 
+ *
  * Adds the driver structure to the list of registered drivers.
- * Returns a negative value on error, otherwise 0. 
- * If no error occurred, the driver remains registered even if 
+ * Returns a negative value on error, otherwise 0.
+ * If no error occurred, the driver remains registered even if
  * no device was claimed during registration.
  */
 int __pci_register_driver(struct pci_driver *drv, struct module *owner,
 			  const char *mod_name)
 {
+	struct pci_driver_rh *ptr;
+
+	if (drv->pci_driver_rh) {
+		ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
+		if (!ptr)
+			return -ENOMEM;
+		/*
+		 * pci_driver_rh->size must be initialized in the driver.
+		 * See pci_driver_rh declaration in include/linux/pci.h
+		 */
+		BUG_ON(!drv->pci_driver_rh->size ||
+		       drv->pci_driver_rh->size > sizeof(*ptr));
+		memcpy(ptr, drv->pci_driver_rh, drv->pci_driver_rh->size);
+		drv->pci_driver_rh = ptr;
+	}
+
 	/* initialize common driver fields */
 	drv->driver.name = drv->name;
 	drv->driver.bus = &pci_bus_type;
@@ -1185,7 +1233,7 @@ int __pci_register_driver(struct pci_driver *drv, struct module *owner,
 /**
  * pci_unregister_driver - unregister a pci driver
  * @drv: the driver structure to unregister
- * 
+ *
  * Deletes the driver structure from the list of registered PCI drivers,
  * gives it a chance to clean up by calling its remove() function for
  * each device it was responsible for, and marks those devices as
@@ -1197,6 +1245,7 @@ pci_unregister_driver(struct pci_driver *drv)
 {
 	driver_unregister(&drv->driver);
 	pci_free_dynids(drv);
+	kfree(drv->pci_driver_rh);
 }
 
 static struct pci_driver pci_compat_driver = {
@@ -1207,7 +1256,7 @@ static struct pci_driver pci_compat_driver = {
  * pci_dev_driver - get the pci_driver of a device
  * @dev: the device to query
  *
- * Returns the appropriate pci_driver structure or %NULL if there is no 
+ * Returns the appropriate pci_driver structure or %NULL if there is no
  * registered driver for the device.
  */
 struct pci_driver *
@@ -1228,7 +1277,7 @@ pci_dev_driver(const struct pci_dev *dev)
  * pci_bus_match - Tell if a PCI device structure has a matching PCI device id structure
  * @dev: the PCI device structure to match against
  * @drv: the device driver to search for matching PCI device id structures
- * 
+ *
  * Used by a driver to check whether a PCI device present in the
  * system is in its list of supported devices. Returns the matching
  * pci_device_id structure or %NULL if there is no match.
@@ -1322,7 +1371,7 @@ struct bus_type pci_bus_type = {
 	.probe		= pci_device_probe,
 	.remove		= pci_device_remove,
 	.shutdown	= pci_device_shutdown,
-	.dev_attrs	= pci_dev_attrs,
+	.dev_groups	= pci_dev_groups,
 	.bus_groups	= pci_bus_groups,
 	.drv_groups	= pci_drv_groups,
 	.pm		= PCI_PM_OPS_PTR,
@@ -1337,6 +1386,7 @@ postcore_initcall(pci_driver_init);
 
 EXPORT_SYMBOL_GPL(pci_add_dynid);
 EXPORT_SYMBOL(pci_match_id);
+EXPORT_SYMBOL(pci_hw_vendor_status);
 EXPORT_SYMBOL(__pci_register_driver);
 EXPORT_SYMBOL(pci_unregister_driver);
 EXPORT_SYMBOL(pci_dev_driver);

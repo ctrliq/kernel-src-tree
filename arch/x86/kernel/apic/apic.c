@@ -2154,7 +2154,7 @@ void __cpuinit generic_processor_info(int apicid, int version)
 			   thiscpu, apicid);
 
 		disabled_cpus++;
-		return -ENODEV;
+		return;
 	}
 
 	/*

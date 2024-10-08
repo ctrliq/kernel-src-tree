@@ -79,6 +79,10 @@ struct writeback_control {
 	unsigned for_reclaim:1;		/* Invoked from the page allocator */
 	unsigned range_cyclic:1;	/* range_start is cyclic */
 	unsigned for_sync:1;		/* sync(2) WB_SYNC_ALL writeback */
+
+	/* reserved for Red Hat */
+	unsigned long rh_reserved1;
+	unsigned long rh_reserved2;
 };
 
 /*

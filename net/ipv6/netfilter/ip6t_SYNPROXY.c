@@ -259,6 +259,7 @@ synproxy_recv_client_ack(const struct synproxy_net *snet,
 
 	this_cpu_inc(snet->stats->cookie_valid);
 	opts->mss = mss;
+	opts->options |= XT_SYNPROXY_OPT_MSS;
 
 	if (opts->options & XT_SYNPROXY_OPT_TIMESTAMP)
 		synproxy_check_timestamp_cookie(opts);
@@ -282,9 +283,10 @@ synproxy_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 	if (th == NULL)
 		return NF_DROP;
 
-	synproxy_parse_options(skb, par->thoff, th, &opts);
+	if (!synproxy_parse_options(skb, par->thoff, th, &opts))
+		return NF_DROP;
 
-	if (th->syn) {
+	if (th->syn && !(th->ack || th->fin || th->rst)) {
 		/* Initial SYN from client */
 		this_cpu_inc(snet->stats->syn_received);
 
@@ -300,14 +302,18 @@ synproxy_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 					  XT_SYNPROXY_OPT_ECN);
 
 		synproxy_send_client_synack(skb, th, &opts);
-	} else if (th->ack && !(th->fin || th->rst))
+		return NF_DROP;
+
+	} else if (th->ack && !(th->fin || th->rst || th->syn)) {
 		/* ACK from client */
 		synproxy_recv_client_ack(snet, skb, th, &opts, ntohl(th->seq));
+		return NF_DROP;
+	}
 
-	return NF_DROP;
+	return XT_CONTINUE;
 }
 
-static unsigned int ipv6_synproxy_hook(unsigned int hooknum,
+static unsigned int ipv6_synproxy_hook(const struct nf_hook_ops *ops,
 				       struct sk_buff *skb,
 				       const struct net_device *in,
 				       const struct net_device *out,
@@ -368,7 +374,8 @@ static unsigned int ipv6_synproxy_hook(unsigned int hooknum,
 
 		/* fall through */
 	case TCP_CONNTRACK_SYN_SENT:
-		synproxy_parse_options(skb, thoff, th, &opts);
+		if (!synproxy_parse_options(skb, thoff, th, &opts))
+			return NF_DROP;
 
 		if (!th->syn && th->ack &&
 		    CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL) {
@@ -391,7 +398,9 @@ static unsigned int ipv6_synproxy_hook(unsigned int hooknum,
 		if (!th->syn || !th->ack)
 			break;
 
-		synproxy_parse_options(skb, thoff, th, &opts);
+		if (!synproxy_parse_options(skb, thoff, th, &opts))
+			return NF_DROP;
+
 		if (opts.options & XT_SYNPROXY_OPT_TIMESTAMP)
 			synproxy->tsoff = opts.tsval - synproxy->its;
 

@@ -707,7 +707,7 @@ static int ax_init_dev(struct net_device *dev)
 
 #ifdef CONFIG_AX88796_93CX6
 	if (ax->plat->flags & AXFLG_HAS_93CX6) {
-		unsigned char mac_addr[ETH_ALEN];
+		unsigned char mac_addr[6];
 		struct eeprom_93cx6 eeprom;
 
 		eeprom.data = ei_local;
@@ -719,7 +719,7 @@ static int ax_init_dev(struct net_device *dev)
 				       (__le16 __force *)mac_addr,
 				       sizeof(mac_addr) >> 1);
 
-		memcpy(dev->dev_addr, mac_addr, ETH_ALEN);
+		memcpy(dev->dev_addr, mac_addr, 6);
 	}
 #endif
 	if (ax->plat->wordlength == 2) {

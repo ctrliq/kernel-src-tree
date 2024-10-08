@@ -783,6 +783,9 @@ static int qlcnic_process_cmd_ring(struct qlcnic_adapter *adapter,
 	struct net_device *netdev = adapter->netdev;
 	struct qlcnic_skb_frag *frag;
 
+	if (!spin_trylock(&tx_ring->tx_clean_lock))
+		return 1;
+
 	sw_consumer = tx_ring->sw_consumer;
 	hw_consumer = le32_to_cpu(*(tx_ring->hw_consumer));
 
@@ -810,8 +813,9 @@ static int qlcnic_process_cmd_ring(struct qlcnic_adapter *adapter,
 			break;
 	}
 
+	tx_ring->sw_consumer = sw_consumer;
+
 	if (count && netif_running(netdev)) {
-		tx_ring->sw_consumer = sw_consumer;
 		smp_mb();
 		if (netif_tx_queue_stopped(tx_ring->txq) &&
 		    netif_carrier_ok(netdev)) {
@@ -839,6 +843,7 @@ static int qlcnic_process_cmd_ring(struct qlcnic_adapter *adapter,
 	hw_consumer = le32_to_cpu(*(tx_ring->hw_consumer));
 	done = (sw_consumer == hw_consumer);
 
+	spin_unlock(&tx_ring->tx_clean_lock);
 	return done;
 }
 

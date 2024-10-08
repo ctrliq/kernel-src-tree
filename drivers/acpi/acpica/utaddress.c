@@ -245,16 +245,12 @@ acpi_ut_check_address_range(acpi_adr_space_type space_id,
 								  region_node);
 
 				ACPI_WARNING((AE_INFO,
-					      "%s range 0x%p-0x%p conflicts with OpRegion 0x%p-0x%p (%s)",
-					      acpi_ut_get_region_name(space_id),
+					     "%s range 0x%p-0x%p conflicts with OpRegion 0x%p-0x%p (%s)",
+					      acpi_ut_get_region_name (space_id),
 					      ACPI_CAST_PTR(void, address),
 					      ACPI_CAST_PTR(void, end_address),
-					      ACPI_CAST_PTR(void,
-							    range_info->
-							    start_address),
-					      ACPI_CAST_PTR(void,
-							    range_info->
-							    end_address),
+					      ACPI_CAST_PTR (void, range_info->start_address),
+					      ACPI_CAST_PTR (void, range_info->end_address),
 					      pathname));
 				ACPI_FREE(pathname);
 			}

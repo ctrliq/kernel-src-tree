@@ -146,7 +146,7 @@ unsigned int nf_iterate(struct list_head *head,
 		/* Optimization: we don't need to hold module
 		   reference here, since function can't sleep. --RR */
 repeat:
-		verdict = (*elemp)->hook(hook, skb, indev, outdev, okfn);
+		verdict = (*elemp)->hook(*elemp, skb, indev, outdev, okfn);
 		if (verdict != NF_ACCEPT) {
 #ifdef CONFIG_NETFILTER_DEBUG
 			if (unlikely((verdict & NF_VERDICT_MASK)
@@ -305,17 +305,26 @@ static struct pernet_operations netfilter_net_ops = {
 	.exit = netfilter_net_exit,
 };
 
-void __init netfilter_init(void)
+int __init netfilter_init(void)
 {
-	int i, h;
+	int i, h, ret;
+
 	for (i = 0; i < ARRAY_SIZE(nf_hooks); i++) {
 		for (h = 0; h < NF_MAX_HOOKS; h++)
 			INIT_LIST_HEAD(&nf_hooks[i][h]);
 	}
 
-	if (register_pernet_subsys(&netfilter_net_ops) < 0)
-		panic("cannot create netfilter proc entry");
+	ret = register_pernet_subsys(&netfilter_net_ops);
+	if (ret < 0)
+		goto err;
 
-	if (netfilter_log_init() < 0)
-		panic("cannot initialize nf_log");
+	ret = netfilter_log_init();
+	if (ret < 0)
+		goto err_pernet;
+
+	return 0;
+err_pernet:
+	unregister_pernet_subsys(&netfilter_net_ops);
+err:
+	return ret;
 }

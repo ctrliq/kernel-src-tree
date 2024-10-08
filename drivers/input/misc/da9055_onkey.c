@@ -36,7 +36,7 @@ static void da9055_onkey_query(struct da9055_onkey *onkey)
 	} else {
 		key_stat &= DA9055_NOKEY_STS;
 		/*
-		 * Onkey status bit is cleared when onkey button is released.
+		 * Onkey status bit is cleared when onkey button is relased.
 		 */
 		if (!key_stat) {
 			input_report_key(onkey->input, KEY_POWER, 0);

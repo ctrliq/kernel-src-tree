@@ -528,7 +528,7 @@ static u16 be_POST_stage_get(struct be_adapter *adapter)
 	return sem & POST_STAGE_MASK;
 }
 
-int lancer_wait_ready(struct be_adapter *adapter)
+static int lancer_wait_ready(struct be_adapter *adapter)
 {
 #define SLIPORT_READY_TIMEOUT 30
 	u32 sliport_status;
@@ -1735,11 +1735,12 @@ err:
 /* set the EQ delay interval of an EQ to specified value
  * Uses async mcc
  */
-int be_cmd_modify_eqd(struct be_adapter *adapter, u32 eq_id, u32 eqd)
+int be_cmd_modify_eqd(struct be_adapter *adapter, struct be_set_eqd *set_eqd,
+		      int num)
 {
 	struct be_mcc_wrb *wrb;
 	struct be_cmd_req_modify_eq_delay *req;
-	int status = 0;
+	int status = 0, i;
 
 	spin_lock_bh(&adapter->mcc_lock);
 
@@ -1753,13 +1754,15 @@ int be_cmd_modify_eqd(struct be_adapter *adapter, u32 eq_id, u32 eqd)
 	be_wrb_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_COMMON,
 		OPCODE_COMMON_MODIFY_EQ_DELAY, sizeof(*req), wrb, NULL);
 
-	req->num_eq = cpu_to_le32(1);
-	req->delay[0].eq_id = cpu_to_le32(eq_id);
-	req->delay[0].phase = 0;
-	req->delay[0].delay_multiplier = cpu_to_le32(eqd);
+	req->num_eq = cpu_to_le32(num);
+	for (i = 0; i < num; i++) {
+		req->set_eqd[i].eq_id = cpu_to_le32(set_eqd[i].eq_id);
+		req->set_eqd[i].phase = 0;
+		req->set_eqd[i].delay_multiplier =
+				cpu_to_le32(set_eqd[i].delay_multiplier);
+	}
 
 	be_mcc_notify(adapter);
-
 err:
 	spin_unlock_bh(&adapter->mcc_lock);
 	return status;
@@ -1767,7 +1770,7 @@ err:
 
 /* Uses sycnhronous mcc */
 int be_cmd_vlan_config(struct be_adapter *adapter, u32 if_id, u16 *vtag_array,
-			u32 num, bool untagged, bool promiscuous)
+		       u32 num, bool promiscuous)
 {
 	struct be_mcc_wrb *wrb;
 	struct be_cmd_req_vlan_config *req;
@@ -1787,7 +1790,7 @@ int be_cmd_vlan_config(struct be_adapter *adapter, u32 if_id, u16 *vtag_array,
 
 	req->interface_id = if_id;
 	req->promiscuous = promiscuous;
-	req->untagged = untagged;
+	req->untagged = BE_IF_FLAGS_UNTAGGED & be_if_cap_flags(adapter) ? 1 : 0;
 	req->num_vlan = num;
 	if (!promiscuous) {
 		memcpy(req->normal_vlan, vtag_array,
@@ -1856,7 +1859,19 @@ int be_cmd_rx_filter(struct be_adapter *adapter, u32 flags, u32 value)
 			memcpy(req->mcast_mac[i++].byte, ha->addr, ETH_ALEN);
 	}
 
+	if ((req->if_flags_mask & cpu_to_le32(be_if_cap_flags(adapter))) !=
+	     req->if_flags_mask) {
+		dev_warn(&adapter->pdev->dev,
+			 "Cannot set rx filter flags 0x%x\n",
+			 req->if_flags_mask);
+		dev_warn(&adapter->pdev->dev,
+			 "Interface is capable of 0x%x flags only\n",
+			 be_if_cap_flags(adapter));
+	}
+	req->if_flags_mask &= cpu_to_le32(be_if_cap_flags(adapter));
+
 	status = be_mcc_notify_wait(adapter);
+
 err:
 	spin_unlock_bh(&adapter->mcc_lock);
 	return status;
@@ -2727,7 +2742,8 @@ err:
  *		  If pmac_id is returned, pmac_id_valid is returned as true
  */
 int be_cmd_get_mac_from_list(struct be_adapter *adapter, u8 *mac,
-			     bool *pmac_id_valid, u32 *pmac_id, u8 domain)
+			     bool *pmac_id_valid, u32 *pmac_id, u32 if_handle,
+			     u8 domain)
 {
 	struct be_mcc_wrb *wrb;
 	struct be_cmd_req_get_mac_list *req;
@@ -2765,7 +2781,7 @@ int be_cmd_get_mac_from_list(struct be_adapter *adapter, u8 *mac,
 	req->mac_type = MAC_ADDRESS_TYPE_NETWORK;
 	if (*pmac_id_valid) {
 		req->mac_id = cpu_to_le32(*pmac_id);
-		req->iface_id = cpu_to_le16(adapter->if_handle);
+		req->iface_id = cpu_to_le16(if_handle);
 		req->perm_override = 0;
 	} else {
 		req->perm_override = 1;
@@ -2818,17 +2834,21 @@ out:
 	return status;
 }
 
-int be_cmd_get_active_mac(struct be_adapter *adapter, u32 curr_pmac_id, u8 *mac)
+int be_cmd_get_active_mac(struct be_adapter *adapter, u32 curr_pmac_id, u8 *mac,
+			  u32 if_handle, bool active, u32 domain)
 {
-	bool active = true;
 
+	if (!active)
+		be_cmd_get_mac_from_list(adapter, mac, &active, &curr_pmac_id,
+					 if_handle, domain);
 	if (BEx_chip(adapter))
 		return be_cmd_mac_addr_query(adapter, mac, false,
-					     adapter->if_handle, curr_pmac_id);
+					     if_handle, curr_pmac_id);
 	else
 		/* Fetch the MAC address using pmac_id */
 		return be_cmd_get_mac_from_list(adapter, mac, &active,
-						&curr_pmac_id, 0);
+						&curr_pmac_id,
+						if_handle, domain);
 }
 
 int be_cmd_get_perm_mac(struct be_adapter *adapter, u8 *mac)
@@ -2847,7 +2867,7 @@ int be_cmd_get_perm_mac(struct be_adapter *adapter, u8 *mac)
 						       adapter->if_handle, 0);
 	} else {
 		status = be_cmd_get_mac_from_list(adapter, mac, &pmac_valid,
-						  NULL, 0);
+						  NULL, adapter->if_handle, 0);
 	}
 
 	return status;
@@ -2908,7 +2928,8 @@ int be_cmd_set_mac(struct be_adapter *adapter, u8 *mac, int if_id, u32 dom)
 	int status;
 
 	status = be_cmd_get_mac_from_list(adapter, old_mac, &active_mac,
-					  &pmac_id, dom);
+					  &pmac_id, if_id, dom);
+
 	if (!status && active_mac)
 		be_cmd_pmac_del(adapter, if_id, pmac_id, dom);
 
@@ -3019,13 +3040,15 @@ int be_cmd_get_acpi_wol_cap(struct be_adapter *adapter)
 {
 	struct be_mcc_wrb *wrb;
 	struct be_cmd_req_acpi_wol_magic_config_v1 *req;
-	int status;
-	int payload_len = sizeof(*req);
+	int status = 0;
 	struct be_dma_mem cmd;
 
 	if (!be_cmd_allowed(adapter, OPCODE_ETH_ACPI_WOL_MAGIC_CONFIG,
 			    CMD_SUBSYSTEM_ETH))
 		return -EPERM;
+
+	if (be_is_wol_excluded(adapter))
+		return status;
 
 	if (mutex_lock_interruptible(&adapter->mbox_lock))
 		return -1;
@@ -3051,7 +3074,7 @@ int be_cmd_get_acpi_wol_cap(struct be_adapter *adapter)
 
 	be_wrb_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ETH,
 			       OPCODE_ETH_ACPI_WOL_MAGIC_CONFIG,
-			       payload_len, wrb, &cmd);
+			       sizeof(*req), wrb, &cmd);
 
 	req->hdr.version = 1;
 	req->query_options = BE_GET_WOL_CAP;
@@ -3061,13 +3084,9 @@ int be_cmd_get_acpi_wol_cap(struct be_adapter *adapter)
 		struct be_cmd_resp_acpi_wol_magic_config_v1 *resp;
 		resp = (struct be_cmd_resp_acpi_wol_magic_config_v1 *) cmd.va;
 
-		/* the command could succeed misleadingly on old f/w
-		 * which is not aware of the V1 version. fake an error. */
-		if (resp->hdr.response_length < payload_len) {
-			status = -1;
-			goto err;
-		}
 		adapter->wol_cap = resp->wol_settings;
+		if (adapter->wol_cap & BE_WOL_CAP)
+			adapter->wol_en = true;
 	}
 err:
 	mutex_unlock(&adapter->mbox_lock);
@@ -3076,6 +3095,76 @@ err:
 	return status;
 
 }
+
+int be_cmd_set_fw_log_level(struct be_adapter *adapter, u32 level)
+{
+	struct be_dma_mem extfat_cmd;
+	struct be_fat_conf_params *cfgs;
+	int status;
+	int i, j;
+
+	memset(&extfat_cmd, 0, sizeof(struct be_dma_mem));
+	extfat_cmd.size = sizeof(struct be_cmd_resp_get_ext_fat_caps);
+	extfat_cmd.va = pci_alloc_consistent(adapter->pdev, extfat_cmd.size,
+					     &extfat_cmd.dma);
+	if (!extfat_cmd.va)
+		return -ENOMEM;
+
+	status = be_cmd_get_ext_fat_capabilites(adapter, &extfat_cmd);
+	if (status)
+		goto err;
+
+	cfgs = (struct be_fat_conf_params *)
+			(extfat_cmd.va + sizeof(struct be_cmd_resp_hdr));
+	for (i = 0; i < le32_to_cpu(cfgs->num_modules); i++) {
+		u32 num_modes = le32_to_cpu(cfgs->module[i].num_modes);
+		for (j = 0; j < num_modes; j++) {
+			if (cfgs->module[i].trace_lvl[j].mode == MODE_UART)
+				cfgs->module[i].trace_lvl[j].dbg_lvl =
+							cpu_to_le32(level);
+		}
+	}
+
+	status = be_cmd_set_ext_fat_capabilites(adapter, &extfat_cmd, cfgs);
+err:
+	pci_free_consistent(adapter->pdev, extfat_cmd.size, extfat_cmd.va,
+			    extfat_cmd.dma);
+	return status;
+}
+
+int be_cmd_get_fw_log_level(struct be_adapter *adapter)
+{
+	struct be_dma_mem extfat_cmd;
+	struct be_fat_conf_params *cfgs;
+	int status, j;
+	int level = 0;
+
+	memset(&extfat_cmd, 0, sizeof(struct be_dma_mem));
+	extfat_cmd.size = sizeof(struct be_cmd_resp_get_ext_fat_caps);
+	extfat_cmd.va = pci_alloc_consistent(adapter->pdev, extfat_cmd.size,
+					     &extfat_cmd.dma);
+
+	if (!extfat_cmd.va) {
+		dev_err(&adapter->pdev->dev, "%s: Memory allocation failure\n",
+			__func__);
+		goto err;
+	}
+
+	status = be_cmd_get_ext_fat_capabilites(adapter, &extfat_cmd);
+	if (!status) {
+		cfgs = (struct be_fat_conf_params *)(extfat_cmd.va +
+						sizeof(struct be_cmd_resp_hdr));
+		for (j = 0; j < le32_to_cpu(cfgs->module[0].num_modes); j++) {
+			if (cfgs->module[0].trace_lvl[j].mode == MODE_UART)
+				level = cfgs->module[0].trace_lvl[j].dbg_lvl;
+		}
+	}
+	pci_free_consistent(adapter->pdev, extfat_cmd.size, extfat_cmd.va,
+			    extfat_cmd.dma);
+err:
+	return level;
+}
+
 int be_cmd_get_ext_fat_capabilites(struct be_adapter *adapter,
 				   struct be_dma_mem *cmd)
 {
@@ -3596,6 +3685,40 @@ int be_cmd_intr_set(struct be_adapter *adapter, bool intr_enable)
 
 	status = be_mbox_notify_wait(adapter);
 
+	mutex_unlock(&adapter->mbox_lock);
+	return status;
+}
+
+/* Uses MBOX */
+int be_cmd_get_active_profile(struct be_adapter *adapter, u16 *profile_id)
+{
+	struct be_cmd_req_get_active_profile *req;
+	struct be_mcc_wrb *wrb;
+	int status;
+
+	if (mutex_lock_interruptible(&adapter->mbox_lock))
+		return -1;
+
+	wrb = wrb_from_mbox(adapter);
+	if (!wrb) {
+		status = -EBUSY;
+		goto err;
+	}
+
+	req = embedded_payload(wrb);
+
+	be_wrb_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_COMMON,
+			       OPCODE_COMMON_GET_ACTIVE_PROFILE, sizeof(*req),
+			       wrb, NULL);
+
+	status = be_mbox_notify_wait(adapter);
+	if (!status) {
+		struct be_cmd_resp_get_active_profile *resp =
+							embedded_payload(wrb);
+		*profile_id = le16_to_cpu(resp->active_profile_id);
+	}
+
+err:
 	mutex_unlock(&adapter->mbox_lock);
 	return status;
 }

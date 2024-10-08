@@ -27,7 +27,7 @@ static ssize_t zfcp_sysfs_##_feat##_##_name##_show(struct device *dev,	       \
 static ZFCP_DEV_ATTR(_feat, _name, S_IRUGO,				       \
 		     zfcp_sysfs_##_feat##_##_name##_show, NULL);
 
-#define ZFCP_DEFINE_ATTR_CONST(_feat, _name, _format, _value)		       \
+#define ZFCP_DEFINE_ATTR_CONST(_feat, _name, _format, _value)	               \
 static ssize_t zfcp_sysfs_##_feat##_##_name##_show(struct device *dev,	       \
 						   struct device_attribute *at,\
 						   char *buf)		       \

@@ -18,33 +18,21 @@
  */
 #include "xfs.h"
 #include "xfs_fs.h"
-#include "xfs_format.h"
 #include "xfs_shared.h"
-#include "xfs_log.h"
-#include "xfs_trans.h"
+#include "xfs_format.h"
+#include "xfs_log_format.h"
+#include "xfs_trans_resv.h"
 #include "xfs_sb.h"
 #include "xfs_ag.h"
 #include "xfs_mount.h"
-#include "xfs_error.h"
-#include "xfs_da_btree.h"
-#include "xfs_bmap_btree.h"
-#include "xfs_alloc_btree.h"
-#include "xfs_ialloc_btree.h"
-#include "xfs_dinode.h"
 #include "xfs_inode.h"
-#include "xfs_btree.h"
-#include "xfs_ialloc.h"
-#include "xfs_alloc.h"
 #include "xfs_extent_busy.h"
-#include "xfs_bmap.h"
 #include "xfs_quota.h"
-#include "xfs_qm.h"
+#include "xfs_trans.h"
 #include "xfs_trans_priv.h"
-#include "xfs_trans_space.h"
-#include "xfs_inode_item.h"
-#include "xfs_log_priv.h"
-#include "xfs_buf_item.h"
+#include "xfs_log.h"
 #include "xfs_trace.h"
+#include "xfs_error.h"
 
 kmem_zone_t	*xfs_trans_zone;
 kmem_zone_t	*xfs_log_item_desc_zone;
@@ -57,7 +45,7 @@ void
 xfs_trans_init(
 	struct xfs_mount	*mp)
 {
-	xfs_trans_resv_calc(mp, &mp->m_resv);
+	xfs_trans_resv_calc(mp, M_RES(mp));
 }
 
 /*
@@ -181,12 +169,10 @@ xfs_trans_dup(
  */
 int
 xfs_trans_reserve(
-	xfs_trans_t	*tp,
-	uint		blocks,
-	uint		logspace,
-	uint		rtextents,
-	uint		flags,
-	uint		logcount)
+	struct xfs_trans	*tp,
+	struct xfs_trans_res	*resp,
+	uint			blocks,
+	uint			rtextents)
 {
 	int		error = 0;
 	int		rsvd = (tp->t_flags & XFS_TRANS_RESERVE) != 0;
@@ -212,13 +198,15 @@ xfs_trans_reserve(
 	/*
 	 * Reserve the log space needed for this transaction.
 	 */
-	if (logspace > 0) {
+	if (resp->tr_logres > 0) {
 		bool	permanent = false;
 
-		ASSERT(tp->t_log_res == 0 || tp->t_log_res == logspace);
-		ASSERT(tp->t_log_count == 0 || tp->t_log_count == logcount);
+		ASSERT(tp->t_log_res == 0 ||
+		       tp->t_log_res == resp->tr_logres);
+		ASSERT(tp->t_log_count == 0 ||
+		       tp->t_log_count == resp->tr_logcount);
 
-		if (flags & XFS_TRANS_PERM_LOG_RES) {
+		if (resp->tr_logflags & XFS_TRANS_PERM_LOG_RES) {
 			tp->t_flags |= XFS_TRANS_PERM_LOG_RES;
 			permanent = true;
 		} else {
@@ -227,20 +215,21 @@ xfs_trans_reserve(
 		}
 
 		if (tp->t_ticket != NULL) {
-			ASSERT(flags & XFS_TRANS_PERM_LOG_RES);
+			ASSERT(resp->tr_logflags & XFS_TRANS_PERM_LOG_RES);
 			error = xfs_log_regrant(tp->t_mountp, tp->t_ticket);
 		} else {
-			error = xfs_log_reserve(tp->t_mountp, logspace,
-						logcount, &tp->t_ticket,
-						XFS_TRANSACTION, permanent,
-						tp->t_type);
+			error = xfs_log_reserve(tp->t_mountp,
+						resp->tr_logres,
+						resp->tr_logcount,
+						&tp->t_ticket, XFS_TRANSACTION,
+						permanent, tp->t_type);
 		}
 
 		if (error)
 			goto undo_blocks;
 
-		tp->t_log_res = logspace;
-		tp->t_log_count = logcount;
+		tp->t_log_res = resp->tr_logres;
+		tp->t_log_count = resp->tr_logcount;
 	}
 
 	/*
@@ -265,10 +254,10 @@ xfs_trans_reserve(
 	 * reservations which have already been performed.
 	 */
 undo_log:
-	if (logspace > 0) {
+	if (resp->tr_logres > 0) {
 		int		log_flags;
 
-		if (flags & XFS_TRANS_PERM_LOG_RES) {
+		if (resp->tr_logflags & XFS_TRANS_PERM_LOG_RES) {
 			log_flags = XFS_LOG_REL_PERM_RESERV;
 		} else {
 			log_flags = 0;
@@ -1010,7 +999,7 @@ xfs_trans_roll(
 	struct xfs_inode	*dp)
 {
 	struct xfs_trans	*trans;
-	unsigned int		logres, count;
+	struct xfs_trans_res	tres;
 	int			error;
 
 	/*
@@ -1022,8 +1011,8 @@ xfs_trans_roll(
 	/*
 	 * Copy the critical parameters from one trans to the next.
 	 */
-	logres = trans->t_log_res;
-	count = trans->t_log_count;
+	tres.tr_logres = trans->t_log_res;
+	tres.tr_logcount = trans->t_log_count;
 	*tpp = xfs_trans_dup(trans);
 
 	/*
@@ -1054,8 +1043,8 @@ xfs_trans_roll(
 	 * across this call, or that anything that is locked be logged in
 	 * the prior and the next transactions.
 	 */
-	error = xfs_trans_reserve(trans, 0, logres, 0,
-				  XFS_TRANS_PERM_LOG_RES, count);
+	tres.tr_logflags = XFS_TRANS_PERM_LOG_RES;
+	error = xfs_trans_reserve(trans, &tres, 0, 0);
 	/*
 	 *  Ensure that the inode is in the new transaction and locked.
 	 */

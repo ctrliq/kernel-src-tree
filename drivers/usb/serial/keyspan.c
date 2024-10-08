@@ -156,7 +156,7 @@ static void keyspan_set_termios(struct tty_struct *tty,
 	p_priv = usb_get_serial_port_data(port);
 	d_details = p_priv->device_details;
 	cflag = tty->termios.c_cflag;
-	device_port = port->number - port->serial->minor;
+	device_port = port->port_number;
 
 	/* Baud rate calculation takes baud rate as an integer
 	   so other rates can be generated if desired. */
@@ -238,8 +238,8 @@ static int keyspan_write(struct tty_struct *tty,
 		dataOffset = 1;
 	}
 
-	dev_dbg(&port->dev, "%s - for port %d (%d chars), flip=%d\n",
-		__func__, port->number, count, p_priv->out_flip);
+	dev_dbg(&port->dev, "%s - %d chars, flip=%d\n", __func__, count,
+		p_priv->out_flip);
 
 	for (left = count; left > 0; left -= todo) {
 		todo = left;
@@ -1045,7 +1045,7 @@ static int keyspan_open(struct tty_struct *tty, struct usb_serial_port *port)
 	/* get the terminal config for the setup message now so we don't
 	 * need to send 2 of them */
 
-	device_port = port->number - port->serial->minor;
+	device_port = port->port_number;
 	if (tty) {
 		cflag = tty->termios.c_cflag;
 		/* Baud rate calculation takes baud rate as an integer
@@ -1551,7 +1551,7 @@ static int keyspan_usa26_send_setup(struct usb_serial *serial,
 	s_priv = usb_get_serial_data(serial);
 	p_priv = usb_get_serial_port_data(port);
 	d_details = s_priv->device_details;
-	device_port = port->number - port->serial->minor;
+	device_port = port->port_number;
 
 	this_urb = p_priv->outcont_urb;
 
@@ -1695,7 +1695,7 @@ static int keyspan_usa28_send_setup(struct usb_serial *serial,
 	s_priv = usb_get_serial_data(serial);
 	p_priv = usb_get_serial_port_data(port);
 	d_details = s_priv->device_details;
-	device_port = port->number - port->serial->minor;
+	device_port = port->port_number;
 
 	/* only do something if we have a bulk out endpoint */
 	this_urb = p_priv->outcont_urb;
@@ -1825,17 +1825,16 @@ static int keyspan_usa49_send_setup(struct usb_serial *serial,
 	this_urb = s_priv->glocont_urb;
 
 	/* Work out which port within the device is being setup */
-	device_port = port->number - port->serial->minor;
+	device_port = port->port_number;
 
 	/* Make sure we have an urb then send the message */
 	if (this_urb == NULL) {
-		dev_dbg(&port->dev, "%s - oops no urb for port %d.\n", __func__, port->number);
+		dev_dbg(&port->dev, "%s - oops no urb for port.\n", __func__);
 		return -1;
 	}
 
-	dev_dbg(&port->dev, "%s - endpoint %d port %d (%d)\n",
-		__func__, usb_pipeendpoint(this_urb->pipe),
-		port->number, device_port);
+	dev_dbg(&port->dev, "%s - endpoint %d (%d)\n",
+		__func__, usb_pipeendpoint(this_urb->pipe), device_port);
 
 	/* Save reset port val for resend.
 	   Don't overwrite resend for open/close condition. */
@@ -1850,7 +1849,6 @@ static int keyspan_usa49_send_setup(struct usb_serial *serial,
 
 	memset(&msg, 0, sizeof(struct keyspan_usa49_portControlMessage));
 
-	/*msg.portNumber = port->number;*/
 	msg.portNumber = device_port;
 
 	/* Only set baud rate if it's changed */
@@ -2140,12 +2138,11 @@ static int keyspan_usa67_send_setup(struct usb_serial *serial,
 	this_urb = s_priv->glocont_urb;
 
 	/* Work out which port within the device is being setup */
-	device_port = port->number - port->serial->minor;
+	device_port = port->port_number;
 
 	/* Make sure we have an urb then send the message */
 	if (this_urb == NULL) {
-		dev_dbg(&port->dev, "%s - oops no urb for port %d.\n", __func__,
-			port->number);
+		dev_dbg(&port->dev, "%s - oops no urb for port.\n", __func__);
 		return -1;
 	}
 
@@ -2310,7 +2307,7 @@ static int keyspan_startup(struct usb_serial *serial)
 	if (d_details == NULL) {
 		dev_err(&serial->dev->dev, "%s - unknown product id %x\n",
 		    __func__, le16_to_cpu(serial->dev->descriptor.idProduct));
-		return 1;
+		return -ENODEV;
 	}
 
 	/* Setup private data for serial driver */
@@ -2438,7 +2435,7 @@ static int keyspan_port_probe(struct usb_serial_port *port)
 	/* Setup values for the various callback routines */
 	cback = &keyspan_callbacks[d_details->msg_format];
 
-	port_num = port->number - port->serial->minor;
+	port_num = port->port_number;
 
 	/* Do indat endpoints first, once for each flip */
 	endp = d_details->indat_endpoints[port_num];

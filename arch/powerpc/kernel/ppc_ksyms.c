@@ -99,8 +99,12 @@ EXPORT_SYMBOL(pci_dram_offset);
 EXPORT_SYMBOL(start_thread);
 
 EXPORT_SYMBOL(giveup_fpu);
+EXPORT_SYMBOL(load_fp_state);
+EXPORT_SYMBOL(store_fp_state);
 #ifdef CONFIG_ALTIVEC
 EXPORT_SYMBOL(giveup_altivec);
+EXPORT_SYMBOL(load_vr_state);
+EXPORT_SYMBOL(store_vr_state);
 #endif /* CONFIG_ALTIVEC */
 #ifdef CONFIG_VSX
 EXPORT_SYMBOL(giveup_vsx);

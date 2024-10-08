@@ -144,7 +144,7 @@ sd_store_cache_type(struct device *dev, struct device_attribute *attr,
 	char *buffer_data;
 	struct scsi_mode_data data;
 	struct scsi_sense_hdr sshdr;
-	const char *temp = "temporary ";
+	static const char temp[] = "temporary ";
 	int len;
 
 	if (sdp->type != TYPE_DISK)
@@ -444,8 +444,10 @@ sd_store_write_same_blocks(struct device *dev, struct device_attribute *attr,
 
 	if (max == 0)
 		sdp->no_write_same = 1;
-	else if (max <= SD_MAX_WS16_BLOCKS)
+	else if (max <= SD_MAX_WS16_BLOCKS) {
+		sdp->no_write_same = 0;
 		sdkp->max_ws_blocks = max;
+	}
 
 	sd_config_write_same(sdkp);
 
@@ -744,7 +746,6 @@ static void sd_config_write_same(struct scsi_disk *sdkp)
 {
 	struct request_queue *q = sdkp->disk->queue;
 	unsigned int logical_block_size = sdkp->device->sector_size;
-	unsigned int blocks = 0;
 
 	if (sdkp->device->no_write_same) {
 		sdkp->max_ws_blocks = 0;
@@ -756,18 +757,20 @@ static void sd_config_write_same(struct scsi_disk *sdkp)
 	 * blocks per I/O unless the device explicitly advertises a
 	 * bigger limit.
 	 */
-	if (sdkp->max_ws_blocks == 0)
-		sdkp->max_ws_blocks = SD_MAX_WS10_BLOCKS;
-
-	if (sdkp->ws16 || sdkp->max_ws_blocks > SD_MAX_WS10_BLOCKS)
-		blocks = min_not_zero(sdkp->max_ws_blocks,
-				      (u32)SD_MAX_WS16_BLOCKS);
-	else
-		blocks = min_not_zero(sdkp->max_ws_blocks,
-				      (u32)SD_MAX_WS10_BLOCKS);
+	if (sdkp->max_ws_blocks > SD_MAX_WS10_BLOCKS)
+		sdkp->max_ws_blocks = min_not_zero(sdkp->max_ws_blocks,
+						   (u32)SD_MAX_WS16_BLOCKS);
+	else if (sdkp->ws16 || sdkp->ws10 || sdkp->device->no_report_opcodes)
+		sdkp->max_ws_blocks = min_not_zero(sdkp->max_ws_blocks,
+						   (u32)SD_MAX_WS10_BLOCKS);
+	else {
+		sdkp->device->no_write_same = 1;
+		sdkp->max_ws_blocks = 0;
+	}
 
 out:
-	blk_queue_max_write_same_sectors(q, blocks * (logical_block_size >> 9));
+	blk_queue_max_write_same_sectors(q, sdkp->max_ws_blocks *
+					 (logical_block_size >> 9));
 }
 
 /**
@@ -1619,6 +1622,8 @@ static int sd_done(struct scsi_cmnd *SCpnt)
 	unsigned char op = SCpnt->cmnd[0];
 	unsigned char unmap = SCpnt->cmnd[1] & 8;
 
+	sd_uninit_command(SCpnt);
+
 	if (req->cmd_flags & REQ_DISCARD || req->cmd_flags & REQ_WRITE_SAME) {
 		if (!result) {
 			good_bytes = blk_rq_bytes(req);
@@ -2395,14 +2400,9 @@ sd_read_cache_type(struct scsi_disk *sdkp, unsigned char *buffer)
 			}
 		}
 
-		if (modepage == 0x3F) {
-			sd_printk(KERN_ERR, sdkp, "No Caching mode page "
-				  "present\n");
-			goto defaults;
-		} else if ((buffer[offset] & 0x3f) != modepage) {
-			sd_printk(KERN_ERR, sdkp, "Got wrong page\n");
-			goto defaults;
-		}
+		sd_printk(KERN_ERR, sdkp, "No Caching mode page found\n");
+		goto defaults;
+
 	Page_found:
 		if (modepage == 8) {
 			sdkp->WCE = ((buffer[offset + 2] & 0x04) != 0);
@@ -2616,9 +2616,30 @@ static void sd_read_block_provisioning(struct scsi_disk *sdkp)
 
 static void sd_read_write_same(struct scsi_disk *sdkp, unsigned char *buffer)
 {
-	if (scsi_report_opcode(sdkp->device, buffer, SD_BUF_SIZE,
-			       WRITE_SAME_16))
+	struct scsi_device *sdev = sdkp->device;
+
+	if (sdev->host->no_write_same) {
+		sdev->no_write_same = 1;
+
+		return;
+	}
+
+	if (scsi_report_opcode(sdev, buffer, SD_BUF_SIZE, INQUIRY) < 0) {
+		sdev->no_report_opcodes = 1;
+
+		/* Disable WRITE SAME if REPORT SUPPORTED OPERATION
+		 * CODES is unsupported and the device has an ATA
+		 * Information VPD page (SAT).
+		 */
+		if (!scsi_get_vpd_page(sdev, 0x89, buffer, SD_BUF_SIZE))
+			sdev->no_write_same = 1;
+	}
+
+	if (scsi_report_opcode(sdev, buffer, SD_BUF_SIZE, WRITE_SAME_16) == 1)
 		sdkp->ws16 = 1;
+
+	if (scsi_report_opcode(sdev, buffer, SD_BUF_SIZE, WRITE_SAME) == 1)
+		sdkp->ws10 = 1;
 }
 
 static int sd_try_extended_inquiry(struct scsi_device *sdp)
@@ -2816,6 +2837,7 @@ static void sd_probe_async(void *data, async_cookie_t cookie)
 		gd->events |= DISK_EVENT_MEDIA_CHANGE;
 	}
 
+	blk_pm_runtime_init(sdp->request_queue, dev);
 	add_disk(gd);
 	if (sdkp->capacity)
 		sd_dif_config_host(sdkp);
@@ -2824,7 +2846,6 @@ static void sd_probe_async(void *data, async_cookie_t cookie)
 
 	sd_printk(KERN_NOTICE, sdkp, "Attached SCSI %sdisk\n",
 		  sdp->removable ? "removable " : "");
-	blk_pm_runtime_init(sdp->request_queue, dev);
 	scsi_autopm_put_device(sdp);
 	put_device(&sdkp->dev);
 }

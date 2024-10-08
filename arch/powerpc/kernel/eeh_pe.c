@@ -151,8 +151,8 @@ static struct eeh_pe *eeh_pe_next(struct eeh_pe *pe,
  * callback returns something other than NULL, or no more PEs
  * to be traversed.
  */
-static void *eeh_pe_traverse(struct eeh_pe *root,
-			eeh_traverse_func fn, void *flag)
+void *eeh_pe_traverse(struct eeh_pe *root,
+		      eeh_traverse_func fn, void *flag)
 {
 	struct eeh_pe *pe;
 	void *ret;
@@ -345,7 +345,7 @@ int eeh_add_to_parent_pe(struct eeh_dev *edev)
 		while (parent) {
 			if (!(parent->type & EEH_PE_INVALID))
 				break;
-			parent->type &= ~EEH_PE_INVALID;
+			parent->type &= ~(EEH_PE_INVALID | EEH_PE_KEEP);
 			parent = parent->parent;
 		}
 		eeh_unlock();
@@ -364,6 +364,17 @@ int eeh_add_to_parent_pe(struct eeh_dev *edev)
 	}
 	pe->addr	= edev->pe_config_addr;
 	pe->config_addr	= edev->config_addr;
+
+	/*
+	 * While doing PE reset, we probably hot-reset the
+	 * upstream bridge. However, the PCI devices including
+	 * the associated EEH devices might be removed when EEH
+	 * core is doing recovery. So that won't safe to retrieve
+	 * the bridge through downstream EEH device. We have to
+	 * trace the parent PCI bus, then the upstream bridge.
+	 */
+	if (eeh_probe_mode_dev())
+		pe->bus = eeh_dev_to_pci_dev(edev)->bus;
 
 	/*
 	 * Put the new EEH PE into hierarchy tree. If the parent
@@ -402,21 +413,20 @@ int eeh_add_to_parent_pe(struct eeh_dev *edev)
 /**
  * eeh_rmv_from_parent_pe - Remove one EEH device from the associated PE
  * @edev: EEH device
- * @purge_pe: remove PE or not
  *
  * The PE hierarchy tree might be changed when doing PCI hotplug.
  * Also, the PCI devices or buses could be removed from the system
  * during EEH recovery. So we have to call the function remove the
  * corresponding PE accordingly if necessary.
  */
-int eeh_rmv_from_parent_pe(struct eeh_dev *edev, int purge_pe)
+int eeh_rmv_from_parent_pe(struct eeh_dev *edev)
 {
 	struct eeh_pe *pe, *parent, *child;
 	int cnt;
 
 	if (!edev->pe) {
-		pr_warning("%s: No PE found for EEH device %s\n",
-			__func__, edev->dn->full_name);
+		pr_debug("%s: No PE found for EEH device %s\n",
+			 __func__, edev->dn->full_name);
 		return -EEXIST;
 	}
 
@@ -438,7 +448,7 @@ int eeh_rmv_from_parent_pe(struct eeh_dev *edev, int purge_pe)
 		if (pe->type & EEH_PE_PHB)
 			break;
 
-		if (purge_pe) {
+		if (!(pe->state & EEH_PE_KEEP)) {
 			if (list_empty(&pe->edevs) &&
 			    list_empty(&pe->child_list)) {
 				list_del(&pe->child);
@@ -592,7 +602,7 @@ void eeh_pe_state_clear(struct eeh_pe *pe, int state)
  * blocked on normal path during the stage. So we need utilize
  * eeh operations, which is always permitted.
  */
-static void eeh_bridge_check_link(struct pci_dev *pdev,
+static void eeh_bridge_check_link(struct eeh_dev *edev,
 				  struct device_node *dn)
 {
 	int cap;
@@ -603,16 +613,17 @@ static void eeh_bridge_check_link(struct pci_dev *pdev,
 	 * We only check root port and downstream ports of
 	 * PCIe switches
 	 */
-	if (!pci_is_pcie(pdev) ||
-	    (pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT &&
-	     pci_pcie_type(pdev) != PCI_EXP_TYPE_DOWNSTREAM))
+	if (!(edev->mode & (EEH_DEV_ROOT_PORT | EEH_DEV_DS_PORT)))
 		return;
 
-	pr_debug("%s: Check PCIe link for %s ...\n",
-		 __func__, pci_name(pdev));
+	pr_debug("%s: Check PCIe link for %04x:%02x:%02x.%01x ...\n",
+		 __func__, edev->phb->global_number,
+		 edev->config_addr >> 8,
+		 PCI_SLOT(edev->config_addr & 0xFF),
+		 PCI_FUNC(edev->config_addr & 0xFF));
 
 	/* Check slot status */
-	cap = pdev->pcie_cap;
+	cap = edev->pcie_cap;
 	eeh_ops->read_config(dn, cap + PCI_EXP_SLTSTA, 2, &val);
 	if (!(val & PCI_EXP_SLTSTA_PDS)) {
 		pr_debug("  No card in the slot (0x%04x) !\n", val);
@@ -666,8 +677,7 @@ static void eeh_bridge_check_link(struct pci_dev *pdev,
 #define BYTE_SWAP(OFF)	(8*((OFF)/4)+3-(OFF))
 #define SAVED_BYTE(OFF)	(((u8 *)(edev->config_space))[BYTE_SWAP(OFF)])
 
-static void eeh_restore_bridge_bars(struct pci_dev *pdev,
-				    struct eeh_dev *edev,
+static void eeh_restore_bridge_bars(struct eeh_dev *edev,
 				    struct device_node *dn)
 {
 	int i;
@@ -693,7 +703,7 @@ static void eeh_restore_bridge_bars(struct pci_dev *pdev,
 	eeh_ops->write_config(dn, PCI_COMMAND, 4, edev->config_space[1]);
 
 	/* Check the PCIe link is ready */
-	eeh_bridge_check_link(pdev, dn);
+	eeh_bridge_check_link(edev, dn);
 }
 
 static void eeh_restore_device_bars(struct eeh_dev *edev,
@@ -742,19 +752,12 @@ static void eeh_restore_device_bars(struct eeh_dev *edev,
  */
 static void *eeh_restore_one_device_bars(void *data, void *flag)
 {
-	struct pci_dev *pdev = NULL;
 	struct eeh_dev *edev = (struct eeh_dev *)data;
 	struct device_node *dn = eeh_dev_to_of_node(edev);
 
-	/* Trace the PCI bridge */
-	if (eeh_probe_mode_dev()) {
-		pdev = eeh_dev_to_pci_dev(edev);
-		if (pdev->hdr_type != PCI_HEADER_TYPE_BRIDGE)
-                        pdev = NULL;
-        }
-
-	if (pdev)
-		eeh_restore_bridge_bars(pdev, edev, dn);
+	/* Do special restore for bridges */
+	if (edev->mode & EEH_DEV_BRIDGE)
+		eeh_restore_bridge_bars(edev, dn);
 	else
 		eeh_restore_device_bars(edev, dn);
 
@@ -799,12 +802,18 @@ struct pci_bus *eeh_pe_bus_get(struct eeh_pe *pe)
 		bus = pe->phb->bus;
 	} else if (pe->type & EEH_PE_BUS ||
 		   pe->type & EEH_PE_DEVICE) {
+		if (pe->bus) {
+			bus = pe->bus;
+			goto out;
+		}
+
 		edev = list_first_entry(&pe->edevs, struct eeh_dev, list);
 		pdev = eeh_dev_to_pci_dev(edev);
 		if (pdev)
 			bus = pdev->bus;
 	}
 
+out:
 	eeh_unlock();
 
 	return bus;

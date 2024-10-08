@@ -93,7 +93,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	}
 	invalidate_inode_pages2(blkif->vbd.bdev->bd_inode->i_mapping);
 
-	blkif->xenblkd = kthread_run(xen_blkif_schedule, blkif, "%s", name);
+	blkif->xenblkd = kthread_run(xen_blkif_schedule, blkif, name);
 	if (IS_ERR(blkif->xenblkd)) {
 		err = PTR_ERR(blkif->xenblkd);
 		blkif->xenblkd = NULL;
@@ -104,6 +104,8 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 {
 	struct xen_blkif *blkif;
+
+	BUILD_BUG_ON(MAX_INDIRECT_PAGES > BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST);
 
 	blkif = kmem_cache_zalloc(xen_blkif_cachep, GFP_KERNEL);
 	if (!blkif)
@@ -678,6 +680,11 @@ again:
 				 dev->nodename);
 		goto abort;
 	}
+	err = xenbus_printf(xbt, dev->nodename, "feature-max-indirect-segments", "%u",
+			    MAX_INDIRECT_SEGMENTS);
+	if (err)
+		dev_warn(&dev->dev, "writing %s/feature-max-indirect-segments (%d)",
+			 dev->nodename, err);
 
 	err = xenbus_printf(xbt, dev->nodename, "sectors", "%llu",
 			    (unsigned long long)vbd_sz(&be->blkif->vbd));
@@ -704,6 +711,11 @@ again:
 				 dev->nodename);
 		goto abort;
 	}
+	err = xenbus_printf(xbt, dev->nodename, "physical-sector-size", "%u",
+			    bdev_physical_block_size(be->blkif->vbd.bdev));
+	if (err)
+		xenbus_dev_error(dev, err, "writing %s/physical-sector-size",
+				 dev->nodename);
 
 	err = xenbus_transaction_end(xbt, 0);
 	if (err == -EAGAIN)

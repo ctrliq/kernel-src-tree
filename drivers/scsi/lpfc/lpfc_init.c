@@ -60,7 +60,8 @@ unsigned long _dump_buf_dif_order;
 spinlock_t _dump_buf_lock;
 
 /* Used when mapping IRQ vectors in a driver centric manner */
-uint16_t lpfc_used_cpu[LPFC_MAX_CPU];
+uint16_t *lpfc_used_cpu;
+uint32_t lpfc_present_cpu;
 
 static void lpfc_get_hba_model_desc(struct lpfc_hba *, uint8_t *, uint8_t *);
 static int lpfc_post_rcv_buf(struct lpfc_hba *);
@@ -471,10 +472,22 @@ lpfc_config_port_post(struct lpfc_hba *phba)
 	lpfc_sli_read_link_ste(phba);
 
 	/* Reset the DFT_HBA_Q_DEPTH to the max xri  */
-	if (phba->cfg_hba_queue_depth > (mb->un.varRdConfig.max_xri+1))
-		phba->cfg_hba_queue_depth =
-			(mb->un.varRdConfig.max_xri + 1) -
-					lpfc_sli4_get_els_iocb_cnt(phba);
+	i = (mb->un.varRdConfig.max_xri + 1);
+	if (phba->cfg_hba_queue_depth > i) {
+		lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
+				"3359 HBA queue depth changed from %d to %d\n",
+				phba->cfg_hba_queue_depth, i);
+		phba->cfg_hba_queue_depth = i;
+	}
+
+	/* Reset the DFT_LUN_Q_DEPTH to (max xri >> 3)  */
+	i = (mb->un.varRdConfig.max_xri >> 3);
+	if (phba->pport->cfg_lun_queue_depth > i) {
+		lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
+				"3360 LUN queue depth changed from %d to %d\n",
+				phba->pport->cfg_lun_queue_depth, i);
+		phba->pport->cfg_lun_queue_depth = i;
+	}
 
 	phba->lmt = mb->un.varRdConfig.lmt;
 
@@ -3018,10 +3031,10 @@ lpfc_sli4_xri_sgl_update(struct lpfc_hba *phba)
 			phba->sli4_hba.scsi_xri_max);
 
 	spin_lock_irq(&phba->scsi_buf_list_get_lock);
-	spin_lock_irq(&phba->scsi_buf_list_put_lock);
+	spin_lock(&phba->scsi_buf_list_put_lock);
 	list_splice_init(&phba->lpfc_scsi_buf_list_get, &scsi_sgl_list);
 	list_splice(&phba->lpfc_scsi_buf_list_put, &scsi_sgl_list);
-	spin_unlock_irq(&phba->scsi_buf_list_put_lock);
+	spin_unlock(&phba->scsi_buf_list_put_lock);
 	spin_unlock_irq(&phba->scsi_buf_list_get_lock);
 
 	if (phba->sli4_hba.scsi_xri_cnt > phba->sli4_hba.scsi_xri_max) {
@@ -3057,10 +3070,10 @@ lpfc_sli4_xri_sgl_update(struct lpfc_hba *phba)
 		psb->cur_iocbq.sli4_xritag = phba->sli4_hba.xri_ids[lxri];
 	}
 	spin_lock_irq(&phba->scsi_buf_list_get_lock);
-	spin_lock_irq(&phba->scsi_buf_list_put_lock);
+	spin_lock(&phba->scsi_buf_list_put_lock);
 	list_splice_init(&scsi_sgl_list, &phba->lpfc_scsi_buf_list_get);
 	INIT_LIST_HEAD(&phba->lpfc_scsi_buf_list_put);
-	spin_unlock_irq(&phba->scsi_buf_list_put_lock);
+	spin_unlock(&phba->scsi_buf_list_put_lock);
 	spin_unlock_irq(&phba->scsi_buf_list_get_lock);
 
 	return 0;
@@ -5050,6 +5063,9 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 	rc = lpfc_sli4_read_config(phba);
 	if (unlikely(rc))
 		goto out_free_bsmbx;
+	rc = lpfc_mem_alloc_active_rrq_pool_s4(phba);
+	if (unlikely(rc))
+		goto out_free_bsmbx;
 
 	/* IF Type 0 ports get initialized now. */
 	if (bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf) ==
@@ -5177,6 +5193,21 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 		rc = -ENOMEM;
 		goto out_free_msix;
 	}
+	if (lpfc_used_cpu == NULL) {
+		lpfc_used_cpu = kzalloc((sizeof(uint16_t) * lpfc_present_cpu),
+					 GFP_KERNEL);
+		if (!lpfc_used_cpu) {
+			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+					"3335 Failed allocate memory for msi-x "
+					"interrupt vector mapping\n");
+			kfree(phba->sli4_hba.cpu_map);
+			rc = -ENOMEM;
+			goto out_free_msix;
+		}
+		for (i = 0; i < lpfc_present_cpu; i++)
+			lpfc_used_cpu[i] = LPFC_VECTOR_MAP_EMPTY;
+	}
+
 	/* Initialize io channels for round robin */
 	cpup = phba->sli4_hba.cpu_map;
 	rc = 0;
@@ -6639,12 +6670,14 @@ lpfc_sli4_read_config(struct lpfc_hba *phba)
 		goto read_cfg_out;
 
 	/* Reset the DFT_HBA_Q_DEPTH to the max xri  */
-	if (phba->cfg_hba_queue_depth >
-		(phba->sli4_hba.max_cfg_param.max_xri -
-			lpfc_sli4_get_els_iocb_cnt(phba)))
-		phba->cfg_hba_queue_depth =
-			phba->sli4_hba.max_cfg_param.max_xri -
-				lpfc_sli4_get_els_iocb_cnt(phba);
+	length = phba->sli4_hba.max_cfg_param.max_xri -
+			lpfc_sli4_get_els_iocb_cnt(phba);
+	if (phba->cfg_hba_queue_depth > length) {
+		lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
+				"3361 HBA queue depth changed from %d to %d\n",
+				phba->cfg_hba_queue_depth, length);
+		phba->cfg_hba_queue_depth = length;
+	}
 
 	if (bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf) !=
 	    LPFC_SLI_INTF_IF_TYPE_2)
@@ -6788,8 +6821,6 @@ lpfc_sli4_queue_verify(struct lpfc_hba *phba)
 	int cfg_fcp_io_channel;
 	uint32_t cpu;
 	uint32_t i = 0;
-	uint32_t j = 0;
-
 
 	/*
 	 * Sanity check for configured queue parameters against the run-time
@@ -6803,10 +6834,9 @@ lpfc_sli4_queue_verify(struct lpfc_hba *phba)
 	for_each_present_cpu(cpu) {
 		if (cpu_online(cpu))
 			i++;
-		j++;
 	}
 	phba->sli4_hba.num_online_cpu = i;
-	phba->sli4_hba.num_present_cpu = j;
+	phba->sli4_hba.num_present_cpu = lpfc_present_cpu;
 
 	if (i < cfg_fcp_io_channel) {
 		lpfc_printf_log(phba,
@@ -8664,9 +8694,12 @@ enable_msix_vectors:
 
 cfg_fail_out:
 	/* free the irq already requested */
-	for (--index; index >= 0; index--)
+	for (--index; index >= 0; index--) {
+		irq_set_affinity_hint(phba->sli4_hba.msix_entries[index].
+					  vector, NULL);
 		free_irq(phba->sli4_hba.msix_entries[index].vector,
 			 &phba->sli4_hba.fcp_eq_hdl[index]);
+	}
 
 msi_fail_out:
 	/* Unconfigure MSI-X capability structure */
@@ -8687,9 +8720,12 @@ lpfc_sli4_disable_msix(struct lpfc_hba *phba)
 	int index;
 
 	/* Free up MSI-X multi-message vectors */
-	for (index = 0; index < phba->cfg_fcp_io_channel; index++)
+	for (index = 0; index < phba->cfg_fcp_io_channel; index++) {
+		irq_set_affinity_hint(phba->sli4_hba.msix_entries[index].
+					  vector, NULL);
 		free_irq(phba->sli4_hba.msix_entries[index].vector,
 			 &phba->sli4_hba.fcp_eq_hdl[index]);
+	}
 
 	/* Disable MSI-X */
 	pci_disable_msix(phba->pcidev);
@@ -9136,6 +9172,7 @@ lpfc_get_sli4_parameters(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
 	sli4_params->mqv = bf_get(cfg_mqv, mbx_sli4_parameters);
 	sli4_params->wqv = bf_get(cfg_wqv, mbx_sli4_parameters);
 	sli4_params->rqv = bf_get(cfg_rqv, mbx_sli4_parameters);
+	sli4_params->wqsize = bf_get(cfg_wqsize, mbx_sli4_parameters);
 	sli4_params->sgl_pages_max = bf_get(cfg_sgl_page_cnt,
 					    mbx_sli4_parameters);
 	sli4_params->sgl_pp_align = bf_get(cfg_sgl_pp_align,
@@ -10935,8 +10972,10 @@ lpfc_init(void)
 	}
 
 	/* Initialize in case vector mapping is needed */
-	for (cpu = 0; cpu < LPFC_MAX_CPU; cpu++)
-		lpfc_used_cpu[cpu] = LPFC_VECTOR_MAP_EMPTY;
+	lpfc_used_cpu = NULL;
+	lpfc_present_cpu = 0;
+	for_each_present_cpu(cpu)
+		lpfc_present_cpu++;
 
 	error = pci_register_driver(&lpfc_driver);
 	if (error) {
@@ -10976,6 +11015,7 @@ lpfc_exit(void)
 				(1L << _dump_buf_dif_order), _dump_buf_dif);
 		free_pages((unsigned long)_dump_buf_dif, _dump_buf_dif_order);
 	}
+	kfree(lpfc_used_cpu);
 }
 
 module_init(lpfc_init);

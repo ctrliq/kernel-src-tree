@@ -2032,6 +2032,8 @@ static int run_delayed_data_ref(struct btrfs_trans_handle *trans,
 	ins.type = BTRFS_EXTENT_ITEM_KEY;
 
 	ref = btrfs_delayed_node_to_data_ref(node);
+	trace_run_delayed_data_ref(node, ref, node->action);
+
 	if (node->type == BTRFS_SHARED_DATA_REF_KEY)
 		parent = ref->parent;
 	else
@@ -2188,6 +2190,8 @@ static int run_delayed_tree_ref(struct btrfs_trans_handle *trans,
 						 SKINNY_METADATA);
 
 	ref = btrfs_delayed_node_to_tree_ref(node);
+	trace_run_delayed_tree_ref(node, ref, node->action);
+
 	if (node->type == BTRFS_SHARED_BLOCK_REF_KEY)
 		parent = ref->parent;
 	else
@@ -2250,6 +2254,8 @@ static int run_one_delayed_ref(struct btrfs_trans_handle *trans,
 		 */
 		BUG_ON(extent_op);
 		head = btrfs_delayed_node_to_head(node);
+		trace_run_delayed_ref_head(node, head, node->action);
+
 		if (insert_reserved) {
 			btrfs_pin_extent(root, node->bytenr,
 					 node->num_bytes, 1);
@@ -3944,7 +3950,6 @@ static int can_overcommit(struct btrfs_root *root,
 	u64 space_size;
 	u64 avail;
 	u64 used;
-	u64 to_add;
 
 	used = space_info->bytes_used + space_info->bytes_reserved +
 		space_info->bytes_pinned + space_info->bytes_readonly;
@@ -3978,25 +3983,17 @@ static int can_overcommit(struct btrfs_root *root,
 		       BTRFS_BLOCK_GROUP_RAID10))
 		avail >>= 1;
 
-	to_add = space_info->total_bytes;
-
 	/*
 	 * If we aren't flushing all things, let us overcommit up to
 	 * 1/2th of the space. If we can flush, don't let us overcommit
 	 * too much, let it overcommit up to 1/8 of the space.
 	 */
 	if (flush == BTRFS_RESERVE_FLUSH_ALL)
-		to_add >>= 3;
+		avail >>= 3;
 	else
-		to_add >>= 1;
+		avail >>= 1;
 
-	/*
-	 * Limit the overcommit to the amount of free space we could possibly
-	 * allocate for chunks.
-	 */
-	to_add = min(avail, to_add);
-
-	if (used + bytes < space_info->total_bytes + to_add)
+	if (used + bytes < space_info->total_bytes + avail)
 		return 1;
 	return 0;
 }

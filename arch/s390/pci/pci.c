@@ -45,12 +45,8 @@
 #define ZPCI_NR_DEVICES			CONFIG_PCI_NR_FUNCTIONS
 
 /* list of all detected zpci devices */
-LIST_HEAD(zpci_list);
-EXPORT_SYMBOL_GPL(zpci_list);
-DEFINE_MUTEX(zpci_list_lock);
-EXPORT_SYMBOL_GPL(zpci_list_lock);
-
-static struct pci_hp_callback_ops *hotplug_ops;
+static LIST_HEAD(zpci_list);
+static DEFINE_SPINLOCK(zpci_list_lock);
 
 static DECLARE_BITMAP(zpci_domain, ZPCI_NR_DEVICES);
 static DEFINE_SPINLOCK(zpci_domain_lock);
@@ -105,20 +101,15 @@ struct zpci_dev *get_zdev_by_fid(u32 fid)
 {
 	struct zpci_dev *tmp, *zdev = NULL;
 
-	mutex_lock(&zpci_list_lock);
+	spin_lock(&zpci_list_lock);
 	list_for_each_entry(tmp, &zpci_list, entry) {
 		if (tmp->fid == fid) {
 			zdev = tmp;
 			break;
 		}
 	}
-	mutex_unlock(&zpci_list_lock);
+	spin_unlock(&zpci_list_lock);
 	return zdev;
-}
-
-bool zpci_fid_present(u32 fid)
-{
-	return (get_zdev_by_fid(fid) != NULL) ? true : false;
 }
 
 static struct zpci_dev *get_zdev_by_bus(struct pci_bus *bus)
@@ -941,11 +932,11 @@ int zpci_create_device(struct zpci_dev *zdev)
 	if (rc)
 		goto out_disable;
 
-	mutex_lock(&zpci_list_lock);
+	spin_lock(&zpci_list_lock);
 	list_add_tail(&zdev->entry, &zpci_list);
-	if (hotplug_ops)
-		hotplug_ops->create_slot(zdev);
-	mutex_unlock(&zpci_list_lock);
+	spin_unlock(&zpci_list_lock);
+
+	zpci_init_slot(zdev);
 
 	return 0;
 
@@ -1007,24 +998,8 @@ static void zpci_mem_exit(void)
 	kmem_cache_destroy(zdev_fmb_cache);
 }
 
-void zpci_register_hp_ops(struct pci_hp_callback_ops *ops)
-{
-	mutex_lock(&zpci_list_lock);
-	hotplug_ops = ops;
-	mutex_unlock(&zpci_list_lock);
-}
-EXPORT_SYMBOL_GPL(zpci_register_hp_ops);
-
-void zpci_deregister_hp_ops(void)
-{
-	mutex_lock(&zpci_list_lock);
-	hotplug_ops = NULL;
-	mutex_unlock(&zpci_list_lock);
-}
-EXPORT_SYMBOL_GPL(zpci_deregister_hp_ops);
-
-unsigned int s390_pci_probe;
-EXPORT_SYMBOL_GPL(s390_pci_probe);
+static unsigned int s390_pci_probe;
+static unsigned int s390_pci_initialized;
 
 char * __init pcibios_setup(char *str)
 {
@@ -1033,6 +1008,11 @@ char * __init pcibios_setup(char *str)
 		return NULL;
 	}
 	return str;
+}
+
+bool zpci_is_enabled(void)
+{
+	return s390_pci_initialized;
 }
 
 static int __init pci_base_init(void)
@@ -1066,10 +1046,11 @@ static int __init pci_base_init(void)
 	if (rc)
 		goto out_dma;
 
-	rc = clp_find_pci_devices();
+	rc = clp_scan_pci_devices();
 	if (rc)
 		goto out_find;
 
+	s390_pci_initialized = 1;
 	return 0;
 
 out_find:
@@ -1084,4 +1065,10 @@ out_mem:
 	zpci_debug_exit();
 	return rc;
 }
-subsys_initcall(pci_base_init);
+subsys_initcall_sync(pci_base_init);
+
+void zpci_rescan(void)
+{
+	if (zpci_is_enabled())
+		clp_rescan_pci_devices_simple();
+}

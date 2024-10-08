@@ -470,6 +470,45 @@ void pci_cfg_access_unlock(struct pci_dev *dev)
 }
 EXPORT_SYMBOL_GPL(pci_cfg_access_unlock);
 
+/**
+ * pci_pcie_type - get the PCIe device/port type
+ * @dev: PCI device
+ */
+int pci_pcie_type(const struct pci_dev *dev)
+{
+	return (pcie_caps_reg(dev) & PCI_EXP_FLAGS_TYPE) >> 4;
+}
+EXPORT_SYMBOL_GPL(pci_pcie_type);
+
+/**
+ * pci_pcie_cap - get the saved PCIe capability offset
+ * @dev: PCI device
+ *
+ * PCIe capability offset is calculated at PCI device initialization
+ * time and saved in the data structure. This function returns saved
+ * PCIe capability offset. Using this instead of pci_find_capability()
+ * reduces unnecessary search in the PCI configuration space. If you
+ * need to calculate PCIe capability offset from raw device for some
+ * reasons, please use pci_find_capability() instead.
+ */
+int pci_pcie_cap(struct pci_dev *dev)
+{
+	return dev->pcie_cap;
+}
+EXPORT_SYMBOL_GPL(pci_pcie_cap);
+
+/**
+ * pci_is_pcie - check if the PCI device is PCI Express capable
+ * @dev: PCI device
+ *
+ * Returns: true if the PCI device is PCI Express capable, false otherwise.
+ */
+bool pci_is_pcie(struct pci_dev *dev)
+{
+	return pci_pcie_cap(dev);
+}
+EXPORT_SYMBOL_GPL(pci_is_pcie);
+
 static inline int pcie_cap_version(const struct pci_dev *dev)
 {
 	return pcie_caps_reg(dev) & PCI_EXP_FLAGS_VERS;
@@ -633,6 +672,18 @@ int pcie_capability_write_dword(struct pci_dev *dev, int pos, u32 val)
 	return pci_write_config_dword(dev, pci_pcie_cap(dev) + pos, val);
 }
 EXPORT_SYMBOL(pcie_capability_write_dword);
+
+int pcie_capability_set_word(struct pci_dev *dev, int pos, u16 set)
+{
+	return pcie_capability_clear_and_set_word(dev, pos, 0, set);
+}
+EXPORT_SYMBOL(pcie_capability_set_word);
+
+int pcie_capability_clear_word(struct pci_dev *dev, int pos, u16 clear)
+{
+	return pcie_capability_clear_and_set_word(dev, pos, clear, 0);
+}
+EXPORT_SYMBOL(pcie_capability_clear_word);
 
 int pcie_capability_clear_and_set_word(struct pci_dev *dev, int pos,
 				       u16 clear, u16 set)

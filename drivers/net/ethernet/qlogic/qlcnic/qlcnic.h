@@ -38,7 +38,7 @@
 #define _QLCNIC_LINUX_MAJOR 5
 #define _QLCNIC_LINUX_MINOR 3
 #define _QLCNIC_LINUX_SUBVERSION 48
-#define QLCNIC_LINUX_VERSIONID  "5.3.48"
+#define QLCNIC_LINUX_VERSIONID  "5.3.48.2"
 #define QLCNIC_DRV_IDC_VER  0x01
 #define QLCNIC_DRIVER_VERSION  ((_QLCNIC_LINUX_MAJOR << 16) |\
 		 (_QLCNIC_LINUX_MINOR << 8) | (_QLCNIC_LINUX_SUBVERSION))
@@ -558,6 +558,8 @@ struct qlcnic_host_tx_ring {
 	dma_addr_t phys_addr;
 	dma_addr_t hw_cons_phys_addr;
 	struct netdev_queue *txq;
+	/* Lock to protect Tx descriptors cleanup */
+	spinlock_t tx_clean_lock;
 } ____cacheline_internodealigned_in_smp;
 
 /*
@@ -1067,7 +1069,6 @@ struct qlcnic_adapter {
 	struct qlcnic_filter_hash rx_fhash;
 	struct list_head vf_mc_list;
 
-	spinlock_t tx_clean_lock;
 	spinlock_t mac_learn_lock;
 	/* spinlock for catching rcv filters for eswitch traffic */
 	spinlock_t rx_mac_learn_lock;

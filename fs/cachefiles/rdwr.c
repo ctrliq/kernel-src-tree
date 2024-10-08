@@ -639,7 +639,6 @@ static int cachefiles_read_backing_file(struct cachefiles_object *object,
 	_debug("out");
 
 out:
-	/* tidy up */
 	if (newpage)
 		page_cache_release(newpage);
 	if (netpage)
