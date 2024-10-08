@@ -1,0 +1,119 @@
+hpsa: add ioaccel sg chaining for the ioaccel2 path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Webb Scales <webbnh@hp.com>
+commit d9a729f3e4d23d4fe8ca458d88d7b982ad3a1600
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d9a729f3.failed
+
+Increase the request size for ioaccel2 path.
+
+The error, if any, returned by hpsa_allocate_ioaccel2_sg_chain_blocks
+to hpsa_alloc_ioaccel2_cmd_and_bft should be returned upstream rather
+than assumed to be -ENOMEM.
+
+This differs slightly from hpsa_alloc_ioaccel1_cmd_and_bft,
+which does not call another hpsa_allocate function and only
+has -ENOMEM to return from some kmalloc calls.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit d9a729f3e4d23d4fe8ca458d88d7b982ad3a1600)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 27627e268bd3,facb438061d5..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -1694,16 -2023,18 +1767,18 @@@ static void complete_scsi_command(struc
+  	struct ctlr_info *h;
+  	struct ErrorInfo *ei;
+  	struct hpsa_scsi_dev_t *dev;
++ 	struct io_accel2_cmd *c2;
+  
+ -	u8 sense_key;
+ -	u8 asc;      /* additional sense code */
+ -	u8 ascq;     /* additional sense code qualifier */
+ +	unsigned char sense_key;
+ +	unsigned char asc;      /* additional sense code */
+ +	unsigned char ascq;     /* additional sense code qualifier */
+  	unsigned long sense_data_size;
+  
+  	ei = cp->err_info;
+ -	cmd = cp->scsi_cmd;
+ +	cmd = (struct scsi_cmnd *) cp->scsi_cmd;
+  	h = cp->h;
+  	dev = cmd->device->hostdata;
++ 	c2 = &h->ioaccel2_cmd_pool[cp->cmdindex];
+  
+  	scsi_dma_unmap(cmd); /* undo the DMA mappings */
+  	if ((cp->cmd_type == CMD_SCSI) &&
+@@@ -3405,11 -3888,13 +3484,15 @@@ static int hpsa_scsi_ioaccel2_queue_com
+  	u32 len;
+  	u32 total_len = 0;
+  
+++<<<<<<< HEAD
+ +	if (scsi_sg_count(cmd) > h->ioaccel_maxsg)
+ +		return IO_ACCEL_INELIGIBLE;
+++=======
++ 	BUG_ON(scsi_sg_count(cmd) > h->maxsgentries);
+++>>>>>>> d9a729f3e4d2 (hpsa: add ioaccel sg chaining for the ioaccel2 path)
+  
+ -	if (fixup_ioaccel_cdb(cdb, &cdb_len)) {
+ -		atomic_dec(&phys_disk->ioaccel_cmds_out);
+ +	if (fixup_ioaccel_cdb(cdb, &cdb_len))
+  		return IO_ACCEL_INELIGIBLE;
+ -	}
+ -
+  	c->cmd_type = CMD_IOACCEL2;
+  	/* Adjust the DMA address to point to the accelerated command buffer */
+  	c->busaddr = (u32) h->ioaccel2_cmd_pool_dhandle +
+@@@ -3420,12 -3905,25 +3503,23 @@@
+  	cp->IU_type = IOACCEL2_IU_TYPE;
+  
+  	use_sg = scsi_dma_map(cmd);
+ -	if (use_sg < 0) {
+ -		atomic_dec(&phys_disk->ioaccel_cmds_out);
+ +	if (use_sg < 0)
+  		return use_sg;
+ -	}
+  
+  	if (use_sg) {
+- 		BUG_ON(use_sg > IOACCEL2_MAXSGENTRIES);
+  		curr_sg = cp->sg;
++ 		if (use_sg > h->ioaccel_maxsg) {
++ 			addr64 = le64_to_cpu(
++ 				h->ioaccel2_cmd_sg_list[c->cmdindex]->address);
++ 			curr_sg->address = cpu_to_le64(addr64);
++ 			curr_sg->length = 0;
++ 			curr_sg->reserved[0] = 0;
++ 			curr_sg->reserved[1] = 0;
++ 			curr_sg->reserved[2] = 0;
++ 			curr_sg->chain_indicator = 0x80;
++ 
++ 			curr_sg = h->ioaccel2_cmd_sg_list[c->cmdindex];
++ 		}
+  		scsi_for_each_sg(cmd, sg, use_sg, i) {
+  			addr64 = (u64) sg_dma_address(sg);
+  			len  = sg_dma_len(sg);
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/hpsa.h b/drivers/scsi/hpsa.h
+index bb1c5c5da1f2..f9a767772d5c 100644
+--- a/drivers/scsi/hpsa.h
++++ b/drivers/scsi/hpsa.h
+@@ -139,6 +139,7 @@ struct ctlr_info {
+ 	u8 max_cmd_sg_entries;
+ 	int chainsize;
+ 	struct SGDescriptor **cmd_sg_list;
++	struct ioaccel2_sg_element **ioaccel2_cmd_sg_list;
+ 
+ 	/* pointers to command and error info pool */
+ 	struct CommandList 	*cmd_pool;
