@@ -7340,6 +7340,14 @@ static const struct nfs4_state_maintenance_ops nfs41_state_renewal_ops = {
 };
 #endif
 
+static const struct nfs4_mig_recovery_ops nfs40_mig_recovery_ops = {
+};
+
+#if defined(CONFIG_NFS_V4_1)
+static const struct nfs4_mig_recovery_ops nfs41_mig_recovery_ops = {
+};
+#endif	/* CONFIG_NFS_V4_1 */
+
 static const struct nfs4_minor_version_ops nfs_v4_0_minor_ops = {
 	.minor_version = 0,
 	.init_caps = NFS_CAP_READDIRPLUS
@@ -7354,6 +7362,7 @@ static const struct nfs4_minor_version_ops nfs_v4_0_minor_ops = {
 	.reboot_recovery_ops = &nfs40_reboot_recovery_ops,
 	.nograce_recovery_ops = &nfs40_nograce_recovery_ops,
 	.state_renewal_ops = &nfs40_state_renewal_ops,
+	.mig_recovery_ops = &nfs40_mig_recovery_ops,
 };
 
 #if defined(CONFIG_NFS_V4_1)
@@ -7373,6 +7382,7 @@ static const struct nfs4_minor_version_ops nfs_v4_1_minor_ops = {
 	.reboot_recovery_ops = &nfs41_reboot_recovery_ops,
 	.nograce_recovery_ops = &nfs41_nograce_recovery_ops,
 	.state_renewal_ops = &nfs41_state_renewal_ops,
+	.mig_recovery_ops = &nfs41_mig_recovery_ops,
 };
 #endif
 
