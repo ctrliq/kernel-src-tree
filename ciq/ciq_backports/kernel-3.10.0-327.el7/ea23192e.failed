@@ -1,0 +1,191 @@
+tunnels: harmonize cleanup done on skb on rx path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit ea23192e8e577dfc51e0f4fc5ca113af334edff9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ea23192e.failed
+
+The goal of this patch is to harmonize cleanup done on a skbuff on rx path.
+Before this patch, behaviors were different depending of the tunnel type.
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ea23192e8e577dfc51e0f4fc5ca113af334edff9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+#	net/ipv6/sit.c
+diff --cc net/ipv4/ip_tunnel.c
+index 97e997263ac1,ac9fabe0300f..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -466,6 -460,9 +466,12 @@@ int ip_tunnel_rcv(struct ip_tunnel *tun
+  	} else {
+  		skb->dev = tunnel->dev;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(tunnel->dev)));
++ 
+++>>>>>>> ea23192e8e57 (tunnels: harmonize cleanup done on skb on rx path)
+  	gro_cells_receive(&tunnel->gro_cells, skb);
+  	return 0;
+  
+diff --cc net/ipv6/sit.c
+index 04b859234833,19abcc9d6a1a..000000000000
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@@ -621,8 -619,6 +619,11 @@@ static int ipip6_rcv(struct sk_buff *sk
+  		tstats->rx_packets++;
+  		tstats->rx_bytes += skb->len;
+  
+++<<<<<<< HEAD
+ +		if (tunnel->net != dev_net(tunnel->dev))
+ +			skb_scrub_packet(skb, true);
+++=======
+++>>>>>>> ea23192e8e57 (tunnels: harmonize cleanup done on skb on rx path)
+  		netif_rx(skb);
+  
+  		return 0;
+diff --git a/include/net/dst.h b/include/net/dst.h
+index 840e73e7d251..7bbc137160cb 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -326,11 +326,13 @@ static inline void skb_dst_force(struct sk_buff *skb)
+  *	__skb_tunnel_rx - prepare skb for rx reinsert
+  *	@skb: buffer
+  *	@dev: tunnel device
++ *	@net: netns for packet i/o
+  *
+  *	After decapsulation, packet is going to re-enter (netif_rx()) our stack,
+  *	so make some cleanups. (no accounting done)
+  */
+-static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
++static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev,
++				   struct net *net)
+ {
+ 	skb->dev = dev;
+ 
+@@ -341,8 +343,7 @@ static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
+ 	 */
+ 	skb_clear_hash_if_not_l4(skb);
+ 	skb_set_queue_mapping(skb, 0);
+-	skb_dst_drop(skb);
+-	nf_reset(skb);
++	skb_scrub_packet(skb, !net_eq(net, dev_net(dev)));
+ }
+ 
+ /**
+@@ -354,12 +355,13 @@ static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
+  *	so make some cleanups, and perform accounting.
+  *	Note: this accounting is not SMP safe.
+  */
+-static inline void skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
++static inline void skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev,
++				 struct net *net)
+ {
+ 	/* TODO : stats should be SMP safe */
+ 	dev->stats.rx_packets++;
+ 	dev->stats.rx_bytes += skb->len;
+-	__skb_tunnel_rx(skb, dev);
++	__skb_tunnel_rx(skb, dev, net);
+ }
+ 
+ /* Children define the path of the packet through the
+* Unmerged path net/ipv4/ip_tunnel.c
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index ab87d80f58e0..79a14c497d36 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -2070,9 +2070,8 @@ static int __pim_rcv(struct mr_table *mrt, struct sk_buff *skb,
+ 	skb_reset_network_header(skb);
+ 	skb->protocol = htons(ETH_P_IP);
+ 	skb->ip_summed = CHECKSUM_NONE;
+-	skb->pkt_type = PACKET_HOST;
+ 
+-	skb_tunnel_rx(skb, reg_dev);
++	skb_tunnel_rx(skb, reg_dev, dev_net(reg_dev));
+ 
+ 	netif_rx(skb);
+ 
+diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
+index dcb80bd7826a..b8cbd9b88b33 100644
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -502,8 +502,6 @@ static int ip6gre_rcv(struct sk_buff *skb)
+ 			goto drop;
+ 		}
+ 
+-		secpath_reset(skb);
+-
+ 		skb->protocol = gre_proto;
+ 		/* WCCP version 1 and 2 protocol decoding.
+ 		 * - Change protocol to IPv6
+@@ -518,7 +516,6 @@ static int ip6gre_rcv(struct sk_buff *skb)
+ 		skb->mac_header = skb->network_header;
+ 		__pskb_pull(skb, offset);
+ 		skb_postpull_rcsum(skb, skb_transport_header(skb), offset);
+-		skb->pkt_type = PACKET_HOST;
+ 
+ 		if (((flags&GRE_CSUM) && csum) ||
+ 		    (!(flags&GRE_CSUM) && tunnel->parms.i_flags&GRE_CSUM)) {
+@@ -550,7 +547,7 @@ static int ip6gre_rcv(struct sk_buff *skb)
+ 			skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+ 		}
+ 
+-		__skb_tunnel_rx(skb, tunnel->dev);
++		__skb_tunnel_rx(skb, tunnel->dev, tunnel->net);
+ 
+ 		skb_reset_network_header(skb);
+ 
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index 21168e121a52..4e232cacbb32 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -806,14 +806,12 @@ static int ip6_tnl_rcv(struct sk_buff *skb, __u16 protocol,
+ 			rcu_read_unlock();
+ 			goto discard;
+ 		}
+-		secpath_reset(skb);
+ 		skb->mac_header = skb->network_header;
+ 		skb_reset_network_header(skb);
+ 		skb->protocol = htons(protocol);
+-		skb->pkt_type = PACKET_HOST;
+ 		memset(skb->cb, 0, sizeof(struct inet6_skb_parm));
+ 
+-		__skb_tunnel_rx(skb, t->dev);
++		__skb_tunnel_rx(skb, t->dev, t->net);
+ 
+ 		err = dscp_ecn_decapsulate(t, ipv6h, skb);
+ 		if (unlikely(err)) {
+@@ -833,9 +831,6 @@ static int ip6_tnl_rcv(struct sk_buff *skb, __u16 protocol,
+ 		tstats->rx_packets++;
+ 		tstats->rx_bytes += skb->len;
+ 
+-		if (!net_eq(t->net, dev_net(t->dev)))
+-			skb_scrub_packet(skb, true);
+-
+ 		netif_rx(skb);
+ 
+ 		rcu_read_unlock();
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+index 4b421249532f..0308b8a3401c 100644
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -672,9 +672,8 @@ static int pim6_rcv(struct sk_buff *skb)
+ 	skb_reset_network_header(skb);
+ 	skb->protocol = htons(ETH_P_IPV6);
+ 	skb->ip_summed = CHECKSUM_NONE;
+-	skb->pkt_type = PACKET_HOST;
+ 
+-	skb_tunnel_rx(skb, reg_dev);
++	skb_tunnel_rx(skb, reg_dev, dev_net(reg_dev));
+ 
+ 	netif_rx(skb);
+ 
+* Unmerged path net/ipv6/sit.c
