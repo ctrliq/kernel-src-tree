@@ -1,0 +1,466 @@
+i40e/i40evf: Limit TSO to 7 descriptors for payload instead of 8 per packet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 3f3f7cb875c0f621485644d4fd7453b0d37f00e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3f3f7cb8.failed
+
+This patch addresses a bug introduced based on my interpretation of the
+XL710 datasheet.  Specifically section 8.4.1 states that "A single transmit
+packet may span up to 8 buffers (up to 8 data descriptors per packet
+including both the header and payload buffers)."  It then later goes on to
+say that each segment for a TSO obeys the previous rule, however it then
+refers to TSO header and the segment payload buffers.
+
+I believe the actual limit for fragments with TSO and a skbuff that has
+payload data in the header portion of the buffer is actually only 7
+fragments as the skb->data portion counts as 2 buffers, one for the TSO
+header, and one for a segment payload buffer.
+
+Fixes: 2d37490b82af ("i40e/i40evf: Rewrite logic for 8 descriptor per packet check")
+	Reported-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Acked-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+	Tested-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 3f3f7cb875c0f621485644d4fd7453b0d37f00e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.h
+#	drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 025ceb57680d,6a49b7ae511c..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -2585,77 -2594,70 +2585,136 @@@ static inline int __i40e_maybe_stop_tx(
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * i40e_maybe_stop_tx - 1st level check for tx stop conditions
+ + * @tx_ring: the ring to be checked
+ + * @size:    the size buffer we want to assure is available
+ + *
+ + * Returns 0 if stop is not needed
+ + **/
+ +#ifdef I40E_FCOE
+ +inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
+ +#else
+ +static inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
+ +#endif
+ +{
+ +	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
+ +		return 0;
+ +	return __i40e_maybe_stop_tx(tx_ring, size);
+ +}
+ +
+ +/**
+ + * i40e_chk_linearize - Check if there are more than 8 fragments per packet
+++=======
++  * __i40e_chk_linearize - Check if there are more than 8 buffers per packet
+++>>>>>>> 3f3f7cb875c0 (i40e/i40evf: Limit TSO to 7 descriptors for payload instead of 8 per packet)
+   * @skb:      send buffer
+ + * @tx_flags: collected send information
+   *
+-  * Note: Our HW can't scatter-gather more than 8 fragments to build
+-  * a packet on the wire and so we need to figure out the cases where we
+-  * need to linearize the skb.
++  * Note: Our HW can't DMA more than 8 buffers to build a packet on the wire
++  * and so we need to figure out the cases where we need to linearize the skb.
++  *
++  * For TSO we need to count the TSO header and segment payload separately.
++  * As such we need to check cases where we have 7 fragments or more as we
++  * can potentially require 9 DMA transactions, 1 for the TSO header, 1 for
++  * the segment payload in the first descriptor, and another 7 for the
++  * fragments.
+   **/
+ -bool __i40e_chk_linearize(struct sk_buff *skb)
+ +static bool i40e_chk_linearize(struct sk_buff *skb, u32 tx_flags)
+  {
+++<<<<<<< HEAD
+ +	struct skb_frag_struct *frag;
+ +	bool linearize = false;
+ +	unsigned int size = 0;
+ +	u16 num_frags;
+ +	u16 gso_segs;
+ +
+ +	num_frags = skb_shinfo(skb)->nr_frags;
+ +	gso_segs = skb_shinfo(skb)->gso_segs;
+ +
+ +	if (tx_flags & (I40E_TX_FLAGS_TSO | I40E_TX_FLAGS_FSO)) {
+ +		u16 j = 0;
+ +
+ +		if (num_frags < (I40E_MAX_BUFFER_TXD))
+ +			goto linearize_chk_done;
+ +		/* try the simple math, if we have too many frags per segment */
+ +		if (DIV_ROUND_UP((num_frags + gso_segs), gso_segs) >
+ +		    I40E_MAX_BUFFER_TXD) {
+ +			linearize = true;
+ +			goto linearize_chk_done;
+ +		}
+ +		frag = &skb_shinfo(skb)->frags[0];
+ +		/* we might still have more fragments per segment */
+ +		do {
+ +			size += skb_frag_size(frag);
+ +			frag++; j++;
+ +			if ((size >= skb_shinfo(skb)->gso_size) &&
+ +			    (j < I40E_MAX_BUFFER_TXD)) {
+ +				size = (size % skb_shinfo(skb)->gso_size);
+ +				j = (size) ? 1 : 0;
+ +			}
+ +			if (j == I40E_MAX_BUFFER_TXD) {
+ +				linearize = true;
+ +				break;
+ +			}
+ +			num_frags--;
+ +		} while (num_frags);
+ +	} else {
+ +		if (num_frags >= I40E_MAX_BUFFER_TXD)
+ +			linearize = true;
+++=======
++ 	const struct skb_frag_struct *frag, *stale;
++ 	int nr_frags, sum;
++ 
++ 	/* no need to check if number of frags is less than 7 */
++ 	nr_frags = skb_shinfo(skb)->nr_frags;
++ 	if (nr_frags < (I40E_MAX_BUFFER_TXD - 1))
++ 		return false;
++ 
++ 	/* We need to walk through the list and validate that each group
++ 	 * of 6 fragments totals at least gso_size.  However we don't need
++ 	 * to perform such validation on the last 6 since the last 6 cannot
++ 	 * inherit any data from a descriptor after them.
++ 	 */
++ 	nr_frags -= I40E_MAX_BUFFER_TXD - 2;
++ 	frag = &skb_shinfo(skb)->frags[0];
++ 
++ 	/* Initialize size to the negative value of gso_size minus 1.  We
++ 	 * use this as the worst case scenerio in which the frag ahead
++ 	 * of us only provides one byte which is why we are limited to 6
++ 	 * descriptors for a single transmit as the header and previous
++ 	 * fragment are already consuming 2 descriptors.
++ 	 */
++ 	sum = 1 - skb_shinfo(skb)->gso_size;
++ 
++ 	/* Add size of frags 0 through 4 to create our initial sum */
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 
++ 	/* Walk through fragments adding latest fragment, testing it, and
++ 	 * then removing stale fragments from the sum.
++ 	 */
++ 	stale = &skb_shinfo(skb)->frags[0];
++ 	for (;;) {
++ 		sum += skb_frag_size(frag++);
++ 
++ 		/* if sum is negative we failed to make sufficient progress */
++ 		if (sum < 0)
++ 			return true;
++ 
++ 		/* use pre-decrement to avoid processing last fragment */
++ 		if (!--nr_frags)
++ 			break;
++ 
++ 		sum -= skb_frag_size(stale++);
+++>>>>>>> 3f3f7cb875c0 (i40e/i40evf: Limit TSO to 7 descriptors for payload instead of 8 per packet)
+  	}
+  
+ -	return false;
+ +linearize_chk_done:
+ +	return linearize;
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.h
+index ae22c4e9162f,a9bd70537d65..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+@@@ -353,4 -360,67 +353,70 @@@ static inline u32 i40e_get_head(struct 
+  
+  	return le32_to_cpu(*(volatile __le32 *)head);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * i40e_xmit_descriptor_count - calculate number of Tx descriptors needed
++  * @skb:     send buffer
++  * @tx_ring: ring to send buffer on
++  *
++  * Returns number of data descriptors needed for this skb. Returns 0 to indicate
++  * there is not enough descriptors available in this ring since we need at least
++  * one descriptor.
++  **/
++ static inline int i40e_xmit_descriptor_count(struct sk_buff *skb)
++ {
++ 	const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
++ 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
++ 	int count = 0, size = skb_headlen(skb);
++ 
++ 	for (;;) {
++ 		count += TXD_USE_COUNT(size);
++ 
++ 		if (!nr_frags--)
++ 			break;
++ 
++ 		size = skb_frag_size(frag++);
++ 	}
++ 
++ 	return count;
++ }
++ 
++ /**
++  * i40e_maybe_stop_tx - 1st level check for Tx stop conditions
++  * @tx_ring: the ring to be checked
++  * @size:    the size buffer we want to assure is available
++  *
++  * Returns 0 if stop is not needed
++  **/
++ static inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
++ {
++ 	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
++ 		return 0;
++ 	return __i40e_maybe_stop_tx(tx_ring, size);
++ }
++ 
++ /**
++  * i40e_chk_linearize - Check if there are more than 8 fragments per packet
++  * @skb:      send buffer
++  * @count:    number of buffers used
++  *
++  * Note: Our HW can't scatter-gather more than 8 fragments to build
++  * a packet on the wire and so we need to figure out the cases where we
++  * need to linearize the skb.
++  **/
++ static inline bool i40e_chk_linearize(struct sk_buff *skb, int count)
++ {
++ 	/* Both TSO and single send will work if count is less than 8 */
++ 	if (likely(count < I40E_MAX_BUFFER_TXD))
++ 		return false;
++ 
++ 	if (skb_is_gso(skb))
++ 		return __i40e_chk_linearize(skb);
++ 
++ 	/* we can support up to 8 data buffers for a single send */
++ 	return count != I40E_MAX_BUFFER_TXD;
++ }
+++>>>>>>> 3f3f7cb875c0 (i40e/i40evf: Limit TSO to 7 descriptors for payload instead of 8 per packet)
+  #endif /* _I40E_TXRX_H_ */
+diff --cc drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+index 0c3ce26cb67a,cea97daa844c..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+@@@ -1768,60 -1795,71 +1768,120 @@@ static void i40e_create_tx_ctx(struct i
+  	context_desc->type_cmd_tso_mss = cpu_to_le64(cd_type_cmd_tso_mss);
+  }
+  
+++<<<<<<< HEAD
+ + /**
+ + * i40e_chk_linearize - Check if there are more than 8 fragments per packet
+++=======
++ /**
++  * __i40evf_chk_linearize - Check if there are more than 8 buffers per packet
+++>>>>>>> 3f3f7cb875c0 (i40e/i40evf: Limit TSO to 7 descriptors for payload instead of 8 per packet)
+   * @skb:      send buffer
+ + * @tx_flags: collected send information
+   *
+-  * Note: Our HW can't scatter-gather more than 8 fragments to build
+-  * a packet on the wire and so we need to figure out the cases where we
+-  * need to linearize the skb.
++  * Note: Our HW can't DMA more than 8 buffers to build a packet on the wire
++  * and so we need to figure out the cases where we need to linearize the skb.
++  *
++  * For TSO we need to count the TSO header and segment payload separately.
++  * As such we need to check cases where we have 7 fragments or more as we
++  * can potentially require 9 DMA transactions, 1 for the TSO header, 1 for
++  * the segment payload in the first descriptor, and another 7 for the
++  * fragments.
+   **/
+ -bool __i40evf_chk_linearize(struct sk_buff *skb)
+ +static bool i40e_chk_linearize(struct sk_buff *skb, u32 tx_flags)
+  {
+++<<<<<<< HEAD
+ +	struct skb_frag_struct *frag;
+ +	bool linearize = false;
+ +	unsigned int size = 0;
+ +	u16 num_frags;
+ +	u16 gso_segs;
+ +
+ +	num_frags = skb_shinfo(skb)->nr_frags;
+ +	gso_segs = skb_shinfo(skb)->gso_segs;
+ +
+ +	if (tx_flags & (I40E_TX_FLAGS_TSO | I40E_TX_FLAGS_FSO)) {
+ +		u16 j = 0;
+ +
+ +		if (num_frags < (I40E_MAX_BUFFER_TXD))
+ +			goto linearize_chk_done;
+ +		/* try the simple math, if we have too many frags per segment */
+ +		if (DIV_ROUND_UP((num_frags + gso_segs), gso_segs) >
+ +		    I40E_MAX_BUFFER_TXD) {
+ +			linearize = true;
+ +			goto linearize_chk_done;
+ +		}
+ +		frag = &skb_shinfo(skb)->frags[0];
+ +		/* we might still have more fragments per segment */
+ +		do {
+ +			size += skb_frag_size(frag);
+ +			frag++; j++;
+ +			if ((size >= skb_shinfo(skb)->gso_size) &&
+ +			    (j < I40E_MAX_BUFFER_TXD)) {
+ +				size = (size % skb_shinfo(skb)->gso_size);
+ +				j = (size) ? 1 : 0;
+ +			}
+ +			if (j == I40E_MAX_BUFFER_TXD) {
+ +				linearize = true;
+ +				break;
+ +			}
+ +			num_frags--;
+ +		} while (num_frags);
+ +	} else {
+ +		if (num_frags >= I40E_MAX_BUFFER_TXD)
+ +			linearize = true;
+++=======
++ 	const struct skb_frag_struct *frag, *stale;
++ 	int nr_frags, sum;
++ 
++ 	/* no need to check if number of frags is less than 7 */
++ 	nr_frags = skb_shinfo(skb)->nr_frags;
++ 	if (nr_frags < (I40E_MAX_BUFFER_TXD - 1))
++ 		return false;
++ 
++ 	/* We need to walk through the list and validate that each group
++ 	 * of 6 fragments totals at least gso_size.  However we don't need
++ 	 * to perform such validation on the last 6 since the last 6 cannot
++ 	 * inherit any data from a descriptor after them.
++ 	 */
++ 	nr_frags -= I40E_MAX_BUFFER_TXD - 2;
++ 	frag = &skb_shinfo(skb)->frags[0];
++ 
++ 	/* Initialize size to the negative value of gso_size minus 1.  We
++ 	 * use this as the worst case scenerio in which the frag ahead
++ 	 * of us only provides one byte which is why we are limited to 6
++ 	 * descriptors for a single transmit as the header and previous
++ 	 * fragment are already consuming 2 descriptors.
++ 	 */
++ 	sum = 1 - skb_shinfo(skb)->gso_size;
++ 
++ 	/* Add size of frags 0 through 4 to create our initial sum */
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 	sum += skb_frag_size(frag++);
++ 
++ 	/* Walk through fragments adding latest fragment, testing it, and
++ 	 * then removing stale fragments from the sum.
++ 	 */
++ 	stale = &skb_shinfo(skb)->frags[0];
++ 	for (;;) {
++ 		sum += skb_frag_size(frag++);
++ 
++ 		/* if sum is negative we failed to make sufficient progress */
++ 		if (sum < 0)
++ 			return true;
++ 
++ 		/* use pre-decrement to avoid processing last fragment */
++ 		if (!--nr_frags)
++ 			break;
++ 
++ 		sum -= skb_frag_size(stale++);
+++>>>>>>> 3f3f7cb875c0 (i40e/i40evf: Limit TSO to 7 descriptors for payload instead of 8 per packet)
+  	}
+  
+ -	return false;
+ +linearize_chk_done:
+ +	return linearize;
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+index 5467fcdf7670,0429553fe887..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+@@@ -341,4 -342,67 +341,70 @@@ static inline u32 i40e_get_head(struct 
+  
+  	return le32_to_cpu(*(volatile __le32 *)head);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * i40e_xmit_descriptor_count - calculate number of Tx descriptors needed
++  * @skb:     send buffer
++  * @tx_ring: ring to send buffer on
++  *
++  * Returns number of data descriptors needed for this skb. Returns 0 to indicate
++  * there is not enough descriptors available in this ring since we need at least
++  * one descriptor.
++  **/
++ static inline int i40e_xmit_descriptor_count(struct sk_buff *skb)
++ {
++ 	const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
++ 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
++ 	int count = 0, size = skb_headlen(skb);
++ 
++ 	for (;;) {
++ 		count += TXD_USE_COUNT(size);
++ 
++ 		if (!nr_frags--)
++ 			break;
++ 
++ 		size = skb_frag_size(frag++);
++ 	}
++ 
++ 	return count;
++ }
++ 
++ /**
++  * i40e_maybe_stop_tx - 1st level check for Tx stop conditions
++  * @tx_ring: the ring to be checked
++  * @size:    the size buffer we want to assure is available
++  *
++  * Returns 0 if stop is not needed
++  **/
++ static inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
++ {
++ 	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
++ 		return 0;
++ 	return __i40evf_maybe_stop_tx(tx_ring, size);
++ }
++ 
++ /**
++  * i40e_chk_linearize - Check if there are more than 8 fragments per packet
++  * @skb:      send buffer
++  * @count:    number of buffers used
++  *
++  * Note: Our HW can't scatter-gather more than 8 fragments to build
++  * a packet on the wire and so we need to figure out the cases where we
++  * need to linearize the skb.
++  **/
++ static inline bool i40e_chk_linearize(struct sk_buff *skb, int count)
++ {
++ 	/* Both TSO and single send will work if count is less than 8 */
++ 	if (likely(count < I40E_MAX_BUFFER_TXD))
++ 		return false;
++ 
++ 	if (skb_is_gso(skb))
++ 		return __i40evf_chk_linearize(skb);
++ 
++ 	/* we can support up to 8 data buffers for a single send */
++ 	return count != I40E_MAX_BUFFER_TXD;
++ }
+++>>>>>>> 3f3f7cb875c0 (i40e/i40evf: Limit TSO to 7 descriptors for payload instead of 8 per packet)
+  #endif /* _I40E_TXRX_H_ */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.h
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40e_txrx.h
