@@ -122,7 +122,7 @@ static int macvlan_broadcast_one(struct sk_buff *skb,
 		return NET_RX_DROP;
 
 	if (local)
-		return vlan->forward(dev, skb);
+		return dev_forward_skb(dev, skb);
 
 	skb->dev = dev;
 	if (ether_addr_equal_64bits(eth->h_dest, dev->broadcast))
@@ -130,7 +130,7 @@ static int macvlan_broadcast_one(struct sk_buff *skb,
 	else
 		skb->pkt_type = PACKET_MULTICAST;
 
-	return vlan->receive(skb);
+	return netif_rx(skb);
 }
 
 static u32 macvlan_hash_mix(const struct macvlan_dev *vlan)
@@ -249,7 +249,7 @@ static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
 	skb->dev = dev;
 	skb->pkt_type = PACKET_HOST;
 
-	ret = vlan->receive(skb);
+	ret = netif_rx(skb);
 
 out:
 	macvlan_count_rx(vlan, len, ret == NET_RX_SUCCESS, 0);
@@ -772,10 +772,7 @@ static int macvlan_validate(struct nlattr *tb[], struct nlattr *data[])
 }
 
 int macvlan_common_newlink(struct net *src_net, struct net_device *dev,
-			   struct nlattr *tb[], struct nlattr *data[],
-			   int (*receive)(struct sk_buff *skb),
-			   int (*forward)(struct net_device *dev,
-					  struct sk_buff *skb))
+			   struct nlattr *tb[], struct nlattr *data[])
 {
 	struct macvlan_dev *vlan = netdev_priv(dev);
 	struct macvlan_port *port;
@@ -819,8 +816,6 @@ int macvlan_common_newlink(struct net *src_net, struct net_device *dev,
 	vlan->lowerdev = lowerdev;
 	vlan->dev      = dev;
 	vlan->port     = port;
-	vlan->receive  = receive;
-	vlan->forward  = forward;
 	vlan->set_features = MACVLAN_FEATURES;
 
 	vlan->mode     = MACVLAN_MODE_VEPA;
@@ -865,9 +860,7 @@ EXPORT_SYMBOL_GPL(macvlan_common_newlink);
 static int macvlan_newlink(struct net *src_net, struct net_device *dev,
 			   struct nlattr *tb[], struct nlattr *data[])
 {
-	return macvlan_common_newlink(src_net, dev, tb, data,
-				      netif_rx,
-				      dev_forward_skb);
+	return macvlan_common_newlink(src_net, dev, tb, data);
 }
 
 void macvlan_dellink(struct net_device *dev, struct list_head *head)
