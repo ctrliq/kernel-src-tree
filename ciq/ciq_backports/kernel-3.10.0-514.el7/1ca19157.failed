@@ -1,0 +1,322 @@
+xfs: Don't use unwritten extents for DAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 1ca191576fc862b4766f58e41aa362b28a7c1866
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1ca19157.failed
+
+DAX has a page fault serialisation problem with block allocation.
+Because it allows concurrent page faults and does not have a page
+lock to serialise faults to the same page, it can get two concurrent
+faults to the page that race.
+
+When two read faults race, this isn't a huge problem as the data
+underlying the page is not changing and so "detect and drop" works
+just fine. The issues are to do with write faults.
+
+When two write faults occur, we serialise block allocation in
+get_blocks() so only one faul will allocate the extent. It will,
+however, be marked as an unwritten extent, and that is where the
+problem lies - the DAX fault code cannot differentiate between a
+block that was just allocated and a block that was preallocated and
+needs zeroing. The result is that both write faults end up zeroing
+the block and attempting to convert it back to written.
+
+The problem is that the first fault can zero and convert before the
+second fault starts zeroing, resulting in the zeroing for the second
+fault overwriting the data that the first fault wrote with zeros.
+The second fault then attempts to convert the unwritten extent,
+which is then a no-op because it's already written. Data loss occurs
+as a result of this race.
+
+Because there is no sane locking construct in the page fault code
+that we can use for serialisation across the page faults, we need to
+ensure block allocation and zeroing occurs atomically in the
+filesystem. This means we can still take concurrent page faults and
+the only time they will serialise is in the filesystem
+mapping/allocation callback. The page fault code will always see
+written, initialised extents, so we will be able to remove the
+unwritten extent handling from the DAX code when all filesystems are
+converted.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 1ca191576fc862b4766f58e41aa362b28a7c1866)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/xfs/xfs_aops.c
+index 3ffbdb7cbd8f,df3dabd469b9..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1260,6 -1228,140 +1260,143 @@@ xfs_vm_releasepage
+  	return try_to_free_buffers(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * When we map a DIO buffer, we may need to attach an ioend that describes the
++  * type of write IO we are doing. This passes to the completion function the
++  * operations it needs to perform. If the mapping is for an overwrite wholly
++  * within the EOF then we don't need an ioend and so we don't allocate one.
++  * This avoids the unnecessary overhead of allocating and freeing ioends for
++  * workloads that don't require transactions on IO completion.
++  *
++  * If we get multiple mappings in a single IO, we might be mapping different
++  * types. But because the direct IO can only have a single private pointer, we
++  * need to ensure that:
++  *
++  * a) i) the ioend spans the entire region of unwritten mappings; or
++  *    ii) the ioend spans all the mappings that cross or are beyond EOF; and
++  * b) if it contains unwritten extents, it is *permanently* marked as such
++  *
++  * We could do this by chaining ioends like buffered IO does, but we only
++  * actually get one IO completion callback from the direct IO, and that spans
++  * the entire IO regardless of how many mappings and IOs are needed to complete
++  * the DIO. There is only going to be one reference to the ioend and its life
++  * cycle is constrained by the DIO completion code. hence we don't need
++  * reference counting here.
++  *
++  * Note that for DIO, an IO to the highest supported file block offset (i.e.
++  * 2^63 - 1FSB bytes) will result in the offset + count overflowing a signed 64
++  * bit variable. Hence if we see this overflow, we have to assume that the IO is
++  * extending the file size. We won't know for sure until IO completion is run
++  * and the actual max write offset is communicated to the IO completion
++  * routine.
++  *
++  * For DAX page faults, we are preparing to never see unwritten extents here,
++  * nor should we ever extend the inode size. Hence we will soon have nothing to
++  * do here for this case, ensuring we don't have to provide an IO completion
++  * callback to free an ioend that we don't actually need for a fault into the
++  * page at offset (2^63 - 1FSB) bytes.
++  */
++ 
++ static void
++ xfs_map_direct(
++ 	struct inode		*inode,
++ 	struct buffer_head	*bh_result,
++ 	struct xfs_bmbt_irec	*imap,
++ 	xfs_off_t		offset,
++ 	bool			dax_fault)
++ {
++ 	struct xfs_ioend	*ioend;
++ 	xfs_off_t		size = bh_result->b_size;
++ 	int			type;
++ 
++ 	if (ISUNWRITTEN(imap))
++ 		type = XFS_IO_UNWRITTEN;
++ 	else
++ 		type = XFS_IO_OVERWRITE;
++ 
++ 	trace_xfs_gbmap_direct(XFS_I(inode), offset, size, type, imap);
++ 
++ 	if (dax_fault) {
++ 		ASSERT(type == XFS_IO_OVERWRITE);
++ 		trace_xfs_gbmap_direct_none(XFS_I(inode), offset, size, type,
++ 					    imap);
++ 		return;
++ 	}
++ 
++ 	if (bh_result->b_private) {
++ 		ioend = bh_result->b_private;
++ 		ASSERT(ioend->io_size > 0);
++ 		ASSERT(offset >= ioend->io_offset);
++ 		if (offset + size > ioend->io_offset + ioend->io_size)
++ 			ioend->io_size = offset - ioend->io_offset + size;
++ 
++ 		if (type == XFS_IO_UNWRITTEN && type != ioend->io_type)
++ 			ioend->io_type = XFS_IO_UNWRITTEN;
++ 
++ 		trace_xfs_gbmap_direct_update(XFS_I(inode), ioend->io_offset,
++ 					      ioend->io_size, ioend->io_type,
++ 					      imap);
++ 	} else if (type == XFS_IO_UNWRITTEN ||
++ 		   offset + size > i_size_read(inode) ||
++ 		   offset + size < 0) {
++ 		ioend = xfs_alloc_ioend(inode, type);
++ 		ioend->io_offset = offset;
++ 		ioend->io_size = size;
++ 
++ 		bh_result->b_private = ioend;
++ 		set_buffer_defer_completion(bh_result);
++ 
++ 		trace_xfs_gbmap_direct_new(XFS_I(inode), offset, size, type,
++ 					   imap);
++ 	} else {
++ 		trace_xfs_gbmap_direct_none(XFS_I(inode), offset, size, type,
++ 					    imap);
++ 	}
++ }
++ 
++ /*
++  * If this is O_DIRECT or the mpage code calling tell them how large the mapping
++  * is, so that we can avoid repeated get_blocks calls.
++  *
++  * If the mapping spans EOF, then we have to break the mapping up as the mapping
++  * for blocks beyond EOF must be marked new so that sub block regions can be
++  * correctly zeroed. We can't do this for mappings within EOF unless the mapping
++  * was just allocated or is unwritten, otherwise the callers would overwrite
++  * existing data with zeros. Hence we have to split the mapping into a range up
++  * to and including EOF, and a second mapping for beyond EOF.
++  */
++ static void
++ xfs_map_trim_size(
++ 	struct inode		*inode,
++ 	sector_t		iblock,
++ 	struct buffer_head	*bh_result,
++ 	struct xfs_bmbt_irec	*imap,
++ 	xfs_off_t		offset,
++ 	ssize_t			size)
++ {
++ 	xfs_off_t		mapping_size;
++ 
++ 	mapping_size = imap->br_startoff + imap->br_blockcount - iblock;
++ 	mapping_size <<= inode->i_blkbits;
++ 
++ 	ASSERT(mapping_size > 0);
++ 	if (mapping_size > size)
++ 		mapping_size = size;
++ 	if (offset < i_size_read(inode) &&
++ 	    offset + mapping_size >= i_size_read(inode)) {
++ 		/* limit mapping to block that spans EOF */
++ 		mapping_size = roundup_64(i_size_read(inode) - offset,
++ 					  1 << inode->i_blkbits);
++ 	}
++ 	if (mapping_size > LONG_MAX)
++ 		mapping_size = LONG_MAX;
++ 
++ 	bh_result->b_size = mapping_size;
++ }
++ 
+++>>>>>>> 1ca191576fc8 (xfs: Don't use unwritten extents for DAX)
+  STATIC int
+  __xfs_get_blocks(
+  	struct inode		*inode,
+@@@ -1317,15 -1421,16 +1455,16 @@@
+  	if (create &&
+  	    (!nimaps ||
+  	     (imap.br_startblock == HOLESTARTBLOCK ||
+- 	      imap.br_startblock == DELAYSTARTBLOCK))) {
++ 	      imap.br_startblock == DELAYSTARTBLOCK) ||
++ 	     (IS_DAX(inode) && ISUNWRITTEN(&imap)))) {
+  		if (direct || xfs_get_extsz_hint(ip)) {
+  			/*
+ -			 * Drop the ilock in preparation for starting the block
+ -			 * allocation transaction.  It will be retaken
+ -			 * exclusively inside xfs_iomap_write_direct for the
+ -			 * actual allocation.
+ +			 * xfs_iomap_write_direct() expects the shared lock. It
+ +			 * is unlocked on return.
+  			 */
+ -			xfs_iunlock(ip, lockmode);
+ +			if (lockmode == XFS_ILOCK_EXCL)
+ +				xfs_ilock_demote(ip, lockmode);
+ +
+  			error = xfs_iomap_write_direct(ip, offset, size,
+  						       &imap, nimaps);
+  			if (error)
+@@@ -1358,19 -1467,31 +1497,37 @@@
+  		goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (IS_DAX(inode) && create) {
++ 		ASSERT(!ISUNWRITTEN(&imap));
++ 		/* zeroing is not needed at a higher layer */
++ 		new = 0;
++ 	}
++ 
++ 	/* trim mapping down to size requested */
++ 	if (direct || size > (1 << inode->i_blkbits))
++ 		xfs_map_trim_size(inode, iblock, bh_result,
++ 				  &imap, offset, size);
++ 
++ 	/*
++ 	 * For unwritten extents do not report a disk address in the buffered
++ 	 * read case (treat as if we're reading into a hole).
++ 	 */
+++>>>>>>> 1ca191576fc8 (xfs: Don't use unwritten extents for DAX)
+  	if (imap.br_startblock != HOLESTARTBLOCK &&
+ -	    imap.br_startblock != DELAYSTARTBLOCK &&
+ -	    (create || !ISUNWRITTEN(&imap))) {
+ -		xfs_map_buffer(inode, bh_result, &imap, offset);
+ -		if (ISUNWRITTEN(&imap))
+ +	    imap.br_startblock != DELAYSTARTBLOCK) {
+ +		/*
+ +		 * For unwritten extents do not report a disk address on
+ +		 * the read case (treat as if we're reading into a hole).
+ +		 */
+ +		if (create || !ISUNWRITTEN(&imap))
+ +			xfs_map_buffer(inode, bh_result, &imap, offset);
+ +		if (create && ISUNWRITTEN(&imap)) {
+ +			if (direct)
+ +				bh_result->b_private = inode;
+  			set_buffer_unwritten(bh_result);
+ -		/* direct IO needs special help */
+ -		if (create && direct)
+ -			xfs_map_direct(inode, bh_result, &imap, offset,
+ -				       dax_fault);
+ +		}
+  	}
+  
+  	/*
+diff --cc fs/xfs/xfs_iomap.c
+index 8a10c6211bb4,b48c6b525e77..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -131,7 -131,11 +131,15 @@@ xfs_iomap_write_direct
+  	uint		qblocks, resblks, resrtextents;
+  	int		committed;
+  	int		error;
+++<<<<<<< HEAD
+ +	int		lockmode;
+++=======
++ 	int		bmapi_flags = XFS_BMAPI_PREALLOC;
++ 
++ 	error = xfs_qm_dqattach(ip, 0);
++ 	if (error)
++ 		return error;
+++>>>>>>> 1ca191576fc8 (xfs: Don't use unwritten extents for DAX)
+  
+  	rt = XFS_IS_REALTIME_INODE(ip);
+  	extsz = xfs_get_extsz_hint(ip);
+@@@ -221,7 -220,7 +246,11 @@@
+  	xfs_bmap_init(&free_list, &firstfsb);
+  	nimaps = 1;
+  	error = xfs_bmapi_write(tp, ip, offset_fsb, count_fsb,
+++<<<<<<< HEAD
+ +				XFS_BMAPI_PREALLOC, &firstfsb, resblks, imap,
+++=======
++ 				bmapi_flags, &firstfsb, 0, imap,
+++>>>>>>> 1ca191576fc8 (xfs: Don't use unwritten extents for DAX)
+  				&nimaps, &free_list);
+  	if (error)
+  		goto out_bmap_cancel;
+@@@ -232,7 -231,8 +261,12 @@@
+  	error = xfs_bmap_finish(&tp, &free_list, &committed);
+  	if (error)
+  		goto out_bmap_cancel;
+++<<<<<<< HEAD
+ +	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+++=======
++ 
++ 	error = xfs_trans_commit(tp);
+++>>>>>>> 1ca191576fc8 (xfs: Don't use unwritten extents for DAX)
+  	if (error)
+  		goto out_unlock;
+  
+* Unmerged path fs/dax.c
+* Unmerged path fs/dax.c
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_iomap.c
