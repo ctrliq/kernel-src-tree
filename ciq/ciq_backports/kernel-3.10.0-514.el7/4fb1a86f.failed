@@ -1,0 +1,144 @@
+memcg: reparent charges of children before processing parent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Filipe Brandenburger <filbranden@google.com>
+commit 4fb1a86fb5e4209a7d4426d4e586c58e9edc74ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4fb1a86f.failed
+
+Sometimes the cleanup after memcg hierarchy testing gets stuck in
+mem_cgroup_reparent_charges(), unable to bring non-kmem usage down to 0.
+
+There may turn out to be several causes, but a major cause is this: the
+workitem to offline parent can get run before workitem to offline child;
+parent's mem_cgroup_reparent_charges() circles around waiting for the
+child's pages to be reparented to its lrus, but it's holding
+cgroup_mutex which prevents the child from reaching its
+mem_cgroup_reparent_charges().
+
+Further testing showed that an ordered workqueue for cgroup_destroy_wq
+is not always good enough: percpu_ref_kill_and_confirm's call_rcu_sched
+stage on the way can mess up the order before reaching the workqueue.
+
+Instead, when offlining a memcg, call mem_cgroup_reparent_charges() on
+all its children (and grandchildren, in the correct order) to have their
+charges reparented first.
+
+Fixes: e5fca243abae ("cgroup: use a dedicated workqueue for cgroup destruction")
+	Signed-off-by: Filipe Brandenburger <filbranden@google.com>
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Reviewed-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Michal Hocko <mhocko@suse.cz>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: <stable@vger.kernel.org>	[v3.10+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4fb1a86fb5e4209a7d4426d4e586c58e9edc74ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 7aa8a6b42188,5b6b0039f725..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -6339,25 -6588,84 +6339,52 @@@ static void mem_cgroup_invalidate_recla
+  	 * explicitely.
+  	 */
+  	if (!root_mem_cgroup->use_hierarchy)
+ -		mem_cgroup_iter_invalidate(root_mem_cgroup);
+ +		atomic_inc(&root_mem_cgroup->dead_count);
+  }
+  
+ -static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
+ +static void mem_cgroup_css_offline(struct cgroup *cont)
+  {
+++<<<<<<< HEAD
+ +	struct mem_cgroup *memcg = mem_cgroup_from_cont(cont);
+++=======
++ 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
++ 	struct mem_cgroup_event *event, *tmp;
++ 	struct cgroup_subsys_state *iter;
++ 
++ 	/*
++ 	 * Unregister events and notify userspace.
++ 	 * Notify userspace about cgroup removing only after rmdir of cgroup
++ 	 * directory to avoid race between userspace and kernelspace.
++ 	 */
++ 	spin_lock(&memcg->event_list_lock);
++ 	list_for_each_entry_safe(event, tmp, &memcg->event_list, list) {
++ 		list_del_init(&event->list);
++ 		schedule_work(&event->remove);
++ 	}
++ 	spin_unlock(&memcg->event_list_lock);
++ 
++ 	kmem_cgroup_css_offline(memcg);
+++>>>>>>> 4fb1a86fb5e4 (memcg: reparent charges of children before processing parent)
+  
+  	mem_cgroup_invalidate_reclaim_iterators(memcg);
+- 	mem_cgroup_reparent_charges(memcg);
++ 
++ 	/*
++ 	 * This requires that offlining is serialized.  Right now that is
++ 	 * guaranteed because css_killed_work_fn() holds the cgroup_mutex.
++ 	 */
++ 	css_for_each_descendant_post(iter, css)
++ 		mem_cgroup_reparent_charges(mem_cgroup_from_css(iter));
++ 
+  	mem_cgroup_destroy_all_caches(memcg);
+ -	vmpressure_cleanup(&memcg->vmpressure);
+  }
+  
+ -static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
+ +static void mem_cgroup_css_free(struct cgroup *cont)
+  {
+ -	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ -	/*
+ -	 * XXX: css_offline() would be where we should reparent all
+ -	 * memory to prepare the cgroup for destruction.  However,
+ -	 * memcg does not do css_tryget() and res_counter charging
+ -	 * under the same RCU lock region, which means that charging
+ -	 * could race with offlining.  Offlining only happens to
+ -	 * cgroups with no tasks in them but charges can show up
+ -	 * without any tasks from the swapin path when the target
+ -	 * memcg is looked up from the swapout record and not from the
+ -	 * current task as it usually is.  A race like this can leak
+ -	 * charges and put pages with stale cgroup pointers into
+ -	 * circulation:
+ -	 *
+ -	 * #0                        #1
+ -	 *                           lookup_swap_cgroup_id()
+ -	 *                           rcu_read_lock()
+ -	 *                           mem_cgroup_lookup()
+ -	 *                           css_tryget()
+ -	 *                           rcu_read_unlock()
+ -	 * disable css_tryget()
+ -	 * call_rcu()
+ -	 *   offline_css()
+ -	 *     reparent_charges()
+ -	 *                           res_counter_charge()
+ -	 *                           css_put()
+ -	 *                             css_free()
+ -	 *                           pc->mem_cgroup = dead memcg
+ -	 *                           add page to lru
+ -	 *
+ -	 * The bulk of the charges are still moved in offline_css() to
+ -	 * avoid pinning a lot of pages in case a long-term reference
+ -	 * like a swapout record is deferring the css_free() to long
+ -	 * after offlining.  But this makes sure we catch any charges
+ -	 * made after offlining:
+ -	 */
+ -	mem_cgroup_reparent_charges(memcg);
+ +	struct mem_cgroup *memcg = mem_cgroup_from_cont(cont);
+  
+ -	memcg_destroy_kmem(memcg);
+ -	__mem_cgroup_free(memcg);
+ +	kmem_cgroup_destroy(memcg);
+ +
+ +	mem_cgroup_put(memcg);
+  }
+  
+  #ifdef CONFIG_MMU
+* Unmerged path mm/memcontrol.c
