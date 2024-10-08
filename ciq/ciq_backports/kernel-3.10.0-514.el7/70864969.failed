@@ -1,0 +1,168 @@
+zram: unify error reporting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+commit 708649694a8699ff91d395c4aef5ecea3ade14bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/70864969.failed
+
+Make zram syslog error reporting more consistent. We have random
+error levels in some places. For example, critical errors like
+  "Error allocating memory for compressed page"
+and
+  "Unable to allocate temp memory"
+are reported as KERN_INFO messages.
+
+a) Reassign error levels
+
+Error messages that directly affect zram
+functionality -- pr_err():
+
+ Error allocating zram address table
+ Error creating memory pool
+ Decompression failed! err=%d, page=%u
+ Unable to allocate temp memory
+ Compression failed! err=%d
+ Error allocating memory for compressed page: %u, size=%zu
+ Cannot initialise %s compressing backend
+ Error allocating disk queue for device %d
+ Error allocating disk structure for device %d
+ Error creating sysfs group for device %d
+ Unable to register zram-control class
+ Unable to get major number
+
+Messages that do not affect functionality, but user
+must be warned (because sysfs attrs will be removed in
+this particular case) -- pr_warn():
+
+ %d (%s) Attribute %s (and others) will be removed. %s
+
+Messages that do not affect functionality and mostly are
+informative -- pr_info():
+
+ Cannot change max compression streams
+ Can't change algorithm for initialized device
+ Cannot change disksize for initialized device
+ Added device: %s
+ Removed device: %s
+
+b) Update sysfs_create_group() error message
+
+First, it lacks a trailing new line; add it.  Second, every error message
+in zram_add() has a "for device %d" part, which makes errors more
+informative.  Add missing part to "Error creating sysfs group" message.
+
+	Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 708649694a8699ff91d395c4aef5ecea3ade14bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/zram/zram_drv.c
+diff --cc drivers/block/zram/zram_drv.c
+index 817b95847bab,9fa15bb9d118..000000000000
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@@ -960,20 -1204,20 +960,20 @@@ static int create_device(struct zram *z
+  
+  	init_rwsem(&zram->init_lock);
+  
+ -	queue = blk_alloc_queue(GFP_KERNEL);
+ -	if (!queue) {
+ +	zram->queue = blk_alloc_queue(GFP_KERNEL);
+ +	if (!zram->queue) {
+  		pr_err("Error allocating disk queue for device %d\n",
+  			device_id);
+ -		ret = -ENOMEM;
+ -		goto out_free_idr;
+ +		goto out;
+  	}
+  
+ -	blk_queue_make_request(queue, zram_make_request);
+ +	blk_queue_make_request(zram->queue, zram_make_request);
+ +	zram->queue->queuedata = zram;
+  
+ -	/* gendisk structure */
+ +	 /* gendisk structure */
+  	zram->disk = alloc_disk(1);
+  	if (!zram->disk) {
+- 		pr_warn("Error allocating disk structure for device %d\n",
++ 		pr_err("Error allocating disk structure for device %d\n",
+  			device_id);
+  		ret = -ENOMEM;
+  		goto out_free_queue;
+@@@ -1035,46 -1403,34 +1036,59 @@@ static void destroy_device(struct zram 
+  
+  static int __init zram_init(void)
+  {
+ -	int ret;
+ +	int ret, dev_id;
+  
+++<<<<<<< HEAD
+ +	if (num_devices > max_num_devices) {
+ +		pr_warn("Invalid value for num_devices: %u\n",
+ +				num_devices);
+ +		ret = -EINVAL;
+ +		goto out;
+++=======
++ 	ret = class_register(&zram_control_class);
++ 	if (ret) {
++ 		pr_err("Unable to register zram-control class\n");
++ 		return ret;
+++>>>>>>> 708649694a86 (zram: unify error reporting)
+  	}
+  
+  	zram_major = register_blkdev(0, "zram");
+  	if (zram_major <= 0) {
+++<<<<<<< HEAD
+ +		pr_warn("Unable to get major number\n");
+ +		ret = -EBUSY;
+ +		goto out;
+++=======
++ 		pr_err("Unable to get major number\n");
++ 		class_unregister(&zram_control_class);
++ 		return -EBUSY;
+++>>>>>>> 708649694a86 (zram: unify error reporting)
+ +	}
+ +
+ +	/* Allocate the device array and initialize each one */
+ +	zram_devices = kzalloc(num_devices * sizeof(struct zram), GFP_KERNEL);
+ +	if (!zram_devices) {
+ +		ret = -ENOMEM;
+ +		goto unregister;
+  	}
+  
+ -	while (num_devices != 0) {
+ -		mutex_lock(&zram_index_mutex);
+ -		ret = zram_add();
+ -		mutex_unlock(&zram_index_mutex);
+ -		if (ret < 0)
+ -			goto out_error;
+ -		num_devices--;
+ +	for (dev_id = 0; dev_id < num_devices; dev_id++) {
+ +		ret = create_device(&zram_devices[dev_id], dev_id);
+ +		if (ret)
+ +			goto free_devices;
+  	}
+  
+ +	pr_info("Created %u device(s) ...\n", num_devices);
+ +
+  	return 0;
+  
+ -out_error:
+ -	destroy_devices();
+ +free_devices:
+ +	while (dev_id)
+ +		destroy_device(&zram_devices[--dev_id]);
+ +	kfree(zram_devices);
+ +unregister:
+ +	unregister_blkdev(zram_major, "zram");
+ +out:
+  	return ret;
+  }
+  
+* Unmerged path drivers/block/zram/zram_drv.c
