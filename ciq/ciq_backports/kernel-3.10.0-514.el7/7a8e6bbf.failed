@@ -1,0 +1,143 @@
+powerpc/pci: Add shutdown hook to pci_controller_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] pci: Add shutdown hook to pci_controller_ops (Gustavo Duarte) [1275657]
+Rebuild_FUZZ: 91.67%
+commit-author Michael Neuling <mikey@neuling.org>
+commit 7a8e6bbf8593a9395dd6c61f7c5f421570600017
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7a8e6bbf.failed
+
+Currently pnv_pci_shutdown() calls the PHB shutdown code for all PHBs in the
+system.  It dereferences the private_data assuming it's a powernv PHB, which
+won't be the case when we have different PHB in the systems (like when we add
+vPHBs for CXL).
+
+This moves the shutdown hook to the pci_controller_ops and fixes the call site
+to use that instead.
+
+	Signed-off-by: Michael Neuling <mikey@neuling.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 7a8e6bbf8593a9395dd6c61f7c5f421570600017)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/pci-bridge.h
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+diff --cc arch/powerpc/include/asm/pci-bridge.h
+index 157251ae4847,3947749de280..000000000000
+--- a/arch/powerpc/include/asm/pci-bridge.h
++++ b/arch/powerpc/include/asm/pci-bridge.h
+@@@ -35,6 -30,18 +35,19 @@@ struct pci_controller_ops 
+  	/* Called during PCI resource reassignment */
+  	resource_size_t (*window_alignment)(struct pci_bus *, unsigned long type);
+  	void		(*reset_secondary_bus)(struct pci_dev *dev);
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_PCI_MSI
++ 	int		(*setup_msi_irqs)(struct pci_dev *dev,
++ 					  int nvec, int type);
++ 	void		(*teardown_msi_irqs)(struct pci_dev *dev);
++ #endif
++ 
++ 	int             (*dma_set_mask)(struct pci_dev *dev, u64 dma_mask);
++ 
++ 	void		(*shutdown)(struct pci_controller *);
+++>>>>>>> 7a8e6bbf8593 (powerpc/pci: Add shutdown hook to pci_controller_ops)
+  };
+  
+  /*
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index fe5c4ee44e89,cec43c8dc44d..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -2873,14 -2643,29 +2873,38 @@@ static u32 pnv_ioda_bdfn_to_pe(struct p
+  	return phb->ioda.pe_rmap[(bus->number << 8) | devfn];
+  }
+  
+- static void pnv_pci_ioda_shutdown(struct pnv_phb *phb)
++ static void pnv_pci_ioda_shutdown(struct pci_controller *hose)
+  {
+++<<<<<<< HEAD
+ +	opal_pci_reset(phb->opal_id, OPAL_PCI_IODA_TABLE_RESET,
+ +		       OPAL_ASSERT_RESET);
+ +}
+ +
+ +void __init pnv_pci_init_ioda_phb(struct device_node *np,
+ +				  u64 hub_id, int ioda_type)
+++=======
++ 	struct pnv_phb *phb = hose->private_data;
++ 
++ 	opal_pci_reset(phb->opal_id, OPAL_RESET_PCI_IODA_TABLE,
++ 		       OPAL_ASSERT_RESET);
++ }
++ 
++ static const struct pci_controller_ops pnv_pci_ioda_controller_ops = {
++        .dma_dev_setup = pnv_pci_dma_dev_setup,
++ #ifdef CONFIG_PCI_MSI
++        .setup_msi_irqs = pnv_setup_msi_irqs,
++        .teardown_msi_irqs = pnv_teardown_msi_irqs,
++ #endif
++        .enable_device_hook = pnv_pci_enable_device_hook,
++        .window_alignment = pnv_pci_window_alignment,
++        .reset_secondary_bus = pnv_pci_reset_secondary_bus,
++        .dma_set_mask = pnv_pci_ioda_dma_set_mask,
++        .shutdown = pnv_pci_ioda_shutdown,
++ };
++ 
++ static void __init pnv_pci_init_ioda_phb(struct device_node *np,
++ 					 u64 hub_id, int ioda_type)
+++>>>>>>> 7a8e6bbf8593 (powerpc/pci: Add shutdown hook to pci_controller_ops)
+  {
+  	struct pci_controller *hose;
+  	struct pnv_phb *phb;
+@@@ -3028,12 -2807,8 +3052,9 @@@
+  
+  	/* Setup TCEs */
+  	phb->dma_dev_setup = pnv_pci_ioda_dma_dev_setup;
+ +	phb->dma_set_mask = pnv_pci_ioda_dma_set_mask;
+  	phb->dma_get_required_mask = pnv_pci_ioda_dma_get_required_mask;
+  
+- 	/* Setup shutdown function for kexec */
+- 	phb->shutdown = pnv_pci_ioda_shutdown;
+- 
+  	/* Setup MSI support */
+  	pnv_pci_init_ioda_msis(phb);
+  
+* Unmerged path arch/powerpc/include/asm/pci-bridge.h
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
+diff --git a/arch/powerpc/platforms/powernv/pci.c b/arch/powerpc/platforms/powernv/pci.c
+index 3a74d719e520..84b5f1e36421 100644
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@ -796,12 +796,9 @@ void pnv_pci_shutdown(void)
+ {
+ 	struct pci_controller *hose;
+ 
+-	list_for_each_entry(hose, &hose_list, list_node) {
+-		struct pnv_phb *phb = hose->private_data;
+-
+-		if (phb && phb->shutdown)
+-			phb->shutdown(phb);
+-	}
++	list_for_each_entry(hose, &hose_list, list_node)
++		if (hose->controller_ops.shutdown)
++			hose->controller_ops.shutdown(hose);
+ }
+ 
+ /* Fixup wrong class code in p7ioc and p8 root complex */
+diff --git a/arch/powerpc/platforms/powernv/pci.h b/arch/powerpc/platforms/powernv/pci.h
+index 9f8987faf648..097b536e206c 100644
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@ -111,7 +111,6 @@ struct pnv_phb {
+ 				     struct pci_dev *pdev);
+ 	void (*fixup_phb)(struct pci_controller *hose);
+ 	u32 (*bdfn_to_pe)(struct pnv_phb *phb, struct pci_bus *bus, u32 devfn);
+-	void (*shutdown)(struct pnv_phb *phb);
+ 	int (*init_m64)(struct pnv_phb *phb);
+ 	void (*alloc_m64_pe)(struct pnv_phb *phb);
+ 	int (*pick_m64_pe)(struct pnv_phb *phb, struct pci_bus *bus, int all);
