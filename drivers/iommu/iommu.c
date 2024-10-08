@@ -124,6 +124,8 @@ static void iommu_group_release(struct kobject *kobj)
 {
 	struct iommu_group *group = to_iommu_group(kobj);
 
+	pr_debug("Releasing group %d\n", group->id);
+
 	if (group->iommu_data_release)
 		group->iommu_data_release(group->iommu_data);
 
@@ -202,6 +204,8 @@ again:
 	 * use the devices_kobj for reference counting.
 	 */
 	kobject_put(&group->kobj);
+
+	pr_debug("Allocated group %d\n", group->id);
 
 	return group;
 }
@@ -368,6 +372,9 @@ rename:
 				     IOMMU_GROUP_NOTIFY_ADD_DEVICE, dev);
 
 	trace_add_device_to_group(group->id, dev);
+
+	pr_info("Adding device %s to group %d\n", dev_name(dev), group->id);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(iommu_group_add_device);
@@ -383,6 +390,8 @@ void iommu_group_remove_device(struct device *dev)
 {
 	struct iommu_group *group = dev->iommu_group;
 	struct iommu_device *tmp_device, *device = NULL;
+
+	pr_info("Removing device %s from group %d\n", dev_name(dev), group->id);
 
 	/* Pre-notify listeners that a device is being removed. */
 	blocking_notifier_call_chain(&group->notifier,
