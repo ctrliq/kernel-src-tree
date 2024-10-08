@@ -1,0 +1,302 @@
+Btrfs: fix snapshot inconsistency after a file write followed by truncate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Filipe Manana <fdmanana@suse.com>
+commit 9ea24bbe17a29f937e7f48e4b15fd52e89e9d386
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9ea24bbe.failed
+
+If right after starting the snapshot creation ioctl we perform a write against a
+file followed by a truncate, with both operations increasing the file's size, we
+can get a snapshot tree that reflects a state of the source subvolume's tree where
+the file truncation happened but the write operation didn't. This leaves a gap
+between 2 file extent items of the inode, which makes btrfs' fsck complain about it.
+
+For example, if we perform the following file operations:
+
+    $ mkfs.btrfs -f /dev/vdd
+    $ mount /dev/vdd /mnt
+    $ xfs_io -f \
+          -c "pwrite -S 0xaa -b 32K 0 32K" \
+          -c "fsync" \
+          -c "pwrite -S 0xbb -b 32770 16K 32770" \
+          -c "truncate 90123" \
+          /mnt/foobar
+
+and the snapshot creation ioctl was just called before the second write, we often
+can get the following inode items in the snapshot's btree:
+
+        item 120 key (257 INODE_ITEM 0) itemoff 7987 itemsize 160
+                inode generation 146 transid 7 size 90123 block group 0 mode 100600 links 1 uid 0 gid 0 rdev 0 flags 0x0
+        item 121 key (257 INODE_REF 256) itemoff 7967 itemsize 20
+                inode ref index 282 namelen 10 name: foobar
+        item 122 key (257 EXTENT_DATA 0) itemoff 7914 itemsize 53
+                extent data disk byte 1104855040 nr 32768
+                extent data offset 0 nr 32768 ram 32768
+                extent compression 0
+        item 123 key (257 EXTENT_DATA 53248) itemoff 7861 itemsize 53
+                extent data disk byte 0 nr 0
+                extent data offset 0 nr 40960 ram 40960
+                extent compression 0
+
+There's a file range, corresponding to the interval [32K; ALIGN(16K + 32770, 4096)[
+for which there's no file extent item covering it. This is because the file write
+and file truncate operations happened both right after the snapshot creation ioctl
+called btrfs_start_delalloc_inodes(), which means we didn't start and wait for the
+ordered extent that matches the write and, in btrfs_setsize(), we were able to call
+btrfs_cont_expand() before being able to commit the current transaction in the
+snapshot creation ioctl. So this made it possibe to insert the hole file extent
+item in the source subvolume (which represents the region added by the truncate)
+right before the transaction commit from the snapshot creation ioctl.
+
+Btrfs' fsck tool complains about such cases with a message like the following:
+
+    "root 331 inode 257 errors 100, file extent discount"
+
+>From a user perspective, the expectation when a snapshot is created while those
+file operations are being performed is that the snapshot will have a file that
+either:
+
+1) is empty
+2) only the first write was captured
+3) only the 2 writes were captured
+4) both writes and the truncation were captured
+
+But never capture a state where only the first write and the truncation were
+captured (since the second write was performed before the truncation).
+
+A test case for xfstests follows.
+
+	Signed-off-by: Filipe Manana <fdmanana@suse.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 9ea24bbe17a29f937e7f48e4b15fd52e89e9d386)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+#	fs/btrfs/ioctl.c
+diff --cc fs/btrfs/extent-tree.c
+index b8033a624907,b4e3ab115f5f..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -9671,9 -9675,9 +9673,9 @@@ void btrfs_end_write_no_snapshoting(str
+  		wake_up(&root->subv_writers->wait);
+  }
+  
+- int btrfs_start_nocow_write(struct btrfs_root *root)
++ int btrfs_start_write_no_snapshoting(struct btrfs_root *root)
+  {
+ -	if (atomic_read(&root->will_be_snapshoted))
+ +	if (unlikely(atomic_read(&root->will_be_snapshoted)))
+  		return 0;
+  
+  	percpu_counter_inc(&root->subv_writers->counter);
+@@@ -9681,8 -9685,8 +9683,13 @@@
+  	 * Make sure counter is updated before we check for snapshot creation.
+  	 */
+  	smp_mb();
+++<<<<<<< HEAD
+ +	if (unlikely(atomic_read(&root->will_be_snapshoted))) {
+ +		btrfs_end_nocow_write(root);
+++=======
++ 	if (atomic_read(&root->will_be_snapshoted)) {
++ 		btrfs_end_write_no_snapshoting(root);
+++>>>>>>> 9ea24bbe17a2 (Btrfs: fix snapshot inconsistency after a file write followed by truncate)
+  		return 0;
+  	}
+  	return 1;
+diff --cc fs/btrfs/ioctl.c
+index 8273345824b0,b590e23fa03e..000000000000
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@@ -645,8 -648,8 +645,13 @@@ static int create_snapshot(struct btrfs
+  		return -EINVAL;
+  
+  	atomic_inc(&root->will_be_snapshoted);
+++<<<<<<< HEAD
+ +	smp_mb__after_atomic_inc();
+ +	btrfs_wait_nocow_write(root);
+++=======
++ 	smp_mb__after_atomic();
++ 	btrfs_wait_for_no_snapshoting_writes(root);
+++>>>>>>> 9ea24bbe17a2 (Btrfs: fix snapshot inconsistency after a file write followed by truncate)
+  
+  	ret = btrfs_start_delalloc_inodes(root, 0);
+  	if (ret)
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index bc89d85a5d61..bbdce9b81799 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3480,8 +3480,8 @@ int btrfs_init_space_info(struct btrfs_fs_info *fs_info);
+ int btrfs_delayed_refs_qgroup_accounting(struct btrfs_trans_handle *trans,
+ 					 struct btrfs_fs_info *fs_info);
+ int __get_raid_index(u64 flags);
+-int btrfs_start_nocow_write(struct btrfs_root *root);
+-void btrfs_end_nocow_write(struct btrfs_root *root);
++int btrfs_start_write_no_snapshoting(struct btrfs_root *root);
++void btrfs_end_write_no_snapshoting(struct btrfs_root *root);
+ /* ctree.c */
+ int btrfs_bin_search(struct extent_buffer *eb, struct btrfs_key *key,
+ 		     int level, int *slot);
+* Unmerged path fs/btrfs/extent-tree.c
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 56f9dab2b04a..aa4b27578131 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1432,7 +1432,7 @@ static noinline int check_can_nocow(struct inode *inode, loff_t pos,
+ 	u64 num_bytes;
+ 	int ret;
+ 
+-	ret = btrfs_start_nocow_write(root);
++	ret = btrfs_start_write_no_snapshoting(root);
+ 	if (!ret)
+ 		return -ENOSPC;
+ 
+@@ -1455,7 +1455,7 @@ static noinline int check_can_nocow(struct inode *inode, loff_t pos,
+ 	ret = can_nocow_extent(inode, lockstart, &num_bytes, NULL, NULL, NULL);
+ 	if (ret <= 0) {
+ 		ret = 0;
+-		btrfs_end_nocow_write(root);
++		btrfs_end_write_no_snapshoting(root);
+ 	} else {
+ 		*write_bytes = min_t(size_t, *write_bytes ,
+ 				     num_bytes - pos + lockstart);
+@@ -1549,7 +1549,7 @@ static noinline ssize_t __btrfs_buffered_write(struct file *file,
+ 				btrfs_free_reserved_data_space(inode,
+ 							       reserve_bytes);
+ 			else
+-				btrfs_end_nocow_write(root);
++				btrfs_end_write_no_snapshoting(root);
+ 			break;
+ 		}
+ 
+@@ -1639,7 +1639,7 @@ again:
+ 
+ 		release_bytes = 0;
+ 		if (only_release_metadata)
+-			btrfs_end_nocow_write(root);
++			btrfs_end_write_no_snapshoting(root);
+ 
+ 		if (only_release_metadata && copied > 0) {
+ 			u64 lockstart = round_down(pos, root->sectorsize);
+@@ -1668,7 +1668,7 @@ again:
+ 
+ 	if (release_bytes) {
+ 		if (only_release_metadata) {
+-			btrfs_end_nocow_write(root);
++			btrfs_end_write_no_snapshoting(root);
+ 			btrfs_delalloc_release_metadata(inode, release_bytes);
+ 		} else {
+ 			btrfs_delalloc_release_space(inode, release_bytes);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 4691855229a0..cb3bb5a136f0 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -1337,7 +1337,7 @@ next_slot:
+ 			 * we fall into common COW way.
+ 			 */
+ 			if (!nolock) {
+-				err = btrfs_start_nocow_write(root);
++				err = btrfs_start_write_no_snapshoting(root);
+ 				if (!err)
+ 					goto out_check;
+ 			}
+@@ -1361,7 +1361,7 @@ out_check:
+ 		if (extent_end <= start) {
+ 			path->slots[0]++;
+ 			if (!nolock && nocow)
+-				btrfs_end_nocow_write(root);
++				btrfs_end_write_no_snapshoting(root);
+ 			goto next_slot;
+ 		}
+ 		if (!nocow) {
+@@ -1381,7 +1381,7 @@ out_check:
+ 					     page_started, nr_written, 1);
+ 			if (ret) {
+ 				if (!nolock && nocow)
+-					btrfs_end_nocow_write(root);
++					btrfs_end_write_no_snapshoting(root);
+ 				goto error;
+ 			}
+ 			cow_start = (u64)-1;
+@@ -1432,7 +1432,7 @@ out_check:
+ 						      num_bytes);
+ 			if (ret) {
+ 				if (!nolock && nocow)
+-					btrfs_end_nocow_write(root);
++					btrfs_end_write_no_snapshoting(root);
+ 				goto error;
+ 			}
+ 		}
+@@ -1443,7 +1443,7 @@ out_check:
+ 					     EXTENT_DELALLOC, PAGE_UNLOCK |
+ 					     PAGE_SET_PRIVATE2);
+ 		if (!nolock && nocow)
+-			btrfs_end_nocow_write(root);
++			btrfs_end_write_no_snapshoting(root);
+ 		cur_offset = extent_end;
+ 		if (cur_offset > end)
+ 			break;
+@@ -4588,6 +4588,26 @@ next:
+ 	return err;
+ }
+ 
++static int wait_snapshoting_atomic_t(atomic_t *a)
++{
++	schedule();
++	return 0;
++}
++
++static void wait_for_snapshot_creation(struct btrfs_root *root)
++{
++	while (true) {
++		int ret;
++
++		ret = btrfs_start_write_no_snapshoting(root);
++		if (ret)
++			break;
++		wait_on_atomic_t(&root->will_be_snapshoted,
++				 wait_snapshoting_atomic_t,
++				 TASK_UNINTERRUPTIBLE);
++	}
++}
++
+ static int btrfs_setsize(struct inode *inode, struct iattr *attr)
+ {
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+@@ -4608,17 +4628,30 @@ static int btrfs_setsize(struct inode *inode, struct iattr *attr)
+ 
+ 	if (newsize > oldsize) {
+ 		truncate_pagecache(inode, newsize);
++		/*
++		 * Don't do an expanding truncate while snapshoting is ongoing.
++		 * This is to ensure the snapshot captures a fully consistent
++		 * state of this file - if the snapshot captures this expanding
++		 * truncation, it must capture all writes that happened before
++		 * this truncation.
++		 */
++		wait_for_snapshot_creation(root);
+ 		ret = btrfs_cont_expand(inode, oldsize, newsize);
+-		if (ret)
++		if (ret) {
++			btrfs_end_write_no_snapshoting(root);
+ 			return ret;
++		}
+ 
+ 		trans = btrfs_start_transaction(root, 1);
+-		if (IS_ERR(trans))
++		if (IS_ERR(trans)) {
++			btrfs_end_write_no_snapshoting(root);
+ 			return PTR_ERR(trans);
++		}
+ 
+ 		i_size_write(inode, newsize);
+ 		btrfs_ordered_update_i_size(inode, i_size_read(inode), NULL);
+ 		ret = btrfs_update_inode(trans, root, inode);
++		btrfs_end_write_no_snapshoting(root);
+ 		btrfs_end_transaction(trans, root);
+ 	} else {
+ 
+* Unmerged path fs/btrfs/ioctl.c
