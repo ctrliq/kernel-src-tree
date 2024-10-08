@@ -1,0 +1,291 @@
+NFS: Unconditionally enable commit code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Anna Schumaker <Anna.Schumaker@netapp.com>
+commit f418c64b71590bac8fdebd0969a1eeaffaf036d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f418c64b.failed
+
+The goal is to create a generic NFS module with code that does not
+depend on what versions of NFS are enabled.
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit f418c64b71590bac8fdebd0969a1eeaffaf036d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/direct.c
+diff --cc fs/nfs/direct.c
+index d133d9ca5ff3,dda4b8667c02..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -762,119 -697,6 +759,122 @@@ static void nfs_direct_write_complete(s
+  	schedule_work(&dreq->work); /* Calls nfs_direct_write_schedule_work */
+  }
+  
+++<<<<<<< HEAD
+ +#else
+ +static void nfs_direct_write_schedule_work(struct work_struct *work)
+ +{
+ +}
+ +
+ +static void nfs_direct_write_complete(struct nfs_direct_req *dreq, struct inode *inode)
+ +{
+ +	nfs_direct_complete(dreq, true);
+ +}
+ +#endif
+ +
+ +/*
+ + * NB: Return the value of the first error return code.  Subsequent
+ + *     errors after the first one are ignored.
+ + */
+ +/*
+ + * For each wsize'd chunk of the user's buffer, dispatch an NFS WRITE
+ + * operation.  If nfs_writedata_alloc() or get_user_pages() fails,
+ + * bail and stop sending more writes.  Write length accounting is
+ + * handled automatically by nfs_direct_write_result().  Otherwise, if
+ + * no requests have been sent, just return an error.
+ + */
+ +static ssize_t nfs_direct_write_schedule_segment(struct nfs_pageio_descriptor *desc,
+ +						 const struct iovec *iov,
+ +						 loff_t pos, bool uio)
+ +{
+ +	struct nfs_direct_req *dreq = desc->pg_dreq;
+ +	struct nfs_open_context *ctx = dreq->ctx;
+ +	struct inode *inode = ctx->dentry->d_inode;
+ +	unsigned long user_addr = (unsigned long)iov->iov_base;
+ +	size_t count = iov->iov_len;
+ +	size_t wsize = NFS_SERVER(inode)->wsize;
+ +	unsigned int pgbase;
+ +	int result;
+ +	ssize_t started = 0;
+ +	struct page **pagevec = NULL;
+ +	unsigned int npages;
+ +
+ +	do {
+ +		size_t bytes;
+ +		int i;
+ +
+ +		pgbase = user_addr & ~PAGE_MASK;
+ +		bytes = min(max_t(size_t, wsize, PAGE_SIZE), count);
+ +
+ +		result = -ENOMEM;
+ +		npages = nfs_page_array_len(pgbase, bytes);
+ +		if (!pagevec)
+ +			pagevec = kmalloc(npages * sizeof(struct page *), GFP_KERNEL);
+ +		if (!pagevec)
+ +			break;
+ +
+ +		if (uio) {
+ +			down_read(&current->mm->mmap_sem);
+ +			result = get_user_pages(current, current->mm, user_addr,
+ +						npages, 0, 0, pagevec, NULL);
+ +			up_read(&current->mm->mmap_sem);
+ +			if (result < 0)
+ +				break;
+ +		} else {
+ +			WARN_ON(npages != 1);
+ +			result = get_kernel_page(user_addr, 0, pagevec);
+ +			if (WARN_ON(result != 1))
+ +				break;
+ +		}
+ +
+ +		if ((unsigned)result < npages) {
+ +			bytes = result * PAGE_SIZE;
+ +			if (bytes <= pgbase) {
+ +				nfs_direct_release_pages(pagevec, result);
+ +				break;
+ +			}
+ +			bytes -= pgbase;
+ +			npages = result;
+ +		}
+ +
+ +		for (i = 0; i < npages; i++) {
+ +			struct nfs_page *req;
+ +			unsigned int req_len = min_t(size_t, bytes, PAGE_SIZE - pgbase);
+ +
+ +			req = nfs_create_request(dreq->ctx, pagevec[i], NULL,
+ +						 pgbase, req_len);
+ +			if (IS_ERR(req)) {
+ +				result = PTR_ERR(req);
+ +				break;
+ +			}
+ +			nfs_lock_request(req);
+ +			req->wb_index = pos >> PAGE_SHIFT;
+ +			req->wb_offset = pos & ~PAGE_MASK;
+ +			if (!nfs_pageio_add_request(desc, req)) {
+ +				result = desc->pg_error;
+ +				nfs_unlock_and_release_request(req);
+ +				break;
+ +			}
+ +			pgbase = 0;
+ +			bytes -= req_len;
+ +			started += req_len;
+ +			user_addr += req_len;
+ +			pos += req_len;
+ +			count -= req_len;
+ +			dreq->bytes_left -= req_len;
+ +		}
+ +		/* The nfs_page now hold references to these pages */
+ +		nfs_direct_release_pages(pagevec, npages);
+ +	} while (count != 0 && result >= 0);
+ +
+ +	kfree(pagevec);
+ +
+ +	if (started)
+ +		return started;
+ +	return result < 0 ? (ssize_t) result : -EFAULT;
+ +}
+ +
+++=======
+++>>>>>>> f418c64b7159 (NFS: Unconditionally enable commit code)
+  static void nfs_direct_write_completion(struct nfs_pgio_header *hdr)
+  {
+  	struct nfs_direct_req *dreq = hdr->dreq;
+* Unmerged path fs/nfs/direct.c
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index f92f753bab33..6a54c184f245 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -720,7 +720,6 @@ nfs_mark_request_dirty(struct nfs_page *req)
+ 	__set_page_dirty_nobuffers(req->wb_page);
+ }
+ 
+-#if IS_ENABLED(CONFIG_NFS_V3) || IS_ENABLED(CONFIG_NFS_V4)
+ /*
+  * nfs_page_search_commits_for_head_request_locked
+  *
+@@ -870,43 +869,6 @@ int nfs_write_need_commit(struct nfs_pgio_header *hdr)
+ 	return hdr->verf.committed != NFS_FILE_SYNC;
+ }
+ 
+-#else
+-static struct nfs_page *
+-nfs_page_search_commits_for_head_request_locked(struct nfs_inode *nfsi,
+-						struct page *page)
+-{
+-	return NULL;
+-}
+-
+-static void nfs_init_cinfo_from_inode(struct nfs_commit_info *cinfo,
+-				      struct inode *inode)
+-{
+-}
+-
+-void nfs_init_cinfo(struct nfs_commit_info *cinfo,
+-		    struct inode *inode,
+-		    struct nfs_direct_req *dreq)
+-{
+-}
+-
+-void
+-nfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
+-			struct nfs_commit_info *cinfo)
+-{
+-}
+-
+-static void
+-nfs_clear_request_commit(struct nfs_page *req)
+-{
+-}
+-
+-int nfs_write_need_commit(struct nfs_pgio_header *hdr)
+-{
+-	return 0;
+-}
+-
+-#endif
+-
+ static void nfs_write_completion(struct nfs_pgio_header *hdr)
+ {
+ 	struct nfs_commit_info cinfo;
+@@ -942,7 +904,6 @@ out:
+ 	hdr->release(hdr);
+ }
+ 
+-#if  IS_ENABLED(CONFIG_NFS_V3) || IS_ENABLED(CONFIG_NFS_V4)
+ unsigned long
+ nfs_reqs_to_commit(struct nfs_commit_info *cinfo)
+ {
+@@ -999,19 +960,6 @@ nfs_scan_commit(struct inode *inode, struct list_head *dst,
+ 	return ret;
+ }
+ 
+-#else
+-unsigned long nfs_reqs_to_commit(struct nfs_commit_info *cinfo)
+-{
+-	return 0;
+-}
+-
+-int nfs_scan_commit(struct inode *inode, struct list_head *dst,
+-		    struct nfs_commit_info *cinfo)
+-{
+-	return 0;
+-}
+-#endif
+-
+ /*
+  * Search for an existing write request, and attempt to update
+  * it to reflect a new dirty region on a given page.
+@@ -1404,7 +1352,6 @@ static int nfs_writeback_done(struct rpc_task *task,
+ 		return status;
+ 	nfs_add_stats(inode, NFSIOS_SERVERWRITTENBYTES, hdr->res.count);
+ 
+-#if IS_ENABLED(CONFIG_NFS_V3) || IS_ENABLED(CONFIG_NFS_V4)
+ 	if (hdr->res.verf->committed < hdr->args.stable &&
+ 	    task->tk_status >= 0) {
+ 		/* We tried a write call, but the server did not
+@@ -1426,7 +1373,6 @@ static int nfs_writeback_done(struct rpc_task *task,
+ 			complain = jiffies + 300 * HZ;
+ 		}
+ 	}
+-#endif
+ 
+ 	/* Deal with the suid/sgid bit corner case */
+ 	if (nfs_should_remove_suid(inode))
+@@ -1479,7 +1425,6 @@ static void nfs_writeback_result(struct rpc_task *task,
+ }
+ 
+ 
+-#if IS_ENABLED(CONFIG_NFS_V3) || IS_ENABLED(CONFIG_NFS_V4)
+ static int nfs_commit_set_lock(struct nfs_inode *nfsi, int may_wait)
+ {
+ 	int ret;
+@@ -1803,12 +1748,6 @@ out_mark_dirty:
+ 	__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
+ 	return ret;
+ }
+-#else
+-static int nfs_commit_unstable_pages(struct inode *inode, struct writeback_control *wbc)
+-{
+-	return 0;
+-}
+-#endif
+ 
+ int nfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+ {
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 5642f116d354..760367a70f12 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -530,17 +530,9 @@ extern int  nfs_updatepage(struct file *, struct page *, unsigned int, unsigned
+ extern int nfs_wb_all(struct inode *inode);
+ extern int nfs_wb_page(struct inode *inode, struct page* page);
+ extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
+-#if IS_ENABLED(CONFIG_NFS_V3) || IS_ENABLED(CONFIG_NFS_V4)
+ extern int  nfs_commit_inode(struct inode *, int);
+ extern struct nfs_commit_data *nfs_commitdata_alloc(void);
+ extern void nfs_commit_free(struct nfs_commit_data *data);
+-#else
+-static inline int
+-nfs_commit_inode(struct inode *inode, int how)
+-{
+-	return 0;
+-}
+-#endif
+ 
+ static inline int
+ nfs_have_writebacks(struct inode *inode)
