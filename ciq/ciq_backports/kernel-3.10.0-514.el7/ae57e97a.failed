@@ -1,0 +1,247 @@
+usb: common: otg-fsm: add HNP polling support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Li Jun <jun.li@nxp.com>
+commit ae57e97a95211397b46a40f8cb0a23966c054bc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ae57e97a.failed
+
+Adds HNP polling timer when transits to host state, the OTG status
+request will be sent to peripheral after timeout, if host request flag
+is set, it will switch to peripheral state, otherwise it will repeat HNP
+polling every 1.5s and maintain the current session.
+
+	Acked-by: Peter Chen <peter.chen@nxp.com>
+	Signed-off-by: Li Jun <jun.li@nxp.com>
+	Signed-off-by: Felipe Balbi <balbi@kernel.org>
+(cherry picked from commit ae57e97a95211397b46a40f8cb0a23966c054bc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/phy/phy-fsm-usb.c
+#	include/linux/usb/otg-fsm.h
+diff --cc drivers/usb/phy/phy-fsm-usb.c
+index 62aa5e160867,504708f59b93..000000000000
+--- a/drivers/usb/phy/phy-fsm-usb.c
++++ b/drivers/usb/phy/phy-fsm-usb.c
+@@@ -75,9 -77,12 +75,11 @@@ void otg_leave_state(struct otg_fsm *fs
+  		fsm->b_srp_done = 0;
+  		break;
+  	case OTG_STATE_B_PERIPHERAL:
++ 		if (fsm->otg->gadget)
++ 			fsm->otg->gadget->host_request_flag = 0;
+  		break;
+  	case OTG_STATE_B_WAIT_ACON:
+ -		otg_del_timer(fsm, B_ASE0_BRST);
+ +		otg_del_timer(fsm, b_ase0_brst_tmr);
+  		fsm->b_ase0_brst_tmout = 0;
+  		break;
+  	case OTG_STATE_B_HOST:
+@@@ -93,17 -99,23 +95,24 @@@
+  		fsm->a_wait_bcon_tmout = 0;
+  		break;
+  	case OTG_STATE_A_HOST:
+ -		otg_del_timer(fsm, A_WAIT_ENUM);
+ +		otg_del_timer(fsm, a_wait_enum_tmr);
+  		break;
+  	case OTG_STATE_A_SUSPEND:
+ -		otg_del_timer(fsm, A_AIDL_BDIS);
+ +		otg_del_timer(fsm, a_aidl_bdis_tmr);
+  		fsm->a_aidl_bdis_tmout = 0;
+ -		fsm->a_suspend_req_inf = 0;
+ +		fsm->a_suspend_req = 0;
+  		break;
+  	case OTG_STATE_A_PERIPHERAL:
+++<<<<<<< HEAD:drivers/usb/phy/phy-fsm-usb.c
+++=======
++ 		otg_del_timer(fsm, A_BIDL_ADIS);
++ 		fsm->a_bidl_adis_tmout = 0;
++ 		if (fsm->otg->gadget)
++ 			fsm->otg->gadget->host_request_flag = 0;
+++>>>>>>> ae57e97a9521 (usb: common: otg-fsm: add HNP polling support):drivers/usb/common/usb-otg-fsm.c
+  		break;
+  	case OTG_STATE_A_WAIT_VFALL:
+ -		otg_del_timer(fsm, A_WAIT_VFALL);
+ -		fsm->a_wait_vfall_tmout = 0;
+ -		otg_del_timer(fsm, A_WAIT_VRISE);
+ +		otg_del_timer(fsm, a_wait_vrise_tmr);
+  		break;
+  	case OTG_STATE_A_VBUS_ERR:
+  		break;
+@@@ -112,14 -124,95 +121,95 @@@
+  	}
+  }
+  
++ static void otg_hnp_polling_work(struct work_struct *work)
++ {
++ 	struct otg_fsm *fsm = container_of(to_delayed_work(work),
++ 				struct otg_fsm, hnp_polling_work);
++ 	struct usb_device *udev;
++ 	enum usb_otg_state state = fsm->otg->state;
++ 	u8 flag;
++ 	int retval;
++ 
++ 	if (state != OTG_STATE_A_HOST && state != OTG_STATE_B_HOST)
++ 		return;
++ 
++ 	udev = usb_hub_find_child(fsm->otg->host->root_hub, 1);
++ 	if (!udev) {
++ 		dev_err(fsm->otg->host->controller,
++ 			"no usb dev connected, can't start HNP polling\n");
++ 		return;
++ 	}
++ 
++ 	*fsm->host_req_flag = 0;
++ 	/* Get host request flag from connected USB device */
++ 	retval = usb_control_msg(udev,
++ 				usb_rcvctrlpipe(udev, 0),
++ 				USB_REQ_GET_STATUS,
++ 				USB_DIR_IN | USB_RECIP_DEVICE,
++ 				0,
++ 				OTG_STS_SELECTOR,
++ 				fsm->host_req_flag,
++ 				1,
++ 				USB_CTRL_GET_TIMEOUT);
++ 	if (retval != 1) {
++ 		dev_err(&udev->dev, "Get one byte OTG status failed\n");
++ 		return;
++ 	}
++ 
++ 	flag = *fsm->host_req_flag;
++ 	if (flag == 0) {
++ 		/* Continue HNP polling */
++ 		schedule_delayed_work(&fsm->hnp_polling_work,
++ 					msecs_to_jiffies(T_HOST_REQ_POLL));
++ 		return;
++ 	} else if (flag != HOST_REQUEST_FLAG) {
++ 		dev_err(&udev->dev, "host request flag %d is invalid\n", flag);
++ 		return;
++ 	}
++ 
++ 	/* Host request flag is set */
++ 	if (state == OTG_STATE_A_HOST) {
++ 		/* Set b_hnp_enable */
++ 		if (!fsm->otg->host->b_hnp_enable) {
++ 			retval = usb_control_msg(udev,
++ 					usb_sndctrlpipe(udev, 0),
++ 					USB_REQ_SET_FEATURE, 0,
++ 					USB_DEVICE_B_HNP_ENABLE,
++ 					0, NULL, 0,
++ 					USB_CTRL_SET_TIMEOUT);
++ 			if (retval >= 0)
++ 				fsm->otg->host->b_hnp_enable = 1;
++ 		}
++ 		fsm->a_bus_req = 0;
++ 	} else if (state == OTG_STATE_B_HOST) {
++ 		fsm->b_bus_req = 0;
++ 	}
++ 
++ 	otg_statemachine(fsm);
++ }
++ 
++ static void otg_start_hnp_polling(struct otg_fsm *fsm)
++ {
++ 	/*
++ 	 * The memory of host_req_flag should be allocated by
++ 	 * controller driver, otherwise, hnp polling is not started.
++ 	 */
++ 	if (!fsm->host_req_flag)
++ 		return;
++ 
++ 	INIT_DELAYED_WORK(&fsm->hnp_polling_work, otg_hnp_polling_work);
++ 	schedule_delayed_work(&fsm->hnp_polling_work,
++ 					msecs_to_jiffies(T_HOST_REQ_POLL));
++ }
++ 
+  /* Called when entering a state */
+ -static int otg_set_state(struct otg_fsm *fsm, enum usb_otg_state new_state)
+ +int otg_set_state(struct otg_fsm *fsm, enum usb_otg_state new_state)
+  {
+  	state_changed = 1;
+ -	if (fsm->otg->state == new_state)
+ +	if (fsm->otg->phy->state == new_state)
+  		return 0;
+  	VDBG("Set state: %s\n", usb_otg_state_string(new_state));
+ -	otg_leave_state(fsm, fsm->otg->state);
+ +	otg_leave_state(fsm, fsm->otg->phy->state);
+  	switch (new_state) {
+  	case OTG_STATE_B_IDLE:
+  		otg_drv_vbus(fsm, 0);
+@@@ -187,8 -287,9 +278,14 @@@
+  		 * When HNP is triggered while a_bus_req = 0, a_host will
+  		 * suspend too fast to complete a_set_b_hnp_en
+  		 */
+++<<<<<<< HEAD:drivers/usb/phy/phy-fsm-usb.c
+ +		if (!fsm->a_bus_req || fsm->a_suspend_req)
+ +			otg_add_timer(fsm, a_wait_enum_tmr);
+++=======
++ 		if (!fsm->a_bus_req || fsm->a_suspend_req_inf)
++ 			otg_add_timer(fsm, A_WAIT_ENUM);
++ 		otg_start_hnp_polling(fsm);
+++>>>>>>> ae57e97a9521 (usb: common: otg-fsm: add HNP polling support):drivers/usb/common/usb-otg-fsm.c
+  		break;
+  	case OTG_STATE_A_SUSPEND:
+  		otg_drv_vbus(fsm, 1);
+diff --cc include/linux/usb/otg-fsm.h
+index c30a2e1d9e46,3059a9599f53..000000000000
+--- a/include/linux/usb/otg-fsm.h
++++ b/include/linux/usb/otg-fsm.h
+@@@ -41,6 -40,37 +41,40 @@@
+  #define PROTO_HOST	(1)
+  #define PROTO_GADGET	(2)
+  
+++<<<<<<< HEAD
+++=======
++ #define OTG_STS_SELECTOR	0xF000	/* OTG status selector, according to
++ 					 * OTG and EH 2.0 Chapter 6.2.3
++ 					 * Table:6-4
++ 					 */
++ 
++ #define HOST_REQUEST_FLAG	1	/* Host request flag, according to
++ 					 * OTG and EH 2.0 Charpter 6.2.3
++ 					 * Table:6-5
++ 					 */
++ 
++ #define T_HOST_REQ_POLL		(1500)	/* 1500ms, HNP polling interval */
++ 
++ enum otg_fsm_timer {
++ 	/* Standard OTG timers */
++ 	A_WAIT_VRISE,
++ 	A_WAIT_VFALL,
++ 	A_WAIT_BCON,
++ 	A_AIDL_BDIS,
++ 	B_ASE0_BRST,
++ 	A_BIDL_ADIS,
++ 
++ 	/* Auxiliary timers */
++ 	B_SE0_SRP,
++ 	B_SRP_FAIL,
++ 	A_WAIT_ENUM,
++ 	B_DATA_PLS,
++ 	B_SSEND_SRP,
++ 
++ 	NUM_OTG_FSM_TIMERS,
++ };
++ 
+++>>>>>>> ae57e97a9521 (usb: common: otg-fsm: add HNP polling support)
+  /* OTG state machine according to the OTG spec */
+  struct otg_fsm {
+  	/* Input */
+@@@ -86,7 -130,9 +120,13 @@@
+  
+  	/* Current usb protocol used: 0:undefine; 1:host; 2:client */
+  	int protocol;
+++<<<<<<< HEAD
+ +	spinlock_t lock;
+++=======
++ 	struct mutex lock;
++ 	u8 *host_req_flag;
++ 	struct delayed_work hnp_polling_work;
+++>>>>>>> ae57e97a9521 (usb: common: otg-fsm: add HNP polling support)
+  };
+  
+  struct otg_fsm_ops {
+* Unmerged path drivers/usb/phy/phy-fsm-usb.c
+* Unmerged path include/linux/usb/otg-fsm.h
