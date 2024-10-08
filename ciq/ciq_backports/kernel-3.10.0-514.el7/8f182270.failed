@@ -1,0 +1,185 @@
+mm/swap.c: flush lru pvecs on compound page arrival
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] swap: flush lru pvecs on compound page arrival (Jerome Marchand) [1341766 1343920]
+Rebuild_FUZZ: 94.85%
+commit-author Lukasz Odzioba <lukasz.odzioba@intel.com>
+commit 8f182270dfec432e93fae14f9208a6b9af01009f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8f182270.failed
+
+Currently we can have compound pages held on per cpu pagevecs, which
+leads to a lot of memory unavailable for reclaim when needed.  In the
+systems with hundreads of processors it can be GBs of memory.
+
+On of the way of reproducing the problem is to not call munmap
+explicitly on all mapped regions (i.e.  after receiving SIGTERM).  After
+that some pages (with THP enabled also huge pages) may end up on
+lru_add_pvec, example below.
+
+  void main() {
+  #pragma omp parallel
+  {
+	size_t size = 55 * 1000 * 1000; // smaller than  MEM/CPUS
+	void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS , -1, 0);
+	if (p != MAP_FAILED)
+		memset(p, 0, size);
+	//munmap(p, size); // uncomment to make the problem go away
+  }
+  }
+
+When we run it with THP enabled it will leave significant amount of
+memory on lru_add_pvec.  This memory will be not reclaimed if we hit
+OOM, so when we run above program in a loop:
+
+	for i in `seq 100`; do ./a.out; done
+
+many processes (95% in my case) will be killed by OOM.
+
+The primary point of the LRU add cache is to save the zone lru_lock
+contention with a hope that more pages will belong to the same zone and
+so their addition can be batched.  The huge page is already a form of
+batched addition (it will add 512 worth of memory in one go) so skipping
+the batching seems like a safer option when compared to a potential
+excess in the caching which can be quite large and much harder to fix
+because lru_add_drain_all is way to expensive and it is not really clear
+what would be a good moment to call it.
+
+Similarly we can reproduce the problem on lru_deactivate_pvec by adding:
+madvise(p, size, MADV_FREE); after memset.
+
+This patch flushes lru pvecs on compound page arrival making the problem
+less severe - after applying it kill rate of above example drops to 0%,
+due to reducing maximum amount of memory held on pvec from 28MB (with
+THP) to 56kB per CPU.
+
+	Suggested-by: Michal Hocko <mhocko@suse.com>
+Link: http://lkml.kernel.org/r/1466180198-18854-1-git-send-email-lukasz.odzioba@intel.com
+	Signed-off-by: Lukasz Odzioba <lukasz.odzioba@intel.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Kirill Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Ming Li <mingli199x@qq.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8f182270dfec432e93fae14f9208a6b9af01009f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap.c
+diff --cc mm/swap.c
+index b4d20d204074,90530ff8ed16..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -471,10 -239,10 +471,15 @@@ void rotate_reclaimable_page(struct pag
+  		struct pagevec *pvec;
+  		unsigned long flags;
+  
+ -		get_page(page);
+ +		page_cache_get(page);
+  		local_irq_save(flags);
+++<<<<<<< HEAD
+ +		pvec = &__get_cpu_var(lru_rotate_pvecs);
+ +		if (!pagevec_add(pvec, page))
+++=======
++ 		pvec = this_cpu_ptr(&lru_rotate_pvecs);
++ 		if (!pagevec_add(pvec, page) || PageCompound(page))
+++>>>>>>> 8f182270dfec (mm/swap.c: flush lru pvecs on compound page arrival)
+  			pagevec_move_tail(pvec);
+  		local_irq_restore(flags);
+  	}
+@@@ -529,8 -295,8 +534,13 @@@ void activate_page(struct page *page
+  	if (PageLRU(page) && !PageActive(page) && !PageUnevictable(page)) {
+  		struct pagevec *pvec = &get_cpu_var(activate_page_pvecs);
+  
+++<<<<<<< HEAD
+ +		page_cache_get(page);
+ +		if (!pagevec_add(pvec, page))
+++=======
++ 		get_page(page);
++ 		if (!pagevec_add(pvec, page) || PageCompound(page))
+++>>>>>>> 8f182270dfec (mm/swap.c: flush lru pvecs on compound page arrival)
+  			pagevec_lru_move_fn(pvec, __activate_page, NULL);
+  		put_cpu_var(activate_page_pvecs);
+  	}
+@@@ -624,13 -390,30 +634,17 @@@ void __lru_cache_add(struct page *page
+  {
+  	struct pagevec *pvec = &get_cpu_var(lru_add_pvec);
+  
+++<<<<<<< HEAD
+ +	page_cache_get(page);
+ +	if (!pagevec_space(pvec))
+++=======
++ 	get_page(page);
++ 	if (!pagevec_add(pvec, page) || PageCompound(page))
+++>>>>>>> 8f182270dfec (mm/swap.c: flush lru pvecs on compound page arrival)
+  		__pagevec_lru_add(pvec);
+- 	pagevec_add(pvec, page);
+  	put_cpu_var(lru_add_pvec);
+  }
+ -
+ -/**
+ - * lru_cache_add: add a page to the page lists
+ - * @page: the page to add
+ - */
+ -void lru_cache_add_anon(struct page *page)
+ -{
+ -	if (PageActive(page))
+ -		ClearPageActive(page);
+ -	__lru_cache_add(page);
+ -}
+ -
+ -void lru_cache_add_file(struct page *page)
+ -{
+ -	if (PageActive(page))
+ -		ClearPageActive(page);
+ -	__lru_cache_add(page);
+ -}
+ -EXPORT_SYMBOL(lru_cache_add_file);
+ +EXPORT_SYMBOL(__lru_cache_add);
+  
+  /**
+   * lru_cache_add - add a page to a page list
+@@@ -781,9 -625,29 +795,35 @@@ void deactivate_page(struct page *page
+  		return;
+  
+  	if (likely(get_page_unless_zero(page))) {
+++<<<<<<< HEAD
+ +		struct pagevec *pvec = &get_cpu_var(lru_deactivate_pvecs);
+ +
+ +		if (!pagevec_add(pvec, page))
+++=======
++ 		struct pagevec *pvec = &get_cpu_var(lru_deactivate_file_pvecs);
++ 
++ 		if (!pagevec_add(pvec, page) || PageCompound(page))
++ 			pagevec_lru_move_fn(pvec, lru_deactivate_file_fn, NULL);
++ 		put_cpu_var(lru_deactivate_file_pvecs);
++ 	}
++ }
++ 
++ /**
++  * deactivate_page - deactivate a page
++  * @page: page to deactivate
++  *
++  * deactivate_page() moves @page to the inactive list if @page was on the active
++  * list and was not an unevictable page.  This is done to accelerate the reclaim
++  * of @page.
++  */
++ void deactivate_page(struct page *page)
++ {
++ 	if (PageLRU(page) && PageActive(page) && !PageUnevictable(page)) {
++ 		struct pagevec *pvec = &get_cpu_var(lru_deactivate_pvecs);
++ 
++ 		get_page(page);
++ 		if (!pagevec_add(pvec, page) || PageCompound(page))
+++>>>>>>> 8f182270dfec (mm/swap.c: flush lru pvecs on compound page arrival)
+  			pagevec_lru_move_fn(pvec, lru_deactivate_fn, NULL);
+  		put_cpu_var(lru_deactivate_pvecs);
+  	}
+* Unmerged path mm/swap.c
