@@ -1,0 +1,105 @@
+sched/numa: Do statistics calculation using local variables only
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Rik van Riel <riel@redhat.com>
+commit 35664fd41e1c8cc4f0b89f6a51db5af39ba50640
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/35664fd4.failed
+
+The current code in task_numa_placement calculates the difference
+between the old and the new value, but also temporarily stores half
+of the old value in the per-process variables.
+
+The NUMA balancing code looks at those per-process variables, and
+having other tasks temporarily see halved statistics could lead to
+unwanted numa migrations. This can be avoided by doing all the math
+in local variables.
+
+This change also simplifies the code a little.
+
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Chegu Vinod <chegu_vinod@hp.com>
+Link: http://lkml.kernel.org/r/1390860228-21539-8-git-send-email-riel@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 35664fd41e1c8cc4f0b89f6a51db5af39ba50640)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index c33e42bc435b,4c449907a10e..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -852,16 -1494,57 +852,54 @@@ static void task_numa_placement(struct 
+  	p->numa_scan_seq = seq;
+  	p->numa_scan_period_max = task_scan_max(p);
+  
+ -	total_faults = p->numa_faults_locality[0] +
+ -		       p->numa_faults_locality[1];
+ -	runtime = numa_get_avg_runtime(p, &period);
+ -
+ -	/* If the task is part of a group prevent parallel updates to group stats */
+ -	if (p->numa_group) {
+ -		group_lock = &p->numa_group->lock;
+ -		spin_lock(group_lock);
+ -	}
+ -
+  	/* Find the node with the highest number of faults */
+  	for_each_online_node(nid) {
+ -		unsigned long faults = 0, group_faults = 0;
+ -		int priv, i;
+ -
+ +		unsigned long faults;
+ +
+++<<<<<<< HEAD
+ +		/* Decay existing window and copy faults since last scan */
+ +		p->numa_faults[nid] >>= 1;
+ +		p->numa_faults[nid] += p->numa_faults_buffer[nid];
+ +		p->numa_faults_buffer[nid] = 0;
+++=======
++ 		for (priv = 0; priv < 2; priv++) {
++ 			long diff, f_diff, f_weight;
++ 
++ 			i = task_faults_idx(nid, priv);
++ 
++ 			/* Decay existing window, copy faults since last scan */
++ 			diff = p->numa_faults_buffer_memory[i] - p->numa_faults_memory[i] / 2;
++ 			fault_types[priv] += p->numa_faults_buffer_memory[i];
++ 			p->numa_faults_buffer_memory[i] = 0;
++ 
++ 			/*
++ 			 * Normalize the faults_from, so all tasks in a group
++ 			 * count according to CPU use, instead of by the raw
++ 			 * number of faults. Tasks with little runtime have
++ 			 * little over-all impact on throughput, and thus their
++ 			 * faults are less important.
++ 			 */
++ 			f_weight = div64_u64(runtime << 16, period + 1);
++ 			f_weight = (f_weight * p->numa_faults_buffer_cpu[i]) /
++ 				   (total_faults + 1);
++ 			f_diff = f_weight - p->numa_faults_cpu[i] / 2;
++ 			p->numa_faults_buffer_cpu[i] = 0;
++ 
++ 			p->numa_faults_memory[i] += diff;
++ 			p->numa_faults_cpu[i] += f_diff;
++ 			faults += p->numa_faults_memory[i];
++ 			p->total_numa_faults += diff;
++ 			if (p->numa_group) {
++ 				/* safe because we can only change our own group */
++ 				p->numa_group->faults[i] += diff;
++ 				p->numa_group->faults_cpu[i] += f_diff;
++ 				p->numa_group->total_faults += diff;
++ 				group_faults += p->numa_group->faults[i];
++ 			}
++ 		}
+++>>>>>>> 35664fd41e1c (sched/numa: Do statistics calculation using local variables only)
+  
+ +		faults = p->numa_faults[nid];
+  		if (faults > max_faults) {
+  			max_faults = faults;
+  			max_nid = nid;
+* Unmerged path kernel/sched/fair.c
