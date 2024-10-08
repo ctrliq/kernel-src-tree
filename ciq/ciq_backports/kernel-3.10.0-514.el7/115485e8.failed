@@ -1,0 +1,124 @@
+dm: add 'dm_numa_node' module parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 115485e83f497fdf9b4bf779038cfe4e141292a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/115485e8.failed
+
+Allows user to control which NUMA node the memory for DM device
+structures (e.g. mapped_device, request_queue, gendisk, blk_mq_tag_set)
+is allocated from.
+
+Defaults to NUMA_NO_NODE (-1).  Allowable range is from -1 until the
+last online NUMA node id.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 115485e83f497fdf9b4bf779038cfe4e141292a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index 511a3a6992f6,cc9ab343730d..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -2417,7 -2352,9 +2449,8 @@@ static struct mapped_device *alloc_dev(
+  	if (r < 0)
+  		goto bad_io_barrier;
+  
++ 	md->numa_node_id = numa_node_id;
+  	md->use_blk_mq = use_blk_mq;
+ -	md->init_tio_pdu = false;
+  	md->type = DM_TYPE_NONE;
+  	mutex_init(&md->suspend_lock);
+  	mutex_init(&md->type_lock);
+@@@ -2431,15 -2368,15 +2464,15 @@@
+  	INIT_LIST_HEAD(&md->table_devices);
+  	spin_lock_init(&md->uevent_lock);
+  
+- 	md->queue = blk_alloc_queue(GFP_KERNEL);
++ 	md->queue = blk_alloc_queue_node(GFP_KERNEL, numa_node_id);
+  	if (!md->queue)
+ -		goto bad;
+ +		goto bad_queue;
+  
+  	dm_init_md_queue(md);
+  
+- 	md->disk = alloc_disk(1);
++ 	md->disk = alloc_disk_node(1, numa_node_id);
+  	if (!md->disk)
+ -		goto bad;
+ +		goto bad_disk;
+  
+  	atomic_set(&md->pending[0], 0);
+  	atomic_set(&md->pending[1], 0);
+@@@ -2909,24 -2757,34 +2942,46 @@@ static int dm_init_request_based_blk_mq
+  	struct request_queue *q;
+  	int err;
+  
+ -	if (dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) {
+ -		DMERR("request-based dm-mq may only be stacked on blk-mq device(s)");
+ -		return -EINVAL;
+ -	}
+ -
+ +	memset(&md->tag_set, 0, sizeof(md->tag_set));
+ +	md->tag_set.ops = &dm_mq_ops;
+ +	md->tag_set.queue_depth = dm_get_blk_mq_queue_depth();
+ +	md->tag_set.numa_node = NUMA_NO_NODE;
+ +	md->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
+ +	md->tag_set.nr_hw_queues = dm_get_blk_mq_nr_hw_queues();
+ +	if (md_type == DM_TYPE_REQUEST_BASED) {
+ +		/* make the memory for non-blk-mq clone part of the pdu */
+ +		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io) + sizeof(struct request);
+ +	} else
+ +		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io);
+ +	md->tag_set.driver_data = md;
+ +
+++<<<<<<< HEAD
+ +	err = blk_mq_alloc_tag_set(&md->tag_set);
+++=======
++ 	md->tag_set = kzalloc_node(sizeof(struct blk_mq_tag_set), GFP_KERNEL, md->numa_node_id);
++ 	if (!md->tag_set)
++ 		return -ENOMEM;
++ 
++ 	md->tag_set->ops = &dm_mq_ops;
++ 	md->tag_set->queue_depth = dm_get_blk_mq_queue_depth();
++ 	md->tag_set->numa_node = md->numa_node_id;
++ 	md->tag_set->flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
++ 	md->tag_set->nr_hw_queues = dm_get_blk_mq_nr_hw_queues();
++ 	md->tag_set->driver_data = md;
++ 
++ 	md->tag_set->cmd_size = sizeof(struct dm_rq_target_io);
++ 	if (immutable_tgt && immutable_tgt->per_io_data_size) {
++ 		/* any target-specific per-io data is immediately after the tio */
++ 		md->tag_set->cmd_size += immutable_tgt->per_io_data_size;
++ 		md->init_tio_pdu = true;
++ 	}
++ 
++ 	err = blk_mq_alloc_tag_set(md->tag_set);
+++>>>>>>> 115485e83f49 (dm: add 'dm_numa_node' module parameter)
+  	if (err)
+ -		goto out_kfree_tag_set;
+ +		return err;
+  
+ -	q = blk_mq_init_allocated_queue(md->tag_set, md->queue);
+ +	q = blk_mq_init_allocated_queue(&md->tag_set, md->queue);
+  	if (IS_ERR(q)) {
+  		err = PTR_ERR(q);
+  		goto out_tag_set;
+@@@ -3674,9 -3529,9 +3729,9 @@@ int dm_noflush_suspending(struct dm_tar
+  EXPORT_SYMBOL_GPL(dm_noflush_suspending);
+  
+  struct dm_md_mempools *dm_alloc_md_mempools(struct mapped_device *md, unsigned type,
+ -					    unsigned integrity, unsigned per_io_data_size)
+ +					    unsigned integrity, unsigned per_bio_data_size)
+  {
+- 	struct dm_md_mempools *pools = kzalloc(sizeof(*pools), GFP_KERNEL);
++ 	struct dm_md_mempools *pools = kzalloc_node(sizeof(*pools), GFP_KERNEL, md->numa_node_id);
+  	struct kmem_cache *cachep = NULL;
+  	unsigned int pool_size = 0;
+  	unsigned int front_pad;
+* Unmerged path drivers/md/dm.c
