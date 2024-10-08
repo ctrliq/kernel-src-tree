@@ -1,0 +1,326 @@
+cxgb4/iw_cxgb4: work request logging feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [infiniband] cxgb4: work request logging feature (Sai Vemuri) [1124947]
+Rebuild_FUZZ: 88.61%
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 7730b4c7e32c0ab4d7db746a9c3a84cf715161fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/7730b4c7.failed
+
+This commit enhances the iwarp driver to optionally keep a log of rdma
+work request timining data for kernel mode QPs.  If iw_cxgb4 module option
+c4iw_wr_log is set to non-zero, each work request is tracked and timing
+data maintained in a rolling log that is 4096 entries deep by default.
+Module option c4iw_wr_log_size_order allows specifing a log2 size to use
+instead of the default order of 12 (4096 entries). Both module options
+are read-only and must be passed in at module load time to set them. IE:
+
+modprobe iw_cxgb4 c4iw_wr_log=1 c4iw_wr_log_size_order=10
+
+The timing data is viewable via the iw_cxgb4 debugfs file "wr_log".
+Writing anything to this file will clear all the timing data.
+Data tracked includes:
+
+- The host time when the work request was posted, just before ringing
+the doorbell.  The host time when the completion was polled by the
+application.  This is also the time the log entry is created.  The delta
+of these two times is the amount of time took processing the work request.
+
+- The qid of the EQ used to post the work request.
+
+- The work request opcode.
+
+- The cqe wr_id field.  For sq completions requests this is the swsqe
+index.  For recv completions this is the MSN of the ingress SEND.
+This value can be used to match log entries from this log with firmware
+flowc event entries.
+
+- The sge timestamp value just before ringing the doorbell when
+posting,  the sge timestamp value just after polling the completion,
+and CQE.timestamp field from the completion itself.  With these three
+timestamps we can track the latency from post to poll, and the amount
+of time the completion resided in the CQ before being reaped by the
+application.  With debug firmware, the sge timestamp is also logged by
+firmware in its flowc history so that we can compute the latency from
+posting the work request until the firmware sees it.
+
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7730b4c7e32c0ab4d7db746a9c3a84cf715161fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/device.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+diff --cc drivers/infiniband/hw/cxgb4/device.c
+index 2b0fdad02d90,df1f1b52c7ec..000000000000
+--- a/drivers/infiniband/hw/cxgb4/device.c
++++ b/drivers/infiniband/hw/cxgb4/device.c
+@@@ -697,7 -843,16 +823,20 @@@ static int c4iw_rdev_open(struct c4iw_r
+  		pr_err(MOD "error allocating status page\n");
+  		goto err4;
+  	}
+++<<<<<<< HEAD
+ +	rdev->status_page->db_off = 0;
+++=======
++ 	if (c4iw_wr_log) {
++ 		rdev->wr_log = kzalloc((1 << c4iw_wr_log_size_order) *
++ 				       sizeof(*rdev->wr_log), GFP_KERNEL);
++ 		if (rdev->wr_log) {
++ 			rdev->wr_log_size = 1 << c4iw_wr_log_size_order;
++ 			atomic_set(&rdev->wr_log_idx, 0);
++ 		} else {
++ 			pr_err(MOD "error allocating wr_log. Logging disabled\n");
++ 		}
++ 	}
+++>>>>>>> 7730b4c7e32c (cxgb4/iw_cxgb4: work request logging feature)
+  	return 0;
+  err4:
+  	c4iw_rqtpool_destroy(rdev);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 56abf6bc051c,9c7e4f0a7683..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -3596,6 -3832,85 +3596,88 @@@ void cxgb4_enable_db_coalescing(struct 
+  }
+  EXPORT_SYMBOL(cxgb4_enable_db_coalescing);
+  
+++<<<<<<< HEAD
+++=======
++ int cxgb4_read_tpte(struct net_device *dev, u32 stag, __be32 *tpte)
++ {
++ 	struct adapter *adap;
++ 	u32 offset, memtype, memaddr;
++ 	u32 edc0_size, edc1_size, mc0_size, mc1_size;
++ 	u32 edc0_end, edc1_end, mc0_end, mc1_end;
++ 	int ret;
++ 
++ 	adap = netdev2adap(dev);
++ 
++ 	offset = ((stag >> 8) * 32) + adap->vres.stag.start;
++ 
++ 	/* Figure out where the offset lands in the Memory Type/Address scheme.
++ 	 * This code assumes that the memory is laid out starting at offset 0
++ 	 * with no breaks as: EDC0, EDC1, MC0, MC1. All cards have both EDC0
++ 	 * and EDC1.  Some cards will have neither MC0 nor MC1, most cards have
++ 	 * MC0, and some have both MC0 and MC1.
++ 	 */
++ 	edc0_size = EDRAM_SIZE_GET(t4_read_reg(adap, MA_EDRAM0_BAR)) << 20;
++ 	edc1_size = EDRAM_SIZE_GET(t4_read_reg(adap, MA_EDRAM1_BAR)) << 20;
++ 	mc0_size = EXT_MEM_SIZE_GET(t4_read_reg(adap, MA_EXT_MEMORY_BAR)) << 20;
++ 
++ 	edc0_end = edc0_size;
++ 	edc1_end = edc0_end + edc1_size;
++ 	mc0_end = edc1_end + mc0_size;
++ 
++ 	if (offset < edc0_end) {
++ 		memtype = MEM_EDC0;
++ 		memaddr = offset;
++ 	} else if (offset < edc1_end) {
++ 		memtype = MEM_EDC1;
++ 		memaddr = offset - edc0_end;
++ 	} else {
++ 		if (offset < mc0_end) {
++ 			memtype = MEM_MC0;
++ 			memaddr = offset - edc1_end;
++ 		} else if (is_t4(adap->params.chip)) {
++ 			/* T4 only has a single memory channel */
++ 			goto err;
++ 		} else {
++ 			mc1_size = EXT_MEM_SIZE_GET(
++ 					t4_read_reg(adap,
++ 						    MA_EXT_MEMORY1_BAR)) << 20;
++ 			mc1_end = mc0_end + mc1_size;
++ 			if (offset < mc1_end) {
++ 				memtype = MEM_MC1;
++ 				memaddr = offset - mc0_end;
++ 			} else {
++ 				/* offset beyond the end of any memory */
++ 				goto err;
++ 			}
++ 		}
++ 	}
++ 
++ 	spin_lock(&adap->win0_lock);
++ 	ret = t4_memory_rw(adap, 0, memtype, memaddr, 32, tpte, T4_MEMORY_READ);
++ 	spin_unlock(&adap->win0_lock);
++ 	return ret;
++ 
++ err:
++ 	dev_err(adap->pdev_dev, "stag %#x, offset %#x out of range\n",
++ 		stag, offset);
++ 	return -EINVAL;
++ }
++ EXPORT_SYMBOL(cxgb4_read_tpte);
++ 
++ u64 cxgb4_read_sge_timestamp(struct net_device *dev)
++ {
++ 	u32 hi, lo;
++ 	struct adapter *adap;
++ 
++ 	adap = netdev2adap(dev);
++ 	lo = t4_read_reg(adap, SGE_TIMESTAMP_LO);
++ 	hi = GET_TSVAL(t4_read_reg(adap, SGE_TIMESTAMP_HI));
++ 
++ 	return ((u64)hi << 32) | (u64)lo;
++ }
++ EXPORT_SYMBOL(cxgb4_read_sge_timestamp);
++ 
+++>>>>>>> 7730b4c7e32c (cxgb4/iw_cxgb4: work request logging feature)
+  static struct pci_driver cxgb4_driver;
+  
+  static void check_neigh_update(struct neighbour *neigh)
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index eb3f2934a704,79a84de1d204..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@@ -291,5 -297,7 +292,10 @@@ int cxgb4_sync_txq_pidx(struct net_devi
+  int cxgb4_flush_eq_cache(struct net_device *dev);
+  void cxgb4_disable_db_coalescing(struct net_device *dev);
+  void cxgb4_enable_db_coalescing(struct net_device *dev);
+++<<<<<<< HEAD
+++=======
++ int cxgb4_read_tpte(struct net_device *dev, u32 stag, __be32 *tpte);
++ u64 cxgb4_read_sge_timestamp(struct net_device *dev);
+++>>>>>>> 7730b4c7e32c (cxgb4/iw_cxgb4: work request logging feature)
+  
+  #endif  /* !__CXGB4_OFLD_H */
+diff --git a/drivers/infiniband/hw/cxgb4/cq.c b/drivers/infiniband/hw/cxgb4/cq.c
+index f04a838b65c7..de9bcf2e6d30 100644
+--- a/drivers/infiniband/hw/cxgb4/cq.c
++++ b/drivers/infiniband/hw/cxgb4/cq.c
+@@ -633,11 +633,15 @@ proc_cqe:
+ 		wq->sq.cidx = (uint16_t)idx;
+ 		PDBG("%s completing sq idx %u\n", __func__, wq->sq.cidx);
+ 		*cookie = wq->sq.sw_sq[wq->sq.cidx].wr_id;
++		if (c4iw_wr_log)
++			c4iw_log_wr_stats(wq, hw_cqe);
+ 		t4_sq_consume(wq);
+ 	} else {
+ 		PDBG("%s completing rq idx %u\n", __func__, wq->rq.cidx);
+ 		*cookie = wq->rq.sw_rq[wq->rq.cidx].wr_id;
+ 		BUG_ON(t4_rq_empty(wq));
++		if (c4iw_wr_log)
++			c4iw_log_wr_stats(wq, hw_cqe);
+ 		t4_rq_consume(wq);
+ 		goto skip_cqe;
+ 	}
+* Unmerged path drivers/infiniband/hw/cxgb4/device.c
+diff --git a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index c1bfc0b9f560..e5680c2b3e1b 100644
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -150,6 +150,18 @@ struct c4iw_hw_queue {
+ 	int t4_stat_len;
+ };
+ 
++struct wr_log_entry {
++	struct timespec post_host_ts;
++	struct timespec poll_host_ts;
++	u64 post_sge_ts;
++	u64 cqe_sge_ts;
++	u64 poll_sge_ts;
++	u16 qid;
++	u16 wr_id;
++	u8 opcode;
++	u8 valid;
++};
++
+ struct c4iw_rdev {
+ 	struct c4iw_resource resource;
+ 	unsigned long qpshift;
+@@ -169,6 +181,9 @@ struct c4iw_rdev {
+ 	struct c4iw_stats stats;
+ 	struct c4iw_hw_queue hw_queue;
+ 	struct t4_dev_status_page *status_page;
++	atomic_t wr_log_idx;
++	struct wr_log_entry *wr_log;
++	int wr_log_size;
+ };
+ 
+ static inline int c4iw_fatal_error(struct c4iw_rdev *rdev)
+@@ -1009,6 +1024,8 @@ void c4iw_ev_dispatch(struct c4iw_dev *dev, struct t4_cqe *err_cqe);
+ 
+ extern struct cxgb4_client t4c_client;
+ extern c4iw_handler_func c4iw_handlers[NUM_CPL_CMDS];
++extern void c4iw_log_wr_stats(struct t4_wq *wq, struct t4_cqe *cqe);
++extern int c4iw_wr_log;
+ extern int db_fc_threshold;
+ extern int db_coalescing_threshold;
+ extern int use_dsgl;
+diff --git a/drivers/infiniband/hw/cxgb4/qp.c b/drivers/infiniband/hw/cxgb4/qp.c
+index 988d317c6a74..78b124b742be 100644
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@ -822,6 +822,11 @@ int c4iw_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 				  qhp->sq_sig_all;
+ 		swsqe->flushed = 0;
+ 		swsqe->wr_id = wr->wr_id;
++		if (c4iw_wr_log) {
++			swsqe->sge_ts = cxgb4_read_sge_timestamp(
++					qhp->rhp->rdev.lldi.ports[0]);
++			getnstimeofday(&swsqe->host_ts);
++		}
+ 
+ 		init_wr_hdr(wqe, qhp->wq.sq.pidx, fw_opcode, fw_flags, len16);
+ 
+@@ -885,6 +890,13 @@ int c4iw_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+ 		}
+ 
+ 		qhp->wq.rq.sw_rq[qhp->wq.rq.pidx].wr_id = wr->wr_id;
++		if (c4iw_wr_log) {
++			qhp->wq.rq.sw_rq[qhp->wq.rq.pidx].sge_ts =
++				cxgb4_read_sge_timestamp(
++						qhp->rhp->rdev.lldi.ports[0]);
++			getnstimeofday(
++				&qhp->wq.rq.sw_rq[qhp->wq.rq.pidx].host_ts);
++		}
+ 
+ 		wqe->recv.opcode = FW_RI_RECV_WR;
+ 		wqe->recv.r1 = 0;
+diff --git a/drivers/infiniband/hw/cxgb4/t4.h b/drivers/infiniband/hw/cxgb4/t4.h
+index fdfb5cdcc1c7..da6fe9b13026 100644
+--- a/drivers/infiniband/hw/cxgb4/t4.h
++++ b/drivers/infiniband/hw/cxgb4/t4.h
+@@ -262,6 +262,8 @@ struct t4_swsqe {
+ 	int			signaled;
+ 	u16			idx;
+ 	int                     flushed;
++	struct timespec         host_ts;
++	u64                     sge_ts;
+ };
+ 
+ static inline pgprot_t t4_pgprot_wc(pgprot_t prot)
+@@ -299,6 +301,8 @@ struct t4_sq {
+ 
+ struct t4_swrqe {
+ 	u64 wr_id;
++	struct timespec host_ts;
++	u64 sge_ts;
+ };
+ 
+ struct t4_rq {
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+index 6b79c3371772..982f11a1c8d8 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+@@ -251,6 +251,12 @@
+ #define V_NOCOALESCE(x) ((x) << S_NOCOALESCE)
+ #define F_NOCOALESCE    V_NOCOALESCE(1U)
+ 
++#define SGE_TIMESTAMP_LO 0x1098
++#define SGE_TIMESTAMP_HI 0x109c
++#define S_TSVAL    0
++#define M_TSVAL    0xfffffffU
++#define GET_TSVAL(x) (((x) >> S_TSVAL) & M_TSVAL)
++
+ #define SGE_TIMER_VALUE_0_AND_1 0x10b8
+ #define  TIMERVALUE0_MASK   0xffff0000U
+ #define  TIMERVALUE0_SHIFT  16
