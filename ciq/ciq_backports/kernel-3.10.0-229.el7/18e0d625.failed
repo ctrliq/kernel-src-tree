@@ -1,0 +1,143 @@
+qlcnic: Optimize ring count validations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Shahed Shaikh <shahed.shaikh@qlogic.com>
+commit 18e0d625336a7690dcb358e2f4157becfa65183b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/18e0d625.failed
+
+- Check interrupt mode at the start of qlcnic_set_channels().
+- Do not validate ring count if they are not going to change.
+
+	Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 18e0d625336a7690dcb358e2f4157becfa65183b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+index f7b72258d28d,1b7f3dbae289..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+@@@ -698,27 -725,48 +698,55 @@@ static int qlcnic_set_channels(struct n
+  {
+  	struct qlcnic_adapter *adapter = netdev_priv(dev);
+  	int err;
+ +	int txq = 0;
+  
++ 	if (!(adapter->flags & QLCNIC_MSIX_ENABLED)) {
++ 		netdev_err(dev, "No RSS/TSS support in non MSI-X mode\n");
++ 		return -EINVAL;
++ 	}
++ 
+  	if (channel->other_count || channel->combined_count)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (channel->rx_count) {
+ +		err = qlcnic_validate_max_rss(adapter, channel->rx_count);
+ +		if (err)
+++=======
++ 	err = qlcnic_validate_ring_count(adapter, channel->rx_count,
++ 					 channel->tx_count);
++ 	if (err)
++ 		return err;
++ 
++ 	if (adapter->drv_sds_rings != channel->rx_count) {
++ 		err = qlcnic_validate_rings(adapter, channel->rx_count,
++ 					    QLCNIC_RX_QUEUE);
++ 		if (err) {
++ 			netdev_err(dev, "Unable to configure %u SDS rings\n",
++ 				   channel->rx_count);
+++>>>>>>> 18e0d625336a (qlcnic: Optimize ring count validations)
+  			return err;
+ -		}
+ -		adapter->drv_rss_rings = channel->rx_count;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (qlcnic_82xx_check(adapter) && channel->tx_count) {
+ +		err = qlcnic_validate_max_tx_rings(adapter, channel->tx_count);
+ +		if (err)
+++=======
++ 	if (adapter->drv_tx_rings != channel->tx_count) {
++ 		err = qlcnic_validate_rings(adapter, channel->tx_count,
++ 					    QLCNIC_TX_QUEUE);
++ 		if (err) {
++ 			netdev_err(dev, "Unable to configure %u Tx rings\n",
++ 				   channel->tx_count);
+++>>>>>>> 18e0d625336a (qlcnic: Optimize ring count validations)
+  			return err;
+ -		}
+ -		adapter->drv_tss_rings = channel->tx_count;
+ +		txq = channel->tx_count;
+  	}
+  
+ -	adapter->flags |= QLCNIC_TSS_RSS;
+ -
+ -	err = qlcnic_setup_rings(adapter);
+ -	netdev_info(dev, "Allocated %d SDS rings and %d Tx rings\n",
+ -		    adapter->drv_sds_rings, adapter->drv_tx_rings);
+ -
+ +	err = qlcnic_set_max_rss(adapter, channel->rx_count, txq);
+ +	netdev_info(dev, "allocated 0x%x sds rings and  0x%x tx rings\n",
+ +		    adapter->max_sds_rings, adapter->max_drv_tx_rings);
+  	return err;
+  }
+  
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index ccf682b59be0,4fc186713b66..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@@ -3680,24 -3985,27 +3680,40 @@@ qlcnicvf_start_firmware(struct qlcnic_a
+  	return err;
+  }
+  
+ -int qlcnic_validate_rings(struct qlcnic_adapter *adapter, __u32 ring_cnt,
+ -			  int queue_type)
+ +int qlcnic_validate_max_tx_rings(struct qlcnic_adapter *adapter, u32 txq)
+  {
+  	struct net_device *netdev = adapter->netdev;
+ -	u8 max_hw_rings = 0;
+ -	char buf[8];
+ -	int cur_rings;
+ +	u8 max_hw = QLCNIC_MAX_TX_RINGS;
+ +	u32 max_allowed;
+ +
+++<<<<<<< HEAD
+ +	if (!qlcnic_use_msi_x && !qlcnic_use_msi) {
+ +		netdev_err(netdev, "No Multi TX-Q support in INT-x mode\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (!qlcnic_check_multi_tx(adapter)) {
+ +		netdev_err(netdev, "No Multi TX-Q support\n");
+ +		return -EINVAL;
+ +	}
+  
+ +	if (txq > QLCNIC_MAX_TX_RINGS) {
+ +		netdev_err(netdev, "Invalid ring count\n");
+++=======
++ 	if (queue_type == QLCNIC_RX_QUEUE) {
++ 		max_hw_rings = adapter->max_sds_rings;
++ 		cur_rings = adapter->drv_sds_rings;
++ 		strcpy(buf, "SDS");
++ 	} else if (queue_type == QLCNIC_TX_QUEUE) {
++ 		max_hw_rings = adapter->max_tx_rings;
++ 		cur_rings = adapter->drv_tx_rings;
++ 		strcpy(buf, "Tx");
++ 	}
++ 
++ 	if (!is_power_of_2(ring_cnt)) {
++ 		netdev_err(netdev, "%s rings value should be a power of 2\n",
++ 			   buf);
+++>>>>>>> 18e0d625336a (qlcnic: Optimize ring count validations)
+  		return -EINVAL;
+  	}
+  
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
