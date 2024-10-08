@@ -1,0 +1,291 @@
+bonding: alb: convert to bond->mode_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit 4bab16d7c97498e91564231b922d49f52efaf7d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4bab16d7.failed
+
+The ALB/TLB specific spinlocks are no longer necessary as we now have
+bond->mode_lock for this purpose, so convert them and remove them from
+struct alb_bond_info.
+Also remove the unneeded lock/unlock functions and use spin_lock/unlock
+directly.
+
+	Suggested-by: Jay Vosburgh <jay.vosburgh@canonical.com>
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4bab16d7c97498e91564231b922d49f52efaf7d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+diff --cc drivers/net/bonding/bond_alb.c
+index 06a8df1ef842,876b97fb55e9..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -200,13 -179,18 +179,21 @@@ static int tlb_initialize(struct bondin
+  static void tlb_deinitialize(struct bonding *bond)
+  {
+  	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct tlb_up_slave *arr;
+  
+- 	_lock_tx_hashtbl_bh(bond);
++ 	spin_lock_bh(&bond->mode_lock);
+  
+  	kfree(bond_info->tx_hashtbl);
+  	bond_info->tx_hashtbl = NULL;
+  
+++<<<<<<< HEAD
+ +	_unlock_tx_hashtbl_bh(bond);
+++=======
++ 	spin_unlock_bh(&bond->mode_lock);
++ 
++ 	arr = rtnl_dereference(bond_info->slave_arr);
++ 	if (arr)
++ 		kfree_rcu(arr, rcu);
+++>>>>>>> 4bab16d7c974 (bonding: alb: convert to bond->mode_lock)
+  }
+  
+  static long long compute_gap(struct slave *slave)
+@@@ -469,14 -469,10 +436,14 @@@ static void rlb_clear_slave(struct bond
+  		}
+  	}
+  
+- 	_unlock_rx_hashtbl_bh(bond);
++ 	spin_unlock_bh(&bond->mode_lock);
+  
+ -	if (slave != rtnl_dereference(bond->curr_active_slave))
+ +	write_lock_bh(&bond->curr_slave_lock);
+ +
+ +	if (slave != bond->curr_active_slave)
+  		rlb_teach_disabled_mac_on_primary(bond, slave->dev->dev_addr);
+ +
+ +	write_unlock_bh(&bond->curr_slave_lock);
+  }
+  
+  static void rlb_update_client(struct rlb_client_info *client_info)
+@@@ -623,8 -615,10 +589,8 @@@ static struct slave *rlb_choose_channel
+  	struct rlb_client_info *client_info;
+  	u32 hash_index = 0;
+  
+- 	_lock_rx_hashtbl(bond);
++ 	spin_lock(&bond->mode_lock);
+  
+ -	curr_active_slave = rcu_dereference(bond->curr_active_slave);
+ -
+  	hash_index = _simple_hash((u8 *)&arp->ip_dst, sizeof(arp->ip_dst));
+  	client_info = &(bond_info->rx_hashtbl[hash_index]);
+  
+@@@ -781,10 -774,9 +747,14 @@@ static void rlb_rebalance(struct bondin
+  	}
+  
+  	/* update the team's flag only after the whole iteration */
+ -	if (ntt)
+ +	if (ntt) {
+  		bond_info->rx_ntt = 1;
+++<<<<<<< HEAD
+ +	}
+ +	_unlock_rx_hashtbl_bh(bond);
+++=======
++ 	spin_unlock_bh(&bond->mode_lock);
+++>>>>>>> 4bab16d7c974 (bonding: alb: convert to bond->mode_lock)
+  }
+  
+  /* Caller must hold rx_hashtbl lock */
+@@@ -914,11 -906,10 +884,11 @@@ static int rlb_initialize(struct bondin
+  
+  	bond_info->rx_hashtbl_used_head = RLB_NULL_INDEX;
+  
+ -	for (i = 0; i < RLB_HASH_TABLE_SIZE; i++)
+ +	for (i = 0; i < RLB_HASH_TABLE_SIZE; i++) {
+  		rlb_init_table_entry(bond_info->rx_hashtbl + i);
+ +	}
+  
+- 	_unlock_rx_hashtbl_bh(bond);
++ 	spin_unlock_bh(&bond->mode_lock);
+  
+  	/* register to receive ARPs */
+  	bond->recv_probe = rlb_arp_recv;
+@@@ -1313,9 -1324,109 +1283,99 @@@ void bond_alb_deinitialize(struct bondi
+  
+  	tlb_deinitialize(bond);
+  
+ -	if (bond_info->rlb_enabled)
+ +	if (bond_info->rlb_enabled) {
+  		rlb_deinitialize(bond);
+ -}
+ -
+ -static int bond_do_alb_xmit(struct sk_buff *skb, struct bonding *bond,
+ -		struct slave *tx_slave)
+ -{
+ -	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct ethhdr *eth_data = eth_hdr(skb);
+ -
+ -	if (!tx_slave) {
+ -		/* unbalanced or unassigned, send through primary */
+ -		tx_slave = rcu_dereference(bond->curr_active_slave);
+ -		if (bond->params.tlb_dynamic_lb)
+ -			bond_info->unbalanced_load += skb->len;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (tx_slave && bond_slave_can_tx(tx_slave)) {
++ 		if (tx_slave != rcu_access_pointer(bond->curr_active_slave)) {
++ 			ether_addr_copy(eth_data->h_source,
++ 					tx_slave->dev->dev_addr);
++ 		}
++ 
++ 		bond_dev_queue_xmit(bond, skb, tx_slave->dev);
++ 		goto out;
++ 	}
++ 
++ 	if (tx_slave && bond->params.tlb_dynamic_lb) {
++ 		spin_lock(&bond->mode_lock);
++ 		__tlb_clear_slave(bond, tx_slave, 0);
++ 		spin_unlock(&bond->mode_lock);
++ 	}
++ 
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ out:
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static int bond_tlb_update_slave_arr(struct bonding *bond,
++ 				     struct slave *skipslave)
++ {
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct slave *tx_slave;
++ 	struct list_head *iter;
++ 	struct tlb_up_slave *new_arr, *old_arr;
++ 
++ 	new_arr = kzalloc(offsetof(struct tlb_up_slave, arr[bond->slave_cnt]),
++ 			  GFP_ATOMIC);
++ 	if (!new_arr)
++ 		return -ENOMEM;
++ 
++ 	bond_for_each_slave(bond, tx_slave, iter) {
++ 		if (!bond_slave_can_tx(tx_slave))
++ 			continue;
++ 		if (skipslave == tx_slave)
++ 			continue;
++ 		new_arr->arr[new_arr->count++] = tx_slave;
++ 	}
++ 
++ 	old_arr = rtnl_dereference(bond_info->slave_arr);
++ 	rcu_assign_pointer(bond_info->slave_arr, new_arr);
++ 	if (old_arr)
++ 		kfree_rcu(old_arr, rcu);
++ 
++ 	return 0;
++ }
++ 
++ int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct ethhdr *eth_data;
++ 	struct slave *tx_slave = NULL;
++ 	u32 hash_index;
++ 
++ 	skb_reset_mac_header(skb);
++ 	eth_data = eth_hdr(skb);
++ 
++ 	/* Do not TX balance any multicast or broadcast */
++ 	if (!is_multicast_ether_addr(eth_data->h_dest)) {
++ 		switch (skb->protocol) {
++ 		case htons(ETH_P_IP):
++ 		case htons(ETH_P_IPX):
++ 		    /* In case of IPX, it will falback to L2 hash */
++ 		case htons(ETH_P_IPV6):
++ 			hash_index = bond_xmit_hash(bond, skb);
++ 			if (bond->params.tlb_dynamic_lb) {
++ 				tx_slave = tlb_choose_channel(bond,
++ 							      hash_index & 0xFF,
++ 							      skb->len);
++ 			} else {
++ 				struct tlb_up_slave *slaves;
++ 
++ 				slaves = rcu_dereference(bond_info->slave_arr);
++ 				if (slaves && slaves->count)
++ 					tx_slave = slaves->arr[hash_index %
++ 							       slaves->count];
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	return bond_do_alb_xmit(skb, bond, tx_slave);
+++>>>>>>> 4bab16d7c974 (bonding: alb: convert to bond->mode_lock)
+  }
+  
+  int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+* Unmerged path drivers/net/bonding/bond_alb.c
+diff --git a/drivers/net/bonding/bond_alb.h b/drivers/net/bonding/bond_alb.h
+index 1dfbe69caad3..f2ae5626cdcd 100644
+--- a/drivers/net/bonding/bond_alb.h
++++ b/drivers/net/bonding/bond_alb.h
+@@ -142,14 +142,12 @@ struct tlb_slave_info {
+ 
+ struct alb_bond_info {
+ 	struct tlb_client_info	*tx_hashtbl; /* Dynamically allocated */
+-	spinlock_t		tx_hashtbl_lock;
+ 	u32			unbalanced_load;
+ 	int			tx_rebalance_counter;
+ 	int			lp_counter;
+ 	/* -------- rlb parameters -------- */
+ 	int rlb_enabled;
+ 	struct rlb_client_info	*rx_hashtbl;	/* Receive hash table */
+-	spinlock_t		rx_hashtbl_lock;
+ 	u32			rx_hashtbl_used_head;
+ 	u8			rx_ntt;	/* flag - need to transmit
+ 					 * to all rx clients
+diff --git a/drivers/net/bonding/bond_debugfs.c b/drivers/net/bonding/bond_debugfs.c
+index 5fc4c2351478..1f6664877f28 100644
+--- a/drivers/net/bonding/bond_debugfs.c
++++ b/drivers/net/bonding/bond_debugfs.c
+@@ -29,7 +29,7 @@ static int bond_debug_rlb_hash_show(struct seq_file *m, void *v)
+ 	seq_printf(m, "SourceIP        DestinationIP   "
+ 			"Destination MAC   DEV\n");
+ 
+-	spin_lock_bh(&(BOND_ALB_INFO(bond).rx_hashtbl_lock));
++	spin_lock_bh(&bond->mode_lock);
+ 
+ 	hash_index = bond_info->rx_hashtbl_used_head;
+ 	for (; hash_index != RLB_NULL_INDEX;
+@@ -42,7 +42,7 @@ static int bond_debug_rlb_hash_show(struct seq_file *m, void *v)
+ 			client_info->slave->dev->name);
+ 	}
+ 
+-	spin_unlock_bh(&(BOND_ALB_INFO(bond).rx_hashtbl_lock));
++	spin_unlock_bh(&bond->mode_lock);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index b4cb8784d691..dc42b93c92f7 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -4700,19 +4700,9 @@ static int bond_init(struct net_device *bond_dev)
+ {
+ 	struct bonding *bond = netdev_priv(bond_dev);
+ 	struct bond_net *bn = net_generic(dev_net(bond_dev), bond_net_id);
+-	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ 
+ 	pr_debug("Begin bond_init for %s\n", bond_dev->name);
+ 
+-	/*
+-	 * Initialize locks that may be required during
+-	 * en/deslave operations.  All of the bond_open work
+-	 * (of which this is part) should really be moved to
+-	 * a phase prior to dev_open
+-	 */
+-	spin_lock_init(&(bond_info->tx_hashtbl_lock));
+-	spin_lock_init(&(bond_info->rx_hashtbl_lock));
+-
+ 	bond->wq = create_singlethread_workqueue(bond_dev->name);
+ 	if (!bond->wq)
+ 		return -ENOMEM;
