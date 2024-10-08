@@ -1501,6 +1501,12 @@ static inline void format_lan_msg(struct ipmi_smi_msg   *smi_msg,
 	smi_msg->msgid = msgid;
 }
 
+static void smi_send(ipmi_smi_t intf, struct ipmi_smi_handlers *handlers,
+		     struct ipmi_smi_msg *smi_msg, int priority)
+{
+	handlers->sender(intf->send_info, smi_msg, 0);
+}
+
 /*
  * Separate from ipmi_request so that the user does not have to be
  * supplied in certain circumstances (mainly at panic time).  If
@@ -1884,7 +1890,7 @@ static int i_ipmi_request(ipmi_user_t          user,
 	}
 #endif
 
-	handlers->sender(intf->send_info, smi_msg, priority);
+	smi_send(intf, handlers, smi_msg, priority);
 	rcu_read_unlock();
 
 	return 0;
@@ -3092,7 +3098,7 @@ static int handle_ipmb_get_msg_cmd(ipmi_smi_t          intf,
 		rcu_read_lock();
 		handlers = intf->handlers;
 		if (handlers) {
-			handlers->sender(intf->send_info, msg, 0);
+			smi_send(intf, handlers, msg, 0);
 			/*
 			 * We used the message, so return the value
 			 * that causes it to not be freed or
@@ -3985,8 +3991,7 @@ static void check_msg_timeout(ipmi_smi_t intf, struct seq_table *ent,
 				ipmi_inc_stat(intf,
 					      retransmitted_ipmb_commands);
 
-			intf->handlers->sender(intf->send_info,
-					       smi_msg, 0);
+			smi_send(intf, intf->handlers, smi_msg, 0);
 		} else
 			ipmi_free_smi_msg(smi_msg);
 
