@@ -1,0 +1,132 @@
+slub: improve bulk alloc strategy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit ebe909e0fdb34b980c5cf636c495e4f0bb0dfda8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ebe909e0.failed
+
+Call slowpath __slab_alloc() from within the bulk loop, as the side-effect
+of this call likely repopulates c->freelist.
+
+Choose to reenable local IRQs while calling slowpath.
+
+Saving some optimizations for later.  E.g.  it is possible to extract
+parts of __slab_alloc() and avoid the unnecessary and expensive (37
+cycles) local_irq_{save,restore}.  For now, be happy calling
+__slab_alloc() this lower icache impact of this func and I don't have to
+worry about correctness.
+
+Measurements on CPU CPU i7-4790K @ 4.00GHz
+Baseline normal fastpath (alloc+free cost): 42 cycles(tsc) 10.601 ns
+
+Bulk- fallback                   - this-patch
+  1 -  58 cycles(tsc) 14.516 ns  -  49 cycles(tsc) 12.459 ns  improved 15.5%
+  2 -  51 cycles(tsc) 12.930 ns  -  38 cycles(tsc)  9.605 ns  improved 25.5%
+  3 -  49 cycles(tsc) 12.274 ns  -  34 cycles(tsc)  8.525 ns  improved 30.6%
+  4 -  48 cycles(tsc) 12.058 ns  -  32 cycles(tsc)  8.036 ns  improved 33.3%
+  8 -  46 cycles(tsc) 11.609 ns  -  31 cycles(tsc)  7.756 ns  improved 32.6%
+ 16 -  45 cycles(tsc) 11.451 ns  -  32 cycles(tsc)  8.148 ns  improved 28.9%
+ 30 -  79 cycles(tsc) 19.865 ns  -  68 cycles(tsc) 17.164 ns  improved 13.9%
+ 32 -  76 cycles(tsc) 19.212 ns  -  66 cycles(tsc) 16.584 ns  improved 13.2%
+ 34 -  74 cycles(tsc) 18.600 ns  -  63 cycles(tsc) 15.954 ns  improved 14.9%
+ 48 -  88 cycles(tsc) 22.092 ns  -  77 cycles(tsc) 19.373 ns  improved 12.5%
+ 64 -  80 cycles(tsc) 20.043 ns  -  68 cycles(tsc) 17.188 ns  improved 15.0%
+128 -  99 cycles(tsc) 24.818 ns  -  89 cycles(tsc) 22.404 ns  improved 10.1%
+158 -  99 cycles(tsc) 24.977 ns  -  92 cycles(tsc) 23.089 ns  improved  7.1%
+250 - 106 cycles(tsc) 26.552 ns  -  99 cycles(tsc) 24.785 ns  improved  6.6%
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ebe909e0fdb34b980c5cf636c495e4f0bb0dfda8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 9bb60eec298f,f98b1b9e7080..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2659,6 -2750,71 +2659,74 @@@ void kmem_cache_free(struct kmem_cache 
+  }
+  EXPORT_SYMBOL(kmem_cache_free);
+  
+++<<<<<<< HEAD
+++=======
++ /* Note that interrupts must be enabled when calling this function. */
++ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++ {
++ 	__kmem_cache_free_bulk(s, size, p);
++ }
++ EXPORT_SYMBOL(kmem_cache_free_bulk);
++ 
++ /* Note that interrupts must be enabled when calling this function. */
++ bool kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++ 			   void **p)
++ {
++ 	struct kmem_cache_cpu *c;
++ 	int i;
++ 
++ 	/* Debugging fallback to generic bulk */
++ 	if (kmem_cache_debug(s))
++ 		return __kmem_cache_alloc_bulk(s, flags, size, p);
++ 
++ 	/*
++ 	 * Drain objects in the per cpu slab, while disabling local
++ 	 * IRQs, which protects against PREEMPT and interrupts
++ 	 * handlers invoking normal fastpath.
++ 	 */
++ 	local_irq_disable();
++ 	c = this_cpu_ptr(s->cpu_slab);
++ 
++ 	for (i = 0; i < size; i++) {
++ 		void *object = c->freelist;
++ 
++ 		if (unlikely(!object)) {
++ 			local_irq_enable();
++ 			/*
++ 			 * Invoking slow path likely have side-effect
++ 			 * of re-populating per CPU c->freelist
++ 			 */
++ 			p[i] = __slab_alloc(s, flags, NUMA_NO_NODE,
++ 					    _RET_IP_, c);
++ 			if (unlikely(!p[i])) {
++ 				__kmem_cache_free_bulk(s, i, p);
++ 				return false;
++ 			}
++ 			local_irq_disable();
++ 			c = this_cpu_ptr(s->cpu_slab);
++ 			continue; /* goto for-loop */
++ 		}
++ 
++ 		c->freelist = get_freepointer(s, object);
++ 		p[i] = object;
++ 	}
++ 	c->tid = next_tid(c->tid);
++ 	local_irq_enable();
++ 
++ 	/* Clear memory outside IRQ disabled fastpath loop */
++ 	if (unlikely(flags & __GFP_ZERO)) {
++ 		int j;
++ 
++ 		for (j = 0; j < i; j++)
++ 			memset(p[j], 0, s->object_size);
++ 	}
++ 
++ 	return true;
++ }
++ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++ 
++ 
+++>>>>>>> ebe909e0fdb3 (slub: improve bulk alloc strategy)
+  /*
+   * Object placement in a slab is made very easy because we always start at
+   * offset 0. If we tune the size of the object to the alignment then we can
+* Unmerged path mm/slub.c
