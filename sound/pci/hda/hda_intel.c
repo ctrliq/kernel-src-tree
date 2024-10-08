@@ -3773,7 +3773,8 @@ static int azx_probe(struct pci_dev *pci,
 		pm_runtime_put_noidle(&pci->dev);
 
 	dev++;
-	complete_all(&chip->probe_wait);
+	if (chip->disabled)
+		complete_all(&chip->probe_wait);
 	return 0;
 
 out_free:
@@ -3835,10 +3836,10 @@ static int azx_probe_continue(struct azx *chip)
 	azx_notifier_register(chip);
 	azx_add_card_list(chip);
 
-	return 0;
-
 out_free:
-	chip->init_failed = 1;
+	if (err < 0)
+		chip->init_failed = 1;
+	complete_all(&chip->probe_wait);
 	return err;
 }
 
