@@ -1,0 +1,366 @@
+ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races
+
+jira LE-1907
+cve CVE-2013-7026
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [ipc] introduce ipc_valid_object() helper to sort out IPC_RMID races (Phillip Lougher) [1043807] {CVE-2013-7026}
+Rebuild_FUZZ: 96.12%
+commit-author Rafael Aquini <aquini@redhat.com>
+commit 0f3d2b0135f4bdbfe47a99753923a64efd373d11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/0f3d2b01.failed
+
+After the locking semantics for the SysV IPC API got improved, a couple
+of IPC_RMID race windows were opened because we ended up dropping the
+'kern_ipc_perm.deleted' check performed way down in ipc_lock().  The
+spotted races got sorted out by re-introducing the old test within the
+racy critical sections.
+
+This patch introduces ipc_valid_object() to consolidate the way we cope
+with IPC_RMID races by using the same abstraction across the API
+implementation.
+
+	Signed-off-by: Rafael Aquini <aquini@redhat.com>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Acked-by: Greg Thelen <gthelen@google.com>
+	Reviewed-by: Davidlohr Bueso <davidlohr@hp.com>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0f3d2b0135f4bdbfe47a99753923a64efd373d11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/msg.c
+#	ipc/sem.c
+#	ipc/shm.c
+#	ipc/util.h
+diff --cc ipc/msg.c
+index d0c6d967b390,8983ea57d970..000000000000
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@@ -651,7 -693,13 +651,17 @@@ long do_msgsnd(int msqid, long mtype, v
+  
+  		err = -EACCES;
+  		if (ipcperms(ns, &msq->q_perm, S_IWUGO))
+++<<<<<<< HEAD
+ +			goto out_unlock_free;
+++=======
++ 			goto out_unlock0;
++ 
++ 		/* raced with RMID? */
++ 		if (!ipc_valid_object(&msq->q_perm)) {
++ 			err = -EIDRM;
++ 			goto out_unlock0;
++ 		}
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  
+  		err = security_msg_queue_msgsnd(msq, msg, msgflg);
+  		if (err)
+@@@ -671,18 -720,23 +681,27 @@@
+  
+  		if (!ipc_rcu_getref(msq)) {
+  			err = -EIDRM;
+ -			goto out_unlock0;
+ +			goto out_unlock_free;
+  		}
+  
+ -		ipc_unlock_object(&msq->q_perm);
+ -		rcu_read_unlock();
+ +		msg_unlock(msq);
+  		schedule();
+  
+++<<<<<<< HEAD
+ +		ipc_lock_by_ptr(&msq->q_perm);
+ +		ipc_rcu_putref(msq);
+ +		if (msq->q_perm.deleted) {
+++=======
++ 		rcu_read_lock();
++ 		ipc_lock_object(&msq->q_perm);
++ 
++ 		ipc_rcu_putref(msq, ipc_rcu_free);
++ 		/* raced with RMID? */
++ 		if (!ipc_valid_object(&msq->q_perm)) {
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  			err = -EIDRM;
+ -			goto out_unlock0;
+ +			goto out_unlock_free;
+  		}
+ -
+  		ss_del(&s);
+  
+  		if (signal_pending(current)) {
+@@@ -849,10 -905,17 +868,22 @@@ long do_msgrcv(int msqid, void __user *
+  
+  		msg = ERR_PTR(-EACCES);
+  		if (ipcperms(ns, &msq->q_perm, S_IRUGO))
+++<<<<<<< HEAD
+ +			goto out_unlock;
+++=======
++ 			goto out_unlock1;
++ 
++ 		ipc_lock_object(&msq->q_perm);
++ 
++ 		/* raced with RMID? */
++ 		if (!ipc_valid_object(&msq->q_perm)) {
++ 			msg = ERR_PTR(-EIDRM);
++ 			goto out_unlock0;
++ 		}
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  
+  		msg = find_msg(msq, &msgtyp, mode);
+ +
+  		if (!IS_ERR(msg)) {
+  			/*
+  			 * Found a suitable message.
+diff --cc ipc/sem.c
+index 6230dd5963de,4d88194a5ffe..000000000000
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@@ -1168,9 -1284,15 +1168,18 @@@ static int semctl_setval(struct ipc_nam
+  
+  	sem_lock(sma, NULL, -1);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!ipc_valid_object(&sma->sem_perm)) {
++ 		sem_unlock(sma, -1);
++ 		rcu_read_unlock();
++ 		return -EIDRM;
++ 	}
++ 
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  	curr = &sma->sem_base[semnum];
+  
+ -	ipc_assert_locked_object(&sma->sem_perm);
+ +	assert_spin_locked(&sma->sem_perm.lock);
+  	list_for_each_entry(un, &sma->list_id, list_id)
+  		un->semadj[semnum] = 0;
+  
+@@@ -1222,12 -1344,14 +1231,19 @@@ static int semctl_main(struct ipc_names
+  		int i;
+  
+  		sem_lock(sma, NULL, -1);
+++<<<<<<< HEAD
+++=======
++ 		if (!ipc_valid_object(&sma->sem_perm)) {
++ 			err = -EIDRM;
++ 			goto out_unlock;
++ 		}
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  		if(nsems > SEMMSL_FAST) {
+  			if (!ipc_rcu_getref(sma)) {
+ +				sem_unlock(sma, -1);
+ +				rcu_read_unlock();
+  				err = -EIDRM;
+ -				goto out_unlock;
+ +				goto out_free;
+  			}
+  			sem_unlock(sma, -1);
+  			rcu_read_unlock();
+@@@ -1239,11 -1363,9 +1255,15 @@@
+  
+  			rcu_read_lock();
+  			sem_lock_and_putref(sma);
+++<<<<<<< HEAD
+ +			if (sma->sem_perm.deleted) {
+ +				sem_unlock(sma, -1);
+ +				rcu_read_unlock();
+++=======
++ 			if (!ipc_valid_object(&sma->sem_perm)) {
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  				err = -EIDRM;
+ -				goto out_unlock;
+ +				goto out_free;
+  			}
+  		}
+  		for (i = 0; i < sma->sem_nsems; i++)
+@@@ -1289,11 -1411,9 +1309,15 @@@
+  		}
+  		rcu_read_lock();
+  		sem_lock_and_putref(sma);
+++<<<<<<< HEAD
+ +		if (sma->sem_perm.deleted) {
+ +			sem_unlock(sma, -1);
+ +			rcu_read_unlock();
+++=======
++ 		if (!ipc_valid_object(&sma->sem_perm)) {
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  			err = -EIDRM;
+ -			goto out_unlock;
+ +			goto out_free;
+  		}
+  
+  		for (i = 0; i < nsems; i++)
+@@@ -1317,6 -1437,10 +1341,13 @@@
+  		goto out_rcu_wakeup;
+  
+  	sem_lock(sma, NULL, -1);
+++<<<<<<< HEAD
+++=======
++ 	if (!ipc_valid_object(&sma->sem_perm)) {
++ 		err = -EIDRM;
++ 		goto out_unlock;
++ 	}
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  	curr = &sma->sem_base[semnum];
+  
+  	switch (cmd) {
+@@@ -1718,6 -1846,18 +1749,21 @@@ SYSCALL_DEFINE4(semtimedop, int, semid
+  	if (error)
+  		goto out_rcu_wakeup;
+  
+++<<<<<<< HEAD
+++=======
++ 	error = -EIDRM;
++ 	locknum = sem_lock(sma, sops, nsops);
++ 	/*
++ 	 * We eventually might perform the following check in a lockless
++ 	 * fashion, considering ipc_valid_object() locking constraints.
++ 	 * If nsops == 1 and there is no contention for sem_perm.lock, then
++ 	 * only a per-semaphore lock is held and it's OK to proceed with the
++ 	 * check below. More details on the fine grained locking scheme
++ 	 * entangled here and why it's RMID race safe on comments at sem_lock()
++ 	 */
++ 	if (!ipc_valid_object(&sma->sem_perm))
++ 		goto out_unlock_free;
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  	/*
+  	 * semid identifiers are not unique - find_alloc_undo may have
+  	 * allocated an undo structure, it was invalidated by an RMID
+@@@ -1923,6 -2077,12 +1969,15 @@@ void exit_sem(struct task_struct *tsk
+  		}
+  
+  		sem_lock(sma, NULL, -1);
+++<<<<<<< HEAD
+++=======
++ 		/* exit_sem raced with IPC_RMID, nothing to do */
++ 		if (!ipc_valid_object(&sma->sem_perm)) {
++ 			sem_unlock(sma, -1);
++ 			rcu_read_unlock();
++ 			continue;
++ 		}
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  		un = __lookup_undo(ulp, semid);
+  		if (un == NULL) {
+  			/* exit_sem raced with IPC_RMID+semget() that created
+diff --cc ipc/shm.c
+index 7e199fa1960f,1bc68f115842..000000000000
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@@ -904,24 -970,34 +904,35 @@@ SYSCALL_DEFINE3(shmctl, int, shmid, int
+  		}
+  
+  		audit_ipc_obj(&(shp->shm_perm));
+ -		err = security_shm_shmctl(shp, cmd);
+ -		if (err)
+ -			goto out_unlock1;
+  
+++<<<<<<< HEAD
+++=======
++ 		ipc_lock_object(&shp->shm_perm);
++ 
++ 		/* check if shm_destroy() is tearing down shp */
++ 		if (!ipc_valid_object(&shp->shm_perm)) {
++ 			err = -EIDRM;
++ 			goto out_unlock0;
++ 		}
++ 
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  		if (!ns_capable(ns->user_ns, CAP_IPC_LOCK)) {
+  			kuid_t euid = current_euid();
+ +			err = -EPERM;
+  			if (!uid_eq(euid, shp->shm_perm.uid) &&
+ -			    !uid_eq(euid, shp->shm_perm.cuid)) {
+ -				err = -EPERM;
+ -				goto out_unlock0;
+ -			}
+ -			if (cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)) {
+ -				err = -EPERM;
+ -				goto out_unlock0;
+ -			}
+ +			    !uid_eq(euid, shp->shm_perm.cuid))
+ +				goto out_unlock;
+ +			if (cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK))
+ +				goto out_unlock;
+  		}
+  
+ +		err = security_shm_shmctl(shp, cmd);
+ +		if (err)
+ +			goto out_unlock;
+ +
+  		shm_file = shp->shm_file;
+  		if (is_file_hugepages(shm_file))
+ -			goto out_unlock0;
+ +			goto out_unlock;
+  
+  		if (cmd == SHM_LOCK) {
+  			struct user_struct *user = current_user();
+@@@ -1037,6 -1113,15 +1048,18 @@@ long do_shmat(int shmid, char __user *s
+  	if (err)
+  		goto out_unlock;
+  
+++<<<<<<< HEAD
+++=======
++ 	ipc_lock_object(&shp->shm_perm);
++ 
++ 	/* check if shm_destroy() is tearing down shp */
++ 	if (!ipc_valid_object(&shp->shm_perm)) {
++ 		ipc_unlock_object(&shp->shm_perm);
++ 		err = -EIDRM;
++ 		goto out_unlock;
++ 	}
++ 
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  	path = shp->shm_file->f_path;
+  	path_get(&path);
+  	shp->shm_nattch++;
+diff --cc ipc/util.h
+index 2b0bdd5d92ce,d05b7085a887..000000000000
+--- a/ipc/util.h
++++ b/ipc/util.h
+@@@ -176,7 -169,35 +176,39 @@@ static inline void ipc_lock_object(stru
+  	spin_lock(&perm->lock);
+  }
+  
+++<<<<<<< HEAD
+ +struct kern_ipc_perm *ipc_lock_check(struct ipc_ids *ids, int id);
+++=======
++ static inline void ipc_unlock_object(struct kern_ipc_perm *perm)
++ {
++ 	spin_unlock(&perm->lock);
++ }
++ 
++ static inline void ipc_assert_locked_object(struct kern_ipc_perm *perm)
++ {
++ 	assert_spin_locked(&perm->lock);
++ }
++ 
++ static inline void ipc_unlock(struct kern_ipc_perm *perm)
++ {
++ 	ipc_unlock_object(perm);
++ 	rcu_read_unlock();
++ }
++ 
++ /*
++  * ipc_valid_object() - helper to sort out IPC_RMID races for codepaths
++  * where the respective ipc_ids.rwsem is not being held down.
++  * Checks whether the ipc object is still around or if it's gone already, as
++  * ipc_rmid() may have already freed the ID while the ipc lock was spinning.
++  * Needs to be called with kern_ipc_perm.lock held -- exception made for one
++  * checkpoint case at sys_semtimedop() as noted in code commentary.
++  */
++ static inline bool ipc_valid_object(struct kern_ipc_perm *perm)
++ {
++ 	return perm->deleted == 0;
++ }
++ 
+++>>>>>>> 0f3d2b0135f4 (ipc: introduce ipc_valid_object() helper to sort out IPC_RMID races)
+  struct kern_ipc_perm *ipc_obtain_object_check(struct ipc_ids *ids, int id);
+  int ipcget(struct ipc_namespace *ns, struct ipc_ids *ids,
+  			struct ipc_ops *ops, struct ipc_params *params);
+* Unmerged path ipc/msg.c
+* Unmerged path ipc/sem.c
+* Unmerged path ipc/shm.c
+* Unmerged path ipc/util.h
