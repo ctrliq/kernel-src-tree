@@ -1,0 +1,227 @@
+usb: gadget: net2280: fix use of GPEP in both directions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mian Yousaf Kaukab <yousaf.kaukab@intel.com>
+commit c65c4f052bc3b67989bf54914798513685c54988
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c65c4f05.failed
+
+USB3380 enhanced mode allows GPEP to be used in both IN and OUT
+directions. However, IN and OUT endpoints must use same USB endpoint
+address (bEndpointAddress). Fix this by setting the ep_cfg.ep_number
+during initialization and keep it in net2280_enable()
+
+	Tested-by: Ricardo Ribalda Delgado <ricardo.ribalda@gmail.com>
+	Signed-off-by: Mian Yousaf Kaukab <yousaf.kaukab@intel.com>
+	Signed-off-by: Felipe Balbi <balbi@ti.com>
+(cherry picked from commit c65c4f052bc3b67989bf54914798513685c54988)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/gadget/net2280.c
+diff --cc drivers/usb/gadget/net2280.c
+index 8a49a999fea4,779e6fe0005f..000000000000
+--- a/drivers/usb/gadget/net2280.c
++++ b/drivers/usb/gadget/net2280.c
+@@@ -154,30 -144,41 +154,32 @@@ net2280_enable (struct usb_ep *_ep, con
+  {
+  	struct net2280		*dev;
+  	struct net2280_ep	*ep;
+- 	u32			max, tmp;
++ 	u32			max;
++ 	u32 tmp = 0;
++ 	u32 type;
+  	unsigned long		flags;
+  	static const u32 ep_key[9] = { 1, 0, 1, 0, 1, 1, 0, 1, 0 };
+ -	int ret = 0;
+ +	static const u32 ep_enhanced[9] = { 0x10, 0x60, 0x30, 0x80,
+ +					  0x50, 0x20, 0x70, 0x40, 0x90 };
+  
+ -	ep = container_of(_ep, struct net2280_ep, ep);
+ -	if (!_ep || !desc || ep->desc || _ep->name == ep0name ||
+ -			desc->bDescriptorType != USB_DT_ENDPOINT) {
+ -		pr_err("%s: failed at line=%d\n", __func__, __LINE__);
+ +	ep = container_of (_ep, struct net2280_ep, ep);
+ +	if (!_ep || !desc || ep->desc || _ep->name == ep0name
+ +			|| desc->bDescriptorType != USB_DT_ENDPOINT)
+  		return -EINVAL;
+ -	}
+  	dev = ep->dev;
+ -	if (!dev->driver || dev->gadget.speed == USB_SPEED_UNKNOWN) {
+ -		ret = -ESHUTDOWN;
+ -		goto print_err;
+ -	}
+ +	if (!dev->driver || dev->gadget.speed == USB_SPEED_UNKNOWN)
+ +		return -ESHUTDOWN;
+  
+  	/* erratum 0119 workaround ties up an endpoint number */
+ -	if ((desc->bEndpointAddress & 0x0f) == EP_DONTUSE) {
+ -		ret = -EDOM;
+ -		goto print_err;
+ -	}
+ +	if ((desc->bEndpointAddress & 0x0f) == EP_DONTUSE)
+ +		return -EDOM;
+  
+ -	if (dev->quirks & PLX_SUPERSPEED) {
+ -		if ((desc->bEndpointAddress & 0x0f) >= 0x0c) {
+ -			ret = -EDOM;
+ -			goto print_err;
+ -		}
+ +	if (dev->pdev->vendor == 0x10b5) {
+ +		if ((desc->bEndpointAddress & 0x0f) >= 0x0c)
+ +			return -EDOM;
+  		ep->is_in = !!usb_endpoint_dir_in(desc);
+ -		if (dev->enhanced_mode && ep->is_in && ep_key[ep->num]) {
+ -			ret = -EINVAL;
+ -			goto print_err;
+ -		}
+ +		if (dev->enhanced_mode && ep->is_in && ep_key[ep->num])
+ +			return -EINVAL;
+  	}
+  
+  	/* sanity check ep-e/ep-f since their fifos are small */
+@@@ -196,41 -198,46 +198,68 @@@
+  	ep->out_overflow = 0;
+  
+  	/* set speed-dependent max packet; may kick in high bandwidth */
+ -	set_max_speed(ep, max);
+ +	set_idx_reg(dev->regs, (dev->enhanced_mode) ? ep_enhanced[ep->num]
+ +					: REG_EP_MAXPKT(dev, ep->num), max);
+ +
+ +	/* FIFO lines can't go to different packets.  PIO is ok, so
+ +	 * use it instead of troublesome (non-bulk) multi-packet DMA.
+ +	 */
+ +	if (ep->dma && (max % 4) != 0 && use_dma_chaining) {
+ +		DEBUG (ep->dev, "%s, no dma for maxpacket %d\n",
+ +			ep->ep.name, ep->ep.maxpacket);
+ +		ep->dma = NULL;
+ +	}
+  
+  	/* set type, direction, address; reset fifo counters */
+++<<<<<<< HEAD:drivers/usb/gadget/net2280.c
+ +	writel ((1 << FIFO_FLUSH), &ep->regs->ep_stat);
+ +	tmp = (desc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK);
+ +	if (tmp == USB_ENDPOINT_XFER_INT) {
+++=======
++ 	writel(BIT(FIFO_FLUSH), &ep->regs->ep_stat);
++ 
++ 	if ((dev->quirks & PLX_SUPERSPEED) && dev->enhanced_mode) {
++ 		tmp = readl(&ep->cfg->ep_cfg);
++ 		/* If USB ep number doesn't match hardware ep number */
++ 		if ((tmp & 0xf) != usb_endpoint_num(desc)) {
++ 			ret = -EINVAL;
++ 			spin_unlock_irqrestore(&dev->lock, flags);
++ 			goto print_err;
++ 		}
++ 		if (ep->is_in)
++ 			tmp &= ~USB3380_EP_CFG_MASK_IN;
++ 		else
++ 			tmp &= ~USB3380_EP_CFG_MASK_OUT;
++ 	}
++ 	type = (desc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK);
++ 	if (type == USB_ENDPOINT_XFER_INT) {
+++>>>>>>> c65c4f052bc3 (usb: gadget: net2280: fix use of GPEP in both directions):drivers/usb/gadget/udc/net2280.c
+  		/* erratum 0105 workaround prevents hs NYET */
+ -		if (dev->chiprev == 0100 &&
+ -				dev->gadget.speed == USB_SPEED_HIGH &&
+ -				!(desc->bEndpointAddress & USB_DIR_IN))
+ -			writel(BIT(CLEAR_NAK_OUT_PACKETS_MODE),
+ +		if (dev->chiprev == 0100
+ +				&& dev->gadget.speed == USB_SPEED_HIGH
+ +				&& !(desc->bEndpointAddress & USB_DIR_IN))
+ +			writel ((1 << CLEAR_NAK_OUT_PACKETS_MODE),
+  				&ep->regs->ep_rsp);
+- 	} else if (tmp == USB_ENDPOINT_XFER_BULK) {
++ 	} else if (type == USB_ENDPOINT_XFER_BULK) {
+  		/* catch some particularly blatant driver bugs */
+  		if ((dev->gadget.speed == USB_SPEED_SUPER && max != 1024) ||
+  		    (dev->gadget.speed == USB_SPEED_HIGH && max != 512) ||
+  		    (dev->gadget.speed == USB_SPEED_FULL && max > 64)) {
+  			spin_unlock_irqrestore(&dev->lock, flags);
+ -			ret = -ERANGE;
+ -			goto print_err;
+ +			return -ERANGE;
+  		}
+  	}
+++<<<<<<< HEAD:drivers/usb/gadget/net2280.c
+ +	ep->is_iso = (tmp == USB_ENDPOINT_XFER_ISOC) ? 1 : 0;
+ +	/* Enable this endpoint */
+ +	if (dev->pdev->vendor == 0x17cc) {
+ +		tmp <<= ENDPOINT_TYPE;
+++=======
++ 	ep->is_iso = (type == USB_ENDPOINT_XFER_ISOC);
++ 	/* Enable this endpoint */
++ 	if (dev->quirks & PLX_LEGACY) {
++ 		tmp |= type << ENDPOINT_TYPE;
+++>>>>>>> c65c4f052bc3 (usb: gadget: net2280: fix use of GPEP in both directions):drivers/usb/gadget/udc/net2280.c
+  		tmp |= desc->bEndpointAddress;
+  		/* default full fifo lines */
+  		tmp |= (4 << ENDPOINT_BYTE_COUNT);
+@@@ -239,17 -246,17 +268,31 @@@
+  	} else {
+  		/* In Legacy mode, only OUT endpoints are used */
+  		if (dev->enhanced_mode && ep->is_in) {
+++<<<<<<< HEAD:drivers/usb/gadget/net2280.c
+ +			tmp <<= IN_ENDPOINT_TYPE;
+ +			tmp |= (1 << IN_ENDPOINT_ENABLE);
+ +			/* Not applicable to Legacy */
+ +			tmp |= (1 << ENDPOINT_DIRECTION);
+ +		} else {
+ +			tmp <<= OUT_ENDPOINT_TYPE;
+ +			tmp |= (1 << OUT_ENDPOINT_ENABLE);
+ +			tmp |= (ep->is_in << ENDPOINT_DIRECTION);
+ +		}
+ +
+ +		tmp |= usb_endpoint_num(desc);
+++=======
++ 			tmp |= type << IN_ENDPOINT_TYPE;
++ 			tmp |= BIT(IN_ENDPOINT_ENABLE);
++ 		} else {
++ 			tmp |= type << OUT_ENDPOINT_TYPE;
++ 			tmp |= BIT(OUT_ENDPOINT_ENABLE);
++ 			tmp |= (ep->is_in << ENDPOINT_DIRECTION);
++ 		}
++ 
++ 		tmp |= (4 << ENDPOINT_BYTE_COUNT);
++ 		if (!dev->enhanced_mode)
++ 			tmp |= usb_endpoint_num(desc);
+++>>>>>>> c65c4f052bc3 (usb: gadget: net2280: fix use of GPEP in both directions):drivers/usb/gadget/udc/net2280.c
+  		tmp |= (ep->ep.maxburst << MAX_BURST_SIZE);
+  	}
+  
+@@@ -2174,10 -2091,15 +2217,16 @@@ static void usb_reinit_338x(struct net2
+  
+  		if (dev->enhanced_mode) {
+  			ep->cfg = &dev->epregs[ne[i]];
++ 			/*
++ 			 * Set USB endpoint number, hardware allows same number
++ 			 * in both directions.
++ 			 */
++ 			 if (i > 0 && i < 5)
++ 				writel(ne[i], &ep->cfg->ep_cfg);
+  			ep->regs = (struct net2280_ep_regs __iomem *)
+ -				(((void __iomem *)&dev->epregs[ne[i]]) +
+ +				(((void *)&dev->epregs[ne[i]]) +
+  				ep_reg_addr[i]);
+ +			ep->fiforegs = &dev->fiforegs[i];
+  		} else {
+  			ep->cfg = &dev->epregs[i];
+  			ep->regs = &dev->epregs[i];
+* Unmerged path drivers/usb/gadget/net2280.c
+diff --git a/include/linux/usb/usb338x.h b/include/linux/usb/usb338x.h
+index f92eb635b9d3..11525d8d89a7 100644
+--- a/include/linux/usb/usb338x.h
++++ b/include/linux/usb/usb338x.h
+@@ -43,6 +43,10 @@
+ #define     IN_ENDPOINT_TYPE                    12
+ #define     OUT_ENDPOINT_ENABLE                 10
+ #define     OUT_ENDPOINT_TYPE                    8
++#define USB3380_EP_CFG_MASK_IN ((0x3 << IN_ENDPOINT_TYPE) | \
++				BIT(IN_ENDPOINT_ENABLE))
++#define USB3380_EP_CFG_MASK_OUT ((0x3 << OUT_ENDPOINT_TYPE) | \
++				BIT(OUT_ENDPOINT_ENABLE))
+ 
+ struct usb338x_usb_ext_regs {
+ 	u32     usbclass;
