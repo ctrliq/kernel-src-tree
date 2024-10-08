@@ -911,7 +911,7 @@ retry:
 	return rdev;
 }
 
-int md_raid10_congested(struct mddev *mddev, int bits)
+static int raid10_congested(struct mddev *mddev, int bits)
 {
 	struct r10conf *conf = mddev->private;
 	int i, ret = 0;
@@ -934,15 +934,6 @@ int md_raid10_congested(struct mddev *mddev, int bits)
 	}
 	rcu_read_unlock();
 	return ret;
-}
-EXPORT_SYMBOL_GPL(md_raid10_congested);
-
-static int raid10_congested(void *data, int bits)
-{
-	struct mddev *mddev = data;
-
-	return mddev_congested(mddev, bits) ||
-		md_raid10_congested(mddev, bits);
 }
 
 static void flush_pending_writes(struct r10conf *conf)
@@ -3775,8 +3766,6 @@ static int run(struct mddev *mddev)
 	if (mddev->queue) {
 		int stripe = conf->geo.raid_disks *
 			((mddev->chunk_sectors << 9) / PAGE_SIZE);
-		mddev->queue->backing_dev_info.congested_fn = raid10_congested;
-		mddev->queue->backing_dev_info.congested_data = mddev;
 
 		/* Calculate max read-ahead size.
 		 * We need to readahead at least twice a whole stripe....
@@ -4746,6 +4735,7 @@ static struct md_personality raid10_personality =
 	.check_reshape	= raid10_check_reshape,
 	.start_reshape	= raid10_start_reshape,
 	.finish_reshape	= raid10_finish_reshape,
+	.congested	= raid10_congested,
 };
 
 static int __init raid_init(void)
