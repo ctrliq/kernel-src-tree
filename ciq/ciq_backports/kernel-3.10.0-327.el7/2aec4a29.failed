@@ -1,0 +1,314 @@
+tcp: add mss_clamp to tcp_request_sock_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Octavian Purdila <octavian.purdila@intel.com>
+commit 2aec4a297b21f3690486bbf8f7d5d29281ba6a48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2aec4a29.failed
+
+Add mss_clamp member to tcp_request_sock_ops so that we can later
+unify tcp_v4_conn_request and tcp_v6_conn_request.
+
+	Signed-off-by: Octavian Purdila <octavian.purdila@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2aec4a297b21f3690486bbf8f7d5d29281ba6a48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_ipv4.c
+#	net/ipv6/tcp_ipv6.c
+diff --cc net/ipv4/tcp_ipv4.c
+index 7c1eb4426934,499d440539ad..000000000000
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@@ -1247,193 -1264,20 +1247,198 @@@ struct request_sock_ops tcp_request_soc
+  	.syn_ack_timeout = 	tcp_syn_ack_timeout,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct tcp_request_sock_ops tcp_request_sock_ipv4_ops = {
++ 	.mss_clamp	=	TCP_MSS_DEFAULT,
+++>>>>>>> 2aec4a297b21 (tcp: add mss_clamp to tcp_request_sock_ops)
+  #ifdef CONFIG_TCP_MD5SIG
+ +static const struct tcp_request_sock_ops tcp_request_sock_ipv4_ops = {
+  	.md5_lookup	=	tcp_v4_reqsk_md5_lookup,
+  	.calc_md5_hash	=	tcp_v4_md5_hash_skb,
+ -#endif
+ -	.init_req	=	tcp_v4_init_req,
+ -#ifdef CONFIG_SYN_COOKIES
+ -	.cookie_init_seq =	cookie_v4_init_sequence,
+ -#endif
+ -	.route_req	=	tcp_v4_route_req,
+ -	.init_seq	=	tcp_v4_init_sequence,
+ -	.send_synack	=	tcp_v4_send_synack,
+  };
+ +#endif
+ +
+ +static bool tcp_fastopen_check(struct sock *sk, struct sk_buff *skb,
+ +			       struct request_sock *req,
+ +			       struct tcp_fastopen_cookie *foc,
+ +			       struct tcp_fastopen_cookie *valid_foc)
+ +{
+ +	bool skip_cookie = false;
+ +	struct fastopen_queue *fastopenq;
+ +
+ +	if (likely(!fastopen_cookie_present(foc))) {
+ +		/* See include/net/tcp.h for the meaning of these knobs */
+ +		if ((sysctl_tcp_fastopen & TFO_SERVER_ALWAYS) ||
+ +		    ((sysctl_tcp_fastopen & TFO_SERVER_COOKIE_NOT_REQD) &&
+ +		    (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1)))
+ +			skip_cookie = true; /* no cookie to validate */
+ +		else
+ +			return false;
+ +	}
+ +	fastopenq = inet_csk(sk)->icsk_accept_queue.fastopenq;
+ +	/* A FO option is present; bump the counter. */
+ +	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPFASTOPENPASSIVE);
+ +
+ +	/* Make sure the listener has enabled fastopen, and we don't
+ +	 * exceed the max # of pending TFO requests allowed before trying
+ +	 * to validating the cookie in order to avoid burning CPU cycles
+ +	 * unnecessarily.
+ +	 *
+ +	 * XXX (TFO) - The implication of checking the max_qlen before
+ +	 * processing a cookie request is that clients can't differentiate
+ +	 * between qlen overflow causing Fast Open to be disabled
+ +	 * temporarily vs a server not supporting Fast Open at all.
+ +	 */
+ +	if ((sysctl_tcp_fastopen & TFO_SERVER_ENABLE) == 0 ||
+ +	    fastopenq == NULL || fastopenq->max_qlen == 0)
+ +		return false;
+ +
+ +	if (fastopenq->qlen >= fastopenq->max_qlen) {
+ +		struct request_sock *req1;
+ +		spin_lock(&fastopenq->lock);
+ +		req1 = fastopenq->rskq_rst_head;
+ +		if ((req1 == NULL) || time_after(req1->expires, jiffies)) {
+ +			spin_unlock(&fastopenq->lock);
+ +			NET_INC_STATS_BH(sock_net(sk),
+ +			    LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
+ +			/* Avoid bumping LINUX_MIB_TCPFASTOPENPASSIVEFAIL*/
+ +			foc->len = -1;
+ +			return false;
+ +		}
+ +		fastopenq->rskq_rst_head = req1->dl_next;
+ +		fastopenq->qlen--;
+ +		spin_unlock(&fastopenq->lock);
+ +		reqsk_free(req1);
+ +	}
+ +	if (skip_cookie) {
+ +		tcp_rsk(req)->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +		return true;
+ +	}
+ +
+ +	if (foc->len == TCP_FASTOPEN_COOKIE_SIZE) {
+ +		if ((sysctl_tcp_fastopen & TFO_SERVER_COOKIE_NOT_CHKED) == 0) {
+ +			tcp_fastopen_cookie_gen(ip_hdr(skb)->saddr,
+ +						ip_hdr(skb)->daddr, valid_foc);
+ +			if ((valid_foc->len != TCP_FASTOPEN_COOKIE_SIZE) ||
+ +			    memcmp(&foc->val[0], &valid_foc->val[0],
+ +			    TCP_FASTOPEN_COOKIE_SIZE) != 0)
+ +				return false;
+ +			valid_foc->len = -1;
+ +		}
+ +		/* Acknowledge the data received from the peer. */
+ +		tcp_rsk(req)->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +		return true;
+ +	} else if (foc->len == 0) { /* Client requesting a cookie */
+ +		tcp_fastopen_cookie_gen(ip_hdr(skb)->saddr,
+ +					ip_hdr(skb)->daddr, valid_foc);
+ +		NET_INC_STATS_BH(sock_net(sk),
+ +		    LINUX_MIB_TCPFASTOPENCOOKIEREQD);
+ +	} else {
+ +		/* Client sent a cookie with wrong size. Treat it
+ +		 * the same as invalid and return a valid one.
+ +		 */
+ +		tcp_fastopen_cookie_gen(ip_hdr(skb)->saddr,
+ +					ip_hdr(skb)->daddr, valid_foc);
+ +	}
+ +	return false;
+ +}
+ +
+ +static int tcp_v4_conn_req_fastopen(struct sock *sk,
+ +				    struct sk_buff *skb,
+ +				    struct sk_buff *skb_synack,
+ +				    struct request_sock *req)
+ +{
+ +	struct tcp_sock *tp = tcp_sk(sk);
+ +	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
+ +	const struct inet_request_sock *ireq = inet_rsk(req);
+ +	struct sock *child;
+ +	int err;
+ +
+ +	req->num_retrans = 0;
+ +	req->num_timeout = 0;
+ +	req->sk = NULL;
+ +
+ +	child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL);
+ +	if (child == NULL) {
+ +		NET_INC_STATS_BH(sock_net(sk),
+ +				 LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
+ +		kfree_skb(skb_synack);
+ +		return -1;
+ +	}
+ +	err = ip_build_and_send_pkt(skb_synack, sk, ireq->ir_loc_addr,
+ +				    ireq->ir_rmt_addr, ireq->opt);
+ +	err = net_xmit_eval(err);
+ +	if (!err)
+ +		tcp_rsk(req)->snt_synack = tcp_time_stamp;
+ +	/* XXX (TFO) - is it ok to ignore error and continue? */
+ +
+ +	spin_lock(&queue->fastopenq->lock);
+ +	queue->fastopenq->qlen++;
+ +	spin_unlock(&queue->fastopenq->lock);
+ +
+ +	/* Initialize the child socket. Have to fix some values to take
+ +	 * into account the child is a Fast Open socket and is created
+ +	 * only out of the bits carried in the SYN packet.
+ +	 */
+ +	tp = tcp_sk(child);
+ +
+ +	tp->fastopen_rsk = req;
+ +	/* Do a hold on the listner sk so that if the listener is being
+ +	 * closed, the child that has been accepted can live on and still
+ +	 * access listen_lock.
+ +	 */
+ +	sock_hold(sk);
+ +	tcp_rsk(req)->listener = sk;
+ +
+ +	/* RFC1323: The window in SYN & SYN/ACK segments is never
+ +	 * scaled. So correct it appropriately.
+ +	 */
+ +	tp->snd_wnd = ntohs(tcp_hdr(skb)->window);
+ +
+ +	/* Activate the retrans timer so that SYNACK can be retransmitted.
+ +	 * The request socket is not added to the SYN table of the parent
+ +	 * because it's been added to the accept queue directly.
+ +	 */
+ +	inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
+ +	    TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+ +
+ +	/* Add the child socket directly into the accept queue */
+ +	inet_csk_reqsk_queue_add(sk, req, child);
+ +
+ +	/* Now finish processing the fastopen child socket. */
+ +	inet_csk(child)->icsk_af_ops->rebuild_header(child);
+ +	tcp_init_congestion_control(child);
+ +	tcp_mtup_init(child);
+ +	tcp_init_metrics(child);
+ +	tcp_init_buffer_space(child);
+ +
+ +	/* Queue the data carried in the SYN packet. We need to first
+ +	 * bump skb's refcnt because the caller will attempt to free it.
+ +	 *
+ +	 * XXX (TFO) - we honor a zero-payload TFO request for now.
+ +	 * (Any reason not to?)
+ +	 */
+ +	if (TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq + 1) {
+ +		/* Don't queue the skb if there is no payload in SYN.
+ +		 * XXX (TFO) - How about SYN+FIN?
+ +		 */
+ +		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +	} else {
+ +		skb = skb_get(skb);
+ +		skb_dst_drop(skb);
+ +		__skb_pull(skb, tcp_hdr(skb)->doff * 4);
+ +		skb_set_owner_r(skb, child);
+ +		__skb_queue_tail(&child->sk_receive_queue, skb);
+ +		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +		tp->syn_data_acked = 1;
+ +	}
+ +	sk->sk_data_ready(sk, 0);
+ +	bh_unlock_sock(child);
+ +	sock_put(child);
+ +	WARN_ON(req->sk == NULL);
+ +	return 0;
+ +}
+  
+  int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+  {
+@@@ -1481,12 -1322,10 +1486,12 @@@
+  	if (!req)
+  		goto drop;
+  
+ -	af_ops = tcp_rsk(req)->af_specific = &tcp_request_sock_ipv4_ops;
+ +#ifdef CONFIG_TCP_MD5SIG
+ +	tcp_rsk(req)->af_specific = &tcp_request_sock_ipv4_ops;
+ +#endif
+  
+  	tcp_clear_options(&tmp_opt);
+- 	tmp_opt.mss_clamp = TCP_MSS_DEFAULT;
++ 	tmp_opt.mss_clamp = af_ops->mss_clamp;
+  	tmp_opt.user_mss  = tp->rx_opt.user_mss;
+  	tcp_parse_options(skb, &tmp_opt, 0, want_cookie ? NULL : &foc);
+  
+diff --cc net/ipv6/tcp_ipv6.c
+index 45f11a2930c9,ad658332cf7d..000000000000
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@@ -723,15 -750,24 +723,21 @@@ struct request_sock_ops tcp6_request_so
+  	.send_ack	=	tcp_v6_reqsk_send_ack,
+  	.destructor	=	tcp_v6_reqsk_destructor,
+  	.send_reset	=	tcp_v6_send_reset,
+ -	.syn_ack_timeout =	tcp_syn_ack_timeout,
+ +	.syn_ack_timeout = 	tcp_syn_ack_timeout,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct tcp_request_sock_ops tcp_request_sock_ipv6_ops = {
++ 	.mss_clamp	=	IPV6_MIN_MTU - sizeof(struct tcphdr) -
++ 				sizeof(struct ipv6hdr),
+++>>>>>>> 2aec4a297b21 (tcp: add mss_clamp to tcp_request_sock_ops)
+  #ifdef CONFIG_TCP_MD5SIG
+ +static const struct tcp_request_sock_ops tcp_request_sock_ipv6_ops = {
+  	.md5_lookup	=	tcp_v6_reqsk_md5_lookup,
+  	.calc_md5_hash	=	tcp_v6_md5_hash_skb,
+ -#endif
+ -	.init_req	=	tcp_v6_init_req,
+ -#ifdef CONFIG_SYN_COOKIES
+ -	.cookie_init_seq =	cookie_v6_init_sequence,
+ -#endif
+ -	.route_req	=	tcp_v6_route_req,
+ -	.init_seq	=	tcp_v6_init_sequence,
+ -	.send_synack	=	tcp_v6_send_synack,
+  };
+ +#endif
+  
+  static void tcp_v6_send_response(struct sk_buff *skb, u32 seq, u32 ack, u32 win,
+  				 u32 tsval, u32 tsecr, int oif,
+@@@ -1002,14 -1046,12 +1008,14 @@@ static int tcp_v6_conn_request(struct s
+  	if (req == NULL)
+  		goto drop;
+  
+ -	af_ops = tcp_rsk(req)->af_specific = &tcp_request_sock_ipv6_ops;
+ +#ifdef CONFIG_TCP_MD5SIG
+ +	tcp_rsk(req)->af_specific = &tcp_request_sock_ipv6_ops;
+ +#endif
+  
+  	tcp_clear_options(&tmp_opt);
+- 	tmp_opt.mss_clamp = IPV6_MIN_MTU - sizeof(struct tcphdr) - sizeof(struct ipv6hdr);
++ 	tmp_opt.mss_clamp = af_ops->mss_clamp;
+  	tmp_opt.user_mss = tp->rx_opt.user_mss;
+ -	tcp_parse_options(skb, &tmp_opt, 0, want_cookie ? NULL : &foc);
+ +	tcp_parse_options(skb, &tmp_opt, 0, NULL);
+  
+  	if (want_cookie && !tmp_opt.saw_tstamp)
+  		tcp_clear_options(&tmp_opt);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index ba45accd7103..6d49297ce324 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1570,6 +1570,7 @@ struct tcp_sock_af_ops {
+ };
+ 
+ struct tcp_request_sock_ops {
++	u16 mss_clamp;
+ #ifdef CONFIG_TCP_MD5SIG
+ 	struct tcp_md5sig_key	*(*md5_lookup) (struct sock *sk,
+ 						struct request_sock *req);
+* Unmerged path net/ipv4/tcp_ipv4.c
+* Unmerged path net/ipv6/tcp_ipv6.c
