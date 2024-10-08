@@ -1,0 +1,137 @@
+net: cdc_ncm: use sane defaults for rx/tx buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bjørn Mork <bjorn@mork.no>
+commit 50f1cb1cc8f50fa88dbeaf990ae2bae91b9ff306
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/50f1cb1c.failed
+
+Lots of devices request much larger buffers than reasonable. This
+cause real problems for users of hosts with limited resources.
+
+Reducing the default buffer size to 16kB for such devices is
+a reasonable trade-off between allowing them to aggregate traffic
+and avoiding memory exhaustion on resource restrained hosts.
+
+	Signed-off-by: Bjørn Mork <bjorn@mork.no>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 50f1cb1cc8f50fa88dbeaf990ae2bae91b9ff306)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/cdc_ncm.c
+diff --cc drivers/net/usb/cdc_ncm.c
+index 4bae7ffa5334,bb53abe1f3a1..000000000000
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@@ -214,68 -485,31 +214,86 @@@ static u8 cdc_ncm_setup(struct usbnet *
+  	}
+  
+  	/* adjust TX-remainder according to NCM specification. */
+ -	ctx->tx_remainder = ((ctx->tx_remainder - cdc_ncm_eth_hlen(dev)) &
+ +	ctx->tx_remainder = ((ctx->tx_remainder - eth_hlen) &
+  			     (ctx->tx_modulus - 1));
+ -}
+  
+++<<<<<<< HEAD
+ +	/* additional configuration */
+ +
+ +	/* set CRC Mode */
+ +	if (flags & USB_CDC_NCM_NCAP_CRC_MODE) {
+ +		err = usbnet_write_cmd(dev, USB_CDC_SET_CRC_MODE,
+ +				       USB_TYPE_CLASS | USB_DIR_OUT
+ +				       | USB_RECIP_INTERFACE,
+ +				       USB_CDC_NCM_CRC_NOT_APPENDED,
+ +				       iface_no, NULL, 0);
+ +		if (err < 0)
+ +			dev_dbg(&dev->intf->dev, "Setting CRC mode off failed\n");
+ +	}
+++=======
++ static int cdc_ncm_setup(struct usbnet *dev)
++ {
++ 	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
++ 	u32 def_rx, def_tx;
++ 
++ 	/* be conservative when selecting intial buffer size to
++ 	 * increase the number of hosts this will work for
++ 	 */
++ 	def_rx = min_t(u32, CDC_NCM_NTB_DEF_SIZE_RX,
++ 		       le32_to_cpu(ctx->ncm_parm.dwNtbInMaxSize));
++ 	def_tx = min_t(u32, CDC_NCM_NTB_DEF_SIZE_TX,
++ 		       le32_to_cpu(ctx->ncm_parm.dwNtbOutMaxSize));
++ 
++ 	/* clamp rx_max and tx_max and inform device */
++ 	cdc_ncm_update_rxtx_max(dev, def_rx, def_tx);
+++>>>>>>> 50f1cb1cc8f5 (net: cdc_ncm: use sane defaults for rx/tx buffers)
+  
+ -	/* sanitize the modulus and remainder values */
+ -	cdc_ncm_fix_modulus(dev);
+ +	/* set NTB format, if both formats are supported */
+ +	if (ntb_fmt_supported & USB_CDC_NCM_NTH32_SIGN) {
+ +		err = usbnet_write_cmd(dev, USB_CDC_SET_NTB_FORMAT,
+ +				       USB_TYPE_CLASS | USB_DIR_OUT
+ +				       | USB_RECIP_INTERFACE,
+ +				       USB_CDC_NCM_NTB16_FORMAT,
+ +				       iface_no, NULL, 0);
+ +		if (err < 0)
+ +			dev_dbg(&dev->intf->dev, "Setting NTB format to 16-bit failed\n");
+ +	}
+ +
+ +	/* inform the device about the selected Max Datagram Size */
+ +	if (!(flags & USB_CDC_NCM_NCAP_MAX_DATAGRAM_SIZE))
+ +		goto out;
+ +
+ +	/* read current mtu value from device */
+ +	err = usbnet_read_cmd(dev, USB_CDC_GET_MAX_DATAGRAM_SIZE,
+ +			      USB_TYPE_CLASS | USB_DIR_IN | USB_RECIP_INTERFACE,
+ +			      0, iface_no, &max_datagram_size, 2);
+ +	if (err < 0) {
+ +		dev_dbg(&dev->intf->dev, "GET_MAX_DATAGRAM_SIZE failed\n");
+ +		goto out;
+ +	}
+ +
+ +	if (le16_to_cpu(max_datagram_size) == ctx->max_datagram_size)
+ +		goto out;
+ +
+ +	max_datagram_size = cpu_to_le16(ctx->max_datagram_size);
+ +	err = usbnet_write_cmd(dev, USB_CDC_SET_MAX_DATAGRAM_SIZE,
+ +			       USB_TYPE_CLASS | USB_DIR_OUT | USB_RECIP_INTERFACE,
+ +			       0, iface_no, &max_datagram_size, 2);
+ +	if (err < 0)
+ +		dev_dbg(&dev->intf->dev, "SET_MAX_DATAGRAM_SIZE failed\n");
+ +
+ +out:
+ +	/* set MTU to max supported by the device if necessary */
+ +	if (dev->net->mtu > ctx->max_datagram_size - eth_hlen)
+ +		dev->net->mtu = ctx->max_datagram_size - eth_hlen;
+ +
+ +	/* do not exceed operater preferred MTU */
+ +	if (ctx->mbim_extended_desc) {
+ +		mbim_mtu = le16_to_cpu(ctx->mbim_extended_desc->wMTU);
+ +		if (mbim_mtu != 0 && mbim_mtu < dev->net->mtu)
+ +			dev->net->mtu = mbim_mtu;
+ +	}
+  
+ -	/* set max datagram size */
+ -	cdc_ncm_set_dgram_size(dev, cdc_ncm_max_dgram_size(dev));
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/usb/cdc_ncm.c
+diff --git a/include/linux/usb/cdc_ncm.h b/include/linux/usb/cdc_ncm.h
+index 55b6feead93b..ec2849990f4f 100644
+--- a/include/linux/usb/cdc_ncm.h
++++ b/include/linux/usb/cdc_ncm.h
+@@ -52,6 +52,10 @@
+ #define	CDC_NCM_NTB_MAX_SIZE_TX			32768	/* bytes */
+ #define	CDC_NCM_NTB_MAX_SIZE_RX			32768	/* bytes */
+ 
++/* Initial NTB length */
++#define	CDC_NCM_NTB_DEF_SIZE_TX			16384	/* bytes */
++#define	CDC_NCM_NTB_DEF_SIZE_RX			16384	/* bytes */
++
+ /* Minimum value for MaxDatagramSize, ch. 6.2.9 */
+ #define	CDC_NCM_MIN_DATAGRAM_SIZE		1514	/* bytes */
+ 
