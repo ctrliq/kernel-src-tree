@@ -1,0 +1,178 @@
+perf ui/stdio: Implement hierarchy output mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit ef86d68a088c324e4bd85f82387d1f9a571affd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ef86d68a.failed
+
+The hierarchy output mode is to group entries for each level so that
+user can see higher level picture more easily.  It also helps to find
+out which component is most costly.  The output will look like below:
+
+      15.11%     swapper
+         14.97%     [kernel.vmlinux]
+          0.09%     [libahci]
+          0.05%     [iwlwifi]
+      10.29%     irq/33-iwlwifi
+          6.45%     [kernel.vmlinux]
+          1.41%     [mac80211]
+          1.15%     [iwldvm]
+          1.14%     [iwlwifi]
+          0.14%     [cfg80211]
+       4.81%     firefox
+          3.92%     libxul.so
+          0.34%     [kernel.vmlinux]
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Acked-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1456326830-30456-10-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit ef86d68a088c324e4bd85f82387d1f9a571affd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/hist.h
+diff --cc tools/perf/util/hist.h
+index 1d52912874e9,722aa447f705..000000000000
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@@ -384,4 -421,22 +384,25 @@@ int perf_hist_config(const char *var, c
+  
+  void perf_hpp_list__init(struct perf_hpp_list *list);
+  
+++<<<<<<< HEAD
+++=======
++ enum hierarchy_move_dir {
++ 	HMD_NORMAL,
++ 	HMD_FORCE_SIBLING,
++ 	HMD_FORCE_CHILD,
++ };
++ 
++ struct rb_node *rb_hierarchy_last(struct rb_node *node);
++ struct rb_node *__rb_hierarchy_next(struct rb_node *node,
++ 				    enum hierarchy_move_dir hmd);
++ struct rb_node *rb_hierarchy_prev(struct rb_node *node);
++ 
++ static inline struct rb_node *rb_hierarchy_next(struct rb_node *node)
++ {
++ 	return __rb_hierarchy_next(node, HMD_NORMAL);
++ }
++ 
++ #define HIERARCHY_INDENT  3
++ 
+++>>>>>>> ef86d68a088c (perf ui/stdio: Implement hierarchy output mode)
+  #endif	/* __PERF_HIST_H */
+diff --git a/tools/perf/ui/stdio/hist.c b/tools/perf/ui/stdio/hist.c
+index 28fcb1ee0342..0967c6a65188 100644
+--- a/tools/perf/ui/stdio/hist.c
++++ b/tools/perf/ui/stdio/hist.c
+@@ -409,6 +409,76 @@ static int hist_entry__snprintf(struct hist_entry *he, struct perf_hpp *hpp)
+ 	return hpp->buf - start;
+ }
+ 
++static int hist_entry__hierarchy_fprintf(struct hist_entry *he,
++					 struct perf_hpp *hpp,
++					 int nr_sort_key, struct hists *hists,
++					 FILE *fp)
++{
++	const char *sep = symbol_conf.field_sep;
++	struct perf_hpp_fmt *fmt;
++	char *buf = hpp->buf;
++	int ret, printed = 0;
++	bool first = true;
++
++	if (symbol_conf.exclude_other && !he->parent)
++		return 0;
++
++	ret = scnprintf(hpp->buf, hpp->size, "%*s", he->depth * HIERARCHY_INDENT, "");
++	advance_hpp(hpp, ret);
++
++	hists__for_each_format(he->hists, fmt) {
++		if (perf_hpp__is_sort_entry(fmt) || perf_hpp__is_dynamic_entry(fmt))
++			break;
++
++		/*
++		 * If there's no field_sep, we still need
++		 * to display initial '  '.
++		 */
++		if (!sep || !first) {
++			ret = scnprintf(hpp->buf, hpp->size, "%s", sep ?: "  ");
++			advance_hpp(hpp, ret);
++		} else
++			first = false;
++
++		if (perf_hpp__use_color() && fmt->color)
++			ret = fmt->color(fmt, hpp, he);
++		else
++			ret = fmt->entry(fmt, hpp, he);
++
++		ret = hist_entry__snprintf_alignment(he, hpp, fmt, ret);
++		advance_hpp(hpp, ret);
++	}
++
++	if (sep)
++		ret = scnprintf(hpp->buf, hpp->size, "%s", sep);
++	else
++		ret = scnprintf(hpp->buf, hpp->size, "%*s",
++				(nr_sort_key - 1) * HIERARCHY_INDENT + 2, "");
++	advance_hpp(hpp, ret);
++
++	/*
++	 * No need to call hist_entry__snprintf_alignment() since this
++	 * fmt is always the last column in the hierarchy mode.
++	 */
++	fmt = he->fmt;
++	if (perf_hpp__use_color() && fmt->color)
++		fmt->color(fmt, hpp, he);
++	else
++		fmt->entry(fmt, hpp, he);
++
++	printed += fprintf(fp, "%s\n", buf);
++
++	if (symbol_conf.use_callchain && he->leaf) {
++		u64 total = hists__total_period(hists);
++
++		printed += hist_entry_callchain__fprintf(he, total, 0, fp);
++		goto out;
++	}
++
++out:
++	return printed;
++}
++
+ static int hist_entry__fprintf(struct hist_entry *he, size_t size,
+ 			       struct hists *hists,
+ 			       char *bf, size_t bfsz, FILE *fp)
+@@ -423,6 +493,13 @@ static int hist_entry__fprintf(struct hist_entry *he, size_t size,
+ 	if (size == 0 || size > bfsz)
+ 		size = hpp.size = bfsz;
+ 
++	if (symbol_conf.report_hierarchy) {
++		int nr_sort = hists->hpp_list->nr_sort_keys;
++
++		return hist_entry__hierarchy_fprintf(he, &hpp, nr_sort,
++						     hists, fp);
++	}
++
+ 	hist_entry__snprintf(he, &hpp);
+ 
+ 	ret = fprintf(fp, "%s\n", bf);
+@@ -521,7 +598,7 @@ print_entries:
+ 		goto out;
+ 	}
+ 
+-	for (nd = rb_first(&hists->entries); nd; nd = rb_next(nd)) {
++	for (nd = rb_first(&hists->entries); nd; nd = __rb_hierarchy_next(nd, HMD_FORCE_CHILD)) {
+ 		struct hist_entry *h = rb_entry(nd, struct hist_entry, rb_node);
+ 		float percent;
+ 
+* Unmerged path tools/perf/util/hist.h
