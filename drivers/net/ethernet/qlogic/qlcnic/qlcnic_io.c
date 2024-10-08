@@ -1752,7 +1752,7 @@ qlcnic_83xx_process_rcv(struct qlcnic_adapter *adapter,
 
 	if (qlcnic_encap_length(sts_data[1]) &&
 	    skb->ip_summed == CHECKSUM_UNNECESSARY) {
-		skb->encapsulation = 1;
+		skb->csum_level = 1;
 		adapter->stats.encap_rx_csummed++;
 	}
 
