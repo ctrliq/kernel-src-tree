@@ -1,0 +1,338 @@
+iommu/vt-d: Make use of IOMMU sysfs support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Make use of IOMMU sysfs support (Myron Stowe) [1136539]
+Rebuild_FUZZ: 92.50%
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit a5459cfece880e82778a60e6290ad6c0dd688a06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a5459cfe.failed
+
+Register our DRHD IOMMUs, cross link devices, and provide a base set
+of attributes for the IOMMU.  Note that IRQ remapping support parses
+the DMAR table very early in boot, well before the iommu_class can
+reasonably be setup, so our registration is split between
+intel_iommu_init(), which occurs later, and alloc_iommu(), which
+typically occurs much earlier, but may happen at any time later
+with IOMMU hot-add support.
+
+On a typical desktop system, this provides the following (pruned):
+
+$ find /sys | grep dmar
+/sys/devices/virtual/iommu/dmar0
+/sys/devices/virtual/iommu/dmar0/devices
+/sys/devices/virtual/iommu/dmar0/devices/0000:00:02.0
+/sys/devices/virtual/iommu/dmar0/intel-iommu
+/sys/devices/virtual/iommu/dmar0/intel-iommu/cap
+/sys/devices/virtual/iommu/dmar0/intel-iommu/ecap
+/sys/devices/virtual/iommu/dmar0/intel-iommu/address
+/sys/devices/virtual/iommu/dmar0/intel-iommu/version
+/sys/devices/virtual/iommu/dmar1
+/sys/devices/virtual/iommu/dmar1/devices
+/sys/devices/virtual/iommu/dmar1/devices/0000:00:00.0
+/sys/devices/virtual/iommu/dmar1/devices/0000:00:01.0
+/sys/devices/virtual/iommu/dmar1/devices/0000:00:16.0
+/sys/devices/virtual/iommu/dmar1/devices/0000:00:1a.0
+/sys/devices/virtual/iommu/dmar1/devices/0000:00:1b.0
+/sys/devices/virtual/iommu/dmar1/devices/0000:00:1c.0
+...
+/sys/devices/virtual/iommu/dmar1/intel-iommu
+/sys/devices/virtual/iommu/dmar1/intel-iommu/cap
+/sys/devices/virtual/iommu/dmar1/intel-iommu/ecap
+/sys/devices/virtual/iommu/dmar1/intel-iommu/address
+/sys/devices/virtual/iommu/dmar1/intel-iommu/version
+/sys/class/iommu/dmar0
+/sys/class/iommu/dmar1
+
+(devices also link back to the dmar units)
+
+This makes address, version, capabilities, and extended capabilities
+available, just like printed on boot.  I've tried not to duplicate
+data that can be found in the DMAR table, with the exception of the
+address, which provides an easy way to associate the sysfs device with
+a DRHD entry in the DMAR.  It's tempting to add scopes and RMRR data
+here, but the full DMAR table is already exposed under /sys/firmware/
+and therefore already provides a way for userspace to learn such
+details.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit a5459cfece880e82778a60e6290ad6c0dd688a06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dmar.c
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/dmar.c
+index e2ae85c4b46e,6744e2d4ff6f..000000000000
+--- a/drivers/iommu/dmar.c
++++ b/drivers/iommu/dmar.c
+@@@ -757,12 -996,15 +764,22 @@@ static int alloc_iommu(struct dmar_drhd
+  	return err;
+  }
+  
+ -static void free_iommu(struct intel_iommu *iommu)
+ +void free_iommu(struct intel_iommu *iommu)
+  {
+++<<<<<<< HEAD
+ +	if (!iommu)
+ +		return;
+ +
+ +	free_dmar_iommu(iommu);
+++=======
++ 	iommu_device_destroy(iommu->iommu_dev);
++ 
++ 	if (iommu->irq) {
++ 		free_irq(iommu->irq, iommu);
++ 		irq_set_handler_data(iommu->irq, NULL);
++ 		dmar_free_hwirq(iommu->irq);
++ 	}
+++>>>>>>> a5459cfece88 (iommu/vt-d: Make use of IOMMU sysfs support)
+  
+  	if (iommu->qi) {
+  		free_page((unsigned long)iommu->qi->desc);
+diff --cc drivers/iommu/intel-iommu.c
+index 45626ce6c39f,f9e5f84ee952..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -3764,10 -3944,68 +3764,67 @@@ static struct notifier_block intel_iomm
+  	.priority = 0
+  };
+  
++ 
++ static ssize_t intel_iommu_show_version(struct device *dev,
++ 					struct device_attribute *attr,
++ 					char *buf)
++ {
++ 	struct intel_iommu *iommu = dev_get_drvdata(dev);
++ 	u32 ver = readl(iommu->reg + DMAR_VER_REG);
++ 	return sprintf(buf, "%d:%d\n",
++ 		       DMAR_VER_MAJOR(ver), DMAR_VER_MINOR(ver));
++ }
++ static DEVICE_ATTR(version, S_IRUGO, intel_iommu_show_version, NULL);
++ 
++ static ssize_t intel_iommu_show_address(struct device *dev,
++ 					struct device_attribute *attr,
++ 					char *buf)
++ {
++ 	struct intel_iommu *iommu = dev_get_drvdata(dev);
++ 	return sprintf(buf, "%llx\n", iommu->reg_phys);
++ }
++ static DEVICE_ATTR(address, S_IRUGO, intel_iommu_show_address, NULL);
++ 
++ static ssize_t intel_iommu_show_cap(struct device *dev,
++ 				    struct device_attribute *attr,
++ 				    char *buf)
++ {
++ 	struct intel_iommu *iommu = dev_get_drvdata(dev);
++ 	return sprintf(buf, "%llx\n", iommu->cap);
++ }
++ static DEVICE_ATTR(cap, S_IRUGO, intel_iommu_show_cap, NULL);
++ 
++ static ssize_t intel_iommu_show_ecap(struct device *dev,
++ 				    struct device_attribute *attr,
++ 				    char *buf)
++ {
++ 	struct intel_iommu *iommu = dev_get_drvdata(dev);
++ 	return sprintf(buf, "%llx\n", iommu->ecap);
++ }
++ static DEVICE_ATTR(ecap, S_IRUGO, intel_iommu_show_ecap, NULL);
++ 
++ static struct attribute *intel_iommu_attrs[] = {
++ 	&dev_attr_version.attr,
++ 	&dev_attr_address.attr,
++ 	&dev_attr_cap.attr,
++ 	&dev_attr_ecap.attr,
++ 	NULL,
++ };
++ 
++ static struct attribute_group intel_iommu_group = {
++ 	.name = "intel-iommu",
++ 	.attrs = intel_iommu_attrs,
++ };
++ 
++ const struct attribute_group *intel_iommu_groups[] = {
++ 	&intel_iommu_group,
++ 	NULL,
++ };
++ 
+  int __init intel_iommu_init(void)
+  {
+ -	int ret = -ENODEV;
+ +	int ret = 0;
+  	struct dmar_drhd_unit *drhd;
+ -	struct intel_iommu *iommu;
+  
+  	/* VT-d is required for a TXT/tboot launch, so enforce that */
+  	force_on = tboot_force_iommu();
+@@@ -4252,91 -4418,25 +4314,105 @@@ static int intel_iommu_domain_has_cap(s
+  	return 0;
+  }
+  
+ +#define REQ_ACS_FLAGS	(PCI_ACS_SV | PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_UF)
+ +
+  static int intel_iommu_add_device(struct device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	struct pci_dev *bridge, *dma_pdev = NULL;
+++=======
++ 	struct intel_iommu *iommu;
+++>>>>>>> a5459cfece88 (iommu/vt-d: Make use of IOMMU sysfs support)
+  	struct iommu_group *group;
+ -	u8 bus, devfn;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!device_to_iommu(pci_domain_nr(pdev->bus),
+ +			     pdev->bus->number, pdev->devfn))
+ +		return -ENODEV;
+ +
+ +	bridge = pci_find_upstream_pcie_bridge(pdev);
+ +	if (bridge) {
+ +		if (pci_is_pcie(bridge))
+ +			dma_pdev = pci_get_domain_bus_and_slot(
+ +						pci_domain_nr(pdev->bus),
+ +						bridge->subordinate->number, 0);
+ +		if (!dma_pdev)
+ +			dma_pdev = pci_dev_get(bridge);
+ +	} else
+ +		dma_pdev = pci_dev_get(pdev);
+++=======
++ 	iommu = device_to_iommu(dev, &bus, &devfn);
++ 	if (!iommu)
++ 		return -ENODEV;
++ 
++ 	iommu_device_link(iommu->iommu_dev, dev);
++ 
++ 	group = iommu_group_get_for_dev(dev);
+++>>>>>>> a5459cfece88 (iommu/vt-d: Make use of IOMMU sysfs support)
+ +
+ +	/* Account for quirked devices */
+ +	swap_pci_ref(&dma_pdev, pci_get_dma_source(dma_pdev));
+  
+ -	if (IS_ERR(group))
+ -		return PTR_ERR(group);
+ +	/*
+ +	 * If it's a multifunction device that does not support our
+ +	 * required ACS flags, add to the same group as lowest numbered
+ +	 * function that also does not suport the required ACS flags.
+ +	 */
+ +	if (dma_pdev->multifunction &&
+ +	    !pci_acs_enabled(dma_pdev, REQ_ACS_FLAGS)) {
+ +		u8 i, slot = PCI_SLOT(dma_pdev->devfn);
+ +
+ +		for (i = 0; i < 8; i++) {
+ +			struct pci_dev *tmp;
+ +
+ +			tmp = pci_get_slot(dma_pdev->bus, PCI_DEVFN(slot, i));
+ +			if (!tmp)
+ +				continue;
+ +
+ +			if (!pci_acs_enabled(tmp, REQ_ACS_FLAGS)) {
+ +				swap_pci_ref(&dma_pdev, tmp);
+ +				break;
+ +			}
+ +			pci_dev_put(tmp);
+ +		}
+ +	}
+ +
+ +	/*
+ +	 * Devices on the root bus go through the iommu.  If that's not us,
+ +	 * find the next upstream device and test ACS up to the root bus.
+ +	 * Finding the next device may require skipping virtual buses.
+ +	 */
+ +	while (!pci_is_root_bus(dma_pdev->bus)) {
+ +		struct pci_bus *bus = dma_pdev->bus;
+ +
+ +		while (!bus->self) {
+ +			if (!pci_is_root_bus(bus))
+ +				bus = bus->parent;
+ +			else
+ +				goto root_bus;
+ +		}
+ +
+ +		if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
+ +			break;
+ +
+ +		swap_pci_ref(&dma_pdev, pci_dev_get(bus->self));
+ +	}
+ +
+ +root_bus:
+ +	group = iommu_group_get(&dma_pdev->dev);
+ +	pci_dev_put(dma_pdev);
+ +	if (!group) {
+ +		group = iommu_group_alloc();
+ +		if (IS_ERR(group))
+ +			return PTR_ERR(group);
+ +	}
+ +
+ +	ret = iommu_group_add_device(group, dev);
+  
+  	iommu_group_put(group);
+ -	return 0;
+ +	return ret;
+  }
+  
+  static void intel_iommu_remove_device(struct device *dev)
+diff --git a/Documentation/ABI/testing/sysfs-class-iommu-intel-iommu b/Documentation/ABI/testing/sysfs-class-iommu-intel-iommu
+new file mode 100644
+index 000000000000..258cc246d98e
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-class-iommu-intel-iommu
+@@ -0,0 +1,32 @@
++What:		/sys/class/iommu/<iommu>/intel-iommu/address
++Date:		June 2014
++KernelVersion:	3.17
++Contact:	Alex Williamson <alex.williamson@redhat.com>
++Description:
++		Physical address of the VT-d DRHD for this IOMMU.
++		Format: %llx.  This allows association of a sysfs
++		intel-iommu with a DMAR DRHD table entry.
++
++What:		/sys/class/iommu/<iommu>/intel-iommu/cap
++Date:		June 2014
++KernelVersion:	3.17
++Contact:	Alex Williamson <alex.williamson@redhat.com>
++Description:
++		The cached hardware capability register value
++		of this DRHD unit.  Format: %llx.
++
++What:		/sys/class/iommu/<iommu>/intel-iommu/ecap
++Date:		June 2014
++KernelVersion:	3.17
++Contact:	Alex Williamson <alex.williamson@redhat.com>
++Description:
++		The cached hardware extended capability register
++		value of this DRHD unit.  Format: %llx.
++
++What:		/sys/class/iommu/<iommu>/intel-iommu/version
++Date:		June 2014
++KernelVersion:	3.17
++Contact:	Alex Williamson <alex.williamson@redhat.com>
++Description:
++		The architecture version as reported from the
++		VT-d VER_REG.  Format: %d:%d, major:minor
+* Unmerged path drivers/iommu/dmar.c
+* Unmerged path drivers/iommu/intel-iommu.c
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index 425f20edbb9b..b48919de585c 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -336,6 +336,7 @@ struct intel_iommu {
+ #ifdef CONFIG_IRQ_REMAP
+ 	struct ir_table *ir_table;	/* Interrupt remapping info */
+ #endif
++	struct device	*iommu_dev; /* IOMMU-sysfs device */
+ 	int		node;
+ };
+ 
+@@ -366,4 +367,6 @@ extern int qi_submit_sync(struct qi_desc *desc, struct intel_iommu *iommu);
+ 
+ extern int dmar_ir_support(void);
+ 
++extern const struct attribute_group *intel_iommu_groups[];
++
+ #endif
