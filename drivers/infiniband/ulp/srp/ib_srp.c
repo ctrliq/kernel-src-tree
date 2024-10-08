@@ -1214,14 +1214,10 @@ static int srp_rport_reconnect(struct srp_rport *rport)
 	 */
 	for (i = 0; i < target->ch_count; i++) {
 		ch = &target->ch[i];
-		if (!ch->target)
-			break;
 		ret += srp_new_cm_id(ch);
 	}
 	for (i = 0; i < target->ch_count; i++) {
 		ch = &target->ch[i];
-		if (!ch->target)
-			break;
 		for (j = 0; j < target->req_ring_size; ++j) {
 			struct srp_request *req = &ch->req_ring[j];
 
@@ -1230,8 +1226,6 @@ static int srp_rport_reconnect(struct srp_rport *rport)
 	}
 	for (i = 0; i < target->ch_count; i++) {
 		ch = &target->ch[i];
-		if (!ch->target)
-			break;
 		/*
 		 * Whether or not creating a new CM ID succeeded, create a new
 		 * QP. This guarantees that all completion callback function
@@ -1248,7 +1242,7 @@ static int srp_rport_reconnect(struct srp_rport *rport)
 
 	for (i = 0; i < target->ch_count; i++) {
 		ch = &target->ch[i];
-		if (ret || !ch->target)
+		if (ret)
 			break;
 		ret = srp_connect_ch(ch, multich);
 		multich = true;
