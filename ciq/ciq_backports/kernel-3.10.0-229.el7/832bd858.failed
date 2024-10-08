@@ -1,0 +1,624 @@
+iommu/vt-d: Change scope lists to struct device, bus, devfn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Change scope lists to struct device, bus, devfn (Myron Stowe) [1129880 1087643]
+Rebuild_FUZZ: 94.64%
+commit-author David Woodhouse <David.Woodhouse@intel.com>
+commit 832bd858674023b2415c7585db3beba345ef807f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/832bd858.failed
+
+It's not only for PCI devices any more, and the scope information for an
+ACPI device provides the bus and devfn so that has to be stored here too.
+
+It is the device pointer itself which needs to be protected with RCU,
+so the __rcu annotation follows it into the definition of struct
+dmar_dev_scope, since we're no longer just passing arrays of device
+pointers around.
+
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 832bd858674023b2415c7585db3beba345ef807f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dmar.c
+#	drivers/iommu/intel-iommu.c
+#	include/linux/dmar.h
+diff --cc drivers/iommu/dmar.c
+index af997da05f06,c1e2e0c82e69..000000000000
+--- a/drivers/iommu/dmar.c
++++ b/drivers/iommu/dmar.c
+@@@ -135,34 -97,159 +135,181 @@@ void *dmar_alloc_dev_scope(void *start
+  	if (*cnt == 0)
+  		return NULL;
+  
+- 	return kcalloc(*cnt, sizeof(struct pci_dev *), GFP_KERNEL);
++ 	return kcalloc(*cnt, sizeof(struct dmar_dev_scope), GFP_KERNEL);
+  }
+  
+++<<<<<<< HEAD
+ +int __init dmar_parse_dev_scope(void *start, void *end, int *cnt,
+ +				struct pci_dev ***devices, u16 segment)
+ +{
+++=======
++ void dmar_free_dev_scope(struct dmar_dev_scope **devices, int *cnt)
++ {
++ 	int i;
++ 	struct device *tmp_dev;
++ 
++ 	if (*devices && *cnt) {
++ 		for_each_active_dev_scope(*devices, *cnt, i, tmp_dev)
++ 			put_device(tmp_dev);
++ 		kfree(*devices);
++ 	}
++ 
++ 	*devices = NULL;
++ 	*cnt = 0;
++ }
++ 
++ /* Optimize out kzalloc()/kfree() for normal cases */
++ static char dmar_pci_notify_info_buf[64];
++ 
++ static struct dmar_pci_notify_info *
++ dmar_alloc_pci_notify_info(struct pci_dev *dev, unsigned long event)
++ {
++ 	int level = 0;
++ 	size_t size;
++ 	struct pci_dev *tmp;
++ 	struct dmar_pci_notify_info *info;
++ 
++ 	BUG_ON(dev->is_virtfn);
++ 
++ 	/* Only generate path[] for device addition event */
++ 	if (event == BUS_NOTIFY_ADD_DEVICE)
++ 		for (tmp = dev; tmp; tmp = tmp->bus->self)
++ 			level++;
++ 
++ 	size = sizeof(*info) + level * sizeof(struct acpi_dmar_pci_path);
++ 	if (size <= sizeof(dmar_pci_notify_info_buf)) {
++ 		info = (struct dmar_pci_notify_info *)dmar_pci_notify_info_buf;
++ 	} else {
++ 		info = kzalloc(size, GFP_KERNEL);
++ 		if (!info) {
++ 			pr_warn("Out of memory when allocating notify_info "
++ 				"for %s.\n", pci_name(dev));
++ 			if (dmar_dev_scope_status == 0)
++ 				dmar_dev_scope_status = -ENOMEM;
++ 			return NULL;
++ 		}
++ 	}
++ 
++ 	info->event = event;
++ 	info->dev = dev;
++ 	info->seg = pci_domain_nr(dev->bus);
++ 	info->level = level;
++ 	if (event == BUS_NOTIFY_ADD_DEVICE) {
++ 		for (tmp = dev, level--; tmp; tmp = tmp->bus->self) {
++ 			info->path[level].device = PCI_SLOT(tmp->devfn);
++ 			info->path[level].function = PCI_FUNC(tmp->devfn);
++ 			if (pci_is_root_bus(tmp->bus))
++ 				info->bus = tmp->bus->number;
++ 		}
++ 	}
++ 
++ 	return info;
++ }
++ 
++ static inline void dmar_free_pci_notify_info(struct dmar_pci_notify_info *info)
++ {
++ 	if ((void *)info != dmar_pci_notify_info_buf)
++ 		kfree(info);
++ }
++ 
++ static bool dmar_match_pci_path(struct dmar_pci_notify_info *info, int bus,
++ 				struct acpi_dmar_pci_path *path, int count)
++ {
++ 	int i;
++ 
++ 	if (info->bus != bus)
++ 		return false;
++ 	if (info->level != count)
++ 		return false;
++ 
++ 	for (i = 0; i < count; i++) {
++ 		if (path[i].device != info->path[i].device ||
++ 		    path[i].function != info->path[i].function)
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ /* Return: > 0 if match found, 0 if no match found, < 0 if error happens */
++ int dmar_insert_dev_scope(struct dmar_pci_notify_info *info,
++ 			  void *start, void*end, u16 segment,
++ 			  struct dmar_dev_scope *devices,
++ 			  int devices_cnt)
++ {
++ 	int i, level;
++ 	struct device *tmp, *dev = &info->dev->dev;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  	struct acpi_dmar_device_scope *scope;
+ -	struct acpi_dmar_pci_path *path;
+ +	int index, ret;
+  
+ -	if (segment != info->seg)
+ +	*devices = dmar_alloc_dev_scope(start, end, cnt);
+ +	if (*cnt == 0)
+  		return 0;
+ +	else if (!*devices)
+ +		return -ENOMEM;
+  
+ -	for (; start < end; start += scope->length) {
+ +	for (index = 0; start < end; start += scope->length) {
+  		scope = start;
+++<<<<<<< HEAD
+ +		if (scope->entry_type == ACPI_DMAR_SCOPE_TYPE_ENDPOINT ||
+ +		    scope->entry_type == ACPI_DMAR_SCOPE_TYPE_BRIDGE) {
+ +			ret = dmar_parse_one_dev_scope(scope,
+ +				&(*devices)[index], segment);
+ +			if (ret) {
+ +				dmar_free_dev_scope(devices, cnt);
+ +				return ret;
+ +			}
+ +			index ++;
+++=======
++ 		if (scope->entry_type != ACPI_DMAR_SCOPE_TYPE_ENDPOINT &&
++ 		    scope->entry_type != ACPI_DMAR_SCOPE_TYPE_BRIDGE)
++ 			continue;
++ 
++ 		path = (struct acpi_dmar_pci_path *)(scope + 1);
++ 		level = (scope->length - sizeof(*scope)) / sizeof(*path);
++ 		if (!dmar_match_pci_path(info, scope->bus, path, level))
++ 			continue;
++ 
++ 		if ((scope->entry_type == ACPI_DMAR_SCOPE_TYPE_ENDPOINT) ^
++ 		    (info->dev->hdr_type == PCI_HEADER_TYPE_NORMAL)) {
++ 			pr_warn("Device scope type does not match for %s\n",
++ 				pci_name(info->dev));
++ 			return -EINVAL;
++ 		}
++ 
++ 		for_each_dev_scope(devices, devices_cnt, i, tmp)
++ 			if (tmp == NULL) {
++ 				devices[i].bus = info->dev->bus->number;
++ 				devices[i].devfn = info->dev->devfn;
++ 				rcu_assign_pointer(devices[i].dev,
++ 						   get_device(dev));
++ 				return 1;
++ 			}
++ 		BUG_ON(i >= devices_cnt);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int dmar_remove_dev_scope(struct dmar_pci_notify_info *info, u16 segment,
++ 			  struct dmar_dev_scope *devices, int count)
++ {
++ 	int index;
++ 	struct device *tmp;
++ 
++ 	if (info->seg != segment)
++ 		return 0;
++ 
++ 	for_each_active_dev_scope(devices, count, index, tmp)
++ 		if (tmp == &info->dev->dev) {
++ 			rcu_assign_pointer(devices[index].dev, NULL);
++ 			synchronize_rcu();
++ 			put_device(tmp);
++ 			return 1;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  		}
+ +	}
+  
+  	return 0;
+  }
+@@@ -421,14 -565,15 +568,26 @@@ parse_dmar_table(void
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int dmar_pci_device_match(struct pci_dev *devices[], int cnt,
+ +			  struct pci_dev *dev)
+ +{
+ +	int index;
+ +
+ +	while (dev) {
+ +		for (index = 0; index < cnt; index++)
+ +			if (dev == devices[index])
+++=======
++ static int dmar_pci_device_match(struct dmar_dev_scope devices[],
++ 				 int cnt, struct pci_dev *dev)
++ {
++ 	int index;
++ 	struct device *tmp;
++ 
++ 	while (dev) {
++ 		for_each_active_dev_scope(devices, cnt, index, tmp)
++ 			if (dev_is_pci(tmp) && dev == to_pci_dev(tmp))
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  				return 1;
+  
+  		/* Check our parent */
+diff --cc drivers/iommu/intel-iommu.c
+index 6fccb28ca7f1,ace088eebb45..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -410,14 -382,14 +410,22 @@@ struct dmar_rmrr_unit 
+  	struct acpi_dmar_header *hdr;	/* ACPI header		*/
+  	u64	base_address;		/* reserved base address*/
+  	u64	end_address;		/* reserved end address */
+++<<<<<<< HEAD
+ +	struct pci_dev **devices;	/* target devices */
+++=======
++ 	struct dmar_dev_scope *devices;	/* target devices */
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  	int	devices_cnt;		/* target device count */
+  };
+  
+  struct dmar_atsr_unit {
+  	struct list_head list;		/* list of ATSR units */
+  	struct acpi_dmar_header *hdr;	/* ACPI header */
+++<<<<<<< HEAD
+ +	struct pci_dev **devices;	/* target devices */
+++=======
++ 	struct dmar_dev_scope *devices;	/* target devices */
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  	int devices_cnt;		/* target device count */
+  	u8 include_all:1;		/* include all ports */
+  };
+@@@ -689,24 -668,27 +697,44 @@@ static void domain_update_iommu_cap(str
+  static struct intel_iommu *device_to_iommu(int segment, u8 bus, u8 devfn)
+  {
+  	struct dmar_drhd_unit *drhd = NULL;
+++<<<<<<< HEAD
+++=======
++ 	struct intel_iommu *iommu;
++ 	struct device *dev;
++ 	struct pci_dev *pdev;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  	int i;
+  
+ -	rcu_read_lock();
+ -	for_each_active_iommu(iommu, drhd) {
+ +	for_each_drhd_unit(drhd) {
+ +		if (drhd->ignored)
+ +			continue;
+  		if (segment != drhd->segment)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		for (i = 0; i < drhd->devices_cnt; i++) {
+ +			if (drhd->devices[i] &&
+ +			    drhd->devices[i]->bus->number == bus &&
+ +			    drhd->devices[i]->devfn == devfn)
+ +				return drhd->iommu;
+ +			if (drhd->devices[i] &&
+ +			    drhd->devices[i]->subordinate &&
+ +			    drhd->devices[i]->subordinate->number <= bus &&
+ +			    drhd->devices[i]->subordinate->busn_res.end >= bus)
+ +				return drhd->iommu;
+++=======
++ 		for_each_active_dev_scope(drhd->devices,
++ 					  drhd->devices_cnt, i, dev) {
++ 			if (!dev_is_pci(dev))
++ 				continue;
++ 			pdev = to_pci_dev(dev);
++ 			if (pdev->bus->number == bus && pdev->devfn == devfn)
++ 				goto out;
++ 			if (pdev->subordinate &&
++ 			    pdev->subordinate->number <= bus &&
++ 			    pdev->subordinate->busn_res.end >= bus)
++ 				goto out;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  		}
+  
+  		if (drhd->include_all)
+@@@ -2379,18 -2483,23 +2407,33 @@@ static int domain_add_dev_info(struct d
+  static bool device_has_rmrr(struct pci_dev *dev)
+  {
+  	struct dmar_rmrr_unit *rmrr;
+++<<<<<<< HEAD
+++=======
++ 	struct device *tmp;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  	int i;
+  
+ -	rcu_read_lock();
+  	for_each_rmrr_units(rmrr) {
+++<<<<<<< HEAD
+ +		for (i = 0; i < rmrr->devices_cnt; i++) {
+ +			/*
+ +			 * Return TRUE if this RMRR contains the device that
+ +			 * is passed in.
+ +			 */
+ +			if (rmrr->devices[i] == dev)
+++=======
++ 		/*
++ 		 * Return TRUE if this RMRR contains the device that
++ 		 * is passed in.
++ 		 */
++ 		for_each_active_dev_scope(rmrr->devices,
++ 					  rmrr->devices_cnt, i, tmp)
++ 			if (tmp == &dev->dev) {
++ 				rcu_read_unlock();
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  				return true;
+ -			}
+ +		}
+  	}
+ -	rcu_read_unlock();
+  	return false;
+  }
+  
+@@@ -2653,15 -2748,12 +2696,24 @@@ static int __init init_dmars(void
+  	 */
+  	printk(KERN_INFO "IOMMU: Setting RMRR:\n");
+  	for_each_rmrr_units(rmrr) {
+++<<<<<<< HEAD
+ +		for (i = 0; i < rmrr->devices_cnt; i++) {
+ +			pdev = rmrr->devices[i];
+ +			/*
+ +			 * some BIOS lists non-exist devices in DMAR
+ +			 * table.
+ +			 */
+ +			if (!pdev)
+ +				continue;
+ +			ret = iommu_prepare_rmrr_dev(rmrr, pdev);
+++=======
++ 		/* some BIOS lists non-exist devices in DMAR table. */
++ 		for_each_active_dev_scope(rmrr->devices, rmrr->devices_cnt,
++ 					  i, dev) {
++ 			if (!dev_is_pci(dev))
++ 				continue;
++ 			ret = iommu_prepare_rmrr_dev(rmrr, to_pci_dev(dev));
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  			if (ret)
+  				printk(KERN_ERR
+  				       "IOMMU: mapping reserved region failed\n");
+@@@ -3349,29 -3440,28 +3401,47 @@@ DECLARE_PCI_FIXUP_ENABLE(PCI_VENDOR_ID_
+  static void __init init_no_remapping_devices(void)
+  {
+  	struct dmar_drhd_unit *drhd;
+++<<<<<<< HEAD
+ +
+ +	for_each_drhd_unit(drhd) {
+ +		if (!drhd->include_all) {
+ +			int i;
+ +			for (i = 0; i < drhd->devices_cnt; i++)
+ +				if (drhd->devices[i] != NULL)
+ +					break;
+ +			/* ignore DMAR unit if no pci devices exist */
+++=======
++ 	struct device *dev;
++ 	int i;
++ 
++ 	for_each_drhd_unit(drhd) {
++ 		if (!drhd->include_all) {
++ 			for_each_active_dev_scope(drhd->devices,
++ 						  drhd->devices_cnt, i, dev)
++ 				break;
++ 			/* ignore DMAR unit if no devices exist */
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  			if (i == drhd->devices_cnt)
+  				drhd->ignored = 1;
+  		}
+  	}
+  
+ -	for_each_active_drhd_unit(drhd) {
+ -		if (drhd->include_all)
+ +	for_each_drhd_unit(drhd) {
+ +		int i;
+ +		if (drhd->ignored || drhd->include_all)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		for (i = 0; i < drhd->devices_cnt; i++)
+ +			if (drhd->devices[i] &&
+ +			    !IS_GFX_DEVICE(drhd->devices[i]))
+++=======
++ 		for_each_active_dev_scope(drhd->devices,
++ 					  drhd->devices_cnt, i, dev)
++ 			if (!dev_is_pci(dev) || !IS_GFX_DEVICE(to_pci_dev(dev)))
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  				break;
+ +
+  		if (i < drhd->devices_cnt)
+  			continue;
+  
+@@@ -3381,11 -3471,9 +3451,17 @@@
+  			intel_iommu_gfx_mapped = 1;
+  		} else {
+  			drhd->ignored = 1;
+++<<<<<<< HEAD
+ +			for (i = 0; i < drhd->devices_cnt; i++) {
+ +				if (!drhd->devices[i])
+ +					continue;
+ +				drhd->devices[i]->dev.archdata.iommu = DUMMY_DEVICE_DOMAIN_INFO;
+ +			}
+++=======
++ 			for_each_active_dev_scope(drhd->devices,
++ 						  drhd->devices_cnt, i, dev)
++ 				dev->archdata.iommu = DUMMY_DEVICE_DOMAIN_INFO;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  		}
+  	}
+  }
+@@@ -3611,9 -3695,10 +3687,13 @@@ static int __init atsr_parse_dev(struc
+  
+  int dmar_find_matched_atsr_unit(struct pci_dev *dev)
+  {
+ -	int i, ret = 1;
+ +	int i;
+  	struct pci_bus *bus;
+  	struct pci_dev *bridge = NULL;
+++<<<<<<< HEAD
+++=======
++ 	struct device *tmp;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  	struct acpi_dmar_atsr *atsr;
+  	struct dmar_atsr_unit *atsru;
+  
+@@@ -3634,36 -3720,72 +3714,42 @@@
+  		if (atsr->segment != pci_domain_nr(dev->bus))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		for (i = 0; i < atsru->devices_cnt; i++)
+ +			if (atsru->devices[i] == bridge)
+ +				return 1;
+++=======
++ 		for_each_dev_scope(atsru->devices, atsru->devices_cnt, i, tmp)
++ 			if (tmp == &bridge->dev)
++ 				goto out;
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  
+  		if (atsru->include_all)
+ -			goto out;
+ +			return 1;
+  	}
+ -	ret = 0;
+ -out:
+ -	rcu_read_unlock();
+  
+ -	return ret;
+ +	return 0;
+  }
+  
+ -int dmar_iommu_notify_scope_dev(struct dmar_pci_notify_info *info)
+ +int __init dmar_parse_rmrr_atsr_dev(void)
+  {
+ +	struct dmar_rmrr_unit *rmrr, *rmrr_n;
+ +	struct dmar_atsr_unit *atsr, *atsr_n;
+  	int ret = 0;
+ -	struct dmar_rmrr_unit *rmrru;
+ -	struct dmar_atsr_unit *atsru;
+ -	struct acpi_dmar_atsr *atsr;
+ -	struct acpi_dmar_reserved_memory *rmrr;
+ -
+ -	if (!intel_iommu_enabled && system_state != SYSTEM_BOOTING)
+ -		return 0;
+  
+ -	list_for_each_entry(rmrru, &dmar_rmrr_units, list) {
+ -		rmrr = container_of(rmrru->hdr,
+ -				    struct acpi_dmar_reserved_memory, header);
+ -		if (info->event == BUS_NOTIFY_ADD_DEVICE) {
+ -			ret = dmar_insert_dev_scope(info, (void *)(rmrr + 1),
+ -				((void *)rmrr) + rmrr->header.length,
+ -				rmrr->segment, rmrru->devices,
+ -				rmrru->devices_cnt);
+ -			if (ret > 0)
+ -				break;
+ -			else if(ret < 0)
+ -				return ret;
+ -		} else if (info->event == BUS_NOTIFY_DEL_DEVICE) {
+ -			if (dmar_remove_dev_scope(info, rmrr->segment,
+ -				rmrru->devices, rmrru->devices_cnt))
+ -				break;
+ -		}
+ +	list_for_each_entry_safe(rmrr, rmrr_n, &dmar_rmrr_units, list) {
+ +		ret = rmrr_parse_dev(rmrr);
+ +		if (ret)
+ +			return ret;
+  	}
+  
+ -	list_for_each_entry(atsru, &dmar_atsr_units, list) {
+ -		if (atsru->include_all)
+ -			continue;
+ -
+ -		atsr = container_of(atsru->hdr, struct acpi_dmar_atsr, header);
+ -		if (info->event == BUS_NOTIFY_ADD_DEVICE) {
+ -			ret = dmar_insert_dev_scope(info, (void *)(atsr + 1),
+ -					(void *)atsr + atsr->header.length,
+ -					atsr->segment, atsru->devices,
+ -					atsru->devices_cnt);
+ -			if (ret > 0)
+ -				break;
+ -			else if(ret < 0)
+ -				return ret;
+ -		} else if (info->event == BUS_NOTIFY_DEL_DEVICE) {
+ -			if (dmar_remove_dev_scope(info, atsr->segment,
+ -					atsru->devices, atsru->devices_cnt))
+ -				break;
+ -		}
+ +	list_for_each_entry_safe(atsr, atsr_n, &dmar_atsr_units, list) {
+ +		ret = atsr_parse_dev(atsr);
+ +		if (ret)
+ +			return ret;
+  	}
+  
+ -	return 0;
+ +	return ret;
+  }
+  
+  /*
+diff --cc include/linux/dmar.h
+index b6fb978dad27,23c8db129560..000000000000
+--- a/include/linux/dmar.h
++++ b/include/linux/dmar.h
+@@@ -40,7 -48,7 +46,11 @@@ struct dmar_drhd_unit 
+  	struct list_head list;		/* list of drhd units	*/
+  	struct  acpi_dmar_header *hdr;	/* ACPI header		*/
+  	u64	reg_base_addr;		/* register base address*/
+++<<<<<<< HEAD
+ +	struct	pci_dev **devices; 	/* target device array	*/
+++=======
++ 	struct	dmar_dev_scope *devices;/* target device array	*/
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  	int	devices_cnt;		/* target device count	*/
+  	u16	segment;		/* PCI domain		*/
+  	u8	ignored:1; 		/* ignore drhd		*/
+@@@ -58,16 -80,37 +68,45 @@@ extern struct list_head dmar_drhd_units
+  		if (i=drhd->iommu, drhd->ignored) {} else
+  
+  #define for_each_iommu(i, drhd)						\
+ -	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list)		\
+ +	list_for_each_entry(drhd, &dmar_drhd_units, list)		\
+  		if (i=drhd->iommu, 0) {} else 
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool dmar_rcu_check(void)
++ {
++ 	return rwsem_is_locked(&dmar_global_lock) ||
++ 	       system_state == SYSTEM_BOOTING;
++ }
++ 
++ #define	dmar_rcu_dereference(p)	rcu_dereference_check((p), dmar_rcu_check())
++ 
++ #define	for_each_dev_scope(a, c, p, d)	\
++ 	for ((p) = 0; ((d) = (p) < (c) ? dmar_rcu_dereference((a)[(p)].dev) : \
++ 			NULL, (p) < (c)); (p)++)
++ 
++ #define	for_each_active_dev_scope(a, c, p, d)	\
++ 	for_each_dev_scope((a), (c), (p), (d))	if (!(d)) { continue; } else
++ 
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  extern int dmar_table_init(void);
+  extern int dmar_dev_scope_init(void);
+  extern int dmar_parse_dev_scope(void *start, void *end, int *cnt,
+- 				struct pci_dev ***devices, u16 segment);
++ 				struct dmar_dev_scope **devices, u16 segment);
+  extern void *dmar_alloc_dev_scope(void *start, void *end, int *cnt);
+++<<<<<<< HEAD
+ +extern void dmar_free_dev_scope(struct pci_dev ***devices, int *cnt);
+ +
+++=======
++ extern void dmar_free_dev_scope(struct dmar_dev_scope **devices, int *cnt);
++ extern int dmar_insert_dev_scope(struct dmar_pci_notify_info *info,
++ 				 void *start, void*end, u16 segment,
++ 				 struct dmar_dev_scope *devices,
++ 				 int devices_cnt);
++ extern int dmar_remove_dev_scope(struct dmar_pci_notify_info *info,
++ 				 u16 segment, struct dmar_dev_scope *devices,
++ 				 int count);
+++>>>>>>> 832bd8586740 (iommu/vt-d: Change scope lists to struct device, bus, devfn)
+  /* Intel IOMMU detection */
+  extern int detect_intel_iommu(void);
+  extern int enable_drhd_fault_handling(void);
+* Unmerged path drivers/iommu/dmar.c
+* Unmerged path drivers/iommu/intel-iommu.c
+* Unmerged path include/linux/dmar.h
