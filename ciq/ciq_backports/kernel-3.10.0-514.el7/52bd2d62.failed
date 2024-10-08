@@ -1,0 +1,170 @@
+net: better skb->sender_cpu and skb->napi_id cohabitation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] better skb->sender_cpu and skb->napi_id cohabitation (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 95.41%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 52bd2d62ce6758d811edcbd2256eb9ea7f6a56cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/52bd2d62.failed
+
+skb->sender_cpu and skb->napi_id share a common storage,
+and we had various bugs about this.
+
+We had to call skb_sender_cpu_clear() in some places to
+not leave a prior skb->napi_id and fool netdev_pick_tx()
+
+As suggested by Alexei, we could split the space so that
+these errors can not happen.
+
+0 value being reserved as the common (not initialized) value,
+let's reserve [1 .. NR_CPUS] range for valid sender_cpu,
+and [NR_CPUS+1 .. ~0U] for valid napi_id.
+
+This will allow proper busy polling support over tunnels.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Suggested-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 52bd2d62ce6758d811edcbd2256eb9ea7f6a56cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/dev.c
+diff --cc include/linux/skbuff.h
+index 3247ee7f6870,c9c394bf0771..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -935,6 -1079,11 +935,13 @@@ static inline void skb_copy_hash(struc
+  	to->l4_hash = from->l4_hash;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline void skb_sender_cpu_clear(struct sk_buff *skb)
++ {
++ }
++ 
+++>>>>>>> 52bd2d62ce67 (net: better skb->sender_cpu and skb->napi_id cohabitation)
+  #ifdef NET_SKBUFF_DATA_USES_OFFSET
+  static inline unsigned char *skb_end_pointer(const struct sk_buff *skb)
+  {
+diff --cc net/core/dev.c
+index b52e68f2dd45,2582c24a75c6..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -173,10 -182,10 +173,10 @@@ EXPORT_SYMBOL(dev_base_lock)
+  /* protects napi_hash addition/deletion and napi_gen_id */
+  static DEFINE_SPINLOCK(napi_hash_lock);
+  
+- static unsigned int napi_gen_id;
++ static unsigned int napi_gen_id = NR_CPUS;
+  static DEFINE_HASHTABLE(napi_hash, 8);
+  
+ -static seqcount_t devnet_rename_seq;
+ +seqcount_t devnet_rename_seq;
+  
+  static inline void dev_base_seq_inc(struct net *net)
+  {
+@@@ -2768,9 -2962,91 +2768,93 @@@ int dev_loopback_xmit(struct sock *sk, 
+  }
+  EXPORT_SYMBOL(dev_loopback_xmit);
+  
+++<<<<<<< HEAD
+++=======
++ static inline int get_xps_queue(struct net_device *dev, struct sk_buff *skb)
++ {
++ #ifdef CONFIG_XPS
++ 	struct xps_dev_maps *dev_maps;
++ 	struct xps_map *map;
++ 	int queue_index = -1;
++ 
++ 	rcu_read_lock();
++ 	dev_maps = rcu_dereference(dev->xps_maps);
++ 	if (dev_maps) {
++ 		map = rcu_dereference(
++ 		    dev_maps->cpu_map[skb->sender_cpu - 1]);
++ 		if (map) {
++ 			if (map->len == 1)
++ 				queue_index = map->queues[0];
++ 			else
++ 				queue_index = map->queues[reciprocal_scale(skb_get_hash(skb),
++ 									   map->len)];
++ 			if (unlikely(queue_index >= dev->real_num_tx_queues))
++ 				queue_index = -1;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return queue_index;
++ #else
++ 	return -1;
++ #endif
++ }
++ 
++ static u16 __netdev_pick_tx(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	struct sock *sk = skb->sk;
++ 	int queue_index = sk_tx_queue_get(sk);
++ 
++ 	if (queue_index < 0 || skb->ooo_okay ||
++ 	    queue_index >= dev->real_num_tx_queues) {
++ 		int new_index = get_xps_queue(dev, skb);
++ 		if (new_index < 0)
++ 			new_index = skb_tx_hash(dev, skb);
++ 
++ 		if (queue_index != new_index && sk &&
++ 		    sk_fullsock(sk) &&
++ 		    rcu_access_pointer(sk->sk_dst_cache))
++ 			sk_tx_queue_set(sk, new_index);
++ 
++ 		queue_index = new_index;
++ 	}
++ 
++ 	return queue_index;
++ }
++ 
++ struct netdev_queue *netdev_pick_tx(struct net_device *dev,
++ 				    struct sk_buff *skb,
++ 				    void *accel_priv)
++ {
++ 	int queue_index = 0;
++ 
++ #ifdef CONFIG_XPS
++ 	u32 sender_cpu = skb->sender_cpu - 1;
++ 
++ 	if (sender_cpu >= (u32)NR_CPUS)
++ 		skb->sender_cpu = raw_smp_processor_id() + 1;
++ #endif
++ 
++ 	if (dev->real_num_tx_queues != 1) {
++ 		const struct net_device_ops *ops = dev->netdev_ops;
++ 		if (ops->ndo_select_queue)
++ 			queue_index = ops->ndo_select_queue(dev, skb, accel_priv,
++ 							    __netdev_pick_tx);
++ 		else
++ 			queue_index = __netdev_pick_tx(dev, skb);
++ 
++ 		if (!accel_priv)
++ 			queue_index = netdev_cap_txqueue(dev, queue_index);
++ 	}
++ 
++ 	skb_set_queue_mapping(skb, queue_index);
++ 	return netdev_get_tx_queue(dev, queue_index);
++ }
++ 
+++>>>>>>> 52bd2d62ce67 (net: better skb->sender_cpu and skb->napi_id cohabitation)
+  /**
+ - *	__dev_queue_xmit - transmit a buffer
+ + *	dev_queue_xmit - transmit a buffer
+   *	@skb: buffer to transmit
+ - *	@accel_priv: private data used for L2 forwarding offload
+   *
+   *	Queue a buffer for transmission to a network device. The caller must
+   *	have set the device and priority and built the buffer before calling
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/dev.c
