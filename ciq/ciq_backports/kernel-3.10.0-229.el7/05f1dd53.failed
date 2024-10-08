@@ -1,0 +1,161 @@
+block: add queue flag for disabling SG merging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [block] add queue flag for disabling SG merging (Mike Snitzer) [1105204]
+Rebuild_FUZZ: 91.76%
+commit-author Jens Axboe <axboe@fb.com>
+commit 05f1dd5315217398fc8d122bdee80f96a9f21274
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/05f1dd53.failed
+
+If devices are not SG starved, we waste a lot of time potentially
+collapsing SG segments. Enough that 1.5% of the CPU time goes
+to this, at only 400K IOPS. Add a queue flag, QUEUE_FLAG_NO_SG_MERGE,
+which just returns the number of vectors in a bio instead of looping
+over all segments and checking for collapsible ones.
+
+Add a BLK_MQ_F_SG_MERGE flag so that drivers can opt-in on the sg
+merging, if they so desire.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 05f1dd5315217398fc8d122bdee80f96a9f21274)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-merge.c
+#	include/linux/blk-mq.h
+#	include/linux/blkdev.h
+diff --cc block/blk-merge.c
+index 1ffc58977835,b3bf0df0f4c2..000000000000
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@@ -12,10 -12,11 +12,15 @@@
+  static unsigned int __blk_recalc_rq_segments(struct request_queue *q,
+  					     struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	struct bio_vec *bv, *bvprv = NULL;
+ +	int cluster, i, high, highprv = 1;
+++=======
++ 	struct bio_vec bv, bvprv = { NULL };
++ 	int cluster, high, highprv = 1, no_sg_merge;
+++>>>>>>> 05f1dd531521 (block: add queue flag for disabling SG merging)
+  	unsigned int seg_size, nr_phys_segs;
+  	struct bio *fbio, *bbio;
+ -	struct bvec_iter iter;
+  
+  	if (!bio)
+  		return 0;
+@@@ -24,26 -35,33 +29,35 @@@
+  	cluster = blk_queue_cluster(q);
+  	seg_size = 0;
+  	nr_phys_segs = 0;
++ 	no_sg_merge = test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
++ 	high = 0;
+  	for_each_bio(bio) {
+ -		bio_for_each_segment(bv, bio, iter) {
+ +		bio_for_each_segment(bv, bio, i) {
++ 			/*
++ 			 * If SG merging is disabled, each bio vector is
++ 			 * a segment
++ 			 */
++ 			if (no_sg_merge)
++ 				goto new_segment;
++ 
+  			/*
+  			 * the trick here is making sure that a high page is
+- 			 * never considered part of another segment, since that
+- 			 * might change with the bounce page.
++ 			 * never considered part of another segment, since
++ 			 * that might change with the bounce page.
+  			 */
+ -			high = page_to_pfn(bv.bv_page) > queue_bounce_pfn(q);
+ -			if (!high && !highprv && cluster) {
+ -				if (seg_size + bv.bv_len
+ +			high = page_to_pfn(bv->bv_page) > queue_bounce_pfn(q);
+ +			if (high || highprv)
+ +				goto new_segment;
+ +			if (cluster) {
+ +				if (seg_size + bv->bv_len
+  				    > queue_max_segment_size(q))
+  					goto new_segment;
+ -				if (!BIOVEC_PHYS_MERGEABLE(&bvprv, &bv))
+ +				if (!BIOVEC_PHYS_MERGEABLE(bvprv, bv))
+  					goto new_segment;
+ -				if (!BIOVEC_SEG_BOUNDARY(q, &bvprv, &bv))
+ +				if (!BIOVEC_SEG_BOUNDARY(q, bvprv, bv))
+  					goto new_segment;
+  
+ -				seg_size += bv.bv_len;
+ +				seg_size += bv->bv_len;
+  				bvprv = bv;
+  				continue;
+  			}
+diff --cc include/linux/blk-mq.h
+index 0f2259d5e784,95de239444d2..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -108,16 -128,23 +108,21 @@@ enum 
+  
+  	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
+  	BLK_MQ_F_SHOULD_SORT	= 1 << 1,
+++<<<<<<< HEAD
+++=======
++ 	BLK_MQ_F_TAG_SHARED	= 1 << 2,
++ 	BLK_MQ_F_SG_MERGE	= 1 << 3,
+++>>>>>>> 05f1dd531521 (block: add queue flag for disabling SG merging)
+  
+  	BLK_MQ_S_STOPPED	= 0,
+ -	BLK_MQ_S_TAG_ACTIVE	= 1,
+  
+  	BLK_MQ_MAX_DEPTH	= 2048,
+ -
+ -	BLK_MQ_CPU_WORK_BATCH	= 8,
+  };
+  
+ -struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *);
+ +struct request_queue *blk_mq_init_queue(struct blk_mq_reg *, void *);
+  int blk_mq_register_disk(struct gendisk *);
+  void blk_mq_unregister_disk(struct gendisk *);
+ -
+ -int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set);
+ -void blk_mq_free_tag_set(struct blk_mq_tag_set *set);
+ +void blk_mq_init_commands(struct request_queue *, void (*init)(void *data, struct blk_mq_hw_ctx *, struct request *, unsigned int), void *data);
+  
+  void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule);
+  
+diff --cc include/linux/blkdev.h
+index 7073d451e562,695b9fd41efe..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -504,7 -510,7 +504,11 @@@ struct request_queue 
+  #define QUEUE_FLAG_SAME_FORCE  18	/* force complete on same CPU */
+  #define QUEUE_FLAG_DEAD        19	/* queue tear-down finished */
+  #define QUEUE_FLAG_INIT_DONE   20	/* queue is initialized */
+++<<<<<<< HEAD
+ +#define QUEUE_FLAG_UNPRIV_SGIO 21	/* SG_IO free for unprivileged users */
+++=======
++ #define QUEUE_FLAG_NO_SG_MERGE 21	/* don't attempt to merge SG segments*/
+++>>>>>>> 05f1dd531521 (block: add queue flag for disabling SG merging)
+  
+  #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+  				 (1 << QUEUE_FLAG_STACKABLE)	|	\
+* Unmerged path block/blk-merge.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 210626be5c6c..94c5ed607dce 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1368,6 +1368,9 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_reg *reg,
+ 	q->mq_ops = reg->ops;
+ 	q->queue_flags |= QUEUE_FLAG_MQ_DEFAULT;
+ 
++	if (!(set->flags & BLK_MQ_F_SG_MERGE))
++		q->queue_flags |= 1 << QUEUE_FLAG_NO_SG_MERGE;
++
+ 	q->sg_reserved_size = INT_MAX;
+ 
+ 	blk_queue_make_request(q, blk_mq_make_request);
+* Unmerged path include/linux/blk-mq.h
+* Unmerged path include/linux/blkdev.h
