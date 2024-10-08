@@ -1,0 +1,404 @@
+iptunnel: scrub packet in iptunnel_pull_header
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 7f290c94352e59b1d720055fce760a69a63bd0a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7f290c94.failed
+
+Part of skb_scrub_packet was open coded in iptunnel_pull_header. Let it call
+skb_scrub_packet directly instead.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7f290c94352e59b1d720055fce760a69a63bd0a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/ip_tunnels.h
+#	net/ipv4/ip_gre.c
+diff --cc drivers/net/vxlan.c
+index a2751f4f523c,c963897e713d..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1249,22 -1193,11 +1249,21 @@@ static void vxlan_rcv(struct vxlan_soc
+  {
+  	struct iphdr *oip = NULL;
+  	struct ipv6hdr *oip6 = NULL;
+ +	struct vxlan_dev *vxlan;
+  	struct pcpu_sw_netstats *stats;
+  	union vxlan_addr saddr;
+ +	__u32 vni;
+  	int err = 0;
+ +	union vxlan_addr *remote_ip;
+  
+ +	vni = ntohl(md->vni) >> 8;
+ +	/* Is this VNI defined? */
+ +	vxlan = vxlan_vs_find_vni(vs, vni);
+ +	if (!vxlan)
+ +		goto drop;
+ +
+ +	remote_ip = &vxlan->default_dst.remote_ip;
+  	skb_reset_mac_header(skb);
+- 	skb_scrub_packet(skb, !net_eq(vxlan->net, dev_net(vxlan->dev)));
+  	skb->protocol = eth_type_trans(skb, vxlan->dev);
+  	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+  
+@@@ -1327,6 -1270,91 +1326,94 @@@ drop
+  	kfree_skb(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Callback from net/ipv4/udp.c to receive packets */
++ static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct metadata_dst *tun_dst = NULL;
++ 	struct vxlan_dev *vxlan;
++ 	struct vxlan_sock *vs;
++ 	struct vxlanhdr unparsed;
++ 	struct vxlan_metadata _md;
++ 	struct vxlan_metadata *md = &_md;
++ 
++ 	/* Need Vxlan and inner Ethernet header to be present */
++ 	if (!pskb_may_pull(skb, VXLAN_HLEN))
++ 		return 1;
++ 
++ 	unparsed = *vxlan_hdr(skb);
++ 	/* VNI flag always required to be set */
++ 	if (!(unparsed.vx_flags & VXLAN_HF_VNI)) {
++ 		netdev_dbg(skb->dev, "invalid vxlan flags=%#x vni=%#x\n",
++ 			   ntohl(vxlan_hdr(skb)->vx_flags),
++ 			   ntohl(vxlan_hdr(skb)->vx_vni));
++ 		/* Return non vxlan pkt */
++ 		return 1;
++ 	}
++ 	unparsed.vx_flags &= ~VXLAN_HF_VNI;
++ 	unparsed.vx_vni &= ~VXLAN_VNI_MASK;
++ 
++ 	vs = rcu_dereference_sk_user_data(sk);
++ 	if (!vs)
++ 		goto drop;
++ 
++ 	vxlan = vxlan_vs_find_vni(vs, vxlan_vni(vxlan_hdr(skb)->vx_vni));
++ 	if (!vxlan)
++ 		goto drop;
++ 
++ 	if (iptunnel_pull_header(skb, VXLAN_HLEN, htons(ETH_P_TEB),
++ 				 !net_eq(vxlan->net, dev_net(vxlan->dev))))
++ 		goto drop;
++ 
++ 	if (vxlan_collect_metadata(vs)) {
++ 		__be32 vni = vxlan_vni(vxlan_hdr(skb)->vx_vni);
++ 
++ 		tun_dst = udp_tun_rx_dst(skb, vxlan_get_sk_family(vs), TUNNEL_KEY,
++ 					 vxlan_vni_to_tun_id(vni), sizeof(*md));
++ 
++ 		if (!tun_dst)
++ 			goto drop;
++ 
++ 		md = ip_tunnel_info_opts(&tun_dst->u.tun_info);
++ 	} else {
++ 		memset(md, 0, sizeof(*md));
++ 	}
++ 
++ 	/* For backwards compatibility, only allow reserved fields to be
++ 	 * used by VXLAN extensions if explicitly requested.
++ 	 */
++ 	if (vs->flags & VXLAN_F_REMCSUM_RX)
++ 		if (!vxlan_remcsum(&unparsed, skb, vs->flags))
++ 			goto drop;
++ 	if (vs->flags & VXLAN_F_GBP)
++ 		vxlan_parse_gbp_hdr(&unparsed, md, tun_dst);
++ 
++ 	if (unparsed.vx_flags || unparsed.vx_vni) {
++ 		/* If there are any unprocessed flags remaining treat
++ 		 * this as a malformed packet. This behavior diverges from
++ 		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
++ 		 * in reserved fields are to be ignored. The approach here
++ 		 * maintains compatibility with previous stack code, and also
++ 		 * is more robust and provides a little more security in
++ 		 * adding extensions to VXLAN.
++ 		 */
++ 		goto drop;
++ 	}
++ 
++ 	vxlan_rcv(vxlan, vs, skb, md, tun_dst);
++ 	return 0;
++ 
++ drop:
++ 	if (tun_dst)
++ 		dst_release((struct dst_entry *)tun_dst);
++ 
++ 	/* Consume bad packet */
++ 	kfree_skb(skb);
++ 	return 0;
++ }
++ 
+++>>>>>>> 7f290c94352e (iptunnel: scrub packet in iptunnel_pull_header)
+  static int arp_reduce(struct net_device *dev, struct sk_buff *skb)
+  {
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+diff --cc include/net/ip_tunnels.h
+index 3a5ac80169cf,4dd616376fec..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -267,23 -270,23 +267,33 @@@ static inline u8 ip_tunnel_ecn_encap(u
+  	return INET_ECN_encapsulate(tos, inner);
+  }
+  
+++<<<<<<< HEAD
+ +int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto);
+ +int iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+ +		  __be32 src, __be32 dst, u8 proto,
+ +		  u8 tos, u8 ttl, __be16 df, bool xnet);
+++=======
++ int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto,
++ 			 bool xnet);
++ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
++ 		   __be32 src, __be32 dst, u8 proto,
++ 		   u8 tos, u8 ttl, __be16 df, bool xnet);
++ struct metadata_dst *iptunnel_metadata_reply(struct metadata_dst *md,
++ 					     gfp_t flags);
+++>>>>>>> 7f290c94352e (iptunnel: scrub packet in iptunnel_pull_header)
+  
+ -struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb, int gso_type_mask);
+ +struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb, bool gre_csum,
+ +					 int gso_type_mask);
+  
+ -static inline void iptunnel_xmit_stats(struct net_device *dev, int pkt_len)
+ +static inline void iptunnel_xmit_stats(int err,
+ +				       struct net_device_stats *err_stats,
+ +				       struct pcpu_sw_netstats __percpu *stats)
+  {
+ -	if (pkt_len > 0) {
+ -		struct pcpu_sw_netstats *tstats = get_cpu_ptr(dev->tstats);
+ +	if (err > 0) {
+ +		struct pcpu_sw_netstats *tstats = get_cpu_ptr(stats);
+  
+  		u64_stats_update_begin(&tstats->syncp);
+ -		tstats->tx_bytes += pkt_len;
+ +		tstats->tx_bytes += err;
+  		tstats->tx_packets++;
+  		u64_stats_update_end(&tstats->syncp);
+  		put_cpu_ptr(tstats);
+diff --cc net/ipv4/ip_gre.c
+index afc4a83f7ee7,12071e28d958..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -121,8 -122,127 +121,132 @@@ static int ipgre_tunnel_init(struct net
+  static int ipgre_net_id __read_mostly;
+  static int gre_tap_net_id __read_mostly;
+  
+++<<<<<<< HEAD
+ +static int ipgre_err(struct sk_buff *skb, u32 info,
+ +		     const struct tnl_ptk_info *tpi)
+++=======
++ static int ip_gre_calc_hlen(__be16 o_flags)
++ {
++ 	int addend = 4;
++ 
++ 	if (o_flags & TUNNEL_CSUM)
++ 		addend += 4;
++ 	if (o_flags & TUNNEL_KEY)
++ 		addend += 4;
++ 	if (o_flags & TUNNEL_SEQ)
++ 		addend += 4;
++ 	return addend;
++ }
++ 
++ static __be16 gre_flags_to_tnl_flags(__be16 flags)
++ {
++ 	__be16 tflags = 0;
++ 
++ 	if (flags & GRE_CSUM)
++ 		tflags |= TUNNEL_CSUM;
++ 	if (flags & GRE_ROUTING)
++ 		tflags |= TUNNEL_ROUTING;
++ 	if (flags & GRE_KEY)
++ 		tflags |= TUNNEL_KEY;
++ 	if (flags & GRE_SEQ)
++ 		tflags |= TUNNEL_SEQ;
++ 	if (flags & GRE_STRICT)
++ 		tflags |= TUNNEL_STRICT;
++ 	if (flags & GRE_REC)
++ 		tflags |= TUNNEL_REC;
++ 	if (flags & GRE_VERSION)
++ 		tflags |= TUNNEL_VERSION;
++ 
++ 	return tflags;
++ }
++ 
++ static __be16 tnl_flags_to_gre_flags(__be16 tflags)
++ {
++ 	__be16 flags = 0;
++ 
++ 	if (tflags & TUNNEL_CSUM)
++ 		flags |= GRE_CSUM;
++ 	if (tflags & TUNNEL_ROUTING)
++ 		flags |= GRE_ROUTING;
++ 	if (tflags & TUNNEL_KEY)
++ 		flags |= GRE_KEY;
++ 	if (tflags & TUNNEL_SEQ)
++ 		flags |= GRE_SEQ;
++ 	if (tflags & TUNNEL_STRICT)
++ 		flags |= GRE_STRICT;
++ 	if (tflags & TUNNEL_REC)
++ 		flags |= GRE_REC;
++ 	if (tflags & TUNNEL_VERSION)
++ 		flags |= GRE_VERSION;
++ 
++ 	return flags;
++ }
++ 
++ static int parse_gre_header(struct sk_buff *skb, struct tnl_ptk_info *tpi,
++ 			    bool *csum_err)
++ {
++ 	const struct gre_base_hdr *greh;
++ 	__be32 *options;
++ 	int hdr_len;
++ 
++ 	if (unlikely(!pskb_may_pull(skb, sizeof(struct gre_base_hdr))))
++ 		return -EINVAL;
++ 
++ 	greh = (struct gre_base_hdr *)skb_transport_header(skb);
++ 	if (unlikely(greh->flags & (GRE_VERSION | GRE_ROUTING)))
++ 		return -EINVAL;
++ 
++ 	tpi->flags = gre_flags_to_tnl_flags(greh->flags);
++ 	hdr_len = ip_gre_calc_hlen(tpi->flags);
++ 
++ 	if (!pskb_may_pull(skb, hdr_len))
++ 		return -EINVAL;
++ 
++ 	greh = (struct gre_base_hdr *)skb_transport_header(skb);
++ 	tpi->proto = greh->protocol;
++ 
++ 	options = (__be32 *)(greh + 1);
++ 	if (greh->flags & GRE_CSUM) {
++ 		if (skb_checksum_simple_validate(skb)) {
++ 			*csum_err = true;
++ 			return -EINVAL;
++ 		}
++ 
++ 		skb_checksum_try_convert(skb, IPPROTO_GRE, 0,
++ 					 null_compute_pseudo);
++ 		options++;
++ 	}
++ 
++ 	if (greh->flags & GRE_KEY) {
++ 		tpi->key = *options;
++ 		options++;
++ 	} else {
++ 		tpi->key = 0;
++ 	}
++ 	if (unlikely(greh->flags & GRE_SEQ)) {
++ 		tpi->seq = *options;
++ 		options++;
++ 	} else {
++ 		tpi->seq = 0;
++ 	}
++ 	/* WCCP version 1 and 2 protocol decoding.
++ 	 * - Change protocol to IP
++ 	 * - When dealing with WCCPv2, Skip extra 4 bytes in GRE header
++ 	 */
++ 	if (greh->flags == 0 && tpi->proto == htons(ETH_P_WCCP)) {
++ 		tpi->proto = htons(ETH_P_IP);
++ 		if ((*(u8 *)options & 0xF0) != 0x40) {
++ 			hdr_len += 4;
++ 			if (!pskb_may_pull(skb, hdr_len))
++ 				return -EINVAL;
++ 		}
++ 	}
++ 	return iptunnel_pull_header(skb, hdr_len, tpi->proto, false);
++ }
++ 
++ static void ipgre_err(struct sk_buff *skb, u32 info,
++ 		      const struct tnl_ptk_info *tpi)
+++>>>>>>> 7f290c94352e (iptunnel: scrub packet in iptunnel_pull_header)
+  {
+  
+  	/* All the routers (except for Linux) return only
+diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
+index 7c79843ccb40..c9a7429f4f54 100644
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -169,7 +169,6 @@ static void geneve_rx(struct geneve_sock *gs, struct sk_buff *skb)
+ 	}
+ 
+ 	skb_reset_mac_header(skb);
+-	skb_scrub_packet(skb, !net_eq(geneve->net, dev_net(geneve->dev)));
+ 	skb->protocol = eth_type_trans(skb, geneve->dev);
+ 	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+ 
+@@ -256,7 +255,8 @@ static int geneve_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+ 
+ 	opts_len = geneveh->opt_len * 4;
+ 	if (iptunnel_pull_header(skb, GENEVE_BASE_HLEN + opts_len,
+-				 htons(ETH_P_TEB)))
++				 htons(ETH_P_TEB),
++				 !net_eq(geneve->net, dev_net(geneve->dev))))
+ 		goto drop;
+ 
+ 	gs = rcu_dereference_sk_user_data(sk);
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/ip_tunnels.h
+* Unmerged path net/ipv4/ip_gre.c
+diff --git a/net/ipv4/ip_tunnel_core.c b/net/ipv4/ip_tunnel_core.c
+index c969294e6abb..f1b517f1d149 100644
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -83,7 +83,8 @@ int iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+ }
+ EXPORT_SYMBOL_GPL(iptunnel_xmit);
+ 
+-int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto)
++int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto,
++			 bool xnet)
+ {
+ 	if (unlikely(!pskb_may_pull(skb, hdr_len)))
+ 		return -ENOMEM;
+@@ -106,13 +107,10 @@ int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto)
+ 		skb->protocol = inner_proto;
+ 	}
+ 
+-	nf_reset(skb);
+-	secpath_reset(skb);
+ 	skb_clear_hash_if_not_l4(skb);
+-	skb_dst_drop(skb);
+ 	skb->vlan_tci = 0;
+ 	skb_set_queue_mapping(skb, 0);
+-	skb->pkt_type = PACKET_HOST;
++	skb_scrub_packet(skb, xnet);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(iptunnel_pull_header);
+diff --git a/net/ipv4/ipip.c b/net/ipv4/ipip.c
+index 9d5dea320662..95937dae4eed 100644
+--- a/net/ipv4/ipip.c
++++ b/net/ipv4/ipip.c
+@@ -196,7 +196,7 @@ static int ipip_rcv(struct sk_buff *skb)
+ 	if (tunnel) {
+ 		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
+ 			goto drop;
+-		if (iptunnel_pull_header(skb, 0, tpi.proto))
++		if (iptunnel_pull_header(skb, 0, tpi.proto, false))
+ 			goto drop;
+ 		return ip_tunnel_rcv(tunnel, skb, &tpi, log_ecn_error);
+ 	}
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+index 7987bacb263b..b8db72720c91 100644
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -652,7 +652,7 @@ static int ipip_rcv(struct sk_buff *skb)
+ 
+ 		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
+ 			goto drop;
+-		if (iptunnel_pull_header(skb, 0, tpi.proto))
++		if (iptunnel_pull_header(skb, 0, tpi.proto, false))
+ 			goto drop;
+ 		return ip_tunnel_rcv(tunnel, skb, &tpi, log_ecn_error);
+ 	}
