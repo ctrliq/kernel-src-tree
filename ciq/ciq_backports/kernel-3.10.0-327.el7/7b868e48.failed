@@ -1,0 +1,115 @@
+uprobes/x86: Reimplement arch_uretprobe_is_alive()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Reimplement arch_uretprobe_is_alive() (Oleg Nesterov) [1207373]
+Rebuild_FUZZ: 95.83%
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 7b868e4802a86d867aad1be0471b5767d9c20e10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7b868e48.failed
+
+Add the x86 specific version of arch_uretprobe_is_alive()
+helper. It returns true if the stack frame mangled by
+prepare_uretprobe() is still on stack. So if it returns false,
+we know that the probed function has already returned.
+
+We add the new return_instance->stack member and change the
+generic code to initialize it in prepare_uretprobe, but it
+should be equally useful for other architectures.
+
+TODO: this assumes that the probed application can't use
+      multiple stacks (say sigaltstack). We will try to improve
+      this logic later.
+
+	Tested-by: Pratyush Anand <panand@redhat.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Acked-by: Anton Arapov <arapov@gmail.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20150721134018.GA4766@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 7b868e4802a86d867aad1be0471b5767d9c20e10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/uprobes.h
+diff --cc include/linux/uprobes.h
+index 13a7f13ff0d3,7ab6d2c8be49..000000000000
+--- a/include/linux/uprobes.h
++++ b/include/linux/uprobes.h
+@@@ -75,31 -90,20 +75,40 @@@ struct uprobe_task 
+  
+  	struct return_instance		*return_instances;
+  	unsigned int			depth;
+ +	struct uprobe			*active_uprobe;
+ +
+ +	unsigned long			xol_vaddr;
+ +	unsigned long			vaddr;
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + * On a breakpoint hit, thread contests for a slot.  It frees the
+ + * slot after singlestep. Currently a fixed number of slots are
+ + * allocated.
+ + */
+ +struct xol_area {
+ +	wait_queue_head_t 	wq;		/* if all slots are busy */
+ +	atomic_t 		slot_count;	/* number of in-use slots */
+ +	unsigned long 		*bitmap;	/* 0 = free slot */
+ +	struct page 		*page;
+++=======
++ struct return_instance {
++ 	struct uprobe		*uprobe;
++ 	unsigned long		func;
++ 	unsigned long		stack;		/* stack pointer */
++ 	unsigned long		orig_ret_vaddr; /* original return address */
++ 	bool			chained;	/* true, if instance is nested */
+ -
+ -	struct return_instance	*next;		/* keep as stack */
+++>>>>>>> 7b868e4802a8 (uprobes/x86: Reimplement arch_uretprobe_is_alive())
+ +
+ +	/*
+ +	 * We keep the vma's vm_start rather than a pointer to the vma
+ +	 * itself.  The probed process or a naughty kernel module could make
+ +	 * the vma go away, and we must handle that reasonably gracefully.
+ +	 */
+ +	unsigned long 		vaddr;		/* Page(s) of instruction slots */
+  };
+  
+ -struct xol_area;
+ -
+  struct uprobes_state {
+  	struct xol_area		*xol_area;
+  };
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index 5d1cbfe4ae58..1bd02690908f 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -926,3 +926,8 @@ arch_uretprobe_hijack_return_addr(unsigned long trampoline_vaddr, struct pt_regs
+ 
+ 	return -1;
+ }
++
++bool arch_uretprobe_is_alive(struct return_instance *ret, struct pt_regs *regs)
++{
++	return regs->sp <= ret->stack;
++}
+* Unmerged path include/linux/uprobes.h
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index b0b89515dd30..b42811426152 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -1517,6 +1517,7 @@ static void prepare_uretprobe(struct uprobe *uprobe, struct pt_regs *regs)
+ 
+ 	ri->uprobe = get_uprobe(uprobe);
+ 	ri->func = instruction_pointer(regs);
++	ri->stack = user_stack_pointer(regs);
+ 	ri->orig_ret_vaddr = orig_ret_vaddr;
+ 	ri->chained = chained;
+ 
