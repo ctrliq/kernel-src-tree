@@ -1,0 +1,1702 @@
+drm/bochs: new driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] bochs: new driver (Gerd Hoffmann) [1043379]
+Rebuild_FUZZ: 89.47%
+commit-author Gerd Hoffmann <kraxel@redhat.com>
+commit 0a6659bdc5e8221da99eebb176fd9591435e38de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0a6659bd.failed
+
+DRM driver for (virtual) vga cards using the bochs dispi
+interface, such as the qemu standard vga (qemu -vga std).
+
+Don't bother supporting anything but 32bpp for now, even
+though the virtual hardware is able to do that.
+
+Known issue: mmap(/dev/fb0) doesn't work.
+
+	Signed-off-by: Gerd Hoffmann <kraxel@redhat.com>
+	Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 0a6659bdc5e8221da99eebb176fd9591435e38de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/Kconfig
+#	drivers/gpu/drm/Makefile
+diff --cc drivers/gpu/drm/Kconfig
+index 5fe7b71f8b2a,8e7fa4dbaed8..000000000000
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@@ -232,3 -191,11 +232,14 @@@ source "drivers/gpu/drm/omapdrm/Kconfig
+  source "drivers/gpu/drm/tilcdc/Kconfig"
+  
+  source "drivers/gpu/drm/qxl/Kconfig"
+++<<<<<<< HEAD
+++=======
++ 
++ source "drivers/gpu/drm/bochs/Kconfig"
++ 
++ source "drivers/gpu/drm/msm/Kconfig"
++ 
++ source "drivers/gpu/drm/tegra/Kconfig"
++ 
++ source "drivers/gpu/drm/panel/Kconfig"
+++>>>>>>> 0a6659bdc5e8 (drm/bochs: new driver)
+diff --cc drivers/gpu/drm/Makefile
+index 2bd8e40e97e1,292a79d64146..000000000000
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@@ -53,4 -58,8 +53,10 @@@ obj-$(CONFIG_DRM_SHMOBILE) +=shmobile
+  obj-$(CONFIG_DRM_OMAP)	+= omapdrm/
+  obj-$(CONFIG_DRM_TILCDC)	+= tilcdc/
+  obj-$(CONFIG_DRM_QXL) += qxl/
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_DRM_BOCHS) += bochs/
++ obj-$(CONFIG_DRM_MSM) += msm/
++ obj-$(CONFIG_DRM_TEGRA) += tegra/
+++>>>>>>> 0a6659bdc5e8 (drm/bochs: new driver)
+  obj-y			+= i2c/
+ -obj-y			+= panel/
+* Unmerged path drivers/gpu/drm/Kconfig
+* Unmerged path drivers/gpu/drm/Makefile
+diff --git a/drivers/gpu/drm/bochs/Kconfig b/drivers/gpu/drm/bochs/Kconfig
+new file mode 100644
+index 000000000000..c8fcf12019f0
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/Kconfig
+@@ -0,0 +1,11 @@
++config DRM_BOCHS
++	tristate "DRM Support for bochs dispi vga interface (qemu stdvga)"
++	depends on DRM && PCI
++	select DRM_KMS_HELPER
++	select FB_SYS_FILLRECT
++	select FB_SYS_COPYAREA
++	select FB_SYS_IMAGEBLIT
++	select DRM_TTM
++	help
++	  Choose this option for qemu.
++	  If M is selected the module will be called bochs-drm.
+diff --git a/drivers/gpu/drm/bochs/Makefile b/drivers/gpu/drm/bochs/Makefile
+new file mode 100644
+index 000000000000..844a55614920
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/Makefile
+@@ -0,0 +1,4 @@
++ccflags-y := -Iinclude/drm
++bochs-drm-y := bochs_drv.o bochs_mm.o bochs_kms.o bochs_fbdev.o bochs_hw.o
++
++obj-$(CONFIG_DRM_BOCHS)	+= bochs-drm.o
+diff --git a/drivers/gpu/drm/bochs/bochs.h b/drivers/gpu/drm/bochs/bochs.h
+new file mode 100644
+index 000000000000..741965c001a6
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/bochs.h
+@@ -0,0 +1,164 @@
++#include <linux/io.h>
++#include <linux/fb.h>
++
++#include <drm/drmP.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_crtc_helper.h>
++#include <drm/drm_fb_helper.h>
++
++#include <ttm/ttm_bo_driver.h>
++#include <ttm/ttm_page_alloc.h>
++
++/* ---------------------------------------------------------------------- */
++
++#define VBE_DISPI_IOPORT_INDEX           0x01CE
++#define VBE_DISPI_IOPORT_DATA            0x01CF
++
++#define VBE_DISPI_INDEX_ID               0x0
++#define VBE_DISPI_INDEX_XRES             0x1
++#define VBE_DISPI_INDEX_YRES             0x2
++#define VBE_DISPI_INDEX_BPP              0x3
++#define VBE_DISPI_INDEX_ENABLE           0x4
++#define VBE_DISPI_INDEX_BANK             0x5
++#define VBE_DISPI_INDEX_VIRT_WIDTH       0x6
++#define VBE_DISPI_INDEX_VIRT_HEIGHT      0x7
++#define VBE_DISPI_INDEX_X_OFFSET         0x8
++#define VBE_DISPI_INDEX_Y_OFFSET         0x9
++#define VBE_DISPI_INDEX_VIDEO_MEMORY_64K 0xa
++
++#define VBE_DISPI_ID0                    0xB0C0
++#define VBE_DISPI_ID1                    0xB0C1
++#define VBE_DISPI_ID2                    0xB0C2
++#define VBE_DISPI_ID3                    0xB0C3
++#define VBE_DISPI_ID4                    0xB0C4
++#define VBE_DISPI_ID5                    0xB0C5
++
++#define VBE_DISPI_DISABLED               0x00
++#define VBE_DISPI_ENABLED                0x01
++#define VBE_DISPI_GETCAPS                0x02
++#define VBE_DISPI_8BIT_DAC               0x20
++#define VBE_DISPI_LFB_ENABLED            0x40
++#define VBE_DISPI_NOCLEARMEM             0x80
++
++/* ---------------------------------------------------------------------- */
++
++enum bochs_types {
++	BOCHS_QEMU_STDVGA,
++	BOCHS_UNKNOWN,
++};
++
++struct bochs_framebuffer {
++	struct drm_framebuffer base;
++	struct drm_gem_object *obj;
++};
++
++struct bochs_device {
++	/* hw */
++	void __iomem   *mmio;
++	int            ioports;
++	void __iomem   *fb_map;
++	unsigned long  fb_base;
++	unsigned long  fb_size;
++
++	/* mode */
++	u16 xres;
++	u16 yres;
++	u16 yres_virtual;
++	u32 stride;
++	u32 bpp;
++
++	/* drm */
++	struct drm_device  *dev;
++	struct drm_crtc crtc;
++	struct drm_encoder encoder;
++	struct drm_connector connector;
++	bool mode_config_initialized;
++
++	/* ttm */
++	struct {
++		struct drm_global_reference mem_global_ref;
++		struct ttm_bo_global_ref bo_global_ref;
++		struct ttm_bo_device bdev;
++		bool initialized;
++	} ttm;
++
++	/* fbdev */
++	struct {
++		struct bochs_framebuffer gfb;
++		struct drm_fb_helper helper;
++		int size;
++		int x1, y1, x2, y2; /* dirty rect */
++		spinlock_t dirty_lock;
++		bool initialized;
++	} fb;
++};
++
++#define to_bochs_framebuffer(x) container_of(x, struct bochs_framebuffer, base)
++
++struct bochs_bo {
++	struct ttm_buffer_object bo;
++	struct ttm_placement placement;
++	struct ttm_bo_kmap_obj kmap;
++	struct drm_gem_object gem;
++	u32 placements[3];
++	int pin_count;
++};
++
++static inline struct bochs_bo *bochs_bo(struct ttm_buffer_object *bo)
++{
++	return container_of(bo, struct bochs_bo, bo);
++}
++
++static inline struct bochs_bo *gem_to_bochs_bo(struct drm_gem_object *gem)
++{
++	return container_of(gem, struct bochs_bo, gem);
++}
++
++#define DRM_FILE_PAGE_OFFSET (0x100000000ULL >> PAGE_SHIFT)
++
++static inline u64 bochs_bo_mmap_offset(struct bochs_bo *bo)
++{
++	return drm_vma_node_offset_addr(&bo->bo.vma_node);
++}
++
++/* ---------------------------------------------------------------------- */
++
++/* bochs_hw.c */
++int bochs_hw_init(struct drm_device *dev, uint32_t flags);
++void bochs_hw_fini(struct drm_device *dev);
++
++void bochs_hw_setmode(struct bochs_device *bochs,
++		      struct drm_display_mode *mode);
++void bochs_hw_setbase(struct bochs_device *bochs,
++		      int x, int y, u64 addr);
++
++/* bochs_mm.c */
++int bochs_mm_init(struct bochs_device *bochs);
++void bochs_mm_fini(struct bochs_device *bochs);
++int bochs_mmap(struct file *filp, struct vm_area_struct *vma);
++
++int bochs_gem_create(struct drm_device *dev, u32 size, bool iskernel,
++		     struct drm_gem_object **obj);
++int bochs_gem_init_object(struct drm_gem_object *obj);
++void bochs_gem_free_object(struct drm_gem_object *obj);
++int bochs_dumb_create(struct drm_file *file, struct drm_device *dev,
++		      struct drm_mode_create_dumb *args);
++int bochs_dumb_mmap_offset(struct drm_file *file, struct drm_device *dev,
++			   uint32_t handle, uint64_t *offset);
++
++int bochs_framebuffer_init(struct drm_device *dev,
++			   struct bochs_framebuffer *gfb,
++			   struct drm_mode_fb_cmd2 *mode_cmd,
++			   struct drm_gem_object *obj);
++int bochs_bo_pin(struct bochs_bo *bo, u32 pl_flag, u64 *gpu_addr);
++int bochs_bo_unpin(struct bochs_bo *bo);
++
++extern const struct drm_mode_config_funcs bochs_mode_funcs;
++
++/* bochs_kms.c */
++int bochs_kms_init(struct bochs_device *bochs);
++void bochs_kms_fini(struct bochs_device *bochs);
++
++/* bochs_fbdev.c */
++int bochs_fbdev_init(struct bochs_device *bochs);
++void bochs_fbdev_fini(struct bochs_device *bochs);
+diff --git a/drivers/gpu/drm/bochs/bochs_drv.c b/drivers/gpu/drm/bochs/bochs_drv.c
+new file mode 100644
+index 000000000000..395bba261c9a
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/bochs_drv.c
+@@ -0,0 +1,178 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++
++#include "bochs.h"
++
++static bool enable_fbdev = true;
++module_param_named(fbdev, enable_fbdev, bool, 0444);
++MODULE_PARM_DESC(fbdev, "register fbdev device");
++
++/* ---------------------------------------------------------------------- */
++/* drm interface                                                          */
++
++static int bochs_unload(struct drm_device *dev)
++{
++	struct bochs_device *bochs = dev->dev_private;
++
++	bochs_fbdev_fini(bochs);
++	bochs_kms_fini(bochs);
++	bochs_mm_fini(bochs);
++	bochs_hw_fini(dev);
++	kfree(bochs);
++	dev->dev_private = NULL;
++	return 0;
++}
++
++static int bochs_load(struct drm_device *dev, unsigned long flags)
++{
++	struct bochs_device *bochs;
++	int ret;
++
++	bochs = kzalloc(sizeof(*bochs), GFP_KERNEL);
++	if (bochs == NULL)
++		return -ENOMEM;
++	dev->dev_private = bochs;
++	bochs->dev = dev;
++
++	ret = bochs_hw_init(dev, flags);
++	if (ret)
++		goto err;
++
++	ret = bochs_mm_init(bochs);
++	if (ret)
++		goto err;
++
++	ret = bochs_kms_init(bochs);
++	if (ret)
++		goto err;
++
++	if (enable_fbdev)
++		bochs_fbdev_init(bochs);
++
++	return 0;
++
++err:
++	bochs_unload(dev);
++	return ret;
++}
++
++static const struct file_operations bochs_fops = {
++	.owner		= THIS_MODULE,
++	.open		= drm_open,
++	.release	= drm_release,
++	.unlocked_ioctl	= drm_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl	= drm_compat_ioctl,
++#endif
++	.poll		= drm_poll,
++	.read		= drm_read,
++	.llseek		= no_llseek,
++	.mmap           = bochs_mmap,
++};
++
++static struct drm_driver bochs_driver = {
++	.driver_features	= DRIVER_GEM | DRIVER_MODESET,
++	.load			= bochs_load,
++	.unload			= bochs_unload,
++	.fops			= &bochs_fops,
++	.name			= "bochs-drm",
++	.desc			= "bochs dispi vga interface (qemu stdvga)",
++	.date			= "20130925",
++	.major			= 1,
++	.minor			= 0,
++	.gem_free_object        = bochs_gem_free_object,
++	.dumb_create            = bochs_dumb_create,
++	.dumb_map_offset        = bochs_dumb_mmap_offset,
++	.dumb_destroy           = drm_gem_dumb_destroy,
++};
++
++/* ---------------------------------------------------------------------- */
++/* pci interface                                                          */
++
++static int bochs_kick_out_firmware_fb(struct pci_dev *pdev)
++{
++	struct apertures_struct *ap;
++
++	ap = alloc_apertures(1);
++	if (!ap)
++		return -ENOMEM;
++
++	ap->ranges[0].base = pci_resource_start(pdev, 0);
++	ap->ranges[0].size = pci_resource_len(pdev, 0);
++	remove_conflicting_framebuffers(ap, "bochsdrmfb", false);
++	kfree(ap);
++
++	return 0;
++}
++
++static int bochs_pci_probe(struct pci_dev *pdev,
++			   const struct pci_device_id *ent)
++{
++	int ret;
++
++	ret = bochs_kick_out_firmware_fb(pdev);
++	if (ret)
++		return ret;
++
++	return drm_get_pci_dev(pdev, ent, &bochs_driver);
++}
++
++static void bochs_pci_remove(struct pci_dev *pdev)
++{
++	struct drm_device *dev = pci_get_drvdata(pdev);
++
++	drm_put_dev(dev);
++}
++
++static DEFINE_PCI_DEVICE_TABLE(bochs_pci_tbl) = {
++	{
++		.vendor      = 0x1234,
++		.device      = 0x1111,
++		.subvendor   = 0x1af4,
++		.subdevice   = 0x1100,
++		.driver_data = BOCHS_QEMU_STDVGA,
++	},
++	{
++		.vendor      = 0x1234,
++		.device      = 0x1111,
++		.subvendor   = PCI_ANY_ID,
++		.subdevice   = PCI_ANY_ID,
++		.driver_data = BOCHS_UNKNOWN,
++	},
++	{ /* end of list */ }
++};
++
++static struct pci_driver bochs_pci_driver = {
++	.name =		"bochs-drm",
++	.id_table =	bochs_pci_tbl,
++	.probe =	bochs_pci_probe,
++	.remove =	bochs_pci_remove,
++};
++
++/* ---------------------------------------------------------------------- */
++/* module init/exit                                                       */
++
++static int __init bochs_init(void)
++{
++	return drm_pci_init(&bochs_driver, &bochs_pci_driver);
++}
++
++static void __exit bochs_exit(void)
++{
++	drm_pci_exit(&bochs_driver, &bochs_pci_driver);
++}
++
++module_init(bochs_init);
++module_exit(bochs_exit);
++
++MODULE_DEVICE_TABLE(pci, bochs_pci_tbl);
++MODULE_AUTHOR("Gerd Hoffmann <kraxel@redhat.com>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/bochs/bochs_fbdev.c b/drivers/gpu/drm/bochs/bochs_fbdev.c
+new file mode 100644
+index 000000000000..4da5206b7cc9
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/bochs_fbdev.c
+@@ -0,0 +1,215 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "bochs.h"
++
++/* ---------------------------------------------------------------------- */
++
++static struct fb_ops bochsfb_ops = {
++	.owner = THIS_MODULE,
++	.fb_check_var = drm_fb_helper_check_var,
++	.fb_set_par = drm_fb_helper_set_par,
++	.fb_fillrect = sys_fillrect,
++	.fb_copyarea = sys_copyarea,
++	.fb_imageblit = sys_imageblit,
++	.fb_pan_display = drm_fb_helper_pan_display,
++	.fb_blank = drm_fb_helper_blank,
++	.fb_setcmap = drm_fb_helper_setcmap,
++};
++
++static int bochsfb_create_object(struct bochs_device *bochs,
++				 struct drm_mode_fb_cmd2 *mode_cmd,
++				 struct drm_gem_object **gobj_p)
++{
++	struct drm_device *dev = bochs->dev;
++	struct drm_gem_object *gobj;
++	u32 size;
++	int ret = 0;
++
++	size = mode_cmd->pitches[0] * mode_cmd->height;
++	ret = bochs_gem_create(dev, size, true, &gobj);
++	if (ret)
++		return ret;
++
++	*gobj_p = gobj;
++	return ret;
++}
++
++static int bochsfb_create(struct drm_fb_helper *helper,
++			  struct drm_fb_helper_surface_size *sizes)
++{
++	struct bochs_device *bochs =
++		container_of(helper, struct bochs_device, fb.helper);
++	struct drm_device *dev = bochs->dev;
++	struct fb_info *info;
++	struct drm_framebuffer *fb;
++	struct drm_mode_fb_cmd2 mode_cmd;
++	struct device *device = &dev->pdev->dev;
++	struct drm_gem_object *gobj = NULL;
++	struct bochs_bo *bo = NULL;
++	int size, ret;
++
++	if (sizes->surface_bpp != 32)
++		return -EINVAL;
++
++	mode_cmd.width = sizes->surface_width;
++	mode_cmd.height = sizes->surface_height;
++	mode_cmd.pitches[0] = mode_cmd.width * ((sizes->surface_bpp + 7) / 8);
++	mode_cmd.pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp,
++							  sizes->surface_depth);
++	size = mode_cmd.pitches[0] * mode_cmd.height;
++
++	/* alloc, pin & map bo */
++	ret = bochsfb_create_object(bochs, &mode_cmd, &gobj);
++	if (ret) {
++		DRM_ERROR("failed to create fbcon backing object %d\n", ret);
++		return ret;
++	}
++
++	bo = gem_to_bochs_bo(gobj);
++
++	ret = ttm_bo_reserve(&bo->bo, true, false, false, 0);
++	if (ret)
++		return ret;
++
++	ret = bochs_bo_pin(bo, TTM_PL_FLAG_VRAM, NULL);
++	if (ret) {
++		DRM_ERROR("failed to pin fbcon\n");
++		ttm_bo_unreserve(&bo->bo);
++		return ret;
++	}
++
++	ret = ttm_bo_kmap(&bo->bo, 0, bo->bo.num_pages,
++			  &bo->kmap);
++	if (ret) {
++		DRM_ERROR("failed to kmap fbcon\n");
++		ttm_bo_unreserve(&bo->bo);
++		return ret;
++	}
++
++	ttm_bo_unreserve(&bo->bo);
++
++	/* init fb device */
++	info = framebuffer_alloc(0, device);
++	if (info == NULL)
++		return -ENOMEM;
++
++	info->par = &bochs->fb.helper;
++
++	ret = bochs_framebuffer_init(bochs->dev, &bochs->fb.gfb, &mode_cmd, gobj);
++	if (ret)
++		return ret;
++
++	bochs->fb.size = size;
++
++	/* setup helper */
++	fb = &bochs->fb.gfb.base;
++	bochs->fb.helper.fb = fb;
++	bochs->fb.helper.fbdev = info;
++
++	strcpy(info->fix.id, "bochsdrmfb");
++
++	info->flags = FBINFO_DEFAULT;
++	info->fbops = &bochsfb_ops;
++
++	drm_fb_helper_fill_fix(info, fb->pitches[0], fb->depth);
++	drm_fb_helper_fill_var(info, &bochs->fb.helper, sizes->fb_width,
++			       sizes->fb_height);
++
++	info->screen_base = bo->kmap.virtual;
++	info->screen_size = size;
++
++#if 0
++	/* FIXME: get this right for mmap(/dev/fb0) */
++	info->fix.smem_start = bochs_bo_mmap_offset(bo);
++	info->fix.smem_len = size;
++#endif
++
++	ret = fb_alloc_cmap(&info->cmap, 256, 0);
++	if (ret) {
++		DRM_ERROR("%s: can't allocate color map\n", info->fix.id);
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static int bochs_fbdev_destroy(struct bochs_device *bochs)
++{
++	struct bochs_framebuffer *gfb = &bochs->fb.gfb;
++	struct fb_info *info;
++
++	DRM_DEBUG_DRIVER("\n");
++
++	if (bochs->fb.helper.fbdev) {
++		info = bochs->fb.helper.fbdev;
++
++		unregister_framebuffer(info);
++		if (info->cmap.len)
++			fb_dealloc_cmap(&info->cmap);
++		framebuffer_release(info);
++	}
++
++	if (gfb->obj) {
++		drm_gem_object_unreference_unlocked(gfb->obj);
++		gfb->obj = NULL;
++	}
++
++	drm_fb_helper_fini(&bochs->fb.helper);
++	drm_framebuffer_unregister_private(&gfb->base);
++	drm_framebuffer_cleanup(&gfb->base);
++
++	return 0;
++}
++
++void bochs_fb_gamma_set(struct drm_crtc *crtc, u16 red, u16 green,
++			u16 blue, int regno)
++{
++}
++
++void bochs_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
++			u16 *blue, int regno)
++{
++	*red   = regno;
++	*green = regno;
++	*blue  = regno;
++}
++
++static struct drm_fb_helper_funcs bochs_fb_helper_funcs = {
++	.gamma_set = bochs_fb_gamma_set,
++	.gamma_get = bochs_fb_gamma_get,
++	.fb_probe = bochsfb_create,
++};
++
++int bochs_fbdev_init(struct bochs_device *bochs)
++{
++	int ret;
++
++	bochs->fb.helper.funcs = &bochs_fb_helper_funcs;
++	spin_lock_init(&bochs->fb.dirty_lock);
++
++	ret = drm_fb_helper_init(bochs->dev, &bochs->fb.helper,
++				 1, 1);
++	if (ret)
++		return ret;
++
++	drm_fb_helper_single_add_all_connectors(&bochs->fb.helper);
++	drm_helper_disable_unused_functions(bochs->dev);
++	drm_fb_helper_initial_config(&bochs->fb.helper, 32);
++
++	bochs->fb.initialized = true;
++	return 0;
++}
++
++void bochs_fbdev_fini(struct bochs_device *bochs)
++{
++	if (!bochs->fb.initialized)
++		return;
++
++	bochs_fbdev_destroy(bochs);
++	bochs->fb.initialized = false;
++}
+diff --git a/drivers/gpu/drm/bochs/bochs_hw.c b/drivers/gpu/drm/bochs/bochs_hw.c
+new file mode 100644
+index 000000000000..dbe619e6aab4
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/bochs_hw.c
+@@ -0,0 +1,177 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "bochs.h"
++
++/* ---------------------------------------------------------------------- */
++
++static void bochs_vga_writeb(struct bochs_device *bochs, u16 ioport, u8 val)
++{
++	if (WARN_ON(ioport < 0x3c0 || ioport > 0x3df))
++		return;
++
++	if (bochs->mmio) {
++		int offset = ioport - 0x3c0 + 0x400;
++		writeb(val, bochs->mmio + offset);
++	} else {
++		outb(val, ioport);
++	}
++}
++
++static u16 bochs_dispi_read(struct bochs_device *bochs, u16 reg)
++{
++	u16 ret = 0;
++
++	if (bochs->mmio) {
++		int offset = 0x500 + (reg << 1);
++		ret = readw(bochs->mmio + offset);
++	} else {
++		outw(reg, VBE_DISPI_IOPORT_INDEX);
++		ret = inw(VBE_DISPI_IOPORT_DATA);
++	}
++	return ret;
++}
++
++static void bochs_dispi_write(struct bochs_device *bochs, u16 reg, u16 val)
++{
++	if (bochs->mmio) {
++		int offset = 0x500 + (reg << 1);
++		writew(val, bochs->mmio + offset);
++	} else {
++		outw(reg, VBE_DISPI_IOPORT_INDEX);
++		outw(val, VBE_DISPI_IOPORT_DATA);
++	}
++}
++
++int bochs_hw_init(struct drm_device *dev, uint32_t flags)
++{
++	struct bochs_device *bochs = dev->dev_private;
++	struct pci_dev *pdev = dev->pdev;
++	unsigned long addr, size, mem, ioaddr, iosize;
++	u16 id;
++
++	if (/* (ent->driver_data == BOCHS_QEMU_STDVGA) && */
++	    (pdev->resource[2].flags & IORESOURCE_MEM)) {
++		/* mmio bar with vga and bochs registers present */
++		if (pci_request_region(pdev, 2, "bochs-drm") != 0) {
++			DRM_ERROR("Cannot request mmio region\n");
++			return -EBUSY;
++		}
++		ioaddr = pci_resource_start(pdev, 2);
++		iosize = pci_resource_len(pdev, 2);
++		bochs->mmio = ioremap(ioaddr, iosize);
++		if (bochs->mmio == NULL) {
++			DRM_ERROR("Cannot map mmio region\n");
++			return -ENOMEM;
++		}
++	} else {
++		ioaddr = VBE_DISPI_IOPORT_INDEX;
++		iosize = 2;
++		if (!request_region(ioaddr, iosize, "bochs-drm")) {
++			DRM_ERROR("Cannot request ioports\n");
++			return -EBUSY;
++		}
++		bochs->ioports = 1;
++	}
++
++	id = bochs_dispi_read(bochs, VBE_DISPI_INDEX_ID);
++	mem = bochs_dispi_read(bochs, VBE_DISPI_INDEX_VIDEO_MEMORY_64K)
++		* 64 * 1024;
++	if ((id & 0xfff0) != VBE_DISPI_ID0) {
++		DRM_ERROR("ID mismatch\n");
++		return -ENODEV;
++	}
++
++	if ((pdev->resource[0].flags & IORESOURCE_MEM) == 0)
++		return -ENODEV;
++	addr = pci_resource_start(pdev, 0);
++	size = pci_resource_len(pdev, 0);
++	if (addr == 0)
++		return -ENODEV;
++	if (size != mem) {
++		DRM_ERROR("Size mismatch: pci=%ld, bochs=%ld\n",
++			size, mem);
++		size = min(size, mem);
++	}
++
++	if (pci_request_region(pdev, 0, "bochs-drm") != 0) {
++		DRM_ERROR("Cannot request framebuffer\n");
++		return -EBUSY;
++	}
++
++	bochs->fb_map = ioremap(addr, size);
++	if (bochs->fb_map == NULL) {
++		DRM_ERROR("Cannot map framebuffer\n");
++		return -ENOMEM;
++	}
++	bochs->fb_base = addr;
++	bochs->fb_size = size;
++
++	DRM_INFO("Found bochs VGA, ID 0x%x.\n", id);
++	DRM_INFO("Framebuffer size %ld kB @ 0x%lx, %s @ 0x%lx.\n",
++		 size / 1024, addr,
++		 bochs->ioports ? "ioports" : "mmio",
++		 ioaddr);
++	return 0;
++}
++
++void bochs_hw_fini(struct drm_device *dev)
++{
++	struct bochs_device *bochs = dev->dev_private;
++
++	if (bochs->mmio)
++		iounmap(bochs->mmio);
++	if (bochs->ioports)
++		release_region(VBE_DISPI_IOPORT_INDEX, 2);
++	if (bochs->fb_map)
++		iounmap(bochs->fb_map);
++	pci_release_regions(dev->pdev);
++}
++
++void bochs_hw_setmode(struct bochs_device *bochs,
++		      struct drm_display_mode *mode)
++{
++	bochs->xres = mode->hdisplay;
++	bochs->yres = mode->vdisplay;
++	bochs->bpp = 32;
++	bochs->stride = mode->hdisplay * (bochs->bpp / 8);
++	bochs->yres_virtual = bochs->fb_size / bochs->stride;
++
++	DRM_DEBUG_DRIVER("%dx%d @ %d bpp, vy %d\n",
++			 bochs->xres, bochs->yres, bochs->bpp,
++			 bochs->yres_virtual);
++
++	bochs_vga_writeb(bochs, 0x3c0, 0x20); /* unblank */
++
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_BPP,         bochs->bpp);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_XRES,        bochs->xres);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_YRES,        bochs->yres);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_BANK,        0);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_VIRT_WIDTH,  bochs->xres);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_VIRT_HEIGHT,
++			  bochs->yres_virtual);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_X_OFFSET,    0);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_Y_OFFSET,    0);
++
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_ENABLE,
++			  VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
++}
++
++void bochs_hw_setbase(struct bochs_device *bochs,
++		      int x, int y, u64 addr)
++{
++	unsigned long offset = (unsigned long)addr +
++		y * bochs->stride +
++		x * (bochs->bpp / 8);
++	int vy = offset / bochs->stride;
++	int vx = (offset % bochs->stride) * 8 / bochs->bpp;
++
++	DRM_DEBUG_DRIVER("x %d, y %d, addr %llx -> offset %lx, vx %d, vy %d\n",
++			 x, y, addr, offset, vx, vy);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_X_OFFSET, vx);
++	bochs_dispi_write(bochs, VBE_DISPI_INDEX_Y_OFFSET, vy);
++}
+diff --git a/drivers/gpu/drm/bochs/bochs_kms.c b/drivers/gpu/drm/bochs/bochs_kms.c
+new file mode 100644
+index 000000000000..62ec7d4b3816
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/bochs_kms.c
+@@ -0,0 +1,294 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "bochs.h"
++
++static int defx = 1024;
++static int defy = 768;
++
++module_param(defx, int, 0444);
++module_param(defy, int, 0444);
++MODULE_PARM_DESC(defx, "default x resolution");
++MODULE_PARM_DESC(defy, "default y resolution");
++
++/* ---------------------------------------------------------------------- */
++
++static void bochs_crtc_load_lut(struct drm_crtc *crtc)
++{
++}
++
++static void bochs_crtc_dpms(struct drm_crtc *crtc, int mode)
++{
++	switch (mode) {
++	case DRM_MODE_DPMS_ON:
++	case DRM_MODE_DPMS_STANDBY:
++	case DRM_MODE_DPMS_SUSPEND:
++	case DRM_MODE_DPMS_OFF:
++	default:
++		return;
++	}
++}
++
++static bool bochs_crtc_mode_fixup(struct drm_crtc *crtc,
++				  const struct drm_display_mode *mode,
++				  struct drm_display_mode *adjusted_mode)
++{
++	return true;
++}
++
++static int bochs_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
++				    struct drm_framebuffer *old_fb)
++{
++	struct bochs_device *bochs =
++		container_of(crtc, struct bochs_device, crtc);
++	struct bochs_framebuffer *bochs_fb;
++	struct bochs_bo *bo;
++	u64 gpu_addr = 0;
++	int ret;
++
++	if (old_fb) {
++		bochs_fb = to_bochs_framebuffer(old_fb);
++		bo = gem_to_bochs_bo(bochs_fb->obj);
++		ret = ttm_bo_reserve(&bo->bo, true, false, false, 0);
++		if (ret) {
++			DRM_ERROR("failed to reserve old_fb bo\n");
++		} else {
++			bochs_bo_unpin(bo);
++			ttm_bo_unreserve(&bo->bo);
++		}
++	}
++
++	if (WARN_ON(crtc->fb == NULL))
++		return -EINVAL;
++
++	bochs_fb = to_bochs_framebuffer(crtc->fb);
++	bo = gem_to_bochs_bo(bochs_fb->obj);
++	ret = ttm_bo_reserve(&bo->bo, true, false, false, 0);
++	if (ret)
++		return ret;
++
++	ret = bochs_bo_pin(bo, TTM_PL_FLAG_VRAM, &gpu_addr);
++	if (ret) {
++		ttm_bo_unreserve(&bo->bo);
++		return ret;
++	}
++
++	ttm_bo_unreserve(&bo->bo);
++	bochs_hw_setbase(bochs, x, y, gpu_addr);
++	return 0;
++}
++
++static int bochs_crtc_mode_set(struct drm_crtc *crtc,
++			       struct drm_display_mode *mode,
++			       struct drm_display_mode *adjusted_mode,
++			       int x, int y, struct drm_framebuffer *old_fb)
++{
++	struct bochs_device *bochs =
++		container_of(crtc, struct bochs_device, crtc);
++
++	bochs_hw_setmode(bochs, mode);
++	bochs_crtc_mode_set_base(crtc, x, y, old_fb);
++	return 0;
++}
++
++static void bochs_crtc_prepare(struct drm_crtc *crtc)
++{
++}
++
++static void bochs_crtc_commit(struct drm_crtc *crtc)
++{
++}
++
++static void bochs_crtc_gamma_set(struct drm_crtc *crtc, u16 *red, u16 *green,
++				 u16 *blue, uint32_t start, uint32_t size)
++{
++}
++
++/* These provide the minimum set of functions required to handle a CRTC */
++static const struct drm_crtc_funcs bochs_crtc_funcs = {
++	.gamma_set = bochs_crtc_gamma_set,
++	.set_config = drm_crtc_helper_set_config,
++	.destroy = drm_crtc_cleanup,
++};
++
++static const struct drm_crtc_helper_funcs bochs_helper_funcs = {
++	.dpms = bochs_crtc_dpms,
++	.mode_fixup = bochs_crtc_mode_fixup,
++	.mode_set = bochs_crtc_mode_set,
++	.mode_set_base = bochs_crtc_mode_set_base,
++	.prepare = bochs_crtc_prepare,
++	.commit = bochs_crtc_commit,
++	.load_lut = bochs_crtc_load_lut,
++};
++
++static void bochs_crtc_init(struct drm_device *dev)
++{
++	struct bochs_device *bochs = dev->dev_private;
++	struct drm_crtc *crtc = &bochs->crtc;
++
++	drm_crtc_init(dev, crtc, &bochs_crtc_funcs);
++	drm_mode_crtc_set_gamma_size(crtc, 256);
++	drm_crtc_helper_add(crtc, &bochs_helper_funcs);
++}
++
++static bool bochs_encoder_mode_fixup(struct drm_encoder *encoder,
++				     const struct drm_display_mode *mode,
++				     struct drm_display_mode *adjusted_mode)
++{
++	return true;
++}
++
++static void bochs_encoder_mode_set(struct drm_encoder *encoder,
++				   struct drm_display_mode *mode,
++				   struct drm_display_mode *adjusted_mode)
++{
++}
++
++static void bochs_encoder_dpms(struct drm_encoder *encoder, int state)
++{
++}
++
++static void bochs_encoder_prepare(struct drm_encoder *encoder)
++{
++}
++
++static void bochs_encoder_commit(struct drm_encoder *encoder)
++{
++}
++
++static const struct drm_encoder_helper_funcs bochs_encoder_helper_funcs = {
++	.dpms = bochs_encoder_dpms,
++	.mode_fixup = bochs_encoder_mode_fixup,
++	.mode_set = bochs_encoder_mode_set,
++	.prepare = bochs_encoder_prepare,
++	.commit = bochs_encoder_commit,
++};
++
++static const struct drm_encoder_funcs bochs_encoder_encoder_funcs = {
++	.destroy = drm_encoder_cleanup,
++};
++
++static void bochs_encoder_init(struct drm_device *dev)
++{
++	struct bochs_device *bochs = dev->dev_private;
++	struct drm_encoder *encoder = &bochs->encoder;
++
++	encoder->possible_crtcs = 0x1;
++	drm_encoder_init(dev, encoder, &bochs_encoder_encoder_funcs,
++			 DRM_MODE_ENCODER_DAC);
++	drm_encoder_helper_add(encoder, &bochs_encoder_helper_funcs);
++}
++
++
++int bochs_connector_get_modes(struct drm_connector *connector)
++{
++	int count;
++
++	count = drm_add_modes_noedid(connector, 8192, 8192);
++	drm_set_preferred_mode(connector, defx, defy);
++	return count;
++}
++
++static int bochs_connector_mode_valid(struct drm_connector *connector,
++				      struct drm_display_mode *mode)
++{
++	struct bochs_device *bochs =
++		container_of(connector, struct bochs_device, connector);
++	unsigned long size = mode->hdisplay * mode->vdisplay * 4;
++
++	/*
++	 * Make sure we can fit two framebuffers into video memory.
++	 * This allows up to 1600x1200 with 16 MB (default size).
++	 * If you want more try this:
++	 *     'qemu -vga std -global VGA.vgamem_mb=32 $otherargs'
++	 */
++	if (size * 2 > bochs->fb_size)
++		return MODE_BAD;
++
++	return MODE_OK;
++}
++
++static struct drm_encoder *
++bochs_connector_best_encoder(struct drm_connector *connector)
++{
++	int enc_id = connector->encoder_ids[0];
++	struct drm_mode_object *obj;
++	struct drm_encoder *encoder;
++
++	/* pick the encoder ids */
++	if (enc_id) {
++		obj = drm_mode_object_find(connector->dev, enc_id,
++					   DRM_MODE_OBJECT_ENCODER);
++		if (!obj)
++			return NULL;
++		encoder = obj_to_encoder(obj);
++		return encoder;
++	}
++	return NULL;
++}
++
++static enum drm_connector_status bochs_connector_detect(struct drm_connector
++							*connector, bool force)
++{
++	return connector_status_connected;
++}
++
++struct drm_connector_helper_funcs bochs_connector_connector_helper_funcs = {
++	.get_modes = bochs_connector_get_modes,
++	.mode_valid = bochs_connector_mode_valid,
++	.best_encoder = bochs_connector_best_encoder,
++};
++
++struct drm_connector_funcs bochs_connector_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
++	.detect = bochs_connector_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = drm_connector_cleanup,
++};
++
++static void bochs_connector_init(struct drm_device *dev)
++{
++	struct bochs_device *bochs = dev->dev_private;
++	struct drm_connector *connector = &bochs->connector;
++
++	drm_connector_init(dev, connector, &bochs_connector_connector_funcs,
++			   DRM_MODE_CONNECTOR_VIRTUAL);
++	drm_connector_helper_add(connector,
++				 &bochs_connector_connector_helper_funcs);
++}
++
++
++int bochs_kms_init(struct bochs_device *bochs)
++{
++	drm_mode_config_init(bochs->dev);
++	bochs->mode_config_initialized = true;
++
++	bochs->dev->mode_config.max_width = 8192;
++	bochs->dev->mode_config.max_height = 8192;
++
++	bochs->dev->mode_config.fb_base = bochs->fb_base;
++	bochs->dev->mode_config.preferred_depth = 24;
++	bochs->dev->mode_config.prefer_shadow = 0;
++
++	bochs->dev->mode_config.funcs = (void *)&bochs_mode_funcs;
++
++	bochs_crtc_init(bochs->dev);
++	bochs_encoder_init(bochs->dev);
++	bochs_connector_init(bochs->dev);
++	drm_mode_connector_attach_encoder(&bochs->connector,
++					  &bochs->encoder);
++
++	return 0;
++}
++
++void bochs_kms_fini(struct bochs_device *bochs)
++{
++	if (bochs->mode_config_initialized) {
++		drm_mode_config_cleanup(bochs->dev);
++		bochs->mode_config_initialized = false;
++	}
++}
+diff --git a/drivers/gpu/drm/bochs/bochs_mm.c b/drivers/gpu/drm/bochs/bochs_mm.c
+new file mode 100644
+index 000000000000..ce6858765b37
+--- /dev/null
++++ b/drivers/gpu/drm/bochs/bochs_mm.c
+@@ -0,0 +1,546 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "bochs.h"
++
++static void bochs_ttm_placement(struct bochs_bo *bo, int domain);
++
++/* ---------------------------------------------------------------------- */
++
++static inline struct bochs_device *bochs_bdev(struct ttm_bo_device *bd)
++{
++	return container_of(bd, struct bochs_device, ttm.bdev);
++}
++
++static int bochs_ttm_mem_global_init(struct drm_global_reference *ref)
++{
++	return ttm_mem_global_init(ref->object);
++}
++
++static void bochs_ttm_mem_global_release(struct drm_global_reference *ref)
++{
++	ttm_mem_global_release(ref->object);
++}
++
++static int bochs_ttm_global_init(struct bochs_device *bochs)
++{
++	struct drm_global_reference *global_ref;
++	int r;
++
++	global_ref = &bochs->ttm.mem_global_ref;
++	global_ref->global_type = DRM_GLOBAL_TTM_MEM;
++	global_ref->size = sizeof(struct ttm_mem_global);
++	global_ref->init = &bochs_ttm_mem_global_init;
++	global_ref->release = &bochs_ttm_mem_global_release;
++	r = drm_global_item_ref(global_ref);
++	if (r != 0) {
++		DRM_ERROR("Failed setting up TTM memory accounting "
++			  "subsystem.\n");
++		return r;
++	}
++
++	bochs->ttm.bo_global_ref.mem_glob =
++		bochs->ttm.mem_global_ref.object;
++	global_ref = &bochs->ttm.bo_global_ref.ref;
++	global_ref->global_type = DRM_GLOBAL_TTM_BO;
++	global_ref->size = sizeof(struct ttm_bo_global);
++	global_ref->init = &ttm_bo_global_init;
++	global_ref->release = &ttm_bo_global_release;
++	r = drm_global_item_ref(global_ref);
++	if (r != 0) {
++		DRM_ERROR("Failed setting up TTM BO subsystem.\n");
++		drm_global_item_unref(&bochs->ttm.mem_global_ref);
++		return r;
++	}
++
++	return 0;
++}
++
++static void bochs_ttm_global_release(struct bochs_device *bochs)
++{
++	if (bochs->ttm.mem_global_ref.release == NULL)
++		return;
++
++	drm_global_item_unref(&bochs->ttm.bo_global_ref.ref);
++	drm_global_item_unref(&bochs->ttm.mem_global_ref);
++	bochs->ttm.mem_global_ref.release = NULL;
++}
++
++
++static void bochs_bo_ttm_destroy(struct ttm_buffer_object *tbo)
++{
++	struct bochs_bo *bo;
++
++	bo = container_of(tbo, struct bochs_bo, bo);
++	drm_gem_object_release(&bo->gem);
++	kfree(bo);
++}
++
++static bool bochs_ttm_bo_is_bochs_bo(struct ttm_buffer_object *bo)
++{
++	if (bo->destroy == &bochs_bo_ttm_destroy)
++		return true;
++	return false;
++}
++
++static int bochs_bo_init_mem_type(struct ttm_bo_device *bdev, uint32_t type,
++				  struct ttm_mem_type_manager *man)
++{
++	switch (type) {
++	case TTM_PL_SYSTEM:
++		man->flags = TTM_MEMTYPE_FLAG_MAPPABLE;
++		man->available_caching = TTM_PL_MASK_CACHING;
++		man->default_caching = TTM_PL_FLAG_CACHED;
++		break;
++	case TTM_PL_VRAM:
++		man->func = &ttm_bo_manager_func;
++		man->flags = TTM_MEMTYPE_FLAG_FIXED |
++			TTM_MEMTYPE_FLAG_MAPPABLE;
++		man->available_caching = TTM_PL_FLAG_UNCACHED |
++			TTM_PL_FLAG_WC;
++		man->default_caching = TTM_PL_FLAG_WC;
++		break;
++	default:
++		DRM_ERROR("Unsupported memory type %u\n", (unsigned)type);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static void
++bochs_bo_evict_flags(struct ttm_buffer_object *bo, struct ttm_placement *pl)
++{
++	struct bochs_bo *bochsbo = bochs_bo(bo);
++
++	if (!bochs_ttm_bo_is_bochs_bo(bo))
++		return;
++
++	bochs_ttm_placement(bochsbo, TTM_PL_FLAG_SYSTEM);
++	*pl = bochsbo->placement;
++}
++
++static int bochs_bo_verify_access(struct ttm_buffer_object *bo,
++				  struct file *filp)
++{
++	struct bochs_bo *bochsbo = bochs_bo(bo);
++
++	return drm_vma_node_verify_access(&bochsbo->gem.vma_node, filp);
++}
++
++static int bochs_ttm_io_mem_reserve(struct ttm_bo_device *bdev,
++				    struct ttm_mem_reg *mem)
++{
++	struct ttm_mem_type_manager *man = &bdev->man[mem->mem_type];
++	struct bochs_device *bochs = bochs_bdev(bdev);
++
++	mem->bus.addr = NULL;
++	mem->bus.offset = 0;
++	mem->bus.size = mem->num_pages << PAGE_SHIFT;
++	mem->bus.base = 0;
++	mem->bus.is_iomem = false;
++	if (!(man->flags & TTM_MEMTYPE_FLAG_MAPPABLE))
++		return -EINVAL;
++	switch (mem->mem_type) {
++	case TTM_PL_SYSTEM:
++		/* system memory */
++		return 0;
++	case TTM_PL_VRAM:
++		mem->bus.offset = mem->start << PAGE_SHIFT;
++		mem->bus.base = bochs->fb_base;
++		mem->bus.is_iomem = true;
++		break;
++	default:
++		return -EINVAL;
++		break;
++	}
++	return 0;
++}
++
++static void bochs_ttm_io_mem_free(struct ttm_bo_device *bdev,
++				  struct ttm_mem_reg *mem)
++{
++}
++
++static int bochs_bo_move(struct ttm_buffer_object *bo,
++			 bool evict, bool interruptible,
++			 bool no_wait_gpu,
++			 struct ttm_mem_reg *new_mem)
++{
++	return ttm_bo_move_memcpy(bo, evict, no_wait_gpu, new_mem);
++}
++
++
++static void bochs_ttm_backend_destroy(struct ttm_tt *tt)
++{
++	ttm_tt_fini(tt);
++	kfree(tt);
++}
++
++static struct ttm_backend_func bochs_tt_backend_func = {
++	.destroy = &bochs_ttm_backend_destroy,
++};
++
++static struct ttm_tt *bochs_ttm_tt_create(struct ttm_bo_device *bdev,
++					  unsigned long size,
++					  uint32_t page_flags,
++					  struct page *dummy_read_page)
++{
++	struct ttm_tt *tt;
++
++	tt = kzalloc(sizeof(struct ttm_tt), GFP_KERNEL);
++	if (tt == NULL)
++		return NULL;
++	tt->func = &bochs_tt_backend_func;
++	if (ttm_tt_init(tt, bdev, size, page_flags, dummy_read_page)) {
++		kfree(tt);
++		return NULL;
++	}
++	return tt;
++}
++
++struct ttm_bo_driver bochs_bo_driver = {
++	.ttm_tt_create = bochs_ttm_tt_create,
++	.ttm_tt_populate = ttm_pool_populate,
++	.ttm_tt_unpopulate = ttm_pool_unpopulate,
++	.init_mem_type = bochs_bo_init_mem_type,
++	.evict_flags = bochs_bo_evict_flags,
++	.move = bochs_bo_move,
++	.verify_access = bochs_bo_verify_access,
++	.io_mem_reserve = &bochs_ttm_io_mem_reserve,
++	.io_mem_free = &bochs_ttm_io_mem_free,
++};
++
++int bochs_mm_init(struct bochs_device *bochs)
++{
++	struct ttm_bo_device *bdev = &bochs->ttm.bdev;
++	int ret;
++
++	ret = bochs_ttm_global_init(bochs);
++	if (ret)
++		return ret;
++
++	ret = ttm_bo_device_init(&bochs->ttm.bdev,
++				 bochs->ttm.bo_global_ref.ref.object,
++				 &bochs_bo_driver, DRM_FILE_PAGE_OFFSET,
++				 true);
++	if (ret) {
++		DRM_ERROR("Error initialising bo driver; %d\n", ret);
++		return ret;
++	}
++
++	ret = ttm_bo_init_mm(bdev, TTM_PL_VRAM,
++			     bochs->fb_size >> PAGE_SHIFT);
++	if (ret) {
++		DRM_ERROR("Failed ttm VRAM init: %d\n", ret);
++		return ret;
++	}
++
++	bochs->ttm.initialized = true;
++	return 0;
++}
++
++void bochs_mm_fini(struct bochs_device *bochs)
++{
++	if (!bochs->ttm.initialized)
++		return;
++
++	ttm_bo_device_release(&bochs->ttm.bdev);
++	bochs_ttm_global_release(bochs);
++	bochs->ttm.initialized = false;
++}
++
++static void bochs_ttm_placement(struct bochs_bo *bo, int domain)
++{
++	u32 c = 0;
++	bo->placement.fpfn = 0;
++	bo->placement.lpfn = 0;
++	bo->placement.placement = bo->placements;
++	bo->placement.busy_placement = bo->placements;
++	if (domain & TTM_PL_FLAG_VRAM) {
++		bo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED
++			| TTM_PL_FLAG_VRAM;
++	}
++	if (domain & TTM_PL_FLAG_SYSTEM) {
++		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++	}
++	if (!c) {
++		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++	}
++	bo->placement.num_placement = c;
++	bo->placement.num_busy_placement = c;
++}
++
++static inline u64 bochs_bo_gpu_offset(struct bochs_bo *bo)
++{
++	return bo->bo.offset;
++}
++
++int bochs_bo_pin(struct bochs_bo *bo, u32 pl_flag, u64 *gpu_addr)
++{
++	int i, ret;
++
++	if (bo->pin_count) {
++		bo->pin_count++;
++		if (gpu_addr)
++			*gpu_addr = bochs_bo_gpu_offset(bo);
++		return 0;
++	}
++
++	bochs_ttm_placement(bo, pl_flag);
++	for (i = 0; i < bo->placement.num_placement; i++)
++		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
++	if (ret)
++		return ret;
++
++	bo->pin_count = 1;
++	if (gpu_addr)
++		*gpu_addr = bochs_bo_gpu_offset(bo);
++	return 0;
++}
++
++int bochs_bo_unpin(struct bochs_bo *bo)
++{
++	int i, ret;
++
++	if (!bo->pin_count) {
++		DRM_ERROR("unpin bad %p\n", bo);
++		return 0;
++	}
++	bo->pin_count--;
++
++	if (bo->pin_count)
++		return 0;
++
++	for (i = 0; i < bo->placement.num_placement; i++)
++		bo->placements[i] &= ~TTM_PL_FLAG_NO_EVICT;
++	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++int bochs_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct drm_file *file_priv;
++	struct bochs_device *bochs;
++
++	if (unlikely(vma->vm_pgoff < DRM_FILE_PAGE_OFFSET))
++		return drm_mmap(filp, vma);
++
++	file_priv = filp->private_data;
++	bochs = file_priv->minor->dev->dev_private;
++	return ttm_bo_mmap(filp, vma, &bochs->ttm.bdev);
++}
++
++/* ---------------------------------------------------------------------- */
++
++static int bochs_bo_create(struct drm_device *dev, int size, int align,
++			   uint32_t flags, struct bochs_bo **pbochsbo)
++{
++	struct bochs_device *bochs = dev->dev_private;
++	struct bochs_bo *bochsbo;
++	size_t acc_size;
++	int ret;
++
++	bochsbo = kzalloc(sizeof(struct bochs_bo), GFP_KERNEL);
++	if (!bochsbo)
++		return -ENOMEM;
++
++	ret = drm_gem_object_init(dev, &bochsbo->gem, size);
++	if (ret) {
++		kfree(bochsbo);
++		return ret;
++	}
++
++	bochsbo->bo.bdev = &bochs->ttm.bdev;
++	bochsbo->bo.bdev->dev_mapping = dev->dev_mapping;
++
++	bochs_ttm_placement(bochsbo, TTM_PL_FLAG_VRAM | TTM_PL_FLAG_SYSTEM);
++
++	acc_size = ttm_bo_dma_acc_size(&bochs->ttm.bdev, size,
++				       sizeof(struct bochs_bo));
++
++	ret = ttm_bo_init(&bochs->ttm.bdev, &bochsbo->bo, size,
++			  ttm_bo_type_device, &bochsbo->placement,
++			  align >> PAGE_SHIFT, false, NULL, acc_size,
++			  NULL, bochs_bo_ttm_destroy);
++	if (ret)
++		return ret;
++
++	*pbochsbo = bochsbo;
++	return 0;
++}
++
++int bochs_gem_create(struct drm_device *dev, u32 size, bool iskernel,
++		     struct drm_gem_object **obj)
++{
++	struct bochs_bo *bochsbo;
++	int ret;
++
++	*obj = NULL;
++
++	size = ALIGN(size, PAGE_SIZE);
++	if (size == 0)
++		return -EINVAL;
++
++	ret = bochs_bo_create(dev, size, 0, 0, &bochsbo);
++	if (ret) {
++		if (ret != -ERESTARTSYS)
++			DRM_ERROR("failed to allocate GEM object\n");
++		return ret;
++	}
++	*obj = &bochsbo->gem;
++	return 0;
++}
++
++int bochs_dumb_create(struct drm_file *file, struct drm_device *dev,
++		      struct drm_mode_create_dumb *args)
++{
++	struct drm_gem_object *gobj;
++	u32 handle;
++	int ret;
++
++	args->pitch = args->width * ((args->bpp + 7) / 8);
++	args->size = args->pitch * args->height;
++
++	ret = bochs_gem_create(dev, args->size, false,
++			       &gobj);
++	if (ret)
++		return ret;
++
++	ret = drm_gem_handle_create(file, gobj, &handle);
++	drm_gem_object_unreference_unlocked(gobj);
++	if (ret)
++		return ret;
++
++	args->handle = handle;
++	return 0;
++}
++
++static void bochs_bo_unref(struct bochs_bo **bo)
++{
++	struct ttm_buffer_object *tbo;
++
++	if ((*bo) == NULL)
++		return;
++
++	tbo = &((*bo)->bo);
++	ttm_bo_unref(&tbo);
++	if (tbo == NULL)
++		*bo = NULL;
++
++}
++
++void bochs_gem_free_object(struct drm_gem_object *obj)
++{
++	struct bochs_bo *bochs_bo = gem_to_bochs_bo(obj);
++
++	if (!bochs_bo)
++		return;
++	bochs_bo_unref(&bochs_bo);
++}
++
++int bochs_dumb_mmap_offset(struct drm_file *file, struct drm_device *dev,
++			   uint32_t handle, uint64_t *offset)
++{
++	struct drm_gem_object *obj;
++	int ret;
++	struct bochs_bo *bo;
++
++	mutex_lock(&dev->struct_mutex);
++	obj = drm_gem_object_lookup(dev, file, handle);
++	if (obj == NULL) {
++		ret = -ENOENT;
++		goto out_unlock;
++	}
++
++	bo = gem_to_bochs_bo(obj);
++	*offset = bochs_bo_mmap_offset(bo);
++
++	drm_gem_object_unreference(obj);
++	ret = 0;
++out_unlock:
++	mutex_unlock(&dev->struct_mutex);
++	return ret;
++
++}
++
++/* ---------------------------------------------------------------------- */
++
++static void bochs_user_framebuffer_destroy(struct drm_framebuffer *fb)
++{
++	struct bochs_framebuffer *bochs_fb = to_bochs_framebuffer(fb);
++	if (bochs_fb->obj)
++		drm_gem_object_unreference_unlocked(bochs_fb->obj);
++	drm_framebuffer_cleanup(fb);
++	kfree(fb);
++}
++
++static const struct drm_framebuffer_funcs bochs_fb_funcs = {
++	.destroy = bochs_user_framebuffer_destroy,
++};
++
++int bochs_framebuffer_init(struct drm_device *dev,
++			   struct bochs_framebuffer *gfb,
++			   struct drm_mode_fb_cmd2 *mode_cmd,
++			   struct drm_gem_object *obj)
++{
++	int ret;
++
++	drm_helper_mode_fill_fb_struct(&gfb->base, mode_cmd);
++	gfb->obj = obj;
++	ret = drm_framebuffer_init(dev, &gfb->base, &bochs_fb_funcs);
++	if (ret) {
++		DRM_ERROR("drm_framebuffer_init failed: %d\n", ret);
++		return ret;
++	}
++	return 0;
++}
++
++static struct drm_framebuffer *
++bochs_user_framebuffer_create(struct drm_device *dev,
++			      struct drm_file *filp,
++			      struct drm_mode_fb_cmd2 *mode_cmd)
++{
++	struct drm_gem_object *obj;
++	struct bochs_framebuffer *bochs_fb;
++	int ret;
++
++	DRM_DEBUG_DRIVER("%dx%d, format %c%c%c%c\n",
++	       mode_cmd->width, mode_cmd->height,
++	       (mode_cmd->pixel_format)       & 0xff,
++	       (mode_cmd->pixel_format >> 8)  & 0xff,
++	       (mode_cmd->pixel_format >> 16) & 0xff,
++	       (mode_cmd->pixel_format >> 24) & 0xff);
++
++	if (mode_cmd->pixel_format != DRM_FORMAT_XRGB8888)
++		return ERR_PTR(-ENOENT);
++
++	obj = drm_gem_object_lookup(dev, filp, mode_cmd->handles[0]);
++	if (obj == NULL)
++		return ERR_PTR(-ENOENT);
++
++	bochs_fb = kzalloc(sizeof(*bochs_fb), GFP_KERNEL);
++	if (!bochs_fb) {
++		drm_gem_object_unreference_unlocked(obj);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	ret = bochs_framebuffer_init(dev, bochs_fb, mode_cmd, obj);
++	if (ret) {
++		drm_gem_object_unreference_unlocked(obj);
++		kfree(bochs_fb);
++		return ERR_PTR(ret);
++	}
++	return &bochs_fb->base;
++}
++
++const struct drm_mode_config_funcs bochs_mode_funcs = {
++	.fb_create = bochs_user_framebuffer_create,
++};
