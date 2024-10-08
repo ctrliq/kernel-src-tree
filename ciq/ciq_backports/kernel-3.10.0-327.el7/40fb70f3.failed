@@ -1,0 +1,196 @@
+vxlan: fix wrong usage of VXLAN_VID_MASK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexey Kodanev <alexey.kodanev@oracle.com>
+commit 40fb70f3aa0a67d28a30c854d4e7aa10b0511db9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/40fb70f3.failed
+
+commit dfd8645ea1bd9127 wrongly assumes that VXLAN_VDI_MASK includes
+eight lower order reserved bits of VNI field that are using for remote
+checksum offload.
+
+Right now, when VNI number greater then 0xffff, vxlan_udp_encap_recv()
+will always return with 'bad_flag' error, reducing the usable vni range
+from 0..16777215 to 0..65535. Also, it doesn't really check whether RCO
+bits processed or not.
+
+Fix it by adding new VNI mask which has all 32 bits of VNI field:
+24 bits for id and 8 bits for other usage.
+
+	Signed-off-by: Alexey Kodanev <alexey.kodanev@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 40fb70f3aa0a67d28a30c854d4e7aa10b0511db9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+diff --cc drivers/net/vxlan.c
+index f6bd9cff732e,f8528a4cf54f..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1120,7 -1211,49 +1120,53 @@@ static int vxlan_udp_encap_recv(struct 
+  	if (!vs)
+  		goto drop;
+  
+++<<<<<<< HEAD
+ +	vs->rcv(vs, skb, vxh->vx_vni);
+++=======
++ 	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
++ 		vxh = vxlan_remcsum(skb, vxh, sizeof(struct vxlanhdr), vni,
++ 				    !!(vs->flags & VXLAN_F_REMCSUM_NOPARTIAL));
++ 		if (!vxh)
++ 			goto drop;
++ 
++ 		flags &= ~VXLAN_HF_RCO;
++ 		vni &= VXLAN_VNI_MASK;
++ 	}
++ 
++ 	/* For backwards compatibility, only allow reserved fields to be
++ 	 * used by VXLAN extensions if explicitly requested.
++ 	 */
++ 	if ((flags & VXLAN_HF_GBP) && (vs->flags & VXLAN_F_GBP)) {
++ 		struct vxlanhdr_gbp *gbp;
++ 
++ 		gbp = (struct vxlanhdr_gbp *)vxh;
++ 		md.gbp = ntohs(gbp->policy_id);
++ 
++ 		if (gbp->dont_learn)
++ 			md.gbp |= VXLAN_GBP_DONT_LEARN;
++ 
++ 		if (gbp->policy_applied)
++ 			md.gbp |= VXLAN_GBP_POLICY_APPLIED;
++ 
++ 		flags &= ~VXLAN_GBP_USED_BITS;
++ 	}
++ 
++ 	if (flags || vni & ~VXLAN_VNI_MASK) {
++ 		/* If there are any unprocessed flags remaining treat
++ 		 * this as a malformed packet. This behavior diverges from
++ 		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
++ 		 * in reserved fields are to be ignored. The approach here
++ 		 * maintains compatbility with previous stack code, and also
++ 		 * is more robust and provides a little more security in
++ 		 * adding extensions to VXLAN.
++ 		 */
++ 
++ 		goto bad_flags;
++ 	}
++ 
++ 	md.vni = vxh->vx_vni;
++ 	vs->rcv(vs, skb, &md);
+++>>>>>>> 40fb70f3aa0a (vxlan: fix wrong usage of VXLAN_VID_MASK)
+  	return 0;
+  
+  drop:
+diff --cc include/net/vxlan.h
+index 1ddc74769f81,c73e7abbbaa5..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -8,8 -11,97 +8,99 @@@
+  #define VNI_HASH_BITS	10
+  #define VNI_HASH_SIZE	(1<<VNI_HASH_BITS)
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * VXLAN Group Based Policy Extension:
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |1|-|-|-|1|-|-|-|R|D|R|R|A|R|R|R|        Group Policy ID        |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |                VXLAN Network Identifier (VNI) |   Reserved    |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * D = Don't Learn bit. When set, this bit indicates that the egress
++  *     VTEP MUST NOT learn the source address of the encapsulated frame.
++  *
++  * A = Indicates that the group policy has already been applied to
++  *     this packet. Policies MUST NOT be applied by devices when the
++  *     A bit is set.
++  *
++  * [0] https://tools.ietf.org/html/draft-smith-vxlan-group-policy
++  */
++ struct vxlanhdr_gbp {
++ 	__u8	vx_flags;
++ #ifdef __LITTLE_ENDIAN_BITFIELD
++ 	__u8	reserved_flags1:3,
++ 		policy_applied:1,
++ 		reserved_flags2:2,
++ 		dont_learn:1,
++ 		reserved_flags3:1;
++ #elif defined(__BIG_ENDIAN_BITFIELD)
++ 	__u8	reserved_flags1:1,
++ 		dont_learn:1,
++ 		reserved_flags2:2,
++ 		policy_applied:1,
++ 		reserved_flags3:3;
++ #else
++ #error	"Please fix <asm/byteorder.h>"
++ #endif
++ 	__be16	policy_id;
++ 	__be32	vx_vni;
++ };
++ 
++ #define VXLAN_GBP_USED_BITS (VXLAN_HF_GBP | 0xFFFFFF)
++ 
++ /* skb->mark mapping
++  *
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |R|R|R|R|R|R|R|R|R|D|R|R|A|R|R|R|        Group Policy ID        |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  */
++ #define VXLAN_GBP_DONT_LEARN		(BIT(6) << 16)
++ #define VXLAN_GBP_POLICY_APPLIED	(BIT(3) << 16)
++ #define VXLAN_GBP_ID_MASK		(0xFFFF)
++ 
++ /* VXLAN protocol header:
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |G|R|R|R|I|R|R|C|               Reserved                        |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |                VXLAN Network Identifier (VNI) |   Reserved    |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * G = 1	Group Policy (VXLAN-GBP)
++  * I = 1	VXLAN Network Identifier (VNI) present
++  * C = 1	Remote checksum offload (RCO)
++  */
++ struct vxlanhdr {
++ 	__be32 vx_flags;
++ 	__be32 vx_vni;
++ };
++ 
++ /* VXLAN header flags. */
++ #define VXLAN_HF_RCO BIT(24)
++ #define VXLAN_HF_VNI BIT(27)
++ #define VXLAN_HF_GBP BIT(31)
++ 
++ /* Remote checksum offload header option */
++ #define VXLAN_RCO_MASK  0x7f    /* Last byte of vni field */
++ #define VXLAN_RCO_UDP   0x80    /* Indicate UDP RCO (TCP when not set *) */
++ #define VXLAN_RCO_SHIFT 1       /* Left shift of start */
++ #define VXLAN_RCO_SHIFT_MASK ((1 << VXLAN_RCO_SHIFT) - 1)
++ #define VXLAN_MAX_REMCSUM_START (VXLAN_RCO_MASK << VXLAN_RCO_SHIFT)
++ 
++ #define VXLAN_N_VID     (1u << 24)
++ #define VXLAN_VID_MASK  (VXLAN_N_VID - 1)
++ #define VXLAN_VNI_MASK  (VXLAN_VID_MASK << 8)
++ #define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
++ 
++ struct vxlan_metadata {
++ 	__be32		vni;
++ 	u32		gbp;
++ };
++ 
+++>>>>>>> 40fb70f3aa0a (vxlan: fix wrong usage of VXLAN_VID_MASK)
+  struct vxlan_sock;
+ -typedef void (vxlan_rcv_t)(struct vxlan_sock *vh, struct sk_buff *skb,
+ -			   struct vxlan_metadata *md);
+ +typedef void (vxlan_rcv_t)(struct vxlan_sock *vh, struct sk_buff *skb, __be32 key);
+  
+  /* per UDP socket information */
+  struct vxlan_sock {
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
