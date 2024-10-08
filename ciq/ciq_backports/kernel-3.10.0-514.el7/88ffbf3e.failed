@@ -1,0 +1,339 @@
+GFS2: Use resizable hash table for glocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 88ffbf3e037e67b52c46d528aca1618489c21f68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/88ffbf3e.failed
+
+This patch changes the glock hash table from a normal hash table to
+a resizable hash table, which scales better. This also simplifies
+a lot of code.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+(cherry picked from commit 88ffbf3e037e67b52c46d528aca1618489c21f68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/incore.h
+diff --cc fs/gfs2/glock.c
+index 53742d4fa4ae,edb15eeb0ad5..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -113,13 -90,6 +88,16 @@@ void gfs2_glock_free(struct gfs2_glock 
+  		kfree(gl->gl_lksb.sb_lvbptr);
+  		kmem_cache_free(gfs2_glock_cachep, gl);
+  	}
+++<<<<<<< HEAD
+ +}
+ +
+ +void gfs2_glock_free(struct gfs2_glock *gl)
+ +{
+ +	struct gfs2_sbd *sdp = gl->gl_sbd;
+ +
+ +	call_rcu(&gl->gl_rcu, gfs2_glock_dealloc);
+++=======
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  	if (atomic_dec_and_test(&sdp->sd_glock_disposal))
+  		wake_up(&sdp->sd_glock_wait);
+  }
+@@@ -203,13 -168,9 +181,11 @@@ void gfs2_glock_put(struct gfs2_glock *
+  
+  	lockref_mark_dead(&gl->gl_lockref);
+  
+ -	gfs2_glock_remove_from_lru(gl);
+ +	spin_lock(&lru_lock);
+ +	__gfs2_glock_remove_from_lru(gl);
+ +	spin_unlock(&lru_lock);
+  	spin_unlock(&gl->gl_lockref.lock);
+- 	spin_lock_bucket(gl->gl_hash);
+- 	hlist_bl_del_rcu(&gl->gl_list);
+- 	spin_unlock_bucket(gl->gl_hash);
++ 	rhashtable_remove_fast(&gl_hash_table, &gl->gl_node, ht_parms);
+  	GLOCK_BUG_ON(gl, !list_empty(&gl->gl_holders));
+  	GLOCK_BUG_ON(gl, mapping && mapping->nrpages);
+  	trace_gfs2_glock_put(gl);
+@@@ -217,33 -178,6 +193,36 @@@
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * search_bucket() - Find struct gfs2_glock by lock number
+ + * @bucket: the bucket to search
+ + * @name: The lock name
+ + *
+ + * Returns: NULL, or the struct gfs2_glock with the requested number
+ + */
+ +
+ +static struct gfs2_glock *search_bucket(unsigned int hash,
+ +					const struct gfs2_sbd *sdp,
+ +					const struct lm_lockname *name)
+ +{
+ +	struct gfs2_glock *gl;
+ +	struct hlist_bl_node *h;
+ +
+ +	hlist_bl_for_each_entry_rcu(gl, h, &gl_hash_table[hash], gl_list) {
+ +		if (!lm_name_equal(&gl->gl_name, name))
+ +			continue;
+ +		if (gl->gl_sbd != sdp)
+ +			continue;
+ +		if (lockref_get_not_dead(&gl->gl_lockref))
+ +			return gl;
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+   * may_grant - check if its ok to grant a new lock
+   * @gl: The glock
+   * @gh: The lock request which we wish to grant
+@@@ -709,15 -643,17 +688,29 @@@ int gfs2_glock_get(struct gfs2_sbd *sdp
+  		   struct gfs2_glock **glp)
+  {
+  	struct super_block *s = sdp->sd_vfs;
+++<<<<<<< HEAD
+ +	struct lm_lockname name = { .ln_number = number, .ln_type = glops->go_type };
+ +	struct gfs2_glock *gl, *tmp;
+ +	unsigned int hash = gl_hash(sdp, &name);
+++=======
++ 	struct lm_lockname name = { .ln_number = number,
++ 				    .ln_type = glops->go_type,
++ 				    .ln_sbd = sdp };
++ 	struct gfs2_glock *gl, *tmp = NULL;
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  	struct address_space *mapping;
+  	struct kmem_cache *cachep;
++ 	int ret, tries = 0;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	gl = search_bucket(hash, sdp, &name);
+ +	rcu_read_unlock();
+++=======
++ 	gl = rhashtable_lookup_fast(&gl_hash_table, &name, ht_parms);
++ 	if (gl && !lockref_get_not_dead(&gl->gl_lockref))
++ 		gl = NULL;
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  
+  	*glp = gl;
+  	if (gl)
+@@@ -744,7 -680,7 +737,11 @@@
+  	}
+  
+  	atomic_inc(&sdp->sd_glock_disposal);
+++<<<<<<< HEAD
+ +	gl->gl_sbd = sdp;
+++=======
++ 	gl->gl_node.next = NULL;
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  	gl->gl_flags = 0;
+  	gl->gl_name = name;
+  	gl->gl_lockref.count = 1;
+@@@ -777,22 -711,34 +773,48 @@@
+  		mapping->writeback_index = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_bucket(hash);
+ +	tmp = search_bucket(hash, sdp, &name);
+ +	if (tmp) {
+ +		spin_unlock_bucket(hash);
+ +		kfree(gl->gl_lksb.sb_lvbptr);
+ +		kmem_cache_free(cachep, gl);
+ +		atomic_dec(&sdp->sd_glock_disposal);
+ +		gl = tmp;
+ +	} else {
+ +		hlist_bl_add_head_rcu(&gl->gl_list, &gl_hash_table[hash]);
+ +		spin_unlock_bucket(hash);
+++=======
++ again:
++ 	ret = rhashtable_lookup_insert_fast(&gl_hash_table, &gl->gl_node,
++ 					    ht_parms);
++ 	if (ret == 0) {
++ 		*glp = gl;
++ 		return 0;
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  	}
+  
+- 	*glp = gl;
++ 	if (ret == -EEXIST) {
++ 		ret = 0;
++ 		tmp = rhashtable_lookup_fast(&gl_hash_table, &name, ht_parms);
++ 		if (tmp == NULL || !lockref_get_not_dead(&tmp->gl_lockref)) {
++ 			if (++tries < 100) {
++ 				cond_resched();
++ 				goto again;
++ 			}
++ 			tmp = NULL;
++ 			ret = -ENOMEM;
++ 		}
++ 	} else {
++ 		WARN_ON_ONCE(ret);
++ 	}
++ 	kfree(gl->gl_lksb.sb_lvbptr);
++ 	kmem_cache_free(cachep, gl);
++ 	atomic_dec(&sdp->sd_glock_disposal);
++ 	*glp = tmp;
+  
+- 	return 0;
++ 	return ret;
+  }
+  
+  /**
+@@@ -1485,17 -1414,21 +1507,27 @@@ static struct shrinker glock_shrinker 
+   *
+   */
+  
+- static void examine_bucket(glock_examiner examiner, const struct gfs2_sbd *sdp,
+- 			  unsigned int hash)
++ static void glock_hash_walk(glock_examiner examiner, const struct gfs2_sbd *sdp)
+  {
+  	struct gfs2_glock *gl;
+- 	struct hlist_bl_head *head = &gl_hash_table[hash];
+- 	struct hlist_bl_node *pos;
++ 	struct rhash_head *pos, *next;
++ 	const struct bucket_table *tbl;
++ 	int i;
+  
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	hlist_bl_for_each_entry_rcu(gl, pos, head, gl_list) {
+ +		if ((gl->gl_sbd == sdp) && lockref_get_not_dead(&gl->gl_lockref))
+ +			examiner(gl);
+++=======
++ 	tbl = rht_dereference_rcu(gl_hash_table.tbl, &gl_hash_table);
++ 	for (i = 0; i < tbl->size; i++) {
++ 		rht_for_each_entry_safe(gl, pos, next, tbl, i, gl_node) {
++ 			if ((gl->gl_name.ln_sbd == sdp) &&
++ 			    lockref_get_not_dead(&gl->gl_lockref))
++ 				examiner(gl);
++ 		}
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  	}
+  	rcu_read_unlock();
+  	cond_resched();
+@@@ -1842,14 -1759,17 +1866,26 @@@ int __init gfs2_glock_init(void
+  
+  	glock_workqueue = alloc_workqueue("glock_workqueue", WQ_MEM_RECLAIM |
+  					  WQ_HIGHPRI | WQ_FREEZABLE, 0);
+++<<<<<<< HEAD
+ +	if (IS_ERR(glock_workqueue))
+ +		return PTR_ERR(glock_workqueue);
+++=======
++ 	if (!glock_workqueue) {
++ 		rhashtable_destroy(&gl_hash_table);
++ 		return -ENOMEM;
++ 	}
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  	gfs2_delete_workqueue = alloc_workqueue("delete_workqueue",
+  						WQ_MEM_RECLAIM | WQ_FREEZABLE,
+  						0);
+ -	if (!gfs2_delete_workqueue) {
+ +	if (IS_ERR(gfs2_delete_workqueue)) {
+  		destroy_workqueue(glock_workqueue);
+++<<<<<<< HEAD
+ +		return PTR_ERR(gfs2_delete_workqueue);
+++=======
++ 		rhashtable_destroy(&gl_hash_table);
++ 		return -ENOMEM;
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  	}
+  
+  	register_shrinker(&glock_shrinker);
+@@@ -1864,49 -1785,18 +1901,25 @@@ void gfs2_glock_exit(void
+  	destroy_workqueue(gfs2_delete_workqueue);
+  }
+  
+- static inline struct gfs2_glock *glock_hash_chain(unsigned hash)
++ static void gfs2_glock_iter_next(struct gfs2_glock_iter *gi)
+  {
+- 	return hlist_bl_entry(hlist_bl_first_rcu(&gl_hash_table[hash]),
+- 			      struct gfs2_glock, gl_list);
+- }
+- 
+- static inline struct gfs2_glock *glock_hash_next(struct gfs2_glock *gl)
+- {
+- 	return hlist_bl_entry(rcu_dereference(gl->gl_list.next),
+- 			      struct gfs2_glock, gl_list);
+- }
+- 
+- static int gfs2_glock_iter_next(struct gfs2_glock_iter *gi)
+- {
+- 	struct gfs2_glock *gl;
+- 
+  	do {
+- 		gl = gi->gl;
+- 		if (gl) {
+- 			gi->gl = glock_hash_next(gl);
+- 			gi->nhash++;
+- 		} else {
+- 			if (gi->hash >= GFS2_GL_HASH_SIZE) {
+- 				rcu_read_unlock();
+- 				return 1;
+- 			}
+- 			gi->gl = glock_hash_chain(gi->hash);
+- 			gi->nhash = 0;
+- 		}
+- 		while (gi->gl == NULL) {
+- 			gi->hash++;
+- 			if (gi->hash >= GFS2_GL_HASH_SIZE) {
+- 				rcu_read_unlock();
+- 				return 1;
+- 			}
+- 			gi->gl = glock_hash_chain(gi->hash);
+- 			gi->nhash = 0;
++ 		gi->gl = rhashtable_walk_next(&gi->hti);
++ 		if (IS_ERR(gi->gl)) {
++ 			if (PTR_ERR(gi->gl) == -EAGAIN)
++ 				continue;
++ 			gi->gl = NULL;
+  		}
+  	/* Skip entries for other sb and dead entries */
+++<<<<<<< HEAD
+ +	} while (gi->sdp != gi->gl->gl_sbd ||
+ +		 __lockref_is_dead(&gi->gl->gl_lockref));
+ +
+ +	return 0;
+++=======
++ 	} while ((gi->gl) && ((gi->sdp != gi->gl->gl_name.ln_sbd) ||
++ 			      __lockref_is_dead(&gi->gl->gl_lockref)));
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  }
+  
+  static void *gfs2_glock_seq_start(struct seq_file *seq, loff_t *pos)
+diff --cc fs/gfs2/incore.h
+index 2caf75dc0244,e300f7419090..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -348,8 -359,16 +348,21 @@@ struct gfs2_glock 
+  	atomic_t gl_ail_count;
+  	atomic_t gl_revokes;
+  	struct delayed_work gl_work;
+++<<<<<<< HEAD
+ +	struct work_struct gl_delete;
+ +	struct rcu_head gl_rcu;
+++=======
++ 	union {
++ 		/* For inode and iopen glocks only */
++ 		struct work_struct gl_delete;
++ 		/* For rgrp glocks only */
++ 		struct {
++ 			loff_t start;
++ 			loff_t end;
++ 		} gl_vm;
++ 	};
++ 	struct rhash_head gl_node;
+++>>>>>>> 88ffbf3e037e (GFS2: Use resizable hash table for glocks)
+  };
+  
+  #define GFS2_MIN_LVB_SIZE 32	/* Min size of LVB that gfs2 supports */
+* Unmerged path fs/gfs2/glock.c
+* Unmerged path fs/gfs2/incore.h
