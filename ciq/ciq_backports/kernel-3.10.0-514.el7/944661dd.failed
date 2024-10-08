@@ -1,0 +1,95 @@
+RDMA/iw_cxgb4: atomically lookup ep and get a reference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hariprasad S <hariprasad@chelsio.com>
+commit 944661dd97f4f257cd914fffec7eb80832ff9141
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/944661dd.failed
+
+There is a race between ULP threads calling c4iw_ep_disconnect() via
+c4iw_modify_rc_qp() and the ingress CPL thread where the ULP thread
+can free the endpoint just after the ingress CPL thread finds the ep
+pointer in the tid table.  To avoid this, we now use the hwtid_idr table
+for lookups instead of the LLD tid table so we can lock around insert,
+remove, and lookup+get_ep to avoid the race.  The CPL handlers now will
+either find the ep ptr and have a ref on it, or not find it and they
+can discard the CPL.  Callers of get_ep_from_tid() will have a ref
+on the ep if found, and thus must deref when they are done.
+Negative advice in peer_abort_intr() need to dereference the ep.
+therefore peer_abort() is scheduled to dereference the ep later.
+
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 944661dd97f4f257cd914fffec7eb80832ff9141)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/cm.c
+diff --cc drivers/infiniband/hw/cxgb4/cm.c
+index 3d4c091e7b0f,c247812fd38c..000000000000
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@@ -315,7 -351,16 +349,20 @@@ void _c4iw_free_ep(struct kref *kref
+  	if (test_bit(QP_REFERENCED, &ep->com.flags))
+  		deref_qp(ep);
+  	if (test_bit(RELEASE_RESOURCES, &ep->com.flags)) {
+++<<<<<<< HEAD
+ +		remove_handle(ep->com.dev, &ep->com.dev->hwtid_idr, ep->hwtid);
+++=======
++ 		if (ep->com.remote_addr.ss_family == AF_INET6) {
++ 			struct sockaddr_in6 *sin6 =
++ 					(struct sockaddr_in6 *)
++ 					&ep->com.local_addr;
++ 
++ 			cxgb4_clip_release(
++ 					ep->com.dev->rdev.lldi.ports[0],
++ 					(const u32 *)&sin6->sin6_addr.s6_addr,
++ 					1);
++ 		}
+++>>>>>>> 944661dd97f4 (RDMA/iw_cxgb4: atomically lookup ep and get a reference)
+  		cxgb4_remove_tid(ep->com.dev->rdev.lldi.tids, 0, ep->hwtid);
+  		dst_release(ep->dst);
+  		cxgb4_l2t_release(ep->l2t);
+@@@ -2479,9 -2601,18 +2535,24 @@@ static int pass_accept_req(struct c4iw_
+  
+  	init_timer(&child_ep->timer);
+  	cxgb4_insert_tid(t, child_ep, hwtid);
+++<<<<<<< HEAD
+ +	insert_handle(dev, &dev->hwtid_idr, child_ep, child_ep->hwtid);
+ +	accept_cr(child_ep, skb, req);
+ +	set_bit(PASS_ACCEPT_REQ, &child_ep->com.history);
+++=======
++ 	insert_ep_tid(child_ep);
++ 	if (accept_cr(child_ep, skb, req)) {
++ 		c4iw_put_ep(&parent_ep->com);
++ 		release_ep_resources(child_ep);
++ 	} else {
++ 		set_bit(PASS_ACCEPT_REQ, &child_ep->com.history);
++ 	}
++ 	if (iptype == 6) {
++ 		sin6 = (struct sockaddr_in6 *)&child_ep->com.local_addr;
++ 		cxgb4_clip_get(child_ep->com.dev->rdev.lldi.ports[0],
++ 			       (const u32 *)&sin6->sin6_addr.s6_addr, 1);
++ 	}
+++>>>>>>> 944661dd97f4 (RDMA/iw_cxgb4: atomically lookup ep and get a reference)
+  	goto out;
+  reject:
+  	reject_cr(dev, hwtid, skb);
+@@@ -2832,7 -2985,13 +2915,9 @@@ static int fw4_ack(struct c4iw_dev *dev
+  		     state_read(&ep->com), ep->mpa_attr.initiator ? 1 : 0);
+  		kfree_skb(ep->mpa_skb);
+  		ep->mpa_skb = NULL;
+ -		mutex_lock(&ep->com.mutex);
+ -		if (test_bit(STOP_MPA_TIMER, &ep->com.flags))
+ -			stop_ep_timer(ep);
+ -		mutex_unlock(&ep->com.mutex);
+  	}
++ out:
++ 	c4iw_put_ep(&ep->com);
+  	return 0;
+  }
+  
+* Unmerged path drivers/infiniband/hw/cxgb4/cm.c
