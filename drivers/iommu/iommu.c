@@ -795,6 +795,11 @@ struct iommu_group *iommu_group_get_for_dev(struct device *dev)
 	return group;
 }
 
+struct iommu_domain *iommu_group_default_domain(struct iommu_group *group)
+{
+	return group->default_domain;
+}
+
 static int add_iommu_group(struct device *dev, void *data)
 {
 	struct iommu_ops *ops = data;
