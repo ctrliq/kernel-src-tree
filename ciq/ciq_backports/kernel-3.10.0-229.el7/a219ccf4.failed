@@ -1,0 +1,144 @@
+smp: print more useful debug info upon receiving IPI on an offline CPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+commit a219ccf4637396a2392bfbec7c12acbfe2b06b46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a219ccf4.failed
+
+There is a longstanding problem related to CPU hotplug which causes IPIs
+to be delivered to offline CPUs, and the smp-call-function IPI handler
+code prints out a warning whenever this is detected.  Every once in a
+while this (usually harmless) warning gets reported on LKML, but so far
+it has not been completely fixed.  Usually the solution involves finding
+out the IPI sender and fixing it by adding appropriate synchronization
+with CPU hotplug.
+
+However, while going through one such internal bug reports, I found that
+there is a significant bug in the receiver side itself (more
+specifically, in stop-machine) that can lead to this problem even when
+the sender code is perfectly fine.  This patchset fixes that
+synchronization problem in the CPU hotplug stop-machine code.
+
+Patch 1 adds some additional debug code to the smp-call-function
+framework, to help debug such issues easily.
+
+Patch 2 modifies the stop-machine code to ensure that any IPIs that were
+sent while the target CPU was online, would be noticed and handled by
+that CPU without fail before it goes offline.  Thus, this avoids
+scenarios where IPIs are received on offline CPUs (as long as the sender
+uses proper hotplug synchronization).
+
+In fact, I debugged the problem by using Patch 1, and found that the
+payload of the IPI was always the block layer's trigger_softirq()
+function.  But I was not able to find anything wrong with the block
+layer code.  That's when I started looking at the stop-machine code and
+realized that there is a race-window which makes the IPI _receiver_ the
+culprit, not the sender.  Patch 2 fixes that race and hence this should
+put an end to most of the hard-to-debug IPI-to-offline-CPU issues.
+
+This patch (of 2):
+
+Today the smp-call-function code just prints a warning if we get an IPI
+on an offline CPU.  This info is sufficient to let us know that
+something went wrong, but often it is very hard to debug exactly who
+sent the IPI and why, from this info alone.
+
+In most cases, we get the warning about the IPI to an offline CPU,
+immediately after the CPU going offline comes out of the stop-machine
+phase and reenables interrupts.  Since all online CPUs participate in
+stop-machine, the information regarding the sender of the IPI is already
+lost by the time we exit the stop-machine loop.  So even if we dump the
+stack on each CPU at this point, we won't find anything useful since all
+of them will show the stack-trace of the stopper thread.  So we need a
+better way to figure out who sent the IPI and why.
+
+To achieve this, when we detect an IPI targeted to an offline CPU, loop
+through the call-single-data linked list and print out the payload
+(i.e., the name of the function which was supposed to be executed by the
+target CPU).  This would give us an insight as to who might have sent
+the IPI and help us debug this further.
+
+[akpm@linux-foundation.org: correctly suppress warning output on second and later occurrences]
+	Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Rusty Russell <rusty@rustcorp.com.au>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mike Galbraith <mgalbraith@suse.de>
+	Cc: Gautham R Shenoy <ego@linux.vnet.ibm.com>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a219ccf4637396a2392bfbec7c12acbfe2b06b46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/smp.c
+diff --cc kernel/smp.c
+index 74100ac030d3,306f8180b0d5..000000000000
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@@ -178,26 -183,31 +178,48 @@@ static void generic_exec_single(int cpu
+   */
+  void generic_smp_call_function_single_interrupt(void)
+  {
+++<<<<<<< HEAD
+ +	struct call_single_queue *q = &__get_cpu_var(call_single_queue);
+ +	LIST_HEAD(list);
+++=======
++ 	struct llist_node *entry;
++ 	struct call_single_data *csd, *csd_next;
++ 	static bool warned;
++ 
++ 	entry = llist_del_all(&__get_cpu_var(call_single_queue));
++ 	entry = llist_reverse_order(entry);
+++>>>>>>> a219ccf46373 (smp: print more useful debug info upon receiving IPI on an offline CPU)
+  
+  	/*
+  	 * Shouldn't receive this interrupt on a cpu that is not yet online.
+  	 */
+- 	WARN_ON_ONCE(!cpu_online(smp_processor_id()));
++ 	if (unlikely(!cpu_online(smp_processor_id()) && !warned)) {
++ 		warned = true;
++ 		WARN(1, "IPI on offline CPU %d\n", smp_processor_id());
+  
+++<<<<<<< HEAD
+ +	raw_spin_lock(&q->lock);
+ +	list_replace_init(&q->list, &list);
+ +	raw_spin_unlock(&q->lock);
+ +
+ +	while (!list_empty(&list)) {
+ +		struct call_single_data *csd;
+ +
+ +		csd = list_entry(list.next, struct call_single_data, list);
+ +		list_del(&csd->list);
+++=======
++ 		/*
++ 		 * We don't have to use the _safe() variant here
++ 		 * because we are not invoking the IPI handlers yet.
++ 		 */
++ 		llist_for_each_entry(csd, entry, llist)
++ 			pr_warn("IPI callback %pS sent to offline CPU\n",
++ 				csd->func);
++ 	}
+++>>>>>>> a219ccf46373 (smp: print more useful debug info upon receiving IPI on an offline CPU)
+  
+ -	llist_for_each_entry_safe(csd, csd_next, entry, llist) {
+  		csd->func(csd->info);
+ +
+  		csd_unlock(csd);
+  	}
+  }
+* Unmerged path kernel/smp.c
