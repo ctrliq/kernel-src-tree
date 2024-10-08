@@ -1,0 +1,95 @@
+NFS: Ensure that rmdir() waits for sillyrenames to complete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Trond Myklebust <Trond.Myklebust@netapp.com>
+commit ba6c05928dcafc7e0a0c8e4ee6a293ba47190fd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/ba6c0592.failed
+
+If an NFS client does
+
+	mkdir("dir");
+	fd = open("dir/file");
+	unlink("dir/file");
+	close(fd);
+	rmdir("dir");
+
+then the asynchronous nature of the sillyrename operation means that
+we can end up getting EBUSY for the rmdir() in the above test. Fix
+that by ensuring that we wait for any in-progress sillyrenames
+before sending the rmdir() to the server.
+
+	Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+(cherry picked from commit ba6c05928dcafc7e0a0c8e4ee6a293ba47190fd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+diff --cc fs/nfs/dir.c
+index 5b465aec0f11,187caa47dad9..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -1649,12 -1693,21 +1649,30 @@@ int nfs_rmdir(struct inode *dir, struc
+  	dfprintk(VFS, "NFS: rmdir(%s/%ld), %s\n",
+  			dir->i_sb->s_id, dir->i_ino, dentry->d_name.name);
+  
+++<<<<<<< HEAD
+ +	error = NFS_PROTO(dir)->rmdir(dir, &dentry->d_name);
+ +	/* Ensure the VFS deletes this inode */
+ +	if (error == 0 && dentry->d_inode != NULL)
+ +		clear_nlink(dentry->d_inode);
+ +	else if (error == -ENOENT)
+ +		nfs_dentry_handle_enoent(dentry);
+++=======
++ 	trace_nfs_rmdir_enter(dir, dentry);
++ 	if (dentry->d_inode) {
++ 		nfs_wait_on_sillyrename(dentry);
++ 		error = NFS_PROTO(dir)->rmdir(dir, &dentry->d_name);
++ 		/* Ensure the VFS deletes this inode */
++ 		switch (error) {
++ 		case 0:
++ 			clear_nlink(dentry->d_inode);
++ 			break;
++ 		case -ENOENT:
++ 			nfs_dentry_handle_enoent(dentry);
++ 		}
++ 	} else
++ 		error = NFS_PROTO(dir)->rmdir(dir, &dentry->d_name);
++ 	trace_nfs_rmdir_exit(dir, dentry, error);
+++>>>>>>> ba6c05928dca (NFS: Ensure that rmdir() waits for sillyrenames to complete)
+  
+  	return error;
+  }
+* Unmerged path fs/nfs/dir.c
+diff --git a/fs/nfs/unlink.c b/fs/nfs/unlink.c
+index 0d9d2fdb24f6..49cfb67ac52c 100644
+--- a/fs/nfs/unlink.c
++++ b/fs/nfs/unlink.c
+@@ -204,6 +204,13 @@ out_free:
+ 	return ret;
+ }
+ 
++void nfs_wait_on_sillyrename(struct dentry *dentry)
++{
++	struct nfs_inode *nfsi = NFS_I(dentry->d_inode);
++
++	wait_event(nfsi->waitqueue, atomic_read(&nfsi->silly_count) <= 1);
++}
++
+ void nfs_block_sillyrename(struct dentry *dentry)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(dentry->d_inode);
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 5adb84b4d85a..2df3e8ae6b20 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -520,6 +520,7 @@ static inline void nfs4_label_free(void *label) {}
+  * linux/fs/nfs/unlink.c
+  */
+ extern void nfs_complete_unlink(struct dentry *dentry, struct inode *);
++extern void nfs_wait_on_sillyrename(struct dentry *dentry);
+ extern void nfs_block_sillyrename(struct dentry *dentry);
+ extern void nfs_unblock_sillyrename(struct dentry *dentry);
+ extern int  nfs_sillyrename(struct inode *dir, struct dentry *dentry);
