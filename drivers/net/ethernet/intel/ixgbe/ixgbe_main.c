@@ -7561,7 +7561,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	struct ixgbe_adapter *adapter = NULL;
 	struct ixgbe_hw *hw;
 	const struct ixgbe_info *ii = ixgbe_info_tbl[ent->driver_data];
-	static int cards_found;
 	int i, err, pci_using_dac, expected_gts;
 	unsigned int indices = MAX_TX_QUEUES;
 	u8 part_str[IXGBE_PBANUM_LENGTH];
@@ -7651,8 +7650,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	ixgbe_set_ethtool_ops(netdev);
 	netdev->watchdog_timeo = 5 * HZ;
 	strlcpy(netdev->name, pci_name(pdev), sizeof(netdev->name));
-
-	adapter->bd_number = cards_found;
 
 	/* Setup hw api */
 	memcpy(&hw->mac.ops, ii->mac_ops, sizeof(hw->mac.ops));
@@ -7939,7 +7936,6 @@ skip_sriov:
 	ixgbe_add_sanmac_netdev(netdev);
 
 	e_dev_info("%s\n", ixgbe_default_device_descr);
-	cards_found++;
 
 #ifdef CONFIG_IXGBE_HWMON
 	if (ixgbe_sysfs_init(adapter))
