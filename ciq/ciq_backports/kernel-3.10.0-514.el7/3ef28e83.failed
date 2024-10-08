@@ -1,0 +1,450 @@
+block: generic request_queue reference counting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 3ef28e83ab15799742e55fd13243a5f678b04242
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3ef28e83.failed
+
+Allow pmem, and other synchronous/bio-based block drivers, to fallback
+on a per-cpu reference count managed by the core for tracking queue
+live/dead state.
+
+The existing per-cpu reference count for the blk_mq case is promoted to
+be used in all block i/o scenarios.  This involves initializing it by
+default, waiting for it to drop to zero at exit, and holding a live
+reference over the invocation of q->make_request_fn() in
+generic_make_request().  The blk_mq code continues to take its own
+reference per blk_mq request and retains the ability to freeze the
+queue, but the check that the queue is frozen is moved to
+generic_make_request().
+
+This fixes crash signatures like the following:
+
+ BUG: unable to handle kernel paging request at ffff880140000000
+ [..]
+ Call Trace:
+  [<ffffffff8145e8bf>] ? copy_user_handle_tail+0x5f/0x70
+  [<ffffffffa004e1e0>] pmem_do_bvec.isra.11+0x70/0xf0 [nd_pmem]
+  [<ffffffffa004e331>] pmem_make_request+0xd1/0x200 [nd_pmem]
+  [<ffffffff811c3162>] ? mempool_alloc+0x72/0x1a0
+  [<ffffffff8141f8b6>] generic_make_request+0xd6/0x110
+  [<ffffffff8141f966>] submit_bio+0x76/0x170
+  [<ffffffff81286dff>] submit_bh_wbc+0x12f/0x160
+  [<ffffffff81286e62>] submit_bh+0x12/0x20
+  [<ffffffff813395bd>] jbd2_write_superblock+0x8d/0x170
+  [<ffffffff8133974d>] jbd2_mark_journal_empty+0x5d/0x90
+  [<ffffffff813399cb>] jbd2_journal_destroy+0x24b/0x270
+  [<ffffffff810bc4ca>] ? put_pwq_unlocked+0x2a/0x30
+  [<ffffffff810bc6f5>] ? destroy_workqueue+0x225/0x250
+  [<ffffffff81303494>] ext4_put_super+0x64/0x360
+  [<ffffffff8124ab1a>] generic_shutdown_super+0x6a/0xf0
+
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Keith Busch <keith.busch@intel.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Suggested-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 3ef28e83ab15799742e55fd13243a5f678b04242)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blkdev.h
+diff --cc block/blk-mq.c
+index e2a26ced568f,6c240712553a..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -77,49 -78,13 +77,58 @@@ static void blk_mq_hctx_clear_pending(s
+  	clear_bit(CTX_TO_BIT(hctx, ctx), &bm->word);
+  }
+  
+++<<<<<<< HEAD
+ +static int blk_mq_queue_enter(struct request_queue *q, gfp_t gfp)
+ +{
+ +	while (true) {
+ +		int ret;
+ +
+ +		if (percpu_ref_tryget_live(&q->mq_usage_counter))
+ +			return 0;
+ +
+ +		if (!(gfp & __GFP_WAIT))
+ +			return -EBUSY;
+ +
+ +		ret = wait_event_interruptible(q->mq_freeze_wq,
+ +				!q->mq_freeze_depth || blk_queue_dying(q));
+ +		if (blk_queue_dying(q))
+ +			return -ENODEV;
+ +		if (ret)
+ +			return ret;
+ +	}
+ +}
+ +
+ +static void blk_mq_queue_exit(struct request_queue *q)
+ +{
+ +	percpu_ref_put(&q->mq_usage_counter);
+ +}
+ +
+ +static void blk_mq_usage_counter_release(struct percpu_ref *ref)
+ +{
+ +	struct request_queue *q =
+ +		container_of(ref, struct request_queue, mq_usage_counter);
+ +
+ +	wake_up_all(&q->mq_freeze_wq);
+ +}
+ +
+++=======
+++>>>>>>> 3ef28e83ab15 (block: generic request_queue reference counting)
+  void blk_mq_freeze_queue_start(struct request_queue *q)
+  {
+ -	int freeze_depth;
+ +	bool freeze;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irq(q->queue_lock);
+ +	freeze = !q->mq_freeze_depth++;
+ +	spin_unlock_irq(q->queue_lock);
+ +
+ +	if (freeze) {
+ +		percpu_ref_kill(&q->mq_usage_counter);
+++=======
++ 	freeze_depth = atomic_inc_return(&q->mq_freeze_depth);
++ 	if (freeze_depth == 1) {
++ 		percpu_ref_kill(&q->q_usage_counter);
+++>>>>>>> 3ef28e83ab15 (block: generic request_queue reference counting)
+  		blk_mq_run_hw_queues(q, false);
+  	}
+  }
+@@@ -143,14 -124,12 +168,21 @@@ EXPORT_SYMBOL_GPL(blk_mq_freeze_queue)
+  
+  void blk_mq_unfreeze_queue(struct request_queue *q)
+  {
+ -	int freeze_depth;
+ +	bool wake;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irq(q->queue_lock);
+ +	wake = !--q->mq_freeze_depth;
+ +	WARN_ON_ONCE(q->mq_freeze_depth < 0);
+ +	spin_unlock_irq(q->queue_lock);
+ +	if (wake) {
+ +		percpu_ref_reinit(&q->mq_usage_counter);
+++=======
++ 	freeze_depth = atomic_dec_return(&q->mq_freeze_depth);
++ 	WARN_ON_ONCE(freeze_depth < 0);
++ 	if (!freeze_depth) {
++ 		percpu_ref_reinit(&q->q_usage_counter);
+++>>>>>>> 3ef28e83ab15 (block: generic request_queue reference counting)
+  		wake_up_all(&q->mq_freeze_wq);
+  	}
+  }
+@@@ -1186,11 -1159,7 +1218,15 @@@ static struct request *blk_mq_map_reque
+  	int rw = bio_data_dir(bio);
+  	struct blk_mq_alloc_data alloc_data;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(blk_mq_queue_enter(q, GFP_KERNEL))) {
+ +		bio_endio(bio, -EIO);
+ +		return NULL;
+ +	}
+ +
+++=======
++ 	blk_queue_enter_live(q);
+++>>>>>>> 3ef28e83ab15 (block: generic request_queue reference counting)
+  	ctx = blk_mq_get_ctx(q);
+  	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+  
+@@@ -1957,67 -1976,8 +1993,59 @@@ static void blk_mq_realloc_hw_ctxs(stru
+  		atomic_set(&hctxs[i]->nr_active, 0);
+  		hctxs[i]->numa_node = node;
+  		hctxs[i]->queue_num = i;
+ +
+ +		if (blk_mq_init_hctx(q, set, hctxs[i], i)) {
+ +			free_cpumask_var(hctxs[i]->cpumask);
+ +			kfree(hctxs[i]);
+ +			hctxs[i] = NULL;
+ +			break;
+ +		}
+ +		blk_mq_hctx_kobj_init(hctxs[i]);
+ +	}
+ +	for (j = i; j < q->nr_hw_queues; j++) {
+ +		struct blk_mq_hw_ctx *hctx = hctxs[j];
+ +
+ +		if (hctx) {
+ +			if (hctx->tags) {
+ +				blk_mq_free_rq_map(set, hctx->tags, j);
+ +				set->tags[j] = NULL;
+ +			}
+ +			blk_mq_exit_hctx(q, set, hctx, j);
+ +			free_cpumask_var(hctx->cpumask);
+ +			kobject_put(&hctx->kobj);
+ +			kfree(hctx->ctxs);
+ +			kfree(hctx);
+ +			hctxs[j] = NULL;
+ +
+ +		}
+  	}
+ +	q->nr_hw_queues = i;
+ +	blk_mq_sysfs_register(q);
+ +}
+ +
+ +struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ +						  struct request_queue *q)
+ +{
+ +	/* mark the queue as mq asap */
+ +	q->mq_ops = set->ops;
+ +
+ +	q->queue_ctx = alloc_percpu(struct blk_mq_ctx);
+ +	if (!q->queue_ctx)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	q->queue_hw_ctx = kzalloc_node(nr_cpu_ids * sizeof(*(q->queue_hw_ctx)),
+ +						GFP_KERNEL, set->numa_node);
+ +	if (!q->queue_hw_ctx)
+ +		goto err_percpu;
+ +
+ +	q->mq_map = blk_mq_make_queue_map(set);
+ +	if (!q->mq_map)
+ +		goto err_map;
+ +
+ +	blk_mq_realloc_hw_ctxs(set, q);
+ +	if (!q->nr_hw_queues)
+ +		goto err_hctxs;
+  
+- 	/*
+- 	 * Init percpu_ref in atomic mode so that it's faster to shutdown.
+- 	 * See blk_register_queue() for details.
+- 	 */
+- 	if (percpu_ref_init(&q->mq_usage_counter, blk_mq_usage_counter_release,
+- 			    PERCPU_REF_INIT_ATOMIC, GFP_KERNEL))
+- 		goto err_hctxs;
+- 
+  	setup_timer(&q->timeout, blk_mq_rq_timer, (unsigned long) q);
+  	blk_queue_rq_timeout(q, set->timeout ? set->timeout : 30 * HZ);
+  
+diff --cc include/linux/blkdev.h
+index 0e72d45d3caf,3e0465257d68..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -505,21 -450,14 +505,25 @@@ struct request_queue 
+  #endif
+  	struct rcu_head		rcu_head;
+  	wait_queue_head_t	mq_freeze_wq;
+++<<<<<<< HEAD
+ +	RH_KABI_DEPRECATE(struct percpu_counter, mq_usage_counter)
+++=======
++ 	struct percpu_ref	q_usage_counter;
+++>>>>>>> 3ef28e83ab15 (block: generic request_queue reference counting)
+  	struct list_head	all_q_node;
+  
+ -	struct blk_mq_tag_set	*tag_set;
+ -	struct list_head	tag_set_list;
+ -	struct bio_set		*bio_split;
+ +	RH_KABI_EXTEND(unprep_rq_fn		*unprep_rq_fn)
+ +
+ +	RH_KABI_EXTEND(struct blk_mq_tag_set	*tag_set)
+ +	RH_KABI_EXTEND(struct list_head		tag_set_list)
+  
+ -	bool			mq_sysfs_init_done;
+ +	RH_KABI_EXTEND(struct list_head		requeue_list)
+ +	RH_KABI_EXTEND(spinlock_t			requeue_lock)
+ +	RH_KABI_EXTEND(struct work_struct		requeue_work)
+ +	RH_KABI_EXTEND(int				mq_freeze_depth)
+ +	RH_KABI_EXTEND(struct blk_flush_queue   *fq)
+ +	RH_KABI_EXTEND(struct percpu_ref	mq_usage_counter)
+ +	RH_KABI_EXTEND(bool			mq_sysfs_init_done)
+  };
+  
+  #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 92879c071cd7..ecee7515a31f 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -530,13 +530,10 @@ void blk_cleanup_queue(struct request_queue *q)
+ 	 * Drain all requests queued before DYING marking. Set DEAD flag to
+ 	 * prevent that q->request_fn() gets invoked after draining finished.
+ 	 */
+-	if (q->mq_ops) {
+-		blk_mq_freeze_queue(q);
+-		spin_lock_irq(lock);
+-	} else {
+-		spin_lock_irq(lock);
++	blk_freeze_queue(q);
++	spin_lock_irq(lock);
++	if (!q->mq_ops)
+ 		__blk_drain_queue(q, true);
+-	}
+ 	queue_flag_set(QUEUE_FLAG_DEAD, q);
+ 	spin_unlock_irq(lock);
+ 
+@@ -546,6 +543,7 @@ void blk_cleanup_queue(struct request_queue *q)
+ 
+ 	if (q->mq_ops)
+ 		blk_mq_free_queue(q);
++	percpu_ref_exit(&q->q_usage_counter);
+ 
+ 	spin_lock_irq(lock);
+ 	if (q->queue_lock != &q->__queue_lock)
+@@ -590,6 +588,40 @@ struct request_queue *blk_alloc_queue(gfp_t gfp_mask)
+ }
+ EXPORT_SYMBOL(blk_alloc_queue);
+ 
++int blk_queue_enter(struct request_queue *q, gfp_t gfp)
++{
++	while (true) {
++		int ret;
++
++		if (percpu_ref_tryget_live(&q->q_usage_counter))
++			return 0;
++
++		if (!(gfp & __GFP_WAIT))
++			return -EBUSY;
++
++		ret = wait_event_interruptible(q->mq_freeze_wq,
++				!atomic_read(&q->mq_freeze_depth) ||
++				blk_queue_dying(q));
++		if (blk_queue_dying(q))
++			return -ENODEV;
++		if (ret)
++			return ret;
++	}
++}
++
++void blk_queue_exit(struct request_queue *q)
++{
++	percpu_ref_put(&q->q_usage_counter);
++}
++
++static void blk_queue_usage_counter_release(struct percpu_ref *ref)
++{
++	struct request_queue *q =
++		container_of(ref, struct request_queue, q_usage_counter);
++
++	wake_up_all(&q->mq_freeze_wq);
++}
++
+ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ {
+ 	struct request_queue *q;
+@@ -648,11 +680,22 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ 
+ 	init_waitqueue_head(&q->mq_freeze_wq);
+ 
+-	if (blkcg_init_queue(q))
++	/*
++	 * Init percpu_ref in atomic mode so that it's faster to shutdown.
++	 * See blk_register_queue() for details.
++	 */
++	if (percpu_ref_init(&q->q_usage_counter,
++				blk_queue_usage_counter_release,
++				PERCPU_REF_INIT_ATOMIC, GFP_KERNEL))
+ 		goto fail_bdi;
+ 
++	if (blkcg_init_queue(q))
++		goto fail_ref;
++
+ 	return q;
+ 
++fail_ref:
++	percpu_ref_exit(&q->q_usage_counter);
+ fail_bdi:
+ 	bdi_destroy(&q->backing_dev_info);
+ fail_id:
+@@ -1942,9 +1985,19 @@ void generic_make_request(struct bio *bio)
+ 	do {
+ 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+ 
+-		q->make_request_fn(q, bio);
++		if (likely(blk_queue_enter(q, __GFP_WAIT) == 0)) {
++
++			q->make_request_fn(q, bio);
++
++			blk_queue_exit(q);
+ 
+-		bio = bio_list_pop(current->bio_list);
++			bio = bio_list_pop(current->bio_list);
++		} else {
++			struct bio *bio_next = bio_list_pop(current->bio_list);
++
++			bio_io_error(bio);
++			bio = bio_next;
++		}
+ 	} while (bio);
+ 	current->bio_list = NULL; /* deactivate */
+ }
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index d49486ea060a..fdc25f5c3cd5 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -414,12 +414,6 @@ static void blk_mq_sysfs_init(struct request_queue *q)
+ 		kobject_init(&ctx->kobj, &blk_mq_ctx_ktype);
+ }
+ 
+-/* see blk_register_queue() */
+-void blk_mq_finish_init(struct request_queue *q)
+-{
+-	percpu_ref_switch_to_percpu(&q->mq_usage_counter);
+-}
+-
+ int blk_mq_register_disk(struct gendisk *disk)
+ {
+ 	struct device *dev = disk_to_dev(disk);
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 13c53380490e..d6baf52ac282 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -592,9 +592,8 @@ int blk_register_queue(struct gendisk *disk)
+ 	 */
+ 	if (!blk_queue_init_done(q)) {
+ 		queue_flag_set_unlocked(QUEUE_FLAG_INIT_DONE, q);
++		percpu_ref_switch_to_percpu(&q->q_usage_counter);
+ 		blk_queue_bypass_end(q);
+-		if (q->mq_ops)
+-			blk_mq_finish_init(q);
+ 	}
+ 
+ 	ret = blk_trace_init_sysfs(dev);
+diff --git a/block/blk.h b/block/blk.h
+index 4e9a648c4bd3..c7ed54645de7 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -74,6 +74,20 @@ void blk_dequeue_request(struct request *rq);
+ void __blk_queue_free_tags(struct request_queue *q);
+ bool __blk_end_bidi_request(struct request *rq, int error,
+ 			    unsigned int nr_bytes, unsigned int bidi_bytes);
++int blk_queue_enter(struct request_queue *q, gfp_t gfp);
++void blk_queue_exit(struct request_queue *q);
++void blk_freeze_queue(struct request_queue *q);
++
++static inline void blk_queue_enter_live(struct request_queue *q)
++{
++	/*
++	 * Given that running in generic_make_request() context
++	 * guarantees that a live reference against q_usage_counter has
++	 * been established, further references under that same context
++	 * need not check that the queue has been frozen (marked dead).
++	 */
++	percpu_ref_get(&q->q_usage_counter);
++}
+ 
+ void blk_rq_timed_out_timer(unsigned long data);
+ unsigned long blk_rq_timeout(unsigned long timeout);
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 72544d7898da..3720bb27b0d1 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -209,7 +209,6 @@ enum {
+ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *);
+ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ 						  struct request_queue *q);
+-void blk_mq_finish_init(struct request_queue *q);
+ int blk_mq_register_disk(struct gendisk *);
+ void blk_mq_unregister_disk(struct gendisk *);
+ 
+* Unmerged path include/linux/blkdev.h
