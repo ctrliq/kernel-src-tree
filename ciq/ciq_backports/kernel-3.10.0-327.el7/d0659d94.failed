@@ -1,0 +1,193 @@
+KVM: x86: add option to advance tscdeadline hrtimer expiration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] kvm: add option to advance tscdeadline hrtimer expiration (Marcelo Tosatti) [1175445]
+Rebuild_FUZZ: 95.80%
+commit-author Marcelo Tosatti <mtosatti@redhat.com>
+commit d0659d946be05e098883b6955d2764595997f6a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d0659d94.failed
+
+For the hrtimer which emulates the tscdeadline timer in the guest,
+add an option to advance expiration, and busy spin on VM-entry waiting
+for the actual expiration time to elapse.
+
+This allows achieving low latencies in cyclictest (or any scenario
+which requires strict timing regarding timer expiration).
+
+Reduces average cyclictest latency from 12us to 8us
+on Core i5 desktop.
+
+Note: this option requires tuning to find the appropriate value
+for a particular hardware/guest combination. One method is to measure the
+average delay between apic_timer_fn and VM-entry.
+Another method is to start with 1000ns, and increase the value
+in say 500ns increments until avg cyclictest numbers stop decreasing.
+
+	Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d0659d946be05e098883b6955d2764595997f6a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+diff --cc arch/x86/kvm/lapic.c
+index f1502c81f308,e1c0befaa9f6..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1015,6 -1070,76 +1016,79 @@@ static void update_divide_count(struct 
+  				   apic->divide_count);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void apic_timer_expired(struct kvm_lapic *apic)
++ {
++ 	struct kvm_vcpu *vcpu = apic->vcpu;
++ 	wait_queue_head_t *q = &vcpu->wq;
++ 	struct kvm_timer *ktimer = &apic->lapic_timer;
++ 
++ 	/*
++ 	 * Note: KVM_REQ_PENDING_TIMER is implicitly checked in
++ 	 * vcpu_enter_guest.
++ 	 */
++ 	if (atomic_read(&apic->lapic_timer.pending))
++ 		return;
++ 
++ 	atomic_inc(&apic->lapic_timer.pending);
++ 	/* FIXME: this code should not know anything about vcpus */
++ 	kvm_make_request(KVM_REQ_PENDING_TIMER, vcpu);
++ 
++ 	if (waitqueue_active(q))
++ 		wake_up_interruptible(q);
++ 
++ 	if (apic_lvtt_tscdeadline(apic))
++ 		ktimer->expired_tscdeadline = ktimer->tscdeadline;
++ }
++ 
++ /*
++  * On APICv, this test will cause a busy wait
++  * during a higher-priority task.
++  */
++ 
++ static bool lapic_timer_int_injected(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 	u32 reg = kvm_apic_get_reg(apic, APIC_LVTT);
++ 
++ 	if (kvm_apic_hw_enabled(apic)) {
++ 		int vec = reg & APIC_VECTOR_MASK;
++ 
++ 		if (kvm_x86_ops->test_posted_interrupt)
++ 			return kvm_x86_ops->test_posted_interrupt(vcpu, vec);
++ 		else {
++ 			if (apic_test_vector(vec, apic->regs + APIC_ISR))
++ 				return true;
++ 		}
++ 	}
++ 	return false;
++ }
++ 
++ void wait_lapic_expire(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 	u64 guest_tsc, tsc_deadline;
++ 
++ 	if (!kvm_vcpu_has_lapic(vcpu))
++ 		return;
++ 
++ 	if (apic->lapic_timer.expired_tscdeadline == 0)
++ 		return;
++ 
++ 	if (!lapic_timer_int_injected(vcpu))
++ 		return;
++ 
++ 	tsc_deadline = apic->lapic_timer.expired_tscdeadline;
++ 	apic->lapic_timer.expired_tscdeadline = 0;
++ 	guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu, native_read_tsc());
++ 
++ 	/* __delay is delay_tsc whenever the hardware has TSC, thus always.  */
++ 	if (guest_tsc < tsc_deadline)
++ 		__delay(tsc_deadline - guest_tsc);
++ }
++ 
+++>>>>>>> d0659d946be0 (KVM: x86: add option to advance tscdeadline hrtimer expiration)
+  static void start_apic_timer(struct kvm_lapic *apic)
+  {
+  	ktime_t now;
+@@@ -1077,9 -1204,12 +1153,18 @@@
+  		if (likely(tscdeadline > guest_tsc)) {
+  			ns = (tscdeadline - guest_tsc) * 1000000ULL;
+  			do_div(ns, this_tsc_khz);
+++<<<<<<< HEAD
+ +		}
+ +		hrtimer_start(&apic->lapic_timer.timer,
+ +			ktime_add_ns(now, ns), HRTIMER_MODE_ABS);
+++=======
++ 			expire = ktime_add_ns(now, ns);
++ 			expire = ktime_sub_ns(expire, lapic_timer_advance_ns);
++ 			hrtimer_start(&apic->lapic_timer.timer,
++ 				      expire, HRTIMER_MODE_ABS);
++ 		} else
++ 			apic_timer_expired(apic);
+++>>>>>>> d0659d946be0 (KVM: x86: add option to advance tscdeadline hrtimer expiration)
+  
+  		local_irq_restore(flags);
+  	}
+* Unmerged path arch/x86/kvm/lapic.c
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index 70ac25221a25..700b846127f5 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -14,6 +14,7 @@ struct kvm_timer {
+ 	u32 timer_mode;
+ 	u32 timer_mode_mask;
+ 	u64 tscdeadline;
++	u64 expired_tscdeadline;
+ 	atomic_t pending;			/* accumulated triggered timers */
+ };
+ 
+@@ -172,4 +173,6 @@ static inline bool kvm_apic_has_events(struct kvm_vcpu *vcpu)
+ 
+ bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector);
+ 
++void wait_lapic_expire(struct kvm_vcpu *vcpu);
++
+ #endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c20fd972473b..9ae66f62cabb 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -106,6 +106,10 @@ EXPORT_SYMBOL_GPL(kvm_max_guest_tsc_khz);
+ static u32 tsc_tolerance_ppm = 250;
+ module_param(tsc_tolerance_ppm, uint, S_IRUGO | S_IWUSR);
+ 
++/* lapic timer advance (tscdeadline mode only) in nanoseconds */
++unsigned int lapic_timer_advance_ns = 0;
++module_param(lapic_timer_advance_ns, uint, S_IRUGO | S_IWUSR);
++
+ static bool backwards_tsc_observed = false;
+ 
+ #define KVM_NR_SHARED_MSRS 16
+@@ -6123,6 +6127,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	trace_kvm_entry(vcpu->vcpu_id);
++	wait_lapic_expire(vcpu);
+ 	kvm_x86_ops->run(vcpu);
+ 
+ 	/*
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 8c97bac9a895..0a7c90a56279 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -130,5 +130,7 @@ extern u64 kvm_supported_xcr0(void);
+ 
+ extern unsigned int min_timer_period_us;
+ 
++extern unsigned int lapic_timer_advance_ns;
++
+ extern struct static_key kvm_no_apic_vcpu;
+ #endif
