@@ -1,0 +1,227 @@
+Btrfs: fix race between start dirty bg cache writeout and bg deletion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Filipe Manana <fdmanana@suse.com>
+commit b58d1a9ef92031a6fc2f418c01abafb4458ba009
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b58d1a9e.failed
+
+While running xfstests I ran into the following:
+
+[20892.242791] ------------[ cut here ]------------
+[20892.243776] WARNING: CPU: 0 PID: 13299 at fs/btrfs/super.c:260 __btrfs_abort_transaction+0x52/0x114 [btrfs]()
+[20892.245874] BTRFS: Transaction aborted (error -2)
+[20892.247329] Modules linked in: btrfs dm_snapshot dm_bufio dm_flakey dm_mod crc32c_generic xor raid6_pq nfsd auth_rpcgss oid_registry nfs_acl nfs lockd grace fscache sunrpc loop fuse$
+[20892.258488] CPU: 0 PID: 13299 Comm: fsstress Tainted: G        W       4.0.0-rc5-btrfs-next-9+ #2
+[20892.262011] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.7.5-0-ge51488c-20140602_164612-nilsson.home.kraxel.org 04/01/2014
+[20892.264738]  0000000000000009 ffff880427f8bc18 ffffffff8142fa46 ffffffff8108b6a2
+[20892.266244]  ffff880427f8bc68 ffff880427f8bc58 ffffffff81045ea5 ffff880427f8bc48
+[20892.267761]  ffffffffa0509a6d 00000000fffffffe ffff8803545d6f40 ffffffffa05a15a0
+[20892.269378] Call Trace:
+[20892.269915]  [<ffffffff8142fa46>] dump_stack+0x4f/0x7b
+[20892.271097]  [<ffffffff8108b6a2>] ? console_unlock+0x361/0x3ad
+[20892.272173]  [<ffffffff81045ea5>] warn_slowpath_common+0xa1/0xbb
+[20892.273386]  [<ffffffffa0509a6d>] ? __btrfs_abort_transaction+0x52/0x114 [btrfs]
+[20892.274857]  [<ffffffff81045f05>] warn_slowpath_fmt+0x46/0x48
+[20892.275851]  [<ffffffffa0509a6d>] __btrfs_abort_transaction+0x52/0x114 [btrfs]
+[20892.277341]  [<ffffffffa0515e10>] write_one_cache_group+0x68/0xaf [btrfs]
+[20892.278628]  [<ffffffffa052088a>] btrfs_start_dirty_block_groups+0x18d/0x29b [btrfs]
+[20892.280191]  [<ffffffffa052f077>] btrfs_commit_transaction+0x130/0x9c9 [btrfs]
+[20892.281781]  [<ffffffff8107d33d>] ? trace_hardirqs_on+0xd/0xf
+[20892.282873]  [<ffffffffa054163b>] btrfs_sync_file+0x313/0x387 [btrfs]
+[20892.284111]  [<ffffffff8117acad>] vfs_fsync_range+0x95/0xa4
+[20892.285203]  [<ffffffff810e603f>] ? time_hardirqs_on+0x15/0x28
+[20892.286290]  [<ffffffff8123960b>] ? trace_hardirqs_on_thunk+0x3a/0x3f
+[20892.287469]  [<ffffffff8117acd8>] vfs_fsync+0x1c/0x1e
+[20892.288412]  [<ffffffff8117ae54>] do_fsync+0x34/0x4e
+[20892.289348]  [<ffffffff8117b07c>] SyS_fsync+0x10/0x14
+[20892.290255]  [<ffffffff81435b32>] system_call_fastpath+0x12/0x17
+[20892.291316] ---[ end trace 597f77e664245373 ]---
+[20892.293955] BTRFS: error (device sdg) in write_one_cache_group:3184: errno=-2 No such entry
+[20892.297390] BTRFS info (device sdg): forced readonly
+
+This happens because in btrfs_start_dirty_block_groups() we splice the
+transaction's list of dirty block groups into a local list and then we
+keep extracting the first element of the list without holding the
+cache_write_mutex mutex. This means that before we acquire that mutex
+the first block group on the list might be removed by a conurrent task
+running btrfs_remove_block_group(). So make sure we extract the first
+element (and test the list emptyness) while holding that mutex.
+
+Fixes: 1bbc621ef284 ("Btrfs: allow block group cache writeout
+                      outside critical section in commit")
+
+	Signed-off-by: Filipe Manana <fdmanana@suse.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit b58d1a9ef92031a6fc2f418c01abafb4458ba009)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+diff --cc fs/btrfs/extent-tree.c
+index b368c3586773,fc0db9887c0e..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -3350,6 -3382,156 +3350,159 @@@ int btrfs_setup_space_cache(struct btrf
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * transaction commit does final block group cache writeback during a
++  * critical section where nothing is allowed to change the FS.  This is
++  * required in order for the cache to actually match the block group,
++  * but can introduce a lot of latency into the commit.
++  *
++  * So, btrfs_start_dirty_block_groups is here to kick off block group
++  * cache IO.  There's a chance we'll have to redo some of it if the
++  * block group changes again during the commit, but it greatly reduces
++  * the commit latency by getting rid of the easy block groups while
++  * we're still allowing others to join the commit.
++  */
++ int btrfs_start_dirty_block_groups(struct btrfs_trans_handle *trans,
++ 				   struct btrfs_root *root)
++ {
++ 	struct btrfs_block_group_cache *cache;
++ 	struct btrfs_transaction *cur_trans = trans->transaction;
++ 	int ret = 0;
++ 	int should_put;
++ 	struct btrfs_path *path = NULL;
++ 	LIST_HEAD(dirty);
++ 	struct list_head *io = &cur_trans->io_bgs;
++ 	int num_started = 0;
++ 	int loops = 0;
++ 
++ 	spin_lock(&cur_trans->dirty_bgs_lock);
++ 	if (list_empty(&cur_trans->dirty_bgs)) {
++ 		spin_unlock(&cur_trans->dirty_bgs_lock);
++ 		return 0;
++ 	}
++ 	list_splice_init(&cur_trans->dirty_bgs, &dirty);
++ 	spin_unlock(&cur_trans->dirty_bgs_lock);
++ 
++ again:
++ 	/*
++ 	 * make sure all the block groups on our dirty list actually
++ 	 * exist
++ 	 */
++ 	btrfs_create_pending_block_groups(trans, root);
++ 
++ 	if (!path) {
++ 		path = btrfs_alloc_path();
++ 		if (!path)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	/*
++ 	 * cache_write_mutex is here only to save us from balance or automatic
++ 	 * removal of empty block groups deleting this block group while we are
++ 	 * writing out the cache
++ 	 */
++ 	mutex_lock(&trans->transaction->cache_write_mutex);
++ 	while (!list_empty(&dirty)) {
++ 		cache = list_first_entry(&dirty,
++ 					 struct btrfs_block_group_cache,
++ 					 dirty_list);
++ 		/*
++ 		 * this can happen if something re-dirties a block
++ 		 * group that is already under IO.  Just wait for it to
++ 		 * finish and then do it all again
++ 		 */
++ 		if (!list_empty(&cache->io_list)) {
++ 			list_del_init(&cache->io_list);
++ 			btrfs_wait_cache_io(root, trans, cache,
++ 					    &cache->io_ctl, path,
++ 					    cache->key.objectid);
++ 			btrfs_put_block_group(cache);
++ 		}
++ 
++ 
++ 		/*
++ 		 * btrfs_wait_cache_io uses the cache->dirty_list to decide
++ 		 * if it should update the cache_state.  Don't delete
++ 		 * until after we wait.
++ 		 *
++ 		 * Since we're not running in the commit critical section
++ 		 * we need the dirty_bgs_lock to protect from update_block_group
++ 		 */
++ 		spin_lock(&cur_trans->dirty_bgs_lock);
++ 		list_del_init(&cache->dirty_list);
++ 		spin_unlock(&cur_trans->dirty_bgs_lock);
++ 
++ 		should_put = 1;
++ 
++ 		cache_save_setup(cache, trans, path);
++ 
++ 		if (cache->disk_cache_state == BTRFS_DC_SETUP) {
++ 			cache->io_ctl.inode = NULL;
++ 			ret = btrfs_write_out_cache(root, trans, cache, path);
++ 			if (ret == 0 && cache->io_ctl.inode) {
++ 				num_started++;
++ 				should_put = 0;
++ 
++ 				/*
++ 				 * the cache_write_mutex is protecting
++ 				 * the io_list
++ 				 */
++ 				list_add_tail(&cache->io_list, io);
++ 			} else {
++ 				/*
++ 				 * if we failed to write the cache, the
++ 				 * generation will be bad and life goes on
++ 				 */
++ 				ret = 0;
++ 			}
++ 		}
++ 		if (!ret)
++ 			ret = write_one_cache_group(trans, root, path, cache);
++ 
++ 		/* if its not on the io list, we need to put the block group */
++ 		if (should_put)
++ 			btrfs_put_block_group(cache);
++ 
++ 		if (ret)
++ 			break;
++ 
++ 		/*
++ 		 * Avoid blocking other tasks for too long. It might even save
++ 		 * us from writing caches for block groups that are going to be
++ 		 * removed.
++ 		 */
++ 		mutex_unlock(&trans->transaction->cache_write_mutex);
++ 		mutex_lock(&trans->transaction->cache_write_mutex);
++ 	}
++ 	mutex_unlock(&trans->transaction->cache_write_mutex);
++ 
++ 	/*
++ 	 * go through delayed refs for all the stuff we've just kicked off
++ 	 * and then loop back (just once)
++ 	 */
++ 	ret = btrfs_run_delayed_refs(trans, root, 0);
++ 	if (!ret && loops == 0) {
++ 		loops++;
++ 		spin_lock(&cur_trans->dirty_bgs_lock);
++ 		list_splice_init(&cur_trans->dirty_bgs, &dirty);
++ 		/*
++ 		 * dirty_bgs_lock protects us from concurrent block group
++ 		 * deletes too (not just cache_write_mutex).
++ 		 */
++ 		if (!list_empty(&dirty)) {
++ 			spin_unlock(&cur_trans->dirty_bgs_lock);
++ 			goto again;
++ 		}
++ 		spin_unlock(&cur_trans->dirty_bgs_lock);
++ 	}
++ 
++ 	btrfs_free_path(path);
++ 	return ret;
++ }
++ 
+++>>>>>>> b58d1a9ef920 (Btrfs: fix race between start dirty bg cache writeout and bg deletion)
+  int btrfs_write_dirty_block_groups(struct btrfs_trans_handle *trans,
+  				   struct btrfs_root *root)
+  {
+* Unmerged path fs/btrfs/extent-tree.c
