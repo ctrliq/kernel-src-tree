@@ -506,6 +506,7 @@ struct outstate {
 	FILE *fh;
 	bool newline;
 	const char *prefix;
+	int  nfields;
 };
 
 #define METRIC_LEN  35
@@ -554,6 +555,43 @@ static void print_metric_std(void *ctx, const char *color, const char *fmt,
 	else
 		n += fprintf(out, fmt, val);
 	fprintf(out, " %-*s", METRIC_LEN - n - 1, unit);
+}
+
+static void new_line_csv(void *ctx)
+{
+	struct outstate *os = ctx;
+	int i;
+
+	fputc('\n', os->fh);
+	if (os->prefix)
+		fprintf(os->fh, "%s%s", os->prefix, csv_sep);
+	for (i = 0; i < os->nfields; i++)
+		fputs(csv_sep, os->fh);
+}
+
+static void print_metric_csv(void *ctx,
+			     const char *color __maybe_unused,
+			     const char *fmt, const char *unit, double val)
+{
+	struct outstate *os = ctx;
+	FILE *out = os->fh;
+	char buf[64], *vals, *ends;
+
+	if (unit == NULL || fmt == NULL) {
+		fprintf(out, "%s%s%s%s", csv_sep, csv_sep, csv_sep, csv_sep);
+		return;
+	}
+	snprintf(buf, sizeof(buf), fmt, val);
+	vals = buf;
+	while (isspace(*vals))
+		vals++;
+	ends = vals;
+	while (isdigit(*ends) || *ends == '.')
+		ends++;
+	*ends = 0;
+	while (isspace(*unit))
+		unit++;
+	fprintf(out, "%s%s%s%s", csv_sep, vals, csv_sep, unit);
 }
 
 static void nsec_printout(int id, int nr, struct perf_evsel *evsel, double avg)
@@ -627,6 +665,22 @@ static void printout(int id, int nr, struct perf_evsel *counter, double uval,
 
 	nl = new_line_std;
 
+	if (csv_output) {
+		static int aggr_fields[] = {
+			[AGGR_GLOBAL] = 0,
+			[AGGR_THREAD] = 1,
+			[AGGR_NONE] = 1,
+			[AGGR_SOCKET] = 2,
+			[AGGR_CORE] = 2,
+		};
+
+		pm = print_metric_csv;
+		nl = new_line_csv;
+		os.nfields = 3;
+		os.nfields += aggr_fields[stat_config.aggr_mode];
+		if (counter->cgrp)
+			os.nfields++;
+	}
 	if (run == 0 || ena == 0 || counter->counts->scaled == -1) {
 		aggr_printout(counter, id, nr);
 
@@ -647,7 +701,12 @@ static void printout(int id, int nr, struct perf_evsel *counter, double uval,
 			fprintf(stat_config.output, "%s%s",
 				csv_sep, counter->cgrp->name);
 
+		if (!csv_output)
+			pm(&os, NULL, NULL, "", 0);
+		print_noise(counter, noise);
 		print_running(run, ena);
+		if (csv_output)
+			pm(&os, NULL, NULL, "", 0);
 		return;
 	}
 
@@ -660,14 +719,20 @@ static void printout(int id, int nr, struct perf_evsel *counter, double uval,
 	out.new_line = nl;
 	out.ctx = &os;
 
-	if (!csv_output)
-		perf_stat__print_shadow_stats(counter, uval,
+	if (csv_output) {
+		print_noise(counter, noise);
+		print_running(run, ena);
+	}
+
+	perf_stat__print_shadow_stats(counter, uval,
 				stat_config.aggr_mode == AGGR_GLOBAL ? 0 :
 				cpu_map__id_to_cpu(id),
 				&out);
 
-	print_noise(counter, noise);
-	print_running(run, ena);
+	if (!csv_output) {
+		print_noise(counter, noise);
+		print_running(run, ena);
+	}
 }
 
 static void print_aggr(char *prefix)
