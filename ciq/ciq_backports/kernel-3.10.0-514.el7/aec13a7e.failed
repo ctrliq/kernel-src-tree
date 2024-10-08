@@ -1,0 +1,284 @@
+perf tools: Fix command line filters in hierarchy mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit aec13a7ec78d9322a348fb26940097b0bdfef1bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/aec13a7e.failed
+
+When a command-line filter is applied in hierarchy mode, output is
+broken especially when filtering on lower level.  The higher level
+entries doesn't show up so it's hard to see the results.
+
+Also it needs to handle multi sort keys in a single hierarchy level.
+
+Before:
+
+  $ perf report --hierarchy -s 'cpu,{dso,comm}' --comms swapper --stdio
+  ...
+  #    Overhead  CPU / Shared Object+Command
+  # ...........  ...........................
+  #
+         13.79%     [kernel.vmlinux]  swapper
+      31.71%     000
+         13.80%     [kernel.vmlinux]  swapper
+          0.43%     [e1000e]          swapper
+         11.89%     [kernel.vmlinux]  swapper
+          9.18%     [kernel.vmlinux]  swapper
+
+After:
+
+  #    Overhead  CPU / Shared Object+Command
+  # ...........  ...............................
+  #
+      33.09%     003
+         13.79%     [kernel.vmlinux]  swapper
+      31.71%     000
+         13.80%     [kernel.vmlinux]  swapper
+          0.43%     [e1000e]          swapper
+      21.90%     002
+         11.89%     [kernel.vmlinux]  swapper
+      13.30%     001
+          9.18%     [kernel.vmlinux]  swapper
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Tested-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1457531222-18130-4-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit aec13a7ec78d9322a348fb26940097b0bdfef1bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/hist.c
+diff --cc tools/perf/util/hist.c
+index 9a525a5b649f,a98f9345f686..000000000000
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@@ -1039,6 -1086,215 +1039,218 @@@ void hist_entry__delete(struct hist_ent
+   * collapse the histogram
+   */
+  
+++<<<<<<< HEAD
+++=======
++ static void hists__apply_filters(struct hists *hists, struct hist_entry *he);
++ static void hists__remove_entry_filter(struct hists *hists, struct hist_entry *he,
++ 				       enum hist_filter type);
++ 
++ typedef bool (*fmt_chk_fn)(struct perf_hpp_fmt *fmt);
++ 
++ static bool check_thread_entry(struct perf_hpp_fmt *fmt)
++ {
++ 	return perf_hpp__is_thread_entry(fmt) || perf_hpp__is_comm_entry(fmt);
++ }
++ 
++ static void hist_entry__check_and_remove_filter(struct hist_entry *he,
++ 						enum hist_filter type,
++ 						fmt_chk_fn check)
++ {
++ 	struct perf_hpp_fmt *fmt;
++ 	bool type_match = false;
++ 	struct hist_entry *parent = he->parent_he;
++ 
++ 	switch (type) {
++ 	case HIST_FILTER__THREAD:
++ 		if (symbol_conf.comm_list == NULL &&
++ 		    symbol_conf.pid_list == NULL &&
++ 		    symbol_conf.tid_list == NULL)
++ 			return;
++ 		break;
++ 	case HIST_FILTER__DSO:
++ 		if (symbol_conf.dso_list == NULL)
++ 			return;
++ 		break;
++ 	case HIST_FILTER__SYMBOL:
++ 		if (symbol_conf.sym_list == NULL)
++ 			return;
++ 		break;
++ 	case HIST_FILTER__PARENT:
++ 	case HIST_FILTER__GUEST:
++ 	case HIST_FILTER__HOST:
++ 	case HIST_FILTER__SOCKET:
++ 	default:
++ 		return;
++ 	}
++ 
++ 	/* if it's filtered by own fmt, it has to have filter bits */
++ 	perf_hpp_list__for_each_format(he->hpp_list, fmt) {
++ 		if (check(fmt)) {
++ 			type_match = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (type_match) {
++ 		/*
++ 		 * If the filter is for current level entry, propagate
++ 		 * filter marker to parents.  The marker bit was
++ 		 * already set by default so it only needs to clear
++ 		 * non-filtered entries.
++ 		 */
++ 		if (!(he->filtered & (1 << type))) {
++ 			while (parent) {
++ 				parent->filtered &= ~(1 << type);
++ 				parent = parent->parent_he;
++ 			}
++ 		}
++ 	} else {
++ 		/*
++ 		 * If current entry doesn't have matching formats, set
++ 		 * filter marker for upper level entries.  it will be
++ 		 * cleared if its lower level entries is not filtered.
++ 		 *
++ 		 * For lower-level entries, it inherits parent's
++ 		 * filter bit so that lower level entries of a
++ 		 * non-filtered entry won't set the filter marker.
++ 		 */
++ 		if (parent == NULL)
++ 			he->filtered |= (1 << type);
++ 		else
++ 			he->filtered |= (parent->filtered & (1 << type));
++ 	}
++ }
++ 
++ static void hist_entry__apply_hierarchy_filters(struct hist_entry *he)
++ {
++ 	hist_entry__check_and_remove_filter(he, HIST_FILTER__THREAD,
++ 					    check_thread_entry);
++ 
++ 	hist_entry__check_and_remove_filter(he, HIST_FILTER__DSO,
++ 					    perf_hpp__is_dso_entry);
++ 
++ 	hist_entry__check_and_remove_filter(he, HIST_FILTER__SYMBOL,
++ 					    perf_hpp__is_sym_entry);
++ 
++ 	hists__apply_filters(he->hists, he);
++ }
++ 
++ static struct hist_entry *hierarchy_insert_entry(struct hists *hists,
++ 						 struct rb_root *root,
++ 						 struct hist_entry *he,
++ 						 struct hist_entry *parent_he,
++ 						 struct perf_hpp_list *hpp_list)
++ {
++ 	struct rb_node **p = &root->rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct hist_entry *iter, *new;
++ 	struct perf_hpp_fmt *fmt;
++ 	int64_t cmp;
++ 
++ 	while (*p != NULL) {
++ 		parent = *p;
++ 		iter = rb_entry(parent, struct hist_entry, rb_node_in);
++ 
++ 		cmp = 0;
++ 		perf_hpp_list__for_each_sort_list(hpp_list, fmt) {
++ 			cmp = fmt->collapse(fmt, iter, he);
++ 			if (cmp)
++ 				break;
++ 		}
++ 
++ 		if (!cmp) {
++ 			he_stat__add_stat(&iter->stat, &he->stat);
++ 			return iter;
++ 		}
++ 
++ 		if (cmp < 0)
++ 			p = &parent->rb_left;
++ 		else
++ 			p = &parent->rb_right;
++ 	}
++ 
++ 	new = hist_entry__new(he, true);
++ 	if (new == NULL)
++ 		return NULL;
++ 
++ 	hists->nr_entries++;
++ 
++ 	/* save related format list for output */
++ 	new->hpp_list = hpp_list;
++ 	new->parent_he = parent_he;
++ 
++ 	hist_entry__apply_hierarchy_filters(new);
++ 
++ 	/* some fields are now passed to 'new' */
++ 	perf_hpp_list__for_each_sort_list(hpp_list, fmt) {
++ 		if (perf_hpp__is_trace_entry(fmt) || perf_hpp__is_dynamic_entry(fmt))
++ 			he->trace_output = NULL;
++ 		else
++ 			new->trace_output = NULL;
++ 
++ 		if (perf_hpp__is_srcline_entry(fmt))
++ 			he->srcline = NULL;
++ 		else
++ 			new->srcline = NULL;
++ 
++ 		if (perf_hpp__is_srcfile_entry(fmt))
++ 			he->srcfile = NULL;
++ 		else
++ 			new->srcfile = NULL;
++ 	}
++ 
++ 	rb_link_node(&new->rb_node_in, parent, p);
++ 	rb_insert_color(&new->rb_node_in, root);
++ 	return new;
++ }
++ 
++ static int hists__hierarchy_insert_entry(struct hists *hists,
++ 					 struct rb_root *root,
++ 					 struct hist_entry *he)
++ {
++ 	struct perf_hpp_list_node *node;
++ 	struct hist_entry *new_he = NULL;
++ 	struct hist_entry *parent = NULL;
++ 	int depth = 0;
++ 	int ret = 0;
++ 
++ 	list_for_each_entry(node, &hists->hpp_formats, list) {
++ 		/* skip period (overhead) and elided columns */
++ 		if (node->level == 0 || node->skip)
++ 			continue;
++ 
++ 		/* insert copy of 'he' for each fmt into the hierarchy */
++ 		new_he = hierarchy_insert_entry(hists, root, he, parent, &node->hpp);
++ 		if (new_he == NULL) {
++ 			ret = -1;
++ 			break;
++ 		}
++ 
++ 		root = &new_he->hroot_in;
++ 		new_he->depth = depth++;
++ 		parent = new_he;
++ 	}
++ 
++ 	if (new_he) {
++ 		new_he->leaf = true;
++ 
++ 		if (symbol_conf.use_callchain) {
++ 			callchain_cursor_reset(&callchain_cursor);
++ 			if (callchain_merge(&callchain_cursor,
++ 					    new_he->callchain,
++ 					    he->callchain) < 0)
++ 				ret = -1;
++ 		}
++ 	}
++ 
++ 	/* 'he' is no longer used */
++ 	hist_entry__delete(he);
++ 
++ 	/* return 0 (or -1) since it already applied filters */
++ 	return ret;
++ }
++ 
+++>>>>>>> aec13a7ec78d (perf tools: Fix command line filters in hierarchy mode)
+  int hists__collapse_insert_entry(struct hists *hists, struct rb_root *root,
+  				 struct hist_entry *he)
+  {
+* Unmerged path tools/perf/util/hist.c
