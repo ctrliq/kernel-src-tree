@@ -1,0 +1,155 @@
+x86/mm/pat: Change free_memtype() to support shrinking case
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mm/pat: Change free_memtype() to support shrinking case (Jeff Moyer) [1346083 1346084 1346445 1346449 1346472 1347091 1359806]
+Rebuild_FUZZ: 96.49%
+commit-author Toshi Kani <toshi.kani@hpe.com>
+commit 2039e6acaf94d83ec6b6d9f3d0bce7ea1f099918
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2039e6ac.failed
+
+Using mremap() to shrink the map size of a VM_PFNMAP range causes
+the following error message, and leaves the pfn range allocated.
+
+ x86/PAT: test:3493 freeing invalid memtype [mem 0x483200000-0x4863fffff]
+
+This is because rbt_memtype_erase(), called from free_memtype()
+with spin_lock held, only supports to free a whole memtype node in
+memtype_rbroot.  Therefore, this patch changes rbt_memtype_erase()
+to support a request that shrinks the size of a memtype node for
+mremap().
+
+memtype_rb_exact_match() is renamed to memtype_rb_match(), and
+is enhanced to support EXACT_MATCH and END_MATCH in @match_type.
+Since the memtype_rbroot tree allows overlapping ranges,
+rbt_memtype_erase() checks with EXACT_MATCH first, i.e. free
+a whole node for the munmap case.  If no such entry is found,
+it then checks with END_MATCH, i.e. shrink the size of a node
+from the end for the mremap case.
+
+On the mremap case, rbt_memtype_erase() proceeds in two steps,
+1) remove the node, and then 2) insert the updated node.  This
+allows proper update of augmented values, subtree_max_end, in
+the tree.
+
+	Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: stsp@list.ru
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/1450832064-10093-3-git-send-email-toshi.kani@hpe.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 2039e6acaf94d83ec6b6d9f3d0bce7ea1f099918)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/pat.c
+diff --cc arch/x86/mm/pat.c
+index 21b47096bb00,031782e74231..000000000000
+--- a/arch/x86/mm/pat.c
++++ b/arch/x86/mm/pat.c
+@@@ -374,9 -586,9 +374,15 @@@ int free_memtype(u64 start, u64 end
+  	entry = rbt_memtype_erase(start, end);
+  	spin_unlock(&memtype_lock);
+  
+++<<<<<<< HEAD
+ +	if (!entry) {
+ +		printk(KERN_INFO "%s:%d freeing invalid memtype [mem %#010Lx-%#010Lx]\n",
+ +		       current->comm, current->pid, start, end - 1);
+++=======
++ 	if (IS_ERR(entry)) {
++ 		pr_info("x86/PAT: %s:%d freeing invalid memtype [mem %#010Lx-%#010Lx]\n",
++ 			current->comm, current->pid, start, end - 1);
+++>>>>>>> 2039e6acaf94 (x86/mm/pat: Change free_memtype() to support shrinking case)
+  		return -EINVAL;
+  	}
+  
+* Unmerged path arch/x86/mm/pat.c
+diff --git a/arch/x86/mm/pat_rbtree.c b/arch/x86/mm/pat_rbtree.c
+index 415f6c4ced36..d07ba2453f27 100644
+--- a/arch/x86/mm/pat_rbtree.c
++++ b/arch/x86/mm/pat_rbtree.c
+@@ -98,8 +98,13 @@ static struct memtype *memtype_rb_lowest_match(struct rb_root *root,
+ 	return last_lower; /* Returns NULL if there is no overlap */
+ }
+ 
+-static struct memtype *memtype_rb_exact_match(struct rb_root *root,
+-				u64 start, u64 end)
++enum {
++	MEMTYPE_EXACT_MATCH	= 0,
++	MEMTYPE_END_MATCH	= 1
++};
++
++static struct memtype *memtype_rb_match(struct rb_root *root,
++				u64 start, u64 end, int match_type)
+ {
+ 	struct memtype *match;
+ 
+@@ -107,7 +112,12 @@ static struct memtype *memtype_rb_exact_match(struct rb_root *root,
+ 	while (match != NULL && match->start < end) {
+ 		struct rb_node *node;
+ 
+-		if (match->start == start && match->end == end)
++		if ((match_type == MEMTYPE_EXACT_MATCH) &&
++		    (match->start == start) && (match->end == end))
++			return match;
++
++		if ((match_type == MEMTYPE_END_MATCH) &&
++		    (match->start < start) && (match->end == end))
+ 			return match;
+ 
+ 		node = rb_next(&match->rb);
+@@ -117,7 +127,7 @@ static struct memtype *memtype_rb_exact_match(struct rb_root *root,
+ 			match = NULL;
+ 	}
+ 
+-	return NULL; /* Returns NULL if there is no exact match */
++	return NULL; /* Returns NULL if there is no match */
+ }
+ 
+ static int memtype_rb_check_conflict(struct rb_root *root,
+@@ -208,12 +218,36 @@ struct memtype *rbt_memtype_erase(u64 start, u64 end)
+ {
+ 	struct memtype *data;
+ 
+-	data = memtype_rb_exact_match(&memtype_rbroot, start, end);
+-	if (!data)
+-		goto out;
++	/*
++	 * Since the memtype_rbroot tree allows overlapping ranges,
++	 * rbt_memtype_erase() checks with EXACT_MATCH first, i.e. free
++	 * a whole node for the munmap case.  If no such entry is found,
++	 * it then checks with END_MATCH, i.e. shrink the size of a node
++	 * from the end for the mremap case.
++	 */
++	data = memtype_rb_match(&memtype_rbroot, start, end,
++				MEMTYPE_EXACT_MATCH);
++	if (!data) {
++		data = memtype_rb_match(&memtype_rbroot, start, end,
++					MEMTYPE_END_MATCH);
++		if (!data)
++			return ERR_PTR(-EINVAL);
++	}
++
++	if (data->start == start) {
++		/* munmap: erase this node */
++		rb_erase_augmented(&data->rb, &memtype_rbroot,
++					&memtype_rb_augment_cb);
++	} else {
++		/* mremap: update the end value of this node */
++		rb_erase_augmented(&data->rb, &memtype_rbroot,
++					&memtype_rb_augment_cb);
++		data->end = start;
++		data->subtree_max_end = data->end;
++		memtype_rb_insert(&memtype_rbroot, data);
++		return NULL;
++	}
+ 
+-	rb_erase_augmented(&data->rb, &memtype_rbroot, &memtype_rb_augment_cb);
+-out:
+ 	return data;
+ }
+ 
