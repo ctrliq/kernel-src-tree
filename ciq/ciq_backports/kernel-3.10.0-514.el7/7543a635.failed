@@ -1,0 +1,244 @@
+KVM: x86: Add KVM exit for IOAPIC EOIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Steve Rutherford <srutherford@google.com>
+commit 7543a635aa09eb138b2cbf60ac3ff19503ae6954
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7543a635.failed
+
+Adds KVM_EXIT_IOAPIC_EOI which allows the kernel to EOI
+level-triggered IOAPIC interrupts.
+
+Uses a per VCPU exit bitmap to decide whether or not the IOAPIC needs
+to be informed (which is identical to the EOI_EXIT_BITMAP field used
+by modern x86 processors, but can also be used to elide kvm IOAPIC EOI
+exits on older processors).
+
+[Note: A prototype using ResampleFDs found that decoupling the EOI
+from the VCPU's thread made it possible for the VCPU to not see a
+recent EOI after reentering the guest. This does not match real
+hardware.]
+
+Compile tested for Intel x86.
+
+	Signed-off-by: Steve Rutherford <srutherford@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7543a635aa09eb138b2cbf60ac3ff19503ae6954)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+#	arch/x86/kvm/lapic.c
+#	include/linux/kvm_host.h
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virtual/kvm/api.txt
+index d54a8098c59b,0d14bf5db534..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -2867,6 -3280,47 +2867,50 @@@ It gets triggered whenever both KVM_CAP
+  external interrupt has just been delivered into the guest. User space
+  should put the acknowledged interrupt vector into the 'epr' field.
+  
+++<<<<<<< HEAD
+++=======
++ 		/* KVM_EXIT_SYSTEM_EVENT */
++ 		struct {
++ #define KVM_SYSTEM_EVENT_SHUTDOWN       1
++ #define KVM_SYSTEM_EVENT_RESET          2
++ #define KVM_SYSTEM_EVENT_CRASH          3
++ 			__u32 type;
++ 			__u64 flags;
++ 		} system_event;
++ 
++ If exit_reason is KVM_EXIT_SYSTEM_EVENT then the vcpu has triggered
++ a system-level event using some architecture specific mechanism (hypercall
++ or some special instruction). In case of ARM/ARM64, this is triggered using
++ HVC instruction based PSCI call from the vcpu. The 'type' field describes
++ the system-level event type. The 'flags' field describes architecture
++ specific flags for the system-level event.
++ 
++ Valid values for 'type' are:
++   KVM_SYSTEM_EVENT_SHUTDOWN -- the guest has requested a shutdown of the
++    VM. Userspace is not obliged to honour this, and if it does honour
++    this does not need to destroy the VM synchronously (ie it may call
++    KVM_RUN again before shutdown finally occurs).
++   KVM_SYSTEM_EVENT_RESET -- the guest has requested a reset of the VM.
++    As with SHUTDOWN, userspace can choose to ignore the request, or
++    to schedule the reset to occur in the future and may call KVM_RUN again.
++   KVM_SYSTEM_EVENT_CRASH -- the guest crash occurred and the guest
++    has requested a crash condition maintenance. Userspace can choose
++    to ignore the request, or to gather VM memory core dump and/or
++    reset/shutdown of the VM.
++ 
++ 		/* KVM_EXIT_IOAPIC_EOI */
++ 		struct {
++ 			__u8 vector;
++ 		} eoi;
++ 
++ Indicates that the VCPU's in-kernel local APIC received an EOI for a
++ level-triggered IOAPIC interrupt.  This exit only triggers when the
++ IOAPIC is implemented in userspace (i.e. KVM_CAP_SPLIT_IRQCHIP is enabled);
++ the userspace IOAPIC should process the EOI and retrigger the interrupt if
++ it is still asserted.  Vector is the LAPIC interrupt vector for which the
++ EOI was received.
++ 
+++>>>>>>> 7543a635aa09 (KVM: x86: Add KVM exit for IOAPIC EOIs)
+  		/* Fix the size of the union. */
+  		char padding[256];
+  	};
+diff --cc arch/x86/kvm/lapic.c
+index 1ea3691b454e,ef70f6f3a37a..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -963,16 -870,32 +963,37 @@@ int kvm_apic_compare_prio(struct kvm_vc
+  	return vcpu1->arch.apic_arb_prio - vcpu2->arch.apic_arb_prio;
+  }
+  
+ -static bool kvm_ioapic_handles_vector(struct kvm_lapic *apic, int vector)
+ -{
+ -	return test_bit(vector, (ulong *)apic->vcpu->arch.eoi_exit_bitmap);
+ -}
+ -
+  static void kvm_ioapic_send_eoi(struct kvm_lapic *apic, int vector)
+  {
+++<<<<<<< HEAD
+ +	if (kvm_ioapic_handles_vector(apic->vcpu->kvm, vector)) {
+ +		int trigger_mode;
+ +		if (apic_test_vector(vector, apic->regs + APIC_TMR))
+ +			trigger_mode = IOAPIC_LEVEL_TRIG;
+ +		else
+ +			trigger_mode = IOAPIC_EDGE_TRIG;
+ +		kvm_ioapic_update_eoi(apic->vcpu, vector, trigger_mode);
+++=======
++ 	int trigger_mode;
++ 
++ 	/* Eoi the ioapic only if the ioapic doesn't own the vector. */
++ 	if (!kvm_ioapic_handles_vector(apic, vector))
++ 		return;
++ 
++ 	/* Request a KVM exit to inform the userspace IOAPIC. */
++ 	if (irqchip_split(apic->vcpu->kvm)) {
++ 		apic->vcpu->arch.pending_ioapic_eoi = vector;
++ 		kvm_make_request(KVM_REQ_IOAPIC_EOI_EXIT, apic->vcpu);
++ 		return;
+++>>>>>>> 7543a635aa09 (KVM: x86: Add KVM exit for IOAPIC EOIs)
+  	}
++ 
++ 	if (apic_test_vector(vector, apic->regs + APIC_TMR))
++ 		trigger_mode = IOAPIC_LEVEL_TRIG;
++ 	else
++ 		trigger_mode = IOAPIC_EDGE_TRIG;
++ 
++ 	kvm_ioapic_update_eoi(apic->vcpu, vector, trigger_mode);
+  }
+  
+  static int apic_set_eoi(struct kvm_lapic *apic)
+diff --cc include/linux/kvm_host.h
+index cf1b632f8991,3b33215ed447..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -139,8 -135,12 +139,13 @@@ static inline bool is_error_page(struc
+  #define KVM_REQ_EPR_EXIT          20
+  #define KVM_REQ_SCAN_IOAPIC       21
+  #define KVM_REQ_GLOBAL_CLOCK_UPDATE 22
+ -#define KVM_REQ_ENABLE_IBS        23
+ -#define KVM_REQ_DISABLE_IBS       24
+  #define KVM_REQ_APIC_PAGE_RELOAD  25
+  #define KVM_REQ_SMI               26
+++<<<<<<< HEAD
+++=======
++ #define KVM_REQ_HV_CRASH          27
++ #define KVM_REQ_IOAPIC_EOI_EXIT   28
+++>>>>>>> 7543a635aa09 (KVM: x86: Add KVM exit for IOAPIC EOIs)
+  
+  #define KVM_USERSPACE_IRQ_SOURCE_ID		0
+  #define KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID	1
+diff --cc include/uapi/linux/kvm.h
+index 39df9ac6ee22,12e3afbf0f47..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -171,6 -181,9 +171,12 @@@ struct kvm_pit_config 
+  #define KVM_EXIT_WATCHDOG         21
+  #define KVM_EXIT_S390_TSCH        22
+  #define KVM_EXIT_EPR              23
+++<<<<<<< HEAD
+++=======
++ #define KVM_EXIT_SYSTEM_EVENT     24
++ #define KVM_EXIT_S390_STSI        25
++ #define KVM_EXIT_IOAPIC_EOI       26
+++>>>>>>> 7543a635aa09 (KVM: x86: Add KVM exit for IOAPIC EOIs)
+  
+  /* For KVM_EXIT_INTERNAL_ERROR */
+  /* Emulate instruction failed. */
+@@@ -301,6 -317,27 +307,30 @@@ struct kvm_run 
+  		struct {
+  			__u32 epr;
+  		} epr;
+++<<<<<<< HEAD
+++=======
++ 		/* KVM_EXIT_SYSTEM_EVENT */
++ 		struct {
++ #define KVM_SYSTEM_EVENT_SHUTDOWN       1
++ #define KVM_SYSTEM_EVENT_RESET          2
++ #define KVM_SYSTEM_EVENT_CRASH          3
++ 			__u32 type;
++ 			__u64 flags;
++ 		} system_event;
++ 		/* KVM_EXIT_S390_STSI */
++ 		struct {
++ 			__u64 addr;
++ 			__u8 ar;
++ 			__u8 reserved;
++ 			__u8 fc;
++ 			__u8 sel1;
++ 			__u16 sel2;
++ 		} s390_stsi;
++ 		/* KVM_EXIT_IOAPIC_EOI */
++ 		struct {
++ 			__u8 vector;
++ 		} eoi;
+++>>>>>>> 7543a635aa09 (KVM: x86: Add KVM exit for IOAPIC EOIs)
+  		/* Fix the size of the union. */
+  		char padding[256];
+  	};
+* Unmerged path Documentation/virtual/kvm/api.txt
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5d383a89c9d4..09f72225c4ea 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -555,6 +555,8 @@ struct kvm_vcpu_arch {
+ 	struct {
+ 		bool pv_unhalted;
+ 	} pv;
++
++	int pending_ioapic_eoi;
+ };
+ 
+ struct kvm_lpage_info {
+* Unmerged path arch/x86/kvm/lapic.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 733894b44f8d..d670b0851f7e 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6739,6 +6739,17 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			kvm_pmu_handle_event(vcpu);
+ 		if (kvm_check_request(KVM_REQ_PMI, vcpu))
+ 			kvm_pmu_deliver_pmi(vcpu);
++		if (kvm_check_request(KVM_REQ_IOAPIC_EOI_EXIT, vcpu)) {
++			BUG_ON(vcpu->arch.pending_ioapic_eoi > 255);
++			if (test_bit(vcpu->arch.pending_ioapic_eoi,
++				     (void *) vcpu->arch.eoi_exit_bitmap)) {
++				vcpu->run->exit_reason = KVM_EXIT_IOAPIC_EOI;
++				vcpu->run->eoi.vector =
++						vcpu->arch.pending_ioapic_eoi;
++				r = 0;
++				goto out;
++			}
++		}
+ 		if (kvm_check_request(KVM_REQ_SCAN_IOAPIC, vcpu))
+ 			vcpu_scan_ioapic(vcpu);
+ 		if (kvm_check_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu))
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path include/uapi/linux/kvm.h
