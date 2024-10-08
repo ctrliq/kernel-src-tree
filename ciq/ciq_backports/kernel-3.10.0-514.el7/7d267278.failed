@@ -1,0 +1,213 @@
+unix: avoid use-after-free in ep_remove_wait_queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Rainer Weikusat <rweikusat@mobileactivedefense.com>
+commit 7d267278a9ece963d77eefec61630223fce08c6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7d267278.failed
+
+Rainer Weikusat <rweikusat@mobileactivedefense.com> writes:
+An AF_UNIX datagram socket being the client in an n:1 association with
+some server socket is only allowed to send messages to the server if the
+receive queue of this socket contains at most sk_max_ack_backlog
+datagrams. This implies that prospective writers might be forced to go
+to sleep despite none of the message presently enqueued on the server
+receive queue were sent by them. In order to ensure that these will be
+woken up once space becomes again available, the present unix_dgram_poll
+routine does a second sock_poll_wait call with the peer_wait wait queue
+of the server socket as queue argument (unix_dgram_recvmsg does a wake
+up on this queue after a datagram was received). This is inherently
+problematic because the server socket is only guaranteed to remain alive
+for as long as the client still holds a reference to it. In case the
+connection is dissolved via connect or by the dead peer detection logic
+in unix_dgram_sendmsg, the server socket may be freed despite "the
+polling mechanism" (in particular, epoll) still has a pointer to the
+corresponding peer_wait queue. There's no way to forcibly deregister a
+wait queue with epoll.
+
+Based on an idea by Jason Baron, the patch below changes the code such
+that a wait_queue_t belonging to the client socket is enqueued on the
+peer_wait queue of the server whenever the peer receive queue full
+condition is detected by either a sendmsg or a poll. A wake up on the
+peer queue is then relayed to the ordinary wait queue of the client
+socket via wake function. The connection to the peer wait queue is again
+dissolved if either a wake up is about to be relayed or the client
+socket reconnects or a dead peer is detected or the client socket is
+itself closed. This enables removing the second sock_poll_wait from
+unix_dgram_poll, thus avoiding the use-after-free, while still ensuring
+that no blocked writer sleeps forever.
+
+	Signed-off-by: Rainer Weikusat <rweikusat@mobileactivedefense.com>
+Fixes: ec0d215f9420 ("af_unix: fix 'poll for write'/connected DGRAM sockets")
+	Reviewed-by: Jason Baron <jbaron@akamai.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7d267278a9ece963d77eefec61630223fce08c6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+diff --cc net/unix/af_unix.c
+index 28170973dc3c,4e95bdf973d9..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -315,9 -326,122 +315,125 @@@ found
+  	return s;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int unix_writable(struct sock *sk)
+++=======
++ /* Support code for asymmetrically connected dgram sockets
++  *
++  * If a datagram socket is connected to a socket not itself connected
++  * to the first socket (eg, /dev/log), clients may only enqueue more
++  * messages if the present receive queue of the server socket is not
++  * "too large". This means there's a second writeability condition
++  * poll and sendmsg need to test. The dgram recv code will do a wake
++  * up on the peer_wait wait queue of a socket upon reception of a
++  * datagram which needs to be propagated to sleeping would-be writers
++  * since these might not have sent anything so far. This can't be
++  * accomplished via poll_wait because the lifetime of the server
++  * socket might be less than that of its clients if these break their
++  * association with it or if the server socket is closed while clients
++  * are still connected to it and there's no way to inform "a polling
++  * implementation" that it should let go of a certain wait queue
++  *
++  * In order to propagate a wake up, a wait_queue_t of the client
++  * socket is enqueued on the peer_wait queue of the server socket
++  * whose wake function does a wake_up on the ordinary client socket
++  * wait queue. This connection is established whenever a write (or
++  * poll for write) hit the flow control condition and broken when the
++  * association to the server socket is dissolved or after a wake up
++  * was relayed.
++  */
++ 
++ static int unix_dgram_peer_wake_relay(wait_queue_t *q, unsigned mode, int flags,
++ 				      void *key)
++ {
++ 	struct unix_sock *u;
++ 	wait_queue_head_t *u_sleep;
++ 
++ 	u = container_of(q, struct unix_sock, peer_wake);
++ 
++ 	__remove_wait_queue(&unix_sk(u->peer_wake.private)->peer_wait,
++ 			    q);
++ 	u->peer_wake.private = NULL;
++ 
++ 	/* relaying can only happen while the wq still exists */
++ 	u_sleep = sk_sleep(&u->sk);
++ 	if (u_sleep)
++ 		wake_up_interruptible_poll(u_sleep, key);
++ 
++ 	return 0;
++ }
++ 
++ static int unix_dgram_peer_wake_connect(struct sock *sk, struct sock *other)
++ {
++ 	struct unix_sock *u, *u_other;
++ 	int rc;
++ 
++ 	u = unix_sk(sk);
++ 	u_other = unix_sk(other);
++ 	rc = 0;
++ 	spin_lock(&u_other->peer_wait.lock);
++ 
++ 	if (!u->peer_wake.private) {
++ 		u->peer_wake.private = other;
++ 		__add_wait_queue(&u_other->peer_wait, &u->peer_wake);
++ 
++ 		rc = 1;
++ 	}
++ 
++ 	spin_unlock(&u_other->peer_wait.lock);
++ 	return rc;
++ }
++ 
++ static void unix_dgram_peer_wake_disconnect(struct sock *sk,
++ 					    struct sock *other)
++ {
++ 	struct unix_sock *u, *u_other;
++ 
++ 	u = unix_sk(sk);
++ 	u_other = unix_sk(other);
++ 	spin_lock(&u_other->peer_wait.lock);
++ 
++ 	if (u->peer_wake.private == other) {
++ 		__remove_wait_queue(&u_other->peer_wait, &u->peer_wake);
++ 		u->peer_wake.private = NULL;
++ 	}
++ 
++ 	spin_unlock(&u_other->peer_wait.lock);
++ }
++ 
++ static void unix_dgram_peer_wake_disconnect_wakeup(struct sock *sk,
++ 						   struct sock *other)
++ {
++ 	unix_dgram_peer_wake_disconnect(sk, other);
++ 	wake_up_interruptible_poll(sk_sleep(sk),
++ 				   POLLOUT |
++ 				   POLLWRNORM |
++ 				   POLLWRBAND);
++ }
++ 
++ /* preconditions:
++  *	- unix_peer(sk) == other
++  *	- association is stable
++  */
++ static int unix_dgram_peer_wake_me(struct sock *sk, struct sock *other)
++ {
++ 	int connected;
++ 
++ 	connected = unix_dgram_peer_wake_connect(sk, other);
++ 
++ 	if (unix_recvq_full(other))
++ 		return 1;
++ 
++ 	if (connected)
++ 		unix_dgram_peer_wake_disconnect(sk, other);
++ 
++ 	return 0;
++ }
++ 
++ static int unix_writable(const struct sock *sk)
+++>>>>>>> 7d267278a9ec (unix: avoid use-after-free in ep_remove_wait_queue)
+  {
+ -	return sk->sk_state != TCP_LISTEN &&
+ -	       (atomic_read(&sk->sk_wmem_alloc) << 2) <= sk->sk_sndbuf;
+ +	return (atomic_read(&sk->sk_wmem_alloc) << 2) <= sk->sk_sndbuf;
+  }
+  
+  static void unix_write_space(struct sock *sk)
+@@@ -1477,14 -1586,13 +1598,15 @@@ static int unix_dgram_sendmsg(struct ki
+  	unsigned int hash;
+  	struct sk_buff *skb;
+  	long timeo;
+ -	struct scm_cookie scm;
+ +	struct scm_cookie tmp_scm;
+  	int max_level;
+  	int data_len = 0;
++ 	int sk_locked;
+  
+ +	if (NULL == siocb->scm)
+ +		siocb->scm = &tmp_scm;
+  	wait_for_unix_gc();
+ -	err = scm_send(sock, msg, &scm, false);
+ +	err = scm_send(sock, msg, siocb->scm, false);
+  	if (err < 0)
+  		return err;
+  
+diff --git a/include/net/af_unix.h b/include/net/af_unix.h
+index 609746ccbe9c..084086e3ba51 100644
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -63,6 +63,7 @@ struct unix_sock {
+ #define UNIX_GC_CANDIDATE	0
+ #define UNIX_GC_MAYBE_CYCLE	1
+ 	struct socket_wq	peer_wq;
++	wait_queue_t		peer_wake;
+ };
+ #define unix_sk(__sk) ((struct unix_sock *)__sk)
+ 
+* Unmerged path net/unix/af_unix.c
