@@ -1,0 +1,123 @@
+blk-mq: bitmap tag: fix race on blk_mq_bitmap_tags::wake_cnt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [block] blk-mq: bitmap tag, fix race on blk_mq_bitmap_tags::wake_cnt (Mike Snitzer) [1105204]
+Rebuild_FUZZ: 98.33%
+commit-author Alexander Gordeev <agordeev@redhat.com>
+commit 2971c35f35886b87af54675313a2afef937c1b0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2971c35f.failed
+
+This piece of code in bt_clear_tag() function is racy:
+
+	bs = bt_wake_ptr(bt);
+	if (bs && atomic_dec_and_test(&bs->wait_cnt)) {
+		atomic_set(&bs->wait_cnt, bt->wake_cnt);
+ 		wake_up(&bs->wait);
+	}
+
+Since nothing prevents bt_wake_ptr() from returning the very
+same 'bs' address on multiple CPUs, the following scenario is
+possible:
+
+    CPU1                                CPU2
+    ----                                ----
+
+0.  bs = bt_wake_ptr(bt);               bs = bt_wake_ptr(bt);
+1.  atomic_dec_and_test(&bs->wait_cnt)
+2.                                      atomic_dec_and_test(&bs->wait_cnt)
+3.  atomic_set(&bs->wait_cnt, bt->wake_cnt);
+
+If the decrement in [1] yields zero then for some amount of time
+the decrement in [2] results in a negative/overflow value, which
+is not expected. The follow-up assignment in [3] overwrites the
+invalid value with the batch value (and likely prevents the issue
+from being severe) which is still incorrect and should be a lesser.
+
+	Cc: Ming Lei <tom.leiming@gmail.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 2971c35f35886b87af54675313a2afef937c1b0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+diff --cc block/blk-mq-tag.c
+index d50cc52e39c1,08fc6716d362..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -72,12 -309,64 +72,67 @@@ static unsigned int __blk_mq_get_reserv
+  	return tag;
+  }
+  
+ -unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ +unsigned int blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp, bool reserved)
+  {
+ -	if (!data->reserved)
+ -		return __blk_mq_get_tag(data);
+ +	if (!reserved)
+ +		return __blk_mq_get_tag(tags, gfp);
+  
+++<<<<<<< HEAD
+ +	return __blk_mq_get_reserved_tag(tags, gfp);
+++=======
++ 	return __blk_mq_get_reserved_tag(data);
++ }
++ 
++ static struct bt_wait_state *bt_wake_ptr(struct blk_mq_bitmap_tags *bt)
++ {
++ 	int i, wake_index;
++ 
++ 	wake_index = atomic_read(&bt->wake_index);
++ 	for (i = 0; i < BT_WAIT_QUEUES; i++) {
++ 		struct bt_wait_state *bs = &bt->bs[wake_index];
++ 
++ 		if (waitqueue_active(&bs->wait)) {
++ 			int o = atomic_read(&bt->wake_index);
++ 			if (wake_index != o)
++ 				atomic_cmpxchg(&bt->wake_index, o, wake_index);
++ 
++ 			return bs;
++ 		}
++ 
++ 		wake_index = bt_index_inc(wake_index);
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static void bt_clear_tag(struct blk_mq_bitmap_tags *bt, unsigned int tag)
++ {
++ 	const int index = TAG_TO_INDEX(bt, tag);
++ 	struct bt_wait_state *bs;
++ 	int wait_cnt;
++ 
++ 	/*
++ 	 * The unlock memory barrier need to order access to req in free
++ 	 * path and clearing tag bit
++ 	 */
++ 	clear_bit_unlock(TAG_TO_BIT(bt, tag), &bt->map[index].word);
++ 
++ 	bs = bt_wake_ptr(bt);
++ 	if (!bs)
++ 		return;
++ 
++ 	wait_cnt = atomic_dec_return(&bs->wait_cnt);
++ 	if (wait_cnt == 0) {
++ wake:
++ 		atomic_add(bt->wake_cnt, &bs->wait_cnt);
++ 		bt_index_atomic_inc(&bt->wake_index);
++ 		wake_up(&bs->wait);
++ 	} else if (wait_cnt < 0) {
++ 		wait_cnt = atomic_inc_return(&bs->wait_cnt);
++ 		if (!wait_cnt)
++ 			goto wake;
++ 	}
+++>>>>>>> 2971c35f3588 (blk-mq: bitmap tag: fix race on blk_mq_bitmap_tags::wake_cnt)
+  }
+  
+  static void __blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag)
+* Unmerged path block/blk-mq-tag.c
