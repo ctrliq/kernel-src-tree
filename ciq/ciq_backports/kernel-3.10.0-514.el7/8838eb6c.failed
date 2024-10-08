@@ -1,0 +1,197 @@
+x86/mce: Clear Local MCE opt-in before kexec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mce: Clear Local MCE opt-in before kexec (Prarit Bhargava) [1301710]
+Rebuild_FUZZ: 95.24%
+commit-author Ashok Raj <ashok.raj@intel.com>
+commit 8838eb6c0bf3b6a6494a163947ab3d1700ab45d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8838eb6c.failed
+
+kexec could boot a kernel that could be legacy with no knowledge
+of LMCE. Hence we should make sure we clear LMCE optin before
+kexec reboot.
+
+	Signed-off-by: Ashok Raj <ashok.raj@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: http://lkml.kernel.org/r/1439396985-12812-9-git-send-email-bp@alien8.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8838eb6c0bf3b6a6494a163947ab3d1700ab45d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/process.c
+diff --cc arch/x86/kernel/process.c
+index f1fb8d015c94,b20ef187ff41..000000000000
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@@ -24,10 -24,12 +24,15 @@@
+  #include <asm/syscalls.h>
+  #include <asm/idle.h>
+  #include <asm/uaccess.h>
+ -#include <asm/mwait.h>
+ -#include <asm/fpu/internal.h>
+ +#include <asm/i387.h>
+ +#include <asm/fpu-internal.h>
+  #include <asm/debugreg.h>
+  #include <asm/nmi.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/tlbflush.h>
++ #include <asm/mce.h>
+++>>>>>>> 8838eb6c0bf3 (x86/mce: Clear Local MCE opt-in before kexec)
+  
+  /*
+   * per-CPU TSS segments. Threads are completely 'soft' on Linux,
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index 21ba156340f0..1d044c2ce871 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -151,10 +151,12 @@ extern int mce_p5_enabled;
+ #ifdef CONFIG_X86_MCE
+ int mcheck_init(void);
+ void mcheck_cpu_init(struct cpuinfo_x86 *c);
++void mcheck_cpu_clear(struct cpuinfo_x86 *c);
+ void mcheck_vendor_init_severity(void);
+ #else
+ static inline int mcheck_init(void) { return 0; }
+ static inline void mcheck_cpu_init(struct cpuinfo_x86 *c) {}
++static inline void mcheck_cpu_clear(struct cpuinfo_x86 *c) {}
+ static inline void mcheck_vendor_init_severity(void) {}
+ #endif
+ 
+@@ -181,6 +183,7 @@ DECLARE_PER_CPU(struct device *, mce_device);
+ 
+ #ifdef CONFIG_X86_MCE_INTEL
+ void mce_intel_feature_init(struct cpuinfo_x86 *c);
++void mce_intel_feature_clear(struct cpuinfo_x86 *c);
+ void cmci_clear(void);
+ void cmci_reenable(void);
+ void cmci_rediscover(void);
+@@ -189,6 +192,7 @@ void lmce_clear(void);
+ void lmce_enable(void);
+ #else
+ static inline void mce_intel_feature_init(struct cpuinfo_x86 *c) { }
++static inline void mce_intel_feature_clear(struct cpuinfo_x86 *c) { }
+ static inline void cmci_clear(void) {}
+ static inline void cmci_reenable(void) {}
+ static inline void cmci_rediscover(void) {}
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index 53f7039f68c9..fb3e562c3027 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -1669,6 +1669,17 @@ static void __mcheck_cpu_init_vendor(struct cpuinfo_x86 *c)
+ 	}
+ }
+ 
++static void __mcheck_cpu_clear_vendor(struct cpuinfo_x86 *c)
++{
++	switch (c->x86_vendor) {
++	case X86_VENDOR_INTEL:
++		mce_intel_feature_clear(c);
++		break;
++	default:
++		break;
++	}
++}
++
+ static void mce_start_timer(unsigned int cpu, struct timer_list *t)
+ {
+ 	unsigned long iv = check_interval * HZ;
+@@ -1737,6 +1748,25 @@ void mcheck_cpu_init(struct cpuinfo_x86 *c)
+ 	init_irq_work(&__get_cpu_var(mce_irq_work), &mce_irq_work_cb);
+ }
+ 
++/*
++ * Called for each booted CPU to clear some machine checks opt-ins
++ */
++void mcheck_cpu_clear(struct cpuinfo_x86 *c)
++{
++	if (mca_cfg.disabled)
++		return;
++
++	if (!mce_available(c))
++		return;
++
++	/*
++	 * Possibly to clear general settings generic to x86
++	 * __mcheck_cpu_clear_generic(c);
++	 */
++	__mcheck_cpu_clear_vendor(c);
++
++}
++
+ /*
+  * mce_chrdev: Character device /dev/mcelog to read and clear the MCE log.
+  */
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_intel.c b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+index 22cb89b9b3b6..aec6fe1b9123 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_intel.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+@@ -435,7 +435,7 @@ static void intel_init_cmci(void)
+ 	cmci_recheck();
+ }
+ 
+-void intel_init_lmce(void)
++static void intel_init_lmce(void)
+ {
+ 	u64 val;
+ 
+@@ -448,9 +448,26 @@ void intel_init_lmce(void)
+ 		wrmsrl(MSR_IA32_MCG_EXT_CTL, val | MCG_EXT_CTL_LMCE_EN);
+ }
+ 
++static void intel_clear_lmce(void)
++{
++	u64 val;
++
++	if (!lmce_supported())
++		return;
++
++	rdmsrl(MSR_IA32_MCG_EXT_CTL, val);
++	val &= ~MCG_EXT_CTL_LMCE_EN;
++	wrmsrl(MSR_IA32_MCG_EXT_CTL, val);
++}
++
+ void mce_intel_feature_init(struct cpuinfo_x86 *c)
+ {
+ 	intel_init_thermal(c);
+ 	intel_init_cmci();
+ 	intel_init_lmce();
+ }
++
++void mce_intel_feature_clear(struct cpuinfo_x86 *c)
++{
++	intel_clear_lmce();
++}
+* Unmerged path arch/x86/kernel/process.c
+diff --git a/arch/x86/kernel/smp.c b/arch/x86/kernel/smp.c
+index cdaa347dfcad..c13dd515a1b4 100644
+--- a/arch/x86/kernel/smp.c
++++ b/arch/x86/kernel/smp.c
+@@ -30,6 +30,7 @@
+ #include <asm/proto.h>
+ #include <asm/apic.h>
+ #include <asm/nmi.h>
++#include <asm/mce.h>
+ #include <asm/trace/irq_vectors.h>
+ /*
+  *	Some notes on x86 processor bugs affecting SMP operation:
+@@ -244,6 +245,7 @@ static void native_stop_other_cpus(int wait)
+ finish:
+ 	local_irq_save(flags);
+ 	disable_local_APIC();
++	mcheck_cpu_clear(this_cpu_ptr(&cpu_info));
+ 	local_irq_restore(flags);
+ }
+ 
