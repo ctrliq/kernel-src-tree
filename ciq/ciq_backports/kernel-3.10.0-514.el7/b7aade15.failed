@@ -1,0 +1,199 @@
+vxlan: break dependency with netdev drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit b7aade15485a660cbf5161962c284131324a9534
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b7aade15.failed
+
+Currently all drivers depend and autoload the vxlan module because how
+vxlan_get_rx_port is linked into them. Remove this dependency:
+
+By using a new event type in the netdevice notifier call chain we proxy
+the request from the drivers to flush and resetup the vxlan ports not
+directly via function call but by the already existing netdevice
+notifier call chain.
+
+I added a separate new event type, NETDEV_OFFLOAD_PUSH_VXLAN, to do so.
+We don't need to save those ids, as the event type field is an unsigned
+long and using specialized event types for this purpose seemed to be a
+more elegant way. This also comes in beneficial if in future we want to
+add offloading knobs for vxlan.
+
+	Cc: Jesse Gross <jesse@kernel.org>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b7aade15485a660cbf5161962c284131324a9534)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/net/vxlan.h
+diff --cc include/linux/netdevice.h
+index 95e53059b81a,d4c8cd424f8d..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1940,8 -2237,14 +1940,15 @@@ struct pcpu_sw_netstats 
+  #define NETDEV_RELEASE		0x0012
+  #define NETDEV_NOTIFY_PEERS	0x0013
+  #define NETDEV_JOIN		0x0014
+ -#define NETDEV_CHANGEUPPER	0x0015
+  #define NETDEV_RESEND_IGMP	0x0016
+ -#define NETDEV_PRECHANGEMTU	0x0017 /* notify before mtu change happened */
+  #define NETDEV_CHANGEINFODATA	0x0018
+++<<<<<<< HEAD
+++=======
++ #define NETDEV_BONDING_INFO	0x0019
++ #define NETDEV_PRECHANGEUPPER	0x001A
++ #define NETDEV_CHANGELOWERSTATE	0x001B
++ #define NETDEV_OFFLOAD_PUSH_VXLAN	0x001C
+++>>>>>>> b7aade15485a (vxlan: break dependency with netdev drivers)
+  
+  int register_netdevice_notifier(struct notifier_block *nb);
+  int unregister_netdevice_notifier(struct notifier_block *nb);
+diff --cc include/net/vxlan.h
+index b3828bd87f8a,673e9f9e6da7..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -181,13 -328,73 +181,79 @@@ static inline netdev_features_t vxlan_f
+  /* IPv6 header + UDP + VXLAN + Ethernet header */
+  #define VXLAN6_HEADROOM (40 + 8 + 8 + 14)
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_VXLAN)
+ +void vxlan_get_rx_port(struct net_device *netdev);
+ +#else
+- static inline void vxlan_get_rx_port(struct net_device *netdev)
+++=======
++ static inline struct vxlanhdr *vxlan_hdr(struct sk_buff *skb)
+  {
++ 	return (struct vxlanhdr *)(udp_hdr(skb) + 1);
+  }
++ 
++ static inline __be32 vxlan_vni(__be32 vni_field)
++ {
++ #if defined(__BIG_ENDIAN)
++ 	return (__force __be32)((__force u32)vni_field >> 8);
++ #else
++ 	return (__force __be32)((__force u32)(vni_field & VXLAN_VNI_MASK) << 8);
++ #endif
++ }
++ 
++ static inline __be32 vxlan_vni_field(__be32 vni)
++ {
++ #if defined(__BIG_ENDIAN)
++ 	return (__force __be32)((__force u32)vni << 8);
++ #else
++ 	return (__force __be32)((__force u32)vni >> 8);
++ #endif
++ }
++ 
++ static inline __be32 vxlan_tun_id_to_vni(__be64 tun_id)
++ {
++ #if defined(__BIG_ENDIAN)
++ 	return (__force __be32)tun_id;
++ #else
++ 	return (__force __be32)((__force u64)tun_id >> 32);
++ #endif
++ }
++ 
++ static inline __be64 vxlan_vni_to_tun_id(__be32 vni)
++ {
++ #if defined(__BIG_ENDIAN)
++ 	return (__force __be64)vni;
++ #else
++ 	return (__force __be64)((u64)(__force u32)vni << 32);
+  #endif
++ }
++ 
++ static inline size_t vxlan_rco_start(__be32 vni_field)
++ {
++ 	return be32_to_cpu(vni_field & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
++ }
++ 
++ static inline size_t vxlan_rco_offset(__be32 vni_field)
++ {
++ 	return (vni_field & VXLAN_RCO_UDP) ?
++ 		offsetof(struct udphdr, check) :
++ 		offsetof(struct tcphdr, check);
++ }
++ 
++ static inline __be32 vxlan_compute_rco(unsigned int start, unsigned int offset)
++ {
++ 	__be32 vni_field = cpu_to_be32(start >> VXLAN_RCO_SHIFT);
++ 
++ 	if (offset == offsetof(struct udphdr, check))
++ 		vni_field |= VXLAN_RCO_UDP;
++ 	return vni_field;
++ }
++ 
+++>>>>>>> b7aade15485a (vxlan: break dependency with netdev drivers)
++ static inline void vxlan_get_rx_port(struct net_device *netdev)
++ {
++ 	ASSERT_RTNL();
++ 	call_netdevice_notifiers(NETDEV_OFFLOAD_PUSH_VXLAN, netdev);
++ }
+  
+  static inline unsigned short vxlan_get_sk_family(struct vxlan_sock *vs)
+  {
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 9215c93ac7ca..e9023cf66bc6 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -2328,7 +2328,7 @@ static struct device_type vxlan_type = {
+  * supply the listening VXLAN udp ports. Callers are expected
+  * to implement the ndo_add_vxlan_port.
+  */
+-void vxlan_get_rx_port(struct net_device *dev)
++static void vxlan_push_rx_ports(struct net_device *dev)
+ {
+ 	struct vxlan_sock *vs;
+ 	struct net *net = dev_net(dev);
+@@ -2337,6 +2337,9 @@ void vxlan_get_rx_port(struct net_device *dev)
+ 	__be16 port;
+ 	unsigned int i;
+ 
++	if (!dev->netdev_ops->ndo_add_vxlan_port)
++		return;
++
+ 	spin_lock(&vn->sock_lock);
+ 	for (i = 0; i < PORT_HASH_SIZE; ++i) {
+ 		hlist_for_each_entry_rcu(vs, &vn->sock_list[i], hlist) {
+@@ -2348,7 +2351,6 @@ void vxlan_get_rx_port(struct net_device *dev)
+ 	}
+ 	spin_unlock(&vn->sock_lock);
+ }
+-EXPORT_SYMBOL_GPL(vxlan_get_rx_port);
+ 
+ /* Initialize the device structure. */
+ static void vxlan_setup(struct net_device *dev)
+@@ -2926,20 +2928,22 @@ static void vxlan_handle_lowerdev_unregister(struct vxlan_net *vn,
+ 	unregister_netdevice_many(&list_kill);
+ }
+ 
+-static int vxlan_lowerdev_event(struct notifier_block *unused,
+-				unsigned long event, void *ptr)
++static int vxlan_netdevice_event(struct notifier_block *unused,
++				 unsigned long event, void *ptr)
+ {
+ 	struct net_device *dev = ptr;
+ 	struct vxlan_net *vn = net_generic(dev_net(dev), vxlan_net_id);
+ 
+ 	if (event == NETDEV_UNREGISTER)
+ 		vxlan_handle_lowerdev_unregister(vn, dev);
++	else if (event == NETDEV_OFFLOAD_PUSH_VXLAN)
++		vxlan_push_rx_ports(dev);
+ 
+ 	return NOTIFY_DONE;
+ }
+ 
+ static struct notifier_block vxlan_notifier_block __read_mostly = {
+-	.notifier_call = vxlan_lowerdev_event,
++	.notifier_call = vxlan_netdevice_event,
+ };
+ 
+ static __net_init int vxlan_init_net(struct net *net)
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/net/vxlan.h
