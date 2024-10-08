@@ -1,0 +1,507 @@
+nfsd: implement pNFS layout recalls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit c5c707f96fc9a6e5a57ca5baac892673270abe3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c5c707f9.failed
+
+Add support to issue layout recalls to clients.  For now we only support
+full-file recalls to get a simple and stable implementation.  This allows
+to embedd a nfsd4_callback structure in the layout_state and thus avoid
+any memory allocations under spinlocks during a recall.  For normal
+use cases that do not intent to share a single file between multiple
+clients this implementation is fully sufficient.
+
+To ensure layouts are recalled on local filesystem access each layout
+state registers a new FL_LAYOUT lease with the kernel file locking code,
+which filesystems that support pNFS exports that require recalls need
+to break on conflicting access patterns.
+
+The XDR code is based on the old pNFS server implementation by
+Andy Adamson, Benny Halevy, Boaz Harrosh, Dean Hildebrand, Fred Isaman,
+Marc Eshel, Mike Sager and Ricardo Labiaga.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit c5c707f96fc9a6e5a57ca5baac892673270abe3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4layouts.c
+#	fs/nfsd/nfs4proc.c
+#	fs/nfsd/nfs4state.c
+#	fs/nfsd/state.h
+diff --cc fs/nfsd/nfs4proc.c
+index 3e6a2e352c96,fa14359eb956..000000000000
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@@ -1095,6 -1179,256 +1095,259 @@@ nfsd4_verify(struct svc_rqst *rqstp, st
+  	return status == nfserr_same ? nfs_ok : status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NFSD_PNFS
++ static const struct nfsd4_layout_ops *
++ nfsd4_layout_verify(struct svc_export *exp, unsigned int layout_type)
++ {
++ 	if (!exp->ex_layout_type) {
++ 		dprintk("%s: export does not support pNFS\n", __func__);
++ 		return NULL;
++ 	}
++ 
++ 	if (exp->ex_layout_type != layout_type) {
++ 		dprintk("%s: layout type %d not supported\n",
++ 			__func__, layout_type);
++ 		return NULL;
++ 	}
++ 
++ 	return nfsd4_layout_ops[layout_type];
++ }
++ 
++ static __be32
++ nfsd4_getdeviceinfo(struct svc_rqst *rqstp,
++ 		struct nfsd4_compound_state *cstate,
++ 		struct nfsd4_getdeviceinfo *gdp)
++ {
++ 	const struct nfsd4_layout_ops *ops;
++ 	struct nfsd4_deviceid_map *map;
++ 	struct svc_export *exp;
++ 	__be32 nfserr;
++ 
++ 	dprintk("%s: layout_type %u dev_id [0x%llx:0x%x] maxcnt %u\n",
++ 	       __func__,
++ 	       gdp->gd_layout_type,
++ 	       gdp->gd_devid.fsid_idx, gdp->gd_devid.generation,
++ 	       gdp->gd_maxcount);
++ 
++ 	map = nfsd4_find_devid_map(gdp->gd_devid.fsid_idx);
++ 	if (!map) {
++ 		dprintk("%s: couldn't find device ID to export mapping!\n",
++ 			__func__);
++ 		return nfserr_noent;
++ 	}
++ 
++ 	exp = rqst_exp_find(rqstp, map->fsid_type, map->fsid);
++ 	if (IS_ERR(exp)) {
++ 		dprintk("%s: could not find device id\n", __func__);
++ 		return nfserr_noent;
++ 	}
++ 
++ 	nfserr = nfserr_layoutunavailable;
++ 	ops = nfsd4_layout_verify(exp, gdp->gd_layout_type);
++ 	if (!ops)
++ 		goto out;
++ 
++ 	nfserr = nfs_ok;
++ 	if (gdp->gd_maxcount != 0)
++ 		nfserr = ops->proc_getdeviceinfo(exp->ex_path.mnt->mnt_sb, gdp);
++ 
++ 	gdp->gd_notify_types &= ops->notify_types;
++ 	exp_put(exp);
++ out:
++ 	return nfserr;
++ }
++ 
++ static __be32
++ nfsd4_layoutget(struct svc_rqst *rqstp,
++ 		struct nfsd4_compound_state *cstate,
++ 		struct nfsd4_layoutget *lgp)
++ {
++ 	struct svc_fh *current_fh = &cstate->current_fh;
++ 	const struct nfsd4_layout_ops *ops;
++ 	struct nfs4_layout_stateid *ls;
++ 	__be32 nfserr;
++ 	int accmode;
++ 
++ 	switch (lgp->lg_seg.iomode) {
++ 	case IOMODE_READ:
++ 		accmode = NFSD_MAY_READ;
++ 		break;
++ 	case IOMODE_RW:
++ 		accmode = NFSD_MAY_READ | NFSD_MAY_WRITE;
++ 		break;
++ 	default:
++ 		dprintk("%s: invalid iomode %d\n",
++ 			__func__, lgp->lg_seg.iomode);
++ 		nfserr = nfserr_badiomode;
++ 		goto out;
++ 	}
++ 
++ 	nfserr = fh_verify(rqstp, current_fh, 0, accmode);
++ 	if (nfserr)
++ 		goto out;
++ 
++ 	nfserr = nfserr_layoutunavailable;
++ 	ops = nfsd4_layout_verify(current_fh->fh_export, lgp->lg_layout_type);
++ 	if (!ops)
++ 		goto out;
++ 
++ 	/*
++ 	 * Verify minlength and range as per RFC5661:
++ 	 *  o  If loga_length is less than loga_minlength,
++ 	 *     the metadata server MUST return NFS4ERR_INVAL.
++ 	 *  o  If the sum of loga_offset and loga_minlength exceeds
++ 	 *     NFS4_UINT64_MAX, and loga_minlength is not
++ 	 *     NFS4_UINT64_MAX, the error NFS4ERR_INVAL MUST result.
++ 	 *  o  If the sum of loga_offset and loga_length exceeds
++ 	 *     NFS4_UINT64_MAX, and loga_length is not NFS4_UINT64_MAX,
++ 	 *     the error NFS4ERR_INVAL MUST result.
++ 	 */
++ 	nfserr = nfserr_inval;
++ 	if (lgp->lg_seg.length < lgp->lg_minlength ||
++ 	    (lgp->lg_minlength != NFS4_MAX_UINT64 &&
++ 	     lgp->lg_minlength > NFS4_MAX_UINT64 - lgp->lg_seg.offset) ||
++ 	    (lgp->lg_seg.length != NFS4_MAX_UINT64 &&
++ 	     lgp->lg_seg.length > NFS4_MAX_UINT64 - lgp->lg_seg.offset))
++ 		goto out;
++ 	if (lgp->lg_seg.length == 0)
++ 		goto out;
++ 
++ 	nfserr = nfsd4_preprocess_layout_stateid(rqstp, cstate, &lgp->lg_sid,
++ 						true, lgp->lg_layout_type, &ls);
++ 	if (nfserr)
++ 		goto out;
++ 
++ 	nfserr = nfserr_recallconflict;
++ 	if (atomic_read(&ls->ls_stid.sc_file->fi_lo_recalls))
++ 		goto out_put_stid;
++ 
++ 	nfserr = ops->proc_layoutget(current_fh->fh_dentry->d_inode,
++ 				     current_fh, lgp);
++ 	if (nfserr)
++ 		goto out_put_stid;
++ 
++ 	nfserr = nfsd4_insert_layout(lgp, ls);
++ 
++ out_put_stid:
++ 	nfs4_put_stid(&ls->ls_stid);
++ out:
++ 	return nfserr;
++ }
++ 
++ static __be32
++ nfsd4_layoutcommit(struct svc_rqst *rqstp,
++ 		struct nfsd4_compound_state *cstate,
++ 		struct nfsd4_layoutcommit *lcp)
++ {
++ 	const struct nfsd4_layout_seg *seg = &lcp->lc_seg;
++ 	struct svc_fh *current_fh = &cstate->current_fh;
++ 	const struct nfsd4_layout_ops *ops;
++ 	loff_t new_size = lcp->lc_last_wr + 1;
++ 	struct inode *inode;
++ 	struct nfs4_layout_stateid *ls;
++ 	__be32 nfserr;
++ 
++ 	nfserr = fh_verify(rqstp, current_fh, 0, NFSD_MAY_WRITE);
++ 	if (nfserr)
++ 		goto out;
++ 
++ 	nfserr = nfserr_layoutunavailable;
++ 	ops = nfsd4_layout_verify(current_fh->fh_export, lcp->lc_layout_type);
++ 	if (!ops)
++ 		goto out;
++ 	inode = current_fh->fh_dentry->d_inode;
++ 
++ 	nfserr = nfserr_inval;
++ 	if (new_size <= seg->offset) {
++ 		dprintk("pnfsd: last write before layout segment\n");
++ 		goto out;
++ 	}
++ 	if (new_size > seg->offset + seg->length) {
++ 		dprintk("pnfsd: last write beyond layout segment\n");
++ 		goto out;
++ 	}
++ 	if (!lcp->lc_newoffset && new_size > i_size_read(inode)) {
++ 		dprintk("pnfsd: layoutcommit beyond EOF\n");
++ 		goto out;
++ 	}
++ 
++ 	nfserr = nfsd4_preprocess_layout_stateid(rqstp, cstate, &lcp->lc_sid,
++ 						false, lcp->lc_layout_type,
++ 						&ls);
++ 	if (nfserr) {
++ 		/* fixup error code as per RFC5661 */
++ 		if (nfserr == nfserr_bad_stateid)
++ 			nfserr = nfserr_badlayout;
++ 		goto out;
++ 	}
++ 
++ 	nfserr = ops->proc_layoutcommit(inode, lcp);
++ 	if (nfserr)
++ 		goto out_put_stid;
++ 
++ 	if (new_size > i_size_read(inode)) {
++ 		lcp->lc_size_chg = 1;
++ 		lcp->lc_newsize = new_size;
++ 	} else {
++ 		lcp->lc_size_chg = 0;
++ 	}
++ 
++ out_put_stid:
++ 	nfs4_put_stid(&ls->ls_stid);
++ out:
++ 	return nfserr;
++ }
++ 
++ static __be32
++ nfsd4_layoutreturn(struct svc_rqst *rqstp,
++ 		struct nfsd4_compound_state *cstate,
++ 		struct nfsd4_layoutreturn *lrp)
++ {
++ 	struct svc_fh *current_fh = &cstate->current_fh;
++ 	__be32 nfserr;
++ 
++ 	nfserr = fh_verify(rqstp, current_fh, 0, NFSD_MAY_NOP);
++ 	if (nfserr)
++ 		goto out;
++ 
++ 	nfserr = nfserr_layoutunavailable;
++ 	if (!nfsd4_layout_verify(current_fh->fh_export, lrp->lr_layout_type))
++ 		goto out;
++ 
++ 	switch (lrp->lr_seg.iomode) {
++ 	case IOMODE_READ:
++ 	case IOMODE_RW:
++ 	case IOMODE_ANY:
++ 		break;
++ 	default:
++ 		dprintk("%s: invalid iomode %d\n", __func__,
++ 			lrp->lr_seg.iomode);
++ 		nfserr = nfserr_inval;
++ 		goto out;
++ 	}
++ 
++ 	switch (lrp->lr_return_type) {
++ 	case RETURN_FILE:
++ 		nfserr = nfsd4_return_file_layouts(rqstp, cstate, lrp);
++ 		break;
++ 	case RETURN_FSID:
++ 	case RETURN_ALL:
++ 		nfserr = nfsd4_return_client_layouts(rqstp, cstate, lrp);
++ 		break;
++ 	default:
++ 		dprintk("%s: invalid return_type %d\n", __func__,
++ 			lrp->lr_return_type);
++ 		nfserr = nfserr_inval;
++ 		break;
++ 	}
++ out:
++ 	return nfserr;
++ }
++ #endif /* CONFIG_NFSD_PNFS */
++ 
+++>>>>>>> c5c707f96fc9 (nfsd: implement pNFS layout recalls)
+  /*
+   * NULL call.
+   */
+diff --cc fs/nfsd/nfs4state.c
+index d661a147de64,f6b2a09f793f..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -3066,7 -3063,11 +3066,15 @@@ static void nfsd4_init_file(struct nfs4
+  	fp->fi_share_deny = 0;
+  	memset(fp->fi_fds, 0, sizeof(fp->fi_fds));
+  	memset(fp->fi_access, 0, sizeof(fp->fi_access));
+++<<<<<<< HEAD
+ +	hlist_add_head(&fp->fi_hash, &file_hashtbl[hashval]);
+++=======
++ #ifdef CONFIG_NFSD_PNFS
++ 	INIT_LIST_HEAD(&fp->fi_lo_states);
++ 	atomic_set(&fp->fi_lo_recalls, 0);
++ #endif
++ 	hlist_add_head_rcu(&fp->fi_hash, &file_hashtbl[hashval]);
+++>>>>>>> c5c707f96fc9 (nfsd: implement pNFS layout recalls)
+  }
+  
+  void
+diff --cc fs/nfsd/state.h
+index 96a8794939cc,4f3bfeb11766..000000000000
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@@ -483,10 -497,13 +483,17 @@@ struct nfs4_file 
+  	atomic_t		fi_access[2];
+  	u32			fi_share_deny;
+  	struct file		*fi_deleg_file;
+ -	int			fi_delegees;
+ +	struct file_lock	*fi_lease;
+ +	atomic_t		fi_delegees;
+  	struct knfsd_fh		fi_fhandle;
+  	bool			fi_had_conflict;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NFSD_PNFS
++ 	struct list_head	fi_lo_states;
++ 	atomic_t		fi_lo_recalls;
++ #endif
+++>>>>>>> c5c707f96fc9 (nfsd: implement pNFS layout recalls)
+  };
+  
+  /*
+@@@ -519,6 -536,24 +526,27 @@@ static inline struct nfs4_ol_stateid *o
+  	return container_of(s, struct nfs4_ol_stateid, st_stid);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs4_layout_stateid {
++ 	struct nfs4_stid		ls_stid;
++ 	struct list_head		ls_perclnt;
++ 	struct list_head		ls_perfile;
++ 	spinlock_t			ls_lock;
++ 	struct list_head		ls_layouts;
++ 	u32				ls_layout_type;
++ 	struct file			*ls_file;
++ 	struct nfsd4_callback		ls_recall;
++ 	stateid_t			ls_recall_sid;
++ 	bool				ls_recalled;
++ };
++ 
++ static inline struct nfs4_layout_stateid *layoutstateid(struct nfs4_stid *s)
++ {
++ 	return container_of(s, struct nfs4_layout_stateid, ls_stid);
++ }
++ 
+++>>>>>>> c5c707f96fc9 (nfsd: implement pNFS layout recalls)
+  /* flags for preprocess_seqid_op() */
+  #define RD_STATE	        0x00000010
+  #define WR_STATE	        0x00000020
+* Unmerged path fs/nfsd/nfs4layouts.c
+diff --git a/fs/nfsd/nfs4callback.c b/fs/nfsd/nfs4callback.c
+index 4fe4be1ee82e..a37a71bcfde3 100644
+--- a/fs/nfsd/nfs4callback.c
++++ b/fs/nfsd/nfs4callback.c
+@@ -549,6 +549,102 @@ out:
+ 	return status;
+ }
+ 
++#ifdef CONFIG_NFSD_PNFS
++/*
++ * CB_LAYOUTRECALL4args
++ *
++ *	struct layoutrecall_file4 {
++ *		nfs_fh4         lor_fh;
++ *		offset4         lor_offset;
++ *		length4         lor_length;
++ *		stateid4        lor_stateid;
++ *	};
++ *
++ *	union layoutrecall4 switch(layoutrecall_type4 lor_recalltype) {
++ *	case LAYOUTRECALL4_FILE:
++ *		layoutrecall_file4 lor_layout;
++ *	case LAYOUTRECALL4_FSID:
++ *		fsid4              lor_fsid;
++ *	case LAYOUTRECALL4_ALL:
++ *		void;
++ *	};
++ *
++ *	struct CB_LAYOUTRECALL4args {
++ *		layouttype4             clora_type;
++ *		layoutiomode4           clora_iomode;
++ *		bool                    clora_changed;
++ *		layoutrecall4           clora_recall;
++ *	};
++ */
++static void encode_cb_layout4args(struct xdr_stream *xdr,
++				  const struct nfs4_layout_stateid *ls,
++				  struct nfs4_cb_compound_hdr *hdr)
++{
++	__be32 *p;
++
++	BUG_ON(hdr->minorversion == 0);
++
++	p = xdr_reserve_space(xdr, 5 * 4);
++	*p++ = cpu_to_be32(OP_CB_LAYOUTRECALL);
++	*p++ = cpu_to_be32(ls->ls_layout_type);
++	*p++ = cpu_to_be32(IOMODE_ANY);
++	*p++ = cpu_to_be32(1);
++	*p = cpu_to_be32(RETURN_FILE);
++
++	encode_nfs_fh4(xdr, &ls->ls_stid.sc_file->fi_fhandle);
++
++	p = xdr_reserve_space(xdr, 2 * 8);
++	p = xdr_encode_hyper(p, 0);
++	xdr_encode_hyper(p, NFS4_MAX_UINT64);
++
++	encode_stateid4(xdr, &ls->ls_recall_sid);
++
++	hdr->nops++;
++}
++
++static void nfs4_xdr_enc_cb_layout(struct rpc_rqst *req,
++				   struct xdr_stream *xdr,
++				   const struct nfsd4_callback *cb)
++{
++	const struct nfs4_layout_stateid *ls =
++		container_of(cb, struct nfs4_layout_stateid, ls_recall);
++	struct nfs4_cb_compound_hdr hdr = {
++		.ident = 0,
++		.minorversion = cb->cb_minorversion,
++	};
++
++	encode_cb_compound4args(xdr, &hdr);
++	encode_cb_sequence4args(xdr, cb, &hdr);
++	encode_cb_layout4args(xdr, ls, &hdr);
++	encode_cb_nops(&hdr);
++}
++
++static int nfs4_xdr_dec_cb_layout(struct rpc_rqst *rqstp,
++				  struct xdr_stream *xdr,
++				  struct nfsd4_callback *cb)
++{
++	struct nfs4_cb_compound_hdr hdr;
++	enum nfsstat4 nfserr;
++	int status;
++
++	status = decode_cb_compound4res(xdr, &hdr);
++	if (unlikely(status))
++		goto out;
++	if (cb) {
++		status = decode_cb_sequence4res(xdr, cb);
++		if (unlikely(status))
++			goto out;
++	}
++	status = decode_cb_op_status(xdr, OP_CB_LAYOUTRECALL, &nfserr);
++	if (unlikely(status))
++		goto out;
++	if (unlikely(nfserr != NFS4_OK))
++		status = nfs_cb_stat_to_errno(nfserr);
++out:
++	return status;
++}
++#endif /* CONFIG_NFSD_PNFS */
++
+ /*
+  * RPC procedure tables
+  */
+@@ -566,6 +662,9 @@ out:
+ static struct rpc_procinfo nfs4_cb_procedures[] = {
+ 	PROC(CB_NULL,	NULL,		cb_null,	cb_null),
+ 	PROC(CB_RECALL,	COMPOUND,	cb_recall,	cb_recall),
++#ifdef CONFIG_NFSD_PNFS
++	PROC(CB_LAYOUT,	COMPOUND,	cb_layout,	cb_layout),
++#endif
+ };
+ 
+ static struct rpc_version nfs_cb_version4 = {
+* Unmerged path fs/nfsd/nfs4layouts.c
+* Unmerged path fs/nfsd/nfs4proc.c
+* Unmerged path fs/nfsd/nfs4state.c
+* Unmerged path fs/nfsd/state.h
+diff --git a/fs/nfsd/xdr4cb.h b/fs/nfsd/xdr4cb.h
+index c5c55dfb91a9..c47f6fdb111a 100644
+--- a/fs/nfsd/xdr4cb.h
++++ b/fs/nfsd/xdr4cb.h
+@@ -21,3 +21,10 @@
+ #define NFS4_dec_cb_recall_sz		(cb_compound_dec_hdr_sz  +      \
+ 					cb_sequence_dec_sz +            \
+ 					op_dec_sz)
++#define NFS4_enc_cb_layout_sz		(cb_compound_enc_hdr_sz +       \
++					cb_sequence_enc_sz +            \
++					1 + 3 +                         \
++					enc_nfs4_fh_sz + 4)
++#define NFS4_dec_cb_layout_sz		(cb_compound_dec_hdr_sz  +      \
++					cb_sequence_dec_sz +            \
++					op_dec_sz)
