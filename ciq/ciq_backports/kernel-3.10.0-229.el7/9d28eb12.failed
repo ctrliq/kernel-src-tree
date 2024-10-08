@@ -1,0 +1,129 @@
+dm bufio: change __GFP_IO to __GFP_FS in shrinker callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [md] dm-bufio: change __GFP_IO to __GFP_FS in shrinker callbacks (Mike Snitzer) [1156161]
+Rebuild_FUZZ: 98.31%
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 9d28eb12447ee08bb5d1e8bb3195cf20e1ecd1c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9d28eb12.failed
+
+The shrinker uses gfp flags to indicate what kind of operation can the
+driver wait for. If __GFP_IO flag is present, the driver can wait for
+block I/O operations, if __GFP_FS flag is present, the driver can wait on
+operations involving the filesystem.
+
+dm-bufio tested for __GFP_IO. However, dm-bufio can run on a loop block
+device that makes calls into the filesystem. If __GFP_IO is present and
+__GFP_FS isn't, dm-bufio could still block on filesystem operations if it
+runs on a loop block device.
+
+The change from __GFP_IO to __GFP_FS supposedly fixes one observed (though
+unreproducible) deadlock involving dm-bufio and loop device.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 9d28eb12447ee08bb5d1e8bb3195cf20e1ecd1c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-bufio.c
+diff --cc drivers/md/dm-bufio.c
+index 34a4845bf0ba,0be200b6dbf2..000000000000
+--- a/drivers/md/dm-bufio.c
++++ b/drivers/md/dm-bufio.c
+@@@ -1456,9 -1443,9 +1456,9 @@@ static int __cleanup_old_buffer(struct 
+  				unsigned long max_jiffies)
+  {
+  	if (jiffies - b->last_accessed < max_jiffies)
+ -		return 0;
+ +		return 1;
+  
+- 	if (!(gfp & __GFP_IO)) {
++ 	if (!(gfp & __GFP_FS)) {
+  		if (test_bit(B_READING, &b->state) ||
+  		    test_bit(B_WRITING, &b->state) ||
+  		    test_bit(B_DIRTY, &b->state))
+@@@ -1480,38 -1467,51 +1480,61 @@@ static void __scan(struct dm_bufio_clie
+  {
+  	int l;
+  	struct dm_buffer *b, *tmp;
+ -	long freed = 0;
+  
+  	for (l = 0; l < LIST_SIZE; l++) {
+ -		list_for_each_entry_safe_reverse(b, tmp, &c->lru[l], lru_list) {
+ -			freed += __cleanup_old_buffer(b, gfp_mask, 0);
+ -			if (!--nr_to_scan)
+ -				return freed;
+ -			dm_bufio_cond_resched();
+ -		}
+ +		list_for_each_entry_safe_reverse(b, tmp, &c->lru[l], lru_list)
+ +			if (!__cleanup_old_buffer(b, sc->gfp_mask, 0) &&
+ +			    !--nr_to_scan)
+ +				return;
+ +		dm_bufio_cond_resched();
+  	}
+ -	return freed;
+  }
+  
+ -static unsigned long
+ -dm_bufio_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ +static int shrink(struct shrinker *shrinker, struct shrink_control *sc)
+  {
+ -	struct dm_bufio_client *c;
+ -	unsigned long freed;
+ -
+ +	struct dm_bufio_client *c =
+ +	    container_of(shrinker, struct dm_bufio_client, shrinker);
+ +	unsigned long r;
+ +	unsigned long nr_to_scan = sc->nr_to_scan;
+ +
+++<<<<<<< HEAD
+ +	if (sc->gfp_mask & __GFP_IO)
+++=======
++ 	c = container_of(shrink, struct dm_bufio_client, shrinker);
++ 	if (sc->gfp_mask & __GFP_FS)
+++>>>>>>> 9d28eb12447e (dm bufio: change __GFP_IO to __GFP_FS in shrinker callbacks)
+  		dm_bufio_lock(c);
+  	else if (!dm_bufio_trylock(c))
+ -		return SHRINK_STOP;
+ +		return !nr_to_scan ? 0 : -1;
+ +
+ +	if (nr_to_scan)
+ +		__scan(c, nr_to_scan, sc);
+ +
+ +	r = c->n_buffers[LIST_CLEAN] + c->n_buffers[LIST_DIRTY];
+ +	if (r > INT_MAX)
+ +		r = INT_MAX;
+  
+ -	freed  = __scan(c, sc->nr_to_scan, sc->gfp_mask);
+  	dm_bufio_unlock(c);
+ -	return freed;
+ -}
+  
+++<<<<<<< HEAD
+ +	return r;
+++=======
++ static unsigned long
++ dm_bufio_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
++ {
++ 	struct dm_bufio_client *c;
++ 	unsigned long count;
++ 
++ 	c = container_of(shrink, struct dm_bufio_client, shrinker);
++ 	if (sc->gfp_mask & __GFP_FS)
++ 		dm_bufio_lock(c);
++ 	else if (!dm_bufio_trylock(c))
++ 		return 0;
++ 
++ 	count = c->n_buffers[LIST_CLEAN] + c->n_buffers[LIST_DIRTY];
++ 	dm_bufio_unlock(c);
++ 	return count;
+++>>>>>>> 9d28eb12447e (dm bufio: change __GFP_IO to __GFP_FS in shrinker callbacks)
+  }
+  
+  /*
+* Unmerged path drivers/md/dm-bufio.c
