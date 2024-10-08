@@ -1,0 +1,256 @@
+perf tools: Enable event_config terms to tracepoint events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author He Kuang <hekuang@huawei.com>
+commit e637d17757a10732fa5d573c18f20b3cd4d31245
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e637d177.failed
+
+This patch enables config terms for tracepoint perf events. Valid terms
+for tracepoint events are 'call-graph' and 'stack-size', so we can use
+different callgraph settings for each event and eliminate unnecessary
+overhead.
+
+Here is an example for using different call-graph config for each
+tracepoint.
+
+  $ perf record -e syscalls:sys_enter_write/call-graph=fp/
+                -e syscalls:sys_exit_write/call-graph=no/
+                dd if=/dev/zero of=test bs=4k count=10
+
+  $ perf report --stdio
+
+  #
+  # Total Lost Samples: 0
+  #
+  # Samples: 13  of event 'syscalls:sys_enter_write'
+  # Event count (approx.): 13
+  #
+  # Children      Self  Command  Shared Object       Symbol
+  # ........  ........  .......  ..................  ......................
+  #
+      76.92%    76.92%  dd       libpthread-2.20.so  [.] __write_nocancel
+                   |
+                   ---__write_nocancel
+
+      23.08%    23.08%  dd       libc-2.20.so        [.] write
+                   |
+                   ---write
+                      |
+                      |--33.33%-- 0x2031342820736574
+                      |
+                      |--33.33%-- 0xa6e69207364726f
+                      |
+                       --33.33%-- 0x34202c7320393039
+  ...
+
+  # Samples: 13  of event 'syscalls:sys_exit_write'
+  # Event count (approx.): 13
+  #
+  # Children      Self  Command  Shared Object       Symbol
+  # ........  ........  .......  ..................  ......................
+  #
+      76.92%    76.92%  dd       libpthread-2.20.so  [.] __write_nocancel
+      23.08%    23.08%  dd       libc-2.20.so        [.] write
+       7.69%     0.00%  dd       [unknown]           [.] 0x0a6e69207364726f
+       7.69%     0.00%  dd       [unknown]           [.] 0x2031342820736574
+       7.69%     0.00%  dd       [unknown]           [.] 0x34202c7320393039
+
+	Signed-off-by: He Kuang <hekuang@huawei.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Wang Nan <wangnan0@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1443412336-120050-4-git-send-email-hekuang@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit e637d17757a10732fa5d573c18f20b3cd4d31245)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/parse-events.c
+diff --cc tools/perf/util/parse-events.c
+index fd7bc5047cba,5ffb356cbcc6..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -643,9 -673,44 +650,46 @@@ do {									   
+  #undef CHECK_TYPE_VAL
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int config_term_pmu(struct perf_event_attr *attr,
++ 			   struct parse_events_term *term,
++ 			   struct parse_events_error *err)
++ {
++ 	if (term->type_term == PARSE_EVENTS__TERM_TYPE_USER)
++ 		/*
++ 		 * Always succeed for sysfs terms, as we dont know
++ 		 * at this point what type they need to have.
++ 		 */
++ 		return 0;
++ 	else
++ 		return config_term_common(attr, term, err);
++ }
++ 
++ static int config_term_tracepoint(struct perf_event_attr *attr,
++ 				  struct parse_events_term *term,
++ 				  struct parse_events_error *err)
++ {
++ 	switch (term->type_term) {
++ 	case PARSE_EVENTS__TERM_TYPE_CALLGRAPH:
++ 	case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
++ 		return config_term_common(attr, term, err);
++ 	default:
++ 		if (err) {
++ 			err->idx = term->err_term;
++ 			err->str = strdup("unknown term");
++ 			err->help = strdup("valid terms: call-graph,stack-size\n");
++ 		}
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e637d17757a1 (perf tools: Enable event_config terms to tracepoint events)
+  static int config_attr(struct perf_event_attr *attr,
+  		       struct list_head *head,
+ -		       struct parse_events_error *err,
+ -		       config_term_func_t config_term)
+ +		       struct parse_events_error *err)
+  {
+  	struct parse_events_term *term;
+  
+@@@ -656,6 -721,71 +700,74 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int get_config_terms(struct list_head *head_config,
++ 			    struct list_head *head_terms __maybe_unused)
++ {
++ #define ADD_CONFIG_TERM(__type, __name, __val)			\
++ do {								\
++ 	struct perf_evsel_config_term *__t;			\
++ 								\
++ 	__t = zalloc(sizeof(*__t));				\
++ 	if (!__t)						\
++ 		return -ENOMEM;					\
++ 								\
++ 	INIT_LIST_HEAD(&__t->list);				\
++ 	__t->type       = PERF_EVSEL__CONFIG_TERM_ ## __type;	\
++ 	__t->val.__name = __val;				\
++ 	list_add_tail(&__t->list, head_terms);			\
++ } while (0)
++ 
++ 	struct parse_events_term *term;
++ 
++ 	list_for_each_entry(term, head_config, list) {
++ 		switch (term->type_term) {
++ 		case PARSE_EVENTS__TERM_TYPE_SAMPLE_PERIOD:
++ 			ADD_CONFIG_TERM(PERIOD, period, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_SAMPLE_FREQ:
++ 			ADD_CONFIG_TERM(FREQ, freq, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_TIME:
++ 			ADD_CONFIG_TERM(TIME, time, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_CALLGRAPH:
++ 			ADD_CONFIG_TERM(CALLGRAPH, callgraph, term->val.str);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
++ 			ADD_CONFIG_TERM(STACK_USER, stack_user, term->val.num);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ #undef ADD_EVSEL_CONFIG
++ 	return 0;
++ }
++ 
++ int parse_events_add_tracepoint(struct list_head *list, int *idx,
++ 				char *sys, char *event,
++ 				struct parse_events_error *error,
++ 				struct list_head *head_config)
++ {
++ 	if (head_config) {
++ 		struct perf_event_attr attr;
++ 
++ 		if (config_attr(&attr, head_config, error,
++ 				config_term_tracepoint))
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (strpbrk(sys, "*?"))
++ 		return add_tracepoint_multi_sys(list, idx, sys, event,
++ 						error, head_config);
++ 	else
++ 		return add_tracepoint_event(list, idx, sys, event,
++ 					    error, head_config);
++ }
++ 
+++>>>>>>> e637d17757a1 (perf tools: Enable event_config terms to tracepoint events)
+  int parse_events_add_numeric(struct parse_events_evlist *data,
+  			     struct list_head *list,
+  			     u32 type, u64 config,
+* Unmerged path tools/perf/util/parse-events.c
+diff --git a/tools/perf/util/parse-events.h b/tools/perf/util/parse-events.h
+index 3500437920bb..a0361f0ee0d0 100644
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@ -115,7 +115,8 @@ int parse_events__modifier_group(struct list_head *list, char *event_mod);
+ int parse_events_name(struct list_head *list, char *name);
+ int parse_events_add_tracepoint(struct list_head *list, int *idx,
+ 				char *sys, char *event,
+-				struct parse_events_error *error);
++				struct parse_events_error *error,
++				struct list_head *head_config);
+ int parse_events_add_numeric(struct parse_events_evlist *data,
+ 			     struct list_head *list,
+ 			     u32 type, u64 config,
+diff --git a/tools/perf/util/parse-events.y b/tools/perf/util/parse-events.y
+index 1c598c2f8dfc..ae6af269f9c9 100644
+--- a/tools/perf/util/parse-events.y
++++ b/tools/perf/util/parse-events.y
+@@ -380,12 +380,30 @@ tracepoint_name
+ 	struct list_head *list;
+ 
+ 	ALLOC_LIST(list);
++	if (error)
++		error->idx = @1.first_column;
++
+ 	if (parse_events_add_tracepoint(list, &data->idx, $1.sys, $1.event,
+-					error)) {
+-		if (error)
+-			error->idx = @1.first_column;
++					error, NULL))
+ 		return -1;
+-	}
++
++	$$ = list;
++}
++|
++tracepoint_name '/' event_config '/'
++{
++	struct parse_events_evlist *data = _data;
++	struct parse_events_error *error = data->error;
++	struct list_head *list;
++
++	ALLOC_LIST(list);
++	if (error)
++		error->idx = @1.first_column;
++
++	if (parse_events_add_tracepoint(list, &data->idx, $1.sys, $1.event,
++					error, $3))
++		return -1;
++
+ 	$$ = list;
+ }
+ 
