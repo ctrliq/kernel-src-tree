@@ -1,0 +1,201 @@
+xfs: only run torn log write detection on dirty logs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 7f6aff3a29b08fc4234c8136eb1ac31b4897522c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7f6aff3a.failed
+
+XFS uses CRC verification over a sub-range of the head of the log to
+detect and handle torn writes. This torn log write detection currently
+runs unconditionally at mount time, regardless of whether the log is
+dirty or clean. This is problematic in cases where a filesystem might
+end up being moved across different, incompatible (i.e., opposite
+byte-endianness) architectures.
+
+The problem lies in the fact that log data is not necessarily written in
+an architecture independent format. For example, certain bits of data
+are written in native endian format. Further, the size of certain log
+data structures differs (i.e., struct xlog_rec_header) depending on the
+word size of the cpu. This leads to false positive crc verification
+errors and ultimately failed mounts when a cleanly unmounted filesystem
+is mounted on a system with an incompatible architecture from data that
+was written near the head of the log.
+
+Update the log head/tail discovery code to run torn write detection only
+when the log is not clean. This means something other than an unmount
+record resides at the head of the log and log recovery is imminent. It
+is a requirement to run log recovery on the same type of host that had
+written the content of the dirty log and therefore CRC failures are
+legitimate corruptions in that scenario.
+
+	Reported-by: Jan Beulich <JBeulich@suse.com>
+	Tested-by: Jan Beulich <JBeulich@suse.com>
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 7f6aff3a29b08fc4234c8136eb1ac31b4897522c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log_recover.c
+diff --cc fs/xfs/xfs_log_recover.c
+index 9a0cd900d9ce,e7aa82faa3d5..000000000000
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@@ -1270,97 -1376,58 +1270,142 @@@ xlog_find_tail
+  	*tail_blk = BLOCK_LSN(be64_to_cpu(rhead->h_tail_lsn));
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Trim the head block back to skip over torn records. We can have
+ +	 * multiple log I/Os in flight at any time, so we assume CRC failures
+ +	 * back through the previous several records are torn writes and skip
+ +	 * them.
+ +	 */
+ +	error = xlog_verify_head(log, head_blk, tail_blk, bp, &rhead_blk,
+ +				 &rhead, &wrapped);
+ +	if (error)
+ +		goto done;
+ +
+ +	/*
+ +	 * Reset log values according to the state of the log when we
+ +	 * crashed.  In the case where head_blk == 0, we bump curr_cycle
+ +	 * one because the next write starts a new cycle rather than
+ +	 * continuing the cycle of the last good log record.  At this
+ +	 * point we have guaranteed that all partial log records have been
+ +	 * accounted for.  Therefore, we know that the last good log record
+ +	 * written was complete and ended exactly on the end boundary
+ +	 * of the physical log.
+++=======
++ 	 * Set the log state based on the current head record.
+++>>>>>>> 7f6aff3a29b0 (xfs: only run torn log write detection on dirty logs)
+  	 */
+ -	xlog_set_state(log, *head_blk, rhead, rhead_blk, wrapped);
+ -	tail_lsn = atomic64_read(&log->l_tail_lsn);
+ +	log->l_prev_block = rhead_blk;
+ +	log->l_curr_block = (int)*head_blk;
+ +	log->l_curr_cycle = be32_to_cpu(rhead->h_cycle);
+ +	if (wrapped)
+ +		log->l_curr_cycle++;
+ +	atomic64_set(&log->l_tail_lsn, be64_to_cpu(rhead->h_tail_lsn));
+ +	atomic64_set(&log->l_last_sync_lsn, be64_to_cpu(rhead->h_lsn));
+ +	xlog_assign_grant_head(&log->l_reserve_head.grant, log->l_curr_cycle,
+ +					BBTOB(log->l_curr_block));
+ +	xlog_assign_grant_head(&log->l_write_head.grant, log->l_curr_cycle,
+ +					BBTOB(log->l_curr_block));
+  
+  	/*
+ -	 * Look for an unmount record at the head of the log. This sets the log
+ -	 * state to determine whether recovery is necessary.
+ +	 * Look for unmount record.  If we find it, then we know there
+ +	 * was a clean unmount.  Since 'i' could be the last block in
+ +	 * the physical log, we convert to a log block before comparing
+ +	 * to the head_blk.
+ +	 *
+ +	 * Save the current tail lsn to use to pass to
+ +	 * xlog_clear_stale_blocks() below.  We won't want to clear the
+ +	 * unmount record if there is one, so we pass the lsn of the
+ +	 * unmount record rather than the block after it.
+  	 */
+ -	error = xlog_check_unmount_rec(log, head_blk, tail_blk, rhead,
+ -				       rhead_blk, bp, &clean);
+ -	if (error)
+ -		goto done;
+ +	if (xfs_sb_version_haslogv2(&log->l_mp->m_sb)) {
+ +		int	h_size = be32_to_cpu(rhead->h_size);
+ +		int	h_version = be32_to_cpu(rhead->h_version);
+ +
+ +		if ((h_version & XLOG_VERSION_2) &&
+ +		    (h_size > XLOG_HEADER_CYCLE_SIZE)) {
+ +			hblks = h_size / XLOG_HEADER_CYCLE_SIZE;
+ +			if (h_size % XLOG_HEADER_CYCLE_SIZE)
+ +				hblks++;
+ +		} else {
+ +			hblks = 1;
+ +		}
+ +	} else {
+ +		hblks = 1;
+ +	}
+ +	after_umount_blk = rhead_blk + hblks + BTOBB(be32_to_cpu(rhead->h_len));
+ +	after_umount_blk = do_mod(after_umount_blk, log->l_logBBsize);
+ +	tail_lsn = atomic64_read(&log->l_tail_lsn);
+ +	if (*head_blk == after_umount_blk &&
+ +	    be32_to_cpu(rhead->h_num_logops) == 1) {
+ +		umount_data_blk = rhead_blk + hblks;
+ +		umount_data_blk = do_mod(umount_data_blk, log->l_logBBsize);
+ +		error = xlog_bread(log, umount_data_blk, 1, bp, &offset);
+ +		if (error)
+ +			goto done;
+ +
+ +		op_head = (xlog_op_header_t *)offset;
+ +		if (op_head->oh_flags & XLOG_UNMOUNT_TRANS) {
+ +			/*
+ +			 * Set tail and last sync so that newly written
+ +			 * log records will point recovery to after the
+ +			 * current unmount record.
+ +			 */
+ +			xlog_assign_atomic_lsn(&log->l_tail_lsn,
+ +					log->l_curr_cycle, after_umount_blk);
+ +			xlog_assign_atomic_lsn(&log->l_last_sync_lsn,
+ +					log->l_curr_cycle, after_umount_blk);
+ +			*tail_blk = after_umount_blk;
+  
+++<<<<<<< HEAD
+ +			/*
+ +			 * Note that the unmount was clean. If the unmount
+ +			 * was not clean, we need to know this to rebuild the
+ +			 * superblock counters from the perag headers if we
+ +			 * have a filesystem using non-persistent counters.
+ +			 */
+ +			log->l_mp->m_flags |= XFS_MOUNT_WAS_CLEAN;
+ +		}
+ +	}
+++=======
++ 	/*
++ 	 * Verify the log head if the log is not clean (e.g., we have anything
++ 	 * but an unmount record at the head). This uses CRC verification to
++ 	 * detect and trim torn writes. If discovered, CRC failures are
++ 	 * considered torn writes and the log head is trimmed accordingly.
++ 	 *
++ 	 * Note that we can only run CRC verification when the log is dirty
++ 	 * because there's no guarantee that the log data behind an unmount
++ 	 * record is compatible with the current architecture.
++ 	 */
++ 	if (!clean) {
++ 		xfs_daddr_t	orig_head = *head_blk;
++ 
++ 		error = xlog_verify_head(log, head_blk, tail_blk, bp,
++ 					 &rhead_blk, &rhead, &wrapped);
++ 		if (error)
++ 			goto done;
++ 
++ 		/* update in-core state again if the head changed */
++ 		if (*head_blk != orig_head) {
++ 			xlog_set_state(log, *head_blk, rhead, rhead_blk,
++ 				       wrapped);
++ 			tail_lsn = atomic64_read(&log->l_tail_lsn);
++ 			error = xlog_check_unmount_rec(log, head_blk, tail_blk,
++ 						       rhead, rhead_blk, bp,
++ 						       &clean);
++ 			if (error)
++ 				goto done;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Note that the unmount was clean. If the unmount was not clean, we
++ 	 * need to know this to rebuild the superblock counters from the perag
++ 	 * headers if we have a filesystem using non-persistent counters.
++ 	 */
++ 	if (clean)
++ 		log->l_mp->m_flags |= XFS_MOUNT_WAS_CLEAN;
+++>>>>>>> 7f6aff3a29b0 (xfs: only run torn log write detection on dirty logs)
+  
+  	/*
+  	 * Make sure that there are no blocks in front of the head
+* Unmerged path fs/xfs/xfs_log_recover.c
