@@ -1,0 +1,1754 @@
+mm: dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [mm] dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE (Andrea Arcangeli) [1135506]
+Rebuild_FUZZ: 96.49%
+commit-author Sasha Levin <sasha.levin@oracle.com>
+commit 309381feaee564281c3d9e90fbca8963bb7428ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/309381fe.failed
+
+Most of the VM_BUG_ON assertions are performed on a page.  Usually, when
+one of these assertions fails we'll get a BUG_ON with a call stack and
+the registers.
+
+I've recently noticed based on the requests to add a small piece of code
+that dumps the page to various VM_BUG_ON sites that the page dump is
+quite useful to people debugging issues in mm.
+
+This patch adds a VM_BUG_ON_PAGE(cond, page) which beyond doing what
+VM_BUG_ON() does, also dumps the page before executing the actual
+BUG_ON.
+
+[akpm@linux-foundation.org: fix up includes]
+	Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 309381feaee564281c3d9e90fbca8963bb7428ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/filemap.c
+#	mm/hugetlb.c
+#	mm/ksm.c
+#	mm/mlock.c
+#	mm/rmap.c
+diff --cc mm/filemap.c
+index 70c995e4fb1c,7a7f3e0db738..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -605,8 -459,43 +605,48 @@@ out
+  int add_to_page_cache_locked(struct page *page, struct address_space *mapping,
+  		pgoff_t offset, gfp_t gfp_mask)
+  {
+++<<<<<<< HEAD
+ +	return __add_to_page_cache_locked(page, mapping, offset,
+ +					  gfp_mask, NULL);
+++=======
++ 	int error;
++ 
++ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
++ 	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
++ 
++ 	error = mem_cgroup_cache_charge(page, current->mm,
++ 					gfp_mask & GFP_RECLAIM_MASK);
++ 	if (error)
++ 		return error;
++ 
++ 	error = radix_tree_maybe_preload(gfp_mask & ~__GFP_HIGHMEM);
++ 	if (error) {
++ 		mem_cgroup_uncharge_cache_page(page);
++ 		return error;
++ 	}
++ 
++ 	page_cache_get(page);
++ 	page->mapping = mapping;
++ 	page->index = offset;
++ 
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	error = radix_tree_insert(&mapping->page_tree, offset, page);
++ 	radix_tree_preload_end();
++ 	if (unlikely(error))
++ 		goto err_insert;
++ 	mapping->nrpages++;
++ 	__inc_zone_page_state(page, NR_FILE_PAGES);
++ 	spin_unlock_irq(&mapping->tree_lock);
++ 	trace_mm_filemap_add_to_page_cache(page);
++ 	return 0;
++ err_insert:
++ 	page->mapping = NULL;
++ 	/* Leave page->index set: truncation relies upon it */
++ 	spin_unlock_irq(&mapping->tree_lock);
++ 	mem_cgroup_uncharge_cache_page(page);
++ 	page_cache_release(page);
++ 	return error;
+++>>>>>>> 309381feaee5 (mm: dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE)
+  }
+  EXPORT_SYMBOL(add_to_page_cache_locked);
+  
+diff --cc mm/hugetlb.c
+index e016d75887c3,c01cb9fedb18..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -638,10 -581,10 +638,10 @@@ static void update_and_free_page(struc
+  	for (i = 0; i < pages_per_huge_page(h); i++) {
+  		page[i].flags &= ~(1 << PG_locked | 1 << PG_error |
+  				1 << PG_referenced | 1 << PG_dirty |
+ -				1 << PG_active | 1 << PG_reserved |
+ -				1 << PG_private | 1 << PG_writeback);
+ +				1 << PG_active | 1 << PG_private |
+ +				1 << PG_writeback);
+  	}
+- 	VM_BUG_ON(hugetlb_cgroup_from_page(page));
++ 	VM_BUG_ON_PAGE(hugetlb_cgroup_from_page(page), page);
+  	set_compound_page_dtor(page, NULL);
+  	set_page_refcounted(page);
+  	arch_release_hugepage(page);
+@@@ -3229,3 -3500,45 +3229,48 @@@ int dequeue_hwpoisoned_huge_page(struc
+  	return ret;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ bool isolate_huge_page(struct page *page, struct list_head *list)
++ {
++ 	VM_BUG_ON_PAGE(!PageHead(page), page);
++ 	if (!get_page_unless_zero(page))
++ 		return false;
++ 	spin_lock(&hugetlb_lock);
++ 	list_move_tail(&page->lru, list);
++ 	spin_unlock(&hugetlb_lock);
++ 	return true;
++ }
++ 
++ void putback_active_hugepage(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(!PageHead(page), page);
++ 	spin_lock(&hugetlb_lock);
++ 	list_move_tail(&page->lru, &(page_hstate(page))->hugepage_activelist);
++ 	spin_unlock(&hugetlb_lock);
++ 	put_page(page);
++ }
++ 
++ bool is_hugepage_active(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(!PageHuge(page), page);
++ 	/*
++ 	 * This function can be called for a tail page because the caller,
++ 	 * scan_movable_pages, scans through a given pfn-range which typically
++ 	 * covers one memory block. In systems using gigantic hugepage (1GB
++ 	 * for x86_64,) a hugepage is larger than a memory block, and we don't
++ 	 * support migrating such large hugepages for now, so return false
++ 	 * when called for tail pages.
++ 	 */
++ 	if (PageTail(page))
++ 		return false;
++ 	/*
++ 	 * Refcount of a hwpoisoned hugepages is 1, but they are not active,
++ 	 * so we should return false for them.
++ 	 */
++ 	if (unlikely(PageHWPoison(page)))
++ 		return false;
++ 	return page_count(page) > 0;
++ }
+++>>>>>>> 309381feaee5 (mm: dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE)
+diff --cc mm/ksm.c
+index b6afe0c440d8,f91ddf5c3688..000000000000
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@@ -1953,60 -1898,13 +1953,70 @@@ int try_to_unmap_ksm(struct page *page
+  	int ret = SWAP_AGAIN;
+  	int search_new_forks = 0;
+  
+++<<<<<<< HEAD
+ +	VM_BUG_ON(!PageKsm(page));
+ +	VM_BUG_ON(!PageLocked(page));
+ +
+ +	stable_node = page_stable_node(page);
+ +	if (!stable_node)
+ +		return SWAP_FAIL;
+ +again:
+ +	hlist_for_each_entry(rmap_item, &stable_node->hlist, hlist) {
+ +		struct anon_vma *anon_vma = rmap_item->anon_vma;
+ +		struct anon_vma_chain *vmac;
+ +		struct vm_area_struct *vma;
+ +
+ +		anon_vma_lock_read(anon_vma);
+ +		anon_vma_interval_tree_foreach(vmac, &anon_vma->rb_root,
+ +					       0, ULONG_MAX) {
+ +			vma = vmac->vma;
+ +			if (rmap_item->address < vma->vm_start ||
+ +			    rmap_item->address >= vma->vm_end)
+ +				continue;
+ +			/*
+ +			 * Initially we examine only the vma which covers this
+ +			 * rmap_item; but later, if there is still work to do,
+ +			 * we examine covering vmas in other mms: in case they
+ +			 * were forked from the original since ksmd passed.
+ +			 */
+ +			if ((rmap_item->mm == vma->vm_mm) == search_new_forks)
+ +				continue;
+ +
+ +			ret = try_to_unmap_one(page, vma,
+ +					rmap_item->address, flags);
+ +			if (ret != SWAP_AGAIN || !page_mapped(page)) {
+ +				anon_vma_unlock_read(anon_vma);
+ +				goto out;
+ +			}
+ +		}
+ +		anon_vma_unlock_read(anon_vma);
+ +	}
+ +	if (!search_new_forks++)
+ +		goto again;
+ +out:
+ +	return ret;
+ +}
+ +
+ +#ifdef CONFIG_MIGRATION
+ +int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
+ +		  struct vm_area_struct *, unsigned long, void *), void *arg)
+ +{
+ +	struct stable_node *stable_node;
+ +	struct rmap_item *rmap_item;
+ +	int ret = SWAP_AGAIN;
+ +	int search_new_forks = 0;
+ +
+ +	VM_BUG_ON(!PageKsm(page));
+ +	VM_BUG_ON(!PageLocked(page));
+++=======
++ 	VM_BUG_ON_PAGE(!PageKsm(page), page);
++ 
++ 	/*
++ 	 * Rely on the page lock to protect against concurrent modifications
++ 	 * to that page's node of the stable tree.
++ 	 */
++ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+++>>>>>>> 309381feaee5 (mm: dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE)
+  
+  	stable_node = page_stable_node(page);
+  	if (!stable_node)
+diff --cc mm/mlock.c
+index 713e462c0776,4e1a68162285..000000000000
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@@ -212,6 -265,190 +212,193 @@@ static int __mlock_posix_error_return(l
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Prepare page for fast batched LRU putback via putback_lru_evictable_pagevec()
++  *
++  * The fast path is available only for evictable pages with single mapping.
++  * Then we can bypass the per-cpu pvec and get better performance.
++  * when mapcount > 1 we need try_to_munlock() which can fail.
++  * when !page_evictable(), we need the full redo logic of putback_lru_page to
++  * avoid leaving evictable page in unevictable list.
++  *
++  * In case of success, @page is added to @pvec and @pgrescued is incremented
++  * in case that the page was previously unevictable. @page is also unlocked.
++  */
++ static bool __putback_lru_fast_prepare(struct page *page, struct pagevec *pvec,
++ 		int *pgrescued)
++ {
++ 	VM_BUG_ON_PAGE(PageLRU(page), page);
++ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
++ 
++ 	if (page_mapcount(page) <= 1 && page_evictable(page)) {
++ 		pagevec_add(pvec, page);
++ 		if (TestClearPageUnevictable(page))
++ 			(*pgrescued)++;
++ 		unlock_page(page);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Putback multiple evictable pages to the LRU
++  *
++  * Batched putback of evictable pages that bypasses the per-cpu pvec. Some of
++  * the pages might have meanwhile become unevictable but that is OK.
++  */
++ static void __putback_lru_fast(struct pagevec *pvec, int pgrescued)
++ {
++ 	count_vm_events(UNEVICTABLE_PGMUNLOCKED, pagevec_count(pvec));
++ 	/*
++ 	 *__pagevec_lru_add() calls release_pages() so we don't call
++ 	 * put_page() explicitly
++ 	 */
++ 	__pagevec_lru_add(pvec);
++ 	count_vm_events(UNEVICTABLE_PGRESCUED, pgrescued);
++ }
++ 
++ /*
++  * Munlock a batch of pages from the same zone
++  *
++  * The work is split to two main phases. First phase clears the Mlocked flag
++  * and attempts to isolate the pages, all under a single zone lru lock.
++  * The second phase finishes the munlock only for pages where isolation
++  * succeeded.
++  *
++  * Note that the pagevec may be modified during the process.
++  */
++ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
++ {
++ 	int i;
++ 	int nr = pagevec_count(pvec);
++ 	int delta_munlocked;
++ 	struct pagevec pvec_putback;
++ 	int pgrescued = 0;
++ 
++ 	pagevec_init(&pvec_putback, 0);
++ 
++ 	/* Phase 1: page isolation */
++ 	spin_lock_irq(&zone->lru_lock);
++ 	for (i = 0; i < nr; i++) {
++ 		struct page *page = pvec->pages[i];
++ 
++ 		if (TestClearPageMlocked(page)) {
++ 			/*
++ 			 * We already have pin from follow_page_mask()
++ 			 * so we can spare the get_page() here.
++ 			 */
++ 			if (__munlock_isolate_lru_page(page, false))
++ 				continue;
++ 			else
++ 				__munlock_isolation_failed(page);
++ 		}
++ 
++ 		/*
++ 		 * We won't be munlocking this page in the next phase
++ 		 * but we still need to release the follow_page_mask()
++ 		 * pin. We cannot do it under lru_lock however. If it's
++ 		 * the last pin, __page_cache_release() would deadlock.
++ 		 */
++ 		pagevec_add(&pvec_putback, pvec->pages[i]);
++ 		pvec->pages[i] = NULL;
++ 	}
++ 	delta_munlocked = -nr + pagevec_count(&pvec_putback);
++ 	__mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
++ 	spin_unlock_irq(&zone->lru_lock);
++ 
++ 	/* Now we can release pins of pages that we are not munlocking */
++ 	pagevec_release(&pvec_putback);
++ 
++ 	/* Phase 2: page munlock */
++ 	for (i = 0; i < nr; i++) {
++ 		struct page *page = pvec->pages[i];
++ 
++ 		if (page) {
++ 			lock_page(page);
++ 			if (!__putback_lru_fast_prepare(page, &pvec_putback,
++ 					&pgrescued)) {
++ 				/*
++ 				 * Slow path. We don't want to lose the last
++ 				 * pin before unlock_page()
++ 				 */
++ 				get_page(page); /* for putback_lru_page() */
++ 				__munlock_isolated_page(page);
++ 				unlock_page(page);
++ 				put_page(page); /* from follow_page_mask() */
++ 			}
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Phase 3: page putback for pages that qualified for the fast path
++ 	 * This will also call put_page() to return pin from follow_page_mask()
++ 	 */
++ 	if (pagevec_count(&pvec_putback))
++ 		__putback_lru_fast(&pvec_putback, pgrescued);
++ }
++ 
++ /*
++  * Fill up pagevec for __munlock_pagevec using pte walk
++  *
++  * The function expects that the struct page corresponding to @start address is
++  * a non-TPH page already pinned and in the @pvec, and that it belongs to @zone.
++  *
++  * The rest of @pvec is filled by subsequent pages within the same pmd and same
++  * zone, as long as the pte's are present and vm_normal_page() succeeds. These
++  * pages also get pinned.
++  *
++  * Returns the address of the next page that should be scanned. This equals
++  * @start + PAGE_SIZE when no page could be added by the pte walk.
++  */
++ static unsigned long __munlock_pagevec_fill(struct pagevec *pvec,
++ 		struct vm_area_struct *vma, int zoneid,	unsigned long start,
++ 		unsigned long end)
++ {
++ 	pte_t *pte;
++ 	spinlock_t *ptl;
++ 
++ 	/*
++ 	 * Initialize pte walk starting at the already pinned page where we
++ 	 * are sure that there is a pte, as it was pinned under the same
++ 	 * mmap_sem write op.
++ 	 */
++ 	pte = get_locked_pte(vma->vm_mm, start,	&ptl);
++ 	/* Make sure we do not cross the page table boundary */
++ 	end = pgd_addr_end(start, end);
++ 	end = pud_addr_end(start, end);
++ 	end = pmd_addr_end(start, end);
++ 
++ 	/* The page next to the pinned page is the first we will try to get */
++ 	start += PAGE_SIZE;
++ 	while (start < end) {
++ 		struct page *page = NULL;
++ 		pte++;
++ 		if (pte_present(*pte))
++ 			page = vm_normal_page(vma, start, *pte);
++ 		/*
++ 		 * Break if page could not be obtained or the page's node+zone does not
++ 		 * match
++ 		 */
++ 		if (!page || page_zone_id(page) != zoneid)
++ 			break;
++ 
++ 		get_page(page);
++ 		/*
++ 		 * Increase the address that will be returned *before* the
++ 		 * eventual break due to pvec becoming full by adding the page
++ 		 */
++ 		start += PAGE_SIZE;
++ 		if (pagevec_add(pvec, page) == 0)
++ 			break;
++ 	}
++ 	pte_unmap_unlock(pte, ptl);
++ 	return start;
++ }
++ 
++ /*
+++>>>>>>> 309381feaee5 (mm: dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE)
+   * munlock_vma_pages_range() - munlock all pages in the vma range.'
+   * @vma - vma containing range to be munlock()ed.
+   * @start - start address in @vma of the range
+diff --cc mm/rmap.c
+index 1f95c591e5eb,2dcd3353c3f6..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1623,16 -1473,29 +1623,20 @@@ out
+  int try_to_unmap(struct page *page, enum ttu_flags flags)
+  {
+  	int ret;
+ -	struct rmap_walk_control rwc = {
+ -		.rmap_one = try_to_unmap_one,
+ -		.arg = (void *)flags,
+ -		.done = page_not_mapped,
+ -		.file_nonlinear = try_to_unmap_nonlinear,
+ -		.anon_lock = page_lock_anon_vma_read,
+ -	};
+  
+++<<<<<<< HEAD
+ +	BUG_ON(!PageLocked(page));
+ +	VM_BUG_ON(!PageHuge(page) && PageTransHuge(page));
+++=======
++ 	VM_BUG_ON_PAGE(!PageHuge(page) && PageTransHuge(page), page);
+++>>>>>>> 309381feaee5 (mm: dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE)
+  
+ -	/*
+ -	 * During exec, a temporary VMA is setup and later moved.
+ -	 * The VMA is moved under the anon_vma lock but not the
+ -	 * page tables leading to a race where migration cannot
+ -	 * find the migration ptes. Rather than increasing the
+ -	 * locking requirements of exec(), migration skips
+ -	 * temporary VMAs until after exec() completes.
+ -	 */
+ -	if (flags & TTU_MIGRATION && !PageKsm(page) && PageAnon(page))
+ -		rwc.invalid_vma = invalid_migration_vma;
+ -
+ -	ret = rmap_walk(page, &rwc);
+ -
+ +	if (unlikely(PageKsm(page)))
+ +		ret = try_to_unmap_ksm(page, flags);
+ +	else if (PageAnon(page))
+ +		ret = try_to_unmap_anon(page, flags);
+ +	else
+ +		ret = try_to_unmap_file(page, flags);
+  	if (ret != SWAP_MLOCK && !page_mapped(page))
+  		ret = SWAP_SUCCESS;
+  	return ret;
+@@@ -1655,14 -1518,25 +1659,33 @@@
+   */
+  int try_to_munlock(struct page *page)
+  {
+++<<<<<<< HEAD
+ +	VM_BUG_ON(!PageLocked(page) || PageLRU(page));
+++=======
++ 	int ret;
++ 	struct rmap_walk_control rwc = {
++ 		.rmap_one = try_to_unmap_one,
++ 		.arg = (void *)TTU_MUNLOCK,
++ 		.done = page_not_mapped,
++ 		/*
++ 		 * We don't bother to try to find the munlocked page in
++ 		 * nonlinears. It's costly. Instead, later, page reclaim logic
++ 		 * may call try_to_unmap() and recover PG_mlocked lazily.
++ 		 */
++ 		.file_nonlinear = NULL,
++ 		.anon_lock = page_lock_anon_vma_read,
++ 
++ 	};
++ 
++ 	VM_BUG_ON_PAGE(!PageLocked(page) || PageLRU(page), page);
+++>>>>>>> 309381feaee5 (mm: dump page when hitting a VM_BUG_ON using VM_BUG_ON_PAGE)
+  
+ -	ret = rmap_walk(page, &rwc);
+ -	return ret;
+ +	if (unlikely(PageKsm(page)))
+ +		return try_to_unmap_ksm(page, TTU_MUNLOCK);
+ +	else if (PageAnon(page))
+ +		return try_to_unmap_anon(page, TTU_MUNLOCK);
+ +	else
+ +		return try_to_unmap_file(page, TTU_MUNLOCK);
+  }
+  
+  void __put_anon_vma(struct anon_vma *anon_vma)
+diff --git a/arch/x86/mm/gup.c b/arch/x86/mm/gup.c
+index 0596e8e0cc19..207d9aef662d 100644
+--- a/arch/x86/mm/gup.c
++++ b/arch/x86/mm/gup.c
+@@ -108,8 +108,8 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
+ 
+ static inline void get_head_page_multiple(struct page *page, int nr)
+ {
+-	VM_BUG_ON(page != compound_head(page));
+-	VM_BUG_ON(page_count(page) == 0);
++	VM_BUG_ON_PAGE(page != compound_head(page), page);
++	VM_BUG_ON_PAGE(page_count(page) == 0, page);
+ 	atomic_add(nr, &page->_count);
+ 	SetPageReferenced(page);
+ }
+@@ -135,7 +135,7 @@ static noinline int gup_huge_pmd(pmd_t pmd, unsigned long addr,
+ 	head = pte_page(pte);
+ 	page = head + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
+ 	do {
+-		VM_BUG_ON(compound_head(page) != head);
++		VM_BUG_ON_PAGE(compound_head(page) != head, page);
+ 		pages[*nr] = page;
+ 		if (PageTail(page))
+ 			get_huge_page_tail(page);
+@@ -212,7 +212,7 @@ static noinline int gup_huge_pud(pud_t pud, unsigned long addr,
+ 	head = pte_page(pte);
+ 	page = head + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
+ 	do {
+-		VM_BUG_ON(compound_head(page) != head);
++		VM_BUG_ON_PAGE(compound_head(page) != head, page);
+ 		pages[*nr] = page;
+ 		if (PageTail(page))
+ 			get_huge_page_tail(page);
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index f29149ee6121..d660c8e6bc8c 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -1,6 +1,7 @@
+ #ifndef __LINUX_GFP_H
+ #define __LINUX_GFP_H
+ 
++#include <linux/mmdebug.h>
+ #include <linux/mmzone.h>
+ #include <linux/stddef.h>
+ #include <linux/linkage.h>
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 1accdf2315a1..655221ca60c5 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -2,6 +2,7 @@
+ #define _LINUX_HUGETLB_H
+ 
+ #include <linux/mm_types.h>
++#include <linux/mmdebug.h>
+ #include <linux/fs.h>
+ #include <linux/hugetlb_inline.h>
+ #include <linux/cgroup.h>
+@@ -340,7 +341,7 @@ static inline pte_t arch_make_huge_pte(pte_t entry, struct vm_area_struct *vma,
+ 
+ static inline struct hstate *page_hstate(struct page *page)
+ {
+-	VM_BUG_ON(!PageHuge(page));
++	VM_BUG_ON_PAGE(!PageHuge(page), page);
+ 	return size_to_hstate(PAGE_SIZE << compound_order(page));
+ }
+ 
+diff --git a/include/linux/hugetlb_cgroup.h b/include/linux/hugetlb_cgroup.h
+index ce8217f7b5c2..787bba3bf552 100644
+--- a/include/linux/hugetlb_cgroup.h
++++ b/include/linux/hugetlb_cgroup.h
+@@ -15,6 +15,7 @@
+ #ifndef _LINUX_HUGETLB_CGROUP_H
+ #define _LINUX_HUGETLB_CGROUP_H
+ 
++#include <linux/mmdebug.h>
+ #include <linux/res_counter.h>
+ 
+ struct hugetlb_cgroup;
+@@ -28,7 +29,7 @@ struct hugetlb_cgroup;
+ 
+ static inline struct hugetlb_cgroup *hugetlb_cgroup_from_page(struct page *page)
+ {
+-	VM_BUG_ON(!PageHuge(page));
++	VM_BUG_ON_PAGE(!PageHuge(page), page);
+ 
+ 	if (compound_order(page) < HUGETLB_CGROUP_MIN_ORDER)
+ 		return NULL;
+@@ -38,7 +39,7 @@ static inline struct hugetlb_cgroup *hugetlb_cgroup_from_page(struct page *page)
+ static inline
+ int set_hugetlb_cgroup(struct page *page, struct hugetlb_cgroup *h_cg)
+ {
+-	VM_BUG_ON(!PageHuge(page));
++	VM_BUG_ON_PAGE(!PageHuge(page), page);
+ 
+ 	if (compound_order(page) < HUGETLB_CGROUP_MIN_ORDER)
+ 		return -1;
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index c26b898c8bfd..6f4945903f32 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -5,6 +5,7 @@
+ 
+ #ifdef __KERNEL__
+ 
++#include <linux/mmdebug.h>
+ #include <linux/gfp.h>
+ #include <linux/bug.h>
+ #include <linux/list.h>
+@@ -292,7 +293,7 @@ static inline int get_freepage_migratetype(struct page *page)
+  */
+ static inline int put_page_testzero(struct page *page)
+ {
+-	VM_BUG_ON(atomic_read(&page->_count) == 0);
++	VM_BUG_ON_PAGE(atomic_read(&page->_count) == 0, page);
+ 	return atomic_dec_and_test(&page->_count);
+ }
+ 
+@@ -339,7 +340,7 @@ static inline int is_vmalloc_or_module_addr(const void *x)
+ static inline void compound_lock(struct page *page)
+ {
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-	VM_BUG_ON(PageSlab(page));
++	VM_BUG_ON_PAGE(PageSlab(page), page);
+ 	bit_spin_lock(PG_compound_lock, &page->flags);
+ #endif
+ }
+@@ -347,7 +348,7 @@ static inline void compound_lock(struct page *page)
+ static inline void compound_unlock(struct page *page)
+ {
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-	VM_BUG_ON(PageSlab(page));
++	VM_BUG_ON_PAGE(PageSlab(page), page);
+ 	bit_spin_unlock(PG_compound_lock, &page->flags);
+ #endif
+ }
+@@ -422,7 +423,7 @@ static inline bool __compound_tail_refcounted(struct page *page)
+  */
+ static inline bool compound_tail_refcounted(struct page *page)
+ {
+-	VM_BUG_ON(!PageHead(page));
++	VM_BUG_ON_PAGE(!PageHead(page), page);
+ 	return __compound_tail_refcounted(page);
+ }
+ 
+@@ -431,9 +432,9 @@ static inline void get_huge_page_tail(struct page *page)
+ 	/*
+ 	 * __split_huge_page_refcount() cannot run from under us.
+ 	 */
+-	VM_BUG_ON(!PageTail(page));
+-	VM_BUG_ON(page_mapcount(page) < 0);
+-	VM_BUG_ON(atomic_read(&page->_count) != 0);
++	VM_BUG_ON_PAGE(!PageTail(page), page);
++	VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
++	VM_BUG_ON_PAGE(atomic_read(&page->_count) != 0, page);
+ 	if (compound_tail_refcounted(page->first_page))
+ 		atomic_inc(&page->_mapcount);
+ }
+@@ -449,7 +450,7 @@ static inline void get_page(struct page *page)
+ 	 * Getting a normal page or the head of a compound page
+ 	 * requires to already have an elevated page->_count.
+ 	 */
+-	VM_BUG_ON(atomic_read(&page->_count) <= 0);
++	VM_BUG_ON_PAGE(atomic_read(&page->_count) <= 0, page);
+ 	atomic_inc(&page->_count);
+ }
+ 
+@@ -486,13 +487,13 @@ static inline int PageBuddy(struct page *page)
+ 
+ static inline void __SetPageBuddy(struct page *page)
+ {
+-	VM_BUG_ON(atomic_read(&page->_mapcount) != -1);
++	VM_BUG_ON_PAGE(atomic_read(&page->_mapcount) != -1, page);
+ 	atomic_set(&page->_mapcount, PAGE_BUDDY_MAPCOUNT_VALUE);
+ }
+ 
+ static inline void __ClearPageBuddy(struct page *page)
+ {
+-	VM_BUG_ON(!PageBuddy(page));
++	VM_BUG_ON_PAGE(!PageBuddy(page), page);
+ 	atomic_set(&page->_mapcount, -1);
+ }
+ 
+@@ -1378,7 +1379,7 @@ static inline bool ptlock_init(struct page *page)
+ 	 * slab code uses page->slab_cache and page->first_page (for tail
+ 	 * pages), which share storage with page->ptl.
+ 	 */
+-	VM_BUG_ON(*(unsigned long *)&page->ptl);
++	VM_BUG_ON_PAGE(*(unsigned long *)&page->ptl, page);
+ 	if (!ptlock_alloc(page))
+ 		return false;
+ 	spin_lock_init(ptlock_ptr(page));
+@@ -1469,7 +1470,7 @@ static inline bool pgtable_pmd_page_ctor(struct page *page)
+ static inline void pgtable_pmd_page_dtor(struct page *page)
+ {
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-	VM_BUG_ON(page->pmd_huge_pte);
++	VM_BUG_ON_PAGE(page->pmd_huge_pte, page);
+ #endif
+ 	ptlock_free(page);
+ }
+@@ -1997,10 +1998,6 @@ extern void shake_page(struct page *p, int access);
+ extern atomic_long_t num_poisoned_pages;
+ extern int soft_offline_page(struct page *page, int flags);
+ 
+-extern void dump_page(struct page *page, char *reason);
+-extern void dump_page_badflags(struct page *page, char *reason,
+-			       unsigned long badflags);
+-
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_HUGETLBFS)
+ extern void clear_huge_page(struct page *page,
+ 			    unsigned long addr,
+diff --git a/include/linux/mmdebug.h b/include/linux/mmdebug.h
+index 580bd587d916..5042c036dda9 100644
+--- a/include/linux/mmdebug.h
++++ b/include/linux/mmdebug.h
+@@ -1,10 +1,19 @@
+ #ifndef LINUX_MM_DEBUG_H
+ #define LINUX_MM_DEBUG_H 1
+ 
++struct page;
++
++extern void dump_page(struct page *page, char *reason);
++extern void dump_page_badflags(struct page *page, char *reason,
++			       unsigned long badflags);
++
+ #ifdef CONFIG_DEBUG_VM
+ #define VM_BUG_ON(cond) BUG_ON(cond)
++#define VM_BUG_ON_PAGE(cond, page) \
++	do { if (unlikely(cond)) { dump_page(page, NULL); BUG(); } } while (0)
+ #else
+ #define VM_BUG_ON(cond) BUILD_BUG_ON_INVALID(cond)
++#define VM_BUG_ON_PAGE(cond, page) VM_BUG_ON(cond)
+ #endif
+ 
+ #ifdef CONFIG_DEBUG_VIRTUAL
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index 5bc4f4047cf0..8b7814630b87 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -413,7 +413,7 @@ static inline void ClearPageCompound(struct page *page)
+  */
+ static inline int PageTransHuge(struct page *page)
+ {
+-	VM_BUG_ON(PageTail(page));
++	VM_BUG_ON_PAGE(PageTail(page), page);
+ 	return PageHead(page);
+ }
+ 
+@@ -461,25 +461,25 @@ static inline int PageTransTail(struct page *page)
+  */
+ static inline int PageSlabPfmemalloc(struct page *page)
+ {
+-	VM_BUG_ON(!PageSlab(page));
++	VM_BUG_ON_PAGE(!PageSlab(page), page);
+ 	return PageActive(page);
+ }
+ 
+ static inline void SetPageSlabPfmemalloc(struct page *page)
+ {
+-	VM_BUG_ON(!PageSlab(page));
++	VM_BUG_ON_PAGE(!PageSlab(page), page);
+ 	SetPageActive(page);
+ }
+ 
+ static inline void __ClearPageSlabPfmemalloc(struct page *page)
+ {
+-	VM_BUG_ON(!PageSlab(page));
++	VM_BUG_ON_PAGE(!PageSlab(page), page);
+ 	__ClearPageActive(page);
+ }
+ 
+ static inline void ClearPageSlabPfmemalloc(struct page *page)
+ {
+-	VM_BUG_ON(!PageSlab(page));
++	VM_BUG_ON_PAGE(!PageSlab(page), page);
+ 	ClearPageActive(page);
+ }
+ 
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index f132fdf5ce0f..e7729734156e 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -173,7 +173,7 @@ static inline int page_cache_get_speculative(struct page *page)
+ 	 * disabling preempt, and hence no need for the "speculative get" that
+ 	 * SMP requires.
+ 	 */
+-	VM_BUG_ON(page_count(page) == 0);
++	VM_BUG_ON_PAGE(page_count(page) == 0, page);
+ 	atomic_inc(&page->_count);
+ 
+ #else
+@@ -186,7 +186,7 @@ static inline int page_cache_get_speculative(struct page *page)
+ 		return 0;
+ 	}
+ #endif
+-	VM_BUG_ON(PageTail(page));
++	VM_BUG_ON_PAGE(PageTail(page), page);
+ 
+ 	return 1;
+ }
+@@ -202,14 +202,14 @@ static inline int page_cache_add_speculative(struct page *page, int count)
+ # ifdef CONFIG_PREEMPT_COUNT
+ 	VM_BUG_ON(!in_atomic());
+ # endif
+-	VM_BUG_ON(page_count(page) == 0);
++	VM_BUG_ON_PAGE(page_count(page) == 0, page);
+ 	atomic_add(count, &page->_count);
+ 
+ #else
+ 	if (unlikely(!atomic_add_unless(&page->_count, count, 0)))
+ 		return 0;
+ #endif
+-	VM_BUG_ON(PageCompound(page) && page != compound_head(page));
++	VM_BUG_ON_PAGE(PageCompound(page) && page != compound_head(page), page);
+ 
+ 	return 1;
+ }
+@@ -221,7 +221,7 @@ static inline int page_freeze_refs(struct page *page, int count)
+ 
+ static inline void page_unfreeze_refs(struct page *page, int count)
+ {
+-	VM_BUG_ON(page_count(page) != 0);
++	VM_BUG_ON_PAGE(page_count(page) != 0, page);
+ 	VM_BUG_ON(count == 0);
+ 
+ 	atomic_set(&page->_count, count);
+diff --git a/include/linux/percpu.h b/include/linux/percpu.h
+index cc88172c7d9a..d56038effeef 100644
+--- a/include/linux/percpu.h
++++ b/include/linux/percpu.h
+@@ -1,6 +1,7 @@
+ #ifndef __LINUX_PERCPU_H
+ #define __LINUX_PERCPU_H
+ 
++#include <linux/mmdebug.h>
+ #include <linux/preempt.h>
+ #include <linux/smp.h>
+ #include <linux/cpumask.h>
+diff --git a/mm/cleancache.c b/mm/cleancache.c
+index 5875f48ce279..d0eac4350403 100644
+--- a/mm/cleancache.c
++++ b/mm/cleancache.c
+@@ -237,7 +237,7 @@ int __cleancache_get_page(struct page *page)
+ 		goto out;
+ 	}
+ 
+-	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	fake_pool_id = page->mapping->host->i_sb->cleancache_poolid;
+ 	if (fake_pool_id < 0)
+ 		goto out;
+@@ -279,7 +279,7 @@ void __cleancache_put_page(struct page *page)
+ 		return;
+ 	}
+ 
+-	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	fake_pool_id = page->mapping->host->i_sb->cleancache_poolid;
+ 	if (fake_pool_id < 0)
+ 		return;
+@@ -318,7 +318,7 @@ void __cleancache_invalidate_page(struct address_space *mapping,
+ 		if (pool_id < 0)
+ 			return;
+ 
+-		VM_BUG_ON(!PageLocked(page));
++		VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 		if (cleancache_get_key(mapping->host, &key) >= 0) {
+ 			cleancache_ops->invalidate_page(pool_id,
+ 					key, page->index);
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 05ccb4cc0bdb..af5378acc45b 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -596,7 +596,7 @@ isolate_migratepages_range(struct zone *zone, struct compact_control *cc,
+ 		if (__isolate_lru_page(page, mode) != 0)
+ 			continue;
+ 
+-		VM_BUG_ON(PageTransCompound(page));
++		VM_BUG_ON_PAGE(PageTransCompound(page), page);
+ 
+ 		/* Successfully isolated */
+ 		cc->finished_update_migrate = true;
+* Unmerged path mm/filemap.c
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index af61e576ae71..d8297a0ee161 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -707,7 +707,7 @@ static int __do_huge_pmd_anonymous_page(struct mm_struct *mm,
+ 	pgtable_t pgtable;
+ 	spinlock_t *ptl;
+ 
+-	VM_BUG_ON(!PageCompound(page));
++	VM_BUG_ON_PAGE(!PageCompound(page), page);
+ 	pgtable = pte_alloc_one(mm, haddr);
+ 	if (unlikely(!pgtable))
+ 		return VM_FAULT_OOM;
+@@ -895,7 +895,7 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 		goto out;
+ 	}
+ 	src_page = pmd_page(pmd);
+-	VM_BUG_ON(!PageHead(src_page));
++	VM_BUG_ON_PAGE(!PageHead(src_page), src_page);
+ 	get_page(src_page);
+ 	page_dup_rmap(src_page);
+ 	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
+@@ -1069,7 +1069,7 @@ static int do_huge_pmd_wp_page_fallback(struct mm_struct *mm,
+ 	ptl = pmd_lock(mm, pmd);
+ 	if (unlikely(!pmd_same(*pmd, orig_pmd)))
+ 		goto out_free_pages;
+-	VM_BUG_ON(!PageHead(page));
++	VM_BUG_ON_PAGE(!PageHead(page), page);
+ 
+ 	pmdp_clear_flush(vma, haddr, pmd);
+ 	/* leave pmd empty until pte is filled */
+@@ -1135,7 +1135,7 @@ int do_huge_pmd_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		goto out_unlock;
+ 
+ 	page = pmd_page(orig_pmd);
+-	VM_BUG_ON(!PageCompound(page) || !PageHead(page));
++	VM_BUG_ON_PAGE(!PageCompound(page) || !PageHead(page), page);
+ 	if (page_mapcount(page) == 1) {
+ 		pmd_t entry;
+ 		entry = pmd_mkyoung(orig_pmd);
+@@ -1215,7 +1215,7 @@ alloc:
+ 			add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR);
+ 			put_huge_zero_page();
+ 		} else {
+-			VM_BUG_ON(!PageHead(page));
++			VM_BUG_ON_PAGE(!PageHead(page), page);
+ 			page_remove_rmap(page);
+ 			put_page(page);
+ 		}
+@@ -1253,7 +1253,7 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
+ 		goto out;
+ 
+ 	page = pmd_page(*pmd);
+-	VM_BUG_ON(!PageHead(page));
++	VM_BUG_ON_PAGE(!PageHead(page), page);
+ 	if (flags & FOLL_TOUCH) {
+ 		pmd_t _pmd;
+ 		/*
+@@ -1278,7 +1278,7 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
+ 		}
+ 	}
+ 	page += (addr & ~HPAGE_PMD_MASK) >> PAGE_SHIFT;
+-	VM_BUG_ON(!PageCompound(page));
++	VM_BUG_ON_PAGE(!PageCompound(page), page);
+ 	if (flags & FOLL_GET)
+ 		get_page_foll(page);
+ 
+@@ -1435,9 +1435,9 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 		} else {
+ 			page = pmd_page(orig_pmd);
+ 			page_remove_rmap(page);
+-			VM_BUG_ON(page_mapcount(page) < 0);
++			VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
+ 			add_mm_counter(tlb->mm, MM_ANONPAGES, -HPAGE_PMD_NR);
+-			VM_BUG_ON(!PageHead(page));
++			VM_BUG_ON_PAGE(!PageHead(page), page);
+ 			atomic_long_dec(&tlb->mm->nr_ptes);
+ 			spin_unlock(ptl);
+ 			tlb_remove_page(tlb, page);
+@@ -2170,9 +2170,9 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
+ 		if (unlikely(!page))
+ 			goto out;
+ 
+-		VM_BUG_ON(PageCompound(page));
+-		BUG_ON(!PageAnon(page));
+-		VM_BUG_ON(!PageSwapBacked(page));
++		VM_BUG_ON_PAGE(PageCompound(page), page);
++		VM_BUG_ON_PAGE(!PageAnon(page), page);
++		VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
+ 
+ 		/* cannot use mapcount: can't collapse if there's a gup pin */
+ 		if (page_count(page) != 1)
+@@ -2195,8 +2195,8 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
+ 		}
+ 		/* 0 stands for page_is_file_cache(page) == false */
+ 		inc_zone_page_state(page, NR_ISOLATED_ANON + 0);
+-		VM_BUG_ON(!PageLocked(page));
+-		VM_BUG_ON(PageLRU(page));
++		VM_BUG_ON_PAGE(!PageLocked(page), page);
++		VM_BUG_ON_PAGE(PageLRU(page), page);
+ 
+ 		/* If there is no mapped pte young don't collapse the page */
+ 		if (pte_young(pteval) || PageReferenced(page) ||
+@@ -2226,7 +2226,7 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
+ 		} else {
+ 			src_page = pte_page(pteval);
+ 			copy_user_highpage(page, src_page, address, vma);
+-			VM_BUG_ON(page_mapcount(src_page) != 1);
++			VM_BUG_ON_PAGE(page_mapcount(src_page) != 1, src_page);
+ 			release_pte_page(src_page);
+ 			/*
+ 			 * ptl mostly unnecessary, but preempt has to
+@@ -2305,7 +2305,7 @@ static struct page
+ 		       struct vm_area_struct *vma, unsigned long address,
+ 		       int node)
+ {
+-	VM_BUG_ON(*hpage);
++	VM_BUG_ON_PAGE(*hpage, *hpage);
+ 	/*
+ 	 * Allocate the page while the vma is still valid and under
+ 	 * the mmap_sem read mode so there is no memory allocation
+@@ -2567,7 +2567,7 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
+ 		 */
+ 		node = page_to_nid(page);
+ 		khugepaged_node_load[node]++;
+-		VM_BUG_ON(PageCompound(page));
++		VM_BUG_ON_PAGE(PageCompound(page), page);
+ 		if (!PageLRU(page) || PageLocked(page) || !PageAnon(page))
+ 			goto out_unmap;
+ 		/* cannot use mapcount: can't collapse if there's a gup pin */
+@@ -2863,7 +2863,7 @@ again:
+ 		return;
+ 	}
+ 	page = pmd_page(*pmd);
+-	VM_BUG_ON(!page_count(page));
++	VM_BUG_ON_PAGE(!page_count(page), page);
+ 	get_page(page);
+ 	spin_unlock(ptl);
+ 	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/hugetlb_cgroup.c b/mm/hugetlb_cgroup.c
+index 9cea7de22ffb..907c0ccbadb1 100644
+--- a/mm/hugetlb_cgroup.c
++++ b/mm/hugetlb_cgroup.c
+@@ -405,7 +405,7 @@ void hugetlb_cgroup_migrate(struct page *oldhpage, struct page *newhpage)
+ 	if (hugetlb_cgroup_disabled())
+ 		return;
+ 
+-	VM_BUG_ON(!PageHuge(oldhpage));
++	VM_BUG_ON_PAGE(!PageHuge(oldhpage), oldhpage);
+ 	spin_lock(&hugetlb_lock);
+ 	h_cg = hugetlb_cgroup_from_page(oldhpage);
+ 	set_hugetlb_cgroup(oldhpage, NULL);
+diff --git a/mm/internal.h b/mm/internal.h
+index 3f5e1aecbf55..d07fa9595ecf 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -27,8 +27,8 @@ static inline void set_page_count(struct page *page, int v)
+  */
+ static inline void set_page_refcounted(struct page *page)
+ {
+-	VM_BUG_ON(PageTail(page));
+-	VM_BUG_ON(atomic_read(&page->_count));
++	VM_BUG_ON_PAGE(PageTail(page), page);
++	VM_BUG_ON_PAGE(atomic_read(&page->_count), page);
+ 	set_page_count(page, 1);
+ }
+ 
+@@ -51,7 +51,7 @@ static inline void __get_page_tail_foll(struct page *page,
+ 	 * speculative page access (like in
+ 	 * page_cache_get_speculative()) on tail pages.
+ 	 */
+-	VM_BUG_ON(atomic_read(&page->first_page->_count) <= 0);
++	VM_BUG_ON_PAGE(atomic_read(&page->first_page->_count) <= 0, page);
+ 	if (get_page_head)
+ 		atomic_inc(&page->first_page->_count);
+ 	get_huge_page_tail(page);
+@@ -76,7 +76,7 @@ static inline void get_page_foll(struct page *page)
+ 		 * Getting a normal page or the head of a compound page
+ 		 * requires to already have an elevated page->_count.
+ 		 */
+-		VM_BUG_ON(atomic_read(&page->_count) <= 0);
++		VM_BUG_ON_PAGE(atomic_read(&page->_count) <= 0, page);
+ 		atomic_inc(&page->_count);
+ 	}
+ }
+@@ -176,7 +176,7 @@ static inline void munlock_vma_pages_all(struct vm_area_struct *vma)
+ static inline int mlocked_vma_newpage(struct vm_area_struct *vma,
+ 				    struct page *page)
+ {
+-	VM_BUG_ON(PageLRU(page));
++	VM_BUG_ON_PAGE(PageLRU(page), page);
+ 
+ 	if (likely((vma->vm_flags & (VM_LOCKED | VM_SPECIAL)) != VM_LOCKED))
+ 		return 0;
+* Unmerged path mm/ksm.c
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index c16fc7c588be..a4c888582b81 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2838,7 +2838,7 @@ struct mem_cgroup *try_get_mem_cgroup_from_page(struct page *page)
+ 	unsigned short id;
+ 	swp_entry_t ent;
+ 
+-	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 
+ 	pc = lookup_page_cgroup(page);
+ 	lock_page_cgroup(pc);
+@@ -2872,7 +2872,7 @@ static void __mem_cgroup_commit_charge(struct mem_cgroup *memcg,
+ 	bool anon;
+ 
+ 	lock_page_cgroup(pc);
+-	VM_BUG_ON(PageCgroupUsed(pc));
++	VM_BUG_ON_PAGE(PageCgroupUsed(pc), page);
+ 	/*
+ 	 * we don't need page_cgroup_lock about tail pages, becase they are not
+ 	 * accessed by any other context at this point.
+@@ -2907,7 +2907,7 @@ static void __mem_cgroup_commit_charge(struct mem_cgroup *memcg,
+ 	if (lrucare) {
+ 		if (was_on_lru) {
+ 			lruvec = mem_cgroup_zone_lruvec(zone, pc->mem_cgroup);
+-			VM_BUG_ON(PageLRU(page));
++			VM_BUG_ON_PAGE(PageLRU(page), page);
+ 			SetPageLRU(page);
+ 			add_page_to_lru_list(page, lruvec, page_lru(page));
+ 		}
+@@ -3689,7 +3689,7 @@ void __memcg_kmem_uncharge_pages(struct page *page, int order)
+ 	if (!memcg)
+ 		return;
+ 
+-	VM_BUG_ON(mem_cgroup_is_root(memcg));
++	VM_BUG_ON_PAGE(mem_cgroup_is_root(memcg), page);
+ 	memcg_uncharge_kmem(memcg, PAGE_SIZE << order);
+ }
+ #else
+@@ -3755,7 +3755,7 @@ static int mem_cgroup_move_account(struct page *page,
+ 	bool anon = PageAnon(page);
+ 
+ 	VM_BUG_ON(from == to);
+-	VM_BUG_ON(PageLRU(page));
++	VM_BUG_ON_PAGE(PageLRU(page), page);
+ 	/*
+ 	 * The page is isolated from LRU. So, collapse function
+ 	 * will not handle this page. But page splitting can happen.
+@@ -3847,7 +3847,7 @@ static int mem_cgroup_move_parent(struct page *page,
+ 		parent = root_mem_cgroup;
+ 
+ 	if (nr_pages > 1) {
+-		VM_BUG_ON(!PageTransHuge(page));
++		VM_BUG_ON_PAGE(!PageTransHuge(page), page);
+ 		flags = compound_lock_irqsave(page);
+ 	}
+ 
+@@ -3881,7 +3881,7 @@ static int mem_cgroup_charge_common(struct page *page, struct mm_struct *mm,
+ 
+ 	if (PageTransHuge(page)) {
+ 		nr_pages <<= compound_order(page);
+-		VM_BUG_ON(!PageTransHuge(page));
++		VM_BUG_ON_PAGE(!PageTransHuge(page), page);
+ 		/*
+ 		 * Never OOM-kill a process for a huge page.  The
+ 		 * fault handler will fall back to regular pages.
+@@ -3901,8 +3901,8 @@ int mem_cgroup_newpage_charge(struct page *page,
+ {
+ 	if (mem_cgroup_disabled())
+ 		return 0;
+-	VM_BUG_ON(page_mapped(page));
+-	VM_BUG_ON(page->mapping && !PageAnon(page));
++	VM_BUG_ON_PAGE(page_mapped(page), page);
++	VM_BUG_ON_PAGE(page->mapping && !PageAnon(page), page);
+ 	VM_BUG_ON(!mm);
+ 	return mem_cgroup_charge_common(page, mm, gfp_mask,
+ 					MEM_CGROUP_CHARGE_TYPE_ANON);
+@@ -4106,7 +4106,7 @@ __mem_cgroup_uncharge_common(struct page *page, enum charge_type ctype,
+ 
+ 	if (PageTransHuge(page)) {
+ 		nr_pages <<= compound_order(page);
+-		VM_BUG_ON(!PageTransHuge(page));
++		VM_BUG_ON_PAGE(!PageTransHuge(page), page);
+ 	}
+ 	/*
+ 	 * Check if our page_cgroup is valid
+@@ -4198,7 +4198,7 @@ void mem_cgroup_uncharge_page(struct page *page)
+ 	/* early check. */
+ 	if (page_mapped(page))
+ 		return;
+-	VM_BUG_ON(page->mapping && !PageAnon(page));
++	VM_BUG_ON_PAGE(page->mapping && !PageAnon(page), page);
+ 	/*
+ 	 * If the page is in swap cache, uncharge should be deferred
+ 	 * to the swap path, which also properly accounts swap usage
+@@ -4218,8 +4218,8 @@ void mem_cgroup_uncharge_page(struct page *page)
+ 
+ void mem_cgroup_uncharge_cache_page(struct page *page)
+ {
+-	VM_BUG_ON(page_mapped(page));
+-	VM_BUG_ON(page->mapping);
++	VM_BUG_ON_PAGE(page_mapped(page), page);
++	VM_BUG_ON_PAGE(page->mapping, page);
+ 	__mem_cgroup_uncharge_common(page, MEM_CGROUP_CHARGE_TYPE_CACHE, false);
+ }
+ 
+@@ -6564,7 +6564,7 @@ static enum mc_target_type get_mctgt_type_thp(struct vm_area_struct *vma,
+ 	enum mc_target_type ret = MC_TARGET_NONE;
+ 
+ 	page = pmd_page(pmd);
+-	VM_BUG_ON(!page || !PageHead(page));
++	VM_BUG_ON_PAGE(!page || !PageHead(page), page);
+ 	if (!move_anon())
+ 		return ret;
+ 	pc = lookup_page_cgroup(page);
+diff --git a/mm/memory.c b/mm/memory.c
+index 6ec143b2bc5a..0ca5fbc56391 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -290,7 +290,7 @@ int __tlb_remove_page(struct mmu_gather *tlb, struct page *page)
+ 			return 0;
+ 		batch = tlb->active;
+ 	}
+-	VM_BUG_ON(batch->nr > batch->max);
++	VM_BUG_ON_PAGE(batch->nr > batch->max, page);
+ 
+ 	return batch->max - batch->nr;
+ }
+@@ -2709,7 +2709,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 					goto unwritable_page;
+ 				}
+ 			} else
+-				VM_BUG_ON(!PageLocked(old_page));
++				VM_BUG_ON_PAGE(!PageLocked(old_page), old_page);
+ 
+ 			/*
+ 			 * Since we dropped the lock we need to revalidate
+@@ -3363,7 +3363,7 @@ static int __do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	if (unlikely(!(ret & VM_FAULT_LOCKED)))
+ 		lock_page(vmf.page);
+ 	else
+-		VM_BUG_ON(!PageLocked(vmf.page));
++		VM_BUG_ON_PAGE(!PageLocked(vmf.page), vmf.page);
+ 
+ 	/*
+ 	 * Should we do an early C-O-W break?
+@@ -3400,7 +3400,7 @@ static int __do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 						goto unwritable_page;
+ 					}
+ 				} else
+-					VM_BUG_ON(!PageLocked(page));
++					VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 				page_mkwrite = 1;
+ 			}
+ 		}
+diff --git a/mm/migrate.c b/mm/migrate.c
+index bb496c8c8950..43277c647806 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -503,7 +503,7 @@ void migrate_page_copy(struct page *newpage, struct page *page)
+ 	if (PageUptodate(page))
+ 		SetPageUptodate(newpage);
+ 	if (TestClearPageActive(page)) {
+-		VM_BUG_ON(PageUnevictable(page));
++		VM_BUG_ON_PAGE(PageUnevictable(page), page);
+ 		SetPageActive(newpage);
+ 	} else if (TestClearPageUnevictable(page))
+ 		SetPageUnevictable(newpage);
+@@ -883,7 +883,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 	 * free the metadata, so the page can be freed.
+ 	 */
+ 	if (!page->mapping) {
+-		VM_BUG_ON(PageAnon(page));
++		VM_BUG_ON_PAGE(PageAnon(page), page);
+ 		if (page_has_private(page)) {
+ 			try_to_free_buffers(page);
+ 			goto uncharge;
+@@ -1623,7 +1623,7 @@ static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page)
+ {
+ 	int page_lru;
+ 
+-	VM_BUG_ON(compound_order(page) && !PageTransHuge(page));
++	VM_BUG_ON_PAGE(compound_order(page) && !PageTransHuge(page), page);
+ 
+ 	/* Avoid migrating to a node that is nearly full */
+ 	if (!migrate_balanced_pgdat(pgdat, 1UL << compound_order(page)))
+* Unmerged path mm/mlock.c
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index c8b29cd69d86..54bbfb62e0fb 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -499,12 +499,12 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
+ 		return 0;
+ 
+ 	if (page_is_guard(buddy) && page_order(buddy) == order) {
+-		VM_BUG_ON(page_count(buddy) != 0);
++		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
+ 		return 1;
+ 	}
+ 
+ 	if (PageBuddy(buddy) && page_order(buddy) == order) {
+-		VM_BUG_ON(page_count(buddy) != 0);
++		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -553,8 +553,8 @@ static inline void __free_one_page(struct page *page,
+ 
+ 	page_idx = page_to_pfn(page) & ((1 << MAX_ORDER) - 1);
+ 
+-	VM_BUG_ON(page_idx & ((1 << order) - 1));
+-	VM_BUG_ON(bad_range(zone, page));
++	VM_BUG_ON_PAGE(page_idx & ((1 << order) - 1), page);
++	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+ 
+ 	while (order < MAX_ORDER-1) {
+ 		buddy_idx = __find_buddy_index(page_idx, order);
+@@ -828,7 +828,7 @@ static inline void expand(struct zone *zone, struct page *page,
+ 		area--;
+ 		high--;
+ 		size >>= 1;
+-		VM_BUG_ON(bad_range(zone, &page[size]));
++		VM_BUG_ON_PAGE(bad_range(zone, &page[size]), &page[size]);
+ 
+ #ifdef CONFIG_DEBUG_PAGEALLOC
+ 		if (high < debug_guardpage_minorder()) {
+@@ -981,7 +981,7 @@ int move_freepages(struct zone *zone,
+ 
+ 	for (page = start_page; page <= end_page;) {
+ 		/* Make sure we are not inadvertently changing nodes */
+-		VM_BUG_ON(page_to_nid(page) != zone_to_nid(zone));
++		VM_BUG_ON_PAGE(page_to_nid(page) != zone_to_nid(zone), page);
+ 
+ 		if (!pfn_valid_within(page_to_pfn(page))) {
+ 			page++;
+@@ -1409,8 +1409,8 @@ void split_page(struct page *page, unsigned int order)
+ {
+ 	int i;
+ 
+-	VM_BUG_ON(PageCompound(page));
+-	VM_BUG_ON(!page_count(page));
++	VM_BUG_ON_PAGE(PageCompound(page), page);
++	VM_BUG_ON_PAGE(!page_count(page), page);
+ 
+ #ifdef CONFIG_KMEMCHECK
+ 	/*
+@@ -1558,7 +1558,7 @@ again:
+ 	zone_statistics(preferred_zone, zone, gfp_flags);
+ 	local_irq_restore(flags);
+ 
+-	VM_BUG_ON(bad_range(zone, page));
++	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+ 	if (prep_new_page(page, order, gfp_flags))
+ 		goto again;
+ 	return page;
+@@ -5863,7 +5863,7 @@ void set_pageblock_flags_group(struct page *page, unsigned long flags,
+ 	pfn = page_to_pfn(page);
+ 	bitmap = get_pageblock_bitmap(zone, pfn);
+ 	bitidx = pfn_to_bitidx(zone, pfn);
+-	VM_BUG_ON(!zone_spans_pfn(zone, pfn));
++	VM_BUG_ON_PAGE(!zone_spans_pfn(zone, pfn), page);
+ 
+ 	for (; start_bitidx <= end_bitidx; start_bitidx++, value <<= 1)
+ 		if (flags & value)
+@@ -6384,3 +6384,4 @@ void dump_page(struct page *page, char *reason)
+ {
+ 	dump_page_badflags(page, reason, 0);
+ }
++EXPORT_SYMBOL_GPL(dump_page);
+diff --git a/mm/page_io.c b/mm/page_io.c
+index a8a3ef45fed7..6059705df335 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -275,8 +275,8 @@ int swap_readpage(struct page *page)
+ 	int ret = 0;
+ 	struct swap_info_struct *sis = page_swap_info(page);
+ 
+-	VM_BUG_ON(!PageLocked(page));
+-	VM_BUG_ON(PageUptodate(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(PageUptodate(page), page);
+ 	if (frontswap_load(page) == 0) {
+ 		SetPageUptodate(page);
+ 		unlock_page(page);
+* Unmerged path mm/rmap.c
+diff --git a/mm/shmem.c b/mm/shmem.c
+index eb46bea28216..8a2260547874 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -283,8 +283,8 @@ static int shmem_add_to_page_cache(struct page *page,
+ {
+ 	int error;
+ 
+-	VM_BUG_ON(!PageLocked(page));
+-	VM_BUG_ON(!PageSwapBacked(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
+ 
+ 	page_cache_get(page);
+ 	page->mapping = mapping;
+@@ -425,7 +425,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+ 				continue;
+ 			if (!unfalloc || !PageUptodate(page)) {
+ 				if (page->mapping == mapping) {
+-					VM_BUG_ON(PageWriteback(page));
++					VM_BUG_ON_PAGE(PageWriteback(page), page);
+ 					truncate_inode_page(mapping, page);
+ 				}
+ 			}
+@@ -503,7 +503,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+ 			lock_page(page);
+ 			if (!unfalloc || !PageUptodate(page)) {
+ 				if (page->mapping == mapping) {
+-					VM_BUG_ON(PageWriteback(page));
++					VM_BUG_ON_PAGE(PageWriteback(page), page);
+ 					truncate_inode_page(mapping, page);
+ 				}
+ 			}
+diff --git a/mm/slub.c b/mm/slub.c
+index 79f2de37e6b4..4ccddca9bfc0 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -1531,7 +1531,7 @@ static inline void *acquire_slab(struct kmem_cache *s,
+ 		new.freelist = freelist;
+ 	}
+ 
+-	VM_BUG_ON(new.frozen);
++	VM_BUG_ON_PAGE(new.frozen, &new);
+ 	new.frozen = 1;
+ 
+ 	if (!__cmpxchg_double_slab(s, page,
+@@ -1782,7 +1782,7 @@ static void deactivate_slab(struct kmem_cache *s, struct page *page, void *freel
+ 			set_freepointer(s, freelist, prior);
+ 			new.counters = counters;
+ 			new.inuse--;
+-			VM_BUG_ON(!new.frozen);
++			VM_BUG_ON_PAGE(!new.frozen, &new);
+ 
+ 		} while (!__cmpxchg_double_slab(s, page,
+ 			prior, counters,
+@@ -1810,7 +1810,7 @@ redo:
+ 
+ 	old.freelist = page->freelist;
+ 	old.counters = page->counters;
+-	VM_BUG_ON(!old.frozen);
++	VM_BUG_ON_PAGE(!old.frozen, &old);
+ 
+ 	/* Determine target state of the slab */
+ 	new.counters = old.counters;
+@@ -1921,7 +1921,7 @@ static void unfreeze_partials(struct kmem_cache *s,
+ 
+ 			old.freelist = page->freelist;
+ 			old.counters = page->counters;
+-			VM_BUG_ON(!old.frozen);
++			VM_BUG_ON_PAGE(!old.frozen, &old);
+ 
+ 			new.counters = old.counters;
+ 			new.freelist = old.freelist;
+@@ -2190,7 +2190,7 @@ static inline void *get_freelist(struct kmem_cache *s, struct page *page)
+ 		counters = page->counters;
+ 
+ 		new.counters = counters;
+-		VM_BUG_ON(!new.frozen);
++		VM_BUG_ON_PAGE(!new.frozen, &new);
+ 
+ 		new.inuse = page->objects;
+ 		new.frozen = freelist != NULL;
+@@ -2284,7 +2284,7 @@ load_freelist:
+ 	 * page is pointing to the page from which the objects are obtained.
+ 	 * That page must be frozen for per cpu allocations to work.
+ 	 */
+-	VM_BUG_ON(!c->page->frozen);
++	VM_BUG_ON_PAGE(!c->page->frozen, c->page);
+ 	c->freelist = get_freepointer(s, freelist);
+ 	c->tid = next_tid(c->tid);
+ 	local_irq_restore(flags);
+diff --git a/mm/swap.c b/mm/swap.c
+index 6dab198384ff..c710b5a3e9c4 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -57,7 +57,7 @@ static void __page_cache_release(struct page *page)
+ 
+ 		spin_lock_irqsave(&zone->lru_lock, flags);
+ 		lruvec = mem_cgroup_page_lruvec(page, zone);
+-		VM_BUG_ON(!PageLRU(page));
++		VM_BUG_ON_PAGE(!PageLRU(page), page);
+ 		__ClearPageLRU(page);
+ 		del_page_from_lru_list(page, lruvec, page_off_lru(page));
+ 		spin_unlock_irqrestore(&zone->lru_lock, flags);
+@@ -272,8 +272,8 @@ static void put_compound_page(struct page *page)
+ 			 * __split_huge_page_refcount cannot race
+ 			 * here.
+ 			 */
+-			VM_BUG_ON(!PageHead(page_head));
+-			VM_BUG_ON(page_mapcount(page) != 0);
++			VM_BUG_ON_PAGE(!PageHead(page_head), page_head);
++			VM_BUG_ON_PAGE(page_mapcount(page) != 0, page);
+ 			if (put_page_testzero(page_head)) {
+ 				/*
+ 				 * If this is the tail of a slab
+@@ -290,7 +290,7 @@ static void put_compound_page(struct page *page)
+ 				 * the compound page enters the buddy
+ 				 * allocator.
+ 				 */
+-				VM_BUG_ON(PageSlab(page_head));
++				VM_BUG_ON_PAGE(PageSlab(page_head), page_head);
+ 				__put_compound_page(page_head);
+ 			}
+ 			return;
+@@ -341,7 +341,7 @@ out_put_single:
+ 				__put_single_page(page);
+ 			return;
+ 		}
+-		VM_BUG_ON(page_head != page->first_page);
++		VM_BUG_ON_PAGE(page_head != page->first_page, page);
+ 		/*
+ 		 * We can release the refcount taken by
+ 		 * get_page_unless_zero() now that
+@@ -349,12 +349,12 @@ out_put_single:
+ 		 * compound_lock.
+ 		 */
+ 		if (put_page_testzero(page_head))
+-			VM_BUG_ON(1);
++			VM_BUG_ON_PAGE(1, page_head);
+ 		/* __split_huge_page_refcount will wait now */
+-		VM_BUG_ON(page_mapcount(page) <= 0);
++		VM_BUG_ON_PAGE(page_mapcount(page) <= 0, page);
+ 		atomic_dec(&page->_mapcount);
+-		VM_BUG_ON(atomic_read(&page_head->_count) <= 0);
+-		VM_BUG_ON(atomic_read(&page->_count) != 0);
++		VM_BUG_ON_PAGE(atomic_read(&page_head->_count) <= 0, page_head);
++		VM_BUG_ON_PAGE(atomic_read(&page->_count) != 0, page);
+ 		compound_unlock_irqrestore(page_head, flags);
+ 
+ 		if (put_page_testzero(page_head)) {
+@@ -365,7 +365,7 @@ out_put_single:
+ 		}
+ 	} else {
+ 		/* page_head is a dangling pointer */
+-		VM_BUG_ON(PageTail(page));
++		VM_BUG_ON_PAGE(PageTail(page), page);
+ 		goto out_put_single;
+ 	}
+ }
+@@ -406,7 +406,7 @@ bool __get_page_tail(struct page *page)
+ 			 * page. __split_huge_page_refcount
+ 			 * cannot race here.
+ 			 */
+-			VM_BUG_ON(!PageHead(page_head));
++			VM_BUG_ON_PAGE(!PageHead(page_head), page_head);
+ 			__get_page_tail_foll(page, true);
+ 			return true;
+ 		} else {
+@@ -748,8 +748,8 @@ EXPORT_SYMBOL(__lru_cache_add);
+  */
+ void lru_cache_add(struct page *page)
+ {
+-	VM_BUG_ON(PageActive(page) && PageUnevictable(page));
+-	VM_BUG_ON(PageLRU(page));
++	VM_BUG_ON_PAGE(PageActive(page) && PageUnevictable(page), page);
++	VM_BUG_ON_PAGE(PageLRU(page), page);
+ 	__lru_cache_add(page);
+ }
+ 
+@@ -990,7 +990,7 @@ void release_pages(struct page **pages, int nr, int cold)
+ 			}
+ 
+ 			lruvec = mem_cgroup_page_lruvec(page, zone);
+-			VM_BUG_ON(!PageLRU(page));
++			VM_BUG_ON_PAGE(!PageLRU(page), page);
+ 			__ClearPageLRU(page);
+ 			del_page_from_lru_list(page, lruvec, page_off_lru(page));
+ 		}
+@@ -1032,9 +1032,9 @@ void lru_add_page_tail(struct page *page, struct page *page_tail,
+ {
+ 	const int file = 0;
+ 
+-	VM_BUG_ON(!PageHead(page));
+-	VM_BUG_ON(PageCompound(page_tail));
+-	VM_BUG_ON(PageLRU(page_tail));
++	VM_BUG_ON_PAGE(!PageHead(page), page);
++	VM_BUG_ON_PAGE(PageCompound(page_tail), page);
++	VM_BUG_ON_PAGE(PageLRU(page_tail), page);
+ 	VM_BUG_ON(NR_CPUS != 1 &&
+ 		  !spin_is_locked(&lruvec_zone(lruvec)->lru_lock));
+ 
+@@ -1073,7 +1073,7 @@ static void __pagevec_lru_add_fn(struct page *page, struct lruvec *lruvec,
+ 	int active = PageActive(page);
+ 	enum lru_list lru = page_lru(page);
+ 
+-	VM_BUG_ON(PageLRU(page));
++	VM_BUG_ON_PAGE(PageLRU(page), page);
+ 
+ 	SetPageLRU(page);
+ 	add_page_to_lru_list(page, lruvec, lru);
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index e6f15f8ca2af..98e85e9c2b2d 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -83,9 +83,9 @@ int __add_to_swap_cache(struct page *page, swp_entry_t entry)
+ 	int error;
+ 	struct address_space *address_space;
+ 
+-	VM_BUG_ON(!PageLocked(page));
+-	VM_BUG_ON(PageSwapCache(page));
+-	VM_BUG_ON(!PageSwapBacked(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(PageSwapCache(page), page);
++	VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
+ 
+ 	page_cache_get(page);
+ 	SetPageSwapCache(page);
+@@ -139,9 +139,9 @@ void __delete_from_swap_cache(struct page *page)
+ 	swp_entry_t entry;
+ 	struct address_space *address_space;
+ 
+-	VM_BUG_ON(!PageLocked(page));
+-	VM_BUG_ON(!PageSwapCache(page));
+-	VM_BUG_ON(PageWriteback(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
++	VM_BUG_ON_PAGE(PageWriteback(page), page);
+ 
+ 	entry.val = page_private(page);
+ 	address_space = swap_address_space(entry);
+@@ -165,8 +165,8 @@ int add_to_swap(struct page *page, struct list_head *list)
+ 	swp_entry_t entry;
+ 	int err;
+ 
+-	VM_BUG_ON(!PageLocked(page));
+-	VM_BUG_ON(!PageUptodate(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(!PageUptodate(page), page);
+ 
+ 	entry = get_swap_page();
+ 	if (!entry.val)
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 8438b30a9f2d..f4b1ca4cd390 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -682,7 +682,7 @@ int reuse_swap_page(struct page *page)
+ {
+ 	int count;
+ 
+-	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	if (unlikely(PageKsm(page)))
+ 		return 0;
+ 	count = page_mapcount(page);
+@@ -702,7 +702,7 @@ int reuse_swap_page(struct page *page)
+  */
+ int try_to_free_swap(struct page *page)
+ {
+-	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 
+ 	if (!PageSwapCache(page))
+ 		return 0;
+@@ -2366,7 +2366,7 @@ struct swap_info_struct *page_swap_info(struct page *page)
+  */
+ struct address_space *__page_file_mapping(struct page *page)
+ {
+-	VM_BUG_ON(!PageSwapCache(page));
++	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
+ 	return page_swap_info(page)->swap_file->f_mapping;
+ }
+ EXPORT_SYMBOL_GPL(__page_file_mapping);
+@@ -2374,7 +2374,7 @@ EXPORT_SYMBOL_GPL(__page_file_mapping);
+ pgoff_t __page_file_index(struct page *page)
+ {
+ 	swp_entry_t swap = { .val = page_private(page) };
+-	VM_BUG_ON(!PageSwapCache(page));
++	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
+ 	return swp_offset(swap);
+ }
+ EXPORT_SYMBOL_GPL(__page_file_index);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index de064e5c4778..8a1972b6d83a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -582,7 +582,7 @@ void putback_lru_page(struct page *page)
+ 	int lru;
+ 	int was_unevictable = PageUnevictable(page);
+ 
+-	VM_BUG_ON(PageLRU(page));
++	VM_BUG_ON_PAGE(PageLRU(page), page);
+ 
+ redo:
+ 	ClearPageUnevictable(page);
+@@ -773,8 +773,8 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 		if (!trylock_page(page))
+ 			goto keep;
+ 
+-		VM_BUG_ON(PageActive(page));
+-		VM_BUG_ON(page_zone(page) != zone);
++		VM_BUG_ON_PAGE(PageActive(page), page);
++		VM_BUG_ON_PAGE(page_zone(page) != zone, page);
+ 
+ 		sc->nr_scanned++;
+ 
+@@ -1058,14 +1058,14 @@ activate_locked:
+ 		/* Not a candidate for swapping, so reclaim swap space. */
+ 		if (PageSwapCache(page) && vm_swap_full())
+ 			try_to_free_swap(page);
+-		VM_BUG_ON(PageActive(page));
++		VM_BUG_ON_PAGE(PageActive(page), page);
+ 		SetPageActive(page);
+ 		pgactivate++;
+ keep_locked:
+ 		unlock_page(page);
+ keep:
+ 		list_add(&page->lru, &ret_pages);
+-		VM_BUG_ON(PageLRU(page) || PageUnevictable(page));
++		VM_BUG_ON_PAGE(PageLRU(page) || PageUnevictable(page), page);
+ 	}
+ 
+ 	free_hot_cold_page_list(&free_pages, 1);
+@@ -1219,7 +1219,7 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
+ 		page = lru_to_page(src);
+ 		prefetchw_prev_lru_page(page, src, flags);
+ 
+-		VM_BUG_ON(!PageLRU(page));
++		VM_BUG_ON_PAGE(!PageLRU(page), page);
+ 
+ 		switch (__isolate_lru_page(page, mode)) {
+ 		case 0:
+@@ -1274,7 +1274,7 @@ int isolate_lru_page(struct page *page)
+ {
+ 	int ret = -EBUSY;
+ 
+-	VM_BUG_ON(!page_count(page));
++	VM_BUG_ON_PAGE(!page_count(page), page);
+ 
+ 	if (PageLRU(page)) {
+ 		struct zone *zone = page_zone(page);
+@@ -1345,7 +1345,7 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
+ 		struct page *page = lru_to_page(page_list);
+ 		int lru;
+ 
+-		VM_BUG_ON(PageLRU(page));
++		VM_BUG_ON_PAGE(PageLRU(page), page);
+ 		list_del(&page->lru);
+ 		if (unlikely(!page_evictable(page))) {
+ 			spin_unlock_irq(&zone->lru_lock);
+@@ -1565,7 +1565,7 @@ static void move_active_pages_to_lru(struct lruvec *lruvec,
+ 		page = lru_to_page(list);
+ 		lruvec = mem_cgroup_page_lruvec(page, zone);
+ 
+-		VM_BUG_ON(PageLRU(page));
++		VM_BUG_ON_PAGE(PageLRU(page), page);
+ 		SetPageLRU(page);
+ 
+ 		nr_pages = hpage_nr_pages(page);
+@@ -3668,7 +3668,7 @@ void check_move_unevictable_pages(struct page **pages, int nr_pages)
+ 		if (page_evictable(page)) {
+ 			enum lru_list lru = page_lru_base_type(page);
+ 
+-			VM_BUG_ON(PageActive(page));
++			VM_BUG_ON_PAGE(PageActive(page), page);
+ 			ClearPageUnevictable(page);
+ 			del_page_from_lru_list(page, lruvec, LRU_UNEVICTABLE);
+ 			add_page_to_lru_list(page, lruvec, lru);
