@@ -1,0 +1,127 @@
+blk-mq: fix race with timeouts and requeue events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 87ee7b112193bd081ba1a171fa5f6f39c429ef56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/87ee7b11.failed
+
+If a requeue event races with a timeout, we can get into the
+situation where we attempt to complete a request from the
+timeout handler when it's not start anymore. This causes a crash.
+So have the timeout handler check that REQ_ATOM_STARTED is still
+set on the request - if not, we ignore the event. If this happens,
+the request has now been marked as complete. As a consequence, we
+need to ensure to clear REQ_ATOM_COMPLETE in blk_mq_start_request(),
+as to maintain proper request state.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 87ee7b112193bd081ba1a171fa5f6f39c429ef56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 1e5a2766fa8d,a84112c94e74..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1348,18 -1425,19 +1373,24 @@@ struct request_queue *blk_mq_init_queue
+  	q->sg_reserved_size = INT_MAX;
+  
+  	blk_queue_make_request(q, blk_mq_make_request);
+++<<<<<<< HEAD
+ +	blk_queue_rq_timed_out(q, reg->ops->timeout);
+ +	if (reg->timeout)
+ +		blk_queue_rq_timeout(q, reg->timeout);
+++=======
++ 	blk_queue_rq_timed_out(q, blk_mq_rq_timed_out);
++ 	if (set->timeout)
++ 		blk_queue_rq_timeout(q, set->timeout);
+++>>>>>>> 87ee7b112193 (blk-mq: fix race with timeouts and requeue events)
+  
+ -	if (set->ops->complete)
+ -		blk_queue_softirq_done(q, set->ops->complete);
+ +	if (reg->ops->complete)
+ +		blk_queue_softirq_done(q, reg->ops->complete);
+  
+  	blk_mq_init_flush(q);
+ -	blk_mq_init_cpu_queues(q, set->nr_hw_queues);
+ +	blk_mq_init_cpu_queues(q, reg->nr_hw_queues);
+  
+ -	q->flush_rq = kzalloc(round_up(sizeof(struct request) +
+ -				set->cmd_size, cache_line_size()),
+ -				GFP_KERNEL);
+ +	q->flush_rq = kzalloc(round_up(sizeof(struct request) + reg->cmd_size,
+ +				cache_line_size()), GFP_KERNEL);
+  	if (!q->flush_rq)
+  		goto err_hw;
+  
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index ebbe6bac9d61..e4cbb634f8f9 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -49,6 +49,4 @@ struct blk_mq_reg;
+ extern unsigned int *blk_mq_make_queue_map(struct blk_mq_reg *reg);
+ extern int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues);
+ 
+-void blk_mq_add_timer(struct request *rq);
+-
+ #endif
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index 2d8c29f1381e..a45dc1f1b609 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -95,11 +95,7 @@ static void blk_rq_timed_out(struct request *req)
+ 			__blk_complete_request(req);
+ 		break;
+ 	case BLK_EH_RESET_TIMER:
+-		if (q->mq_ops)
+-			blk_mq_add_timer(req);
+-		else
+-			blk_add_timer(req);
+-
++		blk_add_timer(req);
+ 		blk_clear_rq_complete(req);
+ 		break;
+ 	case BLK_EH_NOT_HANDLED:
+@@ -169,7 +165,8 @@ void blk_abort_request(struct request *req)
+ }
+ EXPORT_SYMBOL_GPL(blk_abort_request);
+ 
+-void __blk_add_timer(struct request *req, struct list_head *timeout_list)
++static void __blk_add_timer(struct request *req,
++			    struct list_head *timeout_list)
+ {
+ 	struct request_queue *q = req->q;
+ 	unsigned long expiry;
+@@ -224,6 +221,11 @@ void __blk_add_timer(struct request *req, struct list_head *timeout_list)
+  */
+ void blk_add_timer(struct request *req)
+ {
+-	__blk_add_timer(req, &req->q->timeout_list);
++	struct request_queue *q = req->q;
++
++	if (q->mq_ops)
++		__blk_add_timer(req, NULL);
++	else
++		__blk_add_timer(req, &req->q->timeout_list);
+ }
+ 
+diff --git a/block/blk.h b/block/blk.h
+index c90e1d8f7a2b..1fddda8ab5d1 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -37,9 +37,8 @@ bool __blk_end_bidi_request(struct request *rq, int error,
+ void blk_rq_timed_out_timer(unsigned long data);
+ void blk_rq_check_expired(struct request *rq, unsigned long *next_timeout,
+ 			  unsigned int *next_set);
+-void __blk_add_timer(struct request *req, struct list_head *timeout_list);
++void blk_add_timer(struct request *req);
+ void blk_delete_timer(struct request *);
+-void blk_add_timer(struct request *);
+ 
+ 
+ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
