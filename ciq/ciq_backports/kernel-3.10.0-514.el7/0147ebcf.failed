@@ -1,0 +1,249 @@
+IB/core: fix null pointer deref and mem leak in error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Colin Ian King <colin.king@canonical.com>
+commit 0147ebcf8927f09e1923114092f6b14c1de75a95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0147ebcf.failed
+
+The current error handling in setup_hw_stats has a couple of issues.
+It is possible to generate a null pointer deference on the
+kfree of hsag->attrs[i] because two of the early error exit paths
+jump to the kfree when hsags NULL and not allocated. Fix this by
+moving the kfree on stats and jumping to that, avoiding the hsag
+freeing.
+
+Secondly, there is a memory leak of stats if the hsag allocation
+fails; instead of returning, jump to the kfree on stats.
+
+	Signed-off-by: Colin Ian King <colin.king@canonical.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 0147ebcf8927f09e1923114092f6b14c1de75a95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/sysfs.c
+diff --cc drivers/infiniband/core/sysfs.c
+index 38b55b5fac75,ed04a7bd4481..000000000000
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@@ -733,6 -747,213 +733,216 @@@ static struct attribute_group *get_coun
+  	return &pma_group;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int update_hw_stats(struct ib_device *dev, struct rdma_hw_stats *stats,
++ 			   u8 port_num, int index)
++ {
++ 	int ret;
++ 
++ 	if (time_is_after_eq_jiffies(stats->timestamp + stats->lifespan))
++ 		return 0;
++ 	ret = dev->get_hw_stats(dev, stats, port_num, index);
++ 	if (ret < 0)
++ 		return ret;
++ 	if (ret == stats->num_counters)
++ 		stats->timestamp = jiffies;
++ 
++ 	return 0;
++ }
++ 
++ static ssize_t print_hw_stat(struct rdma_hw_stats *stats, int index, char *buf)
++ {
++ 	return sprintf(buf, "%llu\n", stats->value[index]);
++ }
++ 
++ static ssize_t show_hw_stats(struct kobject *kobj, struct attribute *attr,
++ 			     char *buf)
++ {
++ 	struct ib_device *dev;
++ 	struct ib_port *port;
++ 	struct hw_stats_attribute *hsa;
++ 	struct rdma_hw_stats *stats;
++ 	int ret;
++ 
++ 	hsa = container_of(attr, struct hw_stats_attribute, attr);
++ 	if (!hsa->port_num) {
++ 		dev = container_of((struct device *)kobj,
++ 				   struct ib_device, dev);
++ 		stats = dev->hw_stats;
++ 	} else {
++ 		port = container_of(kobj, struct ib_port, kobj);
++ 		dev = port->ibdev;
++ 		stats = port->hw_stats;
++ 	}
++ 	ret = update_hw_stats(dev, stats, hsa->port_num, hsa->index);
++ 	if (ret)
++ 		return ret;
++ 	return print_hw_stat(stats, hsa->index, buf);
++ }
++ 
++ static ssize_t show_stats_lifespan(struct kobject *kobj,
++ 				   struct attribute *attr,
++ 				   char *buf)
++ {
++ 	struct hw_stats_attribute *hsa;
++ 	int msecs;
++ 
++ 	hsa = container_of(attr, struct hw_stats_attribute, attr);
++ 	if (!hsa->port_num) {
++ 		struct ib_device *dev = container_of((struct device *)kobj,
++ 						     struct ib_device, dev);
++ 		msecs = jiffies_to_msecs(dev->hw_stats->lifespan);
++ 	} else {
++ 		struct ib_port *p = container_of(kobj, struct ib_port, kobj);
++ 		msecs = jiffies_to_msecs(p->hw_stats->lifespan);
++ 	}
++ 	return sprintf(buf, "%d\n", msecs);
++ }
++ 
++ static ssize_t set_stats_lifespan(struct kobject *kobj,
++ 				  struct attribute *attr,
++ 				  const char *buf, size_t count)
++ {
++ 	struct hw_stats_attribute *hsa;
++ 	int msecs;
++ 	int jiffies;
++ 	int ret;
++ 
++ 	ret = kstrtoint(buf, 10, &msecs);
++ 	if (ret)
++ 		return ret;
++ 	if (msecs < 0 || msecs > 10000)
++ 		return -EINVAL;
++ 	jiffies = msecs_to_jiffies(msecs);
++ 	hsa = container_of(attr, struct hw_stats_attribute, attr);
++ 	if (!hsa->port_num) {
++ 		struct ib_device *dev = container_of((struct device *)kobj,
++ 						     struct ib_device, dev);
++ 		dev->hw_stats->lifespan = jiffies;
++ 	} else {
++ 		struct ib_port *p = container_of(kobj, struct ib_port, kobj);
++ 		p->hw_stats->lifespan = jiffies;
++ 	}
++ 	return count;
++ }
++ 
++ static void free_hsag(struct kobject *kobj, struct attribute_group *attr_group)
++ {
++ 	struct attribute **attr;
++ 
++ 	sysfs_remove_group(kobj, attr_group);
++ 
++ 	for (attr = attr_group->attrs; *attr; attr++)
++ 		kfree(*attr);
++ 	kfree(attr_group);
++ }
++ 
++ static struct attribute *alloc_hsa(int index, u8 port_num, const char *name)
++ {
++ 	struct hw_stats_attribute *hsa;
++ 
++ 	hsa = kmalloc(sizeof(*hsa), GFP_KERNEL);
++ 	if (!hsa)
++ 		return NULL;
++ 
++ 	hsa->attr.name = (char *)name;
++ 	hsa->attr.mode = S_IRUGO;
++ 	hsa->show = show_hw_stats;
++ 	hsa->store = NULL;
++ 	hsa->index = index;
++ 	hsa->port_num = port_num;
++ 
++ 	return &hsa->attr;
++ }
++ 
++ static struct attribute *alloc_hsa_lifespan(char *name, u8 port_num)
++ {
++ 	struct hw_stats_attribute *hsa;
++ 
++ 	hsa = kmalloc(sizeof(*hsa), GFP_KERNEL);
++ 	if (!hsa)
++ 		return NULL;
++ 
++ 	hsa->attr.name = name;
++ 	hsa->attr.mode = S_IWUSR | S_IRUGO;
++ 	hsa->show = show_stats_lifespan;
++ 	hsa->store = set_stats_lifespan;
++ 	hsa->index = 0;
++ 	hsa->port_num = port_num;
++ 
++ 	return &hsa->attr;
++ }
++ 
++ static void setup_hw_stats(struct ib_device *device, struct ib_port *port,
++ 			   u8 port_num)
++ {
++ 	struct attribute_group *hsag = NULL;
++ 	struct rdma_hw_stats *stats;
++ 	int i = 0, ret;
++ 
++ 	stats = device->alloc_hw_stats(device, port_num);
++ 
++ 	if (!stats)
++ 		return;
++ 
++ 	if (!stats->names || stats->num_counters <= 0)
++ 		goto err_free_stats;
++ 
++ 	hsag = kzalloc(sizeof(*hsag) +
++ 		       // 1 extra for the lifespan config entry
++ 		       sizeof(void *) * (stats->num_counters + 1),
++ 		       GFP_KERNEL);
++ 	if (!hsag)
++ 		goto err_free_stats;
++ 
++ 	ret = device->get_hw_stats(device, stats, port_num,
++ 				   stats->num_counters);
++ 	if (ret != stats->num_counters)
++ 		goto err;
++ 
++ 	stats->timestamp = jiffies;
++ 
++ 	hsag->name = "hw_counters";
++ 	hsag->attrs = (void *)hsag + sizeof(*hsag);
++ 
++ 	for (i = 0; i < stats->num_counters; i++) {
++ 		hsag->attrs[i] = alloc_hsa(i, port_num, stats->names[i]);
++ 		if (!hsag->attrs[i])
++ 			goto err;
++ 	}
++ 
++ 	/* treat an error here as non-fatal */
++ 	hsag->attrs[i] = alloc_hsa_lifespan("lifespan", port_num);
++ 
++ 	if (port) {
++ 		struct kobject *kobj = &port->kobj;
++ 		ret = sysfs_create_group(kobj, hsag);
++ 		if (ret)
++ 			goto err;
++ 		port->hw_stats_ag = hsag;
++ 		port->hw_stats = stats;
++ 	} else {
++ 		struct kobject *kobj = &device->dev.kobj;
++ 		ret = sysfs_create_group(kobj, hsag);
++ 		if (ret)
++ 			goto err;
++ 		device->hw_stats_ag = hsag;
++ 		device->hw_stats = stats;
++ 	}
++ 
++ 	return;
++ 
++ err:
++ 	for (; i >= 0; i--)
++ 		kfree(hsag->attrs[i]);
++ 	kfree(hsag);
++ err_free_stats:
++ 	kfree(stats);
++ 	return;
++ }
++ 
+++>>>>>>> 0147ebcf8927 (IB/core: fix null pointer deref and mem leak in error handling)
+  static int add_port(struct ib_device *device, int port_num,
+  		    int (*port_callback)(struct ib_device *,
+  					 u8, struct kobject *))
+* Unmerged path drivers/infiniband/core/sysfs.c
