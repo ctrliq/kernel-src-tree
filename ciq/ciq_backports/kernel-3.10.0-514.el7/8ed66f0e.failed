@@ -1,0 +1,266 @@
+geneve: implement support for IPv6-based tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author John W. Linville <linville@tuxdriver.com>
+commit 8ed66f0e8235118a31720acdab3bbbe9debd0f6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8ed66f0e.failed
+
+NOTE: Link-local IPv6 addresses for remote endpoints are not supported,
+since the driver currently has no capacity for binding a geneve
+interface to a specific link.
+
+	Signed-off-by: John W. Linville <linville@tuxdriver.com>
+	Reviewed-by: Jesse Gross <jesse@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8ed66f0e8235118a31720acdab3bbbe9debd0f6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+diff --cc drivers/net/geneve.c
+index 61619a003943,393b0bddf7cf..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -623,32 -803,33 +808,43 @@@ static void tunnel_id_to_vni(__be64 tun
+  #endif
+  }
+  
+- static netdev_tx_t geneve_xmit(struct sk_buff *skb, struct net_device *dev)
++ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
++ 				   struct ip_tunnel_info *info)
+  {
+  	struct geneve_dev *geneve = netdev_priv(dev);
+- 	struct geneve_sock *gs = geneve->sock;
+- 	struct ip_tunnel_info *info = NULL;
++ 	struct geneve_sock *gs4 = geneve->sock4;
+  	struct rtable *rt = NULL;
+  	const struct iphdr *iip; /* interior IP header */
+ -	int err = -EINVAL;
+  	struct flowi4 fl4;
+  	__u8 tos, ttl;
+  	__be16 sport;
+  	bool udp_csum;
+  	__be16 df;
+++<<<<<<< HEAD
+ +	int err;
+ +
+ +	if (geneve->collect_md) {
+ +		info = skb_tunnel_info(skb);
+ +		if (unlikely(info && info->mode != IP_TUNNEL_INFO_TX)) {
+++=======
++ 	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
++ 
++ 	if (geneve->collect_md) {
++ 		if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX))) {
+++>>>>>>> 8ed66f0e8235 (geneve: implement support for IPv6-based tunnels)
+  			netdev_dbg(dev, "no tunnel metadata\n");
+  			goto tx_error;
+  		}
+ -		if (info && ip_tunnel_info_af(info) != AF_INET)
+ -			goto tx_error;
+  	}
+  
+- 	rt = geneve_get_rt(skb, dev, &fl4, info);
++ 	rt = geneve_get_v4_rt(skb, dev, &fl4, info);
+  	if (IS_ERR(rt)) {
+++<<<<<<< HEAD
+ +		netdev_dbg(dev, "no route to %pI4\n", &fl4.daddr);
+ +		dev->stats.tx_carrier_errors++;
+++=======
++ 		err = PTR_ERR(rt);
+++>>>>>>> 8ed66f0e8235 (geneve: implement support for IPv6-based tunnels)
+  		goto tx_error;
+  	}
+  
+@@@ -704,6 -890,123 +900,126 @@@ err
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_IPV6)
++ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
++ 				    struct ip_tunnel_info *info)
++ {
++ 	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct geneve_sock *gs6 = geneve->sock6;
++ 	struct dst_entry *dst = NULL;
++ 	int err = -EINVAL;
++ 	struct flowi6 fl6;
++ 	__u8 ttl;
++ 	__be16 sport;
++ 	bool udp_csum;
++ 	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
++ 
++ 	if (geneve->collect_md) {
++ 		if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX))) {
++ 			netdev_dbg(dev, "no tunnel metadata\n");
++ 			goto tx_error;
++ 		}
++ 	}
++ 
++ 	dst = geneve_get_v6_dst(skb, dev, &fl6, info);
++ 	if (IS_ERR(dst)) {
++ 		err = PTR_ERR(dst);
++ 		goto tx_error;
++ 	}
++ 
++ 	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
++ 	skb_reset_mac_header(skb);
++ 
++ 	if (info) {
++ 		const struct ip_tunnel_key *key = &info->key;
++ 		u8 *opts = NULL;
++ 		u8 vni[3];
++ 
++ 		tunnel_id_to_vni(key->tun_id, vni);
++ 		if (key->tun_flags & TUNNEL_GENEVE_OPT)
++ 			opts = ip_tunnel_info_opts(info);
++ 
++ 		udp_csum = !!(key->tun_flags & TUNNEL_CSUM);
++ 		err = geneve6_build_skb(dst, skb, key->tun_flags, vni,
++ 					info->options_len, opts,
++ 					udp_csum, xnet);
++ 		if (unlikely(err))
++ 			goto err;
++ 
++ 		ttl = key->ttl;
++ 	} else {
++ 		udp_csum = false;
++ 		err = geneve6_build_skb(dst, skb, 0, geneve->vni,
++ 					0, NULL, udp_csum, xnet);
++ 		if (unlikely(err))
++ 			goto err;
++ 
++ 		ttl = geneve->ttl;
++ 		if (!ttl && ipv6_addr_is_multicast(&fl6.daddr))
++ 			ttl = 1;
++ 		ttl = ttl ? : ip6_dst_hoplimit(dst);
++ 	}
++ 	err = udp_tunnel6_xmit_skb(dst, gs6->sock->sk, skb, dev,
++ 				   &fl6.saddr, &fl6.daddr, 0, ttl,
++ 				   sport, geneve->dst_port, !udp_csum);
++ 
++ 	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
++ 	return NETDEV_TX_OK;
++ 
++ tx_error:
++ 	dev_kfree_skb(skb);
++ err:
++ 	if (err == -ELOOP)
++ 		dev->stats.collisions++;
++ 	else if (err == -ENETUNREACH)
++ 		dev->stats.tx_carrier_errors++;
++ 	else
++ 		dev->stats.tx_errors++;
++ 	return NETDEV_TX_OK;
++ }
++ #endif
++ 
++ static netdev_tx_t geneve_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct ip_tunnel_info *info = NULL;
++ 
++ 	if (geneve->collect_md)
++ 		info = skb_tunnel_info(skb);
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	if ((info && ip_tunnel_info_af(info) == AF_INET6) ||
++ 	    (!info && geneve->remote.sa.sa_family == AF_INET6))
++ 		return geneve6_xmit_skb(skb, dev, info);
++ #endif
++ 	return geneve_xmit_skb(skb, dev, info);
++ }
++ 
++ static int geneve_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	struct geneve_dev *geneve = netdev_priv(dev);
++ 	struct rtable *rt;
++ 	struct flowi4 fl4;
++ 
++ 	if (ip_tunnel_info_af(info) != AF_INET)
++ 		return -EINVAL;
++ 
++ 	rt = geneve_get_v4_rt(skb, dev, &fl4, info);
++ 	if (IS_ERR(rt))
++ 		return PTR_ERR(rt);
++ 
++ 	ip_rt_put(rt);
++ 	info->key.u.ipv4.src = fl4.saddr;
++ 	info->key.tp_src = udp_flow_src_port(geneve->net, skb,
++ 					     1, USHRT_MAX, true);
++ 	info->key.tp_dst = geneve->dst_port;
++ 	return 0;
++ }
++ 
+++>>>>>>> 8ed66f0e8235 (geneve: implement support for IPv6-based tunnels)
+  static const struct net_device_ops geneve_netdev_ops = {
+  	.ndo_init		= geneve_init,
+  	.ndo_uninit		= geneve_uninit,
+@@@ -871,15 -1181,36 +1193,48 @@@ static int geneve_newlink(struct net *n
+  	__be16 dst_port = htons(GENEVE_UDP_PORT);
+  	__u8 ttl = 0, tos = 0;
+  	bool metadata = false;
+++<<<<<<< HEAD
+ +	__be32 rem_addr;
+ +	__u32 vni;
+ +
+ +	if (!data[IFLA_GENEVE_ID] || !data[IFLA_GENEVE_REMOTE])
+ +		return -EINVAL;
+ +
+ +	vni = nla_get_u32(data[IFLA_GENEVE_ID]);
+ +	rem_addr = nla_get_in_addr(data[IFLA_GENEVE_REMOTE]);
+ +
+++=======
++ 	union geneve_addr remote = geneve_remote_unspec;
++ 	__u32 vni = 0;
++ 
++ 	if (data[IFLA_GENEVE_REMOTE] && data[IFLA_GENEVE_REMOTE6])
++ 		return -EINVAL;
++ 
++ 	if (data[IFLA_GENEVE_REMOTE]) {
++ 		remote.sa.sa_family = AF_INET;
++ 		remote.sin.sin_addr.s_addr =
++ 			nla_get_in_addr(data[IFLA_GENEVE_REMOTE]);
++ 	}
++ 
++ 	if (data[IFLA_GENEVE_REMOTE6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		remote.sa.sa_family = AF_INET6;
++ 		remote.sin6.sin6_addr =
++ 			nla_get_in6_addr(data[IFLA_GENEVE_REMOTE6]);
++ 
++ 		if (ipv6_addr_type(&remote.sin6.sin6_addr) &
++ 		    IPV6_ADDR_LINKLOCAL) {
++ 			netdev_dbg(dev, "link-local remote is unsupported\n");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	if (data[IFLA_GENEVE_ID])
++ 		vni = nla_get_u32(data[IFLA_GENEVE_ID]);
++ 
+++>>>>>>> 8ed66f0e8235 (geneve: implement support for IPv6-based tunnels)
+  	if (data[IFLA_GENEVE_TTL])
+  		ttl = nla_get_u8(data[IFLA_GENEVE_TTL]);
+  
+* Unmerged path drivers/net/geneve.c
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 719f99b573ac..7aaf169a0f22 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -355,6 +355,7 @@ enum {
+ 	IFLA_GENEVE_TOS,
+ 	IFLA_GENEVE_PORT,	/* destination port */
+ 	IFLA_GENEVE_COLLECT_METADATA,
++	IFLA_GENEVE_REMOTE6,
+ 	__IFLA_GENEVE_MAX
+ };
+ #define IFLA_GENEVE_MAX	(__IFLA_GENEVE_MAX - 1)
