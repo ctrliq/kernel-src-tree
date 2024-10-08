@@ -1,0 +1,160 @@
+KVM: x86: Remove return code from enable_irq/nmi_window
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/x86: Remove return code from enable_irq/nmi_window (Paolo Bonzini) [1116936]
+Rebuild_FUZZ: 97.25%
+commit-author Jan Kiszka <jan.kiszka@siemens.com>
+commit c9a7953f09bbe2b66050ebf97e0532eaeefbc9f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c9a7953f.failed
+
+It's no longer possible to enter enable_irq_window in guest mode when
+L1 intercepts external interrupts and we are entering L2. This is now
+caught in vcpu_enter_guest. So we can remove the check from the VMX
+version of enable_irq_window, thus the need to return an error code from
+both enable_irq_window and enable_nmi_window.
+
+	Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c9a7953f09bbe2b66050ebf97e0532eaeefbc9f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 069e61ca9f37,622312176f28..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -5967,15 -5972,13 +5967,19 @@@ static int vcpu_enter_guest(struct kvm_
+  			goto out;
+  		}
+  
+ -		if (inject_pending_event(vcpu, req_int_win) != 0)
+ -			req_immediate_exit = true;
+ +		inject_pending_event(vcpu);
+ +
+  		/* enable NMI/IRQ window open exits if needed */
+++<<<<<<< HEAD
+ +		if (vcpu->arch.nmi_pending)
+ +			req_immediate_exit =
+ +				kvm_x86_ops->enable_nmi_window(vcpu) != 0;
+++=======
++ 		else if (vcpu->arch.nmi_pending)
++ 			kvm_x86_ops->enable_nmi_window(vcpu);
+++>>>>>>> c9a7953f09bb (KVM: x86: Remove return code from enable_irq/nmi_window)
+  		else if (kvm_cpu_has_injectable_intr(vcpu) || req_int_win)
+- 			req_immediate_exit =
+- 				kvm_x86_ops->enable_irq_window(vcpu) != 0;
++ 			kvm_x86_ops->enable_irq_window(vcpu);
+  
+  		if (kvm_lapic_enabled(vcpu)) {
+  			/*
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 020713b49e2a..ec641209b381 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -727,8 +727,8 @@ struct kvm_x86_ops {
+ 	int (*nmi_allowed)(struct kvm_vcpu *vcpu);
+ 	bool (*get_nmi_mask)(struct kvm_vcpu *vcpu);
+ 	void (*set_nmi_mask)(struct kvm_vcpu *vcpu, bool masked);
+-	int (*enable_nmi_window)(struct kvm_vcpu *vcpu);
+-	int (*enable_irq_window)(struct kvm_vcpu *vcpu);
++	void (*enable_nmi_window)(struct kvm_vcpu *vcpu);
++	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
+ 	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
+ 	int (*vm_has_apicv)(struct kvm *kvm);
+ 	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 3c730499b2d4..362034c5b3c6 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3654,7 +3654,7 @@ static int svm_interrupt_allowed(struct kvm_vcpu *vcpu)
+ 	return ret;
+ }
+ 
+-static int enable_irq_window(struct kvm_vcpu *vcpu)
++static void enable_irq_window(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
+@@ -3668,16 +3668,15 @@ static int enable_irq_window(struct kvm_vcpu *vcpu)
+ 		svm_set_vintr(svm);
+ 		svm_inject_irq(svm, 0x0);
+ 	}
+-	return 0;
+ }
+ 
+-static int enable_nmi_window(struct kvm_vcpu *vcpu)
++static void enable_nmi_window(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
+ 	if ((svm->vcpu.arch.hflags & (HF_NMI_MASK | HF_IRET_MASK))
+ 	    == HF_NMI_MASK)
+-		return 0; /* IRET will cause a vm exit */
++		return; /* IRET will cause a vm exit */
+ 
+ 	/*
+ 	 * Something prevents NMI from been injected. Single step over possible
+@@ -3686,7 +3685,6 @@ static int enable_nmi_window(struct kvm_vcpu *vcpu)
+ 	svm->nmi_singlestep = true;
+ 	svm->vmcb->save.rflags |= (X86_EFLAGS_TF | X86_EFLAGS_RF);
+ 	update_db_bp_intercept(vcpu);
+-	return 0;
+ }
+ 
+ static int svm_set_tss_addr(struct kvm *kvm, unsigned int addr)
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 827c1e271e94..36fb42fbd7d9 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -4442,39 +4442,28 @@ static bool nested_exit_on_nmi(struct kvm_vcpu *vcpu)
+ 		PIN_BASED_NMI_EXITING;
+ }
+ 
+-static int enable_irq_window(struct kvm_vcpu *vcpu)
++static void enable_irq_window(struct kvm_vcpu *vcpu)
+ {
+ 	u32 cpu_based_vm_exec_control;
+ 
+-	if (is_guest_mode(vcpu) && nested_exit_on_intr(vcpu))
+-		/*
+-		 * We get here if vmx_interrupt_allowed() said we can't
+-		 * inject to L1 now because L2 must run. The caller will have
+-		 * to make L2 exit right after entry, so we can inject to L1
+-		 * more promptly.
+-		 */
+-		return -EBUSY;
+-
+ 	cpu_based_vm_exec_control = vmcs_read32(CPU_BASED_VM_EXEC_CONTROL);
+ 	cpu_based_vm_exec_control |= CPU_BASED_VIRTUAL_INTR_PENDING;
+ 	vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_vm_exec_control);
+-	return 0;
+ }
+ 
+-static int enable_nmi_window(struct kvm_vcpu *vcpu)
++static void enable_nmi_window(struct kvm_vcpu *vcpu)
+ {
+ 	u32 cpu_based_vm_exec_control;
+ 
+-	if (!cpu_has_virtual_nmis())
+-		return enable_irq_window(vcpu);
+-
+-	if (vmcs_read32(GUEST_INTERRUPTIBILITY_INFO) & GUEST_INTR_STATE_STI)
+-		return enable_irq_window(vcpu);
++	if (!cpu_has_virtual_nmis() ||
++	    vmcs_read32(GUEST_INTERRUPTIBILITY_INFO) & GUEST_INTR_STATE_STI) {
++		enable_irq_window(vcpu);
++		return;
++	}
+ 
+ 	cpu_based_vm_exec_control = vmcs_read32(CPU_BASED_VM_EXEC_CONTROL);
+ 	cpu_based_vm_exec_control |= CPU_BASED_VIRTUAL_NMI_PENDING;
+ 	vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_vm_exec_control);
+-	return 0;
+ }
+ 
+ static void vmx_inject_irq(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/x86.c
