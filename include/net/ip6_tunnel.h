@@ -73,6 +73,7 @@ __u32 ip6_tnl_get_cap(struct ip6_tnl *t, const struct in6_addr *laddr,
 struct net *ip6_tnl_get_link_net(const struct net_device *dev);
 int ip6_tnl_get_iflink(const struct net_device *dev);
 
+#ifdef CONFIG_INET
 static inline void ip6tunnel_xmit(struct sock *sk, struct sk_buff *skb,
 				  struct net_device *dev)
 {
@@ -94,4 +95,5 @@ static inline void ip6tunnel_xmit(struct sock *sk, struct sk_buff *skb,
 		stats->tx_aborted_errors++;
 	}
 }
+#endif
 #endif
