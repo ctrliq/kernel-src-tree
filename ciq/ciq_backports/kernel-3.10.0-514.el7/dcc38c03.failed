@@ -1,0 +1,743 @@
+openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit dcc38c033b32b81b88b798f0c0b8453839ac996b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dcc38c03.failed
+
+This readds the config option CONFIG_OPENVSWITCH_VXLAN to avoid a
+hard dependency of OVS on VXLAN. It moves the VXLAN config compat
+code to vport-vxlan.c and allows compliation as a module.
+
+Fixes: 614732eaa12d ("openvswitch: Use regular VXLAN net_device device")
+Fixes: 2661371ace96 ("openvswitch: fix compilation when vxlan is a module")
+	Cc: Pravin B Shelar <pshelar@nicira.com>
+	Cc: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dcc38c033b32b81b88b798f0c0b8453839ac996b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/vport-netdev.c
+#	net/openvswitch/vport-netdev.h
+#	net/openvswitch/vport-vxlan.c
+diff --cc net/openvswitch/vport-netdev.c
+index 6c7a9d49beb5,cddb7069b11b..000000000000
+--- a/net/openvswitch/vport-netdev.c
++++ b/net/openvswitch/vport-netdev.c
+@@@ -26,10 -26,13 +26,16 @@@
+  #include <linux/rtnetlink.h>
+  #include <linux/skbuff.h>
+  #include <linux/openvswitch.h>
++ #include <linux/export.h>
+  
+++<<<<<<< HEAD
+ +#include <net/llc.h>
+++=======
++ #include <net/ip_tunnels.h>
++ #include <net/rtnetlink.h>
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  
+  #include "datapath.h"
+ -#include "vport.h"
+  #include "vport-internal_dev.h"
+  #include "vport-netdev.h"
+  
+@@@ -83,87 -86,87 +89,144 @@@ static struct net_device *get_dpdev(con
+  
+  	local = ovs_vport_ovsl(dp, OVSP_LOCAL);
+  	BUG_ON(!local);
+++<<<<<<< HEAD
+ +	return netdev_vport_priv(local)->dev;
+++=======
++ 	return local->dev;
+  }
+  
++ struct vport *ovs_netdev_link(struct vport *vport, const char *name)
++ {
++ 	int err;
++ 
++ 	vport->dev = dev_get_by_name(ovs_dp_get_net(vport->dp), name);
++ 	if (!vport->dev) {
++ 		err = -ENODEV;
++ 		goto error_free_vport;
++ 	}
++ 
++ 	if (vport->dev->flags & IFF_LOOPBACK ||
++ 	    vport->dev->type != ARPHRD_ETHER ||
++ 	    ovs_is_internal_dev(vport->dev)) {
++ 		err = -EINVAL;
++ 		goto error_put;
++ 	}
++ 
++ 	rtnl_lock();
++ 	err = netdev_master_upper_dev_link(vport->dev,
++ 					   get_dpdev(vport->dp));
++ 	if (err)
++ 		goto error_unlock;
++ 
++ 	err = netdev_rx_handler_register(vport->dev, netdev_frame_hook,
++ 					 vport);
++ 	if (err)
++ 		goto error_master_upper_dev_unlink;
++ 
++ 	dev_disable_lro(vport->dev);
++ 	dev_set_promiscuity(vport->dev, 1);
++ 	vport->dev->priv_flags |= IFF_OVS_DATAPATH;
++ 	rtnl_unlock();
++ 
++ 	return vport;
++ 
++ error_master_upper_dev_unlink:
++ 	netdev_upper_dev_unlink(vport->dev, get_dpdev(vport->dp));
++ error_unlock:
++ 	rtnl_unlock();
++ error_put:
++ 	dev_put(vport->dev);
++ error_free_vport:
++ 	ovs_vport_free(vport);
++ 	return ERR_PTR(err);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
++ }
++ EXPORT_SYMBOL_GPL(ovs_netdev_link);
++ 
+  static struct vport *netdev_create(const struct vport_parms *parms)
+  {
+  	struct vport *vport;
+ +	struct netdev_vport *netdev_vport;
+ +	int err;
+ +
+ +	vport = ovs_vport_alloc(sizeof(struct netdev_vport),
+ +				&ovs_netdev_vport_ops, parms);
+ +	if (IS_ERR(vport)) {
+ +		err = PTR_ERR(vport);
+ +		goto error;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	netdev_vport = netdev_vport_priv(vport);
+ +
+ +	netdev_vport->dev = dev_get_by_name(ovs_dp_get_net(vport->dp), parms->name);
+ +	if (!netdev_vport->dev) {
+ +		err = -ENODEV;
+ +		goto error_free_vport;
+ +	}
+ +
+ +	if (netdev_vport->dev->flags & IFF_LOOPBACK ||
+ +	    netdev_vport->dev->type != ARPHRD_ETHER ||
+ +	    ovs_is_internal_dev(netdev_vport->dev)) {
+ +		err = -EINVAL;
+ +		goto error_put;
+ +	}
+  
+ -	vport = ovs_vport_alloc(0, &ovs_netdev_vport_ops, parms);
+ -	if (IS_ERR(vport))
+ -		return vport;
+ +	rtnl_lock();
+ +	err = netdev_master_upper_dev_link(netdev_vport->dev,
+ +					   get_dpdev(vport->dp));
+ +	if (err)
+ +		goto error_unlock;
+  
+ +	err = netdev_rx_handler_register(netdev_vport->dev, netdev_frame_hook,
+ +					 vport);
+ +	if (err)
+ +		goto error_master_upper_dev_unlink;
+ +
+ +	dev_disable_lro(netdev_vport->dev);
+ +	dev_set_promiscuity(netdev_vport->dev, 1);
+ +	netdev_vport->dev->priv_flags |= IFF_OVS_DATAPATH;
+ +	rtnl_unlock();
+ +
+ +	return vport;
+ +
+ +error_master_upper_dev_unlink:
+ +	netdev_upper_dev_unlink(netdev_vport->dev, get_dpdev(vport->dp));
+ +error_unlock:
+ +	rtnl_unlock();
+ +error_put:
+ +	dev_put(netdev_vport->dev);
+ +error_free_vport:
+ +	ovs_vport_free(vport);
+ +error:
+ +	return ERR_PTR(err);
+++=======
++ 	return ovs_netdev_link(vport, parms->name);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  }
+  
+- static void free_port_rcu(struct rcu_head *rcu)
++ void ovs_vport_free_rcu(struct rcu_head *rcu)
+  {
+ -	struct vport *vport = container_of(rcu, struct vport, rcu);
+ +	struct netdev_vport *netdev_vport = container_of(rcu,
+ +					struct netdev_vport, rcu);
+  
+ -	if (vport->dev)
+ -		dev_put(vport->dev);
+ -	ovs_vport_free(vport);
+ +	dev_put(netdev_vport->dev);
+ +	ovs_vport_free(vport_from_priv(netdev_vport));
+  }
++ EXPORT_SYMBOL_GPL(ovs_vport_free_rcu);
+  
+  void ovs_netdev_detach_dev(struct vport *vport)
+  {
+ +	struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
+ +
+  	ASSERT_RTNL();
+ -	vport->dev->priv_flags &= ~IFF_OVS_DATAPATH;
+ -	netdev_rx_handler_unregister(vport->dev);
+ -	netdev_upper_dev_unlink(vport->dev,
+ -				netdev_master_upper_dev_get(vport->dev));
+ -	dev_set_promiscuity(vport->dev, -1);
+ +	netdev_vport->dev->priv_flags &= ~IFF_OVS_DATAPATH;
+ +	netdev_rx_handler_unregister(netdev_vport->dev);
+ +	netdev_upper_dev_unlink(netdev_vport->dev,
+ +				netdev_master_upper_dev_get(netdev_vport->dev));
+ +	dev_set_promiscuity(netdev_vport->dev, -1);
+  }
++ EXPORT_SYMBOL_GPL(ovs_netdev_detach_dev);
+  
+  static void netdev_destroy(struct vport *vport)
+  {
+@@@ -174,13 -175,7 +237,17 @@@
+  		ovs_netdev_detach_dev(vport);
+  	rtnl_unlock();
+  
+++<<<<<<< HEAD
+ +	call_rcu(&netdev_vport->rcu, free_port_rcu);
+ +}
+ +
+ +const char *ovs_netdev_get_name(const struct vport *vport)
+ +{
+ +	const struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
+ +	return netdev_vport->dev->name;
+++=======
++ 	call_rcu(&vport->rcu, ovs_vport_free_rcu);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  }
+  
+  static unsigned int packet_length(const struct sk_buff *skb)
+@@@ -193,10 -188,9 +260,10 @@@
+  	return length;
+  }
+  
+- static int netdev_send(struct vport *vport, struct sk_buff *skb)
++ int ovs_netdev_send(struct vport *vport, struct sk_buff *skb)
+  {
+ -	int mtu = vport->dev->mtu;
+ +	struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
+ +	int mtu = netdev_vport->dev->mtu;
+  	int len;
+  
+  	if (unlikely(packet_length(skb) > mtu && !skb_is_gso(skb))) {
+@@@ -231,8 -226,7 +299,12 @@@ static struct vport_ops ovs_netdev_vpor
+  	.type		= OVS_VPORT_TYPE_NETDEV,
+  	.create		= netdev_create,
+  	.destroy	= netdev_destroy,
+++<<<<<<< HEAD
+ +	.get_name	= ovs_netdev_get_name,
+ +	.send		= netdev_send,
+++=======
++ 	.send		= ovs_netdev_send,
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  };
+  
+  int __init ovs_netdev_init(void)
+diff --cc net/openvswitch/vport-netdev.h
+index 6f7038e79c52,804412697a90..000000000000
+--- a/net/openvswitch/vport-netdev.h
++++ b/net/openvswitch/vport-netdev.h
+@@@ -26,20 -26,10 +26,26 @@@
+  
+  struct vport *ovs_netdev_get_vport(struct net_device *dev);
+  
+++<<<<<<< HEAD
+ +struct netdev_vport {
+ +	struct rcu_head rcu;
+ +
+ +	struct net_device *dev;
+ +};
+ +
+ +static inline struct netdev_vport *
+ +netdev_vport_priv(const struct vport *vport)
+ +{
+ +	return vport_priv(vport);
+ +}
+ +
+ +const char *ovs_netdev_get_name(const struct vport *);
+++=======
++ struct vport *ovs_netdev_link(struct vport *vport, const char *name);
++ int ovs_netdev_send(struct vport *vport, struct sk_buff *skb);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  void ovs_netdev_detach_dev(struct vport *);
++ void ovs_vport_free_rcu(struct rcu_head *);
+  
+  int __init ovs_netdev_init(void);
+  void ovs_netdev_exit(void);
+diff --cc net/openvswitch/vport-vxlan.c
+index 6f7986fabb70,547173336cd3..000000000000
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@@ -17,94 -17,37 +17,123 @@@
+   * 02110-1301, USA
+   */
+  
+++<<<<<<< HEAD
+ +#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ +
+ +#include <linux/in.h>
+ +#include <linux/ip.h>
+ +#include <linux/net.h>
+ +#include <linux/rculist.h>
+ +#include <linux/udp.h>
+ +#include <linux/module.h>
+ +
+ +#include <net/icmp.h>
+ +#include <net/ip.h>
+ +#include <net/udp.h>
+ +#include <net/ip_tunnels.h>
+ +#include <net/rtnetlink.h>
+ +#include <net/route.h>
+ +#include <net/dsfield.h>
+ +#include <net/inet_ecn.h>
+ +#include <net/net_namespace.h>
+ +#include <net/netns/generic.h>
+++=======
++ #include <linux/kernel.h>
++ #include <linux/skbuff.h>
++ #include <linux/openvswitch.h>
++ #include <linux/module.h>
++ #include <net/udp.h>
++ #include <net/ip_tunnels.h>
++ #include <net/rtnetlink.h>
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  #include <net/vxlan.h>
+  
+  #include "datapath.h"
+  #include "vport.h"
+++<<<<<<< HEAD
+ +#include "vport-vxlan.h"
+ +
+ +/**
+ + * struct vxlan_port - Keeps track of open UDP ports
+ + * @vs: vxlan_sock created for the port.
+ + * @name: vport name.
+ + */
+ +struct vxlan_port {
+ +	struct vxlan_sock *vs;
+ +	char name[IFNAMSIZ];
+ +	u32 exts; /* VXLAN_F_* in <net/vxlan.h> */
+ +};
+ +
+ +static struct vport_ops ovs_vxlan_vport_ops;
+ +
+ +static inline struct vxlan_port *vxlan_vport(const struct vport *vport)
+ +{
+ +	return vport_priv(vport);
+ +}
+ +
+ +/* Called with rcu_read_lock and BH disabled. */
+ +static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ +		      struct vxlan_metadata *md)
+ +{
+ +	struct ip_tunnel_info tun_info;
+ +	struct vxlan_port *vxlan_port;
+ +	struct vport *vport = vs->data;
+ +	struct iphdr *iph;
+ +	struct ovs_vxlan_opts opts = {
+ +		.gbp = md->gbp,
+ +	};
+ +	__be64 key;
+ +	__be16 flags;
+ +
+ +	flags = TUNNEL_KEY | (udp_hdr(skb)->check != 0 ? TUNNEL_CSUM : 0);
+ +	vxlan_port = vxlan_vport(vport);
+ +	if (vxlan_port->exts & VXLAN_F_GBP && md->gbp)
+ +		flags |= TUNNEL_VXLAN_OPT;
+ +
+ +	/* Save outer tunnel values */
+ +	iph = ip_hdr(skb);
+ +	key = cpu_to_be64(ntohl(md->vni) >> 8);
+ +	ip_tunnel_info_init(&tun_info, iph,
+ +			    udp_hdr(skb)->source, udp_hdr(skb)->dest,
+ +			    key, flags, &opts, sizeof(opts));
+ +
+ +	ovs_vport_receive(vport, skb, &tun_info);
+ +}
+ +
+ +static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
+ +{
+ +	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+ +	__be16 dst_port = inet_sk(vxlan_port->vs->sock->sk)->inet_sport;
+++=======
++ #include "vport-netdev.h"
++ 
++ static struct vport_ops ovs_vxlan_netdev_vport_ops;
++ 
++ static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
++ {
++ 	struct vxlan_dev *vxlan = netdev_priv(vport->dev);
++ 	__be16 dst_port = vxlan->cfg.dst_port;
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  
+  	if (nla_put_u16(skb, OVS_TUNNEL_ATTR_DST_PORT, ntohs(dst_port)))
+  		return -EMSGSIZE;
+  
+++<<<<<<< HEAD
+ +	if (vxlan_port->exts) {
+++=======
++ 	if (vxlan->flags & VXLAN_F_GBP) {
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  		struct nlattr *exts;
+  
+  		exts = nla_nest_start(skb, OVS_TUNNEL_ATTR_EXTENSION);
+  		if (!exts)
+  			return -EMSGSIZE;
+  
+++<<<<<<< HEAD
+ +		if (vxlan_port->exts & VXLAN_F_GBP &&
+++=======
++ 		if (vxlan->flags & VXLAN_F_GBP &&
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  		    nla_put_flag(skb, OVS_VXLAN_EXT_GBP))
+  			return -EMSGSIZE;
+  
+@@@ -114,23 -57,14 +143,34 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void vxlan_tnl_destroy(struct vport *vport)
+ +{
+ +	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+ +
+ +	vxlan_sock_release(vxlan_port->vs);
+ +
+ +	ovs_vport_deferred_free(vport);
+ +}
+ +
+ +static const struct nla_policy exts_policy[OVS_VXLAN_EXT_MAX+1] = {
+ +	[OVS_VXLAN_EXT_GBP]	= { .type = NLA_FLAG, },
+ +};
+ +
+ +static int vxlan_configure_exts(struct vport *vport, struct nlattr *attr)
+ +{
+ +	struct nlattr *exts[OVS_VXLAN_EXT_MAX+1];
+ +	struct vxlan_port *vxlan_port;
+++=======
++ static const struct nla_policy exts_policy[OVS_VXLAN_EXT_MAX + 1] = {
++ 	[OVS_VXLAN_EXT_GBP]	= { .type = NLA_FLAG, },
++ };
++ 
++ static int vxlan_configure_exts(struct vport *vport, struct nlattr *attr,
++ 				struct vxlan_config *conf)
++ {
++ 	struct nlattr *exts[OVS_VXLAN_EXT_MAX + 1];
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  	int err;
+  
+  	if (nla_len(attr) < sizeof(struct nlattr))
+@@@ -140,10 -74,8 +180,15 @@@
+  	if (err < 0)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	vxlan_port = vxlan_vport(vport);
+ +
+ +	if (exts[OVS_VXLAN_EXT_GBP])
+ +		vxlan_port->exts |= VXLAN_F_GBP;
+++=======
++ 	if (exts[OVS_VXLAN_EXT_GBP])
++ 		conf->flags |= VXLAN_F_GBP;
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  
+  	return 0;
+  }
+@@@ -152,128 -84,89 +197,203 @@@ static struct vport *vxlan_tnl_create(c
+  {
+  	struct net *net = ovs_dp_get_net(parms->dp);
+  	struct nlattr *options = parms->options;
+++<<<<<<< HEAD
+ +	struct vxlan_port *vxlan_port;
+ +	struct vxlan_sock *vs;
+ +	struct vport *vport;
+ +	struct nlattr *a;
+ +	u16 dst_port;
+ +	int err;
+++=======
++ 	struct net_device *dev;
++ 	struct vport *vport;
++ 	struct nlattr *a;
++ 	int err;
++ 	struct vxlan_config conf = {
++ 		.no_share = true,
++ 		.flags = VXLAN_F_FLOW_BASED | VXLAN_F_COLLECT_METADATA,
++ 	};
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  
+  	if (!options) {
+  		err = -EINVAL;
+  		goto error;
+  	}
+++<<<<<<< HEAD
+ +	a = nla_find_nested(options, OVS_TUNNEL_ATTR_DST_PORT);
+ +	if (a && nla_len(a) == sizeof(u16)) {
+ +		dst_port = nla_get_u16(a);
+++=======
++ 
++ 	a = nla_find_nested(options, OVS_TUNNEL_ATTR_DST_PORT);
++ 	if (a && nla_len(a) == sizeof(u16)) {
++ 		conf.dst_port = htons(nla_get_u16(a));
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  	} else {
+  		/* Require destination port from userspace. */
+  		err = -EINVAL;
+  		goto error;
+  	}
+  
+++<<<<<<< HEAD
+ +	vport = ovs_vport_alloc(sizeof(struct vxlan_port),
+ +				&ovs_vxlan_vport_ops, parms);
+ +	if (IS_ERR(vport))
+ +		return vport;
+ +
+ +	vxlan_port = vxlan_vport(vport);
+ +	strncpy(vxlan_port->name, parms->name, IFNAMSIZ);
+ +
+ +	a = nla_find_nested(options, OVS_TUNNEL_ATTR_EXTENSION);
+ +	if (a) {
+ +		err = vxlan_configure_exts(vport, a);
+++=======
++ 	vport = ovs_vport_alloc(0, &ovs_vxlan_netdev_vport_ops, parms);
++ 	if (IS_ERR(vport))
++ 		return vport;
++ 
++ 	a = nla_find_nested(options, OVS_TUNNEL_ATTR_EXTENSION);
++ 	if (a) {
++ 		err = vxlan_configure_exts(vport, a, &conf);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  		if (err) {
+  			ovs_vport_free(vport);
+  			goto error;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	vs = vxlan_sock_add(net, htons(dst_port), vxlan_rcv, vport, true,
+ +			    vxlan_port->exts);
+ +	if (IS_ERR(vs)) {
+ +		ovs_vport_free(vport);
+ +		return (void *)vs;
+ +	}
+ +	vxlan_port->vs = vs;
+ +
+ +	return vport;
+ +
+++=======
++ 	rtnl_lock();
++ 	dev = vxlan_dev_create(net, parms->name, NET_NAME_USER, &conf);
++ 	if (IS_ERR(dev)) {
++ 		rtnl_unlock();
++ 		ovs_vport_free(vport);
++ 		return ERR_CAST(dev);
++ 	}
++ 
++ 	dev_change_flags(dev, dev->flags | IFF_UP);
++ 	rtnl_unlock();
++ 	return vport;
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  error:
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+ +static int vxlan_ext_gbp(struct sk_buff *skb)
+ +{
+ +	const struct ip_tunnel_info *tun_info;
+ +	const struct ovs_vxlan_opts *opts;
+ +
+ +	tun_info = OVS_CB(skb)->egress_tun_info;
+ +	opts = tun_info->options;
+ +
+ +	if (tun_info->key.tun_flags & TUNNEL_VXLAN_OPT &&
+ +	    tun_info->options_len >= sizeof(*opts))
+ +		return opts->gbp;
+ +	else
+ +		return 0;
+ +}
+ +
+ +static int vxlan_tnl_send(struct vport *vport, struct sk_buff *skb)
+ +{
+ +	struct net *net = ovs_dp_get_net(vport->dp);
+ +	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+ +	struct sock *sk = vxlan_port->vs->sock->sk;
+ +	__be16 dst_port = inet_sk(sk)->inet_sport;
+ +	const struct ip_tunnel_key *tun_key;
+ +	struct vxlan_metadata md = {0};
+ +	struct rtable *rt;
+ +	struct flowi4 fl;
+ +	__be16 src_port;
+ +	__be16 df;
+ +	int err;
+ +	u32 vxflags;
+ +
+ +	if (unlikely(!OVS_CB(skb)->egress_tun_info)) {
+ +		err = -EINVAL;
+ +		goto error;
+ +	}
+ +
+ +	tun_key = &OVS_CB(skb)->egress_tun_info->key;
+ +	rt = ovs_tunnel_route_lookup(net, tun_key, skb->mark, &fl, IPPROTO_UDP);
+ +	if (IS_ERR(rt)) {
+ +		err = PTR_ERR(rt);
+ +		goto error;
+ +	}
+ +
+ +	df = tun_key->tun_flags & TUNNEL_DONT_FRAGMENT ?
+ +		htons(IP_DF) : 0;
+ +
+ +	skb->ignore_df = 1;
+ +
+ +	src_port = udp_flow_src_port(net, skb, 0, 0, true);
+ +	md.vni = htonl(be64_to_cpu(tun_key->tun_id) << 8);
+ +	md.gbp = vxlan_ext_gbp(skb);
+ +	vxflags = vxlan_port->exts |
+ +		      (tun_key->tun_flags & TUNNEL_CSUM ? VXLAN_F_UDP_CSUM : 0);
+ +
+ +	err = vxlan_xmit_skb(rt, sk, skb, fl.saddr, tun_key->ipv4_dst,
+ +			     tun_key->ipv4_tos, tun_key->ipv4_ttl, df,
+ +			     src_port, dst_port,
+ +			     &md, false, vxflags);
+ +	if (err < 0)
+ +		ip_rt_put(rt);
+ +	return err;
+ +error:
+ +	kfree_skb(skb);
+ +	return err;
+++=======
++ static struct vport *vxlan_create(const struct vport_parms *parms)
++ {
++ 	struct vport *vport;
++ 
++ 	vport = vxlan_tnl_create(parms);
++ 	if (IS_ERR(vport))
++ 		return vport;
++ 
++ 	return ovs_netdev_link(vport, parms->name);
++ }
++ 
++ static void vxlan_destroy(struct vport *vport)
++ {
++ 	rtnl_lock();
++ 	if (vport->dev->priv_flags & IFF_OVS_DATAPATH)
++ 		ovs_netdev_detach_dev(vport);
++ 
++ 	/* Early release so we can unregister the device */
++ 	dev_put(vport->dev);
++ 	rtnl_delete_link(vport->dev);
++ 	vport->dev = NULL;
++ 	rtnl_unlock();
++ 
++ 	call_rcu(&vport->rcu, ovs_vport_free_rcu);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  }
+  
+  static int vxlan_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
+  				     struct ip_tunnel_info *egress_tun_info)
+  {
+++<<<<<<< HEAD
+ +	struct net *net = ovs_dp_get_net(vport->dp);
+ +	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+ +	__be16 dst_port = inet_sk(vxlan_port->vs->sock->sk)->inet_sport;
+++=======
++ 	struct vxlan_dev *vxlan = netdev_priv(vport->dev);
++ 	struct net *net = ovs_dp_get_net(vport->dp);
++ 	__be16 dst_port = vxlan_dev_dst_port(vxlan);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  	__be16 src_port;
+  	int port_min;
+  	int port_max;
+@@@ -287,31 -180,23 +407,49 @@@
+  					  src_port, dst_port);
+  }
+  
+++<<<<<<< HEAD
+ +static const char *vxlan_get_name(const struct vport *vport)
+ +{
+ +	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+ +	return vxlan_port->name;
+ +}
+ +
+ +static struct vport_ops ovs_vxlan_vport_ops = {
+ +	.type		= OVS_VPORT_TYPE_VXLAN,
+ +	.create		= vxlan_tnl_create,
+ +	.destroy	= vxlan_tnl_destroy,
+ +	.get_name	= vxlan_get_name,
+ +	.get_options	= vxlan_get_options,
+ +	.send		= vxlan_tnl_send,
+ +	.get_egress_tun_info	= vxlan_get_egress_tun_info,
+ +	.owner		= THIS_MODULE,
+++=======
++ static struct vport_ops ovs_vxlan_netdev_vport_ops = {
++ 	.type			= OVS_VPORT_TYPE_VXLAN,
++ 	.create			= vxlan_create,
++ 	.destroy		= vxlan_destroy,
++ 	.get_options		= vxlan_get_options,
++ 	.send			= ovs_netdev_send,
++ 	.get_egress_tun_info	= vxlan_get_egress_tun_info,
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  };
+  
+  static int __init ovs_vxlan_tnl_init(void)
+  {
+++<<<<<<< HEAD
+ +	return ovs_vport_ops_register(&ovs_vxlan_vport_ops);
+++=======
++ 	return ovs_vport_ops_register(&ovs_vxlan_netdev_vport_ops);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  }
+  
+  static void __exit ovs_vxlan_tnl_exit(void)
+  {
+++<<<<<<< HEAD
+ +	ovs_vport_ops_unregister(&ovs_vxlan_vport_ops);
+++=======
++ 	ovs_vport_ops_unregister(&ovs_vxlan_netdev_vport_ops);
+++>>>>>>> dcc38c033b32 (openvswitch: Re-add CONFIG_OPENVSWITCH_VXLAN)
+  }
+  
+  module_init(ovs_vxlan_tnl_init);
+diff --git a/net/openvswitch/Kconfig b/net/openvswitch/Kconfig
+index aa5eac5326eb..15840401a2ce 100644
+--- a/net/openvswitch/Kconfig
++++ b/net/openvswitch/Kconfig
+@@ -5,7 +5,6 @@
+ config OPENVSWITCH
+ 	tristate "Open vSwitch"
+ 	depends on INET
+-	depends on VXLAN
+ 	select LIBCRC32C
+ 	select MPLS
+ 	select NET_MPLS_GSO
+diff --git a/net/openvswitch/Makefile b/net/openvswitch/Makefile
+index 91b9478413ef..c40fca175330 100644
+--- a/net/openvswitch/Makefile
++++ b/net/openvswitch/Makefile
+@@ -15,6 +15,7 @@ openvswitch-y := \
+ 	vport-internal_dev.o \
+ 	vport-netdev.o
+ 
++obj-$(CONFIG_OPENVSWITCH_VXLAN)+= vport-vxlan.o
+ obj-$(CONFIG_OPENVSWITCH_GENEVE)+= vport-geneve.o
+ obj-$(CONFIG_OPENVSWITCH_VXLAN)	+= vport-vxlan.o
+ obj-$(CONFIG_OPENVSWITCH_GRE)	+= vport-gre.o
+* Unmerged path net/openvswitch/vport-netdev.c
+* Unmerged path net/openvswitch/vport-netdev.h
+* Unmerged path net/openvswitch/vport-vxlan.c
