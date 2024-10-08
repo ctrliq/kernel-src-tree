@@ -1,0 +1,180 @@
+xfs: ensure EFD trans aborts on log recovery extent free failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 6bc43af3d5f507254b8de2058ea51f6ec998ae52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6bc43af3.failed
+
+Log recovery attempts to free extents with leftover EFIs in the AIL
+after initial processing. If the extent free fails (e.g., due to
+unrelated fs corruption), the transaction is cancelled, though it
+might not be dirtied at the time. If this is the case, the EFD does
+not abort and thus does not release the EFI. This can lead to hangs
+as the EFI pins the AIL.
+
+Update xlog_recover_process_efi() to log the EFD in the transaction
+before xfs_free_extent() errors are handled to ensure the
+transaction is dirty, aborts the EFD and releases the EFI on error.
+Since this is a requirement for EFD processing (and consistent with
+xfs_bmap_finish()), update the EFD logging helper to do the extent
+free and unconditionally log the EFD. This encodes the required EFD
+logging behavior into the helper and reduces the likelihood of
+errors down the road.
+
+[dchinner: re-add xfs_alloc.h to xfs_log_recover.c to fix build
+ failure.]
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 6bc43af3d5f507254b8de2058ea51f6ec998ae52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans.h
+diff --cc fs/xfs/xfs_trans.h
+index cb916e269926,4643070d7cae..000000000000
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@@ -220,13 -220,13 +220,21 @@@ void		xfs_trans_log_efi_extent(xfs_tran
+  struct xfs_efd_log_item	*xfs_trans_get_efd(xfs_trans_t *,
+  				  struct xfs_efi_log_item *,
+  				  uint);
+++<<<<<<< HEAD
+ +void		xfs_trans_log_efd_extent(xfs_trans_t *,
+ +					 struct xfs_efd_log_item *,
+ +					 xfs_fsblock_t,
+ +					 xfs_extlen_t);
+ +int		xfs_trans_commit(xfs_trans_t *, uint flags);
+++=======
++ int		xfs_trans_free_extent(struct xfs_trans *,
++ 				      struct xfs_efd_log_item *, xfs_fsblock_t,
++ 				      xfs_extlen_t);
++ int		xfs_trans_commit(struct xfs_trans *);
++ int		__xfs_trans_roll(struct xfs_trans **, struct xfs_inode *, int *);
+++>>>>>>> 6bc43af3d5f5 (xfs: ensure EFD trans aborts on log recovery extent free failure)
+  int		xfs_trans_roll(struct xfs_trans **, struct xfs_inode *);
+ -void		xfs_trans_cancel(xfs_trans_t *);
+ +void		xfs_trans_cancel(xfs_trans_t *, int);
+  int		xfs_trans_ail_init(struct xfs_mount *);
+  void		xfs_trans_ail_destroy(struct xfs_mount *);
+  
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 8eece46acdbc..ae905beb558f 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -112,24 +112,17 @@ xfs_bmap_finish(
+ 		return error;
+ 	}
+ 
++	/*
++	 * Get an EFD and free each extent in the list, logging to the EFD in
++	 * the process. The remaining bmap free list is cleaned up by the caller
++	 * on error.
++	 */
+ 	efd = xfs_trans_get_efd(*tp, efi, flist->xbf_count);
+ 	for (free = flist->xbf_first; free != NULL; free = next) {
+ 		next = free->xbfi_next;
+ 
+-		/*
+-		 * Free the extent and log the EFD to dirty the transaction
+-		 * before handling errors. This ensures that the transaction is
+-		 * aborted, which:
+-		 *
+-		 * 1.) releases the EFI and frees the EFD
+-		 * 2.) shuts down the filesystem
+-		 *
+-		 * The bmap free list is cleaned up at a higher level.
+-		 */
+-		error = xfs_free_extent(*tp, free->xbfi_startblock,
+-					free->xbfi_blockcount);
+-		xfs_trans_log_efd_extent(*tp, efd, free->xbfi_startblock,
+-					 free->xbfi_blockcount);
++		error = xfs_trans_free_extent(*tp, efd, free->xbfi_startblock,
++					      free->xbfi_blockcount);
+ 		if (error)
+ 			return error;
+ 
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 171c74f3b7e7..0bdbb2039ec5 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -3779,11 +3779,11 @@ xlog_recover_process_efi(
+ 
+ 	for (i = 0; i < efip->efi_format.efi_nextents; i++) {
+ 		extp = &(efip->efi_format.efi_extents[i]);
+-		error = xfs_free_extent(tp, extp->ext_start, extp->ext_len);
++		error = xfs_trans_free_extent(tp, efdp, extp->ext_start,
++					      extp->ext_len);
+ 		if (error)
+ 			goto abort_error;
+-		xfs_trans_log_efd_extent(tp, efdp, extp->ext_start,
+-					 extp->ext_len);
++
+ 	}
+ 
+ 	set_bit(XFS_EFI_RECOVERED, &efip->efi_flags);
+* Unmerged path fs/xfs/xfs_trans.h
+diff --git a/fs/xfs/xfs_trans_extfree.c b/fs/xfs/xfs_trans_extfree.c
+index 284397dd7990..a96ae540eb62 100644
+--- a/fs/xfs/xfs_trans_extfree.c
++++ b/fs/xfs/xfs_trans_extfree.c
+@@ -25,6 +25,7 @@
+ #include "xfs_trans.h"
+ #include "xfs_trans_priv.h"
+ #include "xfs_extfree_item.h"
++#include "xfs_alloc.h"
+ 
+ /*
+  * This routine is called to allocate an "extent free intention"
+@@ -108,19 +109,30 @@ xfs_trans_get_efd(xfs_trans_t		*tp,
+ }
+ 
+ /*
+- * This routine is called to indicate that the described
+- * extent is to be logged as having been freed.  It should
+- * be called once for each extent freed.
++ * Free an extent and log it to the EFD. Note that the transaction is marked
++ * dirty regardless of whether the extent free succeeds or fails to support the
++ * EFI/EFD lifecycle rules.
+  */
+-void
+-xfs_trans_log_efd_extent(xfs_trans_t		*tp,
+-			 xfs_efd_log_item_t	*efdp,
+-			 xfs_fsblock_t		start_block,
+-			 xfs_extlen_t		ext_len)
++int
++xfs_trans_free_extent(
++	struct xfs_trans	*tp,
++	struct xfs_efd_log_item	*efdp,
++	xfs_fsblock_t		start_block,
++	xfs_extlen_t		ext_len)
+ {
+ 	uint			next_extent;
+-	xfs_extent_t		*extp;
++	struct xfs_extent	*extp;
++	int			error;
+ 
++	error = xfs_free_extent(tp, start_block, ext_len);
++
++	/*
++	 * Mark the transaction dirty, even on error. This ensures the
++	 * transaction is aborted, which:
++	 *
++	 * 1.) releases the EFI and frees the EFD
++	 * 2.) shuts down the filesystem
++	 */
+ 	tp->t_flags |= XFS_TRANS_DIRTY;
+ 	efdp->efd_item.li_desc->lid_flags |= XFS_LID_DIRTY;
+ 
+@@ -130,4 +142,6 @@ xfs_trans_log_efd_extent(xfs_trans_t		*tp,
+ 	extp->ext_start = start_block;
+ 	extp->ext_len = ext_len;
+ 	efdp->efd_next_extent++;
++
++	return error;
+ }
