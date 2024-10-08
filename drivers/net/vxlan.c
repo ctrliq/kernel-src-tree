@@ -2338,6 +2338,8 @@ static struct socket *create_v4_sock(struct net *net, __be16 port, u32 flags)
 	if (!(flags & VXLAN_F_UDP_CSUM))
 		sock->sk->sk_no_check_tx = 1;
 
+	udp_set_convert_csum(sock->sk, true);
+
 	return sock;
 }
 
