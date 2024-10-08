@@ -1,0 +1,224 @@
+r8152: fix the runtime suspend issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author hayeswang <hayeswang@realtek.com>
+commit 2dd49e0f16fb0e07c6fcc1322ebba310f5827072
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2dd49e0f.failed
+
+Fix the runtime suspend issues result from the linking change.
+
+Case 1:
+a) link down occurs.
+b) driver disable tx/rx.
+c) autosuspend occurs.
+d) hw linking up.
+e) device suspends without enabling tx/rx.
+f) couldn't wake up when receiving packets.
+
+Case 2:
+a) Nway results in linking down.
+b) autosuspend occurs.
+c) device suspends.
+d) device may not wake up when linking up.
+
+	Signed-off-by: Hayes Wang <hayeswang@realtek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2dd49e0f16fb0e07c6fcc1322ebba310f5827072)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/r8152.c
+diff --cc drivers/net/usb/r8152.c
+index a5864fc9686d,d9427ca3dba7..000000000000
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@@ -25,11 -24,17 +25,21 @@@
+  #include <net/ip6_checksum.h>
+  #include <uapi/linux/mdio.h>
+  #include <linux/mdio.h>
+ -#include <linux/usb/cdc.h>
+  
+++<<<<<<< HEAD
+ +/* Version Information */
+ +#define DRIVER_VERSION "v1.06.0 (2014/03/03)"
+++=======
++ /* Information for net-next */
++ #define NETNEXT_VERSION		"08"
++ 
++ /* Information for net */
++ #define NET_VERSION		"2"
++ 
++ #define DRIVER_VERSION		"v1." NETNEXT_VERSION "." NET_VERSION
+++>>>>>>> 2dd49e0f16fb (r8152: fix the runtime suspend issues)
+  #define DRIVER_AUTHOR "Realtek linux nic maintainers <nic_swsd@realtek.com>"
+ -#define DRIVER_DESC "Realtek RTL8152/RTL8153 Based USB Ethernet Adapters"
+ +#define DRIVER_DESC "Realtek RTL8152 Based USB 2.0 Ethernet Adapters"
+  #define MODULENAME "r8152"
+  
+  #define R8152_PHY_ID		32
+@@@ -139,7 -145,10 +149,12 @@@
+  #define OCP_SRAM_ADDR		0xa436
+  #define OCP_SRAM_DATA		0xa438
+  #define OCP_DOWN_SPEED		0xa442
+ -#define OCP_EEE_ABLE		0xa5c4
+  #define OCP_EEE_ADV		0xa5d0
+++<<<<<<< HEAD
+++=======
++ #define OCP_EEE_LPABLE		0xa5d2
++ #define OCP_PHY_STATE		0xa708		/* nway state for 8153 */
+++>>>>>>> 2dd49e0f16fb (r8152: fix the runtime suspend issues)
+  #define OCP_ADC_CFG		0xbc06
+  
+  /* SRAM Register */
+@@@ -569,6 -612,9 +588,12 @@@ struct r8152 
+  		void (*up)(struct r8152 *);
+  		void (*down)(struct r8152 *);
+  		void (*unload)(struct r8152 *);
+++<<<<<<< HEAD
+++=======
++ 		int (*eee_get)(struct r8152 *, struct ethtool_eee *);
++ 		int (*eee_set)(struct r8152 *, struct ethtool_eee *);
++ 		bool (*in_nway)(struct r8152 *);
+++>>>>>>> 2dd49e0f16fb (r8152: fix the runtime suspend issues)
+  	} rtl_ops;
+  
+  	int intr_interval;
+@@@ -3234,26 -3466,39 +3306,39 @@@ static bool delay_autosuspend(struct r8
+  static int rtl8152_suspend(struct usb_interface *intf, pm_message_t message)
+  {
+  	struct r8152 *tp = usb_get_intfdata(intf);
+++<<<<<<< HEAD
+++=======
++ 	struct net_device *netdev = tp->netdev;
++ 	int ret = 0;
++ 
++ 	mutex_lock(&tp->control);
++ 
++ 	if (PMSG_IS_AUTO(message)) {
++ 		if (netif_running(netdev) && delay_autosuspend(tp)) {
++ 			ret = -EBUSY;
++ 			goto out1;
++ 		}
+++>>>>>>> 2dd49e0f16fb (r8152: fix the runtime suspend issues)
+  
+ +	if (PMSG_IS_AUTO(message))
+  		set_bit(SELECTIVE_SUSPEND, &tp->flags);
+ -	} else {
+ -		netif_device_detach(netdev);
+ -	}
+ +	else
+ +		netif_device_detach(tp->netdev);
+  
+ -	if (netif_running(netdev) && test_bit(WORK_ENABLE, &tp->flags)) {
+ +	if (netif_running(tp->netdev)) {
+  		clear_bit(WORK_ENABLE, &tp->flags);
+  		usb_kill_urb(tp->intr_urb);
+ -		napi_disable(&tp->napi);
+ +		cancel_delayed_work_sync(&tp->schedule);
+  		if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
+ -			rtl_stop_rx(tp);
+  			rtl_runtime_suspend_enable(tp, true);
+  		} else {
+ -			cancel_delayed_work_sync(&tp->schedule);
+ +			tasklet_disable(&tp->tl);
+  			tp->rtl_ops.down(tp);
+ +			tasklet_enable(&tp->tl);
+  		}
+ -		napi_enable(&tp->napi);
+  	}
+ -out1:
+ -	mutex_unlock(&tp->control);
+  
+ -	return ret;
+ +	return 0;
+  }
+  
+  static int rtl8152_resume(struct usb_interface *intf)
+@@@ -3521,51 -4086,38 +3606,81 @@@ static void rtl8153_unload(struct r815
+  	r8153_power_cut_en(tp, false);
+  }
+  
+ -static int rtl_ops_init(struct r8152 *tp)
+ +static int rtl_ops_init(struct r8152 *tp, const struct usb_device_id *id)
+  {
+  	struct rtl_ops *ops = &tp->rtl_ops;
+ -	int ret = 0;
+ +	int ret = -ENODEV;
+ +
+++<<<<<<< HEAD
+ +	switch (id->idVendor) {
+ +	case VENDOR_ID_REALTEK:
+ +		switch (id->idProduct) {
+ +		case PRODUCT_ID_RTL8152:
+ +			ops->init		= r8152b_init;
+ +			ops->enable		= rtl8152_enable;
+ +			ops->disable		= rtl8152_disable;
+ +			ops->up			= rtl8152_up;
+ +			ops->down		= rtl8152_down;
+ +			ops->unload		= rtl8152_unload;
+ +			ret = 0;
+ +			break;
+ +		case PRODUCT_ID_RTL8153:
+ +			ops->init		= r8153_init;
+ +			ops->enable		= rtl8153_enable;
+ +			ops->disable		= rtl8153_disable;
+ +			ops->up			= rtl8153_up;
+ +			ops->down		= rtl8153_down;
+ +			ops->unload		= rtl8153_unload;
+ +			ret = 0;
+ +			break;
+ +		default:
+ +			break;
+ +		}
+ +		break;
+  
+ +	case VENDOR_ID_SAMSUNG:
+ +		switch (id->idProduct) {
+ +		case PRODUCT_ID_SAMSUNG:
+ +			ops->init		= r8153_init;
+ +			ops->enable		= rtl8153_enable;
+ +			ops->disable		= rtl8153_disable;
+ +			ops->up			= rtl8153_up;
+ +			ops->down		= rtl8153_down;
+ +			ops->unload		= rtl8153_unload;
+ +			ret = 0;
+ +			break;
+ +		default:
+ +			break;
+ +		}
+++=======
++ 	switch (tp->version) {
++ 	case RTL_VER_01:
++ 	case RTL_VER_02:
++ 		ops->init		= r8152b_init;
++ 		ops->enable		= rtl8152_enable;
++ 		ops->disable		= rtl8152_disable;
++ 		ops->up			= rtl8152_up;
++ 		ops->down		= rtl8152_down;
++ 		ops->unload		= rtl8152_unload;
++ 		ops->eee_get		= r8152_get_eee;
++ 		ops->eee_set		= r8152_set_eee;
++ 		ops->in_nway		= rtl8152_in_nway;
++ 		break;
++ 
++ 	case RTL_VER_03:
++ 	case RTL_VER_04:
++ 	case RTL_VER_05:
++ 	case RTL_VER_06:
++ 		ops->init		= r8153_init;
++ 		ops->enable		= rtl8153_enable;
++ 		ops->disable		= rtl8153_disable;
++ 		ops->up			= rtl8153_up;
++ 		ops->down		= rtl8153_down;
++ 		ops->unload		= rtl8153_unload;
++ 		ops->eee_get		= r8153_get_eee;
++ 		ops->eee_set		= r8153_set_eee;
++ 		ops->in_nway		= rtl8153_in_nway;
+++>>>>>>> 2dd49e0f16fb (r8152: fix the runtime suspend issues)
+  		break;
+  
+  	default:
+* Unmerged path drivers/net/usb/r8152.c
