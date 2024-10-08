@@ -1,0 +1,169 @@
+ACPI / video / i915: No ACPI backlight if firmware expects Windows 8
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [acpi] video / i915: No ACPI backlight if firmware expects Windows 8 (Benjamin Tissoires) [1218354]
+Rebuild_FUZZ: 94.57%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 8c5bd7adb2ce47e6aa39d17b2375f69b0c0aa255
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8c5bd7ad.failed
+
+According to Matthew Garrett, "Windows 8 leaves backlight control up
+to individual graphics drivers rather than making ACPI calls itself.
+There's plenty of evidence to suggest that the Intel driver for
+Windows [8] doesn't use the ACPI interface, including the fact that
+it's broken on a bunch of machines when the OS claims to support
+Windows 8.  The simplest thing to do appears to be to disable the
+ACPI backlight interface on these systems".
+
+There's a problem with that approach, however, because simply
+avoiding to register the ACPI backlight interface if the firmware
+calls _OSI for Windows 8 may not work in the following situations:
+ (1) The ACPI backlight interface actually works on the given system
+     and the i915 driver is not loaded (e.g. another graphics driver
+     is used).
+ (2) The ACPI backlight interface doesn't work on the given system,
+     but there is a vendor platform driver that will register its
+     own, equally broken, backlight interface if not prevented from
+     doing so by the ACPI subsystem.
+Therefore we need to allow the ACPI backlight interface to be
+registered until the i915 driver is loaded which then will unregister
+it if the firmware has called _OSI for Windows 8 (or will register
+the ACPI video driver without backlight support if not already
+present).
+
+For this reason, introduce an alternative function for registering
+ACPI video, acpi_video_register_with_quirks(), that will check
+whether or not the ACPI video driver has already been registered
+and whether or not the backlight Windows 8 quirk has to be applied.
+If the quirk has to be applied, it will block the ACPI backlight
+support and either unregister the backlight interface if the ACPI
+video driver has already been registered, or register the ACPI
+video driver without the backlight interface otherwise.  Make
+the i915 driver use acpi_video_register_with_quirks() instead of
+acpi_video_register() in i915_driver_load().
+
+This change is based on earlier patches from Matthew Garrett,
+Chun-Yi Lee and Seth Forshee and includes a fix from Aaron Lu's.
+
+References: https://bugzilla.kernel.org/show_bug.cgi?id=51231
+	Tested-by: Aaron Lu <aaron.lu@intel.com>
+	Tested-by: Igor Gnatenko <i.gnatenko.brain@gmail.com>
+	Tested-by: Yves-Alexis Perez <corsac@debian.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Aaron Lu <aaron.lu@intel.com>
+	Acked-by: Matthew Garrett <matthew.garrett@nebula.com>
+(cherry picked from commit 8c5bd7adb2ce47e6aa39d17b2375f69b0c0aa255)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/video.c
+#	drivers/acpi/video_detect.c
+diff --cc drivers/acpi/video.c
+index e85f3db4db1e,e9d4bb60c35c..000000000000
+--- a/drivers/acpi/video.c
++++ b/drivers/acpi/video.c
+@@@ -45,6 -45,8 +45,11 @@@
+  #include <acpi/video.h>
+  
+  #include "internal.h"
+++<<<<<<< HEAD
+++=======
++ 
++ #define PREFIX "ACPI: "
+++>>>>>>> 8c5bd7adb2ce (ACPI / video / i915: No ACPI backlight if firmware expects Windows 8)
+  
+  #define ACPI_VIDEO_BUS_NAME		"Video Bus"
+  #define ACPI_VIDEO_DEVICE_NAME		"Video Device"
+diff --cc drivers/acpi/video_detect.c
+index 00bcfb92f3ef,826e52def080..000000000000
+--- a/drivers/acpi/video_detect.c
++++ b/drivers/acpi/video_detect.c
+@@@ -39,6 -39,8 +39,11 @@@
+  #include <linux/pci.h>
+  
+  #include "internal.h"
+++<<<<<<< HEAD
+++=======
++ 
++ #define PREFIX "ACPI: "
+++>>>>>>> 8c5bd7adb2ce (ACPI / video / i915: No ACPI backlight if firmware expects Windows 8)
+  
+  ACPI_MODULE_NAME("video");
+  #define _COMPONENT		ACPI_VIDEO_COMPONENT
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index 1eabf931aaba..873057e3481f 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -172,4 +172,15 @@ struct platform_device;
+ int acpi_create_platform_device(struct acpi_device *adev,
+ 				const struct acpi_device_id *id);
+ 
++/*--------------------------------------------------------------------------
++					Video
++  -------------------------------------------------------------------------- */
++#if defined(CONFIG_ACPI_VIDEO) || defined(CONFIG_ACPI_VIDEO_MODULE)
++bool acpi_video_backlight_quirks(void);
++bool acpi_video_verify_backlight_support(void);
++#else
++static inline bool acpi_video_backlight_quirks(void) { return false; }
++static inline bool acpi_video_verify_backlight_support(void) { return false; }
++#endif
++
+ #endif /* _ACPI_INTERNAL_H_ */
+* Unmerged path drivers/acpi/video.c
+* Unmerged path drivers/acpi/video_detect.c
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index bb61cffa4b72..1b4db9ea491b 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1786,7 +1786,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 	if (INTEL_INFO(dev)->num_pipes) {
+ 		/* Must be done after probing outputs */
+ 		intel_opregion_init(dev);
+-		acpi_video_register();
++		acpi_video_register_with_quirks();
+ 	}
+ 
+ 	if (IS_GEN5(dev))
+diff --git a/include/acpi/video.h b/include/acpi/video.h
+index 61109f2609fc..b26dc4fb7ba8 100644
+--- a/include/acpi/video.h
++++ b/include/acpi/video.h
+@@ -17,12 +17,21 @@ struct acpi_device;
+ #define ACPI_VIDEO_DISPLAY_LEGACY_TV      0x0200
+ 
+ #if (defined CONFIG_ACPI_VIDEO || defined CONFIG_ACPI_VIDEO_MODULE)
+-extern int acpi_video_register(void);
++extern int __acpi_video_register(bool backlight_quirks);
++static inline int acpi_video_register(void)
++{
++	return __acpi_video_register(false);
++}
++static inline int acpi_video_register_with_quirks(void)
++{
++	return __acpi_video_register(true);
++}
+ extern void acpi_video_unregister(void);
+ extern int acpi_video_get_edid(struct acpi_device *device, int type,
+ 			       int device_id, void **edid);
+ #else
+ static inline int acpi_video_register(void) { return 0; }
++static inline int acpi_video_register_with_quirks(void) { return 0; }
+ static inline void acpi_video_unregister(void) { return; }
+ static inline int acpi_video_get_edid(struct acpi_device *device, int type,
+ 				      int device_id, void **edid)
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 3ebc82e7b5ca..6ef84beecaa9 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -206,6 +206,7 @@ extern bool wmi_has_guid(const char *guid);
+ #define ACPI_VIDEO_BACKLIGHT_DMI_VIDEO			0x0200
+ #define ACPI_VIDEO_OUTPUT_SWITCHING_DMI_VENDOR		0x0400
+ #define ACPI_VIDEO_OUTPUT_SWITCHING_DMI_VIDEO		0x0800
++#define ACPI_VIDEO_SKIP_BACKLIGHT			0x1000
+ 
+ #if defined(CONFIG_ACPI_VIDEO) || defined(CONFIG_ACPI_VIDEO_MODULE)
+ 
