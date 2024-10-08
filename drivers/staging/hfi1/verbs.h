@@ -381,6 +381,20 @@ struct hfi1_ack_entry {
 };
 
 /*
+ * hfi1 specific data structures that will be hidden from rvt after the queue
+ * pair is made common
+ */
+struct hfi1_qp;
+struct hfi1_qp_priv {
+	struct ahg_ib_header *s_hdr; /* next packet header to send */
+	struct sdma_engine *s_sde;   /* current sde */
+	u8 s_sc;		     /* SC[0..4] for next packet */
+	u8 r_adefered;               /* number of acks defered */
+	struct iowait s_iowait;
+	struct hfi1_qp *owner;
+};
+
+/*
  * Variables prefixed with s_ are for the requester (sender).
  * Variables prefixed with r_ are for the responder (receiver).
  * Variables prefixed with ack_ are for responder replies.
@@ -390,16 +404,13 @@ struct hfi1_ack_entry {
  */
 struct hfi1_qp {
 	struct ib_qp ibqp;
+	void *priv;
 	/* read mostly fields above and below */
 	struct ib_ah_attr remote_ah_attr;
 	struct ib_ah_attr alt_ah_attr;
 	struct hfi1_qp __rcu *next;           /* link list for QPN hash table */
 	struct hfi1_swqe *s_wq;  /* send work queue */
 	struct hfi1_mmap_info *ip;
-	struct ahg_ib_header *s_hdr;     /* next packet header to send */
-	struct sdma_engine *s_sde; /* current sde */
-	/* sc for UC/RC QPs - based on ah for UD */
-	u8 s_sc;
 	unsigned long timeout_jiffies;  /* computed from timeout */
 
 	enum ib_mtu path_mtu;
@@ -447,7 +458,6 @@ struct hfi1_qp {
 	u32 r_psn;              /* expected rcv packet sequence number */
 	u32 r_msn;              /* message sequence number */
 
-	u8 r_adefered;         /* number of acks defered */
 	u8 r_state;             /* opcode of last packet received */
 	u8 r_flags;
 	u8 r_head_ack_queue;    /* index into s_ack_queue[] */
@@ -494,8 +504,6 @@ struct hfi1_qp {
 
 	struct hfi1_sge_state s_ack_rdma_sge;
 	struct timer_list s_timer;
-
-	struct iowait s_iowait;
 
 	struct hfi1_sge r_sg_list[0] /* verified SGEs */
 		____cacheline_aligned_in_smp;
@@ -783,6 +791,14 @@ static inline struct hfi1_qp *to_iqp(struct ib_qp *ibqp)
 static inline struct hfi1_ibdev *to_idev(struct ib_device *ibdev)
 {
 	return container_of(ibdev, struct hfi1_ibdev, ibdev);
+}
+
+static inline struct hfi1_qp *iowait_to_qp(struct  iowait *s_iowait)
+{
+	struct hfi1_qp_priv *priv;
+
+	priv = container_of(s_iowait, struct hfi1_qp_priv, s_iowait);
+	return priv->owner;
 }
 
 /*
