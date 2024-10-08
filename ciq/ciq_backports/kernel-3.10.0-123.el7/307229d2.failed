@@ -1,0 +1,339 @@
+ALSA: hda - hdmi: Allow HDA patches to customize more operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [alsa] hda/hdmi: Allow HDA patches to customize more operations (Jaroslav Kysela) [1044022]
+Rebuild_FUZZ: 91.67%
+commit-author Anssi Hannula <anssi.hannula@iki.fi>
+commit 307229d2ac5f60447cc655ebbce5d9c0baa18bbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/307229d2.failed
+
+Upcoming AMD multichannel support requires many customized operations
+(channel mapping, ELD, HBR) but can otherwise share most of its code
+with the generic patch.
+
+Add a local struct hdmi_ops containing customizable HDMI-specific
+callbacks and move the current code to those callbacks. Functionality is
+unaltered.
+
+	Signed-off-by: Anssi Hannula <anssi.hannula@iki.fi>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 307229d2ac5f60447cc655ebbce5d9c0baa18bbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/patch_hdmi.c
+diff --cc sound/pci/hda/patch_hdmi.c
+index 11d61f096ef5,acc00fe01b71..000000000000
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@@ -71,8 -77,44 +71,41 @@@ struct hdmi_spec_per_pin 
+  	bool chmap_set;		/* channel-map override by ALSA API? */
+  	unsigned char chmap[8]; /* ALSA API channel-map */
+  	char pcm_name[8];	/* filled in build_pcm callbacks */
+ -#ifdef CONFIG_PROC_FS
+ -	struct snd_info_entry *proc_entry;
+ -#endif
+  };
+  
++ struct cea_channel_speaker_allocation;
++ 
++ /* operations used by generic code that can be overridden by patches */
++ struct hdmi_ops {
++ 	int (*pin_get_eld)(struct hda_codec *codec, hda_nid_t pin_nid,
++ 			   unsigned char *buf, int *eld_size);
++ 
++ 	/* get and set channel assigned to each HDMI ASP (audio sample packet) slot */
++ 	int (*pin_get_slot_channel)(struct hda_codec *codec, hda_nid_t pin_nid,
++ 				    int asp_slot);
++ 	int (*pin_set_slot_channel)(struct hda_codec *codec, hda_nid_t pin_nid,
++ 				    int asp_slot, int channel);
++ 
++ 	void (*pin_setup_infoframe)(struct hda_codec *codec, hda_nid_t pin_nid,
++ 				    int ca, int active_channels, int conn_type);
++ 
++ 	/* enable/disable HBR (HD passthrough) */
++ 	int (*pin_hbr_setup)(struct hda_codec *codec, hda_nid_t pin_nid, bool hbr);
++ 
++ 	int (*setup_stream)(struct hda_codec *codec, hda_nid_t cvt_nid,
++ 			    hda_nid_t pin_nid, u32 stream_tag, int format);
++ 
++ 	/* Helpers for producing the channel map TLVs. These can be overridden
++ 	 * for devices that have non-standard mapping requirements. */
++ 	int (*chmap_cea_alloc_validate_get_type)(struct cea_channel_speaker_allocation *cap,
++ 						 int channels);
++ 	void (*cea_alloc_to_tlv_chmap)(struct cea_channel_speaker_allocation *cap,
++ 				       unsigned int *chmap, int channels);
++ 
++ 	/* check that the user-given chmap is supported */
++ 	int (*chmap_validate)(int ca, int channels, unsigned char *chmap);
++ };
++ 
+  struct hdmi_spec {
+  	int num_cvts;
+  	struct snd_array cvts; /* struct hdmi_spec_per_cvt */
+@@@ -713,8 -842,11 +748,13 @@@ static int hdmi_manual_channel_allocati
+  /* set up the channel slots for the given ALSA API channel map */
+  static int hdmi_manual_setup_channel_mapping(struct hda_codec *codec,
+  					     hda_nid_t pin_nid,
+ -					     int chs, unsigned char *map,
+ -					     int ca)
+ +					     int chs, unsigned char *map)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct hdmi_spec *spec = codec->spec;
++ 	int ordered_ca = get_channel_allocation_order(ca);
+++>>>>>>> 307229d2ac5f (ALSA: hda - hdmi: Allow HDA patches to customize more operations)
+  	int alsa_pos, hdmi_slot;
+  	int assignments[8] = {[0 ... 7] = 0xf};
+  
+@@@ -764,8 -896,26 +803,24 @@@ static void hdmi_setup_channel_mapping(
+  		hdmi_std_setup_channel_mapping(codec, pin_nid, non_pcm, ca);
+  		hdmi_setup_fake_chmap(map, ca);
+  	}
+ -
+ -	hdmi_debug_channel_mapping(codec, pin_nid);
+  }
+  
++ static int hdmi_pin_set_slot_channel(struct hda_codec *codec, hda_nid_t pin_nid,
++ 				     int asp_slot, int channel)
++ {
++ 	return snd_hda_codec_write(codec, pin_nid, 0,
++ 				   AC_VERB_SET_HDMI_CHAN_SLOT,
++ 				   (channel << 4) | asp_slot);
++ }
++ 
++ static int hdmi_pin_get_slot_channel(struct hda_codec *codec, hda_nid_t pin_nid,
++ 				     int asp_slot)
++ {
++ 	return (snd_hda_codec_read(codec, pin_nid, 0,
++ 				   AC_VERB_GET_HDMI_CHAN_SLOT,
++ 				   asp_slot) & 0xf0) >> 4;
++ }
++ 
+  /*
+   * Audio InfoFrame routines
+   */
+@@@ -887,17 -1037,72 +942,77 @@@ static bool hdmi_infoframe_uptodate(str
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static void hdmi_setup_audio_infoframe(struct hda_codec *codec, int pin_idx,
+ +				       bool non_pcm,
+ +				       struct snd_pcm_substream *substream)
+ +{
+ +	struct hdmi_spec *spec = codec->spec;
+ +	struct hdmi_spec_per_pin *per_pin = get_pin(spec, pin_idx);
+++=======
++ static void hdmi_pin_setup_infoframe(struct hda_codec *codec,
++ 				     hda_nid_t pin_nid,
++ 				     int ca, int active_channels,
++ 				     int conn_type)
++ {
++ 	union audio_infoframe ai;
++ 
++ 	if (conn_type == 0) { /* HDMI */
++ 		struct hdmi_audio_infoframe *hdmi_ai = &ai.hdmi;
++ 
++ 		hdmi_ai->type		= 0x84;
++ 		hdmi_ai->ver		= 0x01;
++ 		hdmi_ai->len		= 0x0a;
++ 		hdmi_ai->CC02_CT47	= active_channels - 1;
++ 		hdmi_ai->CA		= ca;
++ 		hdmi_checksum_audio_infoframe(hdmi_ai);
++ 	} else if (conn_type == 1) { /* DisplayPort */
++ 		struct dp_audio_infoframe *dp_ai = &ai.dp;
++ 
++ 		dp_ai->type		= 0x84;
++ 		dp_ai->len		= 0x1b;
++ 		dp_ai->ver		= 0x11 << 2;
++ 		dp_ai->CC02_CT47	= active_channels - 1;
++ 		dp_ai->CA		= ca;
++ 	} else {
++ 		snd_printd("HDMI: unknown connection type at pin %d\n",
++ 			    pin_nid);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * sizeof(ai) is used instead of sizeof(*hdmi_ai) or
++ 	 * sizeof(*dp_ai) to avoid partial match/update problems when
++ 	 * the user switches between HDMI/DP monitors.
++ 	 */
++ 	if (!hdmi_infoframe_uptodate(codec, pin_nid, ai.bytes,
++ 					sizeof(ai))) {
++ 		snd_printdd("hdmi_pin_setup_infoframe: "
++ 			    "pin=%d channels=%d ca=0x%02x\n",
++ 			    pin_nid,
++ 			    active_channels, ca);
++ 		hdmi_stop_infoframe_trans(codec, pin_nid);
++ 		hdmi_fill_audio_infoframe(codec, pin_nid,
++ 					    ai.bytes, sizeof(ai));
++ 		hdmi_start_infoframe_trans(codec, pin_nid);
++ 	}
++ }
++ 
++ static void hdmi_setup_audio_infoframe(struct hda_codec *codec,
++ 				       struct hdmi_spec_per_pin *per_pin,
++ 				       bool non_pcm)
++ {
++ 	struct hdmi_spec *spec = codec->spec;
+++>>>>>>> 307229d2ac5f (ALSA: hda - hdmi: Allow HDA patches to customize more operations)
+  	hda_nid_t pin_nid = per_pin->pin_nid;
+ -	int channels = per_pin->channels;
+ -	int active_channels;
+ +	int channels = substream->runtime->channels;
+  	struct hdmi_eld *eld;
+++<<<<<<< HEAD
+ +	int ca;
+ +	union audio_infoframe ai;
+++=======
++ 	int ca, ordered_ca;
+ -
+ -	if (!channels)
+ -		return;
+ -
+ -	if (is_haswell(codec))
+ -		snd_hda_codec_write(codec, pin_nid, 0,
+ -					    AC_VERB_SET_AMP_GAIN_MUTE,
+ -					    AMP_OUT_UNMUTE);
+++>>>>>>> 307229d2ac5f (ALSA: hda - hdmi: Allow HDA patches to customize more operations)
+  
+  	eld = &per_pin->sink_eld;
+  	if (!eld->monitor_present)
+@@@ -910,56 -1115,21 +1025,74 @@@
+  	if (ca < 0)
+  		ca = 0;
+  
+++<<<<<<< HEAD
+ +	memset(&ai, 0, sizeof(ai));
+ +	if (eld->info.conn_type == 0) { /* HDMI */
+ +		struct hdmi_audio_infoframe *hdmi_ai = &ai.hdmi;
+ +
+ +		hdmi_ai->type		= 0x84;
+ +		hdmi_ai->ver		= 0x01;
+ +		hdmi_ai->len		= 0x0a;
+ +		hdmi_ai->CC02_CT47	= channels - 1;
+ +		hdmi_ai->CA		= ca;
+ +		hdmi_checksum_audio_infoframe(hdmi_ai);
+ +	} else if (eld->info.conn_type == 1) { /* DisplayPort */
+ +		struct dp_audio_infoframe *dp_ai = &ai.dp;
+ +
+ +		dp_ai->type		= 0x84;
+ +		dp_ai->len		= 0x1b;
+ +		dp_ai->ver		= 0x11 << 2;
+ +		dp_ai->CC02_CT47	= channels - 1;
+ +		dp_ai->CA		= ca;
+ +	} else {
+ +		snd_printd("HDMI: unknown connection type at pin %d\n",
+ +			    pin_nid);
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * sizeof(ai) is used instead of sizeof(*hdmi_ai) or
+ +	 * sizeof(*dp_ai) to avoid partial match/update problems when
+ +	 * the user switches between HDMI/DP monitors.
+ +	 */
+ +	if (!hdmi_infoframe_uptodate(codec, pin_nid, ai.bytes,
+ +					sizeof(ai))) {
+ +		snd_printdd("hdmi_setup_audio_infoframe: "
+ +			    "pin=%d channels=%d\n",
+ +			    pin_nid,
+ +			    channels);
+ +		hdmi_setup_channel_mapping(codec, pin_nid, non_pcm, ca,
+ +					   channels, per_pin->chmap,
+ +					   per_pin->chmap_set);
+ +		hdmi_stop_infoframe_trans(codec, pin_nid);
+ +		hdmi_fill_audio_infoframe(codec, pin_nid,
+ +					    ai.bytes, sizeof(ai));
+ +		hdmi_start_infoframe_trans(codec, pin_nid);
+ +	} else {
+ +		/* For non-pcm audio switch, setup new channel mapping
+ +		 * accordingly */
+ +		if (per_pin->non_pcm != non_pcm)
+ +			hdmi_setup_channel_mapping(codec, pin_nid, non_pcm, ca,
+ +						   channels, per_pin->chmap,
+ +						   per_pin->chmap_set);
+ +	}
+++=======
++ 	ordered_ca = get_channel_allocation_order(ca);
++ 	active_channels = channel_allocations[ordered_ca].channels;
++ 
++ 	hdmi_set_channel_count(codec, per_pin->cvt_nid, active_channels);
++ 
++ 	/*
++ 	 * always configure channel mapping, it may have been changed by the
++ 	 * user in the meantime
++ 	 */
++ 	hdmi_setup_channel_mapping(codec, pin_nid, non_pcm, ca,
++ 				   channels, per_pin->chmap,
++ 				   per_pin->chmap_set);
++ 
++ 	spec->ops.pin_setup_infoframe(codec, pin_nid, ca, active_channels,
++ 				      eld->info.conn_type);
+++>>>>>>> 307229d2ac5f (ALSA: hda - hdmi: Allow HDA patches to customize more operations)
+  
+  	per_pin->non_pcm = non_pcm;
+  }
+@@@ -1086,14 -1236,10 +1218,18 @@@ static void haswell_verify_pin_D0(struc
+  #define is_hbr_format(format) \
+  	((format & AC_FMT_TYPE_NON_PCM) && (format & AC_FMT_CHAN_MASK) == 7)
+  
+- static int hdmi_setup_stream(struct hda_codec *codec, hda_nid_t cvt_nid,
+- 			      hda_nid_t pin_nid, u32 stream_tag, int format)
++ static int hdmi_pin_hbr_setup(struct hda_codec *codec, hda_nid_t pin_nid,
++ 			      bool hbr)
+  {
+++<<<<<<< HEAD
+ +	int pinctl;
+ +	int new_pinctl = 0;
+ +
+ +	if (codec->vendor_id == 0x80862807)
+ +		haswell_verify_pin_D0(codec, cvt_nid, pin_nid);
+++=======
++ 	int pinctl, new_pinctl;
+++>>>>>>> 307229d2ac5f (ALSA: hda - hdmi: Allow HDA patches to customize more operations)
+  
+  	if (snd_hda_query_pin_caps(codec, pin_nid) & AC_PINCAP_HBR) {
+  		pinctl = snd_hda_codec_read(codec, pin_nid, 0,
+@@@ -1534,12 -1718,14 +1685,12 @@@ static int generic_hdmi_playback_pcm_pr
+  	bool non_pcm;
+  
+  	non_pcm = check_non_pcm_per_cvt(codec, cvt_nid);
+ -	mutex_lock(&per_pin->lock);
+ -	per_pin->channels = substream->runtime->channels;
+ -	per_pin->setup = true;
+  
+ -	hdmi_setup_audio_infoframe(codec, per_pin, non_pcm);
+ -	mutex_unlock(&per_pin->lock);
+ +	hdmi_set_channel_count(codec, cvt_nid, substream->runtime->channels);
+ +
+ +	hdmi_setup_audio_infoframe(codec, pin_idx, non_pcm, substream);
+  
+- 	return hdmi_setup_stream(codec, cvt_nid, pin_nid, stream_tag, format);
++ 	return spec->ops.setup_stream(codec, cvt_nid, pin_nid, stream_tag, format);
+  }
+  
+  static int generic_hdmi_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
+@@@ -1705,6 -1924,12 +1883,15 @@@ static int hdmi_chmap_ctl_put(struct sn
+  	ca = hdmi_manual_channel_allocation(ARRAY_SIZE(chmap), chmap);
+  	if (ca < 0)
+  		return -EINVAL;
+++<<<<<<< HEAD
+++=======
++ 	if (spec->ops.chmap_validate) {
++ 		err = spec->ops.chmap_validate(ca, ARRAY_SIZE(chmap), chmap);
++ 		if (err)
++ 			return err;
++ 	}
++ 	mutex_lock(&per_pin->lock);
+++>>>>>>> 307229d2ac5f (ALSA: hda - hdmi: Allow HDA patches to customize more operations)
+  	per_pin->chmap_set = true;
+  	memcpy(per_pin->chmap, chmap, sizeof(chmap));
+  	if (prepared)
+* Unmerged path sound/pci/hda/patch_hdmi.c
