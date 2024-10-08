@@ -50,7 +50,6 @@
 
 #if defined(CONFIG_PPC_PMAC)
 #include <asm/prom.h>
-#include <asm/pci-bridge.h>
 #include "../macmodes.h"
 #endif
 
