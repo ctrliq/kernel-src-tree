@@ -2963,7 +2963,7 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 			.no_buffering  = true,
 			.mmap_pages    = UINT_MAX,
 		},
-		.output = stdout,
+		.output = stderr,
 		.show_comm = true,
 		.trace_syscalls = true,
 	};
