@@ -473,7 +473,7 @@ bool virtqueue_notify(struct virtqueue *_vq)
 		return false;
 
 	/* Prod other side to tell it about changes. */
-	if (vq->notify(_vq) < 0) {
+	if (!vq->notify(_vq)) {
 		vq->broken = true;
 		return false;
 	}
