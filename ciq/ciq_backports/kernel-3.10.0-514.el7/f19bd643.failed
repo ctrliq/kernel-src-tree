@@ -1,0 +1,417 @@
+IB/hfi1: Prevent NULL pointer deferences in caching code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit f19bd643dbded8672bfeffe9e51322464e4a9239
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f19bd643.failed
+
+There is a potential kernel crash when the MMU notifier calls the
+invalidation routines in the hfi1 pinned page caching code for sdma.
+
+The invalidation routine could call the remove callback
+for the node, which in turn ends up dereferencing the
+current task_struct to get a pointer to the mm_struct.
+However, the mm_struct pointer could be NULL resulting in
+the following backtrace:
+
+    BUG: unable to handle kernel NULL pointer dereference at 00000000000000a8
+    IP: [<ffffffffa041f75a>] sdma_rb_remove+0xaa/0x100 [hfi1]
+    15
+    task: ffff88085e66e080 ti: ffff88085c244000 task.ti: ffff88085c244000
+    RIP: 0010:[<ffffffffa041f75a>]  [<ffffffffa041f75a>] sdma_rb_remove+0xaa/0x100 [hfi1]
+    RSP: 0000:ffff88085c245878  EFLAGS: 00010002
+    RAX: 0000000000000000 RBX: ffff88105b9bbd40 RCX: ffffea003931a830
+    RDX: 0000000000000004 RSI: ffff88105754a9c0 RDI: ffff88105754a9c0
+    RBP: ffff88085c245890 R08: ffff88105b9bbd70 R09: 00000000fffffffb
+    R10: ffff88105b9bbd58 R11: 0000000000000013 R12: ffff88105754a9c0
+    R13: 0000000000000001 R14: 0000000000000001 R15: ffff88105b9bbd40
+    FS:  0000000000000000(0000) GS:ffff88107ef40000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 00000000000000a8 CR3: 0000000001a0b000 CR4: 00000000001407e0
+    Stack:
+     ffff88105b9bbd40 ffff88080ec481a8 ffff88080ec481b8 ffff88085c2458c0
+     ffffffffa03fa00e ffff88080ec48190 ffff88080ed9cd00 0000000001024000
+     0000000000000000 ffff88085c245920 ffffffffa03fa0e7 0000000000000282
+    Call Trace:
+     [<ffffffffa03fa00e>] __mmu_rb_remove.isra.5+0x5e/0x70 [hfi1]
+     [<ffffffffa03fa0e7>] mmu_notifier_mem_invalidate+0xc7/0xf0 [hfi1]
+     [<ffffffffa03fa143>] mmu_notifier_page+0x13/0x20 [hfi1]
+     [<ffffffff81156dd0>] __mmu_notifier_invalidate_page+0x50/0x70
+     [<ffffffff81140bbb>] try_to_unmap_one+0x20b/0x470
+     [<ffffffff81141ee7>] try_to_unmap_anon+0xa7/0x120
+     [<ffffffff81141fad>] try_to_unmap+0x4d/0x60
+     [<ffffffff8111fd7b>] shrink_page_list+0x2eb/0x9d0
+     [<ffffffff81120ab3>] shrink_inactive_list+0x243/0x490
+     [<ffffffff81121491>] shrink_lruvec+0x4c1/0x640
+     [<ffffffff81121641>] shrink_zone+0x31/0x100
+     [<ffffffff81121b0f>] kswapd_shrink_zone.constprop.62+0xef/0x1c0
+     [<ffffffff811229e3>] kswapd+0x403/0x7e0
+     [<ffffffff811225e0>] ? shrink_all_memory+0xf0/0xf0
+     [<ffffffff81068ac0>] kthread+0xc0/0xd0
+     [<ffffffff81068a00>] ? insert_kthread_work+0x40/0x40
+     [<ffffffff814ff8ec>] ret_from_fork+0x7c/0xb0
+     [<ffffffff81068a00>] ? insert_kthread_work+0x40/0x40
+
+To correct this, the mm_struct passed to us by the MMU notifier is
+used (which is what should have been done to begin with). This avoids
+the broken derefences and ensures that the correct mm_struct is used.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f19bd643dbded8672bfeffe9e51322464e4a9239)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/debugfs.h
+#	drivers/staging/hfi1/user_sdma.c
+#	drivers/staging/rdma/hfi1/mmu_rb.c
+#	drivers/staging/rdma/hfi1/user_exp_rcv.c
+diff --cc drivers/staging/hfi1/debugfs.h
+index 92d6fe146714,19a306e83c7d..000000000000
+--- a/drivers/staging/hfi1/debugfs.h
++++ b/drivers/staging/hfi1/debugfs.h
+@@@ -49,30 -44,31 +49,40 @@@
+   * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   *
+   */
+ -#ifndef _HFI1_MMU_RB_H
+ -#define _HFI1_MMU_RB_H
+  
+ -#include "hfi.h"
+ +struct hfi1_ibdev;
+ +#ifdef CONFIG_DEBUG_FS
+ +void hfi1_dbg_ibdev_init(struct hfi1_ibdev *ibd);
+ +void hfi1_dbg_ibdev_exit(struct hfi1_ibdev *ibd);
+ +void hfi1_dbg_init(void);
+ +void hfi1_dbg_exit(void);
+ +#else
+ +static inline void hfi1_dbg_ibdev_init(struct hfi1_ibdev *ibd)
+ +{
+ +}
+  
+ -struct mmu_rb_node {
+ -	unsigned long addr;
+ -	unsigned long len;
+ -	unsigned long __last;
+ -	struct rb_node node;
+ -};
+ +void hfi1_dbg_ibdev_exit(struct hfi1_ibdev *ibd)
+ +{
+ +}
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/debugfs.h
+ +void hfi1_dbg_init(void)
+ +{
+ +}
+++=======
++ struct mmu_rb_ops {
++ 	bool (*filter)(struct mmu_rb_node *, unsigned long, unsigned long);
++ 	int (*insert)(struct rb_root *, struct mmu_rb_node *);
++ 	void (*remove)(struct rb_root *, struct mmu_rb_node *,
++ 		       struct mm_struct *);
++ 	int (*invalidate)(struct rb_root *, struct mmu_rb_node *);
++ };
+++>>>>>>> f19bd643dbde (IB/hfi1: Prevent NULL pointer deferences in caching code):drivers/staging/rdma/hfi1/mmu_rb.h
+ +
+ +void hfi1_dbg_exit(void)
+ +{
+ +}
+  
+ -int hfi1_mmu_rb_register(struct rb_root *root, struct mmu_rb_ops *ops);
+ -void hfi1_mmu_rb_unregister(struct rb_root *);
+ -int hfi1_mmu_rb_insert(struct rb_root *, struct mmu_rb_node *);
+ -void hfi1_mmu_rb_remove(struct rb_root *, struct mmu_rb_node *);
+ -struct mmu_rb_node *hfi1_mmu_rb_search(struct rb_root *, unsigned long,
+ -				       unsigned long);
+ +#endif
+  
+ -#endif /* _HFI1_MMU_RB_H */
+ +#endif                          /* _HFI1_DEBUGFS_H */
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 6967deb7956a,e08c74fe4c6b..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -297,6 -297,18 +297,21 @@@ static int defer_packet_queue
+  	struct sdma_txreq *,
+  	unsigned seq);
+  static void activate_packet_queue(struct iowait *, int);
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ static bool sdma_rb_filter(struct mmu_rb_node *, unsigned long, unsigned long);
++ static int sdma_rb_insert(struct rb_root *, struct mmu_rb_node *);
++ static void sdma_rb_remove(struct rb_root *, struct mmu_rb_node *,
++ 			   struct mm_struct *);
++ static int sdma_rb_invalidate(struct rb_root *, struct mmu_rb_node *);
++ 
++ static struct mmu_rb_ops sdma_rb_ops = {
++ 	.filter = sdma_rb_filter,
++ 	.insert = sdma_rb_insert,
++ 	.remove = sdma_rb_remove,
++ 	.invalidate = sdma_rb_invalidate
++ };
+++>>>>>>> f19bd643dbde (IB/hfi1: Prevent NULL pointer deferences in caching code):drivers/staging/rdma/hfi1/user_sdma.c
+  
+  static int defer_packet_queue(
+  	struct sdma_engine *sde,
+@@@ -1036,40 -1029,131 +1051,68 @@@ static inline int num_user_pages(const 
+  	return 1 + ((epage - spage) >> PAGE_SHIFT);
+  }
+  
+ -/* Caller must hold pq->evict_lock */
+ -static u32 sdma_cache_evict(struct hfi1_user_sdma_pkt_q *pq, u32 npages)
+ -{
+ -	u32 cleared = 0;
+ -	struct sdma_mmu_node *node, *ptr;
+ -
+ -	list_for_each_entry_safe_reverse(node, ptr, &pq->evict, list) {
+ -		/* Make sure that no one is still using the node. */
+ -		if (!atomic_read(&node->refcount)) {
+ -			/*
+ -			 * Need to use the page count now as the remove callback
+ -			 * will free the node.
+ -			 */
+ -			cleared += node->npages;
+ -			spin_unlock(&pq->evict_lock);
+ -			hfi1_mmu_rb_remove(&pq->sdma_rb_root, &node->rb);
+ -			spin_lock(&pq->evict_lock);
+ -			if (cleared >= npages)
+ -				break;
+ -		}
+ -	}
+ -	return cleared;
+ -}
+ -
+  static int pin_vector_pages(struct user_sdma_request *req,
+  			    struct user_sdma_iovec *iovec) {
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +	int pinned, npages;
+++=======
++ 	int ret = 0, pinned, npages, cleared;
++ 	struct page **pages;
++ 	struct hfi1_user_sdma_pkt_q *pq = req->pq;
++ 	struct sdma_mmu_node *node = NULL;
++ 	struct mmu_rb_node *rb_node;
++ 
++ 	rb_node = hfi1_mmu_rb_search(&pq->sdma_rb_root,
++ 				     (unsigned long)iovec->iov.iov_base,
++ 				     iovec->iov.iov_len);
++ 	if (rb_node && !IS_ERR(rb_node))
++ 		node = container_of(rb_node, struct sdma_mmu_node, rb);
++ 	else
++ 		rb_node = NULL;
++ 
++ 	if (!node) {
++ 		node = kzalloc(sizeof(*node), GFP_KERNEL);
++ 		if (!node)
++ 			return -ENOMEM;
++ 
++ 		node->rb.addr = (unsigned long)iovec->iov.iov_base;
++ 		node->rb.len = iovec->iov.iov_len;
++ 		node->pq = pq;
++ 		atomic_set(&node->refcount, 0);
++ 		INIT_LIST_HEAD(&node->list);
++ 	}
+++>>>>>>> f19bd643dbde (IB/hfi1: Prevent NULL pointer deferences in caching code):drivers/staging/rdma/hfi1/user_sdma.c
+  
+  	npages = num_user_pages(&iovec->iov);
+ -	if (node->npages < npages) {
+ -		pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
+ -		if (!pages) {
+ -			SDMA_DBG(req, "Failed page array alloc");
+ -			ret = -ENOMEM;
+ -			goto bail;
+ -		}
+ -		memcpy(pages, node->pages, node->npages * sizeof(*pages));
+ -
+ -		npages -= node->npages;
+ -retry:
+ -		if (!hfi1_can_pin_pages(pq->dd, pq->n_locked, npages)) {
+ -			spin_lock(&pq->evict_lock);
+ -			cleared = sdma_cache_evict(pq, npages);
+ -			spin_unlock(&pq->evict_lock);
+ -			if (cleared >= npages)
+ -				goto retry;
+ -		}
+ -		pinned = hfi1_acquire_user_pages(
+ -			((unsigned long)iovec->iov.iov_base +
+ -			 (node->npages * PAGE_SIZE)), npages, 0,
+ -			pages + node->npages);
+ -		if (pinned < 0) {
+ -			kfree(pages);
+ -			ret = pinned;
+ -			goto bail;
+ -		}
+ -		if (pinned != npages) {
+ -			unpin_vector_pages(current->mm, pages, pinned);
+ -			ret = -EFAULT;
+ -			goto bail;
+ -		}
+ -		kfree(node->pages);
+ -		node->pages = pages;
+ -		node->npages += pinned;
+ -		npages = node->npages;
+ -		spin_lock(&pq->evict_lock);
+ -		if (!rb_node)
+ -			list_add(&node->list, &pq->evict);
+ -		else
+ -			list_move(&node->list, &pq->evict);
+ -		pq->n_locked += pinned;
+ -		spin_unlock(&pq->evict_lock);
+ +	iovec->pages = kcalloc(npages, sizeof(*iovec->pages), GFP_KERNEL);
+ +	if (!iovec->pages) {
+ +		SDMA_DBG(req, "Failed page array alloc");
+ +		return -ENOMEM;
+  	}
+ -	iovec->pages = node->pages;
+ -	iovec->npages = npages;
+  
+ -	if (!rb_node) {
+ -		ret = hfi1_mmu_rb_insert(&req->pq->sdma_rb_root, &node->rb);
+ -		if (ret) {
+ -			spin_lock(&pq->evict_lock);
+ -			list_del(&node->list);
+ -			pq->n_locked -= node->npages;
+ -			spin_unlock(&pq->evict_lock);
+ -			ret = 0;
+ -			goto bail;
+ -		}
+ -	} else {
+ -		atomic_inc(&node->refcount);
+ +	pinned = hfi1_acquire_user_pages((unsigned long)iovec->iov.iov_base,
+ +					 npages, 0, iovec->pages);
+ +
+ +	if (pinned < 0)
+ +		return pinned;
+ +
+ +	iovec->npages = pinned;
+ +	if (pinned != npages) {
+ +		SDMA_DBG(req, "Failed to pin pages (%d/%u)", pinned, npages);
+ +		unpin_vector_pages(iovec);
+ +		return -EFAULT;
+  	}
+  	return 0;
+ -bail:
+ -	if (!rb_node)
+ -		kfree(node);
+ -	return ret;
+  }
+  
+ -static void unpin_vector_pages(struct mm_struct *mm, struct page **pages,
+ -			       unsigned npages)
+ +static void unpin_vector_pages(struct user_sdma_iovec *iovec)
+  {
+ -	hfi1_release_user_pages(mm, pages, npages, 0);
+ -	kfree(pages);
+ +	hfi1_release_user_pages(iovec->pages, iovec->npages, 0);
+ +
+ +	kfree(iovec->pages);
+ +	iovec->pages = NULL;
+ +	iovec->npages = 0;
+ +	iovec->offset = 0;
+  }
+  
+  static int check_header_template(struct user_sdma_request *req,
+@@@ -1427,12 -1495,26 +1470,30 @@@ static void user_sdma_free_request(stru
+  			kmem_cache_free(req->pq->txreq_cache, tx);
+  		}
+  	}
+ -	if (req->data_iovs) {
+ -		struct sdma_mmu_node *node;
+ -		struct mmu_rb_node *mnode;
+ +	if (req->data_iovs && unpin) {
+  		int i;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +		for (i = 0; i < req->data_iovs; i++)
+ +			if (req->iovs[i].npages && req->iovs[i].pages)
+ +				unpin_vector_pages(&req->iovs[i]);
+++=======
++ 		for (i = 0; i < req->data_iovs; i++) {
++ 			mnode = hfi1_mmu_rb_search(
++ 				&req->pq->sdma_rb_root,
++ 				(unsigned long)req->iovs[i].iov.iov_base,
++ 				req->iovs[i].iov.iov_len);
++ 			if (!mnode || IS_ERR(mnode))
++ 				continue;
++ 
++ 			node = container_of(mnode, struct sdma_mmu_node, rb);
++ 			if (unpin)
++ 				hfi1_mmu_rb_remove(&req->pq->sdma_rb_root,
++ 						   &node->rb);
++ 			else
++ 				atomic_dec(&node->refcount);
++ 		}
+++>>>>>>> f19bd643dbde (IB/hfi1: Prevent NULL pointer deferences in caching code):drivers/staging/rdma/hfi1/user_sdma.c
+  	}
+  	kfree(req->tids);
+  	clear_bit(SDMA_REQ_IN_USE, &req->flags);
+@@@ -1451,3 -1533,55 +1512,58 @@@ static inline void set_comp_state(struc
+  	trace_hfi1_sdma_user_completion(pq->dd, pq->ctxt, pq->subctxt,
+  					idx, state, ret);
+  }
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 
++ static bool sdma_rb_filter(struct mmu_rb_node *node, unsigned long addr,
++ 			   unsigned long len)
++ {
++ 	return (bool)(node->addr == addr);
++ }
++ 
++ static int sdma_rb_insert(struct rb_root *root, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	atomic_inc(&node->refcount);
++ 	return 0;
++ }
++ 
++ static void sdma_rb_remove(struct rb_root *root, struct mmu_rb_node *mnode,
++ 			   struct mm_struct *mm)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	spin_lock(&node->pq->evict_lock);
++ 	list_del(&node->list);
++ 	node->pq->n_locked -= node->npages;
++ 	spin_unlock(&node->pq->evict_lock);
++ 
++ 	/*
++ 	 * If mm is set, we are being called by the MMU notifier and we
++ 	 * should not pass a mm_struct to unpin_vector_page(). This is to
++ 	 * prevent a deadlock when hfi1_release_user_pages() attempts to
++ 	 * take the mmap_sem, which the MMU notifier has already taken.
++ 	 */
++ 	unpin_vector_pages(mm ? NULL : current->mm, node->pages, node->npages);
++ 	/*
++ 	 * If called by the MMU notifier, we have to adjust the pinned
++ 	 * page count ourselves.
++ 	 */
++ 	if (mm)
++ 		mm->pinned_vm -= node->npages;
++ 	kfree(node);
++ }
++ 
++ static int sdma_rb_invalidate(struct rb_root *root, struct mmu_rb_node *mnode)
++ {
++ 	struct sdma_mmu_node *node =
++ 		container_of(mnode, struct sdma_mmu_node, rb);
++ 
++ 	if (!atomic_read(&node->refcount))
++ 		return 1;
++ 	return 0;
++ }
+++>>>>>>> f19bd643dbde (IB/hfi1: Prevent NULL pointer deferences in caching code):drivers/staging/rdma/hfi1/user_sdma.c
+* Unmerged path drivers/staging/rdma/hfi1/mmu_rb.c
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
+* Unmerged path drivers/staging/hfi1/debugfs.h
+* Unmerged path drivers/staging/hfi1/user_sdma.c
+* Unmerged path drivers/staging/rdma/hfi1/mmu_rb.c
+* Unmerged path drivers/staging/rdma/hfi1/user_exp_rcv.c
