@@ -1,0 +1,182 @@
+powerpc/powernv/ioda2: Add TCE invalidation for all attached groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv/ioda2: Add TCE invalidation for all attached groups (David Gibson) [1213665]
+Rebuild_FUZZ: 93.65%
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit e57080f17da5d50f7b3b9d6c045f28632d71309d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e57080f1.failed
+
+The iommu_table struct keeps a list of IOMMU groups it is used for.
+At the moment there is just a single group attached but further
+patches will add TCE table sharing. When sharing is enabled, TCE cache
+in each PE needs to be invalidated so does the patch.
+
+This does not change pnv_pci_ioda1_tce_invalidate() as there is no plan
+to enable TCE table sharing on PHBs older than IODA2.
+
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Reviewed-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit e57080f17da5d50f7b3b9d6c045f28632d71309d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index 109e90d84e34,390863608569..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -23,6 -23,8 +23,11 @@@
+  #include <linux/io.h>
+  #include <linux/msi.h>
+  #include <linux/memblock.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/iommu.h>
++ #include <linux/rculist.h>
+++>>>>>>> e57080f17da5 (powerpc/powernv/ioda2: Add TCE invalidation for all attached groups)
+  
+  #include <asm/sections.h>
+  #include <asm/io.h>
+@@@ -628,16 -1724,57 +633,65 @@@ static void pnv_pci_ioda1_tce_invalidat
+  	 */
+  }
+  
+ -static int pnv_ioda1_tce_build(struct iommu_table *tbl, long index,
+ -		long npages, unsigned long uaddr,
+ -		enum dma_data_direction direction,
+ -		struct dma_attrs *attrs)
+ +static void pnv_pci_ioda2_tce_invalidate(struct pnv_ioda_pe *pe,
+ +					 struct iommu_table *tbl,
+ +					 __be64 *startp, __be64 *endp)
+  {
+++<<<<<<< HEAD
+ +	unsigned long start, end, inc;
+ +	__be64 __iomem *invalidate = (__be64 __iomem *)tbl->it_index;
+ +
+ +	/* We'll invalidate DMA address in PE scope */
+ +	start = 0x2ul << 60;
+ +	start |= (pe->pe_number & 0xFF);
+++=======
++ 	int ret = pnv_tce_build(tbl, index, npages, uaddr, direction,
++ 			attrs);
++ 
++ 	if (!ret && (tbl->it_type & TCE_PCI_SWINV_CREATE))
++ 		pnv_pci_ioda1_tce_invalidate(tbl, index, npages, false);
++ 
++ 	return ret;
++ }
++ 
++ static void pnv_ioda1_tce_free(struct iommu_table *tbl, long index,
++ 		long npages)
++ {
++ 	pnv_tce_free(tbl, index, npages);
++ 
++ 	if (tbl->it_type & TCE_PCI_SWINV_FREE)
++ 		pnv_pci_ioda1_tce_invalidate(tbl, index, npages, false);
++ }
++ 
++ static struct iommu_table_ops pnv_ioda1_iommu_ops = {
++ 	.set = pnv_ioda1_tce_build,
++ 	.clear = pnv_ioda1_tce_free,
++ 	.get = pnv_tce_get,
++ };
++ 
++ static inline void pnv_pci_ioda2_tce_invalidate_entire(struct pnv_ioda_pe *pe)
++ {
++ 	/* 01xb - invalidate TCEs that match the specified PE# */
++ 	unsigned long val = (0x4ull << 60) | (pe->pe_number & 0xFF);
++ 	struct pnv_phb *phb = pe->phb;
++ 
++ 	if (!phb->ioda.tce_inval_reg)
++ 		return;
++ 
++ 	mb(); /* Ensure above stores are visible */
++ 	__raw_writeq(cpu_to_be64(val), phb->ioda.tce_inval_reg);
++ }
++ 
++ static void pnv_pci_ioda2_do_tce_invalidate(unsigned pe_number, bool rm,
++ 		__be64 __iomem *invalidate, unsigned shift,
++ 		unsigned long index, unsigned long npages)
++ {
++ 	unsigned long start, end, inc;
++ 
++ 	/* We'll invalidate DMA address in PE scope */
++ 	start = 0x2ull << 60;
++ 	start |= (pe_number & 0xFF);
+++>>>>>>> e57080f17da5 (powerpc/powernv/ioda2: Add TCE invalidation for all attached groups)
+  	end = start;
+  
+  	/* Figure out the start, end and step */
+@@@ -654,19 -1792,53 +708,44 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +void pnv_pci_ioda_tce_invalidate(struct iommu_table *tbl,
+ +				 __be64 *startp, __be64 *endp)
+++=======
++ static void pnv_pci_ioda2_tce_invalidate(struct iommu_table *tbl,
++ 		unsigned long index, unsigned long npages, bool rm)
++ {
++ 	struct iommu_table_group_link *tgl;
++ 
++ 	list_for_each_entry_rcu(tgl, &tbl->it_group_list, next) {
++ 		struct pnv_ioda_pe *pe = container_of(tgl->table_group,
++ 				struct pnv_ioda_pe, table_group);
++ 		__be64 __iomem *invalidate = rm ?
++ 			(__be64 __iomem *)pe->phb->ioda.tce_inval_reg_phys :
++ 			pe->phb->ioda.tce_inval_reg;
++ 
++ 		pnv_pci_ioda2_do_tce_invalidate(pe->pe_number, rm,
++ 			invalidate, tbl->it_page_shift,
++ 			index, npages);
++ 	}
++ }
++ 
++ static int pnv_ioda2_tce_build(struct iommu_table *tbl, long index,
++ 		long npages, unsigned long uaddr,
++ 		enum dma_data_direction direction,
++ 		struct dma_attrs *attrs)
+++>>>>>>> e57080f17da5 (powerpc/powernv/ioda2: Add TCE invalidation for all attached groups)
+  {
+ -	int ret = pnv_tce_build(tbl, index, npages, uaddr, direction,
+ -			attrs);
+ -
+ -	if (!ret && (tbl->it_type & TCE_PCI_SWINV_CREATE))
+ -		pnv_pci_ioda2_tce_invalidate(tbl, index, npages, false);
+ -
+ -	return ret;
+ -}
+ -
+ -static void pnv_ioda2_tce_free(struct iommu_table *tbl, long index,
+ -		long npages)
+ -{
+ -	pnv_tce_free(tbl, index, npages);
+ +	struct pnv_ioda_pe *pe = container_of(tbl, struct pnv_ioda_pe,
+ +					      tce32_table);
+ +	struct pnv_phb *phb = pe->phb;
+  
+ -	if (tbl->it_type & TCE_PCI_SWINV_FREE)
+ -		pnv_pci_ioda2_tce_invalidate(tbl, index, npages, false);
+ +	if (phb->type == PNV_PHB_IODA1)
+ +		pnv_pci_ioda1_tce_invalidate(tbl, startp, endp);
+ +	else
+ +		pnv_pci_ioda2_tce_invalidate(pe, tbl, startp, endp);
+  }
+  
+ -static struct iommu_table_ops pnv_ioda2_iommu_ops = {
+ -	.set = pnv_ioda2_tce_build,
+ -	.clear = pnv_ioda2_tce_free,
+ -	.get = pnv_tce_get,
+ -};
+ -
+  static void pnv_pci_ioda_setup_dma_pe(struct pnv_phb *phb,
+  				      struct pnv_ioda_pe *pe, unsigned int base,
+  				      unsigned int segs)
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
