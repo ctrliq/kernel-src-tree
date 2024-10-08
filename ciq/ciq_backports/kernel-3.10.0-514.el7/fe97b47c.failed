@@ -1,0 +1,337 @@
+xprtrdma: Use workqueue to process RPC/RDMA replies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit fe97b47cd623ebbaa55a163c336abc47153526d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fe97b47c.failed
+
+The reply tasklet is fast, but it's single threaded. After reply
+traffic saturates a single CPU, there's no more reply processing
+capacity.
+
+Replace the tasklet with a workqueue to spread reply handling across
+all CPUs.  This also moves RPC/RDMA reply handling out of the soft
+IRQ context and into a context that allows sleeps.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit fe97b47cd623ebbaa55a163c336abc47153526d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index cbbf36c8c6ad,95774fcc1b43..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -759,52 -741,28 +759,53 @@@ rpcrdma_reply_handler(struct rpcrdma_re
+  	unsigned long cwnd;
+  	u32 credits;
+  
+ -	dprintk("RPC:       %s: incoming rep %p\n", __func__, rep);
+ -
+ -	if (rep->rr_len == RPCRDMA_BAD_LEN)
+ -		goto out_badstatus;
+ -	if (rep->rr_len < RPCRDMA_HDRLEN_MIN)
+ -		goto out_shortreply;
+ -
+ +	/* Check status. If bad, signal disconnect and return rep to pool */
+ +	if (rep->rr_len == ~0U) {
+ +		rpcrdma_recv_buffer_put(rep);
+ +		if (r_xprt->rx_ep.rep_connected == 1) {
+ +			r_xprt->rx_ep.rep_connected = -EIO;
+ +			rpcrdma_conn_func(&r_xprt->rx_ep);
+ +		}
+ +		return;
+ +	}
+ +	if (rep->rr_len < RPCRDMA_HDRLEN_MIN) {
+ +		dprintk("RPC:       %s: short/invalid reply\n", __func__);
+ +		goto repost;
+ +	}
+  	headerp = rdmab_to_msg(rep->rr_rdmabuf);
+ -	if (headerp->rm_vers != rpcrdma_version)
+ -		goto out_badversion;
+ +	if (headerp->rm_vers != rpcrdma_version) {
+ +		dprintk("RPC:       %s: invalid version %d\n",
+ +			__func__, be32_to_cpu(headerp->rm_vers));
+ +		goto repost;
+ +	}
+  
+- 	/* Get XID and try for a match. */
+- 	spin_lock(&xprt->transport_lock);
++ 	/* Match incoming rpcrdma_rep to an rpcrdma_req to
++ 	 * get context for handling any incoming chunks.
++ 	 */
++ 	spin_lock_bh(&xprt->transport_lock);
+  	rqst = xprt_lookup_rqst(xprt, headerp->rm_xid);
+ -	if (!rqst)
+ -		goto out_nomatch;
+ +	if (rqst == NULL) {
+ +		spin_unlock(&xprt->transport_lock);
+ +		dprintk("RPC:       %s: reply 0x%p failed "
+ +			"to match any request xid 0x%08x len %d\n",
+ +			__func__, rep, be32_to_cpu(headerp->rm_xid),
+ +			rep->rr_len);
+ +repost:
+ +		r_xprt->rx_stats.bad_reply_count++;
+ +		if (rpcrdma_ep_post_recv(&r_xprt->rx_ia, &r_xprt->rx_ep, rep))
+ +			rpcrdma_recv_buffer_put(rep);
+ +
+ +		return;
+ +	}
+  
+- 	/* get request object */
+  	req = rpcr_to_rdmar(rqst);
+ -	if (req->rl_reply)
+ -		goto out_duplicate;
+ +	if (req->rl_reply) {
+ +		spin_unlock(&xprt->transport_lock);
+ +		dprintk("RPC:       %s: duplicate reply 0x%p to RPC "
+ +			"request 0x%p: xid 0x%08x\n", __func__, rep, req,
+ +			be32_to_cpu(headerp->rm_xid));
+ +		goto repost;
+ +	}
+  
+  	dprintk("RPC:       %s: reply 0x%p completes request 0x%p\n"
+  		"                   RPC request 0x%p xid 0x%08x\n",
+@@@ -901,8 -859,44 +902,51 @@@ badheader
+  	if (xprt->cwnd > cwnd)
+  		xprt_release_rqst_cong(rqst->rq_task);
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC:       %s: xprt_complete_rqst(0x%p, 0x%p, %d)\n",
+ +			__func__, xprt, rqst, status);
+ +	xprt_complete_rqst(rqst->rq_task, status);
+ +	spin_unlock(&xprt->transport_lock);
+++=======
++ 	xprt_complete_rqst(rqst->rq_task, status);
++ 	spin_unlock_bh(&xprt->transport_lock);
++ 	dprintk("RPC:       %s: xprt_complete_rqst(0x%p, 0x%p, %d)\n",
++ 			__func__, xprt, rqst, status);
++ 	return;
++ 
++ out_badstatus:
++ 	rpcrdma_recv_buffer_put(rep);
++ 	if (r_xprt->rx_ep.rep_connected == 1) {
++ 		r_xprt->rx_ep.rep_connected = -EIO;
++ 		rpcrdma_conn_func(&r_xprt->rx_ep);
++ 	}
++ 	return;
++ 
++ out_shortreply:
++ 	dprintk("RPC:       %s: short/invalid reply\n", __func__);
++ 	goto repost;
++ 
++ out_badversion:
++ 	dprintk("RPC:       %s: invalid version %d\n",
++ 		__func__, be32_to_cpu(headerp->rm_vers));
++ 	goto repost;
++ 
++ out_nomatch:
++ 	spin_unlock_bh(&xprt->transport_lock);
++ 	dprintk("RPC:       %s: no match for incoming xid 0x%08x len %d\n",
++ 		__func__, be32_to_cpu(headerp->rm_xid),
++ 		rep->rr_len);
++ 	goto repost;
++ 
++ out_duplicate:
++ 	spin_unlock_bh(&xprt->transport_lock);
++ 	dprintk("RPC:       %s: "
++ 		"duplicate reply %p to RPC request %p: xid 0x%08x\n",
++ 		__func__, rep, req, be32_to_cpu(headerp->rm_xid));
++ 
++ repost:
++ 	r_xprt->rx_stats.bad_reply_count++;
++ 	if (rpcrdma_ep_post_recv(&r_xprt->rx_ia, &r_xprt->rx_ep, rep))
++ 		rpcrdma_recv_buffer_put(rep);
+++>>>>>>> fe97b47cd623 (xprtrdma: Use workqueue to process RPC/RDMA replies)
+  }
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 6115ededb593,5c20629544bb..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -100,31 -100,34 +100,62 @@@ rpcrdma_run_tasklet(unsigned long data
+  
+  static DECLARE_TASKLET(rpcrdma_tasklet_g, rpcrdma_run_tasklet, 0UL);
+  
+++<<<<<<< HEAD
+ +static const char * const async_event[] = {
+ +	"CQ error",
+ +	"QP fatal error",
+ +	"QP request error",
+ +	"QP access error",
+ +	"communication established",
+ +	"send queue drained",
+ +	"path migration successful",
+ +	"path mig error",
+ +	"device fatal error",
+ +	"port active",
+ +	"port error",
+ +	"LID change",
+ +	"P_key change",
+ +	"SM change",
+ +	"SRQ error",
+ +	"SRQ limit reached",
+ +	"last WQE reached",
+ +	"client reregister",
+ +	"GID change",
+ +};
+ +
+ +#define ASYNC_MSG(status)					\
+ +	((status) < ARRAY_SIZE(async_event) ?			\
+ +		async_event[(status)] : "unknown async error")
+++=======
++ static struct workqueue_struct *rpcrdma_receive_wq;
++ 
++ int
++ rpcrdma_alloc_wq(void)
++ {
++ 	struct workqueue_struct *recv_wq;
++ 
++ 	recv_wq = alloc_workqueue("xprtrdma_receive",
++ 				  WQ_MEM_RECLAIM | WQ_UNBOUND | WQ_HIGHPRI,
++ 				  0);
++ 	if (!recv_wq)
++ 		return -ENOMEM;
++ 
++ 	rpcrdma_receive_wq = recv_wq;
++ 	return 0;
++ }
++ 
++ void
++ rpcrdma_destroy_wq(void)
++ {
++ 	struct workqueue_struct *wq;
++ 
++ 	if (rpcrdma_receive_wq) {
++ 		wq = rpcrdma_receive_wq;
++ 		rpcrdma_receive_wq = NULL;
++ 		destroy_workqueue(wq);
++ 	}
++ }
+++>>>>>>> fe97b47cd623 (xprtrdma: Use workqueue to process RPC/RDMA replies)
+  
+  static void
+  rpcrdma_schedule_tasklet(struct list_head *sched_list)
+@@@ -283,31 -268,29 +324,41 @@@ out_fail
+  	goto out_schedule;
+  }
+  
+ -/* The wc array is on stack: automatic memory is always CPU-local.
+ - *
+ - * struct ib_wc is 64 bytes, making the poll array potentially
+ - * large. But this is at the bottom of the call chain. Further
+ - * substantial work is done in another thread.
+ - */
+ -static void
+ -rpcrdma_recvcq_poll(struct ib_cq *cq)
+ +static int
+ +rpcrdma_recvcq_poll(struct ib_cq *cq, struct rpcrdma_ep *ep)
+  {
+++<<<<<<< HEAD
+ +	struct list_head sched_list;
+ +	struct ib_wc *wcs;
+ +	int budget, count, rc;
+++=======
++ 	struct ib_wc *pos, wcs[4];
++ 	int count, rc;
+++>>>>>>> fe97b47cd623 (xprtrdma: Use workqueue to process RPC/RDMA replies)
+  
+ +	INIT_LIST_HEAD(&sched_list);
+ +	budget = RPCRDMA_WC_BUDGET / RPCRDMA_POLLSIZE;
+  	do {
+ -		pos = wcs;
+ +		wcs = ep->rep_recv_wcs;
+  
+ -		rc = ib_poll_cq(cq, ARRAY_SIZE(wcs), pos);
+ -		if (rc < 0)
+ -			break;
+ +		rc = ib_poll_cq(cq, RPCRDMA_POLLSIZE, wcs);
+ +		if (rc <= 0)
+ +			goto out_schedule;
+  
+  		count = rc;
+  		while (count-- > 0)
+++<<<<<<< HEAD
+ +			rpcrdma_recvcq_process_wc(wcs++, &sched_list);
+ +	} while (rc == RPCRDMA_POLLSIZE && --budget);
+ +	rc = 0;
+ +
+ +out_schedule:
+ +	rpcrdma_schedule_tasklet(&sched_list);
+ +	return rc;
+++=======
++ 			rpcrdma_recvcq_process_wc(pos++);
++ 	} while (rc == ARRAY_SIZE(wcs));
+++>>>>>>> fe97b47cd623 (xprtrdma: Use workqueue to process RPC/RDMA replies)
+  }
+  
+  /* Handle provider receive completion upcalls.
+@@@ -1020,7 -944,9 +1068,8 @@@ rpcrdma_create_rep(struct rpcrdma_xprt 
+  		goto out_free;
+  	}
+  
+ -	rep->rr_device = ia->ri_device;
+  	rep->rr_rxprt = r_xprt;
++ 	INIT_WORK(&rep->rr_work, rpcrdma_receive_worker);
+  	return rep;
+  
+  out_free:
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index fe00a205527b..736a8a58c33a 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -738,6 +738,7 @@ static void __exit xprt_rdma_cleanup(void)
+ 		dprintk("RPC:       %s: xprt_unregister returned %i\n",
+ 			__func__, rc);
+ 
++	rpcrdma_destroy_wq();
+ 	frwr_destroy_recovery_wq();
+ }
+ 
+@@ -749,8 +750,15 @@ static int __init xprt_rdma_init(void)
+ 	if (rc)
+ 		return rc;
+ 
++	rc = rpcrdma_alloc_wq();
++	if (rc) {
++		frwr_destroy_recovery_wq();
++		return rc;
++	}
++
+ 	rc = xprt_register_transport(&xprt_rdma);
+ 	if (rc) {
++		rpcrdma_destroy_wq();
+ 		frwr_destroy_recovery_wq();
+ 		return rc;
+ 	}
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index b2d2c86a7023..4a50d983daad 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -171,6 +171,7 @@ struct rpcrdma_buffer;
+ struct rpcrdma_rep {
+ 	unsigned int		rr_len;
+ 	struct rpcrdma_xprt	*rr_rxprt;
++	struct work_struct	rr_work;
+ 	struct list_head	rr_list;
+ 	struct rpcrdma_regbuf	*rr_rdmabuf;
+ };
+@@ -430,6 +431,9 @@ unsigned int rpcrdma_max_segments(struct rpcrdma_xprt *);
+ int frwr_alloc_recovery_wq(void);
+ void frwr_destroy_recovery_wq(void);
+ 
++int rpcrdma_alloc_wq(void);
++void rpcrdma_destroy_wq(void);
++
+ /*
+  * Wrappers for chunk registration, shared by read/write chunk code.
+  */
