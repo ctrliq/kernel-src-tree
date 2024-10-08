@@ -1,0 +1,2119 @@
+net: sctp: rework debugging framework to use pr_debug and friends
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] sctp: rework debugging framework to use pr_debug and friends (Marcelo Leitner) [1337639]
+Rebuild_FUZZ: 96.00%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit bb33381d0c97cdee25f2cdab540b6e2bd16fa03b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bb33381d.failed
+
+We should get rid of all own SCTP debug printk macros and use the ones
+that the kernel offers anyway instead. This makes the code more readable
+and conform to the kernel code, and offers all the features of dynamic
+debbuging that pr_debug() et al has, such as only turning on/off portions
+of debug messages at runtime through debugfs. The runtime cost of having
+CONFIG_DYNAMIC_DEBUG enabled, but none of the debug statements printing,
+is negligible [1]. If kernel debugging is completly turned off, then these
+statements will also compile into "empty" functions.
+
+While we're at it, we also need to change the Kconfig option as it /now/
+only refers to the ifdef'ed code portions in outqueue.c that enable further
+debugging/tracing of SCTP transaction fields. Also, since SCTP_ASSERT code
+was enabled with this Kconfig option and has now been removed, we
+transform those code parts into WARNs resp. where appropriate BUG_ONs so
+that those bugs can be more easily detected as probably not many people
+have SCTP debugging permanently turned on.
+
+To turn on all SCTP debugging, the following steps are needed:
+
+ # mount -t debugfs none /sys/kernel/debug
+ # echo -n 'module sctp +p' > /sys/kernel/debug/dynamic_debug/control
+
+This can be done more fine-grained on a per file, per line basis and others
+as described in [2].
+
+ [1] https://www.kernel.org/doc/ols/2009/ols2009-pages-39-46.pdf
+ [2] Documentation/dynamic-debug-howto.txt
+
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bb33381d0c97cdee25f2cdab540b6e2bd16fa03b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/ipv6.c
+diff --cc net/sctp/ipv6.c
+index 09aaba531950,09ffcc912d23..000000000000
+--- a/net/sctp/ipv6.c
++++ b/net/sctp/ipv6.c
+@@@ -215,17 -215,32 +215,22 @@@ static int sctp_v6_xmit(struct sk_buff 
+  {
+  	struct sock *sk = skb->sk;
+  	struct ipv6_pinfo *np = inet6_sk(sk);
+ -	struct flowi6 fl6;
+ -
+ -	memset(&fl6, 0, sizeof(fl6));
+ +	struct flowi6 *fl6 = &transport->fl.u.ip6;
+ +	int res;
+  
+ -	fl6.flowi6_proto = sk->sk_protocol;
+++<<<<<<< HEAD
+ +	SCTP_DEBUG_PRINTK("%s: skb:%p, len:%d, src:%pI6 dst:%pI6\n",
+ +			  __func__, skb, skb->len,
+ +			  &fl6->saddr, &fl6->daddr);
+  
+ -	/* Fill in the dest address from the route entry passed with the skb
+ -	 * and the source address from the transport.
+ -	 */
+ -	fl6.daddr = transport->ipaddr.v6.sin6_addr;
+ -	fl6.saddr = transport->saddr.v6.sin6_addr;
+ -
+ -	fl6.flowlabel = np->flow_label;
+ -	IP6_ECN_flow_xmit(sk, fl6.flowlabel);
+ -	if (ipv6_addr_type(&fl6.saddr) & IPV6_ADDR_LINKLOCAL)
+ -		fl6.flowi6_oif = transport->saddr.v6.sin6_scope_id;
+ -	else
+ -		fl6.flowi6_oif = sk->sk_bound_dev_if;
+ -
+ -	if (np->opt && np->opt->srcrt) {
+ -		struct rt0_hdr *rt0 = (struct rt0_hdr *) np->opt->srcrt;
+ -		fl6.daddr = *rt0->addr;
+ -	}
+ +	IP6_ECN_flow_xmit(sk, fl6->flowlabel);
+  
+ +	if (!(transport->param_flags & SPP_PMTUD_ENABLE))
+ +		skb->ignore_df = 1;
+++=======
++ 	pr_debug("%s: skb:%p, len:%d, src:%pI6 dst:%pI6\n", __func__, skb,
++ 		 skb->len, &fl6.saddr, &fl6.daddr);
+++>>>>>>> bb33381d0c97 (net: sctp: rework debugging framework to use pr_debug and friends)
+  
+  	SCTP_INC_STATS(sock_net(sk), SCTP_MIB_OUTSCTPPACKS);
+  
+@@@ -270,14 -283,11 +275,15 @@@ static void sctp_v6_get_dst(struct sctp
+  	if (saddr) {
+  		fl6->saddr = saddr->v6.sin6_addr;
+  		fl6->fl6_sport = saddr->v6.sin6_port;
+- 		SCTP_DEBUG_PRINTK("SRC=%pI6 - ", &fl6->saddr);
++ 
++ 		pr_debug("src=%pI6 - ", &fl6->saddr);
+  	}
+  
+ -	dst = ip6_dst_lookup_flow(sk, fl6, NULL, false);
+ +	rcu_read_lock();
+ +	final_p = fl6_update_dst(fl6, rcu_dereference(np->opt), &final);
+ +	rcu_read_unlock();
+ +
+ +	dst = ip6_dst_lookup_flow(sk, fl6, final_p);
+  	if (!asoc || saddr)
+  		goto out;
+  
+diff --git a/include/net/sctp/sctp.h b/include/net/sctp/sctp.h
+index d5fd19390b86..33e9388a1d06 100644
+--- a/include/net/sctp/sctp.h
++++ b/include/net/sctp/sctp.h
+@@ -83,16 +83,6 @@
+ #include <net/sctp/structs.h>
+ #include <net/sctp/constants.h>
+ 
+-
+-/* Set SCTP_DEBUG flag via config if not already set. */
+-#ifndef SCTP_DEBUG
+-#ifdef CONFIG_SCTP_DBG_MSG
+-#define SCTP_DEBUG	1
+-#else
+-#define SCTP_DEBUG      0
+-#endif /* CONFIG_SCTP_DBG */
+-#endif /* SCTP_DEBUG */
+-
+ #ifdef CONFIG_IP_SCTP_MODULE
+ #define SCTP_PROTOSW_FLAG 0
+ #else /* static! */
+@@ -292,61 +282,6 @@ static inline void sctp_max_rto(struct sctp_association *asoc,
+ 	}
+ }
+ 
+-/* Print debugging messages.  */
+-#if SCTP_DEBUG
+-extern int sctp_debug_flag;
+-#define SCTP_DEBUG_PRINTK(fmt, args...)			\
+-do {							\
+-	if (sctp_debug_flag)				\
+-		printk(KERN_DEBUG pr_fmt(fmt), ##args);	\
+-} while (0)
+-#define SCTP_DEBUG_PRINTK_CONT(fmt, args...)		\
+-do {							\
+-	if (sctp_debug_flag)				\
+-		pr_cont(fmt, ##args);			\
+-} while (0)
+-#define SCTP_DEBUG_PRINTK_IPADDR(fmt_lead, fmt_trail,			\
+-				 args_lead, addr, args_trail...)	\
+-do {									\
+-	const union sctp_addr *_addr = (addr);				\
+-	if (sctp_debug_flag) {						\
+-		if (_addr->sa.sa_family == AF_INET6) {			\
+-			printk(KERN_DEBUG				\
+-			       pr_fmt(fmt_lead "%pI6" fmt_trail),	\
+-			       args_lead,				\
+-			       &_addr->v6.sin6_addr,			\
+-			       args_trail);				\
+-		} else {						\
+-			printk(KERN_DEBUG				\
+-			       pr_fmt(fmt_lead "%pI4" fmt_trail),	\
+-			       args_lead,				\
+-			       &_addr->v4.sin_addr.s_addr,		\
+-			       args_trail);				\
+-		}							\
+-	}								\
+-} while (0)
+-#define SCTP_ENABLE_DEBUG { sctp_debug_flag = 1; }
+-#define SCTP_DISABLE_DEBUG { sctp_debug_flag = 0; }
+-
+-#define SCTP_ASSERT(expr, str, func) \
+-	if (!(expr)) { \
+-		SCTP_DEBUG_PRINTK("Assertion Failed: %s(%s) at %s:%s:%d\n", \
+-			str, (#expr), __FILE__, __func__, __LINE__); \
+-		func; \
+-	}
+-
+-#else	/* SCTP_DEBUG */
+-
+-#define SCTP_DEBUG_PRINTK(whatever...)
+-#define SCTP_DEBUG_PRINTK_CONT(fmt, args...)
+-#define SCTP_DEBUG_PRINTK_IPADDR(whatever...)
+-#define SCTP_ENABLE_DEBUG
+-#define SCTP_DISABLE_DEBUG
+-#define SCTP_ASSERT(expr, str, func)
+-
+-#endif /* SCTP_DEBUG */
+-
+-
+ /*
+  * Macros for keeping a global reference of object allocations.
+  */
+@@ -619,16 +554,6 @@ static inline int param_type2af(__be16 type)
+ 	}
+ }
+ 
+-/* Perform some sanity checks. */
+-static inline int sctp_sanity_check(void)
+-{
+-	SCTP_ASSERT(sizeof(struct sctp_ulpevent) <=
+-		    sizeof(((struct sk_buff *)0)->cb),
+-		    "SCTP: ulpevent does not fit in skb!\n", return 0);
+-
+-	return 1;
+-}
+-
+ /* Warning: The following hash functions assume a power of two 'size'. */
+ /* This is the hash function for the SCTP port hash table. */
+ static inline int sctp_phashfn(struct net *net, __u16 lport)
+diff --git a/net/sctp/Kconfig b/net/sctp/Kconfig
+index 31ae23990e24..f1f060ad6117 100644
+--- a/net/sctp/Kconfig
++++ b/net/sctp/Kconfig
+@@ -30,7 +30,8 @@ menuconfig IP_SCTP
+ 	  homing at either or both ends of an association."
+ 
+ 	  To compile this protocol support as a module, choose M here: the
+-	  module will be called sctp.
++	  module will be called sctp. Debug messages are handeled by the
++	  kernel's dynamic debugging framework.
+ 
+ 	  If in doubt, say N.
+ 
+@@ -48,13 +49,14 @@ config NET_SCTPPROBE
+         To compile this code as a module, choose M here: the
+         module will be called sctp_probe.
+ 
+-config SCTP_DBG_MSG
+-	bool "SCTP: Debug messages"
++config SCTP_DBG_TSNS
++	bool "SCTP: Debug transactions"
+ 	help
+-	  If you say Y, this will enable verbose debugging messages. 
++	  If you say Y, this will enable transaction debugging, visible
++	  from the kernel's dynamic debugging framework.
+ 
+ 	  If unsure, say N.  However, if you are running into problems, use 
+-	  this option to gather detailed trace information
++	  this option to gather outqueue trace information.
+ 
+ config SCTP_DBG_OBJCNT
+ 	bool "SCTP: Debug object counts"
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index 95613ef42a0c..90d33ceb7bc6 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -358,7 +358,8 @@ struct sctp_association *sctp_association_new(const struct sctp_endpoint *ep,
+ 		goto fail_init;
+ 
+ 	SCTP_DBG_OBJCNT_INC(assoc);
+-	SCTP_DEBUG_PRINTK("Created asoc %p\n", asoc);
++
++	pr_debug("Created asoc %p\n", asoc);
+ 
+ 	return asoc;
+ 
+@@ -456,7 +457,10 @@ void sctp_association_free(struct sctp_association *asoc)
+ /* Cleanup and free up an association. */
+ static void sctp_association_destroy(struct sctp_association *asoc)
+ {
+-	SCTP_ASSERT(asoc->base.dead, "Assoc is not dead", return);
++	if (unlikely(!asoc->base.dead)) {
++		WARN(1, "Attempt to destroy undead association %p!\n", asoc);
++		return;
++	}
+ 
+ 	sctp_endpoint_put(asoc->ep);
+ 	sock_put(asoc->base.sk);
+@@ -537,11 +541,8 @@ void sctp_assoc_rm_peer(struct sctp_association *asoc,
+ 	struct list_head	*pos;
+ 	struct sctp_transport	*transport;
+ 
+-	SCTP_DEBUG_PRINTK_IPADDR("sctp_assoc_rm_peer:association %p addr: ",
+-				 " port: %d\n",
+-				 asoc,
+-				 (&peer->ipaddr),
+-				 ntohs(peer->ipaddr.v4.sin_port));
++	pr_debug("%s: association:%p addr:%pISpc\n",
++		 __func__, asoc, &peer->ipaddr.sa);
+ 
+ 	/* If we are to remove the current retran_path, update it
+ 	 * to the next peer before removing this peer from the list.
+@@ -637,12 +638,8 @@ struct sctp_transport *sctp_assoc_add_peer(struct sctp_association *asoc,
+ 	/* AF_INET and AF_INET6 share common port field. */
+ 	port = ntohs(addr->v4.sin_port);
+ 
+-	SCTP_DEBUG_PRINTK_IPADDR("sctp_assoc_add_peer:association %p addr: ",
+-				 " port: %d state:%d\n",
+-				 asoc,
+-				 addr,
+-				 port,
+-				 peer_state);
++	pr_debug("%s: association:%p addr:%pISpc state:%d\n", __func__,
++		 asoc, &addr->sa, peer_state);
+ 
+ 	/* Set the port if it has not been set yet.  */
+ 	if (0 == asoc->peer.port)
+@@ -709,8 +706,9 @@ struct sctp_transport *sctp_assoc_add_peer(struct sctp_association *asoc,
+ 	else
+ 		asoc->pathmtu = peer->pathmtu;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_assoc_add_peer:association %p PMTU set to "
+-			  "%d\n", asoc, asoc->pathmtu);
++	pr_debug("%s: association:%p PMTU set to %d\n", __func__, asoc,
++		 asoc->pathmtu);
++
+ 	peer->pmtu_pending = 0;
+ 
+ 	asoc->frag_point = sctp_frag_point(asoc, asoc->pathmtu);
+@@ -1350,12 +1348,8 @@ void sctp_assoc_update_retran_path(struct sctp_association *asoc)
+ 	else
+ 		t = asoc->peer.retran_path;
+ 
+-	SCTP_DEBUG_PRINTK_IPADDR("sctp_assoc_update_retran_path:association"
+-				 " %p addr: ",
+-				 " port: %d\n",
+-				 asoc,
+-				 (&t->ipaddr),
+-				 ntohs(t->ipaddr.v4.sin_port));
++	pr_debug("%s: association:%p addr:%pISpc\n", __func__, asoc,
++		 &t->ipaddr.sa);
+ }
+ 
+ /* Choose the transport for sending retransmit packet.  */
+@@ -1402,8 +1396,8 @@ void sctp_assoc_sync_pmtu(struct sock *sk, struct sctp_association *asoc)
+ 		asoc->frag_point = sctp_frag_point(asoc, pmtu);
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("%s: asoc:%p, pmtu:%d, frag_point:%d\n",
+-			  __func__, asoc, asoc->pathmtu, asoc->frag_point);
++	pr_debug("%s: asoc:%p, pmtu:%d, frag_point:%d\n", __func__, asoc,
++		 asoc->pathmtu, asoc->frag_point);
+ }
+ 
+ /* Should we send a SACK to update our peer? */
+@@ -1455,9 +1449,9 @@ void sctp_assoc_rwnd_increase(struct sctp_association *asoc, unsigned int len)
+ 		asoc->rwnd_press -= change;
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("%s: asoc %p rwnd increased by %d to (%u, %u) "
+-			  "- %u\n", __func__, asoc, len, asoc->rwnd,
+-			  asoc->rwnd_over, asoc->a_rwnd);
++	pr_debug("%s: asoc:%p rwnd increased by %d to (%u, %u) - %u\n",
++		 __func__, asoc, len, asoc->rwnd, asoc->rwnd_over,
++		 asoc->a_rwnd);
+ 
+ 	/* Send a window update SACK if the rwnd has increased by at least the
+ 	 * minimum of the association's PMTU and half of the receive buffer.
+@@ -1466,9 +1460,11 @@ void sctp_assoc_rwnd_increase(struct sctp_association *asoc, unsigned int len)
+ 	 */
+ 	if (sctp_peer_needs_update(asoc)) {
+ 		asoc->a_rwnd = asoc->rwnd;
+-		SCTP_DEBUG_PRINTK("%s: Sending window update SACK- asoc: %p "
+-				  "rwnd: %u a_rwnd: %u\n", __func__,
+-				  asoc, asoc->rwnd, asoc->a_rwnd);
++
++		pr_debug("%s: sending window update SACK- asoc:%p rwnd:%u "
++			 "a_rwnd:%u\n", __func__, asoc, asoc->rwnd,
++			 asoc->a_rwnd);
++
+ 		sack = sctp_make_sack(asoc);
+ 		if (!sack)
+ 			return;
+@@ -1490,8 +1486,10 @@ void sctp_assoc_rwnd_decrease(struct sctp_association *asoc, unsigned int len)
+ 	int rx_count;
+ 	int over = 0;
+ 
+-	SCTP_ASSERT(asoc->rwnd, "rwnd zero", return);
+-	SCTP_ASSERT(!asoc->rwnd_over, "rwnd_over not zero", return);
++	if (unlikely(!asoc->rwnd || asoc->rwnd_over))
++		pr_debug("%s: association:%p has asoc->rwnd:%u, "
++			 "asoc->rwnd_over:%u!\n", __func__, asoc,
++			 asoc->rwnd, asoc->rwnd_over);
+ 
+ 	if (asoc->ep->rcvbuf_policy)
+ 		rx_count = atomic_read(&asoc->rmem_alloc);
+@@ -1516,9 +1514,10 @@ void sctp_assoc_rwnd_decrease(struct sctp_association *asoc, unsigned int len)
+ 		asoc->rwnd_over = len - asoc->rwnd;
+ 		asoc->rwnd = 0;
+ 	}
+-	SCTP_DEBUG_PRINTK("%s: asoc %p rwnd decreased by %d to (%u, %u, %u)\n",
+-			  __func__, asoc, len, asoc->rwnd,
+-			  asoc->rwnd_over, asoc->rwnd_press);
++
++	pr_debug("%s: asoc:%p rwnd decreased by %d to (%u, %u, %u)\n",
++		 __func__, asoc, len, asoc->rwnd, asoc->rwnd_over,
++		 asoc->rwnd_press);
+ }
+ 
+ /* Build the bind address list for the association based on info from the
+diff --git a/net/sctp/chunk.c b/net/sctp/chunk.c
+index 3a4892aa38ae..92d4f6e7e177 100644
+--- a/net/sctp/chunk.c
++++ b/net/sctp/chunk.c
+@@ -193,8 +193,9 @@ struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *asoc,
+ 		msg->expires_at = jiffies +
+ 				    msecs_to_jiffies(sinfo->sinfo_timetolive);
+ 		msg->can_abandon = 1;
+-		SCTP_DEBUG_PRINTK("%s: msg:%p expires_at: %ld jiffies:%ld\n",
+-				  __func__, msg, msg->expires_at, jiffies);
++
++		pr_debug("%s: msg:%p expires_at:%ld jiffies:%ld\n", __func__,
++			 msg, msg->expires_at, jiffies);
+ 	}
+ 
+ 	/* This is the biggest possible DATA chunk that can fit into
+diff --git a/net/sctp/debug.c b/net/sctp/debug.c
+index ec997cfe0a7e..f4998780d6df 100644
+--- a/net/sctp/debug.c
++++ b/net/sctp/debug.c
+@@ -47,10 +47,6 @@
+ 
+ #include <net/sctp/sctp.h>
+ 
+-#if SCTP_DEBUG
+-int sctp_debug_flag = 1;	/* Initially enable DEBUG */
+-#endif	/* SCTP_DEBUG */
+-
+ /* These are printable forms of Chunk ID's from section 3.1.  */
+ static const char *const sctp_cid_tbl[SCTP_NUM_BASE_CHUNK_TYPES] = {
+ 	"DATA",
+diff --git a/net/sctp/endpointola.c b/net/sctp/endpointola.c
+index 000d00e3ee2c..3de869e2ea6f 100644
+--- a/net/sctp/endpointola.c
++++ b/net/sctp/endpointola.c
+@@ -249,7 +249,10 @@ static void sctp_endpoint_destroy(struct sctp_endpoint *ep)
+ {
+ 	struct sock *sk;
+ 
+-	SCTP_ASSERT(ep->base.dead, "Endpoint is not dead", return);
++	if (unlikely(!ep->base.dead)) {
++		WARN(1, "Attempt to destroy undead endpoint %p!\n", ep);
++		return;
++	}
+ 
+ 	/* Free the digest buffer */
+ 	kfree(ep->digest);
+diff --git a/net/sctp/input.c b/net/sctp/input.c
+index c53999ec1d68..04e6f42901bf 100644
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@ -448,8 +448,6 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
+ 			   struct sctp_association *asoc,
+ 			   struct sctp_transport *t)
+ {
+-	SCTP_DEBUG_PRINTK("%s\n",  __func__);
+-
+ 	if (sock_owned_by_user(sk)) {
+ 		if (timer_pending(&t->proto_unreach_timer))
+ 			return;
+@@ -458,10 +456,12 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
+ 						jiffies + (HZ/20)))
+ 				sctp_association_hold(asoc);
+ 		}
+-			
+ 	} else {
+ 		struct net *net = sock_net(sk);
+ 
++		pr_debug("%s: unrecognized next header type "
++			 "encountered!\n", __func__);
++
+ 		if (del_timer(&t->proto_unreach_timer))
+ 			sctp_association_put(asoc);
+ 
+diff --git a/net/sctp/inqueue.c b/net/sctp/inqueue.c
+index f49b9cedb9f5..162436c4af3c 100644
+--- a/net/sctp/inqueue.c
++++ b/net/sctp/inqueue.c
+@@ -210,10 +210,10 @@ next_chunk:
+ 		chunk->end_of_packet = 1;
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("+++sctp_inq_pop+++ chunk %p[%s],"
+-			  " length %d, skb->len %d\n",chunk,
+-			  sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)),
+-			  ntohs(chunk->chunk_hdr->length), chunk->skb->len);
++	pr_debug("+++sctp_inq_pop+++ chunk:%p[%s], length:%d, skb->len:%d\n",
++		 chunk, sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)),
++		 ntohs(chunk->chunk_hdr->length), chunk->skb->len);
++
+ 	return chunk;
+ }
+ 
+@@ -229,4 +229,3 @@ void sctp_inq_set_th_handler(struct sctp_inq *q, work_func_t callback)
+ {
+ 	INIT_WORK(&q->immediate, callback);
+ }
+-
+* Unmerged path net/sctp/ipv6.c
+diff --git a/net/sctp/output.c b/net/sctp/output.c
+index fed27c5c328a..a6557b7fd6e2 100644
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@ -93,8 +93,7 @@ struct sctp_packet *sctp_packet_config(struct sctp_packet *packet,
+ {
+ 	struct sctp_chunk *chunk = NULL;
+ 
+-	SCTP_DEBUG_PRINTK("%s: packet:%p vtag:0x%x\n", __func__,
+-			  packet, vtag);
++	pr_debug("%s: packet:%p vtag:0x%x\n", __func__, packet, vtag);
+ 
+ 	packet->vtag = vtag;
+ 
+@@ -119,8 +118,7 @@ struct sctp_packet *sctp_packet_init(struct sctp_packet *packet,
+ 	struct sctp_association *asoc = transport->asoc;
+ 	size_t overhead;
+ 
+-	SCTP_DEBUG_PRINTK("%s: packet:%p transport:%p\n", __func__,
+-			  packet, transport);
++	pr_debug("%s: packet:%p transport:%p\n", __func__, packet, transport);
+ 
+ 	packet->transport = transport;
+ 	packet->source_port = sport;
+@@ -145,7 +143,7 @@ void sctp_packet_free(struct sctp_packet *packet)
+ {
+ 	struct sctp_chunk *chunk, *tmp;
+ 
+-	SCTP_DEBUG_PRINTK("%s: packet:%p\n", __func__, packet);
++	pr_debug("%s: packet:%p\n", __func__, packet);
+ 
+ 	list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
+ 		list_del_init(&chunk->list);
+@@ -167,8 +165,7 @@ sctp_xmit_t sctp_packet_transmit_chunk(struct sctp_packet *packet,
+ 	sctp_xmit_t retval;
+ 	int error = 0;
+ 
+-	SCTP_DEBUG_PRINTK("%s: packet:%p chunk:%p\n", __func__,
+-			  packet, chunk);
++	pr_debug("%s: packet:%p chunk:%p\n", __func__, packet, chunk);
+ 
+ 	switch ((retval = (sctp_packet_append_chunk(packet, chunk)))) {
+ 	case SCTP_XMIT_PMTU_FULL:
+@@ -334,8 +331,7 @@ sctp_xmit_t sctp_packet_append_chunk(struct sctp_packet *packet,
+ {
+ 	sctp_xmit_t retval = SCTP_XMIT_OK;
+ 
+-	SCTP_DEBUG_PRINTK("%s: packet:%p chunk:%p\n", __func__, packet,
+-			  chunk);
++	pr_debug("%s: packet:%p chunk:%p\n", __func__, packet, chunk);
+ 
+ 	/* Data chunks are special.  Before seeing what else we can
+ 	 * bundle into this packet, check to see if we are allowed to
+@@ -401,7 +397,7 @@ int sctp_packet_transmit(struct sctp_packet *packet)
+ 	struct dst_entry *dst;
+ 	unsigned char *auth = NULL;	/* pointer to auth in skb data */
+ 
+-	SCTP_DEBUG_PRINTK("%s: packet:%p\n", __func__, packet);
++	pr_debug("%s: packet:%p\n", __func__, packet);
+ 
+ 	/* Do NOT generate a chunkless packet. */
+ 	if (list_empty(&packet->chunk_list))
+@@ -471,7 +467,9 @@ int sctp_packet_transmit(struct sctp_packet *packet)
+ 	 *
+ 	 * [This whole comment explains WORD_ROUND() below.]
+ 	 */
+-	SCTP_DEBUG_PRINTK("***sctp_transmit_packet***\n");
++
++	pr_debug("***sctp_transmit_packet***\n");
++
+ 	list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
+ 		list_del_init(&chunk->list);
+ 		if (sctp_chunk_is_data(chunk)) {
+@@ -504,16 +502,13 @@ int sctp_packet_transmit(struct sctp_packet *packet)
+ 		memcpy(skb_put(nskb, chunk->skb->len),
+ 			       chunk->skb->data, chunk->skb->len);
+ 
+-		SCTP_DEBUG_PRINTK("%s %p[%s] %s 0x%x, %s %d, %s %d, %s %d\n",
+-				  "*** Chunk", chunk,
+-				  sctp_cname(SCTP_ST_CHUNK(
+-					  chunk->chunk_hdr->type)),
+-				  chunk->has_tsn ? "TSN" : "No TSN",
+-				  chunk->has_tsn ?
+-				  ntohl(chunk->subh.data_hdr->tsn) : 0,
+-				  "length", ntohs(chunk->chunk_hdr->length),
+-				  "chunk->skb->len", chunk->skb->len,
+-				  "rtt_in_progress", chunk->rtt_in_progress);
++		pr_debug("*** Chunk:%p[%s] %s 0x%x, length:%d, chunk->skb->len:%d, "
++			 "rtt_in_progress:%d\n", chunk,
++			 sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)),
++			 chunk->has_tsn ? "TSN" : "No TSN",
++			 chunk->has_tsn ? ntohl(chunk->subh.data_hdr->tsn) : 0,
++			 ntohs(chunk->chunk_hdr->length), chunk->skb->len,
++			 chunk->rtt_in_progress);
+ 
+ 		/*
+ 		 * If this is a control chunk, this is our last
+@@ -601,8 +596,7 @@ int sctp_packet_transmit(struct sctp_packet *packet)
+ 		}
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("***sctp_transmit_packet*** skb len %d\n",
+-			  nskb->len);
++	pr_debug("***sctp_transmit_packet*** skb->len:%d\n", nskb->len);
+ 
+ 	nskb->ignore_df = packet->ipfragok;
+ 	(*tp->af_specific->sctp_xmit)(nskb, tp);
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index cb1123e96285..8af302388fbd 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -299,10 +299,10 @@ int sctp_outq_tail(struct sctp_outq *q, struct sctp_chunk *chunk)
+ 	struct net *net = sock_net(q->asoc->base.sk);
+ 	int error = 0;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_outq_tail(%p, %p[%s])\n",
+-			  q, chunk, chunk && chunk->chunk_hdr ?
+-			  sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type))
+-			  : "Illegal Chunk");
++	pr_debug("%s: outq:%p, chunk:%p[%s]\n", __func__, q, chunk,
++		 chunk && chunk->chunk_hdr ?
++		 sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)) :
++		 "illegal chunk");
+ 
+ 	/* If it is data, queue it up, otherwise, send it
+ 	 * immediately.
+@@ -328,10 +328,10 @@ int sctp_outq_tail(struct sctp_outq *q, struct sctp_chunk *chunk)
+ 			break;
+ 
+ 		default:
+-			SCTP_DEBUG_PRINTK("outqueueing (%p, %p[%s])\n",
+-			  q, chunk, chunk && chunk->chunk_hdr ?
+-			  sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type))
+-			  : "Illegal Chunk");
++			pr_debug("%s: outqueueing: outq:%p, chunk:%p[%s])\n",
++				 __func__, q, chunk, chunk && chunk->chunk_hdr ?
++				 sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)) :
++				 "illegal chunk");
+ 
+ 			sctp_outq_tail_data(q, chunk);
+ 			if (chunk->chunk_hdr->flags & SCTP_DATA_UNORDERED)
+@@ -462,14 +462,10 @@ void sctp_retransmit_mark(struct sctp_outq *q,
+ 		}
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("%s: transport: %p, reason: %d, "
+-			  "cwnd: %d, ssthresh: %d, flight_size: %d, "
+-			  "pba: %d\n", __func__,
+-			  transport, reason,
+-			  transport->cwnd, transport->ssthresh,
+-			  transport->flight_size,
+-			  transport->partial_bytes_acked);
+-
++	pr_debug("%s: transport:%p, reason:%d, cwnd:%d, ssthresh:%d, "
++		 "flight_size:%d, pba:%d\n", __func__, transport, reason,
++		 transport->cwnd, transport->ssthresh, transport->flight_size,
++		 transport->partial_bytes_acked);
+ }
+ 
+ /* Mark all the eligible packets on a transport for retransmission and force
+@@ -1016,19 +1012,13 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 				sctp_transport_burst_limited(transport);
+ 			}
+ 
+-			SCTP_DEBUG_PRINTK("sctp_outq_flush(%p, %p[%s]), ",
+-					  q, chunk,
+-					  chunk && chunk->chunk_hdr ?
+-					  sctp_cname(SCTP_ST_CHUNK(
+-						  chunk->chunk_hdr->type))
+-					  : "Illegal Chunk");
+-
+-			SCTP_DEBUG_PRINTK("TX TSN 0x%x skb->head "
+-					"%p skb->users %d.\n",
+-					ntohl(chunk->subh.data_hdr->tsn),
+-					chunk->skb ?chunk->skb->head : NULL,
+-					chunk->skb ?
+-					atomic_read(&chunk->skb->users) : -1);
++			pr_debug("%s: outq:%p, chunk:%p[%s], tx-tsn:0x%x skb->head:%p "
++				 "skb->users:%d\n",
++				 __func__, q, chunk, chunk && chunk->chunk_hdr ?
++				 sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)) :
++				 "illegal chunk", ntohl(chunk->subh.data_hdr->tsn),
++				 chunk->skb ? chunk->skb->head : NULL, chunk->skb ?
++				 atomic_read(&chunk->skb->users) : -1);
+ 
+ 			/* Add the chunk to the packet.  */
+ 			status = sctp_packet_transmit_chunk(packet, chunk, 0);
+@@ -1040,10 +1030,10 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 				/* We could not append this chunk, so put
+ 				 * the chunk back on the output queue.
+ 				 */
+-				SCTP_DEBUG_PRINTK("sctp_outq_flush: could "
+-					"not transmit TSN: 0x%x, status: %d\n",
+-					ntohl(chunk->subh.data_hdr->tsn),
+-					status);
++				pr_debug("%s: could not transmit tsn:0x%x, status:%d\n",
++					 __func__, ntohl(chunk->subh.data_hdr->tsn),
++					 status);
++
+ 				sctp_outq_head_data(q, chunk);
+ 				goto sctp_flush_out;
+ 				break;
+@@ -1286,11 +1276,10 @@ int sctp_outq_sack(struct sctp_outq *q, struct sctp_chunk *chunk)
+ 
+ 	sctp_generate_fwdtsn(q, sack_ctsn);
+ 
+-	SCTP_DEBUG_PRINTK("%s: sack Cumulative TSN Ack is 0x%x.\n",
+-			  __func__, sack_ctsn);
+-	SCTP_DEBUG_PRINTK("%s: Cumulative TSN Ack of association, "
+-			  "%p is 0x%x. Adv peer ack point: 0x%x\n",
+-			  __func__, asoc, ctsn, asoc->adv_peer_ack_point);
++	pr_debug("%s: sack cumulative tsn ack:0x%x\n", __func__, sack_ctsn);
++	pr_debug("%s: cumulative tsn ack of assoc:%p is 0x%x, "
++		 "advertised peer ack point:0x%x\n", __func__, asoc, ctsn,
++		 asoc->adv_peer_ack_point);
+ 
+ 	/* See if all chunks are acked.
+ 	 * Make sure the empty queue handler will get run later.
+@@ -1306,7 +1295,7 @@ int sctp_outq_sack(struct sctp_outq *q, struct sctp_chunk *chunk)
+ 			goto finish;
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("sack queue is empty.\n");
++	pr_debug("%s: sack queue is empty\n", __func__);
+ finish:
+ 	return q->empty;
+ }
+@@ -1351,7 +1340,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 
+ 	/* These state variables are for coherent debug output. --xguo */
+ 
+-#if SCTP_DEBUG
++#ifdef CONFIG_SCTP_DBG_TSNS
+ 	__u32 dbg_ack_tsn = 0;	/* An ACKed TSN range starts here... */
+ 	__u32 dbg_last_ack_tsn = 0;  /* ...and finishes here.	     */
+ 	__u32 dbg_kept_tsn = 0;	/* An un-ACKed range starts here...  */
+@@ -1362,7 +1351,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 	 * -1: We need to initialize.
+ 	 */
+ 	int dbg_prt_state = -1;
+-#endif /* SCTP_DEBUG */
++#endif /* CONFIG_SCTP_DBG_TSNS */
+ 
+ 	sack_ctsn = ntohl(sack->cum_tsn_ack);
+ 
+@@ -1489,7 +1478,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 				list_add_tail(lchunk, &tlist);
+ 			}
+ 
+-#if SCTP_DEBUG
++#ifdef CONFIG_SCTP_DBG_TSNS
+ 			switch (dbg_prt_state) {
+ 			case 0:	/* last TSN was ACKed */
+ 				if (dbg_last_ack_tsn + 1 == tsn) {
+@@ -1503,42 +1492,39 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 					/* Display the end of the
+ 					 * current range.
+ 					 */
+-					SCTP_DEBUG_PRINTK_CONT("-%08x",
+-							       dbg_last_ack_tsn);
++					pr_cont("-%08x", dbg_last_ack_tsn);
+ 				}
+ 
+ 				/* Start a new range.  */
+-				SCTP_DEBUG_PRINTK_CONT(",%08x", tsn);
++				pr_cont(",%08x", tsn);
+ 				dbg_ack_tsn = tsn;
+ 				break;
+ 
+ 			case 1:	/* The last TSN was NOT ACKed. */
+ 				if (dbg_last_kept_tsn != dbg_kept_tsn) {
+ 					/* Display the end of current range. */
+-					SCTP_DEBUG_PRINTK_CONT("-%08x",
+-							       dbg_last_kept_tsn);
++					pr_cont("-%08x", dbg_last_kept_tsn);
+ 				}
+ 
+-				SCTP_DEBUG_PRINTK_CONT("\n");
+-
++				pr_cont("\n");
+ 				/* FALL THROUGH... */
+ 			default:
+ 				/* This is the first-ever TSN we examined.  */
+ 				/* Start a new range of ACK-ed TSNs.  */
+-				SCTP_DEBUG_PRINTK("ACKed: %08x", tsn);
++				pr_debug("ACKed: %08x", tsn);
++
+ 				dbg_prt_state = 0;
+ 				dbg_ack_tsn = tsn;
+ 			}
+ 
+ 			dbg_last_ack_tsn = tsn;
+-#endif /* SCTP_DEBUG */
++#endif /* CONFIG_SCTP_DBG_TSNS */
+ 
+ 		} else {
+ 			if (tchunk->tsn_gap_acked) {
+-				SCTP_DEBUG_PRINTK("%s: Receiver reneged on "
+-						  "data TSN: 0x%x\n",
+-						  __func__,
+-						  tsn);
++				pr_debug("%s: receiver reneged on data TSN:0x%x\n",
++					 __func__, tsn);
++
+ 				tchunk->tsn_gap_acked = 0;
+ 
+ 				if (tchunk->transport)
+@@ -1558,7 +1544,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 
+ 			list_add_tail(lchunk, &tlist);
+ 
+-#if SCTP_DEBUG
++#ifdef CONFIG_SCTP_DBG_TSNS
+ 			/* See the above comments on ACK-ed TSNs. */
+ 			switch (dbg_prt_state) {
+ 			case 1:
+@@ -1566,50 +1552,47 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 					break;
+ 
+ 				if (dbg_last_kept_tsn != dbg_kept_tsn)
+-					SCTP_DEBUG_PRINTK_CONT("-%08x",
+-							       dbg_last_kept_tsn);
++					pr_cont("-%08x", dbg_last_kept_tsn);
+ 
+-				SCTP_DEBUG_PRINTK_CONT(",%08x", tsn);
++				pr_cont(",%08x", tsn);
+ 				dbg_kept_tsn = tsn;
+ 				break;
+ 
+ 			case 0:
+ 				if (dbg_last_ack_tsn != dbg_ack_tsn)
+-					SCTP_DEBUG_PRINTK_CONT("-%08x",
+-							       dbg_last_ack_tsn);
+-				SCTP_DEBUG_PRINTK_CONT("\n");
++					pr_cont("-%08x", dbg_last_ack_tsn);
+ 
++				pr_cont("\n");
+ 				/* FALL THROUGH... */
+ 			default:
+-				SCTP_DEBUG_PRINTK("KEPT: %08x",tsn);
++				pr_debug("KEPT: %08x", tsn);
++
+ 				dbg_prt_state = 1;
+ 				dbg_kept_tsn = tsn;
+ 			}
+ 
+ 			dbg_last_kept_tsn = tsn;
+-#endif /* SCTP_DEBUG */
++#endif /* CONFIG_SCTP_DBG_TSNS */
+ 		}
+ 	}
+ 
+-#if SCTP_DEBUG
++#ifdef CONFIG_SCTP_DBG_TSNS
+ 	/* Finish off the last range, displaying its ending TSN.  */
+ 	switch (dbg_prt_state) {
+ 	case 0:
+-		if (dbg_last_ack_tsn != dbg_ack_tsn) {
+-			SCTP_DEBUG_PRINTK_CONT("-%08x\n", dbg_last_ack_tsn);
+-		} else {
+-			SCTP_DEBUG_PRINTK_CONT("\n");
+-		}
+-	break;
+-
++		if (dbg_last_ack_tsn != dbg_ack_tsn)
++			pr_cont("-%08x\n", dbg_last_ack_tsn);
++		else
++			pr_cont("\n");
++		break;
+ 	case 1:
+-		if (dbg_last_kept_tsn != dbg_kept_tsn) {
+-			SCTP_DEBUG_PRINTK_CONT("-%08x\n", dbg_last_kept_tsn);
+-		} else {
+-			SCTP_DEBUG_PRINTK_CONT("\n");
+-		}
++		if (dbg_last_kept_tsn != dbg_kept_tsn)
++			pr_cont("-%08x\n", dbg_last_kept_tsn);
++		else
++			pr_cont("\n");
++		break;
+ 	}
+-#endif /* SCTP_DEBUG */
++#endif /* CONFIG_SCTP_DBG_TSNS */
+ 	if (transport) {
+ 		if (bytes_acked) {
+ 			struct sctp_association *asoc = transport->asoc;
+@@ -1683,9 +1666,9 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 			    !list_empty(&tlist) &&
+ 			    (sack_ctsn+2 == q->asoc->next_tsn) &&
+ 			    q->asoc->state < SCTP_STATE_SHUTDOWN_PENDING) {
+-				SCTP_DEBUG_PRINTK("%s: SACK received for zero "
+-						  "window probe: %u\n",
+-						  __func__, sack_ctsn);
++				pr_debug("%s: sack received for zero window "
++					 "probe:%u\n", __func__, sack_ctsn);
++
+ 				q->asoc->overall_error_count = 0;
+ 				transport->error_count = 0;
+ 			}
+@@ -1751,10 +1734,8 @@ static void sctp_mark_missing(struct sctp_outq *q,
+ 						count_of_newacks, tsn)) {
+ 				chunk->tsn_missing_report++;
+ 
+-				SCTP_DEBUG_PRINTK(
+-					"%s: TSN 0x%x missing counter: %d\n",
+-					__func__, tsn,
+-					chunk->tsn_missing_report);
++				pr_debug("%s: tsn:0x%x missing counter:%d\n",
++					 __func__, tsn, chunk->tsn_missing_report);
+ 			}
+ 		}
+ 		/*
+@@ -1774,11 +1755,10 @@ static void sctp_mark_missing(struct sctp_outq *q,
+ 		if (do_fast_retransmit)
+ 			sctp_retransmit(q, transport, SCTP_RTXR_FAST_RTX);
+ 
+-		SCTP_DEBUG_PRINTK("%s: transport: %p, cwnd: %d, "
+-				  "ssthresh: %d, flight_size: %d, pba: %d\n",
+-				  __func__, transport, transport->cwnd,
+-				  transport->ssthresh, transport->flight_size,
+-				  transport->partial_bytes_acked);
++		pr_debug("%s: transport:%p, cwnd:%d, ssthresh:%d, "
++			 "flight_size:%d, pba:%d\n",  __func__, transport,
++			 transport->cwnd, transport->ssthresh,
++			 transport->flight_size, transport->partial_bytes_acked);
+ 	}
+ }
+ 
+diff --git a/net/sctp/protocol.c b/net/sctp/protocol.c
+index ce4856e5bfb8..da7f22a4d561 100644
+--- a/net/sctp/protocol.c
++++ b/net/sctp/protocol.c
+@@ -451,8 +451,8 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 		fl4->fl4_sport = saddr->v4.sin_port;
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("%s: DST:%pI4, SRC:%pI4 - ",
+-			  __func__, &fl4->daddr, &fl4->saddr);
++	pr_debug("%s: dst:%pI4, src:%pI4 - ", __func__, &fl4->daddr,
++		 &fl4->saddr);
+ 
+ 	rt = ip_route_output_key(sock_net(sk), fl4);
+ 	if (!IS_ERR(rt))
+@@ -538,10 +538,10 @@ out_unlock:
+ out:
+ 	t->dst = dst;
+ 	if (dst)
+-		SCTP_DEBUG_PRINTK("rt_dst:%pI4, rt_src:%pI4\n",
+-				  &fl4->daddr, &fl4->saddr);
++		pr_debug("rt_dst:%pI4, rt_src:%pI4\n",
++			 &fl4->daddr, &fl4->saddr);
+ 	else
+-		SCTP_DEBUG_PRINTK("NO ROUTE\n");
++		pr_debug("no route\n");
+ }
+ 
+ /* For v4, the source address is cached in the route entry(dst). So no need
+@@ -629,9 +629,9 @@ static void sctp_addr_wq_timeout_handler(unsigned long arg)
+ 	spin_lock_bh(&net->sctp.addr_wq_lock);
+ 
+ 	list_for_each_entry_safe(addrw, temp, &net->sctp.addr_waitq, list) {
+-		SCTP_DEBUG_PRINTK_IPADDR("sctp_addrwq_timo_handler: the first ent in wq %p is ",
+-		    " for cmd %d at entry %p\n", &net->sctp.addr_waitq, &addrw->a, addrw->state,
+-		    addrw);
++		pr_debug("%s: the first ent in wq:%p is addr:%pISc for cmd:%d at "
++			 "entry:%p\n", __func__, &net->sctp.addr_waitq, &addrw->a.sa,
++			 addrw->state, addrw);
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+ 		/* Now we send an ASCONF for each association */
+@@ -648,8 +648,10 @@ static void sctp_addr_wq_timeout_handler(unsigned long arg)
+ 			    addrw->state == SCTP_ADDR_NEW) {
+ 				unsigned long timeo_val;
+ 
+-				SCTP_DEBUG_PRINTK("sctp_timo_handler: this is on DAD, trying %d sec later\n",
+-				    SCTP_ADDRESS_TICK_DELAY);
++				pr_debug("%s: this is on DAD, trying %d sec "
++					 "later\n", __func__,
++					 SCTP_ADDRESS_TICK_DELAY);
++
+ 				timeo_val = jiffies;
+ 				timeo_val += msecs_to_jiffies(SCTP_ADDRESS_TICK_DELAY);
+ 				mod_timer(&net->sctp.addr_wq_timer, timeo_val);
+@@ -666,7 +668,7 @@ static void sctp_addr_wq_timeout_handler(unsigned long arg)
+ 				continue;
+ 			sctp_bh_lock_sock(sk);
+ 			if (sctp_asconf_mgmt(sp, addrw) < 0)
+-				SCTP_DEBUG_PRINTK("sctp_addrwq_timo_handler: sctp_asconf_mgmt failed\n");
++				pr_debug("%s: sctp_asconf_mgmt failed\n", __func__);
+ 			sctp_bh_unlock_sock(sk);
+ 		}
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -732,9 +734,10 @@ void sctp_addr_wq_mgmt(struct net *net, struct sctp_sockaddr_entry *addr, int cm
+ 	addrw = sctp_addr_wq_lookup(net, addr);
+ 	if (addrw) {
+ 		if (addrw->state != cmd) {
+-			SCTP_DEBUG_PRINTK_IPADDR("sctp_addr_wq_mgmt offsets existing entry for %d ",
+-			    " in wq %p\n", addrw->state, &addrw->a,
+-			    &net->sctp.addr_waitq);
++			pr_debug("%s: offsets existing entry for %d, addr:%pISc "
++				 "in wq:%p\n", __func__, addrw->state, &addrw->a.sa,
++				 &net->sctp.addr_waitq);
++
+ 			list_del(&addrw->list);
+ 			kfree(addrw);
+ 		}
+@@ -750,8 +753,9 @@ void sctp_addr_wq_mgmt(struct net *net, struct sctp_sockaddr_entry *addr, int cm
+ 	}
+ 	addrw->state = cmd;
+ 	list_add_tail(&addrw->list, &net->sctp.addr_waitq);
+-	SCTP_DEBUG_PRINTK_IPADDR("sctp_addr_wq_mgmt add new entry for cmd:%d ",
+-	    " in wq %p\n", addrw->state, &addrw->a, &net->sctp.addr_waitq);
++
++	pr_debug("%s: add new entry for cmd:%d, addr:%pISc in wq:%p\n",
++		 __func__, addrw->state, &addrw->a.sa, &net->sctp.addr_waitq);
+ 
+ 	if (!timer_pending(&net->sctp.addr_wq_timer)) {
+ 		timeo_val = jiffies;
+@@ -977,15 +981,14 @@ static inline int sctp_v4_xmit(struct sk_buff *skb,
+ {
+ 	struct inet_sock *inet = inet_sk(skb->sk);
+ 
+-	SCTP_DEBUG_PRINTK("%s: skb:%p, len:%d, src:%pI4, dst:%pI4\n",
+-			  __func__, skb, skb->len,
+-			  &transport->fl.u.ip4.saddr,
+-			  &transport->fl.u.ip4.daddr);
++	pr_debug("%s: skb:%p, len:%d, src:%pI4, dst:%pI4\n", __func__, skb,
++		 skb->len, &transport->fl.u.ip4.saddr, &transport->fl.u.ip4.daddr);
+ 
+ 	inet->pmtudisc = transport->param_flags & SPP_PMTUD_ENABLE ?
+ 			 IP_PMTUDISC_DO : IP_PMTUDISC_DONT;
+ 
+ 	SCTP_INC_STATS(sock_net(&inet->sk), SCTP_MIB_OUTSCTPPACKS);
++
+ 	return ip_queue_xmit(skb, &transport->fl);
+ }
+ 
+@@ -1355,9 +1358,8 @@ SCTP_STATIC __init int sctp_init(void)
+ 	int max_share;
+ 	int order;
+ 
+-	/* SCTP_DEBUG sanity check. */
+-	if (!sctp_sanity_check())
+-		goto out;
++	BUILD_BUG_ON(sizeof(struct sctp_ulpevent) >
++		     sizeof(((struct sk_buff *) 0)->cb));
+ 
+ 	/* Allocate bind_bucket and chunk caches. */
+ 	status = -ENOBUFS;
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index 226deffa4e7d..94ead45a1bc6 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -743,7 +743,8 @@ struct sctp_chunk *sctp_make_sack(const struct sctp_association *asoc)
+ 
+ 	memset(gabs, 0, sizeof(gabs));
+ 	ctsn = sctp_tsnmap_get_ctsn(map);
+-	SCTP_DEBUG_PRINTK("sackCTSNAck sent:  0x%x.\n", ctsn);
++
++	pr_debug("%s: sackCTSNAck sent:0x%x\n", __func__, ctsn);
+ 
+ 	/* How much room is needed in the chunk? */
+ 	num_gabs = sctp_tsnmap_num_gabs(map, gabs);
+@@ -1289,10 +1290,8 @@ struct sctp_chunk *sctp_chunkify(struct sk_buff *skb,
+ 
+ 	if (!retval)
+ 		goto nodata;
+-
+-	if (!sk) {
+-		SCTP_DEBUG_PRINTK("chunkifying skb %p w/o an sk\n", skb);
+-	}
++	if (!sk)
++		pr_debug("%s: chunkifying skb:%p w/o an sk\n", __func__, skb);
+ 
+ 	INIT_LIST_HEAD(&retval->list);
+ 	retval->skb		= skb;
+@@ -2195,8 +2194,9 @@ static sctp_ierror_t sctp_verify_param(struct net *net,
+ 		break;
+ fallthrough:
+ 	default:
+-		SCTP_DEBUG_PRINTK("Unrecognized param: %d for chunk %d.\n",
+-				ntohs(param.p->type), cid);
++		pr_debug("%s: unrecognized param:%d for chunk:%d\n",
++			 __func__, ntohs(param.p->type), cid);
++
+ 		retval = sctp_process_unk_param(asoc, param, chunk, err_chunk);
+ 		break;
+ 	}
+@@ -2520,7 +2520,7 @@ do_addr_param:
+ 		break;
+ 
+ 	case SCTP_PARAM_HOST_NAME_ADDRESS:
+-		SCTP_DEBUG_PRINTK("unimplemented SCTP_HOST_NAME_ADDRESS\n");
++		pr_debug("%s: unimplemented SCTP_HOST_NAME_ADDRESS\n", __func__);
+ 		break;
+ 
+ 	case SCTP_PARAM_SUPPORTED_ADDRESS_TYPES:
+@@ -2669,8 +2669,8 @@ fall_through:
+ 		 * called prior to this routine.  Simply log the error
+ 		 * here.
+ 		 */
+-		SCTP_DEBUG_PRINTK("Ignoring param: %d for association %p.\n",
+-				  ntohs(param.p->type), asoc);
++		pr_debug("%s: ignoring param:%d for association:%p.\n",
++			 __func__, ntohs(param.p->type), asoc);
+ 		break;
+ 	}
+ 
+@@ -2812,7 +2812,10 @@ struct sctp_chunk *sctp_make_asconf_update_ip(struct sctp_association *asoc,
+ 			totallen += paramlen;
+ 			totallen += addr_param_len;
+ 			del_pickup = 1;
+-			SCTP_DEBUG_PRINTK("mkasconf_update_ip: picked same-scope del_pending addr, totallen for all addresses is %d\n", totallen);
++
++			pr_debug("%s: picked same-scope del_pending addr, "
++				 "totallen for all addresses is %d\n",
++				 __func__, totallen);
+ 		}
+ 	}
+ 
+diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
+index 3850ffd28208..209392bafcde 100644
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -261,7 +261,7 @@ void sctp_generate_t3_rtx_event(unsigned long peer)
+ 
+ 	sctp_bh_lock_sock(asoc->base.sk);
+ 	if (sock_owned_by_user(asoc->base.sk)) {
+-		SCTP_DEBUG_PRINTK("%s:Sock is busy.\n", __func__);
++		pr_debug("%s: sock is busy\n", __func__);
+ 
+ 		/* Try again later.  */
+ 		if (!mod_timer(&transport->T3_rtx_timer, jiffies + (HZ/20)))
+@@ -301,9 +301,8 @@ static void sctp_generate_timeout_event(struct sctp_association *asoc,
+ 
+ 	sctp_bh_lock_sock(asoc->base.sk);
+ 	if (sock_owned_by_user(asoc->base.sk)) {
+-		SCTP_DEBUG_PRINTK("%s:Sock is busy: timer %d\n",
+-				  __func__,
+-				  timeout_type);
++		pr_debug("%s: sock is busy: timer %d\n", __func__,
++			 timeout_type);
+ 
+ 		/* Try again later.  */
+ 		if (!mod_timer(&asoc->timers[timeout_type], jiffies + (HZ/20)))
+@@ -381,7 +380,7 @@ void sctp_generate_heartbeat_event(unsigned long data)
+ 
+ 	sctp_bh_lock_sock(asoc->base.sk);
+ 	if (sock_owned_by_user(asoc->base.sk)) {
+-		SCTP_DEBUG_PRINTK("%s:Sock is busy.\n", __func__);
++		pr_debug("%s: sock is busy\n", __func__);
+ 
+ 		/* Try again later.  */
+ 		if (!mod_timer(&transport->hb_timer, jiffies + (HZ/20)))
+@@ -419,7 +418,7 @@ void sctp_generate_proto_unreach_event(unsigned long data)
+ 	
+ 	sctp_bh_lock_sock(asoc->base.sk);
+ 	if (sock_owned_by_user(asoc->base.sk)) {
+-		SCTP_DEBUG_PRINTK("%s:Sock is busy.\n", __func__);
++		pr_debug("%s: sock is busy\n", __func__);
+ 
+ 		/* Try again later.  */
+ 		if (!mod_timer(&transport->proto_unreach_timer,
+@@ -526,11 +525,9 @@ static void sctp_do_8_2_transport_strike(sctp_cmd_seq_t *commands,
+ 
+ 	if (transport->state != SCTP_INACTIVE &&
+ 	    (transport->error_count > transport->pathmaxrxt)) {
+-		SCTP_DEBUG_PRINTK_IPADDR("transport_strike:association %p",
+-					 " transport IP: port:%d failed.\n",
+-					 asoc,
+-					 (&transport->ipaddr),
+-					 ntohs(transport->ipaddr.v4.sin_port));
++		pr_debug("%s: association:%p transport addr:%pISpc failed\n",
++			 __func__, asoc, &transport->ipaddr.sa);
++
+ 		sctp_assoc_control_transport(asoc, transport,
+ 					     SCTP_TRANSPORT_DOWN,
+ 					     SCTP_FAILED_THRESHOLD);
+@@ -815,8 +812,7 @@ static void sctp_cmd_new_state(sctp_cmd_seq_t *cmds,
+ 
+ 	asoc->state = state;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_cmd_new_state: asoc %p[%s]\n",
+-			  asoc, sctp_state_tbl[state]);
++	pr_debug("%s: asoc:%p[%s]\n", __func__, asoc, sctp_state_tbl[state]);
+ 
+ 	if (sctp_style(sk, TCP)) {
+ 		/* Change the sk->sk_state of a TCP-style socket that has
+@@ -1027,15 +1023,11 @@ static void sctp_cmd_t1_timer_update(struct sctp_association *asoc,
+ 			asoc->timeouts[timer] = asoc->max_init_timeo;
+ 		}
+ 		asoc->init_cycle++;
+-		SCTP_DEBUG_PRINTK(
+-			"T1 %s Timeout adjustment"
+-			" init_err_counter: %d"
+-			" cycle: %d"
+-			" timeout: %ld\n",
+-			name,
+-			asoc->init_err_counter,
+-			asoc->init_cycle,
+-			asoc->timeouts[timer]);
++
++		pr_debug("%s: T1[%s] timeout adjustment init_err_counter:%d"
++			 " cycle:%d timeout:%ld\n", __func__, name,
++			 asoc->init_err_counter, asoc->init_cycle,
++			 asoc->timeouts[timer]);
+ 	}
+ 
+ }
+@@ -1090,23 +1082,19 @@ static void sctp_cmd_send_asconf(struct sctp_association *asoc)
+  * main flow of sctp_do_sm() to keep attention focused on the real
+  * functionality there.
+  */
+-#define DEBUG_PRE \
+-	SCTP_DEBUG_PRINTK("sctp_do_sm prefn: " \
+-			  "ep %p, %s, %s, asoc %p[%s], %s\n", \
+-			  ep, sctp_evttype_tbl[event_type], \
+-			  (*debug_fn)(subtype), asoc, \
+-			  sctp_state_tbl[state], state_fn->name)
+-
+-#define DEBUG_POST \
+-	SCTP_DEBUG_PRINTK("sctp_do_sm postfn: " \
+-			  "asoc %p, status: %s\n", \
+-			  asoc, sctp_status_tbl[status])
+-
+-#define DEBUG_POST_SFX \
+-	SCTP_DEBUG_PRINTK("sctp_do_sm post sfx: error %d, asoc %p[%s]\n", \
+-			  error, asoc, \
+-			  sctp_state_tbl[(asoc && sctp_id2assoc(ep->base.sk, \
+-			  sctp_assoc2id(asoc)))?asoc->state:SCTP_STATE_CLOSED])
++#define debug_pre_sfn() \
++	pr_debug("%s[pre-fn]: ep:%p, %s, %s, asoc:%p[%s], %s\n", __func__, \
++		 ep, sctp_evttype_tbl[event_type], (*debug_fn)(subtype),   \
++		 asoc, sctp_state_tbl[state], state_fn->name)
++
++#define debug_post_sfn() \
++	pr_debug("%s[post-fn]: asoc:%p, status:%s\n", __func__, asoc, \
++		 sctp_status_tbl[status])
++
++#define debug_post_sfx() \
++	pr_debug("%s[post-sfx]: error:%d, asoc:%p[%s]\n", __func__, error, \
++		 asoc, sctp_state_tbl[(asoc && sctp_id2assoc(ep->base.sk, \
++		 sctp_assoc2id(asoc))) ? asoc->state : SCTP_STATE_CLOSED])
+ 
+ /*
+  * This is the master state machine processing function.
+@@ -1126,7 +1114,6 @@ int sctp_do_sm(struct net *net, sctp_event_t event_type, sctp_subtype_t subtype,
+ 	sctp_disposition_t status;
+ 	int error = 0;
+ 	typedef const char *(printfn_t)(sctp_subtype_t);
+-
+ 	static printfn_t *table[] = {
+ 		NULL, sctp_cname, sctp_tname, sctp_oname, sctp_pname,
+ 	};
+@@ -1139,21 +1126,18 @@ int sctp_do_sm(struct net *net, sctp_event_t event_type, sctp_subtype_t subtype,
+ 
+ 	sctp_init_cmd_seq(&commands);
+ 
+-	DEBUG_PRE;
++	debug_pre_sfn();
+ 	status = (*state_fn->fn)(net, ep, asoc, subtype, event_arg, &commands);
+-	DEBUG_POST;
++	debug_post_sfn();
+ 
+ 	error = sctp_side_effects(event_type, subtype, state,
+ 				  ep, asoc, event_arg, status,
+ 				  &commands, gfp);
+-	DEBUG_POST_SFX;
++	debug_post_sfx();
+ 
+ 	return error;
+ }
+ 
+-#undef DEBUG_PRE
+-#undef DEBUG_POST
+-
+ /*****************************************************************
+  * This the master state function side effect processing function.
+  *****************************************************************/
+@@ -1182,9 +1166,9 @@ static int sctp_side_effects(sctp_event_t event_type, sctp_subtype_t subtype,
+ 
+ 	switch (status) {
+ 	case SCTP_DISPOSITION_DISCARD:
+-		SCTP_DEBUG_PRINTK("Ignored sctp protocol event - state %d, "
+-				  "event_type %d, event_id %d\n",
+-				  state, event_type, subtype.chunk);
++		pr_debug("%s: ignored sctp protocol event - state:%d, "
++			 "event_type:%d, event_id:%d\n", __func__, state,
++			 event_type, subtype.chunk);
+ 		break;
+ 
+ 	case SCTP_DISPOSITION_NOMEM:
+@@ -1435,18 +1419,18 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
+ 
+ 		case SCTP_CMD_CHUNK_ULP:
+ 			/* Send a chunk to the sockets layer.  */
+-			SCTP_DEBUG_PRINTK("sm_sideff: %s %p, %s %p.\n",
+-					  "chunk_up:", cmd->obj.chunk,
+-					  "ulpq:", &asoc->ulpq);
++			pr_debug("%s: sm_sideff: chunk_up:%p, ulpq:%p\n",
++				 __func__, cmd->obj.chunk, &asoc->ulpq);
++
+ 			sctp_ulpq_tail_data(&asoc->ulpq, cmd->obj.chunk,
+ 					    GFP_ATOMIC);
+ 			break;
+ 
+ 		case SCTP_CMD_EVENT_ULP:
+ 			/* Send a notification to the sockets layer.  */
+-			SCTP_DEBUG_PRINTK("sm_sideff: %s %p, %s %p.\n",
+-					  "event_up:",cmd->obj.ulpevent,
+-					  "ulpq:",&asoc->ulpq);
++			pr_debug("%s: sm_sideff: event_up:%p, ulpq:%p\n",
++				 __func__, cmd->obj.ulpevent, &asoc->ulpq);
++
+ 			sctp_ulpq_tail_event(&asoc->ulpq, cmd->obj.ulpevent);
+ 			break;
+ 
+@@ -1611,7 +1595,7 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
+ 			break;
+ 
+ 		case SCTP_CMD_REPORT_BAD_TAG:
+-			SCTP_DEBUG_PRINTK("vtag mismatch!\n");
++			pr_debug("%s: vtag mismatch!\n", __func__);
+ 			break;
+ 
+ 		case SCTP_CMD_STRIKE:
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+index 3cf0d9f35e16..8fa05b326d57 100644
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -1189,9 +1189,9 @@ sctp_disposition_t sctp_sf_backbeat_8_3(struct net *net,
+ 	/* Check if the timestamp looks valid.  */
+ 	if (time_after(hbinfo->sent_at, jiffies) ||
+ 	    time_after(jiffies, hbinfo->sent_at + max_interval)) {
+-		SCTP_DEBUG_PRINTK("%s: HEARTBEAT ACK with invalid timestamp "
+-				  "received for transport: %p\n",
+-				   __func__, link);
++		pr_debug("%s: HEARTBEAT ACK with invalid timestamp received "
++			 "for transport:%p\n", __func__, link);
++
+ 		return SCTP_DISPOSITION_DISCARD;
+ 	}
+ 
+@@ -2585,7 +2585,8 @@ static sctp_disposition_t sctp_stop_t1_and_abort(struct net *net,
+ 					   const struct sctp_association *asoc,
+ 					   struct sctp_transport *transport)
+ {
+-	SCTP_DEBUG_PRINTK("ABORT received (INIT).\n");
++	pr_debug("%s: ABORT received (INIT)\n", __func__);
++
+ 	sctp_add_cmd_sf(commands, SCTP_CMD_NEW_STATE,
+ 			SCTP_STATE(SCTP_STATE_CLOSED));
+ 	SCTP_INC_STATS(net, SCTP_MIB_ABORTEDS);
+@@ -2595,6 +2596,7 @@ static sctp_disposition_t sctp_stop_t1_and_abort(struct net *net,
+ 	/* CMD_INIT_FAILED will DELETE_TCB. */
+ 	sctp_add_cmd_sf(commands, SCTP_CMD_INIT_FAILED,
+ 			SCTP_PERR(error));
++
+ 	return SCTP_DISPOSITION_ABORT;
+ }
+ 
+@@ -2660,8 +2662,9 @@ sctp_disposition_t sctp_sf_do_9_2_shutdown(struct net *net,
+ 	ctsn = ntohl(sdh->cum_tsn_ack);
+ 
+ 	if (TSN_lt(ctsn, asoc->ctsn_ack_point)) {
+-		SCTP_DEBUG_PRINTK("ctsn %x\n", ctsn);
+-		SCTP_DEBUG_PRINTK("ctsn_ack_point %x\n", asoc->ctsn_ack_point);
++		pr_debug("%s: ctsn:%x, ctsn_ack_point:%x\n", __func__, ctsn,
++			 asoc->ctsn_ack_point);
++
+ 		return SCTP_DISPOSITION_DISCARD;
+ 	}
+ 
+@@ -2744,8 +2747,9 @@ sctp_disposition_t sctp_sf_do_9_2_shut_ctsn(struct net *net,
+ 	ctsn = ntohl(sdh->cum_tsn_ack);
+ 
+ 	if (TSN_lt(ctsn, asoc->ctsn_ack_point)) {
+-		SCTP_DEBUG_PRINTK("ctsn %x\n", ctsn);
+-		SCTP_DEBUG_PRINTK("ctsn_ack_point %x\n", asoc->ctsn_ack_point);
++		pr_debug("%s: ctsn:%x, ctsn_ack_point:%x\n", __func__, ctsn,
++			 asoc->ctsn_ack_point);
++
+ 		return SCTP_DISPOSITION_DISCARD;
+ 	}
+ 
+@@ -3197,8 +3201,9 @@ sctp_disposition_t sctp_sf_eat_sack_6_2(struct net *net,
+ 	 *     Point indicates an out-of-order SACK.
+ 	 */
+ 	if (TSN_lt(ctsn, asoc->ctsn_ack_point)) {
+-		SCTP_DEBUG_PRINTK("ctsn %x\n", ctsn);
+-		SCTP_DEBUG_PRINTK("ctsn_ack_point %x\n", asoc->ctsn_ack_point);
++		pr_debug("%s: ctsn:%x, ctsn_ack_point:%x\n", __func__, ctsn,
++			 asoc->ctsn_ack_point);
++
+ 		return SCTP_DISPOSITION_DISCARD;
+ 	}
+ 
+@@ -3868,7 +3873,7 @@ sctp_disposition_t sctp_sf_eat_fwd_tsn(struct net *net,
+ 	skb_pull(chunk->skb, len);
+ 
+ 	tsn = ntohl(fwdtsn_hdr->new_cum_tsn);
+-	SCTP_DEBUG_PRINTK("%s: TSN 0x%x.\n", __func__, tsn);
++	pr_debug("%s: TSN 0x%x\n", __func__, tsn);
+ 
+ 	/* The TSN is too high--silently discard the chunk and count on it
+ 	 * getting retransmitted later.
+@@ -3936,7 +3941,7 @@ sctp_disposition_t sctp_sf_eat_fwd_tsn_fast(
+ 	skb_pull(chunk->skb, len);
+ 
+ 	tsn = ntohl(fwdtsn_hdr->new_cum_tsn);
+-	SCTP_DEBUG_PRINTK("%s: TSN 0x%x.\n", __func__, tsn);
++	pr_debug("%s: TSN 0x%x\n", __func__, tsn);
+ 
+ 	/* The TSN is too high--silently discard the chunk and count on it
+ 	 * getting retransmitted later.
+@@ -4175,7 +4180,7 @@ sctp_disposition_t sctp_sf_unk_chunk(struct net *net,
+ 	struct sctp_chunk *err_chunk;
+ 	sctp_chunkhdr_t *hdr;
+ 
+-	SCTP_DEBUG_PRINTK("Processing the unknown chunk id %d.\n", type.chunk);
++	pr_debug("%s: processing unknown chunk id:%d\n", __func__, type.chunk);
+ 
+ 	if (!sctp_vtag_verify(unk_chunk, asoc))
+ 		return sctp_sf_pdiscard(net, ep, asoc, type, arg, commands);
+@@ -4265,7 +4270,8 @@ sctp_disposition_t sctp_sf_discard_chunk(struct net *net,
+ 		return sctp_sf_violation_chunklen(net, ep, asoc, type, arg,
+ 						  commands);
+ 
+-	SCTP_DEBUG_PRINTK("Chunk %d is discarded\n", type.chunk);
++	pr_debug("%s: chunk:%d is discarded\n", __func__, type.chunk);
++
+ 	return SCTP_DISPOSITION_DISCARD;
+ }
+ 
+@@ -5195,7 +5201,9 @@ sctp_disposition_t sctp_sf_ignore_primitive(
+ 	void *arg,
+ 	sctp_cmd_seq_t *commands)
+ {
+-	SCTP_DEBUG_PRINTK("Primitive type %d is ignored.\n", type.primitive);
++	pr_debug("%s: primitive type:%d is ignored\n", __func__,
++		 type.primitive);
++
+ 	return SCTP_DISPOSITION_DISCARD;
+ }
+ 
+@@ -5390,7 +5398,9 @@ sctp_disposition_t sctp_sf_ignore_other(struct net *net,
+ 					void *arg,
+ 					sctp_cmd_seq_t *commands)
+ {
+-	SCTP_DEBUG_PRINTK("The event other type %d is ignored\n", type.other);
++	pr_debug("%s: the event other type:%d is ignored\n",
++		 __func__, type.other);
++
+ 	return SCTP_DISPOSITION_DISCARD;
+ }
+ 
+@@ -5538,7 +5548,8 @@ sctp_disposition_t sctp_sf_t1_init_timer_expire(struct net *net,
+ 	struct sctp_bind_addr *bp;
+ 	int attempts = asoc->init_err_counter + 1;
+ 
+-	SCTP_DEBUG_PRINTK("Timer T1 expired (INIT).\n");
++	pr_debug("%s: timer T1 expired (INIT)\n", __func__);
++
+ 	SCTP_INC_STATS(net, SCTP_MIB_T1_INIT_EXPIREDS);
+ 
+ 	if (attempts <= asoc->max_init_attempts) {
+@@ -5557,9 +5568,10 @@ sctp_disposition_t sctp_sf_t1_init_timer_expire(struct net *net,
+ 
+ 		sctp_add_cmd_sf(commands, SCTP_CMD_REPLY, SCTP_CHUNK(repl));
+ 	} else {
+-		SCTP_DEBUG_PRINTK("Giving up on INIT, attempts: %d"
+-				  " max_init_attempts: %d\n",
+-				  attempts, asoc->max_init_attempts);
++		pr_debug("%s: giving up on INIT, attempts:%d "
++			 "max_init_attempts:%d\n", __func__, attempts,
++			 asoc->max_init_attempts);
++
+ 		sctp_add_cmd_sf(commands, SCTP_CMD_SET_SK_ERR,
+ 				SCTP_ERROR(ETIMEDOUT));
+ 		sctp_add_cmd_sf(commands, SCTP_CMD_INIT_FAILED,
+@@ -5599,7 +5611,8 @@ sctp_disposition_t sctp_sf_t1_cookie_timer_expire(struct net *net,
+ 	struct sctp_chunk *repl = NULL;
+ 	int attempts = asoc->init_err_counter + 1;
+ 
+-	SCTP_DEBUG_PRINTK("Timer T1 expired (COOKIE-ECHO).\n");
++	pr_debug("%s: timer T1 expired (COOKIE-ECHO)\n", __func__);
++
+ 	SCTP_INC_STATS(net, SCTP_MIB_T1_COOKIE_EXPIREDS);
+ 
+ 	if (attempts <= asoc->max_init_attempts) {
+@@ -5647,7 +5660,8 @@ sctp_disposition_t sctp_sf_t2_timer_expire(struct net *net,
+ {
+ 	struct sctp_chunk *reply = NULL;
+ 
+-	SCTP_DEBUG_PRINTK("Timer T2 expired.\n");
++	pr_debug("%s: timer T2 expired\n", __func__);
++
+ 	SCTP_INC_STATS(net, SCTP_MIB_T2_SHUTDOWN_EXPIREDS);
+ 
+ 	((struct sctp_association *)asoc)->shutdown_retries++;
+@@ -5788,7 +5802,8 @@ sctp_disposition_t sctp_sf_t5_timer_expire(struct net *net,
+ {
+ 	struct sctp_chunk *reply = NULL;
+ 
+-	SCTP_DEBUG_PRINTK("Timer T5 expired.\n");
++	pr_debug("%s: timer T5 expired\n", __func__);
++
+ 	SCTP_INC_STATS(net, SCTP_MIB_T5_SHUTDOWN_GUARD_EXPIREDS);
+ 
+ 	reply = sctp_make_abort(asoc, NULL, 0);
+@@ -5903,7 +5918,8 @@ sctp_disposition_t sctp_sf_timer_ignore(struct net *net,
+ 					void *arg,
+ 					sctp_cmd_seq_t *commands)
+ {
+-	SCTP_DEBUG_PRINTK("Timer %d ignored.\n", type.chunk);
++	pr_debug("%s: timer %d ignored\n", __func__, type.chunk);
++
+ 	return SCTP_DISPOSITION_CONSUME;
+ }
+ 
+@@ -6113,7 +6129,7 @@ static int sctp_eat_data(const struct sctp_association *asoc,
+ 	skb_pull(chunk->skb, sizeof(sctp_datahdr_t));
+ 
+ 	tsn = ntohl(data_hdr->tsn);
+-	SCTP_DEBUG_PRINTK("eat_data: TSN 0x%x.\n", tsn);
++	pr_debug("%s: TSN 0x%x\n", __func__, tsn);
+ 
+ 	/* ASSERT:  Now skb->data is really the user data.  */
+ 
+@@ -6190,12 +6206,12 @@ static int sctp_eat_data(const struct sctp_association *asoc,
+ 		 */
+ 		if (sctp_tsnmap_has_gap(map) &&
+ 		    (sctp_tsnmap_get_ctsn(map) + 1) == tsn) {
+-			SCTP_DEBUG_PRINTK("Reneging for tsn:%u\n", tsn);
++			pr_debug("%s: reneging for tsn:%u\n", __func__, tsn);
+ 			deliver = SCTP_CMD_RENEGE;
+ 		} else {
+-			SCTP_DEBUG_PRINTK("Discard tsn: %u len: %Zd, "
+-					  "rwnd: %d\n", tsn, datalen,
+-					  asoc->rwnd);
++			pr_debug("%s: discard tsn:%u len:%zu, rwnd:%d\n",
++				 __func__, tsn, datalen, asoc->rwnd);
++
+ 			return SCTP_IERROR_IGNORE_TSN;
+ 		}
+ 	}
+@@ -6210,7 +6226,8 @@ static int sctp_eat_data(const struct sctp_association *asoc,
+ 	if (*sk->sk_prot_creator->memory_pressure) {
+ 		if (sctp_tsnmap_has_gap(map) &&
+ 	           (sctp_tsnmap_get_ctsn(map) + 1) == tsn) {
+-			SCTP_DEBUG_PRINTK("Under Pressure! Reneging for tsn:%u\n", tsn);
++			pr_debug("%s: under pressure, reneging for tsn:%u\n",
++				 __func__, tsn);
+ 			deliver = SCTP_CMD_RENEGE;
+ 		 }
+ 	}
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 16a2a0de6dda..2e43df15d899 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -287,8 +287,8 @@ SCTP_STATIC int sctp_bind(struct sock *sk, struct sockaddr *addr, int addr_len)
+ 
+ 	sctp_lock_sock(sk);
+ 
+-	SCTP_DEBUG_PRINTK("sctp_bind(sk: %p, addr: %p, addr_len: %d)\n",
+-			  sk, addr, addr_len);
++	pr_debug("%s: sk:%p, addr:%p, addr_len:%d\n", __func__, sk,
++		 addr, addr_len);
+ 
+ 	/* Disallow binding twice. */
+ 	if (!sctp_sk(sk)->ep->base.bind_addr.port)
+@@ -348,19 +348,15 @@ SCTP_STATIC int sctp_do_bind(struct sock *sk, union sctp_addr *addr, int len)
+ 	/* Common sockaddr verification. */
+ 	af = sctp_sockaddr_af(sp, addr, len);
+ 	if (!af) {
+-		SCTP_DEBUG_PRINTK("sctp_do_bind(sk: %p, newaddr: %p, len: %d) EINVAL\n",
+-				  sk, addr, len);
++		pr_debug("%s: sk:%p, newaddr:%p, len:%d EINVAL\n",
++			 __func__, sk, addr, len);
+ 		return -EINVAL;
+ 	}
+ 
+ 	snum = ntohs(addr->v4.sin_port);
+ 
+-	SCTP_DEBUG_PRINTK_IPADDR("sctp_do_bind(sk: %p, new addr: ",
+-				 ", port: %d, new port: %d, len: %d)\n",
+-				 sk,
+-				 addr,
+-				 bp->port, snum,
+-				 len);
++	pr_debug("%s: sk:%p, new addr:%pISc, port:%d, new port:%d, len:%d\n",
++		 __func__, sk, &addr->sa, bp->port, snum, len);
+ 
+ 	/* PF specific bind() address verification. */
+ 	if (!sp->pf->bind_verify(sp, addr))
+@@ -374,9 +370,8 @@ SCTP_STATIC int sctp_do_bind(struct sock *sk, union sctp_addr *addr, int len)
+ 		if (!snum)
+ 			snum = bp->port;
+ 		else if (snum != bp->port) {
+-			SCTP_DEBUG_PRINTK("sctp_do_bind:"
+-				  " New port %d does not match existing port "
+-				  "%d.\n", snum, bp->port);
++			pr_debug("%s: new port %d doesn't match existing port "
++				 "%d\n", __func__, snum, bp->port);
+ 			return -EINVAL;
+ 		}
+ 	}
+@@ -474,8 +469,8 @@ static int sctp_bindx_add(struct sock *sk, struct sockaddr *addrs, int addrcnt)
+ 	struct sockaddr *sa_addr;
+ 	struct sctp_af *af;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_bindx_add (sk: %p, addrs: %p, addrcnt: %d)\n",
+-			  sk, addrs, addrcnt);
++	pr_debug("%s: sk:%p, addrs:%p, addrcnt:%d\n", __func__, sk,
++		 addrs, addrcnt);
+ 
+ 	addr_buf = addrs;
+ 	for (cnt = 0; cnt < addrcnt; cnt++) {
+@@ -541,11 +536,10 @@ static int sctp_send_asconf_add_ip(struct sock		*sk,
+ 	sp = sctp_sk(sk);
+ 	ep = sp->ep;
+ 
+-	SCTP_DEBUG_PRINTK("%s: (sk: %p, addrs: %p, addrcnt: %d)\n",
+-			  __func__, sk, addrs, addrcnt);
++	pr_debug("%s: sk:%p, addrs:%p, addrcnt:%d\n",
++		 __func__, sk, addrs, addrcnt);
+ 
+ 	list_for_each_entry(asoc, &ep->asocs, asocs) {
+-
+ 		if (!asoc->peer.asconf_capable)
+ 			continue;
+ 
+@@ -652,8 +646,8 @@ static int sctp_bindx_rem(struct sock *sk, struct sockaddr *addrs, int addrcnt)
+ 	union sctp_addr *sa_addr;
+ 	struct sctp_af *af;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_bindx_rem (sk: %p, addrs: %p, addrcnt: %d)\n",
+-			  sk, addrs, addrcnt);
++	pr_debug("%s: sk:%p, addrs:%p, addrcnt:%d\n",
++		 __func__, sk, addrs, addrcnt);
+ 
+ 	addr_buf = addrs;
+ 	for (cnt = 0; cnt < addrcnt; cnt++) {
+@@ -746,8 +740,8 @@ static int sctp_send_asconf_del_ip(struct sock		*sk,
+ 	sp = sctp_sk(sk);
+ 	ep = sp->ep;
+ 
+-	SCTP_DEBUG_PRINTK("%s: (sk: %p, addrs: %p, addrcnt: %d)\n",
+-			  __func__, sk, addrs, addrcnt);
++	pr_debug("%s: sk:%p, addrs:%p, addrcnt:%d\n",
++		 __func__, sk, addrs, addrcnt);
+ 
+ 	list_for_each_entry(asoc, &ep->asocs, asocs) {
+ 
+@@ -814,9 +808,11 @@ static int sctp_send_asconf_del_ip(struct sock		*sk,
+ 				sin6 = (struct sockaddr_in6 *)addrs;
+ 				asoc->asconf_addr_del_pending->v6.sin6_addr = sin6->sin6_addr;
+ 			}
+-			SCTP_DEBUG_PRINTK_IPADDR("send_asconf_del_ip: keep the last address asoc: %p ",
+-			    " at %p\n", asoc, asoc->asconf_addr_del_pending,
+-			    asoc->asconf_addr_del_pending);
++
++			pr_debug("%s: keep the last address asoc:%p %pISc at %p\n",
++				 __func__, asoc, &asoc->asconf_addr_del_pending->sa,
++				 asoc->asconf_addr_del_pending);
++
+ 			asoc->src_out_of_asoc_ok = 1;
+ 			stored = 1;
+ 			goto skip_mkasconf;
+@@ -981,8 +977,8 @@ SCTP_STATIC int sctp_setsockopt_bindx(struct sock* sk,
+ 	void *addr_buf;
+ 	struct sctp_af *af;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_setsockopt_bindx: sk %p addrs %p"
+-			  " addrs_size %d opt %d\n", sk, addrs, addrs_size, op);
++	pr_debug("%s: sk:%p addrs:%p addrs_size:%d opt:%d\n",
++		 __func__, sk, addrs, addrs_size, op);
+ 
+ 	if (unlikely(addrs_size <= 0))
+ 		return -EINVAL;
+@@ -1240,10 +1236,9 @@ static int __sctp_connect(struct sock* sk,
+ 	asoc = NULL;
+ 
+ out_free:
++	pr_debug("%s: took out_free path with asoc:%p kaddrs:%p err:%d\n",
++		 __func__, asoc, kaddrs, err);
+ 
+-	SCTP_DEBUG_PRINTK("About to exit __sctp_connect() free asoc: %p"
+-			  " kaddrs: %p err: %d\n",
+-			  asoc, kaddrs, err);
+ 	if (asoc) {
+ 		/* sctp_primitive_ASSOCIATE may have added this association
+ 		 * To the hash table, try to unhash it, just in case, its a noop
+@@ -1325,8 +1320,8 @@ SCTP_STATIC int __sctp_setsockopt_connectx(struct sock* sk,
+ 	int err = 0;
+ 	struct sockaddr *kaddrs;
+ 
+-	SCTP_DEBUG_PRINTK("%s - sk %p addrs %p addrs_size %d\n",
+-			  __func__, sk, addrs, addrs_size);
++	pr_debug("%s: sk:%p addrs:%p addrs_size:%d\n",
++		 __func__, sk, addrs, addrs_size);
+ 
+ 	if (unlikely(addrs_size <= 0))
+ 		return -EINVAL;
+@@ -1499,7 +1494,7 @@ SCTP_STATIC void sctp_close(struct sock *sk, long timeout)
+ 	struct list_head *pos, *temp;
+ 	unsigned int data_was_unread;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_close(sk: 0x%p, timeout:%ld)\n", sk, timeout);
++	pr_debug("%s: sk:%p, timeout:%ld\n", __func__, sk, timeout);
+ 
+ 	sctp_lock_sock(sk);
+ 	sk->sk_shutdown = SHUTDOWN_MASK;
+@@ -1626,14 +1621,12 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 	struct sctp_datamsg *datamsg;
+ 	int msg_flags = msg->msg_flags;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_sendmsg(sk: %p, msg: %p, msg_len: %zu)\n",
+-			  sk, msg, msg_len);
+-
+ 	err = 0;
+ 	sp = sctp_sk(sk);
+ 	ep = sp->ep;
+ 
+-	SCTP_DEBUG_PRINTK("Using endpoint: %p.\n", ep);
++	pr_debug("%s: sk:%p, msg:%p, msg_len:%zu ep:%p\n", __func__, sk,
++		 msg, msg_len, ep);
+ 
+ 	/* We cannot send a message over a TCP-style listening socket. */
+ 	if (sctp_style(sk, TCP) && sctp_sstate(sk, LISTENING)) {
+@@ -1643,9 +1636,8 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 
+ 	/* Parse out the SCTP CMSGs.  */
+ 	err = sctp_msghdr_parse(msg, &cmsgs);
+-
+ 	if (err) {
+-		SCTP_DEBUG_PRINTK("msghdr parse err = %x\n", err);
++		pr_debug("%s: msghdr parse err:%x\n", __func__, err);
+ 		goto out_nounlock;
+ 	}
+ 
+@@ -1677,8 +1669,8 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 		associd = sinfo->sinfo_assoc_id;
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("msg_len: %zu, sinfo_flags: 0x%x\n",
+-			  msg_len, sinfo_flags);
++	pr_debug("%s: msg_len:%zu, sinfo_flags:0x%x\n", __func__,
++		 msg_len, sinfo_flags);
+ 
+ 	/* SCTP_EOF or SCTP_ABORT cannot be set on a TCP-style socket. */
+ 	if (sctp_style(sk, TCP) && (sinfo_flags & (SCTP_EOF | SCTP_ABORT))) {
+@@ -1707,7 +1699,7 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 
+ 	transport = NULL;
+ 
+-	SCTP_DEBUG_PRINTK("About to look up association.\n");
++	pr_debug("%s: about to look up association\n", __func__);
+ 
+ 	sctp_lock_sock(sk);
+ 
+@@ -1737,7 +1729,7 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 	}
+ 
+ 	if (asoc) {
+-		SCTP_DEBUG_PRINTK("Just looked up association: %p.\n", asoc);
++		pr_debug("%s: just looked up association:%p\n", __func__, asoc);
+ 
+ 		/* We cannot send a message on a TCP-style SCTP_SS_ESTABLISHED
+ 		 * socket that has an association in CLOSED state. This can
+@@ -1750,8 +1742,9 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 		}
+ 
+ 		if (sinfo_flags & SCTP_EOF) {
+-			SCTP_DEBUG_PRINTK("Shutting down association: %p\n",
+-					  asoc);
++			pr_debug("%s: shutting down association:%p\n",
++				 __func__, asoc);
++
+ 			sctp_primitive_SHUTDOWN(net, asoc, NULL);
+ 			err = 0;
+ 			goto out_unlock;
+@@ -1764,7 +1757,9 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 				goto out_unlock;
+ 			}
+ 
+-			SCTP_DEBUG_PRINTK("Aborting association: %p\n", asoc);
++			pr_debug("%s: aborting association:%p\n",
++				 __func__, asoc);
++
+ 			sctp_primitive_ABORT(net, asoc, chunk);
+ 			err = 0;
+ 			goto out_unlock;
+@@ -1773,7 +1768,7 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 
+ 	/* Do we need to create the association?  */
+ 	if (!asoc) {
+-		SCTP_DEBUG_PRINTK("There is no association yet.\n");
++		pr_debug("%s: there is no association yet\n", __func__);
+ 
+ 		if (sinfo_flags & (SCTP_EOF | SCTP_ABORT)) {
+ 			err = -EINVAL;
+@@ -1872,7 +1867,7 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 	}
+ 
+ 	/* ASSERT: we have a valid association at this point.  */
+-	SCTP_DEBUG_PRINTK("We have a valid association.\n");
++	pr_debug("%s: we have a valid association\n", __func__);
+ 
+ 	if (!sinfo) {
+ 		/* If the user didn't specify SNDRCVINFO, make up one with
+@@ -1941,7 +1936,8 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 		err = sctp_primitive_ASSOCIATE(net, asoc, NULL);
+ 		if (err < 0)
+ 			goto out_free;
+-		SCTP_DEBUG_PRINTK("We associated primitively.\n");
++
++		pr_debug("%s: we associated primitively\n", __func__);
+ 	}
+ 
+ 	/* Break the message into multiple chunks of maximum size. */
+@@ -1968,17 +1964,15 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 	 */
+ 	err = sctp_primitive_SEND(net, asoc, datamsg);
+ 	/* Did the lower layer accept the chunk? */
+-	if (err)
++	if (err) {
+ 		sctp_datamsg_free(datamsg);
+-	else
+-		sctp_datamsg_put(datamsg);
++		goto out_free;
++	}
+ 
+-	SCTP_DEBUG_PRINTK("We sent primitively.\n");
++	pr_debug("%s: we sent primitively\n", __func__);
+ 
+-	if (err)
+-		goto out_free;
+-	else
+-		err = msg_len;
++	sctp_datamsg_put(datamsg);
++	err = msg_len;
+ 
+ 	/* If we are already past ASSOCIATE, the lower
+ 	 * layers are responsible for association cleanup.
+@@ -2073,10 +2067,9 @@ SCTP_STATIC int sctp_recvmsg(struct kiocb *iocb, struct sock *sk,
+ 	int err = 0;
+ 	int skb_len;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_recvmsg(%s: %p, %s: %p, %s: %zd, %s: %d, %s: "
+-			  "0x%x, %s: %p)\n", "sk", sk, "msghdr", msg,
+-			  "len", len, "knoblauch", noblock,
+-			  "flags", flags, "addr_len", addr_len);
++	pr_debug("%s: sk:%p, msghdr:%p, len:%zd, noblock:%d, flags:0x%x, "
++		 "addr_len:%p)\n", __func__, sk, msg, len, noblock, flags,
++		 addr_len);
+ 
+ 	sctp_lock_sock(sk);
+ 
+@@ -3118,7 +3111,7 @@ static int sctp_setsockopt_peer_primary_addr(struct sock *sk, char __user *optva
+ 
+ 	err = sctp_send_asconf(asoc, chunk);
+ 
+-	SCTP_DEBUG_PRINTK("We set peer primary addr primitively.\n");
++	pr_debug("%s: we set peer primary addr primitively\n", __func__);
+ 
+ 	return err;
+ }
+@@ -3593,8 +3586,7 @@ SCTP_STATIC int sctp_setsockopt(struct sock *sk, int level, int optname,
+ {
+ 	int retval = 0;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_setsockopt(sk: %p... optname: %d)\n",
+-			  sk, optname);
++	pr_debug("%s: sk:%p, optname:%d\n", __func__, sk, optname);
+ 
+ 	/* I can hardly begin to describe how wrong this is.  This is
+ 	 * so broken as to be worse than useless.  The API draft
+@@ -3756,8 +3748,8 @@ SCTP_STATIC int sctp_connect(struct sock *sk, struct sockaddr *addr,
+ 
+ 	sctp_lock_sock(sk);
+ 
+-	SCTP_DEBUG_PRINTK("%s - sk: %p, sockaddr: %p, addr_len: %d\n",
+-			  __func__, sk, addr, addr_len);
++	pr_debug("%s: sk:%p, sockaddr:%p, addr_len:%d\n", __func__, sk,
++		 addr, addr_len);
+ 
+ 	/* Validate addr_len before calling common connect/connectx routine. */
+ 	af = sctp_get_af_specific(addr->sa_family);
+@@ -3888,7 +3880,7 @@ SCTP_STATIC int sctp_init_sock(struct sock *sk)
+ 	struct sctp_endpoint *ep;
+ 	struct sctp_sock *sp;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_init_sock(sk: %p)\n", sk);
++	pr_debug("%s: sk:%p\n", __func__, sk);
+ 
+ 	sp = sctp_sk(sk);
+ 
+@@ -4034,7 +4026,7 @@ SCTP_STATIC void sctp_destroy_sock(struct sock *sk)
+ {
+ 	struct sctp_sock *sp;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_destroy_sock(sk: %p)\n", sk);
++	pr_debug("%s: sk:%p\n", __func__, sk);
+ 
+ 	/* Release our hold on the endpoint. */
+ 	sp = sctp_sk(sk);
+@@ -4254,9 +4246,9 @@ static int sctp_getsockopt_sctp_status(struct sock *sk, int len,
+ 		goto out;
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("sctp_getsockopt_sctp_status(%d): %d %d %d\n",
+-			  len, status.sstat_state, status.sstat_rwnd,
+-			  status.sstat_assoc_id);
++	pr_debug("%s: len:%d, state:%d, rwnd:%d, assoc_id:%d\n",
++		 __func__, len, status.sstat_state, status.sstat_rwnd,
++		 status.sstat_assoc_id);
+ 
+ 	if (copy_to_user(optval, &status, len)) {
+ 		retval = -EFAULT;
+@@ -4464,8 +4456,8 @@ static int sctp_getsockopt_peeloff(struct sock *sk, int len, char __user *optval
+ 		return PTR_ERR(newfile);
+ 	}
+ 
+-	SCTP_DEBUG_PRINTK("%s: sk: %p newsk: %p sd: %d\n",
+-			  __func__, sk, newsock->sk, retval);
++	pr_debug("%s: sk:%p, newsk:%p, sd:%d\n", __func__, sk, newsock->sk,
++		 retval);
+ 
+ 	/* Return the fd mapped to the new socket.  */
+ 	if (put_user(len, optlen)) {
+@@ -4598,7 +4590,7 @@ static int sctp_getsockopt_peer_addr_params(struct sock *sk, int len,
+ 		trans = sctp_addr_id2transport(sk, &params.spp_address,
+ 					       params.spp_assoc_id);
+ 		if (!trans) {
+-			SCTP_DEBUG_PRINTK("Failed no transport\n");
++			pr_debug("%s: failed no transport\n", __func__);
+ 			return -EINVAL;
+ 		}
+ 	}
+@@ -4609,7 +4601,7 @@ static int sctp_getsockopt_peer_addr_params(struct sock *sk, int len,
+ 	 */
+ 	asoc = sctp_id2assoc(sk, params.spp_assoc_id);
+ 	if (!asoc && params.spp_assoc_id && sctp_style(sk, UDP)) {
+-		SCTP_DEBUG_PRINTK("Failed no association\n");
++		pr_debug("%s: failed no association\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -5834,8 +5826,7 @@ static int sctp_getsockopt_assoc_stats(struct sock *sk, int len,
+ 	if (put_user(len, optlen))
+ 		return -EFAULT;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_getsockopt_assoc_stat(%d): %d\n",
+-			  len, sas.sas_assoc_id);
++	pr_debug("%s: len:%d, assoc_id:%d\n", __func__, len, sas.sas_assoc_id);
+ 
+ 	if (copy_to_user(optval, &sas, len))
+ 		return -EFAULT;
+@@ -5849,8 +5840,7 @@ SCTP_STATIC int sctp_getsockopt(struct sock *sk, int level, int optname,
+ 	int retval = 0;
+ 	int len;
+ 
+-	SCTP_DEBUG_PRINTK("sctp_getsockopt(sk: %p... optname: %d)\n",
+-			  sk, optname);
++	pr_debug("%s: sk:%p, optname:%d\n", __func__, sk, optname);
+ 
+ 	/* I can hardly begin to describe how wrong this is.  This is
+ 	 * so broken as to be worse than useless.  The API draft
+@@ -6030,7 +6020,8 @@ static long sctp_get_port_local(struct sock *sk, union sctp_addr *addr)
+ 
+ 	snum = ntohs(addr->v4.sin_port);
+ 
+-	SCTP_DEBUG_PRINTK("sctp_get_port() begins, snum=%d\n", snum);
++	pr_debug("%s: begins, snum:%d\n", __func__, snum);
++
+ 	sctp_local_bh_disable();
+ 
+ 	if (snum == 0) {
+@@ -6096,7 +6087,8 @@ pp_found:
+ 		int reuse = sk->sk_reuse;
+ 		struct sock *sk2;
+ 
+-		SCTP_DEBUG_PRINTK("sctp_get_port() found a possible match\n");
++		pr_debug("%s: found a possible match\n", __func__);
++
+ 		if (pp->fastreuse && sk->sk_reuse &&
+ 			sk->sk_state != SCTP_SS_LISTENING)
+ 			goto success;
+@@ -6126,7 +6118,8 @@ pp_found:
+ 				goto fail_unlock;
+ 			}
+ 		}
+-		SCTP_DEBUG_PRINTK("sctp_get_port(): Found a match\n");
++
++		pr_debug("%s: found a match\n", __func__);
+ 	}
+ pp_not_found:
+ 	/* If there was a hash table miss, create a new port.  */
+@@ -6621,8 +6614,8 @@ static struct sk_buff *sctp_skb_recv_datagram(struct sock *sk, int flags,
+ 
+ 	timeo = sock_rcvtimeo(sk, noblock);
+ 
+-	SCTP_DEBUG_PRINTK("Timeout: timeo: %ld, MAX: %ld.\n",
+-			  timeo, MAX_SCHEDULE_TIMEOUT);
++	pr_debug("%s: timeo:%ld, max:%ld\n", __func__, timeo,
++		 MAX_SCHEDULE_TIMEOUT);
+ 
+ 	do {
+ 		/* Again only user level code calls this function,
+@@ -6793,8 +6786,8 @@ static int sctp_wait_for_sndbuf(struct sctp_association *asoc, long *timeo_p,
+ 	long current_timeo = *timeo_p;
+ 	DEFINE_WAIT(wait);
+ 
+-	SCTP_DEBUG_PRINTK("wait_for_sndbuf: asoc=%p, timeo=%ld, msg_len=%zu\n",
+-			  asoc, (long)(*timeo_p), msg_len);
++	pr_debug("%s: asoc:%p, timeo:%ld, msg_len:%zu\n", __func__, asoc,
++		 *timeo_p, msg_len);
+ 
+ 	/* Increment the association's refcnt.  */
+ 	sctp_association_hold(asoc);
+@@ -6900,8 +6893,7 @@ static int sctp_wait_for_connect(struct sctp_association *asoc, long *timeo_p)
+ 	long current_timeo = *timeo_p;
+ 	DEFINE_WAIT(wait);
+ 
+-	SCTP_DEBUG_PRINTK("%s: asoc=%p, timeo=%ld\n", __func__, asoc,
+-			  (long)(*timeo_p));
++	pr_debug("%s: asoc:%p, timeo:%ld\n", __func__, asoc, *timeo_p);
+ 
+ 	/* Increment the association's refcnt.  */
+ 	sctp_association_hold(asoc);
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 5387cb44ad90..05b83fe74e3f 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -176,7 +176,10 @@ static void sctp_transport_destroy_rcu(struct rcu_head *head)
+  */
+ static void sctp_transport_destroy(struct sctp_transport *transport)
+ {
+-	SCTP_ASSERT(transport->dead, "Transport is not dead", return);
++	if (unlikely(!transport->dead)) {
++		WARN(1, "Attempt to destroy undead transport %p!\n", transport);
++		return;
++	}
+ 
+ 	call_rcu(&transport->rcu, sctp_transport_destroy_rcu);
+ 
+@@ -317,11 +320,9 @@ void sctp_transport_put(struct sctp_transport *transport)
+ /* Update transport's RTO based on the newly calculated RTT. */
+ void sctp_transport_update_rto(struct sctp_transport *tp, __u32 rtt)
+ {
+-	/* Check for valid transport.  */
+-	SCTP_ASSERT(tp, "NULL transport", return);
+-
+-	/* We should not be doing any RTO updates unless rto_pending is set.  */
+-	SCTP_ASSERT(tp->rto_pending, "rto_pending not set", return);
++	if (unlikely(!tp->rto_pending))
++		/* We should not be doing any RTO updates unless rto_pending is set.  */
++		pr_debug("%s: rto_pending not set on transport %p!\n", __func__, tp);
+ 
+ 	if (tp->rttvar || tp->srtt) {
+ 		struct net *net = sock_net(tp->asoc->base.sk);
+@@ -377,9 +378,8 @@ void sctp_transport_update_rto(struct sctp_transport *tp, __u32 rtt)
+ 	 */
+ 	tp->rto_pending = 0;
+ 
+-	SCTP_DEBUG_PRINTK("%s: transport: %p, rtt: %d, srtt: %d "
+-			  "rttvar: %d, rto: %ld\n", __func__,
+-			  tp, rtt, tp->srtt, tp->rttvar, tp->rto);
++	pr_debug("%s: transport:%p, rtt:%d, srtt:%d rttvar:%d, rto:%ld\n",
++		 __func__, tp, rtt, tp->srtt, tp->rttvar, tp->rto);
+ }
+ 
+ /* This routine updates the transport's cwnd and partial_bytes_acked
+@@ -433,12 +433,11 @@ void sctp_transport_raise_cwnd(struct sctp_transport *transport,
+ 			cwnd += pmtu;
+ 		else
+ 			cwnd += bytes_acked;
+-		SCTP_DEBUG_PRINTK("%s: SLOW START: transport: %p, "
+-				  "bytes_acked: %d, cwnd: %d, ssthresh: %d, "
+-				  "flight_size: %d, pba: %d\n",
+-				  __func__,
+-				  transport, bytes_acked, cwnd,
+-				  ssthresh, flight_size, pba);
++
++		pr_debug("%s: slow start: transport:%p, bytes_acked:%d, "
++			 "cwnd:%d, ssthresh:%d, flight_size:%d, pba:%d\n",
++			 __func__, transport, bytes_acked, cwnd, ssthresh,
++			 flight_size, pba);
+ 	} else {
+ 		/* RFC 2960 7.2.2 Whenever cwnd is greater than ssthresh,
+ 		 * upon each SACK arrival that advances the Cumulative TSN Ack
+@@ -459,12 +458,12 @@ void sctp_transport_raise_cwnd(struct sctp_transport *transport,
+ 			cwnd += pmtu;
+ 			pba = ((cwnd < pba) ? (pba - cwnd) : 0);
+ 		}
+-		SCTP_DEBUG_PRINTK("%s: CONGESTION AVOIDANCE: "
+-				  "transport: %p, bytes_acked: %d, cwnd: %d, "
+-				  "ssthresh: %d, flight_size: %d, pba: %d\n",
+-				  __func__,
+-				  transport, bytes_acked, cwnd,
+-				  ssthresh, flight_size, pba);
++
++		pr_debug("%s: congestion avoidance: transport:%p, "
++			 "bytes_acked:%d, cwnd:%d, ssthresh:%d, "
++			 "flight_size:%d, pba:%d\n", __func__,
++			 transport, bytes_acked, cwnd, ssthresh,
++			 flight_size, pba);
+ 	}
+ 
+ 	transport->cwnd = cwnd;
+@@ -558,10 +557,10 @@ void sctp_transport_lower_cwnd(struct sctp_transport *transport,
+ 	}
+ 
+ 	transport->partial_bytes_acked = 0;
+-	SCTP_DEBUG_PRINTK("%s: transport: %p reason: %d cwnd: "
+-			  "%d ssthresh: %d\n", __func__,
+-			  transport, reason,
+-			  transport->cwnd, transport->ssthresh);
++
++	pr_debug("%s: transport:%p, reason:%d, cwnd:%d, ssthresh:%d\n",
++		 __func__, transport, reason, transport->cwnd,
++		 transport->ssthresh);
+ }
+ 
+ /* Apply Max.Burst limit to the congestion window:
