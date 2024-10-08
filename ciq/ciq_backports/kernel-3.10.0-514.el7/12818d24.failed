@@ -1,0 +1,226 @@
+xfs: rework log recovery to submit buffers on LSN boundaries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 12818d24db8ab01836bf423a7c1be639c3135572
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/12818d24.failed
+
+The fix to log recovery to update the metadata LSN in recovered buffers
+introduces the requirement that a buffer is submitted only once per
+current LSN. Log recovery currently submits buffers on transaction
+boundaries. This is not sufficient as the abstraction between log
+records and transactions allows for various scenarios where multiple
+transactions can share the same current LSN. If independent transactions
+share an LSN and both modify the same buffer, log recovery can
+incorrectly skip updates and leave the filesystem in an inconsisent
+state.
+
+In preparation for proper metadata LSN updates during log recovery,
+update log recovery to submit buffers for write on LSN change boundaries
+rather than transaction boundaries. Explicitly track the current LSN in
+a new struct xlog field to handle the various corner cases of when the
+current LSN may or may not change.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 12818d24db8ab01836bf423a7c1be639c3135572)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log_recover.c
+diff --cc fs/xfs/xfs_log_recover.c
+index 9a0cd900d9ce,e24fb7b6f3fb..000000000000
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@@ -3896,10 -4080,11 +3894,11 @@@ STATIC in
+  xlog_recovery_process_trans(
+  	struct xlog		*log,
+  	struct xlog_recover	*trans,
+ -	char			*dp,
+ +	xfs_caddr_t		dp,
+  	unsigned int		len,
+  	unsigned int		flags,
+- 	int			pass)
++ 	int			pass,
++ 	struct list_head	*buffer_list)
+  {
+  	int			error = 0;
+  	bool			freeit = false;
+@@@ -4003,9 -4189,10 +4003,16 @@@ xlog_recover_process_ophdr
+  	struct hlist_head	rhash[],
+  	struct xlog_rec_header	*rhead,
+  	struct xlog_op_header	*ohead,
+++<<<<<<< HEAD
+ +	xfs_caddr_t		dp,
+ +	xfs_caddr_t		end,
+ +	int			pass)
+++=======
++ 	char			*dp,
++ 	char			*end,
++ 	int			pass,
++ 	struct list_head	*buffer_list)
+++>>>>>>> 12818d24db8a (xfs: rework log recovery to submit buffers on LSN boundaries)
+  {
+  	struct xlog_recover	*trans;
+  	unsigned int		len;
+@@@ -4053,11 -4272,12 +4092,17 @@@ xlog_recover_process_data
+  	struct xlog		*log,
+  	struct hlist_head	rhash[],
+  	struct xlog_rec_header	*rhead,
+++<<<<<<< HEAD
+ +	xfs_caddr_t		dp,
+ +	int			pass)
+++=======
++ 	char			*dp,
++ 	int			pass,
++ 	struct list_head	*buffer_list)
+++>>>>>>> 12818d24db8a (xfs: rework log recovery to submit buffers on LSN boundaries)
+  {
+  	struct xlog_op_header	*ohead;
+ -	char			*end;
+ +	xfs_caddr_t		end;
+  	int			num_logops;
+  	int			error;
+  
+@@@ -4514,9 -4719,49 +4559,10 @@@ xlog_recover_process
+  	struct hlist_head	rhash[],
+  	struct xlog_rec_header	*rhead,
+  	char			*dp,
+- 	int			pass)
++ 	int			pass,
++ 	struct list_head	*buffer_list)
+  {
+  	int			error;
+ -	__le32			crc;
+ -
+ -	crc = xlog_cksum(log, rhead, dp, be32_to_cpu(rhead->h_len));
+ -
+ -	/*
+ -	 * Nothing else to do if this is a CRC verification pass. Just return
+ -	 * if this a record with a non-zero crc. Unfortunately, mkfs always
+ -	 * sets h_crc to 0 so we must consider this valid even on v5 supers.
+ -	 * Otherwise, return EFSBADCRC on failure so the callers up the stack
+ -	 * know precisely what failed.
+ -	 */
+ -	if (pass == XLOG_RECOVER_CRCPASS) {
+ -		if (rhead->h_crc && crc != rhead->h_crc)
+ -			return -EFSBADCRC;
+ -		return 0;
+ -	}
+ -
+ -	/*
+ -	 * We're in the normal recovery path. Issue a warning if and only if the
+ -	 * CRC in the header is non-zero. This is an advisory warning and the
+ -	 * zero CRC check prevents warnings from being emitted when upgrading
+ -	 * the kernel from one that does not add CRCs by default.
+ -	 */
+ -	if (crc != rhead->h_crc) {
+ -		if (rhead->h_crc || xfs_sb_version_hascrc(&log->l_mp->m_sb)) {
+ -			xfs_alert(log->l_mp,
+ -		"log record CRC mismatch: found 0x%x, expected 0x%x.",
+ -					le32_to_cpu(rhead->h_crc),
+ -					le32_to_cpu(crc));
+ -			xfs_hex_dump(dp, 32);
+ -		}
+ -
+ -		/*
+ -		 * If the filesystem is CRC enabled, this mismatch becomes a
+ -		 * fatal log corruption failure.
+ -		 */
+ -		if (xfs_sb_version_hascrc(&log->l_mp->m_sb))
+ -			return -EFSCORRUPTED;
+ -	}
+  
+  	error = xlog_unpack_data(rhead, dp, log);
+  	if (error)
+@@@ -4578,14 -4825,18 +4625,16 @@@ xlog_do_recovery_pass
+  {
+  	xlog_rec_header_t	*rhead;
+  	xfs_daddr_t		blk_no;
+ -	xfs_daddr_t		rhead_blk;
+ -	char			*offset;
+ +	xfs_caddr_t		offset;
+  	xfs_buf_t		*hbp, *dbp;
+  	int			error = 0, h_size, h_len;
++ 	int			error2 = 0;
+  	int			bblks, split_bblks;
+  	int			hblks, split_hblks, wrapped_hblks;
+  	struct hlist_head	rhash[XLOG_RHASH_SIZE];
++ 	LIST_HEAD		(buffer_list);
+  
+  	ASSERT(head_blk != tail_blk);
+ -	rhead_blk = 0;
+  
+  	/*
+  	 * Read the header of the tail block and get the iclog buffer size from
+@@@ -4768,10 -5019,12 +4817,10 @@@
+  			}
+  
+  			error = xlog_recover_process(log, rhash, rhead, offset,
+- 						     pass);
++ 						     pass, &buffer_list);
+  			if (error)
+  				goto bread_err2;
+ -
+  			blk_no += bblks;
+ -			rhead_blk = blk_no;
+  		}
+  
+  		ASSERT(blk_no >= log->l_logBBsize);
+@@@ -4796,17 -5050,31 +4845,33 @@@
+  		if (error)
+  			goto bread_err2;
+  
+- 		error = xlog_recover_process(log, rhash, rhead, offset, pass);
++ 		error = xlog_recover_process(log, rhash, rhead, offset, pass,
++ 					     &buffer_list);
+  		if (error)
+  			goto bread_err2;
+ -
+  		blk_no += bblks + hblks;
+ -		rhead_blk = blk_no;
+  	}
+  
+   bread_err2:
+  	xlog_put_bp(dbp);
+   bread_err1:
+  	xlog_put_bp(hbp);
+++<<<<<<< HEAD
+ +	return error;
+++=======
++ 
++ 	/*
++ 	 * Submit buffers that have been added from the last record processed,
++ 	 * regardless of error status.
++ 	 */
++ 	if (!list_empty(&buffer_list))
++ 		error2 = xfs_buf_delwri_submit(&buffer_list);
++ 
++ 	if (error && first_bad)
++ 		*first_bad = rhead_blk;
++ 
++ 	return error ? error : error2;
+++>>>>>>> 12818d24db8a (xfs: rework log recovery to submit buffers on LSN boundaries)
+  }
+  
+  /*
+diff --git a/fs/xfs/xfs_log_priv.h b/fs/xfs/xfs_log_priv.h
+index ed8896310c00..14c65d584ebc 100644
+--- a/fs/xfs/xfs_log_priv.h
++++ b/fs/xfs/xfs_log_priv.h
+@@ -414,7 +414,8 @@ struct xlog {
+ 	/* log record crc error injection factor */
+ 	uint32_t		l_badcrc_factor;
+ #endif
+-
++	/* log recovery lsn tracking (for buffer submission */
++	xfs_lsn_t		l_recovery_lsn;
+ };
+ 
+ #define XLOG_BUF_CANCEL_BUCKET(log, blkno) \
+* Unmerged path fs/xfs/xfs_log_recover.c
