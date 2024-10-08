@@ -814,8 +814,8 @@ megasas_adp_reset_gen2(struct megasas_instance *instance,
 {
 	u32			retry = 0 ;
 	u32			HostDiag;
-	u32			*seq_offset = &reg_set->seq_offset;
-	u32			*hostdiag_offset = &reg_set->host_diag;
+	u32 __iomem		*seq_offset = &reg_set->seq_offset;
+	u32 __iomem		*hostdiag_offset = &reg_set->host_diag;
 
 	if (instance->instancet == &megasas_instance_template_skinny) {
 		seq_offset = &reg_set->fusion_seq_offset;
@@ -4630,7 +4630,7 @@ static int megasas_init_fw(struct megasas_instance *instance)
 	 * It is used for all MPT based Adapters.
 	 */
 	instance->reply_post_host_index_addr[0] =
-		(u32 *)((u8 *)instance->reg_set +
+		(u32 __iomem *)((u8 __iomem *)instance->reg_set +
 		MPI2_REPLY_POST_HOST_INDEX_OFFSET);
 
 	/* Check if MSI-X is supported while in ready state */
@@ -4662,7 +4662,8 @@ static int megasas_init_fw(struct megasas_instance *instance)
 			 */
 			for (loop = 1; loop < MR_MAX_MSIX_REG_ARRAY; loop++) {
 				instance->reply_post_host_index_addr[loop] =
-					(u32 *)((u8 *)instance->reg_set +
+					(u32 __iomem *)
+					((u8 __iomem *)instance->reg_set +
 					MPI2_SUP_REPLY_POST_HOST_INDEX_OFFSET
 					+ (loop * 0x10));
 			}
