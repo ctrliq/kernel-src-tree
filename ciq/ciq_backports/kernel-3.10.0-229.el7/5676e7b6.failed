@@ -1,0 +1,138 @@
+blk-mq: cleanup after blk_mq_init_rq_map failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Robert Elliott <elliott@hp.com>
+commit 5676e7b6db02b80eafc2e3ad316d5f2fee817ecb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5676e7b6.failed
+
+In blk-mq.c blk_mq_alloc_tag_set, if:
+	set->tags = kmalloc_node()
+succeeds, but one of the blk_mq_init_rq_map() calls fails,
+	goto out_unwind;
+needs to free set->tags so the caller is not obligated
+to do so.  None of the current callers (null_blk,
+virtio_blk, virtio_blk, or the forthcoming scsi-mq)
+do so.
+
+set->tags needs to be set to NULL after doing so,
+so other tag cleanup logic doesn't try to free
+a stale pointer later.  Also set it to NULL
+in blk_mq_free_tag_set.
+
+Tested with error injection on the forthcoming
+scsi-mq + hpsa combination.
+
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 5676e7b6db02b80eafc2e3ad316d5f2fee817ecb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index e7914e35b358,f9b85e83d9ba..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1492,6 -1936,95 +1492,98 @@@ static int __cpuinit blk_mq_queue_reini
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Alloc a tag set to be associated with one or more request queues.
++  * May fail with EINVAL for various error conditions. May adjust the
++  * requested depth down, if if it too large. In that case, the set
++  * value will be stored in set->queue_depth.
++  */
++ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	if (!set->nr_hw_queues)
++ 		return -EINVAL;
++ 	if (!set->queue_depth)
++ 		return -EINVAL;
++ 	if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
++ 		return -EINVAL;
++ 
++ 	if (!set->nr_hw_queues || !set->ops->queue_rq || !set->ops->map_queue)
++ 		return -EINVAL;
++ 
++ 	if (set->queue_depth > BLK_MQ_MAX_DEPTH) {
++ 		pr_info("blk-mq: reduced tag depth to %u\n",
++ 			BLK_MQ_MAX_DEPTH);
++ 		set->queue_depth = BLK_MQ_MAX_DEPTH;
++ 	}
++ 
++ 	set->tags = kmalloc_node(set->nr_hw_queues *
++ 				 sizeof(struct blk_mq_tags *),
++ 				 GFP_KERNEL, set->numa_node);
++ 	if (!set->tags)
++ 		goto out;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		set->tags[i] = blk_mq_init_rq_map(set, i);
++ 		if (!set->tags[i])
++ 			goto out_unwind;
++ 	}
++ 
++ 	mutex_init(&set->tag_list_lock);
++ 	INIT_LIST_HEAD(&set->tag_list);
++ 
++ 	return 0;
++ 
++ out_unwind:
++ 	while (--i >= 0)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ 	kfree(set->tags);
++ 	set->tags = NULL;
++ out:
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL(blk_mq_alloc_tag_set);
++ 
++ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		if (set->tags[i])
++ 			blk_mq_free_rq_map(set, set->tags[i], i);
++ 	}
++ 
++ 	kfree(set->tags);
++ 	set->tags = NULL;
++ }
++ EXPORT_SYMBOL(blk_mq_free_tag_set);
++ 
++ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
++ {
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 	struct blk_mq_hw_ctx *hctx;
++ 	int i, ret;
++ 
++ 	if (!set || nr > set->queue_depth)
++ 		return -EINVAL;
++ 
++ 	ret = 0;
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		ret = blk_mq_tag_update_depth(hctx->tags, nr);
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	if (!ret)
++ 		q->nr_requests = nr;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 5676e7b6db02 (blk-mq: cleanup after blk_mq_init_rq_map failures)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+* Unmerged path block/blk-mq.c
