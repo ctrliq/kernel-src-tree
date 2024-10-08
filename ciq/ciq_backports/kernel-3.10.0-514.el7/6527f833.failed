@@ -1,0 +1,168 @@
+net: cdc_ncm: fix NULL pointer deref in cdc_ncm_bind_common
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bjørn Mork <bjorn@mork.no>
+commit 6527f833bf3fa34ed53e10b8010760fff42169f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6527f833.failed
+
+Commit 77b0a099674a ("cdc-ncm: use common parser") added a dangerous
+new trust in the CDC functional descriptors presented by the device,
+unconditionally assuming that any device handled by the driver has
+a CDC Union descriptor.
+
+This descriptor is required by the NCM and MBIM specs, but crashing
+on non-compliant devices is still unacceptable. Not only will that
+allow malicious devices to crash the kernel, but in this case it is
+also well known that there are non-compliant real devices on the
+market - as shown by the comment accompanying the IAD workaround
+in the same function.
+
+The Sierra Wireless EM7305 is an example of such device, having
+a CDC header and a CDC MBIM descriptor but no CDC Union:
+
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber       12
+      bAlternateSetting       0
+      bNumEndpoints           1
+      bInterfaceClass         2 Communications
+      bInterfaceSubClass     14
+      bInterfaceProtocol      0
+      iInterface              0
+      CDC Header:
+        bcdCDC               1.10
+      CDC MBIM:
+        bcdMBIMVersion       1.00
+        wMaxControlMessage   4096
+        bNumberFilters       16
+        bMaxFilterSize       128
+        wMaxSegmentSize      4064
+        bmNetworkCapabilities 0x20
+          8-byte ntb input size
+      Endpoint Descriptor:
+	..
+
+The conversion to a common parser also left the local cdc_union
+variable untouched.  This caused the IAD workaround code to be applied
+to all devices with an IAD descriptor, which was never intended.  Finish
+the conversion by testing for hdr.usb_cdc_union_desc instead.
+
+	Cc: Oliver Neukum <oneukum@suse.com>
+Fixes: 77b0a099674a ("cdc-ncm: use common parser")
+	Signed-off-by: Bjørn Mork <bjorn@mork.no>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6527f833bf3fa34ed53e10b8010760fff42169f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/cdc_ncm.c
+diff --cc drivers/net/usb/cdc_ncm.c
+index e977104210f9,3b1ba8237768..000000000000
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@@ -338,19 -687,10 +338,18 @@@ static void cdc_ncm_free(struct cdc_ncm
+  	kfree(ctx);
+  }
+  
+ -int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting, int drvflags)
+ +static const struct ethtool_ops cdc_ncm_ethtool_ops = {
+ +	.get_drvinfo = cdc_ncm_get_drvinfo,
+ +	.get_link = usbnet_get_link,
+ +	.get_msglevel = usbnet_get_msglevel,
+ +	.set_msglevel = usbnet_set_msglevel,
+ +	.get_settings = usbnet_get_settings,
+ +	.set_settings = usbnet_set_settings,
+ +	.nway_reset = usbnet_nway_reset,
+ +};
+ +
+ +int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting)
+  {
+- 	const struct usb_cdc_union_desc *union_desc = NULL;
+  	struct cdc_ncm_ctx *ctx;
+  	struct usb_driver *driver;
+  	u8 *buf;
+@@@ -381,67 -722,18 +380,77 @@@
+  	len = intf->cur_altsetting->extralen;
+  
+  	/* parse through descriptors associated with control interface */
+ -	cdc_parse_cdc_header(&hdr, intf, buf, len);
+ +	while ((len > 0) && (buf[0] > 2) && (buf[0] <= len)) {
+ +
+++<<<<<<< HEAD
+ +		if (buf[1] != USB_DT_CS_INTERFACE)
+ +			goto advance;
+ +
+ +		switch (buf[2]) {
+ +		case USB_CDC_UNION_TYPE:
+ +			if (buf[0] < sizeof(*union_desc))
+ +				break;
+ +
+ +			union_desc = (const struct usb_cdc_union_desc *)buf;
+ +			/* the master must be the interface we are probing */
+ +			if (intf->cur_altsetting->desc.bInterfaceNumber !=
+ +			    union_desc->bMasterInterface0)
+ +				goto error;
+ +			ctx->data = usb_ifnum_to_if(dev->udev,
+ +						    union_desc->bSlaveInterface0);
+ +			break;
+ +
+ +		case USB_CDC_ETHERNET_TYPE:
+ +			if (buf[0] < sizeof(*(ctx->ether_desc)))
+ +				break;
+ +
+ +			ctx->ether_desc =
+ +					(const struct usb_cdc_ether_desc *)buf;
+ +			break;
+  
+ +		case USB_CDC_NCM_TYPE:
+ +			if (buf[0] < sizeof(*(ctx->func_desc)))
+ +				break;
+ +
+ +			ctx->func_desc = (const struct usb_cdc_ncm_desc *)buf;
+ +			break;
+ +
+ +		case USB_CDC_MBIM_TYPE:
+ +			if (buf[0] < sizeof(*(ctx->mbim_desc)))
+ +				break;
+ +
+ +			ctx->mbim_desc = (const struct usb_cdc_mbim_desc *)buf;
+ +			break;
+ +
+ +		case USB_CDC_MBIM_EXTENDED_TYPE:
+ +			if (buf[0] < sizeof(*(ctx->mbim_extended_desc)))
+ +				break;
+ +
+ +			ctx->mbim_extended_desc =
+ +				(const struct usb_cdc_mbim_extended_desc *)buf;
+ +			break;
+ +
+ +		default:
+ +			break;
+ +		}
+ +advance:
+ +		/* advance to next descriptor */
+ +		temp = buf[0];
+ +		buf += temp;
+ +		len -= temp;
+ +	}
+++=======
++ 	if (hdr.usb_cdc_union_desc)
++ 		ctx->data = usb_ifnum_to_if(dev->udev,
++ 					    hdr.usb_cdc_union_desc->bSlaveInterface0);
++ 	ctx->ether_desc = hdr.usb_cdc_ether_desc;
++ 	ctx->func_desc = hdr.usb_cdc_ncm_desc;
++ 	ctx->mbim_desc = hdr.usb_cdc_mbim_desc;
++ 	ctx->mbim_extended_desc = hdr.usb_cdc_mbim_extended_desc;
+++>>>>>>> 6527f833bf3f (net: cdc_ncm: fix NULL pointer deref in cdc_ncm_bind_common)
+  
+  	/* some buggy devices have an IAD but no CDC Union */
+- 	if (!union_desc && intf->intf_assoc && intf->intf_assoc->bInterfaceCount == 2) {
++ 	if (!hdr.usb_cdc_union_desc && intf->intf_assoc && intf->intf_assoc->bInterfaceCount == 2) {
+  		ctx->data = usb_ifnum_to_if(dev->udev, intf->cur_altsetting->desc.bInterfaceNumber + 1);
+  		dev_dbg(&intf->dev, "CDC Union missing - got slave from IAD\n");
+  	}
+* Unmerged path drivers/net/usb/cdc_ncm.c
