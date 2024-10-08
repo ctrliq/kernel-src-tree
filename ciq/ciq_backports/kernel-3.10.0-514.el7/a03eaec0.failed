@@ -1,0 +1,153 @@
+rhashtable: Dump bucket tables on locking violation under PROVE_LOCKING
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit a03eaec0df52a0f1fd37ebf7dcb2dc505d891255
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a03eaec0.failed
+
+This simplifies debugging of locking violations if compiled with
+CONFIG_PROVE_LOCKING.
+
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a03eaec0df52a0f1fd37ebf7dcb2dc505d891255)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index 91429a30ff68,c2c39495fac6..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -26,23 -26,34 +26,26 @@@
+  
+  #define HASH_DEFAULT_SIZE	64UL
+  #define HASH_MIN_SIZE		4UL
+ -#define BUCKET_LOCKS_PER_CPU   128UL
+  
+ -/* Base bits plus 1 bit for nulls marker */
+ -#define HASH_RESERVED_SPACE	(RHT_BASE_BITS + 1)
+++<<<<<<< HEAD
+ +#define ASSERT_RHT_MUTEX(HT) BUG_ON(!lockdep_rht_mutex_is_held(HT))
+  
+ -enum {
+ -	RHT_LOCK_NORMAL,
+ -	RHT_LOCK_NESTED,
+ -};
+ +#ifdef CONFIG_PROVE_LOCKING
+ +int lockdep_rht_mutex_is_held(const struct rhashtable *ht)
+ +{
+ +	return ht->p.mutex_is_held();
+ +}
+ +EXPORT_SYMBOL_GPL(lockdep_rht_mutex_is_held);
+  
+ -/* The bucket lock is selected based on the hash and protects mutations
+ - * on a group of hash buckets.
+ - *
+ - * A maximum of tbl->size/2 bucket locks is allocated. This ensures that
+ - * a single lock always covers both buckets which may both contains
+ - * entries which link to the same bucket of the old table during resizing.
+ - * This allows to simplify the locking as locking the bucket in both
+ - * tables during resize always guarantee protection.
+ - *
+ - * IMPORTANT: When holding the bucket lock of both the old and new table
+ - * during expansions and shrinking, the old bucket lock must always be
+ - * acquired first.
+ - */
+ -static spinlock_t *bucket_lock(const struct bucket_table *tbl, u32 hash)
+ +int lockdep_rht_bucket_is_held(const struct bucket_table *tbl, u32 hash)
+  {
+ -	return &tbl->locks[hash & tbl->locks_mask];
+ +	return 1;
+  }
+ +EXPORT_SYMBOL_GPL(lockdep_rht_bucket_is_held);
+ +#endif
+  
+++=======
+++>>>>>>> a03eaec0df52 (rhashtable: Dump bucket tables on locking violation under PROVE_LOCKING)
+  static void *rht_obj(const struct rhashtable *ht, const struct rhash_head *he)
+  {
+  	return (void *) he - ht->p.head_offset;
+@@@ -142,25 -267,58 +216,76 @@@ bool rht_shrink_below_30(const struct r
+  }
+  EXPORT_SYMBOL_GPL(rht_shrink_below_30);
+  
+++<<<<<<< HEAD
+ +static void hashtable_chain_unzip(const struct rhashtable *ht,
+++=======
++ static void lock_buckets(struct bucket_table *new_tbl,
++ 			 struct bucket_table *old_tbl, unsigned int hash)
++ 	__acquires(old_bucket_lock)
++ {
++ 	spin_lock_bh(bucket_lock(old_tbl, hash));
++ 	if (new_tbl != old_tbl)
++ 		spin_lock_bh_nested(bucket_lock(new_tbl, hash),
++ 				    RHT_LOCK_NESTED);
++ }
++ 
++ static void unlock_buckets(struct bucket_table *new_tbl,
++ 			   struct bucket_table *old_tbl, unsigned int hash)
++ 	__releases(old_bucket_lock)
++ {
++ 	if (new_tbl != old_tbl)
++ 		spin_unlock_bh(bucket_lock(new_tbl, hash));
++ 	spin_unlock_bh(bucket_lock(old_tbl, hash));
++ }
++ 
++ /**
++  * Unlink entries on bucket which hash to different bucket.
++  *
++  * Returns true if no more work needs to be performed on the bucket.
++  */
++ static bool hashtable_chain_unzip(struct rhashtable *ht,
+++>>>>>>> a03eaec0df52 (rhashtable: Dump bucket tables on locking violation under PROVE_LOCKING)
+  				  const struct bucket_table *new_tbl,
+ -				  struct bucket_table *old_tbl,
+ -				  size_t old_hash)
+ +				  struct bucket_table *old_tbl, size_t n)
+  {
+  	struct rhash_head *he, *p, *next;
+++<<<<<<< HEAD
+ +	unsigned int h;
+ +
+ +	/* Old bucket empty, no work needed. */
+ +	p = rht_dereference(old_tbl->buckets[n], ht);
+ +	if (!p)
+ +		return;
+++=======
++ 	unsigned int new_hash, new_hash2;
++ 
++ 	ASSERT_BUCKET_LOCK(ht, old_tbl, old_hash);
++ 
++ 	/* Old bucket empty, no work needed. */
++ 	p = rht_dereference_bucket(old_tbl->buckets[old_hash], old_tbl,
++ 				   old_hash);
++ 	if (rht_is_a_nulls(p))
++ 		return false;
++ 
++ 	new_hash = head_hashfn(ht, new_tbl, p);
++ 	ASSERT_BUCKET_LOCK(ht, new_tbl, new_hash);
+++>>>>>>> a03eaec0df52 (rhashtable: Dump bucket tables on locking violation under PROVE_LOCKING)
+  
+  	/* Advance the old bucket pointer one or more times until it
+  	 * reaches a node that doesn't hash to the same bucket as the
+  	 * previous node p. Call the previous node p;
+  	 */
+++<<<<<<< HEAD
+ +	h = head_hashfn(ht, new_tbl, p);
+ +	rht_for_each_continue(he, p->next, old_tbl, n) {
+ +		if (head_hashfn(ht, new_tbl, he) != h)
+++=======
++ 	rht_for_each_continue(he, p->next, old_tbl, old_hash) {
++ 		new_hash2 = head_hashfn(ht, new_tbl, he);
++ 		ASSERT_BUCKET_LOCK(ht, new_tbl, new_hash2);
++ 
++ 		if (new_hash != new_hash2)
+++>>>>>>> a03eaec0df52 (rhashtable: Dump bucket tables on locking violation under PROVE_LOCKING)
+  			break;
+  		p = he;
+  	}
+* Unmerged path lib/rhashtable.c
