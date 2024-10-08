@@ -328,7 +328,6 @@ void i40e_init_pf_fcoe(struct i40e_pf *pf)
 	i40e_write_rx_ctl(hw, I40E_GLFCOE_RCTL, val);
 
 	dev_info(&pf->pdev->dev, "FCoE is supported.\n");
-	return;
 }
 
 /**
