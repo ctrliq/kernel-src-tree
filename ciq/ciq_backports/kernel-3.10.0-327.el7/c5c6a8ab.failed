@@ -1,0 +1,303 @@
+net: tcp: add key management to congestion control
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] tcp: add key management to congestion control (Florian Westphal) [1212624]
+Rebuild_FUZZ: 94.74%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit c5c6a8ab45ec0f18733afb4aaade0d4a139d80b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c5c6a8ab.failed
+
+This patch adds necessary infrastructure to the congestion control
+framework for later per route congestion control support.
+
+For a per route congestion control possibility, our aim is to store
+a unique u32 key identifier into dst metrics, which can then be
+mapped into a tcp_congestion_ops struct. We argue that having a
+RTAX key entry is the most simple, generic and easy way to manage,
+and also keeps the memory footprint of dst entries lower on 64 bit
+than with storing a pointer directly, for example. Having a unique
+key id also allows for decoupling actual TCP congestion control
+module management from the FIB layer, i.e. we don't have to care
+about expensive module refcounting inside the FIB at this point.
+
+We first thought of using an IDR store for the realization, which
+takes over dynamic assignment of unused key space and also performs
+the key to pointer mapping in RCU. While doing so, we stumbled upon
+the issue that due to the nature of dynamic key distribution, it
+just so happens, arguably in very rare occasions, that excessive
+module loads and unloads can lead to a possible reuse of previously
+used key space. Thus, previously stale keys in the dst metric are
+now being reassigned to a different congestion control algorithm,
+which might lead to unexpected behaviour. One way to resolve this
+would have been to walk FIBs on the actually rare occasion of a
+module unload and reset the metric keys for each FIB in each netns,
+but that's just very costly.
+
+Therefore, we argue a better solution is to reuse the unique
+congestion control algorithm name member and map that into u32 key
+space through jhash. For that, we split the flags attribute (as it
+currently uses 2 bits only anyway) into two u32 attributes, flags
+and key, so that we can keep the cacheline boundary of 2 cachelines
+on x86_64 and cache the precalculated key at registration time for
+the fast path. On average we might expect 2 - 4 modules being loaded
+worst case perhaps 15, so a key collision possibility is extremely
+low, and guaranteed collision-free on LE/BE for all in-tree modules.
+Overall this results in much simpler code, and all without the
+overhead of an IDR. Due to the deterministic nature, modules can
+now be unloaded, the congestion control algorithm for a specific
+but unloaded key will fall back to the default one, and on module
+reload time it will switch back to the expected algorithm
+transparently.
+
+Joint work with Florian Westphal.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c5c6a8ab45ec0f18733afb4aaade0d4a139d80b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+diff --cc include/net/tcp.h
+index 0373da38f3bc,135b70c9a734..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -793,8 -787,12 +793,14 @@@ enum tcp_ca_ack_event_flags 
+  #define TCP_CA_MAX	128
+  #define TCP_CA_BUF_MAX	(TCP_CA_NAME_MAX*TCP_CA_MAX)
+  
+++<<<<<<< HEAD
+++=======
++ #define TCP_CA_UNSPEC	0
++ 
++ /* Algorithm can be set on socket without CAP_NET_ADMIN privileges */
+++>>>>>>> c5c6a8ab45ec (net: tcp: add key management to congestion control)
+  #define TCP_CONG_NON_RESTRICTED 0x1
+ -/* Requires ECN/ECT set on all packets */
+ -#define TCP_CONG_NEEDS_ECN	0x2
+ +#define TCP_CONG_RTT_STAMP	0x2
+  
+  struct tcp_congestion_ops {
+  	struct list_head	list;
+@@@ -828,26 -825,36 +835,40 @@@
+  	struct module 	*owner;
+  };
+  
+ -int tcp_register_congestion_control(struct tcp_congestion_ops *type);
+ -void tcp_unregister_congestion_control(struct tcp_congestion_ops *type);
+ -
+ -void tcp_assign_congestion_control(struct sock *sk);
+ -void tcp_init_congestion_control(struct sock *sk);
+ -void tcp_cleanup_congestion_control(struct sock *sk);
+ -int tcp_set_default_congestion_control(const char *name);
+ -void tcp_get_default_congestion_control(char *name);
+ -void tcp_get_available_congestion_control(char *buf, size_t len);
+ -void tcp_get_allowed_congestion_control(char *buf, size_t len);
+ -int tcp_set_allowed_congestion_control(char *allowed);
+ -int tcp_set_congestion_control(struct sock *sk, const char *name);
+ -void tcp_slow_start(struct tcp_sock *tp, u32 acked);
+ -void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w);
+ -
+ -u32 tcp_reno_ssthresh(struct sock *sk);
+ -void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 acked);
+ +extern int tcp_register_congestion_control(struct tcp_congestion_ops *type);
+ +extern void tcp_unregister_congestion_control(struct tcp_congestion_ops *type);
+ +
+ +extern void tcp_init_congestion_control(struct sock *sk);
+ +extern void tcp_cleanup_congestion_control(struct sock *sk);
+ +extern int tcp_set_default_congestion_control(const char *name);
+ +extern void tcp_get_default_congestion_control(char *name);
+ +extern void tcp_get_available_congestion_control(char *buf, size_t len);
+ +extern void tcp_get_allowed_congestion_control(char *buf, size_t len);
+ +extern int tcp_set_allowed_congestion_control(char *allowed);
+ +extern int tcp_set_congestion_control(struct sock *sk, const char *name);
+ +extern void tcp_slow_start(struct tcp_sock *tp);
+ +extern void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w);
+ +
+ +extern struct tcp_congestion_ops tcp_init_congestion_ops;
+ +extern u32 tcp_reno_ssthresh(struct sock *sk);
+ +extern void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight);
+ +extern u32 tcp_reno_min_cwnd(const struct sock *sk);
+  extern struct tcp_congestion_ops tcp_reno;
+  
+++<<<<<<< HEAD
+++=======
++ struct tcp_congestion_ops *tcp_ca_find_key(u32 key);
++ u32 tcp_ca_get_key_by_name(const char *name);
++ char *tcp_ca_get_name_by_key(u32 key, char *buffer);
++ 
++ static inline bool tcp_ca_needs_ecn(const struct sock *sk)
++ {
++ 	const struct inet_connection_sock *icsk = inet_csk(sk);
++ 
++ 	return icsk->icsk_ca_ops->flags & TCP_CONG_NEEDS_ECN;
++ }
++ 
+++>>>>>>> c5c6a8ab45ec (net: tcp: add key management to congestion control)
+  static inline void tcp_set_ca_state(struct sock *sk, const u8 ca_state)
+  {
+  	struct inet_connection_sock *icsk = inet_csk(sk);
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index c55aeed41ace..e7cbebf8ae57 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -97,7 +97,8 @@ struct inet_connection_sock {
+ 	const struct tcp_congestion_ops *icsk_ca_ops;
+ 	const struct inet_connection_sock_af_ops *icsk_af_ops;
+ 	unsigned int		  (*icsk_sync_mss)(struct sock *sk, u32 pmtu);
+-	__u8			  icsk_ca_state;
++	__u8			  icsk_ca_state:7,
++				  icsk_ca_dst_locked:1;
+ 	__u8			  icsk_retransmits;
+ 	__u8			  icsk_pending;
+ 	__u8			  icsk_backoff;
+* Unmerged path include/net/tcp.h
+diff --git a/net/ipv4/tcp_cong.c b/net/ipv4/tcp_cong.c
+index 511547b93096..2dee2111c896 100644
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@ -13,6 +13,7 @@
+ #include <linux/types.h>
+ #include <linux/list.h>
+ #include <linux/gfp.h>
++#include <linux/jhash.h>
+ #include <net/tcp.h>
+ 
+ int sysctl_tcp_max_ssthresh = 0;
+@@ -33,6 +34,34 @@ static struct tcp_congestion_ops *tcp_ca_find(const char *name)
+ 	return NULL;
+ }
+ 
++/* Must be called with rcu lock held */
++static const struct tcp_congestion_ops *__tcp_ca_find_autoload(const char *name)
++{
++	const struct tcp_congestion_ops *ca = tcp_ca_find(name);
++#ifdef CONFIG_MODULES
++	if (!ca && capable(CAP_NET_ADMIN)) {
++		rcu_read_unlock();
++		request_module("tcp_%s", name);
++		rcu_read_lock();
++		ca = tcp_ca_find(name);
++	}
++#endif
++	return ca;
++}
++
++/* Simple linear search, not much in here. */
++struct tcp_congestion_ops *tcp_ca_find_key(u32 key)
++{
++	struct tcp_congestion_ops *e;
++
++	list_for_each_entry_rcu(e, &tcp_cong_list, list) {
++		if (e->key == key)
++			return e;
++	}
++
++	return NULL;
++}
++
+ /*
+  * Attach new congestion control algorithm to the list
+  * of available options.
+@@ -47,9 +76,12 @@ int tcp_register_congestion_control(struct tcp_congestion_ops *ca)
+ 		return -EINVAL;
+ 	}
+ 
++	ca->key = jhash(ca->name, sizeof(ca->name), strlen(ca->name));
++
+ 	spin_lock(&tcp_cong_list_lock);
+-	if (tcp_ca_find(ca->name)) {
+-		pr_notice("%s already registered\n", ca->name);
++	if (ca->key == TCP_CA_UNSPEC || tcp_ca_find_key(ca->key)) {
++		pr_notice("%s already registered or non-unique key\n",
++			  ca->name);
+ 		ret = -EEXIST;
+ 	} else {
+ 		list_add_tail_rcu(&ca->list, &tcp_cong_list);
+@@ -72,9 +104,50 @@ void tcp_unregister_congestion_control(struct tcp_congestion_ops *ca)
+ 	spin_lock(&tcp_cong_list_lock);
+ 	list_del_rcu(&ca->list);
+ 	spin_unlock(&tcp_cong_list_lock);
++
++	/* Wait for outstanding readers to complete before the
++	 * module gets removed entirely.
++	 *
++	 * A try_module_get() should fail by now as our module is
++	 * in "going" state since no refs are held anymore and
++	 * module_exit() handler being called.
++	 */
++	synchronize_rcu();
+ }
+ EXPORT_SYMBOL_GPL(tcp_unregister_congestion_control);
+ 
++u32 tcp_ca_get_key_by_name(const char *name)
++{
++	const struct tcp_congestion_ops *ca;
++	u32 key;
++
++	might_sleep();
++
++	rcu_read_lock();
++	ca = __tcp_ca_find_autoload(name);
++	key = ca ? ca->key : TCP_CA_UNSPEC;
++	rcu_read_unlock();
++
++	return key;
++}
++EXPORT_SYMBOL_GPL(tcp_ca_get_key_by_name);
++
++char *tcp_ca_get_name_by_key(u32 key, char *buffer)
++{
++	const struct tcp_congestion_ops *ca;
++	char *ret = NULL;
++
++	rcu_read_lock();
++	ca = tcp_ca_find_key(key);
++	if (ca)
++		ret = strncpy(buffer, ca->name,
++			      TCP_CA_NAME_MAX);
++	rcu_read_unlock();
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tcp_ca_get_name_by_key);
++
+ /* Assign choice of congestion control. */
+ void tcp_init_congestion_control(struct sock *sk)
+ {
+@@ -249,25 +322,17 @@ out:
+ int tcp_set_congestion_control(struct sock *sk, const char *name)
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+-	struct tcp_congestion_ops *ca;
++	const struct tcp_congestion_ops *ca;
+ 	int err = 0;
+ 
+-	rcu_read_lock();
+-	ca = tcp_ca_find(name);
++	if (icsk->icsk_ca_dst_locked)
++		return -EPERM;
+ 
+-	/* no change asking for existing value */
++	rcu_read_lock();
++	ca = __tcp_ca_find_autoload(name);
++	/* No change asking for existing value */
+ 	if (ca == icsk->icsk_ca_ops)
+ 		goto out;
+-
+-#ifdef CONFIG_MODULES
+-	/* not found attempt to autoload module */
+-	if (!ca && capable(CAP_NET_ADMIN)) {
+-		rcu_read_unlock();
+-		request_module("tcp_%s", name);
+-		rcu_read_lock();
+-		ca = tcp_ca_find(name);
+-	}
+-#endif
+ 	if (!ca)
+ 		err = -ENOENT;
+ 	else if (!((ca->flags & TCP_CONG_NON_RESTRICTED) ||
