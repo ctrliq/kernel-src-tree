@@ -1,0 +1,173 @@
+GFS2: fix dentry leaks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Miklos Szeredi <miklos@szeredi.hu>
+commit 5ca1db41ecdeb0358b968265fadb755213558a85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/5ca1db41.failed
+
+We need to dput() the result of d_splice_alias(), unless it is passed to
+finish_no_open().
+
+Edited by Steven Whitehouse in order to make it apply to the current
+GFS2 git tree, and taking account of a prerequisite patch which hasn't
+been applied.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 5ca1db41ecdeb0358b968265fadb755213558a85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/inode.c
+diff --cc fs/gfs2/inode.c
+index 06ca4e826edd,cd58611912f5..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -593,6 -579,27 +593,30 @@@ static int gfs2_create_inode(struct ino
+  	if (error)
+  		goto fail_gunlock;
+  
+++<<<<<<< HEAD
+++=======
++ 	inode = gfs2_dir_search(dir, &dentry->d_name, !S_ISREG(mode) || excl);
++ 	error = PTR_ERR(inode);
++ 	if (!IS_ERR(inode)) {
++ 		d = d_splice_alias(inode, dentry);
++ 		error = 0;
++ 		if (file) {
++ 			if (S_ISREG(inode->i_mode)) {
++ 				WARN_ON(d != NULL);
++ 				error = finish_open(file, dentry, gfs2_open_common, opened);
++ 			} else {
++ 				error = finish_no_open(file, d);
++ 			}
++ 		} else {
++ 			dput(d);
++ 		}
++ 		gfs2_glock_dq_uninit(ghs);
++ 		return error;
++ 	} else if (error != -ENOENT) {
++ 		goto fail_gunlock;
++ 	}
++ 
+++>>>>>>> 5ca1db41ecde (GFS2: fix dentry leaks)
+  	arq = error = gfs2_diradd_alloc_required(dir, name);
+  	if (error < 0)
+  		goto fail_gunlock;
+@@@ -743,22 -752,44 +767,59 @@@ static int gfs2_create(struct inode *di
+   * Returns: errno
+   */
+  
+++<<<<<<< HEAD
+++=======
++ static struct dentry *__gfs2_lookup(struct inode *dir, struct dentry *dentry,
++ 				    struct file *file, int *opened)
++ {
++ 	struct inode *inode;
++ 	struct dentry *d;
++ 	struct gfs2_holder gh;
++ 	struct gfs2_glock *gl;
++ 	int error;
++ 
++ 	inode = gfs2_lookupi(dir, &dentry->d_name, 0);
++ 	if (!inode)
++ 		return NULL;
++ 	if (IS_ERR(inode))
++ 		return ERR_CAST(inode);
++ 
++ 	gl = GFS2_I(inode)->i_gl;
++ 	error = gfs2_glock_nq_init(gl, LM_ST_SHARED, LM_FLAG_ANY, &gh);
++ 	if (error) {
++ 		iput(inode);
++ 		return ERR_PTR(error);
++ 	}
++ 
++ 	d = d_splice_alias(inode, dentry);
++ 	if (file && S_ISREG(inode->i_mode))
++ 		error = finish_open(file, dentry, gfs2_open_common, opened);
++ 
++ 	gfs2_glock_dq_uninit(&gh);
++ 	if (error) {
++ 		dput(d);
++ 		return ERR_PTR(error);
++ 	}
++ 	return d;
++ }
++ 
+++>>>>>>> 5ca1db41ecde (GFS2: fix dentry leaks)
+  static struct dentry *gfs2_lookup(struct inode *dir, struct dentry *dentry,
+ -				  unsigned flags)
+ +				  unsigned int flags)
+  {
+ -	return __gfs2_lookup(dir, dentry, NULL, NULL);
+ +	struct inode *inode = gfs2_lookupi(dir, &dentry->d_name, 0);
+ +	if (inode && !IS_ERR(inode)) {
+ +		struct gfs2_glock *gl = GFS2_I(inode)->i_gl;
+ +		struct gfs2_holder gh;
+ +		int error;
+ +		error = gfs2_glock_nq_init(gl, LM_ST_SHARED, LM_FLAG_ANY, &gh);
+ +		if (error) {
+ +			iput(inode);
+ +			return ERR_PTR(error);
+ +		}
+ +		gfs2_glock_dq_uninit(&gh);
+ +	}
+ +	return d_splice_alias(inode, dentry);
+  }
+  
+  /**
+@@@ -1107,7 -1138,45 +1168,49 @@@ static int gfs2_mkdir(struct inode *dir
+  static int gfs2_mknod(struct inode *dir, struct dentry *dentry, umode_t mode,
+  		      dev_t dev)
+  {
+++<<<<<<< HEAD
+ +	return gfs2_create_inode(dir, dentry, mode, dev, NULL, 0, 0);
+++=======
++ 	return gfs2_create_inode(dir, dentry, NULL, mode, dev, NULL, 0, 0, NULL);
++ }
++ 
++ /**
++  * gfs2_atomic_open - Atomically open a file
++  * @dir: The directory
++  * @dentry: The proposed new entry
++  * @file: The proposed new struct file
++  * @flags: open flags
++  * @mode: File mode
++  * @opened: Flag to say whether the file has been opened or not
++  *
++  * Returns: error code or 0 for success
++  */
++ 
++ static int gfs2_atomic_open(struct inode *dir, struct dentry *dentry,
++                             struct file *file, unsigned flags,
++                             umode_t mode, int *opened)
++ {
++ 	struct dentry *d;
++ 	bool excl = !!(flags & O_EXCL);
++ 
++ 	d = __gfs2_lookup(dir, dentry, file, opened);
++ 	if (IS_ERR(d))
++ 		return PTR_ERR(d);
++ 	if (d != NULL)
++ 		dentry = d;
++ 	if (dentry->d_inode) {
++ 		if (!(*opened & FILE_OPENED))
++ 			return finish_no_open(file, dentry);
++ 		dput(d);
++ 		return 0;
++ 	}
++ 
++ 	BUG_ON(d != NULL);
++ 	if (!(flags & O_CREAT))
++ 		return -ENOENT;
++ 
++ 	return gfs2_create_inode(dir, dentry, file, S_IFREG | mode, 0, NULL, 0, excl, opened);
+++>>>>>>> 5ca1db41ecde (GFS2: fix dentry leaks)
+  }
+  
+  /*
+* Unmerged path fs/gfs2/inode.c
