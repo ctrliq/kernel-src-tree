@@ -1,0 +1,347 @@
+IB/mlx5: Add GSI QP wrapper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haggai Eran <haggaie@mellanox.com>
+commit d16e91daf446c605a92112889552f9df757186bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d16e91da.failed
+
+mlx5 creates special GSI QPs that has limited ability to control the P_Key
+of transmitted packets. The sent P_Key is taken from the QP object,
+similarly to what happens with regular UD QPs.
+
+Create a software wrapper around GSI QPs that with the following patches
+will be able to emulate the functionality of a GSI QP including control of
+the P_Key per work request.
+
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Haggai Eran <haggaie@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit d16e91daf446c605a92112889552f9df757186bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 483a003bcadc,85cf9c4a9500..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -587,10 -598,10 +587,10 @@@ static int to_mlx5_st(enum ib_qp_type t
+  	case IB_QPT_XRC_INI:
+  	case IB_QPT_XRC_TGT:		return MLX5_QP_ST_XRC;
+  	case IB_QPT_SMI:		return MLX5_QP_ST_QP0;
+- 	case IB_QPT_GSI:		return MLX5_QP_ST_QP1;
++ 	case MLX5_IB_QPT_HW_GSI:	return MLX5_QP_ST_QP1;
+  	case IB_QPT_RAW_IPV6:		return MLX5_QP_ST_RAW_IPV6;
+ -	case IB_QPT_RAW_PACKET:
+  	case IB_QPT_RAW_ETHERTYPE:	return MLX5_QP_ST_RAW_ETHERTYPE;
+ +	case IB_QPT_RAW_PACKET:
+  	case IB_QPT_MAX:
+  	default:		return -EINVAL;
+  	}
+@@@ -1350,9 -1722,11 +1350,12 @@@ struct ib_qp *mlx5_ib_create_qp(struct 
+  
+  		break;
+  
++ 	case IB_QPT_GSI:
++ 		return mlx5_ib_gsi_create_qp(pd, init_attr);
++ 
+  	case IB_QPT_RAW_IPV6:
+  	case IB_QPT_RAW_ETHERTYPE:
+ +	case IB_QPT_RAW_PACKET:
+  	case IB_QPT_MAX:
+  	default:
+  		mlx5_ib_dbg(dev, "unsupported qp type %d\n",
+@@@ -2837,8 -3316,7 +2849,12 @@@ int mlx5_ib_post_send(struct ib_qp *ibq
+  {
+  	struct mlx5_wqe_ctrl_seg *ctrl = NULL;  /* compiler warning */
+  	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+++<<<<<<< HEAD
+ +	struct mlx5_core_dev *mdev = dev->mdev;
+ +	struct mlx5_ib_qp *qp = to_mqp(ibqp);
+++=======
++ 	struct mlx5_ib_qp *qp;
+++>>>>>>> d16e91daf446 (IB/mlx5: Add GSI QP wrapper)
+  	struct mlx5_ib_mr *mr;
+  	struct mlx5_wqe_data_seg *dpseg;
+  	struct mlx5_wqe_xrc_seg *xrc;
+diff --git a/drivers/infiniband/hw/mlx5/Makefile b/drivers/infiniband/hw/mlx5/Makefile
+index 27a70159e2ea..4e851889355a 100644
+--- a/drivers/infiniband/hw/mlx5/Makefile
++++ b/drivers/infiniband/hw/mlx5/Makefile
+@@ -1,4 +1,4 @@
+ obj-$(CONFIG_MLX5_INFINIBAND)	+= mlx5_ib.o
+ 
+-mlx5_ib-y :=	main.o cq.o doorbell.o qp.o mem.o srq.o mr.o ah.o mad.o
++mlx5_ib-y :=	main.o cq.o doorbell.o qp.o mem.o srq.o mr.o ah.o mad.o gsi.o
+ mlx5_ib-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += odp.o
+diff --git a/drivers/infiniband/hw/mlx5/gsi.c b/drivers/infiniband/hw/mlx5/gsi.c
+new file mode 100644
+index 000000000000..711655400ca5
+--- /dev/null
++++ b/drivers/infiniband/hw/mlx5/gsi.c
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (c) 2016, Mellanox Technologies. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "mlx5_ib.h"
++
++struct mlx5_ib_gsi_qp {
++	struct ib_qp ibqp;
++	struct ib_qp *rx_qp;
++	u8 port_num;
++	struct ib_qp_cap cap;
++	enum ib_sig_type sq_sig_type;
++	/* Serialize qp state modifications */
++	struct mutex mutex;
++};
++
++static struct mlx5_ib_gsi_qp *gsi_qp(struct ib_qp *qp)
++{
++	return container_of(qp, struct mlx5_ib_gsi_qp, ibqp);
++}
++
++struct ib_qp *mlx5_ib_gsi_create_qp(struct ib_pd *pd,
++				    struct ib_qp_init_attr *init_attr)
++{
++	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++	struct mlx5_ib_gsi_qp *gsi;
++	struct ib_qp_init_attr hw_init_attr = *init_attr;
++	const u8 port_num = init_attr->port_num;
++	int ret;
++
++	mlx5_ib_dbg(dev, "creating GSI QP\n");
++
++	if (port_num > ARRAY_SIZE(dev->devr.ports) || port_num < 1) {
++		mlx5_ib_warn(dev,
++			     "invalid port number %d during GSI QP creation\n",
++			     port_num);
++		return ERR_PTR(-EINVAL);
++	}
++
++	gsi = kzalloc(sizeof(*gsi), GFP_KERNEL);
++	if (!gsi)
++		return ERR_PTR(-ENOMEM);
++
++	mutex_init(&gsi->mutex);
++
++	mutex_lock(&dev->devr.mutex);
++
++	if (dev->devr.ports[port_num - 1].gsi) {
++		mlx5_ib_warn(dev, "GSI QP already exists on port %d\n",
++			     port_num);
++		ret = -EBUSY;
++		goto err_free;
++	}
++
++	gsi->cap = init_attr->cap;
++	gsi->sq_sig_type = init_attr->sq_sig_type;
++	gsi->ibqp.qp_num = 1;
++	gsi->port_num = port_num;
++
++	hw_init_attr.qp_type = MLX5_IB_QPT_HW_GSI;
++	gsi->rx_qp = ib_create_qp(pd, &hw_init_attr);
++	if (IS_ERR(gsi->rx_qp)) {
++		mlx5_ib_warn(dev, "unable to create hardware GSI QP. error %ld\n",
++			     PTR_ERR(gsi->rx_qp));
++		ret = PTR_ERR(gsi->rx_qp);
++		goto err_free;
++	}
++
++	dev->devr.ports[init_attr->port_num - 1].gsi = gsi;
++
++	mutex_unlock(&dev->devr.mutex);
++
++	return &gsi->ibqp;
++
++err_free:
++	mutex_unlock(&dev->devr.mutex);
++	kfree(gsi);
++	return ERR_PTR(ret);
++}
++
++int mlx5_ib_gsi_destroy_qp(struct ib_qp *qp)
++{
++	struct mlx5_ib_dev *dev = to_mdev(qp->device);
++	struct mlx5_ib_gsi_qp *gsi = gsi_qp(qp);
++	const int port_num = gsi->port_num;
++	int ret;
++
++	mlx5_ib_dbg(dev, "destroying GSI QP\n");
++
++	mutex_lock(&dev->devr.mutex);
++	ret = ib_destroy_qp(gsi->rx_qp);
++	if (ret) {
++		mlx5_ib_warn(dev, "unable to destroy hardware GSI QP. error %d\n",
++			     ret);
++		mutex_unlock(&dev->devr.mutex);
++		return ret;
++	}
++	dev->devr.ports[port_num - 1].gsi = NULL;
++	mutex_unlock(&dev->devr.mutex);
++
++	kfree(gsi);
++
++	return 0;
++}
++
++int mlx5_ib_gsi_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
++			  int attr_mask)
++{
++	struct mlx5_ib_dev *dev = to_mdev(qp->device);
++	struct mlx5_ib_gsi_qp *gsi = gsi_qp(qp);
++	int ret;
++
++	mlx5_ib_dbg(dev, "modifying GSI QP to state %d\n", attr->qp_state);
++
++	mutex_lock(&gsi->mutex);
++	ret = ib_modify_qp(gsi->rx_qp, attr, attr_mask);
++	mutex_unlock(&gsi->mutex);
++
++	return ret;
++}
++
++int mlx5_ib_gsi_query_qp(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
++			 int qp_attr_mask,
++			 struct ib_qp_init_attr *qp_init_attr)
++{
++	struct mlx5_ib_gsi_qp *gsi = gsi_qp(qp);
++	int ret;
++
++	mutex_lock(&gsi->mutex);
++	ret = ib_query_qp(gsi->rx_qp, qp_attr, qp_attr_mask, qp_init_attr);
++	qp_init_attr->cap = gsi->cap;
++	mutex_unlock(&gsi->mutex);
++
++	return ret;
++}
++
++int mlx5_ib_gsi_post_send(struct ib_qp *qp, struct ib_send_wr *wr,
++			  struct ib_send_wr **bad_wr)
++{
++	struct mlx5_ib_gsi_qp *gsi = gsi_qp(qp);
++
++	return ib_post_send(gsi->rx_qp, wr, bad_wr);
++}
++
++int mlx5_ib_gsi_post_recv(struct ib_qp *qp, struct ib_recv_wr *wr,
++			  struct ib_recv_wr **bad_wr)
++{
++	struct mlx5_ib_gsi_qp *gsi = gsi_qp(qp);
++
++	return ib_post_recv(gsi->rx_qp, wr, bad_wr);
++}
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 3a8b8f2e8dd9..fed81bf57374 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1969,6 +1969,8 @@ static int create_dev_resources(struct mlx5_ib_resources *devr)
+ 
+ 	dev = container_of(devr, struct mlx5_ib_dev, devr);
+ 
++	mutex_init(&devr->mutex);
++
+ 	devr->p0 = mlx5_ib_alloc_pd(&dev->ib_dev, NULL, NULL);
+ 	if (IS_ERR(devr->p0)) {
+ 		ret = PTR_ERR(devr->p0);
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 34dc68c37d1b..57d2ebf03cb7 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -163,6 +163,11 @@ struct mlx5_ib_flow_db {
+ #define MLX5_IB_SEND_UMR_FAIL_IF_FREE (IB_SEND_RESERVED_START << 1)
+ #define MLX5_IB_SEND_UMR_UPDATE_MTT (IB_SEND_RESERVED_START << 2)
+ #define MLX5_IB_QPT_REG_UMR	IB_QPT_RESERVED1
++/*
++ * IB_QPT_GSI creates the software wrapper around GSI, and MLX5_IB_QPT_HW_GSI
++ * creates the actual hardware QP.
++ */
++#define MLX5_IB_QPT_HW_GSI	IB_QPT_RESERVED2
+ #define MLX5_IB_WR_UMR		IB_WR_RESERVED1
+ 
+ struct wr_list {
+@@ -465,6 +470,12 @@ struct mlx5_mr_cache {
+ 	unsigned long		last_add;
+ };
+ 
++struct mlx5_ib_gsi_qp;
++
++struct mlx5_ib_port_resources {
++	struct mlx5_ib_gsi_qp *gsi;
++};
++
+ struct mlx5_ib_resources {
+ 	struct ib_cq	*c0;
+ 	struct ib_xrcd	*x0;
+@@ -472,6 +483,9 @@ struct mlx5_ib_resources {
+ 	struct ib_pd	*p0;
+ 	struct ib_srq	*s0;
+ 	struct ib_srq	*s1;
++	struct mlx5_ib_port_resources ports[2];
++	/* Protects changes to the port resources */
++	struct mutex	mutex;
+ };
+ 
+ struct mlx5_roce {
+@@ -724,6 +738,20 @@ static inline void mlx5_ib_qp_enable_pagefaults(struct mlx5_ib_qp *qp)  {}
+ __be16 mlx5_get_roce_udp_sport(struct mlx5_ib_dev *dev, u8 port_num,
+ 			       int index);
+ 
++/* GSI QP helper functions */
++struct ib_qp *mlx5_ib_gsi_create_qp(struct ib_pd *pd,
++				    struct ib_qp_init_attr *init_attr);
++int mlx5_ib_gsi_destroy_qp(struct ib_qp *qp);
++int mlx5_ib_gsi_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
++			  int attr_mask);
++int mlx5_ib_gsi_query_qp(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
++			 int qp_attr_mask,
++			 struct ib_qp_init_attr *qp_init_attr);
++int mlx5_ib_gsi_post_send(struct ib_qp *qp, struct ib_send_wr *wr,
++			  struct ib_send_wr **bad_wr);
++int mlx5_ib_gsi_post_recv(struct ib_qp *qp, struct ib_recv_wr *wr,
++			  struct ib_recv_wr **bad_wr);
++
+ static inline void init_query_mad(struct ib_smp *mad)
+ {
+ 	mad->base_version  = 1;
+@@ -743,7 +771,7 @@ static inline u8 convert_access(int acc)
+ 
+ static inline int is_qp1(enum ib_qp_type qp_type)
+ {
+-	return qp_type == IB_QPT_GSI;
++	return qp_type == MLX5_IB_QPT_HW_GSI;
+ }
+ 
+ #define MLX5_MAX_UMR_SHIFT 16
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
