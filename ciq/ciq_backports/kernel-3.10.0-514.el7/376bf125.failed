@@ -1,0 +1,213 @@
+slub: clean up code for kmem cgroup support to kmem_cache_free_bulk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 376bf125ac781d32e202760ed7deb1ae4ed35d31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/376bf125.failed
+
+This change is primarily an attempt to make it easier to realize the
+optimizations the compiler performs in-case CONFIG_MEMCG_KMEM is not
+enabled.
+
+Performance wise, even when CONFIG_MEMCG_KMEM is compiled in, the
+overhead is zero.  This is because, as long as no process have enabled
+kmem cgroups accounting, the assignment is replaced by asm-NOP
+operations.  This is possible because memcg_kmem_enabled() uses a
+static_key_false() construct.
+
+It also helps readability as it avoid accessing the p[] array like:
+p[size - 1] which "expose" that the array is processed backwards inside
+helper function build_detached_freelist().
+
+Lastly this also makes the code more robust, in error case like passing
+NULL pointers in the array.  Which were previously handled before commit
+033745189b1b ("slub: add missing kmem cgroup support to
+kmem_cache_free_bulk").
+
+Fixes: 033745189b1b ("slub: add missing kmem cgroup support to kmem_cache_free_bulk")
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Vladimir Davydov <vdavydov@virtuozzo.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 376bf125ac781d32e202760ed7deb1ae4ed35d31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 9230da41a30e,2a722e141958..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2659,6 -2810,161 +2659,164 @@@ void kmem_cache_free(struct kmem_cache 
+  }
+  EXPORT_SYMBOL(kmem_cache_free);
+  
+++<<<<<<< HEAD
+++=======
++ struct detached_freelist {
++ 	struct page *page;
++ 	void *tail;
++ 	void *freelist;
++ 	int cnt;
++ 	struct kmem_cache *s;
++ };
++ 
++ /*
++  * This function progressively scans the array with free objects (with
++  * a limited look ahead) and extract objects belonging to the same
++  * page.  It builds a detached freelist directly within the given
++  * page/objects.  This can happen without any need for
++  * synchronization, because the objects are owned by running process.
++  * The freelist is build up as a single linked list in the objects.
++  * The idea is, that this detached freelist can then be bulk
++  * transferred to the real freelist(s), but only requiring a single
++  * synchronization primitive.  Look ahead in the array is limited due
++  * to performance reasons.
++  */
++ static inline
++ int build_detached_freelist(struct kmem_cache *s, size_t size,
++ 			    void **p, struct detached_freelist *df)
++ {
++ 	size_t first_skipped_index = 0;
++ 	int lookahead = 3;
++ 	void *object;
++ 
++ 	/* Always re-init detached_freelist */
++ 	df->page = NULL;
++ 
++ 	do {
++ 		object = p[--size];
++ 	} while (!object && size);
++ 
++ 	if (!object)
++ 		return 0;
++ 
++ 	/* Support for memcg, compiler can optimize this out */
++ 	df->s = cache_from_obj(s, object);
++ 
++ 	/* Start new detached freelist */
++ 	set_freepointer(df->s, object, NULL);
++ 	df->page = virt_to_head_page(object);
++ 	df->tail = object;
++ 	df->freelist = object;
++ 	p[size] = NULL; /* mark object processed */
++ 	df->cnt = 1;
++ 
++ 	while (size) {
++ 		object = p[--size];
++ 		if (!object)
++ 			continue; /* Skip processed objects */
++ 
++ 		/* df->page is always set at this point */
++ 		if (df->page == virt_to_head_page(object)) {
++ 			/* Opportunity build freelist */
++ 			set_freepointer(df->s, object, df->freelist);
++ 			df->freelist = object;
++ 			df->cnt++;
++ 			p[size] = NULL; /* mark object processed */
++ 
++ 			continue;
++ 		}
++ 
++ 		/* Limit look ahead search */
++ 		if (!--lookahead)
++ 			break;
++ 
++ 		if (!first_skipped_index)
++ 			first_skipped_index = size + 1;
++ 	}
++ 
++ 	return first_skipped_index;
++ }
++ 
++ /* Note that interrupts must be enabled when calling this function. */
++ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++ {
++ 	if (WARN_ON(!size))
++ 		return;
++ 
++ 	do {
++ 		struct detached_freelist df;
++ 
++ 		size = build_detached_freelist(s, size, p, &df);
++ 		if (unlikely(!df.page))
++ 			continue;
++ 
++ 		slab_free(df.s, df.page, df.freelist, df.tail, df.cnt,_RET_IP_);
++ 	} while (likely(size));
++ }
++ EXPORT_SYMBOL(kmem_cache_free_bulk);
++ 
++ /* Note that interrupts must be enabled when calling this function. */
++ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++ 			  void **p)
++ {
++ 	struct kmem_cache_cpu *c;
++ 	int i;
++ 
++ 	/* memcg and kmem_cache debug support */
++ 	s = slab_pre_alloc_hook(s, flags);
++ 	if (unlikely(!s))
++ 		return false;
++ 	/*
++ 	 * Drain objects in the per cpu slab, while disabling local
++ 	 * IRQs, which protects against PREEMPT and interrupts
++ 	 * handlers invoking normal fastpath.
++ 	 */
++ 	local_irq_disable();
++ 	c = this_cpu_ptr(s->cpu_slab);
++ 
++ 	for (i = 0; i < size; i++) {
++ 		void *object = c->freelist;
++ 
++ 		if (unlikely(!object)) {
++ 			/*
++ 			 * Invoking slow path likely have side-effect
++ 			 * of re-populating per CPU c->freelist
++ 			 */
++ 			p[i] = ___slab_alloc(s, flags, NUMA_NO_NODE,
++ 					    _RET_IP_, c);
++ 			if (unlikely(!p[i]))
++ 				goto error;
++ 
++ 			c = this_cpu_ptr(s->cpu_slab);
++ 			continue; /* goto for-loop */
++ 		}
++ 		c->freelist = get_freepointer(s, object);
++ 		p[i] = object;
++ 	}
++ 	c->tid = next_tid(c->tid);
++ 	local_irq_enable();
++ 
++ 	/* Clear memory outside IRQ disabled fastpath loop */
++ 	if (unlikely(flags & __GFP_ZERO)) {
++ 		int j;
++ 
++ 		for (j = 0; j < i; j++)
++ 			memset(p[j], 0, s->object_size);
++ 	}
++ 
++ 	/* memcg and kmem_cache debug support */
++ 	slab_post_alloc_hook(s, flags, size, p);
++ 	return i;
++ error:
++ 	local_irq_enable();
++ 	slab_post_alloc_hook(s, flags, i, p);
++ 	__kmem_cache_free_bulk(s, i, p);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++ 
++ 
+++>>>>>>> 376bf125ac78 (slub: clean up code for kmem cgroup support to kmem_cache_free_bulk)
+  /*
+   * Object placement in a slab is made very easy because we always start at
+   * offset 0. If we tune the size of the object to the alignment then we can
+* Unmerged path mm/slub.c
