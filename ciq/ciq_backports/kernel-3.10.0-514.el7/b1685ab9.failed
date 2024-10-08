@@ -1,0 +1,182 @@
+s390/cpumf: Improve guest detection heuristics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [s390] cpumf: Improve guest detection heuristics (Hendrik Brueckner) [1339534]
+Rebuild_FUZZ: 94.25%
+commit-author Christian Borntraeger <borntraeger@de.ibm.com>
+commit b1685ab9bd3ae14830acac8ffdc7aafc0fb416e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b1685ab9.failed
+
+commit e22cf8ca6f75 ("s390/cpumf: rework program parameter setting
+to detect guest samples") requires guest changes to get proper
+guest/host. We can do better: We can use the primary asn value,
+which is set on all Linux variants to compare this with the host
+pp value.
+We now have the following cases:
+1. Guest using PP
+host sample:  gpp == 0, asn == hpp --> host
+guest sample: gpp != 0 --> guest
+2. Guest not using PP
+host sample:  gpp == 0, asn == hpp --> host
+guest sample: gpp == 0, asn != hpp --> guest
+
+As soon as the host no longer sets CR4, we must back out
+this heuristics - let's add a comment in switch_to.
+
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Reviewed-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit b1685ab9bd3ae14830acac8ffdc7aafc0fb416e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/entry.S
+#	arch/s390/kernel/perf_cpum_sf.c
+diff --cc arch/s390/kernel/entry.S
+index 9fd2c1f12630,4ba688c9d5a6..000000000000
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@@ -146,26 -172,86 +146,44 @@@ STACK_INIT  = STACK_SIZE - STACK_FRAME_
+   *  gpr2 = prev
+   */
+  ENTRY(__switch_to)
+++<<<<<<< HEAD
+ +	stm	%r6,%r15,__SF_GPRS(%r15)	# store gprs of prev task
+ +	st	%r15,__THREAD_ksp(%r2)		# store kernel stack of prev
+ +	l	%r4,__THREAD_info(%r2)		# get thread_info of prev
+ +	l	%r5,__THREAD_info(%r3)		# get thread_info of next
+ +	lr	%r15,%r5
+ +	ahi	%r15,STACK_INIT			# end of kernel stack of next
+ +	st	%r3,__LC_CURRENT		# store task struct of next
+ +	st	%r5,__LC_THREAD_INFO		# store thread info of next
+ +	st	%r15,__LC_KERNEL_STACK		# store end of kernel stack
+++=======
++ 	stmg	%r6,%r15,__SF_GPRS(%r15)	# store gprs of prev task
++ 	lgr	%r1,%r2
++ 	aghi	%r1,__TASK_thread		# thread_struct of prev task
++ 	lg	%r4,__TASK_thread_info(%r2)	# get thread_info of prev
++ 	lg	%r5,__TASK_thread_info(%r3)	# get thread_info of next
++ 	stg	%r15,__THREAD_ksp(%r1)		# store kernel stack of prev
++ 	lgr	%r1,%r3
++ 	aghi	%r1,__TASK_thread		# thread_struct of next task
++ 	lgr	%r15,%r5
++ 	aghi	%r15,STACK_INIT			# end of kernel stack of next
++ 	stg	%r3,__LC_CURRENT		# store task struct of next
++ 	stg	%r5,__LC_THREAD_INFO		# store thread info of next
++ 	stg	%r15,__LC_KERNEL_STACK		# store end of kernel stack
++ 	lg	%r15,__THREAD_ksp(%r1)		# load kernel stack of next
++ 	/* c4 is used in guest detection: arch/s390/kernel/perf_cpum_sf.c */
+++>>>>>>> b1685ab9bd3a (s390/cpumf: Improve guest detection heuristics)
+  	lctl	%c4,%c4,__TASK_pid(%r3)		# load pid to control reg. 4
+ -	mvc	__LC_CURRENT_PID(4,%r0),__TASK_pid(%r3) # store pid of next
+ -	lmg	%r6,%r15,__SF_GPRS(%r15)	# load gprs of next task
+ -	TSTMSK	__LC_MACHINE_FLAGS,MACHINE_FLAG_LPP
+ -	bzr	%r14
+ -	.insn	s,0xb2800000,__LC_LPP		# set program parameter
+ -	br	%r14
+ -
+ -.L__critical_start:
+ -
+ -#if IS_ENABLED(CONFIG_KVM)
+ -/*
+ - * sie64a calling convention:
+ - * %r2 pointer to sie control block
+ - * %r3 guest register save area
+ - */
+ -ENTRY(sie64a)
+ -	stmg	%r6,%r14,__SF_GPRS(%r15)	# save kernel registers
+ -	stg	%r2,__SF_EMPTY(%r15)		# save control block pointer
+ -	stg	%r3,__SF_EMPTY+8(%r15)		# save guest register save area
+ -	xc	__SF_EMPTY+16(8,%r15),__SF_EMPTY+16(%r15) # reason code = 0
+ -	TSTMSK	__LC_CPU_FLAGS,_CIF_FPU		# load guest fp/vx registers ?
+ -	jno	.Lsie_load_guest_gprs
+ -	brasl	%r14,load_fpu_regs		# load guest fp/vx regs
+ -.Lsie_load_guest_gprs:
+ -	lmg	%r0,%r13,0(%r3)			# load guest gprs 0-13
+ -	lg	%r14,__LC_GMAP			# get gmap pointer
+ -	ltgr	%r14,%r14
+ -	jz	.Lsie_gmap
+ -	lctlg	%c1,%c1,__GMAP_ASCE(%r14)	# load primary asce
+ -.Lsie_gmap:
+ -	lg	%r14,__SF_EMPTY(%r15)		# get control block pointer
+ -	oi	__SIE_PROG0C+3(%r14),1		# we are going into SIE now
+ -	tm	__SIE_PROG20+3(%r14),3		# last exit...
+ -	jnz	.Lsie_skip
+ -	TSTMSK	__LC_CPU_FLAGS,_CIF_FPU
+ -	jo	.Lsie_skip			# exit if fp/vx regs changed
+ -	sie	0(%r14)
+ -.Lsie_skip:
+ -	ni	__SIE_PROG0C+3(%r14),0xfe	# no longer in SIE
+ -	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
+ -.Lsie_done:
+ -# some program checks are suppressing. C code (e.g. do_protection_exception)
+ -# will rewind the PSW by the ILC, which is 4 bytes in case of SIE. Other
+ -# instructions between sie64a and .Lsie_done should not cause program
+ -# interrupts. So lets use a nop (47 00 00 00) as a landing pad.
+ -# See also .Lcleanup_sie
+ -.Lrewind_pad:
+ -	nop	0
+ -	.globl sie_exit
+ -sie_exit:
+ -	lg	%r14,__SF_EMPTY+8(%r15)		# load guest register save area
+ -	stmg	%r0,%r13,0(%r14)		# save guest gprs 0-13
+ -	lmg	%r6,%r14,__SF_GPRS(%r15)	# restore kernel registers
+ -	lg	%r2,__SF_EMPTY+16(%r15)		# return exit reason code
+ +	mvc	__LC_CURRENT_PID(4,%r0),__TASK_pid(%r3)	# store pid of next
+ +	l	%r15,__THREAD_ksp(%r3)		# load kernel stack of next
+ +	tm	__TI_flags+3(%r4),_TIF_MCCK_PENDING # machine check pending?
+ +	jz	0f
+ +	ni	__TI_flags+3(%r4),255-_TIF_MCCK_PENDING	# clear flag in prev
+ +	oi	__TI_flags+3(%r5),_TIF_MCCK_PENDING	# set it in next
+ +0:	lm	%r6,%r15,__SF_GPRS(%r15)	# load gprs of next task
+  	br	%r14
+ -.Lsie_fault:
+ -	lghi	%r14,-EFAULT
+ -	stg	%r14,__SF_EMPTY+16(%r15)	# set exit reason code
+ -	j	sie_exit
+ -
+ -	EX_TABLE(.Lrewind_pad,.Lsie_fault)
+ -	EX_TABLE(sie_exit,.Lsie_fault)
+ -#endif
+  
+ +__critical_start:
+  /*
+   * SVC interrupt handler routine. System calls are synchronous events and
+   * are executed with interrupts enabled.
+diff --cc arch/s390/kernel/perf_cpum_sf.c
+index 3e71ee872319,1a43474df541..000000000000
+--- a/arch/s390/kernel/perf_cpum_sf.c
++++ b/arch/s390/kernel/perf_cpum_sf.c
+@@@ -1021,14 -1019,16 +1021,27 @@@ static int perf_push_sample(struct perf
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* The host-program-parameter (hpp) contains the sie control
+ +	 * block that is set by sie64a() in entry64.S.	Check if hpp
+ +	 * refers to a valid control block and set sde_regs flags
+ +	 * accordingly.  This would allow to use hpp values for other
+ +	 * purposes too.
+ +	 * For now, simply use a non-zero value as guest indicator.
+ +	 */
+ +	if (sfr->basic.hpp)
+++=======
++ 	/*
++ 	 * A non-zero guest program parameter indicates a guest
++ 	 * sample.
++ 	 * Note that some early samples or samples from guests without
++ 	 * lpp usage would be misaccounted to the host. We use the asn
++ 	 * value as a heuristic to detect most of these guest samples.
++ 	 * If the value differs from the host hpp value, we assume
++ 	 * it to be a KVM guest.
++ 	 */
++ 	if (sfr->basic.gpp || sfr->basic.prim_asn != (u16) sfr->basic.hpp)
+++>>>>>>> b1685ab9bd3a (s390/cpumf: Improve guest detection heuristics)
+  		sde_regs->in_guest = 1;
+  
+  	overflow = 0;
+* Unmerged path arch/s390/kernel/entry.S
+* Unmerged path arch/s390/kernel/perf_cpum_sf.c
