@@ -1,0 +1,163 @@
+Btrfs: load checksum data once when submitting a direct read io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Miao Xie <miaox@cn.fujitsu.com>
+commit 23ea8e5a07673127d05cb5cf6f9914d7a53e0847
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/23ea8e5a.failed
+
+The current code would load checksum data for several times when we split
+a whole direct read io because of the limit of the raid stripe, it would
+make us search the csum tree for several times. In fact, it just wasted time,
+and made the contention of the csum tree root be more serious. This patch
+improves this problem by loading the data at once.
+
+	Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 23ea8e5a07673127d05cb5cf6f9914d7a53e0847)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/file-item.c
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/file-item.c
+index 4c8ad84b81e7,783a94355efd..000000000000
+--- a/fs/btrfs/file-item.c
++++ b/fs/btrfs/file-item.c
+@@@ -299,19 -299,9 +299,22 @@@ int btrfs_lookup_bio_sums(struct btrfs_
+  }
+  
+  int btrfs_lookup_bio_sums_dio(struct btrfs_root *root, struct inode *inode,
+- 			      struct btrfs_dio_private *dip, struct bio *bio,
+- 			      u64 offset)
++ 			      struct bio *bio, u64 offset)
+  {
+++<<<<<<< HEAD
+ +	int len = (bio->bi_sector << 9) - dip->disk_bytenr;
+ +	u16 csum_size = btrfs_super_csum_size(root->fs_info->super_copy);
+ +	int ret;
+ +
+ +	len >>= inode->i_sb->s_blocksize_bits;
+ +	len *= csum_size;
+ +
+ +	ret = __btrfs_lookup_bio_sums(root, inode, bio, offset,
+ +				      (u32 *)(dip->csum + len), 1);
+ +	return ret;
+++=======
++ 	return __btrfs_lookup_bio_sums(root, inode, bio, offset, NULL, 1);
+++>>>>>>> 23ea8e5a0767 (Btrfs: load checksum data once when submitting a direct read io)
+  }
+  
+  int btrfs_lookup_csums_range(struct btrfs_root *root, u64 start, u64 end,
+diff --cc fs/btrfs/inode.c
+index a4bd5317d647,fca944211bf0..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -7194,12 -7240,13 +7194,17 @@@ static void btrfs_endio_direct_read(str
+  	struct inode *inode = dip->inode;
+  	struct btrfs_root *root = BTRFS_I(inode)->root;
+  	struct bio *dio_bio;
+++<<<<<<< HEAD
+ +	u32 *csums = (u32 *)dip->csum;
+ +	int index = 0;
+++=======
++ 	struct btrfs_io_bio *io_bio = btrfs_io_bio(bio);
++ 	u32 *csums = (u32 *)io_bio->csum;
+++>>>>>>> 23ea8e5a0767 (Btrfs: load checksum data once when submitting a direct read io)
+  	u64 start;
+ -	int i;
+  
+  	start = dip->logical_offset;
+ -	bio_for_each_segment_all(bvec, bio, i) {
+ +	do {
+  		if (!(BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)) {
+  			struct page *page = bvec->bv_page;
+  			char *kaddr;
+@@@ -7403,10 -7459,10 +7418,10 @@@ static int btrfs_submit_direct_hook(in
+  	u64 submit_len = 0;
+  	u64 map_length;
+  	int nr_pages = 0;
+- 	int ret = 0;
++ 	int ret;
+  	int async_submit = 0;
+  
+ -	map_length = orig_bio->bi_iter.bi_size;
+ +	map_length = orig_bio->bi_size;
+  	ret = btrfs_map_block(root->fs_info, rw, start_sector << 9,
+  			      &map_length, NULL, 0);
+  	if (ret)
+@@@ -7521,15 -7576,7 +7535,19 @@@ static void btrfs_submit_direct(int rw
+  		goto free_ordered;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!skip_sum && !write) {
+ +		csum_size = btrfs_super_csum_size(root->fs_info->super_copy);
+ +		sum_len = dio_bio->bi_size >> inode->i_sb->s_blocksize_bits;
+ +		sum_len *= csum_size;
+ +	} else {
+ +		sum_len = 0;
+ +	}
+ +
+ +	dip = kmalloc(sizeof(*dip) + sum_len, GFP_NOFS);
+++=======
++ 	dip = kmalloc(sizeof(*dip), GFP_NOFS);
+++>>>>>>> 23ea8e5a0767 (Btrfs: load checksum data once when submitting a direct read io)
+  	if (!dip) {
+  		ret = -ENOMEM;
+  		goto free_io_bio;
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index 1aa38414f6c8..403111d32dd1 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -272,7 +272,6 @@ struct btrfs_dio_private {
+ 
+ 	/* dio_bio came from fs/direct-io.c */
+ 	struct bio *dio_bio;
+-	u8 csum[0];
+ };
+ 
+ /*
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index fa328cfbd485..b68afd0b7333 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3719,8 +3719,7 @@ int btrfs_del_csums(struct btrfs_trans_handle *trans,
+ int btrfs_lookup_bio_sums(struct btrfs_root *root, struct inode *inode,
+ 			  struct bio *bio, u32 *dst);
+ int btrfs_lookup_bio_sums_dio(struct btrfs_root *root, struct inode *inode,
+-			      struct btrfs_dio_private *dip, struct bio *bio,
+-			      u64 logical_offset);
++			      struct bio *bio, u64 logical_offset);
+ int btrfs_insert_file_extent(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_root *root,
+ 			     u64 objectid, u64 pos,
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index f96ea62e4cf9..472917efd6f4 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2627,9 +2627,18 @@ btrfs_bio_alloc(struct block_device *bdev, u64 first_sector, int nr_vecs,
+ 
+ struct bio *btrfs_bio_clone(struct bio *bio, gfp_t gfp_mask)
+ {
+-	return bio_clone_bioset(bio, gfp_mask, btrfs_bioset);
+-}
++	struct btrfs_io_bio *btrfs_bio;
++	struct bio *new;
+ 
++	new = bio_clone_bioset(bio, gfp_mask, btrfs_bioset);
++	if (new) {
++		btrfs_bio = btrfs_io_bio(new);
++		btrfs_bio->csum = NULL;
++		btrfs_bio->csum_allocated = NULL;
++		btrfs_bio->end_io = NULL;
++	}
++	return new;
++}
+ 
+ /* this also allocates from the btrfs_bioset */
+ struct bio *btrfs_io_bio_alloc(gfp_t gfp_mask, unsigned int nr_iovecs)
+* Unmerged path fs/btrfs/file-item.c
+* Unmerged path fs/btrfs/inode.c
