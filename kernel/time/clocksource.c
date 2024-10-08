@@ -480,7 +480,7 @@ static u64 clocksource_max_deferment(struct clocksource *cs)
 
 #ifndef CONFIG_ARCH_USES_GETTIMEOFFSET
 
-static struct clocksource *clocksource_find_best(bool oneshot)
+static struct clocksource *clocksource_find_best(bool oneshot, bool skipcur)
 {
 	struct clocksource *cs;
 
@@ -493,6 +493,8 @@ static struct clocksource *clocksource_find_best(bool oneshot)
 	 * the best rating.
 	 */
 	list_for_each_entry(cs, &clocksource_list, list) {
+		if (skipcur && cs == curr_clocksource)
+			continue;
 		if (oneshot && !(cs->flags & CLOCK_SOURCE_VALID_FOR_HRES))
 			continue;
 		return cs;
@@ -500,26 +502,20 @@ static struct clocksource *clocksource_find_best(bool oneshot)
 	return NULL;
 }
 
-/**
- * clocksource_select - Select the best clocksource available
- *
- * Private function. Must hold clocksource_mutex when called.
- *
- * Select the clocksource with the best rating, or the clocksource,
- * which is selected by userspace override.
- */
-static void clocksource_select(void)
+static void __clocksource_select(bool skipcur)
 {
 	bool oneshot = tick_oneshot_mode_active();
 	struct clocksource *best, *cs;
 
 	/* Find the best suitable clocksource */
-	best = clocksource_find_best(oneshot);
+	best = clocksource_find_best(oneshot, skipcur);
 	if (!best)
 		return;
 
 	/* Check for the override clocksource. */
 	list_for_each_entry(cs, &clocksource_list, list) {
+		if (skipcur && cs == curr_clocksource)
+			continue;
 		if (strcmp(cs->name, override_name) != 0)
 			continue;
 		/*
@@ -543,6 +539,19 @@ static void clocksource_select(void)
 		pr_info("Switched to clocksource %s\n", best->name);
 		curr_clocksource = best;
 	}
+}
+
+/**
+ * clocksource_select - Select the best clocksource available
+ *
+ * Private function. Must hold clocksource_mutex when called.
+ *
+ * Select the clocksource with the best rating, or the clocksource,
+ * which is selected by userspace override.
+ */
+static void clocksource_select(void)
+{
+	return __clocksource_select(false);
 }
 
 #else /* !CONFIG_ARCH_USES_GETTIMEOFFSET */
