@@ -1093,7 +1093,8 @@ int audit_receive_filter(int type, __u32 portid, int seq, void *data,
 		audit_free_rule(entry);
 		break;
 	default:
-		return -EINVAL;
+		err = -EINVAL;
+		WARN_ON(1);
 	}
 
 	return err;
