@@ -1,0 +1,148 @@
+net: Changes to ip_tunnel to support foo-over-udp encapsulation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] ip_tunnel: Changes to ip_tunnel to support foo-over-udp encapsulation (Marcelo Leitner) [1206570]
+Rebuild_FUZZ: 93.94%
+commit-author Tom Herbert <therbert@google.com>
+commit 56328486539ddd07cbaafec7a542a2c8a3043623
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/56328486.failed
+
+This patch changes IP tunnel to support (secondary) encapsulation,
+Foo-over-UDP. Changes include:
+
+1) Adding tun_hlen as the tunnel header length, encap_hlen as the
+   encapsulation header length, and hlen becomes the grand total
+   of these.
+2) Added common netlink define to support FOU encapsulation.
+3) Routines to perform FOU encapsulation.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 56328486539ddd07cbaafec7a542a2c8a3043623)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_tunnels.h
+#	net/ipv4/ip_tunnel.c
+diff --cc include/net/ip_tunnels.h
+index 8d95b01ba42b,7f538ba6e267..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -53,11 -64,18 +61,16 @@@ struct ip_tunnel 
+  	/* These four fields used only by GRE */
+  	__u32		i_seqno;	/* The last seen seqno	*/
+  	__u32		o_seqno;	/* The last output seqno */
+- 	int		hlen;		/* Precalculated header length */
++ 	int		tun_hlen;	/* Precalculated header length */
+  	int		mlink;
+  
+ -	struct ip_tunnel_dst __percpu *dst_cache;
+ -
+  	struct ip_tunnel_parm parms;
+  
++ 	int		encap_hlen;	/* Encap header length (FOU,GUE) */
++ 	struct ip_tunnel_encap encap;
++ 
++ 	int		hlen;		/* tun_hlen + encap_hlen */
++ 
+  	/* for SIT */
+  #ifdef CONFIG_IPV6_SIT_6RD
+  	struct ip_tunnel_6rd_parm ip6rd;
+@@@ -135,6 -145,9 +150,12 @@@ int ip_tunnel_changelink(struct net_dev
+  int ip_tunnel_newlink(struct net_device *dev, struct nlattr *tb[],
+  		      struct ip_tunnel_parm *p);
+  void ip_tunnel_setup(struct net_device *dev, int net_id);
+++<<<<<<< HEAD
+++=======
++ void ip_tunnel_dst_reset_all(struct ip_tunnel *t);
++ int ip_tunnel_encap_setup(struct ip_tunnel *t,
++ 			  struct ip_tunnel_encap *ipencap);
+++>>>>>>> 56328486539d (net: Changes to ip_tunnel to support foo-over-udp encapsulation)
+  
+  /* Extract dsfield from inner protocol */
+  static inline u8 ip_tunnel_get_dsfield(const struct iphdr *iph,
+diff --cc net/ipv4/ip_tunnel.c
+index 9d86734859b5,e3a3dc91e49c..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -593,22 -691,34 +679,42 @@@ void ip_tunnel_xmit(struct sk_buff *skb
+  	tos = tnl_params->tos;
+  	if (tos & 0x1) {
+  		tos &= ~0x1;
+ -		if (skb->protocol == htons(ETH_P_IP)) {
+ +		if (skb->protocol == htons(ETH_P_IP))
+  			tos = inner_iph->tos;
+ -			connected = false;
+ -		} else if (skb->protocol == htons(ETH_P_IPV6)) {
+ +		else if (skb->protocol == htons(ETH_P_IPV6))
+  			tos = ipv6_get_dsfield((const struct ipv6hdr *)inner_iph);
+ -			connected = false;
+ -		}
+  	}
+  
+++<<<<<<< HEAD
+ +	rt = ip_route_output_tunnel(tunnel->net, &fl4,
+ +				    protocol,
+ +				    dst, tnl_params->saddr,
+ +				    tunnel->parms.o_key,
+ +				    RT_TOS(tos),
+ +				    tunnel->parms.link);
+ +	if (IS_ERR(rt)) {
+ +		dev->stats.tx_carrier_errors++;
+ +		goto tx_error;
+++=======
++ 	init_tunnel_flow(&fl4, protocol, dst, tnl_params->saddr,
++ 			 tunnel->parms.o_key, RT_TOS(tos), tunnel->parms.link);
++ 
++ 	if (ip_tunnel_encap(skb, tunnel, &protocol, &fl4) < 0)
++ 		goto tx_error;
++ 
++ 	rt = connected ? tunnel_rtable_get(tunnel, 0, &fl4.saddr) : NULL;
++ 
++ 	if (!rt) {
++ 		rt = ip_route_output_key(tunnel->net, &fl4);
++ 
++ 		if (IS_ERR(rt)) {
++ 			dev->stats.tx_carrier_errors++;
++ 			goto tx_error;
++ 		}
++ 		if (connected)
++ 			tunnel_dst_set(tunnel, &rt->dst, fl4.saddr);
+++>>>>>>> 56328486539d (net: Changes to ip_tunnel to support foo-over-udp encapsulation)
+  	}
+ -
+  	if (rt->dst.dev == dev) {
+  		ip_rt_put(rt);
+  		dev->stats.collisions++;
+* Unmerged path include/net/ip_tunnels.h
+diff --git a/include/uapi/linux/if_tunnel.h b/include/uapi/linux/if_tunnel.h
+index aee73d0611fb..bbe243e7c2ba 100644
+--- a/include/uapi/linux/if_tunnel.h
++++ b/include/uapi/linux/if_tunnel.h
+@@ -53,10 +53,22 @@ enum {
+ 	IFLA_IPTUN_6RD_RELAY_PREFIX,
+ 	IFLA_IPTUN_6RD_PREFIXLEN,
+ 	IFLA_IPTUN_6RD_RELAY_PREFIXLEN,
++	IFLA_IPTUN_ENCAP_TYPE,
++	IFLA_IPTUN_ENCAP_FLAGS,
++	IFLA_IPTUN_ENCAP_SPORT,
++	IFLA_IPTUN_ENCAP_DPORT,
+ 	__IFLA_IPTUN_MAX,
+ };
+ #define IFLA_IPTUN_MAX	(__IFLA_IPTUN_MAX - 1)
+ 
++enum tunnel_encap_types {
++	TUNNEL_ENCAP_NONE,
++	TUNNEL_ENCAP_FOU,
++};
++
++#define TUNNEL_ENCAP_FLAG_CSUM		(1<<0)
++#define TUNNEL_ENCAP_FLAG_CSUM6		(1<<1)
++
+ /* SIT-mode i_flags */
+ #define	SIT_ISATAP	0x0001
+ 
+* Unmerged path net/ipv4/ip_tunnel.c
