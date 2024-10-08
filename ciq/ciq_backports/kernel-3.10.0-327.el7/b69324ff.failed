@@ -1,0 +1,188 @@
+hpsa: refactor and rework support for sending TEST_UNIT_READY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Webb Scales <webbnh@hp.com>
+commit b69324ff93127b1a2042612ff2aa95b42af873a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b69324ff.failed
+
+Factor out the code which sends the TEST_UNIT_READY from
+wait_for_device_to_become_ready() into its own function.
+
+Move the code which waits for the TEST_UNIT_READY from
+wait_for_device_to_become_ready() into its own function.
+
+If a logical drive has failed, resetting it will ensure
+outstanding commands are completed, but polling it with
+TURs after the reset will not work because the TURs will
+never report good status.  So successful TUR should not
+be a condition of success for the device reset error
+handler.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@Suse.de>
+	Signed-off-by: Webb Scales <webbnh@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit b69324ff93127b1a2042612ff2aa95b42af873a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index f57c783f05e4,6e1d5f6f68a9..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -4109,47 -4834,61 +4150,98 @@@ static int hpsa_wait_for_test_unit_read
+  	int rc;
+  	int count = 0;
+  	int waittime = 1; /* seconds */
++ 
++ 	/* Send test unit ready until device ready, or give up. */
++ 	for (count = 0; count < HPSA_TUR_RETRY_LIMIT; count++) {
++ 
++ 		/*
++ 		 * Wait for a bit.  do this first, because if we send
++ 		 * the TUR right away, the reset will just abort it.
++ 		 */
++ 		msleep(1000 * waittime);
++ 
++ 		rc = hpsa_send_test_unit_ready(h, c, lunaddr, reply_queue);
++ 		if (!rc)
++ 			break;
++ 
++ 		/* Increase wait time with each try, up to a point. */
++ 		if (waittime < HPSA_MAX_WAIT_INTERVAL_SECS)
++ 			waittime *= 2;
++ 
++ 		dev_warn(&h->pdev->dev,
++ 			 "waiting %d secs for device to become ready.\n",
++ 			 waittime);
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ static int wait_for_device_to_become_ready(struct ctlr_info *h,
++ 					   unsigned char lunaddr[],
++ 					   int reply_queue)
++ {
++ 	int first_queue;
++ 	int last_queue;
++ 	int rq;
++ 	int rc = 0;
+  	struct CommandList *c;
+  
+ -	c = cmd_alloc(h);
+ +	c = cmd_special_alloc(h);
+ +	if (!c) {
+ +		dev_warn(&h->pdev->dev, "out of memory in "
+ +			"wait_for_device_to_become_ready.\n");
+ +		return IO_ERROR;
+ +	}
+  
+- 	/* Send test unit ready until device ready, or give up. */
+- 	while (count < HPSA_TUR_RETRY_LIMIT) {
++ 	/*
++ 	 * If no specific reply queue was requested, then send the TUR
++ 	 * repeatedly, requesting a reply on each reply queue; otherwise execute
++ 	 * the loop exactly once using only the specified queue.
++ 	 */
++ 	if (reply_queue == DEFAULT_REPLY_QUEUE) {
++ 		first_queue = 0;
++ 		last_queue = h->nreply_queues - 1;
++ 	} else {
++ 		first_queue = reply_queue;
++ 		last_queue = reply_queue;
++ 	}
+  
+++<<<<<<< HEAD
+ +		/* Wait for a bit.  do this first, because if we send
+ +		 * the TUR right away, the reset will just abort it.
+ +		 */
+ +		msleep(1000 * waittime);
+ +		count++;
+ +		rc = 0; /* Device ready. */
+ +
+ +		/* Increase wait time with each try, up to a point. */
+ +		if (waittime < HPSA_MAX_WAIT_INTERVAL_SECS)
+ +			waittime = waittime * 2;
+ +
+ +		/* Send the Test Unit Ready, fill_cmd can't fail, no mapping */
+ +		(void) fill_cmd(c, TEST_UNIT_READY, h,
+ +				NULL, 0, 0, lunaddr, TYPE_CMD);
+ +		hpsa_scsi_do_simple_cmd_core(h, c);
+ +		/* no unmap needed here because no data xfer. */
+ +
+ +		if (c->err_info->CommandStatus == CMD_SUCCESS)
+ +			break;
+ +
+ +		if (c->err_info->CommandStatus == CMD_TARGET_STATUS &&
+ +			c->err_info->ScsiStatus == SAM_STAT_CHECK_CONDITION &&
+ +			(c->err_info->SenseInfo[2] == NO_SENSE ||
+ +			c->err_info->SenseInfo[2] == UNIT_ATTENTION))
+ +			break;
+ +
+ +		dev_warn(&h->pdev->dev, "waiting %d secs "
+ +			"for device to become ready.\n", waittime);
+ +		rc = 1; /* device not ready. */
+++=======
++ 	for (rq = first_queue; rq <= last_queue; rq++) {
++ 		rc = hpsa_wait_for_test_unit_ready(h, c, lunaddr, rq);
++ 		if (rc)
++ 			break;
+++>>>>>>> b69324ff9312 (hpsa: refactor and rework support for sending TEST_UNIT_READY)
+  	}
+  
+  	if (rc)
+@@@ -4184,14 -4923,36 +4276,20 @@@ static int hpsa_eh_device_reset_handler
+  			"device lookup failed.\n");
+  		return FAILED;
+  	}
+ -
+ -	/* if controller locked up, we can guarantee command won't complete */
+ -	if (lockup_detected(h)) {
+ -		dev_warn(&h->pdev->dev,
+ -			"scsi %d:%d:%d:%d RESET FAILED, lockup detected\n",
+ -			h->scsi_host->host_no, dev->bus, dev->target,
+ -			dev->lun);
+ -		return FAILED;
+ -	}
+ -
+ -	/* this reset request might be the result of a lockup; check */
+ -	if (detect_controller_lockup(h)) {
+ -		dev_warn(&h->pdev->dev,
+ -			 "scsi %d:%d:%d:%d RESET FAILED, new lockup detected\n",
+ -			 h->scsi_host->host_no, dev->bus, dev->target,
+ -			 dev->lun);
+ -		return FAILED;
+ -	}
+ -
+ -	hpsa_show_dev_msg(KERN_WARNING, h, dev, "resetting");
+ -
+ +	dev_warn(&h->pdev->dev, "resetting device %d:%d:%d:%d\n",
+ +		h->scsi_host->host_no, dev->bus, dev->target, dev->lun);
+  	/* send a reset to the SCSI LUN which the command was sent to */
+++<<<<<<< HEAD
+ +	rc = hpsa_send_reset(h, dev->scsi3addr, HPSA_RESET_TYPE_LUN);
+ +	if (rc == 0 && wait_for_device_to_become_ready(h, dev->scsi3addr) == 0)
+++=======
++ 	rc = hpsa_send_reset(h, dev->scsi3addr, HPSA_RESET_TYPE_LUN,
++ 			     DEFAULT_REPLY_QUEUE);
++ 	if (rc == 0)
+++>>>>>>> b69324ff9312 (hpsa: refactor and rework support for sending TEST_UNIT_READY)
+  		return SUCCESS;
+  
+ -	dev_warn(&h->pdev->dev,
+ -		"scsi %d:%d:%d:%d reset failed\n",
+ -		h->scsi_host->host_no, dev->bus, dev->target, dev->lun);
+ +	dev_warn(&h->pdev->dev, "resetting device failed.\n");
+  	return FAILED;
+  }
+  
+* Unmerged path drivers/scsi/hpsa.c
