@@ -1,0 +1,208 @@
+x86/asm/tsc: Inline native_read_tsc() and remove __native_read_tsc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] tsc: Inline native_read_tsc() and remove __native_read_tsc() (Prarit Bhargava) [1302325]
+Rebuild_FUZZ: 93.75%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit c6e5ca35c4685cd920b1d5279dbc9f4483d7dfd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c6e5ca35.failed
+
+In the following commit:
+
+  cdc7957d1954 ("x86: move native_read_tsc() offline")
+
+... native_read_tsc() was moved out of line, presumably for some
+now-obsolete vDSO-related reason. Undo it.
+
+The entire rdtsc, shl, or sequence is only 11 bytes, and calls
+via rdtscl() and similar helpers were already inlined.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Huang Rui <ray.huang@amd.com>
+	Cc: John Stultz <john.stultz@linaro.org>
+	Cc: Len Brown <lenb@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Ralf Baechle <ralf@linux-mips.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: kvm ML <kvm@vger.kernel.org>
+Link: http://lkml.kernel.org/r/d05ffe2aaf8468ca475ebc00efad7b2fa174af19.1434501121.git.luto@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit c6e5ca35c4685cd920b1d5279dbc9f4483d7dfd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/vdso/vclock_gettime.c
+diff --cc arch/x86/vdso/vclock_gettime.c
+index 72074d528400,972b488ac16a..000000000000
+--- a/arch/x86/vdso/vclock_gettime.c
++++ b/arch/x86/vdso/vclock_gettime.c
+@@@ -150,6 -162,48 +150,51 @@@ notrace static long vdso_fallback_gtod(
+  	return ret;
+  }
+  
+++<<<<<<< HEAD:arch/x86/vdso/vclock_gettime.c
+++=======
++ #ifdef CONFIG_PARAVIRT_CLOCK
++ 
++ static notrace cycle_t vread_pvclock(int *mode)
++ {
++ 	*mode = VCLOCK_NONE;
++ 	return 0;
++ }
++ #endif
++ 
++ #endif
++ 
++ notrace static cycle_t vread_tsc(void)
++ {
++ 	cycle_t ret;
++ 	u64 last;
++ 
++ 	/*
++ 	 * Empirically, a fence (of type that depends on the CPU)
++ 	 * before rdtsc is enough to ensure that rdtsc is ordered
++ 	 * with respect to loads.  The various CPU manuals are unclear
++ 	 * as to whether rdtsc can be reordered with later loads,
++ 	 * but no one has ever seen it happen.
++ 	 */
++ 	rdtsc_barrier();
++ 	ret = (cycle_t)native_read_tsc();
++ 
++ 	last = gtod->cycle_last;
++ 
++ 	if (likely(ret >= last))
++ 		return ret;
++ 
++ 	/*
++ 	 * GCC likes to generate cmov here, but this branch is extremely
++ 	 * predictable (it's just a funciton of time and the likely is
++ 	 * very likely) and there's a data dependence, so force GCC
++ 	 * to generate a branch instead.  I don't barrier() because
++ 	 * we don't actually need a barrier, and if this function
++ 	 * ever gets inlined it will generate worse code.
++ 	 */
++ 	asm volatile ("");
++ 	return last;
++ }
+++>>>>>>> c6e5ca35c468 (x86/asm/tsc: Inline native_read_tsc() and remove __native_read_tsc()):arch/x86/entry/vdso/vclock_gettime.c
+  
+  notrace static inline u64 vgetsns(int *mode)
+  {
+diff --git a/arch/x86/include/asm/msr.h b/arch/x86/include/asm/msr.h
+index de36f22eb0b9..1445d1990eb6 100644
+--- a/arch/x86/include/asm/msr.h
++++ b/arch/x86/include/asm/msr.h
+@@ -105,12 +105,10 @@ notrace static inline int native_write_msr_safe(unsigned int msr,
+ 	return err;
+ }
+ 
+-extern unsigned long long native_read_tsc(void);
+-
+ extern int rdmsr_safe_regs(u32 regs[8]);
+ extern int wrmsr_safe_regs(u32 regs[8]);
+ 
+-static __always_inline unsigned long long __native_read_tsc(void)
++static __always_inline unsigned long long native_read_tsc(void)
+ {
+ 	DECLARE_ARGS(val, low, high);
+ 
+@@ -180,10 +178,10 @@ static inline int rdmsrl_safe(unsigned msr, unsigned long long *p)
+ }
+ 
+ #define rdtscl(low)						\
+-	((low) = (u32)__native_read_tsc())
++	((low) = (u32)native_read_tsc())
+ 
+ #define rdtscll(val)						\
+-	((val) = __native_read_tsc())
++	((val) = native_read_tsc())
+ 
+ #define rdpmc(counter, low, high)			\
+ do {							\
+diff --git a/arch/x86/include/asm/pvclock.h b/arch/x86/include/asm/pvclock.h
+index 628954ceede1..2bd69d62c623 100644
+--- a/arch/x86/include/asm/pvclock.h
++++ b/arch/x86/include/asm/pvclock.h
+@@ -62,7 +62,7 @@ static inline u64 pvclock_scale_delta(u64 delta, u32 mul_frac, int shift)
+ static __always_inline
+ u64 pvclock_get_nsec_offset(const struct pvclock_vcpu_time_info *src)
+ {
+-	u64 delta = __native_read_tsc() - src->tsc_timestamp;
++	u64 delta = native_read_tsc() - src->tsc_timestamp;
+ 	return pvclock_scale_delta(delta, src->tsc_to_system_mul,
+ 				   src->tsc_shift);
+ }
+diff --git a/arch/x86/include/asm/stackprotector.h b/arch/x86/include/asm/stackprotector.h
+index 6a998598f172..9b37878488e4 100644
+--- a/arch/x86/include/asm/stackprotector.h
++++ b/arch/x86/include/asm/stackprotector.h
+@@ -70,7 +70,7 @@ static __always_inline void boot_init_stack_canary(void)
+ 	 * on during the bootup the random pool has true entropy too.
+ 	 */
+ 	get_random_bytes(&canary, sizeof(canary));
+-	tsc = __native_read_tsc();
++	tsc = native_read_tsc();
+ 	canary += tsc + (tsc << 32UL);
+ 
+ 	current->stack_canary = canary;
+diff --git a/arch/x86/include/asm/tsc.h b/arch/x86/include/asm/tsc.h
+index 235be70d5bb4..1aade16b2171 100644
+--- a/arch/x86/include/asm/tsc.h
++++ b/arch/x86/include/asm/tsc.h
+@@ -42,7 +42,7 @@ static __always_inline cycles_t vget_cycles(void)
+ 	if (!cpu_has_tsc)
+ 		return 0;
+ #endif
+-	return (cycles_t)__native_read_tsc();
++	return (cycles_t)native_read_tsc();
+ }
+ 
+ extern void tsc_init(void);
+diff --git a/arch/x86/kernel/apb_timer.c b/arch/x86/kernel/apb_timer.c
+index c9876efecafb..79141cba6aaa 100644
+--- a/arch/x86/kernel/apb_timer.c
++++ b/arch/x86/kernel/apb_timer.c
+@@ -404,13 +404,13 @@ unsigned long apbt_quick_calibrate(void)
+ 	old = dw_apb_clocksource_read(clocksource_apbt);
+ 	old += loop;
+ 
+-	t1 = __native_read_tsc();
++	t1 = native_read_tsc();
+ 
+ 	do {
+ 		new = dw_apb_clocksource_read(clocksource_apbt);
+ 	} while (new < old);
+ 
+-	t2 = __native_read_tsc();
++	t2 = native_read_tsc();
+ 
+ 	shift = 5;
+ 	if (unlikely(loop >> shift == 0)) {
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index 629006c0f4fe..69f521adbdb9 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -80,12 +80,6 @@ unsigned long long
+ sched_clock(void) __attribute__((alias("native_sched_clock")));
+ #endif
+ 
+-unsigned long long native_read_tsc(void)
+-{
+-	return __native_read_tsc();
+-}
+-EXPORT_SYMBOL(native_read_tsc);
+-
+ int check_tsc_unstable(void)
+ {
+ 	return tsc_unstable;
+* Unmerged path arch/x86/vdso/vclock_gettime.c
