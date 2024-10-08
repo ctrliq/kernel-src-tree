@@ -1,0 +1,333 @@
+gfs2: change gfs2 readdir cookie
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Benjamin Marzinski <bmarzins@redhat.com>
+commit 471f3db2786bc32011d6693413eb93b0c3da2579
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/471f3db2.failed
+
+gfs2 currently returns 31 bits of filename hash as a cookie that readdir
+uses for an offset into the directory.  When there are a large number of
+directory entries, the likelihood of a collision goes up way too
+quickly.  GFS2 will now return cookies that are guaranteed unique for a
+while, and then fail back to using 30 bits of filename hash.
+Specifically, the directory leaf blocks are divided up into chunks based
+on the minimum size of a gfs2 directory entry (48 bytes). Each entry's
+cookie is based off the chunk where it starts, in the linked list of
+leaf blocks that it hashes to (there are 131072 hash buckets). Directory
+entries will have unique names until they take reach chunk 8192.
+Assuming the largest filenames possible, and the least efficient spacing
+possible, this new method will still be able to return unique names when
+the previous method has statistically more than a 99% chance of a
+collision.  The non-unique names it fails back to are guaranteed to not
+collide with the unique names.
+
+unique cookies will be in this format:
+- 1 bit "0" to make sure the the returned cookie is positive
+- 17 bits for the hash table index
+- 1 bit for the mode "0"
+- 13 bits for the offset
+
+non-unique cookies will be in this format:
+- 1 bit "0" to make sure the the returned cookie is positive
+- 17 bits for the hash table index
+- 1 bit for the mode "1"
+- 13 more bits of the name hash
+
+Another benefit of location based cookies, is that once a directory's
+exhash table is fully extended (so that multiple hash table indexs do
+not use the same leaf blocks), gfs2 can skip sorting the directory
+entries until it reaches the non-unique ones, and then it only needs to
+sort these. This provides a significant speed up for directory reads of
+very large directories.
+
+The only issue is that for these cookies to continue to point to the
+correct entry as files are added and removed from the directory, gfs2
+must keep the entries at the same offset in the leaf block when they are
+split (see my previous patch). This means that until all the nodes in a
+cluster are running with code that will split the directory leaf blocks
+this way, none of the nodes can use the new cookie code. To deal with
+this, gfs2 now has the mount option loccookie, which, if set, will make
+it return these new location based cookies.  This option must not be set
+until all nodes in the cluster are at least running this version of the
+kernel code, and you have guaranteed that there are no outstanding
+cookies required by other software, such as NFS.
+
+gfs2 uses some of the extra space at the end of the gfs2_dirent
+structure to store the calculated readdir cookies. This keeps us from
+needing to allocate a seperate array to hold these values.  gfs2
+recomputes the cookie stored in de_cookie for every readdir call.  The
+time it takes to do so is small, and if gfs2 expected this value to be
+saved on disk, the new code wouldn't work correctly on filesystems
+created with an earlier version of gfs2.
+
+One issue with adding de_cookie to the union in the gfs2_dirent
+structure is that it caused the union to align itself to a 4 byte
+boundary, instead of its previous 2 byte boundary. This changed the
+offset of de_rahead. To solve that, I pulled de_rahead out of the union,
+since it does not need to be there.
+
+	Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 471f3db2786bc32011d6693413eb93b0c3da2579)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/dir.c
+#	fs/gfs2/super.c
+#	include/uapi/linux/gfs2_ondisk.h
+diff --cc fs/gfs2/dir.c
+index 68c8b73800ed,6a92592304fb..000000000000
+--- a/fs/gfs2/dir.c
++++ b/fs/gfs2/dir.c
+@@@ -1267,25 -1262,24 +1269,32 @@@ static int compare_dents(const void *a
+   * the possibility that they will fall into different readdir buffers or
+   * that someone will want to seek to that location.
+   *
+ - * Returns: errno, >0 if the actor tells you to stop
+ + * Returns: errno, >0 on exception from filldir
+   */
+  
+++<<<<<<< HEAD
+ +static int do_filldir_main(struct gfs2_inode *dip, u64 *offset,
+ +			   void *opaque, filldir_t filldir,
+ +			   const struct gfs2_dirent **darr, u32 entries,
+ +			   int *copied)
+++=======
++ static int do_filldir_main(struct gfs2_inode *dip, struct dir_context *ctx,
++ 			   struct gfs2_dirent **darr, u32 entries,
++ 			   u32 sort_start, int *copied)
+++>>>>>>> 471f3db2786b (gfs2: change gfs2 readdir cookie)
+  {
+  	const struct gfs2_dirent *dent, *dent_next;
+  	u64 off, off_next;
+  	unsigned int x, y;
+  	int run = 0;
+ +	int error = 0;
+  
+- 	sort(darr, entries, sizeof(struct gfs2_dirent *), compare_dents, NULL);
++ 	if (sort_start < entries)
++ 		sort(&darr[sort_start], entries - sort_start,
++ 		     sizeof(struct gfs2_dirent *), compare_dents, NULL);
+  
+  	dent_next = darr[0];
+- 	off_next = be32_to_cpu(dent_next->de_hash);
+- 	off_next = gfs2_disk_hash2offset(off_next);
++ 	off_next = dent_next->de_cookie;
+  
+  	for (x = 0, y = 1; x < entries; x++, y++) {
+  		dent = dent_next;
+@@@ -1293,12 -1287,11 +1302,11 @@@
+  
+  		if (y < entries) {
+  			dent_next = darr[y];
+- 			off_next = be32_to_cpu(dent_next->de_hash);
+- 			off_next = gfs2_disk_hash2offset(off_next);
++ 			off_next = dent_next->de_cookie;
+  
+ -			if (off < ctx->pos)
+ +			if (off < *offset)
+  				continue;
+ -			ctx->pos = off;
+ +			*offset = off;
+  
+  			if (off_next == off) {
+  				if (*copied && !run)
+@@@ -1342,16 -1334,42 +1350,55 @@@ static void *gfs2_alloc_sort_buffer(uns
+  	return ptr;
+  }
+  
+++<<<<<<< HEAD
+ +static void gfs2_free_sort_buffer(void *ptr)
+ +{
+ +	if (is_vmalloc_addr(ptr))
+ +		vfree(ptr);
+ +	else
+ +		kfree(ptr);
+ +}
+ +
+ +static int gfs2_dir_read_leaf(struct inode *inode, u64 *offset, void *opaque,
+ +			      filldir_t filldir, int *copied, unsigned *depth,
+++=======
++ 
++ static int gfs2_set_cookies(struct gfs2_sbd *sdp, struct buffer_head *bh,
++ 			    unsigned leaf_nr, struct gfs2_dirent **darr,
++ 			    unsigned entries)
++ {
++ 	int sort_id = -1;
++ 	int i;
++ 	
++ 	for (i = 0; i < entries; i++) {
++ 		unsigned offset;
++ 
++ 		darr[i]->de_cookie = be32_to_cpu(darr[i]->de_hash);
++ 		darr[i]->de_cookie = gfs2_disk_hash2offset(darr[i]->de_cookie);
++ 
++ 		if (!sdp->sd_args.ar_loccookie)
++ 			continue;
++ 		offset = (char *)(darr[i]) -
++ 			 (bh->b_data + gfs2_dirent_offset(bh->b_data));
++ 		offset /= GFS2_MIN_DIRENT_SIZE;
++ 		offset += leaf_nr * sdp->sd_max_dents_per_leaf;
++ 		if (offset >= GFS2_USE_HASH_FLAG ||
++ 		    leaf_nr >= GFS2_USE_HASH_FLAG) {
++ 			darr[i]->de_cookie |= GFS2_USE_HASH_FLAG;
++ 			if (sort_id < 0)
++ 				sort_id = i;
++ 			continue;
++ 		}
++ 		darr[i]->de_cookie &= GFS2_HASH_INDEX_MASK;
++ 		darr[i]->de_cookie |= offset;
++ 	}
++ 	return sort_id;
++ }	
++ 
++ 
++ static int gfs2_dir_read_leaf(struct inode *inode, struct dir_context *ctx,
++ 			      int *copied, unsigned *depth,
+++>>>>>>> 471f3db2786b (gfs2: change gfs2 readdir cookie)
+  			      u64 leaf_no)
+  {
+  	struct gfs2_inode *ip = GFS2_I(inode);
+@@@ -1429,12 -1459,13 +1488,22 @@@
+  	} while(lfn);
+  
+  	BUG_ON(entries2 != entries);
+++<<<<<<< HEAD
+ +	error = do_filldir_main(ip, offset, opaque, filldir, darr,
+ +				entries, copied);
+ +out_free:
+ +	for(i = 0; i < leaf; i++)
+ +		brelse(larr[i]);
+ +	gfs2_free_sort_buffer(larr);
+++=======
++ 	error = do_filldir_main(ip, ctx, darr, entries, need_sort ?
++ 				sort_offset : entries, copied);
++ out_free:
++ 	for(i = 0; i < leaf; i++)
++ 		if (larr[i])
++ 			brelse(larr[i]);
++ 	kvfree(larr);
+++>>>>>>> 471f3db2786b (gfs2: change gfs2 readdir cookie)
+  out:
+  	return error;
+  }
+@@@ -1582,8 -1611,9 +1651,14 @@@ int gfs2_dir_read(struct inode *inode, 
+  			error = -EIO;
+  			goto out;
+  		}
+++<<<<<<< HEAD
+ +		error = do_filldir_main(dip, offset, opaque, filldir, darr,
+ +					dip->i_entries, &copied);
+++=======
++ 		gfs2_set_cookies(sdp, dibh, 0, darr, dip->i_entries);
++ 		error = do_filldir_main(dip, ctx, darr,
++ 					dip->i_entries, 0, &copied);
+++>>>>>>> 471f3db2786b (gfs2: change gfs2 readdir cookie)
+  out:
+  		kfree(darr);
+  	}
+diff --cc fs/gfs2/super.c
+index 7c8f12885717,0f3d64606e93..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -277,9 -282,15 +281,15 @@@ int gfs2_mount_args(struct gfs2_args *a
+  		case Opt_norgrplvb:
+  			args->ar_rgrplvb = 0;
+  			break;
++ 		case Opt_loccookie:
++ 			args->ar_loccookie = 1;
++ 			break;
++ 		case Opt_noloccookie:
++ 			args->ar_loccookie = 0;
++ 			break;
+  		case Opt_error:
+  		default:
+ -			pr_warn("invalid mount option: %s\n", o);
+ +			printk(KERN_WARNING "GFS2: invalid mount option: %s\n", o);
+  			return -EINVAL;
+  		}
+  	}
+@@@ -1371,11 -1423,13 +1381,17 @@@ static int gfs2_show_options(struct seq
+  		seq_printf(s, ",errors=%s", state);
+  	}
+  	if (test_bit(SDF_NOBARRIERS, &sdp->sd_flags))
+ -		seq_puts(s, ",nobarrier");
+ +		seq_printf(s, ",nobarrier");
+  	if (test_bit(SDF_DEMOTE, &sdp->sd_flags))
+ -		seq_puts(s, ",demote_interface_used");
+ +		seq_printf(s, ",demote_interface_used");
+  	if (args->ar_rgrplvb)
+++<<<<<<< HEAD
+ +		seq_printf(s, ",rgrplvb");
+++=======
++ 		seq_puts(s, ",rgrplvb");
++ 	if (args->ar_loccookie)
++ 		seq_puts(s, ",loccookie");
+++>>>>>>> 471f3db2786b (gfs2: change gfs2 readdir cookie)
+  	return 0;
+  }
+  
+diff --cc include/uapi/linux/gfs2_ondisk.h
+index 3657f62142d9,7c4be7711c81..000000000000
+--- a/include/uapi/linux/gfs2_ondisk.h
++++ b/include/uapi/linux/gfs2_ondisk.h
+@@@ -304,7 -306,14 +306,18 @@@ struct gfs2_dirent 
+  	__be16 de_rec_len;
+  	__be16 de_name_len;
+  	__be16 de_type;
+++<<<<<<< HEAD
+ +	__u8 __pad[14];
+++=======
++ 	__be16 de_rahead;
++ 	union {
++ 		__u8 __pad[12];
++ 		struct {
++ 			__u32 de_cookie; /* ondisk value not used */
++ 			__u8 pad3[8];
++ 		};
++ 	};
+++>>>>>>> 471f3db2786b (gfs2: change gfs2 readdir cookie)
+  };
+  
+  /*
+* Unmerged path fs/gfs2/dir.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 2caf75dc0244..64b0fe7d207f 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -539,6 +539,8 @@ struct gfs2_args {
+ 	unsigned int ar_errors:2;               /* errors=withdraw | panic */
+ 	unsigned int ar_nobarrier:1;            /* do not send barriers */
+ 	unsigned int ar_rgrplvb:1;		/* use lvbs for rgrp info */
++	unsigned int ar_loccookie:1;		/* use location based readdir
++						   cookies */
+ 	int ar_commit;				/* Commit interval */
+ 	int ar_statfs_quantum;			/* The fast statfs interval */
+ 	int ar_quota_quantum;			/* The quota interval */
+@@ -660,6 +662,7 @@ struct gfs2_sbd {
+ 	u64 sd_heightsize[GFS2_MAX_META_HEIGHT + 1];
+ 	u32 sd_max_jheight; /* Max height of journaled file's meta tree */
+ 	u64 sd_jheightsize[GFS2_MAX_META_HEIGHT + 1];
++	u32 sd_max_dents_per_leaf; /* Max number of dirents in a leaf block */
+ 
+ 	struct gfs2_args sd_args;	/* Mount arguments */
+ 	struct gfs2_tune sd_tune;	/* Filesystem tuning structure */
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 902da6b6e2b5..14525d19e2a5 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -336,6 +336,9 @@ static int gfs2_read_sb(struct gfs2_sbd *sdp, int silent)
+ 	sdp->sd_jheightsize[x] = ~0;
+ 	gfs2_assert(sdp, sdp->sd_max_jheight <= GFS2_MAX_META_HEIGHT);
+ 
++	sdp->sd_max_dents_per_leaf = (sdp->sd_sb.sb_bsize -
++				      sizeof(struct gfs2_leaf)) /
++				     GFS2_MIN_DIRENT_SIZE;
+ 	return 0;
+ }
+ 
+* Unmerged path fs/gfs2/super.c
+* Unmerged path include/uapi/linux/gfs2_ondisk.h
