@@ -1,0 +1,145 @@
+IB/qib: Insure last cursor is updated prior to complete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit ee84541ad11e70d372670160e727680051801517
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ee84541a.failed
+
+This patch is a prerequisite for adding a separate lock
+for post send.
+
+The timing of updating s_last needs to be before returning
+any send completion to avoid a race between a poll cq seeing
+a completion and the post send checking for a full queue.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ee84541ad11e70d372670160e727680051801517)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qib/qib_rc.c
+diff --cc drivers/infiniband/hw/qib/qib_rc.c
+index c23ede5294da,ce886b2ade74..000000000000
+--- a/drivers/infiniband/hw/qib/qib_rc.c
++++ b/drivers/infiniband/hw/qib/qib_rc.c
+@@@ -1006,17 -1008,25 +1006,29 @@@ void qib_rc_send_complete(struct qib_q
+  		start_timer(qp);
+  
+  	while (qp->s_last != qp->s_acked) {
+++<<<<<<< HEAD
+ +		wqe = get_swqe_ptr(qp, qp->s_last);
+++=======
++ 		u32 s_last;
++ 
++ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+++>>>>>>> ee84541ad11e (IB/qib: Insure last cursor is updated prior to complete)
+  		if (qib_cmp24(wqe->lpsn, qp->s_sending_psn) >= 0 &&
+  		    qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) <= 0)
+  			break;
++ 		s_last = qp->s_last;
++ 		if (++s_last >= qp->s_size)
++ 			s_last = 0;
++ 		qp->s_last = s_last;
++ 		/* see post_send() */
++ 		barrier();
+  		for (i = 0; i < wqe->wr.num_sge; i++) {
+ -			struct rvt_sge *sge = &wqe->sg_list[i];
+ +			struct qib_sge *sge = &wqe->sg_list[i];
+  
+ -			rvt_put_mr(sge->mr);
+ +			qib_put_mr(sge->mr);
+  		}
+  		/* Post a send completion queue entry if requested. */
+ -		if (!(qp->s_flags & RVT_S_SIGNAL_REQ_WR) ||
+ +		if (!(qp->s_flags & QIB_S_SIGNAL_REQ_WR) ||
+  		    (wqe->wr.send_flags & IB_SEND_SIGNALED)) {
+  			memset(&wc, 0, sizeof(wc));
+  			wc.wr_id = wqe->wr.wr_id;
+@@@ -1024,10 -1034,8 +1036,8 @@@
+  			wc.opcode = ib_qib_wc_opcode[wqe->wr.opcode];
+  			wc.byte_len = wqe->length;
+  			wc.qp = &qp->ibqp;
+ -			rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.send_cq), &wc, 0);
+ +			qib_cq_enter(to_icq(qp->ibqp.send_cq), &wc, 0);
+  		}
+- 		if (++qp->s_last >= qp->s_size)
+- 			qp->s_last = 0;
+  	}
+  	/*
+  	 * If we were waiting for sends to complete before resending,
+@@@ -1066,13 -1074,21 +1076,21 @@@ static struct qib_swqe *do_rc_completio
+  	 */
+  	if (qib_cmp24(wqe->lpsn, qp->s_sending_psn) < 0 ||
+  	    qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) > 0) {
++ 		u32 s_last;
++ 
+  		for (i = 0; i < wqe->wr.num_sge; i++) {
+ -			struct rvt_sge *sge = &wqe->sg_list[i];
+ +			struct qib_sge *sge = &wqe->sg_list[i];
+  
+ -			rvt_put_mr(sge->mr);
+ +			qib_put_mr(sge->mr);
+  		}
++ 		s_last = qp->s_last;
++ 		if (++s_last >= qp->s_size)
++ 			s_last = 0;
++ 		qp->s_last = s_last;
++ 		/* see post_send() */
++ 		barrier();
+  		/* Post a send completion queue entry if requested. */
+ -		if (!(qp->s_flags & RVT_S_SIGNAL_REQ_WR) ||
+ +		if (!(qp->s_flags & QIB_S_SIGNAL_REQ_WR) ||
+  		    (wqe->wr.send_flags & IB_SEND_SIGNALED)) {
+  			memset(&wc, 0, sizeof(wc));
+  			wc.wr_id = wqe->wr.wr_id;
+@@@ -1080,12 -1096,10 +1098,10 @@@
+  			wc.opcode = ib_qib_wc_opcode[wqe->wr.opcode];
+  			wc.byte_len = wqe->length;
+  			wc.qp = &qp->ibqp;
+ -			rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.send_cq), &wc, 0);
+ +			qib_cq_enter(to_icq(qp->ibqp.send_cq), &wc, 0);
+  		}
+- 		if (++qp->s_last >= qp->s_size)
+- 			qp->s_last = 0;
+  	} else
+ -		this_cpu_inc(*ibp->rvp.rc_delayed_comp);
+ +		ibp->n_rc_delayed_comp++;
+  
+  	qp->s_retry = qp->s_retry_cnt;
+  	update_last_psn(qp, wqe->lpsn);
+* Unmerged path drivers/infiniband/hw/qib/qib_rc.c
+diff --git a/drivers/infiniband/hw/qib/qib_ruc.c b/drivers/infiniband/hw/qib/qib_ruc.c
+index e9132f7a68b0..d544a53ced0d 100644
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@ -781,6 +781,13 @@ void qib_send_complete(struct qib_qp *qp, struct qib_swqe *wqe,
+ 	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_OR_FLUSH_SEND))
+ 		return;
+ 
++	last = qp->s_last;
++	old_last = last;
++	if (++last >= qp->s_size)
++		last = 0;
++	qp->s_last = last;
++	/* See post_send() */
++	barrier();
+ 	for (i = 0; i < wqe->wr.num_sge; i++) {
+ 		struct qib_sge *sge = &wqe->sg_list[i];
+ 
+@@ -808,11 +815,6 @@ void qib_send_complete(struct qib_qp *qp, struct qib_swqe *wqe,
+ 			     status != IB_WC_SUCCESS);
+ 	}
+ 
+-	last = qp->s_last;
+-	old_last = last;
+-	if (++last >= qp->s_size)
+-		last = 0;
+-	qp->s_last = last;
+ 	if (qp->s_acked == old_last)
+ 		qp->s_acked = last;
+ 	if (qp->s_cur == old_last)
