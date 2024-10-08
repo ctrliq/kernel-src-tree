@@ -1,0 +1,721 @@
+NVMe: Metadata format support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit e1e5e5641e6f271321aec257ed26a72715e4a8c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e1e5e564.failed
+
+Adds support for NVMe metadata formats and exposes block devices for
+all namespaces regardless of their format. Namespace formats that are
+unusable will have disk capacity set to 0, but a handle to the block
+device is created to simplify device management. A namespace is not
+usable when the format requires host interleave block and metadata in
+single buffer, has no provisioned storage, or has better data but failed
+to register with blk integrity.
+
+The namespace has to be scanned in two phases to support separate
+metadata formats. The first establishes the sector size and capacity
+prior to invoking add_disk. If metadata is required, the capacity will
+be temporarilly set to 0 until it can be revalidated and registered with
+the integrity extenstions after add_disk completes.
+
+The driver relies on the integrity extensions to provide the metadata
+buffer. NVMe requires this be a single physically contiguous region,
+so only one integrity segment is allowed per command. If the metadata
+is used for T10 PI, the driver provides mappings to save and restore
+the reftag physical block translation. The driver provides no-op
+functions for generate and verify if metadata is not used for protection
+information. This way the setup is always provided by the block layer.
+
+If a request does not supply a required metadata buffer, the command
+is failed with bad address. This could only happen if a user manually
+disables verify/generate on such a disk. The only exception to where
+this is okay is if the controller is capable of stripping/generating
+the metadata, which is possible on some types of formats.
+
+The metadata scatter gather list now occupies the spot in the nvme_iod
+that used to be used to link retryable IOD's, but we don't do that
+anymore, so the field was unused.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+(cherry picked from commit e1e5e5641e6f271321aec257ed26a72715e4a8c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	include/linux/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 29d2b5fb1975,3ffa57a932ea..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -455,31 -483,101 +456,112 @@@ static int nvme_error_status(u16 status
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void bio_completion(struct nvme_queue *nvmeq, void *ctx,
+++=======
++ static void nvme_dif_prep(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ 	if (be32_to_cpu(pi->ref_tag) == v)
++ 		pi->ref_tag = cpu_to_be32(p);
++ }
++ 
++ static void nvme_dif_complete(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ 	if (be32_to_cpu(pi->ref_tag) == p)
++ 		pi->ref_tag = cpu_to_be32(v);
++ }
++ 
++ /**
++  * nvme_dif_remap - remaps ref tags to bip seed and physical lba
++  *
++  * The virtual start sector is the one that was originally submitted by the
++  * block layer.	Due to partitioning, MD/DM cloning, etc. the actual physical
++  * start sector may be different. Remap protection information to match the
++  * physical LBA on writes, and back to the original seed on reads.
++  *
++  * Type 0 and 3 do not have a ref tag, so no remapping required.
++  */
++ static void nvme_dif_remap(struct request *req,
++ 			void (*dif_swap)(u32 p, u32 v, struct t10_pi_tuple *pi))
++ {
++ 	struct nvme_ns *ns = req->rq_disk->private_data;
++ 	struct bio_integrity_payload *bip;
++ 	struct t10_pi_tuple *pi;
++ 	void *p, *pmap;
++ 	u32 i, nlb, ts, phys, virt;
++ 
++ 	if (!ns->pi_type || ns->pi_type == NVME_NS_DPS_PI_TYPE3)
++ 		return;
++ 
++ 	bip = bio_integrity(req->bio);
++ 	if (!bip)
++ 		return;
++ 
++ 	pmap = kmap_atomic(bip->bip_vec->bv_page) + bip->bip_vec->bv_offset;
++ 	if (!pmap)
++ 		return;
++ 
++ 	p = pmap;
++ 	virt = bip_get_seed(bip);
++ 	phys = nvme_block_nr(ns, blk_rq_pos(req));
++ 	nlb = (blk_rq_bytes(req) >> ns->lba_shift);
++ 	ts = ns->disk->integrity->tuple_size;
++ 
++ 	for (i = 0; i < nlb; i++, virt++, phys++) {
++ 		pi = (struct t10_pi_tuple *)p;
++ 		dif_swap(phys, virt, pi);
++ 		p += ts;
++ 	}
++ 	kunmap_atomic(pmap);
++ }
++ 
++ static void req_completion(struct nvme_queue *nvmeq, void *ctx,
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  						struct nvme_completion *cqe)
+  {
+  	struct nvme_iod *iod = ctx;
+ -	struct request *req = iod_get_private(iod);
+ -	struct nvme_cmd_info *cmd_rq = blk_mq_rq_to_pdu(req);
+ -
+ +	struct bio *bio = iod->private;
+  	u16 status = le16_to_cpup(&cqe->status) >> 1;
+ +	int error = 0;
+  
+  	if (unlikely(status)) {
+ -		if (!(status & NVME_SC_DNR || blk_noretry_request(req))
+ -		    && (jiffies - req->start_time) < req->timeout) {
+ -			unsigned long flags;
+ -
+ -			blk_mq_requeue_request(req);
+ -			spin_lock_irqsave(req->q->queue_lock, flags);
+ -			if (!blk_queue_stopped(req->q))
+ -				blk_mq_kick_requeue_list(req->q);
+ -			spin_unlock_irqrestore(req->q->queue_lock, flags);
+ +		if (!(status & NVME_SC_DNR ||
+ +				bio->bi_rw & REQ_FAILFAST_MASK) &&
+ +				(jiffies - iod->start_time) < IOD_TIMEOUT) {
+ +			if (!waitqueue_active(&nvmeq->sq_full))
+ +				add_wait_queue(&nvmeq->sq_full,
+ +							&nvmeq->sq_cong_wait);
+ +			list_add_tail(&iod->node, &nvmeq->iod_bio);
+ +			wake_up(&nvmeq->sq_full);
+  			return;
+  		}
+++<<<<<<< HEAD
+ +		error = nvme_error_status(status);
+ +	}
+ +	if (iod->nents) {
+ +		dma_unmap_sg(nvmeq->q_dmadev, iod->sg, iod->nents,
+ +			bio_data_dir(bio) ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +		nvme_end_io_acct(bio, iod->start_time);
+++=======
++ 		req->errors = nvme_error_status(status);
++ 	} else
++ 		req->errors = 0;
++ 
++ 	if (cmd_rq->aborted)
++ 		dev_warn(&nvmeq->dev->pci_dev->dev,
++ 			"completing aborted command with status:%04x\n",
++ 			status);
++ 
++ 	if (iod->nents) {
++ 		dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->sg, iod->nents,
++ 			rq_data_dir(req) ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++ 		if (blk_integrity_rq(req)) {
++ 			if (!rq_data_dir(req))
++ 				nvme_dif_remap(req, nvme_dif_complete);
++ 			dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->meta_sg, 1,
++ 				rq_data_dir(req) ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++ 		}
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  	}
+  	nvme_free_iod(nvmeq->dev, iod);
+  
+@@@ -797,9 -732,26 +879,32 @@@ static int nvme_submit_iod(struct nvme_
+  	cmnd->rw.nsid = cpu_to_le32(ns->ns_id);
+  	cmnd->rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
+  	cmnd->rw.prp2 = cpu_to_le64(iod->first_dma);
+++<<<<<<< HEAD
+ +	cmnd->rw.slba = cpu_to_le64(nvme_block_nr(ns, bio->bi_sector));
+ +	cmnd->rw.length =
+ +		cpu_to_le16((bio->bi_size >> ns->lba_shift) - 1);
+++=======
++ 	cmnd->rw.slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
++ 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
++ 
++ 	if (blk_integrity_rq(req)) {
++ 		cmnd->rw.metadata = cpu_to_le64(sg_dma_address(iod->meta_sg));
++ 		switch (ns->pi_type) {
++ 		case NVME_NS_DPS_PI_TYPE3:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD;
++ 			break;
++ 		case NVME_NS_DPS_PI_TYPE1:
++ 		case NVME_NS_DPS_PI_TYPE2:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD |
++ 					NVME_RW_PRINFO_PRCHK_REF;
++ 			cmnd->rw.reftag = cpu_to_le32(
++ 					nvme_block_nr(ns, blk_rq_pos(req)));
++ 			break;
++ 		}
++ 	} else if (ns->ms)
++ 		control |= NVME_RW_PRINFO_PRACT;
++ 
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  	cmnd->rw.control = cpu_to_le16(control);
+  	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
+  
+@@@ -808,46 -760,36 +913,63 @@@
+  	writel(nvmeq->sq_tail, nvmeq->q_db);
+  
+  	return 0;
+ +
+  }
+  
+ -static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ -			 const struct blk_mq_queue_data *bd)
+ +static int nvme_split_flush_data(struct nvme_queue *nvmeq, struct bio *bio)
+ +{
+ +	struct nvme_bio_pair *bp = nvme_bio_split(bio, 0, 0, 0);
+ +	if (!bp)
+ +		return -ENOMEM;
+ +
+ +	bp->b1.bi_phys_segments = 0;
+ +	bp->b2.bi_rw &= ~REQ_FLUSH;
+ +
+ +	if (!waitqueue_active(&nvmeq->sq_full))
+ +		add_wait_queue(&nvmeq->sq_full, &nvmeq->sq_cong_wait);
+ +	bio_list_add(&nvmeq->sq_cong, &bp->b1);
+ +	bio_list_add(&nvmeq->sq_cong, &bp->b2);
+ +	wake_up(&nvmeq->sq_full);
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Called with local interrupts disabled and the q_lock held.  May not sleep.
+ + */
+ +static int nvme_submit_bio_queue(struct nvme_queue *nvmeq, struct nvme_ns *ns,
+ +								struct bio *bio)
+  {
+ -	struct nvme_ns *ns = hctx->queue->queuedata;
+ -	struct nvme_queue *nvmeq = hctx->driver_data;
+ -	struct request *req = bd->rq;
+ -	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
+  	struct nvme_iod *iod;
+ -	enum dma_data_direction dma_dir;
+ +	int psegs = bio_phys_segments(ns->queue, bio);
+ +	int result;
+ +
+++<<<<<<< HEAD
+ +	if ((bio->bi_rw & REQ_FLUSH) && psegs)
+ +		return nvme_split_flush_data(nvmeq, bio);
+  
+ +	iod = nvme_alloc_iod(psegs, bio->bi_size, GFP_ATOMIC);
+++=======
++ 	/*
++ 	 * If formated with metadata, require the block layer provide a buffer
++ 	 * unless this namespace is formated such that the metadata can be
++ 	 * stripped/generated by the controller with PRACT=1.
++ 	 */
++ 	if (ns->ms && !blk_integrity_rq(req)) {
++ 		if (!(ns->pi_type && ns->ms == 8)) {
++ 			req->errors = -EFAULT;
++ 			blk_mq_complete_request(req);
++ 			return BLK_MQ_RQ_QUEUE_OK;
++ 		}
++ 	}
++ 
++ 	iod = nvme_alloc_iod(req, ns->dev, GFP_ATOMIC);
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  	if (!iod)
+ -		return BLK_MQ_RQ_QUEUE_BUSY;
+ +		return -ENOMEM;
+  
+ -	if (req->cmd_flags & REQ_DISCARD) {
+ +	iod->private = bio;
+ +	if (bio->bi_rw & REQ_DISCARD) {
+  		void *range;
+  		/*
+  		 * We reuse the small pool to allocate the 16-byte range here
+@@@ -857,35 -799,63 +979,53 @@@
+  		range = dma_pool_alloc(nvmeq->dev->prp_small_pool,
+  						GFP_ATOMIC,
+  						&iod->first_dma);
+ -		if (!range)
+ -			goto retry_cmd;
+ +		if (!range) {
+ +			result = -ENOMEM;
+ +			goto free_iod;
+ +		}
+  		iod_list(iod)[0] = (__le64 *)range;
+  		iod->npages = 0;
+ -	} else if (req->nr_phys_segments) {
+ -		dma_dir = rq_data_dir(req) ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+ -
+ -		sg_init_table(iod->sg, req->nr_phys_segments);
+ -		iod->nents = blk_rq_map_sg(req->q, req, iod->sg);
+ -		if (!iod->nents)
+ -			goto error_cmd;
+ -
+ -		if (!dma_map_sg(nvmeq->q_dmadev, iod->sg, iod->nents, dma_dir))
+ -			goto retry_cmd;
+ -
+ -		if (blk_rq_bytes(req) !=
+ -                    nvme_setup_prps(nvmeq->dev, iod, blk_rq_bytes(req), GFP_ATOMIC)) {
+ -			dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->sg,
+ -					iod->nents, dma_dir);
+ -			goto retry_cmd;
+ +	} else if (psegs) {
+ +		result = nvme_map_bio(nvmeq, iod, bio,
+ +			bio_data_dir(bio) ? DMA_TO_DEVICE : DMA_FROM_DEVICE,
+ +			psegs);
+ +		if (result <= 0)
+ +			goto free_iod;
+ +		if (nvme_setup_prps(nvmeq->dev, iod, result, GFP_ATOMIC) !=
+ +								result) {
+ +			result = -ENOMEM;
+ +			goto free_iod;
+  		}
+++<<<<<<< HEAD
+ +		nvme_start_io_acct(bio);
+++=======
++ 		if (blk_integrity_rq(req)) {
++ 			if (blk_rq_count_integrity_sg(req->q, req->bio) != 1)
++ 				goto error_cmd;
++ 
++ 			sg_init_table(iod->meta_sg, 1);
++ 			if (blk_rq_map_integrity_sg(
++ 					req->q, req->bio, iod->meta_sg) != 1)
++ 				goto error_cmd;
++ 
++ 			if (rq_data_dir(req))
++ 				nvme_dif_remap(req, nvme_dif_prep);
++ 
++ 			if (!dma_map_sg(nvmeq->q_dmadev, iod->meta_sg, 1, dma_dir))
++ 				goto error_cmd;
++ 		}
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  	}
+ +	if (unlikely(nvme_submit_iod(nvmeq, iod))) {
+ +		if (!waitqueue_active(&nvmeq->sq_full))
+ +			add_wait_queue(&nvmeq->sq_full, &nvmeq->sq_cong_wait);
+ +		list_add_tail(&iod->node, &nvmeq->iod_bio);
+ +	}
+ +	return 0;
+  
+ -	nvme_set_info(cmd, iod, req_completion);
+ -	spin_lock_irq(&nvmeq->q_lock);
+ -	if (req->cmd_flags & REQ_DISCARD)
+ -		nvme_submit_discard(nvmeq, ns, req, iod);
+ -	else if (req->cmd_flags & REQ_FLUSH)
+ -		nvme_submit_flush(nvmeq, ns, req->tag);
+ -	else
+ -		nvme_submit_iod(nvmeq, iod, ns);
+ -
+ -	nvme_process_cq(nvmeq);
+ -	spin_unlock_irq(&nvmeq->q_lock);
+ -	return BLK_MQ_RQ_QUEUE_OK;
+ -
+ - error_cmd:
+ -	nvme_free_iod(nvmeq->dev, iod);
+ -	return BLK_MQ_RQ_QUEUE_ERROR;
+ - retry_cmd:
+ + free_iod:
+  	nvme_free_iod(nvmeq->dev, iod);
+ -	return BLK_MQ_RQ_QUEUE_BUSY;
+ +	return result;
+  }
+  
+  static int nvme_process_cq(struct nvme_queue *nvmeq)
+@@@ -2078,34 -2152,30 +2289,45 @@@ static void nvme_alloc_ns(struct nvme_d
+  {
+  	struct nvme_ns *ns;
+  	struct gendisk *disk;
+++<<<<<<< HEAD
+ +	int lbaf;
+ +
+ +	if (rt->attributes & NVME_LBART_ATTRIB_HIDE)
+ +		return NULL;
+++=======
++ 	int node = dev_to_node(&dev->pci_dev->dev);
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  
+ -	ns = kzalloc_node(sizeof(*ns), GFP_KERNEL, node);
+ +	ns = kzalloc(sizeof(*ns), GFP_KERNEL);
+  	if (!ns)
+++<<<<<<< HEAD
+ +		return NULL;
+ +	ns->queue = blk_alloc_queue(GFP_KERNEL);
+ +	if (!ns->queue)
+++=======
++ 		return;
++ 
++ 	ns->queue = blk_mq_init_queue(&dev->tagset);
++ 	if (IS_ERR(ns->queue))
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  		goto out_free_ns;
+ +	ns->queue->queue_flags = QUEUE_FLAG_DEFAULT;
+ +	queue_flag_clear_unlocked(QUEUE_FLAG_STACKABLE, ns->queue);
+  	queue_flag_set_unlocked(QUEUE_FLAG_NOMERGES, ns->queue);
+  	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, ns->queue);
+ -	queue_flag_set_unlocked(QUEUE_FLAG_SG_GAPS, ns->queue);
+ +	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, ns->queue);
+ +	blk_queue_make_request(ns->queue, nvme_make_request);
+  	ns->dev = dev;
+  	ns->queue->queuedata = ns;
+  
+ -	disk = alloc_disk_node(0, node);
+ +	disk = alloc_disk(0);
+  	if (!disk)
+  		goto out_free_queue;
+ -
+  	ns->ns_id = nsid;
+  	ns->disk = disk;
+- 	lbaf = id->flbas & 0xf;
+- 	ns->lba_shift = id->lbaf[lbaf].ds;
+- 	ns->ms = le16_to_cpu(id->lbaf[lbaf].ms);
++ 	ns->lba_shift = 9; /* set to a default value for 512 until disk is validated */
++ 	list_add_tail(&ns->list, &dev->namespaces);
++ 
+  	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+  	if (dev->max_hw_sectors)
+  		blk_queue_max_hw_sectors(ns->queue, dev->max_hw_sectors);
+@@@ -2131,144 -2209,19 +2359,143 @@@
+  	blk_cleanup_queue(ns->queue);
+   out_free_ns:
+  	kfree(ns);
+- 	return NULL;
+  }
+  
+ +static int nvme_find_closest_node(int node)
+ +{
+ +	int n, val, min_val = INT_MAX, best_node = node;
+ +
+ +	for_each_online_node(n) {
+ +		if (n == node)
+ +			continue;
+ +		val = node_distance(node, n);
+ +		if (val < min_val) {
+ +			min_val = val;
+ +			best_node = n;
+ +		}
+ +	}
+ +	return best_node;
+ +}
+ +
+ +static void nvme_set_queue_cpus(cpumask_t *qmask, struct nvme_queue *nvmeq,
+ +								int count)
+ +{
+ +	int cpu;
+ +	for_each_cpu(cpu, qmask) {
+ +		if (cpumask_weight(nvmeq->cpu_mask) >= count)
+ +			break;
+ +		if (!cpumask_test_and_set_cpu(cpu, nvmeq->cpu_mask))
+ +			*per_cpu_ptr(nvmeq->dev->io_queue, cpu) = nvmeq->qid;
+ +	}
+ +}
+ +
+ +static void nvme_add_cpus(cpumask_t *mask, const cpumask_t *unassigned_cpus,
+ +	const cpumask_t *new_mask, struct nvme_queue *nvmeq, int cpus_per_queue)
+ +{
+ +	int next_cpu;
+ +	for_each_cpu(next_cpu, new_mask) {
+ +		cpumask_or(mask, mask, get_cpu_mask(next_cpu));
+ +		cpumask_or(mask, mask, topology_thread_cpumask(next_cpu));
+ +		cpumask_and(mask, mask, unassigned_cpus);
+ +		nvme_set_queue_cpus(mask, nvmeq, cpus_per_queue);
+ +	}
+ +}
+ +
+  static void nvme_create_io_queues(struct nvme_dev *dev)
+  {
+ -	unsigned i;
+ +	unsigned i, max;
+ +
+ +	max = min(dev->max_qid, num_online_cpus());
+ +	for (i = dev->queue_count; i <= max; i++)
+ +		if (!nvme_alloc_queue(dev, i, dev->q_depth, i - 1))
+ +			break;
+  
+ -	for (i = dev->queue_count; i <= dev->max_qid; i++)
+ -		if (!nvme_alloc_queue(dev, i, dev->q_depth))
+ +	max = min(dev->queue_count - 1, num_online_cpus());
+ +	for (i = dev->online_queues; i <= max; i++)
+ +		if (nvme_create_queue(raw_nvmeq(dev, i), i))
+  			break;
+ +}
+  
+ -	for (i = dev->online_queues; i <= dev->queue_count - 1; i++)
+ -		if (nvme_create_queue(dev->queues[i], i))
+ +/*
+ + * If there are fewer queues than online cpus, this will try to optimally
+ + * assign a queue to multiple cpus by grouping cpus that are "close" together:
+ + * thread siblings, core, socket, closest node, then whatever else is
+ + * available.
+ + */
+ +static void nvme_assign_io_queues(struct nvme_dev *dev)
+ +{
+ +	unsigned cpu, cpus_per_queue, queues, remainder, i;
+ +	cpumask_var_t unassigned_cpus;
+ +
+ +	nvme_create_io_queues(dev);
+ +
+ +	queues = min(dev->online_queues - 1, num_online_cpus());
+ +	if (!queues)
+ +		return;
+ +
+ +	cpus_per_queue = num_online_cpus() / queues;
+ +	remainder = queues - (num_online_cpus() - queues * cpus_per_queue);
+ +
+ +	if (!alloc_cpumask_var(&unassigned_cpus, GFP_KERNEL))
+ +		return;
+ +
+ +	cpumask_copy(unassigned_cpus, cpu_online_mask);
+ +	cpu = cpumask_first(unassigned_cpus);
+ +	for (i = 1; i <= queues; i++) {
+ +		struct nvme_queue *nvmeq = lock_nvmeq(dev, i);
+ +		cpumask_t mask;
+ +
+ +		cpumask_clear(nvmeq->cpu_mask);
+ +		if (!cpumask_weight(unassigned_cpus)) {
+ +			unlock_nvmeq(nvmeq);
+  			break;
+ +		}
+ +
+ +		mask = *get_cpu_mask(cpu);
+ +		nvme_set_queue_cpus(&mask, nvmeq, cpus_per_queue);
+ +		if (cpus_weight(mask) < cpus_per_queue)
+ +			nvme_add_cpus(&mask, unassigned_cpus,
+ +				topology_thread_cpumask(cpu),
+ +				nvmeq, cpus_per_queue);
+ +		if (cpus_weight(mask) < cpus_per_queue)
+ +			nvme_add_cpus(&mask, unassigned_cpus,
+ +				topology_core_cpumask(cpu),
+ +				nvmeq, cpus_per_queue);
+ +		if (cpus_weight(mask) < cpus_per_queue)
+ +			nvme_add_cpus(&mask, unassigned_cpus,
+ +				cpumask_of_node(cpu_to_node(cpu)),
+ +				nvmeq, cpus_per_queue);
+ +		if (cpus_weight(mask) < cpus_per_queue)
+ +			nvme_add_cpus(&mask, unassigned_cpus,
+ +				cpumask_of_node(
+ +					nvme_find_closest_node(
+ +						cpu_to_node(cpu))),
+ +				nvmeq, cpus_per_queue);
+ +		if (cpus_weight(mask) < cpus_per_queue)
+ +			nvme_add_cpus(&mask, unassigned_cpus,
+ +				unassigned_cpus,
+ +				nvmeq, cpus_per_queue);
+ +
+ +		WARN(cpumask_weight(nvmeq->cpu_mask) != cpus_per_queue,
+ +			"nvme%d qid:%d mis-matched queue-to-cpu assignment\n",
+ +			dev->instance, i);
+ +
+ +		irq_set_affinity_hint(dev->entry[nvmeq->cq_vector].vector,
+ +							nvmeq->cpu_mask);
+ +		cpumask_andnot(unassigned_cpus, unassigned_cpus,
+ +						nvmeq->cpu_mask);
+ +		cpu = cpumask_next(cpu, unassigned_cpus);
+ +		if (remainder && !--remainder)
+ +			cpus_per_queue++;
+ +		unlock_nvmeq(nvmeq);
+ +	}
+ +	WARN(cpumask_weight(unassigned_cpus), "nvme%d unassigned online cpus\n",
+ +								dev->instance);
+ +	i = 0;
+ +	cpumask_andnot(unassigned_cpus, cpu_possible_mask, cpu_online_mask);
+ +	for_each_cpu(cpu, unassigned_cpus)
+ +		*per_cpu_ptr(dev->io_queue, cpu) = (i++ % queues) + 1;
+ +	free_cpumask_var(unassigned_cpus);
+  }
+  
+  static int set_queue_count(struct nvme_dev *dev, int count)
+@@@ -2444,34 -2361,36 +2669,37 @@@ static int nvme_dev_add(struct nvme_de
+  	if (ctrl->mdts)
+  		dev->max_hw_sectors = 1 << (ctrl->mdts + shift - 9);
+  	if ((pdev->vendor == PCI_VENDOR_ID_INTEL) &&
+ -			(pdev->device == 0x0953) && ctrl->vs[3]) {
+ -		unsigned int max_hw_sectors;
+ -
+ +			(pdev->device == 0x0953) && ctrl->vs[3])
+  		dev->stripe_size = 1 << (ctrl->vs[3] + shift);
+++<<<<<<< HEAD
+++=======
++ 		max_hw_sectors = dev->stripe_size >> (shift - 9);
++ 		if (dev->max_hw_sectors) {
++ 			dev->max_hw_sectors = min(max_hw_sectors,
++ 							dev->max_hw_sectors);
++ 		} else
++ 			dev->max_hw_sectors = max_hw_sectors;
++ 	}
++ 	dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
++ 
++ 	dev->tagset.ops = &nvme_mq_ops;
++ 	dev->tagset.nr_hw_queues = dev->online_queues - 1;
++ 	dev->tagset.timeout = NVME_IO_TIMEOUT;
++ 	dev->tagset.numa_node = dev_to_node(&dev->pci_dev->dev);
++ 	dev->tagset.queue_depth =
++ 				min_t(int, dev->q_depth, BLK_MQ_MAX_DEPTH) - 1;
++ 	dev->tagset.cmd_size = nvme_cmd_size(dev);
++ 	dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
++ 	dev->tagset.driver_data = dev;
++ 
++ 	if (blk_mq_alloc_tag_set(&dev->tagset))
++ 		return 0;
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  
+- 	id_ns = mem;
+- 	for (i = 1; i <= nn; i++) {
+- 		res = nvme_identify(dev, i, 0, dma_addr);
+- 		if (res)
+- 			continue;
+- 
+- 		if (id_ns->ncap == 0)
+- 			continue;
+- 
+- 		res = nvme_get_features(dev, NVME_FEAT_LBA_RANGE, i,
+- 							dma_addr + 4096, NULL);
+- 		if (res)
+- 			memset(mem + 4096, 0, 4096);
++ 	for (i = 1; i <= nn; i++)
++ 		nvme_alloc_ns(dev, i);
+  
+- 		ns = nvme_alloc_ns(dev, i, mem, mem + 4096);
+- 		if (ns)
+- 			list_add_tail(&ns->list, &dev->namespaces);
+- 	}
+- 	list_for_each_entry(ns, &dev->namespaces, list)
+- 		add_disk(ns->disk);
+- 	res = 0;
+- 
+-  out:
+- 	dma_free_coherent(&dev->pci_dev->dev, 8192, mem, dma_addr);
+- 	return res;
++ 	return 0;
+  }
+  
+  static int nvme_dev_map(struct nvme_dev *dev)
+@@@ -2723,10 -2689,15 +2951,18 @@@ static void nvme_dev_remove(struct nvme
+  	struct nvme_ns *ns;
+  
+  	list_for_each_entry(ns, &dev->namespaces, list) {
+- 		if (ns->disk->flags & GENHD_FL_UP)
++ 		if (ns->disk->flags & GENHD_FL_UP) {
++ 			if (ns->disk->integrity)
++ 				blk_integrity_unregister(ns->disk);
+  			del_gendisk(ns->disk);
+++<<<<<<< HEAD
+ +		if (!blk_queue_dying(ns->queue))
+++=======
++ 		}
++ 		if (!blk_queue_dying(ns->queue)) {
++ 			blk_mq_abort_requeue_list(ns->queue);
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  			blk_cleanup_queue(ns->queue);
+ -		}
+  	}
+  }
+  
+diff --cc include/linux/nvme.h
+index 0ee15565532d,cca264db2478..000000000000
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@@ -130,9 -138,8 +131,13 @@@ struct nvme_iod 
+  	int offset;		/* Of PRP list */
+  	int nents;		/* Used in scatterlist */
+  	int length;		/* Of data, in bytes */
+ +	unsigned long start_time;
+  	dma_addr_t first_dma;
+++<<<<<<< HEAD
+ +	struct list_head node;
+++=======
++ 	struct scatterlist meta_sg[1]; /* metadata requires single contiguous buffer */
+++>>>>>>> e1e5e5641e6f (NVMe: Metadata format support)
+  	struct scatterlist sg[0];
+  };
+  
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path include/linux/nvme.h
+diff --git a/include/uapi/linux/nvme.h b/include/uapi/linux/nvme.h
+index 521ca5ae2746..43914239e214 100644
+--- a/include/uapi/linux/nvme.h
++++ b/include/uapi/linux/nvme.h
+@@ -130,10 +130,22 @@ struct nvme_id_ns {
+ 
+ enum {
+ 	NVME_NS_FEAT_THIN	= 1 << 0,
++	NVME_NS_FLBAS_LBA_MASK	= 0xf,
++	NVME_NS_FLBAS_META_EXT	= 0x10,
+ 	NVME_LBAF_RP_BEST	= 0,
+ 	NVME_LBAF_RP_BETTER	= 1,
+ 	NVME_LBAF_RP_GOOD	= 2,
+ 	NVME_LBAF_RP_DEGRADED	= 3,
++	NVME_NS_DPC_PI_LAST	= 1 << 4,
++	NVME_NS_DPC_PI_FIRST	= 1 << 3,
++	NVME_NS_DPC_PI_TYPE3	= 1 << 2,
++	NVME_NS_DPC_PI_TYPE2	= 1 << 1,
++	NVME_NS_DPC_PI_TYPE1	= 1 << 0,
++	NVME_NS_DPS_PI_FIRST	= 1 << 3,
++	NVME_NS_DPS_PI_MASK	= 0x7,
++	NVME_NS_DPS_PI_TYPE1	= 1,
++	NVME_NS_DPS_PI_TYPE2	= 2,
++	NVME_NS_DPS_PI_TYPE3	= 3,
+ };
+ 
+ struct nvme_smart_log {
+@@ -267,6 +279,10 @@ enum {
+ 	NVME_RW_DSM_LATENCY_LOW		= 3 << 4,
+ 	NVME_RW_DSM_SEQ_REQ		= 1 << 6,
+ 	NVME_RW_DSM_COMPRESSED		= 1 << 7,
++	NVME_RW_PRINFO_PRCHK_REF	= 1 << 10,
++	NVME_RW_PRINFO_PRCHK_APP	= 1 << 11,
++	NVME_RW_PRINFO_PRCHK_GUARD	= 1 << 12,
++	NVME_RW_PRINFO_PRACT		= 1 << 13,
+ };
+ 
+ struct nvme_dsm_cmd {
