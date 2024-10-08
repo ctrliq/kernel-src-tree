@@ -1,0 +1,158 @@
+ipv6: Remove external dependency on rt6i_gateway and RTF_ANYCAST
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 2647a9b07032c5a95ddee1fcb65d95bddbc6b7f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2647a9b0.failed
+
+When creating a RTF_CACHE route, RTF_ANYCAST is set based on rt6i_dst.
+Also, rt6i_gateway is always set to the nexthop while the nexthop
+could be a gateway or the rt6i_dst.addr.
+
+After removing the rt6i_dst and rt6i_src dependency in the last patch,
+we also need to stop the caller from depending on rt6i_gateway and
+RTF_ANYCAST.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Cc: Steffen Klassert <steffen.klassert@secunet.com>
+	Cc: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2647a9b07032c5a95ddee1fcb65d95bddbc6b7f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_route.h
+#	net/bluetooth/6lowpan.c
+#	net/ipv6/icmp.c
+diff --cc include/net/ip6_route.h
+index c2439795bc4f,4caf7d697dee..000000000000
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@@ -184,6 -163,16 +184,19 @@@ static inline bool ipv6_unicast_destina
+  	return rt->rt6i_flags & RTF_LOCAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool ipv6_anycast_destination(const struct dst_entry *dst,
++ 					    const struct in6_addr *daddr)
++ {
++ 	struct rt6_info *rt = (struct rt6_info *)dst;
++ 
++ 	return rt->rt6i_flags & RTF_ANYCAST ||
++ 		(rt->rt6i_dst.plen != 128 &&
++ 		 ipv6_addr_equal(&rt->rt6i_dst.addr, daddr));
++ }
++ 
+++>>>>>>> 2647a9b07032 (ipv6: Remove external dependency on rt6i_gateway and RTF_ANYCAST)
+  int ip6_fragment(struct sock *sk, struct sk_buff *skb,
+  		 int (*output)(struct sock *, struct sk_buff *));
+  
+diff --cc net/ipv6/icmp.c
+index 8a66e2366f49,713d7434c911..000000000000
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@@ -322,8 -337,8 +322,13 @@@ static struct dst_entry *icmpv6_route_l
+  	 * We won't send icmp if the destination is known
+  	 * anycast.
+  	 */
+++<<<<<<< HEAD
+ +	if (((struct rt6_info *)dst)->rt6i_flags & RTF_ANYCAST) {
+ +		LIMIT_NETDEBUG(KERN_DEBUG "icmp6_send: acast source\n");
+++=======
++ 	if (ipv6_anycast_destination(dst, &fl6->daddr)) {
++ 		net_dbg_ratelimited("icmp6_send: acast source\n");
+++>>>>>>> 2647a9b07032 (ipv6: Remove external dependency on rt6i_gateway and RTF_ANYCAST)
+  		dst_release(dst);
+  		return ERR_PTR(-EINVAL);
+  	}
+@@@ -546,7 -560,11 +551,13 @@@ static void icmpv6_echo_reply(struct sk
+  
+  	saddr = &ipv6_hdr(skb)->daddr;
+  
+++<<<<<<< HEAD
+ +	if (!ipv6_unicast_destination(skb))
+++=======
++ 	if (!ipv6_unicast_destination(skb) &&
++ 	    !(net->ipv6.sysctl.anycast_src_echo_reply &&
++ 	      ipv6_anycast_destination(skb_dst(skb), saddr)))
+++>>>>>>> 2647a9b07032 (ipv6: Remove external dependency on rt6i_gateway and RTF_ANYCAST)
+  		saddr = NULL;
+  
+  	memcpy(&tmp_hdr, icmph, sizeof(tmp_hdr));
+* Unmerged path net/bluetooth/6lowpan.c
+* Unmerged path include/net/ip6_route.h
+* Unmerged path net/bluetooth/6lowpan.c
+* Unmerged path net/ipv6/icmp.c
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 6e24dc6ba803..4f8810a937d5 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -105,7 +105,7 @@ static int ip6_finish_output2(struct sock *sk, struct sk_buff *skb)
+ 	}
+ 
+ 	rcu_read_lock_bh();
+-	nexthop = rt6_nexthop((struct rt6_info *)dst);
++	nexthop = rt6_nexthop((struct rt6_info *)dst, &ipv6_hdr(skb)->daddr);
+ 	neigh = __ipv6_neigh_lookup_noref(dst->dev, nexthop);
+ 	if (unlikely(!neigh))
+ 		neigh = __neigh_create(&nd_tbl, nexthop, dst->dev, false);
+@@ -898,7 +898,8 @@ static int ip6_dst_lookup_tail(struct sock *sk,
+ 	 */
+ 	rt = (struct rt6_info *) *dst;
+ 	rcu_read_lock_bh();
+-	n = __ipv6_neigh_lookup_noref(rt->dst.dev, rt6_nexthop(rt));
++	n = __ipv6_neigh_lookup_noref(rt->dst.dev,
++				      rt6_nexthop(rt, &fl6->daddr));
+ 	err = n && !(n->nud_state & NUD_VALID) ? -EINVAL : 0;
+ 	rcu_read_unlock_bh();
+ 
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index f29489da8bee..348db89cdb26 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1986,11 +1986,7 @@ static struct rt6_info *ip6_rt_copy(struct rt6_info *ort,
+ 		if (rt->rt6i_idev)
+ 			in6_dev_hold(rt->rt6i_idev);
+ 		rt->dst.lastuse = jiffies;
+-
+-		if (ort->rt6i_flags & RTF_GATEWAY)
+-			rt->rt6i_gateway = ort->rt6i_gateway;
+-		else
+-			rt->rt6i_gateway = *dest;
++		rt->rt6i_gateway = ort->rt6i_gateway;
+ 		rt->rt6i_flags = ort->rt6i_flags;
+ 		rt6_set_from(rt, ort);
+ 		rt->rt6i_metric = 0;
+diff --git a/net/netfilter/nf_conntrack_h323_main.c b/net/netfilter/nf_conntrack_h323_main.c
+index 1d69f5b9748f..9511af04dc81 100644
+--- a/net/netfilter/nf_conntrack_h323_main.c
++++ b/net/netfilter/nf_conntrack_h323_main.c
+@@ -779,8 +779,8 @@ static int callforward_do_filter(struct net *net,
+ 				   flowi6_to_flowi(&fl1), false)) {
+ 			if (!afinfo->route(net, (struct dst_entry **)&rt2,
+ 					   flowi6_to_flowi(&fl2), false)) {
+-				if (ipv6_addr_equal(rt6_nexthop(rt1),
+-						    rt6_nexthop(rt2)) &&
++				if (ipv6_addr_equal(rt6_nexthop(rt1, &fl1.daddr),
++						    rt6_nexthop(rt2, &fl2.daddr)) &&
+ 				    rt1->dst.dev == rt2->dst.dev)
+ 					ret = 1;
+ 				dst_release(&rt2->dst);
+diff --git a/net/netfilter/xt_addrtype.c b/net/netfilter/xt_addrtype.c
+index 68ff29f60867..6347ef83ff71 100644
+--- a/net/netfilter/xt_addrtype.c
++++ b/net/netfilter/xt_addrtype.c
+@@ -73,7 +73,7 @@ static u32 match_lookup_rt6(struct net *net, const struct net_device *dev,
+ 
+ 	if (dev == NULL && rt->rt6i_flags & RTF_LOCAL)
+ 		ret |= XT_ADDRTYPE_LOCAL;
+-	if (rt->rt6i_flags & RTF_ANYCAST)
++	if (ipv6_anycast_destination((struct dst_entry *)rt, addr))
+ 		ret |= XT_ADDRTYPE_ANYCAST;
+ 
+ 	dst_release(&rt->dst);
