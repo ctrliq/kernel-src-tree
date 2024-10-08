@@ -1,0 +1,135 @@
+tcp: move logic out of tcp_v[64]_gso_send_check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit d020f8f73318589bf41f864b7f89f95669350873
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d020f8f7.failed
+
+In tcp_v[46]_gso_send_check the TCP checksum is initialized to the
+pseudo header checksum using __tcp_v[46]_send_check. We can move this
+logic into new tcp[46]_gso_segment functions to be done when
+ip_summed != CHECKSUM_PARTIAL (ip_summed == CHECKSUM_PARTIAL should be
+the common case, possibly always true when taking GSO path). After this
+change tcp_v[46]_gso_send_check is no-op.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d020f8f73318589bf41f864b7f89f95669350873)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_offload.c
+diff --cc net/ipv4/tcp_offload.c
+index 7cdeac54cee6,7cd12b0458ff..000000000000
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@@ -14,6 -14,43 +14,46 @@@
+  #include <net/tcp.h>
+  #include <net/protocol.h>
+  
+++<<<<<<< HEAD
+++=======
++ static void tcp_gso_tstamp(struct sk_buff *skb, unsigned int ts_seq,
++ 			   unsigned int seq, unsigned int mss)
++ {
++ 	while (skb) {
++ 		if (before(ts_seq, seq + mss)) {
++ 			skb_shinfo(skb)->tx_flags |= SKBTX_SW_TSTAMP;
++ 			skb_shinfo(skb)->tskey = ts_seq;
++ 			return;
++ 		}
++ 
++ 		skb = skb->next;
++ 		seq += mss;
++ 	}
++ }
++ 
++ struct sk_buff *tcp4_gso_segment(struct sk_buff *skb,
++ 				 netdev_features_t features)
++ {
++ 	if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (unlikely(skb->ip_summed != CHECKSUM_PARTIAL)) {
++ 		const struct iphdr *iph = ip_hdr(skb);
++ 		struct tcphdr *th = tcp_hdr(skb);
++ 
++ 		/* Set up checksum pseudo header, usually expect stack to
++ 		 * have done this already.
++ 		 */
++ 
++ 		th->check = 0;
++ 		skb->ip_summed = CHECKSUM_PARTIAL;
++ 		__tcp_v4_send_check(skb, iph->saddr, iph->daddr);
++ 	}
++ 
++ 	return tcp_gso_segment(skb, features);
++ }
++ 
+++>>>>>>> d020f8f73318 (tcp: move logic out of tcp_v[64]_gso_send_check)
+  struct sk_buff *tcp_gso_segment(struct sk_buff *skb,
+  				netdev_features_t features)
+  {
+* Unmerged path net/ipv4/tcp_offload.c
+diff --git a/net/ipv6/tcpv6_offload.c b/net/ipv6/tcpv6_offload.c
+index dbb3d9262bf6..96253154db3a 100644
+--- a/net/ipv6/tcpv6_offload.c
++++ b/net/ipv6/tcpv6_offload.c
+@@ -17,18 +17,6 @@
+ 
+ static int tcp_v6_gso_send_check(struct sk_buff *skb)
+ {
+-	const struct ipv6hdr *ipv6h;
+-	struct tcphdr *th;
+-
+-	if (!pskb_may_pull(skb, sizeof(*th)))
+-		return -EINVAL;
+-
+-	ipv6h = ipv6_hdr(skb);
+-	th = tcp_hdr(skb);
+-
+-	th->check = 0;
+-	skb->ip_summed = CHECKSUM_PARTIAL;
+-	__tcp_v6_send_check(skb, &ipv6h->saddr, &ipv6h->daddr);
+ 	return 0;
+ }
+ 
+@@ -58,10 +46,33 @@ static int tcp6_gro_complete(struct sk_buff *skb, int thoff)
+ 	return tcp_gro_complete(skb);
+ }
+ 
++struct sk_buff *tcp6_gso_segment(struct sk_buff *skb,
++				 netdev_features_t features)
++{
++	struct tcphdr *th;
++
++	if (!pskb_may_pull(skb, sizeof(*th)))
++		return ERR_PTR(-EINVAL);
++
++	if (unlikely(skb->ip_summed != CHECKSUM_PARTIAL)) {
++		const struct ipv6hdr *ipv6h = ipv6_hdr(skb);
++		struct tcphdr *th = tcp_hdr(skb);
++
++		/* Set up pseudo header, usually expect stack to have done
++		 * this.
++		 */
++
++		th->check = 0;
++		skb->ip_summed = CHECKSUM_PARTIAL;
++		__tcp_v6_send_check(skb, &ipv6h->saddr, &ipv6h->daddr);
++	}
++
++	return tcp_gso_segment(skb, features);
++}
+ static const struct net_offload tcpv6_offload = {
+ 	.callbacks = {
+ 		.gso_send_check	=	tcp_v6_gso_send_check,
+-		.gso_segment	=	tcp_gso_segment,
++		.gso_segment	=	tcp6_gso_segment,
+ 		.gro_receive	=	tcp6_gro_receive,
+ 		.gro_complete	=	tcp6_gro_complete,
+ 	},
