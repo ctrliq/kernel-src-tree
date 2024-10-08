@@ -71,6 +71,25 @@ struct product_info {
 	__u8	hardware_type;		/* Type of hardware */
 } __attribute__((packed));
 
+/*
+ * Edgeport firmware header
+ *
+ * "build_number" has been set to 0 in all three of the images I have
+ * seen, and Digi Tech Support suggests that it is safe to ignore it.
+ *
+ * "length" is the number of bytes of actual data following the header.
+ *
+ * "checksum" is the low order byte resulting from adding the values of
+ * all the data bytes.
+ */
+struct edgeport_fw_hdr {
+	u8 major_version;
+	u8 minor_version;
+	__le16 build_number;
+	__le16 length;
+	u8 checksum;
+} __packed;
+
 struct edgeport_port {
 	__u16 uart_base;
 	__u16 dma_address;
@@ -101,6 +120,7 @@ struct edgeport_serial {
 	struct mutex es_lock;
 	int num_ports_open;
 	struct usb_serial *serial;
+	int fw_version;
 };
 
 
@@ -186,10 +206,6 @@ static const struct usb_device_id id_table_combined[] = {
 };
 
 MODULE_DEVICE_TABLE(usb, id_table_combined);
-
-static unsigned char OperationalMajorVersion;
-static unsigned char OperationalMinorVersion;
-static unsigned short OperationalBuildNumber;
 
 static int closing_wait = EDGE_CLOSING_WAIT;
 static bool ignore_cpu_rev;
@@ -748,18 +764,17 @@ exit:
 }
 
 /* Build firmware header used for firmware update */
-static int build_i2c_fw_hdr(__u8 *header, struct device *dev)
+static int build_i2c_fw_hdr(u8 *header, struct device *dev,
+		const struct firmware *fw)
 {
 	__u8 *buffer;
 	int buffer_size;
 	int i;
-	int err;
 	__u8 cs = 0;
 	struct ti_i2c_desc *i2c_header;
 	struct ti_i2c_image_header *img_header;
 	struct ti_i2c_firmware_rec *firmware_rec;
-	const struct firmware *fw;
-	const char *fw_name = "edgeport/down3.bin";
+	struct edgeport_fw_hdr *fw_hdr = (struct edgeport_fw_hdr *)fw->data;
 
 	/* In order to update the I2C firmware we must change the type 2 record
 	 * to type 0xF2.  This will force the UMP to come up in Boot Mode.
@@ -782,24 +797,11 @@ static int build_i2c_fw_hdr(__u8 *header, struct device *dev)
 	// Set entire image of 0xffs
 	memset(buffer, 0xff, buffer_size);
 
-	err = request_firmware(&fw, fw_name, dev);
-	if (err) {
-		dev_err(dev, "Failed to load image \"%s\" err %d\n",
-			fw_name, err);
-		kfree(buffer);
-		return err;
-	}
-
-	/* Save Download Version Number */
-	OperationalMajorVersion = fw->data[0];
-	OperationalMinorVersion = fw->data[1];
-	OperationalBuildNumber = fw->data[2] | (fw->data[3] << 8);
-
 	/* Copy version number into firmware record */
 	firmware_rec = (struct ti_i2c_firmware_rec *)buffer;
 
-	firmware_rec->Ver_Major	= OperationalMajorVersion;
-	firmware_rec->Ver_Minor	= OperationalMinorVersion;
+	firmware_rec->Ver_Major	= fw_hdr->major_version;
+	firmware_rec->Ver_Minor	= fw_hdr->minor_version;
 
 	/* Pointer to fw_down memory image */
 	img_header = (struct ti_i2c_image_header *)&fw->data[4];
@@ -807,8 +809,6 @@ static int build_i2c_fw_hdr(__u8 *header, struct device *dev)
 	memcpy(buffer + sizeof(struct ti_i2c_firmware_rec),
 		&fw->data[4 + sizeof(struct ti_i2c_image_header)],
 		le16_to_cpu(img_header->Length));
-
-	release_firmware(fw);
 
 	for (i=0; i < buffer_size; i++) {
 		cs = (__u8)(cs + buffer[i]);
@@ -823,8 +823,8 @@ static int build_i2c_fw_hdr(__u8 *header, struct device *dev)
 	i2c_header->Type	= I2C_DESC_TYPE_FIRMWARE_BLANK;
 	i2c_header->Size	= cpu_to_le16(buffer_size);
 	i2c_header->CheckSum	= cs;
-	firmware_rec->Ver_Major	= OperationalMajorVersion;
-	firmware_rec->Ver_Minor	= OperationalMinorVersion;
+	firmware_rec->Ver_Major	= fw_hdr->major_version;
+	firmware_rec->Ver_Minor	= fw_hdr->minor_version;
 
 	return 0;
 }
@@ -931,7 +931,8 @@ static int ti_cpu_rev(struct edge_ti_manuf_descriptor *desc)
  * This routine downloads the main operating code into the TI5052, using the
  * boot code already burned into E2PROM or ROM.
  */
-static int download_fw(struct edgeport_serial *serial)
+static int download_fw(struct edgeport_serial *serial,
+		const struct firmware *fw)
 {
 	struct device *dev = &serial->serial->dev->dev;
 	int status = 0;
@@ -940,6 +941,17 @@ static int download_fw(struct edgeport_serial *serial)
 	struct usb_interface_descriptor *interface;
 	int download_cur_ver;
 	int download_new_ver;
+	struct edgeport_fw_hdr *fw_hdr = (struct edgeport_fw_hdr *)fw->data;
+
+	if (fw->size < sizeof(struct edgeport_fw_hdr)) {
+		dev_err(&serial->serial->interface->dev,
+				"Incomplete firmware header.\n");
+		return -EINVAL;
+	}
+
+	/* If on-board version is newer, "fw_version" will be updated below. */
+	serial->fw_version = (fw_hdr->major_version << 8) +
+			fw_hdr->minor_version;
 
 	/* This routine is entered by both the BOOT mode and the Download mode
 	 * We can determine which code is running by the reading the config
@@ -1047,14 +1059,13 @@ static int download_fw(struct edgeport_serial *serial)
 			   version in I2c */
 			download_cur_ver = (firmware_version->Ver_Major << 8) +
 					   (firmware_version->Ver_Minor);
-			download_new_ver = (OperationalMajorVersion << 8) +
-					   (OperationalMinorVersion);
+			download_new_ver = (fw_hdr->major_version << 8) +
+					   (fw_hdr->minor_version);
 
 			dev_dbg(dev, "%s - >> FW Versions Device %d.%d  Driver %d.%d\n",
 				__func__, firmware_version->Ver_Major,
 				firmware_version->Ver_Minor,
-				OperationalMajorVersion,
-				OperationalMinorVersion);
+				fw_hdr->major_version, fw_hdr->minor_version);
 
 			/* Check if we have an old version in the I2C and
 			   update if necessary */
@@ -1063,8 +1074,8 @@ static int download_fw(struct edgeport_serial *serial)
 					__func__,
 					firmware_version->Ver_Major,
 					firmware_version->Ver_Minor,
-					OperationalMajorVersion,
-					OperationalMinorVersion);
+					fw_hdr->major_version,
+					fw_hdr->minor_version);
 
 				record = kmalloc(1, GFP_KERNEL);
 				if (!record) {
@@ -1139,6 +1150,9 @@ static int download_fw(struct edgeport_serial *serial)
 				kfree(rom_desc);
 				kfree(ti_manuf_desc);
 				return -ENODEV;
+			} else {
+				/* Same or newer fw version is already loaded */
+				serial->fw_version = download_cur_ver;
 			}
 			kfree(firmware_version);
 		}
@@ -1177,7 +1191,7 @@ static int download_fw(struct edgeport_serial *serial)
 			 * UMP Ram to I2C and the firmware will update the
 			 * record type from 0xf2 to 0x02.
 			 */
-			status = build_i2c_fw_hdr(header, dev);
+			status = build_i2c_fw_hdr(header, dev, fw);
 			if (status) {
 				kfree(vheader);
 				kfree(header);
@@ -1278,9 +1292,6 @@ static int download_fw(struct edgeport_serial *serial)
 		__u8 cs = 0;
 		__u8 *buffer;
 		int buffer_size;
-		int err;
-		const struct firmware *fw;
-		const char *fw_name = "edgeport/down3.bin";
 
 		/* Validate Hardware version number
 		 * Read Manufacturing Descriptor from TI Based Edgeport
@@ -1328,16 +1339,7 @@ static int download_fw(struct edgeport_serial *serial)
 
 		/* Initialize the buffer to 0xff (pad the buffer) */
 		memset(buffer, 0xff, buffer_size);
-
-		err = request_firmware(&fw, fw_name, dev);
-		if (err) {
-			dev_err(dev, "Failed to load image \"%s\" err %d\n",
-				fw_name, err);
-			kfree(buffer);
-			return err;
-		}
 		memcpy(buffer, &fw->data[4], fw->size - 4);
-		release_firmware(fw);
 
 		for (i = sizeof(struct ti_i2c_image_header);
 				i < buffer_size; i++) {
@@ -1352,7 +1354,9 @@ static int download_fw(struct edgeport_serial *serial)
 		header->CheckSum = cs;
 
 		/* Download the operational code  */
-		dev_dbg(dev, "%s - Downloading operational code image (TI UMP)\n", __func__);
+		dev_dbg(dev, "%s - Downloading operational code image version %d.%d (TI UMP)\n",
+				__func__,
+				fw_hdr->major_version, fw_hdr->minor_version);
 		status = download_code(serial, buffer, buffer_size);
 
 		kfree(buffer);
@@ -2377,6 +2381,9 @@ static int edge_startup(struct usb_serial *serial)
 {
 	struct edgeport_serial *edge_serial;
 	int status;
+	const struct firmware *fw;
+	const char *fw_name = "edgeport/down3.bin";
+	struct device *dev = &serial->interface->dev;
 
 	/* create our private serial structure */
 	edge_serial = kzalloc(sizeof(struct edgeport_serial), GFP_KERNEL);
@@ -2387,7 +2394,16 @@ static int edge_startup(struct usb_serial *serial)
 	edge_serial->serial = serial;
 	usb_set_serial_data(serial, edge_serial);
 
-	status = download_fw(edge_serial);
+	status = request_firmware(&fw, fw_name, dev);
+	if (status) {
+		dev_err(dev, "Failed to load image \"%s\" err %d\n",
+				fw_name, status);
+		kfree(edge_serial);
+		return status;
+	}
+
+	status = download_fw(edge_serial, fw);
+	release_firmware(fw);
 	if (status) {
 		kfree(edge_serial);
 		return status;
