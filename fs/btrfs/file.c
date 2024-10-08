@@ -1555,9 +1555,10 @@ again:
 			unlock_extent_cached(&BTRFS_I(inode)->io_tree,
 					     lockstart, lockend, &cached_state,
 					     GFP_NOFS);
-		btrfs_drop_pages(pages, num_pages);
-		if (ret)
+		if (ret) {
+			btrfs_drop_pages(pages, num_pages);
 			break;
+		}
 
 		release_bytes = 0;
 		if (only_release_metadata && copied > 0) {
@@ -1570,6 +1571,8 @@ again:
 				       NULL, GFP_NOFS);
 			only_release_metadata = false;
 		}
+
+		btrfs_drop_pages(pages, num_pages);
 
 		cond_resched();
 
