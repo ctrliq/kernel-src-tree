@@ -1,0 +1,221 @@
+iommu: provide early initialisation hook for IOMMU drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [iommu] provide early initialisation hook for IOMMU drivers (Myron Stowe) [1287300]
+Rebuild_FUZZ: 93.58%
+commit-author Will Deacon <will.deacon@arm.com>
+commit 1cd076bf67793942ed921b766f7d461de2ebc0a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1cd076bf.failed
+
+IOMMU drivers must be initialised before any of their upstream devices,
+otherwise the relevant iommu_ops won't be configured for the bus in
+question. To solve this, a number of IOMMU drivers use initcalls to
+initialise the driver before anything has a chance to be probed.
+
+Whilst this solves the immediate problem, it leaves the job of probing
+the IOMMU completely separate from the iommu_ops to configure the IOMMU,
+which are called on a per-bus basis and require the driver to figure out
+exactly which instance of the IOMMU is being requested. In particular,
+the add_device callback simply passes a struct device to the driver,
+which then has to parse firmware tables or probe buses to identify the
+relevant IOMMU instance.
+
+This patch takes the first step in addressing this problem by adding an
+early initialisation pass for IOMMU drivers, giving them the ability to
+store some per-instance data in their iommu_ops structure and store that
+in their of_node. This can later be used when parsing OF masters to
+identify the IOMMU instance in question.
+
+	Acked-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Joerg Roedel <jroedel@suse.de>
+	Acked-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Tested-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit 1cd076bf67793942ed921b766f7d461de2ebc0a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/asm-generic/vmlinux.lds.h
+diff --cc include/asm-generic/vmlinux.lds.h
+index 72e4edc4536e,bee5d683074d..000000000000
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@@ -135,33 -150,24 +135,43 @@@
+  #define TRACE_SYSCALLS()
+  #endif
+  
+ +#ifdef CONFIG_CLKSRC_OF
+ +#define CLKSRC_OF_TABLES() . = ALIGN(8);				\
+ +			   VMLINUX_SYMBOL(__clksrc_of_table) = .;	\
+ +			   *(__clksrc_of_table)				\
+ +			   *(__clksrc_of_table_end)
+ +#else
+ +#define CLKSRC_OF_TABLES()
+ +#endif
+  
+ -#define ___OF_TABLE(cfg, name)	_OF_TABLE_##cfg(name)
+ -#define __OF_TABLE(cfg, name)	___OF_TABLE(cfg, name)
+ -#define OF_TABLE(cfg, name)	__OF_TABLE(config_enabled(cfg), name)
+ -#define _OF_TABLE_0(name)
+ -#define _OF_TABLE_1(name)						\
+ +#ifdef CONFIG_IRQCHIP
+ +#define IRQCHIP_OF_MATCH_TABLE()					\
+  	. = ALIGN(8);							\
+ -	VMLINUX_SYMBOL(__##name##_of_table) = .;			\
+ -	*(__##name##_of_table)						\
+ -	*(__##name##_of_table_end)
+ +	VMLINUX_SYMBOL(__irqchip_begin) = .;				\
+ +	*(__irqchip_of_table)		  				\
+ +	*(__irqchip_of_end)
+ +#else
+ +#define IRQCHIP_OF_MATCH_TABLE()
+ +#endif
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_COMMON_CLK
+ +#define CLK_OF_TABLES() . = ALIGN(8);				\
+ +			VMLINUX_SYMBOL(__clk_of_table) = .;	\
+ +			*(__clk_of_table)			\
+ +			*(__clk_of_table_end)
+ +#else
+ +#define CLK_OF_TABLES()
+ +#endif
+++=======
++ #define CLKSRC_OF_TABLES()	OF_TABLE(CONFIG_CLKSRC_OF, clksrc)
++ #define IRQCHIP_OF_MATCH_TABLE() OF_TABLE(CONFIG_IRQCHIP, irqchip)
++ #define CLK_OF_TABLES()		OF_TABLE(CONFIG_COMMON_CLK, clk)
++ #define IOMMU_OF_TABLES()	OF_TABLE(CONFIG_OF_IOMMU, iommu)
++ #define RESERVEDMEM_OF_TABLES()	OF_TABLE(CONFIG_OF_RESERVED_MEM, reservedmem)
++ #define CPU_METHOD_OF_TABLES()	OF_TABLE(CONFIG_SMP, cpu_method)
++ #define EARLYCON_OF_TABLES()	OF_TABLE(CONFIG_SERIAL_EARLYCON, earlycon)
+++>>>>>>> 1cd076bf6779 (iommu: provide early initialisation hook for IOMMU drivers)
+  
+  #define KERNEL_DTB()							\
+  	STRUCT_ALIGN();							\
+@@@ -497,12 -493,16 +507,17 @@@
+  	*(.init.rodata)							\
+  	FTRACE_EVENTS()							\
+  	TRACE_SYSCALLS()						\
+ -	KPROBE_BLACKLIST()						\
+ +	CPU_DISCARD(init.rodata)					\
+  	MEM_DISCARD(init.rodata)					\
+  	CLK_OF_TABLES()							\
+ -	RESERVEDMEM_OF_TABLES()						\
+  	CLKSRC_OF_TABLES()						\
+++<<<<<<< HEAD
+++=======
++ 	IOMMU_OF_TABLES()						\
++ 	CPU_METHOD_OF_TABLES()						\
+++>>>>>>> 1cd076bf6779 (iommu: provide early initialisation hook for IOMMU drivers)
+  	KERNEL_DTB()							\
+ -	IRQCHIP_OF_MATCH_TABLE()					\
+ -	EARLYCON_OF_TABLES()
+ +	IRQCHIP_OF_MATCH_TABLE()
+  
+  #define INIT_TEXT							\
+  	*(.init.text)							\
+diff --git a/drivers/iommu/of_iommu.c b/drivers/iommu/of_iommu.c
+index e550ccb7634e..89b903406968 100644
+--- a/drivers/iommu/of_iommu.c
++++ b/drivers/iommu/of_iommu.c
+@@ -22,6 +22,9 @@
+ #include <linux/of.h>
+ #include <linux/of_iommu.h>
+ 
++static const struct of_device_id __iommu_of_table_sentinel
++	__used __section(__iommu_of_table_end);
++
+ /**
+  * of_get_dma_window - Parse *dma-window property and returns 0 if found.
+  *
+@@ -89,3 +92,17 @@ int of_get_dma_window(struct device_node *dn, const char *prefix, int index,
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(of_get_dma_window);
++
++void __init of_iommu_init(void)
++{
++	struct device_node *np;
++	const struct of_device_id *match, *matches = &__iommu_of_table;
++
++	for_each_matching_node_and_match(np, matches, &match) {
++		const of_iommu_init_fn init_fn = match->data;
++
++		if (init_fn(np))
++			pr_err("Failed to initialise IOMMU %s\n",
++				of_node_full_name(np));
++	}
++}
+* Unmerged path include/asm-generic/vmlinux.lds.h
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 1aebc8512b1e..2a84db9ab384 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -87,6 +87,7 @@ enum iommu_attr {
+  * @domain_get_attr: Query domain attributes
+  * @domain_set_attr: Change domain attributes
+  * @pgsize_bitmap: bitmap of supported page sizes
++ * @priv: per-instance data private to the iommu driver
+  */
+ struct iommu_ops {
+ 	bool (*capable)(enum iommu_cap);
+@@ -117,6 +118,7 @@ struct iommu_ops {
+ 	u32 (*domain_get_windows)(struct iommu_domain *domain);
+ 
+ 	unsigned long pgsize_bitmap;
++	void *priv;
+ };
+ 
+ #define IOMMU_GROUP_NOTIFY_ADD_DEVICE		1 /* Device added */
+diff --git a/include/linux/of_iommu.h b/include/linux/of_iommu.h
+index 51a560f34bca..5762cdc8effe 100644
+--- a/include/linux/of_iommu.h
++++ b/include/linux/of_iommu.h
+@@ -1,12 +1,17 @@
+ #ifndef __OF_IOMMU_H
+ #define __OF_IOMMU_H
+ 
++#include <linux/iommu.h>
++#include <linux/of.h>
++
+ #ifdef CONFIG_OF_IOMMU
+ 
+ extern int of_get_dma_window(struct device_node *dn, const char *prefix,
+ 			     int index, unsigned long *busno, dma_addr_t *addr,
+ 			     size_t *size);
+ 
++extern void of_iommu_init(void);
++
+ #else
+ 
+ static inline int of_get_dma_window(struct device_node *dn, const char *prefix,
+@@ -16,6 +21,26 @@ static inline int of_get_dma_window(struct device_node *dn, const char *prefix,
+ 	return -EINVAL;
+ }
+ 
++static inline void of_iommu_init(void) { }
++
+ #endif	/* CONFIG_OF_IOMMU */
+ 
++static inline void of_iommu_set_ops(struct device_node *np,
++				    const struct iommu_ops *ops)
++{
++	np->data = (struct iommu_ops *)ops;
++}
++
++static inline struct iommu_ops *of_iommu_get_ops(struct device_node *np)
++{
++	return np->data;
++}
++
++extern struct of_device_id __iommu_of_table;
++
++typedef int (*of_iommu_init_fn)(struct device_node *);
++
++#define IOMMU_OF_DECLARE(name, compat, fn) \
++	_OF_DECLARE(iommu, name, compat, fn, of_iommu_init_fn)
++
+ #endif /* __OF_IOMMU_H */
