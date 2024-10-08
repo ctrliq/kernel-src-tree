@@ -1,0 +1,119 @@
+Drivers: hv: vmbus: fix init_vp_index() for reloading hv_netvsc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hv] vmbus: fix init_vp_index() for reloading hv_netvsc (Vitaly Kuznetsov) [1321073]
+Rebuild_FUZZ: 88.50%
+commit-author Dexuan Cui <decui@microsoft.com>
+commit ca1c4b745779e20711322b3338f3a942a3c1224a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ca1c4b74.failed
+
+This fixes the recent commit 3b71107d73b16074afa7658f3f0fcf837aabfe24:
+Drivers: hv: vmbus: Further improve CPU affiliation logic
+
+Without the fix, reloading hv_netvsc hangs the guest.
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ca1c4b745779e20711322b3338f3a942a3c1224a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel_mgmt.c
+diff --cc drivers/hv/channel_mgmt.c
+index 19b6510e7e18,652afd11a9ef..000000000000
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@@ -205,8 -210,17 +207,16 @@@ void hv_process_channel_removal(struct 
+  		primary_channel = channel->primary_channel;
+  		spin_lock_irqsave(&primary_channel->lock, flags);
+  		list_del(&channel->sc_list);
+ -		primary_channel->num_sc--;
+  		spin_unlock_irqrestore(&primary_channel->lock, flags);
+  	}
++ 
++ 	/*
++ 	 * We need to free the bit for init_vp_index() to work in the case
++ 	 * of sub-channel, when we reload drivers like hv_netvsc.
++ 	 */
++ 	cpumask_clear_cpu(channel->target_cpu,
++ 			  &primary_channel->alloced_cpus_in_node);
++ 
+  	free_channel(channel);
+  }
+  
+@@@ -409,7 -424,66 +419,70 @@@ static void init_vp_index(struct vmbus_
+  		channel->target_vp = hv_context.vp_index[0];
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	cur_cpu = (++next_vp % max_cpus);
+++=======
++ 
++ 	/*
++ 	 * We distribute primary channels evenly across all the available
++ 	 * NUMA nodes and within the assigned NUMA node we will assign the
++ 	 * first available CPU to the primary channel.
++ 	 * The sub-channels will be assigned to the CPUs available in the
++ 	 * NUMA node evenly.
++ 	 */
++ 	if (!primary) {
++ 		while (true) {
++ 			next_node = next_numa_node_id++;
++ 			if (next_node == nr_node_ids)
++ 				next_node = next_numa_node_id = 0;
++ 			if (cpumask_empty(cpumask_of_node(next_node)))
++ 				continue;
++ 			break;
++ 		}
++ 		channel->numa_node = next_node;
++ 		primary = channel;
++ 	}
++ 	alloced_mask = &hv_context.hv_numa_map[primary->numa_node];
++ 
++ 	if (cpumask_weight(alloced_mask) ==
++ 	    cpumask_weight(cpumask_of_node(primary->numa_node))) {
++ 		/*
++ 		 * We have cycled through all the CPUs in the node;
++ 		 * reset the alloced map.
++ 		 */
++ 		cpumask_clear(alloced_mask);
++ 	}
++ 
++ 	cpumask_xor(&available_mask, alloced_mask,
++ 		    cpumask_of_node(primary->numa_node));
++ 
++ 	cur_cpu = -1;
++ 	while (true) {
++ 		cur_cpu = cpumask_next(cur_cpu, &available_mask);
++ 		if (cur_cpu >= nr_cpu_ids) {
++ 			cur_cpu = -1;
++ 			cpumask_copy(&available_mask,
++ 				     cpumask_of_node(primary->numa_node));
++ 			continue;
++ 		}
++ 
++ 		/*
++ 		 * NOTE: in the case of sub-channel, we clear the sub-channel
++ 		 * related bit(s) in primary->alloced_cpus_in_node in
++ 		 * hv_process_channel_removal(), so when we reload drivers
++ 		 * like hv_netvsc in SMP guest, here we're able to re-allocate
++ 		 * bit from primary->alloced_cpus_in_node.
++ 		 */
++ 		if (!cpumask_test_cpu(cur_cpu,
++ 				&primary->alloced_cpus_in_node)) {
++ 			cpumask_set_cpu(cur_cpu,
++ 					&primary->alloced_cpus_in_node);
++ 			cpumask_set_cpu(cur_cpu, alloced_mask);
++ 			break;
++ 		}
++ 	}
++ 
+++>>>>>>> ca1c4b745779 (Drivers: hv: vmbus: fix init_vp_index() for reloading hv_netvsc)
+  	channel->target_cpu = cur_cpu;
+  	channel->target_vp = hv_context.vp_index[cur_cpu];
+  }
+* Unmerged path drivers/hv/channel_mgmt.c
