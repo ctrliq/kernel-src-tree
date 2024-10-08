@@ -196,8 +196,8 @@ struct pci_vpd_pci22 {
 	struct pci_vpd base;
 	struct mutex lock;
 	u16	flag;
-	bool	busy;
 	u8	cap;
+	u8	busy:1;
 };
 
 /*
@@ -226,7 +226,7 @@ static int pci_vpd_pci22_wait(struct pci_dev *dev)
 			return ret;
 
 		if ((status & PCI_VPD_ADDR_F) == vpd->flag) {
-			vpd->busy = false;
+			vpd->busy = 0;
 			return 0;
 		}
 
@@ -268,7 +268,7 @@ static ssize_t pci_vpd_pci22_read(struct pci_dev *dev, loff_t pos, size_t count,
 						 pos & ~3);
 		if (ret < 0)
 			break;
-		vpd->busy = true;
+		vpd->busy = 1;
 		vpd->flag = PCI_VPD_ADDR_F;
 		ret = pci_vpd_pci22_wait(dev);
 		if (ret < 0)
@@ -328,7 +328,7 @@ static ssize_t pci_vpd_pci22_write(struct pci_dev *dev, loff_t pos, size_t count
 		if (ret < 0)
 			break;
 
-		vpd->busy = true;
+		vpd->busy = 1;
 		vpd->flag = 0;
 		ret = pci_vpd_pci22_wait(dev);
 		if (ret < 0)
@@ -408,7 +408,7 @@ int pci_vpd_pci22_init(struct pci_dev *dev)
 		vpd->base.ops = &pci_vpd_pci22_ops;
 	mutex_init(&vpd->lock);
 	vpd->cap = cap;
-	vpd->busy = false;
+	vpd->busy = 0;
 	dev->vpd = &vpd->base;
 	return 0;
 }
