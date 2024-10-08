@@ -54,6 +54,7 @@ static inline char *bfd_demangle(void __maybe_unused *v,
 #endif
 
 #ifndef DMGL_PARAMS
+#define DMGL_NO_OPTS     0              /* For readability... */
 #define DMGL_PARAMS      (1 << 0)       /* Include function args */
 #define DMGL_ANSI        (1 << 1)       /* Include const, volatile, etc */
 #endif
