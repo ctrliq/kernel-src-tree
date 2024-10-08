@@ -302,7 +302,7 @@ static __init int thermal_throttle_init_device(void)
 	if (!atomic_read(&therm_throt_en))
 		return 0;
 
-	register_hotcpu_notifier(&thermal_throttle_cpu_notifier);
+	cpu_notifier_register_begin();
 
 #ifdef CONFIG_HOTPLUG_CPU
 	mutex_lock(&therm_cpu_lock);
@@ -315,6 +315,9 @@ static __init int thermal_throttle_init_device(void)
 #ifdef CONFIG_HOTPLUG_CPU
 	mutex_unlock(&therm_cpu_lock);
 #endif
+
+	__register_hotcpu_notifier(&thermal_throttle_cpu_notifier);
+	cpu_notifier_register_done();
 
 	return 0;
 }
