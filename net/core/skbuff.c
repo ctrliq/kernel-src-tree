@@ -539,7 +539,7 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int len,
 
 	skb = __build_skb(data, len);
 	if (unlikely(!skb)) {
-		put_page(virt_to_head_page(data));
+		skb_free_frag(data);
 		return NULL;
 	}
 
@@ -593,7 +593,7 @@ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi, unsigned int len,
 
 	skb = __build_skb(data, len);
 	if (unlikely(!skb)) {
-		put_page(virt_to_head_page(data));
+		skb_free_frag(data);
 		return NULL;
 	}
 
@@ -640,10 +640,12 @@ static void skb_clone_fraglist(struct sk_buff *skb)
 
 static void skb_free_head(struct sk_buff *skb)
 {
+	unsigned char *head = skb->head;
+
 	if (skb->head_frag)
-		put_page(virt_to_head_page(skb->head));
+		skb_free_frag(head);
 	else
-		kfree(skb->head);
+		kfree(head);
 }
 
 static void skb_release_data(struct sk_buff *skb)
