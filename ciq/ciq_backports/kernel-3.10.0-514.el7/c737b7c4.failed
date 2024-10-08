@@ -1,0 +1,319 @@
+netfilter: bridge: add helpers for fetching physin/outdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit c737b7c4510026c200e14de51eb0006adea0fb2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c737b7c4.failed
+
+right now we store this in the nf_bridge_info struct, accessible
+via skb->nf_bridge.  This patch prepares removal of this pointer from skb:
+
+Instead of using skb->nf_bridge->x, we use helpers to obtain the in/out
+device (or ifindexes).
+
+Followup patches to netfilter will then allow nf_bridge_info to be
+obtained by a call into the br_netfilter core, rather than keeping a
+pointer to it in sk_buff.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit c737b7c4510026c200e14de51eb0006adea0fb2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/netfilter/nf_reject_ipv4.c
+#	net/ipv6/netfilter/nf_reject_ipv6.c
+#	net/netfilter/ipset/ip_set_hash_netiface.c
+diff --cc net/netfilter/ipset/ip_set_hash_netiface.c
+index 84ae6f6ce624,380ef5148ea1..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_netiface.c
++++ b/net/netfilter/ipset/ip_set_hash_netiface.c
+@@@ -283,13 -254,12 +300,17 @@@ hash_netiface4_kadt(struct ip_set *set
+  #define SRCDIR		(opt->flags & IPSET_DIM_TWO_SRC)
+  
+  	if (opt->cmdflags & IPSET_FLAG_PHYSDEV) {
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +		const struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+++=======
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ 		e.iface = SRCDIR ? get_physindev_name(skb) :
++ 				   get_phyoutdev_name(skb);
+++>>>>>>> c737b7c45100 (netfilter: bridge: add helpers for fetching physin/outdev)
+  
+- 		if (!nf_bridge)
++ 		if (!e.iface)
+  			return -EINVAL;
+- 		e.iface = SRCDIR ? PHYSDEV(physindev) : PHYSDEV(physoutdev);
+  		e.physdev = 1;
+  #else
+  		e.iface = NULL;
+@@@ -549,12 -491,12 +570,19 @@@ hash_netiface6_kadt(struct ip_set *set
+  	ip6_netmask(&e.ip, e.cidr);
+  
+  	if (opt->cmdflags & IPSET_FLAG_PHYSDEV) {
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +		const struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+ +
+ +		if (!nf_bridge)
+++=======
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ 		e.iface = SRCDIR ? get_physindev_name(skb) :
++ 				   get_phyoutdev_name(skb);
++ 		if (!e.iface)
+++>>>>>>> c737b7c45100 (netfilter: bridge: add helpers for fetching physin/outdev)
+  			return -EINVAL;
+- 		e.iface = SRCDIR ? PHYSDEV(physindev) : PHYSDEV(physoutdev);
++ 
+  		e.physdev = 1;
+  #else
+  		e.iface = NULL;
+* Unmerged path net/ipv4/netfilter/nf_reject_ipv4.c
+* Unmerged path net/ipv6/netfilter/nf_reject_ipv6.c
+diff --git a/include/linux/netfilter_bridge.h b/include/linux/netfilter_bridge.h
+index 91f08439b405..9eacea1ee358 100644
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@ -2,7 +2,7 @@
+ #define __LINUX_BRIDGE_NETFILTER_H
+ 
+ #include <uapi/linux/netfilter_bridge.h>
+-
++#include <linux/skbuff.h>
+ 
+ enum nf_br_hook_priorities {
+ 	NF_BR_PRI_FIRST = INT_MIN,
+@@ -111,6 +111,27 @@ static inline void br_drop_fake_rtable(struct sk_buff *skb)
+ 		skb_dst_drop(skb);
+ }
+ 
++static inline int nf_bridge_get_physinif(const struct sk_buff *skb)
++{
++	return skb->nf_bridge ? skb->nf_bridge->physindev->ifindex : 0;
++}
++
++static inline int nf_bridge_get_physoutif(const struct sk_buff *skb)
++{
++	return skb->nf_bridge ? skb->nf_bridge->physoutdev->ifindex : 0;
++}
++
++static inline struct net_device *
++nf_bridge_get_physindev(const struct sk_buff *skb)
++{
++	return skb->nf_bridge ? skb->nf_bridge->physindev : NULL;
++}
++
++static inline struct net_device *
++nf_bridge_get_physoutdev(const struct sk_buff *skb)
++{
++	return skb->nf_bridge ? skb->nf_bridge->physoutdev : NULL;
++}
+ #else
+ #define nf_bridge_maybe_copy_header(skb)	(0)
+ #define nf_bridge_pad(skb)			(0)
+* Unmerged path net/ipv4/netfilter/nf_reject_ipv4.c
+* Unmerged path net/ipv6/netfilter/nf_reject_ipv6.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_netiface.c
+diff --git a/net/netfilter/nf_log_common.c b/net/netfilter/nf_log_common.c
+index eeb8ef4ff1a3..922fcaa2ae83 100644
+--- a/net/netfilter/nf_log_common.c
++++ b/net/netfilter/nf_log_common.c
+@@ -17,6 +17,7 @@
+ #include <net/route.h>
+ 
+ #include <linux/netfilter.h>
++#include <linux/netfilter_bridge.h>
+ #include <linux/netfilter/xt_LOG.h>
+ #include <net/netfilter/nf_log.h>
+ 
+@@ -163,10 +164,10 @@ nf_log_dump_packet_common(struct nf_log_buf *m, u_int8_t pf,
+ 		const struct net_device *physindev;
+ 		const struct net_device *physoutdev;
+ 
+-		physindev = skb->nf_bridge->physindev;
++		physindev = nf_bridge_get_physindev(skb);
+ 		if (physindev && in != physindev)
+ 			nf_log_buf_add(m, "PHYSIN=%s ", physindev->name);
+-		physoutdev = skb->nf_bridge->physoutdev;
++		physoutdev = nf_bridge_get_physoutdev(skb);
+ 		if (physoutdev && out != physoutdev)
+ 			nf_log_buf_add(m, "PHYSOUT=%s ", physoutdev->name);
+ 	}
+diff --git a/net/netfilter/nf_queue.c b/net/netfilter/nf_queue.c
+index 9aff1d2fbfd7..c3fb33602e8d 100644
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@ -10,6 +10,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/skbuff.h>
+ #include <linux/netfilter.h>
++#include <linux/netfilter_bridge.h>
+ #include <linux/seq_file.h>
+ #include <linux/rcupdate.h>
+ #include <net/protocol.h>
+@@ -58,12 +59,14 @@ void nf_queue_entry_release_refs(struct nf_queue_entry *entry)
+ 		sock_put(state->sk);
+ #ifdef CONFIG_BRIDGE_NETFILTER
+ 	if (entry->skb->nf_bridge) {
+-		struct nf_bridge_info *nf_bridge = entry->skb->nf_bridge;
++		struct net_device *physdev;
+ 
+-		if (nf_bridge->physindev)
+-			dev_put(nf_bridge->physindev);
+-		if (nf_bridge->physoutdev)
+-			dev_put(nf_bridge->physoutdev);
++		physdev = nf_bridge_get_physindev(entry->skb);
++		if (physdev)
++			dev_put(physdev);
++		physdev = nf_bridge_get_physoutdev(entry->skb);
++		if (physdev)
++			dev_put(physdev);
+ 	}
+ #endif
+ 	/* Drop reference to owner of hook which queued us. */
+@@ -87,13 +90,12 @@ bool nf_queue_entry_get_refs(struct nf_queue_entry *entry)
+ 		sock_hold(state->sk);
+ #ifdef CONFIG_BRIDGE_NETFILTER
+ 	if (entry->skb->nf_bridge) {
+-		struct nf_bridge_info *nf_bridge = entry->skb->nf_bridge;
+ 		struct net_device *physdev;
+ 
+-		physdev = nf_bridge->physindev;
++		physdev = nf_bridge_get_physindev(entry->skb);
+ 		if (physdev)
+ 			dev_hold(physdev);
+-		physdev = nf_bridge->physoutdev;
++		physdev = nf_bridge_get_physoutdev(entry->skb);
+ 		if (physdev)
+ 			dev_hold(physdev);
+ 	}
+diff --git a/net/netfilter/nfnetlink_log.c b/net/netfilter/nfnetlink_log.c
+index 096d94c457ab..6272ddf2db6e 100644
+--- a/net/netfilter/nfnetlink_log.c
++++ b/net/netfilter/nfnetlink_log.c
+@@ -20,6 +20,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/netdevice.h>
+ #include <linux/netfilter.h>
++#include <linux/netfilter_bridge.h>
+ #include <net/netlink.h>
+ #include <linux/netfilter/nfnetlink.h>
+ #include <linux/netfilter/nfnetlink_log.h>
+@@ -445,14 +446,18 @@ __build_packet_message(struct nfnl_log_net *log,
+ 					 htonl(br_port_get_rcu(indev)->br->dev->ifindex)))
+ 				goto nla_put_failure;
+ 		} else {
++			struct net_device *physindev;
++
+ 			/* Case 2: indev is bridge group, we need to look for
+ 			 * physical device (when called from ipv4) */
+ 			if (nla_put_be32(inst->skb, NFULA_IFINDEX_INDEV,
+ 					 htonl(indev->ifindex)))
+ 				goto nla_put_failure;
+-			if (skb->nf_bridge && skb->nf_bridge->physindev &&
++
++			physindev = nf_bridge_get_physindev(skb);
++			if (physindev &&
+ 			    nla_put_be32(inst->skb, NFULA_IFINDEX_PHYSINDEV,
+-					 htonl(skb->nf_bridge->physindev->ifindex)))
++					 htonl(physindev->ifindex)))
+ 				goto nla_put_failure;
+ 		}
+ #endif
+@@ -476,14 +481,18 @@ __build_packet_message(struct nfnl_log_net *log,
+ 					 htonl(br_port_get_rcu(outdev)->br->dev->ifindex)))
+ 				goto nla_put_failure;
+ 		} else {
++			struct net_device *physoutdev;
++
+ 			/* Case 2: indev is a bridge group, we need to look
+ 			 * for physical device (when called from ipv4) */
+ 			if (nla_put_be32(inst->skb, NFULA_IFINDEX_OUTDEV,
+ 					 htonl(outdev->ifindex)))
+ 				goto nla_put_failure;
+-			if (skb->nf_bridge && skb->nf_bridge->physoutdev &&
++
++			physoutdev = nf_bridge_get_physoutdev(skb);
++			if (physoutdev &&
+ 			    nla_put_be32(inst->skb, NFULA_IFINDEX_PHYSOUTDEV,
+-					 htonl(skb->nf_bridge->physoutdev->ifindex)))
++					 htonl(physoutdev->ifindex)))
+ 				goto nla_put_failure;
+ 		}
+ #endif
+diff --git a/net/netfilter/nfnetlink_queue_core.c b/net/netfilter/nfnetlink_queue_core.c
+index b5cda594b57a..782204d8d262 100644
+--- a/net/netfilter/nfnetlink_queue_core.c
++++ b/net/netfilter/nfnetlink_queue_core.c
+@@ -25,6 +25,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/netfilter_ipv4.h>
+ #include <linux/netfilter_ipv6.h>
++#include <linux/netfilter_bridge.h>
+ #include <linux/netfilter/nfnetlink.h>
+ #include <linux/netfilter/nfnetlink_queue.h>
+ #include <linux/list.h>
+@@ -357,14 +358,18 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
+ 					 htonl(br_port_get_rcu(indev)->br->dev->ifindex)))
+ 				goto nla_put_failure;
+ 		} else {
++			int physinif;
++
+ 			/* Case 2: indev is bridge group, we need to look for
+ 			 * physical device (when called from ipv4) */
+ 			if (nla_put_be32(skb, NFQA_IFINDEX_INDEV,
+ 					 htonl(indev->ifindex)))
+ 				goto nla_put_failure;
+-			if (entskb->nf_bridge && entskb->nf_bridge->physindev &&
++
++			physinif = nf_bridge_get_physinif(entskb);
++			if (physinif &&
+ 			    nla_put_be32(skb, NFQA_IFINDEX_PHYSINDEV,
+-					 htonl(entskb->nf_bridge->physindev->ifindex)))
++					 htonl(physinif)))
+ 				goto nla_put_failure;
+ 		}
+ #endif
+@@ -387,14 +392,18 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
+ 					 htonl(br_port_get_rcu(outdev)->br->dev->ifindex)))
+ 				goto nla_put_failure;
+ 		} else {
++			int physoutif;
++
+ 			/* Case 2: outdev is bridge group, we need to look for
+ 			 * physical output device (when called from ipv4) */
+ 			if (nla_put_be32(skb, NFQA_IFINDEX_OUTDEV,
+ 					 htonl(outdev->ifindex)))
+ 				goto nla_put_failure;
+-			if (entskb->nf_bridge && entskb->nf_bridge->physoutdev &&
++
++			physoutif = nf_bridge_get_physoutif(entskb);
++			if (physoutif &&
+ 			    nla_put_be32(skb, NFQA_IFINDEX_PHYSOUTDEV,
+-					 htonl(entskb->nf_bridge->physoutdev->ifindex)))
++					 htonl(physoutif)))
+ 				goto nla_put_failure;
+ 		}
+ #endif
+@@ -726,11 +735,12 @@ dev_cmp(struct nf_queue_entry *entry, unsigned long ifindex)
+ 			return 1;
+ #ifdef CONFIG_BRIDGE_NETFILTER
+ 	if (entry->skb->nf_bridge) {
+-		if (entry->skb->nf_bridge->physindev &&
+-		    entry->skb->nf_bridge->physindev->ifindex == ifindex)
+-			return 1;
+-		if (entry->skb->nf_bridge->physoutdev &&
+-		    entry->skb->nf_bridge->physoutdev->ifindex == ifindex)
++		int physinif, physoutif;
++
++		physinif = nf_bridge_get_physinif(entry->skb);
++		physoutif = nf_bridge_get_physoutif(entry->skb);
++
++		if (physinif == ifindex || physoutif == ifindex)
+ 			return 1;
+ 	}
+ #endif
