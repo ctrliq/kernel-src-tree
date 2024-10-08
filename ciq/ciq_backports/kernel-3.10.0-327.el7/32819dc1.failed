@@ -1,0 +1,192 @@
+bonding: modify the old and add new xmit hash policies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit 32819dc1834866cb9547cb75f81af9edd58d33cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/32819dc1.failed
+
+This patch adds two new hash policy modes which use skb_flow_dissect:
+3 - Encapsulated layer 2+3
+4 - Encapsulated layer 3+4
+There should be a good improvement for tunnel users in those modes.
+It also changes the old hash functions to:
+hash ^= (__force u32)flow.dst ^ (__force u32)flow.src;
+hash ^= (hash >> 16);
+hash ^= (hash >> 8);
+
+Where hash will be initialized either to L2 hash, that is
+SRCMAC[5] XOR DSTMAC[5], or to flow->ports which should be extracted
+from the upper layer. Flow's dst and src are also extracted based on the
+xmit policy either directly from the buffer or by using skb_flow_dissect,
+but in both cases if the protocol is IPv6 then dst and src are obtained by
+ipv6_addr_hash() on the real addresses. In case of a non-dissectable
+packet, the algorithms fall back to L2 hashing.
+The bond_set_mode_ops() function is now obsolete and thus deleted
+because it was used only to set the proper hash policy. Also we trim a
+pointer from struct bonding because we no longer need to keep the hash
+function, now there's only a single hash function - bond_xmit_hash that
+works based on bond->params.xmit_policy.
+
+The hash function and skb_flow_dissect were suggested by Eric Dumazet.
+The layer names were suggested by Andy Gospodarek, because I suck at
+semantics.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 32819dc1834866cb9547cb75f81af9edd58d33cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_3ad.c
+index 466dba240756,ea3e64e22e22..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -2439,15 -2403,24 +2439,20 @@@ int bond_3ad_xmit_xor(struct sk_buff *s
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	slave_agg_no = bond->xmit_hash_policy(skb, slaves_in_agg);
+++=======
++ 	slave_agg_no = bond_xmit_hash(bond, skb, slaves_in_agg);
++ 	first_ok_slave = NULL;
+++>>>>>>> 32819dc18348 (bonding: modify the old and add new xmit hash policies)
+  
+ -	bond_for_each_slave(bond, slave, iter) {
+ -		agg = SLAVE_AD_INFO(slave).port.aggregator;
+ -		if (!agg || agg->aggregator_identifier != agg_id)
+ -			continue;
+ +	bond_for_each_slave(bond, slave, i) {
+ +		struct aggregator *agg = SLAVE_AD_INFO(slave).port.aggregator;
+  
+ -		if (slave_agg_no >= 0) {
+ -			if (!first_ok_slave && SLAVE_IS_OK(slave))
+ -				first_ok_slave = slave;
+ +		if (agg && (agg->aggregator_identifier == agg_id)) {
+  			slave_agg_no--;
+ -			continue;
+ -		}
+ -
+ -		if (SLAVE_IS_OK(slave)) {
+ -			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ -			goto out;
+ +			if (slave_agg_no < 0)
+ +				break;
+  		}
+  	}
+  
+diff --cc drivers/net/bonding/bond_main.c
+index 05a57077bb1c,dfb4f6dd5de0..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -77,6 -77,8 +77,11 @@@
+  #include <net/net_namespace.h>
+  #include <net/netns/generic.h>
+  #include <net/pkt_sched.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/rculist.h>
++ #include <net/flow_keys.h>
+++>>>>>>> 32819dc18348 (bonding: modify the old and add new xmit hash policies)
+  #include "bonding.h"
+  #include "bond_3ad.h"
+  #include "bond_alb.h"
+@@@ -3986,34 -3718,8 +3979,38 @@@ static int bond_xmit_activebackup(struc
+  static int bond_xmit_xor(struct sk_buff *skb, struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+ +	struct slave *slave, *start_at;
+ +	int slave_no;
+ +	int i;
+ +	int res = 1;
+ +
+++<<<<<<< HEAD
+ +	slave_no = bond->xmit_hash_policy(skb, bond->slave_cnt);
+  
+ +	bond_for_each_slave(bond, slave, i) {
+ +		slave_no--;
+ +		if (slave_no < 0)
+ +			break;
+ +	}
+ +
+ +	start_at = slave;
+ +
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		if (IS_UP(slave->dev) &&
+ +		    (slave->link == BOND_LINK_UP) &&
+ +		    bond_is_active_slave(slave)) {
+ +			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+ +	}
+++=======
++ 	bond_xmit_slave_id(bond, skb, bond_xmit_hash(bond, skb, bond->slave_cnt));
+++>>>>>>> 32819dc18348 (bonding: modify the old and add new xmit hash policies)
+  
+  	return NETDEV_TX_OK;
+  }
+diff --cc drivers/net/bonding/bonding.h
+index d605c88d8e52,0bd04fbda8e9..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -233,8 -217,6 +233,11 @@@ struct bonding 
+  	char     proc_file_name[IFNAMSIZ];
+  #endif /* CONFIG_PROC_FS */
+  	struct   list_head bond_list;
+++<<<<<<< HEAD
+ +	struct   netdev_hw_addr_list mc_list;
+ +	int      (*xmit_hash_policy)(struct sk_buff *, int);
+++=======
+++>>>>>>> 32819dc18348 (bonding: modify the old and add new xmit hash policies)
+  	u16      rr_tx_counter;
+  	struct   ad_bond_info ad_info;
+  	struct   alb_bond_info alb_info;
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/bonding/bond_sysfs.c b/drivers/net/bonding/bond_sysfs.c
+index 739d4dbe8629..1b29d23eac6a 100644
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@ -351,7 +351,6 @@ static ssize_t bonding_store_mode(struct device *d,
+ 	/* don't cache arp_validate between modes */
+ 	bond->params.arp_validate = BOND_ARP_VALIDATE_NONE;
+ 	bond->params.mode = new_value;
+-	bond_set_mode_ops(bond, bond->params.mode);
+ 	pr_info("%s: setting mode to %s (%d).\n",
+ 		bond->dev->name, bond_mode_tbl[new_value].modename,
+ 		new_value);
+@@ -391,7 +390,6 @@ static ssize_t bonding_store_xmit_hash(struct device *d,
+ 		ret = -EINVAL;
+ 	} else {
+ 		bond->params.xmit_policy = new_value;
+-		bond_set_mode_ops(bond, bond->params.mode);
+ 		pr_info("%s: setting xmit hash policy to %s (%d).\n",
+ 			bond->dev->name,
+ 			xmit_hashtype_tbl[new_value].modename, new_value);
+* Unmerged path drivers/net/bonding/bonding.h
+diff --git a/include/uapi/linux/if_bonding.h b/include/uapi/linux/if_bonding.h
+index a17edda8a781..9635a62f6f89 100644
+--- a/include/uapi/linux/if_bonding.h
++++ b/include/uapi/linux/if_bonding.h
+@@ -91,6 +91,8 @@
+ #define BOND_XMIT_POLICY_LAYER2		0 /* layer 2 (MAC only), default */
+ #define BOND_XMIT_POLICY_LAYER34	1 /* layer 3+4 (IP ^ (TCP || UDP)) */
+ #define BOND_XMIT_POLICY_LAYER23	2 /* layer 2+3 (IP ^ MAC) */
++#define BOND_XMIT_POLICY_ENCAP23	3 /* encapsulated layer 2+3 */
++#define BOND_XMIT_POLICY_ENCAP34	4 /* encapsulated layer 3+4 */
+ 
+ typedef struct ifbond {
+ 	__s32 bond_mode;
