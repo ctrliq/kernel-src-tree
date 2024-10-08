@@ -1,0 +1,187 @@
+KVM: PPC: Book3S PR: Expose TM registers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: book3s/pr - Expose TM registers (David Gibson) [1123145 1123133 1123367]
+Rebuild_FUZZ: 90.00%
+commit-author Alexander Graf <agraf@suse.de>
+commit 9916d57e64a49d85bcffe272478f869b8fe1583a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9916d57e.failed
+
+POWER8 introduces transactional memory which brings along a number of new
+registers and MSR bits.
+
+Implementing all of those is a pretty big headache, so for now let's at least
+emulate enough to make Linux's context switching code happy.
+
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 9916d57e64a49d85bcffe272478f869b8fe1583a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_emulate.c
+#	arch/powerpc/kvm/book3s_pr.c
+diff --cc arch/powerpc/kvm/book3s_emulate.c
+index b7863af892e8,9bdff159ad2a..000000000000
+--- a/arch/powerpc/kvm/book3s_emulate.c
++++ b/arch/powerpc/kvm/book3s_emulate.c
+@@@ -438,6 -438,31 +438,34 @@@ int kvmppc_core_emulate_mtspr(struct kv
+  	case SPRN_GQR7:
+  		to_book3s(vcpu)->gqr[sprn - SPRN_GQR0] = spr_val;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case SPRN_FSCR:
++ 		vcpu->arch.fscr = spr_val;
++ 		break;
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	case SPRN_BESCR:
++ 		vcpu->arch.bescr = spr_val;
++ 		break;
++ 	case SPRN_EBBHR:
++ 		vcpu->arch.ebbhr = spr_val;
++ 		break;
++ 	case SPRN_EBBRR:
++ 		vcpu->arch.ebbrr = spr_val;
++ 		break;
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ 	case SPRN_TFHAR:
++ 		vcpu->arch.tfhar = spr_val;
++ 		break;
++ 	case SPRN_TEXASR:
++ 		vcpu->arch.texasr = spr_val;
++ 		break;
++ 	case SPRN_TFIAR:
++ 		vcpu->arch.tfiar = spr_val;
++ 		break;
++ #endif
++ #endif
+++>>>>>>> 9916d57e64a4 (KVM: PPC: Book3S PR: Expose TM registers)
+  	case SPRN_ICTC:
+  	case SPRN_THRM1:
+  	case SPRN_THRM2:
+@@@ -545,6 -570,31 +573,34 @@@ int kvmppc_core_emulate_mfspr(struct kv
+  	case SPRN_GQR7:
+  		*spr_val = to_book3s(vcpu)->gqr[sprn - SPRN_GQR0];
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case SPRN_FSCR:
++ 		*spr_val = vcpu->arch.fscr;
++ 		break;
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	case SPRN_BESCR:
++ 		*spr_val = vcpu->arch.bescr;
++ 		break;
++ 	case SPRN_EBBHR:
++ 		*spr_val = vcpu->arch.ebbhr;
++ 		break;
++ 	case SPRN_EBBRR:
++ 		*spr_val = vcpu->arch.ebbrr;
++ 		break;
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ 	case SPRN_TFHAR:
++ 		*spr_val = vcpu->arch.tfhar;
++ 		break;
++ 	case SPRN_TEXASR:
++ 		*spr_val = vcpu->arch.texasr;
++ 		break;
++ 	case SPRN_TFIAR:
++ 		*spr_val = vcpu->arch.tfiar;
++ 		break;
++ #endif
++ #endif
+++>>>>>>> 9916d57e64a4 (KVM: PPC: Book3S PR: Expose TM registers)
+  	case SPRN_THRM1:
+  	case SPRN_THRM2:
+  	case SPRN_THRM3:
+diff --cc arch/powerpc/kvm/book3s_pr.c
+index 4a72f612a23b,23367a7e44c3..000000000000
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@@ -718,8 -768,76 +718,81 @@@ static void kvmppc_handle_lost_ext(stru
+  	current->thread.regs->msr |= lost_ext;
+  }
+  
+++<<<<<<< HEAD
+ +int kvmppc_handle_exit(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ +                       unsigned int exit_nr)
+++=======
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 
++ static void kvmppc_trigger_fac_interrupt(struct kvm_vcpu *vcpu, ulong fac)
++ {
++ 	/* Inject the Interrupt Cause field and trigger a guest interrupt */
++ 	vcpu->arch.fscr &= ~(0xffULL << 56);
++ 	vcpu->arch.fscr |= (fac << 56);
++ 	kvmppc_book3s_queue_irqprio(vcpu, BOOK3S_INTERRUPT_FAC_UNAVAIL);
++ }
++ 
++ static void kvmppc_emulate_fac(struct kvm_vcpu *vcpu, ulong fac)
++ {
++ 	enum emulation_result er = EMULATE_FAIL;
++ 
++ 	if (!(kvmppc_get_msr(vcpu) & MSR_PR))
++ 		er = kvmppc_emulate_instruction(vcpu->run, vcpu);
++ 
++ 	if ((er != EMULATE_DONE) && (er != EMULATE_AGAIN)) {
++ 		/* Couldn't emulate, trigger interrupt in guest */
++ 		kvmppc_trigger_fac_interrupt(vcpu, fac);
++ 	}
++ }
++ 
++ /* Enable facilities (TAR, EBB, DSCR) for the guest */
++ static int kvmppc_handle_fac(struct kvm_vcpu *vcpu, ulong fac)
++ {
++ 	bool guest_fac_enabled;
++ 	BUG_ON(!cpu_has_feature(CPU_FTR_ARCH_207S));
++ 
++ 	/*
++ 	 * Not every facility is enabled by FSCR bits, check whether the
++ 	 * guest has this facility enabled at all.
++ 	 */
++ 	switch (fac) {
++ 	case FSCR_TAR_LG:
++ 	case FSCR_EBB_LG:
++ 		guest_fac_enabled = (vcpu->arch.fscr & (1ULL << fac));
++ 		break;
++ 	case FSCR_TM_LG:
++ 		guest_fac_enabled = kvmppc_get_msr(vcpu) & MSR_TM;
++ 		break;
++ 	default:
++ 		guest_fac_enabled = false;
++ 		break;
++ 	}
++ 
++ 	if (!guest_fac_enabled) {
++ 		/* Facility not enabled by the guest */
++ 		kvmppc_trigger_fac_interrupt(vcpu, fac);
++ 		return RESUME_GUEST;
++ 	}
++ 
++ 	switch (fac) {
++ 	case FSCR_TAR_LG:
++ 		/* TAR switching isn't lazy in Linux yet */
++ 		current->thread.tar = mfspr(SPRN_TAR);
++ 		mtspr(SPRN_TAR, vcpu->arch.tar);
++ 		vcpu->arch.shadow_fscr |= FSCR_TAR;
++ 		break;
++ 	default:
++ 		kvmppc_emulate_fac(vcpu, fac);
++ 		break;
++ 	}
++ 
++ 	return RESUME_GUEST;
++ }
++ #endif
++ 
++ int kvmppc_handle_exit_pr(struct kvm_run *run, struct kvm_vcpu *vcpu,
++ 			  unsigned int exit_nr)
+++>>>>>>> 9916d57e64a4 (KVM: PPC: Book3S PR: Expose TM registers)
+  {
+  	int r = RESUME_HOST;
+  	int s;
+* Unmerged path arch/powerpc/kvm/book3s_emulate.c
+* Unmerged path arch/powerpc/kvm/book3s_pr.c
