@@ -1,0 +1,293 @@
+xfs: fix broken i_nlink accounting for whiteout tmpfile inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 22419ac9fe5e79483596cebdbd1d1209c18bac1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/22419ac9.failed
+
+XFS uses the internal tmpfile() infrastructure for the whiteout inode
+used for RENAME_WHITEOUT operations. For tmpfile inodes, XFS allocates
+the inode, drops di_nlink, adds the inode to the agi unlinked list,
+calls d_tmpfile() which correspondingly drops i_nlink of the vfs inode,
+and then finishes the common inode setup (e.g., clear I_NEW and unlock).
+
+The d_tmpfile() call was originally made inxfs_create_tmpfile(), but was
+pulled up out of that function as part of the following commit to
+resolve a deadlock issue:
+
+	330033d6 xfs: fix tmpfile/selinux deadlock and initialize security
+
+As a result, callers of xfs_create_tmpfile() are responsible for either
+calling d_tmpfile() or fixing up i_nlink appropriately. The whiteout
+tmpfile allocation helper does neither. As a result, the vfs ->i_nlink
+becomes inconsistent with the on-disk ->di_nlink once xfs_rename() links
+it back into the source dentry and calls xfs_bumplink().
+
+Update the assert in xfs_rename() to help detect this problem in the
+future and update xfs_rename_alloc_whiteout() to decrement the link
+count as part of the manual tmpfile inode setup.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 22419ac9fe5e79483596cebdbd1d1209c18bac1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/xfs_inode.c
+index 3568db66c7f6,539a85fddbc2..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -2806,6 -2712,187 +2806,190 @@@ xfs_sort_for_rename
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ xfs_finish_rename(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_bmap_free	*free_list)
++ {
++ 	int			committed = 0;
++ 	int			error;
++ 
++ 	/*
++ 	 * If this is a synchronous mount, make sure that the rename transaction
++ 	 * goes to disk before returning to the user.
++ 	 */
++ 	if (tp->t_mountp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
++ 		xfs_trans_set_sync(tp);
++ 
++ 	error = xfs_bmap_finish(&tp, free_list, &committed);
++ 	if (error) {
++ 		xfs_bmap_cancel(free_list);
++ 		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
++ 		return error;
++ 	}
++ 
++ 	return xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++ }
++ 
++ /*
++  * xfs_cross_rename()
++  *
++  * responsible for handling RENAME_EXCHANGE flag in renameat2() sytemcall
++  */
++ STATIC int
++ xfs_cross_rename(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*dp1,
++ 	struct xfs_name		*name1,
++ 	struct xfs_inode	*ip1,
++ 	struct xfs_inode	*dp2,
++ 	struct xfs_name		*name2,
++ 	struct xfs_inode	*ip2,
++ 	struct xfs_bmap_free	*free_list,
++ 	xfs_fsblock_t		*first_block,
++ 	int			spaceres)
++ {
++ 	int		error = 0;
++ 	int		ip1_flags = 0;
++ 	int		ip2_flags = 0;
++ 	int		dp2_flags = 0;
++ 
++ 	/* Swap inode number for dirent in first parent */
++ 	error = xfs_dir_replace(tp, dp1, name1,
++ 				ip2->i_ino,
++ 				first_block, free_list, spaceres);
++ 	if (error)
++ 		goto out_trans_abort;
++ 
++ 	/* Swap inode number for dirent in second parent */
++ 	error = xfs_dir_replace(tp, dp2, name2,
++ 				ip1->i_ino,
++ 				first_block, free_list, spaceres);
++ 	if (error)
++ 		goto out_trans_abort;
++ 
++ 	/*
++ 	 * If we're renaming one or more directories across different parents,
++ 	 * update the respective ".." entries (and link counts) to match the new
++ 	 * parents.
++ 	 */
++ 	if (dp1 != dp2) {
++ 		dp2_flags = XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG;
++ 
++ 		if (S_ISDIR(ip2->i_d.di_mode)) {
++ 			error = xfs_dir_replace(tp, ip2, &xfs_name_dotdot,
++ 						dp1->i_ino, first_block,
++ 						free_list, spaceres);
++ 			if (error)
++ 				goto out_trans_abort;
++ 
++ 			/* transfer ip2 ".." reference to dp1 */
++ 			if (!S_ISDIR(ip1->i_d.di_mode)) {
++ 				error = xfs_droplink(tp, dp2);
++ 				if (error)
++ 					goto out_trans_abort;
++ 				error = xfs_bumplink(tp, dp1);
++ 				if (error)
++ 					goto out_trans_abort;
++ 			}
++ 
++ 			/*
++ 			 * Although ip1 isn't changed here, userspace needs
++ 			 * to be warned about the change, so that applications
++ 			 * relying on it (like backup ones), will properly
++ 			 * notify the change
++ 			 */
++ 			ip1_flags |= XFS_ICHGTIME_CHG;
++ 			ip2_flags |= XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG;
++ 		}
++ 
++ 		if (S_ISDIR(ip1->i_d.di_mode)) {
++ 			error = xfs_dir_replace(tp, ip1, &xfs_name_dotdot,
++ 						dp2->i_ino, first_block,
++ 						free_list, spaceres);
++ 			if (error)
++ 				goto out_trans_abort;
++ 
++ 			/* transfer ip1 ".." reference to dp2 */
++ 			if (!S_ISDIR(ip2->i_d.di_mode)) {
++ 				error = xfs_droplink(tp, dp1);
++ 				if (error)
++ 					goto out_trans_abort;
++ 				error = xfs_bumplink(tp, dp2);
++ 				if (error)
++ 					goto out_trans_abort;
++ 			}
++ 
++ 			/*
++ 			 * Although ip2 isn't changed here, userspace needs
++ 			 * to be warned about the change, so that applications
++ 			 * relying on it (like backup ones), will properly
++ 			 * notify the change
++ 			 */
++ 			ip1_flags |= XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG;
++ 			ip2_flags |= XFS_ICHGTIME_CHG;
++ 		}
++ 	}
++ 
++ 	if (ip1_flags) {
++ 		xfs_trans_ichgtime(tp, ip1, ip1_flags);
++ 		xfs_trans_log_inode(tp, ip1, XFS_ILOG_CORE);
++ 	}
++ 	if (ip2_flags) {
++ 		xfs_trans_ichgtime(tp, ip2, ip2_flags);
++ 		xfs_trans_log_inode(tp, ip2, XFS_ILOG_CORE);
++ 	}
++ 	if (dp2_flags) {
++ 		xfs_trans_ichgtime(tp, dp2, dp2_flags);
++ 		xfs_trans_log_inode(tp, dp2, XFS_ILOG_CORE);
++ 	}
++ 	xfs_trans_ichgtime(tp, dp1, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
++ 	xfs_trans_log_inode(tp, dp1, XFS_ILOG_CORE);
++ 	return xfs_finish_rename(tp, free_list);
++ 
++ out_trans_abort:
++ 	xfs_bmap_cancel(free_list);
++ 	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
++ 	return error;
++ }
++ 
++ /*
++  * xfs_rename_alloc_whiteout()
++  *
++  * Return a referenced, unlinked, unlocked inode that that can be used as a
++  * whiteout in a rename transaction. We use a tmpfile inode here so that if we
++  * crash between allocating the inode and linking it into the rename transaction
++  * recovery will free the inode and we won't leak it.
++  */
++ static int
++ xfs_rename_alloc_whiteout(
++ 	struct xfs_inode	*dp,
++ 	struct xfs_inode	**wip)
++ {
++ 	struct xfs_inode	*tmpfile;
++ 	int			error;
++ 
++ 	error = xfs_create_tmpfile(dp, NULL, S_IFCHR | WHITEOUT_MODE, &tmpfile);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * Prepare the tmpfile inode as if it were created through the VFS.
++ 	 * Otherwise, the link increment paths will complain about nlink 0->1.
++ 	 * Drop the link count as done by d_tmpfile(), complete the inode setup
++ 	 * and flag it as linkable.
++ 	 */
++ 	drop_nlink(VFS_I(tmpfile));
++ 	xfs_finish_inode_setup(tmpfile);
++ 	VFS_I(tmpfile)->i_state |= I_LINKABLE;
++ 
++ 	*wip = tmpfile;
++ 	return 0;
++ }
++ 
+++>>>>>>> 22419ac9fe5e (xfs: fix broken i_nlink accounting for whiteout tmpfile inode)
+  /*
+   * xfs_rename
+   */
+@@@ -3019,13 -3127,48 +3203,43 @@@ xfs_rename
+  		 */
+  		error = xfs_droplink(tp, src_dp);
+  		if (error)
+ -			goto out_trans_abort;
+ +			goto abort_return;
+  	}
+  
+ -	/*
+ -	 * For whiteouts, we only need to update the source dirent with the
+ -	 * inode number of the whiteout inode rather than removing it
+ -	 * altogether.
+ -	 */
+ -	if (wip) {
+ -		error = xfs_dir_replace(tp, src_dp, src_name, wip->i_ino,
+ +	error = xfs_dir_removename(tp, src_dp, src_name, src_ip->i_ino,
+  					&first_block, &free_list, spaceres);
+ -	} else
+ -		error = xfs_dir_removename(tp, src_dp, src_name, src_ip->i_ino,
+ -					   &first_block, &free_list, spaceres);
+  	if (error)
+++<<<<<<< HEAD
+ +		goto abort_return;
+++=======
++ 		goto out_trans_abort;
++ 
++ 	/*
++ 	 * For whiteouts, we need to bump the link count on the whiteout inode.
++ 	 * This means that failures all the way up to this point leave the inode
++ 	 * on the unlinked list and so cleanup is a simple matter of dropping
++ 	 * the remaining reference to it. If we fail here after bumping the link
++ 	 * count, we're shutting down the filesystem so we'll never see the
++ 	 * intermediate state on disk.
++ 	 */
++ 	if (wip) {
++ 		ASSERT(VFS_I(wip)->i_nlink == 0 && wip->i_d.di_nlink == 0);
++ 		error = xfs_bumplink(tp, wip);
++ 		if (error)
++ 			goto out_trans_abort;
++ 		error = xfs_iunlink_remove(tp, wip);
++ 		if (error)
++ 			goto out_trans_abort;
++ 		xfs_trans_log_inode(tp, wip, XFS_ILOG_CORE);
++ 
++ 		/*
++ 		 * Now we have a real link, clear the "I'm a tmpfile" state
++ 		 * flag from the inode so it doesn't accidentally get misused in
++ 		 * future.
++ 		 */
++ 		VFS_I(wip)->i_state &= ~I_LINKABLE;
++ 	}
+++>>>>>>> 22419ac9fe5e (xfs: fix broken i_nlink accounting for whiteout tmpfile inode)
+  
+  	xfs_trans_ichgtime(tp, src_dp, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+  	xfs_trans_log_inode(tp, src_dp, XFS_ILOG_CORE);
+* Unmerged path fs/xfs/xfs_inode.c
