@@ -1,0 +1,136 @@
+libceph: enable ceph in a non-default network namespace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 757856d2b9568a701df9ea6a4be68effbb9d6f44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/757856d2.failed
+
+Grab a reference on a network namespace of the 'rbd map' (in case of
+rbd) or 'mount' (in case of ceph) process and use that to open sockets
+instead of always using init_net and bailing if network namespace is
+anything but init_net.  Be careful to not share struct ceph_client
+instances between different namespaces and don't add any code in the
+!CONFIG_NET_NS case.
+
+This is based on a patch from Hong Zhiguo <zhiguohong@tencent.com>.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by: Sage Weil <sage@redhat.com>
+(cherry picked from commit 757856d2b9568a701df9ea6a4be68effbb9d6f44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/messenger.c
+diff --cc net/ceph/messenger.c
+index a7baf40752c5,5c1f98ea6741..000000000000
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@@ -476,8 -480,8 +477,13 @@@ static int ceph_tcp_connect(struct ceph
+  	int ret;
+  
+  	BUG_ON(con->sock);
+++<<<<<<< HEAD
+ +	ret = sock_create_kern(con->peer_addr.in_addr.ss_family, SOCK_STREAM,
+ +			       IPPROTO_TCP, &sock);
+++=======
++ 	ret = sock_create_kern(read_pnet(&con->msgr->net), paddr->ss_family,
++ 			       SOCK_STREAM, IPPROTO_TCP, &sock);
+++>>>>>>> 757856d2b956 (libceph: enable ceph in a non-default network namespace)
+  	if (ret)
+  		return ret;
+  	sock->sk->sk_allocation = GFP_NOFS;
+diff --git a/include/linux/ceph/messenger.h b/include/linux/ceph/messenger.h
+index 363d6b80443d..5ad18098597b 100644
+--- a/include/linux/ceph/messenger.h
++++ b/include/linux/ceph/messenger.h
+@@ -7,6 +7,7 @@
+ #include <linux/radix-tree.h>
+ #include <linux/uio.h>
+ #include <linux/workqueue.h>
++#include <net/net_namespace.h>
+ 
+ #include <linux/ceph/types.h>
+ #include <linux/ceph/buffer.h>
+@@ -55,6 +56,7 @@ struct ceph_messenger {
+ 	struct ceph_entity_addr my_enc_addr;
+ 
+ 	atomic_t stopping;
++	possible_net_t net;
+ 	bool nocrc;
+ 	bool tcp_nodelay;
+ 
+@@ -267,6 +269,7 @@ extern void ceph_messenger_init(struct ceph_messenger *msgr,
+ 			u64 required_features,
+ 			bool nocrc,
+ 			bool tcp_nodelay);
++extern void ceph_messenger_fini(struct ceph_messenger *msgr);
+ 
+ extern void ceph_con_init(struct ceph_connection *con, void *private,
+ 			const struct ceph_connection_operations *ops,
+diff --git a/net/ceph/ceph_common.c b/net/ceph/ceph_common.c
+index 9807430864b1..525abf97ce94 100644
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@ -9,6 +9,7 @@
+ #include <keys/ceph-type.h>
+ #include <linux/module.h>
+ #include <linux/mount.h>
++#include <linux/nsproxy.h>
+ #include <linux/parser.h>
+ #include <linux/sched.h>
+ #include <linux/seq_file.h>
+@@ -16,8 +17,6 @@
+ #include <linux/statfs.h>
+ #include <linux/string.h>
+ #include <linux/vmalloc.h>
+-#include <linux/nsproxy.h>
+-#include <net/net_namespace.h>
+ 
+ 
+ #include <linux/ceph/ceph_features.h>
+@@ -131,6 +130,13 @@ int ceph_compare_options(struct ceph_options *new_opt,
+ 	int i;
+ 	int ret;
+ 
++	/*
++	 * Don't bother comparing options if network namespaces don't
++	 * match.
++	 */
++	if (!net_eq(current->nsproxy->net_ns, read_pnet(&client->msgr.net)))
++		return -1;
++
+ 	ret = memcmp(opt1, opt2, ofs);
+ 	if (ret)
+ 		return ret;
+@@ -335,9 +341,6 @@ ceph_parse_options(char *options, const char *dev_name,
+ 	int err = -ENOMEM;
+ 	substring_t argstr[MAX_OPT_ARGS];
+ 
+-	if (current->nsproxy->net_ns != &init_net)
+-		return ERR_PTR(-EINVAL);
+-
+ 	opt = kzalloc(sizeof(*opt), GFP_KERNEL);
+ 	if (!opt)
+ 		return ERR_PTR(-ENOMEM);
+@@ -587,6 +590,7 @@ struct ceph_client *ceph_create_client(struct ceph_options *opt, void *private,
+ fail_monc:
+ 	ceph_monc_stop(&client->monc);
+ fail:
++	ceph_messenger_fini(&client->msgr);
+ 	kfree(client);
+ 	return ERR_PTR(err);
+ }
+@@ -600,8 +604,8 @@ void ceph_destroy_client(struct ceph_client *client)
+ 
+ 	/* unmount */
+ 	ceph_osdc_stop(&client->osdc);
+-
+ 	ceph_monc_stop(&client->monc);
++	ceph_messenger_fini(&client->msgr);
+ 
+ 	ceph_debugfs_client_cleanup(client);
+ 
+* Unmerged path net/ceph/messenger.c
