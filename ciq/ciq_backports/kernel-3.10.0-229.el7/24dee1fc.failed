@@ -1,0 +1,176 @@
+ACPI / bind: Pass struct acpi_device pointer to acpi_bind_one()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] bind: Pass struct acpi_device pointer to acpi_bind_one() (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 94.12%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 24dee1fc99fd6d38fc859d7f6dda1dab21493bef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/24dee1fc.failed
+
+There is no reason to pass an ACPI handle to acpi_bind_one() instead
+of a struct acpi_device pointer to the target device object, so
+modify that function to take a struct acpi_device pointer as its
+second argument and update all code depending on it accordingly.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Lan Tianyu <tianyu.lan@intel.com> # for USB/ACPI
+(cherry picked from commit 24dee1fc99fd6d38fc859d7f6dda1dab21493bef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/glue.c
+diff --cc drivers/acpi/glue.c
+index 7b82e04a359a,896351b9d483..000000000000
+--- a/drivers/acpi/glue.c
++++ b/drivers/acpi/glue.c
+@@@ -171,32 -172,27 +171,41 @@@ static void acpi_physnode_link_name(cha
+  		strcpy(buf, PHYSICAL_NODE_STRING);
+  }
+  
+- int acpi_bind_one(struct device *dev, acpi_handle handle)
++ int acpi_bind_one(struct device *dev, struct acpi_device *acpi_dev)
+  {
+++<<<<<<< HEAD
+ +	struct acpi_device *acpi_dev;
+ +	acpi_status status;
+++=======
+++>>>>>>> 24dee1fc99fd (ACPI / bind: Pass struct acpi_device pointer to acpi_bind_one())
+  	struct acpi_device_physical_node *physical_node, *pn;
+  	char physical_node_name[PHYSICAL_NODE_NAME_SIZE];
+  	struct list_head *physnode_list;
+  	unsigned int node_id;
+  	int retval = -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (ACPI_HANDLE(dev)) {
+ +		if (handle) {
+ +			dev_warn(dev, "ACPI handle is already set\n");
+++=======
++ 	if (ACPI_COMPANION(dev)) {
++ 		if (acpi_dev) {
++ 			dev_warn(dev, "ACPI companion already set\n");
+++>>>>>>> 24dee1fc99fd (ACPI / bind: Pass struct acpi_device pointer to acpi_bind_one())
+  			return -EINVAL;
+  		} else {
+ -			acpi_dev = ACPI_COMPANION(dev);
+ +			handle = ACPI_HANDLE(dev);
+  		}
+  	}
+ -	if (!acpi_dev)
+ +	if (!handle)
+  		return -EINVAL;
+  
+ -	get_device(&acpi_dev->dev);
+  	get_device(dev);
+ +	status = acpi_bus_get_device(handle, &acpi_dev);
+ +	if (ACPI_FAILURE(status))
+ +		goto err;
+ +
+  	physical_node = kzalloc(sizeof(*physical_node), GFP_KERNEL);
+  	if (!physical_node) {
+  		retval = -ENOMEM;
+@@@ -312,12 -303,15 +321,16 @@@ static int acpi_platform_notify(struct 
+  
+  	ret = acpi_bind_one(dev, NULL);
+  	if (ret && type) {
+ -		struct acpi_device *adev;
+ -
+ -		adev = type->find_companion(dev);
+ -		if (!adev) {
+ +		ret = type->find_device(dev, &handle);
+ +		if (ret) {
+  			DBG("Unable to get handle for %s\n", dev_name(dev));
+ -			ret = -ENODEV;
+  			goto out;
+  		}
+++<<<<<<< HEAD
+ +		ret = acpi_bind_one(dev, handle);
+++=======
++ 		ret = acpi_bind_one(dev, adev);
+++>>>>>>> 24dee1fc99fd (ACPI / bind: Pass struct acpi_device pointer to acpi_bind_one())
+  		if (ret)
+  			goto out;
+  	}
+diff --git a/drivers/acpi/acpi_memhotplug.c b/drivers/acpi/acpi_memhotplug.c
+index 6c67cc433a6e..79954199e2bf 100644
+--- a/drivers/acpi/acpi_memhotplug.c
++++ b/drivers/acpi/acpi_memhotplug.c
+@@ -180,14 +180,14 @@ static unsigned long acpi_meminfo_end_pfn(struct acpi_memory_info *info)
+ 
+ static int acpi_bind_memblk(struct memory_block *mem, void *arg)
+ {
+-	return acpi_bind_one(&mem->dev, (acpi_handle)arg);
++	return acpi_bind_one(&mem->dev, arg);
+ }
+ 
+ static int acpi_bind_memory_blocks(struct acpi_memory_info *info,
+-				   acpi_handle handle)
++				   struct acpi_device *adev)
+ {
+ 	return walk_memory_range(acpi_meminfo_start_pfn(info),
+-				 acpi_meminfo_end_pfn(info), (void *)handle,
++				 acpi_meminfo_end_pfn(info), adev,
+ 				 acpi_bind_memblk);
+ }
+ 
+@@ -197,8 +197,7 @@ static int acpi_unbind_memblk(struct memory_block *mem, void *arg)
+ 	return 0;
+ }
+ 
+-static void acpi_unbind_memory_blocks(struct acpi_memory_info *info,
+-				      acpi_handle handle)
++static void acpi_unbind_memory_blocks(struct acpi_memory_info *info)
+ {
+ 	walk_memory_range(acpi_meminfo_start_pfn(info),
+ 			  acpi_meminfo_end_pfn(info), NULL, acpi_unbind_memblk);
+@@ -242,9 +241,9 @@ static int acpi_memory_enable_device(struct acpi_memory_device *mem_device)
+ 		if (result && result != -EEXIST)
+ 			continue;
+ 
+-		result = acpi_bind_memory_blocks(info, handle);
++		result = acpi_bind_memory_blocks(info, mem_device->device);
+ 		if (result) {
+-			acpi_unbind_memory_blocks(info, handle);
++			acpi_unbind_memory_blocks(info);
+ 			return -ENODEV;
+ 		}
+ 
+@@ -285,7 +284,7 @@ static void acpi_memory_remove_memory(struct acpi_memory_device *mem_device)
+ 		if (nid < 0)
+ 			nid = memory_add_physaddr_to_nid(info->start_addr);
+ 
+-		acpi_unbind_memory_blocks(info, handle);
++		acpi_unbind_memory_blocks(info);
+ 		remove_memory(nid, info->start_addr, info->length);
+ 		list_del(&info->list);
+ 		kfree(info);
+diff --git a/drivers/acpi/acpi_processor.c b/drivers/acpi/acpi_processor.c
+index 7c5c312af9e0..79f2fe8754c2 100644
+--- a/drivers/acpi/acpi_processor.c
++++ b/drivers/acpi/acpi_processor.c
+@@ -400,7 +400,7 @@ static int acpi_processor_add(struct acpi_device *device,
+ 		goto err;
+ 	}
+ 
+-	result = acpi_bind_one(dev, pr->handle);
++	result = acpi_bind_one(dev, device);
+ 	if (result)
+ 		goto err;
+ 
+* Unmerged path drivers/acpi/glue.c
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index f54dd71472f9..3dac94439c7d 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -85,7 +85,7 @@ void acpi_init_device_object(struct acpi_device *device, acpi_handle handle,
+ 			     int type, unsigned long long sta);
+ void acpi_device_add_finalize(struct acpi_device *device);
+ void acpi_free_pnp_ids(struct acpi_device_pnp *pnp);
+-int acpi_bind_one(struct device *dev, acpi_handle handle);
++int acpi_bind_one(struct device *dev, struct acpi_device *adev);
+ int acpi_unbind_one(struct device *dev);
+ void acpi_bus_device_eject(struct acpi_device *device, u32 ost_src);
+ 
