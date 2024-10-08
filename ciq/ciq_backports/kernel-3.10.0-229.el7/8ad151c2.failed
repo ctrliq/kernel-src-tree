@@ -1,0 +1,222 @@
+GFS2: Only run logd and quota when mounted read/write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit 8ad151c2ac9aa106cb903cfd838b31561dbd7bcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/8ad151c2.failed
+
+While investigating a rather strange bit of code in the quota
+clean up function, I spotted that the reason for its existence
+was that when remounting read only, we were not stopping the
+quotad thread, and thus it was possible for it to still have
+a reference to some of the quotas in that case.
+
+This patch moves the logd and quota thread start and stop into
+the make_fs_rw/ro functions, so that we now stop those threads
+when mounted read only.
+
+This means that quotad will always be stopped before we call
+the quota clean up function, and we can thus dispose of the
+(rather hackish) code that waits for it to give up its
+reference on the quotas.
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+	Cc: Abhijith Das <adas@redhat.com>
+(cherry picked from commit 8ad151c2ac9aa106cb903cfd838b31561dbd7bcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/ops_fstype.c
+#	fs/gfs2/quota.c
+diff --cc fs/gfs2/ops_fstype.c
+index 08ac6d84be14,27648e803d1e..000000000000
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@@ -958,40 -969,6 +958,43 @@@ fail
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +static int init_threads(struct gfs2_sbd *sdp, int undo)
+ +{
+ +	struct task_struct *p;
+ +	int error = 0;
+ +
+ +	if (undo)
+ +		goto fail_quotad;
+ +
+ +	p = kthread_run(gfs2_logd, sdp, "gfs2_logd");
+ +	error = IS_ERR(p);
+ +	if (error) {
+ +		fs_err(sdp, "can't start logd thread: %d\n", error);
+ +		return error;
+ +	}
+ +	sdp->sd_logd_process = p;
+ +
+ +	p = kthread_run(gfs2_quotad, sdp, "gfs2_quotad");
+ +	error = IS_ERR(p);
+ +	if (error) {
+ +		fs_err(sdp, "can't start quotad thread: %d\n", error);
+ +		goto fail;
+ +	}
+ +	sdp->sd_quotad_process = p;
+ +
+ +	return 0;
+ +
+ +
+ +fail_quotad:
+ +	kthread_stop(sdp->sd_quotad_process);
+ +fail:
+ +	kthread_stop(sdp->sd_logd_process);
+ +	return error;
+ +}
+ +
+++=======
+++>>>>>>> 8ad151c2ac9a (GFS2: Only run logd and quota when mounted read/write)
+  static const match_table_t nolock_tokens = {
+  	{ Opt_jid, "jid=%d\n", },
+  	{ Opt_err, NULL },
+diff --cc fs/gfs2/quota.c
+index 679b366e073c,3287d9871508..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -1311,37 -1376,19 +1311,37 @@@ void gfs2_quota_cleanup(struct gfs2_sb
+  	while (!list_empty(head)) {
+  		qd = list_entry(head->prev, struct gfs2_quota_data, qd_list);
+  
+ -		list_del(&qd->qd_list);
+++<<<<<<< HEAD
+ +		/*
+ +		 * To be removed in due course... we should be able to
+ +		 * ensure that all refs to the qd have done by this point
+ +		 * so that this rather odd test is not required
+ +		 */
+ +		spin_lock(&qd->qd_lockref.lock);
+ +		if (qd->qd_lockref.count > 1 ||
+ +		    (qd->qd_lockref.count && !test_bit(QDF_CHANGE, &qd->qd_flags))) {
+ +			spin_unlock(&qd->qd_lockref.lock);
+ +			list_move(&qd->qd_list, head);
+ +			spin_unlock(&qd_lru_lock);
+ +			schedule();
+ +			spin_lock(&qd_lru_lock);
+ +			continue;
+ +		}
+ +		spin_unlock(&qd->qd_lockref.lock);
+  
+++=======
+++>>>>>>> 8ad151c2ac9a (GFS2: Only run logd and quota when mounted read/write)
+ +		list_del(&qd->qd_list);
+  		/* Also remove if this qd exists in the reclaim list */
+ -		list_lru_del(&gfs2_qd_lru, &qd->qd_lru);
+ +		if (!list_empty(&qd->qd_reclaim)) {
+ +			list_del_init(&qd->qd_reclaim);
+ +			atomic_dec(&qd_lru_count);
+ +		}
+  		atomic_dec(&sdp->sd_quota_count);
+ -		spin_unlock(&qd_lock);
+ -
+ -		spin_lock_bucket(qd->qd_hash);
+ -		hlist_bl_del_rcu(&qd->qd_hlist);
+ -		spin_unlock_bucket(qd->qd_hash);
+ +		spin_unlock(&qd_lru_lock);
+  
+- 		if (!qd->qd_lockref.count) {
+- 			gfs2_assert_warn(sdp, !qd->qd_change);
+- 			gfs2_assert_warn(sdp, !qd->qd_slot_count);
+- 		} else
+- 			gfs2_assert_warn(sdp, qd->qd_slot_count == 1);
++ 		gfs2_assert_warn(sdp, !qd->qd_change);
++ 		gfs2_assert_warn(sdp, !qd->qd_slot_count);
+  		gfs2_assert_warn(sdp, !qd->qd_bh_count);
+  
+  		gfs2_glock_put(qd->qd_gl);
+* Unmerged path fs/gfs2/ops_fstype.c
+* Unmerged path fs/gfs2/quota.c
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index ac96a99c0e5d..2486f1c9b7ac 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -369,6 +369,33 @@ int gfs2_jdesc_check(struct gfs2_jdesc *jd)
+ 	return 0;
+ }
+ 
++static int init_threads(struct gfs2_sbd *sdp)
++{
++	struct task_struct *p;
++	int error = 0;
++
++	p = kthread_run(gfs2_logd, sdp, "gfs2_logd");
++	if (IS_ERR(p)) {
++		error = PTR_ERR(p);
++		fs_err(sdp, "can't start logd thread: %d\n", error);
++		return error;
++	}
++	sdp->sd_logd_process = p;
++
++	p = kthread_run(gfs2_quotad, sdp, "gfs2_quotad");
++	if (IS_ERR(p)) {
++		error = PTR_ERR(p);
++		fs_err(sdp, "can't start quotad thread: %d\n", error);
++		goto fail;
++	}
++	sdp->sd_quotad_process = p;
++	return 0;
++
++fail:
++	kthread_stop(sdp->sd_logd_process);
++	return error;
++}
++
+ /**
+  * gfs2_make_fs_rw - Turn a Read-Only FS into a Read-Write one
+  * @sdp: the filesystem
+@@ -384,10 +411,14 @@ int gfs2_make_fs_rw(struct gfs2_sbd *sdp)
+ 	struct gfs2_log_header_host head;
+ 	int error;
+ 
+-	error = gfs2_glock_nq_init(sdp->sd_trans_gl, LM_ST_SHARED, 0, &t_gh);
++	error = init_threads(sdp);
+ 	if (error)
+ 		return error;
+ 
++	error = gfs2_glock_nq_init(sdp->sd_trans_gl, LM_ST_SHARED, 0, &t_gh);
++	if (error)
++		goto fail_threads;
++
+ 	j_gl->gl_ops->go_inval(j_gl, DIO_METADATA);
+ 
+ 	error = gfs2_find_jhead(sdp->sd_jdesc, &head);
+@@ -417,7 +448,9 @@ int gfs2_make_fs_rw(struct gfs2_sbd *sdp)
+ fail:
+ 	t_gh.gh_flags |= GL_NOCACHE;
+ 	gfs2_glock_dq_uninit(&t_gh);
+-
++fail_threads:
++	kthread_stop(sdp->sd_quotad_process);
++	kthread_stop(sdp->sd_logd_process);
+ 	return error;
+ }
+ 
+@@ -800,6 +833,9 @@ static int gfs2_make_fs_ro(struct gfs2_sbd *sdp)
+ 	struct gfs2_holder t_gh;
+ 	int error;
+ 
++	kthread_stop(sdp->sd_quotad_process);
++	kthread_stop(sdp->sd_logd_process);
++
+ 	flush_workqueue(gfs2_delete_workqueue);
+ 	gfs2_quota_sync(sdp->sd_vfs, 0);
+ 	gfs2_statfs_sync(sdp->sd_vfs, 0);
+@@ -857,9 +893,6 @@ restart:
+ 	}
+ 	spin_unlock(&sdp->sd_jindex_spin);
+ 
+-	kthread_stop(sdp->sd_quotad_process);
+-	kthread_stop(sdp->sd_logd_process);
+-
+ 	if (!(sb->s_flags & MS_RDONLY)) {
+ 		error = gfs2_make_fs_ro(sdp);
+ 		if (error)
