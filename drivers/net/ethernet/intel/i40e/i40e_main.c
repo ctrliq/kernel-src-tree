@@ -4785,7 +4785,7 @@ static int i40e_prep_for_reset(struct i40e_pf *pf)
 }
 
 /**
- * i40e_reset_and_rebuild - reset and rebuid using a saved config
+ * i40e_reset_and_rebuild - reset and rebuild using a saved config
  * @pf: board private structure
  **/
 static void i40e_reset_and_rebuild(struct i40e_pf *pf)
