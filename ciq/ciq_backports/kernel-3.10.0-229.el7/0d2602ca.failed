@@ -1,0 +1,948 @@
+blk-mq: improve support for shared tags maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 0d2602ca30e410e84e8bdf05c84ed5688e0a5a44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0d2602ca.failed
+
+This adds support for active queue tracking, meaning that the
+blk-mq tagging maintains a count of active users of a tag set.
+This allows us to maintain a notion of fairness between users,
+so that we can distribute the tag depth evenly without starving
+some users while allowing others to try unfair deep queues.
+
+If sharing of a tag set is detected, each hardware queue will
+track the depth of its own queue. And if this exceeds the total
+depth divided by the number of active queues, the user is actively
+throttled down.
+
+The active queue count is done lazily to avoid bouncing that data
+between submitter and completer. Each hardware queue gets marked
+active when it allocates its first tag, and gets marked inactive
+when 1) the last tag is cleared, and 2) the queue timeout grace
+period has passed.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0d2602ca30e410e84e8bdf05c84ed5688e0a5a44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq-tag.h
+#	block/blk-mq.c
+#	block/blk-timeout.c
+#	block/blk.h
+#	include/linux/blk-mq.h
+#	include/linux/blk_types.h
+diff --cc block/blk-mq-tag.c
+index 83ae96c51a27,c80086c9c064..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -7,32 -7,248 +7,270 @@@
+  #include "blk-mq.h"
+  #include "blk-mq-tag.h"
+  
+++<<<<<<< HEAD
+ +/*
+ + * Per tagged queue (tag address space) map
+ + */
+ +struct blk_mq_tags {
+ +	unsigned int nr_tags;
+ +	unsigned int nr_reserved_tags;
+ +	unsigned int nr_batch_move;
+ +	unsigned int nr_max_cache;
+ +
+ +	struct percpu_ida free_tags;
+ +	struct percpu_ida reserved_tags;
+ +};
+ +
+ +void blk_mq_wait_for_tags(struct blk_mq_tags *tags)
+ +{
+ +	int tag = blk_mq_get_tag(tags, __GFP_WAIT, false);
+ +	blk_mq_put_tag(tags, tag);
+++=======
++ void blk_mq_wait_for_tags(struct blk_mq_hw_ctx *hctx, bool reserved)
++ {
++ 	int tag, zero = 0;
++ 
++ 	tag = blk_mq_get_tag(hctx, &zero, __GFP_WAIT, reserved);
++ 	blk_mq_put_tag(hctx, tag, &zero);
++ }
++ 
++ static bool bt_has_free_tags(struct blk_mq_bitmap_tags *bt)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		struct blk_mq_bitmap *bm = &bt->map[i];
++ 		int ret;
++ 
++ 		ret = find_first_zero_bit(&bm->word, bm->depth);
++ 		if (ret < bm->depth)
++ 			return true;
++ 	}
++ 
++ 	return false;
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  }
+  
+  bool blk_mq_has_free_tags(struct blk_mq_tags *tags)
+  {
+ -	if (!tags)
+ -		return true;
+ -
+ -	return bt_has_free_tags(&tags->bitmap_tags);
+ +	return !tags ||
+ +		percpu_ida_free_tags(&tags->free_tags, nr_cpu_ids) != 0;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int __blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp)
+++=======
++ static inline void bt_index_inc(unsigned int *index)
++ {
++ 	*index = (*index + 1) & (BT_WAIT_QUEUES - 1);
++ }
++ 
++ /*
++  * If a previously inactive queue goes active, bump the active user count.
++  */
++ bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
++ {
++ 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
++ 	    !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		atomic_inc(&hctx->tags->active_queues);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * If a previously busy queue goes inactive, potential waiters could now
++  * be allowed to queue. Wake them up and check.
++  */
++ void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct blk_mq_tags *tags = hctx->tags;
++ 	struct blk_mq_bitmap_tags *bt;
++ 	int i, wake_index;
++ 
++ 	if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		return;
++ 
++ 	atomic_dec(&tags->active_queues);
++ 
++ 	/*
++ 	 * Will only throttle depth on non-reserved tags
++ 	 */
++ 	bt = &tags->bitmap_tags;
++ 	wake_index = bt->wake_index;
++ 	for (i = 0; i < BT_WAIT_QUEUES; i++) {
++ 		struct bt_wait_state *bs = &bt->bs[wake_index];
++ 
++ 		if (waitqueue_active(&bs->wait))
++ 			wake_up(&bs->wait);
++ 
++ 		bt_index_inc(&wake_index);
++ 	}
++ }
++ 
++ /*
++  * For shared tag users, we track the number of currently active users
++  * and attempt to provide a fair share of the tag depth for each of them.
++  */
++ static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
++ 				  struct blk_mq_bitmap_tags *bt)
++ {
++ 	unsigned int depth, users;
++ 
++ 	if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_SHARED))
++ 		return true;
++ 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		return true;
++ 
++ 	/*
++ 	 * Don't try dividing an ant
++ 	 */
++ 	if (bt->depth == 1)
++ 		return true;
++ 
++ 	users = atomic_read(&hctx->tags->active_queues);
++ 	if (!users)
++ 		return true;
++ 
++ 	/*
++ 	 * Allow at least some tags
++ 	 */
++ 	depth = max((bt->depth + users - 1) / users, 4U);
++ 	return atomic_read(&hctx->nr_active) < depth;
++ }
++ 
++ static int __bt_get_word(struct blk_mq_bitmap *bm, unsigned int last_tag)
++ {
++ 	int tag, org_last_tag, end;
++ 
++ 	org_last_tag = last_tag;
++ 	end = bm->depth;
++ 	do {
++ restart:
++ 		tag = find_next_zero_bit(&bm->word, end, last_tag);
++ 		if (unlikely(tag >= end)) {
++ 			/*
++ 			 * We started with an offset, start from 0 to
++ 			 * exhaust the map.
++ 			 */
++ 			if (org_last_tag && last_tag) {
++ 				end = last_tag;
++ 				last_tag = 0;
++ 				goto restart;
++ 			}
++ 			return -1;
++ 		}
++ 		last_tag = tag + 1;
++ 	} while (test_and_set_bit_lock(tag, &bm->word));
++ 
++ 	return tag;
++ }
++ 
++ /*
++  * Straight forward bitmap tag implementation, where each bit is a tag
++  * (cleared == free, and set == busy). The small twist is using per-cpu
++  * last_tag caches, which blk-mq stores in the blk_mq_ctx software queue
++  * contexts. This enables us to drastically limit the space searched,
++  * without dirtying an extra shared cacheline like we would if we stored
++  * the cache value inside the shared blk_mq_bitmap_tags structure. On top
++  * of that, each word of tags is in a separate cacheline. This means that
++  * multiple users will tend to stick to different cachelines, at least
++  * until the map is exhausted.
++  */
++ static int __bt_get(struct blk_mq_hw_ctx *hctx, struct blk_mq_bitmap_tags *bt,
++ 		    unsigned int *tag_cache)
++ {
++ 	unsigned int last_tag, org_last_tag;
++ 	int index, i, tag;
++ 
++ 	if (!hctx_may_queue(hctx, bt))
++ 		return -1;
++ 
++ 	last_tag = org_last_tag = *tag_cache;
++ 	index = TAG_TO_INDEX(bt, last_tag);
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		tag = __bt_get_word(&bt->map[index], TAG_TO_BIT(bt, last_tag));
++ 		if (tag != -1) {
++ 			tag += (index << bt->bits_per_word);
++ 			goto done;
++ 		}
++ 
++ 		last_tag = 0;
++ 		if (++index >= bt->map_nr)
++ 			index = 0;
++ 	}
++ 
++ 	*tag_cache = 0;
++ 	return -1;
++ 
++ 	/*
++ 	 * Only update the cache from the allocation path, if we ended
++ 	 * up using the specific cached tag.
++ 	 */
++ done:
++ 	if (tag == org_last_tag) {
++ 		last_tag = tag + 1;
++ 		if (last_tag >= bt->depth - 1)
++ 			last_tag = 0;
++ 
++ 		*tag_cache = last_tag;
++ 	}
++ 
++ 	return tag;
++ }
++ 
++ static struct bt_wait_state *bt_wait_ptr(struct blk_mq_bitmap_tags *bt,
++ 					 struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct bt_wait_state *bs;
++ 
++ 	if (!hctx)
++ 		return &bt->bs[0];
++ 
++ 	bs = &bt->bs[hctx->wait_index];
++ 	bt_index_inc(&hctx->wait_index);
++ 	return bs;
++ }
++ 
++ static int bt_get(struct blk_mq_bitmap_tags *bt, struct blk_mq_hw_ctx *hctx,
++ 		  unsigned int *last_tag, gfp_t gfp)
++ {
++ 	struct bt_wait_state *bs;
++ 	DEFINE_WAIT(wait);
++ 	int tag;
++ 
++ 	tag = __bt_get(hctx, bt, last_tag);
++ 	if (tag != -1)
++ 		return tag;
++ 
++ 	if (!(gfp & __GFP_WAIT))
++ 		return -1;
++ 
++ 	bs = bt_wait_ptr(bt, hctx);
++ 	do {
++ 		bool was_empty;
++ 
++ 		was_empty = list_empty(&wait.task_list);
++ 		prepare_to_wait(&bs->wait, &wait, TASK_UNINTERRUPTIBLE);
++ 
++ 		tag = __bt_get(hctx, bt, last_tag);
++ 		if (tag != -1)
++ 			break;
++ 
++ 		if (was_empty)
++ 			atomic_set(&bs->wait_cnt, bt->wake_cnt);
++ 
++ 		io_schedule();
++ 	} while (1);
++ 
++ 	finish_wait(&bs->wait, &wait);
++ 	return tag;
++ }
++ 
++ static unsigned int __blk_mq_get_tag(struct blk_mq_tags *tags,
++ 				     struct blk_mq_hw_ctx *hctx,
++ 				     unsigned int *last_tag, gfp_t gfp)
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  {
+  	int tag;
+  
+@@@ -60,14 -275,56 +298,22 @@@ static unsigned int __blk_mq_get_reserv
+  	return tag;
+  }
+  
+++<<<<<<< HEAD
+ +unsigned int blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp, bool reserved)
+ +{
+ +	if (!reserved)
+ +		return __blk_mq_get_tag(tags, gfp);
+++=======
++ unsigned int blk_mq_get_tag(struct blk_mq_hw_ctx *hctx, unsigned int *last_tag,
++ 			    gfp_t gfp, bool reserved)
++ {
++ 	if (!reserved)
++ 		return __blk_mq_get_tag(hctx->tags, hctx, last_tag, gfp);
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  
+- 	return __blk_mq_get_reserved_tag(tags, gfp);
++ 	return __blk_mq_get_reserved_tag(hctx->tags, gfp);
+  }
+  
+ -static struct bt_wait_state *bt_wake_ptr(struct blk_mq_bitmap_tags *bt)
+ -{
+ -	int i, wake_index;
+ -
+ -	wake_index = bt->wake_index;
+ -	for (i = 0; i < BT_WAIT_QUEUES; i++) {
+ -		struct bt_wait_state *bs = &bt->bs[wake_index];
+ -
+ -		if (waitqueue_active(&bs->wait)) {
+ -			if (wake_index != bt->wake_index)
+ -				bt->wake_index = wake_index;
+ -
+ -			return bs;
+ -		}
+ -
+ -		bt_index_inc(&wake_index);
+ -	}
+ -
+ -	return NULL;
+ -}
+ -
+ -static void bt_clear_tag(struct blk_mq_bitmap_tags *bt, unsigned int tag)
+ -{
+ -	const int index = TAG_TO_INDEX(bt, tag);
+ -	struct bt_wait_state *bs;
+ -
+ -	/*
+ -	 * The unlock memory barrier need to order access to req in free
+ -	 * path and clearing tag bit
+ -	 */
+ -	clear_bit_unlock(TAG_TO_BIT(bt, tag), &bt->map[index].word);
+ -
+ -	bs = bt_wake_ptr(bt);
+ -	if (bs && atomic_dec_and_test(&bs->wait_cnt)) {
+ -		atomic_set(&bs->wait_cnt, bt->wake_cnt);
+ -		bt_index_inc(&bt->wake_index);
+ -		wake_up(&bs->wait);
+ -	}
+ -}
+ -
+  static void __blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag)
+  {
+  	BUG_ON(tag >= tags->nr_tags);
+@@@ -80,14 -337,20 +326,28 @@@ static void __blk_mq_put_reserved_tag(s
+  {
+  	BUG_ON(tag >= tags->nr_reserved_tags);
+  
+ -	bt_clear_tag(&tags->breserved_tags, tag);
+ +	percpu_ida_free(&tags->reserved_tags, tag);
+  }
+  
+++<<<<<<< HEAD
+ +void blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag)
+ +{
+ +	if (tag >= tags->nr_reserved_tags)
+ +		__blk_mq_put_tag(tags, tag);
+ +	else
+++=======
++ void blk_mq_put_tag(struct blk_mq_hw_ctx *hctx, unsigned int tag,
++ 		    unsigned int *last_tag)
++ {
++ 	struct blk_mq_tags *tags = hctx->tags;
++ 
++ 	if (tag >= tags->nr_reserved_tags) {
++ 		const int real_tag = tag - tags->nr_reserved_tags;
++ 
++ 		__blk_mq_put_tag(tags, real_tag);
++ 		*last_tag = real_tag;
++ 	} else
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  		__blk_mq_put_reserved_tag(tags, tag);
+  }
+  
+@@@ -189,18 -533,16 +449,23 @@@ ssize_t blk_mq_tag_sysfs_show(struct bl
+  	if (!tags)
+  		return 0;
+  
+ -	page += sprintf(page, "nr_tags=%u, reserved_tags=%u, "
+ -			"bits_per_word=%u\n",
+ -			tags->nr_tags, tags->nr_reserved_tags,
+ -			tags->bitmap_tags.bits_per_word);
+ +	page += sprintf(page, "nr_tags=%u, reserved_tags=%u, batch_move=%u,"
+ +			" max_cache=%u\n", tags->nr_tags, tags->nr_reserved_tags,
+ +			tags->nr_batch_move, tags->nr_max_cache);
+  
+ -	free = bt_unused_tags(&tags->bitmap_tags);
+ -	res = bt_unused_tags(&tags->breserved_tags);
+ +	page += sprintf(page, "nr_free=%u, nr_reserved=%u\n",
+ +			percpu_ida_free_tags(&tags->free_tags, nr_cpu_ids),
+ +			percpu_ida_free_tags(&tags->reserved_tags, nr_cpu_ids));
+  
+++<<<<<<< HEAD
+ +	for_each_possible_cpu(cpu) {
+ +		page += sprintf(page, "  cpu%02u: nr_free=%u\n", cpu,
+ +				percpu_ida_free_tags(&tags->free_tags, cpu));
+ +	}
+++=======
++ 	page += sprintf(page, "nr_free=%u, nr_reserved=%u\n", free, res);
++ 	page += sprintf(page, "active_queues=%u\n", atomic_read(&tags->active_queues));
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  
+  	return page - orig_page;
+  }
+diff --cc block/blk-mq-tag.h
+index 947ba2c6148e,0f5ec8b50ef3..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -1,14 -1,59 +1,69 @@@
+  #ifndef INT_BLK_MQ_TAG_H
+  #define INT_BLK_MQ_TAG_H
+  
+++<<<<<<< HEAD
+ +struct blk_mq_tags;
+++=======
++ enum {
++ 	BT_WAIT_QUEUES	= 8,
++ 	BT_WAIT_BATCH	= 8,
++ };
++ 
++ struct bt_wait_state {
++ 	atomic_t wait_cnt;
++ 	wait_queue_head_t wait;
++ } ____cacheline_aligned_in_smp;
++ 
++ #define TAG_TO_INDEX(bt, tag)	((tag) >> (bt)->bits_per_word)
++ #define TAG_TO_BIT(bt, tag)	((tag) & ((1 << (bt)->bits_per_word) - 1))
++ 
++ struct blk_mq_bitmap {
++ 	unsigned long word;
++ 	unsigned long depth;
++ } ____cacheline_aligned_in_smp;
++ 
++ struct blk_mq_bitmap_tags {
++ 	unsigned int depth;
++ 	unsigned int wake_cnt;
++ 	unsigned int bits_per_word;
++ 
++ 	unsigned int map_nr;
++ 	struct blk_mq_bitmap *map;
++ 
++ 	unsigned int wake_index;
++ 	struct bt_wait_state *bs;
++ };
++ 
++ /*
++  * Tag address space map.
++  */
++ struct blk_mq_tags {
++ 	unsigned int nr_tags;
++ 	unsigned int nr_reserved_tags;
++ 
++ 	atomic_t active_queues;
++ 
++ 	struct blk_mq_bitmap_tags bitmap_tags;
++ 	struct blk_mq_bitmap_tags breserved_tags;
++ 
++ 	struct request **rqs;
++ 	struct list_head page_list;
++ };
++ 
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  
+  extern struct blk_mq_tags *blk_mq_init_tags(unsigned int nr_tags, unsigned int reserved_tags, int node);
+  extern void blk_mq_free_tags(struct blk_mq_tags *tags);
+  
+++<<<<<<< HEAD
+ +extern unsigned int blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp, bool reserved);
+ +extern void blk_mq_wait_for_tags(struct blk_mq_tags *tags);
+ +extern void blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag);
+++=======
++ extern unsigned int blk_mq_get_tag(struct blk_mq_hw_ctx *hctx, unsigned int *last_tag, gfp_t gfp, bool reserved);
++ extern void blk_mq_wait_for_tags(struct blk_mq_hw_ctx *hctx, bool reserved);
++ extern void blk_mq_put_tag(struct blk_mq_hw_ctx *hctx, unsigned int tag, unsigned int *last_tag);
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  extern void blk_mq_tag_busy_iter(struct blk_mq_tags *tags, void (*fn)(void *data, unsigned long *), void *data);
+  extern bool blk_mq_has_free_tags(struct blk_mq_tags *tags);
+  extern ssize_t blk_mq_tag_sysfs_show(struct blk_mq_tags *tags, char *page);
+diff --cc block/blk-mq.c
+index 16306cf3ce81,3c4f1fceef8e..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -79,11 -80,17 +79,24 @@@ static struct request *__blk_mq_alloc_r
+  	struct request *rq;
+  	unsigned int tag;
+  
+++<<<<<<< HEAD
+ +	tag = blk_mq_get_tag(hctx->tags, gfp, reserved);
+ +	if (tag != BLK_MQ_TAG_FAIL) {
+ +		rq = hctx->rqs[tag];
+++=======
++ 	tag = blk_mq_get_tag(hctx, &ctx->last_tag, gfp, reserved);
++ 	if (tag != BLK_MQ_TAG_FAIL) {
++ 		rq = hctx->tags->rqs[tag];
++ 
++ 		rq->cmd_flags = 0;
++ 		if (blk_mq_tag_busy(hctx)) {
++ 			rq->cmd_flags = REQ_MQ_INFLIGHT;
++ 			atomic_inc(&hctx->nr_active);
++ 		}
++ 
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  		rq->tag = tag;
+ +
+  		return rq;
+  	}
+  
+@@@ -186,10 -193,54 +199,26 @@@ static void blk_mq_rq_ctx_init(struct r
+  	if (blk_queue_io_stat(q))
+  		rw_flags |= REQ_IO_STAT;
+  
+ -	INIT_LIST_HEAD(&rq->queuelist);
+ -	/* csd/requeue_work/fifo_time is initialized before use */
+ -	rq->q = q;
+  	rq->mq_ctx = ctx;
+++<<<<<<< HEAD
+ +	rq->cmd_flags = rw_flags;
+++=======
++ 	rq->cmd_flags |= rw_flags;
++ 	rq->cmd_type = 0;
++ 	/* do not touch atomic flags, it needs atomic ops against the timer */
++ 	rq->cpu = -1;
++ 	rq->__data_len = 0;
++ 	rq->__sector = (sector_t) -1;
++ 	rq->bio = NULL;
++ 	rq->biotail = NULL;
++ 	INIT_HLIST_NODE(&rq->hash);
++ 	RB_CLEAR_NODE(&rq->rb_node);
++ 	memset(&rq->flush, 0, max(sizeof(rq->flush), sizeof(rq->elv)));
++ 	rq->rq_disk = NULL;
++ 	rq->part = NULL;
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  	rq->start_time = jiffies;
+ -#ifdef CONFIG_BLK_CGROUP
+ -	rq->rl = NULL;
+  	set_start_time_ns(rq);
+ -	rq->io_start_time_ns = 0;
+ -#endif
+ -	rq->nr_phys_segments = 0;
+ -#if defined(CONFIG_BLK_DEV_INTEGRITY)
+ -	rq->nr_integrity_segments = 0;
+ -#endif
+ -	rq->ioprio = 0;
+ -	rq->special = NULL;
+ -	/* tag was already set */
+ -	rq->errors = 0;
+ -	memset(rq->__cmd, 0, sizeof(rq->__cmd));
+ -	rq->cmd = rq->__cmd;
+ -	rq->cmd_len = BLK_MAX_CDB;
+ -
+ -	rq->extra_len = 0;
+ -	rq->sense_len = 0;
+ -	rq->resid_len = 0;
+ -	rq->sense = NULL;
+ -
+ -	rq->deadline = 0;
+ -	INIT_LIST_HEAD(&rq->timeout_list);
+ -	rq->timeout = 0;
+ -	rq->retries = 0;
+ -	rq->end_io = NULL;
+ -	rq->end_io_data = NULL;
+ -	rq->next_rq = NULL;
+ -
+  	ctx->rq_dispatched[rw_is_sync(rw_flags)]++;
+  }
+  
+@@@ -217,7 -269,7 +246,11 @@@ static struct request *blk_mq_alloc_req
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		blk_mq_wait_for_tags(hctx->tags);
+++=======
++ 		blk_mq_wait_for_tags(hctx, reserved);
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  	} while (1);
+  
+  	return rq;
+@@@ -268,9 -310,11 +301,17 @@@ static void __blk_mq_free_request(struc
+  	const int tag = rq->tag;
+  	struct request_queue *q = rq->q;
+  
+++<<<<<<< HEAD
+ +	blk_mq_rq_init(hctx, rq);
+ +	blk_mq_put_tag(hctx->tags, tag);
+ +
+++=======
++ 	if (rq->cmd_flags & REQ_MQ_INFLIGHT)
++ 		atomic_dec(&hctx->nr_active);
++ 
++ 	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
++ 	blk_mq_put_tag(hctx, tag, &ctx->last_tag);
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  	blk_mq_queue_exit(q);
+  }
+  
+@@@ -1287,10 -1447,64 +1333,64 @@@ static void blk_mq_map_swqueue(struct r
+  		ctx->index_hw = hctx->nr_ctx;
+  		hctx->ctxs[hctx->nr_ctx++] = ctx;
+  	}
+ -
+ -	queue_for_each_hw_ctx(q, hctx, i) {
+ -		hctx->next_cpu = cpumask_first(hctx->cpumask);
+ -		hctx->next_cpu_batch = BLK_MQ_CPU_WORK_BATCH;
+ -	}
+  }
+  
+++<<<<<<< HEAD
+ +struct request_queue *blk_mq_init_queue(struct blk_mq_reg *reg,
+ +					void *driver_data)
+++=======
++ static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	struct request_queue *q;
++ 	bool shared;
++ 	int i;
++ 
++ 	if (set->tag_list.next == set->tag_list.prev)
++ 		shared = false;
++ 	else
++ 		shared = true;
++ 
++ 	list_for_each_entry(q, &set->tag_list, tag_set_list) {
++ 		blk_mq_freeze_queue(q);
++ 
++ 		queue_for_each_hw_ctx(q, hctx, i) {
++ 			if (shared)
++ 				hctx->flags |= BLK_MQ_F_TAG_SHARED;
++ 			else
++ 				hctx->flags &= ~BLK_MQ_F_TAG_SHARED;
++ 		}
++ 		blk_mq_unfreeze_queue(q);
++ 	}
++ }
++ 
++ static void blk_mq_del_queue_tag_set(struct request_queue *q)
++ {
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 
++ 	blk_mq_freeze_queue(q);
++ 
++ 	mutex_lock(&set->tag_list_lock);
++ 	list_del_init(&q->tag_set_list);
++ 	blk_mq_update_tag_set_depth(set);
++ 	mutex_unlock(&set->tag_list_lock);
++ 
++ 	blk_mq_unfreeze_queue(q);
++ }
++ 
++ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
++ 				     struct request_queue *q)
++ {
++ 	q->tag_set = set;
++ 
++ 	mutex_lock(&set->tag_list_lock);
++ 	list_add_tail(&q->tag_set_list, &set->tag_list);
++ 	blk_mq_update_tag_set_depth(set);
++ 	mutex_unlock(&set->tag_list_lock);
++ }
++ 
++ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  {
+  	struct blk_mq_hw_ctx **hctxs;
+  	struct blk_mq_ctx *ctx;
+@@@ -1472,6 -1676,58 +1577,61 @@@ static int __cpuinit blk_mq_queue_reini
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	if (!set->nr_hw_queues)
++ 		return -EINVAL;
++ 	if (!set->queue_depth || set->queue_depth > BLK_MQ_MAX_DEPTH)
++ 		return -EINVAL;
++ 	if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
++ 		return -EINVAL;
++ 
++ 	if (!set->nr_hw_queues ||
++ 	    !set->ops->queue_rq || !set->ops->map_queue ||
++ 	    !set->ops->alloc_hctx || !set->ops->free_hctx)
++ 		return -EINVAL;
++ 
++ 
++ 	set->tags = kmalloc_node(set->nr_hw_queues *
++ 				 sizeof(struct blk_mq_tags *),
++ 				 GFP_KERNEL, set->numa_node);
++ 	if (!set->tags)
++ 		goto out;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		set->tags[i] = blk_mq_init_rq_map(set, i);
++ 		if (!set->tags[i])
++ 			goto out_unwind;
++ 	}
++ 
++ 	mutex_init(&set->tag_list_lock);
++ 	INIT_LIST_HEAD(&set->tag_list);
++ 
++ 	return 0;
++ 
++ out_unwind:
++ 	while (--i >= 0)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ out:
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL(blk_mq_alloc_tag_set);
++ 
++ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ 	kfree(set->tags);
++ }
++ EXPORT_SYMBOL(blk_mq_free_tag_set);
++ 
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+diff --cc block/blk-timeout.c
+index 31bf75eefa7b,43e8b515806f..000000000000
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@@ -169,7 -166,26 +169,30 @@@ void blk_abort_request(struct request *
+  }
+  EXPORT_SYMBOL_GPL(blk_abort_request);
+  
+++<<<<<<< HEAD
+ +void __blk_add_timer(struct request *req, struct list_head *timeout_list)
+++=======
++ unsigned long blk_rq_timeout(unsigned long timeout)
++ {
++ 	unsigned long maxt;
++ 
++ 	maxt = round_jiffies_up(jiffies + BLK_MAX_TIMEOUT);
++ 	if (time_after(timeout, maxt))
++ 		timeout = maxt;
++ 
++ 	return timeout;
++ }
++ 
++ /**
++  * blk_add_timer - Start timeout timer for a single request
++  * @req:	request that is about to start running.
++  *
++  * Notes:
++  *    Each request has its own timer, and as it is added to the queue, we
++  *    set up the timer. When the request completes, we cancel the timer.
++  */
++ void blk_add_timer(struct request *req)
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  {
+  	struct request_queue *q = req->q;
+  	unsigned long expiry;
+diff --cc block/blk.h
+index c90e1d8f7a2b,95cab70000e3..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -37,9 -40,9 +40,14 @@@ bool __blk_end_bidi_request(struct requ
+  void blk_rq_timed_out_timer(unsigned long data);
+  void blk_rq_check_expired(struct request *rq, unsigned long *next_timeout,
+  			  unsigned int *next_set);
+++<<<<<<< HEAD
+ +void __blk_add_timer(struct request *req, struct list_head *timeout_list);
+++=======
++ unsigned long blk_rq_timeout(unsigned long timeout);
++ void blk_add_timer(struct request *req);
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  void blk_delete_timer(struct request *);
+ +void blk_add_timer(struct request *);
+  
+  
+  bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
+diff --cc include/linux/blk-mq.h
+index 82a4a8e60c38,379f88d5c44d..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -59,6 -63,12 +61,15 @@@ struct blk_mq_reg 
+  	int			numa_node;
+  	unsigned int		timeout;
+  	unsigned int		flags;		/* BLK_MQ_F_* */
+++<<<<<<< HEAD
+++=======
++ 	void			*driver_data;
++ 
++ 	struct blk_mq_tags	**tags;
++ 
++ 	struct mutex		tag_list_lock;
++ 	struct list_head	tag_list;
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  };
+  
+  typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+@@@ -108,16 -131,22 +119,18 @@@ enum 
+  
+  	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
+  	BLK_MQ_F_SHOULD_SORT	= 1 << 1,
++ 	BLK_MQ_F_TAG_SHARED	= 1 << 2,
+  
+  	BLK_MQ_S_STOPPED	= 0,
++ 	BLK_MQ_S_TAG_ACTIVE	= 1,
+  
+  	BLK_MQ_MAX_DEPTH	= 2048,
+ -
+ -	BLK_MQ_CPU_WORK_BATCH	= 8,
+  };
+  
+ -struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *);
+ +struct request_queue *blk_mq_init_queue(struct blk_mq_reg *, void *);
+  int blk_mq_register_disk(struct gendisk *);
+  void blk_mq_unregister_disk(struct gendisk *);
+ -
+ -int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set);
+ -void blk_mq_free_tag_set(struct blk_mq_tag_set *set);
+ +void blk_mq_init_commands(struct request_queue *, void (*init)(void *data, struct blk_mq_hw_ctx *, struct request *, unsigned int), void *data);
+  
+  void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule);
+  
+diff --cc include/linux/blk_types.h
+index 1ab064ef48f2,d8e4cea23a25..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -186,6 -189,8 +186,11 @@@ enum rq_flag_bits 
+  	__REQ_KERNEL, 		/* direct IO to kernel pages */
+  	__REQ_PM,		/* runtime pm request */
+  	__REQ_END,		/* last of chain of requests */
+++<<<<<<< HEAD
+++=======
++ 	__REQ_HASHED,		/* on IO scheduler merge hash */
++ 	__REQ_MQ_INFLIGHT,	/* track inflight for MQ */
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  	__REQ_NR_BITS,		/* stops here */
+  };
+  
+@@@ -238,5 -243,7 +243,10 @@@
+  #define REQ_KERNEL		(1ULL << __REQ_KERNEL)
+  #define REQ_PM			(1ULL << __REQ_PM)
+  #define REQ_END			(1ULL << __REQ_END)
+++<<<<<<< HEAD
+++=======
++ #define REQ_HASHED		(1ULL << __REQ_HASHED)
++ #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
+++>>>>>>> 0d2602ca30e4 (blk-mq: improve support for shared tags maps)
+  
+  #endif /* __LINUX_BLK_TYPES_H */
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index 8145b5b25b4b..99a60a829e69 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -208,6 +208,11 @@ static ssize_t blk_mq_hw_sysfs_tags_show(struct blk_mq_hw_ctx *hctx, char *page)
+ 	return blk_mq_tag_sysfs_show(hctx->tags, page);
+ }
+ 
++static ssize_t blk_mq_hw_sysfs_active_show(struct blk_mq_hw_ctx *hctx, char *page)
++{
++	return sprintf(page, "%u\n", atomic_read(&hctx->nr_active));
++}
++
+ static ssize_t blk_mq_hw_sysfs_cpus_show(struct blk_mq_hw_ctx *hctx, char *page)
+ {
+ 	unsigned int i, first = 1;
+@@ -267,6 +272,10 @@ static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_dispatched = {
+ 	.attr = {.name = "dispatched", .mode = S_IRUGO },
+ 	.show = blk_mq_hw_sysfs_dispatched_show,
+ };
++static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_active = {
++	.attr = {.name = "active", .mode = S_IRUGO },
++	.show = blk_mq_hw_sysfs_active_show,
++};
+ static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_pending = {
+ 	.attr = {.name = "pending", .mode = S_IRUGO },
+ 	.show = blk_mq_hw_sysfs_rq_list_show,
+@@ -287,6 +296,7 @@ static struct attribute *default_hw_ctx_attrs[] = {
+ 	&blk_mq_hw_sysfs_pending.attr,
+ 	&blk_mq_hw_sysfs_tags.attr,
+ 	&blk_mq_hw_sysfs_cpus.attr,
++	&blk_mq_hw_sysfs_active.attr,
+ 	NULL,
+ };
+ 
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq-tag.h
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-timeout.c
+* Unmerged path block/blk.h
+* Unmerged path include/linux/blk-mq.h
+* Unmerged path include/linux/blk_types.h
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 7073d451e562..21416eccfed3 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -481,6 +481,9 @@ struct request_queue {
+ 	wait_queue_head_t	mq_freeze_wq;
+ 	struct percpu_counter	mq_usage_counter;
+ 	struct list_head	all_q_node;
++
++	struct blk_mq_tag_set	*tag_set;
++	struct list_head	tag_set_list;
+ };
+ 
+ #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
