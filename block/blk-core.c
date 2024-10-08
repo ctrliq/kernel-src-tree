@@ -1279,6 +1279,11 @@ void __blk_put_request(struct request_queue *q, struct request *req)
 	if (unlikely(--req->ref_count))
 		return;
 
+	if (q->mq_ops) {
+		blk_mq_free_request(req);
+		return;
+	}
+
 	blk_pm_put_request(req);
 
 	elv_completed_request(q, req);
