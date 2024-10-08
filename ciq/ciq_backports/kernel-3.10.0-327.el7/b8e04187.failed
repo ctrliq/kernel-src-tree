@@ -1,0 +1,297 @@
+crypto: nx - simplify pSeries nx842 driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [crypto] nx - simplify pSeries nx842 driver (Gustavo Duarte) [1221925]
+Rebuild_FUZZ: 89.47%
+commit-author Dan Streetman <ddstreet@ieee.org>
+commit b8e04187c90107c58d1ccbeb68a0ba4c5bfd4167
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b8e04187.failed
+
+Simplify the pSeries NX-842 driver: do not expect incoming buffers to be
+exactly page-sized; do not break up input buffers to compress smaller
+blocks; do not use any internal headers in the compressed data blocks;
+remove the software decompression implementation; implement the pSeries
+nx842_constraints.
+
+This changes the pSeries NX-842 driver to perform constraints-based
+compression so that it only needs to compress one entire input block at a
+time.  This removes the need for it to split input data blocks into
+multiple compressed data sections in the output buffer, and removes the
+need for any extra header info in the compressed data; all that is moved
+(in a later patch) into the main crypto 842 driver.  Additionally, the
+842 software decompression implementation is no longer needed here, as
+the crypto 842 driver will use the generic software 842 decompression
+function as a fallback if any hardware 842 driver fails.
+
+	Signed-off-by: Dan Streetman <ddstreet@ieee.org>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit b8e04187c90107c58d1ccbeb68a0ba4c5bfd4167)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/nx/nx-842-pseries.c
+diff --cc drivers/crypto/nx/nx-842-pseries.c
+index 502edf0a2933,85837e96e9a3..000000000000
+--- a/drivers/crypto/nx/nx-842-pseries.c
++++ b/drivers/crypto/nx/nx-842-pseries.c
+@@@ -21,18 -21,12 +21,21 @@@
+   *          Seth Jennings <sjenning@linux.vnet.ibm.com>
+   */
+  
+++<<<<<<< HEAD
+ +#include <linux/kernel.h>
+ +#include <linux/module.h>
+ +#include <linux/nx842.h>
+ +#include <linux/of.h>
+ +#include <linux/slab.h>
+ +
+ +#include <asm/page.h>
+++=======
+++>>>>>>> b8e04187c901 (crypto: nx - simplify pSeries nx842 driver)
+  #include <asm/vio.h>
+  
+ -#include "nx-842.h"
+  #include "nx_csbcpb.h" /* struct nx_csbcpb */
+  
+ -#define MODULE_NAME NX842_PSERIES_MODULE_NAME
+ +#define MODULE_NAME "nx-compress"
+  MODULE_LICENSE("GPL");
+  MODULE_AUTHOR("Robert Jennings <rcj@linux.vnet.ibm.com>");
+  MODULE_DESCRIPTION("842 H/W Compression driver for IBM Power processors");
+@@@ -40,23 -34,59 +43,69 @@@
+  /* IO buffer must be 128 byte aligned */
+  #define IO_BUFFER_ALIGN 128
+  
+++<<<<<<< HEAD
+ +struct nx842_header {
+ +	int blocks_nr; /* number of compressed blocks */
+ +	int offset; /* offset of the first block (from beginning of header) */
+ +	int sizes[0]; /* size of compressed blocks */
+ +};
+ +
+ +static inline int nx842_header_size(const struct nx842_header *hdr)
+++=======
++ static struct nx842_constraints nx842_pseries_constraints = {
++ 	.alignment =	IO_BUFFER_ALIGN,
++ 	.multiple =	DDE_BUFFER_LAST_MULT,
++ 	.minimum =	IO_BUFFER_ALIGN,
++ 	.maximum =	PAGE_SIZE, /* dynamic, max_sync_size */
++ };
++ 
++ static int check_constraints(unsigned long buf, unsigned int *len, bool in)
+++>>>>>>> b8e04187c901 (crypto: nx - simplify pSeries nx842 driver)
+  {
+- 	return sizeof(struct nx842_header) +
+- 			hdr->blocks_nr * sizeof(hdr->sizes[0]);
++ 	if (!IS_ALIGNED(buf, nx842_pseries_constraints.alignment)) {
++ 		pr_debug("%s buffer 0x%lx not aligned to 0x%x\n",
++ 			 in ? "input" : "output", buf,
++ 			 nx842_pseries_constraints.alignment);
++ 		return -EINVAL;
++ 	}
++ 	if (*len % nx842_pseries_constraints.multiple) {
++ 		pr_debug("%s buffer len 0x%x not multiple of 0x%x\n",
++ 			 in ? "input" : "output", *len,
++ 			 nx842_pseries_constraints.multiple);
++ 		if (in)
++ 			return -EINVAL;
++ 		*len = round_down(*len, nx842_pseries_constraints.multiple);
++ 	}
++ 	if (*len < nx842_pseries_constraints.minimum) {
++ 		pr_debug("%s buffer len 0x%x under minimum 0x%x\n",
++ 			 in ? "input" : "output", *len,
++ 			 nx842_pseries_constraints.minimum);
++ 		return -EINVAL;
++ 	}
++ 	if (*len > nx842_pseries_constraints.maximum) {
++ 		pr_debug("%s buffer len 0x%x over maximum 0x%x\n",
++ 			 in ? "input" : "output", *len,
++ 			 nx842_pseries_constraints.maximum);
++ 		if (in)
++ 			return -EINVAL;
++ 		*len = nx842_pseries_constraints.maximum;
++ 	}
++ 	return 0;
+  }
+  
++ /* I assume we need to align the CSB? */
++ #define WORKMEM_ALIGN	(256)
++ 
++ struct nx842_workmem {
++ 	/* scatterlist */
++ 	char slin[4096];
++ 	char slout[4096];
++ 	/* coprocessor status/parameter block */
++ 	struct nx_csbcpb csbcpb;
++ 
++ 	char padding[WORKMEM_ALIGN];
++ } __aligned(WORKMEM_ALIGN);
++ 
+  /* Macros for fields within nx_csbcpb */
+  /* Check the valid bit within the csbcpb valid field */
+  #define NX842_CSBCBP_VALID_CHK(x) (x & BIT_MASK(7))
+@@@ -201,53 -221,6 +249,56 @@@ static int nx842_build_scatterlist(unsi
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Working memory for software decompression
+ + */
+ +struct sw842_fifo {
+ +	union {
+ +		char f8[256][8];
+ +		char f4[512][4];
+ +	};
+ +	char f2[256][2];
+ +	unsigned char f84_full;
+ +	unsigned char f2_full;
+ +	unsigned char f8_count;
+ +	unsigned char f2_count;
+ +	unsigned int f4_count;
+ +};
+ +
+ +/*
+ + * Working memory for crypto API
+ + */
+ +struct nx842_workmem {
+ +	char bounce[PAGE_SIZE]; /* bounce buffer for decompression input */
+ +	union {
+ +		/* hardware working memory */
+ +		struct {
+ +			/* scatterlist */
+ +			char slin[SIZE_4K];
+ +			char slout[SIZE_4K];
+ +			/* coprocessor status/parameter block */
+ +			struct nx_csbcpb csbcpb;
+ +		};
+ +		/* software working memory */
+ +		struct sw842_fifo swfifo; /* software decompression fifo */
+ +	};
+ +};
+ +
+ +int nx842_get_workmem_size(void)
+ +{
+ +	return sizeof(struct nx842_workmem) + NX842_HW_PAGE_SIZE;
+ +}
+ +EXPORT_SYMBOL_GPL(nx842_get_workmem_size);
+ +
+ +int nx842_get_workmem_size_aligned(void)
+ +{
+ +	return sizeof(struct nx842_workmem);
+ +}
+ +EXPORT_SYMBOL_GPL(nx842_get_workmem_size_aligned);
+ +
+++=======
+++>>>>>>> b8e04187c901 (crypto: nx - simplify pSeries nx842 driver)
+  static int nx842_validate_result(struct device *dev,
+  	struct cop_status_block *csb)
+  {
+@@@ -324,11 -297,10 +375,9 @@@
+   *   -EIO	Internal error
+   *   -ENODEV	Hardware unavailable
+   */
+ -static int nx842_pseries_compress(const unsigned char *in, unsigned int inlen,
+ -				  unsigned char *out, unsigned int *outlen,
+ -				  void *wmem)
+ +int nx842_compress(const unsigned char *in, unsigned int inlen,
+ +		       unsigned char *out, unsigned int *outlen, void *wmem)
+  {
+- 	struct nx842_header *hdr;
+  	struct nx842_devdata *local_devdata;
+  	struct device *dev = NULL;
+  	struct nx842_workmem *workmem;
+@@@ -493,13 -398,9 +475,10 @@@ unlock
+  	rcu_read_unlock();
+  	return ret;
+  }
+ +EXPORT_SYMBOL_GPL(nx842_compress);
+  
+- static int sw842_decompress(const unsigned char *, int, unsigned char *, int *,
+- 			const void *);
+- 
+  /**
+ - * nx842_pseries_decompress - Decompress data using the 842 algorithm
+ + * nx842_decompress - Decompress data using the 842 algorithm
+   *
+   * Decompression provide by the NX842 coprocessor on IBM Power systems.
+   * The input buffer is decompressed and the result is stored in the
+@@@ -509,13 -410,12 +488,12 @@@
+   * If there is an error then @outlen will be 0 and an error will be
+   * specified by the return code from this function.
+   *
+-  * @in: Pointer to input buffer, will use bounce buffer if not 128 byte
+-  *      aligned
++  * @in: Pointer to input buffer
+   * @inlen: Length of input buffer
+-  * @out: Pointer to output buffer, must be page aligned
+-  * @outlen: Length of output buffer, must be PAGE_SIZE
++  * @out: Pointer to output buffer
++  * @outlen: Length of output buffer
+   * @wrkmem: ptr to buffer for working memory, size determined by
+ - *          NX842_MEM_COMPRESS
+ + *          nx842_get_workmem_size()
+   *
+   * Returns:
+   *   0		Success, output of length @outlen stored in the buffer at @out
+@@@ -525,10 -425,10 +503,9 @@@
+   *   -EINVAL	Bad input data encountered when attempting decompress
+   *   -EIO	Internal error
+   */
+ -static int nx842_pseries_decompress(const unsigned char *in, unsigned int inlen,
+ -				    unsigned char *out, unsigned int *outlen,
+ -				    void *wmem)
+ +int nx842_decompress(const unsigned char *in, unsigned int inlen,
+ +			 unsigned char *out, unsigned int *outlen, void *wmem)
+  {
+- 	struct nx842_header *hdr;
+  	struct nx842_devdata *local_devdata;
+  	struct device *dev = NULL;
+  	struct nx842_workmem *workmem;
+@@@ -1239,17 -1068,20 +1149,22 @@@ static int __exit nx842_remove(struct v
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static struct vio_device_id nx842_driver_ids[] = {
+ +	{"ibm,compression-v1", "ibm,compression"},
+++=======
++ static struct vio_device_id nx842_vio_driver_ids[] = {
++ 	{NX842_PSERIES_COMPAT_NAME "-v1", NX842_PSERIES_COMPAT_NAME},
+++>>>>>>> b8e04187c901 (crypto: nx - simplify pSeries nx842 driver)
+  	{"", ""},
+  };
+  
+- static struct vio_driver nx842_driver = {
++ static struct vio_driver nx842_vio_driver = {
+  	.name = MODULE_NAME,
+  	.probe = nx842_probe,
+ -	.remove = __exit_p(nx842_remove),
+ +	.remove = nx842_remove,
+  	.get_desired_dma = nx842_get_desired_dma,
+- 	.id_table = nx842_driver_ids,
++ 	.id_table = nx842_vio_driver_ids,
+  };
+  
+  static int __init nx842_init(void)
+@@@ -1283,10 -1117,11 +1198,15 @@@ static void __exit nx842_exit(void
+  	RCU_INIT_POINTER(devdata, NULL);
+  	spin_unlock_irqrestore(&devdata_mutex, flags);
+  	synchronize_rcu();
+- 	if (old_devdata)
++ 	if (old_devdata && old_devdata->dev)
+  		dev_set_drvdata(old_devdata->dev, NULL);
+  	kfree(old_devdata);
+++<<<<<<< HEAD
+ +	vio_unregister_driver(&nx842_driver);
+++=======
++ 	nx842_unregister_driver(&nx842_pseries_driver);
++ 	vio_unregister_driver(&nx842_vio_driver);
+++>>>>>>> b8e04187c901 (crypto: nx - simplify pSeries nx842 driver)
+  }
+  
+  module_exit(nx842_exit);
+* Unmerged path drivers/crypto/nx/nx-842-pseries.c
