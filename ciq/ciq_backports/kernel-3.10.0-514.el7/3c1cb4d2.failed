@@ -1,0 +1,145 @@
+net/ipv4: add dst cache support for gre lwtunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] ipv4: add dst cache support for gre lwtunnels (Jiri Benc) [1323141]
+Rebuild_FUZZ: 95.74%
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 3c1cb4d2604c03779a6c9485204e2a80be6c28f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3c1cb4d2.failed
+
+In case of UDP traffic with datagram length below MTU this
+gives about 4% performance increase
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Suggested-and-Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3c1cb4d2604c03779a6c9485204e2a80be6c28f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_gre.c
+diff --cc net/ipv4/ip_gre.c
+index 3ae6be751377,917c2c1bfadd..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -246,6 -499,114 +246,116 @@@ static void __gre_xmit(struct sk_buff *
+  	ip_tunnel_xmit(skb, dev, tnl_params, tnl_params->protocol);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *gre_handle_offloads(struct sk_buff *skb,
++ 					   bool csum)
++ {
++ 	return iptunnel_handle_offloads(skb, csum ? SKB_GSO_GRE_CSUM : SKB_GSO_GRE);
++ }
++ 
++ static struct rtable *gre_get_rt(struct sk_buff *skb,
++ 				 struct net_device *dev,
++ 				 struct flowi4 *fl,
++ 				 const struct ip_tunnel_key *key)
++ {
++ 	struct net *net = dev_net(dev);
++ 
++ 	memset(fl, 0, sizeof(*fl));
++ 	fl->daddr = key->u.ipv4.dst;
++ 	fl->saddr = key->u.ipv4.src;
++ 	fl->flowi4_tos = RT_TOS(key->tos);
++ 	fl->flowi4_mark = skb->mark;
++ 	fl->flowi4_proto = IPPROTO_GRE;
++ 
++ 	return ip_route_output_key(net, fl);
++ }
++ 
++ static void gre_fb_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct ip_tunnel_info *tun_info;
++ 	const struct ip_tunnel_key *key;
++ 	struct flowi4 fl;
++ 	struct rtable *rt;
++ 	int min_headroom;
++ 	int tunnel_hlen;
++ 	__be16 df, flags;
++ 	int err;
++ 
++ 	tun_info = skb_tunnel_info(skb);
++ 	if (unlikely(!tun_info || !(tun_info->mode & IP_TUNNEL_INFO_TX) ||
++ 		     ip_tunnel_info_af(tun_info) != AF_INET))
++ 		goto err_free_skb;
++ 
++ 	key = &tun_info->key;
++ 	rt = !skb->mark ? dst_cache_get_ip4(&tun_info->dst_cache, &fl.saddr) :
++ 			 NULL;
++ 	if (!rt) {
++ 		rt = gre_get_rt(skb, dev, &fl, key);
++ 		if (IS_ERR(rt))
++ 				goto err_free_skb;
++ 		if (!skb->mark)
++ 			dst_cache_set_ip4(&tun_info->dst_cache, &rt->dst,
++ 					  fl.saddr);
++ 	}
++ 
++ 	tunnel_hlen = ip_gre_calc_hlen(key->tun_flags);
++ 
++ 	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
++ 			+ tunnel_hlen + sizeof(struct iphdr);
++ 	if (skb_headroom(skb) < min_headroom || skb_header_cloned(skb)) {
++ 		int head_delta = SKB_DATA_ALIGN(min_headroom -
++ 						skb_headroom(skb) +
++ 						16);
++ 		err = pskb_expand_head(skb, max_t(int, head_delta, 0),
++ 				       0, GFP_ATOMIC);
++ 		if (unlikely(err))
++ 			goto err_free_rt;
++ 	}
++ 
++ 	/* Push Tunnel header. */
++ 	skb = gre_handle_offloads(skb, !!(tun_info->key.tun_flags & TUNNEL_CSUM));
++ 	if (IS_ERR(skb)) {
++ 		skb = NULL;
++ 		goto err_free_rt;
++ 	}
++ 
++ 	flags = tun_info->key.tun_flags & (TUNNEL_CSUM | TUNNEL_KEY);
++ 	build_header(skb, tunnel_hlen, flags, htons(ETH_P_TEB),
++ 		     tunnel_id_to_key(tun_info->key.tun_id), 0);
++ 
++ 	df = key->tun_flags & TUNNEL_DONT_FRAGMENT ?  htons(IP_DF) : 0;
++ 
++ 	iptunnel_xmit(skb->sk, rt, skb, fl.saddr, key->u.ipv4.dst, IPPROTO_GRE,
++ 		      key->tos, key->ttl, df, false);
++ 	return;
++ 
++ err_free_rt:
++ 	ip_rt_put(rt);
++ err_free_skb:
++ 	kfree_skb(skb);
++ 	dev->stats.tx_dropped++;
++ }
++ 
++ static int gre_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	struct rtable *rt;
++ 	struct flowi4 fl4;
++ 
++ 	if (ip_tunnel_info_af(info) != AF_INET)
++ 		return -EINVAL;
++ 
++ 	rt = gre_get_rt(skb, dev, &fl4, &info->key);
++ 	if (IS_ERR(rt))
++ 		return PTR_ERR(rt);
++ 
++ 	ip_rt_put(rt);
++ 	info->key.u.ipv4.src = fl4.saddr;
++ 	return 0;
++ }
++ 
+++>>>>>>> 3c1cb4d2604c (net/ipv4: add dst cache support for gre lwtunnels)
+  static netdev_tx_t ipgre_xmit(struct sk_buff *skb,
+  			      struct net_device *dev)
+  {
+* Unmerged path net/ipv4/ip_gre.c
