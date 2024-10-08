@@ -1,0 +1,170 @@
+net: ip, ipv6: handle gso skbs in forwarding path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [net] ip, ipv6: handle gso skbs in forwarding path (Florian Westphal) [1065299]
+Rebuild_FUZZ: 94.62%
+commit-author Florian Westphal <fw@strlen.de>
+commit fe6cc55f3a9a053482a76f5a6b2257cee51b4663
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/fe6cc55f.failed
+
+Marcelo Ricardo Leitner reported problems when the forwarding link path
+has a lower mtu than the incoming one if the inbound interface supports GRO.
+
+Given:
+Host <mtu1500> R1 <mtu1200> R2
+
+Host sends tcp stream which is routed via R1 and R2.  R1 performs GRO.
+
+In this case, the kernel will fail to send ICMP fragmentation needed
+messages (or pkt too big for ipv6), as GSO packets currently bypass dstmtu
+checks in forward path. Instead, Linux tries to send out packets exceeding
+the mtu.
+
+When locking route MTU on Host (i.e., no ipv4 DF bit set), R1 does
+not fragment the packets when forwarding, and again tries to send out
+packets exceeding R1-R2 link mtu.
+
+This alters the forwarding dstmtu checks to take the individual gso
+segment lengths into account.
+
+For ipv6, we send out pkt too big error for gso if the individual
+segments are too big.
+
+For ipv4, we either send icmp fragmentation needed, or, if the DF bit
+is not set, perform software segmentation and let the output path
+create fragments when the packet is leaving the machine.
+It is not 100% correct as the error message will contain the headers of
+the GRO skb instead of the original/segmented one, but it seems to
+work fine in my (limited) tests.
+
+Eric Dumazet suggested to simply shrink mss via ->gso_size to avoid
+sofware segmentation.
+
+However it turns out that skb_segment() assumes skb nr_frags is related
+to mss size so we would BUG there.  I don't want to mess with it considering
+Herbert and Eric disagree on what the correct behavior should be.
+
+Hannes Frederic Sowa notes that when we would shrink gso_size
+skb_segment would then also need to deal with the case where
+SKB_MAX_FRAGS would be exceeded.
+
+This uses sofware segmentation in the forward path when we hit ipv4
+non-DF packets and the outgoing link mtu is too small.  Its not perfect,
+but given the lack of bug reports wrt. GRO fwd being broken this is a
+rare case anyway.  Also its not like this could not be improved later
+once the dust settles.
+
+	Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Reported-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fe6cc55f3a9a053482a76f5a6b2257cee51b4663)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_forward.c
+#	net/ipv6/ip6_output.c
+diff --cc net/ipv4/ip_forward.c
+index 694de3b7aebf,f3869c186d97..000000000000
+--- a/net/ipv4/ip_forward.c
++++ b/net/ipv4/ip_forward.c
+@@@ -88,11 -157,12 +156,17 @@@ int ip_forward(struct sk_buff *skb
+  	if (opt->is_strictroute && rt->rt_uses_gateway)
+  		goto sr_failed;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(skb->len > dst_mtu(&rt->dst) && !skb_is_gso(skb) &&
+ +		     (ip_hdr(skb)->frag_off & htons(IP_DF))) && !skb->local_df) {
+++=======
++ 	IPCB(skb)->flags |= IPSKB_FORWARDED;
++ 	mtu = ip_dst_mtu_maybe_forward(&rt->dst, true);
++ 	if (!ip_may_fragment(skb) && ip_exceeds_mtu(skb, mtu)) {
+++>>>>>>> fe6cc55f3a9a (net: ip, ipv6: handle gso skbs in forwarding path)
+  		IP_INC_STATS(dev_net(rt->dst.dev), IPSTATS_MIB_FRAGFAILS);
+  		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+ -			  htonl(mtu));
+ +			  htonl(dst_mtu(&rt->dst)));
+  		goto drop;
+  	}
+  
+diff --cc net/ipv6/ip6_output.c
+index 1f471eecb984,070a2fae2375..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -320,6 -321,41 +320,44 @@@ static inline int ip6_forward_finish(st
+  	return dst_output(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int ip6_dst_mtu_forward(const struct dst_entry *dst)
++ {
++ 	unsigned int mtu;
++ 	struct inet6_dev *idev;
++ 
++ 	if (dst_metric_locked(dst, RTAX_MTU)) {
++ 		mtu = dst_metric_raw(dst, RTAX_MTU);
++ 		if (mtu)
++ 			return mtu;
++ 	}
++ 
++ 	mtu = IPV6_MIN_MTU;
++ 	rcu_read_lock();
++ 	idev = __in6_dev_get(dst->dev);
++ 	if (idev)
++ 		mtu = idev->cnf.mtu6;
++ 	rcu_read_unlock();
++ 
++ 	return mtu;
++ }
++ 
++ static bool ip6_pkt_too_big(const struct sk_buff *skb, unsigned int mtu)
++ {
++ 	if (skb->len <= mtu || skb->local_df)
++ 		return false;
++ 
++ 	if (IP6CB(skb)->frag_max_size && IP6CB(skb)->frag_max_size > mtu)
++ 		return true;
++ 
++ 	if (skb_is_gso(skb) && skb_gso_network_seglen(skb) <= mtu)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> fe6cc55f3a9a (net: ip, ipv6: handle gso skbs in forwarding path)
+  int ip6_forward(struct sk_buff *skb)
+  {
+  	struct dst_entry *dst = skb_dst(skb);
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 68e9d4dbcf3b..8f93fa1380da 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2835,5 +2835,22 @@ static inline bool skb_head_is_locked(const struct sk_buff *skb)
+ {
+ 	return !skb->head_frag || skb_cloned(skb);
+ }
++
++/**
++ * skb_gso_network_seglen - Return length of individual segments of a gso packet
++ *
++ * @skb: GSO skb
++ *
++ * skb_gso_network_seglen is used to determine the real size of the
++ * individual segments, including Layer3 (IP, IPv6) and L4 headers (TCP/UDP).
++ *
++ * The MAC/L2 header is not accounted for.
++ */
++static inline unsigned int skb_gso_network_seglen(const struct sk_buff *skb)
++{
++	unsigned int hdr_len = skb_transport_header(skb) -
++			       skb_network_header(skb);
++	return hdr_len + skb_gso_transport_seglen(skb);
++}
+ #endif	/* __KERNEL__ */
+ #endif	/* _LINUX_SKBUFF_H */
+* Unmerged path net/ipv4/ip_forward.c
+* Unmerged path net/ipv6/ip6_output.c
