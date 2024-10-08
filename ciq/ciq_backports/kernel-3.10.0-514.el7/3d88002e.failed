@@ -1,0 +1,278 @@
+libnvdimm: support for legacy (non-aliasing) nvdimms
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 3d88002e4a7bd40f355550284c6cd140e6fe29dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3d88002e.failed
+
+The libnvdimm region driver is an intermediary driver that translates
+non-volatile "region"s into "namespace" sub-devices that are surfaced by
+persistent memory block-device drivers (PMEM and BLK).
+
+ACPI 6 introduces the concept that a given nvdimm may simultaneously
+offer multiple access modes to its media through direct PMEM load/store
+access, or windowed BLK mode.  Existing nvdimms mostly implement a PMEM
+interface, some offer a BLK-like mode, but never both as ACPI 6 defines.
+If an nvdimm is single interfaced, then there is no need for dimm
+metadata labels.  For these devices we can take the region boundaries
+directly to create a child namespace device (nd_namespace_io).
+
+	Acked-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 3d88002e4a7bd40f355550284c6cd140e6fe29dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/nfit.c
+#	drivers/nvdimm/Makefile
+#	drivers/nvdimm/bus.c
+#	drivers/nvdimm/core.c
+#	drivers/nvdimm/dimm.c
+#	drivers/nvdimm/nd-core.h
+#	drivers/nvdimm/nd.h
+#	drivers/nvdimm/region_devs.c
+#	include/linux/libnvdimm.h
+#	include/linux/nd.h
+#	include/uapi/linux/ndctl.h
+* Unmerged path drivers/acpi/nfit.c
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path drivers/nvdimm/bus.c
+* Unmerged path drivers/nvdimm/core.c
+* Unmerged path drivers/nvdimm/dimm.c
+* Unmerged path drivers/nvdimm/nd-core.h
+* Unmerged path drivers/nvdimm/nd.h
+* Unmerged path drivers/nvdimm/region_devs.c
+* Unmerged path include/linux/libnvdimm.h
+* Unmerged path include/linux/nd.h
+* Unmerged path include/uapi/linux/ndctl.h
+* Unmerged path drivers/acpi/nfit.c
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path drivers/nvdimm/bus.c
+* Unmerged path drivers/nvdimm/core.c
+* Unmerged path drivers/nvdimm/dimm.c
+diff --git a/drivers/nvdimm/namespace_devs.c b/drivers/nvdimm/namespace_devs.c
+new file mode 100644
+index 000000000000..4f653d1e61ad
+--- /dev/null
++++ b/drivers/nvdimm/namespace_devs.c
+@@ -0,0 +1,111 @@
++/*
++ * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/slab.h>
++#include <linux/nd.h>
++#include "nd.h"
++
++static void namespace_io_release(struct device *dev)
++{
++	struct nd_namespace_io *nsio = to_nd_namespace_io(dev);
++
++	kfree(nsio);
++}
++
++static struct device_type namespace_io_device_type = {
++	.name = "nd_namespace_io",
++	.release = namespace_io_release,
++};
++
++static ssize_t nstype_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct nd_region *nd_region = to_nd_region(dev->parent);
++
++	return sprintf(buf, "%d\n", nd_region_to_nstype(nd_region));
++}
++static DEVICE_ATTR_RO(nstype);
++
++static struct attribute *nd_namespace_attributes[] = {
++	&dev_attr_nstype.attr,
++	NULL,
++};
++
++static struct attribute_group nd_namespace_attribute_group = {
++	.attrs = nd_namespace_attributes,
++};
++
++static const struct attribute_group *nd_namespace_attribute_groups[] = {
++	&nd_device_attribute_group,
++	&nd_namespace_attribute_group,
++	NULL,
++};
++
++static struct device **create_namespace_io(struct nd_region *nd_region)
++{
++	struct nd_namespace_io *nsio;
++	struct device *dev, **devs;
++	struct resource *res;
++
++	nsio = kzalloc(sizeof(*nsio), GFP_KERNEL);
++	if (!nsio)
++		return NULL;
++
++	devs = kcalloc(2, sizeof(struct device *), GFP_KERNEL);
++	if (!devs) {
++		kfree(nsio);
++		return NULL;
++	}
++
++	dev = &nsio->dev;
++	dev->type = &namespace_io_device_type;
++	dev->parent = &nd_region->dev;
++	res = &nsio->res;
++	res->name = dev_name(&nd_region->dev);
++	res->flags = IORESOURCE_MEM;
++	res->start = nd_region->ndr_start;
++	res->end = res->start + nd_region->ndr_size - 1;
++
++	devs[0] = dev;
++	return devs;
++}
++
++int nd_region_register_namespaces(struct nd_region *nd_region, int *err)
++{
++	struct device **devs = NULL;
++	int i;
++
++	*err = 0;
++	switch (nd_region_to_nstype(nd_region)) {
++	case ND_DEVICE_NAMESPACE_IO:
++		devs = create_namespace_io(nd_region);
++		break;
++	default:
++		break;
++	}
++
++	if (!devs)
++		return -ENODEV;
++
++	for (i = 0; devs[i]; i++) {
++		struct device *dev = devs[i];
++
++		dev_set_name(dev, "namespace%d.%d", nd_region->id, i);
++		dev->groups = nd_namespace_attribute_groups;
++		nd_device_register(dev);
++	}
++	kfree(devs);
++
++	return i;
++}
+* Unmerged path drivers/nvdimm/nd-core.h
+* Unmerged path drivers/nvdimm/nd.h
+diff --git a/drivers/nvdimm/region.c b/drivers/nvdimm/region.c
+new file mode 100644
+index 000000000000..ade3dba81afd
+--- /dev/null
++++ b/drivers/nvdimm/region.c
+@@ -0,0 +1,93 @@
++/*
++ * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/nd.h>
++#include "nd.h"
++
++static int nd_region_probe(struct device *dev)
++{
++	int err;
++	struct nd_region_namespaces *num_ns;
++	struct nd_region *nd_region = to_nd_region(dev);
++	int rc = nd_region_register_namespaces(nd_region, &err);
++
++	num_ns = devm_kzalloc(dev, sizeof(*num_ns), GFP_KERNEL);
++	if (!num_ns)
++		return -ENOMEM;
++
++	if (rc < 0)
++		return rc;
++
++	num_ns->active = rc;
++	num_ns->count = rc + err;
++	dev_set_drvdata(dev, num_ns);
++
++	if (err == 0)
++		return 0;
++
++	if (rc == err)
++		return -ENODEV;
++
++	/*
++	 * Given multiple namespaces per region, we do not want to
++	 * disable all the successfully registered peer namespaces upon
++	 * a single registration failure.  If userspace is missing a
++	 * namespace that it expects it can disable/re-enable the region
++	 * to retry discovery after correcting the failure.
++	 * <regionX>/namespaces returns the current
++	 * "<async-registered>/<total>" namespace count.
++	 */
++	dev_err(dev, "failed to register %d namespace%s, continuing...\n",
++			err, err == 1 ? "" : "s");
++	return 0;
++}
++
++static int child_unregister(struct device *dev, void *data)
++{
++	nd_device_unregister(dev, ND_SYNC);
++	return 0;
++}
++
++static int nd_region_remove(struct device *dev)
++{
++	/* flush attribute readers and disable */
++	nvdimm_bus_lock(dev);
++	dev_set_drvdata(dev, NULL);
++	nvdimm_bus_unlock(dev);
++
++	device_for_each_child(dev, NULL, child_unregister);
++	return 0;
++}
++
++static struct nd_device_driver nd_region_driver = {
++	.probe = nd_region_probe,
++	.remove = nd_region_remove,
++	.drv = {
++		.name = "nd_region",
++	},
++	.type = ND_DRIVER_REGION_BLK | ND_DRIVER_REGION_PMEM,
++};
++
++int __init nd_region_init(void)
++{
++	return nd_driver_register(&nd_region_driver);
++}
++
++void nd_region_exit(void)
++{
++	driver_unregister(&nd_region_driver.drv);
++}
++
++MODULE_ALIAS_ND_DEVICE(ND_DEVICE_REGION_PMEM);
++MODULE_ALIAS_ND_DEVICE(ND_DEVICE_REGION_BLK);
+* Unmerged path drivers/nvdimm/region_devs.c
+* Unmerged path include/linux/libnvdimm.h
+* Unmerged path include/linux/nd.h
+* Unmerged path include/uapi/linux/ndctl.h
