@@ -1,0 +1,201 @@
+nfs42: serialize LAYOUTSTATS calls of the same file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit 1bfe3b259ff2e579b2acb190f874397d53274497
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1bfe3b25.failed
+
+There is no need to report concurrently.
+
+	Reviewed-by: Jeff Layton <jeff.layton@primarydata.com>
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 1bfe3b259ff2e579b2acb190f874397d53274497)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs42proc.c
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/nfs42proc.c
+index 0899db096637,06c74cd93875..000000000000
+--- a/fs/nfs/nfs42proc.c
++++ b/fs/nfs/nfs42proc.c
+@@@ -166,20 -171,78 +166,91 @@@ static loff_t _nfs42_proc_llseek(struc
+  	return vfs_setpos(filep, res.sr_offset, inode->i_sb->s_maxbytes);
+  }
+  
+ -static void
+ -nfs42_layoutstat_prepare(struct rpc_task *task, void *calldata)
+ +loff_t nfs42_proc_llseek(struct file *filep, loff_t offset, int whence)
+  {
+ -	struct nfs42_layoutstat_data *data = calldata;
+ -	struct nfs_server *server = NFS_SERVER(data->args.inode);
+ +	struct nfs_server *server = NFS_SERVER(file_inode(filep));
+ +	struct nfs4_exception exception = { };
+ +	loff_t err;
+  
+++<<<<<<< HEAD
+ +	do {
+ +		err = _nfs42_proc_llseek(filep, offset, whence);
+ +		if (err >= 0)
+ +			break;
+ +		if (err == -ENOTSUPP)
+ +			return -EOPNOTSUPP;
+ +		err = nfs4_handle_exception(server, err, &exception);
+ +	} while (exception.retry);
+ +
+ +	return err;
+++=======
++ 	nfs41_setup_sequence(nfs4_get_session(server), &data->args.seq_args,
++ 			     &data->res.seq_res, task);
++ }
++ 
++ static void
++ nfs42_layoutstat_done(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs42_layoutstat_data *data = calldata;
++ 
++ 	if (!nfs4_sequence_done(task, &data->res.seq_res))
++ 		return;
++ 
++ 	/* well, we don't care about errors at all! */
++ 	if (task->tk_status)
++ 		dprintk("%s server returns %d\n", __func__, task->tk_status);
++ }
++ 
++ static void
++ nfs42_layoutstat_release(void *calldata)
++ {
++ 	struct nfs42_layoutstat_data *data = calldata;
++ 	struct nfs_server *nfss = NFS_SERVER(data->args.inode);
++ 
++ 	if (nfss->pnfs_curr_ld->cleanup_layoutstats)
++ 		nfss->pnfs_curr_ld->cleanup_layoutstats(data);
++ 
++ 	pnfs_put_layout_hdr(NFS_I(data->args.inode)->layout);
++ 	smp_mb__before_atomic();
++ 	clear_bit(NFS_INO_LAYOUTSTATS, &NFS_I(data->args.inode)->flags);
++ 	smp_mb__after_atomic();
++ 	nfs_iput_and_deactive(data->inode);
++ 	kfree(data->args.devinfo);
++ 	kfree(data);
++ }
++ 
++ static const struct rpc_call_ops nfs42_layoutstat_ops = {
++ 	.rpc_call_prepare = nfs42_layoutstat_prepare,
++ 	.rpc_call_done = nfs42_layoutstat_done,
++ 	.rpc_release = nfs42_layoutstat_release,
++ };
++ 
++ int nfs42_proc_layoutstats_generic(struct nfs_server *server,
++ 				   struct nfs42_layoutstat_data *data)
++ {
++ 	struct rpc_message msg = {
++ 		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_LAYOUTSTATS],
++ 		.rpc_argp = &data->args,
++ 		.rpc_resp = &data->res,
++ 	};
++ 	struct rpc_task_setup task_setup = {
++ 		.rpc_client = server->client,
++ 		.rpc_message = &msg,
++ 		.callback_ops = &nfs42_layoutstat_ops,
++ 		.callback_data = data,
++ 		.flags = RPC_TASK_ASYNC,
++ 	};
++ 	struct rpc_task *task;
++ 
++ 	data->inode = nfs_igrab_and_active(data->args.inode);
++ 	if (!data->inode) {
++ 		nfs42_layoutstat_release(data);
++ 		return -EAGAIN;
++ 	}
++ 	nfs4_init_sequence(&data->args.seq_args, &data->res.seq_res, 0);
++ 	task = rpc_run_task(&task_setup);
++ 	if (IS_ERR(task))
++ 		return PTR_ERR(task);
++ 	return 0;
+++>>>>>>> 1bfe3b259ff2 (nfs42: serialize LAYOUTSTATS calls of the same file)
+  }
+diff --cc fs/nfs/pnfs.c
+index e661b8a0925b,5b5224341bcd..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -2236,3 -2251,58 +2236,61 @@@ struct nfs4_threshold *pnfs_mdsthreshol
+  	}
+  	return thp;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int
++ pnfs_report_layoutstat(struct inode *inode)
++ {
++ 	struct pnfs_layoutdriver_type *ld = NFS_SERVER(inode)->pnfs_curr_ld;
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct nfs_inode *nfsi = NFS_I(inode);
++ 	struct nfs42_layoutstat_data *data;
++ 	struct pnfs_layout_hdr *hdr;
++ 	int status = 0;
++ 
++ 	if (!pnfs_enabled_sb(server) || !ld->prepare_layoutstats)
++ 		goto out;
++ 
++ 	if (test_and_set_bit(NFS_INO_LAYOUTSTATS, &nfsi->flags))
++ 		goto out;
++ 
++ 	spin_lock(&inode->i_lock);
++ 	if (!NFS_I(inode)->layout) {
++ 		spin_unlock(&inode->i_lock);
++ 		goto out;
++ 	}
++ 	hdr = NFS_I(inode)->layout;
++ 	pnfs_get_layout_hdr(hdr);
++ 	spin_unlock(&inode->i_lock);
++ 
++ 	data = kzalloc(sizeof(*data), GFP_KERNEL);
++ 	if (!data) {
++ 		status = -ENOMEM;
++ 		goto out_put;
++ 	}
++ 
++ 	data->args.fh = NFS_FH(inode);
++ 	data->args.inode = inode;
++ 	nfs4_stateid_copy(&data->args.stateid, &hdr->plh_stateid);
++ 	status = ld->prepare_layoutstats(&data->args);
++ 	if (status)
++ 		goto out_free;
++ 
++ 	status = nfs42_proc_layoutstats_generic(NFS_SERVER(inode), data);
++ 
++ out:
++ 	dprintk("%s returns %d\n", __func__, status);
++ 	return status;
++ 
++ out_free:
++ 	kfree(data);
++ out_put:
++ 	pnfs_put_layout_hdr(hdr);
++ 	smp_mb__before_atomic();
++ 	clear_bit(NFS_INO_LAYOUTSTATS, &nfsi->flags);
++ 	smp_mb__after_atomic();
++ 	goto out;
++ }
++ EXPORT_SYMBOL_GPL(pnfs_report_layoutstat);
+++>>>>>>> 1bfe3b259ff2 (nfs42: serialize LAYOUTSTATS calls of the same file)
+* Unmerged path fs/nfs/nfs42proc.c
+* Unmerged path fs/nfs/pnfs.c
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 19147f60445d..9813f9c20cf8 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -223,6 +223,7 @@ struct nfs_inode {
+ #define NFS_INO_COMMIT		(7)		/* inode is committing unstable writes */
+ #define NFS_INO_LAYOUTCOMMIT	(9)		/* layoutcommit required */
+ #define NFS_INO_LAYOUTCOMMITTING (10)		/* layoutcommit inflight */
++#define NFS_INO_LAYOUTSTATS	(11)		/* layoutstats inflight */
+ 
+ static inline struct nfs_inode *NFS_I(const struct inode *inode)
+ {
