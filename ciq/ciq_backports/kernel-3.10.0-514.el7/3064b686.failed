@@ -1,0 +1,167 @@
+nfs: have flexfiles mirror keep creds for both ro and rw layouts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jeff Layton <jlayton@poochiereds.net>
+commit 3064b6861d00b7124558cdf79f9387f948361be3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3064b686.failed
+
+A mirror can be shared between multiple layouts, even with different
+iomodes. That makes stats gathering simpler, but it causes a problem
+when we get different creds in READ vs. RW layouts.
+
+The current code drops the newer credentials onto the floor when this
+occurs. That's problematic when you fetch a READ layout first, and then
+a RW. If the READ layout doesn't have the correct creds to do a write,
+then writes will fail.
+
+We could just overwrite the READ credentials with the RW ones, but that
+would break the ability for the server to fence the layout for reads if
+things go awry. We need to be able to revert to the earlier READ creds
+if the RW layout is returned afterward.
+
+The simplest fix is to just keep two sets of creds per mirror. One for
+READ layouts and one for RW, and then use the appropriate set depending
+on the iomode of the layout segment.
+
+Also fix up some RCU nits that sparse found.
+
+	Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3064b6861d00b7124558cdf79f9387f948361be3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/flexfilelayout/flexfilelayout.c
+#	fs/nfs/flexfilelayout/flexfilelayout.h
+diff --cc fs/nfs/flexfilelayout/flexfilelayout.c
+index 6af5423f4768,60d690dbc947..000000000000
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@@ -149,9 -213,16 +149,19 @@@ static struct nfs4_ff_layout_mirror *ff
+  
+  static void ff_layout_free_mirror(struct nfs4_ff_layout_mirror *mirror)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct rpc_cred	*cred;
++ 
++ 	ff_layout_remove_mirror(mirror);
+++>>>>>>> 3064b6861d00 (nfs: have flexfiles mirror keep creds for both ro and rw layouts)
+  	kfree(mirror->fh_versions);
+- 	if (mirror->cred)
+- 		put_rpccred(mirror->cred);
++ 	cred = rcu_access_pointer(mirror->ro_cred);
++ 	if (cred)
++ 		put_rpccred(cred);
++ 	cred = rcu_access_pointer(mirror->rw_cred);
++ 	if (cred)
++ 		put_rpccred(cred);
+  	nfs4_ff_layout_put_deviceid(mirror->mirror_ds);
+  	kfree(mirror);
+  }
+@@@ -282,10 -412,12 +292,16 @@@ ff_layout_alloc_lseg(struct pnfs_layout
+  		goto out_err_free;
+  
+  	for (i = 0; i < fls->mirror_array_cnt; i++) {
+ -		struct nfs4_ff_layout_mirror *mirror;
+  		struct nfs4_deviceid devid;
+  		struct nfs4_deviceid_node *idnode;
+++<<<<<<< HEAD
+ +		u32 ds_count;
+ +		u32 fh_count;
+++=======
++ 		struct auth_cred acred = { .group_info = ff_zero_group };
++ 		struct rpc_cred	__rcu *cred;
++ 		u32 ds_count, fh_count, id;
+++>>>>>>> 3064b6861d00 (nfs: have flexfiles mirror keep creds for both ro and rw layouts)
+  		int j;
+  
+  		rc = -EIO;
+@@@ -371,9 -504,38 +387,44 @@@
+  		if (rc)
+  			goto out_err_free;
+  
+++<<<<<<< HEAD
+ +		dprintk("%s: uid %d gid %d\n", __func__,
+ +			fls->mirror_array[i]->uid,
+ +			fls->mirror_array[i]->gid);
+++=======
++ 		acred.gid = make_kgid(&init_user_ns, id);
++ 
++ 		/* find the cred for it */
++ 		rcu_assign_pointer(cred, rpc_lookup_generic_cred(&acred, 0, gfp_flags));
++ 		if (IS_ERR(cred)) {
++ 			rc = PTR_ERR(cred);
++ 			goto out_err_free;
++ 		}
++ 
++ 		if (lgr->range.iomode == IOMODE_READ)
++ 			rcu_assign_pointer(fls->mirror_array[i]->ro_cred, cred);
++ 		else
++ 			rcu_assign_pointer(fls->mirror_array[i]->rw_cred, cred);
++ 
++ 		mirror = ff_layout_add_mirror(lh, fls->mirror_array[i]);
++ 		if (mirror != fls->mirror_array[i]) {
++ 			/* swap cred ptrs so free_mirror will clean up old */
++ 			if (lgr->range.iomode == IOMODE_READ) {
++ 				cred = xchg(&mirror->ro_cred, cred);
++ 				rcu_assign_pointer(fls->mirror_array[i]->ro_cred, cred);
++ 			} else {
++ 				cred = xchg(&mirror->rw_cred, cred);
++ 				rcu_assign_pointer(fls->mirror_array[i]->rw_cred, cred);
++ 			}
++ 			ff_layout_free_mirror(fls->mirror_array[i]);
++ 			fls->mirror_array[i] = mirror;
++ 		}
++ 
++ 		dprintk("%s: iomode %s uid %u gid %u\n", __func__,
++ 			lgr->range.iomode == IOMODE_READ ? "READ" : "RW",
++ 			from_kuid(&init_user_ns, acred.uid),
++ 			from_kgid(&init_user_ns, acred.gid));
+++>>>>>>> 3064b6861d00 (nfs: have flexfiles mirror keep creds for both ro and rw layouts)
+  	}
+  
+  	p = xdr_inline_decode(&stream, 4);
+diff --cc fs/nfs/flexfilelayout/flexfilelayout.h
+index 291bbdbc6e03,1318c77aeb35..000000000000
+--- a/fs/nfs/flexfilelayout/flexfilelayout.h
++++ b/fs/nfs/flexfilelayout/flexfilelayout.h
+@@@ -75,9 -76,8 +75,14 @@@ struct nfs4_ff_layout_mirror 
+  	u32				fh_versions_cnt;
+  	struct nfs_fh			*fh_versions;
+  	nfs4_stateid			stateid;
+++<<<<<<< HEAD
+ +	u32				uid;
+ +	u32				gid;
+ +	struct rpc_cred			*cred;
+++=======
++ 	struct rpc_cred	__rcu		*ro_cred;
++ 	struct rpc_cred	__rcu		*rw_cred;
+++>>>>>>> 3064b6861d00 (nfs: have flexfiles mirror keep creds for both ro and rw layouts)
+  	atomic_t			ref;
+  	spinlock_t			lock;
+  	struct nfs4_ff_layoutstat	read_stat;
+* Unmerged path fs/nfs/flexfilelayout/flexfilelayout.c
+* Unmerged path fs/nfs/flexfilelayout/flexfilelayout.h
+diff --git a/fs/nfs/flexfilelayout/flexfilelayoutdev.c b/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+index 74421a65cd15..a91f3f8a2252 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayoutdev.c
++++ b/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+@@ -360,9 +360,12 @@ static int ff_layout_update_mirror_cred(struct nfs4_ff_layout_mirror *mirror,
+ static struct rpc_cred *
+ ff_layout_get_mirror_cred(struct nfs4_ff_layout_mirror *mirror, u32 iomode)
+ {
+-	struct rpc_cred *cred, **pcred;
++	struct rpc_cred *cred, __rcu **pcred;
+ 
+-	pcred = &mirror->cred;
++	if (iomode == IOMODE_READ)
++		pcred = &mirror->ro_cred;
++	else
++		pcred = &mirror->rw_cred;
+ 
+ 	rcu_read_lock();
+ 	do {
