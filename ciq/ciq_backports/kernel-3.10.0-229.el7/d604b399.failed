@@ -1,0 +1,174 @@
+ALSA: hda - Fix registration of beep input device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [alsa] hda: Fix registration of beep input device (Jaroslav Kysela) [1112200]
+Rebuild_FUZZ: 90.11%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit d604b3990884062873e3bef09ef5e89857c409c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d604b399.failed
+
+The beep input device is registered via input_register_device(), but
+this is called in snd_hda_attach_beep_device() where the sound devices
+aren't registered yet.  This leads to the binding to non-existing
+object, thus results in failure.  And, even if the binding worked
+(against the PCI object), it's still racy; the input device appears
+before the sound objects.
+
+For fixing this, register the input device properly at dev_register
+ops of the codec object it's bound with.  Also, call
+snd_hda_detach_beep_device() at dev_disconnection so that it's
+detached at the right timing.  As a bonus, since it's called in the
+codec's ops, we can get rid of the further call from the other codec
+drivers.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit d604b3990884062873e3bef09ef5e89857c409c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_beep.c
+diff --cc sound/pci/hda/hda_beep.c
+index ae0e02a59aa5,8c6c50afc0b7..000000000000
+--- a/sound/pci/hda/hda_beep.c
++++ b/sound/pci/hda/hda_beep.c
+@@@ -169,12 -171,6 +171,15 @@@ static int snd_hda_do_attach(struct hda
+  	input_dev->dev.parent = &codec->dev;
+  	input_set_drvdata(input_dev, beep);
+  
+++<<<<<<< HEAD
+ +	err = input_register_device(input_dev);
+ +	if (err < 0) {
+ +		input_free_device(input_dev);
+ +		printk(KERN_INFO "hda_beep: unable to register input device\n");
+ +		return err;
+ +	}
+++=======
+++>>>>>>> d604b3990884 (ALSA: hda - Fix registration of beep input device)
+  	beep->dev = input_dev;
+  	return 0;
+  }
+@@@ -242,8 -238,29 +247,29 @@@ void snd_hda_detach_beep_device(struct 
+  		kfree(beep);
+  	}
+  }
+ -EXPORT_SYMBOL_GPL(snd_hda_detach_beep_device);
+ +EXPORT_SYMBOL_HDA(snd_hda_detach_beep_device);
+  
++ int snd_hda_register_beep_device(struct hda_codec *codec)
++ {
++ 	struct hda_beep *beep = codec->beep;
++ 	int err;
++ 
++ 	if (!beep || !beep->dev)
++ 		return 0;
++ 
++ 	err = input_register_device(beep->dev);
++ 	if (err < 0) {
++ 		codec_err(codec, "hda_beep: unable to register input device\n");
++ 		input_free_device(beep->dev);
++ 		codec->beep = NULL;
++ 		kfree(beep);
++ 		return err;
++ 	}
++ 	beep->registered = true;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(snd_hda_register_beep_device);
++ 
+  static bool ctl_has_mute(struct snd_kcontrol *kcontrol)
+  {
+  	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+* Unmerged path sound/pci/hda/hda_beep.c
+diff --git a/sound/pci/hda/hda_beep.h b/sound/pci/hda/hda_beep.h
+index cb88464676b6..a63b5e077332 100644
+--- a/sound/pci/hda/hda_beep.h
++++ b/sound/pci/hda/hda_beep.h
+@@ -34,6 +34,7 @@ struct hda_beep {
+ 	char phys[32];
+ 	int tone;
+ 	hda_nid_t nid;
++	unsigned int registered:1;
+ 	unsigned int enabled:1;
+ 	unsigned int linear_tone:1;	/* linear tone for IDT/STAC codec */
+ 	unsigned int playing:1;
+@@ -45,6 +46,7 @@ struct hda_beep {
+ int snd_hda_enable_beep_device(struct hda_codec *codec, int enable);
+ int snd_hda_attach_beep_device(struct hda_codec *codec, int nid);
+ void snd_hda_detach_beep_device(struct hda_codec *codec);
++int snd_hda_register_beep_device(struct hda_codec *codec);
+ #else
+ static inline int snd_hda_attach_beep_device(struct hda_codec *codec, int nid)
+ {
+@@ -53,5 +55,9 @@ static inline int snd_hda_attach_beep_device(struct hda_codec *codec, int nid)
+ static inline void snd_hda_detach_beep_device(struct hda_codec *codec)
+ {
+ }
++static inline int snd_hda_register_beep_device(struct hda_codec *codec)
++{
++	return 0;
++}
+ #endif
+ #endif
+diff --git a/sound/pci/hda/hda_codec.c b/sound/pci/hda/hda_codec.c
+index 11666375682f..536c17c046d3 100644
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -1379,14 +1379,19 @@ static unsigned int hda_set_power_state(struct hda_codec *codec,
+ static int snd_hda_codec_dev_register(struct snd_device *device)
+ {
+ 	struct hda_codec *codec = device->device_data;
++	int err = device_add(&codec->dev);
+ 
+-	return device_add(&codec->dev);
++	if (err < 0)
++		return err;
++	snd_hda_register_beep_device(codec);
++	return 0;
+ }
+ 
+ static int snd_hda_codec_dev_disconnect(struct snd_device *device)
+ {
+ 	struct hda_codec *codec = device->device_data;
+ 
++	snd_hda_detach_beep_device(codec);
+ 	device_del(&codec->dev);
+ 	return 0;
+ }
+@@ -2687,6 +2692,7 @@ int snd_hda_codec_reset(struct hda_codec *codec)
+ 				  bus->pcm_dev_bits);
+ 		}
+ 	}
++	snd_hda_detach_beep_device(codec);
+ 	if (codec->patch_ops.free)
+ 		codec->patch_ops.free(codec);
+ 	memset(&codec->patch_ops, 0, sizeof(codec->patch_ops));
+diff --git a/sound/pci/hda/hda_generic.c b/sound/pci/hda/hda_generic.c
+index 5820a74b5781..59af7251c66b 100644
+--- a/sound/pci/hda/hda_generic.c
++++ b/sound/pci/hda/hda_generic.c
+@@ -5351,7 +5351,6 @@ EXPORT_SYMBOL_HDA(snd_hda_gen_init);
+ void snd_hda_gen_free(struct hda_codec *codec)
+ {
+ 	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_FREE);
+-	snd_hda_detach_beep_device(codec);
+ 	snd_hda_gen_spec_free(codec->spec);
+ 	kfree(codec->spec);
+ 	codec->spec = NULL;
+diff --git a/sound/pci/hda/patch_conexant.c b/sound/pci/hda/patch_conexant.c
+index 13a416060eb8..5ea0e2feed38 100644
+--- a/sound/pci/hda/patch_conexant.c
++++ b/sound/pci/hda/patch_conexant.c
+@@ -445,9 +445,7 @@ static int conexant_init(struct hda_codec *codec)
+ 
+ static void conexant_free(struct hda_codec *codec)
+ {
+-	struct conexant_spec *spec = codec->spec;
+-	snd_hda_detach_beep_device(codec);
+-	kfree(spec);
++	kfree(codec->spec);
+ }
+ 
+ static const struct snd_kcontrol_new cxt_capture_mixers[] = {
