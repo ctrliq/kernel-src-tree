@@ -1,0 +1,153 @@
+ipv4: support for fib route lwtunnel encap attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Roopa Prabhu <roopa@cumulusnetworks.com>
+commit 571e722676fe386bb66f72a75b64a6ebf535c077
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/571e7226.failed
+
+This patch adds support in ipv4 fib functions to parse user
+provided encap attributes and attach encap state data to fib_nh
+and rtable.
+
+	Signed-off-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 571e722676fe386bb66f72a75b64a6ebf535c077)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/route.h
+#	net/ipv4/fib_semantics.c
+#	net/ipv4/route.c
+diff --cc include/net/route.h
+index 3765d2348b06,2d45f419477f..000000000000
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@@ -64,6 -65,8 +64,11 @@@ struct rtable 
+  	u32			rt_pmtu;
+  
+  	struct list_head	rt_uncached;
+++<<<<<<< HEAD
+++=======
++ 	struct uncached_list	*rt_uncached_list;
++ 	struct lwtunnel_state   *rt_lwtstate;
+++>>>>>>> 571e722676fe (ipv4: support for fib route lwtunnel encap attributes)
+  };
+  
+  static inline bool rt_is_input_route(const struct rtable *rt)
+diff --cc net/ipv4/fib_semantics.c
+index 1938e2490ebe,6754c64b2fe0..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -266,7 -268,8 +268,12 @@@ static inline int nh_comp(const struct 
+  #ifdef CONFIG_IP_ROUTE_CLASSID
+  		    nh->nh_tclassid != onh->nh_tclassid ||
+  #endif
+++<<<<<<< HEAD
+ +		    ((nh->nh_flags ^ onh->nh_flags) & ~RTNH_F_DEAD))
+++=======
++ 		    lwtunnel_cmp_encap(nh->nh_lwtstate, onh->nh_lwtstate) ||
++ 		    ((nh->nh_flags ^ onh->nh_flags) & ~RTNH_COMPARE_MASK))
+++>>>>>>> 571e722676fe (ipv4: support for fib route lwtunnel encap attributes)
+  			return -1;
+  		onh++;
+  	} endfor_nexthops(fi);
+diff --cc net/ipv4/route.c
+index bc344977f369,226570ba1ced..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -1331,10 -1350,13 +1332,11 @@@ static void ipv4_dst_destroy(struct dst
+  	struct rtable *rt = (struct rtable *) dst;
+  
+  	if (!list_empty(&rt->rt_uncached)) {
+ -		struct uncached_list *ul = rt->rt_uncached_list;
+ -
+ -		spin_lock_bh(&ul->lock);
+ +		spin_lock_bh(&rt_uncached_lock);
+  		list_del(&rt->rt_uncached);
+ -		spin_unlock_bh(&ul->lock);
+ +		spin_unlock_bh(&rt_uncached_lock);
+  	}
++ 	lwtunnel_state_put(rt->rt_lwtstate);
+  }
+  
+  void rt_flush_dev(struct net_device *dev)
+@@@ -1595,6 -1626,8 +1604,11 @@@ static int __mkroute_input(struct sk_bu
+  	rth->rt_gateway	= 0;
+  	rth->rt_uses_gateway = 0;
+  	INIT_LIST_HEAD(&rth->rt_uncached);
+++<<<<<<< HEAD
+++=======
++ 	rth->rt_lwtstate = NULL;
++ 	RT_CACHE_STAT_INC(in_slow_tot);
+++>>>>>>> 571e722676fe (ipv4: support for fib route lwtunnel encap attributes)
+  
+  	rth->dst.input = ip_forward;
+  	rth->dst.output = ip_output;
+@@@ -1766,6 -1801,9 +1780,12 @@@ local_input
+  	rth->rt_gateway	= 0;
+  	rth->rt_uses_gateway = 0;
+  	INIT_LIST_HEAD(&rth->rt_uncached);
+++<<<<<<< HEAD
+++=======
++ 	rth->rt_lwtstate = NULL;
++ 
++ 	RT_CACHE_STAT_INC(in_slow_tot);
+++>>>>>>> 571e722676fe (ipv4: support for fib route lwtunnel encap attributes)
+  	if (res.type == RTN_UNREACHABLE) {
+  		rth->dst.input= ip_error;
+  		rth->dst.error= -err;
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index 8aa6f829293d..858c5b783d1d 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -44,7 +44,9 @@ struct fib_config {
+ 	u32			fc_flow;
+ 	u32			fc_nlflags;
+ 	struct nl_info		fc_nlinfo;
+- };
++	struct nlattr		*fc_encap;
++	u16			fc_encap_type;
++};
+ 
+ struct fib_info;
+ struct rtable;
+@@ -89,6 +91,7 @@ struct fib_nh {
+ 	struct rtable __rcu * __percpu *nh_pcpu_rth_output;
+ 	struct rtable __rcu	*nh_rth_input;
+ 	struct fnhe_hash_bucket	__rcu *nh_exceptions;
++	struct lwtunnel_state	*nh_lwtstate;
+ };
+ 
+ /*
+* Unmerged path include/net/route.h
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index 59c306b4d24b..b33716ff8249 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -528,6 +528,8 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
+ 	[RTA_METRICS]		= { .type = NLA_NESTED },
+ 	[RTA_MULTIPATH]		= { .len = sizeof(struct rtnexthop) },
+ 	[RTA_FLOW]		= { .type = NLA_U32 },
++	[RTA_ENCAP_TYPE]	= { .type = NLA_U16 },
++	[RTA_ENCAP]		= { .type = NLA_NESTED },
+ };
+ 
+ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
+@@ -593,6 +595,12 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
+ 		case RTA_TABLE:
+ 			cfg->fc_table = nla_get_u32(attr);
+ 			break;
++		case RTA_ENCAP:
++			cfg->fc_encap = attr;
++			break;
++		case RTA_ENCAP_TYPE:
++			cfg->fc_encap_type = nla_get_u16(attr);
++			break;
+ 		}
+ 	}
+ 
+* Unmerged path net/ipv4/fib_semantics.c
+* Unmerged path net/ipv4/route.c
