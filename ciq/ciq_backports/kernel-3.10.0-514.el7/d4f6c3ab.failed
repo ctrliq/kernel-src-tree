@@ -1,0 +1,203 @@
+nvme: factor out a nvme_unmap_data helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit d4f6c3aba5b496a2cb80a8e8e082ae51e46579f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d4f6c3ab.failed
+
+This is the counter part to nvme_map_data.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit d4f6c3aba5b496a2cb80a8e8e082ae51e46579f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,801d51d4ea10..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -81,9 -87,15 +81,21 @@@ static wait_queue_head_t nvme_kthread_w
+  
+  static struct class *nvme_class;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static void nvme_reset_failed_dev(struct work_struct *ws);
+ +static int nvme_reset(struct nvme_dev *dev);
+ +static int nvme_process_cq(struct nvme_queue *nvmeq);
+++=======
++ struct nvme_dev;
++ struct nvme_queue;
++ struct nvme_iod;
++ 
++ static int __nvme_reset(struct nvme_dev *dev);
++ static int nvme_reset(struct nvme_dev *dev);
++ static void nvme_process_cq(struct nvme_queue *nvmeq);
++ static void nvme_unmap_data(struct nvme_dev *dev, struct nvme_iod *iod);
++ static void nvme_dead_ctrl(struct nvme_dev *dev);
+++>>>>>>> d4f6c3aba5b4 (nvme: factor out a nvme_unmap_data helper):drivers/nvme/host/pci.c
+  
+  struct async_cmd_info {
+  	struct kthread_work work;
+@@@ -515,14 -656,16 +527,23 @@@ static void req_completion(struct nvme_
+  	struct nvme_iod *iod = ctx;
+  	struct request *req = iod_get_private(iod);
+  	struct nvme_cmd_info *cmd_rq = blk_mq_rq_to_pdu(req);
+ +
+  	u16 status = le16_to_cpup(&cqe->status) >> 1;
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++ 	int error = 0;
+++>>>>>>> d4f6c3aba5b4 (nvme: factor out a nvme_unmap_data helper):drivers/nvme/host/pci.c
+  
+  	if (unlikely(status)) {
+  		if (!(status & NVME_SC_DNR || blk_noretry_request(req))
+  		    && (jiffies - req->start_time) < req->timeout) {
+  			unsigned long flags;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++ 			nvme_unmap_data(nvmeq->dev, iod);
++ 
+++>>>>>>> d4f6c3aba5b4 (nvme: factor out a nvme_unmap_data helper):drivers/nvme/host/pci.c
+  			blk_mq_requeue_request(req);
+  			spin_lock_irqsave(req->q->queue_lock, flags);
+  			if (!blk_queue_stopped(req->q))
+@@@ -530,30 -673,33 +551,35 @@@
+  			spin_unlock_irqrestore(req->q->queue_lock, flags);
+  			return;
+  		}
+ -
+ -		if (req->cmd_type == REQ_TYPE_DRV_PRIV) {
+ -			if (cmd_rq->ctx == CMD_CTX_CANCELLED)
+ -				error = -EINTR;
+ -			else
+ -				error = status;
+ -		} else {
+ -			error = nvme_error_status(status);
+ -		}
+ -	}
+ -
+ -	if (req->cmd_type == REQ_TYPE_DRV_PRIV) {
+ -		u32 result = le32_to_cpup(&cqe->result);
+ -		req->special = (void *)(uintptr_t)result;
+ -	}
+ +		req->errors = nvme_error_status(status);
+ +	} else
+ +		req->errors = 0;
+  
+  	if (cmd_rq->aborted)
+ -		dev_warn(nvmeq->dev->dev,
+ +		dev_warn(&nvmeq->dev->pci_dev->dev,
+  			"completing aborted command with status:%04x\n",
+ -			error);
+ +			status);
+ +
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	if (iod->nents) {
+ +		dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->sg, iod->nents,
+ +			rq_data_dir(req) ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +		if (blk_integrity_rq(req))
+ +			dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->meta_sg, 1,
+ +				rq_data_dir(req) ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +	}
+ +	nvme_free_iod(nvmeq->dev, iod);
+  
+ +	blk_mq_complete_request(req);
+++=======
++ 	nvme_unmap_data(nvmeq->dev, iod);
++ 	blk_mq_complete_request(req, error);
+++>>>>>>> d4f6c3aba5b4 (nvme: factor out a nvme_unmap_data helper):drivers/nvme/host/pci.c
+  }
+  
+ -static bool nvme_setup_prps(struct nvme_dev *dev, struct nvme_iod *iod,
+ -		int total_len)
+ +/* length is in bytes.  gfp flags indicates whether we may sleep. */
+ +int nvme_setup_prps(struct nvme_dev *dev, struct nvme_iod *iod, int total_len,
+ +								gfp_t gfp)
+  {
+  	struct dma_pool *pool;
+  	int length = total_len;
+@@@ -628,9 -774,76 +654,27 @@@
+  		dma_len = sg_dma_len(sg);
+  	}
+  
+ -	return true;
+ -}
+ -
+ -static int nvme_map_data(struct nvme_dev *dev, struct nvme_iod *iod,
+ -		struct nvme_command *cmnd)
+ -{
+ -	struct request *req = iod_get_private(iod);
+ -	struct request_queue *q = req->q;
+ -	enum dma_data_direction dma_dir = rq_data_dir(req) ?
+ -			DMA_TO_DEVICE : DMA_FROM_DEVICE;
+ -	int ret = BLK_MQ_RQ_QUEUE_ERROR;
+ -
+ -	sg_init_table(iod->sg, req->nr_phys_segments);
+ -	iod->nents = blk_rq_map_sg(q, req, iod->sg);
+ -	if (!iod->nents)
+ -		goto out;
+ -
+ -	ret = BLK_MQ_RQ_QUEUE_BUSY;
+ -	if (!dma_map_sg(dev->dev, iod->sg, iod->nents, dma_dir))
+ -		goto out;
+ -
+ -	if (!nvme_setup_prps(dev, iod, blk_rq_bytes(req)))
+ -		goto out_unmap;
+ -
+ -	ret = BLK_MQ_RQ_QUEUE_ERROR;
+ -	if (blk_integrity_rq(req)) {
+ -		if (blk_rq_count_integrity_sg(q, req->bio) != 1)
+ -			goto out_unmap;
+ -
+ -		sg_init_table(iod->meta_sg, 1);
+ -		if (blk_rq_map_integrity_sg(q, req->bio, iod->meta_sg) != 1)
+ -			goto out_unmap;
+ -
+ -		if (rq_data_dir(req))
+ -			nvme_dif_remap(req, nvme_dif_prep);
+ -
+ -		if (!dma_map_sg(dev->dev, iod->meta_sg, 1, dma_dir))
+ -			goto out_unmap;
+ -	}
+ -
+ -	cmnd->rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
+ -	cmnd->rw.prp2 = cpu_to_le64(iod->first_dma);
+ -	if (blk_integrity_rq(req))
+ -		cmnd->rw.metadata = cpu_to_le64(sg_dma_address(iod->meta_sg));
+ -	return BLK_MQ_RQ_QUEUE_OK;
+ -
+ -out_unmap:
+ -	dma_unmap_sg(dev->dev, iod->sg, iod->nents, dma_dir);
+ -out:
+ -	return ret;
+ +	return total_len;
+  }
+  
++ static void nvme_unmap_data(struct nvme_dev *dev, struct nvme_iod *iod)
++ {
++ 	struct request *req = iod_get_private(iod);
++ 	enum dma_data_direction dma_dir = rq_data_dir(req) ?
++ 			DMA_TO_DEVICE : DMA_FROM_DEVICE;
++ 
++ 	if (iod->nents) {
++ 		dma_unmap_sg(dev->dev, iod->sg, iod->nents, dma_dir);
++ 		if (blk_integrity_rq(req)) {
++ 			if (!rq_data_dir(req))
++ 				nvme_dif_remap(req, nvme_dif_complete);
++ 			dma_unmap_sg(dev->dev, iod->meta_sg, 1, dma_dir);
++ 		}
++ 	}
++ 
++ 	nvme_free_iod(dev, iod);
++ }
++ 
+  /*
+   * We reuse the small pool to allocate the 16-byte range here as it is not
+   * worth having a special pool for these or additional cases to handle freeing
+* Unmerged path drivers/block/nvme-core.c
