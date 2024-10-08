@@ -5755,8 +5755,6 @@ static void i40e_reset_and_rebuild(struct i40e_pf *pf, bool reinit)
 	dv.subbuild_version = 0;
 	i40e_aq_send_driver_version(&pf->hw, &dv, NULL);
 
-	dev_info(&pf->pdev->dev, "reset complete\n");
-
 end_core_reset:
 	clear_bit(__I40E_RESET_RECOVERY_PENDING, &pf->state);
 }
