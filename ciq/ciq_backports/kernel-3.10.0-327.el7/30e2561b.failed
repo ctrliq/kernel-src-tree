@@ -1,0 +1,178 @@
+i40e: Fix for recursive RTNL lock during PROMISC change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Anjali Singhai <anjali.singhai@intel.com>
+commit 30e2561b95295258890b4e0366ce867e04d34a97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/30e2561b.failed
+
+The sync_vsi_filters function can be called directly under RTNL
+or through the timer subtask without one. This was causing a deadlock.
+
+If sync_vsi_filters is called from a thread which held the lock,
+and in another thread the PROMISC setting got changed we would
+be executing the PROMISC change in the thread which already held
+the lock alongside the other filter update. The PROMISC change
+requires a reset if we are on a VEB, which requires it to be called
+under RTNL.
+
+Earlier the driver would call reset for PROMISC change without
+checking if we were already under RTNL and would try to grab it
+causing a deadlock. This patch changes the flow to see if we are
+already under RTNL before trying to grab it.
+
+	Signed-off-by: Anjali Singhai Jain <anjali.singhai@intel.com>
+	Signed-off-by: Kiran Patil <kiran.patil@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 30e2561b95295258890b4e0366ce867e04d34a97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 8eb554d9026d,52e58f304b21..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1872,20 -1951,48 +1873,60 @@@ int i40e_sync_vsi_filters(struct i40e_v
+  		cur_promisc = (!!(vsi->current_netdev_flags & IFF_PROMISC) ||
+  			       test_bit(__I40E_FILTER_OVERFLOW_PROMISC,
+  					&vsi->state));
+++<<<<<<< HEAD
+ +		aq_ret = i40e_aq_set_vsi_unicast_promiscuous(&vsi->back->hw,
+ +							     vsi->seid,
+ +							     cur_promisc, NULL);
+ +		if (aq_ret)
+++=======
++ 		if (vsi->type == I40E_VSI_MAIN && pf->lan_veb != I40E_NO_VEB) {
++ 			/* set defport ON for Main VSI instead of true promisc
++ 			 * this way we will get all unicast/multicast and VLAN
++ 			 * promisc behavior but will not get VF or VMDq traffic
++ 			 * replicated on the Main VSI.
++ 			 */
++ 			if (pf->cur_promisc != cur_promisc) {
++ 				pf->cur_promisc = cur_promisc;
++ 				if (grab_rtnl)
++ 					i40e_do_reset_safe(pf,
++ 						BIT(__I40E_PF_RESET_REQUESTED));
++ 				else
++ 					i40e_do_reset(pf,
++ 						BIT(__I40E_PF_RESET_REQUESTED));
++ 			}
++ 		} else {
++ 			ret = i40e_aq_set_vsi_unicast_promiscuous(
++ 							  &vsi->back->hw,
++ 							  vsi->seid,
++ 							  cur_promisc, NULL);
++ 			if (ret)
++ 				dev_info(&pf->pdev->dev,
++ 					 "set unicast promisc failed, err %d, aq_err %d\n",
++ 					 ret, pf->hw.aq.asq_last_status);
++ 			ret = i40e_aq_set_vsi_multicast_promiscuous(
++ 							  &vsi->back->hw,
++ 							  vsi->seid,
++ 							  cur_promisc, NULL);
++ 			if (ret)
++ 				dev_info(&pf->pdev->dev,
++ 					 "set multicast promisc failed, err %d, aq_err %d\n",
++ 					 ret, pf->hw.aq.asq_last_status);
++ 		}
++ 		ret = i40e_aq_set_vsi_broadcast(&vsi->back->hw,
++ 						vsi->seid,
++ 						cur_promisc, NULL);
++ 		if (ret)
+++>>>>>>> 30e2561b9529 (i40e: Fix for recursive RTNL lock during PROMISC change)
+  			dev_info(&pf->pdev->dev,
+ -				 "set brdcast promisc failed, err %s, aq_err %s\n",
+ -				 i40e_stat_str(&pf->hw, ret),
+ -				 i40e_aq_str(&pf->hw,
+ -					     pf->hw.aq.asq_last_status));
+ +				 "set uni promisc failed, err %d, aq_err %d\n",
+ +				 aq_ret, pf->hw.aq.asq_last_status);
+ +		aq_ret = i40e_aq_set_vsi_broadcast(&vsi->back->hw,
+ +						   vsi->seid,
+ +						   cur_promisc, NULL);
+ +		if (aq_ret)
+ +			dev_info(&pf->pdev->dev,
+ +				 "set brdcast promisc failed, err %d, aq_err %d\n",
+ +				 aq_ret, pf->hw.aq.asq_last_status);
+  	}
+  
+  	clear_bit(__I40E_CONFIG_BUSY, &vsi->state);
+diff --git a/drivers/net/ethernet/intel/i40e/i40e.h b/drivers/net/ethernet/intel/i40e/i40e.h
+index 11601b91991b..4c6ed13afac6 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -652,7 +652,7 @@ struct i40e_mac_filter *i40e_add_filter(struct i40e_vsi *vsi,
+ 					bool is_vf, bool is_netdev);
+ void i40e_del_filter(struct i40e_vsi *vsi, u8 *macaddr, s16 vlan,
+ 		     bool is_vf, bool is_netdev);
+-int i40e_sync_vsi_filters(struct i40e_vsi *vsi);
++int i40e_sync_vsi_filters(struct i40e_vsi *vsi, bool grab_rtnl);
+ struct i40e_vsi *i40e_vsi_setup(struct i40e_pf *pf, u8 type,
+ 				u16 uplink, u32 param1);
+ int i40e_vsi_release(struct i40e_vsi *vsi);
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_debugfs.c b/drivers/net/ethernet/intel/i40e/i40e_debugfs.c
+index 6a703a15a320..69c9ac5b1daa 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_debugfs.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_debugfs.c
+@@ -1146,7 +1146,7 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
+ 		}
+ 
+ 		f = i40e_add_filter(vsi, ma, vlan, false, false);
+-		ret = i40e_sync_vsi_filters(vsi);
++		ret = i40e_sync_vsi_filters(vsi, true);
+ 		if (f && !ret)
+ 			dev_info(&pf->pdev->dev,
+ 				 "add macaddr: %pM vlan=%d added to VSI %d\n",
+@@ -1183,7 +1183,7 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
+ 		}
+ 
+ 		i40e_del_filter(vsi, ma, vlan, false, false);
+-		ret = i40e_sync_vsi_filters(vsi);
++		ret = i40e_sync_vsi_filters(vsi, true);
+ 		if (!ret)
+ 			dev_info(&pf->pdev->dev,
+ 				 "del macaddr: %pM vlan=%d removed from VSI %d\n",
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index 54eeabe60e3a..a3197815d41c 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@ -423,7 +423,7 @@ static int i40e_alloc_vsi_res(struct i40e_vf *vf, enum i40e_vsi_type type)
+ 	}
+ 
+ 	/* program mac filter */
+-	ret = i40e_sync_vsi_filters(vsi);
++	ret = i40e_sync_vsi_filters(vsi, false);
+ 	if (ret)
+ 		dev_err(&pf->pdev->dev, "Unable to program ucast filters\n");
+ 
+@@ -1461,7 +1461,7 @@ static int i40e_vc_add_mac_addr_msg(struct i40e_vf *vf, u8 *msg, u16 msglen)
+ 	}
+ 
+ 	/* program the updated filter list */
+-	if (i40e_sync_vsi_filters(vsi))
++	if (i40e_sync_vsi_filters(vsi, false))
+ 		dev_err(&pf->pdev->dev, "Unable to program VF MAC filters\n");
+ 
+ error_param:
+@@ -1512,7 +1512,7 @@ static int i40e_vc_del_mac_addr_msg(struct i40e_vf *vf, u8 *msg, u16 msglen)
+ 				I40E_VLAN_ANY, true, false);
+ 
+ 	/* program the updated filter list */
+-	if (i40e_sync_vsi_filters(vsi))
++	if (i40e_sync_vsi_filters(vsi, false))
+ 		dev_err(&pf->pdev->dev, "Unable to program VF MAC filters\n");
+ 
+ error_param:
+@@ -2029,7 +2029,7 @@ int i40e_ndo_set_vf_mac(struct net_device *netdev, int vf_id, u8 *mac)
+ 
+ 	dev_info(&pf->pdev->dev, "Setting MAC %pM on VF %d\n", mac, vf_id);
+ 	/* program mac filter */
+-	if (i40e_sync_vsi_filters(vsi)) {
++	if (i40e_sync_vsi_filters(vsi, false)) {
+ 		dev_err(&pf->pdev->dev, "Unable to program ucast filters\n");
+ 		ret = -EIO;
+ 		goto error_param;
