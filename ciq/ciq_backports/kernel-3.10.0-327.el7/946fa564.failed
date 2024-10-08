@@ -1,0 +1,203 @@
+virtio_net: pass vi around
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [virtio] virtio-net: pass vi around (Jason Wang) [1227339]
+Rebuild_FUZZ: 96.15%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 946fa5647b529402161814ca8ed1302254b6affb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/946fa564.failed
+
+Too many places poke at [rs]q->vq->vdev->priv just to get
+the vi structure.  Let's just pass the pointer around: seems
+cleaner, and might even be faster.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+
+
+
+
+(cherry picked from commit 946fa5647b529402161814ca8ed1302254b6affb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index 376e2c75ee06,1630c217d9f7..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -234,16 -241,17 +234,22 @@@ static void set_skb_frag(struct sk_buf
+  }
+  
+  /* Called from bottom half context */
+++<<<<<<< HEAD
+ +static struct sk_buff *page_to_skb(struct receive_queue *rq,
+ +				   struct page *page, unsigned int len)
+++=======
++ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
++ 				   struct receive_queue *rq,
++ 				   struct page *page, unsigned int offset,
++ 				   unsigned int len, unsigned int truesize)
+++>>>>>>> 946fa5647b52 (virtio_net: pass vi around)
+  {
+- 	struct virtnet_info *vi = rq->vq->vdev->priv;
+  	struct sk_buff *skb;
+  	struct skb_vnet_hdr *hdr;
+ -	unsigned int copy, hdr_len, hdr_padded_len;
+ +	unsigned int copy, hdr_len, offset;
+  	char *p;
+  
+ -	p = page_address(page) + offset;
+ +	p = page_address(page);
+  
+  	/* copy small packet so we can reuse these pages for small data */
+  	skb = netdev_alloc_skb_ip_align(vi->dev, GOOD_COPY_LEN);
+@@@ -308,11 -328,13 +314,16 @@@ static struct sk_buff *receive_small(vo
+  }
+  
+  static struct sk_buff *receive_big(struct net_device *dev,
++ 				   struct virtnet_info *vi,
+  				   struct receive_queue *rq,
+ -				   void *buf,
+ -				   unsigned int len)
+ +				   void *buf, unsigned int len)
+  {
+  	struct page *page = buf;
+++<<<<<<< HEAD
+ +	struct sk_buff *skb = page_to_skb(rq, page, len);
+++=======
++ 	struct sk_buff *skb = page_to_skb(vi, rq, page, 0, len, PAGE_SIZE);
+++>>>>>>> 946fa5647b52 (virtio_net: pass vi around)
+  
+  	if (unlikely(!skb))
+  		goto err;
+@@@ -326,30 -348,33 +337,38 @@@ err
+  }
+  
+  static struct sk_buff *receive_mergeable(struct net_device *dev,
+ -					 struct virtnet_info *vi,
+  					 struct receive_queue *rq,
+ -					 unsigned long ctx,
+ +					 void *buf,
+  					 unsigned int len)
+  {
+ -	void *buf = mergeable_ctx_to_buf_address(ctx);
+ -	struct skb_vnet_hdr *hdr = buf;
+ -	u16 num_buf = virtio16_to_cpu(rq->vq->vdev, hdr->mhdr.num_buffers);
+ -	struct page *page = virt_to_head_page(buf);
+ -	int offset = buf - page_address(page);
+ -	unsigned int truesize = max(len, mergeable_ctx_to_buf_truesize(ctx));
+ +	struct skb_vnet_hdr *hdr = page_address(buf);
+ +	int num_buf = hdr->mhdr.num_buffers;
+ +	struct page *page = buf;
+ +	struct sk_buff *skb = page_to_skb(rq, page, len);
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!skb))
+++=======
++ 	struct sk_buff *head_skb = page_to_skb(vi, rq, page, offset, len,
++ 					       truesize);
++ 	struct sk_buff *curr_skb = head_skb;
++ 
++ 	if (unlikely(!curr_skb))
+++>>>>>>> 946fa5647b52 (virtio_net: pass vi around)
+  		goto err_skb;
+ +
+  	while (--num_buf) {
+ -		int num_skb_frags;
+ -
+ -		ctx = (unsigned long)virtqueue_get_buf(rq->vq, &len);
+ -		if (unlikely(!ctx)) {
+ -			pr_debug("%s: rx error: %d buffers out of %d missing\n",
+ -				 dev->name, num_buf,
+ -				 virtio16_to_cpu(rq->vq->vdev,
+ -						 hdr->mhdr.num_buffers));
+ +		i = skb_shinfo(skb)->nr_frags;
+ +		if (i >= MAX_SKB_FRAGS) {
+ +			pr_debug("%s: packet too long\n", skb->dev->name);
+ +			skb->dev->stats.rx_length_errors++;
+ +			return NULL;
+ +		}
+ +		page = virtqueue_get_buf(rq->vq, &len);
+ +		if (!page) {
+ +			pr_debug("%s: rx error: %d buffers %d missing\n",
+ +				 dev->name, hdr->mhdr.num_buffers, num_buf);
+  			dev->stats.rx_length_errors++;
+  			goto err_buf;
+  		}
+@@@ -393,16 -446,22 +412,16 @@@ static void receive_buf(struct virtnet_
+  	if (unlikely(len < sizeof(struct virtio_net_hdr) + ETH_HLEN)) {
+  		pr_debug("%s: short packet %i\n", dev->name, len);
+  		dev->stats.rx_length_errors++;
+ -		if (vi->mergeable_rx_bufs) {
+ -			unsigned long ctx = (unsigned long)buf;
+ -			void *base = mergeable_ctx_to_buf_address(ctx);
+ -			put_page(virt_to_head_page(base));
+ -		} else if (vi->big_packets) {
+ +		if (vi->mergeable_rx_bufs || vi->big_packets)
+  			give_pages(rq, buf);
+ -		} else {
+ +		else
+  			dev_kfree_skb(buf);
+ -		}
+  		return;
+  	}
+ -
+  	if (vi->mergeable_rx_bufs)
+ -		skb = receive_mergeable(dev, vi, rq, (unsigned long)buf, len);
+ +		skb = receive_mergeable(dev, rq, buf, len);
+  	else if (vi->big_packets)
+- 		skb = receive_big(dev, rq, buf, len);
++ 		skb = receive_big(dev, vi, rq, buf, len);
+  	else
+  		skb = receive_small(buf, len);
+  
+@@@ -643,6 -739,26 +662,29 @@@ static void refill_work(struct work_str
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int virtnet_receive(struct receive_queue *rq, int budget)
++ {
++ 	struct virtnet_info *vi = rq->vq->vdev->priv;
++ 	unsigned int len, received = 0;
++ 	void *buf;
++ 
++ 	while (received < budget &&
++ 	       (buf = virtqueue_get_buf(rq->vq, &len)) != NULL) {
++ 		receive_buf(vi, rq, buf, len);
++ 		received++;
++ 	}
++ 
++ 	if (rq->vq->num_free > virtqueue_get_vring_size(rq->vq) / 2) {
++ 		if (!try_fill_recv(vi, rq, GFP_ATOMIC))
++ 			schedule_delayed_work(&vi->refill, 0);
++ 	}
++ 
++ 	return received;
++ }
++ 
+++>>>>>>> 946fa5647b52 (virtio_net: pass vi around)
+  static int virtnet_poll(struct napi_struct *napi, int budget)
+  {
+  	struct receive_queue *rq =
+@@@ -1663,10 -1853,11 +1705,10 @@@ static int virtnet_probe(struct virtio_
+  
+  	/* Last of all, set up some receive buffers. */
+  	for (i = 0; i < vi->curr_queue_pairs; i++) {
+- 		try_fill_recv(&vi->rq[i], GFP_KERNEL);
++ 		try_fill_recv(vi, &vi->rq[i], GFP_KERNEL);
+  
+  		/* If we didn't even get one input buffer, we're useless. */
+ -		if (vi->rq[i].vq->num_free ==
+ -		    virtqueue_get_vring_size(vi->rq[i].vq)) {
+ +		if (vi->rq[i].num == 0) {
+  			free_unused_bufs(vi);
+  			err = -ENOMEM;
+  			goto free_recv_bufs;
+* Unmerged path drivers/net/virtio_net.c
