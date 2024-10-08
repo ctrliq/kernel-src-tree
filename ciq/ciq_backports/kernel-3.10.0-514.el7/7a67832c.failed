@@ -1,0 +1,156 @@
+libnvdimm, e820: make CONFIG_X86_PMEM_LEGACY a tristate option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 7a67832c7e44c20935c5d6f2264035a0f7bf0d8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7a67832c.failed
+
+We currently register a platform device for e820 type-12 memory and
+register a nvdimm bus beneath it.  Registering the platform device
+triggers the device-core machinery to probe for a driver, but that
+search currently comes up empty.  Building the nvdimm-bus registration
+into the e820_pmem platform device registration in this way forces
+libnvdimm to be built-in.  Instead, convert the built-in portion of
+CONFIG_X86_PMEM_LEGACY to simply register a platform device and move the
+rest of the logic to the driver for e820_pmem, for the following
+reasons:
+
+1/ Letting e820_pmem support be a module allows building and testing
+   libnvdimm.ko changes without rebooting
+
+2/ All the normal policy around modules can be applied to e820_pmem
+   (unbind to disable and/or blacklisting the module from loading by
+   default)
+
+3/ Moving the driver to a generic location and converting it to scan
+   "iomem_resource" rather than "e820.map" means any other architecture can
+   take advantage of this simple nvdimm resource discovery mechanism by
+   registering a resource named "Persistent Memory (legacy)"
+
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 7a67832c7e44c20935c5d6f2264035a0f7bf0d8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/pmem.c
+#	drivers/block/e820.c
+#	drivers/nvdimm/Makefile
+#	tools/testing/nvdimm/Kbuild
+diff --cc arch/x86/kernel/pmem.c
+index 0f4ef472ab9e,4f00b63d7ff3..000000000000
+--- a/arch/x86/kernel/pmem.c
++++ b/arch/x86/kernel/pmem.c
+@@@ -8,74 -7,13 +7,52 @@@
+  
+  static __init int register_e820_pmem(void)
+  {
+- 	static struct nvdimm_bus_descriptor nd_desc;
+- 	struct device *dev = &e820_pmem.dev;
+- 	struct nvdimm_bus *nvdimm_bus;
+- 	int rc, i;
++ 	struct platform_device *pdev;
+  
+++<<<<<<< HEAD
+ +	rc = platform_device_register(&e820_pmem);
+ +	if (rc)
+ +		return rc;
+ +
+ +	nd_desc.attr_groups = e820_pmem_attribute_groups;
+ +	nd_desc.provider_name = "e820";
+ +	nvdimm_bus = nvdimm_bus_register(dev, &nd_desc);
+ +	if (!nvdimm_bus)
+ +		goto err;
+ +	dev->platform_data = nvdimm_bus;
+ +
+ +	for (i = 0; i < e820.nr_map; i++) {
+ +		struct e820entry *ei = &e820.map[i];
+ +		struct resource res = {
+ +			.flags	= IORESOURCE_MEM,
+ +			.start	= ei->addr,
+ +			.end	= ei->addr + ei->size - 1,
+ +		};
+ +		struct nd_region_desc ndr_desc;
+ +
+ +		if (ei->type != E820_PRAM)
+ +			continue;
+ +
+ +		memset(&ndr_desc, 0, sizeof(ndr_desc));
+ +		ndr_desc.res = &res;
+ +		ndr_desc.attr_groups = e820_pmem_region_attribute_groups;
+ +		if (!nvdimm_pmem_region_create(nvdimm_bus, &ndr_desc))
+ +			goto err;
+ +	}
+ +
+ +	return 0;
+ +
+ + err:
+ +	dev_err(dev, "failed to register legacy persistent memory ranges\n");
+ +	platform_device_unregister(&e820_pmem);
+ +	return -ENXIO;
+++=======
++ 	/*
++ 	 * See drivers/nvdimm/e820.c for the implementation, this is
++ 	 * simply here to trigger the module to load on demand.
++ 	 */
++ 	pdev = platform_device_alloc("e820_pmem", -1);
++ 	return platform_device_add(pdev);
+++>>>>>>> 7a67832c7e44 (libnvdimm, e820: make CONFIG_X86_PMEM_LEGACY a tristate option)
+  }
+  device_initcall(register_e820_pmem);
+* Unmerged path drivers/block/e820.c
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path tools/testing/nvdimm/Kbuild
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index eca69935277c..ea12169e3fa6 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1359,10 +1359,14 @@ config ILLEGAL_POINTER_VALUE
+ 
+ source "mm/Kconfig"
+ 
++config X86_PMEM_LEGACY_DEVICE
++	bool
++
+ config X86_PMEM_LEGACY
+-	bool "Support non-standard NVDIMMs and ADR protected memory"
++	tristate "Support non-standard NVDIMMs and ADR protected memory"
+ 	depends on PHYS_ADDR_T_64BIT
+ 	depends on BLK_DEV
++	select X86_PMEM_LEGACY_DEVICE
+ 	select LIBNVDIMM
+ 	help
+ 	  Treat memory marked using the non-standard e820 type of 12 as used
+diff --git a/arch/x86/include/uapi/asm/e820.h b/arch/x86/include/uapi/asm/e820.h
+index 8f7a661d8380..a8ae07d9343d 100644
+--- a/arch/x86/include/uapi/asm/e820.h
++++ b/arch/x86/include/uapi/asm/e820.h
+@@ -41,7 +41,7 @@
+ /*
+  * This is a non-standardized way to represent ADR or NVDIMM regions that
+  * persist over a reboot.  The kernel will ignore their special capabilities
+- * unless the CONFIG_X86_PMEM_LEGACY=y option is set.
++ * unless the CONFIG_X86_PMEM_LEGACY option is set.
+  *
+  * ( Note that older platforms also used 6 for the same type of memory,
+  *   but newer versions switched to 12 as 6 was assigned differently.  Some
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 4b39aa99fe27..7ae38607bcbe 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -89,7 +89,7 @@ obj-$(CONFIG_KVM_GUEST)		+= kvm.o kvmclock.o
+ obj-$(CONFIG_PARAVIRT)		+= paravirt.o paravirt_patch_$(BITS).o
+ obj-$(CONFIG_PARAVIRT_SPINLOCKS)+= paravirt-spinlocks.o
+ obj-$(CONFIG_PARAVIRT_CLOCK)	+= pvclock.o
+-obj-$(CONFIG_X86_PMEM_LEGACY)	+= pmem.o
++obj-$(CONFIG_X86_PMEM_LEGACY_DEVICE) += pmem.o
+ 
+ obj-$(CONFIG_PCSPKR_PLATFORM)	+= pcspeaker.o
+ 
+* Unmerged path arch/x86/kernel/pmem.c
+* Unmerged path drivers/block/e820.c
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path tools/testing/nvdimm/Kbuild
