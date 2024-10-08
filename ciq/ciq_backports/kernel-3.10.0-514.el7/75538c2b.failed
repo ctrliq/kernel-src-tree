@@ -1,0 +1,320 @@
+net: always pass struct netdev_notifier_info to netdevice notifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] always pass struct netdev_notifier_info to netdevice notifiers (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 96.12%
+commit-author Cong Wang <amwang@redhat.com>
+commit 75538c2b85cf22eb9af6adfaf26ed7219025adeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/75538c2b.failed
+
+commit 351638e7deeed2ec8ce451b53d3 (net: pass info struct via netdevice notifier)
+breaks booting of my KVM guest, this is due to we still forget to pass
+struct netdev_notifier_info in several places. This patch completes it.
+
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Cc: David S. Miller <davem@davemloft.net>
+	Signed-off-by: Cong Wang <amwang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 75538c2b85cf22eb9af6adfaf26ed7219025adeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/ipv4/netfilter/ipt_MASQUERADE.c
+#	net/ipv6/netfilter/ip6t_MASQUERADE.c
+diff --cc include/linux/netdevice.h
+index eb7e9fa3e472,8f967e34142b..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1936,12 -1595,35 +1936,42 @@@ struct pcpu_sw_netstats 
+  #define NETDEV_RELEASE		0x0012
+  #define NETDEV_NOTIFY_PEERS	0x0013
+  #define NETDEV_JOIN		0x0014
+ -#define NETDEV_CHANGEUPPER	0x0015
+ -
+ +#define NETDEV_RESEND_IGMP	0x0016
+ +#define NETDEV_CHANGEINFODATA	0x0018
+ +
+++<<<<<<< HEAD
+ +int register_netdevice_notifier(struct notifier_block *nb);
+ +int unregister_netdevice_notifier(struct notifier_block *nb);
+ +int call_netdevice_notifiers(unsigned long val, struct net_device *dev);
+++=======
++ extern int register_netdevice_notifier(struct notifier_block *nb);
++ extern int unregister_netdevice_notifier(struct notifier_block *nb);
++ 
++ struct netdev_notifier_info {
++ 	struct net_device *dev;
++ };
++ 
++ struct netdev_notifier_change_info {
++ 	struct netdev_notifier_info info; /* must be first */
++ 	unsigned int flags_changed;
++ };
++ 
++ static inline void netdev_notifier_info_init(struct netdev_notifier_info *info,
++ 					     struct net_device *dev)
++ {
++ 	info->dev = dev;
++ }
++ 
++ static inline struct net_device *
++ netdev_notifier_info_to_dev(const struct netdev_notifier_info *info)
++ {
++ 	return info->dev;
++ }
++ 
++ extern int call_netdevice_notifiers_info(unsigned long val, struct net_device *dev,
++ 					 struct netdev_notifier_info *info);
++ extern int call_netdevice_notifiers(unsigned long val, struct net_device *dev);
+++>>>>>>> 75538c2b85cf (net: always pass struct netdev_notifier_info to netdevice notifiers)
+  
+  
+  extern rwlock_t				dev_base_lock;		/* Device list lock */
+diff --cc net/core/dev.c
+index ce5758e98847,b2e9057be3bf..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -1464,6 -1391,14 +1464,17 @@@ void dev_disable_lro(struct net_device 
+  }
+  EXPORT_SYMBOL(dev_disable_lro);
+  
+++<<<<<<< HEAD
+++=======
++ static int call_netdevice_notifier(struct notifier_block *nb, unsigned long val,
++ 				   struct net_device *dev)
++ {
++ 	struct netdev_notifier_info info;
++ 
++ 	netdev_notifier_info_init(&info, dev);
++ 	return nb->notifier_call(nb, val, &info);
++ }
+++>>>>>>> 75538c2b85cf (net: always pass struct netdev_notifier_info to netdevice notifiers)
+  
+  static int dev_boot_phase = 1;
+  
+diff --cc net/ipv4/netfilter/ipt_MASQUERADE.c
+index da7f02a0b868,30e4de940567..000000000000
+--- a/net/ipv4/netfilter/ipt_MASQUERADE.c
++++ b/net/ipv4/netfilter/ipt_MASQUERADE.c
+@@@ -47,17 -46,103 +47,71 @@@ static int masquerade_tg_check(const st
+  static unsigned int
+  masquerade_tg(struct sk_buff *skb, const struct xt_action_param *par)
+  {
+ -	struct nf_conn *ct;
+ -	struct nf_conn_nat *nat;
+ -	enum ip_conntrack_info ctinfo;
+ -	struct nf_nat_range newrange;
+ +	struct nf_nat_range range;
+  	const struct nf_nat_ipv4_multi_range_compat *mr;
+ -	const struct rtable *rt;
+ -	__be32 newsrc, nh;
+ -
+ -	NF_CT_ASSERT(par->hooknum == NF_INET_POST_ROUTING);
+ -
+ -	ct = nf_ct_get(skb, &ctinfo);
+ -	nat = nfct_nat(ct);
+ -
+ -	NF_CT_ASSERT(ct && (ctinfo == IP_CT_NEW || ctinfo == IP_CT_RELATED ||
+ -			    ctinfo == IP_CT_RELATED_REPLY));
+ -
+ -	/* Source address is 0.0.0.0 - locally generated packet that is
+ -	 * probably not supposed to be masqueraded.
+ -	 */
+ -	if (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip == 0)
+ -		return NF_ACCEPT;
+  
+  	mr = par->targinfo;
+ -	rt = skb_rtable(skb);
+ -	nh = rt_nexthop(rt, ip_hdr(skb)->daddr);
+ -	newsrc = inet_select_addr(par->out, nh, RT_SCOPE_UNIVERSE);
+ -	if (!newsrc) {
+ -		pr_info("%s ate my IP address\n", par->out->name);
+ -		return NF_DROP;
+ -	}
+ -
+ -	nat->masq_index = par->out->ifindex;
+ +	range.flags = mr->range[0].flags;
+ +	range.min_proto = mr->range[0].min;
+ +	range.max_proto = mr->range[0].max;
+  
+ -	/* Transfer from original range. */
+ -	memset(&newrange.min_addr, 0, sizeof(newrange.min_addr));
+ -	memset(&newrange.max_addr, 0, sizeof(newrange.max_addr));
+ -	newrange.flags       = mr->range[0].flags | NF_NAT_RANGE_MAP_IPS;
+ -	newrange.min_addr.ip = newsrc;
+ -	newrange.max_addr.ip = newsrc;
+ -	newrange.min_proto   = mr->range[0].min;
+ -	newrange.max_proto   = mr->range[0].max;
+ -
+ -	/* Hand modified range to generic setup. */
+ -	return nf_nat_setup_info(ct, &newrange, NF_NAT_MANIP_SRC);
+ +	return nf_nat_masquerade_ipv4(skb, par->hooknum, &range, par->out);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ device_cmp(struct nf_conn *i, void *ifindex)
++ {
++ 	const struct nf_conn_nat *nat = nfct_nat(i);
++ 
++ 	if (!nat)
++ 		return 0;
++ 	if (nf_ct_l3num(i) != NFPROTO_IPV4)
++ 		return 0;
++ 	return nat->masq_index == (int)(long)ifindex;
++ }
++ 
++ static int masq_device_event(struct notifier_block *this,
++ 			     unsigned long event,
++ 			     void *ptr)
++ {
++ 	const struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++ 	struct net *net = dev_net(dev);
++ 
++ 	if (event == NETDEV_DOWN) {
++ 		/* Device was downed.  Search entire table for
++ 		   conntracks which were associated with that device,
++ 		   and forget them. */
++ 		NF_CT_ASSERT(dev->ifindex != 0);
++ 
++ 		nf_ct_iterate_cleanup(net, device_cmp,
++ 				      (void *)(long)dev->ifindex);
++ 	}
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static int masq_inet_event(struct notifier_block *this,
++ 			   unsigned long event,
++ 			   void *ptr)
++ {
++ 	struct net_device *dev = ((struct in_ifaddr *)ptr)->ifa_dev->dev;
++ 	struct netdev_notifier_info info;
++ 
++ 	netdev_notifier_info_init(&info, dev);
++ 	return masq_device_event(this, event, &info);
++ }
++ 
++ static struct notifier_block masq_dev_notifier = {
++ 	.notifier_call	= masq_device_event,
++ };
++ 
++ static struct notifier_block masq_inet_notifier = {
++ 	.notifier_call	= masq_inet_event,
++ };
++ 
+++>>>>>>> 75538c2b85cf (net: always pass struct netdev_notifier_info to netdevice notifiers)
+  static struct xt_target masquerade_tg_reg __read_mostly = {
+  	.name		= "MASQUERADE",
+  	.family		= NFPROTO_IPV4,
+diff --cc net/ipv6/netfilter/ip6t_MASQUERADE.c
+index 7f9f45d829d2,47bff6107519..000000000000
+--- a/net/ipv6/netfilter/ip6t_MASQUERADE.c
++++ b/net/ipv6/netfilter/ip6t_MASQUERADE.c
+@@@ -36,6 -57,48 +36,51 @@@ static int masquerade_tg6_checkentry(co
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int device_cmp(struct nf_conn *ct, void *ifindex)
++ {
++ 	const struct nf_conn_nat *nat = nfct_nat(ct);
++ 
++ 	if (!nat)
++ 		return 0;
++ 	if (nf_ct_l3num(ct) != NFPROTO_IPV6)
++ 		return 0;
++ 	return nat->masq_index == (int)(long)ifindex;
++ }
++ 
++ static int masq_device_event(struct notifier_block *this,
++ 			     unsigned long event, void *ptr)
++ {
++ 	const struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++ 	struct net *net = dev_net(dev);
++ 
++ 	if (event == NETDEV_DOWN)
++ 		nf_ct_iterate_cleanup(net, device_cmp,
++ 				      (void *)(long)dev->ifindex);
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static struct notifier_block masq_dev_notifier = {
++ 	.notifier_call	= masq_device_event,
++ };
++ 
++ static int masq_inet_event(struct notifier_block *this,
++ 			   unsigned long event, void *ptr)
++ {
++ 	struct inet6_ifaddr *ifa = ptr;
++ 	struct netdev_notifier_info info;
++ 
++ 	netdev_notifier_info_init(&info, ifa->idev->dev);
++ 	return masq_device_event(this, event, &info);
++ }
++ 
++ static struct notifier_block masq_inet_notifier = {
++ 	.notifier_call	= masq_inet_event,
++ };
++ 
+++>>>>>>> 75538c2b85cf (net: always pass struct netdev_notifier_info to netdevice notifiers)
+  static struct xt_target masquerade_tg6_reg __read_mostly = {
+  	.name		= "MASQUERADE",
+  	.family		= NFPROTO_IPV6,
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/atm/clip.c b/net/atm/clip.c
+index d1d8f524179f..13c2c7f0b041 100644
+--- a/net/atm/clip.c
++++ b/net/atm/clip.c
+@@ -575,6 +575,7 @@ static int clip_inet_event(struct notifier_block *this, unsigned long event,
+ 			   void *ifa)
+ {
+ 	struct in_device *in_dev;
++	struct netdev_notifier_info info;
+ 
+ 	in_dev = ((struct in_ifaddr *)ifa)->ifa_dev;
+ 	/*
+@@ -583,7 +584,8 @@ static int clip_inet_event(struct notifier_block *this, unsigned long event,
+ 	 */
+ 	if (event != NETDEV_UP)
+ 		return NOTIFY_DONE;
+-	return clip_device_event(this, NETDEV_CHANGE, in_dev->dev);
++	netdev_notifier_info_init(&info, in_dev->dev);
++	return clip_device_event(this, NETDEV_CHANGE, &info);
+ }
+ 
+ static struct notifier_block clip_dev_notifier = {
+* Unmerged path net/core/dev.c
+* Unmerged path net/ipv4/netfilter/ipt_MASQUERADE.c
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index 1fa5aee38495..a724fec7661a 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -4863,13 +4863,16 @@ int addrconf_sysctl_mtu(struct ctl_table *ctl, int write,
+ 
+ static void dev_disable_change(struct inet6_dev *idev)
+ {
++	struct netdev_notifier_info info;
++
+ 	if (!idev || !idev->dev)
+ 		return;
+ 
++	netdev_notifier_info_init(&info, idev->dev);
+ 	if (idev->cnf.disable_ipv6)
+-		addrconf_notify(NULL, NETDEV_DOWN, idev->dev);
++		addrconf_notify(NULL, NETDEV_DOWN, &info);
+ 	else
+-		addrconf_notify(NULL, NETDEV_UP, idev->dev);
++		addrconf_notify(NULL, NETDEV_UP, &info);
+ }
+ 
+ static void addrconf_disable_change(struct net *net, __s32 newf)
+* Unmerged path net/ipv6/netfilter/ip6t_MASQUERADE.c
