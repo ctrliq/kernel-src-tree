@@ -1343,6 +1343,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
 	beq	machine_check_realmode
 mc_cont:
 
+	mr 	r3, r12
 	/* Increment exit count, poke other threads to exit */
 	bl	kvmhv_commence_exit
 	nop
