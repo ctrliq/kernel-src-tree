@@ -1,0 +1,209 @@
+mmc: sdhci-pci: Add support for drive strength selection for SPT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit e1bfad6d936d7149a83423e2a7244dd5771f27e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e1bfad6d.failed
+
+Implement the select_drive_strength callback to provide
+drive strength selection for Intel SPT.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit e1bfad6d936d7149a83423e2a7244dd5771f27e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/sdhci-pci.c
+diff --cc drivers/mmc/host/sdhci-pci.c
+index a627aad5414a,6ecd158d8084..000000000000
+--- a/drivers/mmc/host/sdhci-pci.c
++++ b/drivers/mmc/host/sdhci-pci.c
+@@@ -247,10 -252,98 +248,101 @@@ static const struct sdhci_pci_fixes sdh
+  	.probe_slot	= pch_hc_probe_slot,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void sdhci_pci_int_hw_reset(struct sdhci_host *host)
++ {
++ 	u8 reg;
++ 
++ 	reg = sdhci_readb(host, SDHCI_POWER_CONTROL);
++ 	reg |= 0x10;
++ 	sdhci_writeb(host, reg, SDHCI_POWER_CONTROL);
++ 	/* For eMMC, minimum is 1us but give it 9us for good measure */
++ 	udelay(9);
++ 	reg &= ~0x10;
++ 	sdhci_writeb(host, reg, SDHCI_POWER_CONTROL);
++ 	/* For eMMC, minimum is 200us but give it 300us for good measure */
++ 	usleep_range(300, 1000);
++ }
++ 
++ static int spt_select_drive_strength(struct sdhci_host *host,
++ 				     struct mmc_card *card,
++ 				     unsigned int max_dtr,
++ 				     int host_drv, int card_drv, int *drv_type)
++ {
++ 	int drive_strength;
++ 
++ 	if (sdhci_pci_spt_drive_strength > 0)
++ 		drive_strength = sdhci_pci_spt_drive_strength & 0xf;
++ 	else
++ 		drive_strength = 1; /* 33-ohm */
++ 
++ 	if ((mmc_driver_type_mask(drive_strength) & card_drv) == 0)
++ 		drive_strength = 0; /* Default 50-ohm */
++ 
++ 	return drive_strength;
++ }
++ 
++ /* Try to read the drive strength from the card */
++ static void spt_read_drive_strength(struct sdhci_host *host)
++ {
++ 	u32 val, i, t;
++ 	u16 m;
++ 
++ 	if (sdhci_pci_spt_drive_strength)
++ 		return;
++ 
++ 	sdhci_pci_spt_drive_strength = -1;
++ 
++ 	m = sdhci_readw(host, SDHCI_HOST_CONTROL2) & 0x7;
++ 	if (m != 3 && m != 5)
++ 		return;
++ 	val = sdhci_readl(host, SDHCI_PRESENT_STATE);
++ 	if (val & 0x3)
++ 		return;
++ 	sdhci_writel(host, 0x007f0023, SDHCI_INT_ENABLE);
++ 	sdhci_writel(host, 0, SDHCI_SIGNAL_ENABLE);
++ 	sdhci_writew(host, 0x10, SDHCI_TRANSFER_MODE);
++ 	sdhci_writeb(host, 0xe, SDHCI_TIMEOUT_CONTROL);
++ 	sdhci_writew(host, 512, SDHCI_BLOCK_SIZE);
++ 	sdhci_writew(host, 1, SDHCI_BLOCK_COUNT);
++ 	sdhci_writel(host, 0, SDHCI_ARGUMENT);
++ 	sdhci_writew(host, 0x83b, SDHCI_COMMAND);
++ 	for (i = 0; i < 1000; i++) {
++ 		val = sdhci_readl(host, SDHCI_INT_STATUS);
++ 		if (val & 0xffff8000)
++ 			return;
++ 		if (val & 0x20)
++ 			break;
++ 		udelay(1);
++ 	}
++ 	val = sdhci_readl(host, SDHCI_PRESENT_STATE);
++ 	if (!(val & 0x800))
++ 		return;
++ 	for (i = 0; i < 47; i++)
++ 		val = sdhci_readl(host, SDHCI_BUFFER);
++ 	t = val & 0xf00;
++ 	if (t != 0x200 && t != 0x300)
++ 		return;
++ 
++ 	sdhci_pci_spt_drive_strength = 0x10 | ((val >> 12) & 0xf);
++ }
++ 
+++>>>>>>> e1bfad6d936d (mmc: sdhci-pci: Add support for drive strength selection for SPT)
+  static int byt_emmc_probe_slot(struct sdhci_pci_slot *slot)
+  {
+ -	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
+ -				 MMC_CAP_HW_RESET | MMC_CAP_1_8V_DDR |
+ -				 MMC_CAP_BUS_WIDTH_TEST |
+ -				 MMC_CAP_WAIT_WHILE_BUSY;
+ +	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE;
+  	slot->host->mmc->caps2 |= MMC_CAP2_HC_ERASE_SZ;
+++<<<<<<< HEAD
+++=======
++ 	slot->hw_reset = sdhci_pci_int_hw_reset;
++ 	if (slot->chip->pdev->device == PCI_DEVICE_ID_INTEL_BSW_EMMC)
++ 		slot->host->timeout_clk = 1000; /* 1000 kHz i.e. 1 MHz */
++ 	if (slot->chip->pdev->device == PCI_DEVICE_ID_INTEL_SPT_EMMC) {
++ 		spt_read_drive_strength(slot->host);
++ 		slot->select_drive_strength = spt_select_drive_strength;
++ 	}
+++>>>>>>> e1bfad6d936d (mmc: sdhci-pci: Add support for drive strength selection for SPT)
+  	return 0;
+  }
+  
+@@@ -976,10 -1263,36 +1068,36 @@@ static void sdhci_pci_hw_reset(struct s
+  	usleep_range(300, 1000);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void sdhci_pci_hw_reset(struct sdhci_host *host)
++ {
++ 	struct sdhci_pci_slot *slot = sdhci_priv(host);
++ 
++ 	if (slot->hw_reset)
++ 		slot->hw_reset(host);
++ }
++ 
++ static int sdhci_pci_select_drive_strength(struct sdhci_host *host,
++ 					   struct mmc_card *card,
++ 					   unsigned int max_dtr, int host_drv,
++ 					   int card_drv, int *drv_type)
++ {
++ 	struct sdhci_pci_slot *slot = sdhci_priv(host);
++ 
++ 	if (!slot->select_drive_strength)
++ 		return 0;
++ 
++ 	return slot->select_drive_strength(host, card, max_dtr, host_drv,
++ 					   card_drv, drv_type);
++ }
++ 
+++>>>>>>> e1bfad6d936d (mmc: sdhci-pci: Add support for drive strength selection for SPT)
+  static const struct sdhci_ops sdhci_pci_ops = {
+ -	.set_clock	= sdhci_set_clock,
+  	.enable_dma	= sdhci_pci_enable_dma,
+ -	.set_bus_width	= sdhci_pci_set_bus_width,
+ -	.reset		= sdhci_reset,
+ -	.set_uhs_signaling = sdhci_set_uhs_signaling,
+ +	.platform_bus_width	= sdhci_pci_bus_width,
+  	.hw_reset		= sdhci_pci_hw_reset,
++ 	.select_drive_strength	= sdhci_pci_select_drive_strength,
+  };
+  
+  /*****************************************************************************\
+diff --git a/drivers/mmc/host/sdhci-pci-data.c b/drivers/mmc/host/sdhci-pci-data.c
+index a611217769f5..56fddc622a54 100644
+--- a/drivers/mmc/host/sdhci-pci-data.c
++++ b/drivers/mmc/host/sdhci-pci-data.c
+@@ -3,3 +3,6 @@
+ 
+ struct sdhci_pci_data *(*sdhci_pci_get_data)(struct pci_dev *pdev, int slotno);
+ EXPORT_SYMBOL_GPL(sdhci_pci_get_data);
++
++int sdhci_pci_spt_drive_strength;
++EXPORT_SYMBOL_GPL(sdhci_pci_spt_drive_strength);
+* Unmerged path drivers/mmc/host/sdhci-pci.c
+diff --git a/drivers/mmc/host/sdhci-pci.h b/drivers/mmc/host/sdhci-pci.h
+index 21fe09d67659..5f100b932d84 100644
+--- a/drivers/mmc/host/sdhci-pci.h
++++ b/drivers/mmc/host/sdhci-pci.h
+@@ -58,6 +58,10 @@ struct sdhci_pci_slot {
+ 	bool			cd_override_level;
+ 
+ 	void (*hw_reset)(struct sdhci_host *host);
++	int (*select_drive_strength)(struct sdhci_host *host,
++				     struct mmc_card *card,
++				     unsigned int max_dtr, int host_drv,
++				     int card_drv, int *drv_type);
+ };
+ 
+ struct sdhci_pci_chip {
+diff --git a/include/linux/mmc/sdhci-pci-data.h b/include/linux/mmc/sdhci-pci-data.h
+index 8959604a13d3..fda15b6d4135 100644
+--- a/include/linux/mmc/sdhci-pci-data.h
++++ b/include/linux/mmc/sdhci-pci-data.h
+@@ -15,4 +15,6 @@ struct sdhci_pci_data {
+ extern struct sdhci_pci_data *(*sdhci_pci_get_data)(struct pci_dev *pdev,
+ 				int slotno);
+ 
++extern int sdhci_pci_spt_drive_strength;
++
+ #endif
