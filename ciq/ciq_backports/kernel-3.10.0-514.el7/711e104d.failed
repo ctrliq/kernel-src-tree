@@ -1,0 +1,628 @@
+staging/rdma/hfi1: fix panic in send engine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: fix panic in send engine (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 89.74%
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 711e104ddca7b609889e1edf0a8482673ea4a7cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/711e104d.failed
+
+The send engine wasn't correctly handling
+pre-built packets, and worse, the pointer to
+a packet state's txreq wasn't initialized correctly.
+
+To fix:
+- all waiters need to save any prebuilt packets
+  (smda waits already did)
+- the progress routine needs to handle a QPs prebuilt packet
+  and initialize the txreq pointer properly
+
+To keep SDMA working, the dma send code needs to see if
+a packet has been built already. If not the code will build
+it.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 711e104ddca7b609889e1edf0a8482673ea4a7cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/ruc.c
+#	drivers/staging/hfi1/ud.c
+#	drivers/staging/hfi1/user_pages.c
+#	drivers/staging/hfi1/user_sdma.h
+#	drivers/staging/hfi1/verbs.c
+diff --cc drivers/staging/hfi1/ruc.c
+index c4280b6f47d4,70f42c93210c..000000000000
+--- a/drivers/staging/hfi1/ruc.c
++++ b/drivers/staging/hfi1/ruc.c
+@@@ -846,11 -874,13 +846,19 @@@ void hfi1_do_send(struct work_struct *w
+  		return;
+  	}
+  
+ -	qp->s_flags |= RVT_S_BUSY;
+ +	qp->s_flags |= HFI1_S_BUSY;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/ruc.c
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+ +
+ +	timeout = jiffies + SEND_RESCHED_TIMEOUT;
+++=======
++ 	timeout = jiffies + (timeout_int) / 8;
++ 	cpu = priv->s_sde ? priv->s_sde->cpu :
++ 			cpumask_first(cpumask_of_node(ps.ppd->dd->node));
++ 	/* insure a pre-built packet is handled  */
++ 	ps.s_txreq = get_waiting_verbs_txreq(qp);
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/ruc.c
+  	do {
+  		/* Check for a constructed packet to be sent. */
+  		if (qp->s_hdrwords != 0) {
+diff --cc drivers/staging/hfi1/ud.c
+index a7f67b0111da,bae5ccdfa7f4..000000000000
+--- a/drivers/staging/hfi1/ud.c
++++ b/drivers/staging/hfi1/ud.c
+@@@ -53,6 -53,7 +53,10 @@@
+  
+  #include "hfi.h"
+  #include "mad.h"
+++<<<<<<< HEAD:drivers/staging/hfi1/ud.c
+++=======
++ #include "verbs_txreq.h"
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/ud.c
+  #include "qp.h"
+  
+  /**
+@@@ -384,13 -394,16 +388,22 @@@ int hfi1_make_ud_req(struct hfi1_qp *qp
+  		priv->s_sc = sc5;
+  	}
+  	priv->s_sde = qp_to_sdma_engine(qp, priv->s_sc);
+++<<<<<<< HEAD:drivers/staging/hfi1/ud.c
+ +	priv->s_hdr->ibh.lrh[0] = cpu_to_be16(lrh0);
+ +	priv->s_hdr->ibh.lrh[1] = cpu_to_be16(ah_attr->dlid);  /* DEST LID */
+ +	priv->s_hdr->ibh.lrh[2] =
+++=======
++ 	ps->s_txreq->sde = priv->s_sde;
++ 	priv->s_sendcontext = qp_to_send_context(qp, priv->s_sc);
++ 	ps->s_txreq->psc = priv->s_sendcontext;
++ 	ps->s_txreq->phdr.hdr.lrh[0] = cpu_to_be16(lrh0);
++ 	ps->s_txreq->phdr.hdr.lrh[1] = cpu_to_be16(ah_attr->dlid);
++ 	ps->s_txreq->phdr.hdr.lrh[2] =
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/ud.c
+  		cpu_to_be16(qp->s_hdrwords + nwords + SIZE_OF_CRC);
+ -	if (ah_attr->dlid == be16_to_cpu(IB_LID_PERMISSIVE)) {
+ -		ps->s_txreq->phdr.hdr.lrh[3] = IB_LID_PERMISSIVE;
+ -	} else {
+ +	if (ah_attr->dlid == be16_to_cpu(IB_LID_PERMISSIVE))
+ +		priv->s_hdr->ibh.lrh[3] = IB_LID_PERMISSIVE;
+ +	else {
+  		lid = ppd->lid;
+  		if (lid) {
+  			lid |= ah_attr->src_path_bits & ((1 << ppd->lmc) - 1);
+@@@ -420,16 -434,24 +433,18 @@@
+  	priv->s_hdr->ahgidx = 0;
+  	priv->s_hdr->tx_flags = 0;
+  	priv->s_hdr->sde = NULL;
++ 	/* pbc */
++ 	ps->s_txreq->hdr_dwords = qp->s_hdrwords + 2;
+  
+ -	return 1;
+ -
+ -done_free_tx:
+ -	hfi1_put_txreq(ps->s_txreq);
+ -	ps->s_txreq = NULL;
+ -	return 1;
+ +done:
+ +	ret = 1;
+ +	goto unlock;
+  
+  bail:
+ -	hfi1_put_txreq(ps->s_txreq);
+ -
+ -bail_no_tx:
+ -	ps->s_txreq = NULL;
+ -	qp->s_flags &= ~RVT_S_BUSY;
+ -	qp->s_hdrwords = 0;
+ -	return 0;
+ +	qp->s_flags &= ~HFI1_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+ +	return ret;
+  }
+  
+  /*
+diff --cc drivers/staging/hfi1/user_pages.c
+index 692de658f0dc,2effb35b9b91..000000000000
+--- a/drivers/staging/hfi1/user_pages.c
++++ b/drivers/staging/hfi1/user_pages.c
+@@@ -48,64 -45,91 +48,73 @@@
+   *
+   */
+  
+ -#ifndef HFI1_SDMA_TXREQ_H
+ -#define HFI1_SDMA_TXREQ_H
+ -
+ -/* increased for AHG */
+ -#define NUM_DESC 6
+ +#include <linux/mm.h>
+ +#include <linux/sched.h>
+ +#include <linux/device.h>
+  
+ -/*
+ - * struct sdma_desc - canonical fragment descriptor
+ - *
+ - * This is the descriptor carried in the tx request
+ - * corresponding to each fragment.
+ - *
+ - */
+ -struct sdma_desc {
+ -	/* private:  don't use directly */
+ -	u64 qw[2];
+ -};
+ +#include "hfi.h"
+  
+  /**
+ - * struct sdma_txreq - the sdma_txreq structure (one per packet)
+ - * @list: for use by user and by queuing for wait
+ - *
+ - * This is the representation of a packet which consists of some
+ - * number of fragments.   Storage is provided to within the structure.
+ - * for all fragments.
+ - *
+ - * The storage for the descriptors are automatically extended as needed
+ - * when the currently allocation is exceeded.
+ - *
+ - * The user (Verbs or PSM) may overload this structure with fields
+ - * specific to their use by putting this struct first in their struct.
+ - * The method of allocation of the overloaded structure is user dependent
+ - *
+ - * The list is the only public field in the structure.
+ + * hfi1_map_page - a safety wrapper around pci_map_page()
+   *
+   */
+ +dma_addr_t hfi1_map_page(struct pci_dev *hwdev, struct page *page,
+ +			 unsigned long offset, size_t size, int direction)
+ +{
+ +	dma_addr_t phys;
+  
+ -#define SDMA_TXREQ_S_OK        0
+ -#define SDMA_TXREQ_S_SENDERROR 1
+ -#define SDMA_TXREQ_S_ABORTED   2
+ -#define SDMA_TXREQ_S_SHUTDOWN  3
+ +	phys = pci_map_page(hwdev, page, offset, size, direction);
+  
+ -/* flags bits */
+ -#define SDMA_TXREQ_F_URGENT       0x0001
+ -#define SDMA_TXREQ_F_AHG_COPY     0x0002
+ -#define SDMA_TXREQ_F_USE_AHG      0x0004
+ +	return phys;
+ +}
+ +
+ +int hfi1_acquire_user_pages(unsigned long vaddr, size_t npages, bool writable,
+ +			    struct page **pages)
+ +{
+ +	unsigned long pinned, lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+ +	bool can_lock = capable(CAP_IPC_LOCK);
+ +	int ret;
+  
+ -struct sdma_txreq;
+ -typedef void (*callback_t)(struct sdma_txreq *, int, int);
+ +	down_read(&current->mm->mmap_sem);
+ +	pinned = current->mm->pinned_vm;
+ +	up_read(&current->mm->mmap_sem);
+  
+ -struct iowait;
+ -struct sdma_txreq {
+ -	struct list_head list;
+ -	/* private: */
+ -	struct sdma_desc *descp;
+ -	/* private: */
+ -	void *coalesce_buf;
+ -	/* private: */
+ -	struct iowait *wait;
+ -	/* private: */
+ -	callback_t                  complete;
+ -#ifdef CONFIG_HFI1_DEBUG_SDMA_ORDER
+ -	u64 sn;
+ -#endif
+ -	/* private: - used in coalesce/pad processing */
+ -	u16                         packet_len;
+ -	/* private: - down-counted to trigger last */
+ -	u16                         tlen;
+ -	/* private: */
+ -	u16                         num_desc;
+ -	/* private: */
+ -	u16                         desc_limit;
+ -	/* private: */
+ -	u16                         next_descq_idx;
+ -	/* private: */
+ -	u16 coalesce_idx;
+ -	/* private: flags */
+ -	u16                         flags;
+ -	/* private: */
+ -	struct sdma_desc descs[NUM_DESC];
+ -};
+++<<<<<<< HEAD:drivers/staging/hfi1/user_pages.c
+ +	if (pinned + npages > lock_limit && !can_lock)
+ +		return -ENOMEM;
+  
+ +	ret = get_user_pages_fast(vaddr, npages, writable, pages);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	down_write(&current->mm->mmap_sem);
+ +	current->mm->pinned_vm += ret;
+ +	up_write(&current->mm->mmap_sem);
+ +
+ +	return ret;
+ +}
+ +
+ +void hfi1_release_user_pages(struct page **p, size_t npages, bool dirty)
+ +{
+ +	size_t i;
+ +
+ +	for (i = 0; i < npages; i++) {
+ +		if (dirty)
+ +			set_page_dirty_lock(p[i]);
+ +		put_page(p[i]);
+ +	}
+ +
+ +	if (current->mm) { /* during close after signal, mm can be NULL */
+ +		down_write(&current->mm->mmap_sem);
+ +		current->mm->pinned_vm -= npages;
+ +		up_write(&current->mm->mmap_sem);
+ +	}
+ +}
+++=======
++ static inline int sdma_txreq_built(struct sdma_txreq *tx)
++ {
++ 	return tx->num_desc;
++ }
++ 
++ #endif                          /* HFI1_SDMA_TXREQ_H */
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/sdma_txreq.h
+diff --cc drivers/staging/hfi1/user_sdma.h
+index 7ebbc4634989,f56149eb51ca..000000000000
+--- a/drivers/staging/hfi1/user_sdma.h
++++ b/drivers/staging/hfi1/user_sdma.h
+@@@ -47,45 -44,68 +47,99 @@@
+   * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   *
+   */
+ +#include <linux/device.h>
+ +#include <linux/wait.h>
+  
+ -#ifndef HFI1_VERBS_TXREQ_H
+ -#define HFI1_VERBS_TXREQ_H
+ +#include "common.h"
+ +#include "iowait.h"
+  
+ -#include <linux/types.h>
+ -#include <linux/slab.h>
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.h
+ +#define EXP_TID_TIDLEN_MASK   0x7FFULL
+ +#define EXP_TID_TIDLEN_SHIFT  0
+ +#define EXP_TID_TIDCTRL_MASK  0x3ULL
+ +#define EXP_TID_TIDCTRL_SHIFT 20
+ +#define EXP_TID_TIDIDX_MASK   0x7FFULL
+ +#define EXP_TID_TIDIDX_SHIFT  22
+ +#define EXP_TID_GET(tid, field)	\
+ +	(((tid) >> EXP_TID_TID##field##_SHIFT) & EXP_TID_TID##field##_MASK)
+  
+ -#include "verbs.h"
+ -#include "sdma_txreq.h"
+ -#include "iowait.h"
+ +extern uint extended_psn;
+  
+ +struct hfi1_user_sdma_pkt_q {
+ +	struct list_head list;
+ +	unsigned ctxt;
+ +	unsigned subctxt;
+ +	u16 n_max_reqs;
+ +	atomic_t n_reqs;
+ +	u16 reqidx;
+ +	struct hfi1_devdata *dd;
+ +	struct kmem_cache *txreq_cache;
+ +	struct user_sdma_request *reqs;
+ +	struct iowait busy;
+ +	unsigned state;
+ +	wait_queue_head_t wait;
+ +	unsigned long unpinned;
+++=======
++ struct verbs_txreq {
++ 	struct hfi1_pio_header	phdr;
++ 	struct sdma_txreq       txreq;
++ 	struct rvt_qp           *qp;
++ 	struct rvt_swqe         *wqe;
++ 	struct rvt_mregion	*mr;
++ 	struct rvt_sge_state    *ss;
++ 	struct sdma_engine     *sde;
++ 	struct send_context     *psc;
++ 	u16                     hdr_dwords;
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/verbs_txreq.h
+  };
+  
+ -struct hfi1_ibdev;
+ -struct verbs_txreq *__get_txreq(struct hfi1_ibdev *dev,
+ -				struct rvt_qp *qp);
+ +struct hfi1_user_sdma_comp_q {
+ +	u16 nentries;
+ +	struct hfi1_sdma_comp_entry *comps;
+ +};
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.h
+ +int hfi1_user_sdma_alloc_queues(struct hfi1_ctxtdata *, struct file *);
+ +int hfi1_user_sdma_free_queues(struct hfi1_filedata *);
+ +int hfi1_user_sdma_process_request(struct file *, struct iovec *, unsigned long,
+ +				   unsigned long *);
+++=======
++ static inline struct verbs_txreq *get_txreq(struct hfi1_ibdev *dev,
++ 					    struct rvt_qp *qp)
++ {
++ 	struct verbs_txreq *tx;
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	tx = kmem_cache_alloc(dev->verbs_txreq_cache, GFP_ATOMIC);
++ 	if (unlikely(!tx)) {
++ 		/* call slow path to get the lock */
++ 		tx = __get_txreq(dev, qp);
++ 		if (IS_ERR(tx))
++ 			return tx;
++ 	}
++ 	tx->qp = qp;
++ 	tx->mr = NULL;
++ 	tx->sde = priv->s_sde;
++ 	tx->psc = priv->s_sendcontext;
++ 	/* so that we can test if the sdma decriptors are there */
++ 	tx->txreq.num_desc = 0;
++ 	return tx;
++ }
++ 
++ static inline struct verbs_txreq *get_waiting_verbs_txreq(struct rvt_qp *qp)
++ {
++ 	struct sdma_txreq *stx;
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	stx = iowait_get_txhead(&priv->s_iowait);
++ 	if (stx)
++ 		return container_of(stx, struct verbs_txreq, txreq);
++ 	return NULL;
++ }
++ 
++ void hfi1_put_txreq(struct verbs_txreq *tx);
++ int verbs_txreq_init(struct hfi1_ibdev *dev);
++ void verbs_txreq_exit(struct hfi1_ibdev *dev);
++ 
++ #endif                         /* HFI1_VERBS_TXREQ_H */
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/verbs_txreq.h
+diff --cc drivers/staging/hfi1/verbs.c
+index d228eb7fc4f0,229dde5fbde6..000000000000
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@@ -848,15 -547,19 +848,23 @@@ static void verbs_sdma_complete
+  	hfi1_put_txreq(tx);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +static int wait_kmem(struct hfi1_ibdev *dev, struct hfi1_qp *qp)
+++=======
++ static int wait_kmem(struct hfi1_ibdev *dev,
++ 		     struct rvt_qp *qp,
++ 		     struct hfi1_pkt_state *ps)
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/verbs.c
+  {
+  	struct hfi1_qp_priv *priv = qp->priv;
+  	unsigned long flags;
+  	int ret = 0;
+  
+  	spin_lock_irqsave(&qp->s_lock, flags);
+ -	if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) {
+ +	if (ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_RECV_OK) {
+  		write_seqlock(&dev->iowait_lock);
++ 		list_add_tail(&ps->s_txreq->txreq.list,
++ 			      &priv->s_iowait.tx_head);
+  		if (list_empty(&priv->s_iowait.list)) {
+  			if (list_empty(&dev->memwait))
+  				mod_timer(&dev->mem_timer, jiffies + 1);
+@@@ -879,9 -582,9 +887,9 @@@
+   *
+   * Add failures will revert the sge cursor
+   */
+- static int build_verbs_ulp_payload(
++ static noinline int build_verbs_ulp_payload(
+  	struct sdma_engine *sde,
+ -	struct rvt_sge_state *ss,
+ +	struct hfi1_sge_state *ss,
+  	u32 length,
+  	struct verbs_txreq *tx)
+  {
+@@@ -1013,43 -698,28 +1020,68 @@@ int hfi1_verbs_send_dma(struct hfi1_qp 
+  	u8 sc5 = priv->s_sc;
+  
+  	int ret;
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +
+ +	if (!list_empty(&priv->s_iowait.tx_head)) {
+ +		stx = list_first_entry(
+ +			&priv->s_iowait.tx_head,
+ +			struct sdma_txreq,
+ +			list);
+ +		list_del_init(&stx->list);
+ +		tx = container_of(stx, struct verbs_txreq, txreq);
+ +		ret = sdma_send_txreq(tx->sde, &priv->s_iowait, stx);
+ +		if (unlikely(ret == -ECOMM))
+ +			goto bail_ecomm;
+ +		return ret;
+ +	}
+ +
+ +	tx = get_txreq(dev, qp);
+ +	if (IS_ERR(tx))
+ +		goto bail_tx;
+ +
+ +	tx->sde = priv->s_sde;
+ +
+ +	if (likely(pbc == 0)) {
+ +		u32 vl = sc_to_vlt(dd_from_ibdev(qp->ibqp.device), sc5);
+ +		/* No vl15 here */
+ +		/* set PBC_DC_INFO bit (aka SC[4]) in pbc_flags */
+ +		pbc_flags |= (!!(sc5 & 0x10)) << PBC_DC_INFO_SHIFT;
+ +
+ +		pbc = create_pbc(ppd, pbc_flags, qp->srate_mbps, vl, plen);
+ +	}
+ +	tx->wqe = qp->s_wqe;
+ +	tx->mr = qp->s_rdma_mr;
+ +	if (qp->s_rdma_mr)
+ +		qp->s_rdma_mr = NULL;
+ +	tx->hdr_dwords = hdrwords + 2;
+ +	ret = build_verbs_tx_desc(tx->sde, ss, len, tx, ahdr, pbc);
+ +	if (unlikely(ret))
+ +		goto bail_build;
+ +	trace_output_ibhdr(dd_from_ibdev(qp->ibqp.device), &ahdr->ibh);
+++=======
++ 
++ 	tx = ps->s_txreq;
++ 	if (!sdma_txreq_built(&tx->txreq)) {
++ 		if (likely(pbc == 0)) {
++ 			u32 vl = sc_to_vlt(dd_from_ibdev(qp->ibqp.device), sc5);
++ 			/* No vl15 here */
++ 			/* set PBC_DC_INFO bit (aka SC[4]) in pbc_flags */
++ 			pbc_flags |= (!!(sc5 & 0x10)) << PBC_DC_INFO_SHIFT;
++ 
++ 			pbc = create_pbc(ppd,
++ 					 pbc_flags,
++ 					 qp->srate_mbps,
++ 					 vl,
++ 					 plen);
++ 		}
++ 		tx->wqe = qp->s_wqe;
++ 		ret = build_verbs_tx_desc(tx->sde, ss, len, tx, ahdr, pbc);
++ 		if (unlikely(ret))
++ 			goto bail_build;
++ 	}
++ 	trace_output_ibhdr(dd_from_ibdev(qp->ibqp.device),
++ 			   &ps->s_txreq->phdr.hdr);
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/verbs.c
+  	ret =  sdma_send_txreq(tx->sde, &priv->s_iowait, &tx->txreq);
+  	if (unlikely(ret == -ECOMM))
+  		goto bail_ecomm;
+@@@ -1070,7 -742,9 +1104,13 @@@ bail_build
+   * If we are now in the error state, return zero to flush the
+   * send work request.
+   */
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +static int no_bufs_available(struct hfi1_qp *qp, struct send_context *sc)
+++=======
++ static int no_bufs_available(struct rvt_qp *qp,
++ 			     struct send_context *sc,
++ 			     struct hfi1_pkt_state *ps)
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/verbs.c
+  {
+  	struct hfi1_qp_priv *priv = qp->priv;
+  	struct hfi1_devdata *dd = sc->dd;
+@@@ -1085,8 -759,10 +1125,10 @@@
+  	 * enabling the PIO avail interrupt.
+  	 */
+  	spin_lock_irqsave(&qp->s_lock, flags);
+ -	if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) {
+ +	if (ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_RECV_OK) {
+  		write_seqlock(&dev->iowait_lock);
++ 		list_add_tail(&ps->s_txreq->txreq.list,
++ 			      &priv->s_iowait.tx_head);
+  		if (list_empty(&priv->s_iowait.list)) {
+  			struct hfi1_ibdev *dev = &dd->verbs_dev;
+  			int was_empty;
+@@@ -1173,7 -851,11 +1215,15 @@@ int hfi1_verbs_send_pio(struct hfi1_qp 
+  			 * so lets continue to queue the request.
+  			 */
+  			hfi1_cdbg(PIO, "alloc failed. state active, queuing");
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +			return no_bufs_available(qp, sc);
+++=======
++ 			ret = no_bufs_available(qp, sc, ps);
++ 			if (!ret)
++ 				goto bail;
++ 			/* tx consumed in wait */
++ 			return ret;
+++>>>>>>> 711e104ddca7 (staging/rdma/hfi1: fix panic in send engine):drivers/staging/rdma/hfi1/verbs.c
+  		}
+  	}
+  
+diff --git a/drivers/staging/hfi1/iowait.h b/drivers/staging/hfi1/iowait.h
+index e8ba5606d08d..e007eb82cbc8 100644
+--- a/drivers/staging/hfi1/iowait.h
++++ b/drivers/staging/hfi1/iowait.h
+@@ -54,6 +54,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/sched.h>
+ 
++#include "sdma_txreq.h"
+ /*
+  * typedef (*restart_t)() - restart callback
+  * @work: pointer to work structure
+@@ -185,4 +186,23 @@ static inline void iowait_drain_wakeup(struct iowait *wait)
+ 	wake_up(&wait->wait_dma);
+ }
+ 
++/**
++ * iowait_get_txhead() - get packet off of iowait list
++ *
++ * @wait wait struture
++ */
++static inline struct sdma_txreq *iowait_get_txhead(struct iowait *wait)
++{
++	struct sdma_txreq *tx = NULL;
++
++	if (!list_empty(&wait->tx_head)) {
++		tx = list_first_entry(
++			&wait->tx_head,
++			struct sdma_txreq,
++			list);
++		list_del_init(&tx->list);
++	}
++	return tx;
++}
++
+ #endif
+diff --git a/drivers/staging/hfi1/rc.c b/drivers/staging/hfi1/rc.c
+index dd57d65aa9b2..c293c6bd74e2 100644
+--- a/drivers/staging/hfi1/rc.c
++++ b/drivers/staging/hfi1/rc.c
+@@ -234,6 +234,8 @@ normal:
+ 	}
+ 	qp->s_rdma_ack_cnt++;
+ 	qp->s_hdrwords = hwords;
++	/* pbc */
++	ps->s_txreq->hdr_dwords = hwords + 2;
+ 	qp->s_cur_size = len;
+ 	hfi1_make_ruc_header(qp, ohdr, bth0, bth2, middle);
+ 	return 1;
+@@ -656,6 +658,8 @@ int hfi1_make_rc_req(struct hfi1_qp *qp)
+ 	}
+ 	qp->s_len -= len;
+ 	qp->s_hdrwords = hwords;
++	/* pbc */
++	ps->s_txreq->hdr_dwords = hwords + 2;
+ 	qp->s_cur_sge = ss;
+ 	qp->s_cur_size = len;
+ 	hfi1_make_ruc_header(
+* Unmerged path drivers/staging/hfi1/ruc.c
+diff --git a/drivers/staging/hfi1/uc.c b/drivers/staging/hfi1/uc.c
+index fc90d4f544e4..9582d23acd44 100644
+--- a/drivers/staging/hfi1/uc.c
++++ b/drivers/staging/hfi1/uc.c
+@@ -232,6 +232,8 @@ int hfi1_make_uc_req(struct hfi1_qp *qp)
+ 	}
+ 	qp->s_len -= len;
+ 	qp->s_hdrwords = hwords;
++	/* pbc */
++	ps->s_txreq->hdr_dwords = qp->s_hdrwords + 2;
+ 	qp->s_cur_sge = &qp->s_sge;
+ 	qp->s_cur_size = len;
+ 	hfi1_make_ruc_header(qp, ohdr, bth0 | (qp->s_state << 24),
+* Unmerged path drivers/staging/hfi1/ud.c
+* Unmerged path drivers/staging/hfi1/user_pages.c
+* Unmerged path drivers/staging/hfi1/user_sdma.h
+* Unmerged path drivers/staging/hfi1/verbs.c
