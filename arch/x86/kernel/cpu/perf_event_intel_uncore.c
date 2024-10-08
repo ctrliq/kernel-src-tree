@@ -970,6 +970,9 @@ static int __init uncore_pci_init(void)
 	case 63: /* Haswell-EP */
 		ret = hswep_uncore_pci_init();
 		break;
+	case 86: /* BDX-DE */
+		ret = bdx_uncore_pci_init();
+		break;
 	case 42: /* Sandy Bridge */
 		ret = snb_uncore_pci_init();
 		break;
@@ -1287,6 +1290,9 @@ static int __init uncore_cpu_init(void)
 		break;
 	case 63: /* Haswell-EP */
 		hswep_uncore_cpu_init();
+		break;
+	case 86: /* BDX-DE */
+		bdx_uncore_cpu_init();
 		break;
 	default:
 		return 0;
