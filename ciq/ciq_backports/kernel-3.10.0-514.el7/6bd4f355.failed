@@ -1,0 +1,248 @@
+ipv6: kill sk_dst_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 6bd4f355df2eae80b8a5c7b097371cd1e05f20d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6bd4f355.failed
+
+While testing the np->opt RCU conversion, I found that UDP/IPv6 was
+using a mixture of xchg() and sk_dst_lock to protect concurrent changes
+to sk->sk_dst_cache, leading to possible corruptions and crashes.
+
+ip6_sk_dst_lookup_flow() uses sk_dst_check() anyway, so the simplest
+way to fix the mess is to remove sk_dst_lock completely, as we did for
+IPv4.
+
+__ip6_dst_store() and ip6_dst_store() share same implementation.
+
+sk_setup_caps() being called with socket lock being held or not,
+we have to use sk_dst_set() instead of __sk_dst_set()
+
+Note that I had to move the "np->dst_cookie = rt6_get_cookie(rt);"
+in ip6_dst_store() before the sk_setup_caps(sk, dst) call.
+
+This is because ip6_dst_store() can be called from process context,
+without any lock held.
+
+As soon as the dst is installed in sk->sk_dst_cache, dst can be freed
+from another cpu doing a concurrent ip6_dst_store()
+
+Doing the dst dereference before doing the install is needed to make
+sure no use after free would trigger.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6bd4f355df2eae80b8a5c7b097371cd1e05f20d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_route.h
+#	net/core/sock.c
+diff --cc include/net/ip6_route.h
+index c2439795bc4f,877f682989b8..000000000000
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@@ -166,26 -145,27 +166,29 @@@ static inline void ip6_dst_store(struc
+  #ifdef CONFIG_IPV6_SUBTREES
+  	np->saddr_cache = saddr;
+  #endif
+++<<<<<<< HEAD
+ +	np->dst_cookie = rt->rt6i_node ? rt->rt6i_node->fn_sernum : 0;
+  }
+  
+ -static inline bool ipv6_unicast_destination(const struct sk_buff *skb)
+ +static inline void ip6_dst_store(struct sock *sk, struct dst_entry *dst,
+ +				 struct in6_addr *daddr, struct in6_addr *saddr)
+  {
+ -	struct rt6_info *rt = (struct rt6_info *) skb_dst(skb);
+ -
+ -	return rt->rt6i_flags & RTF_LOCAL;
+ +	spin_lock(&sk->sk_dst_lock);
+ +	__ip6_dst_store(sk, dst, daddr, saddr);
+ +	spin_unlock(&sk->sk_dst_lock);
+++=======
+++>>>>>>> 6bd4f355df2e (ipv6: kill sk_dst_lock)
+  }
+  
+ -static inline bool ipv6_anycast_destination(const struct dst_entry *dst,
+ -					    const struct in6_addr *daddr)
+ +static inline bool ipv6_unicast_destination(const struct sk_buff *skb)
+  {
+ -	struct rt6_info *rt = (struct rt6_info *)dst;
+ +	struct rt6_info *rt = (struct rt6_info *) skb_dst(skb);
+  
+ -	return rt->rt6i_flags & RTF_ANYCAST ||
+ -		(rt->rt6i_dst.plen != 128 &&
+ -		 ipv6_addr_equal(&rt->rt6i_dst.addr, daddr));
+ +	return rt->rt6i_flags & RTF_LOCAL;
+  }
+  
+ -int ip6_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ -		 int (*output)(struct net *, struct sock *, struct sk_buff *));
+ +int ip6_fragment(struct sock *sk, struct sk_buff *skb,
+ +		 int (*output)(struct sock *, struct sk_buff *));
+  
+  static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+  {
+diff --cc net/core/sock.c
+index 5df7b494f26e,e31dfcee1729..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -1568,7 -1604,9 +1567,13 @@@ EXPORT_SYMBOL_GPL(sk_clone_lock)
+  
+  void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
+  {
+++<<<<<<< HEAD
+ +	__sk_dst_set(sk, dst);
+++=======
++ 	u32 max_segs = 1;
++ 
++ 	sk_dst_set(sk, dst);
+++>>>>>>> 6bd4f355df2e (ipv6: kill sk_dst_lock)
+  	sk->sk_route_caps = dst->dev->features;
+  	if (sk->sk_route_caps & NETIF_F_GSO)
+  		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;
+* Unmerged path include/net/ip6_route.h
+diff --git a/include/net/sock.h b/include/net/sock.h
+index d2b60f37533f..e03bedbe7828 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -226,7 +226,6 @@ struct cg_proto;
+   *	@sk_wq: sock wait queue and async head
+   *	@sk_rx_dst: receive input route used by early tcp demux
+   *	@sk_dst_cache: destination cache
+-  *	@sk_dst_lock: destination cache lock
+   *	@sk_policy: flow policy
+   *	@sk_receive_queue: incoming packets
+   *	@sk_wmem_alloc: transmit queue bytes committed
+@@ -364,7 +363,7 @@ struct sock {
+ 	unsigned long 		sk_flags;
+ 	struct dst_entry	*sk_rx_dst;
+ 	struct dst_entry __rcu	*sk_dst_cache;
+-	spinlock_t		sk_dst_lock;
++	/* Note: 32bit hole on 64bit arches */
+ 	atomic_t		sk_wmem_alloc;
+ 	atomic_t		sk_omem_alloc;
+ 	int			sk_sndbuf;
+* Unmerged path net/core/sock.c
+diff --git a/net/dccp/ipv6.c b/net/dccp/ipv6.c
+index 04cb17d4b0ce..e6081a92be4c 100644
+--- a/net/dccp/ipv6.c
++++ b/net/dccp/ipv6.c
+@@ -530,7 +530,7 @@ static struct sock *dccp_v6_request_recv_sock(struct sock *sk,
+ 	 * comment in that function for the gory details. -acme
+ 	 */
+ 
+-	__ip6_dst_store(newsk, dst, NULL, NULL);
++	ip6_dst_store(newsk, dst, NULL, NULL);
+ 	newsk->sk_route_caps = dst->dev->features & ~(NETIF_F_IP_CSUM |
+ 						      NETIF_F_TSO);
+ 	newdp6 = (struct dccp6_sock *)newsk;
+@@ -949,7 +949,7 @@ static int dccp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
+ 	np->saddr = *saddr;
+ 	inet->inet_rcv_saddr = LOOPBACK4_IPV6;
+ 
+-	__ip6_dst_store(sk, dst, NULL, NULL);
++	ip6_dst_store(sk, dst, NULL, NULL);
+ 
+ 	icsk->icsk_ext_hdr_len = 0;
+ 	if (np->opt != NULL)
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index f6f52bfe535a..c108c0b989db 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -664,7 +664,7 @@ int inet6_sk_rebuild_header(struct sock *sk)
+ 			return PTR_ERR(dst);
+ 		}
+ 
+-		__ip6_dst_store(sk, dst, NULL, NULL);
++		ip6_dst_store(sk, dst, NULL, NULL);
+ 	}
+ 
+ 	return 0;
+diff --git a/net/ipv6/icmp.c b/net/ipv6/icmp.c
+index 0e5c15f31e60..77be77c02f96 100644
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@ -803,11 +803,6 @@ void icmpv6_flow_init(struct sock *sk, struct flowi6 *fl6,
+ 	security_sk_classify_flow(sk, flowi6_to_flowi(fl6));
+ }
+ 
+-/*
+- * Special lock-class for __icmpv6_sk:
+- */
+-static struct lock_class_key icmpv6_socket_sk_dst_lock_key;
+-
+ static int __net_init icmpv6_sk_init(struct net *net)
+ {
+ 	struct sock *sk;
+@@ -829,15 +824,6 @@ static int __net_init icmpv6_sk_init(struct net *net)
+ 
+ 		net->ipv6.icmp_sk[i] = sk;
+ 
+-		/*
+-		 * Split off their lock-class, because sk->sk_dst_lock
+-		 * gets used from softirqs, which is safe for
+-		 * __icmpv6_sk (because those never get directly used
+-		 * via userspace syscalls), but unsafe for normal sockets.
+-		 */
+-		lockdep_set_class(&sk->sk_dst_lock,
+-				  &icmpv6_socket_sk_dst_lock_key);
+-
+ 		/* Enough space for 2 64K ICMP packets, including
+ 		 * sk_buff struct overhead.
+ 		 */
+diff --git a/net/ipv6/inet6_connection_sock.c b/net/ipv6/inet6_connection_sock.c
+index c9138189415a..61376f180781 100644
+--- a/net/ipv6/inet6_connection_sock.c
++++ b/net/ipv6/inet6_connection_sock.c
+@@ -178,14 +178,6 @@ void inet6_csk_addr2sockaddr(struct sock *sk, struct sockaddr * uaddr)
+ 
+ EXPORT_SYMBOL_GPL(inet6_csk_addr2sockaddr);
+ 
+-static inline
+-void __inet6_csk_dst_store(struct sock *sk, struct dst_entry *dst,
+-			   const struct in6_addr *daddr,
+-			   const struct in6_addr *saddr)
+-{
+-	__ip6_dst_store(sk, dst, daddr, saddr);
+-}
+-
+ static inline
+ struct dst_entry *__inet6_csk_dst_check(struct sock *sk, u32 cookie)
+ {
+@@ -219,7 +211,7 @@ static struct dst_entry *inet6_csk_route_socket(struct sock *sk,
+ 		dst = ip6_dst_lookup_flow(sk, fl6, final_p);
+ 
+ 		if (!IS_ERR(dst))
+-			__inet6_csk_dst_store(sk, dst, NULL, NULL);
++			ip6_dst_store(sk, dst, NULL, NULL);
+ 	}
+ 	return dst;
+ }
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index b1e56e7b4f4f..77276e3764bd 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -272,7 +272,7 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
+ 	inet->inet_rcv_saddr = LOOPBACK4_IPV6;
+ 
+ 	sk->sk_gso_type = SKB_GSO_TCPV6;
+-	__ip6_dst_store(sk, dst, NULL, NULL);
++	ip6_dst_store(sk, dst, NULL, NULL);
+ 
+ 	rt = (struct rt6_info *) dst;
+ 	if (tcp_death_row.sysctl_tw_recycle &&
+@@ -1127,7 +1127,7 @@ static struct sock *tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+ 	 */
+ 
+ 	newsk->sk_gso_type = SKB_GSO_TCPV6;
+-	__ip6_dst_store(newsk, dst, NULL, NULL);
++	ip6_dst_store(newsk, dst, NULL, NULL);
+ 	inet6_sk_rx_dst_set(newsk, skb);
+ 
+ 	newtcp6sk = (struct tcp6_sock *)newsk;
