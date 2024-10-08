@@ -1,0 +1,446 @@
+xfs: inode and free block counters need to use __percpu_counter_compare
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 8c1903d3081ab7c416f1bbc7905f37a265d5e2e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8c1903d3.failed
+
+Because the counters use a custom batch size, the comparison
+functions need to be aware of that batch size otherwise the
+comparison does not work correctly. This leads to ASSERT failures
+on generic/027 like this:
+
+ XFS: Assertion failed: 0, file: fs/xfs/xfs_mount.c, line: 1099
+ ------------[ cut here ]------------
+....
+ Call Trace:
+  [<ffffffff81522a39>] xfs_mod_icount+0x99/0xc0
+  [<ffffffff815285cb>] xfs_trans_unreserve_and_mod_sb+0x28b/0x5b0
+  [<ffffffff8152f941>] xfs_log_commit_cil+0x321/0x580
+  [<ffffffff81528e17>] xfs_trans_commit+0xb7/0x260
+  [<ffffffff81503d4d>] xfs_bmap_finish+0xcd/0x1b0
+  [<ffffffff8151da41>] xfs_inactive_ifree+0x1e1/0x250
+  [<ffffffff8151dbe0>] xfs_inactive+0x130/0x200
+  [<ffffffff81523a21>] xfs_fs_evict_inode+0x91/0xf0
+  [<ffffffff811f3958>] evict+0xb8/0x190
+  [<ffffffff811f433b>] iput+0x18b/0x1f0
+  [<ffffffff811e8853>] do_unlinkat+0x1f3/0x320
+  [<ffffffff811d548a>] ? filp_close+0x5a/0x80
+  [<ffffffff811e999b>] SyS_unlinkat+0x1b/0x40
+  [<ffffffff81e0892e>] system_call_fastpath+0x12/0x71
+
+This is a regression introduced by commit 501ab32 ("xfs: use generic
+percpu counters for inode counter").
+
+This patch fixes the same problem for both the inode counter and the
+free block counter in the superblocks.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 8c1903d3081ab7c416f1bbc7905f37a265d5e2e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_mount.c
+diff --cc fs/xfs/xfs_mount.c
+index 1f0460bd27b8,6f23fbdfb365..000000000000
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@@ -1123,266 -1081,145 +1123,339 @@@ xfs_log_sbcount(xfs_mount_t *mp
+  	if (!xfs_sb_version_haslazysbcount(&mp->m_sb))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	tp = _xfs_trans_alloc(mp, XFS_TRANS_SB_COUNT, KM_SLEEP);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		return error;
+++=======
++ 	return xfs_sync_sb(mp, true);
++ }
++ 
++ /*
++  * Deltas for the inode count are +/-64, hence we use a large batch size
++  * of 128 so we don't need to take the counter lock on every update.
++  */
++ #define XFS_ICOUNT_BATCH	128
++ int
++ xfs_mod_icount(
++ 	struct xfs_mount	*mp,
++ 	int64_t			delta)
++ {
++ 	__percpu_counter_add(&mp->m_icount, delta, XFS_ICOUNT_BATCH);
++ 	if (__percpu_counter_compare(&mp->m_icount, 0, XFS_ICOUNT_BATCH) < 0) {
++ 		ASSERT(0);
++ 		percpu_counter_add(&mp->m_icount, -delta);
++ 		return -EINVAL;
+++>>>>>>> 8c1903d3081a (xfs: inode and free block counters need to use __percpu_counter_compare)
+  	}
+ -	return 0;
+ +
+ +	xfs_mod_sb(tp, XFS_SB_IFREE | XFS_SB_ICOUNT | XFS_SB_FDBLOCKS);
+ +	xfs_trans_set_sync(tp);
+ +	error = xfs_trans_commit(tp, 0);
+ +	return error;
+  }
+  
+ -int
+ -xfs_mod_ifree(
+ -	struct xfs_mount	*mp,
+ -	int64_t			delta)
+ +/*
+ + * xfs_mod_incore_sb_unlocked() is a utility routine commonly used to apply
+ + * a delta to a specified field in the in-core superblock.  Simply
+ + * switch on the field indicated and apply the delta to that field.
+ + * Fields are not allowed to dip below zero, so if the delta would
+ + * do this do not apply it and return EINVAL.
+ + *
+ + * The m_sb_lock must be held when this routine is called.
+ + */
+ +STATIC int
+ +xfs_mod_incore_sb_unlocked(
+ +	xfs_mount_t	*mp,
+ +	xfs_sb_field_t	field,
+ +	int64_t		delta,
+ +	int		rsvd)
+  {
+ -	percpu_counter_add(&mp->m_ifree, delta);
+ -	if (percpu_counter_compare(&mp->m_ifree, 0) < 0) {
+ -		ASSERT(0);
+ -		percpu_counter_add(&mp->m_ifree, -delta);
+ -		return -EINVAL;
+ -	}
+ -	return 0;
+ -}
+ +	int		scounter;	/* short counter for 32 bit fields */
+ +	long long	lcounter;	/* long counter for 64 bit fields */
+ +	long long	res_used, rem;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * With the in-core superblock spin lock held, switch
+ +	 * on the indicated field.  Apply the delta to the
+ +	 * proper field.  If the fields value would dip below
+ +	 * 0, then do not apply the delta and return EINVAL.
+ +	 */
+ +	switch (field) {
+ +	case XFS_SBS_ICOUNT:
+ +		lcounter = (long long)mp->m_sb.sb_icount;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+++=======
++ /*
++  * Deltas for the block count can vary from 1 to very large, but lock contention
++  * only occurs on frequent small block count updates such as in the delayed
++  * allocation path for buffered writes (page a time updates). Hence we set
++  * a large batch count (1024) to minimise global counter updates except when
++  * we get near to ENOSPC and we have to be very accurate with our updates.
++  */
++ #define XFS_FDBLOCKS_BATCH	1024
++ int
++ xfs_mod_fdblocks(
++ 	struct xfs_mount	*mp,
++ 	int64_t			delta,
++ 	bool			rsvd)
++ {
++ 	int64_t			lcounter;
++ 	long long		res_used;
++ 	s32			batch;
++ 
++ 	if (delta > 0) {
++ 		/*
++ 		 * If the reserve pool is depleted, put blocks back into it
++ 		 * first. Most of the time the pool is full.
++ 		 */
++ 		if (likely(mp->m_resblks == mp->m_resblks_avail)) {
++ 			percpu_counter_add(&mp->m_fdblocks, delta);
++ 			return 0;
+++>>>>>>> 8c1903d3081a (xfs: inode and free block counters need to use __percpu_counter_compare)
+  		}
+ -
+ -		spin_lock(&mp->m_sb_lock);
+ +		mp->m_sb.sb_icount = lcounter;
+ +		return 0;
+ +	case XFS_SBS_IFREE:
+ +		lcounter = (long long)mp->m_sb.sb_ifree;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_ifree = lcounter;
+ +		return 0;
+ +	case XFS_SBS_FDBLOCKS:
+ +		lcounter = (long long)
+ +			mp->m_sb.sb_fdblocks - XFS_ALLOC_SET_ASIDE(mp);
+  		res_used = (long long)(mp->m_resblks - mp->m_resblks_avail);
+  
+ -		if (res_used > delta) {
+ -			mp->m_resblks_avail += delta;
+ -		} else {
+ -			delta -= res_used;
+ -			mp->m_resblks_avail = mp->m_resblks;
+ -			percpu_counter_add(&mp->m_fdblocks, delta);
+ +		if (delta > 0) {		/* Putting blocks back */
+ +			if (res_used > delta) {
+ +				mp->m_resblks_avail += delta;
+ +			} else {
+ +				rem = delta - res_used;
+ +				mp->m_resblks_avail = mp->m_resblks;
+ +				lcounter += rem;
+ +			}
+ +		} else {				/* Taking blocks away */
+ +			lcounter += delta;
+ +			if (lcounter >= 0) {
+ +				mp->m_sb.sb_fdblocks = lcounter +
+ +							XFS_ALLOC_SET_ASIDE(mp);
+ +				return 0;
+ +			}
+ +
+ +			/*
+ +			 * We are out of blocks, use any available reserved
+ +			 * blocks if were allowed to.
+ +			 */
+ +			if (!rsvd)
+ +				return XFS_ERROR(ENOSPC);
+ +
+ +			lcounter = (long long)mp->m_resblks_avail + delta;
+ +			if (lcounter >= 0) {
+ +				mp->m_resblks_avail = lcounter;
+ +				return 0;
+ +			}
+ +			printk_once(KERN_WARNING
+ +				"Filesystem \"%s\": reserve blocks depleted! "
+ +				"Consider increasing reserve pool size.",
+ +				mp->m_fsname);
+ +			return XFS_ERROR(ENOSPC);
+  		}
+ -		spin_unlock(&mp->m_sb_lock);
+ +
+ +		mp->m_sb.sb_fdblocks = lcounter + XFS_ALLOC_SET_ASIDE(mp);
+  		return 0;
+++<<<<<<< HEAD
+ +	case XFS_SBS_FREXTENTS:
+ +		lcounter = (long long)mp->m_sb.sb_frextents;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			return XFS_ERROR(ENOSPC);
+ +		}
+ +		mp->m_sb.sb_frextents = lcounter;
+++=======
++ 	}
++ 
++ 	/*
++ 	 * Taking blocks away, need to be more accurate the closer we
++ 	 * are to zero.
++ 	 *
++ 	 * If the counter has a value of less than 2 * max batch size,
++ 	 * then make everything serialise as we are real close to
++ 	 * ENOSPC.
++ 	 */
++ 	if (__percpu_counter_compare(&mp->m_fdblocks, 2 * XFS_FDBLOCKS_BATCH,
++ 				     XFS_FDBLOCKS_BATCH) < 0)
++ 		batch = 1;
++ 	else
++ 		batch = XFS_FDBLOCKS_BATCH;
++ 
++ 	__percpu_counter_add(&mp->m_fdblocks, delta, batch);
++ 	if (__percpu_counter_compare(&mp->m_fdblocks, XFS_ALLOC_SET_ASIDE(mp),
++ 				     XFS_FDBLOCKS_BATCH) >= 0) {
++ 		/* we had space! */
+++>>>>>>> 8c1903d3081a (xfs: inode and free block counters need to use __percpu_counter_compare)
+ +		return 0;
+ +	case XFS_SBS_DBLOCKS:
+ +		lcounter = (long long)mp->m_sb.sb_dblocks;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_dblocks = lcounter;
+ +		return 0;
+ +	case XFS_SBS_AGCOUNT:
+ +		scounter = mp->m_sb.sb_agcount;
+ +		scounter += delta;
+ +		if (scounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_agcount = scounter;
+ +		return 0;
+ +	case XFS_SBS_IMAX_PCT:
+ +		scounter = mp->m_sb.sb_imax_pct;
+ +		scounter += delta;
+ +		if (scounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_imax_pct = scounter;
+ +		return 0;
+ +	case XFS_SBS_REXTSIZE:
+ +		scounter = mp->m_sb.sb_rextsize;
+ +		scounter += delta;
+ +		if (scounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_rextsize = scounter;
+ +		return 0;
+ +	case XFS_SBS_RBMBLOCKS:
+ +		scounter = mp->m_sb.sb_rbmblocks;
+ +		scounter += delta;
+ +		if (scounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_rbmblocks = scounter;
+ +		return 0;
+ +	case XFS_SBS_RBLOCKS:
+ +		lcounter = (long long)mp->m_sb.sb_rblocks;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_rblocks = lcounter;
+  		return 0;
+ +	case XFS_SBS_REXTENTS:
+ +		lcounter = (long long)mp->m_sb.sb_rextents;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_rextents = lcounter;
+ +		return 0;
+ +	case XFS_SBS_REXTSLOG:
+ +		scounter = mp->m_sb.sb_rextslog;
+ +		scounter += delta;
+ +		if (scounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_rextslog = scounter;
+ +		return 0;
+ +	default:
+ +		ASSERT(0);
+ +		return XFS_ERROR(EINVAL);
+  	}
+ +}
+  
+ -	/*
+ -	 * lock up the sb for dipping into reserves before releasing the space
+ -	 * that took us to ENOSPC.
+ -	 */
+ -	spin_lock(&mp->m_sb_lock);
+ -	percpu_counter_add(&mp->m_fdblocks, -delta);
+ -	if (!rsvd)
+ -		goto fdblocks_enospc;
+ +/*
+ + * xfs_mod_incore_sb() is used to change a field in the in-core
+ + * superblock structure by the specified delta.  This modification
+ + * is protected by the m_sb_lock.  Just use the xfs_mod_incore_sb_unlocked()
+ + * routine to do the work.
+ + */
+ +int
+ +xfs_mod_incore_sb(
+ +	struct xfs_mount	*mp,
+ +	xfs_sb_field_t		field,
+ +	int64_t			delta,
+ +	int			rsvd)
+ +{
+ +	int			status;
+  
+ -	lcounter = (long long)mp->m_resblks_avail + delta;
+ -	if (lcounter >= 0) {
+ -		mp->m_resblks_avail = lcounter;
+ -		spin_unlock(&mp->m_sb_lock);
+ -		return 0;
+ -	}
+ -	printk_once(KERN_WARNING
+ -		"Filesystem \"%s\": reserve blocks depleted! "
+ -		"Consider increasing reserve pool size.",
+ -		mp->m_fsname);
+ -fdblocks_enospc:
+ +#ifdef HAVE_PERCPU_SB
+ +	ASSERT(field < XFS_SBS_ICOUNT || field > XFS_SBS_FDBLOCKS);
+ +#endif
+ +	spin_lock(&mp->m_sb_lock);
+ +	status = xfs_mod_incore_sb_unlocked(mp, field, delta, rsvd);
+  	spin_unlock(&mp->m_sb_lock);
+ -	return -ENOSPC;
+ +
+ +	return status;
+  }
+  
+ +/*
+ + * Change more than one field in the in-core superblock structure at a time.
+ + *
+ + * The fields and changes to those fields are specified in the array of
+ + * xfs_mod_sb structures passed in.  Either all of the specified deltas
+ + * will be applied or none of them will.  If any modified field dips below 0,
+ + * then all modifications will be backed out and EINVAL will be returned.
+ + *
+ + * Note that this function may not be used for the superblock values that
+ + * are tracked with the in-memory per-cpu counters - a direct call to
+ + * xfs_icsb_modify_counters is required for these.
+ + */
+  int
+ -xfs_mod_frextents(
+ +xfs_mod_incore_sb_batch(
+  	struct xfs_mount	*mp,
+ -	int64_t			delta)
+ +	xfs_mod_sb_t		*msb,
+ +	uint			nmsb,
+ +	int			rsvd)
+  {
+ -	int64_t			lcounter;
+ -	int			ret = 0;
+ +	xfs_mod_sb_t		*msbp;
+ +	int			error = 0;
+  
+ +	/*
+ +	 * Loop through the array of mod structures and apply each individually.
+ +	 * If any fail, then back out all those which have already been applied.
+ +	 * Do all of this within the scope of the m_sb_lock so that all of the
+ +	 * changes will be atomic.
+ +	 */
+  	spin_lock(&mp->m_sb_lock);
+ -	lcounter = mp->m_sb.sb_frextents + delta;
+ -	if (lcounter < 0)
+ -		ret = -ENOSPC;
+ -	else
+ -		mp->m_sb.sb_frextents = lcounter;
+ +	for (msbp = msb; msbp < (msb + nmsb); msbp++) {
+ +		ASSERT(msbp->msb_field < XFS_SBS_ICOUNT ||
+ +		       msbp->msb_field > XFS_SBS_FDBLOCKS);
+ +
+ +		error = xfs_mod_incore_sb_unlocked(mp, msbp->msb_field,
+ +						   msbp->msb_delta, rsvd);
+ +		if (error)
+ +			goto unwind;
+ +	}
+  	spin_unlock(&mp->m_sb_lock);
+ -	return ret;
+ +	return 0;
+ +
+ +unwind:
+ +	while (--msbp >= msb) {
+ +		error = xfs_mod_incore_sb_unlocked(mp, msbp->msb_field,
+ +						   -msbp->msb_delta, rsvd);
+ +		ASSERT(error == 0);
+ +	}
+ +	spin_unlock(&mp->m_sb_lock);
+ +	return error;
+  }
+  
+  /*
+* Unmerged path fs/xfs/xfs_mount.c
