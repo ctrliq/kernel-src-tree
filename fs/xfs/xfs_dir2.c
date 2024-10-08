@@ -146,9 +146,7 @@ xfs_da_mount(
 	mp->m_dirleafblk = mp->m_dir_geo->leafblk;
 	mp->m_dirfreeblk = mp->m_dir_geo->freeblk;
 	mp->m_dir_node_ents = mp->m_dir_geo->node_ents;
-	mp->m_dir_magicpct = mp->m_dir_geo->magicpct;
 	mp->m_attr_node_ents = mp->m_attr_geo->node_ents;
-	mp->m_attr_magicpct = mp->m_attr_geo->magicpct;
 	return 0;
 }
 
