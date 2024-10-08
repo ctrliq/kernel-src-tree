@@ -449,6 +449,7 @@ struct hfi1_sge_state;
 #define HLS_LINK_COOLDOWN (1 << __HLS_LINK_COOLDOWN_BP)
 
 #define HLS_UP (HLS_UP_INIT | HLS_UP_ARMED | HLS_UP_ACTIVE)
+#define HLS_DOWN ~(HLS_UP)
 
 /* use this MTU size if none other is given */
 #define HFI1_DEFAULT_ACTIVE_MTU 8192
