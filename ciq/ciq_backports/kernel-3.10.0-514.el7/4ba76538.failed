@@ -1,0 +1,159 @@
+KVM: x86: Move TSC scaling logic out of call-back read_l1_tsc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haozhong Zhang <haozhong.zhang@intel.com>
+commit 4ba76538dd52dd9b18b464e509cb8f3ed4ed993f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4ba76538.failed
+
+Both VMX and SVM scales the host TSC in the same way in call-back
+read_l1_tsc(), so this patch moves the scaling logic from call-back
+read_l1_tsc() to a common function kvm_read_l1_tsc().
+
+	Signed-off-by: Haozhong Zhang <haozhong.zhang@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4ba76538dd52dd9b18b464e509cb8f3ed4ed993f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/lapic.c
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index c40aad26d942,456a3869a57e..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1172,6 -1225,9 +1172,12 @@@ void kvm_arch_mmu_notifier_invalidate_p
+  void kvm_define_shared_msr(unsigned index, u32 msr);
+  int kvm_set_shared_msr(unsigned index, u64 val, u64 mask);
+  
+++<<<<<<< HEAD
+++=======
++ u64 kvm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc);
++ u64 kvm_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc);
++ 
+++>>>>>>> 4ba76538dd52 (KVM: x86: Move TSC scaling logic out of call-back read_l1_tsc())
+  unsigned long kvm_get_linear_rip(struct kvm_vcpu *vcpu);
+  bool kvm_is_linear_rip(struct kvm_vcpu *vcpu, unsigned long linear_rip);
+  
+diff --cc arch/x86/kvm/lapic.c
+index 37f736cffd24,4d30b865be30..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1185,7 -1250,7 +1185,11 @@@ void wait_lapic_expire(struct kvm_vcpu 
+  
+  	tsc_deadline = apic->lapic_timer.expired_tscdeadline;
+  	apic->lapic_timer.expired_tscdeadline = 0;
+++<<<<<<< HEAD
+ +	guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu, native_read_tsc());
+++=======
++ 	guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+++>>>>>>> 4ba76538dd52 (KVM: x86: Move TSC scaling logic out of call-back read_l1_tsc())
+  	trace_kvm_wait_lapic_expire(vcpu->vcpu_id, guest_tsc - tsc_deadline);
+  
+  	/* __delay is delay_tsc whenever the hardware has TSC, thus always.  */
+@@@ -1283,7 -1318,7 +1287,11 @@@ static void start_apic_timer(struct kvm
+  		local_irq_save(flags);
+  
+  		now = apic->lapic_timer.timer.base->get_time();
+++<<<<<<< HEAD
+ +		guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu, native_read_tsc());
+++=======
++ 		guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+++>>>>>>> 4ba76538dd52 (KVM: x86: Move TSC scaling logic out of call-back read_l1_tsc())
+  		if (likely(tscdeadline > guest_tsc)) {
+  			ns = (tscdeadline - guest_tsc) * 1000000ULL;
+  			do_div(ns, this_tsc_khz);
+diff --cc arch/x86/kvm/svm.c
+index f4d872b9eba6,f2ba91990b4e..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -3062,8 -2984,7 +3062,12 @@@ static int cr8_write_interception(struc
+  static u64 svm_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc)
+  {
+  	struct vmcb *vmcb = get_host_vmcb(to_svm(vcpu));
+++<<<<<<< HEAD
+ +	return vmcb->control.tsc_offset +
+ +		svm_scale_tsc(vcpu, host_tsc);
+++=======
++ 	return vmcb->control.tsc_offset + host_tsc;
+++>>>>>>> 4ba76538dd52 (KVM: x86: Move TSC scaling logic out of call-back read_l1_tsc())
+  }
+  
+  static int svm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+diff --cc arch/x86/kvm/x86.c
+index 24f418aad1ea,3d008de9cb05..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1310,6 -1365,48 +1310,51 @@@ static void update_ia32_tsc_adjust_msr(
+  	vcpu->arch.ia32_tsc_adjust_msr += offset - curr_offset;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Multiply tsc by a fixed point number represented by ratio.
++  *
++  * The most significant 64-N bits (mult) of ratio represent the
++  * integral part of the fixed point number; the remaining N bits
++  * (frac) represent the fractional part, ie. ratio represents a fixed
++  * point number (mult + frac * 2^(-N)).
++  *
++  * N equals to kvm_tsc_scaling_ratio_frac_bits.
++  */
++ static inline u64 __scale_tsc(u64 ratio, u64 tsc)
++ {
++ 	return mul_u64_u64_shr(tsc, ratio, kvm_tsc_scaling_ratio_frac_bits);
++ }
++ 
++ u64 kvm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc)
++ {
++ 	u64 _tsc = tsc;
++ 	u64 ratio = vcpu->arch.tsc_scaling_ratio;
++ 
++ 	if (ratio != kvm_default_tsc_scaling_ratio)
++ 		_tsc = __scale_tsc(ratio, tsc);
++ 
++ 	return _tsc;
++ }
++ EXPORT_SYMBOL_GPL(kvm_scale_tsc);
++ 
++ static u64 kvm_compute_tsc_offset(struct kvm_vcpu *vcpu, u64 target_tsc)
++ {
++ 	u64 tsc;
++ 
++ 	tsc = kvm_scale_tsc(vcpu, rdtsc());
++ 
++ 	return target_tsc - tsc;
++ }
++ 
++ u64 kvm_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc)
++ {
++ 	return kvm_x86_ops->read_l1_tsc(vcpu, kvm_scale_tsc(vcpu, host_tsc));
++ }
++ EXPORT_SYMBOL_GPL(kvm_read_l1_tsc);
++ 
+++>>>>>>> 4ba76538dd52 (KVM: x86: Move TSC scaling logic out of call-back read_l1_tsc())
+  void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+  {
+  	struct kvm *kvm = vcpu->kvm;
+@@@ -6833,8 -6551,7 +6878,12 @@@ static int vcpu_enter_guest(struct kvm_
+  	if (hw_breakpoint_active())
+  		hw_breakpoint_restore();
+  
+++<<<<<<< HEAD
+ +	vcpu->arch.last_guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu,
+ +							   native_read_tsc());
+++=======
++ 	vcpu->arch.last_guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+++>>>>>>> 4ba76538dd52 (KVM: x86: Move TSC scaling logic out of call-back read_l1_tsc())
+  
+  	vcpu->mode = OUTSIDE_GUEST_MODE;
+  	smp_wmb();
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/lapic.c
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/x86.c
