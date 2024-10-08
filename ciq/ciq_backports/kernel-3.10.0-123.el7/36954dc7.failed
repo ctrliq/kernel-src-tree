@@ -1,0 +1,123 @@
+powerpc/powernv: Reserve the correct PE number
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Reserve the correct PE number (Steve Best) [1033086]
+Rebuild_FUZZ: 90.48%
+commit-author Gavin Shan <shangw@linux.vnet.ibm.com>
+commit 36954dc78d8a1dcd4780cf4bd0fc6292791821b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/36954dc7.failed
+
+We're assigning PE numbers after the completion of PCI probe. During
+the PCI probe, we had PE#0 as the super container to encompass all
+PCI devices. However, that's inappropriate since PELTM has ascending
+order of priority on search on P7IOC. So we need PE#127 takes the
+role that PE#0 has previously. For PHB3, we still have PE#0 as the
+reserved PE.
+
+The patch supposes that the underly firmware has built the RID to
+PE# mapping after resetting IODA tables: all PELTM entries except
+last one has invalid mapping on P7IOC, but all RTEs have binding
+to PE#0. The reserved PE# is being exported by firmware by device
+tree.
+
+	Signed-off-by: Gavin Shan <shangw@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 36954dc78d8a1dcd4780cf4bd0fc6292791821b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+#	arch/powerpc/platforms/powernv/pci.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index dd7063409cff,084cdfa40682..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -1157,12 -1209,13 +1157,21 @@@ void __init pnv_pci_init_ioda_phb(struc
+  		pr_err("  Failed to map registers !\n");
+  
+  	/* Initialize more IODA stuff */
++ 	phb->ioda.total_pe = 1;
+  	prop32 = of_get_property(np, "ibm,opal-num-pes", NULL);
+++<<<<<<< HEAD
+ +	if (!prop32)
+ +		phb->ioda.total_pe = 1;
+ +	else
+ +		phb->ioda.total_pe = *prop32;
+ +
+++=======
++ 	if (prop32)
++ 		phb->ioda.total_pe = be32_to_cpup(prop32);
++ 	prop32 = of_get_property(np, "ibm,opal-reserved-pe", NULL);
++ 	if (prop32)
++ 		phb->ioda.reserved_pe = be32_to_cpup(prop32);
+++>>>>>>> 36954dc78d8a (powerpc/powernv: Reserve the correct PE number)
+  	phb->ioda.m32_size = resource_size(&hose->mem_resources[0]);
+  	/* FW Has already off top 64k of M32 space (MSI space) */
+  	phb->ioda.m32_size += 0x10000;
+@@@ -1254,16 -1309,9 +1265,9 @@@
+  	rc = opal_pci_reset(phb_id, OPAL_PCI_IODA_TABLE_RESET, OPAL_ASSERT_RESET);
+  	if (rc)
+  		pr_warning("  OPAL Error %ld performing IODA table reset !\n", rc);
+- 
+- 	/*
+- 	 * On IODA1 map everything to PE#0, on IODA2 we assume the IODA reset
+- 	 * has cleared the RTT which has the same effect
+- 	 */
+- 	if (ioda_type == PNV_PHB_IODA1)
+- 		opal_pci_set_pe(phb_id, 0, 0, 7, 1, 1 , OPAL_MAP_PE);
+  }
+  
+ -void __init pnv_pci_init_ioda2_phb(struct device_node *np)
+ +void pnv_pci_init_ioda2_phb(struct device_node *np)
+  {
+  	pnv_pci_init_ioda_phb(np, 0, PNV_PHB_IODA2);
+  }
+diff --cc arch/powerpc/platforms/powernv/pci.c
+index 6d9a506b541a,4eb33a9ed532..000000000000
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@@ -235,11 -236,21 +235,26 @@@ static void pnv_pci_config_check_eeh(st
+  {
+  	s64	rc;
+  	u8	fstate;
+ -	__be16	pcierr;
+ +	u16	pcierr;
+  	u32	pe_no;
+  
+++<<<<<<< HEAD
+ +	/* Get PE# if we support IODA */
+ +	pe_no = phb->bdfn_to_pe ? phb->bdfn_to_pe(phb, bus, bdfn & 0xff) : 0;
+++=======
++ 	/*
++ 	 * Get the PE#. During the PCI probe stage, we might not
++ 	 * setup that yet. So all ER errors should be mapped to
++ 	 * reserved PE.
++ 	 */
++ 	pe_no = PCI_DN(dn)->pe_number;
++ 	if (pe_no == IODA_INVALID_PE) {
++ 		if (phb->type == PNV_PHB_P5IOC2)
++ 			pe_no = 0;
++ 		else
++ 			pe_no = phb->ioda.reserved_pe;
++ 	}
+++>>>>>>> 36954dc78d8a (powerpc/powernv: Reserve the correct PE number)
+  
+  	/* Read freeze status */
+  	rc = opal_pci_eeh_freeze_status(phb->opal_id, pe_no, &fstate, &pcierr,
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
+* Unmerged path arch/powerpc/platforms/powernv/pci.c
+diff --git a/arch/powerpc/platforms/powernv/pci.h b/arch/powerpc/platforms/powernv/pci.h
+index c0f40dc6aab1..fda11039b9f7 100644
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@ -96,6 +96,7 @@ struct pnv_phb {
+ 		struct {
+ 			/* Global bridge info */
+ 			unsigned int		total_pe;
++			unsigned int		reserved_pe;
+ 			unsigned int		m32_size;
+ 			unsigned int		m32_segsize;
+ 			unsigned int		m32_pci_base;
