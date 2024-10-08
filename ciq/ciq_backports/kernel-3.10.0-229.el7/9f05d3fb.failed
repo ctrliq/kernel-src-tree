@@ -1,0 +1,104 @@
+iommu/vt-d: Fix get_domain_for_dev() handling of upstream PCIe bridges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Fix get_domain_for_dev() handling of upstream PCIe bridges (Myron Stowe) [1129880 1087643]
+Rebuild_FUZZ: 95.52%
+commit-author David Woodhouse <David.Woodhouse@intel.com>
+commit 9f05d3fb644bf178c169d9c70dcfe360e3a006ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9f05d3fb.failed
+
+Commit 146922ec79 ("iommu/vt-d: Make get_domain_for_dev() take struct
+device") introduced new variables bridge_bus and bridge_devfn to
+identify the upstream PCIe to PCI bridge responsible for the given
+target device. Leaving the original bus/devfn variables to identify
+the target device itself, now that it is no longer assumed to be PCI
+and we can no longer trivially find that information.
+
+However, the patch failed to correctly use the new variables in all
+cases; instead using the as-yet-uninitialised 'bus' and 'devfn'
+variables.
+
+	Reported-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 9f05d3fb644bf178c169d9c70dcfe360e3a006ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 3869cde5d60a,f256ffc02e29..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -2093,35 -2222,41 +2093,60 @@@ static struct dmar_domain *get_domain_f
+  	if (domain)
+  		return domain;
+  
+ -	if (dev_is_pci(dev)) {
+ -		struct pci_dev *pdev = to_pci_dev(dev);
+ -		u16 segment;
+ +	segment = pci_domain_nr(pdev->bus);
+  
+++<<<<<<< HEAD
+ +	dev_tmp = pci_find_upstream_pcie_bridge(pdev);
+ +	if (dev_tmp) {
+ +		if (pci_is_pcie(dev_tmp)) {
+ +			bus = dev_tmp->subordinate->number;
+ +			devfn = 0;
+ +		} else {
+ +			bus = dev_tmp->bus->number;
+ +			devfn = dev_tmp->devfn;
+++=======
++ 		segment = pci_domain_nr(pdev->bus);
++ 		dev_tmp = pci_find_upstream_pcie_bridge(pdev);
++ 		if (dev_tmp) {
++ 			if (pci_is_pcie(dev_tmp)) {
++ 				bridge_bus = dev_tmp->subordinate->number;
++ 				bridge_devfn = 0;
++ 			} else {
++ 				bridge_bus = dev_tmp->bus->number;
++ 				bridge_devfn = dev_tmp->devfn;
++ 			}
++ 			spin_lock_irqsave(&device_domain_lock, flags);
++ 			info = dmar_search_domain_by_dev_info(segment,
++ 							      bridge_bus,
++ 							      bridge_devfn);
++ 			if (info) {
++ 				iommu = info->iommu;
++ 				domain = info->domain;
++ 			}
++ 			spin_unlock_irqrestore(&device_domain_lock, flags);
++ 			/* pcie-pci bridge already has a domain, uses it */
++ 			if (info)
++ 				goto found_domain;
+++>>>>>>> 9f05d3fb644b (iommu/vt-d: Fix get_domain_for_dev() handling of upstream PCIe bridges)
+  		}
+ +		spin_lock_irqsave(&device_domain_lock, flags);
+ +		domain = dmar_search_domain_by_dev_info(segment, bus, devfn);
+ +		spin_unlock_irqrestore(&device_domain_lock, flags);
+ +		/* pcie-pci bridge already has a domain, uses it */
+ +		if (domain)
+ +			goto found_domain;
+  	}
+  
+ -	iommu = device_to_iommu(dev, &bus, &devfn);
+ -	if (!iommu)
+ -		goto error;
+ +	drhd = dmar_find_matched_drhd_unit(pdev);
+ +	if (!drhd) {
+ +		printk(KERN_ERR "IOMMU: can't find DMAR for device %s\n",
+ +			pci_name(pdev));
+ +		return NULL;
+ +	}
+ +	iommu = drhd->iommu;
+  
+ -	/* Allocate and initialize new domain for the device */
+ -	domain = alloc_domain(false);
+ +	/* Allocate and intialize new domain for the device */
+ +	domain = alloc_domain();
+  	if (!domain)
+  		goto error;
+  	if (iommu_attach_domain(domain, iommu)) {
+* Unmerged path drivers/iommu/intel-iommu.c
