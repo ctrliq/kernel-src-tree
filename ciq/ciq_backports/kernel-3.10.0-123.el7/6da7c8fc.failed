@@ -1,0 +1,471 @@
+qdisc: allow setting default queuing discipline
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 6da7c8fcbcbdb50ec68c61b40d554c74850fdb91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6da7c8fc.failed
+
+By default, the pfifo_fast queue discipline has been used by default
+for all devices. But we have better choices now.
+
+This patch allow setting the default queueing discipline with sysctl.
+This allows easy use of better queueing disciplines on all devices
+without having to use tc qdisc scripts. It is intended to allow
+an easy path for distributions to make fq_codel or sfq the default
+qdisc.
+
+This patch also makes pfifo_fast more of a first class qdisc, since
+it is now possible to manually override the default and explicitly
+use pfifo_fast. The behavior for systems who do not use the sysctl
+is unchanged, they still get pfifo_fast
+
+Also removes leftover random # in sysctl net core.
+
+	Signed-off-by: Stephen Hemminger <stephen@networkplumber.org>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6da7c8fcbcbdb50ec68c61b40d554c74850fdb91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sysctl/net.txt
+#	net/core/sysctl_net_core.c
+diff --cc Documentation/sysctl/net.txt
+index 98335b7a5337,9a0319a82470..000000000000
+--- a/Documentation/sysctl/net.txt
++++ b/Documentation/sysctl/net.txt
+@@@ -50,6 -50,43 +50,46 @@@ The maximum number of packets that kern
+  it's a Per-CPU variable.
+  Default: 64
+  
+++<<<<<<< HEAD
+++=======
++ default_qdisc
++ --------------
++ 
++ The default queuing discipline to use for network devices. This allows
++ overriding the default queue discipline of pfifo_fast with an
++ alternative. Since the default queuing discipline is created with the
++ no additional parameters so is best suited to queuing disciplines that
++ work well without configuration like stochastic fair queue (sfq),
++ CoDel (codel) or fair queue CoDel (fq_codel). Don't use queuing disciplines
++ like Hierarchical Token Bucket or Deficit Round Robin which require setting
++ up classes and bandwidths.
++ Default: pfifo_fast
++ 
++ busy_read
++ ----------------
++ Low latency busy poll timeout for socket reads. (needs CONFIG_NET_RX_BUSY_POLL)
++ Approximate time in us to busy loop waiting for packets on the device queue.
++ This sets the default value of the SO_BUSY_POLL socket option.
++ Can be set or overridden per socket by setting socket option SO_BUSY_POLL,
++ which is the preferred method of enabling. If you need to enable the feature
++ globally via sysctl, a value of 50 is recommended.
++ Will increase power usage.
++ Default: 0 (off)
++ 
++ busy_poll
++ ----------------
++ Low latency busy poll timeout for poll and select. (needs CONFIG_NET_RX_BUSY_POLL)
++ Approximate time in us to busy loop waiting for events.
++ Recommended value depends on the number of sockets you poll on.
++ For several sockets 50, for several hundreds 100.
++ For more than that you probably want to use epoll.
++ Note that only sockets with SO_BUSY_POLL set will be busy polled,
++ so you want to either selectively set SO_BUSY_POLL on those sockets or set
++ sysctl.net.busy_read globally.
++ Will increase power usage.
++ Default: 0 (off)
++ 
+++>>>>>>> 6da7c8fcbcbd (qdisc: allow setting default queuing discipline)
+  rmem_default
+  ------------
+  
+diff --cc net/core/sysctl_net_core.c
+index cfdb46ab3a7f,cca444190907..000000000000
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@@ -19,11 -19,15 +19,16 @@@
+  #include <net/ip.h>
+  #include <net/sock.h>
+  #include <net/net_ratelimit.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/busy_poll.h>
++ #include <net/pkt_sched.h>
+++>>>>>>> 6da7c8fcbcbd (qdisc: allow setting default queuing discipline)
+  
+ -static int zero = 0;
+  static int one = 1;
+ -static int ushort_max = USHRT_MAX;
+  
+  #ifdef CONFIG_RPS
+ -static int rps_sock_flow_sysctl(struct ctl_table *table, int write,
+ +static int rps_sock_flow_sysctl(ctl_table *table, int write,
+  				void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+  	unsigned int orig_size, size;
+@@@ -87,6 -91,129 +92,132 @@@
+  }
+  #endif /* CONFIG_RPS */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_FLOW_LIMIT
++ static DEFINE_MUTEX(flow_limit_update_mutex);
++ 
++ static int flow_limit_cpu_sysctl(struct ctl_table *table, int write,
++ 				 void __user *buffer, size_t *lenp,
++ 				 loff_t *ppos)
++ {
++ 	struct sd_flow_limit *cur;
++ 	struct softnet_data *sd;
++ 	cpumask_var_t mask;
++ 	int i, len, ret = 0;
++ 
++ 	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
++ 		return -ENOMEM;
++ 
++ 	if (write) {
++ 		ret = cpumask_parse_user(buffer, *lenp, mask);
++ 		if (ret)
++ 			goto done;
++ 
++ 		mutex_lock(&flow_limit_update_mutex);
++ 		len = sizeof(*cur) + netdev_flow_limit_table_len;
++ 		for_each_possible_cpu(i) {
++ 			sd = &per_cpu(softnet_data, i);
++ 			cur = rcu_dereference_protected(sd->flow_limit,
++ 				     lockdep_is_held(&flow_limit_update_mutex));
++ 			if (cur && !cpumask_test_cpu(i, mask)) {
++ 				RCU_INIT_POINTER(sd->flow_limit, NULL);
++ 				synchronize_rcu();
++ 				kfree(cur);
++ 			} else if (!cur && cpumask_test_cpu(i, mask)) {
++ 				cur = kzalloc(len, GFP_KERNEL);
++ 				if (!cur) {
++ 					/* not unwinding previous changes */
++ 					ret = -ENOMEM;
++ 					goto write_unlock;
++ 				}
++ 				cur->num_buckets = netdev_flow_limit_table_len;
++ 				rcu_assign_pointer(sd->flow_limit, cur);
++ 			}
++ 		}
++ write_unlock:
++ 		mutex_unlock(&flow_limit_update_mutex);
++ 	} else {
++ 		char kbuf[128];
++ 
++ 		if (*ppos || !*lenp) {
++ 			*lenp = 0;
++ 			goto done;
++ 		}
++ 
++ 		cpumask_clear(mask);
++ 		rcu_read_lock();
++ 		for_each_possible_cpu(i) {
++ 			sd = &per_cpu(softnet_data, i);
++ 			if (rcu_dereference(sd->flow_limit))
++ 				cpumask_set_cpu(i, mask);
++ 		}
++ 		rcu_read_unlock();
++ 
++ 		len = min(sizeof(kbuf) - 1, *lenp);
++ 		len = cpumask_scnprintf(kbuf, len, mask);
++ 		if (!len) {
++ 			*lenp = 0;
++ 			goto done;
++ 		}
++ 		if (len < *lenp)
++ 			kbuf[len++] = '\n';
++ 		if (copy_to_user(buffer, kbuf, len)) {
++ 			ret = -EFAULT;
++ 			goto done;
++ 		}
++ 		*lenp = len;
++ 		*ppos += len;
++ 	}
++ 
++ done:
++ 	free_cpumask_var(mask);
++ 	return ret;
++ }
++ 
++ static int flow_limit_table_len_sysctl(struct ctl_table *table, int write,
++ 				       void __user *buffer, size_t *lenp,
++ 				       loff_t *ppos)
++ {
++ 	unsigned int old, *ptr;
++ 	int ret;
++ 
++ 	mutex_lock(&flow_limit_update_mutex);
++ 
++ 	ptr = table->data;
++ 	old = *ptr;
++ 	ret = proc_dointvec(table, write, buffer, lenp, ppos);
++ 	if (!ret && write && !is_power_of_2(*ptr)) {
++ 		*ptr = old;
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	mutex_unlock(&flow_limit_update_mutex);
++ 	return ret;
++ }
++ #endif /* CONFIG_NET_FLOW_LIMIT */
++ 
++ #ifdef CONFIG_NET_SCHED
++ static int set_default_qdisc(struct ctl_table *table, int write,
++ 			     void __user *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	char id[IFNAMSIZ];
++ 	struct ctl_table tbl = {
++ 		.data = id,
++ 		.maxlen = IFNAMSIZ,
++ 	};
++ 	int ret;
++ 
++ 	qdisc_get_default(id, IFNAMSIZ);
++ 
++ 	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
++ 	if (write && ret == 0)
++ 		ret = qdisc_set_default(id);
++ 	return ret;
++ }
++ #endif
++ 
+++>>>>>>> 6da7c8fcbcbd (qdisc: allow setting default queuing discipline)
+  static struct ctl_table net_core_table[] = {
+  #ifdef CONFIG_NET
+  	{
+@@@ -180,6 -307,44 +311,47 @@@
+  		.proc_handler	= rps_sock_flow_sysctl
+  	},
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_FLOW_LIMIT
++ 	{
++ 		.procname	= "flow_limit_cpu_bitmap",
++ 		.mode		= 0644,
++ 		.proc_handler	= flow_limit_cpu_sysctl
++ 	},
++ 	{
++ 		.procname	= "flow_limit_table_len",
++ 		.data		= &netdev_flow_limit_table_len,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= flow_limit_table_len_sysctl
++ 	},
++ #endif /* CONFIG_NET_FLOW_LIMIT */
++ #ifdef CONFIG_NET_RX_BUSY_POLL
++ 	{
++ 		.procname	= "busy_poll",
++ 		.data		= &sysctl_net_busy_poll,
++ 		.maxlen		= sizeof(unsigned int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "busy_read",
++ 		.data		= &sysctl_net_busy_read,
++ 		.maxlen		= sizeof(unsigned int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ #endif
++ #ifdef CONFIG_NET_SCHED
++ 	{
++ 		.procname	= "default_qdisc",
++ 		.mode		= 0644,
++ 		.maxlen		= IFNAMSIZ,
++ 		.proc_handler	= set_default_qdisc
++ 	},
++ #endif
+++>>>>>>> 6da7c8fcbcbd (qdisc: allow setting default queuing discipline)
+  #endif /* CONFIG_NET */
+  	{
+  		.procname	= "netdev_budget",
+* Unmerged path Documentation/sysctl/net.txt
+diff --git a/include/net/pkt_sched.h b/include/net/pkt_sched.h
+index f7c24f8fbdc5..59ec3cd15d68 100644
+--- a/include/net/pkt_sched.h
++++ b/include/net/pkt_sched.h
+@@ -85,6 +85,9 @@ struct Qdisc *fifo_create_dflt(struct Qdisc *sch, struct Qdisc_ops *ops,
+ 
+ int register_qdisc(struct Qdisc_ops *qops);
+ int unregister_qdisc(struct Qdisc_ops *qops);
++void qdisc_get_default(char *id, size_t len);
++int qdisc_set_default(const char *id);
++
+ void qdisc_list_del(struct Qdisc *q);
+ struct Qdisc *qdisc_lookup(struct net_device *dev, u32 handle);
+ struct Qdisc *qdisc_lookup_class(struct net_device *dev, u32 handle);
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 76368c9d4503..2e31bf14df00 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -316,6 +316,7 @@ extern struct Qdisc noop_qdisc;
+ extern struct Qdisc_ops noop_qdisc_ops;
+ extern struct Qdisc_ops pfifo_fast_ops;
+ extern struct Qdisc_ops mq_qdisc_ops;
++extern const struct Qdisc_ops *default_qdisc_ops;
+ 
+ struct Qdisc_class_common {
+ 	u32			classid;
+* Unmerged path net/core/sysctl_net_core.c
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index 51b968d3febb..812e57900591 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -131,6 +131,11 @@ static DEFINE_RWLOCK(qdisc_mod_lock);
+  ************************************************/
+ 
+ 
++/* Qdisc to use by default */
++
++const struct Qdisc_ops *default_qdisc_ops = &pfifo_fast_ops;
++EXPORT_SYMBOL(default_qdisc_ops);
++
+ /* The list of all installed queueing disciplines. */
+ 
+ static struct Qdisc_ops *qdisc_base;
+@@ -200,6 +205,58 @@ int unregister_qdisc(struct Qdisc_ops *qops)
+ }
+ EXPORT_SYMBOL(unregister_qdisc);
+ 
++/* Get default qdisc if not otherwise specified */
++void qdisc_get_default(char *name, size_t len)
++{
++	read_lock(&qdisc_mod_lock);
++	strlcpy(name, default_qdisc_ops->id, len);
++	read_unlock(&qdisc_mod_lock);
++}
++
++static struct Qdisc_ops *qdisc_lookup_default(const char *name)
++{
++	struct Qdisc_ops *q = NULL;
++
++	for (q = qdisc_base; q; q = q->next) {
++		if (!strcmp(name, q->id)) {
++			if (!try_module_get(q->owner))
++				q = NULL;
++			break;
++		}
++	}
++
++	return q;
++}
++
++/* Set new default qdisc to use */
++int qdisc_set_default(const char *name)
++{
++	const struct Qdisc_ops *ops;
++
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	write_lock(&qdisc_mod_lock);
++	ops = qdisc_lookup_default(name);
++	if (!ops) {
++		/* Not found, drop lock and try to load module */
++		write_unlock(&qdisc_mod_lock);
++		request_module("sch_%s", name);
++		write_lock(&qdisc_mod_lock);
++
++		ops = qdisc_lookup_default(name);
++	}
++
++	if (ops) {
++		/* Set new default */
++		module_put(default_qdisc_ops->owner);
++		default_qdisc_ops = ops;
++	}
++	write_unlock(&qdisc_mod_lock);
++
++	return ops ? 0 : -ENOENT;
++}
++
+ /* We know handle. Find qdisc among all qdisc's attached to device
+    (root qdisc, all its children, children of children etc.)
+  */
+@@ -1854,6 +1911,7 @@ static int __init pktsched_init(void)
+ 		return err;
+ 	}
+ 
++	register_qdisc(&pfifo_fast_ops);
+ 	register_qdisc(&pfifo_qdisc_ops);
+ 	register_qdisc(&bfifo_qdisc_ops);
+ 	register_qdisc(&pfifo_head_drop_qdisc_ops);
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index faacf63aa29c..583e0ecc3a3d 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -525,7 +525,6 @@ struct Qdisc_ops pfifo_fast_ops __read_mostly = {
+ 	.dump		=	pfifo_fast_dump,
+ 	.owner		=	THIS_MODULE,
+ };
+-EXPORT_SYMBOL(pfifo_fast_ops);
+ 
+ static struct lock_class_key qdisc_tx_busylock;
+ 
+@@ -578,6 +577,9 @@ struct Qdisc *qdisc_create_dflt(struct netdev_queue *dev_queue,
+ {
+ 	struct Qdisc *sch;
+ 
++	if (!try_module_get(ops->owner))
++		goto errout;
++
+ 	sch = qdisc_alloc(dev_queue, ops);
+ 	if (IS_ERR(sch))
+ 		goto errout;
+@@ -681,7 +683,7 @@ static void attach_one_default_qdisc(struct net_device *dev,
+ 
+ 	if (dev->tx_queue_len) {
+ 		qdisc = qdisc_create_dflt(dev_queue,
+-					  &pfifo_fast_ops, TC_H_ROOT);
++					  default_qdisc_ops, TC_H_ROOT);
+ 		if (!qdisc) {
+ 			netdev_info(dev, "activation failed\n");
+ 			return;
+@@ -734,9 +736,8 @@ void dev_activate(struct net_device *dev)
+ 	int need_watchdog;
+ 
+ 	/* No queueing discipline is attached to device;
+-	   create default one i.e. pfifo_fast for devices,
+-	   which need queueing and noqueue_qdisc for
+-	   virtual interfaces
++	 * create default one for devices, which need queueing
++	 * and noqueue_qdisc for virtual interfaces
+ 	 */
+ 
+ 	if (dev->qdisc == &noop_qdisc)
+diff --git a/net/sched/sch_mq.c b/net/sched/sch_mq.c
+index 5da78a19ac9a..2e56185736d6 100644
+--- a/net/sched/sch_mq.c
++++ b/net/sched/sch_mq.c
+@@ -57,7 +57,7 @@ static int mq_init(struct Qdisc *sch, struct nlattr *opt)
+ 
+ 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
+ 		dev_queue = netdev_get_tx_queue(dev, ntx);
+-		qdisc = qdisc_create_dflt(dev_queue, &pfifo_fast_ops,
++		qdisc = qdisc_create_dflt(dev_queue, default_qdisc_ops,
+ 					  TC_H_MAKE(TC_H_MAJ(sch->handle),
+ 						    TC_H_MIN(ntx + 1)));
+ 		if (qdisc == NULL)
+diff --git a/net/sched/sch_mqprio.c b/net/sched/sch_mqprio.c
+index accec33c454c..d44c868cb537 100644
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@ -124,7 +124,7 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt)
+ 
+ 	for (i = 0; i < dev->num_tx_queues; i++) {
+ 		dev_queue = netdev_get_tx_queue(dev, i);
+-		qdisc = qdisc_create_dflt(dev_queue, &pfifo_fast_ops,
++		qdisc = qdisc_create_dflt(dev_queue, default_qdisc_ops,
+ 					  TC_H_MAKE(TC_H_MAJ(sch->handle),
+ 						    TC_H_MIN(i + 1)));
+ 		if (qdisc == NULL) {
