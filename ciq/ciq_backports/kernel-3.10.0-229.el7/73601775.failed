@@ -1,0 +1,197 @@
+KVM: PPC: Book3S: MMIO emulation support for little endian guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: book3s - MMIO emulation support for little endian guests (Don Zickus) [1127366]
+Rebuild_FUZZ: 95.38%
+commit-author Cédric Le Goater <clg@fr.ibm.com>
+commit 736017752d2f6ed0d64f5e15cf48e79779b11c85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/73601775.failed
+
+MMIO emulation reads the last instruction executed by the guest
+and then emulates. If the guest is running in Little Endian order,
+or more generally in a different endian order of the host, the
+instruction needs to be byte-swapped before being emulated.
+
+This patch adds a helper routine which tests the endian order of
+the host and the guest in order to decide whether a byteswap is
+needed or not. It is then used to byteswap the last instruction
+of the guest in the endian order of the host before MMIO emulation
+is performed.
+
+Finally, kvmppc_handle_load() of kvmppc_handle_store() are modified
+to reverse the endianness of the MMIO if required.
+
+	Signed-off-by: Cédric Le Goater <clg@fr.ibm.com>
+[agraf: add booke handling]
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 736017752d2f6ed0d64f5e15cf48e79779b11c85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s.h
+diff --cc arch/powerpc/include/asm/kvm_book3s.h
+index 99ef8711e906,1e9c26f45d18..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@@ -268,18 -264,27 +268,28 @@@ static inline ulong kvmppc_get_pc(struc
+  	return vcpu->arch.pc;
+  }
+  
+++<<<<<<< HEAD
+ +static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+++=======
++ static inline bool kvmppc_need_byteswap(struct kvm_vcpu *vcpu)
++ {
++ 	return (vcpu->arch.shared->msr & MSR_LE) != (MSR_KERNEL & MSR_LE);
++ }
++ 
++ static inline u32 kvmppc_get_last_inst_internal(struct kvm_vcpu *vcpu, ulong pc)
+++>>>>>>> 736017752d2f (KVM: PPC: Book3S: MMIO emulation support for little endian guests)
+  {
+ +	ulong pc = kvmppc_get_pc(vcpu);
+ +
+  	/* Load the instruction manually if it failed to do so in the
+  	 * exit path */
+  	if (vcpu->arch.last_inst == KVM_INST_FETCH_FAILED)
+  		kvmppc_ld(vcpu, &pc, sizeof(u32), &vcpu->arch.last_inst, false);
+  
+- 	return vcpu->arch.last_inst;
++ 	return kvmppc_need_byteswap(vcpu) ? swab32(vcpu->arch.last_inst) :
++ 		vcpu->arch.last_inst;
+  }
+  
+ -static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+ -{
+ -	return kvmppc_get_last_inst_internal(vcpu, kvmppc_get_pc(vcpu));
+ -}
+ -
+  /*
+   * Like kvmppc_get_last_inst(), but for fetching a sc instruction.
+   * Because the sc instruction sets SRR0 to point to the following
+* Unmerged path arch/powerpc/include/asm/kvm_book3s.h
+diff --git a/arch/powerpc/include/asm/kvm_booke.h b/arch/powerpc/include/asm/kvm_booke.h
+index d3c1eb34c986..0ce56fbadbdf 100644
+--- a/arch/powerpc/include/asm/kvm_booke.h
++++ b/arch/powerpc/include/asm/kvm_booke.h
+@@ -58,6 +58,12 @@ static inline u32 kvmppc_get_xer(struct kvm_vcpu *vcpu)
+ 	return vcpu->arch.xer;
+ }
+ 
++static inline bool kvmppc_need_byteswap(struct kvm_vcpu *vcpu)
++{
++	/* XXX Would need to check TLB entry */
++	return false;
++}
++
+ static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+ {
+ 	return vcpu->arch.last_inst;
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 1823f38906c6..e5a1788e0565 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -54,12 +54,13 @@ extern void kvmppc_handler_highmem(void);
+ extern void kvmppc_dump_vcpu(struct kvm_vcpu *vcpu);
+ extern int kvmppc_handle_load(struct kvm_run *run, struct kvm_vcpu *vcpu,
+                               unsigned int rt, unsigned int bytes,
+-                              int is_bigendian);
++			      int is_default_endian);
+ extern int kvmppc_handle_loads(struct kvm_run *run, struct kvm_vcpu *vcpu,
+                                unsigned int rt, unsigned int bytes,
+-                               int is_bigendian);
++			       int is_default_endian);
+ extern int kvmppc_handle_store(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                               u64 val, unsigned int bytes, int is_bigendian);
++			       u64 val, unsigned int bytes,
++			       int is_default_endian);
+ 
+ extern int kvmppc_emulate_instruction(struct kvm_run *run,
+                                       struct kvm_vcpu *vcpu);
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index c420372ed942..edbcc7db163e 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -566,7 +566,7 @@ static int kvmppc_hv_emulate_mmio(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	 * we just return and retry the instruction.
+ 	 */
+ 
+-	if (instruction_is_store(vcpu->arch.last_inst) != !!is_store)
++	if (instruction_is_store(kvmppc_get_last_inst(vcpu)) != !!is_store)
+ 		return RESUME_GUEST;
+ 
+ 	/*
+diff --git a/arch/powerpc/kvm/emulate.c b/arch/powerpc/kvm/emulate.c
+index 6d20566d074e..467ddca7e40d 100644
+--- a/arch/powerpc/kvm/emulate.c
++++ b/arch/powerpc/kvm/emulate.c
+@@ -216,7 +216,6 @@ static int kvmppc_emulate_mfspr(struct kvm_vcpu *vcpu, int sprn, int rt)
+  * lmw
+  * stmw
+  *
+- * XXX is_bigendian should depend on MMU mapping or MSR[LE]
+  */
+ /* XXX Should probably auto-generate instruction decoding for a particular core
+  * from opcode tables in the future. */
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index 126467ebd44f..aa5098c3bded 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -625,9 +625,19 @@ static void kvmppc_complete_mmio_load(struct kvm_vcpu *vcpu,
+ }
+ 
+ int kvmppc_handle_load(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                       unsigned int rt, unsigned int bytes, int is_bigendian)
++		       unsigned int rt, unsigned int bytes,
++		       int is_default_endian)
+ {
+ 	int idx, ret;
++	int is_bigendian;
++
++	if (kvmppc_need_byteswap(vcpu)) {
++		/* Default endianness is "little endian". */
++		is_bigendian = !is_default_endian;
++	} else {
++		/* Default endianness is "big endian". */
++		is_bigendian = is_default_endian;
++	}
+ 
+ 	if (bytes > sizeof(run->mmio.data)) {
+ 		printk(KERN_ERR "%s: bad MMIO length: %d\n", __func__,
+@@ -662,21 +672,31 @@ int kvmppc_handle_load(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 
+ /* Same as above, but sign extends */
+ int kvmppc_handle_loads(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                        unsigned int rt, unsigned int bytes, int is_bigendian)
++			unsigned int rt, unsigned int bytes,
++			int is_default_endian)
+ {
+ 	int r;
+ 
+ 	vcpu->arch.mmio_sign_extend = 1;
+-	r = kvmppc_handle_load(run, vcpu, rt, bytes, is_bigendian);
++	r = kvmppc_handle_load(run, vcpu, rt, bytes, is_default_endian);
+ 
+ 	return r;
+ }
+ 
+ int kvmppc_handle_store(struct kvm_run *run, struct kvm_vcpu *vcpu,
+-                        u64 val, unsigned int bytes, int is_bigendian)
++			u64 val, unsigned int bytes, int is_default_endian)
+ {
+ 	void *data = run->mmio.data;
+ 	int idx, ret;
++	int is_bigendian;
++
++	if (kvmppc_need_byteswap(vcpu)) {
++		/* Default endianness is "little endian". */
++		is_bigendian = !is_default_endian;
++	} else {
++		/* Default endianness is "big endian". */
++		is_bigendian = is_default_endian;
++	}
+ 
+ 	if (bytes > sizeof(run->mmio.data)) {
+ 		printk(KERN_ERR "%s: bad MMIO length: %d\n", __func__,
