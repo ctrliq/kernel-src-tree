@@ -1,0 +1,204 @@
+ALSA: hda - Move snd page allocation to ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [alsa] hda: Move snd page allocation to ops (Jaroslav Kysela) [1112200]
+Rebuild_FUZZ: 88.61%
+commit-author Dylan Reid <dgreid@chromium.org>
+commit b419b35be45f858830e9e0e44741d8de91b3df07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b419b35b.failed
+
+Break out the allocation of pages for DMA and PCM buffers to ops in
+the chip structure.  This is done to allow for architecture specific
+work-arounds to be added.  Currently mark_pages_wc is used by
+hda_intel.  This avoids needing to move that x86-specific code to a
+common area shared with hda platform drivers.
+
+	Signed-off-by: Dylan Reid <dgreid@chromium.org>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit b419b35be45f858830e9e0e44741d8de91b3df07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_intel.c
+#	sound/pci/hda/hda_priv.h
+diff --cc sound/pci/hda/hda_intel.c
+index f803cf3b4c64,fa3a04c7771e..000000000000
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@@ -372,15 -369,11 +375,23 @@@ static int azx_alloc_cmd_io(struct azx 
+  	int err;
+  
+  	/* single page (at least 4096 bytes) must suffice for both ringbuffes */
+++<<<<<<< HEAD
+ +	err = snd_dma_alloc_pages(SNDRV_DMA_TYPE_DEV,
+ +				  chip->card->dev,
+ +				  PAGE_SIZE, &chip->rb);
+ +	if (err < 0) {
+ +		snd_printk(KERN_ERR SFX "%s: cannot allocate CORB/RIRB\n", pci_name(chip->pci));
+ +		return err;
+ +	}
+ +	mark_pages_wc(chip, &chip->rb, true);
+ +	return 0;
+++=======
++ 	err = chip->ops->dma_alloc_pages(chip, SNDRV_DMA_TYPE_DEV,
++ 					 PAGE_SIZE, &chip->rb);
++ 	if (err < 0)
++ 		dev_err(chip->card->dev, "cannot allocate CORB/RIRB\n");
++ 	return err;
+++>>>>>>> b419b35be45f (ALSA: hda - Move snd page allocation to ops)
+  }
+  
+  static void azx_init_cmd_io(struct azx *chip)
+@@@ -3358,24 -3326,21 +3353,21 @@@ static int azx_first_init(struct azx *c
+  	for (i = 0; i < chip->num_streams; i++) {
+  		dsp_lock_init(&chip->azx_dev[i]);
+  		/* allocate memory for the BDL for each stream */
+- 		err = snd_dma_alloc_pages(SNDRV_DMA_TYPE_DEV,
+- 					  chip->card->dev,
+- 					  BDL_SIZE, &chip->azx_dev[i].bdl);
++ 		err = chip->ops->dma_alloc_pages(chip, SNDRV_DMA_TYPE_DEV,
++ 						 BDL_SIZE,
++ 						 &chip->azx_dev[i].bdl);
+  		if (err < 0) {
+ -			dev_err(card->dev, "cannot allocate BDL\n");
+ +			snd_printk(KERN_ERR SFX "%s: cannot allocate BDL\n", pci_name(chip->pci));
+  			return -ENOMEM;
+  		}
+- 		mark_pages_wc(chip, &chip->azx_dev[i].bdl, true);
+  	}
+  	/* allocate memory for the position buffer */
+- 	err = snd_dma_alloc_pages(SNDRV_DMA_TYPE_DEV,
+- 				  chip->card->dev,
+- 				  chip->num_streams * 8, &chip->posbuf);
++ 	err = chip->ops->dma_alloc_pages(chip, SNDRV_DMA_TYPE_DEV,
++ 					 chip->num_streams * 8, &chip->posbuf);
+  	if (err < 0) {
+ -		dev_err(card->dev, "cannot allocate posbuf\n");
+ +		snd_printk(KERN_ERR SFX "%s: cannot allocate posbuf\n", pci_name(chip->pci));
+  		return -ENOMEM;
+  	}
+- 	mark_pages_wc(chip, &chip->posbuf, true);
+  	/* allocate CORB/RIRB */
+  	err = azx_alloc_cmd_io(chip);
+  	if (err < 0)
+@@@ -3480,6 -3444,70 +3472,73 @@@ static u8 pci_azx_readb(u8 *addr
+  	return readb(addr);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int disable_msi_reset_irq(struct azx *chip)
++ {
++ 	int err;
++ 
++ 	free_irq(chip->irq, chip);
++ 	chip->irq = -1;
++ 	pci_disable_msi(chip->pci);
++ 	chip->msi = 0;
++ 	err = azx_acquire_irq(chip, 1);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ /* DMA page allocation helpers.  */
++ static int dma_alloc_pages(struct azx *chip,
++ 			   int type,
++ 			   size_t size,
++ 			   struct snd_dma_buffer *buf)
++ {
++ 	int err;
++ 
++ 	err = snd_dma_alloc_pages(type,
++ 				  chip->card->dev,
++ 				  size, buf);
++ 	if (err < 0)
++ 		return err;
++ 	mark_pages_wc(chip, buf, true);
++ 	return 0;
++ }
++ 
++ static void dma_free_pages(struct azx *chip, struct snd_dma_buffer *buf)
++ {
++ 	mark_pages_wc(chip, buf, false);
++ 	snd_dma_free_pages(buf);
++ }
++ 
++ static int substream_alloc_pages(struct azx *chip,
++ 				 struct snd_pcm_substream *substream,
++ 				 size_t size)
++ {
++ 	struct azx_dev *azx_dev = get_azx_dev(substream);
++ 	int ret;
++ 
++ 	mark_runtime_wc(chip, azx_dev, substream, false);
++ 	azx_dev->bufsize = 0;
++ 	azx_dev->period_bytes = 0;
++ 	azx_dev->format_val = 0;
++ 	ret = snd_pcm_lib_malloc_pages(substream, size);
++ 	if (ret < 0)
++ 		return ret;
++ 	mark_runtime_wc(chip, azx_dev, substream, true);
++ 	return 0;
++ }
++ 
++ static int substream_free_pages(struct azx *chip,
++ 				struct snd_pcm_substream *substream)
++ {
++ 	struct azx_dev *azx_dev = get_azx_dev(substream);
++ 	mark_runtime_wc(chip, azx_dev, substream, false);
++ 	return snd_pcm_lib_free_pages(substream);
++ }
++ 
+++>>>>>>> b419b35be45f (ALSA: hda - Move snd page allocation to ops)
+  static const struct hda_controller_ops pci_hda_ops = {
+  	.writel = pci_azx_writel,
+  	.readl = pci_azx_readl,
+@@@ -3487,6 -3515,11 +3546,14 @@@
+  	.readw = pci_azx_readw,
+  	.writeb = pci_azx_writeb,
+  	.readb = pci_azx_readb,
+++<<<<<<< HEAD
+++=======
++ 	.disable_msi_reset_irq = disable_msi_reset_irq,
++ 	.dma_alloc_pages = dma_alloc_pages,
++ 	.dma_free_pages = dma_free_pages,
++ 	.substream_alloc_pages = substream_alloc_pages,
++ 	.substream_free_pages = substream_free_pages,
+++>>>>>>> b419b35be45f (ALSA: hda - Move snd page allocation to ops)
+  };
+  
+  static int azx_probe(struct pci_dev *pci,
+diff --cc sound/pci/hda/hda_priv.h
+index c3b3f3090142,10bcec127319..000000000000
+--- a/sound/pci/hda/hda_priv.h
++++ b/sound/pci/hda/hda_priv.h
+@@@ -294,6 -296,19 +294,22 @@@ struct hda_controller_ops 
+  	u16 (*readw)(u16 *addr);
+  	void (*writeb)(u8 value, u8 *addr);
+  	u8 (*readb)(u8 *addr);
+++<<<<<<< HEAD
+++=======
++ 	/* Disable msi if supported, PCI only */
++ 	int (*disable_msi_reset_irq)(struct azx *);
++ 	/* Allocation ops */
++ 	int (*dma_alloc_pages)(struct azx *chip,
++ 			       int type,
++ 			       size_t size,
++ 			       struct snd_dma_buffer *buf);
++ 	void (*dma_free_pages)(struct azx *chip, struct snd_dma_buffer *buf);
++ 	int (*substream_alloc_pages)(struct azx *chip,
++ 				     struct snd_pcm_substream *substream,
++ 				     size_t size);
++ 	int (*substream_free_pages)(struct azx *chip,
++ 				    struct snd_pcm_substream *substream);
+++>>>>>>> b419b35be45f (ALSA: hda - Move snd page allocation to ops)
+  };
+  
+  struct azx_pcm {
+* Unmerged path sound/pci/hda/hda_intel.c
+* Unmerged path sound/pci/hda/hda_priv.h
