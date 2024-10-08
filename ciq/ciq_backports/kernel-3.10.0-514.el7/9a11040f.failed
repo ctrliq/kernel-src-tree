@@ -1,0 +1,321 @@
+x86/efi: Restore 'attr' argument to query_variable_info()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] efi: Restore 'attr' argument to query_variable_info() (Lenny Szubowicz) [1310154]
+Rebuild_FUZZ: 96.36%
+commit-author Matt Fleming <matt.fleming@intel.com>
+commit 9a11040ff962304c1838aa9a9f33be78784eae47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9a11040f.failed
+
+In the thunk patches the 'attr' argument was dropped to
+query_variable_info(). Restore it otherwise the firmware will return
+EFI_INVALID_PARAMETER.
+
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 9a11040ff962304c1838aa9a9f33be78784eae47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi_64.c
+diff --cc arch/x86/platform/efi/efi_64.c
+index 0998f3a536ff,290d397e1dd9..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -268,3 -315,290 +268,293 @@@ void __init efi_dump_pagetable(void
+  	ptdump_walk_pgd_level(NULL, pgd);
+  #endif
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_EFI_MIXED
++ extern efi_status_t efi64_thunk(u32, ...);
++ 
++ #define runtime_service32(func)						 \
++ ({									 \
++ 	u32 table = (u32)(unsigned long)efi.systab;			 \
++ 	u32 *rt, *___f;							 \
++ 									 \
++ 	rt = (u32 *)(table + offsetof(efi_system_table_32_t, runtime));	 \
++ 	___f = (u32 *)(*rt + offsetof(efi_runtime_services_32_t, func)); \
++ 	*___f;								 \
++ })
++ 
++ /*
++  * Switch to the EFI page tables early so that we can access the 1:1
++  * runtime services mappings which are not mapped in any other page
++  * tables. This function must be called before runtime_service32().
++  *
++  * Also, disable interrupts because the IDT points to 64-bit handlers,
++  * which aren't going to function correctly when we switch to 32-bit.
++  */
++ #define efi_thunk(f, ...)						\
++ ({									\
++ 	efi_status_t __s;						\
++ 	unsigned long flags;						\
++ 	u32 func;							\
++ 									\
++ 	efi_sync_low_kernel_mappings();					\
++ 	local_irq_save(flags);						\
++ 									\
++ 	efi_scratch.prev_cr3 = read_cr3();				\
++ 	write_cr3((unsigned long)efi_scratch.efi_pgt);			\
++ 	__flush_tlb_all();						\
++ 									\
++ 	func = runtime_service32(f);					\
++ 	__s = efi64_thunk(func, __VA_ARGS__);			\
++ 									\
++ 	write_cr3(efi_scratch.prev_cr3);				\
++ 	__flush_tlb_all();						\
++ 	local_irq_restore(flags);					\
++ 									\
++ 	__s;								\
++ })
++ 
++ efi_status_t efi_thunk_set_virtual_address_map(
++ 	void *phys_set_virtual_address_map,
++ 	unsigned long memory_map_size,
++ 	unsigned long descriptor_size,
++ 	u32 descriptor_version,
++ 	efi_memory_desc_t *virtual_map)
++ {
++ 	efi_status_t status;
++ 	unsigned long flags;
++ 	u32 func;
++ 
++ 	efi_sync_low_kernel_mappings();
++ 	local_irq_save(flags);
++ 
++ 	efi_scratch.prev_cr3 = read_cr3();
++ 	write_cr3((unsigned long)efi_scratch.efi_pgt);
++ 	__flush_tlb_all();
++ 
++ 	func = (u32)(unsigned long)phys_set_virtual_address_map;
++ 	status = efi64_thunk(func, memory_map_size, descriptor_size,
++ 			     descriptor_version, virtual_map);
++ 
++ 	write_cr3(efi_scratch.prev_cr3);
++ 	__flush_tlb_all();
++ 	local_irq_restore(flags);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t efi_thunk_get_time(efi_time_t *tm, efi_time_cap_t *tc)
++ {
++ 	efi_status_t status;
++ 	u32 phys_tm, phys_tc;
++ 
++ 	spin_lock(&rtc_lock);
++ 
++ 	phys_tm = virt_to_phys(tm);
++ 	phys_tc = virt_to_phys(tc);
++ 
++ 	status = efi_thunk(get_time, phys_tm, phys_tc);
++ 
++ 	spin_unlock(&rtc_lock);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t efi_thunk_set_time(efi_time_t *tm)
++ {
++ 	efi_status_t status;
++ 	u32 phys_tm;
++ 
++ 	spin_lock(&rtc_lock);
++ 
++ 	phys_tm = virt_to_phys(tm);
++ 
++ 	status = efi_thunk(set_time, phys_tm);
++ 
++ 	spin_unlock(&rtc_lock);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t
++ efi_thunk_get_wakeup_time(efi_bool_t *enabled, efi_bool_t *pending,
++ 			  efi_time_t *tm)
++ {
++ 	efi_status_t status;
++ 	u32 phys_enabled, phys_pending, phys_tm;
++ 
++ 	spin_lock(&rtc_lock);
++ 
++ 	phys_enabled = virt_to_phys(enabled);
++ 	phys_pending = virt_to_phys(pending);
++ 	phys_tm = virt_to_phys(tm);
++ 
++ 	status = efi_thunk(get_wakeup_time, phys_enabled,
++ 			     phys_pending, phys_tm);
++ 
++ 	spin_unlock(&rtc_lock);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t
++ efi_thunk_set_wakeup_time(efi_bool_t enabled, efi_time_t *tm)
++ {
++ 	efi_status_t status;
++ 	u32 phys_tm;
++ 
++ 	spin_lock(&rtc_lock);
++ 
++ 	phys_tm = virt_to_phys(tm);
++ 
++ 	status = efi_thunk(set_wakeup_time, enabled, phys_tm);
++ 
++ 	spin_unlock(&rtc_lock);
++ 
++ 	return status;
++ }
++ 
++ 
++ static efi_status_t
++ efi_thunk_get_variable(efi_char16_t *name, efi_guid_t *vendor,
++ 		       u32 *attr, unsigned long *data_size, void *data)
++ {
++ 	efi_status_t status;
++ 	u32 phys_name, phys_vendor, phys_attr;
++ 	u32 phys_data_size, phys_data;
++ 
++ 	phys_data_size = virt_to_phys(data_size);
++ 	phys_vendor = virt_to_phys(vendor);
++ 	phys_name = virt_to_phys(name);
++ 	phys_attr = virt_to_phys(attr);
++ 	phys_data = virt_to_phys(data);
++ 
++ 	status = efi_thunk(get_variable, phys_name, phys_vendor,
++ 			   phys_attr, phys_data_size, phys_data);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t
++ efi_thunk_set_variable(efi_char16_t *name, efi_guid_t *vendor,
++ 		       u32 attr, unsigned long data_size, void *data)
++ {
++ 	u32 phys_name, phys_vendor, phys_data;
++ 	efi_status_t status;
++ 
++ 	phys_name = virt_to_phys(name);
++ 	phys_vendor = virt_to_phys(vendor);
++ 	phys_data = virt_to_phys(data);
++ 
++ 	/* If data_size is > sizeof(u32) we've got problems */
++ 	status = efi_thunk(set_variable, phys_name, phys_vendor,
++ 			   attr, data_size, phys_data);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t
++ efi_thunk_get_next_variable(unsigned long *name_size,
++ 			    efi_char16_t *name,
++ 			    efi_guid_t *vendor)
++ {
++ 	efi_status_t status;
++ 	u32 phys_name_size, phys_name, phys_vendor;
++ 
++ 	phys_name_size = virt_to_phys(name_size);
++ 	phys_vendor = virt_to_phys(vendor);
++ 	phys_name = virt_to_phys(name);
++ 
++ 	status = efi_thunk(get_next_variable, phys_name_size,
++ 			   phys_name, phys_vendor);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t
++ efi_thunk_get_next_high_mono_count(u32 *count)
++ {
++ 	efi_status_t status;
++ 	u32 phys_count;
++ 
++ 	phys_count = virt_to_phys(count);
++ 	status = efi_thunk(get_next_high_mono_count, phys_count);
++ 
++ 	return status;
++ }
++ 
++ static void
++ efi_thunk_reset_system(int reset_type, efi_status_t status,
++ 		       unsigned long data_size, efi_char16_t *data)
++ {
++ 	u32 phys_data;
++ 
++ 	phys_data = virt_to_phys(data);
++ 
++ 	efi_thunk(reset_system, reset_type, status, data_size, phys_data);
++ }
++ 
++ static efi_status_t
++ efi_thunk_update_capsule(efi_capsule_header_t **capsules,
++ 			 unsigned long count, unsigned long sg_list)
++ {
++ 	/*
++ 	 * To properly support this function we would need to repackage
++ 	 * 'capsules' because the firmware doesn't understand 64-bit
++ 	 * pointers.
++ 	 */
++ 	return EFI_UNSUPPORTED;
++ }
++ 
++ static efi_status_t
++ efi_thunk_query_variable_info(u32 attr, u64 *storage_space,
++ 			      u64 *remaining_space,
++ 			      u64 *max_variable_size)
++ {
++ 	efi_status_t status;
++ 	u32 phys_storage, phys_remaining, phys_max;
++ 
++ 	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
++ 		return EFI_UNSUPPORTED;
++ 
++ 	phys_storage = virt_to_phys(storage_space);
++ 	phys_remaining = virt_to_phys(remaining_space);
++ 	phys_max = virt_to_phys(max_variable_size);
++ 
++ 	status = efi_thunk(query_variable_info, attr, phys_storage,
++ 			   phys_remaining, phys_max);
++ 
++ 	return status;
++ }
++ 
++ static efi_status_t
++ efi_thunk_query_capsule_caps(efi_capsule_header_t **capsules,
++ 			     unsigned long count, u64 *max_size,
++ 			     int *reset_type)
++ {
++ 	/*
++ 	 * To properly support this function we would need to repackage
++ 	 * 'capsules' because the firmware doesn't understand 64-bit
++ 	 * pointers.
++ 	 */
++ 	return EFI_UNSUPPORTED;
++ }
++ 
++ void efi_thunk_runtime_setup(void)
++ {
++ 	efi.get_time = efi_thunk_get_time;
++ 	efi.set_time = efi_thunk_set_time;
++ 	efi.get_wakeup_time = efi_thunk_get_wakeup_time;
++ 	efi.set_wakeup_time = efi_thunk_set_wakeup_time;
++ 	efi.get_variable = efi_thunk_get_variable;
++ 	efi.get_next_variable = efi_thunk_get_next_variable;
++ 	efi.set_variable = efi_thunk_set_variable;
++ 	efi.get_next_high_mono_count = efi_thunk_get_next_high_mono_count;
++ 	efi.reset_system = efi_thunk_reset_system;
++ 	efi.query_variable_info = efi_thunk_query_variable_info;
++ 	efi.update_capsule = efi_thunk_update_capsule;
++ 	efi.query_capsule_caps = efi_thunk_query_capsule_caps;
++ }
++ #endif /* CONFIG_EFI_MIXED */
+++>>>>>>> 9a11040ff962 (x86/efi: Restore 'attr' argument to query_variable_info())
+* Unmerged path arch/x86/platform/efi/efi_64.c
