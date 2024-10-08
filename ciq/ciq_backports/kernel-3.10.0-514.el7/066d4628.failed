@@ -1,0 +1,418 @@
+drm/i915/kbl: Add WaClearSlmSpaceAtContextSwitch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] i915/kbl: Add WaClearSlmSpaceAtContextSwitch (Rob Clark) [1348329 1349064]
+Rebuild_FUZZ: 95.65%
+commit-author Mika Kuoppala <mika.kuoppala@linux.intel.com>
+commit 066d462888514af727008a450f4078b1a23d5cbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/066d4628.failed
+
+This workaround for bdw and chv, is also needed for kbl A0.
+
+References: HSD#1911519, BSID#569
+	Signed-off-by: Mika Kuoppala <mika.kuoppala@intel.com>
+	Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1465309159-30531-24-git-send-email-mika.kuoppala@intel.com
+(cherry picked from commit 066d462888514af727008a450f4078b1a23d5cbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_lrc.c
+diff --cc drivers/gpu/drm/i915/intel_lrc.c
+index 424e62197787,4fad8303648e..000000000000
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@@ -1126,39 -1127,369 +1126,314 @@@ static int intel_logical_ring_workaroun
+  	return 0;
+  }
+  
+ -/**
+ - * gen8_init_indirectctx_bb() - initialize indirect ctx batch with WA
+ - *
+ - * @engine: only applicable for RCS
+ - * @wa_ctx: structure representing wa_ctx
+ - *  offset: specifies start of the batch, should be cache-aligned. This is updated
+ - *    with the offset value received as input.
+ - *  size: size of the batch in DWORDS but HW expects in terms of cachelines
+ - * @batch: page in which WA are loaded
+ - * @offset: This field specifies the start of the batch, it should be
+ - *  cache-aligned otherwise it is adjusted accordingly.
+ - *  Typically we only have one indirect_ctx and per_ctx batch buffer which are
+ - *  initialized at the beginning and shared across all contexts but this field
+ - *  helps us to have multiple batches at different offsets and select them based
+ - *  on a criteria. At the moment this batch always start at the beginning of the page
+ - *  and at this point we don't have multiple wa_ctx batch buffers.
+ - *
+ - *  The number of WA applied are not known at the beginning; we use this field
+ - *  to return the no of DWORDS written.
+ - *
+ - *  It is to be noted that this batch does not contain MI_BATCH_BUFFER_END
+ - *  so it adds NOOPs as padding to make it cacheline aligned.
+ - *  MI_BATCH_BUFFER_END will be added to perctx batch and both of them together
+ - *  makes a complete batch buffer.
+ - *
+ - * Return: non-zero if we exceed the PAGE_SIZE limit.
+ - */
+ -
+ -static int gen8_init_indirectctx_bb(struct intel_engine_cs *engine,
+ -				    struct i915_wa_ctx_bb *wa_ctx,
+ -				    uint32_t *const batch,
+ -				    uint32_t *offset)
+ +static int gen8_init_common_ring(struct intel_engine_cs *ring)
+  {
+ -	uint32_t scratch_addr;
+ -	uint32_t index = wa_ctx_start(wa_ctx, *offset, CACHELINE_DWORDS);
+ +	struct drm_device *dev = ring->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+  
+ -	/* WaDisableCtxRestoreArbitration:bdw,chv */
+ -	wa_ctx_emit(batch, index, MI_ARB_ON_OFF | MI_ARB_DISABLE);
+ -
+ -	/* WaFlushCoherentL3CacheLinesAtContextSwitch:bdw */
+ -	if (IS_BROADWELL(engine->i915)) {
+ -		int rc = gen8_emit_flush_coherentl3_wa(engine, batch, index);
+ -		if (rc < 0)
+ -			return rc;
+ -		index = rc;
+ +	I915_WRITE_IMR(ring, ~(ring->irq_enable_mask | ring->irq_keep_mask));
+ +	I915_WRITE(RING_HWSTAM(ring->mmio_base), 0xffffffff);
+ +
+ +	if (ring->status_page.obj) {
+ +		I915_WRITE(RING_HWS_PGA(ring->mmio_base),
+ +			   (u32)ring->status_page.gfx_addr);
+ +		POSTING_READ(RING_HWS_PGA(ring->mmio_base));
+  	}
+  
+++<<<<<<< HEAD
+ +	I915_WRITE(RING_MODE_GEN7(ring),
+++=======
++ 	/* WaClearSlmSpaceAtContextSwitch:bdw,chv */
++ 	/* Actual scratch location is at 128 bytes offset */
++ 	scratch_addr = engine->scratch.gtt_offset + 2*CACHELINE_BYTES;
++ 
++ 	wa_ctx_emit(batch, index, GFX_OP_PIPE_CONTROL(6));
++ 	wa_ctx_emit(batch, index, (PIPE_CONTROL_FLUSH_L3 |
++ 				   PIPE_CONTROL_GLOBAL_GTT_IVB |
++ 				   PIPE_CONTROL_CS_STALL |
++ 				   PIPE_CONTROL_QW_WRITE));
++ 	wa_ctx_emit(batch, index, scratch_addr);
++ 	wa_ctx_emit(batch, index, 0);
++ 	wa_ctx_emit(batch, index, 0);
++ 	wa_ctx_emit(batch, index, 0);
++ 
++ 	/* Pad to end of cacheline */
++ 	while (index % CACHELINE_DWORDS)
++ 		wa_ctx_emit(batch, index, MI_NOOP);
++ 
++ 	/*
++ 	 * MI_BATCH_BUFFER_END is not required in Indirect ctx BB because
++ 	 * execution depends on the length specified in terms of cache lines
++ 	 * in the register CTX_RCS_INDIRECT_CTX
++ 	 */
++ 
++ 	return wa_ctx_end(wa_ctx, *offset = index, CACHELINE_DWORDS);
++ }
++ 
++ /**
++  * gen8_init_perctx_bb() - initialize per ctx batch with WA
++  *
++  * @engine: only applicable for RCS
++  * @wa_ctx: structure representing wa_ctx
++  *  offset: specifies start of the batch, should be cache-aligned.
++  *  size: size of the batch in DWORDS but HW expects in terms of cachelines
++  * @batch: page in which WA are loaded
++  * @offset: This field specifies the start of this batch.
++  *   This batch is started immediately after indirect_ctx batch. Since we ensure
++  *   that indirect_ctx ends on a cacheline this batch is aligned automatically.
++  *
++  *   The number of DWORDS written are returned using this field.
++  *
++  *  This batch is terminated with MI_BATCH_BUFFER_END and so we need not add padding
++  *  to align it with cacheline as padding after MI_BATCH_BUFFER_END is redundant.
++  */
++ static int gen8_init_perctx_bb(struct intel_engine_cs *engine,
++ 			       struct i915_wa_ctx_bb *wa_ctx,
++ 			       uint32_t *const batch,
++ 			       uint32_t *offset)
++ {
++ 	uint32_t index = wa_ctx_start(wa_ctx, *offset, CACHELINE_DWORDS);
++ 
++ 	/* WaDisableCtxRestoreArbitration:bdw,chv */
++ 	wa_ctx_emit(batch, index, MI_ARB_ON_OFF | MI_ARB_ENABLE);
++ 
++ 	wa_ctx_emit(batch, index, MI_BATCH_BUFFER_END);
++ 
++ 	return wa_ctx_end(wa_ctx, *offset = index, 1);
++ }
++ 
++ static int gen9_init_indirectctx_bb(struct intel_engine_cs *engine,
++ 				    struct i915_wa_ctx_bb *wa_ctx,
++ 				    uint32_t *const batch,
++ 				    uint32_t *offset)
++ {
++ 	int ret;
++ 	uint32_t index = wa_ctx_start(wa_ctx, *offset, CACHELINE_DWORDS);
++ 
++ 	/* WaDisableCtxRestoreArbitration:skl,bxt */
++ 	if (IS_SKL_REVID(engine->i915, 0, SKL_REVID_D0) ||
++ 	    IS_BXT_REVID(engine->i915, 0, BXT_REVID_A1))
++ 		wa_ctx_emit(batch, index, MI_ARB_ON_OFF | MI_ARB_DISABLE);
++ 
++ 	/* WaFlushCoherentL3CacheLinesAtContextSwitch:skl,bxt */
++ 	ret = gen8_emit_flush_coherentl3_wa(engine, batch, index);
++ 	if (ret < 0)
++ 		return ret;
++ 	index = ret;
++ 
++ 	/* WaClearSlmSpaceAtContextSwitch:kbl */
++ 	/* Actual scratch location is at 128 bytes offset */
++ 	if (IS_KBL_REVID(engine->i915, 0, KBL_REVID_A0)) {
++ 		uint32_t scratch_addr
++ 			= engine->scratch.gtt_offset + 2*CACHELINE_BYTES;
++ 
++ 		wa_ctx_emit(batch, index, GFX_OP_PIPE_CONTROL(6));
++ 		wa_ctx_emit(batch, index, (PIPE_CONTROL_FLUSH_L3 |
++ 					   PIPE_CONTROL_GLOBAL_GTT_IVB |
++ 					   PIPE_CONTROL_CS_STALL |
++ 					   PIPE_CONTROL_QW_WRITE));
++ 		wa_ctx_emit(batch, index, scratch_addr);
++ 		wa_ctx_emit(batch, index, 0);
++ 		wa_ctx_emit(batch, index, 0);
++ 		wa_ctx_emit(batch, index, 0);
++ 	}
++ 	/* Pad to end of cacheline */
++ 	while (index % CACHELINE_DWORDS)
++ 		wa_ctx_emit(batch, index, MI_NOOP);
++ 
++ 	return wa_ctx_end(wa_ctx, *offset = index, CACHELINE_DWORDS);
++ }
++ 
++ static int gen9_init_perctx_bb(struct intel_engine_cs *engine,
++ 			       struct i915_wa_ctx_bb *wa_ctx,
++ 			       uint32_t *const batch,
++ 			       uint32_t *offset)
++ {
++ 	uint32_t index = wa_ctx_start(wa_ctx, *offset, CACHELINE_DWORDS);
++ 
++ 	/* WaSetDisablePixMaskCammingAndRhwoInCommonSliceChicken:skl,bxt */
++ 	if (IS_SKL_REVID(engine->i915, 0, SKL_REVID_B0) ||
++ 	    IS_BXT_REVID(engine->i915, 0, BXT_REVID_A1)) {
++ 		wa_ctx_emit(batch, index, MI_LOAD_REGISTER_IMM(1));
++ 		wa_ctx_emit_reg(batch, index, GEN9_SLICE_COMMON_ECO_CHICKEN0);
++ 		wa_ctx_emit(batch, index,
++ 			    _MASKED_BIT_ENABLE(DISABLE_PIXEL_MASK_CAMMING));
++ 		wa_ctx_emit(batch, index, MI_NOOP);
++ 	}
++ 
++ 	/* WaClearTdlStateAckDirtyBits:bxt */
++ 	if (IS_BXT_REVID(engine->i915, 0, BXT_REVID_B0)) {
++ 		wa_ctx_emit(batch, index, MI_LOAD_REGISTER_IMM(4));
++ 
++ 		wa_ctx_emit_reg(batch, index, GEN8_STATE_ACK);
++ 		wa_ctx_emit(batch, index, _MASKED_BIT_DISABLE(GEN9_SUBSLICE_TDL_ACK_BITS));
++ 
++ 		wa_ctx_emit_reg(batch, index, GEN9_STATE_ACK_SLICE1);
++ 		wa_ctx_emit(batch, index, _MASKED_BIT_DISABLE(GEN9_SUBSLICE_TDL_ACK_BITS));
++ 
++ 		wa_ctx_emit_reg(batch, index, GEN9_STATE_ACK_SLICE2);
++ 		wa_ctx_emit(batch, index, _MASKED_BIT_DISABLE(GEN9_SUBSLICE_TDL_ACK_BITS));
++ 
++ 		wa_ctx_emit_reg(batch, index, GEN7_ROW_CHICKEN2);
++ 		/* dummy write to CS, mask bits are 0 to ensure the register is not modified */
++ 		wa_ctx_emit(batch, index, 0x0);
++ 		wa_ctx_emit(batch, index, MI_NOOP);
++ 	}
++ 
++ 	/* WaDisableCtxRestoreArbitration:skl,bxt */
++ 	if (IS_SKL_REVID(engine->i915, 0, SKL_REVID_D0) ||
++ 	    IS_BXT_REVID(engine->i915, 0, BXT_REVID_A1))
++ 		wa_ctx_emit(batch, index, MI_ARB_ON_OFF | MI_ARB_ENABLE);
++ 
++ 	wa_ctx_emit(batch, index, MI_BATCH_BUFFER_END);
++ 
++ 	return wa_ctx_end(wa_ctx, *offset = index, 1);
++ }
++ 
++ static int lrc_setup_wa_ctx_obj(struct intel_engine_cs *engine, u32 size)
++ {
++ 	int ret;
++ 
++ 	engine->wa_ctx.obj = i915_gem_object_create(engine->i915->dev,
++ 						   PAGE_ALIGN(size));
++ 	if (IS_ERR(engine->wa_ctx.obj)) {
++ 		DRM_DEBUG_DRIVER("alloc LRC WA ctx backing obj failed.\n");
++ 		ret = PTR_ERR(engine->wa_ctx.obj);
++ 		engine->wa_ctx.obj = NULL;
++ 		return ret;
++ 	}
++ 
++ 	ret = i915_gem_obj_ggtt_pin(engine->wa_ctx.obj, PAGE_SIZE, 0);
++ 	if (ret) {
++ 		DRM_DEBUG_DRIVER("pin LRC WA ctx backing obj failed: %d\n",
++ 				 ret);
++ 		drm_gem_object_unreference(&engine->wa_ctx.obj->base);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void lrc_destroy_wa_ctx_obj(struct intel_engine_cs *engine)
++ {
++ 	if (engine->wa_ctx.obj) {
++ 		i915_gem_object_ggtt_unpin(engine->wa_ctx.obj);
++ 		drm_gem_object_unreference(&engine->wa_ctx.obj->base);
++ 		engine->wa_ctx.obj = NULL;
++ 	}
++ }
++ 
++ static int intel_init_workaround_bb(struct intel_engine_cs *engine)
++ {
++ 	int ret;
++ 	uint32_t *batch;
++ 	uint32_t offset;
++ 	struct page *page;
++ 	struct i915_ctx_workarounds *wa_ctx = &engine->wa_ctx;
++ 
++ 	WARN_ON(engine->id != RCS);
++ 
++ 	/* update this when WA for higher Gen are added */
++ 	if (INTEL_GEN(engine->i915) > 9) {
++ 		DRM_ERROR("WA batch buffer is not initialized for Gen%d\n",
++ 			  INTEL_GEN(engine->i915));
++ 		return 0;
++ 	}
++ 
++ 	/* some WA perform writes to scratch page, ensure it is valid */
++ 	if (engine->scratch.obj == NULL) {
++ 		DRM_ERROR("scratch page not allocated for %s\n", engine->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ret = lrc_setup_wa_ctx_obj(engine, PAGE_SIZE);
++ 	if (ret) {
++ 		DRM_DEBUG_DRIVER("Failed to setup context WA page: %d\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	page = i915_gem_object_get_dirty_page(wa_ctx->obj, 0);
++ 	batch = kmap_atomic(page);
++ 	offset = 0;
++ 
++ 	if (IS_GEN8(engine->i915)) {
++ 		ret = gen8_init_indirectctx_bb(engine,
++ 					       &wa_ctx->indirect_ctx,
++ 					       batch,
++ 					       &offset);
++ 		if (ret)
++ 			goto out;
++ 
++ 		ret = gen8_init_perctx_bb(engine,
++ 					  &wa_ctx->per_ctx,
++ 					  batch,
++ 					  &offset);
++ 		if (ret)
++ 			goto out;
++ 	} else if (IS_GEN9(engine->i915)) {
++ 		ret = gen9_init_indirectctx_bb(engine,
++ 					       &wa_ctx->indirect_ctx,
++ 					       batch,
++ 					       &offset);
++ 		if (ret)
++ 			goto out;
++ 
++ 		ret = gen9_init_perctx_bb(engine,
++ 					  &wa_ctx->per_ctx,
++ 					  batch,
++ 					  &offset);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ out:
++ 	kunmap_atomic(batch);
++ 	if (ret)
++ 		lrc_destroy_wa_ctx_obj(engine);
++ 
++ 	return ret;
++ }
++ 
++ static void lrc_init_hws(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 
++ 	I915_WRITE(RING_HWS_PGA(engine->mmio_base),
++ 		   (u32)engine->status_page.gfx_addr);
++ 	POSTING_READ(RING_HWS_PGA(engine->mmio_base));
++ }
++ 
++ static int gen8_init_common_ring(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	unsigned int next_context_status_buffer_hw;
++ 
++ 	lrc_init_hws(engine);
++ 
++ 	I915_WRITE_IMR(engine,
++ 		       ~(engine->irq_enable_mask | engine->irq_keep_mask));
++ 	I915_WRITE(RING_HWSTAM(engine->mmio_base), 0xffffffff);
++ 
++ 	I915_WRITE(RING_MODE_GEN7(engine),
+++>>>>>>> 066d46288851 (drm/i915/kbl: Add WaClearSlmSpaceAtContextSwitch)
+  		   _MASKED_BIT_DISABLE(GFX_REPLAY_MODE) |
+  		   _MASKED_BIT_ENABLE(GFX_RUN_LIST_ENABLE));
+ -	POSTING_READ(RING_MODE_GEN7(engine));
+ -
+ -	/*
+ -	 * Instead of resetting the Context Status Buffer (CSB) read pointer to
+ -	 * zero, we need to read the write pointer from hardware and use its
+ -	 * value because "this register is power context save restored".
+ -	 * Effectively, these states have been observed:
+ -	 *
+ -	 *      | Suspend-to-idle (freeze) | Suspend-to-RAM (mem) |
+ -	 * BDW  | CSB regs not reset       | CSB regs reset       |
+ -	 * CHT  | CSB regs not reset       | CSB regs not reset   |
+ -	 * SKL  |         ?                |         ?            |
+ -	 * BXT  |         ?                |         ?            |
+ -	 */
+ -	next_context_status_buffer_hw =
+ -		GEN8_CSB_WRITE_PTR(I915_READ(RING_CONTEXT_STATUS_PTR(engine)));
+ -
+ -	/*
+ -	 * When the CSB registers are reset (also after power-up / gpu reset),
+ -	 * CSB write pointer is set to all 1's, which is not valid, use '5' in
+ -	 * this special case, so the first element read is CSB[0].
+ -	 */
+ -	if (next_context_status_buffer_hw == GEN8_CSB_PTR_MASK)
+ -		next_context_status_buffer_hw = (GEN8_CSB_ENTRIES - 1);
+ +	POSTING_READ(RING_MODE_GEN7(ring));
+ +	ring->next_context_status_buffer = 0;
+ +	DRM_DEBUG_DRIVER("Execlists enabled for %s\n", ring->name);
+  
+ -	engine->next_context_status_buffer = next_context_status_buffer_hw;
+ -	DRM_DEBUG_DRIVER("Execlists enabled for %s\n", engine->name);
+ +	memset(&ring->hangcheck, 0, sizeof(ring->hangcheck));
+  
+ -	intel_engine_init_hangcheck(engine);
+ -
+ -	return intel_mocs_init_engine(engine);
+ +	return 0;
+  }
+  
+ -static int gen8_init_render_ring(struct intel_engine_cs *engine)
+ +static int gen8_init_render_ring(struct intel_engine_cs *ring)
+  {
+ -	struct drm_i915_private *dev_priv = engine->i915;
+ +	struct drm_device *dev = ring->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+  	int ret;
+  
+ -	ret = gen8_init_common_ring(engine);
+ +	ret = gen8_init_common_ring(ring);
+  	if (ret)
+  		return ret;
+  
+* Unmerged path drivers/gpu/drm/i915/intel_lrc.c
