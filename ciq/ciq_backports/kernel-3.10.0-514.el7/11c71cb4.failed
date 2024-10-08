@@ -1,0 +1,371 @@
+megaraid_sas: Do not allow PCI access during OCR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sumit Saxena <sumit.saxena@avagotech.com>
+commit 11c71cb4ab7cd901b9d6f0ff267c102778c1c8ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/11c71cb4.failed
+
+This patch will do synhronization between OCR function and AEN function
+using "reset_mutex" lock.  reset_mutex will be acquired only in the
+first half of the AEN function which issues a DCMD. Second half of the
+function which calls SCSI API (scsi_add_device/scsi_remove_device)
+should be out of reset_mutex to avoid deadlock between scsi_eh thread
+and driver.
+
+During chip reset (inside OCR function), there should not be any PCI
+access and AEN function (which is called in delayed context) may be
+firing DCMDs (doing PCI writes) when chip reset is happening in parallel
+which will cause FW fault. This patch will solve the problem by making
+AEN thread and OCR thread mutually exclusive.
+
+	Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+	Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 11c71cb4ab7cd901b9d6f0ff267c102778c1c8ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index b60f8ef53c66,96504877890a..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -6736,16 -6659,7 +6736,20 @@@ megasas_aen_polling(struct work_struct 
+  		wait_time = MEGASAS_ROUTINE_WAIT_TIME_VF;
+  
+  	/* Don't run the event workqueue thread if OCR is running */
+++<<<<<<< HEAD
+ +	for (i = 0; i < wait_time; i++) {
+ +		if (instance->adprecovery == MEGASAS_HBA_OPERATIONAL)
+ +			break;
+ +		if (!(i % MEGASAS_RESET_NOTICE_INTERVAL)) {
+ +			printk(KERN_NOTICE "megasas: %s waiting for "
+ +			       "controller reset to finish for scsi%d\n",
+ +			       __func__, instance->host->host_no);
+ +		}
+ +		msleep(1000);
+ +	}
+++=======
++ 	mutex_lock(&instance->reset_mutex);
+++>>>>>>> 11c71cb4ab7c (megaraid_sas: Do not allow PCI access during OCR)
+  
+  	instance->ev = NULL;
+  	host = instance->host;
+@@@ -6753,124 -6667,27 +6757,63 @@@
+  		megasas_decode_evt(instance);
+  
+  		switch (le32_to_cpu(instance->evt_detail->code)) {
++ 
+  		case MR_EVT_PD_INSERTED:
+++<<<<<<< HEAD
+ +			if (megasas_get_pd_list(instance) == 0) {
+ +			for (i = 0; i < MEGASAS_MAX_PD_CHANNELS; i++) {
+ +				for (j = 0;
+ +				j < MEGASAS_MAX_DEV_PER_CHANNEL;
+ +				j++) {
+ +
+ +				pd_index =
+ +				(i * MEGASAS_MAX_DEV_PER_CHANNEL) + j;
+ +
+ +				sdev1 =
+ +				scsi_device_lookup(host, i, j, 0);
+ +
+ +				if (instance->pd_list[pd_index].driveState
+ +						== MR_PD_STATE_SYSTEM) {
+ +						if (!sdev1) {
+ +						scsi_add_device(host, i, j, 0);
+ +						}
+ +
+ +					if (sdev1)
+ +						scsi_device_put(sdev1);
+ +					}
+ +				}
+ +			}
+ +			}
+ +			doscan = 0;
+++=======
++ 		case MR_EVT_PD_REMOVED:
++ 			dcmd_ret = megasas_get_pd_list(instance);
++ 			if (dcmd_ret == 0)
++ 				doscan = SCAN_PD_CHANNEL;
+++>>>>>>> 11c71cb4ab7c (megaraid_sas: Do not allow PCI access during OCR)
+  			break;
+  
+- 		case MR_EVT_PD_REMOVED:
+- 			if (megasas_get_pd_list(instance) == 0) {
+- 			for (i = 0; i < MEGASAS_MAX_PD_CHANNELS; i++) {
+- 				for (j = 0;
+- 				j < MEGASAS_MAX_DEV_PER_CHANNEL;
+- 				j++) {
++ 		case MR_EVT_LD_OFFLINE:
++ 		case MR_EVT_CFG_CLEARED:
++ 		case MR_EVT_LD_DELETED:
++ 		case MR_EVT_LD_CREATED:
++ 			if (!instance->requestorId ||
++ 				(instance->requestorId && megasas_get_ld_vf_affiliation(instance, 0)))
++ 				dcmd_ret = megasas_ld_list_query(instance, MR_LD_QUERY_TYPE_EXPOSED_TO_HOST);
+  
+- 				pd_index =
+- 				(i * MEGASAS_MAX_DEV_PER_CHANNEL) + j;
++ 			if (dcmd_ret == 0)
++ 				doscan = SCAN_VD_CHANNEL;
+  
+++<<<<<<< HEAD
+ +				sdev1 =
+ +				scsi_device_lookup(host, i, j, 0);
+ +
+ +				if (instance->pd_list[pd_index].driveState
+ +					== MR_PD_STATE_SYSTEM) {
+ +					if (sdev1) {
+- 						scsi_device_put(sdev1);
+- 					}
+- 				} else {
+- 					if (sdev1) {
+- 						scsi_remove_device(sdev1);
+- 						scsi_device_put(sdev1);
+- 					}
+- 				}
+- 				}
+- 			}
+- 			}
+- 			doscan = 0;
+++=======
+  			break;
+  
+- 		case MR_EVT_LD_OFFLINE:
+- 		case MR_EVT_CFG_CLEARED:
+- 		case MR_EVT_LD_DELETED:
+- 			if (!instance->requestorId ||
+- 			    megasas_get_ld_vf_affiliation(instance, 0)) {
+- 				if (megasas_ld_list_query(instance,
+- 							  MR_LD_QUERY_TYPE_EXPOSED_TO_HOST))
+- 					megasas_get_ld_list(instance);
+- 				for (i = 0; i < MEGASAS_MAX_LD_CHANNELS; i++) {
+- 					for (j = 0;
+- 					     j < MEGASAS_MAX_DEV_PER_CHANNEL;
+- 					     j++) {
+- 
+- 						ld_index =
+- 							(i * MEGASAS_MAX_DEV_PER_CHANNEL) + j;
+- 
+- 						sdev1 = scsi_device_lookup(host, MEGASAS_MAX_PD_CHANNELS + i, j, 0);
+- 
+- 						if (instance->ld_ids[ld_index]
+- 						    != 0xff) {
+- 							if (sdev1)
+- 								scsi_device_put(sdev1);
+- 						} else {
+- 							if (sdev1) {
+- 								scsi_remove_device(sdev1);
+- 								scsi_device_put(sdev1);
+- 							}
+- 						}
+- 					}
+- 				}
+- 				doscan = 0;
+- 			}
+- 			break;
+- 		case MR_EVT_LD_CREATED:
+- 			if (!instance->requestorId ||
+- 			    megasas_get_ld_vf_affiliation(instance, 0)) {
+- 				if (megasas_ld_list_query(instance,
+- 							  MR_LD_QUERY_TYPE_EXPOSED_TO_HOST))
+- 					megasas_get_ld_list(instance);
+- 				for (i = 0; i < MEGASAS_MAX_LD_CHANNELS; i++) {
+- 					for (j = 0;
+- 					     j < MEGASAS_MAX_DEV_PER_CHANNEL;
+- 					     j++) {
+- 						ld_index =
+- 							(i * MEGASAS_MAX_DEV_PER_CHANNEL) + j;
+- 
+- 						sdev1 = scsi_device_lookup(host, MEGASAS_MAX_PD_CHANNELS + i, j, 0);
+- 
+- 						if (instance->ld_ids[ld_index]
+- 						    != 0xff) {
+- 							if (!sdev1)
+- 								scsi_add_device(host, MEGASAS_MAX_PD_CHANNELS + i, j, 0);
+- 						}
+- 						if (sdev1)
+- 							scsi_device_put(sdev1);
+- 					}
+- 				}
+- 				doscan = 0;
+- 			}
+- 			break;
+  		case MR_EVT_CTRL_HOST_BUS_SCAN_REQUESTED:
+  		case MR_EVT_FOREIGN_CFG_IMPORTED:
+  		case MR_EVT_LD_STATE_CHANGE:
+@@@ -6883,86 -6715,79 +6841,152 @@@
+  			doscan = 0;
+  			break;
+  		}
++ 	} else {
++ 		dev_err(&instance->pdev->dev, "invalid evt_detail!\n");
++ 		mutex_unlock(&instance->reset_mutex);
++ 		kfree(ev);
++ 		return;
++ 	}
++ 
++ 	mutex_unlock(&instance->reset_mutex);
++ 
++ 	if (doscan & SCAN_PD_CHANNEL) {
++ 		for (i = 0; i < MEGASAS_MAX_PD_CHANNELS; i++) {
++ 			for (j = 0; j < MEGASAS_MAX_DEV_PER_CHANNEL; j++) {
++ 				pd_index = i*MEGASAS_MAX_DEV_PER_CHANNEL + j;
++ 				sdev1 = scsi_device_lookup(host, i, j, 0);
++ 				if (instance->pd_list[pd_index].driveState ==
++ 							MR_PD_STATE_SYSTEM) {
++ 					if (!sdev1)
++ 						scsi_add_device(host, i, j, 0);
++ 					else
+++>>>>>>> 11c71cb4ab7c (megaraid_sas: Do not allow PCI access during OCR)
++ 						scsi_device_put(sdev1);
+++					}
++ 				} else {
++ 					if (sdev1) {
++ 						scsi_remove_device(sdev1);
++ 						scsi_device_put(sdev1);
++ 					}
++ 				}
++ 			}
++ 		}
+++<<<<<<< HEAD
+ +	} else {
+ +		printk(KERN_ERR "invalid evt_detail!\n");
+ +		kfree(ev);
+ +		return;
+ +	}
+ +
+ +	if (doscan) {
+ +		printk(KERN_INFO "megaraid_sas: scanning for scsi%d...\n",
+ +		       instance->host->host_no);
+ +		if (megasas_get_pd_list(instance) == 0) {
+ +			for (i = 0; i < MEGASAS_MAX_PD_CHANNELS; i++) {
+ +				for (j = 0; j < MEGASAS_MAX_DEV_PER_CHANNEL; j++) {
+ +					pd_index = i*MEGASAS_MAX_DEV_PER_CHANNEL + j;
+ +					sdev1 = scsi_device_lookup(host, i, j, 0);
+ +					if (instance->pd_list[pd_index].driveState ==
+ +					    MR_PD_STATE_SYSTEM) {
+ +						if (!sdev1) {
+ +							scsi_add_device(host, i, j, 0);
+ +						}
+ +						if (sdev1)
+ +							scsi_device_put(sdev1);
+ +					} else {
+ +						if (sdev1) {
+ +							scsi_remove_device(sdev1);
+ +							scsi_device_put(sdev1);
+ +						}
+ +					}
+ +				}
+ +			}
+ +		}
+ +
+ +		if (!instance->requestorId ||
+ +		    megasas_get_ld_vf_affiliation(instance, 0)) {
+ +			if (megasas_ld_list_query(instance,
+ +						  MR_LD_QUERY_TYPE_EXPOSED_TO_HOST))
+ +				megasas_get_ld_list(instance);
+ +			for (i = 0; i < MEGASAS_MAX_LD_CHANNELS; i++) {
+ +				for (j = 0; j < MEGASAS_MAX_DEV_PER_CHANNEL;
+ +				     j++) {
+ +					ld_index =
+ +						(i * MEGASAS_MAX_DEV_PER_CHANNEL) + j;
+ +
+ +					sdev1 = scsi_device_lookup(host,
+ +								   MEGASAS_MAX_PD_CHANNELS + i, j, 0);
+ +					if (instance->ld_ids[ld_index]
+ +					    != 0xff) {
+ +						if (!sdev1)
+ +							scsi_add_device(host, MEGASAS_MAX_PD_CHANNELS + i, j, 0);
+ +						else
+ +							scsi_device_put(sdev1);
+ +					} else {
+ +						if (sdev1) {
+ +							scsi_remove_device(sdev1);
+ +							scsi_device_put(sdev1);
+ +						}
+++=======
++ 	}
++ 
++ 	if (doscan & SCAN_VD_CHANNEL) {
++ 		for (i = 0; i < MEGASAS_MAX_LD_CHANNELS; i++) {
++ 			for (j = 0; j < MEGASAS_MAX_DEV_PER_CHANNEL; j++) {
++ 				ld_index = (i * MEGASAS_MAX_DEV_PER_CHANNEL) + j;
++ 				sdev1 = scsi_device_lookup(host, MEGASAS_MAX_PD_CHANNELS + i, j, 0);
++ 				if (instance->ld_ids[ld_index] != 0xff) {
++ 					if (!sdev1)
++ 						scsi_add_device(host, MEGASAS_MAX_PD_CHANNELS + i, j, 0);
++ 					else
++ 						scsi_device_put(sdev1);
++ 				} else {
++ 					if (sdev1) {
++ 						scsi_remove_device(sdev1);
++ 						scsi_device_put(sdev1);
+++>>>>>>> 11c71cb4ab7c (megaraid_sas: Do not allow PCI access during OCR)
+  					}
+  				}
+  			}
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if ( instance->aen_cmd != NULL ) {
+ +		kfree(ev);
+ +		return ;
+ +	}
+ +
+ +	seq_num = le32_to_cpu(instance->evt_detail->seq_num) + 1;
+++=======
++ 	if (dcmd_ret == 0)
++ 		seq_num = le32_to_cpu(instance->evt_detail->seq_num) + 1;
++ 	else
++ 		seq_num = instance->last_seq_num;
+++>>>>>>> 11c71cb4ab7c (megaraid_sas: Do not allow PCI access during OCR)
+  
+  	/* Register AEN with FW for latest sequence number plus 1 */
+  	class_locale.members.reserved = 0;
+  	class_locale.members.locale = MR_EVT_LOCALE_ALL;
+  	class_locale.members.class = MR_EVT_CLASS_DEBUG;
+- 	mutex_lock(&instance->aen_mutex);
++ 
++ 	if (instance->aen_cmd != NULL) {
++ 		kfree(ev);
++ 		return;
++ 	}
++ 
++ 	mutex_lock(&instance->reset_mutex);
+  	error = megasas_register_aen(instance, seq_num,
+  					class_locale.word);
+- 	mutex_unlock(&instance->aen_mutex);
+- 
+  	if (error)
+++<<<<<<< HEAD
+ +		printk(KERN_ERR "register aen failed error %x\n", error);
+++=======
++ 		dev_err(&instance->pdev->dev,
++ 			"register aen failed error %x\n", error);
+++>>>>>>> 11c71cb4ab7c (megaraid_sas: Do not allow PCI access during OCR)
+  
++ 	mutex_unlock(&instance->reset_mutex);
+  	kfree(ev);
+  }
+  
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index d4c399b43165..941a9474f24c 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -1083,6 +1083,8 @@ struct megasas_ctrl_info {
+ 
+ #define VD_EXT_DEBUG 0
+ 
++#define SCAN_PD_CHANNEL	0x1
++#define SCAN_VD_CHANNEL	0x2
+ 
+ enum MR_SCSI_CMD_TYPE {
+ 	READ_WRITE_LDIO = 0,
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
