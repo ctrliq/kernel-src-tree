@@ -1,0 +1,310 @@
+ACPI / property: Expose data-only subnodes via sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 263b4c1a64bc12470684aeaf7c44f03d31716819
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/263b4c1a.failed
+
+Add infrastructure needed to expose data-only subnodes of ACPI
+device objects introduced previously via sysfs.
+
+Each data-only subnode is represented as a sysfs directory under
+the directory corresponding to its parent object (a device or a
+data-only subnode).  Each of them has a "path" attribute (containing
+the full ACPI namespace path to the object the subnode data come from)
+at this time.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit 263b4c1a64bc12470684aeaf7c44f03d31716819)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/device_sysfs.c
+#	drivers/acpi/property.c
+#	include/acpi/acpi_bus.h
+diff --cc drivers/acpi/property.c
+index 3d47281953cd,333f9146d19e..000000000000
+--- a/drivers/acpi/property.c
++++ b/drivers/acpi/property.c
+@@@ -24,6 -24,116 +24,119 @@@ static const u8 prp_uuid[16] = 
+  	0x14, 0xd8, 0xff, 0xda, 0xba, 0x6e, 0x8c, 0x4d,
+  	0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3, 0x01
+  };
+++<<<<<<< HEAD
+++=======
++ /* ACPI _DSD data subnodes UUID: dbb8e3e6-5886-4ba6-8795-1319f52a966b */
++ static const u8 ads_uuid[16] = {
++ 	0xe6, 0xe3, 0xb8, 0xdb, 0x86, 0x58, 0xa6, 0x4b,
++ 	0x87, 0x95, 0x13, 0x19, 0xf5, 0x2a, 0x96, 0x6b
++ };
++ 
++ static bool acpi_enumerate_nondev_subnodes(acpi_handle scope,
++ 					   const union acpi_object *desc,
++ 					   struct acpi_device_data *data);
++ static bool acpi_extract_properties(const union acpi_object *desc,
++ 				    struct acpi_device_data *data);
++ 
++ static bool acpi_nondev_subnode_ok(acpi_handle scope,
++ 				   const union acpi_object *link,
++ 				   struct list_head *list)
++ {
++ 	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
++ 	struct acpi_data_node *dn;
++ 	acpi_handle handle;
++ 	acpi_status status;
++ 
++ 	dn = kzalloc(sizeof(*dn), GFP_KERNEL);
++ 	if (!dn)
++ 		return false;
++ 
++ 	dn->name = link->package.elements[0].string.pointer;
++ 	dn->fwnode.type = FWNODE_ACPI_DATA;
++ 	INIT_LIST_HEAD(&dn->data.subnodes);
++ 
++ 	status = acpi_get_handle(scope, link->package.elements[1].string.pointer,
++ 				 &handle);
++ 	if (ACPI_FAILURE(status))
++ 		goto fail;
++ 
++ 	status = acpi_evaluate_object_typed(handle, NULL, NULL, &buf,
++ 					    ACPI_TYPE_PACKAGE);
++ 	if (ACPI_FAILURE(status))
++ 		goto fail;
++ 
++ 	if (acpi_extract_properties(buf.pointer, &dn->data))
++ 		dn->handle = handle;
++ 
++ 	if (acpi_enumerate_nondev_subnodes(scope, buf.pointer, &dn->data))
++ 		dn->handle = handle;
++ 
++ 	if (dn->handle) {
++ 		dn->data.pointer = buf.pointer;
++ 		list_add_tail(&dn->sibling, list);
++ 		return true;
++ 	}
++ 
++ 	acpi_handle_debug(handle, "Invalid properties/subnodes data, skipping\n");
++ 
++  fail:
++ 	ACPI_FREE(buf.pointer);
++ 	kfree(dn);
++ 	return false;
++ }
++ 
++ static int acpi_add_nondev_subnodes(acpi_handle scope,
++ 				    const union acpi_object *links,
++ 				    struct list_head *list)
++ {
++ 	bool ret = false;
++ 	int i;
++ 
++ 	for (i = 0; i < links->package.count; i++) {
++ 		const union acpi_object *link;
++ 
++ 		link = &links->package.elements[i];
++ 		/* Only two elements allowed, both must be strings. */
++ 		if (link->package.count == 2
++ 		    && link->package.elements[0].type == ACPI_TYPE_STRING
++ 		    && link->package.elements[1].type == ACPI_TYPE_STRING
++ 		    && acpi_nondev_subnode_ok(scope, link, list))
++ 			ret = true;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static bool acpi_enumerate_nondev_subnodes(acpi_handle scope,
++ 					   const union acpi_object *desc,
++ 					   struct acpi_device_data *data)
++ {
++ 	int i;
++ 
++ 	/* Look for the ACPI data subnodes UUID. */
++ 	for (i = 0; i < desc->package.count; i += 2) {
++ 		const union acpi_object *uuid, *links;
++ 
++ 		uuid = &desc->package.elements[i];
++ 		links = &desc->package.elements[i + 1];
++ 
++ 		/*
++ 		 * The first element must be a UUID and the second one must be
++ 		 * a package.
++ 		 */
++ 		if (uuid->type != ACPI_TYPE_BUFFER || uuid->buffer.length != 16
++ 		    || links->type != ACPI_TYPE_PACKAGE)
++ 			break;
++ 
++ 		if (memcmp(uuid->buffer.pointer, ads_uuid, sizeof(ads_uuid)))
++ 			continue;
++ 
++ 		return acpi_add_nondev_subnodes(scope, links, &data->subnodes);
++ 	}
++ 
++ 	return false;
++ }
+++>>>>>>> 263b4c1a64bc (ACPI / property: Expose data-only subnodes via sysfs)
+  
+  static bool acpi_property_value_ok(const union acpi_object *value)
+  {
+@@@ -117,14 -243,71 +230,24 @@@ void acpi_init_properties(struct acpi_d
+  		if (!acpi_properties_format_valid(properties))
+  			break;
+  
+ -		data->properties = properties;
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -void acpi_init_properties(struct acpi_device *adev)
+ -{
+ -	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
+ -	struct acpi_hardware_id *hwid;
+ -	acpi_status status;
+ -	bool acpi_of = false;
+ -
+ -	INIT_LIST_HEAD(&adev->data.subnodes);
+ -
+ -	/*
+ -	 * Check if ACPI_DT_NAMESPACE_HID is present and inthat case we fill in
+ -	 * Device Tree compatible properties for this device.
+ -	 */
+ -	list_for_each_entry(hwid, &adev->pnp.ids, list) {
+ -		if (!strcmp(hwid->id, ACPI_DT_NAMESPACE_HID)) {
+ -			acpi_of = true;
+ -			break;
+ -		}
+ -	}
+ -
+ -	status = acpi_evaluate_object_typed(adev->handle, "_DSD", NULL, &buf,
+ -					    ACPI_TYPE_PACKAGE);
+ -	if (ACPI_FAILURE(status))
+ -		goto out;
+ -
+ -	if (acpi_extract_properties(buf.pointer, &adev->data)) {
+ -		adev->data.pointer = buf.pointer;
+ -		if (acpi_of)
+ -			acpi_init_of_compatible(adev);
+ -	}
+ -	if (acpi_enumerate_nondev_subnodes(adev->handle, buf.pointer, &adev->data))
+  		adev->data.pointer = buf.pointer;
+ -
+ -	if (!adev->data.pointer) {
+ -		acpi_handle_debug(adev->handle, "Invalid _DSD data, skipping\n");
+ -		ACPI_FREE(buf.pointer);
+ -	}
+ -
+ - out:
+ -	if (acpi_of && !adev->flags.of_compatible_ok)
+ -		acpi_handle_info(adev->handle,
+ -			 ACPI_DT_NAMESPACE_HID " requires 'compatible' property\n");
+ -}
+ -
+ -static void acpi_destroy_nondev_subnodes(struct list_head *list)
+ -{
+ -	struct acpi_data_node *dn, *next;
+ -
+ -	if (list_empty(list))
+ +		adev->data.properties = properties;
+  		return;
+++<<<<<<< HEAD
+++=======
++ 
++ 	list_for_each_entry_safe_reverse(dn, next, list, sibling) {
++ 		acpi_destroy_nondev_subnodes(&dn->data.subnodes);
++ 		wait_for_completion(&dn->kobj_done);
++ 		list_del(&dn->sibling);
++ 		ACPI_FREE((void *)dn->data.pointer);
++ 		kfree(dn);
+++>>>>>>> 263b4c1a64bc (ACPI / property: Expose data-only subnodes via sysfs)
+  	}
+ +
+ + fail:
+ +	dev_warn(&adev->dev, "Returned _DSD data is not valid, skipping\n");
+ +	ACPI_FREE(buf.pointer);
+  }
+  
+  void acpi_free_properties(struct acpi_device *adev)
+diff --cc include/acpi/acpi_bus.h
+index 8bcd3caab412,e0d7c193d6e0..000000000000
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@@ -363,6 -379,66 +363,69 @@@ struct acpi_device 
+  	void (*remove)(struct acpi_device *);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Non-device subnode */
++ struct acpi_data_node {
++ 	const char *name;
++ 	acpi_handle handle;
++ 	struct fwnode_handle fwnode;
++ 	struct acpi_device_data data;
++ 	struct list_head sibling;
++ 	struct kobject kobj;
++ 	struct completion kobj_done;
++ };
++ 
++ static inline bool acpi_check_dma(struct acpi_device *adev, bool *coherent)
++ {
++ 	bool ret = false;
++ 
++ 	if (!adev)
++ 		return ret;
++ 
++ 	/**
++ 	 * Currently, we only support _CCA=1 (i.e. coherent_dma=1)
++ 	 * This should be equivalent to specifyig dma-coherent for
++ 	 * a device in OF.
++ 	 *
++ 	 * For the case when _CCA=0 (i.e. coherent_dma=0 && cca_seen=1),
++ 	 * There are two cases:
++ 	 * case 1. Do not support and disable DMA.
++ 	 * case 2. Support but rely on arch-specific cache maintenance for
++ 	 *         non-coherence DMA operations.
++ 	 * Currently, we implement case 1 above.
++ 	 *
++ 	 * For the case when _CCA is missing (i.e. cca_seen=0) and
++ 	 * platform specifies ACPI_CCA_REQUIRED, we do not support DMA,
++ 	 * and fallback to arch-specific default handling.
++ 	 *
++ 	 * See acpi_init_coherency() for more info.
++ 	 */
++ 	if (adev->flags.coherent_dma) {
++ 		ret = true;
++ 		if (coherent)
++ 			*coherent = adev->flags.coherent_dma;
++ 	}
++ 	return ret;
++ }
++ 
++ static inline bool is_acpi_node(struct fwnode_handle *fwnode)
++ {
++ 	return fwnode && fwnode->type == FWNODE_ACPI;
++ }
++ 
++ static inline struct acpi_device *to_acpi_node(struct fwnode_handle *fwnode)
++ {
++ 	return is_acpi_node(fwnode) ?
++ 		container_of(fwnode, struct acpi_device, fwnode) : NULL;
++ }
++ 
++ static inline struct fwnode_handle *acpi_fwnode_handle(struct acpi_device *adev)
++ {
++ 	return &adev->fwnode;
++ }
++ 
+++>>>>>>> 263b4c1a64bc (ACPI / property: Expose data-only subnodes via sysfs)
+  static inline void *acpi_driver_data(struct acpi_device *d)
+  {
+  	return d->driver_data;
+* Unmerged path drivers/acpi/device_sysfs.c
+* Unmerged path drivers/acpi/device_sysfs.c
+* Unmerged path drivers/acpi/property.c
+* Unmerged path include/acpi/acpi_bus.h
